@@ -8,10 +8,13 @@ The ultimate goal is a Linux-capable RV64GC core.
 Use the Veryl compiler from the `veryl/` submodule — do **not** use a system-installed version.
 
 ```bash
-cd veryl && cargo build --release
+cd veryl && cargo build          # debug build (default for development)
+cd veryl && cargo build --release # release build (benchmarks only)
 ```
 
-Binary: `veryl/target/release/veryl`
+- **Debug build**: `veryl/target/debug/veryl` — use for all development and testing.
+- **Release build**: `veryl/target/release/veryl` — use only for performance benchmarks (`cargo bench`).
+- When modifying the simulator, always use debug builds. Release builds with LTO take minutes and hide compilation errors behind optimization.
 
 Key commands:
 
@@ -20,7 +23,7 @@ Key commands:
 | `veryl check` | Analyze (type check, lint)               |
 | `veryl build` | Transpile to SystemVerilog               |
 | `veryl fmt`   | Format source files                      |
-| `veryl test`  | Run native testbenches                   |
+| `veryl test`  | Run native testbenches (uses debug binary)|
 | `veryl clean` | Remove build artifacts                   |
 
 The compiler itself may be debugged or patched as needed.
