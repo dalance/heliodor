@@ -1,0 +1,183 @@
+// Integration test for RV64C compressed instructions
+module test_core_compressed_harness (
+    clk    : input  clock    ,
+    rst    : input  reset    ,
+    o_pass : output logic     ,
+    o_r1   : output logic<64>,
+    o_r2   : output logic<64>,
+    o_r3   : output logic<64>,
+) {
+    var imem_addr : logic<64>;
+    var imem_rdata: logic<32>;
+    var dmem_addr : logic<64>;
+    var dmem_wdata: logic<64>;
+    var dmem_rdata: logic<64>;
+    var dmem_wen  : logic;
+    var dmem_ren  : logic;
+    var dmem_wstrb: logic<8>;
+    var dbg_regs  : logic<64> [32];
+    var dbg_pc    : logic<64>;
+    var dbg_pass  : logic;
+    var dbg_r1    : logic<64>;
+    var dbg_r2    : logic<64>;
+    var dbg_r3    : logic<64>;
+
+    inst dut: heliodor_top (
+        clk                          ,
+        rst                          ,
+        o_imem_addr  : imem_addr     ,
+        i_imem_rdata : imem_rdata    ,
+        o_dmem_addr  : dmem_addr     ,
+        o_dmem_wdata : dmem_wdata    ,
+        i_dmem_rdata : dmem_rdata    ,
+        o_dmem_wen   : dmem_wen      ,
+        o_dmem_ren   : dmem_ren      ,
+        o_dmem_wstrb : dmem_wstrb    ,
+        o_dbg_regs   : dbg_regs      ,
+        o_dbg_pc     : dbg_pc        ,
+        o_dbg_pass   : dbg_pass      ,
+        o_dbg_r1     : dbg_r1        ,
+        o_dbg_r2     : dbg_r2        ,
+        o_dbg_r3     : dbg_r3        ,
+    );
+
+    assign dmem_rdata = 64'd0;
+
+    // Program: mix of 32-bit and 16-bit compressed instructions
+    // All compressed instructions are 16-bit (2 bytes), so we pack
+    // two per 32-bit word or one 32-bit + padding.
+    //
+    // Test plan:
+    //   ADDI x1, x0, 10      (32-bit) -> x1 = 10
+    //   NOP                   (32-bit)
+    //   NOP                   (32-bit)
+    //   NOP                   (32-bit)
+    //   C.LI x2, 20          (16-bit) -> x2 = 20   (expand: addi x2, x0, 20)
+    //   C.ADD x3, x1         (16-bit) -> x3 = x3 + x1 (but x3=0, so x3=10? No, C.ADD is x3 = x3 + x1)
+    //                                    After C.LI x2, the next compressed instruction...
+    //
+    // Actually, let me simplify: use only compressed instructions after setup.
+    // The PC will advance by 2 for compressed and 4 for normal.
+    //
+    //   0x00: ADDI x1, x0, 10      (32-bit, 4 bytes) -> x1 = 10
+    //   0x04: NOP                   (32-bit)
+    //   0x08: NOP                   (32-bit)
+    //   0x0C: NOP                   (32-bit)
+    //   0x10: C.LI x2, 20          (16-bit, 2 bytes) -> x2 = 20
+    //   0x12: C.NOP                 (16-bit, 2 bytes)
+    //   0x14: C.NOP                 (16-bit, 2 bytes)
+    //   0x16: C.NOP                 (16-bit, 2 bytes)
+    //   0x18: C.ADD x3, x1         (16-bit, 2 bytes) -> x3 = x3 + x1 = 0 + 10 = 10
+    //   ... (but x3 was set by C.LI above? No, C.LI wrote to x2)
+    //
+    // Wait, we read x1, x2, x3 via debug. Let me design carefully:
+    //   x1 = 10 (from ADDI)
+    //   x2 = 20 (from C.LI)
+    //   x3 = x1 + x2 = 30 (from C.ADD or regular ADD using forwarding)
+    //
+    // But C.ADD x3, x2 means x3 = x3 + x2. We need x3 to already be x1=10.
+    // Better: use C.MV x3, x1 then C.ADD x3, x2
+    //   C.MV x3, x1: add x3, x0, x1 → x3 = 10
+    //   C.ADD x3, x2: add x3, x3, x2 → x3 = 30
+    //
+    // Encoding:
+    //   ADDI x1, x0, 10:  0x00A00093 (32-bit)
+    //   C.LI x2, 20:      CI-type, funct3=010, imm[5]=0, rd=x2(00010), imm[4:0]=10100, op=01
+    //     = 010_0_00010_10100_01 = 0x4_0_2_14_1 ...
+    //   Let me compute properly:
+    //     C.LI: [15:13]=010, [12]=imm[5], [11:7]=rd, [6:2]=imm[4:0], [1:0]=01
+    //     imm = 20 = 0b010100, imm[5]=0, imm[4:0]=10100
+    //     rd = x2 = 00010
+    //     = 010_0_00010_10100_01 = 0b0100_0001_0101_0001 = 0x4151
+    //
+    //   C.NOP: [15:13]=000, [12]=0, [11:7]=00000, [6:2]=00000, [1:0]=01
+    //     = 000_0_00000_00000_01 = 0x0001
+    //
+    //   C.MV x3, x1: [15:12]=1000, [11:7]=rd=x3=00011, [6:2]=rs2=x1=00001, [1:0]=10
+    //     Wait, C.MV is in Q2: funct4=1000, rd, rs2, op=10
+    //     [15]=1, [14:13]=00, [12]=0, [11:7]=00011, [6:2]=00001, [1:0]=10
+    //     = 100_0_00011_00001_10 = 0b1000_0001_1000_0110 = 0x8186
+    //
+    //   C.ADD x3, x2: funct4=1001, rd=x3, rs2=x2, op=10
+    //     [15:12]=1001, [11:7]=00011, [6:2]=00010, [1:0]=10
+    //     = 100_1_00011_00010_10 = 0b1001_0001_1000_1010 = 0x918A
+    //
+    // Memory layout (byte addresses):
+    //   0x00-0x03: ADDI x1, x0, 10 = 0x00A00093
+    //   0x04-0x07: NOP = 0x00000013
+    //   0x08-0x0B: NOP = 0x00000013
+    //   0x0C-0x0F: NOP = 0x00000013
+    //   0x10-0x11: C.LI x2, 20 = 0x4151
+    //   0x12-0x13: C.NOP = 0x0001
+    //   0x14-0x15: C.NOP = 0x0001
+    //   0x16-0x17: C.NOP = 0x0001
+    //   0x18-0x19: C.MV x3, x1 = 0x8186
+    //   0x1A-0x1B: C.NOP = 0x0001
+    //   0x1C-0x1D: C.NOP = 0x0001
+    //   0x1E-0x1F: C.NOP = 0x0001
+    //   0x20-0x21: C.ADD x3, x2 = 0x918A
+    //   0x22+: NOP
+    //
+    // For the testbench, imem returns 32 bits from the PC address.
+    // When PC is at a 2-byte boundary within a word, we need the upper half.
+
+    always_comb {
+        case imem_addr[7:0] {
+            8'h00:   imem_rdata = 32'h00A00093; // ADDI x1, x0, 10
+            8'h04:   imem_rdata = 32'h00000013; // NOP
+            8'h08:   imem_rdata = 32'h00000013; // NOP
+            8'h0C:   imem_rdata = 32'h00000013; // NOP
+            // Compressed instructions: pack two 16-bit instrs per 32-bit word
+            // PC=0x10: C.LI x2, 20 (0x4151) | PC=0x12: C.NOP (0x0001)
+            8'h10:   imem_rdata = {16'h0001, 16'h4151};
+            8'h12:   imem_rdata = {16'h0001, 16'h0001}; // C.NOP | C.NOP
+            8'h14:   imem_rdata = {16'h0001, 16'h0001}; // C.NOP | C.NOP
+            8'h16:   imem_rdata = {16'h8186, 16'h0001}; // C.NOP | pad, then next
+            // PC=0x18: C.MV x3, x1 (0x8186)
+            8'h18:   imem_rdata = {16'h0001, 16'h8186}; // C.MV x3, x1 | C.NOP
+            8'h1A:   imem_rdata = {16'h0001, 16'h0001}; // C.NOP | C.NOP
+            8'h1C:   imem_rdata = {16'h0001, 16'h0001}; // C.NOP | C.NOP
+            8'h1E:   imem_rdata = {16'h918A, 16'h0001}; // C.NOP | pad
+            // PC=0x20: C.ADD x3, x2 (0x918A)
+            8'h20:   imem_rdata = {16'h0001, 16'h918A}; // C.ADD x3, x2 | C.NOP
+            default: imem_rdata = 32'h00000013; // NOP (32-bit)
+        }
+    }
+
+    assign o_r1 = dbg_r1;
+    assign o_r2 = dbg_r2;
+    assign o_r3 = dbg_r3;
+    // x1 = 10, x2 = 20, x3 = 10 + 20 = 30
+    assign o_pass = dbg_r1 == 64'd10
+                 && dbg_r2 == 64'd20
+                 && dbg_r3 == 64'd30;
+}
+
+#[test(test_core_compressed)]
+module test_core_compressed {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen;
+
+    var pass: logic;
+    var r1  : logic<64>;
+    var r2  : logic<64>;
+    var r3  : logic<64>;
+
+    inst harness: test_core_compressed_harness (
+        clk    : clk  ,
+        rst    : rst  ,
+        o_pass : pass ,
+        o_r1   : r1   ,
+        o_r2   : r2   ,
+        o_r3   : r3   ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(30);
+        $display(r1, r2, r3, pass);
+        $assert(pass, "Compressed instruction test failed");
+        $display("RV64C compressed instruction test passed");
+        $finish();
+    }
+}
