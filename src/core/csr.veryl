@@ -1,5 +1,5 @@
-// CSR (Control and Status Register) file for Machine mode
-// Implements M-mode CSRs required for basic trap handling.
+// CSR (Control and Status Register) file for Machine and Supervisor modes
+// Implements M/S-mode CSRs for trap handling, delegation, and virtual memory.
 pub module csr (
     clk       : input  clock    ,
     rst       : input  reset    ,
@@ -15,11 +15,14 @@ pub module csr (
     i_trap_cause: input logic<64>,
     i_trap_pc  : input  logic<64>,
     i_trap_val : input  logic<64>,
-    // MRET
+    // MRET / SRET
     i_mret    : input  logic    ,
+    i_sret    : input  logic    ,
     o_mret_pc : output logic<64>,
-    // Trap vector
+    o_sret_pc : output logic<64>,
+    // Trap vectors
     o_mtvec   : output logic<64>,
+    o_stvec   : output logic<64>,
     // Current privilege level
     o_priv    : output csr_pkg::PrivLevel,
     // Interrupt pending
@@ -28,12 +31,19 @@ pub module csr (
     i_timer_irq: input  logic    ,
     // Cycle/instret increment
     i_instret : input  logic    ,
+    // SATP output for MMU
+    o_satp    : output logic<64>,
 ) {
     import csr_pkg::*;
 
+    // ============================================================
     // CSR registers
+    // ============================================================
+    // Machine mode
     var mstatus  : logic<64>;
     var misa     : logic<64>;
+    var medeleg  : logic<64>;
+    var mideleg  : logic<64>;
     var mie      : logic<64>;
     var mtvec    : logic<64>;
     var mscratch : logic<64>;
@@ -43,29 +53,66 @@ pub module csr (
     var mip      : logic<64>;
     var mcycle   : logic<64>;
     var minstret : logic<64>;
+    // Supervisor mode
+    var stvec    : logic<64>;
+    var sscratch : logic<64>;
+    var sepc     : logic<64>;
+    var scause   : logic<64>;
+    var stval    : logic<64>;
+    var satp     : logic<64>;
+    // Privilege level
     var priv_lvl : PrivLevel;
 
-    // mstatus fields
-    // Bit 3: MIE (Machine Interrupt Enable)
-    // Bit 7: MPIE (Machine Previous Interrupt Enable)
-    // Bits 12:11: MPP (Machine Previous Privilege)
-    let mstatus_mie : logic = mstatus[3];
-    let mstatus_mpie: logic = mstatus[7];
+    // ============================================================
+    // mstatus / sstatus fields
+    // ============================================================
+    let mstatus_sie : logic    = mstatus[1];
+    let mstatus_mie : logic    = mstatus[3];
+    let mstatus_spie: logic    = mstatus[5];
+    let mstatus_mpie: logic    = mstatus[7];
+    let mstatus_spp : logic    = mstatus[8];
     let mstatus_mpp : logic<2> = mstatus[12:11];
 
-    // mip.MTIP (bit 7) is set by hardware timer, read-only via CSR
+    // sstatus is a restricted view of mstatus
+    // Visible bits: SIE(1), SPIE(5), SPP(8), FS(14:13), XS(16:15), SUM(18), MXR(19), UXS(32), SD(63)
+    let sstatus_mask: logic<64> = 64'h80000000000DE162;
+    let sstatus: logic<64> = mstatus & sstatus_mask;
+
+    // sie/sip are restricted views of mie/mip (only S-mode bits)
+    let sie_mask: logic<64> = 64'h222; // bits 1(SSIP), 5(STIP), 9(SEIP)
+    let sip_mask: logic<64> = 64'h222;
+
+    // ============================================================
+    // mip with hardware timer
+    // ============================================================
     var mip_effective: logic<64>;
     always_comb {
         mip_effective    = mip;
-        mip_effective[7] = i_timer_irq;
+        mip_effective[7] = i_timer_irq; // MTIP
     }
 
+    // ============================================================
+    // Trap delegation: determine target privilege level
+    // ============================================================
+    let trap_is_interrupt: logic = i_trap_cause[63];
+    let trap_code: logic<6> = i_trap_cause[5:0];
+    let deleg_to_s: logic = if trap_is_interrupt ?
+        (mideleg[trap_code] == 1'b1)
+    : (medeleg[trap_code] == 1'b1);
+    // Delegate to S-mode only if current priv <= S
+    let trap_to_s: logic = deleg_to_s && (priv_lvl != PrivLevel::MACHINE);
+
+    // ============================================================
     // CSR read
+    // ============================================================
     var rdata: logic<64>;
     always_comb {
         case i_addr {
+            // Machine mode
             CSR_MSTATUS : rdata = mstatus;
             CSR_MISA    : rdata = misa;
+            CSR_MEDELEG : rdata = medeleg;
+            CSR_MIDELEG : rdata = mideleg;
             CSR_MIE     : rdata = mie;
             CSR_MTVEC   : rdata = mtvec;
             CSR_MSCRATCH: rdata = mscratch;
@@ -75,24 +122,43 @@ pub module csr (
             CSR_MIP     : rdata = mip_effective;
             CSR_MCYCLE  : rdata = mcycle;
             CSR_MINSTRET: rdata = minstret;
+            // Supervisor mode
+            CSR_SSTATUS : rdata = sstatus;
+            CSR_SIE     : rdata = mie & sie_mask;
+            CSR_STVEC   : rdata = stvec;
+            CSR_SSCRATCH: rdata = sscratch;
+            CSR_SEPC    : rdata = sepc;
+            CSR_SCAUSE  : rdata = scause;
+            CSR_STVAL   : rdata = stval;
+            CSR_SIP     : rdata = mip_effective & sip_mask;
+            CSR_SATP    : rdata = satp;
+            // User counters
             CSR_CYCLE   : rdata = mcycle;
             CSR_INSTRET : rdata = minstret;
-            CSR_MHARTID : rdata = 64'd0;
+            // Read-only info
+            CSR_MHARTID  : rdata = 64'd0;
             CSR_MVENDORID: rdata = 64'd0;
-            CSR_MARCHID : rdata = 64'd0;
-            CSR_MIMPID  : rdata = 64'd0;
-            default     : rdata = 64'd0;
+            CSR_MARCHID  : rdata = 64'd0;
+            CSR_MIMPID   : rdata = 64'd0;
+            default      : rdata = 64'd0;
         }
     }
-    assign o_rdata = rdata;
-    assign o_mtvec = mtvec;
+    assign o_rdata   = rdata;
+    assign o_mtvec   = mtvec;
+    assign o_stvec   = stvec;
     assign o_mret_pc = mepc;
-    assign o_priv = priv_lvl;
+    assign o_sret_pc = sepc;
+    assign o_priv    = priv_lvl;
+    assign o_satp    = satp;
 
-    // Interrupt pending: any enabled and pending interrupt while MIE is set
-    assign o_irq_pending = mstatus_mie && ((mie & mip_effective) != 64'd0);
+    // Interrupt pending: check M-mode and S-mode enables
+    let m_irq_pending: logic = mstatus_mie && ((mie & mip_effective & ~mideleg) != 64'd0);
+    let s_irq_pending: logic = mstatus_sie && ((mie & mip_effective & mideleg) != 64'd0);
+    assign o_irq_pending = m_irq_pending || s_irq_pending;
 
-    // Compute new CSR value based on operation
+    // ============================================================
+    // Compute new CSR value
+    // ============================================================
     var new_val: logic<64>;
     always_comb {
         case i_op {
@@ -103,12 +169,16 @@ pub module csr (
         }
     }
 
+    // ============================================================
     // CSR write logic
+    // ============================================================
     always_ff (clk, rst) {
         if_reset {
             mstatus  = 64'd0;
-            // misa: RV64IM (MXL=2, I=1, M=1)
-            misa     = {2'b10, 36'b0, 26'b00000000000001000100000000};
+            // misa: RV64IMAC (MXL=2, A=1, C=1, I=1, M=1)
+            misa     = {2'b10, 36'b0, 26'b00000000000001000100000101};
+            medeleg  = 64'd0;
+            mideleg  = 64'd0;
             mie      = 64'd0;
             mtvec    = 64'd0;
             mscratch = 64'd0;
@@ -118,6 +188,12 @@ pub module csr (
             mip      = 64'd0;
             mcycle   = 64'd0;
             minstret = 64'd0;
+            stvec    = 64'd0;
+            sscratch = 64'd0;
+            sepc     = 64'd0;
+            scause   = 64'd0;
+            stval    = 64'd0;
+            satp     = 64'd0;
             priv_lvl = PrivLevel::MACHINE;
         } else {
             // Counters
@@ -128,27 +204,48 @@ pub module csr (
 
             // Trap entry
             if i_trap {
-                mepc = i_trap_pc;
-                mcause = i_trap_cause;
-                mtval = i_trap_val;
-                // Save MIE to MPIE, clear MIE, save current priv to MPP
-                mstatus[7] = mstatus_mie;
-                mstatus[3] = 1'b0;
-                mstatus[12:11] = priv_lvl[1:0];
-                priv_lvl = PrivLevel::MACHINE;
+                if trap_to_s {
+                    // Delegate to S-mode
+                    sepc   = i_trap_pc;
+                    scause = i_trap_cause;
+                    stval  = i_trap_val;
+                    // Save SIE to SPIE, clear SIE, save priv to SPP
+                    mstatus[5] = mstatus_sie;
+                    mstatus[1] = 1'b0;
+                    mstatus[8] = priv_lvl[0];
+                    priv_lvl = PrivLevel::SUPERVISOR;
+                } else {
+                    // Handle in M-mode
+                    mepc   = i_trap_pc;
+                    mcause = i_trap_cause;
+                    mtval  = i_trap_val;
+                    // Save MIE to MPIE, clear MIE, save priv to MPP
+                    mstatus[7] = mstatus_mie;
+                    mstatus[3] = 1'b0;
+                    mstatus[12:11] = priv_lvl[1:0];
+                    priv_lvl = PrivLevel::MACHINE;
+                }
             }
             // MRET
             else if i_mret {
-                // Restore MIE from MPIE, set MPIE=1, restore priv from MPP
-                mstatus[3] = mstatus_mpie;
-                mstatus[7] = 1'b1;
-                priv_lvl = mstatus_mpp[1:0] as PrivLevel;
-                mstatus[12:11] = 2'b00; // USER
+                mstatus[3]     = mstatus_mpie;
+                mstatus[7]     = 1'b1;
+                priv_lvl       = mstatus_mpp[1:0] as PrivLevel;
+                mstatus[12:11] = 2'b00;
+            }
+            // SRET
+            else if i_sret {
+                mstatus[1] = mstatus_spie;
+                mstatus[5] = 1'b1;
+                priv_lvl   = if mstatus_spp ? PrivLevel::SUPERVISOR : PrivLevel::USER;
+                mstatus[8] = 1'b0;
             }
             // Normal CSR write
             else if i_wen {
                 case i_addr {
                     CSR_MSTATUS : mstatus = new_val;
+                    CSR_MEDELEG : medeleg = new_val;
+                    CSR_MIDELEG : mideleg = new_val;
                     CSR_MIE     : mie = new_val;
                     CSR_MTVEC   : mtvec = new_val;
                     CSR_MSCRATCH: mscratch = new_val;
@@ -156,6 +253,16 @@ pub module csr (
                     CSR_MCAUSE  : mcause = new_val;
                     CSR_MTVAL   : mtval = new_val;
                     CSR_MIP     : mip = new_val;
+                    // Supervisor CSRs
+                    CSR_SSTATUS : mstatus = (mstatus & ~sstatus_mask) | (new_val & sstatus_mask);
+                    CSR_SIE     : mie = (mie & ~sie_mask) | (new_val & sie_mask);
+                    CSR_STVEC   : stvec = new_val;
+                    CSR_SSCRATCH: sscratch = new_val;
+                    CSR_SEPC    : sepc = new_val;
+                    CSR_SCAUSE  : scause = new_val;
+                    CSR_STVAL   : stval = new_val;
+                    CSR_SIP     : mip = (mip & ~sip_mask) | (new_val & sip_mask);
+                    CSR_SATP    : satp = new_val;
                     default: {}
                 }
             }
