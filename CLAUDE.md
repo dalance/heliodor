@@ -51,7 +51,11 @@ heliodor/
 
 - **Language**: Veryl (transpiles to SystemVerilog)
 - **Comments & documentation**: English
-- **Testing**: Veryl native testbench (`veryl test`)
+- **Testing**: Veryl native testbench — always run **both** JIT on and off to catch simulator bugs early:
+  ```bash
+  veryl test                # JIT on (default)
+  veryl test --disable-jit  # JIT off
+  ```
 - **Formatting**: `veryl fmt`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
 
