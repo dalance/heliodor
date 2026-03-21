@@ -12,9 +12,9 @@ cd veryl && cargo build          # debug build (default for development)
 cd veryl && cargo build --release # release build (benchmarks only)
 ```
 
-- **Debug build**: `veryl/target/debug/veryl` — use for all development and testing.
-- **Release build**: `veryl/target/release/veryl` — use only for performance benchmarks (`cargo bench`).
-- When modifying the simulator, always use debug builds. Release builds with LTO take minutes and hide compilation errors behind optimization.
+- **Release build**: `veryl/target/release/veryl` — use for heliodor development and testing (faster simulation).
+- **Debug build**: `veryl/target/debug/veryl` — use only when debugging the Veryl compiler/simulator itself.
+- When modifying the simulator, use debug builds first to catch compilation errors quickly, then switch to release for verification.
 
 Key commands:
 
