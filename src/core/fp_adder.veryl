@@ -1,0 +1,321 @@
+// IEEE 754 double-precision floating-point adder/subtractor
+// Combinational (single-cycle). Handles normals, subnormals, zeros, infinities, NaNs.
+pub module fp_adder (
+    i_a      : input  logic<64>,
+    i_b      : input  logic<64>,
+    i_sub    : input  logic    ,   // 1 = subtract (negate b sign)
+    i_rm     : input  logic<3> ,   // rounding mode
+    o_result : output logic<64>,
+    o_fflags : output logic<5> ,   // {NV, DZ, OF, UF, NX}
+) {
+    // All field extraction and computation done inside always_comb
+    // to avoid module-scope `let` bit-select issues with the simulator.
+
+    // Result
+    var r_sign   : logic;
+    var r_exp    : logic<12>;
+    var r_mant   : logic<56>; // includes G/R/S in low 3 bits
+    var r_sticky : logic;
+    var fflags   : logic<5>;
+    var result   : logic<64>;
+
+    // CLZ on 57-bit value (for normalization after subtraction)
+    // Simple priority encoder
+    function clz57 (
+        val: input logic<57>,
+    ) -> logic<6> {
+        var ret: logic<6>;
+        ret = 6'd57;
+        for i: i32 in 0..57 {
+            if val[56 - i] == 1'b1 && ret == 6'd57 {
+                ret = i[5:0];
+            }
+        }
+        return ret;
+    }
+
+    always_comb {
+        // Extract fields
+        var sa: logic;
+        var ea: logic<11>;
+        var ma: logic<52>;
+        var sb_raw: logic;
+        var eb: logic<11>;
+        var mb: logic<52>;
+        var sb: logic;
+
+        sa = i_a[63];
+        ea = i_a[62:52];
+        ma = i_a[51:0];
+        sb_raw = i_b[63];
+        eb = i_b[62:52];
+        mb = i_b[51:0];
+        sb = sb_raw ^ i_sub;
+
+        // Classify
+        var a_is_zero: logic;
+        var b_is_zero: logic;
+        var a_is_inf: logic;
+        var b_is_inf: logic;
+        var a_is_nan: logic;
+        var b_is_nan: logic;
+        var a_is_snan: logic;
+        var b_is_snan: logic;
+        var a_is_sub: logic;
+        var b_is_sub: logic;
+
+        a_is_zero = ea == 11'd0 && ma == 52'd0;
+        b_is_zero = eb == 11'd0 && mb == 52'd0;
+        a_is_inf  = ea == 11'h7FF && ma == 52'd0;
+        b_is_inf  = eb == 11'h7FF && mb == 52'd0;
+        a_is_nan  = ea == 11'h7FF && ma != 52'd0;
+        b_is_nan  = eb == 11'h7FF && mb != 52'd0;
+        a_is_snan = a_is_nan && ma[51] == 1'b0;
+        b_is_snan = b_is_nan && mb[51] == 1'b0;
+        a_is_sub  = ea == 11'd0 && ma != 52'd0;
+        b_is_sub  = eb == 11'd0 && mb != 52'd0;
+
+        // Effective exponents
+        var ea_eff: logic<12>;
+        var eb_eff: logic<12>;
+        if a_is_sub || a_is_zero { ea_eff = 12'd1; } else { ea_eff = {1'b0, ea}; }
+        if b_is_sub || b_is_zero { eb_eff = 12'd1; } else { eb_eff = {1'b0, eb}; }
+
+        // Significands with implicit bit (53 bits)
+        // Always compute: normal case has implicit 1, subnormal has 0, zero has 0
+        var imp_a: logic;
+        var imp_b: logic;
+        if a_is_sub || a_is_zero { imp_a = 1'b0; } else { imp_a = 1'b1; }
+        if b_is_sub || b_is_zero { imp_b = 1'b0; } else { imp_b = 1'b1; }
+        var sig_a: logic<53>;
+        var sig_b: logic<53>;
+        sig_a = {imp_a, ma};
+        sig_b = {imp_b, mb};
+
+        // Extend to 56 bits for G/R/S
+        var ext_a: logic<56>;
+        var ext_b: logic<56>;
+        ext_a = {sig_a, 3'b000};
+        ext_b = {sig_b, 3'b000};
+
+        // Magnitude comparison
+        var a_ge_b: logic;
+        if ea_eff != eb_eff {
+            a_ge_b = ea_eff >: eb_eff;
+        } else {
+            a_ge_b = !(sig_a <: sig_b);
+        }
+
+        // Align
+        var large_sign: logic;
+        var small_sign: logic;
+        var large_ext: logic<56>;
+        var small_ext: logic<56>;
+        var result_exp: logic<12>;
+        var shift_amt: logic<12>;
+        if a_ge_b {
+            large_sign = sa; small_sign = sb;
+            large_ext = ext_a; small_ext = ext_b;
+            result_exp = ea_eff; shift_amt = ea_eff - eb_eff;
+        } else {
+            large_sign = sb; small_sign = sa;
+            large_ext = ext_b; small_ext = ext_a;
+            result_exp = eb_eff; shift_amt = eb_eff - ea_eff;
+        }
+
+        // Clamp shift
+        var shift_clamped: logic<6>;
+        if shift_amt >: 12'd56 { shift_clamped = 6'd56; } else { shift_clamped = shift_amt[5:0]; }
+
+        // Right-shift with sticky
+        var shifted: logic<56>;
+        var shift_mask: logic<56>;
+        var sticky_shift: logic;
+        var shifted_with_sticky: logic<56>;
+        shifted = small_ext >> shift_clamped;
+        shift_mask = (56'd1 << shift_clamped) - 56'd1;
+        sticky_shift = (small_ext & shift_mask) != 56'd0;
+        shifted_with_sticky = {shifted[55:1], shifted[0] | sticky_shift};
+
+        // Effective operation
+        var eff_sub: logic;
+        eff_sub = large_sign ^ small_sign;
+
+        // Add/subtract (use 64-bit to avoid potential width issues)
+        var sum64: logic<64>;
+        if eff_sub {
+            sum64 = {8'd0, large_ext} - {8'd0, shifted_with_sticky};
+        } else {
+            sum64 = {8'd0, large_ext} + {8'd0, shifted_with_sticky};
+        }
+        var sum: logic<57>;
+        sum = sum64[56:0];
+
+        r_sign   = large_sign;
+        r_exp    = result_exp;
+        r_mant   = sum[55:0];
+        r_sticky = 1'b0;
+        fflags   = 5'd0;
+        result   = 64'd0;
+
+        // === Special cases ===
+        if a_is_nan || b_is_nan {
+            // NaN input → canonical qNaN
+            result = 64'h7FF8_0000_0000_0000;
+            if a_is_snan || b_is_snan {
+                fflags = 5'b10000; // NV (invalid)
+            }
+        } else if a_is_inf && b_is_inf {
+            if sa == sb {
+                // Same sign: inf
+                result = {sa, 11'h7FF, 52'd0};
+            } else {
+                // Different sign: NaN (inf - inf)
+                result = 64'h7FF8_0000_0000_0000;
+                fflags = 5'b10000; // NV
+            }
+        } else if a_is_inf {
+            result = {sa, 11'h7FF, 52'd0};
+        } else if b_is_inf {
+            result = {sb, 11'h7FF, 52'd0};
+        } else if a_is_zero && b_is_zero {
+            // +0 + +0 = +0, -0 + -0 = -0, mixed = +0 (in RNE)
+            // In RDN mode, mixed zeros give -0
+            let zero_sign: logic = if sa == sb ? sa
+                                 : if i_rm == 3'b010 ? 1'b1 : 1'b0;
+            result = {zero_sign, 63'd0};
+        } else if a_is_zero {
+            result = {sb, eb, mb};
+        } else if b_is_zero {
+            result = {sa, ea, ma};
+        } else {
+            // === Normal computation ===
+
+            // Normalize after add/subtract
+            if sum == 57'd0 {
+                // Exact zero result
+                let zero_sign_r: logic = if i_rm == 3'b010 ? 1'b1 : 1'b0;
+                result = {zero_sign_r, 63'd0};
+            } else if sum[56] {
+                // Carry out (addition): shift right by 1
+                // sum[56:1] with sticky in bit 0
+                var co_mant: logic<56>;
+                co_mant = {sum[56:1]};
+                co_mant = {co_mant[55:1], co_mant[0] | sum[0]};
+                var co_exp: logic<12>;
+                co_exp = result_exp + 12'd1;
+
+                // Rounding
+                var co_g: logic;
+                var co_r: logic;
+                var co_s: logic;
+                var co_lsb: logic;
+                co_g = co_mant[2];
+                co_r = co_mant[1];
+                co_s = co_mant[0];
+                co_lsb = co_mant[3];
+                var co_round_up: logic;
+                case i_rm {
+                    3'b000: co_round_up = co_g && (co_r || co_s || co_lsb); // RNE
+                    3'b001: co_round_up = 1'b0;                  // RTZ
+                    3'b010: co_round_up = r_sign && (co_g || co_r || co_s); // RDN
+                    3'b011: co_round_up = !r_sign && (co_g || co_r || co_s); // RUP
+                    3'b100: co_round_up = co_g;                     // RMM
+                    default: co_round_up = co_g && (co_r || co_s || co_lsb);
+                }
+                var co_rounded: logic<53>;
+                co_rounded = co_mant[55:3] + {52'd0, co_round_up};
+                if co_rounded[52] && !co_mant[55] {
+                    co_exp = co_exp + 12'd1;
+                }
+                var co_nx: logic;
+                co_nx = co_g || co_r || co_s;
+
+                // Overflow check
+                if co_exp >= 12'd2047 {
+                    result = {r_sign, 11'h7FF, 52'd0};
+                    fflags = 5'b00101; // OF | NX
+                } else {
+                    result = {r_sign, co_exp[10:0], co_rounded[51:0]};
+                    if co_nx { fflags = 5'b00001; }
+                }
+            } else {
+                // No carry: need to normalize (shift left to remove leading zeros)
+                let lzc: logic<6> = clz57(sum);
+                // The result has the implicit 1 at position 55 (for aligned case)
+                // Leading zeros beyond position 55 need left-shift
+                let norm_shift: logic<6> = if lzc == 6'd0 ? 6'd0 : lzc - 6'd1;
+                // But also account for the fact that sum[55] should be the implicit 1
+                let actual_shift: logic<6> = if sum[55] ? 6'd0 : lzc;
+
+                let norm_mant: logic<56> = sum[55:0] << actual_shift;
+                let norm_exp : logic<12> = result_exp - {6'd0, actual_shift};
+
+                // Check for subnormal result
+                if norm_exp <= 12'd0 {
+                    // Subnormal: right-shift mantissa
+                    let sub_shift: logic<12> = 12'd1 - norm_exp;
+                    // sub_shift > 56 → clamp to 56
+                    let sub_le56: logic = sub_shift <: 12'd57;
+                    let sub_shift_c: logic<6> = if sub_le56 ? sub_shift[5:0] : 6'd56;
+                    let sub_mant: logic<56> = norm_mant >> sub_shift_c;
+                    let sub_sticky: logic = (norm_mant & ((56'd1 << sub_shift_c) - 56'd1)) != 56'd0;
+                    r_mant = {sub_mant[55:1], sub_mant[0] | sub_sticky};
+                    r_exp  = 12'd0;
+                } else {
+                    r_mant = norm_mant;
+                    r_exp  = norm_exp;
+                }
+
+                // Rounding
+                var nc_g: logic;
+                var nc_r: logic;
+                var nc_s: logic;
+                var nc_lsb: logic;
+                nc_g = r_mant[2];
+                nc_r = r_mant[1];
+                nc_s = r_mant[0];
+                nc_lsb = r_mant[3];
+                var nc_round_up: logic;
+                case i_rm {
+                    3'b000: nc_round_up = nc_g && (nc_r || nc_s || nc_lsb);
+                    3'b001: nc_round_up = 1'b0;
+                    3'b010: nc_round_up = r_sign && (nc_g || nc_r || nc_s);
+                    3'b011: nc_round_up = !r_sign && (nc_g || nc_r || nc_s);
+                    3'b100: nc_round_up = nc_g;
+                    default: nc_round_up = nc_g && (nc_r || nc_s || nc_lsb);
+                }
+                var nc_rounded: logic<53>;
+                nc_rounded = r_mant[55:3] + {52'd0, nc_round_up};
+
+                // Check if rounding caused carry
+                var final_exp : logic<12>;
+                var final_mant: logic<52>;
+                if nc_rounded[52] {
+                    final_exp  = r_exp + 12'd1;
+                    final_mant = nc_rounded[51:0];
+                } else {
+                    final_exp  = r_exp;
+                    final_mant = nc_rounded[51:0];
+                }
+
+                var nc_nx: logic;
+                nc_nx = nc_g || nc_r || nc_s;
+
+                // Overflow
+                if final_exp >= 12'd2047 {
+                    result = {r_sign, 11'h7FF, 52'd0};
+                    fflags = 5'b00101; // OF | NX
+                } else {
+                    result = {r_sign, final_exp[10:0], final_mant};
+                    if nc_nx { fflags = 5'b00001; }
+                    // UF: subnormal and inexact
+                    if final_exp == 12'd0 && nc_nx { fflags = 5'b00011; } // UF | NX
+                }
+            }
+        }
+    }
+
+    assign o_result = result;
+    assign o_fflags = fflags;
+}
