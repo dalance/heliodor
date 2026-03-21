@@ -32,7 +32,12 @@ pub module execute (
     // FP extension
     i_is_fp        : input  logic                  ,
     i_fp_reg_wen   : input  logic                  ,
+    i_fpu_op       : input  fpu_pkg::FpuOp         ,
+    i_fp_rm        : input  logic<3>               ,
+    i_fp_rs1_data  : input  logic<64>              ,
     i_fp_rs2_data  : input  logic<64>              ,
+    i_fp_rs3_data  : input  logic<64>              ,
+    i_frm          : input  logic<3>               ,
     // CSR interface
     i_is_csr       : input  logic                  ,
     i_csr_addr     : input  logic<12>              ,
@@ -105,6 +110,153 @@ pub module execute (
         i_b  : alu_b      ,
         o_out: alu_result ,
     );
+
+    // ============================================================
+    // FPU bit operations (FSGNJ, FMIN/FMAX, FMV, FCLASS, FCMP)
+    // ============================================================
+    import fpu_pkg::*;
+
+    // Resolve rounding mode: use frm CSR when instruction specifies DYN
+    let _fp_rm_resolved: logic<3> = if i_fp_rm == 3'b111 ? i_frm : i_fp_rm;
+
+    // NaN-boxing helpers for single-precision
+    let fp_s1: logic<32> = i_fp_rs1_data[31:0];
+    let fp_s2: logic<32> = i_fp_rs2_data[31:0];
+    let s1_nanboxed: logic = i_fp_rs1_data[63:32] == 32'hFFFFFFFF;
+    let s2_nanboxed: logic = i_fp_rs2_data[63:32] == 32'hFFFFFFFF;
+    // If not properly NaN-boxed, treat as canonical NaN
+    let s1_val: logic<32> = if s1_nanboxed ? fp_s1 : 32'h7FC00000;
+    let s2_val: logic<32> = if s2_nanboxed ? fp_s2 : 32'h7FC00000;
+
+    // Double-precision aliases
+    let d1: logic<64> = i_fp_rs1_data;
+    let d2: logic<64> = i_fp_rs2_data;
+
+    // NaN detection
+    let s1_is_nan: logic = s1_val[30:23] == 8'hFF && s1_val[22:0] != 23'd0;
+    let s2_is_nan: logic = s2_val[30:23] == 8'hFF && s2_val[22:0] != 23'd0;
+    let d1_is_nan: logic = d1[62:52] == 11'h7FF && d1[51:0] != 52'd0;
+    let d2_is_nan: logic = d2[62:52] == 11'h7FF && d2[51:0] != 52'd0;
+
+    // FP result computation
+    var fpu_result: logic<64>;
+    always_comb {
+        fpu_result = 64'd0;
+        case i_fpu_op {
+            // FSGNJ: result sign = rs2 sign, magnitude = rs1
+            FpuOp::FSGNJ_S:  fpu_result = {32'hFFFFFFFF, s2_val[31], s1_val[30:0]};
+            FpuOp::FSGNJN_S: fpu_result = {32'hFFFFFFFF, ~s2_val[31], s1_val[30:0]};
+            FpuOp::FSGNJX_S: fpu_result = {32'hFFFFFFFF, s1_val[31] ^ s2_val[31], s1_val[30:0]};
+            FpuOp::FSGNJ_D:  fpu_result = {d2[63], d1[62:0]};
+            FpuOp::FSGNJN_D: fpu_result = {~d2[63], d1[62:0]};
+            FpuOp::FSGNJX_D: fpu_result = {d1[63] ^ d2[63], d1[62:0]};
+
+            // FMIN/FMAX single
+            FpuOp::FMIN_S: {
+                if s1_is_nan && s2_is_nan { fpu_result = {32'hFFFFFFFF, 32'h7FC00000}; }
+                else if s1_is_nan         { fpu_result = {32'hFFFFFFFF, s2_val}; }
+                else if s2_is_nan         { fpu_result = {32'hFFFFFFFF, s1_val}; }
+                else if s1_val == 32'h80000000 && s2_val == 32'h00000000 { fpu_result = {32'hFFFFFFFF, 32'h80000000}; } // -0 < +0
+                else { fpu_result = if ({s1_val[31], ~s1_val[30:0]} <: {s2_val[31], ~s2_val[30:0]}) ? {32'hFFFFFFFF, s1_val} : {32'hFFFFFFFF, s2_val}; }
+            }
+            FpuOp::FMAX_S: {
+                if s1_is_nan && s2_is_nan { fpu_result = {32'hFFFFFFFF, 32'h7FC00000}; }
+                else if s1_is_nan         { fpu_result = {32'hFFFFFFFF, s2_val}; }
+                else if s2_is_nan         { fpu_result = {32'hFFFFFFFF, s1_val}; }
+                else if s1_val == 32'h00000000 && s2_val == 32'h80000000 { fpu_result = {32'hFFFFFFFF, 32'h00000000}; }
+                else { fpu_result = if ({s1_val[31], ~s1_val[30:0]} >: {s2_val[31], ~s2_val[30:0]}) ? {32'hFFFFFFFF, s1_val} : {32'hFFFFFFFF, s2_val}; }
+            }
+            // FMIN/FMAX double
+            FpuOp::FMIN_D: {
+                if d1_is_nan && d2_is_nan { fpu_result = 64'h7FF8000000000000; }
+                else if d1_is_nan         { fpu_result = d2; }
+                else if d2_is_nan         { fpu_result = d1; }
+                else if d1 == 64'h8000000000000000 && d2 == 64'h0000000000000000 { fpu_result = 64'h8000000000000000; }
+                else { fpu_result = if ({d1[63], ~d1[62:0]} <: {d2[63], ~d2[62:0]}) ? d1 : d2; }
+            }
+            FpuOp::FMAX_D: {
+                if d1_is_nan && d2_is_nan { fpu_result = 64'h7FF8000000000000; }
+                else if d1_is_nan         { fpu_result = d2; }
+                else if d2_is_nan         { fpu_result = d1; }
+                else if d1 == 64'h0000000000000000 && d2 == 64'h8000000000000000 { fpu_result = 64'h0000000000000000; }
+                else { fpu_result = if ({d1[63], ~d1[62:0]} >: {d2[63], ~d2[62:0]}) ? d1 : d2; }
+            }
+
+            // FMV: bit-for-bit moves between integer and FP registers
+            FpuOp::FMV_X_W: fpu_result = {s1_val[31] repeat 32, s1_val}; // sign-extend 32→64
+            FpuOp::FMV_X_D: fpu_result = d1;
+            FpuOp::FMV_W_X: fpu_result = {32'hFFFFFFFF, fwd_rs1[31:0]}; // NaN-box
+            FpuOp::FMV_D_X: fpu_result = fwd_rs1;
+
+            // FCLASS: classify FP value into 10-bit mask
+            FpuOp::FCLASS_S: {
+                let s: logic     = s1_val[31];
+                let e: logic<8>  = s1_val[30:23];
+                let m: logic<23> = s1_val[22:0];
+                if e == 8'hFF && m != 23'd0 {
+                    fpu_result = if m[22] ? 64'd512 : 64'd256; // qNaN : sNaN
+                } else if e == 8'hFF { fpu_result = if s ? 64'd1 : 64'd128; } // -inf : +inf
+                else if e == 8'd0 && m == 23'd0 { fpu_result = if s ? 64'd8 : 64'd16; } // -0 : +0
+                else if e == 8'd0 { fpu_result = if s ? 64'd4 : 64'd32; } // -subnormal : +subnormal
+                else { fpu_result = if s ? 64'd2 : 64'd64; } // -normal : +normal
+            }
+            FpuOp::FCLASS_D: {
+                let sd: logic      = d1[63];
+                let ed: logic<11>  = d1[62:52];
+                let md: logic<52>  = d1[51:0];
+                if ed == 11'h7FF && md != 52'd0 {
+                    fpu_result = if md[51] ? 64'd512 : 64'd256;
+                } else if ed == 11'h7FF { fpu_result = if sd ? 64'd1 : 64'd128; }
+                else if ed == 11'd0 && md == 52'd0 { fpu_result = if sd ? 64'd8 : 64'd16; }
+                else if ed == 11'd0 { fpu_result = if sd ? 64'd4 : 64'd32; }
+                else { fpu_result = if sd ? 64'd2 : 64'd64; }
+            }
+
+            // FCMP: FEQ/FLT/FLE (result is 0 or 1 to integer rd)
+            FpuOp::FEQ_S: fpu_result = if s1_is_nan || s2_is_nan ? 64'd0
+                        : if s1_val == s2_val ? 64'd1
+                        : if s1_val == 32'h80000000 && s2_val == 32'h00000000 ? 64'd1
+                        : if s1_val == 32'h00000000 && s2_val == 32'h80000000 ? 64'd1
+                        : 64'd0;
+            FpuOp::FLT_S: fpu_result = if s1_is_nan || s2_is_nan ? 64'd0
+                        : if {s1_val[31], ~s1_val[30:0]} <: {s2_val[31], ~s2_val[30:0]} ? 64'd1 : 64'd0;
+            FpuOp::FLE_S: fpu_result = if s1_is_nan || s2_is_nan ? 64'd0
+                        : if s1_val == s2_val ? 64'd1
+                        : if s1_val == 32'h80000000 && s2_val == 32'h00000000 ? 64'd1
+                        : if s1_val == 32'h00000000 && s2_val == 32'h80000000 ? 64'd1
+                        : if {s1_val[31], ~s1_val[30:0]} <: {s2_val[31], ~s2_val[30:0]} ? 64'd1 : 64'd0;
+            FpuOp::FEQ_D: fpu_result = if d1_is_nan || d2_is_nan ? 64'd0
+                        : if d1 == d2 ? 64'd1
+                        : if d1 == 64'h8000000000000000 && d2 == 64'h0000000000000000 ? 64'd1
+                        : if d1 == 64'h0000000000000000 && d2 == 64'h8000000000000000 ? 64'd1
+                        : 64'd0;
+            FpuOp::FLT_D: fpu_result = if d1_is_nan || d2_is_nan ? 64'd0
+                        : if {d1[63], ~d1[62:0]} <: {d2[63], ~d2[62:0]} ? 64'd1 : 64'd0;
+            FpuOp::FLE_D: fpu_result = if d1_is_nan || d2_is_nan ? 64'd0
+                        : if d1 == d2 ? 64'd1
+                        : if d1 == 64'h8000000000000000 && d2 == 64'h0000000000000000 ? 64'd1
+                        : if d1 == 64'h0000000000000000 && d2 == 64'h8000000000000000 ? 64'd1
+                        : if {d1[63], ~d1[62:0]} <: {d2[63], ~d2[62:0]} ? 64'd1 : 64'd0;
+
+            // FCVT.S.D: double → single (truncate, NaN-box)
+            // Simplified: just truncate mantissa, no proper rounding yet
+            FpuOp::FCVT_D_S: {
+                // single → double: exact conversion, no rounding needed
+                let cs: logic     = s1_val[31];
+                let ce: logic<8>  = s1_val[30:23];
+                let cm: logic<23> = s1_val[22:0];
+                if ce == 8'hFF && cm != 23'd0 { fpu_result = 64'h7FF8000000000000; } // NaN
+                else if ce == 8'hFF { fpu_result = {cs, 11'h7FF, 52'd0}; } // Inf
+                else if ce == 8'd0 && cm == 23'd0 { fpu_result = {cs, 63'd0}; } // Zero
+                else {
+                    let de: logic<11> = {3'd0, ce} + 11'd896; // bias adjust: 1023-127=896
+                    fpu_result = {cs, de, cm, 29'd0};
+                }
+            }
+
+            default: fpu_result = 64'd0;
+        }
+    }
 
     // Branch comparator
     var branch_cmp: logic;
@@ -187,10 +339,17 @@ pub module execute (
         } else {
             o_valid     = i_valid;
             o_pc        = i_pc;
-            // AMO: address is rs1, CSR: read value, otherwise: ALU result
-            o_alu_out   = if i_is_amo ? fwd_rs1
-                        : if i_is_csr ? i_csr_rdata
-                        : alu_result;
+            // AMO: address is rs1, CSR: read value, FP arith: FPU result, otherwise: ALU result
+            // FP arithmetic instructions have is_fp=1 but no mem_ren/mem_wen (unlike FP load/store)
+            if i_is_fp && !i_mem_ren && !i_mem_wen {
+                o_alu_out = fpu_result;
+            } else if i_is_amo {
+                o_alu_out = fwd_rs1;
+            } else if i_is_csr {
+                o_alu_out = i_csr_rdata;
+            } else {
+                o_alu_out = alu_result;
+            }
             o_rs2_data  = fwd_rs2;
             o_rd_addr   = i_rd_addr;
             o_wb_sel    = i_wb_sel;
