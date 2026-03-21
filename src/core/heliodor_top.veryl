@@ -4,9 +4,10 @@ pub module heliodor_top #(
 ) (
     clk          : input  clock         ,
     rst          : input  reset         ,
-    // Instruction memory interface (read-only)
+    // Instruction memory interface (read-only, 32-bit for icache fill)
     o_imem_addr  : output logic<64>     ,
     i_imem_rdata : input  logic<32>     ,
+    o_imem_ren   : output logic         ,
     // Data memory interface
     o_dmem_addr  : output logic<64>     ,
     o_dmem_wdata : output logic<64>     ,
@@ -29,6 +30,8 @@ pub module heliodor_top #(
     // Hazard unit outputs
     var stall_if : logic;
     var stall_id : logic;
+    var stall_ex : logic;
+    var stall_mem: logic;
     var flush_id : logic;
     var flush_ex : logic;
 
@@ -129,6 +132,10 @@ pub module heliodor_top #(
     // MMU not yet active — stall always false in Bare mode
     var mmu_stall   : logic;
 
+    // Cache stall signals
+    var icache_stall: logic;
+    var dcache_stall: logic;
+
     // WB stage signals
     var wb_data: logic<64>;
     var wb_rd_addr: logic<5>;
@@ -148,8 +155,12 @@ pub module heliodor_top #(
         i_trap_taken  : trap_taken         ,
         i_mret_taken  : mret_taken         ,
         i_mmu_stall   : mmu_stall          ,
+        i_icache_stall: icache_stall      ,
+        i_dcache_stall: dcache_stall      ,
         o_stall_if    : stall_if           ,
         o_stall_id    : stall_id           ,
+        o_stall_ex    : stall_ex           ,
+        o_stall_mem   : stall_mem          ,
         o_flush_id    : flush_id           ,
         o_flush_ex    : flush_ex           ,
     );
@@ -174,19 +185,38 @@ pub module heliodor_top #(
     // Combinational: is the instruction in EX a JALR?
     let ex_is_jalr: logic = id_valid && id_is_jalr;
 
+    // I-Cache between fetch and external instruction memory (32-bit)
+    var icache_rdata: logic<32>;
+
+    inst u_icache: icache (
+        clk, rst,
+        i_addr     : if_pc          ,
+        i_ren      : 1'b1           ,
+        o_rdata    : icache_rdata   ,
+        o_stall    : icache_stall   ,
+        o_mem_addr : o_imem_addr    ,
+        i_mem_rdata: i_imem_rdata   ,
+        o_mem_ren  : o_imem_ren     ,
+    );
+
+    // Halfword selection for compressed instruction support
+    let curr_halfword: logic<16> = if if_pc[1] ? icache_rdata[31:16] : icache_rdata[15:0];
+
     // Compressed instruction detection and expansion
-    let is_compressed: logic = i_imem_rdata[1:0] != 2'b11;
+    let is_compressed: logic = curr_halfword[1:0] != 2'b11;
     var expanded_instr: logic<32>;
     var c_illegal     : logic;
 
     inst u_c_expander: c_expander (
-        i_cinstr  : i_imem_rdata[15:0],
+        i_cinstr  : curr_halfword     ,
         o_instr   : expanded_instr    ,
         o_illegal : c_illegal         ,
     );
 
     // Select expanded or original instruction
-    let if_instr: logic<32> = if is_compressed ? expanded_instr : i_imem_rdata;
+    let if_instr: logic<32> = if is_compressed ? expanded_instr : icache_rdata;
+
+    var fetch_imem_addr: logic<64>; // unused, icache drives o_imem_addr
 
     inst u_fetch: fetch (
         clk                              ,
@@ -202,7 +232,7 @@ pub module heliodor_top #(
         i_mret_target  : if sret_taken ? csr_sret_pc : csr_mret_pc,
         i_is_compressed: is_compressed   ,
         o_pc           : if_pc           ,
-        o_imem_addr                      ,
+        o_imem_addr    : fetch_imem_addr ,
     );
 
     // IF/ID pipeline register
@@ -317,6 +347,7 @@ pub module heliodor_top #(
         i_fwd_memwb  : wb_data             ,
         i_fwd_a      : fwd_a               ,
         i_fwd_b      : fwd_b               ,
+        i_stall      : stall_ex            ,
         i_flush      : flush_ex            ,
         o_valid      : ex_valid            ,
         o_pc         : ex_pc               ,
@@ -363,6 +394,7 @@ pub module heliodor_top #(
         i_mem_wen    : ex_mem_wen          ,
         i_mem_funct3 : ex_mem_funct3       ,
         i_amo_funct5 : ex_amo_funct5      ,
+        i_stall      : stall_mem          ,
         o_dmem_addr  : mem_dmem_addr       ,
         o_dmem_wdata : mem_dmem_wdata      ,
         i_dmem_rdata : mmu_rdata            ,
@@ -384,6 +416,13 @@ pub module heliodor_top #(
     // dmem is routed through dmem_mmu (passthrough in Bare mode, Sv39 PTW when enabled).
     var mmu_fault      : logic;
     var mmu_fault_store: logic;
+    var mmu_paddr      : logic<64>;
+    var mmu_wdata_out  : logic<64>;
+    var mmu_wen_out    : logic;
+    var mmu_ren_out    : logic;
+    var mmu_wstrb_out  : logic<8>;
+    var mmu_rdata_in   : logic<64>;
+
     inst u_dmmu: dmem_mmu (
         clk                                ,
         rst                                ,
@@ -393,18 +432,47 @@ pub module heliodor_top #(
         i_ren        : mem_dmem_ren        ,
         i_wstrb      : mem_dmem_wstrb      ,
         o_rdata      : mmu_rdata           ,
-        o_dmem_addr                        ,
-        o_dmem_wdata                       ,
-        i_dmem_rdata                       ,
-        o_dmem_wen                         ,
-        o_dmem_ren                         ,
-        o_dmem_wstrb                       ,
+        o_dmem_addr  : mmu_paddr           ,
+        o_dmem_wdata : mmu_wdata_out       ,
+        i_dmem_rdata : mmu_rdata_in        ,
+        o_dmem_wen   : mmu_wen_out         ,
+        o_dmem_ren   : mmu_ren_out         ,
+        o_dmem_wstrb : mmu_wstrb_out       ,
         i_satp       : csr_satp            ,
         i_priv       : csr_priv            ,
         o_busy       : mmu_stall           ,
         o_fault      : mmu_fault           ,
         o_fault_store: mmu_fault_store     ,
     );
+
+    // D-Cache (between MMU and external data memory)
+    // MMIO reads bypass dcache — CLINT read data declared here for forward use
+    var clint_rdata: logic<64>;
+    // MMIO region (0x02xxxxxx) bypasses cache
+    let is_mmio: logic = mmu_paddr[31:24] == 8'h02;
+    var dcache_rdata : logic<64>;
+    var dcache_stall_raw: logic;
+
+    inst u_dcache: dcache (
+        clk, rst,
+        i_addr      : mmu_paddr             ,
+        i_wdata     : mmu_wdata_out          ,
+        i_wen       : mmu_wen_out && !is_mmio,
+        i_ren       : mmu_ren_out && !is_mmio,
+        i_wstrb     : mmu_wstrb_out          ,
+        o_rdata     : dcache_rdata           ,
+        o_stall     : dcache_stall_raw       ,
+        o_mem_addr  : o_dmem_addr            ,
+        o_mem_wdata : o_dmem_wdata           ,
+        i_mem_rdata : i_dmem_rdata           ,
+        o_mem_wen   : o_dmem_wen             ,
+        o_mem_ren   : o_dmem_ren             ,
+        o_mem_wstrb : o_dmem_wstrb           ,
+    );
+
+    // MMIO reads bypass dcache and use CLINT read data
+    assign mmu_rdata_in  = if is_mmio ? clint_rdata : dcache_rdata;
+    assign dcache_stall  = dcache_stall_raw && !is_mmio;
 
     // ============================================================
     // CSR unit (operates in EX stage timing)
@@ -467,16 +535,16 @@ pub module heliodor_top #(
     // CLINT (Core Local Interruptor)
     // ============================================================
     // Address decode: CLINT region at 0x02000000
-    let clint_sel: logic = o_dmem_addr[31:24] == 8'h02;
-    var clint_rdata: logic<64>;
+    // Uses physical address from MMU (before cache)
+    let clint_sel: logic = mmu_paddr[31:24] == 8'h02;
 
     inst u_clint: clint (
         clk                              ,
         rst                              ,
-        i_addr      : o_dmem_addr[3:0]  ,
-        i_wdata     : o_dmem_wdata       ,
-        i_wen       : o_dmem_wen && clint_sel,
-        i_ren       : o_dmem_ren && clint_sel,
+        i_addr      : mmu_paddr[3:0]    ,
+        i_wdata     : mmu_wdata_out      ,
+        i_wen       : mmu_wen_out && clint_sel,
+        i_ren       : mmu_ren_out && clint_sel,
         o_rdata     : clint_rdata        ,
         o_timer_irq : timer_irq          ,
     );
