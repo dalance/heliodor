@@ -37,6 +37,8 @@ pub module csr (
     i_instret : input  logic    ,
     // mtime from CLINT (for TIME CSR)
     i_mtime   : input  logic<64>,
+    // ECALL: adjust cause based on pre-trap privilege level
+    i_is_ecall: input  logic    ,
     // SATP output for MMU
     o_satp    : output logic<64>,
     // CSR access violation (insufficient privilege)
@@ -121,14 +123,28 @@ pub module csr (
     // ============================================================
     // Trap delegation: determine target privilege level
     // ============================================================
-    let trap_is_interrupt: logic = i_trap_cause[63];
-    let trap_code: logic<6> = i_trap_cause[5:0];
+    // Trap cause and delegation: use always_comb with priv_lvl_q (1-cycle delayed copy)
+    // to avoid simulator eval order issue where priv_lvl is updated by always_ff
+    // before combinational logic reads it.
+    var priv_lvl_q: PrivLevel; // previous cycle's priv_lvl
+    var effective_cause: logic<64>;
+    always_comb {
+        if i_is_ecall {
+            if priv_lvl_q == PrivLevel::USER        { effective_cause = CAUSE_ECALL_U; }
+            else if priv_lvl_q == PrivLevel::SUPERVISOR { effective_cause = CAUSE_ECALL_S; }
+            else                                        { effective_cause = CAUSE_ECALL_M; }
+        } else {
+            effective_cause = i_trap_cause;
+        }
+    }
+    let trap_is_interrupt: logic = effective_cause[63];
+    let trap_code: logic<6> = effective_cause[5:0];
     // Use shift instead of dynamic bit select (simulator bug workaround)
     let deleg_to_s: logic = if trap_is_interrupt ?
         ((mideleg >> trap_code) & 64'd1) == 64'd1
     : ((medeleg >> trap_code) & 64'd1) == 64'd1;
-    // Delegate to S-mode only if current priv <= S
-    let trap_to_s: logic = deleg_to_s && (priv_lvl != PrivLevel::MACHINE);
+    // Delegate to S-mode only if current priv <= S (use priv_lvl_q)
+    let trap_to_s: logic = deleg_to_s && (priv_lvl_q != PrivLevel::MACHINE);
 
     // ============================================================
     // CSR read
@@ -236,6 +252,7 @@ pub module csr (
     // ============================================================
     always_ff (clk, rst) {
         if_reset {
+            priv_lvl_q = PrivLevel::MACHINE;
             mstatus  = 64'd0;
             // misa: RV64IMAC (MXL=2, A=1, C=1, I=1, M=1)
             misa     = {2'b10, 36'b0, 26'b00000000000001000100000101};
@@ -266,12 +283,16 @@ pub module csr (
                 minstret += 64'd1;
             }
 
-            // Trap entry
+            // Update priv_lvl_q: copy current priv_lvl BEFORE any updates
+            priv_lvl_q = priv_lvl;
+
+            // Trap entry (uses trap_to_s from combinational logic,
+            // which reads priv_lvl_q — guaranteed to be the stable value)
             if i_trap {
                 if trap_to_s {
                     // Delegate to S-mode
                     sepc   = i_trap_pc;
-                    scause = i_trap_cause;
+                    scause = effective_cause;
                     stval  = i_trap_val;
                     // Save SIE to SPIE, clear SIE, save priv to SPP
                     mstatus[5] = mstatus_sie;
@@ -281,7 +302,7 @@ pub module csr (
                 } else {
                     // Handle in M-mode
                     mepc   = i_trap_pc;
-                    mcause = i_trap_cause;
+                    mcause = effective_cause;
                     mtval  = i_trap_val;
                     // Save MIE to MPIE, clear MIE, save priv to MPP
                     mstatus[7] = mstatus_mie;
@@ -294,7 +315,9 @@ pub module csr (
             else if i_mret {
                 mstatus[3]     = mstatus_mpie;
                 mstatus[7]     = 1'b1;
-                priv_lvl       = mstatus_mpp[1:0] as PrivLevel;
+                if mstatus_mpp == 2'b01 { priv_lvl = PrivLevel::SUPERVISOR; }
+                else if mstatus_mpp == 2'b00 { priv_lvl = PrivLevel::USER; }
+                else { priv_lvl = PrivLevel::MACHINE; }
                 mstatus[12:11] = 2'b00;
             }
             // SRET
