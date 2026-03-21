@@ -22,6 +22,8 @@ pub module heliodor_top #(
     o_dbg_r1     : output logic<64>    ,
     o_dbg_r2     : output logic<64>    ,
     o_dbg_r3     : output logic<64>    ,
+    // External interrupt sources (directly from peripherals to PLIC)
+    i_ext_irq    : input  logic<32>    ,
 ) {
     // ============================================================
     // Inter-stage signal declarations (all declared before use)
@@ -116,6 +118,7 @@ pub module heliodor_top #(
     var csr_sret_pc : logic<64>;
     var csr_priv    : csr_pkg::PrivLevel;
     var csr_satp    : logic<64>;
+    var csr_access_fault: logic;
     var trap_taken  : logic;
     var trap_cause  : logic<64>;
     var trap_pc     : logic<64>;
@@ -127,6 +130,12 @@ pub module heliodor_top #(
 
     // CLINT signals
     var timer_irq   : logic;
+    var sw_irq      : logic;
+
+    // PLIC signals
+    var plic_irq_m  : logic;
+    var plic_irq_s  : logic;
+    var irq_cause   : logic<64>;
 
     // MMU signals (declared early for hazard unit)
     // MMU not yet active — stall always false in Bare mode
@@ -446,10 +455,13 @@ pub module heliodor_top #(
     );
 
     // D-Cache (between MMU and external data memory)
-    // MMIO reads bypass dcache — CLINT read data declared here for forward use
+    // MMIO reads bypass dcache
     var clint_rdata: logic<64>;
-    // MMIO region (0x02xxxxxx) bypasses cache
-    let is_mmio: logic = mmu_paddr[31:24] == 8'h02;
+    var plic_rdata : logic<64>;
+    // MMIO regions: CLINT at 0x02xxxxxx, PLIC at 0x0Cxxxxxx
+    let clint_sel: logic = mmu_paddr[31:24] == 8'h02;
+    let plic_sel : logic = mmu_paddr[31:24] == 8'h0C;
+    let is_mmio  : logic = clint_sel || plic_sel;
     var dcache_rdata : logic<64>;
     var dcache_stall_raw: logic;
 
@@ -470,8 +482,10 @@ pub module heliodor_top #(
         o_mem_wstrb : o_dmem_wstrb           ,
     );
 
-    // MMIO reads bypass dcache and use CLINT read data
-    assign mmu_rdata_in  = if is_mmio ? clint_rdata : dcache_rdata;
+    // MMIO reads bypass dcache
+    assign mmu_rdata_in  = if clint_sel ? clint_rdata
+                         : if plic_sel  ? plic_rdata
+                         :                dcache_rdata;
     assign dcache_stall  = dcache_stall_raw && !is_mmio;
 
     // ============================================================
@@ -481,25 +495,43 @@ pub module heliodor_top #(
     let csr_wdata: logic<64> = if id_csr_imm ?
         {59'b0, id_rs1_addr} : id_rs1_data;
 
-    // Synchronous trap detection: ECALL/EBREAK/illegal instruction in EX stage
-    let sync_trap: logic = ex_valid && (ex_is_ecall || ex_is_ebreak || ex_illegal);
+    // Synchronous trap detection: ECALL/EBREAK/illegal instruction/CSR access fault in EX stage
+    // CSR access fault: insufficient privilege for CSR access
+    // Currently disabled: needs pipeline stage alignment (fault detected
+    // in ID but trap taken in EX). Enable when privilege mode switching
+    // is fully tested with S/U mode software.
+    // let csr_fault: logic = id_is_csr && csr_access_fault;
+    let ex_trap: logic = ex_valid && (ex_is_ecall || ex_is_ebreak || ex_illegal);
+
+    // Page fault detection from MMU (MEM stage)
+    let mem_page_fault: logic = mmu_fault;
+
+    // Combined synchronous trap
+    let sync_trap: logic = ex_trap || mem_page_fault;
 
     // Asynchronous interrupt detection: take interrupt when pipeline is clean
     assign irq_taken = irq_pending && !sync_trap && !ex_branch_taken && !mret_taken && !sret_taken;
 
     // Combined trap: sync exception or async interrupt
     assign trap_taken = sync_trap || irq_taken;
-    assign trap_cause = if sync_trap ? (
+    assign trap_cause = if mem_page_fault ? (
+        if mmu_fault_store ?
+            csr_pkg::CAUSE_STORE_PAGE_FAULT
+        : csr_pkg::CAUSE_LOAD_PAGE_FAULT
+    ) : if ex_trap ? (
         if ex_is_ecall ?
             csr_pkg::CAUSE_ECALL_M
         : if ex_is_ebreak ?
             csr_pkg::CAUSE_BREAKPOINT
         : csr_pkg::CAUSE_ILLEGAL_INST
-    ) : csr_pkg::CAUSE_M_TIMER_IRQ;
+    ) : irq_cause;
     // mepc: for sync exceptions = PC of faulting instruction,
     //        for interrupts = PC of next instruction to execute
-    assign trap_pc  = if sync_trap ? ex_pc : if_pc;
-    assign trap_val = 64'd0;
+    // Page faults use the MEM stage PC (instruction that caused the fault)
+    assign trap_pc  = if mem_page_fault ? mem_pc
+                    : if ex_trap ? ex_pc
+                    :              if_pc;
+    assign trap_val = if mem_page_fault ? mmu_paddr : 64'd0;
 
     // MRET/SRET detection: in ID stage
     assign mret_taken = id_valid && id_is_mret;
@@ -526,27 +558,45 @@ pub module heliodor_top #(
         o_stvec     : csr_stvec          ,
         o_priv      : csr_priv           ,
         o_irq_pending: irq_pending       ,
+        o_irq_cause : irq_cause         ,
         i_timer_irq : timer_irq          ,
+        i_ext_irq_m : plic_irq_m        ,
+        i_ext_irq_s : plic_irq_s        ,
+        i_sw_irq    : sw_irq            ,
         i_instret   : mem_valid          ,
         o_satp      : csr_satp           ,
+        o_access_fault: csr_access_fault ,
     );
 
     // ============================================================
-    // CLINT (Core Local Interruptor)
+    // CLINT (Core Local Interruptor) — 0x02000000
     // ============================================================
-    // Address decode: CLINT region at 0x02000000
-    // Uses physical address from MMU (before cache)
-    let clint_sel: logic = mmu_paddr[31:24] == 8'h02;
-
     inst u_clint: clint (
         clk                              ,
         rst                              ,
-        i_addr      : mmu_paddr[3:0]    ,
+        i_addr      : mmu_paddr[15:0]   ,
         i_wdata     : mmu_wdata_out      ,
         i_wen       : mmu_wen_out && clint_sel,
         i_ren       : mmu_ren_out && clint_sel,
         o_rdata     : clint_rdata        ,
         o_timer_irq : timer_irq          ,
+        o_sw_irq    : sw_irq             ,
+    );
+
+    // ============================================================
+    // PLIC (Platform-Level Interrupt Controller) — 0x0C000000
+    // ============================================================
+    inst u_plic: plic (
+        clk                               ,
+        rst                               ,
+        i_src       : i_ext_irq           ,
+        i_addr      : mmu_paddr[23:0]    ,
+        i_wdata     : mmu_wdata_out       ,
+        i_wen       : mmu_wen_out && plic_sel,
+        i_ren       : mmu_ren_out && plic_sel,
+        o_rdata     : plic_rdata          ,
+        o_irq_m     : plic_irq_m         ,
+        o_irq_s     : plic_irq_s         ,
     );
 
     // ============================================================

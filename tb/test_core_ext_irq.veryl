@@ -1,0 +1,278 @@
+// Integration test for external interrupt via PLIC:
+// Configure PLIC source 1 (M-mode), trigger interrupt, handle, MRET.
+module test_core_ext_irq_harness (
+    clk    : input  clock    ,
+    rst    : input  reset    ,
+    o_pass : output logic     ,
+    o_r1   : output logic<64>,
+    o_r2   : output logic<64>,
+    o_r3   : output logic<64>,
+) {
+    var imem_addr : logic<64>;
+    var imem_rdata: logic<32>;
+    var imem_ren  : logic;
+    var dmem_addr : logic<64>;
+    var dmem_wdata: logic<64>;
+    var dmem_rdata: logic<64>;
+    var dmem_wen  : logic;
+    var dmem_ren  : logic;
+    var dmem_wstrb: logic<8>;
+    var dbg_regs  : logic<64> [32];
+    var dbg_pc    : logic<64>;
+    var dbg_pass  : logic;
+    var dbg_r1    : logic<64>;
+    var dbg_r2    : logic<64>;
+    var dbg_r3    : logic<64>;
+
+    // External interrupt source: assert source 1 after some cycles
+    var ext_irq: logic<32>;
+    var cycle_cnt: logic<16>;
+    always_ff (clk, rst) {
+        if_reset {
+            ext_irq   = 32'd0;
+            cycle_cnt = 16'd0;
+        } else {
+            cycle_cnt = cycle_cnt + 16'd1;
+            // Assert source 1 after 400 cycles (after PLIC setup completes)
+            if cycle_cnt == 16'd400 {
+                ext_irq[1] = 1'b1;
+            }
+            // De-assert after 1 cycle (edge-triggered via gateway)
+            if cycle_cnt == 16'd401 {
+                ext_irq[1] = 1'b0;
+            }
+        }
+    }
+
+    inst dut: heliodor_top (
+        clk                          ,
+        rst                          ,
+        o_imem_addr  : imem_addr     ,
+        i_imem_rdata : imem_rdata    ,
+        o_imem_ren   : imem_ren      ,
+        o_dmem_addr  : dmem_addr     ,
+        o_dmem_wdata : dmem_wdata    ,
+        i_dmem_rdata : dmem_rdata    ,
+        o_dmem_wen   : dmem_wen      ,
+        o_dmem_ren   : dmem_ren      ,
+        o_dmem_wstrb : dmem_wstrb    ,
+        o_dbg_regs   : dbg_regs      ,
+        o_dbg_pc     : dbg_pc        ,
+        o_dbg_pass   : dbg_pass      ,
+        o_dbg_r1     : dbg_r1        ,
+        o_dbg_r2     : dbg_r2        ,
+        o_dbg_r3     : dbg_r3        ,
+        i_ext_irq    : ext_irq       ,
+    );
+
+    assign dmem_rdata = 64'd0;
+
+    // Program:
+    // --- Setup (0x00-0x6C): Configure PLIC and enable M-mode external interrupt ---
+    //   0x00: LUI   x1, 0x0C000       # x1 = 0x0C000000 (PLIC base)
+    //   0x04-0x0C: NOP
+    //   0x10: ADDI  x2, x0, 7         # x2 = 7 (max priority)
+    //   0x14-0x1C: NOP
+    //   0x20: SW    x2, 4(x1)         # PLIC priority[1] = 7 (offset 0x04 = source 1)
+    //   0x24-0x2C: NOP
+    //   0x30: ADDI  x3, x0, 2         # x3 = 2 (bit 1 = source 1)
+    //   0x34-0x3C: NOP
+    //   0x40: SW    x3, 0(x1)         # PLIC enable_m (offset 0x002000)
+    //     -- need to use a different address for enable --
+    //     Actually: enable_m is at base+0x002000. We need a second LUI.
+    //
+    // Revised approach: use two base addresses.
+    //   x1 = 0x0C000000 (priority region)
+    //   x5 = 0x0C002000 (enable M-mode region)
+    //   x6 = 0x0C200000 (threshold/claim M-mode region)
+    //
+    //   0x00: LUI   x1, 0x0C000       # x1 = 0x0C000000
+    //   0x04-0x0C: NOP
+    //   0x10: ADDI  x2, x0, 7         # x2 = 7 (priority)
+    //   0x14-0x1C: NOP
+    //   0x20: SW    x2, 4(x1)         # priority[1] = 7
+    //   0x24-0x2C: NOP
+    //   0x30: LUI   x5, 0x0C002       # x5 = 0x0C002000
+    //   0x34-0x3C: NOP
+    //   0x40: ADDI  x3, x0, 2         # x3 = 2 (enable bit 1)
+    //   0x44-0x4C: NOP
+    //   0x50: SW    x3, 0(x5)         # enable_m[1] = 1
+    //   0x54-0x5C: NOP
+    //   0x60: ADDI  x4, x0, 0x80      # mtvec = 0x80
+    //   0x64-0x6C: NOP
+    //   0x70: CSRRW x0, mtvec, x4     # mtvec = 0x80
+    //   0x74-0x7C: NOP
+    //
+    // --- Enable MIE.MEIE and mstatus.MIE ---
+    //   0x80: LUI   x7, 0x00001       # x7 = 0x1000... wait, need 0x800 = bit 11
+    //     ADDI x7, x0, 0x800 won't work (12-bit signed imm max = 2047)
+    //     Use: LUI x7, 1 → x7=0x1000, then ADDI x7, x7, -0x800 → x7=0x800
+    //     Or: ADDI x7, x0, 0x080 then SLLI x7, x7, 4 → too complex
+    //     Simpler: use CSRRSI with immediate for bit 11 — but immediate is only 5 bits
+    //     Best: LUI x7, 1 → 0x1000, SRLI x7, x7, 1 → 0x800
+    //   0x80: LUI   x7, 1             # x7 = 0x1000
+    //   0x84-0x8C: NOP
+    //   0x90: SRLI  x7, x7, 1         # x7 = 0x800 (bit 11)
+    //   0x94-0x9C: NOP
+    //   0xA0: CSRRW x0, mie, x7       # mie = 0x800 (MEIE only)
+    //   0xA4-0xAC: NOP
+    //   0xB0: CSRRSI x0, mstatus, 8   # mstatus.MIE = 1
+    //   0xB4: ADDI  x10, x0, 1        # x10 = 1 (before interrupt)
+    //   0xB8-0xBC: NOP (wait for interrupt)
+    //
+    // --- Trap handler at 0x100 ---
+    // Actually let's put mtvec at 0x100 for cleaner layout.
+    // Revise: mtvec = 0x100
+    //   0x100: ADDI x11, x0, 2        # x11 = 2 (in handler)
+    //   0x104-0x10C: NOP
+    //   0x110: LUI  x20, 0x0C200      # x20 = 0x0C200000 (claim register region)
+    //   0x114-0x11C: NOP
+    //   0x120: LW   x21, 4(x20)       # x21 = claim (reads & claims source; offset 0x04)
+    //   0x124-0x12C: NOP
+    //   0x130: SW   x21, 4(x20)       # complete (write back claimed ID)
+    //   0x134-0x13C: NOP
+    //   0x140: MRET
+    //
+    // After MRET: x10=1 (before irq), x11=2 (in handler), x12 set to 3 below
+    //   Return to ~0xB8 area. Put x12=3 after the NOP loop.
+    //   We'll check x10==1 && x11==2 to pass.
+
+    // Encodings:
+    //   LUI x1, 0x0C000:   imm[31:12]=0x0C000, rd=1  → 0x0C000_0B7
+    //   ADDI x2, x0, 7:    imm=7, rs1=0, rd=2        → 0x007_00_113
+    //   SW x2, 4(x1):      imm=4, rs2=2, rs1=1, f3=010 → 0x002_0A_223
+    //   LUI x5, 0x0C002:   0x0C002_2B7
+    //   ADDI x3, x0, 2:    0x002_00_193
+    //   SW x3, 0(x5):      imm=0, rs2=3, rs1=5, f3=010 → 0x003_2A_023
+    //   ADDI x4, x0, 0x100: imm=256, rs1=0, rd=4     → 0x100_00_213
+    //   CSRRW x0, mtvec, x4: 0x305_21_073
+    //   LUI x7, 1:         0x00001_3B7
+    //   SRLI x7, x7, 1:    funct7=0, shamt=1, rs1=7, f3=101, rd=7 → 0x001_3D_393
+    //   CSRRW x0, mie, x7: 0x304_39_073
+    //   CSRRSI x0, mstatus, 8: 0x300_46_073
+    //   ADDI x10, x0, 1:   0x001_00_513
+    //   ADDI x11, x0, 2:   0x002_00_593
+    //   LUI x20, 0x0C200:  0x0C200_A37
+    //   LW x21, 4(x20):    imm=4, rs1=20, f3=010, rd=21 → 0x004_A2_A83
+    //   SW x21, 4(x20):    imm=4, rs2=21, rs1=20, f3=010 → 0x015_A2_223
+    //   MRET:               0x302_00_073
+
+    always_comb {
+        case imem_addr[8:0] {
+            // PLIC priority setup
+            9'h000: imem_rdata = 32'h0C0000B7; // LUI x1, 0x0C000
+            9'h004: imem_rdata = 32'h00000013; // NOP
+            9'h008: imem_rdata = 32'h00000013;
+            9'h00C: imem_rdata = 32'h00000013;
+            9'h010: imem_rdata = 32'h00700113; // ADDI x2, x0, 7
+            9'h014: imem_rdata = 32'h00000013;
+            9'h018: imem_rdata = 32'h00000013;
+            9'h01C: imem_rdata = 32'h00000013;
+            9'h020: imem_rdata = 32'h0020A223; // SW x2, 4(x1) → priority[1] = 7
+            9'h024: imem_rdata = 32'h00000013;
+            9'h028: imem_rdata = 32'h00000013;
+            9'h02C: imem_rdata = 32'h00000013;
+
+            // PLIC enable_m setup
+            9'h030: imem_rdata = 32'h0C0022B7; // LUI x5, 0x0C002
+            9'h034: imem_rdata = 32'h00000013;
+            9'h038: imem_rdata = 32'h00000013;
+            9'h03C: imem_rdata = 32'h00000013;
+            9'h040: imem_rdata = 32'h00200193; // ADDI x3, x0, 2
+            9'h044: imem_rdata = 32'h00000013;
+            9'h048: imem_rdata = 32'h00000013;
+            9'h04C: imem_rdata = 32'h00000013;
+            9'h050: imem_rdata = 32'h0032A023; // SW x3, 0(x5) → enable_m = 0x02
+            9'h054: imem_rdata = 32'h00000013;
+            9'h058: imem_rdata = 32'h00000013;
+            9'h05C: imem_rdata = 32'h00000013;
+
+            // Set mtvec = 0x100
+            9'h060: imem_rdata = 32'h10000213; // ADDI x4, x0, 0x100
+            9'h064: imem_rdata = 32'h00000013;
+            9'h068: imem_rdata = 32'h00000013;
+            9'h06C: imem_rdata = 32'h00000013;
+            9'h070: imem_rdata = 32'h30521073; // CSRRW x0, mtvec, x4
+            9'h074: imem_rdata = 32'h00000013;
+            9'h078: imem_rdata = 32'h00000013;
+            9'h07C: imem_rdata = 32'h00000013;
+
+            // Set mie = 0x800 (MEIE, bit 11)
+            9'h080: imem_rdata = 32'h000013B7; // LUI x7, 1 → 0x1000
+            9'h084: imem_rdata = 32'h00000013;
+            9'h088: imem_rdata = 32'h00000013;
+            9'h08C: imem_rdata = 32'h00000013;
+            9'h090: imem_rdata = 32'h0013D393; // SRLI x7, x7, 1 → 0x800
+            9'h094: imem_rdata = 32'h00000013;
+            9'h098: imem_rdata = 32'h00000013;
+            9'h09C: imem_rdata = 32'h00000013;
+            9'h0A0: imem_rdata = 32'h30439073; // CSRRW x0, mie, x7
+            9'h0A4: imem_rdata = 32'h00000013;
+            9'h0A8: imem_rdata = 32'h00000013;
+            9'h0AC: imem_rdata = 32'h00000013;
+
+            // Enable mstatus.MIE and set marker
+            9'h0B0: imem_rdata = 32'h30046073; // CSRRSI x0, mstatus, 8
+            9'h0B4: imem_rdata = 32'h00100513; // ADDI x10, x0, 1 (marker: before irq)
+            9'h0B8: imem_rdata = 32'h00000013; // NOP (wait for interrupt)
+            9'h0BC: imem_rdata = 32'h00000013;
+
+            // --- Trap handler at 0x100 ---
+            9'h100: imem_rdata = 32'h00200593; // ADDI x11, x0, 2 (marker: in handler)
+            9'h104: imem_rdata = 32'h00000013;
+            9'h108: imem_rdata = 32'h00000013;
+            9'h10C: imem_rdata = 32'h00000013;
+            9'h110: imem_rdata = 32'h0C200A37; // LUI x20, 0x0C200
+            9'h114: imem_rdata = 32'h00000013;
+            9'h118: imem_rdata = 32'h00000013;
+            9'h11C: imem_rdata = 32'h00000013;
+            9'h120: imem_rdata = 32'h004A2A83; // LW x21, 4(x20) → claim
+            9'h124: imem_rdata = 32'h00000013;
+            9'h128: imem_rdata = 32'h00000013;
+            9'h12C: imem_rdata = 32'h00000013;
+            9'h130: imem_rdata = 32'h015A2223; // SW x21, 4(x20) → complete
+            9'h134: imem_rdata = 32'h00000013;
+            9'h138: imem_rdata = 32'h00000013;
+            9'h13C: imem_rdata = 32'h00000013;
+            9'h140: imem_rdata = 32'h30200073; // MRET
+
+            default: imem_rdata = 32'h00000013; // NOP
+        }
+    }
+
+    assign o_r1 = dbg_r1;
+    assign o_r2 = dbg_r2;
+    assign o_r3 = dbg_r3;
+    // Pass: x10 = 1 (before interrupt), x11 = 2 (in handler)
+    assign o_pass = dbg_regs[10] == 64'd1
+                 && dbg_regs[11] == 64'd2;
+}
+
+#[test(test_core_ext_irq)]
+module test_core_ext_irq {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen;
+
+    var pass: logic;
+    var r1  : logic<64>;
+    var r2  : logic<64>;
+    var r3  : logic<64>;
+
+    inst harness: test_core_ext_irq_harness (
+        clk    : clk  ,
+        rst    : rst  ,
+        o_pass : pass ,
+        o_r1   : r1   ,
+        o_r2   : r2   ,
+        o_r3   : r3   ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(1000);
+        $display(r1, r2, r3, pass);
+        $assert(pass, "External interrupt test failed");
+        $display("External interrupt test passed");
+        $finish();
+    }
+}
