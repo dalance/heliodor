@@ -53,8 +53,9 @@ heliodor/
 - **Comments & documentation**: English
 - **Testing**: Veryl native testbench — always run **both** JIT on and off to catch simulator bugs early:
   ```bash
-  veryl test                # JIT on (default)
-  veryl test --disable-jit  # JIT off
+  veryl test                          # JIT on (default), all tests
+  veryl test --disable-jit            # JIT off, all tests
+  veryl test --test test_dcache_lbu   # run specific test only (faster for debugging)
   ```
 - **Formatting**: `veryl fmt`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
