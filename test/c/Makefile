@@ -6,33 +6,37 @@ CFLAGS = -march=rv64im -mabi=lp64 -Os -nostdlib -nostartfiles -ffreestanding -fn
 LDFLAGS = -T bare.ld -nostdlib
 
 HEX_DIR = ../hex
+ELF2HEX = python3 bin2hex.py
 
-all: $(HEX_DIR)/hello_c.hex
+all: $(HEX_DIR)/hello_c.hex $(HEX_DIR)/hello_str.hex
 
-# Convert ELF → flat binary → simple hex (one word per line, no @address)
 $(HEX_DIR)/hello_c.hex: hello.elf
 	$(OBJCOPY) -O binary $< hello.bin
-	python3 -c "\
-import struct; \
-data = bytearray(open('hello.bin','rb').read()); \
-data += b'\x00' * (4 - len(data) % 4) if len(data) % 4 else b''; \
-lines = ['%08X' % struct.unpack('<I', data[i:i+4])[0] for i in range(0,len(data),4)]; \
-open('$@','w').write('\n'.join(lines)+'\n'); \
-print('%d words (%d bytes)' % (len(lines), len(data)))"
+	$(ELF2HEX) hello.bin $@
+
+$(HEX_DIR)/hello_str.hex: hello_str.elf
+	$(OBJCOPY) -O binary $< hello_str.bin
+	$(ELF2HEX) hello_str.bin $@
 
 hello.elf: start.o hello.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+hello_str.elf: start.o hello_str.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 start.o: start.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-hello.o: hello.c
+%.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 dump: hello.elf
 	$(OBJDUMP) -d $<
 
-clean:
-	rm -f *.o *.elf *.bin $(HEX_DIR)/hello_c.hex
+dump-str: hello_str.elf
+	$(OBJDUMP) -d -s $<
 
-.PHONY: all dump clean
+clean:
+	rm -f *.o *.elf *.bin $(HEX_DIR)/hello_c.hex $(HEX_DIR)/hello_str.hex
+
+.PHONY: all dump dump-str clean
