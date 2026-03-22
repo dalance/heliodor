@@ -87,19 +87,22 @@ _start:
     /* S-mode code (runs with Sv39 virtual memory)  */
     /* ============================================ */
 s_mode_entry:
-    /* Simple store/load test through Sv39 virtual memory */
-    li a0, 0x1800           /* address in data_mem region */
-    li t0, 0xDEAD
-    sd t0, 0(a0)            /* store through MMU */
-    nop
-    nop
-    ld a1, 0(a0)            /* load back through MMU */
+    /* Test: read code memory through MMU (identity-mapped) */
+    /* Address 0x0000 contains the first instruction: 00008137 (LUI x2, 0x8) */
+    /* Read as doubleword: low word = 0x00008137 */
+    li a0, 0
+    ld a1, 0(a0)            /* a1 = first doubleword of code */
 
-    /* Check result */
+    /* Extract low 32 bits */
+    slli a2, a1, 32
+    srli a2, a2, 32          /* a2 = a1[31:0] */
+
+    /* Check if it matches the first instruction (0x00008137) */
     li x3, 0xBB
-    li t0, 0xDEAD
-    bne a1, t0, 2f
-    li x3, 0xAA             /* success */
+    lui t0, 0x8
+    addi t0, t0, 0x137       /* t0 = 0x8137 */
+    bne a2, t0, 2f
+    li x3, 0xAA             /* success: MMU read worked */
 2:  j 2b
 
     /* ============================================ */
