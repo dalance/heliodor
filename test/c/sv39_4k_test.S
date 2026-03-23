@@ -190,9 +190,7 @@ s_mode_entry:
     li x3, 0xBB               /* fail marker (overwritten on success) */
 
     /* Test 1: Store/load doubleword to VA 0x3800 (→ PA 0x3800) */
-    /* NOPs work around simulator comb evaluation ordering issue:
-     * branch_taken evaluates before mmu_stall propagates in the
-     * full_comb_statements DAG sort. Real RTL is correct. */
+    /* NOPs work around simulator comb evaluation ordering issue */
     li t0, 0x3800
     li t1, 0x12345678
     sd t1, 0(t0)
