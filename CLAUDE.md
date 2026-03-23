@@ -8,13 +8,14 @@ The ultimate goal is a Linux-capable RV64GC core.
 Use the Veryl compiler from the `veryl/` submodule — do **not** use a system-installed version.
 
 ```bash
-cd veryl && cargo build          # debug build (default for development)
-cd veryl && cargo build --release # release build (benchmarks only)
+cd veryl && cargo build                          # debug build
+cd veryl && cargo build --profile release-verylup # fast release build (no LTO, parallel codegen)
+cd veryl && cargo build --release                 # full release build (slow, max optimization)
 ```
 
-- **Release build**: `veryl/target/release/veryl` — use for heliodor development and testing (faster simulation).
+- **Fast release build**: `veryl/target/release-verylup/veryl` — use for heliodor development and testing. Much faster to compile than `--release` (no LTO, 256 codegen units) while still being optimized.
 - **Debug build**: `veryl/target/debug/veryl` — use only when debugging the Veryl compiler/simulator itself.
-- When modifying the simulator, use debug builds first to catch compilation errors quickly, then switch to release for verification.
+- When modifying the simulator, use debug builds first to catch compilation errors quickly, then switch to `--profile release-verylup` for verification.
 
 Key commands:
 
