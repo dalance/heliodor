@@ -190,21 +190,28 @@ s_mode_entry:
     li x3, 0xBB               /* fail marker (overwritten on success) */
 
     /* Test 1: Store/load doubleword to VA 0x3800 (→ PA 0x3800) */
+    /* NOPs between sd/ld/bne work around simulator comb ordering issue */
+    /* where branch_taken evaluates before mmu_stall propagates */
     li t0, 0x3800
     li t1, 0x12345678
     sd t1, 0(t0)
+    nop; nop; nop
     ld t2, 0(t0)
+    nop; nop; nop
     bne t1, t2, fail
 
     /* Test 2: Store/load another value */
     li t1, 0xABCD
     sd t1, 8(t0)
+    nop; nop; nop
     ld t2, 8(t0)
+    nop; nop; nop
     bne t1, t2, fail
 
     /* Test 3: Read code through MMU (VA 0x0000 → PA 0x0000) */
     li t0, 0
-    ld a1, 0(t0)              /* first doubleword of code */
+    ld a1, 0(t0)
+    nop; nop; nop
     /* Low 32 bits should be 0x00008137 (LUI sp, 0x8) */
     slli a2, a1, 32
     srli a2, a2, 32
