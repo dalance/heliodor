@@ -1,6 +1,7 @@
 // Sv39 MMU: Virtual-to-Physical address translation
 // Performs 3-level page table walk using data memory interface.
-// Stalls the pipeline during page table walk.
+// Includes a 16-entry fully-associative TLB for fast translation.
+// Stalls the pipeline during page table walk on TLB miss.
 pub module mmu (
     clk            : input  clock    ,
     rst            : input  reset    ,
@@ -23,6 +24,8 @@ pub module mmu (
     i_ptw_valid    : input  logic    ,
     // Downstream stall: keep DONE state active while dcache is filling
     i_stall        : input  logic    ,
+    // TLB flush (SFENCE.VMA)
+    i_sfence       : input  logic    ,
 ) {
     import csr_pkg::*;
 
@@ -36,9 +39,79 @@ pub module mmu (
     let vpn0: logic<9> = i_vaddr[20:12];
     let page_off: logic<12> = i_vaddr[11:0];
 
+    // VPN for TLB tag (27 bits = VPN[2] || VPN[1] || VPN[0])
+    let vpn_full: logic<27> = i_vaddr[38:12];
+
     // Translation enabled: Sv39 mode and not in M-mode
     let vm_enabled: logic = satp_mode == SATP_MODE_SV39
                          && i_priv != PrivLevel::MACHINE;
+
+    // ============================================================
+    // TLB: 16-entry fully-associative
+    // ============================================================
+    var tlb_valid : logic    [16];
+    var tlb_vpn   : logic<27>[16];
+    var tlb_ppn   : logic<44>[16];
+    var tlb_perm_r: logic    [16];
+    var tlb_perm_w: logic    [16];
+    var tlb_perm_x: logic    [16];
+    var tlb_level : logic<2> [16]; // leaf level (0/1/2)
+
+    // TLB lookup (combinational)
+    var tlb_hit    : logic;
+    var tlb_hit_idx: logic<4>;
+    var tlb_hit_ppn: logic<44>;
+    var tlb_hit_r  : logic;
+    var tlb_hit_w  : logic;
+    var tlb_hit_x  : logic;
+    var tlb_hit_lvl: logic<2>;
+
+    always_comb {
+        tlb_hit     = 1'b0;
+        tlb_hit_idx = 4'd0;
+        tlb_hit_ppn = 44'd0;
+        tlb_hit_r   = 1'b0;
+        tlb_hit_w   = 1'b0;
+        tlb_hit_x   = 1'b0;
+        tlb_hit_lvl = 2'd0;
+
+        for i: u32 in 0..16 {
+            // Match based on page level:
+            // Level 2 (1GB): match VPN[2] only (bits 26:18)
+            // Level 1 (2MB): match VPN[2:1] (bits 26:9)
+            // Level 0 (4KB): match all VPN[2:0] (bits 26:0)
+            let match_ok: logic = tlb_valid[i] && (
+                   (tlb_level[i] == 2'd2 && tlb_vpn[i][26:18] == vpn_full[26:18])
+                || (tlb_level[i] == 2'd1 && tlb_vpn[i][26:9]  == vpn_full[26:9])
+                || (tlb_level[i] == 2'd0 && tlb_vpn[i]         == vpn_full)
+            );
+            if match_ok {
+                tlb_hit     = 1'b1;
+                tlb_hit_idx = i[3:0];
+                tlb_hit_ppn = tlb_ppn[i];
+                tlb_hit_r   = tlb_perm_r[i];
+                tlb_hit_w   = tlb_perm_w[i];
+                tlb_hit_x   = tlb_perm_x[i];
+                tlb_hit_lvl = tlb_level[i];
+            }
+        }
+    }
+
+    // TLB hit physical address construction
+    var tlb_pa: logic<64>;
+    always_comb {
+        case tlb_hit_lvl {
+            2'd2: tlb_pa = {8'b0, tlb_hit_ppn[43:18], i_vaddr[29:0]};
+            2'd1: tlb_pa = {8'b0, tlb_hit_ppn[43:9], i_vaddr[20:0]};
+            default: tlb_pa = {8'b0, tlb_hit_ppn, page_off};
+        }
+    }
+
+    // TLB hit permission check
+    let tlb_perm_ok: logic = if i_store ? tlb_hit_w : (tlb_hit_r || tlb_hit_x);
+
+    // Round-robin replacement pointer
+    var tlb_replace_idx: logic<4>;
 
     // ============================================================
     // Page table walk state machine
@@ -61,9 +134,6 @@ pub module mmu (
     let pte_r: logic = pte[1];
     let pte_w: logic = pte[2];
     let pte_x: logic = pte[3];
-    // PTE is a leaf if R or X is set
-    let pte_leaf: logic = pte_r || pte_x;
-
     // Physical address construction
     var pa: logic<64>;
 
@@ -78,10 +148,21 @@ pub module mmu (
             state = State::IDLE;
             pte   = '0;
             leaf_level = 2'd0;
+            tlb_replace_idx = 4'd0;
+            for i: u32 in 0..16 {
+                tlb_valid[i] = 1'b0;
+            }
+        } else if i_sfence {
+            // SFENCE.VMA: flush all TLB entries
+            for i: u32 in 0..16 {
+                tlb_valid[i] = 1'b0;
+            }
+            state = State::IDLE;
         } else {
             case state {
                 State::IDLE: {
-                    if i_req && vm_enabled {
+                    if i_req && vm_enabled && !tlb_hit {
+                        // TLB miss: start page table walk
                         // PTE address = satp.PPN * 4096 + VPN[2] * 8
                         ptw_addr_reg = {8'b0, satp_ppn, vpn2, 3'b000};
                         state = State::LEVEL2;
@@ -137,6 +218,16 @@ pub module mmu (
                     }
                 }
                 State::DONE: {
+                    // Fill TLB with the completed translation
+                    tlb_valid [tlb_replace_idx] = 1'b1;
+                    tlb_vpn   [tlb_replace_idx] = vpn_full;
+                    tlb_ppn   [tlb_replace_idx] = pte_ppn;
+                    tlb_perm_r[tlb_replace_idx] = pte_r;
+                    tlb_perm_w[tlb_replace_idx] = pte_w;
+                    tlb_perm_x[tlb_replace_idx] = pte_x;
+                    tlb_level [tlb_replace_idx] = leaf_level;
+                    tlb_replace_idx = tlb_replace_idx + 4'd1;
+
                     // Stay in DONE until the actual data access completes
                     // (dcache not stalling). This ensures ptw_valid remains
                     // high throughout the dcache fill for the translated PA.
@@ -176,10 +267,19 @@ pub module mmu (
     // Permission check: store requires W bit
     let perm_ok: logic = if i_store ? pte_w : (pte_r || pte_x);
 
-    // Outputs
-    assign o_paddr = if vm_enabled ? pa : i_vaddr;
-    assign o_valid = if vm_enabled ? (state == State::DONE && perm_ok) : i_req;
-    assign o_fault = if vm_enabled ? (state == State::FAULT || (state == State::DONE && !perm_ok)) : 1'b0;
+    // Outputs: TLB hit takes priority over PTW result
+    assign o_paddr = if !vm_enabled              ? i_vaddr
+                   : if tlb_hit && state == State::IDLE ? tlb_pa
+                   : pa;
+
+    assign o_valid = if !vm_enabled              ? i_req
+                   : if tlb_hit && state == State::IDLE ? (i_req && tlb_perm_ok)
+                   : (state == State::DONE && perm_ok);
+
+    assign o_fault = if !vm_enabled              ? 1'b0
+                   : if tlb_hit && state == State::IDLE ? (i_req && !tlb_perm_ok)
+                   : (state == State::FAULT || (state == State::DONE && !perm_ok));
+
     assign o_busy  = vm_enabled && (state != State::IDLE && state != State::DONE && state != State::FAULT);
     assign o_ptw_addr = ptw_addr_reg;
     assign o_ptw_req  = state == State::LEVEL2 || state == State::LEVEL1 || state == State::LEVEL0;
