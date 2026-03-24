@@ -112,11 +112,6 @@ s_trap_handler:
 /* S-mode payload — will be copied to PA 0x5000, executed at VA 0x10000 */
     .balign 4
 s_payload:
-    /* NOP before first real instruction: workaround for a pipeline bug
-     * where the first instruction after a long icache stall (non-identity
-     * VA→PA) gets skipped. See project_imem_pipeline_skip.md.
-     */
-    nop
     li x3, 0xAA
 6:  nop
     j 6b
