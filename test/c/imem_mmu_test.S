@@ -112,12 +112,9 @@ s_trap_handler:
 /* S-mode payload — will be copied to PA 0x5000, executed at VA 0x10000 */
     .balign 4
 s_payload:
-    /* Payload: set x3=0xAA and spin.
-     * Use raw .word for the self-loop to avoid j-offset=0 pipeline bug
-     * and ensure the jump offset is -4 (back to the j itself via nop trick).
-     */
     li x3, 0xAA
-    .word 0xffdff06f   /* j . - 4 (i.e., j to li x3,0xAA) */
+    li t0, 0x42         /* test with more instructions */
+5:  j 5b               /* spin (assembler generates j . = offset 0, now fixed) */
     nop
     nop
     nop
