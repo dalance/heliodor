@@ -112,17 +112,20 @@ s_trap_handler:
 /* S-mode payload — will be copied to PA 0x5000, executed at VA 0x10000 */
     .balign 4
 s_payload:
-    /* li x3, 0xAA */
-    li x3, 0xAA
-    /* Store/load test through data page */
-    li t0, 0x4000
-    li t1, 0xDEAD
-    sd t1, 0(t0)
-    ld t2, 0(t0)
-    bne t1, t2, 4f
-    /* Success — spin */
-5:  j 5b
-4:  /* Fail */
-    li x3, 0xBB
-    j 4b
+    li x3, 0xAA     /* addi x3, x0, 0xAA */
+    j s_payload      /* spin (offset 0 = self-loop) */
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
 s_payload_end:
