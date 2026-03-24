@@ -9,6 +9,7 @@ pub module mmu (
     i_vaddr        : input  logic<64>,
     i_req          : input  logic    ,
     i_store        : input  logic    ,  // 1=store, 0=load/fetch
+    i_fetch        : input  logic    ,  // 1=instruction fetch
     // Translation result
     o_paddr        : output logic<64>,
     o_valid        : output logic    ,
@@ -17,6 +18,9 @@ pub module mmu (
     // SATP register
     i_satp         : input  logic<64>,
     i_priv         : input  csr_pkg::PrivLevel,
+    // mstatus permission bits
+    i_sum          : input  logic    ,  // Supervisor User Memory access
+    i_mxr          : input  logic    ,  // Make eXecutable Readable
     // Page table walk memory interface
     o_ptw_addr     : output logic<64>,
     o_ptw_req      : output logic    ,
@@ -55,6 +59,7 @@ pub module mmu (
     var tlb_perm_r: logic    [16];
     var tlb_perm_w: logic    [16];
     var tlb_perm_x: logic    [16];
+    var tlb_perm_u: logic    [16]; // U bit (user page)
     var tlb_level : logic<2> [16]; // leaf level (0/1/2)
 
     // TLB lookup (combinational)
@@ -64,6 +69,7 @@ pub module mmu (
     var tlb_hit_r  : logic;
     var tlb_hit_w  : logic;
     var tlb_hit_x  : logic;
+    var tlb_hit_u  : logic;
     var tlb_hit_lvl: logic<2>;
 
     always_comb {
@@ -73,6 +79,7 @@ pub module mmu (
         tlb_hit_r   = 1'b0;
         tlb_hit_w   = 1'b0;
         tlb_hit_x   = 1'b0;
+        tlb_hit_u   = 1'b0;
         tlb_hit_lvl = 2'd0;
 
         for i: u32 in 0..16 {
@@ -92,6 +99,7 @@ pub module mmu (
                 tlb_hit_r   = tlb_perm_r[i];
                 tlb_hit_w   = tlb_perm_w[i];
                 tlb_hit_x   = tlb_perm_x[i];
+                tlb_hit_u   = tlb_perm_u[i];
                 tlb_hit_lvl = tlb_level[i];
             }
         }
@@ -107,8 +115,19 @@ pub module mmu (
         }
     }
 
-    // TLB hit permission check
-    let tlb_perm_ok: logic = if i_store ? tlb_hit_w : (tlb_hit_r || tlb_hit_x);
+    // TLB hit permission check (RISC-V Sv39 spec compliant)
+    // R/W/X permission with MXR: MXR=1 makes X pages readable
+    let tlb_read_ok: logic = tlb_hit_r || (i_mxr && tlb_hit_x);
+    let tlb_rwx_ok : logic = if i_fetch ? tlb_hit_x
+                           : if i_store ? tlb_hit_w
+                           : tlb_read_ok;
+    // U-bit check:
+    //   U=1 (user page): U-mode OK; S-mode needs SUM=1, never executable by S
+    //   U=0 (supervisor page): S-mode OK; U-mode never
+    let tlb_u_ok: logic = if i_priv == PrivLevel::USER ?
+        tlb_hit_u
+    : (if tlb_hit_u ? (i_sum && !i_fetch) : 1'b1);
+    let tlb_perm_ok: logic = tlb_rwx_ok && tlb_u_ok;
 
     // Round-robin replacement pointer
     var tlb_replace_idx: logic<4>;
@@ -134,6 +153,9 @@ pub module mmu (
     let pte_r: logic = pte[1];
     let pte_w: logic = pte[2];
     let pte_x: logic = pte[3];
+    let pte_u: logic = pte[4];
+    let pte_a: logic = pte[6];
+    let pte_d: logic = pte[7];
     // Physical address construction
     var pa: logic<64>;
 
@@ -142,6 +164,13 @@ pub module mmu (
 
     // Track which level the leaf PTE was found at
     var leaf_level: logic<2>;
+
+    // Leaf PTE validity: check A/D bits and superpage alignment
+    // A must be set; D must be set for stores.
+    // Superpage: level-1 requires PPN[0]=0, level-2 requires PPN[1:0]=0.
+    let leaf_valid: logic = i_ptw_data[0] && (i_ptw_data[1] || i_ptw_data[3])
+        && i_ptw_data[6]
+        && (!i_store || i_ptw_data[7]);
 
     always_ff (clk, rst) {
         if_reset {
@@ -176,8 +205,13 @@ pub module mmu (
                             state = State::FAULT;
                         } else if i_ptw_data[1] || i_ptw_data[3] {
                             // Leaf PTE at level 2 (1GB gigapage)
-                            leaf_level = 2'd2;
-                            state = State::DONE;
+                            // Check alignment: PPN[1:0] (i.e. PPN[17:0]) must be 0
+                            if !leaf_valid || i_ptw_data[27:10] != 18'd0 {
+                                state = State::FAULT;
+                            } else {
+                                leaf_level = 2'd2;
+                                state = State::DONE;
+                            }
                         } else {
                             // Non-leaf: follow to level 1
                             let next_ppn: logic<44> = i_ptw_data[53:10];
@@ -193,8 +227,13 @@ pub module mmu (
                             state = State::FAULT;
                         } else if i_ptw_data[1] || i_ptw_data[3] {
                             // Leaf PTE at level 1 (2MB megapage)
-                            leaf_level = 2'd1;
-                            state = State::DONE;
+                            // Check alignment: PPN[0] (i.e. PPN[8:0]) must be 0
+                            if !leaf_valid || i_ptw_data[18:10] != 9'd0 {
+                                state = State::FAULT;
+                            } else {
+                                leaf_level = 2'd1;
+                                state = State::DONE;
+                            }
                         } else {
                             let next_ppn: logic<44> = i_ptw_data[53:10];
                             ptw_addr_reg = {8'b0, next_ppn, vpn0, 3'b000};
@@ -209,8 +248,12 @@ pub module mmu (
                             state = State::FAULT;
                         } else if i_ptw_data[1] || i_ptw_data[3] {
                             // Leaf PTE at level 0 (4KB page)
-                            leaf_level = 2'd0;
-                            state = State::DONE;
+                            if !leaf_valid {
+                                state = State::FAULT;
+                            } else {
+                                leaf_level = 2'd0;
+                                state = State::DONE;
+                            }
                         } else {
                             // Non-leaf at level 0 is invalid
                             state = State::FAULT;
@@ -225,6 +268,7 @@ pub module mmu (
                     tlb_perm_r[tlb_replace_idx] = pte_r;
                     tlb_perm_w[tlb_replace_idx] = pte_w;
                     tlb_perm_x[tlb_replace_idx] = pte_x;
+                    tlb_perm_u[tlb_replace_idx] = pte_u;
                     tlb_level [tlb_replace_idx] = leaf_level;
                     tlb_replace_idx = tlb_replace_idx + 4'd1;
 
@@ -264,8 +308,15 @@ pub module mmu (
         }
     }
 
-    // Permission check: store requires W bit
-    let perm_ok: logic = if i_store ? pte_w : (pte_r || pte_x);
+    // PTW result permission check (same logic as TLB hit)
+    let ptw_read_ok: logic = pte_r || (i_mxr && pte_x);
+    let ptw_rwx_ok : logic = if i_fetch ? pte_x
+                           : if i_store ? pte_w
+                           : ptw_read_ok;
+    let ptw_u_ok: logic = if i_priv == PrivLevel::USER ?
+        pte_u
+    : (if pte_u ? (i_sum && !i_fetch) : 1'b1);
+    let perm_ok: logic = ptw_rwx_ok && ptw_u_ok;
 
     // Outputs: TLB hit takes priority over PTW result
     assign o_paddr = if !vm_enabled              ? i_vaddr
