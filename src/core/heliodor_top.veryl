@@ -9,6 +9,10 @@ pub module heliodor_top #(
     o_imem_addr  : output logic<64>     ,
     i_imem_rdata : input  logic<32>     ,
     o_imem_ren   : output logic         ,
+    // Instruction PTW memory interface (64-bit, for page table walks)
+    o_iptw_addr  : output logic<64>     ,
+    o_iptw_req   : output logic         ,
+    i_iptw_rdata : input  logic<64>     ,
     // Data memory interface
     o_dmem_addr  : output logic<64>     ,
     o_dmem_wdata : output logic<64>     ,
@@ -169,9 +173,10 @@ pub module heliodor_top #(
     // MMU not yet active — stall always false in Bare mode
     var mmu_stall   : logic;
 
-    // Cache stall signals
+    // Cache/MMU stall signals
     var icache_stall: logic;
     var dcache_stall: logic;
+    var immu_busy   : logic;
 
     // WB stage signals
     var wb_data: logic<64>;
@@ -194,7 +199,7 @@ pub module heliodor_top #(
         i_trap_taken  : trap_taken         ,
         i_mret_taken  : mret_taken         ,
         i_mmu_stall   : mmu_stall          ,
-        i_icache_stall: icache_stall      ,
+        i_icache_stall: icache_stall || immu_busy,
         i_dcache_stall: dcache_stall      ,
         o_stall_if    : stall_if           ,
         o_stall_id    : stall_id           ,
@@ -224,18 +229,45 @@ pub module heliodor_top #(
     // Combinational: is the instruction in EX a JALR?
     let ex_is_jalr: logic = id_valid && id_is_jalr;
 
-    // I-Cache between fetch and external instruction memory (32-bit)
+    // Instruction fetch MMU (Sv39 virtual-to-physical translation)
+    var immu_paddr : logic<64>;
+    var immu_valid : logic;
+    var immu_fault : logic;
+    var immu_ptw_addr: logic<64>;
+    var immu_ptw_req : logic;
+
+    assign o_iptw_addr = immu_ptw_addr;
+    assign o_iptw_req  = immu_ptw_req;
+
+    inst u_immu: imem_mmu (
+        clk, rst,
+        i_vaddr    : if_pc              ,
+        i_req      : 1'b1              ,
+        o_paddr    : immu_paddr        ,
+        o_valid    : immu_valid        ,
+        o_fault    : immu_fault        ,
+        o_busy     : immu_busy         ,
+        i_satp     : csr_satp          ,
+        i_priv     : csr_priv          ,
+        o_ptw_addr : immu_ptw_addr     ,
+        o_ptw_req  : immu_ptw_req      ,
+        i_ptw_data : i_iptw_rdata      ,
+        i_ptw_valid: immu_ptw_req      ,
+        i_sfence   : id_valid && id_is_sfence,
+    );
+
+    // I-Cache between fetch MMU and external instruction memory (32-bit)
     var icache_rdata: logic<32>;
 
     inst u_icache: icache (
         clk, rst,
-        i_addr     : if_pc          ,
-        i_ren      : 1'b1           ,
-        o_rdata    : icache_rdata   ,
-        o_stall    : icache_stall   ,
-        o_mem_addr : o_imem_addr    ,
-        i_mem_rdata: i_imem_rdata   ,
-        o_mem_ren  : o_imem_ren     ,
+        i_addr     : immu_paddr      ,
+        i_ren      : immu_valid      ,
+        o_rdata    : icache_rdata    ,
+        o_stall    : icache_stall    ,
+        o_mem_addr : o_imem_addr     ,
+        i_mem_rdata: i_imem_rdata    ,
+        o_mem_ren  : o_imem_ren      ,
     );
 
     // Halfword selection for compressed instruction support
@@ -589,15 +621,20 @@ pub module heliodor_top #(
     // Page fault detection from MMU (MEM stage)
     let mem_page_fault: logic = mmu_fault;
 
+    // Instruction page fault (IF stage)
+    let if_page_fault: logic = immu_fault;
+
     // Combined synchronous trap
-    let sync_trap: logic = ex_trap || mem_page_fault;
+    let sync_trap: logic = ex_trap || mem_page_fault || if_page_fault;
 
     // Asynchronous interrupt detection: take interrupt when pipeline is clean
     assign irq_taken = irq_pending && !sync_trap && !ex_branch_taken && !mret_taken && !sret_taken;
 
     // Combined trap: sync exception or async interrupt
     assign trap_taken = sync_trap || irq_taken;
-    assign trap_cause = if mem_page_fault ? (
+    assign trap_cause = if if_page_fault ?
+        csr_pkg::CAUSE_INST_PAGE_FAULT
+    : if mem_page_fault ? (
         if mmu_fault_store ?
             csr_pkg::CAUSE_STORE_PAGE_FAULT
         : csr_pkg::CAUSE_LOAD_PAGE_FAULT
@@ -619,7 +656,9 @@ pub module heliodor_top #(
     assign trap_pc  = if mem_page_fault ? mem_pc
                     : if ex_trap ? ex_pc
                     :              if_pc;
-    assign trap_val = if mem_page_fault ? mmu_paddr : 64'd0;
+    assign trap_val = if if_page_fault ? if_pc
+                    : if mem_page_fault ? mmu_paddr
+                    : 64'd0;
 
     // MRET/SRET detection: in ID stage
     assign mret_taken = id_valid && id_is_mret;
