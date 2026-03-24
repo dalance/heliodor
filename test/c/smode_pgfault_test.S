@@ -33,7 +33,7 @@ _start:
     /* Copy S-mode code to PA 0x5000 */
     la t0, s_code
     li t1, 0x5000
-    li t2, 256
+    li t2, 512
 2:  lw t3, 0(t0)
     sw t3, 0(t1)
     addi t0, t0, 4
@@ -138,9 +138,19 @@ s_code:
 4:  nop
     j 4b
 
-/* S-mode page fault handler */
+/* S-mode page fault handler
+ * Must save/restore t0-t4 since the faulting code uses them.
+ * Uses stack at sp (VA 0x7000 page, mapped). */
     .balign 4
 s_trap_handler:
+    /* Save registers to stack */
+    addi sp, sp, -48
+    sd t0, 0(sp)
+    sd t1, 8(sp)
+    sd t2, 16(sp)
+    sd t3, 24(sp)
+    sd t4, 32(sp)
+
     csrr t0, scause
     csrr t1, stval             /* faulting address */
 
@@ -158,7 +168,15 @@ s_trap_handler:
     /* Flush TLB for the faulting VA */
     sfence.vma t1, zero
 
-    li x2, 15                 /* handler reached (cause 15) */
+    li x9, 15                 /* handler reached (cause 15) */
+
+    /* Restore registers from stack */
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld t4, 32(sp)
+    addi sp, sp, 48
     sret
 
 s_trap_check_load:
@@ -171,7 +189,15 @@ s_trap_check_load:
     li t4, ((4 << 10) | 0xCF)
     sd t4, 0(t3)
     sfence.vma t1, zero
-    li x2, 13
+    li x9, 13
+
+    /* Restore registers from stack */
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld t4, 32(sp)
+    addi sp, sp, 48
     sret
 
 s_trap_other:
