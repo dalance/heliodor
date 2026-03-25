@@ -112,6 +112,10 @@ _start:
     la t0, m_sbi_handler
     csrw mtvec, t0
 
+    /* Allow S-mode to read counters (TIME for rdtime) */
+    li t0, 7
+    csrw mcounteren, t0
+
     /* Delegate traps to S-mode */
     /* Exceptions: inst page fault(12), load page fault(13), store page fault(15), ecall-U(8) */
     li t0, (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
