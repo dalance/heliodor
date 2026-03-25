@@ -161,7 +161,9 @@ _start:
 m_sbi_handler:
     csrr t0, mcause
 
-    /* Check if interrupt (MSB set) */
+    /* Check if interrupt (MSB set) — use shift instead of BLT to
+     * avoid simulator always_ff evaluation order issue where
+     * csr_rdata changes before execute captures it. */
     srli t1, t0, 63
     bnez t1, m_handle_irq
 
