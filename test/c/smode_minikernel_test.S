@@ -292,14 +292,6 @@ s_kernel:
     /* Mark: page fault handled + data verified */
     li x9, 0x04
 
-    /* NOP sled: work around simulator comb ordering issue after
-     * MMU stall (load-use after page table walk needs extra cycles
-     * for combinational values to settle in the simulator). */
-    nop
-    nop
-    nop
-    nop
-
     /* === Test 3: Data page read/write === */
     li t0, 0x6008          /* data variable at VA 0x6008 */
     li t1, 42
