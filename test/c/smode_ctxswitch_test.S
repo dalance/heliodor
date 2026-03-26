@@ -1,4 +1,15 @@
-/* Minimal context switch: single process yield + resume */
+/* Context switch test: two U-mode processes with cooperative scheduling.
+ *
+ * Process A and B share the same code (count + yield loop).
+ * Each process counts to 3, yielding after each increment.
+ * At 3, the process signals "done" via ECALL.
+ * The kernel verifies both processes completed.
+ *
+ * Context save area at VA 0x6000:
+ *   +0x000: Process A: sepc(8), a0(8), done(8)
+ *   +0x080: Process B: sepc(8), a0(8), done(8)
+ *   +0x200: current_proc (0=A, 1=B)
+ */
 
     .section .text.start, "ax"
     .global _start
@@ -31,6 +42,7 @@ _start:
     addi t2, t2, -4
     bgtz t2, 3b
 
+    /* Page tables */
     li t0, 0x1000
     li t1, ((2 << 10) | 0x01)
     sd t1, 0(t0)
@@ -78,39 +90,146 @@ m_trap:
     li x3, 0xEE
     j .
 
-/* S-mode kernel */
+/* ============================================================
+ * S-mode kernel (VA 0x10000)
+ * ============================================================ */
     .balign 4
 s_kernel:
     la t0, s_trap_handler
     csrw stvec, t0
     lui sp, 0x8
-    li x1, 1
 
-    /* SRET to U-mode at VA 0x4000 */
+    /* Init process A at ctx+0x000 */
+    li t0, 0x6000
+    li t1, 0x4000
+    sd t1, 0(t0)          /* A.sepc */
+    sd zero, 8(t0)        /* A.a0 */
+    sd zero, 16(t0)       /* A.done */
+    /* Init process B at ctx+0x080 */
+    li t0, 0x6080
+    sd t1, 0(t0)
+    sd zero, 8(t0)
+    sd zero, 16(t0)
+    /* current_proc = 0 (A) */
+    li t0, 0x6200
+    sd zero, 0(t0)
+
+    /* Launch process A */
     li t0, (1 << 18) | (1 << 5)
     csrw sstatus, t0
     li t0, 0x4000
     csrw sepc, t0
     li a0, 0
+    li a7, 0
     sret
 
-/* S-mode handler: just advance sepc past ECALL and return */
+/* Trap handler: ECALL from U-mode.
+ * a7=0: yield (save ctx, switch, restore, SRET)
+ * a7=1: done  (mark done, check both, maybe switch) */
     .balign 4
 s_trap_handler:
+    /* Use sscratch to save sp, then use kernel stack */
+    csrw sscratch, sp
+    lui sp, 0x8
+
+    /* Save caller-saved regs we use */
+    addi sp, sp, -48
+    sd t0, 0(sp)
+    sd t1, 8(sp)
+    sd t2, 16(sp)
+    sd t3, 24(sp)
+    sd ra, 32(sp)
+
     csrr t0, scause
     li t1, 8
     bne t0, t1, s_trap_other
 
-    /* ECALL: if a7=1, success. Otherwise advance and return. */
-    li t0, 1
-    beq a7, t0, s_success
+    /* Get current process context base */
+    li t3, 0x6200
+    ld t0, 0(t3)           /* current_proc */
+    slli t1, t0, 7
+    li t2, 0x6000
+    add t2, t2, t1         /* ctx base */
 
-    csrr t0, sepc
-    addi t0, t0, 4
-    csrw sepc, t0
+    /* Save: sepc+4, a0 */
+    csrr t1, sepc
+    addi t1, t1, 4
+    sd t1, 0(t2)
+    sd a0, 8(t2)
+
+    /* Branch on syscall type */
+    bnez a7, s_handle_done
+
+    /* === YIELD === */
+    /* Switch to other process */
+    ld t0, 0(t3)           /* current_proc */
+    xori t0, t0, 1
+    sd t0, 0(t3)           /* current_proc = other */
+
+    /* Restore other process */
+    slli t1, t0, 7
+    li t2, 0x6000
+    add t2, t2, t1
+    ld t1, 0(t2)           /* other.sepc */
+    ld a0, 8(t2)           /* other.a0 */
+    csrw sepc, t1
+    li a7, 0               /* clear a7 for the resumed process */
+
+    /* SRET to U-mode */
+    li t0, (1 << 8)
+    csrc sstatus, t0       /* SPP=0 */
+    li t0, (1 << 5) | (1 << 18)
+    csrs sstatus, t0       /* SPIE=1, SUM=1 */
+
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld ra, 32(sp)
+    addi sp, sp, 48
+    csrr sp, sscratch      /* restore U-mode sp (not used but correct) */
     sret
 
-s_success:
+s_handle_done:
+    /* Mark current process as done */
+    li t0, 1
+    sd t0, 16(t2)          /* ctx.done = 1 */
+
+    /* Check if both are done */
+    li t0, 0x6000
+    ld t0, 16(t0)          /* A.done */
+    li t1, 0x6080
+    ld t1, 16(t1)          /* B.done */
+    and t0, t0, t1
+    bnez t0, s_all_done
+
+    /* Only one done: switch to the other */
+    ld t0, 0(t3)           /* current_proc */
+    xori t0, t0, 1
+    sd t0, 0(t3)
+    slli t1, t0, 7
+    li t2, 0x6000
+    add t2, t2, t1
+    ld t1, 0(t2)
+    ld a0, 8(t2)
+    csrw sepc, t1
+    li a7, 0
+
+    li t0, (1 << 8)
+    csrc sstatus, t0
+    li t0, (1 << 5) | (1 << 18)
+    csrs sstatus, t0
+
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld ra, 32(sp)
+    addi sp, sp, 48
+    csrr sp, sscratch
+    sret
+
+s_all_done:
     li x9, 0xAA
     li x3, 0xAA
 5:  nop
@@ -127,7 +246,10 @@ s_trap_other:
     nop
 s_kernel_end:
 
-/* U-mode: count to 3 with yields, then done */
+/* ============================================================
+ * U-mode code (VA 0x4000)
+ * a0 = counter, a7 = syscall (0=yield, 1=done)
+ * ============================================================ */
     .balign 4
 u_code:
     addi a0, a0, 1
