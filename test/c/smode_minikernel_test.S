@@ -199,6 +199,7 @@ m_handle_irq:
     mret
 
 m_handle_ecall:
+    nop
     /* SBI call convention: a7=EID, a0-a5=args */
     /* EID 0x00: sbi_set_timer(a0=stime_value) */
     /* EID 0x01: sbi_console_putchar(a0=ch) */
