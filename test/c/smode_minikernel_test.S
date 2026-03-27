@@ -8,8 +8,9 @@
  *      c. Handle timer interrupt (periodic tick via SBI ECALL)
  *      d. Handle store page fault (demand paging)
  *      e. Lazy FP restore (FS=Off → illegal inst → restore)
- *      f. UART output via SBI ECALL
- *      g. Verify all features worked
+ *      f. SBI base extension probe (spec version, extension probe)
+ *      g. UART output via SBI ECALL
+ *      h. Verify all features worked
  *
  * Memory layout (physical):
  *   0x0000-0x0FFF : M-mode firmware code + SBI handler
@@ -37,6 +38,7 @@
  *   0x04 = data verified after demand paging
  *   0x05 = data verified
  *   0x06 = FP lazy restore succeeded
+ *   0x07 = SBI base probe succeeded
  *   0xAA = all passed (copied to x3)
  */
 
@@ -204,9 +206,11 @@ m_handle_ecall:
     beq a7, t0, m_sbi_set_timer
     li t0, 1
     beq a7, t0, m_sbi_putchar
+    li t0, 0x10
+    beq a7, t0, m_sbi_base
 
-    /* Unknown SBI call */
-    li a0, -1
+    /* Unknown SBI call: return SBI_ERR_NOT_SUPPORTED (-2) */
+    li a0, -2
     csrr t0, mepc
     addi t0, t0, 4
     csrw mepc, t0
@@ -237,6 +241,39 @@ m_sbi_putchar:
     sb a0, 0(t0)
     li a0, 0
     csrr t0, mepc
+    addi t0, t0, 4
+    csrw mepc, t0
+    mret
+
+m_sbi_base:
+    /* SBI base extension (EID=0x10)
+     * FID (a6): 0=get_spec_version, 1=get_impl_id, 2=get_impl_version,
+     *           3=probe_extension, 4=get_mvendorid, 5=get_marchid, 6=get_mimpid
+     * Returns: a0=error(SBI_SUCCESS=0), a1=value */
+    mv t3, a0          /* save original a0 (used by probe_extension) */
+    li a0, 0           /* SBI_SUCCESS */
+    li t0, 0
+    beq a6, t0, 1f     /* FID=0: get_spec_version */
+    li t0, 1
+    beq a6, t0, 2f     /* FID=1: get_impl_id */
+    li t0, 3
+    beq a6, t0, 3f     /* FID=3: probe_extension */
+    li a1, 0           /* default: value=0 */
+    j 4f
+1:  li a1, 0x02000000  /* SBI spec v2.0 */
+    j 4f
+2:  li a1, 0xFF        /* impl ID = custom firmware */
+    j 4f
+3:  /* probe: t3=extension_id; report available for 0x00,0x01,0x10 */
+    li a1, 0           /* assume not available */
+    beqz t3, 5f        /* 0x00 = legacy set_timer → available */
+    li t0, 1
+    beq t3, t0, 5f     /* 0x01 = legacy putchar → available */
+    li t0, 0x10
+    beq t3, t0, 5f     /* 0x10 = base → available */
+    j 4f
+5:  li a1, 1           /* available */
+4:  csrr t0, mepc
     addi t0, t0, 4
     csrw mepc, t0
     mret
@@ -285,6 +322,9 @@ s_kernel:
     li t0, 0x4000          /* unmapped VA */
     li t1, 0xCAFEBABE
     sd t1, 0(t0)           /* should trigger store page fault */
+    nop
+    nop
+    nop
 
     /* Verify the store succeeded after handler fixed PTE */
     ld t2, 0(t0)
@@ -336,7 +376,28 @@ s_kernel:
     /* Mark: FP lazy restore passed */
     li x9, 0x06
 
-    /* === Test 5: SBI console putchar === */
+    /* === Test 5: SBI base extension probe === */
+    /* Get SBI spec version */
+    li a7, 0x10        /* EID = base */
+    li a6, 0           /* FID = get_spec_version */
+    ecall
+    bnez a0, s_fail    /* a0 should be SBI_SUCCESS (0) */
+    li t0, 0x02000000
+    bne a1, t0, s_fail /* a1 should be spec version 2.0 */
+
+    /* Probe timer extension */
+    li a7, 0x10        /* EID = base */
+    li a6, 3           /* FID = probe_extension */
+    li a0, 0           /* probe legacy set_timer (EID=0) */
+    ecall
+    bnez a0, s_fail    /* a0 = SBI_SUCCESS */
+    li t0, 1
+    bne a1, t0, s_fail /* a1 = 1 (available) */
+
+    /* Mark: SBI base probe passed */
+    li x9, 0x07
+
+    /* === Test 6: SBI console putchar === */
     li a0, 0x4F            /* 'O' */
     li a7, 1               /* SBI EID = putchar */
     ecall
