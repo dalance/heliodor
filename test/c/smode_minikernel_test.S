@@ -7,8 +7,8 @@
  *      b. Enable Sv39
  *      c. Handle timer interrupt (periodic tick via SBI ECALL)
  *      d. Handle store page fault (demand paging)
- *      e. UART output via SBI ECALL
- *      f. Atomic operations (LR/SC spin lock)
+ *      e. Lazy FP restore (FS=Off → illegal inst → restore)
+ *      f. UART output via SBI ECALL
  *      g. Verify all features worked
  *
  * Memory layout (physical):
@@ -35,7 +35,8 @@
  *   0x02 = timer tick received
  *   0x03 = page fault handled
  *   0x04 = data verified after demand paging
- *   0x05 = atomic LR/SC succeeded
+ *   0x05 = data verified
+ *   0x06 = FP lazy restore succeeded
  *   0xAA = all passed (copied to x3)
  */
 
@@ -117,8 +118,8 @@ _start:
     csrw mcounteren, t0
 
     /* Delegate traps to S-mode */
-    /* Exceptions: inst page fault(12), load page fault(13), store page fault(15), ecall-U(8) */
-    li t0, (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
+    /* Exceptions: illegal(2), ecall-U(8), inst page fault(12), load page fault(13), store page fault(15) */
+    li t0, (1 << 2) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
     csrw medeleg, t0
     /* Interrupts: SSIP(1), STIP(5), SEIP(9) */
     li t0, 0x222
@@ -302,7 +303,40 @@ s_kernel:
     /* Mark: data test passed */
     li x9, 0x05
 
-    /* === Test 4: SBI console putchar === */
+    /* === Test 4: FP lazy restore (FS=Off → illegal inst → restore) === */
+    /* Set FS=Off by clearing FS bits in sstatus */
+    li t0, 0x6000          /* FS mask = bits 14:13 */
+    csrc sstatus, t0       /* FS = Off (0) */
+    nop
+    nop
+    nop
+    /* Execute FP instruction — should trap as illegal instruction */
+    fmv.d.x ft0, zero     /* this should trap because FS=Off */
+    /* Trap handler sets FS=Initial and skips the fmv.d.x (+4) */
+
+    /* After trap handler restores FS, verify FP works */
+    nop
+    nop
+    nop
+    li t0, 42
+    nop
+    nop
+    nop
+    fmv.d.x ft1, t0
+    nop
+    nop
+    nop
+    fmv.x.d t1, ft1
+    nop
+    nop
+    nop
+    li t2, 42
+    bne t1, t2, s_fail
+
+    /* Mark: FP lazy restore passed */
+    li x9, 0x06
+
+    /* === Test 5: SBI console putchar === */
     li a0, 0x4F            /* 'O' */
     li a7, 1               /* SBI EID = putchar */
     ecall
@@ -338,7 +372,9 @@ s_trap_handler:
     srli t1, t0, 63
     bnez t1, s_handle_irq
 
-    /* Synchronous: check for page faults */
+    /* Synchronous: check cause */
+    li t1, 2               /* illegal instruction (FP with FS=Off) */
+    beq t0, t1, s_handle_illegal
     li t1, 15              /* store page fault */
     beq t0, t1, s_handle_pgfault
     li t1, 13              /* load page fault */
@@ -378,6 +414,25 @@ s_handle_irq:
 s_irq_other:
     li x3, 0xBB
     j .
+
+s_handle_illegal:
+    /* FP illegal instruction: set FS=Initial and retry */
+    li t1, 0x2000          /* FS = Initial (01) = bit 13 */
+    csrs sstatus, t1
+    /* Skip past the 4-byte FP instruction (FP instrs are never compressed) */
+    csrr t1, sepc
+    addi t1, t1, 4
+    csrw sepc, t1
+
+    /* Restore and return */
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld t4, 32(sp)
+    ld ra, 40(sp)
+    addi sp, sp, 64
+    sret
 
 s_handle_pgfault:
     csrr t1, stval         /* faulting address */
