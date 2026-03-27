@@ -323,9 +323,6 @@ s_kernel:
     li t0, 0x4000          /* unmapped VA */
     li t1, 0xCAFEBABE
     sd t1, 0(t0)           /* should trigger store page fault */
-    nop
-    nop
-    nop
 
     /* Verify the store succeeded after handler fixed PTE */
     ld t2, 0(t0)
