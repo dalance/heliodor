@@ -199,7 +199,7 @@ m_handle_irq:
     mret
 
 m_handle_ecall:
-    nop
+    nop    /* pipeline bubble for trap entry */
     /* SBI call convention: a7=EID, a0-a5=args */
     /* EID 0x00: sbi_set_timer(a0=stime_value) */
     /* EID 0x01: sbi_console_putchar(a0=ch) */
@@ -345,29 +345,15 @@ s_kernel:
     /* Set FS=Off by clearing FS bits in sstatus */
     li t0, 0x6000          /* FS mask = bits 14:13 */
     csrc sstatus, t0       /* FS = Off (0) */
-    nop
-    nop
-    nop
+    nop                    /* CSR FS change pipeline propagation */
     /* Execute FP instruction — should trap as illegal instruction */
     fmv.d.x ft0, zero     /* this should trap because FS=Off */
     /* Trap handler sets FS=Initial and skips the fmv.d.x (+4) */
 
     /* After trap handler restores FS, verify FP works */
-    nop
-    nop
-    nop
     li t0, 42
-    nop
-    nop
-    nop
     fmv.d.x ft1, t0
-    nop
-    nop
-    nop
     fmv.x.d t1, ft1
-    nop
-    nop
-    nop
     li t2, 42
     bne t1, t2, s_fail
 
