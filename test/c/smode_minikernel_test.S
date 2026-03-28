@@ -345,7 +345,7 @@ s_kernel:
     /* Set FS=Off by clearing FS bits in sstatus */
     li t0, 0x6000          /* FS mask = bits 14:13 */
     csrc sstatus, t0       /* FS = Off (0) */
-    nop                    /* CSR FS change pipeline propagation */
+    nop
     /* Execute FP instruction — should trap as illegal instruction */
     fmv.d.x ft0, zero     /* this should trap because FS=Off */
     /* Trap handler sets FS=Initial and skips the fmv.d.x (+4) */
