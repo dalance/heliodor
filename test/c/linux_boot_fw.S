@@ -99,8 +99,6 @@ m_trap_handler:
     beq t0, t1, m_handle_ecall
 
     /* Unexpected exception: halt with debug info */
-    csrr x11, mcause
-    csrr x12, mtval
     li x3, 0xEE
     j .
 
