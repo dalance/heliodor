@@ -198,8 +198,8 @@ m_handle_irq:
     csrc mie, t0
     mret
 
-    .balign 4              /* ensure 4-byte alignment (icache straddled fetch) */
 m_handle_ecall:
+    nop                    /* TODO: still needed — root cause TBD */
     /* SBI call convention: a7=EID, a0-a5=args */
     /* EID 0x00: sbi_set_timer(a0=stime_value) */
     /* EID 0x01: sbi_console_putchar(a0=ch) */
