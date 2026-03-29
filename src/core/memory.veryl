@@ -1,4 +1,5 @@
 // MEM stage: Data memory access, load alignment/sign-extension, AMO
+// Supports hardware misaligned access including cross-doubleword splits.
 pub module memory (
     clk: input clock,
     rst: input reset,
@@ -43,6 +44,8 @@ pub module memory (
     // Misaligned access exception
     o_misaligned : output logic,
     o_misalign_st: output logic, // 1=store, 0=load
+    // Cross-DW split stall
+    o_split_stall: output logic,
 ) {
     import riscv_pkg::AmoFunct5;
 
@@ -57,55 +60,128 @@ pub module memory (
     // SC succeeds if reservation is valid and address matches
     let sc_success: logic = is_sc && reserv_valid && reserv_addr == i_alu_out;
 
-    // Memory address and enables
-    assign o_dmem_addr = i_alu_out;
-    // For SC: only write if reservation matches
-    assign o_dmem_wen = i_valid && (if is_sc ? sc_success : i_mem_wen);
-    assign o_dmem_ren = i_valid && i_mem_ren;
-
     // Byte offset within doubleword
     let byte_off: logic<3> = i_alu_out[2:0];
 
     // Size from funct3[1:0]
     let size: logic<2> = i_mem_funct3[1:0];
 
-    // Misaligned access: handled in hardware (no exception).
-    // Accesses that cross doubleword boundaries are split into two cycles.
-    assign o_misaligned  = 1'b0; // never raise misaligned exception
+    // Access size in bytes minus 1
+    let access_bytes_m1: logic<3> = if size == 2'd0 ? 3'd0 : if size == 2'd1 ? 3'd1 : if size == 2'd2 ? 3'd3 : 3'd7;
+
+    // Detect cross-doubleword boundary (byte_off + size > 8)
+    let access_end: logic<4> = {1'b0, byte_off} + {1'b0, access_bytes_m1};
+    let crosses_dw: logic    = access_end >= 4'd8 && (i_mem_ren || i_mem_wen) && i_valid && !is_amo;
+
+    // No misaligned exception — handled in hardware
+    assign o_misaligned  = 1'b0;
     assign o_misalign_st = 1'b0;
 
-    // Store data source: integer rs2 for normal stores, FP rs2 for FP stores
+    // ============================================================
+    // Cross-DW split state machine
+    // ============================================================
+    var split_phase2  : logic    ; // in second phase of split access
+    var split_rdata_lo: logic<64>; // first-phase read data (lower DW)
+
+    // Aligned addresses for split access
+    let addr_lo: logic<64> = {i_alu_out[63:3], 3'b000}; // aligned DW containing first byte
+    let addr_hi: logic<64> = {i_alu_out[63:3], 3'b000} + 64'd8; // next aligned DW
+
+    // Stall pipeline during first phase of cross-DW access
+    assign o_split_stall = crosses_dw && !split_phase2;
+
+    // Split state advances independently of pipeline stall (to avoid deadlock:
+    // split_stall → dcache_stall → stall_mem → i_stall → split can't advance).
+    // Only gate on EXTERNAL stalls (dcache/MMU), not the split's own stall.
+    let external_stall: logic = i_stall && !o_split_stall;
+
+    always_ff (clk, rst) {
+        if_reset {
+            split_phase2   = 1'b0;
+            split_rdata_lo = '0;
+        } else if crosses_dw && !split_phase2 && !external_stall {
+            // Phase 1 → Phase 2: save lower DW data
+            split_phase2   = 1'b1;
+            split_rdata_lo = i_dmem_rdata;
+        } else if split_phase2 && !external_stall {
+            split_phase2 = 1'b0;
+        }
+    }
+
+    // Memory address: phase 2 reads/writes the upper DW
+    assign o_dmem_addr = if split_phase2 ? addr_hi : if crosses_dw ? addr_lo : i_alu_out;
+
+    // Memory enables
+    assign o_dmem_wen = i_valid && (if is_sc ? sc_success : i_mem_wen);
+    assign o_dmem_ren = i_valid && i_mem_ren;
+
+    // ============================================================
+    // Store data alignment and strobe generation
+    // ============================================================
     let store_data: logic<64> = if i_is_fp ? i_fp_rs2_data : i_rs2_data;
 
-    // Write data alignment and strobe generation
     var wdata: logic<64>;
     var wstrb: logic<8> ;
 
     always_comb {
         wdata = '0;
         wstrb = '0;
-        case size {
-            2'd0: {
-                // SB
-                wdata = {store_data[7:0] repeat 8};
-                wstrb = 8'b00000001 << byte_off;
+        if crosses_dw && !split_phase2 {
+            // Phase 1: write lower bytes (from byte_off to byte 7)
+            case size {
+                2'd1: {
+                    wdata = {store_data[7:0] repeat 8};
+                    wstrb = 8'b00000001 << byte_off;
+                }
+                2'd2: {
+                    wdata = {store_data[31:0] repeat 2};
+                    wstrb = (8'b00001111 << byte_off) & 8'b11111111;
+                }
+                2'd3: {
+                    wdata = store_data << {byte_off, 3'b000};
+                    wstrb = (8'b11111111 << byte_off) & 8'b11111111;
+                }
+                default: {}
             }
-            2'd1: {
-                // SH
-                wdata = {store_data[15:0] repeat 4};
-                wstrb = 8'b00000011 << byte_off;
+        } else if split_phase2 {
+            // Phase 2: write upper bytes (from byte 0 to remaining)
+            let remaining: logic<3> = access_end[2:0]; // bytes that spill into upper DW
+            case size {
+                2'd1: {
+                    wdata = {store_data[15:8] repeat 8};
+                    wstrb = 8'b00000001;
+                }
+                2'd2: {
+                    wdata = {store_data[31:0] repeat 2} >> {~byte_off + 3'd1, 3'b000};
+                    wstrb = if remaining == 3'd1 ? 8'b00000001 : if remaining == 3'd2 ? 8'b00000011 : 8'b00000111;
+                }
+                2'd3: {
+                    wdata = store_data >> {~byte_off + 3'd1, 3'b000};
+                    wstrb = (8'b11111111 >> (4'd8 - {1'b0, remaining}));
+                }
+                default: {}
             }
-            2'd2: {
-                // SW (also FSW)
-                wdata = {store_data[31:0] repeat 2};
-                wstrb = 8'b00001111 << byte_off;
+        } else {
+            // Normal (non-crossing) access
+            case size {
+                2'd0: {
+                    wdata = {store_data[7:0] repeat 8};
+                    wstrb = 8'b00000001 << byte_off;
+                }
+                2'd1: {
+                    wdata = {store_data[15:0] repeat 4};
+                    wstrb = 8'b00000011 << byte_off;
+                }
+                2'd2: {
+                    wdata = {store_data[31:0] repeat 2};
+                    wstrb = 8'b00001111 << byte_off;
+                }
+                2'd3: {
+                    wdata = store_data;
+                    wstrb = 8'b11111111;
+                }
+                default: {}
             }
-            2'd3: {
-                // SD (also FSD)
-                wdata = store_data;
-                wstrb = 8'b11111111;
-            }
-            default: {}
         }
     }
 
@@ -159,42 +235,57 @@ pub module memory (
     assign o_dmem_wdata = final_wdata;
     assign o_dmem_wstrb = final_wstrb;
 
-    // Load data alignment and sign/zero extension
-    let shifted    : logic<64> = i_dmem_rdata >> {byte_off, 3'b000};
-    let is_unsigned: logic     = i_mem_funct3[2];
+    // ============================================================
+    // Load data: combine for cross-DW, shift for normal
+    // ============================================================
+    // For cross-DW loads: combine lower and upper DW data
+    // split_rdata_lo has the lower DW (saved in phase 1)
+    // i_dmem_rdata has the upper DW (read in phase 2)
+    // Build a 128-bit value: {upper_dw, lower_dw}, then shift by byte_off
+    let combined_lo: logic<64> = if split_phase2 ? split_rdata_lo : i_dmem_rdata;
+    let combined_hi: logic<64> = i_dmem_rdata;
+    // Shift the 128-bit combined value right by byte_off*8
+    // Result is in the lower 64 bits
+    let combined_shifted: logic<64> = if split_phase2 ?
+        (combined_lo >> {byte_off, 3'b000}) | (combined_hi << {~byte_off + 3'd1, 3'b000})
+    :
+        i_dmem_rdata >> {byte_off, 3'b000}
+    ;
+
+    let is_unsigned: logic = i_mem_funct3[2];
 
     var load_data: logic<64>;
 
     always_comb {
-        load_data = shifted;
+        load_data = combined_shifted;
         case size {
             2'd0: {
                 // LB/LBU
                 if is_unsigned {
-                    load_data = {56'b0, shifted[7:0]};
+                    load_data = {56'b0, combined_shifted[7:0]};
                 } else {
-                    load_data = {shifted[7] repeat 56, shifted[7:0]};
+                    load_data = {combined_shifted[7] repeat 56, combined_shifted[7:0]};
                 }
             }
             2'd1: {
                 // LH/LHU
                 if is_unsigned {
-                    load_data = {48'b0, shifted[15:0]};
+                    load_data = {48'b0, combined_shifted[15:0]};
                 } else {
-                    load_data = {shifted[15] repeat 48, shifted[15:0]};
+                    load_data = {combined_shifted[15] repeat 48, combined_shifted[15:0]};
                 }
             }
             2'd2: {
                 // LW/LWU
                 if is_unsigned {
-                    load_data = {32'b0, shifted[31:0]};
+                    load_data = {32'b0, combined_shifted[31:0]};
                 } else {
-                    load_data = {shifted[31] repeat 32, shifted[31:0]};
+                    load_data = {combined_shifted[31] repeat 32, combined_shifted[31:0]};
                 }
             }
             2'd3: {
                 // LD
-                load_data = shifted;
+                load_data = combined_shifted;
             }
             default: {}
         }
