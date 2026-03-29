@@ -199,7 +199,7 @@ m_handle_irq:
     mret
 
 m_handle_ecall:
-    nop                    /* TODO: still needed — root cause TBD */
+    nop                    /* pipeline timing workaround — root cause TBD */
     /* SBI call convention: a7=EID, a0-a5=args */
     /* EID 0x00: sbi_set_timer(a0=stime_value) */
     /* EID 0x01: sbi_console_putchar(a0=ch) */
@@ -503,14 +503,4 @@ s_handle_pgfault:
     addi sp, sp, 64
     sret
 
-    .balign 4
-    /* Padding to ensure s_kernel fits in copy size */
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
 s_kernel_end:
