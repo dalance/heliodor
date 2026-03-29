@@ -27,7 +27,7 @@
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
-#define DTB_ADDR        0x803E0000
+#define DTB_ADDR        0x80200000
 
 /* SBI extension IDs */
 #define SBI_LEGACY_SET_TIMER    0x00
@@ -98,7 +98,10 @@ m_trap_handler:
     li t1, 9
     beq t0, t1, m_handle_ecall
 
-    /* Unexpected exception: halt with debug info */
+    /* Unexpected exception: save debug info and halt */
+    csrr x9, mepc       /* x9 = faulting PC */
+    csrr x11, mcause    /* x11 = exception cause */
+    csrr x12, mtval     /* x12 = faulting instruction encoding */
     li x3, 0xEE
     j .
 
