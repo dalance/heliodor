@@ -27,7 +27,7 @@
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
-#define DTB_ADDR        0x80200000
+#define DTB_ADDR        0x80C00000
 
 /* SBI extension IDs */
 #define SBI_LEGACY_SET_TIMER    0x00
@@ -57,7 +57,9 @@ _start:
      *  12: instruction page fault
      *  13: load page fault
      *  15: store page fault */
-    li t0, (1 << 2) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
+    /* Delegate: misaligned load/store(4,6), illegal(2), ecall-U(8),
+     * inst/load/store page fault(12,13,15) */
+    li t0, (1 << 2) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
     csrw medeleg, t0
 
     /* Delegate interrupts to S-mode:
@@ -72,6 +74,10 @@ _start:
     /* Set mstatus: MPP=01 (S-mode), MPIE=1, SIE=1 */
     li t0, (1 << 11) | (1 << 7) | (1 << 5) | (1 << 1)
     csrw mstatus, t0
+
+    /* Set initial stvec to debug handler (catches S-mode traps before kernel sets its own) */
+    la t0, s_debug_trap
+    csrw stvec, t0
 
     /* Set kernel entry point */
     li t0, KERNEL_ENTRY
@@ -266,3 +272,15 @@ sbi_return:
     addi t0, t0, 4
     csrw mepc, t0
     mret
+
+/* ============================================================
+ * S-mode debug trap handler (initial stvec before kernel sets its own)
+ * Captures scause/sepc/stval and halts for debug inspection.
+ * ============================================================ */
+    .balign 4
+s_debug_trap:
+    csrr x9, sepc       /* x9 = faulting PC */
+    csrr x11, scause    /* x11 = exception cause */
+    csrr x12, stval     /* x12 = trap value (faulting addr or instr) */
+    li x3, 0xDD         /* signal: S-mode trap caught */
+    j .
