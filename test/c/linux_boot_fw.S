@@ -67,6 +67,11 @@ _start:
     li t0, 0x222
     csrw mideleg, t0
 
+    /* Set mtimecmp to max to prevent immediate timer interrupt */
+    li t0, CLINT_MTIMECMP
+    li t1, -1               /* 0xFFFFFFFFFFFFFFFF */
+    sd t1, 0(t0)
+
     /* Enable machine timer interrupt (for SBI timer delegation) */
     li t0, 0x80    /* MIE.MTIE = bit 7 */
     csrw mie, t0
@@ -78,6 +83,10 @@ _start:
     /* Set initial stvec to debug handler (catches S-mode traps before kernel sets its own) */
     la t0, s_debug_trap
     csrw stvec, t0
+
+    /* Clear hart_lottery (kernel BSS may not be zeroed by DRAM init) */
+    li t0, 0x80A86440       /* hart_lottery PA (from kernel nm) */
+    sd zero, 0(t0)
 
     /* Set kernel entry point */
     li t0, KERNEL_ENTRY
