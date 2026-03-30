@@ -27,7 +27,7 @@
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
-#define DTB_ADDR        0x80C00000
+#define DTB_ADDR        0x80ABE000
 
 /* SBI extension IDs */
 #define SBI_LEGACY_SET_TIMER    0x00
