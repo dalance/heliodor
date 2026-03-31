@@ -57,6 +57,9 @@ pub module memory (
     var reserv_valid: logic    ;
     var reserv_addr : logic<64>;
 
+    // AMO write-once guard: prevent AMO write from repeating during stall
+    var amo_done: logic;
+
     // SC succeeds if reservation is valid and address matches
     let sc_success: logic = is_sc && reserv_valid && reserv_addr == i_alu_out;
 
@@ -95,6 +98,22 @@ pub module memory (
     // Only gate on EXTERNAL stalls (dcache/MMU), not the split's own stall.
     let external_stall: logic = i_stall && !o_split_stall;
 
+    // AMO read-modify-write flag (not LR/SC)
+    let amo_rw: logic = is_amo && !is_lr && !is_sc;
+
+    // AMO done tracking: set on first AMO cycle, clear when instruction advances
+    always_ff (clk, rst) {
+        if_reset {
+            amo_done = 1'b0;
+        } else if !i_stall {
+            // New instruction entering MEM stage — reset
+            amo_done = 1'b0;
+        } else if amo_rw && i_valid {
+            // AMO in progress and stalled — mark as done after first write
+            amo_done = 1'b1;
+        }
+    }
+
     always_ff (clk, rst) {
         if_reset {
             split_phase2   = 1'b0;
@@ -111,9 +130,12 @@ pub module memory (
     // Memory address: phase 2 reads/writes the upper DW
     assign o_dmem_addr = if split_phase2 ? addr_hi : if crosses_dw ? addr_lo : i_alu_out;
 
+    // AMO write-once: suppress AMO write after first cycle (prevent replay during stall)
+    let amo_wen_ok: logic = !amo_rw || !amo_done;
+
     // Memory enables
-    assign o_dmem_wen = i_valid && (if is_sc ? sc_success : i_mem_wen);
-    assign o_dmem_ren = i_valid && i_mem_ren;
+    assign o_dmem_wen = i_valid && (if is_sc ? sc_success : i_mem_wen) && amo_wen_ok;
+    assign o_dmem_ren = i_valid && i_mem_ren && amo_wen_ok;
 
     // ============================================================
     // Store data alignment and strobe generation
@@ -187,8 +209,17 @@ pub module memory (
 
     // AMO read-modify-write: compute new value from old memory value and rs2
     let amo_word: logic = i_mem_funct3[0] == 1'b0; // funct3=010 → word, 011 → dword
+    // Latch AMO read value on first cycle to survive stall (rdata changes after write)
+    var amo_saved_rdata: logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            amo_saved_rdata = '0;
+        } else if amo_rw && i_valid && !amo_done {
+            amo_saved_rdata = i_dmem_rdata;
+        }
+    }
     // For word AMO, use sign-extended 32-bit values
-    let amo_old_raw: logic<64> = i_dmem_rdata;
+    let amo_old_raw: logic<64> = if amo_done ? amo_saved_rdata : i_dmem_rdata;
     let amo_old    : logic<64> = if amo_word ? {amo_old_raw[31] repeat 32, amo_old_raw[31:0]} : amo_old_raw;
     let amo_src    : logic<64> = if amo_word ? {i_rs2_data[31] repeat 32, i_rs2_data[31:0]} : i_rs2_data;
 
@@ -292,7 +323,8 @@ pub module memory (
     }
 
     // Combinational load data output for MEM→EX forwarding
-    assign o_load_data = load_data;
+    // For AMO: return old value (before modification) to rd
+    assign o_load_data = if amo_rw ? amo_old : load_data;
 
     // SC result: 0 = success, 1 = failure
     let sc_result: logic<64> = if sc_success ? 64'd0 : 64'd1;
@@ -346,7 +378,7 @@ pub module memory (
             o_valid         = i_valid;
             o_pc            = i_pc;
             o_alu_out       = alu_out_final;
-            o_mem_data      = load_data;
+            o_mem_data      = if amo_rw ? amo_old : load_data;
             o_rd_addr       = i_rd_addr;
             o_wb_sel        = i_wb_sel;
             o_reg_wen       = i_reg_wen;
