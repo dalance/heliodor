@@ -74,6 +74,10 @@ heliodor/
 | 7     | F/D extensions (floating-point) — full GC compliance                |
 | 8     | Linux boot integration test                                         |
 
+## Sandbox Restrictions
+
+- **Do NOT use `ps`** to check for running processes. The `ps` command does not work correctly inside the sandbox and produces misleading results (e.g., empty output even when processes are running). Instead, wait for command completion via the shell's return or use the timeout mechanism.
+
 ## RISC-V Reference
 
 - **ISA**: RV64GC (`RV64IMAFDCZicsr_Zifencei`)

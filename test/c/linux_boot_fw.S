@@ -27,7 +27,7 @@
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
-#define DTB_ADDR        0x80ABE000
+#define DTB_ADDR        0x80AB9000
 
 /* SBI extension IDs */
 #define SBI_LEGACY_SET_TIMER    0x00
@@ -47,6 +47,12 @@ _start:
     la t0, m_trap_handler
     csrw mtvec, t0
 
+    /* Set mscratch to M-mode scratch area for register save/restore.
+     * Must be in writable DRAM (not firmware ROM which ignores writes).
+     * Use top of DRAM: 0x80FFF000 (last 32 bytes of 16MB DRAM). */
+    li t0, 0x80FFF000
+    csrw mscratch, t0
+
     /* Allow S-mode to read counters (TIME/CYCLE/INSTRET) */
     li t0, 7
     csrw mcounteren, t0
@@ -59,7 +65,7 @@ _start:
      *  15: store page fault */
     /* Delegate: misaligned load/store(4,6), illegal(2), ecall-U(8),
      * inst/load/store page fault(12,13,15) */
-    li t0, (1 << 2) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
+    li t0, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
     csrw medeleg, t0
 
     /* Delegate interrupts to S-mode:
@@ -85,7 +91,7 @@ _start:
     csrw stvec, t0
 
     /* Clear hart_lottery (kernel BSS may not be zeroed by DRAM init) */
-    li t0, 0x80A86440       /* hart_lottery PA (from kernel nm) */
+    li t0, 0x80A85380       /* hart_lottery PA (from kernel nm) */
     sd zero, 0(t0)
 
     /* Set kernel entry point */
@@ -104,6 +110,12 @@ _start:
  * ============================================================ */
     .balign 4
 m_trap_handler:
+    /* Save t0-t2 to mscratch area (use mscratch as temp stack) */
+    csrrw sp, mscratch, sp    /* swap sp and mscratch */
+    sd t0, 0(sp)
+    sd t1, 8(sp)
+    sd t2, 16(sp)
+
     csrr t0, mcause
 
     /* Interrupt? (MSB set) */
@@ -141,10 +153,17 @@ m_handle_timer:
     /* Disable MTIE to prevent re-entry */
     li t0, 0x80     /* MIE.MTIE = bit 7 */
     csrc mie, t0
+    /* Restore t0-t2 and sp */
+    ld t0, 0(sp)
+    ld t1, 8(sp)
+    ld t2, 16(sp)
+    csrrw sp, mscratch, sp    /* restore sp */
     mret
 
 /* ---- ECALL handling (SBI) ---- */
 m_handle_ecall:
+    /* Restore sp (swapped with mscratch at trap entry) */
+    csrrw sp, mscratch, sp
     /* Save caller's a0 in t3 (needed for probe_extension) */
     mv t3, a0
 
@@ -153,6 +172,10 @@ m_handle_ecall:
     li t0, SBI_LEGACY_SET_TIMER
     beq a7, t0, sbi_legacy_set_timer
     li t0, SBI_LEGACY_PUTCHAR
+    beq a7, t0, sbi_legacy_putchar
+    /* Legacy shutdown (EID 0x08) — reuse SRST halt */
+    li t0, 8
+    beq a7, t0, sbi_srst
     beq a7, t0, sbi_legacy_putchar
 
     /* Standard extensions */

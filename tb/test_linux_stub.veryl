@@ -1,0 +1,274 @@
+// Linux stub boot test: M-mode SBI firmware + minimal S-mode stub kernel
+// testing Sv39 MMU, timer interrupts, and SBI console output.
+// Uses a tiny stub kernel (linux_dram.hex), not the real Linux kernel.
+//
+// Memory map:
+//   PA 0x00000000 : Firmware ROM (16 KB)
+//   PA 0x02000000 : CLINT (internal to heliodor_top)
+//   PA 0x0C000000 : PLIC  (internal to heliodor_top)
+//   PA 0x10000000 : UART  (internal to heliodor_top)
+//   PA 0x80000000 : DRAM  (4 MB, kernel + DTB)
+module test_linux_stub_harness (
+    clk   : input  clock    ,
+    rst   : input  reset    ,
+    o_pass: output logic    ,
+    o_r1  : output logic<64>,
+    o_r2  : output logic<64>,
+    o_r3  : output logic<64>,
+) {
+    var imem_addr : logic<64>     ;
+    var imem_rdata: logic<32>     ;
+    var imem_ren  : logic         ;
+    var dmem_addr : logic<64>     ;
+    var dmem_wdata: logic<64>     ;
+    var dmem_rdata: logic<64>     ;
+    var dmem_wen  : logic         ;
+    var dmem_ren  : logic         ;
+    var dmem_wstrb: logic<8>      ;
+    var dbg_regs  : logic<64> [32];
+    var dbg_pc    : logic<64>     ;
+    var _dbg_pass : logic         ;
+    var _dbg_r1   : logic<64>     ;
+    var _dbg_r2   : logic<64>     ;
+    var dbg_r3    : logic<64>     ;
+    var iptw_addr : logic<64>     ;
+    var iptw_req  : logic         ;
+    var iptw_rdata: logic<64>     ;
+    var dbg_stall : logic<8>      ;
+    var uart_tx   : logic         ;
+    var uart_data : logic<8>      ;
+
+    inst dut: heliodor_top #(
+        RESET_PC: 0,
+    ) (
+        clk                        ,
+        rst                        ,
+        o_imem_addr    : imem_addr ,
+        i_imem_rdata   : imem_rdata,
+        o_imem_ren     : imem_ren  ,
+        o_iptw_addr    : iptw_addr ,
+        o_iptw_req     : iptw_req  ,
+        i_iptw_rdata   : iptw_rdata,
+        i_uart_rx_data : 8'd0      ,
+        i_uart_rx_valid: 1'b0      ,
+        o_dmem_addr    : dmem_addr ,
+        o_dmem_wdata   : dmem_wdata,
+        i_dmem_rdata   : dmem_rdata,
+        o_dmem_wen     : dmem_wen  ,
+        o_dmem_ren     : dmem_ren  ,
+        o_dmem_wstrb   : dmem_wstrb,
+        o_dbg_regs     : dbg_regs  ,
+        o_dbg_pc       : dbg_pc    ,
+        o_dbg_pass     : _dbg_pass ,
+        o_dbg_r1       : _dbg_r1   ,
+        o_dbg_r2       : _dbg_r2   ,
+        o_dbg_r3       : dbg_r3    ,
+        i_ext_irq      : 32'd0     ,
+        o_dbg_stall    : dbg_stall ,
+        o_uart_tx      : uart_tx   ,
+        o_uart_data    : uart_data ,
+    );
+
+    // ============================================================
+    // Memory arrays
+    // ============================================================
+    // Firmware ROM: 16 KB = 4096 × 32-bit words
+    var fw_rom: logic<32> [4096];
+
+    // DRAM: 256 KB = 65536 × 32-bit words (PA 0x80000000 - 0x8003FFFF)
+    var dram: logic<32> [65536];
+
+    initial {
+        $readmemh("test/hex/linux_boot_fw.hex", fw_rom);
+        $readmemh("test/hex/linux_dram.hex", dram);
+    }
+
+    // ============================================================
+    // Address decode
+    // ============================================================
+    // Firmware ROM: PA[31:14] == 0 (0x00000000 - 0x00003FFF)
+    let imem_in_fw  : logic = imem_addr[31:14] == 18'd0;
+    let dmem_in_dram: logic = dmem_addr[31];
+    let iptw_in_fw  : logic = iptw_addr[31:14] == 18'd0;
+    let iptw_in_dram: logic = iptw_addr[31];
+
+    // DRAM word index (from PA, 256 KB range → 16-bit index)
+    let dram_imem_idx: logic<16> = imem_addr[17:2];
+    let dram_dmem_lo : logic<16> = {dmem_addr[17:3], 1'b0};
+    let dram_dmem_hi : logic<16> = {dmem_addr[17:3], 1'b1};
+    let dram_iptw_lo : logic<16> = {iptw_addr[17:3], 1'b0};
+    let dram_iptw_hi : logic<16> = {iptw_addr[17:3], 1'b1};
+
+    // Firmware ROM indices
+    let fw_imem_idx: logic<12> = imem_addr[13:2];
+    let fw_iptw_lo : logic<12> = {iptw_addr[13:3], 1'b0};
+    let fw_iptw_hi : logic<12> = {iptw_addr[13:3], 1'b1};
+
+    // ============================================================
+    // Write-first forwarding for DRAM
+    // ============================================================
+    var fwd_lo: logic<32>;
+    var fwd_hi: logic<32>;
+    always_comb {
+        fwd_lo = dram[dram_dmem_lo];
+        fwd_hi = dram[dram_dmem_hi];
+        if dmem_wen && dmem_in_dram {
+            if dmem_wstrb[0] {
+                fwd_lo[7:0] = dmem_wdata[7:0];
+            }
+            if dmem_wstrb[1] {
+                fwd_lo[15:8] = dmem_wdata[15:8];
+            }
+            if dmem_wstrb[2] {
+                fwd_lo[23:16] = dmem_wdata[23:16];
+            }
+            if dmem_wstrb[3] {
+                fwd_lo[31:24] = dmem_wdata[31:24];
+            }
+            if dmem_wstrb[4] {
+                fwd_hi[7:0] = dmem_wdata[39:32];
+            }
+            if dmem_wstrb[5] {
+                fwd_hi[15:8] = dmem_wdata[47:40];
+            }
+            if dmem_wstrb[6] {
+                fwd_hi[23:16] = dmem_wdata[55:48];
+            }
+            if dmem_wstrb[7] {
+                fwd_hi[31:24] = dmem_wdata[63:56];
+            }
+        }
+    }
+
+    // ============================================================
+    // Instruction memory read (32-bit)
+    // ============================================================
+    assign imem_rdata = if imem_in_fw ? fw_rom[fw_imem_idx] : if imem_addr[31] ? dram[dram_imem_idx] : 32'd0;
+
+    // ============================================================
+    // Instruction PTW read (64-bit) with write forwarding
+    // ============================================================
+    let iptw_lo: logic<32> = if iptw_in_dram && dmem_wen && dmem_in_dram && dram_iptw_lo == dram_dmem_lo ?
+        fwd_lo
+    : if iptw_in_dram && dmem_wen && dmem_in_dram && dram_iptw_lo == dram_dmem_hi ?
+        fwd_hi
+    : if iptw_in_dram ?
+        dram[dram_iptw_lo]
+    : if iptw_in_fw ?
+        fw_rom[fw_iptw_lo]
+    :
+        32'd0
+    ;
+    let iptw_hi: logic<32> = if iptw_in_dram && dmem_wen && dmem_in_dram && dram_iptw_hi == dram_dmem_lo ?
+        fwd_lo
+    : if iptw_in_dram && dmem_wen && dmem_in_dram && dram_iptw_hi == dram_dmem_hi ?
+        fwd_hi
+    : if iptw_in_dram ?
+        dram[dram_iptw_hi]
+    : if iptw_in_fw ?
+        fw_rom[fw_iptw_hi]
+    :
+        32'd0
+    ;
+    assign iptw_rdata = {iptw_hi, iptw_lo};
+
+    // ============================================================
+    // Data memory read (64-bit, no write forwarding for dmem self-read)
+    // ============================================================
+    assign dmem_rdata = if dmem_in_dram ?
+        {dram[dram_dmem_hi], dram[dram_dmem_lo]}
+    : if dmem_addr[31:14] == 18'd0 ?
+        {fw_rom[{dmem_addr[13:3], 1'b1}], fw_rom[{dmem_addr[13:3], 1'b0}]}
+    :
+        64'd0
+    ;
+
+    // ============================================================
+    // Data memory write (byte-strobe, DRAM only)
+    // ============================================================
+    always_ff (clk, rst) {
+        if_reset {} else if dmem_wen && dmem_in_dram {
+            if dmem_wstrb[0] {
+                dram[dram_dmem_lo][7:0] = dmem_wdata[7:0];
+            }
+            if dmem_wstrb[1] {
+                dram[dram_dmem_lo][15:8] = dmem_wdata[15:8];
+            }
+            if dmem_wstrb[2] {
+                dram[dram_dmem_lo][23:16] = dmem_wdata[23:16];
+            }
+            if dmem_wstrb[3] {
+                dram[dram_dmem_lo][31:24] = dmem_wdata[31:24];
+            }
+            if dmem_wstrb[4] {
+                dram[dram_dmem_hi][7:0] = dmem_wdata[39:32];
+            }
+            if dmem_wstrb[5] {
+                dram[dram_dmem_hi][15:8] = dmem_wdata[47:40];
+            }
+            if dmem_wstrb[6] {
+                dram[dram_dmem_hi][23:16] = dmem_wdata[55:48];
+            }
+            if dmem_wstrb[7] {
+                dram[dram_dmem_hi][31:24] = dmem_wdata[63:56];
+            }
+        }
+    }
+
+    // ============================================================
+    // UART output trace + periodic PC trace
+    // ============================================================
+    var cycle_cnt: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            cycle_cnt = 0;
+        } else {
+            cycle_cnt = cycle_cnt + 1;
+            if uart_tx {
+                $write("%c", uart_data);
+            }
+            // Periodic trace
+            if cycle_cnt[18:0] == 19'd0 {
+                $display("  [%d] PC=%h SP=%h", cycle_cnt, dbg_pc, dbg_regs[2]);
+            }
+        }
+    }
+
+    // ============================================================
+    // Debug outputs
+    // ============================================================
+    assign o_r1   = dbg_regs[9]; // x9
+    assign o_r2   = dbg_regs[11]; // x11
+    assign o_r3   = dbg_r3; // x3 (0xAA=success)
+    assign o_pass = dbg_r3 == 64'hAA;
+
+}
+
+#[test(test_linux_stub)]
+module test_linux_stub {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen;
+
+    var pass: logic    ;
+    var r1  : logic<64>;
+    var r2  : logic<64>;
+    var r3  : logic<64>;
+
+    inst harness: test_linux_stub_harness (
+        clk   : clk ,
+        rst   : rst ,
+        o_pass: pass,
+        o_r1  : r1  ,
+        o_r2  : r2  ,
+        o_r3  : r3  ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next  (5000000);
+        $display  ("x9=%h x11=%h x3=%h pass=%b", r1, r2, r3, pass);
+        $assert   (pass, "Linux stub boot: expected x3=0xAA (SBI SRST shutdown)");
+        $display  ("Linux stub boot test passed");
+        $finish   ();
+    }
+}
