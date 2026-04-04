@@ -59,6 +59,7 @@ heliodor/
   veryl test --test test_dcache_lbu   # run specific test only (faster for debugging)
   ```
 - **Formatting**: `veryl fmt`
+- **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
 
 ## Development Roadmap
