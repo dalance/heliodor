@@ -49,8 +49,8 @@ _start:
 
     /* Set mscratch to M-mode scratch area for register save/restore.
      * Must be in writable DRAM (not firmware ROM which ignores writes).
-     * Use top of DRAM: 0x80FFF000 (last 32 bytes of 16MB DRAM). */
-    li t0, 0x80FFF000
+     * Use top of DRAM: 0x81FFF000 (last page of 32MB DRAM). */
+    li t0, 0x81FFF000
     csrw mscratch, t0
 
     /* Allow S-mode to read counters (TIME/CYCLE/INSTRET) */
