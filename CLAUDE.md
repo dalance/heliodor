@@ -58,6 +58,9 @@ heliodor/
   veryl test --disable-jit            # JIT off, all tests
   veryl test --test test_dcache_lbu   # run specific test only (faster for debugging)
   ```
+- **Regression testing**: After modifying heliodor or veryl, run the two-step regression:
+  1. `veryl test` — fast tests (~60 tests, seconds). Fix any failures before proceeding.
+  2. `veryl test --ignored --test test_linux_boot` — Linux boot test (~50M cycles, minutes). Only JIT on is sufficient for this test.
 - **Formatting**: `veryl fmt`
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
