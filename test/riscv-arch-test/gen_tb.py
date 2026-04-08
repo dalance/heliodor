@@ -7,6 +7,7 @@ file with the necessary boilerplate. Run from the heliodor project root:
     python3 test/riscv-arch-test/gen_tb.py
 """
 import os
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -124,7 +125,7 @@ module test_arch_{suite}_{name}_harness (
         }}
     }}
 
-    let tohost_lo: logic<32> = dram[18'd1024];
+    let tohost_lo: logic<32> = dram[18'd{tohost_idx}];
     assign o_tohost = tohost_lo;
     assign o_pass = tohost_lo == 32'd1;
     assign o_fail = tohost_lo[0] == 1'b0 && tohost_lo != 32'd0;
@@ -160,6 +161,30 @@ module test_arch_{suite}_{name} {{
 '''
 
 
+def tohost_index(elf_path):
+    """Return dram-word index of `tohost` symbol, computed from an ELF file.
+
+    dram is organized as logic<32>[262144] covering PA 0x80000000..+1MB, so
+    index = (tohost_vaddr - 0x80000000) / 4. Falls back to 1024 (0x80001000,
+    the default for the standard "p" link.ld) if nm is unavailable or the
+    symbol is missing."""
+    default = 1024
+    if not os.path.exists(elf_path):
+        return default
+    try:
+        out = subprocess.check_output(
+            ["riscv64-unknown-elf-nm", elf_path], stderr=subprocess.DEVNULL
+        ).decode()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return default
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1] == "tohost":
+            addr = int(parts[0], 16)
+            return (addr - 0x80000000) // 4
+    return default
+
+
 def main():
     out = [HEADER]
     total = 0
@@ -174,7 +199,11 @@ def main():
             if f.endswith(".hex")
         )
         for n in names:
-            out.append(HARNESS_TEMPLATE.format(suite=suite, name=n))
+            elf = os.path.join(build_dir, f"{n}.elf")
+            idx = tohost_index(elf)
+            out.append(
+                HARNESS_TEMPLATE.format(suite=suite, name=n, tohost_idx=idx)
+            )
             total += 1
 
     if total == 0:
