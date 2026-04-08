@@ -65,6 +65,50 @@ heliodor/
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
 
+## Running Tests on Verilator
+
+The Veryl native simulator is the default, but tests can also be run on
+Verilator for cross-checking simulator bugs or getting faster wall-clock
+times on long tests (Linux boot: ~22s on Verilator vs ~125s on Veryl sim).
+
+Native Veryl testbenches (those that use `$tb::clock_gen` / `$tb::reset_gen`)
+cannot run directly on Verilator. Instead, SystemVerilog wrappers live in
+`sim/verilator/` and instantiate the corresponding `<test>_harness` modules
+(which *are* emitted to SV by `veryl build`).
+
+Steps:
+
+1. Generate SystemVerilog from the Veryl sources:
+   ```bash
+   veryl build
+   ```
+   This produces `heliodor.f` (file list) and all `.sv` files in `src/` and `tb/`.
+
+2. Build the Verilator binary (re-run after any `.veryl` change):
+   ```bash
+   cd sim/verilator
+   verilator --binary --top tb_linux_boot -f ../../heliodor.f tb_linux_boot.sv \
+             --timing -Wno-fatal -O3 --Mdir build_linux -o tb_linux_boot
+   ```
+
+3. Run from the heliodor project root (the `$readmemh` paths in the harness
+   are relative to the project root):
+   ```bash
+   cd /home/hatta/work/repos/heliodor
+   sim/verilator/build_linux/tb_linux_boot
+   ```
+
+Existing Verilator testbenches:
+
+| TB file            | Target harness                          | Purpose                 |
+|--------------------|-----------------------------------------|-------------------------|
+| `tb_alu.sv`        | `heliodor_test_alu_harness`             | ALU unit test           |
+| `tb_fibonacci.sv`  | `heliodor_test_fibonacci_harness`       | Small pipeline integ.   |
+| `tb_linux_boot.sv` | `heliodor_test_linux_boot_harness`      | Full Linux boot         |
+
+To add a new Verilator wrapper, copy `tb_fibonacci.sv` as a template, rewire
+the ports to the target harness, and use the same `verilator --binary` flags.
+
 ## Development Roadmap
 
 | Phase | Target                                                              |
