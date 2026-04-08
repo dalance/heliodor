@@ -36,10 +36,7 @@ veryl test --ignored --test test_arch_rv64ui         # run all 49 tests
 - The Veryl simulator currently requires `$readmemh` to take a string
   literal, so each test gets its own dedicated harness (cannot be
   parameterised). `gen_tb.py` handles the boilerplate.
-- All 49 rv64ui tests pass under JIT on. Under JIT off, 9 tests
-  involving signed shifts/comparisons (sra/sraiw/sraw/srai/slt/slti/
-  blt/bge/lui) fail — this is a separate Veryl simulator interpreter
-  bug to investigate, NOT a heliodor bug.
+- All 49 rv64ui tests pass under both JIT on and off.
 - The arch tests are marked `#[ignore]` to keep the default `veryl
   test` fast. Run them explicitly via `--ignored --test
   test_arch_rv64ui`.
