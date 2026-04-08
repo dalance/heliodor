@@ -20,25 +20,27 @@ LDFLAGS := -T $(ENV)/p/link.ld
 
 BUILD := build
 
-# rv64ui (RV64I user-mode) tests we currently build.
-RV64UI := add addi addiw addw and andi auipc beq bge bgeu blt bltu bne \
-          jal jalr lb lbu lh lhu lui lw lwu ld or ori sb sh sw sd \
-          sll slli slliw sllw slt slti sltiu sltu sra srai sraiw sraw \
-          srl srli srliw srlw sub subw xor xori
+# Test suites (all auto-discovered from upstream/isa/<suite>/*.S)
+SUITES := rv64ui rv64um rv64ua rv64uc rv64uf rv64ud
 
-RV64UI_HEX := $(addprefix $(BUILD)/rv64ui/,$(addsuffix .hex,$(RV64UI)))
+define SUITE_template
+$(1)_NAMES := $$(patsubst $$(UPSTREAM)/isa/$(1)/%.S,%,$$(wildcard $$(UPSTREAM)/isa/$(1)/*.S))
+$(1)_HEX   := $$(addprefix $$(BUILD)/$(1)/,$$(addsuffix .hex,$$($(1)_NAMES)))
 
-all: rv64ui
+$(1): $$($(1)_HEX)
 
-rv64ui: $(RV64UI_HEX)
+$$(BUILD)/$(1)/%.hex: $$(UPSTREAM)/isa/$(1)/%.S
+	@mkdir -p $$(BUILD)/$(1)
+	$$(CC) $$(CFLAGS) $$(LDFLAGS) $$< -o $$(BUILD)/$(1)/$$*.elf
+	$$(OBJCOPY) -O binary $$(BUILD)/$(1)/$$*.elf $$(BUILD)/$(1)/$$*.bin
+	$$(BIN2HEX) $$(BUILD)/$(1)/$$*.bin $$@
+endef
 
-$(BUILD)/rv64ui/%.hex: $(UPSTREAM)/isa/rv64ui/%.S
-	@mkdir -p $(BUILD)/rv64ui
-	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $(BUILD)/rv64ui/$*.elf
-	$(OBJCOPY) -O binary $(BUILD)/rv64ui/$*.elf $(BUILD)/rv64ui/$*.bin
-	$(BIN2HEX) $(BUILD)/rv64ui/$*.bin $@
+$(foreach s,$(SUITES),$(eval $(call SUITE_template,$(s))))
+
+all: $(SUITES)
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all rv64ui clean
+.PHONY: all clean $(SUITES)

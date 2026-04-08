@@ -1,7 +1,9 @@
 # riscv-tests integration for heliodor
 
-Builds the official riscv-tests rv64ui ISA test suite as `.hex` files
+Builds the official riscv-tests ISA test suites as `.hex` files
 loadable by heliodor and generates one Veryl native testbench per test.
+Suites currently built: `rv64ui`, `rv64um`, `rv64ua`, `rv64uc`,
+`rv64uf`, `rv64ud` (110 tests total).
 
 ## Layout
 
@@ -26,17 +28,34 @@ cd upstream && git submodule update --init env
 ## Build & run
 
 ```bash
-make                                                # build all rv64ui hex files
-python3 gen_tb.py                                   # regenerate tb/test_arch.veryl
-veryl test --ignored --test test_arch_rv64ui         # run all 49 tests
+make                                                  # build every suite
+# or one at a time: make rv64ui / rv64um / rv64ua / rv64uc / rv64uf / rv64ud
+python3 gen_tb.py                                     # regenerate tb/test_arch.veryl
+veryl test --ignored --test test_arch_rv64ui          # one suite
+veryl test --ignored --test test_arch_                # every arch test
 ```
+
+## Current pass rate (2026-04-08)
+
+| Suite   | Passed   | Notes                                                |
+|---------|----------|------------------------------------------------------|
+| rv64ui  | 49/49    | clean (JIT on/off)                                   |
+| rv64um  | 6/13     | div/rem/mulh family fail — RV64M corner cases        |
+| rv64ua  | 19/19    | clean — all atomics pass                             |
+| rv64uc  | 0/1      | `rvc` — compressed decoder gap(s)                    |
+| rv64uf  | 4/11     | heliodor FP 32-bit semantics gaps                    |
+| rv64ud  | 1/12     | heliodor FP 64-bit semantics gaps                    |
+
+Failing suites are tracked as heliodor-side bugs to be fixed in a
+follow-up phase. All failures go through the same harness, so adding a
+fix and re-running `veryl test --ignored --test test_arch_<suite>_<name>`
+is the recommended debug loop.
 
 ## Notes
 
 - The Veryl simulator currently requires `$readmemh` to take a string
   literal, so each test gets its own dedicated harness (cannot be
   parameterised). `gen_tb.py` handles the boilerplate.
-- All 49 rv64ui tests pass under both JIT on and off.
 - The arch tests are marked `#[ignore]` to keep the default `veryl
   test` fast. Run them explicitly via `--ignored --test
-  test_arch_rv64ui`.
+  test_arch_...`.
