@@ -21,7 +21,7 @@ LDFLAGS := -T $(ENV)/p/link.ld
 BUILD := build
 
 # Test suites (all auto-discovered from upstream/isa/<suite>/*.S)
-SUITES := rv64ui rv64um rv64ua rv64uc rv64uf rv64ud
+SUITES := rv64ui rv64um rv64ua rv64uc rv64uf rv64ud rv64mi rv64si
 
 define SUITE_template
 $(1)_NAMES := $$(patsubst $$(UPSTREAM)/isa/$(1)/%.S,%,$$(wildcard $$(UPSTREAM)/isa/$(1)/*.S))
