@@ -58,12 +58,45 @@ heliodor/
   veryl test --disable-jit            # JIT off, all tests
   veryl test --test test_dcache_lbu   # run specific test only (faster for debugging)
   ```
-- **Regression testing**: After modifying heliodor or veryl, run the two-step regression:
-  1. `veryl test` — fast tests (~60 tests, seconds). Fix any failures before proceeding.
-  2. `veryl test --ignored --test test_linux_boot` — Linux boot test (~50M cycles, minutes). Only JIT on is sufficient for this test.
+- **Regression testing**: After modifying heliodor or veryl, run the multi-step regression:
+  1. `veryl test` — fast tests (~70 tests, seconds). Fix any failures before proceeding.
+  2. `veryl test --ignored --test test_arch_rv64ui` — riscv-tests rv64ui (49 tests, ~minute). JIT on is sufficient.
+  3. `veryl test --ignored --test test_linux_boot` — Linux boot test (~50M cycles, minutes). Only JIT on is sufficient for this test.
 - **Formatting**: `veryl fmt`
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
+
+## ISA Compliance Tests (riscv-tests)
+
+The official `riscv-software-src/riscv-tests` ISA tests are integrated
+under `test/riscv-arch-test/`. The upstream is cloned (not a git
+submodule) into `upstream/`, the rv64ui suite is built as `.hex` files
+under `build/rv64ui/`, and one Veryl harness per test is generated into
+`tb/test_arch.veryl`.
+
+Build and (re-)generate the harness:
+
+```bash
+# 1. Build hex files (one-time, requires riscv64-unknown-elf-gcc)
+make -C test/riscv-arch-test
+
+# 2. Regenerate tb/test_arch.veryl from the built .hex files
+python3 test/riscv-arch-test/gen_tb.py
+```
+
+Run all rv64ui ISA tests:
+
+```bash
+veryl test --ignored --test test_arch_rv64ui          # all 49 tests, JIT on
+```
+
+Each test loads its hex into a 1 MB DRAM mapped at PA 0x80000000 and
+boots heliodor at that address. Pass/fail is signalled via the standard
+riscv-tests `tohost` mechanism (write to PA 0x80001000): `tohost == 1`
+means all subtests passed; `tohost > 1` means subtest with that ID
+failed. The arch tests are marked `#[ignore]` so they don't run as part
+of the default `veryl test`; run them explicitly via `--ignored --test
+test_arch_rv64ui` (substring filter matches all 49 tests).
 
 ## Running Tests on Verilator
 
