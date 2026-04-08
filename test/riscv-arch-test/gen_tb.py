@@ -52,8 +52,9 @@ module test_arch_{suite}_{name}_harness (
     var dbg_r1    : logic<64>     ;
     var dbg_r2    : logic<64>     ;
     var dbg_r3    : logic<64>     ;
-    var _iptw_addr: logic<64>     ;
-    var _iptw_req : logic         ;
+    var iptw_addr : logic<64>     ;
+    var iptw_req  : logic         ;
+    var iptw_rdata: logic<64>     ;
 
     inst dut: heliodor_top #(
         RESET_PC: 64'h80000000,
@@ -63,9 +64,9 @@ module test_arch_{suite}_{name}_harness (
         o_imem_addr    : imem_addr ,
         i_imem_rdata   : imem_rdata,
         o_imem_ren     : imem_ren  ,
-        o_iptw_addr    : _iptw_addr,
-        o_iptw_req     : _iptw_req ,
-        i_iptw_rdata   : 64'd0     ,
+        o_iptw_addr    : iptw_addr ,
+        o_iptw_req     : iptw_req  ,
+        i_iptw_rdata   : iptw_rdata,
         i_uart_rx_data : 8'd0      ,
         i_uart_rx_valid: 1'b0      ,
         o_dmem_addr    : dmem_addr ,
@@ -95,6 +96,10 @@ module test_arch_{suite}_{name}_harness (
 
     assign imem_rdata = if imem_addr[31] ? dram[dram_imem_idx] : 32'd0;
     assign dmem_rdata = if in_dram ? {{dram[dram_dmem_hi], dram[dram_dmem_lo]}} : 64'd0;
+
+    let dram_iptw_lo: logic<18> = {{iptw_addr[19:3], 1'b0}};
+    let dram_iptw_hi: logic<18> = {{iptw_addr[19:3], 1'b1}};
+    assign iptw_rdata = if iptw_addr[31] ? {{dram[dram_iptw_hi], dram[dram_iptw_lo]}} : 64'd0;
 
     always_ff (clk, rst) {{
         if_reset {{}} else if dmem_wen && in_dram {{
