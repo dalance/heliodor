@@ -60,11 +60,12 @@ pub module heliodor_top #(
     var if_pc: logic<64>;
 
     // IF/ID pipeline register
-    var ifid_valid     : logic    ;
-    var ifid_pc        : logic<64>;
-    var ifid_instr     : logic<32>;
-    var ifid_compressed: logic    ;
-    var ifid_c_illegal : logic    ;
+    var ifid_valid        : logic    ;
+    var ifid_pc           : logic<64>;
+    var ifid_instr        : logic<32>;
+    var ifid_compressed   : logic    ;
+    var ifid_c_illegal    : logic    ;
+    var ifid_predict_taken: logic    ;
 
     // ID stage output signals
     var id_pc           : logic                <64>;
@@ -141,6 +142,13 @@ pub module heliodor_top #(
     var ex_branch_taken : logic                  ;
     var ex_branch_target: logic              <64>;
     var ex_jump_target  : logic              <64>;
+    var ex_misprediction: logic                  ;
+
+    // Branch prediction signals
+    var bp_predict_taken : logic    ;
+    var bp_predict_target: logic<64>;
+    var if_predict_taken : logic    ;
+    var id_predict_taken : logic    ;
 
     // MEM stage output signals
     var mem_valid        : logic                  ;
@@ -253,6 +261,7 @@ pub module heliodor_top #(
         i_ifid_rs2        : ifid_instr[24:20]                                     ,
         i_ifid_fp_read    : ifid_fp_read                                          , // IF/ID reads FP registers?
         i_branch_taken    : ex_branch_taken                                       ,
+        i_misprediction   : ex_misprediction                                      ,
         i_is_jal          : id_is_jal                                             ,
         i_is_jalr         : id_is_jalr                                            ,
         i_trap_taken      : trap_taken                                            ,
@@ -360,25 +369,52 @@ pub module heliodor_top #(
     let straddled_instr: logic<32> = {icache_rdata_next[15:0], icache_rdata[31:16]};
     let if_instr       : logic<32> = if is_compressed ? expanded_instr : if if_pc[1] ? straddled_instr : icache_rdata;
 
+    // IF stage: detect branch/jal/jalr from fetched instruction opcode
+    let if_opcode   : logic<7> = if_instr[6:0];
+    let if_is_branch: logic    = if_opcode == 7'b1100011;
+    let if_is_jal   : logic    = if_opcode == 7'b1101111;
+    let if_is_jalr  : logic    = if_opcode == 7'b1100111;
+
+    inst u_bp: branch_predictor (
+        clk                                ,
+        rst                                ,
+        i_pc            : if_pc            ,
+        i_is_branch     : if_is_branch     ,
+        i_is_jal        : if_is_jal        ,
+        i_is_jalr       : if_is_jalr       ,
+        o_predict_taken : bp_predict_taken ,
+        o_predict_target: bp_predict_target,
+        // id_* are decode outputs (ID/EX pipeline register) = EX stage values.
+        // ex_branch_taken/target are combinational EX-stage outputs.
+        i_update_valid    : id_valid && !stall_ex                            ,
+        i_update_pc       : id_pc                                            ,
+        i_update_taken    : ex_branch_taken                                  ,
+        i_update_target   : if id_is_jalr ? ex_jump_target : ex_branch_target,
+        i_update_is_branch: id_is_branch                                     ,
+    );
+
     var fetch_imem_addr: logic<64>; // unused, icache drives o_imem_addr
 
     inst u_fetch: fetch #(
         RESET_PC  ,
     ) (
-        clk                                                       ,
-        rst                                                       ,
-        i_stall        : stall_if                                 ,
-        i_branch_taken : ex_branch_taken                          ,
-        i_branch_target: ex_branch_target                         ,
-        i_jump_target  : ex_jump_target                           ,
-        i_is_jalr      : ex_is_jalr                               ,
-        i_trap_taken   : trap_taken                               ,
-        i_trap_target  : trap_target                              ,
-        i_mret_taken   : mret_taken || sret_taken                 ,
-        i_mret_target  : if sret_taken ? csr_sret_pc : csr_mret_pc,
-        i_is_compressed: is_compressed                            ,
-        o_pc           : if_pc                                    ,
-        o_imem_addr    : fetch_imem_addr                          ,
+        clk                                                        ,
+        rst                                                        ,
+        i_stall         : stall_if                                 ,
+        i_branch_taken  : ex_misprediction                         ,
+        i_branch_target : ex_branch_target                         ,
+        i_jump_target   : ex_jump_target                           ,
+        i_is_jalr       : ex_is_jalr                               ,
+        i_trap_taken    : trap_taken                               ,
+        i_trap_target   : trap_target                              ,
+        i_mret_taken    : mret_taken || sret_taken                 ,
+        i_mret_target   : if sret_taken ? csr_sret_pc : csr_mret_pc,
+        i_is_compressed : is_compressed                            ,
+        i_predict_taken : bp_predict_taken                         ,
+        i_predict_target: bp_predict_target                        ,
+        o_pc            : if_pc                                    ,
+        o_imem_addr     : fetch_imem_addr                          ,
+        o_predict_taken : if_predict_taken                         ,
     );
 
     // IF/ID pipeline register
@@ -387,11 +423,12 @@ pub module heliodor_top #(
     // computations in later stages use the correct instruction address.
     always_ff (clk, rst) {
         if_reset {
-            ifid_valid      = 1'b1;
-            ifid_pc         = '0;
-            ifid_instr      = 32'h00000013; // NOP
-            ifid_compressed = 1'b0;
-            ifid_c_illegal  = 1'b0;
+            ifid_valid         = 1'b1;
+            ifid_pc            = '0;
+            ifid_instr         = 32'h00000013; // NOP
+            ifid_compressed    = 1'b0;
+            ifid_c_illegal     = 1'b0;
+            ifid_predict_taken = 1'b0;
             // Shadow pipeline for trap_val (instruction encoding)
             id_instr_shadow = 32'h00000013;
             ex_instr_shadow = 32'h00000013;
@@ -402,17 +439,19 @@ pub module heliodor_top #(
             xret_taken_q = mret_taken || sret_taken;
             // IF/ID pipeline register
             if flush_id && !stall_if {
-                ifid_valid      = 1'b0;
-                ifid_pc         = if_pc;
-                ifid_instr      = 32'h00000013;
-                ifid_compressed = 1'b0;
-                ifid_c_illegal  = 1'b0;
+                ifid_valid         = 1'b0;
+                ifid_pc            = if_pc;
+                ifid_instr         = 32'h00000013;
+                ifid_compressed    = 1'b0;
+                ifid_c_illegal     = 1'b0;
+                ifid_predict_taken = 1'b0;
             } else if !stall_if {
-                ifid_valid      = 1'b1;
-                ifid_pc         = if_pc;
-                ifid_instr      = if_instr;
-                ifid_compressed = is_compressed;
-                ifid_c_illegal  = is_compressed && c_illegal;
+                ifid_valid         = 1'b1;
+                ifid_pc            = if_pc;
+                ifid_instr         = if_instr;
+                ifid_compressed    = is_compressed;
+                ifid_c_illegal     = is_compressed && c_illegal;
+                ifid_predict_taken = if_predict_taken;
             }
             // Shadow pipeline: ID stage (synced with decode pipeline register)
             if flush_id {
@@ -502,6 +541,8 @@ pub module heliodor_top #(
         i_fp_wb_data   : wb_data                    ,
         i_fp_wb_wen    : mem_valid && mem_fp_reg_wen,
         o_valid        : id_valid                   ,
+        i_predict_taken: ifid_predict_taken         ,
+        o_predict_taken: id_predict_taken           ,
         o_dbg_regs                                  ,
         o_dbg_pass                                  ,
         o_dbg_r1                                    ,
@@ -584,9 +625,11 @@ pub module heliodor_top #(
         o_fp_fflags_wen   : ex_fp_fflags_wen,
         o_fp_fflags_ex    : fp_fflags_ex    ,
         o_fp_fflags_ex_wen: fp_fflags_ex_wen,
+        i_predict_taken   : id_predict_taken,
         o_branch_taken    : ex_branch_taken ,
         o_branch_target   : ex_branch_target,
         o_jump_target     : ex_jump_target  ,
+        o_misprediction   : ex_misprediction,
     );
 
     // ============================================================
