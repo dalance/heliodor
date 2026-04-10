@@ -160,6 +160,8 @@ pub module heliodor_top #(
     // Registered copies (1-cycle latched to cut cross-module comb chain)
     var bp_predict_taken_q : logic    ;
     var bp_predict_target_q: logic<64>;
+    // Local BHT for conditional branch prediction (avoids cross-module comb)
+    var local_bht: logic<2> [256];
     var if_predict_taken   : logic    ;
     var id_predict_taken   : logic    ;
     var id_predict_target  : logic<64>;
@@ -389,9 +391,17 @@ pub module heliodor_top #(
     let if_is_branch: logic    = if_opcode == 7'b1100011;
     let if_is_jal   : logic    = if_opcode == 7'b1101111;
     let if_is_jalr  : logic    = if_opcode == 7'b1100111;
-    // JAL immediate decode (for prediction target, avoids cross-module BTB comb chain)
-    let if_jal_imm  : logic<64> = {if_instr[31] repeat 44, if_instr[19:12], if_instr[20], if_instr[30:21], 1'b0};
+    // JAL immediate decode (for prediction target)
+    let if_jal_imm   : logic<64> = {if_instr[31] repeat 44, if_instr[19:12], if_instr[20], if_instr[30:21], 1'b0};
     let if_jal_target: logic<64> = if_pc + if_jal_imm;
+    // B-type immediate decode (for conditional branch prediction target)
+    let if_branch_imm   : logic<64> = {if_instr[31] repeat 52, if_instr[7], if_instr[30:25], if_instr[11:8], 1'b0};
+    let if_branch_target: logic<64> = if_pc + if_branch_imm;
+    // Local BHT prediction read
+    let local_bht_idx  : logic<8> = if_pc[9:2];
+    let local_bht_taken: logic    = local_bht[local_bht_idx][1];
+    // BHT update index (EX stage PC)
+    let bht_upd_idx: logic<8> = id_pc[9:2];
 
     inst u_bp: branch_predictor (
         clk                                ,
@@ -431,14 +441,15 @@ pub module heliodor_top #(
         i_mret_taken    : mret_taken || sret_taken                 ,
         i_mret_target   : if sret_taken ? csr_sret_pc : csr_mret_pc,
         i_is_compressed : is_compressed                            ,
-        // Local prediction (workaround for simulator cross-module comb bug)
-        // Using bp_predict_taken (cross-module from BP) causes Linux boot
-        // failure. All other tests (205 fast + Dhrystone) pass. The comb
-        // values converge correctly (verified with debug + release checks).
-        // Root cause unknown — likely a heliodor pipeline interaction with
-        // VM/interrupts exposed by different prediction timing.
+        // Local prediction: JAL (always taken) + conditional branch (BHT)
+        // JAL prediction + conditional branch BHT prediction
+        // BHT passes 205 fast tests but causes Linux boot SIGSEGV.
+        // Root cause unknown — likely another pipeline timing issue
+        // exposed by branch prediction changing the execution flow.
+        // Disabled pending investigation.
         i_predict_taken : if_is_jal && !icache_stall && !immu_busy ,
-        i_predict_target: if_jal_target                            ,
+        // i_predict_taken : (if_is_jal || (if_is_branch && local_bht_taken)) && !icache_stall && !immu_busy ,
+        i_predict_target: if if_is_jal ? if_jal_target : if_branch_target                                 ,
         o_pc            : if_pc                                    ,
         o_imem_addr     : fetch_imem_addr                          ,
         o_predict_taken : if_predict_taken                         ,
@@ -485,7 +496,7 @@ pub module heliodor_top #(
                 ifid_compressed     = is_compressed;
                 ifid_c_illegal      = is_compressed && c_illegal;
                 ifid_predict_taken  = if_predict_taken;
-                ifid_predict_target = bp_predict_target;
+                ifid_predict_target = if if_is_jal ? if_jal_target : if_branch_target;
                 // Debug removed
             }
             // Shadow pipeline: ID stage (synced with decode pipeline register)
@@ -508,6 +519,30 @@ pub module heliodor_top #(
                 id_csr_fault_q = 1'b0;
             } else if !stall_id {
                 id_csr_fault_q = id_is_csr && csr_access_fault;
+            }
+        }
+    }
+
+    // Local BHT update (from EX stage) and flush
+    let bht_flush: logic = id_valid && (id_is_sfence || id_is_fence_i || (id_is_csr && id_csr_addr == csr_pkg::CSR_SATP)) && !stall_id;
+    always_ff (clk, rst) {
+        if_reset {
+            for i: i32 in 0..256 {
+                local_bht[i] = 2'b01; // weakly not-taken
+            }
+        } else if bht_flush {
+            for i: i32 in 0..256 {
+                local_bht[i] = 2'b01;
+            }
+        } else if id_valid && id_is_branch && !stall_ex {
+            if ex_branch_taken {
+                if local_bht[bht_upd_idx] != 2'b11 {
+                    local_bht[bht_upd_idx] = local_bht[bht_upd_idx] + 2'd1;
+                }
+            } else {
+                if local_bht[bht_upd_idx] != 2'b00 {
+                    local_bht[bht_upd_idx] = local_bht[bht_upd_idx] - 2'd1;
+                }
             }
         }
     }
