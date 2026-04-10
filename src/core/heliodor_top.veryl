@@ -154,9 +154,12 @@ pub module heliodor_top #(
     var ex_jump_target  : logic              <64>;
     var ex_misprediction: logic                  ;
 
-    // Branch prediction signals
+    // Branch prediction signals (raw combinational from branch_predictor)
     var bp_predict_taken   : logic    ;
     var bp_predict_target  : logic<64>;
+    // Registered copies (1-cycle latched to cut cross-module comb chain)
+    var bp_predict_taken_q : logic    ;
+    var bp_predict_target_q: logic<64>;
     var if_predict_taken   : logic    ;
     var id_predict_taken   : logic    ;
     var id_predict_target  : logic<64>;
@@ -386,6 +389,9 @@ pub module heliodor_top #(
     let if_is_branch: logic    = if_opcode == 7'b1100011;
     let if_is_jal   : logic    = if_opcode == 7'b1101111;
     let if_is_jalr  : logic    = if_opcode == 7'b1100111;
+    // JAL immediate decode (for prediction target, avoids cross-module BTB comb chain)
+    let if_jal_imm  : logic<64> = {if_instr[31] repeat 44, if_instr[19:12], if_instr[20], if_instr[30:21], 1'b0};
+    let if_jal_target: logic<64> = if_pc + if_jal_imm;
 
     inst u_bp: branch_predictor (
         clk                                ,
@@ -425,8 +431,14 @@ pub module heliodor_top #(
         i_mret_taken    : mret_taken || sret_taken                 ,
         i_mret_target   : if sret_taken ? csr_sret_pc : csr_mret_pc,
         i_is_compressed : is_compressed                            ,
-        i_predict_taken : bp_predict_taken                         ,
-        i_predict_target: bp_predict_target                        ,
+        // Prediction: all JAL instructions predicted taken with target = PC + imm.
+        // Target is decoded locally from the JAL immediate instead of using
+        // the BTB target (bp_predict_target) — the BTB cross-module comb path
+        // has a suspected simulator evaluation bug. This approach predicts ALL
+        // JALs (not just BTB-hit ones), which is always correct since JAL is
+        // unconditional. Suppress during icache stall (if_instr might be stale).
+        i_predict_taken : if_is_jal && !icache_stall && !immu_busy ,
+        i_predict_target: if_jal_target                            ,
         o_pc            : if_pc                                    ,
         o_imem_addr     : fetch_imem_addr                          ,
         o_predict_taken : if_predict_taken                         ,
@@ -443,7 +455,9 @@ pub module heliodor_top #(
             ifid_instr         = 32'h00000013; // NOP
             ifid_compressed    = 1'b0;
             ifid_c_illegal     = 1'b0;
-            ifid_predict_taken = 1'b0;
+            ifid_predict_taken  = 1'b0;
+            bp_predict_taken_q  = 1'b0;
+            bp_predict_target_q = '0;
             // Shadow pipeline for trap_val (instruction encoding)
             id_instr_shadow = 32'h00000013;
             ex_instr_shadow = 32'h00000013;
@@ -452,21 +466,27 @@ pub module heliodor_top #(
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
+            // Latch prediction signals to cut cross-module comb chain
+            bp_predict_taken_q  = bp_predict_taken;
+            bp_predict_target_q = bp_predict_target;
             // IF/ID pipeline register
             if flush_id && !stall_if {
-                ifid_valid         = 1'b0;
-                ifid_pc            = if_pc;
-                ifid_instr         = 32'h00000013;
-                ifid_compressed    = 1'b0;
-                ifid_c_illegal     = 1'b0;
-                ifid_predict_taken = 1'b0;
+                ifid_valid          = 1'b0;
+                ifid_pc             = if_pc;
+                ifid_instr          = 32'h00000013;
+                ifid_compressed     = 1'b0;
+                ifid_c_illegal      = 1'b0;
+                ifid_predict_taken  = 1'b0;
+                ifid_predict_target = '0;
             } else if !stall_if {
-                ifid_valid         = 1'b1;
-                ifid_pc            = if_pc;
-                ifid_instr         = if_instr;
-                ifid_compressed    = is_compressed;
-                ifid_c_illegal     = is_compressed && c_illegal;
-                ifid_predict_taken = if_predict_taken;
+                ifid_valid          = 1'b1;
+                ifid_pc             = if_pc;
+                ifid_instr          = if_instr;
+                ifid_compressed     = is_compressed;
+                ifid_c_illegal      = is_compressed && c_illegal;
+                ifid_predict_taken  = if_predict_taken;
+                ifid_predict_target = bp_predict_target;
+                // Debug removed
             }
             // Shadow pipeline: ID stage (synced with decode pipeline register)
             if flush_id {
@@ -496,7 +516,17 @@ pub module heliodor_top #(
     assign wb_rd_addr = mem_rd_addr;
     assign wb_wen     = mem_valid && mem_reg_wen;
 
-    let _fwd_exmem_data: logic<64> = if ex_wb_sel == pipeline_pkg::WbSel::MEM ? mem_load_data : ex_alu_out;
+    // EX/MEM forwarding: select the correct data source based on wb_sel.
+    // PC4 (link address for JAL/JALR) must forward the computed link addr,
+    // not the ALU result — otherwise predicted JALs corrupt the link register.
+    let ex_link_addr   : logic<64> = if ex_is_compressed ? ex_pc + 64'd2 : ex_pc + 64'd4;
+    let _fwd_exmem_data: logic<64> = if ex_wb_sel == pipeline_pkg::WbSel::MEM ?
+        mem_load_data
+    : if ex_wb_sel == pipeline_pkg::WbSel::PC4 ?
+        ex_link_addr
+    :
+        ex_alu_out
+    ;
 
     // (debug traces removed)
 
@@ -821,6 +851,11 @@ pub module heliodor_top #(
     assign trap_target = if tvec_mode && irq_taken ? tvec_base + {48'd0, trap_cause[13:0], 2'b00} : tvec_base;
 
     // Asynchronous interrupt detection: take interrupt when pipeline is clean.
+    // Suppress when EX has a taken branch/jump — the instruction in ID may be
+    // from the wrong path (pre-redirect), so mepc would be incorrect.
+    // TODO: With branch prediction, correctly-predicted branches could safely
+    // allow interrupts (!ex_misprediction instead of !ex_branch_taken) since
+    // ID has the correct instruction. But this requires further validation.
     // xret_taken_q suppresses interrupts for 1 cycle after mret/sret so that
     // the NBA privilege/MIE update completes before interrupt eligibility is
     // re-evaluated — prevents mepc corruption from a same-cycle interrupt.
