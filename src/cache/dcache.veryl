@@ -1,7 +1,8 @@
-// Direct-mapped data cache
-// 1KB: 16 sets × 64B lines (8 doublewords per line)
+// 4-way set-associative data cache
+// 4KB: 16 sets × 4 ways × 64B lines (8 doublewords per line)
 // Write-through, no-write-allocate
 // Blocking: stalls pipeline on miss until line fill completes
+// Replacement: pseudo-LRU (3-bit tree per set)
 //
 // Address breakdown (64-bit byte address):
 //   [63:10] tag  |  [9:6] index (4 bits, 16 sets)  |  [5:3] offset (3 bits, 8 words)  |  [2:0] byte
@@ -30,13 +31,41 @@ pub module dcache (
     let offset  : logic<3>  = i_addr[5:3];
     let data_idx: logic<7>  = {index, offset};
 
-    // Cache storage (unpacked array for valid to avoid simulator bit-select bug)
-    var valid: logic     [16] ;
-    var tags : logic<54> [16] ;
-    var data : logic<64> [128]; // [index*8 + word]
+    // Cache storage: 4 ways
+    var valid_0: logic     [16] ;
+    var valid_1: logic     [16] ;
+    var valid_2: logic     [16] ;
+    var valid_3: logic     [16] ;
+    var tags_0 : logic<54> [16] ;
+    var tags_1 : logic<54> [16] ;
+    var tags_2 : logic<54> [16] ;
+    var tags_3 : logic<54> [16] ;
+    var data_0 : logic<64> [128]; // 16 sets × 8 dwords
+    var data_1 : logic<64> [128];
+    var data_2 : logic<64> [128];
+    var data_3 : logic<64> [128];
 
-    // Cache lookup
-    let cache_hit: logic = valid[index] && tags[index] == tag;
+    // Pseudo-LRU tree: 3 bits per set
+    // bit[2]: root → 0=left(way 0,1), 1=right(way 2,3)
+    // bit[1]: left child → 0=way 0, 1=way 1
+    // bit[0]: right child → 0=way 2, 1=way 3
+    var plru: logic<3> [16];
+
+    // Cache lookup: per-way hit
+    let hit_0    : logic = valid_0[index] && tags_0[index] == tag;
+    let hit_1    : logic = valid_1[index] && tags_1[index] == tag;
+    let hit_2    : logic = valid_2[index] && tags_2[index] == tag;
+    let hit_3    : logic = valid_3[index] && tags_3[index] == tag;
+    let cache_hit: logic = hit_0 || hit_1 || hit_2 || hit_3;
+
+    // Hit way select
+    let hit_way: logic<2> = if hit_0 ? 2'd0 : if hit_1 ? 2'd1 : if hit_2 ? 2'd2 : 2'd3;
+
+    // Read data from hit way
+    let rdata_0: logic<64> = data_0[data_idx];
+    let rdata_1: logic<64> = data_1[data_idx];
+    let rdata_2: logic<64> = data_2[data_idx];
+    let rdata_3: logic<64> = data_3[data_idx];
 
     // State machine for line fill
     enum State: logic<2> {
@@ -49,6 +78,7 @@ pub module dcache (
     var fill_count   : logic<3> ; // 0..7, which word to fill
     var fill_index   : logic<4> ; // index being filled
     var fill_tag     : logic<54>; // tag being filled
+    var fill_way     : logic<2> ; // which way to fill
     let fill_data_idx: logic<7>  = {fill_index, fill_count};
 
     // CPU request present
@@ -57,33 +87,43 @@ pub module dcache (
     // Miss: read request, not hit, not already filling
     let miss: logic = i_ren && !cache_hit && state == State::IDLE;
 
+    // PLRU victim selection
+    let plru_bits  : logic<3> = plru[index];
+    let has_invalid: logic    = !valid_0[index] || !valid_1[index] || !valid_2[index] || !valid_3[index];
+    let invalid_way: logic<2> = if !valid_0[index] ? 2'd0 : if !valid_1[index] ? 2'd1 : if !valid_2[index] ? 2'd2 : 2'd3;
+    let plru_way   : logic<2> = {plru_bits[2], if !plru_bits[2] ? plru_bits[1] : plru_bits[0]};
+    let victim_way : logic<2> = if has_invalid ? invalid_way : plru_way;
+
+    let filling: logic = state == State::FILL;
+
     always_ff (clk, rst) {
         if_reset {
             state      = State::IDLE;
             fill_count = 3'd0;
             fill_index = 4'd0;
             fill_tag   = '0;
+            fill_way   = 2'd0;
             for i: i32 in 0..16 {
-                valid[i] = 1'b0;
+                valid_0[i] = 1'b0;
+                valid_1[i] = 1'b0;
+                valid_2[i] = 1'b0;
+                valid_3[i] = 1'b0;
             }
         } else {
             case state {
                 State::IDLE: {
                     if miss {
-                        // Start line fill
                         fill_index = index;
                         fill_tag   = tag;
+                        fill_way   = victim_way;
                         fill_count = 3'd0;
                         state      = State::FILL;
                     }
-                    // Write-through: update cache on write hit, invalidate on miss.
-                    // Invalidation ensures subsequent reads go through fill,
-                    // avoiding stale data when external memory has 1-cycle write latency.
+                    // Write-through: update cache on write hit, invalidate on miss
                     if i_wen {
                         if cache_hit {
-                            // Byte-strobe merge: only update bytes selected by wstrb
-                            let old           : logic<64> = data[data_idx];
-                            data[data_idx] = {
+                            let old: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : rdata_3;
+                            let merged: logic<64> = {
                                 if i_wstrb[7] ? i_wdata[63:56] : old[63:56],
                                 if i_wstrb[6] ? i_wdata[55:48] : old[55:48],
                                 if i_wstrb[5] ? i_wdata[47:40] : old[47:40],
@@ -93,19 +133,68 @@ pub module dcache (
                                 if i_wstrb[1] ? i_wdata[15:8] : old[15:8],
                                 if i_wstrb[0] ? i_wdata[7:0] : old[7:0]
                             };
+                            if hit_0 {
+                                data_0[data_idx] = merged;
+                            }
+                            if hit_1 {
+                                data_1[data_idx] = merged;
+                            }
+                            if hit_2 {
+                                data_2[data_idx] = merged;
+                            }
+                            if hit_3 {
+                                data_3[data_idx] = merged;
+                            }
                         } else {
-                            valid[index] = 1'b0;
+                            // Invalidate the way that would be selected if this were a read miss
+                            if victim_way == 2'd0 {
+                                valid_0[index] = 1'b0;
+                            }
+                            if victim_way == 2'd1 {
+                                valid_1[index] = 1'b0;
+                            }
+                            if victim_way == 2'd2 {
+                                valid_2[index] = 1'b0;
+                            }
+                            if victim_way == 2'd3 {
+                                valid_3[index] = 1'b0;
+                            }
                         }
                     }
                 }
                 State::FILL: {
-                    // Fill one word per cycle from memory
-                    data[fill_data_idx] = i_mem_rdata;
+                    // Fill one dword per cycle from memory
+                    if fill_way == 2'd0 {
+                        data_0[fill_data_idx] = i_mem_rdata;
+                    }
+                    if fill_way == 2'd1 {
+                        data_1[fill_data_idx] = i_mem_rdata;
+                    }
+                    if fill_way == 2'd2 {
+                        data_2[fill_data_idx] = i_mem_rdata;
+                    }
+                    if fill_way == 2'd3 {
+                        data_3[fill_data_idx] = i_mem_rdata;
+                    }
                     if fill_count == 3'd7 {
                         // Fill complete
-                        tags[fill_index]  = fill_tag;
-                        valid[fill_index] = 1'b1;
-                        state             = State::DONE;
+                        if fill_way == 2'd0 {
+                            tags_0[fill_index]  = fill_tag;
+                            valid_0[fill_index] = 1'b1;
+                        }
+                        if fill_way == 2'd1 {
+                            tags_1[fill_index]  = fill_tag;
+                            valid_1[fill_index] = 1'b1;
+                        }
+                        if fill_way == 2'd2 {
+                            tags_2[fill_index]  = fill_tag;
+                            valid_2[fill_index] = 1'b1;
+                        }
+                        if fill_way == 2'd3 {
+                            tags_3[fill_index]  = fill_tag;
+                            valid_3[fill_index] = 1'b1;
+                        }
+                        state = State::DONE;
                     } else {
                         fill_count = fill_count + 3'd1;
                     }
@@ -117,15 +206,24 @@ pub module dcache (
                     state = State::IDLE;
                 }
             }
+
+            // Update PLRU on cache hit (point tree AWAY from accessed way)
+            if cache_hit && cpu_req && !filling {
+                if hit_way[1] == 1'b0 {
+                    plru[index][2] = 1'b1;
+                    plru[index][1] = if hit_way[0] ? 1'b0 : 1'b1;
+                } else {
+                    plru[index][2] = 1'b0;
+                    plru[index][0] = if hit_way[0] ? 1'b0 : 1'b1;
+                }
+            }
         }
     }
 
-    // Read data: from cache on hit, from memory on fill completion
-    assign o_rdata = if cache_hit ? data[data_idx] : i_mem_rdata;
+    // Read data: from hit way on cache hit, from memory during fill
+    assign o_rdata = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : i_mem_rdata;
 
-    // Memory interface (individual assigns for independent comb paths)
-    let filling: logic = state == State::FILL;
-
+    // Memory interface
     assign o_mem_addr = if filling ?
         {fill_tag, fill_index, fill_count, 3'b000}
     : if i_wen ?
@@ -140,18 +238,14 @@ pub module dcache (
 
     // Suppress write-through on cache miss when AMO (ren && wen) to prevent
     // corrupting DRAM before the fill reads the old value.
-    let amo_miss : logic = i_ren && i_wen && !cache_hit;
+    let amo_miss: logic = i_ren && i_wen && !cache_hit;
     assign o_mem_wen = if filling ? 1'b0 : if amo_miss ? 1'b0 : i_wen;
 
     assign o_mem_ren = if filling ? 1'b1 : if i_ren && !cache_hit ? 1'b1 : 1'b0;
 
     assign o_mem_wstrb = if i_wen && !filling ? i_wstrb : '0;
 
-    // Stall on miss, during fill, DONE, and writes during fill.
-    // DONE must stall to prevent the pipeline from advancing before
-    // a new miss at the translated PA can be detected (MMU case).
-    // Writes during fill must stall because the memory port is busy
-    // with fill reads and write-through would be dropped.
+    // Stall on miss, during fill, DONE, and writes during fill
     let write_during_fill: logic = filling && i_wen;
     assign o_stall           = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill;
 
