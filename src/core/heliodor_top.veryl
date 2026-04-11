@@ -162,6 +162,9 @@ pub module heliodor_top #(
     var bp_predict_target_q: logic<64>;
     // Local BHT for conditional branch prediction (avoids cross-module comb)
     var local_bht: logic<2> [256];
+    // Return Address Stack (RAS) for JALR return prediction
+    var ras_stack: logic<64> [8]; // 8-entry circular stack
+    var ras_ptr  : logic<3>    ; // top-of-stack pointer
     var if_predict_taken   : logic    ;
     // 1-cycle delayed prediction flag: true when IF is on a speculative path
     // (fetch was redirected by prediction in the previous cycle).
@@ -407,6 +410,23 @@ pub module heliodor_top #(
     // BHT update index (EX stage PC)
     let bht_upd_idx: logic<8> = id_pc[9:2];
 
+    // RAS: RISC-V call/return detection from IF instruction
+    // Call: JAL/JALR with rd = x1 or x5 (link registers)
+    // Return: JALR with rd = x0, rs1 = x1 or x5
+    let if_rd : logic<5> = if_instr[11:7];
+    let if_rs1: logic<5> = if_instr[19:15];
+    let if_rd_is_link : logic = if_rd == 5'd1 || if_rd == 5'd5;
+    let if_rs1_is_link: logic = if_rs1 == 5'd1 || if_rs1 == 5'd5;
+    let if_is_call  : logic = (if_is_jal || if_is_jalr) && if_rd_is_link;
+    // Return detection: JALR with rs1=link, rd!=link, and imm=0 (standard ret pattern)
+    let if_jalr_imm  : logic<12> = if_instr[31:20];
+    let if_is_return : logic     = if_is_jalr && !if_rd_is_link && if_rs1_is_link && if_jalr_imm == 12'd0;
+    let if_link_addr: logic<64> = if is_compressed ? if_pc + 64'd2 : if_pc + 64'd4;
+    // RAS prediction: return target from top of stack (only if stack non-empty)
+    var ras_count: logic<4>; // number of valid entries (0..8)
+    let ras_predict_target: logic<64> = ras_stack[ras_ptr - 3'd1];
+    let ras_predict_valid : logic     = if_is_return && ras_count != 4'd0;
+
     inst u_bp: branch_predictor (
         clk                                ,
         rst                                ,
@@ -446,6 +466,9 @@ pub module heliodor_top #(
         i_mret_target   : if sret_taken ? csr_sret_pc : csr_mret_pc,
         i_is_compressed : is_compressed                            ,
         // Branch prediction: JAL (always taken) + conditional branch (BHT, 2-bit saturating)
+        // RAS return prediction implemented but disabled (causes Linux boot failure
+        // when speculative fetch jumps to return address — same class of issue as
+        // BHT timing sensitivity, needs further investigation).
         i_predict_taken : (if_is_jal || (if_is_branch && local_bht_taken)) && !icache_stall && !immu_busy ,
         i_predict_target: if if_is_jal ? if_jal_target : if_branch_target                                 ,
         o_pc            : if_pc                                    ,
@@ -523,6 +546,40 @@ pub module heliodor_top #(
                 id_csr_fault_q = 1'b0;
             } else if !stall_id {
                 id_csr_fault_q = id_is_csr && csr_access_fault;
+            }
+        }
+    }
+
+    // RAS update: non-speculative, from EX stage (id_* = EX pipeline register).
+    // Push on committed call (JAL/JALR with rd=x1/x5).
+    // Pop on committed return (JALR with rd!=link, rs1=link).
+    // Link address is computed from EX PC + instruction size.
+    let ex_rd : logic<5> = id_rd_addr;
+    let ex_rs1: logic<5> = id_rs1_addr;
+    let ex_rd_is_link : logic = ex_rd == 5'd1 || ex_rd == 5'd5;
+    let ex_rs1_is_link: logic = ex_rs1 == 5'd1 || ex_rs1 == 5'd5;
+    let ex_is_call_q  : logic = id_valid && (id_is_jal || id_is_jalr) && ex_rd_is_link;
+    let ex_is_return_q: logic = id_valid && id_is_jalr && !ex_rd_is_link && ex_rs1_is_link;
+    let ex_link_addr_ras: logic<64> = if id_is_compressed ? id_pc + 64'd2 : id_pc + 64'd4;
+    always_ff (clk, rst) {
+        if_reset {
+            ras_ptr   = 3'd0;
+            ras_count = 4'd0;
+        } else if !stall_ex {
+            if ex_is_call_q && ex_is_return_q {
+                // Simultaneous call+return: replace TOS (count unchanged)
+                ras_stack[ras_ptr - 3'd1] = ex_link_addr_ras;
+            } else if ex_is_call_q {
+                ras_stack[ras_ptr] = ex_link_addr_ras;
+                ras_ptr            = ras_ptr + 3'd1;
+                if ras_count != 4'd8 {
+                    ras_count = ras_count + 4'd1;
+                }
+            } else if ex_is_return_q {
+                ras_ptr = ras_ptr - 3'd1;
+                if ras_count != 4'd0 {
+                    ras_count = ras_count - 4'd1;
+                }
             }
         }
     }
