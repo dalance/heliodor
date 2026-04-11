@@ -72,13 +72,17 @@ pub module heliodor_top #(
     // IF stage signals
     var if_pc: logic<64>;
 
-    // IF/ID pipeline register
+    // IF/ID pipeline register (slot0)
     var ifid_valid        : logic    ;
     var ifid_pc           : logic<64>;
     var ifid_instr        : logic<32>;
     var ifid_compressed   : logic    ;
     var ifid_c_illegal    : logic    ;
     var ifid_predict_taken: logic    ;
+    // IF/ID pipeline register (slot1 — valid only during dual issue)
+    var s1_ifid_valid : logic    ;
+    var s1_ifid_pc    : logic<64>;
+    var s1_ifid_instr : logic<32>;
 
     // Pre-Decode Buffer (PDB): holds 2nd instruction from dual fetch
     var pdb_valid     : logic    ;
@@ -263,6 +267,39 @@ pub module heliodor_top #(
     var wb_rd_addr: logic<5> ;
     var wb_wen    : logic    ;
 
+    // Slot1 regfile read data (from decode module's regfile ports 3/4)
+    var s1_rs1_raw: logic<64>;
+    var s1_rs2_raw: logic<64>;
+
+    // Slot1 EX/WB pipeline signals (from execute_s1)
+    var s1_ex_valid  : logic    ;
+    var s1_ex_pc     : logic<64>;
+    var s1_ex_alu_out: logic<64>;
+    var s1_ex_rd_addr: logic<5> ;
+    var s1_ex_reg_wen: logic    ;
+    // Slot1 WB signals
+    let s1_wb_data   : logic<64> = s1_ex_alu_out;
+    let s1_wb_rd_addr: logic<5>  = s1_ex_rd_addr;
+    let s1_wb_wen    : logic     = s1_ex_valid && s1_ex_reg_wen;
+
+    // Slot1 ID/EX pipeline signals
+    var s1_id_valid    : logic                    ;
+    var s1_id_pc       : logic                <64>;
+    var s1_id_rs1_data : logic                <64>;
+    var s1_id_rs2_data : logic                <64>;
+    var s1_id_imm      : logic                <64>;
+    var s1_id_rd_addr  : logic                <5> ;
+    var s1_id_rs1_addr : logic                <5> ;
+    var s1_id_rs2_addr : logic                <5> ;
+    var s1_id_alu_op   : alu_pkg::AluOp           ;
+    var s1_id_alu_src_a: pipeline_pkg::AluSrcA    ;
+    var s1_id_alu_src_b: pipeline_pkg::AluSrcB    ;
+    var s1_id_reg_wen  : logic                    ;
+
+    // Slot1 forwarding selects
+    var s1_fwd_a: pipeline_pkg::FwdSel;
+    var s1_fwd_b: pipeline_pkg::FwdSel;
+
     // ============================================================
     // Hazard unit (declared first since others depend on it)
     // ============================================================
@@ -318,10 +355,16 @@ pub module heliodor_top #(
         i_rs2_addr     : id_rs2_addr                    ,
         i_exmem_rd     : ex_rd_addr                     ,
         i_exmem_wen    : ex_reg_wen                     ,
+        i_s1exwb_rd    : s1_ex_rd_addr                  ,
+        i_s1exwb_wen   : s1_ex_reg_wen && s1_ex_valid   ,
         i_memwb_rd     : mem_rd_addr                    ,
         i_memwb_wen    : mem_reg_wen                    ,
         o_fwd_a        : fwd_a                          ,
         o_fwd_b        : fwd_b                          ,
+        i_s1_rs1_addr  : s1_id_rs1_addr                 ,
+        i_s1_rs2_addr  : s1_id_rs2_addr                 ,
+        o_s1_fwd_a     : s1_fwd_a                       ,
+        o_s1_fwd_b     : s1_fwd_b                       ,
         // FP forwarding (rs1/rs2/rs3 addresses from ID/EX pipeline register)
         i_fp_rs1_addr  : id_rs1_addr                    , // same field as integer
         i_fp_rs2_addr  : id_rs2_addr                    , // same field as integer
@@ -481,10 +524,92 @@ pub module heliodor_top #(
     // slot1_pc[1]=1 means slot1 straddles word boundaries, and
     // icache_rdata_next alone cannot provide the full 32-bit encoding.
     let slot1_word_aligned: logic = !slot1_pc[1];
-    // PDB disabled: single-issue pipeline gains no benefit from dual fetch
-    // (PDB drain costs 1 cycle, negating the fetch bandwidth gain).
-    // Enable when Phase 2b adds true 2-way issue capability.
-    let dual_fetch_valid  : logic = 1'b0;
+    // Dual fetch: slot1 is available when slot0 is not control-flow, both
+    // slots are word-aligned and in the same cache line.
+    let dual_fetch_valid: logic = !slot0_is_control && !icache_stall && !immu_busy && !pdb_valid && !if_predict_taken && slot1_same_line && !if_pc[1] && slot1_word_aligned;
+
+    // ============================================================
+    // Slot1 decode (combinational): decoder + imm_gen for dual-issue
+    // ============================================================
+    var s1_dec_alu_op   : alu_pkg::AluOp       ;
+    var s1_dec_alu_src_a: pipeline_pkg::AluSrcA ;
+    var s1_dec_alu_src_b: pipeline_pkg::AluSrcB ;
+    var s1_dec_imm_type : riscv_pkg::ImmType    ;
+    var s1_dec_wb_sel   : pipeline_pkg::WbSel   ;
+    var s1_dec_reg_wen  : logic                 ;
+    var s1_dec_mem_ren  : logic                 ;
+    var s1_dec_mem_wen  : logic                 ;
+    var s1_dec_is_branch: logic                 ;
+    var s1_dec_is_jal   : logic                 ;
+    var s1_dec_is_jalr  : logic                 ;
+    var s1_dec_is_ecall : logic                 ;
+    var s1_dec_is_ebreak: logic                 ;
+    var s1_dec_is_mret  : logic                 ;
+    var s1_dec_is_csr   : logic                 ;
+    var s1_dec_illegal  : logic                 ;
+    var s1_dec_is_amo   : logic                 ;
+    var s1_dec_is_fp    : logic                 ;
+    var s1_dec_is_sfence: logic                 ;
+    var s1_dec_is_fence_i: logic                ;
+
+    inst u_decoder_s1: decoder (
+        i_instr     : s1_ifid_instr    ,
+        o_alu_op    : s1_dec_alu_op    ,
+        o_alu_src_a : s1_dec_alu_src_a ,
+        o_alu_src_b : s1_dec_alu_src_b ,
+        o_imm_type  : s1_dec_imm_type  ,
+        o_wb_sel    : s1_dec_wb_sel    ,
+        o_reg_wen   : s1_dec_reg_wen   ,
+        o_mem_ren   : s1_dec_mem_ren   ,
+        o_mem_wen   : s1_dec_mem_wen   ,
+        o_is_branch : s1_dec_is_branch ,
+        o_is_jal    : s1_dec_is_jal    ,
+        o_is_jalr   : s1_dec_is_jalr   ,
+        o_is_ecall  : s1_dec_is_ecall  ,
+        o_is_ebreak : s1_dec_is_ebreak ,
+        o_is_mret   : s1_dec_is_mret   ,
+        o_csr_op    : _                ,
+        o_is_csr    : s1_dec_is_csr    ,
+        o_csr_imm   : _                ,
+        o_illegal   : s1_dec_illegal   ,
+        o_is_amo    : s1_dec_is_amo    ,
+        o_amo_funct5: _                ,
+        o_is_fp     : s1_dec_is_fp     ,
+        o_fp_reg_wen: _                ,
+        o_fp_int_wen: _                ,
+        o_fpu_op    : _                ,
+        o_fp_rm     : _                ,
+        o_fp_rs3_addr: _               ,
+        o_is_sfence : s1_dec_is_sfence ,
+        o_is_fence_i: s1_dec_is_fence_i,
+    );
+
+    var s1_dec_imm: logic<64>;
+    inst u_imm_gen_s1: imm_gen (
+        i_instr   : s1_ifid_instr   ,
+        i_imm_type: s1_dec_imm_type ,
+        o_imm     : s1_dec_imm      ,
+    );
+
+    // Slot1 is a simple ALU instruction (eligible for dual-issue)
+    let slot1_opcode: logic<7> = slot1_instr[6:0];
+    let slot1_is_alu: logic = slot1_opcode == 7'b0110011 // OP (ADD/SUB/MUL/...)
+                           || slot1_opcode == 7'b0111011 // OP-32 (ADDW/SUBW/...)
+                           || slot1_opcode == 7'b0010011 // OP-IMM (ADDI/SLTI/...)
+                           || slot1_opcode == 7'b0011011 // OP-IMM-32 (ADDIW/...)
+                           || slot1_opcode == 7'b0110111 // LUI
+                           || slot1_opcode == 7'b0010111 // AUIPC
+                           ;
+
+    // Intra-pair RAW hazard: slot0 writes rd that slot1 reads
+    let slot1_rs1: logic<5> = slot1_instr[19:15];
+    let slot1_rs2: logic<5> = slot1_instr[24:20];
+    let slot0_rd : logic<5> = if_instr[11:7];
+    let intra_pair_raw: logic = slot0_rd != 5'd0 &&
+        (slot0_rd == slot1_rs1 || slot0_rd == slot1_rs2);
+
+    // Dual-issue decision: slot1 can execute in parallel with slot0
+    let dual_issue: logic = dual_fetch_valid && slot1_is_alu && !intra_pair_raw && !stall_if;
 
     inst u_bp: branch_predictor (
         clk                                ,
@@ -547,6 +672,21 @@ pub module heliodor_top #(
             ifid_compressed    = 1'b0;
             ifid_c_illegal     = 1'b0;
             ifid_predict_taken  = 1'b0;
+            s1_ifid_valid       = 1'b0;
+            s1_ifid_pc          = '0;
+            s1_ifid_instr       = 32'h00000013;
+            s1_id_valid         = 1'b0;
+            s1_id_pc            = '0;
+            s1_id_rs1_data      = '0;
+            s1_id_rs2_data      = '0;
+            s1_id_imm           = '0;
+            s1_id_rd_addr       = 5'd0;
+            s1_id_rs1_addr      = 5'd0;
+            s1_id_rs2_addr      = 5'd0;
+            s1_id_alu_op        = alu_pkg::AluOp::ADD;
+            s1_id_alu_src_a     = pipeline_pkg::AluSrcA::REG;
+            s1_id_alu_src_b     = pipeline_pkg::AluSrcB::REG;
+            s1_id_reg_wen       = 1'b0;
             pdb_valid           = 1'b0;
             pdb_pc              = '0;
             pdb_instr           = 32'h00000013;
@@ -611,8 +751,11 @@ pub module heliodor_top #(
             // the PDB instruction hasn't entered IF/ID yet and must be kept).
             if (flush_id && !stall_if) || trap_taken {
                 pdb_valid = 1'b0;
+            } else if !stall_if && dual_issue {
+                // Dual issue: slot1 goes directly to s1_ifid, no PDB needed
+                // (PDB stays invalid)
             } else if !stall_if && dual_fetch_valid && !pdb_valid {
-                // Dual fetch: store slot1 in PDB
+                // Dual fetch but no dual issue: store slot1 in PDB
                 pdb_valid      = 1'b1;
                 pdb_pc         = slot1_pc;
                 pdb_instr      = slot1_instr;
@@ -622,6 +765,37 @@ pub module heliodor_top #(
                 // PDB drain: consumed into IF/ID above
                 pdb_valid = 1'b0;
             }
+
+            // Slot1 IF/ID pipeline register
+            if flush_id || stall_if {
+                s1_ifid_valid = 1'b0;
+            } else if dual_issue {
+                s1_ifid_valid = 1'b1;
+                s1_ifid_pc    = slot1_pc;
+                s1_ifid_instr = slot1_instr;
+            } else {
+                s1_ifid_valid = 1'b0;
+            }
+
+            // Slot1 ID/EX pipeline register (latch decoded slot1 signals)
+            if flush_id || flush_ex {
+                s1_id_valid = 1'b0;
+                s1_id_reg_wen = 1'b0;
+            } else if !stall_id {
+                s1_id_valid     = s1_ifid_valid;
+                s1_id_pc        = s1_ifid_pc;
+                s1_id_rs1_data  = s1_rs1_raw;
+                s1_id_rs2_data  = s1_rs2_raw;
+                s1_id_imm       = s1_dec_imm;
+                s1_id_rd_addr   = s1_ifid_instr[11:7];
+                s1_id_rs1_addr  = s1_ifid_instr[19:15];
+                s1_id_rs2_addr  = s1_ifid_instr[24:20];
+                s1_id_alu_op    = s1_dec_alu_op;
+                s1_id_alu_src_a = s1_dec_alu_src_a;
+                s1_id_alu_src_b = s1_dec_alu_src_b;
+                s1_id_reg_wen   = s1_ifid_valid && s1_dec_reg_wen;
+            }
+
             // Shadow pipeline: ID stage (synced with decode pipeline register)
             if flush_id {
                 id_instr_shadow = 32'h00000013;
@@ -788,14 +962,14 @@ pub module heliodor_top #(
         o_predict_taken : id_predict_taken           ,
         i_predict_target: ifid_predict_target        ,
         o_predict_target: id_predict_target          ,
-        // Slot1 register file access (unused until dual-issue enabled)
-        i_s1_rs1_addr   : 5'd0                       ,
-        i_s1_rs2_addr   : 5'd0                       ,
-        o_s1_rs1_data   : _                            ,
-        o_s1_rs2_data   : _                            ,
-        i_s1_wb_rd      : 5'd0                       ,
-        i_s1_wb_data    : 64'd0                      ,
-        i_s1_wb_wen     : 1'b0                       ,
+        // Slot1 register file access
+        i_s1_rs1_addr   : s1_ifid_instr[19:15]        ,
+        i_s1_rs2_addr   : s1_ifid_instr[24:20]        ,
+        o_s1_rs1_data   : s1_rs1_raw                   ,
+        o_s1_rs2_data   : s1_rs2_raw                   ,
+        i_s1_wb_rd      : s1_wb_rd_addr                ,
+        i_s1_wb_data    : s1_wb_data                   ,
+        i_s1_wb_wen     : s1_wb_wen                    ,
         o_dbg_regs                                   ,
         o_dbg_pass                                   ,
         o_dbg_r1                                     ,
@@ -851,6 +1025,7 @@ pub module heliodor_top #(
         // ALU result for other instructions.
         i_fwd_exmem       : _fwd_exmem_data  ,
         i_fwd_memwb       : wb_data          ,
+        i_fwd_s1exwb      : s1_wb_data       ,
         i_fwd_a           : fwd_a            ,
         i_fwd_b           : fwd_b            ,
         i_fp_fwd_exmem    : _fwd_exmem_data  , // same data source (ALU/MEM/PC4 mux)
@@ -1303,11 +1478,44 @@ pub module heliodor_top #(
         o_wb_data      : wb_data          ,
     );
 
+    // ============================================================
+    // Slot1 execute path (ALU only)
+    // ============================================================
+    inst u_execute_s1: execute_s1 (
+        clk                                  ,
+        rst                                  ,
+        i_valid     : s1_id_valid            ,
+        i_pc        : s1_id_pc               ,
+        i_rs1_data  : s1_id_rs1_data         ,
+        i_rs2_data  : s1_id_rs2_data         ,
+        i_imm       : s1_id_imm              ,
+        i_rd_addr   : s1_id_rd_addr          ,
+        i_rs1_addr  : s1_id_rs1_addr         ,
+        i_rs2_addr  : s1_id_rs2_addr         ,
+        i_alu_op    : s1_id_alu_op           ,
+        i_alu_src_a : s1_id_alu_src_a        ,
+        i_alu_src_b : s1_id_alu_src_b        ,
+        i_reg_wen   : s1_id_reg_wen          ,
+        i_fwd_exmem : _fwd_exmem_data        ,
+        i_fwd_s1exwb: s1_wb_data             , // slot1's own previous result
+        i_fwd_memwb : wb_data                ,
+        i_fwd_a     : s1_fwd_a               ,
+        i_fwd_b     : s1_fwd_b               ,
+        i_stall     : stall_ex               ,
+        i_flush     : flush_ex || (flush_id && !stall_ex),
+        o_valid     : s1_ex_valid            ,
+        o_pc        : s1_ex_pc               ,
+        o_alu_out   : s1_ex_alu_out          ,
+        o_rd_addr   : s1_ex_rd_addr          ,
+        o_reg_wen   : s1_ex_reg_wen          ,
+    );
+
     // Debug PC output
     assign o_dbg_pc = ex_pc; // MEM stage PC (accurate for store traces)
 
-    // Debug: instruction retirement
-    assign o_dbg_instret = mem_valid;
+    // Debug: instruction retirement (count both slot0 and slot1)
+    assign o_dbg_instret = mem_valid || s1_ex_valid;
+
 
     // Debug stall signals
     assign o_dbg_stall = {
