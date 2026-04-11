@@ -80,6 +80,13 @@ pub module heliodor_top #(
     var ifid_c_illegal    : logic    ;
     var ifid_predict_taken: logic    ;
 
+    // Pre-Decode Buffer (PDB): holds 2nd instruction from dual fetch
+    var pdb_valid     : logic    ;
+    var pdb_pc        : logic<64>;
+    var pdb_instr     : logic<32>;
+    var pdb_compressed: logic    ;
+    var pdb_c_illegal : logic    ;
+
     // ID stage output signals
     var id_pc           : logic                <64>;
     var id_rs1_data     : logic                <64>;
@@ -439,6 +446,32 @@ pub module heliodor_top #(
     let ras_predict_target: logic<64> = ras_stack[ras_ptr - 3'd1];
     let ras_predict_valid : logic     = if_is_return && ras_count != 4'd0;
 
+    // ============================================================
+    // Dual fetch: second instruction (slot1) detection
+    // ============================================================
+    let slot0_size  : logic<3>  = if is_compressed ? 3'd2 : 3'd4;
+    let slot1_pc    : logic<64> = if_pc + {61'd0, slot0_size};
+    // slot1 raw halfword from icache
+    let slot1_halfword: logic<16> = if is_compressed ?
+        (if if_pc[1] ? icache_rdata_next[15:0] : icache_rdata[31:16])
+    :
+        (if if_pc[1] ? icache_rdata_next[31:16] : icache_rdata_next[15:0])
+    ;
+    let slot1_is_compressed: logic = slot1_halfword[1:0] != 2'b11;
+    var slot1_expanded: logic<32>;
+    var slot1_c_illegal: logic;
+    inst u_c_expander_s1: c_expander (
+        i_cinstr : slot1_halfword,
+        o_instr  : slot1_expanded,
+        o_illegal: slot1_c_illegal,
+    );
+    let slot1_word : logic<32> = icache_rdata_next;
+    let slot1_instr: logic<32> = if slot1_is_compressed ? slot1_expanded : slot1_word;
+    // Dual fetch valid: slot1 is valid when slot0 is not control-flow
+    let slot0_is_control: logic = if_is_jal || if_is_jalr || if_is_branch ||
+        (if_instr[6:0] == 7'b1110011) || (if_instr[6:0] == 7'b0001111) || (if_instr[6:0] == 7'b0101111);
+    let dual_fetch_valid: logic = 1'b0; // PDB disabled for debugging
+
     inst u_bp: branch_predictor (
         clk                                ,
         rst                                ,
@@ -481,6 +514,9 @@ pub module heliodor_top #(
         // RAS disabled (Linux boot timing sensitivity — see speculative_fault fix)
         i_predict_taken : (if_is_jal || (if_is_branch && local_bht_taken)) && !icache_stall && !immu_busy ,
         i_predict_target: if if_is_jal ? if_jal_target : if_branch_target                                 ,
+        i_pdb_valid     : pdb_valid                                                                        ,
+        i_dual_fetch    : dual_fetch_valid                                                                 ,
+        i_slot1_size    : if slot1_is_compressed ? 3'd2 : 3'd4                                             ,
         o_pc            : if_pc                                    ,
         o_imem_addr     : fetch_imem_addr                          ,
         o_predict_taken : if_predict_taken                         ,
@@ -498,6 +534,11 @@ pub module heliodor_top #(
             ifid_compressed    = 1'b0;
             ifid_c_illegal     = 1'b0;
             ifid_predict_taken  = 1'b0;
+            pdb_valid           = 1'b0;
+            pdb_pc              = '0;
+            pdb_instr           = 32'h00000013;
+            pdb_compressed      = 1'b0;
+            pdb_c_illegal       = 1'b0;
             speculative_if      = 1'b0;
             bp_predict_taken_q  = 1'b0;
             bp_predict_target_q = '0;
@@ -524,6 +565,21 @@ pub module heliodor_top #(
             // Latch prediction signals to cut cross-module comb chain
             bp_predict_taken_q  = bp_predict_taken;
             bp_predict_target_q = bp_predict_target;
+            // PDB management: flush on redirect, fill on dual fetch, drain to IF/ID
+            if flush_id || trap_taken {
+                pdb_valid = 1'b0;
+            } else if !stall_if && dual_fetch_valid && !pdb_valid {
+                // Dual fetch: store slot1 in PDB
+                pdb_valid      = 1'b1;
+                pdb_pc         = slot1_pc;
+                pdb_instr      = slot1_instr;
+                pdb_compressed = slot1_is_compressed;
+                pdb_c_illegal  = slot1_is_compressed && slot1_c_illegal;
+            } else if !stall_if && pdb_valid && !flush_id {
+                // PDB drain: will be consumed into IF/ID below
+                pdb_valid = 1'b0;
+            }
+
             // IF/ID pipeline register
             if flush_id && !stall_if {
                 ifid_valid          = 1'b0;
@@ -533,6 +589,15 @@ pub module heliodor_top #(
                 ifid_c_illegal      = 1'b0;
                 ifid_predict_taken  = 1'b0;
                 ifid_predict_target = '0;
+            } else if !stall_if && pdb_valid {
+                // PDB drain: feed buffered instruction to IF/ID
+                ifid_valid          = 1'b1;
+                ifid_pc             = pdb_pc;
+                ifid_instr          = pdb_instr;
+                ifid_compressed     = pdb_compressed;
+                ifid_c_illegal      = pdb_c_illegal;
+                ifid_predict_taken  = 1'b0; // PDB instructions have no prediction
+                ifid_predict_target = '0;
             } else if !stall_if {
                 ifid_valid          = 1'b1;
                 ifid_pc             = if_pc;
@@ -541,7 +606,6 @@ pub module heliodor_top #(
                 ifid_c_illegal      = is_compressed && c_illegal;
                 ifid_predict_taken  = if_predict_taken;
                 ifid_predict_target = if if_is_jal ? if_jal_target : if_branch_target;
-                // Debug removed
             }
             // Shadow pipeline: ID stage (synced with decode pipeline register)
             if flush_id {
