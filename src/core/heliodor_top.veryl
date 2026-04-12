@@ -67,6 +67,26 @@ pub module heliodor_top #(
     // Bit R = 1 means register xR has a pending write not yet available.
     var scoreboard: logic<32>;
 
+    // MSHR (Miss Status Holding Register): holds load metadata during dcache fill.
+    // Non-blocking: pipeline continues while fill completes in background.
+    var mshr_valid     : logic    ;
+    var mshr_rd_addr   : logic<5> ;
+    var mshr_funct3    : logic<3> ;
+    var mshr_byte_off  : logic<3> ;
+    var mshr_is_fp     : logic    ;
+    var mshr_fp_reg_wen: logic    ;
+    // MSHR combinational signals (forward-declared, assigned after dcache)
+    var mshr_absorb     : logic    ;
+    var mshr_wb_valid   : logic    ;
+    var mshr_wb_conflict: logic    ;
+    var mshr_wb_data    : logic<64>;
+    var mshr_int_wb     : logic    ; // MSHR writes integer regfile
+    var mshr_fp_wb      : logic    ; // MSHR writes FP regfile
+    var actual_wb_rd    : logic<5> ;
+    var actual_wb_data  : logic<64>;
+    var actual_wb_wen   : logic    ;
+    var actual_fp_wb_wen: logic    ;
+
     // Forwarding unit outputs
     var fwd_a     : pipeline_pkg::FwdSel;
     var fwd_b     : pipeline_pkg::FwdSel;
@@ -208,6 +228,7 @@ pub module heliodor_top #(
     var mem_misaligned   : logic                  ;
     var mem_misalign_st  : logic                  ;
     var mem_split_stall  : logic                  ;
+    var mem_crosses_dw   : logic                  ;
 
     // CSR signals
     var csr_rdata       : logic             <64>;
@@ -326,30 +347,15 @@ pub module heliodor_top #(
      || ifid_opcode == 7'b0100111; // FP-STORE (reads FP rs2)
 
     // ============================================================
-    // Scoreboard-based stall: replaces point-to-point load-use check.
-    // Stall when source register has a pending write AND the result
-    // won't be available via forwarding when consumer reaches EX.
+    // Scoreboard-based stall (forward-declared; computed after dcache)
     // ============================================================
     let ifid_rs1_addr: logic<5> = ifid_instr[19:15];
     let ifid_rs2_addr: logic<5> = ifid_instr[24:20];
-    // Result will be in MEM_WB (forwarding available) when load is in MEM
-    // stage (ex_*) and advancing to WB (no dcache/mmu stall).
-    // Uses dcache_stall/mmu_stall directly to avoid circular dependency with hazard_unit.
-    let sb_avail_rs1: logic = ex_reg_wen && ex_rd_addr != 5'd0 && ex_rd_addr == ifid_rs1_addr && !dcache_stall && !mmu_stall;
-    let sb_avail_rs2: logic = ex_reg_wen && ex_rd_addr != 5'd0 && ex_rd_addr == ifid_rs2_addr && !dcache_stall && !mmu_stall;
-    // Result already in WB (mem_*): forwarding or regfile write-first resolves
-    let sb_wb_rs1: logic = mem_reg_wen && mem_rd_addr != 5'd0 && mem_rd_addr == ifid_rs1_addr;
-    let sb_wb_rs2: logic = mem_reg_wen && mem_rd_addr != 5'd0 && mem_rd_addr == ifid_rs2_addr;
-    // Combined scoreboard stall: EX-stage interlock + scoreboard for MEM-stage
     // EX-stage: direct load-use check (load/SC in EX, consumer in ID)
     let ex_has_pending: logic = (id_mem_ren || (id_is_amo && id_amo_funct5 == 5'b00011)) && id_rd_addr != 5'd0;
     let ex_load_use   : logic = ex_has_pending && (id_rd_addr == ifid_rs1_addr || id_rd_addr == ifid_rs2_addr);
-    // MEM-stage: scoreboard catches dcache-stall case (load stuck in MEM)
-    // Only fire if EX-stage check didn't already stall (avoid double-counting)
-    let sb_mem_stall: logic = !ex_load_use
-                           && ((scoreboard[ifid_rs1_addr] && !sb_avail_rs1 && !sb_wb_rs1)
-                            || (scoreboard[ifid_rs2_addr] && !sb_avail_rs2 && !sb_wb_rs2));
-    let sb_stall: logic = ex_load_use || sb_mem_stall;
+    // sb_stall is var because it depends on dcache outputs (computed later)
+    var sb_stall: logic;
 
     inst u_hazard: hazard_unit (
         // SC result is computed in MEM stage (like a load), needs load-use stall.
@@ -380,6 +386,7 @@ pub module heliodor_top #(
         i_mmu_stall       : mmu_stall                                             ,
         i_icache_stall    : icache_stall || immu_busy                             ,
         i_dcache_stall    : dcache_stall                                          ,
+        i_mshr_wb_stall   : mshr_wb_conflict                                     ,
         o_stall_if        : stall_if                                              ,
         o_stall_id        : stall_id                                              ,
         o_stall_ex        : stall_ex                                              ,
@@ -817,6 +824,12 @@ pub module heliodor_top #(
             pdb_compressed      = 1'b0;
             pdb_c_illegal       = 1'b0;
             scoreboard          = 32'd0;
+            mshr_valid          = 1'b0;
+            mshr_rd_addr        = 5'd0;
+            mshr_funct3         = 3'd0;
+            mshr_byte_off       = 3'd0;
+            mshr_is_fp          = 1'b0;
+            mshr_fp_reg_wen     = 1'b0;
             speculative_if      = 1'b0;
             bp_predict_taken_q  = 1'b0;
             bp_predict_target_q = '0;
@@ -955,12 +968,15 @@ pub module heliodor_top #(
                 // Full pipeline flush: all pending results discarded
                 scoreboard = 32'd0;
             } else {
-                // CLEAR: result committed at WB (slot0 and slot1)
+                // CLEAR: result committed at WB (slot0, slot1, and MSHR)
                 if wb_wen && wb_rd_addr != 5'd0 {
                     scoreboard[wb_rd_addr] = 1'b0;
                 }
                 if s1_wb_wen && s1_wb_rd_addr != 5'd0 {
                     scoreboard[s1_wb_rd_addr] = 1'b0;
+                }
+                if mshr_wb_valid && mshr_rd_addr != 5'd0 {
+                    scoreboard[mshr_rd_addr] = 1'b0;
                 }
                 // SET: load entering EX (IF/ID → ID/EX transition)
                 // Higher priority than CLEAR: if same register, SET wins (new pending write)
@@ -972,6 +988,23 @@ pub module heliodor_top #(
                 if !stall_id && !flush_id && (ifid_is_load || ifid_is_amo) && ifid_rd != 5'd0 {
                     scoreboard[ifid_rd] = 1'b1;
                 }
+            }
+
+            // MSHR lifecycle
+            if trap_taken || mret_taken || sret_taken {
+                // Invalidate on trap: fill continues (populates cache), result discarded
+                mshr_valid = 1'b0;
+            } else if mshr_absorb {
+                // Capture load metadata from EX/MEM pipeline register
+                mshr_valid      = 1'b1;
+                mshr_rd_addr    = ex_rd_addr;
+                mshr_funct3     = ex_mem_funct3;
+                mshr_byte_off   = ex_alu_out[2:0];
+                mshr_is_fp      = ex_is_fp;
+                mshr_fp_reg_wen = ex_fp_reg_wen;
+            } else if mshr_wb_valid {
+                // Fill complete, regfile write done
+                mshr_valid = 1'b0;
             }
         }
     }
@@ -1066,9 +1099,9 @@ pub module heliodor_top #(
         i_valid         : ifid_valid                 ,
         i_stall         : stall_id                   ,
         i_flush         : flush_id                   ,
-        i_wb_rd         : wb_rd_addr                 ,
-        i_wb_data       : wb_data                    ,
-        i_wb_wen        : wb_wen                     ,
+        i_wb_rd         : actual_wb_rd               ,
+        i_wb_data       : actual_wb_data             ,
+        i_wb_wen        : actual_wb_wen              ,
         o_pc            : id_pc                      ,
         o_rs1_data      : id_rs1_data                ,
         o_rs2_data      : id_rs2_data                ,
@@ -1110,9 +1143,9 @@ pub module heliodor_top #(
         o_fp_rs1_data   : id_fp_rs1_data             ,
         o_fp_rs2_data   : id_fp_rs2_data             ,
         o_fp_rs3_data   : id_fp_rs3_data             ,
-        i_fp_wb_rd      : mem_rd_addr                ,
-        i_fp_wb_data    : wb_data                    ,
-        i_fp_wb_wen     : mem_valid && mem_fp_reg_wen,
+        i_fp_wb_rd      : if mshr_fp_wb ? mshr_rd_addr : mem_rd_addr ,
+        i_fp_wb_data    : if mshr_fp_wb ? mshr_wb_data : wb_data    ,
+        i_fp_wb_wen     : actual_fp_wb_wen           ,
         o_valid         : id_valid                   ,
         i_predict_taken : ifid_predict_taken         ,
         o_predict_taken : id_predict_taken           ,
@@ -1276,6 +1309,8 @@ pub module heliodor_top #(
         o_misaligned   : mem_misaligned   ,
         o_misalign_st  : mem_misalign_st  ,
         o_split_stall  : mem_split_stall  ,
+        i_mshr_absorb  : mshr_absorb     ,
+        o_crosses_dw   : mem_crosses_dw  ,
     );
 
     // ============================================================
@@ -1330,30 +1365,103 @@ pub module heliodor_top #(
     let plic_sel        : logic     = mmu_paddr[31:24] == 8'h0C;
     let uart_sel        : logic     = mmu_paddr[31:24] == 8'h10;
     let is_mmio         : logic     = clint_sel || plic_sel || uart_sel;
-    var dcache_rdata    : logic<64>;
-    var dcache_stall_raw: logic    ;
+    var dcache_rdata        : logic<64>;
+    var dcache_stall_raw   : logic    ;
+    var dcache_miss_valid  : logic    ;
+    var dcache_fill_complete: logic   ;
+    var dcache_fill_rdata  : logic<64>;
 
     inst u_dcache: dcache (
         clk                                 ,
         rst                                 ,
-        i_addr     : mmu_paddr              ,
-        i_wdata    : mmu_wdata_out          ,
-        i_wen      : mmu_wen_out && !is_mmio,
-        i_ren      : mmu_ren_out && !is_mmio,
-        i_wstrb    : mmu_wstrb_out          ,
-        o_rdata    : dcache_rdata           ,
-        o_stall    : dcache_stall_raw       ,
-        o_mem_addr : o_dmem_addr            ,
-        o_mem_wdata: o_dmem_wdata           ,
-        i_mem_rdata: i_dmem_rdata           ,
-        o_mem_wen  : o_dmem_wen             ,
-        o_mem_ren  : o_dmem_ren             ,
-        o_mem_wstrb: o_dmem_wstrb           ,
+        i_addr          : mmu_paddr              ,
+        i_wdata         : mmu_wdata_out          ,
+        i_wen           : mmu_wen_out && !is_mmio,
+        i_ren           : mmu_ren_out && !is_mmio,
+        i_wstrb         : mmu_wstrb_out          ,
+        o_rdata         : dcache_rdata           ,
+        o_stall         : dcache_stall_raw       ,
+        o_miss_valid    : dcache_miss_valid       ,
+        o_fill_complete : dcache_fill_complete    ,
+        o_fill_rdata    : dcache_fill_rdata       ,
+        o_mem_addr      : o_dmem_addr            ,
+        o_mem_wdata     : o_dmem_wdata           ,
+        i_mem_rdata     : i_dmem_rdata           ,
+        o_mem_wen       : o_dmem_wen             ,
+        o_mem_ren       : o_dmem_ren             ,
+        o_mem_wstrb     : o_dmem_wstrb           ,
     );
 
     // MMIO reads bypass dcache
     assign mmu_rdata_in = if clint_sel ? clint_rdata : if plic_sel ? plic_rdata : if uart_sel ? {56'd0, uart_rdata} : dcache_rdata;
-    assign dcache_stall = (dcache_stall_raw && !is_mmio) || mem_split_stall;
+    // Non-blocking dcache: suppress the initial miss stall when MSHR absorbs.
+    // During fill, dcache only stalls on actual conflicts (write-during-fill,
+    // read-miss-during-fill), which are always honored.
+    assign dcache_stall = (dcache_stall_raw && !is_mmio && !mshr_absorb) || mem_split_stall;
+
+    // ============================================================
+    // MSHR (non-blocking dcache miss handling)
+    // ============================================================
+    // MSHR absorb: load miss in MEM, MSHR available, not AMO/MMIO/split
+    assign mshr_absorb = dcache_miss_valid && !mshr_valid && !is_mmio
+                      && ex_valid && ex_mem_ren && !ex_is_amo && !ex_is_fp
+                      && !mem_crosses_dw;
+
+    // MSHR writeback: fill complete and MSHR valid
+    assign mshr_wb_valid = dcache_fill_complete && mshr_valid;
+
+    // MSHR WB data extraction: shift by byte offset, sign/zero extend
+    let mshr_shifted: logic<64> = dcache_fill_rdata >> {mshr_byte_off, 3'b000};
+    assign mshr_wb_data = case mshr_funct3[1:0] {
+        2'd0: if mshr_funct3[2] ?
+                  {56'd0, mshr_shifted[7:0]}
+              : {mshr_shifted[7] repeat 56, mshr_shifted[7:0]},
+        2'd1: if mshr_funct3[2] ?
+                  {48'd0, mshr_shifted[15:0]}
+              : {mshr_shifted[15] repeat 48, mshr_shifted[15:0]},
+        2'd2: if mshr_fp_reg_wen ?
+                  {32'hFFFFFFFF, mshr_shifted[31:0]} // FP NaN-boxing
+              : if mshr_funct3[2] ?
+                  {32'd0, mshr_shifted[31:0]}
+              : {mshr_shifted[31] repeat 32, mshr_shifted[31:0]},
+        2'd3: mshr_shifted,
+        default: mshr_shifted,
+    };
+
+    // MSHR WB: separate integer and FP paths
+    assign mshr_int_wb = mshr_wb_valid && !mshr_fp_reg_wen;
+    assign mshr_fp_wb  = mshr_wb_valid && mshr_fp_reg_wen;
+
+    // MSHR WB conflict: MSHR and normal WB write to same port
+    assign mshr_wb_conflict = (mshr_int_wb && wb_wen)
+                           || (mshr_fp_wb && mem_valid && mem_fp_reg_wen);
+
+    // Integer regfile write port mux
+    assign actual_wb_rd   = if mshr_int_wb ? mshr_rd_addr : wb_rd_addr;
+    assign actual_wb_data = if mshr_int_wb ? mshr_wb_data : wb_data;
+    assign actual_wb_wen  = if mshr_int_wb ? 1'b1         : wb_wen;
+
+    // FP regfile write port mux
+    assign actual_fp_wb_wen = if mshr_fp_wb ? 1'b1
+                            : mem_valid && mem_fp_reg_wen;
+
+    // ============================================================
+    // Scoreboard stall computation (after dcache, uses mshr_absorb)
+    // ============================================================
+    // Result will be in MEM_WB (forwarding available) when load is in MEM
+    // stage (ex_*) and advancing to WB (no dcache/mmu stall, not MSHR miss).
+    let sb_avail_rs1: logic = ex_reg_wen && ex_rd_addr != 5'd0 && ex_rd_addr == ifid_rs1_addr
+                           && !dcache_stall && !mmu_stall && !mshr_absorb;
+    let sb_avail_rs2: logic = ex_reg_wen && ex_rd_addr != 5'd0 && ex_rd_addr == ifid_rs2_addr
+                           && !dcache_stall && !mmu_stall && !mshr_absorb;
+    // Result already in WB (mem_*): forwarding or regfile write-first resolves
+    let sb_wb_rs1: logic = mem_reg_wen && mem_rd_addr != 5'd0 && mem_rd_addr == ifid_rs1_addr;
+    let sb_wb_rs2: logic = mem_reg_wen && mem_rd_addr != 5'd0 && mem_rd_addr == ifid_rs2_addr;
+    // MEM-stage: scoreboard catches pending loads (dcache stall or MSHR fill)
+    let sb_mem_stall: logic = !ex_load_use
+                           && ((scoreboard[ifid_rs1_addr] && !sb_avail_rs1 && !sb_wb_rs1)
+                            || (scoreboard[ifid_rs2_addr] && !sb_avail_rs2 && !sb_wb_rs2));
+    assign sb_stall = ex_load_use || sb_mem_stall;
 
     // ============================================================
     // CSR unit (operates in EX stage timing)
