@@ -61,6 +61,7 @@ pub module heliodor_top #(
     var stall_mem: logic;
     var flush_id : logic;
     var flush_ex : logic;
+    var raw_load_use: logic; // raw load-use signal from hazard_unit
 
     // Forwarding unit outputs
     var fwd_a     : pipeline_pkg::FwdSel;
@@ -354,6 +355,7 @@ pub module heliodor_top #(
         o_stall_mem       : stall_mem                                             ,
         o_flush_id        : flush_id                                              ,
         o_flush_ex        : flush_ex                                              ,
+        o_load_use        : raw_load_use                                          ,
     );
 
     // ============================================================
@@ -364,8 +366,8 @@ pub module heliodor_top #(
         i_rs2_addr     : id_rs2_addr                    ,
         i_exmem_rd     : ex_rd_addr                     ,
         i_exmem_wen    : ex_reg_wen                     ,
-        i_s1exwb_rd    : 5'd0                             ,
-        i_s1exwb_wen   : 1'b0                            ,
+        i_s1exwb_rd    : s1_ex_rd_addr                     ,
+        i_s1exwb_wen   : s1_ex_reg_wen                   ,
         i_memwb_rd     : mem_rd_addr                    ,
         i_memwb_wen    : mem_reg_wen                    ,
         o_fwd_a        : fwd_a                          ,
@@ -661,6 +663,47 @@ pub module heliodor_top #(
     // when PDB drain is eliminated (e.g., ID-stage drain or 2-port icache).
     let dual_issue  : logic = 1'b0;
 
+    // ============================================================
+    // Load-use bubble fill: issue IF instruction to slot1 during
+    // load-use stall to fill the 1-cycle bubble with useful work.
+    // ============================================================
+    // IF instruction (C) field extraction (if_instr is already expanded)
+    let fill_rs1   : logic<5> = if_instr[19:15];
+    let fill_rs2   : logic<5> = if_instr[24:20];
+    let fill_rd    : logic<5> = if_instr[11:7];
+    let fill_opcode: logic<7> = if_instr[6:0];
+    // C is a simple ALU instruction (same criteria as slot1_is_alu)
+    let fill_is_alu: logic = fill_opcode == 7'b0110011 // OP
+                          || fill_opcode == 7'b0111011 // OP-32
+                          || fill_opcode == 7'b0010011 // OP-IMM
+                          || fill_opcode == 7'b0011011 // OP-IMM-32
+                          || fill_opcode == 7'b0110111 // LUI
+                          || fill_opcode == 7'b0010111 // AUIPC
+                          ;
+    // C is independent of the load (A@EX): C's sources don't read A's rd
+    let load_rd         : logic<5> = id_rd_addr; // A's rd (in EX stage = decode output)
+    let fill_independent: logic = load_rd == 5'd0
+                               || (load_rd != fill_rs1 && load_rd != fill_rs2);
+    // C is independent of B (stalled in IF/ID): C's sources don't read B's rd
+    let b_rd             : logic<5> = ifid_instr[11:7];
+    let fill_b_independent: logic = b_rd == 5'd0
+                                 || (b_rd != fill_rs1 && b_rd != fill_rs2);
+    // No WAW: C's rd doesn't conflict with any in-flight instruction
+    let fill_no_waw: logic = fill_rd == 5'd0
+                          || (fill_rd != b_rd
+                           && fill_rd != id_rd_addr
+                           && fill_rd != ex_rd_addr
+                           && fill_rd != mem_rd_addr);
+    // Pipeline redirect: trap, mret, sret, misprediction
+    // Misprediction gated by dcache/mmu stall (can't redirect until memory op completes)
+    let redirect_active: logic = trap_taken || mret_taken || sret_taken
+                              || (ex_misprediction && !dcache_stall && !mmu_stall);
+    // Final fill decision
+    let load_use_fill: logic = raw_load_use && fill_is_alu
+                            && fill_independent && fill_b_independent && fill_no_waw
+                            && s1_all_clear && !redirect_active
+                            && !icache_stall && !immu_busy && !pdb_valid;
+
     inst u_bp: branch_predictor (
         clk                                ,
         rst                                ,
@@ -705,6 +748,7 @@ pub module heliodor_top #(
         i_pdb_valid     : pdb_valid                                                                        ,
         i_dual_fetch    : dual_fetch_valid                                                                 ,
         i_slot1_size    : if slot1_is_compressed ? 3'd2 : 3'd4                                             ,
+        i_load_use_fill : load_use_fill                                                                    ,
         o_pc            : if_pc                                    ,
         o_imem_addr     : fetch_imem_addr                          ,
         o_predict_taken : if_predict_taken                         ,
@@ -813,9 +857,17 @@ pub module heliodor_top #(
                 pdb_valid = 1'b0;
             }
 
-            // Slot1 IF/ID pipeline register: hold during stall, flush on redirect
-            if flush_id {
+            // Slot1 IF/ID pipeline register: flush on redirect (not load-use),
+            // fill on load_use_fill, hold during stall.
+            // Separate redirect flush from hazard flush: load-use hazard flush
+            // must NOT clear s1_ifid when we're filling the bubble.
+            if redirect_active {
                 s1_ifid_valid = 1'b0;
+            } else if load_use_fill {
+                // Fill bubble: latch IF instruction (C) into slot1
+                s1_ifid_valid = 1'b1;
+                s1_ifid_pc    = if_pc;
+                s1_ifid_instr = if_instr;
             } else if !stall_if && dual_issue {
                 s1_ifid_valid = 1'b1;
                 s1_ifid_pc    = slot1_pc;
