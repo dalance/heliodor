@@ -98,6 +98,8 @@ pub module execute (
     o_jump_target  : output logic<64>,
     // Misprediction: actual != predicted
     o_misprediction: output logic,
+    // Multi-cycle divider busy (stall pipeline while computing)
+    o_div_busy: output logic,
 ) {
     import pipeline_pkg::*;
 
@@ -148,7 +150,80 @@ pub module execute (
         o_out: alu_result,
     );
 
-    assign o_alu_result_comb = alu_result;
+    // Multi-cycle integer divider
+    import alu_pkg::AluOp;
+    let is_div_op: logic = i_alu_op == AluOp::DIV || i_alu_op == AluOp::DIVU
+                        || i_alu_op == AluOp::REM || i_alu_op == AluOp::REMU
+                        || i_alu_op == AluOp::DIVW || i_alu_op == AluOp::DIVUW
+                        || i_alu_op == AluOp::REMW || i_alu_op == AluOp::REMUW;
+    let div_is_signed: logic = i_alu_op == AluOp::DIV || i_alu_op == AluOp::REM
+                            || i_alu_op == AluOp::DIVW || i_alu_op == AluOp::REMW;
+    let div_is_rem: logic = i_alu_op == AluOp::REM || i_alu_op == AluOp::REMU
+                         || i_alu_op == AluOp::REMW || i_alu_op == AluOp::REMUW;
+    let div_is_word: logic = i_alu_op == AluOp::DIVW || i_alu_op == AluOp::DIVUW
+                          || i_alu_op == AluOp::REMW || i_alu_op == AluOp::REMUW;
+    // Start divider when a valid DIV/REM instruction enters EX and divider is idle
+    var div_result: logic<64>;
+    var div_valid : logic    ;
+    var div_busy  : logic    ;
+    // Track whether we already started the divider for the current instruction
+    // (prevents re-start during stall cycles)
+    var div_started: logic;
+
+    inst u_div: int_divider (
+        clk                              ,
+        rst                              ,
+        i_valid : i_valid && is_div_op && !i_flush && !div_busy && !div_started,
+        i_a     : alu_a                  ,
+        i_b     : alu_b                  ,
+        i_signed: div_is_signed          ,
+        i_rem   : div_is_rem             ,
+        i_word  : div_is_word            ,
+        i_flush : i_flush                ,
+        o_result: div_result             ,
+        o_valid : div_valid              ,
+        o_busy  : div_busy               ,
+    );
+
+    // Track div_started: set when divider accepts, clear on completion or flush
+    always_ff (clk, rst) {
+        if_reset {
+            div_started = 1'b0;
+        } else if i_flush {
+            div_started = 1'b0;
+        } else if i_valid && is_div_op && !div_busy && !div_started {
+            div_started = 1'b1;
+        } else if div_valid {
+            div_started = 1'b0;
+        }
+    }
+
+    // Latch divider result when valid (it's only a 1-cycle pulse)
+    var div_result_q: logic<64>;
+    var div_done_q  : logic    ;
+    always_ff (clk, rst) {
+        if_reset {
+            div_result_q = '0;
+            div_done_q   = 1'b0;
+        } else if i_flush {
+            div_done_q = 1'b0;
+        } else if div_valid {
+            div_result_q = div_result;
+            div_done_q   = 1'b1;
+        } else if !i_stall {
+            div_done_q = 1'b0; // clear when instruction advances
+        }
+    }
+
+    // Divider busy: stall pipeline while computing (D0 conservative stall)
+    // Not busy when result is ready (div_valid or div_done_q)
+    assign o_div_busy = (div_busy || (i_valid && is_div_op && !div_started)) && !div_valid && !div_done_q;
+
+    // Use divider result for DIV/REM operations, ALU result for everything else
+    let ex_alu_result: logic<64> = if is_div_op && (div_valid || div_done_q) ?
+        (if div_valid ? div_result : div_result_q) : alu_result;
+
+    assign o_alu_result_comb = alu_result; // Combinational bypass stays ALU-only (DIV is multi-cycle)
 
     // ============================================================
     // FPU bit operations (FSGNJ, FMIN/FMAX, FMV, FCLASS, FCMP)
@@ -1678,7 +1753,7 @@ pub module execute (
             } else if i_is_csr {
                 o_alu_out = i_csr_rdata;
             } else {
-                o_alu_out = alu_result;
+                o_alu_out = ex_alu_result; // uses divider result for DIV/REM
             }
             o_rs2_data      = fwd_rs2;
             o_rd_addr       = i_rd_addr;
