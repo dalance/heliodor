@@ -76,7 +76,6 @@ pub module heliodor_top #(
     var mshr_is_fp     : logic    ;
     var mshr_fp_reg_wen: logic    ;
     var mshr_rob_idx   : logic<3> ; // ROB index of MSHR-absorbed load
-    var mshr_absorbed_q: logic    ; // 1-cycle delayed: WB instruction was MSHR-absorbed
     var _mshr_count    : logic<16>; // debug: MSHR absorb counter (unused prefix)
     // MSHR combinational signals (forward-declared, assigned after dcache)
     var mshr_absorb     : logic    ;
@@ -263,6 +262,7 @@ pub module heliodor_top #(
     var mem_misalign_st  : logic                  ;
     var mem_split_stall  : logic                  ;
     var mem_crosses_dw   : logic                  ;
+    var mem_mshr_absorbed: logic                  ;
 
     // CSR signals
     var csr_rdata       : logic             <64>;
@@ -866,7 +866,6 @@ pub module heliodor_top #(
             mshr_is_fp          = 1'b0;
             mshr_fp_reg_wen     = 1'b0;
             mshr_rob_idx        = 3'd0;
-            mshr_absorbed_q     = 1'b0;
             speculative_if      = 1'b0;
             bp_predict_taken_q  = 1'b0;
             bp_predict_target_q = '0;
@@ -1048,11 +1047,6 @@ pub module heliodor_top #(
                 id_rob_idx = 3'd0;
             } else if !stall_id {
                 id_rob_idx = rob_alloc_idx;
-            }
-
-            // Track MSHR-absorbed status for WB stage (1-cycle delay)
-            if !stall_mem {
-                mshr_absorbed_q = mshr_absorb;
             }
 
             if mshr_absorb {
@@ -1378,8 +1372,9 @@ pub module heliodor_top #(
         o_misaligned   : mem_misaligned   ,
         o_misalign_st  : mem_misalign_st  ,
         o_split_stall  : mem_split_stall  ,
-        i_mshr_absorb  : mshr_absorb     ,
-        o_crosses_dw   : mem_crosses_dw  ,
+        i_mshr_absorb   : mshr_absorb      ,
+        o_crosses_dw    : mem_crosses_dw  ,
+        o_mshr_absorbed : mem_mshr_absorbed,
     );
 
     // ============================================================
@@ -1504,8 +1499,9 @@ pub module heliodor_top #(
     assign mshr_int_wb = mshr_wb_valid && !mshr_fp_reg_wen;
     assign mshr_fp_wb  = mshr_wb_valid && mshr_fp_reg_wen;
 
-    // MSHR WB conflict: MSHR and normal WB write to same port
-    assign mshr_wb_conflict = (mshr_int_wb && rob_commit_valid && rob_commit_wen)
+    // MSHR WB conflict: MSHR ROB complete and normal WB complete share
+    // the single i_complete port. When both fire, MSHR takes priority.
+    assign mshr_wb_conflict = (mshr_int_wb && mem_valid && !mem_mshr_absorbed)
                            || (mshr_fp_wb && mem_valid && mem_fp_reg_wen);
 
     // Integer regfile write port mux:
@@ -1536,14 +1532,21 @@ pub module heliodor_top #(
     // Result already in WB (mem_*): forwarding or regfile write-first resolves
     let sb_wb_rs1: logic = mem_reg_wen && mem_rd_addr != 5'd0 && mem_rd_addr == ifid_rs1_addr;
     let sb_wb_rs2: logic = mem_reg_wen && mem_rd_addr != 5'd0 && mem_rd_addr == ifid_rs2_addr;
-    // RAT+scoreboard hybrid stall: use scoreboard scope (loads/AMOs only)
-    // with RAT valid as confirmation. This ensures no false stalls for ALU
-    // instructions while enabling future RAT-only stall when C0 provides
-    // correct MSHR→ROB completion data.
-    let sb_mem_stall: logic = !ex_load_use
-                           && ((scoreboard[ifid_rs1_addr] && !sb_avail_rs1 && !sb_wb_rs1)
-                            || (scoreboard[ifid_rs2_addr] && !sb_avail_rs2 && !sb_wb_rs2));
-    assign sb_stall = ex_load_use || sb_mem_stall;
+    // EX-stage ALU forwarding: instruction in EX writes rs and is NOT a load/SC
+    // (ALU result will be available via EX_MEM forwarding when consumer reaches EX)
+    let ex_alu_fwd_rs1: logic = id_reg_wen && id_rd_addr != 5'd0 && id_rd_addr == ifid_rs1_addr
+                             && !id_mem_ren && !(id_is_amo && id_amo_funct5 == 5'b00011);
+    let ex_alu_fwd_rs2: logic = id_reg_wen && id_rd_addr != 5'd0 && id_rd_addr == ifid_rs2_addr
+                             && !id_mem_ren && !(id_is_amo && id_amo_funct5 == 5'b00011);
+    // RAT-based stall: pending value not available via forwarding or ROB completion.
+    // MSHR loads stay uncompleted in ROB until fill finishes (C0), so RAT correctly
+    // stalls dependents. ALU results are forwarded (ex_alu_fwd) — no false stall.
+    let rat_stall_rs1: logic = rat_rs1_valid && !rob_lookup1_completed
+                            && !sb_avail_rs1 && !sb_wb_rs1 && !ex_alu_fwd_rs1;
+    let rat_stall_rs2: logic = rat_rs2_valid && !rob_lookup2_completed
+                            && !sb_avail_rs2 && !sb_wb_rs2 && !ex_alu_fwd_rs2;
+    let rat_mem_stall: logic = !ex_load_use && (rat_stall_rs1 || rat_stall_rs2);
+    assign sb_stall = ex_load_use || rat_mem_stall;
 
     // ============================================================
     // ROB: in-order commit drives integer regfile write.
@@ -1590,9 +1593,13 @@ pub module heliodor_top #(
         i_alloc_compr : ifid_compressed                            ,
         o_alloc_idx   : rob_alloc_idx                              ,
         o_alloc_ready : rob_alloc_ready                            ,
-        i_complete_valid: mem_valid                                 ,
-        i_complete_idx  : mem_rob_idx                               ,
-        i_complete_data : wb_data                                   ,
+        // Complete mux: MSHR fill has priority over normal WB.
+        // MSHR-absorbed loads skip WB complete (o_mshr_absorbed from memory module);
+        // they complete when MSHR fill finishes with correct data.
+        // mshr_int_wb still writes regfile directly as fallback (post-flush safety).
+        i_complete_valid: if mshr_int_wb ? 1'b1 : (mem_valid && !mem_mshr_absorbed),
+        i_complete_idx  : if mshr_int_wb ? mshr_rob_idx : mem_rob_idx               ,
+        i_complete_data : if mshr_int_wb ? mshr_wb_data : wb_data                   ,
         i_exc_valid   : exc_rob_valid                               ,
         i_exc_idx     : ex_rob_idx                                 ,
         i_exc_cause   : exc_rob_cause                              ,
