@@ -63,9 +63,7 @@ pub module heliodor_top #(
     var flush_ex : logic;
     var raw_load_use: logic; // raw load-use signal from hazard_unit
 
-    // Scoreboard: tracks pending register writes (OoO infrastructure).
-    // Bit R = 1 means register xR has a pending write not yet available.
-    var scoreboard: logic<32>;
+    // (Scoreboard removed — replaced by RAT + ROB lookup in B2+C0)
 
     // MSHR (Miss Status Holding Register): holds load metadata during dcache fill.
     // Non-blocking: pipeline continues while fill completes in background.
@@ -112,6 +110,8 @@ pub module heliodor_top #(
     var rat_rs1_rob_idx: logic<3> ;
     var rat_rs2_valid  : logic    ;
     var rat_rs2_rob_idx: logic<3> ;
+    var rat_fill_rs1_valid: logic; // bubble fill rs1 pending check
+    var rat_fill_rs2_valid: logic; // bubble fill rs2 pending check
     // ROB lookup outputs (completed check for RAT stall)
     var rob_lookup1_completed: logic;
     var rob_lookup2_completed: logic;
@@ -388,7 +388,7 @@ pub module heliodor_top #(
     // EX-stage: direct load-use check (load/SC in EX, consumer in ID)
     let ex_has_pending: logic = (id_mem_ren || (id_is_amo && id_amo_funct5 == 5'b00011)) && id_rd_addr != 5'd0;
     let ex_load_use   : logic = ex_has_pending && (id_rd_addr == ifid_rs1_addr || id_rd_addr == ifid_rs2_addr);
-    // sb_stall is var because it depends on dcache outputs (computed later)
+    // RAT-based stall (forward-declared; computed after dcache)
     var sb_stall: logic;
 
     inst u_hazard: hazard_unit (
@@ -752,9 +752,9 @@ pub module heliodor_top #(
                           || fill_opcode == 7'b0110111 // LUI
                           || fill_opcode == 7'b0010111 // AUIPC
                           ;
-    // C is independent of ALL pending writes (scoreboard-based):
-    // replaces point-to-point load_rd check with general scoreboard lookup
-    let fill_independent: logic = !scoreboard[fill_rs1] && !scoreboard[fill_rs2];
+    // C is independent of ALL pending writes (RAT-based):
+    // no pending ROB entry for either source register
+    let fill_independent: logic = !rat_fill_rs1_valid && !rat_fill_rs2_valid;
     // C is independent of B (stalled in IF/ID): C's sources don't read B's rd
     let b_rd             : logic<5> = ifid_instr[11:7];
     let fill_b_independent: logic = b_rd == 5'd0
@@ -857,7 +857,7 @@ pub module heliodor_top #(
             pdb_instr           = 32'h00000013;
             pdb_compressed      = 1'b0;
             pdb_c_illegal       = 1'b0;
-            scoreboard          = 32'd0;
+
             _mshr_count         = 16'd0;
             mshr_valid          = 1'b0;
             mshr_rd_addr        = 5'd0;
@@ -1000,33 +1000,6 @@ pub module heliodor_top #(
                 id_csr_fault_q = 1'b0;
             } else if !stall_id {
                 id_csr_fault_q = id_is_csr && csr_access_fault;
-            }
-
-            // Scoreboard update
-            if trap_taken || mret_taken || sret_taken {
-                // Full pipeline flush: all pending results discarded
-                scoreboard = 32'd0;
-            } else {
-                // CLEAR: result committed at WB (slot0, slot1, and MSHR)
-                if wb_wen && wb_rd_addr != 5'd0 {
-                    scoreboard[wb_rd_addr] = 1'b0;
-                }
-                if s1_wb_wen && s1_wb_rd_addr != 5'd0 {
-                    scoreboard[s1_wb_rd_addr] = 1'b0;
-                }
-                if mshr_wb_valid && mshr_rd_addr != 5'd0 {
-                    scoreboard[mshr_rd_addr] = 1'b0;
-                }
-                // SET: load entering EX (IF/ID → ID/EX transition)
-                // Higher priority than CLEAR: if same register, SET wins (new pending write)
-                // Track loads (opcode LOAD) and all AMO instructions (LR/SC/AMO*):
-                // their results are computed in MEM stage, not available from EX ALU.
-                let ifid_is_load: logic = ifid_valid && ifid_instr[6:0] == 7'b0000011;
-                let ifid_is_amo : logic = ifid_valid && ifid_instr[6:0] == 7'b0101111;
-                let ifid_rd     : logic<5> = ifid_instr[11:7];
-                if !stall_id && !flush_id && (ifid_is_load || ifid_is_amo) && ifid_rd != 5'd0 {
-                    scoreboard[ifid_rd] = 1'b1;
-                }
             }
 
             // ROB index pipeline registers (synced with decode/execute/memory)
@@ -1495,7 +1468,7 @@ pub module heliodor_top #(
         default: mshr_shifted,
     };
 
-    // MSHR WB signals (kept for scoreboard clear and FP path)
+    // MSHR WB signals (kept for FP path and ROB complete mux)
     assign mshr_int_wb = mshr_wb_valid && !mshr_fp_reg_wen;
     assign mshr_fp_wb  = mshr_wb_valid && mshr_fp_reg_wen;
 
@@ -1603,7 +1576,7 @@ pub module heliodor_top #(
         i_exc_valid   : exc_rob_valid                               ,
         i_exc_idx     : ex_rob_idx                                 ,
         i_exc_cause   : exc_rob_cause                              ,
-        i_suppress_wen_valid: 1'b0                                   , // not needed: scoreboard blocks dependents, mshr_int_wb overwrites
+        i_suppress_wen_valid: 1'b0                                   , // not needed: mshr_int_wb overwrites
         i_suppress_wen_idx  : 3'd0                                  ,
         o_commit_valid : rob_commit_valid                           ,
         o_commit_pc    : rob_commit_pc                              ,
@@ -1645,6 +1618,10 @@ pub module heliodor_top #(
         i_rs2_addr    : ifid_rs2_addr                               ,
         o_rs2_valid   : rat_rs2_valid                               ,
         o_rs2_rob_idx : rat_rs2_rob_idx                             ,
+        i_rs3_addr    : if_instr[19:15]                             , // bubble fill rs1
+        o_rs3_valid   : rat_fill_rs1_valid                          ,
+        i_rs4_addr    : if_instr[24:20]                             , // bubble fill rs2
+        o_rs4_valid   : rat_fill_rs2_valid                          ,
         i_flush       : trap_taken || mret_taken || sret_taken || ex_misprediction,
     );
 
