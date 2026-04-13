@@ -89,6 +89,27 @@ pub module heliodor_top #(
     var actual_fp_wb_wen: logic    ;
     var dcache_stall_pipeline: logic; // dcache stall for pipeline (suppressed by MSHR)
 
+    // ROB (shadow mode): tracks in-order commit, output ignored.
+    // Pipeline continues to use WB-driven regfile writes.
+    var rob_alloc_idx    : logic<3> ;
+    var rob_alloc_ready  : logic    ;
+    var rob_commit_valid : logic    ;
+    var rob_commit_pc    : logic<64>;
+    var rob_commit_rd    : logic<5> ;
+    var rob_commit_data  : logic<64>;
+    var rob_commit_wen   : logic    ;
+    var rob_commit_is_fp : logic    ;
+    var rob_commit_fp_wen: logic    ;
+    var rob_commit_compr : logic    ;
+    var rob_commit_exc   : logic    ;
+    var rob_commit_cause : logic<64>;
+    var rob_empty        : logic    ;
+    var rob_full         : logic    ;
+    // ROB index pipeline registers (shadow pipeline, managed in heliodor_top)
+    var id_rob_idx : logic<3>;
+    var ex_rob_idx : logic<3>;
+    var mem_rob_idx: logic<3>;
+
     // Forwarding unit outputs
     var fwd_a     : pipeline_pkg::FwdSel;
     var fwd_b     : pipeline_pkg::FwdSel;
@@ -841,6 +862,9 @@ pub module heliodor_top #(
             ex_instr_shadow = 32'h00000013;
             id_csr_fault_q  = 1'b0;
             xret_taken_q    = 1'b0;
+            id_rob_idx      = 3'd0;
+            ex_rob_idx      = 3'd0;
+            mem_rob_idx     = 3'd0;
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
@@ -991,6 +1015,26 @@ pub module heliodor_top #(
                 if !stall_id && !flush_id && (ifid_is_load || ifid_is_amo) && ifid_rd != 5'd0 {
                     scoreboard[ifid_rd] = 1'b1;
                 }
+            }
+
+            // ROB index pipeline registers (synced with decode/execute/memory)
+            // Process later stages first: within always_ff, assignments are
+            // sequential (blocking). Reading before writing ensures each stage
+            // captures the OLD value from the previous stage.
+            if trap_taken {
+                mem_rob_idx = 3'd0;
+            } else if !stall_mem {
+                mem_rob_idx = ex_rob_idx;
+            }
+            if flush_ex {
+                ex_rob_idx = 3'd0;
+            } else if !stall_ex {
+                ex_rob_idx = id_rob_idx;
+            }
+            if flush_id {
+                id_rob_idx = 3'd0;
+            } else if !stall_id {
+                id_rob_idx = rob_alloc_idx;
             }
 
             if mshr_absorb {
@@ -1441,14 +1485,23 @@ pub module heliodor_top #(
     assign mshr_int_wb = mshr_wb_valid && !mshr_fp_reg_wen;
     assign mshr_fp_wb  = mshr_wb_valid && mshr_fp_reg_wen;
 
-    // MSHR WB conflict: MSHR and normal WB write to same port
-    assign mshr_wb_conflict = (mshr_int_wb && wb_wen)
+    // MSHR WB conflict: MSHR and ROB commit write to same port
+    assign mshr_wb_conflict = (mshr_int_wb && rob_commit_valid && rob_commit_wen)
                            || (mshr_fp_wb && mem_valid && mem_fp_reg_wen);
 
-    // Integer regfile write port mux
-    assign actual_wb_rd   = if mshr_int_wb ? mshr_rd_addr : wb_rd_addr;
-    assign actual_wb_data = if mshr_int_wb ? mshr_wb_data : wb_data;
-    assign actual_wb_wen  = if mshr_int_wb ? 1'b1         : wb_wen;
+    // Integer regfile write port mux:
+    // Priority: MSHR WB > ROB commit > direct WB (fallback after flush)
+    // ROB commit fires same-cycle as WB via bypass. After ROB flush
+    // (trap/misprediction), the fallback path handles in-flight instructions.
+    assign actual_wb_rd   = if mshr_int_wb ? mshr_rd_addr
+                          : if rob_commit_valid ? rob_commit_rd
+                          : wb_rd_addr;
+    assign actual_wb_data = if mshr_int_wb ? mshr_wb_data
+                          : if rob_commit_valid ? rob_commit_data
+                          : wb_data;
+    assign actual_wb_wen  = if mshr_int_wb ? 1'b1
+                          : if rob_commit_valid ? rob_commit_wen
+                          : wb_wen;
 
     // FP regfile write port mux
     assign actual_fp_wb_wen = if mshr_fp_wb ? 1'b1
@@ -1471,6 +1524,71 @@ pub module heliodor_top #(
                            && ((scoreboard[ifid_rs1_addr] && !sb_avail_rs1 && !sb_wb_rs1)
                             || (scoreboard[ifid_rs2_addr] && !sb_avail_rs2 && !sb_wb_rs2));
     assign sb_stall = ex_load_use || sb_mem_stall;
+
+    // ============================================================
+    // ROB: in-order commit drives integer regfile write.
+    // Same-cycle complete+commit bypass preserves WB timing.
+    // ============================================================
+    // Pre-decode: does this instruction write an integer register?
+    let ifid_alloc_op: logic<7> = ifid_instr[6:0];
+    let ifid_alloc_f5: logic<5> = ifid_instr[31:27];
+    // OP-FP instructions that write integer rd (not FP rd)
+    let ifid_fp_writes_int: logic = ifid_alloc_op == 7'b1010011 && (
+        ifid_alloc_f5 == 5'b11100 || // FMV.X.W/D, FCLASS
+        ifid_alloc_f5 == 5'b11000 || // FCVT.W.S/D
+        ifid_alloc_f5 == 5'b10100 || // FEQ, FLT, FLE
+        ifid_alloc_f5 == 5'b11010    // FCVT.L.S/D (RV64)
+    );
+    // Match decoder behavior: wen=1 even for rd=x0 (regfile ignores x0 writes)
+    let ifid_alloc_wen: logic =
+        ifid_alloc_op == 7'b0110011 || // OP (R-type)
+        ifid_alloc_op == 7'b0111011 || // OP-32
+        ifid_alloc_op == 7'b0010011 || // OP-IMM
+        ifid_alloc_op == 7'b0011011 || // OP-IMM-32
+        ifid_alloc_op == 7'b0000011 || // LOAD
+        ifid_alloc_op == 7'b1100111 || // JALR
+        ifid_alloc_op == 7'b1101111 || // JAL
+        ifid_alloc_op == 7'b0110111 || // LUI
+        ifid_alloc_op == 7'b0010111 || // AUIPC
+        ifid_alloc_op == 7'b0101111 || // AMO
+        (ifid_alloc_op == 7'b1110011 && ifid_instr[14:12] != 3'd0) || // CSR
+        ifid_fp_writes_int; // OP-FP int-writing variants
+
+    inst u_rob: rob (
+        clk                                                        ,
+        rst                                                        ,
+        i_alloc_valid : !stall_id && !flush_id && ifid_valid       ,
+        i_alloc_pc    : ifid_pc                                    ,
+        i_alloc_rd    : ifid_instr[11:7]                           ,
+        i_alloc_wen   : ifid_alloc_wen                             ,
+        i_alloc_is_fp : 1'b0                                      , // FP path unchanged (A2)
+        i_alloc_fp_wen: 1'b0                                      , // FP path unchanged (A2)
+        i_alloc_compr : ifid_compressed                            ,
+        o_alloc_idx   : rob_alloc_idx                              ,
+        o_alloc_ready : rob_alloc_ready                            ,
+        i_complete_valid: mem_valid                                 ,
+        i_complete_idx  : mem_rob_idx                               ,
+        i_complete_data : wb_data                                   ,
+        i_exc_valid   : 1'b0                                       ,
+        i_exc_idx     : 3'd0                                       ,
+        i_exc_cause   : '0                                         ,
+        i_suppress_wen_valid: 1'b0                                  , // disabled: scoreboard handles MSHR stall
+        i_suppress_wen_idx  : 3'd0                                 ,
+        o_commit_valid : rob_commit_valid                           ,
+        o_commit_pc    : rob_commit_pc                              ,
+        o_commit_rd    : rob_commit_rd                              ,
+        o_commit_data  : rob_commit_data                            ,
+        o_commit_wen   : rob_commit_wen                             ,
+        o_commit_is_fp : rob_commit_is_fp                           ,
+        o_commit_fp_wen: rob_commit_fp_wen                          ,
+        o_commit_compr : rob_commit_compr                           ,
+        o_commit_exc   : rob_commit_exc                             ,
+        o_commit_cause : rob_commit_cause                           ,
+        i_commit_ack  : 1'b1                                       , // auto-commit
+        i_flush       : trap_taken || mret_taken || sret_taken || ex_misprediction,
+        o_empty       : rob_empty                                   ,
+        o_full        : rob_full                                    ,
+    );
 
     // ============================================================
     // CSR unit (operates in EX stage timing)
