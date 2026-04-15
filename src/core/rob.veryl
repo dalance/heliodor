@@ -31,6 +31,10 @@ pub module rob (
     i_suppress_wen_valid: input logic    ,
     i_suppress_wen_idx  : input logic<3> ,
 
+    // Cancel entry: mark as completed with wen=0 (for flushed RS-eligible instructions)
+    i_cancel_valid: input logic    ,
+    i_cancel_idx  : input logic<3> ,
+
     // Commit: retire head entry (in-order)
     o_commit_valid : output logic    ,
     o_commit_pc    : output logic<64>,
@@ -44,15 +48,35 @@ pub module rob (
     o_commit_cause : output logic<64>,
     i_commit_ack   : input  logic    , // pipeline acknowledges commit
 
-    // Flush: invalidate all entries (on trap/misprediction)
+    // Flush: invalidate all entries (on trap/mret/sret)
     i_flush: input logic,
+
+    // Squash: invalidate entries AFTER the given index (on branch misprediction).
+    // Keeps entries from head to squash_idx (inclusive), discards the rest.
+    i_squash_valid: input logic    ,
+    i_squash_idx  : input logic<3> , // branch instruction's ROB index
 
     // Lookup: check if entry is completed (combinational, for RAT stall)
     // Includes same-cycle completing_head bypass for zero-latency visibility.
     i_lookup1_idx      : input  logic<3> ,
     o_lookup1_completed: output logic    ,
+    o_lookup1_valid    : output logic    , // entry exists (not squashed)
     i_lookup2_idx      : input  logic<3> ,
     o_lookup2_completed: output logic    ,
+    o_lookup2_valid    : output logic    , // entry exists (not squashed)
+
+    // Data read ports (for RS operand resolution at dispatch)
+    i_read1_idx      : input  logic<3> ,
+    o_read1_data     : output logic<64>,
+    o_read1_completed: output logic    , // RS dispatch: is operand ready?
+    o_read1_valid    : output logic    , // RS dispatch: is entry valid (not squashed)?
+    i_read2_idx      : input  logic<3> ,
+    o_read2_data     : output logic<64>,
+    o_read2_completed: output logic    ,
+    o_read2_valid    : output logic    ,
+
+    // Squash mask output (for RAT cleanup)
+    o_squash_mask: output logic [8],
 
     // Status
     o_empty      : output logic,
@@ -77,6 +101,39 @@ pub module rob (
     var tail: logic<3>;
     var count: logic<4>; // 0..8
 
+    // Squash mask: computed combinationally for use in always_ff.
+    // Entry i should be squashed if it's in the range [squash_idx, tail) (circular).
+    var squash_mask: logic [8];
+    var _sq_di  : logic<3>; // distance from squash_idx to entry i
+    var _sq_dt  : logic<3>; // distance from squash_idx to tail
+    always_comb {
+        _sq_dt = tail - i_squash_idx;
+        for i: i32 in 0..8 {
+            squash_mask[i] = 1'b0;
+            if i_squash_valid {
+                _sq_di = i[2:0] - i_squash_idx;
+                if _sq_di <: _sq_dt {
+                    squash_mask[i] = 1'b1;
+                }
+            }
+        }
+    }
+
+    for i in 0..8 :g_sq_mask {
+        assign o_squash_mask[i] = squash_mask[i];
+    }
+
+    // Debug: count invariant check
+    var _dbg_valid_count: logic<4>;
+    always_comb {
+        _dbg_valid_count = 4'd0;
+        for _i: i32 in 0..8 {
+            if valid[_i] {
+                _dbg_valid_count = _dbg_valid_count + 4'd1;
+            }
+        }
+    }
+
     assign o_empty = count == 4'd0;
     assign o_full  = count == 4'd8;
     assign o_alloc_ready = count <: 4'd8;
@@ -89,14 +146,43 @@ pub module rob (
     let completing_head: logic = i_complete_valid && i_complete_idx == head
                               && valid[head] && !completed[head] && !o_empty;
 
-    // Lookup: completed flag with same-cycle bypass
+    // Lookup: completed flag with same-cycle bypass.
+    // Invalid entries (squashed or committed) return completed=true so consumers
+    // don't wait forever for a dead entry. Stale RAT mappings are handled by
+    // using regfile data (via rs_stale_s1/s2 in heliodor_top).
     assign o_lookup1_completed = completed[i_lookup1_idx]
         || (completing_head && i_lookup1_idx == head);
     assign o_lookup2_completed = completed[i_lookup2_idx]
         || (completing_head && i_lookup2_idx == head);
 
-    // Commit output: head entry (with bypass for data)
-    assign o_commit_valid  = completing_head || (!o_empty && valid[head] && completed[head]);
+    // Validity of looked-up entries: needed to distinguish "completed" from
+    // "squashed" (both return lookup_completed=true, but squashed entries
+    // should use regfile data, not ROB read data).
+    assign o_lookup1_valid = valid[i_lookup1_idx];
+    assign o_lookup2_valid = valid[i_lookup2_idx];
+
+    // Data read ports: combinational read with same-cycle complete bypass.
+    // When the entry is being completed this cycle, return the completing data.
+    assign o_read1_data = if i_complete_valid && i_complete_idx == i_read1_idx ?
+        i_complete_data : rd_data[i_read1_idx];
+    assign o_read2_data = if i_complete_valid && i_complete_idx == i_read2_idx ?
+        i_complete_data : rd_data[i_read2_idx];
+
+    // Read port completion/validity: with same-cycle completing_head bypass
+    assign o_read1_completed = completed[i_read1_idx]
+        || (completing_head && i_read1_idx == head);
+    assign o_read1_valid = valid[i_read1_idx];
+    assign o_read2_completed = completed[i_read2_idx]
+        || (completing_head && i_read2_idx == head);
+    assign o_read2_valid = valid[i_read2_idx];
+
+    // Commit output: head entry (with bypass for data).
+    // Suppress commit if squash is active and head is in squash range
+    // (wrong-path instruction must not commit to regfile).
+    // Commit output: suppress if head is being squashed (wrong-path commit).
+    let squash_head: logic = i_squash_valid && squash_mask[head];
+    assign o_commit_valid  = !squash_head
+        && (completing_head || (!o_empty && valid[head] && completed[head]));
     assign o_commit_pc     = pc[head];
     assign o_commit_rd     = rd_addr[head];
     assign o_commit_data   = if completing_head ? i_complete_data : rd_data[head];
@@ -118,7 +204,7 @@ pub module rob (
                 exception[i] = 1'b0;
             }
         } else if i_flush {
-            // Flush: invalidate all entries, reset pointers
+            // Full flush: invalidate all entries, reset pointers (trap/mret/sret)
             head  = 3'd0;
             tail  = 3'd0;
             count = 4'd0;
@@ -128,8 +214,16 @@ pub module rob (
                 exception[i] = 1'b0;
             }
         } else {
-            // Allocate at tail
-            if i_alloc_valid && o_alloc_ready {
+            // Precompute alloc/commit predicates for unified count management.
+            // NBA semantics: multiple writes to `count` → last write wins, earlier lost.
+            // So count must be updated exactly once, accounting for all operations.
+            let do_alloc : logic = i_alloc_valid && o_alloc_ready && !i_squash_valid;
+            let do_commit: logic = i_commit_ack && o_commit_valid;
+
+            // Debug removed
+
+            // Allocate at tail (suppressed during squash — pipeline asserts flush_id)
+            if do_alloc {
                 valid[tail]     = 1'b1;
                 completed[tail] = 1'b0;
                 exception[tail] = 1'b0;
@@ -141,8 +235,7 @@ pub module rob (
                 compr[tail]     = i_alloc_compr;
                 rd_data[tail]   = '0;
                 cause[tail]     = '0;
-                tail  = tail + 3'd1;
-                count = count + 4'd1;
+                tail = tail + 3'd1;
             }
 
             // Complete: mark entry as done, write result
@@ -165,15 +258,43 @@ pub module rob (
                 reg_wen[i_suppress_wen_idx] = 1'b0;
             }
 
-            // Commit: retire head
-            if i_commit_ack && o_commit_valid {
+            // Cancel entry: mark as completed with wen=0 (for flushed instructions)
+            if i_cancel_valid && valid[i_cancel_idx] {
+                completed[i_cancel_idx] = 1'b1;
+                reg_wen[i_cancel_idx]   = 1'b0;
+                fp_wen[i_cancel_idx]    = 1'b0;
+            }
+
+            // Commit: retire head (count handled below)
+            if do_commit {
                 valid[head] = 1'b0;
-                head  = head + 3'd1;
+                head = head + 3'd1;
+            }
+
+            // Unified count update: single write avoids NBA last-write-wins issue.
+            // Squash overlay overrides normal count when active.
+            if i_squash_valid {
+                let sq_diff_3: logic<3> = i_squash_idx - head;
+                let sq_new_count: logic<4> = {1'b0, sq_diff_3};
+                for i: i32 in 0..8 {
+                    if squash_mask[i] {
+                        valid[i]     = 1'b0;
+                        completed[i] = 1'b0;
+                        exception[i] = 1'b0;
+                    }
+                }
+                tail = i_squash_idx;
+                // NBA: head is pre-commit value. Adjust -1 when commit happened.
+                count = if do_commit ? sq_new_count - 4'd1 : sq_new_count;
+            } else if do_alloc && do_commit {
+                // Net change: +1 -1 = 0. No count update needed.
+            } else if do_alloc {
+                count = count + 4'd1;
+            } else if do_commit {
                 count = count - 4'd1;
             }
 
-            // Simultaneous alloc + commit: adjust count
-            // (already handled by separate +1 and -1 on count)
+            // (old debug trace removed)
         }
     }
 }

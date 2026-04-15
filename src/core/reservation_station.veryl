@@ -1,0 +1,228 @@
+// Integer Reservation Station: 8-entry issue queue with CDB wakeup.
+// Dispatches decoded ALU/DIV instructions, tracks operand readiness,
+// and issues the oldest-ready entry to the execute stage.
+// Issue output is REGISTERED (1-cycle latency from dispatch to issue)
+// to avoid combinational loops through module boundaries.
+pub module reservation_station (
+    clk: input clock,
+    rst: input reset,
+
+    // Dispatch interface (from ID stage)
+    i_dispatch_valid : input logic              ,
+    i_dispatch_pc    : input logic          <64>,
+    i_dispatch_alu_op: input alu_pkg::AluOp     ,
+    i_dispatch_src_a : input pipeline_pkg::AluSrcA,
+    i_dispatch_src_b : input pipeline_pkg::AluSrcB,
+    i_dispatch_imm   : input logic          <64>,
+    i_dispatch_rd    : input logic          <5> ,
+    i_dispatch_rs1   : input logic          <5> ,
+    i_dispatch_rs2   : input logic          <5> ,
+    i_dispatch_wen   : input logic              ,
+    i_dispatch_rob   : input logic          <3> ,
+    // Operand status at dispatch
+    i_dispatch_s1_ready: input logic          ,
+    i_dispatch_s1_tag  : input logic      <3> ,
+    i_dispatch_s1_data : input logic      <64>,
+    i_dispatch_s2_ready: input logic          ,
+    i_dispatch_s2_tag  : input logic      <3> ,
+    i_dispatch_s2_data : input logic      <64>,
+    o_dispatch_ready   : output logic         , // RS can accept dispatch
+
+    // Issue interface (to EX stage) — REGISTERED output
+    o_issue_valid : output logic              ,
+    o_issue_pc    : output logic          <64>,
+    o_issue_alu_op: output alu_pkg::AluOp     ,
+    o_issue_src_a : output pipeline_pkg::AluSrcA,
+    o_issue_src_b : output pipeline_pkg::AluSrcB,
+    o_issue_imm   : output logic          <64>,
+    o_issue_rd    : output logic          <5> ,
+    o_issue_rs1   : output logic          <5> ,
+    o_issue_rs2   : output logic          <5> ,
+    o_issue_s1_data: output logic         <64>,
+    o_issue_s2_data: output logic         <64>,
+    o_issue_wen   : output logic              ,
+    o_issue_rob   : output logic          <3> ,
+    i_issue_stall : input  logic              , // EX cannot accept (stall/busy)
+
+    // CDB port 0 (EX stage ALU result)
+    i_cdb0_valid: input logic    ,
+    i_cdb0_rob  : input logic<3> ,
+    i_cdb0_data : input logic<64>,
+
+    // CDB port 1 (WB / MSHR / async DIV result)
+    i_cdb1_valid: input logic    ,
+    i_cdb1_rob  : input logic<3> ,
+    i_cdb1_data : input logic<64>,
+
+    // Flush (trap only — full invalidation)
+    i_flush: input logic,
+
+    // Squash (branch misprediction — selective invalidation)
+    i_squash_valid: input logic    ,
+    i_squash_mask : input logic [8], // from ROB: which ROB indices to squash
+) {
+    // ============================================================
+    // Entry storage (8 entries)
+    // ============================================================
+    var valid     : logic              [8];
+    var e_pc      : logic          <64>[8];
+    var e_alu_op  : logic          <5> [8]; // AluOp as raw logic
+    var e_src_a   : logic          <2> [8]; // AluSrcA as raw logic
+    var e_src_b   : logic          <2> [8]; // AluSrcB as raw logic
+    var e_imm     : logic          <64>[8];
+    var e_rd      : logic          <5> [8];
+    var e_rs1     : logic          <5> [8];
+    var e_rs2     : logic          <5> [8];
+    var e_wen     : logic              [8];
+    var e_rob     : logic          <3> [8];
+    var s1_ready  : logic              [8];
+    var s1_tag    : logic          <3> [8];
+    var s1_data   : logic          <64>[8];
+    var s2_ready  : logic              [8];
+    var s2_tag    : logic          <3> [8];
+    var s2_data   : logic          <64>[8];
+
+    // ============================================================
+    // Combinational: free slot, ready detection, issue select
+    // ============================================================
+    var free_idx  : logic<3>;
+    var free_found: logic   ;
+    var ready     : logic [8];
+    var sel_idx   : logic<3>;
+    var sel_valid : logic   ;
+
+    always_comb {
+        free_found = 1'b0;
+        free_idx = 3'd0;
+        for i: i32 in 0..8 {
+            if !valid[i] && !free_found {
+                free_found = 1'b1;
+                free_idx = i[2:0];
+            }
+        }
+        // Ready mask with same-cycle CDB bypass
+        for i: i32 in 0..8 {
+            ready[i] = valid[i]
+                && (s1_ready[i] || (i_cdb0_valid && s1_tag[i] == i_cdb0_rob) || (i_cdb1_valid && s1_tag[i] == i_cdb1_rob))
+                && (s2_ready[i] || (i_cdb0_valid && s2_tag[i] == i_cdb0_rob) || (i_cdb1_valid && s2_tag[i] == i_cdb1_rob));
+        }
+        // Issue select: first ready entry (lowest index = simple priority)
+        sel_valid = 1'b0;
+        sel_idx   = 3'd0;
+        for i: i32 in 0..8 {
+            if ready[i] && !sel_valid {
+                sel_valid = 1'b1;
+                sel_idx   = i[2:0];
+            }
+        }
+    }
+
+    // Dispatch accepted: RS has a free slot or not dispatching
+    assign o_dispatch_ready = free_found || !i_dispatch_valid;
+
+    // ============================================================
+    // Sequential: dispatch, CDB wakeup, issue (registered output), flush
+    // ============================================================
+    always_ff (clk, rst) {
+        if_reset {
+            o_issue_valid = 1'b0;
+            for i: i32 in 0..8 {
+                valid[i] = 1'b0;
+            }
+        } else if i_flush {
+            o_issue_valid = 1'b0;
+            for i: i32 in 0..8 {
+                valid[i] = 1'b0;
+            }
+        } else {
+            // CDB wakeup: update operand data and ready flags
+            for i: i32 in 0..8 {
+                if valid[i] {
+                    if !s1_ready[i] {
+                        if i_cdb0_valid && s1_tag[i] == i_cdb0_rob {
+                            s1_ready[i] = 1'b1;
+                            s1_data[i]  = i_cdb0_data;
+                        } else if i_cdb1_valid && s1_tag[i] == i_cdb1_rob {
+                            s1_ready[i] = 1'b1;
+                            s1_data[i]  = i_cdb1_data;
+                        }
+                    }
+                    if !s2_ready[i] {
+                        if i_cdb0_valid && s2_tag[i] == i_cdb0_rob {
+                            s2_ready[i] = 1'b1;
+                            s2_data[i]  = i_cdb0_data;
+                        } else if i_cdb1_valid && s2_tag[i] == i_cdb1_rob {
+                            s2_ready[i] = 1'b1;
+                            s2_data[i]  = i_cdb1_data;
+                        }
+                    }
+                }
+            }
+
+            // Issue output: registered. Select ready entry and latch to output.
+            if !i_issue_stall {
+                if sel_valid {
+                    o_issue_valid   = 1'b1;
+                    o_issue_pc      = e_pc[sel_idx];
+                    o_issue_alu_op  = e_alu_op[sel_idx];
+                    o_issue_src_a   = e_src_a[sel_idx];
+                    o_issue_src_b   = e_src_b[sel_idx];
+                    o_issue_imm     = e_imm[sel_idx];
+                    o_issue_rd      = e_rd[sel_idx];
+                    o_issue_rs1     = e_rs1[sel_idx];
+                    o_issue_rs2     = e_rs2[sel_idx];
+                    // Operand data: use CDB bypass if waking up this cycle
+                    o_issue_s1_data = if !s1_ready[sel_idx] && i_cdb0_valid && s1_tag[sel_idx] == i_cdb0_rob ?
+                        i_cdb0_data : if !s1_ready[sel_idx] && i_cdb1_valid && s1_tag[sel_idx] == i_cdb1_rob ?
+                        i_cdb1_data : s1_data[sel_idx];
+                    o_issue_s2_data = if !s2_ready[sel_idx] && i_cdb0_valid && s2_tag[sel_idx] == i_cdb0_rob ?
+                        i_cdb0_data : if !s2_ready[sel_idx] && i_cdb1_valid && s2_tag[sel_idx] == i_cdb1_rob ?
+                        i_cdb1_data : s2_data[sel_idx];
+                    o_issue_wen     = e_wen[sel_idx];
+                    o_issue_rob     = e_rob[sel_idx];
+                    // Free the issued entry
+                    valid[sel_idx]  = 1'b0;
+                } else {
+                    o_issue_valid = 1'b0;
+                }
+            }
+            // When i_issue_stall: hold output (o_issue_valid/data unchanged)
+
+            // Dispatch: allocate new entry
+            if i_dispatch_valid && free_found {
+                valid[free_idx]     = 1'b1;
+                e_pc[free_idx]      = i_dispatch_pc;
+                e_alu_op[free_idx]  = i_dispatch_alu_op;
+                e_src_a[free_idx]   = i_dispatch_src_a;
+                e_src_b[free_idx]   = i_dispatch_src_b;
+                e_imm[free_idx]     = i_dispatch_imm;
+                e_rd[free_idx]      = i_dispatch_rd;
+                e_rs1[free_idx]     = i_dispatch_rs1;
+                e_rs2[free_idx]     = i_dispatch_rs2;
+                e_wen[free_idx]     = i_dispatch_wen;
+                e_rob[free_idx]     = i_dispatch_rob;
+                s1_ready[free_idx]  = i_dispatch_s1_ready;
+                s1_tag[free_idx]    = i_dispatch_s1_tag;
+                s1_data[free_idx]   = i_dispatch_s1_data;
+                s2_ready[free_idx]  = i_dispatch_s2_ready;
+                s2_tag[free_idx]    = i_dispatch_s2_tag;
+                s2_data[free_idx]   = i_dispatch_s2_data;
+            }
+
+            // Squash overlay: selectively invalidate entries whose ROB index
+            // is in the squash range. Placed AFTER normal logic so squash wins.
+            if i_squash_valid {
+                for i: i32 in 0..8 {
+                    if valid[i] && i_squash_mask[e_rob[i]] {
+                        valid[i] = 1'b0;
+                    }
+                }
+                // Suppress issue output if the just-issued entry was squashed.
+                // The entry's e_rob data is still readable even after valid=0.
+                if sel_valid && i_squash_mask[e_rob[sel_idx]] {
+                    o_issue_valid = 1'b0;
+                }
+            }
+        }
+    }
+}
