@@ -15,6 +15,7 @@ pub module rob (
     i_alloc_fp_wen: input  logic    , // instruction writes FP register
     i_alloc_compr : input  logic    , // compressed instruction
     o_alloc_idx   : output logic<3> , // allocated ROB index (tail)
+    o_alloc_epoch : output logic    , // allocation epoch (toggles on tail wrap)
     o_alloc_ready : output logic    , // ROB has space (not full)
 
     // Complete: mark entry as done, write result (called at WB or MSHR)
@@ -46,6 +47,7 @@ pub module rob (
     o_commit_compr : output logic    ,
     o_commit_exc   : output logic    , // head has exception
     o_commit_cause : output logic<64>,
+    o_commit_epoch : output logic    , // epoch of committing entry
     i_commit_ack   : input  logic    , // pipeline acknowledges commit
 
     // Flush: invalidate all entries (on trap/mret/sret)
@@ -95,11 +97,13 @@ pub module rob (
     var fp_wen   : logic     [8];
     var compr    : logic     [8];
     var cause    : logic<64> [8];
+    var epoch    : logic     [8]; // epoch at allocation time (for aliasing detection)
 
     // Head and tail pointers
     var head: logic<3>;
     var tail: logic<3>;
     var count: logic<4>; // 0..8
+    var alloc_epoch: logic; // toggles when tail wraps from 7→0
 
     // Squash mask: computed combinationally for use in always_ff.
     // Entry i should be squashed if it's in the range [squash_idx, tail) (circular).
@@ -138,6 +142,7 @@ pub module rob (
     assign o_full  = count == 4'd8;
     assign o_alloc_ready = count <: 4'd8;
     assign o_alloc_idx   = tail;
+    assign o_alloc_epoch = alloc_epoch;
     assign o_commit_idx  = head;
 
     // Same-cycle complete+commit bypass: when the completing entry IS the head
@@ -195,12 +200,14 @@ pub module rob (
     assign o_commit_compr  = compr[head];
     assign o_commit_exc    = exception[head];
     assign o_commit_cause  = cause[head];
+    assign o_commit_epoch  = epoch[head];
 
     always_ff (clk, rst) {
         if_reset {
-            head  = 3'd0;
-            tail  = 3'd0;
-            count = 4'd0;
+            head        = 3'd0;
+            tail        = 3'd0;
+            count       = 4'd0;
+            alloc_epoch = 1'b0;
             for i: i32 in 0..8 {
                 valid[i]     = 1'b0;
                 completed[i] = 1'b0;
@@ -208,9 +215,10 @@ pub module rob (
             }
         } else if i_flush {
             // Full flush: invalidate all entries, reset pointers (trap/mret/sret)
-            head  = 3'd0;
-            tail  = 3'd0;
-            count = 4'd0;
+            head        = 3'd0;
+            tail        = 3'd0;
+            count       = 4'd0;
+            alloc_epoch = 1'b0;
             for i: i32 in 0..8 {
                 valid[i]     = 1'b0;
                 completed[i] = 1'b0;
@@ -236,8 +244,13 @@ pub module rob (
                 is_fp[tail]     = i_alloc_is_fp;
                 fp_wen[tail]    = i_alloc_fp_wen;
                 compr[tail]     = i_alloc_compr;
+                epoch[tail]     = alloc_epoch;
                 rd_data[tail]   = '0;
                 cause[tail]     = '0;
+                // Toggle epoch when tail wraps from 7→0
+                if tail == 3'd7 {
+                    alloc_epoch = ~alloc_epoch;
+                }
                 tail = tail + 3'd1;
             }
 
@@ -282,8 +295,6 @@ pub module rob (
             // Unified count update: single write avoids NBA last-write-wins issue.
             // Squash overlay overrides normal count when active.
             if i_squash_valid {
-                let sq_diff_3: logic<3> = i_squash_idx - head;
-                let sq_new_count: logic<4> = {1'b0, sq_diff_3};
                 for i: i32 in 0..8 {
                     if squash_mask[i] {
                         valid[i]     = 1'b0;
@@ -291,9 +302,17 @@ pub module rob (
                         exception[i] = 1'b0;
                     }
                 }
-                tail = i_squash_idx;
-                // NBA: head is pre-commit value. Adjust -1 when commit happened.
-                count = if do_commit ? sq_new_count - 4'd1 : sq_new_count;
+                let sq_diff_3: logic<3> = i_squash_idx - head;
+                let sq_new_count: logic<4> = {1'b0, sq_diff_3};
+                // Guard: skip tail/count update when nothing to squash
+                // (squash_idx == tail means no entries exist after the branch).
+                // Without this, 3-bit arithmetic wraps: count = 0 when ROB is full.
+                if i_squash_idx != tail {
+                    tail = i_squash_idx;
+                    count = if do_commit ? sq_new_count - 4'd1 : sq_new_count;
+                } else if do_commit {
+                    count = count - 4'd1;
+                }
             } else if do_alloc && do_commit {
                 // Net change: +1 -1 = 0. No count update needed.
             } else if do_alloc {
