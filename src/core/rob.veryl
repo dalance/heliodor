@@ -1,7 +1,12 @@
-// Reorder Buffer: 8-entry circular buffer for in-order commit.
+// Reorder Buffer: 16-entry circular buffer for in-order commit.
 // Supports allocate (tail), complete (by index), commit (head), flush.
 // Same-cycle complete+commit bypass: when the completing entry is the head,
 // commit output is available immediately (no 1-cycle delay).
+//
+// Head/tail are 5-bit pointers: [4] = wrap bit (epoch), [3:0] = array index.
+// The wrap bit naturally prevents aliasing between different allocations at
+// the same array index. Full/empty is unambiguous: head == tail means empty,
+// head[3:0] == tail[3:0] && head[4] != tail[4] means full.
 pub module rob (
     clk: input clock,
     rst: input reset,
@@ -14,28 +19,28 @@ pub module rob (
     i_alloc_is_fp : input  logic    , // FP instruction
     i_alloc_fp_wen: input  logic    , // instruction writes FP register
     i_alloc_compr : input  logic    , // compressed instruction
-    o_alloc_idx   : output logic<3> , // allocated ROB index (tail)
-    o_alloc_epoch : output logic    , // allocation epoch (toggles on tail wrap)
+    o_alloc_idx   : output logic<4> , // allocated ROB index (tail[3:0])
+    o_alloc_epoch : output logic    , // allocation epoch (tail[4])
     o_alloc_ready : output logic    , // ROB has space (not full)
 
     // Complete: mark entry as done, write result (called at WB or MSHR)
     i_complete_valid: input logic    ,
-    i_complete_idx  : input logic<3> ,
+    i_complete_idx  : input logic<4> ,
     i_complete_epoch: input logic    , // epoch of completing instruction
     i_complete_data : input logic<64>,
 
     // Exception: mark entry as faulting (called at EX/MEM stage)
     i_exc_valid: input logic    ,
-    i_exc_idx  : input logic<3> ,
+    i_exc_idx  : input logic<4> ,
     i_exc_cause: input logic<64>,
 
     // Suppress register write (for MSHR-absorbed loads)
     i_suppress_wen_valid: input logic    ,
-    i_suppress_wen_idx  : input logic<3> ,
+    i_suppress_wen_idx  : input logic<4> ,
 
     // Cancel entry: mark as completed with wen=0 (for flushed RS-eligible instructions)
     i_cancel_valid: input logic    ,
-    i_cancel_idx  : input logic<3> ,
+    i_cancel_idx  : input logic<4> ,
 
     // Commit: retire head entry (in-order)
     o_commit_valid : output logic    ,
@@ -55,294 +60,219 @@ pub module rob (
     i_flush: input logic,
 
     // Squash: invalidate entries AFTER the given index (on branch misprediction).
-    // Keeps entries from head to squash_idx (inclusive), discards the rest.
+    // i_squash_idx is a 5-bit pointer (same format as head/tail).
     i_squash_valid: input logic    ,
-    i_squash_idx  : input logic<3> , // branch instruction's ROB index
+    i_squash_idx  : input logic<5> ,
 
     // Lookup: check if entry is completed (combinational, for RAT stall)
-    // Includes same-cycle completing_head bypass for zero-latency visibility.
-    i_lookup1_idx      : input  logic<3> ,
+    i_lookup1_idx      : input  logic<4> ,
     o_lookup1_completed: output logic    ,
-    o_lookup1_valid    : output logic    , // entry exists (not squashed)
-    i_lookup2_idx      : input  logic<3> ,
+    o_lookup1_valid    : output logic    ,
+    i_lookup2_idx      : input  logic<4> ,
     o_lookup2_completed: output logic    ,
-    o_lookup2_valid    : output logic    , // entry exists (not squashed)
+    o_lookup2_valid    : output logic    ,
 
     // Data read ports (for RS operand resolution at dispatch)
-    i_read1_idx      : input  logic<3> ,
+    i_read1_idx      : input  logic<4> ,
     o_read1_data     : output logic<64>,
-    o_read1_completed: output logic    , // RS dispatch: is operand ready?
-    o_read1_valid    : output logic    , // RS dispatch: is entry valid (not squashed)?
-    i_read2_idx      : input  logic<3> ,
+    o_read1_completed: output logic    ,
+    o_read1_valid    : output logic    ,
+    i_read2_idx      : input  logic<4> ,
     o_read2_data     : output logic<64>,
     o_read2_completed: output logic    ,
     o_read2_valid    : output logic    ,
 
-    // Squash mask output (for RAT cleanup)
-    o_squash_mask: output logic [8],
-
-    // Epoch validation ports: check if pipeline instruction's epoch matches ROB entry.
-    // Independent of completion ports to avoid combinational loops.
-    // Port 1: MEM/WB stage
-    i_wb_check_idx  : input  logic<3> ,
-    i_wb_check_epoch: input  logic    ,
-    o_wb_epoch_ok   : output logic    ,
-    // Port 2: EX stage (for CDB0 gating)
-    i_ex_check_idx  : input  logic<3> ,
-    i_ex_check_epoch: input  logic    ,
-    o_ex_epoch_ok   : output logic    ,
+    // Squash mask output (for RS cleanup — indexed by 4-bit ROB index)
+    o_squash_mask: output logic [16],
 
     // Status
     o_empty      : output logic,
     o_full       : output logic,
-    o_commit_idx : output logic<3>, // ROB index of committed entry (= head)
+    o_commit_idx : output logic<4>, // ROB index of committed entry (= head[3:0])
 ) {
-    // Entry storage
-    var valid    : logic     [8];
-    var completed: logic     [8];
-    var exception: logic     [8];
-    var pc       : logic<64> [8];
-    var rd_addr  : logic<5>  [8];
-    var rd_data  : logic<64> [8];
-    var reg_wen  : logic     [8];
-    var is_fp    : logic     [8];
-    var fp_wen   : logic     [8];
-    var compr    : logic     [8];
-    var cause    : logic<64> [8];
-    var epoch    : logic     [8]; // epoch at allocation time (for aliasing detection)
+    // Entry storage (16 entries)
+    var valid    : logic     [16];
+    var completed: logic     [16];
+    var exception: logic     [16];
+    var pc       : logic<64> [16];
+    var rd_addr  : logic<5>  [16];
+    var rd_data  : logic<64> [16];
+    var reg_wen  : logic     [16];
+    var is_fp    : logic     [16];
+    var fp_wen   : logic     [16];
+    var compr    : logic     [16];
+    var cause    : logic<64> [16];
+    var wrap_bit : logic     [16]; // wrap bit at allocation time (= tail[4])
 
-    // Head and tail pointers
-    var head: logic<3>;
-    var tail: logic<3>;
-    var count: logic<4>; // 0..8
-    var alloc_epoch: logic; // toggles when tail wraps from 7→0
+    // Head and tail pointers (5-bit: [4] = wrap, [3:0] = index)
+    var head: logic<5>;
+    var tail: logic<5>;
 
-    // Squash mask: computed combinationally for use in always_ff.
-    // Entry i should be squashed if it's in the range [squash_idx, tail) (circular).
-    var squash_mask: logic [8];
-    var _sq_di  : logic<3>; // distance from squash_idx to entry i
-    var _sq_dt  : logic<3>; // distance from squash_idx to tail
+    // Count derived from 5-bit pointer difference (no separate counter needed,
+    // but we keep one for cleaner empty/full logic).
+    var count: logic<5>; // 0..16
+
+    // Squash mask: entry i should be squashed if it's in the range
+    // (squash_idx, tail) — entries strictly AFTER squash_idx up to tail.
+    var squash_mask: logic [16];
     always_comb {
-        _sq_dt = tail - i_squash_idx;
-        for i: i32 in 0..8 {
+        let sq_dt: logic<5> = tail - i_squash_idx;
+        for i: i32 in 0..16 {
             squash_mask[i] = 1'b0;
             if i_squash_valid {
-                _sq_di = i[2:0] - i_squash_idx;
-                if _sq_di <: _sq_dt {
+                let sq_di: logic<5> = {1'b0, i[3:0]} - i_squash_idx;
+                if sq_di <: sq_dt && sq_di != 5'd0 {
                     squash_mask[i] = 1'b1;
                 }
             }
         }
     }
 
-    for i in 0..8 :g_sq_mask {
+    for i in 0..16 :g_sq_mask {
         assign o_squash_mask[i] = squash_mask[i];
     }
 
-    // Debug: count invariant check
-    var _dbg_valid_count: logic<4>;
-    always_comb {
-        _dbg_valid_count = 4'd0;
-        for _i: i32 in 0..8 {
-            if valid[_i] {
-                _dbg_valid_count = _dbg_valid_count + 4'd1;
-            }
-        }
-    }
+    let head_idx: logic<4> = head[3:0];
+    let tail_idx: logic<4> = tail[3:0];
 
-    assign o_wb_epoch_ok = valid[i_wb_check_idx] && epoch[i_wb_check_idx] == i_wb_check_epoch;
-    assign o_ex_epoch_ok = valid[i_ex_check_idx] && epoch[i_ex_check_idx] == i_ex_check_epoch;
-    assign o_empty = count == 4'd0;
-    assign o_full  = count == 4'd8;
-    assign o_alloc_ready = count <: 4'd8;
-    assign o_alloc_idx   = tail;
-    assign o_alloc_epoch = alloc_epoch;
-    assign o_commit_idx  = head;
+    assign o_empty       = count == 5'd0;
+    assign o_full        = count == 5'd16;
+    assign o_alloc_ready = count <: 5'd16;
+    assign o_alloc_idx   = tail_idx;
+    assign o_alloc_epoch = tail[4];
+    assign o_commit_idx  = head_idx;
 
-    // Same-cycle complete+commit bypass: when the completing entry IS the head
-    // and it hasn't been completed yet, the commit fires in the same cycle.
-    // This preserves regfile write timing (same cycle as WB).
-    let completing_head: logic = i_complete_valid && i_complete_idx == head
-                              && valid[head] && !completed[head] && !o_empty
-                              && epoch[head] == i_complete_epoch;
+    // Same-cycle complete+commit bypass
+    let completing_head: logic = i_complete_valid && i_complete_idx == head_idx
+                              && valid[head_idx] && !completed[head_idx] && !o_empty
+                              && wrap_bit[head_idx] == i_complete_epoch;
 
-    // Alloc bypass: when an entry is being allocated this cycle, its completed flag
-    // is still the OLD value (from the previous occupant). Override to false.
-
-    // Lookup: completed flag with same-cycle bypass.
-    // Invalid entries (squashed or committed) return completed=true so consumers
-    // don't wait forever for a dead entry. Stale RAT mappings are handled by
-    // using regfile data (via rs_stale_s1/s2 in heliodor_top).
+    // Lookup: completed flag with same-cycle bypass
     assign o_lookup1_completed = completed[i_lookup1_idx]
-        || (completing_head && i_lookup1_idx == head);
+        || (completing_head && i_lookup1_idx == head_idx);
     assign o_lookup2_completed = completed[i_lookup2_idx]
-        || (completing_head && i_lookup2_idx == head);
-
-    // Validity of looked-up entries: needed to distinguish "completed" from
-    // "squashed" (both return lookup_completed=true, but squashed entries
-    // should use regfile data, not ROB read data).
+        || (completing_head && i_lookup2_idx == head_idx);
     assign o_lookup1_valid = valid[i_lookup1_idx];
     assign o_lookup2_valid = valid[i_lookup2_idx];
 
-    // Data read ports: combinational read with same-cycle complete bypass.
-    // When the entry is being completed this cycle, return the completing data.
+    // Data read ports with same-cycle complete bypass
     assign o_read1_data = if i_complete_valid && i_complete_idx == i_read1_idx ?
         i_complete_data : rd_data[i_read1_idx];
     assign o_read2_data = if i_complete_valid && i_complete_idx == i_read2_idx ?
         i_complete_data : rd_data[i_read2_idx];
-
-    // Read port completion/validity: with same-cycle completing_head bypass
     assign o_read1_completed = completed[i_read1_idx]
-        || (completing_head && i_read1_idx == head);
+        || (completing_head && i_read1_idx == head_idx);
     assign o_read1_valid = valid[i_read1_idx];
     assign o_read2_completed = completed[i_read2_idx]
-        || (completing_head && i_read2_idx == head);
+        || (completing_head && i_read2_idx == head_idx);
     assign o_read2_valid = valid[i_read2_idx];
 
-    // Commit output: head entry (with bypass for data).
-    // Suppress commit if squash is active and head is in squash range
-    // (wrong-path instruction must not commit to regfile).
-    // Commit output: suppress if head is being squashed (wrong-path commit).
-    let squash_head: logic = i_squash_valid && squash_mask[head];
+    // Commit output
+    let squash_head: logic = i_squash_valid && squash_mask[head_idx];
     assign o_commit_valid  = !squash_head
-        && (completing_head || (!o_empty && valid[head] && completed[head]));
-    assign o_commit_pc     = pc[head];
-    assign o_commit_rd     = rd_addr[head];
-    assign o_commit_data   = if completing_head ? i_complete_data : rd_data[head];
-    assign o_commit_wen    = reg_wen[head];
-    assign o_commit_is_fp  = is_fp[head];
-    assign o_commit_fp_wen = fp_wen[head];
-    assign o_commit_compr  = compr[head];
-    assign o_commit_exc    = exception[head];
-    assign o_commit_cause  = cause[head];
-    assign o_commit_epoch  = epoch[head];
+        && (completing_head || (!o_empty && valid[head_idx] && completed[head_idx]));
+    assign o_commit_pc     = pc[head_idx];
+    assign o_commit_rd     = rd_addr[head_idx];
+    assign o_commit_data   = if completing_head ? i_complete_data : rd_data[head_idx];
+    assign o_commit_wen    = reg_wen[head_idx];
+    assign o_commit_is_fp  = is_fp[head_idx];
+    assign o_commit_fp_wen = fp_wen[head_idx];
+    assign o_commit_compr  = compr[head_idx];
+    assign o_commit_exc    = exception[head_idx];
+    assign o_commit_cause  = cause[head_idx];
+    assign o_commit_epoch  = wrap_bit[head_idx];
 
     always_ff (clk, rst) {
         if_reset {
-            head        = 3'd0;
-            tail        = 3'd0;
-            count       = 4'd0;
-            alloc_epoch = 1'b0;
-            for i: i32 in 0..8 {
+            head  = 5'd0;
+            tail  = 5'd0;
+            count = 5'd0;
+            for i: i32 in 0..16 {
                 valid[i]     = 1'b0;
                 completed[i] = 1'b0;
                 exception[i] = 1'b0;
             }
         } else if i_flush {
-            // Full flush: invalidate all entries, reset pointers (trap/mret/sret)
-            head        = 3'd0;
-            tail        = 3'd0;
-            count       = 4'd0;
-            alloc_epoch = 1'b0;
-            for i: i32 in 0..8 {
+            head  = 5'd0;
+            tail  = 5'd0;
+            count = 5'd0;
+            for i: i32 in 0..16 {
                 valid[i]     = 1'b0;
                 completed[i] = 1'b0;
                 exception[i] = 1'b0;
             }
         } else {
-            // Precompute alloc/commit predicates for unified count management.
-            // NBA semantics: multiple writes to `count` → last write wins, earlier lost.
-            // So count must be updated exactly once, accounting for all operations.
             let do_alloc : logic = i_alloc_valid && o_alloc_ready && !i_squash_valid;
             let do_commit: logic = i_commit_ack && o_commit_valid;
 
-            // Debug removed
+            // Complete/exception/cancel BEFORE alloc (last write wins on same index)
 
-            // Complete/exception/cancel BEFORE alloc: within sequential always_ff,
-            // if an old instruction completes at the same index that a new instruction
-            // is being allocated, the alloc's completed=0 must win (last write wins).
-            // Placing complete FIRST ensures alloc's reset takes priority.
-
-            // Complete: mark entry as done, write result
-            // Guard: only complete if entry is valid AND epoch matches.
-            // Without epoch check, a stale completion from a previous allocation
-            // (same index, different epoch) overwrites the new entry's completed flag.
-            if i_complete_valid && valid[i_complete_idx] && epoch[i_complete_idx] == i_complete_epoch {
+            // Complete: epoch guard prevents stale completion from wrong generation
+            if i_complete_valid && valid[i_complete_idx] && wrap_bit[i_complete_idx] == i_complete_epoch {
                 completed[i_complete_idx] = 1'b1;
                 rd_data[i_complete_idx]   = i_complete_data;
             }
 
-            // Exception: mark entry as faulting
             if i_exc_valid {
                 completed[i_exc_idx] = 1'b1;
                 exception[i_exc_idx] = 1'b1;
                 cause[i_exc_idx]     = i_exc_cause;
             }
 
-            // Suppress register write (MSHR-absorbed loads)
             if i_suppress_wen_valid {
                 reg_wen[i_suppress_wen_idx] = 1'b0;
             }
 
-            // Cancel entry: mark as completed with wen=0 (for flushed instructions)
             if i_cancel_valid && valid[i_cancel_idx] {
                 completed[i_cancel_idx] = 1'b1;
                 reg_wen[i_cancel_idx]   = 1'b0;
                 fp_wen[i_cancel_idx]    = 1'b0;
             }
 
-            // Allocate at tail (AFTER complete: last write wins when same index)
+            // Allocate at tail (AFTER complete: last write wins)
             if do_alloc {
-                valid[tail]     = 1'b1;
-                completed[tail] = 1'b0;
-                exception[tail] = 1'b0;
-                pc[tail]        = i_alloc_pc;
-                rd_addr[tail]   = i_alloc_rd;
-                reg_wen[tail]   = i_alloc_wen;
-                is_fp[tail]     = i_alloc_is_fp;
-                fp_wen[tail]    = i_alloc_fp_wen;
-                compr[tail]     = i_alloc_compr;
-                epoch[tail]     = alloc_epoch;
-                rd_data[tail]   = '0;
-                cause[tail]     = '0;
-                // Toggle epoch when tail wraps from 7→0
-                if tail == 3'd7 {
-                    alloc_epoch = ~alloc_epoch;
-                }
-                tail = tail + 3'd1;
+                valid[tail_idx]     = 1'b1;
+                completed[tail_idx] = 1'b0;
+                exception[tail_idx] = 1'b0;
+                pc[tail_idx]        = i_alloc_pc;
+                rd_addr[tail_idx]   = i_alloc_rd;
+                reg_wen[tail_idx]   = i_alloc_wen;
+                is_fp[tail_idx]     = i_alloc_is_fp;
+                fp_wen[tail_idx]    = i_alloc_fp_wen;
+                compr[tail_idx]     = i_alloc_compr;
+                wrap_bit[tail_idx]  = tail[4];
+                rd_data[tail_idx]   = '0;
+                cause[tail_idx]     = '0;
+                tail = tail + 5'd1;
             }
 
-            // Commit: retire head (count handled below)
-            // Clear completed flag so the entry doesn't show as "completed"
-            // when reused (stale completed from previous occupant would cause
-            // id_direct_stall to falsely resolve, letting dependent instructions
-            // proceed before their operand is ready).
+            // Commit: retire head
             if do_commit {
-                valid[head]     = 1'b0;
-                completed[head] = 1'b0;
-                head = head + 3'd1;
+                valid[head_idx]     = 1'b0;
+                completed[head_idx] = 1'b0;
+                head = head + 5'd1;
             }
 
-            // Unified count update: single write avoids NBA last-write-wins issue.
-            // Squash overlay overrides normal count when active.
+            // Count update
             if i_squash_valid {
-                for i: i32 in 0..8 {
+                for i: i32 in 0..16 {
                     if squash_mask[i] {
                         valid[i]     = 1'b0;
                         completed[i] = 1'b0;
                         exception[i] = 1'b0;
                     }
                 }
-                let sq_diff_3: logic<3> = i_squash_idx - head;
-                let sq_new_count: logic<4> = {1'b0, sq_diff_3};
-                // Guard: skip tail/count update when nothing to squash
-                // (squash_idx == tail means no entries exist after the branch).
-                // Without this, 3-bit arithmetic wraps: count = 0 when ROB is full.
-                if i_squash_idx != tail {
-                    tail = i_squash_idx;
-                    count = if do_commit ? sq_new_count - 4'd1 : sq_new_count;
-                } else if do_commit {
-                    count = count - 4'd1;
-                }
+                // 5-bit arithmetic: no ambiguity (squash_idx - head gives correct count)
+                let sq_new_count: logic<5> = i_squash_idx - head;
+                tail = i_squash_idx;
+                count = if do_commit ? sq_new_count - 5'd1 : sq_new_count;
             } else if do_alloc && do_commit {
-                // Net change: +1 -1 = 0. No count update needed.
+                // Net change: 0
             } else if do_alloc {
-                count = count + 4'd1;
+                count = count + 5'd1;
             } else if do_commit {
-                count = count - 4'd1;
+                count = count - 5'd1;
             }
-
-            // (old debug trace removed)
         }
     }
 }
