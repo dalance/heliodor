@@ -3,10 +3,9 @@
 // Same-cycle complete+commit bypass: when the completing entry is the head,
 // commit output is available immediately (no 1-cycle delay).
 //
-// Head/tail are 5-bit pointers: [4] = wrap bit (epoch), [3:0] = array index.
-// The wrap bit naturally prevents aliasing between different allocations at
-// the same array index. Full/empty is unambiguous: head == tail means empty,
-// head[3:0] == tail[3:0] && head[4] != tail[4] means full.
+// Head/tail are 6-bit pointers: [5:4] = wrap counter (epoch), [3:0] = array index.
+// 2-bit wrap counter prevents aliasing for up to 64 allocations (4 full wraps).
+// Full/empty: head == tail means empty, head[3:0] == tail[3:0] && head[5:4] != tail[5:4] means full.
 pub module rob (
     clk: input clock,
     rst: input reset,
@@ -20,13 +19,13 @@ pub module rob (
     i_alloc_fp_wen: input  logic    , // instruction writes FP register
     i_alloc_compr : input  logic    , // compressed instruction
     o_alloc_idx   : output logic<4> , // allocated ROB index (tail[3:0])
-    o_alloc_epoch : output logic    , // allocation epoch (tail[4])
+    o_alloc_epoch : output logic<2> , // allocation epoch (tail[5:4])
     o_alloc_ready : output logic    , // ROB has space (not full)
 
     // Complete: mark entry as done, write result (called at WB or MSHR)
     i_complete_valid: input logic    ,
     i_complete_idx  : input logic<4> ,
-    i_complete_epoch: input logic    , // epoch of completing instruction
+    i_complete_epoch: input logic<2> , // epoch of completing instruction
     i_complete_data : input logic<64>,
 
     // Exception: mark entry as faulting (called at EX/MEM stage)
@@ -53,7 +52,7 @@ pub module rob (
     o_commit_compr : output logic    ,
     o_commit_exc   : output logic    , // head has exception
     o_commit_cause : output logic<64>,
-    o_commit_epoch : output logic    , // epoch of committing entry
+    o_commit_epoch : output logic<2> , // epoch of committing entry
     i_commit_ack   : input  logic    , // pipeline acknowledges commit
 
     // Flush: invalidate all entries (on trap/mret/sret)
@@ -62,7 +61,7 @@ pub module rob (
     // Squash: invalidate entries AFTER the given index (on branch misprediction).
     // i_squash_idx is a 5-bit pointer (same format as head/tail).
     i_squash_valid: input logic    ,
-    i_squash_idx  : input logic<5> ,
+    i_squash_idx  : input logic<6> ,
 
     // Lookup: check if entry is completed (combinational, for RAT stall)
     i_lookup1_idx      : input  logic<4> ,
@@ -102,26 +101,25 @@ pub module rob (
     var fp_wen   : logic     [16];
     var compr    : logic     [16];
     var cause    : logic<64> [16];
-    var wrap_bit : logic     [16]; // wrap bit at allocation time (= tail[4])
+    var wrap_cnt : logic<2>  [16]; // wrap counter at allocation time (= tail[5:4])
 
-    // Head and tail pointers (5-bit: [4] = wrap, [3:0] = index)
-    var head: logic<5>;
-    var tail: logic<5>;
+    // Head and tail pointers (6-bit: [5:4] = wrap counter, [3:0] = index)
+    var head: logic<6>;
+    var tail: logic<6>;
 
-    // Count derived from 5-bit pointer difference (no separate counter needed,
-    // but we keep one for cleaner empty/full logic).
+    // Count: number of valid entries (0..16).
     var count: logic<5>; // 0..16
 
     // Squash mask: entry i should be squashed if it's in the range
     // (squash_idx, tail) — entries strictly AFTER squash_idx up to tail.
     var squash_mask: logic [16];
     always_comb {
-        let sq_dt: logic<5> = tail - i_squash_idx;
+        let sq_dt: logic<6> = tail - i_squash_idx;
         for i: i32 in 0..16 {
             squash_mask[i] = 1'b0;
             if i_squash_valid {
-                let sq_di: logic<5> = {1'b0, i[3:0]} - i_squash_idx;
-                if sq_di <: sq_dt && sq_di != 5'd0 {
+                let sq_di: logic<6> = {2'b0, i[3:0]} - i_squash_idx;
+                if sq_di <: sq_dt && sq_di != 6'd0 {
                     squash_mask[i] = 1'b1;
                 }
             }
@@ -139,13 +137,13 @@ pub module rob (
     assign o_full        = count == 5'd16;
     assign o_alloc_ready = count <: 5'd16;
     assign o_alloc_idx   = tail_idx;
-    assign o_alloc_epoch = tail[4];
+    assign o_alloc_epoch = tail[5:4];
     assign o_commit_idx  = head_idx;
 
     // Same-cycle complete+commit bypass
     let completing_head: logic = i_complete_valid && i_complete_idx == head_idx
                               && valid[head_idx] && !completed[head_idx] && !o_empty
-                              && wrap_bit[head_idx] == i_complete_epoch;
+                              && wrap_cnt[head_idx] == i_complete_epoch;
 
     // Lookup: completed flag with same-cycle bypass
     assign o_lookup1_completed = completed[i_lookup1_idx]
@@ -180,12 +178,12 @@ pub module rob (
     assign o_commit_compr  = compr[head_idx];
     assign o_commit_exc    = exception[head_idx];
     assign o_commit_cause  = cause[head_idx];
-    assign o_commit_epoch  = wrap_bit[head_idx];
+    assign o_commit_epoch  = wrap_cnt[head_idx];
 
     always_ff (clk, rst) {
         if_reset {
-            head  = 5'd0;
-            tail  = 5'd0;
+            head  = 6'd0;
+            tail  = 6'd0;
             count = 5'd0;
             for i: i32 in 0..16 {
                 valid[i]     = 1'b0;
@@ -193,8 +191,8 @@ pub module rob (
                 exception[i] = 1'b0;
             }
         } else if i_flush {
-            head  = 5'd0;
-            tail  = 5'd0;
+            head  = 6'd0;
+            tail  = 6'd0;
             count = 5'd0;
             for i: i32 in 0..16 {
                 valid[i]     = 1'b0;
@@ -208,7 +206,7 @@ pub module rob (
             // Complete/exception/cancel BEFORE alloc (last write wins on same index)
 
             // Complete: epoch guard prevents stale completion from wrong generation
-            if i_complete_valid && valid[i_complete_idx] && wrap_bit[i_complete_idx] == i_complete_epoch {
+            if i_complete_valid && valid[i_complete_idx] && wrap_cnt[i_complete_idx] == i_complete_epoch {
                 completed[i_complete_idx] = 1'b1;
                 rd_data[i_complete_idx]   = i_complete_data;
             }
@@ -240,17 +238,17 @@ pub module rob (
                 is_fp[tail_idx]     = i_alloc_is_fp;
                 fp_wen[tail_idx]    = i_alloc_fp_wen;
                 compr[tail_idx]     = i_alloc_compr;
-                wrap_bit[tail_idx]  = tail[4];
+                wrap_cnt[tail_idx]  = tail[5:4];
                 rd_data[tail_idx]   = '0;
                 cause[tail_idx]     = '0;
-                tail = tail + 5'd1;
+                tail = tail + 6'd1;
             }
 
             // Commit: retire head
             if do_commit {
                 valid[head_idx]     = 1'b0;
                 completed[head_idx] = 1'b0;
-                head = head + 5'd1;
+                head = head + 6'd1;
             }
 
             // Count update
@@ -262,8 +260,9 @@ pub module rob (
                         exception[i] = 1'b0;
                     }
                 }
-                // 5-bit arithmetic: no ambiguity (squash_idx - head gives correct count)
-                let sq_new_count: logic<5> = i_squash_idx - head;
+                // 6-bit arithmetic: squash_idx - head gives correct count (lower 5 bits)
+                let sq_diff: logic<6> = i_squash_idx - head;
+                let sq_new_count: logic<5> = sq_diff[4:0];
                 tail = i_squash_idx;
                 count = if do_commit ? sq_new_count - 5'd1 : sq_new_count;
             } else if do_alloc && do_commit {
