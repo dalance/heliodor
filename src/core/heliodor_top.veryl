@@ -412,6 +412,17 @@ pub module heliodor_top #(
     // after mret/sret pipeline flush (prevents race with NBA privilege update)
     var xret_taken_q: logic;
 
+    // ============================================================
+    // Commit-time trap: pending trap register
+    // ============================================================
+    // When EX/MEM detects a synchronous exception on a ROB-tracked
+    // instruction, save the trap info here and defer firing until
+    // the excepted ROB entry reaches the commit head.
+    var pend_trap_valid: logic    ;
+    var pend_trap_cause: logic<64>;
+    var pend_trap_pc   : logic<64>;
+    var pend_trap_val  : logic<64>;
+
     // CLINT signals
     var timer_irq: logic    ;
     var sw_irq   : logic    ;
@@ -544,7 +555,7 @@ pub module heliodor_top #(
         i_dcache_stall    : dcache_stall_pipeline                                 ,
         i_mshr_wb_stall   : mshr_wb_conflict                                     ,
         i_div_busy        : ex_div_busy                                            ,
-        i_rob_full        : rob_full                                              ,
+        i_rob_full        : rob_full || pend_trap_valid                            ,
         // Stall when RS-eligible instruction can't dispatch (RS full).
         // id_is_rs_eligible: decoded instruction in ID is RS-eligible.
         // !rs_dispatch_ready: RS can't accept dispatch.
@@ -1047,6 +1058,8 @@ pub module heliodor_top #(
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
+
+            // (pend_trap register updated in separate always_ff below trap signals)
             // Capture ROB commit for next-cycle bypass (handles same-cycle
             // commit+regfile-read race where NBA invalidates rob_commit_valid).
             commit_bypass_valid = rob_commit_valid && rob_commit_wen;
@@ -2251,13 +2264,32 @@ pub module heliodor_top #(
     // Misaligned access exception (MEM stage)
     let mem_misalign_trap: logic = mem_misaligned;
 
-    // Combined synchronous trap
-    let sync_trap: logic = ex_trap || mem_page_fault || mem_misalign_trap || if_page_fault;
+    // ============================================================
+    // Commit-time trap: deferred synchronous exception handling
+    // ============================================================
+    // EX/MEM detected exceptions are recorded in the ROB (exc bit) AND
+    // saved in the pend_trap register.  The actual trap fires only when
+    // the excepted ROB entry reaches the commit head.  This allows older
+    // in-flight RS-dispatched instructions to commit first, preventing
+    // the flush from destroying their results.
+    //
+    // IF page fault (no ROB entry) and IRQ (no ROB entry) stay immediate.
 
-    // ROB exception recording: EX/MEM stage exceptions stored in ROB entry.
-    // Both ex_trap and mem exceptions target the instruction in EX/MEM register
-    // (rob_idx = ex_rob_idx). IF page fault has no ROB entry (handled separately).
-    assign exc_rob_valid = ex_trap || mem_page_fault || mem_misalign_trap;
+    // Detect: a ROB-tracked exception fires this cycle
+    let rob_tracked_exc: logic = ex_trap || mem_page_fault || mem_misalign_trap;
+
+    // Capture into pending register (first detection only)
+    let pend_trap_capture: logic = rob_tracked_exc && !pend_trap_valid;
+
+    // Commit-time firing: ROB head has exception AND we have saved info
+    let rob_exc_trap: logic = rob_commit_valid && rob_commit_exc && pend_trap_valid;
+
+    // Combined synchronous trap — only IF page fault is immediate;
+    // EX/MEM exceptions fire via rob_exc_trap at commit time.
+    let sync_trap: logic = if_page_fault || rob_exc_trap;
+
+    // ROB exception recording (unchanged — marks the entry for commit-time detection)
+    assign exc_rob_valid = rob_tracked_exc;
     assign exc_rob_cause = if mem_misalign_trap ?
         (if mem_misalign_st ? csr_pkg::CAUSE_MISALIGNED_STORE : csr_pkg::CAUSE_MISALIGNED_LOAD)
     : if mem_page_fault ?
@@ -2291,30 +2323,17 @@ pub module heliodor_top #(
     // xret_taken_q suppresses interrupts for 1 cycle after mret/sret so that
     // the NBA privilege/MIE update completes before interrupt eligibility is
     // re-evaluated — prevents mepc corruption from a same-cycle interrupt.
-    assign irq_taken = irq_pending && !sync_trap && !ex_misprediction && !mret_taken && !sret_taken && !xret_taken_q;
+    // Suppress IRQ while a synchronous exception is pending commit
+    assign irq_taken = irq_pending && !sync_trap && !pend_trap_valid && !ex_misprediction && !mret_taken && !sret_taken && !xret_taken_q;
 
     // Combined trap: sync exception or async interrupt
     assign trap_taken = sync_trap || irq_taken;
-    assign trap_cause = if if_page_fault ?
+
+    // Trap cause: for commit-time exceptions, use the saved register
+    assign trap_cause = if rob_exc_trap ?
+        pend_trap_cause
+    : if if_page_fault ?
         csr_pkg::CAUSE_INST_PAGE_FAULT
-    : if mem_misalign_trap ?
-        (if mem_misalign_st ? csr_pkg::CAUSE_MISALIGNED_STORE : csr_pkg::CAUSE_MISALIGNED_LOAD)
-    : if mem_page_fault ?
-        (if mmu_fault_store ? csr_pkg::CAUSE_STORE_PAGE_FAULT : csr_pkg::CAUSE_LOAD_PAGE_FAULT)
-    : if ex_trap ?
-        (if ex_is_ecall ?
-            (if csr_priv == csr_pkg::PrivLevel::USER ?
-                csr_pkg::CAUSE_ECALL_U
-            : if csr_priv == csr_pkg::PrivLevel::SUPERVISOR ?
-                csr_pkg::CAUSE_ECALL_S
-            :
-                csr_pkg::CAUSE_ECALL_M
-            )
-        : if ex_is_ebreak ?
-            csr_pkg::CAUSE_BREAKPOINT
-        :
-            csr_pkg::CAUSE_ILLEGAL_INST
-        )
     :
         irq_cause
     ;
@@ -2346,10 +2365,9 @@ pub module heliodor_top #(
     // for memory but may double-execute CSR side effects).
     // TODO: This is a fundamental pipeline flush issue that needs
     // proper resolution. For now, use the original chain without mem_valid.
-    assign trap_pc = if mem_page_fault || mem_misalign_trap ?
-        ex_pc
-    : if ex_trap ?
-        ex_pc
+    // Trap PC: commit-time exceptions use saved register, others as before
+    assign trap_pc = if rob_exc_trap ?
+        pend_trap_pc
     : if if_page_fault ?
         if_pc
     : if ex_valid ?
@@ -2362,23 +2380,11 @@ pub module heliodor_top #(
         if_pc
     ;
 
-    // trap_val: for page faults, must be the faulting VIRTUAL address
-    // (not physical). The RISC-V spec requires stval = faulting VA.
-    assign trap_val = if if_page_fault ?
+    // trap_val: commit-time exceptions use saved register, others as before
+    assign trap_val = if rob_exc_trap ?
+        pend_trap_val
+    : if if_page_fault ?
         if_pc
-    : if mem_misalign_trap ?
-        ex_alu_out
-    : if mem_page_fault ?
-        mem_dmem_addr // faulting virtual address (from EX/MEM ALU output)
-    : if ex_illegal ?
-        // For illegal-instruction traps, ex_instr_shadow carries the
-        // 32-bit expansion which — for a compressed-illegal — is the
-        // NOP placeholder from c_expander, not the real encoding.
-        // The spec allows mtval = 0 for illegal instructions, and
-        // riscv-tests' rv64mi-illegal tolerates either 0 or the exact
-        // instruction bytes at mepc.  Report 0 rather than the NOP
-        // placeholder to avoid leaking bogus mtval.
-        64'd0
     :
         64'd0
     ;
@@ -2394,6 +2400,22 @@ pub module heliodor_top #(
     // the resulting pipeline flush destroys their ROB entries.
     assign mret_taken = mret_raw && csr_priv == csr_pkg::PrivLevel::MACHINE && !id_direct_stall;
     assign sret_taken = sret_raw && csr_priv != csr_pkg::PrivLevel::USER && !(csr_tsr && csr_priv == csr_pkg::PrivLevel::SUPERVISOR) && !id_direct_stall;
+
+    // Pending trap register: capture on first MEM/EX fault, clear on trap fire
+    always_ff (clk, rst) {
+        if_reset {
+            pend_trap_valid = 1'b0;
+        } else if trap_taken {
+            pend_trap_valid = 1'b0;
+        } else if pend_trap_capture {
+            pend_trap_valid = 1'b1;
+            pend_trap_cause = exc_rob_cause;
+            pend_trap_pc    = ex_pc;
+            pend_trap_val   = if mem_misalign_trap ? ex_alu_out
+                            : if mem_page_fault ? mem_dmem_addr
+                            : 64'd0;
+        }
+    }
 
     // Privilege checks for privileged instructions
     // MRET: only in M-mode
