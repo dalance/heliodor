@@ -185,6 +185,11 @@ pub module heliodor_top #(
     var mem_epoch   : logic<2>;
     var mem_from_rs : logic   ; // instruction in MEM/WB came from RS path
     var ex_from_rs_q: logic   ; // registered: instruction in EX came from RS
+    // Registered commit bypass: captures ROB commit from previous cycle
+    // (needed because same-cycle commit+regfile-read race in Verilog NBA semantics)
+    var commit_bypass_valid: logic    ;
+    var commit_bypass_rd   : logic<5> ;
+    var commit_bypass_data : logic<64>;
     // Forwarding unit outputs
     var fwd_a     : pipeline_pkg::FwdSel;
     var fwd_b     : pipeline_pkg::FwdSel;
@@ -999,6 +1004,7 @@ pub module heliodor_top #(
             ex_epoch        = 2'b0;
             ex_from_rs_q    = 1'b0;
             mem_from_rs     = 1'b0;
+            commit_bypass_valid = 1'b0;
             rs_yield        = 1'b0;
             id_has_rob      = 1'b0;
             _ex_rob_idx_q   = 4'd0;
@@ -1006,6 +1012,11 @@ pub module heliodor_top #(
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
+            // Capture ROB commit for next-cycle bypass (handles same-cycle
+            // commit+regfile-read race where NBA invalidates rob_commit_valid).
+            commit_bypass_valid = rob_commit_valid && rob_commit_wen;
+            commit_bypass_rd    = rob_commit_rd;
+            commit_bypass_data  = rob_commit_data;
             // Track speculative IF: true when IF is on a predicted path
             // that hasn't been verified. Stays true during stalls (e.g., IMMU
             // PTW for the speculative address). Cleared when the stall ends
@@ -1406,11 +1417,16 @@ pub module heliodor_top #(
         // The commit bypass handles the case where the ROB commits a register write
         // in the same cycle as the decode module reads from regfile — the regfile
         // value is stale (from the previous cycle), so use the commit data directly.
+        // Data path: RS > ROB (epoch-matched, data survives commit) > regfile.
+        // ROB rd_data is only cleared on NEW allocation, not on commit. So even
+        // after an entry commits (valid=0, completed=0), the data remains valid
+        // as long as the epoch matches (no reallocation has overwritten it).
+        // This eliminates the commit-to-regfile timing gap.
         i_rs1_data     : if ex_from_rs ? rs_issue_s1_data
-                       : if rat_id_rs1_valid && rob_read1_valid && rob_read1_completed && rob_read1_epoch == rat_id_rs1_rob_epoch ? rob_read1_data
+                       : if rat_id_rs1_valid && rob_read1_epoch == rat_id_rs1_rob_epoch ? rob_read1_data
                        : id_rs1_data                                                                                                    ,
         i_rs2_data     : if ex_from_rs ? rs_issue_s2_data
-                       : if rat_id_rs2_valid && rob_read2_valid && rob_read2_completed && rob_read2_epoch == rat_id_rs2_rob_epoch ? rob_read2_data
+                       : if rat_id_rs2_valid && rob_read2_epoch == rat_id_rs2_rob_epoch ? rob_read2_data
                        : id_rs2_data                                                                                                    ,
         i_imm          : if ex_from_rs ? rs_issue_imm     : id_imm                                                                      ,
         i_rd_addr      : if ex_from_rs ? rs_issue_rd      : id_rd_addr                                                                   ,
@@ -1466,19 +1482,19 @@ pub module heliodor_top #(
         // 1. RS issue: operands pre-resolved, no forwarding needed
         // 2. RAT valid + ROB completed: use ROB data (prevents aliasing)
         // 3. Epoch+index mismatch: pipeline has wrong instruction's result
-        // Forwarding override: epoch-checked at every stage to prevent stale data.
-        // 1. RS: no forwarding (operands pre-resolved)
-        // 2. ROB completed AND epoch matches: use ROB data (suppress forwarding)
-        // 3. Pipeline epoch mismatch: suppress forwarding (wrong instruction)
+        // Forwarding override:
+        // 1. RS issue: operands pre-resolved, no forwarding
+        // 2. Pipeline epoch mismatch: suppress forwarding (wrong instruction)
+        // Note: removed rob_completed → NONE override — the standard forwarding
+        // from MEM_WB handles the WB data correctly and avoids the stale-regfile
+        // race condition that occurs when ROB commit clears the RAT.
         i_fwd_a           : if ex_from_rs ? pipeline_pkg::FwdSel::NONE
-                          : if rat_id_rs1_valid && rob_read1_completed && rob_read1_epoch == rat_id_rs1_rob_epoch ? pipeline_pkg::FwdSel::NONE
                           : if rat_id_rs1_valid && fwd_a != pipeline_pkg::FwdSel::NONE
                             && ((fwd_a == pipeline_pkg::FwdSel::EX_MEM && (ex_rob_idx != rat_id_rs1_rob_idx || ex_epoch != rat_id_rs1_rob_epoch))
                              || (fwd_a == pipeline_pkg::FwdSel::MEM_WB && (mem_rob_idx != rat_id_rs1_rob_idx || mem_epoch != rat_id_rs1_rob_epoch)))
                             ? pipeline_pkg::FwdSel::NONE
                           : fwd_a                                                      ,
         i_fwd_b           : if ex_from_rs ? pipeline_pkg::FwdSel::NONE
-                          : if rat_id_rs2_valid && rob_read2_completed && rob_read2_epoch == rat_id_rs2_rob_epoch ? pipeline_pkg::FwdSel::NONE
                           : if rat_id_rs2_valid && fwd_b != pipeline_pkg::FwdSel::NONE
                             && ((fwd_b == pipeline_pkg::FwdSel::EX_MEM && (ex_rob_idx != rat_id_rs2_rob_idx || ex_epoch != rat_id_rs2_rob_epoch))
                              || (fwd_b == pipeline_pkg::FwdSel::MEM_WB && (mem_rob_idx != rat_id_rs2_rob_idx || mem_epoch != rat_id_rs2_rob_epoch)))
