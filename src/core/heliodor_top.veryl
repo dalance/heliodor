@@ -311,13 +311,27 @@ pub module heliodor_top #(
     // respective non-RS-eligible instruction types (mret/sret/sfence/csr),
     // which are already excluded above by !id_is_csr etc., so no extra guard
     // is needed for them here.
+    // DIV/REM excluded from RS: multi-cycle divider doesn't preserve instruction
+    // identity across the divider pipeline — new instructions entering EX during
+    // DIV computation overwrite the EX/MEM register with their own alu_result,
+    // causing the DIV result to be lost. Direct-path DIV works because the
+    // instruction stays in ID while the divider computes.
+    let id_is_div_op: logic = id_alu_op == alu_pkg::AluOp::DIV
+                           || id_alu_op == alu_pkg::AluOp::DIVU
+                           || id_alu_op == alu_pkg::AluOp::REM
+                           || id_alu_op == alu_pkg::AluOp::REMU
+                           || id_alu_op == alu_pkg::AluOp::DIVW
+                           || id_alu_op == alu_pkg::AluOp::DIVUW
+                           || id_alu_op == alu_pkg::AluOp::REMW
+                           || id_alu_op == alu_pkg::AluOp::REMUW;
     let id_is_rs_eligible: logic = id_valid && id_reg_wen
         && id_wb_sel == pipeline_pkg::WbSel::ALU
         && !id_mem_ren && !id_mem_wen
         && !id_is_branch && !id_is_jal && !id_is_jalr
         && !id_is_csr && !id_is_fp && !id_is_amo
         && !id_is_ecall && !id_is_ebreak
-        && !id_illegal;
+        && !id_illegal
+        && !id_is_div_op;
 
     // RS dispatch valid: instruction is RS-eligible AND not flushed/stalled/already dispatched
     let rs_dispatch_valid: logic = id_is_rs_eligible && !flush_id && !stall_ex && !rs_dispatched_q && !rob_full;
@@ -464,9 +478,13 @@ pub module heliodor_top #(
     // instruction has already been committed, preventing re-write during
     // stalls and ensuring trap_taken cancels uncommitted writes.
     var s1_wb_done   : logic    ;
-    let s1_wb_data   : logic<64> = s1_ex_alu_out;
-    let s1_wb_rd_addr: logic<5>  = s1_ex_rd_addr;
-    let s1_wb_wen    : logic     = s1_ex_valid && s1_ex_reg_wen && !s1_wb_done && !trap_taken && !flush_ex;
+    let s1_normal_wb_wen: logic = s1_ex_valid && s1_ex_reg_wen && !s1_wb_done && !trap_taken && !flush_ex;
+    // ROB commit overflow: MSHR has priority on slot0, so route ROB commit to slot1.
+    // This prevents ROB commit regfile writes from being silently dropped.
+    let rob_commit_overflow: logic = mshr_int_wb && rob_commit_valid && rob_commit_wen;
+    let s1_wb_data   : logic<64> = if rob_commit_overflow ? rob_commit_data : s1_ex_alu_out;
+    let s1_wb_rd_addr: logic<5>  = if rob_commit_overflow ? rob_commit_rd : s1_ex_rd_addr;
+    let s1_wb_wen    : logic     = s1_normal_wb_wen || rob_commit_overflow;
 
     // Slot1 ID/EX pipeline signals
     var s1_id_valid    : logic                    ;
@@ -564,7 +582,8 @@ pub module heliodor_top #(
         // operand stall, RS yield, ROB full), stall IF/ID to prevent the
         // decode module from being overwritten.
         i_rs_stall        : (id_is_rs_eligible && !rs_dispatch_ready)
-                          || (id_valid && !id_is_rs_eligible && !direct_path_v),
+                          || (id_valid && !id_is_rs_eligible && !direct_path_v)
+                          || (irq_pending && !rob_empty),
         o_stall_if        : stall_if                                              ,
         o_stall_id        : stall_id                                              ,
         o_stall_ex        : stall_ex                                              ,
@@ -2327,7 +2346,10 @@ pub module heliodor_top #(
     // the NBA privilege/MIE update completes before interrupt eligibility is
     // re-evaluated — prevents mepc corruption from a same-cycle interrupt.
     // Suppress IRQ while a synchronous exception is pending commit
-    assign irq_taken = irq_pending && !sync_trap && !pend_trap_valid && !ex_misprediction && !mret_taken && !sret_taken && !xret_taken_q;
+    // IRQ requires ROB drain: RS-issued instructions only write regfile via ROB
+    // commit. Flushing in-flight completed entries would lose their results,
+    // corrupting post-trap register state.
+    assign irq_taken = irq_pending && rob_empty && !sync_trap && !pend_trap_valid && !ex_misprediction && !mret_taken && !sret_taken && !xret_taken_q;
 
     // Combined trap: sync exception or async interrupt
     assign trap_taken = sync_trap || irq_taken;
@@ -2369,10 +2391,16 @@ pub module heliodor_top #(
     // TODO: This is a fundamental pipeline flush issue that needs
     // proper resolution. For now, use the original chain without mem_valid.
     // Trap PC: commit-time exceptions use saved register, others as before
+    // For async IRQ with rob_empty: all in-flight instructions committed.
+    // Use ifid_pc (next-to-execute) rather than stale ex_pc register to avoid
+    // re-executing the just-committed instruction (which would corrupt state
+    // when a post-load register value gets used as if it were pre-load).
     assign trap_pc = if rob_exc_trap ?
         pend_trap_pc
     : if if_page_fault ?
         if_pc
+    : if irq_taken && rob_empty && ifid_valid ?
+        ifid_pc
     : if ex_valid ?
         ex_pc
     : if id_valid ?
