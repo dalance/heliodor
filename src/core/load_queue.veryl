@@ -1,0 +1,207 @@
+// Load Queue: 8-entry FIFO for tracking in-flight loads.
+//
+// Loads are allocated at dispatch (rob_idx, dest_rd, funct3, is_fp known).
+// Address is provided once EX computes it (addr_update). The entry issues
+// a dcache read when its address is ready and no older store-buffer entry
+// aliases the address. The result is either returned via store-to-load
+// forwarding (from store_buffer) or from dcache, and broadcast on CDB at
+// completion.
+//
+// E1-a (skeleton): no OoO issue ordering yet. Just a FIFO that tracks
+// allocation, addr-ready, and retirement. Later phases will add the full
+// issue/completion path.
+pub module load_queue (
+    clk: input clock,
+    rst: input reset,
+
+    // ----- Allocate (from RS dispatch or ID) -----
+    i_alloc_valid  : input  logic    ,
+    i_alloc_rob    : input  logic<5> ,
+    i_alloc_epoch  : input  logic<2> ,
+    i_alloc_rd     : input  logic<5> ,
+    i_alloc_funct3 : input  logic<3> , // size + signedness
+    i_alloc_is_fp  : input  logic    , // FP load (NaN-box for FLW)
+    o_alloc_ready  : output logic    ,
+    o_alloc_idx    : output logic<3> , // LQ index assigned to this load
+
+    // ----- Address update (from EX) -----
+    i_addr_valid: input logic    ,
+    i_addr_idx  : input logic<3> ,
+    i_addr_addr : input logic<64>,
+
+    // ----- Issue (to dcache) -----
+    // Oldest addr-ready entry with no SB alias issues to the dcache.
+    o_issue_valid : output logic    ,
+    o_issue_addr  : output logic<64>,
+    o_issue_funct3: output logic<3> ,
+    o_issue_rob   : output logic<5> ,
+    o_issue_idx   : output logic<3> ,
+    i_issue_ready : input  logic    ,
+
+    // ----- Complete (dcache result returned) -----
+    i_complete_valid: input logic    ,
+    i_complete_idx  : input logic<3> ,
+    i_complete_data : input logic<64>,
+
+    // ----- Retire (CDB broadcast + free) -----
+    o_retire_valid: output logic    ,
+    o_retire_rob  : output logic<5> ,
+    o_retire_epoch: output logic<2> ,
+    o_retire_rd   : output logic<5> ,
+    o_retire_data : output logic<64>,
+    o_retire_is_fp: output logic    ,
+
+    // ----- Squash (misprediction) -----
+    i_squash_valid: input logic    ,
+    i_squash_mask : input logic [32],
+
+    // ----- Flush (trap) -----
+    i_flush: input logic,
+
+    // ----- Debug -----
+    o_count: output logic<4>,
+    o_full : output logic   ,
+    o_empty: output logic   ,
+) {
+    // ============================================================
+    // Entry storage (8 entries)
+    // ============================================================
+    var valid     : logic    [8];
+    var addr_ready: logic    [8];
+    var data_ready: logic    [8];
+    var e_rob     : logic<5> [8];
+    var e_epoch   : logic<2> [8];
+    var e_rd      : logic<5> [8];
+    var e_funct3  : logic<3> [8];
+    var e_is_fp   : logic    [8];
+    var e_addr    : logic<64>[8];
+    var e_data    : logic<64>[8];
+
+    // Circular FIFO head (oldest) / tail (next alloc)
+    var head: logic<4>;
+    var tail: logic<4>;
+
+    let count_sub: logic<4> = tail - head;
+    assign o_count = count_sub;
+    assign o_full  = count_sub == 4'd8;
+    assign o_empty = count_sub == 4'd0;
+
+    let head_idx: logic<3> = head[2:0];
+    let tail_idx: logic<3> = tail[2:0];
+
+    assign o_alloc_ready = !o_full;
+    assign o_alloc_idx   = tail_idx;
+
+    // ============================================================
+    // Issue: pick oldest addr_ready && !data_ready entry.
+    // E1-a: no SB alias check (E1-b/c will add).
+    // ============================================================
+    var issue_found: logic   ;
+    var issue_sel  : logic<3>;
+    always_comb {
+        issue_found = 1'b0;
+        issue_sel   = 3'd0;
+        // Walk from head to tail (oldest first)
+        for i: i32 in 0..8 {
+            // Not yet clear how to linearly order circular; use naive scan
+            // and let the outer pipeline handle ordering. Good enough for
+            // skeleton.
+            if valid[i] && addr_ready[i] && !data_ready[i] && !issue_found {
+                issue_found = 1'b1;
+                issue_sel   = i[2:0];
+            }
+        }
+    }
+    assign o_issue_valid  = issue_found;
+    assign o_issue_addr   = e_addr  [issue_sel];
+    assign o_issue_funct3 = e_funct3[issue_sel];
+    assign o_issue_rob    = e_rob   [issue_sel];
+    assign o_issue_idx    = issue_sel;
+
+    // ============================================================
+    // Retire: oldest entry with data_ready → broadcast on CDB + free
+    // ============================================================
+    let head_retire: logic = valid[head_idx] && data_ready[head_idx];
+    assign o_retire_valid = head_retire;
+    assign o_retire_rob   = e_rob  [head_idx];
+    assign o_retire_epoch = e_epoch[head_idx];
+    assign o_retire_rd    = e_rd   [head_idx];
+    assign o_retire_data  = e_data [head_idx];
+    assign o_retire_is_fp = e_is_fp[head_idx];
+
+    // ============================================================
+    // Sequential: alloc, addr-update, complete, retire, squash, flush
+    // ============================================================
+    always_ff (clk, rst) {
+        if_reset {
+            head = 4'd0;
+            tail = 4'd0;
+            for i: i32 in 0..8 {
+                valid[i]      = 1'b0;
+                addr_ready[i] = 1'b0;
+                data_ready[i] = 1'b0;
+                e_rob[i]      = 5'd0;
+                e_epoch[i]    = 2'd0;
+                e_rd[i]       = 5'd0;
+                e_funct3[i]   = 3'd0;
+                e_is_fp[i]    = 1'b0;
+                e_addr[i]     = 64'd0;
+                e_data[i]     = 64'd0;
+            }
+        } else {
+            if i_flush {
+                head = 4'd0;
+                tail = 4'd0;
+                for i: i32 in 0..8 {
+                    valid[i]      = 1'b0;
+                    addr_ready[i] = 1'b0;
+                    data_ready[i] = 1'b0;
+                }
+            } else {
+                // Squash: invalidate entries in squash bitmap
+                if i_squash_valid {
+                    for i: i32 in 0..8 {
+                        if valid[i] && i_squash_mask[e_rob[i]] {
+                            valid[i]      = 1'b0;
+                            addr_ready[i] = 1'b0;
+                            data_ready[i] = 1'b0;
+                        }
+                    }
+                }
+
+                // Retire head when data_ready
+                if head_retire {
+                    valid     [head_idx] = 1'b0;
+                    addr_ready[head_idx] = 1'b0;
+                    data_ready[head_idx] = 1'b0;
+                    head                 = head + 4'd1;
+                }
+
+                // Completion writes data into entry
+                if i_complete_valid && valid[i_complete_idx] {
+                    e_data    [i_complete_idx] = i_complete_data;
+                    data_ready[i_complete_idx] = 1'b1;
+                }
+
+                // Address update
+                if i_addr_valid && valid[i_addr_idx] {
+                    e_addr    [i_addr_idx] = i_addr_addr;
+                    addr_ready[i_addr_idx] = 1'b1;
+                }
+
+                // Allocate at tail
+                if i_alloc_valid && !o_full {
+                    valid     [tail_idx] = 1'b1;
+                    addr_ready[tail_idx] = 1'b0;
+                    data_ready[tail_idx] = 1'b0;
+                    e_rob     [tail_idx] = i_alloc_rob;
+                    e_epoch   [tail_idx] = i_alloc_epoch;
+                    e_rd      [tail_idx] = i_alloc_rd;
+                    e_funct3  [tail_idx] = i_alloc_funct3;
+                    e_is_fp   [tail_idx] = i_alloc_is_fp;
+                    tail                 = tail + 4'd1;
+                }
+            }
+        }
+    }
+}
