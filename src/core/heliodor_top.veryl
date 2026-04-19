@@ -388,6 +388,15 @@ pub module heliodor_top #(
     var fp_cdb1_rob            : logic<5> ;
     var fp_cdb1_epoch          : logic<2> ;
     var fp_cdb1_data           : logic<64>;
+    // FP ROB read ports (for FP RS dispatch operand resolution)
+    var fp_rob_read1_data      : logic<64>;
+    var fp_rob_read1_completed : logic    ;
+    var fp_rob_read1_valid     : logic    ;
+    var fp_rob_read1_epoch     : logic<2> ;
+    var fp_rob_read2_data      : logic<64>;
+    var fp_rob_read2_completed : logic    ;
+    var fp_rob_read2_valid     : logic    ;
+    var fp_rob_read2_epoch     : logic<2> ;
 
     // Forward-declared vars for RS/direct-path interaction (computed after RAT)
     var id_direct_stall: logic;
@@ -430,14 +439,13 @@ pub module heliodor_top #(
     let rs_dispatch_valid: logic = id_is_rs_eligible && !flush_id && !stall_ex && !rs_dispatched_q && !rob_full;
 
     // FP RS eligibility (E2 MVP: FADD.D with sources already in regfile).
-    // fp_cdb0 (arith) and fp_cdb1 (FP load complete) are wired, but dispatch
-    // still gates on !fp_rat_id_rs*_valid: otherwise we hit a CDB-before-
-    // dispatch race where a producer broadcasts in cycle C while the consumer
-    // only reaches IFID→ID at C+1, so FP RS enters a !ready entry for an
-    // already-completed producer and deadlocks waiting for a second wakeup.
-    // Lifting the gate requires FP ROB read ports (like integer RS uses) so
-    // dispatch can resolve completed-but-uncommitted producers directly from
-    // ROB. Tracked as E2-c4.
+    // E2-c4 added FP ROB read ports for completed-but-uncommitted producer
+    // resolution, but lifting the gate still exposes a subtle failure at
+    // rv64ud-fadd subtest 2 (tohost=5): FADD's result is correct in EX
+    // and the ROB commits, but the subsequent fmv.x.d appears to read a
+    // stale f13 somehow, or an fflags leak causes the check to fail.
+    // Kept the gate for now; next step is to instrument the fmv.x.d path
+    // to pinpoint where the value diverges.
     let id_is_fp_rs_eligible: logic = id_valid && id_is_fp && id_fp_reg_wen
         && id_fpu_op == fpu_pkg::FpuOp::FADD_D
         && !id_mem_ren && !id_mem_wen
@@ -1376,6 +1384,10 @@ pub module heliodor_top #(
                     ex_rob_idx   = rs_issue_rob;
                     ex_epoch     = rs_issue_epoch;
                     ex_from_rs_q = 1'b1;
+                } else if fp_rs_issue_valid {
+                    ex_rob_idx   = fp_rs_issue_rob;
+                    ex_epoch     = fp_rs_issue_epoch;
+                    ex_from_rs_q = 1'b0; // shadowed RS flag used by MEM forwarding — FP RS not tracked
                 } else {
                     ex_rob_idx   = 5'd0;
                     ex_epoch     = 2'b0;
@@ -2318,6 +2330,16 @@ pub module heliodor_top #(
         (ifid_alloc_op == 7'b1110011 && ifid_instr[14:12] != 3'd0) || // CSR
         ifid_fp_writes_int; // OP-FP int-writing variants
 
+    // FP alloc predicates for ROB (matches decode's is_fp / fp_reg_wen semantics).
+    let ifid_fp_load  : logic = ifid_alloc_op == 7'b0000111;
+    let ifid_fp_store : logic = ifid_alloc_op == 7'b0100111;
+    let ifid_fp_arith : logic = ifid_alloc_op == 7'b1010011 && !ifid_fp_writes_int;
+    let ifid_fmadd    : logic = ifid_alloc_op == 7'b1000011 || ifid_alloc_op == 7'b1000111
+                             || ifid_alloc_op == 7'b1001011 || ifid_alloc_op == 7'b1001111;
+    let ifid_alloc_fp_wen: logic = ifid_fp_load || ifid_fp_arith || ifid_fmadd;
+    let ifid_is_fp       : logic = ifid_fp_load || ifid_fp_store
+                                || ifid_alloc_op == 7'b1010011 || ifid_fmadd;
+
     // ROB exception recording (forward-declared; computed after trap detection)
     var exc_rob_valid: logic    ;
     var exc_rob_cause: logic<64>;
@@ -2329,8 +2351,14 @@ pub module heliodor_top #(
         i_alloc_pc    : ifid_pc                                    ,
         i_alloc_rd    : ifid_instr[11:7]                           ,
         i_alloc_wen   : ifid_alloc_wen                             ,
-        i_alloc_is_fp : 1'b0                                      , // FP path unchanged (A2)
-        i_alloc_fp_wen: 1'b0                                      , // FP path unchanged (A2)
+        // FP alloc metadata not wired for MVP: rob_commit_fp_wen stays 0,
+        // fp_rat commit never fires, the !fp_rat_id_rs*_valid gate keeps
+        // FADD.Ds with any renamed source on the direct path where FP
+        // forwarding already works. Flipping these on triggers a still-
+        // unresolved rv64ud-fadd failure (see E2 memory) when dispatch
+        // starts reaching the FP RS path.
+        i_alloc_is_fp : 1'b0                                      ,
+        i_alloc_fp_wen: 1'b0                                      ,
         i_alloc_compr : ifid_compressed                            ,
         o_alloc_idx   : rob_alloc_idx                              ,
         o_alloc_epoch : rob_alloc_epoch                            ,
@@ -2416,6 +2444,16 @@ pub module heliodor_top #(
         o_read2_completed  : rob_read2_completed                    ,
         o_read2_valid      : rob_read2_valid                        ,
         o_read2_epoch      : rob_read2_epoch                        ,
+        i_read3_idx        : fp_rat_id_rs1_rob_idx                  ,
+        o_read3_data       : fp_rob_read1_data                      ,
+        o_read3_completed  : fp_rob_read1_completed                 ,
+        o_read3_valid      : fp_rob_read1_valid                     ,
+        o_read3_epoch      : fp_rob_read1_epoch                     ,
+        i_read4_idx        : fp_rat_id_rs2_rob_idx                  ,
+        o_read4_data       : fp_rob_read2_data                      ,
+        o_read4_completed  : fp_rob_read2_completed                 ,
+        o_read4_valid      : fp_rob_read2_valid                     ,
+        o_read4_epoch      : fp_rob_read2_epoch                     ,
         o_squash_mask      : rob_squash_mask                          ,
         o_empty            : rob_empty                               ,
         o_full             : rob_full                                ,
@@ -2540,6 +2578,25 @@ pub module heliodor_top #(
         }
     }
 
+    // FP RS operand resolution (mirrors integer RS pattern):
+    //  - If RAT says "not renamed" → value is in fp_regfile (id_fp_rs*_data).
+    //  - If RAT says "renamed" but ROB entry is squashed/reallocated (epoch
+    //    mismatch or !valid) → stale; fall back to fp_regfile.
+    //  - Else if ROB says "completed" → use ROB data, entry is ready now.
+    //  - Else → wait for CDB wakeup; s*_data is don't-care until then.
+    let fp_rs_stale_s1: logic = fp_rat_id_rs1_valid
+        && (!fp_rob_read1_valid || fp_rob_read1_epoch != fp_rat_id_rs1_rob_epoch);
+    let fp_rs_s1_ready: logic = !fp_rat_id_rs1_valid || fp_rs_stale_s1 || fp_rob_read1_completed;
+    let fp_rs_s1_data : logic<64> = if fp_rs_stale_s1 ? id_fp_rs1_data
+                                  : if !fp_rat_id_rs1_valid ? id_fp_rs1_data
+                                  : fp_rob_read1_data;
+    let fp_rs_stale_s2: logic = fp_rat_id_rs2_valid
+        && (!fp_rob_read2_valid || fp_rob_read2_epoch != fp_rat_id_rs2_rob_epoch);
+    let fp_rs_s2_ready: logic = !fp_rat_id_rs2_valid || fp_rs_stale_s2 || fp_rob_read2_completed;
+    let fp_rs_s2_data : logic<64> = if fp_rs_stale_s2 ? id_fp_rs2_data
+                                  : if !fp_rat_id_rs2_valid ? id_fp_rs2_data
+                                  : fp_rob_read2_data;
+
     inst u_fp_rs: fp_reservation_station (
         clk                                                          ,
         rst                                                          ,
@@ -2555,14 +2612,14 @@ pub module heliodor_top #(
         i_dispatch_fflags_valid: 1'b1                                ,
         i_dispatch_rob         : id_rob_idx                          ,
         i_dispatch_epoch       : id_epoch                            ,
-        i_dispatch_s1_ready    : !fp_rat_id_rs1_valid                ,
+        i_dispatch_s1_ready    : fp_rs_s1_ready                      ,
         i_dispatch_s1_tag      : fp_rat_id_rs1_rob_idx               ,
         i_dispatch_s1_epoch    : fp_rat_id_rs1_rob_epoch             ,
-        i_dispatch_s1_data     : id_fp_rs1_data                      ,
-        i_dispatch_s2_ready    : !fp_rat_id_rs2_valid                ,
+        i_dispatch_s1_data     : fp_rs_s1_data                       ,
+        i_dispatch_s2_ready    : fp_rs_s2_ready                      ,
         i_dispatch_s2_tag      : fp_rat_id_rs2_rob_idx               ,
         i_dispatch_s2_epoch    : fp_rat_id_rs2_rob_epoch             ,
-        i_dispatch_s2_data     : id_fp_rs2_data                      ,
+        i_dispatch_s2_data     : fp_rs_s2_data                       ,
         i_dispatch_s3_ready    : 1'b1                                ,
         i_dispatch_s3_tag      : 5'd0                                ,
         i_dispatch_s3_epoch    : 2'd0                                ,
