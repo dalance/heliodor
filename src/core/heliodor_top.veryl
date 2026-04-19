@@ -438,19 +438,12 @@ pub module heliodor_top #(
     // RS dispatch valid: instruction is RS-eligible AND not flushed/stalled/already dispatched
     let rs_dispatch_valid: logic = id_is_rs_eligible && !flush_id && !stall_ex && !rs_dispatched_q && !rob_full;
 
-    // FP RS eligibility (E2 MVP: FADD.D with sources already in regfile).
-    // Lifting the !fp_rat_id_rs{1,2}_valid gate would route more FADD.Ds
-    // through FP RS, but non-RS FP consumers (FMV.X.D, FCVT.W.D, FCMP,
-    // FCLASS — all direct-path) currently read id_fp_rs*_data from the
-    // regfile without consulting fp_rat / FP ROB. An RS-dispatched FADD
-    // writes fp_regfile a few cycles later; a direct-path consumer in
-    // between reads stale data. Lifting the gate requires adding an FP
-    // ROB-read bypass to the direct-path FP operand muxes (parallel to
-    // the integer i_rs1_data rat→rob read mux). Tracked in memory.
+    // FP RS eligibility (E2 MVP: only FADD.D). Direct-path FP consumers
+    // read fp_rat → FP ROB via the i_fp_rs{1,2}_data bypass in execute,
+    // so an RS-dispatched FADD's result is visible before it commits.
     let id_is_fp_rs_eligible: logic = id_valid && id_is_fp && id_fp_reg_wen
         && id_fpu_op == fpu_pkg::FpuOp::FADD_D
-        && !id_mem_ren && !id_mem_wen
-        && !fp_rat_id_rs1_valid && !fp_rat_id_rs2_valid;
+        && !id_mem_ren && !id_mem_wen;
     let fp_rs_dispatch_valid: logic = id_is_fp_rs_eligible && !flush_id && !stall_ex
         && !fp_rs_dispatched_q && !rob_full;
 
@@ -1678,8 +1671,19 @@ pub module heliodor_top #(
         i_fp_reg_wen   : if ex_from_fp_rs ? fp_rs_issue_fp_wen : if ex_from_rs ? 1'b0 : id_fp_reg_wen                                   ,
         i_fpu_op       : if ex_from_fp_rs ? fp_rs_issue_fpu_op : if ex_from_rs ? 6'd0 : id_fpu_op                                       ,
         i_fp_rm        : if ex_from_fp_rs ? fp_rs_issue_rm : if ex_from_rs ? 3'd0 : id_fp_rm                                            ,
-        i_fp_rs1_data  : if ex_from_fp_rs ? fp_rs_issue_s1_data : if ex_from_rs ? 64'd0 : id_fp_rs1_data                                ,
-        i_fp_rs2_data  : if ex_from_fp_rs ? fp_rs_issue_s2_data : if ex_from_rs ? 64'd0 : id_fp_rs2_data                                ,
+        // Direct-path FP ops also read through fp_rat → FP ROB to avoid
+        // stale-regfile reads when a producer is still in flight via the
+        // FP RS. Pattern parallels integer i_rs1_data's rat→rob read mux.
+        i_fp_rs1_data  : if ex_from_fp_rs ? fp_rs_issue_s1_data
+                       : if ex_from_rs ? 64'd0
+                       : if fp_rat_id_rs1_valid && fp_rob_read1_epoch == fp_rat_id_rs1_rob_epoch
+                           ? fp_rob_read1_data
+                       : id_fp_rs1_data                                                                                                ,
+        i_fp_rs2_data  : if ex_from_fp_rs ? fp_rs_issue_s2_data
+                       : if ex_from_rs ? 64'd0
+                       : if fp_rat_id_rs2_valid && fp_rob_read2_epoch == fp_rat_id_rs2_rob_epoch
+                           ? fp_rob_read2_data
+                       : id_fp_rs2_data                                                                                                ,
         i_fp_rs3_data  : if ex_from_fp_rs ? fp_rs_issue_s3_data : if ex_from_rs ? 64'd0 : id_fp_rs3_data                                ,
         i_frm          : csr_frm                                                                                                        ,
         i_fs           : csr_fs                                                                                                         ,
@@ -2158,6 +2162,28 @@ pub module heliodor_top #(
     let id_direct_stall_rs2: logic = id_rs2_addr != 5'd0 && rat_id_rs2_valid && !id_rob_stale_rs2
         && !rob_read2_completed && (fwd_b == pipeline_pkg::FwdSel::NONE || fwd_b_stale);
 
+    // FP direct-path stall: an FP op on the direct path reads a renamed FP
+    // source that hasn't completed in ROB yet, and no FP forwarding path
+    // provides the value. Covers FMV.X.D / FCVT.W.D / FCMP / FCLASS / FSD
+    // that read an FP register whose producer is still in flight via FP RS.
+    let fp_id_rob_stale_rs1: logic = !fp_rob_read1_valid
+        || fp_rob_read1_epoch != fp_rat_id_rs1_rob_epoch;
+    let fp_id_rob_stale_rs2: logic = !fp_rob_read2_valid
+        || fp_rob_read2_epoch != fp_rat_id_rs2_rob_epoch;
+    let fp_fwd_a_hit: logic = fp_fwd_a == pipeline_pkg::FwdSel::EX_MEM
+                           || fp_fwd_a == pipeline_pkg::FwdSel::MEM_WB;
+    let fp_fwd_b_hit: logic = fp_fwd_b == pipeline_pkg::FwdSel::EX_MEM
+                           || fp_fwd_b == pipeline_pkg::FwdSel::MEM_WB;
+    // Any direct-path FP op that reads FP registers — i.e., id_is_fp without
+    // being an FP load (FP loads read integer rs1 for the address).
+    let id_fp_reads_fp: logic = id_is_fp && !id_mem_ren;
+    let fp_id_direct_stall_rs1: logic = id_fp_reads_fp
+        && fp_rat_id_rs1_valid && !fp_id_rob_stale_rs1
+        && !fp_rob_read1_completed && !fp_fwd_a_hit;
+    let fp_id_direct_stall_rs2: logic = id_fp_reads_fp
+        && fp_rat_id_rs2_valid && !fp_id_rob_stale_rs2
+        && !fp_rob_read2_completed && !fp_fwd_b_hit;
+
     // Exception-causing / pipeline-flushing instructions must not enter EX
     // until all previous instructions have committed from ROB (pipeline drain).
     // Without this, the flush (for the trap, or for mret/sret PC redirect)
@@ -2180,7 +2206,8 @@ pub module heliodor_top #(
         // Direct-path stall: operand depends on in-flight RS instruction whose
         // result isn't available yet (not completed in ROB, not in forwarding path).
         // Also drain ROB before exception-causing instructions.
-        id_direct_stall = !id_is_rs_eligible && (id_direct_stall_rs1 || id_direct_stall_rs2
+        id_direct_stall = !id_is_rs_eligible && !id_is_fp_rs_eligible && (id_direct_stall_rs1 || id_direct_stall_rs2
+                                                || fp_id_direct_stall_rs1 || fp_id_direct_stall_rs2
                                                || rob_drain_needed);
         // Normal: direct-path takes EX. RS yield: RS takes EX for one cycle.
         // Allow EX entry when instruction already has a ROB entry (id_has_rob),
@@ -2352,10 +2379,8 @@ pub module heliodor_top #(
         i_alloc_pc    : ifid_pc                                    ,
         i_alloc_rd    : ifid_instr[11:7]                           ,
         i_alloc_wen   : ifid_alloc_wen                             ,
-        // Not wired: fp_rat commit never fires, !fp_rat_id_rs*_valid gate
-        // keeps FADD.Ds with renamed sources on direct path.
-        i_alloc_is_fp : 1'b0                                      ,
-        i_alloc_fp_wen: 1'b0                                      ,
+        i_alloc_is_fp : ifid_is_fp                                ,
+        i_alloc_fp_wen: ifid_alloc_fp_wen                         ,
         i_alloc_compr : ifid_compressed                            ,
         o_alloc_idx   : rob_alloc_idx                              ,
         o_alloc_epoch : rob_alloc_epoch                            ,
@@ -2637,7 +2662,8 @@ pub module heliodor_top #(
         o_issue_fflags_valid   : fp_rs_issue_fflags_valid            ,
         o_issue_rob            : fp_rs_issue_rob                     ,
         o_issue_epoch          : fp_rs_issue_epoch                   ,
-        i_issue_stall          : stall_ex                            ,
+        // FP RS must yield to direct-path and int RS for EX slot0.
+        i_issue_stall          : stall_ex || direct_path_v || rs_issue_valid,
         i_fp_cdb0_valid        : fp_cdb0_valid                       ,
         i_fp_cdb0_rob          : fp_cdb0_rob                         ,
         i_fp_cdb0_epoch        : fp_cdb0_epoch                       ,
