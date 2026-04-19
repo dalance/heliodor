@@ -1,14 +1,46 @@
 // IEEE 754 double-precision floating-point divider
-// Combinational (single-cycle). Handles normals, subnormals, zeros, infinities, NaNs.
+// Multi-cycle FSM wrapper around the combinational math (preserves bit-exactness).
+// Latency: 1 (capture) + 55 (RUN) + 1 (DONE) = 57 cycles from i_valid to o_valid.
 pub module fp_divider (
-    i_a     : input  logic<64>,
-    i_b     : input  logic<64>,
-    i_rm    : input  logic<3> ,
+    clk: input clock,
+    rst: input reset,
+
+    i_valid: input logic    , // start new division (pulse)
+    i_a    : input logic<64>,
+    i_b    : input logic<64>,
+    i_rm   : input logic<3> ,
+    i_flush: input logic    , // abort current operation
+
     o_result: output logic<64>,
     o_fflags: output logic<5> , // {NV, DZ, OF, UF, NX}
+    o_valid : output logic    , // result ready (1-cycle pulse)
+    o_busy  : output logic    , // divider occupied
 ) {
-    var result: logic<64>;
-    var fflags: logic<5> ;
+    enum State: logic<2> {
+        IDLE = 2'd0,
+        RUN  = 2'd1,
+        DONE = 2'd2,
+    }
+
+    var state    : State    ;
+    var count    : logic<6> ;
+    var latched_a: logic<64>;
+    var latched_b: logic<64>;
+    var latched_m: logic<3> ;
+
+    // Busy while RUN or DONE — caller must not re-dispatch until o_valid.
+    assign o_busy = state != State::IDLE;
+
+    // 55 RUN cycles then DONE — 57 total including IDLE capture and DONE.
+    const RUN_LAST: logic<6> = 6'd54;
+
+    // ====================================================================
+    // Combinational divider math operating on LATCHED operands.
+    // Logic is unchanged from the former single-cycle implementation —
+    // the FSM below gates when the result is sampled into o_result.
+    // ====================================================================
+    var comb_result: logic<64>;
+    var comb_fflags: logic<5> ;
 
     always_comb {
         var sa: logic    ;
@@ -18,12 +50,12 @@ pub module fp_divider (
         var eb: logic<11>;
         var mb: logic<52>;
 
-        sa = i_a[63];
-        ea = i_a[62:52];
-        ma = i_a[51:0];
-        sb = i_b[63];
-        eb = i_b[62:52];
-        mb = i_b[51:0];
+        sa = latched_a[63];
+        ea = latched_a[62:52];
+        ma = latched_a[51:0];
+        sb = latched_b[63];
+        eb = latched_b[62:52];
+        mb = latched_b[51:0];
 
         var r_sign: logic;
         r_sign = sa ^ sb;
@@ -51,31 +83,31 @@ pub module fp_divider (
         a_is_sub  = ea == 11'd0 && ma != 52'd0;
         b_is_sub  = eb == 11'd0 && mb != 52'd0;
 
-        result = 64'd0;
-        fflags = 5'd0;
+        comb_result = 64'd0;
+        comb_fflags = 5'd0;
 
         if a_is_nan || b_is_nan {
-            result = 64'h7FF8_0000_0000_0000;
+            comb_result = 64'h7FF8_0000_0000_0000;
             if a_is_snan || b_is_snan {
-                fflags = 5'b10000;
+                comb_fflags = 5'b10000;
             }
         } else if a_is_inf && b_is_inf {
-            result = 64'h7FF8_0000_0000_0000; // inf/inf = NaN
-            fflags = 5'b10000;
+            comb_result = 64'h7FF8_0000_0000_0000; // inf/inf = NaN
+            comb_fflags = 5'b10000;
         } else if a_is_inf {
-            result = {r_sign, 11'h7FF, 52'd0}; // inf/x = inf
+            comb_result = {r_sign, 11'h7FF, 52'd0}; // inf/x = inf
         } else if b_is_inf {
-            result = {r_sign, 63'd0}; // x/inf = 0
+            comb_result = {r_sign, 63'd0}; // x/inf = 0
         } else if b_is_zero {
             if a_is_zero {
-                result = 64'h7FF8_0000_0000_0000; // 0/0 = NaN
-                fflags = 5'b10000;
+                comb_result = 64'h7FF8_0000_0000_0000; // 0/0 = NaN
+                comb_fflags = 5'b10000;
             } else {
-                result = {r_sign, 11'h7FF, 52'd0}; // x/0 = inf
-                fflags = 5'b01000; // DZ
+                comb_result = {r_sign, 11'h7FF, 52'd0}; // x/0 = inf
+                comb_fflags = 5'b01000; // DZ
             }
         } else if a_is_zero {
-            result = {r_sign, 63'd0}; // 0/x = 0
+            comb_result = {r_sign, 63'd0}; // 0/x = 0
         } else {
             // Normal/subnormal division
             var ea_eff: logic<13>;
@@ -199,16 +231,16 @@ pub module fp_divider (
             }
 
             // Rounding
-            var g       : logic;
-            var r       : logic;
-            var s       : logic;
-            var bit_lsb : logic;
-            g        = q_mant[2];
-            r        = q_mant[1];
-            s        = q_mant[0];
-            bit_lsb  = q_mant[3];
+            var g      : logic;
+            var r      : logic;
+            var s      : logic;
+            var bit_lsb: logic;
+            g       = q_mant[2];
+            r       = q_mant[1];
+            s       = q_mant[0];
+            bit_lsb = q_mant[3];
             var round_up: logic;
-            case i_rm {
+            case latched_m {
                 3'b000 : round_up = g && (r || s || bit_lsb);
                 3'b001 : round_up = 1'b0;
                 3'b010 : round_up = r_sign && (g || r || s);
@@ -225,20 +257,67 @@ pub module fp_divider (
             nx = g || r || s;
 
             if q_exp >= 13'd2047 {
-                result = {r_sign, 11'h7FF, 52'd0};
-                fflags = 5'b00101;
+                comb_result = {r_sign, 11'h7FF, 52'd0};
+                comb_fflags = 5'b00101;
             } else {
-                result = {r_sign, q_exp[10:0], rounded[51:0]};
+                comb_result = {r_sign, q_exp[10:0], rounded[51:0]};
                 if nx {
-                    fflags = 5'b00001;
+                    comb_fflags = 5'b00001;
                 }
                 if q_exp == 13'd0 && nx {
-                    fflags = 5'b00011;
+                    comb_fflags = 5'b00011;
                 }
             }
         }
     }
 
-    assign o_result = result;
-    assign o_fflags = fflags;
+    // ====================================================================
+    // FSM: sequences the multi-cycle result presentation.
+    // ====================================================================
+    always_ff (clk, rst) {
+        if_reset {
+            state     = State::IDLE;
+            count     = '0;
+            latched_a = '0;
+            latched_b = '0;
+            latched_m = '0;
+            o_result  = '0;
+            o_fflags  = '0;
+            o_valid   = 1'b0;
+        } else if i_flush {
+            state   = State::IDLE;
+            count   = '0;
+            o_valid = 1'b0;
+        } else {
+            o_valid = 1'b0; // default: pulse
+
+            case state {
+                State::IDLE: {
+                    if i_valid {
+                        latched_a = i_a;
+                        latched_b = i_b;
+                        latched_m = i_rm;
+                        count     = '0;
+                        state     = State::RUN;
+                    }
+                }
+                State::RUN: {
+                    if count == RUN_LAST {
+                        state = State::DONE;
+                    } else {
+                        count = count + 6'd1;
+                    }
+                }
+                State::DONE: {
+                    o_result = comb_result;
+                    o_fflags = comb_fflags;
+                    o_valid  = 1'b1;
+                    state    = State::IDLE;
+                }
+                default: {
+                    state = State::IDLE;
+                }
+            }
+        }
+    }
 }

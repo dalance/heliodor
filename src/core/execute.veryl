@@ -101,7 +101,8 @@ pub module execute (
     // Misprediction: actual != predicted
     o_misprediction: output logic,
     // Multi-cycle divider busy (stall pipeline while computing)
-    o_div_busy: output logic,
+    o_div_busy   : output logic,
+    o_fp_busy    : output logic, // FP div/sqrt multi-cycle busy (D1)
     // ROB index (pipeline register, like o_rd_addr)
     i_rob_idx  : input  logic<5>,
     i_rob_epoch: input  logic<2>, // ROB epoch (for async DIV completion)
@@ -390,26 +391,128 @@ pub module execute (
         o_fflags: fp_mul_fflags ,
     );
 
-    // FP divider (double-precision)
-    var fp_div_result: logic<64>;
-    var fp_div_fflags: logic<5> ;
+    // FP divider (double-precision) — multi-cycle (D1). Result is latched
+    // into fp_div_result_q / fp_div_fflags_q on the o_valid pulse. The
+    // pipeline stalls via o_fp_busy until the latch fires.
+    let is_fdiv_d : logic = i_fpu_op == FpuOp::FDIV_D;
+    let is_fsqrt_d: logic = i_fpu_op == FpuOp::FSQRT_D;
+
+    var fp_div_result_raw: logic<64>;
+    var fp_div_fflags_raw: logic<5> ;
+    var fp_div_valid_w   : logic    ;
+    var fp_div_busy_w    : logic    ;
+    var fp_div_started   : logic    ;
+    var fp_div_result_q  : logic<64>;
+    var fp_div_fflags_q  : logic<5> ;
+    var fp_div_done_q    : logic    ;
+
     inst u_fp_div: fp_divider (
-        i_a     : d1            ,
-        i_b     : d2            ,
-        i_rm    : fp_rm_resolved,
-        o_result: fp_div_result ,
-        o_fflags: fp_div_fflags ,
+        clk                                                                     ,
+        rst                                                                     ,
+        // Gate with !fp_div_done_q to prevent re-firing on the release cycle:
+        // at that cycle i_valid is still 1 (instruction about to leave EX)
+        // and fp_div_started just cleared, so without this guard the divider
+        // would restart a second time on the same operands and clobber the
+        // latched result.
+        i_valid : i_valid && is_fdiv_d && !i_flush && !fp_div_busy_w && !fp_div_started && !fp_div_done_q,
+        i_a     : d1                                                            ,
+        i_b     : d2                                                            ,
+        i_rm    : fp_rm_resolved                                                ,
+        i_flush : i_flush                                                       ,
+        o_result: fp_div_result_raw                                             ,
+        o_fflags: fp_div_fflags_raw                                             ,
+        o_valid : fp_div_valid_w                                                ,
+        o_busy  : fp_div_busy_w                                                 ,
     );
 
-    // FP square root (double-precision)
-    var fp_sqrt_result: logic<64>;
-    var fp_sqrt_fflags: logic<5> ;
+    always_ff (clk, rst) {
+        if_reset {
+            fp_div_started  = 1'b0;
+            fp_div_done_q   = 1'b0;
+            fp_div_result_q = '0;
+            fp_div_fflags_q = '0;
+        } else if i_flush {
+            fp_div_started = 1'b0;
+            fp_div_done_q  = 1'b0;
+        } else {
+            if i_valid && is_fdiv_d && !fp_div_busy_w && !fp_div_started && !fp_div_done_q {
+                fp_div_started = 1'b1;
+            } else if fp_div_valid_w {
+                fp_div_started = 1'b0;
+            }
+            if fp_div_valid_w {
+                fp_div_result_q = fp_div_result_raw;
+                fp_div_fflags_q = fp_div_fflags_raw;
+                fp_div_done_q   = 1'b1;
+            } else if !i_stall {
+                fp_div_done_q = 1'b0;
+            }
+        }
+    }
+
+    // Expose latched result to fpu_result / fpu_fflags muxes.
+    let fp_div_result: logic<64> = fp_div_result_q;
+    let fp_div_fflags: logic<5>  = fp_div_fflags_q;
+    // Busy: hold pipeline on FDIV until the _q latch has been updated
+    // (fp_div_done_q). !valid_w alone is insufficient because the valid
+    // pulse occurs the same cycle we latch — releasing stall there would
+    // commit stale fp_div_result_q to EX/MEM.
+    let fp_div_busy_o: logic = i_valid && is_fdiv_d && !fp_div_done_q;
+
+    // FP square root (double-precision) — multi-cycle (D1). Same pattern.
+    var fp_sqrt_result_raw: logic<64>;
+    var fp_sqrt_fflags_raw: logic<5> ;
+    var fp_sqrt_valid_w   : logic    ;
+    var fp_sqrt_busy_w    : logic    ;
+    var fp_sqrt_started   : logic    ;
+    var fp_sqrt_result_q  : logic<64>;
+    var fp_sqrt_fflags_q  : logic<5> ;
+    var fp_sqrt_done_q    : logic    ;
+
     inst u_fp_sqrt: fp_sqrt (
-        i_a     : d1            ,
-        i_rm    : fp_rm_resolved,
-        o_result: fp_sqrt_result,
-        o_fflags: fp_sqrt_fflags,
+        clk                                                                          ,
+        rst                                                                          ,
+        i_valid : i_valid && is_fsqrt_d && !i_flush && !fp_sqrt_busy_w && !fp_sqrt_started && !fp_sqrt_done_q,
+        i_a     : d1                                                                 ,
+        i_rm    : fp_rm_resolved                                                     ,
+        i_flush : i_flush                                                            ,
+        o_result: fp_sqrt_result_raw                                                 ,
+        o_fflags: fp_sqrt_fflags_raw                                                 ,
+        o_valid : fp_sqrt_valid_w                                                    ,
+        o_busy  : fp_sqrt_busy_w                                                     ,
     );
+
+    always_ff (clk, rst) {
+        if_reset {
+            fp_sqrt_started  = 1'b0;
+            fp_sqrt_done_q   = 1'b0;
+            fp_sqrt_result_q = '0;
+            fp_sqrt_fflags_q = '0;
+        } else if i_flush {
+            fp_sqrt_started = 1'b0;
+            fp_sqrt_done_q  = 1'b0;
+        } else {
+            if i_valid && is_fsqrt_d && !fp_sqrt_busy_w && !fp_sqrt_started && !fp_sqrt_done_q {
+                fp_sqrt_started = 1'b1;
+            } else if fp_sqrt_valid_w {
+                fp_sqrt_started = 1'b0;
+            }
+            if fp_sqrt_valid_w {
+                fp_sqrt_result_q = fp_sqrt_result_raw;
+                fp_sqrt_fflags_q = fp_sqrt_fflags_raw;
+                fp_sqrt_done_q   = 1'b1;
+            } else if !i_stall {
+                fp_sqrt_done_q = 1'b0;
+            }
+        }
+    }
+
+    let fp_sqrt_result: logic<64> = fp_sqrt_result_q;
+    let fp_sqrt_fflags: logic<5>  = fp_sqrt_fflags_q;
+    let fp_sqrt_busy_o: logic     = i_valid && is_fsqrt_d && !fp_sqrt_done_q;
+
+    // Combined FP multi-cycle busy for hazard_unit stall.
+    assign o_fp_busy = fp_div_busy_o || fp_sqrt_busy_o;
 
     // FP adder/subtractor (double-precision)
     // For FMADD/FMSUB: addend_a = multiply result, addend_b = rs3

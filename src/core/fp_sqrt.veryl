@@ -1,22 +1,49 @@
 // IEEE 754 double-precision floating-point square root
-// Combinational (single-cycle). Handles normals, subnormals, zeros, infinities, NaNs.
+// Multi-cycle FSM wrapper around the combinational math (preserves bit-exactness).
+// Latency: 1 (capture) + 55 (RUN) + 1 (DONE) = 57 cycles from i_valid to o_valid.
 pub module fp_sqrt (
-    i_a     : input  logic<64>,
-    i_rm    : input  logic<3> ,
+    clk: input clock,
+    rst: input reset,
+
+    i_valid: input logic    ,
+    i_a    : input logic<64>,
+    i_rm   : input logic<3> ,
+    i_flush: input logic    ,
+
     o_result: output logic<64>,
     o_fflags: output logic<5> ,
+    o_valid : output logic    ,
+    o_busy  : output logic    ,
 ) {
-    var result: logic<64>;
-    var fflags: logic<5> ;
+    enum State: logic<2> {
+        IDLE = 2'd0,
+        RUN  = 2'd1,
+        DONE = 2'd2,
+    }
+
+    var state    : State    ;
+    var count    : logic<6> ;
+    var latched_a: logic<64>;
+    var latched_m: logic<3> ;
+
+    assign o_busy = state != State::IDLE;
+
+    const RUN_LAST: logic<6> = 6'd54;
+
+    // ====================================================================
+    // Combinational sqrt math operating on LATCHED operand — unchanged.
+    // ====================================================================
+    var comb_result: logic<64>;
+    var comb_fflags: logic<5> ;
 
     always_comb {
         var sa: logic    ;
         var ea: logic<11>;
         var ma: logic<52>;
 
-        sa = i_a[63];
-        ea = i_a[62:52];
-        ma = i_a[51:0];
+        sa = latched_a[63];
+        ea = latched_a[62:52];
+        ma = latched_a[51:0];
 
         var a_is_zero: logic;
         var a_is_inf : logic;
@@ -30,22 +57,22 @@ pub module fp_sqrt (
         a_is_snan = a_is_nan && ma[51] == 1'b0;
         a_is_sub  = ea == 11'd0 && ma != 52'd0;
 
-        result = 64'd0;
-        fflags = 5'd0;
+        comb_result = 64'd0;
+        comb_fflags = 5'd0;
 
         if a_is_nan {
-            result = 64'h7FF8_0000_0000_0000;
+            comb_result = 64'h7FF8_0000_0000_0000;
             if a_is_snan {
-                fflags = 5'b10000;
+                comb_fflags = 5'b10000;
             }
         } else if sa && !a_is_zero {
             // sqrt(negative) = NaN
-            result = 64'h7FF8_0000_0000_0000;
-            fflags = 5'b10000;
+            comb_result = 64'h7FF8_0000_0000_0000;
+            comb_fflags = 5'b10000;
         } else if a_is_inf {
-            result = {1'b0, 11'h7FF, 52'd0};
+            comb_result = {1'b0, 11'h7FF, 52'd0};
         } else if a_is_zero {
-            result = {sa, 63'd0};
+            comb_result = {sa, 63'd0};
         } else {
             // Normal/subnormal positive value
             var ea_eff: logic<13>;
@@ -128,7 +155,7 @@ pub module fp_sqrt (
 
             for _i: i32 in 0..56 {
                 // Get next 2 bits from shift register (MSB first)
-                var rad_bits : logic<2>;
+                var rad_bits: logic<2>;
                 rad_bits  = rad_shift[55:54];
                 rad_shift = {rad_shift[53:0], 2'b00};
 
@@ -180,16 +207,16 @@ pub module fp_sqrt (
             }
 
             // Rounding
-            var g       : logic;
-            var r       : logic;
-            var s       : logic;
-            var bit_lsb : logic;
-            g        = sq_mant[2];
-            r        = sq_mant[1];
-            s        = sq_mant[0];
-            bit_lsb  = sq_mant[3];
+            var g      : logic;
+            var r      : logic;
+            var s      : logic;
+            var bit_lsb: logic;
+            g       = sq_mant[2];
+            r       = sq_mant[1];
+            s       = sq_mant[0];
+            bit_lsb = sq_mant[3];
             var round_up: logic;
-            case i_rm {
+            case latched_m {
                 3'b000 : round_up = g && (r || s || bit_lsb);
                 3'b001 : round_up = 1'b0;
                 3'b010 : round_up = 1'b0;
@@ -206,20 +233,65 @@ pub module fp_sqrt (
             nx = g || r || s;
 
             if r_exp >= 13'd2047 {
-                result = {1'b0, 11'h7FF, 52'd0};
-                fflags = 5'b00101;
+                comb_result = {1'b0, 11'h7FF, 52'd0};
+                comb_fflags = 5'b00101;
             } else {
-                result = {1'b0, r_exp[10:0], rounded[51:0]};
+                comb_result = {1'b0, r_exp[10:0], rounded[51:0]};
                 if nx {
-                    fflags = 5'b00001;
+                    comb_fflags = 5'b00001;
                 }
                 if r_exp == 13'd0 && nx {
-                    fflags = 5'b00011;
+                    comb_fflags = 5'b00011;
                 }
             }
         }
     }
 
-    assign o_result = result;
-    assign o_fflags = fflags;
+    // ====================================================================
+    // FSM: sequences the multi-cycle result presentation.
+    // ====================================================================
+    always_ff (clk, rst) {
+        if_reset {
+            state     = State::IDLE;
+            count     = '0;
+            latched_a = '0;
+            latched_m = '0;
+            o_result  = '0;
+            o_fflags  = '0;
+            o_valid   = 1'b0;
+        } else if i_flush {
+            state   = State::IDLE;
+            count   = '0;
+            o_valid = 1'b0;
+        } else {
+            o_valid = 1'b0;
+
+            case state {
+                State::IDLE: {
+                    if i_valid {
+                        latched_a = i_a;
+                        latched_m = i_rm;
+                        count     = '0;
+                        state     = State::RUN;
+                    }
+                }
+                State::RUN: {
+                    if count == RUN_LAST {
+                        state = State::DONE;
+                    } else {
+                        count = count + 6'd1;
+                    }
+                }
+                State::DONE: {
+                    o_result = comb_result;
+                    o_fflags = comb_fflags;
+                    o_valid  = 1'b1;
+                    state    = State::IDLE;
+                }
+                default: {
+                    state = State::IDLE;
+                }
+            }
+        }
+    }
 }
