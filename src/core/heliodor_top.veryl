@@ -380,6 +380,7 @@ pub module heliodor_top #(
     var fp_rs_issue_s2_data    : logic<64>;
     var fp_rs_issue_s3_data    : logic<64>;
     var fp_rs_issue_fp_wen     : logic    ;
+    var fp_rs_issue_reg_wen    : logic    ;
     var fp_rs_issue_fflags_valid: logic   ;
     var fp_rs_issue_rob        : logic<5> ;
     var fp_rs_issue_epoch      : logic<2> ;
@@ -483,8 +484,31 @@ pub module heliodor_top #(
                             || id_fpu_op == fpu_pkg::FpuOp::FMSUB_S
                             || id_fpu_op == fpu_pkg::FpuOp::FNMSUB_S
                             || id_fpu_op == fpu_pkg::FpuOp::FNMADD_S;
-    let id_is_fp_rs_eligible: logic = id_valid && id_is_fp && id_fp_reg_wen
-        && (id_fpu_2op_fp || id_fpu_1op_fp || id_fpu_3op_fp)
+    // Int-writing FP ops: read FP reg(s), write integer reg. Covers FMV.X,
+    // FCLASS (no fflags), FCMP and FCVT.int (emit fflags). Fflags-producing
+    // ops rely on the rob_drain_needed gate on CSR fflags/frm/fcsr reads
+    // to guarantee ordering between RS-issued fflags and CSR reads.
+    let id_fpu_fp2int: logic = id_fpu_op == fpu_pkg::FpuOp::FMV_X_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FMV_X_W
+                            || id_fpu_op == fpu_pkg::FpuOp::FCLASS_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FCLASS_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FEQ_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FLT_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FLE_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FEQ_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FLT_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FLE_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_W_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_WU_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_L_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_LU_D
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_W_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_WU_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_L_S
+                            || id_fpu_op == fpu_pkg::FpuOp::FCVT_LU_S;
+    let id_is_fp_rs_eligible: logic = id_valid && id_is_fp
+        && ((id_fp_reg_wen && (id_fpu_2op_fp || id_fpu_1op_fp || id_fpu_3op_fp))
+            || (id_reg_wen && id_fpu_fp2int))
         && !id_mem_ren && !id_mem_wen;
     let fp_rs_dispatch_valid: logic = id_is_fp_rs_eligible && !flush_id && !stall_ex
         && !fp_rs_dispatched_q && !rob_full;
@@ -1696,7 +1720,7 @@ pub module heliodor_top #(
         i_alu_src_a    : if ex_from_rs ? rs_issue_src_a   : id_alu_src_a                                                                 ,
         i_alu_src_b    : if ex_from_rs ? rs_issue_src_b   : id_alu_src_b                                                                 ,
         i_wb_sel       : if ex_from_rs || ex_from_fp_rs ? pipeline_pkg::WbSel::ALU : id_wb_sel                                          ,
-        i_reg_wen      : if ex_from_fp_rs ? 1'b0 : if ex_from_rs ? rs_issue_wen     : id_reg_wen                                        ,
+        i_reg_wen      : if ex_from_fp_rs ? fp_rs_issue_reg_wen : if ex_from_rs ? rs_issue_wen     : id_reg_wen                          ,
         i_mem_ren      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : id_mem_ren                                                             ,
         i_mem_wen      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : id_mem_wen                                                             ,
         i_mem_funct3   : if ex_from_rs || ex_from_fp_rs ? 3'd0 : id_mem_funct3                                                          ,
@@ -2246,12 +2270,20 @@ pub module heliodor_top #(
     // (which flush the pipeline on return), mret/sret privilege fault,
     // sfence privilege fault, TVM/TSR traps, FP with FS=Off.
     let id_fp_fs_off: logic = id_is_fp && csr_fs == 2'b00;
+    // CSR ops that touch fflags/frm/fcsr must drain the ROB first so any
+    // in-flight FP RS-dispatched fflags-producing op has committed before
+    // the read/modify returns. Otherwise csrr fflags could return a stale
+    // value while a pending FCMP/FCVT.int in FP RS hasn't written fflags yet.
+    let id_csr_fflags: logic = id_is_csr
+        && (id_csr_addr == csr_pkg::CSR_FFLAGS
+         || id_csr_addr == csr_pkg::CSR_FRM
+         || id_csr_addr == csr_pkg::CSR_FCSR);
     let rob_drain_needed: logic = (id_is_ecall || id_is_ebreak || id_illegal
                                 || id_is_mret
                                 || id_csr_fault_q
                                 || mret_priv_fault || sret_priv_fault
                                 || sfence_priv_fault || tvm_trap || tsr_trap
-                                || id_fp_fs_off)
+                                || id_fp_fs_off || id_csr_fflags)
                                 && rob_commit_idx != id_rob_idx;
 
     // rs_yield is set in heliodor_top main always_ff (reset block)
@@ -2549,7 +2581,8 @@ pub module heliodor_top #(
         rst                                                        ,
         // Rename at dispatch/EX-entry time to avoid self-reference.
         i_rename_valid: (rs_dispatch_valid && rs_dispatch_ready)
-                     || (direct_path_v && !stall_ex && id_reg_wen),
+                     || (direct_path_v && !stall_ex && id_reg_wen)
+                     || (fp_rs_dispatch_valid && fp_rs_dispatch_ready && id_reg_wen),
         i_rename_rd   : id_rd_addr                                 ,
         i_rename_idx  : id_rob_idx                                 ,
         i_rename_epoch: id_epoch                                   ,
@@ -2612,7 +2645,7 @@ pub module heliodor_top #(
     ) (
         clk                                                          ,
         rst                                                          ,
-        i_rename_valid: (fp_rs_dispatch_valid && fp_rs_dispatch_ready)
+        i_rename_valid: (fp_rs_dispatch_valid && fp_rs_dispatch_ready && id_fp_reg_wen)
                       || (direct_path_v && !stall_ex && id_fp_reg_wen),
         i_rename_rd   : id_rd_addr                                   ,
         i_rename_idx  : id_rob_idx                                   ,
@@ -2708,7 +2741,8 @@ pub module heliodor_top #(
         i_dispatch_rs1         : id_rs1_addr                         ,
         i_dispatch_rs2         : id_rs2_addr                         ,
         i_dispatch_rs3         : id_rs3_addr                         ,
-        i_dispatch_fp_wen      : 1'b1                                ,
+        i_dispatch_fp_wen      : id_fp_reg_wen                        ,
+        i_dispatch_reg_wen     : id_reg_wen                           ,
         i_dispatch_fflags_valid: 1'b1                                ,
         i_dispatch_rob         : id_rob_idx                          ,
         i_dispatch_epoch       : id_epoch                            ,
@@ -2737,6 +2771,7 @@ pub module heliodor_top #(
         o_issue_s2_data        : fp_rs_issue_s2_data                 ,
         o_issue_s3_data        : fp_rs_issue_s3_data                 ,
         o_issue_fp_wen         : fp_rs_issue_fp_wen                  ,
+        o_issue_reg_wen        : fp_rs_issue_reg_wen                 ,
         o_issue_fflags_valid   : fp_rs_issue_fflags_valid            ,
         o_issue_rob            : fp_rs_issue_rob                     ,
         o_issue_epoch          : fp_rs_issue_epoch                   ,
