@@ -558,7 +558,8 @@ pub module heliodor_top #(
     // SRS-2 observational mode: dispatch only; issue output is not wired into
     // the pipeline. Stores still proceed via direct path, so SRS populates in
     // parallel and retires when operands arrive.
-    let srs_dispatch_valid: logic = id_is_srs_eligible && !flush_id && !stall_ex && !srs_dispatched_q && srs_dispatch_ready;
+    let srs_dispatch_valid: logic = id_is_srs_eligible && (!rob_full || id_has_rob)
+                                 && !flush_id && !stall_ex && !srs_dispatched_q && srs_dispatch_ready;
 
     // FP RS eligibility: 2/1/3-operand FP→FP ops for both single and double
     // precision. Covers FADD/FSUB/FMUL/FDIV/FMIN/FMAX/FSGNJ(N/X)/FSQRT/FMADD
@@ -880,11 +881,12 @@ pub module heliodor_top #(
         // decode module from being overwritten.
         i_rs_stall        : (id_is_rs_eligible && !rs_dispatch_ready)
                           || (id_is_fp_rs_eligible && !fp_rs_dispatch_ready)
+                          || (id_is_srs_eligible && !srs_dispatched_q && !srs_dispatch_valid)
                           // Direct-path can't proceed (operand not ready etc.).
                           // Exclude the AMO-RMW gate case — direct_path_v=0 there means
                           // the instruction already dispatched and is in-flight; ID
                           // should wait for drain, not stall as a dispatch failure.
-                          || (id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !direct_path_v && !(direct_path_dispatched_q && id_is_amo_rmw))
+                          || (id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !direct_path_v && !(direct_path_dispatched_q && id_is_amo_rmw))
                           || (irq_pending && !rob_empty),
         o_stall_if        : stall_if                                              ,
         o_stall_id        : stall_id                                              ,
@@ -2480,14 +2482,28 @@ pub module heliodor_top #(
                                 || id_fp_fs_off || id_csr_fflags)
                                 && rob_commit_idx != id_rob_idx;
 
+    // SRS memory-ordering gate: direct-path loads / AMOs / FP stores wait
+    // until SRS-queued stores have drained through MEM so dcache writes
+    // land in program order.
+    //   - !srs_empty: queue non-empty
+    //   - srs_issue_valid: registered output asserted (store about to
+    //     enter EX or has just entered) — queue may already show empty
+    //     but the store hasn't reached MEM
+    //   - ex_from_srs_q: store is in MEM this cycle; dcache write latches
+    //     at end of cycle, so hold the load one more cycle
+    let srs_drain_needed: logic = (!srs_empty || srs_issue_valid || ex_from_srs_q)
+                                && (id_mem_ren || id_is_amo || (id_mem_wen && !id_is_srs_eligible));
+
     // rs_yield is set in heliodor_top main always_ff (reset block)
     always_comb {
         // Direct-path stall: operand depends on in-flight RS instruction whose
         // result isn't available yet (not completed in ROB, not in forwarding path).
         // Also drain ROB before exception-causing instructions.
-        id_direct_stall = !id_is_rs_eligible && !id_is_fp_rs_eligible && (id_direct_stall_rs1 || id_direct_stall_rs2
+        // SRS-eligible stores bypass direct-path and are not evaluated here.
+        id_direct_stall = !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && (id_direct_stall_rs1 || id_direct_stall_rs2
                                                 || fp_id_direct_stall_rs1 || fp_id_direct_stall_rs2
-                                               || rob_drain_needed);
+                                               || rob_drain_needed
+                                               || srs_drain_needed);
         // Normal: direct-path takes EX. RS yield: RS takes EX for one cycle.
         // Allow EX entry when instruction already has a ROB entry (id_has_rob),
         // even if ROB is full — the entry was allocated before ROB filled.
@@ -2495,7 +2511,8 @@ pub module heliodor_top #(
         // Re-evaluation gate applied only to AMO-RMW (re-reads dcache and
         // corrupts amo_old with its own post-write value). Other direct-path
         // ops tolerate re-evaluation; LR/SC are idempotent.
-        direct_path_v = id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !rs_yield
+        // SRS-eligible stores are excluded — they flow through SRS instead.
+        direct_path_v = id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !rs_yield
                       && (!rob_full || id_has_rob) && !id_direct_stall
                       && !(direct_path_dispatched_q && id_is_amo_rmw);
 
@@ -2669,10 +2686,9 @@ pub module heliodor_top #(
         o_issue_s2_data    : srs_issue_s2_data            ,
         o_issue_rob        : srs_issue_rob                ,
         o_issue_epoch      : srs_issue_epoch              ,
-        // SRS-3b: permanently stall issue output to keep the new EX-mux
-        // branches dead while we land the structural wiring. Flipped to
-        // real priority logic in step 3c once mux is verified side-effect-free.
-        i_issue_stall      : 1'b1                         ,
+        // SRS-3c: live issue arbitration. SRS fires when slot0 isn't claimed
+        // by direct path or int RS. FP RS is below SRS in priority.
+        i_issue_stall      : stall_ex || direct_path_v || rs_issue_valid,
         i_cdb0_valid       : cdb0_valid                   ,
         i_cdb0_rob         : cdb0_rob                     ,
         i_cdb0_epoch       : cdb0_epoch                   ,
