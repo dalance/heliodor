@@ -230,12 +230,26 @@ pub module heliodor_top #(
     var rat_fill_rs1_valid: logic; // bubble fill rs1 pending check
     var rat_fill_rs2_valid: logic; // bubble fill rs2 pending check
     // RAT ID-stage lookup outputs (for RS operand resolution using ID addresses)
-    var rat_id_rs1_valid    : logic    ;
-    var rat_id_rs1_rob_idx  : logic<5> ;
-    var rat_id_rs1_rob_epoch: logic<2> ;
-    var rat_id_rs2_valid    : logic    ;
-    var rat_id_rs2_rob_idx  : logic<5> ;
-    var rat_id_rs2_rob_epoch: logic<2> ;
+    // Raw outputs from RAT — post-processed below to handle self-reference
+    // (when RAT entry points to the instruction's own rob_idx because the
+    // same instruction renamed RAT in a prior cycle — e.g. direct-path JALR
+    // with rs=rd stalled at ID keeps re-renaming each cycle direct_path_v
+    // fires, and next-cycle reads see self).
+    var _raw_rat_id_rs1_valid    : logic    ;
+    var _raw_rat_id_rs1_rob_idx  : logic<5> ;
+    var _raw_rat_id_rs1_rob_epoch: logic<2> ;
+    var _raw_rat_id_rs2_valid    : logic    ;
+    var _raw_rat_id_rs2_rob_idx  : logic<5> ;
+    var _raw_rat_id_rs2_rob_epoch: logic<2> ;
+    // Effective ID-stage RAT values — substitute undo buffer (prior writer)
+    // when raw lookup returns self-reference. Downstream logic (direct-path
+    // stall check, EX operand mux, forwarding stale check) uses these.
+    var rat_id_rs1_valid     : logic    ;
+    var rat_id_rs1_rob_idx   : logic<5> ;
+    var rat_id_rs1_rob_epoch : logic<2> ;
+    var rat_id_rs2_valid     : logic    ;
+    var rat_id_rs2_rob_idx   : logic<5> ;
+    var rat_id_rs2_rob_epoch : logic<2> ;
     // ROB lookup outputs (completed check for RAT stall)
     var rob_lookup1_completed: logic;
     var rob_lookup1_valid    : logic;
@@ -243,8 +257,10 @@ pub module heliodor_top #(
     var rob_lookup2_valid    : logic;
     var rob_squash_mask     : logic [32];
     // RAT undo buffer outputs (for self-reference resolution)
-    var rat_undo_valid  : logic;
-    var rat_undo_rob_idx: logic<5>;
+    var rat_undo_valid   : logic;
+    var rat_undo_rd      : logic<5>;
+    var rat_undo_rob_idx : logic<5>;
+    var rat_undo_rob_epoch: logic<2>;
     // Store buffer shadow-mode outputs (E1-b1: instantiate but not yet wired
     // to the store path). Kept for future E1-b2/b3 integration.
     var sb_enq_ready  : logic    ;
@@ -2802,13 +2818,13 @@ pub module heliodor_top #(
         o_rs4_valid   : rat_fill_rs2_valid                          ,
         // ID-stage lookup ports (for RS operand resolution)
         i_id_rs1_addr    : id_rs1_addr                                ,
-        o_id_rs1_valid     : rat_id_rs1_valid                         ,
-        o_id_rs1_rob_idx   : rat_id_rs1_rob_idx                      ,
-        o_id_rs1_rob_epoch : rat_id_rs1_rob_epoch                    ,
+        o_id_rs1_valid     : _raw_rat_id_rs1_valid                    ,
+        o_id_rs1_rob_idx   : _raw_rat_id_rs1_rob_idx                  ,
+        o_id_rs1_rob_epoch : _raw_rat_id_rs1_rob_epoch                ,
         i_id_rs2_addr      : id_rs2_addr                              ,
-        o_id_rs2_valid     : rat_id_rs2_valid                         ,
-        o_id_rs2_rob_idx   : rat_id_rs2_rob_idx                      ,
-        o_id_rs2_rob_epoch : rat_id_rs2_rob_epoch                    ,
+        o_id_rs2_valid     : _raw_rat_id_rs2_valid                    ,
+        o_id_rs2_rob_idx   : _raw_rat_id_rs2_rob_idx                  ,
+        o_id_rs2_rob_epoch : _raw_rat_id_rs2_rob_epoch                ,
         i_id_rs3_addr      : 5'd0                                     , // integer RS has no rs3
         o_id_rs3_valid     : _                                        ,
         o_id_rs3_rob_idx   : _                                        ,
@@ -2824,9 +2840,39 @@ pub module heliodor_top #(
         i_undo        : 1'b0,
         i_squash_valid: ex_misprediction,
         i_squash_mask : rob_squash_mask,
-        o_undo_valid  : rat_undo_valid,
-        o_undo_rob_idx: rat_undo_rob_idx,
+        o_undo_valid   : rat_undo_valid,
+        o_undo_rd      : rat_undo_rd,
+        o_undo_rob_idx : rat_undo_rob_idx,
+        o_undo_rob_epoch: rat_undo_rob_epoch,
     );
+
+    // Self-reference resolution for ID-stage integer RAT lookup.
+    //
+    // Problem: direct-path instructions that write the same reg they read
+    // (e.g. JALR with rs1 == rd, or CSR read-modify-write) rename the RAT at
+    // end of cycle N. When the instruction stalls at ID for N+1 (icache
+    // miss on speculative fetch, MMU PTW, etc.), the next-cycle RAT read for
+    // its own rs returns its OWN rob_idx. Forwarding then sees rob match at
+    // EX_MEM (which holds the SAME instruction's in-flight result) and
+    // forwards self-garbage as rs data — concretely, JALR rs=rd at ID+1
+    // forwards its own ex_link_addr (PC+4) as rs1, so jalr_target becomes
+    // PC+4 instead of target_3.
+    //
+    // Fix: detect self-reference (rat rob == id rob AND undo_rd == rs_addr)
+    // and substitute the undo buffer's saved mapping (the prior writer). The
+    // undo buffer was designed for exactly this case.
+    let _rs1_is_self: logic = _raw_rat_id_rs1_valid && _raw_rat_id_rs1_rob_idx == id_rob_idx
+                           && rat_undo_valid && rat_undo_rd == id_rs1_addr;
+    let _rs2_is_self: logic = _raw_rat_id_rs2_valid && _raw_rat_id_rs2_rob_idx == id_rob_idx
+                           && rat_undo_valid && rat_undo_rd == id_rs2_addr;
+    always_comb {
+        rat_id_rs1_valid     = if _rs1_is_self ? rat_undo_valid     : _raw_rat_id_rs1_valid;
+        rat_id_rs1_rob_idx   = if _rs1_is_self ? rat_undo_rob_idx   : _raw_rat_id_rs1_rob_idx;
+        rat_id_rs1_rob_epoch = if _rs1_is_self ? rat_undo_rob_epoch : _raw_rat_id_rs1_rob_epoch;
+        rat_id_rs2_valid     = if _rs2_is_self ? rat_undo_valid     : _raw_rat_id_rs2_valid;
+        rat_id_rs2_rob_idx   = if _rs2_is_self ? rat_undo_rob_idx   : _raw_rat_id_rs2_rob_idx;
+        rat_id_rs2_rob_epoch = if _rs2_is_self ? rat_undo_rob_epoch : _raw_rat_id_rs2_rob_epoch;
+    }
 
     // ============================================================
     // FP RAT (E2-c1 shadow mode).
@@ -2880,8 +2926,10 @@ pub module heliodor_top #(
         i_undo        : 1'b0                                         ,
         i_squash_valid: ex_misprediction                             ,
         i_squash_mask : rob_squash_mask                              ,
-        o_undo_valid  : _                                            ,
-        o_undo_rob_idx: _                                            ,
+        o_undo_valid   : _                                            ,
+        o_undo_rd      : _                                            ,
+        o_undo_rob_idx : _                                            ,
+        o_undo_rob_epoch: _                                           ,
     );
 
     // FP RS dispatched_q: prevents re-dispatch while IFID holds.
