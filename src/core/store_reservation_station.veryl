@@ -1,0 +1,272 @@
+// Store Reservation Station: in-order store queue with CDB wakeup.
+//
+// Stores dispatch from ID without operand-ready gating. They wait in
+// SRS until both rs1 (base) and rs2 (data) are resolved via CDB,
+// then issue in program order to EX for addr compute → MEM dcache.
+//
+// Memory ordering: in-order FIFO both on dispatch and issue side
+// guarantees stores hit dcache in program order. Load ordering vs
+// stores is preserved by existing SB forwarding (MEM-stage path).
+//
+// Scope: skeleton + unit test. Pipeline wiring is a separate step.
+pub module store_reservation_station (
+    clk: input clock,
+    rst: input reset,
+
+    // ----- Dispatch (from ID stage, in program order) -----
+    i_dispatch_valid  : input  logic        ,
+    i_dispatch_pc     : input  logic    <64>,
+    i_dispatch_imm    : input  logic    <64>, // sign-extended offset
+    i_dispatch_funct3 : input  logic    <3> , // 0=SB,1=SH,2=SW,3=SD
+    i_dispatch_rs1    : input  logic    <5> , // base arch reg (debug only)
+    i_dispatch_rs2    : input  logic    <5> , // data arch reg (debug only)
+    i_dispatch_rob    : input  logic    <5> ,
+    i_dispatch_epoch  : input  logic    <2> ,
+    // Operand status: if s*_ready, s*_data is live; else s*_tag identifies
+    // the in-flight producer (ROB idx + epoch).
+    i_dispatch_s1_ready: input logic        ,
+    i_dispatch_s1_tag  : input logic    <5> ,
+    i_dispatch_s1_epoch: input logic    <2> ,
+    i_dispatch_s1_data : input logic    <64>,
+    i_dispatch_s2_ready: input logic        ,
+    i_dispatch_s2_tag  : input logic    <5> ,
+    i_dispatch_s2_epoch: input logic    <2> ,
+    i_dispatch_s2_data : input logic    <64>,
+    o_dispatch_ready  : output logic        , // SRS has space
+
+    // ----- Issue (to EX → MEM) REGISTERED to mirror RS convention -----
+    o_issue_valid  : output logic        ,
+    o_issue_pc     : output logic    <64>,
+    o_issue_imm    : output logic    <64>,
+    o_issue_funct3 : output logic    <3> ,
+    o_issue_rs1    : output logic    <5> ,
+    o_issue_rs2    : output logic    <5> ,
+    o_issue_s1_data: output logic    <64>, // base
+    o_issue_s2_data: output logic    <64>, // data-to-store
+    o_issue_rob    : output logic    <5> ,
+    o_issue_epoch  : output logic    <2> ,
+    i_issue_stall  : input  logic        , // EX/MEM cannot accept this cycle
+
+    // ----- CDB wakeup (3 ports, shared with int RS) -----
+    i_cdb0_valid: input logic    ,
+    i_cdb0_rob  : input logic<5> ,
+    i_cdb0_epoch: input logic<2> ,
+    i_cdb0_data : input logic<64>,
+    i_cdb1_valid: input logic    ,
+    i_cdb1_rob  : input logic<5> ,
+    i_cdb1_epoch: input logic<2> ,
+    i_cdb1_data : input logic<64>,
+    i_cdb2_valid: input logic    ,
+    i_cdb2_rob  : input logic<5> ,
+    i_cdb2_epoch: input logic<2> ,
+    i_cdb2_data : input logic<64>,
+
+    // ----- Flush (trap: drop all entries) -----
+    i_flush: input logic,
+    // ----- Squash (branch mispredict: selective invalidate by rob_idx) -----
+    i_squash_valid: input logic     ,
+    i_squash_mask : input logic [32],
+
+    // ----- Debug -----
+    o_count: output logic<3>,
+    o_full : output logic   ,
+    o_empty: output logic   ,
+) {
+    // ============================================================
+    // Entry storage (4 entries, FIFO)
+    // ============================================================
+    var valid    : logic    [4];
+    var e_pc     : logic<64>[4];
+    var e_imm    : logic<64>[4];
+    var e_funct3 : logic<3> [4];
+    var e_rs1    : logic<5> [4];
+    var e_rs2    : logic<5> [4];
+    var e_rob    : logic<5> [4];
+    var e_epoch  : logic<2> [4];
+    var s1_ready : logic    [4];
+    var s1_tag   : logic<5> [4];
+    var s1_epoch : logic<2> [4];
+    var s1_data  : logic<64>[4];
+    var s2_ready : logic    [4];
+    var s2_tag   : logic<5> [4];
+    var s2_epoch : logic<2> [4];
+    var s2_data  : logic<64>[4];
+
+    // Circular FIFO: head (oldest), tail (next alloc).
+    // MSB of head/tail is wrap counter; tail==head+4 ⇒ full, ==head ⇒ empty.
+    var head: logic<3>;
+    var tail: logic<3>;
+
+    let count_sub: logic<3> = tail - head;
+    assign o_count = count_sub;
+    assign o_full  = count_sub == 3'd4;
+    assign o_empty = count_sub == 3'd0;
+
+    let head_idx: logic<2> = head[1:0];
+    let tail_idx: logic<2> = tail[1:0];
+
+    assign o_dispatch_ready = !o_full;
+
+    // ============================================================
+    // Head-entry readiness (with same-cycle CDB bypass, epoch-checked)
+    // ============================================================
+    var head_s1_ready_comb: logic;
+    var head_s2_ready_comb: logic;
+    always_comb {
+        head_s1_ready_comb = s1_ready[head_idx]
+            || (i_cdb0_valid && s1_tag[head_idx] == i_cdb0_rob && s1_epoch[head_idx] == i_cdb0_epoch)
+            || (i_cdb1_valid && s1_tag[head_idx] == i_cdb1_rob && s1_epoch[head_idx] == i_cdb1_epoch)
+            || (i_cdb2_valid && s1_tag[head_idx] == i_cdb2_rob && s1_epoch[head_idx] == i_cdb2_epoch);
+        head_s2_ready_comb = s2_ready[head_idx]
+            || (i_cdb0_valid && s2_tag[head_idx] == i_cdb0_rob && s2_epoch[head_idx] == i_cdb0_epoch)
+            || (i_cdb1_valid && s2_tag[head_idx] == i_cdb1_rob && s2_epoch[head_idx] == i_cdb2_epoch)
+            || (i_cdb2_valid && s2_tag[head_idx] == i_cdb2_rob && s2_epoch[head_idx] == i_cdb2_epoch);
+    }
+    let head_ready: logic = valid[head_idx] && head_s1_ready_comb && head_s2_ready_comb;
+
+    // ============================================================
+    // Sequential
+    // ============================================================
+    always_ff (clk, rst) {
+        if_reset {
+            head = 3'd0;
+            tail = 3'd0;
+            o_issue_valid = 1'b0;
+            for i: i32 in 0..4 {
+                valid[i] = 1'b0;
+            }
+        } else if i_flush {
+            head = 3'd0;
+            tail = 3'd0;
+            o_issue_valid = 1'b0;
+            for i: i32 in 0..4 {
+                valid[i] = 1'b0;
+            }
+        } else {
+            // CDB wakeup: update operand data and ready flags.
+            for i: i32 in 0..4 {
+                if valid[i] {
+                    if !s1_ready[i] {
+                        if i_cdb0_valid && s1_tag[i] == i_cdb0_rob && s1_epoch[i] == i_cdb0_epoch {
+                            s1_ready[i] = 1'b1;
+                            s1_data[i]  = i_cdb0_data;
+                        } else if i_cdb1_valid && s1_tag[i] == i_cdb1_rob && s1_epoch[i] == i_cdb1_epoch {
+                            s1_ready[i] = 1'b1;
+                            s1_data[i]  = i_cdb1_data;
+                        } else if i_cdb2_valid && s1_tag[i] == i_cdb2_rob && s1_epoch[i] == i_cdb2_epoch {
+                            s1_ready[i] = 1'b1;
+                            s1_data[i]  = i_cdb2_data;
+                        }
+                    }
+                    if !s2_ready[i] {
+                        if i_cdb0_valid && s2_tag[i] == i_cdb0_rob && s2_epoch[i] == i_cdb0_epoch {
+                            s2_ready[i] = 1'b1;
+                            s2_data[i]  = i_cdb0_data;
+                        } else if i_cdb1_valid && s2_tag[i] == i_cdb1_rob && s2_epoch[i] == i_cdb1_epoch {
+                            s2_ready[i] = 1'b1;
+                            s2_data[i]  = i_cdb1_data;
+                        } else if i_cdb2_valid && s2_tag[i] == i_cdb2_rob && s2_epoch[i] == i_cdb2_epoch {
+                            s2_ready[i] = 1'b1;
+                            s2_data[i]  = i_cdb2_data;
+                        }
+                    }
+                }
+            }
+
+            // Issue output (registered): head entry when both ready.
+            if !i_issue_stall {
+                if head_ready {
+                    o_issue_valid   = 1'b1;
+                    o_issue_pc      = e_pc[head_idx];
+                    o_issue_imm     = e_imm[head_idx];
+                    o_issue_funct3  = e_funct3[head_idx];
+                    o_issue_rs1     = e_rs1[head_idx];
+                    o_issue_rs2     = e_rs2[head_idx];
+                    // Use CDB bypass if waking THIS cycle.
+                    o_issue_s1_data = if !s1_ready[head_idx] && i_cdb0_valid && s1_tag[head_idx] == i_cdb0_rob && s1_epoch[head_idx] == i_cdb0_epoch ?
+                        i_cdb0_data : if !s1_ready[head_idx] && i_cdb1_valid && s1_tag[head_idx] == i_cdb1_rob && s1_epoch[head_idx] == i_cdb1_epoch ?
+                        i_cdb1_data : if !s1_ready[head_idx] && i_cdb2_valid && s1_tag[head_idx] == i_cdb2_rob && s1_epoch[head_idx] == i_cdb2_epoch ?
+                        i_cdb2_data : s1_data[head_idx];
+                    o_issue_s2_data = if !s2_ready[head_idx] && i_cdb0_valid && s2_tag[head_idx] == i_cdb0_rob && s2_epoch[head_idx] == i_cdb0_epoch ?
+                        i_cdb0_data : if !s2_ready[head_idx] && i_cdb1_valid && s2_tag[head_idx] == i_cdb1_rob && s2_epoch[head_idx] == i_cdb1_epoch ?
+                        i_cdb1_data : if !s2_ready[head_idx] && i_cdb2_valid && s2_tag[head_idx] == i_cdb2_rob && s2_epoch[head_idx] == i_cdb2_epoch ?
+                        i_cdb2_data : s2_data[head_idx];
+                    o_issue_rob     = e_rob[head_idx];
+                    o_issue_epoch   = e_epoch[head_idx];
+                    // Pop head
+                    valid[head_idx] = 1'b0;
+                    head            = head + 3'd1;
+                } else {
+                    o_issue_valid = 1'b0;
+                }
+            }
+            // When i_issue_stall: hold output (o_issue_valid/data unchanged).
+
+            // Dispatch: allocate at tail. Same-cycle CDB capture for freshly-
+            // broadcast operands (dispatch runs AFTER wake/issue above, so
+            // the just-issued CDB is still visible via the input bus).
+            if i_dispatch_valid && !o_full {
+                valid[tail_idx]    = 1'b1;
+                e_pc[tail_idx]     = i_dispatch_pc;
+                e_imm[tail_idx]    = i_dispatch_imm;
+                e_funct3[tail_idx] = i_dispatch_funct3;
+                e_rs1[tail_idx]    = i_dispatch_rs1;
+                e_rs2[tail_idx]    = i_dispatch_rs2;
+                e_rob[tail_idx]    = i_dispatch_rob;
+                e_epoch[tail_idx]  = i_dispatch_epoch;
+
+                let s1_cdb0_hit: logic = !i_dispatch_s1_ready && i_cdb0_valid
+                    && i_dispatch_s1_tag == i_cdb0_rob && i_dispatch_s1_epoch == i_cdb0_epoch;
+                let s1_cdb1_hit: logic = !i_dispatch_s1_ready && i_cdb1_valid
+                    && i_dispatch_s1_tag == i_cdb1_rob && i_dispatch_s1_epoch == i_cdb1_epoch;
+                let s1_cdb2_hit: logic = !i_dispatch_s1_ready && i_cdb2_valid
+                    && i_dispatch_s1_tag == i_cdb2_rob && i_dispatch_s1_epoch == i_cdb2_epoch;
+                s1_ready[tail_idx] = i_dispatch_s1_ready || s1_cdb0_hit || s1_cdb1_hit || s1_cdb2_hit;
+                s1_tag[tail_idx]   = i_dispatch_s1_tag;
+                s1_epoch[tail_idx] = i_dispatch_s1_epoch;
+                s1_data[tail_idx]  = if s1_cdb0_hit ? i_cdb0_data
+                                   : if s1_cdb1_hit ? i_cdb1_data
+                                   : if s1_cdb2_hit ? i_cdb2_data
+                                   : i_dispatch_s1_data;
+
+                let s2_cdb0_hit: logic = !i_dispatch_s2_ready && i_cdb0_valid
+                    && i_dispatch_s2_tag == i_cdb0_rob && i_dispatch_s2_epoch == i_cdb0_epoch;
+                let s2_cdb1_hit: logic = !i_dispatch_s2_ready && i_cdb1_valid
+                    && i_dispatch_s2_tag == i_cdb1_rob && i_dispatch_s2_epoch == i_cdb1_epoch;
+                let s2_cdb2_hit: logic = !i_dispatch_s2_ready && i_cdb2_valid
+                    && i_dispatch_s2_tag == i_cdb2_rob && i_dispatch_s2_epoch == i_cdb2_epoch;
+                s2_ready[tail_idx] = i_dispatch_s2_ready || s2_cdb0_hit || s2_cdb1_hit || s2_cdb2_hit;
+                s2_tag[tail_idx]   = i_dispatch_s2_tag;
+                s2_epoch[tail_idx] = i_dispatch_s2_epoch;
+                s2_data[tail_idx]  = if s2_cdb0_hit ? i_cdb0_data
+                                   : if s2_cdb1_hit ? i_cdb1_data
+                                   : if s2_cdb2_hit ? i_cdb2_data
+                                   : i_dispatch_s2_data;
+
+                tail = tail + 3'd1;
+            }
+
+            // Squash overlay: invalidate entries whose rob_idx is squash-masked.
+            // SRS is in-order FIFO, so a squash may leave holes at the head —
+            // skip past invalid head entries on issue by treating them as !valid.
+            if i_squash_valid {
+                for i: i32 in 0..4 {
+                    if valid[i] && i_squash_mask[e_rob[i]] {
+                        valid[i] = 1'b0;
+                    }
+                }
+                // Cancel this cycle's issue if the issued entry was squashed.
+                if head_ready && i_squash_mask[e_rob[head_idx]] {
+                    o_issue_valid = 1'b0;
+                }
+            }
+
+            // Advance head past squashed (invalid) entries so the FIFO drains.
+            // Only advance one slot per cycle to keep logic simple; holes clear
+            // over multiple cycles.
+            if !valid[head_idx] && head != tail {
+                head = head + 3'd1;
+            }
+        }
+    }
+}
