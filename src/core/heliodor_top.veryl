@@ -156,6 +156,24 @@ pub module heliodor_top #(
     // AMO to re-read dcache (now holding its own post-write value) and
     // corrupt both wb_data and the final dcache state.
     var direct_path_dispatched_q: logic;
+
+    // Direct-path operand capture: at the cycle the EX/MEM pipeline reg
+    // latches a direct-path instruction (direct_path_v && !stall_ex), freeze
+    // the final forwarded operand values. On subsequent re-fires (when the
+    // instruction stays at ID after dispatch — e.g., redirect deferred by
+    // stall_ex on a later cache miss), feed the frozen values back to
+    // execute with fwd_a/fwd_b=NONE so the combinational re-evaluation is
+    // stable against forwarding-source drift. Fixes the pmpaddr-class bug
+    // where a branch's rs1 flips as producer ROB entries commit/release
+    // across stall cycles.
+    var direct_path_operand_captured_q: logic;
+    var direct_path_rs1_q             : logic<64>;
+    var direct_path_rs2_q             : logic<64>;
+
+    // Execute's final forwarded operand debug outputs (promoted from
+    // unused `_` to real wires so heliodor_top can capture them).
+    var ex_dbg_fwd_rs1: logic<64>;
+    var ex_dbg_fwd_rs2: logic<64>;
     // SRS (Store RS) observation signals — SRS-2: dispatch only; issue output
     // is not yet wired to the pipeline, so stores also proceed on direct path.
     var srs_dispatch_ready: logic    ;
@@ -1404,6 +1422,9 @@ pub module heliodor_top #(
             rs_dispatched_q = 1'b0;
             srs_dispatched_q = 1'b0;
             direct_path_dispatched_q = 1'b0;
+            direct_path_operand_captured_q = 1'b0;
+            direct_path_rs1_q = 64'd0;
+            direct_path_rs2_q = 64'd0;
             ex_from_srs_q   = 1'b0;
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
@@ -1567,6 +1588,20 @@ pub module heliodor_top #(
                 direct_path_dispatched_q = 1'b0;
             } else if direct_path_v && !stall_ex {
                 direct_path_dispatched_q = 1'b1;
+            }
+
+            // Direct-path operand capture: latch at the same cycle the
+            // pipeline reg latches (direct_path_v && !stall_ex), freezing
+            // the authoritative forwarded operand. Clears when instruction
+            // leaves ID, matching dispatched_q's lifetime.
+            if flush_id || !stall_id {
+                direct_path_operand_captured_q = 1'b0;
+                direct_path_rs1_q              = 64'd0;
+                direct_path_rs2_q              = 64'd0;
+            } else if direct_path_v && !stall_ex && !direct_path_operand_captured_q {
+                direct_path_operand_captured_q = 1'b1;
+                direct_path_rs1_q              = ex_dbg_fwd_rs1;
+                direct_path_rs2_q              = ex_dbg_fwd_rs2;
             }
 
             // RS starvation prevention: yield EX to RS after 1 cycle of blocking.
@@ -1895,11 +1930,13 @@ pub module heliodor_top #(
         i_rs1_data     : if ex_from_fp_rs ? 64'd0
                        : if ex_from_srs  ? srs_issue_s1_data
                        : if ex_from_rs ? rs_issue_s1_data
+                       : if direct_path_operand_captured_q ? direct_path_rs1_q
                        : if rat_id_rs1_valid && rob_read1_epoch == rat_id_rs1_rob_epoch ? rob_read1_data
                        : id_rs1_data                                                                                                    ,
         i_rs2_data     : if ex_from_fp_rs ? 64'd0
                        : if ex_from_srs  ? srs_issue_s2_data
                        : if ex_from_rs ? rs_issue_s2_data
+                       : if direct_path_operand_captured_q ? direct_path_rs2_q
                        : if rat_id_rs2_valid && rob_read2_epoch == rat_id_rs2_rob_epoch ? rob_read2_data
                        : id_rs2_data                                                                                                    ,
         i_imm          : if ex_from_fp_rs ? 64'd0 : if ex_from_srs ? srs_issue_imm : if ex_from_rs ? rs_issue_imm : id_imm              ,
@@ -1974,12 +2011,14 @@ pub module heliodor_top #(
         // from MEM_WB handles the WB data correctly and avoids the stale-regfile
         // race condition that occurs when ROB commit clears the RAT.
         i_fwd_a           : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE
+                          : if direct_path_operand_captured_q ? pipeline_pkg::FwdSel::NONE
                           : if rat_id_rs1_valid && fwd_a != pipeline_pkg::FwdSel::NONE
                             && ((fwd_a == pipeline_pkg::FwdSel::EX_MEM && (ex_rob_idx != rat_id_rs1_rob_idx || ex_epoch != rat_id_rs1_rob_epoch))
                              || (fwd_a == pipeline_pkg::FwdSel::MEM_WB && (mem_rob_idx != rat_id_rs1_rob_idx || mem_epoch != rat_id_rs1_rob_epoch || mem_was_lq)))
                             ? pipeline_pkg::FwdSel::NONE
                           : fwd_a                                                      ,
         i_fwd_b           : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE
+                          : if direct_path_operand_captured_q ? pipeline_pkg::FwdSel::NONE
                           : if rat_id_rs2_valid && fwd_b != pipeline_pkg::FwdSel::NONE
                             && ((fwd_b == pipeline_pkg::FwdSel::EX_MEM && (ex_rob_idx != rat_id_rs2_rob_idx || ex_epoch != rat_id_rs2_rob_epoch))
                              || (fwd_b == pipeline_pkg::FwdSel::MEM_WB && (mem_rob_idx != rat_id_rs2_rob_idx || mem_epoch != rat_id_rs2_rob_epoch || mem_was_lq)))
@@ -2019,8 +2058,8 @@ pub module heliodor_top #(
         i_predict_taken   : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_predict_taken ,
         i_predict_target  : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 64'd0 : id_predict_target,
         o_branch_taken    : ex_branch_taken  ,
-        o_dbg_fwd_rs1     : _                ,
-        o_dbg_fwd_rs2     : _                ,
+        o_dbg_fwd_rs1     : ex_dbg_fwd_rs1   ,
+        o_dbg_fwd_rs2     : ex_dbg_fwd_rs2   ,
         o_branch_target   : ex_branch_target ,
         o_jump_target     : ex_jump_target   ,
         o_misprediction   : ex_misprediction ,
