@@ -149,6 +149,13 @@ pub module heliodor_top #(
     var mem_is_div: logic;
     // RS dispatched tracking (prevents double-dispatch when ID stalls)
     var rs_dispatched_q: logic;
+    // Direct-path dispatched tracking: set when a direct-path instruction
+    // enters EX, cleared when ID advances / flushes. Prevents re-firing of
+    // direct_path_v when ID stalls across multiple cycles — without this,
+    // execute + memory re-process the same instruction each cycle, causing
+    // AMO to re-read dcache (now holding its own post-write value) and
+    // corrupt both wb_data and the final dcache state.
+    var direct_path_dispatched_q: logic;
     // SRS (Store RS) observation signals — SRS-2: dispatch only; issue output
     // is not yet wired to the pipeline, so stores also proceed on direct path.
     var srs_dispatch_ready: logic    ;
@@ -531,6 +538,9 @@ pub module heliodor_top #(
     // also route through direct path for now since they share the integer
     // store MEM path but read FP regs for data.
     let id_is_srs_eligible: logic = id_valid && id_mem_wen && !id_is_amo && !id_is_fp && !flush_id;
+    // AMO-RMW detection: distinguishes RMW (mem_ren && mem_wen) from LR/SC
+    // (pure load or store). Used as the direct-path re-evaluation gate scope.
+    let id_is_amo_rmw: logic = id_is_amo && id_mem_ren && id_mem_wen;
     // SRS-2 observational mode: dispatch only; issue output is not wired into
     // the pipeline. Stores still proceed via direct path, so SRS populates in
     // parallel and retires when operands arrive.
@@ -856,7 +866,11 @@ pub module heliodor_top #(
         // decode module from being overwritten.
         i_rs_stall        : (id_is_rs_eligible && !rs_dispatch_ready)
                           || (id_is_fp_rs_eligible && !fp_rs_dispatch_ready)
-                          || (id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !direct_path_v)
+                          // Direct-path can't proceed (operand not ready etc.).
+                          // Exclude the AMO-RMW gate case — direct_path_v=0 there means
+                          // the instruction already dispatched and is in-flight; ID
+                          // should wait for drain, not stall as a dispatch failure.
+                          || (id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !direct_path_v && !(direct_path_dispatched_q && id_is_amo_rmw))
                           || (irq_pending && !rob_empty),
         o_stall_if        : stall_if                                              ,
         o_stall_id        : stall_id                                              ,
@@ -1360,6 +1374,7 @@ pub module heliodor_top #(
             _ex_rob_idx_q   = 5'd0;
             rs_dispatched_q = 1'b0;
             srs_dispatched_q = 1'b0;
+            direct_path_dispatched_q = 1'b0;
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
@@ -1513,6 +1528,15 @@ pub module heliodor_top #(
                 srs_dispatched_q = 1'b0;
             } else if srs_dispatch_valid {
                 srs_dispatched_q = 1'b1;
+            }
+
+            // Direct-path dispatched tracking: set when direct_path_v fires
+            // and the pipeline accepts the instruction into EX (!stall_ex).
+            // Clears when ID advances so the next instruction can dispatch.
+            if flush_id || !stall_id {
+                direct_path_dispatched_q = 1'b0;
+            } else if direct_path_v && !stall_ex {
+                direct_path_dispatched_q = 1'b1;
             }
 
             // RS starvation prevention: yield EX to RS after 1 cycle of blocking.
@@ -2434,8 +2458,12 @@ pub module heliodor_top #(
         // Allow EX entry when instruction already has a ROB entry (id_has_rob),
         // even if ROB is full — the entry was allocated before ROB filled.
         // Block only if ROB is full AND no entry allocated (would use stale rob_idx).
+        // Re-evaluation gate applied only to AMO-RMW (re-reads dcache and
+        // corrupts amo_old with its own post-write value). Other direct-path
+        // ops tolerate re-evaluation; LR/SC are idempotent.
         direct_path_v = id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !rs_yield
-                      && (!rob_full || id_has_rob) && !id_direct_stall;
+                      && (!rob_full || id_has_rob) && !id_direct_stall
+                      && !(direct_path_dispatched_q && id_is_amo_rmw);
 
         // (debug traces removed)
     }
