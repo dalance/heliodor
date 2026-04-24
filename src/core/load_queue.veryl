@@ -21,6 +21,17 @@ pub module load_queue (
     i_alloc_rd     : input  logic<5> ,
     i_alloc_funct3 : input  logic<3> , // size + signedness
     i_alloc_is_fp  : input  logic    , // FP load (NaN-box for FLW)
+    // P3.2 Stage 1: rs1 tracking for OoO load issue. When a load is
+    // dispatched with an unresolved rs1, the caller sets s1_ready=0 and
+    // supplies the producer's rob/epoch via s1_tag/s1_epoch. LQ captures
+    // the value when the matching CDB broadcasts. Legacy callers that
+    // supply a fully-resolved address pass s1_ready=1 + s1_data=addr +
+    // imm=0 (or stay on the i_addr_* path — see below).
+    i_alloc_s1_ready: input  logic    ,
+    i_alloc_s1_tag  : input  logic<5> ,
+    i_alloc_s1_epoch: input  logic<2> ,
+    i_alloc_s1_data : input  logic<64>,
+    i_alloc_imm     : input  logic<64>,
     o_alloc_ready  : output logic    ,
     o_alloc_idx    : output logic<3> , // LQ index assigned to this load
 
@@ -66,6 +77,24 @@ pub module load_queue (
     // ----- Flush (trap) -----
     i_flush: input logic,
 
+    // ----- CDB (Stage 1 scaffold) -----
+    // For pending-rs1 loads: wake when a matching producer broadcasts.
+    // Currently captured in parallel with RS/SRS from the same CDB
+    // signals; behavior change comes in Stage 2 when pending-rs1 loads
+    // actually allocate here instead of stalling ID.
+    i_cdb0_valid: input logic    ,
+    i_cdb0_rob  : input logic<5> ,
+    i_cdb0_epoch: input logic<2> ,
+    i_cdb0_data : input logic<64>,
+    i_cdb1_valid: input logic    ,
+    i_cdb1_rob  : input logic<5> ,
+    i_cdb1_epoch: input logic<2> ,
+    i_cdb1_data : input logic<64>,
+    i_cdb2_valid: input logic    ,
+    i_cdb2_rob  : input logic<5> ,
+    i_cdb2_epoch: input logic<2> ,
+    i_cdb2_data : input logic<64>,
+
     // ----- Alias probe (P3.4 speculation replay) -----
     // Given a resolved store VA, find any LQ entry whose addr matches
     // (±1 8B line). On hit, return the entry's rob_idx + epoch so the
@@ -95,6 +124,16 @@ pub module load_queue (
     var e_is_fp   : logic    [8];
     var e_addr    : logic<64>[8];
     var e_data    : logic<64>[8];
+    // P3.2 Stage 1 scaffold: rs1 tracking for future pending-dispatch loads.
+    // Today every alloc supplies s1_ready=1 + s1_data=addr + imm=0, so the
+    // existing `e_addr` / `addr_ready` path is unchanged. Stage 2 will
+    // add pending-rs1 alloc where s1_data captures CDB and addr is computed
+    // when s1 resolves.
+    var s1_ready  : logic    [8];
+    var s1_tag    : logic<5> [8];
+    var s1_epoch  : logic<2> [8];
+    var s1_data   : logic<64>[8];
+    var e_imm     : logic<64>[8];
 
     // Circular FIFO head (oldest) / tail (next alloc)
     var head: logic<4>;
@@ -203,6 +242,11 @@ pub module load_queue (
                 e_is_fp[i]    = 1'b0;
                 e_addr[i]     = 64'd0;
                 e_data[i]     = 64'd0;
+                s1_ready[i]   = 1'b0;
+                s1_tag[i]     = 5'd0;
+                s1_epoch[i]   = 2'd0;
+                s1_data[i]    = 64'd0;
+                e_imm[i]      = 64'd0;
             }
         } else {
             if i_flush {
@@ -250,6 +294,21 @@ pub module load_queue (
                     e_rd      [tail_idx] = i_alloc_rd;
                     e_funct3  [tail_idx] = i_alloc_funct3;
                     e_is_fp   [tail_idx] = i_alloc_is_fp;
+                    // P3.2 Stage 1: capture rs1 state + imm at alloc. Same-cycle
+                    // CDB bypass matches the RS/SRS convention: if a matching
+                    // CDB is live this cycle, latch its data and mark ready.
+                    let alloc_s1_cdb0: logic = i_cdb0_valid && i_alloc_s1_tag == i_cdb0_rob && i_alloc_s1_epoch == i_cdb0_epoch;
+                    let alloc_s1_cdb1: logic = i_cdb1_valid && i_alloc_s1_tag == i_cdb1_rob && i_alloc_s1_epoch == i_cdb1_epoch;
+                    let alloc_s1_cdb2: logic = i_cdb2_valid && i_alloc_s1_tag == i_cdb2_rob && i_alloc_s1_epoch == i_cdb2_epoch;
+                    s1_ready  [tail_idx] = i_alloc_s1_ready || alloc_s1_cdb0 || alloc_s1_cdb1 || alloc_s1_cdb2;
+                    s1_data   [tail_idx] = if i_alloc_s1_ready  ? i_alloc_s1_data
+                                          : if alloc_s1_cdb0 ? i_cdb0_data
+                                          : if alloc_s1_cdb1 ? i_cdb1_data
+                                          : if alloc_s1_cdb2 ? i_cdb2_data
+                                          : 64'd0;
+                    s1_tag    [tail_idx] = i_alloc_s1_tag;
+                    s1_epoch  [tail_idx] = i_alloc_s1_epoch;
+                    e_imm     [tail_idx] = i_alloc_imm;
                     // Same-cycle complete targeting the just-alloc'd entry
                     if i_complete_valid && i_complete_idx == tail_idx {
                         e_data    [tail_idx] = i_complete_data;
@@ -286,6 +345,24 @@ pub module load_queue (
                 if i_addr_valid && valid[i_addr_idx] && !(do_alloc && i_addr_idx == tail_idx) {
                     e_addr    [i_addr_idx] = i_addr_addr;
                     addr_ready[i_addr_idx] = 1'b1;
+                }
+
+                // P3.2 Stage 1: CDB wakeup for pending-rs1 entries. Walks all
+                // valid entries (skipping the one just alloc'd, whose initial
+                // s1 was handled inline above) and captures a matching CDB.
+                for i in 0..8 {
+                    if valid[i] && !s1_ready[i] && !(do_alloc && tail_idx == i[2:0]) {
+                        if i_cdb0_valid && s1_tag[i] == i_cdb0_rob && s1_epoch[i] == i_cdb0_epoch {
+                            s1_ready[i] = 1'b1;
+                            s1_data [i] = i_cdb0_data;
+                        } else if i_cdb1_valid && s1_tag[i] == i_cdb1_rob && s1_epoch[i] == i_cdb1_epoch {
+                            s1_ready[i] = 1'b1;
+                            s1_data [i] = i_cdb1_data;
+                        } else if i_cdb2_valid && s1_tag[i] == i_cdb2_rob && s1_epoch[i] == i_cdb2_epoch {
+                            s1_ready[i] = 1'b1;
+                            s1_data [i] = i_cdb2_data;
+                        }
+                    }
                 }
             }
         }
