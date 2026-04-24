@@ -584,17 +584,25 @@ pub module heliodor_top #(
     // with this gate but the real Linux boot goal takes precedence.
     // SRS dispatch/wake/drain infrastructure is kept for Phase 3.
     //
-    // SRS store routing is gated off: even with P3.3 byte-granular SB
-    // forwarding in place, re-enabling SRS-3c still hangs Linux boot
-    // around ~37% of the way through (pass=0 at 50M cycles with
-    // lq_alloc=595K vs 1608K on a passing run). Root cause is a
-    // pipeline interaction that is orthogonal to the SB forwarding
-    // path. SRS dispatch/wake/drain infrastructure stays in tree.
+    // 2026-04-24 progress: two independent bugs were uncovered and
+    // fixed while investigating the earlier BGEU hang at
+    // 0xffffffff80046d1e:
+    //   (a) the `!flush_id` reference in the gate created a JIT-on
+    //       comb fixed-point bug (flush_id → id_is_srs_eligible →
+    //       srs_drain_needed → id_direct_stall → direct_path_v →
+    //       flush_id).
+    //   (b) div_async CDB1 pulse was dropped on priority conflict
+    //       (see div_pending_valid latch below).
+    // With both fixes the BGEU hang is resolved (Linux progresses
+    // from lq_alloc=595K to 1.72M at 100M cycles), but a NEW hang
+    // appears at PC=0xffffffff800b9be8 — a tight loop with
+    // near-zero lq_alloc growth, suggesting __delay/spinlock that
+    // never exits. That investigation is deferred; SRS-3c stays
+    // gated off to keep Linux boot green.
     //
-    // Defined as a plain literal rather than `1'b0 && <cond>` so the
-    // simulator's JIT-off dependency analysis does not see a syntactic
-    // path from `flush_id` → `id_is_srs_eligible` → `srs_drain_needed` →
-    // `id_direct_stall` → `direct_path_v` → `flush_id`.
+    // Defined as a plain literal rather than `1'b0 && <cond>` so
+    // the simulator's JIT-off dependency analysis does not see a
+    // syntactic path through flush_id.
     let id_is_srs_eligible: logic = 1'b0;
     // AMO-RMW detection: distinguishes RMW (mem_ren && mem_wen) from LR/SC
     // (pure load or store). Used as the direct-path re-evaluation gate scope.
@@ -2345,6 +2353,45 @@ pub module heliodor_top #(
     // port 1 normal WB path). DIV still blocks the pipeline via i_div_busy
     // so there's no RS-dispatch / async completion race yet.
     let div_async_valid: logic = ex_div_complete_valid;
+    // Div-async CDB1 pending latch: DIV completion is a 1-cycle pulse
+    // from the divider FSM. When it collides with mshr_int_wb /
+    // normal_wb_complete / lq_wb_complete, the CDB1 priority mux drops
+    // lower-priority sources and the DIV broadcast is lost forever —
+    // RS dependents never see the wakeup. ROB port 4 still captures
+    // completion, but RS has no way to observe ROB.completed without a
+    // CDB. One-entry buffer rescues the dropped pulse and re-drives CDB1
+    // on the next free cycle (DIV takes >=32 cycles, so a single-entry
+    // buffer never overflows before draining).
+    var div_pending_valid: logic    ;
+    var div_pending_rob  : logic<5> ;
+    var div_pending_epoch: logic<2> ;
+    var div_pending_data : logic<64>;
+    let cdb1_other_src   : logic    = mshr_int_wb || normal_wb_complete || lq_wb_complete;
+    let div_conflict     : logic    = div_async_valid && cdb1_other_src;
+    let div_drain_now    : logic    = div_pending_valid && !cdb1_other_src;
+    always_ff (clk, rst) {
+        if_reset {
+            div_pending_valid = 1'b0;
+            div_pending_rob   = 5'd0;
+            div_pending_epoch = 2'd0;
+            div_pending_data  = 64'd0;
+        } else {
+            if div_drain_now {
+                div_pending_valid = 1'b0;
+            }
+            if div_conflict && !div_pending_valid {
+                div_pending_valid = 1'b1;
+                div_pending_rob   = ex_div_complete_rob_idx;
+                div_pending_epoch = ex_div_complete_epoch;
+                div_pending_data  = ex_div_complete_data;
+            }
+        }
+    }
+    let div_broadcast_valid: logic     = (div_async_valid && !div_conflict) || div_drain_now;
+    let div_broadcast_rob  : logic<5>  = if div_drain_now ? div_pending_rob   : ex_div_complete_rob_idx;
+    let div_broadcast_epoch: logic<2>  = if div_drain_now ? div_pending_epoch : ex_div_complete_epoch;
+    let div_broadcast_data : logic<64> = if div_drain_now ? div_pending_data  : ex_div_complete_data;
+
     assign mshr_wb_conflict = (mshr_int_wb && (normal_wb_complete || lq_wb_complete))
                            || (normal_wb_complete && lq_wb_complete)
                            || (mshr_fp_wb && mem_valid && mem_fp_reg_wen);
@@ -2381,17 +2428,19 @@ pub module heliodor_top #(
     // CDB port 1: WB/MSHR/DIV async results + LQ retire (late wakeup).
     // LQ retire drives CDB1 for captured loads so RS dependents wake up
     // on the same cycle they would have via the normal WB path.
-    let _cdb1_valid_w: logic     = mshr_int_wb || div_async_valid || normal_wb_complete || lq_wb_complete;
+    // CDB1 uses div_broadcast_* (live pulse or pending-latch drain) so a
+    // div completion colliding with mshr/normal_wb/lq is never lost.
+    let _cdb1_valid_w: logic     = mshr_int_wb || div_broadcast_valid || normal_wb_complete || lq_wb_complete;
     let _cdb1_rob_w  : logic<5>  = if mshr_int_wb ? mshr_rob_idx
-                                  : if div_async_valid ? ex_div_complete_rob_idx
+                                  : if div_broadcast_valid ? div_broadcast_rob
                                   : if lq_wb_complete ? lq_retire_rob
                                   : mem_rob_idx;
     let _cdb1_epoch_w: logic<2>  = if mshr_int_wb ? mshr_epoch
-                                  : if div_async_valid ? ex_div_complete_epoch
+                                  : if div_broadcast_valid ? div_broadcast_epoch
                                   : if lq_wb_complete ? lq_retire_epoch
                                   : mem_epoch;
     let _cdb1_data_w : logic<64> = if mshr_int_wb ? mshr_wb_data
-                                  : if div_async_valid ? ex_div_complete_data
+                                  : if div_broadcast_valid ? div_broadcast_data
                                   : if lq_wb_complete ? lq_retire_data
                                   : wb_data;
     // CDB port 2: slot1 EX result (dual-issue from RS)
