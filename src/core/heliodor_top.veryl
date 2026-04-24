@@ -217,6 +217,13 @@ pub module heliodor_top #(
     // Latched at the EX→MEM transition; read by the direct-path load
     // drain check so loads that don't alias can skip the stall.
     var ex_from_srs_q_addr: logic<64>;
+    // P3.2 Stage 2b: registered flag + LQ idx for an LQ-reinjected load
+    // travelling through EX→MEM. MEM uses these to suppress duplicate
+    // lq_alloc and route lq_complete to the existing entry.
+    var ex_from_lq_q      : logic    ;
+    var lq_reinject_idx_q : logic<3> ;
+    var mem_from_lq       : logic    ;
+    var mem_reinject_idx  : logic<3> ;
     // SRS alias probe result — see srs_drain_needed.
     var srs_probe_alias           : logic;
     // Subset of srs_probe_alias: set when the alias=1 is driven solely by
@@ -982,7 +989,7 @@ pub module heliodor_top #(
                           // Exclude the AMO-RMW gate case — direct_path_v=0 there means
                           // the instruction already dispatched and is in-flight; ID
                           // should wait for drain, not stall as a dispatch failure.
-                          || (id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !direct_path_v && !(direct_path_dispatched_q && id_direct_oneshot_scope))
+                          || (id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !direct_path_v && !lq_id_alloc_fire && !lq_id_dispatched_q && !(direct_path_dispatched_q && id_direct_oneshot_scope))
                           || (irq_pending && !rob_empty),
         o_stall_if        : stall_if                                              ,
         o_stall_id        : stall_id                                              ,
@@ -1493,6 +1500,10 @@ pub module heliodor_top #(
             direct_path_rs2_q = 64'd0;
             ex_from_srs_q   = 1'b0;
             ex_from_srs_q_addr = 64'd0;
+            ex_from_lq_q    = 1'b0;
+            lq_reinject_idx_q = 3'd0;
+            mem_from_lq     = 1'b0;
+            mem_reinject_idx = 3'd0;
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
@@ -1698,25 +1709,32 @@ pub module heliodor_top #(
             // Only mem_from_rs remains as a shadow pipeline register.
             if trap_taken {
                 mem_from_rs = 1'b0;
+                mem_from_lq = 1'b0;
             } else if !stall_mem {
                 mem_from_rs = ex_from_rs_q;
+                mem_from_lq = ex_from_lq_q;
+                mem_reinject_idx = lq_reinject_idx_q;
             }
             if flush_ex {
-                ex_rob_idx    = 5'd0;
-                ex_epoch      = 2'b0;
-                ex_from_rs_q  = 1'b0;
-                ex_from_srs_q = 1'b0;
+                ex_rob_idx       = 5'd0;
+                ex_epoch         = 2'b0;
+                ex_from_rs_q     = 1'b0;
+                ex_from_srs_q    = 1'b0;
+                ex_from_lq_q     = 1'b0;
+                lq_reinject_idx_q = 3'd0;
             } else if !stall_ex {
                 if direct_path_v {
                     ex_rob_idx    = id_rob_idx;
                     ex_epoch      = id_epoch;
                     ex_from_rs_q  = 1'b0;
                     ex_from_srs_q = 1'b0;
+                    ex_from_lq_q  = 1'b0;
                 } else if rs_issue_valid && !rs_issue_stall {
                     ex_rob_idx    = rs_issue_rob;
                     ex_epoch      = rs_issue_epoch;
                     ex_from_rs_q  = 1'b1;
                     ex_from_srs_q = 1'b0;
+                    ex_from_lq_q  = 1'b0;
                 // SRS-3b: SRS is issue-stalled (i_issue_stall=1'b1), so
                 // srs_issue_valid=0 and this branch stays dead during step 3b.
                 // Flipped live with i_issue_stall in 3c.
@@ -1725,6 +1743,7 @@ pub module heliodor_top #(
                     ex_epoch      = srs_issue_epoch;
                     ex_from_rs_q  = 1'b0;
                     ex_from_srs_q = 1'b1;
+                    ex_from_lq_q  = 1'b0;
                     // Effective VA = base + immediate. Used by the direct-
                     // path load drain probe so subsequent loads can skip
                     // the stall when they don't alias this in-flight store.
@@ -1734,11 +1753,20 @@ pub module heliodor_top #(
                     ex_epoch      = fp_rs_issue_epoch;
                     ex_from_rs_q  = 1'b0; // shadowed RS flag used by MEM forwarding — FP RS not tracked
                     ex_from_srs_q = 1'b0;
+                    ex_from_lq_q  = 1'b0;
+                } else if lq_reinject_valid {
+                    ex_rob_idx    = lq_reinject_rob;
+                    ex_epoch      = lq_reinject_epoch;
+                    ex_from_rs_q  = 1'b0;
+                    ex_from_srs_q = 1'b0;
+                    ex_from_lq_q  = 1'b1;
+                    lq_reinject_idx_q = lq_reinject_idx;
                 } else {
                     ex_rob_idx    = 5'd0;
                     ex_epoch      = 2'b0;
                     ex_from_rs_q  = 1'b0;
                     ex_from_srs_q = 1'b0;
+                    ex_from_lq_q  = 1'b0;
                 }
             }
             if flush_id {
@@ -1964,18 +1992,22 @@ pub module heliodor_top #(
     // direct_path_v is set by always_comb after id_direct_stall is computed (below RAT).
     // direct_path_v = id_valid && !id_is_rs_eligible && !id_direct_stall
     let ex_from_rs     : logic = !direct_path_v && rs_issue_valid;
-    // SRS priority: direct > int RS > SRS > FP RS. While SRS is stalled
-    // (i_issue_stall=1 in step 3b), srs_issue_valid=0 so ex_from_srs=0.
+    // Priority: direct > int RS > SRS > FP RS > LQ-reinject. LQ-reinject
+    // sits at the lowest priority so it fills pipeline bubbles only when
+    // ID/RS/SRS/FP-RS have nothing to dispatch this cycle.
     let ex_from_srs    : logic = !direct_path_v && !rs_issue_valid && srs_issue_valid;
     let ex_from_fp_rs  : logic = !direct_path_v && !rs_issue_valid && !srs_issue_valid && fp_rs_issue_valid;
-    let ex_in_valid    : logic = direct_path_v || rs_issue_valid || srs_issue_valid || fp_rs_issue_valid;
+    let ex_from_lq     : logic = !direct_path_v && !rs_issue_valid && !srs_issue_valid && !fp_rs_issue_valid && lq_reinject_valid;
+    let ex_in_valid    : logic = direct_path_v || rs_issue_valid || srs_issue_valid || fp_rs_issue_valid || ex_from_lq;
     let ex_in_rob_idx  : logic<5> = if ex_from_fp_rs ? fp_rs_issue_rob
                                   : if ex_from_srs   ? srs_issue_rob
                                   : if ex_from_rs ? rs_issue_rob
+                                  : if ex_from_lq ? lq_reinject_rob
                                   : id_rob_idx;
     let ex_in_epoch    : logic<2> = if ex_from_fp_rs ? fp_rs_issue_epoch
                                   : if ex_from_srs   ? srs_issue_epoch
                                   : if ex_from_rs ? rs_issue_epoch
+                                  : if ex_from_lq ? lq_reinject_epoch
                                   : id_epoch;
 
     inst u_execute: execute (
@@ -1988,7 +2020,7 @@ pub module heliodor_top #(
         // EX/MEM forwarding inside execute will override if a more recent writer is in the
         // pipeline stages.
         i_valid        : ex_in_valid                                                                                                    ,
-        i_pc           : if ex_from_fp_rs ? fp_rs_issue_pc : if ex_from_srs ? srs_issue_pc : if ex_from_rs ? rs_issue_pc : id_pc        ,
+        i_pc           : if ex_from_fp_rs ? fp_rs_issue_pc : if ex_from_srs ? srs_issue_pc : if ex_from_rs ? rs_issue_pc : if ex_from_lq ? lq_reinject_pc : id_pc,
         // Direct-path ROB forwarding: when a source register has a completed ROB entry
         // (renamed but not yet committed), use the ROB data instead of stale regfile.
         // ROB data override + ROB commit bypass.
@@ -2009,59 +2041,61 @@ pub module heliodor_top #(
         i_rs1_data     : if ex_from_fp_rs ? 64'd0
                        : if ex_from_srs  ? srs_issue_s1_data
                        : if ex_from_rs ? rs_issue_s1_data
+                       : if ex_from_lq ? lq_reinject_s1
                        : if direct_path_operand_captured_q ? direct_path_rs1_q
                        : if rat_id_rs1_valid && rob_read1_epoch == rat_id_rs1_rob_epoch ? rob_read1_data
                        : id_rs1_data                                                                                                    ,
         i_rs2_data     : if ex_from_fp_rs ? 64'd0
                        : if ex_from_srs  ? srs_issue_s2_data
                        : if ex_from_rs ? rs_issue_s2_data
+                       : if ex_from_lq ? 64'd0
                        : if direct_path_operand_captured_q ? direct_path_rs2_q
                        : if rat_id_rs2_valid && rob_read2_epoch == rat_id_rs2_rob_epoch ? rob_read2_data
                        : id_rs2_data                                                                                                    ,
-        i_imm          : if ex_from_fp_rs ? 64'd0 : if ex_from_srs ? srs_issue_imm : if ex_from_rs ? rs_issue_imm : id_imm              ,
-        i_rd_addr      : if ex_from_fp_rs ? fp_rs_issue_rd  : if ex_from_srs ? 5'd0 : if ex_from_rs ? rs_issue_rd : id_rd_addr          ,
-        i_rs1_addr     : if ex_from_fp_rs ? fp_rs_issue_rs1 : if ex_from_srs ? srs_issue_rs1 : if ex_from_rs ? rs_issue_rs1 : id_rs1_addr,
-        i_rs2_addr     : if ex_from_fp_rs ? fp_rs_issue_rs2 : if ex_from_srs ? srs_issue_rs2 : if ex_from_rs ? rs_issue_rs2 : id_rs2_addr,
-        i_alu_op       : if ex_from_srs ? alu_pkg::AluOp::ADD : if ex_from_rs ? rs_issue_alu_op  : id_alu_op                            ,
-        i_alu_src_a    : if ex_from_srs ? pipeline_pkg::AluSrcA::REG : if ex_from_rs ? rs_issue_src_a : id_alu_src_a                    ,
-        i_alu_src_b    : if ex_from_srs ? pipeline_pkg::AluSrcB::IMM : if ex_from_rs ? rs_issue_src_b : id_alu_src_b                    ,
-        i_wb_sel       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::WbSel::ALU : id_wb_sel                          ,
-        i_reg_wen      : if ex_from_fp_rs ? fp_rs_issue_reg_wen : if ex_from_srs ? 1'b0 : if ex_from_rs ? rs_issue_wen : id_reg_wen    ,
-        i_mem_ren      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : if ex_from_srs ? 1'b0 : id_mem_ren                                    ,
-        i_mem_wen      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : if ex_from_srs ? 1'b1 : id_mem_wen                                    ,
-        i_mem_funct3   : if ex_from_rs || ex_from_fp_rs ? 3'd0 : if ex_from_srs ? srs_issue_funct3 : id_mem_funct3                     ,
-        i_is_branch    : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_branch                                           ,
-        i_is_jal       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_jal                                              ,
-        i_is_jalr      : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_jalr                                             ,
-        i_funct3       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 3'd0 : id_funct3                                              ,
-        i_is_ecall     : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_ecall                                            ,
-        i_is_ebreak    : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_ebreak                                           ,
-        i_illegal      : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : (id_illegal || id_csr_fault_q || tvm_trap || tsr_trap || mret_priv_fault || sret_priv_fault || sfence_priv_fault),
-        i_amo_funct5   : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 5'd0 : id_amo_funct5                                          ,
-        i_is_amo       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_amo                                              ,
-        i_is_compressed: if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_compressed                                       ,
-        i_is_fp        : if ex_from_fp_rs ? 1'b1 : if ex_from_rs || ex_from_srs ? 1'b0 : id_is_fp                                      ,
-        i_fp_reg_wen   : if ex_from_fp_rs ? fp_rs_issue_fp_wen : if ex_from_rs || ex_from_srs ? 1'b0 : id_fp_reg_wen                   ,
-        i_fpu_op       : if ex_from_fp_rs ? fp_rs_issue_fpu_op : if ex_from_rs || ex_from_srs ? 6'd0 : id_fpu_op                       ,
-        i_fp_rm        : if ex_from_fp_rs ? fp_rs_issue_rm : if ex_from_rs || ex_from_srs ? 3'd0 : id_fp_rm                            ,
+        i_imm          : if ex_from_fp_rs ? 64'd0 : if ex_from_srs ? srs_issue_imm : if ex_from_rs ? rs_issue_imm : if ex_from_lq ? lq_reinject_imm : id_imm,
+        i_rd_addr      : if ex_from_fp_rs ? fp_rs_issue_rd  : if ex_from_srs ? 5'd0 : if ex_from_rs ? rs_issue_rd : if ex_from_lq ? lq_reinject_rd : id_rd_addr,
+        i_rs1_addr     : if ex_from_fp_rs ? fp_rs_issue_rs1 : if ex_from_srs ? srs_issue_rs1 : if ex_from_rs ? rs_issue_rs1 : if ex_from_lq ? 5'd0 : id_rs1_addr,
+        i_rs2_addr     : if ex_from_fp_rs ? fp_rs_issue_rs2 : if ex_from_srs ? srs_issue_rs2 : if ex_from_rs ? rs_issue_rs2 : if ex_from_lq ? 5'd0 : id_rs2_addr,
+        i_alu_op       : if ex_from_srs ? alu_pkg::AluOp::ADD : if ex_from_rs ? rs_issue_alu_op : if ex_from_lq ? alu_pkg::AluOp::ADD : id_alu_op,
+        i_alu_src_a    : if ex_from_srs ? pipeline_pkg::AluSrcA::REG : if ex_from_rs ? rs_issue_src_a : if ex_from_lq ? pipeline_pkg::AluSrcA::REG : id_alu_src_a,
+        i_alu_src_b    : if ex_from_srs ? pipeline_pkg::AluSrcB::IMM : if ex_from_rs ? rs_issue_src_b : if ex_from_lq ? pipeline_pkg::AluSrcB::IMM : id_alu_src_b,
+        i_wb_sel       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::WbSel::ALU : if ex_from_lq ? pipeline_pkg::WbSel::MEM : id_wb_sel,
+        i_reg_wen      : if ex_from_fp_rs ? fp_rs_issue_reg_wen : if ex_from_srs ? 1'b0 : if ex_from_rs ? rs_issue_wen : if ex_from_lq ? (lq_reinject_rd != 5'd0) : id_reg_wen,
+        i_mem_ren      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : if ex_from_srs ? 1'b0 : if ex_from_lq ? 1'b1 : id_mem_ren              ,
+        i_mem_wen      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : if ex_from_srs ? 1'b1 : if ex_from_lq ? 1'b0 : id_mem_wen              ,
+        i_mem_funct3   : if ex_from_rs || ex_from_fp_rs ? 3'd0 : if ex_from_srs ? srs_issue_funct3 : if ex_from_lq ? lq_reinject_funct3 : id_mem_funct3,
+        i_is_branch    : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_branch                              ,
+        i_is_jal       : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_jal                                 ,
+        i_is_jalr      : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_jalr                                ,
+        i_funct3       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 3'd0 : if ex_from_lq ? lq_reinject_funct3 : id_funct3          ,
+        i_is_ecall     : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_ecall                               ,
+        i_is_ebreak    : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_ebreak                              ,
+        i_illegal      : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : (id_illegal || id_csr_fault_q || tvm_trap || tsr_trap || mret_priv_fault || sret_priv_fault || sfence_priv_fault),
+        i_amo_funct5   : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 5'd0 : id_amo_funct5                             ,
+        i_is_amo       : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_amo                                 ,
+        i_is_compressed: if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_compressed                          ,
+        i_is_fp        : if ex_from_fp_rs ? 1'b1 : if ex_from_rs || ex_from_srs ? 1'b0 : if ex_from_lq ? lq_reinject_is_fp : id_is_fp   ,
+        i_fp_reg_wen   : if ex_from_fp_rs ? fp_rs_issue_fp_wen : if ex_from_rs || ex_from_srs ? 1'b0 : if ex_from_lq ? lq_reinject_is_fp : id_fp_reg_wen,
+        i_fpu_op       : if ex_from_fp_rs ? fp_rs_issue_fpu_op : if ex_from_rs || ex_from_srs || ex_from_lq ? 6'd0 : id_fpu_op          ,
+        i_fp_rm        : if ex_from_fp_rs ? fp_rs_issue_rm : if ex_from_rs || ex_from_srs || ex_from_lq ? 3'd0 : id_fp_rm               ,
         // Direct-path FP ops also read through fp_rat → FP ROB to avoid
         // stale-regfile reads when a producer is still in flight via the
         // FP RS. Pattern parallels integer i_rs1_data's rat→rob read mux.
         i_fp_rs1_data  : if ex_from_fp_rs ? fp_rs_issue_s1_data
-                       : if ex_from_rs || ex_from_srs ? 64'd0
+                       : if ex_from_rs || ex_from_srs || ex_from_lq ? 64'd0
                        : if fp_rat_id_rs1_valid && fp_rob_read1_epoch == fp_rat_id_rs1_rob_epoch
                            ? fp_rob_read1_data
                        : id_fp_rs1_data                                                                                                ,
         i_fp_rs2_data  : if ex_from_fp_rs ? fp_rs_issue_s2_data
-                       : if ex_from_rs || ex_from_srs ? 64'd0
+                       : if ex_from_rs || ex_from_srs || ex_from_lq ? 64'd0
                        : if fp_rat_id_rs2_valid && fp_rob_read2_epoch == fp_rat_id_rs2_rob_epoch
                            ? fp_rob_read2_data
                        : id_fp_rs2_data                                                                                                ,
-        i_fp_rs3_data  : if ex_from_fp_rs ? fp_rs_issue_s3_data : if ex_from_rs || ex_from_srs ? 64'd0 : id_fp_rs3_data                ,
+        i_fp_rs3_data  : if ex_from_fp_rs ? fp_rs_issue_s3_data : if ex_from_rs || ex_from_srs || ex_from_lq ? 64'd0 : id_fp_rs3_data  ,
         i_frm          : csr_frm                                                                                                        ,
         i_fs           : csr_fs                                                                                                         ,
-        i_is_csr       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_is_csr                                              ,
-        i_csr_addr     : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 12'd0 : id_csr_addr                                           ,
+        i_is_csr       : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_csr                                ,
+        i_csr_addr     : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 12'd0 : id_csr_addr                             ,
         i_csr_rdata    : csr_rdata                                                                                                      ,
         // Forwarding: disabled for RS issue (operands pre-resolved).
         // For direct path: detect stale forwarding by comparing the forwarding
@@ -2089,14 +2123,14 @@ pub module heliodor_top #(
         // Note: removed rob_completed → NONE override — the standard forwarding
         // from MEM_WB handles the WB data correctly and avoids the stale-regfile
         // race condition that occurs when ROB commit clears the RAT.
-        i_fwd_a           : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE
+        i_fwd_a           : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? pipeline_pkg::FwdSel::NONE
                           : if direct_path_operand_captured_q ? pipeline_pkg::FwdSel::NONE
                           : if rat_id_rs1_valid && fwd_a != pipeline_pkg::FwdSel::NONE
                             && ((fwd_a == pipeline_pkg::FwdSel::EX_MEM && (ex_rob_idx != rat_id_rs1_rob_idx || ex_epoch != rat_id_rs1_rob_epoch))
                              || (fwd_a == pipeline_pkg::FwdSel::MEM_WB && (mem_rob_idx != rat_id_rs1_rob_idx || mem_epoch != rat_id_rs1_rob_epoch || mem_was_lq)))
                             ? pipeline_pkg::FwdSel::NONE
                           : fwd_a                                                      ,
-        i_fwd_b           : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE
+        i_fwd_b           : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? pipeline_pkg::FwdSel::NONE
                           : if direct_path_operand_captured_q ? pipeline_pkg::FwdSel::NONE
                           : if rat_id_rs2_valid && fwd_b != pipeline_pkg::FwdSel::NONE
                             && ((fwd_b == pipeline_pkg::FwdSel::EX_MEM && (ex_rob_idx != rat_id_rs2_rob_idx || ex_epoch != rat_id_rs2_rob_epoch))
@@ -2105,9 +2139,9 @@ pub module heliodor_top #(
                           : fwd_b                                                      ,
         i_fp_fwd_exmem    : _fwd_exmem_data                                           ,
         i_fp_fwd_memwb    : wb_data                                                   ,
-        i_fp_fwd_a        : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE : fp_fwd_a,
-        i_fp_fwd_b        : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE : fp_fwd_b,
-        i_fp_fwd_c        : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::FwdSel::NONE : fp_fwd_c,
+        i_fp_fwd_a        : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? pipeline_pkg::FwdSel::NONE : fp_fwd_a,
+        i_fp_fwd_b        : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? pipeline_pkg::FwdSel::NONE : fp_fwd_b,
+        i_fp_fwd_c        : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? pipeline_pkg::FwdSel::NONE : fp_fwd_c,
         i_stall           : stall_ex                                                   ,
         i_flush           : flush_ex                                                   ,
         o_valid           : ex_valid         ,
@@ -2134,8 +2168,8 @@ pub module heliodor_top #(
         o_fp_fflags_wen   : ex_fp_fflags_wen ,
         o_fp_fflags_ex    : fp_fflags_ex     ,
         o_fp_fflags_ex_wen: fp_fflags_ex_wen ,
-        i_predict_taken   : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 1'b0 : id_predict_taken ,
-        i_predict_target  : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 64'd0 : id_predict_target,
+        i_predict_taken   : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_predict_taken ,
+        i_predict_target  : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 64'd0 : id_predict_target,
         o_branch_taken    : ex_branch_taken  ,
         o_dbg_fwd_rs1     : ex_dbg_fwd_rs1   ,
         o_dbg_fwd_rs2     : ex_dbg_fwd_rs2   ,
@@ -2384,7 +2418,7 @@ pub module heliodor_top #(
     // Direct (non-LQ) WB completion — drives ROB port 1 and CDB1's
     // normal source. LQ-captured loads (mem_was_lq) complete via port 3
     // (lq_retire) and use the CDB1 LQ source below.
-    let normal_wb_complete: logic = mem_valid && !mem_mshr_absorbed && !mem_was_lq;
+    let normal_wb_complete: logic = mem_valid && !mem_mshr_absorbed && !mem_was_lq && !mem_from_lq;
     // LQ retire is already MEM-sync gated (head.rob == mem_rob_idx when
     // it fires), so it's functionally equivalent to normal_wb_complete
     // for captured loads — just a different data source.
@@ -2749,23 +2783,25 @@ pub module heliodor_top #(
     let id_load_rs1_pending: logic = id_is_lq_pending_eligible && id_direct_stall_rs1
         && !id_direct_stall_rs2 && !fp_id_direct_stall_rs1 && !fp_id_direct_stall_rs2;
     // Fire LQ-ID alloc when: load has pending rs1, LQ has room, ROB is not
-    // full (or already allocated), no flush, not already dispatched via LQ.
-    // GATE OFF for now — the ex_from_lq EX mux + pipeline flag are not yet
-    // wired; enabling this without the consumer deadlocks the pending load.
-    let _lq_id_alloc_fire_eligible: logic = id_load_rs1_pending
+    // full (or already allocated), not already dispatched via LQ.
+    // Note: !flush_id is intentionally NOT in this expression — gating on it
+    // closes a comb loop (flush_id ← ex_misprediction ← execute.i_valid ←
+    // ex_in_valid ← direct_path_v ← !id_direct_stall ← !lq_id_alloc_fire).
+    // flush_id squashes any wrong-path LQ entry via the squash mask anyway,
+    // so we land the gate at the LQ instance instead.
+    assign lq_id_alloc_fire = id_load_rs1_pending
                            && lq_alloc_ready
                            && (!rob_full || id_has_rob)
-                           && !flush_id
                            && !lq_id_dispatched_q
                            && !rob_drain_needed
                            && !srs_drain_needed;
-    assign lq_id_alloc_fire = 1'b0; // Stage 2 trigger — disabled until reinject mux lands
     assign lq_id_s1_ready = 1'b0;
     assign lq_id_s1_tag   = rat_id_rs1_rob_idx;
     assign lq_id_s1_epoch = rat_id_rs1_rob_epoch;
     assign lq_id_s1_data  = 64'd0;
-    // Reinject consumer — wired to ex_from_lq in a follow-up step.
-    assign lq_reinject_fire = 1'b0;
+    // Re-inject is consumed by EX whenever the mux selects ex_from_lq and
+    // EX isn't stalled (stall_ex would re-fire next cycle anyway).
+    assign lq_reinject_fire = ex_from_lq && !stall_ex;
 
     // rs_yield is set in heliodor_top main always_ff (reset block)
     always_comb {
@@ -2791,6 +2827,7 @@ pub module heliodor_top #(
         // SRS-eligible stores are excluded — they flow through SRS instead.
         direct_path_v = id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !rs_yield
                       && (!rob_full || id_has_rob) && !id_direct_stall
+                      && !lq_id_alloc_fire && !lq_id_dispatched_q
                       && !(direct_path_dispatched_q && id_direct_oneshot_scope);
     }
 
@@ -3530,11 +3567,19 @@ pub module heliodor_top #(
     // `mem_was_lq=1` still suppresses port 1, orphaning the completion.
     // Not observed in practice (LQ fills to 8 would require 8 hits
     // stacked behind a single pending miss) but structurally required.
-    let lq_load_common_gate: logic = mmu_ren_out && !ex_is_amo && !mem_crosses_dw && !is_mmio && !stall_ex && lq_alloc_ready;
+    // P3.2 Stage 2b: a re-injected load already has an LQ entry, so suppress
+    // the EX/MEM-stage alloc gate. The dcache return is routed back to the
+    // existing entry via lq_cp_idx_mux below.
+    let lq_load_common_gate: logic = mmu_ren_out && !ex_is_amo && !mem_crosses_dw && !is_mmio && !stall_ex && lq_alloc_ready && !mem_from_lq;
     let lq_hit_case        : logic = lq_load_common_gate && mmu_rdata_valid && !dcache_stall_raw;
     assign lq_alloc_gate = lq_hit_case || (lq_load_common_gate && mshr_absorb);
     // LQ complete gate (hit-case only): data arrives same cycle as alloc.
     let lq_complete_gate: logic = lq_hit_case;
+    // Re-injected load: dcache hit returns data this cycle. Fire complete
+    // for the existing LQ idx so the entry transitions to data_ready.
+    let lq_reinject_complete_gate: logic = mem_from_lq && mmu_ren_out && mmu_rdata_valid
+                                        && !dcache_stall_raw && !ex_is_amo && !mem_crosses_dw
+                                        && !is_mmio && !stall_ex;
 
     // LQ-4.3: dcache-hit response → LQ complete path. Infrastructure
     // only — `lq_dc_hit_ok` is tied to 0 today (dcache_sel_lq is 0 in
@@ -3564,14 +3609,19 @@ pub module heliodor_top #(
         }
     }
     let lq_dc_hit_ok  : logic     = 1'b0; // LQ-4.4 will enable
-    let lq_cp_valid_mux: logic     = lq_complete_gate || lq_dc_hit_ok;
-    let lq_cp_idx_mux  : logic<3>  = if lq_dc_hit_ok ? lq_issue_idx : lq_alloc_idx;
+    // Complete-source priority: re-injected load (existing entry, idx from
+    // pipeline reg) > LQ→dcache issue (LQ-4.4 path, idx from issue mux) >
+    // EX/MEM hit-case (idx = freshly alloc'd tail).
+    let lq_cp_valid_mux: logic     = lq_complete_gate || lq_dc_hit_ok || lq_reinject_complete_gate;
+    let lq_cp_idx_mux  : logic<3>  = if lq_reinject_complete_gate ? mem_reinject_idx
+                                    : if lq_dc_hit_ok ? lq_issue_idx
+                                    : lq_alloc_idx;
     let lq_cp_data_mux : logic<64> = if lq_dc_hit_ok ? lq_dc_extended : mem_load_data;
 
     inst u_load_queue: load_queue (
         clk                                                      ,
         rst                                                      ,
-        i_alloc_valid   : lq_alloc_gate || lq_id_alloc_fire       ,
+        i_alloc_valid   : lq_alloc_gate || (lq_id_alloc_fire && !flush_id),
         i_alloc_rob     : if lq_id_alloc_fire ? id_rob_idx : ex_rob_idx,
         i_alloc_epoch   : if lq_id_alloc_fire ? id_epoch   : ex_epoch  ,
         i_alloc_rd      : if lq_id_alloc_fire ? id_rd_addr : ex_rd_addr,
