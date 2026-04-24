@@ -200,6 +200,10 @@ pub module heliodor_top #(
     // SRS-3 scaffolding: set when an SRS-issued store is in EX/MEM. Stays 0
     // in SRS-2 observational mode (no SRS→EX wiring yet).
     var ex_from_srs_q     : logic    ;
+    // Effective VA of the SRS-issued store sitting in MEM this cycle.
+    // Latched at the EX→MEM transition; read by the direct-path load
+    // drain check so loads that don't alias can skip the stall.
+    var ex_from_srs_q_addr: logic<64>;
     // SRS alias probe result — see srs_drain_needed.
     var srs_probe_alias   : logic    ;
     // CDB signals (must be declared before RS instantiation which reads them)
@@ -1443,6 +1447,7 @@ pub module heliodor_top #(
             direct_path_rs1_q = 64'd0;
             direct_path_rs2_q = 64'd0;
             ex_from_srs_q   = 1'b0;
+            ex_from_srs_q_addr = 64'd0;
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
@@ -1667,6 +1672,10 @@ pub module heliodor_top #(
                     ex_epoch      = srs_issue_epoch;
                     ex_from_rs_q  = 1'b0;
                     ex_from_srs_q = 1'b1;
+                    // Effective VA = base + immediate. Used by the direct-
+                    // path load drain probe so subsequent loads can skip
+                    // the stall when they don't alias this in-flight store.
+                    ex_from_srs_q_addr = srs_issue_s1_data + srs_issue_imm;
                 } else if fp_rs_issue_valid {
                     ex_rob_idx    = fp_rs_issue_rob;
                     ex_epoch      = fp_rs_issue_epoch;
@@ -2625,16 +2634,38 @@ pub module heliodor_top #(
     // spurious kernel store page fault during /init uaccess under SRS-3c.
     // Drain SRS before any CSR op to preserve permission ordering.
     //
-    // Direct-path LOAD relaxation: only drain when the load's effective VA
-    // is on the same 8B line as some queued store (srs_probe_alias). Stores
-    // whose base isn't resolved yet are conservatively flagged as aliases
-    // inside the SRS probe. AMO / CSR / non-SRS stores keep blanket drain.
-    let srs_inflight     : logic = !srs_empty || srs_issue_valid || ex_from_srs_q;
-    let srs_load_drain   : logic = id_mem_ren
-                                 && (srs_probe_alias || srs_issue_valid || ex_from_srs_q);
-    let srs_other_drain  : logic = (id_is_amo || id_is_csr
-                                 || (id_mem_wen && !id_is_srs_eligible)) && srs_inflight;
-    let srs_drain_needed : logic = srs_load_drain || srs_other_drain;
+    // Direct-path LOAD relaxation: drain only when the load's effective VA
+    // may overlap a pending store's bytes (±1 8B line compare, handling
+    // misaligned ops). Covers two of the three stages of a pending store:
+    //   - Queued in SRS — checked by srs_probe_alias
+    //   - In MEM stage — ex_from_srs_q_alias using the latched addr
+    // The intermediate srs_issue_valid case (store at EX comb) keeps an
+    // unconditional drain: relaxing it allows direct_path_v=1 while SRS
+    // asserts o_issue_valid, which the SRS protocol treats as "downstream
+    // held" — SRS would either overwrite its own output with the next
+    // entry or starve the store forever, depending on the next entry's
+    // readiness. Safe to relax once SRS grows an ack/commit handshake.
+    // Stores whose base isn't resolved inside SRS are conservatively
+    // flagged as aliases by the probe. AMO / CSR / non-SRS stores keep
+    // blanket drain whenever any stage is in flight.
+    let id_load_probe_addr: logic<64> = (
+        if rat_id_rs1_valid && rob_read1_epoch == rat_id_rs1_rob_epoch && rob_read1_completed ? rob_read1_data
+        : if fwd_a == pipeline_pkg::FwdSel::EX_MEM ? ex_alu_out
+        : if fwd_a == pipeline_pkg::FwdSel::MEM_WB ? wb_data
+        : id_rs1_data
+    ) + id_imm;
+    let id_load_line       : logic<61> = id_load_probe_addr[63:3];
+    let ex_srs_q_line      : logic<61> = ex_from_srs_q_addr[63:3];
+    let ex_from_srs_q_alias: logic = ex_from_srs_q && (
+        ex_srs_q_line == id_load_line
+     || ex_srs_q_line + 61'd1 == id_load_line
+     || id_load_line + 61'd1 == ex_srs_q_line);
+    let srs_inflight   : logic = !srs_empty || srs_issue_valid || ex_from_srs_q;
+    let srs_load_drain : logic = id_mem_ren
+                              && (srs_probe_alias || srs_issue_valid || ex_from_srs_q_alias);
+    let srs_other_drain: logic = (id_is_amo || id_is_csr
+                                || (id_mem_wen && !id_is_srs_eligible)) && srs_inflight;
+    let srs_drain_needed: logic = srs_load_drain || srs_other_drain;
 
     // rs_yield is set in heliodor_top main always_ff (reset block)
     always_comb {
@@ -2845,14 +2876,7 @@ pub module heliodor_top #(
         i_squash_valid     : ex_misprediction             ,
         i_squash_mask      : rob_squash_mask              ,
         // Load alias probe: effective VA = forwarded rs1 + id_imm.
-        // Stages checked in priority order: ROB (producer completed), then
-        // EX_MEM / MEM_WB bypass, then the raw id_rs1_data regfile read.
-        i_probe_addr       : ((
-            if rat_id_rs1_valid && rob_read1_epoch == rat_id_rs1_rob_epoch && rob_read1_completed ? rob_read1_data
-            : if fwd_a == pipeline_pkg::FwdSel::EX_MEM ? ex_alu_out
-            : if fwd_a == pipeline_pkg::FwdSel::MEM_WB ? wb_data
-            : id_rs1_data
-        ) + id_imm)                                       ,
+        i_probe_addr       : id_load_probe_addr           ,
         o_probe_alias      : srs_probe_alias              ,
         o_count            : srs_count                    ,
         o_full             : srs_full                     ,
