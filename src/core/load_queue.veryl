@@ -21,6 +21,7 @@ pub module load_queue (
     i_alloc_rd     : input  logic<5> ,
     i_alloc_funct3 : input  logic<3> , // size + signedness
     i_alloc_is_fp  : input  logic    , // FP load (NaN-box for FLW)
+    i_alloc_pc     : input  logic<64>, // load PC (for re-inject at Stage 2)
     // P3.2 Stage 1: rs1 tracking for OoO load issue. When a load is
     // dispatched with an unresolved rs1, the caller sets s1_ready=0 and
     // supplies the producer's rob/epoch via s1_tag/s1_epoch. LQ captures
@@ -32,6 +33,10 @@ pub module load_queue (
     i_alloc_s1_epoch: input  logic<2> ,
     i_alloc_s1_data : input  logic<64>,
     i_alloc_imm     : input  logic<64>,
+    // `i_alloc_pending` marks the alloc as "ID-stage, pending execution"
+    // rather than "EX/MEM-stage capture of completed dcache access". The
+    // former is re-injected later; the latter is data-ready at alloc.
+    i_alloc_pending : input  logic    ,
     o_alloc_ready  : output logic    ,
     o_alloc_idx    : output logic<3> , // LQ index assigned to this load
 
@@ -76,6 +81,23 @@ pub module load_queue (
 
     // ----- Flush (trap) -----
     i_flush: input logic,
+
+    // ----- Re-inject (Stage 2) -----
+    // When an ID-stage pending alloc has its s1 resolved and no earlier
+    // pending entry is re-injecting, emit the load back into the EX
+    // pipeline. EX computes addr via s1_data + imm (like SRS), MMU
+    // translates, MEM accesses dcache, and i_complete_* returns data.
+    o_reinject_valid : output logic    ,
+    o_reinject_pc    : output logic<64>,
+    o_reinject_rob   : output logic<5> ,
+    o_reinject_epoch : output logic<2> ,
+    o_reinject_rd    : output logic<5> ,
+    o_reinject_funct3: output logic<3> ,
+    o_reinject_is_fp : output logic    ,
+    o_reinject_s1    : output logic<64>,
+    o_reinject_imm   : output logic<64>,
+    o_reinject_idx   : output logic<3> ,
+    i_reinject_fire  : input  logic    , // EX consumed the re-inject this cycle
 
     // ----- CDB (Stage 1 scaffold) -----
     // For pending-rs1 loads: wake when a matching producer broadcasts.
@@ -134,6 +156,12 @@ pub module load_queue (
     var s1_epoch  : logic<2> [8];
     var s1_data   : logic<64>[8];
     var e_imm     : logic<64>[8];
+    var e_pc      : logic<64>[8];
+    // `pending[i]=1` → entry was alloc'd at ID and awaits re-inject.
+    // `reissued[i]=1` → entry was re-injected and awaits dcache return.
+    // `data_ready[i]=1` (set by i_complete_*) → ready to retire.
+    var pending   : logic    [8];
+    var reissued  : logic    [8];
 
     // Circular FIFO head (oldest) / tail (next alloc)
     var head: logic<4>;
@@ -174,6 +202,36 @@ pub module load_queue (
     assign o_issue_addr   = e_addr  [issue_sel];
     assign o_issue_funct3 = e_funct3[issue_sel];
     assign o_issue_is_fp  = e_is_fp [issue_sel];
+
+    // ============================================================
+    // Re-inject: oldest pending entry with s1 resolved.
+    // Walks head→tail (FIFO order). Entries with `pending[i]` awaiting
+    // s1 wake; once `s1_ready[i]` they can re-inject into the EX
+    // pipeline. `reissued[i]` gates against double-injection while the
+    // re-injected load is in flight through EX/MEM/dcache.
+    // ============================================================
+    var reinject_found_comb: logic   ;
+    var reinject_sel_comb  : logic<3>;
+    always_comb {
+        reinject_found_comb = 1'b0;
+        reinject_sel_comb   = 3'd0;
+        for i in 0..8 {
+            if valid[i] && pending[i] && !reissued[i] && s1_ready[i] && !reinject_found_comb {
+                reinject_found_comb = 1'b1;
+                reinject_sel_comb   = i[2:0];
+            }
+        }
+    }
+    assign o_reinject_valid  = reinject_found_comb;
+    assign o_reinject_pc     = e_pc    [reinject_sel_comb];
+    assign o_reinject_rob    = e_rob   [reinject_sel_comb];
+    assign o_reinject_epoch  = e_epoch [reinject_sel_comb];
+    assign o_reinject_rd     = e_rd    [reinject_sel_comb];
+    assign o_reinject_funct3 = e_funct3[reinject_sel_comb];
+    assign o_reinject_is_fp  = e_is_fp [reinject_sel_comb];
+    assign o_reinject_s1     = s1_data [reinject_sel_comb];
+    assign o_reinject_imm    = e_imm   [reinject_sel_comb];
+    assign o_reinject_idx    = reinject_sel_comb;
     assign o_issue_rob    = e_rob   [issue_sel];
     assign o_issue_idx    = issue_sel;
 
@@ -247,6 +305,9 @@ pub module load_queue (
                 s1_epoch[i]   = 2'd0;
                 s1_data[i]    = 64'd0;
                 e_imm[i]      = 64'd0;
+                e_pc[i]       = 64'd0;
+                pending[i]    = 1'b0;
+                reissued[i]   = 1'b0;
             }
         } else {
             if i_flush {
@@ -256,6 +317,8 @@ pub module load_queue (
                     valid[i]      = 1'b0;
                     addr_ready[i] = 1'b0;
                     data_ready[i] = 1'b0;
+                    pending[i]    = 1'b0;
+                    reissued[i]   = 1'b0;
                 }
             } else {
                 // Squash: invalidate entries in squash bitmap
@@ -265,6 +328,8 @@ pub module load_queue (
                             valid[i]      = 1'b0;
                             addr_ready[i] = 1'b0;
                             data_ready[i] = 1'b0;
+                            pending[i]    = 1'b0;
+                            reissued[i]   = 1'b0;
                         }
                     }
                 }
@@ -294,6 +359,9 @@ pub module load_queue (
                     e_rd      [tail_idx] = i_alloc_rd;
                     e_funct3  [tail_idx] = i_alloc_funct3;
                     e_is_fp   [tail_idx] = i_alloc_is_fp;
+                    e_pc      [tail_idx] = i_alloc_pc;
+                    pending   [tail_idx] = i_alloc_pending;
+                    reissued  [tail_idx] = 1'b0;
                     // P3.2 Stage 1: capture rs1 state + imm at alloc. Same-cycle
                     // CDB bypass matches the RS/SRS convention: if a matching
                     // CDB is live this cycle, latch its data and mark ready.
@@ -320,6 +388,16 @@ pub module load_queue (
                         addr_ready[tail_idx] = 1'b1;
                     }
                     tail = tail + 4'd1;
+                }
+
+                // Re-inject consumption: when EX accepts the re-inject, mark
+                // the entry as issued so it doesn't re-fire. addr_ready is
+                // also set since s1_data + e_imm is now effectively computed
+                // (memory.veryl receives the VA for MMU translation).
+                if i_reinject_fire && reinject_found_comb {
+                    reissued  [reinject_sel_comb] = 1'b1;
+                    addr_ready[reinject_sel_comb] = 1'b1;
+                    e_addr    [reinject_sel_comb] = s1_data[reinject_sel_comb] + e_imm[reinject_sel_comb];
                 }
 
                 // Completion targeting an already-valid (pre-alloc) entry.

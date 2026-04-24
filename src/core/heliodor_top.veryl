@@ -162,6 +162,10 @@ pub module heliodor_top #(
     var mem_is_div: logic;
     // RS dispatched tracking (prevents double-dispatch when ID stalls)
     var rs_dispatched_q: logic;
+    // P3.2 Stage 2: latch when a load was LQ-dispatched at ID — prevents
+    // re-dispatching the same instruction on subsequent cycles while ID
+    // still holds it (e.g. waiting for stall_ex to clear).
+    var lq_id_dispatched_q: logic;
     // Direct-path dispatched tracking: set when a direct-path instruction
     // enters EX, cleared when ID advances / flushes. Prevents re-firing of
     // direct_path_v when ID stalls across multiple cycles — without this,
@@ -371,6 +375,23 @@ pub module heliodor_top #(
     var lq_count       : logic<4>;
     var lq_full        : logic   ;
     var lq_empty       : logic   ;
+    // P3.2 Stage 2: ID-stage pending-rs1 alloc + LQ re-inject signals.
+    var lq_id_alloc_fire : logic    ;
+    var lq_id_s1_ready   : logic    ;
+    var lq_id_s1_tag     : logic<5> ;
+    var lq_id_s1_epoch   : logic<2> ;
+    var lq_id_s1_data    : logic<64>;
+    var lq_reinject_valid : logic    ;
+    var lq_reinject_pc    : logic<64>;
+    var lq_reinject_rob   : logic<5> ;
+    var lq_reinject_epoch : logic<2> ;
+    var lq_reinject_rd    : logic<5> ;
+    var lq_reinject_funct3: logic<3> ;
+    var lq_reinject_is_fp : logic    ;
+    var lq_reinject_s1    : logic<64>;
+    var lq_reinject_imm   : logic<64>;
+    var lq_reinject_idx   : logic<3> ;
+    var lq_reinject_fire  : logic    ; // = ex_from_lq — EX accepts reinject this cycle
     // ROB read port outputs (for RS operand resolution at dispatch)
     var rob_read1_data     : logic<64>;
     var rob_read1_completed: logic    ;
@@ -1465,6 +1486,7 @@ pub module heliodor_top #(
             _ex_rob_idx_q   = 5'd0;
             rs_dispatched_q = 1'b0;
             srs_dispatched_q = 1'b0;
+            lq_id_dispatched_q = 1'b0;
             direct_path_dispatched_q = 1'b0;
             direct_path_operand_captured_q = 1'b0;
             direct_path_rs1_q = 64'd0;
@@ -1624,6 +1646,14 @@ pub module heliodor_top #(
                 srs_dispatched_q = 1'b0;
             } else if srs_dispatch_valid {
                 srs_dispatched_q = 1'b1;
+            }
+
+            // LQ-ID dispatched tracking: load was alloc'd to LQ at ID — do
+            // not re-dispatch while ID still holds the same instruction.
+            if flush_id || !stall_id {
+                lq_id_dispatched_q = 1'b0;
+            } else if lq_id_alloc_fire {
+                lq_id_dispatched_q = 1'b1;
             }
 
             // Direct-path dispatched tracking: set when direct_path_v fires
@@ -2708,13 +2738,46 @@ pub module heliodor_top #(
     let p34_load_younger: logic   = p34_load_dist >: p34_store_dist;
     let p34_spec_violation: logic = srs_wake_valid && lq_probe_hit && p34_load_younger;
 
+    // P3.2 Stage 2: integer loads with pending rs1 can side-step direct-path
+    // stall by allocating an LQ entry that waits for CDB wake, then
+    // re-injects into EX once s1 resolves. AMO/FP/cross-DW stay on the
+    // direct path (cross-DW is unknowable at ID — tolerated because
+    // direct_stall_rs1 gates on resolvable rs1 only).
+    let id_is_lq_pending_eligible: logic = id_valid && id_mem_ren && !id_mem_wen
+        && !id_is_amo && !id_is_fp
+        && !id_is_csr && !id_is_ecall && !id_is_ebreak && !id_illegal;
+    let id_load_rs1_pending: logic = id_is_lq_pending_eligible && id_direct_stall_rs1
+        && !id_direct_stall_rs2 && !fp_id_direct_stall_rs1 && !fp_id_direct_stall_rs2;
+    // Fire LQ-ID alloc when: load has pending rs1, LQ has room, ROB is not
+    // full (or already allocated), no flush, not already dispatched via LQ.
+    // GATE OFF for now — the ex_from_lq EX mux + pipeline flag are not yet
+    // wired; enabling this without the consumer deadlocks the pending load.
+    let _lq_id_alloc_fire_eligible: logic = id_load_rs1_pending
+                           && lq_alloc_ready
+                           && (!rob_full || id_has_rob)
+                           && !flush_id
+                           && !lq_id_dispatched_q
+                           && !rob_drain_needed
+                           && !srs_drain_needed;
+    assign lq_id_alloc_fire = 1'b0; // Stage 2 trigger — disabled until reinject mux lands
+    assign lq_id_s1_ready = 1'b0;
+    assign lq_id_s1_tag   = rat_id_rs1_rob_idx;
+    assign lq_id_s1_epoch = rat_id_rs1_rob_epoch;
+    assign lq_id_s1_data  = 64'd0;
+    // Reinject consumer — wired to ex_from_lq in a follow-up step.
+    assign lq_reinject_fire = 1'b0;
+
     // rs_yield is set in heliodor_top main always_ff (reset block)
     always_comb {
         // Direct-path stall: operand depends on in-flight RS instruction whose
         // result isn't available yet (not completed in ROB, not in forwarding path).
         // Also drain ROB before exception-causing instructions.
         // SRS-eligible stores bypass direct-path and are not evaluated here.
-        id_direct_stall = !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && (id_direct_stall_rs1 || id_direct_stall_rs2
+        // LQ-pending-eligible loads also bypass direct-path once we commit
+        // them to the LQ re-inject queue; until then they remain a stall.
+        id_direct_stall = !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible
+                       && !lq_id_alloc_fire
+                       && (id_direct_stall_rs1 || id_direct_stall_rs2
                                                 || fp_id_direct_stall_rs1 || fp_id_direct_stall_rs2
                                                || rob_drain_needed
                                                || srs_drain_needed);
@@ -3508,21 +3571,21 @@ pub module heliodor_top #(
     inst u_load_queue: load_queue (
         clk                                                      ,
         rst                                                      ,
-        i_alloc_valid   : lq_alloc_gate                          ,
-        i_alloc_rob     : ex_rob_idx                             ,
-        i_alloc_epoch   : ex_epoch                               ,
-        i_alloc_rd      : ex_rd_addr                             ,
-        i_alloc_funct3  : ex_mem_funct3                          ,
-        i_alloc_is_fp   : ex_is_fp                               ,
-        // Stage 1 scaffold: addr is already resolved at alloc time (this
-        // path fires from EX/MEM after dcache), so s1_ready=1 and the
-        // s1_* / imm carry safe placeholders. Stage 2 switches pending-rs1
-        // loads onto a second alloc path with real CDB wake.
-        i_alloc_s1_ready: 1'b1                                   ,
-        i_alloc_s1_tag  : 5'd0                                   ,
-        i_alloc_s1_epoch: 2'd0                                   ,
-        i_alloc_s1_data : mmu_paddr                              ,
-        i_alloc_imm     : 64'd0                                  ,
+        i_alloc_valid   : lq_alloc_gate || lq_id_alloc_fire       ,
+        i_alloc_rob     : if lq_id_alloc_fire ? id_rob_idx : ex_rob_idx,
+        i_alloc_epoch   : if lq_id_alloc_fire ? id_epoch   : ex_epoch  ,
+        i_alloc_rd      : if lq_id_alloc_fire ? id_rd_addr : ex_rd_addr,
+        i_alloc_funct3  : if lq_id_alloc_fire ? id_mem_funct3 : ex_mem_funct3,
+        i_alloc_is_fp   : if lq_id_alloc_fire ? id_is_fp   : ex_is_fp ,
+        i_alloc_pc      : if lq_id_alloc_fire ? id_pc      : ex_pc    ,
+        // EX/MEM-stage alloc has addr pre-resolved (via mmu_paddr); ID-stage
+        // pending alloc captures s1_tag/epoch and waits for CDB wake.
+        i_alloc_s1_ready: if lq_id_alloc_fire ? lq_id_s1_ready : 1'b1 ,
+        i_alloc_s1_tag  : if lq_id_alloc_fire ? lq_id_s1_tag   : 5'd0 ,
+        i_alloc_s1_epoch: if lq_id_alloc_fire ? lq_id_s1_epoch : 2'd0 ,
+        i_alloc_s1_data : if lq_id_alloc_fire ? lq_id_s1_data  : mmu_paddr,
+        i_alloc_imm     : if lq_id_alloc_fire ? id_imm         : 64'd0,
+        i_alloc_pending : lq_id_alloc_fire                            ,
         o_alloc_ready   : lq_alloc_ready                         ,
         o_alloc_idx     : lq_alloc_idx                           ,
         i_addr_valid    : lq_alloc_gate                          ,
@@ -3571,6 +3634,18 @@ pub module heliodor_top #(
         o_probe_hit     : lq_probe_hit                           ,
         o_probe_hit_rob : lq_probe_hit_rob                       ,
         o_probe_hit_epoch: lq_probe_hit_epoch                    ,
+        // P3.2 Stage 2: re-inject path for ID-stage pending-rs1 loads.
+        o_reinject_valid : lq_reinject_valid                     ,
+        o_reinject_pc    : lq_reinject_pc                        ,
+        o_reinject_rob   : lq_reinject_rob                       ,
+        o_reinject_epoch : lq_reinject_epoch                     ,
+        o_reinject_rd    : lq_reinject_rd                        ,
+        o_reinject_funct3: lq_reinject_funct3                    ,
+        o_reinject_is_fp : lq_reinject_is_fp                     ,
+        o_reinject_s1    : lq_reinject_s1                        ,
+        o_reinject_imm   : lq_reinject_imm                       ,
+        o_reinject_idx   : lq_reinject_idx                       ,
+        i_reinject_fire  : lq_reinject_fire                      ,
         o_count         : lq_count                               ,
         o_full          : lq_full                                ,
         o_empty         : lq_empty                               ,
