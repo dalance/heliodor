@@ -224,6 +224,9 @@ pub module heliodor_top #(
     var lq_reinject_idx_q : logic<3> ;
     var mem_from_lq       : logic    ;
     var mem_reinject_idx  : logic<3> ;
+    // WB-stage flag: load was re-injected from LQ. Used to gate the
+    // normal regfile write so the LQ retire path is the only writer.
+    var wb_from_lq        : logic    ;
     // SRS alias probe result — see srs_drain_needed.
     var srs_probe_alias           : logic;
     // Subset of srs_probe_alias: set when the alias=1 is driven solely by
@@ -1504,6 +1507,7 @@ pub module heliodor_top #(
             lq_reinject_idx_q = 3'd0;
             mem_from_lq     = 1'b0;
             mem_reinject_idx = 3'd0;
+            wb_from_lq      = 1'b0;
         } else {
             // Track mret/sret for 1-cycle interrupt suppression
             xret_taken_q = mret_taken || sret_taken;
@@ -1714,6 +1718,14 @@ pub module heliodor_top #(
                 mem_from_rs = ex_from_rs_q;
                 mem_from_lq = ex_from_lq_q;
                 mem_reinject_idx = lq_reinject_idx_q;
+            }
+            // WB-stage shadow of mem_from_lq, advanced at MEM→WB edge.
+            // Used to gate the normal regfile write so the LQ retire is
+            // the sole writer for re-injected loads.
+            if trap_taken {
+                wb_from_lq = 1'b0;
+            } else if !stall_mem {
+                wb_from_lq = mem_from_lq;
             }
             if flush_ex {
                 ex_rob_idx       = 5'd0;
@@ -2488,7 +2500,7 @@ pub module heliodor_top #(
                           : wb_data;
     assign actual_wb_wen  = if mshr_int_wb ? 1'b1
                           : if rob_commit_valid ? rob_commit_wen
-                          : wb_wen && !mem_from_rs;
+                          : wb_wen && !mem_from_rs && !wb_from_lq;
 
     // FP regfile write port mux (MSHR FP loads not supported, mshr_fp_wb dead)
     assign actual_fp_wb_wen = if mshr_fp_wb ? 1'b1
@@ -3197,9 +3209,12 @@ pub module heliodor_top #(
         clk                                                        ,
         rst                                                        ,
         // Rename at dispatch/EX-entry time to avoid self-reference.
+        // P3.2 Stage 2b: LQ-pending alloc also renames the load's rd so
+        // dependents see rob_idx in RAT (instead of stale regfile/older idx).
         i_rename_valid: (rs_dispatch_valid && rs_dispatch_ready)
                      || (direct_path_v && !stall_ex && id_reg_wen)
-                     || (fp_rs_dispatch_valid && fp_rs_dispatch_ready && id_reg_wen),
+                     || (fp_rs_dispatch_valid && fp_rs_dispatch_ready && id_reg_wen)
+                     || (lq_id_alloc_fire && id_reg_wen),
         i_rename_rd   : id_rd_addr                                 ,
         i_rename_idx  : id_rob_idx                                 ,
         i_rename_epoch: id_epoch                                   ,
@@ -3568,16 +3583,17 @@ pub module heliodor_top #(
     // Not observed in practice (LQ fills to 8 would require 8 hits
     // stacked behind a single pending miss) but structurally required.
     // P3.2 Stage 2b: a re-injected load already has an LQ entry, so suppress
-    // the EX/MEM-stage alloc gate. The dcache return is routed back to the
-    // existing entry via lq_cp_idx_mux below.
-    let lq_load_common_gate: logic = mmu_ren_out && !ex_is_amo && !mem_crosses_dw && !is_mmio && !stall_ex && lq_alloc_ready && !mem_from_lq;
+    // the EX/MEM-stage alloc gate. Use ex_from_lq_q (the EX-stage FF that's
+    // 1 during the load's MEM cycle) — `mem_from_lq` is one cycle late and
+    // sits at WB-stage timing.
+    let lq_load_common_gate: logic = mmu_ren_out && !ex_is_amo && !mem_crosses_dw && !is_mmio && !stall_ex && lq_alloc_ready && !ex_from_lq_q;
     let lq_hit_case        : logic = lq_load_common_gate && mmu_rdata_valid && !dcache_stall_raw;
     assign lq_alloc_gate = lq_hit_case || (lq_load_common_gate && mshr_absorb);
     // LQ complete gate (hit-case only): data arrives same cycle as alloc.
     let lq_complete_gate: logic = lq_hit_case;
     // Re-injected load: dcache hit returns data this cycle. Fire complete
     // for the existing LQ idx so the entry transitions to data_ready.
-    let lq_reinject_complete_gate: logic = mem_from_lq && mmu_ren_out && mmu_rdata_valid
+    let lq_reinject_complete_gate: logic = ex_from_lq_q && mmu_ren_out && mmu_rdata_valid
                                         && !dcache_stall_raw && !ex_is_amo && !mem_crosses_dw
                                         && !is_mmio && !stall_ex;
 
@@ -3613,7 +3629,7 @@ pub module heliodor_top #(
     // pipeline reg) > LQ→dcache issue (LQ-4.4 path, idx from issue mux) >
     // EX/MEM hit-case (idx = freshly alloc'd tail).
     let lq_cp_valid_mux: logic     = lq_complete_gate || lq_dc_hit_ok || lq_reinject_complete_gate;
-    let lq_cp_idx_mux  : logic<3>  = if lq_reinject_complete_gate ? mem_reinject_idx
+    let lq_cp_idx_mux  : logic<3>  = if lq_reinject_complete_gate ? lq_reinject_idx_q
                                     : if lq_dc_hit_ok ? lq_issue_idx
                                     : lq_alloc_idx;
     let lq_cp_data_mux : logic<64> = if lq_dc_hit_ok ? lq_dc_extended : mem_load_data;
