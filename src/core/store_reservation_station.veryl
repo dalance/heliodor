@@ -46,6 +46,11 @@ pub module store_reservation_station (
     o_issue_rob    : output logic    <5> ,
     o_issue_epoch  : output logic    <2> ,
     i_issue_stall  : input  logic        , // EX/MEM cannot accept this cycle
+    // alias-style stall: forces o_issue_valid=0 without holding the FF.
+    // Used to gate the SRS issue against an external alias-probe result;
+    // i_issue_stall would let EX consume the previously-fired store while
+    // the FF is held, double-firing it.
+    i_issue_inhibit: input  logic        ,
 
     // ----- CDB wakeup (3 ports, shared with int RS) -----
     i_cdb0_valid: input logic    ,
@@ -102,6 +107,22 @@ pub module store_reservation_station (
     // LQ re-inject to age-compare against the load and avoid bypassing
     // an older in-flight store.
     o_oldest_rob: output logic<5>,
+
+    // ----- Issue candidate (P3.2 bug (b) fix): combinational view of the
+    // head entry, evaluated BEFORE the o_issue_* registers latch. Used by
+    // an external alias probe to gate i_issue_stall — when an older LQ
+    // load may alias the candidate's 8B line, the probe asserts and the
+    // host stalls SRS. This is intentionally pre-FF: gating o_issue_*
+    // post-FF (i.e., gating ex_from_srs) is too late because the registered
+    // store is already visible to EX.
+    o_cand_valid    : output logic    ,
+    o_cand_addr     : output logic<64>,
+    o_cand_rob      : output logic<5> ,
+    o_cand_epoch    : output logic<2> ,
+    o_cand_s1_ready : output logic    , // FF s1_ready (no comb bypass)
+    o_cand_s1_tag   : output logic<5> , // rs1 producer ROB
+    o_cand_s1_epoch : output logic<2> ,
+    o_cand_funct3   : output logic<3> , // store size (for byte-mask compare)
 ) {
     // ============================================================
     // Entry storage (4 entries, FIFO)
@@ -156,6 +177,30 @@ pub module store_reservation_station (
             || (i_cdb2_valid && s2_tag[head_idx] == i_cdb2_rob && s2_epoch[head_idx] == i_cdb2_epoch);
     }
     let head_ready: logic = valid[head_idx] && head_s1_ready_comb && head_s2_ready_comb;
+
+    // ============================================================
+    // Candidate output: head VA evaluated combinationally with CDB bypass.
+    // Drives external alias probe; result feeds back into i_issue_stall.
+    // ============================================================
+    // CDB bypass for cand: catches wake-cycle race where SRS head s1
+    // resolves on the same CDB as an older LQ load — without bypass,
+    // SRS would fire at this cycle and beat the load to dcache.
+    let head_cand_s1_data: logic<64> =
+        if !s1_ready[head_idx] && i_cdb0_valid && s1_tag[head_idx] == i_cdb0_rob && s1_epoch[head_idx] == i_cdb0_epoch ?
+            i_cdb0_data
+        : if !s1_ready[head_idx] && i_cdb1_valid && s1_tag[head_idx] == i_cdb1_rob && s1_epoch[head_idx] == i_cdb1_epoch ?
+            i_cdb1_data
+        : if !s1_ready[head_idx] && i_cdb2_valid && s1_tag[head_idx] == i_cdb2_rob && s1_epoch[head_idx] == i_cdb2_epoch ?
+            i_cdb2_data
+        : s1_data[head_idx];
+    assign o_cand_valid    = head_ready;
+    assign o_cand_addr     = head_cand_s1_data + e_imm[head_idx];
+    assign o_cand_rob      = e_rob[head_idx];
+    assign o_cand_epoch    = e_epoch[head_idx];
+    assign o_cand_s1_ready = s1_ready[head_idx];
+    assign o_cand_s1_tag   = s1_tag[head_idx];
+    assign o_cand_s1_epoch = s1_epoch[head_idx];
+    assign o_cand_funct3   = e_funct3[head_idx];
 
     // ============================================================
     // Alias probe (±1 8B-line compare)
@@ -273,8 +318,17 @@ pub module store_reservation_station (
                 }
             }
 
-            // Issue output (registered): head entry when both ready.
-            if !i_issue_stall {
+            // Issue output. Two stall semantics:
+            //   i_issue_inhibit=1: force o_issue_valid=0, no pop. Used for
+            //     alias gates where EX must NOT see this store this cycle.
+            //   i_issue_stall=1 (with !inhibit): hold FF. Used for stall_ex
+            //     / direct_path / rs_issue, where the EX mux already
+            //     selects a different source so the held o_issue_valid is
+            //     "informational" and not consumed.
+            //   neither: fire when head_ready, else valid=0.
+            if i_issue_inhibit {
+                o_issue_valid = 1'b0;
+            } else if !i_issue_stall {
                 if head_ready {
                     o_issue_valid   = 1'b1;
                     o_issue_pc      = e_pc[head_idx];
@@ -300,7 +354,7 @@ pub module store_reservation_station (
                     o_issue_valid = 1'b0;
                 }
             }
-            // When i_issue_stall: hold output (o_issue_valid/data unchanged).
+            // When i_issue_stall && !i_issue_inhibit: hold output unchanged.
 
             // Dispatch: allocate at tail. Same-cycle CDB capture for freshly-
             // broadcast operands (dispatch runs AFTER wake/issue above, so
