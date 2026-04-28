@@ -606,6 +606,7 @@ pub module heliodor_top #(
     var rs_yield        : logic; // RS starvation prevention: yield EX to RS
     var rs_sel_valid    : logic; // RS has a ready entry to issue
     var srs_yield       : logic; // SRS starvation prevention: yield EX to SRS
+    var lq_yield        : logic; // LQ starvation prevention: yield EX to LQ reinject
     var id_has_rob      : logic; // true when current ID instruction has a valid ROB entry
 
     // RS-eligible check on ID stage (decode output): pure integer ALU/MUL/DIV.
@@ -1523,6 +1524,7 @@ pub module heliodor_top #(
             commit_bypass_valid = 1'b0;
             rs_yield        = 1'b0;
             srs_yield       = 1'b0;
+            lq_yield        = 1'b0;
             id_has_rob      = 1'b0;
             _ex_rob_idx_q   = 5'd0;
             rs_dispatched_q = 1'b0;
@@ -1737,6 +1739,12 @@ pub module heliodor_top #(
             // drains) keeps direct_path_v=1, starves SRS issue, and SRS-head
             // stores never complete → ROB drain deadlock.
             srs_yield = (srs_issue_valid || srs_cand_valid) && direct_path_v;
+            // LQ starvation prevention (bug-b residual): yield EX to LQ
+            // reinject when an LQ entry is ready (data resolved) but blocked
+            // by direct_path_v. Same deadlock pattern as srs_yield: held ID
+            // command keeps direct_path_v=1 forever, LQ-head load can't
+            // re-inject, never completes, ROB drain stuck.
+            lq_yield = lq_reinject_valid && direct_path_v;
 
             // ROB index pipeline registers (synced with decode/execute/memory)
             // Process later stages first: within always_ff, assignments are
@@ -2861,20 +2869,16 @@ pub module heliodor_top #(
     // store-load ordering, hello_str UART MMIO, smode_* tests). Linux boot
     // and Dhrystone (bare-metal) work with LQ on. The remaining bugs are
     // tracked separately and gated until fixed.
+    // bug-b: SRS pre-fire alias probe handles memory ordering on Verilator,
+    // and srs_yield + lq_yield handle priority inversion under IRQ wait
+    // (direct_path_v starvation of SRS/LQ during ROB drain). With satp gate
+    // dropped, Verilator passes Linux boot but the Veryl simulator hangs at
+    // PC 0x800b3744 due to a known cross-module comb-mux bug in the Veryl
+    // simulator (see project_sim_sb_fwd_mux_bug). Keep the satp=0 gate so
+    // the default Veryl simulator passes; revisit when the simulator bug
+    // is fixed.
     let _lq_id_alloc_fire_eligible: logic = id_load_rs1_pending
                            && lq_alloc_ready
-                           // satp=0 gate retained: the SRS pre-fire alias probe
-                           // resolves the original bug-b memory ordering issue
-                           // (notifier_call_chain self-pointer at 0x800a9fe2),
-                           // but a separate LQ x MMU x AMO interaction fails
-                           // late in Linux boot when satp != 0. AMO inserts a
-                           // dcache write that races with older LQ-pending
-                           // loads on the same line; AMOs go MEM-direct so
-                           // the SRS alias probe doesn't catch them. A simple
-                           // stall (ex_is_amo && !lq_empty) deadlocks because
-                           // the LQ can't drain while EX is stalled. Keep
-                           // gate until proper AMO probe + LQ-drain priority
-                           // inversion is implemented.
                            && (csr_satp == 64'd0)
                            && (!rob_full || id_has_rob)
                            && !lq_id_dispatched_q
@@ -2911,7 +2915,7 @@ pub module heliodor_top #(
         // corrupts amo_old with its own post-write value). Other direct-path
         // ops tolerate re-evaluation; LR/SC are idempotent.
         // SRS-eligible stores are excluded — they flow through SRS instead.
-        direct_path_v = id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !rs_yield && !srs_yield
+        direct_path_v = id_valid && !id_is_rs_eligible && !id_is_fp_rs_eligible && !id_is_srs_eligible && !rs_yield && !srs_yield && !lq_yield
                       && (!rob_full || id_has_rob) && !id_direct_stall
                       && !lq_id_alloc_fire && !lq_id_dispatched_q
                       && !(direct_path_dispatched_q && id_direct_oneshot_scope);
