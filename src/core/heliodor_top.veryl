@@ -253,6 +253,9 @@ pub module heliodor_top #(
     var lq_probe_hit      : logic    ;
     var lq_probe_hit_rob  : logic<5> ;
     var lq_probe_hit_epoch: logic<2> ;
+    // P3.4 (d).1: PC of the probe-hit LQ entry; used as the redirect target
+    // when speculation replay fires.
+    var lq_probe_hit_pc   : logic<64>;
     // CDB signals (must be declared before RS instantiation which reads them)
     var cdb0_valid: logic    ;
     var cdb0_rob  : logic<5> ;
@@ -548,6 +551,23 @@ pub module heliodor_top #(
     var ex_mispred_target: logic                 ;
     var ex_div_busy     : logic                  ;
     var ex_fp_busy      : logic                  ;
+
+    // P3.4 (d).2: replay-latch registers (driven by always_ff later in the
+    // file) and the unified pipeline_squash fabric. Declared/assigned here
+    // up-front so downstream `let` bindings (hazard_unit, IMMU redirect,
+    // fetch redirect, ROB squash) can reference them without forward-ref
+    // errors.
+    var p34_replay_valid_q   : logic    ;
+    var p34_replay_idx_q     : logic<5> ;
+    var p34_replay_epoch_q   : logic<2> ;
+    var p34_replay_pc_q      : logic<64>;
+    var pipeline_squash      : logic    ;
+    var pipeline_branch_target: logic<64>;
+    var pipeline_is_jalr     : logic    ;
+    assign pipeline_squash       = ex_misprediction || p34_replay_valid_q;
+    assign pipeline_branch_target = if p34_replay_valid_q ? p34_replay_pc_q
+                                                          : ex_branch_target;
+    // pipeline_is_jalr assigned after `let ex_is_jalr` is defined.
 
     // FP RS / FP RAT signals (E2-c2)
     var fp_rat_id_rs1_valid    : logic    ;
@@ -981,7 +1001,7 @@ pub module heliodor_top #(
         i_s1_ifid_valid   : s1_ifid_valid                                         ,
         i_sb_stall        : sb_stall                                              ,
         i_branch_taken    : ex_branch_taken                                       ,
-        i_misprediction   : ex_misprediction                                      ,
+        i_misprediction   : pipeline_squash                                       ,
         i_is_jal          : id_is_jal                                             ,
         i_is_jalr         : id_is_jalr                                            ,
         i_trap_taken      : trap_taken                                            ,
@@ -1089,6 +1109,9 @@ pub module heliodor_top #(
     // ============================================================
     // Combinational: is the instruction in EX a JALR?
     let ex_is_jalr: logic = id_valid && id_is_jalr;
+    // P3.4 (d).2: assign pipeline_is_jalr now that ex_is_jalr is defined.
+    // Routes p34 replay through the branch_target path (not jump_target).
+    assign pipeline_is_jalr = if p34_replay_valid_q ? 1'b0 : ex_is_jalr;
 
     // Instruction fetch MMU (Sv39 virtual-to-physical translation)
     var immu_paddr   : logic<64>;
@@ -1122,7 +1145,7 @@ pub module heliodor_top #(
         // instruction's PTW is in progress, sfence held in ID would reset the
         // MMU state machine every cycle, preventing the PTW from completing.
         i_sfence  : id_valid && id_is_sfence && !stall_id,
-        i_redirect: ex_misprediction || trap_taken || mret_taken || sret_taken,
+        i_redirect: pipeline_squash || trap_taken || mret_taken || sret_taken,
     );
 
     // I-Cache between fetch MMU and external instruction memory (32-bit)
@@ -1397,7 +1420,7 @@ pub module heliodor_top #(
     // Pipeline redirect: trap, mret, sret, misprediction
     // Misprediction gated by dcache/mmu stall (can't redirect until memory op completes)
     let redirect_active: logic = trap_taken || mret_taken || sret_taken
-                              || (ex_misprediction && !dcache_stall && !mmu_stall);
+                              || (pipeline_squash && !dcache_stall && !mmu_stall);
     // Bubble fill: only when both load_use AND ex_load_use agree.
     // raw_load_use (= sb_stall) includes rat_mem_stall, but ex_load_use
     // is pure 1-cycle load-use. When rat_mem_stall fires without ex_load_use,
@@ -1442,10 +1465,10 @@ pub module heliodor_top #(
         clk                                                        ,
         rst                                                        ,
         i_stall         : stall_if                                 ,
-        i_branch_taken  : ex_misprediction                         ,
-        i_branch_target : ex_branch_target                         ,
+        i_branch_taken  : pipeline_squash                          ,
+        i_branch_target : pipeline_branch_target                   ,
         i_jump_target   : ex_jump_target                           ,
-        i_is_jalr       : ex_is_jalr                               ,
+        i_is_jalr       : pipeline_is_jalr                         ,
         i_trap_taken    : trap_taken                               ,
         i_trap_target   : trap_target                              ,
         i_mret_taken    : mret_taken || sret_taken                 ,
@@ -1848,7 +1871,7 @@ pub module heliodor_top #(
             if trap_taken || mret_taken || sret_taken {
                 // Invalidate on trap: fill continues (populates cache), result discarded
                 mshr_valid = 1'b0;
-            } else if ex_misprediction && rob_squash_mask[mshr_rob_idx] {
+            } else if pipeline_squash && rob_squash_mask[mshr_rob_idx] {
                 // P3.2 Stage 2d: squash invalidates MSHR if its captured load
                 // is in the squash range. Without this, the OLD MSHR fill
                 // would silently drop on arrival (LQ entry gone) and the
@@ -2083,6 +2106,13 @@ pub module heliodor_top #(
                                   : if ex_from_rs ? rs_issue_epoch
                                   : if ex_from_lq ? lq_reinject_epoch
                                   : id_epoch;
+
+    // P3.4 (d).2: ROB squash index. ex_misprediction squashes from the EX
+    // instruction +1 (right-path); p34 replay squashes from the offending
+    // LOAD itself (inclusive) so it re-fetches and re-issues from PC.
+    let pipeline_squash_idx: logic<7> = if p34_replay_valid_q
+                                       ? {p34_replay_epoch_q, p34_replay_idx_q}
+                                       : {ex_in_epoch, ex_in_rob_idx} + 7'd1;
 
     inst u_execute: execute (
         clk                                                                                                                             ,
@@ -2823,8 +2853,26 @@ pub module heliodor_top #(
      || ex_srs_q_line + 61'd1 == id_load_line
      || id_load_line + 61'd1 == ex_srs_q_line);
     let srs_inflight   : logic = !srs_empty || srs_issue_valid || ex_from_srs_q;
-    let srs_load_drain : logic = id_mem_ren
-                              && (srs_probe_alias || srs_issue_valid || ex_from_srs_q_alias);
+    // P3.4 (d).3: distinguish KNOWN aliases (resolved store base + line
+    // match — must drain regardless of load route) from UNRESOLVED aliases
+    // (store base pending — only direct-path loads must drain). LQ-routed
+    // loads can speculate past unresolved stores; the P3.4 squash machinery
+    // (LQ retire stall + SRS-wake CAM + p34_replay latch) recovers if the
+    // resolved address turns out to alias.
+    // id_load_via_lq mirrors the gate that selects LQ alloc at ID for
+    // pending-rs1 integer loads. Keep it inline (defined later: ~2936).
+    let id_load_via_lq: logic = id_valid && id_mem_ren && !id_mem_wen
+                              && !id_is_amo && !id_is_fp
+                              && !id_is_csr && !id_is_ecall && !id_is_ebreak && !id_illegal
+                              && id_direct_stall_rs1
+                              && !id_direct_stall_rs2;
+    let srs_known_alias: logic = srs_probe_alias && !srs_probe_alias_unresolved;
+    let srs_load_drain_known    : logic = id_mem_ren
+                                       && (srs_known_alias || srs_issue_valid || ex_from_srs_q_alias);
+    let srs_load_drain_unresolved: logic = id_mem_ren
+                                        && srs_probe_alias_unresolved
+                                        && !id_load_via_lq;
+    let srs_load_drain : logic = srs_load_drain_known || srs_load_drain_unresolved;
     let srs_other_drain: logic = (id_is_amo || id_is_csr
                                 || (id_mem_wen && !id_is_srs_eligible)) && srs_inflight;
     let srs_drain_needed: logic = srs_load_drain || srs_other_drain;
@@ -2846,6 +2894,37 @@ pub module heliodor_top #(
     let p34_load_dist  : logic<5> = lq_probe_hit_rob - rob_commit_idx;
     let p34_load_younger: logic   = p34_load_dist >: p34_store_dist;
     let p34_spec_violation: logic = srs_wake_valid && lq_probe_hit && p34_load_younger;
+
+    // P3.4 (d).2: replay latch (1-cycle delay).
+    // Latching p34_spec_violation into a register avoids new combinational
+    // paths through the squash fabric (ex_misprediction is already comb
+    // from EX inputs, while srs_wake/lq_probe path would create a parallel
+    // comb chain). The 1-cycle latency is safe because ROB in-order commit
+    // guarantees the offending LOAD cannot commit before the older STORE
+    // that woke it — the latched p34 still catches the LOAD before it
+    // architecturally retires.
+    always_ff (clk, rst) {
+        if_reset {
+            p34_replay_valid_q   = 1'b0;
+            p34_replay_idx_q     = 5'd0;
+            p34_replay_epoch_q   = 2'd0;
+            p34_replay_pc_q      = 64'd0;
+        } else {
+            // Suppress new latch when another redirect already fired this
+            // cycle: ex_misprediction has its own squash, and trap/xret will
+            // flush regardless. Lets the higher-priority redirect win and
+            // keeps p34_replay from stomping it next cycle.
+            if p34_spec_violation && !ex_misprediction
+                                  && !trap_taken && !mret_taken && !sret_taken {
+                p34_replay_valid_q = 1'b1;
+                p34_replay_idx_q   = lq_probe_hit_rob;
+                p34_replay_epoch_q = lq_probe_hit_epoch;
+                p34_replay_pc_q    = lq_probe_hit_pc;
+            } else {
+                p34_replay_valid_q = 1'b0;
+            }
+        }
+    }
 
     // P3.2 Stage 2: integer loads with pending rs1 can side-step direct-path
     // stall by allocating an LQ entry that waits for CDB wake, then
@@ -3050,7 +3129,7 @@ pub module heliodor_top #(
         i_cdb2_epoch   : cdb2_epoch                    ,
         i_cdb2_data    : cdb2_data                     ,
         i_flush: trap_taken || mret_taken || sret_taken,
-        i_squash_valid: ex_misprediction               ,
+        i_squash_valid: pipeline_squash               ,
         i_squash_mask : rob_squash_mask                 ,
         o_sel_valid   : rs_sel_valid                    ,
     );
@@ -3120,7 +3199,7 @@ pub module heliodor_top #(
         i_cdb2_epoch       : cdb2_epoch                   ,
         i_cdb2_data        : cdb2_data                    ,
         i_flush            : trap_taken || mret_taken || sret_taken,
-        i_squash_valid     : ex_misprediction             ,
+        i_squash_valid     : pipeline_squash             ,
         i_squash_mask      : rob_squash_mask              ,
         // Load alias probe: effective VA = forwarded rs1 + id_imm.
         i_probe_addr            : id_load_probe_addr       ,
@@ -3260,11 +3339,13 @@ pub module heliodor_top #(
         o_commit_epoch : rob_commit_epoch                           ,
         i_commit_ack  : 1'b1                                       , // auto-commit
         i_flush       : trap_taken || mret_taken || sret_taken,
-        i_squash_valid: ex_misprediction                            ,
+        i_squash_valid: pipeline_squash                             ,
         // ex_misprediction fires combinationally for the instruction ENTERING EX
         // (same as execute module's i_valid = ex_in_valid). Use ex_in_rob_idx
         // which is the ROB index of that instruction, not ex_rob_idx (previous cycle).
-        i_squash_idx  : {ex_in_epoch, ex_in_rob_idx} + 7'd1             ,
+        // P3.4 (d).2: when p34_replay_valid_q fires, squash from the offending
+        // LOAD itself (inclusive) so it re-fetches and re-issues from PC.
+        i_squash_idx  : pipeline_squash_idx                             ,
         // Lookup: IF/ID-stage index for scoreboard stall.
         // RS operand resolution uses read ports instead.
         i_lookup1_idx      : rat_rs1_rob_idx                          ,
@@ -3359,7 +3440,7 @@ pub module heliodor_top #(
         // all wrong-path entries (ROB indices after the branch).
         i_flush       : trap_taken || mret_taken || sret_taken,
         i_undo        : 1'b0,
-        i_squash_valid: ex_misprediction,
+        i_squash_valid: pipeline_squash,
         i_squash_mask : rob_squash_mask,
         o_undo_valid   : rat_undo_valid,
         o_undo_rd      : rat_undo_rd,
@@ -3445,7 +3526,7 @@ pub module heliodor_top #(
         o_id_rs3_rob_epoch : fp_rat_id_rs3_rob_epoch                 ,
         i_flush       : trap_taken || mret_taken || sret_taken       ,
         i_undo        : 1'b0                                         ,
-        i_squash_valid: ex_misprediction                             ,
+        i_squash_valid: pipeline_squash                             ,
         i_squash_mask : rob_squash_mask                              ,
         o_undo_valid   : _                                            ,
         o_undo_rd      : _                                            ,
@@ -3553,7 +3634,7 @@ pub module heliodor_top #(
         i_fp_cdb1_epoch        : fp_cdb1_epoch                       ,
         i_fp_cdb1_data         : fp_cdb1_data                        ,
         i_flush                : trap_taken || mret_taken || sret_taken,
-        i_squash_valid         : ex_misprediction                    ,
+        i_squash_valid         : pipeline_squash                    ,
         i_squash_mask          : rob_squash_mask                     ,
         o_sel_valid            : fp_rs_sel_valid                     ,
     );
@@ -3669,7 +3750,7 @@ pub module heliodor_top #(
         o_fwd_hit      : sb_fwd_hit                            ,
         o_fwd_data     : sb_fwd_data                           ,
         o_fwd_partial  : sb_fwd_partial                        ,
-        i_squash_valid: ex_misprediction                      ,
+        i_squash_valid: pipeline_squash                      ,
         i_squash_mask : rob_squash_mask                       ,
         i_flush       : trap_taken || mret_taken || sret_taken,
         // AMO / cross-DW writes bypass the SB enqueue path and write
@@ -3832,7 +3913,7 @@ pub module heliodor_top #(
         o_retire_rd     : lq_retire_rd                           ,
         o_retire_data   : lq_retire_data                         ,
         o_retire_is_fp  : lq_retire_is_fp                        ,
-        i_squash_valid  : ex_misprediction                       ,
+        i_squash_valid  : pipeline_squash                       ,
         i_squash_mask   : rob_squash_mask                        ,
         i_flush         : trap_taken || mret_taken || sret_taken ,
         // P3.4 step (c): SRS wake triggers LQ alias probe. The hit output
@@ -3844,6 +3925,7 @@ pub module heliodor_top #(
         o_probe_hit     : lq_probe_hit                           ,
         o_probe_hit_rob : lq_probe_hit_rob                       ,
         o_probe_hit_epoch: lq_probe_hit_epoch                    ,
+        o_probe_hit_pc  : lq_probe_hit_pc                        ,
         // Phase 4 / bug-b: probe LQ against the SRS HEAD CANDIDATE (comb,
         // pre-FF). The probe result feeds back into SRS i_issue_stall, so
         // an aliasing store never enters o_issue_valid. Using the post-FF
@@ -3928,7 +4010,7 @@ pub module heliodor_top #(
     // Suppress during misprediction squash: a wrong-path instruction in EX
     // might decode as ecall/illegal, but its ROB entry will be squashed.
     // Capturing would leave pend_trap_valid stuck (no commit-time exc to clear it).
-    let pend_trap_capture: logic = rob_tracked_exc && !pend_trap_valid && !ex_misprediction;
+    let pend_trap_capture: logic = rob_tracked_exc && !pend_trap_valid && !pipeline_squash;
 
     // Commit-time firing: ROB head has exception AND we have saved info
     let rob_exc_trap: logic = rob_commit_valid && rob_commit_exc && pend_trap_valid;
