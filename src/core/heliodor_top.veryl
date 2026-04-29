@@ -144,6 +144,13 @@ pub module heliodor_top #(
     var rs_issue_wen     : logic    ;
     var rs_issue_rob     : logic<5> ;
     var rs_issue_epoch   : logic<2> ;
+    // RS-routed branch/JALR fields (slot0 only — slot1 is ALU-only)
+    var rs_issue_is_branch     : logic    ;
+    var rs_issue_is_jalr       : logic    ;
+    var rs_issue_funct3        : logic<3> ;
+    var rs_issue_predict_taken : logic    ;
+    var rs_issue_predict_target: logic<64>;
+    var rs_issue_is_compressed : logic    ;
     // RS secondary issue port (for dual-issue via slot1)
     var rs_issue2_valid   : logic    ;
     var rs_issue2_pc      : logic<64>;
@@ -574,7 +581,26 @@ pub module heliodor_top #(
     assign pipeline_squash       = ex_misprediction || p34_replay_valid_q;
     assign pipeline_branch_target = if p34_replay_valid_q ? p34_replay_pc_q
                                                           : ex_branch_target;
-    // pipeline_is_jalr assigned after `let ex_is_jalr` is defined.
+    // pipeline_is_jalr assigned after `ex_inst_is_jalr` is defined.
+
+    // EX-stage instruction fields. Combine direct-path (id_*) and RS-routed
+    // (rs_issue_*) so RAS / BHT / BP / counters / fetch redirect (pipeline_is_jalr)
+    // all see the same view. Declared early because users span IF and EX
+    // stages.
+    var ex_rd              : logic<5> ;
+    var ex_rs1             : logic<5> ;
+    var ex_inst_pc         : logic<64>;
+    var ex_inst_compressed : logic    ;
+    var ex_inst_is_jal     : logic    ;
+    var ex_inst_is_jalr    : logic    ;
+    var ex_inst_is_branch  : logic    ;
+    // Forward-declared dispatch sources. Early users: BP update / RAS / BHT /
+    // pipeline_is_jalr.
+    var ex_from_rs   : logic;
+    var ex_from_srs  : logic;
+    var ex_from_fp_rs: logic;
+    var ex_from_lq   : logic;
+    var ex_in_valid  : logic;
 
     // FP RS / FP RAT signals (E2-c2)
     var fp_rat_id_rs1_valid    : logic    ;
@@ -661,13 +687,38 @@ pub module heliodor_top #(
     // EX_MEM forwarding (which sourced `ex_alu_out` = ALU comb DIV).
     // RS-dispatched ops set ex_from_rs, which zeros forwarding selects
     // into execute; dependents wake via CDB1's div_async branch.
-    let id_is_rs_eligible: logic = id_valid && id_reg_wen
+    // ALU-class RS eligibility: ordinary R/I-type that writes rd via ALU result.
+    let id_is_rs_eligible_alu: logic = id_valid && id_reg_wen
         && id_wb_sel == pipeline_pkg::WbSel::ALU
         && !id_mem_ren && !id_mem_wen
         && !id_is_branch && !id_is_jal && !id_is_jalr
         && !id_is_csr && !id_is_fp && !id_is_amo
         && !id_is_ecall && !id_is_ebreak
         && !id_illegal;
+    // Control-flow RS eligibility: branch + JALR. Both have operand
+    // dependencies that benefit from RS waiting (direct path stalls
+    // ds_op_bj cycles when rs1/rs2 are not ready). JAL has no operand
+    // deps and stays direct.
+    // Branch/JALR RS routing infrastructure exists (RS extended with branch
+    // fields, dispatch/issue plumbing, ex_inst_* fabric for BHT/RAS/BP/
+    // counters/redirect). Currently DISABLED because it exposes a pre-
+    // existing ROB squash-mask issue:
+    //   pipeline_squash_idx = BNE+1, but `sq_di != 0` excludes squash_idx
+    //   from the mask, leaving the first speculative entry at ROB[BNE+1]
+    //   valid+completed. With RS-routed branches, speculation runs many
+    //   cycles (waiting for operands) and the speculative entry can complete
+    //   before the squash. After squash, head reaches BNE+1 and commits
+    //   stale data before the right-path instruction's alloc overwrites.
+    // Fix needs: epoch-aware mask + inclusive squash_idx + reliable alloc-
+    //   ordering vs commit. Direct-path branches resolve too fast to expose
+    //   this. Deferred — see project_branch_rs_routing.md for status.
+    const CTL_RS_ENABLE: bit = 1'b0;
+    let id_is_rs_eligible_ctl: logic = CTL_RS_ENABLE
+        && id_valid && (id_is_branch || id_is_jalr)
+        && !id_is_csr && !id_is_fp && !id_is_amo
+        && !id_is_ecall && !id_is_ebreak
+        && !id_illegal;
+    let id_is_rs_eligible: logic = id_is_rs_eligible_alu || id_is_rs_eligible_ctl;
 
     // RS dispatch valid: instruction is RS-eligible AND not flushed/stalled/already dispatched
     let rs_dispatch_valid: logic = id_is_rs_eligible && !flush_id && !stall_ex && !rs_dispatched_q && !rob_full;
@@ -1114,11 +1165,14 @@ pub module heliodor_top #(
     // ============================================================
     // IF stage
     // ============================================================
-    // Combinational: is the instruction in EX a JALR?
-    let ex_is_jalr: logic = id_valid && id_is_jalr;
-    // P3.4 (d).2: assign pipeline_is_jalr now that ex_is_jalr is defined.
-    // Routes p34 replay through the branch_target path (not jump_target).
-    assign pipeline_is_jalr = if p34_replay_valid_q ? 1'b0 : ex_is_jalr;
+    // Combinational: is the instruction in EX a JALR? Must include RS-routed
+    // path via ex_inst_is_jalr (covers both direct_path && id_is_jalr and
+    // ex_from_rs && rs_issue_is_jalr). Without this, fetch redirect after a
+    // RS-routed JALR misprediction goes to ex_branch_target (PC + imm) instead
+    // of ex_jump_target (rs1 + imm), looping back to the JALR itself.
+    // P3.4 (d).2: pipeline_is_jalr routes p34 replay through the branch_target
+    // path (not jump_target).
+    assign pipeline_is_jalr = if p34_replay_valid_q ? 1'b0 : ex_inst_is_jalr;
 
     // Instruction fetch MMU (Sv39 virtual-to-physical translation)
     var immu_paddr   : logic<64>;
@@ -1207,8 +1261,9 @@ pub module heliodor_top #(
     // Local BHT prediction read
     let local_bht_idx  : logic<8> = if_pc[9:2];
     let local_bht_taken: logic    = local_bht[local_bht_idx][1]; // MSB = predict taken
-    // BHT update index (EX stage PC)
-    let bht_upd_idx: logic<8> = id_pc[9:2];
+    // BHT update index uses ex_inst_pc, which is defined later; declared here
+    // as var and assigned in the EX-stage section.
+    var bht_upd_idx: logic<8>;
 
     // RAS: RISC-V call/return detection from IF instruction
     // Call: JAL/JALR with rd = x1 or x5 (link registers)
@@ -1451,13 +1506,13 @@ pub module heliodor_top #(
         // Flush BTB/BHT on SFENCE.VMA, FENCE.I, or SATP write (virtual
         // address mapping change invalidates cached branch targets).
         i_flush: (id_valid && (id_is_sfence || id_is_fence_i || (id_is_csr && id_csr_addr == csr_pkg::CSR_SATP)) && !stall_id),
-        // id_* are decode outputs (ID/EX pipeline register) = EX stage values.
-        // ex_branch_taken/target are combinational EX-stage outputs.
-        i_update_valid    : id_valid && !stall_ex                            ,
-        i_update_pc       : id_pc                                            ,
-        i_update_taken    : ex_branch_taken                                  ,
-        i_update_target   : if id_is_jalr ? ex_jump_target : ex_branch_target,
-        i_update_is_branch: id_is_branch                                     ,
+        // ex_* describe the instruction at EX (direct-path id_* OR RS-routed
+        // rs_issue_*). ex_branch_taken/target are combinational EX-stage outputs.
+        i_update_valid    : ex_in_valid && !stall_ex                                ,
+        i_update_pc       : ex_inst_pc                                              ,
+        i_update_taken    : ex_branch_taken                                         ,
+        i_update_target   : if ex_inst_is_jalr ? ex_jump_target : ex_branch_target  ,
+        i_update_is_branch: ex_inst_is_branch                                       ,
     );
 
     var fetch_imem_addr: logic<64>; // unused, icache drives o_imem_addr
@@ -1903,17 +1958,30 @@ pub module heliodor_top #(
         }
     }
 
-    // RAS update: non-speculative, from EX stage (id_* = EX pipeline register).
+    // RAS update: non-speculative, from EX stage. The instruction at EX may
+    // be direct-path (id_*) or RS-routed (rs_issue_*); pick fields accordingly.
     // Push on committed call (JAL/JALR with rd=x1/x5).
     // Pop on committed return (JALR with rd!=link, rs1=link).
-    // Link address is computed from EX PC + instruction size.
-    let ex_rd : logic<5> = id_rd_addr;
-    let ex_rs1: logic<5> = id_rs1_addr;
+    // JAL stays direct (no operand deps); JALR may be RS-routed.
+    assign ex_rd               = if ex_from_rs ? rs_issue_rd            : id_rd_addr;
+    assign ex_rs1              = if ex_from_rs ? rs_issue_rs1           : id_rs1_addr;
+    assign ex_inst_pc          = if ex_from_rs ? rs_issue_pc            : id_pc;
+    assign ex_inst_compressed  = if ex_from_rs ? rs_issue_is_compressed : id_is_compressed;
+    // is_branch / is_jal / is_jalr must fire only when the corresponding
+    // instruction is actually at EX. Direct-path: gated by direct_path_v
+    // (which clears when ID is RS-eligible and waiting for dispatch). RS path:
+    // gated by rs_issue_valid via ex_from_rs. Without these gates, an RS-eligible
+    // branch sitting in ID would falsely drive ex_inst_is_branch and trigger
+    // BHT/RAS/mispred updates with no actual EX activity.
+    assign ex_inst_is_jal      = direct_path_v && id_is_jal;
+    assign ex_inst_is_jalr     = (ex_from_rs && rs_issue_is_jalr  ) || (direct_path_v && id_is_jalr  );
+    assign ex_inst_is_branch   = (ex_from_rs && rs_issue_is_branch) || (direct_path_v && id_is_branch);
     let ex_rd_is_link : logic = ex_rd == 5'd1 || ex_rd == 5'd5;
     let ex_rs1_is_link: logic = ex_rs1 == 5'd1 || ex_rs1 == 5'd5;
-    let ex_is_call_q  : logic = id_valid && (id_is_jal || id_is_jalr) && ex_rd_is_link;
-    let ex_is_return_q: logic = id_valid && id_is_jalr && !ex_rd_is_link && ex_rs1_is_link;
-    let ex_link_addr_ras: logic<64> = if id_is_compressed ? id_pc + 64'd2 : id_pc + 64'd4;
+    let ex_is_call_q  : logic = (ex_inst_is_jal || ex_inst_is_jalr) && ex_rd_is_link;
+    let ex_is_return_q: logic = ex_inst_is_jalr && !ex_rd_is_link && ex_rs1_is_link;
+    let ex_link_addr_ras: logic<64> = if ex_inst_compressed ? ex_inst_pc + 64'd2 : ex_inst_pc + 64'd4;
+    assign bht_upd_idx = ex_inst_pc[9:2];
     // IF-stage observability signals (push/pop counters are driven from a
     // HYPOTHETICAL IF-stage RAS; actual RAS state is still maintained at EX)
     let if_valid_gate: logic = !icache_stall && !immu_busy && !stall_if;
@@ -1959,7 +2027,7 @@ pub module heliodor_top #(
             for i in 0..256 {
                 local_bht[i] = 2'b01;
             }
-        } else if id_valid && id_is_branch && !stall_ex {
+        } else if ex_inst_is_branch && !stall_ex {
             if ex_branch_taken {
                 if local_bht[bht_upd_idx] != 2'b11 {
                     local_bht[bht_upd_idx] = local_bht[bht_upd_idx] + 2'd1;
@@ -2080,12 +2148,14 @@ pub module heliodor_top #(
     // RS issue output is registered (1-cycle delayed) so no comb loop.
     // direct_path_v is set by always_comb after id_direct_stall is computed (below RAT).
     // direct_path_v = id_valid && !id_is_rs_eligible && !id_direct_stall
-    let ex_from_rs     : logic = !direct_path_v && rs_issue_valid;
+    // Forward-declared as var so that BP/RAS/BHT update wiring earlier in the
+    // file can reference them.
+    assign ex_from_rs     = !direct_path_v && rs_issue_valid;
     // Priority: direct > int RS > SRS > FP RS > LQ-reinject. LQ-reinject
     // sits at the lowest priority so it fills pipeline bubbles only when
     // ID/RS/SRS/FP-RS have nothing to dispatch this cycle.
-    let ex_from_srs    : logic = !direct_path_v && !rs_issue_valid && srs_issue_valid;
-    let ex_from_fp_rs  : logic = !direct_path_v && !rs_issue_valid && !srs_issue_valid && fp_rs_issue_valid;
+    assign ex_from_srs    = !direct_path_v && !rs_issue_valid && srs_issue_valid;
+    assign ex_from_fp_rs  = !direct_path_v && !rs_issue_valid && !srs_issue_valid && fp_rs_issue_valid;
     // P3.2 bug (c) fix: LQ re-inject must not bypass an older in-flight store.
     // If SRS has an older store, letting LQ probe SB before that store
     // enqueues returns stale dcache data (rv64ui-sd subtest 11). ROB-age
@@ -2097,8 +2167,8 @@ pub module heliodor_top #(
     let lq_reinject_age : logic<5> = lq_reinject_rob - rob_commit_idx;
     let srs_oldest_age  : logic<5> = srs_oldest_rob  - rob_commit_idx;
     let lq_no_older_srs : logic    = srs_empty || (lq_reinject_age <= srs_oldest_age);
-    let ex_from_lq     : logic = !direct_path_v && !rs_issue_valid && !srs_issue_valid && !fp_rs_issue_valid && lq_reinject_valid && lq_no_older_srs;
-    let ex_in_valid    : logic = direct_path_v || rs_issue_valid || srs_issue_valid || fp_rs_issue_valid || ex_from_lq;
+    assign ex_from_lq     = !direct_path_v && !rs_issue_valid && !srs_issue_valid && !fp_rs_issue_valid && lq_reinject_valid && lq_no_older_srs;
+    assign ex_in_valid    = direct_path_v || rs_issue_valid || srs_issue_valid || fp_rs_issue_valid || ex_from_lq;
     let ex_in_rob_idx  : logic<5> = if ex_from_fp_rs ? fp_rs_issue_rob
                                   : if ex_from_srs   ? srs_issue_rob
                                   : if ex_from_rs ? rs_issue_rob
@@ -2166,21 +2236,21 @@ pub module heliodor_top #(
         i_alu_op       : if ex_from_srs ? alu_pkg::AluOp::ADD : if ex_from_rs ? rs_issue_alu_op : if ex_from_lq ? alu_pkg::AluOp::ADD : id_alu_op,
         i_alu_src_a    : if ex_from_srs ? pipeline_pkg::AluSrcA::REG : if ex_from_rs ? rs_issue_src_a : if ex_from_lq ? pipeline_pkg::AluSrcA::REG : id_alu_src_a,
         i_alu_src_b    : if ex_from_srs ? pipeline_pkg::AluSrcB::IMM : if ex_from_rs ? rs_issue_src_b : if ex_from_lq ? pipeline_pkg::AluSrcB::IMM : id_alu_src_b,
-        i_wb_sel       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? pipeline_pkg::WbSel::ALU : if ex_from_lq ? pipeline_pkg::WbSel::MEM : id_wb_sel,
+        i_wb_sel       : if ex_from_rs ? (if rs_issue_is_jalr ? pipeline_pkg::WbSel::PC4 : pipeline_pkg::WbSel::ALU) : if ex_from_fp_rs || ex_from_srs ? pipeline_pkg::WbSel::ALU : if ex_from_lq ? pipeline_pkg::WbSel::MEM : id_wb_sel,
         i_reg_wen      : if ex_from_fp_rs ? fp_rs_issue_reg_wen : if ex_from_srs ? 1'b0 : if ex_from_rs ? rs_issue_wen : if ex_from_lq ? (lq_reinject_rd != 5'd0) : id_reg_wen,
         i_mem_ren      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : if ex_from_srs ? 1'b0 : if ex_from_lq ? 1'b1 : id_mem_ren              ,
         i_mem_wen      : if ex_from_rs || ex_from_fp_rs ? 1'b0 : if ex_from_srs ? 1'b1 : if ex_from_lq ? 1'b0 : id_mem_wen              ,
         i_mem_funct3   : if ex_from_rs || ex_from_fp_rs ? 3'd0 : if ex_from_srs ? srs_issue_funct3 : if ex_from_lq ? lq_reinject_funct3 : id_mem_funct3,
-        i_is_branch    : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_branch                              ,
+        i_is_branch    : if ex_from_rs ? rs_issue_is_branch : if ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_branch       ,
         i_is_jal       : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_jal                                 ,
-        i_is_jalr      : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_jalr                                ,
-        i_funct3       : if ex_from_rs || ex_from_fp_rs || ex_from_srs ? 3'd0 : if ex_from_lq ? lq_reinject_funct3 : id_funct3          ,
+        i_is_jalr      : if ex_from_rs ? rs_issue_is_jalr   : if ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_jalr         ,
+        i_funct3       : if ex_from_rs ? rs_issue_funct3    : if ex_from_fp_rs || ex_from_srs ? 3'd0 : if ex_from_lq ? lq_reinject_funct3 : id_funct3,
         i_is_ecall     : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_ecall                               ,
         i_is_ebreak    : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_ebreak                              ,
         i_illegal      : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : (id_illegal || id_csr_fault_q || tvm_trap || tsr_trap || mret_priv_fault || sret_priv_fault || sfence_priv_fault),
         i_amo_funct5   : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 5'd0 : id_amo_funct5                             ,
         i_is_amo       : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_amo                                 ,
-        i_is_compressed: if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_compressed                          ,
+        i_is_compressed: if ex_from_rs ? rs_issue_is_compressed : if ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_is_compressed,
         i_is_fp        : if ex_from_fp_rs ? 1'b1 : if ex_from_rs || ex_from_srs ? 1'b0 : if ex_from_lq ? lq_reinject_is_fp : id_is_fp   ,
         i_fp_reg_wen   : if ex_from_fp_rs ? fp_rs_issue_fp_wen : if ex_from_rs || ex_from_srs ? 1'b0 : if ex_from_lq ? lq_reinject_is_fp : id_fp_reg_wen,
         i_fpu_op       : if ex_from_fp_rs ? fp_rs_issue_fpu_op : if ex_from_rs || ex_from_srs || ex_from_lq ? 6'd0 : id_fpu_op          ,
@@ -2275,8 +2345,8 @@ pub module heliodor_top #(
         o_fp_fflags_wen   : ex_fp_fflags_wen ,
         o_fp_fflags_ex    : fp_fflags_ex     ,
         o_fp_fflags_ex_wen: fp_fflags_ex_wen ,
-        i_predict_taken   : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0 : id_predict_taken ,
-        i_predict_target  : if ex_from_rs || ex_from_fp_rs || ex_from_srs || ex_from_lq ? 64'd0 : id_predict_target,
+        i_predict_taken   : if ex_from_rs ? rs_issue_predict_taken  : if ex_from_fp_rs || ex_from_srs || ex_from_lq ? 1'b0  : id_predict_taken ,
+        i_predict_target  : if ex_from_rs ? rs_issue_predict_target : if ex_from_fp_rs || ex_from_srs || ex_from_lq ? 64'd0 : id_predict_target,
         o_branch_taken    : ex_branch_taken  ,
         o_dbg_fwd_rs1     : ex_dbg_fwd_rs1   ,
         o_dbg_fwd_rs2     : ex_dbg_fwd_rs2   ,
@@ -2687,7 +2757,9 @@ pub module heliodor_top #(
         ifid_op_for_rs == 7'b0010011 || // OP-IMM
         ifid_op_for_rs == 7'b0011011 || // OP-IMM-32
         ifid_op_for_rs == 7'b0110111 || // LUI
-        ifid_op_for_rs == 7'b0010111;   // AUIPC
+        ifid_op_for_rs == 7'b0010111 || // AUIPC
+        ifid_op_for_rs == 7'b1100011 || // BRANCH (BEQ/BNE/BLT/BGE/BLTU/BGEU)
+        ifid_op_for_rs == 7'b1100111;   // JALR
 
     // For RS-eligible IF/ID instructions, disable RAT/load-use stall.
     // RS handles operand tracking and dependency resolution via CDB.
@@ -3087,6 +3159,13 @@ pub module heliodor_top #(
         i_dispatch_s2_tag  : rs_s2_tag                 ,
         i_dispatch_s2_epoch: rat_id_rs2_rob_epoch      ,
         i_dispatch_s2_data : rs_s2_data                ,
+        // Branch/JALR fields (zero for ALU-class entries)
+        i_dispatch_is_branch     : id_is_branch         ,
+        i_dispatch_is_jalr       : id_is_jalr           ,
+        i_dispatch_funct3        : id_funct3            ,
+        i_dispatch_predict_taken : id_predict_taken     ,
+        i_dispatch_predict_target: id_predict_target    ,
+        i_dispatch_is_compressed : id_is_compressed     ,
         o_dispatch_ready   : rs_dispatch_ready         ,
         o_issue_valid  : rs_issue_valid                ,
         o_issue_pc     : rs_issue_pc                   ,
@@ -3102,6 +3181,12 @@ pub module heliodor_top #(
         o_issue_wen    : rs_issue_wen                  ,
         o_issue_rob    : rs_issue_rob                  ,
         o_issue_epoch  : rs_issue_epoch                ,
+        o_issue_is_branch     : rs_issue_is_branch     ,
+        o_issue_is_jalr       : rs_issue_is_jalr       ,
+        o_issue_funct3        : rs_issue_funct3        ,
+        o_issue_predict_taken : rs_issue_predict_taken ,
+        o_issue_predict_target: rs_issue_predict_target,
+        o_issue_is_compressed : rs_issue_is_compressed ,
         i_issue_stall  : rs_issue_stall                ,
         // Secondary issue port (slot1)
         o_issue2_valid  : rs_issue2_valid              ,
@@ -4382,7 +4467,7 @@ pub module heliodor_top #(
     assign o_dbg_bp_mispred = ex_misprediction;
     assign o_dbg_bp_taken   = ex_branch_taken;
     assign o_dbg_bp_ex_pc   = id_pc; // EX stage PC
-    assign o_dbg_bp_target  = if id_is_jalr ? ex_jump_target : ex_branch_target;
+    assign o_dbg_bp_target  = if ex_inst_is_jalr ? ex_jump_target : ex_branch_target;
 
     // Debug: trap trace
     assign o_dbg_trap_taken = trap_taken;
@@ -4547,12 +4632,12 @@ pub module heliodor_top #(
 
     // flush_id sub-cause: classify mispredicts by branch type (id_is_* at
     // same cycle tracks the instruction in EX via execute's i_* inputs).
-    assign o_dbg_mispred_branch = ex_misprediction && id_is_branch;
-    assign o_dbg_mispred_jalr   = ex_misprediction && id_is_jalr;
-    assign o_dbg_mispred_jal    = ex_misprediction && id_is_jal;
+    assign o_dbg_mispred_branch = ex_misprediction && ex_inst_is_branch;
+    assign o_dbg_mispred_jalr   = ex_misprediction && ex_inst_is_jalr;
+    assign o_dbg_mispred_jal    = ex_misprediction && ex_inst_is_jal;
     assign o_dbg_flush_trap     = (trap_taken || mret_taken || sret_taken) && !ex_misprediction;
-    assign o_dbg_mispred_jalr_return   = ex_misprediction && id_is_jalr && ex_is_return_q;
-    assign o_dbg_mispred_jalr_indirect = ex_misprediction && id_is_jalr && !ex_is_return_q;
+    assign o_dbg_mispred_jalr_return   = ex_misprediction && ex_inst_is_jalr && ex_is_return_q;
+    assign o_dbg_mispred_jalr_indirect = ex_misprediction && ex_inst_is_jalr && !ex_is_return_q;
 
     // RAS diagnostics: IF-stage return detection rate + RAS-valid hit rate
     assign o_dbg_if_return_count = if_is_return && !icache_stall && !immu_busy;
