@@ -54,74 +54,70 @@ _start:
     /* Disable interrupts during init */
     csrw mie, zero
 
-    /* Per-hart split: hart 0 boots Linux, harts ≥1 park awaiting MSIP wake.
-     * mhartid is the canonical id, not a0 (the bootloader contract sets a0
-     * to 0/hartid by convention but hart 1+ on heliodor enter at PC=0 with
-     * a0 stale, so use mhartid).
-     */
-    csrr a0, mhartid
-    bnez a0, _secondary_park
+    /* Save hartid for later (s11 is callee-saved across our flow). */
+    csrr s11, mhartid
 
-    /* Set up M-mode trap handler */
+    /* Set up M-mode trap handler (per-hart, but the same handler) */
     la t0, m_trap_handler
     csrw mtvec, t0
 
-    /* Set mscratch to M-mode scratch area for register save/restore.
-     * Must be in writable DRAM (not firmware ROM which ignores writes).
-     * Use top of DRAM: 0x81FFF000 (last page of 32MB DRAM). */
+    /* Per-hart mscratch: top-of-DRAM minus 0x80*hartid keeps each hart's
+     * trap save area independent. */
     li t0, 0x81FFF000
+    slli t1, s11, 7
+    sub  t0, t0, t1
     csrw mscratch, t0
 
     /* Allow S-mode to read counters (TIME/CYCLE/INSTRET) */
     li t0, 7
     csrw mcounteren, t0
 
-    /* Delegate exceptions to S-mode:
-     *   2: illegal instruction
-     *   8: ecall from U-mode
-     *  12: instruction page fault
-     *  13: load page fault
-     *  15: store page fault */
-    /* Delegate: misaligned load/store(4,6), illegal(2), ecall-U(8),
-     * inst/load/store page fault(12,13,15) */
+    /* Delegate misaligned load/store(4,6), illegal(2), ecall-U(8),
+     * inst/load/store page fault(12,13,15) to S-mode. */
     li t0, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
     csrw medeleg, t0
 
-    /* Delegate interrupts to S-mode:
-     *   1: SSIP, 5: STIP, 9: SEIP */
+    /* Delegate interrupts to S-mode: SSIP/STIP/SEIP (1,5,9). */
     li t0, 0x222
     csrw mideleg, t0
 
-    /* Set mtimecmp to max to prevent immediate timer interrupt */
-    li t0, CLINT_MTIMECMP
-    li t1, -1               /* 0xFFFFFFFFFFFFFFFF */
-    sd t1, 0(t0)
+    /* Per-hart mtimecmp = max */
+    li   t0, CLINT_MTIMECMP
+    slli t1, s11, 3        /* 8 * hartid */
+    add  t0, t0, t1
+    li   t1, -1
+    sd   t1, 0(t0)
 
-    /* Enable machine timer interrupt (for SBI timer delegation) */
-    li t0, 0x80    /* MIE.MTIE = bit 7 */
+    /* Enable machine timer interrupt (kernel re-enables MTIE via SBI set_timer) */
+    li t0, 0x80
     csrw mie, t0
 
-    /* Set mstatus: MPP=01 (S-mode), MPIE=1, SIE=1 */
+    /* mstatus: MPP=01 (S-mode), MPIE=1, SIE=1 */
     li t0, (1 << 11) | (1 << 7) | (1 << 5) | (1 << 1)
     csrw mstatus, t0
 
-    /* Set initial stvec to debug handler (catches S-mode traps before kernel sets its own) */
+    /* Initial stvec to debug handler (kernel installs its own later) */
     la t0, s_debug_trap
     csrw stvec, t0
 
-    /* Clear hart_lottery (kernel BSS may not be zeroed by DRAM init) */
-    li t0, 0x80A85380       /* hart_lottery PA (from kernel nm) */
-    sd zero, 0(t0)
+    /* hart 0 only: clear hart_lottery so the kernel's amoadd-based boot
+     * CPU pick lands deterministically on hart 0. Secondaries don't touch
+     * it — when they amoadd they'll get a non-zero return and fall into
+     * .Lsecondary_start (the spinwait protocol). */
+    bnez s11, _skip_lottery
+    li   t0, 0x80A85380      /* hart_lottery PA (from kernel nm) */
+    sd   zero, 0(t0)
+_skip_lottery:
 
-    /* Set kernel entry point */
-    li t0, KERNEL_ENTRY
+    /* All harts mret into kernel _start_kernel. Hart 0 wins the lottery
+     * and runs primary boot; hart 1+ end up in the kernel's spinwait
+     * polling __cpu_up_stack_pointer until the primary releases them. */
+    li   t0, KERNEL_ENTRY
     csrw mepc, t0
 
-    /* a0 = hartid, a1 = DTB address */
-    li a0, 0
-    li a1, DTB_ADDR
+    mv   a0, s11             /* a0 = hartid */
+    li   a1, DTB_ADDR        /* a1 = DTB physical address */
 
-    /* Jump to S-mode kernel */
     mret
 
 /* ============================================================
