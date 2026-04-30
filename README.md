@@ -4,7 +4,7 @@ RV64GC RISC-V processor core written in [Veryl](https://veryl-lang.org/).
 
 ## Status
 
-Phase 2 (ALU-side out-of-order execution) complete.
+Phase 2 (ALU OoO) and Phase 3 (memory OoO) complete.
 
 - **Pipeline**: Tomasulo-style out-of-order with in-order commit
   - 5 logical stages (IF → ID → EX → MEM → WB)
@@ -15,10 +15,12 @@ Phase 2 (ALU-side out-of-order execution) complete.
   - Dual-issue ALU (slot0 + slot1) via RS dispatch
   - Branch predictor: 256-entry local BHT + 8-entry RAS
   - Speculative execution with epoch-based squash / precise exceptions
-- **Memory**:
+- **Memory OoO**:
   - I-cache / D-cache (4-way, non-blocking via MSHR)
-  - Store Buffer shadow (E1-d) with partial forwarding
-  - Load Queue / Store RS scaffolding (observational — Phase 3 scope)
+  - Store Reservation Station (8 entries) — store decouple from direct path
+  - Load Queue (8 entries) — OoO load issue with addr/data tracking
+  - Store Buffer (8 entries) with byte-granular store-to-load forwarding
+  - Speculative load past unresolved store base, with squash/replay on alias
 - **Multi-cycle FUs**: integer divider, FP divider, FP sqrt — all non-blocking
 - **ISA**: **RV64IMAFDC_Zicsr_Zifencei**
 - **Privilege levels**: Machine / Supervisor / User
@@ -41,10 +43,10 @@ All run bare-metal from the test harness. IPC = instret / cycle (no interrupts, 
 
 | Benchmark  | Cycles  | Instret | IPC   | Dominant stall cause         |
 |------------|---------|---------|-------|------------------------------|
-| Dhrystone  | 407,878 | 277,716 | 0.681 | ds_operand (store-dep chain) |
-| memcpy     | 148,965 | 108,896 | 0.731 | load_use + ds_op_store       |
-| multiply   |  34,556 |  24,509 | 0.709 | load_use                     |
-| median     |  11,549 |   7,619 | 0.660 | branch mispredict (data-dep) |
+| Dhrystone  | 437,530 | 288,365 | 0.659 | ds_operand (store-dep chain) |
+| memcpy     | 164,976 | 108,884 | 0.660 | load_use + ds_op_store       |
+| multiply   |  34,979 |  24,504 | 0.701 | load_use                     |
+| median     |  11,090 |   7,621 | 0.687 | branch mispredict (data-dep) |
 
 Run individually with:
 
@@ -100,6 +102,6 @@ make -C test/c/bench
 |-------|------------------------------------------|--------------|
 | 1     | RV64I scalar pipeline + caches + privilege + MMU + Linux boot | complete |
 | 2     | ALU-side OoO: Tomasulo + ROB + RAT, dual-issue, FP RS, multi-cycle FU non-blocking | complete |
-| 3     | Memory OoO: Store RS, Load Queue OoO issue, store-to-load forwarding, speculative load | planned  |
+| 3     | Memory OoO: Store RS, Load Queue OoO issue, store-to-load forwarding, speculative load | complete |
 
 See `CLAUDE.md` for development conventions.
