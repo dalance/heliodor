@@ -29,7 +29,8 @@
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
-#define DTB_ADDR        0x80AB9000
+/* DTB sits after the kernel Image (~19MB at the moment, plus headroom). */
+#define DTB_ADDR        0x81400000
 
 /* Per-hart parking scratch: 0x81FFE000 + 0x100*hartid.
  * Layout (256 bytes per hart):
@@ -105,7 +106,7 @@ _start:
      * it — when they amoadd they'll get a non-zero return and fall into
      * .Lsecondary_start (the spinwait protocol). */
     bnez s11, _skip_lottery
-    li   t0, 0x80A85380      /* hart_lottery PA (from kernel nm) */
+    li   t0, 0x812e6668      /* hart_lottery PA (from kernel nm) */
     sd   zero, 0(t0)
 _skip_lottery:
 
