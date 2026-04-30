@@ -106,7 +106,7 @@ _start:
      * it — when they amoadd they'll get a non-zero return and fall into
      * .Lsecondary_start (the spinwait protocol). */
     bnez s11, _skip_lottery
-    li   t0, 0x812e6668      /* hart_lottery PA (from kernel nm) */
+    li   t0, 0x812e65e8      /* hart_lottery PA (from kernel nm) */
     sd   zero, 0(t0)
 _skip_lottery:
 
