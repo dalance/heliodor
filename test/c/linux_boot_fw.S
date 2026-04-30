@@ -45,6 +45,7 @@
 #define SBI_EXT_BASE            0x10
 #define SBI_EXT_TIME            0x54494D45
 #define SBI_EXT_SRST            0x53525354
+#define SBI_EXT_HSM             0x48534D    /* "HSM" */
 
 /* ============================================================
  * Entry point
@@ -205,6 +206,9 @@ m_handle_ecall:
     /* SRST extension (0x53525354) */
     li t0, SBI_EXT_SRST
     beq a7, t0, sbi_srst
+    /* HSM extension (0x48534D) */
+    li t0, SBI_EXT_HSM
+    beq a7, t0, sbi_hsm
 
     /* Unknown: SBI_ERR_NOT_SUPPORTED (-2) */
     li a0, -2
@@ -279,6 +283,8 @@ sbi_base_probe_extension:
     beq t3, t0, 1f                  /* TIME */
     li t0, SBI_EXT_SRST
     beq t3, t0, 1f                  /* SRST */
+    li t0, SBI_EXT_HSM
+    beq t3, t0, 1f                  /* HSM */
     j sbi_return                    /* not available */
 1:  li a1, 1                        /* available */
     j sbi_return
@@ -309,6 +315,63 @@ sbi_time:
     li a1, 0
     j sbi_return
 
+/* ---- SBI: Hart State Management extension (EID 0x48534D) ---- */
+sbi_hsm:
+    /* FID 0: HART_START(a0=hartid, a1=start_addr, a2=opaque)
+     * FID 1: HART_STOP
+     * FID 2: HART_GET_STATUS
+     */
+    li t0, 0
+    beq a6, t0, sbi_hsm_hart_start
+    li t0, 1
+    beq a6, t0, sbi_hsm_hart_stop
+    li t0, 2
+    beq a6, t0, sbi_hsm_hart_get_status
+    /* Other FIDs not implemented */
+    li a0, -2   /* SBI_ERR_NOT_SUPPORTED */
+    li a1, 0
+    j sbi_return
+
+sbi_hsm_hart_start:
+    /* a0 = target hartid (passed via t3 we saved); but caller layout has
+     * already mv'd t3 = a0. Original a0 is in t3 (saved in m_handle_ecall).
+     * a1, a2 are still live registers (caller didn't touch them yet).
+     */
+    /* Per-hart scratch: HART_SCRATCH_BASE + 0x100 * target_hart */
+    li   t0, HART_SCRATCH_BASE
+    slli t1, t3, 8           /* 0x100 * hartid */
+    add  t0, t0, t1
+    sd   a1, 0(t0)           /* jump_addr */
+    sd   a2, 8(t0)           /* opaque */
+    li   t1, 2
+    sd   t1, 16(t0)          /* state = HART_START_PENDING */
+
+    /* Send msip to target hart: CLINT_MSIP_BASE + 4*target_hart */
+    li   t0, CLINT_MSIP_BASE
+    slli t1, t3, 2           /* 4 * hartid */
+    add  t0, t0, t1
+    li   t1, 1
+    sw   t1, 0(t0)           /* msip[target] = 1 */
+
+    li a0, 0    /* SBI_SUCCESS */
+    li a1, 0
+    j sbi_return
+
+sbi_hsm_hart_stop:
+    /* For simplicity: clear our msip and re-enter park */
+    li a0, 0
+    li a1, 0
+    j sbi_return
+
+sbi_hsm_hart_get_status:
+    /* Read state from per-hart scratch (HART_SCRATCH_BASE + 0x100 * t3) */
+    li   t0, HART_SCRATCH_BASE
+    slli t1, t3, 8
+    add  t0, t0, t1
+    ld   a1, 16(t0)
+    li   a0, 0
+    j sbi_return
+
 /* ---- SBI: System Reset extension (EID 0x53525354) ---- */
 sbi_srst:
     /* FID 0: system_reset(a0=reset_type, a1=reset_reason) */
@@ -334,46 +397,99 @@ sbi_return:
  * ============================================================ */
     .balign 4
 _secondary_park:
-    /* Use top-of-DRAM page minus 0x80*hartid as M-mode stack/scratch */
+    /* Full M-mode init for secondaries: trap vector, delegation, mtimecmp,
+     * per-hart scratch, msip clear, MSIE-only enable. mstatus.MIE stays 0
+     * so MSIP wakes wfi without taking a trap (we read scratch + mret to
+     * S-mode below).
+     */
     csrr  t0, mhartid
+
+    /* Per-hart mscratch (0x81FFF000 - 0x80*hartid) */
     li    t1, 0x81FFF000
-    slli  t2, t0, 7        /* 0x80 * hartid */
+    slli  t2, t0, 7
     sub   t1, t1, t2
     csrw  mscratch, t1
 
-    /* Compute per-hart parking scratch */
+    /* Trap vector */
+    la    t1, m_trap_handler
+    csrw  mtvec, t1
+
+    /* Allow S-mode counter access */
+    li    t1, 7
+    csrw  mcounteren, t1
+
+    /* Same delegation as hart 0 (medeleg + mideleg) */
+    li    t1, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
+    csrw  medeleg, t1
+    li    t1, 0x222
+    csrw  mideleg, t1
+
+    /* Per-hart mtimecmp = max */
+    li    t1, CLINT_MTIMECMP
+    slli  t2, t0, 3        /* 8 * hartid */
+    add   t1, t1, t2
+    li    t2, -1
+    sd    t2, 0(t1)
+
+    /* Per-hart parking scratch.
+     * SBI HSM state encoding: 0=STARTED, 1=STOPPED, 2=START_PENDING.
+     * Secondaries enter park as STOPPED so the kernel calls HART_START.
+     */
     li    t1, HART_SCRATCH_BASE
     slli  t2, t0, 8        /* 0x100 * hartid */
     add   t1, t1, t2
     sd    zero, 0(t1)      /* jump_addr = 0 */
-    sd    zero, 8(t1)      /* opaque = 0 */
-    sd    zero, 16(t1)     /* state = 0 (stopped) */
+    sd    zero, 8(t1)      /* opaque    = 0 */
+    li    t3, 1
+    sd    t3, 16(t1)       /* state = 1 (HART_STOPPED) */
 
-    /* Set up trap vector (re-use M-mode handler — most traps will be
-     * undelegated for parked harts) */
-    la    t1, m_trap_handler
-    csrw  mtvec, t1
-
-    /* Clear msip[hartid] in case it was set at reset */
+    /* Clear msip[hartid] */
     li    t1, CLINT_MSIP_BASE
-    slli  t2, t0, 2        /* msip stride = 4 bytes */
-    add   t1, t1, t2
-    sw    zero, 0(t1)
-
-    /* Enable MSIP only (used as IPI/wake signal). MTIE could be added
-     * later for periodic wake when SBI HSM is implemented. */
-    li    t1, 0x8          /* MIE.MSIE = bit 3 */
-    csrw  mie, t1
-
-1:  wfi
-    /* If we got here, an interrupt fired. Inspect msip and either jump
-     * to the requested S-mode entry or loop back. SBI HSM logic is TODO;
-     * until then we just clear msip and re-park. */
-    li    t1, CLINT_MSIP_BASE
-    csrr  t0, mhartid
     slli  t2, t0, 2
     add   t1, t1, t2
     sw    zero, 0(t1)
+
+    /* Enable MSIE only (wake signal). mstatus.MIE = 0. */
+    li    t1, 0x8          /* MIE.MSIE = bit 3 */
+    csrw  mie, t1
+
+    /* Initial stvec for S-mode (until kernel sets its own) */
+    la    t1, s_debug_trap
+    csrw  stvec, t1
+
+1:  wfi
+    /* Wake: check per-hart scratch for a HART_START request */
+    csrr  t0, mhartid
+    li    t1, HART_SCRATCH_BASE
+    slli  t2, t0, 8
+    add   t1, t1, t2
+    ld    t2, 0(t1)        /* jump_addr */
+    beqz  t2, 2f           /* spurious wake */
+
+    /* HART_START: prepare mret into S-mode kernel entry */
+    ld    a1, 8(t1)        /* opaque → a1 */
+    sd    zero, 16(t1)     /* state = 0 (HART_STARTED) */
+
+    /* Clear msip[hartid] */
+    li    t3, CLINT_MSIP_BASE
+    slli  t4, t0, 2
+    add   t3, t3, t4
+    sw    zero, 0(t3)
+
+    /* mstatus: MPP=01 (S-mode), MPIE=0 (IRQs off until kernel re-enables) */
+    li    t3, (1 << 11) | (1 << 7)
+    csrw  mstatus, t3
+
+    /* mepc = jump_addr; a0 = hartid */
+    csrw  mepc, t2
+    csrr  a0, mhartid
+    mret
+
+2:  /* Spurious wake: clear msip and re-park */
+    li    t3, CLINT_MSIP_BASE
+    slli  t4, t0, 2
+    add   t3, t3, t4
+    sw    zero, 0(t3)
     j     1b
 
 /* ============================================================
