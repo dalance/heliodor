@@ -1,0 +1,199 @@
+// Multi-hart heliodor SoC (Phase 4).
+//
+// N heliodor_core copies (HART_ID = 0..N-1) + a single shared CLINT/PLIC/UART.
+// MMIO requests are arbitrated by memory_bus; imem/iptw/dmem stay per-hart and
+// are exported as N-wide arrays so the test harness attaches a multi-port DRAM.
+//
+// All heliodor_core o_dbg_* ports are intentionally left unconnected — the
+// Veryl analyzer raises warnings, not errors.
+pub module heliodor_soc #(
+    param N_HARTS: u32 = 2,
+    param RESET_PC: u64 = 0,
+) (
+    clk: input clock,
+    rst: input reset,
+    // Per-hart instruction memory
+    o_imem_addr : output logic<64> [N_HARTS],
+    i_imem_rdata: input  logic<32> [N_HARTS],
+    o_imem_ren  : output logic     [N_HARTS],
+    o_iptw_addr : output logic<64> [N_HARTS],
+    o_iptw_req  : output logic     [N_HARTS],
+    i_iptw_rdata: input  logic<64> [N_HARTS],
+    // Per-hart data memory (DRAM only — MMIO factored out)
+    o_dmem_addr : output logic<64> [N_HARTS],
+    o_dmem_wdata: output logic<64> [N_HARTS],
+    i_dmem_rdata: input  logic<64> [N_HARTS],
+    o_dmem_wen  : output logic     [N_HARTS],
+    o_dmem_ren  : output logic     [N_HARTS],
+    o_dmem_wstrb: output logic<8>  [N_HARTS],
+    // External interrupt sources (shared PLIC)
+    i_ext_irq: input logic<32>,
+    // UART (single shared instance)
+    o_uart_tx      : output logic   ,
+    o_uart_data    : output logic<8>,
+    i_uart_rx_data : input  logic<8>,
+    i_uart_rx_valid: input  logic   ,
+) {
+    // ============================================================
+    // Per-hart wires (core ↔ memory_bus / peripherals)
+    // ============================================================
+    var core_mmio_paddr : logic<32> [N_HARTS];
+    var core_mmio_wdata : logic<64> [N_HARTS];
+    var core_mmio_wstrb : logic<8>  [N_HARTS];
+    var core_mmio_wen   : logic     [N_HARTS];
+    var core_mmio_ren   : logic     [N_HARTS];
+    var core_stall_mem  : logic     [N_HARTS];
+    var core_clint_sel  : logic     [N_HARTS];
+    var core_plic_sel   : logic     [N_HARTS];
+    var core_uart_sel   : logic     [N_HARTS];
+
+    // Granted MMIO bundle (memory_bus → CLINT/PLIC/UART)
+    var bus_paddr      : logic<32>;
+    var bus_wdata      : logic<64>;
+    var bus_wstrb      : logic<8> ;
+    var bus_wen_clint  : logic    ;
+    var bus_ren_clint  : logic    ;
+    var bus_wen_plic   : logic    ;
+    var bus_ren_plic   : logic    ;
+    var bus_wen_uart   : logic    ;
+    var bus_ren_uart   : logic    ;
+
+    // Peripheral rdata (broadcast to all cores)
+    var clint_rdata: logic<64>;
+    var plic_rdata : logic<64>;
+    var uart_rdata : logic<8> ;
+    var uart_irq   : logic    ;
+
+    // Per-hart interrupt arrays from CLINT / PLIC
+    var timer_irq_arr : logic [N_HARTS];
+    var sw_irq_arr    : logic [N_HARTS];
+    var plic_irq_m_arr: logic [N_HARTS];
+    var plic_irq_s_arr: logic [N_HARTS];
+    var mtime_val     : logic<64>;
+
+    // ============================================================
+    // Heliodor cores (generate-for)
+    // Debug outputs are deliberately left unconnected.
+    // ============================================================
+    for h in 0..N_HARTS: gen_core {
+        inst u_core: heliodor_core #(
+            DEBUG   : 1                    ,
+            RESET_PC: RESET_PC             ,
+            HART_ID : h as 8               ,
+        ) (
+            clk                                 ,
+            rst                                 ,
+            o_imem_addr  : o_imem_addr[h]       ,
+            i_imem_rdata : i_imem_rdata[h]      ,
+            o_imem_ren   : o_imem_ren[h]        ,
+            o_iptw_addr  : o_iptw_addr[h]       ,
+            o_iptw_req   : o_iptw_req[h]        ,
+            i_iptw_rdata : i_iptw_rdata[h]      ,
+            o_dmem_addr  : o_dmem_addr[h]       ,
+            o_dmem_wdata : o_dmem_wdata[h]      ,
+            i_dmem_rdata : i_dmem_rdata[h]      ,
+            o_dmem_wen   : o_dmem_wen[h]        ,
+            o_dmem_ren   : o_dmem_ren[h]        ,
+            o_dmem_wstrb : o_dmem_wstrb[h]      ,
+            o_mmio_paddr : core_mmio_paddr[h]   ,
+            o_mmio_wdata : core_mmio_wdata[h]   ,
+            o_mmio_wstrb : core_mmio_wstrb[h]   ,
+            o_mmio_wen   : core_mmio_wen[h]     ,
+            o_mmio_ren   : core_mmio_ren[h]     ,
+            o_stall_mem  : core_stall_mem[h]    ,
+            o_clint_sel  : core_clint_sel[h]    ,
+            o_plic_sel   : core_plic_sel[h]     ,
+            o_uart_sel   : core_uart_sel[h]     ,
+            i_clint_rdata: clint_rdata          ,
+            i_plic_rdata : plic_rdata           ,
+            i_uart_rdata : uart_rdata           ,
+            i_timer_irq  : timer_irq_arr[h]     ,
+            i_sw_irq     : sw_irq_arr[h]        ,
+            i_plic_irq_m : plic_irq_m_arr[h]    ,
+            i_plic_irq_s : plic_irq_s_arr[h]    ,
+            i_mtime      : mtime_val            ,
+        );
+    }
+
+    // ============================================================
+    // memory_bus
+    // ============================================================
+    inst u_mmio_bus: memory_bus #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk             ,
+        rst             ,
+        i_mmio_paddr    : core_mmio_paddr,
+        i_mmio_wdata    : core_mmio_wdata,
+        i_mmio_wstrb    : core_mmio_wstrb,
+        i_mmio_wen      : core_mmio_wen  ,
+        i_mmio_ren      : core_mmio_ren  ,
+        i_clint_sel     : core_clint_sel ,
+        i_plic_sel      : core_plic_sel  ,
+        i_uart_sel      : core_uart_sel  ,
+        i_stall_mem     : core_stall_mem ,
+        o_mmio_paddr    : bus_paddr      ,
+        o_mmio_wdata    : bus_wdata      ,
+        o_mmio_wstrb    : bus_wstrb      ,
+        o_mmio_wen_clint: bus_wen_clint  ,
+        o_mmio_ren_clint: bus_ren_clint  ,
+        o_mmio_wen_plic : bus_wen_plic   ,
+        o_mmio_ren_plic : bus_ren_plic   ,
+        o_mmio_wen_uart : bus_wen_uart   ,
+        o_mmio_ren_uart : bus_ren_uart   ,
+    );
+
+    // ============================================================
+    // CLINT
+    // ============================================================
+    inst u_clint: clint #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk                                ,
+        rst                                ,
+        i_addr     : bus_paddr[15:0]       ,
+        i_wdata    : bus_wdata             ,
+        i_wen      : bus_wen_clint         ,
+        i_ren      : bus_ren_clint         ,
+        o_rdata    : clint_rdata           ,
+        o_timer_irq: timer_irq_arr         ,
+        o_sw_irq   : sw_irq_arr            ,
+        o_mtime    : mtime_val             ,
+    );
+
+    // ============================================================
+    // PLIC
+    // ============================================================
+    inst u_plic: plic #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk                                          ,
+        rst                                          ,
+        i_src  : i_ext_irq | {21'd0, uart_irq, 10'd0},
+        i_addr : bus_paddr[23:0]                     ,
+        i_wdata: bus_wdata                           ,
+        i_wen  : bus_wen_plic                        ,
+        i_ren  : bus_ren_plic                        ,
+        o_rdata: plic_rdata                          ,
+        o_irq_m: plic_irq_m_arr                      ,
+        o_irq_s: plic_irq_s_arr                      ,
+    );
+
+    // ============================================================
+    // UART
+    // ============================================================
+    inst u_uart: uart (
+        clk                                ,
+        rst                                ,
+        i_addr    : bus_paddr[2:0]         ,
+        i_wdata   : bus_wdata[7:0]         ,
+        i_wen     : bus_wen_uart           ,
+        i_ren     : bus_ren_uart           ,
+        o_rdata   : uart_rdata             ,
+        o_tx_valid: o_uart_tx              ,
+        o_tx_data : o_uart_data            ,
+        i_rx_data : i_uart_rx_data         ,
+        i_rx_valid: i_uart_rx_valid        ,
+        o_irq     : uart_irq               ,
+    );
+}

@@ -22,12 +22,22 @@
     .section .text.start, "ax"
     .global _start
 
+#define CLINT_BASE      0x02000000
+#define CLINT_MSIP_BASE 0x02000000
 #define CLINT_MTIMECMP  0x02004000
 #define CLINT_MTIME     0x0200BFF8
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
 #define DTB_ADDR        0x80AB9000
+
+/* Per-hart parking scratch: 0x81FFE000 + 0x100*hartid.
+ * Layout (256 bytes per hart):
+ *   +0x00 : jump_addr  (S-mode entry, written by HART_START SBI)
+ *   +0x08 : opaque     (a1 to pass)
+ *   +0x10 : state      (0=stopped, 1=started, 2=resumed)
+ */
+#define HART_SCRATCH_BASE 0x81FFE000
 
 /* SBI extension IDs */
 #define SBI_LEGACY_SET_TIMER    0x00
@@ -42,6 +52,14 @@
 _start:
     /* Disable interrupts during init */
     csrw mie, zero
+
+    /* Per-hart split: hart 0 boots Linux, harts ≥1 park awaiting MSIP wake.
+     * mhartid is the canonical id, not a0 (the bootloader contract sets a0
+     * to 0/hartid by convention but hart 1+ on heliodor enter at PC=0 with
+     * a0 stale, so use mhartid).
+     */
+    csrr a0, mhartid
+    bnez a0, _secondary_park
 
     /* Set up M-mode trap handler */
     la t0, m_trap_handler
@@ -304,6 +322,59 @@ sbi_return:
     addi t0, t0, 4
     csrw mepc, t0
     mret
+
+/* ============================================================
+ * Secondary hart parking loop.
+ *
+ * Harts ≥ 1 enter here at reset. They wait for an MSIP wake (HART_START
+ * SBI from hart 0). On wake they read jump_addr/opaque from per-hart
+ * scratch and mret into S-mode. SBI HSM HART_START itself is not yet
+ * wired; until then secondary harts park forever, which is enough for
+ * Linux to recognize them via DTB without bringing them online.
+ * ============================================================ */
+    .balign 4
+_secondary_park:
+    /* Use top-of-DRAM page minus 0x80*hartid as M-mode stack/scratch */
+    csrr  t0, mhartid
+    li    t1, 0x81FFF000
+    slli  t2, t0, 7        /* 0x80 * hartid */
+    sub   t1, t1, t2
+    csrw  mscratch, t1
+
+    /* Compute per-hart parking scratch */
+    li    t1, HART_SCRATCH_BASE
+    slli  t2, t0, 8        /* 0x100 * hartid */
+    add   t1, t1, t2
+    sd    zero, 0(t1)      /* jump_addr = 0 */
+    sd    zero, 8(t1)      /* opaque = 0 */
+    sd    zero, 16(t1)     /* state = 0 (stopped) */
+
+    /* Set up trap vector (re-use M-mode handler — most traps will be
+     * undelegated for parked harts) */
+    la    t1, m_trap_handler
+    csrw  mtvec, t1
+
+    /* Clear msip[hartid] in case it was set at reset */
+    li    t1, CLINT_MSIP_BASE
+    slli  t2, t0, 2        /* msip stride = 4 bytes */
+    add   t1, t1, t2
+    sw    zero, 0(t1)
+
+    /* Enable MSIP only (used as IPI/wake signal). MTIE could be added
+     * later for periodic wake when SBI HSM is implemented. */
+    li    t1, 0x8          /* MIE.MSIE = bit 3 */
+    csrw  mie, t1
+
+1:  wfi
+    /* If we got here, an interrupt fired. Inspect msip and either jump
+     * to the requested S-mode entry or loop back. SBI HSM logic is TODO;
+     * until then we just clear msip and re-park. */
+    li    t1, CLINT_MSIP_BASE
+    csrr  t0, mhartid
+    slli  t2, t0, 2
+    add   t1, t1, t2
+    sw    zero, 0(t1)
+    j     1b
 
 /* ============================================================
  * S-mode debug trap handler (initial stvec before kernel sets its own)
