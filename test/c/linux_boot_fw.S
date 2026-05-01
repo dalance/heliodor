@@ -29,8 +29,12 @@
 #define UART_BASE       0x10000000
 
 #define KERNEL_ENTRY    0x80000000
-/* DTB sits after the kernel Image (~19MB at the moment, plus headroom). */
+/* DTB physical address — build-time override via -DDTB_ADDR=0x...
+ * Default is the 2-hart hex layout (DTB after the 19MB kernel image).
+ * The 1-hart hex predates the layout fix and embeds the DTB at 0x80AB9000. */
+#ifndef DTB_ADDR
 #define DTB_ADDR        0x81400000
+#endif
 
 /* Per-hart parking scratch: 0x81FFE000 + 0x100*hartid.
  * Layout (256 bytes per hart):
@@ -57,6 +61,14 @@ _start:
 
     /* Save hartid for later (s11 is callee-saved across our flow). */
     csrr s11, mhartid
+
+    /* Secondary harts (mhartid != 0) park immediately and wait for SBI
+     * HSM HART_START. Avoids racing the kernel's hart_lottery amoadd
+     * since heliodor's AMO is per-hart dcache, not bus-atomic across
+     * harts — without this branch both harts would win the lottery and
+     * race through primary boot. _secondary_park sets up its own M-mode
+     * state (trap vector, mscratch, delegation, mtimecmp, scratch). */
+    bnez s11, _secondary_park
 
     /* Set up M-mode trap handler (per-hart, but the same handler) */
     la t0, m_trap_handler
@@ -117,7 +129,7 @@ _skip_lottery:
     csrw mepc, t0
 
     mv   a0, s11             /* a0 = hartid */
-    li   a1, DTB_ADDR        /* a1 = DTB physical address */
+    li   a1, DTB_ADDR        /* a1 = DTB physical address (build-time) */
 
     mret
 
