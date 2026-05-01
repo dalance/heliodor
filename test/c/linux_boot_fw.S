@@ -146,11 +146,20 @@ _skip_lottery:
  * ============================================================ */
     .balign 4
 m_trap_handler:
-    /* Save t0-t2 to mscratch area (use mscratch as temp stack) */
+    /* Save t0-t6 to mscratch area (use mscratch as temp stack).
+     * SBI v0.1 callers expect tn registers to be preserved across ecalls,
+     * so the firmware must save/restore them. Otherwise, the kernel's
+     * compiler-assumed t0-t6 values get clobbered by our handlers and
+     * subsequent kernel code dereferences garbage (manifests as crashes
+     * like "spinlock at 0x207ff400" page faults). */
     csrrw sp, mscratch, sp    /* swap sp and mscratch */
     sd t0, 0(sp)
     sd t1, 8(sp)
     sd t2, 16(sp)
+    sd t3, 24(sp)
+    sd t4, 32(sp)
+    sd t5, 40(sp)
+    sd t6, 48(sp)
 
     csrr t0, mcause
 
@@ -198,10 +207,14 @@ m_handle_timer:
     /* Disable MTIE to prevent re-entry */
     li t0, 0x80     /* MIE.MTIE = bit 7 */
     csrc mie, t0
-    /* Restore t0-t2 and sp */
+    /* Restore t0-t6 and sp */
     ld t0, 0(sp)
     ld t1, 8(sp)
     ld t2, 16(sp)
+    ld t3, 24(sp)
+    ld t4, 32(sp)
+    ld t5, 40(sp)
+    ld t6, 48(sp)
     csrrw sp, mscratch, sp    /* restore sp */
     mret
 
@@ -240,24 +253,32 @@ m_handle_msip:
 
     csrr a0, mhartid
 
-    /* Restore t0-t2 and sp before mret. The S-mode sp is whatever was
+    /* Restore t0-t6 and sp before mret. The S-mode sp is whatever was
      * in sp when the trap fired; secondary_start_sbi resets it from
      * init_thread_union, so its current value doesn't matter. */
     ld   t0, 0(sp)
     ld   t1, 8(sp)
     ld   t2, 16(sp)
+    ld   t3, 24(sp)
+    ld   t4, 32(sp)
+    ld   t5, 40(sp)
+    ld   t6, 48(sp)
     csrrw sp, mscratch, sp
     mret
 
 .Lspurious_msip:
-    /* No HART_START pending — this is a kernel-issued IPI (via SBI sPI).
-     * Deliver it to S-mode by raising sip.SSIP so the kernel's IPI
-     * handler runs. msip was already cleared above. */
+    /* No HART_START pending — this is a kernel-issued IPI (via SBI sPI
+     * or legacy SEND_IPI). Deliver to S-mode by raising sip.SSIP so the
+     * kernel's IPI handler runs. msip was already cleared above. */
     li   t0, 0x2     /* SIP.SSIP = bit 1 */
     csrs mip, t0
     ld   t0, 0(sp)
     ld   t1, 8(sp)
     ld   t2, 16(sp)
+    ld   t3, 24(sp)
+    ld   t4, 32(sp)
+    ld   t5, 40(sp)
+    ld   t6, 48(sp)
     csrrw sp, mscratch, sp
     mret
 
@@ -274,6 +295,13 @@ m_handle_ecall:
     beq a7, t0, sbi_legacy_set_timer
     li t0, SBI_LEGACY_PUTCHAR
     beq a7, t0, sbi_legacy_putchar
+    /* Legacy SEND_IPI / REMOTE_FENCE_I / REMOTE_SFENCE_VMA (EID 4-7)
+     * fall through to the unknown-EID NOT_SUPPORTED return. Implementing
+     * SEND_IPI as msip-to-all caused kthread crashes (kworker fetch at
+     * PC 0x207ff400), and gating on hart state caused hart 1 to never
+     * transition to S-mode. Until we understand how the working baseline
+     * actually wakes hart 1 (HSM HART_START seems to fire despite SBI v01
+     * detected message), keep this disabled. */
     /* Legacy shutdown (EID 0x08) — reuse SRST halt */
     li t0, 8
     beq a7, t0, sbi_srst
@@ -334,6 +362,44 @@ sbi_legacy_set_timer:
 sbi_legacy_putchar:
     li t0, UART_BASE
     sb a0, 0(t0)
+    li a0, 0
+    j sbi_return
+
+/* ---- SBI: Legacy SEND_IPI (EID 0x04) ----
+ * a0 = hart_mask pointer (S-mode VA). We can't easily dereference it
+ * from M-mode (no MMU here), so we ignore the mask and IPI every OTHER
+ * hart. This is functionally correct — the receiving hart will set
+ * sip.SSIP via m_handle_msip's spurious path, and the kernel's IPI
+ * handler will check the actual cpumask in software. The cost is that
+ * a hart not in the mask still wakes briefly to find no work for it. */
+sbi_legacy_send_ipi:
+    /* For each potentially-receiving hart, only IPI it if its
+     * scratch[hart].state == HART_STARTED (0). Hart still in
+     * STOPPED (1) or START_PENDING (2) shouldn't get an IPI: the
+     * kernel's SSIP dispatch isn't wired before HSM HART_START
+     * dispatches the hart into S-mode (= sets state=0). */
+    li   t0, CLINT_MSIP_BASE
+    li   t1, HART_SCRATCH_BASE
+    /* hart 0 */
+    ld   t2, 16(t1)             /* scratch[0].state */
+    bnez t2, .Lipi_skip0
+    li   t3, 1
+    sw   t3, 0(t0)              /* msip[0] = 1 */
+.Lipi_skip0:
+    /* hart 1 */
+    ld   t2, 272(t1)            /* scratch[1].state @ +0x100+16 = +272 */
+    bnez t2, .Lipi_skip1
+    li   t3, 1
+    sw   t3, 4(t0)              /* msip[1] = 1 */
+.Lipi_skip1:
+    li   a0, 0
+    j    sbi_return
+
+/* ---- SBI: Legacy REMOTE_FENCE_I / REMOTE_SFENCE_VMA stubs ----
+ * Real impl needs to IPI other harts and run the fence there. We just
+ * succeed; for the heliodor 2-hart smoke test the per-hart TLB / icache
+ * mostly stays in sync via memory_bus broadcast invalidates. */
+sbi_legacy_ok_stub:
     li a0, 0
     j sbi_return
 
@@ -533,11 +599,24 @@ sbi_srst:
     li x3, 0xAA
     j .         /* halt */
 
-/* ---- Common SBI return: advance mepc past ecall ---- */
+/* ---- Common SBI return: advance mepc past ecall + restore tn ----
+ * SBI v0.1 spec requires t0-t6 to be preserved across SBI ecalls.
+ * m_handle_ecall swapped sp to S-mode sp on entry; re-swap here to
+ * access the M-mode stack (which holds saved S-mode t0-t6 from the
+ * m_trap_handler entry). Then load them back, swap sp again, mret. */
 sbi_return:
-    csrr t0, mepc
-    addi t0, t0, 4
-    csrw mepc, t0
+    csrrw sp, mscratch, sp        /* sp ← M-mode stack, mscratch ← S-mode sp */
+    csrr  t0, mepc
+    addi  t0, t0, 4
+    csrw  mepc, t0
+    ld    t0, 0(sp)
+    ld    t1, 8(sp)
+    ld    t2, 16(sp)
+    ld    t3, 24(sp)
+    ld    t4, 32(sp)
+    ld    t5, 40(sp)
+    ld    t6, 48(sp)
+    csrrw sp, mscratch, sp        /* sp ← S-mode sp, mscratch ← M-mode stack */
     mret
 
 /* ============================================================
