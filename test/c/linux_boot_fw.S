@@ -62,11 +62,14 @@ _start:
     /* Save hartid for later (s11 is callee-saved across our flow). */
     csrr s11, mhartid
 
-    /* Phase 5: heliodor's AMO is now bus-atomic via memory_bus single
-     * grant + amo_inflight lock, so kernel hart_lottery (amoadd) selects
-     * exactly one primary across harts. Both harts mret into the kernel
-     * — one wins the lottery and runs primary boot, the other falls to
-     * .Lsecondary_start and spinwaits __cpu_up_stack_pointer. */
+    /* Phase 5 has bus-atomic AMO via memory_bus, but the kernel
+     * hart_lottery path still doesn't reliably online secondaries
+     * across the AMO boundary (likely a separate race in the early
+     * boot path before MMU enable). Until that is investigated,
+     * keep secondaries parked in M-mode until SBI HSM HART_START
+     * wakes them — the path that demonstrably reaches set_cpu_online
+     * and brings up "smp: Brought up 1 node, 2 CPUs". */
+    bnez s11, _secondary_park
 
     /* Set up M-mode trap handler (per-hart, but the same handler) */
     la t0, m_trap_handler
@@ -99,8 +102,12 @@ _start:
     li   t1, -1
     sd   t1, 0(t0)
 
-    /* Enable machine timer interrupt (kernel re-enables MTIE via SBI set_timer) */
-    li t0, 0x80
+    /* Enable machine timer interrupt (MTIE bit 7) and software interrupt
+     * (MSIE bit 3). MSIE is the wake signal for SBI HSM HART_START — when
+     * the kernel calls HART_START(target_hart, ...) the firmware sets
+     * msip[target] which triggers an M-mode trap to m_handle_msip on the
+     * target hart, redirecting it to S-mode at the requested entry. */
+    li t0, 0x88
     csrw mie, t0
 
     /* mstatus: MPP=01 (S-mode), MPIE=1, SIE=1 */
@@ -168,6 +175,15 @@ m_handle_irq:
     li t2, 7
     beq t1, t2, m_handle_timer
 
+    /* Machine software interrupt (code 3) — SBI HSM HART_START wake.
+     * Kernel writes msip[hartid] after writing scratch[hartid].jump_addr;
+     * we clear msip, read jump_addr, and mret to S-mode at jump_addr.
+     * Works whether the receiving hart was in M-mode wfi (parked) or
+     * S-mode (e.g. .Lwait_for_cpu_up spinwait when hart_lottery is in
+     * play). */
+    li t2, 3
+    beq t1, t2, m_handle_msip
+
     /* Other interrupt: halt */
     li x3, 0xDD
     j .
@@ -184,6 +200,53 @@ m_handle_timer:
     ld t1, 8(sp)
     ld t2, 16(sp)
     csrrw sp, mscratch, sp    /* restore sp */
+    mret
+
+m_handle_msip:
+    /* Clear msip[mhartid] */
+    csrr t1, mhartid
+    li   t2, CLINT_MSIP_BASE
+    slli t0, t1, 2
+    add  t2, t2, t0
+    sw   zero, 0(t2)
+
+    /* Read scratch[mhartid].jump_addr */
+    li   t2, HART_SCRATCH_BASE
+    slli t0, t1, 8           /* 0x100 * hartid */
+    add  t2, t2, t0
+    ld   t0, 0(t2)           /* jump_addr */
+    beqz t0, .Lspurious_msip /* spurious: just resume */
+
+    /* HART_START dispatch: redirect to S-mode at jump_addr.
+     * a0 = hartid, a1 = opaque (per SBI HSM spec). */
+    ld   a1, 8(t2)           /* opaque */
+    sd   zero, 16(t2)        /* state = HART_STARTED */
+
+    /* mstatus: MPP=01 (S-mode), MPIE=0 (S-mode IRQs off until kernel
+     * re-enables). */
+    li   t0, (1 << 11) | (1 << 7)
+    csrw mstatus, t0
+
+    /* mepc = jump_addr */
+    ld   t0, 0(t2)
+    csrw mepc, t0
+    csrr a0, mhartid
+
+    /* Restore t0-t2 and sp before mret. The S-mode sp is whatever was
+     * in sp when the trap fired; secondary_start_sbi resets it from
+     * init_thread_union, so its current value doesn't matter. */
+    ld   t0, 0(sp)
+    ld   t1, 8(sp)
+    ld   t2, 16(sp)
+    csrrw sp, mscratch, sp
+    mret
+
+.Lspurious_msip:
+    /* No HART_START pending — just clear msip and return to S-mode. */
+    ld   t0, 0(sp)
+    ld   t1, 8(sp)
+    ld   t2, 16(sp)
+    csrrw sp, mscratch, sp
     mret
 
 /* ---- ECALL handling (SBI) ---- */
@@ -224,7 +287,15 @@ m_handle_ecall:
 
 /* ---- SBI: Legacy set_timer (EID 0x00) ---- */
 sbi_legacy_set_timer:
-    li t0, CLINT_MTIMECMP
+    /* Per-hart mtimecmp: CLINT_MTIMECMP + 8*mhartid. The previous
+     * implementation always wrote hart 0's mtimecmp, so on hart 1 the
+     * timer never fired, scheduler ticks never arrived, kernel_init
+     * kthread never got scheduled, and 2-hart Linux boot deadlocked
+     * inside sched_init_smp. */
+    csrr t1, mhartid
+    slli t2, t1, 3
+    li   t0, CLINT_MTIMECMP
+    add  t0, t0, t2
     sd a0, 0(t0)
     /* Clear STIP */
     li t0, 0x20
@@ -311,8 +382,11 @@ sbi_base_get_mimpid:
 
 /* ---- SBI: Timer extension (EID 0x54494D45) ---- */
 sbi_time:
-    /* FID 0: set_timer(a0=stime_value) */
-    li t0, CLINT_MTIMECMP
+    /* FID 0: set_timer(a0=stime_value) — per-hart mtimecmp. */
+    csrr t1, mhartid
+    slli t2, t1, 3
+    li   t0, CLINT_MTIMECMP
+    add  t0, t0, t2
     sd a0, 0(t0)
     li t0, 0x20
     csrc mip, t0
