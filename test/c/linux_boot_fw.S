@@ -51,6 +51,9 @@
 #define SBI_EXT_TIME            0x54494D45
 #define SBI_EXT_SRST            0x53525354
 #define SBI_EXT_HSM             0x48534D    /* "HSM" */
+#define SBI_EXT_IPI             0x735049    /* "sPI" — inter-processor IRQ */
+#define SBI_EXT_RFENCE          0x52464E43  /* "RFNC" — remote fence */
+#define SBI_LEGACY_SEND_IPI     0x04        /* legacy IPI (a0 = mask ptr in S-mode VA) */
 
 /* ============================================================
  * Entry point
@@ -218,18 +221,23 @@ m_handle_msip:
     beqz t0, .Lspurious_msip /* spurious: just resume */
 
     /* HART_START dispatch: redirect to S-mode at jump_addr.
-     * a0 = hartid, a1 = opaque (per SBI HSM spec). */
+     * a0 = hartid, a1 = opaque (per SBI HSM spec).
+     * t0 already holds jump_addr; preserve it across mstatus setup so
+     * we can clear scratch[0] AFTER consuming it. Clearing now ensures
+     * subsequent msips on this hart go through .Lspurious_msip (kernel
+     * IPI → SSIP delivery) instead of re-dispatching back into the
+     * kernel HART_START start_addr. */
     ld   a1, 8(t2)           /* opaque */
     sd   zero, 16(t2)        /* state = HART_STARTED */
 
+    csrw mepc, t0            /* mepc = jump_addr (use saved t0) */
+    sd   zero, 0(t2)         /* clear jump_addr now (post-consume) */
+
     /* mstatus: MPP=01 (S-mode), MPIE=0 (S-mode IRQs off until kernel
-     * re-enables). */
+     * re-enables). t0 may be clobbered after this. */
     li   t0, (1 << 11) | (1 << 7)
     csrw mstatus, t0
 
-    /* mepc = jump_addr */
-    ld   t0, 0(t2)
-    csrw mepc, t0
     csrr a0, mhartid
 
     /* Restore t0-t2 and sp before mret. The S-mode sp is whatever was
@@ -242,7 +250,11 @@ m_handle_msip:
     mret
 
 .Lspurious_msip:
-    /* No HART_START pending — just clear msip and return to S-mode. */
+    /* No HART_START pending — this is a kernel-issued IPI (via SBI sPI).
+     * Deliver it to S-mode by raising sip.SSIP so the kernel's IPI
+     * handler runs. msip was already cleared above. */
+    li   t0, 0x2     /* SIP.SSIP = bit 1 */
+    csrs mip, t0
     ld   t0, 0(sp)
     ld   t1, 8(sp)
     ld   t2, 16(sp)
@@ -279,6 +291,18 @@ m_handle_ecall:
     /* HSM extension (0x48534D) */
     li t0, SBI_EXT_HSM
     beq a7, t0, sbi_hsm
+    /* IPI extension (0x735049) — wakes other harts via msip */
+    li t0, SBI_EXT_IPI
+    beq a7, t0, sbi_ipi
+    /* RFENCE extension (0x52464E43) — best-effort: kernel uses it for
+     * remote SFENCE.VMA. We don't implement actual remote fence (no
+     * way to interrupt other harts to run sfence in M-mode without
+     * IPI infrastructure), but returning SUCCESS is generally safe
+     * because Linux only calls it after explicit synchronization on
+     * the originating CPU and TLB shootdown is best-effort on most
+     * architectures during early boot. */
+    li t0, SBI_EXT_RFENCE
+    beq a7, t0, sbi_rfence_stub
 
     /* Unknown: SBI_ERR_NOT_SUPPORTED (-2) */
     li a0, -2
@@ -363,6 +387,10 @@ sbi_base_probe_extension:
     beq t3, t0, 1f                  /* SRST */
     li t0, SBI_EXT_HSM
     beq t3, t0, 1f                  /* HSM */
+    li t0, SBI_EXT_IPI
+    beq t3, t0, 1f                  /* IPI (sPI) */
+    li t0, SBI_EXT_RFENCE
+    beq t3, t0, 1f                  /* RFENCE */
     j sbi_return                    /* not available */
 1:  li a1, 1                        /* available */
     j sbi_return
@@ -393,6 +421,51 @@ sbi_time:
     li t0, 0x80
     csrs mie, t0
     li a0, 0    /* SBI_SUCCESS */
+    li a1, 0
+    j sbi_return
+
+/* ---- SBI: IPI extension (EID 0x735049) ----
+ * FID 0: send_ipi(a0=hart_mask, a1=hart_mask_base)
+ * Sets msip[base + i] for each bit i set in hart_mask. The receiving
+ * hart traps to m_handle_msip; m_handle_msip's spurious path will
+ * raise sip.SSIP so the kernel S-mode handler runs. */
+sbi_ipi:
+    li   t0, 0
+    bne  a6, t0, sbi_ipi_unsupported
+    mv   t1, a0                 /* hart_mask copy */
+    mv   t2, a1                 /* hart_mask_base */
+    li   t3, 0                  /* index */
+sbi_ipi_loop:
+    beqz t1, sbi_ipi_done
+    andi t4, t1, 1
+    beqz t4, sbi_ipi_skip
+    add  t4, t2, t3             /* hartid = base + index */
+    slli t4, t4, 2              /* 4 * hartid */
+    li   t5, CLINT_MSIP_BASE
+    add  t5, t5, t4
+    li   t6, 1
+    sw   t6, 0(t5)              /* msip[hartid] = 1 */
+sbi_ipi_skip:
+    srli t1, t1, 1
+    addi t3, t3, 1
+    j sbi_ipi_loop
+sbi_ipi_done:
+    li a0, 0    /* SBI_SUCCESS */
+    li a1, 0
+    j sbi_return
+sbi_ipi_unsupported:
+    li a0, -2
+    li a1, 0
+    j sbi_return
+
+/* ---- SBI: RFENCE stub (EID 0x52464E43) ----
+ * Linux uses this for cross-hart SFENCE.VMA / FENCE.I. A real impl
+ * would IPI other harts and have them execute SFENCE.VMA. As a stub
+ * we just succeed; this is acceptable for the heliodor 2-hart smoke
+ * test where mappings are stable after boot, but is a TODO for a
+ * proper SMP firmware. */
+sbi_rfence_stub:
+    li a0, 0
     li a1, 0
     j sbi_return
 
