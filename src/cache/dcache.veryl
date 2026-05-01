@@ -35,6 +35,14 @@ pub module dcache (
     // completes without setting valid (line stays Invalid).
     i_inv_valid: input logic    ,
     i_inv_addr : input logic<64>,
+    // Bus arbitration (Phase 5 single-port DRAM bus).
+    //   o_mem_req — combinational request: high while we need the DRAM bus
+    //               (waiting to start a fill, mid-fill, or issuing a write).
+    //   i_mem_grant — high when memory_bus has granted this hart access this
+    //                 cycle. State advances only when granted; non-granted
+    //                 cycles stall (o_stall stays high so the pipeline holds).
+    o_mem_req  : output logic,
+    i_mem_grant: input  logic,
 ) {
     // Address decomposition
     let tag     : logic<54> = i_addr[63:10];
@@ -131,7 +139,11 @@ pub module dcache (
         } else {
             case state {
                 State::IDLE: {
-                    if miss {
+                    // Phase 5: gate fill start and write-through on bus grant.
+                    // Without grant we hold the IDLE state and stall the pipe;
+                    // memory_bus arbitrates between harts and holds grant for
+                    // the entire 8-cycle FILL burst once we transition.
+                    if miss && i_mem_grant {
                         fill_index   = index;
                         fill_tag     = tag;
                         fill_way     = victim_way;
@@ -140,8 +152,10 @@ pub module dcache (
                         fill_aborted = 1'b0;
                         state        = State::FILL;
                     }
-                    // Write-through: update cache on write hit, invalidate on miss
-                    if i_wen {
+                    // Write-through: update cache on write hit, invalidate on miss.
+                    // Only commit the cache change + DRAM write when granted so
+                    // the local update and the DRAM emission stay in lockstep.
+                    if i_wen && i_mem_grant {
                         if cache_hit {
                             let old: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : rdata_3;
                             let merged: logic<64> = {
@@ -184,42 +198,46 @@ pub module dcache (
                     }
                 }
                 State::FILL: {
-                    // Fill one dword per cycle from memory
-                    if fill_way == 2'd0 {
-                        data_0[fill_data_idx] = i_mem_rdata;
-                    }
-                    if fill_way == 2'd1 {
-                        data_1[fill_data_idx] = i_mem_rdata;
-                    }
-                    if fill_way == 2'd2 {
-                        data_2[fill_data_idx] = i_mem_rdata;
-                    }
-                    if fill_way == 2'd3 {
-                        data_3[fill_data_idx] = i_mem_rdata;
-                    }
-                    if fill_count == 3'd7 {
-                        // Fill complete. If a remote invalidate hit this line
-                        // mid-fill, leave valid=0 so the next access misses
-                        // and re-fills. Tag write is harmless either way.
+                    // Phase 5: only write fill data and advance the count when
+                    // bus is granted. memory_bus is expected to hold grant for
+                    // the entire 8-cycle burst once a fill starts.
+                    if i_mem_grant {
                         if fill_way == 2'd0 {
-                            tags_0[fill_index]  = fill_tag;
-                            valid_0[fill_index] = !fill_aborted;
+                            data_0[fill_data_idx] = i_mem_rdata;
                         }
                         if fill_way == 2'd1 {
-                            tags_1[fill_index]  = fill_tag;
-                            valid_1[fill_index] = !fill_aborted;
+                            data_1[fill_data_idx] = i_mem_rdata;
                         }
                         if fill_way == 2'd2 {
-                            tags_2[fill_index]  = fill_tag;
-                            valid_2[fill_index] = !fill_aborted;
+                            data_2[fill_data_idx] = i_mem_rdata;
                         }
                         if fill_way == 2'd3 {
-                            tags_3[fill_index]  = fill_tag;
-                            valid_3[fill_index] = !fill_aborted;
+                            data_3[fill_data_idx] = i_mem_rdata;
                         }
-                        state = State::DONE;
-                    } else {
-                        fill_count = fill_count + 3'd1;
+                        if fill_count == 3'd7 {
+                            // Fill complete. If a remote invalidate hit this line
+                            // mid-fill, leave valid=0 so the next access misses
+                            // and re-fills. Tag write is harmless either way.
+                            if fill_way == 2'd0 {
+                                tags_0[fill_index]  = fill_tag;
+                                valid_0[fill_index] = !fill_aborted;
+                            }
+                            if fill_way == 2'd1 {
+                                tags_1[fill_index]  = fill_tag;
+                                valid_1[fill_index] = !fill_aborted;
+                            }
+                            if fill_way == 2'd2 {
+                                tags_2[fill_index]  = fill_tag;
+                                valid_2[fill_index] = !fill_aborted;
+                            }
+                            if fill_way == 2'd3 {
+                                tags_3[fill_index]  = fill_tag;
+                                valid_3[fill_index] = !fill_aborted;
+                            }
+                            state = State::DONE;
+                        } else {
+                            fill_count = fill_count + 3'd1;
+                        }
                     }
                 }
                 State::DONE: {
@@ -284,11 +302,17 @@ pub module dcache (
     // Suppress write-through on cache miss when AMO (ren && wen) to prevent
     // corrupting DRAM before the fill reads the old value.
     let amo_miss: logic = i_ren && i_wen && !cache_hit;
-    assign o_mem_wen = if filling ? 1'b0 : if amo_miss ? 1'b0 : i_wen;
+    // Phase 5: only emit DRAM write strobe when bus is granted. Otherwise the
+    // write must wait until the arbiter gives us a slot.
+    assign o_mem_wen = if filling ? 1'b0 : if amo_miss ? 1'b0 : (i_wen && i_mem_grant);
+    assign o_mem_ren = if filling ? 1'b1 : if i_ren && !cache_hit && i_mem_grant ? 1'b1 : 1'b0;
+    assign o_mem_wstrb = if i_wen && !filling && i_mem_grant ? i_wstrb : '0;
 
-    assign o_mem_ren = if filling ? 1'b1 : if i_ren && !cache_hit ? 1'b1 : 1'b0;
-
-    assign o_mem_wstrb = if i_wen && !filling ? i_wstrb : '0;
+    // Bus request: any cycle we need DRAM access. memory_bus arbitrates
+    // among harts and asserts i_mem_grant when this hart's turn comes.
+    let want_fill_start: logic = miss;                                  // IDLE+miss
+    let want_write     : logic = i_wen && !amo_miss && state == State::IDLE;
+    assign o_mem_req = filling || want_fill_start || want_write;
 
     // Non-blocking miss interface
     assign o_miss_valid    = miss; // 1-cycle pulse on load miss (state == IDLE)
@@ -303,7 +327,9 @@ pub module dcache (
 
     // Stall on miss, during fill, DONE, and writes during fill.
     // Fill state stalls all accesses (original conservative behavior).
+    // Phase 5: also stall while waiting for bus grant on a write-through.
     let write_during_fill: logic = filling && i_wen;
-    assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill;
+    let write_wait_grant : logic = state == State::IDLE && i_wen && !amo_miss && !i_mem_grant;
+    assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant;
 
 }

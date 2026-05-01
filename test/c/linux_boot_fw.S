@@ -62,13 +62,11 @@ _start:
     /* Save hartid for later (s11 is callee-saved across our flow). */
     csrr s11, mhartid
 
-    /* Secondary harts (mhartid != 0) park immediately and wait for SBI
-     * HSM HART_START. Avoids racing the kernel's hart_lottery amoadd
-     * since heliodor's AMO is per-hart dcache, not bus-atomic across
-     * harts — without this branch both harts would win the lottery and
-     * race through primary boot. _secondary_park sets up its own M-mode
-     * state (trap vector, mscratch, delegation, mtimecmp, scratch). */
-    bnez s11, _secondary_park
+    /* Phase 5: heliodor's AMO is now bus-atomic via memory_bus single
+     * grant + amo_inflight lock, so kernel hart_lottery (amoadd) selects
+     * exactly one primary across harts. Both harts mret into the kernel
+     * — one wins the lottery and runs primary boot, the other falls to
+     * .Lsecondary_start and spinwaits __cpu_up_stack_pointer. */
 
     /* Set up M-mode trap handler (per-hart, but the same handler) */
     la t0, m_trap_handler

@@ -20,6 +20,7 @@ pub module memory_bus #(
 ) (
     clk: input clock,
     rst: input reset,
+    // MMIO inputs
     i_mmio_paddr: input  logic<32> [N_HARTS],
     i_mmio_wdata: input  logic<64> [N_HARTS],
     i_mmio_wstrb: input  logic<8>  [N_HARTS],
@@ -38,6 +39,28 @@ pub module memory_bus #(
     o_mmio_ren_plic : output logic    ,
     o_mmio_wen_uart : output logic    ,
     o_mmio_ren_uart : output logic    ,
+
+    // Phase 5: DRAM bus arbitration (single shared port).
+    // Per-hart dcache request bundles + amo_inflight (priority lock).
+    // When any hart asserts amo_inflight, only that hart wins grants
+    // until amo_inflight drops — gives bus-atomic AMO RMW windows.
+    i_dmem_addr     : input  logic<64> [N_HARTS],
+    i_dmem_wdata    : input  logic<64> [N_HARTS],
+    i_dmem_wstrb    : input  logic<8>  [N_HARTS],
+    i_dmem_wen      : input  logic     [N_HARTS],
+    i_dmem_ren      : input  logic     [N_HARTS],
+    i_dmem_req      : input  logic     [N_HARTS],
+    i_amo_inflight  : input  logic     [N_HARTS],
+    o_dmem_grant    : output logic     [N_HARTS],
+    o_dmem_addr     : output logic<64>,
+    o_dmem_wdata    : output logic<64>,
+    o_dmem_wstrb    : output logic<8> ,
+    o_dmem_wen      : output logic    ,
+    o_dmem_ren      : output logic    ,
+    // Invalidate broadcast: address granted hart wrote, exposed to all harts
+    // as inv pulse for cache coherence.
+    o_dmem_inv_valid: output logic    ,
+    o_dmem_inv_addr : output logic<64>,
 ) {
     if N_HARTS == 1: gen_n1 {
         // Degenerate: hart 0 owns the bus, no arbitration.
@@ -53,6 +76,17 @@ pub module memory_bus #(
         assign o_mmio_ren_plic  = active0 && i_mmio_ren[0] && i_plic_sel [0];
         assign o_mmio_wen_uart  = active0 && i_mmio_wen[0] && i_uart_sel [0];
         assign o_mmio_ren_uart  = active0 && i_mmio_ren[0] && i_uart_sel [0];
+
+        // DRAM bus: hart 0 always granted (no contention).
+        assign o_dmem_grant[0]   = i_dmem_req[0];
+        assign o_dmem_addr       = i_dmem_addr [0];
+        assign o_dmem_wdata      = i_dmem_wdata[0];
+        assign o_dmem_wstrb      = i_dmem_wstrb[0];
+        assign o_dmem_wen        = i_dmem_wen  [0];
+        assign o_dmem_ren        = i_dmem_ren  [0];
+        // Invalidate broadcast unused at N=1 (no other hart to notify).
+        assign o_dmem_inv_valid  = 1'b0;
+        assign o_dmem_inv_addr   = 64'd0;
     } else if N_HARTS == 2: gen_n2 {
         // N=2: hardcoded static priority encoder. Avoids the dynamic-index
         // pattern (`i_*[grant_idx]`) which causes the Veryl simulator to
@@ -82,6 +116,37 @@ pub module memory_bus #(
                                || (grant_h1 && i_mmio_wen[1] && i_uart_sel[1]);
         assign o_mmio_ren_uart  = (grant_h0 && i_mmio_ren[0] && i_uart_sel[0])
                                || (grant_h1 && i_mmio_ren[1] && i_uart_sel[1]);
+
+        // Phase 5 DRAM arbitration (N=2). amo_inflight gives priority lock
+        // for the holder; otherwise lowest-id requesting hart wins. The
+        // burst self-holds because dcache keeps i_dmem_req high through
+        // an 8-cycle FILL.
+        let amo_lock_0: logic = i_amo_inflight[0];
+        let amo_lock_1: logic = i_amo_inflight[1] && !amo_lock_0;
+        let dmem_grant_h0: logic = if amo_lock_0 ? 1'b1
+                                 : if amo_lock_1 ? 1'b0
+                                 : i_dmem_req[0];
+        let dmem_grant_h1: logic = if amo_lock_0 ? 1'b0
+                                 : if amo_lock_1 ? 1'b1
+                                 : !i_dmem_req[0] && i_dmem_req[1];
+        assign o_dmem_grant[0] = dmem_grant_h0 && i_dmem_req[0];
+        assign o_dmem_grant[1] = dmem_grant_h1 && i_dmem_req[1];
+
+        // Single-port DRAM mux. When neither hart actually has a live
+        // transaction (just amo_lock holding), o_dmem_wen/o_dmem_ren are 0
+        // because the granted hart's i_dmem_wen/i_dmem_ren are 0.
+        assign o_dmem_addr  = if dmem_grant_h0 ? i_dmem_addr [0] : i_dmem_addr [1];
+        assign o_dmem_wdata = if dmem_grant_h0 ? i_dmem_wdata[0] : i_dmem_wdata[1];
+        assign o_dmem_wstrb = if dmem_grant_h0 ? i_dmem_wstrb[0] : i_dmem_wstrb[1];
+        assign o_dmem_wen   = (dmem_grant_h0 && i_dmem_wen[0] && i_dmem_req[0])
+                           || (dmem_grant_h1 && i_dmem_wen[1] && i_dmem_req[1]);
+        assign o_dmem_ren   = (dmem_grant_h0 && i_dmem_ren[0] && i_dmem_req[0])
+                           || (dmem_grant_h1 && i_dmem_ren[1] && i_dmem_req[1]);
+
+        // Invalidate broadcast: any cycle the granted hart writes DRAM,
+        // pulse invalidate so the other hart drops the line.
+        assign o_dmem_inv_valid = o_dmem_wen;
+        assign o_dmem_inv_addr  = o_dmem_addr;
     } else: gen_arb {
         // Generic N>=3 path (untested; preserved for future N=4 expansion).
         var active : logic [N_HARTS];
@@ -121,5 +186,46 @@ pub module memory_bus #(
         assign o_mmio_ren_plic  = g_ren && g_plic;
         assign o_mmio_wen_uart  = g_wen && g_uart;
         assign o_mmio_ren_uart  = g_ren && g_uart;
+
+        // Phase 5 DRAM arbitration N>=3 (untested; future N=4 use).
+        // amo_inflight wins; otherwise lowest-id requesting hart.
+        var amo_found : logic    [N_HARTS];
+        var amo_idx_st: logic<3> [N_HARTS];
+        for h in 0..N_HARTS: gen_amo {
+            if h == 0: gen_first {
+                assign amo_found [h] = i_amo_inflight[h];
+                assign amo_idx_st[h] = 3'd0;
+            } else: gen_rest {
+                assign amo_found [h] = amo_found[h - 1] || i_amo_inflight[h];
+                assign amo_idx_st[h] = if amo_found[h - 1] ? amo_idx_st[h - 1] : h as 3;
+            }
+        }
+        let amo_lock     : logic    = amo_found [N_HARTS - 1];
+        let amo_holder   : logic<3> = amo_idx_st[N_HARTS - 1];
+
+        var dreq_found : logic    [N_HARTS];
+        var dreq_idx_st: logic<3> [N_HARTS];
+        for h in 0..N_HARTS: gen_dreq {
+            if h == 0: gen_first {
+                assign dreq_found [h] = i_dmem_req[h];
+                assign dreq_idx_st[h] = 3'd0;
+            } else: gen_rest {
+                assign dreq_found [h] = dreq_found[h - 1] || i_dmem_req[h];
+                assign dreq_idx_st[h] = if dreq_found[h - 1] ? dreq_idx_st[h - 1] : h as 3;
+            }
+        }
+        let dmem_grant_valid: logic    = if amo_lock ? 1'b1 : dreq_found[N_HARTS - 1];
+        let dmem_grant_idx  : logic<3> = if amo_lock ? amo_holder : dreq_idx_st[N_HARTS - 1];
+
+        for h in 0..N_HARTS: gen_dgrant {
+            assign o_dmem_grant[h] = dmem_grant_valid && (h == dmem_grant_idx) && i_dmem_req[h];
+        }
+        assign o_dmem_addr  = i_dmem_addr [dmem_grant_idx];
+        assign o_dmem_wdata = i_dmem_wdata[dmem_grant_idx];
+        assign o_dmem_wstrb = i_dmem_wstrb[dmem_grant_idx];
+        assign o_dmem_wen   = dmem_grant_valid && i_dmem_wen[dmem_grant_idx] && i_dmem_req[dmem_grant_idx];
+        assign o_dmem_ren   = dmem_grant_valid && i_dmem_ren[dmem_grant_idx] && i_dmem_req[dmem_grant_idx];
+        assign o_dmem_inv_valid = o_dmem_wen;
+        assign o_dmem_inv_addr  = o_dmem_addr;
     }
 }
