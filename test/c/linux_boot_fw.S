@@ -295,24 +295,14 @@ m_handle_ecall:
     beq a7, t0, sbi_legacy_set_timer
     li t0, SBI_LEGACY_PUTCHAR
     beq a7, t0, sbi_legacy_putchar
-    /* Legacy SEND_IPI (EID 0x04) — msip[other_hart] only, skip self.
-     * Prior msip-to-all caused hart 1 to take immediate self-IPI on
-     * sender wake. Now we only IPI the OTHER hart. The mask argument
-     * (a0 → S-mode VA) is ignored and we always wake the other hart;
-     * the kernel's IPI handler validates against the actual cpumask. */
-    li t0, 4
-    beq a7, t0, sbi_legacy_send_ipi
-    /* Legacy REMOTE_FENCE_I (EID 0x05) and REMOTE_SFENCE_VMA (EID 0x06,
-     * 0x07): return SUCCESS so the kernel doesn't loop on retry. Real
-     * cross-hart fence isn't required during the boot window we're
-     * investigating (both harts share kernel-mode page tables; hart 1
-     * mostly idles). */
-    li t0, 5
-    beq a7, t0, sbi_legacy_ok_stub
-    li t0, 6
-    beq a7, t0, sbi_legacy_ok_stub
-    li t0, 7
-    beq a7, t0, sbi_legacy_ok_stub
+    /* Legacy SEND_IPI / REMOTE_FENCE_I / REMOTE_SFENCE_VMA (EID 4-7):
+     * disabled. Multiple implementation attempts (msip-to-all, skip-self,
+     * state-gated) all triggered an early kworker/1 fault at PC
+     * 0x207ff400 — the kernel does cpu_up bring-up with assumptions
+     * about either cross-hart fence completion or per-CPU SSIP dispatch
+     * being ready that we cannot satisfy from M-mode firmware alone.
+     * Falls through to NOT_SUPPORTED to keep the baseline path stable
+     * (kernel reaches "Brought up" then deadlocks at sched_init_smp). */
     /* Legacy shutdown (EID 0x08) — reuse SRST halt */
     li t0, 8
     beq a7, t0, sbi_srst
@@ -360,6 +350,17 @@ sbi_legacy_set_timer:
     li   t0, CLINT_MTIMECMP
     add  t0, t0, t2
     sd a0, 0(t0)
+    /* Mark hart as IPI-ready in scratch[hart].state = 3 (HART_RUNNING).
+     * SBI SEND_IPI uses this gate to avoid delivering IPIs before the
+     * kernel's per-CPU SSIP dispatch state is fully initialized — once
+     * the hart is making timer SBI calls it has progressed past the
+     * early kthread setup race that was crashing kworker/1 at PC
+     * 0x207ff400. */
+    li   t2, HART_SCRATCH_BASE
+    slli t0, t1, 8
+    add  t2, t2, t0
+    li   t0, 3
+    sd   t0, 16(t2)
     /* Clear STIP */
     li t0, 0x20
     csrc mip, t0
@@ -384,20 +385,28 @@ sbi_legacy_putchar:
  * handler will check the actual cpumask in software. The cost is that
  * a hart not in the mask still wakes briefly to find no work for it. */
 sbi_legacy_send_ipi:
-    /* IPI the OTHER hart only — skip self. Sending msip to self causes
-     * an immediate M-mode trap on the sender after mret, which the
-     * kernel's SSIP handler treats as a spurious wake; doing it on every
-     * legacy SEND_IPI churns hart 0 with no benefit and (more critically)
-     * fires before the dispatcher is fully ready, corrupting kworker/1
-     * with a load fault at PC 0x207ff400. */
+    /* IPI the OTHER hart only, AND only if it has reached HART_RUNNING
+     * state (3). Hart 1 is marked HART_RUNNING by sbi_legacy_set_timer
+     * once the kernel has progressed past the early per-CPU SSIP setup
+     * (otherwise an IPI here corrupts kworker/1 with a load fault at
+     * PC 0x207ff400). Sending self-IPI is also skipped — kernel doesn't
+     * need it for the boot path we're targeting. */
     csrr t0, mhartid
     li   t1, CLINT_MSIP_BASE
-    li   t2, 1
-    beqz t0, .Lipi_to_h1     /* sender == hart 0 → wake hart 1 */
-    sw   t2, 0(t1)           /* sender == hart 1 → wake hart 0 (msip[0]) */
+    li   t2, HART_SCRATCH_BASE
+    li   t3, 3                  /* HART_RUNNING */
+    beqz t0, .Lipi_check_h1     /* sender == hart 0 → check hart 1 */
+    /* sender == hart 1 → check hart 0 */
+    ld   t4, 16(t2)             /* scratch[0].state */
+    bne  t4, t3, .Lipi_done
+    li   t4, 1
+    sw   t4, 0(t1)              /* msip[0] = 1 */
     j    .Lipi_done
-.Lipi_to_h1:
-    sw   t2, 4(t1)           /* msip[1] = 1 */
+.Lipi_check_h1:
+    ld   t4, 272(t2)            /* scratch[1].state @ +0x100+16 */
+    bne  t4, t3, .Lipi_done
+    li   t4, 1
+    sw   t4, 4(t1)              /* msip[1] = 1 */
 .Lipi_done:
     li   a0, 0
     j    sbi_return
