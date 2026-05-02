@@ -302,11 +302,9 @@ m_handle_ecall:
      * to a kernel boot-ordering assumption we can't satisfy from
      * firmware. NO-OP keeps the kernel happy enough to potentially
      * progress past wait_for_completion if the path doesn't strictly
-     * require the IPI ack. EID 0x04 SEND_IPI now uses a delayed-IPI
-     * variant: drop the first N calls (kernel still in early per-CPU
-     * setup), then start actually delivering msip. */
+     * require the IPI ack. */
     li t0, 4
-    beq a7, t0, sbi_legacy_send_ipi_delayed
+    beq a7, t0, sbi_legacy_ok_stub
     li t0, 5
     beq a7, t0, sbi_legacy_ok_stub
     li t0, 6
@@ -418,32 +416,6 @@ sbi_legacy_send_ipi:
     li   t4, 1
     sw   t4, 4(t1)              /* msip[1] = 1 */
 .Lipi_done:
-    li   a0, 0
-    j    sbi_return
-
-/* ---- SBI: Legacy SEND_IPI delayed (EID 0x04) ----
- * Drop the first N calls (kernel is still in early per-CPU setup
- * during cpu_up where an IPI corrupts kworker/1 with a load fault at
- * 0x207ff400). Past N, send msip to the OTHER hart so kthreads can
- * actually run there. Counter lives at scratch[0].opaque (offset
- * HART_SCRATCH_BASE + 8) — only one hart writes at a time so no
- * atomicity needed. */
-sbi_legacy_send_ipi_delayed:
-    li   t1, HART_SCRATCH_BASE
-    ld   t2, 8(t1)              /* call counter */
-    addi t2, t2, 1
-    sd   t2, 8(t1)
-    li   t3, 200
-    bltu t2, t3, .Lipi_skip
-    csrr t0, mhartid
-    li   t4, CLINT_MSIP_BASE
-    li   t5, 1
-    beqz t0, .Lipi_to_h1_d
-    sw   t5, 0(t4)              /* sender == hart 1 → wake hart 0 */
-    j    .Lipi_skip
-.Lipi_to_h1_d:
-    sw   t5, 4(t4)              /* sender == hart 0 → wake hart 1 */
-.Lipi_skip:
     li   a0, 0
     j    sbi_return
 
