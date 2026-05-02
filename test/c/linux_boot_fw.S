@@ -296,13 +296,10 @@ m_handle_ecall:
     li t0, SBI_LEGACY_PUTCHAR
     beq a7, t0, sbi_legacy_putchar
     /* Legacy SEND_IPI / REMOTE_FENCE_I / REMOTE_SFENCE_VMA (EID 4-7):
-     * disabled. Multiple implementation attempts (msip-to-all, skip-self,
-     * state-gated) all triggered an early kworker/1 fault at PC
-     * 0x207ff400 — the kernel does cpu_up bring-up with assumptions
-     * about either cross-hart fence completion or per-CPU SSIP dispatch
-     * being ready that we cannot satisfy from M-mode firmware alone.
-     * Falls through to NOT_SUPPORTED to keep the baseline path stable
-     * (kernel reaches "Brought up" then deadlocks at sched_init_smp). */
+     * disabled. Even with the csr.veryl trap+csr-write fix, enabling
+     * SEND_IPI still crashes kworker/1 at PC 0x207ff400 — that crash
+     * is independent of the csrsi/csrr lossage. Falls through to
+     * NOT_SUPPORTED. */
     /* Legacy shutdown (EID 0x08) — reuse SRST halt */
     li t0, 8
     beq a7, t0, sbi_srst
