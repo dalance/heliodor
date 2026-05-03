@@ -295,16 +295,15 @@ m_handle_ecall:
     beq a7, t0, sbi_legacy_set_timer
     li t0, SBI_LEGACY_PUTCHAR
     beq a7, t0, sbi_legacy_putchar
-    /* Legacy SEND_IPI / REMOTE_FENCE_I / REMOTE_SFENCE_VMA (EID 4-7):
-     * NO-OP success. Kernel sees IPI dispatch as successful but no
-     * actual msip is written; hart 1 progresses via timer ticks only.
-     * Real msip-write attempts crash kworker/1 at PC 0x207ff400 due
-     * to a kernel boot-ordering assumption we can't satisfy from
-     * firmware. NO-OP keeps the kernel happy enough to potentially
-     * progress past wait_for_completion if the path doesn't strictly
-     * require the IPI ack. */
+    /* Legacy SEND_IPI (EID 4) — route to real impl. The receiving hart
+     * gets msip set, traps to m_handle_msip → .Lspurious_msip → SSIP,
+     * then kernel S-mode IPI handler runs. Gated on scratch[h].state=3
+     * (HART_RUNNING set by sbi_legacy_set_timer) to avoid early-boot
+     * kworker/1 crash. RFENCE_I / SFENCE_VMA (5-7) stay NO-OP since
+     * implementing them needs real cross-hart fence, but TLB consistency
+     * is mostly maintained by memory_bus invalidate broadcast. */
     li t0, 4
-    beq a7, t0, sbi_legacy_ok_stub
+    beq a7, t0, sbi_legacy_send_ipi
     li t0, 5
     beq a7, t0, sbi_legacy_ok_stub
     li t0, 6
