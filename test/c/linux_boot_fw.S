@@ -30,10 +30,11 @@
 
 #define KERNEL_ENTRY    0x80000000
 /* DTB physical address — build-time override via -DDTB_ADDR=0x...
- * Default is the 2-hart hex layout (DTB after the 19MB kernel image).
- * The 1-hart hex predates the layout fix and embeds the DTB at 0x80AB9000. */
+ * Default 0x80AE0000 = page after the ~10.8MB tinyconfig 1-hart kernel
+ * (test/hex/linux_dram_real.hex). 2-hart kernel uses 0x81400000 via
+ * -DDTB_ADDR override (see linux_boot_fw_2hart.bin build). */
 #ifndef DTB_ADDR
-#define DTB_ADDR        0x81400000
+#define DTB_ADDR        0x80AE0000
 #endif
 
 /* Per-hart parking scratch: 0x81FFE000 + 0x100*hartid.
@@ -126,7 +127,7 @@ _start:
      * it — when they amoadd they'll get a non-zero return and fall into
      * .Lsecondary_start (the spinwait protocol). */
     bnez s11, _skip_lottery
-    li   t0, 0x812e65e8      /* hart_lottery PA (from kernel nm) */
+    li   t0, 0x80a85440      /* hart_lottery PA (from kernel nm) */
     sd   zero, 0(t0)
 _skip_lottery:
 
