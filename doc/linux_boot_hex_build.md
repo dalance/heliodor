@@ -37,16 +37,48 @@ hart_lottery PA = 0x80A85380  (changes per kernel build!)
 mscratch        = 0x81FFF000  (top of 32MB DRAM)
 ```
 
-### Kernel config (`.config`, NOT committed)
+### Kernel config
+
+Two snapshots are committed to the repo to prevent the "lost config"
+problem we hit when the original 1-hart `.config` was overwritten by a
+2-hart rebuild:
+
+| File | Source | Use |
+|------|--------|-----|
+| `test/c/heliodor_kernel_2hart.config` | Extracted from `linux_dram_real_2hart.hex` via IKCONFIG (CONFIG_IKCONFIG=y embeds .config in the Image; extract via `gzip -d` of the `IKCFG_ST..IKCFG_ED` region) | Canonical 2-hart build config — copy to `linux/.config` and run `make Image` to reproduce the committed 2-hart hex |
+| `test/c/heliodor_kernel.frag` | merge_config fragment — applies on top of `make ARCH=riscv defconfig` to produce a minimal 1-hart kernel | Use to derive the 1-hart minimal config when the original is unavailable |
+
+Note: the original Apr 6 1-hart `.config` was lost (IKCONFIG was not
+enabled). All future builds **must** keep `CONFIG_IKCONFIG=y` so future
+configs are recoverable directly from the kernel binary.
+
+Key overrides included in the fragment:
 ```
-CONFIG_INITRAMFS_SOURCE="/tmp/claude-4004/initramfs_clean.cpio"
-CONFIG_INITRAMFS_COMPRESSION_NONE=y
-CONFIG_HVC_RISCV_SBI=n
-CONFIG_VMAP_STACK=n
+# CONFIG_SMP is not set
+CONFIG_NR_CPUS=1
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_HZ=250
+# CONFIG_VMAP_STACK is not set
+# CONFIG_HVC_RISCV_SBI is not set
 CONFIG_CMDLINE="earlycon=sbi nokaslr"
 CONFIG_CMDLINE_FORCE=y
-CONFIG_SLUB=y
-CONFIG_HZ=250
+CONFIG_INITRAMFS_SOURCE="/tmp/claude-4004/initramfs_clean.cpio"
+CONFIG_INITRAMFS_COMPRESSION_NONE=y
+# Disabled to match Apr 6 minimal: NET, PCI, SCSI, USB, MMC, DRM, FB,
+# SOUND, HID, INPUT, SERIO, I2C, HWMON, RTC, MTD, VT, BLOCK, VIRTIO,
+# DEBUG_PLIST, etc. (see fragment for complete list)
+```
+
+To extract `.config` from a built kernel Image:
+```bash
+python3 -c "
+import gzip
+data = open('/path/to/Image', 'rb').read()
+st = data.find(b'IKCFG_ST') + 8
+ed = data.find(b'IKCFG_ED')
+print(gzip.decompress(data[st:ed]).decode(), end='')
+" > extracted.config
 ```
 
 ### Test harness (`tb/test_linux_boot.veryl`)
