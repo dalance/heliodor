@@ -127,7 +127,7 @@ _start:
      * it — when they amoadd they'll get a non-zero return and fall into
      * .Lsecondary_start (the spinwait protocol). */
     bnez s11, _skip_lottery
-    li   t0, 0x80a85440      /* hart_lottery PA (from kernel nm) */
+    li   t0, 0x80a84fc0      /* hart_lottery PA (from kernel nm) */
     sd   zero, 0(t0)
 _skip_lottery:
 
@@ -400,28 +400,27 @@ sbi_legacy_putchar:
  * hart. This is functionally correct — the receiving hart will set
  * sip.SSIP via m_handle_msip's spurious path, and the kernel's IPI
  * handler will check the actual cpumask in software. The cost is that
- * a hart not in the mask still wakes briefly to find no work for it. */
+ * a hart not in the mask still wakes briefly to find no work for it.
+ *
+ * Phase 5: HART_RUNNING gate REMOVED. Previously gated on
+ * scratch[h].state == 3 to avoid an early-boot OOPS, but the gate also
+ * silently dropped legitimate IPIs from the boot CPU to a secondary
+ * during the cpu_stopper unpark sequence (cpu_stop_queue_work for
+ * remote hart's stopper kthread → smp_send_reschedule → sbi_send_ipi
+ * → firmware drops it because secondary hasn't called set_timer yet).
+ * That stop_machine livelock blocks Phase 5 SBI shutdown. The DTS
+ * memory carve-out fix (heliodor_2hart.dts memory size = 0x1FFE000)
+ * already prevents the page-table corruption this gate was a band-aid
+ * for, so we can deliver IPIs unconditionally now. */
 sbi_legacy_send_ipi:
-    /* IPI the OTHER hart only, AND only if it has reached HART_RUNNING
-     * state (3). Hart 1 is marked HART_RUNNING by sbi_legacy_set_timer
-     * once the kernel has progressed past the early per-CPU SSIP setup
-     * (otherwise an IPI here corrupts kworker/1 with a load fault at
-     * PC 0x207ff400). Sending self-IPI is also skipped — kernel doesn't
-     * need it for the boot path we're targeting. */
     csrr t0, mhartid
     li   t1, CLINT_MSIP_BASE
-    li   t2, HART_SCRATCH_BASE
-    li   t3, 3                  /* HART_RUNNING */
-    beqz t0, .Lipi_check_h1     /* sender == hart 0 → check hart 1 */
-    /* sender == hart 1 → check hart 0 */
-    ld   t4, 16(t2)             /* scratch[0].state */
-    bne  t4, t3, .Lipi_done
+    beqz t0, .Lipi_target_h1    /* sender == hart 0 → IPI hart 1 */
+    /* sender == hart 1 → IPI hart 0 */
     li   t4, 1
     sw   t4, 0(t1)              /* msip[0] = 1 */
     j    .Lipi_done
-.Lipi_check_h1:
-    ld   t4, 272(t2)            /* scratch[1].state @ +0x100+16 */
-    bne  t4, t3, .Lipi_done
+.Lipi_target_h1:
     li   t4, 1
     sw   t4, 4(t1)              /* msip[1] = 1 */
 .Lipi_done:
