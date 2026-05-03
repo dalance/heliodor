@@ -227,10 +227,19 @@ m_handle_msip:
     add  t2, t2, t0
     sw   zero, 0(t2)
 
-    /* Read scratch[mhartid].jump_addr */
+    /* Check scratch[mhartid].state for SRST flag (0xAA, set by sbi_srst
+     * when called from the OTHER hart). If set, halt this hart with
+     * x3=0xAA so tb's h0_x3 check passes regardless of which hart did
+     * the SBI shutdown call. */
     li   t2, HART_SCRATCH_BASE
     slli t0, t1, 8           /* 0x100 * hartid */
     add  t2, t2, t0
+    ld   t3, 16(t2)          /* state */
+    li   t4, 0xAA
+    bne  t3, t4, .Lmsip_no_srst
+    li   x3, 0xAA
+    j    .                   /* halt with x3=0xAA */
+.Lmsip_no_srst:
     ld   t0, 0(t2)           /* jump_addr */
     beqz t0, .Lspurious_msip /* spurious: just resume */
 
@@ -618,10 +627,28 @@ sbi_hsm_hart_get_status:
 
 /* ---- SBI: System Reset extension (EID 0x53525354) ---- */
 sbi_srst:
-    /* FID 0: system_reset(a0=reset_type, a1=reset_reason) */
-    /* Signal success to test harness */
+    /* FID 0: system_reset(a0=reset_type, a1=reset_reason)
+     *
+     * For 2-hart: tb checks h0_x3==0xAA. If kernel_init runs on hart 1,
+     * sbi_srst is called from hart 1. Set x3=0xAA on calling hart, then
+     * IPI hart 0 so its m_handle_msip can also halt with x3=0xAA. */
+    csrr t0, mhartid
+    bnez t0, .Lsrst_from_h1
+.Lsrst_from_h0:
     li x3, 0xAA
-    j .         /* halt */
+    j .         /* halt — h0_x3=0xAA */
+.Lsrst_from_h1:
+    /* hart 1 calling SRST — write SRST_PENDING marker into hart 0's
+     * scratch.state slot, then IPI hart 0 (msip[0]=1). Hart 0's
+     * m_handle_msip checks the marker and halts with x3=0xAA. */
+    li   t1, HART_SCRATCH_BASE
+    li   t2, 0xAA
+    sd   t2, 16(t1)              /* scratch[0].state = 0xAA (SRST flag) */
+    li   t1, CLINT_MSIP_BASE
+    li   t2, 1
+    sw   t2, 0(t1)               /* msip[0] = 1 */
+    li x3, 0xAA
+    j .         /* hart 1 halts with x3=0xAA too */
 
 /* ---- Common SBI return: advance mepc past ecall + restore tn ----
  * SBI v0.1 spec requires t0-t6 to be preserved across SBI ecalls.

@@ -49,6 +49,18 @@ pub module heliodor_soc #(
     // Per-hart instruction retirement counter (any non-zero on hart 1 means
     // secondary actually executed instructions in kernel mode).
     o_dbg_h1_instret : output logic    ,
+    // Per-hart SW IRQ (CLINT MSIP) line into the core. Used by tb to
+    // confirm whether sbi_ipi's `sw msip[1]=1` actually reaches the
+    // CLINT and asserts hart 1's MSIP wire.
+    o_dbg_h1_sw_irq  : output logic    ,
+    o_dbg_h0_sw_irq  : output logic    ,
+    // CLINT MMIO write probes — bus_wen_clint pulses high on any cycle a
+    // hart's MMIO write hits the CLINT range, with bus_paddr the lower 16
+    // bits of the address. Used by tb to confirm whether sbi_ipi's
+    // sw msip[1]=1 actually reaches the CLINT input.
+    o_dbg_clint_wen  : output logic     ,
+    o_dbg_clint_addr : output logic<16>,
+    o_dbg_clint_wdata: output logic<64>,
 ) {
     // ============================================================
     // Per-hart wires (core ↔ memory_bus / peripherals)
@@ -194,6 +206,11 @@ pub module heliodor_soc #(
     assign o_dbg_h0_pc      = dbg_pc_arr[0];
     assign o_dbg_h1_pc      = if 2 >= 2 ? dbg_pc_arr[1]      : 64'd0;
     assign o_dbg_h1_instret = if 2 >= 2 ? dbg_instret_arr[1] : 1'b0;
+    assign o_dbg_h1_sw_irq  = if 2 >= 2 ? sw_irq_arr[1]      : 1'b0;
+    assign o_dbg_h0_sw_irq  = sw_irq_arr[0];
+    assign o_dbg_clint_wen  = bus_wen_clint;
+    assign o_dbg_clint_addr = bus_paddr[15:0];
+    assign o_dbg_clint_wdata = bus_wdata;
 
     // ============================================================
     // memory_bus
@@ -243,37 +260,33 @@ pub module heliodor_soc #(
 
     // ============================================================
     // dcache invalidate broadcast (Phase 5).
-    // memory_bus emits one inv pulse per granted DRAM write. Flop the
-    // pulse (and the writer hart id) for one cycle to break the cross-
-    // module comb path through analyze_dependency, then route to every
-    // OTHER hart's dcache invalidate input. The writer hart sees its own
+    // memory_bus emits one inv pulse per granted DRAM write. Forward
+    // combinationally (same cycle as the write commit) to every OTHER
+    // hart's dcache invalidate input. The writer hart sees its own
     // write as a no-op (line was just updated by it).
+    //
+    // Same-cycle delivery is required for Linux SMP memory ordering:
+    // a 1-cycle flop here lets the receiver's same-cycle read return a
+    // stale value, which corrupts kthread structs during secondary CPU
+    // bring-up (Oops at PC 0x207ff400 from a broken function pointer).
+    //
+    // No comb loop forms because every signal in the path is sourced
+    // from a flop on either end (core_dmem_wen/grant come out of dcache
+    // always_ff, and i_inv_valid feeds dcache always_ff on the receiver).
     // ============================================================
     if 2 == 2: gen_inv2 {
-        var inv_v_q   : logic    ;
-        var inv_a_q   : logic<64>;
-        var inv_src_q : logic    ; // 0 = hart 0 wrote, 1 = hart 1 wrote
-        always_ff (clk, rst) {
-            if_reset {
-                inv_v_q   = 1'b0;
-                inv_a_q   = 64'd0;
-                inv_src_q = 1'b0;
-            } else {
-                inv_v_q   = bus_dmem_inv_valid && bus_dmem_inv_addr[31];
-                inv_a_q   = bus_dmem_inv_addr;
-                inv_src_q = core_dmem_grant[1] && core_dmem_wen[1];
-            }
-        }
         // Forward to the non-writer hart only. AMO inflight on the
         // receiver suppresses remote invalidates so a live RMW window
         // isn't poisoned (covers LR/SC retry too via memory.veryl's
         // is_amo gating).
-        let h0_lock: logic = core_amo_inflight[0];
-        let h1_lock: logic = core_amo_inflight[1];
-        assign bus_inv_valid[0] = inv_v_q && inv_src_q   && !h0_lock;
-        assign bus_inv_addr [0] = inv_a_q;
-        assign bus_inv_valid[1] = inv_v_q && !inv_src_q  && !h1_lock;
-        assign bus_inv_addr [1] = inv_a_q;
+        let inv_v   : logic = bus_dmem_inv_valid && bus_dmem_inv_addr[31];
+        let inv_src : logic = core_dmem_grant[1] && core_dmem_wen[1]; // 1 = hart 1 wrote
+        let h0_lock : logic = core_amo_inflight[0];
+        let h1_lock : logic = core_amo_inflight[1];
+        assign bus_inv_valid[0] = inv_v && inv_src   && !h0_lock;
+        assign bus_inv_addr [0] = bus_dmem_inv_addr;
+        assign bus_inv_valid[1] = inv_v && !inv_src  && !h1_lock;
+        assign bus_inv_addr [1] = bus_dmem_inv_addr;
     } else: gen_inv_other {
         // N == 1 (or N >= 3): no broadcast.
         for h in 0..2: gen_tie {

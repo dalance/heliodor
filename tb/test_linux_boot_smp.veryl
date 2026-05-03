@@ -50,6 +50,11 @@ module test_linux_boot_smp_harness #(
     var h0_pc       : logic<64>;
     var h1_pc       : logic<64>;
     var h1_instret  : logic   ;
+    var h1_sw_irq   : logic   ;
+    var h0_sw_irq   : logic   ;
+    var clint_wen   : logic    ;
+    var clint_addr  : logic<16>;
+    var clint_wdata : logic<64>;
 
     inst dut: heliodor_soc #(
         RESET_PC: 0,
@@ -77,6 +82,11 @@ module test_linux_boot_smp_harness #(
         o_dbg_h0_pc     : h0_pc        ,
         o_dbg_h1_pc     : h1_pc        ,
         o_dbg_h1_instret: h1_instret   ,
+        o_dbg_h1_sw_irq : h1_sw_irq    ,
+        o_dbg_h0_sw_irq : h0_sw_irq    ,
+        o_dbg_clint_wen : clint_wen    ,
+        o_dbg_clint_addr: clint_addr   ,
+        o_dbg_clint_wdata: clint_wdata ,
     );
 
     // Track whether hart 1 ever entered kernel address space (>= 0x80000000)
@@ -100,6 +110,49 @@ module test_linux_boot_smp_harness #(
     var h1_complete_seen   : logic    ;
     var brought_up_seen    : logic    ;
     var bu_match_idx       : logic<3> ;
+    // Oops-PC trigger and bad function-pointer load tracker.
+    // The 2-hart Linux boot dies with an unmapped jump to virtual address
+    // 0x00000000_207ff400 from a corrupted scheduler function pointer.
+    // Capture (a) the cycle and dmem_addr where 0x207ff400 first appears
+    // on the bus as a load result (so we can identify which kernel struct
+    // field is being corrupted), and (b) the cycle when the PC actually
+    // reaches 0x207ff400 (the fault dispatch).
+    var oops_triggered     : logic    ;
+    var bad_ptr_log_cnt    : logic<4> ;
+    var bad_ptr_write_cnt  : logic<4> ;
+    var fetch_bad_pa_h0    : logic    ;
+    var fetch_bad_pa_h1    : logic    ;
+    // Track msip writes to CLINT (per-hart). msip[h] = CLINT_BASE + 4*h.
+    var msip0_write_cnt    : logic<32>;
+    var msip1_write_cnt    : logic<32>;
+    // Hart 0 firmware: count `sw t6,0(t5)` retire at sbi_ipi+0x26 (PC 0x39c)
+    // — the actual instruction that writes msip[hartid] in the sbi_ipi
+    // loop. If sbi_ipi is entered (h0_sbi_ipi_cnt) but sw_cnt == 0, the
+    // loop is exiting before reaching the store (mask==0 or unsupported).
+    var h0_sbi_ipi_sw_cnt  : logic<32>;
+    // Trap entry counters: m_trap_handler (PC 0xa0) is the M-mode trap
+    // entry point; m_handle_irq (PC 0xd2) is the interrupt sub-dispatcher.
+    // If hart 1's trap_cnt is 0 we know mip never asserted, so any msip[1]
+    // write the firmware made never reached the CLINT->core wire (or the
+    // CLINT is not driving sw_irq into hart 1's core).
+    var h1_trap_cnt        : logic<32>;
+    var h1_irq_cnt         : logic<32>;
+    // Cycles during which CLINT raised hart 1's MSIP wire. Independent of
+    // whether hart 1's core actually trapped — distinguishes the
+    // "CLINT not driving sw_irq" case from "core not trapping" case.
+    var h1_swirq_cyc       : logic<32>;
+    var h0_swirq_cyc       : logic<32>;
+    // S-mode kernel IPI/IRQ handler reach counters. handle_IPI and
+    // riscv_intc_irq tell us whether SSIP, once raised by m_handle_msip,
+    // actually drives the kernel's IPI dispatch path.
+    var h0_handle_ipi_cnt  : logic<32>;
+    var h0_intc_irq_cnt    : logic<32>;
+    var h1_handle_ipi_cnt  : logic<32>;
+    var h1_intc_irq_cnt    : logic<32>;
+    // Track the first 4 CLINT MSIP region writes (addr 0x0000-0x001F) so
+    // we can confirm whether sbi_ipi's sw msip[1]=1 actually reaches the
+    // CLINT input port. addr=0 → msip[0], addr=4 → msip[1].
+    var clint_msip_w_cnt   : logic<4>;
 
     // Free-running cycle counter used by stage prints (declared early).
     var cycle_cnt: logic<32>;
@@ -260,7 +313,84 @@ module test_linux_boot_smp_harness #(
             h1_sbi_specver_seen = 1'b0;
             max_init_pc_h0   = 64'd0;
             max_init_pc_h1   = 64'd0;
+            oops_triggered    = 1'b0;
+            bad_ptr_log_cnt   = 4'd0;
+            bad_ptr_write_cnt = 4'd0;
+            fetch_bad_pa_h0   = 1'b0;
+            fetch_bad_pa_h1   = 1'b0;
+            msip0_write_cnt   = 32'd0;
+            msip1_write_cnt   = 32'd0;
+            h0_sbi_ipi_sw_cnt = 32'd0;
+            h1_trap_cnt       = 32'd0;
+            h1_irq_cnt        = 32'd0;
+            h1_swirq_cyc      = 32'd0;
+            h0_swirq_cyc      = 32'd0;
+            h0_handle_ipi_cnt = 32'd0;
+            h0_intc_irq_cnt   = 32'd0;
+            h1_handle_ipi_cnt = 32'd0;
+            h1_intc_irq_cnt   = 32'd0;
+            clint_msip_w_cnt  = 4'd0;
         } else {
+            // Trigger first when hart 0 enters Linux page-fault handler
+            // (no_context+0x2 = ffffffff80004622) which signals the Oops
+            // is about to be dumped. This freezes oops_triggered so the
+            // surrounding bad-pointer trace stops; we only care about
+            // events BEFORE this point.
+            if !oops_triggered && h0_pc == 64'hffffffff80004622 {
+                oops_triggered = 1'b1;
+                $write("[OOPS_HANDLER_ENTRY cyc=%h h0_pc=%h h1_pc=%h]\n",
+                       cycle_cnt, h0_pc, h1_pc);
+            }
+            // CLINT msip[h] write tracking. msip[0] @ 0x02000000, msip[1]
+            // @ 0x02000004. dmem is the bus-arbitrated single port, so any
+            // write to these addresses is some hart asking the SBI/CLINT
+            // to interrupt itself or another hart.
+            if dmem_wen && dmem_addr[31:0] == 32'h02000000 {
+                msip0_write_cnt = msip0_write_cnt + 32'd1;
+            }
+            if dmem_wen && dmem_addr[31:0] == 32'h02000004 {
+                msip1_write_cnt = msip1_write_cnt + 32'd1;
+                if msip1_write_cnt <: 32'd5 {
+                    $write("[MSIP1_WRITE#%h cyc=%h wdata=%h h0_pc=%h h1_pc=%h]\n",
+                           msip1_write_cnt + 32'd1, cycle_cnt, dmem_wdata, h0_pc, h1_pc);
+                }
+            }
+
+            // Direct fetch trigger: capture when hart 0's translated
+            // physical fetch address falls in the bad page 0x207ff___.
+            // sticky-first only.
+            if !oops_triggered && fetch_bad_pa_h0 == 1'b0
+                && imem_addr[0][31:12] == 20'h207ff && imem_addr[0][63:32] == 32'd0 {
+                fetch_bad_pa_h0 = 1'b1;
+                $write("[FETCH_BAD_PA_FIRST_h0 cyc=%h pa=%h h0_pc=%h h1_pc=%h]\n",
+                       cycle_cnt, imem_addr[0], h0_pc, h1_pc);
+            }
+            if !oops_triggered && fetch_bad_pa_h1 == 1'b0
+                && imem_addr[1][31:12] == 20'h207ff && imem_addr[1][63:32] == 32'd0 {
+                fetch_bad_pa_h1 = 1'b1;
+                $write("[FETCH_BAD_PA_FIRST_h1 cyc=%h pa=%h h0_pc=%h h1_pc=%h]\n",
+                       cycle_cnt, imem_addr[1], h0_pc, h1_pc);
+            }
+            // Match anything in the 0x00000000_207ff000-0x207fffff page
+            // (the unmapped page the bad function pointer points into),
+            // since the actual fault PC could be any offset within the
+            // page (jalr masks LSB, load value may have low bits set).
+            let bad_load_match: logic = dmem_rdata[63:32] == 32'd0
+                                     && dmem_rdata[31:12] == 20'h207ff;
+            let bad_write_match: logic = dmem_wdata[63:32] == 32'd0
+                                      && dmem_wdata[31:12] == 20'h207ff;
+            // Pre-Oops bad pointer load tracking — only first event to
+            // keep log size minimal so the bg task output isn't truncated.
+            if !oops_triggered && bad_load_match && bad_ptr_log_cnt == 4'd0 {
+                bad_ptr_log_cnt = 4'd1;
+                $write("[BAD_PTR_LOAD_FIRST cyc=%h val=%h dmem_addr=%h h0_pc=%h h1_pc=%h]\n",
+                       cycle_cnt, dmem_rdata, dmem_addr, h0_pc, h1_pc);
+            }
+            if !oops_triggered && dmem_wen && bad_write_match && bad_ptr_write_cnt == 4'd0 {
+                bad_ptr_write_cnt = 4'd1;
+                $write("[BAD_PTR_WRITE_FIRST cyc=%h val=%h dmem_addr=%h h0_pc=%h h1_pc=%h]\n",
+                       cycle_cnt, dmem_wdata, dmem_addr, h0_pc, h1_pc);
+            }
             if h1_pc[31] {
                 h1_kernel_seen = 1'b1;
             }
@@ -364,21 +494,38 @@ module test_linux_boot_smp_harness #(
             }
             // Per-hart firmware entry counters + first-reach prints.
             // Addresses from objdump linux_boot_fw_2hart.elf (post-IPI patch).
-            if h1_pc == 64'h118 { h1_timer_cnt    = h1_timer_cnt + 32'd1; }
-            if h1_pc == 64'h14c { h1_msip_cnt     = h1_msip_cnt + 32'd1; }
-            if h1_pc == 64'h1ec { h1_ecall_cnt    = h1_ecall_cnt + 32'd1; }
-            if h1_pc == 64'h3ec { h1_sbi_time_cnt = h1_sbi_time_cnt + 32'd1; }
-            if h1_pc == 64'h280 { h1_sbi_lstm_cnt = h1_sbi_lstm_cnt + 32'd1; }
-            if h1_pc == 64'h41c { h1_sbi_ipi_cnt  = h1_sbi_ipi_cnt + 32'd1; }
-            if h1_pc == 64'h2bc { h1_sbi_lipi_cnt = h1_sbi_lipi_cnt + 32'd1; }
-            if h1_pc == 64'h554 { h1_park_cnt     = h1_park_cnt + 32'd1; }
-            if h0_pc == 64'h118 { h0_timer_cnt    = h0_timer_cnt + 32'd1; }
-            if h0_pc == 64'h14c { h0_msip_cnt     = h0_msip_cnt + 32'd1; }
-            if h0_pc == 64'h1ec { h0_ecall_cnt    = h0_ecall_cnt + 32'd1; }
-            if h0_pc == 64'h3ec { h0_sbi_time_cnt = h0_sbi_time_cnt + 32'd1; }
-            if h0_pc == 64'h280 { h0_sbi_lstm_cnt = h0_sbi_lstm_cnt + 32'd1; }
-            if h0_pc == 64'h41c { h0_sbi_ipi_cnt  = h0_sbi_ipi_cnt + 32'd1; }
-            if h0_pc == 64'h2bc { h0_sbi_lipi_cnt = h0_sbi_lipi_cnt + 32'd1; }
+            if h1_pc == 64'hec  { h1_timer_cnt    = h1_timer_cnt + 32'd1; }
+            if h1_pc == 64'h112 { h1_msip_cnt     = h1_msip_cnt + 32'd1; }
+            if h1_pc == 64'h19c { h1_ecall_cnt    = h1_ecall_cnt + 32'd1; }
+            if h1_pc == 64'h34e { h1_sbi_time_cnt = h1_sbi_time_cnt + 32'd1; }
+            if h1_pc == 64'h218 { h1_sbi_lstm_cnt = h1_sbi_lstm_cnt + 32'd1; }
+            if h1_pc == 64'h376 { h1_sbi_ipi_cnt  = h1_sbi_ipi_cnt + 32'd1; }
+            if h1_pc == 64'h25e { h1_sbi_lipi_cnt = h1_sbi_lipi_cnt + 32'd1; }
+            if h1_pc == 64'h474 { h1_park_cnt     = h1_park_cnt + 32'd1; }
+            if h1_pc == 64'ha0  { h1_trap_cnt     = h1_trap_cnt + 32'd1; }
+            if h1_pc == 64'hd2  { h1_irq_cnt      = h1_irq_cnt + 32'd1; }
+            if h1_sw_irq        { h1_swirq_cyc    = h1_swirq_cyc + 32'd1; }
+            if h0_sw_irq        { h0_swirq_cyc    = h0_swirq_cyc + 32'd1; }
+            if h0_pc == 64'hffffffff80003cd6 { h0_handle_ipi_cnt = h0_handle_ipi_cnt + 32'd1; }
+            if h0_pc == 64'hffffffff800a720e { h0_intc_irq_cnt   = h0_intc_irq_cnt + 32'd1; }
+            if h1_pc == 64'hffffffff80003cd6 { h1_handle_ipi_cnt = h1_handle_ipi_cnt + 32'd1; }
+            if h1_pc == 64'hffffffff800a720e { h1_intc_irq_cnt   = h1_intc_irq_cnt + 32'd1; }
+            // CLINT MSIP SET only (wdata bit0 = 1) — clears are uninteresting
+            // (secondary/firmware self-clear). Set events are kernel→firmware
+            // IPI delivery requests.
+            if clint_wen && clint_addr[15:5] == 11'd0 && clint_wdata[0] == 1'b1 && clint_msip_w_cnt <: 4'hf {
+                clint_msip_w_cnt = clint_msip_w_cnt + 4'd1;
+                $write("[CLINT_MSIP_SET#%h cyc=%h addr=%h h0_pc=%h h1_pc=%h]\n",
+                       clint_msip_w_cnt, cycle_cnt, clint_addr, h0_pc, h1_pc);
+            }
+            if h0_pc == 64'hec  { h0_timer_cnt    = h0_timer_cnt + 32'd1; }
+            if h0_pc == 64'h112 { h0_msip_cnt     = h0_msip_cnt + 32'd1; }
+            if h0_pc == 64'h19c { h0_ecall_cnt    = h0_ecall_cnt + 32'd1; }
+            if h0_pc == 64'h34e { h0_sbi_time_cnt = h0_sbi_time_cnt + 32'd1; }
+            if h0_pc == 64'h218 { h0_sbi_lstm_cnt = h0_sbi_lstm_cnt + 32'd1; }
+            if h0_pc == 64'h376 { h0_sbi_ipi_cnt  = h0_sbi_ipi_cnt + 32'd1; }
+            if h0_pc == 64'h25e { h0_sbi_lipi_cnt = h0_sbi_lipi_cnt + 32'd1; }
+            if h0_pc == 64'h39c { h0_sbi_ipi_sw_cnt = h0_sbi_ipi_sw_cnt + 32'd1; }
             if !h1_timer_seen    && h1_pc == 64'h118 {
                 h1_timer_seen    = 1'b1;
                 $write("[fw h1 m_handle_timer       cyc=%h]\n", cycle_cnt);
@@ -509,12 +656,17 @@ module test_linux_boot_smp_harness #(
     // (cycle_cnt declared earlier so stage prints can reference it.)
     // ============================================================
 
-    // UART output trace — print every byte the firmware/kernel writes to UART.
+    // UART output trace — capped at 16K bytes so the bg-task log isn't
+    // truncated past the trigger output. Sufficient to see the boot
+    // progress up to "Brought up 1 node, 2 CPUs" or any early panic.
+    var uart_print_cnt: logic<32>;
     always_ff (clk, rst) {
         if_reset {
+            uart_print_cnt = 32'd0;
         } else {
-            if uart_tx {
+            if uart_tx && uart_print_cnt <: 32'd16384 {
                 $write("%c", uart_data);
+                uart_print_cnt = uart_print_cnt + 32'd1;
             }
         }
     }
@@ -528,14 +680,14 @@ module test_linux_boot_smp_harness #(
                 $write("[smp-trace cyc=%h h1_pc=%h h1_ret=%h h0_pc=%h max_h0=%h max_h1=%h]\n",
                        cycle_cnt, h1_pc, h1_retire_cnt, h0_pc, max_init_pc_h0, max_init_pc_h1);
             }
-            // Every 100M cycles, dump per-hart firmware entry counters so
+            // Every ~33M cycles, dump per-hart firmware entry counters so
             // we can confirm the timer / msip / SBI paths actually fire on
             // hart 1 before the deadlock.
-            if cycle_cnt[27:0] == 28'd0 && cycle_cnt != 32'd0 {
-                $write("[fw-cnt cyc=%h h0(t=%h m=%h e=%h st=%h sl=%h ipi=%h li=%h) h1(t=%h m=%h e=%h st=%h sl=%h ipi=%h li=%h p=%h)]\n",
+            if cycle_cnt[24:0] == 25'd0 && cycle_cnt != 32'd0 {
+                $write("[fw-cnt cyc=%h h0(m=%h e=%h sw_irq=%h hipi=%h intc=%h) h1(trap=%h irq=%h m=%h e=%h sw_irq=%h hipi=%h intc=%h)]\n",
                        cycle_cnt,
-                       h0_timer_cnt, h0_msip_cnt, h0_ecall_cnt, h0_sbi_time_cnt, h0_sbi_lstm_cnt, h0_sbi_ipi_cnt, h0_sbi_lipi_cnt,
-                       h1_timer_cnt, h1_msip_cnt, h1_ecall_cnt, h1_sbi_time_cnt, h1_sbi_lstm_cnt, h1_sbi_ipi_cnt, h1_sbi_lipi_cnt, h1_park_cnt);
+                       h0_msip_cnt, h0_ecall_cnt, h0_swirq_cyc, h0_handle_ipi_cnt, h0_intc_irq_cnt,
+                       h1_trap_cnt, h1_irq_cnt, h1_msip_cnt, h1_ecall_cnt, h1_swirq_cyc, h1_handle_ipi_cnt, h1_intc_irq_cnt);
             }
         }
     }
@@ -607,7 +759,7 @@ module test_smp_linux_boot {
         // the wait_for_completion blocks). Reaching SBI shutdown requires
         // either working IPI infrastructure or sim-level WFI halt to make
         // a 5B+ cycle run feasible.
-        for _i in 0..50000 {
+        for _i in 0..6000 {
             clk.next(10000);
             if pass {
                 break;
