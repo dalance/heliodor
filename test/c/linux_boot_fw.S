@@ -261,6 +261,14 @@ m_handle_msip:
     li   t0, (1 << 11) | (1 << 7)
     csrw mstatus, t0
 
+    /* Phase 5 fix: secondary_start_sbi expects MMU OFF (it sets up paging
+     * itself). If hart was already in S-mode kernel with satp != 0 before
+     * this MSIP arrived (e.g., the CLINT msip[1] bug previously masked the
+     * HART_START IPI, and Linux later resent), the mret to PA would page
+     * fault. Clear satp here so the mret targets PA correctly. */
+    csrw satp, zero
+    sfence.vma
+
     csrr a0, mhartid
 
     /* Restore t0-t6 and sp before mret. The S-mode sp is whatever was
