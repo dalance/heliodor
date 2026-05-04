@@ -1,0 +1,215 @@
+// Minimal reproducer for the cross-module multi-instance comb evaluation
+// bug observed in Phase 5 SMP. Two cores share a bus rdata broadcast
+// signal; the bus arbiter grants alternately. Each core captures bus rdata
+// into its own FF on the cycle it is granted. If the simulator
+// correctly orders cross-module comb settle, each core captures the
+// rdata corresponding to ITS OWN address. If fanout is incomplete or
+// settle order is wrong, a core may capture the OTHER core's rdata
+// (the heliodor h1 spin scenario).
+
+module mini_dram (
+    i_addr : input  logic<8>  ,
+    o_rdata: output logic<32> ,
+) {
+    // Arbitrary deterministic mapping: rdata = (addr << 24) | 0x00ABCDEF
+    // — top byte distinguishes which addr was read.
+    assign o_rdata = ({i_addr, 24'd0}) | 32'h00ABCDEF;
+}
+
+module mini_core #(
+    param ID: u32 = 0,
+) (
+    clk        : input  clock     ,
+    rst        : input  reset     ,
+    i_bus_rdata: input  logic<32> ,
+    i_grant    : input  logic     ,
+    o_addr     : output logic<8>  ,
+    o_request  : output logic     ,
+    o_captured : output logic<32> ,
+    o_done     : output logic     ,
+) {
+    var captured: logic<32>;
+    var done    : logic    ;
+    var phase   : logic<2> ; // 0=idle, 1=request, 2=done
+
+    let my_addr: logic<8> = (ID as 8) + 8'd10;
+
+    always_ff (clk, rst) {
+        if_reset {
+            captured = 32'd0;
+            done     = 1'b0;
+            phase    = 2'd0;
+        } else if phase == 2'd0 {
+            phase = 2'd1;
+        } else if phase == 2'd1 && i_grant {
+            // Capture only when granted — bus rdata is OUR data
+            captured = i_bus_rdata;
+            done     = 1'b1;
+            phase    = 2'd2;
+        }
+    }
+
+    assign o_addr     = my_addr;
+    assign o_request  = phase == 2'd1;
+    assign o_captured = captured;
+    assign o_done     = done;
+}
+
+module mini_bus_arbiter (
+    clk      : input  clock     ,
+    rst      : input  reset     ,
+    i_req_a  : input  logic     ,
+    i_addr_a : input  logic<8>  ,
+    i_req_b  : input  logic     ,
+    i_addr_b : input  logic<8>  ,
+    o_addr   : output logic<8>  ,
+    o_grant_a: output logic     ,
+    o_grant_b: output logic     ,
+) {
+    // Toggle-based round-robin: even cycles → a priority; odd → b priority
+    var toggle: logic;
+    always_ff (clk, rst) {
+        if_reset {
+            toggle = 1'b0;
+        } else {
+            toggle = !toggle;
+        }
+    }
+
+    // Grant logic: requested + (priority OR other not requesting)
+    let grant_a: logic = i_req_a && (!i_req_b || !toggle);
+    let grant_b: logic = i_req_b && (!i_req_a ||  toggle);
+    assign o_addr    = if grant_a ? i_addr_a : if grant_b ? i_addr_b : 8'd0;
+    assign o_grant_a = grant_a;
+    assign o_grant_b = grant_b;
+}
+
+module test_multi_instance_amo_harness (
+    clk          : input  clock     ,
+    rst          : input  reset     ,
+    o_pass       : output logic     ,
+    o_a_captured : output logic<32> ,
+    o_b_captured : output logic<32> ,
+    o_a_done     : output logic     ,
+    o_b_done     : output logic     ,
+    o_cycle      : output logic<32> ,
+) {
+    var bus_addr  : logic<8>;
+    var bus_rdata : logic<32>;
+    var addr_a    : logic<8>;
+    var req_a     : logic;
+    var grant_a   : logic;
+    var cap_a     : logic<32>;
+    var done_a    : logic;
+    var addr_b    : logic<8>;
+    var req_b     : logic;
+    var grant_b   : logic;
+    var cap_b     : logic<32>;
+    var done_b    : logic;
+    var cycle     : logic<32>;
+
+    inst u_a: mini_core #(ID: 0) (
+        clk        : clk        ,
+        rst        : rst        ,
+        i_bus_rdata: bus_rdata  ,
+        i_grant    : grant_a    ,
+        o_addr     : addr_a     ,
+        o_request  : req_a      ,
+        o_captured : cap_a      ,
+        o_done     : done_a     ,
+    );
+
+    inst u_b: mini_core #(ID: 1) (
+        clk        : clk        ,
+        rst        : rst        ,
+        i_bus_rdata: bus_rdata  ,
+        i_grant    : grant_b    ,
+        o_addr     : addr_b     ,
+        o_request  : req_b      ,
+        o_captured : cap_b      ,
+        o_done     : done_b     ,
+    );
+
+    inst u_arb: mini_bus_arbiter (
+        clk      : clk     ,
+        rst      : rst     ,
+        i_req_a  : req_a   ,
+        i_addr_a : addr_a  ,
+        i_req_b  : req_b   ,
+        i_addr_b : addr_b  ,
+        o_addr   : bus_addr,
+        o_grant_a: grant_a ,
+        o_grant_b: grant_b ,
+    );
+
+    inst u_dram: mini_dram (
+        i_addr : bus_addr,
+        o_rdata: bus_rdata,
+    );
+
+    always_ff (clk, rst) {
+        if_reset {
+            cycle = 32'd0;
+        } else {
+            cycle = cycle + 32'd1;
+        }
+    }
+
+    // Expected:
+    //   addr_a = 10, addr_b = 11
+    //   When core a is granted, bus_addr = 10, bus_rdata = (10<<24)|0xABCDEF = 0x0AABCDEF
+    //   When core b is granted, bus_addr = 11, bus_rdata = (11<<24)|0xABCDEF = 0x0BABCDEF
+    //   a captures 0x0AABCDEF, b captures 0x0BABCDEF
+    //
+    // Bug shape: if cross-module fanout is incomplete, a core may
+    // capture the bus_rdata BEFORE it's updated for that core's own
+    // address. That means a captures 0x0BABCDEF or b captures 0x0AABCDEF.
+    let expected_a: logic<32> = 32'h0AABCDEF;
+    let expected_b: logic<32> = 32'h0BABCDEF;
+
+    assign o_pass        = (!done_a || cap_a == expected_a) && (!done_b || cap_b == expected_b);
+    assign o_a_captured  = cap_a;
+    assign o_b_captured  = cap_b;
+    assign o_a_done      = done_a;
+    assign o_b_done      = done_b;
+    assign o_cycle       = cycle;
+}
+
+#[test(test_multi_instance_amo)]
+module test_multi_instance_amo {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen(clk);
+
+    var pass       : logic;
+    var a_cap      : logic<32>;
+    var b_cap      : logic<32>;
+    var a_done     : logic;
+    var b_done     : logic;
+    var cycle      : logic<32>;
+
+    inst h: test_multi_instance_amo_harness (
+        clk          : clk     ,
+        rst          : rst     ,
+        o_pass       : pass    ,
+        o_a_captured : a_cap   ,
+        o_b_captured : b_cap   ,
+        o_a_done     : a_done  ,
+        o_b_done     : b_done  ,
+        o_cycle      : cycle   ,
+    );
+
+    initial {
+        rst.assert(clk);
+        // Run 16 cycles, both cores should be done with correct captures
+        for _i in 0..16 {
+            clk.next(10);
+        }
+        $display("test_multi_instance_amo: cycle=%h a_cap=%h b_cap=%h a_done=%b b_done=%b pass=%b",
+                 cycle, a_cap, b_cap, a_done, b_done, pass);
+        $assert(a_done, "core a never granted");
+        $assert(b_done, "core b never granted");
+        $assert(pass, "captured value mismatch — cross-module fanout bug");
+        $display("test_multi_instance_amo: passed (a=0x%h b=0x%h)", a_cap, b_cap);
+        $finish();
+    }
+}
