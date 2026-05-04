@@ -287,9 +287,16 @@ m_handle_msip:
 .Lspurious_msip:
     /* No HART_START pending — this is a kernel-issued IPI (via SBI sPI
      * or legacy SEND_IPI). Deliver to S-mode by raising sip.SSIP so the
-     * kernel's IPI handler runs. msip was already cleared above. */
-    li   t0, 0x2     /* SIP.SSIP = bit 1 */
-    csrs mip, t0
+     * kernel's IPI handler runs. msip was already cleared above.
+     *
+     * Phase 5 SMP debug: write SSIP via two separate paths to make sure
+     * the bit actually commits before mret. csrw mip with read-modify-write
+     * (alternative to csrrs) and a fence guard against any pipeline race
+     * where the SSIP set wouldn't commit before mret restores S-mode. */
+    csrr t0, mip
+    ori  t0, t0, 0x2     /* mip |= SIP.SSIP (bit 1) */
+    csrw mip, t0
+    fence
     ld   t0, 0(sp)
     ld   t1, 8(sp)
     ld   t2, 16(sp)
