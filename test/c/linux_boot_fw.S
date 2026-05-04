@@ -243,6 +243,19 @@ m_handle_msip:
     ld   t0, 0(t2)           /* jump_addr */
     beqz t0, .Lspurious_msip /* spurious: just resume */
 
+    /* Phase 5 fix: if state == 0 (HART_STARTED), the cpu was already
+     * brought up via hart_lottery — Linux's HART_START call queued a
+     * stale jump_addr that we must NOT re-dispatch (would re-bootstrap
+     * the cpu from secondary_start_sbi, breaking Linux's CPUHP state
+     * tracking; in particular riscv_intc_cpu_starting wouldn't run a
+     * second time, leaving mie.SSIE=0 and IPIs undeliverable). Clear
+     * the stale jump_addr and fall through to .Lspurious_msip. */
+    ld   t3, 16(t2)          /* state */
+    bnez t3, .Lhart_start_actual    /* state != 0 → real HART_START path */
+    sd   zero, 0(t2)         /* clear stale jump_addr */
+    j    .Lspurious_msip
+.Lhart_start_actual:
+
     /* HART_START dispatch: redirect to S-mode at jump_addr.
      * a0 = hartid, a1 = opaque (per SBI HSM spec).
      * t0 already holds jump_addr; preserve it across mstatus setup so
