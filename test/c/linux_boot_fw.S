@@ -636,6 +636,24 @@ sbi_hsm_hart_start:
     li   t1, 1
     sw   t1, 0(t0)           /* msip[target] = 1 */
 
+    /* Phase 6.A.3 N=4 fix: delay SBI return so the kernel's
+     * wait_for_completion polling on the boot CPU starts later, giving
+     * the just-woken secondary a head start in S-mode kernel boot. With
+     * 4-way bus contention CPU3's cold secondary boot takes longer than
+     * the kernel default timeout (kernel prints "CPU3: failed to come
+     * online" then CPU3 belatedly arrives at riscv-intc start, leaving
+     * cpuhp state inconsistent and deadlocking later init). Apply only
+     * to target_hart >= 1 so 1-hart / 2-hart paths are unaffected.
+     * 0x80000 cycles ≈ 0.5M cycles ≈ 1 jiffy.
+     */
+    li   t5, 1
+    blt  t3, t5, .Lhsm_skip_delay  /* target=0 only: no delay */
+    li   t5, 0x80000
+.Lhsm_delay_loop:
+    addi t5, t5, -1
+    bnez t5, .Lhsm_delay_loop
+.Lhsm_skip_delay:
+
     li a0, 0    /* SBI_SUCCESS */
     li a1, 0
     j sbi_return
