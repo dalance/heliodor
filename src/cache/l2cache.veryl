@@ -1,8 +1,9 @@
-// Shared L2 cache (Phase 6.E.2 — direct-mapped, write-through).
+// Shared L2 cache (Phase 6.E.3 — 4-way set-associative, write-through).
 //
-// 32KB direct-mapped:
+// 128KB total, 4-way set-associative:
 //   line  = 64B (8 dwords) — same as L1 dcache
-//   sets  = 512
+//   ways  = 4
+//   sets  = 512 per way (32KB per way)
 //   addr[63:15] = tag (49 bits)
 //   addr[14:6]  = index (9 bits, 512 sets)
 //   addr[5:3]   = word offset (3 bits, 8 dwords)
@@ -14,18 +15,18 @@
 //
 // Policy: write-through, no-write-allocate.
 //   - read hit  : serve from L2 array, do NOT forward to DRAM.
-//   - read miss : forward to DRAM, install word in L2 (replace tag if conflict).
-//   - write hit : update L2 entry (byte-merge with wstrb), forward to DRAM.
-//   - write miss: forward to DRAM, leave L2 untouched.
+//   - read miss : forward to DRAM, install word in chosen victim way
+//                 (replace tag if conflict; clear word_valid).
+//   - write hit : update hit way's data (byte-merge), forward to DRAM.
+//   - write miss: pure pass-through.
 //
-// MSHR is intentionally absent: the testbench DRAM is 1-cycle
-// combinational, so there is no fill latency to overlap. Real-DRAM
-// latency would warrant adding it; current value is zero.
+// Replacement: tree-pseudo-LRU (3 bits per set, same encoding as L1
+// dcache) — bit[2] selects LRU sub-group; bit[1] LRU in {way0,way1};
+// bit[0] LRU in {way2,way3}. Updated on every access (hit + install).
 //
-// Coherence: invalidate broadcast still fires from memory_bus directly to
-// L1 dcaches (heliodor_soc bus_inv_valid path). L2 does not yet drive its
-// own invalidates — a future Phase 6.E.4 will add L2-eviction-driven L1
-// invalidate fanout. For N=1 (current scope) coherence is moot.
+// MSHR is intentionally absent: testbench DRAM is 1-cycle combinational.
+// Coherence: invalidate broadcast still fires from memory_bus to L1
+// dcaches directly. L2 does not yet drive its own invalidates.
 pub module l2cache (
     clk: input clock,
     rst: input reset,
@@ -50,36 +51,94 @@ pub module l2cache (
     let req_tag    : logic<49> = i_addr[63:15];
     let req_index  : logic<9>  = i_addr[14:6];
     let req_offset : logic<3>  = i_addr[5:3];
-
-    // -----------------------------------------------------------------
-    // Storage
-    // -----------------------------------------------------------------
-    var tag_array  : logic<49> [512];
-    var line_valid : logic     [512];
-    var word_valid : logic<8>  [512];      // per-word valid (8 bits per line)
-    var data_array : logic<64> [4096];     // 512 sets × 8 dwords flattened
-
     let data_idx   : logic<12> = {req_index, req_offset};
 
     // -----------------------------------------------------------------
-    // Lookup
+    // Storage — 4 separate banks (one per way)
     // -----------------------------------------------------------------
-    let cur_tag       : logic<49> = tag_array [req_index];
-    let cur_line_valid: logic     = line_valid[req_index];
-    let cur_word_valid: logic<8>  = word_valid[req_index];
-    let cur_data      : logic<64> = data_array[data_idx];
+    var tag_0 : logic<49> [512];
+    var tag_1 : logic<49> [512];
+    var tag_2 : logic<49> [512];
+    var tag_3 : logic<49> [512];
+    var lv_0  : logic     [512];
+    var lv_1  : logic     [512];
+    var lv_2  : logic     [512];
+    var lv_3  : logic     [512];
+    var wv_0  : logic<8>  [512];
+    var wv_1  : logic<8>  [512];
+    var wv_2  : logic<8>  [512];
+    var wv_3  : logic<8>  [512];
+    var data_0: logic<64> [4096];
+    var data_1: logic<64> [4096];
+    var data_2: logic<64> [4096];
+    var data_3: logic<64> [4096];
+    var plru  : logic<3>  [512]; // tree-PLRU per set
 
-    let tag_match : logic = cur_line_valid && (cur_tag == req_tag);
-    let word_hit  : logic = tag_match && cur_word_valid[req_offset];
+    // -----------------------------------------------------------------
+    // Per-way lookup
+    // -----------------------------------------------------------------
+    let cur_tag_0 : logic<49> = tag_0 [req_index];
+    let cur_tag_1 : logic<49> = tag_1 [req_index];
+    let cur_tag_2 : logic<49> = tag_2 [req_index];
+    let cur_tag_3 : logic<49> = tag_3 [req_index];
+    let cur_lv_0  : logic     = lv_0  [req_index];
+    let cur_lv_1  : logic     = lv_1  [req_index];
+    let cur_lv_2  : logic     = lv_2  [req_index];
+    let cur_lv_3  : logic     = lv_3  [req_index];
+    let cur_wv_0  : logic<8>  = wv_0  [req_index];
+    let cur_wv_1  : logic<8>  = wv_1  [req_index];
+    let cur_wv_2  : logic<8>  = wv_2  [req_index];
+    let cur_wv_3  : logic<8>  = wv_3  [req_index];
+    let cur_data_0: logic<64> = data_0[data_idx];
+    let cur_data_1: logic<64> = data_1[data_idx];
+    let cur_data_2: logic<64> = data_2[data_idx];
+    let cur_data_3: logic<64> = data_3[data_idx];
 
-    let read_hit  : logic = i_ren && word_hit;
-    let read_miss : logic = i_ren && !word_hit;
+    // tag_match: line-level (line valid AND tag matches) — controls
+    // write-hit and "same-line miss" (word missing on existing line).
+    let tm_0: logic = cur_lv_0 && (cur_tag_0 == req_tag);
+    let tm_1: logic = cur_lv_1 && (cur_tag_1 == req_tag);
+    let tm_2: logic = cur_lv_2 && (cur_tag_2 == req_tag);
+    let tm_3: logic = cur_lv_3 && (cur_tag_3 == req_tag);
+    let any_tm: logic = tm_0 || tm_1 || tm_2 || tm_3;
+
+    // word_hit: tag_match AND requested word present.
+    let wh_0: logic = tm_0 && cur_wv_0[req_offset];
+    let wh_1: logic = tm_1 && cur_wv_1[req_offset];
+    let wh_2: logic = tm_2 && cur_wv_2[req_offset];
+    let wh_3: logic = tm_3 && cur_wv_3[req_offset];
+    let any_wh: logic = wh_0 || wh_1 || wh_2 || wh_3;
+
+    // Hit way select (priority irrelevant — at most one way matches).
+    let hit_way: logic<2> = if wh_0 ? 2'd0 : if wh_1 ? 2'd1 : if wh_2 ? 2'd2 : 2'd3;
+    let tm_way : logic<2> = if tm_0 ? 2'd0 : if tm_1 ? 2'd1 : if tm_2 ? 2'd2 : 2'd3;
+
+    let hit_data: logic<64> = if wh_0 ? cur_data_0
+                            : if wh_1 ? cur_data_1
+                            : if wh_2 ? cur_data_2 : cur_data_3;
+
+    let read_hit  : logic = i_ren && any_wh;
+    let read_miss : logic = i_ren && !any_wh;
+
+    // -----------------------------------------------------------------
+    // Victim selection — invalid first, otherwise PLRU.
+    // -----------------------------------------------------------------
+    let plru_bits  : logic<3> = plru[req_index];
+    let has_inv    : logic    = !cur_lv_0 || !cur_lv_1 || !cur_lv_2 || !cur_lv_3;
+    let invalid_way: logic<2> = if !cur_lv_0 ? 2'd0
+                              : if !cur_lv_1 ? 2'd1
+                              : if !cur_lv_2 ? 2'd2 : 2'd3;
+    let plru_way   : logic<2> = {plru_bits[2], if !plru_bits[2] ? plru_bits[1] : plru_bits[0]};
+    let victim_way : logic<2> = if has_inv ? invalid_way : plru_way;
+
+    // For read_miss, the install way:
+    //   - same-line miss (any_tm): use the existing same-line way (tm_way)
+    //                              so we don't double-allocate the same line
+    //   - conflict miss          : use victim_way (LRU or invalid)
+    let install_way: logic<2> = if any_tm ? tm_way : victim_way;
 
     // -----------------------------------------------------------------
     // DRAM bus driving
-    //   read hit  → suppress ren (no DRAM access)
-    //   read miss → ren, addr=i_addr  (DRAM responds combinationally)
-    //   any write → wen, addr=i_addr, wdata, wstrb (write-through)
     // -----------------------------------------------------------------
     assign o_mem_addr  = i_addr;
     assign o_mem_wdata = i_wdata;
@@ -87,54 +146,106 @@ pub module l2cache (
     assign o_mem_wen   = i_wen;
     assign o_mem_ren   = read_miss;
 
-    // o_rdata: from L2 on hit, from DRAM on miss.
-    assign o_rdata = if read_hit ? cur_data : i_mem_rdata;
+    assign o_rdata = if read_hit ? hit_data : i_mem_rdata;
 
     // -----------------------------------------------------------------
-    // Write merge — byte-granular wstrb on existing L2 line content.
-    // Only used on write-hit; computed combinationally for clarity.
+    // Byte-merge for write hit
     // -----------------------------------------------------------------
+    let cur_data_hit: logic<64> = if tm_0 ? cur_data_0
+                                : if tm_1 ? cur_data_1
+                                : if tm_2 ? cur_data_2 : cur_data_3;
     let write_merged: logic<64> = {
-        if i_wstrb[7] ? i_wdata[63:56] : cur_data[63:56],
-        if i_wstrb[6] ? i_wdata[55:48] : cur_data[55:48],
-        if i_wstrb[5] ? i_wdata[47:40] : cur_data[47:40],
-        if i_wstrb[4] ? i_wdata[39:32] : cur_data[39:32],
-        if i_wstrb[3] ? i_wdata[31:24] : cur_data[31:24],
-        if i_wstrb[2] ? i_wdata[23:16] : cur_data[23:16],
-        if i_wstrb[1] ? i_wdata[15:8]  : cur_data[15:8] ,
-        if i_wstrb[0] ? i_wdata[7:0]   : cur_data[7:0]  ,
+        if i_wstrb[7] ? i_wdata[63:56] : cur_data_hit[63:56],
+        if i_wstrb[6] ? i_wdata[55:48] : cur_data_hit[55:48],
+        if i_wstrb[5] ? i_wdata[47:40] : cur_data_hit[47:40],
+        if i_wstrb[4] ? i_wdata[39:32] : cur_data_hit[39:32],
+        if i_wstrb[3] ? i_wdata[31:24] : cur_data_hit[31:24],
+        if i_wstrb[2] ? i_wdata[23:16] : cur_data_hit[23:16],
+        if i_wstrb[1] ? i_wdata[15:8]  : cur_data_hit[15:8] ,
+        if i_wstrb[0] ? i_wdata[7:0]   : cur_data_hit[7:0]  ,
     };
+
+    // PLRU update target — way that was accessed (hit or new install).
+    let access_way: logic<2> = if read_hit ? hit_way
+                             : install_way;
+    let access_valid: logic = read_hit || read_miss || (i_wen && any_tm);
+
+    // -----------------------------------------------------------------
+    // PLRU bit update — point AWAY from accessed way.
+    // -----------------------------------------------------------------
+    let new_plru: logic<3> = {
+        !access_way[1],
+        if !access_way[1] ? !access_way[0] : plru_bits[1],
+        if  access_way[1] ? !access_way[0] : plru_bits[0],
+    };
+
+    // One-hot mask for the requested word's valid bit.
+    let one_hot_word: logic<8> = 8'd1 << req_offset;
 
     // -----------------------------------------------------------------
     // Cache update
-    //   - read miss + same-tag : install this word, OR in valid bit.
-    //   - read miss + diff-tag : replace line; valid = single-bit at offset.
-    //   - write hit            : update word with byte-merged value.
-    //   - write miss           : pure pass-through (no allocate).
     // -----------------------------------------------------------------
-    // One-hot mask for the requested word's valid bit. Used to either OR
-    // into the existing word_valid (same-line miss) or to seed a fresh
-    // word_valid on conflict miss.
-    let one_hot_word: logic<8> = 8'd1 << req_offset;
-
     always_ff (clk, rst) {
         if_reset {
             for i in 0..512 {
-                line_valid[i] = 1'b0;
-                word_valid[i] = 8'b0;
+                lv_0[i] = 1'b0;
+                lv_1[i] = 1'b0;
+                lv_2[i] = 1'b0;
+                lv_3[i] = 1'b0;
+                wv_0[i] = 8'b0;
+                wv_1[i] = 8'b0;
+                wv_2[i] = 8'b0;
+                wv_3[i] = 8'b0;
+                plru[i] = 3'b0;
             }
         } else {
+            // PLRU update on any access (hit or install).
+            if access_valid {
+                plru[req_index] = new_plru;
+            }
+
             if read_miss {
-                tag_array [req_index] = req_tag;
-                line_valid[req_index] = 1'b1;
-                word_valid[req_index] = if tag_match
-                                      ? cur_word_valid | one_hot_word
-                                      : one_hot_word;
-                data_array[data_idx]  = i_mem_rdata;
-            } else if i_wen && tag_match {
-                // Write hit: update L2 with byte-merged value (write-through
-                // also fires through o_mem_wen so DRAM stays current).
-                data_array[data_idx] = write_merged;
+                // Install in install_way: same-line OR-in valid bit, else
+                // start fresh. Per-way conditional needed because each
+                // way has its own bank.
+                let new_wv: logic<8> = if any_tm
+                                     ? if install_way == 2'd0 ? cur_wv_0 | one_hot_word
+                                       : if install_way == 2'd1 ? cur_wv_1 | one_hot_word
+                                       : if install_way == 2'd2 ? cur_wv_2 | one_hot_word
+                                       :                          cur_wv_3 | one_hot_word
+                                     : one_hot_word;
+                if install_way == 2'd0 {
+                    tag_0 [req_index] = req_tag;
+                    lv_0  [req_index] = 1'b1;
+                    wv_0  [req_index] = new_wv;
+                    data_0[data_idx]  = i_mem_rdata;
+                } else if install_way == 2'd1 {
+                    tag_1 [req_index] = req_tag;
+                    lv_1  [req_index] = 1'b1;
+                    wv_1  [req_index] = new_wv;
+                    data_1[data_idx]  = i_mem_rdata;
+                } else if install_way == 2'd2 {
+                    tag_2 [req_index] = req_tag;
+                    lv_2  [req_index] = 1'b1;
+                    wv_2  [req_index] = new_wv;
+                    data_2[data_idx]  = i_mem_rdata;
+                } else {
+                    tag_3 [req_index] = req_tag;
+                    lv_3  [req_index] = 1'b1;
+                    wv_3  [req_index] = new_wv;
+                    data_3[data_idx]  = i_mem_rdata;
+                }
+            } else if i_wen && any_tm {
+                // Write hit on tm_way.
+                if tm_way == 2'd0 {
+                    data_0[data_idx] = write_merged;
+                } else if tm_way == 2'd1 {
+                    data_1[data_idx] = write_merged;
+                } else if tm_way == 2'd2 {
+                    data_2[data_idx] = write_merged;
+                } else {
+                    data_3[data_idx] = write_merged;
+                }
             }
         }
     }
