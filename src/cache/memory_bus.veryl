@@ -15,6 +15,11 @@
 // used to panic when default param N_HARTS=1 hit the dynamic-index
 // pattern (expression.rs:4232 "len=1, index=1"); that bug has since
 // been fixed upstream, so the split is no longer necessary.
+//
+// N=4 has its own gen_n4 round-robin path (Phase 6.A.1) so the
+// 4-way fairness is explicit and easily auditable; gen_arb's
+// generic priority encoder defaults to lowest-id-wins which would
+// starve high-id harts under bus contention.
 pub module memory_bus #(
     param N_HARTS: u32 = 1,
 ) (
@@ -170,8 +175,134 @@ pub module memory_bus #(
         // pulse invalidate so the other hart drops the line.
         assign o_dmem_inv_valid = o_dmem_wen;
         assign o_dmem_inv_addr  = o_dmem_addr;
+    } else if N_HARTS == 4: gen_n4 {
+        // 4-way round-robin (Phase 6.A.1). Same fairness shape as gen_n2 —
+        // track last-granted hart index, give the OTHER three priority
+        // through a priority encoder over rotated candidates. AMO lock has
+        // priority over round-robin (lowest-id breaks AMO ties — Linux SMP
+        // kernel never has overlapping AMOs from multiple harts in
+        // practice, so the tie path is unreachable but kept for safety).
+
+        // ---- MMIO arbitration ----
+        var last_granted_mmio_idx: logic<2>;
+
+        var active_mmio: logic [4];
+        for h in 0..4: gen_active_mmio {
+            assign active_mmio[h] = (i_mmio_wen[h] || i_mmio_ren[h])
+                                 && (i_clint_sel[h] || i_plic_sel[h] || i_uart_sel[h]);
+        }
+
+        // Candidate hart for priority position p: (last+1+p) mod 4
+        var cand_mmio: logic<2> [4];
+        for p in 0..4: gen_cand_mmio {
+            assign cand_mmio[p] = last_granted_mmio_idx + (p as 2) + 2'd1;
+        }
+
+        var sel_found_mmio: logic    [4];
+        var sel_idx_mmio  : logic<2> [4];
+        for p in 0..4: gen_sel_mmio {
+            if p == 0: gen_first {
+                assign sel_found_mmio[p] = active_mmio[cand_mmio[p]];
+                assign sel_idx_mmio  [p] = cand_mmio[p];
+            } else: gen_rest {
+                assign sel_found_mmio[p] = sel_found_mmio[p - 1] || active_mmio[cand_mmio[p]];
+                assign sel_idx_mmio  [p] = if sel_found_mmio[p - 1] ? sel_idx_mmio[p - 1] : cand_mmio[p];
+            }
+        }
+        let grant_valid_mmio: logic    = sel_found_mmio[3];
+        let grant_idx_mmio  : logic<2> = sel_idx_mmio  [3];
+
+        always_ff (clk, rst) {
+            if_reset {
+                last_granted_mmio_idx = 2'd3;
+            } else if grant_valid_mmio {
+                last_granted_mmio_idx = grant_idx_mmio;
+            }
+        }
+
+        assign o_mmio_paddr = i_mmio_paddr[grant_idx_mmio];
+        assign o_mmio_wdata = i_mmio_wdata[grant_idx_mmio];
+        assign o_mmio_wstrb = i_mmio_wstrb[grant_idx_mmio];
+
+        let g_wen_mmio_n4: logic = grant_valid_mmio && i_mmio_wen [grant_idx_mmio];
+        let g_ren_mmio_n4: logic = grant_valid_mmio && i_mmio_ren [grant_idx_mmio];
+        let g_clint_n4   : logic = grant_valid_mmio && i_clint_sel[grant_idx_mmio];
+        let g_plic_n4    : logic = grant_valid_mmio && i_plic_sel [grant_idx_mmio];
+        let g_uart_n4    : logic = grant_valid_mmio && i_uart_sel [grant_idx_mmio];
+
+        assign o_mmio_wen_clint = g_wen_mmio_n4 && g_clint_n4;
+        assign o_mmio_ren_clint = g_ren_mmio_n4 && g_clint_n4;
+        assign o_mmio_wen_plic  = g_wen_mmio_n4 && g_plic_n4;
+        assign o_mmio_ren_plic  = g_ren_mmio_n4 && g_plic_n4;
+        assign o_mmio_wen_uart  = g_wen_mmio_n4 && g_uart_n4;
+        assign o_mmio_ren_uart  = g_ren_mmio_n4 && g_uart_n4;
+
+        for h in 0..4: gen_mmio_grant_n4 {
+            assign o_mmio_grant[h] = grant_valid_mmio
+                                  && (grant_idx_mmio == (h as 2))
+                                  && active_mmio[h];
+        }
+
+        // ---- DMEM arbitration ----
+        // AMO lock — lowest-id wins ties (effectively unreachable in Linux
+        // SMP, but kept for safety so amo_lock is a deterministic function
+        // of i_amo_inflight).
+        var amo_found_n4: logic    [4];
+        var amo_idx_n4  : logic<2> [4];
+        for h in 0..4: gen_amo_n4 {
+            if h == 0: gen_first {
+                assign amo_found_n4[h] = i_amo_inflight[h];
+                assign amo_idx_n4  [h] = 2'd0;
+            } else: gen_rest {
+                assign amo_found_n4[h] = amo_found_n4[h - 1] || i_amo_inflight[h];
+                assign amo_idx_n4  [h] = if amo_found_n4[h - 1] ? amo_idx_n4[h - 1] : (h as 2);
+            }
+        }
+        let amo_lock_n4  : logic    = amo_found_n4[3];
+        let amo_holder_n4: logic<2> = amo_idx_n4  [3];
+
+        // Round-robin DRAM grant when no AMO holder.
+        var last_granted_dmem_idx: logic<2>;
+        var cand_dmem: logic<2> [4];
+        for p in 0..4: gen_cand_dmem {
+            assign cand_dmem[p] = last_granted_dmem_idx + (p as 2) + 2'd1;
+        }
+        var sel_found_dmem: logic    [4];
+        var sel_idx_dmem  : logic<2> [4];
+        for p in 0..4: gen_sel_dmem {
+            if p == 0: gen_first {
+                assign sel_found_dmem[p] = i_dmem_req[cand_dmem[p]];
+                assign sel_idx_dmem  [p] = cand_dmem[p];
+            } else: gen_rest {
+                assign sel_found_dmem[p] = sel_found_dmem[p - 1] || i_dmem_req[cand_dmem[p]];
+                assign sel_idx_dmem  [p] = if sel_found_dmem[p - 1] ? sel_idx_dmem[p - 1] : cand_dmem[p];
+            }
+        }
+        let dmem_grant_valid_n4: logic    = if amo_lock_n4 ? 1'b1 : sel_found_dmem[3];
+        let dmem_grant_idx_n4  : logic<2> = if amo_lock_n4 ? amo_holder_n4 : sel_idx_dmem[3];
+
+        always_ff (clk, rst) {
+            if_reset {
+                last_granted_dmem_idx = 2'd3;
+            } else if dmem_grant_valid_n4 && !amo_lock_n4 {
+                last_granted_dmem_idx = dmem_grant_idx_n4;
+            }
+        }
+
+        for h in 0..4: gen_dgrant_n4 {
+            assign o_dmem_grant[h] = dmem_grant_valid_n4
+                                  && (dmem_grant_idx_n4 == (h as 2))
+                                  && i_dmem_req[h];
+        }
+        assign o_dmem_addr  = i_dmem_addr [dmem_grant_idx_n4];
+        assign o_dmem_wdata = i_dmem_wdata[dmem_grant_idx_n4];
+        assign o_dmem_wstrb = i_dmem_wstrb[dmem_grant_idx_n4];
+        assign o_dmem_wen   = dmem_grant_valid_n4 && i_dmem_wen[dmem_grant_idx_n4] && i_dmem_req[dmem_grant_idx_n4];
+        assign o_dmem_ren   = dmem_grant_valid_n4 && i_dmem_ren[dmem_grant_idx_n4] && i_dmem_req[dmem_grant_idx_n4];
+        assign o_dmem_inv_valid = o_dmem_wen;
+        assign o_dmem_inv_addr  = o_dmem_addr;
     } else: gen_arb {
-        // Generic N>=3 path (untested; preserved for future N=4 expansion).
+        // Generic N=1 / N>=5 path (lowest-id-wins, no fairness).
         var active : logic [N_HARTS];
         for h in 0..N_HARTS: gen_active {
             // !i_stall_mem gate REMOVED (Phase 5 fix) — would self-deadlock
