@@ -1,0 +1,118 @@
+// Phase 7 v4: Reorder Buffer (in-order commit gate).
+//
+// 32 entries (M1). At dispatch the tail slot is allocated per
+// in-flight op. The CDB writes back `result_written=1` when EX
+// completes. Commit pops the head only when `result_written` is set
+// (the precise-exception invariant that v2 violated).
+//
+// On commit-time mispredict / trap the ROB is fully flushed via
+// `i_redirect_fire`. M6 will refine to branch-checkpoint recovery.
+//
+// M1: 1-wide commit + 1-wide alloc + 1 CDB. Fields are minimal
+// (RobEntry struct in pipeline_v4_pkg) — extended in M3+ for MUL/
+// DIV / trap / AMO / STORE.
+pub module rob_v4 #(
+    param ROB_DEPTH: u32 = 32,
+    param ROB_IDX_W: u32 = 5 ,
+    param PRF_W    : u32 = 6 ,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Allocation (dispatch)
+    i_alloc_en   : input  logic                       ,
+    i_alloc_entry: input  pipeline_v4_pkg::RobEntry   ,
+    o_alloc_idx  : output logic<ROB_IDX_W>            ,
+    o_full       : output logic                       ,
+
+    // Writeback (CDB)
+    i_cdb_valid       : input logic            ,
+    i_cdb_rob_idx     : input logic<ROB_IDX_W> ,
+    i_cdb_result_data : input logic<64>        ,
+    i_cdb_mispredict  : input logic            ,
+    i_cdb_redirect_pc : input logic<64>        ,
+
+    // Commit (M1 = 1-wide)
+    o_commit_valid: output logic                     ,
+    o_commit_entry: output pipeline_v4_pkg::RobEntry ,
+    o_commit_idx  : output logic<ROB_IDX_W>          ,
+    i_commit_ack  : input  logic                     ,
+
+    // Full flush (commit-time mispredict / trap)
+    i_redirect_fire: input logic,
+
+    // Status outputs (for asserts and dispatch back-pressure)
+    o_head_idx : output logic<ROB_IDX_W>,
+    o_size     : output logic<8>        ,
+) {
+    var entries: pipeline_v4_pkg::RobEntry [ROB_DEPTH];
+    var head   : logic<6>; // ROB_IDX_W + 1 for full/empty distinction
+    var tail   : logic<6>;
+
+    let head_idx: logic<ROB_IDX_W> = head[ROB_IDX_W - 1:0];
+    let tail_idx: logic<ROB_IDX_W> = tail[ROB_IDX_W - 1:0];
+
+    let is_empty: logic = head == tail;
+    let size_w  : logic<6> = tail - head;
+    let is_full : logic = size_w == 6'd32;
+
+    assign o_alloc_idx    = tail_idx;
+    assign o_full         = is_full;
+    assign o_commit_valid = !is_empty && entries[head_idx].valid && entries[head_idx].result_written;
+    assign o_commit_entry = entries[head_idx];
+    assign o_commit_idx   = head_idx;
+    assign o_head_idx     = head_idx;
+    assign o_size         = size_w[5:0] as 8;
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..ROB_DEPTH {
+                entries[i].valid          = 1'b0;
+                entries[i].pc             = 64'd0;
+                entries[i].rd_arch        = 5'd0;
+                entries[i].rd_pdst        = 6'd0;
+                entries[i].old_rd_pdst    = 6'd0;
+                entries[i].has_rd         = 1'b0;
+                entries[i].result_written = 1'b0;
+                entries[i].is_branch      = 1'b0;
+                entries[i].is_jal         = 1'b0;
+                entries[i].is_jalr        = 1'b0;
+                entries[i].mispredict     = 1'b0;
+                entries[i].redirect_pc    = 64'd0;
+                entries[i].illegal        = 1'b0;
+                entries[i].result_data    = 64'd0;
+            }
+            head = 6'd0;
+            tail = 6'd0;
+        } else if i_redirect_fire {
+            // Full flush — return ROB to empty. n_inflight in free_list
+            // gets the same recovery_fire pulse so popped pdsts come back.
+            for i in 0..ROB_DEPTH {
+                entries[i].valid          = 1'b0;
+                entries[i].result_written = 1'b0;
+            }
+            head = 6'd0;
+            tail = 6'd0;
+        } else {
+            // Allocation (1-wide)
+            if i_alloc_en && !is_full {
+                entries[tail_idx] = i_alloc_entry;
+                // Enforce result_written=0 at alloc regardless of input
+                entries[tail_idx].result_written = 1'b0;
+                tail = tail + 6'd1;
+            }
+            // CDB writeback (mark entry done)
+            if i_cdb_valid {
+                entries[i_cdb_rob_idx].result_written = 1'b1;
+                entries[i_cdb_rob_idx].result_data    = i_cdb_result_data;
+                entries[i_cdb_rob_idx].mispredict     = i_cdb_mispredict;
+                entries[i_cdb_rob_idx].redirect_pc    = i_cdb_redirect_pc;
+            }
+            // Commit (1-wide). Back-end ack frees the slot.
+            if i_commit_ack && !is_empty && entries[head_idx].result_written {
+                entries[head_idx].valid = 1'b0;
+                head                    = head + 6'd1;
+            }
+        }
+    }
+}
