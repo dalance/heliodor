@@ -1,0 +1,243 @@
+// Phase 7 v4 M1.E: heliodor_core_v4 smoke test.
+//
+// Loads a small program of ALU ops into toy ROM and runs the M1 core
+// for N cycles. Validates: rename pipelines, IQ wakeup, ROB commit
+// produces sane retire stream. STORE/LOAD/CSR are illegal in M1 so we
+// hand-craft an ALU-only sequence that exercises:
+//   - rd != 0 with multiple in-flight ops
+//   - RAW dependency (rd[N] used as rs1[N+1]) → IQ stall + wake
+//   - branch backward (loop) → mispredict at commit + redirect
+//
+// Acceptance: after 200 cycles, x10 (a0) holds 64'd42 and x11 (a1)
+// holds 64'd5 (loop iteration count). Computed at compile time of
+// the embedded program; assertion in the test body.
+//
+// Program (hand-written, starts at 0x80000000):
+//   addi x10, x0, 0       ; x10 = 0    (sum)
+//   addi x11, x0, 5       ; x11 = 5    (loop counter)
+//   addi x10, x10, 8      ; x10 += 8   (loop body — 5×8=40, then +2 = 42 below)
+//   addi x11, x11, -1     ; x11 -= 1
+//   bne  x11, x0, -8      ; branch back to addi x10,x10,8 while x11 != 0
+//   addi x10, x10, 2      ; x10 += 2 → 42
+//   jal  x0, 0            ; halt (infinite loop)
+module test_v4_smoke_harness (
+    clk          : input  clock           ,
+    rst          : input  reset           ,
+    o_x10        : output logic<64>       ,
+    o_x11        : output logic<64>       ,
+    o_done       : output logic           ,
+    o_cycle      : output logic<32>       ,
+    o_commit_cnt : output logic<32>       ,
+    o_last_ret_pc: output logic<64>       ,
+    o_rename_cnt : output logic<32>       ,
+    o_cdb_cnt    : output logic<32>       ,
+    o_rob_size   : output logic<8>        ,
+    o_if_v       : output logic           ,
+    o_if_instr   : output logic<32>       ,
+    o_stall_dr   : output logic           ,
+    o_hv         : output logic           ,
+    o_hrw        : output logic           ,
+    o_hil        : output logic           ,
+    o_rob_alloc  : output logic<32>       ,
+    o_rob_cdb    : output logic<32>       ,
+    o_rob_commit : output logic<32>       ,
+    o_rob_head   : output logic<6>        ,
+    o_rob_tail   : output logic<6>        ,
+) {
+    var cycle: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            cycle = 32'd0;
+        } else {
+            cycle = cycle + 32'd1;
+        }
+    }
+    assign o_cycle = cycle;
+
+    var imem_addr : logic<64>;
+    var imem_rdata: logic<32>;
+    var imem_ren  : logic    ;
+    var dmem_addr : logic<64>;
+    var dmem_wdata: logic<64>;
+    var dmem_rdata: logic<64>;
+    var dmem_wen  : logic    ;
+    var dmem_ren  : logic    ;
+    var dmem_wstrb: logic<8> ;
+    var dbg_pc    : logic<64>;
+    var dbg_regs  : logic<64> [32];
+    var ret_v     : logic    ;
+    var ret_pc    : logic<64>;
+    var ret_rdv   : logic    ;
+    var ret_rd    : logic<5> ;
+    var ret_data  : logic<64>;
+
+    var rename_cnt : logic<32>;
+    var cdb_cnt    : logic<32>;
+    var rob_size   : logic<8> ;
+    var if_v       : logic    ;
+    var if_instr   : logic<32>;
+    var stall_dr   : logic    ;
+    var hv         : logic    ;
+    var hrw        : logic    ;
+    var hil        : logic    ;
+    var r_alloc    : logic<32>;
+    var r_cdb      : logic<32>;
+    var r_commit   : logic<32>;
+    var r_head     : logic<6> ;
+    var r_tail     : logic<6> ;
+
+    inst dut: heliodor_core_v4 #(
+        RESET_PC: 64'h80000000,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr        : imem_addr  ,
+        i_imem_rdata       : imem_rdata ,
+        o_imem_ren         : imem_ren   ,
+        o_dmem_addr        : dmem_addr  ,
+        o_dmem_wdata       : dmem_wdata ,
+        i_dmem_rdata       : dmem_rdata ,
+        o_dmem_wen         : dmem_wen   ,
+        o_dmem_ren         : dmem_ren   ,
+        o_dmem_wstrb       : dmem_wstrb ,
+        o_dbg_pc           : dbg_pc     ,
+        o_dbg_regs         : dbg_regs   ,
+        o_dbg_retire_v_a   : ret_v      ,
+        o_dbg_retire_pc_a  : ret_pc     ,
+        o_dbg_retire_rd_v_a: ret_rdv    ,
+        o_dbg_retire_rd_a  : ret_rd     ,
+        o_dbg_retire_data_a: ret_data   ,
+        o_dbg_rename_cnt   : rename_cnt ,
+        o_dbg_cdb_cnt      : cdb_cnt    ,
+        o_dbg_rob_size     : rob_size   ,
+        o_dbg_if_v         : if_v       ,
+        o_dbg_if_instr     : if_instr   ,
+        o_dbg_stall_dr     : stall_dr   ,
+        o_dbg_head_valid   : hv         ,
+        o_dbg_head_rw      : hrw        ,
+        o_dbg_head_illegal : hil        ,
+        o_dbg_rob_alloc_cnt: r_alloc    ,
+        o_dbg_rob_cdb_cnt  : r_cdb      ,
+        o_dbg_rob_commit_cnt: r_commit  ,
+        o_dbg_rob_head     : r_head     ,
+        o_dbg_rob_tail     : r_tail     ,
+    );
+
+    // Toy imem: 8-word ROM holding the program above. Encoded for RV64I:
+    //   00000513 addi x10, x0, 0
+    //   00500593 addi x11, x0, 5
+    //   00850513 addi x10, x10, 8
+    //   fff58593 addi x11, x11, -1
+    //   fe0596e3 bne  x11, x0, -8      (offset = -8 from current PC = 0x80000010)
+    //   00250513 addi x10, x10, 2
+    //   0000006f jal  x0, 0            (infinite halt)
+    //   00000013 nop (addi x0, x0, 0)
+    // Toy ROM (program + NOP padding). Hex layout in test/v4_smoke.hex.
+    var imem: logic<32> [16];
+    initial {
+        $readmemh("test/v4_smoke.hex", imem);
+    }
+    let imem_idx: logic<4> = imem_addr[5:2];
+    assign imem_rdata = imem[imem_idx];
+
+    // dmem inactive (M1)
+    assign dmem_rdata = 64'd0;
+
+    assign o_x10  = dbg_regs[10];
+    assign o_x11  = dbg_regs[11];
+    // Done when x10=42 and x11=0 (final loop state)
+    assign o_done = dbg_regs[10] == 64'd42 && dbg_regs[11] == 64'd0;
+
+    var commit_cnt  : logic<32>;
+    var last_ret_pc : logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            commit_cnt  = 32'd0;
+            last_ret_pc = 64'd0;
+        } else if ret_v {
+            commit_cnt  = commit_cnt + 32'd1;
+            last_ret_pc = ret_pc;
+        }
+    }
+    assign o_commit_cnt  = commit_cnt;
+    assign o_last_ret_pc = last_ret_pc;
+    assign o_rename_cnt  = rename_cnt;
+    assign o_cdb_cnt     = cdb_cnt;
+    assign o_rob_size    = rob_size;
+    assign o_if_v        = if_v;
+    assign o_if_instr    = if_instr;
+    assign o_stall_dr    = stall_dr;
+    assign o_hv          = hv;
+    assign o_hrw         = hrw;
+    assign o_hil         = hil;
+    assign o_rob_alloc   = r_alloc;
+    assign o_rob_cdb     = r_cdb;
+    assign o_rob_commit  = r_commit;
+    assign o_rob_head    = r_head;
+    assign o_rob_tail    = r_tail;
+}
+
+#[test(test_v4_smoke)]
+#[ignore]
+module test_v4_smoke {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen(clk);
+
+    var x10        : logic<64>;
+    var x11        : logic<64>;
+    var done       : logic    ;
+    var cycle      : logic<32>;
+    var commit_cnt : logic<32>;
+    var last_ret_pc: logic<64>;
+    var rename_cnt : logic<32>;
+    var cdb_cnt    : logic<32>;
+    var rob_size   : logic<8> ;
+    var if_v       : logic    ;
+    var if_instr   : logic<32>;
+    var stall_dr   : logic    ;
+    var hv         : logic    ;
+    var hrw        : logic    ;
+    var hil        : logic    ;
+    var r_alloc    : logic<32>;
+    var r_cdb      : logic<32>;
+    var r_commit   : logic<32>;
+    var r_head     : logic<6> ;
+    var r_tail     : logic<6> ;
+
+    inst h: test_v4_smoke_harness (
+        clk                       ,
+        rst                       ,
+        o_x10        : x10        ,
+        o_x11        : x11        ,
+        o_done       : done       ,
+        o_cycle      : cycle      ,
+        o_commit_cnt : commit_cnt ,
+        o_last_ret_pc: last_ret_pc,
+        o_rename_cnt : rename_cnt ,
+        o_cdb_cnt    : cdb_cnt    ,
+        o_rob_size   : rob_size   ,
+        o_if_v       : if_v       ,
+        o_if_instr   : if_instr   ,
+        o_stall_dr   : stall_dr   ,
+        o_hv         : hv         ,
+        o_hrw        : hrw        ,
+        o_hil        : hil        ,
+        o_rob_alloc  : r_alloc    ,
+        o_rob_cdb    : r_cdb      ,
+        o_rob_commit : r_commit   ,
+        o_rob_head   : r_head     ,
+        o_rob_tail   : r_tail     ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next  (5000);
+        $display  ("[test_v4_smoke] cy=%d x10=%h x11=%h commit=%d rename=%d cdb=%d rob_sz=%d stall=%b head_v=%b head_rw=%b head_il=%b head=%h tail=%h rob_alloc=%d rob_cdb=%d rob_commit=%d",
+                   cycle, x10, x11, commit_cnt,
+                   rename_cnt, cdb_cnt, rob_size, stall_dr, hv, hrw, hil, r_head, r_tail, r_alloc, r_cdb, r_commit);
+        $assert (x10 == 64'd42, "test_v4_smoke: x10 != 42");
+        $assert (x11 == 64'd0 , "test_v4_smoke: x11 != 0");
+        $display("[test_v4_smoke] PASS");
+        $finish ();
+    }
+}

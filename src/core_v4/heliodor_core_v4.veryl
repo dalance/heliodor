@@ -1,0 +1,408 @@
+// Phase 7 v4: Heliodor OoO core (M1 wiring).
+//
+// 1-wide pure Tomasulo: F → D+R → IQ → ALU → C. Backing modules:
+//   prf_int       : 64-entry physical register file (2R/1W)
+//   free_list     : 32-entry PRF tag pool (1 pop + 1 push / cycle)
+//   rat_v4        : speculative + architectural rename map
+//   rob_v4        : 32-entry reorder buffer (in-order commit gate)
+//   iq_int_v4     : 8-entry integer issue queue
+//   alu_wrap_v4   : v1 alu + branch evaluator → CDB
+//   decoder_v4    : v1 decoder + imm_gen → DecodedOp
+//
+// Pipeline:
+//   F  : fetch instr from imem at pc_q → IF/ID reg
+//   DR : decode + rename + ROB.alloc + IQ.alloc (combinational from
+//        IF/ID reg; back-pressure stalls F when full)
+//   IE : iq_int.issue → alu_wrap → CDB (same cycle).
+//        CDB writes prf_int, snoops IQ wakeup, marks ROB.result_written.
+//   C  : ROB.commit when head.result_written → arch RAT update + free
+//        list push + retire stream output. Mispredict triggers redirect
+//        next cycle (flush ROB+IQ, recover RAT, set pc_q to redirect_pc).
+//
+// M1 only supports RV64I ALU/branch/JAL/JALR/LUI/AUIPC; illegal ops
+// raise a precise trap stub (redirect to RESET_PC) — M4 replaces this
+// with the csr_v4 trap path. LOAD/STORE/CSR/AMO/FP are deferred.
+pub module heliodor_core_v4 #(
+    param RESET_PC: u64 = 64'h80000000,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Instruction memory (read-only, 32-bit fetch granule)
+    o_imem_addr : output logic<64>,
+    i_imem_rdata: input  logic<32>,
+    o_imem_ren  : output logic    ,
+
+    // Data memory (M5+; M1 holds these inactive)
+    o_dmem_addr : output logic<64>,
+    o_dmem_wdata: output logic<64>,
+    i_dmem_rdata: input  logic<64>,
+    o_dmem_wen  : output logic    ,
+    o_dmem_ren  : output logic    ,
+    o_dmem_wstrb: output logic<8> ,
+
+    // Debug / cosim observation
+    o_dbg_pc           : output logic<64>     ,
+    o_dbg_regs         : output logic<64> [32],
+    o_dbg_retire_v_a   : output logic         ,
+    o_dbg_retire_pc_a  : output logic<64>     ,
+    o_dbg_retire_rd_v_a: output logic         ,
+    o_dbg_retire_rd_a  : output logic<5>      ,
+    o_dbg_retire_data_a: output logic<64>     ,
+    o_dbg_rename_cnt   : output logic<32>     ,
+    o_dbg_cdb_cnt      : output logic<32>     ,
+    o_dbg_rob_size     : output logic<8>      ,
+    o_dbg_if_v         : output logic         ,
+    o_dbg_if_instr     : output logic<32>     ,
+    o_dbg_stall_dr     : output logic         ,
+    o_dbg_head_valid   : output logic         ,
+    o_dbg_head_rw      : output logic         ,
+    o_dbg_head_illegal : output logic         ,
+    o_dbg_rob_alloc_cnt: output logic<32>     ,
+    o_dbg_rob_cdb_cnt  : output logic<32>     ,
+    o_dbg_rob_commit_cnt: output logic<32>    ,
+    o_dbg_rob_head     : output logic<6>      ,
+    o_dbg_rob_tail     : output logic<6>      ,
+) {
+    import pipeline_v4_pkg::*;
+
+    // ============================================================
+    // Fetch (Stage F)
+    // ============================================================
+    var pc_q      : logic<64>;
+    var if_v_q    : logic    ;
+    var if_pc_q   : logic<64>;
+    var if_instr_q: logic<32>;
+
+    var redirect_fire: logic    ;
+    var redirect_pc  : logic<64>;
+    var stall_dr     : logic    ; // back-pressure from D/R
+
+    always_ff (clk, rst) {
+        if_reset {
+            pc_q       = RESET_PC;
+            if_v_q     = 1'b0;
+            if_pc_q    = RESET_PC;
+            if_instr_q = 32'd0;
+        } else {
+            if redirect_fire {
+                pc_q       = redirect_pc;
+                if_v_q     = 1'b0;
+                if_pc_q    = redirect_pc;
+                if_instr_q = 32'd0;
+            } else if !stall_dr {
+                if_v_q     = 1'b1;
+                if_pc_q    = pc_q;
+                if_instr_q = i_imem_rdata;
+                pc_q       = pc_q + 64'd4;
+            }
+        }
+    }
+
+    assign o_imem_addr = pc_q;
+    assign o_imem_ren  = 1'b1;
+
+    // ============================================================
+    // Decode (Stage D)
+    // ============================================================
+    var dec_op: DecodedOp;
+    inst u_dec: decoder_v4 (
+        i_pc   : if_pc_q   ,
+        i_instr: if_instr_q,
+        o_op   : dec_op    ,
+    );
+
+    // ============================================================
+    // Rename (Stage R)
+    // ============================================================
+    var rs1_pdst   : logic<PRF_INT_W>;
+    var rs2_pdst   : logic<PRF_INT_W>;
+    var old_rd_pdst: logic<PRF_INT_W>;
+    var new_rd_pdst: logic<PRF_INT_W>;
+    var free_empty : logic           ;
+
+    var rob_alloc_idx: logic<ROB_IDX_W>;
+    var rob_full     : logic           ;
+    var iq_alloc_rdy : logic           ;
+
+    let resources_avail: logic = !rob_full && iq_alloc_rdy && (!dec_op.has_rd || !free_empty);
+    assign stall_dr = if_v_q && !resources_avail;
+
+    let rename_fire: logic = if_v_q && !stall_dr && !redirect_fire;
+
+    // ROB alloc entry
+    var rob_alloc_entry: RobEntry;
+    always_comb {
+        rob_alloc_entry.valid          = 1'b1;
+        rob_alloc_entry.pc             = if_pc_q;
+        rob_alloc_entry.rd_arch        = dec_op.rd_arch;
+        rob_alloc_entry.rd_pdst        = new_rd_pdst;
+        rob_alloc_entry.old_rd_pdst    = old_rd_pdst;
+        rob_alloc_entry.has_rd         = dec_op.has_rd;
+        rob_alloc_entry.result_written = 1'b0;
+        rob_alloc_entry.is_branch      = dec_op.is_branch;
+        rob_alloc_entry.is_jal         = dec_op.is_jal;
+        rob_alloc_entry.is_jalr        = dec_op.is_jalr;
+        rob_alloc_entry.mispredict     = 1'b0;
+        rob_alloc_entry.redirect_pc    = 64'd0;
+        rob_alloc_entry.illegal        = dec_op.illegal;
+        rob_alloc_entry.result_data    = 64'd0;
+    }
+
+    // RenamedOp
+    var ren_op: RenamedOp;
+    always_comb {
+        ren_op.base        = dec_op;
+        ren_op.rd_pdst     = new_rd_pdst;
+        ren_op.rs1_pdst    = rs1_pdst;
+        ren_op.rs2_pdst    = rs2_pdst;
+        ren_op.old_rd_pdst = old_rd_pdst;
+        ren_op.rob_idx     = rob_alloc_idx;
+    }
+
+    // ============================================================
+    // Issue / Execute (Stage IE)
+    // ============================================================
+    var iq_issue_valid: logic    ;
+    var iq_issue_op   : RenamedOp;
+
+    var prf_rs1_data: logic<64>;
+    var prf_rs2_data: logic<64>;
+
+    var cdb: CdbBus;
+
+    inst u_alu: alu_wrap_v4 (
+        i_issue_valid: iq_issue_valid,
+        i_issue_op   : iq_issue_op   ,
+        i_rs1_data   : prf_rs1_data  ,
+        i_rs2_data   : prf_rs2_data  ,
+        o_cdb        : cdb           ,
+    );
+
+    let iq_issue_ack: logic = iq_issue_valid;
+
+    // ============================================================
+    // PRF
+    // ============================================================
+    inst u_prf: prf_int (
+        clk        ,
+        rst        ,
+        i_rd1_pdst: iq_issue_op.rs1_pdst,
+        o_rd1_data: prf_rs1_data       ,
+        i_rd2_pdst: iq_issue_op.rs2_pdst,
+        o_rd2_data: prf_rs2_data       ,
+        i_wr_en   : cdb.valid && cdb.has_rd,
+        i_wr_pdst : cdb.pdst           ,
+        i_wr_data : cdb.data           ,
+    );
+
+    // ============================================================
+    // free_list
+    // ============================================================
+    var fl_push_en  : logic           ;
+    var fl_push_pdst: logic<PRF_INT_W>;
+
+    let fl_pop_en: logic = rename_fire && dec_op.has_rd;
+    inst u_fl: free_list (
+        clk            ,
+        rst            ,
+        i_pop_en       : fl_pop_en    ,
+        o_pop_pdst     : new_rd_pdst  ,
+        o_empty        : free_empty   ,
+        i_push_en      : fl_push_en   ,
+        i_push_pdst    : fl_push_pdst ,
+        i_recovery_fire: redirect_fire,
+    );
+
+    // ============================================================
+    // RAT
+    // ============================================================
+    var rat_commit_en  : logic           ;
+    var rat_commit_arch: logic<5>        ;
+    var rat_commit_pdst: logic<PRF_INT_W>;
+
+    inst u_rat: rat_v4 (
+        clk            ,
+        rst            ,
+        i_rs1_arch     : dec_op.rs1_arch ,
+        o_rs1_pdst     : rs1_pdst        ,
+        i_rs2_arch     : dec_op.rs2_arch ,
+        o_rs2_pdst     : rs2_pdst        ,
+        i_rd_arch      : dec_op.rd_arch  ,
+        o_rd_old_pdst  : old_rd_pdst     ,
+        i_rename_en    : rename_fire && dec_op.has_rd,
+        i_rename_arch  : dec_op.rd_arch  ,
+        i_rename_pdst  : new_rd_pdst     ,
+        i_commit_en    : rat_commit_en   ,
+        i_commit_arch  : rat_commit_arch ,
+        i_commit_pdst  : rat_commit_pdst ,
+        i_recovery_fire: redirect_fire   ,
+    );
+
+    // ============================================================
+    // IQ
+    // ============================================================
+    inst u_iq: iq_int_v4 (
+        clk                 ,
+        rst                 ,
+        i_alloc_en          : rename_fire ,
+        i_alloc_op          : ren_op      ,
+        o_alloc_rdy         : iq_alloc_rdy,
+        i_rename_set_pending: rename_fire && dec_op.has_rd,
+        i_rename_pdst       : new_rd_pdst ,
+        i_cdb_valid         : cdb.valid   ,
+        i_cdb_has_rd        : cdb.has_rd  ,
+        i_cdb_pdst          : cdb.pdst    ,
+        o_issue_valid       : iq_issue_valid,
+        o_issue_op          : iq_issue_op   ,
+        i_issue_ack         : iq_issue_ack  ,
+        i_flush             : redirect_fire ,
+    );
+
+    // ============================================================
+    // ROB
+    // ============================================================
+    var rob_commit_valid: logic    ;
+    var rob_commit_entry: RobEntry ;
+    var rob_commit_idx  : logic<ROB_IDX_W>;
+    var rob_head_idx    : logic<ROB_IDX_W>;
+    var rob_size        : logic<8>;
+
+    let rob_commit_ack: logic = rob_commit_valid;
+
+    var rob_head_valid  : logic;
+    var rob_head_rw     : logic;
+    var rob_head_illegal: logic;
+    var rob_alloc_cnt_w : logic<32>;
+    var rob_cdb_cnt_w   : logic<32>;
+    var rob_commit_cnt_w: logic<32>;
+    var rob_head_w      : logic<6>;
+    var rob_tail_w      : logic<6>;
+
+    inst u_rob: rob_v4 (
+        clk             ,
+        rst             ,
+        i_alloc_en       : rename_fire     ,
+        i_alloc_entry    : rob_alloc_entry ,
+        o_alloc_idx      : rob_alloc_idx   ,
+        o_full           : rob_full        ,
+        i_cdb_valid      : cdb.valid       ,
+        i_cdb_rob_idx    : cdb.rob_idx     ,
+        i_cdb_result_data: cdb.data        ,
+        i_cdb_mispredict : cdb.mispredict  ,
+        i_cdb_redirect_pc: cdb.redirect_pc ,
+        o_commit_valid   : rob_commit_valid,
+        o_commit_entry   : rob_commit_entry,
+        o_commit_idx     : rob_commit_idx  ,
+        i_commit_ack     : rob_commit_ack  ,
+        i_redirect_fire  : redirect_fire   ,
+        o_head_idx       : rob_head_idx    ,
+        o_size           : rob_size        ,
+        o_dbg_head_valid : rob_head_valid  ,
+        o_dbg_head_rw    : rob_head_rw     ,
+        o_dbg_head_illegal: rob_head_illegal,
+        o_dbg_alloc_cnt  : rob_alloc_cnt_w ,
+        o_dbg_cdb_cnt    : rob_cdb_cnt_w   ,
+        o_dbg_commit_cnt : rob_commit_cnt_w,
+        o_dbg_head       : rob_head_w      ,
+        o_dbg_tail       : rob_tail_w      ,
+    );
+
+    // ============================================================
+    // Commit stage
+    // ============================================================
+    always_comb {
+        rat_commit_en   = rob_commit_valid && rob_commit_entry.has_rd && !rob_commit_entry.illegal;
+        rat_commit_arch = rob_commit_entry.rd_arch;
+        rat_commit_pdst = rob_commit_entry.rd_pdst;
+
+        fl_push_en   = rob_commit_valid && rob_commit_entry.has_rd && !rob_commit_entry.illegal;
+        fl_push_pdst = rob_commit_entry.old_rd_pdst;
+    }
+
+    // ============================================================
+    // Redirect (commit-time mispredict / illegal)
+    // ============================================================
+    var redirect_fire_q: logic    ;
+    var redirect_pc_q  : logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            redirect_fire_q = 1'b0;
+            redirect_pc_q   = 64'd0;
+        } else if rob_commit_valid && (rob_commit_entry.mispredict || rob_commit_entry.illegal) {
+            redirect_fire_q = 1'b1;
+            if rob_commit_entry.illegal {
+                redirect_pc_q = RESET_PC; // M1 trap stub
+            } else {
+                redirect_pc_q = rob_commit_entry.redirect_pc;
+            }
+        } else {
+            redirect_fire_q = 1'b0;
+        }
+    }
+    assign redirect_fire = redirect_fire_q;
+    assign redirect_pc   = redirect_pc_q;
+
+    // ============================================================
+    // arch_regs shadow (debug/cosim)
+    // ============================================================
+    var arch_regs: logic<64> [32];
+    always_ff (clk, rst) {
+        if_reset {
+            for r in 0..32 {
+                arch_regs[r] = 64'd0;
+            }
+        } else if rob_commit_valid && rob_commit_entry.has_rd && !rob_commit_entry.illegal {
+            arch_regs[rob_commit_entry.rd_arch] = rob_commit_entry.result_data;
+        }
+    }
+    assign o_dbg_regs = arch_regs;
+    assign o_dbg_pc   = rob_commit_entry.pc;
+
+    // ============================================================
+    // Retire stream (lane A only in M1)
+    // ============================================================
+    assign o_dbg_retire_v_a    = rob_commit_valid && !rob_commit_entry.illegal;
+    assign o_dbg_retire_pc_a   = rob_commit_entry.pc;
+    assign o_dbg_retire_rd_v_a = rob_commit_entry.has_rd;
+    assign o_dbg_retire_rd_a   = rob_commit_entry.rd_arch;
+    assign o_dbg_retire_data_a = rob_commit_entry.result_data;
+
+    // dmem inactive (M5+)
+    assign o_dmem_addr  = 64'd0;
+    assign o_dmem_wdata = 64'd0;
+    assign o_dmem_wen   = 1'b0;
+    assign o_dmem_ren   = 1'b0;
+    assign o_dmem_wstrb = 8'd0;
+
+    // M1 debug counters
+    var rename_cnt: logic<32>;
+    var cdb_cnt   : logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            rename_cnt = 32'd0;
+            cdb_cnt    = 32'd0;
+        } else {
+            if rename_fire {
+                rename_cnt = rename_cnt + 32'd1;
+            }
+            if cdb.valid {
+                cdb_cnt = cdb_cnt + 32'd1;
+            }
+        }
+    }
+    assign o_dbg_rename_cnt = rename_cnt;
+    assign o_dbg_cdb_cnt    = cdb_cnt;
+    assign o_dbg_rob_size   = rob_size;
+    assign o_dbg_if_v       = if_v_q;
+    assign o_dbg_if_instr   = if_instr_q;
+    assign o_dbg_stall_dr   = stall_dr;
+    assign o_dbg_head_valid = rob_head_valid;
+    assign o_dbg_head_rw    = rob_head_rw;
+    assign o_dbg_head_illegal = rob_head_illegal;
+    assign o_dbg_rob_alloc_cnt  = rob_alloc_cnt_w;
+    assign o_dbg_rob_cdb_cnt    = rob_cdb_cnt_w;
+    assign o_dbg_rob_commit_cnt = rob_commit_cnt_w;
+    assign o_dbg_rob_head       = rob_head_w;
+    assign o_dbg_rob_tail       = rob_tail_w;
+}
