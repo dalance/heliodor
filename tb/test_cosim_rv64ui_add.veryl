@@ -1,0 +1,307 @@
+// Phase 7 v4 M0: cosim infrastructure smoke test (rv64ui-add).
+//
+// Instantiates two `heliodor_top` (v1) cores running the same hex and
+// feeds their retire streams through `cosim_checker`. Because both
+// sides are the same RTL, retire streams must match byte-for-byte —
+// `diverged=0` and `compared > 0` is the success signature.
+//
+// This proves the cosim machinery (FIFO buffering, comparator, retire
+// dbg ports on heliodor_core/heliodor_top) works end-to-end on a real
+// RV64I program. In M1+, the "ref" side will be replaced with the
+// emerging `heliodor_core_v4` so cosim divergence localizes bugs as
+// they appear, not 30M cycles later.
+//
+// Acceptance (Iron Rule 1):
+//   o_pass = !diverged && compared >= 32, and both sides reach
+//            tohost==1 (rv64ui-add complete).
+//   exit gate: this test passes under `veryl test --include-ignored
+//              --test test_cosim_rv64ui_add` with diverged=0.
+module test_cosim_rv64ui_add_harness (
+    clk             : input  clock     ,
+    rst             : input  reset     ,
+    o_pass          : output logic     ,
+    o_done          : output logic     ,
+    o_diverged      : output logic     ,
+    o_compared_cnt  : output logic<32> ,
+    o_v1_pushed_cnt : output logic<32> ,
+    o_v4_pushed_cnt : output logic<32> ,
+    o_v1_tohost     : output logic<32> ,
+    o_v4_tohost     : output logic<32> ,
+) {
+    // Cycle counter for cosim context
+    var cycle: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            cycle = 32'd0;
+        } else {
+            cycle = cycle + 32'd1;
+        }
+    }
+
+    // ============================================================
+    // v1 instance (golden reference)
+    // ============================================================
+    var v1_imem_addr : logic<64>;
+    var v1_imem_rdata: logic<32>;
+    var v1_imem_ren  : logic    ;
+    var v1_dmem_addr : logic<64>;
+    var v1_dmem_wdata: logic<64>;
+    var v1_dmem_rdata: logic<64>;
+    var v1_dmem_wen  : logic    ;
+    var v1_dmem_ren  : logic    ;
+    var v1_dmem_wstrb: logic<8> ;
+    var v1_iptw_addr : logic<64>;
+    var v1_iptw_req  : logic    ;
+    var v1_iptw_rdata: logic<64>;
+    var v1_dbg_regs  : logic<64> [32];
+    var v1_dbg_pc    : logic<64>;
+    var v1_dbg_pass  : logic    ;
+    var v1_dbg_r1    : logic<64>;
+    var v1_dbg_r2    : logic<64>;
+    var v1_dbg_r3    : logic<64>;
+    var v1_ret_v_a   : logic    ;
+    var v1_ret_pc_a  : logic<64>;
+    var v1_ret_rdv_a : logic    ;
+    var v1_ret_rd_a  : logic<5> ;
+    var v1_ret_data_a: logic<64>;
+    var v1_dbg_instret: logic;
+
+    inst v1: heliodor_top #(
+        RESET_PC: 64'h80000000,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr        : v1_imem_addr  ,
+        i_imem_rdata       : v1_imem_rdata ,
+        o_imem_ren         : v1_imem_ren   ,
+        o_iptw_addr        : v1_iptw_addr  ,
+        o_iptw_req         : v1_iptw_req   ,
+        i_iptw_rdata       : v1_iptw_rdata ,
+        i_uart_rx_data     : 8'd0          ,
+        i_uart_rx_valid    : 1'b0          ,
+        o_dmem_addr        : v1_dmem_addr  ,
+        o_dmem_wdata       : v1_dmem_wdata ,
+        i_dmem_rdata       : v1_dmem_rdata ,
+        o_dmem_wen         : v1_dmem_wen   ,
+        o_dmem_ren         : v1_dmem_ren   ,
+        o_dmem_wstrb       : v1_dmem_wstrb ,
+        o_dbg_regs         : v1_dbg_regs   ,
+        o_dbg_pc           : v1_dbg_pc     ,
+        o_dbg_pass         : v1_dbg_pass   ,
+        o_dbg_r1           : v1_dbg_r1     ,
+        o_dbg_r2           : v1_dbg_r2     ,
+        o_dbg_r3           : v1_dbg_r3     ,
+        i_ext_irq          : 32'd0         ,
+        o_dbg_instret      : v1_dbg_instret,
+        o_dbg_retire_v_a   : v1_ret_v_a    ,
+        o_dbg_retire_pc_a  : v1_ret_pc_a   ,
+        o_dbg_retire_rd_v_a: v1_ret_rdv_a  ,
+        o_dbg_retire_rd_a  : v1_ret_rd_a   ,
+        o_dbg_retire_data_a: v1_ret_data_a ,
+    );
+
+    // v1 private DRAM
+    var v1_dram: logic<32> [65536];
+    initial {
+        $readmemh("test/riscv-arch-test/build/rv64ui/add.hex", v1_dram);
+    }
+    let v1_in_dram    : logic     = v1_dmem_addr[31];
+    let v1_imem_idx   : logic<16> = v1_imem_addr[17:2];
+    let v1_dmem_lo    : logic<16> = {v1_dmem_addr[17:3], 1'b0};
+    let v1_dmem_hi    : logic<16> = {v1_dmem_addr[17:3], 1'b1};
+    let v1_iptw_lo    : logic<16> = {v1_iptw_addr[17:3], 1'b0};
+    let v1_iptw_hi    : logic<16> = {v1_iptw_addr[17:3], 1'b1};
+    assign v1_imem_rdata = if v1_imem_addr[31] ? v1_dram[v1_imem_idx] : 32'd0;
+    assign v1_dmem_rdata = if v1_in_dram ? {v1_dram[v1_dmem_hi], v1_dram[v1_dmem_lo]} : 64'd0;
+    assign v1_iptw_rdata = if v1_iptw_addr[31] ? {v1_dram[v1_iptw_hi], v1_dram[v1_iptw_lo]} : 64'd0;
+    always_ff (clk, rst) {
+        if_reset {} else if v1_dmem_wen && v1_in_dram {
+            if v1_dmem_wstrb[0] { v1_dram[v1_dmem_lo][7:0]   = v1_dmem_wdata[7:0];   }
+            if v1_dmem_wstrb[1] { v1_dram[v1_dmem_lo][15:8]  = v1_dmem_wdata[15:8];  }
+            if v1_dmem_wstrb[2] { v1_dram[v1_dmem_lo][23:16] = v1_dmem_wdata[23:16]; }
+            if v1_dmem_wstrb[3] { v1_dram[v1_dmem_lo][31:24] = v1_dmem_wdata[31:24]; }
+            if v1_dmem_wstrb[4] { v1_dram[v1_dmem_hi][7:0]   = v1_dmem_wdata[39:32]; }
+            if v1_dmem_wstrb[5] { v1_dram[v1_dmem_hi][15:8]  = v1_dmem_wdata[47:40]; }
+            if v1_dmem_wstrb[6] { v1_dram[v1_dmem_hi][23:16] = v1_dmem_wdata[55:48]; }
+            if v1_dmem_wstrb[7] { v1_dram[v1_dmem_hi][31:24] = v1_dmem_wdata[63:56]; }
+        }
+    }
+    let v1_tohost: logic<32> = v1_dram[16'd1024];
+
+    // ============================================================
+    // v4-side instance — M0: same v1 RTL (proves cosim infra).
+    // M1+ replaces this with heliodor_core_v4 wrapper.
+    // ============================================================
+    var v4_imem_addr : logic<64>;
+    var v4_imem_rdata: logic<32>;
+    var v4_imem_ren  : logic    ;
+    var v4_dmem_addr : logic<64>;
+    var v4_dmem_wdata: logic<64>;
+    var v4_dmem_rdata: logic<64>;
+    var v4_dmem_wen  : logic    ;
+    var v4_dmem_ren  : logic    ;
+    var v4_dmem_wstrb: logic<8> ;
+    var v4_iptw_addr : logic<64>;
+    var v4_iptw_req  : logic    ;
+    var v4_iptw_rdata: logic<64>;
+    var v4_dbg_regs  : logic<64> [32];
+    var v4_dbg_pc    : logic<64>;
+    var v4_dbg_pass  : logic    ;
+    var v4_dbg_r1    : logic<64>;
+    var v4_dbg_r2    : logic<64>;
+    var v4_dbg_r3    : logic<64>;
+    var v4_ret_v_a   : logic    ;
+    var v4_ret_pc_a  : logic<64>;
+    var v4_ret_rdv_a : logic    ;
+    var v4_ret_rd_a  : logic<5> ;
+    var v4_ret_data_a: logic<64>;
+    var v4_dbg_instret: logic;
+
+    inst v4: heliodor_top #(
+        RESET_PC: 64'h80000000,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr        : v4_imem_addr  ,
+        i_imem_rdata       : v4_imem_rdata ,
+        o_imem_ren         : v4_imem_ren   ,
+        o_iptw_addr        : v4_iptw_addr  ,
+        o_iptw_req         : v4_iptw_req   ,
+        i_iptw_rdata       : v4_iptw_rdata ,
+        i_uart_rx_data     : 8'd0          ,
+        i_uart_rx_valid    : 1'b0          ,
+        o_dmem_addr        : v4_dmem_addr  ,
+        o_dmem_wdata       : v4_dmem_wdata ,
+        i_dmem_rdata       : v4_dmem_rdata ,
+        o_dmem_wen         : v4_dmem_wen   ,
+        o_dmem_ren         : v4_dmem_ren   ,
+        o_dmem_wstrb       : v4_dmem_wstrb ,
+        o_dbg_regs         : v4_dbg_regs   ,
+        o_dbg_pc           : v4_dbg_pc     ,
+        o_dbg_pass         : v4_dbg_pass   ,
+        o_dbg_r1           : v4_dbg_r1     ,
+        o_dbg_r2           : v4_dbg_r2     ,
+        o_dbg_r3           : v4_dbg_r3     ,
+        i_ext_irq          : 32'd0         ,
+        o_dbg_instret      : v4_dbg_instret,
+        o_dbg_retire_v_a   : v4_ret_v_a    ,
+        o_dbg_retire_pc_a  : v4_ret_pc_a   ,
+        o_dbg_retire_rd_v_a: v4_ret_rdv_a  ,
+        o_dbg_retire_rd_a  : v4_ret_rd_a   ,
+        o_dbg_retire_data_a: v4_ret_data_a ,
+    );
+
+    var v4_dram: logic<32> [65536];
+    initial {
+        $readmemh("test/riscv-arch-test/build/rv64ui/add.hex", v4_dram);
+    }
+    let v4_in_dram    : logic     = v4_dmem_addr[31];
+    let v4_imem_idx   : logic<16> = v4_imem_addr[17:2];
+    let v4_dmem_lo    : logic<16> = {v4_dmem_addr[17:3], 1'b0};
+    let v4_dmem_hi    : logic<16> = {v4_dmem_addr[17:3], 1'b1};
+    let v4_iptw_lo    : logic<16> = {v4_iptw_addr[17:3], 1'b0};
+    let v4_iptw_hi    : logic<16> = {v4_iptw_addr[17:3], 1'b1};
+    assign v4_imem_rdata = if v4_imem_addr[31] ? v4_dram[v4_imem_idx] : 32'd0;
+    assign v4_dmem_rdata = if v4_in_dram ? {v4_dram[v4_dmem_hi], v4_dram[v4_dmem_lo]} : 64'd0;
+    assign v4_iptw_rdata = if v4_iptw_addr[31] ? {v4_dram[v4_iptw_hi], v4_dram[v4_iptw_lo]} : 64'd0;
+    always_ff (clk, rst) {
+        if_reset {} else if v4_dmem_wen && v4_in_dram {
+            if v4_dmem_wstrb[0] { v4_dram[v4_dmem_lo][7:0]   = v4_dmem_wdata[7:0];   }
+            if v4_dmem_wstrb[1] { v4_dram[v4_dmem_lo][15:8]  = v4_dmem_wdata[15:8];  }
+            if v4_dmem_wstrb[2] { v4_dram[v4_dmem_lo][23:16] = v4_dmem_wdata[23:16]; }
+            if v4_dmem_wstrb[3] { v4_dram[v4_dmem_lo][31:24] = v4_dmem_wdata[31:24]; }
+            if v4_dmem_wstrb[4] { v4_dram[v4_dmem_hi][7:0]   = v4_dmem_wdata[39:32]; }
+            if v4_dmem_wstrb[5] { v4_dram[v4_dmem_hi][15:8]  = v4_dmem_wdata[47:40]; }
+            if v4_dmem_wstrb[6] { v4_dram[v4_dmem_hi][23:16] = v4_dmem_wdata[55:48]; }
+            if v4_dmem_wstrb[7] { v4_dram[v4_dmem_hi][31:24] = v4_dmem_wdata[63:56]; }
+        }
+    }
+    let v4_tohost: logic<32> = v4_dram[16'd1024];
+
+    // ============================================================
+    // Cosim checker
+    // ============================================================
+    var diverged_w     : logic    ;
+    var compared_cnt_w : logic<32>;
+    var v1_pushed_cnt_w: logic<32>;
+    var v4_pushed_cnt_w: logic<32>;
+    var fd_cy_w        : logic<32>;
+    var fd_kind_w      : logic<2> ;
+    var fd_v1pc_w      : logic<64>;
+    var fd_v4pc_w      : logic<64>;
+
+    inst u_check: cosim_checker (
+        clk                                   ,
+        rst                                   ,
+        i_cycle             : cycle           ,
+        i_v1_push           : v1_ret_v_a      ,
+        i_v1_pc             : v1_ret_pc_a     ,
+        i_v1_rd_v           : v1_ret_rdv_a    ,
+        i_v1_rd             : v1_ret_rd_a     ,
+        i_v1_data           : v1_ret_data_a   ,
+        i_v4_push           : v4_ret_v_a      ,
+        i_v4_pc             : v4_ret_pc_a     ,
+        i_v4_rd_v           : v4_ret_rdv_a    ,
+        i_v4_rd             : v4_ret_rd_a     ,
+        i_v4_data           : v4_ret_data_a   ,
+        o_diverged          : diverged_w      ,
+        o_compared_cnt      : compared_cnt_w  ,
+        o_v1_pushed_cnt     : v1_pushed_cnt_w ,
+        o_v4_pushed_cnt     : v4_pushed_cnt_w ,
+        o_first_diverge_cy  : fd_cy_w         ,
+        o_first_diverge_kind: fd_kind_w       ,
+        o_first_diverge_v1pc: fd_v1pc_w       ,
+        o_first_diverge_v4pc: fd_v4pc_w       ,
+    );
+
+    assign o_done = (v1_tohost != 32'd0 && v4_tohost != 32'd0) || cycle >= 32'd200_000 || diverged_w;
+    assign o_pass = !diverged_w && compared_cnt_w >= 32'd32 && v1_tohost == 32'd1 && v4_tohost == 32'd1;
+    assign o_diverged      = diverged_w;
+    assign o_compared_cnt  = compared_cnt_w;
+    assign o_v1_pushed_cnt = v1_pushed_cnt_w;
+    assign o_v4_pushed_cnt = v4_pushed_cnt_w;
+    assign o_v1_tohost     = v1_tohost;
+    assign o_v4_tohost     = v4_tohost;
+}
+
+#[test(test_cosim_rv64ui_add)]
+#[ignore]
+module test_cosim_rv64ui_add {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen(clk);
+
+    var pass      : logic    ;
+    var done      : logic    ;
+    var diverged  : logic    ;
+    var compared  : logic<32>;
+    var v1_pushed : logic<32>;
+    var v4_pushed : logic<32>;
+    var v1_tohost : logic<32>;
+    var v4_tohost : logic<32>;
+
+    inst h: test_cosim_rv64ui_add_harness (
+        clk                              ,
+        rst                              ,
+        o_pass         : pass            ,
+        o_done         : done            ,
+        o_diverged     : diverged        ,
+        o_compared_cnt : compared        ,
+        o_v1_pushed_cnt: v1_pushed       ,
+        o_v4_pushed_cnt: v4_pushed       ,
+        o_v1_tohost    : v1_tohost       ,
+        o_v4_tohost    : v4_tohost       ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next  (200_000);
+        $display  ("[test_cosim_rv64ui_add] diverged=%b compared=%d v1_pushed=%d v4_pushed=%d v1_tohost=%h v4_tohost=%h pass=%b",
+                   diverged, compared, v1_pushed, v4_pushed, v1_tohost, v4_tohost, pass);
+        $assert (!diverged       , "cosim_rv64ui_add: diverged=1 (retire stream mismatch — bug in cosim machinery or v4 stub)");
+        $assert (compared >= 32'd32 , "cosim_rv64ui_add: compared<32 (cosim never popped — both retire streams empty)");
+        $assert (v1_tohost == 32'd1, "cosim_rv64ui_add: v1 tohost did not signal pass");
+        $assert (v4_tohost == 32'd1, "cosim_rv64ui_add: v4 tohost did not signal pass");
+        $display("[test_cosim_rv64ui_add] PASS");
+        $finish ();
+    }
+}
