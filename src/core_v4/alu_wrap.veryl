@@ -1,0 +1,104 @@
+// Phase 7 v4: ALU + branch execute wrapper.
+//
+// Combinational shell around v1 `alu`. Takes one issued op from
+// `iq_int_v4` along with PRF-read source values, computes the ALU
+// result, evaluates branch / JAL / JALR target + misprediction, and
+// emits one CDB entry per cycle.
+//
+// Branch logic:
+//   - cond branches: ALU output not used for rd; instead, compare
+//     unit decides taken/not-taken via br_cond; target = pc + imm
+//   - JAL : target = pc + imm; wb = pc + 4
+//   - JALR: target = (rs1 + imm) & ~1; wb = pc + 4
+//   - LUI / AUIPC: ALU SrcA forced to 0/PC, SrcB = imm
+//
+// Misprediction is detected against an upstream prediction encoded in
+// the RenamedOp.base. For M1 we ignore prediction (always predict
+// fall-through) so any taken branch / JAL / JALR is a mispredict.
+// M2 adds gshare+BTB+RAS and predict_target carried in DecodedOp.
+pub module alu_wrap_v4 (
+    // Issued op (combinational input from iq_int)
+    i_issue_valid: input logic                       ,
+    i_issue_op   : input pipeline_v4_pkg::RenamedOp  ,
+
+    // PRF read values (from prf_int)
+    i_rs1_data: input logic<64>,
+    i_rs2_data: input logic<64>,
+
+    // CDB output (1-wide M1)
+    o_cdb: output pipeline_v4_pkg::CdbBus,
+) {
+    // ALU operand select
+    let src_a: logic<64> =
+        if i_issue_op.base.use_zero_a ? 64'd0
+        : if i_issue_op.base.use_pc_a  ? i_issue_op.base.pc
+        :                                i_rs1_data;
+    let src_b: logic<64> = if i_issue_op.base.use_imm_b ? i_issue_op.base.imm : i_rs2_data;
+
+    var alu_out: logic<64>;
+    inst u_alu: alu (
+        i_op : i_issue_op.base.alu_op ,
+        i_a  : src_a                  ,
+        i_b  : src_b                  ,
+        o_out: alu_out                ,
+    );
+
+    // Branch evaluation
+    let s1_eq : logic = i_rs1_data == i_rs2_data;
+    let s1_lt : logic = $signed(i_rs1_data) <: $signed(i_rs2_data);
+    let s1_ltu: logic = i_rs1_data <: i_rs2_data;
+
+    var br_taken: logic;
+    always_comb {
+        case i_issue_op.base.br_cond {
+            pipeline_v4_pkg::BrCond::BEQ : br_taken = s1_eq;
+            pipeline_v4_pkg::BrCond::BNE : br_taken = !s1_eq;
+            pipeline_v4_pkg::BrCond::BLT : br_taken = s1_lt;
+            pipeline_v4_pkg::BrCond::BGE : br_taken = !s1_lt;
+            pipeline_v4_pkg::BrCond::BLTU: br_taken = s1_ltu;
+            pipeline_v4_pkg::BrCond::BGEU: br_taken = !s1_ltu;
+            default                     : br_taken = 1'b0;
+        }
+    }
+
+    // Resolved branch / JAL / JALR target
+    let br_target  : logic<64> = i_issue_op.base.pc + i_issue_op.base.imm;
+    let jalr_target: logic<64> = (i_rs1_data + i_issue_op.base.imm) & {63'h7fff_ffff_ffff_ffff, 1'b0};
+    let pc_plus4   : logic<64> = i_issue_op.base.pc + 64'd4;
+    let pc_plus2   : logic<64> = i_issue_op.base.pc + 64'd2; // RVC link (M7)
+
+    var resolved_target: logic<64>;
+    var taken          : logic    ;
+    var is_ctrl        : logic    ;
+    always_comb {
+        is_ctrl = i_issue_op.base.is_branch || i_issue_op.base.is_jal || i_issue_op.base.is_jalr;
+        if i_issue_op.base.is_jalr {
+            resolved_target = jalr_target;
+            taken           = 1'b1;
+        } else if i_issue_op.base.is_jal {
+            resolved_target = br_target;
+            taken           = 1'b1;
+        } else if i_issue_op.base.is_branch {
+            resolved_target = if br_taken ? br_target : pc_plus4;
+            taken           = br_taken;
+        } else {
+            resolved_target = pc_plus4;
+            taken           = 1'b0;
+        }
+    }
+
+    // Result data: JAL/JALR write pc+4 to rd; everything else writes alu_out
+    let wb_data: logic<64> = if i_issue_op.base.wb_pc4 ? pc_plus4 : alu_out;
+    let _pc2_unused: logic<64> = pc_plus2;
+
+    // Mispredict (M1 = always predict fall-through, so any taken is mispredict)
+    let mispred: logic = is_ctrl && taken;
+
+    assign o_cdb.valid       = i_issue_valid;
+    assign o_cdb.has_rd      = i_issue_valid && i_issue_op.base.has_rd;
+    assign o_cdb.pdst        = i_issue_op.rd_pdst;
+    assign o_cdb.data        = wb_data;
+    assign o_cdb.rob_idx     = i_issue_op.rob_idx;
+    assign o_cdb.mispredict  = i_issue_valid && mispred;
+    assign o_cdb.redirect_pc = resolved_target;
+}

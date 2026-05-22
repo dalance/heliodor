@@ -1,0 +1,154 @@
+// Phase 7 v4: Integer Issue Queue.
+//
+// 8 entries (M1), holds renamed integer ops awaiting source-operand
+// readiness. Each entry tracks {rs1_pdst, rs1_ready, rs2_pdst,
+// rs2_ready}; the CDB snoop sets rs*_ready when broadcasting a pdst
+// matching rs1/rs2.
+//
+// PRF-ready bitmap (the IQ owns it for M1 simplicity): CDB writes
+// set ready[pdst]=1, rename clears ready[new_pdst]=0 on allocation.
+// Initial rs*_ready at rename samples this bitmap.
+//
+// CDB snoop wakeup is gated by `i_cdb_has_rd` — non-rd ops (stores,
+// branches without link) drive the CDB to mark their ROB entry done,
+// but their pdst is the spec-time free-list pop value with no real
+// architectural data; waking on it falsely marks consumers ready.
+//
+// M1: lowest-index ready entry wins issue. M6 widens to age-ordered
+// priority pick.
+pub module iq_int_v4 #(
+    param IQ_N     : u32 = 8,
+    param IQ_W     : u32 = 3,
+    param PRF_N    : u32 = 64,
+    param PRF_W    : u32 = 6,
+    param ROB_IDX_W: u32 = 5,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Allocation
+    i_alloc_en : input  logic                       ,
+    i_alloc_op : input  pipeline_v4_pkg::RenamedOp  ,
+    o_alloc_rdy: output logic                       ,
+
+    // PRF-ready bitmap maintenance (rename clears, CDB sets)
+    i_rename_set_pending: input logic        ,
+    i_rename_pdst       : input logic<PRF_W> ,
+
+    // CDB writeback snoop
+    i_cdb_valid : input logic        ,
+    i_cdb_has_rd: input logic        ,
+    i_cdb_pdst  : input logic<PRF_W> ,
+
+    // Issue (M1 = 1 op/cycle)
+    o_issue_valid: output logic                       ,
+    o_issue_op   : output pipeline_v4_pkg::RenamedOp  ,
+    i_issue_ack  : input  logic                       ,
+
+    // Flush (commit-time redirect)
+    i_flush: input logic,
+) {
+    var ops     : pipeline_v4_pkg::RenamedOp [IQ_N];
+    var occupied: logic                       [IQ_N];
+    var rs1_rdy : logic                       [IQ_N];
+    var rs2_rdy : logic                       [IQ_N];
+
+    var prf_ready: logic [PRF_N];
+
+    // Find first free slot (allocation)
+    var free_idx     : logic<IQ_W>;
+    var has_free_slot: logic       ;
+    always_comb {
+        free_idx      = 3'd0;
+        has_free_slot = 1'b0;
+        for i in 0..IQ_N {
+            if !has_free_slot && !occupied[i] {
+                free_idx      = i as IQ_W;
+                has_free_slot = 1'b1;
+            }
+        }
+    }
+    assign o_alloc_rdy = has_free_slot;
+
+    // Find lowest-index ready entry (issue)
+    var issue_idx   : logic<IQ_W>;
+    var has_issuable: logic       ;
+    always_comb {
+        issue_idx    = 3'd0;
+        has_issuable = 1'b0;
+        for i in 0..IQ_N {
+            if !has_issuable && occupied[i] && rs1_rdy[i] && rs2_rdy[i] {
+                issue_idx    = i as IQ_W;
+                has_issuable = 1'b1;
+            }
+        }
+    }
+    assign o_issue_valid = has_issuable;
+    assign o_issue_op    = ops[issue_idx];
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..IQ_N {
+                occupied[i] = 1'b0;
+                rs1_rdy[i]  = 1'b0;
+                rs2_rdy[i]  = 1'b0;
+            }
+            for i in 0..PRF_N {
+                // Initial RAT identity → PRF[0..31] are ready;
+                // PRF[32..63] are free-list entries with no producer yet
+                // (any rename clears their ready bit before issue depends
+                // on them).
+                prf_ready[i] = 1'b1;
+            }
+        } else if i_flush {
+            for i in 0..IQ_N {
+                occupied[i] = 1'b0;
+            }
+            // PRF-ready bitmap state survives flush — recovery_fire on
+            // free_list reclaims squashed pdsts; the ready bits on those
+            // reclaimed pdsts remain whatever they were (the next rename
+            // will reset them). On subsequent commits the bitmap stays
+            // consistent.
+        } else {
+            // CDB snoop: wake matching rs*_pdst and set prf_ready[pdst].
+            // Gate by has_rd to suppress false wakeups from non-rd ops.
+            if i_cdb_valid && i_cdb_has_rd {
+                prf_ready[i_cdb_pdst] = 1'b1;
+                for i in 0..IQ_N {
+                    if occupied[i] && ops[i].rs1_pdst == i_cdb_pdst {
+                        rs1_rdy[i] = 1'b1;
+                    }
+                    if occupied[i] && ops[i].rs2_pdst == i_cdb_pdst {
+                        rs2_rdy[i] = 1'b1;
+                    }
+                }
+            }
+            // Rename clears prf_ready[new_pdst] so subsequent renames
+            // that depend on it see "not ready" until producer writes back.
+            if i_rename_set_pending {
+                prf_ready[i_rename_pdst] = 1'b0;
+            }
+            // Issue: free the slot once back-end accepts the op.
+            if i_issue_ack && has_issuable {
+                occupied[issue_idx] = 1'b0;
+            }
+            // Allocate: install op in free_idx, sample initial ready bits
+            // from prf_ready. For !has_rsN ops the ready bit is forced 1.
+            if i_alloc_en && has_free_slot {
+                ops[free_idx]      = i_alloc_op;
+                occupied[free_idx] = 1'b1;
+                // Initial readiness: sample prf_ready at rename. If the
+                // CDB *this cycle* matches rs*_pdst the rs*_rdy needs to
+                // reflect that. The CDB snoop above runs for ALL ops
+                // (not just the just-allocated one), but free_idx was
+                // !occupied — the loop skipped it. Handle here:
+                rs1_rdy[free_idx] = (!i_alloc_op.base.has_rs1) ||
+                                    prf_ready[i_alloc_op.rs1_pdst] ||
+                                    (i_cdb_valid && i_cdb_has_rd && i_cdb_pdst == i_alloc_op.rs1_pdst);
+                rs2_rdy[free_idx] = (!i_alloc_op.base.has_rs2) ||
+                                    prf_ready[i_alloc_op.rs2_pdst] ||
+                                    (i_cdb_valid && i_cdb_has_rd && i_cdb_pdst == i_alloc_op.rs2_pdst);
+            }
+        }
+    }
+}
