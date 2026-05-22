@@ -147,6 +147,17 @@ pub module heliodor_core_v4 #(
         rob_alloc_entry.redirect_pc    = 64'd0;
         rob_alloc_entry.illegal        = dec_op.illegal;
         rob_alloc_entry.result_data    = 64'd0;
+        rob_alloc_entry.is_store       = 1'b0;
+        rob_alloc_entry.store_addr     = 64'd0;
+        rob_alloc_entry.store_data     = 64'd0;
+        rob_alloc_entry.store_funct3   = 3'd0;
+        // M4 fields captured at alloc (decode)
+        rob_alloc_entry.is_csr         = 1'b0; // CSR write captured at CDB
+        rob_alloc_entry.csr_addr       = 12'd0;
+        rob_alloc_entry.csr_wdata      = 64'd0;
+        rob_alloc_entry.is_ecall       = dec_op.is_ecall;
+        rob_alloc_entry.is_ebreak      = dec_op.is_ebreak;
+        rob_alloc_entry.is_mret        = dec_op.is_mret;
     }
 
     // RenamedOp
@@ -179,6 +190,10 @@ pub module heliodor_core_v4 #(
 
     var cdb: CdbBus;
 
+    var csr_rd_data : logic<64>;
+    var csr_mtvec   : logic<64>;
+    var csr_mepc    : logic<64>;
+
     inst u_alu: alu_wrap_v4 (
         i_issue_valid  : iq_issue_valid ,
         i_issue_op     : iq_issue_op    ,
@@ -187,6 +202,7 @@ pub module heliodor_core_v4 #(
         i_rs1_data     : prf_rs1_data   ,
         i_rs2_data     : prf_rs2_data   ,
         i_load_data    : i_dmem_rdata   ,
+        i_csr_data     : csr_rd_data    ,
         o_cdb          : cdb            ,
     );
 
@@ -300,6 +316,12 @@ pub module heliodor_core_v4 #(
     var c_store_addr  : logic<64>;
     var c_store_data  : logic<64>;
     var c_store_funct3: logic<3> ;
+    var c_is_csr      : logic    ;
+    var c_csr_addr    : logic<12>;
+    var c_csr_wdata   : logic<64>;
+    var c_is_ecall    : logic    ;
+    var c_is_ebreak   : logic    ;
+    var c_is_mret     : logic    ;
 
     let rob_commit_ack: logic = rob_commit_valid;
 
@@ -328,6 +350,9 @@ pub module heliodor_core_v4 #(
         i_cdb_store_addr  : cdb.store_addr   ,
         i_cdb_store_data  : cdb.store_data   ,
         i_cdb_store_funct3: cdb.store_funct3 ,
+        i_cdb_is_csr      : cdb.is_csr       ,
+        i_cdb_csr_addr    : cdb.csr_addr     ,
+        i_cdb_csr_wdata   : cdb.csr_wdata    ,
         o_commit_valid   : rob_commit_valid,
         o_commit_entry   : rob_commit_entry,
         o_commit_pc          : c_pc         ,
@@ -344,6 +369,12 @@ pub module heliodor_core_v4 #(
         o_commit_store_data  : c_store_data  ,
         o_commit_store_funct3: c_store_funct3,
         o_has_pending_store  : rob_has_pending_store,
+        o_commit_is_csr      : c_is_csr      ,
+        o_commit_csr_addr    : c_csr_addr    ,
+        o_commit_csr_wdata   : c_csr_wdata   ,
+        o_commit_is_ecall    : c_is_ecall    ,
+        o_commit_is_ebreak   : c_is_ebreak   ,
+        o_commit_is_mret     : c_is_mret     ,
         o_commit_idx     : rob_commit_idx  ,
         i_commit_ack     : rob_commit_ack  ,
         i_redirect_fire  : redirect_fire   ,
@@ -372,7 +403,47 @@ pub module heliodor_core_v4 #(
     }
 
     // ============================================================
-    // Redirect (commit-time mispredict / illegal)
+    // M4 trap entry decisions (commit-time, registered into redirect)
+    // ============================================================
+    let commit_trap : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak);
+    let commit_mret : logic = rob_commit_valid && c_is_mret;
+    let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal;
+
+    // Cause encoding (per RISC-V priv spec, M-mode causes)
+    var trap_cause: logic<64>;
+    always_comb {
+        if c_illegal {
+            trap_cause = 64'd2;  // illegal instruction
+        } else if c_is_ebreak {
+            trap_cause = 64'd3;  // breakpoint
+        } else {
+            trap_cause = 64'd11; // ECALL from M-mode
+        }
+    }
+
+    // ============================================================
+    // CSR file
+    // ============================================================
+    inst u_csr: csr_v4 (
+        clk         ,
+        rst         ,
+        i_rd_addr   : iq_issue_op.base.csr_addr,
+        o_rd_data   : csr_rd_data              ,
+        i_wr_en     : commit_csrwr             ,
+        i_wr_addr   : c_csr_addr               ,
+        i_wr_data   : c_csr_wdata              ,
+        i_trap_fire : commit_trap              ,
+        i_trap_pc   : c_pc                     ,
+        i_trap_cause: trap_cause               ,
+        i_trap_tval : 64'd0                    ,
+        i_mret_fire : commit_mret              ,
+        o_mtvec     : csr_mtvec                ,
+        o_mepc      : csr_mepc                 ,
+        i_instret_en: rob_commit_valid && !commit_trap,
+    );
+
+    // ============================================================
+    // Redirect (commit-time mispredict / trap / mret)
     // ============================================================
     var redirect_fire_q: logic    ;
     var redirect_pc_q  : logic<64>;
@@ -380,13 +451,15 @@ pub module heliodor_core_v4 #(
         if_reset {
             redirect_fire_q = 1'b0;
             redirect_pc_q   = 64'd0;
-        } else if rob_commit_valid && (c_mispredict || c_illegal) {
+        } else if commit_trap {
             redirect_fire_q = 1'b1;
-            if c_illegal {
-                redirect_pc_q = RESET_PC; // M1 trap stub
-            } else {
-                redirect_pc_q = c_redirect_pc;
-            }
+            redirect_pc_q   = csr_mtvec & 64'hffff_ffff_ffff_fffc;
+        } else if commit_mret {
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = csr_mepc;
+        } else if rob_commit_valid && c_mispredict {
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = c_redirect_pc;
         } else {
             redirect_fire_q = 1'b0;
         }

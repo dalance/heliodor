@@ -1,0 +1,184 @@
+// Phase 7 v4: minimal CSR file (M-mode only, M4).
+//
+// Implements the subset of M-mode CSRs sufficient for rv64ui-* startup:
+//   mhartid (RO, 0)
+//   mtvec, mstatus, mscratch, mepc, mcause, mtval, mie, mip
+//   mcycle, minstret (counters, free-running)
+//   misa (RO, return 0)
+//   medeleg, mideleg (RW, accept writes — Phase 5+ wires them to
+//                     trap_delegate logic; M4 keeps them as plain RW)
+//   pmpcfg0, pmpaddr0 (RW, accept writes — no enforcement)
+//   satp (RW, no MMU enforcement until M5)
+//
+// All other addresses return 0 on read and silently drop writes (so
+// rv64ui startup does not trap on unknown CSR ops). M5+ MMU wires
+// satp into the page-walker; for M4 it is just a register.
+//
+// Read port is combinational; write port is registered (commit-time).
+// Trap entry / MRET updates also go through the registered write
+// path; the caller (heliodor_core_v4 commit stage) drives i_trap_fire
+// + i_mret_fire pulses.
+pub module csr_v4 #(
+    param HART_ID: u8 = 0,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Combinational read (issue-time CSR value sample)
+    i_rd_addr : input  logic<12>,
+    o_rd_data : output logic<64>,
+
+    // Registered CSR write (commit-time)
+    i_wr_en   : input logic     ,
+    i_wr_addr : input logic<12> ,
+    i_wr_data : input logic<64> ,
+
+    // Trap entry (commit-time)
+    i_trap_fire   : input logic    ,
+    i_trap_pc     : input logic<64>, // → mepc
+    i_trap_cause  : input logic<64>, // → mcause
+    i_trap_tval   : input logic<64>, // → mtval
+
+    // MRET (commit-time): restore PC from mepc, restore mstatus[MIE]
+    // from mstatus[MPIE]
+    i_mret_fire   : input logic,
+
+    // mtvec for trap redirect target
+    o_mtvec       : output logic<64>,
+    o_mepc        : output logic<64>,
+
+    // commit_instret pulse (for counter increment)
+    i_instret_en  : input logic,
+) {
+    // === CSR address constants (subset) ===
+    const ADDR_MHARTID  : logic<12> = 12'hF14;
+    const ADDR_MSTATUS  : logic<12> = 12'h300;
+    const ADDR_MISA     : logic<12> = 12'h301;
+    const ADDR_MEDELEG  : logic<12> = 12'h302;
+    const ADDR_MIDELEG  : logic<12> = 12'h303;
+    const ADDR_MIE      : logic<12> = 12'h304;
+    const ADDR_MTVEC    : logic<12> = 12'h305;
+    const ADDR_MSCRATCH : logic<12> = 12'h340;
+    const ADDR_MEPC     : logic<12> = 12'h341;
+    const ADDR_MCAUSE   : logic<12> = 12'h342;
+    const ADDR_MTVAL    : logic<12> = 12'h343;
+    const ADDR_MIP      : logic<12> = 12'h344;
+    const ADDR_PMPCFG0  : logic<12> = 12'h3A0;
+    const ADDR_PMPADDR0 : logic<12> = 12'h3B0;
+    const ADDR_SATP     : logic<12> = 12'h180;
+    const ADDR_MCYCLE   : logic<12> = 12'hB00;
+    const ADDR_MINSTRET : logic<12> = 12'hB02;
+    const ADDR_TIME     : logic<12> = 12'hC01; // user time (== mtime)
+    const ADDR_CYCLE    : logic<12> = 12'hC00;
+    const ADDR_INSTRET  : logic<12> = 12'hC02;
+
+    // === Registered CSRs ===
+    var mstatus  : logic<64>;
+    var mie      : logic<64>;
+    var mtvec    : logic<64>;
+    var mscratch : logic<64>;
+    var mepc     : logic<64>;
+    var mcause   : logic<64>;
+    var mtval    : logic<64>;
+    var mip      : logic<64>;
+    var medeleg  : logic<64>;
+    var mideleg  : logic<64>;
+    var pmpcfg0  : logic<64>;
+    var pmpaddr0 : logic<64>;
+    var satp     : logic<64>;
+    var mcycle   : logic<64>;
+    var minstret : logic<64>;
+
+    // === Combinational read ===
+    var rd_data_w: logic<64>;
+    always_comb {
+        case i_rd_addr {
+            ADDR_MHARTID : rd_data_w = {56'd0, HART_ID};
+            ADDR_MSTATUS : rd_data_w = mstatus;
+            ADDR_MISA    : rd_data_w = 64'd0;
+            ADDR_MEDELEG : rd_data_w = medeleg;
+            ADDR_MIDELEG : rd_data_w = mideleg;
+            ADDR_MIE     : rd_data_w = mie;
+            ADDR_MTVEC   : rd_data_w = mtvec;
+            ADDR_MSCRATCH: rd_data_w = mscratch;
+            ADDR_MEPC    : rd_data_w = mepc;
+            ADDR_MCAUSE  : rd_data_w = mcause;
+            ADDR_MTVAL   : rd_data_w = mtval;
+            ADDR_MIP     : rd_data_w = mip;
+            ADDR_PMPCFG0 : rd_data_w = pmpcfg0;
+            ADDR_PMPADDR0: rd_data_w = pmpaddr0;
+            ADDR_SATP    : rd_data_w = satp;
+            ADDR_MCYCLE  : rd_data_w = mcycle;
+            ADDR_MINSTRET: rd_data_w = minstret;
+            ADDR_TIME    : rd_data_w = mcycle;  // alias
+            ADDR_CYCLE   : rd_data_w = mcycle;  // alias
+            ADDR_INSTRET : rd_data_w = minstret;
+            default      : rd_data_w = 64'd0;
+        }
+    }
+    assign o_rd_data = rd_data_w;
+    assign o_mtvec   = mtvec;
+    assign o_mepc    = mepc;
+
+    // === Registered writes + trap entry + counters ===
+    always_ff (clk, rst) {
+        if_reset {
+            mstatus  = 64'd0;
+            mie      = 64'd0;
+            mtvec    = 64'd0;
+            mscratch = 64'd0;
+            mepc     = 64'd0;
+            mcause   = 64'd0;
+            mtval    = 64'd0;
+            mip      = 64'd0;
+            medeleg  = 64'd0;
+            mideleg  = 64'd0;
+            pmpcfg0  = 64'd0;
+            pmpaddr0 = 64'd0;
+            satp     = 64'd0;
+            mcycle   = 64'd0;
+            minstret = 64'd0;
+        } else {
+            // Trap entry (priority over CSR write since trap fires
+            // commit-time and writes mepc/mcause/mtval atomically).
+            if i_trap_fire {
+                mepc   = i_trap_pc;
+                mcause = i_trap_cause;
+                mtval  = i_trap_tval;
+                // mstatus: MPIE ← MIE (bit 7 ← bit 3), MIE ← 0
+                mstatus[7] = mstatus[3];
+                mstatus[3] = 1'b0;
+            } else if i_mret_fire {
+                // mstatus: MIE ← MPIE, MPIE ← 1
+                mstatus[3] = mstatus[7];
+                mstatus[7] = 1'b1;
+            } else if i_wr_en {
+                case i_wr_addr {
+                    ADDR_MSTATUS : mstatus  = i_wr_data;
+                    ADDR_MEDELEG : medeleg  = i_wr_data;
+                    ADDR_MIDELEG : mideleg  = i_wr_data;
+                    ADDR_MIE     : mie      = i_wr_data;
+                    ADDR_MTVEC   : mtvec    = i_wr_data;
+                    ADDR_MSCRATCH: mscratch = i_wr_data;
+                    ADDR_MEPC    : mepc     = i_wr_data;
+                    ADDR_MCAUSE  : mcause   = i_wr_data;
+                    ADDR_MTVAL   : mtval    = i_wr_data;
+                    ADDR_MIP     : mip      = i_wr_data;
+                    ADDR_PMPCFG0 : pmpcfg0  = i_wr_data;
+                    ADDR_PMPADDR0: pmpaddr0 = i_wr_data;
+                    ADDR_SATP    : satp     = i_wr_data;
+                    ADDR_MCYCLE  : mcycle   = i_wr_data;
+                    ADDR_MINSTRET: minstret = i_wr_data;
+                    default      : {}
+                }
+            }
+            // Free-running counters (also written above when written by
+            // CSR write — last-assign wins). Increment by 1 each cycle
+            // (mcycle) / on each commit (minstret).
+            mcycle = mcycle + 64'd1;
+            if i_instret_en {
+                minstret = minstret + 64'd1;
+            }
+        }
+    }
+}
