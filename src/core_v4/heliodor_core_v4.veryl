@@ -84,6 +84,8 @@ pub module heliodor_core_v4 #(
     // M5.D.2: forward declaration for IQ-issue/CDB stall gate; driven
     // by the dmem_mmu inst near end of file. Bare mode keeps this at 0.
     var dmem_mmu_busy: logic;
+    // M5.D: medeleg needed by trap_to_s computation in commit stage.
+    var csr_medeleg_w: logic<64>;
 
     var redirect_fire: logic    ;
     var redirect_pc  : logic<64>;
@@ -208,6 +210,8 @@ pub module heliodor_core_v4 #(
         rob_alloc_entry.is_ecall       = dec_op.is_ecall;
         rob_alloc_entry.is_ebreak      = dec_op.is_ebreak;
         rob_alloc_entry.is_mret        = dec_op.is_mret;
+        rob_alloc_entry.is_sret        = dec_op.is_sret;
+        rob_alloc_entry.is_sfence      = dec_op.is_sfence;
         rob_alloc_entry.is_amo         = dec_op.is_amo;
     }
 
@@ -251,8 +255,11 @@ pub module heliodor_core_v4 #(
     var csr_rd_data : logic<64>;
     var csr_mtvec   : logic<64>;
     var csr_mepc    : logic<64>;
-    // csr_satp / csr_priv / csr_sum / csr_mxr declared near pc_q (M5.C
-    // forward declaration for imem_mmu/dmem_mmu insts).
+    var csr_stvec   : logic<64>;
+    var csr_sepc    : logic<64>;
+    var csr_mideleg_w: logic<64>;
+    // csr_satp / csr_priv / csr_sum / csr_mxr / csr_medeleg_w declared
+    // earlier (M5.C/M5.D forward declarations for inst use sites).
 
     var rsv_valid_q: logic    ;
     var rsv_addr_q : logic<64>;
@@ -406,6 +413,8 @@ pub module heliodor_core_v4 #(
     var c_is_ecall    : logic    ;
     var c_is_ebreak   : logic    ;
     var c_is_mret     : logic    ;
+    var c_is_sret     : logic    ;
+    var c_is_sfence   : logic    ;
 
     let rob_commit_ack: logic = rob_commit_valid;
 
@@ -459,6 +468,8 @@ pub module heliodor_core_v4 #(
         o_commit_is_ecall    : c_is_ecall    ,
         o_commit_is_ebreak   : c_is_ebreak   ,
         o_commit_is_mret     : c_is_mret     ,
+        o_commit_is_sret     : c_is_sret     ,
+        o_commit_is_sfence   : c_is_sfence   ,
         o_commit_idx     : rob_commit_idx  ,
         i_commit_ack     : rob_commit_ack  ,
         i_redirect_fire  : redirect_fire   ,
@@ -491,19 +502,31 @@ pub module heliodor_core_v4 #(
     // ============================================================
     let commit_trap : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak);
     let commit_mret : logic = rob_commit_valid && c_is_mret;
+    let commit_sret : logic = rob_commit_valid && c_is_sret;
     let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal;
 
-    // Cause encoding (per RISC-V priv spec, M-mode causes)
+    // Cause encoding (per RISC-V priv spec). ECALL cause depends on
+    // current priv: M=11, S=9, U=8.
     var trap_cause: logic<64>;
     always_comb {
         if c_illegal {
             trap_cause = 64'd2;  // illegal instruction
         } else if c_is_ebreak {
             trap_cause = 64'd3;  // breakpoint
+        } else if csr_priv == csr_pkg::PrivLevel::MACHINE {
+            trap_cause = 64'd11; // ECALL from M
+        } else if csr_priv == csr_pkg::PrivLevel::SUPERVISOR {
+            trap_cause = 64'd9;  // ECALL from S
         } else {
-            trap_cause = 64'd11; // ECALL from M-mode
+            trap_cause = 64'd8;  // ECALL from U
         }
     }
+
+    // M5.D trap delegation: if medeleg[cause]=1 AND current priv ∈ {S,U},
+    // the trap is taken in S-mode (sepc/scause/stval, stvec target).
+    // (csr_medeleg_w forward-declared near pc_q.)
+    let trap_cause_bit: logic = csr_medeleg_w[trap_cause[5:0]];
+    let trap_to_s    : logic = trap_cause_bit && (csr_priv != csr_pkg::PrivLevel::MACHINE);
 
     // ============================================================
     // CSR file
@@ -523,10 +546,16 @@ pub module heliodor_core_v4 #(
         i_mret_fire : commit_mret              ,
         o_mtvec     : csr_mtvec                ,
         o_mepc      : csr_mepc                 ,
+        o_stvec     : csr_stvec                ,
+        o_sepc      : csr_sepc                 ,
+        o_medeleg   : csr_medeleg_w            ,
+        o_mideleg   : csr_mideleg_w            ,
         o_satp        : csr_satp                ,
         o_priv        : csr_priv                ,
         o_mstatus_sum : csr_sum                 ,
         o_mstatus_mxr : csr_mxr                 ,
+        i_sret_fire   : commit_sret             ,
+        i_trap_to_s   : trap_to_s               ,
         i_instret_en: rob_commit_valid && !commit_trap,
     );
 
@@ -541,10 +570,15 @@ pub module heliodor_core_v4 #(
             redirect_pc_q   = 64'd0;
         } else if commit_trap {
             redirect_fire_q = 1'b1;
-            redirect_pc_q   = csr_mtvec & 64'hffff_ffff_ffff_fffc;
+            // M5.D: trap to S → stvec, else mtvec
+            redirect_pc_q   = if trap_to_s ? (csr_stvec & 64'hffff_ffff_ffff_fffc)
+                                            : (csr_mtvec & 64'hffff_ffff_ffff_fffc);
         } else if commit_mret {
             redirect_fire_q = 1'b1;
             redirect_pc_q   = csr_mepc;
+        } else if commit_sret {
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = csr_sepc;
         } else if rob_commit_valid && c_mispredict {
             redirect_fire_q = 1'b1;
             redirect_pc_q   = c_redirect_pc;
@@ -581,7 +615,7 @@ pub module heliodor_core_v4 #(
     // v1 does not emit a retire-valid pulse for MRET / ECALL / EBREAK
     // (they go through a separate squash path in EX). To keep the
     // cosim FIFO order aligned, gate v4's retire-valid the same way.
-    assign o_dbg_retire_v_a    = rob_commit_valid && !c_illegal && !c_is_mret && !c_is_ecall && !c_is_ebreak;
+    assign o_dbg_retire_v_a    = rob_commit_valid && !c_illegal && !c_is_mret && !c_is_sret && !c_is_ecall && !c_is_ebreak;
     assign o_dbg_retire_pc_a   = c_pc;
     assign o_dbg_retire_rd_v_a = c_has_rd;
     assign o_dbg_retire_rd_a   = c_rd_arch;

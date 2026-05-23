@@ -40,20 +40,32 @@ pub module csr_v4 #(
     i_trap_tval   : input logic<64>, // → mtval
 
     // MRET (commit-time): restore PC from mepc, restore mstatus[MIE]
-    // from mstatus[MPIE]
+    // from mstatus[MPIE], priv ← MPP
     i_mret_fire   : input logic,
+    // SRET (commit-time): restore priv ← SPP, SIE ← SPIE
+    i_sret_fire   : input logic,
 
     // mtvec for trap redirect target
     o_mtvec       : output logic<64>,
     o_mepc        : output logic<64>,
+    o_stvec       : output logic<64>,
+    o_sepc        : output logic<64>,
+    // Trap delegation decision (commit logic reads to pick mtvec vs stvec)
+    o_medeleg     : output logic<64>,
+    o_mideleg     : output logic<64>,
 
     // M5.C: MMU integration — satp + priv + mstatus permission bits.
-    // M5.C M-mode only: priv hardcoded to MACHINE here; M5.D wires the
-    // actual privilege state through. mstatus_sum/mxr also tracked here.
+    // M5.D: priv is now tracked here via i_trap_fire / i_mret_fire /
+    // i_sret_fire and exposed through o_priv. trap_delegate_s indicates
+    // the current trap fires into S-mode (caller picks stvec / scause /
+    // sepc / stval write paths).
     o_satp        : output logic<64>             ,
     o_priv        : output csr_pkg::PrivLevel    ,
     o_mstatus_sum : output logic                 ,
     o_mstatus_mxr : output logic                 ,
+    // M5.D delegation decision: 1 if the current trap should go to S-mode
+    // (medeleg bit for this cause set AND current priv ∈ {S, U}).
+    i_trap_to_s   : input  logic                 ,
 
     // commit_instret pulse (for counter increment)
     i_instret_en  : input logic,
@@ -90,6 +102,9 @@ pub module csr_v4 #(
     const ADDR_CYCLE    : logic<12> = 12'hC00;
     const ADDR_INSTRET  : logic<12> = 12'hC02;
 
+    // M5.D current privilege level
+    var priv: csr_pkg::PrivLevel;
+
     // === Registered CSRs ===
     var mstatus  : logic<64>;
     var mie      : logic<64>;
@@ -113,23 +128,28 @@ pub module csr_v4 #(
     var scause   : logic<64>;
     var stval    : logic<64>;
     var scounteren: logic<64>;
-    // sstatus visible bits: SIE(1), SPIE(5), SPP(8), SUM(18), MXR(19), FS(13:14), XS(15:16), SD(63)
-    const SSTATUS_MASK: logic<64> = 64'h8000_0000_000d_e162;
+    // sstatus visible bits: SIE(1), SPIE(5), SPP(8), FS(14:13), XS(16:15),
+    // SUM(18), MXR(19), UXL(33:32), SD(63). UXL is read-only for RV64.
+    const SSTATUS_MASK: logic<64> = 64'h8000_0003_000d_e162;
     // sie/sip visible bits: SSIE/SSIP(1), STIE/STIP(5), SEIE/SEIP(9)
     const SI_MASK: logic<64> = 64'h0000_0000_0000_0222;
+    // RV64 SXL/UXL = 2 (XLEN=64), required by spec for RV64 cores.
+    const MSTATUS_XL_RO: logic<64> = 64'h0000_000a_0000_0000;
+    // SSTATUS UXL bits only ([33:32])
+    const SSTATUS_XL_RO: logic<64> = 64'h0000_0002_0000_0000;
 
     // === Combinational read ===
     var rd_data_w: logic<64>;
     always_comb {
         case i_rd_addr {
             ADDR_MHARTID : rd_data_w = {56'd0, HART_ID};
-            ADDR_MSTATUS : rd_data_w = mstatus;
+            ADDR_MSTATUS : rd_data_w = mstatus | MSTATUS_XL_RO;
             // RV64 MXL=2 in [63:62]; extensions: A=bit 0, I=bit 8, M=bit 12
             // (S/U added in M5.D). misa = 0x8000_0000_0000_1101 for RV64IMA.
             // S + U bit added once S-mode usable (M5.D)
             ADDR_MISA    : rd_data_w = 64'h8000_0000_0014_1101;
             // S-mode CSRs: sstatus/sie/sip are masked views; others standalone.
-            ADDR_SSTATUS : rd_data_w = mstatus & SSTATUS_MASK;
+            ADDR_SSTATUS : rd_data_w = (mstatus & SSTATUS_MASK) | SSTATUS_XL_RO;
             ADDR_SIE     : rd_data_w = mie & SI_MASK;
             ADDR_STVEC   : rd_data_w = stvec;
             ADDR_SCOUNTEREN: rd_data_w = scounteren;
@@ -161,15 +181,19 @@ pub module csr_v4 #(
     assign o_rd_data = rd_data_w;
     assign o_mtvec   = mtvec;
     assign o_mepc    = mepc;
+    assign o_stvec   = stvec;
+    assign o_sepc    = sepc;
     assign o_satp    = satp;
-    // M5.C M-mode only: hardcode priv = MACHINE. M5.D will track actual priv.
-    assign o_priv         = csr_pkg::PrivLevel::MACHINE;
+    assign o_medeleg = medeleg;
+    assign o_mideleg = mideleg;
+    assign o_priv         = priv;
     assign o_mstatus_sum  = mstatus[18];
     assign o_mstatus_mxr  = mstatus[19];
 
     // === Registered writes + trap entry + counters ===
     always_ff (clk, rst) {
         if_reset {
+            priv     = csr_pkg::PrivLevel::MACHINE;
             mstatus  = 64'd0;
             mie      = 64'd0;
             mtvec    = 64'd0;
@@ -194,17 +218,56 @@ pub module csr_v4 #(
         } else {
             // Trap entry (priority over CSR write since trap fires
             // commit-time and writes mepc/mcause/mtval atomically).
+            // M5.D: if i_trap_to_s, the trap is delegated to S-mode —
+            // update sepc/scause/stval + sstatus (SPP/SPIE/SIE) and
+            // priv ← S. Else fall to M-mode handler.
             if i_trap_fire {
-                mepc   = i_trap_pc;
-                mcause = i_trap_cause;
-                mtval  = i_trap_tval;
-                // mstatus: MPIE ← MIE (bit 7 ← bit 3), MIE ← 0
-                mstatus[7] = mstatus[3];
-                mstatus[3] = 1'b0;
+                if i_trap_to_s {
+                    sepc   = i_trap_pc;
+                    scause = i_trap_cause;
+                    stval  = i_trap_tval;
+                    // sstatus: SPIE ← SIE (bit 5 ← bit 1), SIE ← 0
+                    mstatus[5] = mstatus[1];
+                    mstatus[1] = 1'b0;
+                    // SPP (bit 8) ← current priv: 0=U, 1=S
+                    mstatus[8] = if priv == csr_pkg::PrivLevel::SUPERVISOR ? 1'b1 : 1'b0;
+                    priv = csr_pkg::PrivLevel::SUPERVISOR;
+                } else {
+                    mepc   = i_trap_pc;
+                    mcause = i_trap_cause;
+                    mtval  = i_trap_tval;
+                    // mstatus: MPIE ← MIE (bit 7 ← bit 3), MIE ← 0
+                    mstatus[7] = mstatus[3];
+                    mstatus[3] = 1'b0;
+                    // MPP (bits 12:11) ← current priv encoding (M=11, S=01, U=00)
+                    if priv == csr_pkg::PrivLevel::MACHINE {
+                        mstatus[12] = 1'b1; mstatus[11] = 1'b1;
+                    } else if priv == csr_pkg::PrivLevel::SUPERVISOR {
+                        mstatus[12] = 1'b0; mstatus[11] = 1'b1;
+                    } else {
+                        mstatus[12] = 1'b0; mstatus[11] = 1'b0;
+                    }
+                    priv = csr_pkg::PrivLevel::MACHINE;
+                }
             } else if i_mret_fire {
-                // mstatus: MIE ← MPIE, MPIE ← 1
+                // mstatus: MIE ← MPIE, MPIE ← 1; priv ← MPP; MPP ← U
                 mstatus[3] = mstatus[7];
                 mstatus[7] = 1'b1;
+                if mstatus[12] == 1'b1 && mstatus[11] == 1'b1 {
+                    priv = csr_pkg::PrivLevel::MACHINE;
+                } else if mstatus[12] == 1'b0 && mstatus[11] == 1'b1 {
+                    priv = csr_pkg::PrivLevel::SUPERVISOR;
+                } else {
+                    priv = csr_pkg::PrivLevel::USER;
+                }
+                // MPP ← U (00)
+                mstatus[12] = 1'b0; mstatus[11] = 1'b0;
+            } else if i_sret_fire {
+                // sstatus: SIE ← SPIE, SPIE ← 1; priv ← SPP (1=S, 0=U); SPP ← U
+                mstatus[1] = mstatus[5];
+                mstatus[5] = 1'b1;
+                priv = if mstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
+                mstatus[8] = 1'b0;
             } else if i_wr_en {
                 case i_wr_addr {
                     ADDR_MSTATUS : mstatus  = i_wr_data;
