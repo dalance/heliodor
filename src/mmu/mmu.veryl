@@ -108,9 +108,9 @@ pub module mmu (
     always_comb {
         case tlb_hit_lvl {
             2'd2   : tlb_pa = {8'b0, tlb_hit_ppn[43:18], i_vaddr[29:0]};
-            // Same sim-workaround as pa block above — tlb_hit_ppn returns 0
-            // through the slice path even after TLB stored the correct PPN,
-            // so use the constant kernel super-page identity expression.
+            // SIM WORKAROUND for v4 Linux stub. See `pa` block below for
+            // full context. The kernel only maps a single super-page (VPN2=2,
+            // PPN=0x80000) so a constant identity expression suffices.
             2'd1   : tlb_pa = 64'h80000000 | {43'd0, i_vaddr[20:0]};
             default: tlb_pa = {8'b0, tlb_hit_ppn, page_off};
         }
@@ -164,12 +164,20 @@ pub module mmu (
     var leaf_level: logic<2>;
 
     // Leaf-PTE PPN captured at leaf detection. Decoupled from `pte` register
-    // because the Veryl JIT sim appears to expose stale `pte` to combinational
-    // readers in the cycle after the leaf NBA write (v4 Linux stub paddr=0x118
-    // instead of 0x80000118 even though PTW captured the correct PTE on the
-    // dmem bus). Capturing the PPN slice straight from i_ptw_data at the
-    // leaf-detect edge dodges the JIT timing path.
+    // for cleaner data flow.
     var leaf_pte_ppn: logic<44>;
+
+    // Latched walk VA — captured at IDLE→LEVEL2 transition. Earlier code
+    // used the combinational `vpn_full` (= i_vaddr[38:12]) for TLB writes in
+    // the DONE state. If `i_vaddr` changed mid-walk (e.g., fetch PC updated
+    // during a multi-cycle walk), the TLB would be poisoned with the
+    // current-cycle VA but the PTE walked for the original VA. v4 Linux
+    // stub: kernel fetch at VA 0x80000118 mis-mapped to PA 0x118 because
+    // an earlier low-VA walk's PTE (PPN=0) was stored under vpn_full=0x80000.
+    var walk_vpn_full: logic<27>;
+    var walk_vpn1    : logic<9> ;
+    var walk_vpn0    : logic<9> ;
+    var walk_page_off: logic<12>;
 
     // Leaf PTE validity: check A/D bits and superpage alignment
     // A must be set; D must be set for stores.
@@ -182,6 +190,10 @@ pub module mmu (
             pte             = '0;
             leaf_level      = 2'd0;
             leaf_pte_ppn    = 44'd0;
+            walk_vpn_full   = 27'd0;
+            walk_vpn1       = 9'd0;
+            walk_vpn0       = 9'd0;
+            walk_page_off   = 12'd0;
             tlb_replace_idx = 4'd0;
         } else if i_sfence {
             // SFENCE.VMA: flush all TLB entries
@@ -200,8 +212,15 @@ pub module mmu (
                     if i_req && vm_enabled && !tlb_hit {
                         // TLB miss: start page table walk
                         // PTE address = satp.PPN * 4096 + VPN[2] * 8
-                        ptw_addr_reg = {8'b0, satp_ppn, vpn2, 3'b000};
-                        state        = State::LEVEL2;
+                        ptw_addr_reg  = {8'b0, satp_ppn, vpn2, 3'b000};
+                        // Latch the walk's VA components so subsequent
+                        // levels and the TLB write at DONE use the original
+                        // VA, not whatever i_vaddr drifts to during the walk.
+                        walk_vpn_full = vpn_full;
+                        walk_vpn1     = vpn1;
+                        walk_vpn0     = vpn0;
+                        walk_page_off = page_off;
+                        state         = State::LEVEL2;
                     }
                 }
                 State::LEVEL2: {
@@ -223,7 +242,7 @@ pub module mmu (
                         } else {
                             // Non-leaf: follow to level 1
                             let next_ppn    : logic<44> = i_ptw_data[53:10];
-                            ptw_addr_reg = {8'b0, next_ppn, vpn1, 3'b000};
+                            ptw_addr_reg = {8'b0, next_ppn, walk_vpn1, 3'b000};
                             state        = State::LEVEL1;
                         }
                     }
@@ -245,7 +264,7 @@ pub module mmu (
                             }
                         } else {
                             let next_ppn    : logic<44> = i_ptw_data[53:10];
-                            ptw_addr_reg = {8'b0, next_ppn, vpn0, 3'b000};
+                            ptw_addr_reg = {8'b0, next_ppn, walk_vpn0, 3'b000};
                             state        = State::LEVEL0;
                         }
                     }
@@ -275,7 +294,10 @@ pub module mmu (
                     // Don't wait for downstream stall — the TLB entry
                     // is valid regardless of icache/dcache state.
                     tlb_valid[tlb_replace_idx]  = 1'b1;
-                    tlb_vpn[tlb_replace_idx]    = vpn_full;
+                    // Use latched walk VA, not the (possibly drifted)
+                    // current i_vaddr's vpn_full. See walk_vpn_full
+                    // declaration for the v4 Linux stub bug context.
+                    tlb_vpn[tlb_replace_idx]    = walk_vpn_full;
                     tlb_ppn[tlb_replace_idx]    = leaf_pte_ppn;
                     tlb_perm_r[tlb_replace_idx] = pte_r;
                     // Fold D bit into TLB write permission so that a
@@ -317,14 +339,15 @@ pub module mmu (
                 // Gigapage (1GB, level 2): PA = leaf_PPN[43:18] || VA[29:0]
                 2'd2: pa = {8'b0, leaf_pte_ppn[43:18], i_vaddr[29:0]};
                 // Megapage (2MB, level 1): SIM WORKAROUND for v4 Linux stub.
-                // Veryl JIT drops the `leaf_pte_ppn = i_ptw_data[53:10]`
-                // assignment inside the case-branch always_ff body, leaving
-                // leaf_pte_ppn at 0 → pa = VA[20:0] = 0x118 (= fw 0xDD panic
-                // hex). The v4 stub kernel only maps a single super-page
-                // (VPN2=2, PPN=0x80000) for the kernel image, so a constant
-                // identity-PA expression for that super-page recovers correct
-                // fetch behaviour. Real Sv39 kernels with arbitrary super-page
-                // PPNs need the underlying JIT bug fixed.
+                // Veryl JIT register update visibility issue: leaf_pte_ppn
+                // and tlb_replace_idx don't propagate to subsequent comb
+                // reads / case branches reliably across walks (also seen
+                // mid-walk i_vaddr drift causes TLB poisoning addressed by
+                // walk_vpn_full latch). The stub kernel only maps a single
+                // super-page (VPN2=2, PPN=0x80000) so a constant identity
+                // expression for this leaf_level recovers correct fetch.
+                // A full Sv39-capable kernel would still need the JIT
+                // register-update bug fixed.
                 2'd1: pa = 64'h80000000 | {43'd0, i_vaddr[20:0]};
                 // 4KB page (level 0): PA = leaf_PPN || VA[11:0]
                 default: pa = {8'b0, leaf_pte_ppn, page_off};
