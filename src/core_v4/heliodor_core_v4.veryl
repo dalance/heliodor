@@ -69,10 +69,11 @@ pub module heliodor_core_v4 #(
     // ============================================================
     // Fetch (Stage F)
     // ============================================================
-    var pc_q      : logic<64>;
-    var if_v_q    : logic    ;
-    var if_pc_q   : logic<64>;
-    var if_instr_q: logic<32>;
+    var pc_q       : logic<64>;
+    var if_v_q     : logic    ;
+    var if_pc_q    : logic<64>;
+    var if_instr_q : logic<32>;
+    var if_is_rvc_q: logic    ; // M7: was the fetched instr a 2-byte RVC
 
     // Forward-declared CSR outputs consumed by imem_mmu/dmem_mmu insts
     // below; driven by csr_v4 inst further down.
@@ -93,16 +94,21 @@ pub module heliodor_core_v4 #(
     var redirect_pc  : logic<64>;
     var stall_dr     : logic    ; // back-pressure from D/R
 
-    // M7.A: RVC fetch path.
-    // - pc_q is the logical PC (2-byte aligned).
-    // - imem_addr is pc_q[63:2]<<2 (word-aligned).
-    // - The fetched 32-bit word holds either 1 32-bit instr, 2 RVC instrs,
-    //   or 1 RVC + half of a straddled 32-bit (handled in M7.B).
-    // For M7.A only the non-straddling cases are wired:
-    //   pc[1]=0 + RVC: low halfword expanded, pc += 2
-    //   pc[1]=0 + 32b: full word, pc += 4
-    //   pc[1]=1 + RVC: high halfword expanded, pc += 2
-    //   pc[1]=1 + 32b: STRADDLE — flagged as illegal for now (M7.B fixes).
+    // M7: RVC fetch path with straddle handling.
+    // Normal: pc_q is the logical PC (2-byte aligned), imem fetches the
+    // word containing pc_q. The half-word at pc_q[1] is decoded as RVC
+    // (bits[1:0]!=11) or 32-bit (bits[1:0]==11).
+    // Straddle: when pc[1]=1 and high half is 32-bit, we need bytes from
+    // the NEXT word too. We enter STRADDLE state:
+    //   cycle T   : detect straddle, save high half (= low 16 bits of
+    //               the 32-bit instr) into straddle_low_q, set
+    //               straddle_q=1, do NOT fire if_v_q this cycle.
+    //   cycle T+1 : imem now fetches pc_q+2 (next word). The instr is
+    //               {rdata[15:0], straddle_low_q}. Fire if_v_q, advance
+    //               pc_q by 4, clear straddle_q.
+    var straddle_q    : logic    ;
+    var straddle_low_q: logic<16>;
+
     var c_inst_w     : logic<16>;
     var c_expanded_w : logic<32>;
     var c_illegal_w  : logic    ;
@@ -111,45 +117,66 @@ pub module heliodor_core_v4 #(
         o_instr  : c_expanded_w,
         o_illegal: c_illegal_w ,
     );
-    let _unused_c_illegal: logic = c_illegal_w;
 
-    // Pick halfword based on pc_q[1]
+    // Halfword pick for the non-straddle cases.
     let curr_hw    : logic<16> = if pc_q[1] ? i_imem_rdata[31:16] : i_imem_rdata[15:0];
     let curr_is_rvc: logic     = curr_hw[1:0] != 2'b11;
+    let needs_straddle: logic  = !straddle_q && pc_q[1] && !curr_is_rvc;
     assign c_inst_w = curr_hw;
 
-    // Choose final 32-bit instr fed to decode. If c_expander flags
-    // illegal (e.g. c.addi4spn imm=0 == all-zero RVC), substitute
-    // 0x00000000 so the decoder takes the illegal-trap path with the
-    // correct PC (mepc must point at the 2-byte RVC, not the 4-byte
-    // equivalent — handled by mepc += 2 in the handler if it inspects
-    // the byte at mepc, but for now the trap fires regardless).
-    let fetched_instr: logic<32> =
-        if curr_is_rvc && c_illegal_w ? 32'h0000_0000
-        : if curr_is_rvc               ? c_expanded_w
-        : if pc_q[1]                   ? 32'h0000_0000  // M7.B straddle
-        :                                i_imem_rdata;
-    let pc_advance: logic<64> = if curr_is_rvc ? 64'd2 : 64'd4;
+    // Straddled 32-bit: low half saved last cycle + new fetch's low half.
+    let straddled_instr: logic<32> = {i_imem_rdata[15:0], straddle_low_q};
 
-    // o_imem_addr / o_imem_ren driven below (after imem_mmu inst).
+    // Choose final 32-bit instr fed to decode.
+    let fetched_instr: logic<32> =
+        if straddle_q                  ? straddled_instr
+        : if curr_is_rvc && c_illegal_w ? 32'h0000_0000
+        : if curr_is_rvc                ? c_expanded_w
+        :                                 i_imem_rdata; // pc[1]=0 + 32b
+    let pc_advance: logic<64> =
+        if straddle_q   ? 64'd4
+        : if curr_is_rvc ? 64'd2
+        :                  64'd4;
+
+    // Fetch ready to deliver an instr to IF/ID this cycle.
+    let fetch_ready: logic = !needs_straddle;
+
+    // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
+    // imem_mmu's i_vaddr is the fetch address — advances ahead of pc_q
+    // by 2 during straddle so the next-word fetch lands cycle T+1.
 
     always_ff (clk, rst) {
         if_reset {
-            pc_q       = RESET_PC;
-            if_v_q     = 1'b0;
-            if_pc_q    = RESET_PC;
-            if_instr_q = 32'd0;
+            pc_q           = RESET_PC;
+            if_v_q         = 1'b0;
+            if_pc_q        = RESET_PC;
+            if_instr_q     = 32'd0;
+            if_is_rvc_q    = 1'b0;
+            straddle_q     = 1'b0;
+            straddle_low_q = 16'd0;
         } else {
             if redirect_fire {
-                pc_q       = redirect_pc;
-                if_v_q     = 1'b0;
-                if_pc_q    = redirect_pc;
-                if_instr_q = 32'd0;
-            } else if !stall_dr {
+                pc_q           = redirect_pc;
+                if_v_q         = 1'b0;
+                if_pc_q        = redirect_pc;
+                if_instr_q     = 32'd0;
+                if_is_rvc_q    = 1'b0;
+                straddle_q     = 1'b0;
+                straddle_low_q = 16'd0;
+            } else if needs_straddle {
+                // Latch high half, advance fetch addr next cycle; hold pc_q.
+                straddle_q     = 1'b1;
+                straddle_low_q = curr_hw;
+                if_v_q         = 1'b0; // no instr ready this cycle
+            } else if !stall_dr && fetch_ready {
                 if_v_q     = 1'b1;
                 if_pc_q    = pc_q;
                 if_instr_q = fetched_instr;
+                // M7: track RVC-origin for the link register (pc+2 vs pc+4).
+                // Straddle resolves a 32-bit, so is_rvc=0 in that case.
+                if_is_rvc_q = !straddle_q && curr_is_rvc;
                 pc_q       = pc_q + pc_advance;
+                straddle_q = 1'b0;
             }
         }
     }
@@ -166,10 +193,13 @@ pub module heliodor_core_v4 #(
     var imem_fault_w   : logic    ;
     var imem_ptw_addr_w: logic<64>;
     var imem_ptw_req_w : logic    ;
+    // Fetch addr advances by 2 during straddle so the next word lands
+    // on the next cycle; in normal cycles it tracks pc_q.
+    let fetch_vaddr: logic<64> = if straddle_q ? pc_q + 64'd2 : pc_q;
     inst u_imem_mmu: imem_mmu (
         clk            ,
         rst            ,
-        i_vaddr        : pc_q              ,
+        i_vaddr        : fetch_vaddr       ,
         i_req          : 1'b1              ,
         o_paddr        : imem_paddr_w      ,
         o_valid        : imem_valid_w      ,
@@ -204,9 +234,10 @@ pub module heliodor_core_v4 #(
     // ============================================================
     var dec_op: DecodedOp;
     inst u_dec: decoder_v4 (
-        i_pc   : if_pc_q   ,
-        i_instr: if_instr_q,
-        o_op   : dec_op    ,
+        i_pc    : if_pc_q    ,
+        i_instr : if_instr_q ,
+        i_is_rvc: if_is_rvc_q,
+        o_op    : dec_op     ,
     );
 
     // ============================================================
