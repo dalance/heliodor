@@ -159,6 +159,7 @@ pub module heliodor_core_v4 #(
         rob_alloc_entry.is_ecall       = dec_op.is_ecall;
         rob_alloc_entry.is_ebreak      = dec_op.is_ebreak;
         rob_alloc_entry.is_mret        = dec_op.is_mret;
+        rob_alloc_entry.is_amo         = dec_op.is_amo;
     }
 
     // RenamedOp
@@ -184,6 +185,8 @@ pub module heliodor_core_v4 #(
     var iq_iss_rd_pdst : logic<PRF_INT_W>;
     var iq_iss_rob_idx : logic<ROB_IDX_W>;
     var iq_iss_is_load : logic;
+    var iq_iss_is_amo    : logic    ;
+    var iq_iss_amo_funct5: logic<5> ;
     var rob_has_pending_store: logic;
 
     var prf_rs1_data: logic<64>;
@@ -195,6 +198,9 @@ pub module heliodor_core_v4 #(
     var csr_mtvec   : logic<64>;
     var csr_mepc    : logic<64>;
 
+    var rsv_valid_q: logic    ;
+    var rsv_addr_q : logic<64>;
+
     inst u_alu: alu_wrap_v4 (
         i_issue_valid  : iq_issue_valid ,
         i_issue_op     : iq_issue_op    ,
@@ -204,6 +210,10 @@ pub module heliodor_core_v4 #(
         i_rs2_data     : prf_rs2_data   ,
         i_load_data    : i_dmem_rdata   ,
         i_csr_data     : csr_rd_data    ,
+        i_rsv_valid    : rsv_valid_q    ,
+        i_rsv_addr     : rsv_addr_q     ,
+        i_is_amo       : iq_iss_is_amo    ,
+        i_amo_funct5   : iq_iss_amo_funct5,
         o_cdb          : cdb            ,
     );
 
@@ -288,6 +298,8 @@ pub module heliodor_core_v4 #(
         o_issue_rd_pdst     : iq_iss_rd_pdst ,
         o_issue_rob_idx     : iq_iss_rob_idx ,
         o_issue_is_load     : iq_iss_is_load ,
+        o_issue_is_amo      : iq_iss_is_amo    ,
+        o_issue_amo_funct5  : iq_iss_amo_funct5,
         i_issue_ack         : iq_issue_ack  ,
         i_flush             : redirect_fire ,
         i_block_loads       : rob_has_pending_store, // M2 conservative gate
@@ -506,8 +518,42 @@ pub module heliodor_core_v4 #(
     // ============================================================
     // LOAD read: drive dmem read address when an issued op is a LOAD.
     // Address comes from rs1 + imm (same as the alu_wrap AGU).
-    let agu_addr_iss: logic<64> = prf_rs1_data + iq_issue_op.base.imm;
-    let issue_is_load : logic = iq_issue_valid && iq_issue_op.base.is_load;
+    // M5.A AMO: address = rs1 alone (no immediate). LR / AMO* need a
+    // read at issue time; SC is write-only at commit time.
+    // Use per-field outputs from iq_int (struct-field READ has sim bug).
+    let amo_is_sc_iss : logic = iq_iss_amo_funct5 == 5'b00011;
+    let agu_imm_iss   : logic<64> = if iq_iss_is_amo ? 64'd0 : iq_issue_op.base.imm;
+    let agu_addr_iss  : logic<64> = prf_rs1_data + agu_imm_iss;
+    let issue_amo_read: logic = iq_issue_valid && iq_iss_is_amo && !amo_is_sc_iss;
+    let issue_is_load : logic = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_read;
+
+    // ============================================================
+    // M5.A LR/SC reservation (single-hart, simplest).
+    // - LR at issue: set valid + addr to agu_addr_iss
+    // - SC at issue: clear (whether matched or not, atomicity)
+    // - Other STORE / AMO at issue: clear if address matches
+    // - Trap / MRET / redirect: clear (Linux assumption)
+    // ============================================================
+    let issue_is_lr     : logic = iq_issue_valid && iq_iss_is_amo && iq_iss_amo_funct5 == 5'b00010;
+    let issue_is_sc     : logic = iq_issue_valid && iq_iss_is_amo && iq_iss_amo_funct5 == 5'b00011;
+    let issue_is_amo    : logic = iq_issue_valid && iq_iss_is_amo;
+    let issue_is_st     : logic = iq_issue_valid && iq_issue_op.base.is_store;
+    let issue_addr_match: logic = rsv_valid_q && rsv_addr_q == agu_addr_iss;
+    always_ff (clk, rst) {
+        if_reset {
+            rsv_valid_q = 1'b0;
+            rsv_addr_q  = 64'd0;
+        } else if redirect_fire_q || commit_trap || commit_mret {
+            rsv_valid_q = 1'b0;
+        } else if issue_is_lr {
+            rsv_valid_q = 1'b1;
+            rsv_addr_q  = agu_addr_iss;
+        } else if issue_is_sc {
+            rsv_valid_q = 1'b0;
+        } else if (issue_is_st || issue_is_amo) && issue_addr_match {
+            rsv_valid_q = 1'b0;
+        }
+    }
 
     // STORE write fires at commit when the head entry is a store.
     let commit_store_fire: logic = rob_commit_valid && c_is_store && !c_illegal;

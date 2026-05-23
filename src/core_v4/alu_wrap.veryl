@@ -39,6 +39,18 @@ pub module alu_wrap_v4 #(
     // sampled at issue time. CSR write side-band lives in o_cdb.
     i_csr_data : input logic<64>,
 
+    // M5.A LR/SC reservation (single-hart). When SC is issued and
+    // (rsv_valid && rsv_addr == agu_addr) the SC commits the STORE and
+    // returns 0 to rd; otherwise no STORE is committed and rd = 1.
+    i_rsv_valid: input logic    ,
+    i_rsv_addr : input logic<64>,
+
+    // M5.A per-field AMO inputs (bypass cross-module struct-port sim
+    // bug): authoritative is_amo / amo_funct5 from iq_int per-field
+    // outputs, plus is_amo_w derived from mem_funct3.
+    i_is_amo    : input logic   ,
+    i_amo_funct5: input logic<5>,
+
     // CDB output (1-wide M1)
     o_cdb: output pipeline_v4_pkg::CdbBus,
 ) {
@@ -108,7 +120,10 @@ pub module alu_wrap_v4 #(
     // load / S-type store). For STORE the immediate decode path is
     // S-type but imm_gen already provides the correct sign-extended
     // value.
-    let agu_addr: logic<64> = i_rs1_data + i_issue_op.base.imm;
+    // M5.A AMO: address = rs1 directly (no immediate). We override the
+    // immediate component to zero when is_amo.
+    let agu_imm : logic<64> = if i_is_amo ? 64'd0 : i_issue_op.base.imm;
+    let agu_addr: logic<64> = i_rs1_data + agu_imm;
 
     // LOAD funct3 sub-decode (sign / zero extend, byte / half / word / dword).
     let f3        : logic<3>  = i_issue_op.base.mem_funct3;
@@ -148,6 +163,78 @@ pub module alu_wrap_v4 #(
     }
 
     // ============================================================
+    // M5.A: AMO compute. Old value = i_load_data (W: sign-ext low 32;
+    // D: full 64). New value depends on amo_funct5:
+    //   AMOSWAP=00001: new = rs2
+    //   AMOADD =00000: new = old + rs2
+    //   AMOXOR =00100: new = old ^ rs2
+    //   AMOAND =01100: new = old & rs2
+    //   AMOOR  =01000: new = old | rs2
+    //   AMOMIN =10000: new = min_signed(old, rs2)
+    //   AMOMAX =10100: new = max_signed(old, rs2)
+    //   AMOMINU=11000: new = min_unsigned(old, rs2)
+    //   AMOMAXU=11100: new = max_unsigned(old, rs2)
+    //   LR     =00010: just load (no write at commit)
+    //   SC     =00011: write rs2 (single-hart always succeeds)
+    // For .W variants compute happens on low 32 bits; result is truncated
+    // to 32 on STORE side; rd gets sign-extended 32-bit old.
+    // ============================================================
+    let amo_w_addr_off: logic = agu_addr[2]; // .W can address either half of 8B word
+    let amo_w_old_raw : logic<32> =
+        if amo_w_addr_off ? i_load_data[63:32] : i_load_data[31:0];
+    let amo_w_old_sext: logic<32> = if amo_w_old_raw[31] ? 32'hffff_ffff : 32'd0;
+    // amo_is_w derived from mem_funct3 (010=.W, 011=.D).
+    let amo_is_w_local: logic = i_issue_op.base.mem_funct3 == 3'b010;
+    let amo_old_64    : logic<64> =
+        if amo_is_w_local ? {amo_w_old_sext, amo_w_old_raw} : i_load_data;
+    let amo_b_32      : logic<32> = i_rs2_data[31:0];
+    let amo_b_64      : logic<64> = i_rs2_data;
+    let amo_old_32    : logic<32> = amo_w_old_raw;
+
+    let amo_lt_w : logic = $signed(amo_old_32) <: $signed(amo_b_32);
+    let amo_lt_d : logic = $signed(amo_old_64) <: $signed(amo_b_64);
+    let amo_ltu_w: logic = amo_old_32 <: amo_b_32;
+    let amo_ltu_d: logic = amo_old_64 <: amo_b_64;
+
+    var amo_new_d: logic<64>;
+    var amo_new_w: logic<32>;
+    always_comb {
+        case i_amo_funct5 {
+            5'b00001: { amo_new_d = amo_b_64;                       amo_new_w = amo_b_32; }            // SWAP
+            5'b00000: { amo_new_d = amo_old_64 + amo_b_64;          amo_new_w = amo_old_32 + amo_b_32; } // ADD
+            5'b00100: { amo_new_d = amo_old_64 ^ amo_b_64;          amo_new_w = amo_old_32 ^ amo_b_32; } // XOR
+            5'b01100: { amo_new_d = amo_old_64 & amo_b_64;          amo_new_w = amo_old_32 & amo_b_32; } // AND
+            5'b01000: { amo_new_d = amo_old_64 | amo_b_64;          amo_new_w = amo_old_32 | amo_b_32; } // OR
+            5'b10000: { amo_new_d = if amo_lt_d  ? amo_old_64 : amo_b_64; amo_new_w = if amo_lt_w  ? amo_old_32 : amo_b_32; } // MIN
+            5'b10100: { amo_new_d = if amo_lt_d  ? amo_b_64 : amo_old_64; amo_new_w = if amo_lt_w  ? amo_b_32 : amo_old_32; } // MAX
+            5'b11000: { amo_new_d = if amo_ltu_d ? amo_old_64 : amo_b_64; amo_new_w = if amo_ltu_w ? amo_old_32 : amo_b_32; } // MINU
+            5'b11100: { amo_new_d = if amo_ltu_d ? amo_b_64 : amo_old_64; amo_new_w = if amo_ltu_w ? amo_b_32 : amo_old_32; } // MAXU
+            5'b00011: { amo_new_d = amo_b_64;                       amo_new_w = amo_b_32; }            // SC: data = rs2
+            default : { amo_new_d = amo_b_64;                       amo_new_w = amo_b_32; }
+        }
+    }
+    // 64-bit STORE data for AMO: leave un-positioned. The commit-time
+    // wstrb generator shifts the wdata by byte_off*8, so we must NOT
+    // pre-shift here (otherwise double-shift loses bits). For .W just
+    // duplicate the new 32-bit value in both halves so whichever half
+    // wstrb selects has the right value; for .D the full 64-bit value.
+    let amo_store_data_64: logic<64> =
+        if amo_is_w_local ? {amo_new_w, amo_new_w}
+        :                   amo_new_d;
+
+    // AMO/LR rd value = old value (sign-ext for .W). SC rd value =
+    // 0 (success) when reservation valid and address matches, else 1.
+    let amo_is_sc      : logic = i_amo_funct5 == 5'b00011;
+    let amo_is_lr      : logic = i_amo_funct5 == 5'b00010;
+    let sc_match       : logic = i_rsv_valid && i_rsv_addr == agu_addr;
+    let sc_wb          : logic<64> = if sc_match ? 64'd0 : 64'd1;
+    let amo_wb         : logic<64> = if amo_is_sc ? sc_wb : amo_old_64;
+
+    // Whether to drive a STORE at commit: AMO* (not LR/SC) always;
+    // SC only if reservation matched.
+    let amo_commit_store : logic = i_is_amo && !amo_is_lr && (!amo_is_sc || sc_match);
+
+    // ============================================================
     // M4: CSR compute. csr_operand = csr_imm ? rs1_arch[4:0] : rs1
     // csrrw: new = operand
     // csrrs: new = csr | operand
@@ -167,10 +254,12 @@ pub module alu_wrap_v4 #(
         }
     }
 
-    // Result data: CSR writes old CSR value to rd; JAL/JALR write
-    // pc+4; LOAD writes load_data_sel; everything else writes alu_out.
+    // Result data: AMO/LR/SC writes amo_wb; CSR writes old CSR value
+    // to rd; JAL/JALR write pc+4; LOAD writes load_data_sel; everything
+    // else writes alu_out.
     let wb_data: logic<64> =
-        if i_issue_op.base.is_csr  ? i_csr_data
+        if i_is_amo  ? amo_wb
+        : if i_issue_op.base.is_csr  ? i_csr_data
         : if i_issue_op.base.is_load ? load_data_sel
         : if i_issue_op.base.wb_pc4  ? pc_plus4
         :                              alu_out;
@@ -186,9 +275,14 @@ pub module alu_wrap_v4 #(
     assign o_cdb.rob_idx      = i_issue_rob_idx;
     assign o_cdb.mispredict   = i_issue_valid && mispred;
     assign o_cdb.redirect_pc  = resolved_target;
-    assign o_cdb.is_store     = i_issue_valid && i_issue_op.base.is_store;
+    // AMO/SC commit a STORE; LR does not. Plain LOAD/STORE goes through
+    // is_store as before.
+    assign o_cdb.is_store     = i_issue_valid && (i_issue_op.base.is_store || amo_commit_store);
     assign o_cdb.store_addr   = agu_addr;
-    assign o_cdb.store_data   = i_rs2_data;
+    // For AMO/SC: store the computed amo_store_data_64; otherwise rs2.
+    assign o_cdb.store_data   = if i_is_amo ? amo_store_data_64 : i_rs2_data;
+    // For AMO: funct3 carries width — .W (010) vs .D (011) — matches
+    // SW/SD encoding so the existing wstrb generator handles it.
     assign o_cdb.store_funct3 = f3;
     assign o_cdb.is_csr       = i_issue_valid && i_issue_op.base.is_csr;
     assign o_cdb.csr_addr     = i_issue_op.base.csr_addr;
