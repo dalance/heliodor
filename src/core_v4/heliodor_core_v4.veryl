@@ -113,10 +113,22 @@ pub module heliodor_core_v4 #(
     var csr_priv    : csr_pkg::PrivLevel;
     var csr_sum     : logic;
     var csr_mxr     : logic;
+    var csr_mprv    : logic;
+    var csr_mpp     : logic<2>;
+    // Effective priv for dmem accesses (MPRV-aware). M-mode loads/stores
+    // with MPRV=1 use mstatus.MPP as the priv level for translation.
+    let dmem_eff_priv: csr_pkg::PrivLevel =
+        if csr_mprv && csr_priv == csr_pkg::PrivLevel::MACHINE ? (
+            if csr_mpp == 2'b11 ? csr_pkg::PrivLevel::MACHINE
+            : if csr_mpp == 2'b01 ? csr_pkg::PrivLevel::SUPERVISOR
+            :                       csr_pkg::PrivLevel::USER
+        ) : csr_priv;
 
     // M5.D.2: forward declaration for IQ-issue/CDB stall gate; driven
     // by the dmem_mmu inst near end of file. Bare mode keeps this at 0.
     var dmem_mmu_busy: logic;
+    var dmem_mmu_fault: logic;
+    var dmem_mmu_fault_s: logic;
     // M5.D: medeleg needed by trap_to_s computation in commit stage.
     var csr_medeleg_w: logic<64>;
     // M5.D: SFENCE.VMA commit pulse (1-cycle), drives mmu i_sfence inputs.
@@ -404,6 +416,8 @@ pub module heliodor_core_v4 #(
         i_rs2_data     : prf_rs2_data   ,
         i_load_data    : i_dmem_rdata   ,
         i_load_data_next: i_dmem_rdata_next,
+        i_dmem_fault   : dmem_mmu_fault   ,
+        i_dmem_fault_s : dmem_mmu_fault_s ,
         i_csr_data     : csr_rd_data    ,
         i_rsv_valid    : rsv_valid_q    ,
         i_rsv_addr     : rsv_addr_q     ,
@@ -545,6 +559,9 @@ pub module heliodor_core_v4 #(
     var c_is_sret     : logic    ;
     var c_is_sfence   : logic    ;
     var c_is_ifault   : logic    ;
+    var c_is_lfault   : logic    ;
+    var c_is_sfault   : logic    ;
+    var c_fault_vaddr : logic<64>;
 
     let rob_commit_ack: logic = rob_commit_valid;
 
@@ -577,6 +594,9 @@ pub module heliodor_core_v4 #(
         i_cdb_csr_addr    : cdb.csr_addr     ,
         i_cdb_csr_wdata   : cdb.csr_wdata    ,
         i_cdb_csr_illegal : cdb.csr_illegal  ,
+        i_cdb_is_lfault   : cdb.is_lfault    ,
+        i_cdb_is_sfault   : cdb.is_sfault    ,
+        i_cdb_fault_vaddr : cdb.fault_vaddr  ,
         o_commit_valid   : rob_commit_valid,
         o_commit_entry   : rob_commit_entry,
         o_commit_pc          : c_pc         ,
@@ -602,6 +622,9 @@ pub module heliodor_core_v4 #(
         o_commit_is_sret     : c_is_sret     ,
         o_commit_is_sfence   : c_is_sfence   ,
         o_commit_is_ifault   : c_is_ifault   ,
+        o_commit_is_lfault   : c_is_lfault   ,
+        o_commit_is_sfault   : c_is_sfault   ,
+        o_commit_fault_vaddr : c_fault_vaddr ,
         o_commit_idx     : rob_commit_idx  ,
         i_commit_ack     : rob_commit_ack  ,
         i_redirect_fire  : redirect_fire   ,
@@ -632,7 +655,7 @@ pub module heliodor_core_v4 #(
     // ============================================================
     // M4 trap entry decisions (commit-time, registered into redirect)
     // ============================================================
-    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak);
+    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault);
     // M8.C: IRQ trap fires as soon as something is committing AND no
     // synchronous exception is firing (excp takes priority). Without
     // anything committing the trap can also fire if the pipeline is
@@ -652,6 +675,10 @@ pub module heliodor_core_v4 #(
     always_comb {
         if c_is_ifault {
             excp_cause = 64'd12; // instruction page fault
+        } else if c_is_lfault {
+            excp_cause = 64'd13; // load page fault
+        } else if c_is_sfault {
+            excp_cause = 64'd15; // store/AMO page fault
         } else if c_illegal {
             excp_cause = 64'd2;  // illegal instruction
         } else if c_is_ebreak {
@@ -688,7 +715,9 @@ pub module heliodor_core_v4 #(
         i_trap_fire : commit_trap              ,
         i_trap_pc   : c_pc                     ,
         i_trap_cause: trap_cause               ,
-        i_trap_tval : 64'd0                    ,
+        // mtval/stval for page faults carry the faulting VA; other
+        // exception kinds leave it at 0 for now.
+        i_trap_tval : if (c_is_lfault || c_is_sfault) ? c_fault_vaddr : 64'd0,
         i_mret_fire : commit_mret              ,
         o_mtvec     : csr_mtvec                ,
         o_mepc      : csr_mepc                 ,
@@ -700,6 +729,8 @@ pub module heliodor_core_v4 #(
         o_priv        : csr_priv                ,
         o_mstatus_sum : csr_sum                 ,
         o_mstatus_mxr : csr_mxr                 ,
+        o_mstatus_mprv: csr_mprv                ,
+        o_mstatus_mpp : csr_mpp                 ,
         i_sret_fire   : commit_sret             ,
         i_trap_to_s   : trap_to_s               ,
         // M8.C: external IRQ pins from harness (tie low when unused).
@@ -873,9 +904,8 @@ pub module heliodor_core_v4 #(
     // PTW shared with imem in M5.D.
     // ============================================================
     var dmem_mmu_rdata : logic<64>;
-    // dmem_mmu_busy declared near pc_q for forward use by iq_int gate
-    var dmem_mmu_fault : logic    ;
-    var dmem_mmu_fault_s: logic   ;
+    // dmem_mmu_busy / dmem_mmu_fault / dmem_mmu_fault_s declared up front
+    // for forward use by iq_int gate and alu_wrap fault inputs.
     var dmem_mmu_rdv   : logic    ;
     // Internal dmem signals from dmem_mmu, muxed below with imem PTW.
     var dmu_dmem_addr  : logic<64>;
@@ -899,7 +929,10 @@ pub module heliodor_core_v4 #(
         o_dmem_ren      : dmu_dmem_ren   ,
         o_dmem_wstrb    : dmu_dmem_wstrb ,
         i_satp          : csr_satp       ,
-        i_priv          : csr_priv       ,
+        // Effective priv for dmem accesses: when mstatus.MPRV is set,
+        // loads/stores use mstatus.MPP's priv level for translation
+        // (RISC-V priv spec). Used by rv64si-dirty etc.
+        i_priv          : dmem_eff_priv  ,
         i_sum           : csr_sum        ,
         i_mxr           : csr_mxr        ,
         o_busy          : dmem_mmu_busy  ,
