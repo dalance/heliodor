@@ -1,0 +1,217 @@
+// Phase 7 v4 Linux stub boot scaffolding.
+//
+// Memory map (matches v1):
+//   PA 0x00000000 : Firmware ROM (16 KB, linux_boot_fw.hex)
+//   PA 0x02000000 : CLINT (internal)
+//   PA 0x10000000 : UART  (internal stub — prints via $write)
+//   PA 0x80000000 : DRAM  (256 KB, kernel + DTB from linux_dram.hex)
+//
+// This is a wiring scaffold: it instantiates heliodor_core_v4 with a
+// memory map that mirrors the v1 stub harness, ties CLINT timer/sw
+// irqs into the core, and exposes arch_shadow[3] (= x3) so a boot
+// completes when the SBI SRST shutdown stub writes 0xAA there. It is
+// expected to NOT yet reach SBI shutdown — multiple v4 capabilities
+// still need work (Sv39 cross-page PTW, dcache, real WFI, etc.).
+// Goal of this scaffold is to provide the surface area for incremental
+// v4 boot debug.
+module test_v4_linux_stub_harness (
+    clk   : input  clock    ,
+    rst   : input  reset    ,
+    o_pass: output logic    ,
+    o_r3  : output logic<64>,
+) {
+    var imem_addr      : logic<64>     ;
+    var imem_rdata     : logic<32>     ;
+    var imem_ren       : logic         ;
+    var dmem_addr      : logic<64>     ;
+    var dmem_wdata     : logic<64>     ;
+    var dmem_rdata     : logic<64>     ;
+    var dmem_rdata_next: logic<64>     ;
+    var dmem_wen       : logic         ;
+    var dmem_ren       : logic         ;
+    var dmem_wstrb     : logic<8>      ;
+    var dmem_wdata_hi  : logic<64>     ;
+    var dmem_wstrb_hi  : logic<8>      ;
+    var dbg_regs       : logic<64> [32];
+    var dbg_pc         : logic<64>     ;
+    var ret_v          : logic         ;
+    var ret_pc         : logic<64>     ;
+    var ret_rdv        : logic         ;
+    var ret_rd         : logic<5>      ;
+    var ret_data       : logic<64>     ;
+    var dbg_rename_cnt : logic<32>     ;
+    var dbg_cdb_cnt    : logic<32>     ;
+    var dbg_rob_size   : logic<8>      ;
+    var dbg_if_v       : logic         ;
+    var dbg_if_instr   : logic<32>     ;
+    var dbg_stall_dr   : logic         ;
+    var dbg_head_valid : logic         ;
+    var dbg_head_rw    : logic         ;
+    var dbg_head_il    : logic         ;
+    var dbg_r_alloc    : logic<32>     ;
+    var dbg_r_cdb      : logic<32>     ;
+    var dbg_r_commit   : logic<32>     ;
+    var dbg_r_head     : logic<6>      ;
+    var dbg_r_tail     : logic<6>      ;
+
+    // CLINT signals
+    var clint_rdata    : logic<64>     ;
+    var clint_timer_irq: logic [1]     ;
+    var clint_sw_irq   : logic [1]     ;
+    var clint_mtime    : logic<64>     ;
+
+    inst dut: heliodor_core_v4 #(
+        RESET_PC: 64'h00000000,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr        : imem_addr      ,
+        i_imem_rdata       : imem_rdata     ,
+        o_imem_ren         : imem_ren       ,
+        o_dmem_addr        : dmem_addr      ,
+        o_dmem_wdata       : dmem_wdata     ,
+        i_dmem_rdata       : dmem_rdata     ,
+        i_dmem_rdata_next  : dmem_rdata_next,
+        o_dmem_wen         : dmem_wen       ,
+        o_dmem_ren         : dmem_ren       ,
+        o_dmem_wstrb       : dmem_wstrb     ,
+        o_dmem_wdata_hi    : dmem_wdata_hi  ,
+        o_dmem_wstrb_hi    : dmem_wstrb_hi  ,
+        o_dbg_pc           : dbg_pc     ,
+        o_dbg_regs         : dbg_regs   ,
+        o_dbg_retire_v_a   : ret_v      ,
+        o_dbg_retire_pc_a  : ret_pc     ,
+        o_dbg_retire_rd_v_a: ret_rdv    ,
+        o_dbg_retire_rd_a  : ret_rd     ,
+        o_dbg_retire_data_a: ret_data   ,
+        o_dbg_rename_cnt   : dbg_rename_cnt ,
+        o_dbg_cdb_cnt      : dbg_cdb_cnt    ,
+        o_dbg_rob_size     : dbg_rob_size   ,
+        o_dbg_if_v         : dbg_if_v       ,
+        o_dbg_if_instr     : dbg_if_instr   ,
+        o_dbg_stall_dr     : dbg_stall_dr   ,
+        o_dbg_head_valid   : dbg_head_valid ,
+        o_dbg_head_rw      : dbg_head_rw    ,
+        o_dbg_head_illegal : dbg_head_il    ,
+        o_dbg_rob_alloc_cnt: dbg_r_alloc    ,
+        o_dbg_rob_cdb_cnt  : dbg_r_cdb      ,
+        o_dbg_rob_commit_cnt: dbg_r_commit  ,
+        o_dbg_rob_head     : dbg_r_head     ,
+        o_dbg_rob_tail     : dbg_r_tail     ,
+    );
+
+    // Firmware ROM: 16 KB
+    var fw_rom: logic<32> [4096];
+    // DRAM: 256 KB
+    var dram: logic<32> [65536];
+    initial {
+        $readmemh("test/hex/linux_boot_fw.hex", fw_rom);
+        $readmemh("test/hex/linux_dram.hex", dram);
+    }
+
+    let imem_in_fw : logic = imem_addr[31:14] == 18'd0;
+    let in_fw      : logic = dmem_addr[31:14] == 18'd0;
+    let in_dram    : logic = dmem_addr[31];
+    let in_uart    : logic = dmem_addr[31:28] == 4'h1;
+    let in_clint   : logic = dmem_addr[31:24] == 8'h02;
+
+    let dram_imem_idx: logic<16> = imem_addr[17:2];
+    let fw_imem_idx  : logic<12> = imem_addr[13:2];
+    assign imem_rdata = if imem_in_fw ? fw_rom[fw_imem_idx]
+                        : if imem_addr[31] ? dram[dram_imem_idx]
+                        : 32'd0;
+
+    let dram_dmem_lo : logic<16> = {dmem_addr[17:3], 1'b0};
+    let dram_dmem_hi : logic<16> = {dmem_addr[17:3], 1'b1};
+    let dram_dmem_nx_lo: logic<16> = {(dmem_addr[17:3] + 15'd1), 1'b0};
+    let dram_dmem_nx_hi: logic<16> = {(dmem_addr[17:3] + 15'd1), 1'b1};
+    let fw_dmem_lo  : logic<12> = {dmem_addr[13:3], 1'b0};
+    let fw_dmem_hi  : logic<12> = {dmem_addr[13:3], 1'b1};
+
+    // dmem read: DRAM / firmware ROM / CLINT (UART read returns 0 stub)
+    assign dmem_rdata = if in_dram ? {dram[dram_dmem_hi], dram[dram_dmem_lo]}
+                        : if in_fw   ? {fw_rom[fw_dmem_hi], fw_rom[fw_dmem_lo]}
+                        : if in_clint ? clint_rdata
+                        : 64'd0;
+    assign dmem_rdata_next = if in_dram ? {dram[dram_dmem_nx_hi], dram[dram_dmem_nx_lo]}
+                             : 64'd0;
+
+    // CLINT instance (1 hart)
+    inst u_clint: clint #(
+        N_HARTS: 1,
+    ) (
+        clk            ,
+        rst            ,
+        i_addr     : dmem_addr[15:0],
+        i_wdata    : dmem_wdata     ,
+        i_wen      : dmem_wen && in_clint,
+        i_ren      : dmem_ren && in_clint,
+        o_rdata    : clint_rdata    ,
+        o_timer_irq: clint_timer_irq,
+        o_sw_irq   : clint_sw_irq   ,
+        o_mtime    : clint_mtime    ,
+    );
+    let _unused_mtime: logic<64> = clint_mtime;
+    let _unused_t_irq: logic = clint_timer_irq[0];
+    let _unused_s_irq: logic = clint_sw_irq[0];
+
+    // dmem write
+    always_ff (clk, rst) {
+        if_reset {} else if dmem_wen && in_dram {
+            if dmem_wstrb[0] { dram[dram_dmem_lo][7:0]   = dmem_wdata[7:0];   }
+            if dmem_wstrb[1] { dram[dram_dmem_lo][15:8]  = dmem_wdata[15:8];  }
+            if dmem_wstrb[2] { dram[dram_dmem_lo][23:16] = dmem_wdata[23:16]; }
+            if dmem_wstrb[3] { dram[dram_dmem_lo][31:24] = dmem_wdata[31:24]; }
+            if dmem_wstrb[4] { dram[dram_dmem_hi][7:0]   = dmem_wdata[39:32]; }
+            if dmem_wstrb[5] { dram[dram_dmem_hi][15:8]  = dmem_wdata[47:40]; }
+            if dmem_wstrb[6] { dram[dram_dmem_hi][23:16] = dmem_wdata[55:48]; }
+            if dmem_wstrb[7] { dram[dram_dmem_hi][31:24] = dmem_wdata[63:56]; }
+            if dmem_wstrb_hi[0] { dram[dram_dmem_nx_lo][7:0]   = dmem_wdata_hi[7:0];   }
+            if dmem_wstrb_hi[1] { dram[dram_dmem_nx_lo][15:8]  = dmem_wdata_hi[15:8];  }
+            if dmem_wstrb_hi[2] { dram[dram_dmem_nx_lo][23:16] = dmem_wdata_hi[23:16]; }
+            if dmem_wstrb_hi[3] { dram[dram_dmem_nx_lo][31:24] = dmem_wdata_hi[31:24]; }
+            if dmem_wstrb_hi[4] { dram[dram_dmem_nx_hi][7:0]   = dmem_wdata_hi[39:32]; }
+            if dmem_wstrb_hi[5] { dram[dram_dmem_nx_hi][15:8]  = dmem_wdata_hi[47:40]; }
+            if dmem_wstrb_hi[6] { dram[dram_dmem_nx_hi][23:16] = dmem_wdata_hi[55:48]; }
+            if dmem_wstrb_hi[7] { dram[dram_dmem_nx_hi][31:24] = dmem_wdata_hi[63:56]; }
+        } else if dmem_wen && in_uart {
+            if dmem_wstrb[0] { $write("%c", dmem_wdata[7:0]); }
+            if dmem_wstrb[1] { $write("%c", dmem_wdata[15:8]); }
+            if dmem_wstrb[2] { $write("%c", dmem_wdata[23:16]); }
+            if dmem_wstrb[3] { $write("%c", dmem_wdata[31:24]); }
+            if dmem_wstrb[4] { $write("%c", dmem_wdata[39:32]); }
+            if dmem_wstrb[5] { $write("%c", dmem_wdata[47:40]); }
+            if dmem_wstrb[6] { $write("%c", dmem_wdata[55:48]); }
+            if dmem_wstrb[7] { $write("%c", dmem_wdata[63:56]); }
+        }
+    }
+
+    assign o_r3   = dbg_regs[3];
+    assign o_pass = dbg_regs[3] == 64'hAA;
+}
+
+#[test(test_v4_linux_stub)]
+#[ignore]
+module test_v4_linux_stub {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen(clk);
+
+    var pass: logic    ;
+    var r3  : logic<64>;
+
+    inst harness: test_v4_linux_stub_harness (
+        clk   : clk ,
+        rst   : rst ,
+        o_pass: pass,
+        o_r3  : r3  ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next  (500000);
+        $display  ("v4 linux stub: x3=%h pass=%b", r3, pass);
+        $assert   (pass, "v4 Linux stub boot: expected x3=0xAA (SBI SRST shutdown)");
+        $display  ("v4 Linux stub boot PASS");
+        $finish   ();
+    }
+}
