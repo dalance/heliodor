@@ -74,6 +74,13 @@ pub module heliodor_core_v4 #(
     var if_pc_q   : logic<64>;
     var if_instr_q: logic<32>;
 
+    // Forward-declared CSR outputs consumed by imem_mmu/dmem_mmu insts
+    // below; driven by csr_v4 inst further down.
+    var csr_satp    : logic<64>;
+    var csr_priv    : csr_pkg::PrivLevel;
+    var csr_sum     : logic;
+    var csr_mxr     : logic;
+
     var redirect_fire: logic    ;
     var redirect_pc  : logic<64>;
     var stall_dr     : logic    ; // back-pressure from D/R
@@ -99,7 +106,42 @@ pub module heliodor_core_v4 #(
         }
     }
 
-    assign o_imem_addr = pc_q;
+    // ============================================================
+    // M5.C: imem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
+    // pure passthrough; o_busy stays 0 and o_paddr == i_vaddr. PTW
+    // port tied off for M5.C; M5.D adds Sv39 + dmem-shared PTW
+    // arbitration.
+    // ============================================================
+    var imem_paddr_w: logic<64>;
+    var imem_valid_w: logic    ;
+    var imem_busy_w : logic    ;
+    var imem_fault_w: logic    ;
+    inst u_imem_mmu: imem_mmu (
+        clk            ,
+        rst            ,
+        i_vaddr        : pc_q          ,
+        i_req          : 1'b1          ,
+        o_paddr        : imem_paddr_w  ,
+        o_valid        : imem_valid_w  ,
+        o_fault        : imem_fault_w  ,
+        o_busy         : imem_busy_w   ,
+        i_satp         : csr_satp      ,
+        i_priv         : csr_priv      ,
+        i_sum          : csr_sum       ,
+        i_mxr          : csr_mxr       ,
+        o_ptw_addr     : _             ,  // M5.D: route to dmem PTW arbiter
+        o_ptw_req      : _             ,
+        i_ptw_data     : 64'd0         ,  // M5.D: from PTW arbiter
+        i_ptw_valid    : 1'b0          ,
+        i_icache_stall : 1'b0          ,  // no icache yet
+        i_sfence       : 1'b0          ,  // M5.D
+        i_redirect     : redirect_fire ,
+    );
+    let _unused_imem_fault: logic = imem_fault_w;
+    let _unused_imem_valid: logic = imem_valid_w;
+    let _unused_imem_busy : logic = imem_busy_w;
+
+    assign o_imem_addr = imem_paddr_w;
     assign o_imem_ren  = 1'b1;
 
     // ============================================================
@@ -200,6 +242,8 @@ pub module heliodor_core_v4 #(
     var csr_rd_data : logic<64>;
     var csr_mtvec   : logic<64>;
     var csr_mepc    : logic<64>;
+    // csr_satp / csr_priv / csr_sum / csr_mxr declared near pc_q (M5.C
+    // forward declaration for imem_mmu/dmem_mmu insts).
 
     var rsv_valid_q: logic    ;
     var rsv_addr_q : logic<64>;
@@ -455,6 +499,10 @@ pub module heliodor_core_v4 #(
         i_mret_fire : commit_mret              ,
         o_mtvec     : csr_mtvec                ,
         o_mepc      : csr_mepc                 ,
+        o_satp        : csr_satp                ,
+        o_priv        : csr_priv                ,
+        o_mstatus_sum : csr_sum                 ,
+        o_mstatus_mxr : csr_mxr                 ,
         i_instret_en: rob_commit_valid && !commit_trap,
     );
 
@@ -572,11 +620,54 @@ pub module heliodor_core_v4 #(
     let st_wstrb : logic<8>  = st_mask_base <<< st_byte_off;
     let st_wdata : logic<64> = c_store_data <<< ({58'd0, st_byte_off} <<< 3);
 
-    assign o_dmem_addr  = if commit_store_fire ? c_store_addr : agu_addr_iss;
-    assign o_dmem_wdata = st_wdata;
-    assign o_dmem_wen   = commit_store_fire;
-    assign o_dmem_ren   = issue_is_load;
-    assign o_dmem_wstrb = if commit_store_fire ? st_wstrb : 8'd0;
+    // Core dmem view (pre-MMU virtual address)
+    let core_dmem_vaddr: logic<64> = if commit_store_fire ? c_store_addr : agu_addr_iss;
+    let core_dmem_wdata: logic<64> = st_wdata;
+    let core_dmem_wen  : logic     = commit_store_fire;
+    let core_dmem_ren  : logic     = issue_is_load;
+    let core_dmem_wstrb: logic<8>  = if commit_store_fire ? st_wstrb : 8'd0;
+
+    // ============================================================
+    // M5.C: dmem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
+    // pure passthrough; o_busy stays 0 and o_dmem_addr == i_vaddr.
+    // PTW shared with imem in M5.D.
+    // ============================================================
+    var dmem_mmu_rdata : logic<64>;
+    var dmem_mmu_busy  : logic    ;
+    var dmem_mmu_fault : logic    ;
+    var dmem_mmu_fault_s: logic   ;
+    var dmem_mmu_rdv   : logic    ;
+    inst u_dmem_mmu: dmem_mmu (
+        clk             ,
+        rst             ,
+        i_vaddr         : core_dmem_vaddr,
+        i_wdata         : core_dmem_wdata,
+        i_wen           : core_dmem_wen  ,
+        i_ren           : core_dmem_ren  ,
+        i_wstrb         : core_dmem_wstrb,
+        o_rdata         : dmem_mmu_rdata ,
+        o_dmem_addr     : o_dmem_addr    ,
+        o_dmem_wdata    : o_dmem_wdata   ,
+        i_dmem_rdata    : i_dmem_rdata   ,
+        o_dmem_wen      : o_dmem_wen     ,
+        o_dmem_ren      : o_dmem_ren     ,
+        o_dmem_wstrb    : o_dmem_wstrb   ,
+        i_satp          : csr_satp       ,
+        i_priv          : csr_priv       ,
+        i_sum           : csr_sum        ,
+        i_mxr           : csr_mxr        ,
+        o_busy          : dmem_mmu_busy  ,
+        o_fault         : dmem_mmu_fault ,
+        o_fault_store   : dmem_mmu_fault_s,
+        o_rdata_valid   : dmem_mmu_rdv   ,
+        i_dcache_stall  : 1'b0           ,  // no dcache yet
+        i_sfence        : 1'b0           ,  // M5.D
+    );
+    let _unused_dmem_busy : logic = dmem_mmu_busy;
+    let _unused_dmem_fault: logic = dmem_mmu_fault;
+    let _unused_dmem_fs   : logic = dmem_mmu_fault_s;
+    let _unused_dmem_rdv  : logic = dmem_mmu_rdv;
+    let _unused_dmem_rdata: logic<64> = dmem_mmu_rdata; // alu_wrap still uses i_dmem_rdata directly (Bare)
 
     // M1 debug counters
     var rename_cnt: logic<32>;
