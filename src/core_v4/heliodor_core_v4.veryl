@@ -86,6 +86,8 @@ pub module heliodor_core_v4 #(
     var dmem_mmu_busy: logic;
     // M5.D: medeleg needed by trap_to_s computation in commit stage.
     var csr_medeleg_w: logic<64>;
+    // M5.D: SFENCE.VMA commit pulse (1-cycle), drives mmu i_sfence inputs.
+    var commit_sfence_pulse: logic;
 
     var redirect_fire: logic    ;
     var redirect_pc  : logic<64>;
@@ -118,30 +120,35 @@ pub module heliodor_core_v4 #(
     // port tied off for M5.C; M5.D adds Sv39 + dmem-shared PTW
     // arbitration.
     // ============================================================
-    var imem_paddr_w: logic<64>;
-    var imem_valid_w: logic    ;
-    var imem_busy_w : logic    ;
-    var imem_fault_w: logic    ;
+    var imem_paddr_w   : logic<64>;
+    var imem_valid_w   : logic    ;
+    var imem_busy_w    : logic    ;
+    var imem_fault_w   : logic    ;
+    var imem_ptw_addr_w: logic<64>;
+    var imem_ptw_req_w : logic    ;
     inst u_imem_mmu: imem_mmu (
         clk            ,
         rst            ,
-        i_vaddr        : pc_q          ,
-        i_req          : 1'b1          ,
-        o_paddr        : imem_paddr_w  ,
-        o_valid        : imem_valid_w  ,
-        o_fault        : imem_fault_w  ,
-        o_busy         : imem_busy_w   ,
-        i_satp         : csr_satp      ,
-        i_priv         : csr_priv      ,
-        i_sum          : csr_sum       ,
-        i_mxr          : csr_mxr       ,
-        o_ptw_addr     : _             ,  // M5.D: route to dmem PTW arbiter
-        o_ptw_req      : _             ,
-        i_ptw_data     : 64'd0         ,  // M5.D: from PTW arbiter
-        i_ptw_valid    : 1'b0          ,
-        i_icache_stall : 1'b0          ,  // no icache yet
-        i_sfence       : 1'b0          ,  // M5.D
-        i_redirect     : redirect_fire ,
+        i_vaddr        : pc_q              ,
+        i_req          : 1'b1              ,
+        o_paddr        : imem_paddr_w      ,
+        o_valid        : imem_valid_w      ,
+        o_fault        : imem_fault_w      ,
+        o_busy         : imem_busy_w       ,
+        i_satp         : csr_satp          ,
+        i_priv         : csr_priv          ,
+        i_sum          : csr_sum           ,
+        i_mxr          : csr_mxr           ,
+        o_ptw_addr     : imem_ptw_addr_w   ,
+        o_ptw_req      : imem_ptw_req_w    ,
+        // Toy memory: combinational read so PTW data is valid the same
+        // cycle as the request. The dmem arbiter below routes
+        // imem_ptw_addr_w through o_dmem_addr while req=1.
+        i_ptw_data     : i_dmem_rdata      ,
+        i_ptw_valid    : imem_ptw_req_w    ,
+        i_icache_stall : 1'b0              ,
+        i_sfence       : commit_sfence_pulse,
+        i_redirect     : redirect_fire     ,
     );
     let _unused_imem_fault: logic = imem_fault_w;
     let _unused_imem_valid: logic = imem_valid_w;
@@ -504,6 +511,7 @@ pub module heliodor_core_v4 #(
     let commit_mret : logic = rob_commit_valid && c_is_mret;
     let commit_sret : logic = rob_commit_valid && c_is_sret;
     let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal;
+    assign commit_sfence_pulse = rob_commit_valid && c_is_sfence;
 
     // Cause encoding (per RISC-V priv spec). ECALL cause depends on
     // current priv: M=11, S=9, U=8.
@@ -695,6 +703,12 @@ pub module heliodor_core_v4 #(
     var dmem_mmu_fault : logic    ;
     var dmem_mmu_fault_s: logic   ;
     var dmem_mmu_rdv   : logic    ;
+    // Internal dmem signals from dmem_mmu, muxed below with imem PTW.
+    var dmu_dmem_addr  : logic<64>;
+    var dmu_dmem_wdata : logic<64>;
+    var dmu_dmem_wen   : logic    ;
+    var dmu_dmem_ren   : logic    ;
+    var dmu_dmem_wstrb : logic<8> ;
     inst u_dmem_mmu: dmem_mmu (
         clk             ,
         rst             ,
@@ -704,12 +718,12 @@ pub module heliodor_core_v4 #(
         i_ren           : core_dmem_ren  ,
         i_wstrb         : core_dmem_wstrb,
         o_rdata         : dmem_mmu_rdata ,
-        o_dmem_addr     : o_dmem_addr    ,
-        o_dmem_wdata    : o_dmem_wdata   ,
+        o_dmem_addr     : dmu_dmem_addr  ,
+        o_dmem_wdata    : dmu_dmem_wdata ,
         i_dmem_rdata    : i_dmem_rdata   ,
-        o_dmem_wen      : o_dmem_wen     ,
-        o_dmem_ren      : o_dmem_ren     ,
-        o_dmem_wstrb    : o_dmem_wstrb   ,
+        o_dmem_wen      : dmu_dmem_wen   ,
+        o_dmem_ren      : dmu_dmem_ren   ,
+        o_dmem_wstrb    : dmu_dmem_wstrb ,
         i_satp          : csr_satp       ,
         i_priv          : csr_priv       ,
         i_sum           : csr_sum        ,
@@ -718,14 +732,22 @@ pub module heliodor_core_v4 #(
         o_fault         : dmem_mmu_fault ,
         o_fault_store   : dmem_mmu_fault_s,
         o_rdata_valid   : dmem_mmu_rdv   ,
-        i_dcache_stall  : 1'b0           ,  // no dcache yet
-        i_sfence        : 1'b0           ,  // M5.D
+        // M5.D PTW arbiter: stall dmem MMU while imem MMU is issuing a
+        // PTW read, so imem's PTW addr can win the dmem bus.
+        i_dcache_stall  : imem_ptw_req_w ,
+        i_sfence        : commit_sfence_pulse,
     );
-    let _unused_dmem_busy : logic = dmem_mmu_busy;
     let _unused_dmem_fault: logic = dmem_mmu_fault;
     let _unused_dmem_fs   : logic = dmem_mmu_fault_s;
     let _unused_dmem_rdv  : logic = dmem_mmu_rdv;
     let _unused_dmem_rdata: logic<64> = dmem_mmu_rdata; // alu_wrap still uses i_dmem_rdata directly (Bare)
+
+    // M5.D dmem arbiter mux: imem PTW wins, else dmem MMU output.
+    assign o_dmem_addr  = if imem_ptw_req_w ? imem_ptw_addr_w : dmu_dmem_addr;
+    assign o_dmem_wdata = dmu_dmem_wdata;
+    assign o_dmem_wen   = dmu_dmem_wen && !imem_ptw_req_w;
+    assign o_dmem_ren   = if imem_ptw_req_w ? 1'b1 : dmu_dmem_ren;
+    assign o_dmem_wstrb = if imem_ptw_req_w ? 8'd0 : dmu_dmem_wstrb;
 
     // M1 debug counters
     var rename_cnt: logic<32>;
