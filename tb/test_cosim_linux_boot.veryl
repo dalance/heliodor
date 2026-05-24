@@ -1,0 +1,488 @@
+// Phase 7 v4 M9 cosim: full Linux boot v1↔v4 lockstep.
+//
+// Mirrors test_v4_linux_boot.veryl memory map (32MB DRAM + firmware ROM +
+// CLINT) for both heliodor_top (v1, golden) and heliodor_core_v4. Drives
+// both with the same linux_boot_fw.hex + linux_dram_real.hex. cosim_checker
+// pops the retire FIFOs in order; first PC or arch-reg mismatch dumps the
+// divergence cycle, v1pc, v4pc + retire history rings.
+//
+// Memory map (per-core, separate arrays):
+//   PA 0x00000000 - 0x00003FFF : firmware ROM (16 KB)
+//   PA 0x02000000 - 0x0200FFFF : CLINT MMIO
+//   PA 0x10000000 - 0x10000FFF : UART tx (write-only)
+//   PA 0x80000000 - 0x81FFFFFF : DRAM (32 MB)
+//
+// Cycle budget: 500K cy (v4 first_trap at ~cy 31bb7, so divergence visible).
+//
+// Run:
+//   veryl test --ignored --test test_cosim_linux_boot
+module test_cosim_linux_boot_harness (
+    clk             : input  clock     ,
+    rst             : input  reset     ,
+    o_diverged      : output logic     ,
+    o_compared_cnt  : output logic<32> ,
+    o_v1_pushed_cnt : output logic<32> ,
+    o_v4_pushed_cnt : output logic<32> ,
+    o_fd_cy         : output logic<32> ,
+    o_fd_kind       : output logic<2>  ,
+    o_fd_v1pc       : output logic<64> ,
+    o_fd_v4pc       : output logic<64> ,
+) {
+    var cycle: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            cycle = 32'd0;
+        } else {
+            cycle = cycle + 32'd1;
+        }
+    }
+
+    // ============================================================
+    // v1 instance (heliodor_top, golden reference, internal CLINT)
+    // ============================================================
+    var v1_imem_addr : logic<64>;
+    var v1_imem_rdata: logic<32>;
+    var v1_imem_ren  : logic    ;
+    var v1_dmem_addr : logic<64>;
+    var v1_dmem_wdata: logic<64>;
+    var v1_dmem_rdata: logic<64>;
+    var v1_dmem_wen  : logic    ;
+    var v1_dmem_ren  : logic    ;
+    var v1_dmem_wstrb: logic<8> ;
+    var v1_iptw_addr : logic<64>;
+    var v1_iptw_req  : logic    ;
+    var v1_iptw_rdata: logic<64>;
+    var v1_dbg_regs  : logic<64> [32];
+    var v1_dbg_pc    : logic<64>;
+    var v1_dbg_pass  : logic    ;
+    var v1_dbg_r1    : logic<64>;
+    var v1_dbg_r2    : logic<64>;
+    var v1_dbg_r3    : logic<64>;
+    var v1_ret_v_a   : logic    ;
+    var v1_ret_pc_a  : logic<64>;
+    var v1_ret_rdv_a : logic    ;
+    var v1_ret_rd_a  : logic<5> ;
+    var v1_ret_data_a: logic<64>;
+    var v1_dbg_instret: logic;
+
+    inst v1: heliodor_top #(
+        RESET_PC: 64'h00000000,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr        : v1_imem_addr  ,
+        i_imem_rdata       : v1_imem_rdata ,
+        o_imem_ren         : v1_imem_ren   ,
+        o_iptw_addr        : v1_iptw_addr  ,
+        o_iptw_req         : v1_iptw_req   ,
+        i_iptw_rdata       : v1_iptw_rdata ,
+        i_uart_rx_data     : 8'd0          ,
+        i_uart_rx_valid    : 1'b0          ,
+        o_dmem_addr        : v1_dmem_addr  ,
+        o_dmem_wdata       : v1_dmem_wdata ,
+        i_dmem_rdata       : v1_dmem_rdata ,
+        o_dmem_wen          : v1_dmem_wen  ,
+        o_dmem_ren          : v1_dmem_ren  ,
+        o_dmem_wstrb        : v1_dmem_wstrb,
+        o_dbg_regs         : v1_dbg_regs   ,
+        o_dbg_pc           : v1_dbg_pc     ,
+        o_dbg_pass         : v1_dbg_pass   ,
+        o_dbg_r1           : v1_dbg_r1     ,
+        o_dbg_r2           : v1_dbg_r2     ,
+        o_dbg_r3           : v1_dbg_r3     ,
+        i_ext_irq          : 32'd0         ,
+        o_dbg_instret      : v1_dbg_instret,
+        o_dbg_retire_v_a   : v1_ret_v_a    ,
+        o_dbg_retire_pc_a  : v1_ret_pc_a   ,
+        o_dbg_retire_rd_v_a: v1_ret_rdv_a  ,
+        o_dbg_retire_rd_a  : v1_ret_rd_a   ,
+        o_dbg_retire_data_a: v1_ret_data_a ,
+    );
+
+    // v1 memory: 16 KB firmware ROM + 32 MB DRAM (loaded with Linux kernel)
+    var v1_fw_rom : logic<32> [4096];
+    var v1_dram   : logic<32> [8388608];
+    initial {
+        $readmemh("test/hex/linux_boot_fw.hex", v1_fw_rom);
+        $readmemh("test/hex/linux_dram_real.hex", v1_dram);
+    }
+    let v1_imem_in_fw   : logic     = v1_imem_addr[31:14] == 18'd0;
+    let v1_dmem_in_fw   : logic     = v1_dmem_addr[31:14] == 18'd0;
+    let v1_dmem_in_dram : logic     = v1_dmem_addr[31];
+    let v1_iptw_in_fw   : logic     = v1_iptw_addr[31:14] == 18'd0;
+    let v1_iptw_in_dram : logic     = v1_iptw_addr[31];
+    let v1_imem_fw_idx  : logic<12> = v1_imem_addr[13:2];
+    let v1_imem_dram_idx: logic<23> = v1_imem_addr[24:2];
+    let v1_dmem_fw_lo   : logic<12> = {v1_dmem_addr[13:3], 1'b0};
+    let v1_dmem_fw_hi   : logic<12> = {v1_dmem_addr[13:3], 1'b1};
+    let v1_dmem_dram_lo : logic<23> = {v1_dmem_addr[24:3], 1'b0};
+    let v1_dmem_dram_hi : logic<23> = {v1_dmem_addr[24:3], 1'b1};
+    let v1_iptw_fw_lo   : logic<12> = {v1_iptw_addr[13:3], 1'b0};
+    let v1_iptw_fw_hi   : logic<12> = {v1_iptw_addr[13:3], 1'b1};
+    let v1_iptw_dram_lo : logic<23> = {v1_iptw_addr[24:3], 1'b0};
+    let v1_iptw_dram_hi : logic<23> = {v1_iptw_addr[24:3], 1'b1};
+    assign v1_imem_rdata = if v1_imem_in_fw ? v1_fw_rom[v1_imem_fw_idx]
+                           : if v1_imem_addr[31] ? v1_dram[v1_imem_dram_idx]
+                           : 32'd0;
+    assign v1_dmem_rdata = if v1_dmem_in_fw ? {v1_fw_rom[v1_dmem_fw_hi], v1_fw_rom[v1_dmem_fw_lo]}
+                           : if v1_dmem_in_dram ? {v1_dram[v1_dmem_dram_hi], v1_dram[v1_dmem_dram_lo]}
+                           : 64'd0;
+    assign v1_iptw_rdata = if v1_iptw_in_fw ? {v1_fw_rom[v1_iptw_fw_hi], v1_fw_rom[v1_iptw_fw_lo]}
+                           : if v1_iptw_in_dram ? {v1_dram[v1_iptw_dram_hi], v1_dram[v1_iptw_dram_lo]}
+                           : 64'd0;
+    always_ff (clk, rst) {
+        if_reset {} else if v1_dmem_wen && v1_dmem_in_dram {
+            if v1_dmem_wstrb[0] { v1_dram[v1_dmem_dram_lo][7:0]   = v1_dmem_wdata[7:0];   }
+            if v1_dmem_wstrb[1] { v1_dram[v1_dmem_dram_lo][15:8]  = v1_dmem_wdata[15:8];  }
+            if v1_dmem_wstrb[2] { v1_dram[v1_dmem_dram_lo][23:16] = v1_dmem_wdata[23:16]; }
+            if v1_dmem_wstrb[3] { v1_dram[v1_dmem_dram_lo][31:24] = v1_dmem_wdata[31:24]; }
+            if v1_dmem_wstrb[4] { v1_dram[v1_dmem_dram_hi][7:0]   = v1_dmem_wdata[39:32]; }
+            if v1_dmem_wstrb[5] { v1_dram[v1_dmem_dram_hi][15:8]  = v1_dmem_wdata[47:40]; }
+            if v1_dmem_wstrb[6] { v1_dram[v1_dmem_dram_hi][23:16] = v1_dmem_wdata[55:48]; }
+            if v1_dmem_wstrb[7] { v1_dram[v1_dmem_dram_hi][31:24] = v1_dmem_wdata[63:56]; }
+        }
+    }
+
+    // ============================================================
+    // v4 instance (heliodor_core_v4 + external CLINT for i_mtime)
+    // ============================================================
+    var v4_imem_addr     : logic<64>;
+    var v4_imem_rdata    : logic<32>;
+    var v4_imem_ren      : logic    ;
+    var v4_dmem_addr     : logic<64>;
+    var v4_dmem_wdata    : logic<64>;
+    var v4_dmem_rdata    : logic<64>;
+    var v4_dmem_rdata_next: logic<64>;
+    var v4_dmem_wen      : logic    ;
+    var v4_dmem_ren      : logic    ;
+    var v4_dmem_wstrb    : logic<8> ;
+    var v4_dmem_wdata_hi : logic<64>;
+    var v4_dmem_wstrb_hi : logic<8> ;
+    var v4_dbg_regs      : logic<64> [32];
+    var v4_dbg_pc        : logic<64>;
+    var v4_ret_v_a       : logic    ;
+    var v4_ret_pc_a      : logic<64>;
+    var v4_ret_rdv_a     : logic    ;
+    var v4_ret_rd_a      : logic<5> ;
+    var v4_ret_data_a    : logic<64>;
+    var v4_rename_cnt    : logic<32>;
+    var v4_cdb_cnt       : logic<32>;
+    var v4_rob_size      : logic<8> ;
+    var v4_if_v          : logic    ;
+    var v4_if_instr      : logic<32>;
+    var v4_stall_dr      : logic    ;
+    var v4_hv            : logic    ;
+    var v4_hrw           : logic    ;
+    var v4_hil           : logic    ;
+    var v4_r_alloc       : logic<32>;
+    var v4_r_cdb         : logic<32>;
+    var v4_r_commit      : logic<32>;
+    var v4_r_head        : logic<6> ;
+    var v4_r_tail        : logic<6> ;
+    var _d1: logic<64>; var _d2: logic<64>; var _d3: logic<2>;
+    var _d4: logic; var _d5: logic<64>; var _d6: logic<64>; var _d7: logic;
+    var _d8: logic<64>; var _d9: logic<64>; var _d10: logic<64>; var _d11: logic; var _d12: logic;
+    var _d13: logic; var _d14: logic<12>; var _d15: logic<64>;
+    var _d16: logic; var _d17: logic<64>; var _d18: logic<64>;
+    var _d19: logic; var _d20: logic<64>; var _d21: logic<64>;
+    var _d22: logic<64>; var _d23: logic<64>; var _d24: logic<64>; var _d25: logic;
+    var _d26: logic<64>; var _d27: logic; var _d28: logic<64>;
+    var _d29: logic<32>; var _d30: logic<64>; var _d31: logic<64>; var _d32: logic<64>;
+
+    // CLINT for v4 (external, drives i_mtime + IRQ inputs)
+    var v4_clint_rdata    : logic<64>;
+    var v4_clint_timer_irq: logic [1];
+    var v4_clint_sw_irq   : logic [1];
+    var v4_clint_mtime    : logic<64>;
+    let v4_dmem_in_clint  : logic = v4_dmem_addr[31:24] == 8'h02;
+
+    inst v4: heliodor_core_v4 #(
+        RESET_PC: 64'h00000000,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr        : v4_imem_addr     ,
+        i_imem_rdata       : v4_imem_rdata    ,
+        o_imem_ren         : v4_imem_ren      ,
+        o_dmem_addr        : v4_dmem_addr     ,
+        o_dmem_wdata       : v4_dmem_wdata    ,
+        i_dmem_rdata       : v4_dmem_rdata    ,
+        i_dmem_rdata_next  : v4_dmem_rdata_next,
+        o_dmem_wen         : v4_dmem_wen      ,
+        o_dmem_ren         : v4_dmem_ren      ,
+        o_dmem_wstrb       : v4_dmem_wstrb    ,
+        o_dmem_wdata_hi    : v4_dmem_wdata_hi ,
+        o_dmem_wstrb_hi    : v4_dmem_wstrb_hi ,
+        i_irq_timer_m      : v4_clint_timer_irq[0],
+        i_irq_sw_m         : v4_clint_sw_irq[0]   ,
+        i_irq_ext_m        : 1'b0             ,
+        i_mtime            : v4_clint_mtime   ,
+        o_dbg_pc           : v4_dbg_pc        ,
+        o_dbg_regs         : v4_dbg_regs      ,
+        o_dbg_retire_v_a   : v4_ret_v_a       ,
+        o_dbg_retire_pc_a  : v4_ret_pc_a      ,
+        o_dbg_retire_rd_v_a: v4_ret_rdv_a     ,
+        o_dbg_retire_rd_a  : v4_ret_rd_a      ,
+        o_dbg_retire_data_a: v4_ret_data_a    ,
+        o_dbg_rename_cnt   : v4_rename_cnt    ,
+        o_dbg_cdb_cnt      : v4_cdb_cnt       ,
+        o_dbg_rob_size     : v4_rob_size      ,
+        o_dbg_if_v         : v4_if_v          ,
+        o_dbg_if_instr     : v4_if_instr      ,
+        o_dbg_stall_dr     : v4_stall_dr      ,
+        o_dbg_head_valid   : v4_hv            ,
+        o_dbg_head_rw      : v4_hrw           ,
+        o_dbg_head_illegal : v4_hil           ,
+        o_dbg_rob_alloc_cnt: v4_r_alloc       ,
+        o_dbg_rob_cdb_cnt  : v4_r_cdb         ,
+        o_dbg_rob_commit_cnt: v4_r_commit     ,
+        o_dbg_rob_head     : v4_r_head        ,
+        o_dbg_rob_tail     : v4_r_tail        ,
+        o_dbg_sepc         : _d1, o_dbg_mepc: _d2, o_dbg_priv: _d3,
+        o_dbg_trap_fire    : _d4, o_dbg_trap_pc: _d5,
+        o_dbg_trap_cause   : _d6, o_dbg_trap_to_s: _d7,
+        o_dbg_satp         : _d8, o_dbg_imem_vaddr: _d9, o_dbg_imem_paddr: _d10,
+        o_dbg_imem_valid   : _d11, o_dbg_imem_fault: _d12,
+        o_dbg_csrwr_v      : _d13, o_dbg_csrwr_addr: _d14, o_dbg_csrwr_wdata: _d15,
+        o_dbg_ptw_req      : _d16, o_dbg_ptw_addr: _d17, o_dbg_ptw_data: _d18,
+        o_dbg_redirect_fire: _d19, o_dbg_redirect_pc: _d20, o_dbg_redirect_src_pc: _d21,
+        o_dbg_alu_pc_out: _d22, o_dbg_alu_src_a_out: _d23, o_dbg_alu_src_b_out: _d24, o_dbg_alu_use_pc_a_out: _d25, o_dbg_alu_rs1_data_out: _d26, o_dbg_alu_valid_out: _d27, o_dbg_alu_alu_out_out: _d28, o_dbg_alu_instr_out: _d29, o_dbg_alu_imm_out: _d30, o_dbg_stval_out: _d31, o_dbg_mtval_out: _d32,
+    );
+
+    inst v4_clint: clint #(N_HARTS: 1) (
+        clk            ,
+        rst            ,
+        i_addr     : v4_dmem_addr[15:0],
+        i_wdata    : v4_dmem_wdata     ,
+        i_wen      : v4_dmem_wen && v4_dmem_in_clint,
+        i_ren      : v4_dmem_ren && v4_dmem_in_clint,
+        o_rdata    : v4_clint_rdata    ,
+        o_timer_irq: v4_clint_timer_irq,
+        o_sw_irq   : v4_clint_sw_irq   ,
+        o_mtime    : v4_clint_mtime    ,
+    );
+    let _unused_clint_mtime: logic<64> = v4_clint_mtime;
+    let _unused_clint_t_irq: logic     = v4_clint_timer_irq[0];
+    let _unused_clint_s_irq: logic     = v4_clint_sw_irq[0];
+
+    // v4 memory: 16 KB firmware ROM + 32 MB DRAM
+    var v4_fw_rom: logic<32> [4096];
+    var v4_dram  : logic<32> [8388608];
+    initial {
+        $readmemh("test/hex/linux_boot_fw.hex", v4_fw_rom);
+        $readmemh("test/hex/linux_dram_real.hex", v4_dram);
+    }
+    let v4_imem_in_fw   : logic     = v4_imem_addr[31:14] == 18'd0;
+    let v4_dmem_in_fw   : logic     = v4_dmem_addr[31:14] == 18'd0;
+    let v4_dmem_in_dram : logic     = v4_dmem_addr[31];
+    let v4_imem_fw_idx  : logic<12> = v4_imem_addr[13:2];
+    let v4_imem_dram_idx: logic<23> = v4_imem_addr[24:2];
+    let v4_dmem_fw_lo   : logic<12> = {v4_dmem_addr[13:3], 1'b0};
+    let v4_dmem_fw_hi   : logic<12> = {v4_dmem_addr[13:3], 1'b1};
+    let v4_dmem_dram_lo : logic<23> = {v4_dmem_addr[24:3], 1'b0};
+    let v4_dmem_dram_hi : logic<23> = {v4_dmem_addr[24:3], 1'b1};
+    let v4_dmem_dram_nx_lo: logic<23> = {(v4_dmem_addr[24:3] + 22'd1), 1'b0};
+    let v4_dmem_dram_nx_hi: logic<23> = {(v4_dmem_addr[24:3] + 22'd1), 1'b1};
+    assign v4_imem_rdata = if v4_imem_in_fw ? v4_fw_rom[v4_imem_fw_idx]
+                           : if v4_imem_addr[31] ? v4_dram[v4_imem_dram_idx]
+                           : 32'd0;
+    assign v4_dmem_rdata = if v4_dmem_in_dram ? {v4_dram[v4_dmem_dram_hi], v4_dram[v4_dmem_dram_lo]}
+                           : if v4_dmem_in_fw ? {v4_fw_rom[v4_dmem_fw_hi], v4_fw_rom[v4_dmem_fw_lo]}
+                           : if v4_dmem_in_clint ? v4_clint_rdata
+                           : 64'd0;
+    assign v4_dmem_rdata_next = if v4_dmem_in_dram ? {v4_dram[v4_dmem_dram_nx_hi], v4_dram[v4_dmem_dram_nx_lo]}
+                                : 64'd0;
+    always_ff (clk, rst) {
+        if_reset {} else if v4_dmem_wen && v4_dmem_in_dram {
+            if v4_dmem_wstrb[0] { v4_dram[v4_dmem_dram_lo][7:0]   = v4_dmem_wdata[7:0];   }
+            if v4_dmem_wstrb[1] { v4_dram[v4_dmem_dram_lo][15:8]  = v4_dmem_wdata[15:8];  }
+            if v4_dmem_wstrb[2] { v4_dram[v4_dmem_dram_lo][23:16] = v4_dmem_wdata[23:16]; }
+            if v4_dmem_wstrb[3] { v4_dram[v4_dmem_dram_lo][31:24] = v4_dmem_wdata[31:24]; }
+            if v4_dmem_wstrb[4] { v4_dram[v4_dmem_dram_hi][7:0]   = v4_dmem_wdata[39:32]; }
+            if v4_dmem_wstrb[5] { v4_dram[v4_dmem_dram_hi][15:8]  = v4_dmem_wdata[47:40]; }
+            if v4_dmem_wstrb[6] { v4_dram[v4_dmem_dram_hi][23:16] = v4_dmem_wdata[55:48]; }
+            if v4_dmem_wstrb[7] { v4_dram[v4_dmem_dram_hi][31:24] = v4_dmem_wdata[63:56]; }
+            if v4_dmem_wstrb_hi[0] { v4_dram[v4_dmem_dram_nx_lo][7:0]   = v4_dmem_wdata_hi[7:0];   }
+            if v4_dmem_wstrb_hi[1] { v4_dram[v4_dmem_dram_nx_lo][15:8]  = v4_dmem_wdata_hi[15:8];  }
+            if v4_dmem_wstrb_hi[2] { v4_dram[v4_dmem_dram_nx_lo][23:16] = v4_dmem_wdata_hi[23:16]; }
+            if v4_dmem_wstrb_hi[3] { v4_dram[v4_dmem_dram_nx_lo][31:24] = v4_dmem_wdata_hi[31:24]; }
+            if v4_dmem_wstrb_hi[4] { v4_dram[v4_dmem_dram_nx_hi][7:0]   = v4_dmem_wdata_hi[39:32]; }
+            if v4_dmem_wstrb_hi[5] { v4_dram[v4_dmem_dram_nx_hi][15:8]  = v4_dmem_wdata_hi[47:40]; }
+            if v4_dmem_wstrb_hi[6] { v4_dram[v4_dmem_dram_nx_hi][23:16] = v4_dmem_wdata_hi[55:48]; }
+            if v4_dmem_wstrb_hi[7] { v4_dram[v4_dmem_dram_nx_hi][31:24] = v4_dmem_wdata_hi[63:56]; }
+        }
+    }
+
+    // ============================================================
+    // Cosim checker (retire-order FIFO compare)
+    // ============================================================
+    var diverged_w     : logic    ;
+    var compared_cnt_w : logic<32>;
+    var v1_pushed_cnt_w: logic<32>;
+    var v4_pushed_cnt_w: logic<32>;
+    var fd_cy_w        : logic<32>;
+    var fd_kind_w      : logic<2> ;
+    var fd_v1pc_w      : logic<64>;
+    var fd_v4pc_w      : logic<64>;
+
+    let v1_ret_v_filt: logic = v1_ret_v_a && (v1_ret_pc_a != 64'd0);
+    let v4_ret_v_filt: logic = v4_ret_v_a && (v4_ret_pc_a != 64'd0);
+
+    inst u_check: cosim_checker (
+        clk                                   ,
+        rst                                   ,
+        i_cycle             : cycle           ,
+        i_v1_push           : v1_ret_v_filt   ,
+        i_v1_pc             : v1_ret_pc_a     ,
+        i_v1_rd_v           : v1_ret_rdv_a    ,
+        i_v1_rd             : v1_ret_rd_a     ,
+        i_v1_data           : v1_ret_data_a   ,
+        i_v4_push           : v4_ret_v_filt   ,
+        i_v4_pc             : v4_ret_pc_a     ,
+        i_v4_rd_v           : v4_ret_rdv_a    ,
+        i_v4_rd             : v4_ret_rd_a     ,
+        i_v4_data           : v4_ret_data_a   ,
+        o_diverged          : diverged_w      ,
+        o_compared_cnt      : compared_cnt_w  ,
+        o_v1_pushed_cnt     : v1_pushed_cnt_w ,
+        o_v4_pushed_cnt     : v4_pushed_cnt_w ,
+        o_first_diverge_cy  : fd_cy_w         ,
+        o_first_diverge_kind: fd_kind_w       ,
+        o_first_diverge_v1pc: fd_v1pc_w       ,
+        o_first_diverge_v4pc: fd_v4pc_w       ,
+    );
+
+    assign o_diverged      = diverged_w;
+    assign o_compared_cnt  = compared_cnt_w;
+    assign o_v1_pushed_cnt = v1_pushed_cnt_w;
+    assign o_v4_pushed_cnt = v4_pushed_cnt_w;
+    assign o_fd_cy         = fd_cy_w;
+    assign o_fd_kind       = fd_kind_w;
+    assign o_fd_v1pc       = fd_v1pc_w;
+    assign o_fd_v4pc       = fd_v4pc_w;
+
+    // ============================================================
+    // Per-side retire PC rings (64 entry each) — frozen 4 cycles
+    // after first divergence so we can see the v1 and v4 paths
+    // diverging side-by-side.
+    // ============================================================
+    // Circular rings — overwrites oldest entry; freeze 8 cy after divergence
+    // so we capture the actual divergence neighborhood. Also store rd/data.
+    var ring_freeze    : logic    ;
+    var ring_freeze_dly: logic<4> ;
+    var v1_ring_idx    : logic<8> ;
+    var v1_ring_pcs    : logic<64> [256];
+    var v1_ring_cys    : logic<32> [256];
+    var v1_ring_rdvs   : logic     [256];
+    var v1_ring_rds    : logic<5>  [256];
+    var v1_ring_datas  : logic<64> [256];
+    var v4_ring_idx    : logic<8> ;
+    var v4_ring_pcs    : logic<64> [256];
+    var v4_ring_cys    : logic<32> [256];
+    var v4_ring_rdvs   : logic     [256];
+    var v4_ring_rds    : logic<5>  [256];
+    var v4_ring_datas  : logic<64> [256];
+    always_ff (clk, rst) {
+        if_reset {
+            ring_freeze     = 1'b0;
+            ring_freeze_dly = 4'd0;
+            v1_ring_idx     = 8'd0;
+            v4_ring_idx     = 8'd0;
+            for i in 0..256 {
+                v1_ring_pcs[i]   = 64'd0;
+                v1_ring_cys[i]   = 32'd0;
+                v1_ring_rdvs[i]  = 1'b0;
+                v1_ring_rds[i]   = 5'd0;
+                v1_ring_datas[i] = 64'd0;
+                v4_ring_pcs[i]   = 64'd0;
+                v4_ring_cys[i]   = 32'd0;
+                v4_ring_rdvs[i]  = 1'b0;
+                v4_ring_rds[i]   = 5'd0;
+                v4_ring_datas[i] = 64'd0;
+            }
+        } else {
+            if v1_ret_v_filt && !ring_freeze {
+                v1_ring_pcs[v1_ring_idx]   = v1_ret_pc_a;
+                v1_ring_cys[v1_ring_idx]   = cycle;
+                v1_ring_rdvs[v1_ring_idx]  = v1_ret_rdv_a;
+                v1_ring_rds[v1_ring_idx]   = v1_ret_rd_a;
+                v1_ring_datas[v1_ring_idx] = v1_ret_data_a;
+                v1_ring_idx                = v1_ring_idx + 8'd1;
+            }
+            if v4_ret_v_filt && !ring_freeze {
+                v4_ring_pcs[v4_ring_idx]   = v4_ret_pc_a;
+                v4_ring_cys[v4_ring_idx]   = cycle;
+                v4_ring_rdvs[v4_ring_idx]  = v4_ret_rdv_a;
+                v4_ring_rds[v4_ring_idx]   = v4_ret_rd_a;
+                v4_ring_datas[v4_ring_idx] = v4_ret_data_a;
+                v4_ring_idx                = v4_ring_idx + 8'd1;
+            }
+            if diverged_w && !ring_freeze {
+                if ring_freeze_dly == 4'd8 {
+                    ring_freeze = 1'b1;
+                } else {
+                    ring_freeze_dly = ring_freeze_dly + 4'd1;
+                }
+            }
+        }
+    }
+    always_ff (clk, rst) {
+        if_reset {} else if ring_freeze && cycle[7:0] == 8'd0 {
+            $display("[cosim ring dump @cy=%h diverged@cy=%h v1pc=%h v4pc=%h kind=%h]",
+                      cycle, fd_cy_w, fd_v1pc_w, fd_v4pc_w, fd_kind_w);
+            $display("[v1 ring; head=%h ring_idx=%h]", v1_ring_idx, v1_ring_idx);
+            for i in 0..256 {
+                if v1_ring_cys[i] != 32'd0 {
+                    $display("  v1[%h] cy=%h pc=%h rdv=%b rd=%h data=%h",
+                              i, v1_ring_cys[i], v1_ring_pcs[i],
+                              v1_ring_rdvs[i], v1_ring_rds[i], v1_ring_datas[i]);
+                }
+            }
+            $display("[v4 ring; head=%h ring_idx=%h]", v4_ring_idx, v4_ring_idx);
+            for i in 0..256 {
+                if v4_ring_cys[i] != 32'd0 {
+                    $display("  v4[%h] cy=%h pc=%h rdv=%b rd=%h data=%h",
+                              i, v4_ring_cys[i], v4_ring_pcs[i],
+                              v4_ring_rdvs[i], v4_ring_rds[i], v4_ring_datas[i]);
+                }
+            }
+        }
+    }
+}
+
+#[test(test_cosim_linux_boot)]
+#[ignore]
+module test_cosim_linux_boot {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen(clk);
+
+    var diverged  : logic    ;
+    var compared  : logic<32>;
+    var v1_pushed : logic<32>;
+    var v4_pushed : logic<32>;
+    var fd_cy     : logic<32>;
+    var fd_kind   : logic<2> ;
+    var fd_v1pc   : logic<64>;
+    var fd_v4pc   : logic<64>;
+
+    inst h: test_cosim_linux_boot_harness (
+        clk                              ,
+        rst                              ,
+        o_diverged     : diverged        ,
+        o_compared_cnt : compared        ,
+        o_v1_pushed_cnt: v1_pushed       ,
+        o_v4_pushed_cnt: v4_pushed       ,
+        o_fd_cy        : fd_cy           ,
+        o_fd_kind      : fd_kind         ,
+        o_fd_v1pc      : fd_v1pc         ,
+        o_fd_v4pc      : fd_v4pc         ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next  (500_000);
+        $display  ("[test_cosim_linux_boot] diverged=%b compared=%d v1_pushed=%d v4_pushed=%d fd_cy=%d kind=%d v1pc=%h v4pc=%h",
+                   diverged, compared, v1_pushed, v4_pushed, fd_cy, fd_kind, fd_v1pc, fd_v4pc);
+        $finish ();
+    }
+}
