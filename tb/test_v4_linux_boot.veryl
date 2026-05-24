@@ -273,12 +273,41 @@ module test_v4_linux_boot_harness (
     // Retire PC ring: last 32 retire PCs frozen at first_trap (precise
     // exception verification — what was the last committed insn before
     // trap entry? Compare with first_trap_pc to see if SEPC is correct.)
-    var ret_idx   : logic<5>;
-    var ret_pcs   : logic<64> [32];
-    var ret_cys   : logic<32> [32];
+    var ret_idx   : logic<9>;
+    var ret_pcs   : logic<64> [512];
+    var ret_cys   : logic<32> [512];
+    var ret_rdvs  : logic     [512];
+    var ret_rds   : logic<5>  [512];
+    var ret_datas : logic<64> [512];
     var ret_freeze: logic;
-    var ret_freeze_dly: logic<3>;
+    var ret_freeze_dly: logic<8>;
     var ret_total : logic<32>;
+    // Second / third trap capture so we can see recursive page faults inside
+    // the trap handler. v4 may double-fault before handler reaches `la gp`.
+    var trap2_pc   : logic<64>;
+    var trap2_cause: logic<64>;
+    var trap2_cy   : logic<32>;
+    var trap2_stval: logic<64>;
+    var trap2_seen : logic;
+    var trap3_pc   : logic<64>;
+    var trap3_cause: logic<64>;
+    var trap3_cy   : logic<32>;
+    var trap3_seen : logic;
+    // Snapshot of x3 (gp) and full reg file at first_trap so we can correlate
+    // stval (= rs1 + imm) with the actual rs1 read by the trapping load.
+    var trap_x1 : logic<64>;
+    var trap_x2 : logic<64>;
+    var trap_x3 : logic<64>;
+    var trap_x8 : logic<64>;
+    var trap_x10: logic<64>;
+    var trap_regs_captured: logic;
+    // Dedicated capture: every retire with rd=3 (gp). 16 entries, frozen at first_trap.
+    var gpw_idx   : logic<4>;
+    var gpw_cys   : logic<32> [16];
+    var gpw_pcs   : logic<64> [16];
+    var gpw_datas : logic<64> [16];
+    var gpw_total : logic<32>;
+    var gpw_freeze: logic;
     // Redirect ring: last 16 redirects (src_pc, target_pc, cy) frozen at first_trap
     // Used to identify wrong jump target bugs (e.g. c.jr ra with bad ra).
     var rdr_idx   : logic<4>;
@@ -361,13 +390,39 @@ module test_v4_linux_boot_harness (
                 st_datas[i] = 64'd0;
                 st_cys[i]   = 32'd0;
             }
-            ret_idx        = 5'd0;
+            ret_idx        = 9'd0;
             ret_freeze     = 1'b0;
-            ret_freeze_dly = 3'd0;
+            ret_freeze_dly = 8'd0;
             ret_total      = 32'd0;
-            for i in 0..32 {
-                ret_pcs[i] = 64'd0;
-                ret_cys[i] = 32'd0;
+            for i in 0..512 {
+                ret_pcs[i]   = 64'd0;
+                ret_cys[i]   = 32'd0;
+                ret_rdvs[i]  = 1'b0;
+                ret_rds[i]   = 5'd0;
+                ret_datas[i] = 64'd0;
+            }
+            trap2_pc    = 64'd0;
+            trap2_cause = 64'd0;
+            trap2_cy    = 32'd0;
+            trap2_stval = 64'd0;
+            trap2_seen  = 1'b0;
+            trap3_pc    = 64'd0;
+            trap3_cause = 64'd0;
+            trap3_cy    = 32'd0;
+            trap3_seen  = 1'b0;
+            trap_x1  = 64'd0;
+            trap_x2  = 64'd0;
+            trap_x3  = 64'd0;
+            trap_x8  = 64'd0;
+            trap_x10 = 64'd0;
+            trap_regs_captured = 1'b0;
+            gpw_idx    = 4'd0;
+            gpw_total  = 32'd0;
+            gpw_freeze = 1'b0;
+            for i in 0..16 {
+                gpw_cys[i]   = 32'd0;
+                gpw_pcs[i]   = 64'd0;
+                gpw_datas[i] = 64'd0;
             }
             rdr_idx        = 4'd0;
             rdr_freeze     = 1'b0;
@@ -501,17 +556,60 @@ module test_v4_linux_boot_harness (
             // Retire PC ring: capture every retire (lane A) until 4 cycles
             // after first_trap. Latest is at ret_idx-1 mod 32.
             if _ret_v && !ret_freeze {
-                ret_pcs[ret_idx] = _ret_pc;
-                ret_cys[ret_idx] = cy;
-                ret_idx = ret_idx + 5'd1;
+                ret_pcs[ret_idx]   = _ret_pc;
+                ret_cys[ret_idx]   = cy;
+                ret_rdvs[ret_idx]  = _ret_rdv;
+                ret_rds[ret_idx]   = _ret_rd;
+                ret_datas[ret_idx] = _ret_data;
+                ret_idx = ret_idx + 9'd1;
                 ret_total = ret_total + 32'd1;
             }
+            // Hold ring open for 256 cycles after first_trap so we see what
+            // the trap handler manages to retire (including the `la gp`
+            // sequence at handler+0x80 = PA 0x800025fc).
             if first_trap_seen && !ret_freeze {
-                if ret_freeze_dly == 3'd4 {
+                if ret_freeze_dly == 8'hff {
                     ret_freeze = 1'b1;
                 } else {
-                    ret_freeze_dly = ret_freeze_dly + 3'd1;
+                    ret_freeze_dly = ret_freeze_dly + 8'd1;
                 }
+            }
+            // Second / third trap capture (recursive page-fault detection)
+            if dbg_trap_fire && first_trap_seen && !trap2_seen {
+                trap2_pc    = dbg_trap_pc;
+                trap2_cause = dbg_trap_cause;
+                trap2_cy    = cy;
+                trap2_stval = dbg_stval;
+                trap2_seen  = 1'b1;
+            }
+            if dbg_trap_fire && trap2_seen && !trap3_seen {
+                trap3_pc    = dbg_trap_pc;
+                trap3_cause = dbg_trap_cause;
+                trap3_cy    = cy;
+                trap3_seen  = 1'b1;
+            }
+            // Snapshot key arch regs at first trap entry (cycle of trap_fire).
+            if dbg_trap_fire && !trap_regs_captured {
+                trap_x1  = dbg_regs[1];
+                trap_x2  = dbg_regs[2];
+                trap_x3  = dbg_regs[3];
+                trap_x8  = dbg_regs[8];
+                trap_x10 = dbg_regs[10];
+                trap_regs_captured = 1'b1;
+            }
+            // Capture every retire writing rd=3 (gp) so we can locate the
+            // instruction that produced the suspected low-half gp value.
+            if _ret_v && _ret_rdv && _ret_rd == 5'd3 && !gpw_freeze {
+                gpw_total = gpw_total + 32'd1;
+                if gpw_idx != 4'd15 {
+                    gpw_cys[gpw_idx]   = cy;
+                    gpw_pcs[gpw_idx]   = _ret_pc;
+                    gpw_datas[gpw_idx] = _ret_data;
+                    gpw_idx = gpw_idx + 4'd1;
+                }
+            }
+            if first_trap_seen && !gpw_freeze {
+                gpw_freeze = 1'b1;
             }
             // Redirect ring: every redirect_fire captured as (src_pc, target).
             if dbg_redir_v && !rdr_freeze {
@@ -586,10 +684,24 @@ module test_v4_linux_boot_harness (
                           clint_wr_cnt, clint_wr_first_cy, clint_wr_first_addr, clint_wr_first_data,
                           clint_wr_last_addr, clint_wr_last_data);
                 $display("v4   uart_wr: cnt=%h first_cy=%h", uart_wr_cnt, uart_wr_first_cy);
-                $display("v4   ret_total=%h (ring cap=32, latest at idx %h)", ret_total, ret_idx);
-                for i in 0..32 {
+                $display("v4   trap_regs: x1=%h x2=%h x3=%h x8=%h x10=%h captured=%b",
+                          trap_x1, trap_x2, trap_x3, trap_x8, trap_x10, trap_regs_captured);
+                $display("v4   gpw_total=%h (all retires writing gp)", gpw_total);
+                for i in 0..16 {
+                    if gpw_cys[i] != 32'd0 {
+                        $display("v4   gpw[%h] cy=%h pc=%h data=%h",
+                                  i, gpw_cys[i], gpw_pcs[i], gpw_datas[i]);
+                    }
+                }
+                $display("v4   trap2: seen=%b cy=%h pc=%h cause=%h stval=%h",
+                          trap2_seen, trap2_cy, trap2_pc, trap2_cause, trap2_stval);
+                $display("v4   trap3: seen=%b cy=%h pc=%h cause=%h",
+                          trap3_seen, trap3_cy, trap3_pc, trap3_cause);
+                $display("v4   ret_total=%h (ring cap=512, latest at idx %h)", ret_total, ret_idx);
+                for i in 0..512 {
                     if ret_cys[i] != 32'd0 {
-                        $display("v4   ret[%h] cy=%h pc=%h", i, ret_cys[i], ret_pcs[i]);
+                        $display("v4   ret[%h] cy=%h pc=%h rdv=%b rd=%h data=%h",
+                                  i, ret_cys[i], ret_pcs[i], ret_rdvs[i], ret_rds[i], ret_datas[i]);
                     }
                 }
                 $display("v4   rdr_total=%h (ring cap=16, latest at idx %h)", rdr_total, rdr_idx);
