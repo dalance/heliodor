@@ -39,7 +39,9 @@ module test_v4_linux_boot_harness (
     var dbg_trap_cause: logic<64>; var dbg_trap_to_s: logic;
     var dbg_satp      : logic<64>; var dbg_imem_vaddr: logic<64>; var dbg_imem_paddr: logic<64>;
     var dbg_imem_valid: logic    ; var dbg_imem_fault: logic;
-    var _d13: logic; var _d14: logic<12>; var _d15: logic<64>;
+    var dbg_csrwr_v   : logic    ;
+    var dbg_csrwr_addr: logic<12>;
+    var dbg_csrwr_wdata:logic<64>;
     var dbg_ptw_req   : logic    ; var dbg_ptw_addr : logic<64>; var dbg_ptw_data : logic<64>;
     var _ret_v: logic; var _ret_pc: logic<64>; var _ret_rdv: logic; var _ret_rd: logic<5>; var _ret_data: logic<64>;
     var _rename_cnt: logic<32>; var _cdb_cnt: logic<32>; var _rob_size: logic<8>;
@@ -100,7 +102,7 @@ module test_v4_linux_boot_harness (
         o_dbg_trap_cause   : dbg_trap_cause, o_dbg_trap_to_s: dbg_trap_to_s,
         o_dbg_satp         : dbg_satp, o_dbg_imem_vaddr: dbg_imem_vaddr, o_dbg_imem_paddr: dbg_imem_paddr,
         o_dbg_imem_valid   : dbg_imem_valid, o_dbg_imem_fault: dbg_imem_fault,
-        o_dbg_csrwr_v      : _d13, o_dbg_csrwr_addr: _d14, o_dbg_csrwr_wdata: _d15,
+        o_dbg_csrwr_v      : dbg_csrwr_v, o_dbg_csrwr_addr: dbg_csrwr_addr, o_dbg_csrwr_wdata: dbg_csrwr_wdata,
         o_dbg_ptw_req      : dbg_ptw_req, o_dbg_ptw_addr: dbg_ptw_addr, o_dbg_ptw_data: dbg_ptw_data,
     );
 
@@ -206,6 +208,39 @@ module test_v4_linux_boot_harness (
     var ptw_addrs: logic<64> [8];
     var ptw_datas: logic<64> [8];
     var ptw_freeze: logic;
+    // Capture first 64 stores to PT root areas to catch full PT setup
+    // history (earlier 16-entry ring overflowed before trap).
+    var st_idx   : logic<6>;
+    var st_addrs : logic<64> [64];
+    var st_datas : logic<64> [64];
+    var st_cys   : logic<32> [64];
+    var st_freeze: logic;
+    var st_total : logic<32>;  // count of all PT stores even when ring full
+    // satp write capture (first 4)
+    var satp_idx : logic<2>;
+    var satp_cys : logic<32> [4];
+    var satp_vals: logic<64> [4];
+    var satp_freeze: logic;
+    // Fetch PC ring: last 16 valid fetches (vaddr, paddr, cy).
+    // Frozen 5 cycles after first_trap so we capture the trap PC + a few prior.
+    var fetch_idx       : logic<4>;
+    var fetch_vaddrs    : logic<64> [16];
+    var fetch_paddrs    : logic<64> [16];
+    var fetch_cys       : logic<32> [16];
+    var fetch_freeze    : logic;
+    var fetch_freeze_dly: logic<4>;
+    // mepc write capture (first 8 mepc writes — to see firmware's
+    // setup of kernel entry before mret)
+    var mepc_idx  : logic<3>;
+    var mepc_cys  : logic<32> [8];
+    var mepc_vals : logic<64> [8];
+    var mepc_freeze: logic;
+    // High-half fetch ring: first 8 fetches with VA bit[39]=1 (= high-half
+    // kernel VA). Captures kernel high-half jump (la+jr in head.S).
+    var hfetch_idx  : logic<3>;
+    var hfetch_cys  : logic<32> [8];
+    var hfetch_vas  : logic<64> [8];
+    var hfetch_freeze: logic;
     always_ff (clk, rst) {
         if_reset {
             cy            = 32'd0;
@@ -224,6 +259,40 @@ module test_v4_linux_boot_harness (
             for i in 0..8 {
                 ptw_addrs[i] = 64'd0;
                 ptw_datas[i] = 64'd0;
+            }
+            st_idx     = 6'd0;
+            st_freeze  = 1'b0;
+            st_total   = 32'd0;
+            satp_idx   = 2'd0;
+            satp_freeze= 1'b0;
+            for i in 0..4 {
+                satp_cys[i]  = 32'd0;
+                satp_vals[i] = 64'd0;
+            }
+            fetch_idx        = 4'd0;
+            fetch_freeze     = 1'b0;
+            fetch_freeze_dly = 4'd0;
+            for i in 0..16 {
+                fetch_vaddrs[i] = 64'd0;
+                fetch_paddrs[i] = 64'd0;
+                fetch_cys[i]    = 32'd0;
+            }
+            mepc_idx   = 3'd0;
+            mepc_freeze= 1'b0;
+            for i in 0..8 {
+                mepc_cys[i]  = 32'd0;
+                mepc_vals[i] = 64'd0;
+            }
+            hfetch_idx    = 3'd0;
+            hfetch_freeze = 1'b0;
+            for i in 0..8 {
+                hfetch_cys[i] = 32'd0;
+                hfetch_vas[i] = 64'd0;
+            }
+            for i in 0..64 {
+                st_addrs[i] = 64'd0;
+                st_datas[i] = 64'd0;
+                st_cys[i]   = 32'd0;
             }
         } else {
             cy = cy + 32'd1;
@@ -251,6 +320,66 @@ module test_v4_linux_boot_harness (
                 ptw_datas[ptw_idx] = dbg_ptw_data;
                 ptw_idx = ptw_idx + 3'd1;
             }
+            // Capture first 16 NON-ZERO PTE writes to PT root areas.
+            // Zero writes are PT clearing; non-zero = real PTE setup.
+            let pt_st_match: logic =
+                (dmem_addr >= 64'h80404000 && dmem_addr <: 64'h80405000) ||
+                (dmem_addr >= 64'h80a8a000 && dmem_addr <: 64'h80a8b000);
+            if dmem_wen && pt_st_match && dmem_wdata != 64'd0 && !st_freeze {
+                st_total = st_total + 32'd1;
+                if st_idx != 6'd63 {
+                    st_addrs[st_idx] = dmem_addr;
+                    st_datas[st_idx] = dmem_wdata;
+                    st_cys[st_idx]   = cy;
+                    st_idx = st_idx + 6'd1;
+                }
+            }
+            if first_trap_seen && !st_freeze {
+                st_freeze = 1'b1;
+            }
+            // Capture satp CSR writes
+            if dbg_csrwr_v && dbg_csrwr_addr == 12'h180 && !satp_freeze && satp_idx != 2'd3 {
+                satp_cys[satp_idx]  = cy;
+                satp_vals[satp_idx] = dbg_csrwr_wdata;
+                satp_idx = satp_idx + 2'd1;
+            }
+            if first_trap_seen && !satp_freeze {
+                satp_freeze = 1'b1;
+            }
+            // Fetch ring: push every valid imem fetch (vaddr + paddr).
+            // After first_trap, give 5 more cycles so trap handler PC is
+            // also visible, then freeze.
+            if dbg_imem_valid && !fetch_freeze {
+                fetch_vaddrs[fetch_idx] = dbg_imem_vaddr;
+                fetch_paddrs[fetch_idx] = dbg_imem_paddr;
+                fetch_cys[fetch_idx]    = cy;
+                fetch_idx = fetch_idx + 4'd1;
+            }
+            if first_trap_seen && !fetch_freeze {
+                if fetch_freeze_dly == 4'd5 {
+                    fetch_freeze = 1'b1;
+                } else {
+                    fetch_freeze_dly = fetch_freeze_dly + 4'd1;
+                }
+            }
+            // mepc write capture (CSR 0x341)
+            if dbg_csrwr_v && dbg_csrwr_addr == 12'h341 && !mepc_freeze && mepc_idx != 3'd7 {
+                mepc_cys[mepc_idx]  = cy;
+                mepc_vals[mepc_idx] = dbg_csrwr_wdata;
+                mepc_idx = mepc_idx + 3'd1;
+            }
+            if first_trap_seen && !mepc_freeze {
+                mepc_freeze = 1'b1;
+            }
+            // High-half fetch capture: vaddr bit[39]=1 (= high-half kernel VA)
+            if dbg_imem_valid && dbg_imem_vaddr[39] == 1'b1 && !hfetch_freeze && hfetch_idx != 3'd7 {
+                hfetch_cys[hfetch_idx] = cy;
+                hfetch_vas[hfetch_idx] = dbg_imem_vaddr;
+                hfetch_idx = hfetch_idx + 3'd1;
+            }
+            if first_trap_seen && !hfetch_freeze {
+                hfetch_freeze = 1'b1;
+            }
             if cy[19:0] == 20'd0 {
                 $display("v4 linux boot @cy=%h: pc=%h x3=%h priv=%h trap_cnt=%h mtime=%h ecall_first_cy=%h",
                           cy, dbg_pc, dbg_regs[3], dbg_priv, trap_cnt, clint_mtime, ecall_first_cy);
@@ -265,6 +394,29 @@ module test_v4_linux_boot_harness (
                 $display("v4   ptw[5] addr=%h data=%h", ptw_addrs[5], ptw_datas[5]);
                 $display("v4   ptw[6] addr=%h data=%h", ptw_addrs[6], ptw_datas[6]);
                 $display("v4   ptw[7] addr=%h data=%h", ptw_addrs[7], ptw_datas[7]);
+                $display("v4   st_total=%h (ring cap=64)", st_total);
+                for i in 0..64 {
+                    if st_cys[i] != 32'd0 {
+                        $display("v4   st[%h] cy=%h addr=%h data=%h",
+                                  i, st_cys[i], st_addrs[i], st_datas[i]);
+                    }
+                }
+                for i in 0..4 {
+                    $display("v4   satp_w[%h] cy=%h val=%h",
+                              i, satp_cys[i], satp_vals[i]);
+                }
+                for i in 0..16 {
+                    $display("v4   fet[%h] cy=%h va=%h pa=%h",
+                              i, fetch_cys[i], fetch_vaddrs[i], fetch_paddrs[i]);
+                }
+                for i in 0..8 {
+                    $display("v4   mepc_w[%h] cy=%h val=%h",
+                              i, mepc_cys[i], mepc_vals[i]);
+                }
+                for i in 0..8 {
+                    $display("v4   hfet[%h] cy=%h va=%h",
+                              i, hfetch_cys[i], hfetch_vas[i]);
+                }
             }
         }
     }
@@ -288,7 +440,7 @@ module test_v4_linux_boot {
 
     initial {
         rst.assert(clk);
-        clk.next  (10000000); // 10M cycle (v1 boots ~22M; v4 is 1-wide so slower)
+        clk.next  (30000000); // 30M cycle (v1 boots ~22M; v4 is 1-wide so slower)
         $display  ("v4 linux real boot smoke: x3=%h pass=%b (smoke run, full boot needs ~100M cy)", r3, pass);
         // Smoke test only — comment in once a longer cycle budget is set:
         // $assert(pass, "v4 Linux real boot: expected x3=0xAA (SBI SRST shutdown)");
