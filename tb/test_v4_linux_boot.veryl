@@ -290,6 +290,29 @@ module test_v4_linux_boot_harness (
     var ret_freeze: logic;
     var ret_freeze_dly: logic<8>;
     var ret_total : logic<32>;
+    // s2 (x18) write ring — every retire with rd=18 captured. 64-entry
+    // circular. Each entry: cy, PC, new s2 value. Helps trace where s2
+    // gets a garbage value (e.g. ffffffce_fefXX000).
+    var s2w_idx   : logic<6>;
+    var s2w_cys   : logic<32> [64];
+    var s2w_pcs   : logic<64> [64];
+    var s2w_datas : logic<64> [64];
+    var s2w_total : logic<32>;
+    // a0 (x10) write ring — same purpose, trace a0 to find function returning
+    // the garbage value 0xffffffce_fefXX000.
+    var a0w_idx   : logic<6>;
+    var a0w_cys   : logic<32> [64];
+    var a0w_pcs   : logic<64> [64];
+    var a0w_datas : logic<64> [64];
+    var a0w_total : logic<32>;
+    // GARBAGE filter ring: ANY retire (any rd) whose data == 0xffffffce_XXXX.
+    // Captures all instructions that produce garbage-like values.
+    var gbw_idx   : logic<6>;
+    var gbw_cys   : logic<32> [64];
+    var gbw_pcs   : logic<64> [64];
+    var gbw_rds   : logic<5>  [64];
+    var gbw_datas : logic<64> [64];
+    var gbw_total : logic<32>;
     // Second / third trap capture so we can see recursive page faults inside
     // the trap handler. v4 may double-fault before handler reaches `la gp`.
     var trap2_pc   : logic<64>;
@@ -312,6 +335,13 @@ module test_v4_linux_boot_harness (
     var trap_last_cy   : logic<32>;
     var trap_last_pc   : logic<64>;
     var trap_last_cause: logic<64>;
+    // Specific cause=13 (load page fault) tracker — Oops PC capture
+    var lfault_seen   : logic;
+    var lfault_cy     : logic<32>;
+    var lfault_pc     : logic<64>;
+    var lfault_stval  : logic<64>;
+    // Snapshot all arch regs at lfault
+    var lfault_regs   : logic<64> [32];
     // M9 perf debug: per-cycle IFU fault snapshot. Capture (cy, vaddr, paddr,
     // valid, ptw_req, ptw_addr, ptw_data) for first 32 cycles where
     // dbg_imem_fault is high. Identifies whether MMU walk fails or TLB
@@ -434,6 +464,28 @@ module test_v4_linux_boot_harness (
                 ret_rds[i]   = 5'd0;
                 ret_datas[i] = 64'd0;
             }
+            s2w_idx   = 6'd0;
+            s2w_total = 32'd0;
+            for i in 0..64 {
+                s2w_cys[i]   = 32'd0;
+                s2w_pcs[i]   = 64'd0;
+                s2w_datas[i] = 64'd0;
+            }
+            a0w_idx   = 6'd0;
+            a0w_total = 32'd0;
+            for i in 0..64 {
+                a0w_cys[i]   = 32'd0;
+                a0w_pcs[i]   = 64'd0;
+                a0w_datas[i] = 64'd0;
+            }
+            gbw_idx   = 6'd0;
+            gbw_total = 32'd0;
+            for i in 0..64 {
+                gbw_cys[i]   = 32'd0;
+                gbw_pcs[i]   = 64'd0;
+                gbw_rds[i]   = 5'd0;
+                gbw_datas[i] = 64'd0;
+            }
             trap2_pc    = 64'd0;
             trap2_cause = 64'd0;
             trap2_cy    = 32'd0;
@@ -447,6 +499,13 @@ module test_v4_linux_boot_harness (
             trap_last_cy   = 32'd0;
             trap_last_pc   = 64'd0;
             trap_last_cause= 64'd0;
+            lfault_seen   = 1'b0;
+            lfault_cy     = 32'd0;
+            lfault_pc     = 64'd0;
+            lfault_stval  = 64'd0;
+            for i in 0..32 {
+                lfault_regs[i] = 64'd0;
+            }
             for i in 0..32 {
                 trap_hist_cys[i] = 32'd0;
                 trap_hist_pcs[i] = 64'd0;
@@ -619,15 +678,39 @@ module test_v4_linux_boot_harness (
                 ret_idx = ret_idx + 9'd1;
                 ret_total = ret_total + 32'd1;
             }
-            // Hold ring open for 256 cycles after first_trap so we see what
-            // the trap handler manages to retire (including the `la gp`
-            // sequence at handler+0x80 = PA 0x800025fc).
-            if first_trap_seen && !ret_freeze {
-                if ret_freeze_dly == 8'hff {
-                    ret_freeze = 1'b1;
-                } else {
-                    ret_freeze_dly = ret_freeze_dly + 8'd1;
-                }
+            // s2 (x18) write ring — capture every retire writing rd=18.
+            // Circular (64 entries). Freezes when ret_ring freezes (=
+            // lfault_seen).
+            if _ret_v && _ret_rdv && _ret_rd == 5'd18 && !ret_freeze {
+                s2w_cys[s2w_idx]   = cy;
+                s2w_pcs[s2w_idx]   = _ret_pc;
+                s2w_datas[s2w_idx] = _ret_data;
+                s2w_idx = s2w_idx + 6'd1;
+                s2w_total = s2w_total + 32'd1;
+            }
+            // a0 (x10) write ring — same.
+            if _ret_v && _ret_rdv && _ret_rd == 5'd10 && !ret_freeze {
+                a0w_cys[a0w_idx]   = cy;
+                a0w_pcs[a0w_idx]   = _ret_pc;
+                a0w_datas[a0w_idx] = _ret_data;
+                a0w_idx = a0w_idx + 6'd1;
+                a0w_total = a0w_total + 32'd1;
+            }
+            // GARBAGE filter: any retire writing a value of pattern
+            // 0xffffffce_XXXX_XXXX (= the kernel page-fault address family).
+            if _ret_v && _ret_rdv && !ret_freeze && _ret_data[63:40] == 24'hffffff && _ret_data[39:32] == 8'hce {
+                gbw_cys[gbw_idx]   = cy;
+                gbw_pcs[gbw_idx]   = _ret_pc;
+                gbw_rds[gbw_idx]   = _ret_rd;
+                gbw_datas[gbw_idx] = _ret_data;
+                gbw_idx = gbw_idx + 6'd1;
+                gbw_total = gbw_total + 32'd1;
+            }
+            // Freeze ret_ring on first cause=13 trap (= the OOPS) so we
+            // capture pre-fault retires. The faulting LOAD itself doesn't
+            // retire (trap diverts), so we freeze on lfault_seen instead.
+            if lfault_seen && !ret_freeze {
+                ret_freeze = 1'b1;
             }
             // Second / third trap capture (recursive page-fault detection)
             if dbg_trap_fire && first_trap_seen && !trap2_seen {
@@ -648,6 +731,16 @@ module test_v4_linux_boot_harness (
                 trap_last_cy    = cy;
                 trap_last_pc    = dbg_trap_pc;
                 trap_last_cause = dbg_trap_cause;
+                // Cause=13 (load page fault) — snapshot regs at first occurrence
+                if dbg_trap_cause == 64'd13 && !lfault_seen {
+                    lfault_seen  = 1'b1;
+                    lfault_cy    = cy;
+                    lfault_pc    = dbg_trap_pc;
+                    lfault_stval = dbg_stval;
+                    for i in 0..32 {
+                        lfault_regs[i] = dbg_regs[i];
+                    }
+                }
                 if trap_hist_idx != 5'd31 {
                     trap_hist_cys[trap_hist_idx] = cy;
                     trap_hist_pcs[trap_hist_idx] = dbg_trap_pc;
@@ -781,6 +874,32 @@ module test_v4_linux_boot_harness (
                           trap3_seen, trap3_cy, trap3_pc, trap3_cause);
                 $display("v4   trap_last: cy=%h pc=%h cause=%h",
                           trap_last_cy, trap_last_pc, trap_last_cause);
+                $display("v4   lfault: seen=%b cy=%h pc=%h stval=%h",
+                          lfault_seen, lfault_cy, lfault_pc, lfault_stval);
+                for i in 0..32 {
+                    $display("v4   lfault_reg[%h]=%h", i, lfault_regs[i]);
+                }
+                $display("v4   s2w_total=%h (ring cap=64, latest at idx %h)", s2w_total, s2w_idx);
+                for i in 0..64 {
+                    if s2w_cys[i] != 32'd0 {
+                        $display("v4   s2w[%h] cy=%h pc=%h data=%h",
+                                  i, s2w_cys[i], s2w_pcs[i], s2w_datas[i]);
+                    }
+                }
+                $display("v4   a0w_total=%h (ring cap=64, latest at idx %h)", a0w_total, a0w_idx);
+                for i in 0..64 {
+                    if a0w_cys[i] != 32'd0 {
+                        $display("v4   a0w[%h] cy=%h pc=%h data=%h",
+                                  i, a0w_cys[i], a0w_pcs[i], a0w_datas[i]);
+                    }
+                }
+                $display("v4   gbw_total=%h (ring cap=64, latest at idx %h)", gbw_total, gbw_idx);
+                for i in 0..64 {
+                    if gbw_cys[i] != 32'd0 {
+                        $display("v4   gbw[%h] cy=%h pc=%h rd=%h data=%h",
+                                  i, gbw_cys[i], gbw_pcs[i], gbw_rds[i], gbw_datas[i]);
+                    }
+                }
                 for i in 0..32 {
                     if trap_hist_cys[i] != 32'd0 {
                         $display("v4   trap_hist[%h] cy=%h pc=%h cause=%h",
@@ -843,7 +962,7 @@ module test_v4_linux_boot {
 
     initial {
         rst.assert(clk);
-        clk.next  (1_000_000); // 1M cy (smoke — boot reaches kernel banner)
+        clk.next  (3_000_000); // 3M cy — capture pre-OOPS context (fault at ~1.3M cy)
         $display  ("v4 linux real boot smoke: x3=%h pass=%b (smoke run, full boot needs ~100M cy)", r3, pass);
         // Smoke test only — comment in once a longer cycle budget is set:
         // $assert(pass, "v4 Linux real boot: expected x3=0xAA (SBI SRST shutdown)");
