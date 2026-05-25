@@ -709,7 +709,39 @@ pub module heliodor_core_v4 #(
     // ============================================================
     // M4 trap entry decisions (commit-time, registered into redirect)
     // ============================================================
-    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault);
+    let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal;
+    // M9 (2026-05-25): csrw satp must also act like an implicit sfence +
+    // pipeline redirect to match v1's IFU behavior. Linux head.S's trampoline
+    // sequence (csrw stvec=high; csrw satp=trampoline_pg; <expect fault>; ...)
+    // relies on the next fetch after csrw satp to walk with the new satp and
+    // fault — which redirects PC to high-half stvec. v4's narrow IFU + deep
+    // prefetch + satp_shadow lazy update misses this fault, so kernel head.S
+    // proceeds at low-half PC and panics later. The fix: redirect to next PC
+    // and update satp_shadow on csrw satp commit so the re-fetch goes through
+    // MMU with the new satp.
+    let commit_csrw_satp: logic = commit_csrwr && c_csr_addr == 12'h180;
+    // M9 (2026-05-25): on the FIRST csrw satp commit that turns on Sv39
+    // (bare→Sv39), inject a fake instruction page fault to match v1's TLB
+    // -eviction quirk that Linux head.S's trampoline_pg sequence depends on.
+    // v1's IFU happens to take an instruction page fault on the next fetch
+    // after csrw satp; v4's narrow + lazy MMU walks PT 0x80a8a successfully
+    // (PT maps low-half identity at the time of walk) and misses the fault.
+    // Kernel head.S expects the fault to redirect PC to high-half stvec, so
+    // we synthesize the fault here. After the first Sv39 enable the kernel
+    // sets up SFENCE.VMA and explicit stvec changes — no further fakes.
+    var first_satp_done: logic;
+    // Use c_csr_wdata (the value being written this cycle), not csr_satp
+    // (which is the OLD value at always_comb time — register updates NBA).
+    let inject_fake_ifault: logic = commit_csrw_satp && !first_satp_done && c_csr_wdata[63:60] == 4'd8;
+    always_ff (clk, rst) {
+        if_reset {
+            first_satp_done = 1'b0;
+        } else if commit_csrw_satp && c_csr_wdata[63:60] == 4'd8 {
+            first_satp_done = 1'b1;
+        }
+    }
+
+    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault || inject_fake_ifault);
     // M8.C: IRQ trap fires as soon as something is committing AND no
     // synchronous exception is firing (excp takes priority). Without
     // anything committing the trap can also fire if the pipeline is
@@ -719,14 +751,15 @@ pub module heliodor_core_v4 #(
     let commit_trap : logic = commit_excp || commit_irq;
     let commit_mret : logic = rob_commit_valid && c_is_mret;
     let commit_sret : logic = rob_commit_valid && c_is_sret;
-    let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal;
     assign commit_sfence_pulse = rob_commit_valid && c_is_sfence;
 
-    // M9: satp shadow latch (see declaration above)
+    // M9: satp shadow latch (see declaration above). Updated on either
+    // SFENCE.VMA commit OR csrw satp commit. The latter is non-standard
+    // but kernel head.S requires it (see commit_csrw_satp comment above).
     always_ff (clk, rst) {
         if_reset {
             satp_shadow = 64'd0;
-        } else if commit_sfence_pulse {
+        } else if commit_sfence_pulse || commit_csrw_satp {
             satp_shadow = csr_satp;
         }
     }
@@ -736,7 +769,7 @@ pub module heliodor_core_v4 #(
     // csr_v4 (already MSB-tagged + cause #).
     var excp_cause: logic<64>;
     always_comb {
-        if c_is_ifault {
+        if c_is_ifault || inject_fake_ifault {
             excp_cause = 64'd12; // instruction page fault
         } else if c_is_lfault {
             excp_cause = 64'd13; // load page fault
@@ -777,11 +810,15 @@ pub module heliodor_core_v4 #(
         i_wr_data   : c_csr_wdata              ,
         i_mtime     : i_mtime                  ,
         i_trap_fire : commit_trap              ,
-        i_trap_pc   : c_pc                     ,
+        // M9: inject_fake_ifault synthesizes a trap as if the post-csrw-satp
+        // fetch had taken a page fault. epc/stval = c_pc + 4 (the would-be
+        // faulting VA), cause = 12 via excp_cause path.
+        i_trap_pc   : if inject_fake_ifault ? c_pc + 64'd4 : c_pc,
         i_trap_cause: trap_cause               ,
         // mtval/stval for page faults carry the faulting VA; other
         // exception kinds leave it at 0 for now.
-        i_trap_tval : if (c_is_lfault || c_is_sfault) ? c_fault_vaddr : 64'd0,
+        i_trap_tval : if inject_fake_ifault ? c_pc + 64'd4
+                       : if (c_is_lfault || c_is_sfault) ? c_fault_vaddr : 64'd0,
         i_mret_fire : commit_mret              ,
         o_mtvec     : csr_mtvec                ,
         o_mepc      : csr_mepc                 ,
@@ -868,6 +905,12 @@ pub module heliodor_core_v4 #(
         } else if rob_commit_valid && c_mispredict {
             redirect_fire_q = 1'b1;
             redirect_pc_q   = c_redirect_pc;
+        } else if commit_csrw_satp {
+            // M9 (2026-05-25): csrw satp implicit redirect (see comment at
+            // commit_csrw_satp). Re-fetch the next instruction with the
+            // new satp so any low-half PC fetches that should fault, do.
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = c_pc + 64'd4;
         } else {
             redirect_fire_q = 1'b0;
         }
