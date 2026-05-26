@@ -1,31 +1,30 @@
-// SystemVerilog testbench for heliodor_test_linux_boot_harness under Verilator.
+// SystemVerilog testbench for heliodor_test_v4_linux_boot_harness under Verilator.
 // The harness internally loads firmware + DRAM via $readmemh and streams
 // UART output via $write, so this binary must be run from the heliodor
 // project root directory.
 
 `timescale 1ns/1ps
 
-module tb_linux_boot;
+module tb_v4_linux_boot;
     logic        clk;
     logic        rst;
     logic        pass;
-    logic [63:0] r1, r2, r3;
+    logic [63:0] r3;
     int unsigned cy;
     int          logf;
 
-    heliodor_test_linux_boot_harness dut (
+    heliodor_test_v4_linux_boot_harness dut (
         .clk   (clk),
         .rst   (rst),
         .o_pass(pass),
-        .o_r1  (r1),
-        .o_r2  (r2),
         .o_r3  (r3)
     );
 
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
-    // dmem activity logger: log every DRAM-range ren or wen for v1/v4 diff.
+    // dmem activity logger: for each ren or wen in DRAM range, log (cy, addr, ren, wen, wdata, rdata).
+    // Filter to DRAM (addr[31]=1) to skip firmware/UART/CLINT noise.
     always @(posedge clk) begin
         if (rst) begin
             cy <= cy + 1;
@@ -39,26 +38,24 @@ module tb_linux_boot;
 
     initial begin
         cy = 0;
-        logf = $fopen("/tmp/v1_dmem.log", "w");
-        if (logf == 0) $fatal(1, "v1: cannot open log file");
+        logf = $fopen("/tmp/v4_dmem.log", "w");
+        if (logf == 0) $fatal(1, "v4: cannot open log file");
         rst = 1'b0;
         repeat (4) @(posedge clk);
         rst = 1'b1;
 
-        // 5M cy: enough to cover v4's panic point (~1M cy on v4); v1 boots in 27M but
-        // we only need the early region for diff against v4's pre-OOPS sequence.
         for (int unsigned i = 0; i < 5_000_000; i++) begin
             @(posedge clk);
             if (pass) break;
         end
 
         $fclose(logf);
-        $display("tb_linux_boot: r1=%h r2=%h r3=%h pass=%0b", r1, r2, r3, pass);
+        $display("tb_v4_linux_boot: r3=%h pass=%0b", r3, pass);
         if (pass) begin
-            $display("Real Linux kernel boot test PASSED");
+            $display("v4 Real Linux kernel boot test PASSED");
             $finish;
         end else begin
-            $display("Real Linux kernel boot test PROGRESS (logged to /tmp/v1_dmem.log)");
+            $display("v4 Real Linux kernel boot test FAILED (logged to /tmp/v4_dmem.log)");
             $finish;
         end
     end
