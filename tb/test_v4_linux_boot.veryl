@@ -72,6 +72,9 @@ module test_v4_linux_boot_harness (
     var dbg_alu_imm     : logic<64>;
     var dbg_stval     : logic<64>;
     var dbg_mtval     : logic<64>;
+    var dbg_dmm_busy  : logic    ;
+    var dbg_iptw_req  : logic    ;
+    var dbg_core_dren : logic    ;
     var _ret_v: logic; var _ret_pc: logic<64>; var _ret_rdv: logic; var _ret_rd: logic<5>; var _ret_data: logic<64>;
     var _rename_cnt: logic<32>; var _cdb_cnt: logic<32>; var _rob_size: logic<8>;
     var _if_v: logic; var _if_instr: logic<32>; var _stall_dr: logic;
@@ -136,9 +139,9 @@ module test_v4_linux_boot_harness (
         o_dbg_ptw_req      : dbg_ptw_req, o_dbg_ptw_addr: dbg_ptw_addr, o_dbg_ptw_data: dbg_ptw_data,
         o_dbg_redirect_fire: dbg_redir_v, o_dbg_redirect_pc: dbg_redir_pc, o_dbg_redirect_src_pc: dbg_redir_src,
         o_dbg_alu_pc_out: dbg_alu_pc, o_dbg_alu_src_a_out: dbg_alu_src_a, o_dbg_alu_src_b_out: dbg_alu_src_b, o_dbg_alu_use_pc_a_out: dbg_alu_use_pc_a, o_dbg_alu_rs1_data_out: dbg_alu_rs1_data, o_dbg_alu_valid_out: dbg_alu_valid, o_dbg_alu_alu_out_out: dbg_alu_alu_out, o_dbg_alu_instr_out: dbg_alu_instr, o_dbg_alu_imm_out: dbg_alu_imm, o_dbg_stval_out: dbg_stval, o_dbg_mtval_out: dbg_mtval,
-        o_dbg_dmem_mmu_busy: _, o_dbg_core_dmem_vaddr: _,
-        o_dbg_core_dmem_wen: _, o_dbg_core_dmem_ren: _,
-        o_dbg_imem_ptw_req: _, o_dbg_commit_store_fire: _,
+        o_dbg_dmem_mmu_busy: dbg_dmm_busy, o_dbg_core_dmem_vaddr: _,
+        o_dbg_core_dmem_wen: _, o_dbg_core_dmem_ren: dbg_core_dren,
+        o_dbg_imem_ptw_req: dbg_iptw_req, o_dbg_commit_store_fire: _,
     );
 
     // Firmware ROM: 16 KB
@@ -1324,6 +1327,166 @@ module test_v4_linux_boot_harness (
                                   k, post_cy[k], post_pc[k], post_rd[k], post_dat[k]);
                     }
                     post_arm = 1'b0;
+                }
+            }
+        }
+    }
+
+    // M9.A.257: per-cycle dmem activity dump around suspected failing
+    // load cycle (6651880..6651910). Shows dmem_addr / ren / rdata / busy
+    // / ptw / IMMU PTW takeover / ALU EX so we can see exactly what
+    // o_dmem_addr was at the moment alu_wrap captured 0.
+    always_ff (clk, rst) {
+        if_reset {} else {
+            if trace_cy_v4 >: 32'd6651880 && trace_cy_v4 <: 32'd6651910 {
+                $display("[v4 cy=%d] dmem_addr=%h ren=%b wen=%b rdata=%h iptw=%b iptw_addr=---"
+                          , trace_cy_v4, dmem_addr, dmem_ren, dmem_wen, dmem_rdata, dbg_iptw_req);
+                $display("           dmem_mmu_busy=%b core_dren=%b ptw_req=%b ptw_addr=%h alu_v=%b alu_pc=%h alu_out=%h",
+                          dbg_dmm_busy, dbg_core_dren, dbg_ptw_req, dbg_ptw_addr,
+                          dbg_alu_valid, dbg_alu_pc, dbg_alu_alu_out);
+            }
+        }
+    }
+
+    // M9.A.256: trace memmap_init_range loop fault chain.
+    // Disasm (verified from linux_dram_real_v4_patched.hex):
+    //   PC 0x80217740  ld   a4, 0(s10)      ← a4 = mem[s10] (zone start_pfn)
+    //   PC 0x80217744  ld   a0, 0(s9)       ← a0 = mem[s9]  (vmemmap base, SUSPECT)
+    //   PC 0x80217748  c.li a3, -1
+    //   PC 0x8021774a  sub  a4, s0, a4      ← a4 = pfn - start_pfn
+    //   PC 0x8021774e  mul  a4, a4, s11     ← a4 *= sizeof(page)=0x38
+    //   PC 0x80217752  c.add a0, a0, a4     ← a0 = vmemmap_base + offset
+    //   ... (later)
+    //   PC 0x80217766  sd   zero, 24(a0)    ← FAULT (badaddr=a0+24=0x9d60)
+    //
+    // Reverse derivation: a0_final=0x9d48, badaddr=0x9d60. a4=(s0-mem[s10])*0x38.
+    // Observed s0=0x802cf, s11=0x38. If mem[s10]=0x80000 then a4=0x9d48 exactly,
+    // which means a0_old must be 0 — i.e. ld a0,0(s9) wrongly returns 0.
+    // v1 boots same binary to SBI shutdown, so this is a v4-specific load bug.
+    //
+    // Strategy: ring of last 16 iterations capturing (ld_a4_val, ld_a0_val,
+    // cadd_a0_result) per iteration. Freeze on first cause=15 store fault.
+    var mm_ldA4_data: logic<64> [16];
+    var mm_ldA4_cy  : logic<32> [16];
+    var mm_ldA4_idx : logic<4>;
+    var mm_ldA0_data: logic<64> [16];
+    var mm_ldA0_cy  : logic<32> [16];
+    var mm_ldA0_idx : logic<4>;
+    var mm_cadd_data: logic<64> [16];
+    var mm_cadd_cy  : logic<32> [16];
+    var mm_cadd_idx : logic<4>;
+    var mm_sub_data : logic<64> [16];
+    var mm_sub_cy   : logic<32> [16];
+    var mm_sub_idx  : logic<4>;
+    var mm_mul_data : logic<64> [16];
+    var mm_mul_cy   : logic<32> [16];
+    var mm_mul_idx  : logic<4>;
+    var mm_freeze   : logic;
+    var mm_dumped   : logic;
+
+    // Store page fault (cause=15) snapshot — distinct from existing cause=13.
+    var sfault_seen : logic;
+    var sfault_cy   : logic<32>;
+    var sfault_pc   : logic<64>;
+    var sfault_tval : logic<64>;
+    var sfault_regs : logic<64> [32];
+
+    let mm_p_ldA4: logic = _ret_v && (_ret_pc == 64'hffffffff80217740);
+    let mm_p_ldA0: logic = _ret_v && (_ret_pc == 64'hffffffff80217744);
+    let mm_p_sub : logic = _ret_v && (_ret_pc == 64'hffffffff8021774a);
+    let mm_p_mul : logic = _ret_v && (_ret_pc == 64'hffffffff8021774e);
+    let mm_p_cadd: logic = _ret_v && (_ret_pc == 64'hffffffff80217752);
+
+    always_ff (clk, rst) {
+        if_reset {
+            mm_ldA4_idx = 4'd0; mm_ldA0_idx = 4'd0; mm_cadd_idx = 4'd0;
+            mm_sub_idx  = 4'd0; mm_mul_idx  = 4'd0;
+            mm_freeze   = 1'b0; mm_dumped   = 1'b0;
+            sfault_seen = 1'b0;
+            sfault_cy   = 32'd0;
+            sfault_pc   = 64'd0;
+            sfault_tval = 64'd0;
+            for k in 0..16 {
+                mm_ldA4_data[k] = 64'd0; mm_ldA4_cy[k] = 32'd0;
+                mm_ldA0_data[k] = 64'd0; mm_ldA0_cy[k] = 32'd0;
+                mm_cadd_data[k] = 64'd0; mm_cadd_cy[k] = 32'd0;
+                mm_sub_data[k]  = 64'd0; mm_sub_cy[k]  = 32'd0;
+                mm_mul_data[k]  = 64'd0; mm_mul_cy[k]  = 32'd0;
+            }
+            for k in 0..32 { sfault_regs[k] = 64'd0; }
+        } else {
+            if !mm_freeze {
+                if mm_p_ldA4 {
+                    mm_ldA4_data[mm_ldA4_idx] = _ret_data;
+                    mm_ldA4_cy  [mm_ldA4_idx] = trace_cy_v4;
+                    mm_ldA4_idx               = mm_ldA4_idx + 4'd1;
+                }
+                if mm_p_ldA0 {
+                    mm_ldA0_data[mm_ldA0_idx] = _ret_data;
+                    mm_ldA0_cy  [mm_ldA0_idx] = trace_cy_v4;
+                    mm_ldA0_idx               = mm_ldA0_idx + 4'd1;
+                }
+                if mm_p_sub {
+                    mm_sub_data[mm_sub_idx] = _ret_data;
+                    mm_sub_cy  [mm_sub_idx] = trace_cy_v4;
+                    mm_sub_idx              = mm_sub_idx + 4'd1;
+                }
+                if mm_p_mul {
+                    mm_mul_data[mm_mul_idx] = _ret_data;
+                    mm_mul_cy  [mm_mul_idx] = trace_cy_v4;
+                    mm_mul_idx              = mm_mul_idx + 4'd1;
+                }
+                if mm_p_cadd {
+                    mm_cadd_data[mm_cadd_idx] = _ret_data;
+                    mm_cadd_cy  [mm_cadd_idx] = trace_cy_v4;
+                    mm_cadd_idx               = mm_cadd_idx + 4'd1;
+                }
+            }
+            if dbg_trap_fire && dbg_trap_cause == 64'd15 && !sfault_seen {
+                sfault_seen = 1'b1;
+                sfault_cy   = trace_cy_v4;
+                sfault_pc   = dbg_trap_pc;
+                sfault_tval = if dbg_trap_to_s ? dbg_stval : dbg_mtval;
+                for i in 0..32 {
+                    sfault_regs[i] = dbg_regs[i];
+                }
+            }
+            if sfault_seen && !mm_freeze {
+                mm_freeze = 1'b1;
+            }
+            if mm_freeze && !mm_dumped {
+                mm_dumped = 1'b1;
+                $display("[v4 STORE PAGE FAULT cause=15] cy=%d pc=%h badaddr=%h sfault_iter15_load_cy=likely_6651894", sfault_cy, sfault_pc, sfault_tval);
+                $display("  regs: a0=%h a1=%h a2=%h a3=%h a4=%h a5=%h",
+                          sfault_regs[10], sfault_regs[11], sfault_regs[12],
+                          sfault_regs[13], sfault_regs[14], sfault_regs[15]);
+                $display("  regs: s0=%h s1=%h s7=%h s8=%h s9=%h s10=%h s11=%h",
+                          sfault_regs[8], sfault_regs[9], sfault_regs[23],
+                          sfault_regs[24], sfault_regs[25], sfault_regs[26], sfault_regs[27]);
+                $display("[v4 memmap iter ring: ld_a4 @PC 80217740 last 16, oldest first]");
+                for k in 0..16 {
+                    let off: logic<4> = mm_ldA4_idx + k;
+                    $display("  ldA4[%h] cy=%d data=%h", k, mm_ldA4_cy[off], mm_ldA4_data[off]);
+                }
+                $display("[v4 memmap iter ring: ld_a0 @PC 80217744 last 16, oldest first]");
+                for k in 0..16 {
+                    let off: logic<4> = mm_ldA0_idx + k;
+                    $display("  ldA0[%h] cy=%d data=%h", k, mm_ldA0_cy[off], mm_ldA0_data[off]);
+                }
+                $display("[v4 memmap iter ring: sub_a4 @PC 8021774a last 16, oldest first]");
+                for k in 0..16 {
+                    let off: logic<4> = mm_sub_idx + k;
+                    $display("  subA4[%h] cy=%d data=%h", k, mm_sub_cy[off], mm_sub_data[off]);
+                }
+                $display("[v4 memmap iter ring: mul_a4 @PC 8021774e last 16, oldest first]");
+                for k in 0..16 {
+                    let off: logic<4> = mm_mul_idx + k;
+                    $display("  mulA4[%h] cy=%d data=%h", k, mm_mul_cy[off], mm_mul_data[off]);
+                }
+                $display("[v4 memmap iter ring: c.add a0 @PC 80217752 last 16, oldest first]");
+                for k in 0..16 {
+                    let off: logic<4> = mm_cadd_idx + k;
+                    $display("  caddA0[%h] cy=%d data=%h", k, mm_cadd_cy[off], mm_cadd_data[off]);
                 }
             }
         }
