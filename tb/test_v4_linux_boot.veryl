@@ -86,6 +86,11 @@ module test_v4_linux_boot_harness (
     var dbg_agu_is_load : logic    ;
     var dbg_agu_is_store: logic    ;
     var dbg_agu_rob_idx : logic<5> ;
+    // M9.A.295: F2 walk-owner / inject internal state
+    var dbg_walk_v     : logic    ;
+    var dbg_walk_rob   : logic<5> ;
+    var dbg_walk_vaddr : logic<64>;
+    var dbg_lfault_inj : logic    ;
     var _ret_v: logic; var _ret_pc: logic<64>; var _ret_rdv: logic; var _ret_rd: logic<5>; var _ret_data: logic<64>;
     var _rename_cnt: logic<32>; var _cdb_cnt: logic<32>; var _rob_size: logic<8>;
     var _if_v: logic; var _if_instr: logic<32>; var _stall_dr: logic;
@@ -158,6 +163,8 @@ module test_v4_linux_boot_harness (
         o_dbg_agu_imm: dbg_agu_imm, o_dbg_agu_addr: dbg_agu_addr,
         o_dbg_agu_is_load: dbg_agu_is_load, o_dbg_agu_is_store: dbg_agu_is_store,
         o_dbg_agu_rob_idx: dbg_agu_rob_idx,
+        o_dbg_walk_v: dbg_walk_v, o_dbg_walk_rob: dbg_walk_rob,
+        o_dbg_walk_vaddr: dbg_walk_vaddr, o_dbg_lfault_inj: dbg_lfault_inj,
     );
 
     // Firmware ROM: 16 KB
@@ -286,6 +293,9 @@ module test_v4_linux_boot_harness (
     var a5_ring_data: logic<64> [32];
     var a5_ring_idx : logic<5>      ;
     var a5_dumped   : logic         ;
+    // M9.A.296: late dump (near end of run) of the trap_ring to see the
+    // ACTUAL init-death trap sequence (~cy 16M), not the first cause=13.
+    var late_dumped : logic         ;
     // M9.A.260: a0 (rd=10) write ring — 64 entries, frozen at first
     // cause=13 trap. Find which load wrote a0=0xffffffff8009d8f2
     // (= the wild kernel-text pointer that propagated through s1/s2).
@@ -523,6 +533,7 @@ module test_v4_linux_boot_harness (
             ecall_seen = 1'b0;
             a5_ring_idx = 5'd0;
             a5_dumped = 1'b0;
+            late_dumped = 1'b0;
             for k in 0..32 {
                 a5_ring_pc[k] = 64'd0;
                 a5_ring_cy[k] = 32'd0;
@@ -942,12 +953,13 @@ module test_v4_linux_boot_harness (
                 sp_ring_data[sp_ring_idx] = _ret_data;
                 sp_ring_idx               = sp_ring_idx + 8'd1;
             }
-            // M9.A.293: UNCONDITIONAL per-issue AGU capture (decisive test).
-            // Drops the rs1_arch==2 filter so we see the bad cy 22364522
-            // issue (which had rs1_arch != 2 and was thus invisible before).
-            // Window [22364480, 22364531] for context; records rob_idx +
-            // rs1_arch + dmem_mmu_busy. 1-wide issue → ≤51 entries.
-            if cy >: 32'd22364479 && cy <: 32'd22364531 && dbg_agu_issue_v && !a5_dumped {
+            // M9.A.295: UNCONDITIONAL per-issue AGU capture, moved to the new
+            // first-fault window (cy ~15820178, PC 0x8009d8ba = `ld a0,264(a5)`).
+            // Goal: see what a5 (rs1_arch=15) value the faulting load read at
+            // issue. If prf_rs1_data != committed 0xffffffe000ccd200, the load
+            // issued with a STALE a5 (wakeup/RAW bug). Window [15819900,15820200];
+            // a5_dumped fires at the fault so capture stops there. Wraps mod 256.
+            if cy >: 32'd15819899 && cy <: 32'd15820201 && dbg_agu_issue_v && !a5_dumped {
                 sp_agu_cy[sp_agu_idx]   = cy;
                 sp_agu_robi[sp_agu_idx] = dbg_agu_rob_idx;
                 sp_agu_arch[sp_agu_idx] = dbg_agu_rs1_arch;
@@ -997,6 +1009,23 @@ module test_v4_linux_boot_harness (
                 if !ecall_seen && (dbg_trap_cause == 64'd8 || dbg_trap_cause == 64'd9 || dbg_trap_cause == 64'd11) {
                     ecall_seen = 1'b1;
                     ecall_first_cy = cy;
+                }
+            }
+            // M9.A.296: late dump near end of run (after the init-death panic
+            // ~cy 16M). trap_ring is a 128-entry wrap ring captured WITHOUT
+            // the a5_dumped freeze, so it holds the LAST 128 traps — revealing
+            // the actual fatal trap sequence that killed init, not the first
+            // (possibly benign) cause=13.
+            if cy >: 32'd17399999 && !late_dumped {
+                late_dumped = 1'b1;
+                $display("[v4 M9.A.296 LATE trap_ring — last 128 traps before cy 17.4M (oldest first): finds the init-death trap sequence]");
+                for k in 0..128 {
+                    let off: logic<7> = trap_ring_idx + (k as 7);
+                    if trap_ring_cy[off] != 32'd0 {
+                        $display("  ltrap[%h] cy=%d pc=%h cause=%h tval=%h satp=%h to_s=%b",
+                                  k, trap_ring_cy[off], trap_ring_pc[off], trap_ring_cause[off],
+                                  trap_ring_tval[off], trap_ring_satp[off], trap_ring_to_s[off]);
+                    }
                 }
             }
             if lfault_seen && !a5_dumped {
@@ -1149,7 +1178,7 @@ module test_v4_linux_boot_harness (
                                   k, sp_ring_cy[off], sp_ring_pc[off], sp_ring_data[off]);
                     }
                 }
-                $display("[v4 agu_ring — UNCONDITIONAL per-issue in cy [22364480,22364530] (oldest first). DECISIVE: compare rob_idx of bad cy 22364522 (addr=...1078) vs correct cy 22364523 (addr=...ccbdb8)]");
+                $display("[v4 agu_ring — UNCONDITIONAL per-issue in cy [15819900,15820200] (oldest first). M9.A.295: find the `ld a0,264(a5)` issue (arch=0f imm=0x108); if rs1(a5) != committed 0xffffffe000ccd200, it issued with STALE a5 (wakeup/RAW bug)]");
                 for k in 0..256 {
                     let off: logic<8> = sp_agu_idx + (k as 8);
                     if sp_agu_cy[off] != 32'd0 {
@@ -1227,6 +1256,15 @@ module test_v4_linux_boot_harness (
                           dbg_alu_src_a, dbg_alu_src_b, dbg_alu_rs1_data, dbg_alu_imm,
                           dbg_alu_instr, dbg_pc);
             }
+            // M9.A.295: per-cycle F2 walk-owner + MMU state around the new
+            // fault (cy 15820178). Shows which load owns the faulting walk
+            // (walk_rob/walk_vaddr), when inject fires, and the dmem/MMU view.
+            if cy >: 32'd15820159 && cy <: 32'd15820186 {
+                $display("[v4 f2 cy=%d] busy=%b walk_v=%b walk_rob=%h walk_vaddr=%h inj=%b | iss_v=%b iss_rob=%h iss_arch=%h iss_addr=%h ld=%b | dmem_addr=%h ren=%b dbg_pc=%h",
+                          cy, dbg_dmm_busy, dbg_walk_v, dbg_walk_rob, dbg_walk_vaddr, dbg_lfault_inj,
+                          dbg_agu_issue_v, dbg_agu_rob_idx, dbg_agu_rs1_arch, dbg_agu_addr, dbg_agu_is_load,
+                          dmem_addr, dmem_ren, dbg_pc);
+            }
         }
     }
 
@@ -1295,7 +1333,7 @@ module test_v4_linux_boot {
 
     initial {
         rst.assert(clk);
-        clk.next  (25_000_000); // 25M cy — M9.A.259: OOPS at cy ~21.4M (post-M9.A.258 fix). v4 sim ~7K cy/sec → ~60min
+        clk.next  (25_000_000); // M9.A.296 F3: restore 25M to check if the spurious-fault fix lets boot pass the init OOPS toward SBI shutdown (~50min).
         $display  ("v4 SUMMARY cy=%h ret=%h lrc=%h trap=%h pri=%h satp=%h pc=%h", s_cy, s_ret, s_lrc, s_trapcnt, s_priv, s_satp, s_pc);
         $display  ("v4 SUMMARY lf=%b lpc=%h ftpc=%h fcause=%h tlpc=%h tlcause=%h", s_lf, s_lpc, s_ftpc, s_fcause, s_tlpc, s_tlcause);
         $display  ("v4 SUMMARY uart=%h ecall=%h", s_uart, s_ecall);
