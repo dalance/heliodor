@@ -78,6 +78,12 @@ pub module rob_v4 #(
     o_commit_store_funct3: output logic<3>      ,
     // M2 LOAD-after-STORE ordering
     o_has_pending_store  : output logic         ,
+    // M9.A.298 translation-state barrier: high while any in-flight (valid,
+    // not-yet-committed) entry will change translation state — a CSR write to
+    // sstatus/mstatus/satp, an SFENCE.VMA, or an MRET/SRET. A younger LOAD/AMO
+    // must not translate through the MMU until these commit (else it sees
+    // stale SUM/MXR/MPRV/priv/satp and records a spurious page fault).
+    o_has_pending_xlate  : output logic         ,
     // M4 CSR drain + trap
     o_commit_is_csr      : output logic         ,
     o_commit_csr_addr    : output logic<12>     ,
@@ -223,6 +229,30 @@ pub module rob_v4 #(
         }
     }
     assign o_has_pending_store = pending_store_w;
+
+    // M9.A.298: translation-affecting state-change barrier. OR-reduce over the
+    // active ROB window: a valid entry that is a CSR write to sstatus (0x100) /
+    // mstatus (0x300) / satp (0x180), or an SFENCE.VMA, or an MRET/SRET. While
+    // any such entry is in flight, a younger LOAD/AMO issuing to the AGU would
+    // translate through the MMU using the OLD (committed) SUM/MXR/MPRV/priv/satp
+    // and record a spurious page fault — Linux brackets user accesses with
+    // `csrs sstatus,SUM; ld; csrc sstatus,SUM`, and the OoO load can translate
+    // with SUM=0 before the csrs commits. Mirrors v1's i_amo_lq_stall narrow
+    // CSR scope (heliodor_core.veryl:1186). iq_int's at_head escape keeps the
+    // oldest entry issuable, so this can never deadlock the ROB head.
+    var pending_xlate_w: logic;
+    always_comb {
+        pending_xlate_w = 1'b0;
+        for i in 0..ROB_DEPTH {
+            if sh_valid[i] && (
+                (sh_is_csr[i] && (sh_csr_addr[i] == 12'h100 || sh_csr_addr[i] == 12'h300 || sh_csr_addr[i] == 12'h180))
+                || sh_is_sfence[i] || sh_is_mret[i] || sh_is_sret[i]
+            ) {
+                pending_xlate_w = 1'b1;
+            }
+        }
+    }
+    assign o_has_pending_xlate = pending_xlate_w;
     assign o_head_idx     = head_idx;
     assign o_size         = size_w[5:0] as 8;
     assign o_dbg_head_valid   = sh_valid[head_idx];
@@ -326,9 +356,14 @@ pub module rob_v4 #(
                 sh_store_data[tail_idx]  = 64'd0;
                 sh_store_funct3[tail_idx]= 3'd0;
                 // M4: ecall/ebreak/mret captured at alloc-time (decode
-                // result). CSR is captured at CDB writeback (below).
-                sh_is_csr[tail_idx]      = 1'b0;
-                sh_csr_addr[tail_idx]    = 12'd0;
+                // result). M9.A.298: is_csr/csr_addr now ALSO captured at
+                // alloc (was deferred to CDB) so the translation-barrier
+                // (o_has_pending_xlate below) sees a translation-affecting
+                // CSR write from dispatch — a younger LOAD must not translate
+                // through the MMU before that CSR commits. csr_wdata is still
+                // filled at CDB (the barrier needs only is_csr + csr_addr).
+                sh_is_csr[tail_idx]      = i_alloc_entry.is_csr;
+                sh_csr_addr[tail_idx]    = i_alloc_entry.csr_addr;
                 sh_csr_wdata[tail_idx]   = 64'd0;
                 sh_is_ecall[tail_idx]    = i_alloc_entry.is_ecall;
                 sh_is_ebreak[tail_idx]   = i_alloc_entry.is_ebreak;

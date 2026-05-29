@@ -142,6 +142,15 @@ pub module heliodor_core_v4 #(
     o_dbg_walk_rob     : output logic<5>      ,
     o_dbg_walk_vaddr   : output logic<64>     ,
     o_dbg_lfault_inj   : output logic         ,
+    // M9.A.298: CSR translation-state snoop. The MMU's permission check for a
+    // U=1 page load in S-mode reduces to tlb_u_ok = i_sum. A TLB-hit load
+    // page-fault therefore implies csr_sum==0 at translate time. Exposing the
+    // SUM/priv/MXR the dmem MMU sees lets us confirm the OoO CSR-write-vs-load
+    // ordering hazard (load translates before an older `csrs sstatus,SUM`
+    // commits → MMU sees stale SUM=0 → spurious fault).
+    o_dbg_csr_sum      : output logic         ,
+    o_dbg_csr_mxr      : output logic         ,
+    o_dbg_csr_dmem_priv: output logic<2>      ,
 ) {
     import pipeline_v4_pkg::*;
 
@@ -192,6 +201,7 @@ pub module heliodor_core_v4 #(
     var walk_v_q     : logic     ;
     var walk_rob_q   : logic<5>  ;
     var walk_vaddr_q : logic<64> ;
+    var walk_is_store_q: logic   ; // M9.A.299: walk started by a commit-store
     var lfault_inj_v : logic     ; // fault delivery to walk owner this cycle
     var rob_cdb_is_lfault: logic ; // cdb.is_lfault with mis-attribution removed
     // M5.D: medeleg needed by trap_to_s computation in commit stage.
@@ -427,8 +437,12 @@ pub module heliodor_core_v4 #(
         rob_alloc_entry.store_data     = 64'd0;
         rob_alloc_entry.store_funct3   = 3'd0;
         // M4 fields captured at alloc (decode)
-        rob_alloc_entry.is_csr         = 1'b0; // CSR write captured at CDB
-        rob_alloc_entry.csr_addr       = 12'd0;
+        // M9.A.298: capture is_csr/csr_addr at alloc (was deferred to CDB) so
+        // the ROB translation-barrier (o_has_pending_xlate) sees a pending CSR
+        // write to sstatus/mstatus/satp from dispatch and blocks younger LOADs
+        // from translating with stale SUM/MXR/satp. csr_wdata still filled at CDB.
+        rob_alloc_entry.is_csr         = dec_op.is_csr;
+        rob_alloc_entry.csr_addr       = dec_op.csr_addr;
         rob_alloc_entry.csr_wdata      = 64'd0;
         rob_alloc_entry.is_ecall       = dec_op.is_ecall;
         rob_alloc_entry.is_ebreak      = dec_op.is_ebreak;
@@ -469,6 +483,7 @@ pub module heliodor_core_v4 #(
     var iq_iss_csr_imm   : logic    ;
     var iq_iss_rs1_arch  : logic<5> ;
     var rob_has_pending_store: logic;
+    var rob_has_pending_xlate: logic; // M9.A.298 translation-barrier
 
     var prf_rs1_data: logic<64>;
     var prf_rs2_data: logic<64>;
@@ -631,6 +646,7 @@ pub module heliodor_core_v4 #(
         i_issue_ack         : iq_issue_ack  ,
         i_flush             : redirect_fire ,
         i_block_loads       : rob_has_pending_store, // M2 conservative gate
+        i_block_mem_xlate   : rob_has_pending_xlate, // M9.A.298 xlate barrier
         i_rob_head_idx      : rob_head_idx           ,
     );
 
@@ -735,6 +751,7 @@ pub module heliodor_core_v4 #(
         o_commit_store_data  : c_store_data  ,
         o_commit_store_funct3: c_store_funct3,
         o_has_pending_store  : rob_has_pending_store,
+        o_has_pending_xlate  : rob_has_pending_xlate,
         o_commit_is_csr      : c_is_csr      ,
         o_commit_csr_addr    : c_csr_addr    ,
         o_commit_csr_wdata   : c_csr_wdata   ,
@@ -800,7 +817,17 @@ pub module heliodor_core_v4 #(
     var first_satp_done: logic;
     // Use c_csr_wdata (the value being written this cycle), not csr_satp
     // (which is the OLD value at always_comb time — register updates NBA).
-    let inject_fake_ifault: logic = commit_csrw_satp && !first_satp_done && c_csr_wdata[63:60] == 4'd8;
+    // M9.A.300: only synthesize the fake instruction page fault when the satp
+    // write happens in S-mode (or U). The hack mimics v1's IFU faulting on the
+    // high-half fetch after Linux head.S enables Sv39 — which only occurs when
+    // instruction fetch TRANSLATES (priv != M). An M-mode `csrw satp` (e.g.
+    // rv64si-dirty turning on VM to test MPRV load/store translation) keeps
+    // fetch in Bare mode, so no real ifault would occur — injecting one there
+    // is spurious and derails the test (it took a phantom cause=12 trap before
+    // reaching its store-fault subtest). Boot is unaffected: OpenSBI firmware
+    // never writes a MODE=8 satp in M-mode; the kernel's first Sv39 enable is
+    // in S-mode, so the hack still fires for Linux.
+    let inject_fake_ifault: logic = commit_csrw_satp && !first_satp_done && c_csr_wdata[63:60] == 4'd8 && csr_priv != csr_pkg::PrivLevel::MACHINE;
     always_ff (clk, rst) {
         if_reset {
             first_satp_done = 1'b0;
@@ -809,7 +836,20 @@ pub module heliodor_core_v4 #(
         }
     }
 
-    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault || inject_fake_ifault);
+    // M9.A.299: store page fault (cause=15) delivery. A STORE translates only
+    // at commit (core_dmem_vaddr=c_store_addr, core_dmem_wen=commit_store_fire),
+    // so dmem_mmu_fault_s asserts at COMMIT for a faulting store — the ROB never
+    // records sfault for commit-translated stores (its CDB-time is_sfault is
+    // always 0 for them), so without this the fault is silently dropped: the
+    // store's head pops normally (the write itself is suppressed by dmem_mmu's
+    // ptw_valid gate) but no trap fires. Confirmed by rv64si-dirty hanging
+    // (D-bit demand store fault) and breaks execve demand-paging store faults.
+    // Defined from primitives (not commit_store_fire, which is in the dmem
+    // section below) to keep declaration order valid. dmem_mmu_fault_s already
+    // implies i_wen (= commit_store_fire), so this only fires on a real store.
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && dmem_mmu_fault_s;
+    let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
+    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault);
     // M8.C: IRQ trap fires as soon as something is committing AND no
     // synchronous exception is firing (excp takes priority).
     //
@@ -852,7 +892,7 @@ pub module heliodor_core_v4 #(
             excp_cause = 64'd12; // instruction page fault
         } else if c_is_lfault {
             excp_cause = 64'd13; // load page fault
-        } else if c_is_sfault {
+        } else if c_is_sfault_eff {
             excp_cause = 64'd15; // store/AMO page fault
         } else if c_illegal {
             excp_cause = 64'd2;  // illegal instruction
@@ -904,8 +944,14 @@ pub module heliodor_core_v4 #(
         i_trap_cause: trap_cause               ,
         // mtval/stval for page faults carry the faulting VA; other
         // exception kinds leave it at 0 for now.
+        // M9.A.299: store-fault tval = the faulting store VA (c_store_addr);
+        // load-fault tval = c_fault_vaddr (set by the ROB inject port). A
+        // commit-translated store never sets sh_fault_vaddr, so use c_store_addr.
         i_trap_tval : if inject_fake_ifault ? c_pc + 64'd4
-                       : if (c_is_lfault || c_is_sfault) ? c_fault_vaddr : 64'd0,
+                       : if c_is_lfault ? c_fault_vaddr
+                       : if commit_store_sfault ? c_store_addr
+                       : if c_is_sfault ? c_fault_vaddr
+                       : 64'd0,
         i_mret_fire : commit_mret              ,
         o_mtvec     : csr_mtvec                ,
         o_mepc      : csr_mepc                 ,
@@ -1158,20 +1204,29 @@ pub module heliodor_core_v4 #(
             walk_v_q     = 1'b0;
             walk_rob_q   = 5'd0;
             walk_vaddr_q = 64'd0;
+            walk_is_store_q = 1'b0;
         } else if redirect_fire_q {
             walk_v_q = 1'b0;
         } else if dmem_walk_start {
             walk_v_q     = 1'b1;
             walk_rob_q   = iq_iss_rob_idx;
             walk_vaddr_q = core_dmem_vaddr;
+            // M9.A.299: a walk driven by a commit-store is a STORE walk. Its
+            // fault is delivered via commit_store_sfault (commit-time), NOT the
+            // load inject port — and walk_rob_q (= issue idx) is meaningless for
+            // it (the IQ is gated off during dmem_mmu_busy). Record store-ness so
+            // lfault_inj_v below does not inject a SPURIOUS load fault into that
+            // stale rob_idx when the store walk faults.
+            walk_is_store_q = commit_store_fire;
         } else if walk_v_q && !dmem_mmu_busy {
             // Walk resolved (success or fault). Owner cleared; if it was a
             // fault, lfault_inj_v delivered it this same cycle.
             walk_v_q = 1'b0;
         }
     }
-    // Deliver the load fault to the walk owner when the walk faults.
-    assign lfault_inj_v = dmem_mmu_fault && walk_v_q;
+    // Deliver the load fault to the walk owner when a LOAD walk faults. Store
+    // walk faults (walk_is_store_q) are handled at commit (commit_store_sfault).
+    assign lfault_inj_v = dmem_mmu_fault && walk_v_q && !walk_is_store_q;
     // Suppress the CDB's is_lfault when it would mis-attribute the owner's
     // fault to a different (current-issue) rob_idx. If the current issue IS
     // the owner, or there is no tracked walk (e.g. a direct TLB-permission
@@ -1295,4 +1350,9 @@ pub module heliodor_core_v4 #(
     assign o_dbg_walk_rob         = walk_rob_q;
     assign o_dbg_walk_vaddr       = walk_vaddr_q;
     assign o_dbg_lfault_inj       = lfault_inj_v;
+    assign o_dbg_csr_sum          = csr_sum;
+    assign o_dbg_csr_mxr          = csr_mxr;
+    assign o_dbg_csr_dmem_priv    = if dmem_eff_priv == csr_pkg::PrivLevel::MACHINE    ? 2'b11
+                                    : if dmem_eff_priv == csr_pkg::PrivLevel::SUPERVISOR ? 2'b01
+                                    :                                                      2'b00;
 }
