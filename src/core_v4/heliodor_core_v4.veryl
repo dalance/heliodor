@@ -177,6 +177,16 @@ pub module heliodor_core_v4 #(
     var dmem_mmu_busy: logic;
     var dmem_mmu_fault: logic;
     var dmem_mmu_fault_s: logic;
+    // M9.A.294 (F2): walk-owner tracking for correct load-fault attribution.
+    // Latched when a LOAD's MMU walk goes busy; used to deliver the fault to
+    // the owner's ROB entry (not the current issue) when o_fault asserts.
+    // Declared here (forward) because the rob inst above references the
+    // derived inject/suppress signals.
+    var walk_v_q     : logic     ;
+    var walk_rob_q   : logic<5>  ;
+    var walk_vaddr_q : logic<64> ;
+    var lfault_inj_v : logic     ; // fault delivery to walk owner this cycle
+    var rob_cdb_is_lfault: logic ; // cdb.is_lfault with mis-attribution removed
     // M5.D: medeleg needed by trap_to_s computation in commit stage.
     var csr_medeleg_w: logic<64>;
     // M5.D: SFENCE.VMA commit pulse (1-cycle), drives mmu i_sfence inputs.
@@ -696,9 +706,12 @@ pub module heliodor_core_v4 #(
         i_cdb_csr_addr    : cdb.csr_addr     ,
         i_cdb_csr_wdata   : cdb.csr_wdata    ,
         i_cdb_csr_illegal : cdb.csr_illegal  ,
-        i_cdb_is_lfault   : cdb.is_lfault    ,
+        i_cdb_is_lfault   : rob_cdb_is_lfault,
         i_cdb_is_sfault   : cdb.is_sfault    ,
         i_cdb_fault_vaddr : cdb.fault_vaddr  ,
+        i_lfault_inj_v    : lfault_inj_v     ,
+        i_lfault_inj_rob  : walk_rob_q       ,
+        i_lfault_inj_vaddr: walk_vaddr_q     ,
         o_commit_valid   : rob_commit_valid,
         o_commit_entry   : rob_commit_entry,
         o_commit_pc          : c_pc         ,
@@ -1104,6 +1117,52 @@ pub module heliodor_core_v4 #(
     let core_dmem_wen  : logic     = commit_store_fire;
     let core_dmem_ren  : logic     = issue_is_load;
     let core_dmem_wstrb: logic<8>  = if commit_store_fire ? st_wstrb : 8'd0;
+
+    // ============================================================
+    // M9.A.294 (F2): load-fault attribution fix.
+    //
+    // Root cause: dmem_mmu drops o_busy the cycle ptw_fault asserts, so a
+    // multi-cycle-walk LOAD that faults is de-selected and a younger op
+    // issues on the o_fault cycle. alu_wrap tags o_cdb.is_lfault with the
+    // CURRENT issue's rob_idx → the fault is mis-attributed to a
+    // correct-path op that then commits (spurious load page fault).
+    //
+    // Fix: latch the walk owner {rob_idx, vaddr} when a LOAD's walk goes
+    // busy, and on o_fault deliver the fault to the owner's ROB entry via
+    // the rob inject port — independent of the current-issue CDB result.
+    // Also suppress the (wrong) is_lfault the CDB would write to the
+    // current issue when it is not the walk owner. All registered / ROB
+    // writes — never feeds back into issue select, so no comb loop (issue
+    // select must NOT depend on any MMU output).
+    //
+    // Latch: a LOAD read driving a busy walk. Bare mode keeps busy=0 so
+    // this never engages. Clear when the walk resolves (busy falls) — the
+    // fault, if any, is delivered combinationally on that same cycle.
+    let walk_latch_start: logic = core_dmem_ren && dmem_mmu_busy && !walk_v_q;
+    always_ff (clk, rst) {
+        if_reset {
+            walk_v_q     = 1'b0;
+            walk_rob_q   = 5'd0;
+            walk_vaddr_q = 64'd0;
+        } else if redirect_fire_q {
+            walk_v_q = 1'b0;
+        } else if walk_latch_start {
+            walk_v_q     = 1'b1;
+            walk_rob_q   = iq_iss_rob_idx;
+            walk_vaddr_q = core_dmem_vaddr;
+        } else if walk_v_q && !dmem_mmu_busy {
+            // Walk resolved (success or fault). Owner cleared; if it was a
+            // fault, lfault_inj_v delivered it this same cycle.
+            walk_v_q = 1'b0;
+        }
+    }
+    // Deliver the load fault to the walk owner when the walk faults.
+    assign lfault_inj_v = dmem_mmu_fault && walk_v_q;
+    // Suppress the CDB's is_lfault when it would mis-attribute the owner's
+    // fault to a different (current-issue) rob_idx. If the current issue IS
+    // the owner, or there is no tracked walk (e.g. a direct TLB-permission
+    // fault on the current issue), the CDB tag stands.
+    assign rob_cdb_is_lfault = cdb.is_lfault && (!walk_v_q || cdb.rob_idx == walk_rob_q);
 
     // ============================================================
     // M5.C: dmem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
