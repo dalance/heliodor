@@ -85,6 +85,7 @@ module test_v4_linux_boot_harness (
     var dbg_agu_addr    : logic<64>;
     var dbg_agu_is_load : logic    ;
     var dbg_agu_is_store: logic    ;
+    var dbg_agu_rob_idx : logic<5> ;
     var _ret_v: logic; var _ret_pc: logic<64>; var _ret_rdv: logic; var _ret_rd: logic<5>; var _ret_data: logic<64>;
     var _rename_cnt: logic<32>; var _cdb_cnt: logic<32>; var _rob_size: logic<8>;
     var _if_v: logic; var _if_instr: logic<32>; var _stall_dr: logic;
@@ -156,6 +157,7 @@ module test_v4_linux_boot_harness (
         o_dbg_agu_rs1_pdst: dbg_agu_rs1_pdst, o_dbg_agu_rs1_data: dbg_agu_rs1_data,
         o_dbg_agu_imm: dbg_agu_imm, o_dbg_agu_addr: dbg_agu_addr,
         o_dbg_agu_is_load: dbg_agu_is_load, o_dbg_agu_is_store: dbg_agu_is_store,
+        o_dbg_agu_rob_idx: dbg_agu_rob_idx,
     );
 
     // Firmware ROM: 16 KB
@@ -431,18 +433,22 @@ module test_v4_linux_boot_harness (
     var sp_ring_pc   : logic<64> [256];
     var sp_ring_data : logic<64> [256];
     var sp_ring_idx  : logic<8>       ;
-    // M9.A.292: AGU rs1=sp issue ring. Captures every cycle the IQ issues
-    // a LOAD / STORE / AMO whose architectural rs1 == 02 (sp). Records
-    // PRF pdst + value AGU saw → distinguishes "PRF returned wrong sp"
-    // (rename/wakeup bug) vs "rs1 architectural number was wrong"
-    // (decoder/c_expander bug for c.ldsp/c.sdsp).
+    // M9.A.293: UNCONDITIONAL per-issue AGU ring (decisive test). Records
+    // EVERY IQ issue (not just rs1==sp) in the OOPS window with rob_idx +
+    // rs1_arch + pdst + AGU addr + dmem_mmu_busy. Compares the bad cy
+    // 22364522 (core_va=0x1078) against the correct replay cy 22364523:
+    //   different rob_idx  → IQ select-flip during MMU-busy stall (mech A)
+    //   same rob_idx       → RAT/rename rs1 mis-map of c.ldsp (mech B)
     var sp_agu_cy   : logic<32> [256];
+    var sp_agu_robi : logic<5>  [256];
+    var sp_agu_arch : logic<5>  [256];
     var sp_agu_pdst : logic<6>  [256];
     var sp_agu_data : logic<64> [256];
     var sp_agu_imm  : logic<64> [256];
     var sp_agu_addr : logic<64> [256];
     var sp_agu_ld   : logic     [256];
     var sp_agu_st   : logic     [256];
+    var sp_agu_busy : logic     [256];
     var sp_agu_idx  : logic<8>       ;
     // M9.A.287: capture every PC 0x800b3e08 retire (function entry).
     // Records sp BEFORE addi (= caller_sp). Verifies whether caller_sp =
@@ -651,12 +657,15 @@ module test_v4_linux_boot_harness (
             sp_agu_idx = 8'd0;
             for k in 0..256 {
                 sp_agu_cy[k]   = 32'd0;
+                sp_agu_robi[k] = 5'd0;
+                sp_agu_arch[k] = 5'd0;
                 sp_agu_pdst[k] = 6'd0;
                 sp_agu_data[k] = 64'd0;
                 sp_agu_imm[k]  = 64'd0;
                 sp_agu_addr[k] = 64'd0;
                 sp_agu_ld[k]   = 1'b0;
                 sp_agu_st[k]   = 1'b0;
+                sp_agu_busy[k] = 1'b0;
             }
             b3e08_idx = 6'd0;
             for k in 0..64 {
@@ -927,17 +936,22 @@ module test_v4_linux_boot_harness (
                 sp_ring_data[sp_ring_idx] = _ret_data;
                 sp_ring_idx               = sp_ring_idx + 8'd1;
             }
-            // M9.A.292: capture every IQ issue whose architectural rs1==02
-            // (sp) so we can see what PRF value the AGU saw. Window
-            // [22364000, 22364530] (narrower than sp_ring; OOPS-local).
-            if cy >: 32'd22363999 && cy <: 32'd22364531 && dbg_agu_issue_v && dbg_agu_rs1_arch == 5'd2 && !a5_dumped {
+            // M9.A.293: UNCONDITIONAL per-issue AGU capture (decisive test).
+            // Drops the rs1_arch==2 filter so we see the bad cy 22364522
+            // issue (which had rs1_arch != 2 and was thus invisible before).
+            // Window [22364480, 22364531] for context; records rob_idx +
+            // rs1_arch + dmem_mmu_busy. 1-wide issue → ≤51 entries.
+            if cy >: 32'd22364479 && cy <: 32'd22364531 && dbg_agu_issue_v && !a5_dumped {
                 sp_agu_cy[sp_agu_idx]   = cy;
+                sp_agu_robi[sp_agu_idx] = dbg_agu_rob_idx;
+                sp_agu_arch[sp_agu_idx] = dbg_agu_rs1_arch;
                 sp_agu_pdst[sp_agu_idx] = dbg_agu_rs1_pdst;
                 sp_agu_data[sp_agu_idx] = dbg_agu_rs1_data;
                 sp_agu_imm[sp_agu_idx]  = dbg_agu_imm;
                 sp_agu_addr[sp_agu_idx] = dbg_agu_addr;
                 sp_agu_ld[sp_agu_idx]   = dbg_agu_is_load;
                 sp_agu_st[sp_agu_idx]   = dbg_agu_is_store;
+                sp_agu_busy[sp_agu_idx] = dbg_dmm_busy;
                 sp_agu_idx              = sp_agu_idx + 8'd1;
             }
             // M9.A.287: capture every retire at PC 0x800b3e08. Sp BEFORE
@@ -1129,13 +1143,14 @@ module test_v4_linux_boot_harness (
                                   k, sp_ring_cy[off], sp_ring_pc[off], sp_ring_data[off]);
                     }
                 }
-                $display("[v4 sp_agu — rs1=02 at IQ issue in cy [22364000,22364530] (oldest first)]");
+                $display("[v4 agu_ring — UNCONDITIONAL per-issue in cy [22364480,22364530] (oldest first). DECISIVE: compare rob_idx of bad cy 22364522 (addr=...1078) vs correct cy 22364523 (addr=...ccbdb8)]");
                 for k in 0..256 {
                     let off: logic<8> = sp_agu_idx + (k as 8);
                     if sp_agu_cy[off] != 32'd0 {
-                        $display("  sp_agu[%h] cy=%d pdst=%h sp_read=%h imm=%h addr=%h ld=%b st=%b",
-                                  k, sp_agu_cy[off], sp_agu_pdst[off], sp_agu_data[off],
-                                  sp_agu_imm[off], sp_agu_addr[off], sp_agu_ld[off], sp_agu_st[off]);
+                        $display("  agu[%h] cy=%d robi=%h arch=%h pdst=%h rs1=%h imm=%h addr=%h ld=%b st=%b busy=%b",
+                                  k, sp_agu_cy[off], sp_agu_robi[off], sp_agu_arch[off], sp_agu_pdst[off],
+                                  sp_agu_data[off], sp_agu_imm[off], sp_agu_addr[off],
+                                  sp_agu_ld[off], sp_agu_st[off], sp_agu_busy[off]);
                     }
                 }
                 $display("[v4 PC 0x800b3e08 entries (caller_sp, ra) — last 64 oldest first]");
