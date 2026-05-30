@@ -151,6 +151,15 @@ pub module heliodor_core_v4 #(
     o_dbg_csr_sum      : output logic         ,
     o_dbg_csr_mxr      : output logic         ,
     o_dbg_csr_dmem_priv: output logic<2>      ,
+    // M9.A.303: dmem PTW / faulting-PTE / TLB-hit context for the kernel
+    // load-fault loop (VA 0x80616198 spurious fault) characterization.
+    o_dbg_dmem_fault   : output logic         ,
+    o_dbg_dptw_req     : output logic         ,
+    o_dbg_dptw_addr    : output logic<64>     ,
+    o_dbg_dpte         : output logic<64>     ,
+    o_dbg_dtlb_hit     : output logic         ,
+    o_dbg_dtlb_ppn     : output logic<44>     ,
+    o_dbg_dtlb_perm    : output logic<4>      ,
 ) {
     import pipeline_v4_pkg::*;
 
@@ -167,6 +176,9 @@ pub module heliodor_core_v4 #(
     // below; driven by csr_v4 inst further down.
     var csr_satp    : logic<64>;
     var csr_priv    : csr_pkg::PrivLevel;
+    // M9.A.304: registered previous-cycle priv snapshot from csr_v4, used for
+    // sync-exception trap delegation to dodge the cross-module eval-order hazard.
+    var csr_priv_prev: csr_pkg::PrivLevel;
     var csr_sum     : logic;
     var csr_mxr     : logic;
     var csr_mprv    : logic;
@@ -193,6 +205,13 @@ pub module heliodor_core_v4 #(
     var dmem_mmu_fault: logic;
     var dmem_mmu_fault_s: logic;
     var dmem_walk_start: logic; // M9.A.296: PTW-start pulse (1 cy at IDLE→walk)
+    // M9.A.303 debug: dmem PTW / faulting-PTE / TLB-hit snoop
+    var dmem_dptw_req : logic    ;
+    var dmem_dptw_addr: logic<64>;
+    var dmem_dpte     : logic<64>;
+    var dmem_dtlb_hit : logic    ;
+    var dmem_dtlb_ppn : logic<44>;
+    var dmem_dtlb_perm: logic<4> ;
     // M9.A.294 (F2): walk-owner tracking for correct load-fault attribution.
     // Latched when a LOAD's MMU walk goes busy; used to deliver the fault to
     // the owner's ROB entry (not the current issue) when o_fault asserts.
@@ -898,9 +917,12 @@ pub module heliodor_core_v4 #(
             excp_cause = 64'd2;  // illegal instruction
         } else if c_is_ebreak {
             excp_cause = 64'd3;  // breakpoint
-        } else if csr_priv == csr_pkg::PrivLevel::MACHINE {
+        } else if csr_priv_prev == csr_pkg::PrivLevel::MACHINE {
+            // M9.A.304: ECALL cause uses the registered priv snapshot, not the
+            // live csr_priv, to avoid the cross-module eval-order hazard that
+            // misrouted S-mode ECALLs to M-mode (cosim first divergence cy 630K).
             excp_cause = 64'd11; // ECALL from M
-        } else if csr_priv == csr_pkg::PrivLevel::SUPERVISOR {
+        } else if csr_priv_prev == csr_pkg::PrivLevel::SUPERVISOR {
             excp_cause = 64'd9;  // ECALL from S
         } else {
             excp_cause = 64'd8;  // ECALL from U
@@ -914,7 +936,7 @@ pub module heliodor_core_v4 #(
     let trap_cause_bit: logic = csr_medeleg_w[excp_cause[5:0]];
     let trap_to_s    : logic =
         if commit_irq ? csr_irq_to_s
-                       : (trap_cause_bit && (csr_priv != csr_pkg::PrivLevel::MACHINE));
+                       : (trap_cause_bit && (csr_priv_prev != csr_pkg::PrivLevel::MACHINE));
 
     // ============================================================
     // CSR file
@@ -969,6 +991,7 @@ pub module heliodor_core_v4 #(
         o_mideleg   : csr_mideleg_w            ,
         o_satp        : csr_satp                ,
         o_priv        : csr_priv                ,
+        o_priv_prev   : csr_priv_prev           ,
         o_mstatus_sum : csr_sum                 ,
         o_mstatus_mxr : csr_mxr                 ,
         o_mstatus_mprv: csr_mprv                ,
@@ -1099,7 +1122,16 @@ pub module heliodor_core_v4 #(
     // for the same store — corrupting retire-stream observers (cosim,
     // ret_total counter, IPC stats). Found via M9.A.264 cosim: v4 retire
     // ring had duplicate entries for `sw sp, 32(tp)` at PC 0x800010f8.
-    assign o_dbg_retire_v_a    = rob_commit_ack && !c_illegal && !c_is_mret && !c_is_sret && !c_is_ecall && !c_is_ebreak && !inject_fake_ifault;
+    // M9.A.305: ECALL/EBREAK ARE emitted to the retire stream to match v1
+    // (heliodor_core.veryl:4800 o_dbg_retire_v_a = rob_commit_valid, which is
+    // asserted for a committing ecall/ebreak — a synchronous exception that
+    // commits at the head before redirecting). Cosim @cy630141 proved v1
+    // emits the ecall retire (pc=...39c2, rdv=0) while v4 jumped straight to
+    // the trap handler (pc=0xa0) — a benign retire-dbg off-by-one, NOT an
+    // execution bug (v4 correctly traps to mtvec=0xa0 and reads mcause=9).
+    // mret/sret stay excluded (they redirect/squash in v1 → no commit_valid);
+    // illegal/fake_ifault stay excluded pending a proven mid-stream divergence.
+    assign o_dbg_retire_v_a    = rob_commit_ack && !c_illegal && !c_is_mret && !c_is_sret && !inject_fake_ifault;
     assign o_dbg_retire_pc_a   = c_pc;
     assign o_dbg_retire_rd_v_a = c_has_rd;
     assign o_dbg_retire_rd_a   = c_rd_arch;
@@ -1171,11 +1203,31 @@ pub module heliodor_core_v4 #(
     let st_wdata_hi  : logic<64>  = st_wdata_ext[127:64];
 
     // Core dmem view (pre-MMU virtual address)
-    let core_dmem_vaddr: logic<64> = if commit_store_fire ? c_store_addr : agu_addr_iss;
+    //
+    // M9.A.303: a STORE committing at the ROB head must NOT hijack the dmem
+    // MMU port while a younger LOAD's page-table walk is in flight. The store's
+    // *retire* is already stalled by rob_commit_ack (it cannot leave the ROB
+    // while dmem_mmu_busy), but commit_store_fire still drove core_dmem_vaddr /
+    // core_dmem_wen, flipping the MMU's i_vaddr to the store VA and i_store=1
+    // mid-walk. That (a) broke walk_va_match so the load's DONE result was
+    // suppressed (busy held), and (b) re-evaluated the load's PTE as a STORE
+    // permission check (ptw_rwx_ok=pte_w, leaf_valid wants the D bit), which
+    // spuriously faults a valid read-only / clean kernel load — observed as the
+    // Linux boot load-fault loop at PC 0x800b84a4 / VA 0x80616198 (~5438-cy
+    // period). Hold the load's *latched* VA (walk_vaddr_q) and suppress the
+    // store drive for the whole load walk. walk_v_q / walk_is_store_q are
+    // registers, so this introduces no combinational path into the MMU's
+    // busy/req. v1 (in-order, single MEM stage) cannot hit this: a store and a
+    // load never co-drive the MMU in the same cycle.
+    let load_walk_busy : logic     = walk_v_q && !walk_is_store_q;
+    let store_drive    : logic     = commit_store_fire && !load_walk_busy;
+    let core_dmem_vaddr: logic<64> = if store_drive ? c_store_addr
+                                     : if load_walk_busy ? walk_vaddr_q
+                                     :                     agu_addr_iss;
     let core_dmem_wdata: logic<64> = st_wdata;
-    let core_dmem_wen  : logic     = commit_store_fire;
-    let core_dmem_ren  : logic     = issue_is_load;
-    let core_dmem_wstrb: logic<8>  = if commit_store_fire ? st_wstrb : 8'd0;
+    let core_dmem_wen  : logic     = store_drive;
+    let core_dmem_ren  : logic     = issue_is_load || load_walk_busy;
+    let core_dmem_wstrb: logic<8>  = if store_drive ? st_wstrb : 8'd0;
 
     // ============================================================
     // M9.A.294 (F2): load-fault attribution fix.
@@ -1286,6 +1338,13 @@ pub module heliodor_core_v4 #(
         // PTW read, so imem's PTW addr can win the dmem bus.
         i_dcache_stall  : imem_ptw_req_w ,
         i_sfence        : commit_sfence_pulse,
+        // M9.A.303 debug
+        o_dbg_ptw_req   : dmem_dptw_req  ,
+        o_dbg_ptw_addr  : dmem_dptw_addr ,
+        o_dbg_pte       : dmem_dpte      ,
+        o_dbg_tlb_hit   : dmem_dtlb_hit  ,
+        o_dbg_tlb_ppn   : dmem_dtlb_ppn  ,
+        o_dbg_tlb_perm  : dmem_dtlb_perm ,
     );
     let _unused_dmem_fault: logic = dmem_mmu_fault;
     let _unused_dmem_fs   : logic = dmem_mmu_fault_s;
@@ -1361,4 +1420,12 @@ pub module heliodor_core_v4 #(
     assign o_dbg_csr_dmem_priv    = if dmem_eff_priv == csr_pkg::PrivLevel::MACHINE    ? 2'b11
                                     : if dmem_eff_priv == csr_pkg::PrivLevel::SUPERVISOR ? 2'b01
                                     :                                                      2'b00;
+    // M9.A.303 debug
+    assign o_dbg_dmem_fault       = dmem_mmu_fault;
+    assign o_dbg_dptw_req         = dmem_dptw_req;
+    assign o_dbg_dptw_addr        = dmem_dptw_addr;
+    assign o_dbg_dpte             = dmem_dpte;
+    assign o_dbg_dtlb_hit         = dmem_dtlb_hit;
+    assign o_dbg_dtlb_ppn         = dmem_dtlb_ppn;
+    assign o_dbg_dtlb_perm        = dmem_dtlb_perm;
 }
