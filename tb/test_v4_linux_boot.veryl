@@ -483,7 +483,21 @@ module test_v4_linux_boot_harness (
     var trap_ring_tval : logic<64> [128];
     var trap_ring_satp : logic<64> [128];
     var trap_ring_to_s : logic     [128];
+    // M9.A.301: priv (pre-trap = faulting context's priv: 0=U → init's user
+    // code faulted; 1=S → kernel faulted) + the MMU SUM the access saw, to
+    // classify the init-killing fault (spurious-v4 vs genuine-demand).
+    var trap_ring_priv : logic<2>  [128];
+    var trap_ring_sum  : logic     [128];
     var trap_ring_idx  : logic<7>       ;
+    // M9.A.302: USER-mode retire ring. Captures the last 128 retires while
+    // priv==U (init's user execution). If EMPTY at the dump → init faulted on
+    // its FIRST user fetch (entry PC = 0x10070 itself unmapped → execve/entry
+    // bug). If non-empty → shows init's user path to the 0x10070 ifetch fault
+    // (wrong entry vs wrong jump). uret_n counts total user retires seen.
+    var uret_cy  : logic<32> [128];
+    var uret_pc  : logic<64> [128];
+    var uret_idx : logic<7>       ;
+    var uret_n   : logic<32>      ;
     // M9.A.289: ld_late ring — last 64 dmem loads in cy [22364400, 22364530]
     // (window around new OOPS at PC 0x8004a3c2 cy 22364524).
     var ldlt_cy    : logic<32> [64];
@@ -698,7 +712,13 @@ module test_v4_linux_boot_harness (
                 trap_ring_tval[k]  = 64'd0;
                 trap_ring_satp[k]  = 64'd0;
                 trap_ring_to_s[k]  = 1'b0;
+                trap_ring_priv[k]  = 2'd0;
+                trap_ring_sum[k]   = 1'b0;
+                uret_cy[k]         = 32'd0;
+                uret_pc[k]         = 64'd0;
             }
+            uret_idx = 7'd0;
+            uret_n   = 32'd0;
             ldlt_idx = 6'd0;
             for k in 0..64 {
                 ldlt_cy[k]    = 32'd0;
@@ -739,6 +759,15 @@ module test_v4_linux_boot_harness (
             if _ret_v {
                 ret_total = ret_total + 32'd1;
                 last_ret_cy = cy;
+            }
+            // M9.A.302: USER-mode retire ring (priv==U = init's user exec).
+            // dbg_priv is the committed priv at this retire; a normal user
+            // instruction commits with priv=USER (00). Wrap ring of last 128.
+            if _ret_v && dbg_priv == 2'b00 {
+                uret_n              = uret_n + 32'd1;
+                uret_cy[uret_idx]   = cy;
+                uret_pc[uret_idx]   = _ret_pc;
+                uret_idx            = uret_idx + 7'd1;
             }
             if _ret_v && _ret_rd == 5'd15 && !a5_dumped {
                 a5_ring_pc[a5_ring_idx]   = _ret_pc;
@@ -990,14 +1019,24 @@ module test_v4_linux_boot_harness (
                 trap_cnt = trap_cnt + 32'd1;
                 trap_last_pc = dbg_trap_pc;
                 trap_last_cause = dbg_trap_cause;
-                // M9.A.289: capture every trap into wrap-around ring.
-                trap_ring_cy[trap_ring_idx]    = cy;
-                trap_ring_pc[trap_ring_idx]    = dbg_trap_pc;
-                trap_ring_cause[trap_ring_idx] = dbg_trap_cause;
-                trap_ring_tval[trap_ring_idx]  = if dbg_trap_to_s ? dbg_stval : dbg_mtval;
-                trap_ring_satp[trap_ring_idx]  = dbg_satp;
-                trap_ring_to_s[trap_ring_idx]  = dbg_trap_to_s;
-                trap_ring_idx                  = trap_ring_idx + 7'd1;
+                // M9.A.301: capture only SYNCHRONOUS EXCEPTIONS (page fault /
+                // illegal / access fault — anything that can SIGSEGV init),
+                // EXCLUDING interrupts (cause[63]=1) and ECALLs (8/9/11). The
+                // old "capture every trap" wrapped the 128-entry ring on the
+                // frequent timer-IRQ + SBI-ecall steady state, so the late dump
+                // never showed the init-death fault. Filtered, the ring holds
+                // the last 128 exceptions — the init-killing one is near the end.
+                if !dbg_trap_cause[63] && dbg_trap_cause != 64'd8 && dbg_trap_cause != 64'd9 && dbg_trap_cause != 64'd11 {
+                    trap_ring_cy[trap_ring_idx]    = cy;
+                    trap_ring_pc[trap_ring_idx]    = dbg_trap_pc;
+                    trap_ring_cause[trap_ring_idx] = dbg_trap_cause;
+                    trap_ring_tval[trap_ring_idx]  = if dbg_trap_to_s ? dbg_stval : dbg_mtval;
+                    trap_ring_satp[trap_ring_idx]  = dbg_satp;
+                    trap_ring_to_s[trap_ring_idx]  = dbg_trap_to_s;
+                    trap_ring_priv[trap_ring_idx]  = dbg_priv;
+                    trap_ring_sum[trap_ring_idx]   = dbg_csr_sum;
+                    trap_ring_idx                  = trap_ring_idx + 7'd1;
+                }
                 if !first_trap_seen {
                     first_trap_seen = 1'b1;
                     first_trap_cy = cy;
@@ -1022,15 +1061,28 @@ module test_v4_linux_boot_harness (
             // the a5_dumped freeze, so it holds the LAST 128 traps — revealing
             // the actual fatal trap sequence that killed init, not the first
             // (possibly benign) cause=13.
-            if cy >: 32'd17399999 && !late_dumped {
+            if cy >: 32'd23000000 && !late_dumped {
                 late_dumped = 1'b1;
-                $display("[v4 M9.A.296 LATE trap_ring — last 128 traps before cy 17.4M (oldest first): finds the init-death trap sequence]");
+                $display("[v4 M9.A.301 EXC trap_ring — last 128 SYNC EXCEPTIONS before cy 23.0M (oldest first): the init-death fault is near the end. priv=0 → init's USER code faulted; cause 12/13/15=page fault, 2=illegal]");
                 for k in 0..128 {
                     let off: logic<7> = trap_ring_idx + (k as 7);
                     if trap_ring_cy[off] != 32'd0 {
-                        $display("  ltrap[%h] cy=%d pc=%h cause=%h tval=%h satp=%h to_s=%b",
+                        $display("  xtrap[%h] cy=%d pc=%h cause=%h tval=%h satp=%h to_s=%b priv=%b sum=%b",
                                   k, trap_ring_cy[off], trap_ring_pc[off], trap_ring_cause[off],
-                                  trap_ring_tval[off], trap_ring_satp[off], trap_ring_to_s[off]);
+                                  trap_ring_tval[off], trap_ring_satp[off], trap_ring_to_s[off],
+                                  trap_ring_priv[off], trap_ring_sum[off]);
+                    }
+                }
+                // M9.A.302: USER-mode retire ring. uret_n = total user retires.
+                // EMPTY (uret_n=0) → init faulted on its FIRST user fetch
+                // (entry PC = the 0x10070 fault, never executed a user instr).
+                // Non-empty → init's user path to the fault (first entry =
+                // init's effective entry PC; last = just before the 0x10070 fault).
+                $display("[v4 M9.A.302 USER retire ring — uret_n=%d total user retires; last 128 (oldest first)]", uret_n);
+                for k in 0..128 {
+                    let uoff: logic<7> = uret_idx + (k as 7);
+                    if uret_cy[uoff] != 32'd0 {
+                        $display("  uret[%h] cy=%d pc=%h", k, uret_cy[uoff], uret_pc[uoff]);
                     }
                 }
             }
