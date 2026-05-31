@@ -52,16 +52,25 @@ heliodor/
 
 - **Language**: Veryl (transpiles to SystemVerilog)
 - **Comments & documentation**: English
-- **Testing**: Veryl native testbench — always run **both** JIT on and off to catch simulator bugs early:
+- **Testing**: Veryl native testbench. The simulator chooses a code-generation
+  backend with `--backend` (default: `cc`). The old `--disable-jit` flag is gone.
   ```bash
-  veryl test                          # JIT on (default), all tests
-  veryl test --disable-jit            # JIT off, all tests
-  veryl test --test test_dcache_lbu   # run specific test only (faster for debugging)
+  veryl test                          # default cc backend (emit C + compile), all tests
+  veryl test --backend cranelift      # in-process Cranelift JIT
+  veryl test --backend interpret      # IR tree-walking interpreter (slowest, reference)
+  veryl test --backend-validate       # dual-run cc vs cranelift, panic on divergence
+  veryl test --test test_dcache_lbu   # run a specific test only (faster for debugging)
   ```
+  To catch simulator/codegen bugs early, cross-check a suspicious result on a
+  second backend (e.g. `--backend cranelift` or `--backend interpret`): two
+  independent backends agreeing is strong evidence the RTL, not the sim, is at fault.
 - **Regression testing**: After modifying heliodor or veryl, run the multi-step regression:
-  1. `veryl test` — fast tests (~70 tests, seconds). Fix any failures before proceeding.
-  2. `veryl test --ignored --test test_arch_rv64ui` — riscv-tests rv64ui (49 tests, ~minute). JIT on is sufficient.
-  3. `veryl test --ignored --test test_linux_boot` — Linux boot test (~50M cycles, minutes). Only JIT on is sufficient for this test.
+  1. `veryl test` — fast tests **+ the v1 arch suite** (~220 tests, seconds-to-~minute;
+     the rv64ui/um/ua/mi/si arch tests in `tb/test_arch.veryl` are NOT `#[ignore]` and
+     run here). Fix any failures before proceeding.
+  2. `veryl test --ignored --test test_v4_arch` — v4 OoO arch suite (~110 tests).
+  3. `veryl test --ignored --test test_v4_linux_boot` — v4 Linux boot (~25M cycles, minutes).
+     The v1 Linux boot is `--ignored --test test_linux_boot`.
 - **Formatting**: `veryl fmt`
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
@@ -87,16 +96,17 @@ python3 test/riscv-arch-test/gen_tb.py
 Run all rv64ui ISA tests:
 
 ```bash
-veryl test --ignored --test test_arch_rv64ui          # all 49 tests, JIT on
+veryl test --test test_arch_rv64ui          # substring filter, all rv64ui tests
 ```
 
 Each test loads its hex into a 1 MB DRAM mapped at PA 0x80000000 and
 boots heliodor at that address. Pass/fail is signalled via the standard
 riscv-tests `tohost` mechanism (write to PA 0x80001000): `tohost == 1`
 means all subtests passed; `tohost > 1` means subtest with that ID
-failed. The arch tests are marked `#[ignore]` so they don't run as part
-of the default `veryl test`; run them explicitly via `--ignored --test
-test_arch_rv64ui` (substring filter matches all 49 tests).
+failed. The v1 arch tests (`tb/test_arch.veryl`) are NOT `#[ignore]`, so
+they run as part of the default `veryl test`; the `--test` substring just
+narrows the run. The v4 OoO arch harnesses (`tb/test_v4_arch_common.veryl`)
+ARE `#[ignore]`; run them via `--ignored --test test_v4_arch`.
 
 ## Running Tests on Verilator
 
