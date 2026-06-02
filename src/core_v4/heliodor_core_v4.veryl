@@ -183,6 +183,8 @@ pub module heliodor_core_v4 #(
     var csr_mxr     : logic;
     var csr_mprv    : logic;
     var csr_mpp     : logic<2>;
+    var csr_tvm     : logic;
+    var csr_tsr     : logic;
     // M9: satp shadow latched on sfence.vma. Linux head.S sets satp without
     // a preceding sfence, expecting the previous TLB/satp to remain effective
     // until the next sfence (QEMU-compatible behavior). v4's narrow IFU
@@ -826,19 +828,27 @@ pub module heliodor_core_v4 #(
     // ============================================================
     // Commit stage
     // ============================================================
+    // TVM (mstatus.TVM) traps satp access / sfence.vma in S-mode; TSR
+    // (mstatus.TSR) traps sret in S-mode. Commit-time priv + mstatus dependent,
+    // so they raise an illegal-instruction trap (cause 2) at commit, not at
+    // decode, and suppress the instruction's side effects (rd / csr write /
+    // sfence pulse / sret). Matches v1 (heliodor_core.veryl:4442).
+    let commit_tvm_trap    : logic = rob_commit_valid && csr_tvm && csr_priv == csr_pkg::PrivLevel::SUPERVISOR && (c_is_sfence || (c_is_csr && c_csr_addr == 12'h180));
+    let commit_tsr_trap    : logic = rob_commit_valid && csr_tsr && csr_priv == csr_pkg::PrivLevel::SUPERVISOR && c_is_sret;
+    let commit_priv_illegal: logic = commit_tvm_trap || commit_tsr_trap;
     always_comb {
-        rat_commit_en   = rob_commit_valid && c_has_rd && !c_illegal;
+        rat_commit_en   = rob_commit_valid && c_has_rd && !c_illegal && !commit_priv_illegal;
         rat_commit_arch = c_rd_arch;
         rat_commit_pdst = c_rd_pdst;
 
-        fl_push_en   = rob_commit_valid && c_has_rd && !c_illegal;
+        fl_push_en   = rob_commit_valid && c_has_rd && !c_illegal && !commit_priv_illegal;
         fl_push_pdst = c_old_rd_pdst;
     }
 
     // ============================================================
     // M4 trap entry decisions (commit-time, registered into redirect)
     // ============================================================
-    let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal;
+    let commit_csrwr: logic = rob_commit_valid && c_is_csr && !c_illegal && !commit_priv_illegal;
     // M9 (2026-05-25): csrw satp must also act like an implicit sfence +
     // pipeline redirect to match v1's IFU behavior. Linux head.S's trampoline
     // sequence (csrw stvec=high; csrw satp=trampoline_pg; <expect fault>; ...)
@@ -893,7 +903,7 @@ pub module heliodor_core_v4 #(
     // implies i_wen (= commit_store_fire), so this only fires on a real store.
     let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && dmem_mmu_fault_s;
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
-    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault);
+    let commit_excp : logic = rob_commit_valid && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault || commit_priv_illegal);
     // M8.C: IRQ trap fires as soon as something is committing AND no
     // synchronous exception is firing (excp takes priority).
     //
@@ -913,8 +923,8 @@ pub module heliodor_core_v4 #(
     let commit_irq  : logic = (rob_size == 8'd0) && !redirect_fire_q && !commit_excp && csr_irq_pending;
     let commit_trap : logic = commit_excp || commit_irq;
     let commit_mret : logic = rob_commit_valid && c_is_mret;
-    let commit_sret : logic = rob_commit_valid && c_is_sret;
-    assign commit_sfence_pulse = rob_commit_valid && c_is_sfence;
+    let commit_sret : logic = rob_commit_valid && c_is_sret && !commit_tsr_trap;
+    assign commit_sfence_pulse = rob_commit_valid && c_is_sfence && !commit_tvm_trap;
 
     // M9: satp shadow latch (see declaration above). Updated on either
     // SFENCE.VMA commit OR csrw satp commit. The latter is non-standard
@@ -938,8 +948,8 @@ pub module heliodor_core_v4 #(
             excp_cause = 64'd13; // load page fault
         } else if c_is_sfault_eff {
             excp_cause = 64'd15; // store/AMO page fault
-        } else if c_illegal {
-            excp_cause = 64'd2;  // illegal instruction
+        } else if c_illegal || commit_priv_illegal {
+            excp_cause = 64'd2;  // illegal instruction (incl. TVM/TSR commit trap)
         } else if c_is_ebreak {
             excp_cause = 64'd3;  // breakpoint
         } else if csr_priv_prev == csr_pkg::PrivLevel::MACHINE {
@@ -1021,6 +1031,8 @@ pub module heliodor_core_v4 #(
         o_mstatus_mxr : csr_mxr                 ,
         o_mstatus_mprv: csr_mprv                ,
         o_mstatus_mpp : csr_mpp                 ,
+        o_mstatus_tvm : csr_tvm                 ,
+        o_mstatus_tsr : csr_tsr                 ,
         i_sret_fire   : commit_sret             ,
         i_trap_to_s   : trap_to_s               ,
         // M8.C: external IRQ pins from harness (tie low when unused).
@@ -1075,15 +1087,22 @@ pub module heliodor_core_v4 #(
     // M9.A.288: redirect_fire_q declared earlier in module (used by
     // commit_irq gate). Kept var redirect_pc_q here.
     var redirect_pc_q  : logic<64>;
+    // Trap vector target (M5.D: trap to S → stvec, else mtvec).  Direct mode
+    // (tvec[0]=0): all traps → base.  Vectored mode (tvec[0]=1): interrupts →
+    // base + 4*cause_number; synchronous exceptions still → base.  (RISC-V
+    // priv spec; matches v1 heliodor_core.veryl trap_target.)
+    let trap_tvec_sel : logic<64> = if trap_to_s ? csr_stvec : csr_mtvec;
+    let trap_tvec_base: logic<64> = trap_tvec_sel & 64'hffff_ffff_ffff_fffc;
+    let trap_target   : logic<64> =
+        if trap_tvec_sel[0] && commit_irq ? trap_tvec_base + {48'd0, trap_cause[13:0], 2'b00}
+        : trap_tvec_base;
     always_ff (clk, rst) {
         if_reset {
             redirect_fire_q = 1'b0;
             redirect_pc_q   = 64'd0;
         } else if commit_trap {
             redirect_fire_q = 1'b1;
-            // M5.D: trap to S → stvec, else mtvec
-            redirect_pc_q   = if trap_to_s ? (csr_stvec & 64'hffff_ffff_ffff_fffc)
-                                            : (csr_mtvec & 64'hffff_ffff_ffff_fffc);
+            redirect_pc_q   = trap_target;
         } else if commit_mret {
             redirect_fire_q = 1'b1;
             redirect_pc_q   = csr_mepc;
