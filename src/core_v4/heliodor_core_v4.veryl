@@ -283,6 +283,17 @@ pub module heliodor_core_v4 #(
     var icache_rdata_next: logic<32>;
     var icache_stall     : logic    ;
 
+    // M8.B: D-cache outputs (instance after dmem_mmu, near end of file).
+    // dcache_rdata replaces the combinational i_dmem_rdata for LOAD results
+    // (alu_wrap) and PTW PTE reads (dmem_mmu). dcache_stall (combinational
+    // on miss/fill/done) folds into the issue/ack/commit gates BLOCKING-style
+    // and into dmem_mmu's i_dcache_stall so a PTE read mid-fill holds the walk.
+    // Forward-declared because alu_wrap (issue) and the gates use them before
+    // the dcache inst. dcache_rdata_next feeds misaligned LOADs (B.3).
+    var dcache_rdata     : logic<64>;
+    var dcache_rdata_next: logic<64>;
+    var dcache_stall     : logic    ;
+
     var c_inst_w    : logic<16>;
     var c_expanded_w: logic<32>;
     var c_illegal_w : logic    ;
@@ -701,14 +712,18 @@ pub module heliodor_core_v4 #(
         cdb = if fpu_cdb.valid ? fpu_cdb : alu_cdb;
     }
     inst u_alu: alu_wrap_v4 (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && dmem_issue_grant_ok,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && dmem_issue_grant_ok && !dcache_stall,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
         i_rs1_data        : prf_rs1_data                                        ,
         i_rs2_data        : alu_rs2_data                                        ,
-        i_load_data       : i_dmem_rdata                                        ,
-        i_load_data_next  : i_dmem_rdata_next                                   ,
+        // M8.B: LOAD result + next-dword come from the dcache (combinational
+        // hit data). On a miss dcache_stall=1 gates i_issue_valid above so the
+        // CDB write is suppressed until the fill lands; the IQ keeps the op
+        // (iq_issue_ack also gated) and re-issues it once the line is cached.
+        i_load_data       : dcache_rdata                                        ,
+        i_load_data_next  : dcache_rdata_next                                   ,
         i_dmem_fault      : dmem_mmu_fault                                      ,
         i_dmem_fault_s    : dmem_mmu_fault_s                                    ,
         i_csr_data        : csr_rd_data                                         ,
@@ -740,7 +755,11 @@ pub module heliodor_core_v4 #(
     // (load_walk_block) so it cannot ack/leave the IQ without issuing.
     // M6: also yield the ack when the FPU owns the CDB this cycle, else the
     // ALU op would leave iq_int without writing back (lost op → ROB stuck).
-    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && dmem_issue_grant_ok;
+    // M8.B: also hold the op in the IQ while the dcache stalls (load miss /
+    // fill / write-during-fill). The op re-issues each cycle (core_dmem_ren
+    // stays asserted, driving the fill) but does not ack/leave until the data
+    // is cached and dcache_stall drops.
+    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && dmem_issue_grant_ok && !dcache_stall;
 
     // ============================================================
     // PRF
@@ -1026,7 +1045,11 @@ pub module heliodor_core_v4 #(
     // rs1), forcing a walk on the 2nd call's store.
     // M9 SMP: a committing STORE drives o_dmem_wen this cycle; hold the commit
     // until the bus grants it (in addition to the MMU-busy hold). N=1: grant high.
-    let rob_commit_ack: logic = rob_commit_valid && !(c_is_store && dmem_mmu_busy) && !(c_is_store && !i_dmem_grant);
+    // M8.B: also hold a committing STORE while the dcache stalls. A write hit
+    // is single-cycle (dcache_stall=0), but if the dcache is mid-FILL for a
+    // younger load (write_during_fill) the store's write-through would be lost
+    // — hold commit_store_fire/pop until the fill finishes and the write lands.
+    let rob_commit_ack: logic = rob_commit_valid && !(c_is_store && dmem_mmu_busy) && !(c_is_store && !i_dmem_grant) && !(c_is_store && dcache_stall);
 
     var rob_head_valid  : logic    ;
     var rob_head_rw     : logic    ;
@@ -1723,7 +1746,10 @@ pub module heliodor_core_v4 #(
         o_rdata     : dmem_mmu_rdata ,
         o_dmem_addr : dmu_dmem_addr  ,
         o_dmem_wdata: dmu_dmem_wdata ,
-        i_dmem_rdata: i_dmem_rdata   ,
+        // M8.B: PTW PTE reads now come from the dcache (PTE is data). On a PTE
+        // miss the dcache fills and dcache_stall holds the walk via i_dcache_stall
+        // below. In Bare mode no walk runs so this input is unused.
+        i_dmem_rdata: dcache_rdata   ,
         o_dmem_wen  : dmu_dmem_wen   ,
         o_dmem_ren  : dmu_dmem_ren   ,
         o_dmem_wstrb: dmu_dmem_wstrb ,
@@ -1742,7 +1768,9 @@ pub module heliodor_core_v4 #(
 
         // M5.D PTW arbiter: stall dmem MMU while imem MMU is issuing a
         // PTW read, so imem's PTW addr can win the dmem bus.
-        i_dcache_stall: imem_ptw_req_w     ,
+        // M8.B: also stall while the dcache is filling a PTE-read miss — the
+        // walk must not advance (i_ptw_valid) until the PTE data is cached.
+        i_dcache_stall: imem_ptw_req_w || dcache_stall,
         i_sfence      : commit_sfence_pulse,
         // M9.A.303 debug
         o_dbg_ptw_req : dmem_dptw_req ,
@@ -1755,23 +1783,92 @@ pub module heliodor_core_v4 #(
     let _unused_dmem_fault: logic     = dmem_mmu_fault;
     let _unused_dmem_fs   : logic     = dmem_mmu_fault_s;
     let _unused_dmem_rdv  : logic     = dmem_mmu_rdv;
-    let _unused_dmem_rdata: logic<64> = dmem_mmu_rdata; // alu_wrap still uses i_dmem_rdata directly (Bare)
+    let _unused_dmem_rdata: logic<64> = dmem_mmu_rdata; // alu_wrap reads dcache_rdata; dmem_mmu.o_rdata stays unused
 
-    // M5.D dmem arbiter mux: imem PTW wins, else dmem MMU output.
-    assign o_dmem_addr  = if imem_ptw_req_w ? imem_ptw_addr_w : dmu_dmem_addr;
-    assign o_dmem_wdata = dmu_dmem_wdata;
-    assign o_dmem_wen   = dmu_dmem_wen && !imem_ptw_req_w;
-    assign o_dmem_ren   = if imem_ptw_req_w ? 1'b1 : dmu_dmem_ren;
-    assign o_dmem_wstrb = if imem_ptw_req_w ? 8'd0 : dmu_dmem_wstrb;
-    // M8: hi-side carry for misaligned STORE; only when commit_store_fire
-    // actually goes through (no PTW takeover) and the misalign extends
-    // beyond the dword. dmu_* signals already include zero shift bytes
-    // when alignment fits, so st_wstrb_hi just propagates as-is.
+    // ============================================================
+    // M8.B: L1 data cache, inserted between dmem_mmu (dmu_dmem_*) and the
+    // external dmem port (o_dmem_*). BLOCKING: o_stall (dcache_stall) folds
+    // into the issue/ack/commit gates and dmem_mmu's i_dcache_stall above, so
+    // a miss holds the pipeline until the 8-dword line fill completes; the hit
+    // data (dcache_rdata) then feeds alu_wrap (LOAD) and dmem_mmu (PTE read).
+    // CPU side = the dmem MMU output, gated off during an imem PTW so the imem
+    // walk bypasses the dcache on the shared dmem bus. Mem side + the imem PTW
+    // addr mux drive o_dmem_*. Single-hart: invalidate port tied off, grant
+    // tied high by the SoC. Misaligned STORE: tb hi-side via o_dmem_wdata_hi/
+    // wstrb_hi bypass + dcache invalidates the touched lines (B.3, i_wstrb_hi).
+    // Misaligned cross-line LOAD: dcache fills the next line too (B.3, i_load_next).
+    // ============================================================
+    // B.3 dcache hints. dc_st_wstrb_hi: hi strobe for a committing misaligned
+    // STORE (drives BOTH the dcache line-invalidation and the tb bypass below).
+    let dc_st_wstrb_hi: logic<8> = if (commit_store_fire && !imem_ptw_req_w) ? st_wstrb_hi : 8'd0;
+    // dc_load_next: the issuing LOAD's data spans into the next dword
+    // (byte_off + size > 8); the dcache fills the next line when it crosses one.
+    let dc_byte_off: logic<3> = dmu_dmem_addr[2:0];
+    let dc_ld_bytes: logic<5> = if iq_issue_op.base.mem_funct3[1:0] == 2'b00 ?
+        5'd1
+    : if iq_issue_op.base.mem_funct3[1:0] == 2'b01 ?
+        5'd2
+    : if iq_issue_op.base.mem_funct3[1:0] == 2'b10 ?
+        5'd4
+    :
+        5'd8
+    ;
+    let dc_span_sum : logic<6> = ({3'b0, dc_byte_off} as 6) + ({1'b0, dc_ld_bytes} as 6);
+    let dc_load_next: logic    = issue_is_load && (dc_span_sum >: 6'd8);
+    var dc_mem_addr : logic<64>;
+    var dc_mem_wdata: logic<64>;
+    var dc_mem_wen  : logic    ;
+    var dc_mem_ren  : logic    ;
+    var dc_mem_wstrb: logic<8> ;
+    var dc_mem_req  : logic    ;
+    inst u_dcache: dcache (
+        clk                                              ,
+        rst                                              ,
+        i_addr           : dmu_dmem_addr                 ,
+        i_wdata          : dmu_dmem_wdata                ,
+        i_wen            : dmu_dmem_wen && !imem_ptw_req_w,
+        i_ren            : dmu_dmem_ren && !imem_ptw_req_w,
+        i_wstrb          : dmu_dmem_wstrb                ,
+        i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
+        i_load_next      : dc_load_next                  , // B.3: misaligned cross-line load fill
+        o_rdata          : dcache_rdata                  ,
+        o_rdata_next     : dcache_rdata_next             ,
+        o_rdata_next_miss: _                             , // hi_miss path stalls cross-line loads
+        o_stall          : dcache_stall                  ,
+        o_data_valid     : _                             , // single-hart
+        o_miss_valid     : _                             ,
+        o_fill_complete  : _                             ,
+        o_fill_rdata     : _                             ,
+        o_mem_addr       : dc_mem_addr                   ,
+        o_mem_wdata      : dc_mem_wdata                  ,
+        i_mem_rdata      : i_dmem_rdata                  ,
+        o_mem_wen        : dc_mem_wen                    ,
+        o_mem_ren        : dc_mem_ren                    ,
+        o_mem_wstrb      : dc_mem_wstrb                  ,
+        i_inv_valid      : 1'b0                          , // single-hart: no coherence
+        i_inv_addr       : 64'd0                         ,
+        o_mem_req        : dc_mem_req                    ,
+        i_mem_grant      : i_dmem_grant                  ,
+    );
+
+    // M8.B / M5.D dmem arbiter mux: imem PTW wins the bus (bypassing the
+    // dcache), else the dcache mem side drives o_dmem_*.
+    assign o_dmem_addr  = if imem_ptw_req_w ? imem_ptw_addr_w : dc_mem_addr;
+    assign o_dmem_wdata = dc_mem_wdata;
+    assign o_dmem_wen   = if imem_ptw_req_w ? 1'b0 : dc_mem_wen;
+    assign o_dmem_ren   = if imem_ptw_req_w ? 1'b1 : dc_mem_ren;
+    assign o_dmem_wstrb = if imem_ptw_req_w ? 8'd0 : dc_mem_wstrb;
+    // M8: hi-side carry for misaligned STORE; bypasses the dcache (B.3 routes
+    // it through). Only when commit_store_fire goes through (no PTW takeover).
     assign o_dmem_wdata_hi = st_wdata_hi;
-    assign o_dmem_wstrb_hi = if (commit_store_fire && !imem_ptw_req_w) ? st_wstrb_hi : 8'd0;
+    assign o_dmem_wstrb_hi = dc_st_wstrb_hi;
     // M9 SMP: assert the bus request whenever this hart drives a dmem access
-    // (data load/store, AMO, or an IMMU/DMMU PTW read through the dmem port).
-    assign o_dmem_req      = o_dmem_ren || o_dmem_wen;
+    // (dcache fill/write/grant-wait, or an IMMU PTW read through the dmem port).
+    assign o_dmem_req      = imem_ptw_req_w || dc_mem_req;
+
+    // i_dmem_rdata_next (top-level next-dword) is superseded by the dcache's
+    // own o_rdata_next; keep the port for tb compatibility.
+    let _unused_dmem_rdata_next: logic<64> = i_dmem_rdata_next;
 
     // M1 debug counters
     var rename_cnt: logic<32>;

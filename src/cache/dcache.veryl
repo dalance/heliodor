@@ -15,6 +15,17 @@ pub module dcache (
     i_wen  : input  logic    ,
     i_ren  : input  logic    ,
     i_wstrb: input  logic<8> ,
+    // M8.B (B.3): hi-side strobe for a misaligned STORE that spans into the
+    // next dword. Nonzero ⇒ the store also writes (i_addr&~7)+8 via the core's
+    // o_dmem_wstrb_hi bypass; the dcache cannot hold the partial result, so it
+    // INVALIDATES both touched lines (lo + next) instead of merging and lets a
+    // later load refill the merged bytes from memory. Single-dword callers tie 0.
+    i_wstrb_hi: input logic<8>,
+    // M8.B (B.3): set when a LOAD's data spans into the next dword (byte_off +
+    // size > 8). When that next dword falls in a DIFFERENT line, the dcache
+    // fills the next line too (a second sequential fill) so o_rdata_next is
+    // valid before o_stall drops. Same-line spans need no extra fill. Tie 0.
+    i_load_next: input logic,
     o_rdata: output logic<64>,
     // M8.B: combinational read of the NEXT dword (at (i_addr&~7)+8), for v4
     // misaligned loads that span two dwords (mirrors the old i_dmem_rdata_next).
@@ -142,17 +153,46 @@ pub module dcache (
     // CPU request present
     let cpu_req: logic = i_wen || i_ren;
 
-    // Miss: read request, not hit, not already filling
-    let miss: logic = i_ren && !cache_hit && state == State::IDLE;
+    // M8.B (B.3): next-dword line decode (also used by o_rdata_next below).
+    // The next dword is at (i_addr & ~7) + 8: same line when offset != 7,
+    // otherwise the following line (different index/tag).
+    let next_addr     : logic<64> = {i_addr[63:3], 3'b000} + 64'd8;
+    let next_index    : logic<4>  = next_addr[9:6];
+    let next_offset   : logic<3>  = next_addr[5:3];
+    let next_tag      : logic<54> = next_addr[63:10];
+    let next_same_line: logic     = offset != 3'd7;
+    let next_data_idx : logic<7>  = {next_index, next_offset};
+    let next_hit_0    : logic     = valid_0[next_index] && tags_0[next_index] == next_tag;
+    let next_hit_1    : logic     = valid_1[next_index] && tags_1[next_index] == next_tag;
+    let next_hit_2    : logic     = valid_2[next_index] && tags_2[next_index] == next_tag;
+    let next_hit_3    : logic     = valid_3[next_index] && tags_3[next_index] == next_tag;
+    let next_line_hit : logic     = next_hit_0 || next_hit_1 || next_hit_2 || next_hit_3;
 
-    // PLRU victim selection
-    let plru_bits  : logic<3> = plru[index];
-    let has_invalid: logic    = !valid_0[index] || !valid_1[index] || !valid_2[index] || !valid_3[index];
-    let invalid_way: logic<2> = if !valid_0[index] ?
+    // Miss handling. A normal read miss fills the i_addr line (lo_miss). A
+    // misaligned LOAD whose next dword crosses into a DIFFERENT line needs that
+    // next line filled too: once the lo line is cached (cache_hit), hi_miss
+    // triggers a SECOND sequential fill of the next line. Both keep o_stall
+    // high until the data is present.
+    let lo_miss: logic = i_ren && !cache_hit && state == State::IDLE;
+    let hi_miss: logic = i_ren && i_load_next && !next_same_line && cache_hit && !next_line_hit && state == State::IDLE;
+    let miss   : logic = lo_miss || hi_miss;
+
+    // Fill target: the lo line normally, or the next line for a hi_miss (lo
+    // already cached, so lo_miss is 0). i_ren-only, so stores/AMO use the lo
+    // line (fill_is_hi stays 0).
+    let fill_is_hi: logic     = hi_miss && !lo_miss;
+    let f_index   : logic<4>  = if fill_is_hi ? next_index : index;
+    let f_tag     : logic<54> = if fill_is_hi ? next_tag : tag;
+    let f_offset  : logic<3>  = if fill_is_hi ? next_offset : offset;
+
+    // PLRU victim selection for the fill-target index.
+    let plru_bits  : logic<3> = plru[f_index];
+    let has_invalid: logic    = !valid_0[f_index] || !valid_1[f_index] || !valid_2[f_index] || !valid_3[f_index];
+    let invalid_way: logic<2> = if !valid_0[f_index] ?
         2'd0
-    : if !valid_1[index] ?
+    : if !valid_1[f_index] ?
         2'd1
-    : if !valid_2[index] ?
+    : if !valid_2[f_index] ?
         2'd2
     :
         2'd3
@@ -185,10 +225,10 @@ pub module dcache (
                     // memory_bus arbitrates between harts and holds grant for
                     // the entire 8-cycle FILL burst once we transition.
                     if miss && i_mem_grant {
-                        fill_index   = index;
-                        fill_tag     = tag;
+                        fill_index   = f_index;
+                        fill_tag     = f_tag;
                         fill_way     = victim_way;
-                        fill_offset  = offset;
+                        fill_offset  = f_offset;
                         fill_count   = 3'd0;
                         fill_aborted = 1'b0;
                         state        = State::FILL;
@@ -197,7 +237,38 @@ pub module dcache (
                     // Only commit the cache change + DRAM write when granted so
                     // the local update and the DRAM emission stay in lockstep.
                     if i_wen && i_mem_grant {
-                        if cache_hit {
+                        if i_wstrb_hi != 8'd0 {
+                            // M8.B (B.3): misaligned 2-dword STORE. tb gets the
+                            // lo dword (mem-side write-through below, o_mem_wen)
+                            // and the hi dword (core o_dmem_wdata_hi bypass). The
+                            // dcache can't hold the partial result, so invalidate
+                            // any cached way for both touched lines (lo + next);
+                            // a later load refills the merged bytes from memory.
+                            if hit_0 {
+                                valid_0[index] = 1'b0;
+                            }
+                            if hit_1 {
+                                valid_1[index] = 1'b0;
+                            }
+                            if hit_2 {
+                                valid_2[index] = 1'b0;
+                            }
+                            if hit_3 {
+                                valid_3[index] = 1'b0;
+                            }
+                            if next_hit_0 {
+                                valid_0[next_index] = 1'b0;
+                            }
+                            if next_hit_1 {
+                                valid_1[next_index] = 1'b0;
+                            }
+                            if next_hit_2 {
+                                valid_2[next_index] = 1'b0;
+                            }
+                            if next_hit_3 {
+                                valid_3[next_index] = 1'b0;
+                            }
+                        } else if cache_hit {
                             let old   : logic<64> = if hit_0 ?
                                 rdata_0
                             : if hit_1 ?
@@ -334,23 +405,11 @@ pub module dcache (
     // Read data: from hit way on cache hit, from memory during fill
     assign o_rdata = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : i_mem_rdata;
 
-    // M8.B: next-dword read for misaligned 2-dword loads. The next dword is at
-    // (i_addr & ~7) + 8. If it stays in the current line (offset != 7) it shares
-    // the lo-access hit way; otherwise it is in the next line — look that line up
-    // in all 4 ways. o_rdata_next_miss = a read is active and the next dword's
-    // line is NOT cached (the consumer stalls until a fill brings it in).
-    let next_addr     : logic<64> = {i_addr[63:3], 3'b000} + 64'd8;
-    let next_index    : logic<4>  = next_addr[9:6];
-    let next_offset   : logic<3>  = next_addr[5:3];
-    let next_tag      : logic<54> = next_addr[63:10];
-    let next_same_line: logic     = offset != 3'd7;
-    let next_data_idx : logic<7>  = {next_index, next_offset};
-    let next_hit_0    : logic     = valid_0[next_index] && tags_0[next_index] == next_tag;
-    let next_hit_1    : logic     = valid_1[next_index] && tags_1[next_index] == next_tag;
-    let next_hit_2    : logic     = valid_2[next_index] && tags_2[next_index] == next_tag;
-    let next_hit_3    : logic     = valid_3[next_index] && tags_3[next_index] == next_tag;
-    let next_line_hit : logic     = next_hit_0 || next_hit_1 || next_hit_2 || next_hit_3;
-    // same line: reuse the lo-access hit way; cross line: pick the next line's way
+    // M8.B: next-dword read for misaligned 2-dword loads (decode moved up to the
+    // miss-handling section). Same line ⇒ reuse the lo-access hit way; cross line
+    // ⇒ pick the next line's hit way (filled by the hi_miss second fill above).
+    // o_rdata_next_miss = a read is active and the next dword's line is not
+    // cached (informational; the hi_miss path already stalls cross-line loads).
     let next_rdata_same : logic<64> = if hit_0 ?
         data_0[next_data_idx]
     : if hit_1 ?
