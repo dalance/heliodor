@@ -1,0 +1,241 @@
+// Phase 7 v4 M9.3: N=2 SMP Linux boot smoke through heliodor_soc_v4_smp.
+//
+// Mirrors test_v4_soc_linux_boot (single-hart) but drives the SMP SoC: per-hart
+// instruction fetch (o_imem_*) and PTW (o_iptw_*) are arrays served from the same
+// firmware ROM + DRAM, while the data path (o_dmem_*) is the single shared port
+// the SoC's memory_bus arbitrates. CLINT / UART live inside the SoC. Pass = hart0
+// x3 reaches 0xAA (SBI SRST shutdown). 2-hart firmware + SMP kernel image.
+//
+// Marked #[ignore] (long run). Run explicitly with:
+//   veryl test --ignored --test test_v4_soc_smp_linux_boot
+module test_v4_soc_smp_linux_boot_harness #(
+    param N_HARTS : u32    = 2                                   ,
+    param HEX_FW  : string = "test/hex/linux_boot_fw_2hart.hex"  ,
+    param HEX_DRAM: string = "test/hex/linux_dram_real_2hart.hex",
+) (
+    clk : input clock,
+    rst : input reset,
+    o_pass : output logic    ,
+    o_r3   : output logic<64>,
+    o_r3_h1: output logic<64>,
+    o_pc0  : output logic<64>,
+    o_pc1  : output logic<64>,
+    o_cy   : output logic<32>,
+) {
+    // Per-hart instruction fetch + PTW (tb-served from shared memory).
+    var imem_addr : logic<64> [N_HARTS];
+    var imem_rdata: logic<32> [N_HARTS];
+    var imem_ren  : logic     [N_HARTS];
+    var iptw_addr : logic<64> [N_HARTS];
+    var iptw_req  : logic     [N_HARTS];
+    var iptw_rdata: logic<64> [N_HARTS];
+    // Shared data port (arbitrated inside the SoC).
+    var dmem_addr    : logic<64>;
+    var dmem_wdata   : logic<64>;
+    var dmem_rdata   : logic<64>;
+    var dmem_wen     : logic    ;
+    var dmem_ren     : logic    ;
+    var dmem_wstrb   : logic<8> ;
+    var dmem_wdata_hi: logic<64>;
+    var dmem_wstrb_hi: logic<8> ;
+    var uart_tx_v    : logic    ;
+    var uart_tx_d    : logic<8> ;
+    var dbg_r3       : logic<64> [N_HARTS];
+    var dbg_pc       : logic<64> [N_HARTS];
+
+    inst dut: heliodor_soc_v4_smp #(
+        N_HARTS : N_HARTS      ,
+        RESET_PC: 64'h0000_0000,
+    ) (
+        clk                          ,
+        rst                          ,
+        o_imem_addr    : imem_addr   ,
+        i_imem_rdata   : imem_rdata  ,
+        o_imem_ren     : imem_ren    ,
+        o_iptw_addr    : iptw_addr   ,
+        o_iptw_req     : iptw_req    ,
+        i_iptw_rdata   : iptw_rdata  ,
+        o_dmem_addr    : dmem_addr   ,
+        o_dmem_wdata   : dmem_wdata  ,
+        i_dmem_rdata   : dmem_rdata  ,
+        o_dmem_wen     : dmem_wen    ,
+        o_dmem_ren     : dmem_ren    ,
+        o_dmem_wstrb   : dmem_wstrb  ,
+        o_dmem_wdata_hi: dmem_wdata_hi,
+        o_dmem_wstrb_hi: dmem_wstrb_hi,
+        o_uart_tx_valid: uart_tx_v   ,
+        o_uart_tx_data : uart_tx_d   ,
+        o_dbg_r3       : dbg_r3      ,
+        o_dbg_pc       : dbg_pc      ,
+    );
+
+    // Firmware ROM (16 KB) + DRAM (32 MB), shared by both harts.
+    var fw_rom: logic<32> [4096]   ;
+    var dram  : logic<32> [8388608];
+    initial {
+        $readmemh(HEX_FW, fw_rom);
+        $readmemh(HEX_DRAM, dram);
+    }
+
+    // Per-hart instruction fetch + PTW: firmware (PA < 0x4000) else DRAM (PA[31]).
+    for h in 0..N_HARTS :gen_fetch {
+        let imem_in_fw   : logic     = imem_addr[h][31:14] == 18'd0;
+        let dram_imem_idx: logic<23> = imem_addr[h][24:2];
+        let fw_imem_idx  : logic<12> = imem_addr[h][13:2];
+        assign imem_rdata[h] = if imem_in_fw ? fw_rom[fw_imem_idx] : if imem_addr[h][31] ? dram[dram_imem_idx] : 32'd0;
+
+        let iptw_in_fw  : logic     = iptw_addr[h][31:14] == 18'd0;
+        let iptw_in_dram: logic     = iptw_addr[h][31];
+        let dram_iptw_lo: logic<23> = {iptw_addr[h][24:3], 1'b0};
+        let dram_iptw_hi: logic<23> = {iptw_addr[h][24:3], 1'b1};
+        let fw_iptw_lo  : logic<12> = {iptw_addr[h][13:3], 1'b0};
+        let fw_iptw_hi  : logic<12> = {iptw_addr[h][13:3], 1'b1};
+        assign iptw_rdata[h] = if iptw_in_dram ?
+            {dram[dram_iptw_hi], dram[dram_iptw_lo]}
+        : if iptw_in_fw ?
+            {fw_rom[fw_iptw_hi], fw_rom[fw_iptw_lo]}
+        :
+            64'd0
+        ;
+    }
+    let _unused_imem_ren: logic = imem_ren[0];
+    let _unused_iptw_req: logic = iptw_req[0];
+    let _unused_dmem_ren: logic = dmem_ren;
+
+    // Shared data reads: DRAM / firmware ROM (CLINT + UART served inside the SoC).
+    let in_fw  : logic = dmem_addr[31:14] == 18'd0;
+    let in_dram: logic = dmem_addr[31];
+
+    let dram_dmem_lo   : logic<23> = {dmem_addr[24:3], 1'b0};
+    let dram_dmem_hi   : logic<23> = {dmem_addr[24:3], 1'b1};
+    let dram_dmem_nx_lo: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b0};
+    let dram_dmem_nx_hi: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b1};
+    let fw_dmem_lo     : logic<12> = {dmem_addr[13:3], 1'b0};
+    let fw_dmem_hi     : logic<12> = {dmem_addr[13:3], 1'b1};
+    assign dmem_rdata = if in_dram ?
+        {dram[dram_dmem_hi], dram[dram_dmem_lo]}
+    : if in_fw ?
+        {fw_rom[fw_dmem_hi], fw_rom[fw_dmem_lo]}
+    :
+        64'd0
+    ;
+
+    // Shared DRAM write (lo dword + misaligned hi-side carry). The SoC gates
+    // o_dmem_wen / o_dmem_wstrb_hi to DRAM accesses only.
+    always_ff (clk, rst) {
+        if_reset {} else if dmem_wen && in_dram {
+            if dmem_wstrb[0] {
+                dram[dram_dmem_lo][7:0] = dmem_wdata[7:0];
+            }
+            if dmem_wstrb[1] {
+                dram[dram_dmem_lo][15:8] = dmem_wdata[15:8];
+            }
+            if dmem_wstrb[2] {
+                dram[dram_dmem_lo][23:16] = dmem_wdata[23:16];
+            }
+            if dmem_wstrb[3] {
+                dram[dram_dmem_lo][31:24] = dmem_wdata[31:24];
+            }
+            if dmem_wstrb[4] {
+                dram[dram_dmem_hi][7:0] = dmem_wdata[39:32];
+            }
+            if dmem_wstrb[5] {
+                dram[dram_dmem_hi][15:8] = dmem_wdata[47:40];
+            }
+            if dmem_wstrb[6] {
+                dram[dram_dmem_hi][23:16] = dmem_wdata[55:48];
+            }
+            if dmem_wstrb[7] {
+                dram[dram_dmem_hi][31:24] = dmem_wdata[63:56];
+            }
+            // misaligned hi-side (next dword)
+            if dmem_wstrb_hi[0] {
+                dram[dram_dmem_nx_lo][7:0] = dmem_wdata_hi[7:0];
+            }
+            if dmem_wstrb_hi[1] {
+                dram[dram_dmem_nx_lo][15:8] = dmem_wdata_hi[15:8];
+            }
+            if dmem_wstrb_hi[2] {
+                dram[dram_dmem_nx_lo][23:16] = dmem_wdata_hi[23:16];
+            }
+            if dmem_wstrb_hi[3] {
+                dram[dram_dmem_nx_lo][31:24] = dmem_wdata_hi[31:24];
+            }
+            if dmem_wstrb_hi[4] {
+                dram[dram_dmem_nx_hi][7:0] = dmem_wdata_hi[39:32];
+            }
+            if dmem_wstrb_hi[5] {
+                dram[dram_dmem_nx_hi][15:8] = dmem_wdata_hi[47:40];
+            }
+            if dmem_wstrb_hi[6] {
+                dram[dram_dmem_nx_hi][23:16] = dmem_wdata_hi[55:48];
+            }
+            if dmem_wstrb_hi[7] {
+                dram[dram_dmem_nx_hi][31:24] = dmem_wdata_hi[63:56];
+            }
+        }
+    }
+
+    // UART TX echo (SoC consumes the writes; mirror to stdout).
+    always_ff (clk, rst) {
+        if_reset {} else if uart_tx_v {
+            $write("%c", uart_tx_d);
+        }
+    }
+
+    // Cycle counter + pass latch (hart 0 x3 == 0xAA).
+    var cy: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            cy = 32'd0;
+        } else {
+            cy = cy + 32'd1;
+        }
+    }
+    assign o_cy    = cy;
+    assign o_r3    = dbg_r3[0];
+    assign o_r3_h1 = dbg_r3[1];
+    assign o_pc0   = dbg_pc[0];
+    assign o_pc1   = dbg_pc[1];
+    assign o_pass  = dbg_r3[0] == 64'h00000000000000aa;
+}
+
+#[test(test_v4_soc_smp_linux_boot)]
+#[ignore]
+module test_v4_soc_smp_linux_boot {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass : logic    ;
+    var r3   : logic<64>;
+    var r3_h1: logic<64>;
+    var pc0  : logic<64>;
+    var pc1  : logic<64>;
+    var cy   : logic<32>;
+
+    inst harness: test_v4_soc_smp_linux_boot_harness (
+        clk            ,
+        rst            ,
+        o_pass : pass  ,
+        o_r3   : r3    ,
+        o_r3_h1: r3_h1 ,
+        o_pc0  : pc0   ,
+        o_pc1  : pc1   ,
+        o_cy   : cy    ,
+    );
+
+    initial {
+        rst.assert(clk);
+        // Poll for SBI shutdown; budget ~250M cycles (SMP secondary bringup is
+        // far longer than the single-hart boot). hart1 PC tells us whether the
+        // secondary woke (kernel PA 0xffffffff8...) or is parked in firmware.
+        for _i in 0..25000 {
+            clk.next(10000);
+            if pass {
+                break;
+            }
+        }
+        $display("v4 SoC SMP(N=2) boot: cy=%h pass=%b h0_x3=%h h1_x3=%h h0_pc=%h h1_pc=%h", cy, pass, r3, r3_h1, pc0, pc1);
+        $finish();
+    }
+}
