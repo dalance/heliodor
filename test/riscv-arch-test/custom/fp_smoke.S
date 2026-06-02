@@ -60,6 +60,21 @@ _start:
     li       t2, 1
     bne      t1, t2, fail
 
+    # M6.B.3 FP load/store: FSD/FLD round-trip of f3 (5.0) via scratch DRAM
+    li       t5, 0x80002000
+    fsd      f3, 0(t5)
+    fld      f10, 0(t5)
+    feq.d    t1, f10, f3
+    li       t2, 1
+    bne      t1, t2, fail
+
+    # FSW/FLW round-trip of f8 (5.0f single)
+    fsw      f8, 8(t5)
+    flw      f11, 8(t5)
+    feq.s    t1, f11, f8
+    li       t2, 1
+    bne      t1, t2, fail
+
     # All passed.
     li       t3, 1
     j        done

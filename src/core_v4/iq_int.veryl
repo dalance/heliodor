@@ -47,6 +47,15 @@ pub module iq_int_v4 #(
     i_fp_int_query_pdst: input  logic<PRF_W>,
     o_fp_int_query_rdy : output logic       ,
 
+    // M6.B.3: FP CDB snoop — an FP store (FSW/FSD) reads its data operand
+    // (rs2) from the FP regfile, so that rs2 wakes on the FP writeback, not
+    // the int one. i_alloc_rs2_fp_ready seeds its initial readiness (from the
+    // FP PRF-ready bitmap that iq_fp owns).
+    i_fp_cdb_valid     : input logic       ,
+    i_fp_cdb_has_rd    : input logic       ,
+    i_fp_cdb_pdst      : input logic<PRF_W>,
+    i_alloc_rs2_fp_ready: input logic      ,
+
     // Issue (M1 = 1 op/cycle)
     o_issue_valid: output logic                     ,
     o_issue_op   : output pipeline_v4_pkg::RenamedOp,
@@ -66,6 +75,10 @@ pub module iq_int_v4 #(
     o_issue_csr_op  : output csr_pkg::CsrOp    ,
     o_issue_csr_imm : output logic             ,
     o_issue_rs1_arch: output logic         <5> ,
+    // M6.B.3: FP load/store flags of the issued op (per-field; the core uses
+    // them to route the FP load result to prf_fp and to read FP store data).
+    o_issue_fp_ld   : output logic             ,
+    o_issue_fp_st   : output logic             ,
     i_issue_ack     : input  logic             ,
     // M2 LOAD ordering: when high, suppress LOAD issue (conservative
     // store-to-load wait, no forwarding). Driven by rob's
@@ -108,6 +121,11 @@ pub module iq_int_v4 #(
     var sh_csr_op    : csr_pkg::CsrOp            [IQ_N];
     var sh_csr_imm   : logic                     [IQ_N];
     var sh_rs1_arch  : logic         <5>         [IQ_N];
+    // M6.B.3: FP load/store tags. sh_rs2_is_fp = the rs2 (store data) operand
+    // lives in the FP regfile (FP store) → tracked against the FP CDB.
+    var sh_fp_ld     : logic                     [IQ_N];
+    var sh_fp_st     : logic                     [IQ_N];
+    var sh_rs2_is_fp : logic                     [IQ_N];
 
     var prf_ready: logic [PRF_N];
 
@@ -166,6 +184,8 @@ pub module iq_int_v4 #(
     assign o_issue_csr_op     = sh_csr_op[issue_idx];
     assign o_issue_csr_imm    = sh_csr_imm[issue_idx];
     assign o_issue_rs1_arch   = sh_rs1_arch[issue_idx];
+    assign o_issue_fp_ld      = sh_fp_ld[issue_idx];
+    assign o_issue_fp_st      = sh_fp_st[issue_idx];
 
     always_ff (clk, rst) {
         if_reset {
@@ -185,6 +205,9 @@ pub module iq_int_v4 #(
                 sh_csr_op[i]     = csr_pkg::CsrOp::RW;
                 sh_csr_imm[i]    = 1'b0;
                 sh_rs1_arch[i]   = 5'd0;
+                sh_fp_ld[i]      = 1'b0;
+                sh_fp_st[i]      = 1'b0;
+                sh_rs2_is_fp[i]  = 1'b0;
             }
             for i in 0..PRF_N {
                 // Initial RAT identity → PRF[0..31] are ready;
@@ -211,7 +234,17 @@ pub module iq_int_v4 #(
                     if occupied[i] && sh_rs1_pdst[i] == i_cdb_pdst {
                         rs1_rdy[i] = 1'b1;
                     }
-                    if occupied[i] && sh_rs2_pdst[i] == i_cdb_pdst {
+                    // rs1 is always an integer source. rs2 wakes on the int
+                    // CDB only when it is NOT an FP-store data operand.
+                    if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == i_cdb_pdst {
+                        rs2_rdy[i] = 1'b1;
+                    }
+                }
+            }
+            // M6.B.3: FP-store data operand (rs2_is_fp) wakes on the FP CDB.
+            if i_fp_cdb_valid && i_fp_cdb_has_rd {
+                for i in 0..IQ_N {
+                    if occupied[i] && sh_rs2_is_fp[i] && sh_rs2_pdst[i] == i_fp_cdb_pdst {
                         rs2_rdy[i] = 1'b1;
                     }
                 }
@@ -241,6 +274,9 @@ pub module iq_int_v4 #(
                 sh_csr_op[free_idx]     = i_alloc_op.base.csr_op;
                 sh_csr_imm[free_idx]    = i_alloc_op.base.csr_imm;
                 sh_rs1_arch[free_idx]   = i_alloc_op.base.rs1_arch;
+                sh_fp_ld[free_idx]      = i_alloc_op.base.fp_ld;
+                sh_fp_st[free_idx]      = i_alloc_op.base.fp_st;
+                sh_rs2_is_fp[free_idx]  = i_alloc_op.base.fp_st;
                 occupied[free_idx]      = 1'b1;
                 // Initial readiness: sample prf_ready at rename. If the
                 // CDB *this cycle* matches rs*_pdst the rs*_rdy needs to
@@ -249,8 +285,13 @@ pub module iq_int_v4 #(
                 // !occupied — the loop skipped it. Handle here:
                 rs1_rdy[free_idx] = (!i_alloc_op.base.has_rs1) || prf_ready[i_alloc_op.rs1_pdst]
                     || (i_cdb_valid && i_cdb_has_rd && i_cdb_pdst == i_alloc_op.rs1_pdst);
-                rs2_rdy[free_idx] = (!i_alloc_op.base.has_rs2) || prf_ready[i_alloc_op.rs2_pdst]
-                    || (i_cdb_valid && i_cdb_has_rd && i_cdb_pdst == i_alloc_op.rs2_pdst);
+                // M6.B.3: an FP store's rs2 (data) is an FP source — seed its
+                // readiness from the FP query / FP CDB instead of the int bitmap.
+                rs2_rdy[free_idx] = (!i_alloc_op.base.has_rs2)
+                    || (if i_alloc_op.base.fp_st ? i_alloc_rs2_fp_ready : prf_ready[i_alloc_op.rs2_pdst])
+                    || (if i_alloc_op.base.fp_st ?
+                        (i_fp_cdb_valid && i_fp_cdb_has_rd && i_fp_cdb_pdst == i_alloc_op.rs2_pdst)
+                        : (i_cdb_valid && i_cdb_has_rd && i_cdb_pdst == i_alloc_op.rs2_pdst));
             }
         }
     }
