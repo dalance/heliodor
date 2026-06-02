@@ -51,6 +51,8 @@ pub module heliodor_soc_v4 #(
     var c_dmem_wstrb   : logic<8>      ;
     var c_dmem_wdata_hi: logic<64>     ;
     var c_dmem_wstrb_hi: logic<8>      ;
+    var c_dmem_req     : logic         ; // core DRAM/bus request (M8.D.3)
+    var c_dmem_grant   : logic         ; // bus -> core grant (M8.D.3)
     var c_dbg_regs     : logic<64> [32];
 
     // MMIO decode (mirrors the standalone tb): DRAM bit31, CLINT 0x02xx_xxxx,
@@ -103,6 +105,62 @@ pub module heliodor_soc_v4 #(
     // from L2 (l2_rdata); a miss forwards to the tb's DRAM combinationally.
     var l2_rdata: logic<64>;
 
+    // M8.D.3: single-hart memory_bus DRAM arbiter between the core and L2. The
+    // arbiter mux carries the core's DRAM request to the L2; it exists to
+    // establish the wiring M9 SMP extends to N harts (bump N_HARTS + add a
+    // second core). MMIO is still decoded directly in this SoC, so the bus MMIO
+    // ports are tied off and its MMIO outputs left open.
+    //
+    // GRANT (N=1): the sole hart is always granted, so i_dmem_grant is tied high
+    // (the correct single-hart behavior — there is no contention to arbitrate).
+    // The bus's o_dmem_grant (== request at N=1) is intentionally left open. NB:
+    // the v4 core's i_dmem_grant back-pressure (added in M9.1, commit 1814fa4)
+    // has only ever run with grant tied high; feeding it the live bus grant hangs
+    // the boot on BOTH the Veryl sim AND Verilator (real-grant version stuck at
+    // x3=0x80a85b60), i.e. a real latent RTL bug in the back-pressure path, NOT a
+    // sim artifact. That must be fixed at M9, where N>=2 makes the live grant
+    // feedback mandatory and testable under real multi-hart contention.
+    var bus_dram_addr : logic<64>; // arbiter -> L2 (granted DRAM request)
+    var bus_dram_wdata: logic<64>;
+    var bus_dram_wstrb: logic<8> ;
+    var bus_dram_wen  : logic    ;
+    var bus_dram_ren  : logic    ;
+    // Per-hart (N=1) DRAM request bundle into the arbiter.
+    var bus_in_addr : logic<64> [1];
+    var bus_in_wdata: logic<64> [1];
+    var bus_in_wstrb: logic<8>  [1];
+    var bus_in_wen  : logic     [1];
+    var bus_in_ren  : logic     [1];
+    var bus_in_req  : logic     [1];
+    var bus_in_amo  : logic     [1];
+    assign bus_in_addr[0]  = c_dmem_addr;
+    assign bus_in_wdata[0] = c_dmem_wdata;
+    assign bus_in_wstrb[0] = if in_dram ? c_dmem_wstrb : 8'd0;
+    assign bus_in_wen[0]   = c_dmem_wen && in_dram;
+    assign bus_in_ren[0]   = c_dmem_ren && in_dram;
+    assign bus_in_req[0]   = c_dmem_req;
+    assign bus_in_amo[0]   = 1'b0; // no cross-hart AMO lock at N=1
+    assign c_dmem_grant    = 1'b1; // N=1: sole hart always granted (see note above)
+    // Tied-off MMIO request bundle (MMIO is SoC-decoded, not bus-arbitrated).
+    var bus_mmio_paddr: logic<32> [1];
+    var bus_mmio_wdata: logic<64> [1];
+    var bus_mmio_wstrb: logic<8>  [1];
+    var bus_mmio_wen  : logic     [1];
+    var bus_mmio_ren  : logic     [1];
+    var bus_clint_sel : logic     [1];
+    var bus_plic_sel  : logic     [1];
+    var bus_uart_sel  : logic     [1];
+    var bus_stall_mem : logic     [1];
+    assign bus_mmio_paddr[0] = 32'd0;
+    assign bus_mmio_wdata[0] = 64'd0;
+    assign bus_mmio_wstrb[0] = 8'd0;
+    assign bus_mmio_wen[0]   = 1'b0;
+    assign bus_mmio_ren[0]   = 1'b0;
+    assign bus_clint_sel[0]  = 1'b0;
+    assign bus_plic_sel[0]   = 1'b0;
+    assign bus_uart_sel[0]   = 1'b0;
+    assign bus_stall_mem[0]  = 1'b0;
+
     // Load data back to the core: CLINT / UART / DRAM (via L2).
     let core_dmem_rdata: logic<64> = if in_clint ? clint_rdata : if in_uart ? {56'd0, uart_rdata} : l2_rdata;
 
@@ -127,8 +185,8 @@ pub module heliodor_soc_v4 #(
         o_dmem_wstrb     : c_dmem_wstrb   ,
         o_dmem_wdata_hi  : c_dmem_wdata_hi,
         o_dmem_wstrb_hi  : c_dmem_wstrb_hi,
-        o_dmem_req       : _              , // N=1: no bus arbitration
-        i_dmem_grant     : 1'b1           ,
+        o_dmem_req       : c_dmem_req     , // M8.D.3: into the memory_bus arbiter
+        i_dmem_grant     : c_dmem_grant   , // M8.D.3: from the memory_bus arbiter
         i_irq_timer_m    : clint_t_irq[0] ,
         i_mtime          : clint_mtime    ,
         i_irq_sw_m       : clint_s_irq[0] ,
@@ -136,20 +194,64 @@ pub module heliodor_soc_v4 #(
         o_dbg_regs       : c_dbg_regs     ,
     );
 
-    // DRAM path through the shared L2 (M8.D.2). The L2's upper interface takes
-    // the SoC's DRAM-decoded request (MMIO gated out so non-DRAM accesses never
-    // disturb the cache); its lower interface drives the external DRAM port to
-    // the tb. i_wstrb_hi tells the L2 about a misaligned store whose hi dword
-    // bypasses it (below), so it can invalidate the stale line(s).
+    // Single-hart DRAM arbiter (M8.D.3). MMIO ports tied off / left open; only
+    // the DRAM arbiter is used. The granted request drives the L2 below.
+    inst u_bus: memory_bus #(
+        N_HARTS: 1,
+    ) (
+        clk                             ,
+        rst                             ,
+        i_mmio_paddr    : bus_mmio_paddr,
+        i_mmio_wdata    : bus_mmio_wdata,
+        i_mmio_wstrb    : bus_mmio_wstrb,
+        i_mmio_wen      : bus_mmio_wen  ,
+        i_mmio_ren      : bus_mmio_ren  ,
+        i_clint_sel     : bus_clint_sel ,
+        i_plic_sel      : bus_plic_sel  ,
+        i_uart_sel      : bus_uart_sel  ,
+        i_stall_mem     : bus_stall_mem ,
+        o_mmio_paddr    : _             ,
+        o_mmio_wdata    : _             ,
+        o_mmio_wstrb    : _             ,
+        o_mmio_wen_clint: _             ,
+        o_mmio_ren_clint: _             ,
+        o_mmio_wen_plic : _             ,
+        o_mmio_ren_plic : _             ,
+        o_mmio_wen_uart : _             ,
+        o_mmio_ren_uart : _             ,
+        o_mmio_grant    : _             ,
+        i_dmem_addr     : bus_in_addr   ,
+        i_dmem_wdata    : bus_in_wdata  ,
+        i_dmem_wstrb    : bus_in_wstrb  ,
+        i_dmem_wen      : bus_in_wen    ,
+        i_dmem_ren      : bus_in_ren    ,
+        i_dmem_req      : bus_in_req    ,
+        i_amo_inflight  : bus_in_amo    ,
+        o_dmem_grant    : _             , // N=1: grant tied high in the SoC (see note)
+        o_dmem_addr     : bus_dram_addr ,
+        o_dmem_wdata    : bus_dram_wdata,
+        o_dmem_wstrb    : bus_dram_wstrb,
+        o_dmem_wen      : bus_dram_wen  ,
+        o_dmem_ren      : bus_dram_ren  ,
+        o_dmem_inv_valid: _             , // N=1: no coherence broadcast
+        o_dmem_inv_addr : _             ,
+    );
+
+    // DRAM path through the shared L2 (M8.D.2/.3). The L2's upper interface
+    // takes the arbiter's granted DRAM request (already MMIO-gated upstream);
+    // its lower interface drives the external DRAM port to the tb. i_wstrb_hi
+    // (direct from the core — the bus does not carry the hi-side) tells the L2
+    // about a misaligned store whose hi dword bypasses it (below), so it can
+    // invalidate the stale line(s).
     inst u_l2: l2cache (
         clk                                             ,
         rst                                             ,
-        i_addr     : c_dmem_addr                        ,
-        i_wdata    : c_dmem_wdata                       ,
-        i_wstrb    : if in_dram ? c_dmem_wstrb : 8'd0,
+        i_addr     : bus_dram_addr                      ,
+        i_wdata    : bus_dram_wdata                     ,
+        i_wstrb    : bus_dram_wstrb                     ,
         i_wstrb_hi : if in_dram ? c_dmem_wstrb_hi : 8'd0,
-        i_wen      : c_dmem_wen && in_dram,
-        i_ren      : c_dmem_ren && in_dram,
+        i_wen      : bus_dram_wen                       ,
+        i_ren      : bus_dram_ren                       ,
         o_rdata    : l2_rdata                           ,
         o_mem_addr : o_dmem_addr                        ,
         o_mem_wdata: o_dmem_wdata                       ,
