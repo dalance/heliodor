@@ -1,0 +1,151 @@
+// Phase 7 v4 M8.D: single-hart SoC wrapping heliodor_core_v4 with CLINT + UART.
+//
+// The v4 core emits DRAM and MMIO mixed on its flat o_dmem port (it has no MMIO
+// select ports, unlike the v1 core). This SoC address-decodes o_dmem into:
+//   - DRAM  (paddr[31] == 1, i.e. >= 0x8000_0000): exposed on o_dmem_* to the tb
+//            (M8.D.1 is direct passthrough; M8.D.2/.3 insert l2cache + memory_bus
+//            on this path).
+//   - CLINT (paddr[31:24] == 0x02): internal clint — drives the timer/sw IRQ and
+//            mtime back into the core.
+//   - UART  (paddr[31:28] == 0x1): internal uart — TX observable on o_uart_tx_*.
+// Load data returns to the core muxed by the same decode. IRQ is wired directly
+// (CLINT -> core). Instruction fetch / PTW stay per-hart and are served by the
+// tb (o_imem_* / o_iptw_*).
+//
+// N=1 today (HART_ID parameter present for the SMP foundation); M9 extends this
+// to N harts via memory_bus + a CLINT with N_HARTS + a second core.
+pub module heliodor_soc_v4 #(
+    param RESET_PC: u64 = 64'h8000_0000,
+    param HART_ID : u8  = 0            ,
+) (
+    clk: input clock,
+    rst: input reset,
+    // Instruction fetch (per-hart, tb-served)
+    o_imem_addr : output logic<64>,
+    i_imem_rdata: input  logic<32>,
+    o_imem_ren  : output logic    ,
+    // Instruction PTW (per-hart, tb-served)
+    o_iptw_addr : output logic<64>,
+    o_iptw_req  : output logic    ,
+    i_iptw_rdata: input  logic<64>,
+    // Data DRAM (MMIO stripped out internally; tb serves DRAM)
+    o_dmem_addr    : output logic<64>,
+    o_dmem_wdata   : output logic<64>,
+    i_dmem_rdata   : input  logic<64>,
+    o_dmem_wen     : output logic    ,
+    o_dmem_ren     : output logic    ,
+    o_dmem_wstrb   : output logic<8> ,
+    o_dmem_wdata_hi: output logic<64>,
+    o_dmem_wstrb_hi: output logic<8> ,
+    // UART TX observation
+    o_uart_tx_valid: output logic   ,
+    o_uart_tx_data : output logic<8>,
+    // Debug: architectural x3 (boot pass = 0xAA)
+    o_dbg_r3: output logic<64>,
+) {
+    // Core <-> SoC dmem wires (pre-decode).
+    var c_dmem_addr    : logic<64>    ;
+    var c_dmem_wdata   : logic<64>    ;
+    var c_dmem_wen     : logic        ;
+    var c_dmem_ren     : logic        ;
+    var c_dmem_wstrb   : logic<8>     ;
+    var c_dmem_wdata_hi: logic<64>    ;
+    var c_dmem_wstrb_hi: logic<8>     ;
+    var c_dbg_regs     : logic<64> [32];
+
+    // MMIO decode (mirrors the standalone tb): DRAM bit31, CLINT 0x02xx_xxxx,
+    // UART 0x1xxx_xxxx.
+    let in_dram : logic = c_dmem_addr[31];
+    let in_clint: logic = c_dmem_addr[31:24] == 8'h02;
+    let in_uart : logic = c_dmem_addr[31:28] == 4'h1;
+
+    // CLINT (1 hart): msip / mtimecmp / mtime + timer/sw IRQ.
+    var clint_rdata: logic<64>;
+    var clint_t_irq: logic [1];
+    var clint_s_irq: logic [1];
+    var clint_mtime: logic<64>;
+    inst u_clint: clint #(
+        N_HARTS: 1,
+    ) (
+        clk                            ,
+        rst                            ,
+        i_addr     : c_dmem_addr[15:0] ,
+        i_wdata    : c_dmem_wdata      ,
+        i_wen      : c_dmem_wen && in_clint,
+        i_ren      : c_dmem_ren && in_clint,
+        o_rdata    : clint_rdata       ,
+        o_timer_irq: clint_t_irq       ,
+        o_sw_irq   : clint_s_irq       ,
+        o_mtime    : clint_mtime       ,
+    );
+
+    // UART: byte-wide register file; TX pulse observable externally.
+    var uart_rdata: logic<8>;
+    var uart_irq  : logic   ;
+    inst u_uart: uart (
+        clk                          ,
+        rst                          ,
+        i_addr    : c_dmem_addr[2:0] ,
+        i_wdata   : c_dmem_wdata[7:0],
+        i_wen     : c_dmem_wen && in_uart,
+        i_ren     : c_dmem_ren && in_uart,
+        o_rdata   : uart_rdata       ,
+        o_tx_valid: o_uart_tx_valid  ,
+        o_tx_data : o_uart_tx_data   ,
+        i_rx_data : 8'd0             ,
+        i_rx_valid: 1'b0             ,
+        o_irq     : uart_irq         ,
+    );
+    let _unused_uart_irq: logic = uart_irq;
+
+    // Load data back to the core: CLINT / UART / DRAM (from the tb).
+    let core_dmem_rdata: logic<64> = if in_clint ?
+        clint_rdata
+    : if in_uart ?
+        {56'd0, uart_rdata}
+    :
+        i_dmem_rdata
+    ;
+
+    inst u_core: heliodor_core_v4 #(
+        RESET_PC: RESET_PC,
+        HART_ID : HART_ID ,
+    ) (
+        clk                              ,
+        rst                              ,
+        o_imem_addr      : o_imem_addr   ,
+        i_imem_rdata     : i_imem_rdata  ,
+        o_imem_ren       : o_imem_ren    ,
+        o_iptw_addr      : o_iptw_addr   ,
+        o_iptw_req       : o_iptw_req    ,
+        i_iptw_rdata     : i_iptw_rdata  ,
+        o_dmem_addr      : c_dmem_addr   ,
+        o_dmem_wdata     : c_dmem_wdata  ,
+        i_dmem_rdata     : core_dmem_rdata,
+        i_dmem_rdata_next: 64'd0         , // dead since M8.B (dcache makes its own)
+        o_dmem_wen       : c_dmem_wen    ,
+        o_dmem_ren       : c_dmem_ren    ,
+        o_dmem_wstrb     : c_dmem_wstrb  ,
+        o_dmem_wdata_hi  : c_dmem_wdata_hi,
+        o_dmem_wstrb_hi  : c_dmem_wstrb_hi,
+        o_dmem_req       : _             , // N=1: no bus arbitration
+        i_dmem_grant     : 1'b1          ,
+        i_irq_timer_m    : clint_t_irq[0],
+        i_mtime          : clint_mtime   ,
+        i_irq_sw_m       : clint_s_irq[0],
+        i_irq_ext_m      : 1'b0          ,
+        o_dbg_regs       : c_dbg_regs    ,
+    );
+
+    // DRAM port to the tb: only real DRAM accesses (MMIO stripped). The hi-side
+    // is the misaligned-store carry (addr+8), also DRAM-only.
+    assign o_dmem_addr     = c_dmem_addr;
+    assign o_dmem_wdata    = c_dmem_wdata;
+    assign o_dmem_wen      = c_dmem_wen && in_dram;
+    assign o_dmem_ren      = c_dmem_ren && in_dram;
+    assign o_dmem_wstrb    = if in_dram ? c_dmem_wstrb : 8'd0;
+    assign o_dmem_wdata_hi = c_dmem_wdata_hi;
+    assign o_dmem_wstrb_hi = if in_dram ? c_dmem_wstrb_hi : 8'd0;
+
+    assign o_dbg_r3 = c_dbg_regs[3];
+}

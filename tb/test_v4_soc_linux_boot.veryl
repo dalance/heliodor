@@ -1,0 +1,208 @@
+// Phase 7 v4 M8.D.1: SoC-level Linux boot smoke.
+//
+// Same firmware + kernel as test_v4_linux_boot, but driven through
+// heliodor_soc_v4 — the CLINT, UART and MMIO address-decode now live INSIDE the
+// SoC, so this harness only serves DRAM + firmware ROM for the imem / iptw / dmem
+// buss. Pass = x3 reaches 0xAA (SBI SRST shutdown).
+//
+// Marked #[ignore] (long run). Run explicitly with:
+//   veryl test --ignored --test test_v4_soc_linux_boot
+module test_v4_soc_linux_boot_harness (
+    clk: input clock,
+    rst: input reset,
+    o_pass: output logic    ,
+    o_r3  : output logic<64>,
+    o_cy  : output logic<32>,
+) {
+    var imem_addr    : logic<64>;
+    var imem_rdata   : logic<32>;
+    var imem_ren     : logic    ;
+    var iptw_addr    : logic<64>;
+    var iptw_rdata   : logic<64>;
+    var dmem_addr    : logic<64>;
+    var dmem_wdata   : logic<64>;
+    var dmem_rdata   : logic<64>;
+    var dmem_wen     : logic    ;
+    var dmem_ren     : logic    ;
+    var dmem_wstrb   : logic<8> ;
+    var dmem_wdata_hi: logic<64>;
+    var dmem_wstrb_hi: logic<8> ;
+    var uart_tx_v    : logic    ;
+    var uart_tx_d    : logic<8> ;
+    var dbg_r3       : logic<64>;
+
+    inst dut: heliodor_soc_v4 #(
+        RESET_PC: 64'h0000_0000,
+    ) (
+        clk                          ,
+        rst                          ,
+        o_imem_addr    : imem_addr   ,
+        i_imem_rdata   : imem_rdata  ,
+        o_imem_ren     : imem_ren    ,
+        o_iptw_addr    : iptw_addr   ,
+        o_iptw_req     : _           ,
+        i_iptw_rdata   : iptw_rdata  ,
+        o_dmem_addr    : dmem_addr   ,
+        o_dmem_wdata   : dmem_wdata  ,
+        i_dmem_rdata   : dmem_rdata  ,
+        o_dmem_wen     : dmem_wen    ,
+        o_dmem_ren     : dmem_ren    ,
+        o_dmem_wstrb   : dmem_wstrb  ,
+        o_dmem_wdata_hi: dmem_wdata_hi,
+        o_dmem_wstrb_hi: dmem_wstrb_hi,
+        o_uart_tx_valid: uart_tx_v   ,
+        o_uart_tx_data : uart_tx_d   ,
+        o_dbg_r3       : dbg_r3      ,
+    );
+    let _unused_imem_ren: logic = imem_ren;
+    let _unused_dmem_ren: logic = dmem_ren;
+
+    // Firmware ROM (16 KB) + DRAM (32 MB).
+    var fw_rom: logic<32> [4096]   ;
+    var dram  : logic<32> [8388608];
+    initial {
+        $readmemh("test/hex/linux_boot_fw.hex", fw_rom);
+        $readmemh("test/hex/linux_dram_real.hex", dram);
+    }
+
+    // Instruction fetch: firmware (PA < 0x4000) else DRAM (PA >= 0x8000_0000).
+    let imem_in_fw   : logic     = imem_addr[31:14] == 18'd0;
+    let dram_imem_idx: logic<23> = imem_addr[24:2];
+    let fw_imem_idx  : logic<12> = imem_addr[13:2];
+    assign imem_rdata = if imem_in_fw ? fw_rom[fw_imem_idx] : if imem_addr[31] ? dram[dram_imem_idx] : 32'd0;
+
+    // Data reads: DRAM / firmware ROM (CLINT + UART are served inside the SoC).
+    let in_fw   : logic = dmem_addr[31:14] == 18'd0;
+    let in_dram : logic = dmem_addr[31];
+
+    let dram_dmem_lo   : logic<23> = {dmem_addr[24:3], 1'b0};
+    let dram_dmem_hi   : logic<23> = {dmem_addr[24:3], 1'b1};
+    let dram_dmem_nx_lo: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b0};
+    let dram_dmem_nx_hi: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b1};
+    let fw_dmem_lo     : logic<12> = {dmem_addr[13:3], 1'b0};
+    let fw_dmem_hi     : logic<12> = {dmem_addr[13:3], 1'b1};
+    assign dmem_rdata = if in_dram ?
+        {dram[dram_dmem_hi], dram[dram_dmem_lo]}
+    : if in_fw ?
+        {fw_rom[fw_dmem_hi], fw_rom[fw_dmem_lo]}
+    :
+        64'd0
+    ;
+
+    // Instruction-PTW PTE read (DRAM / firmware).
+    let iptw_in_fw  : logic     = iptw_addr[31:14] == 18'd0;
+    let iptw_in_dram: logic     = iptw_addr[31];
+    let dram_iptw_lo: logic<23> = {iptw_addr[24:3], 1'b0};
+    let dram_iptw_hi: logic<23> = {iptw_addr[24:3], 1'b1};
+    let fw_iptw_lo  : logic<12> = {iptw_addr[13:3], 1'b0};
+    let fw_iptw_hi  : logic<12> = {iptw_addr[13:3], 1'b1};
+    assign iptw_rdata = if iptw_in_dram ?
+        {dram[dram_iptw_hi], dram[dram_iptw_lo]}
+    : if iptw_in_fw ?
+        {fw_rom[fw_iptw_hi], fw_rom[fw_iptw_lo]}
+    :
+        64'd0
+    ;
+
+    // DRAM write (lo dword + misaligned hi-side carry). The SoC already gates
+    // o_dmem_wen / o_dmem_wstrb_hi to DRAM accesses only.
+    always_ff (clk, rst) {
+        if_reset {} else if dmem_wen && in_dram {
+            if dmem_wstrb[0] {
+                dram[dram_dmem_lo][7:0] = dmem_wdata[7:0];
+            }
+            if dmem_wstrb[1] {
+                dram[dram_dmem_lo][15:8] = dmem_wdata[15:8];
+            }
+            if dmem_wstrb[2] {
+                dram[dram_dmem_lo][23:16] = dmem_wdata[23:16];
+            }
+            if dmem_wstrb[3] {
+                dram[dram_dmem_lo][31:24] = dmem_wdata[31:24];
+            }
+            if dmem_wstrb[4] {
+                dram[dram_dmem_hi][7:0] = dmem_wdata[39:32];
+            }
+            if dmem_wstrb[5] {
+                dram[dram_dmem_hi][15:8] = dmem_wdata[47:40];
+            }
+            if dmem_wstrb[6] {
+                dram[dram_dmem_hi][23:16] = dmem_wdata[55:48];
+            }
+            if dmem_wstrb[7] {
+                dram[dram_dmem_hi][31:24] = dmem_wdata[63:56];
+            }
+            // misaligned hi-side (next dword)
+            if dmem_wstrb_hi[0] {
+                dram[dram_dmem_nx_lo][7:0] = dmem_wdata_hi[7:0];
+            }
+            if dmem_wstrb_hi[1] {
+                dram[dram_dmem_nx_lo][15:8] = dmem_wdata_hi[15:8];
+            }
+            if dmem_wstrb_hi[2] {
+                dram[dram_dmem_nx_lo][23:16] = dmem_wdata_hi[23:16];
+            }
+            if dmem_wstrb_hi[3] {
+                dram[dram_dmem_nx_lo][31:24] = dmem_wdata_hi[31:24];
+            }
+            if dmem_wstrb_hi[4] {
+                dram[dram_dmem_nx_hi][7:0] = dmem_wdata_hi[39:32];
+            }
+            if dmem_wstrb_hi[5] {
+                dram[dram_dmem_nx_hi][15:8] = dmem_wdata_hi[47:40];
+            }
+            if dmem_wstrb_hi[6] {
+                dram[dram_dmem_nx_hi][23:16] = dmem_wdata_hi[55:48];
+            }
+            if dmem_wstrb_hi[7] {
+                dram[dram_dmem_nx_hi][31:24] = dmem_wdata_hi[63:56];
+            }
+        }
+    }
+
+    // UART TX echo (SoC consumes the writes; this just mirrors them to stdout).
+    always_ff (clk, rst) {
+        if_reset {} else if uart_tx_v {
+            $write("%c", uart_tx_d);
+        }
+    }
+
+    // Cycle counter + pass latch.
+    var cy: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            cy = 32'd0;
+        } else {
+            cy = cy + 32'd1;
+        }
+    }
+    assign o_cy   = cy;
+    assign o_r3   = dbg_r3;
+    assign o_pass = dbg_r3 == 64'hAA;
+}
+
+#[test(test_v4_soc_linux_boot)]
+#[ignore]
+module test_v4_soc_linux_boot {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass: logic    ;
+    var r3  : logic<64>;
+    var cy  : logic<32>;
+
+    inst harness: test_v4_soc_linux_boot_harness (
+        clk           ,
+        rst           ,
+        o_pass: pass  ,
+        o_r3  : r3    ,
+        o_cy  : cy    ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next  (45_000_000); // same budget as test_v4_linux_boot (icache-driven)
+        $display  ("v4 SoC linux boot smoke: cy=%h x3=%h pass=%b", cy, r3, pass);
+        $finish   ();
+    }
+}
