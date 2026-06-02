@@ -68,6 +68,17 @@ pub module heliodor_core_v4 #(
     o_dmem_req   : output logic,
     i_dmem_grant : input  logic,
 
+    // M9 SMP coherence: the SoC broadcasts every remote hart's granted DRAM
+    // write here (filtered to exclude this hart's own write). It invalidates a
+    // matching L1 dcache line AND clears this hart's LR/SC reservation if the
+    // remote write hit the reserved address. Single-hart SoCs tie these to 0.
+    i_dcache_inv_valid: input logic    ,
+    i_dcache_inv_addr : input logic<64>,
+    // M9 SMP: high while this hart has an AMO/LR/SC mid-RMW (read captured at
+    // issue, write pending at commit). Fed to memory_bus.i_amo_inflight so the
+    // bus locks to this hart for the whole window → the RMW is bus-atomic.
+    o_amo_inflight: output logic,
+
     // M8.C: external IRQ pins (CLINT / PLIC). Drive low if no SoC.
     i_irq_timer_m: input logic,
     // External CLINT mtime, exposed via CSR_TIME (0xC01)
@@ -658,6 +669,7 @@ pub module heliodor_core_v4 #(
     var iq_iss_rs1_arch      : logic         <5>        ;
     var rob_has_pending_store: logic                    ;
     var rob_has_pending_xlate: logic                    ; // M9.A.298 translation-barrier
+    var rob_has_pending_amo  : logic                    ; // M9 SMP: AMO RMW bus lock
 
     var prf_rs1_data: logic<64>;
     var prf_rs2_data: logic<64>;
@@ -727,11 +739,34 @@ pub module heliodor_core_v4 #(
     let cdb_dest_is_fp: logic = if fpu_cdb.valid ? !iqf_iss_wr_int : iq_iss_fp_ld;
     // rs2 operand fed to the ALU: FP store data from prf_fp, else int rs2.
     let alu_rs2_data: logic<64> = if iq_iss_fp_st ? prf_fp_store_data : prf_rs2_data;
+    // M9 SMP: bus-atomic AMO lock. An AMO/LR/SC computes its write value from a
+    // memory READ at issue and writes it at COMMIT; no remote hart may write the
+    // location in between. o_amo_inflight feeds memory_bus.i_amo_inflight, which
+    // locks the shared bus to this hart across that window. Coverage is split to
+    // stay comb-loop-free (o_amo_inflight must NOT depend on i_dmem_grant, or
+    // o_amo_inflight→grant→dcache_stall→issue→o_amo_inflight would close a loop):
+    //   - amo_read_pending_q: registered from the grant-independent IQ select.
+    //     We DELAY the AMO's value-capture by one cycle (amo_issue_lock_ok gates
+    //     the alu i_issue_valid + iq_issue_ack) so the lock is already asserted
+    //     the cycle the AMO actually reads. Only AMOs whose operands are ready
+    //     are selected, so this never locks behind a remote-dependent spin.
+    //   - rob_has_pending_amo: registered ROB scan (sh_rw), holds the lock from
+    //     the read until commit and is squash-safe (a flushed AMO leaves the scan).
+    var amo_read_pending_q: logic;
+    always_ff (clk, rst) {
+        if_reset {
+            amo_read_pending_q = 1'b0;
+        } else {
+            amo_read_pending_q = iq_issue_valid && iq_iss_is_amo;
+        }
+    }
+    let amo_issue_lock_ok: logic = !iq_iss_is_amo || amo_read_pending_q;
+    assign o_amo_inflight = amo_read_pending_q || rob_has_pending_amo;
     always_comb {
         cdb = if fpu_cdb.valid ? fpu_cdb : alu_cdb;
     }
     inst u_alu: alu_wrap_v4 (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -778,7 +813,7 @@ pub module heliodor_core_v4 #(
     // fill / write-during-fill). The op re-issues each cycle (core_dmem_ren
     // stays asserted, driving the fill) but does not ack/leave until the data
     // is cached and dcache_stall drops.
-    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall;
+    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok;
 
     // ============================================================
     // PRF
@@ -1125,6 +1160,7 @@ pub module heliodor_core_v4 #(
         o_commit_store_funct3: c_store_funct3       ,
         o_has_pending_store  : rob_has_pending_store,
         o_has_pending_xlate  : rob_has_pending_xlate,
+        o_has_pending_amo    : rob_has_pending_amo  ,
         o_commit_is_csr      : c_is_csr             ,
         o_commit_csr_addr    : c_csr_addr           ,
         o_commit_csr_wdata   : c_csr_wdata          ,
@@ -1588,12 +1624,26 @@ pub module heliodor_core_v4 #(
             rsv_addr_q  = 64'd0;
         } else if redirect_fire_q || commit_trap || commit_mret {
             rsv_valid_q = 1'b0;
-        } else if issue_is_lr {
+        } else if issue_is_lr && iq_issue_ack {
+            // M9 SMP: gate the reservation updates on iq_issue_ack (ACTUAL issue),
+            // not bare selection. The AMO/LR/SC issue is now delayed one cycle by
+            // amo_issue_lock_ok (bus-lock bubble); a selection-time clear would
+            // fire DURING that bubble, one cycle before the SC's sc_match check
+            // in alu_wrap (which runs at the delayed issue) — clearing the
+            // reservation before its own check, so every SC failed. Tying these
+            // to iq_issue_ack keeps the clear and the check on the same cycle:
+            // sc_match reads the pre-edge reservation, the clear applies the edge.
             rsv_valid_q = 1'b1;
             rsv_addr_q  = agu_addr_iss;
-        } else if issue_is_sc {
+        } else if i_dcache_inv_valid && i_dcache_inv_addr[63:3] == rsv_addr_q[63:3] {
+            // M9 SMP: a remote hart's store hit our reserved dword — kill the
+            // reservation so a following SC fails (matches RVWMO). dword-granular
+            // (not line) to avoid false-sharing livelock. Placed after the LR set
+            // so a fresh LR this cycle wins over a remote write to the OLD addr.
             rsv_valid_q = 1'b0;
-        } else if (issue_is_st || issue_is_amo) && issue_addr_match {
+        } else if issue_is_sc && iq_issue_ack {
+            rsv_valid_q = 1'b0;
+        } else if (issue_is_st || issue_is_amo) && issue_addr_match && iq_issue_ack {
             rsv_valid_q = 1'b0;
         }
     }
@@ -1865,8 +1915,8 @@ pub module heliodor_core_v4 #(
         o_mem_wen        : dc_mem_wen                    ,
         o_mem_ren        : dc_mem_ren                    ,
         o_mem_wstrb      : dc_mem_wstrb                  ,
-        i_inv_valid      : 1'b0                          , // single-hart: no coherence
-        i_inv_addr       : 64'd0                         ,
+        i_inv_valid      : i_dcache_inv_valid            , // M9 SMP: remote-write coherence
+        i_inv_addr       : i_dcache_inv_addr             ,
         o_mem_req        : dc_mem_req                    ,
         i_mem_grant      : i_dmem_grant                  ,
     );
