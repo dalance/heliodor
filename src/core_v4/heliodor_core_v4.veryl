@@ -245,6 +245,8 @@ pub module heliodor_core_v4 #(
     var csr_medeleg_w: logic<64>;
     // M5.D: SFENCE.VMA commit pulse (1-cycle), drives mmu i_sfence inputs.
     var commit_sfence_pulse: logic;
+    // M8.A: FENCE.I commit pulse (forward-declared; assigned in commit stage).
+    var commit_fence_i_pulse: logic;
 
     // M9.A.288: forward-declared so commit_irq gate can reference it
     // (the always_ff that assigns redirect_fire_q lives near line 935).
@@ -273,6 +275,13 @@ pub module heliodor_core_v4 #(
     // them. Actual assignment happens at the imem_mmu inst below.
     var imem_fault_w: logic;
     var imem_valid_w: logic;
+    // M8.A: I-cache outputs (instance after imem_mmu). icache_rdata replaces
+    // the combinational i_imem_rdata in the fetch path; icache_stall folds
+    // into fetch_ready and the imem_mmu i_icache_stall hook. icache_rdata_next
+    // is unused — v4 resolves straddles via the explicit 2-cycle re-fetch.
+    var icache_rdata     : logic<32>;
+    var icache_rdata_next: logic<32>;
+    var icache_stall     : logic    ;
 
     var c_inst_w    : logic<16>;
     var c_expanded_w: logic<32>;
@@ -280,13 +289,13 @@ pub module heliodor_core_v4 #(
     inst u_cexp: c_expander ( i_cinstr: c_inst_w, o_instr: c_expanded_w, o_illegal: c_illegal_w );
 
     // Halfword pick for the non-straddle cases.
-    let curr_hw       : logic<16> = if pc_q[1] ? i_imem_rdata[31:16] : i_imem_rdata[15:0];
+    let curr_hw       : logic<16> = if pc_q[1] ? icache_rdata[31:16] : icache_rdata[15:0];
     let curr_is_rvc   : logic     = curr_hw[1:0] != 2'b11;
     let needs_straddle: logic     = !straddle_q && pc_q[1] && !curr_is_rvc;
     assign c_inst_w = curr_hw;
 
     // Straddled 32-bit: low half saved last cycle + new fetch's low half.
-    let straddled_instr: logic<32> = {i_imem_rdata[15:0], straddle_low_q};
+    let straddled_instr: logic<32> = {icache_rdata[15:0], straddle_low_q};
 
     // Choose final 32-bit instr fed to decode.
     let fetched_instr: logic<32> = if straddle_q ?
@@ -296,7 +305,7 @@ pub module heliodor_core_v4 #(
     : if curr_is_rvc ?
         c_expanded_w
     :
-        i_imem_rdata
+        icache_rdata
     ; // pc[1]=0 + 32b
     let pc_advance   : logic<64> = if straddle_q ? 64'd4 : if curr_is_rvc ? 64'd2 : 64'd4;
 
@@ -304,7 +313,9 @@ pub module heliodor_core_v4 #(
     // imem_mmu only asserts valid (or fault) once the PT walk completes;
     // gate the latch on it so we don't advance with garbage. In Bare mode
     // imem_valid_w == i_req == 1, so no slowdown.
-    let fetch_ready: logic = !needs_straddle && (imem_valid_w || imem_fault_w);
+    // M8.A: also hold delivery while the icache is filling a miss. On a fault
+    // i_ren=0 (no lookup) so icache_stall=0 — the fault still delivers.
+    let fetch_ready: logic = !needs_straddle && (imem_valid_w || imem_fault_w) && !icache_stall;
 
     // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
     // imem_mmu's i_vaddr is the fetch address — advances ahead of pc_q
@@ -330,7 +341,7 @@ pub module heliodor_core_v4 #(
                 straddle_q     = 1'b0;
                 straddle_low_q = 16'd0;
                 if_ifault_q    = 1'b0;
-            } else if needs_straddle && (imem_valid_w || imem_fault_w) && !stall_dr {
+            } else if needs_straddle && (imem_valid_w || imem_fault_w) && !stall_dr && !icache_stall {
                 // Latch high half, advance fetch addr next cycle; hold pc_q.
                 // M9.A.315: gate on !stall_dr (symmetric with the delivery
                 // branch below). Without it, when the IF/ID slot holds a
@@ -364,6 +375,18 @@ pub module heliodor_core_v4 #(
                 if_is_rvc_q = !straddle_q && curr_is_rvc;
                 pc_q        = pc_q + pc_advance;
                 straddle_q  = 1'b0;
+            } else if !stall_dr {
+                // M8.A: IF/ID slot is free (empty, or its instr was renamed
+                // this cycle since !stall_dr ⇒ rename_fire) but no replacement
+                // could be delivered — the icache is filling a miss (or, under
+                // Sv39, the imem PTW is still walking / awaiting valid). Clear
+                // if_v_q so the just-renamed instr is NOT re-dispatched on the
+                // following cycle. pc_q and straddle_q are held, so the fetch
+                // resumes at the same point once the stall clears. Before the
+                // icache made fetch genuinely multi-cycle, fetch_ready was
+                // always 1 in Bare mode so this slot was refreshed every cycle
+                // and the gap never appeared.
+                if_v_q = 1'b0;
             }
         }
     }
@@ -412,7 +435,7 @@ pub module heliodor_core_v4 #(
         // imem_ptw_addr_w through o_dmem_addr while req=1.
         i_ptw_data    : i_dmem_rdata       ,
         i_ptw_valid   : imem_ptw_req_w     ,
-        i_icache_stall: 1'b0               ,
+        i_icache_stall: icache_stall       , // M8.A: hold MMU/TLB during icache fill
         i_sfence      : commit_sfence_pulse,
         i_redirect    : redirect_fire      ,
     );
@@ -420,10 +443,35 @@ pub module heliodor_core_v4 #(
     let _unused_imem_valid: logic = imem_valid_w;
     let _unused_imem_busy : logic = imem_busy_w;
 
-    // Word-aligned fetch addr (drops pc[1] since the toy memory is 32-bit
-    // addressable). The RVC fetch logic above picks the halfword.
-    assign o_imem_addr = {imem_paddr_w[63:2], 2'b00};
-    assign o_imem_ren  = 1'b1;
+    // ============================================================
+    // M8.A: L1 instruction cache, inserted between imem_mmu (imem_paddr_w)
+    // and the external 32-bit instruction memory port (o_imem_addr /
+    // i_imem_rdata). BLOCKING: o_stall (icache_stall) holds the fetch latch
+    // and the imem_mmu on a miss until the 16-word line fill completes; the
+    // pipeline then reads the combinational hit data (icache_rdata). Mem-side
+    // goes DIRECT to the per-hart imem port (NOT through memory_bus); the tb's
+    // combinational dram drives i_imem_rdata word-by-word during fill.
+    //   - i_ren = imem_valid_w: only look up once the MMU has a valid paddr.
+    //     On a page fault imem_valid_w=0 so no lookup/fill occurs (the fault
+    //     delivers via if_ifault_q).
+    //   - i_flush = commit_fence_i_pulse: FENCE.I invalidates all lines.
+    //   - o_rdata_next is unused: v4 resolves halfword-straddled 32-bit instrs
+    //     via the explicit 2-cycle re-fetch (fetch_vaddr+2), not a combo probe.
+    // ============================================================
+    inst u_icache: icache (
+        clk                              ,
+        rst                              ,
+        i_addr      : imem_paddr_w       ,
+        i_ren       : imem_valid_w       ,
+        i_flush     : commit_fence_i_pulse,
+        o_rdata     : icache_rdata       ,
+        o_rdata_next: icache_rdata_next  ,
+        o_stall     : icache_stall       ,
+        o_mem_addr  : o_imem_addr        ,
+        i_mem_rdata : i_imem_rdata       ,
+        o_mem_ren   : o_imem_ren         ,
+    );
+    let _unused_icache_rdata_next: logic<32> = icache_rdata_next;
 
     // ============================================================
     // Decode (Stage D)
@@ -549,6 +597,7 @@ pub module heliodor_core_v4 #(
         rob_alloc_entry.is_mret   = dec_op.is_mret;
         rob_alloc_entry.is_sret   = dec_op.is_sret;
         rob_alloc_entry.is_sfence = dec_op.is_sfence;
+        rob_alloc_entry.is_fence_i = dec_op.is_fence_i;
         rob_alloc_entry.is_amo    = dec_op.is_amo;
     }
 
@@ -952,6 +1001,7 @@ pub module heliodor_core_v4 #(
     var c_is_mret     : logic           ;
     var c_is_sret     : logic           ;
     var c_is_sfence   : logic           ;
+    var c_is_fence_i  : logic           ; // M8.A FENCE.I → icache flush
     var c_is_ifault   : logic           ;
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
@@ -1040,6 +1090,7 @@ pub module heliodor_core_v4 #(
         o_commit_is_mret     : c_is_mret            ,
         o_commit_is_sret     : c_is_sret            ,
         o_commit_is_sfence   : c_is_sfence          ,
+        o_commit_is_fence_i  : c_is_fence_i         ,
         o_commit_is_ifault   : c_is_ifault          ,
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_is_sfault   : c_is_sfault          ,
@@ -1178,6 +1229,12 @@ pub module heliodor_core_v4 #(
     let commit_mret: logic = rob_commit_valid && c_is_mret;
     let commit_sret: logic = rob_commit_valid && c_is_sret && !commit_tsr_trap;
     assign commit_sfence_pulse = rob_commit_valid && c_is_sfence && !commit_tvm_trap;
+
+    // M8.A: FENCE.I commit pulse → flush the icache. Fired at commit so all
+    // prior stores (self-modifying code) have updated memory before the
+    // icache refills. A redundant flush is harmless. Straight-line code after
+    // FENCE.I is not itself patched, so no pipeline redirect is needed.
+    assign commit_fence_i_pulse = rob_commit_valid && c_is_fence_i;
 
     // M9: satp shadow latch (see declaration above). Updated on either
     // SFENCE.VMA commit OR csrw satp commit. The latter is non-standard
