@@ -1,0 +1,1563 @@
+// Phase 7 v4: FPU compute wrapper.
+//
+// Combinational/multi-cycle shell around the v1 floating-point compute
+// logic, ported verbatim from `src/core/execute.veryl` (the v1 FP block,
+// lines ~240-1751). The arithmetic / rounding / fflags logic is copied
+// unchanged; only the v1 forwarding muxes are replaced by direct PRF
+// source inputs, and the v1 stall-based div/sqrt completion latch is
+// replaced by the v4 issue/flush handshake.
+//
+// Single-cycle ops drive the CDB combinationally this cycle. FDIV.D and
+// FSQRT.D are sequential (57-cycle); the core gates iq_fp issue with
+// !o_fpu_busy and the result fires on the latched-done cycle.
+pub module fpu_wrap_v4 #(
+    param PRF_W    : u32 = 6,
+    param ROB_IDX_W: u32 = 5,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Issued op metadata (combinational, from iq_fp via the core)
+    i_issue_valid     : input  logic            ,
+    i_fpu_op          : input  fpu_pkg::FpuOp   ,
+    i_fp_rm           : input  logic        <3> , // instruction rm field
+    i_frm             : input  logic        <3> , // dynamic rounding mode (fcsr.frm)
+    i_issue_rd_pdst   : input  logic   <PRF_W>  ,
+    i_issue_rob_idx   : input  logic<ROB_IDX_W> ,
+    i_issue_has_rd    : input  logic            ,
+    i_issue_writes_int: input  logic            , // dest is INT reg (unused inside; carried by core)
+
+    // Operands: FP sources from prf_fp, integer source from prf_int
+    i_s1_data     : input logic<64>, // FP rs1
+    i_s2_data     : input logic<64>, // FP rs2
+    i_s3_data     : input logic<64>, // FP rs3 (FMADD addend)
+    i_int_rs1_data: input logic<64>, // INT rs1 (INT->FP ops: FMV.W.X/FCVT.S.W/etc.)
+
+    // Flush (commit-time redirect)
+    i_flush: input logic,
+
+    // Multi-cycle busy (FDIV.D / FSQRT.D). Core gates iq_fp issue+ack with !busy.
+    o_fpu_busy: output logic,
+
+    // CDB result (combinational this cycle for single-cycle ops; on the
+    // completion cycle for FDIV.D/FSQRT.D)
+    o_cdb: output pipeline_v4_pkg::CdbBus,
+
+    // fflags accrual side-band (the core routes this into fcsr at commit)
+    o_fflags    : output logic<5>,
+    o_fflags_wen: output logic   ,
+) {
+    import fpu_pkg::*;
+
+    // ============================================================
+    // Source aliases (replace the v1 forwarding muxes). The copied v1
+    // body refers to fwd_fp_rs1/2/3 and fwd_rs1 by name; bind them to the
+    // PRF read inputs so the body needs no edits.
+    // ============================================================
+    let fwd_fp_rs1: logic<64> = i_s1_data;
+    let fwd_fp_rs2: logic<64> = i_s2_data;
+    let fwd_fp_rs3: logic<64> = i_s3_data;
+    let fwd_rs1   : logic<64> = i_int_rs1_data;
+
+    // Resolve rounding mode: use frm CSR when instruction specifies DYN
+    let fp_rm_resolved: logic<3> = if i_fp_rm == 3'b111 ? i_frm : i_fp_rm;
+
+    // NaN-boxing helpers for single-precision (use forwarded data)
+    let fp_s1      : logic<32> = fwd_fp_rs1[31:0];
+    let fp_s2      : logic<32> = fwd_fp_rs2[31:0];
+    let s1_nanboxed: logic     = fwd_fp_rs1[63:32] == 32'hFFFFFFFF;
+    let s2_nanboxed: logic     = fwd_fp_rs2[63:32] == 32'hFFFFFFFF;
+    // If not properly NaN-boxed, treat as canonical NaN
+    let s1_val: logic<32> = if s1_nanboxed ? fp_s1 : 32'h7FC00000;
+    let s2_val: logic<32> = if s2_nanboxed ? fp_s2 : 32'h7FC00000;
+
+    // Double-precision aliases (use forwarded data)
+    let d1: logic<64> = fwd_fp_rs1;
+    let d2: logic<64> = fwd_fp_rs2;
+
+    // Signed-order encodings for ordered FP compares (FMIN/FMAX/FLT/FLE):
+    //   positive (sign=0): XOR 0x8000..00 (flip MSB)
+    //   negative (sign=1): XOR 0xFFFF..FF (bit invert)
+    // After this, unsigned integer comparison matches FP ordering. The
+    // previous {sign, ~rest} trick inverted the magnitude ordering for
+    // positive values, causing fmin to return the larger operand.
+    let s1_ord: logic<32> = s1_val ^ (if s1_val[31] ? 32'hFFFFFFFF : 32'h80000000);
+    let s2_ord: logic<32> = s2_val ^ (if s2_val[31] ? 32'hFFFFFFFF : 32'h80000000);
+    let d1_ord: logic<64> = d1 ^ (if d1[63] ? 64'hFFFFFFFFFFFFFFFF : 64'h8000000000000000);
+    let d2_ord: logic<64> = d2 ^ (if d2[63] ? 64'hFFFFFFFFFFFFFFFF : 64'h8000000000000000);
+
+    // === Single-precision FP modules ===
+    let is_fma_s: logic     = i_fpu_op == FpuOp::FMADD_S || i_fpu_op == FpuOp::FMSUB_S || i_fpu_op == FpuOp::FNMADD_S
+        || i_fpu_op == FpuOp::FNMSUB_S;
+    let s3_val  : logic<32> = if fwd_fp_rs3[63:32] == 32'hFFFFFFFF ? fwd_fp_rs3[31:0] : 32'h7FC00000;
+
+    // Single-precision multiplier
+    var fp_mul_s_result: logic<32>;
+    var fp_mul_s_fflags: logic<5> ;
+    inst u_fp_mul_s: fp_multiplier_s (
+        i_a     : s1_val         ,
+        i_b     : s2_val         ,
+        i_rm    : fp_rm_resolved ,
+        o_result: fp_mul_s_result,
+        o_fflags: fp_mul_s_fflags,
+    );
+
+    // Single-precision adder (shared for FADD/FSUB/FMADD)
+    let fma_s_product: logic<32> = if i_fpu_op == FpuOp::FNMADD_S || i_fpu_op == FpuOp::FNMSUB_S ?
+        {~fp_mul_s_result[31], fp_mul_s_result[30:0]}
+    :
+        fp_mul_s_result
+    ;
+    let fma_s_sub    : logic     = i_fpu_op == FpuOp::FMSUB_S || i_fpu_op == FpuOp::FNMADD_S;
+    let add_s_a      : logic<32> = if is_fma_s ? fma_s_product : s1_val;
+    let add_s_b      : logic<32> = if is_fma_s ? s3_val : s2_val;
+    let add_s_sub    : logic     = if is_fma_s ? fma_s_sub : i_fpu_op == FpuOp::FSUB_S;
+
+    var fp_add_s_result: logic<32>;
+    var fp_add_s_fflags: logic<5> ;
+    inst u_fp_add_s: fp_adder_s (
+        i_a     : add_s_a        ,
+        i_b     : add_s_b        ,
+        i_sub   : add_s_sub      ,
+        i_rm    : fp_rm_resolved ,
+        o_result: fp_add_s_result,
+        o_fflags: fp_add_s_fflags,
+    );
+
+    // Single-precision divider
+    var fp_div_s_result: logic<32>;
+    var fp_div_s_fflags: logic<5> ;
+    inst u_fp_div_s: fp_divider_s (
+        i_a     : s1_val         ,
+        i_b     : s2_val         ,
+        i_rm    : fp_rm_resolved ,
+        o_result: fp_div_s_result,
+        o_fflags: fp_div_s_fflags,
+    );
+
+    // Single-precision sqrt
+    var fp_sqrt_s_result: logic<32>;
+    var fp_sqrt_s_fflags: logic<5> ;
+    inst u_fp_sqrt_s: fp_sqrt_s (
+        i_a     : s1_val          ,
+        i_rm    : fp_rm_resolved  ,
+        o_result: fp_sqrt_s_result,
+        o_fflags: fp_sqrt_s_fflags,
+    );
+
+    // === Double-precision FP modules ===
+    // FP multiplier (double-precision)
+    var fp_mul_result: logic<64>;
+    var fp_mul_fflags: logic<5> ;
+    inst u_fp_mul: fp_multiplier (
+        i_a     : d1            ,
+        i_b     : d2            ,
+        i_rm    : fp_rm_resolved,
+        o_result: fp_mul_result ,
+        o_fflags: fp_mul_fflags ,
+    );
+
+    // ---- FDIV.D / FSQRT.D sequential FUs + completion latch ----
+    let is_fdiv_d : logic = i_fpu_op == FpuOp::FDIV_D;
+    let is_fsqrt_d: logic = i_fpu_op == FpuOp::FSQRT_D;
+
+    var fp_div_result_raw: logic<64>;
+    var fp_div_fflags_raw: logic<5> ;
+    var fp_div_valid_w   : logic    ;
+    var fp_div_busy_w    : logic    ;
+    var fp_div_started   : logic    ;
+    var fp_div_result_q  : logic<64>;
+    var fp_div_fflags_q  : logic<5> ;
+    var fp_div_done_q    : logic    ;
+    inst u_fp_div: fp_divider (
+        clk                                                                                                  ,
+        rst                                                                                                  ,
+        i_valid : i_issue_valid && is_fdiv_d && !i_flush && !fp_div_busy_w && !fp_div_started && !fp_div_done_q,
+        i_a     : i_s1_data                                                                                  ,
+        i_b     : i_s2_data                                                                                  ,
+        i_rm    : fp_rm_resolved                                                                             ,
+        i_flush : i_flush                                                                                    ,
+        o_result: fp_div_result_raw                                                                          ,
+        o_fflags: fp_div_fflags_raw                                                                          ,
+        o_valid : fp_div_valid_w                                                                             ,
+        o_busy  : fp_div_busy_w                                                                              ,
+    );
+    always_ff (clk, rst) {
+        if_reset {
+            fp_div_started  = 1'b0;
+            fp_div_done_q   = 1'b0;
+            fp_div_result_q = '0;
+            fp_div_fflags_q = '0;
+        } else if i_flush {
+            fp_div_started = 1'b0;
+            fp_div_done_q  = 1'b0;
+        } else {
+            if i_issue_valid && is_fdiv_d && !fp_div_busy_w && !fp_div_started && !fp_div_done_q {
+                fp_div_started = 1'b1;
+            } else if fp_div_valid_w {
+                fp_div_started = 1'b0;
+            }
+            if fp_div_valid_w {
+                fp_div_result_q = fp_div_result_raw;
+                fp_div_fflags_q = fp_div_fflags_raw;
+                fp_div_done_q   = 1'b1;
+            } else if !(i_issue_valid && is_fdiv_d) {
+                fp_div_done_q = 1'b0;
+            }
+        }
+    }
+    let fp_div_result: logic<64> = fp_div_result_q;
+    let fp_div_fflags: logic<5>  = fp_div_fflags_q;
+    let fp_div_busy_o: logic     = i_issue_valid && is_fdiv_d && !fp_div_done_q;
+
+    var fp_sqrt_result_raw: logic<64>;
+    var fp_sqrt_fflags_raw: logic<5> ;
+    var fp_sqrt_valid_w   : logic    ;
+    var fp_sqrt_busy_w    : logic    ;
+    var fp_sqrt_started   : logic    ;
+    var fp_sqrt_result_q  : logic<64>;
+    var fp_sqrt_fflags_q  : logic<5> ;
+    var fp_sqrt_done_q    : logic    ;
+    inst u_fp_sqrt: fp_sqrt (
+        clk                                                                                                    ,
+        rst                                                                                                    ,
+        i_valid : i_issue_valid && is_fsqrt_d && !i_flush && !fp_sqrt_busy_w && !fp_sqrt_started && !fp_sqrt_done_q,
+        i_a     : i_s1_data                                                                                    ,
+        i_rm    : fp_rm_resolved                                                                               ,
+        i_flush : i_flush                                                                                      ,
+        o_result: fp_sqrt_result_raw                                                                           ,
+        o_fflags: fp_sqrt_fflags_raw                                                                           ,
+        o_valid : fp_sqrt_valid_w                                                                              ,
+        o_busy  : fp_sqrt_busy_w                                                                               ,
+    );
+    always_ff (clk, rst) {
+        if_reset {
+            fp_sqrt_started  = 1'b0;
+            fp_sqrt_done_q   = 1'b0;
+            fp_sqrt_result_q = '0;
+            fp_sqrt_fflags_q = '0;
+        } else if i_flush {
+            fp_sqrt_started = 1'b0;
+            fp_sqrt_done_q  = 1'b0;
+        } else {
+            if i_issue_valid && is_fsqrt_d && !fp_sqrt_busy_w && !fp_sqrt_started && !fp_sqrt_done_q {
+                fp_sqrt_started = 1'b1;
+            } else if fp_sqrt_valid_w {
+                fp_sqrt_started = 1'b0;
+            }
+            if fp_sqrt_valid_w {
+                fp_sqrt_result_q = fp_sqrt_result_raw;
+                fp_sqrt_fflags_q = fp_sqrt_fflags_raw;
+                fp_sqrt_done_q   = 1'b1;
+            } else if !(i_issue_valid && is_fsqrt_d) {
+                fp_sqrt_done_q = 1'b0;
+            }
+        }
+    }
+    let fp_sqrt_result: logic<64> = fp_sqrt_result_q;
+    let fp_sqrt_fflags: logic<5>  = fp_sqrt_fflags_q;
+    let fp_sqrt_busy_o: logic     = i_issue_valid && is_fsqrt_d && !fp_sqrt_done_q;
+
+    // FP adder/subtractor (double-precision)
+    // For FMADD/FMSUB: addend_a = multiply result, addend_b = rs3
+    // For FADD/FSUB: addend_a = rs1, addend_b = rs2
+    let is_fma: logic = i_fpu_op == FpuOp::FMADD_D || i_fpu_op == FpuOp::FMSUB_D || i_fpu_op == FpuOp::FNMADD_D
+        || i_fpu_op == FpuOp::FNMSUB_D;
+    // FMADD: rs1*rs2 + rs3,  FMSUB: rs1*rs2 - rs3
+    // FNMSUB: -(rs1*rs2) + rs3 = negate product sign, add rs3
+    // FNMADD: -(rs1*rs2) - rs3 = negate product sign, sub rs3
+    let fma_product: logic<64> = if i_fpu_op == FpuOp::FNMADD_D || i_fpu_op == FpuOp::FNMSUB_D ?
+        {~fp_mul_result[63], fp_mul_result[62:0]}
+    :
+        fp_mul_result
+    ;
+    let fma_sub    : logic     = i_fpu_op == FpuOp::FMSUB_D || i_fpu_op == FpuOp::FNMADD_D;
+
+    let add_a  : logic<64> = if is_fma ? fma_product : d1;
+    let add_b  : logic<64> = if is_fma ? fwd_fp_rs3 : d2;
+    let add_sub: logic     = if is_fma ? fma_sub : i_fpu_op == FpuOp::FSUB_D;
+
+    var fp_add_result: logic<64>;
+    var fp_add_fflags: logic<5> ;
+    inst u_fp_adder: fp_adder (
+        i_a     : add_a         ,
+        i_b     : add_b         ,
+        i_sub   : add_sub       ,
+        i_rm    : fp_rm_resolved,
+        o_result: fp_add_result ,
+        o_fflags: fp_add_fflags ,
+    );
+
+    // NaN detection
+    let s1_is_nan: logic = s1_val[30:23] == 8'hFF && s1_val[22:0] != 23'd0;
+    let s2_is_nan: logic = s2_val[30:23] == 8'hFF && s2_val[22:0] != 23'd0;
+    let d1_is_nan: logic = d1[62:52] == 11'h7FF && d1[51:0] != 52'd0;
+    let d2_is_nan: logic = d2[62:52] == 11'h7FF && d2[51:0] != 52'd0;
+
+    // sNaN detection: NaN with top mantissa bit = 0 (and any nonzero payload)
+    let s1_is_snan_comb: logic = s1_val[30:23] == 8'hFF && s1_val[22] == 1'b0 && s1_val[21:0] != 22'd0;
+    let s2_is_snan_comb: logic = s2_val[30:23] == 8'hFF && s2_val[22] == 1'b0 && s2_val[21:0] != 22'd0;
+    let d1_is_snan_comb: logic = d1[62:52] == 11'h7FF && d1[51] == 1'b0 && d1[50:0] != 51'd0;
+    let d2_is_snan_comb: logic = d2[62:52] == 11'h7FF && d2[51] == 1'b0 && d2[50:0] != 51'd0;
+
+    // FP fflags selection (combinational) — selects the right submodule's
+    // fflags based on the current fpu_op. FMIN/FMAX/FCMP synthesize NV
+    // directly from operand classification.
+    var fpu_fflags_comb: logic<5>;
+    always_comb {
+        fpu_fflags_comb = 5'd0;
+        case i_fpu_op {
+            FpuOp::FADD_S, FpuOp::FSUB_S, FpuOp::FMADD_S, FpuOp::FMSUB_S, FpuOp::FNMADD_S, FpuOp::FNMSUB_S: {
+                fpu_fflags_comb = fp_add_s_fflags;
+            }
+            FpuOp::FMUL_S                                                                                 : fpu_fflags_comb = fp_mul_s_fflags;
+            FpuOp::FDIV_S                                                                                 : fpu_fflags_comb = fp_div_s_fflags;
+            FpuOp::FSQRT_S                                                                                : fpu_fflags_comb = fp_sqrt_s_fflags;
+            FpuOp::FADD_D, FpuOp::FSUB_D, FpuOp::FMADD_D, FpuOp::FMSUB_D, FpuOp::FNMADD_D, FpuOp::FNMSUB_D: {
+                fpu_fflags_comb = fp_add_fflags;
+            }
+            FpuOp::FMUL_D               : fpu_fflags_comb = fp_mul_fflags;
+            FpuOp::FDIV_D               : fpu_fflags_comb = fp_div_fflags;
+            FpuOp::FSQRT_D              : fpu_fflags_comb = fp_sqrt_fflags;
+            // FMIN/FMAX raise NV only for signaling NaN inputs.
+            FpuOp::FMIN_S, FpuOp::FMAX_S: {
+                if s1_is_snan_comb || s2_is_snan_comb {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            FpuOp::FMIN_D, FpuOp::FMAX_D: {
+                if d1_is_snan_comb || d2_is_snan_comb {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            // FEQ raises NV only on signaling NaN.
+            FpuOp::FEQ_S: {
+                if s1_is_snan_comb || s2_is_snan_comb {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            FpuOp::FEQ_D: {
+                if d1_is_snan_comb || d2_is_snan_comb {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            // FLT/FLE raise NV on any NaN (quiet or signaling).
+            FpuOp::FLT_S, FpuOp::FLE_S: {
+                if s1_is_nan || s2_is_nan {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            FpuOp::FLT_D, FpuOp::FLE_D: {
+                if d1_is_nan || d2_is_nan {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            // FCVT.WU.S — unsigned int32 from single.
+            FpuOp::FCVT_WU_S: {
+                let e: logic<8> = s1_val[30:23];
+                if s1_is_nan || (e == 8'hFF && !s1_val[31]) || (e >= 8'd159 && !s1_val[31]) {
+                    // NaN or +inf or |x| >= 2^32 → saturate to UINT32_MAX, NV
+                    fpu_fflags_comb = 5'b10000;
+                } else if s1_val[31] {
+                    // Negative. Under rtz, |x|<1 rounds to 0 (representable)
+                    // and the result is inexact (NX) unless exactly -0.
+                    // |x|>=1 rounds to a negative integer, not representable
+                    // as unsigned, so saturate to 0 with NV.
+                    if e <: 8'd127 {
+                        if s1_val[30:0] != 31'd0 {
+                            fpu_fflags_comb = 5'b00001;
+                        }
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 8'd127 {
+                    if s1_val[30:0] != 31'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 8'd150 {
+                    let sh  : logic<8>  = 8'd150 - e;
+                    let mask: logic<24> = (24'd1 << sh[4:0]) - 24'd1;
+                    let lost: logic<24> = {1'b1, s1_val[22:0]} & mask;
+                    if lost != 24'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+                // e in (150, 159): left-shift only, no lost bits → exact.
+            }
+            // FCVT.L.S — signed int64 from single.
+            FpuOp::FCVT_L_S: {
+                let e: logic<8> = s1_val[30:23];
+                if s1_is_nan {
+                    fpu_fflags_comb = 5'b10000;
+                } else if e == 8'hFF || e >= 8'd190 {
+                    // Overflow, except for exact -2^63 (0xDF000000).
+                    if s1_val[31] && s1_val == 32'hDF000000 {
+                        fpu_fflags_comb = 5'd0;
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 8'd127 {
+                    if s1_val[30:0] != 31'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 8'd150 {
+                    // Right-shift case: sh = 150 - e
+                    let sh  : logic<8>  = 8'd150 - e;
+                    let mask: logic<24> = (24'd1 << sh[4:0]) - 24'd1;
+                    let lost: logic<24> = {1'b1, s1_val[22:0]} & mask;
+                    if lost != 24'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+                // Left-shift case (e > 150): no fraction bits → exact
+            }
+            // FCVT.LU.S — unsigned int64 from single.
+            FpuOp::FCVT_LU_S: {
+                let e: logic<8> = s1_val[30:23];
+                if s1_is_nan || (e == 8'hFF && !s1_val[31]) || (e >= 8'd191 && !s1_val[31]) {
+                    fpu_fflags_comb = 5'b10000;
+                } else if s1_val[31] {
+                    if e <: 8'd127 {
+                        if s1_val[30:0] != 31'd0 {
+                            fpu_fflags_comb = 5'b00001;
+                        }
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 8'd127 {
+                    if s1_val[30:0] != 31'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 8'd150 {
+                    let sh  : logic<8>  = 8'd150 - e;
+                    let mask: logic<24> = (24'd1 << sh[4:0]) - 24'd1;
+                    let lost: logic<24> = {1'b1, s1_val[22:0]} & mask;
+                    if lost != 24'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+            }
+            // FCVT.W.D — double → signed int32.
+            FpuOp::FCVT_W_D: {
+                let e: logic<11> = d1[62:52];
+                if d1_is_nan {
+                    fpu_fflags_comb = 5'b10000;
+                } else if e == 11'h7FF || e >= 11'd1054 {
+                    if d1[63] && d1 == 64'hC1E0000000000000 {
+                        // INT32_MIN exactly
+                        fpu_fflags_comb = 5'd0;
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 11'd1023 {
+                    if d1[62:0] != 63'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 11'd1075 {
+                    let sh  : logic<11> = 11'd1075 - e;
+                    let mask: logic<53> = (53'd1 << sh[5:0]) - 53'd1;
+                    let lost: logic<53> = {1'b1, d1[51:0]} & mask;
+                    if lost != 53'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+                // e in (1075, 1054): left-shift, exact.
+            }
+            FpuOp::FCVT_WU_D: {
+                let e: logic<11> = d1[62:52];
+                if d1_is_nan || (e == 11'h7FF && !d1[63]) || (e >= 11'd1055 && !d1[63]) {
+                    fpu_fflags_comb = 5'b10000;
+                } else if d1[63] {
+                    if e <: 11'd1023 {
+                        if d1[62:0] != 63'd0 {
+                            fpu_fflags_comb = 5'b00001;
+                        }
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 11'd1023 {
+                    if d1[62:0] != 63'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 11'd1075 {
+                    let sh  : logic<11> = 11'd1075 - e;
+                    let mask: logic<53> = (53'd1 << sh[5:0]) - 53'd1;
+                    let lost: logic<53> = {1'b1, d1[51:0]} & mask;
+                    if lost != 53'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+            }
+            FpuOp::FCVT_L_D: {
+                let e: logic<11> = d1[62:52];
+                if d1_is_nan {
+                    fpu_fflags_comb = 5'b10000;
+                } else if e == 11'h7FF || e >= 11'd1086 {
+                    if d1[63] && d1 == 64'hC3E0000000000000 {
+                        // INT64_MIN exactly
+                        fpu_fflags_comb = 5'd0;
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 11'd1023 {
+                    if d1[62:0] != 63'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 11'd1075 {
+                    let sh  : logic<11> = 11'd1075 - e;
+                    let mask: logic<53> = (53'd1 << sh[5:0]) - 53'd1;
+                    let lost: logic<53> = {1'b1, d1[51:0]} & mask;
+                    if lost != 53'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+            }
+            FpuOp::FCVT_LU_D: {
+                let e: logic<11> = d1[62:52];
+                if d1_is_nan || (e == 11'h7FF && !d1[63]) || (e >= 11'd1087 && !d1[63]) {
+                    fpu_fflags_comb = 5'b10000;
+                } else if d1[63] {
+                    if e <: 11'd1023 {
+                        if d1[62:0] != 63'd0 {
+                            fpu_fflags_comb = 5'b00001;
+                        }
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 11'd1023 {
+                    if d1[62:0] != 63'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 11'd1075 {
+                    let sh  : logic<11> = 11'd1075 - e;
+                    let mask: logic<53> = (53'd1 << sh[5:0]) - 53'd1;
+                    let lost: logic<53> = {1'b1, d1[51:0]} & mask;
+                    if lost != 53'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+            }
+            // FCVT.W.S — signed int32 from single. NV on NaN or
+            // out-of-range, NX on inexact truncation.
+            FpuOp::FCVT_W_S: {
+                let e: logic<8> = s1_val[30:23];
+                if s1_is_nan {
+                    fpu_fflags_comb = 5'b10000;
+                } else if e == 8'hFF || e >= 8'd158 {
+                    // Overflow: +/-inf or magnitude >= 2^31. Negative 2^31
+                    // exactly (0xCF000000) is representable as INT32_MIN,
+                    // so detect that special case and do not raise NV.
+                    if s1_val[31] && s1_val == 32'hCF000000 {
+                        fpu_fflags_comb = 5'd0;
+                    } else {
+                        fpu_fflags_comb = 5'b10000;
+                    }
+                } else if e <: 8'd127 {
+                    // Subnormals, small normals: |x| < 1 → truncates to 0
+                    // but is inexact unless exactly zero.
+                    if s1_val[30:0] != 31'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                } else if e <= 8'd150 {
+                    // Normal range with right-shift: NX iff truncated bits
+                    // are non-zero.
+                    let sh  : logic<8>  = 8'd150 - e;
+                    let mask: logic<24> = (24'd1 << sh[4:0]) - 24'd1;
+                    let lost: logic<24> = {1'b1, s1_val[22:0]} & mask;
+                    if lost != 24'd0 {
+                        fpu_fflags_comb = 5'b00001;
+                    }
+                }
+                // e in (150, 158): left-shift only, exact.
+            }
+            default: fpu_fflags_comb = 5'd0;
+        }
+    }
+
+    // FP result computation
+    var fpu_result: logic<64>;
+    always_comb {
+        fpu_result = 64'd0;
+        case i_fpu_op {
+            // FSGNJ: result sign = rs2 sign, magnitude = rs1
+            FpuOp::FSGNJ_S : fpu_result = {32'hFFFFFFFF, s2_val[31], s1_val[30:0]};
+            FpuOp::FSGNJN_S: fpu_result = {32'hFFFFFFFF, ~s2_val[31], s1_val[30:0]};
+            FpuOp::FSGNJX_S: fpu_result = {32'hFFFFFFFF, s1_val[31] ^ s2_val[31], s1_val[30:0]};
+            FpuOp::FSGNJ_D : fpu_result = {d2[63], d1[62:0]};
+            FpuOp::FSGNJN_D: fpu_result = {~d2[63], d1[62:0]};
+            FpuOp::FSGNJX_D: fpu_result = {d1[63] ^ d2[63], d1[62:0]};
+
+            // FMIN/FMAX single
+            FpuOp::FMIN_S  : {
+                if s1_is_nan && s2_is_nan {
+                    fpu_result = {32'hFFFFFFFF, 32'h7FC00000};
+                } else if s1_is_nan {
+                    fpu_result = {32'hFFFFFFFF, s2_val};
+                } else if s2_is_nan {
+                    fpu_result = {32'hFFFFFFFF, s1_val};
+                } else if s1_val == 32'h80000000 && s2_val == 32'h00000000 {
+                    fpu_result = {32'hFFFFFFFF, 32'h80000000};
+                } // -0 < +0
+                 else {
+                    fpu_result = if (s1_ord <: s2_ord) ? {32'hFFFFFFFF, s1_val} : {32'hFFFFFFFF, s2_val};
+                }
+            }
+            FpuOp::FMAX_S: {
+                if s1_is_nan && s2_is_nan {
+                    fpu_result = {32'hFFFFFFFF, 32'h7FC00000};
+                } else if s1_is_nan {
+                    fpu_result = {32'hFFFFFFFF, s2_val};
+                } else if s2_is_nan {
+                    fpu_result = {32'hFFFFFFFF, s1_val};
+                } else if s1_val == 32'h00000000 && s2_val == 32'h80000000 {
+                    fpu_result = {32'hFFFFFFFF, 32'h00000000};
+                } else {
+                    fpu_result = if (s1_ord >: s2_ord) ? {32'hFFFFFFFF, s1_val} : {32'hFFFFFFFF, s2_val};
+                }
+            }
+            // FMIN/FMAX double
+            FpuOp::FMIN_D: {
+                if d1_is_nan && d2_is_nan {
+                    fpu_result = 64'h7FF8000000000000;
+                } else if d1_is_nan {
+                    fpu_result = d2;
+                } else if d2_is_nan {
+                    fpu_result = d1;
+                } else if d1 == 64'h8000000000000000 && d2 == 64'h0000000000000000 {
+                    fpu_result = 64'h8000000000000000;
+                } else {
+                    fpu_result = if (d1_ord <: d2_ord) ? d1 : d2;
+                }
+            }
+            FpuOp::FMAX_D: {
+                if d1_is_nan && d2_is_nan {
+                    fpu_result = 64'h7FF8000000000000;
+                } else if d1_is_nan {
+                    fpu_result = d2;
+                } else if d2_is_nan {
+                    fpu_result = d1;
+                } else if d1 == 64'h0000000000000000 && d2 == 64'h8000000000000000 {
+                    fpu_result = 64'h0000000000000000;
+                } else {
+                    fpu_result = if (d1_ord >: d2_ord) ? d1 : d2;
+                }
+            }
+
+            // FMV: bit-for-bit moves between integer and FP registers
+            // FMV.X.W moves raw single-precision bits to the integer
+            // register with sign-extension. It must NOT substitute a
+            // canonical NaN for non-NaN-boxed values — the spec says
+            // the bits are transferred unmodified.
+            FpuOp::FMV_X_W : fpu_result = {fp_s1[31] repeat 32, fp_s1};
+            FpuOp::FMV_X_D : fpu_result = d1;
+            FpuOp::FMV_W_X : fpu_result = {32'hFFFFFFFF, fwd_rs1[31:0]}; // NaN-box
+            FpuOp::FMV_D_X : fpu_result = fwd_rs1;
+
+            // FCLASS: classify FP value into 10-bit mask
+            FpuOp::FCLASS_S: {
+                let s: logic     = s1_val[31];
+                let e: logic<8>  = s1_val[30:23];
+                let m: logic<23> = s1_val[22:0];
+                if e == 8'hFF && m != 23'd0 {
+                    fpu_result = if m[22] ? 64'd512 : 64'd256; // qNaN : sNaN
+                } else if e == 8'hFF {
+                    fpu_result = if s ? 64'd1 : 64'd128;
+                } // -inf : +inf
+                 else if e == 8'd0 && m == 23'd0 {
+                    fpu_result = if s ? 64'd8 : 64'd16;
+                } // -0 : +0
+                 else if e == 8'd0 {
+                    fpu_result = if s ? 64'd4 : 64'd32;
+                } // -subnormal : +subnormal
+                 else {
+                    fpu_result = if s ? 64'd2 : 64'd64;
+                } // -normal : +normal
+            }
+            FpuOp::FCLASS_D: {
+                let sd: logic     = d1[63];
+                let ed: logic<11> = d1[62:52];
+                let md: logic<52> = d1[51:0];
+                if ed == 11'h7FF && md != 52'd0 {
+                    fpu_result = if md[51] ? 64'd512 : 64'd256;
+                } else if ed == 11'h7FF {
+                    fpu_result = if sd ? 64'd1 : 64'd128;
+                } else if ed == 11'd0 && md == 52'd0 {
+                    fpu_result = if sd ? 64'd8 : 64'd16;
+                } else if ed == 11'd0 {
+                    fpu_result = if sd ? 64'd4 : 64'd32;
+                } else {
+                    fpu_result = if sd ? 64'd2 : 64'd64;
+                }
+            }
+
+            // FCMP: FEQ/FLT/FLE (result is 0 or 1 to integer rd)
+            FpuOp::FEQ_S   : fpu_result = if s1_is_nan || s2_is_nan ?
+                64'd0
+            : if s1_val == s2_val ?
+                64'd1
+            : if s1_val == 32'h80000000 && s2_val == 32'h00000000 ?
+                64'd1
+            : if s1_val == 32'h00000000 && s2_val == 32'h80000000 ?
+                64'd1
+            :
+                64'd0
+            ;
+            FpuOp::FLT_S   : fpu_result = if s1_is_nan || s2_is_nan ? 64'd0 : if s1_ord <: s2_ord ? 64'd1 : 64'd0;
+            FpuOp::FLE_S   : fpu_result = if s1_is_nan || s2_is_nan ?
+                64'd0
+            : if s1_val == s2_val ?
+                64'd1
+            : if s1_val == 32'h80000000 && s2_val == 32'h00000000 ?
+                64'd1
+            : if s1_val == 32'h00000000 && s2_val == 32'h80000000 ?
+                64'd1
+            : if s1_ord <: s2_ord ?
+                64'd1
+            :
+                64'd0
+            ;
+            FpuOp::FEQ_D   : fpu_result = if d1_is_nan || d2_is_nan ?
+                64'd0
+            : if d1 == d2 ?
+                64'd1
+            : if d1 == 64'h8000000000000000 && d2 == 64'h0000000000000000 ?
+                64'd1
+            : if d1 == 64'h0000000000000000 && d2 == 64'h8000000000000000 ?
+                64'd1
+            :
+                64'd0
+            ;
+            FpuOp::FLT_D   : fpu_result = if d1_is_nan || d2_is_nan ? 64'd0 : if d1_ord <: d2_ord ? 64'd1 : 64'd0;
+            FpuOp::FLE_D   : fpu_result = if d1_is_nan || d2_is_nan ?
+                64'd0
+            : if d1 == d2 ?
+                64'd1
+            : if d1 == 64'h8000000000000000 && d2 == 64'h0000000000000000 ?
+                64'd1
+            : if d1 == 64'h0000000000000000 && d2 == 64'h8000000000000000 ?
+                64'd1
+            : if d1_ord <: d2_ord ?
+                64'd1
+            :
+                64'd0
+            ;
+
+            // FCVT.S.D: double → single (truncate, NaN-box)
+            // Simplified: just truncate mantissa, no proper rounding yet
+            FpuOp::FCVT_D_S: {
+                // single → double: exact conversion, no rounding needed
+                let cs: logic     = s1_val[31];
+                let ce: logic<8>  = s1_val[30:23];
+                let cm: logic<23> = s1_val[22:0];
+                if ce == 8'hFF && cm != 23'd0 {
+                    fpu_result = 64'h7FF8000000000000;
+                } // NaN
+                 else if ce == 8'hFF {
+                    fpu_result = {cs, 11'h7FF, 52'd0};
+                } // Inf
+                 else if ce == 8'd0 && cm == 23'd0 {
+                    fpu_result = {cs, 63'd0};
+                } // Zero
+                 else {
+                    let de        : logic<11> = {3'd0, ce} + 11'd896; // bias adjust: 1023-127=896
+                    fpu_result = {cs, de, cm, 29'd0};
+                }
+            }
+
+            // FADD/FSUB (double-precision)
+            FpuOp::FADD_D  : fpu_result = fp_add_result;
+            FpuOp::FSUB_D  : fpu_result = fp_add_result;
+
+            // FMUL / FDIV / FSQRT (double-precision)
+            FpuOp::FMUL_D  : fpu_result = fp_mul_result;
+            FpuOp::FDIV_D  : fpu_result = fp_div_result;
+            FpuOp::FSQRT_D : fpu_result = fp_sqrt_result;
+
+            // FMADD/FMSUB/FNMADD/FNMSUB (double-precision)
+            // Non-fused: multiply then add (chained through fp_mul → fp_adder)
+            FpuOp::FMADD_D : fpu_result = fp_add_result;
+            FpuOp::FMSUB_D : fpu_result = fp_add_result;
+            FpuOp::FNMADD_D: fpu_result = fp_add_result;
+            FpuOp::FNMSUB_D: fpu_result = fp_add_result;
+
+            // Single-precision arithmetic (NaN-boxed results)
+            FpuOp::FADD_S  : fpu_result = {32'hFFFFFFFF, fp_add_s_result};
+            FpuOp::FSUB_S  : fpu_result = {32'hFFFFFFFF, fp_add_s_result};
+            FpuOp::FMUL_S  : fpu_result = {32'hFFFFFFFF, fp_mul_s_result};
+            FpuOp::FDIV_S  : fpu_result = {32'hFFFFFFFF, fp_div_s_result};
+            FpuOp::FSQRT_S : fpu_result = {32'hFFFFFFFF, fp_sqrt_s_result};
+            FpuOp::FMADD_S : fpu_result = {32'hFFFFFFFF, fp_add_s_result};
+            FpuOp::FMSUB_S : fpu_result = {32'hFFFFFFFF, fp_add_s_result};
+            FpuOp::FNMADD_S: fpu_result = {32'hFFFFFFFF, fp_add_s_result};
+            FpuOp::FNMSUB_S: fpu_result = {32'hFFFFFFFF, fp_add_s_result};
+
+            // FCVT int↔single (NaN-boxed)
+            FpuOp::FCVT_S_W: {
+                // signed int32 → single
+                var csw_neg: logic    ;
+                var csw_abs: logic<32>;
+                csw_neg = fwd_rs1[31];
+                if csw_neg {
+                    csw_abs = ~fwd_rs1[31:0] + 32'd1;
+                } else {
+                    csw_abs = fwd_rs1[31:0];
+                }
+                if csw_abs == 32'd0 {
+                    fpu_result = {32'hFFFFFFFF, csw_neg, 31'd0};
+                } else {
+                    var csw_lz: logic<6>;
+                    csw_lz = 6'd32;
+                    for i in 0..32 {
+                        if csw_abs[31 - i] == 1'b1 && csw_lz == 6'd32 {
+                            csw_lz = i[5:0];
+                        }
+                    }
+                    var csw_norm: logic<32>;
+                    csw_norm = csw_abs << csw_lz;
+                    // csw_norm[31]=implicit 1, [30:8]=mantissa, [7:0]=GRS+extra
+                    var csw_g : logic;
+                    var csw_r : logic;
+                    var csw_s : logic;
+                    var csw_l : logic;
+                    csw_g  = csw_norm[8];
+                    csw_r  = csw_norm[7];
+                    csw_s  = csw_norm[6:0] != 7'd0;
+                    csw_l  = csw_norm[9];
+                    var csw_ru: logic;
+                    case fp_rm_resolved {
+                        3'b000 : csw_ru = csw_g && (csw_r || csw_s || csw_l);
+                        3'b001 : csw_ru = 1'b0;
+                        3'b010 : csw_ru = csw_neg && (csw_g || csw_r || csw_s);
+                        3'b011 : csw_ru = !csw_neg && (csw_g || csw_r || csw_s);
+                        3'b100 : csw_ru = csw_g;
+                        default: csw_ru = csw_g && (csw_r || csw_s || csw_l);
+                    }
+                    var csw_m : logic<24>;
+                    csw_m  = {1'b0, csw_norm[30:8]} + {23'd0, csw_ru};
+                    var csw_e : logic<8>;
+                    csw_e  = 8'd158 - {2'd0, csw_lz}; // 127+31-lz
+                    if csw_m[23] {
+                        csw_e = csw_e + 8'd1;
+                    }
+                    fpu_result = {32'hFFFFFFFF, csw_neg, csw_e, csw_m[22:0]};
+                }
+            }
+            FpuOp::FCVT_S_WU: {
+                var cswu: logic<32>;
+                cswu = fwd_rs1[31:0];
+                if cswu == 32'd0 {
+                    fpu_result = {32'hFFFFFFFF, 32'd0};
+                } else {
+                    var cswu_lz: logic<6>;
+                    cswu_lz = 6'd32;
+                    for i in 0..32 {
+                        if cswu[31 - i] == 1'b1 && cswu_lz == 6'd32 {
+                            cswu_lz = i[5:0];
+                        }
+                    }
+                    var cswu_n : logic<32>;
+                    cswu_n  = cswu << cswu_lz;
+                    var cswu_g : logic;
+                    var cswu_r : logic;
+                    var cswu_s : logic;
+                    var cswu_l : logic;
+                    cswu_g  = cswu_n[8];
+                    cswu_r  = cswu_n[7];
+                    cswu_s  = cswu_n[6:0] != 7'd0;
+                    cswu_l  = cswu_n[9];
+                    var cswu_ru: logic;
+                    case fp_rm_resolved {
+                        3'b000 : cswu_ru = cswu_g && (cswu_r || cswu_s || cswu_l);
+                        3'b001 : cswu_ru = 1'b0;
+                        3'b010 : cswu_ru = 1'b0;
+                        3'b011 : cswu_ru = cswu_g || cswu_r || cswu_s;
+                        3'b100 : cswu_ru = cswu_g;
+                        default: cswu_ru = cswu_g && (cswu_r || cswu_s || cswu_l);
+                    }
+                    var cswu_m : logic<24>;
+                    cswu_m  = {1'b0, cswu_n[30:8]} + {23'd0, cswu_ru};
+                    var cswu_e : logic<8>;
+                    cswu_e  = 8'd158 - {2'd0, cswu_lz};
+                    if cswu_m[23] {
+                        cswu_e = cswu_e + 8'd1;
+                    }
+                    fpu_result = {32'hFFFFFFFF, 1'b0, cswu_e, cswu_m[22:0]};
+                }
+            }
+            FpuOp::FCVT_S_L: {
+                // signed int64 → single (may round)
+                var csl_neg: logic    ;
+                var csl_abs: logic<64>;
+                csl_neg = fwd_rs1[63];
+                if csl_neg {
+                    csl_abs = ~fwd_rs1 + 64'd1;
+                } else {
+                    csl_abs = fwd_rs1;
+                }
+                if csl_abs == 64'd0 {
+                    fpu_result = {32'hFFFFFFFF, csl_neg, 31'd0};
+                } else {
+                    var csl_lz: logic<7>;
+                    csl_lz = 7'd64;
+                    for i in 0..64 {
+                        if csl_abs[63 - i] == 1'b1 && csl_lz == 7'd64 {
+                            csl_lz = i[6:0];
+                        }
+                    }
+                    var csl_sh: logic<64>;
+                    csl_sh = csl_abs << csl_lz;
+                    // sh[63]=implicit 1, [62:40]=mantissa, [39]=G, [38]=R, [37:0]=S
+                    var csl_g : logic;
+                    var csl_r : logic;
+                    var csl_s : logic;
+                    var csl_l : logic;
+                    csl_g  = csl_sh[39];
+                    csl_r  = csl_sh[38];
+                    csl_s  = csl_sh[37:0] != 38'd0;
+                    csl_l  = csl_sh[40];
+                    var csl_ru: logic;
+                    case fp_rm_resolved {
+                        3'b000 : csl_ru = csl_g && (csl_r || csl_s || csl_l);
+                        3'b001 : csl_ru = 1'b0;
+                        3'b010 : csl_ru = csl_neg && (csl_g || csl_r || csl_s);
+                        3'b011 : csl_ru = !csl_neg && (csl_g || csl_r || csl_s);
+                        3'b100 : csl_ru = csl_g;
+                        default: csl_ru = csl_g && (csl_r || csl_s || csl_l);
+                    }
+                    var csl_m : logic<24>;
+                    csl_m  = {1'b0, csl_sh[62:40]} + {23'd0, csl_ru};
+                    var csl_e : logic<8>;
+                    csl_e  = 8'd190 - csl_lz[6:0]; // 127+63-lz
+                    if csl_m[23] {
+                        csl_e = csl_e + 8'd1;
+                    }
+                    fpu_result = {32'hFFFFFFFF, csl_neg, csl_e, csl_m[22:0]};
+                }
+            }
+            FpuOp::FCVT_S_LU: {
+                var cslu: logic<64>;
+                cslu = fwd_rs1;
+                if cslu == 64'd0 {
+                    fpu_result = {32'hFFFFFFFF, 32'd0};
+                } else {
+                    var cslu_lz: logic<7>;
+                    cslu_lz = 7'd64;
+                    for i in 0..64 {
+                        if cslu[63 - i] == 1'b1 && cslu_lz == 7'd64 {
+                            cslu_lz = i[6:0];
+                        }
+                    }
+                    var cslu_sh: logic<64>;
+                    cslu_sh = cslu << cslu_lz;
+                    var cslu_g : logic;
+                    var cslu_r : logic;
+                    var cslu_s : logic;
+                    var cslu_l : logic;
+                    cslu_g  = cslu_sh[39];
+                    cslu_r  = cslu_sh[38];
+                    cslu_s  = cslu_sh[37:0] != 38'd0;
+                    cslu_l  = cslu_sh[40];
+                    var cslu_ru: logic;
+                    case fp_rm_resolved {
+                        3'b000 : cslu_ru = cslu_g && (cslu_r || cslu_s || cslu_l);
+                        3'b001 : cslu_ru = 1'b0;
+                        3'b010 : cslu_ru = 1'b0;
+                        3'b011 : cslu_ru = cslu_g || cslu_r || cslu_s;
+                        3'b100 : cslu_ru = cslu_g;
+                        default: cslu_ru = cslu_g && (cslu_r || cslu_s || cslu_l);
+                    }
+                    var cslu_m : logic<24>;
+                    cslu_m  = {1'b0, cslu_sh[62:40]} + {23'd0, cslu_ru};
+                    var cslu_e : logic<8>;
+                    cslu_e  = 8'd190 - cslu_lz[6:0];
+                    if cslu_m[23] {
+                        cslu_e = cslu_e + 8'd1;
+                    }
+                    fpu_result = {32'hFFFFFFFF, 1'b0, cslu_e, cslu_m[22:0]};
+                }
+            }
+            FpuOp::FCVT_W_S: {
+                // single → signed int32
+                var fws_e: logic<8> ;
+                var fws_m: logic<23>;
+                fws_e = s1_val[30:23];
+                fws_m = s1_val[22:0];
+                if fws_e == 8'hFF || fws_e >= 8'd158 {
+                    if s1_is_nan {
+                        fpu_result = 64'h000000007FFFFFFF;
+                    } else if s1_val[31] {
+                        fpu_result = 64'hFFFFFFFF80000000;
+                    } else {
+                        fpu_result = 64'h000000007FFFFFFF;
+                    }
+                } else if fws_e <: 8'd127 {
+                    fpu_result = 64'd0;
+                } else {
+                    var fws_sig: logic<24>;
+                    fws_sig = {1'b1, fws_m};
+                    var fws_abs: logic<32>;
+                    if fws_e >: 8'd150 {
+                        // Left-shift case (e in (150, 158)): 2^24..2^31
+                        let fws_ls : logic<8> = fws_e - 8'd150;
+                        fws_abs = {8'd0, fws_sig} << fws_ls[4:0];
+                    } else {
+                        let fws_rs : logic<8> = 8'd150 - fws_e;
+                        fws_abs = {8'd0, fws_sig} >> fws_rs[4:0];
+                    }
+                    var fws_r32: logic<32>;
+                    fws_r32 = fws_abs;
+                    if s1_val[31] {
+                        fws_r32 = ~fws_r32 + 32'd1;
+                    }
+                    fpu_result = {fws_r32[31] repeat 32, fws_r32};
+                }
+            }
+            FpuOp::FCVT_WU_S: {
+                var fwus_e: logic<8> ;
+                var fwus_m: logic<23>;
+                fwus_e = s1_val[30:23];
+                fwus_m = s1_val[22:0];
+                if s1_is_nan || (fwus_e == 8'hFF && !s1_val[31]) || (fwus_e >= 8'd159 && !s1_val[31]) {
+                    // NaN, +inf, or +overflow → UINT32_MAX.
+                    fpu_result = 64'hFFFFFFFFFFFFFFFF;
+                } else if s1_val[31] || fwus_e <: 8'd127 {
+                    // Negative (incl. -inf, -overflow) or |x|<1 → 0.
+                    fpu_result = 64'd0;
+                } else {
+                    var fwus_sig: logic<24>;
+                    fwus_sig = {1'b1, fwus_m};
+                    var fwus_abs: logic<32>;
+                    if fwus_e >: 8'd150 {
+                        // Left-shift: 2^31 <= value < 2^32.
+                        let ls      : logic<8> = fwus_e - 8'd150;
+                        fwus_abs = {8'd0, fwus_sig} << ls[4:0];
+                    } else {
+                        let rs      : logic<8> = 8'd150 - fwus_e;
+                        fwus_abs = {8'd0, fwus_sig} >> rs[4:0];
+                    }
+                    // RV64 sign-extends the 32-bit unsigned result to 64 bits.
+                    fpu_result = {fwus_abs[31] repeat 32, fwus_abs};
+                }
+            }
+            FpuOp::FCVT_L_S: {
+                var fls_e: logic<8> ;
+                var fls_m: logic<23>;
+                fls_e = s1_val[30:23];
+                fls_m = s1_val[22:0];
+                if fls_e == 8'hFF || fls_e >= 8'd190 {
+                    if s1_is_nan {
+                        fpu_result = 64'h7FFFFFFFFFFFFFFF;
+                    } else if s1_val[31] {
+                        fpu_result = 64'h8000000000000000;
+                    } else {
+                        fpu_result = 64'h7FFFFFFFFFFFFFFF;
+                    }
+                } else if fls_e <: 8'd127 {
+                    fpu_result = 64'd0;
+                } else {
+                    var fls_sig: logic<24>;
+                    fls_sig = {1'b1, fls_m};
+                    var fls_abs: logic<64>;
+                    if fls_e >: 8'd150 {
+                        var fls_ls : logic<8>;
+                        fls_ls  = fls_e - 8'd150;
+                        fls_abs = {40'd0, fls_sig} << fls_ls;
+                    } else {
+                        var fls_rs : logic<8>;
+                        fls_rs  = 8'd150 - fls_e;
+                        fls_abs = {40'd0, fls_sig} >> fls_rs;
+                    }
+                    if s1_val[31] {
+                        fpu_result = ~fls_abs + 64'd1;
+                    } else {
+                        fpu_result = fls_abs;
+                    }
+                }
+            }
+            FpuOp::FCVT_LU_S: {
+                var flus_e: logic<8> ;
+                var flus_m: logic<23>;
+                flus_e = s1_val[30:23];
+                flus_m = s1_val[22:0];
+                if s1_is_nan || (flus_e == 8'hFF && !s1_val[31]) || (flus_e >= 8'd191 && !s1_val[31]) {
+                    fpu_result = 64'hFFFFFFFFFFFFFFFF;
+                } else if s1_val[31] || flus_e <: 8'd127 {
+                    fpu_result = 64'd0;
+                } else {
+                    var flus_sig: logic<24>;
+                    flus_sig = {1'b1, flus_m};
+                    var flus_abs: logic<64>;
+                    if flus_e >: 8'd150 {
+                        var flus_ls : logic<8>;
+                        flus_ls  = flus_e - 8'd150;
+                        flus_abs = {40'd0, flus_sig} << flus_ls;
+                    } else {
+                        var flus_rs : logic<8>;
+                        flus_rs  = 8'd150 - flus_e;
+                        flus_abs = {40'd0, flus_sig} >> flus_rs;
+                    }
+                    fpu_result = flus_abs;
+                }
+            }
+
+            // FCVT.S.D: double → single (with rounding)
+            FpuOp::FCVT_S_D: {
+                let sd_sign: logic     = d1[63];
+                let sd_exp : logic<11> = d1[62:52];
+                let sd_mant: logic<52> = d1[51:0];
+                if sd_exp == 11'h7FF && sd_mant != 52'd0 {
+                    fpu_result = {32'hFFFFFFFF, 32'h7FC00000}; // NaN → canonical single NaN
+                } else if sd_exp == 11'h7FF {
+                    fpu_result = {32'hFFFFFFFF, sd_sign, 8'hFF, 23'd0}; // Inf
+                } else if sd_exp == 11'd0 && sd_mant == 52'd0 {
+                    fpu_result = {32'hFFFFFFFF, sd_sign, 31'd0}; // Zero
+                } else {
+                    // Rebias exponent: single bias=127, double bias=1023, diff=896
+                    var se: logic<12>;
+                    if sd_exp == 11'd0 {
+                        se = 12'd1 - 12'd896;
+                    } // subnormal
+                     else {
+                        se = {1'b0, sd_exp} - 12'd896;
+                    }
+
+                    // Significand: take top 23+3 bits for G/R/S rounding
+                    var imp: logic;
+                    if sd_exp == 11'd0 {
+                        imp = 1'b0;
+                    } else {
+                        imp = 1'b1;
+                    }
+                    // Full significand: imp.mant[51:0] = 53 bits
+                    // Single needs 23 bits of mantissa + G R S
+                    // G = bit 28 (mant[28]), R = bit 27, S = OR of bits [26:0]
+                    var sg     : logic;
+                    var sr     : logic;
+                    var ss     : logic;
+                    sg      = sd_mant[28];
+                    sr      = sd_mant[27];
+                    ss      = sd_mant[26:0] != 27'd0;
+                    var s_round: logic;
+                    var s_lsb_v: logic;
+                    s_lsb_v = sd_mant[29];
+                    case fp_rm_resolved {
+                        3'b000 : s_round = sg && (sr || ss || s_lsb_v);
+                        3'b001 : s_round = 1'b0;
+                        3'b010 : s_round = sd_sign && (sg || sr || ss);
+                        3'b011 : s_round = !sd_sign && (sg || sr || ss);
+                        3'b100 : s_round = sg;
+                        default: s_round = sg && (sr || ss || s_lsb_v);
+                    }
+                    // s_mant_r is 25 bits wide so rounding-induced
+                    // overflow lands in bit 24 and we can detect it
+                    // without conflating it with the always-set
+                    // implicit bit.
+                    var s_mant_r: logic<25>;
+                    s_mant_r = {1'b0, imp, sd_mant[51:29]} + {24'd0, s_round};
+
+                    // se is a signed 12-bit value (can be negative when
+                    // the double exponent is below the single minimum).
+                    // Use the MSB as the sign bit for the "<= 0" check.
+                    if se[11] == 1'b1 || se == 12'd0 {
+                        // Subnormal single result. Shift the 53-bit
+                        // double significand right by (30 + 1 - se):
+                        // the +30 drops to the 23-bit single fraction
+                        // width, and (1 - se) further denormalizes it.
+                        // Capture guard/round/sticky below for
+                        // round-to-nearest-even.
+                        var sub_mant: logic<53>;
+                        sub_mant = {imp, sd_mant};
+                        // Shift so the implicit bit (sub_mant[52]) lands
+                        // at bit (de+152) of the shifted value, where
+                        // de = se - 127. This places frac[MSB] at bit
+                        // (de+149+3) = bit (de+152), giving 3 GRS bits
+                        // below and 23 fraction bits above.
+                        //   sub_shift = 52 - (de + 152) = -100 - de
+                        //             = -100 - (se - 127) = 27 - se
+                        var sub_shift : logic<12>;
+                        sub_shift  = 12'd27 - se;
+                        var shifted   : logic<53>;
+                        var sub_sticky: logic    ;
+                        if sub_shift >: 12'd52 {
+                            shifted    = 53'd0;
+                            sub_sticky = sub_mant != 53'd0;
+                        } else {
+                            shifted    = sub_mant >> sub_shift[5:0];
+                            let sh_mask   : logic<53> = (53'd1 << sub_shift[5:0]) - 53'd1;
+                            let lost      : logic<53> = sub_mant & sh_mask;
+                            sub_sticky = lost != 53'd0;
+                        }
+                        // shifted[25:3] = single fraction (23 bits)
+                        // shifted[2] = guard, shifted[1] = round,
+                        // shifted[0] | sub_sticky = sticky.
+                        var sub_g : logic;
+                        var sub_r : logic;
+                        var sub_s : logic;
+                        var sub_l : logic;
+                        sub_g  = shifted[2];
+                        sub_r  = shifted[1];
+                        sub_s  = shifted[0] | sub_sticky;
+                        sub_l  = shifted[3];
+                        var sub_ru: logic;
+                        case fp_rm_resolved {
+                            3'b000 : sub_ru   = sub_g && (sub_r || sub_s || sub_l);
+                            3'b001 : sub_ru   = 1'b0;
+                            3'b010 : sub_ru   = sd_sign && (sub_g || sub_r || sub_s);
+                            3'b011 : sub_ru   = !sd_sign && (sub_g || sub_r || sub_s);
+                            3'b100 : sub_ru   = sub_g;
+                            default: sub_ru   = sub_g && (sub_r || sub_s || sub_l);
+                        }
+                        var sub_frac: logic<24>;
+                        sub_frac = {1'b0, shifted[25:3]} + {23'd0, sub_ru};
+                        if sub_frac[23] {
+                            fpu_result = {32'hFFFFFFFF, sd_sign, 8'd1, 23'd0};
+                        } else {
+                            fpu_result = {32'hFFFFFFFF, sd_sign, 8'd0, sub_frac[22:0]};
+                        }
+                    } else if se >= 12'd255 {
+                        // Overflow → infinity
+                        fpu_result = {32'hFFFFFFFF, sd_sign, 8'hFF, 23'd0};
+                    } else if s_mant_r[24] {
+                        // Rounding caused carry into new bit → exp + 1
+                        let new_se: logic<12> = se + 12'd1;
+                        if new_se >= 12'd255 {
+                            fpu_result = {32'hFFFFFFFF, sd_sign, 8'hFF, 23'd0};
+                        } else {
+                            fpu_result = {32'hFFFFFFFF, sd_sign, new_se[7:0], s_mant_r[23:1]};
+                        }
+                    } else {
+                        fpu_result = {32'hFFFFFFFF, sd_sign, se[7:0], s_mant_r[22:0]};
+                    }
+                }
+            }
+
+            // FCVT: integer ↔ double conversion
+            FpuOp::FCVT_D_W: {
+                // signed int32 → double (exact, no rounding needed for 32-bit)
+                var cw_neg: logic    ;
+                var cw_abs: logic<32>;
+                cw_neg = fwd_rs1[31];
+                if cw_neg {
+                    cw_abs = ~fwd_rs1[31:0] + 32'd1;
+                } else {
+                    cw_abs = fwd_rs1[31:0];
+                }
+                if cw_abs == 32'd0 {
+                    fpu_result = {cw_neg, 63'd0};
+                } else {
+                    // Find leading zeros in 32-bit value
+                    var cw_lz: logic<6>;
+                    cw_lz = 6'd32;
+                    for i in 0..32 {
+                        if cw_abs[31 - i] == 1'b1 && cw_lz == 6'd32 {
+                            cw_lz = i[5:0];
+                        }
+                    }
+                    // Normalize: shift left to put leading 1 at bit 31
+                    var cw_norm: logic<32>;
+                    cw_norm = cw_abs << cw_lz;
+                    // cw_norm[31] = implicit 1, cw_norm[30:0] = mantissa bits
+                    var cw_mant   : logic<52>;
+                    cw_mant    = {cw_norm[30:0], 21'd0};
+                    var cw_exp    : logic<11>;
+                    cw_exp     = 11'd1054 - {5'd0, cw_lz}; // 1023 + 31 - lz
+                    fpu_result = {cw_neg, cw_exp, cw_mant};
+                }
+            }
+            FpuOp::FCVT_D_WU: {
+                // unsigned int32 → double (exact, no rounding needed)
+                var cwu_val: logic<32>;
+                cwu_val = fwd_rs1[31:0];
+                if cwu_val == 32'd0 {
+                    fpu_result = 64'd0;
+                } else {
+                    var cwu_lz: logic<6>;
+                    cwu_lz = 6'd32;
+                    for i in 0..32 {
+                        if cwu_val[31 - i] == 1'b1 && cwu_lz == 6'd32 {
+                            cwu_lz = i[5:0];
+                        }
+                    }
+                    var cwu_norm  : logic<32>;
+                    cwu_norm   = cwu_val << cwu_lz;
+                    var cwu_mant  : logic<52>;
+                    cwu_mant   = {cwu_norm[30:0], 21'd0};
+                    var cwu_exp   : logic<11>;
+                    cwu_exp    = 11'd1054 - {5'd0, cwu_lz};
+                    fpu_result = {1'b0, cwu_exp, cwu_mant};
+                }
+            }
+            FpuOp::FCVT_D_L: {
+                // signed int64 → double
+                var cl_neg: logic    ;
+                var cl_abs: logic<64>;
+                cl_neg = fwd_rs1[63];
+                if cl_neg {
+                    cl_abs = ~fwd_rs1 + 64'd1;
+                } else {
+                    cl_abs = fwd_rs1;
+                }
+                if cl_abs == 64'd0 {
+                    fpu_result = {cl_neg, 63'd0};
+                } else {
+                    var cl_lz: logic<7>;
+                    cl_lz = 7'd64;
+                    for i in 0..64 {
+                        if cl_abs[63 - i] == 1'b1 && cl_lz == 7'd64 {
+                            cl_lz = i[6:0];
+                        }
+                    }
+                    // Shift to get 53-bit significand (implicit 1 + 52 mantissa)
+                    // Position of leading 1: bit (63 - cl_lz)
+                    // We need bits below the leading 1 as mantissa
+                    var cl_shifted: logic<64>;
+                    cl_shifted = cl_abs << cl_lz;
+                    // cl_shifted[63] is the implicit 1, [62:11] are mantissa bits
+                    var cl_mant: logic<52>;
+                    cl_mant = cl_shifted[62:11];
+                    // Rounding: G=bit10, R=bit9, S=OR(bits[8:0])
+                    var cl_g    : logic;
+                    var cl_r    : logic;
+                    var cl_s    : logic;
+                    cl_g     = cl_shifted[10];
+                    cl_r     = cl_shifted[9];
+                    cl_s     = cl_shifted[8:0] != 9'd0;
+                    var cl_lsb_v: logic;
+                    cl_lsb_v = cl_shifted[11];
+                    var cl_round: logic;
+                    case fp_rm_resolved {
+                        3'b000 : cl_round  = cl_g && (cl_r || cl_s || cl_lsb_v);
+                        3'b001 : cl_round  = 1'b0;
+                        3'b010 : cl_round  = cl_neg && (cl_g || cl_r || cl_s);
+                        3'b011 : cl_round  = !cl_neg && (cl_g || cl_r || cl_s);
+                        3'b100 : cl_round  = cl_g;
+                        default: cl_round  = cl_g && (cl_r || cl_s || cl_lsb_v);
+                    }
+                    var cl_mant_r: logic<53>;
+                    cl_mant_r = {1'b0, cl_mant} + {52'd0, cl_round};
+                    var cl_exp   : logic<11>;
+                    cl_exp    = 11'd1086 - cl_lz[6:0]; // 1023 + 63 - lz
+                    if cl_mant_r[52] {
+                        cl_exp = cl_exp + 11'd1;
+                    }
+                    fpu_result = {cl_neg, cl_exp, cl_mant_r[51:0]};
+                }
+            }
+            FpuOp::FCVT_D_LU: {
+                // unsigned int64 → double
+                var clu_val: logic<64>;
+                clu_val = fwd_rs1;
+                if clu_val == 64'd0 {
+                    fpu_result = 64'd0;
+                } else {
+                    var clu_lz: logic<7>;
+                    clu_lz = 7'd64;
+                    for i in 0..64 {
+                        if clu_val[63 - i] == 1'b1 && clu_lz == 7'd64 {
+                            clu_lz = i[6:0];
+                        }
+                    }
+                    var clu_shifted: logic<64>;
+                    clu_shifted = clu_val << clu_lz;
+                    var clu_mant   : logic<52>;
+                    clu_mant    = clu_shifted[62:11];
+                    var clu_g      : logic;
+                    var clu_r      : logic;
+                    var clu_s      : logic;
+                    clu_g       = clu_shifted[10];
+                    clu_r       = clu_shifted[9];
+                    clu_s       = clu_shifted[8:0] != 9'd0;
+                    var clu_lsb_v  : logic;
+                    clu_lsb_v   = clu_shifted[11];
+                    var clu_round  : logic;
+                    case fp_rm_resolved {
+                        3'b000 : clu_round  = clu_g && (clu_r || clu_s || clu_lsb_v);
+                        3'b001 : clu_round  = 1'b0;
+                        3'b010 : clu_round  = 1'b0; // RDN: positive → truncate
+                        3'b011 : clu_round  = clu_g || clu_r || clu_s; // RUP: positive → round up
+                        3'b100 : clu_round  = clu_g;
+                        default: clu_round  = clu_g && (clu_r || clu_s || clu_lsb_v);
+                    }
+                    var clu_mant_r: logic<53>;
+                    clu_mant_r = {1'b0, clu_mant} + {52'd0, clu_round};
+                    var clu_exp   : logic<11>;
+                    clu_exp    = 11'd1086 - clu_lz[6:0];
+                    if clu_mant_r[52] {
+                        clu_exp = clu_exp + 11'd1;
+                    }
+                    fpu_result = {1'b0, clu_exp, clu_mant_r[51:0]};
+                }
+            }
+
+            // Double → integer conversions
+            FpuOp::FCVT_W_D: {
+                // double → signed int32. Left-shift path handles
+                // 2^20 <= |x| < 2^31.
+                var fw_s: logic    ;
+                var fw_e: logic<11>;
+                var fw_m: logic<52>;
+                fw_s = d1[63];
+                fw_e = d1[62:52];
+                fw_m = d1[51:0];
+                if fw_e == 11'h7FF || (fw_e >= 11'd1054) {
+                    // NaN, Inf, or too large
+                    if d1_is_nan {
+                        fpu_result = 64'h000000007FFFFFFF;
+                    } else if fw_s {
+                        fpu_result = 64'hFFFFFFFF80000000;
+                    } else {
+                        fpu_result = 64'h000000007FFFFFFF;
+                    }
+                } else if fw_e <: 11'd1023 {
+                    fpu_result = 64'd0;
+                } else {
+                    var fw_sig: logic<53>;
+                    fw_sig = {1'b1, fw_m};
+                    var fw_abs: logic<64>;
+                    if fw_e >: 11'd1075 {
+                        let ls    : logic<11> = fw_e - 11'd1075;
+                        fw_abs = {11'd0, fw_sig} << ls[5:0];
+                    } else {
+                        let rs    : logic<11> = 11'd1075 - fw_e;
+                        fw_abs = {11'd0, fw_sig} >> rs[5:0];
+                    }
+                    var fw_result32: logic<32>;
+                    fw_result32 = fw_abs[31:0];
+                    if fw_s {
+                        fw_result32 = ~fw_result32 + 32'd1;
+                    }
+                    fpu_result = {fw_result32[31] repeat 32, fw_result32};
+                }
+            }
+            FpuOp::FCVT_WU_D: {
+                // double → unsigned int32 (sign-extended to 64 per RV64).
+                var fwu_s: logic    ;
+                var fwu_e: logic<11>;
+                var fwu_m: logic<52>;
+                fwu_s = d1[63];
+                fwu_e = d1[62:52];
+                fwu_m = d1[51:0];
+                if d1_is_nan || (fwu_e == 11'h7FF && !fwu_s) || (fwu_e >= 11'd1055 && !fwu_s) {
+                    fpu_result = 64'hFFFFFFFFFFFFFFFF;
+                } else if fwu_s || fwu_e <: 11'd1023 {
+                    fpu_result = 64'd0;
+                } else {
+                    var fwu_sig: logic<53>;
+                    fwu_sig = {1'b1, fwu_m};
+                    var fwu_abs: logic<64>;
+                    if fwu_e >: 11'd1075 {
+                        let ls     : logic<11> = fwu_e - 11'd1075;
+                        fwu_abs = {11'd0, fwu_sig} << ls[5:0];
+                    } else {
+                        let rs     : logic<11> = 11'd1075 - fwu_e;
+                        fwu_abs = {11'd0, fwu_sig} >> rs[5:0];
+                    }
+                    fpu_result = {fwu_abs[31] repeat 32, fwu_abs[31:0]};
+                }
+            }
+            FpuOp::FCVT_L_D: {
+                // double → signed int64
+                var fl_s: logic    ;
+                var fl_e: logic<11>;
+                var fl_m: logic<52>;
+                fl_s = d1[63];
+                fl_e = d1[62:52];
+                fl_m = d1[51:0];
+                if fl_e == 11'h7FF || (fl_e >= 11'd1086) {
+                    if d1_is_nan {
+                        fpu_result = 64'h7FFFFFFFFFFFFFFF;
+                    } else if fl_s {
+                        fpu_result = 64'h8000000000000000;
+                    } else {
+                        fpu_result = 64'h7FFFFFFFFFFFFFFF;
+                    }
+                } else if fl_e <: 11'd1023 {
+                    fpu_result = 64'd0;
+                } else {
+                    var fl_sig  : logic<53>;
+                    fl_sig   = {1'b1, fl_m};
+                    var fl_shift: logic<11>;
+                    fl_shift = 11'd1075 - fl_e;
+                    var fl_abs  : logic<64>;
+                    if fl_shift >: 11'd52 {
+                        fl_abs = {11'd0, fl_sig};
+                    } else if fl_e >: 11'd1075 {
+                        var fl_lshift: logic<11>;
+                        fl_lshift = fl_e - 11'd1075;
+                        fl_abs    = {11'd0, fl_sig} << fl_lshift;
+                    } else {
+                        fl_abs = {11'd0, fl_sig} >> fl_shift;
+                    }
+                    if fl_s {
+                        fpu_result = ~fl_abs + 64'd1;
+                    } else {
+                        fpu_result = fl_abs;
+                    }
+                }
+            }
+            FpuOp::FCVT_LU_D: {
+                // double → unsigned int64
+                var flu_s: logic    ;
+                var flu_e: logic<11>;
+                var flu_m: logic<52>;
+                flu_s = d1[63];
+                flu_e = d1[62:52];
+                flu_m = d1[51:0];
+                if d1_is_nan || (flu_e == 11'h7FF && !flu_s) || (flu_e >= 11'd1087 && !flu_s) {
+                    fpu_result = 64'hFFFFFFFFFFFFFFFF;
+                } else if flu_s || flu_e <: 11'd1023 {
+                    fpu_result = 64'd0;
+                } else {
+                    var flu_sig  : logic<53>;
+                    flu_sig   = {1'b1, flu_m};
+                    var flu_shift: logic<11>;
+                    flu_shift = 11'd1075 - flu_e;
+                    var flu_abs  : logic<64>;
+                    if flu_e >: 11'd1075 {
+                        var flu_lshift: logic<11>;
+                        flu_lshift = flu_e - 11'd1075;
+                        flu_abs    = {11'd0, flu_sig} << flu_lshift;
+                    } else {
+                        flu_abs = {11'd0, flu_sig} >> flu_shift;
+                    }
+                    fpu_result = flu_abs;
+                }
+            }
+
+            default: fpu_result = 64'd0;
+        }
+    }
+
+    assign o_fpu_busy = fp_div_busy_o || fp_sqrt_busy_o;
+
+    // Completion: single-cycle ops fire this cycle; FDIV.D/FSQRT.D fire on the
+    // latched-done cycle (busy already dropped that cycle).
+    let fp_done_ok: logic =
+        (!is_fdiv_d && !is_fsqrt_d) || (is_fdiv_d && fp_div_done_q) || (is_fsqrt_d && fp_sqrt_done_q);
+    let cdb_fire: logic = i_issue_valid && !i_flush && fp_done_ok;
+
+    assign o_cdb.valid        = cdb_fire;
+    assign o_cdb.has_rd       = cdb_fire && i_issue_has_rd;
+    assign o_cdb.pdst         = i_issue_rd_pdst;
+    assign o_cdb.data         = fpu_result;
+    assign o_cdb.rob_idx      = i_issue_rob_idx;
+    assign o_cdb.mispredict   = 1'b0;
+    assign o_cdb.redirect_pc  = 64'd0;
+    assign o_cdb.is_store     = 1'b0;
+    assign o_cdb.store_addr   = 64'd0;
+    assign o_cdb.store_data   = 64'd0;
+    assign o_cdb.store_funct3 = 3'd0;
+    assign o_cdb.is_csr       = 1'b0;
+    assign o_cdb.csr_addr     = 12'd0;
+    assign o_cdb.csr_wdata    = 64'd0;
+    assign o_cdb.csr_illegal  = 1'b0;
+    assign o_cdb.is_lfault    = 1'b0;
+    assign o_cdb.is_sfault    = 1'b0;
+    assign o_cdb.fault_vaddr  = 64'd0;
+
+    assign o_fflags     = fpu_fflags_comb;
+    assign o_fflags_wen = cdb_fire;
+
+    // Suppress unused-port warnings for fields carried by the core, not used here.
+    let _unused_writes_int: logic = i_issue_writes_int;
+}

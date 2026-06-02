@@ -1,0 +1,225 @@
+// Phase 7 v4: Floating-point Issue Queue.
+//
+// 8 entries, holds renamed FP ops awaiting source-operand readiness.
+// Mirrors iq_int but with THREE FP source operands (rs1/rs2/rs3 — rs3
+// is the FMADD-family addend) plus ONE optional integer source operand
+// (for INT→FP ops: FMV.W.X / FMV.D.X / FCVT.{S,D}.{W,WU,L,LU}, which
+// read an integer register and write an FP register).
+//
+// Wakeup:
+//   - FP sources snoop the FP CDB (i_fp_cdb_*) by FP pdst and the locally
+//     owned fp_prf_ready bitmap (CDB sets, rename clears), like iq_int.
+//   - The integer source snoops the INT CDB (i_int_cdb_*). iq_fp does NOT
+//     own the integer ready bitmap (iq_int does); its initial readiness is
+//     sampled from i_alloc_int_ready, computed by the core at rename.
+//
+// Multi-cycle FUs (FDIV/FSQRT): the core gates i_issue_ack with !fpu_busy
+// so the issued op is HELD in this queue until the FU result latches.
+//
+// 1-wide: lowest-index ready entry wins issue.
+pub module iq_fp #(
+    param IQ_N     : u32 = 8 ,
+    param IQ_W     : u32 = 3 ,
+    param PRF_N    : u32 = 64,
+    param PRF_W    : u32 = 6 ,
+    param ROB_IDX_W: u32 = 5 ,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Allocation (per-field — bypasses cross-module struct-port sim bug)
+    i_alloc_en        : input  logic                ,
+    i_alloc_fpu_op    : input  fpu_pkg::FpuOp       ,
+    i_alloc_rm        : input  logic         <3>    ,
+    i_alloc_rd_pdst   : input  logic         <PRF_W>, // FP dest pdst
+    i_alloc_rob_idx   : input  logic         <ROB_IDX_W>,
+    i_alloc_has_rd    : input  logic                , // writes a register
+    i_alloc_writes_int: input  logic                , // dest is INT reg (FEQ/FCVT.w/FMV.X/FCLASS)
+    i_alloc_s1_pdst   : input  logic         <PRF_W>, // FP rs1
+    i_alloc_s2_pdst   : input  logic         <PRF_W>, // FP rs2
+    i_alloc_s3_pdst   : input  logic         <PRF_W>, // FP rs3
+    i_alloc_has_s1    : input  logic                ,
+    i_alloc_has_s2    : input  logic                ,
+    i_alloc_has_s3    : input  logic                ,
+    i_alloc_int_pdst  : input  logic         <PRF_W>, // INT rs1 (int→fp ops)
+    i_alloc_has_int   : input  logic                ,
+    i_alloc_int_ready : input  logic                , // initial int-source readiness (core-computed)
+    o_alloc_rdy       : output logic                ,
+
+    // FP-ready bitmap maintenance (rename clears the new FP pdst)
+    i_rename_set_pending: input logic       ,
+    i_rename_pdst       : input logic<PRF_W>,
+
+    // FP CDB writeback snoop (wakes FP sources, sets fp_prf_ready)
+    i_fp_cdb_valid : input logic       ,
+    i_fp_cdb_has_rd: input logic       ,
+    i_fp_cdb_pdst  : input logic<PRF_W>,
+
+    // INT CDB writeback snoop (wakes the integer source of int→fp ops)
+    i_int_cdb_valid : input logic       ,
+    i_int_cdb_has_rd: input logic       ,
+    i_int_cdb_pdst  : input logic<PRF_W>,
+
+    // Issue (1-wide)
+    o_issue_valid     : output logic                ,
+    o_issue_fpu_op    : output fpu_pkg::FpuOp       ,
+    o_issue_rm        : output logic         <3>    ,
+    o_issue_rd_pdst   : output logic         <PRF_W>,
+    o_issue_rob_idx   : output logic         <ROB_IDX_W>,
+    o_issue_has_rd    : output logic                ,
+    o_issue_writes_int: output logic                ,
+    o_issue_s1_pdst   : output logic         <PRF_W>,
+    o_issue_s2_pdst   : output logic         <PRF_W>,
+    o_issue_s3_pdst   : output logic         <PRF_W>,
+    o_issue_int_pdst  : output logic         <PRF_W>,
+    i_issue_ack       : input  logic                ,
+
+    // Flush (commit-time redirect)
+    i_flush: input logic,
+) {
+    var occupied  : logic            [IQ_N];
+    var fpu_op    : fpu_pkg::FpuOp    [IQ_N];
+    var rm        : logic         <3> [IQ_N];
+    var rd_pdst   : logic    <PRF_W>  [IQ_N];
+    var rob_idx   : logic <ROB_IDX_W> [IQ_N];
+    var has_rd    : logic            [IQ_N];
+    var writes_int: logic            [IQ_N];
+    var s1_pdst   : logic    <PRF_W>  [IQ_N];
+    var s2_pdst   : logic    <PRF_W>  [IQ_N];
+    var s3_pdst   : logic    <PRF_W>  [IQ_N];
+    var int_pdst  : logic    <PRF_W>  [IQ_N];
+    var s1_rdy    : logic            [IQ_N];
+    var s2_rdy    : logic            [IQ_N];
+    var s3_rdy    : logic            [IQ_N];
+    var int_rdy   : logic            [IQ_N];
+
+    // FP physical-register ready bitmap (this IQ owns it, mirror iq_int).
+    var fp_prf_ready: logic [PRF_N];
+
+    // Find first free slot (allocation)
+    var free_idx     : logic<IQ_W>;
+    var has_free_slot: logic      ;
+    always_comb {
+        free_idx      = 3'd0;
+        has_free_slot = 1'b0;
+        for i in 0..IQ_N {
+            if !has_free_slot && !occupied[i] {
+                free_idx      = i as IQ_W;
+                has_free_slot = 1'b1;
+            }
+        }
+    }
+    assign o_alloc_rdy = has_free_slot;
+
+    // Find lowest-index entry with ALL operands ready (issue).
+    var issue_idx   : logic<IQ_W>;
+    var has_issuable: logic      ;
+    always_comb {
+        issue_idx    = 3'd0;
+        has_issuable = 1'b0;
+        for i in 0..IQ_N {
+            if !has_issuable && occupied[i] && s1_rdy[i] && s2_rdy[i] && s3_rdy[i] && int_rdy[i] {
+                issue_idx    = i as IQ_W;
+                has_issuable = 1'b1;
+            }
+        }
+    }
+    assign o_issue_valid      = has_issuable;
+    assign o_issue_fpu_op     = fpu_op[issue_idx];
+    assign o_issue_rm         = rm[issue_idx];
+    assign o_issue_rd_pdst    = rd_pdst[issue_idx];
+    assign o_issue_rob_idx    = rob_idx[issue_idx];
+    assign o_issue_has_rd     = has_rd[issue_idx];
+    assign o_issue_writes_int = writes_int[issue_idx];
+    assign o_issue_s1_pdst    = s1_pdst[issue_idx];
+    assign o_issue_s2_pdst    = s2_pdst[issue_idx];
+    assign o_issue_s3_pdst    = s3_pdst[issue_idx];
+    assign o_issue_int_pdst   = int_pdst[issue_idx];
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..IQ_N {
+                occupied[i]   = 1'b0;
+                fpu_op[i]     = fpu_pkg::FpuOp::NONE;
+                rm[i]         = 3'd0;
+                rd_pdst[i]    = 6'd0;
+                rob_idx[i]    = 5'd0;
+                has_rd[i]     = 1'b0;
+                writes_int[i] = 1'b0;
+                s1_pdst[i]    = 6'd0;
+                s2_pdst[i]    = 6'd0;
+                s3_pdst[i]    = 6'd0;
+                int_pdst[i]   = 6'd0;
+                s1_rdy[i]     = 1'b0;
+                s2_rdy[i]     = 1'b0;
+                s3_rdy[i]     = 1'b0;
+                int_rdy[i]    = 1'b0;
+            }
+            for i in 0..PRF_N {
+                // Initial RAT identity → FP PRF[0..31] ready; [32..63] free.
+                fp_prf_ready[i] = 1'b1;
+            }
+        } else if i_flush {
+            for i in 0..IQ_N {
+                occupied[i] = 1'b0;
+            }
+        } else {
+            // FP CDB snoop: wake matching FP sources + set fp_prf_ready.
+            if i_fp_cdb_valid && i_fp_cdb_has_rd {
+                fp_prf_ready[i_fp_cdb_pdst] = 1'b1;
+                for i in 0..IQ_N {
+                    if occupied[i] && s1_pdst[i] == i_fp_cdb_pdst {
+                        s1_rdy[i] = 1'b1;
+                    }
+                    if occupied[i] && s2_pdst[i] == i_fp_cdb_pdst {
+                        s2_rdy[i] = 1'b1;
+                    }
+                    if occupied[i] && s3_pdst[i] == i_fp_cdb_pdst {
+                        s3_rdy[i] = 1'b1;
+                    }
+                }
+            }
+            // INT CDB snoop: wake the integer source of int→fp ops.
+            if i_int_cdb_valid && i_int_cdb_has_rd {
+                for i in 0..IQ_N {
+                    if occupied[i] && int_pdst[i] == i_int_cdb_pdst {
+                        int_rdy[i] = 1'b1;
+                    }
+                }
+            }
+            // Rename clears fp_prf_ready[new_pdst].
+            if i_rename_set_pending {
+                fp_prf_ready[i_rename_pdst] = 1'b0;
+            }
+            // Issue: free the slot once the back-end accepts the op.
+            if i_issue_ack && has_issuable {
+                occupied[issue_idx] = 1'b0;
+            }
+            // Allocate.
+            if i_alloc_en && has_free_slot {
+                occupied[free_idx]   = 1'b1;
+                fpu_op[free_idx]     = i_alloc_fpu_op;
+                rm[free_idx]         = i_alloc_rm;
+                rd_pdst[free_idx]    = i_alloc_rd_pdst;
+                rob_idx[free_idx]    = i_alloc_rob_idx;
+                has_rd[free_idx]     = i_alloc_has_rd;
+                writes_int[free_idx] = i_alloc_writes_int;
+                s1_pdst[free_idx]    = i_alloc_s1_pdst;
+                s2_pdst[free_idx]    = i_alloc_s2_pdst;
+                s3_pdst[free_idx]    = i_alloc_s3_pdst;
+                int_pdst[free_idx]   = i_alloc_int_pdst;
+                // Initial readiness: !has_s → ready; else sample fp_prf_ready
+                // (or same-cycle FP CDB). Integer source uses core-supplied
+                // i_alloc_int_ready (or same-cycle INT CDB).
+                s1_rdy[free_idx] = (!i_alloc_has_s1) || fp_prf_ready[i_alloc_s1_pdst]
+                    || (i_fp_cdb_valid && i_fp_cdb_has_rd && i_fp_cdb_pdst == i_alloc_s1_pdst);
+                s2_rdy[free_idx] = (!i_alloc_has_s2) || fp_prf_ready[i_alloc_s2_pdst]
+                    || (i_fp_cdb_valid && i_fp_cdb_has_rd && i_fp_cdb_pdst == i_alloc_s2_pdst);
+                s3_rdy[free_idx] = (!i_alloc_has_s3) || fp_prf_ready[i_alloc_s3_pdst]
+                    || (i_fp_cdb_valid && i_fp_cdb_has_rd && i_fp_cdb_pdst == i_alloc_s3_pdst);
+                int_rdy[free_idx] = (!i_alloc_has_int) || i_alloc_int_ready
+                    || (i_int_cdb_valid && i_int_cdb_has_rd && i_int_cdb_pdst == i_alloc_int_pdst);
+            }
+        }
+    }
+}
