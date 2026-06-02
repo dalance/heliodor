@@ -429,12 +429,58 @@ pub module heliodor_core_v4 #(
     var new_rd_pdst: logic<PRF_INT_W>;
     var free_empty : logic           ;
 
+    // M6: FP rename / dual datapath (declared early; wired to rat_fp /
+    // fp free_list / prf_fp / iq_fp / fpu_wrap instances below).
+    var fp_rs1_pdst    : logic<PRF_FP_W>;
+    var fp_rs2_pdst    : logic<PRF_FP_W>;
+    var fp_rs3_pdst    : logic<PRF_FP_W>;
+    var fp_old_rd_pdst : logic<PRF_FP_W>;
+    var new_fp_rd_pdst : logic<PRF_FP_W>;
+    var fp_free_empty  : logic          ;
+    var csr_frm        : logic<3>       ;
+    // Dest pdst actually allocated (FP free-list for FP-dest ops, else int).
+    let ren_dst_is_fp  : logic          = dec_op.fp_writes_fp;
+    let ren_rd_pdst    : logic<PRF_FP_W> = if ren_dst_is_fp ? new_fp_rd_pdst : new_rd_pdst;
+    let ren_old_rd_pdst: logic<PRF_FP_W> = if ren_dst_is_fp ? fp_old_rd_pdst : old_rd_pdst;
+    // Merged CDB (ALU and FPU are mutually exclusive: at most one valid/cycle).
+    var alu_cdb: CdbBus;
+    var fpu_cdb: CdbBus;
+    // iq_fp issue outputs
+    var iqf_issue_valid : logic          ;
+    var iqf_iss_fpu_op  : fpu_pkg::FpuOp ;
+    var iqf_iss_rm      : logic<3>       ;
+    var iqf_iss_rd_pdst : logic<PRF_FP_W>;
+    var iqf_iss_rob_idx : logic<ROB_IDX_W>;
+    var iqf_iss_has_rd  : logic          ;
+    var iqf_iss_wr_int  : logic          ;
+    var iqf_iss_s1_pdst : logic<PRF_FP_W>;
+    var iqf_iss_s2_pdst : logic<PRF_FP_W>;
+    var iqf_iss_s3_pdst : logic<PRF_FP_W>;
+    var iqf_iss_int_pdst: logic<PRF_FP_W>;
+    var iqf_alloc_rdy   : logic          ;
+    // prf_fp read data + prf_int 3rd-port (FPU int source) read data
+    var prf_fp_rs1_data : logic<64>;
+    var prf_fp_rs2_data : logic<64>;
+    var prf_fp_rs3_data : logic<64>;
+    var prf_int_rs3_data: logic<64>;
+    // FPU side-band
+    var fpu_fflags    : logic<5>;
+    var fpu_fflags_wen: logic   ;
+    var fpu_busy      : logic   ;
+    // iq_int → iq_fp int-source ready query result
+    var iq_int_fp_query_rdy: logic;
+
     var rob_alloc_idx: logic<ROB_IDX_W>;
     var rob_head_idx : logic<ROB_IDX_W>; // declared early so iq instance can use it
     var rob_full     : logic           ;
     var iq_alloc_rdy : logic           ;
 
-    let resources_avail: logic = !rob_full && iq_alloc_rdy && (!dec_op.has_rd || !free_empty);
+    // M6: route IQ-readiness to iq_fp for FPU ops, iq_int otherwise; require
+    // the int free-list for an int dest and the FP free-list for an FP dest.
+    let resources_avail: logic = !rob_full
+        && (if dec_op.is_fpu_op ? iqf_alloc_rdy : iq_alloc_rdy)
+        && (!dec_op.has_rd || !free_empty)
+        && (!dec_op.fp_writes_fp || !fp_free_empty);
     assign stall_dr = if_v_q && !resources_avail;
 
     let rename_fire: logic = if_v_q && !stall_dr && !redirect_fire;
@@ -445,9 +491,14 @@ pub module heliodor_core_v4 #(
         rob_alloc_entry.valid          = 1'b1;
         rob_alloc_entry.pc             = if_pc_q;
         rob_alloc_entry.rd_arch        = dec_op.rd_arch;
-        rob_alloc_entry.rd_pdst        = new_rd_pdst;
-        rob_alloc_entry.old_rd_pdst    = old_rd_pdst;
+        // M6: dest pdst is the FP pdst for FP-dest ops, else the int pdst
+        // (rd_pdst/old_rd_pdst are reused; is_fp_dest routes commit).
+        rob_alloc_entry.rd_pdst        = ren_rd_pdst;
+        rob_alloc_entry.old_rd_pdst    = ren_old_rd_pdst;
         rob_alloc_entry.has_rd         = dec_op.has_rd;
+        rob_alloc_entry.is_fp_dest     = dec_op.fp_writes_fp;
+        rob_alloc_entry.fflags         = 5'd0;
+        rob_alloc_entry.fflags_wen     = 1'b0;
         rob_alloc_entry.result_written = 1'b0;
         rob_alloc_entry.is_branch      = dec_op.is_branch;
         rob_alloc_entry.is_jal         = dec_op.is_jal;
@@ -484,10 +535,10 @@ pub module heliodor_core_v4 #(
     var ren_op: RenamedOp;
     always_comb {
         ren_op.base        = dec_op;
-        ren_op.rd_pdst     = new_rd_pdst;
+        ren_op.rd_pdst     = ren_rd_pdst;
         ren_op.rs1_pdst    = rs1_pdst;
         ren_op.rs2_pdst    = rs2_pdst;
-        ren_op.old_rd_pdst = old_rd_pdst;
+        ren_op.old_rd_pdst = ren_old_rd_pdst;
         ren_op.rob_idx     = rob_alloc_idx;
     }
 
@@ -562,8 +613,18 @@ pub module heliodor_core_v4 #(
     // the IQ select (iq_issue_op/iq_iss_rob_idx), never core_dmem_vaddr.
     let load_walk_block: logic = walk_v_q && !walk_is_store_q && iq_issue_op.base.is_load && iq_iss_rob_idx
         != walk_rob_q;
+    // M6: FPU owns the single CDB / PRF-write slot whenever it writes back —
+    // a single-cycle FP op this cycle, or an FDIV.D/FSQRT.D completion. The
+    // ALU yields issue that cycle. While an FDIV is in flight (busy) the FPU
+    // CDB is silent (fpu_cdb.valid=0), so int ops keep issuing — no deadlock
+    // for an older int op stuck behind the FDIV in the ROB. fpu_cdb.valid
+    // derives only from registered iq_fp / fpu_wrap state, so this is loop-free.
+    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? !iqf_iss_wr_int : 1'b0;
+    always_comb {
+        cdb = if fpu_cdb.valid ? fpu_cdb : alu_cdb;
+    }
     inst u_alu: alu_wrap_v4 (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -584,7 +645,7 @@ pub module heliodor_core_v4 #(
         i_csr_imm         : iq_iss_csr_imm                                      ,
         i_rs1_arch        : iq_iss_rs1_arch                                     ,
         i_priv            : csr_priv                                            ,
-        o_cdb             : cdb                                                 ,
+        o_cdb             : alu_cdb                                             ,
         o_dbg_alu_pc      : dbg_alu_pc                                          ,
         o_dbg_alu_src_a   : dbg_alu_src_a                                       ,
         o_dbg_alu_src_b   : dbg_alu_src_b                                       ,
@@ -599,21 +660,25 @@ pub module heliodor_core_v4 #(
     // M5.D.2: gate ack on MMU busy. While busy the IQ holds the op.
     // M9.A.309: also hold a non-owner load while a load walk is in flight
     // (load_walk_block) so it cannot ack/leave the IQ without issuing.
-    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block;
+    // M6: also yield the ack when the FPU owns the CDB this cycle, else the
+    // ALU op would leave iq_int without writing back (lost op → ROB stuck).
+    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid;
 
     // ============================================================
     // PRF
     // ============================================================
     inst u_prf: prf_int (
-        clk                                ,
-        rst                                ,
-        i_rd1_pdst: iq_iss_rs1_pdst        ,
-        o_rd1_data: prf_rs1_data           ,
-        i_rd2_pdst: iq_iss_rs2_pdst        ,
-        o_rd2_data: prf_rs2_data           ,
-        i_wr_en   : cdb.valid && cdb.has_rd,
-        i_wr_pdst : cdb.pdst               ,
-        i_wr_data : cdb.data               ,
+        clk                                                  ,
+        rst                                                  ,
+        i_rd1_pdst: iq_iss_rs1_pdst                          ,
+        o_rd1_data: prf_rs1_data                             ,
+        i_rd2_pdst: iq_iss_rs2_pdst                          ,
+        o_rd2_data: prf_rs2_data                             ,
+        i_rd3_pdst: iqf_iss_int_pdst                         , // M6: FPU int source
+        o_rd3_data: prf_int_rs3_data                         ,
+        i_wr_en   : cdb.valid && cdb.has_rd && !cdb_dest_is_fp,
+        i_wr_pdst : cdb.pdst                                 ,
+        i_wr_data : cdb.data                                 ,
     );
 
     // ============================================================
@@ -660,19 +725,141 @@ pub module heliodor_core_v4 #(
     );
 
     // ============================================================
+    // M6: FP datapath — rat_fp + fp free_list + prf_fp + iq_fp + fpu_wrap
+    // ============================================================
+    var fp_rat_commit_en: logic          ;
+    var fp_fl_push_en   : logic          ;
+    var fp_fl_push_pdst : logic<PRF_FP_W>;
+
+    inst u_rat_fp: rat_fp (
+        clk                                                ,
+        rst                                                ,
+        i_rs1_arch     : dec_op.rs1_arch                   ,
+        o_rs1_pdst     : fp_rs1_pdst                       ,
+        i_rs2_arch     : dec_op.rs2_arch                   ,
+        o_rs2_pdst     : fp_rs2_pdst                       ,
+        i_rs3_arch     : dec_op.rs3_arch                   ,
+        o_rs3_pdst     : fp_rs3_pdst                       ,
+        i_rd_arch      : dec_op.rd_arch                    ,
+        o_rd_old_pdst  : fp_old_rd_pdst                    ,
+        i_rename_en    : rename_fire && dec_op.fp_writes_fp,
+        i_rename_arch  : dec_op.rd_arch                    ,
+        i_rename_pdst  : new_fp_rd_pdst                    ,
+        i_commit_en    : fp_rat_commit_en                  ,
+        i_commit_arch  : rat_commit_arch                   , // = c_rd_arch (shared)
+        i_commit_pdst  : rat_commit_pdst                   , // = c_rd_pdst (shared)
+        i_recovery_fire: redirect_fire                     ,
+    );
+
+    inst u_fl_fp: free_list (
+        clk                                                 ,
+        rst                                                 ,
+        i_pop_en       : rename_fire && dec_op.fp_writes_fp ,
+        o_pop_pdst     : new_fp_rd_pdst                     ,
+        o_empty        : fp_free_empty                      ,
+        i_push_en      : fp_fl_push_en                      ,
+        i_push_pdst    : fp_fl_push_pdst                    ,
+        i_recovery_fire: redirect_fire                      ,
+    );
+
+    inst u_prf_fp: prf_fp (
+        clk                                                  ,
+        rst                                                  ,
+        i_rd1_pdst: iqf_iss_s1_pdst                          ,
+        o_rd1_data: prf_fp_rs1_data                          ,
+        i_rd2_pdst: iqf_iss_s2_pdst                          ,
+        o_rd2_data: prf_fp_rs2_data                          ,
+        i_rd3_pdst: iqf_iss_s3_pdst                          ,
+        o_rd3_data: prf_fp_rs3_data                          ,
+        i_wr_en   : cdb.valid && cdb.has_rd && cdb_dest_is_fp,
+        i_wr_pdst : cdb.pdst                                 ,
+        i_wr_data : cdb.data                                 ,
+    );
+
+    let iqf_issue_ack: logic = iqf_issue_valid && !fpu_busy && !redirect_fire;
+    inst u_iq_fp: iq_fp (
+        clk                                                       ,
+        rst                                                       ,
+        i_alloc_en          : rename_fire && dec_op.is_fpu_op     ,
+        i_alloc_fpu_op      : dec_op.fpu_op                       ,
+        i_alloc_rm          : dec_op.fp_rm                        ,
+        i_alloc_rd_pdst     : ren_rd_pdst                         , // FP pdst (writes_fp) or INT pdst (writes_int)
+        i_alloc_rob_idx     : rob_alloc_idx                       ,
+        i_alloc_has_rd      : dec_op.fp_writes_fp || dec_op.fp_writes_int,
+        i_alloc_writes_int  : dec_op.fp_writes_int               ,
+        i_alloc_s1_pdst     : fp_rs1_pdst                         ,
+        i_alloc_s2_pdst     : fp_rs2_pdst                         ,
+        i_alloc_s3_pdst     : fp_rs3_pdst                         ,
+        i_alloc_has_s1      : dec_op.fp_rs1_is_fp                 ,
+        i_alloc_has_s2      : dec_op.fp_rs2_is_fp                 ,
+        i_alloc_has_s3      : dec_op.fp_uses_rs3                  ,
+        i_alloc_int_pdst    : rs1_pdst                            , // INT source (int→fp)
+        i_alloc_has_int     : dec_op.fp_int_src                   ,
+        i_alloc_int_ready   : iq_int_fp_query_rdy                 ,
+        o_alloc_rdy         : iqf_alloc_rdy                       ,
+        i_rename_set_pending: rename_fire && dec_op.fp_writes_fp  ,
+        i_rename_pdst       : new_fp_rd_pdst                      ,
+        i_fp_cdb_valid      : cdb.valid && cdb_dest_is_fp         ,
+        i_fp_cdb_has_rd     : cdb.has_rd                          ,
+        i_fp_cdb_pdst       : cdb.pdst                            ,
+        i_int_cdb_valid     : cdb.valid && !cdb_dest_is_fp        ,
+        i_int_cdb_has_rd    : cdb.has_rd                          ,
+        i_int_cdb_pdst      : cdb.pdst                            ,
+        o_issue_valid       : iqf_issue_valid                    ,
+        o_issue_fpu_op      : iqf_iss_fpu_op                     ,
+        o_issue_rm          : iqf_iss_rm                         ,
+        o_issue_rd_pdst     : iqf_iss_rd_pdst                    ,
+        o_issue_rob_idx     : iqf_iss_rob_idx                    ,
+        o_issue_has_rd      : iqf_iss_has_rd                     ,
+        o_issue_writes_int  : iqf_iss_wr_int                     ,
+        o_issue_s1_pdst     : iqf_iss_s1_pdst                    ,
+        o_issue_s2_pdst     : iqf_iss_s2_pdst                    ,
+        o_issue_s3_pdst     : iqf_iss_s3_pdst                    ,
+        o_issue_int_pdst    : iqf_iss_int_pdst                   ,
+        i_issue_ack         : iqf_issue_ack                      ,
+        i_flush             : redirect_fire                      ,
+    );
+
+    inst u_fpu: fpu_wrap_v4 (
+        clk                                ,
+        rst                                ,
+        i_issue_valid     : iqf_issue_valid,
+        i_fpu_op          : iqf_iss_fpu_op ,
+        i_fp_rm           : iqf_iss_rm     ,
+        i_frm             : csr_frm        ,
+        i_issue_rd_pdst   : iqf_iss_rd_pdst,
+        i_issue_rob_idx   : iqf_iss_rob_idx,
+        i_issue_has_rd    : iqf_iss_has_rd ,
+        i_issue_writes_int: iqf_iss_wr_int ,
+        i_s1_data         : prf_fp_rs1_data,
+        i_s2_data         : prf_fp_rs2_data,
+        i_s3_data         : prf_fp_rs3_data,
+        i_int_rs1_data    : prf_int_rs3_data,
+        i_flush           : redirect_fire  ,
+        o_fpu_busy        : fpu_busy       ,
+        o_cdb             : fpu_cdb        ,
+        o_fflags          : fpu_fflags     ,
+        o_fflags_wen      : fpu_fflags_wen ,
+    );
+
+    // ============================================================
     // IQ
     // ============================================================
     inst u_iq: iq_int_v4 (
         clk                                               ,
         rst                                               ,
-        i_alloc_en          : rename_fire                 ,
+        i_alloc_en          : rename_fire && !dec_op.is_fpu_op    ,
         i_alloc_op          : ren_op                      ,
         o_alloc_rdy         : iq_alloc_rdy                ,
+        // M6: clear int prf-ready only on an INT dest rename (has_rd covers
+        // int ops + FP→INT). FP-dest renames clear the FP bitmap in iq_fp.
         i_rename_set_pending: rename_fire && dec_op.has_rd,
         i_rename_pdst       : new_rd_pdst                 ,
         i_cdb_valid         : cdb.valid                   ,
-        i_cdb_has_rd        : cdb.has_rd                  ,
+        i_cdb_has_rd        : cdb.has_rd && !cdb_dest_is_fp,
         i_cdb_pdst          : cdb.pdst                    ,
+        i_fp_int_query_pdst : rs1_pdst                    , // M6: iq_fp int-source ready
+        o_fp_int_query_rdy  : iq_int_fp_query_rdy         ,
         o_issue_valid       : iq_issue_valid              ,
         o_issue_op          : iq_issue_op                 ,
         o_issue_rs1_pdst    : iq_iss_rs1_pdst             ,
@@ -729,6 +916,10 @@ pub module heliodor_core_v4 #(
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
     var c_fault_vaddr : logic<64>       ;
+    // M6: FP commit
+    var c_is_fp_dest  : logic           ;
+    var c_fflags      : logic<5>        ;
+    var c_fflags_wen  : logic           ;
 
     // M9.A.255: gate ROB commit_ack on dmem_mmu_busy when committing a
     // store. commit_store_fire is a single-cycle pulse derived from
@@ -776,6 +967,8 @@ pub module heliodor_core_v4 #(
         i_cdb_is_lfault      : rob_cdb_is_lfault    ,
         i_cdb_is_sfault      : cdb.is_sfault        ,
         i_cdb_fault_vaddr    : cdb.fault_vaddr      ,
+        i_cdb_fflags         : fpu_fflags           , // M6: from FPU (only valid when FP wrote back)
+        i_cdb_fflags_wen     : fpu_fflags_wen       ,
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
@@ -808,6 +1001,9 @@ pub module heliodor_core_v4 #(
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_is_sfault   : c_is_sfault          ,
         o_commit_fault_vaddr : c_fault_vaddr        ,
+        o_commit_is_fp_dest  : c_is_fp_dest         ,
+        o_commit_fflags      : c_fflags             ,
+        o_commit_fflags_wen  : c_fflags_wen         ,
         o_commit_idx         : rob_commit_idx       ,
         i_commit_ack         : rob_commit_ack       ,
         i_redirect_fire      : redirect_fire        ,
@@ -843,6 +1039,12 @@ pub module heliodor_core_v4 #(
 
         fl_push_en   = rob_commit_valid && c_has_rd && !c_illegal && !commit_priv_illegal;
         fl_push_pdst = c_old_rd_pdst;
+
+        // M6: FP-dest commit — rename the FP arch RAT + push the displaced FP
+        // pdst to the FP free-list (rd_pdst/old_rd_pdst hold the FP pdsts).
+        fp_rat_commit_en = rob_commit_valid && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
+        fp_fl_push_en    = rob_commit_valid && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
+        fp_fl_push_pdst  = c_old_rd_pdst;
     }
 
     // ============================================================
@@ -1053,6 +1255,10 @@ pub module heliodor_core_v4 #(
         o_irq_cause  : csr_irq_cause                   ,
         o_irq_to_s   : csr_irq_to_s                    ,
         i_instret_en : rob_commit_valid && !commit_trap,
+        // M6: fcsr — frm to the FPU; accrue fflags from a committing FP op.
+        o_frm        : csr_frm                                                          ,
+        i_fflags_set : rob_commit_valid && c_fflags_wen && !c_illegal && !commit_priv_illegal,
+        i_fflags     : c_fflags                                                         ,
     );
 
     // Debug observation of CSR / trap state (for boot debug).
