@@ -34,6 +34,14 @@ pub module heliodor_core_v4 #(
     i_imem_rdata: input  logic<32>,
     o_imem_ren  : output logic    ,
 
+    // Instruction PTW memory (64-bit PTE reads for the IMMU page-table walk).
+    // M8.C: a dedicated bus, split out of the dmem port (was muxed onto o_dmem).
+    // Single combinational tb: i_iptw_rdata = dram[o_iptw_addr] dword. The SoC's
+    // memory_bus arbitrates this as a separate per-hart port (mirrors v1).
+    o_iptw_addr : output logic<64>,
+    o_iptw_req  : output logic    ,
+    i_iptw_rdata: input  logic<64>,
+
     // Data memory (M5+; M1 holds these inactive)
     o_dmem_addr : output logic<64>,
     o_dmem_wdata: output logic<64>,
@@ -441,10 +449,10 @@ pub module heliodor_core_v4 #(
         i_mxr     : csr_mxr        ,
         o_ptw_addr: imem_ptw_addr_w,
         o_ptw_req : imem_ptw_req_w ,
-        // Toy memory: combinational read so PTW data is valid the same
-        // cycle as the request. The dmem arbiter below routes
-        // imem_ptw_addr_w through o_dmem_addr while req=1.
-        i_ptw_data    : i_dmem_rdata       ,
+        // M8.C: dedicated IPTW bus. PTE reads come back on i_iptw_rdata (was
+        // i_dmem_rdata, muxed onto o_dmem). o_iptw_addr/req are driven below.
+        // Toy memory: combinational read so PTW data is valid the same cycle.
+        i_ptw_data    : i_iptw_rdata       ,
         i_ptw_valid   : imem_ptw_req_w     ,
         i_icache_stall: icache_stall       , // M8.A: hold MMU/TLB during icache fill
         i_sfence      : commit_sfence_pulse,
@@ -453,6 +461,12 @@ pub module heliodor_core_v4 #(
     let _unused_imem_fault: logic = imem_fault_w;
     let _unused_imem_valid: logic = imem_valid_w;
     let _unused_imem_busy : logic = imem_busy_w;
+
+    // M8.C: dedicated instruction-PTW bus (split out of the dmem port). The
+    // IMMU walk drives o_iptw_addr/req; PTE data returns on i_iptw_rdata. This
+    // removes the imem-PTW-vs-dcache contention on o_dmem entirely.
+    assign o_iptw_addr = imem_ptw_addr_w;
+    assign o_iptw_req  = imem_ptw_req_w;
 
     // ============================================================
     // M8.A: L1 instruction cache, inserted between imem_mmu (imem_paddr_w)
@@ -1766,11 +1780,11 @@ pub module heliodor_core_v4 #(
         o_rdata_valid: dmem_mmu_rdv    ,
         o_walk_start : dmem_walk_start , // M9.A.296: PTW-start pulse for F2 owner re-latch
 
-        // M5.D PTW arbiter: stall dmem MMU while imem MMU is issuing a
-        // PTW read, so imem's PTW addr can win the dmem bus.
-        // M8.B: also stall while the dcache is filling a PTE-read miss — the
-        // walk must not advance (i_ptw_valid) until the PTE data is cached.
-        i_dcache_stall: imem_ptw_req_w || dcache_stall,
+        // M8.B: stall the dmem MMU walk while the dcache is filling a PTE-read
+        // miss — the walk must not advance (i_ptw_valid) until the PTE is cached.
+        // M8.C: the old imem_ptw_req_w term is gone — imem PTW now has its own
+        // o_iptw bus and no longer contends for the dmem bus.
+        i_dcache_stall: dcache_stall,
         i_sfence      : commit_sfence_pulse,
         // M9.A.303 debug
         o_dbg_ptw_req : dmem_dptw_req ,
@@ -1800,7 +1814,7 @@ pub module heliodor_core_v4 #(
     // ============================================================
     // B.3 dcache hints. dc_st_wstrb_hi: hi strobe for a committing misaligned
     // STORE (drives BOTH the dcache line-invalidation and the tb bypass below).
-    let dc_st_wstrb_hi: logic<8> = if (commit_store_fire && !imem_ptw_req_w) ? st_wstrb_hi : 8'd0;
+    let dc_st_wstrb_hi: logic<8> = if commit_store_fire ? st_wstrb_hi : 8'd0;
     // dc_load_next: the issuing LOAD's data spans into the next dword
     // (byte_off + size > 8); the dcache fills the next line when it crosses one.
     let dc_byte_off: logic<3> = dmu_dmem_addr[2:0];
@@ -1826,8 +1840,8 @@ pub module heliodor_core_v4 #(
         rst                                              ,
         i_addr           : dmu_dmem_addr                 ,
         i_wdata          : dmu_dmem_wdata                ,
-        i_wen            : dmu_dmem_wen && !imem_ptw_req_w,
-        i_ren            : dmu_dmem_ren && !imem_ptw_req_w,
+        i_wen            : dmu_dmem_wen                  ,
+        i_ren            : dmu_dmem_ren                  ,
         i_wstrb          : dmu_dmem_wstrb                ,
         i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
         i_load_next      : dc_load_next                  , // B.3: misaligned cross-line load fill
@@ -1851,20 +1865,19 @@ pub module heliodor_core_v4 #(
         i_mem_grant      : i_dmem_grant                  ,
     );
 
-    // M8.B / M5.D dmem arbiter mux: imem PTW wins the bus (bypassing the
-    // dcache), else the dcache mem side drives o_dmem_*.
-    assign o_dmem_addr  = if imem_ptw_req_w ? imem_ptw_addr_w : dc_mem_addr;
+    // M8.C: o_dmem is now purely the dcache mem side — imem PTW moved to the
+    // dedicated o_iptw bus, so no arbiter mux here anymore.
+    assign o_dmem_addr  = dc_mem_addr;
     assign o_dmem_wdata = dc_mem_wdata;
-    assign o_dmem_wen   = if imem_ptw_req_w ? 1'b0 : dc_mem_wen;
-    assign o_dmem_ren   = if imem_ptw_req_w ? 1'b1 : dc_mem_ren;
-    assign o_dmem_wstrb = if imem_ptw_req_w ? 8'd0 : dc_mem_wstrb;
-    // M8: hi-side carry for misaligned STORE; bypasses the dcache (B.3 routes
-    // it through). Only when commit_store_fire goes through (no PTW takeover).
+    assign o_dmem_wen   = dc_mem_wen;
+    assign o_dmem_ren   = dc_mem_ren;
+    assign o_dmem_wstrb = dc_mem_wstrb;
+    // M8: hi-side carry for a misaligned STORE that spans into the next dword.
     assign o_dmem_wdata_hi = st_wdata_hi;
     assign o_dmem_wstrb_hi = dc_st_wstrb_hi;
-    // M9 SMP: assert the bus request whenever this hart drives a dmem access
-    // (dcache fill/write/grant-wait, or an IMMU PTW read through the dmem port).
-    assign o_dmem_req      = imem_ptw_req_w || dc_mem_req;
+    // M9 SMP: assert the bus request whenever the dcache needs the dmem bus
+    // (fill / write-through / grant-wait).
+    assign o_dmem_req      = dc_mem_req;
 
     // i_dmem_rdata_next (top-level next-dword) is superseded by the dcache's
     // own o_rdata_next; keep the port for tb compatibility.
