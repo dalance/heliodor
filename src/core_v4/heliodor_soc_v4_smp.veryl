@@ -1,0 +1,325 @@
+// Phase 7 v4 M9.2.b: N-hart SMP SoC wrapping heliodor_core_v4.
+//
+// Mirrors the single-hart heliodor_soc_v4 (which stays untouched) but scales to
+// N_HARTS cores sharing one memory_bus DRAM arbiter, one L2, one CLINT (N_HARTS
+// contexts) and one UART. The v4 core has NO MMIO select ports (it emits DRAM
+// and MMIO mixed on its flat o_dmem); the SoC address-decodes each core's o_dmem
+// into DRAM (paddr[31]) / CLINT (paddr[31:24]==0x02) / UART (paddr[31:28]==0x1).
+//
+// MMIO needs NO separate arbiter: the dcache grant-gates o_dmem_wen/ren, so only
+// the core that won the memory_bus DRAM arbiter this cycle asserts c_dmem_wen[h]
+// / c_dmem_ren[h]. An OR-reduction over the harts therefore selects exactly the
+// granted core's MMIO access, and the bus already muxes its address/wdata onto
+// bus_dram_addr/bus_dram_wdata. c_dmem_req covers DRAM+MMIO, so the single DRAM
+// grant serialises MMIO too. (MMIO is effectively write-only in this boot —
+// mtime is read via the CSR i_mtime path, timer/sw IRQ arrive on pins, the UART
+// is TX-only — so the dcache never caches a stale MMIO read.)
+//
+// Per-hart instruction fetch (o_imem_*) and instruction PTW (o_iptw_*) stay
+// per-hart and are served by the tb. Coherence: the bus broadcasts every granted
+// DRAM write to all cores' i_dcache_inv (filtered to skip the writer); AMO
+// atomicity: each core's o_amo_inflight feeds the bus i_amo_inflight[h] lock.
+pub module heliodor_soc_v4_smp #(
+    param N_HARTS : u32 = 2            ,
+    param RESET_PC: u64 = 64'h8000_0000,
+) (
+    clk: input clock,
+    rst: input reset,
+    // Per-hart instruction fetch (tb-served)
+    o_imem_addr : output logic<64> [N_HARTS],
+    i_imem_rdata: input  logic<32> [N_HARTS],
+    o_imem_ren  : output logic     [N_HARTS],
+    // Per-hart instruction PTW (tb-served)
+    o_iptw_addr : output logic<64> [N_HARTS],
+    o_iptw_req  : output logic     [N_HARTS],
+    i_iptw_rdata: input  logic<64> [N_HARTS],
+    // Shared data DRAM (MMIO stripped out internally; tb serves DRAM)
+    o_dmem_addr    : output logic<64>,
+    o_dmem_wdata   : output logic<64>,
+    i_dmem_rdata   : input  logic<64>,
+    o_dmem_wen     : output logic    ,
+    o_dmem_ren     : output logic    ,
+    o_dmem_wstrb   : output logic<8> ,
+    o_dmem_wdata_hi: output logic<64>,
+    o_dmem_wstrb_hi: output logic<8> ,
+    // UART TX observation (shared)
+    o_uart_tx_valid: output logic   ,
+    o_uart_tx_data : output logic<8>,
+    // Per-hart architectural x3 (boot pass = hart0 x3 == 0xAA)
+    o_dbg_r3: output logic<64> [N_HARTS],
+) {
+    // Per-hart core <-> SoC dmem wires (pre-decode, flat DRAM+MMIO).
+    var c_dmem_addr    : logic<64> [N_HARTS];
+    var c_dmem_wdata   : logic<64> [N_HARTS];
+    var c_dmem_wen     : logic     [N_HARTS];
+    var c_dmem_ren     : logic     [N_HARTS];
+    var c_dmem_wstrb   : logic<8>  [N_HARTS];
+    var c_dmem_wdata_hi: logic<64> [N_HARTS];
+    var c_dmem_wstrb_hi: logic<8>  [N_HARTS];
+    var c_dmem_req     : logic     [N_HARTS];
+    var c_amo_inflight : logic     [N_HARTS];
+
+    // Per-hart MMIO address decode (mirrors the standalone tb / N=1 SoC).
+    var in_dram : logic [N_HARTS];
+    var in_clint: logic [N_HARTS];
+    var in_uart : logic [N_HARTS];
+    for h in 0..N_HARTS :gen_dec {
+        assign in_dram[h]  = c_dmem_addr[h][31];
+        assign in_clint[h] = c_dmem_addr[h][31:24] == 8'h02;
+        assign in_uart[h]  = c_dmem_addr[h][31:28] == 4'h1;
+    }
+
+    // Per-hart DRAM request bundle into the memory_bus arbiter. wen/ren/wstrb are
+    // gated to DRAM only (MMIO is decoded here, not in the bus); req covers both
+    // so the single grant serialises DRAM and MMIO accesses.
+    var bus_in_addr : logic<64> [N_HARTS];
+    var bus_in_wdata: logic<64> [N_HARTS];
+    var bus_in_wstrb: logic<8>  [N_HARTS];
+    var bus_in_wen  : logic     [N_HARTS];
+    var bus_in_ren  : logic     [N_HARTS];
+    var bus_in_req  : logic     [N_HARTS];
+    var bus_in_amo  : logic     [N_HARTS];
+    var bus_dgrant  : logic     [N_HARTS]; // arbiter -> per-hart grant
+    for h in 0..N_HARTS :gen_busin {
+        assign bus_in_addr[h]  = c_dmem_addr[h];
+        assign bus_in_wdata[h] = c_dmem_wdata[h];
+        assign bus_in_wstrb[h] = if in_dram[h] ? c_dmem_wstrb[h] : 8'd0;
+        assign bus_in_wen[h]   = c_dmem_wen[h] && in_dram[h];
+        assign bus_in_ren[h]   = c_dmem_ren[h] && in_dram[h];
+        assign bus_in_req[h]   = c_dmem_req[h];
+        assign bus_in_amo[h]   = c_amo_inflight[h];
+    }
+
+    // Tied-off MMIO bus ports (MMIO is SoC-decoded, not bus-arbitrated).
+    var bus_mmio_paddr: logic<32> [N_HARTS];
+    var bus_mmio_wdata: logic<64> [N_HARTS];
+    var bus_mmio_wstrb: logic<8>  [N_HARTS];
+    var bus_mmio_wen  : logic     [N_HARTS];
+    var bus_mmio_ren  : logic     [N_HARTS];
+    var bus_clint_sel : logic     [N_HARTS];
+    var bus_plic_sel  : logic     [N_HARTS];
+    var bus_uart_sel  : logic     [N_HARTS];
+    var bus_stall_mem : logic     [N_HARTS];
+    for h in 0..N_HARTS :gen_mmio_tie {
+        assign bus_mmio_paddr[h] = 32'd0;
+        assign bus_mmio_wdata[h] = 64'd0;
+        assign bus_mmio_wstrb[h] = 8'd0;
+        assign bus_mmio_wen[h]   = 1'b0;
+        assign bus_mmio_ren[h]   = 1'b0;
+        assign bus_clint_sel[h]  = 1'b0;
+        assign bus_plic_sel[h]   = 1'b0;
+        assign bus_uart_sel[h]   = 1'b0;
+        assign bus_stall_mem[h]  = 1'b0;
+    }
+
+    // memory_bus DRAM arbiter outputs (granted, single downstream port → L2).
+    var bus_dram_addr : logic<64>;
+    var bus_dram_wdata: logic<64>;
+    var bus_dram_wstrb: logic<8> ;
+    var bus_dram_wen  : logic    ;
+    var bus_dram_ren  : logic    ;
+    var bus_inv_valid : logic    ;
+    var bus_inv_addr  : logic<64>;
+
+    inst u_bus: memory_bus #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk                             ,
+        rst                             ,
+        i_mmio_paddr    : bus_mmio_paddr,
+        i_mmio_wdata    : bus_mmio_wdata,
+        i_mmio_wstrb    : bus_mmio_wstrb,
+        i_mmio_wen      : bus_mmio_wen  ,
+        i_mmio_ren      : bus_mmio_ren  ,
+        i_clint_sel     : bus_clint_sel ,
+        i_plic_sel      : bus_plic_sel  ,
+        i_uart_sel      : bus_uart_sel  ,
+        i_stall_mem     : bus_stall_mem ,
+        o_mmio_paddr    : _             ,
+        o_mmio_wdata    : _             ,
+        o_mmio_wstrb    : _             ,
+        o_mmio_wen_clint: _             ,
+        o_mmio_ren_clint: _             ,
+        o_mmio_wen_plic : _             ,
+        o_mmio_ren_plic : _             ,
+        o_mmio_wen_uart : _             ,
+        o_mmio_ren_uart : _             ,
+        o_mmio_grant    : _             ,
+        i_dmem_addr     : bus_in_addr   ,
+        i_dmem_wdata    : bus_in_wdata  ,
+        i_dmem_wstrb    : bus_in_wstrb  ,
+        i_dmem_wen      : bus_in_wen    ,
+        i_dmem_ren      : bus_in_ren    ,
+        i_dmem_req      : bus_in_req    ,
+        i_amo_inflight  : bus_in_amo    ,
+        o_dmem_grant    : bus_dgrant    ,
+        o_dmem_addr     : bus_dram_addr ,
+        o_dmem_wdata    : bus_dram_wdata,
+        o_dmem_wstrb    : bus_dram_wstrb,
+        o_dmem_wen      : bus_dram_wen  ,
+        o_dmem_ren      : bus_dram_ren  ,
+        o_dmem_inv_valid: bus_inv_valid ,
+        o_dmem_inv_addr : bus_inv_addr  ,
+    );
+
+    // Coherence broadcast: a granted DRAM write invalidates the matching L1 line
+    // in every OTHER core. Filter the writer (it owns the line). DRAM-only
+    // (addr[31]) so MMIO "writes" never spuriously invalidate.
+    var core_inv_valid: logic     [N_HARTS];
+    var core_inv_addr : logic<64> [N_HARTS];
+    let inv_v: logic = bus_inv_valid && bus_inv_addr[31];
+    for h in 0..N_HARTS :gen_inv {
+        assign core_inv_valid[h] = inv_v && !(bus_dgrant[h] && bus_in_wen[h]);
+        assign core_inv_addr[h]  = bus_inv_addr;
+    }
+
+    // Misaligned-store hi-side (addr+8): carried per-hart by the core, not by the
+    // bus. Select the granted DRAM writer's hi-side for the L2 invalidate hint and
+    // the DRAM hi-side write bypass.
+    var l2_wstrb_hi  : logic<8> ;
+    var dram_wdata_hi: logic<64>;
+    var dram_wstrb_hi: logic<8> ;
+    always_comb {
+        l2_wstrb_hi   = 8'd0;
+        dram_wdata_hi = 64'd0;
+        dram_wstrb_hi = 8'd0;
+        for h in 0..N_HARTS {
+            if bus_dgrant[h] && in_dram[h] {
+                l2_wstrb_hi   = c_dmem_wstrb_hi[h];
+                dram_wdata_hi = c_dmem_wdata_hi[h];
+                dram_wstrb_hi = c_dmem_wstrb_hi[h];
+            }
+        }
+    }
+
+    // Shared L2 on the DRAM path (granted request → L2 → external DRAM port).
+    var l2_rdata: logic<64>;
+    inst u_l2: l2cache (
+        clk                        ,
+        rst                        ,
+        i_addr     : bus_dram_addr ,
+        i_wdata    : bus_dram_wdata,
+        i_wstrb    : bus_dram_wstrb,
+        i_wstrb_hi : l2_wstrb_hi   ,
+        i_wen      : bus_dram_wen  ,
+        i_ren      : bus_dram_ren  ,
+        o_rdata    : l2_rdata      ,
+        o_mem_addr : o_dmem_addr   ,
+        o_mem_wdata: o_dmem_wdata  ,
+        o_mem_wstrb: o_dmem_wstrb  ,
+        o_mem_wen  : o_dmem_wen    ,
+        o_mem_ren  : o_dmem_ren    ,
+        i_mem_rdata: i_dmem_rdata  ,
+    );
+    assign o_dmem_wdata_hi = dram_wdata_hi;
+    assign o_dmem_wstrb_hi = dram_wstrb_hi;
+
+    // Shared CLINT / UART driven by the granted core's decoded MMIO access.
+    // Enables are an OR-reduction (only the granted core has c_dmem_wen/ren=1);
+    // address/wdata come from the bus-muxed granted request.
+    var clint_wen_w: logic;
+    var clint_ren_w: logic;
+    var uart_wen_w : logic;
+    var uart_ren_w : logic;
+    always_comb {
+        clint_wen_w = 1'b0;
+        clint_ren_w = 1'b0;
+        uart_wen_w  = 1'b0;
+        uart_ren_w  = 1'b0;
+        for h in 0..N_HARTS {
+            if c_dmem_wen[h] && in_clint[h] {
+                clint_wen_w = 1'b1;
+            }
+            if c_dmem_ren[h] && in_clint[h] {
+                clint_ren_w = 1'b1;
+            }
+            if c_dmem_wen[h] && in_uart[h] {
+                uart_wen_w = 1'b1;
+            }
+            if c_dmem_ren[h] && in_uart[h] {
+                uart_ren_w = 1'b1;
+            }
+        }
+    }
+
+    var clint_rdata: logic<64>         ;
+    var clint_t_irq: logic     [N_HARTS];
+    var clint_s_irq: logic     [N_HARTS];
+    var clint_mtime: logic<64>         ;
+    inst u_clint: clint #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk                              ,
+        rst                              ,
+        i_addr     : bus_dram_addr[15:0] ,
+        i_wdata    : bus_dram_wdata      ,
+        i_wen      : clint_wen_w         ,
+        i_ren      : clint_ren_w         ,
+        o_rdata    : clint_rdata         ,
+        o_timer_irq: clint_t_irq         ,
+        o_sw_irq   : clint_s_irq         ,
+        o_mtime    : clint_mtime         ,
+    );
+
+    var uart_rdata: logic<8>;
+    var uart_irq  : logic   ;
+    inst u_uart: uart (
+        clk                             ,
+        rst                             ,
+        i_addr    : bus_dram_addr[2:0]  ,
+        i_wdata   : bus_dram_wdata[7:0] ,
+        i_wen     : uart_wen_w          ,
+        i_ren     : uart_ren_w          ,
+        o_rdata   : uart_rdata          ,
+        o_tx_valid: o_uart_tx_valid     ,
+        o_tx_data : o_uart_tx_data      ,
+        i_rx_data : 8'd0                ,
+        i_rx_valid: 1'b0                ,
+        o_irq     : uart_irq            ,
+    );
+    let _unused_uart_irq: logic = uart_irq;
+
+    // Per-hart load data: CLINT / UART / DRAM (via L2). A non-granted core's
+    // dcache is stalled (o_stall) and never latches l2_rdata destined for the
+    // granted core, so sharing l2_rdata across harts is safe.
+    var core_dmem_rdata: logic<64> [N_HARTS];
+    for h in 0..N_HARTS :gen_rdata {
+        assign core_dmem_rdata[h] = if in_clint[h] ? clint_rdata : if in_uart[h] ? {56'd0, uart_rdata} : l2_rdata;
+    }
+
+    // N cores. HART_ID = loop index → mhartid. imem/iptw per-hart (tb-served).
+    for h in 0..N_HARTS :gen_core {
+        inst u_core: heliodor_core_v4 #(
+            RESET_PC: RESET_PC,
+            HART_ID : h as 8  ,
+        ) (
+            clk                                   ,
+            rst                                   ,
+            o_imem_addr       : o_imem_addr[h]    ,
+            i_imem_rdata      : i_imem_rdata[h]   ,
+            o_imem_ren        : o_imem_ren[h]     ,
+            o_iptw_addr       : o_iptw_addr[h]    ,
+            o_iptw_req        : o_iptw_req[h]     ,
+            i_iptw_rdata      : i_iptw_rdata[h]   ,
+            o_dmem_addr       : c_dmem_addr[h]    ,
+            o_dmem_wdata      : c_dmem_wdata[h]   ,
+            i_dmem_rdata      : core_dmem_rdata[h],
+            i_dmem_rdata_next : 64'd0             ,
+            o_dmem_wen        : c_dmem_wen[h]     ,
+            o_dmem_ren        : c_dmem_ren[h]     ,
+            o_dmem_wstrb      : c_dmem_wstrb[h]   ,
+            o_dmem_wdata_hi   : c_dmem_wdata_hi[h],
+            o_dmem_wstrb_hi   : c_dmem_wstrb_hi[h],
+            o_dmem_req        : c_dmem_req[h]     ,
+            i_dmem_grant      : bus_dgrant[h]     ,
+            i_dcache_inv_valid: core_inv_valid[h] ,
+            i_dcache_inv_addr : core_inv_addr[h]  ,
+            o_amo_inflight    : c_amo_inflight[h] ,
+            i_irq_timer_m     : clint_t_irq[h]    ,
+            i_mtime           : clint_mtime       ,
+            i_irq_sw_m        : clint_s_irq[h]    ,
+            i_irq_ext_m       : 1'b0              ,
+            o_dbg_x3          : o_dbg_r3[h]       ,
+        );
+    }
+}
