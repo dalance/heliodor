@@ -115,6 +115,29 @@ module test_v4_soc_smp_linux_boot_harness #(
     o_rec_last_rd  : output logic<5> , // last coincidence's committed arch rd
     o_rec_last_pdst: output logic<6> , // last coincidence's committed new pdst
     o_rec_last_cy  : output logic<32>,
+    // rename-vs-PRF: the faulting load's rs1 arch/pdst (captured at the storm
+    // dmem fault) vs the pdst the last sp commit used. pdst mismatch ⇒ the load
+    // was renamed to a stale/wrong physical reg (rename); same pdst ⇒ the PRF
+    // value at that reg was wrong (PRF/forwarding).
+    o_ld_rs1_arch : output logic<5> ,
+    o_ld_rs1_pdst : output logic<6> ,
+    o_sp_prod_pdst: output logic<6> , // pdst of the most recent committed sp (arch 2) write
+    // The SEED fault precisely: the FIRST dmem fault where the committed/arch sp is
+    // still VALID (0xffffffe0_xxxxxxxx) but the load's effective VA is garbage
+    // (<0x1000). Its rs1 pdst vs the live sp-producer pdst is the clean rename-vs-PRF
+    // test (storm faults read an already-corrupt sp, so they're inconclusive).
+    o_seed_ld_pdst : output logic<6> ,
+    o_seed_sp_pdst : output logic<6> ,
+    o_seed_archsp  : output logic<64>,
+    o_seed_vaddr   : output logic<64>,
+    o_seed_cy      : output logic<32>,
+    o_seed_seen    : output logic    ,
+    // seed-FAULT: the PTW walk VA at the first dmem fault while arch sp is valid.
+    o_sf_walkva : output logic<64>,
+    o_sf_archsp : output logic<64>,
+    o_sf_tlbhit : output logic    ,
+    o_sf_cy     : output logic<32>,
+    o_sf_seen   : output logic    ,
 ) {
     // Per-hart instruction fetch + PTW (tb-served from shared memory).
     var imem_addr : logic<64> [N_HARTS];
@@ -158,6 +181,10 @@ module test_v4_soc_smp_linux_boot_harness #(
     var dbg_fl_push_en : logic     [N_HARTS];
     var dbg_commit_rd  : logic<5>  [N_HARTS];
     var dbg_commit_pdst: logic<6>  [N_HARTS];
+    var dbg_agu_rs1_arch: logic<5> [N_HARTS];
+    var dbg_agu_rs1_pdst: logic<6> [N_HARTS];
+    var dbg_agu_is_load : logic    [N_HARTS];
+    var dbg_agu_addr    : logic<64>[N_HARTS];
     var dbg_retire_pc : logic<64> [N_HARTS];
     var dbg_retire_rdv: logic     [N_HARTS];
     var dbg_retire_rd : logic<5>  [N_HARTS];
@@ -209,6 +236,10 @@ module test_v4_soc_smp_linux_boot_harness #(
         o_dbg_fl_push_en: dbg_fl_push_en,
         o_dbg_commit_rd : dbg_commit_rd ,
         o_dbg_commit_pdst: dbg_commit_pdst,
+        o_dbg_agu_rs1_arch: dbg_agu_rs1_arch,
+        o_dbg_agu_rs1_pdst: dbg_agu_rs1_pdst,
+        o_dbg_agu_is_load: dbg_agu_is_load,
+        o_dbg_agu_addr  : dbg_agu_addr  ,
         o_dbg_retire_pc : dbg_retire_pc ,
         o_dbg_retire_rdv: dbg_retire_rdv,
         o_dbg_retire_rd : dbg_retire_rd ,
@@ -497,6 +528,20 @@ module test_v4_soc_smp_linux_boot_harness #(
     var rec_last_rd  : logic<5> ;
     var rec_last_pdst: logic<6> ;
     var rec_last_cy  : logic<32>;
+    var ld_rs1_arch : logic<5> ;
+    var ld_rs1_pdst : logic<6> ;
+    var sp_prod_pdst: logic<6> ;
+    var seed_ld_pdst: logic<6> ;
+    var seed_sp_pdst: logic<6> ;
+    var seed_archsp : logic<64>;
+    var seed_vaddr  : logic<64>;
+    var seed_cy     : logic<32>;
+    var seed_seen   : logic    ;
+    var sf_walkva : logic<64>;
+    var sf_archsp : logic<64>;
+    var sf_tlbhit : logic    ;
+    var sf_cy     : logic<32>;
+    var sf_seen   : logic    ;
     let ks_lo_w : logic<32> = dram[23'h329604]; // PA 0x80ca5810 kernel_sp lo
     let ks_hi_w : logic<32> = dram[23'h329605]; // PA 0x80ca5814 kernel_sp hi
     // Live DRAM words (DRAM index = PA[24:2]); 0x80a0bd08>>2 = 0x282f42, etc.
@@ -563,6 +608,20 @@ module test_v4_soc_smp_linux_boot_harness #(
             rec_last_rd  = 5'd0;
             rec_last_pdst= 6'd0;
             rec_last_cy  = 32'd0;
+            ld_rs1_arch  = 5'd0;
+            ld_rs1_pdst  = 6'd0;
+            sp_prod_pdst = 6'd0;
+            seed_ld_pdst = 6'd0;
+            seed_sp_pdst = 6'd0;
+            seed_archsp  = 64'd0;
+            seed_vaddr   = 64'd0;
+            seed_cy      = 32'd0;
+            seed_seen    = 1'b0;
+            sf_walkva  = 64'd0;
+            sf_archsp  = 64'd0;
+            sf_tlbhit  = 1'b0;
+            sf_cy      = 32'd0;
+            sf_seen    = 1'b0;
         } else {
             // hart1 retires `ld sp,0(a4)` @PA 0x8000109c → captured sp value.
             if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd2 && dbg_retire_pc[1][31:0] == 32'h8000_109c {
@@ -667,6 +726,37 @@ module test_v4_soc_smp_linux_boot_harness #(
                 df_pte      = dbg_dpte[1];
                 df_vaddr    = dbg_dmem_vaddr[1];
                 df_cy       = cy;
+                ld_rs1_arch = dbg_agu_rs1_arch[1]; // faulting load's rs1 arch/pdst
+                ld_rs1_pdst = dbg_agu_rs1_pdst[1];
+            }
+            // (a) Did any LOAD ever ISSUE with rs1=sp and a garbage address while
+            // arch sp is valid? If NOT (seen_op stays 0), the load OPERAND is fine
+            // and the garbage comes from the PTW walk VA, not rename/PRF.
+            if dbg_agu_is_load[1] && dbg_agu_rs1_arch[1] == 5'd2 && dbg_agu_addr[1] <: 64'h1000
+                && dbg_sp[1][63:40] == 24'hffff_e0 && !seed_seen && h1_sp_ld_n != 32'd0 {
+                seed_seen    = 1'b1;
+                seed_ld_pdst = dbg_agu_rs1_pdst[1];
+                seed_sp_pdst = sp_prod_pdst;
+                seed_archsp  = dbg_sp[1];
+                seed_vaddr   = dbg_agu_addr[1];
+                seed_cy      = cy;
+            }
+            // (b) The SEED FAULT: the first dmem fault while arch sp is still VALID
+            // (0xffffffe0...). dbg_dmem_vaddr there = the PTW walk VA. If it is
+            // garbage (low) while the operand was never garbage (a, seed_seen=0),
+            // the bug is a CORRUPT WALK VA (walk_vaddr_q), not the load operand.
+            if dbg_dmem_fault[1] && !sf_seen && h1_sp_ld_n != 32'd0
+                && dbg_sp[1][63:40] == 24'hffff_e0 {
+                sf_seen   = 1'b1;
+                sf_walkva = dbg_dmem_vaddr[1];
+                sf_archsp = dbg_sp[1];
+                sf_tlbhit = dbg_dtlb_hit[1];
+                sf_cy     = cy;
+            }
+            // Track the physical reg the most recent committed sp (arch 2) write
+            // used — the "correct" pdst the rename map should point sp to.
+            if dbg_retire_v[1] && dbg_commit_rd[1] == 5'd2 && !sc_seen {
+                sp_prod_pdst = dbg_commit_pdst[1];
             }
             // free_list/rat recovery hypothesis: count hart1 redirect_fire and the
             // suspect coincidence (redirect_fire && fl_push_en = an rd-bearing commit
@@ -753,6 +843,20 @@ module test_v4_soc_smp_linux_boot_harness #(
     assign o_rec_last_rd   = rec_last_rd;
     assign o_rec_last_pdst = rec_last_pdst;
     assign o_rec_last_cy   = rec_last_cy;
+    assign o_ld_rs1_arch   = ld_rs1_arch;
+    assign o_ld_rs1_pdst   = ld_rs1_pdst;
+    assign o_sp_prod_pdst  = sp_prod_pdst;
+    assign o_seed_ld_pdst  = seed_ld_pdst;
+    assign o_seed_sp_pdst  = seed_sp_pdst;
+    assign o_seed_archsp   = seed_archsp;
+    assign o_seed_vaddr    = seed_vaddr;
+    assign o_seed_cy       = seed_cy;
+    assign o_seed_seen     = seed_seen;
+    assign o_sf_walkva   = sf_walkva;
+    assign o_sf_archsp   = sf_archsp;
+    assign o_sf_tlbhit   = sf_tlbhit;
+    assign o_sf_cy       = sf_cy;
+    assign o_sf_seen     = sf_seen;
 }
 
 #[test(test_v4_soc_smp_linux_boot)]
@@ -838,6 +942,20 @@ module test_v4_soc_smp_linux_boot {
     var rec_last_rd  : logic<5> ;
     var rec_last_pdst: logic<6> ;
     var rec_last_cy  : logic<32>;
+    var ld_rs1_arch : logic<5> ;
+    var ld_rs1_pdst : logic<6> ;
+    var sp_prod_pdst: logic<6> ;
+    var seed_ld_pdst: logic<6> ;
+    var seed_sp_pdst: logic<6> ;
+    var seed_archsp : logic<64>;
+    var seed_vaddr  : logic<64>;
+    var seed_cy     : logic<32>;
+    var seed_seen   : logic    ;
+    var sf_walkva : logic<64>;
+    var sf_archsp : logic<64>;
+    var sf_tlbhit : logic    ;
+    var sf_cy     : logic<32>;
+    var sf_seen   : logic    ;
 
     inst harness: test_v4_soc_smp_linux_boot_harness (
         clk             ,
@@ -919,6 +1037,20 @@ module test_v4_soc_smp_linux_boot {
         o_rec_last_rd  : rec_last_rd  ,
         o_rec_last_pdst: rec_last_pdst,
         o_rec_last_cy  : rec_last_cy  ,
+        o_ld_rs1_arch : ld_rs1_arch ,
+        o_ld_rs1_pdst : ld_rs1_pdst ,
+        o_sp_prod_pdst: sp_prod_pdst,
+        o_seed_ld_pdst: seed_ld_pdst,
+        o_seed_sp_pdst: seed_sp_pdst,
+        o_seed_archsp : seed_archsp ,
+        o_seed_vaddr  : seed_vaddr  ,
+        o_seed_cy     : seed_cy     ,
+        o_seed_seen   : seed_seen   ,
+        o_sf_walkva : sf_walkva ,
+        o_sf_archsp : sf_archsp ,
+        o_sf_tlbhit : sf_tlbhit ,
+        o_sf_cy     : sf_cy     ,
+        o_sf_seen   : sf_seen   ,
     );
 
     initial {
@@ -963,6 +1095,10 @@ module test_v4_soc_smp_linux_boot {
         $display("  hart1 storm dmem-fault DMMU (last before corruption, of %h faults): vaddr=%h tlb_hit=%b tlb_ppn=%h tlb_perm=%h ptw_addr=%h pte=%h @cy=%h seen=%b", df_n, df_vaddr, df_tlb_hit, df_tlb_ppn, df_tlb_perm, df_ptw_addr, df_pte, df_cy, df_seen);
         // free_list/rat recovery hypothesis test (pre-corruption window).
         $display("  hart1 recovery: redirect_fire=%h | redirect&&rd-commit(SUSPECT)=%h (of which rd==sp: %h) | last: rd=%h pdst=%h @cy=%h", rec_n, rec_rd_n, rec_sp_n, rec_last_rd, rec_last_pdst, rec_last_cy);
+        // rename-vs-PRF: faulting load's rs1 arch/pdst vs the sp producer's pdst.
+        $display("  hart1 faulting load rs1: arch=%h pdst=%h | last sp-producer pdst=%h  (arch==2=sp; pdst mismatch=>rename, same=>PRF/forward)", ld_rs1_arch, ld_rs1_pdst, sp_prod_pdst);
+        $display("  hart1 SEED operand check (load rs1=sp issued garbage addr while sp valid?): seen=%b (0=>operand FINE=>walk-VA bug)", seed_seen);
+        $display("  hart1 SEED FAULT (first dmem fault, sp still valid): walkVA=%h archsp=%h tlb_hit=%b @cy=%h seen=%b  <== walkVA garbage + operand fine => corrupt walk_vaddr_q", sf_walkva, sf_archsp, sf_tlbhit, sf_cy, sf_seen);
         $display("  kernel_sp slot (PA 0x80ca5810): live DRAM=%h%h | last bus write=%h @cy=%h", ks_hi, ks_lo, ks_wval, ks_wcy);
         $display("  hart1 sp-commit ring (oldest..newest, pc=val), frozen at first garbage sp:");
         for k in 0..8 {
