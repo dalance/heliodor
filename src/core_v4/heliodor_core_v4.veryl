@@ -190,6 +190,12 @@ pub module heliodor_core_v4 #(
     o_dbg_dlk_stval  : output logic<64>,
     o_dbg_dlk_pc     : output logic<64>,
     o_dbg_dlk_walkpc : output logic<64>,
+    // M9.3 operand-capture probe (slli@0x800df85e reads a3 wrong).
+    o_dbg_opc_seen     : output logic    ,
+    o_dbg_opc_rs1_pdst : output logic<6> ,
+    o_dbg_opc_rs1_data : output logic<64>,
+    o_dbg_opc_prod_pc  : output logic<64>,
+    o_dbg_opc_prod_data: output logic<64>,
     // M9.A.298: CSR translation-state snoop. The MMU's permission check for a
     // U=1 page load in S-mode reduces to tlb_u_ok = i_sum. A TLB-hit load
     // page-fault therefore implies csr_sum==0 at translate time. Exposing the
@@ -1255,18 +1261,34 @@ pub module heliodor_core_v4 #(
     // effects suppressed — same machinery as the TVM/TSR commit traps.
     let commit_fp_disabled : logic = rob_commit_valid && c_is_fp && csr_fs == 2'b00;
     let commit_priv_illegal: logic = commit_tvm_trap || commit_tsr_trap || commit_fp_disabled;
+    // M9.3 SMP FIX (cosim-pinned free-list double-alloc): gate the commit-side
+    // architectural mutations on the actual RETIRE (rob_commit_ack), NOT on
+    // rob_commit_valid. A store-class op held at the ROB head keeps
+    // rob_commit_valid HIGH for every cycle it waits (rob_commit_ack low while
+    // dmem_mmu_busy / dcache_stall). For an AMO (is_store AND has_rd — the
+    // SMP-spinlock case, held by the bus-atomic lock + bus contention),
+    // fl_push_en = rob_commit_valid && c_has_rd then PUSHES the displaced
+    // old_rd_pdst to the free-list EVERY held cycle → the same pdst is enqueued
+    // K times → it is later popped by K different renames → a DOUBLE-ALLOCATION.
+    // The SMP cosim caught the symptom: `c.slli a3,0x3` @0x800df85e read a3 as
+    // a4's value because the `lw a3` and the `addi a4` were both handed pdst 12.
+    // rob_commit_ack == rob_commit_valid for every non-held op (so the common
+    // path is unchanged); only a held AMO now pushes/commits exactly once, at
+    // retire. (Gating rat_commit_en too keeps RAT-arch atomic with the push and
+    // avoids committing a held AMO's rd before it actually retires / if it
+    // faults.) v4 N=1 never hit this (AMOs rarely held without bus contention).
     always_comb {
-        rat_commit_en   = rob_commit_valid && c_has_rd && !c_illegal && !commit_priv_illegal;
+        rat_commit_en   = rob_commit_ack && c_has_rd && !c_illegal && !commit_priv_illegal;
         rat_commit_arch = c_rd_arch;
         rat_commit_pdst = c_rd_pdst;
 
-        fl_push_en   = rob_commit_valid && c_has_rd && !c_illegal && !commit_priv_illegal;
+        fl_push_en   = rob_commit_ack && c_has_rd && !c_illegal && !commit_priv_illegal;
         fl_push_pdst = c_old_rd_pdst;
 
         // M6: FP-dest commit — rename the FP arch RAT + push the displaced FP
         // pdst to the FP free-list (rd_pdst/old_rd_pdst hold the FP pdsts).
-        fp_rat_commit_en = rob_commit_valid && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
-        fp_fl_push_en    = rob_commit_valid && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
+        fp_rat_commit_en = rob_commit_ack && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
+        fp_fl_push_en    = rob_commit_ack && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
         fp_fl_push_pdst  = c_old_rd_pdst;
     }
 
@@ -1921,6 +1943,55 @@ pub module heliodor_core_v4 #(
     }
 
     // ============================================================
+    // M9.3 operand-capture probe (debug). The SMP cosim pinned the root to an
+    // intermittent OoO operand bug: `c.slli a3,0x3` @0x800df85e reads its rs1
+    // (a3) as 0x..80ab3920 (= a4, the immediately-preceding addi's result)
+    // instead of its own load result 1. To find the mechanism, shadow every PRF
+    // pdst's LAST int-CDB producer {pc, data}; at the bad slli (issuing PC
+    // 0x800df85e with rs1 operand != 1) capture the slli's rs1_pdst, the value it
+    // read, and who last wrote that pdst:
+    //   prod_pc==0x800df84a (lw)  + data==1  => correct mapping; the slli read PRF
+    //       stale/wrong (PRF read-vs-write race or a wrong rs1_pdst output).
+    //   prod_pc==0x800df852 (addi)+ data==a4 => the ADDI wrote the slli's rs1 pdst
+    //       => a3 & a4 share a pdst (free-list double-alloc / rename mismap).
+    // Debug-only: shadow + capture feed only debug regs (no path into issue).
+    var prf_prod_pc  : logic<64> [PRF_INT_N];
+    var prf_prod_data: logic<64> [PRF_INT_N];
+    let opc_int_cdb_wr: logic = cdb.valid && cdb.has_rd && !cdb_dest_is_fp;
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..PRF_INT_N {
+                prf_prod_pc[i]   = 64'd0;
+                prf_prod_data[i] = 64'd0;
+            }
+        } else if opc_int_cdb_wr {
+            prf_prod_pc[cdb.pdst]   = dbg_alu_pc;
+            prf_prod_data[cdb.pdst] = cdb.data;
+        }
+    }
+    let opc_bad_slli: logic = iq_issue_ack && iq_issue_op.base.pc[31:0] == 32'h800d_f85e && prf_rs1_data != 64'd1;
+    var opc_seen_q     : logic              ;
+    var opc_rs1_pdst_q : logic<PRF_INT_W>   ;
+    var opc_rs1_data_q : logic<64>          ;
+    var opc_prod_pc_q  : logic<64>          ;
+    var opc_prod_data_q: logic<64>          ;
+    always_ff (clk, rst) {
+        if_reset {
+            opc_seen_q      = 1'b0;
+            opc_rs1_pdst_q  = 6'd0;
+            opc_rs1_data_q  = 64'd0;
+            opc_prod_pc_q   = 64'd0;
+            opc_prod_data_q = 64'd0;
+        } else if opc_bad_slli && !opc_seen_q {
+            opc_seen_q      = 1'b1;
+            opc_rs1_pdst_q  = iq_iss_rs1_pdst;
+            opc_rs1_data_q  = prf_rs1_data;
+            opc_prod_pc_q   = prf_prod_pc[iq_iss_rs1_pdst];
+            opc_prod_data_q = prf_prod_data[iq_iss_rs1_pdst];
+        }
+    }
+
+    // ============================================================
     // M5.C: dmem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
     // pure passthrough; o_busy stays 0 and o_dmem_addr == i_vaddr.
     // PTW shared with imem in M5.D.
@@ -2131,6 +2202,11 @@ pub module heliodor_core_v4 #(
     assign o_dbg_dlk_stval     = dlk_stval_q;
     assign o_dbg_dlk_pc        = dlk_pc_q;
     assign o_dbg_dlk_walkpc    = dlk_walkpc_q;
+    assign o_dbg_opc_seen      = opc_seen_q;
+    assign o_dbg_opc_rs1_pdst  = opc_rs1_pdst_q;
+    assign o_dbg_opc_rs1_data  = opc_rs1_data_q;
+    assign o_dbg_opc_prod_pc   = opc_prod_pc_q;
+    assign o_dbg_opc_prod_data = opc_prod_data_q;
     assign o_dbg_csr_sum       = csr_sum;
     assign o_dbg_csr_mxr       = csr_mxr;
     assign o_dbg_csr_dmem_priv = if dmem_eff_priv == csr_pkg::PrivLevel::MACHINE ?
