@@ -185,6 +185,11 @@ module test_v4_soc_smp_linux_boot_harness #(
     o_go_cy      : output logic<32>,
     o_go_s0pc    : output logic<64>, // PC that committed the garbage s0 value
     o_go_s0val   : output logic<64>,
+    // M9.3: DRAM[sp+48] snapshot when `ld s0,48(sp)`@0x7750 committed s0=0x01.
+    o_prod_seen   : output logic    ,
+    o_prod_dram_lo: output logic<32>,
+    o_prod_dram_hi: output logic<32>,
+    o_prod_sp_cap : output logic<64>,
 ) {
     // Per-hart instruction fetch + PTW (tb-served from shared memory).
     var imem_addr : logic<64> [N_HARTS];
@@ -638,6 +643,15 @@ module test_v4_soc_smp_linux_boot_harness #(
     var go_s0pc    : logic<64>; // s0 producer PC frozen at the garbage-operand load
     var go_s0val   : logic<64>;
     var inj_seen   : logic    ;
+    // M9.3: live DRAM word index for hart1's `ld s0,48(sp)` producer (PA = sp[31:0]+48).
+    var prod_seen   : logic    ;
+    var prod_dram_lo: logic<32>;
+    var prod_dram_hi: logic<32>;
+    var prod_sp_cap : logic<64>;
+    // producer sp is a LINEAR-MAP VA (0xffffffe0_xxxxxxxx): its low 32 bits ARE
+    // the DRAM byte offset (PA = 0x80000000 + sp[31:0]), so do NOT subtract base.
+    let prod_off : logic<32> = dbg_sp[1][31:0] + 32'd48;
+    let prod_widx: logic<23> = prod_off[24:2];
     let ks_lo_w : logic<32> = dram[23'h329604]; // PA 0x80ca5810 kernel_sp lo
     let ks_hi_w : logic<32> = dram[23'h329605]; // PA 0x80ca5814 kernel_sp hi
     // Live DRAM words (DRAM index = PA[24:2]); 0x80a0bd08>>2 = 0x282f42, etc.
@@ -747,6 +761,10 @@ module test_v4_soc_smp_linux_boot_harness #(
             s0prod_val  = 64'd0;
             go_s0pc     = 64'd0;
             go_s0val    = 64'd0;
+            prod_seen    = 1'b0;
+            prod_dram_lo = 32'd0;
+            prod_dram_hi = 32'd0;
+            prod_sp_cap  = 64'd0;
         } else {
             // M9.3: rolling 16-cy redirect history (hart1).
             red_hist = {red_hist[14:0], dbg_redirect_fire[1]};
@@ -755,6 +773,17 @@ module test_v4_soc_smp_linux_boot_harness #(
             if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd8 {
                 s0prod_pc  = dbg_retire_pc[1];
                 s0prod_val = dbg_retire_dat[1];
+            }
+            // M9.3 decisive: when the `ld s0,48(sp)` @0x80007750 producer commits
+            // s0=0x01, snapshot DRAM[sp+48] THIS cycle. DRAM!=0x01 ⇒ the load got
+            // STALE dcache data (store→load ordering hole); DRAM==0x01 ⇒ s0 was
+            // already garbage when saved (walk the chain back).
+            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd8
+                && dbg_retire_pc[1][31:0] == 32'h8000_7750 && dbg_retire_dat[1] == 64'd1 && !prod_seen {
+                prod_seen    = 1'b1;
+                prod_sp_cap  = dbg_sp[1];
+                prod_dram_lo = dram[prod_widx];
+                prod_dram_hi = dram[prod_widx + 23'd1];
             }
             // M9.3: first garbage-OPERAND load (any rs1) after secondary entry.
             if dbg_agu_is_load[1] && dbg_agu_addr[1] <: 64'h1000 && !go_seen && h1_sp_ld_n != 32'd0 {
@@ -1067,6 +1096,10 @@ module test_v4_soc_smp_linux_boot_harness #(
     assign o_go_cy       = go_cy;
     assign o_go_s0pc     = go_s0pc;
     assign o_go_s0val    = go_s0val;
+    assign o_prod_seen    = prod_seen;
+    assign o_prod_dram_lo = prod_dram_lo;
+    assign o_prod_dram_hi = prod_dram_hi;
+    assign o_prod_sp_cap  = prod_sp_cap;
 }
 
 #[test(test_v4_soc_smp_linux_boot)]
@@ -1196,6 +1229,10 @@ module test_v4_soc_smp_linux_boot {
     var s0prod_val : logic<64>; // value it committed into s0
     var go_s0pc    : logic<64>; // s0 producer PC frozen at the garbage-operand load
     var go_s0val   : logic<64>;
+    var prod_seen   : logic    ;
+    var prod_dram_lo: logic<32>;
+    var prod_dram_hi: logic<32>;
+    var prod_sp_cap : logic<64>;
 
     inst harness: test_v4_soc_smp_linux_boot_harness (
         clk             ,
@@ -1317,6 +1354,10 @@ module test_v4_soc_smp_linux_boot {
         o_go_cy      : go_cy      ,
         o_go_s0pc    : go_s0pc    ,
         o_go_s0val   : go_s0val   ,
+        o_prod_seen   : prod_seen   ,
+        o_prod_dram_lo: prod_dram_lo,
+        o_prod_dram_hi: prod_dram_hi,
+        o_prod_sp_cap : prod_sp_cap ,
     );
 
     initial {
@@ -1377,6 +1418,7 @@ module test_v4_soc_smp_linux_boot {
         $display("  hart1 INJECT MECHANISM @first garbage: redhist=%h (nonzero=>redirect in last 16cy=>squash/reuse) walkVA=%h | issuing load: addr=%h rs1arch=%h is_load=%b", inj_redhist, inj_walkva, inj_aguaddr, inj_rs1a, inj_isld);
         $display("  hart1 GARBAGE-OPERAND load (FIRST load w/ addr<0x1000): seen=%b rs1arch=%h ARCHval=%h addr=%h @cy=%h  (ARCHval valid 0xff..+addr garbage=>RENAME/PRF read bug; ARCHval garbage=>dcache/data bug)", go_seen, go_rs1arch, go_archval, go_addr, go_cy);
         $display("  hart1 GARBAGE s0 PRODUCER (last x8 commit before the garbage load): pc=%h val=%h  (objdump pc: load=>dcache/data bug @that load; non-load=>upstream garbage chain)", go_s0pc, go_s0val);
+        $display("  hart1 DRAM[sp+48] @ld-s0-producer: seen=%b sp=%h DRAM=%h%h  (DRAM!=0x01 + load got 0x01 => dcache STALE-data; DRAM==0x01 => store wrote garbage => chain back)", prod_seen, prod_sp_cap, prod_dram_hi, prod_dram_lo);
         $display("  kernel_sp slot (PA 0x80ca5810): live DRAM=%h%h | last bus write=%h @cy=%h", ks_hi, ks_lo, ks_wval, ks_wcy);
         $display("  hart1 sp-commit ring (oldest..newest, pc=val), frozen at first garbage sp:");
         for k in 0..8 {
