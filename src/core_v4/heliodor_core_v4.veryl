@@ -259,6 +259,7 @@ pub module heliodor_core_v4 #(
     var dmem_mmu_fault  : logic;
     var dmem_mmu_fault_s: logic;
     var dmem_walk_start : logic; // M9.A.296: PTW-start pulse (1 cy at IDLE→walk)
+    var dmem_mmu_idle   : logic; // M9.3: dmem MMU FSM is IDLE (no walk owns port)
     // M9.A.303 debug: dmem PTW / faulting-PTE / TLB-hit snoop
     var dmem_dptw_req : logic    ;
     var dmem_dptw_addr: logic<64>;
@@ -1720,7 +1721,24 @@ pub module heliodor_core_v4 #(
     // load never co-drive the MMU in the same cycle.
     let load_walk_busy : logic     = walk_v_q && !walk_is_store_q;
     let store_drive    : logic     = commit_store_fire && !load_walk_busy;
-    let core_dmem_vaddr: logic<64> = if store_drive ? c_store_addr : if load_walk_busy ? walk_vaddr_q : agu_addr_iss;
+    // M9.3: a load walk PHYSICALLY owns the dmem port only while the MMU FSM is
+    // NOT idle (LEVEL/DONE/FAULT). walk_v_q is a registered owner tag that, under
+    // hart1's SMP bus-contention back-to-back walks, stays set CONTINUOUSLY across
+    // walks (busy never drops between them, so the `walk_v_q && !dmem_mmu_busy`
+    // clear below never fires) — leaving a STALE window where walk_v_q=1 but the
+    // MMU is already back in IDLE about to start the NEXT walk. In that window the
+    // old `load_walk_busy ? walk_vaddr_q` pin forced the freshly-issuing load
+    // (incl. a squash-reused walk_rob_q "owner" that load_walk_block lets through)
+    // to inherit the PREVIOUS walk's VA. When the previous walk was a wrong-path
+    // VA~0 load, the new VALID load then walked VA~0, faulted at the root PTE, and
+    // lfault_inj delivered stval=0 to it (walk_rob_q==itself, walk_v_q=1) — a
+    // spurious load page fault => the N=2 trap storm. Gate the pin (and the ren
+    // term) on a real in-flight walk so the fresh load drives its OWN agu_addr_iss
+    // and the walk_vaddr_q re-latch at dmem_walk_start captures the correct VA.
+    // dmem_mmu_idle is the MMU's `state` register (== IDLE), combinationally
+    // independent of i_vaddr/core_dmem_vaddr, so no combinational loop is formed.
+    let mmu_walk_inflight: logic   = load_walk_busy && !dmem_mmu_idle;
+    let core_dmem_vaddr: logic<64> = if store_drive ? c_store_addr : if mmu_walk_inflight ? walk_vaddr_q : agu_addr_iss;
     let core_dmem_wdata: logic<64> = st_wdata;
     let core_dmem_wen  : logic     = store_drive;
     // M9.A.316: do NOT let a speculative LOAD request the dmem MMU on a
@@ -1740,7 +1758,7 @@ pub module heliodor_core_v4 #(
     // no walk starts this cycle, the wrong-path load is flushed, and the walk
     // owner is never a squashed op. load_walk_busy (an already-in-flight walk)
     // is preserved; stores commit in-order (never speculative) so are unaffected.
-    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire) || load_walk_busy;
+    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire) || mmu_walk_inflight;
     let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
 
     // ============================================================
@@ -1883,6 +1901,7 @@ pub module heliodor_core_v4 #(
         o_fault_store: dmem_mmu_fault_s,
         o_rdata_valid: dmem_mmu_rdv    ,
         o_walk_start : dmem_walk_start , // M9.A.296: PTW-start pulse for F2 owner re-latch
+        o_idle       : dmem_mmu_idle   , // M9.3: gate the load-walk VA pin on a REAL in-flight walk
 
         // M8.B: stall the dmem MMU walk while the dcache is filling a PTE-read
         // miss — the walk must not advance (i_ptw_valid) until the PTE is cached.
