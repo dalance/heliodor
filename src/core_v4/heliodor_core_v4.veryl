@@ -177,6 +177,19 @@ pub module heliodor_core_v4 #(
     o_dbg_walk_vaddr: output logic<64>,
     o_dbg_lfault_inj: output logic    ,
     o_dbg_orphan_walk: output logic   ,
+    // M9.3 walk-FSM ring enrichment: physical-walk-in-flight, PTW-start pulse,
+    // and dmem MMU IDLE, so the ring can disambiguate a fresh re-latch from a
+    // stale/orphan walk leaking its fault.
+    o_dbg_walk_phys : output logic    ,
+    o_dbg_walk_start: output logic    ,
+    o_dbg_dmem_idle : output logic    ,
+    // M9.3 inject→commit linkage result (first committed garbage-VA load fault).
+    o_dbg_dlk_seen   : output logic    ,
+    o_dbg_dlk_genuine: output logic    ,
+    o_dbg_dlk_inj    : output logic    ,
+    o_dbg_dlk_stval  : output logic<64>,
+    o_dbg_dlk_pc     : output logic<64>,
+    o_dbg_dlk_walkpc : output logic<64>,
     // M9.A.298: CSR translation-state snoop. The MMU's permission check for a
     // U=1 page load in S-mode reduces to tlb_u_ok = i_sum. A TLB-hit load
     // page-fault therefore implies csr_sum==0 at translate time. Exposing the
@@ -276,6 +289,7 @@ pub module heliodor_core_v4 #(
     var walk_rob_q       : logic<5> ;
     var walk_vaddr_q     : logic<64>;
     var walk_is_store_q  : logic    ; // M9.A.299: walk started by a commit-store
+    var walk_pc_q        : logic<64>; // M9.3 inject-linkage probe: PC of the load that started the walk
     // M9.3 SMP: physical PTW-walk-in-progress, tracked INDEPENDENTLY of the owner
     // (walk_v_q clears on a redirect; walk_phys_q does not). walk_phys_q && !walk_v_q
     // at a fault ⇒ an ORPHAN walk (its owner was squashed mid-walk) — its fault must
@@ -1103,6 +1117,10 @@ pub module heliodor_core_v4 #(
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
     var c_fault_vaddr : logic<64>       ;
+    // M9.3 inject-linkage probe (debug): head entry's recorded walk-start PC
+    // and inject-delivered flag.
+    var commit_dbg_walk_pc: logic<64>   ;
+    var commit_dbg_inj    : logic       ;
     // M6: FP commit
     var c_is_fp_dest  : logic           ;
     var c_is_fp       : logic           ;
@@ -1167,6 +1185,7 @@ pub module heliodor_core_v4 #(
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
+        i_lfault_inj_pc      : walk_pc_q            ,
         o_commit_valid       : rob_commit_valid     ,
         o_commit_entry       : rob_commit_entry     ,
         o_commit_pc          : c_pc                 ,
@@ -1198,6 +1217,8 @@ pub module heliodor_core_v4 #(
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_is_sfault   : c_is_sfault          ,
         o_commit_fault_vaddr : c_fault_vaddr        ,
+        o_commit_dbg_walk_pc : commit_dbg_walk_pc   ,
+        o_commit_dbg_inj     : commit_dbg_inj       ,
         o_commit_is_fp_dest  : c_is_fp_dest         ,
         o_commit_is_fp       : c_is_fp              ,
         o_commit_fflags      : c_fflags             ,
@@ -1795,6 +1816,7 @@ pub module heliodor_core_v4 #(
             walk_rob_q      = 5'd0;
             walk_vaddr_q    = 64'd0;
             walk_is_store_q = 1'b0;
+            walk_pc_q       = 64'd0;
         } else if dmem_walk_start {
             // M9.A.312: dmem_walk_start MUST take priority over redirect_fire_q.
             // When both coincide, a NEW PTW walk is starting THIS cycle (the MMU
@@ -1810,6 +1832,8 @@ pub module heliodor_core_v4 #(
             walk_v_q     = 1'b1;
             walk_rob_q   = iq_iss_rob_idx;
             walk_vaddr_q = core_dmem_vaddr;
+            // M9.3 inject-linkage probe: PC of the load that starts this walk.
+            walk_pc_q    = iq_issue_op.base.pc;
             // M9.A.299: a walk driven by a commit-store is a STORE walk. Its
             // fault is delivered via commit_store_sfault (commit-time), NOT the
             // load inject port — and walk_rob_q (= issue idx) is meaningless for
@@ -1855,6 +1879,46 @@ pub module heliodor_core_v4 #(
     // a STALE walk_vaddr_q (back-to-back-walk VA inheritance). So we leave the
     // committed behaviour at baseline here.
     assign rob_cdb_is_lfault = cdb.is_lfault && (!walk_v_q || cdb.rob_idx == walk_rob_q);
+
+    // ============================================================
+    // M9.3 inject→commit linkage probe (debug-only). Captures the FIRST
+    // committed load page-fault whose stval (fault_vaddr) is a GARBAGE VA
+    // (< 0x1000 — no real kernel/user VA is that low during secondary
+    // bringup). This is the trap that deadlocks hart1's secondary. We record:
+    //   dlk_inj     — was the committed fault delivered via the lfault inject
+    //                 port (vs a direct CDB permission fault on the op itself)?
+    //   dlk_genuine — does the committing op's PC equal the walk-start PC that
+    //                 the inject recorded? equal ⇒ the op that STARTED the
+    //                 garbage-VA walk is itself the trapping op (a genuine load
+    //                 with a garbage base register → value/control bug);
+    //                 different ⇒ the fault was injected into a reused/innocent
+    //                 entry (mis-attribution → a fault-inject GATE is the fix).
+    // All reads are commit-stage signals; the writes touch only debug regs, so
+    // no path feeds back into issue/select (comb-loop-free).
+    var dlk_seen_q   : logic    ;
+    var dlk_genuine_q: logic    ;
+    var dlk_inj_q    : logic    ;
+    var dlk_stval_q  : logic<64>;
+    var dlk_pc_q     : logic<64>;
+    var dlk_walkpc_q : logic<64>;
+    let commit_lfault_garbage: logic = rob_commit_valid && c_is_lfault && c_fault_vaddr <: 64'h1000;
+    always_ff (clk, rst) {
+        if_reset {
+            dlk_seen_q    = 1'b0;
+            dlk_genuine_q = 1'b0;
+            dlk_inj_q     = 1'b0;
+            dlk_stval_q   = 64'd0;
+            dlk_pc_q      = 64'd0;
+            dlk_walkpc_q  = 64'd0;
+        } else if commit_lfault_garbage && !dlk_seen_q {
+            dlk_seen_q    = 1'b1;
+            dlk_inj_q     = commit_dbg_inj;
+            dlk_genuine_q = commit_dbg_inj && (commit_dbg_walk_pc == c_pc);
+            dlk_stval_q   = c_fault_vaddr;
+            dlk_pc_q      = c_pc;
+            dlk_walkpc_q  = commit_dbg_walk_pc;
+        }
+    }
 
     // ============================================================
     // M5.C: dmem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
@@ -2058,6 +2122,15 @@ pub module heliodor_core_v4 #(
     assign o_dbg_walk_vaddr    = walk_vaddr_q;
     assign o_dbg_lfault_inj    = lfault_inj_v;
     assign o_dbg_orphan_walk   = orphan_walk_fault;
+    assign o_dbg_walk_phys     = walk_phys_q;
+    assign o_dbg_walk_start    = dmem_walk_start;
+    assign o_dbg_dmem_idle     = dmem_mmu_idle;
+    assign o_dbg_dlk_seen      = dlk_seen_q;
+    assign o_dbg_dlk_genuine   = dlk_genuine_q;
+    assign o_dbg_dlk_inj       = dlk_inj_q;
+    assign o_dbg_dlk_stval     = dlk_stval_q;
+    assign o_dbg_dlk_pc        = dlk_pc_q;
+    assign o_dbg_dlk_walkpc    = dlk_walkpc_q;
     assign o_dbg_csr_sum       = csr_sum;
     assign o_dbg_csr_mxr       = csr_mxr;
     assign o_dbg_csr_dmem_priv = if dmem_eff_priv == csr_pkg::PrivLevel::MACHINE ?
