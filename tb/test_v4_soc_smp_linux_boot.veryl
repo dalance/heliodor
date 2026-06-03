@@ -38,6 +38,72 @@ module test_v4_soc_smp_linux_boot_harness #(
     o_isepc1  : output logic<64>,
     o_istval1 : output logic<64>,
     o_cy   : output logic<32>,
+    // M9.3 secondary-stack trace outputs.
+    o_h1_sp      : output logic<64>, // hart1 current committed sp (arch_regs[2])
+    o_h1_sp_ld   : output logic<64>, // sp value retired by `ld sp,0(a4)` @PA 0x8000109c
+    o_h1_sp_ld_cy: output logic<32>, // cycle of the (last) such retire
+    o_h1_sp_ld_n : output logic<32>, // how many times that ld-sp retired on hart1
+    o_h1_tp_ld   : output logic<64>, // tp value retired by `ld tp,0(a5)` @PA 0x800010a0
+    o_cuse_lo    : output logic<32>, // live DRAM __cpu_up_stack_pointer[1] low32  (PA 0x80a0bd08)
+    o_cuse_hi    : output logic<32>, // live DRAM __cpu_up_stack_pointer[1] high32 (PA 0x80a0bd0c)
+    o_cutp_lo    : output logic<32>, // live DRAM __cpu_up_task_pointer[1]  low32  (PA 0x80a0bd18)
+    o_cutp_hi    : output logic<32>, // live DRAM __cpu_up_task_pointer[1]  high32 (PA 0x80a0bd1c)
+    o_cuse_wcy   : output logic<32>, // cycle DRAM __cpu_up_stack_pointer[1] first became nonzero
+    o_cuse_wval  : output logic<64>, // value DRAM __cpu_up_stack_pointer[1] first became (nonzero)
+    // First "real" hart1 trap (sepc outside the fake_ifault PC and the handler
+    // range) = the root fault that leads to the storm, with sp/tp at that point.
+    o_rt_cause : output logic<64>,
+    o_rt_sepc  : output logic<64>,
+    o_rt_stval : output logic<64>,
+    o_rt_sp    : output logic<64>,
+    o_rt_tp    : output logic<64>,
+    o_rt_cy    : output logic<32>,
+    // First moment hart1's committed sp goes "garbage" (top word all-ones or
+    // < 0x1000) after the valid secondary ld-sp — the instruction that clobbers
+    // the stack pointer, with the value it wrote and the PC that wrote it.
+    o_sc_pc    : output logic<64>,
+    o_sc_val   : output logic<64>,
+    o_sc_cy    : output logic<32>,
+    o_sc_satp  : output logic<64>, // satp at the corruption (0 ⇒ still in firmware/Bare)
+    // handle_exception path diagnosis. sscratch-at-trap is read non-invasively as
+    // the value `csrrw tp,sscratch,tp` (PC 0x800025ac, rd=tp=x4) commits — nonzero
+    // ⇒ handler takes the "from user" path and SKIPS saving kernel_sp.
+    o_fhe_cause : output logic<64>, // FIRST handle_exception trap cause
+    o_fhe_sepc  : output logic<64>, // FIRST handle_exception sepc
+    o_fhe_sscr  : output logic<64>, // sscratch at FIRST handle_exception entry
+    o_fhe_cy    : output logic<32>,
+    o_fhe_cnt   : output logic<32>, // # handle_exception entries before sp-corruption
+    o_scx_cause : output logic<64>, // cause of the trap whose handler corrupted sp
+    o_scx_sepc  : output logic<64>, // sepc of that trap
+    o_scx_sscr  : output logic<64>, // sscratch at that trap (proves user vs kernel path)
+    // sp/tp captured at the FIRST load-PF @0x800d7740 (printk) — the corrupting
+    // trap's faulting context: was sp already garbage, or still a valid stack?
+    o_pf_sp    : output logic<64>,
+    o_pf_tp    : output logic<64>,
+    o_pf_stval : output logic<64>, // faulting addr of the first printk load-PF
+    o_pf_seen  : output logic    ,
+    // kernel_sp backing store (PA 0x80ca5810 = tp+16 for this deterministic run).
+    // Live DRAM value + the last write the bus carried to it (the handler's
+    // `sd sp,16(tp)` write-through). If the last write was a valid sp but the
+    // handler's reload got 0x15, the load read stale data (store→load / bus race).
+    o_ks_lo    : output logic<32>,
+    o_ks_hi    : output logic<32>,
+    o_ks_wval  : output logic<64>, // last bus write value to PA 0x80ca5810
+    o_ks_wcy   : output logic<32>,
+    // Ring of the last 8 hart1 sp commits (pc,val) up to the corruption, frozen
+    // when sp first goes garbage — shows the sp trajectory / the culprit write.
+    o_ring_pc  : output logic<64> [8],
+    o_ring_val : output logic<64> [8],
+    // hart1 DMMU state latched at its FIRST dmem fault after secondary entry =
+    // the spurious printk load-PF. dtlb_hit + ppn/perm reveal whether the stack
+    // page's translation is WRONG (DTLB/PTW corruption) vs a real fault.
+    o_df_tlb_hit : output logic    ,
+    o_df_tlb_ppn : output logic<44>,
+    o_df_tlb_perm: output logic<4> ,
+    o_df_ptw_addr: output logic<64>,
+    o_df_pte     : output logic<64>,
+    o_df_cy      : output logic<32>,
+    o_df_seen    : output logic    ,
 ) {
     // Per-hart instruction fetch + PTW (tb-served from shared memory).
     var imem_addr : logic<64> [N_HARTS];
@@ -68,6 +134,18 @@ module test_v4_soc_smp_linux_boot_harness #(
     var dbg_stvec     : logic<64> [N_HARTS];
     var dbg_mtvec     : logic<64> [N_HARTS];
     var dbg_trap_to_s : logic     [N_HARTS];
+    var dbg_sp        : logic<64> [N_HARTS];
+    var dbg_tp        : logic<64> [N_HARTS];
+    var dbg_dmem_fault: logic     [N_HARTS];
+    var dbg_dtlb_hit  : logic     [N_HARTS];
+    var dbg_dtlb_ppn  : logic<44> [N_HARTS];
+    var dbg_dtlb_perm : logic<4>  [N_HARTS];
+    var dbg_dptw_addr : logic<64> [N_HARTS];
+    var dbg_dpte      : logic<64> [N_HARTS];
+    var dbg_retire_pc : logic<64> [N_HARTS];
+    var dbg_retire_rdv: logic     [N_HARTS];
+    var dbg_retire_rd : logic<5>  [N_HARTS];
+    var dbg_retire_dat: logic<64> [N_HARTS];
 
     inst dut: heliodor_soc_v4_smp #(
         N_HARTS : N_HARTS      ,
@@ -102,6 +180,18 @@ module test_v4_soc_smp_linux_boot_harness #(
         o_dbg_stvec     : dbg_stvec     ,
         o_dbg_mtvec     : dbg_mtvec     ,
         o_dbg_trap_to_s : dbg_trap_to_s ,
+        o_dbg_sp        : dbg_sp        ,
+        o_dbg_tp        : dbg_tp        ,
+        o_dbg_dmem_fault: dbg_dmem_fault,
+        o_dbg_dtlb_hit  : dbg_dtlb_hit  ,
+        o_dbg_dtlb_ppn  : dbg_dtlb_ppn  ,
+        o_dbg_dtlb_perm : dbg_dtlb_perm ,
+        o_dbg_dptw_addr : dbg_dptw_addr ,
+        o_dbg_dpte      : dbg_dpte      ,
+        o_dbg_retire_pc : dbg_retire_pc ,
+        o_dbg_retire_rdv: dbg_retire_rdv,
+        o_dbg_retire_rd : dbg_retire_rd ,
+        o_dbg_retire_dat: dbg_retire_dat,
     );
 
     // Firmware ROM (16 KB) + DRAM (32 MB), shared by both harts.
@@ -315,6 +405,288 @@ module test_v4_soc_smp_linux_boot_harness #(
     assign o_pc0   = dbg_pc[0];
     assign o_pc1   = dbg_pc[1];
     assign o_pass  = dbg_r3[0] == 64'h00000000000000aa;
+
+    // ============================================================
+    // M9.3 secondary-stack trace captures.
+    //
+    // hart1's secondary entry (secondary_start_sbi) runs at PA — MMU is off
+    // until relocate_enable_mmu later in the same routine:
+    //   PA 0x8000109c: ld sp, 0(a4)   a4 = &__cpu_up_stack_pointer[hartid]
+    //   PA 0x800010a0: ld tp, 0(a5)   a5 = &__cpu_up_task_pointer[hartid]
+    // __cpu_up_stack_pointer = PA 0x80a0bd00 → hart1 slot = PA 0x80a0bd08.
+    // __cpu_up_task_pointer  = PA 0x80a0bd10 → hart1 slot = PA 0x80a0bd18.
+    //
+    // We latch the value hart1 actually retired into sp/tp (ground truth from
+    // its pipeline) plus the live DRAM backing of those slots, so we can tell
+    // whether the secondary read a valid kernel stack or a stale/garbage value.
+    // ============================================================
+    var h1_sp_ld   : logic<64>;
+    var h1_sp_ld_cy: logic<32>;
+    var h1_sp_ld_n : logic<32>;
+    var h1_tp_ld   : logic<64>;
+    var cuse_wcy   : logic<32>;
+    var cuse_wval  : logic<64>;
+    var cuse_seen  : logic    ;
+    var rt_cause: logic<64>;
+    var rt_sepc : logic<64>;
+    var rt_stval: logic<64>;
+    var rt_sp   : logic<64>;
+    var rt_tp   : logic<64>;
+    var rt_cy   : logic<32>;
+    var rt_seen : logic    ;
+    var sc_pc   : logic<64>;
+    var sc_val  : logic<64>;
+    var sc_cy   : logic<32>;
+    var sc_satp : logic<64>;
+    var sc_seen : logic    ;
+    // handle_exception (PC 0x800025ac) running context.
+    var last_sscr   : logic<64>; // most recent sscratch-at-trap (post-csrrw tp value)
+    var last_he_cause: logic<64>;
+    var last_he_sepc : logic<64>;
+    var he_cnt      : logic<32>;
+    var fhe_cause: logic<64>;
+    var fhe_sepc : logic<64>;
+    var fhe_sscr : logic<64>;
+    var fhe_cy   : logic<32>;
+    var fhe_seen : logic    ;
+    var fhe_cnt  : logic<32>; // he_cnt snapshot at sp-corruption
+    var scx_cause: logic<64>;
+    var scx_sepc : logic<64>;
+    var scx_sscr : logic<64>;
+    var pf_sp   : logic<64>;
+    var pf_tp   : logic<64>;
+    var pf_stval: logic<64>;
+    var pf_seen : logic    ;
+    var ks_wval : logic<64>;
+    var ks_wcy  : logic<32>;
+    var ring_pc : logic<64> [8];
+    var ring_val: logic<64> [8];
+    var df_tlb_hit : logic    ;
+    var df_tlb_ppn : logic<44>;
+    var df_tlb_perm: logic<4> ;
+    var df_ptw_addr: logic<64>;
+    var df_pte     : logic<64>;
+    var df_cy      : logic<32>;
+    var df_seen    : logic    ;
+    let ks_lo_w : logic<32> = dram[23'h329604]; // PA 0x80ca5810 kernel_sp lo
+    let ks_hi_w : logic<32> = dram[23'h329605]; // PA 0x80ca5814 kernel_sp hi
+    // Live DRAM words (DRAM index = PA[24:2]); 0x80a0bd08>>2 = 0x282f42, etc.
+    let cuse_lo_w: logic<32> = dram[23'h282f42]; // PA 0x80a0bd08 __cpu_up_stack_pointer[1] lo
+    let cuse_hi_w: logic<32> = dram[23'h282f43]; // PA 0x80a0bd0c                            hi
+    let cutp_lo_w: logic<32> = dram[23'h282f46]; // PA 0x80a0bd18 __cpu_up_task_pointer[1]  lo
+    let cutp_hi_w: logic<32> = dram[23'h282f47]; // PA 0x80a0bd1c                            hi
+    always_ff (clk, rst) {
+        if_reset {
+            h1_sp_ld    = 64'd0;
+            h1_sp_ld_cy = 32'd0;
+            h1_sp_ld_n  = 32'd0;
+            h1_tp_ld    = 64'd0;
+            cuse_wcy    = 32'd0;
+            cuse_wval   = 64'd0;
+            cuse_seen   = 1'b0;
+            rt_cause    = 64'd0;
+            rt_sepc     = 64'd0;
+            rt_stval    = 64'd0;
+            rt_sp       = 64'd0;
+            rt_tp       = 64'd0;
+            rt_cy       = 32'd0;
+            rt_seen     = 1'b0;
+            sc_pc       = 64'd0;
+            sc_val      = 64'd0;
+            sc_cy       = 32'd0;
+            sc_satp     = 64'd0;
+            sc_seen     = 1'b0;
+            last_sscr    = 64'd0;
+            last_he_cause= 64'd0;
+            last_he_sepc = 64'd0;
+            he_cnt       = 32'd0;
+            fhe_cause   = 64'd0;
+            fhe_sepc    = 64'd0;
+            fhe_sscr    = 64'd0;
+            fhe_cy      = 32'd0;
+            fhe_seen    = 1'b0;
+            fhe_cnt     = 32'd0;
+            scx_cause   = 64'd0;
+            scx_sepc    = 64'd0;
+            scx_sscr    = 64'd0;
+            pf_sp       = 64'd0;
+            pf_tp       = 64'd0;
+            pf_stval    = 64'd0;
+            pf_seen     = 1'b0;
+            ks_wval     = 64'd0;
+            ks_wcy      = 32'd0;
+            for k in 0..8 {
+                ring_pc[k]  = 64'd0;
+                ring_val[k] = 64'd0;
+            }
+            df_tlb_hit  = 1'b0;
+            df_tlb_ppn  = 44'd0;
+            df_tlb_perm = 4'd0;
+            df_ptw_addr = 64'd0;
+            df_pte      = 64'd0;
+            df_cy       = 32'd0;
+            df_seen     = 1'b0;
+        } else {
+            // hart1 retires `ld sp,0(a4)` @PA 0x8000109c → captured sp value.
+            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd2 && dbg_retire_pc[1][31:0] == 32'h8000_109c {
+                h1_sp_ld    = dbg_retire_dat[1];
+                h1_sp_ld_cy = cy;
+                h1_sp_ld_n  = h1_sp_ld_n + 32'd1;
+            }
+            // hart1 retires `ld tp,0(a5)` @PA 0x800010a0 → captured tp value.
+            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd4 && dbg_retire_pc[1][31:0] == 32'h8000_10a0 {
+                h1_tp_ld = dbg_retire_dat[1];
+            }
+            // First moment DRAM __cpu_up_stack_pointer[1] becomes nonzero — i.e.
+            // hart0's WRITE_ONCE actually reached DRAM behind the shared L2.
+            if !cuse_seen && (cuse_lo_w != 32'd0 || cuse_hi_w != 32'd0) {
+                cuse_seen = 1'b1;
+                cuse_wcy  = cy;
+                cuse_wval = {cuse_hi_w, cuse_lo_w};
+            }
+            // First "real" hart1 trap: not the benign fake_ifault (sepc 0x80001040)
+            // and not a re-fault inside handle_exception [0x800025ac,0x80002600].
+            // Snapshot sp/tp so we can tell whether they were already trashed
+            // BEFORE this trap (corruption in normal exec) or still valid (a
+            // legit fault the handler then mishandles).
+            if dbg_trap_fire[1] && !rt_seen
+                && dbg_trap_pc[1][31:0] != 32'h8000_1040
+                && !(dbg_trap_pc[1][31:0] >= 32'h8000_25ac && dbg_trap_pc[1][31:0] <= 32'h8000_2600) {
+                rt_seen  = 1'b1;
+                rt_cause = dbg_trap_cause[1];
+                rt_sepc  = dbg_trap_pc[1];
+                rt_stval = dbg_stval[1];
+                rt_sp    = dbg_sp[1];
+                rt_tp    = dbg_tp[1];
+                rt_cy    = cy;
+            }
+            // Track handle_exception (PC 0x800025ac) entries: count them, and read
+            // sscratch-at-trap non-invasively as the value the entry csrrw commits
+            // into tp (PC 0x800025ac, rd=x4) — that equals the OLD sscratch.
+            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd4 && dbg_retire_pc[1][31:0] == 32'h8000_25ac {
+                he_cnt    = he_cnt + 32'd1;
+                last_sscr = dbg_retire_dat[1];
+                if !fhe_seen {
+                    fhe_seen = 1'b1;
+                    fhe_sscr = dbg_retire_dat[1];
+                    fhe_cy   = cy;
+                }
+            }
+            // Track the most recent S-mode trap that targets handle_exception
+            // (stvec == 0x800025ac), capturing its cause/sepc + first occurrence.
+            if dbg_trap_fire[1] && dbg_trap_to_s[1] && dbg_stvec[1][31:0] == 32'h8000_25ac {
+                last_he_cause = dbg_trap_cause[1];
+                last_he_sepc  = dbg_trap_pc[1];
+                if fhe_cause == 64'd0 {
+                    fhe_cause = dbg_trap_cause[1];
+                    fhe_sepc  = dbg_trap_pc[1];
+                }
+            }
+            // First hart1 sp commit that goes "garbage" after the valid secondary
+            // ld-sp — the instruction that clobbers the stack pointer. Garbage =
+            // >= 0xfffffffff0000000 (top 36 bits set) or < 0x1000; this excludes
+            // the valid linear-map stack (0xffffffe0_xxxxxxxx) and any kernel-image
+            // stack (0xffffffff8_xxxxxxx, top nibble 8 not f). Snapshot the trap
+            // context (cause/sepc/sscratch) responsible for this handler entry.
+            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd2
+                && h1_sp_ld_n != 32'd0 && !sc_seen
+                && (dbg_retire_dat[1][63:28] == 36'hf_ffff_ffff || dbg_retire_dat[1] <: 64'h1000) {
+                sc_seen   = 1'b1;
+                sc_pc     = dbg_retire_pc[1];
+                sc_val    = dbg_retire_dat[1];
+                sc_cy     = cy;
+                sc_satp   = dbg_satp[1];
+                scx_cause = last_he_cause;
+                scx_sepc  = last_he_sepc;
+                scx_sscr  = last_sscr;
+                fhe_cnt   = he_cnt;
+            }
+            // sp/tp at the FIRST printk load-PF (cause 13 @ 0x800d7740) — the
+            // corrupting trap's faulting context.
+            if dbg_trap_fire[1] && !pf_seen && dbg_trap_cause[1] == 64'd13 && dbg_trap_pc[1][31:0] == 32'h800d_7740 {
+                pf_seen  = 1'b1;
+                pf_sp    = dbg_sp[1];
+                pf_tp    = dbg_tp[1];
+                pf_stval = dbg_stval[1];
+            }
+            // Last bus write the shared dmem carried to the kernel_sp slot
+            // PA 0x80ca5810 (the handler's write-through `sd sp,16(tp)`).
+            if dmem_wen && in_dram && (dmem_addr[31:3] == 29'h1019_4b02) {
+                ks_wval = dmem_wdata;
+                ks_wcy  = cy;
+            }
+            // hart1 DMMU state at its FIRST dmem fault after secondary entry — the
+            // spurious printk load-PF. dtlb_hit=1 with wrong ppn/perm ⇒ DTLB holds a
+            // corrupt entry; dtlb_hit=0 ⇒ it walked (dpte = the PTE it read).
+            if dbg_dmem_fault[1] && !df_seen && h1_sp_ld_n != 32'd0 {
+                df_seen     = 1'b1;
+                df_tlb_hit  = dbg_dtlb_hit[1];
+                df_tlb_ppn  = dbg_dtlb_ppn[1];
+                df_tlb_perm = dbg_dtlb_perm[1];
+                df_ptw_addr = dbg_dptw_addr[1];
+                df_pte      = dbg_dpte[1];
+                df_cy       = cy;
+            }
+            // Ring of the last 8 hart1 sp commits (pc,val); freeze once sp first
+            // goes garbage so it retains the trajectory INTO the corruption.
+            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd2 && !sc_seen {
+                for k in 0..7 {
+                    ring_pc[k]  = ring_pc[k + 1];
+                    ring_val[k] = ring_val[k + 1];
+                }
+                ring_pc[7]  = dbg_retire_pc[1];
+                ring_val[7] = dbg_retire_dat[1];
+            }
+        }
+    }
+    assign o_h1_sp       = dbg_sp[1];
+    assign o_h1_sp_ld    = h1_sp_ld;
+    assign o_h1_sp_ld_cy = h1_sp_ld_cy;
+    assign o_h1_sp_ld_n  = h1_sp_ld_n;
+    assign o_h1_tp_ld    = h1_tp_ld;
+    assign o_cuse_lo     = cuse_lo_w;
+    assign o_cuse_hi     = cuse_hi_w;
+    assign o_cutp_lo     = cutp_lo_w;
+    assign o_cutp_hi     = cutp_hi_w;
+    assign o_cuse_wcy    = cuse_wcy;
+    assign o_cuse_wval   = cuse_wval;
+    assign o_rt_cause    = rt_cause;
+    assign o_rt_sepc     = rt_sepc;
+    assign o_rt_stval    = rt_stval;
+    assign o_rt_sp       = rt_sp;
+    assign o_rt_tp       = rt_tp;
+    assign o_rt_cy       = rt_cy;
+    assign o_sc_pc       = sc_pc;
+    assign o_sc_val      = sc_val;
+    assign o_sc_cy       = sc_cy;
+    assign o_sc_satp     = sc_satp;
+    assign o_fhe_cause   = fhe_cause;
+    assign o_fhe_sepc    = fhe_sepc;
+    assign o_fhe_sscr    = fhe_sscr;
+    assign o_fhe_cy      = fhe_cy;
+    assign o_fhe_cnt     = fhe_cnt;
+    assign o_scx_cause   = scx_cause;
+    assign o_scx_sepc    = scx_sepc;
+    assign o_scx_sscr    = scx_sscr;
+    assign o_pf_sp       = pf_sp;
+    assign o_pf_tp       = pf_tp;
+    assign o_pf_stval    = pf_stval;
+    assign o_pf_seen     = pf_seen;
+    assign o_ks_lo       = ks_lo_w;
+    assign o_ks_hi       = ks_hi_w;
+    assign o_ks_wval     = ks_wval;
+    assign o_ks_wcy      = ks_wcy;
+    for k in 0..8 :gen_ring {
+        assign o_ring_pc[k]  = ring_pc[k];
+        assign o_ring_val[k] = ring_val[k];
+    }
+    assign o_df_tlb_hit  = df_tlb_hit;
+    assign o_df_tlb_ppn  = df_tlb_ppn;
+    assign o_df_tlb_perm = df_tlb_perm;
+    assign o_df_ptw_addr = df_ptw_addr;
+    assign o_df_pte      = df_pte;
+    assign o_df_cy       = df_cy;
+    assign o_df_seen     = df_seen;
 }
 
 #[test(test_v4_soc_smp_linux_boot)]
@@ -346,6 +718,52 @@ module test_v4_soc_smp_linux_boot {
     var isepc1 : logic<64>;
     var istval1: logic<64>;
     var cy     : logic<32>;
+    var h1_sp      : logic<64>;
+    var h1_sp_ld   : logic<64>;
+    var h1_sp_ld_cy: logic<32>;
+    var h1_sp_ld_n : logic<32>;
+    var h1_tp_ld   : logic<64>;
+    var cuse_lo    : logic<32>;
+    var cuse_hi    : logic<32>;
+    var cutp_lo    : logic<32>;
+    var cutp_hi    : logic<32>;
+    var cuse_wcy   : logic<32>;
+    var cuse_wval  : logic<64>;
+    var rt_cause: logic<64>;
+    var rt_sepc : logic<64>;
+    var rt_stval: logic<64>;
+    var rt_sp   : logic<64>;
+    var rt_tp   : logic<64>;
+    var rt_cy   : logic<32>;
+    var sc_pc   : logic<64>;
+    var sc_val  : logic<64>;
+    var sc_cy   : logic<32>;
+    var sc_satp : logic<64>;
+    var fhe_cause: logic<64>;
+    var fhe_sepc : logic<64>;
+    var fhe_sscr : logic<64>;
+    var fhe_cy   : logic<32>;
+    var fhe_cnt  : logic<32>;
+    var scx_cause: logic<64>;
+    var scx_sepc : logic<64>;
+    var scx_sscr : logic<64>;
+    var pf_sp   : logic<64>;
+    var pf_tp   : logic<64>;
+    var pf_stval: logic<64>;
+    var pf_seen : logic    ;
+    var ks_lo   : logic<32>;
+    var ks_hi   : logic<32>;
+    var ks_wval : logic<64>;
+    var ks_wcy  : logic<32>;
+    var ring_pc : logic<64> [8];
+    var ring_val: logic<64> [8];
+    var df_tlb_hit : logic    ;
+    var df_tlb_ppn : logic<44>;
+    var df_tlb_perm: logic<4> ;
+    var df_ptw_addr: logic<64>;
+    var df_pte     : logic<64>;
+    var df_cy      : logic<32>;
+    var df_seen    : logic    ;
 
     inst harness: test_v4_soc_smp_linux_boot_harness (
         clk             ,
@@ -373,6 +791,52 @@ module test_v4_soc_smp_linux_boot {
         o_isepc1 : isepc1 ,
         o_istval1: istval1,
         o_cy    : cy     ,
+        o_h1_sp      : h1_sp      ,
+        o_h1_sp_ld   : h1_sp_ld   ,
+        o_h1_sp_ld_cy: h1_sp_ld_cy,
+        o_h1_sp_ld_n : h1_sp_ld_n ,
+        o_h1_tp_ld   : h1_tp_ld   ,
+        o_cuse_lo    : cuse_lo    ,
+        o_cuse_hi    : cuse_hi    ,
+        o_cutp_lo    : cutp_lo    ,
+        o_cutp_hi    : cutp_hi    ,
+        o_cuse_wcy   : cuse_wcy   ,
+        o_cuse_wval  : cuse_wval  ,
+        o_rt_cause : rt_cause,
+        o_rt_sepc  : rt_sepc ,
+        o_rt_stval : rt_stval,
+        o_rt_sp    : rt_sp   ,
+        o_rt_tp    : rt_tp   ,
+        o_rt_cy    : rt_cy   ,
+        o_sc_pc    : sc_pc   ,
+        o_sc_val   : sc_val  ,
+        o_sc_cy    : sc_cy   ,
+        o_sc_satp  : sc_satp ,
+        o_fhe_cause: fhe_cause,
+        o_fhe_sepc : fhe_sepc ,
+        o_fhe_sscr : fhe_sscr ,
+        o_fhe_cy   : fhe_cy   ,
+        o_fhe_cnt  : fhe_cnt  ,
+        o_scx_cause: scx_cause,
+        o_scx_sepc : scx_sepc ,
+        o_scx_sscr : scx_sscr ,
+        o_pf_sp    : pf_sp    ,
+        o_pf_tp    : pf_tp    ,
+        o_pf_stval : pf_stval ,
+        o_pf_seen  : pf_seen  ,
+        o_ks_lo    : ks_lo    ,
+        o_ks_hi    : ks_hi    ,
+        o_ks_wval  : ks_wval  ,
+        o_ks_wcy   : ks_wcy   ,
+        o_ring_pc  : ring_pc  ,
+        o_ring_val : ring_val ,
+        o_df_tlb_hit : df_tlb_hit ,
+        o_df_tlb_ppn : df_tlb_ppn ,
+        o_df_tlb_perm: df_tlb_perm,
+        o_df_ptw_addr: df_ptw_addr,
+        o_df_pte     : df_pte     ,
+        o_df_cy      : df_cy      ,
+        o_df_seen    : df_seen    ,
     );
 
     initial {
@@ -384,8 +848,15 @@ module test_v4_soc_smp_linux_boot {
             clk.next(10000);
             if _i % 1000 == 0 {
                 $display("  [smp probe] cy=%h h0_pc=%h h1_pc=%h ret0=%h ret1=%h trap0=%h trap1=%h h1cause=%h h1tpc=%h", cy, pc0, pc1, ret0, ret1, trapc0, trapc1, tcause1, tpc1);
+                $display("    [stack ] h1_sp=%h | h1_sp_ld=%h (cy=%h n=%h) h1_tp_ld=%h | DRAM cuse[1]=%h%h cutp[1]=%h%h", h1_sp, h1_sp_ld, h1_sp_ld_cy, h1_sp_ld_n, h1_tp_ld, cuse_hi, cuse_lo, cutp_hi, cutp_lo);
             }
             if pass {
+                break;
+            }
+            // Early exit once the sp-corruption has been captured (+margin) — the
+            // storm steady-state adds nothing, and stopping at ~corruption+1M
+            // cycles cuts this debug run from ~100M to ~17M cycles.
+            if sc_cy != 32'd0 && cy >: sc_cy + 32'd1000000 {
                 break;
             }
         }
@@ -393,6 +864,26 @@ module test_v4_soc_smp_linux_boot {
         $display("  hart1 trap: first_cause=%h first_pc=%h last_cause=%h last_tpc=%h stval=%h | satp0=%h satp1=%h", fcause1, fpc1, tcause1, tpc1, stval1, satp0, satp1);
         $display("  hart1 first-trap vectors: stvec=%h mtvec=%h trap_to_s=%b", fstvec1, fmtvec1, ftos1);
         $display("  hart1 storm-initiator (sepc outside handler): cause=%h sepc=%h stval=%h", icause1, isepc1, istval1);
+        // M9.3 secondary-stack trace summary: the value hart1 loaded into sp/tp at
+        // secondary_start_sbi vs. when DRAM's __cpu_up_stack_pointer[1] went live.
+        $display("  hart1 secondary stack: ld-sp=%h @cy=%h (loaded %h times) ld-tp=%h", h1_sp_ld, h1_sp_ld_cy, h1_sp_ld_n, h1_tp_ld);
+        $display("  __cpu_up_stack_pointer[1] DRAM: live=%h%h first-nonzero=%h @cy=%h | __cpu_up_task_pointer[1]=%h%h", cuse_hi, cuse_lo, cuse_wval, cuse_wcy, cutp_hi, cutp_lo);
+        // Root fault + stack-corruption pinpoint.
+        $display("  hart1 FIRST-REAL-trap: cause=%h sepc=%h stval=%h | sp@trap=%h tp@trap=%h @cy=%h", rt_cause, rt_sepc, rt_stval, rt_sp, rt_tp, rt_cy);
+        $display("  hart1 sp-CORRUPTION: pc=%h wrote sp=%h @cy=%h satp=%h", sc_pc, sc_val, sc_cy, sc_satp);
+        // handle_exception path: sscratch nonzero at entry ⇒ "from user" path ⇒
+        // kernel_sp save skipped ⇒ ld sp,16(tp) returns garbage.
+        $display("  hart1 FIRST handle_exception: cause=%h sepc=%h sscratch@entry=%h @cy=%h", fhe_cause, fhe_sepc, fhe_sscr, fhe_cy);
+        $display("  hart1 CORRUPTING trap: cause=%h sepc=%h sscratch@entry=%h | he_entries_before=%h", scx_cause, scx_sepc, scx_sscr, fhe_cnt);
+        $display("  printk-PF context: sp@fault=%h tp@fault=%h stval(faultaddr)=%h seen=%b (sp+40=expected)", pf_sp, pf_tp, pf_stval, pf_seen);
+        // DMMU state at hart1's first dmem fault: a WRONG ppn/perm for the (valid,
+        // mapped) faulting stack page ⇒ DTLB/PTW corruption (the SMP coherence bug).
+        $display("  hart1 first-dmem-fault DMMU: tlb_hit=%b tlb_ppn=%h tlb_perm=%h ptw_addr=%h pte=%h @cy=%h seen=%b", df_tlb_hit, df_tlb_ppn, df_tlb_perm, df_ptw_addr, df_pte, df_cy, df_seen);
+        $display("  kernel_sp slot (PA 0x80ca5810): live DRAM=%h%h | last bus write=%h @cy=%h", ks_hi, ks_lo, ks_wval, ks_wcy);
+        $display("  hart1 sp-commit ring (oldest..newest, pc=val), frozen at first garbage sp:");
+        for k in 0..8 {
+            $display("    ring[%h] pc=%h sp=%h", k, ring_pc[k], ring_val[k]);
+        }
         $finish();
     }
 }
