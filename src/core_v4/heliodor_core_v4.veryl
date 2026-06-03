@@ -176,6 +176,7 @@ pub module heliodor_core_v4 #(
     o_dbg_walk_rob  : output logic<5> ,
     o_dbg_walk_vaddr: output logic<64>,
     o_dbg_lfault_inj: output logic    ,
+    o_dbg_orphan_walk: output logic   ,
     // M9.A.298: CSR translation-state snoop. The MMU's permission check for a
     // U=1 page load in S-mode reduces to tlb_u_ok = i_sum. A TLB-hit load
     // page-fault therefore implies csr_sum==0 at translate time. Exposing the
@@ -274,6 +275,12 @@ pub module heliodor_core_v4 #(
     var walk_rob_q       : logic<5> ;
     var walk_vaddr_q     : logic<64>;
     var walk_is_store_q  : logic    ; // M9.A.299: walk started by a commit-store
+    // M9.3 SMP: physical PTW-walk-in-progress, tracked INDEPENDENTLY of the owner
+    // (walk_v_q clears on a redirect; walk_phys_q does not). walk_phys_q && !walk_v_q
+    // at a fault ⇒ an ORPHAN walk (its owner was squashed mid-walk) — its fault must
+    // not leak to the current valid issue via the CDB. SMP exposes this because
+    // hart1's bus contention stretches walks long enough to outlive a redirect.
+    var walk_phys_q      : logic    ;
     var lfault_inj_v     : logic    ; // fault delivery to walk owner this cycle
     var rob_cdb_is_lfault: logic    ; // cdb.is_lfault with mis-attribution removed
     // M5.D: medeleg needed by trap_to_s computation in commit stage.
@@ -1800,6 +1807,23 @@ pub module heliodor_core_v4 #(
             walk_v_q = 1'b0;
         }
     }
+    // M9.3 SMP: track the PHYSICAL walk in the dmem_mmu independently of the
+    // owner. Unlike walk_v_q this does NOT clear on a redirect, only when the
+    // walk actually finishes (busy drops / faults). So walk_phys_q && !walk_v_q
+    // marks a walk whose owner was squashed mid-flight = an ORPHAN walk.
+    always_ff (clk, rst) {
+        if_reset {
+            walk_phys_q = 1'b0;
+        } else if dmem_walk_start {
+            walk_phys_q = 1'b1;
+        } else if walk_phys_q && !dmem_mmu_busy {
+            walk_phys_q = 1'b0;
+        }
+    }
+    // An orphan-walk fault: a physical walk is faulting but its owner is gone
+    // (walk_v_q cleared by an intervening redirect). Its VA belongs to a
+    // squashed wrong-path load, so the fault is spurious and must be dropped.
+    let orphan_walk_fault: logic = dmem_mmu_fault && walk_phys_q && !walk_v_q;
     // Deliver the load fault to the walk owner when a LOAD walk faults. Store
     // walk faults (walk_is_store_q) are handled at commit (commit_store_sfault).
     assign lfault_inj_v = dmem_mmu_fault && walk_v_q && !walk_is_store_q;
@@ -1807,6 +1831,11 @@ pub module heliodor_core_v4 #(
     // fault to a different (current-issue) rob_idx. If the current issue IS
     // the owner, or there is no tracked walk (e.g. a direct TLB-permission
     // fault on the current issue), the CDB tag stands.
+    // NOTE (M9.3): orphan_walk_fault is kept as a DEBUG-ONLY observable. The
+    // N=2 storm does NOT leak via this CDB path (orphan suppression had no
+    // effect); it leaks via the lfault_inj ROB-inject port with walk_v_q=1 and
+    // a STALE walk_vaddr_q (back-to-back-walk VA inheritance). So we leave the
+    // committed behaviour at baseline here.
     assign rob_cdb_is_lfault = cdb.is_lfault && (!walk_v_q || cdb.rob_idx == walk_rob_q);
 
     // ============================================================
@@ -2009,6 +2038,7 @@ pub module heliodor_core_v4 #(
     assign o_dbg_walk_rob      = walk_rob_q;
     assign o_dbg_walk_vaddr    = walk_vaddr_q;
     assign o_dbg_lfault_inj    = lfault_inj_v;
+    assign o_dbg_orphan_walk   = orphan_walk_fault;
     assign o_dbg_csr_sum       = csr_sum;
     assign o_dbg_csr_mxr       = csr_mxr;
     assign o_dbg_csr_dmem_priv = if dmem_eff_priv == csr_pkg::PrivLevel::MACHINE ?
