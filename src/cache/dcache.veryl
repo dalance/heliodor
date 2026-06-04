@@ -26,6 +26,15 @@ pub module dcache (
     // fills the next line too (a second sequential fill) so o_rdata_next is
     // valid before o_stall drops. Same-line spans need no extra fill. Tie 0.
     i_load_next: input logic,
+    // M9.4 SMP: this read is an AMO/LR value-capture (read-for-RMW). The bus
+    // amo_inflight lock serializes AMOs across harts, but a cache HIT returns
+    // data without a bus grant — so a hart locked out of the bus (not the
+    // amo_holder) could read a STALE cached value while a lower-id holder is
+    // mid-RMW, producing a lost update (observed as the N=4 stop_machine
+    // multi_cpu_stop ack-counter never reaching EXIT). On an AMO read that
+    // HITS, force the line to miss (invalidate + re-fill via the bus) so the
+    // value is fetched coherently under the lock. See amo_force_trigger below.
+    i_amo_read: input logic,
     o_rdata: output logic<64>,
     // M8.B: combinational read of the NEXT dword (at (i_addr&~7)+8), for v4
     // misaligned loads that span two dwords (mirrors the old i_dmem_rdata_next).
@@ -146,6 +155,18 @@ pub module dcache (
     var fill_aborted : logic    ; // remote invalidate hit the line being filled
     let fill_data_idx: logic<7>  = {fill_index, fill_count};
 
+    // M9.4 SMP AMO coherence: an AMO/LR read that HITS the cache must not return
+    // a possibly-stale line (a non-amo_holder hart is locked out of the bus but
+    // a hit needs no grant). Force such a read to miss: invalidate the hit way
+    // (registered below), which makes the next cycle a normal lo_miss → fill via
+    // the bus under the amo_inflight lock → coherent value. amo_filled_q is a
+    // one-shot guard: after that forced re-fill the line is fresh, so the
+    // post-fill hit must NOT re-trigger the force (else it loops forever). It is
+    // set when the fill completes for the pending AMO read and cleared when the
+    // AMO read request drops.
+    var amo_filled_q     : logic;
+    let amo_force_trigger: logic = i_amo_read && i_ren && cache_hit && state == State::IDLE && !amo_filled_q;
+
     // Invalidate decode (combinational from request port)
     let inv_tag  : logic<54> = i_inv_addr[63:10];
     let inv_index: logic<4>  = i_inv_addr[9:6];
@@ -211,6 +232,7 @@ pub module dcache (
             fill_way     = 2'd0;
             fill_offset  = 3'd0;
             fill_aborted = 1'b0;
+            amo_filled_q = 1'b0;
             for i in 0..16 {
                 valid_0[i] = 1'b0;
                 valid_1[i] = 1'b0;
@@ -220,6 +242,25 @@ pub module dcache (
         } else {
             case state {
                 State::IDLE: {
+                    // M9.4 SMP: force an AMO/LR read-HIT to miss by invalidating
+                    // the hit way. Next cycle cache_hit drops → lo_miss → the line
+                    // re-fills from the bus under the amo_inflight lock (coherent).
+                    // i_wen=0 for an AMO read phase, so this never races the write
+                    // block below; miss=0 here (still a hit) so no fill starts yet.
+                    if amo_force_trigger {
+                        if hit_0 {
+                            valid_0[index] = 1'b0;
+                        }
+                        if hit_1 {
+                            valid_1[index] = 1'b0;
+                        }
+                        if hit_2 {
+                            valid_2[index] = 1'b0;
+                        }
+                        if hit_3 {
+                            valid_3[index] = 1'b0;
+                        }
+                    }
                     // Phase 5: gate fill start and write-through on bus grant.
                     // Without grant we hold the IDLE state and stall the pipe;
                     // memory_bus arbitrates between harts and holds grant for
@@ -399,6 +440,16 @@ pub module dcache (
                     fill_aborted = 1'b1;
                 }
             }
+
+            // M9.4 SMP: AMO force-miss one-shot guard. Set when the forced
+            // re-fill for the pending AMO read completes (DONE) — the line is now
+            // fresh, so the post-fill hit must not re-trigger amo_force_trigger.
+            // Cleared when the AMO read request drops (next AMO re-arms the guard).
+            if !i_amo_read {
+                amo_filled_q = 1'b0;
+            } else if state == State::DONE {
+                amo_filled_q = 1'b1;
+            }
         }
     }
 
@@ -488,6 +539,6 @@ pub module dcache (
     let write_during_fill: logic = filling && i_wen;
     let write_wait_grant : logic = state == State::IDLE && i_wen && !amo_miss && !i_mem_grant;
     assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
-        || inv_hits_active;
+        || inv_hits_active || amo_force_trigger;
 
 }
