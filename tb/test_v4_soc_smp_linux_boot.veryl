@@ -9,9 +9,14 @@
 // Marked #[ignore] (long run). Run explicitly with:
 //   veryl test --ignored --test test_v4_soc_smp_linux_boot
 module test_v4_soc_smp_linux_boot_harness #(
-    param N_HARTS : u32    = 2                                   ,
-    param HEX_FW  : string = "test/hex/linux_boot_fw_2hart.hex"  ,
-    param HEX_DRAM: string = "test/hex/linux_dram_real_2hart.hex",
+    param N_HARTS   : u32    = 2                                   ,
+    param HEX_FW    : string = "test/hex/linux_boot_fw_2hart.hex"  ,
+    param HEX_DRAM  : string = "test/hex/linux_dram_real_2hart.hex",
+    // M9.4: gate the high-frequency hart1 cosim $display dumps (H1RET/H1TRC).
+    // Default 1 preserves the N=2 cosim stream; the N=4 boot run sets it 0 to
+    // avoid ~400k junk $display lines (hart1 is now a real kernel hart, not the
+    // 2hart-deadlock subject) and the associated simulation-time cost.
+    param COSIM_DUMP: bit    = 1                                   ,
 ) (
     clk : input clock,
     rst : input reset,
@@ -44,6 +49,12 @@ module test_v4_soc_smp_linux_boot_harness #(
     o_isp1    : output logic<64>,
     o_itp1    : output logic<64>,
     o_cy   : output logic<32>,
+    // M9.4 N=4: clean per-hart liveness arrays (PC + retire/trap counters) for
+    // ALL harts, so the N=4 top module can observe harts 2/3 without the N=2
+    // hart1-only forensic ports. Additive; the N=2 top module ignores these.
+    o_pc_all   : output logic<64> [N_HARTS],
+    o_ret_all  : output logic<32> [N_HARTS],
+    o_trapc_all: output logic<32> [N_HARTS],
     // M9.3 secondary-stack trace outputs.
     o_h1_sp      : output logic<64>, // hart1 current committed sp (arch_regs[2])
     o_h1_sp_ld   : output logic<64>, // sp value retired by `ld sp,0(a4)` @PA 0x8000109c
@@ -556,6 +567,30 @@ module test_v4_soc_smp_linux_boot_harness #(
     assign o_ret1   = ret1;
     assign o_trapc0 = trapc0;
     assign o_trapc1 = trapc1;
+
+    // M9.4 N=4: per-hart retire/trap counters for ALL harts (N-generic).
+    var ret_arr  : logic<32> [N_HARTS];
+    var trapc_arr: logic<32> [N_HARTS];
+    always_ff (clk, rst) {
+        if_reset {
+            for h in 0..N_HARTS {
+                ret_arr[h]   = 32'd0;
+                trapc_arr[h] = 32'd0;
+            }
+        } else {
+            for h in 0..N_HARTS {
+                if dbg_retire_v[h] {
+                    ret_arr[h] = ret_arr[h] + 32'd1;
+                }
+                if dbg_trap_fire[h] {
+                    trapc_arr[h] = trapc_arr[h] + 32'd1;
+                }
+            }
+        }
+    }
+    assign o_pc_all    = dbg_pc;
+    assign o_ret_all   = ret_arr;
+    assign o_trapc_all = trapc_arr;
     assign o_tcause1 = tcause1;
     assign o_tpc1    = tpc1;
     assign o_fcause1 = fcause1;
@@ -895,14 +930,14 @@ module test_v4_soc_smp_linux_boot_harness #(
             // entry until the first garbage-addr load. The garbage origin is only
             // ~1467 cy after entry, so this window (~hundreds of commits) contains
             // where a register FIRST goes bad. Analyze offline (grep H1TRC).
-            if h1_sp_ld_n != 32'd0 && !go_seen && dbg_retire_v[1] && dbg_retire_rdv[1] {
+            if COSIM_DUMP && h1_sp_ld_n != 32'd0 && !go_seen && dbg_retire_v[1] && dbg_retire_rdv[1] {
                 $display("H1TRC cy=%h pc=%h rd=%h val=%h", cy, dbg_retire_pc[1], dbg_retire_rd[1], dbg_retire_dat[1]);
             }
             // Phase 7 v4 SMP cosim: hart1 committed (retire) stream for EVERY
             // KERNEL/secondary-boot retire (PC high-half or low-PA 0x80xxxxxx), same
             // format as the v1 golden H1RET dump. Sequence-align + diff offline to pin
             // the FIRST divergence (where v4's hart1 commits a different pc/rd/data).
-            if dbg_retire_v[1] && (dbg_retire_pc[1][63] || dbg_retire_pc[1][31]) && h1ret_dumped <: 32'd400000 {
+            if COSIM_DUMP && dbg_retire_v[1] && (dbg_retire_pc[1][63] || dbg_retire_pc[1][31]) && h1ret_dumped <: 32'd400000 {
                 h1ret_dumped = h1ret_dumped + 32'd1;
                 $display("H1RET pc=%h rdv=%h rd=%h data=%h", dbg_retire_pc[1], dbg_retire_rdv[1], dbg_retire_rd[1], dbg_retire_dat[1]);
             }
@@ -1009,7 +1044,11 @@ module test_v4_soc_smp_linux_boot_harness #(
                 go_s0val   = s0prod_val;
             }
             // hart1 retires `ld sp,0(a4)` @PA 0x8000109c → captured sp value.
-            if dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd2 && dbg_retire_pc[1][31:0] == 32'h8000_109c {
+            // h1_sp_ld_n is the master trigger for the per-cycle WFR ring and the
+            // other hart1 forensic blocks; gating it on COSIM_DUMP keeps it 0 for
+            // the N=4 boot run so all that machinery elaborates-active but stays
+            // dormant (no per-cycle cost).
+            if COSIM_DUMP && dbg_retire_v[1] && dbg_retire_rdv[1] && dbg_retire_rd[1] == 5'd2 && dbg_retire_pc[1][31:0] == 32'h8000_109c {
                 h1_sp_ld    = dbg_retire_dat[1];
                 h1_sp_ld_cy = cy;
                 h1_sp_ld_n  = h1_sp_ld_n + 32'd1;
@@ -1697,6 +1736,88 @@ module test_v4_soc_smp_linux_boot {
         $display("  hart1 WALK-FSM cycle-ring (oldest..newest, 24cy INTO the first garbage inject):");
         for k in 0..24 {
             $display("    wfr[%h] cy=%h walk_vaddr=%h walk_v=%b walk_rob=%h lfault_inj=%b", k, wfr_cy[k], wfr_wva[k], wfr_wv[k], wfr_wrob[k], wfr_inj[k]);
+        }
+        $finish();
+    }
+}
+
+// ============================================================
+// M9.4 — N=4 SMP Linux boot.
+//
+// Reuses test_v4_soc_smp_linux_boot_harness with N_HARTS=4 and the 4-hart hex
+// assets: linux_boot_fw_4hart.hex (firmware already carries the Phase 6.A.3
+// HART_START msip delay, 0x80000 cy for target hart>=1) and
+// linux_dram_real_4hart.hex (kernel CONFIG_NR_CPUS=4 + 4-cpu DTB @ 0x81400000).
+// The SoC/bus/CLINT are already N_HARTS-parameterized (memory_bus gen_n4), and
+// the M9.3 free-list fix (commit 3a28998) is N-agnostic and already in the core.
+//
+// The heavy M9.3 hart1-only forensic ports are left unconnected
+// (#[allow(missing_port)]); harts 2/3 are observed via the clean per-hart
+// o_pc_all / o_ret_all / o_trapc_all liveness arrays. Pass = hart0 x3 == 0xAA.
+//
+//   veryl test --ignored --test test_v4_soc_smp_linux_boot_4hart
+// ============================================================
+#[test(test_v4_soc_smp_linux_boot_4hart)]
+#[ignore]
+module test_v4_soc_smp_linux_boot_4hart {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass     : logic     ;
+    var r3       : logic<64> ;
+    var cy       : logic<32> ;
+    var pc_all   : logic<64> [4];
+    var ret_all  : logic<32> [4];
+    var trapc_all: logic<32> [4];
+
+    #[allow(missing_port)]
+    inst harness: test_v4_soc_smp_linux_boot_harness #(
+        N_HARTS   : 4                                   ,
+        HEX_FW    : "test/hex/linux_boot_fw_4hart.hex"  ,
+        HEX_DRAM  : "test/hex/linux_dram_real_4hart.hex",
+        COSIM_DUMP: 0                                   ,
+    ) (
+        clk                   ,
+        rst                   ,
+        o_pass     : pass     ,
+        o_r3       : r3       ,
+        o_cy       : cy       ,
+        o_pc_all   : pc_all   ,
+        o_ret_all  : ret_all  ,
+        o_trapc_all: trapc_all,
+    );
+
+    initial {
+        rst.assert(clk);
+        // Poll for SBI shutdown (hart0 x3==0xAA). Periodically dump all 4 harts'
+        // PC + retire/trap counts: rising retire on a hart = forward progress, a
+        // frozen count = a stuck hart. N=2 reached shutdown ~37M cy.
+        //
+        // NOTE: `veryl test` buffers all $display until the test COMPLETES (no
+        // mid-run progress with any backend). So this is a BOUNDED DIAGNOSTIC run
+        // with a dense checkpoint interval: the single end-of-run flush then
+        // contains a fine-grained per-hart trajectory showing whether harts climb
+        // firmware->kernel->secondary-bringup or stall (and where).
+        //
+        // 25M-cy run (COSIM_DUMP off): hart0 boots the kernel solo (~0-18M), then
+        // brings up secondaries sequentially via the firmware-delayed SBI
+        // HART_START (hart1 woke ~18M, hart2 ~22M) — healthy, no stall. 50M cy
+        // here covers hart3's wake (~26M) + the kernel's "Brought up N CPUs" SMP
+        // completion, i.e. the CPU bring-up-race window (the main N=4 risk).
+        // Extend only once the trajectory shows healthy progress, never to mask a
+        // frozen (deadlocked) retire count.
+        for _i in 0..5000 {
+            clk.next(10000);
+            if _i % 100 == 0 {
+                $display("  [n4 probe] cy=%h pc=[%h %h %h %h] ret=[%h %h %h %h] trap=[%h %h %h %h]", cy, pc_all[0], pc_all[1], pc_all[2], pc_all[3], ret_all[0], ret_all[1], ret_all[2], ret_all[3], trapc_all[0], trapc_all[1], trapc_all[2], trapc_all[3]);
+            }
+            if pass {
+                break;
+            }
+        }
+        $display("v4 SoC SMP(N=4) boot: cy=%h pass=%b r3=%h", cy, pass, r3);
+        for h in 0..4 {
+            $display("  hart%h: pc=%h retired=%h traps=%h", h, pc_all[h], ret_all[h], trapc_all[h]);
         }
         $finish();
     }
