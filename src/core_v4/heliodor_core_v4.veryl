@@ -737,6 +737,14 @@ pub module heliodor_core_v4 #(
     var rsv_valid_q: logic    ;
     var rsv_addr_q : logic<64>;
 
+    // M9.4 SMP: SC commit-time re-validation state (declared early so the
+    // commit-redirect always_ff can read it; logic + comment near the
+    // reservation always_ff below).
+    var sc_watch_valid_q: logic           ;
+    var sc_watch_addr_q : logic<64>       ;
+    var sc_watch_rob_q  : logic<ROB_IDX_W>;
+    var sc_poison_q     : logic           ;
+
     // M5.D.2: dmem_mmu busy stall — issue is held while MMU is in PTW
     // / dcache-stall. In Bare mode busy stays 0 so behavior is
     // unchanged. The IQ's `lowest-idx ready` pick keeps the in-flight
@@ -1590,6 +1598,15 @@ pub module heliodor_core_v4 #(
         } else if rob_commit_valid && c_mispredict {
             redirect_fire_q = 1'b1;
             redirect_pc_q   = c_redirect_pc;
+        } else if sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q && sc_poison_q {
+            // M9.4 SMP: a poisoned SC (remote write hit its reserved line
+            // between execute and commit) — its store was suppressed; re-fetch
+            // the SC so it re-evaluates against the (now-cleared) reservation
+            // and correctly fails (rd=1). Mirrors the mispredict redirect but
+            // targets the SC's own PC. Condition is inlined here (the equivalent
+            // `commit_sc_replay` let is defined later, near the SC-watch logic).
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = c_pc;
         } else if commit_csrw_satp {
             // M9 (2026-05-25): csrw satp implicit redirect (see comment at
             // commit_csrw_satp). Re-fetch the next instruction with the
@@ -1718,9 +1735,69 @@ pub module heliodor_core_v4 #(
         }
     }
 
+    // ============================================================
+    // M9.4 SMP: SC commit-time re-validation (LR/SC atomicity under OoO).
+    //
+    // alu_wrap evaluates sc_match (reservation valid && addr) at the SC's
+    // EXECUTE (issue) and latches the result into the ROB as c_is_store
+    // (= amo_commit_store). But the STORE itself fires at COMMIT, several
+    // cycles later. In between, a REMOTE hart can write the reserved line;
+    // RVWMO then requires THIS SC to FAIL, yet the already-latched success
+    // still fires the store at commit. Two harts' SCs to the same line both
+    // succeed -> one update is lost. Observed as the N=4 kernel tasklist_lock
+    // (PA 0x80a07240) read-lock counter going stuck-NEGATIVE (two read_lock
+    // `addi+1; sc.w` both write count+1, a reader increment is lost, later
+    // read_unlock `amoadd -1` drives it negative = a phantom write-lock) so
+    // every reader spins forever in arch_read_lock @0x80025b58. v1 (in-order,
+    // execute==commit in one MEM stage) has NO such window, so it boots N=4.
+    //
+    // Fix: WATCH the in-flight matched SC's reserved dword. If a remote write
+    // (i_dcache_inv, self-filtered = remote only) hits it before the SC
+    // commits, POISON the SC. At the watched SC's commit, if poisoned,
+    // SUPPRESS its store and REDIRECT to its own PC (commit_sc_replay, handled
+    // like a mispredict). The replayed SC re-reads the redirect-cleared
+    // reservation -> sc_match fails (rd=1, no store) -> software retries its
+    // LR/SC loop. Single watch slot suffices: a hart never has two LR/SC pairs
+    // in flight at once. All registered; the watch state never feeds issue
+    // select, so no comb loop. (The four sc_*_q registers are declared up near
+    // rsv_valid_q so the commit-redirect always_ff can read them.)
+    // A matched SC issues this cycle (it will fire a store at commit):
+    let sc_exec_match  : logic = issue_is_sc && iq_issue_ack && issue_addr_match;
+    // A remote write hits the watched SC's reserved dword (dword-granular,
+    // matching the reservation grain at the remote-clear above):
+    let sc_remote_hit  : logic = sc_watch_valid_q && i_dcache_inv_valid && i_dcache_inv_addr[63:3] == sc_watch_addr_q[63:3];
+    // The watched SC is the op committing this cycle:
+    let sc_watch_commit: logic = sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q;
+    // Poisoned watched SC at its commit -> replay (fail it):
+    let commit_sc_replay: logic = sc_watch_commit && sc_poison_q;
+    always_ff (clk, rst) {
+        if_reset {
+            sc_watch_valid_q = 1'b0;
+            sc_watch_addr_q  = 64'd0;
+            sc_watch_rob_q   = '0;
+            sc_poison_q      = 1'b0;
+        } else if redirect_fire_q {
+            // Any flush (incl. this fix's own replay) clears the watch.
+            sc_watch_valid_q = 1'b0;
+            sc_poison_q      = 1'b0;
+        } else if sc_exec_match {
+            sc_watch_valid_q = 1'b1;
+            sc_watch_addr_q  = agu_addr_iss;
+            sc_watch_rob_q   = iq_iss_rob_idx;
+            // Same-cycle remote write to the new SC's line also poisons it.
+            sc_poison_q      = i_dcache_inv_valid && i_dcache_inv_addr[63:3] == agu_addr_iss[63:3];
+        } else if sc_watch_commit {
+            sc_watch_valid_q = 1'b0;
+            sc_poison_q      = 1'b0;
+        } else if sc_remote_hit {
+            sc_poison_q = 1'b1;
+        }
+    }
+
     // STORE write fires at commit when the head entry is a store.
     // M6.B.4: suppress a faulted/FS-disabled FP store's memory write.
-    let commit_store_fire: logic = rob_commit_valid && c_is_store && !c_illegal && !commit_priv_illegal;
+    // M9.4: suppress a poisoned SC's store (it is being replayed to fail).
+    let commit_store_fire: logic = rob_commit_valid && c_is_store && !c_illegal && !commit_priv_illegal && !commit_sc_replay;
 
     // funct3 → wstrb (size mask) shifted by byte offset (lo 3 bits)
     let st_byte_off : logic<3> = c_store_addr[2:0];
