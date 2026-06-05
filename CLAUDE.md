@@ -65,12 +65,14 @@ heliodor/
   second backend (e.g. `--backend cranelift` or `--backend interpret`): two
   independent backends agreeing is strong evidence the RTL, not the sim, is at fault.
 - **Regression testing**: After modifying heliodor or veryl, run the multi-step regression:
-  1. `veryl test` — fast tests **+ the v1 arch suite** (~220 tests, seconds-to-~minute;
-     the rv64ui/um/ua/mi/si arch tests in `tb/test_arch.veryl` are NOT `#[ignore]` and
-     run here). Fix any failures before proceeding.
-  2. `veryl test --ignored --test test_v4_arch` — v4 OoO arch suite (~110 tests).
-  3. `veryl test --ignored --test test_v4_linux_boot` — v4 Linux boot (~25M cycles, minutes).
-     The v1 Linux boot is `--ignored --test test_linux_boot`.
+  1. `veryl test` — fast tests **+ the arch suite** (~150 tests, seconds-to-~minute;
+     the rv64ui/um/ua/mi/si arch tests in `tb/test_arch_common.veryl` and the
+     rv64uf/ud FP tests in `tb/test_arch_fp.veryl` are NOT `#[ignore]` and run here,
+     on the OoO core). Fix any failures before proceeding.
+  2. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
+     (~37M cycles, minutes). N=1 single-hart is `--ignored --test test_soc_linux_boot`.
+  3. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
+     (~52M cycles, ~1h).
 - **Formatting**: `veryl fmt`
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
 - **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
@@ -103,10 +105,12 @@ Each test loads its hex into a 1 MB DRAM mapped at PA 0x80000000 and
 boots heliodor at that address. Pass/fail is signalled via the standard
 riscv-tests `tohost` mechanism (write to PA 0x80001000): `tohost == 1`
 means all subtests passed; `tohost > 1` means subtest with that ID
-failed. The v1 arch tests (`tb/test_arch.veryl`) are NOT `#[ignore]`, so
-they run as part of the default `veryl test`; the `--test` substring just
-narrows the run. The v4 OoO arch harnesses (`tb/test_v4_arch_common.veryl`)
-ARE `#[ignore]`; run them via `--ignored --test test_v4_arch`.
+failed. The OoO-core arch harness + per-test modules live inline in
+`tb/test_arch_common.veryl` (rv64ui/um/ua/mi/si) and `tb/test_arch_fp.veryl`
+(rv64uf/ud); they are NOT `#[ignore]`, so they run as part of the default
+`veryl test`. The `--test test_arch_rv64ui` substring just narrows the run.
+(`test/riscv-arch-test/gen_tb.py` is the legacy v1 generator that emitted the
+now-removed `tb/test_arch.veryl`; obsolete after the v1-core removal.)
 
 ## Running Tests on Verilator
 
