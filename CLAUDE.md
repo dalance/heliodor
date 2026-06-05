@@ -81,18 +81,14 @@ heliodor/
 
 The official `riscv-software-src/riscv-tests` ISA tests are integrated
 under `test/riscv-arch-test/`. The upstream is cloned (not a git
-submodule) into `upstream/`, the rv64ui suite is built as `.hex` files
-under `build/rv64ui/`, and one Veryl harness per test is generated into
-`tb/test_arch.veryl`.
+submodule) into `upstream/`, and the suites are built as `.hex` files
+under `build/<suite>/`. The Veryl `#[test]` modules are hand-maintained
+inline in `tb/test_arch_common.veryl` + `tb/test_arch_fp.veryl`.
 
-Build and (re-)generate the harness:
+Build the hex files (one-time, requires riscv64-unknown-elf-gcc):
 
 ```bash
-# 1. Build hex files (one-time, requires riscv64-unknown-elf-gcc)
 make -C test/riscv-arch-test
-
-# 2. Regenerate tb/test_arch.veryl from the built .hex files
-python3 test/riscv-arch-test/gen_tb.py
 ```
 
 Run all rv64ui ISA tests:
@@ -109,52 +105,30 @@ failed. The OoO-core arch harness + per-test modules live inline in
 `tb/test_arch_common.veryl` (rv64ui/um/ua/mi/si) and `tb/test_arch_fp.veryl`
 (rv64uf/ud); they are NOT `#[ignore]`, so they run as part of the default
 `veryl test`. The `--test test_arch_rv64ui` substring just narrows the run.
-(`test/riscv-arch-test/gen_tb.py` is the legacy v1 generator that emitted the
-now-removed `tb/test_arch.veryl`; obsolete after the v1-core removal.)
+The hex files are built by `make -C test/riscv-arch-test` (from the cloned
+`upstream/`); the test modules themselves are hand-maintained inline in
+`test_arch_common.veryl` / `test_arch_fp.veryl` (the old `gen_tb.py` v1
+generator was removed in the cleanup).
 
 ## Running Tests on Verilator
 
-The Veryl native simulator is the default, but tests can also be run on
-Verilator for cross-checking simulator bugs or getting faster wall-clock
-times on long tests (Linux boot: ~22s on Verilator vs ~125s on Veryl sim).
+The **Veryl native simulator is the supported flow**; Verilator is only an
+occasional cross-check. The old `sim/verilator/` SystemVerilog wrappers were
+removed in the P7 cleanup (they referenced the deleted v1 harnesses and the
+since-pruned debug ports).
 
-Native Veryl testbenches (those that use `$tb::clock_gen` / `$tb::reset_gen`)
-cannot run directly on Verilator. Instead, SystemVerilog wrappers live in
-`sim/verilator/` and instantiate the corresponding `<test>_harness` modules
-(which *are* emitted to SV by `veryl build`).
+To cross-check a harness on Verilator today: `veryl build` emits one SV module
+per testbench harness (e.g. `heliodor_test_soc_smp_linux_boot_harness`) into
+`tb/*.sv` and the file list into `heliodor.f`. Write a thin SV wrapper that
+instantiates `heliodor_<harness>` (driving `clk`/`rst`, reading `o_pass`/`o_r3`),
+then:
 
-Steps:
+```bash
+verilator --binary --top <wrapper> -f heliodor.f <wrapper>.sv \
+          --timing -Wno-fatal -O3 -o <wrapper>
+```
 
-1. Generate SystemVerilog from the Veryl sources:
-   ```bash
-   veryl build
-   ```
-   This produces `heliodor.f` (file list) and all `.sv` files in `src/` and `tb/`.
-
-2. Build the Verilator binary (re-run after any `.veryl` change):
-   ```bash
-   cd sim/verilator
-   verilator --binary --top tb_linux_boot -f ../../heliodor.f tb_linux_boot.sv \
-             --timing -Wno-fatal -O3 --Mdir build_linux -o tb_linux_boot
-   ```
-
-3. Run from the heliodor project root (the `$readmemh` paths in the harness
-   are relative to the project root):
-   ```bash
-   cd /home/hatta/work/repos/heliodor
-   sim/verilator/build_linux/tb_linux_boot
-   ```
-
-Existing Verilator testbenches:
-
-| TB file            | Target harness                          | Purpose                 |
-|--------------------|-----------------------------------------|-------------------------|
-| `tb_alu.sv`        | `heliodor_test_alu_harness`             | ALU unit test           |
-| `tb_fibonacci.sv`  | `heliodor_test_fibonacci_harness`       | Small pipeline integ.   |
-| `tb_linux_boot.sv` | `heliodor_test_linux_boot_harness`      | Full Linux boot         |
-
-To add a new Verilator wrapper, copy `tb_fibonacci.sv` as a template, rewire
-the ports to the target harness, and use the same `verilator --binary` flags.
+Run it from the project root (the harness `$readmemh` paths are relative to it).
 
 ## Development Roadmap
 
