@@ -736,6 +736,13 @@ pub module heliodor_core_v4 #(
 
     var rsv_valid_q: logic    ;
     var rsv_addr_q : logic<64>;
+    // M9.4 SMP: the rob_idx of the LR that set the reservation, and whether that LR
+    // has committed. Used to gate the SC's reservation-clear so an OoO-reordered
+    // OLDER sc.w (issuing after a YOUNGER lr.w, e.g. when its result op was delayed
+    // by a force-miss fill under N=4 bus contention) cannot wipe the younger lr.w's
+    // reservation — the N=4 read_lock livelock.
+    var rsv_rob_q  : logic<ROB_IDX_W>;
+    var rsv_owner_committed_q: logic ;
 
     // M9.4 SMP: SC commit-time re-validation state (declared early so the
     // commit-redirect always_ff can read it; logic + comment near the
@@ -744,6 +751,9 @@ pub module heliodor_core_v4 #(
     var sc_watch_addr_q : logic<64>       ;
     var sc_watch_rob_q  : logic<ROB_IDX_W>;
     var sc_poison_q     : logic           ;
+    // M9.4 diag: last thing to touch rsv_valid_q (1=LR set, 2=SC clear, 3=remote
+    // clear, 4=arch clear, 5=store/amo clear) — captured at the failing SC.
+    var rsv_lw_q        : logic<3>        ;
 
     // M5.D.2: dmem_mmu busy stall — issue is held while MMU is in PTW
     // / dcache-stall. In Bare mode busy stays 0 so behavior is
@@ -1705,11 +1715,39 @@ pub module heliodor_core_v4 #(
     let issue_is_amo    : logic = iq_issue_valid && iq_iss_is_amo;
     let issue_is_st     : logic = iq_issue_valid && iq_issue_op.base.is_store;
     let issue_addr_match: logic = rsv_valid_q && rsv_addr_q == agu_addr_iss;
+    // M9.4 SMP: program-order age (distance from the ROB head) of the issuing SC vs
+    // the LR that owns the reservation. An SC may consume (clear) the reservation
+    // only if it is program-order AFTER its owner LR, or that LR has committed. This
+    // stops an OoO-reordered OLDER sc.w (which issues after a YOUNGER lr.w because
+    // its result op was delayed — e.g. by a force-miss fill stretched under N=4 bus
+    // contention) from wiping the younger lr.w's reservation → the read_lock livelock.
+    let rsv_age_sc   : logic<ROB_IDX_W> = iq_iss_rob_idx - rob_head_idx;
+    let rsv_age_owner: logic<ROB_IDX_W> = rsv_rob_q - rob_head_idx;
+    let sc_may_clear : logic = rsv_owner_committed_q || (rsv_age_sc >: rsv_age_owner);
     always_ff (clk, rst) {
         if_reset {
             rsv_valid_q = 1'b0;
             rsv_addr_q  = 64'd0;
-        } else if redirect_fire_q || commit_trap || commit_mret {
+            rsv_lw_q    = 3'd0;
+            rsv_rob_q   = '0;
+            rsv_owner_committed_q = 1'b0;
+        } else if commit_trap || commit_mret || commit_sret || commit_csrw_satp {
+            rsv_lw_q = 3'd4;
+            // M9.4 SMP: clear the LR/SC reservation only on ARCHITECTURAL control
+            // events (trap / mret / sret / satp context switch), NOT on a plain
+            // branch-mispredict redirect. The old `redirect_fire_q` term cleared the
+            // reservation on EVERY redirect, including a speculative branch mispredict.
+            // In a tight read_lock spin (lr.w; blt; addi; sc.w; bnez), the blt/bnez
+            // mispredict between the (already-committed) lr.w and the sc.w wiped the
+            // CORRECT-PATH reservation every iteration, so the sc.w never succeeded —
+            // hart spun forever on an UNCONTENDED rwlock (observed: N=4 hart0 stuck in
+            // arch_read_lock @0x80025b58 with rsv_valid=0 at the SC, addr correct,
+            // poison=0, lock dword written only ~3× in 62M). A branch mispredict is a
+            // microarchitectural event and must NOT clear an architectural reservation
+            // (RVWMO). v1 (in-order, ~1-cycle LR→SC window) never exposed it. The rare
+            // remote-write case is still handled by the dword-granular remote-clear
+            // below; a squashed wrong-path lr.w is re-paired with its own sc.w on the
+            // correct path so its stale reservation cannot make a bare sc.w succeed.
             rsv_valid_q = 1'b0;
         } else if issue_is_lr && iq_issue_ack {
             // M9 SMP: gate the reservation updates on iq_issue_ack (ACTUAL issue),
@@ -1722,16 +1760,34 @@ pub module heliodor_core_v4 #(
             // sc_match reads the pre-edge reservation, the clear applies the edge.
             rsv_valid_q = 1'b1;
             rsv_addr_q  = agu_addr_iss;
+            rsv_rob_q   = iq_iss_rob_idx;
+            rsv_lw_q    = 3'd1;
         } else if i_dcache_inv_valid && i_dcache_inv_addr[63:3] == rsv_addr_q[63:3] {
+            rsv_lw_q = 3'd3;
             // M9 SMP: a remote hart's store hit our reserved dword — kill the
             // reservation so a following SC fails (matches RVWMO). dword-granular
             // (not line) to avoid false-sharing livelock. Placed after the LR set
             // so a fresh LR this cycle wins over a remote write to the OLD addr.
             rsv_valid_q = 1'b0;
         } else if issue_is_sc && iq_issue_ack {
-            rsv_valid_q = 1'b0;
+            // M9.4 SMP: the SC consumes the reservation, but ONLY if it is program-
+            // order after the owning LR (sc_may_clear). An OoO-reordered OLDER SC
+            // (issuing after a younger LR) must not wipe that younger LR's
+            // reservation, or the next SC fails forever on an uncontended lock.
+            if sc_may_clear {
+                rsv_valid_q = 1'b0;
+                rsv_lw_q    = 3'd2;
+            }
         } else if (issue_is_st || issue_is_amo) && issue_addr_match && iq_issue_ack {
             rsv_valid_q = 1'b0;
+            rsv_lw_q    = 3'd5;
+        }
+        // M9.4 SMP: track whether the LR that owns the reservation has committed
+        // (then any later SC may clear it, regardless of the modular age window).
+        if issue_is_lr && iq_issue_ack {
+            rsv_owner_committed_q = 1'b0;
+        } else if rob_commit_valid && rob_commit_idx == rsv_rob_q {
+            rsv_owner_committed_q = 1'b1;
         }
     }
 
@@ -2053,7 +2109,17 @@ pub module heliodor_core_v4 #(
             prf_prod_data[cdb.pdst] = cdb.data;
         }
     }
-    let opc_bad_slli: logic = iq_issue_ack && iq_issue_op.base.pc[31:0] == 32'h800d_f85e && prf_rs1_data != 64'd1;
+    // M9.4 re-target 2: OPC seen=0 ⇒ the blt is NOT the cause; hart0 loops because
+    // the read_lock SC @0x80025b62 keeps FAILING on an UNCONTENDED lock (dword
+    // 0x80a868c8 written only 3+1× in 62M — not false sharing). Capture the LAST
+    // SC@0x80025b62 issue's reservation state to see WHY sc_match fails:
+    //   opc_data  = rsv_addr_q (the reserved addr)
+    //   opc_ppc   = agu_addr_iss (the SC's own addr — should equal rsv_addr_q)
+    //   opc_pdat  = {sc_watch_valid_q, sc_poison_q, rsv_valid_q}  (bits 2,1,0)
+    // rsv_valid=0 ⇒ reservation cleared between LR and SC (OoO reorder / own-clear /
+    // force-miss timing); addr mismatch ⇒ wrong reservation; poison=1 ⇒ my SC fix
+    // is replaying it.
+    let opc_bad_slli: logic = iq_issue_ack && iq_issue_op.base.pc[31:0] == 32'h8002_5b62;
     var opc_seen_q     : logic              ;
     var opc_rs1_pdst_q : logic<PRF_INT_W>   ;
     var opc_rs1_data_q : logic<64>          ;
@@ -2066,12 +2132,13 @@ pub module heliodor_core_v4 #(
             opc_rs1_data_q  = 64'd0;
             opc_prod_pc_q   = 64'd0;
             opc_prod_data_q = 64'd0;
-        } else if opc_bad_slli && !opc_seen_q {
+        } else if opc_bad_slli {
+            // M9.4: capture the LAST SC@0x80025b62 issue's reservation state.
             opc_seen_q      = 1'b1;
             opc_rs1_pdst_q  = iq_iss_rs1_pdst;
-            opc_rs1_data_q  = prf_rs1_data;
-            opc_prod_pc_q   = prf_prod_pc[iq_iss_rs1_pdst];
-            opc_prod_data_q = prf_prod_data[iq_iss_rs1_pdst];
+            opc_rs1_data_q  = rsv_addr_q;
+            opc_prod_pc_q   = agu_addr_iss;
+            opc_prod_data_q = {58'd0, rsv_lw_q, sc_watch_valid_q, sc_poison_q, rsv_valid_q};
         }
     }
 

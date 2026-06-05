@@ -55,6 +55,15 @@ module test_v4_soc_smp_linux_boot_harness #(
     o_pc_all   : output logic<64> [N_HARTS],
     o_ret_all  : output logic<32> [N_HARTS],
     o_trapc_all: output logic<32> [N_HARTS],
+    o_a0_all   : output logic<64> [N_HARTS], // M9.4 diag: per-hart a0 (rwlock ptr in read_lock)
+    o_lrval    : output logic<64>           , // M9.4 diag: hart0's last lr.w@0x80025b58 result (a5)
+    o_opc_seen : output logic               , // M9.4 diag: hart0 operand-capture probe (blt@0x80025b5c)
+    o_opc_data : output logic<64>           , // a5 value the blt READ (should be negative)
+    o_opc_pdst : output logic<6>            , // a5's pdst the blt read
+    o_opc_ppc  : output logic<64>           , // last CDB producer PC of that pdst
+    o_opc_pdat : output logic<64>           , // last CDB producer DATA of that pdst
+    o_dwlo     : output logic<32>           , // M9.4 diag: writes to lock LO word 0x80a868c8
+    o_dwhi     : output logic<32>           , // writes to HI word 0x80a868cc (same dword = false sharing)
     // M9.3 secondary-stack trace outputs.
     o_h1_sp      : output logic<64>, // hart1 current committed sp (arch_regs[2])
     o_h1_sp_ld   : output logic<64>, // sp value retired by `ld sp,0(a4)` @PA 0x8000109c
@@ -251,6 +260,7 @@ module test_v4_soc_smp_linux_boot_harness #(
     var dbg_trap_to_s : logic     [N_HARTS];
     var dbg_sp        : logic<64> [N_HARTS];
     var dbg_tp        : logic<64> [N_HARTS];
+    var dbg_a0        : logic<64> [N_HARTS]; // M9.4 diag: a0 (rwlock ptr in read_lock)
     var dbg_dmem_fault: logic     [N_HARTS];
     var dbg_dtlb_hit  : logic     [N_HARTS];
     var dbg_dtlb_ppn  : logic<44> [N_HARTS];
@@ -327,6 +337,7 @@ module test_v4_soc_smp_linux_boot_harness #(
         o_dbg_trap_to_s : dbg_trap_to_s ,
         o_dbg_sp        : dbg_sp        ,
         o_dbg_tp        : dbg_tp        ,
+        o_dbg_a0        : dbg_a0        ,
         o_dbg_dmem_fault: dbg_dmem_fault,
         o_dbg_dtlb_hit  : dbg_dtlb_hit  ,
         o_dbg_dtlb_ppn  : dbg_dtlb_ppn  ,
@@ -419,6 +430,10 @@ module test_v4_soc_smp_linux_boot_harness #(
         64'd0
     ;
 
+    // Cycle counter (declared here so the LOCKW diag in the DRAM-write
+    // always_ff below can read it; incremented in the counter always_ff later).
+    var cy: logic<32>;
+
     // Shared DRAM write (lo dword + misaligned hi-side carry). The SoC gates
     // o_dmem_wen / o_dmem_wstrb_hi to DRAM accesses only.
     always_ff (clk, rst) {
@@ -475,6 +490,62 @@ module test_v4_soc_smp_linux_boot_harness #(
         }
     }
 
+    // M9.4 diag: PA 0x80a868c8 is init-0 and NEVER written (zero LOCKW), yet hart0
+    // read-locks it and spins on `blt a5,x0` (= it loaded a NEGATIVE a5). So the
+    // bug is hart0's lr.w returning WRONG DATA, not a lock-write corruption. Latch
+    // hart0's lr.w (0x80025b58) committed result (a5 = the loaded value) so the
+    // final summary shows what it actually read (vs the memory value 0). A small
+    // negative / a recognizable neighbor value points at OoO operand-capture; raw
+    // garbage at a bad dcache fill / DTLB mistranslation.
+    var lrval_q: logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            lrval_q = 64'd0;
+        } else if dbg_retire_v[0] && dbg_retire_pc[0][31:0] == 32'h8002_5b58 {
+            lrval_q = dbg_retire_dat[0];
+        }
+    }
+    assign o_lrval = lrval_q;
+    // M9.4 diag: expose hart0's operand-capture probe result (the stuck read_lock
+    // blt@0x80025b5c that read a5 negative) for the tail-safe final DIAG line.
+    assign o_opc_seen = dbg_opc_seen[0];
+    assign o_opc_data = dbg_opc_rs1_data[0];
+    assign o_opc_pdst = dbg_opc_rs1_pdst[0];
+    assign o_opc_ppc  = dbg_opc_prod_pc[0];
+    assign o_opc_pdat = dbg_opc_prod_data[0];
+    // M9.4 diag: OPC seen=0 + a5=0 ⇒ the blt is NOT taken; hart0 loops because the
+    // read_lock SC keeps FAILING (lr.w/blt/addi/sc.w/bnez). The lock LO word is never
+    // written, so the reservation must be cleared by a remote write to the SAME 8B
+    // dword. v4's reservation clear is DWORD-granular ([63:3]); count LO (lock) vs HI
+    // (0x80a868cc, a different var) word writes — a hot HI word = false-sharing
+    // livelock (v1 likely word-granular ⇒ boots).
+    var dwlo_n: logic<32>;
+    var dwhi_n: logic<32>;
+    let dw_hit: logic = dmem_wen && in_dram && (dmem_addr[24:3] == 22'h15_0D19);
+    always_ff (clk, rst) {
+        if_reset {
+            dwlo_n = 32'd0;
+            dwhi_n = 32'd0;
+        } else {
+            if dw_hit && dmem_wstrb[3:0] != 4'd0 {
+                dwlo_n = dwlo_n + 32'd1;
+            }
+            if dw_hit && dmem_wstrb[7:4] != 4'd0 {
+                dwhi_n = dwhi_n + 32'd1;
+            }
+        }
+    }
+    assign o_dwlo = dwlo_n;
+    assign o_dwhi = dwhi_n;
+
+    // M9.4 diag: hart0 deadlocks spinning in arch_read_lock @0x80025b58 on a rwlock
+    // whose word is stuck NEGATIVE. The earlier guess (tasklist_lock PA 0x80a07240)
+    // was WRONG (zero writes to it in the SMP window). Expose each hart's a0 (= the
+    // rwlock ptr while in read_lock) so the test module prints hart0's a0 in the
+    // FINAL summary (reliably at the tail, unlike a truncated mid-stream $display).
+    // hart0 is stuck in read_lock at the end ⇒ a0_all[0] = the actual lock address.
+    assign o_a0_all = dbg_a0;
+
     // UART TX echo (SoC consumes the writes; mirror to stdout).
     always_ff (clk, rst) {
         if_reset {} else if uart_tx_v {
@@ -483,7 +554,7 @@ module test_v4_soc_smp_linux_boot_harness #(
     }
 
     // Cycle counter + per-hart retire/trap counters + pass latch (hart0 x3==0xAA).
-    var cy    : logic<32>;
+    // (var cy is declared earlier, above the DRAM-write always_ff.)
     var ret0  : logic<32>;
     var ret1  : logic<32>;
     var trapc0 : logic<32>;
@@ -1769,6 +1840,15 @@ module test_v4_soc_smp_linux_boot_4hart {
     var pc_all   : logic<64> [4];
     var ret_all  : logic<32> [4];
     var trapc_all: logic<32> [4];
+    var a0_all   : logic<64> [4];
+    var lrval    : logic<64>    ;
+    var opc_seen : logic        ;
+    var opc_data : logic<64>    ;
+    var opc_pdst : logic<6>     ;
+    var opc_ppc  : logic<64>    ;
+    var opc_pdat : logic<64>    ;
+    var dwlo     : logic<32>    ;
+    var dwhi     : logic<32>    ;
 
     #[allow(missing_port)]
     inst harness: test_v4_soc_smp_linux_boot_harness #(
@@ -1785,6 +1865,15 @@ module test_v4_soc_smp_linux_boot_4hart {
         o_pc_all   : pc_all   ,
         o_ret_all  : ret_all  ,
         o_trapc_all: trapc_all,
+        o_a0_all   : a0_all   ,
+        o_lrval    : lrval    ,
+        o_opc_seen : opc_seen ,
+        o_opc_data : opc_data ,
+        o_opc_pdst : opc_pdst ,
+        o_opc_ppc  : opc_ppc  ,
+        o_opc_pdat : opc_pdat ,
+        o_dwlo     : dwlo     ,
+        o_dwhi     : dwhi     ,
     );
 
     initial {
@@ -1816,6 +1905,8 @@ module test_v4_soc_smp_linux_boot_4hart {
         // climbing, not plateau at a stuck spin PC).
         for _i in 0..10000 {
             clk.next(10000);
+            // Per-100-iter trajectory probe (re-enabled now that the key diag is in
+            // the tail-safe final DIAG/OPC lines).
             if _i % 100 == 0 {
                 $display("  [n4 probe] cy=%h pc=[%h %h %h %h] ret=[%h %h %h %h] trap=[%h %h %h %h]", cy, pc_all[0], pc_all[1], pc_all[2], pc_all[3], ret_all[0], ret_all[1], ret_all[2], ret_all[3], trapc_all[0], trapc_all[1], trapc_all[2], trapc_all[3]);
             }
@@ -1825,8 +1916,12 @@ module test_v4_soc_smp_linux_boot_4hart {
         }
         $display("v4 SoC SMP(N=4) boot: cy=%h pass=%b r3=%h", cy, pass, r3);
         for h in 0..4 {
-            $display("  hart%h: pc=%h retired=%h traps=%h", h, pc_all[h], ret_all[h], trapc_all[h]);
+            $display("  hart%h: pc=%h retired=%h traps=%h a0=%h", h, pc_all[h], ret_all[h], trapc_all[h], a0_all[h]);
         }
+        // Put the key diag LAST so it survives the task output's tail-truncation.
+        $display("DIAG hart0 a0=%h lr_a5=%h pass=%b", a0_all[0], lrval, pass);
+        $display("SCFAIL seen=%b rsv_addr=%h sc_addr=%h flags{lw[5:3],watch,poison,rsvvalid}=%h", opc_seen, opc_data, opc_ppc, opc_pdat);
+        $display("LOCKDWORD lo_writes=%h hi_writes=%h", dwlo, dwhi);
         $finish();
     }
 }
