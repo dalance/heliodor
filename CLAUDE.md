@@ -112,23 +112,34 @@ generator was removed in the cleanup).
 
 ## Running Tests on Verilator
 
-The **Veryl native simulator is the supported flow**; Verilator is only an
-occasional cross-check. The old `sim/verilator/` SystemVerilog wrappers were
-removed in the P7 cleanup (they referenced the deleted v1 harnesses and the
-since-pruned debug ports).
+The Veryl native simulator is the primary flow, but the Linux boot is also
+cross-checked on Verilator — standard SV NBA semantics are closer to real
+hardware and have caught bugs the Veryl sim's multi-instance evaluation masked
+(e.g. the SMP LR/SC read_lock livelock fixed in `heliodor_core` sc_may_clear).
 
-To cross-check a harness on Verilator today: `veryl build` emits one SV module
-per testbench harness (e.g. `heliodor_test_soc_smp_linux_boot_harness`) into
-`tb/*.sv` and the file list into `heliodor.f`. Write a thin SV wrapper that
-instantiates `heliodor_<harness>` (driving `clk`/`rst`, reading `o_pass`/`o_r3`),
-then:
+Native Veryl `#[test]` modules use `$tb::clock_gen`/`reset_gen` and cannot run
+on Verilator, so thin SV wrappers in `sim/verilator/` instantiate the harness
+modules `veryl build` emits to `tb/*.sv`:
+
+| Wrapper                              | Config | Harness                                  |
+|--------------------------------------|--------|------------------------------------------|
+| `tb_soc_linux_boot.sv`               | N=1    | `heliodor_test_soc_linux_boot_harness`   |
+| `tb_soc_smp_linux_boot_2hart.sv`     | N=2    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=2) |
+| `tb_soc_smp_linux_boot_4hart.sv`     | N=4    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=4) |
+
+Build + run (from the project root, so the harness `$readmemh` paths resolve):
 
 ```bash
-verilator --binary --top <wrapper> -f heliodor.f <wrapper>.sv \
-          --timing -Wno-fatal -O3 -o <wrapper>
+veryl build                                         # emit tb/*.sv + heliodor.f
+verilator --binary --top-module tb_soc_smp_linux_boot_2hart -f heliodor.f \
+          sim/verilator/tb_soc_smp_linux_boot_2hart.sv --timing -Wno-fatal -O3 \
+          --Mdir sim/verilator/build_n2 -o tb_soc_smp_linux_boot_2hart
+sim/verilator/build_n2/tb_soc_smp_linux_boot_2hart  # prints "... PASSED ..." on x3==0xAA
 ```
 
-Run it from the project root (the harness `$readmemh` paths are relative to it).
+Comment lines must not start with the word `verilator` (Verilator parses
+`// verilator ...` as a pragma — `BADVLTPRAGMA`). The `build_*/` output dirs are
+gitignored. Add a new wrapper by copying one of the above and rewiring the ports.
 
 ## Development Roadmap
 

@@ -730,13 +730,11 @@ pub module heliodor_core #(
 
     var rsv_valid_q: logic    ;
     var rsv_addr_q : logic<64>;
-    // M9.4 SMP: the rob_idx of the LR that set the reservation, and whether that LR
-    // has committed. Used to gate the SC's reservation-clear so an OoO-reordered
-    // OLDER sc.w (issuing after a YOUNGER lr.w, e.g. when its result op was delayed
-    // by a force-miss fill under N=4 bus contention) cannot wipe the younger lr.w's
-    // reservation — the N=4 read_lock livelock.
+    // M9.4 SMP: the rob_idx of the LR that set the reservation. Used by the age gate
+    // in sc_may_clear so an OoO-reordered OLDER sc.w (issuing after a YOUNGER lr.w,
+    // e.g. when its result op was delayed by a force-miss fill under N=4 bus
+    // contention) cannot wipe the younger lr.w's reservation — the read_lock livelock.
     var rsv_rob_q  : logic<ROB_IDX_W>;
-    var rsv_owner_committed_q: logic ;
 
     // M9.4 SMP: SC commit-time re-validation state (declared early so the
     // commit-redirect always_ff can read it; logic + comment near the
@@ -1706,21 +1704,29 @@ pub module heliodor_core #(
     let issue_is_amo    : logic = iq_issue_valid && iq_iss_is_amo;
     let issue_is_st     : logic = iq_issue_valid && iq_issue_op.base.is_store;
     let issue_addr_match: logic = rsv_valid_q && rsv_addr_q == agu_addr_iss;
-    // M9.4 SMP: program-order age (distance from the ROB head) of the issuing SC vs
-    // the LR that owns the reservation. An SC may consume (clear) the reservation
-    // only if it is program-order AFTER its owner LR, or that LR has committed. This
-    // stops an OoO-reordered OLDER sc.w (which issues after a YOUNGER lr.w because
-    // its result op was delayed — e.g. by a force-miss fill stretched under N=4 bus
-    // contention) from wiping the younger lr.w's reservation → the read_lock livelock.
+    // M9.4 SMP: an SC may consume (clear) the reservation only if BOTH (a) it is
+    // program-order AFTER its owner LR (age = distance from the ROB head), so an
+    // OoO-reordered OLDER sc.w cannot wipe a YOUNGER lr.w's reservation, AND (b) its
+    // address matches the reservation, so an SC to a different lock cannot clear it.
+    //
+    // The old `rsv_owner_committed_q ||` escape hatch (allow any SC to clear once the
+    // owner LR has committed) was a BUG: in a speculatively-unrolled read_lock spin
+    // (lr.w; bltz; addi; sc.w; bnez) the owner LR commits within a few cycles, after
+    // which a stale/reordered in-flight sc.w cleared the reservation BEFORE the
+    // matching sc.w could check it → every sc.w then saw rsv_valid=0 → the hart spun
+    // forever in arch_read_lock. The Veryl sim's evaluation order happened to avoid
+    // it, but Verilator (correct SV NBA, ≈ real HW) livelocked N=2/N=4 SMP boot here.
+    // The age gate alone is enough; a stale reservation that the wrapped age compare
+    // fails to clear is harmless because the sc.w's own match check (rsv_addr == its
+    // own addr) still gates success.
     let rsv_age_sc   : logic<ROB_IDX_W> = iq_iss_rob_idx - rob_head_idx;
     let rsv_age_owner: logic<ROB_IDX_W> = rsv_rob_q - rob_head_idx;
-    let sc_may_clear : logic = rsv_owner_committed_q || (rsv_age_sc >: rsv_age_owner);
+    let sc_may_clear : logic = (rsv_age_sc >: rsv_age_owner) && (rsv_addr_q == agu_addr_iss);
     always_ff (clk, rst) {
         if_reset {
             rsv_valid_q = 1'b0;
             rsv_addr_q  = 64'd0;
             rsv_rob_q   = '0;
-            rsv_owner_committed_q = 1'b0;
         } else if commit_trap || commit_mret || commit_sret || commit_csrw_satp {
             // M9.4 SMP: clear the LR/SC reservation only on ARCHITECTURAL control
             // events (trap / mret / sret / satp context switch), NOT on a plain
@@ -1766,13 +1772,6 @@ pub module heliodor_core #(
             }
         } else if (issue_is_st || issue_is_amo) && issue_addr_match && iq_issue_ack {
             rsv_valid_q = 1'b0;
-        }
-        // M9.4 SMP: track whether the LR that owns the reservation has committed
-        // (then any later SC may clear it, regardless of the modular age window).
-        if issue_is_lr && iq_issue_ack {
-            rsv_owner_committed_q = 1'b0;
-        } else if rob_commit_valid && rob_commit_idx == rsv_rob_q {
-            rsv_owner_committed_q = 1'b1;
         }
     }
 
