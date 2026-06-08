@@ -230,12 +230,34 @@ pub module heliodor_core #(
     // Fetch (Stage F)
     // ============================================================
     var pc_q       : logic<64>;
-    var if_v_q     : logic    ;
+    // Phase 8 S4a: the IF/ID hand-off is now a decoupled fetch buffer (FIFO),
+    // not a single registered latch. The if_*_q names below are kept (every
+    // consumer — decode, rename, rob alloc, IRQ trap-PC, debug — reads them) but
+    // are now COMBINATIONAL reads of the FIFO head (see the fetch_buffer block
+    // after the fetch always_ff). Decoupling lets the fetch engine run ahead of
+    // rename during back-end stalls and (in S4b) drain 2/cycle for 2-wide rename.
+    var if_v_q     : logic    ; // FIFO non-empty (head valid)
     var if_pc_q    : logic<64>;
     var if_instr_q : logic<32>;
     var if_is_rvc_q: logic    ; // M7: was the fetched instr a 2-byte RVC
     var if_pred_next_pc_q: logic<64>; // Phase 8 M1: next PC fetched after the delivered instr (= predicted)
     var if_pred_index_q  : logic<10>; // Phase 8 M4: gshare BHT index used for the delivered instr
+
+    // Phase 8 S4a: fetch buffer (decode queue). Depth-8 FIFO of clean fetched
+    // records. Per-field plain arrays (NOT an array of structs) so the
+    // combinational head read is not subject to the Veryl-sim dynamic-index
+    // struct-field-read staleness bug. Filled by the fetch engine (<=1/cycle in
+    // S4a.2, <=2/cycle from S4a.3), drained by rename (<=1/cycle until S4b).
+    const FB_DEPTH: u32 = 8;
+    var fb_pc          : logic<64> [FB_DEPTH];
+    var fb_instr       : logic<32> [FB_DEPTH];
+    var fb_is_rvc      : logic     [FB_DEPTH];
+    var fb_pred_next_pc: logic<64> [FB_DEPTH];
+    var fb_pred_index  : logic<10> [FB_DEPTH];
+    var fb_ifault      : logic     [FB_DEPTH];
+    var fb_head : logic<3>; // read pointer (oldest, = IF/ID head)
+    var fb_tail : logic<3>; // write pointer (next push slot)
+    var fb_count: logic<4>; // occupancy 0..8
 
     // Forward-declared CSR outputs consumed by imem_mmu/dmem_mmu insts
     // below; driven by csr inst further down.
@@ -317,6 +339,10 @@ pub module heliodor_core #(
 
     var redirect_fire: logic    ;
     var redirect_pc  : logic<64>;
+    // Phase 8 S4a: forward-declared (assigned by the csr inst's o_irq_pending
+    // far below) so the fetch-buffer drain gate in fb_pop / rename_fire can
+    // reference it. High when an enabled+pending interrupt should be taken.
+    var csr_irq_pending: logic;
     var stall_dr     : logic    ; // back-pressure from D/R
 
     // M7: RVC fetch path with straddle handling.
@@ -344,6 +370,7 @@ pub module heliodor_core #(
     // is unused — v4 resolves straddles via the explicit 2-cycle re-fetch.
     var icache_rdata     : logic<32>;
     var icache_rdata_next: logic<32>;
+    var icache_rdata_next_valid: logic; // Phase 8 S4: next-word present this cycle
     var icache_stall     : logic    ;
 
     // M8.B: D-cache outputs (instance after dmem_mmu, near end of file).
@@ -425,11 +452,23 @@ pub module heliodor_core #(
     let pred_target    : logic<64> = if pred_use_ras ? ras_spec_top : btb_target;
     let pred_next_pc_bp: logic<64> = if predicted_taken ? pred_target : pc_q + pc_advance;
 
+    // Phase 8 S4a: fetch buffer push/pop/full control.
+    //   fb_pop   = rename drains the head this cycle (== rename_fire below;
+    //              MUST stay identical or a popped record is never renamed).
+    //   fb_full  = no room for a push (full and not simultaneously draining).
+    //   fb_push  = the fetch engine delivers a record into the FIFO this cycle.
+    // fb_pop depends only on registered state (if_v_q/fb_count) + external
+    // resource readiness, so fb_full→fb_push has no combinational cycle.
+    // !csr_irq_pending: see the interrupt-drain note at rename_fire — a pending
+    // interrupt halts rename so the ROB drains to empty and commit_irq can fire.
+    let fb_pop : logic = if_v_q && !stall_dr && !redirect_fire && !csr_irq_pending;
+    let fb_full: logic = fb_count == 4'd8 && !fb_pop;
     // M3: an instruction is delivered (its prediction applied) this cycle when
-    // the delivery arm of the fetch latch fires. RAS speculative push/pop are
-    // gated on this so a stalled / squashed cycle does not perturb the stack
-    // (straddle-prep has needs_straddle=1 ⇒ fetch_ready=0, so it is excluded).
-    let fetch_deliver : logic     = !redirect_fire && !stall_dr && fetch_ready;
+    // the fetch engine pushes it into the FIFO. RAS speculative push/pop and the
+    // gshare spec-history update are gated on this so a stalled / squashed /
+    // straddle-prep cycle does not perturb them (straddle-prep has fetch_ready=0).
+    let fb_push       : logic     = !redirect_fire && !fb_full && fetch_ready;
+    let fetch_deliver : logic     = fb_push;
     let ras_push_addr : logic<64> = pc_q + pc_advance; // return address of a call
     let ras_spec_push : logic     = fetch_deliver && btb_hit && btb_is_call;
     let ras_spec_pop  : logic     = fetch_deliver && btb_hit && btb_is_ret;
@@ -492,86 +531,96 @@ pub module heliodor_core #(
     // imem_mmu's i_vaddr is the fetch address — advances ahead of pc_q
     // by 2 during straddle so the next-word fetch lands cycle T+1.
 
+    // ============================================================
+    // Phase 8 S4a: fetch engine. Owns pc_q + the straddle state. Decoupled from
+    // rename: it advances whenever the fetch buffer has room (fb_full=0), no
+    // longer gated on rename back-pressure (was !stall_dr). The delivered record
+    // is pushed into the fetch buffer (FIFO) below, not written into a single
+    // latch. On a flush pc_q resets here and the FIFO is emptied in its own
+    // always_ff. While the FIFO is full the engine freezes (pc_q/straddle held).
+    // ============================================================
     always_ff (clk, rst) {
         if_reset {
             pc_q           = RESET_PC;
-            if_v_q         = 1'b0;
-            if_pc_q        = RESET_PC;
-            if_instr_q     = 32'd0;
-            if_is_rvc_q    = 1'b0;
-            if_pred_next_pc_q = RESET_PC;
-            if_pred_index_q   = 10'd0;
             straddle_q     = 1'b0;
             straddle_low_q = 16'd0;
-            if_ifault_q    = 1'b0;
-        } else {
-            if redirect_fire {
-                pc_q           = redirect_pc;
-                if_v_q         = 1'b0;
-                if_pc_q        = redirect_pc;
-                if_instr_q     = 32'd0;
-                if_is_rvc_q    = 1'b0;
-                if_pred_next_pc_q = redirect_pc;
-                if_pred_index_q   = 10'd0;
-                straddle_q     = 1'b0;
-                straddle_low_q = 16'd0;
-                if_ifault_q    = 1'b0;
-            } else if needs_straddle && (imem_valid_w || imem_fault_w) && !stall_dr && !icache_stall {
-                // Latch high half, advance fetch addr next cycle; hold pc_q.
-                // M9.A.315: gate on !stall_dr (symmetric with the delivery
-                // branch below). Without it, when the IF/ID slot holds a
-                // delivered-but-not-yet-renamed instr (if_v_q=1 + stall_dr=1)
-                // and the NEXT pc_q is a straddling 32-bit instr, this branch
-                // fired and cleared if_v_q=1'b0 — DROPPING the held instr. Seen
-                // as a skipped `c.jr ra` (ret) at PC 0x80047afc (the next instr
-                // 0x80047afe straddles the 0x80047b00 line): the function fell
-                // through to 0x80047afe with the just-restored caller s2=0 →
-                // NULL deref → init Oops. Holding IF/ID through the stall lets
-                // the c.jr rename, then the straddle preps once the slot frees.
-                // M9.A.255: gate on imem_valid_w. During Sv39 PTW walks
-                // mmu's o_paddr returns a stale `pa` derived from the
-                // previous walk's leaf_pte_ppn — if this branch fires
-                // before imem_valid_w=1, straddle_low_q captures garbage
-                // from the wrong PA's word, producing a corrupted 32-bit
-                // straddled instruction. Manifested as PC 0x80003dd6
-                // SLLIW being executed as ADDI s3, a1, 0xc on the 2nd
-                // __set_fixmap call (boot blocker, see
-                // project_phase7_v4_m9_blocker.md M9.A.254).
+        } else if redirect_fire {
+            pc_q           = redirect_pc;
+            straddle_q     = 1'b0;
+            straddle_low_q = 16'd0;
+        } else if !fb_full {
+            if needs_straddle && (imem_valid_w || imem_fault_w) && !icache_stall {
+                // Straddle prep (cycle 1 of 2): latch the high half, advance the
+                // fetch addr (fetch_vaddr = pc_q+2) next cycle, hold pc_q. Does
+                // NOT push — the straddled 32-bit instr delivers on cycle 2.
+                // M9.A.255: gate on imem_valid_w. During Sv39 PTW walks mmu's
+                // o_paddr returns a stale `pa` derived from the previous walk's
+                // leaf_pte_ppn — if this fired before imem_valid_w=1,
+                // straddle_low_q would capture garbage from the wrong PA's word,
+                // producing a corrupted 32-bit straddled instruction (boot
+                // blocker, project_phase7_v4_m9_blocker.md M9.A.254). The old
+                // !stall_dr gate (M9.A.315) is gone: with the FIFO decoupling,
+                // back-end stalls hold the renamed instr in the FIFO, never in
+                // the fetch engine, so straddle-prep can never drop it.
                 straddle_q     = 1'b1;
                 straddle_low_q = curr_hw;
-                if_v_q         = 1'b0; // no instr ready this cycle
-            } else if !stall_dr && fetch_ready {
-                if_v_q      = 1'b1;
-                if_pc_q     = pc_q;
-                if_instr_q  = fetched_instr;
-                if_ifault_q = imem_fault_w;
-                // M7: track RVC-origin for the link register (pc+2 vs pc+4).
-                // Straddle resolves a 32-bit, so is_rvc=0 in that case.
-                if_is_rvc_q = !straddle_q && curr_is_rvc;
-                // Phase 8 M2: steer the next fetch to the BTB/BHT prediction
-                // (pred_next_pc_bp = btb_target when predicted taken, else the
-                // sequential pc_q + pc_advance). Record the same value as this
-                // op's predicted next PC so commit can validate it. A wrong
-                // prediction is caught by c_bp_mispredict and flushed.
-                if_pred_next_pc_q = pred_next_pc_bp;
-                if_pred_index_q   = bht_lk_index;
+            } else if fetch_ready {
+                // Deliver: push handled in the fetch_buffer always_ff (fb_push).
+                // Steer the next fetch to the BTB/BHT/RAS prediction
+                // (pred_next_pc_bp); commit validates it (c_bp_mispredict).
                 pc_q        = pred_next_pc_bp;
                 straddle_q  = 1'b0;
-            } else if !stall_dr {
-                // M8.A: IF/ID slot is free (empty, or its instr was renamed
-                // this cycle since !stall_dr ⇒ rename_fire) but no replacement
-                // could be delivered — the icache is filling a miss (or, under
-                // Sv39, the imem PTW is still walking / awaiting valid). Clear
-                // if_v_q so the just-renamed instr is NOT re-dispatched on the
-                // following cycle. pc_q and straddle_q are held, so the fetch
-                // resumes at the same point once the stall clears. Before the
-                // icache made fetch genuinely multi-cycle, fetch_ready was
-                // always 1 in Bare mode so this slot was refreshed every cycle
-                // and the gap never appeared.
-                if_v_q = 1'b0;
             }
+            // else: icache filling a miss / Sv39 PTW still walking → hold pc_q +
+            // straddle_q so fetch resumes at the same point once the stall clears.
+        }
+        // else fb_full → freeze the fetch engine (no push possible this cycle).
+    }
+
+    // ============================================================
+    // Phase 8 S4a: fetch buffer (decode queue). The fetch engine pushes a clean
+    // record (fb_push) and rename drains the head (fb_pop). The head is exposed
+    // combinationally on the if_*_q names every downstream stage already reads.
+    // On a flush the FIFO is emptied (head=tail, count=0). Per-field plain
+    // arrays avoid the dynamic-index struct-field-read sim bug.
+    // ============================================================
+    always_ff (clk, rst) {
+        if_reset {
+            fb_head  = 3'd0;
+            fb_tail  = 3'd0;
+            fb_count = 4'd0;
+        } else if redirect_fire {
+            fb_head  = 3'd0;
+            fb_tail  = 3'd0;
+            fb_count = 4'd0;
+        } else {
+            if fb_push {
+                fb_pc[fb_tail]           = pc_q;
+                fb_instr[fb_tail]        = fetched_instr;
+                // M7: track RVC-origin for the link register (pc+2 vs pc+4). A
+                // straddle resolves a 32-bit instr, so is_rvc=0 in that case.
+                fb_is_rvc[fb_tail]       = !straddle_q && curr_is_rvc;
+                fb_ifault[fb_tail]       = imem_fault_w;
+                fb_pred_next_pc[fb_tail] = pred_next_pc_bp;
+                fb_pred_index[fb_tail]   = bht_lk_index;
+                fb_tail                  = fb_tail + 3'd1;
+            }
+            if fb_pop {
+                fb_head = fb_head + 3'd1;
+            }
+            fb_count = fb_count + (if fb_push ? 4'd1 : 4'd0) - (if fb_pop ? 4'd1 : 4'd0);
         }
     }
+
+    // FIFO head → IF/ID hand-off (combinational reads; latency identical to the
+    // old single registered latch since the record was pushed >=1 cycle earlier).
+    assign if_v_q          = fb_count != 4'd0;
+    assign if_pc_q         = fb_pc[fb_head];
+    assign if_instr_q      = fb_instr[fb_head];
+    assign if_is_rvc_q     = fb_is_rvc[fb_head];
+    assign if_pred_next_pc_q = fb_pred_next_pc[fb_head];
+    assign if_pred_index_q = fb_pred_index[fb_head];
+    assign if_ifault_q     = fb_ifault[fb_head];
 
     // ============================================================
     // M5.C: imem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
@@ -654,12 +703,14 @@ pub module heliodor_core #(
         i_flush     : commit_fence_i_pulse,
         o_rdata     : icache_rdata       ,
         o_rdata_next: icache_rdata_next  ,
+        o_rdata_next_valid: icache_rdata_next_valid,
         o_stall     : icache_stall       ,
         o_mem_addr  : o_imem_addr        ,
         i_mem_rdata : i_imem_rdata       ,
         o_mem_ren   : o_imem_ren         ,
     );
     let _unused_icache_rdata_next: logic<32> = icache_rdata_next;
+    let _unused_icache_rdata_next_valid: logic = icache_rdata_next_valid;
 
     // ============================================================
     // Decode (Stage D)
@@ -742,7 +793,20 @@ pub module heliodor_core #(
         && (!dec_op.fp_writes_fp || !fp_free_empty);
     assign stall_dr = if_v_q && !resources_avail;
 
-    let rename_fire: logic = if_v_q && !stall_dr && !redirect_fire;
+    // Phase 8 S4a: interrupt-drain gate (!csr_irq_pending). An interrupt is taken
+    // only at commit when the ROB is empty (commit_irq = rob_size==0 && ... &&
+    // csr_irq_pending). With the 1-deep IF/ID latch the front end naturally left
+    // the ROB empty often enough; the decoupled fetch buffer keeps rename fed
+    // every cycle, so a hart in a WFI/idle busy-loop (WFI is a NOP in v4) keeps
+    // the ROB non-empty and would NEVER reach rob_size==0 → the pending timer/IPI
+    // interrupt is never taken → SMP boot livelocks past the normal finish and
+    // eventually panics ("Fatal exception in interrupt"). Halting rename while an
+    // interrupt is pending drains the in-flight ops so commit_irq can fire. This
+    // is the standard precise-interrupt drain; it cannot deadlock (commit is not
+    // gated, the ROB empties, and commit_irq keys on the SAME csr_irq_pending, so
+    // the trap is taken and clears MIE/SIE → csr_irq_pending drops → rename
+    // resumes). fb_pop carries the same gate so no FIFO record is dropped.
+    let rename_fire: logic = if_v_q && !stall_dr && !redirect_fire && !csr_irq_pending;
 
     // ROB alloc entry
     var rob_alloc_entry: RobEntry;
@@ -916,7 +980,8 @@ pub module heliodor_core #(
     var dbg_csr_mtval  : logic<64>;
     var csr_sepc       : logic<64>;
     var csr_mideleg_w  : logic<64>;
-    var csr_irq_pending: logic    ;
+    // csr_irq_pending forward-declared early (interrupt-drain gate in fb_pop /
+    // rename_fire references it before this point).
     var csr_irq_cause  : logic<64>;
     var csr_irq_to_s   : logic    ;
     // csr_satp / csr_priv / csr_sum / csr_mxr / csr_medeleg_w declared
