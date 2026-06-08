@@ -813,6 +813,59 @@ pub module heliodor_core #(
     }
 
     // ============================================================
+    // Phase 8 S2: slot-1 rename datapath (2-wide alloc/rename, built dead).
+    // ============================================================
+    // The slot-1 (younger) op of the rename bundle. The front end is still
+    // 1-wide in S2/S3, so there is no second decode yet — slot-1 is sourced from
+    // slot-0 as a placeholder and gated entirely off (rename_fire2 = 0). S4
+    // repoints the dec_op2_* lets to the real second decode lane and flips
+    // rename_fire2 on. With rename_fire2 = 0, every slot-1 module enable is 0, so
+    // the pipeline behaves exactly as 1-wide (cycle-exact). This milestone only
+    // builds and wires the ports + the intra-bundle rename bypass.
+    let rename_fire2: logic = 1'b0;
+    // Placeholder slot-1 decoded fields (S4: second decode lane). Slot-1 is
+    // integer-only (FP stays 1-wide on pipe-0), so no FP-dest fields here.
+    let dec_op2_rs1_arch : logic<5> = dec_op.rs1_arch;
+    let dec_op2_rs2_arch : logic<5> = dec_op.rs2_arch;
+    let dec_op2_rd_arch  : logic<5> = dec_op.rd_arch;
+    let dec_op2_has_rd   : logic    = dec_op.has_rd;
+
+    // slot-1 free-list pop (int dest only).
+    var new_rd_pdst2: logic<PRF_INT_W>;
+    let fl_pop_en2  : logic = rename_fire2 && dec_op2_has_rd;
+
+    // slot-1 RAT raw reads (intra-bundle bypass applied below).
+    var rat_rs1_pdst2   : logic<PRF_INT_W>;
+    var rat_rs2_pdst2   : logic<PRF_INT_W>;
+    var rat_rd_old_pdst2: logic<PRF_INT_W>;
+    // o_alloc_idx2 from the ROB; consumed by ren_op2.rob_idx below.
+    var rob_alloc_idx2: logic<ROB_IDX_W>;
+
+    // Intra-bundle RAW/WAW bypass: slot-0 renames its int dest to new_rd_pdst
+    // this same cycle. slot-1 (younger) must see that mapping for any source or
+    // old-dest that names slot-0's rd, because the RAT write lands at the clock
+    // edge (slot-1's combinational RAT read would otherwise see the stale value).
+    // new_rd_pdst is the free-list registered read, combinationally available →
+    // no comb loop. FP-dest slot-0 renames do not touch the int RAT, so the
+    // bypass is int-dest-only.
+    let s0_int_rename : logic = rename_fire && dec_op.has_rd && !ren_dst_is_fp && dec_op.rd_arch != 5'd0;
+    let s1_rs1_pdst   : logic<PRF_INT_W> = if s0_int_rename && dec_op2_rs1_arch == dec_op.rd_arch ? new_rd_pdst : rat_rs1_pdst2;
+    let s1_rs2_pdst   : logic<PRF_INT_W> = if s0_int_rename && dec_op2_rs2_arch == dec_op.rd_arch ? new_rd_pdst : rat_rs2_pdst2;
+    let s1_old_rd_pdst: logic<PRF_INT_W> = if s0_int_rename && dec_op2_rd_arch == dec_op.rd_arch ? new_rd_pdst : rat_rd_old_pdst2;
+
+    // slot-1 RenamedOp (consumes the bypass + slot-1 pdsts; fed to iq_int's
+    // slot-1 alloc port, which is enable-gated off in S2).
+    var ren_op2: RenamedOp;
+    always_comb {
+        ren_op2.base        = dec_op; // S4: second decode
+        ren_op2.rd_pdst     = new_rd_pdst2;
+        ren_op2.rs1_pdst    = s1_rs1_pdst;
+        ren_op2.rs2_pdst    = s1_rs2_pdst;
+        ren_op2.old_rd_pdst = s1_old_rd_pdst;
+        ren_op2.rob_idx     = rob_alloc_idx2;
+    }
+
+    // ============================================================
     // Issue / Execute (Stage IE)
     // ============================================================
     var iq_issue_valid: logic    ;
@@ -1028,6 +1081,8 @@ pub module heliodor_core #(
         rst                           ,
         i_pop_en       : fl_pop_en    ,
         o_pop_pdst     : new_rd_pdst  ,
+        i_pop_en2      : fl_pop_en2   ,
+        o_pop_pdst2    : new_rd_pdst2 ,
         o_empty        : free_empty   ,
         i_push_en      : fl_push_en   ,
         i_push_pdst    : fl_push_pdst ,
@@ -1056,9 +1111,20 @@ pub module heliodor_core #(
         o_rs2_pdst     : rs2_pdst                    ,
         i_rd_arch      : dec_op.rd_arch              ,
         o_rd_old_pdst  : old_rd_pdst                 ,
+        // Phase 8 S2: slot-1 raw reads (core applies the intra-bundle bypass).
+        i_rs1_arch2    : dec_op2_rs1_arch            ,
+        o_rs1_pdst2    : rat_rs1_pdst2               ,
+        i_rs2_arch2    : dec_op2_rs2_arch            ,
+        o_rs2_pdst2    : rat_rs2_pdst2               ,
+        i_rd_arch2     : dec_op2_rd_arch             ,
+        o_rd_old_pdst2 : rat_rd_old_pdst2            ,
         i_rename_en    : rename_fire && dec_op.has_rd,
         i_rename_arch  : dec_op.rd_arch              ,
         i_rename_pdst  : new_rd_pdst                 ,
+        // Phase 8 S2: slot-1 rename write (int dest), gated off until S4.
+        i_rename_en2   : rename_fire2 && dec_op2_has_rd,
+        i_rename_arch2 : dec_op2_rd_arch             ,
+        i_rename_pdst2 : new_rd_pdst2                ,
         i_commit_en    : rat_commit_en               ,
         i_commit_arch  : rat_commit_arch             ,
         i_commit_pdst  : rat_commit_pdst             ,
@@ -1100,9 +1166,15 @@ pub module heliodor_core #(
         rst                                                 ,
         i_pop_en       : rename_fire && dec_op.fp_writes_fp ,
         o_pop_pdst     : new_fp_rd_pdst                     ,
+        // FP free list stays 1-wide (FP is rare, pipe-0 only): slot-1 pop/push
+        // ports tied off.
+        i_pop_en2      : 1'b0                               ,
+        o_pop_pdst2    : _                                  ,
         o_empty        : fp_free_empty                      ,
         i_push_en      : fp_fl_push_en                      ,
         i_push_pdst    : fp_fl_push_pdst                    ,
+        i_push_en2     : 1'b0                               ,
+        i_push_pdst2   : 6'd0                               ,
         i_recovery_fire: redirect_fire                      ,
     );
 
@@ -1199,10 +1271,18 @@ pub module heliodor_core #(
         i_alloc_en          : rename_fire && !dec_op.is_fpu_op    ,
         i_alloc_op          : ren_op                      ,
         o_alloc_rdy         : iq_alloc_rdy                ,
+        // Phase 8 S2: slot-1 alloc (integer-only; gated off via rename_fire2=0
+        // until S4). o_alloc_rdy2 is discarded in S2 — S4 gates rename_fire2 on it.
+        i_alloc_en2         : rename_fire2                ,
+        i_alloc_op2         : ren_op2                     ,
+        o_alloc_rdy2        : _                           ,
         // M6: clear int prf-ready only on an INT dest rename (has_rd covers
         // int ops + FP→INT). FP-dest renames clear the FP bitmap in iq_fp.
         i_rename_set_pending: rename_fire && dec_op.has_rd,
         i_rename_pdst       : new_rd_pdst                 ,
+        // Phase 8 S2: slot-1 rename clear (int dest), gated off until S4.
+        i_rename_set_pending2: rename_fire2 && dec_op2_has_rd,
+        i_rename_pdst2       : new_rd_pdst2               ,
         i_cdb_valid         : cdb.valid                   ,
         i_cdb_has_rd        : cdb.has_rd && !cdb_dest_is_fp,
         i_cdb_pdst          : cdb.pdst                    ,
@@ -1341,6 +1421,12 @@ pub module heliodor_core #(
         i_alloc_entry        : rob_alloc_entry      ,
         o_alloc_idx          : rob_alloc_idx        ,
         o_full               : rob_full             ,
+        // Phase 8 S2: slot-1 alloc port, gated off (rename_fire2=0) until S4.
+        // i_alloc_entry2 is a placeholder (slot-0 entry) in S2 — S4 builds the
+        // real second-decode entry. o_alloc_idx2 feeds ren_op2.rob_idx.
+        i_alloc_en2          : rename_fire2         ,
+        i_alloc_entry2       : rob_alloc_entry      ,
+        o_alloc_idx2         : rob_alloc_idx2       ,
         i_cdb_valid          : cdb.valid            ,
         i_cdb_rob_idx        : cdb.rob_idx          ,
         i_cdb_result_data    : cdb.data             ,
