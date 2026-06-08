@@ -235,6 +235,7 @@ pub module heliodor_core #(
     var if_instr_q : logic<32>;
     var if_is_rvc_q: logic    ; // M7: was the fetched instr a 2-byte RVC
     var if_pred_next_pc_q: logic<64>; // Phase 8 M1: next PC fetched after the delivered instr (= predicted)
+    var if_pred_index_q  : logic<10>; // Phase 8 M4: gshare BHT index used for the delivered instr
 
     // Forward-declared CSR outputs consumed by imem_mmu/dmem_mmu insts
     // below; driven by csr inst further down.
@@ -405,6 +406,12 @@ pub module heliodor_core #(
     var btb_is_call: logic    ;
     var btb_is_ret : logic    ;
     var bht_taken  : logic    ;
+    // M4 gshare: speculative + committed global history. The lookup index folds
+    // the speculative history into the low PC index bits. The committed history
+    // tracks actual conditional-branch outcomes; on a flush spec <- committed.
+    var spec_ghr     : logic<8> ;
+    var committed_ghr: logic<8> ;
+    let bht_lk_index : logic<10> = pc_q[10:1] ^ {2'b00, spec_ghr};
     // M3 RAS speculative top (combinational).
     var ras_spec_top  : logic<64>;
     var ras_spec_valid: logic    ;
@@ -436,6 +443,7 @@ pub module heliodor_core #(
     var btb_train_is_call: logic    ;
     var btb_train_is_ret : logic    ;
     var bht_train_taken  : logic    ;
+    var bht_train_index  : logic<10>; // M4 gshare: carried fetch-time index
     // M3 RAS architectural push/pop (commit; forward-referenced).
     var ras_arch_push     : logic    ;
     var ras_arch_pop      : logic    ;
@@ -460,10 +468,10 @@ pub module heliodor_core #(
     inst u_bht: bht (
         clk                            ,
         rst                            ,
-        i_pc         : pc_q            ,
+        i_index      : bht_lk_index    ,
         o_taken      : bht_taken       ,
         i_train_en   : bht_train_en    ,
-        i_train_pc   : bp_train_pc     ,
+        i_train_index: bht_train_index ,
         i_train_taken: bht_train_taken ,
     );
     inst u_ras: ras (
@@ -492,6 +500,7 @@ pub module heliodor_core #(
             if_instr_q     = 32'd0;
             if_is_rvc_q    = 1'b0;
             if_pred_next_pc_q = RESET_PC;
+            if_pred_index_q   = 10'd0;
             straddle_q     = 1'b0;
             straddle_low_q = 16'd0;
             if_ifault_q    = 1'b0;
@@ -503,6 +512,7 @@ pub module heliodor_core #(
                 if_instr_q     = 32'd0;
                 if_is_rvc_q    = 1'b0;
                 if_pred_next_pc_q = redirect_pc;
+                if_pred_index_q   = 10'd0;
                 straddle_q     = 1'b0;
                 straddle_low_q = 16'd0;
                 if_ifault_q    = 1'b0;
@@ -544,6 +554,7 @@ pub module heliodor_core #(
                 // op's predicted next PC so commit can validate it. A wrong
                 // prediction is caught by c_bp_mispredict and flushed.
                 if_pred_next_pc_q = pred_next_pc_bp;
+                if_pred_index_q   = bht_lk_index;
                 pc_q        = pred_next_pc_bp;
                 straddle_q  = 1'b0;
             } else if !stall_dr {
@@ -760,6 +771,9 @@ pub module heliodor_core #(
         // a link reg with no link write (RISC-V return-address-stack hints).
         rob_alloc_entry.is_call        = (dec_op.is_jal || dec_op.is_jalr) && (dec_op.rd_arch == 5'd1 || dec_op.rd_arch == 5'd5);
         rob_alloc_entry.is_ret         = dec_op.is_jalr && (dec_op.rs1_arch == 5'd1 || dec_op.rs1_arch == 5'd5) && !(dec_op.rd_arch == 5'd1 || dec_op.rd_arch == 5'd5);
+        // M4 gshare: carry the fetch-time BHT index (the speculative-history one
+        // actually used for this op's prediction) so commit trains that entry.
+        rob_alloc_entry.pred_index     = if_pred_index_q;
         rob_alloc_entry.illegal        = dec_op.illegal || if_ifault_q;
         rob_alloc_entry.is_ifault      = if_ifault_q;
         rob_alloc_entry.result_data    = 64'd0;
@@ -1234,6 +1248,7 @@ pub module heliodor_core #(
     var c_is_cond     : logic           ; // M2: conditional branch (BHT train)
     var c_is_call     : logic           ; // M3: call (RAS push + BTB kind)
     var c_is_ret      : logic           ; // M3: return (RAS pop + BTB kind)
+    var c_pred_index  : logic<10>       ; // M4: carried gshare BHT index
     var c_result_data : logic<64>       ;
     var c_is_store    : logic           ;
     var c_store_addr  : logic<64>       ;
@@ -1337,6 +1352,7 @@ pub module heliodor_core #(
         o_commit_is_cond     : c_is_cond            ,
         o_commit_is_call     : c_is_call            ,
         o_commit_is_ret      : c_is_ret             ,
+        o_commit_pred_index  : c_pred_index         ,
         o_commit_result_data : c_result_data        ,
         o_commit_is_store    : c_is_store           ,
         o_commit_store_addr  : c_store_addr         ,
@@ -1732,12 +1748,36 @@ pub module heliodor_core #(
     assign btb_train_is_call = c_is_call;
     assign btb_train_is_ret  = c_is_ret;
     assign bht_train_taken   = c_is_control && (c_redirect_pc != c_fall_pc);
+    assign bht_train_index   = c_pred_index;
     // M3 RAS architectural update: a committed call pushes its return address
     // (the fall-through PC); a committed return pops. On a redirect the
     // speculative RAS is restored from this architectural stack.
     assign ras_arch_push      = rob_commit_ack && c_is_call;
     assign ras_arch_pop       = rob_commit_ack && c_is_ret;
     assign ras_arch_push_addr = c_fall_pc;
+    // M4 gshare global history. committed_ghr shifts in each committed
+    // conditional branch's actual direction; spec_ghr shifts in the predicted
+    // direction at fetch and is restored from committed_ghr on a flush. Because
+    // redirect_fire lags the commit by one cycle, committed_ghr has already
+    // absorbed the redirecting branch's outcome by the recovery cycle, so the
+    // restore is exact.
+    let c_dir_taken: logic = c_redirect_pc != c_fall_pc; // control op went taken
+    always_ff (clk, rst) {
+        if_reset {
+            committed_ghr = 8'd0;
+        } else if rob_commit_ack && c_is_cond {
+            committed_ghr = {committed_ghr[6:0], c_dir_taken};
+        }
+    }
+    always_ff (clk, rst) {
+        if_reset {
+            spec_ghr = 8'd0;
+        } else if redirect_fire {
+            spec_ghr = committed_ghr;
+        } else if fetch_deliver && btb_hit && btb_is_cond {
+            spec_ghr = {spec_ghr[6:0], bht_taken};
+        }
+    }
     always_ff (clk, rst) {
         if_reset {
             redirect_fire_q = 1'b0;
