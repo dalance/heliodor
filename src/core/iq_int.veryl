@@ -93,6 +93,20 @@ pub module iq_int #(
     o_issue_fp_ld   : output logic             ,
     o_issue_fp_st   : output logic             ,
     i_issue_ack     : input  logic             ,
+    // Phase 8 S3.b: 2nd issue port (pipe-1). Picks the lowest-index ready entry
+    // that is pipe-1-eligible — register ALU / branch / JAL / JALR / LUI / AUIPC
+    // (MUL/DIV included: they are plain AluOp results, not a separate busy unit)
+    // — and distinct from the slot-0 issue_idx. LOAD/STORE/AMO/CSR/FP stay on
+    // slot-0/pipe-0 (pipe-1 has no mem/csr/amo/fp side-bands). Both issue slots
+    // snoop both CDB lanes (S3.a wakeup). pipe-1 completes in one cycle with no
+    // back-pressure, so i_issue_ack2 == o_issue_valid2 from the core.
+    o_issue_valid2   : output logic                     ,
+    o_issue_op2      : output pipeline_pkg::RenamedOp,
+    o_issue_rs1_pdst2: output logic<PRF_W>              ,
+    o_issue_rs2_pdst2: output logic<PRF_W>              ,
+    o_issue_rd_pdst2 : output logic<PRF_W>              ,
+    o_issue_rob_idx2 : output logic<ROB_IDX_W>          ,
+    i_issue_ack2     : input  logic                     ,
     // M2 LOAD ordering: when high, suppress LOAD issue (conservative
     // store-to-load wait, no forwarding). Driven by rob's
     // o_has_pending_store. M5 LSQ replaces this with per-LOAD age-aware
@@ -127,6 +141,10 @@ pub module iq_int #(
     var sh_rd_pdst   : logic         <PRF_W>     [IQ_N];
     var sh_rob_idx   : logic         <ROB_IDX_W> [IQ_N];
     var sh_is_load   : logic                     [IQ_N];
+    // Phase 8 S3.b: store flag mirror — pipe-1 eligibility excludes stores
+    // (no store side-band on CDB lane 1). Shadowed like the other tags so the
+    // dynamic-index issue-select read is not the buggy struct-field read.
+    var sh_is_store  : logic                     [IQ_N];
     var sh_is_amo    : logic                     [IQ_N];
     var sh_amo_funct5: logic         <5>         [IQ_N];
     var sh_is_csr    : logic                     [IQ_N];
@@ -216,6 +234,34 @@ pub module iq_int #(
     assign o_issue_fp_ld      = sh_fp_ld[issue_idx];
     assign o_issue_fp_st      = sh_fp_st[issue_idx];
 
+    // Phase 8 S3.b: 2nd issue pick — lowest-index ready entry that is pipe-1-
+    // eligible and not the slot-0 pick. Eligible entries are never blocked
+    // (i_block_loads / i_block_mem_xlate / CSR-serialize gate only LOAD/AMO/CSR,
+    // all excluded by pipe1_ok), so no `blocked` term is needed. issue_idx2 >
+    // issue_idx always holds: any lower ready+eligible entry would already be
+    // the slot-0 pick (issue_idx is the lowest ready+unblocked entry).
+    var issue_idx2   : logic<IQ_W>;
+    var has_issuable2: logic      ;
+    always_comb {
+        issue_idx2    = 3'd0;
+        has_issuable2 = 1'b0;
+        for i in 0..IQ_N {
+            let pipe1_ok: logic = !sh_is_load[i] && !sh_is_store[i] && !sh_is_amo[i]
+                && !sh_is_csr[i] && !sh_fp_ld[i] && !sh_fp_st[i];
+            if has_issuable && !has_issuable2 && occupied[i] && rs1_rdy[i] && rs2_rdy[i]
+                && pipe1_ok && ((i as IQ_W) != issue_idx) {
+                issue_idx2    = i as IQ_W;
+                has_issuable2 = 1'b1;
+            }
+        }
+    }
+    assign o_issue_valid2    = has_issuable2;
+    assign o_issue_op2       = ops[issue_idx2];
+    assign o_issue_rs1_pdst2 = sh_rs1_pdst[issue_idx2];
+    assign o_issue_rs2_pdst2 = sh_rs2_pdst[issue_idx2];
+    assign o_issue_rd_pdst2  = sh_rd_pdst[issue_idx2];
+    assign o_issue_rob_idx2  = sh_rob_idx[issue_idx2];
+
     always_ff (clk, rst) {
         if_reset {
             for i in 0..IQ_N {
@@ -227,6 +273,7 @@ pub module iq_int #(
                 sh_rd_pdst[i]    = 6'd0;
                 sh_rob_idx[i]    = 5'd0;
                 sh_is_load[i]    = 1'b0;
+                sh_is_store[i]   = 1'b0;
                 sh_is_amo[i]     = 1'b0;
                 sh_amo_funct5[i] = 5'd0;
                 sh_is_csr[i]     = 1'b0;
@@ -305,6 +352,11 @@ pub module iq_int #(
             if i_issue_ack && has_issuable {
                 occupied[issue_idx] = 1'b0;
             }
+            // Phase 8 S3.b: free the slot-1 (pipe-1) issued entry. issue_idx2 !=
+            // issue_idx by construction, so the two frees touch distinct elements.
+            if i_issue_ack2 && has_issuable2 {
+                occupied[issue_idx2] = 1'b0;
+            }
             // Allocate: install op in free_idx, sample initial ready bits
             // from prf_ready. For !has_rsN ops the ready bit is forced 1.
             if i_alloc_en && has_free_slot {
@@ -314,6 +366,7 @@ pub module iq_int #(
                 sh_rd_pdst[free_idx]    = i_alloc_op.rd_pdst;
                 sh_rob_idx[free_idx]    = i_alloc_op.rob_idx;
                 sh_is_load[free_idx]    = i_alloc_op.base.is_load;
+                sh_is_store[free_idx]   = i_alloc_op.base.is_store;
                 sh_is_amo[free_idx]     = i_alloc_op.base.is_amo;
                 sh_amo_funct5[free_idx] = i_alloc_op.base.amo_funct5;
                 sh_is_csr[free_idx]     = i_alloc_op.base.is_csr;
@@ -356,6 +409,7 @@ pub module iq_int #(
                 sh_rd_pdst[free_idx2]    = i_alloc_op2.rd_pdst;
                 sh_rob_idx[free_idx2]    = i_alloc_op2.rob_idx;
                 sh_is_load[free_idx2]    = i_alloc_op2.base.is_load;
+                sh_is_store[free_idx2]   = i_alloc_op2.base.is_store;
                 sh_is_amo[free_idx2]     = i_alloc_op2.base.is_amo;
                 sh_amo_funct5[free_idx2] = i_alloc_op2.base.amo_funct5;
                 sh_is_csr[free_idx2]     = i_alloc_op2.base.is_csr;
