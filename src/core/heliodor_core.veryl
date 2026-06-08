@@ -1018,6 +1018,9 @@ pub module heliodor_core #(
     // ============================================================
     var fl_push_en  : logic           ;
     var fl_push_pdst: logic<PRF_INT_W>;
+    // Phase 8 S1: 2-wide commit slot-1 integer free-list push.
+    var fl_push_en2  : logic           ;
+    var fl_push_pdst2: logic<PRF_INT_W>;
 
     let fl_pop_en: logic = rename_fire && dec_op.has_rd;
     inst u_fl: free_list (
@@ -1028,6 +1031,8 @@ pub module heliodor_core #(
         o_empty        : free_empty   ,
         i_push_en      : fl_push_en   ,
         i_push_pdst    : fl_push_pdst ,
+        i_push_en2     : fl_push_en2  ,
+        i_push_pdst2   : fl_push_pdst2,
         i_recovery_fire: redirect_fire,
     );
 
@@ -1037,6 +1042,10 @@ pub module heliodor_core #(
     var rat_commit_en  : logic           ;
     var rat_commit_arch: logic<5>        ;
     var rat_commit_pdst: logic<PRF_INT_W>;
+    // Phase 8 S1: 2-wide commit slot-1 arch-RAT write.
+    var rat_commit_en2  : logic           ;
+    var rat_commit_arch2: logic<5>        ;
+    var rat_commit_pdst2: logic<PRF_INT_W>;
 
     inst u_rat: rat (
         clk                                          ,
@@ -1053,6 +1062,9 @@ pub module heliodor_core #(
         i_commit_en    : rat_commit_en               ,
         i_commit_arch  : rat_commit_arch             ,
         i_commit_pdst  : rat_commit_pdst             ,
+        i_commit_en2   : rat_commit_en2              ,
+        i_commit_arch2 : rat_commit_arch2            ,
+        i_commit_pdst2 : rat_commit_pdst2            ,
         i_recovery_fire: redirect_fire               ,
     );
 
@@ -1238,6 +1250,14 @@ pub module heliodor_core #(
     var c_rd_arch     : logic<5>        ;
     var c_rd_pdst     : logic<PRF_INT_W>;
     var c_old_rd_pdst : logic<PRF_INT_W>;
+    // Phase 8 S1: 2-wide commit slot-1 (head+1, simple integer ops only).
+    var c2_valid      : logic           ;
+    var c2_pc         : logic<64>       ;
+    var c2_rd_arch    : logic<5>        ;
+    var c2_rd_pdst    : logic<PRF_INT_W>;
+    var c2_old_rd_pdst: logic<PRF_INT_W>;
+    var c2_has_rd     : logic           ;
+    var c2_result_data: logic<64>       ;
     var c_has_rd      : logic           ;
     var c_illegal     : logic           ;
     var c_redirect_pc : logic<64>       ;
@@ -1297,6 +1317,13 @@ pub module heliodor_core #(
     // lands. This subsumes the old M9.1 `!(c_is_store && !i_dmem_grant)` gate:
     // the dcache (not the core) now owns bus back-pressure (see dmem_issue note).
     let rob_commit_ack: logic = rob_commit_valid && !(c_is_store && dmem_mmu_busy) && !(c_is_store && dcache_stall);
+    // Phase 8 S1: 2-wide commit. commit2_fire is a var assigned LATE (after all
+    // the slot-0 redirect conditions: trap/mret/sret/satp/mispredict/sc-replay)
+    // so it can also require that slot-0 does NOT redirect — otherwise the head+1
+    // op is wrong-path (squashed by slot-0's redirect) and must not retire.
+    // Declared here (var) so the rob i_commit_ack2 connection and the slot-1
+    // commit always_comb may reference it before the assign.
+    var commit2_fire: logic;
 
     var rob_head_valid  : logic    ;
     var rob_head_rw     : logic    ;
@@ -1382,6 +1409,14 @@ pub module heliodor_core #(
         o_commit_fflags_wen  : c_fflags_wen         ,
         o_commit_idx         : rob_commit_idx       ,
         i_commit_ack         : rob_commit_ack       ,
+        o_commit2_valid      : c2_valid             ,
+        o_commit2_pc         : c2_pc                ,
+        o_commit2_rd_arch    : c2_rd_arch           ,
+        o_commit2_rd_pdst    : c2_rd_pdst           ,
+        o_commit2_old_rd_pdst: c2_old_rd_pdst       ,
+        o_commit2_has_rd     : c2_has_rd            ,
+        o_commit2_result_data: c2_result_data       ,
+        i_commit_ack2        : commit2_fire         ,
         i_redirect_fire      : redirect_fire        ,
         o_head_idx           : rob_head_idx         ,
         o_size               : rob_size             ,
@@ -1441,6 +1476,17 @@ pub module heliodor_core #(
         fp_rat_commit_en = rob_commit_ack && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
         fp_fl_push_en    = rob_commit_ack && c_is_fp_dest && !c_illegal && !commit_priv_illegal;
         fp_fl_push_pdst  = c_old_rd_pdst;
+
+        // Phase 8 S1: commit slot-1 (simple integer op). It is never illegal /
+        // priv-illegal / FP / control (excluded by c2_valid), so the only
+        // architectural effects are the integer arch-RAT write and free-list push
+        // (ordered AFTER slot-0 in rat/free_list so a same-rd WAW lets the younger
+        // slot-1 win). arch_regs slot-1 update is in the arch_regs always_ff.
+        rat_commit_en2   = commit2_fire && c2_has_rd;
+        rat_commit_arch2 = c2_rd_arch;
+        rat_commit_pdst2 = c2_rd_pdst;
+        fl_push_en2      = commit2_fire && c2_has_rd;
+        fl_push_pdst2    = c2_old_rd_pdst;
     }
 
     // ============================================================
@@ -1825,10 +1871,22 @@ pub module heliodor_core #(
             for r in 0..32 {
                 arch_regs[r] = 64'd0;
             }
-        } else if rob_commit_valid && c_has_rd && !c_illegal {
-            for r in 1..32 {
-                if c_rd_arch == (r as 5) {
-                    arch_regs[r] = c_result_data;
+        } else {
+            if rob_commit_valid && c_has_rd && !c_illegal {
+                for r in 1..32 {
+                    if c_rd_arch == (r as 5) {
+                        arch_regs[r] = c_result_data;
+                    }
+                }
+            }
+            // Phase 8 S1: commit slot-1 — ordered AFTER slot-0 so a same-rd WAW
+            // leaves the younger (slot-1) value. x3 (boot pass/fail) is sourced
+            // from here, so slot-1 writes MUST be reflected.
+            if commit2_fire && c2_has_rd {
+                for r in 1..32 {
+                    if c2_rd_arch == (r as 5) {
+                        arch_regs[r] = c2_result_data;
+                    }
                 }
             }
         }
@@ -2035,6 +2093,15 @@ pub module heliodor_core #(
     let sc_watch_commit: logic = sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q;
     // Poisoned watched SC at its commit -> replay (fail it):
     let commit_sc_replay: logic = sc_watch_commit && sc_poison_q;
+
+    // Phase 8 S1: slot-0 (head) triggers a redirect this cycle? If so the head+1
+    // op is wrong-path (will be squashed) and must NOT retire in slot-1. Mirrors
+    // every arm of the commit redirect always_ff.
+    let commit_redirect: logic = commit_trap || commit_mret || commit_sret || c_bp_mispredict || commit_sc_replay || commit_csrw_satp;
+    // Slot-1 retires only when slot-0 actually retires (rob_commit_ack), slot-0
+    // does not redirect, and head+1 is a simple integer op (c2_valid from ROB).
+    assign commit2_fire = rob_commit_ack && !commit_redirect && c2_valid;
+
     always_ff (clk, rst) {
         if_reset {
             sc_watch_valid_q = 1'b0;
