@@ -390,6 +390,54 @@ pub module heliodor_core #(
     // i_ren=0 (no lookup) so icache_stall=0 — the fault still delivers.
     let fetch_ready: logic = !needs_straddle && (imem_valid_w || imem_fault_w) && !icache_stall;
 
+    // ============================================================
+    // Phase 8 M2: branch prediction (BTB + bimodal BHT) — frontend redirect.
+    // Looked up combinationally on pc_q (= the instr delivered this cycle).
+    // predicted_taken steers the next fetch to btb_target with no bubble; a
+    // wrong prediction is caught at commit (c_bp_mispredict) and flushed. The
+    // tables are trained only by committed ops (signals near the commit stage),
+    // so wrong-path fetches never pollute them. Prediction is applied only in
+    // the delivery arm of the fetch latch below (never during straddle-prep).
+    // ============================================================
+    var btb_hit    : logic    ;
+    var btb_target : logic<64>;
+    var btb_is_cond: logic    ;
+    var bht_taken  : logic    ;
+    // A conditional branch is predicted taken per the BHT; JAL/JALR (is_cond=0)
+    // are predicted taken on any BTB hit.
+    let predicted_taken: logic     = btb_hit && (!btb_is_cond || bht_taken);
+    let pred_next_pc_bp: logic<64> = if predicted_taken ? btb_target : pc_q + pc_advance;
+
+    // Training signals (driven from the commit stage; forward-referenced here).
+    var btb_train_en     : logic    ;
+    var bht_train_en     : logic    ;
+    var bp_train_pc      : logic<64>;
+    var btb_train_target : logic<64>;
+    var btb_train_is_cond: logic    ;
+    var bht_train_taken  : logic    ;
+
+    inst u_btb: btb (
+        clk                              ,
+        rst                              ,
+        i_pc           : pc_q            ,
+        o_hit          : btb_hit         ,
+        o_target       : btb_target      ,
+        o_is_cond      : btb_is_cond     ,
+        i_train_en     : btb_train_en    ,
+        i_train_pc     : bp_train_pc     ,
+        i_train_target : btb_train_target,
+        i_train_is_cond: btb_train_is_cond,
+    );
+    inst u_bht: bht (
+        clk                            ,
+        rst                            ,
+        i_pc         : pc_q            ,
+        o_taken      : bht_taken       ,
+        i_train_en   : bht_train_en    ,
+        i_train_pc   : bp_train_pc     ,
+        i_train_taken: bht_train_taken ,
+    );
+
     // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
     // imem_mmu's i_vaddr is the fetch address — advances ahead of pc_q
     // by 2 during straddle so the next-word fetch lands cycle T+1.
@@ -448,12 +496,13 @@ pub module heliodor_core #(
                 // M7: track RVC-origin for the link register (pc+2 vs pc+4).
                 // Straddle resolves a 32-bit, so is_rvc=0 in that case.
                 if_is_rvc_q = !straddle_q && curr_is_rvc;
-                // Phase 8 M1: record the next PC the frontend chose for the
-                // op delivered this cycle. With no predictor this is the
-                // sequential fall-through; M2 replaces it with the BTB/BHT
-                // prediction. Equals pc_q (= if_pc_q) + the instruction length.
-                if_pred_next_pc_q = pc_q + pc_advance;
-                pc_q        = pc_q + pc_advance;
+                // Phase 8 M2: steer the next fetch to the BTB/BHT prediction
+                // (pred_next_pc_bp = btb_target when predicted taken, else the
+                // sequential pc_q + pc_advance). Record the same value as this
+                // op's predicted next PC so commit can validate it. A wrong
+                // prediction is caught by c_bp_mispredict and flushed.
+                if_pred_next_pc_q = pred_next_pc_bp;
+                pc_q        = pred_next_pc_bp;
                 straddle_q  = 1'b0;
             } else if !stall_dr {
                 // M8.A: IF/ID slot is free (empty, or its instr was renamed
@@ -752,6 +801,10 @@ pub module heliodor_core #(
     // e.g. when its result op was delayed by a force-miss fill under N=4 bus
     // contention) cannot wipe the younger lr.w's reservation — the read_lock livelock.
     var rsv_rob_q  : logic<ROB_IDX_W>;
+    // Phase 8 M2: high once the reservation's owner LR has committed (the
+    // reservation is then architectural; rsv_rob_q is stale). Gates sc_may_clear's
+    // owner-committed escape — see the comment there.
+    var rsv_committed_q: logic;
 
     // M9.4 SMP: SC commit-time re-validation state (declared early so the
     // commit-redirect always_ff can read it; logic + comment near the
@@ -1132,6 +1185,7 @@ pub module heliodor_core #(
     var c_pred_next_pc: logic<64>       ;
     var c_is_rvc      : logic           ;
     var c_is_control  : logic           ;
+    var c_is_cond     : logic           ; // M2: conditional branch (BHT train)
     var c_result_data : logic<64>       ;
     var c_is_store    : logic           ;
     var c_store_addr  : logic<64>       ;
@@ -1232,6 +1286,7 @@ pub module heliodor_core #(
         o_commit_pred_next_pc: c_pred_next_pc       ,
         o_commit_is_rvc      : c_is_rvc             ,
         o_commit_is_control  : c_is_control         ,
+        o_commit_is_cond     : c_is_cond            ,
         o_commit_result_data : c_result_data        ,
         o_commit_is_store    : c_is_store           ,
         o_commit_store_addr  : c_store_addr         ,
@@ -1611,8 +1666,20 @@ pub module heliodor_core #(
     // unifies branch/jal/jalr today and (M2+) BTB false-hit / mis-target
     // recovery: a non-control op's arch_next_pc is always pc+len, so a stray
     // prediction self-corrects to the fall-through.
-    let c_arch_next_pc : logic<64> = if c_is_control ? c_redirect_pc : c_pc + (if c_is_rvc ? 64'd2 : 64'd4);
+    let c_fall_pc      : logic<64> = c_pc + (if c_is_rvc ? 64'd2 : 64'd4);
+    let c_arch_next_pc : logic<64> = if c_is_control ? c_redirect_pc : c_fall_pc;
     let c_bp_mispredict: logic     = rob_commit_valid && (c_pred_next_pc != c_arch_next_pc);
+    // Phase 8 M2: predictor training at retire. c_taken = a committed control
+    // op went taken (its resolved target differs from the fall-through). Train
+    // the BTB on every taken control op (allocate/refresh target + conditional
+    // flag); train the BHT on every conditional branch toward its real
+    // direction. rob_commit_ack (not _valid) so a held store/AMO trains once.
+    assign btb_train_en      = rob_commit_ack && c_is_control && (c_redirect_pc != c_fall_pc);
+    assign bht_train_en      = rob_commit_ack && c_is_cond;
+    assign bp_train_pc       = c_pc;
+    assign btb_train_target  = c_redirect_pc;
+    assign btb_train_is_cond = c_is_cond;
+    assign bht_train_taken   = c_is_control && (c_redirect_pc != c_fall_pc);
     always_ff (clk, rst) {
         if_reset {
             redirect_fire_q = 1'b0;
@@ -1753,7 +1820,33 @@ pub module heliodor_core #(
     // own addr) still gates success.
     let rsv_age_sc   : logic<ROB_IDX_W> = iq_iss_rob_idx - rob_head_idx;
     let rsv_age_owner: logic<ROB_IDX_W> = rsv_rob_q - rob_head_idx;
-    let sc_may_clear : logic = (rsv_age_sc >: rsv_age_owner) && (rsv_addr_q == agu_addr_iss);
+    // M9.4 age gate (owner still IN-FLIGHT): the SC may consume the reservation
+    // only if it is program-order AFTER the owner LR (its distance from the ROB
+    // head exceeds the owner's), so an OoO-reordered OLDER sc.w cannot wipe a
+    // YOUNGER lr.w's reservation.
+    // Phase 8 M2 (rsv_committed_q escape): once the owner LR has COMMITTED it has
+    // left the ROB and rsv_rob_q is stale — the distance compare wraps and would
+    // wrongly reject every SC. A committed reservation is architectural, and any
+    // in-flight SC is necessarily program-order after the (retired) owner, so a
+    // matching SC may consume it. This is what M2's faster front end exposed: the
+    // owner lr.w now commits before the paired sc.w even issues (AMOs are
+    // bus-serialized, so the sc.w lags), leaving sc_may_clear=0 for every sc.w —
+    // the reservation was never consumed, so a later bare sc.w spuriously
+    // succeeded (rv64ua-lrsc test 6). The in-flight age gate above is retained, so
+    // the M9.4 reorder protection still holds while the owner is in flight.
+    let sc_may_clear : logic = (rsv_committed_q || (rsv_age_sc >: rsv_age_owner)) && (rsv_addr_q == agu_addr_iss);
+    // Phase 8 M2: track whether the reservation's owner LR has committed. Reset by
+    // each new LR (fresh, uncommitted owner); raised when the owner's ROB slot
+    // retires. Only meaningful while rsv_valid_q is set.
+    always_ff (clk, rst) {
+        if_reset {
+            rsv_committed_q = 1'b0;
+        } else if issue_is_lr && iq_issue_ack {
+            rsv_committed_q = 1'b0;
+        } else if rob_commit_ack && rob_commit_idx == rsv_rob_q {
+            rsv_committed_q = 1'b1;
+        }
+    }
     always_ff (clk, rst) {
         if_reset {
             rsv_valid_q = 1'b0;
@@ -1775,6 +1868,8 @@ pub module heliodor_core #(
             // remote-write case is still handled by the dword-granular remote-clear
             // below; a squashed wrong-path lr.w is re-paired with its own sc.w on the
             // correct path so its stale reservation cannot make a bare sc.w succeed.
+            // Phase 8 M2: a wrong-path lr.w can no longer set the reservation at all —
+            // amo_at_head restricts AMO/LR/SC issue to the non-speculative ROB head.
             rsv_valid_q = 1'b0;
         } else if issue_is_lr && iq_issue_ack {
             // M9 SMP: gate the reservation updates on iq_issue_ack (ACTUAL issue),
