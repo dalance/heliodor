@@ -735,6 +735,19 @@ pub module heliodor_core #(
     assign if_pred_index_q = fb_pred_index[fb_head];
     assign if_ifault_q     = fb_ifault[fb_head];
 
+    // Phase 8 S4b: slot-1 (head+1) FIFO read for the 2nd decode/rename lane.
+    // Combinational reads at fb_head+1 (wraps mod 8). Only meaningful when the
+    // FIFO holds >=2 records (rename_fire2 checks fb_count below); harmless to
+    // read a stale slot otherwise since every slot-1 consumer is rename_fire2-
+    // gated.
+    let fb_head_p1: logic<3> = fb_head + 3'd1;
+    let if_pc_q1          : logic<64> = fb_pc[fb_head_p1];
+    let if_instr_q1       : logic<32> = fb_instr[fb_head_p1];
+    let if_is_rvc_q1      : logic     = fb_is_rvc[fb_head_p1];
+    let if_pred_next_pc_q1: logic<64> = fb_pred_next_pc[fb_head_p1];
+    let if_pred_index_q1  : logic<10> = fb_pred_index[fb_head_p1];
+    let if_ifault_q1      : logic     = fb_ifault[fb_head_p1];
+
     // ============================================================
     // M5.C: imem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
     // pure passthrough; o_busy stays 0 and o_paddr == i_vaddr. PTW
@@ -831,6 +844,11 @@ pub module heliodor_core #(
     // ============================================================
     var dec_op: DecodedOp;
     inst u_dec: decode ( i_pc: if_pc_q, i_instr: if_instr_q, i_is_rvc: if_is_rvc_q, o_op: dec_op );
+    // Phase 8 S4b: 2nd decode lane — the younger op (head+1) of a 2-wide rename
+    // bundle. Dead until rename_fire2 flips on: dec_op2 feeds only rename_fire2-
+    // gated slot-1 ports (RAT reads, free_list pop2, ROB alloc2, IQ alloc2).
+    var dec_op2: DecodedOp;
+    inst u_dec2: decode ( i_pc: if_pc_q1, i_instr: if_instr_q1, i_is_rvc: if_is_rvc_q1, o_op: dec_op2 );
 
     // ============================================================
     // Rename (Stage R)
@@ -1003,13 +1021,29 @@ pub module heliodor_core #(
     // rename_fire2 on. With rename_fire2 = 0, every slot-1 module enable is 0, so
     // the pipeline behaves exactly as 1-wide (cycle-exact). This milestone only
     // builds and wires the ports + the intra-bundle rename bypass.
+    // Phase 8 S4b: slot-1 eligibility. The slot-1 rename/alloc datapath is
+    // integer-only — there is no FP slot-1 port (rat_fp / fp free_list / iq_fp
+    // are 1-wide), and pipe-1 has no LOAD/STORE/AMO/CSR side-bands. Restrict
+    // slot-1 to a simple register-writing integer ALU op (matches the ROB's
+    // c2_simple 2-wide-commit eligibility), so a 2-wide-renamed bundle can also
+    // 2-wide-commit. Control transfers are excluded for now (conservative first
+    // flip); a later milestone can admit them. has_rd && !fp covers the dest.
+    let dec_op2_eligible: logic = dec_op2.has_rd && !dec_op2.fp_writes_fp
+        && !dec_op2.is_fpu_op && !dec_op2.fp_ld && !dec_op2.fp_st
+        && !dec_op2.is_load && !dec_op2.is_store && !dec_op2.is_amo
+        && !dec_op2.is_csr && !dec_op2.is_branch && !dec_op2.is_jal && !dec_op2.is_jalr
+        && !dec_op2.is_ecall && !dec_op2.is_ebreak && !dec_op2.is_mret && !dec_op2.is_sret
+        && !dec_op2.is_sfence && !dec_op2.is_fence_i && !dec_op2.illegal;
+    // S4b.1: still gated OFF (1'b0). S4b.2 flips this to the real condition
+    // (rename_fire && dec_op2_eligible && fb_count>=2 && IQ/free_list/ROB room).
     let rename_fire2: logic = 1'b0;
-    // Placeholder slot-1 decoded fields (S4: second decode lane). Slot-1 is
-    // integer-only (FP stays 1-wide on pipe-0), so no FP-dest fields here.
-    let dec_op2_rs1_arch : logic<5> = dec_op.rs1_arch;
-    let dec_op2_rs2_arch : logic<5> = dec_op.rs2_arch;
-    let dec_op2_rd_arch  : logic<5> = dec_op.rd_arch;
-    let dec_op2_has_rd   : logic    = dec_op.has_rd;
+    let _unused_dec_op2_eligible: logic = dec_op2_eligible; // S4b.2 consumes this
+    // Slot-1 decoded arch fields (real 2nd decode lane). Slot-1 is integer-only,
+    // so no FP-dest fields here.
+    let dec_op2_rs1_arch : logic<5> = dec_op2.rs1_arch;
+    let dec_op2_rs2_arch : logic<5> = dec_op2.rs2_arch;
+    let dec_op2_rd_arch  : logic<5> = dec_op2.rd_arch;
+    let dec_op2_has_rd   : logic    = dec_op2.has_rd;
 
     // slot-1 free-list pop (int dest only).
     var new_rd_pdst2: logic<PRF_INT_W>;
@@ -1038,12 +1072,62 @@ pub module heliodor_core #(
     // slot-1 alloc port, which is enable-gated off in S2).
     var ren_op2: RenamedOp;
     always_comb {
-        ren_op2.base        = dec_op; // S4: second decode
+        ren_op2.base        = dec_op2; // S4b: real 2nd decode lane
         ren_op2.rd_pdst     = new_rd_pdst2;
         ren_op2.rs1_pdst    = s1_rs1_pdst;
         ren_op2.rs2_pdst    = s1_rs2_pdst;
         ren_op2.old_rd_pdst = s1_old_rd_pdst;
         ren_op2.rob_idx     = rob_alloc_idx2;
+    }
+
+    // Phase 8 S4b: slot-1 ROB entry (real 2nd-decode lane). Mirrors the slot-0
+    // rob_alloc_entry but sourced from dec_op2 + the slot-1 head+1 fetch fields
+    // and the slot-1 int pdsts. Slot-1 is integer-only, so is_fp_dest=0; for an
+    // eligible op (dec_op2_eligible) the control/mem/csr/fp flags are all 0, but
+    // every field is built faithfully so the entry stays correct if eligibility
+    // is relaxed later. Consumed by the ROB i_alloc_entry2 port (gated by
+    // rename_fire2; dead until S4b.2).
+    var rob_alloc_entry2: RobEntry;
+    always_comb {
+        rob_alloc_entry2.valid          = 1'b1;
+        rob_alloc_entry2.pc             = if_pc_q1;
+        rob_alloc_entry2.rd_arch        = dec_op2.rd_arch;
+        rob_alloc_entry2.rd_pdst        = new_rd_pdst2;
+        rob_alloc_entry2.old_rd_pdst    = s1_old_rd_pdst;
+        rob_alloc_entry2.has_rd         = dec_op2.has_rd;
+        rob_alloc_entry2.is_fp_dest     = dec_op2.fp_writes_fp;
+        rob_alloc_entry2.is_fp          = dec_op2.is_fp;
+        rob_alloc_entry2.fflags         = 5'd0;
+        rob_alloc_entry2.fflags_wen     = 1'b0;
+        rob_alloc_entry2.result_written = 1'b0;
+        rob_alloc_entry2.is_branch      = dec_op2.is_branch;
+        rob_alloc_entry2.is_jal         = dec_op2.is_jal;
+        rob_alloc_entry2.is_jalr        = dec_op2.is_jalr;
+        rob_alloc_entry2.mispredict     = 1'b0;
+        rob_alloc_entry2.redirect_pc    = 64'd0;
+        rob_alloc_entry2.pred_next_pc   = if_pred_next_pc_q1;
+        rob_alloc_entry2.is_rvc         = if_is_rvc_q1;
+        rob_alloc_entry2.is_control     = dec_op2.is_branch || dec_op2.is_jal || dec_op2.is_jalr;
+        rob_alloc_entry2.is_call        = (dec_op2.is_jal || dec_op2.is_jalr) && (dec_op2.rd_arch == 5'd1 || dec_op2.rd_arch == 5'd5);
+        rob_alloc_entry2.is_ret         = dec_op2.is_jalr && (dec_op2.rs1_arch == 5'd1 || dec_op2.rs1_arch == 5'd5) && !(dec_op2.rd_arch == 5'd1 || dec_op2.rd_arch == 5'd5);
+        rob_alloc_entry2.pred_index     = if_pred_index_q1;
+        rob_alloc_entry2.illegal        = dec_op2.illegal || if_ifault_q1;
+        rob_alloc_entry2.is_ifault      = if_ifault_q1;
+        rob_alloc_entry2.result_data    = 64'd0;
+        rob_alloc_entry2.is_store       = dec_op2.is_store || dec_op2.is_amo;
+        rob_alloc_entry2.store_addr     = 64'd0;
+        rob_alloc_entry2.store_data     = 64'd0;
+        rob_alloc_entry2.store_funct3   = 3'd0;
+        rob_alloc_entry2.is_csr         = dec_op2.is_csr;
+        rob_alloc_entry2.csr_addr       = dec_op2.csr_addr;
+        rob_alloc_entry2.csr_wdata      = 64'd0;
+        rob_alloc_entry2.is_ecall       = dec_op2.is_ecall;
+        rob_alloc_entry2.is_ebreak      = dec_op2.is_ebreak;
+        rob_alloc_entry2.is_mret        = dec_op2.is_mret;
+        rob_alloc_entry2.is_sret        = dec_op2.is_sret;
+        rob_alloc_entry2.is_sfence      = dec_op2.is_sfence;
+        rob_alloc_entry2.is_fence_i     = dec_op2.is_fence_i;
+        rob_alloc_entry2.is_amo         = dec_op2.is_amo;
     }
 
     // ============================================================
@@ -1690,11 +1774,11 @@ pub module heliodor_core #(
         i_alloc_entry        : rob_alloc_entry      ,
         o_alloc_idx          : rob_alloc_idx        ,
         o_full               : rob_full             ,
-        // Phase 8 S2: slot-1 alloc port, gated off (rename_fire2=0) until S4.
-        // i_alloc_entry2 is a placeholder (slot-0 entry) in S2 — S4 builds the
-        // real second-decode entry. o_alloc_idx2 feeds ren_op2.rob_idx.
+        // Phase 8 S4b: slot-1 alloc port (gated by rename_fire2; dead until
+        // S4b.2). i_alloc_entry2 is now the real 2nd-decode entry. o_alloc_idx2
+        // feeds ren_op2.rob_idx.
         i_alloc_en2          : rename_fire2         ,
-        i_alloc_entry2       : rob_alloc_entry      ,
+        i_alloc_entry2       : rob_alloc_entry2     ,
         o_alloc_idx2         : rob_alloc_idx2       ,
         i_cdb_valid          : cdb.valid            ,
         i_cdb_rob_idx        : cdb.rob_idx          ,
