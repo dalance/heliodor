@@ -1,33 +1,47 @@
 # Heliodor
 
-RISC-V processor core written in [Veryl](https://veryl-lang.org/).
-The ultimate goal is a Linux-capable RV64GC core.
+RV64GC RISC-V processor core written in [Veryl](https://veryl-lang.org/). Boots
+mainline Linux 5.15 (1/2/4-hart SMP) to SBI shutdown. See `README.md` for the
+architecture overview, status, and roadmap; this file covers the development
+workflow.
 
-## Veryl Compiler
+## Veryl Toolchain
 
-Use the Veryl compiler from the `veryl/` submodule — do **not** use a system-installed version.
+Heliodor is written in Veryl and needs the Veryl compiler/simulator to build and
+test. Veryl lives at `./veryl/` as a **local clone** of veryl-lang/veryl —
+gitignored, *not* a git submodule, so heliodor stays self-contained (same policy
+as the `riscv-tests` upstream under `test/riscv-arch-test/`). Two situations:
+
+**(1) Standalone heliodor development** — heliodor is the top-level repo and
+`./veryl/` is a CHILD clone you check out and build:
 
 ```bash
-cd veryl && cargo build                          # debug build
-cd veryl && cargo build --profile release-verylup # fast release build (no LTO, parallel codegen)
-cd veryl && cargo build --release                 # full release build (slow, max optimization)
+git clone https://github.com/veryl-lang/veryl.git veryl
+cd veryl && cargo build --profile release-verylup   # fast release: no LTO, parallel codegen
 ```
 
-- **Fast release build**: `veryl/target/release-verylup/veryl` — use for heliodor development and testing. Much faster to compile than `--release` (no LTO, 256 codegen units) while still being optimized.
-- **Debug build**: `veryl/target/debug/veryl` — use only when debugging the Veryl compiler/simulator itself.
-- When modifying the simulator, use debug builds first to catch compilation errors quickly, then switch to `--profile release-verylup` for verification.
+Use that binary — `veryl/target/release-verylup/veryl` — for all development and
+testing. Use the debug build (`cargo build`, `veryl/target/debug/veryl`) only
+when debugging the compiler/simulator itself; `cargo build --release` is the slow
+max-optimization build. You can patch the compiler in this clone and branch/PR it
+upstream.
 
-Key commands:
+**(2) heliodor as a Veryl test fixture** — this tree is checked out INSIDE the
+veryl repo (veryl is an ANCESTOR dir) to test the compiler against a real RV64GC
+design. Do NOT clone veryl; the compiler under test is the surrounding repo's
+build. The veryl test harness runs heliodor's scripts with `$VERYL` set to that
+binary (heliodor's scripts honor `$VERYL`). The clone step in (1) does not apply.
 
-| Command       | Description                              |
-|---------------|------------------------------------------|
-| `veryl check` | Analyze (type check, lint)               |
-| `veryl build` | Transpile to SystemVerilog               |
-| `veryl fmt`   | Format source files                      |
-| `veryl test`  | Run native testbenches (uses debug binary)|
-| `veryl clean` | Remove build artifacts                   |
+Key commands (run the resolved `veryl` binary from the project root):
 
-The compiler itself may be debugged or patched as needed.
+| Command       | Description                  |
+|---------------|------------------------------|
+| `veryl check` | Analyze (type check, lint)   |
+| `veryl build` | Transpile to SystemVerilog   |
+| `veryl fmt`   | Format source files          |
+| `veryl test`  | Run native testbenches       |
+| `veryl clean` | Remove build artifacts       |
+
 Refer to `veryl/testcases/veryl/` for language feature examples.
 
 ## Directory Structure
@@ -37,15 +51,15 @@ heliodor/
 ├── CLAUDE.md
 ├── Veryl.toml              # Project configuration
 ├── src/
-│   ├── core/               # Pipeline stages, decode, ALU, etc.
-│   ├── cache/              # I-Cache / D-Cache
-│   ├── mmu/                # MMU (Sv39 / Sv48)
-│   ├── peripheral/         # UART, CLINT, PLIC, etc.
+│   ├── core/               # Pipeline stages, decode, ALU, FPU, CSR, RS/ROB/RAT, SoC
+│   ├── cache/              # I-Cache / D-Cache / shared L2 / memory_bus
+│   ├── mmu/                # Sv39 MMU
+│   ├── peripheral/         # UART, CLINT, PLIC
 │   └── pkg/                # Shared packages & type definitions
 ├── tb/                     # Testbenches (Veryl native test)
-├── test/                   # RISC-V ISA test programs
+├── test/                   # RISC-V ISA tests, hex programs, C benchmarks
 ├── doc/                    # Documentation
-└── veryl/                  # Veryl compiler (git submodule)
+└── veryl/                  # Veryl compiler — local clone, gitignored (see Veryl Toolchain)
 ```
 
 ## Development Conventions
@@ -73,9 +87,12 @@ heliodor/
      (~37M cycles, minutes). N=1 single-hart is `--ignored --test test_soc_linux_boot`.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
      (~52M cycles, ~1h).
-- **Formatting**: `veryl fmt`
+- **Formatting**: `veryl fmt`. Note: bare `veryl fmt` reformats the ENTIRE repo;
+  before a focused commit, format by hand in the surrounding style instead.
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
-- **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor source code. Report the issue and fix it in the `veryl/` submodule.
+- **Veryl compiler/simulator bugs**: Do NOT work around bugs by modifying heliodor
+  source code. Fix them in the `veryl/` clone (branch + PR upstream; do not commit
+  to veryl `master` directly).
 
 ## ISA Compliance Tests (riscv-tests)
 
@@ -141,25 +158,6 @@ Comment lines must not start with the word `verilator` (Verilator parses
 `// verilator ...` as a pragma — `BADVLTPRAGMA`). The `build_*/` output dirs are
 gitignored. Add a new wrapper by copying one of the above and rewiring the ports.
 
-## Development Roadmap
-
-| Phase | Target                                                              |
-|-------|---------------------------------------------------------------------|
-| 1     | RV64I base integer ISA — basic pipeline                             |
-| 2     | M extension (multiply / divide) and pipeline optimization           |
-| 3     | Privilege specification (M/S/U modes, CSRs)                         |
-| 4     | MMU (Sv39), I-Cache / D-Cache                                       |
-| 5     | A extension (atomics), interrupts & exceptions (CLINT / PLIC)       |
-| 6     | C extension (compressed instructions)                               |
-| 7     | F/D extensions (floating-point) — full GC compliance                |
-| 8     | Linux boot integration test                                         |
-
 ## Sandbox Restrictions
 
 - **Do NOT use `ps`** to check for running processes. The `ps` command does not work correctly inside the sandbox and produces misleading results (e.g., empty output even when processes are running). Instead, wait for command completion via the shell's return or use the timeout mechanism.
-
-## RISC-V Reference
-
-- **ISA**: RV64GC (`RV64IMAFDCZicsr_Zifencei`)
-- **Privilege levels**: Machine / Supervisor / User
-- **Virtual memory**: Sv39 (minimum), Sv48 (optional)

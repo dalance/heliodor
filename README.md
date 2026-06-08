@@ -96,14 +96,16 @@ src/
 └── pkg/          Shared packages and type definitions
 tb/               Veryl native testbenches
 test/             Hex programs, riscv-tests harnesses, C benchmarks
-veryl/            Veryl compiler (git submodule)
+veryl/            Veryl compiler (local clone, gitignored)
 ```
 
 ## Build & Test
 
-The Veryl compiler ships as a submodule and must be built first:
+The Veryl compiler lives at `./veryl/` as a local clone (gitignored, not a
+submodule) and must be cloned and built first:
 
 ```bash
+git clone https://github.com/veryl-lang/veryl.git veryl
 cd veryl && cargo build --profile release-verylup
 ```
 

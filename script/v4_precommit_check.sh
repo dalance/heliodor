@@ -18,7 +18,7 @@ set -o pipefail
 
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
-VERYL="$ROOT/veryl/target/release-verylup/veryl"
+VERYL="${VERYL:-$ROOT/veryl/target/release-verylup/veryl}"
 
 if [[ ! -x "$VERYL" ]]; then
     echo "[v4_precommit] missing $VERYL — run: (cd veryl && cargo build --profile release-verylup)" >&2
