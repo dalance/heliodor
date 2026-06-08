@@ -364,6 +364,7 @@ pub module heliodor_core #(
     // them. Actual assignment happens at the imem_mmu inst below.
     var imem_fault_w: logic;
     var imem_valid_w: logic;
+    var imem_paddr_w: logic<64>; // translated fetch PA (S4a.3 slot-1 same-line check)
     // M8.A: I-cache outputs (instance after imem_mmu). icache_rdata replaces
     // the combinational i_imem_rdata in the fetch path; icache_stall folds
     // into fetch_ready and the imem_mmu i_icache_stall hook. icache_rdata_next
@@ -388,6 +389,11 @@ pub module heliodor_core #(
     var c_expanded_w: logic<32>;
     var c_illegal_w : logic    ;
     inst u_cexp: c_expander ( i_cinstr: c_inst_w, o_instr: c_expanded_w, o_illegal: c_illegal_w );
+    // Phase 8 S4a.3: slot-1 RVC expander (2-wide fetch bundle, younger op).
+    var c_inst_w1    : logic<16>;
+    var c_expanded_w1: logic<32>;
+    var c_illegal_w1 : logic    ;
+    inst u_cexp1: c_expander ( i_cinstr: c_inst_w1, o_instr: c_expanded_w1, o_illegal: c_illegal_w1 );
 
     // Halfword pick for the non-straddle cases.
     let curr_hw       : logic<16> = if pc_q[1] ? icache_rdata[31:16] : icache_rdata[15:0];
@@ -452,6 +458,75 @@ pub module heliodor_core #(
     let pred_target    : logic<64> = if pred_use_ras ? ras_spec_top : btb_target;
     let pred_next_pc_bp: logic<64> = if predicted_taken ? pred_target : pc_q + pc_advance;
 
+    // ============================================================
+    // Phase 8 S4a.3: slot-1 (younger op of a 2-wide fetch bundle). Extracted
+    // from the 64-bit window {icache_rdata_next, icache_rdata} when slot-0 is a
+    // CLEAN non-straddle delivery (Option B: the proven straddle_q path is left
+    // 100% intact — a straddling/faulting/taken slot-0 delivers alone). slot-1
+    // is built here but its delivery is gated off in S4a.3-a (slot1_valid_gate=0)
+    // and flipped on in S4a.3-b. The 64-bit window has 4 halfwords; with slot-0
+    // non-straddling the slot-1 start index b1 is 1 or 2 (never crosses out of
+    // the window or into a different page — slot-1 using the next word is
+    // restricted to same-line, hence same page as slot-0).
+    let fw_hw1: logic<16> = icache_rdata[31:16];     // window halfword 1
+    let fw_hw2: logic<16> = icache_rdata_next[15:0]; // window halfword 2
+    let fw_hw3: logic<16> = icache_rdata_next[31:16];// window halfword 3
+    // b1 = halfword index where slot-1 starts (clean case: curr_is_rvc == slot-0
+    // is RVC). pc[1]=0,rvc→1 / pc[1]=0,32b→2 / pc[1]=1,rvc→2 (pc[1]=1,32b is a
+    // straddle, excluded by slot1_eligible).
+    let s1_b1: logic<2> = (if pc_q[1] ? 2'd1 : 2'd0) + (if curr_is_rvc ? 2'd1 : 2'd2);
+    let s1_hw     : logic<16> = if s1_b1 == 2'd1 ? fw_hw1 : fw_hw2; // b1∈{1,2}
+    let s1_hw_next: logic<16> = if s1_b1 == 2'd1 ? fw_hw2 : fw_hw3; // halfword b1+1
+    let s1_is_rvc : logic     = s1_hw[1:0] != 2'b11;
+    assign c_inst_w1 = s1_hw;
+    let s1_raw32: logic<32> = {s1_hw_next, s1_hw};
+    let s1_instr: logic<32> = if s1_is_rvc && c_illegal_w1 ?
+        32'h0000_0000
+    : if s1_is_rvc ?
+        c_expanded_w1
+    :
+        s1_raw32
+    ;
+    let s1_pc: logic<64> = pc_q + pc_advance; // = pc_q + slot-0 length (clean case)
+    let s1_len: logic<64> = if s1_is_rvc ? 64'd2 : 64'd4;
+    // slot-1 prediction via the BTB/BHT 2nd read ports (lookup on s1_pc).
+    var btb_hit2    : logic    ;
+    var btb_target2 : logic<64>;
+    var btb_is_cond2: logic    ;
+    var btb_is_call2: logic    ;
+    var btb_is_ret2 : logic    ;
+    var bht_taken2  : logic    ;
+    let bht_lk_index1   : logic<10> = s1_pc[10:1] ^ {2'b00, spec_ghr};
+    let predicted_taken1: logic     = btb_hit2 && (!btb_is_cond2 || bht_taken2);
+    let pred_use_ras1   : logic     = btb_hit2 && btb_is_ret2 && ras_spec_valid;
+    let pred_target1    : logic<64> = if pred_use_ras1 ? ras_spec_top : btb_target2;
+    let pred_next_pc1   : logic<64> = if predicted_taken1 ? pred_target1 : s1_pc + s1_len;
+    // slot-1 delivery eligibility. slot-0 must be a clean (non-straddle, non-
+    // fault) delivery that was NOT predicted taken (else slot-1 is wrong-path).
+    let slot1_eligible: logic = fetch_ready && !straddle_q && !imem_fault_w && !predicted_taken;
+    // slot-1 needs the next word (rdata_next) unless it is an RVC sitting in the
+    // slot-0 word (b1==1 && rvc). Using the next word requires it be in the SAME
+    // cache line (→ same page as slot-0, so slot-1's fetch can't fault separately).
+    let s1_needs_next: logic = (s1_b1 == 2'd2) || (s1_b1 == 2'd1 && !s1_is_rvc);
+    let s1_same_line : logic = imem_paddr_w[5:2] != 4'hf;
+    // S4a.3-a: the slot-1 datapath (extraction, dual BTB/BHT lookup, 2-push FIFO,
+    // 2-bit gshare, dual RAS) is fully built but delivery is gated OFF, so the
+    // fetch stays 1-wide and cycle-identical to S4a.2 (verified: 152/0 + Dhrystone
+    // 378400 bit-exact). S4a.3-b flips this to 1'b1. The flip is CORRECT and ready,
+    // but is BLOCKED by a pre-existing latent bug in the S3.b 2nd-issue path (NOT
+    // in this fetch logic): with slot-1 live the IQ fills denser so S3.b's 2-issue
+    // fires far more often (cc N=1 boot 20.65M→19.45M proves the speed-up), and on
+    // the FP↔int-dense rv64u{f,d}-{fcvt,recoding} streams that exposes the 2-issue
+    // bug — the four tests hang (a load starves on !fpu_cdb.valid). Proof of
+    // isolation: with `issue2_valid && 1'b0` (2-issue disabled) and slot-1 fully
+    // live, all 152 pass. So: fix the S3.b 2-issue/FP interaction (pipe-1 ack
+    // i_issue_ack2 has no fpu_cdb/dcache_stall gate, asymmetric with pipe-0's
+    // iq_issue_ack — see iq_int / alu_cdb2 / prf_int wr2 / rob cdb2 writeback),
+    // then flip this gate to 1'b1.
+    let slot1_valid_gate: logic = 1'b0;
+    let slot1_valid: logic = slot1_valid_gate && slot1_eligible
+        && (!s1_needs_next || (s1_same_line && icache_rdata_next_valid));
+
     // Phase 8 S4a: fetch buffer push/pop/full control.
     //   fb_pop   = rename drains the head this cycle (== rename_fire below;
     //              MUST stay identical or a popped record is never renamed).
@@ -463,15 +538,31 @@ pub module heliodor_core #(
     // interrupt halts rename so the ROB drains to empty and commit_irq can fire.
     let fb_pop : logic = if_v_q && !stall_dr && !redirect_fire && !csr_irq_pending;
     let fb_full: logic = fb_count == 4'd8 && !fb_pop;
+    // Free slots available for a push this cycle (accounts for a simultaneous
+    // drain freeing one). fb_count is 0..8, fb_pop is 0..1, so fb_free is 0..8.
+    let fb_free : logic<4> = (4'd8 - fb_count) + (if fb_pop ? 4'd1 : 4'd0);
+    let fb_tail1: logic<3> = fb_tail + 3'd1; // slot-1 write index (wraps mod 8)
+    // Phase 8 S4a.3: 2-wide push. fb_push0 = the slot-0 delivery (== the S4a.2
+    // single push); fb_push1 = the slot-1 delivery (needs slot1_valid + room for
+    // a 2nd record). slot-0 pushes to fb_tail, slot-1 to fb_tail+1.
+    let fb_push0: logic = !redirect_fire && !fb_full && fetch_ready;
+    let fb_push1: logic = fb_push0 && slot1_valid && fb_free >= 4'd2;
     // M3: an instruction is delivered (its prediction applied) this cycle when
     // the fetch engine pushes it into the FIFO. RAS speculative push/pop and the
     // gshare spec-history update are gated on this so a stalled / squashed /
     // straddle-prep cycle does not perturb them (straddle-prep has fetch_ready=0).
-    let fb_push       : logic     = !redirect_fire && !fb_full && fetch_ready;
-    let fetch_deliver : logic     = fb_push;
-    let ras_push_addr : logic<64> = pc_q + pc_advance; // return address of a call
-    let ras_spec_push : logic     = fetch_deliver && btb_hit && btb_is_call;
-    let ras_spec_pop  : logic     = fetch_deliver && btb_hit && btb_is_ret;
+    let fetch_deliver : logic     = fb_push0;
+    // RAS speculative update: at most one per cycle. A slot-0 call/ret is always
+    // predicted taken (BTB hit, is_cond=0) → slot1_valid=0, so slot-0's RAS update
+    // and slot-1's are mutually exclusive. ras_push_addr is the return address of
+    // whichever slot is the call (slot-0's pc+len, or slot-1's pc+len).
+    let s0_ras_push: logic = fb_push0 && btb_hit && btb_is_call;
+    let s0_ras_pop : logic = fb_push0 && btb_hit && btb_is_ret;
+    let s1_ras_push: logic = fb_push1 && btb_hit2 && btb_is_call2;
+    let s1_ras_pop : logic = fb_push1 && btb_hit2 && btb_is_ret2;
+    let ras_push_addr : logic<64> = if s1_ras_push ? s1_pc + s1_len : pc_q + pc_advance;
+    let ras_spec_push : logic     = s0_ras_push || s1_ras_push;
+    let ras_spec_pop  : logic     = s0_ras_pop || s1_ras_pop;
 
     // Training signals (driven from the commit stage; forward-referenced here).
     var btb_train_en     : logic    ;
@@ -497,6 +588,13 @@ pub module heliodor_core #(
         o_is_cond      : btb_is_cond      ,
         o_is_call      : btb_is_call      ,
         o_is_ret       : btb_is_ret       ,
+        // Phase 8 S4a.3: 2nd read port on the slot-1 PC.
+        i_pc2          : s1_pc            ,
+        o_hit2         : btb_hit2         ,
+        o_target2      : btb_target2      ,
+        o_is_cond2     : btb_is_cond2     ,
+        o_is_call2     : btb_is_call2     ,
+        o_is_ret2      : btb_is_ret2      ,
         i_train_en     : btb_train_en     ,
         i_train_pc     : bp_train_pc      ,
         i_train_target : btb_train_target ,
@@ -509,6 +607,9 @@ pub module heliodor_core #(
         rst                            ,
         i_index      : bht_lk_index    ,
         o_taken      : bht_taken       ,
+        // Phase 8 S4a.3: 2nd read port on the slot-1 gshare index.
+        i_index2     : bht_lk_index1   ,
+        o_taken2     : bht_taken2      ,
         i_train_en   : bht_train_en    ,
         i_train_index: bht_train_index ,
         i_train_taken: bht_train_taken ,
@@ -565,10 +666,11 @@ pub module heliodor_core #(
                 straddle_q     = 1'b1;
                 straddle_low_q = curr_hw;
             } else if fetch_ready {
-                // Deliver: push handled in the fetch_buffer always_ff (fb_push).
-                // Steer the next fetch to the BTB/BHT/RAS prediction
-                // (pred_next_pc_bp); commit validates it (c_bp_mispredict).
-                pc_q        = pred_next_pc_bp;
+                // Deliver: push handled in the fetch_buffer always_ff (fb_push0/
+                // fb_push1). Steer the next fetch past the delivered bundle — to
+                // slot-1's predicted next PC when slot-1 was also pushed, else
+                // slot-0's (pred_next_pc_bp). Commit validates it (c_bp_mispredict).
+                pc_q        = if fb_push1 ? pred_next_pc1 : pred_next_pc_bp;
                 straddle_q  = 1'b0;
             }
             // else: icache filling a miss / Sv39 PTW still walking → hold pc_q +
@@ -594,7 +696,7 @@ pub module heliodor_core #(
             fb_tail  = 3'd0;
             fb_count = 4'd0;
         } else {
-            if fb_push {
+            if fb_push0 {
                 fb_pc[fb_tail]           = pc_q;
                 fb_instr[fb_tail]        = fetched_instr;
                 // M7: track RVC-origin for the link register (pc+2 vs pc+4). A
@@ -603,12 +705,23 @@ pub module heliodor_core #(
                 fb_ifault[fb_tail]       = imem_fault_w;
                 fb_pred_next_pc[fb_tail] = pred_next_pc_bp;
                 fb_pred_index[fb_tail]   = bht_lk_index;
-                fb_tail                  = fb_tail + 3'd1;
             }
+            // Phase 8 S4a.3: slot-1 record into fb_tail+1. slot-1 is delivered
+            // only on a clean, non-faulting, not-predicted-taken slot-0, so its
+            // ifault is 0. Dead until S4a.3-b (fb_push1 needs slot1_valid_gate).
+            if fb_push1 {
+                fb_pc[fb_tail1]           = s1_pc;
+                fb_instr[fb_tail1]        = s1_instr;
+                fb_is_rvc[fb_tail1]       = s1_is_rvc;
+                fb_ifault[fb_tail1]       = 1'b0;
+                fb_pred_next_pc[fb_tail1] = pred_next_pc1;
+                fb_pred_index[fb_tail1]   = bht_lk_index1;
+            }
+            fb_tail = fb_tail + (if fb_push0 ? (if fb_push1 ? 3'd2 : 3'd1) : 3'd0);
             if fb_pop {
                 fb_head = fb_head + 3'd1;
             }
-            fb_count = fb_count + (if fb_push ? 4'd1 : 4'd0) - (if fb_pop ? 4'd1 : 4'd0);
+            fb_count = fb_count + (if fb_push0 ? (if fb_push1 ? 4'd2 : 4'd1) : 4'd0) - (if fb_pop ? 4'd1 : 4'd0);
         }
     }
 
@@ -628,7 +741,8 @@ pub module heliodor_core #(
     // port tied off for M5.C; M5.D adds Sv39 + dmem-shared PTW
     // arbitration.
     // ============================================================
-    var imem_paddr_w: logic<64>;
+    // imem_paddr_w forward-declared early (the S4a.3 slot-1 same-line check reads
+    // imem_paddr_w[5:2] before this point); assigned by the imem_mmu inst below.
     // imem_valid_w forward-declared with the fetch latch above.
     var imem_busy_w: logic;
     // imem_fault_w forward-declared with the fetch latch above.
@@ -2057,13 +2171,23 @@ pub module heliodor_core #(
             committed_ghr = {committed_ghr[6:0], c_dir_taken};
         }
     }
+    // Phase 8 S4a.3: gshare spec history shifts in the predicted direction of
+    // each delivered conditional branch — up to two per cycle (slot-0 then
+    // slot-1). A slot-0 predicted-taken cond branch kills slot-1, so the
+    // both-cond case only arises when slot-0 went not-taken (bht_taken=0).
+    let ghr_upd0: logic = fb_push0 && btb_hit && btb_is_cond;
+    let ghr_upd1: logic = fb_push1 && btb_hit2 && btb_is_cond2;
     always_ff (clk, rst) {
         if_reset {
             spec_ghr = 8'd0;
         } else if redirect_fire {
             spec_ghr = committed_ghr;
-        } else if fetch_deliver && btb_hit && btb_is_cond {
+        } else if ghr_upd0 && ghr_upd1 {
+            spec_ghr = {spec_ghr[5:0], bht_taken, bht_taken2};
+        } else if ghr_upd0 {
             spec_ghr = {spec_ghr[6:0], bht_taken};
+        } else if ghr_upd1 {
+            spec_ghr = {spec_ghr[6:0], bht_taken2};
         }
     }
     always_ff (clk, rst) {
