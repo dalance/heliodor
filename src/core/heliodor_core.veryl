@@ -402,11 +402,30 @@ pub module heliodor_core #(
     var btb_hit    : logic    ;
     var btb_target : logic<64>;
     var btb_is_cond: logic    ;
+    var btb_is_call: logic    ;
+    var btb_is_ret : logic    ;
     var bht_taken  : logic    ;
-    // A conditional branch is predicted taken per the BHT; JAL/JALR (is_cond=0)
-    // are predicted taken on any BTB hit.
-    let predicted_taken: logic     = btb_hit && (!btb_is_cond || bht_taken);
-    let pred_next_pc_bp: logic<64> = if predicted_taken ? btb_target : pc_q + pc_advance;
+    // M3 RAS speculative top (combinational).
+    var ras_spec_top  : logic<64>;
+    var ras_spec_valid: logic    ;
+    // A conditional branch is predicted taken per the BHT; JAL/JALR/call/ret
+    // (is_cond=0) are predicted taken on any BTB hit.
+    let predicted_taken: logic = btb_hit && (!btb_is_cond || bht_taken);
+    // M3: a return's target comes from the RAS (the BTB stores the previous
+    // caller's return addr, usually wrong); fall back to the BTB target when the
+    // RAS is empty. A wrong target is caught at commit (c_bp_mispredict).
+    let pred_use_ras   : logic     = btb_hit && btb_is_ret && ras_spec_valid;
+    let pred_target    : logic<64> = if pred_use_ras ? ras_spec_top : btb_target;
+    let pred_next_pc_bp: logic<64> = if predicted_taken ? pred_target : pc_q + pc_advance;
+
+    // M3: an instruction is delivered (its prediction applied) this cycle when
+    // the delivery arm of the fetch latch fires. RAS speculative push/pop are
+    // gated on this so a stalled / squashed cycle does not perturb the stack
+    // (straddle-prep has needs_straddle=1 ⇒ fetch_ready=0, so it is excluded).
+    let fetch_deliver : logic     = !redirect_fire && !stall_dr && fetch_ready;
+    let ras_push_addr : logic<64> = pc_q + pc_advance; // return address of a call
+    let ras_spec_push : logic     = fetch_deliver && btb_hit && btb_is_call;
+    let ras_spec_pop  : logic     = fetch_deliver && btb_hit && btb_is_ret;
 
     // Training signals (driven from the commit stage; forward-referenced here).
     var btb_train_en     : logic    ;
@@ -414,19 +433,29 @@ pub module heliodor_core #(
     var bp_train_pc      : logic<64>;
     var btb_train_target : logic<64>;
     var btb_train_is_cond: logic    ;
+    var btb_train_is_call: logic    ;
+    var btb_train_is_ret : logic    ;
     var bht_train_taken  : logic    ;
+    // M3 RAS architectural push/pop (commit; forward-referenced).
+    var ras_arch_push     : logic    ;
+    var ras_arch_pop      : logic    ;
+    var ras_arch_push_addr: logic<64>;
 
     inst u_btb: btb (
-        clk                              ,
-        rst                              ,
-        i_pc           : pc_q            ,
-        o_hit          : btb_hit         ,
-        o_target       : btb_target      ,
-        o_is_cond      : btb_is_cond     ,
-        i_train_en     : btb_train_en    ,
-        i_train_pc     : bp_train_pc     ,
-        i_train_target : btb_train_target,
+        clk                               ,
+        rst                               ,
+        i_pc           : pc_q             ,
+        o_hit          : btb_hit          ,
+        o_target       : btb_target       ,
+        o_is_cond      : btb_is_cond      ,
+        o_is_call      : btb_is_call      ,
+        o_is_ret       : btb_is_ret       ,
+        i_train_en     : btb_train_en     ,
+        i_train_pc     : bp_train_pc      ,
+        i_train_target : btb_train_target ,
         i_train_is_cond: btb_train_is_cond,
+        i_train_is_call: btb_train_is_call,
+        i_train_is_ret : btb_train_is_ret ,
     );
     inst u_bht: bht (
         clk                            ,
@@ -436,6 +465,19 @@ pub module heliodor_core #(
         i_train_en   : bht_train_en    ,
         i_train_pc   : bp_train_pc     ,
         i_train_taken: bht_train_taken ,
+    );
+    inst u_ras: ras (
+        clk                                 ,
+        rst                                 ,
+        i_spec_push     : ras_spec_push     ,
+        i_spec_pop      : ras_spec_pop      ,
+        i_spec_push_addr: ras_push_addr     ,
+        o_spec_top      : ras_spec_top      ,
+        o_spec_valid    : ras_spec_valid    ,
+        i_arch_push     : ras_arch_push     ,
+        i_arch_pop      : ras_arch_pop      ,
+        i_arch_push_addr: ras_arch_push_addr,
+        i_recovery_fire : redirect_fire     ,
     );
 
     // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
@@ -714,6 +756,10 @@ pub module heliodor_core #(
         rob_alloc_entry.pred_next_pc   = if_pred_next_pc_q;
         rob_alloc_entry.is_rvc         = if_is_rvc_q;
         rob_alloc_entry.is_control     = dec_op.is_branch || dec_op.is_jal || dec_op.is_jalr;
+        // M3 RAS: call = jal/jalr writing a link reg (x1/x5); ret = jalr reading
+        // a link reg with no link write (RISC-V return-address-stack hints).
+        rob_alloc_entry.is_call        = (dec_op.is_jal || dec_op.is_jalr) && (dec_op.rd_arch == 5'd1 || dec_op.rd_arch == 5'd5);
+        rob_alloc_entry.is_ret         = dec_op.is_jalr && (dec_op.rs1_arch == 5'd1 || dec_op.rs1_arch == 5'd5) && !(dec_op.rd_arch == 5'd1 || dec_op.rd_arch == 5'd5);
         rob_alloc_entry.illegal        = dec_op.illegal || if_ifault_q;
         rob_alloc_entry.is_ifault      = if_ifault_q;
         rob_alloc_entry.result_data    = 64'd0;
@@ -1186,6 +1232,8 @@ pub module heliodor_core #(
     var c_is_rvc      : logic           ;
     var c_is_control  : logic           ;
     var c_is_cond     : logic           ; // M2: conditional branch (BHT train)
+    var c_is_call     : logic           ; // M3: call (RAS push + BTB kind)
+    var c_is_ret      : logic           ; // M3: return (RAS pop + BTB kind)
     var c_result_data : logic<64>       ;
     var c_is_store    : logic           ;
     var c_store_addr  : logic<64>       ;
@@ -1287,6 +1335,8 @@ pub module heliodor_core #(
         o_commit_is_rvc      : c_is_rvc             ,
         o_commit_is_control  : c_is_control         ,
         o_commit_is_cond     : c_is_cond            ,
+        o_commit_is_call     : c_is_call            ,
+        o_commit_is_ret      : c_is_ret             ,
         o_commit_result_data : c_result_data        ,
         o_commit_is_store    : c_is_store           ,
         o_commit_store_addr  : c_store_addr         ,
@@ -1679,7 +1729,15 @@ pub module heliodor_core #(
     assign bp_train_pc       = c_pc;
     assign btb_train_target  = c_redirect_pc;
     assign btb_train_is_cond = c_is_cond;
+    assign btb_train_is_call = c_is_call;
+    assign btb_train_is_ret  = c_is_ret;
     assign bht_train_taken   = c_is_control && (c_redirect_pc != c_fall_pc);
+    // M3 RAS architectural update: a committed call pushes its return address
+    // (the fall-through PC); a committed return pops. On a redirect the
+    // speculative RAS is restored from this architectural stack.
+    assign ras_arch_push      = rob_commit_ack && c_is_call;
+    assign ras_arch_pop       = rob_commit_ack && c_is_ret;
+    assign ras_arch_push_addr = c_fall_pc;
     always_ff (clk, rst) {
         if_reset {
             redirect_fire_q = 1'b0;
