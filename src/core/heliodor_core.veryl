@@ -344,6 +344,10 @@ pub module heliodor_core #(
     // reference it. High when an enabled+pending interrupt should be taken.
     var csr_irq_pending: logic;
     var stall_dr     : logic    ; // back-pressure from D/R
+    // Phase 8 S4b: declared early so fb_pop2 (FIFO drain) can reference them
+    // before their drivers in the rename stage / ROB instance below.
+    var rename_fire2 : logic    ; // 2-wide rename enable (assigned at rename)
+    var rob_size     : logic<8> ; // ROB occupancy (driven by the ROB o_size port)
 
     // M7: RVC fetch path with straddle handling.
     // Normal: pc_q is the logical PC (2-byte aligned), imem fetches the
@@ -537,10 +541,14 @@ pub module heliodor_core #(
     // !csr_irq_pending: see the interrupt-drain note at rename_fire — a pending
     // interrupt halts rename so the ROB drains to empty and commit_irq can fire.
     let fb_pop : logic = if_v_q && !stall_dr && !redirect_fire && !csr_irq_pending;
+    // Phase 8 S4b: slot-1 drain == rename_fire2 (defined below). rename_fire2
+    // implies rename_fire (which is identical to fb_pop), so fb_pop2 is only ever
+    // set when fb_pop is — the FIFO never drains slot-1 without slot-0.
+    let fb_pop2: logic = rename_fire2;
     let fb_full: logic = fb_count == 4'd8 && !fb_pop;
     // Free slots available for a push this cycle (accounts for a simultaneous
-    // drain freeing one). fb_count is 0..8, fb_pop is 0..1, so fb_free is 0..8.
-    let fb_free : logic<4> = (4'd8 - fb_count) + (if fb_pop ? 4'd1 : 4'd0);
+    // drain freeing slots). fb_count 0..8, fb_pop/fb_pop2 0..1, so fb_free 0..8.
+    let fb_free : logic<4> = (4'd8 - fb_count) + (if fb_pop ? 4'd1 : 4'd0) + (if fb_pop2 ? 4'd1 : 4'd0);
     let fb_tail1: logic<3> = fb_tail + 3'd1; // slot-1 write index (wraps mod 8)
     // Phase 8 S4a.3: 2-wide push. fb_push0 = the slot-0 delivery (== the S4a.2
     // single push); fb_push1 = the slot-1 delivery (needs slot1_valid + room for
@@ -718,10 +726,12 @@ pub module heliodor_core #(
                 fb_pred_index[fb_tail1]   = bht_lk_index1;
             }
             fb_tail = fb_tail + (if fb_push0 ? (if fb_push1 ? 3'd2 : 3'd1) : 3'd0);
+            // Phase 8 S4b: 2-wide drain. fb_pop2 (== rename_fire2) drains the
+            // head+1 record too, so head advances by 2 and count drops by 2.
             if fb_pop {
-                fb_head = fb_head + 3'd1;
+                fb_head = fb_head + (if fb_pop2 ? 3'd2 : 3'd1);
             }
-            fb_count = fb_count + (if fb_push0 ? (if fb_push1 ? 4'd2 : 4'd1) : 4'd0) - (if fb_pop ? 4'd1 : 4'd0);
+            fb_count = fb_count + (if fb_push0 ? (if fb_push1 ? 4'd2 : 4'd1) : 4'd0) - (if fb_pop ? (if fb_pop2 ? 4'd2 : 4'd1) : 4'd0);
         }
     }
 
@@ -858,6 +868,8 @@ pub module heliodor_core #(
     var old_rd_pdst: logic<PRF_INT_W>;
     var new_rd_pdst: logic<PRF_INT_W>;
     var free_empty : logic           ;
+    var free_avail2: logic           ; // Phase 8 S4b: free-list has >=2 free pdsts
+    var iq_alloc_rdy2: logic         ; // Phase 8 S4b: iq_int has a 2nd free slot
 
     // M6: FP rename / dual datapath (declared early; wired to rat_fp /
     // fp free_list / prf_fp / iq_fp / fpu_wrap instances below).
@@ -1034,10 +1046,14 @@ pub module heliodor_core #(
         && !dec_op2.is_csr && !dec_op2.is_branch && !dec_op2.is_jal && !dec_op2.is_jalr
         && !dec_op2.is_ecall && !dec_op2.is_ebreak && !dec_op2.is_mret && !dec_op2.is_sret
         && !dec_op2.is_sfence && !dec_op2.is_fence_i && !dec_op2.illegal;
-    // S4b.1: still gated OFF (1'b0). S4b.2 flips this to the real condition
-    // (rename_fire && dec_op2_eligible && fb_count>=2 && IQ/free_list/ROB room).
-    let rename_fire2: logic = 1'b0;
-    let _unused_dec_op2_eligible: logic = dec_op2_eligible; // S4b.2 consumes this
+    // S4b.2: 2-wide rename LIVE. slot-1 renames alongside slot-0 when: slot-0
+    // fires (rename_fire), the slot-1 op is a simple int ALU op (dec_op2_eligible),
+    // the FIFO holds the 2nd record (fb_count >= 2), and there is room for a 2nd
+    // op in the int IQ (iq_alloc_rdy2), free-list (free_avail2), and ROB
+    // (rob_size <= 30 = room for 2). rename_fire is itself gated on !redirect /
+    // !csr_irq / !stall_dr, which rename_fire2 inherits.
+    assign rename_fire2 = rename_fire && dec_op2_eligible && fb_count >= 4'd2
+        && iq_alloc_rdy2 && free_avail2 && rob_size <= 8'd30;
     // Slot-1 decoded arch fields (real 2nd decode lane). Slot-1 is integer-only,
     // so no FP-dest fields here.
     let dec_op2_rs1_arch : logic<5> = dec_op2.rs1_arch;
@@ -1419,6 +1435,7 @@ pub module heliodor_core #(
         i_pop_en2      : fl_pop_en2   ,
         o_pop_pdst2    : new_rd_pdst2 ,
         o_empty        : free_empty   ,
+        o_avail2       : free_avail2  ,
         i_push_en      : fl_push_en   ,
         i_push_pdst    : fl_push_pdst ,
         i_push_en2     : fl_push_en2  ,
@@ -1506,6 +1523,8 @@ pub module heliodor_core #(
         i_pop_en2      : 1'b0                               ,
         o_pop_pdst2    : _                                  ,
         o_empty        : fp_free_empty                      ,
+        o_avail2       : _                                  , // FP free-list 1-wide
+
         i_push_en      : fp_fl_push_en                      ,
         i_push_pdst    : fp_fl_push_pdst                    ,
         i_push_en2     : 1'b0                               ,
@@ -1612,10 +1631,10 @@ pub module heliodor_core #(
         i_alloc_op          : ren_op                      ,
         o_alloc_rdy         : iq_alloc_rdy                ,
         // Phase 8 S2: slot-1 alloc (integer-only; gated off via rename_fire2=0
-        // until S4). o_alloc_rdy2 is discarded in S2 — S4 gates rename_fire2 on it.
+        // until S4). Phase 8 S4b: o_alloc_rdy2 now gates rename_fire2.
         i_alloc_en2         : rename_fire2                ,
         i_alloc_op2         : ren_op2                     ,
-        o_alloc_rdy2        : _                           ,
+        o_alloc_rdy2        : iq_alloc_rdy2               ,
         // M6: clear int prf-ready only on an INT dest rename (has_rd covers
         // int ops + FP→INT). FP-dest renames clear the FP bitmap in iq_fp.
         i_rename_set_pending: rename_fire && dec_op.has_rd,
@@ -1675,7 +1694,7 @@ pub module heliodor_core #(
     var rob_commit_valid: logic              ;
     var rob_commit_entry: RobEntry           ;
     var rob_commit_idx  : logic   <ROB_IDX_W>;
-    var rob_size        : logic   <8>        ;
+    // rob_size declared early (near stall_dr) for the S4b rename_fire2 gate.
 
     // Per-field commit signals (sim-bug workaround for cross-module
     // struct-port; mirror of rob_commit_entry.X).
