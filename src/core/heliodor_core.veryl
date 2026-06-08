@@ -234,6 +234,7 @@ pub module heliodor_core #(
     var if_pc_q    : logic<64>;
     var if_instr_q : logic<32>;
     var if_is_rvc_q: logic    ; // M7: was the fetched instr a 2-byte RVC
+    var if_pred_next_pc_q: logic<64>; // Phase 8 M1: next PC fetched after the delivered instr (= predicted)
 
     // Forward-declared CSR outputs consumed by imem_mmu/dmem_mmu insts
     // below; driven by csr inst further down.
@@ -400,6 +401,7 @@ pub module heliodor_core #(
             if_pc_q        = RESET_PC;
             if_instr_q     = 32'd0;
             if_is_rvc_q    = 1'b0;
+            if_pred_next_pc_q = RESET_PC;
             straddle_q     = 1'b0;
             straddle_low_q = 16'd0;
             if_ifault_q    = 1'b0;
@@ -410,6 +412,7 @@ pub module heliodor_core #(
                 if_pc_q        = redirect_pc;
                 if_instr_q     = 32'd0;
                 if_is_rvc_q    = 1'b0;
+                if_pred_next_pc_q = redirect_pc;
                 straddle_q     = 1'b0;
                 straddle_low_q = 16'd0;
                 if_ifault_q    = 1'b0;
@@ -445,6 +448,11 @@ pub module heliodor_core #(
                 // M7: track RVC-origin for the link register (pc+2 vs pc+4).
                 // Straddle resolves a 32-bit, so is_rvc=0 in that case.
                 if_is_rvc_q = !straddle_q && curr_is_rvc;
+                // Phase 8 M1: record the next PC the frontend chose for the
+                // op delivered this cycle. With no predictor this is the
+                // sequential fall-through; M2 replaces it with the BTB/BHT
+                // prediction. Equals pc_q (= if_pc_q) + the instruction length.
+                if_pred_next_pc_q = pc_q + pc_advance;
                 pc_q        = pc_q + pc_advance;
                 straddle_q  = 1'b0;
             } else if !stall_dr {
@@ -652,6 +660,11 @@ pub module heliodor_core #(
         rob_alloc_entry.is_jalr        = dec_op.is_jalr;
         rob_alloc_entry.mispredict     = 1'b0;
         rob_alloc_entry.redirect_pc    = 64'd0;
+        // Phase 8 M1: carry the frontend's chosen next PC + control/length so
+        // commit can decide mispredict (= pred_next_pc != arch_next_pc).
+        rob_alloc_entry.pred_next_pc   = if_pred_next_pc_q;
+        rob_alloc_entry.is_rvc         = if_is_rvc_q;
+        rob_alloc_entry.is_control     = dec_op.is_branch || dec_op.is_jal || dec_op.is_jalr;
         rob_alloc_entry.illegal        = dec_op.illegal || if_ifault_q;
         rob_alloc_entry.is_ifault      = if_ifault_q;
         rob_alloc_entry.result_data    = 64'd0;
@@ -1114,8 +1127,11 @@ pub module heliodor_core #(
     var c_old_rd_pdst : logic<PRF_INT_W>;
     var c_has_rd      : logic           ;
     var c_illegal     : logic           ;
-    var c_mispredict  : logic           ;
     var c_redirect_pc : logic<64>       ;
+    // Phase 8 M1: carried fields for the commit-time mispredict decision.
+    var c_pred_next_pc: logic<64>       ;
+    var c_is_rvc      : logic           ;
+    var c_is_control  : logic           ;
     var c_result_data : logic<64>       ;
     var c_is_store    : logic           ;
     var c_store_addr  : logic<64>       ;
@@ -1211,8 +1227,11 @@ pub module heliodor_core #(
         o_commit_old_rd_pdst : c_old_rd_pdst        ,
         o_commit_has_rd      : c_has_rd             ,
         o_commit_illegal     : c_illegal            ,
-        o_commit_mispredict  : c_mispredict         ,
+        o_commit_mispredict  : _                    , // Phase 8 M1: superseded by commit-time check
         o_commit_redirect_pc : c_redirect_pc        ,
+        o_commit_pred_next_pc: c_pred_next_pc       ,
+        o_commit_is_rvc      : c_is_rvc             ,
+        o_commit_is_control  : c_is_control         ,
         o_commit_result_data : c_result_data        ,
         o_commit_is_store    : c_is_store           ,
         o_commit_store_addr  : c_store_addr         ,
@@ -1585,6 +1604,15 @@ pub module heliodor_core #(
     :
         trap_tvec_base
     ;
+    // Phase 8 M1: commit-time mispredict. The architectural next PC of the
+    // committing op is its resolved target (carried as c_redirect_pc by
+    // execute) for a control op, else the fall-through pc+len. A mismatch with
+    // the frontend's chosen next PC (c_pred_next_pc) is a misprediction. This
+    // unifies branch/jal/jalr today and (M2+) BTB false-hit / mis-target
+    // recovery: a non-control op's arch_next_pc is always pc+len, so a stray
+    // prediction self-corrects to the fall-through.
+    let c_arch_next_pc : logic<64> = if c_is_control ? c_redirect_pc : c_pc + (if c_is_rvc ? 64'd2 : 64'd4);
+    let c_bp_mispredict: logic     = rob_commit_valid && (c_pred_next_pc != c_arch_next_pc);
     always_ff (clk, rst) {
         if_reset {
             redirect_fire_q = 1'b0;
@@ -1598,9 +1626,9 @@ pub module heliodor_core #(
         } else if commit_sret {
             redirect_fire_q = 1'b1;
             redirect_pc_q   = csr_sepc;
-        } else if rob_commit_valid && c_mispredict {
+        } else if c_bp_mispredict {
             redirect_fire_q = 1'b1;
-            redirect_pc_q   = c_redirect_pc;
+            redirect_pc_q   = c_arch_next_pc;
         } else if sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q && sc_poison_q {
             // M9.4 SMP: a poisoned SC (remote write hit its reserved line
             // between execute and commit) — its store was suppressed; re-fetch
@@ -2260,7 +2288,7 @@ pub module heliodor_core #(
             redirect_cnt   = 32'd0;
             front_idle_cnt = 32'd0;
         } else {
-            if rob_commit_valid && c_mispredict {
+            if c_bp_mispredict {
                 mispredict_cnt = mispredict_cnt + 32'd1;
             }
             if redirect_fire {
