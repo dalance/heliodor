@@ -346,6 +346,28 @@ pub module heliodor_core #(
 
     var redirect_fire: logic    ;
     var redirect_pc  : logic<64>;
+    // Phase 8 S8.E: early (execute-time) branch redirect. Forward-declared so the
+    // fetch engine / fetch buffer / rename gates below can reference the registered
+    // pulse, while the registration always_ff (which needs the late-defined
+    // early_mispredict* signals + alu_cdb) lives near the bottom of the module.
+    // early_redir_fire_q is a 1-cycle pulse (mirrors redirect_fire_q): the cycle
+    // AFTER a control op resolves mispredicted at execute. _idx_q is the resolved
+    // branch's rob_idx (drives the partial squash + checkpoint restore); _pc_q is
+    // its resolved architectural next-PC (front-end steer target).
+    var early_redir_fire_q: logic            ;
+    var early_redir_idx_q : logic<ROB_IDX_W> ;
+    var early_redir_pc_q  : logic<64>        ;
+    // S8.E re-redirect guard: asserted (per CDB lane) the cycle a control op resolves
+    // an acted-on execute-time mispredict, so the ROB rewrites that op's predicted
+    // next-PC to the resolved target in the CDB writeback (forward-declared; assigned
+    // beside early_redir_trigger near the bottom of the module).
+    var early_redir_fix0: logic;
+    var early_redir_fix1: logic;
+    // Unified "a redirect recovery is in flight this cycle" gate. The commit-time
+    // redirect (redirect_fire = trap/mret/sret/mispredict/SC-replay/satp) is precise
+    // and OUTRANKS the early redirect everywhere; early_redir_fire_q is the
+    // execute-time partial recovery. Front-end steering/draining keys on either.
+    let any_redirect: logic = redirect_fire || early_redir_fire_q;
     // Phase 8 S4a: forward-declared (assigned by the csr inst's o_irq_pending
     // far below) so the fetch-buffer drain gate in fb_pop / rename_fire can
     // reference it. High when an enabled+pending interrupt should be taken.
@@ -592,7 +614,7 @@ pub module heliodor_core #(
     // resource readiness, so fb_full→fb_push has no combinational cycle.
     // !csr_irq_pending: see the interrupt-drain note at rename_fire — a pending
     // interrupt halts rename so the ROB drains to empty and commit_irq can fire.
-    let fb_pop : logic = if_v_q && !stall_dr && !redirect_fire && !csr_irq_pending;
+    let fb_pop : logic = if_v_q && !stall_dr && !any_redirect && !csr_irq_pending;
     // Phase 8 S4b: slot-1 drain == rename_fire2 (defined below). rename_fire2
     // implies rename_fire (which is identical to fb_pop), so fb_pop2 is only ever
     // set when fb_pop is — the FIFO never drains slot-1 without slot-0.
@@ -605,7 +627,7 @@ pub module heliodor_core #(
     // Phase 8 S4a.3: 2-wide push. fb_push0 = the slot-0 delivery (== the S4a.2
     // single push); fb_push1 = the slot-1 delivery (needs slot1_valid + room for
     // a 2nd record). slot-0 pushes to fb_tail, slot-1 to fb_tail+1.
-    let fb_push0: logic = !redirect_fire && !fb_full && fetch_ready;
+    let fb_push0: logic = !any_redirect && !fb_full && fetch_ready;
     let fb_push1: logic = fb_push0 && slot1_valid && fb_free >= 4'd2;
     // M3: an instruction is delivered (its prediction applied) this cycle when
     // the fetch engine pushes it into the FIFO. RAS speculative push/pop and the
@@ -685,7 +707,10 @@ pub module heliodor_core #(
         i_arch_push     : ras_arch_push     ,
         i_arch_pop      : ras_arch_pop      ,
         i_arch_push_addr: ras_arch_push_addr,
-        i_recovery_fire : redirect_fire     ,
+        // Phase 8 S8.E: restore the speculative RAS from the architectural stack on
+        // an early redirect too (accuracy-only approximation — loses in-flight
+        // call/ret nesting between the commit head and the resolved branch).
+        i_recovery_fire : any_redirect      ,
     );
 
     // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
@@ -707,6 +732,12 @@ pub module heliodor_core #(
             straddle_low_q = 16'd0;
         } else if redirect_fire {
             pc_q           = redirect_pc;
+            straddle_q     = 1'b0;
+            straddle_low_q = 16'd0;
+        } else if early_redir_fire_q {
+            // Phase 8 S8.E: execute-time redirect steers here a cycle after the
+            // branch resolves (commit redirect, above, has priority when both fire).
+            pc_q           = early_redir_pc_q;
             straddle_q     = 1'b0;
             straddle_low_q = 16'd0;
         } else if !fb_full {
@@ -751,7 +782,9 @@ pub module heliodor_core #(
             fb_head  = 3'd0;
             fb_tail  = 3'd0;
             fb_count = 4'd0;
-        } else if redirect_fire {
+        } else if any_redirect {
+            // Phase 8 S8.E: drain the fetch buffer on an early redirect too (it
+            // holds wrong-path records younger than the resolved branch).
             fb_head  = 3'd0;
             fb_tail  = 3'd0;
             fb_count = 4'd0;
@@ -839,7 +872,7 @@ pub module heliodor_core #(
         clk                        ,
         rst                        ,
         i_vaddr   : fetch_vaddr    ,
-        i_req     : !redirect_fire ,
+        i_req     : !any_redirect  ,
         o_paddr   : imem_paddr_w   ,
         o_valid   : imem_valid_w   ,
         o_fault   : imem_fault_w   ,
@@ -857,7 +890,7 @@ pub module heliodor_core #(
         i_ptw_valid   : imem_ptw_req_w     ,
         i_icache_stall: icache_stall       , // M8.A: hold MMU/TLB during icache fill
         i_sfence      : commit_sfence_pulse,
-        i_redirect    : redirect_fire      ,
+        i_redirect    : any_redirect       ,
     );
     let _unused_imem_fault: logic = imem_fault_w;
     let _unused_imem_valid: logic = imem_valid_w;
@@ -1002,7 +1035,7 @@ pub module heliodor_core #(
     // gated, the ROB empties, and commit_irq keys on the SAME csr_irq_pending, so
     // the trap is taken and clears MIE/SIE → csr_irq_pending drops → rename
     // resumes). fb_pop carries the same gate so no FIFO record is dropped.
-    let rename_fire: logic = if_v_q && !stall_dr && !redirect_fire && !csr_irq_pending;
+    let rename_fire: logic = if_v_q && !stall_dr && !any_redirect && !csr_irq_pending;
 
     // ROB alloc entry
     var rob_alloc_entry: RobEntry;
@@ -1533,8 +1566,14 @@ pub module heliodor_core #(
     let s8_ckpt0_idx  : logic<ROB_IDX_W> = rob_alloc_idx;
     let s8_ckpt1_en   : logic            = rename_fire2 && rob_alloc_entry2.is_control;
     let s8_ckpt1_idx  : logic<ROB_IDX_W> = rob_alloc_idx2;
-    let s8_restore_en : logic            = 1'b0;
-    let s8_restore_idx: logic<ROB_IDX_W> = 5'd0;
+    // Phase 8 S8.E: the flip. Restore the int/fp RAT + both free lists from the
+    // resolved branch's checkpoint, and partial-squash the ROB + both IQs of every
+    // entry younger than it, the cycle after the mispredict is detected at execute.
+    // Gated by !redirect_fire so a same-cycle commit redirect (full flush) wins;
+    // when it does, the ROB/RAT/free-list recover via i_redirect_fire/i_recovery_fire
+    // instead. The restore index = the squash index = the resolved branch's rob_idx.
+    let s8_restore_en : logic            = early_redir_fire_q && !redirect_fire;
+    let s8_restore_idx: logic<ROB_IDX_W> = early_redir_idx_q;
 
     let fl_pop_en: logic = rename_fire && dec_op.has_rd;
     inst u_fl: free_list (
@@ -1731,10 +1770,11 @@ pub module heliodor_core #(
         o_issue_int_pdst    : iqf_iss_int_pdst                   ,
         i_issue_ack         : iqf_issue_ack                      ,
         i_flush             : redirect_fire                      ,
-        // Phase 8 S8.D: early partial squash — gated off until S8.E.
+        // Phase 8 S8.E: early partial squash (flip). Drop iq_fp entries younger
+        // than the resolved branch; survivors keep their CDB wakeups.
         i_rob_head_idx      : rob_head_idx                       ,
-        i_squash_en         : 1'b0                               ,
-        i_squash_idx        : 5'd0                               ,
+        i_squash_en         : s8_restore_en                      ,
+        i_squash_idx        : s8_restore_idx                     ,
     );
 
     inst u_fpu: fpu_wrap (
@@ -1827,9 +1867,10 @@ pub module heliodor_core #(
         i_block_store_age   : rob_block_store_age         ,
         i_block_mem_xlate   : rob_has_pending_xlate       , // M9.A.298 xlate barrier
         i_rob_head_idx      : rob_head_idx                ,
-        // Phase 8 S8.D: early partial squash — gated off until S8.E.
-        i_squash_en         : 1'b0                        ,
-        i_squash_idx        : 5'd0                        ,
+        // Phase 8 S8.E: early partial squash (flip). Drop iq_int entries younger
+        // than the resolved branch (age via the shared S4c head-relative metric).
+        i_squash_en         : s8_restore_en               ,
+        i_squash_idx        : s8_restore_idx              ,
     );
 
     // ============================================================
@@ -2045,9 +2086,14 @@ pub module heliodor_core #(
         o_commit2_result_data: c2_result_data       ,
         i_commit_ack2        : commit2_fire         ,
         i_redirect_fire      : redirect_fire        ,
-        // Phase 8 S8.C: early partial squash — gated off until S8.E.
-        i_squash_en          : 1'b0                 ,
-        i_squash_idx         : 5'd0                 ,
+        // Phase 8 S8.E: early partial squash (flip). Rewind tail to one past the
+        // resolved branch and clear younger entries; coexists with CDB writeback
+        // and head commit on the same cycle.
+        i_squash_en          : s8_restore_en        ,
+        i_squash_idx         : s8_restore_idx       ,
+        // Phase 8 S8.E re-redirect guard (CDB-writeback pred rewrite).
+        i_cdb_redir_fix      : early_redir_fix0     ,
+        i_cdb2_redir_fix     : early_redir_fix1     ,
         o_head_idx           : rob_head_idx         ,
         o_size               : rob_size             ,
         o_dbg_head_valid     : rob_head_valid       ,
@@ -2454,7 +2500,11 @@ pub module heliodor_core #(
     always_ff (clk, rst) {
         if_reset {
             spec_ghr = 8'd0;
-        } else if redirect_fire {
+        } else if any_redirect {
+            // Phase 8 S8.E: restore spec history on an early redirect too. Like the
+            // RAS restore, this is an approximation (committed_ghr lags the resolved
+            // branch by the in-flight conditional branches between it and the commit
+            // head) — accuracy-only, not a correctness requirement for gshare.
             spec_ghr = committed_ghr;
         } else if ghr_upd0 && ghr_upd1 {
             spec_ghr = {spec_ghr[5:0], bht_taken, bht_taken2};
@@ -2570,7 +2620,6 @@ pub module heliodor_core #(
     assign o_dbg_retire_rd_v_a = c_has_rd;
     assign o_dbg_retire_rd_a   = c_rd_arch;
     assign o_dbg_retire_data_a = c_result_data;
-
 
     // ============================================================
     // dmem ports (M2: toy memory — combinational read, registered
@@ -2973,7 +3022,13 @@ pub module heliodor_core #(
     let commit_redirect: logic = commit_trap || commit_mret || commit_sret || c_bp_mispredict || commit_sc_replay || commit_csrw_satp;
     // Slot-1 retires only when slot-0 actually retires (rob_commit_ack), slot-0
     // does not redirect, and head+1 is a simple integer op (c2_valid from ROB).
-    assign commit2_fire = rob_commit_ack && !commit_redirect && c2_valid;
+    // Phase 8 S8.E: suppress the 2-wide commit on an early-squash cycle. c2_valid is
+    // computed from the PRE-squash sh_valid[head+1]; if the branch is at the head
+    // (squash_age 0) then head+1 is YOUNGER and being squashed this cycle — committing
+    // it would advance head by 2 while the squash rewinds tail to head+1, leaving
+    // head > tail (catastrophic size wrap). Slot-0 (the branch / an older op) still
+    // commits; the extra slot-1 commit just waits one cycle.
+    assign commit2_fire = rob_commit_ack && !commit_redirect && c2_valid && !s8_restore_en;
 
     always_ff (clk, rst) {
         if_reset {
@@ -3157,6 +3212,20 @@ pub module heliodor_core #(
             walk_vaddr_q    = 64'd0;
             walk_is_store_q = 1'b0;
             walk_pc_q       = 64'd0;
+        } else if early_redir_fire_q {
+            // Phase 8 S8.E: an early redirect's PARTIAL squash rewinds tail to
+            // branch_idx+1, so the squashed wrong-path rob_idx is REUSED by the
+            // correct-path op on the very next allocation. Unlike the commit full-
+            // flush (M9.A.312, where the latched squashed owner is harmless because
+            // the empty ROB refills from idx 0), here we must take PRIORITY over
+            // dmem_walk_start and clear the owner — even for a walk starting THIS
+            // cycle (the wrong-path load that mispredicted-down the fall-through).
+            // Otherwise its later PTW fault is injected (lfault_inj_v) into the reused
+            // idx = a valid correct-path load → spurious page fault (the BUG5 boot
+            // livelock: a fall-through wrong-path load @0x8001b288 walked a garbage VA
+            // 0xfffffffffffc.. whose fault landed on the jump-target load @0x8001b8da).
+            // The walk becomes an orphan (walk_phys_q=1, walk_v_q=0); its fault drops.
+            walk_v_q = 1'b0;
         } else if dmem_walk_start {
             // M9.A.312: dmem_walk_start MUST take priority over redirect_fire_q.
             // When both coincide, a NEW PTW walk is starting THIS cycle (the MMU
@@ -3504,12 +3573,76 @@ pub module heliodor_core #(
     // change); S8.E steers the front-end on these signals. The early count is >=
     // the committed mispredict count because wrong-path control ops execute (and
     // are counted) but are flushed before they commit.
-    let early_mispredict0: logic = alu_cdb.valid && rob_is_control[alu_cdb.rob_idx]
+    // S8.E LIVENESS gate: a wrong-path op whose ROB entry was already committed/
+    // squashed can still be sitting in the IQ and issue, producing a CDB with a
+    // rob_idx that is BEHIND the head (age, head-relative, >= the live size). Acting
+    // on its (stale) mispredict would register an early redirect for a non-live idx,
+    // and the partial squash would rewind tail to head+(huge age)+1 = a full ROB
+    // (deadlock). Restrict early-mispredict to genuinely live entries: age < size.
+    // (5-bit age intermediate + zero-extended compare — the inline subtraction form
+    // mis-evaluates under the Veryl cc sim; see the rob.veryl squash note.)
+    let em0_age: logic<ROB_IDX_W> = alu_cdb.rob_idx - rob_head_idx;
+    let em1_age: logic<ROB_IDX_W> = alu_cdb2.rob_idx - rob_head_idx;
+    let em0_live: logic = {3'b000, em0_age} <: rob_size;
+    let em1_live: logic = {3'b000, em1_age} <: rob_size;
+    let early_mispredict0: logic = alu_cdb.valid && em0_live && rob_is_control[alu_cdb.rob_idx]
         && (alu_cdb.redirect_pc != rob_pred_next_pc[alu_cdb.rob_idx]);
-    let early_mispredict1: logic = alu_cdb2.valid && rob_is_control[alu_cdb2.rob_idx]
+    let early_mispredict1: logic = alu_cdb2.valid && em1_live && rob_is_control[alu_cdb2.rob_idx]
         && (alu_cdb2.redirect_pc != rob_pred_next_pc[alu_cdb2.rob_idx]);
     let early_mispred_inc: logic<32> =
         (if early_mispredict0 ? 32'd1 : 32'd0) + (if early_mispredict1 ? 32'd1 : 32'd0);
+
+    // Phase 8 S8.E: the flip. Steer the front-end on an execute-time mispredict
+    // instead of waiting for the branch to reach the ROB head and commit-redirect.
+    // SELECT: the two ALU lanes can both resolve a mispredicting control op in the
+    // same cycle; recover on the OLDER one (smallest age relative to the ROB head)
+    // — it dominates the younger one's path, and its single-cycle checkpoint
+    // restore + younger-squash subsumes the younger redirect (the younger branch's
+    // own ROB/IQ entries are squashed, so it cannot later fire a stale redirect).
+    let early_redir_pick1: logic = early_mispredict1 && (!early_mispredict0 || (em1_age <: em0_age));
+    // REGISTER (+1 cy, mirrors redirect_fire_q). Gate so it never fires when:
+    //  - a commit redirect is recovering this cycle (!redirect_fire): commit is
+    //    precise and does a full flush — let it win and don't double-recover; the
+    //    branch (if mispredicted) is re-detectable next cycle if still in flight.
+    //  - we are ALREADY in an early-recovery cycle (!early_redir_fire_q): the ALU
+    //    may issue a YOUNGER wrong-path branch this cycle (issue reads pre-squash
+    //    IQ state) whose execute-time redirect must NOT steer the just-recovered
+    //    front-end. Such a branch is squashed at the edge; if a genuinely OLDER
+    //    branch mispredicts here it still commit-redirects (its pred_next_pc was
+    //    not rewritten by the guard), so no mispredict is ever lost.
+    // Phase 8 S8.E flip ENABLE. The early-redirect datapath below steers the front-
+    // end at execute instead of at commit. Validated: arch 152/0, N=1 Linux boot to
+    // SBI shutdown (x3=0xAA @15.1M cy, -6% vs the commit-redirect S8.D 16.1M), and a
+    // committed-stream byte-diff vs the gated-off baseline (identical → the early
+    // recovery is architecturally transparent). BUG5 (a boot trap-redirect livelock)
+    // was a wrong-path PTW whose page fault mis-attributed to a reused rob_idx; fixed
+    // by clearing the decoupled walk owner (walk_v_q) on early_redir_fire_q with
+    // priority over dmem_walk_start (see the walk-owner always_ff). Set 1'b0 to revert
+    // to S8.D (commit-time redirect) exactly — early_redir_fire_q then never fires.
+    let s8e_flip_en: logic = 1'b1;
+    let early_redir_trigger: logic = s8e_flip_en && (early_mispredict0 || early_mispredict1)
+        && !redirect_fire && !early_redir_fire_q;
+    let early_redir_sel_idx: logic<ROB_IDX_W> = if early_redir_pick1 ? alu_cdb2.rob_idx : alu_cdb.rob_idx;
+    let early_redir_sel_pc : logic<64>        = if early_redir_pick1 ? alu_cdb2.redirect_pc : alu_cdb.redirect_pc;
+    // S8.E re-redirect guard drive (this cycle = the resolving op's CDB writeback;
+    // see the ROB i_cdb_redir_fix port). When the early redirect triggers, rewrite the
+    // committed prediction of EVERY mispredicting lane: the selected (older) op survives
+    // and must not re-redirect at commit; a non-selected younger op is squashed anyway.
+    assign early_redir_fix0 = early_redir_trigger && early_mispredict0;
+    assign early_redir_fix1 = early_redir_trigger && early_mispredict1;
+    always_ff (clk, rst) {
+        if_reset {
+            early_redir_fire_q = 1'b0;
+            early_redir_idx_q  = 5'd0;
+            early_redir_pc_q   = 64'd0;
+        } else if early_redir_trigger {
+            early_redir_fire_q = 1'b1;
+            early_redir_idx_q  = early_redir_sel_idx;
+            early_redir_pc_q   = early_redir_sel_pc;
+        } else {
+            early_redir_fire_q = 1'b0;
+        }
+    }
 
     var mispredict_cnt    : logic<32>;
     var redirect_cnt      : logic<32>;
