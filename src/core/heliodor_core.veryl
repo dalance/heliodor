@@ -293,6 +293,12 @@ pub module heliodor_core #(
     :
         csr_priv
     ;
+    // Phase 8 S5.1: Sv39 dmem translation active (mirrors dmem_mmu vm_enabled =
+    // satp.MODE==Sv39 && eff_priv != M). Drives rob i_conservative: VA-based
+    // store-to-load forwarding/disambiguation is only sound when VA==PA (bare
+    // mode); under an MMU the same PA aliases across VAs and MMIO would be
+    // wrongly forwarded, so loads fall back to baseline store-ordering there.
+    let dmem_vm_on: logic = satp_shadow[63:60] == 4'd8 && dmem_eff_priv != csr_pkg::PrivLevel::MACHINE;
 
     // M5.D.2: forward declaration for IQ-issue/CDB stall gate; driven
     // by the dmem_mmu inst near end of file. Bare mode keeps this at 0.
@@ -388,6 +394,16 @@ pub module heliodor_core #(
     var dcache_rdata     : logic<64>;
     var dcache_rdata_next: logic<64>;
     var dcache_stall     : logic    ;
+    // Phase 8 S5.1: a LOAD issue must NOT drive the single dcache port while an
+    // older STORE is firing its commit write (store_drive). Without the M2 global
+    // load-block, the relaxed store-to-load gate lets a load (even one forwarding
+    // from that very store) issue concurrently with the store's commit. The core
+    // would then assert BOTH core_dmem_ren (load) and core_dmem_wen (store) with
+    // the address pinned to the store → a conflicting dcache request that wedges
+    // dcache_stall high forever (the store never completes its write, so it never
+    // commits, so store_drive never drops). Declared early (assigned after
+    // store_drive); gates issue ack / alu valid / core_dmem_ren below.
+    var load_blocks_on_store: logic;
 
     var c_inst_w    : logic<16>;
     var c_expanded_w: logic<32>;
@@ -1177,6 +1193,28 @@ pub module heliodor_core #(
     var rob_has_pending_store: logic                    ;
     var rob_has_pending_xlate: logic                    ; // M9.A.298 translation-barrier
     var rob_has_pending_amo  : logic                    ; // M9 SMP: AMO RMW bus lock
+    // Phase 8 S5.1 store-to-load: age-relative gate (from u_rob) + the ROB's
+    // per-entry store shadow (FF-derived). The byte-granular forward is computed
+    // HERE in the core (below, after agu_addr_iss) — the ROB store arrays and
+    // agu_addr_iss are forward-refs/local so the (large) byte-network reads only
+    // settled values, avoiding the Veryl-sim comb-settle hang that a
+    // backward-referenced cross-module array read in a big comb block triggers.
+    // The merged result is delivered to alu_wrap as fwd_data[64]/fwd_mask[8].
+    var rob_block_store_exists: logic                    ;
+    var rob_block_store_age   : logic<ROB_IDX_W>         ;
+    var rob_store_addr        : logic<64>     [ROB_DEPTH];
+    var rob_store_data        : logic<64>     [ROB_DEPTH];
+    var rob_store_funct3      : logic<3>      [ROB_DEPTH];
+    var rob_store_fwdable     : logic         [ROB_DEPTH];
+    var stld_fwd_data         : logic<64>                ;
+    var stld_fwd_mask         : logic<8>                 ;
+    // Local copies of the ROB store shadow: the forward byte-network reads these
+    // (same-module) instead of the cross-module rob_store_* arrays 8×32 times —
+    // many cross-module array reads in a big comb block hang the Veryl sim.
+    var ls_addr               : logic<64>     [ROB_DEPTH];
+    var ls_data               : logic<64>     [ROB_DEPTH];
+    var ls_f3                 : logic<3>      [ROB_DEPTH];
+    var ls_fwd                : logic         [ROB_DEPTH];
 
     var prf_rs1_data: logic<64>;
     var prf_rs2_data: logic<64>;
@@ -1294,7 +1332,7 @@ pub module heliodor_core #(
         cdb = if fpu_cdb.valid ? fpu_cdb : alu_cdb;
     }
     inst u_alu: alu_wrap (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -1306,6 +1344,9 @@ pub module heliodor_core #(
         // (iq_issue_ack also gated) and re-issues it once the line is cached.
         i_load_data       : dcache_rdata                                        ,
         i_load_data_next  : dcache_rdata_next                                   ,
+        // Phase 8 S5.1: core-computed store-to-load forward bytes + mask.
+        i_fwd_data        : stld_fwd_data                                       ,
+        i_fwd_mask        : stld_fwd_mask                                       ,
         i_dmem_fault      : dmem_mmu_fault                                      ,
         i_dmem_fault_s    : dmem_mmu_fault_s                                    ,
         i_csr_data        : csr_rd_data                                         ,
@@ -1354,6 +1395,8 @@ pub module heliodor_core #(
         i_rs2_data        : prf_rs2_data2   ,
         i_load_data       : 64'd0           , // pipe-1: no LOAD
         i_load_data_next  : 64'd0           ,
+        i_fwd_data        : 64'd0           , // pipe-1: no LOAD → no forward
+        i_fwd_mask        : 8'd0            ,
         i_dmem_fault      : 1'b0            ,
         i_dmem_fault_s    : 1'b0            ,
         i_csr_data        : 64'd0           , // pipe-1: no CSR
@@ -1389,7 +1432,7 @@ pub module heliodor_core #(
     // fill / write-during-fill). The op re-issues each cycle (core_dmem_ren
     // stays asserted, driving the fill) but does not ack/leave until the data
     // is cached and dcache_stall drops.
-    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok;
+    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store;
 
     // ============================================================
     // PRF
@@ -1683,7 +1726,9 @@ pub module heliodor_core #(
         o_issue_rob_idx2    : iq_iss_rob_idx2             ,
         i_issue_ack2        : issue2_valid                ,
         i_flush             : redirect_fire               ,
-        i_block_loads       : rob_has_pending_store       , // M2 conservative gate
+        // Phase 8 S5.1 age-relative store-to-load gate (was global i_block_loads).
+        i_block_store_exists: rob_block_store_exists      ,
+        i_block_store_age   : rob_block_store_age         ,
         i_block_mem_xlate   : rob_has_pending_xlate       , // M9.A.298 xlate barrier
         i_rob_head_idx      : rob_head_idx                ,
     );
@@ -1852,6 +1897,15 @@ pub module heliodor_core #(
         o_has_pending_store  : rob_has_pending_store,
         o_has_pending_xlate  : rob_has_pending_xlate,
         o_has_pending_amo    : rob_has_pending_amo  ,
+        // Phase 8 S5.1 store-to-load gate + per-entry store shadow (forwarded to
+        // alu_wrap for the local byte-network).
+        o_block_store_exists : rob_block_store_exists,
+        o_block_store_age    : rob_block_store_age   ,
+        i_conservative       : dmem_vm_on            ,
+        o_store_addr         : rob_store_addr        ,
+        o_store_data         : rob_store_data        ,
+        o_store_funct3       : rob_store_funct3      ,
+        o_store_fwdable      : rob_store_fwdable     ,
         o_commit_is_csr      : c_is_csr             ,
         o_commit_csr_addr    : c_csr_addr           ,
         o_commit_csr_wdata   : c_csr_wdata          ,
@@ -2422,6 +2476,125 @@ pub module heliodor_core #(
     let issue_is_load : logic     = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_read;
 
     // ============================================================
+    // Phase 8 S5.1: store-to-load forward byte-network (computed in the core so
+    // the ROB store shadow + agu_addr_iss are forward-refs/local — a big comb
+    // reading a backward-referenced cross-module array hangs the Veryl sim). For
+    // each of the 8 bytes [agu_addr_iss, +7] the issuing LOAD consumes, override
+    // the dcache byte with the YOUNGEST older forwardable store writing it. Each
+    // store's data is aligned into the load frame ONCE (`asd`); the 8 scalar
+    // accumulators (manually unrolled — a loop-var WRITE index hangs the sim) read
+    // constant slices. stld_fwd_data is in the natural load frame (byte p = addr
+    // agu_addr_iss+p, matching alu_wrap's ld_shifted); stld_fwd_mask gates it.
+    // ============================================================
+    let stld_fwd_age: logic<ROB_IDX_W> = iq_iss_rob_idx - rob_head_idx;
+    let stld_fwd_en : logic              = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo;
+    assign ls_addr = rob_store_addr;
+    assign ls_data = rob_store_data;
+    assign ls_f3   = rob_store_funct3;
+    assign ls_fwd  = rob_store_fwdable;
+    var sf0_v: logic; var sf0_age: logic<ROB_IDX_W>; var sf0_b: logic<8>;
+    var sf1_v: logic; var sf1_age: logic<ROB_IDX_W>; var sf1_b: logic<8>;
+    var sf2_v: logic; var sf2_age: logic<ROB_IDX_W>; var sf2_b: logic<8>;
+    var sf3_v: logic; var sf3_age: logic<ROB_IDX_W>; var sf3_b: logic<8>;
+    var sf4_v: logic; var sf4_age: logic<ROB_IDX_W>; var sf4_b: logic<8>;
+    var sf5_v: logic; var sf5_age: logic<ROB_IDX_W>; var sf5_b: logic<8>;
+    var sf6_v: logic; var sf6_age: logic<ROB_IDX_W>; var sf6_b: logic<8>;
+    var sf7_v: logic; var sf7_age: logic<ROB_IDX_W>; var sf7_b: logic<8>;
+    // One always_comb per byte (each a single self-ref accumulator like iq_int's
+    // oldest-ready select): 8 accumulators in ONE block made the combinational_loop
+    // diagnostic falsely fuse them into a loop. p = byte position; la = agu+p.
+    always_comb {
+        sf0_v = 1'b0; sf0_age = '0; sf0_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd0;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf0_v || age_i >: sf0_age) { sf0_v = 1'b1; sf0_age = age_i; sf0_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf1_v = 1'b0; sf1_age = '0; sf1_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd1;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf1_v || age_i >: sf1_age) { sf1_v = 1'b1; sf1_age = age_i; sf1_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf2_v = 1'b0; sf2_age = '0; sf2_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd2;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf2_v || age_i >: sf2_age) { sf2_v = 1'b1; sf2_age = age_i; sf2_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf3_v = 1'b0; sf3_age = '0; sf3_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd3;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf3_v || age_i >: sf3_age) { sf3_v = 1'b1; sf3_age = age_i; sf3_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf4_v = 1'b0; sf4_age = '0; sf4_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd4;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf4_v || age_i >: sf4_age) { sf4_v = 1'b1; sf4_age = age_i; sf4_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf5_v = 1'b0; sf5_age = '0; sf5_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd5;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf5_v || age_i >: sf5_age) { sf5_v = 1'b1; sf5_age = age_i; sf5_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf6_v = 1'b0; sf6_age = '0; sf6_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd6;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf6_v || age_i >: sf6_age) { sf6_v = 1'b1; sf6_age = age_i; sf6_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sf7_v = 1'b0; sf7_age = '0; sf7_b = 8'd0;
+        if stld_fwd_en { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd7;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sf7_v || age_i >: sf7_age) { sf7_v = 1'b1; sf7_age = age_i; sf7_b = byt[7:0]; }
+        } }
+    }
+    assign stld_fwd_data = {sf7_b, sf6_b, sf5_b, sf4_b, sf3_b, sf2_b, sf1_b, sf0_b};
+    assign stld_fwd_mask = {sf7_v, sf6_v, sf5_v, sf4_v, sf3_v, sf2_v, sf1_v, sf0_v};
+
+    // ============================================================
     // M5.A LR/SC reservation (single-hart, simplest).
     // - LR at issue: set valid + addr to agu_addr_iss
     // - SC at issue: clear (whether matched or not, atomicity)
@@ -2684,7 +2857,13 @@ pub module heliodor_core #(
     // no walk starts this cycle, the wrong-path load is flushed, and the walk
     // owner is never a squashed op. load_walk_busy (an already-in-flight walk)
     // is preserved; stores commit in-order (never speculative) so are unaffected.
-    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire) || mmu_walk_inflight;
+    // Phase 8 S5.1: suppress the LOAD read request while a STORE drives its
+    // commit write (store_drive) — the dcache port + address are the store's this
+    // cycle, so a concurrent ren would be a conflicting request that wedges
+    // dcache_stall. The load is held in the IQ (iq_issue_ack gated by
+    // load_blocks_on_store) and re-issues once the store commits.
+    assign load_blocks_on_store = issue_is_load && store_drive;
+    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive) || mmu_walk_inflight;
     let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
     // M9.4 SMP: mark the AMO/LR data read so the dcache forces a coherent,
     // bus-serialized re-fill instead of returning a possibly-stale cache HIT

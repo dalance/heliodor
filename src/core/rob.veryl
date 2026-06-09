@@ -127,6 +127,35 @@ pub module rob #(
     // must not translate through the MMU until these commit (else it sees
     // stale SUM/MXR/MPRV/priv/satp and records a spurious page fault).
     o_has_pending_xlate: output logic,
+    // Phase 8 S5.1 store-to-load: age-relative store-block gate (replaces the
+    // global o_has_pending_store for the LOAD ordering gate). A LOAD must wait
+    // only for an OLDER plain store with an unknown address (!sh_rw) or an
+    // OLDER AMO/SC (kept conservative — never reorder a load before an older
+    // atomic). A known plain store no longer blocks; the LOAD issues and
+    // forwards from it. o_block_store_age = the MIN age (oldest) among blocking
+    // entries; iq_int blocks a load iff that oldest blocker is older than it.
+    o_block_store_exists: output logic           ,
+    o_block_store_age   : output logic<ROB_IDX_W>,
+    // Phase 8 S5.1: conservative mode (driven by dmem_vm_on = Sv39 translation
+    // active). VA-based forwarding/disambiguation is UNSOUND under an MMU: the
+    // same physical line is reachable via different VAs (kernel linear map vs
+    // user / ioremap), so a VA-match forward MISSES an aliased older store (load
+    // reads stale dcache) and an MMIO store would be wrongly forwarded. When
+    // i_conservative=1 every valid store blocks younger loads (baseline ordering)
+    // and nothing is forwardable — restored to the safe M2 behaviour. Relaxed
+    // store-to-load only runs in bare mode (M-mode / satp.MODE=0, VA==PA).
+    i_conservative      : input  logic           ,
+    // Phase 8 S5.1 store-to-load forward: expose the per-entry store shadow so
+    // the forward byte-network can live in alu_wrap (where the issuing LOAD's
+    // effective address is local). These are pure FF-derived outputs (like
+    // o_has_pending_store) — alu_wrap reads them combinationally, mirroring the
+    // dcache_rdata path, with NO core→rob→alu live-address round-trip (that
+    // tangled cross-module comb chain mis-evaluated in the Veryl sim).
+    // o_store_fwdable[i] = entry i is a known forwardable plain store.
+    o_store_addr   : output logic<64> [ROB_DEPTH],
+    o_store_data   : output logic<64> [ROB_DEPTH],
+    o_store_funct3 : output logic<3>  [ROB_DEPTH],
+    o_store_fwdable: output logic     [ROB_DEPTH],
     // M4 CSR drain + trap
     o_commit_is_csr     : output logic           ,
     o_commit_csr_addr   : output logic<12>       ,
@@ -400,6 +429,48 @@ pub module rob #(
         }
     }
     assign o_has_pending_xlate = pending_xlate_w;
+
+    // ============================================================
+    // Phase 8 S5.1: store-to-load disambiguation + forwarding.
+    // ============================================================
+    // (a) Age-relative store-block gate. An entry blocks a younger LOAD iff it
+    // is a valid store-ordering entry that the LOAD cannot safely pass: an AMO/
+    // SC store (atomic — never reorder), or a plain store whose address is not
+    // yet known (!sh_rw). A KNOWN plain store does NOT block (the LOAD forwards
+    // from it below). o_block_store_age = MIN age over blockers = the OLDEST
+    // blocker; iq_int gates a load when that oldest blocker is older than it.
+    var block_store_exists_w: logic             ;
+    var block_store_age_w   : logic<ROB_IDX_W>;
+    always_comb {
+        block_store_exists_w = 1'b0;
+        block_store_age_w    = '0;
+        for i in 0..ROB_DEPTH {
+            let age_i   : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
+            // i_conservative (MMU active): EVERY valid store blocks (baseline).
+            let is_block: logic              = sh_valid[i] && sh_is_store[i] && (i_conservative || sh_is_amo[i] || !sh_rw[i]);
+            if is_block && (!block_store_exists_w || age_i <: block_store_age_w) {
+                block_store_exists_w = 1'b1;
+                block_store_age_w    = age_i;
+            }
+        }
+    }
+    assign o_block_store_exists = block_store_exists_w;
+    assign o_block_store_age    = block_store_age_w;
+
+    // (b) Per-entry store shadow exposure for the alu_wrap forward byte-network.
+    // o_store_fwdable[i] = entry i is a KNOWN forwardable plain store (executed,
+    // address+data captured at CDB, not an AMO/SC). alu_wrap age-filters against
+    // the issuing load and does the byte merge. Pure FF-derived (settles like
+    // o_has_pending_store); no live address input crosses into the ROB.
+    always_comb {
+        for i in 0..ROB_DEPTH {
+            o_store_addr[i]    = sh_store_addr[i];
+            o_store_data[i]    = sh_store_data[i];
+            o_store_funct3[i]  = sh_store_funct3[i];
+            o_store_fwdable[i] = sh_valid[i] && sh_is_store[i] && !sh_is_amo[i] && sh_rw[i] && !i_conservative;
+        }
+    }
+
     assign o_head_idx          = head_idx;
     assign o_size              = size_w[5:0] as 8;
     assign o_dbg_head_valid    = sh_valid[head_idx];
