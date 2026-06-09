@@ -394,6 +394,15 @@ pub module heliodor_core #(
     var dcache_rdata     : logic<64>;
     var dcache_rdata_next: logic<64>;
     var dcache_stall     : logic    ;
+    // Phase 8 S5.2: 2nd hit-only dcache read port (slot-1 / pipe-1 LOAD). Driver
+    // signals (dc_addr2/dc_ren2/dc_load_next2) and result (dcache_rdata2 / _next /
+    // dcache_hit2). Forward-declared; the dcache inst is near end of file.
+    var dc_addr2          : logic<64>;
+    var dc_ren2           : logic    ;
+    var dc_load_next2     : logic    ;
+    var dcache_rdata2     : logic<64>;
+    var dcache_rdata2_next: logic<64>;
+    var dcache_hit2       : logic    ;
     // Phase 8 S5.1: a LOAD issue must NOT drive the single dcache port while an
     // older STORE is firing its commit write (store_drive). Without the M2 global
     // load-block, the relaxed store-to-load gate lets a load (even one forwarding
@@ -1190,6 +1199,12 @@ pub module heliodor_core #(
     var iq_iss_rs2_pdst2     : logic         <PRF_INT_W>;
     var iq_iss_rd_pdst2      : logic         <PRF_INT_W>;
     var iq_iss_rob_idx2      : logic         <ROB_IDX_W>;
+    // Phase 8 S5.2: slot-1 op is a LOAD (per-field) + the slot-1 fire signal
+    // (= valid2 for ALU; = a completed bare-mode LOAD hit for a slot-1 load).
+    // issue2_fire is forward-ref (drives u_alu2.i_issue_valid + iq.i_issue_ack2)
+    // and assigned after the dcache 2nd-port hit is known.
+    var iq_iss_is_load2      : logic                    ;
+    var issue2_fire          : logic                    ;
     var rob_has_pending_store: logic                    ;
     var rob_has_pending_xlate: logic                    ; // M9.A.298 translation-barrier
     var rob_has_pending_amo  : logic                    ; // M9 SMP: AMO RMW bus lock
@@ -1208,6 +1223,10 @@ pub module heliodor_core #(
     var rob_store_fwdable     : logic         [ROB_DEPTH];
     var stld_fwd_data         : logic<64>                ;
     var stld_fwd_mask         : logic<8>                 ;
+    // Phase 8 S5.2: 2nd store-to-load forward network (slot-1 / pipe-1 LOAD at
+    // agu_addr_iss2). Mirror of the slot-0 network below; feeds u_alu2.i_fwd_*.
+    var stld_fwd_data2        : logic<64>                ;
+    var stld_fwd_mask2        : logic<8>                 ;
     // Local copies of the ROB store shadow: the forward byte-network reads these
     // (same-module) instead of the cross-module rob_store_* arrays 8×32 times —
     // many cross-module array reads in a big comb block hang the Veryl sim.
@@ -1385,18 +1404,23 @@ pub module heliodor_core #(
     // pipe-0 hazards (dcache_stall / dmem_mmu_busy / load_walk_block /
     // fpu_cdb.valid / amo lock); its CDB lane 1, PRF write port 1 and ROB
     // writeback port 1 are all separate from lane 0.
-    let issue2_valid: logic = iq_issue_valid2;
+    // Phase 8 S5.2: pipe-1 now also executes bare-mode LOADs. alu_wrap re-derives
+    // the AGU (i_rs1_data2 + imm == agu_addr_iss2) and the load merge from the 2nd
+    // dcache read (dcache_rdata2 / _next) + the 2nd forward network. i_issue_valid
+    // = issue2_fire (an ALU op always fires; a slot-1 load fires only when it hits
+    // the 2nd port — else it is held in the IQ). A slot-1 LOAD is bare-mode, so
+    // i_dmem_fault stays 0; FP loads stay slot-0 (i_fp_ld=0).
     inst u_alu2: alu_wrap (
-        i_issue_valid     : issue2_valid    ,
+        i_issue_valid     : issue2_fire      ,
         i_issue_op        : iq_issue_op2    , // S3.b: slot-1 issue op
         i_issue_rd_pdst   : iq_iss_rd_pdst2 , // S3.b: slot-1 rd pdst
         i_issue_rob_idx   : iq_iss_rob_idx2 , // S3.b: slot-1 rob idx
         i_rs1_data        : prf_rs1_data2   ,
         i_rs2_data        : prf_rs2_data2   ,
-        i_load_data       : 64'd0           , // pipe-1: no LOAD
-        i_load_data_next  : 64'd0           ,
-        i_fwd_data        : 64'd0           , // pipe-1: no LOAD → no forward
-        i_fwd_mask        : 8'd0            ,
+        i_load_data       : dcache_rdata2   , // S5.2: 2nd dcache read
+        i_load_data_next  : dcache_rdata2_next,
+        i_fwd_data        : stld_fwd_data2  , // S5.2: 2nd forward network
+        i_fwd_mask        : stld_fwd_mask2  ,
         i_dmem_fault      : 1'b0            ,
         i_dmem_fault_s    : 1'b0            ,
         i_csr_data        : 64'd0           , // pipe-1: no CSR
@@ -1724,7 +1748,8 @@ pub module heliodor_core #(
         o_issue_rs2_pdst2   : iq_iss_rs2_pdst2            ,
         o_issue_rd_pdst2    : iq_iss_rd_pdst2             ,
         o_issue_rob_idx2    : iq_iss_rob_idx2             ,
-        i_issue_ack2        : issue2_valid                ,
+        o_issue_is_load2    : iq_iss_is_load2            , // Phase 8 S5.2
+        i_issue_ack2        : issue2_fire                 ,
         i_flush             : redirect_fire               ,
         // Phase 8 S5.1 age-relative store-to-load gate (was global i_block_loads).
         i_block_store_exists: rob_block_store_exists      ,
@@ -2474,6 +2499,12 @@ pub module heliodor_core #(
     let agu_addr_iss  : logic<64> = prf_rs1_data + agu_imm_iss;
     let issue_amo_read: logic     = iq_issue_valid && iq_iss_is_amo && !amo_is_sc_iss;
     let issue_is_load : logic     = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_read;
+    // Phase 8 S5.2: slot-1 (pipe-1) LOAD effective address for the 2nd dcache read
+    // port. alu_wrap (u_alu2) re-derives the same agu internally; this drives the
+    // dcache i_addr2 and the 2nd forward network. Slot-1 never issues AMO/STORE
+    // (pipe1_ok), so the immediate is always the load offset (no AMO-zero case).
+    let agu_addr_iss2 : logic<64> = prf_rs1_data2 + iq_issue_op2.base.imm;
+    let issue2_is_load: logic     = iq_issue_valid2 && iq_iss_is_load2;
 
     // ============================================================
     // Phase 8 S5.1: store-to-load forward byte-network (computed in the core so
@@ -2593,6 +2624,114 @@ pub module heliodor_core #(
     }
     assign stld_fwd_data = {sf7_b, sf6_b, sf5_b, sf4_b, sf3_b, sf2_b, sf1_b, sf0_b};
     assign stld_fwd_mask = {sf7_v, sf6_v, sf5_v, sf4_v, sf3_v, sf2_v, sf1_v, sf0_v};
+
+    // ============================================================
+    // Phase 8 S5.2: 2nd store-to-load forward byte-network for the slot-1
+    // (pipe-1) LOAD at agu_addr_iss2. Identical to the slot-0 network above but
+    // keyed on the slot-1 load's address/age; reads the SAME ROB store shadow
+    // (ls_*). Feeds u_alu2.i_fwd_data/mask. 8 separate always_comb (one per byte)
+    // — fusing them re-trips the combinational_loop diagnostic (see slot-0 note).
+    // ============================================================
+    let stld_fwd_age2: logic<ROB_IDX_W> = iq_iss_rob_idx2 - rob_head_idx;
+    let stld_fwd_en2 : logic              = issue2_is_load;
+    var sg0_v: logic; var sg0_age: logic<ROB_IDX_W>; var sg0_b: logic<8>;
+    var sg1_v: logic; var sg1_age: logic<ROB_IDX_W>; var sg1_b: logic<8>;
+    var sg2_v: logic; var sg2_age: logic<ROB_IDX_W>; var sg2_b: logic<8>;
+    var sg3_v: logic; var sg3_age: logic<ROB_IDX_W>; var sg3_b: logic<8>;
+    var sg4_v: logic; var sg4_age: logic<ROB_IDX_W>; var sg4_b: logic<8>;
+    var sg5_v: logic; var sg5_age: logic<ROB_IDX_W>; var sg5_b: logic<8>;
+    var sg6_v: logic; var sg6_age: logic<ROB_IDX_W>; var sg6_b: logic<8>;
+    var sg7_v: logic; var sg7_age: logic<ROB_IDX_W>; var sg7_b: logic<8>;
+    always_comb {
+        sg0_v = 1'b0; sg0_age = '0; sg0_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd0;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg0_v || age_i >: sg0_age) { sg0_v = 1'b1; sg0_age = age_i; sg0_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg1_v = 1'b0; sg1_age = '0; sg1_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd1;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg1_v || age_i >: sg1_age) { sg1_v = 1'b1; sg1_age = age_i; sg1_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg2_v = 1'b0; sg2_age = '0; sg2_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd2;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg2_v || age_i >: sg2_age) { sg2_v = 1'b1; sg2_age = age_i; sg2_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg3_v = 1'b0; sg3_age = '0; sg3_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd3;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg3_v || age_i >: sg3_age) { sg3_v = 1'b1; sg3_age = age_i; sg3_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg4_v = 1'b0; sg4_age = '0; sg4_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd4;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg4_v || age_i >: sg4_age) { sg4_v = 1'b1; sg4_age = age_i; sg4_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg5_v = 1'b0; sg5_age = '0; sg5_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd5;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg5_v || age_i >: sg5_age) { sg5_v = 1'b1; sg5_age = age_i; sg5_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg6_v = 1'b0; sg6_age = '0; sg6_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd6;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg6_v || age_i >: sg6_age) { sg6_v = 1'b1; sg6_age = age_i; sg6_b = byt[7:0]; }
+        } }
+    }
+    always_comb {
+        sg7_v = 1'b0; sg7_age = '0; sg7_b = 8'd0;
+        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
+            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd7;
+            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+            let off: logic<64> = la - sa;
+            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
+            if cov && (!sg7_v || age_i >: sg7_age) { sg7_v = 1'b1; sg7_age = age_i; sg7_b = byt[7:0]; }
+        } }
+    }
+    assign stld_fwd_data2 = {sg7_b, sg6_b, sg5_b, sg4_b, sg3_b, sg2_b, sg1_b, sg0_b};
+    assign stld_fwd_mask2 = {sg7_v, sg6_v, sg5_v, sg4_v, sg3_v, sg2_v, sg1_v, sg0_v};
 
     // ============================================================
     // M5.A LR/SC reservation (single-hart, simplest).
@@ -3107,6 +3246,25 @@ pub module heliodor_core #(
     ;
     let dc_span_sum : logic<6> = ({3'b0, dc_byte_off} as 6) + ({1'b0, dc_ld_bytes} as 6);
     let dc_load_next: logic    = issue_is_load && (dc_span_sum >: 6'd8);
+    // Phase 8 S5.2: drive the 2nd hit-only read port from the slot-1 LOAD AGU.
+    // BARE mode only (PA==VA); under Sv39/VM the slot-1 load is not admitted
+    // (S5.1 conservative) so the port stays off. dc_ren2 is independent of the
+    // 2nd-port hit (no comb loop). The completion gate (ld2_complete / issue2_fire,
+    // after the dcache inst) adds !dcache_stall / !redirect / !inv.
+    let dc_byte_off2: logic<3> = agu_addr_iss2[2:0];
+    let dc_ld_bytes2: logic<5> = if iq_issue_op2.base.mem_funct3[1:0] == 2'b00 ?
+        5'd1
+    : if iq_issue_op2.base.mem_funct3[1:0] == 2'b01 ?
+        5'd2
+    : if iq_issue_op2.base.mem_funct3[1:0] == 2'b10 ?
+        5'd4
+    :
+        5'd8
+    ;
+    let dc_span_sum2: logic<6> = ({3'b0, dc_byte_off2} as 6) + ({1'b0, dc_ld_bytes2} as 6);
+    assign dc_addr2      = agu_addr_iss2;
+    assign dc_ren2       = issue2_is_load && !dmem_vm_on;
+    assign dc_load_next2 = issue2_is_load && (dc_span_sum2 >: 6'd8);
     var dc_mem_addr : logic<64>;
     var dc_mem_wdata: logic<64>;
     var dc_mem_wen  : logic    ;
@@ -3124,6 +3282,14 @@ pub module heliodor_core #(
         i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
         i_load_next      : dc_load_next                  , // B.3: misaligned cross-line load fill
         i_amo_read       : dc_amo_read                   , // M9.4: AMO/LR read → force coherent re-fill
+        // Phase 8 S5.2: 2nd hit-only read port (dual-issue loads). Tied off in
+        // step 1; wired to the slot-1 load AGU/result in steps 2-3.
+        i_addr2          : dc_addr2                       ,
+        i_ren2           : dc_ren2                        ,
+        i_load_next2     : dc_load_next2                  ,
+        o_rdata2         : dcache_rdata2                  ,
+        o_rdata2_next    : dcache_rdata2_next            ,
+        o_hit2           : dcache_hit2                    ,
         o_rdata          : dcache_rdata                  ,
         o_rdata_next     : dcache_rdata_next             ,
         o_rdata_next_miss: _                             , // hi_miss path stalls cross-line loads
@@ -3143,6 +3309,18 @@ pub module heliodor_core #(
         o_mem_req        : dc_mem_req                    ,
         i_mem_grant      : i_dmem_grant                  ,
     );
+
+    // Phase 8 S5.2: slot-1 LOAD completion. A bare-mode slot-1 load completes on
+    // pipe-1 only when the 2nd port HITS and the dcache is not stalled (a mid-FILL
+    // 2nd read could see a victim way's old tag with partially-overwritten data),
+    // not on a redirect (wrong-path), and not during a same-cycle remote invalidate
+    // (SMP race). Otherwise the load is held in the IQ (issue2_fire=0 for it →
+    // ack2=0) and re-issues later. Non-load slot-1 ops fire unconditionally
+    // (= the old issue2_valid). issue2_fire drives BOTH u_alu2.i_issue_valid and
+    // iq.i_issue_ack2 (forward-ref var). Store ordering is enforced by the slot-1
+    // select's block term + the 2nd forward network (older overlapping stores).
+    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !dcache_stall && !redirect_fire && !i_dcache_inv_valid;
+    assign issue2_fire = iq_issue_valid2 && (!issue2_is_load || ld2_complete);
 
     // M8.C: o_dmem is now purely the dcache mem side — imem PTW moved to the
     // dedicated o_iptw bus, so no arbiter mux here anymore.
