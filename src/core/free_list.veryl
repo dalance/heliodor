@@ -15,11 +15,13 @@
 // same cycle (common case: commit + rename) and let n_inflight grow
 // unboundedly, corrupting recovery.
 pub module free_list #(
-    param PRF_N : u32 = 64,
-    param PRF_W : u32 = 6 ,
-    param ARCH_N: u32 = 32,
-    param FREE_N: u32 = 32, // PRF_N - ARCH_N
-    param IDX_W : u32 = 6 , // log2(FREE_N) + 1 for full/empty distinction
+    param PRF_N    : u32 = 64,
+    param PRF_W    : u32 = 6 ,
+    param ARCH_N   : u32 = 32,
+    param FREE_N   : u32 = 32, // PRF_N - ARCH_N
+    param IDX_W    : u32 = 6 , // log2(FREE_N) + 1 for full/empty distinction
+    param ROB_DEPTH: u32 = 32, // Phase 8 S8: per-branch checkpoint slots
+    param ROB_IDX_W: u32 = 5 ,
 ) (
     clk: input clock,
     rst: input reset,
@@ -40,13 +42,30 @@ pub module free_list #(
     i_push_en2  : input logic       ,
     i_push_pdst2: input logic<PRF_W>,
 
-    // Recovery (full reclaim of in-flight pops)
+    // Recovery (full reclaim of in-flight pops) — commit-time mispredict/trap.
     i_recovery_fire: input logic,
+
+    // Phase 8 S8: per-branch checkpoint of `head` for EARLY (execute-time) branch
+    // redirect. At a control op's rename, snapshot the head value AFTER that op's
+    // bundle-position pop (slot-0 op → after slot-0's pop; slot-1 op → after both
+    // pops), indexed by the op's rob_idx. On its later mispredict-restore, head is
+    // rewound to that snapshot, reclaiming exactly the pdsts popped by ops YOUNGER
+    // than the branch (n_inflight -= head - ckpt_head). The commit-time
+    // i_recovery_fire path (rewind by full n_inflight) is unchanged. Restore is
+    // gated OFF by the core (i_restore_en=0) until S8.E.
+    i_ckpt0_en  : input logic              , // slot-0 op is a checkpointed control op
+    i_ckpt0_idx : input logic<ROB_IDX_W>   ,
+    i_ckpt1_en  : input logic              , // slot-1 op is a checkpointed control op
+    i_ckpt1_idx : input logic<ROB_IDX_W>   ,
+    i_restore_en : input logic             ,
+    i_restore_idx: input logic<ROB_IDX_W>  ,
 ) {
     var entries   : logic<PRF_W> [FREE_N];
     var head      : logic<IDX_W>         ;
     var tail      : logic<IDX_W>         ;
     var n_inflight: logic<IDX_W>         ;
+    // Phase 8 S8: per-branch head checkpoints (one slot per ROB entry).
+    var head_ckpt : logic<IDX_W> [ROB_DEPTH];
 
     let head_idx: logic<5> = head[4:0];
     let tail_idx: logic<5> = tail[4:0];
@@ -62,9 +81,9 @@ pub module free_list #(
     // update below share them. With i_pop_en2=0 (S2 dead-code build) pop_count
     // reduces to do_pop1 → identical to the 1-wide pop.
     let free_avail: logic<IDX_W> = tail - head;
-    let do_pop1   : logic        = i_pop_en && !i_recovery_fire && (free_avail >= 6'd1);
+    let do_pop1   : logic        = i_pop_en && !i_recovery_fire && !i_restore_en && (free_avail >= 6'd1);
     let pop2_need : logic<IDX_W> = if do_pop1 ? 6'd2 : 6'd1;
-    let do_pop2   : logic        = i_pop_en2 && !i_recovery_fire && (free_avail >= pop2_need);
+    let do_pop2   : logic        = i_pop_en2 && !i_recovery_fire && !i_restore_en && (free_avail >= pop2_need);
     let pop_count : logic<IDX_W> = (if do_pop1 ? 6'd1 : 6'd0) + (if do_pop2 ? 6'd1 : 6'd0);
     let pop2_base : logic<IDX_W> = head + (if do_pop1 ? 6'd1 : 6'd0);
     let pop2_idx  : logic<5>     = pop2_base[4:0];
@@ -73,6 +92,15 @@ pub module free_list #(
     assign o_pop_pdst2 = entries[pop2_idx];
     assign o_empty     = is_empty;
     assign o_avail2    = free_avail >= 6'd2;
+
+    // Phase 8 S8: head value to checkpoint for a control op, by bundle slot.
+    //   post0_head = head after slot-0's pop (slot-0 control op snapshot)
+    //   post1_head = head after both pops      (slot-1 control op snapshot)
+    let post0_head: logic<IDX_W> = head + (if do_pop1 ? 6'd1 : 6'd0);
+    let post1_head: logic<IDX_W> = head + pop_count;
+    // Phase 8 S8: restore reclaim = pops issued AFTER the checkpoint (= old head
+    // minus the snapshot), in ring arithmetic.
+    let restore_reclaim: logic<IDX_W> = head - head_ckpt[i_restore_idx];
 
     always_ff (clk, rst) {
         if_reset {
@@ -83,6 +111,9 @@ pub module free_list #(
             head       = 6'd0;
             tail       = 6'd32; // tail - head = 32 → full
             n_inflight = 6'd0;
+            for j in 0..ROB_DEPTH {
+                head_ckpt[j] = 6'd0;
+            }
         } else {
             // Phase 8 S1: commit may push 0/1/2 pdsts (2-wide commit). slot-1
             // (i_push_en2) may fire independently of slot-0 (a slot-0 store has
@@ -107,12 +138,28 @@ pub module free_list #(
             }
             tail = tail + push_count;
 
-            if i_recovery_fire {
+            // Phase 8 S8: capture per-branch head checkpoints (post-pop, per slot).
+            // Two different rob_idx slots → at most two distinct dynamic writes
+            // (same pattern as the 2-wide push entries[] writes above).
+            if i_ckpt0_en {
+                head_ckpt[i_ckpt0_idx] = post0_head;
+            }
+            if i_ckpt1_en {
+                head_ckpt[i_ckpt1_idx] = post1_head;
+            }
+            // head update: early-restore (S8, gated off until S8.E) > commit-time
+            // recovery > normal advance.
+            if i_restore_en {
+                head = head_ckpt[i_restore_idx];
+            } else if i_recovery_fire {
                 head = head - n_inflight;
             } else {
                 head = head + pop_count;
             }
-            if i_recovery_fire {
+            if i_restore_en {
+                // Reclaim only the pops issued after the branch's checkpoint.
+                n_inflight = n_inflight - restore_reclaim;
+            } else if i_recovery_fire {
                 n_inflight = 6'd0;
             } else {
                 // Each push retires one in-flight pop; decrement by min(push_count,
