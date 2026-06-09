@@ -134,6 +134,7 @@ pub module heliodor_core #(
     o_dbg_mispredict_cnt : output logic<32>, // committed branch mispredicts (= taken control transfers, static not-taken)
     o_dbg_redirect_cnt   : output logic<32>, // total redirect events (mispredict + trap + mret/sret + sc/satp)
     o_dbg_front_idle_cnt : output logic<32>, // cycles fetch could not deliver (icache/MMU stall or post-redirect refill bubble)
+    o_dbg_early_mispredict_cnt: output logic<32>, // S8.A: execute-time control mispredicts (>= committed; wrong-path included)
     // M9 diag: ALU operand observation (verify base.pc passthrough)
     o_dbg_alu_pc_out      : output logic<64>,
     o_dbg_alu_src_a_out   : output logic<64>,
@@ -1247,6 +1248,9 @@ pub module heliodor_core #(
     var rob_store_data        : logic<64>     [ROB_DEPTH];
     var rob_store_funct3      : logic<3>      [ROB_DEPTH];
     var rob_store_fwdable     : logic         [ROB_DEPTH];
+    // Phase 8 S8: per-entry prediction shadow for early-mispredict detection.
+    var rob_pred_next_pc      : logic<64>     [ROB_DEPTH];
+    var rob_is_control        : logic         [ROB_DEPTH];
     var stld_fwd_data         : logic<64>                ;
     var stld_fwd_mask         : logic<8>                 ;
     // Phase 8 S5.2: 2nd store-to-load forward network (slot-1 / pipe-1 LOAD at
@@ -1965,6 +1969,8 @@ pub module heliodor_core #(
         o_store_data         : rob_store_data        ,
         o_store_funct3       : rob_store_funct3      ,
         o_store_fwdable      : rob_store_fwdable     ,
+        o_pred_next_pc       : rob_pred_next_pc      ,
+        o_is_control         : rob_is_control        ,
         o_commit_is_csr      : c_is_csr             ,
         o_commit_csr_addr    : c_csr_addr           ,
         o_commit_csr_wdata   : c_csr_wdata          ,
@@ -3435,14 +3441,39 @@ pub module heliodor_core #(
     //  - front_idle_cnt: fetch slot empty while not stalled by the back-end and
     //    not the redirect cycle itself — i.e. an i-fetch bubble (icache/MMU fill
     //    or the refill gap after a redirect).
-    var mispredict_cnt: logic<32>;
-    var redirect_cnt  : logic<32>;
-    var front_idle_cnt: logic<32>;
+    // Phase 8 S8.A: early (execute-time) branch-misprediction detection. The
+    // resolved architectural next-PC is already on the CDB — alu_wrap's
+    // resolved_target (= o_cdb.redirect_pc) encodes taken→target / not-taken→
+    // fall-through. Compare it against the fetch-time prediction recorded in the
+    // ROB entry that just resolved (indexed by the CDB rob_idx, exposed via
+    // rob_pred_next_pc / rob_is_control). A mismatch on a CONTROL op is an early
+    // mispredict, available the cycle the branch executes — many cycles before it
+    // reaches the commit head. Restricted to control ops; a stray BTB hit on a
+    // non-control op still self-corrects at commit (rare). NOTE: o_cdb.mispredict
+    // is the STALE M1 "any taken = mispredict" flag (alu_wrap predates the BTB/BHT)
+    // and is deliberately NOT used here.
+    //
+    // S8.A is OBSERVATION-ONLY: redirect still fires at commit (zero behavior
+    // change); S8.E steers the front-end on these signals. The early count is >=
+    // the committed mispredict count because wrong-path control ops execute (and
+    // are counted) but are flushed before they commit.
+    let early_mispredict0: logic = alu_cdb.valid && rob_is_control[alu_cdb.rob_idx]
+        && (alu_cdb.redirect_pc != rob_pred_next_pc[alu_cdb.rob_idx]);
+    let early_mispredict1: logic = alu_cdb2.valid && rob_is_control[alu_cdb2.rob_idx]
+        && (alu_cdb2.redirect_pc != rob_pred_next_pc[alu_cdb2.rob_idx]);
+    let early_mispred_inc: logic<32> =
+        (if early_mispredict0 ? 32'd1 : 32'd0) + (if early_mispredict1 ? 32'd1 : 32'd0);
+
+    var mispredict_cnt    : logic<32>;
+    var redirect_cnt      : logic<32>;
+    var front_idle_cnt    : logic<32>;
+    var early_mispred_cnt : logic<32>;
     always_ff (clk, rst) {
         if_reset {
-            mispredict_cnt = 32'd0;
-            redirect_cnt   = 32'd0;
-            front_idle_cnt = 32'd0;
+            mispredict_cnt    = 32'd0;
+            redirect_cnt      = 32'd0;
+            front_idle_cnt    = 32'd0;
+            early_mispred_cnt = 32'd0;
         } else {
             if c_bp_mispredict {
                 mispredict_cnt = mispredict_cnt + 32'd1;
@@ -3453,11 +3484,15 @@ pub module heliodor_core #(
             if !redirect_fire && !if_v_q && !stall_dr {
                 front_idle_cnt = front_idle_cnt + 32'd1;
             }
+            if early_mispred_inc != 32'd0 {
+                early_mispred_cnt = early_mispred_cnt + early_mispred_inc;
+            }
         }
     }
-    assign o_dbg_mispredict_cnt = mispredict_cnt;
-    assign o_dbg_redirect_cnt   = redirect_cnt;
-    assign o_dbg_front_idle_cnt = front_idle_cnt;
+    assign o_dbg_mispredict_cnt       = mispredict_cnt;
+    assign o_dbg_redirect_cnt         = redirect_cnt;
+    assign o_dbg_front_idle_cnt       = front_idle_cnt;
+    assign o_dbg_early_mispredict_cnt = early_mispred_cnt;
     assign o_dbg_rob_size       = rob_size;
     assign o_dbg_if_v           = if_v_q;
     assign o_dbg_if_instr       = if_instr_q;
