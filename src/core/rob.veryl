@@ -41,6 +41,12 @@ pub module rob #(
     i_cdb_store_addr  : input logic<64>,
     i_cdb_store_data  : input logic<64>,
     i_cdb_store_funct3: input logic<3> ,
+    // Phase 8 S9 Load Queue: a PLAIN load executed on lane 0. Its VA/size ride
+    // on i_cdb_store_addr / i_cdb_store_funct3 (the AGU output, written for every
+    // op). Recorded into the per-entry load shadow for memory-order violation
+    // detection (an older store resolving its address scans for younger loads
+    // that already executed and bypassed it).
+    i_cdb_is_load     : input logic    ,
     // M4 CSR side-band on CDB
     i_cdb_is_csr     : input logic    ,
     i_cdb_csr_addr   : input logic<12>,
@@ -65,6 +71,11 @@ pub module rob #(
     i_cdb2_result_data: input logic<64>       ,
     i_cdb2_mispredict : input logic           ,
     i_cdb2_redirect_pc: input logic<64>       ,
+    // Phase 8 S9 Load Queue: lane 1 (S5.2 bare-mode slot-1 LOAD). pipe-1 never
+    // stores, so the only side-band needed here is the load record (VA/size).
+    i_cdb2_is_load     : input logic    ,
+    i_cdb2_store_addr  : input logic<64>,
+    i_cdb2_store_funct3: input logic<3> ,
     // M9.A.294 (F2): independent load-page-fault injection port. A
     // multi-cycle MMU walk reports o_fault one cycle after busy drops, by
     // which time the IQ has moved on to a different op — so the CDB tags
@@ -246,6 +257,11 @@ pub module rob #(
     o_dbg_commit_cnt  : output logic<32>,
     o_dbg_head        : output logic<6> ,
     o_dbg_tail        : output logic<6> ,
+    // Phase 8 S9: memory-order violation events (a store-resolve cycle that
+    // poisoned ≥1 younger aliasing executed load). MUST be 0 while speculation
+    // is OFF (conservative block prevents any younger load from executing before
+    // an older unknown store resolves); after the S9.4 flip it counts replays.
+    o_dbg_load_viol_cnt: output logic<32>,
 ) {
     var entries: pipeline_pkg::RobEntry    [ROB_DEPTH];
     var head   : logic                    <6>            ; // ROB_IDX_W + 1 for full/empty distinction
@@ -282,6 +298,14 @@ pub module rob #(
     var sh_store_addr  : logic<64> [ROB_DEPTH];
     var sh_store_data  : logic<64> [ROB_DEPTH];
     var sh_store_funct3: logic<3>  [ROB_DEPTH];
+    // Phase 8 S9 Load Queue (per-entry shadow, mirrors the store side). A load
+    // entry records its VA + size at CDB writeback (sh_load_done set), so a later
+    // older-store address resolve can detect a younger aliasing load that already
+    // executed (= a memory-order violation) and poison it for commit-time replay.
+    var sh_load_done   : logic     [ROB_DEPTH]; // load has executed (addr valid)
+    var sh_load_addr   : logic<64> [ROB_DEPTH]; // load effective VA (= AGU output)
+    var sh_load_funct3 : logic<3>  [ROB_DEPTH]; // load size encoding (1<<f3[1:0])
+    var sh_load_poison : logic     [ROB_DEPTH]; // violated → replay at commit (S9.3)
     // M4 CSR + trap
     var sh_is_csr   : logic     [ROB_DEPTH];
     var sh_csr_addr : logic<12> [ROB_DEPTH];
@@ -522,9 +546,44 @@ pub module rob #(
     assign o_dbg_head          = head;
     assign o_dbg_tail          = tail;
 
-    var alloc_cnt : logic<32>;
-    var cdb_cnt2  : logic<32>;
-    var commit_cnt: logic<32>;
+    // ============================================================
+    // Phase 8 S9: memory-order violation detection.
+    // ============================================================
+    // When a STORE resolves its address on lane 0 (i_cdb_valid && i_cdb_is_store),
+    // scan the Load Queue for a YOUNGER executed load (sh_load_done) whose VA
+    // byte-overlaps the store's [addr, addr+size). Such a load issued and read the
+    // dcache BEFORE this store's address was known, so it bypassed the store and
+    // read stale data — a memory-order violation. load_viol_w[i] flags each such
+    // load this cycle; the always_ff sets sh_load_poison[i] (replayed at commit,
+    // S9.3). Ages are relative to head (0 = oldest). The store's own entry has
+    // equal age (excluded by the strict `>:`). Pure-comb from registered shadow +
+    // the combinational store CDB inputs. With speculation OFF this fires never
+    // (the conservative block keeps every younger load from executing first).
+    var load_viol_w    : logic [ROB_DEPTH];
+    var any_load_viol_w: logic            ;
+    always_comb {
+        any_load_viol_w = 1'b0;
+        for i in 0..ROB_DEPTH {
+            let st_age : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
+            let ld_age : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
+            let la     : logic<64>        = sh_load_addr[i];
+            let lsz    : logic<64>        = (5'd1 << sh_load_funct3[i][1:0]) as 64;
+            let sa     : logic<64>        = i_cdb_store_addr;
+            let ssz    : logic<64>        = (5'd1 << i_cdb_store_funct3[1:0]) as 64;
+            let overlap: logic            = (la <: sa + ssz) && (sa <: la + lsz);
+            load_viol_w[i] = i_cdb_valid && i_cdb_is_store
+                && sh_valid[i] && sh_load_done[i] && !sh_load_poison[i]
+                && (ld_age >: st_age) && overlap;
+            if load_viol_w[i] {
+                any_load_viol_w = 1'b1;
+            }
+        }
+    }
+
+    var alloc_cnt    : logic<32>;
+    var cdb_cnt2     : logic<32>;
+    var commit_cnt   : logic<32>;
+    var load_viol_cnt: logic<32>;
 
     always_ff (clk, rst) {
         if_reset {
@@ -585,12 +644,17 @@ pub module rob #(
                 sh_is_fp[i]               = 1'b0;
                 sh_fflags[i]              = 5'd0;
                 sh_fflags_wen[i]          = 1'b0;
+                sh_load_done[i]           = 1'b0;
+                sh_load_addr[i]           = 64'd0;
+                sh_load_funct3[i]         = 3'd0;
+                sh_load_poison[i]         = 1'b0;
             }
-            head       = 6'd0;
-            tail       = 6'd0;
-            alloc_cnt  = 32'd0;
-            cdb_cnt2   = 32'd0;
-            commit_cnt = 32'd0;
+            head          = 6'd0;
+            tail          = 6'd0;
+            alloc_cnt     = 32'd0;
+            cdb_cnt2      = 32'd0;
+            commit_cnt    = 32'd0;
+            load_viol_cnt = 32'd0;
         } else if i_redirect_fire {
             // Full flush — return ROB to empty. n_inflight in free_list
             // gets the same recovery_fire pulse so popped pdsts come back.
@@ -602,6 +666,9 @@ pub module rob #(
                 sh_has_rd[i]              = 1'b0;
                 sh_illegal[i]             = 1'b0;
                 sh_mispredict[i]          = 1'b0;
+                // Phase 8 S9: a full flush drops every load record + poison.
+                sh_load_done[i]           = 1'b0;
+                sh_load_poison[i]         = 1'b0;
             }
             head = 6'd0;
             tail = 6'd0;
@@ -640,6 +707,11 @@ pub module rob #(
                 sh_store_addr[tail_idx]   = 64'd0;
                 sh_store_data[tail_idx]   = 64'd0;
                 sh_store_funct3[tail_idx] = 3'd0;
+                // Phase 8 S9: fresh entry has not executed as a load yet.
+                sh_load_done[tail_idx]    = 1'b0;
+                sh_load_addr[tail_idx]    = 64'd0;
+                sh_load_funct3[tail_idx]  = 3'd0;
+                sh_load_poison[tail_idx]  = 1'b0;
                 // M4: ecall/ebreak/mret captured at alloc-time (decode
                 // result). M9.A.298: is_csr/csr_addr now ALSO captured at
                 // alloc (was deferred to CDB) so the translation-barrier
@@ -695,6 +767,10 @@ pub module rob #(
                     sh_store_addr[tail1_idx]   = 64'd0;
                     sh_store_data[tail1_idx]   = 64'd0;
                     sh_store_funct3[tail1_idx] = 3'd0;
+                    sh_load_done[tail1_idx]    = 1'b0;
+                    sh_load_addr[tail1_idx]    = 64'd0;
+                    sh_load_funct3[tail1_idx]  = 3'd0;
+                    sh_load_poison[tail1_idx]  = 1'b0;
                     sh_is_csr[tail1_idx]      = i_alloc_entry2.is_csr;
                     sh_csr_addr[tail1_idx]    = i_alloc_entry2.csr_addr;
                     sh_csr_wdata[tail1_idx]   = 64'd0;
@@ -766,6 +842,15 @@ pub module rob #(
                     sh_fflags[i_cdb_rob_idx]     = i_cdb_fflags;
                     sh_fflags_wen[i_cdb_rob_idx] = 1'b1;
                 }
+                // Phase 8 S9 Load Queue: record a non-faulting plain load's VA +
+                // size (a faulting load traps at commit and never reads data, so
+                // it is not a violation source). store_addr/store_funct3 carry the
+                // AGU output for every op.
+                if i_cdb_is_load && !i_cdb_is_lfault {
+                    sh_load_done[i_cdb_rob_idx]   = 1'b1;
+                    sh_load_addr[i_cdb_rob_idx]   = i_cdb_store_addr;
+                    sh_load_funct3[i_cdb_rob_idx] = i_cdb_store_funct3;
+                }
             }
             // Phase 8 S3: 2nd CDB writeback (pipe-1 = ALU/branch). Targets a
             // different rob_idx than lane 0 (one producer per entry). No store/
@@ -783,9 +868,29 @@ pub module rob #(
                     sh_pred_next_pc[i_cdb2_rob_idx] = i_cdb2_redirect_pc;
                 }
                 sh_result_data[i_cdb2_rob_idx]         = i_cdb2_result_data;
+                // Phase 8 S9 Load Queue: lane 1 bare-mode load record (S5.2). No
+                // faults on pipe-1, so no fault gate needed.
+                if i_cdb2_is_load {
+                    sh_load_done[i_cdb2_rob_idx]   = 1'b1;
+                    sh_load_addr[i_cdb2_rob_idx]   = i_cdb2_store_addr;
+                    sh_load_funct3[i_cdb2_rob_idx] = i_cdb2_store_funct3;
+                }
             }
             // Phase 8 S3: count both CDB lanes in one NBA (two `+= 1` would race).
             cdb_cnt2 = cdb_cnt2 + (if i_cdb_valid ? 32'd1 : 32'd0) + (if i_cdb2_valid ? 32'd1 : 32'd0);
+            // Phase 8 S9: memory-order violation — poison each younger aliasing
+            // load that bypassed the store resolving this cycle (load_viol_w, the
+            // combinational scan above). Static-index loop write (sim-safe). The
+            // partial-squash below runs LATER in this block, so a squashed entry's
+            // poison is correctly re-cleared. Dead until the S9.4 flip.
+            for i in 0..ROB_DEPTH {
+                if load_viol_w[i] {
+                    sh_load_poison[i] = 1'b1;
+                }
+            }
+            if any_load_viol_w {
+                load_viol_cnt = load_viol_cnt + 32'd1;
+            }
             // M9.A.294 (F2): load-fault injection (independent of CDB).
             // Delivers a load page fault to the walk-owner's ROB entry and
             // marks it result_written so it can commit-trap. Same side-effect
@@ -839,6 +944,10 @@ pub module rob #(
                         sh_has_rd[i]              = 1'b0;
                         sh_illegal[i]             = 1'b0;
                         sh_mispredict[i]          = 1'b0;
+                        // Phase 8 S9: a squashed (wrong-path) entry drops its load
+                        // record + poison (wins over the poison-set above).
+                        sh_load_done[i]           = 1'b0;
+                        sh_load_poison[i]         = 1'b0;
                     }
                 }
                 tail = squash_new_tail;
@@ -851,4 +960,5 @@ pub module rob #(
     assign o_dbg_alloc_cnt  = alloc_cnt;
     assign o_dbg_cdb_cnt    = cdb_cnt2;
     assign o_dbg_commit_cnt = commit_cnt;
+    assign o_dbg_load_viol_cnt = load_viol_cnt;
 }
