@@ -356,13 +356,18 @@ pub module rob #(
     // Phase 8 S1: head+1 is commit-slot-1 eligible when it is a valid,
     // result-written, SIMPLE integer op (no serial side effects) and at least 2
     // entries are occupied, and not a flush cycle.
+    // Phase 8 S9: a POISONED load (memory-order violation) must NOT retire via
+    // slot-1 — the replay is triggered only from the commit HEAD (slot-0), so a
+    // poisoned head+1 load must wait to become the head. Without this it would
+    // silently retire its stale value alongside slot-0 and never replay.
     let c2_simple: logic = sh_valid[head1_idx] && sh_rw[head1_idx]
         && !sh_is_store[head1_idx] && !sh_is_amo[head1_idx] && !sh_is_csr[head1_idx]
         && !sh_is_sfence[head1_idx] && !sh_is_fence_i[head1_idx]
         && !sh_is_ecall[head1_idx] && !sh_is_ebreak[head1_idx]
         && !sh_is_mret[head1_idx] && !sh_is_sret[head1_idx]
         && !sh_is_lfault[head1_idx] && !sh_is_sfault[head1_idx] && !sh_is_ifault[head1_idx]
-        && !sh_illegal[head1_idx] && !sh_is_control[head1_idx] && !sh_is_fp[head1_idx];
+        && !sh_illegal[head1_idx] && !sh_is_control[head1_idx] && !sh_is_fp[head1_idx]
+        && !sh_load_poison[head1_idx];
     let c2_valid: logic = c2_simple && (size_w >= 6'd2) && !i_redirect_fire;
 
     assign o_alloc_idx  = tail_idx;
@@ -508,6 +513,14 @@ pub module rob #(
     // yet known (!sh_rw). A KNOWN plain store does NOT block (the LOAD forwards
     // from it below). o_block_store_age = MIN age over blockers = the OLDEST
     // blocker; iq_int gates a load when that oldest blocker is older than it.
+    // Phase 8 S9.4 FLIP: when speculation is enabled AND we are in bare mode
+    // (!i_conservative), an unknown-addr plain store no longer blocks — the load
+    // SPECULATES past it. If the store later resolves to an aliasing address, the
+    // violation detector poisons the younger load and the core replays it at
+    // commit (S9.1/S9.3). AMO/SC (sh_is_amo) and MMU mode (i_conservative) stay
+    // conservative: VA-overlap disambiguation is unsound under aliasing VAs, and
+    // atomics must never be reordered past.
+    let s9_speculate_en: logic = 1'b1;
     var block_store_exists_w: logic             ;
     var block_store_age_w   : logic<ROB_IDX_W>;
     always_comb {
@@ -516,7 +529,9 @@ pub module rob #(
         for i in 0..ROB_DEPTH {
             let age_i   : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
             // i_conservative (MMU active): EVERY valid store blocks (baseline).
-            let is_block: logic              = sh_valid[i] && sh_is_store[i] && (i_conservative || sh_is_amo[i] || !sh_rw[i]);
+            // S9.4: a bare-mode unknown-addr plain store only blocks when
+            // speculation is OFF (!s9_speculate_en).
+            let is_block: logic              = sh_valid[i] && sh_is_store[i] && (i_conservative || sh_is_amo[i] || (!sh_rw[i] && !s9_speculate_en));
             if is_block && (!block_store_exists_w || age_i <: block_store_age_w) {
                 block_store_exists_w = 1'b1;
                 block_store_age_w    = age_i;
@@ -555,15 +570,22 @@ pub module rob #(
     // Phase 8 S9: memory-order violation detection.
     // ============================================================
     // When a STORE resolves its address on lane 0 (i_cdb_valid && i_cdb_is_store),
-    // scan the Load Queue for a YOUNGER executed load (sh_load_done) whose VA
-    // byte-overlaps the store's [addr, addr+size). Such a load issued and read the
-    // dcache BEFORE this store's address was known, so it bypassed the store and
-    // read stale data — a memory-order violation. load_viol_w[i] flags each such
-    // load this cycle; the always_ff sets sh_load_poison[i] (replayed at commit,
-    // S9.3). Ages are relative to head (0 = oldest). The store's own entry has
-    // equal age (excluded by the strict `>:`). Pure-comb from registered shadow +
-    // the combinational store CDB inputs. With speculation OFF this fires never
-    // (the conservative block keeps every younger load from executing first).
+    // scan the Load Queue for a YOUNGER executed load whose VA byte-overlaps the
+    // store's [addr, addr+size). Such a load issued and read the dcache BEFORE this
+    // store's address was known, so it bypassed the store and read stale data — a
+    // memory-order violation. load_viol_w[i] flags each such load this cycle; the
+    // always_ff sets sh_load_poison[i] (replayed at commit, S9.3). Ages are
+    // relative to head (0 = oldest). The store's own entry has equal age (excluded
+    // by the strict `>:`).
+    //
+    // A load counts as "executed" if its record is registered (sh_load_done) OR it
+    // is writing back THIS cycle on lane 1 (S5.2 slot-1 bare load — lane 0 IS the
+    // resolving store, so it can't also be a load). The same-cycle lane-1 case is
+    // only reachable once S9.4 relaxes the block (a younger load co-issuing while
+    // the older store is still unknown); its sh_load_done is not set until next
+    // cycle, so it must be folded in here from the live CDB inputs or the violation
+    // is missed. With speculation OFF this whole scan fires never (the conservative
+    // block keeps every younger load from executing before the store resolves).
     var load_viol_w    : logic [ROB_DEPTH];
     var any_load_viol_w: logic            ;
     always_comb {
@@ -571,13 +593,17 @@ pub module rob #(
         for i in 0..ROB_DEPTH {
             let st_age : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
             let ld_age : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
-            let la     : logic<64>        = sh_load_addr[i];
-            let lsz    : logic<64>        = (5'd1 << sh_load_funct3[i][1:0]) as 64;
+            // Load record for entry i: registered, or executing this cycle on lane 1.
+            let ld_now : logic            = i_cdb2_is_load && ((i as ROB_IDX_W) == i_cdb2_rob_idx);
+            let ld_seen: logic            = sh_valid[i] && (sh_load_done[i] || ld_now);
+            let la     : logic<64>        = if ld_now ? i_cdb2_store_addr : sh_load_addr[i];
+            let lf3    : logic<3>         = if ld_now ? i_cdb2_store_funct3 : sh_load_funct3[i];
+            let lsz    : logic<64>        = (5'd1 << lf3[1:0]) as 64;
             let sa     : logic<64>        = i_cdb_store_addr;
             let ssz    : logic<64>        = (5'd1 << i_cdb_store_funct3[1:0]) as 64;
             let overlap: logic            = (la <: sa + ssz) && (sa <: la + lsz);
             load_viol_w[i] = i_cdb_valid && i_cdb_is_store
-                && sh_valid[i] && sh_load_done[i] && !sh_load_poison[i]
+                && ld_seen && !sh_load_poison[i]
                 && (ld_age >: st_age) && overlap;
             if load_viol_w[i] {
                 any_load_viol_w = 1'b1;
