@@ -414,6 +414,16 @@ pub module heliodor_core #(
     // store_drive); gates issue ack / alu valid / core_dmem_ren below.
     var load_blocks_on_store: logic;
 
+    // Phase 8 S6: a committing BARE-mode aligned PLAIN store (not AMO/SC, not
+    // misaligned) takes the SEPARATE dcache store-drain port (i_saddr/i_swen)
+    // instead of the combined i_wen path, so it coexists with a load read in
+    // the same cycle. fast_store is forward-declared (assigned after the store
+    // data / commit_store_fire below); rob_commit_ack reads it here and gates a
+    // fast store's retire on dc_sdrain_ack (the store drained) rather than
+    // dcache_stall. dc_sdrain_ack is the dcache's o_sdrain_ack (instance below).
+    var fast_store   : logic;
+    var dc_sdrain_ack: logic;
+
     var c_inst_w    : logic<16>;
     var c_expanded_w: logic<32>;
     var c_illegal_w : logic    ;
@@ -1793,6 +1803,7 @@ pub module heliodor_core #(
     var c_pred_index  : logic<10>       ; // M4: carried gshare BHT index
     var c_result_data : logic<64>       ;
     var c_is_store    : logic           ;
+    var c_is_amo      : logic           ; // Phase 8 S6: head is AMO/LR/SC (vs plain store)
     var c_store_addr  : logic<64>       ;
     var c_store_data  : logic<64>       ;
     var c_store_funct3: logic<3>        ;
@@ -1838,7 +1849,13 @@ pub module heliodor_core #(
     // lost — hold commit_store_fire/pop until dcache_stall drops and the write
     // lands. This subsumes the old M9.1 `!(c_is_store && !i_dmem_grant)` gate:
     // the dcache (not the core) now owns bus back-pressure (see dmem_issue note).
-    let rob_commit_ack: logic = rob_commit_valid && !(c_is_store && dmem_mmu_busy) && !(c_is_store && dcache_stall);
+    // Phase 8 S6: a fast (bare aligned plain) store does NOT use the i_wen path,
+    // so its retire is gated on the store-drain ack (dc_sdrain_ack = it wrote the
+    // dcache this cycle) instead of dcache_stall/dmem_mmu_busy. The dmem_mmu_busy
+    // / dcache_stall gates apply only to NON-fast stores (AMO/Sv39/misaligned on
+    // the i_wen path). A waiting fast store does not raise dcache_stall, so a load
+    // read is never blocked by it.
+    let rob_commit_ack: logic = rob_commit_valid && !(c_is_store && !fast_store && dmem_mmu_busy) && !(c_is_store && !fast_store && dcache_stall) && !(fast_store && !dc_sdrain_ack);
     // Phase 8 S1: 2-wide commit. commit2_fire is a var assigned LATE (after all
     // the slot-0 redirect conditions: trap/mret/sret/satp/mispredict/sc-replay)
     // so it can also require that slot-0 does NOT redirect — otherwise the head+1
@@ -1916,6 +1933,7 @@ pub module heliodor_core #(
         o_commit_pred_index  : c_pred_index         ,
         o_commit_result_data : c_result_data        ,
         o_commit_is_store    : c_is_store           ,
+        o_commit_is_amo      : c_is_amo             ,
         o_commit_store_addr  : c_store_addr         ,
         o_commit_store_data  : c_store_data         ,
         o_commit_store_funct3: c_store_funct3       ,
@@ -2940,6 +2958,14 @@ pub module heliodor_core #(
     let st_wdata    : logic<64>  = st_wdata_ext[63:0];
     let st_wdata_hi : logic<64>  = st_wdata_ext[127:64];
 
+    // Phase 8 S6: route a committing BARE-mode aligned PLAIN store to the
+    // separate dcache store-drain port (i_saddr/i_swen). Excludes AMO/LR/SC
+    // (c_is_amo — RMW on the combined port, SMP-critical) and misaligned
+    // straddling stores (st_wstrb_hi != 0 — the hi-dword bypass path). Under
+    // Sv39 (dmem_vm_on) stores translate at commit through dmem_mmu and stay on
+    // i_wen. The drained fast store does NOT use load_walk_busy (bare ⇒ no walk).
+    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0;
+
     // Core dmem view (pre-MMU virtual address)
     //
     // M9.A.303: a STORE committing at the ROB head must NOT hijack the dmem
@@ -2958,7 +2984,11 @@ pub module heliodor_core #(
     // busy/req. v1 (in-order, single MEM stage) cannot hit this: a store and a
     // load never co-drive the MMU in the same cycle.
     let load_walk_busy : logic     = walk_v_q && !walk_is_store_q;
-    let store_drive    : logic     = commit_store_fire && !load_walk_busy;
+    // Phase 8 S6: a fast store drains via the i_saddr port, NOT the i_wen path,
+    // so exclude it from store_drive. This also drops load_blocks_on_store for
+    // the fast-store cycle (= issue_is_load && store_drive), letting the load
+    // read coexist with the store write on the separate ports.
+    let store_drive    : logic     = commit_store_fire && !load_walk_busy && !fast_store;
     // M9.3: a load walk PHYSICALLY owns the dmem port only while the MMU FSM is
     // NOT idle (LEVEL/DONE/FAULT). walk_v_q is a registered owner tag that, under
     // hart1's SMP bus-contention back-to-back walks, stays set CONTINUOUSLY across
@@ -3001,8 +3031,16 @@ pub module heliodor_core #(
     // cycle, so a concurrent ren would be a conflicting request that wedges
     // dcache_stall. The load is held in the IQ (iq_issue_ack gated by
     // load_blocks_on_store) and re-issues once the store commits.
-    assign load_blocks_on_store = issue_is_load && store_drive;
-    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive) || mmu_walk_inflight;
+    // Phase 8 S6: an AMO/LR read does NOT participate in store-to-load forwarding
+    // (stld_fwd_en excludes is_amo), so it must not read the dcache while an older
+    // FAST store is committing — the store-drain write only lands at the clock
+    // edge, so a same-cycle AMO read would see STALE data and compute the wrong
+    // RMW (the rv64ua subtest-5 failures). Plain loads DO forward, so they may
+    // coexist with the fast store. The AMO read is held in the IQ until the older
+    // fast store commits (its data is then in the dcache). issue_amo_read covers
+    // AMO + LR (not SC, which is a store).
+    assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && fast_store);
+    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store) || mmu_walk_inflight;
     let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
     // M9.4 SMP: mark the AMO/LR data read so the dcache forces a coherent,
     // bus-serialized re-fill instead of returning a possibly-stale cache HIT
@@ -3010,7 +3048,10 @@ pub module heliodor_core #(
     // N=4 stop_machine lost-update root cause). Excludes the PTE-walk read
     // (mmu_walk_inflight drives core_dmem_ren for the walk, not the AMO) and
     // redirect/flush cycles. SC is not an issue_amo_read so it is unaffected.
-    let dc_amo_read    : logic    = issue_amo_read && !mmu_walk_inflight && !redirect_fire;
+    // Phase 8 S6: also suppress while the AMO read is held behind a committing
+    // fast store (load_blocks_on_store) so it neither reads stale data nor fires
+    // amo_force_trigger (invalidate + re-fill) on a line the fast store is writing.
+    let dc_amo_read    : logic    = issue_amo_read && !mmu_walk_inflight && !redirect_fire && !load_blocks_on_store;
 
     // ============================================================
     // M9.A.294 (F2): load-fault attribution fix.
@@ -3287,6 +3328,14 @@ pub module heliodor_core #(
         i_addr2          : dc_addr2                       ,
         i_ren2           : dc_ren2                        ,
         i_load_next2     : dc_load_next2                  ,
+        // Phase 8 S6: 2nd write port (store-drain). A committing bare aligned
+        // plain store (fast_store) writes here while a load reads i_addr/i_ren.
+        // i_swen=fast_store gates the port; the addr/data/strb are ignored when 0.
+        i_saddr          : c_store_addr                   ,
+        i_swen           : fast_store                     ,
+        i_swdata         : st_wdata                       ,
+        i_swstrb         : st_wstrb                       ,
+        o_sdrain_ack     : dc_sdrain_ack                  ,
         o_rdata2         : dcache_rdata2                  ,
         o_rdata2_next    : dcache_rdata2_next            ,
         o_hit2           : dcache_hit2                    ,

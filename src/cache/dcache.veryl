@@ -50,6 +50,19 @@ pub module dcache (
     o_rdata2     : output logic<64>,
     o_rdata2_next: output logic<64>,
     o_hit2       : output logic    ,
+    // Phase 8 S6: 2nd WRITE port (store-drain). A PHYSICALLY SEPARATE address
+    // (i_saddr) so a store write-through coexists with a load read on
+    // i_addr/i_ren in the same cycle (the data arrays are comb-read +
+    // registered-write). The core routes ONLY bare-mode aligned plain stores
+    // here; AMO/Sv39/misaligned stay on the combined i_wen path. The store
+    // drain shares the single bus o_mem_*: a load-miss FILL/read wins, the
+    // store drain waits (o_sdrain_ack=0, store held at the ROB head). Tie
+    // i_swen=0 to disable the port entirely (no behavioral effect).
+    i_saddr     : input  logic<64>,
+    i_swen      : input  logic    ,
+    i_swdata    : input  logic<64>,
+    i_swstrb    : input  logic<8> ,
+    o_sdrain_ack: output logic    ,
     o_rdata: output logic<64>,
     // M8.B: combinational read of the NEXT dword (at (i_addr&~7)+8), for v4
     // misaligned loads that span two dwords (mirrors the old i_dmem_rdata_next).
@@ -238,6 +251,44 @@ pub module dcache (
 
     let filling: logic = state == State::FILL;
 
+    // ============================================================
+    // Phase 8 S6: store-drain (2nd write port) decode. Combinational tag-match
+    // on i_saddr, independent of the i_addr read port. The actual data-array
+    // write happens in the IDLE state of the always_ff below (mutually exclusive
+    // with the i_wen write at the core level — a store fires EITHER i_wen or
+    // i_swen, never both). Tie i_swen=0 ⇒ want_store/store_can_drain=0 ⇒ no effect.
+    // ============================================================
+    let stag       : logic<54> = i_saddr[63:10];
+    let sindex     : logic<4>  = i_saddr[9:6];
+    let soffset    : logic<3>  = i_saddr[5:3];
+    let sdata_idx  : logic<7>  = {sindex, soffset};
+    let shit_0     : logic     = valid_0[sindex] && tags_0[sindex] == stag;
+    let shit_1     : logic     = valid_1[sindex] && tags_1[sindex] == stag;
+    let shit_2     : logic     = valid_2[sindex] && tags_2[sindex] == stag;
+    let shit_3     : logic     = valid_3[sindex] && tags_3[sindex] == stag;
+    let scache_hit : logic     = shit_0 || shit_1 || shit_2 || shit_3;
+    // Victim way for a store MISS (write-through, no-allocate → invalidate the
+    // victim so a later load refills the merged bytes from DRAM).
+    let s_has_invalid: logic    = !valid_0[sindex] || !valid_1[sindex] || !valid_2[sindex] || !valid_3[sindex];
+    let s_invalid_way: logic<2> = if !valid_0[sindex] ?
+        2'd0
+    : if !valid_1[sindex] ?
+        2'd1
+    : if !valid_2[sindex] ?
+        2'd2
+    :
+        2'd3
+    ;
+    let s_plru_bits  : logic<3> = plru[sindex];
+    let s_plru_way   : logic<2> = {s_plru_bits[2], if !s_plru_bits[2] ? s_plru_bits[1] : s_plru_bits[0]};
+    let s_victim_way : logic<2> = if s_has_invalid ? s_invalid_way : s_plru_way;
+    // The drain wins the single bus only when granted and no load-miss FILL is
+    // using it (miss ⇒ IDLE+load-miss). want_store presents the request/address
+    // pre-grant; store_can_drain qualifies the actual write strobe + cache write.
+    let want_store     : logic = i_swen && state == State::IDLE && !miss;
+    let store_can_drain: logic = want_store && i_mem_grant;
+    assign o_sdrain_ack = store_can_drain;
+
     always_ff (clk, rst) {
         if_reset {
             state        = State::IDLE;
@@ -371,6 +422,62 @@ pub module dcache (
                             }
                         }
                     }
+                    // Phase 8 S6: store-drain WRITE (separate i_saddr port).
+                    // Mirrors the i_wen hit/miss logic on sindex/sdata_idx with
+                    // i_swdata/i_swstrb. Aligned plain stores only (no i_swstrb_hi
+                    // straddle path — the core keeps misaligned stores on i_wen).
+                    // Mutually exclusive with the i_wen block above at the core
+                    // level, so no same-element double write. No PLRU update
+                    // (replacement-policy only; correctness unaffected).
+                    if store_can_drain {
+                        if scache_hit {
+                            let sold   : logic<64> = if shit_0 ?
+                                data_0[sdata_idx]
+                            : if shit_1 ?
+                                data_1[sdata_idx]
+                            : if shit_2 ?
+                                data_2[sdata_idx]
+                            :
+                                data_3[sdata_idx]
+                            ;
+                            let smerged: logic<64> = {
+                                if i_swstrb[7] ? i_swdata[63:56] : sold[63:56],
+                                if i_swstrb[6] ? i_swdata[55:48] : sold[55:48],
+                                if i_swstrb[5] ? i_swdata[47:40] : sold[47:40],
+                                if i_swstrb[4] ? i_swdata[39:32] : sold[39:32],
+                                if i_swstrb[3] ? i_swdata[31:24] : sold[31:24],
+                                if i_swstrb[2] ? i_swdata[23:16] : sold[23:16], if i_swstrb[1] ? i_swdata[15:8] : sold[15:8],
+                                if i_swstrb[0] ? i_swdata[7:0] : sold[7:0]
+                            };
+                            if shit_0 {
+                                data_0[sdata_idx] = smerged;
+                            }
+                            if shit_1 {
+                                data_1[sdata_idx] = smerged;
+                            }
+                            if shit_2 {
+                                data_2[sdata_idx] = smerged;
+                            }
+                            if shit_3 {
+                                data_3[sdata_idx] = smerged;
+                            }
+                        } else {
+                            // Store miss: write-through to DRAM (o_mem below),
+                            // invalidate the victim way (no-allocate).
+                            if s_victim_way == 2'd0 {
+                                valid_0[sindex] = 1'b0;
+                            }
+                            if s_victim_way == 2'd1 {
+                                valid_1[sindex] = 1'b0;
+                            }
+                            if s_victim_way == 2'd2 {
+                                valid_2[sindex] = 1'b0;
+                            }
+                            if s_victim_way == 2'd3 {
+                                valid_3[sindex] = 1'b0;
+                            }
+                        }
+                    }
                 }
                 State::FILL: {
                     // Phase 5: only write fill data and advance the count when
@@ -497,33 +604,40 @@ pub module dcache (
     assign o_rdata_next      = if next_same_line ? next_rdata_same : next_rdata_xline;
     assign o_rdata_next_miss = i_ren && (if next_same_line ? !cache_hit : !next_line_hit);
 
-    // Memory interface
+    // Memory interface. Phase 8 S6: the store-drain (i_saddr/i_swdata) is the
+    // LOWEST-priority bus user: FILL > i_wen write > load-miss read > store
+    // drain. want_store requires !miss, so it never coexists with a load-miss
+    // read; i_wen and i_swen are mutually exclusive at the core, so the i_wen
+    // and store-drain write terms never both fire.
     assign o_mem_addr = if filling ?
         {fill_tag, fill_index, fill_count, 3'b000}
     : if i_wen ?
         i_addr
     : if i_ren && !cache_hit ?
         {tag, index, 3'd0, 3'b000}
+    : if want_store ?
+        i_saddr
     :
         '0
     ;
 
-    assign o_mem_wdata = if i_wen && !filling ? i_wdata : '0;
+    assign o_mem_wdata = if i_wen && !filling ? i_wdata : if store_can_drain ? i_swdata : '0;
 
     // Suppress write-through on cache miss when AMO (ren && wen) to prevent
     // corrupting DRAM before the fill reads the old value.
     let amo_miss: logic = i_ren && i_wen && !cache_hit;
     // Phase 5: only emit DRAM write strobe when bus is granted. Otherwise the
-    // write must wait until the arbiter gives us a slot.
-    assign o_mem_wen   = if filling ? 1'b0 : if amo_miss ? 1'b0 : (i_wen && i_mem_grant);
+    // write must wait until the arbiter gives us a slot. S6: the store drain
+    // adds its write strobe (store_can_drain already implies i_mem_grant + !miss).
+    assign o_mem_wen   = if filling ? 1'b0 : if amo_miss ? 1'b0 : (i_wen && i_mem_grant) || store_can_drain;
     assign o_mem_ren   = if filling ? 1'b1 : if i_ren && !cache_hit && i_mem_grant ? 1'b1 : 1'b0;
-    assign o_mem_wstrb = if i_wen && !filling && i_mem_grant ? i_wstrb : '0;
+    assign o_mem_wstrb = if i_wen && !filling && i_mem_grant ? i_wstrb : if store_can_drain ? i_swstrb : '0;
 
     // Bus request: any cycle we need DRAM access. memory_bus arbitrates
     // among harts and asserts i_mem_grant when this hart's turn comes.
     let want_fill_start: logic = miss; // IDLE+miss
     let want_write     : logic = i_wen && !amo_miss && state == State::IDLE;
-    assign o_mem_req = filling || want_fill_start || want_write;
+    assign o_mem_req = filling || want_fill_start || want_write || want_store;
 
     // Non-blocking miss interface
     assign o_miss_valid    = miss; // 1-cycle pulse on load miss (state == IDLE)
