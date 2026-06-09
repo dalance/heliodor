@@ -438,6 +438,20 @@ pub module heliodor_core #(
     let curr_hw       : logic<16> = if pc_q[1] ? icache_rdata[31:16] : icache_rdata[15:0];
     let curr_is_rvc   : logic     = curr_hw[1:0] != 2'b11;
     let needs_straddle: logic     = !straddle_q && pc_q[1] && !curr_is_rvc;
+    // Phase 8 S7: single-cycle straddle resolution. A 32-bit instr at a halfword
+    // boundary (pc_q[1], non-RVC) normally takes a 2-cycle re-fetch (straddle_q),
+    // costing a fetch bubble (fetch_ready=0 the prep cycle). When the NEXT 32-bit
+    // word is already present in the icache window this cycle (icache_rdata_next_valid)
+    // AND in the same 4KB page (so the PA+4 word IS the virtual successor under
+    // Sv39 — a cross-page straddle keeps the 2-cycle path, which re-translates
+    // pc_q+2), assemble the instr in ONE cycle from {next_lo, curr_hi} and deliver
+    // now (no bubble). This is the same {icache_rdata_next, icache_rdata} window the
+    // slot-1 path already reads. RVC-mixed code with misaligned 32-bit instrs (e.g.
+    // memcpy: 3 of 5 loop ops straddle → 37% i-fetch idle) is the big win.
+    let straddle_same_page : logic     = pc_q[11:2] != 10'h3ff;
+    let straddle_oneshot   : logic     = needs_straddle && icache_rdata_next_valid && straddle_same_page;
+    let needs_straddle_slow: logic     = needs_straddle && !straddle_oneshot;
+    let straddle1_instr    : logic<32> = {icache_rdata_next[15:0], icache_rdata[31:16]};
     assign c_inst_w = curr_hw;
 
     // Straddled 32-bit: low half saved last cycle + new fetch's low half.
@@ -446,13 +460,15 @@ pub module heliodor_core #(
     // Choose final 32-bit instr fed to decode.
     let fetched_instr: logic<32> = if straddle_q ?
         straddled_instr
+    : if straddle_oneshot ?
+        straddle1_instr
     : if curr_is_rvc && c_illegal_w ?
         32'h0000_0000
     : if curr_is_rvc ?
         c_expanded_w
     :
         icache_rdata
-    ; // pc[1]=0 + 32b
+    ; // pc[1]=0 + 32b (or 1-cycle straddle)
     let pc_advance   : logic<64> = if straddle_q ? 64'd4 : if curr_is_rvc ? 64'd2 : 64'd4;
 
     // Fetch ready to deliver an instr to IF/ID this cycle. Under Sv39 the
@@ -461,7 +477,7 @@ pub module heliodor_core #(
     // imem_valid_w == i_req == 1, so no slowdown.
     // M8.A: also hold delivery while the icache is filling a miss. On a fault
     // i_ren=0 (no lookup) so icache_stall=0 — the fault still delivers.
-    let fetch_ready: logic = !needs_straddle && (imem_valid_w || imem_fault_w) && !icache_stall;
+    let fetch_ready: logic = !needs_straddle_slow && (imem_valid_w || imem_fault_w) && !icache_stall;
 
     // ============================================================
     // Phase 8 M2: branch prediction (BTB + bimodal BHT) — frontend redirect.
@@ -542,7 +558,7 @@ pub module heliodor_core #(
     let pred_next_pc1   : logic<64> = if predicted_taken1 ? pred_target1 : s1_pc + s1_len;
     // slot-1 delivery eligibility. slot-0 must be a clean (non-straddle, non-
     // fault) delivery that was NOT predicted taken (else slot-1 is wrong-path).
-    let slot1_eligible: logic = fetch_ready && !straddle_q && !imem_fault_w && !predicted_taken;
+    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !imem_fault_w && !predicted_taken;
     // slot-1 needs the next word (rdata_next) unless it is an RVC sitting in the
     // slot-0 word (b1==1 && rvc). Using the next word requires it be in the SAME
     // cache line (→ same page as slot-0, so slot-1's fetch can't fault separately).
@@ -693,7 +709,7 @@ pub module heliodor_core #(
             straddle_q     = 1'b0;
             straddle_low_q = 16'd0;
         } else if !fb_full {
-            if needs_straddle && (imem_valid_w || imem_fault_w) && !icache_stall {
+            if needs_straddle_slow && (imem_valid_w || imem_fault_w) && !icache_stall {
                 // Straddle prep (cycle 1 of 2): latch the high half, advance the
                 // fetch addr (fetch_vaddr = pc_q+2) next cycle, hold pc_q. Does
                 // NOT push — the straddled 32-bit instr delivers on cycle 2.
