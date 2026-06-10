@@ -1,12 +1,15 @@
 // 4-way set-associative data cache
-// 4KB: 16 sets × 4 ways × 64B lines (8 doublewords per line)
+// Size = 2^INDEX_W sets × 4 ways × 64B lines (8 doublewords per line):
+// INDEX_W=4 → 4KB, 6 → 16KB (default), 7 → 32KB.
 // Write-through, no-write-allocate
 // Non-blocking for loads: MSHR absorbs load miss, pipeline continues.
 // Replacement: pseudo-LRU (3-bit tree per set)
 //
 // Address breakdown (64-bit byte address):
-//   [63:10] tag  |  [9:6] index (4 bits, 16 sets)  |  [5:3] offset (3 bits, 8 words)  |  [2:0] byte
-pub module dcache (
+//   [63:INDEX_W+6] tag  |  [INDEX_W+5:6] index  |  [5:3] offset (8 dwords)  |  [2:0] byte
+pub module dcache #(
+    param INDEX_W: u32 = 6, // log2(#sets)
+) (
     clk: input clock,
     rst: input reset,
     // CPU side
@@ -110,30 +113,34 @@ pub module dcache (
     i_mem_grant: input  logic,
 ) {
     // Address decomposition
-    let tag     : logic<54> = i_addr[63:10];
-    let index   : logic<4>  = i_addr[9:6];
+    // Derived geometry
+    const SETS : u32 = 1 << INDEX_W;
+    const TAG_W: u32 = 58 - INDEX_W;
+
+    let tag     : logic<TAG_W> = i_addr[63:INDEX_W + 6];
+    let index   : logic<INDEX_W> = i_addr[INDEX_W + 5:6];
     let offset  : logic<3>  = i_addr[5:3];
-    let data_idx: logic<7>  = {index, offset};
+    let data_idx: logic<INDEX_W + 3>  = {index, offset};
 
     // Cache storage: 4 ways
-    var valid_0: logic     [16] ;
-    var valid_1: logic     [16] ;
-    var valid_2: logic     [16] ;
-    var valid_3: logic     [16] ;
-    var tags_0 : logic<54> [16] ;
-    var tags_1 : logic<54> [16] ;
-    var tags_2 : logic<54> [16] ;
-    var tags_3 : logic<54> [16] ;
-    var data_0 : logic<64> [128]; // 16 sets × 8 dwords
-    var data_1 : logic<64> [128];
-    var data_2 : logic<64> [128];
-    var data_3 : logic<64> [128];
+    var valid_0: logic         [SETS];
+    var valid_1: logic         [SETS];
+    var valid_2: logic         [SETS];
+    var valid_3: logic         [SETS];
+    var tags_0 : logic<TAG_W>  [SETS];
+    var tags_1 : logic<TAG_W>  [SETS];
+    var tags_2 : logic<TAG_W>  [SETS];
+    var tags_3 : logic<TAG_W>  [SETS];
+    var data_0 : logic<64>     [SETS * 8]; // SETS × 8 dwords
+    var data_1 : logic<64>     [SETS * 8];
+    var data_2 : logic<64>     [SETS * 8];
+    var data_3 : logic<64>     [SETS * 8];
 
     // Pseudo-LRU tree: 3 bits per set
     // bit[2]: root → 0=left(way 0,1), 1=right(way 2,3)
     // bit[1]: left child → 0=way 0, 1=way 1
     // bit[0]: right child → 0=way 2, 1=way 3
-    var plru: logic<3> [16];
+    var plru: logic<3> [SETS];
 
     // Cache lookup: per-way hit
     let hit_0    : logic = valid_0[index] && tags_0[index] == tag;
@@ -158,8 +165,8 @@ pub module dcache (
     // self.i_inv_valid, which the simulator flags as a cycle even when
     // the grants are mutually exclusive. o_stall only feeds pipeline
     // sequential stages, breaking the cycle.
-    let inv_hits_active: logic = i_inv_valid && (i_wen || i_ren) && cache_hit && (index as 4 == i_inv_addr[9:6])
-        && (tag == i_inv_addr[63:10]);
+    let inv_hits_active: logic = i_inv_valid && (i_wen || i_ren) && cache_hit && (index == i_inv_addr[INDEX_W + 5:6])
+        && (tag == i_inv_addr[63:INDEX_W + 6]);
 
     // Hit way select
     let hit_way: logic<2> = if hit_0 ? 2'd0 : if hit_1 ? 2'd1 : if hit_2 ? 2'd2 : 2'd3;
@@ -179,12 +186,12 @@ pub module dcache (
 
     var state        : State    ;
     var fill_count   : logic<3> ; // 0..7, which word to fill
-    var fill_index   : logic<4> ; // index being filled
-    var fill_tag     : logic<54>; // tag being filled
+    var fill_index   : logic<INDEX_W>; // index being filled
+    var fill_tag     : logic<TAG_W>; // tag being filled
     var fill_way     : logic<2> ; // which way to fill
     var fill_offset  : logic<3> ; // original miss dword offset (for MSHR re-read)
     var fill_aborted : logic    ; // remote invalidate hit the line being filled
-    let fill_data_idx: logic<7>  = {fill_index, fill_count};
+    let fill_data_idx: logic<INDEX_W + 3>  = {fill_index, fill_count};
 
     // M9.4 SMP AMO coherence: an AMO/LR read that HITS the cache must not return
     // a possibly-stale line (a non-amo_holder hart is locked out of the bus but
@@ -199,8 +206,8 @@ pub module dcache (
     let amo_force_trigger: logic = i_amo_read && i_ren && cache_hit && state == State::IDLE && !amo_filled_q;
 
     // Invalidate decode (combinational from request port)
-    let inv_tag  : logic<54> = i_inv_addr[63:10];
-    let inv_index: logic<4>  = i_inv_addr[9:6];
+    let inv_tag  : logic<TAG_W> = i_inv_addr[63:INDEX_W + 6];
+    let inv_index: logic<INDEX_W> = i_inv_addr[INDEX_W + 5:6];
 
     // CPU request present
     let cpu_req: logic = i_wen || i_ren;
@@ -209,11 +216,11 @@ pub module dcache (
     // The next dword is at (i_addr & ~7) + 8: same line when offset != 7,
     // otherwise the following line (different index/tag).
     let next_addr     : logic<64> = {i_addr[63:3], 3'b000} + 64'd8;
-    let next_index    : logic<4>  = next_addr[9:6];
+    let next_index    : logic<INDEX_W> = next_addr[INDEX_W + 5:6];
     let next_offset   : logic<3>  = next_addr[5:3];
-    let next_tag      : logic<54> = next_addr[63:10];
+    let next_tag      : logic<TAG_W> = next_addr[63:INDEX_W + 6];
     let next_same_line: logic     = offset != 3'd7;
-    let next_data_idx : logic<7>  = {next_index, next_offset};
+    let next_data_idx : logic<INDEX_W + 3>  = {next_index, next_offset};
     let next_hit_0    : logic     = valid_0[next_index] && tags_0[next_index] == next_tag;
     let next_hit_1    : logic     = valid_1[next_index] && tags_1[next_index] == next_tag;
     let next_hit_2    : logic     = valid_2[next_index] && tags_2[next_index] == next_tag;
@@ -233,8 +240,8 @@ pub module dcache (
     // already cached, so lo_miss is 0). i_ren-only, so stores/AMO use the lo
     // line (fill_is_hi stays 0).
     let fill_is_hi: logic     = hi_miss && !lo_miss;
-    let f_index   : logic<4>  = if fill_is_hi ? next_index : index;
-    let f_tag     : logic<54> = if fill_is_hi ? next_tag : tag;
+    let f_index   : logic<INDEX_W> = if fill_is_hi ? next_index : index;
+    let f_tag     : logic<TAG_W> = if fill_is_hi ? next_tag : tag;
     let f_offset  : logic<3>  = if fill_is_hi ? next_offset : offset;
 
     // PLRU victim selection for the fill-target index.
@@ -261,10 +268,10 @@ pub module dcache (
     // with the i_wen write at the core level — a store fires EITHER i_wen or
     // i_swen, never both). Tie i_swen=0 ⇒ want_store/store_can_drain=0 ⇒ no effect.
     // ============================================================
-    let stag       : logic<54> = i_saddr[63:10];
-    let sindex     : logic<4>  = i_saddr[9:6];
+    let stag       : logic<TAG_W> = i_saddr[63:INDEX_W + 6];
+    let sindex     : logic<INDEX_W> = i_saddr[INDEX_W + 5:6];
     let soffset    : logic<3>  = i_saddr[5:3];
-    let sdata_idx  : logic<7>  = {sindex, soffset};
+    let sdata_idx  : logic<INDEX_W + 3>  = {sindex, soffset};
     let shit_0     : logic     = valid_0[sindex] && tags_0[sindex] == stag;
     let shit_1     : logic     = valid_1[sindex] && tags_1[sindex] == stag;
     let shit_2     : logic     = valid_2[sindex] && tags_2[sindex] == stag;
@@ -302,7 +309,7 @@ pub module dcache (
             fill_offset  = 3'd0;
             fill_aborted = 1'b0;
             amo_filled_q = 1'b0;
-            for i in 0..16 {
+            for i in 0..SETS {
                 valid_0[i] = 1'b0;
                 valid_1[i] = 1'b0;
                 valid_2[i] = 1'b0;
@@ -672,7 +679,7 @@ pub module dcache (
     assign o_data_valid = cache_hit || (state == State::DONE);
 
     // Re-read filled data at original miss offset (valid during DONE)
-    let fill_rdata_idx: logic<7> = {fill_index, fill_offset};
+    let fill_rdata_idx: logic<INDEX_W + 3> = {fill_index, fill_offset};
     assign o_fill_rdata = if fill_way == 2'd0 ?
         data_0[fill_rdata_idx]
     : if fill_way == 2'd1 ?
@@ -687,10 +694,10 @@ pub module dcache (
     // Phase 8 S5.2: 2nd hit-only READ port. Pure combinational mirror of the
     // lo/hi hit logic above on i_addr2. No state writes, no o_stall effect.
     // ============================================================
-    let tag2      : logic<54> = i_addr2[63:10];
-    let index2    : logic<4>  = i_addr2[9:6];
+    let tag2      : logic<TAG_W> = i_addr2[63:INDEX_W + 6];
+    let index2    : logic<INDEX_W> = i_addr2[INDEX_W + 5:6];
     let offset2   : logic<3>  = i_addr2[5:3];
-    let data_idx2 : logic<7>  = {index2, offset2};
+    let data_idx2 : logic<INDEX_W + 3>  = {index2, offset2};
     // Phase 8 S10.2 (hit-under-miss): mid-FILL the victim way (fill_way at
     // fill_index) still carries its OLD tag + valid while its DATA words are
     // being overwritten — a port-2 hit on that way would return corrupted
@@ -712,11 +719,11 @@ pub module dcache (
     assign o_rdata2 = if hit2_0 ? rdata2_0 : if hit2_1 ? rdata2_1 : if hit2_2 ? rdata2_2 : rdata2_3;
     // Next-dword for a misaligned 2-dword 2nd load (mirror of o_rdata_next).
     let next_addr2     : logic<64> = {i_addr2[63:3], 3'b000} + 64'd8;
-    let next_index2    : logic<4>  = next_addr2[9:6];
+    let next_index2    : logic<INDEX_W> = next_addr2[INDEX_W + 5:6];
     let next_offset2   : logic<3>  = next_addr2[5:3];
-    let next_tag2      : logic<54> = next_addr2[63:10];
+    let next_tag2      : logic<TAG_W> = next_addr2[63:INDEX_W + 6];
     let next_same_line2: logic     = offset2 != 3'd7;
-    let next_data_idx2 : logic<7>  = {next_index2, next_offset2};
+    let next_data_idx2 : logic<INDEX_W + 3>  = {next_index2, next_offset2};
     // S10.2: same victim-way exclusion for the next-line hit (cross-dword span).
     let fill_busy2_next: logic     = filling && fill_index == next_index2;
     let next_hit2_0    : logic     = valid_0[next_index2] && tags_0[next_index2] == next_tag2 && !(fill_busy2_next && fill_way == 2'd0);
