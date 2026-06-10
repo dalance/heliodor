@@ -521,6 +521,7 @@ pub module heliodor_core #(
     var btb_is_cond: logic    ;
     var btb_is_call: logic    ;
     var btb_is_ret : logic    ;
+    var btb_is_ind : logic    ; // S18: non-return JALR kind
     var bht_taken  : logic    ;
     // M4 gshare: speculative + committed global history. The lookup index folds
     // the speculative history into the low PC index bits. The committed history
@@ -531,14 +532,35 @@ pub module heliodor_core #(
     // M3 RAS speculative top (combinational).
     var ras_spec_top  : logic<64>;
     var ras_spec_valid: logic    ;
+    // S18 iBTB lookup: history-hashed indirect targets. The index folds the
+    // gshare index slice with the indirect PATH history (recent indirect
+    // TARGETS) — a state-machine dispatch (`jr` through a jump table) keys
+    // its next target on the current state, which IS the previous indirect
+    // target; cond-branch GHR alone barely discriminates those (S18 probe:
+    // −12% only). spec_ind_hist folds each predicted indirect target at
+    // fetch and restores from committed_ind_hist on any flush (same
+    // approximation as spec_ghr); the committed twin folds actual targets at
+    // commit, so a committing op's PRE-update committed_ind_hist equals its
+    // fetch-time spec_ind_hist (older indirects all committed; a mispredicted
+    // one squashes this op) — training needs no extra ROB-carried state.
+    var spec_ind_hist     : logic<9>;
+    var committed_ind_hist: logic<9>;
+    var ibtb_hit    : logic    ;
+    var ibtb_target : logic<64>;
+    var ibtb_hit2   : logic    ;
+    var ibtb_target2: logic<64>;
     // A conditional branch is predicted taken per the BHT; JAL/JALR/call/ret
     // (is_cond=0) are predicted taken on any BTB hit.
     let predicted_taken: logic = btb_hit && (!btb_is_cond || bht_taken);
     // M3: a return's target comes from the RAS (the BTB stores the previous
     // caller's return addr, usually wrong); fall back to the BTB target when the
     // RAS is empty. A wrong target is caught at commit (c_bp_mispredict).
+    // S18: a non-return JALR (jump table / ops-table call) takes its target
+    // from the iBTB when the (PC, history) entry hits; the BTB's last-target
+    // is the fallback. Returns keep the RAS.
     let pred_use_ras   : logic     = btb_hit && btb_is_ret && ras_spec_valid;
-    let pred_target    : logic<64> = if pred_use_ras ? ras_spec_top : btb_target;
+    let pred_use_ibtb  : logic     = btb_hit && btb_is_ind && !pred_use_ras && ibtb_hit;
+    let pred_target    : logic<64> = if pred_use_ras ? ras_spec_top : if pred_use_ibtb ? ibtb_target : btb_target;
     let pred_next_pc_bp: logic<64> = if predicted_taken ? pred_target : pc_q + pc_advance;
 
     // ============================================================
@@ -578,11 +600,13 @@ pub module heliodor_core #(
     var btb_is_cond2: logic    ;
     var btb_is_call2: logic    ;
     var btb_is_ret2 : logic    ;
+    var btb_is_ind2 : logic    ; // S18
     var bht_taken2  : logic    ;
     let bht_lk_index1   : logic<13> = s1_pc[13:1] ^ spec_ghr;
     let predicted_taken1: logic     = btb_hit2 && (!btb_is_cond2 || bht_taken2);
     let pred_use_ras1   : logic     = btb_hit2 && btb_is_ret2 && ras_spec_valid;
-    let pred_target1    : logic<64> = if pred_use_ras1 ? ras_spec_top : btb_target2;
+    let pred_use_ibtb1  : logic     = btb_hit2 && btb_is_ind2 && !pred_use_ras1 && ibtb_hit2;
+    let pred_target1    : logic<64> = if pred_use_ras1 ? ras_spec_top : if pred_use_ibtb1 ? ibtb_target2 : btb_target2;
     let pred_next_pc1   : logic<64> = if predicted_taken1 ? pred_target1 : s1_pc + s1_len;
     // slot-1 delivery eligibility. slot-0 must be a clean (non-straddle, non-
     // fault) delivery that was NOT predicted taken (else slot-1 is wrong-path).
@@ -659,6 +683,9 @@ pub module heliodor_core #(
     var btb_train_is_cond: logic    ;
     var btb_train_is_call: logic    ;
     var btb_train_is_ret : logic    ;
+    var btb_train_is_ind : logic    ; // S18: non-return JALR kind
+    var ibtb_train_en    : logic    ; // S18
+    var ibtb_train_index : logic<9> ; // S18: fetch-time gshare index slice
     var bht_train_taken  : logic    ;
     var bht_train_index  : logic<13>; // M4 gshare: carried fetch-time index
     // M3 RAS architectural push/pop (commit; forward-referenced).
@@ -675,6 +702,7 @@ pub module heliodor_core #(
         o_is_cond      : btb_is_cond      ,
         o_is_call      : btb_is_call      ,
         o_is_ret       : btb_is_ret       ,
+        o_is_ind       : btb_is_ind       , // S18
         // Phase 8 S4a.3: 2nd read port on the slot-1 PC.
         i_pc2          : s1_pc            ,
         o_hit2         : btb_hit2         ,
@@ -682,12 +710,35 @@ pub module heliodor_core #(
         o_is_cond2     : btb_is_cond2     ,
         o_is_call2     : btb_is_call2     ,
         o_is_ret2      : btb_is_ret2      ,
+        o_is_ind2      : btb_is_ind2      , // S18
         i_train_en     : btb_train_en     ,
         i_train_pc     : bp_train_pc      ,
         i_train_target : btb_train_target ,
         i_train_is_cond: btb_train_is_cond,
         i_train_is_call: btb_train_is_call,
         i_train_is_ret : btb_train_is_ret ,
+        i_train_is_ind : btb_train_is_ind , // S18
+    );
+    // S18: indirect-target buffer. The lookup index is the gshare index
+    // slice XOR the indirect path history (see the spec_ind_hist comment).
+    // Trained at commit on non-return JALRs.
+    let ibtb_lk_idx0: logic<9> = bht_lk_index[8:0] ^ spec_ind_hist;
+    let ibtb_lk_idx1: logic<9> = bht_lk_index1[8:0] ^ spec_ind_hist;
+    inst u_ibtb: ibtb (
+        clk                             ,
+        rst                             ,
+        i_index       : ibtb_lk_idx0    ,
+        i_pc          : pc_q            ,
+        o_hit         : ibtb_hit        ,
+        o_target      : ibtb_target     ,
+        i_index2      : ibtb_lk_idx1    ,
+        i_pc2         : s1_pc           ,
+        o_hit2        : ibtb_hit2       ,
+        o_target2     : ibtb_target2    ,
+        i_train_en    : ibtb_train_en   ,
+        i_train_index : ibtb_train_index,
+        i_train_pc    : bp_train_pc     ,
+        i_train_target: btb_train_target,
     );
     inst u_bht: bht (
         clk                            ,
@@ -2603,6 +2654,23 @@ pub module heliodor_core #(
     assign btb_train_is_ret  = c_is_ret;
     assign bht_train_taken   = c_is_control && (c_redirect_pc != c_fall_pc);
     assign bht_train_index   = c_pred_index;
+    // S18: iBTB training — every committed non-return JALR writes its resolved
+    // target at its fetch-time index (last-target per (PC, path)). The
+    // PRE-update committed_ind_hist read here equals the op's fetch-time
+    // spec_ind_hist (see the spec_ind_hist comment), so no carried state is
+    // needed. The BTB entry's is_ind kind bit marks the PC so fetch consults
+    // the iBTB.
+    assign btb_train_is_ind  = rob_commit_entry.is_jalr && !c_is_ret;
+    assign ibtb_train_en     = btb_train_en && btb_train_is_ind;
+    assign ibtb_train_index  = c_pred_index[8:0] ^ committed_ind_hist;
+    // S18 indirect path history (committed twin; fold = shift-2 XOR target).
+    always_ff (clk, rst) {
+        if_reset {
+            committed_ind_hist = 9'd0;
+        } else if rob_commit_ack && rob_commit_entry.is_jalr && !c_is_ret {
+            committed_ind_hist = {committed_ind_hist[6:0], 2'b00} ^ c_redirect_pc[9:1];
+        }
+    }
     // M3 RAS architectural update: a committed call pushes its return address
     // (the fall-through PC); a committed return pops. On a redirect the
     // speculative RAS is restored from this architectural stack.
@@ -2644,6 +2712,23 @@ pub module heliodor_core #(
             spec_ghr = {spec_ghr[11:0], bht_taken};
         } else if ghr_upd1 {
             spec_ghr = {spec_ghr[11:0], bht_taken2};
+        }
+    }
+    // S18 indirect path history (speculative twin): fold each delivered
+    // predicted indirect's target; restore on any flush (same approximation
+    // as spec_ghr above). A slot-0 indirect is predicted taken, which kills
+    // slot-1 delivery, so at most one indirect folds per cycle.
+    let ind_upd0: logic = fb_push0 && btb_hit && btb_is_ind;
+    let ind_upd1: logic = fb_push1 && btb_hit2 && btb_is_ind2;
+    always_ff (clk, rst) {
+        if_reset {
+            spec_ind_hist = 9'd0;
+        } else if any_redirect {
+            spec_ind_hist = committed_ind_hist;
+        } else if ind_upd0 {
+            spec_ind_hist = {spec_ind_hist[6:0], 2'b00} ^ pred_target[9:1];
+        } else if ind_upd1 {
+            spec_ind_hist = {spec_ind_hist[6:0], 2'b00} ^ pred_target1[9:1];
         }
     }
     always_ff (clk, rst) {
