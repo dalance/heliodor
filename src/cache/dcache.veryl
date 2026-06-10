@@ -88,6 +88,12 @@ pub module dcache #(
     o_fill_complete: output logic    , // DONE state, fill not aborted (fill data readable)
     o_fill_rdata   : output logic<64>, // filled doubleword at original miss offset
     o_fill_aborted : output logic    , // DONE state, fill ABORTED by i_inv (data may be stale)
+    // S14.2: the missing dword (fill_offset) is already in the data array —
+    // with critical-word-first it is transfer #0, so this rises ~7 cycles
+    // before o_fill_complete. Held until DONE; drops if the fill aborts
+    // (the consumer must then fall back to the abort path). o_fill_rdata is
+    // valid whenever this is high.
+    o_fill_data_ready: output logic,
     o_hit_safe     : output logic    , // S10.4: fill-safe pipe-0 hit on i_addr (see assign)
     // Memory side
     o_mem_addr : output logic<64>,
@@ -185,13 +191,21 @@ pub module dcache #(
     }
 
     var state        : State    ;
-    var fill_count   : logic<3> ; // 0..7, which word to fill
+    var fill_count   : logic<3> ; // 0..7, which TRANSFER of the burst (not the dword)
     var fill_index   : logic<INDEX_W>; // index being filled
     var fill_tag     : logic<TAG_W>; // tag being filled
     var fill_way     : logic<2> ; // which way to fill
     var fill_offset  : logic<3> ; // original miss dword offset (for MSHR re-read)
     var fill_aborted : logic    ; // remote invalidate hit the line being filled
-    let fill_data_idx: logic<INDEX_W + 3>  = {fill_index, fill_count};
+    // Phase 8 S14.2: critical-word-first. The fill bursts the 8 dwords
+    // starting at the MISSING dword (fill_offset) and wraps, so the demand
+    // word is transfer #0 — the owner's early writeback (o_fill_data_ready)
+    // and any streaming consumer get it ~7 cycles sooner. The L2 is per-word
+    // (lazy word-valid fills, no order assumption) and the bus passes
+    // addresses through, so the wrapped order is safe end-to-end.
+    let s14_cwf_en   : logic    = 1'b0;
+    let fill_woff    : logic<3> = if s14_cwf_en ? fill_offset + fill_count : fill_count;
+    let fill_data_idx: logic<INDEX_W + 3>  = {fill_index, fill_woff};
 
     // M9.4 SMP AMO coherence: an AMO/LR read that HITS the cache must not return
     // a possibly-stale line (a non-amo_holder hart is locked out of the bus but
@@ -260,6 +274,36 @@ pub module dcache #(
     let victim_way : logic<2> = if has_invalid ? invalid_way : plru_way;
 
     let filling: logic = state == State::FILL;
+
+    // Phase 8 S14.1: streaming (early restart) on the pipe-0 read port. Fill
+    // dword k commits to the data array at the granted FILL cycle where
+    // fill_count==k, so dwords 0..fill_count-1 of the line BEING FILLED are
+    // already readable from the fill way (its tag/valid are rewritten only at
+    // completion; identification is by the latched fill line). A load that
+    // demands one of them completes through the hit-under-miss path
+    // (o_hit_safe) instead of waiting out the 8-dword fill. Excluded: an
+    // aborted fill (a remote invalidate hit the line — its dwords may be
+    // stale) and the same-cycle invalidate race on the fill line (mirrors
+    // inv_hits_active for ordinary hits). AMO reads and cross-dword spans are
+    // excluded by the o_hit_safe gates below, exactly like ordinary safe hits.
+    let s14_st_en    : logic     = 1'b0;
+    // Streaming written-dword test: transfer k writes dword
+    // fill_offset+k (cwf) or k (linear), so dword w is present iff
+    // (w - first_dword) mod 8 < fill_count.
+    let stream_rel   : logic<3>  = offset - (if s14_cwf_en ? fill_offset : 3'd0);
+    let stream_line  : logic<58> = {fill_tag, fill_index};
+    let stream_hit0  : logic     = s14_st_en && filling && stream_line == {tag, index}
+        && stream_rel <: fill_count && !fill_aborted
+        && !(i_inv_valid && {inv_tag, inv_index} == stream_line);
+    let stream_rdata0: logic<64> = if fill_way == 2'd0 ?
+        rdata_0
+    : if fill_way == 2'd1 ?
+        rdata_1
+    : if fill_way == 2'd2 ?
+        rdata_2
+    :
+        rdata_3
+    ;
 
     // ============================================================
     // Phase 8 S6: store-drain (2nd write port) decode. Combinational tag-match
@@ -585,8 +629,11 @@ pub module dcache #(
         }
     }
 
-    // Read data: from hit way on cache hit, from memory during fill
-    assign o_rdata = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : i_mem_rdata;
+    // Read data: from hit way on cache hit, from the fill way for a streaming
+    // hit (S14.1; the raw hits are all 0 then — the new line's tag is not
+    // written yet and the victim's old tag cannot equal it), from memory
+    // during fill (legacy fallback, gated by o_data_valid at the consumers).
+    assign o_rdata = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
 
     // M8.B: next-dword read for misaligned 2-dword loads (decode moved up to the
     // miss-handling section). Same line ⇒ reuse the lo-access hit way; cross line
@@ -620,7 +667,7 @@ pub module dcache #(
     // read; i_wen and i_swen are mutually exclusive at the core, so the i_wen
     // and store-drain write terms never both fire.
     assign o_mem_addr = if filling ?
-        {fill_tag, fill_index, fill_count, 3'b000}
+        {fill_tag, fill_index, fill_woff, 3'b000}
     : if i_wen ?
         i_addr
     : if i_ren && !cache_hit ?
@@ -660,6 +707,13 @@ pub module dcache #(
     assign o_miss_valid    = miss && i_mem_grant;
     assign o_fill_complete = state == State::DONE && !fill_aborted;
     assign o_fill_aborted  = state == State::DONE && fill_aborted;
+    // S14.2: owner early restart. With critical-word-first the demanded dword
+    // is written at the fill_count==0 transfer, so it is readable from
+    // fill_count==1 onward. Guarded like stream_hit0 against an aborted fill
+    // and the same-cycle invalidate race on the fill line; without cwf the
+    // demand dword's transfer slot is offset-dependent, so this stays 0.
+    assign o_fill_data_ready = s14_cwf_en && filling && fill_count != 3'd0 && !fill_aborted
+        && !(i_inv_valid && {inv_tag, inv_index} == stream_line);
     // Phase 8 S10.4a: fill-safe PIPE-0 hit on i_addr — the same per-way
     // victim exclusion the port-2 read got in S10.2 (mid-FILL the filling way
     // carries a stale tag over partially-overwritten data; every other way is
@@ -669,7 +723,7 @@ pub module dcache #(
     // spans (o_rdata_next not fill-checked) are excluded — they keep the
     // blocking path.
     let fill_busy0: logic = filling && fill_index == index;
-    assign o_hit_safe = i_ren && !i_amo_read && !i_load_next && ((hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3)));
+    assign o_hit_safe = i_ren && !i_amo_read && !i_load_next && ((hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3)) || stream_hit0);
     // Phase 5 SMP fix: data is valid for this hart's request only when
     // the cache actually has the data (hit) or the fill just completed
     // (DONE state — filled doubleword is in data_X arrays). During
