@@ -341,6 +341,7 @@ pub module rob #(
     var sh_is_sret  : logic     [ROB_DEPTH];
     var sh_is_sfence: logic     [ROB_DEPTH];
     var sh_is_fence_i: logic    [ROB_DEPTH]; // M8.A FENCE.I
+    var sh_is_fence  : logic    [ROB_DEPTH]; // S15: plain FENCE (load-ordering barrier)
     var sh_is_ifault: logic     [ROB_DEPTH];
     // M5.D dmem MMU faults
     var sh_is_lfault  : logic     [ROB_DEPTH];
@@ -542,6 +543,16 @@ pub module rob #(
     // conservative: VA-overlap disambiguation is unsound under aliasing VAs, and
     // atomics must never be reordered past.
     let s9_speculate_en: logic = 1'b1;
+    // Phase 8 S15: VM (Sv39) load speculation. The S9 conservative VM block held
+    // EVERY load behind EVERY older store because the violation scan compared a
+    // load PA against a store VA (unsound under aliasing). S15 makes the VM scan
+    // compare 4KB page offsets instead — VA[11:0] == PA[11:0] is translation-
+    // invariant, so an offset overlap is a superset of a true overlap (alias-
+    // blind, only spurious replays possible) and the block can be lifted. VM
+    // store-to-load forwarding stays OFF (a VA/PA offset match does not imply
+    // the same page, so a byte-merge would be unsound); a load that should have
+    // forwarded reads stale data and is caught by the record-time scan below.
+    let s15_vm_spec_en: logic = 1'b1;
     var block_store_exists_w: logic             ;
     var block_store_age_w   : logic<ROB_IDX_W>;
     always_comb {
@@ -549,10 +560,16 @@ pub module rob #(
         block_store_age_w    = '0;
         for i in 0..ROB_DEPTH {
             let age_i   : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
-            // i_conservative (MMU active): EVERY valid store blocks (baseline).
+            // i_conservative (MMU active): EVERY valid store blocks (baseline)
+            // until the S15 flip lifts it (offset-compare scans take over).
             // S9.4: a bare-mode unknown-addr plain store only blocks when
             // speculation is OFF (!s9_speculate_en).
-            let is_block: logic              = sh_valid[i] && sh_is_store[i] && (i_conservative || sh_is_amo[i] || (!sh_rw[i] && !s9_speculate_en));
+            // S15: a plain FENCE is an unconditional ordering blocker — a
+            // younger load must not issue (read memory) before the fence
+            // retires. Required once loads speculate past stores: the Dekker /
+            // store-buffering pattern (st A; fence rw,rw; ld B) breaks on SMP
+            // if the load hoists above the fence+store (lost-wakeup hangs).
+            let is_block: logic              = sh_valid[i] && ((sh_is_store[i] && ((i_conservative && !s15_vm_spec_en) || sh_is_amo[i] || (!sh_rw[i] && !s9_speculate_en))) || sh_is_fence[i]);
             if is_block && (!block_store_exists_w || age_i <: block_store_age_w) {
                 block_store_exists_w = 1'b1;
                 block_store_age_w    = age_i;
@@ -614,20 +631,89 @@ pub module rob #(
         for i in 0..ROB_DEPTH {
             let st_age : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
             let ld_age : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
-            // Load record for entry i: registered, or executing this cycle on lane 1.
+            // Load record for entry i: registered, executing this cycle on lane 1,
+            // or MSHR-captured this cycle (i_lq_rec — its sh_load_done lands next
+            // edge, so a store resolving in the SAME cycle would miss it; the load
+            // has already read past the store, so it must be folded in here).
             let ld_now : logic            = i_cdb2_is_load && ((i as ROB_IDX_W) == i_cdb2_rob_idx);
-            let ld_seen: logic            = sh_valid[i] && (sh_load_done[i] || ld_now);
-            let la     : logic<64>        = if ld_now ? i_cdb2_store_addr : sh_load_addr[i];
-            let lf3    : logic<3>         = if ld_now ? i_cdb2_store_funct3 : sh_load_funct3[i];
+            let ld_rec : logic            = i_lq_rec_valid && ((i as ROB_IDX_W) == i_lq_rec_idx);
+            let ld_seen: logic            = sh_valid[i] && (sh_load_done[i] || ld_now || ld_rec);
+            let la     : logic<64>        = if ld_now ? i_cdb2_store_addr : (if ld_rec ? i_lq_rec_addr : sh_load_addr[i]);
+            let lf3    : logic<3>         = if ld_now ? i_cdb2_store_funct3 : (if ld_rec ? i_lq_rec_funct3 : sh_load_funct3[i]);
             let lsz    : logic<64>        = (5'd1 << lf3[1:0]) as 64;
             let sa     : logic<64>        = i_cdb_store_addr;
             let ssz    : logic<64>        = (5'd1 << i_cdb_store_funct3[1:0]) as 64;
             let overlap: logic            = (la <: sa + ssz) && (sa <: la + lsz);
+            // S15 VM overlap: the load record holds a PA, the resolving store a
+            // VA — only the 4KB page offset [11:0] is comparable (translation-
+            // invariant). 13-bit range compare; an access spilling past the page
+            // boundary ([11:0]+size > 0x1000) translates its tail bytes through a
+            // DIFFERENT page, so it is conservatively treated as overlapping.
+            let la13   : logic<13>        = {1'b0, la[11:0]};
+            let sa13   : logic<13>        = {1'b0, sa[11:0]};
+            let le13   : logic<13>        = la13 + lsz[12:0];
+            let se13   : logic<13>        = sa13 + ssz[12:0];
+            let pgx    : logic            = (le13 >: 13'h1000) || (se13 >: 13'h1000);
+            let ovl_vm : logic            = pgx || ((la13 <: se13) && (sa13 <: le13));
+            let ovl    : logic            = if i_conservative ? ovl_vm : overlap;
             load_viol_w[i] = i_cdb_valid && i_cdb_is_store
                 && ld_seen && !sh_load_poison[i]
-                && (ld_age >: st_age) && overlap;
+                && (ld_age >: st_age) && ovl;
             if load_viol_w[i] {
                 any_load_viol_w = 1'b1;
+            }
+        }
+    }
+
+    // Phase 8 S15: record-time self-scan (VM only). With VM forwarding OFF, a
+    // load that issues past an already-RESOLVED older plain store cannot get the
+    // store's data forwarded — it reads the dcache and may return stale bytes.
+    // The store-resolve scan above never sees this ordering (the store resolved
+    // BEFORE the load executed), so the recording load itself scans older
+    // known-addr stores by page offset and self-poisons on overlap; the commit
+    // replay then re-reads after the store has drained. Bare mode stays exact
+    // via the forward network — this scan is VM-gated. One flag per record port
+    // (lane-0 CDB / lane-1 CDB / MSHR capture); each folds its own event gate.
+    var rec0_self_viol_w: logic;
+    var rec1_self_viol_w: logic;
+    var recq_self_viol_w: logic;
+    always_comb {
+        rec0_self_viol_w = 1'b0;
+        rec1_self_viol_w = 1'b0;
+        recq_self_viol_w = 1'b0;
+        for i in 0..ROB_DEPTH {
+            let st_age  : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
+            let st_known: logic            = sh_valid[i] && sh_is_store[i] && sh_rw[i] && !sh_is_amo[i];
+            let sa13    : logic<13>        = {1'b0, sh_store_addr[i][11:0]};
+            let ssz13   : logic<13>        = (5'd1 << sh_store_funct3[i][1:0]) as 13;
+            let se13    : logic<13>        = sa13 + ssz13;
+            let s_pgx   : logic            = se13 >: 13'h1000;
+            // lane-0 CDB load record
+            let a0_age : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
+            let a0_la13: logic<13>        = {1'b0, i_cdb_store_addr[11:0]};
+            let a0_le13: logic<13>        = a0_la13 + ((5'd1 << i_cdb_store_funct3[1:0]) as 13);
+            let a0_ovl : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
+            if i_conservative && s15_vm_spec_en && i_cdb_valid && i_cdb_is_load && !i_cdb_is_lfault
+                && st_known && (st_age <: a0_age) && a0_ovl {
+                rec0_self_viol_w = 1'b1;
+            }
+            // lane-1 CDB load record (bare-only today, kept for symmetry)
+            let a1_age : logic<ROB_IDX_W> = i_cdb2_rob_idx - head_idx;
+            let a1_la13: logic<13>        = {1'b0, i_cdb2_store_addr[11:0]};
+            let a1_le13: logic<13>        = a1_la13 + ((5'd1 << i_cdb2_store_funct3[1:0]) as 13);
+            let a1_ovl : logic            = s_pgx || (a1_le13 >: 13'h1000) || ((a1_la13 <: se13) && (sa13 <: a1_le13));
+            if i_conservative && s15_vm_spec_en && i_cdb2_valid && i_cdb2_is_load
+                && st_known && (st_age <: a1_age) && a1_ovl {
+                rec1_self_viol_w = 1'b1;
+            }
+            // MSHR-capture load record
+            let aq_age : logic<ROB_IDX_W> = i_lq_rec_idx - head_idx;
+            let aq_la13: logic<13>        = {1'b0, i_lq_rec_addr[11:0]};
+            let aq_le13: logic<13>        = aq_la13 + ((5'd1 << i_lq_rec_funct3[1:0]) as 13);
+            let aq_ovl : logic            = s_pgx || (aq_le13 >: 13'h1000) || ((aq_la13 <: se13) && (sa13 <: aq_le13));
+            if i_conservative && s15_vm_spec_en && i_lq_rec_valid
+                && st_known && (st_age <: aq_age) && aq_ovl {
+                recq_self_viol_w = 1'b1;
             }
         }
     }
@@ -686,6 +772,7 @@ pub module rob #(
                 sh_is_sret[i]             = 1'b0;
                 sh_is_sfence[i]           = 1'b0;
                 sh_is_fence_i[i]          = 1'b0;
+                sh_is_fence[i]            = 1'b0;
                 sh_is_ifault[i]           = 1'b0;
                 sh_is_lfault[i]           = 1'b0;
                 sh_is_sfault[i]           = 1'b0;
@@ -780,6 +867,7 @@ pub module rob #(
                 sh_is_sret[tail_idx]     = i_alloc_entry.is_sret;
                 sh_is_sfence[tail_idx]   = i_alloc_entry.is_sfence;
                 sh_is_fence_i[tail_idx]  = i_alloc_entry.is_fence_i;
+                sh_is_fence[tail_idx]    = i_alloc_entry.is_fence;
                 sh_is_ifault[tail_idx]   = i_alloc_entry.is_ifault;
                 sh_is_lfault[tail_idx]   = 1'b0;
                 sh_is_sfault[tail_idx]   = 1'b0;
@@ -832,6 +920,7 @@ pub module rob #(
                     sh_is_sret[tail1_idx]     = i_alloc_entry2.is_sret;
                     sh_is_sfence[tail1_idx]   = i_alloc_entry2.is_sfence;
                     sh_is_fence_i[tail1_idx]  = i_alloc_entry2.is_fence_i;
+                    sh_is_fence[tail1_idx]    = i_alloc_entry2.is_fence;
                     sh_is_ifault[tail1_idx]   = i_alloc_entry2.is_ifault;
                     sh_is_lfault[tail1_idx]   = 1'b0;
                     sh_is_sfault[tail1_idx]   = 1'b0;
@@ -902,6 +991,11 @@ pub module rob #(
                     sh_load_done[i_cdb_rob_idx]   = 1'b1;
                     sh_load_addr[i_cdb_rob_idx]   = i_cdb_store_addr;
                     sh_load_funct3[i_cdb_rob_idx] = i_cdb_store_funct3;
+                    // S15: self-poison — this load passed a known older store
+                    // whose page offset overlaps (VM record-time scan).
+                    if rec0_self_viol_w {
+                        sh_load_poison[i_cdb_rob_idx] = 1'b1;
+                    }
                 }
             }
             // Phase 8 S3: 2nd CDB writeback (pipe-1 = ALU/branch). Targets a
@@ -926,6 +1020,10 @@ pub module rob #(
                     sh_load_done[i_cdb2_rob_idx]   = 1'b1;
                     sh_load_addr[i_cdb2_rob_idx]   = i_cdb2_store_addr;
                     sh_load_funct3[i_cdb2_rob_idx] = i_cdb2_store_funct3;
+                    // S15: self-poison (VM record-time scan, lane 1).
+                    if rec1_self_viol_w {
+                        sh_load_poison[i_cdb2_rob_idx] = 1'b1;
+                    }
                 }
             }
             // Phase 8 S10.3: MSHR capture-time load record (see port comment).
@@ -935,6 +1033,10 @@ pub module rob #(
                 sh_load_done[i_lq_rec_idx]   = 1'b1;
                 sh_load_addr[i_lq_rec_idx]   = i_lq_rec_addr;
                 sh_load_funct3[i_lq_rec_idx] = i_lq_rec_funct3;
+                // S15: self-poison (VM record-time scan, MSHR capture).
+                if recq_self_viol_w {
+                    sh_load_poison[i_lq_rec_idx] = 1'b1;
+                }
             }
             // Phase 8 S3: count both CDB lanes in one NBA (two `+= 1` would race).
             cdb_cnt2 = cdb_cnt2 + (if i_cdb_valid ? 32'd1 : 32'd0) + (if i_cdb2_valid ? 32'd1 : 32'd0);
@@ -948,7 +1050,7 @@ pub module rob #(
                     sh_load_poison[i] = 1'b1;
                 }
             }
-            if any_load_viol_w {
+            if any_load_viol_w || rec0_self_viol_w || rec1_self_viol_w || recq_self_viol_w {
                 load_viol_cnt = load_viol_cnt + 32'd1;
             }
             // Phase 8 S10.3: aborted-MSHR-fill poison (replay at commit, S9.3).
