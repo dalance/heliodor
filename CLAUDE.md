@@ -87,11 +87,14 @@ heliodor/
      (~37M cycles, minutes). N=1 single-hart is `--ignored --test test_soc_linux_boot`.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
      (~52M cycles, ~1h).
-- **Microbenchmarks**: `tb/test_bench.veryl` has 4 `#[ignore]` perf tests
-  (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`) that print cycles +
-  retired instructions (IPC = instret / cycles, frozen at `tohost`). NOT a
-  regression gate (IPC tuning is out of scope) — run individually, e.g.
-  `veryl test --ignored --test test_dhrystone`. Current numbers are in README.md.
+- **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
+  (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`, `test_coremark`)
+  that print cycles + retired instructions (IPC = instret / cycles, frozen at
+  `tohost`). NOT a regression gate (IPC tuning is out of scope) — run
+  individually, e.g. `veryl test --ignored --test test_dhrystone`. Current
+  numbers are in README.md. CoreMark runs ITERATIONS=1 with the upstream EEMBC
+  sources vendored under `test/c/coremark/` (port layer: core_portme.*,
+  start.S, link.ld; tohost at PA 0x80008000 → TOHOST_IDX 8192).
 - **Formatting**: `veryl fmt`. Note: bare `veryl fmt` reformats the ENTIRE repo;
   before a focused commit, format by hand in the surrounding style instead.
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
