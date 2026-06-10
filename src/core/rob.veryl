@@ -548,10 +548,11 @@ pub module rob #(
     // load PA against a store VA (unsound under aliasing). S15 makes the VM scan
     // compare 4KB page offsets instead — VA[11:0] == PA[11:0] is translation-
     // invariant, so an offset overlap is a superset of a true overlap (alias-
-    // blind, only spurious replays possible) and the block can be lifted. VM
-    // store-to-load forwarding stays OFF (a VA/PA offset match does not imply
-    // the same page, so a byte-merge would be unsound); a load that should have
-    // forwarded reads stale data and is caught by the record-time scan below.
+    // blind, only spurious replays possible) and the block can be lifted.
+    // S16: VM store-to-load forwarding is ON via full-VA equality (sound within
+    // one translation context — see the o_store_fwdable comment); only a VA
+    // alias of the same page cannot forward and is caught by the record-time
+    // scan below (offset overlap without VA overlap → replay).
     let s15_vm_spec_en: logic = 1'b1;
     var block_store_exists_w: logic             ;
     var block_store_age_w   : logic<ROB_IDX_W>;
@@ -584,12 +585,20 @@ pub module rob #(
     // address+data captured at CDB, not an AMO/SC). alu_wrap age-filters against
     // the issuing load and does the byte merge. Pure FF-derived (settles like
     // o_has_pending_store); no live address input crosses into the ROB.
+    // S16: forwarding is enabled under VM too. The byte-network compares full
+    // 64-bit addresses; in VM both sides are VAs from the SAME translation
+    // context (any satp/sstatus/priv change commits with a redirect, so all
+    // in-flight ROB memory ops share one context) — equal VA implies equal PA,
+    // so a VA-keyed byte merge is exact. Aliasing (two VAs, one PA) cannot be
+    // forwarded-from but is caught: such a pair always shares the 4KB page
+    // offset, so the record-time self-scan below still poisons it (its
+    // exemption requires full-VA overlap).
     always_comb {
         for i in 0..ROB_DEPTH {
             o_store_addr[i]    = sh_store_addr[i];
             o_store_data[i]    = sh_store_data[i];
             o_store_funct3[i]  = sh_store_funct3[i];
-            o_store_fwdable[i] = sh_valid[i] && sh_is_store[i] && !sh_is_amo[i] && sh_rw[i] && !i_conservative;
+            o_store_fwdable[i] = sh_valid[i] && sh_is_store[i] && !sh_is_amo[i] && sh_rw[i];
             // Phase 8 S8: early-mispredict detection shadow (see port comment).
             o_pred_next_pc[i]  = sh_pred_next_pc[i];
             o_is_control[i]    = sh_valid[i] && sh_is_control[i];
@@ -665,15 +674,17 @@ pub module rob #(
         }
     }
 
-    // Phase 8 S15: record-time self-scan (VM only). With VM forwarding OFF, a
-    // load that issues past an already-RESOLVED older plain store cannot get the
-    // store's data forwarded — it reads the dcache and may return stale bytes.
-    // The store-resolve scan above never sees this ordering (the store resolved
-    // BEFORE the load executed), so the recording load itself scans older
-    // known-addr stores by page offset and self-poisons on overlap; the commit
-    // replay then re-reads after the store has drained. Bare mode stays exact
-    // via the forward network — this scan is VM-gated. One flag per record port
-    // (lane-0 CDB / lane-1 CDB / MSHR capture); each folds its own event gate.
+    // Phase 8 S15: record-time self-scan (VM only). A load that issues past an
+    // already-RESOLVED older plain store reads the dcache and may return stale
+    // bytes. The store-resolve scan above never sees this ordering (the store
+    // resolved BEFORE the load executed), so the recording load itself scans
+    // older known-addr stores by page offset and self-poisons on overlap; the
+    // commit replay then re-reads after the store has drained. S16: same-VA
+    // stores are exempt on the lane-0 path — their bytes were forwarded (see
+    // the per-port comment); only the offset-match-without-VA-match alias case
+    // still replays. Bare mode stays exact via the forward network — this scan
+    // is VM-gated. One flag per record port (lane-0 CDB / lane-1 CDB / MSHR
+    // capture); each folds its own event gate.
     var rec0_self_viol_w: logic;
     var rec1_self_viol_w: logic;
     var recq_self_viol_w: logic;
@@ -688,13 +699,24 @@ pub module rob #(
             let ssz13   : logic<13>        = (5'd1 << sh_store_funct3[i][1:0]) as 13;
             let se13    : logic<13>        = sa13 + ssz13;
             let s_pgx   : logic            = se13 >: 13'h1000;
-            // lane-0 CDB load record
-            let a0_age : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
-            let a0_la13: logic<13>        = {1'b0, i_cdb_store_addr[11:0]};
-            let a0_le13: logic<13>        = a0_la13 + ((5'd1 << i_cdb_store_funct3[1:0]) as 13);
-            let a0_ovl : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
+            // lane-0 CDB load record.
+            // S16 exemption: if the store's FULL VA range overlaps the load's,
+            // the overlapping bytes were forwarded this same cycle by the
+            // byte-network (a lane-0 load records on its completing issue
+            // cycle, when the network samples the live store shadow; a store
+            // cannot resolve that cycle — lane 0 is the load's), so the data
+            // is correct and no poison is needed. Only an offset-overlap
+            // WITHOUT VA overlap (a potential VA alias of the same page,
+            // which the network cannot forward) still poisons.
+            let a0_age   : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
+            let a0_la13  : logic<13>        = {1'b0, i_cdb_store_addr[11:0]};
+            let a0_lsz   : logic<64>        = (5'd1 << i_cdb_store_funct3[1:0]) as 64;
+            let a0_le13  : logic<13>        = a0_la13 + a0_lsz[12:0];
+            let a0_ovl   : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
+            let a0_ssz   : logic<64>        = (5'd1 << sh_store_funct3[i][1:0]) as 64;
+            let a0_va_ovl: logic            = (i_cdb_store_addr <: sh_store_addr[i] + a0_ssz) && (sh_store_addr[i] <: i_cdb_store_addr + a0_lsz);
             if i_conservative && s15_vm_spec_en && i_cdb_valid && i_cdb_is_load && !i_cdb_is_lfault
-                && st_known && (st_age <: a0_age) && a0_ovl {
+                && st_known && (st_age <: a0_age) && a0_ovl && !a0_va_ovl {
                 rec0_self_viol_w = 1'b1;
             }
             // lane-1 CDB load record (bare-only today, kept for symmetry)
