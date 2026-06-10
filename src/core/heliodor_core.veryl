@@ -3272,7 +3272,16 @@ pub module heliodor_core #(
     // fast store commits (its data is then in the dcache). issue_amo_read covers
     // AMO + LR (not SC, which is a store).
     assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && fast_store);
-    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store) || mmu_walk_inflight;
+    // Phase 8 S10.5: !replay_q — no NEW dmem-MMU request while a queued-MSHR
+    // replay drives the dcache port. Without this, a TLB-missing load selected
+    // on slot-0 starts a PTW walk on a replay cycle (walk_v_q is not set yet,
+    // so replay_drive does not defer): the walk's first PTE read goes out with
+    // the dcache i_addr OVERRIDDEN to the replay's PA, and on a replay HIT
+    // i_dcache_stall=0 lets the MMU consume the replay load's DATA as a PTE —
+    // a corrupted translation (observed as a wild jump into the _etext/
+    // .init.text padding hole, N=2 trap-loop timeout). An already-in-flight
+    // walk (mmu_walk_inflight) still owns the port; replay defers to it.
+    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || mmu_walk_inflight;
     let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
     // M9.4 SMP: mark the AMO/LR data read so the dcache forces a coherent,
     // bus-serialized re-fill instead of returning a possibly-stale cache HIT
@@ -3568,7 +3577,19 @@ pub module heliodor_core #(
     let mshrb_queued: logic     = mshrb_v_q && !mshrb_done_q && !mshrb_own_q;
     let replay_is_a : logic     = mshra_queued;
     let replay_addr : logic<64> = if mshra_queued ? mshra_addr_q : mshrb_addr_q;
-    let replay_drive: logic     = replay_q && !store_drive && !mmu_walk_inflight;
+    // S10.5: defer to the MMU being fully IDLE, not merely !mmu_walk_inflight.
+    // mmu_walk_inflight is walk_v_q-based and so misses (1) STORE-commit walks
+    // (excluded from load_walk_busy; !store_drive happens to cover them) and
+    // (2) ORPHAN walks — a walk whose owner was squashed by a redirect
+    // (walk_phys_q && !walk_v_q, the M9.3 class) keeps issuing PTE reads; a
+    // replay overriding i_addr during one of them feeds the REPLAY LOAD's
+    // data to the MMU as a PTE, installing a garbage TLB entry → spurious
+    // load page faults on valid kernel VAs (the N=2 post-SMP-bringup Oops,
+    // badaddr == a live kernel pointer). dmem_mmu_idle is the MMU's state
+    // register — no walk of any kind can consume the port while it is IDLE,
+    // and the !replay_q term in core_dmem_ren keeps a NEW walk from starting
+    // mid-replay.
+    let replay_drive: logic = replay_q && !store_drive && dmem_mmu_idle;
     var dc_mem_addr : logic<64>;
     var dc_mem_wdata: logic<64>;
     var dc_mem_wen  : logic    ;
@@ -3682,7 +3703,22 @@ pub module heliodor_core #(
     // entry (mshr_abort_poison) → S9.3 commit replay re-reads fresh data.
     let s10_flip_en: logic = 1'b1;
     // Capturable plain load issuing on slot-0 (shared qualifier).
-    let mshr_plain_load: logic = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    // S10.5 (Sv39 extension): !dmem_vm_on is GONE — a TLB-hit Sv39 load
+    // captures like a bare one. By that point dmu_dmem_addr is the translated
+    // PA (ptw_valid), so the MSHR/fill/replay all carry a PA and are immune to
+    // later satp/sfence changes (translation happens at issue, as it always
+    // did; an OLDER captured load also always completes before a younger
+    // csrw-satp/sfence can commit, by in-order commit). TLB-miss loads walk
+    // first (dmem_mmu_busy gates this term; PTE-read misses can't capture for
+    // the same reason). !dmem_mmu_fault: a faulting translation never reads
+    // the dcache (the MMU drops o_dmem_ren), so it must trap via the normal
+    // CDB path, not capture. Store ordering under VM is STRICTER than bare:
+    // the S9 conservative block holds every load while ANY older store is
+    // in the ROB, so a captured VM load has no older in-flight stores at all
+    // (this is also why the LQ-record PA-vs-VA unit mismatch is benign — the
+    // violation scan structurally cannot fire under VM, and fwd_mask is
+    // always 0 there).
+    let mshr_plain_load: logic = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
     let mshr_free_ok    : logic = !mshra_v_q || !mshrb_v_q;
     let mshr_alloc_a    : logic = !mshra_v_q;
     // !replay_q on both: on a replay cycle the dcache port (and so
@@ -3700,7 +3736,13 @@ pub module heliodor_core #(
     // it does outside a fill, so fwd_mask!=0 loads are NOT excluded here (only
     // the MSHR capture excludes them — a fill alone is not their result).
     // !i_dcache_inv_valid mirrors ld2_complete (same-cycle remote-inv race).
-    assign ld0_hum_ok = iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && dc_hit_safe && !redirect_fire && !i_dcache_inv_valid;
+    // S10.5: !dmem_vm_on gone here too — a TLB-hit Sv39 load (busy=0, i_addr
+    // already the PA) completes from a fill-safe dcache hit mid-fill exactly
+    // like a bare one; the alu CDB fault side-band still applies if the
+    // translation hit a permission fault (then the MMU drops o_dmem_ren, so
+    // dc_hit_safe=0 and this term cannot fire anyway — !dmem_mmu_fault makes
+    // it explicit).
+    assign ld0_hum_ok = iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dc_load_next && dc_hit_safe && !redirect_fire && !i_dcache_inv_valid;
     // Per-entry squash (see header comment).
     let mshra_age    : logic<ROB_IDX_W> = mshra_rob_idx_q - rob_head_idx;
     let mshrb_age    : logic<ROB_IDX_W> = mshrb_rob_idx_q - rob_head_idx;
