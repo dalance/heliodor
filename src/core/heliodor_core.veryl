@@ -977,6 +977,10 @@ pub module heliodor_core #(
     // Merged CDB (ALU and FPU are mutually exclusive: at most one valid/cycle).
     var alu_cdb: CdbBus;
     var fpu_cdb: CdbBus;
+    // Phase 8 S10.1: deferred MSHR writeback (non-blocking load-miss fill
+    // completion). Assigned in the MSHR block after the dcache instance;
+    // muxed onto lane 0 below FPU priority. valid=0 while s10_flip_en=0.
+    var mshr_cdb: CdbBus;
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -1415,11 +1419,14 @@ pub module heliodor_core #(
     }
     let amo_issue_lock_ok: logic = !iq_iss_is_amo || amo_read_pending_q;
     assign o_amo_inflight = amo_read_pending_q || rob_has_pending_amo;
+    // Phase 8 S10.1: lane-0 priority FPU > MSHR (deferred load fill) > ALU.
+    // The MSHR holds its completion (mshr_done_q) until the FPU lane is free,
+    // and the ALU yields issue/ack the cycle the MSHR writes back (gates below).
     always_comb {
-        cdb = if fpu_cdb.valid ? fpu_cdb : alu_cdb;
+        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : alu_cdb;
     }
     inst u_alu: alu_wrap (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -1524,7 +1531,9 @@ pub module heliodor_core #(
     // fill / write-during-fill). The op re-issues each cycle (core_dmem_ren
     // stays asserted, driving the fill) but does not ack/leave until the data
     // is cached and dcache_stall drops.
-    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store;
+    // Phase 8 S10.1: also yield the ack when the MSHR owns the CDB (deferred
+    // load-fill writeback), mirroring the FPU-yield term.
+    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store;
 
     // ============================================================
     // PRF
@@ -3481,6 +3490,12 @@ pub module heliodor_core #(
     var dc_mem_ren  : logic    ;
     var dc_mem_wstrb: logic<8> ;
     var dc_mem_req  : logic    ;
+    // Phase 8 S10.1: non-blocking miss (MSHR) interface, consumed by the MSHR
+    // block after the instance. dc_miss_valid = fill-start pulse, dc_fill_complete
+    // = non-aborted DONE, dc_fill_rdata = filled dword at the original miss offset.
+    var dc_miss_valid   : logic    ;
+    var dc_fill_complete: logic    ;
+    var dc_fill_rdata   : logic<64>;
     inst u_dcache: dcache (
         clk                                              ,
         rst                                              ,
@@ -3513,9 +3528,9 @@ pub module heliodor_core #(
         o_rdata_next_miss: _                             , // hi_miss path stalls cross-line loads
         o_stall          : dcache_stall                  ,
         o_data_valid     : _                             , // single-hart
-        o_miss_valid     : _                             ,
-        o_fill_complete  : _                             ,
-        o_fill_rdata     : _                             ,
+        o_miss_valid     : dc_miss_valid                 , // S10.1: MSHR capture trigger
+        o_fill_complete  : dc_fill_complete              ,
+        o_fill_rdata     : dc_fill_rdata                 ,
         o_mem_addr       : dc_mem_addr                   ,
         o_mem_wdata      : dc_mem_wdata                  ,
         i_mem_rdata      : i_dmem_rdata                  ,
@@ -3539,6 +3554,121 @@ pub module heliodor_core #(
     // select's block term + the 2nd forward network (older overlapping stores).
     let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !dcache_stall && !redirect_fire && !i_dcache_inv_valid;
     assign issue2_fire = iq_issue_valid2 && (!issue2_is_load || ld2_complete);
+
+    // ============================================================
+    // Phase 8 S10.1: non-blocking load-miss MSHR (single entry) — BUILT DEAD
+    // (s10_flip_en=0: mshr_capture never fires, mshr_cdb.valid stays 0, so the
+    // cdb mux and the !mshr_cdb.valid issue/ack terms reduce to the S9 baseline).
+    // Intended S10.3 flow: on the fill-START pulse (dc_miss_valid) for a plain
+    // bare-mode int load, capture {rob_idx, pdst, addr, funct3} here and ACK the
+    // load out of the IQ (instead of holding/re-issuing it against dcache_stall
+    // for the whole fill). The dcache fill proceeds autonomously (fill regs are
+    // latched at IDLE→FILL); on dc_fill_complete the fill dword is latched and
+    // a DEFERRED writeback (mshr_cdb) takes lane 0 on the first FPU-free cycle:
+    // PRF write + ROB result + IQ wakeup, exactly like an in-pipe load.
+    // Excluded from capture (stay on the blocking path): AMO/LR (force-miss
+    // re-fill protocol), FP loads, Sv39 (PTE reads share the port), cross-dword
+    // misaligned loads (two-line fill, two rdata), loads with forwarded store
+    // bytes (fill data alone is not the result).
+    // Squash safety (the S8.E BUG5 idx-reuse class): the MSHR is cleared on
+    // redirect_fire (registered, covers every full flush incl. S9 load replay)
+    // and on an early redirect when the load is YOUNGER than the branch
+    // (modular age compare vs rob_head_idx) — so a stale writeback can never
+    // land on a re-allocated rob_idx. A SAME-cycle squash+writeback is mooted
+    // inside the ROB (squash runs later in its block) and the stray prf_ready
+    // is cleared when the pdst is re-allocated at rename.
+    // SMP: an aborted fill (remote inv) never asserts dc_fill_complete, so the
+    // load would hang pending — the S10.3 flip must replay it (S9 poison path)
+    // or re-arm the fill; until then capture stays off.
+    let s10_flip_en: logic = 1'b0;
+    var mshr_v_q      : logic           ;
+    var mshr_done_q   : logic           ;
+    var mshr_rob_idx_q: logic<ROB_IDX_W>;
+    var mshr_pdst_q   : logic<PRF_INT_W>;
+    var mshr_has_rd_q : logic           ;
+    var mshr_addr_q   : logic<64>       ;
+    var mshr_funct3_q : logic<3>        ;
+    var mshr_data_q   : logic<64>       ;
+    let mshr_capture: logic = s10_flip_en && dc_miss_valid && !mshr_v_q && iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    let mshr_age     : logic<ROB_IDX_W> = mshr_rob_idx_q - rob_head_idx;
+    let s10_early_age: logic<ROB_IDX_W> = early_redir_idx_q - rob_head_idx;
+    let mshr_squashed: logic            = mshr_v_q && (redirect_fire || (early_redir_fire_q && (mshr_age >: s10_early_age)));
+    let mshr_wb_fire : logic            = mshr_v_q && mshr_done_q && !fpu_cdb.valid;
+    always_ff (clk, rst) {
+        if_reset {
+            mshr_v_q       = 1'b0;
+            mshr_done_q    = 1'b0;
+            mshr_rob_idx_q = '0;
+            mshr_pdst_q    = '0;
+            mshr_has_rd_q  = 1'b0;
+            mshr_addr_q    = '0;
+            mshr_funct3_q  = '0;
+            mshr_data_q    = '0;
+        } else {
+            if mshr_squashed {
+                mshr_v_q    = 1'b0;
+                mshr_done_q = 1'b0;
+            } else if mshr_capture {
+                mshr_v_q       = 1'b1;
+                mshr_done_q    = 1'b0;
+                mshr_rob_idx_q = iq_iss_rob_idx;
+                mshr_pdst_q    = iq_iss_rd_pdst;
+                mshr_has_rd_q  = iq_issue_op.base.has_rd;
+                mshr_addr_q    = dmu_dmem_addr;
+                mshr_funct3_q  = iq_issue_op.base.mem_funct3;
+            } else if mshr_v_q && !mshr_done_q && dc_fill_complete {
+                mshr_data_q = dc_fill_rdata;
+                mshr_done_q = 1'b1;
+            } else if mshr_wb_fire {
+                mshr_v_q    = 1'b0;
+                mshr_done_q = 1'b0;
+            }
+        }
+    }
+    // Deferred load-data extension: the captured load is within-dword (cross-
+    // dword excluded at capture) with no forwarded bytes, so this is the
+    // single-dword slice of alu_wrap's ld_* select on the latched fill dword.
+    let mshr_shift  : logic<6>  = {mshr_addr_q[2:0], 3'b000};
+    let mshr_shifted: logic<64> = mshr_data_q >> mshr_shift;
+    var mshr_ld_data: logic<64>;
+    always_comb {
+        case mshr_funct3_q {
+            3'b000 : mshr_ld_data = {if mshr_shifted[7] ? 56'hff_ffff_ffff_ffff : 56'd0, mshr_shifted[7:0]}; // LB
+            3'b001 : mshr_ld_data = {if mshr_shifted[15] ? 48'hffff_ffff_ffff : 48'd0, mshr_shifted[15:0]}; // LH
+            3'b010 : mshr_ld_data = {if mshr_shifted[31] ? 32'hffff_ffff : 32'd0, mshr_shifted[31:0]}; // LW
+            3'b011 : mshr_ld_data = mshr_shifted; // LD
+            3'b100 : mshr_ld_data = {56'd0, mshr_shifted[7:0]}; // LBU
+            3'b101 : mshr_ld_data = {48'd0, mshr_shifted[15:0]}; // LHU
+            3'b110 : mshr_ld_data = {32'd0, mshr_shifted[31:0]}; // LWU
+            default: mshr_ld_data = mshr_shifted;
+        }
+    }
+    always_comb {
+        mshr_cdb.valid       = mshr_wb_fire;
+        mshr_cdb.has_rd      = mshr_wb_fire && mshr_has_rd_q;
+        mshr_cdb.pdst        = mshr_pdst_q;
+        mshr_cdb.data        = mshr_ld_data;
+        mshr_cdb.rob_idx     = mshr_rob_idx_q;
+        mshr_cdb.mispredict  = 1'b0;
+        mshr_cdb.redirect_pc = '0;
+        mshr_cdb.is_store    = 1'b0;
+        // is_load + store_addr/store_funct3 feed the S9 Load Queue shadow at
+        // this (deferred) writeback. ⚠S10.3 ordering caveat: during the fill
+        // window the load is NOT yet in the shadow, so an older store resolving
+        // there would miss the violation — re-examine before the flip (record
+        // at capture instead, or block store resolution while the MSHR is busy).
+        mshr_cdb.is_load      = mshr_wb_fire;
+        mshr_cdb.store_addr   = mshr_addr_q;
+        mshr_cdb.store_data   = '0;
+        mshr_cdb.store_funct3 = mshr_funct3_q;
+        mshr_cdb.is_csr       = 1'b0;
+        mshr_cdb.csr_addr     = '0;
+        mshr_cdb.csr_wdata    = '0;
+        mshr_cdb.csr_illegal  = 1'b0;
+        mshr_cdb.is_lfault    = 1'b0;
+        mshr_cdb.is_sfault    = 1'b0;
+        mshr_cdb.fault_vaddr  = '0;
+    }
 
     // M8.C: o_dmem is now purely the dcache mem side — imem PTW moved to the
     // dedicated o_iptw bus, so no arbiter mux here anymore.
