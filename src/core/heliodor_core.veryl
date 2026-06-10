@@ -985,18 +985,37 @@ pub module heliodor_core #(
     // block) — the issuing load misses, the fill starts, and the load is acked
     // OUT of the IQ with its writeback deferred to fill completion.
     var mshr_capture: logic;
-    // S10.3 MSHR state + rob-port feeds (declared here so the rob instance can
-    // consume them; assigned in the MSHR block after the dcache instance).
-    var mshr_v_q       : logic           ;
-    var mshr_done_q    : logic           ;
-    var mshr_rob_idx_q : logic<ROB_IDX_W>;
-    var mshr_pdst_q    : logic<PRF_INT_W>;
-    var mshr_has_rd_q  : logic           ;
-    var mshr_addr_q    : logic<64>       ;
-    var mshr_funct3_q  : logic<3>        ;
-    var mshr_data_q    : logic<64>       ;
+    // S10.3/S10.4b MSHR state + rob-port feeds (declared here so the rob
+    // instance and the issue gates can consume them; assigned in the MSHR
+    // block after the dcache instance). S10.4b: TWO entries (a/b) = one fill
+    // OWNER + one QUEUED miss (miss-under-miss); own_q marks which entry the
+    // in-flight dcache fill belongs to.
+    var mshra_v_q      : logic           ;
+    var mshra_done_q   : logic           ;
+    var mshra_own_q    : logic           ;
+    var mshra_rob_idx_q: logic<ROB_IDX_W>;
+    var mshra_pdst_q   : logic<PRF_INT_W>;
+    var mshra_has_rd_q : logic           ;
+    var mshra_addr_q   : logic<64>       ;
+    var mshra_funct3_q : logic<3>        ;
+    var mshra_data_q   : logic<64>       ;
+    var mshrb_v_q      : logic           ;
+    var mshrb_done_q   : logic           ;
+    var mshrb_own_q    : logic           ;
+    var mshrb_rob_idx_q: logic<ROB_IDX_W>;
+    var mshrb_pdst_q   : logic<PRF_INT_W>;
+    var mshrb_has_rd_q : logic           ;
+    var mshrb_addr_q   : logic<64>       ;
+    var mshrb_funct3_q : logic<3>        ;
+    var mshrb_data_q   : logic<64>       ;
     var mshr_rec_addr  : logic<64>       ; // = the capturing load's PA/VA (bare)
     var mshr_abort_poison: logic         ; // aborted-fill pulse → rob poison port
+    var mshr_poison_idx: logic<ROB_IDX_W>; // owner entry's rob idx (abort poison)
+    // S10.4b: replay injection active — a QUEUED entry's address is driven
+    // onto the dcache CPU port (no fill in flight). While high, slot-0 dmem
+    // readers yield the port (iss_dc_ok), so dc_hit_safe is the REPLAY
+    // address's verdict, not an issuing load's.
+    var replay_q: logic;
     // Phase 8 S10.4a: pipe-0 hit-under-miss. dc_hit_safe = the dcache's
     // fill-safe hit on i_addr; ld0_hum_ok (forward-ref, assigned in the MSHR
     // block) lets a plain bare-mode slot-0 load that HITS complete in-pipe
@@ -1452,8 +1471,11 @@ pub module heliodor_core #(
     // load complete in-pipe while a fill is in flight, when the fill-safe
     // dcache hit (dc_hit_safe) says its data is consistent (the filling way
     // is excluded inside the dcache).
+    // S10.4b: dmem readers also yield while a queued-MSHR replay is driving
+    // the dcache port (!replay_q) — during a replay cycle i_addr is the
+    // replayed entry's, so dc_hit_safe is not the issuing load's verdict.
     let iss_reads_dmem: logic = iq_issue_op.base.is_load || iq_iss_is_amo;
-    let iss_dc_ok     : logic = !iss_reads_dmem || !dcache_stall || ld0_hum_ok;
+    let iss_dc_ok     : logic = !iss_reads_dmem || (!replay_q && (!dcache_stall || ld0_hum_ok));
     // Phase 8 S10.1: lane-0 priority FPU > MSHR (deferred load fill) > ALU.
     // The MSHR holds its completion (mshr_done_q) until the FPU lane is free,
     // and the ALU yields issue/ack the cycle the MSHR writes back (gates below).
@@ -2092,7 +2114,7 @@ pub module heliodor_core #(
         i_lq_rec_addr        : mshr_rec_addr        ,
         i_lq_rec_funct3      : iq_issue_op.base.mem_funct3,
         i_load_poison_v      : mshr_abort_poison    ,
-        i_load_poison_idx    : mshr_rob_idx_q       ,
+        i_load_poison_idx    : mshr_poison_idx      ,
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
@@ -3530,6 +3552,23 @@ pub module heliodor_core #(
     assign dc_addr2      = agu_addr_iss2;
     assign dc_ren2       = issue2_is_load && !dmem_vm_on;
     assign dc_load_next2 = issue2_is_load && (dc_span_sum2 >: 6'd8);
+    // Phase 8 S10.4b: replay injection. A QUEUED MSHR (captured while the
+    // dcache was busy) re-executes its read by driving its address onto the
+    // dcache CPU port once armed (replay_q). The drive defers to a committing
+    // store's write (store_drive owns i_addr for the write-through) and to a
+    // PTW PTE read (mmu_walk_inflight owns the port for the walk) — both are
+    // bounded, so the replay always eventually gets the port. Outcomes:
+    //   HIT  (dc_hit_safe — the line arrived via an earlier fill, possibly
+    //         still mid-another-fill): complete from o_rdata (replay_hit_fire).
+    //   MISS (dc_miss_valid while driving): the fill starts and the entry
+    //         becomes its owner (replay_claim).
+    // The target select (replay_is_a) is combinational; it is consistent with
+    // the address being driven on the same cycle by construction.
+    let mshra_queued: logic     = mshra_v_q && !mshra_done_q && !mshra_own_q;
+    let mshrb_queued: logic     = mshrb_v_q && !mshrb_done_q && !mshrb_own_q;
+    let replay_is_a : logic     = mshra_queued;
+    let replay_addr : logic<64> = if mshra_queued ? mshra_addr_q : mshrb_addr_q;
+    let replay_drive: logic     = replay_q && !store_drive && !mmu_walk_inflight;
     var dc_mem_addr : logic<64>;
     var dc_mem_wdata: logic<64>;
     var dc_mem_wen  : logic    ;
@@ -3546,14 +3585,16 @@ pub module heliodor_core #(
     inst u_dcache: dcache (
         clk                                              ,
         rst                                              ,
-        i_addr           : dmu_dmem_addr                 ,
+        // S10.4b: a replay drive overrides the READ address (the write path is
+        // unaffected — replay_drive excludes store_drive, so i_wen=0 then).
+        i_addr           : if replay_drive ? replay_addr : dmu_dmem_addr,
         i_wdata          : dmu_dmem_wdata                ,
         i_wen            : dmu_dmem_wen                  ,
-        i_ren            : dmu_dmem_ren                  ,
+        i_ren            : dmu_dmem_ren || replay_drive  ,
         i_wstrb          : dmu_dmem_wstrb                ,
         i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
-        i_load_next      : dc_load_next                  , // B.3: misaligned cross-line load fill
-        i_amo_read       : dc_amo_read                   , // M9.4: AMO/LR read → force coherent re-fill
+        i_load_next      : dc_load_next && !replay_drive , // B.3: misaligned cross-line load fill
+        i_amo_read       : dc_amo_read && !replay_drive  , // M9.4: AMO/LR read → force coherent re-fill
         // Phase 8 S5.2: 2nd hit-only read port (dual-issue loads). Tied off in
         // step 1; wired to the slot-1 load AGU/result in steps 2-3.
         i_addr2          : dc_addr2                       ,
@@ -3612,89 +3653,192 @@ pub module heliodor_core #(
     assign issue2_fire = iq_issue_valid2 && (!issue2_is_load || ld2_complete);
 
     // ============================================================
-    // Phase 8 S10.1: non-blocking load-miss MSHR (single entry) — BUILT DEAD
-    // (s10_flip_en=0: mshr_capture never fires, mshr_cdb.valid stays 0, so the
-    // cdb mux and the !mshr_cdb.valid issue/ack terms reduce to the S9 baseline).
-    // Intended S10.3 flow: on the fill-START pulse (dc_miss_valid) for a plain
-    // bare-mode int load, capture {rob_idx, pdst, addr, funct3} here and ACK the
-    // load out of the IQ (instead of holding/re-issuing it against dcache_stall
-    // for the whole fill). The dcache fill proceeds autonomously (fill regs are
-    // latched at IDLE→FILL); on dc_fill_complete the fill dword is latched and
-    // a DEFERRED writeback (mshr_cdb) takes lane 0 on the first FPU-free cycle:
-    // PRF write + ROB result + IQ wakeup, exactly like an in-pipe load.
-    // Excluded from capture (stay on the blocking path): AMO/LR (force-miss
-    // re-fill protocol), FP loads, Sv39 (PTE reads share the port), cross-dword
-    // misaligned loads (two-line fill, two rdata), loads with forwarded store
-    // bytes (fill data alone is not the result).
-    // Squash safety (the S8.E BUG5 idx-reuse class): the MSHR is cleared on
-    // redirect_fire (registered, covers every full flush incl. S9 load replay)
-    // and on an early redirect when the load is YOUNGER than the branch
-    // (modular age compare vs rob_head_idx) — so a stale writeback can never
-    // land on a re-allocated rob_idx. A SAME-cycle squash+writeback is mooted
-    // inside the ROB (squash runs later in its block) and the stray prf_ready
-    // is cleared when the pdst is re-allocated at rename.
-    // SMP: an aborted fill (remote inv) never asserts dc_fill_complete, so the
-    // load would hang pending — the S10.3 flip must replay it (S9 poison path)
-    // or re-arm the fill; until then capture stays off.
+    // Phase 8 S10: non-blocking load-miss MSHRs. S10.4b: TWO entries (a/b) =
+    // miss-under-miss. A plain bare-mode int load that misses is captured and
+    // acked OUT of the IQ in one of two ways:
+    //   - OWNER capture (mshr_capture_own): the fill starting THIS cycle
+    //     (dc_miss_valid) is this load's; the entry owns it (own_q=1) and
+    //     latches dc_fill_rdata at DONE.
+    //   - QUEUED capture (mshr_capture_que): the load misses (fill-safe
+    //     verdict !dc_hit_safe) while the dcache is busy — mid-fill, or its
+    //     own miss is still waiting for the bus grant. No fill starts now;
+    //     the replay machinery (replay_q / replay_drive at the dcache
+    //     instance) injects the address once the dcache is idle: a HIT
+    //     completes from o_rdata, a MISS starts its fill (entry claims it).
+    // Completion is a DEFERRED writeback (mshr_cdb) on lane 0 at the first
+    // FPU-free cycle: PRF write + ROB result + IQ wakeup, like an in-pipe
+    // load. Excluded from capture (blocking path): AMO/LR (force-miss
+    // protocol), FP loads, Sv39 (PTE reads share the port), cross-dword
+    // misaligned loads, loads with forwarded store bytes.
+    // Squash safety (the S8.E BUG5 idx-reuse class): each entry clears on
+    // redirect_fire (registered, covers every full flush incl. S9 load
+    // replay) and on an early redirect when the load is YOUNGER than the
+    // branch (modular age compare vs rob_head_idx) — a stale writeback can
+    // never land on a re-allocated rob_idx. A same-cycle squash+writeback is
+    // mooted inside the ROB (squash runs later in its block); a same-cycle
+    // squash+replay_claim is voided (squash branch has priority, the fill
+    // goes ownerless and harmlessly caches the line).
+    // SMP aborted fill: completes the OWNER with stale data + poisons its ROB
+    // entry (mshr_abort_poison) → S9.3 commit replay re-reads fresh data.
     let s10_flip_en: logic = 1'b1;
-    assign mshr_capture = s10_flip_en && dc_miss_valid && !mshr_v_q && iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    // Capturable plain load issuing on slot-0 (shared qualifier).
+    let mshr_plain_load: logic = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    let mshr_free_ok    : logic = !mshra_v_q || !mshrb_v_q;
+    let mshr_alloc_a    : logic = !mshra_v_q;
+    // !replay_q on both: on a replay cycle the dcache port (and so
+    // dc_miss_valid / dc_hit_safe) belongs to the replayed entry, not to an
+    // issuing load (which iss_dc_ok holds anyway).
+    let mshr_capture_own: logic = s10_flip_en && !replay_q && dc_miss_valid && mshr_plain_load && mshr_free_ok;
+    let mshr_capture_que: logic = s10_flip_en && !replay_q && !dc_miss_valid && dcache_stall && !dc_hit_safe && !i_dcache_inv_valid && mshr_plain_load && mshr_free_ok;
+    assign mshr_capture = mshr_capture_own || mshr_capture_que;
     // rob LQ-record / abort-poison port feeds (vars declared near mshr_cdb).
     assign mshr_rec_addr     = dmu_dmem_addr;
-    assign mshr_abort_poison = mshr_v_q && !mshr_done_q && dc_fill_aborted;
+    assign mshr_abort_poison = ((mshra_v_q && mshra_own_q && !mshra_done_q) || (mshrb_v_q && mshrb_own_q && !mshrb_done_q)) && dc_fill_aborted;
+    assign mshr_poison_idx   = if mshra_own_q ? mshra_rob_idx_q : mshrb_rob_idx_q;
     // Phase 8 S10.4a: pipe-0 hit-under-miss qualifier (see iss_dc_ok). The
     // forwarded-bytes merge (stld_fwd_*) works on a hit completion exactly as
     // it does outside a fill, so fwd_mask!=0 loads are NOT excluded here (only
     // the MSHR capture excludes them — a fill alone is not their result).
     // !i_dcache_inv_valid mirrors ld2_complete (same-cycle remote-inv race).
     assign ld0_hum_ok = iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && dc_hit_safe && !redirect_fire && !i_dcache_inv_valid;
-    let mshr_age     : logic<ROB_IDX_W> = mshr_rob_idx_q - rob_head_idx;
+    // Per-entry squash (see header comment).
+    let mshra_age    : logic<ROB_IDX_W> = mshra_rob_idx_q - rob_head_idx;
+    let mshrb_age    : logic<ROB_IDX_W> = mshrb_rob_idx_q - rob_head_idx;
     let s10_early_age: logic<ROB_IDX_W> = early_redir_idx_q - rob_head_idx;
-    let mshr_squashed: logic            = mshr_v_q && (redirect_fire || (early_redir_fire_q && (mshr_age >: s10_early_age)));
-    let mshr_wb_fire : logic            = mshr_v_q && mshr_done_q && !fpu_cdb.valid;
+    let mshra_squashed: logic = mshra_v_q && (redirect_fire || (early_redir_fire_q && (mshra_age >: s10_early_age)));
+    let mshrb_squashed: logic = mshrb_v_q && (redirect_fire || (early_redir_fire_q && (mshrb_age >: s10_early_age)));
+    // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).
+    let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid;
+    let replay_claim   : logic = replay_drive && dc_miss_valid;
+    // Fill completion routes to the OWNING entry.
+    let mshra_fill_done: logic = mshra_v_q && mshra_own_q && !mshra_done_q && (dc_fill_complete || dc_fill_aborted);
+    let mshrb_fill_done: logic = mshrb_v_q && mshrb_own_q && !mshrb_done_q && (dc_fill_complete || dc_fill_aborted);
+    // Deferred writeback arbitration: lane 0, priority FPU > MSHR(a>b) > ALU.
+    let mshra_wb_rdy : logic = mshra_v_q && mshra_done_q;
+    let mshrb_wb_rdy : logic = mshrb_v_q && mshrb_done_q;
+    let mshr_wb_sel_a: logic = mshra_wb_rdy;
+    let mshr_wb_fire : logic = (mshra_wb_rdy || mshrb_wb_rdy) && !fpu_cdb.valid;
+    // Core-tracked dcache fill-FSM busy (fill start → DONE) — arms the replay.
+    var fill_busy_q: logic;
     always_ff (clk, rst) {
         if_reset {
-            mshr_v_q       = 1'b0;
-            mshr_done_q    = 1'b0;
-            mshr_rob_idx_q = '0;
-            mshr_pdst_q    = '0;
-            mshr_has_rd_q  = 1'b0;
-            mshr_addr_q    = '0;
-            mshr_funct3_q  = '0;
-            mshr_data_q    = '0;
+            fill_busy_q = 1'b0;
+            replay_q    = 1'b0;
         } else {
-            if mshr_squashed {
-                mshr_v_q    = 1'b0;
-                mshr_done_q = 1'b0;
-            } else if mshr_capture {
-                mshr_v_q       = 1'b1;
-                mshr_done_q    = 1'b0;
-                mshr_rob_idx_q = iq_iss_rob_idx;
-                mshr_pdst_q    = iq_iss_rd_pdst;
-                mshr_has_rd_q  = iq_issue_op.base.has_rd;
-                mshr_addr_q    = dmu_dmem_addr;
-                mshr_funct3_q  = iq_issue_op.base.mem_funct3;
-            } else if mshr_v_q && !mshr_done_q && (dc_fill_complete || dc_fill_aborted) {
-                // S10.3: an ABORTED fill (remote inv, SMP) also completes the
-                // load — with potentially-stale data — but the same cycle
-                // poisons its ROB entry (mshr_abort_poison below), so it
-                // replays at commit and re-reads fresh data; its speculative
-                // consumers are full-flushed by the replay (the S9 model).
-                mshr_data_q = dc_fill_rdata;
-                mshr_done_q = 1'b1;
-            } else if mshr_wb_fire {
-                mshr_v_q    = 1'b0;
-                mshr_done_q = 1'b0;
+            if dc_miss_valid {
+                fill_busy_q = 1'b1;
+            } else if dc_fill_complete || dc_fill_aborted {
+                fill_busy_q = 1'b0;
+            }
+            // Replay arming / retirement. Any fill start clears it (either the
+            // replay's own claim, or a PTW/blocking read won the port — the
+            // queued entry stays and re-arms after that fill). It also clears
+            // when the replay hits, or when no live queued entry remains
+            // (squash). Otherwise it arms (and holds) while a queued entry
+            // exists and the fill FSM is idle.
+            if dc_miss_valid {
+                replay_q = 1'b0;
+            } else if replay_hit_fire {
+                replay_q = 1'b0;
+            } else if !((mshra_queued && !mshra_squashed) || (mshrb_queued && !mshrb_squashed)) {
+                replay_q = 1'b0;
+            } else if !fill_busy_q {
+                replay_q = 1'b1;
             }
         }
     }
-    // Deferred load-data extension: the captured load is within-dword (cross-
-    // dword excluded at capture) with no forwarded bytes, so this is the
-    // single-dword slice of alu_wrap's ld_* select on the latched fill dword.
-    let mshr_shift  : logic<6>  = {mshr_addr_q[2:0], 3'b000};
-    let mshr_shifted: logic<64> = mshr_data_q >> mshr_shift;
+    always_ff (clk, rst) {
+        if_reset {
+            mshra_v_q       = 1'b0;
+            mshra_done_q    = 1'b0;
+            mshra_own_q     = 1'b0;
+            mshra_rob_idx_q = '0;
+            mshra_pdst_q    = '0;
+            mshra_has_rd_q  = 1'b0;
+            mshra_addr_q    = '0;
+            mshra_funct3_q  = '0;
+            mshra_data_q    = '0;
+            mshrb_v_q       = 1'b0;
+            mshrb_done_q    = 1'b0;
+            mshrb_own_q     = 1'b0;
+            mshrb_rob_idx_q = '0;
+            mshrb_pdst_q    = '0;
+            mshrb_has_rd_q  = 1'b0;
+            mshrb_addr_q    = '0;
+            mshrb_funct3_q  = '0;
+            mshrb_data_q    = '0;
+        } else {
+            // entry A
+            if mshra_squashed {
+                mshra_v_q    = 1'b0;
+                mshra_done_q = 1'b0;
+                mshra_own_q  = 1'b0;
+            } else if mshr_capture && mshr_alloc_a {
+                mshra_v_q       = 1'b1;
+                mshra_done_q    = 1'b0;
+                mshra_own_q     = mshr_capture_own;
+                mshra_rob_idx_q = iq_iss_rob_idx;
+                mshra_pdst_q    = iq_iss_rd_pdst;
+                mshra_has_rd_q  = iq_issue_op.base.has_rd;
+                mshra_addr_q    = dmu_dmem_addr;
+                mshra_funct3_q  = iq_issue_op.base.mem_funct3;
+            } else if replay_claim && replay_is_a {
+                mshra_own_q = 1'b1;
+            } else if replay_hit_fire && replay_is_a {
+                mshra_data_q = dcache_rdata;
+                mshra_done_q = 1'b1;
+            } else if mshra_fill_done {
+                mshra_data_q = dc_fill_rdata;
+                mshra_done_q = 1'b1;
+                mshra_own_q  = 1'b0;
+            } else if mshr_wb_fire && mshr_wb_sel_a {
+                mshra_v_q    = 1'b0;
+                mshra_done_q = 1'b0;
+            }
+            // entry B
+            if mshrb_squashed {
+                mshrb_v_q    = 1'b0;
+                mshrb_done_q = 1'b0;
+                mshrb_own_q  = 1'b0;
+            } else if mshr_capture && !mshr_alloc_a {
+                mshrb_v_q       = 1'b1;
+                mshrb_done_q    = 1'b0;
+                mshrb_own_q     = mshr_capture_own;
+                mshrb_rob_idx_q = iq_iss_rob_idx;
+                mshrb_pdst_q    = iq_iss_rd_pdst;
+                mshrb_has_rd_q  = iq_issue_op.base.has_rd;
+                mshrb_addr_q    = dmu_dmem_addr;
+                mshrb_funct3_q  = iq_issue_op.base.mem_funct3;
+            } else if replay_claim && !replay_is_a {
+                mshrb_own_q = 1'b1;
+            } else if replay_hit_fire && !replay_is_a {
+                mshrb_data_q = dcache_rdata;
+                mshrb_done_q = 1'b1;
+            } else if mshrb_fill_done {
+                mshrb_data_q = dc_fill_rdata;
+                mshrb_done_q = 1'b1;
+                mshrb_own_q  = 1'b0;
+            } else if mshr_wb_fire && !mshr_wb_sel_a {
+                mshrb_v_q    = 1'b0;
+                mshrb_done_q = 1'b0;
+            }
+        }
+    }
+    // Deferred load-data extension on the SELECTED writeback entry: the
+    // captured load is within-dword (cross-dword excluded at capture) with no
+    // forwarded bytes, so this is the single-dword slice of alu_wrap's ld_*
+    // select on the latched fill/hit dword.
+    let mshr_wb_addr  : logic<64>        = if mshr_wb_sel_a ? mshra_addr_q : mshrb_addr_q;
+    let mshr_wb_funct3: logic<3>         = if mshr_wb_sel_a ? mshra_funct3_q : mshrb_funct3_q;
+    let mshr_wb_data64: logic<64>        = if mshr_wb_sel_a ? mshra_data_q : mshrb_data_q;
+    let mshr_wb_pdst  : logic<PRF_INT_W> = if mshr_wb_sel_a ? mshra_pdst_q : mshrb_pdst_q;
+    let mshr_wb_rob   : logic<ROB_IDX_W> = if mshr_wb_sel_a ? mshra_rob_idx_q : mshrb_rob_idx_q;
+    let mshr_wb_has_rd: logic            = if mshr_wb_sel_a ? mshra_has_rd_q : mshrb_has_rd_q;
+    let mshr_shift  : logic<6>  = {mshr_wb_addr[2:0], 3'b000};
+    let mshr_shifted: logic<64> = mshr_wb_data64 >> mshr_shift;
     var mshr_ld_data: logic<64>;
     always_comb {
-        case mshr_funct3_q {
+        case mshr_wb_funct3 {
             3'b000 : mshr_ld_data = {if mshr_shifted[7] ? 56'hff_ffff_ffff_ffff : 56'd0, mshr_shifted[7:0]}; // LB
             3'b001 : mshr_ld_data = {if mshr_shifted[15] ? 48'hffff_ffff_ffff : 48'd0, mshr_shifted[15:0]}; // LH
             3'b010 : mshr_ld_data = {if mshr_shifted[31] ? 32'hffff_ffff : 32'd0, mshr_shifted[31:0]}; // LW
@@ -3707,10 +3851,10 @@ pub module heliodor_core #(
     }
     always_comb {
         mshr_cdb.valid       = mshr_wb_fire;
-        mshr_cdb.has_rd      = mshr_wb_fire && mshr_has_rd_q;
-        mshr_cdb.pdst        = mshr_pdst_q;
+        mshr_cdb.has_rd      = mshr_wb_fire && mshr_wb_has_rd;
+        mshr_cdb.pdst        = mshr_wb_pdst;
         mshr_cdb.data        = mshr_ld_data;
-        mshr_cdb.rob_idx     = mshr_rob_idx_q;
+        mshr_cdb.rob_idx     = mshr_wb_rob;
         mshr_cdb.mispredict  = 1'b0;
         mshr_cdb.redirect_pc = '0;
         mshr_cdb.is_store    = 1'b0;
@@ -3720,9 +3864,9 @@ pub module heliodor_core #(
         // the load in the violation scan. A second record here would be
         // redundant at best.
         mshr_cdb.is_load      = 1'b0;
-        mshr_cdb.store_addr   = mshr_addr_q;
+        mshr_cdb.store_addr   = mshr_wb_addr;
         mshr_cdb.store_data   = '0;
-        mshr_cdb.store_funct3 = mshr_funct3_q;
+        mshr_cdb.store_funct3 = mshr_wb_funct3;
         mshr_cdb.is_csr       = 1'b0;
         mshr_cdb.csr_addr     = '0;
         mshr_cdb.csr_wdata    = '0;
