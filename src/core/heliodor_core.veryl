@@ -979,8 +979,24 @@ pub module heliodor_core #(
     var fpu_cdb: CdbBus;
     // Phase 8 S10.1: deferred MSHR writeback (non-blocking load-miss fill
     // completion). Assigned in the MSHR block after the dcache instance;
-    // muxed onto lane 0 below FPU priority. valid=0 while s10_flip_en=0.
+    // muxed onto lane 0 below FPU priority.
     var mshr_cdb: CdbBus;
+    // Phase 8 S10.3: MSHR capture pulse (forward-ref var, assigned in the MSHR
+    // block) — the issuing load misses, the fill starts, and the load is acked
+    // OUT of the IQ with its writeback deferred to fill completion.
+    var mshr_capture: logic;
+    // S10.3 MSHR state + rob-port feeds (declared here so the rob instance can
+    // consume them; assigned in the MSHR block after the dcache instance).
+    var mshr_v_q       : logic           ;
+    var mshr_done_q    : logic           ;
+    var mshr_rob_idx_q : logic<ROB_IDX_W>;
+    var mshr_pdst_q    : logic<PRF_INT_W>;
+    var mshr_has_rd_q  : logic           ;
+    var mshr_addr_q    : logic<64>       ;
+    var mshr_funct3_q  : logic<3>        ;
+    var mshr_data_q    : logic<64>       ;
+    var mshr_rec_addr  : logic<64>       ; // = the capturing load's PA/VA (bare)
+    var mshr_abort_poison: logic         ; // aborted-fill pulse → rob poison port
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -1419,6 +1435,15 @@ pub module heliodor_core #(
     }
     let amo_issue_lock_ok: logic = !iq_iss_is_amo || amo_read_pending_q;
     assign o_amo_inflight = amo_read_pending_q || rob_has_pending_amo;
+    // Phase 8 S10.3: dcache_stall now gates ONLY ops that read the dcache at
+    // issue (loads incl. FP loads, and AMO/LR/SC value-capture reads). Stores
+    // (AGU-only at issue; their write drains at commit, separately gated),
+    // CSR, MUL/DIV and plain ALU ops issue freely while a miss fills — the
+    // memory pipe is non-blocking for independent work. Loads/AMOs that miss
+    // while the fill is busy simply wait in the IQ (blocking fallback;
+    // miss-under-miss is S10.4).
+    let iss_reads_dmem: logic = iq_issue_op.base.is_load || iq_iss_is_amo;
+    let iss_dc_ok     : logic = !iss_reads_dmem || !dcache_stall;
     // Phase 8 S10.1: lane-0 priority FPU > MSHR (deferred load fill) > ALU.
     // The MSHR holds its completion (mshr_done_q) until the FPU lane is free,
     // and the ALU yields issue/ack the cycle the MSHR writes back (gates below).
@@ -1426,7 +1451,7 @@ pub module heliodor_core #(
         cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : alu_cdb;
     }
     inst u_alu: alu_wrap (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && amo_issue_lock_ok && !load_blocks_on_store,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -1533,7 +1558,11 @@ pub module heliodor_core #(
     // is cached and dcache_stall drops.
     // Phase 8 S10.1: also yield the ack when the MSHR owns the CDB (deferred
     // load-fill writeback), mirroring the FPU-yield term.
-    let iq_issue_ack: logic = iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && !dcache_stall && amo_issue_lock_ok && !load_blocks_on_store;
+    // Phase 8 S10.3: a CAPTURED missing load acks OUT of the IQ on the
+    // fill-start cycle (mshr_capture) even though dcache_stall holds — its
+    // writeback is deferred to the MSHR; u_alu.i_issue_valid stays suppressed
+    // that cycle (iss_dc_ok=0 for a load under stall), so no CDB write happens.
+    let iq_issue_ack: logic = (iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && amo_issue_lock_ok && !load_blocks_on_store) || mshr_capture;
 
     // ============================================================
     // PRF
@@ -2047,6 +2076,13 @@ pub module heliodor_core #(
         i_cdb2_is_load       : alu_cdb2.is_load     ,
         i_cdb2_store_addr    : alu_cdb2.store_addr  ,
         i_cdb2_store_funct3  : alu_cdb2.store_funct3,
+        // Phase 8 S10.3: MSHR capture-time LQ record + aborted-fill poison.
+        i_lq_rec_valid       : mshr_capture         ,
+        i_lq_rec_idx         : iq_iss_rob_idx       ,
+        i_lq_rec_addr        : mshr_rec_addr        ,
+        i_lq_rec_funct3      : iq_issue_op.base.mem_funct3,
+        i_load_poison_v      : mshr_abort_poison    ,
+        i_load_poison_idx    : mshr_rob_idx_q       ,
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
@@ -3496,6 +3532,7 @@ pub module heliodor_core #(
     var dc_miss_valid   : logic    ;
     var dc_fill_complete: logic    ;
     var dc_fill_rdata   : logic<64>;
+    var dc_fill_aborted : logic    ;
     inst u_dcache: dcache (
         clk                                              ,
         rst                                              ,
@@ -3531,6 +3568,8 @@ pub module heliodor_core #(
         o_miss_valid     : dc_miss_valid                 , // S10.1: MSHR capture trigger
         o_fill_complete  : dc_fill_complete              ,
         o_fill_rdata     : dc_fill_rdata                 ,
+        o_fill_aborted   : dc_fill_aborted               , // S10.3: stale fill → poison+replay
+
         o_mem_addr       : dc_mem_addr                   ,
         o_mem_wdata      : dc_mem_wdata                  ,
         i_mem_rdata      : i_dmem_rdata                  ,
@@ -3586,16 +3625,11 @@ pub module heliodor_core #(
     // SMP: an aborted fill (remote inv) never asserts dc_fill_complete, so the
     // load would hang pending — the S10.3 flip must replay it (S9 poison path)
     // or re-arm the fill; until then capture stays off.
-    let s10_flip_en: logic = 1'b0;
-    var mshr_v_q      : logic           ;
-    var mshr_done_q   : logic           ;
-    var mshr_rob_idx_q: logic<ROB_IDX_W>;
-    var mshr_pdst_q   : logic<PRF_INT_W>;
-    var mshr_has_rd_q : logic           ;
-    var mshr_addr_q   : logic<64>       ;
-    var mshr_funct3_q : logic<3>        ;
-    var mshr_data_q   : logic<64>       ;
-    let mshr_capture: logic = s10_flip_en && dc_miss_valid && !mshr_v_q && iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    let s10_flip_en: logic = 1'b1;
+    assign mshr_capture = s10_flip_en && dc_miss_valid && !mshr_v_q && iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_vm_on && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    // rob LQ-record / abort-poison port feeds (vars declared near mshr_cdb).
+    assign mshr_rec_addr     = dmu_dmem_addr;
+    assign mshr_abort_poison = mshr_v_q && !mshr_done_q && dc_fill_aborted;
     let mshr_age     : logic<ROB_IDX_W> = mshr_rob_idx_q - rob_head_idx;
     let s10_early_age: logic<ROB_IDX_W> = early_redir_idx_q - rob_head_idx;
     let mshr_squashed: logic            = mshr_v_q && (redirect_fire || (early_redir_fire_q && (mshr_age >: s10_early_age)));
@@ -3622,7 +3656,12 @@ pub module heliodor_core #(
                 mshr_has_rd_q  = iq_issue_op.base.has_rd;
                 mshr_addr_q    = dmu_dmem_addr;
                 mshr_funct3_q  = iq_issue_op.base.mem_funct3;
-            } else if mshr_v_q && !mshr_done_q && dc_fill_complete {
+            } else if mshr_v_q && !mshr_done_q && (dc_fill_complete || dc_fill_aborted) {
+                // S10.3: an ABORTED fill (remote inv, SMP) also completes the
+                // load — with potentially-stale data — but the same cycle
+                // poisons its ROB entry (mshr_abort_poison below), so it
+                // replays at commit and re-reads fresh data; its speculative
+                // consumers are full-flushed by the replay (the S9 model).
                 mshr_data_q = dc_fill_rdata;
                 mshr_done_q = 1'b1;
             } else if mshr_wb_fire {
@@ -3658,12 +3697,12 @@ pub module heliodor_core #(
         mshr_cdb.mispredict  = 1'b0;
         mshr_cdb.redirect_pc = '0;
         mshr_cdb.is_store    = 1'b0;
-        // is_load + store_addr/store_funct3 feed the S9 Load Queue shadow at
-        // this (deferred) writeback. ⚠S10.3 ordering caveat: during the fill
-        // window the load is NOT yet in the shadow, so an older store resolving
-        // there would miss the violation — re-examine before the flip (record
-        // at capture instead, or block store resolution while the MSHR is busy).
-        mshr_cdb.is_load      = mshr_wb_fire;
+        // S10.3: is_load=0 — the S9 Load Queue shadow is recorded at CAPTURE
+        // (rob i_lq_rec_*, address known at the AGU), NOT at this deferred
+        // writeback, so an older store resolving DURING the fill window sees
+        // the load in the violation scan. A second record here would be
+        // redundant at best.
+        mshr_cdb.is_load      = 1'b0;
         mshr_cdb.store_addr   = mshr_addr_q;
         mshr_cdb.store_data   = '0;
         mshr_cdb.store_funct3 = mshr_funct3_q;
