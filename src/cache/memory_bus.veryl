@@ -133,63 +133,45 @@ pub module memory_bus #(
         // Burst self-holds because dcache keeps i_dmem_req high through an
         // 8-cycle FILL — and during those bursts only one hart usually has
         // a request, so the alternation only triggers when both contend.
-        var last_granted_h0: logic;
-        // M9.4 SMP AMO atomicity: sticky (FCFS) AMO bus-lock holder. The bare
-        // lowest-id priority (amo_lock_0 = i_amo_inflight[0]) let hart 0 preempt
-        // hart 1 mid-RMW, losing a concurrent atomic update — the same defect
-        // fixed in gen_n4 (see that note). N=2 only manifested it rarely (hart 0
-        // is always lowest so only hart 1 is preemptable, and the 2-hart rendezvous
-        // tends to serialize), but it is still a real lost-update hole. Once a hart
-        // holds the lock, keep it until ITS amo_inflight drops, then re-arbitrate.
-        var amo_holder_q    : logic; // 0 => hart0 holds, 1 => hart1 holds
-        var amo_held_q      : logic;
-        let amo_any_2       : logic = i_amo_inflight[0] || i_amo_inflight[1];
-        let amo_lowest_2    : logic = !i_amo_inflight[0]; // 0 if hart0 inflight, else hart1
+        // M9.4 SMP AMO atomicity + S15 FAIRNESS (mirrors gen_n4): the holder
+        // keeps the lock until ITS amo_inflight drops (no mid-RMW preemption);
+        // ACQUISITION goes through the round-robin, so an AMO-dense hart
+        // cannot re-grab the lock back-to-back and starve the other hart's
+        // plain requests.
+        var last_granted_h0: logic; // 1 => hart0 was served last
+        var amo_holder_q   : logic; // 0 => hart0 holds, 1 => hart1 holds
+        var amo_held_q     : logic;
         let amo_hold_valid_2: logic = amo_held_q && (if amo_holder_q ? i_amo_inflight[1] : i_amo_inflight[0]);
-        let amo_holder_2    : logic = if amo_hold_valid_2 ? amo_holder_q : amo_lowest_2;
-        let amo_lock_any_2  : logic = amo_hold_valid_2 || amo_any_2;
-        let amo_lock_0      : logic = amo_lock_any_2 && !amo_holder_2;
-        let amo_lock_1      : logic = amo_lock_any_2 && amo_holder_2;
-        let both_req        : logic = i_dmem_req[0] && i_dmem_req[1];
-        let dmem_grant_h0  : logic = if amo_lock_0 ?
-            1'b1
-        : if amo_lock_1 ?
-            1'b0
-        : if both_req ?
-            !last_granted_h0
-        :
-            i_dmem_req[0]
-        ;
-        let dmem_grant_h1  : logic = if amo_lock_0 ?
-            1'b0
-        : if amo_lock_1 ?
-            1'b1
-        : if both_req ?
-            last_granted_h0
-        :
-            !i_dmem_req[0] && i_dmem_req[1]
-        ;
+        let want0           : logic = i_dmem_req[0] || i_amo_inflight[0];
+        let want1           : logic = i_dmem_req[1] || i_amo_inflight[1];
+        let any_want        : logic = want0 || want1;
+        // Round-robin winner (1 = hart1): alternate when both want the bus.
+        let rr_idx_2        : logic = if want0 && want1 ? last_granted_h0 : want1;
+        let amo_acquire_2   : logic = !amo_hold_valid_2 && any_want && (if rr_idx_2 ? i_amo_inflight[1] : i_amo_inflight[0]);
+        let gsel_h1         : logic = if amo_hold_valid_2 ? amo_holder_q : rr_idx_2;
+        let gvalid_2        : logic = amo_hold_valid_2 || any_want;
+        let dmem_grant_h0   : logic = gvalid_2 && !gsel_h1;
+        let dmem_grant_h1   : logic = gvalid_2 && gsel_h1;
         assign o_dmem_grant[0] = dmem_grant_h0 && i_dmem_req[0];
         assign o_dmem_grant[1] = dmem_grant_h1 && i_dmem_req[1];
 
         always_ff (clk, rst) {
             if_reset {
                 last_granted_h0 = 1'b0;
-            } else if dmem_grant_h0 && i_dmem_req[0] {
-                last_granted_h0 = 1'b1;
-            } else if dmem_grant_h1 && i_dmem_req[1] {
-                last_granted_h0 = 1'b0;
+            } else if !amo_hold_valid_2 && any_want {
+                last_granted_h0 = !rr_idx_2;
             }
         }
 
-        // M9.4 SMP: register the sticky AMO holder (see note above).
         always_ff (clk, rst) {
             if_reset {
                 amo_held_q   = 1'b0;
                 amo_holder_q = 1'b0;
             } else {
-                amo_held_q   = amo_lock_any_2;
-                amo_holder_q = amo_holder_2;
+                amo_held_q = amo_hold_valid_2 || amo_acquire_2;
+                if amo_acquire_2 {
+                    amo_holder_q = rr_idx_2;
+                }
             }
         }
 
@@ -275,52 +257,28 @@ pub module memory_bus #(
         }
 
         // ---- DMEM arbitration ----
-        // AMO lock — lowest-id wins ties (effectively unreachable in Linux
-        // SMP, but kept for safety so amo_lock is a deterministic function
-        // of i_amo_inflight).
-        var amo_found_n4: logic    [4];
-        var amo_idx_n4  : logic<2> [4];
-        for h in 0..4 :gen_amo_n4 {
-            if h == 0 :gen_first {
-                assign amo_found_n4[h] = i_amo_inflight[h];
-                assign amo_idx_n4[h]   = 2'd0;
-            } else :gen_rest {
-                assign amo_found_n4[h] = amo_found_n4[h - 1] || i_amo_inflight[h];
-                assign amo_idx_n4[h]   = if amo_found_n4[h - 1] ? amo_idx_n4[h - 1] : (h as 2);
-            }
-        }
-        // M9.4 SMP AMO atomicity: make the AMO bus-lock holder STICKY (FCFS),
-        // not lowest-id-recomputed-every-cycle. The bare priority encoder above
-        // would let a LOWER-id hart preempt a HIGHER-id hart mid-RMW: hart H reads
-        // the counter under the lock (forced-miss fill) and is waiting to write at
-        // commit (still asserting amo_inflight via rob_has_pending_amo), then a
-        // lower-id hart L asserts amo_inflight → amo_holder switches to L the same
-        // cycle → L reads the SAME pre-write DRAM value → both write V-1 and one
-        // decrement is LOST. The N=4 stop_machine ack-counter then never reaches its
-        // "last acker" (old==1) condition and all harts spin forever. Fix: once a
-        // hart becomes the holder, KEEP it until ITS amo_inflight drops (read→write
-        // done), then re-arbitrate to the next lowest-id. amo_holder_q/amo_held_q
-        // are registered, so no comb loop forms (grant → dcache → core o_amo_inflight
-        // is registered in the core). The force-miss fill (560f746) keeps each read
-        // DRAM-coherent; this sticky lock keeps the two RMW windows from overlapping.
+        // M9.4 SMP AMO atomicity + S15 FAIRNESS. Once a hart holds the AMO
+        // bus lock it KEEPS it until ITS amo_inflight drops (read -> commit
+        // write under one tenure; prevents the M9.4 mid-RMW preemption
+        // lost-update). ACQUISITION, however, goes through the same
+        // round-robin as plain requests: the old scheme (any inflight =>
+        // lock NOW, lowest id wins) let two harts running AMO-dense loops
+        // trade the lock seamlessly (re-acquired the same cycle the previous
+        // holder released) and starve every other hart's plain request
+        // FOREVER - observed as the N=4 post-S15 boot hang: two harts spin
+        // in AMO loops waiting on a flag that the bus-starved other harts
+        // can never write. Now a hart with amo_inflight gets the lock only
+        // when the rotation reaches it, so each RMW tenure is bounded and
+        // every requester is served. amo_holder_q/amo_held_q stay
+        // registered, so no comb loop forms (grant -> dcache -> core
+        // o_amo_inflight is registered in the core).
         var amo_holder_q  : logic<2>;
         var amo_held_q    : logic   ;
-        let amo_any_n4    : logic    = amo_found_n4[3];
-        let amo_lowest_n4 : logic<2> = amo_idx_n4[3];
         let amo_hold_valid: logic    = amo_held_q && i_amo_inflight[amo_holder_q];
-        let amo_lock_n4   : logic    = amo_hold_valid || amo_any_n4;
-        let amo_holder_n4 : logic<2> = if amo_hold_valid ? amo_holder_q : amo_lowest_n4;
-        always_ff (clk, rst) {
-            if_reset {
-                amo_held_q   = 1'b0;
-                amo_holder_q = 2'd0;
-            } else {
-                amo_held_q   = amo_lock_n4;
-                amo_holder_q = amo_holder_n4;
-            }
-        }
 
-        // Round-robin DRAM grant when no AMO holder.
+        // Round-robin over "wants the bus" = a live dcache request OR an AMO
+        // RMW window asking for the lock (its forced-miss read request
+        // follows within a couple of cycles).
         var last_granted_dmem_idx: logic<2>    ;
         var cand_dmem            : logic<2> [4];
         for p in 0..4 :gen_cand_dmem {
@@ -330,27 +288,44 @@ pub module memory_bus #(
         var sel_idx_dmem  : logic<2> [4];
         for p in 0..4 :gen_sel_dmem {
             if p == 0 :gen_first {
-                assign sel_found_dmem[p] = i_dmem_req[cand_dmem[p]];
+                assign sel_found_dmem[p] = i_dmem_req[cand_dmem[p]] || i_amo_inflight[cand_dmem[p]];
                 assign sel_idx_dmem[p]   = cand_dmem[p];
             } else :gen_rest {
-                assign sel_found_dmem[p] = sel_found_dmem[p - 1] || i_dmem_req[cand_dmem[p]];
+                assign sel_found_dmem[p] = sel_found_dmem[p - 1] || i_dmem_req[cand_dmem[p]] || i_amo_inflight[cand_dmem[p]];
                 assign sel_idx_dmem[p]   = if sel_found_dmem[p - 1] ? sel_idx_dmem[p - 1] : cand_dmem[p];
             }
         }
-        let dmem_grant_valid_n4: logic    = if amo_lock_n4 ? 1'b1 : sel_found_dmem[3];
-        let dmem_grant_idx_n4  : logic<2> = if amo_lock_n4 ? amo_holder_n4 : sel_idx_dmem[3];
+        let rr_found_n4   : logic    = sel_found_dmem[3];
+        let rr_idx_n4     : logic<2> = sel_idx_dmem[3];
+        let amo_acquire_n4: logic    = !amo_hold_valid && rr_found_n4 && i_amo_inflight[rr_idx_n4];
+        let dmem_grant_valid_n4: logic    = if amo_hold_valid ? 1'b1 : rr_found_n4;
+        let dmem_grant_idx_n4  : logic<2> = if amo_hold_valid ? amo_holder_q : rr_idx_n4;
 
         always_ff (clk, rst) {
             if_reset {
+                amo_held_q   = 1'b0;
+                amo_holder_q = 2'd0;
+            } else {
+                amo_held_q = amo_hold_valid || amo_acquire_n4;
+                if amo_acquire_n4 {
+                    amo_holder_q = rr_idx_n4;
+                }
+            }
+        }
+        always_ff (clk, rst) {
+            if_reset {
                 last_granted_dmem_idx = 2'd3;
-            } else if dmem_grant_valid_n4 && !amo_lock_n4 {
-                last_granted_dmem_idx = dmem_grant_idx_n4;
+            } else if !amo_hold_valid && rr_found_n4 {
+                // Advance the rotation past the winner - including a lock
+                // acquisition, so after the tenure the NEXT hart is served.
+                last_granted_dmem_idx = rr_idx_n4;
             }
         }
 
         for h in 0..4 :gen_dgrant_n4 {
             assign o_dmem_grant[h] = dmem_grant_valid_n4 && (dmem_grant_idx_n4 == (h as 2)) && i_dmem_req[h];
         }
+
         assign o_dmem_addr      = i_dmem_addr[dmem_grant_idx_n4];
         assign o_dmem_wdata     = i_dmem_wdata[dmem_grant_idx_n4];
         assign o_dmem_wstrb     = i_dmem_wstrb[dmem_grant_idx_n4];
