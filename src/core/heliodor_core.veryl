@@ -3167,8 +3167,9 @@ pub module heliodor_core #(
             if cov && (!sf7_v || age_i >: sf7_age) { sf7_v = 1'b1; sf7_age = age_i; sf7_b = byt[7:0]; }
         } }
     }
-    assign stld_fwd_data = {sf7_b, sf6_b, sf5_b, sf4_b, sf3_b, sf2_b, sf1_b, sf0_b};
-    assign stld_fwd_mask = {sf7_v, sf6_v, sf5_v, sf4_v, sf3_v, sf2_v, sf1_v, sf0_v};
+    // S27: stld_fwd_data/mask are now composed AFTER the committed-store-
+    // buffer forward layer (near the sb FIFO below): ROB bytes win, sb bytes
+    // fill the rest.
 
     // ============================================================
     // Phase 8 S5.2: 2nd store-to-load forward byte-network for the slot-1
@@ -3275,8 +3276,7 @@ pub module heliodor_core #(
             if cov && (!sg7_v || age_i >: sg7_age) { sg7_v = 1'b1; sg7_age = age_i; sg7_b = byt[7:0]; }
         } }
     }
-    assign stld_fwd_data2 = {sg7_b, sg6_b, sg5_b, sg4_b, sg3_b, sg2_b, sg1_b, sg0_b};
-    assign stld_fwd_mask2 = {sg7_v, sg6_v, sg5_v, sg4_v, sg3_v, sg2_v, sg1_v, sg0_v};
+    // S27: stld_fwd_data2/mask2 composed after the sb forward layer (below).
 
     // ============================================================
     // M5.A LR/SC reservation (single-hart, simplest).
@@ -3608,7 +3608,18 @@ pub module heliodor_core #(
     // RTL: with the precise gates here plus the MSHR sb-overlap poison, both
     // the fixed native sim and a Verilator cross-check boot N1/N2/N4 Linux
     // with byte-identical commit streams (N2 -4.4% / N1 -1.5% cycles).
-    assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_is_load && sb_ld_ovl)
+    // S27: a plain LOAD no longer blocks on a buffered-store overlap — the
+    // sb forward layer (sbf*/sbg*, near the sb FIFO) supplies the pending
+    // bytes on the data path instead. The overlap scan still gates:
+    //  - an AMO/LR read (issue_amo_read): its RMW value must come from
+    //    MEMORY after the drain (AMOs are excluded from the forward nets);
+    //  - a VM load whose 8-byte window crosses a page boundary: the forward
+    //    layer compares PHYSICAL addresses byte-by-byte as pa+p, which is
+    //    wrong past a page edge — hold it the old way until the buffer
+    //    empties (page-tail misaligned loads are vanishingly rare).
+    let sb_ld_pg_edge: logic = agu_addr_iss[11:3] == 9'h1ff && agu_addr_iss[2:0] != 3'd0;
+    assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && sb_ld_ovl)
+        || (issue_is_load && !issue_amo_read && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
         || (issue_is_load && sb_cnt >= 4'd3)
         || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])));
     // Phase 8 S10.5: !replay_q — no NEW dmem-MMU request while a queued-MSHR
@@ -3863,13 +3874,16 @@ pub module heliodor_core #(
     assign sb_merge_ok = sb_match_v && !(sb_match_idx == 2'd0 && sb_pop);
     assign sb_push     = sb_elig && (sb_merge_ok || !sb_full);
     let sb_alloc: logic = sb_push && !sb_merge_ok;
-    // The issuing load's dword span vs the buffered entries. Compared by 4KB
-    // page offset ([11:3], translation-invariant — the S15 trick) on the AGU
-    // VA, NOT the translated PA: dmu_dmem_addr is combinationally entangled
-    // with i_ren and this term feeds core_dmem_ren (a PA compare closes a
-    // comb loop through the MMU). A page-offset match is a superset of a true
-    // PA overlap, so a false match only HOLDS the load a few cycles (the
-    // buffer does not forward; the entry drains and the load re-issues).
+    // The issuing AMO/LR read's dword span vs the buffered entries (S27:
+    // plain loads now FORWARD from the buffer instead — this scan only gates
+    // AMO reads, whose RMW value must come from memory after the drain).
+    // Compared by 4KB page offset ([11:3], translation-invariant — the S15
+    // trick) on the AGU VA, NOT the translated PA: dmu_dmem_addr is
+    // combinationally entangled with i_ren and this term feeds
+    // core_dmem_ren (a PA compare closes a comb loop through the MMU). A
+    // page-offset match is a superset of a true PA overlap, so a false
+    // match only HOLDS the AMO a few cycles (the entry drains and it
+    // re-issues).
     // dword+1 is checked only when the load actually spans into it
     // (byte offset + size > 8) — an unconditional +1 check doubled the
     // false-hold rate on adjacent-dword store/load pairs.
@@ -3982,6 +3996,318 @@ pub module heliodor_core #(
             sb_head_strb[l] = sb_strb[l];
         }
     }
+
+    // ============================================================
+    // S27: committed-store-buffer FORWARD layer. sb bytes are committed —
+    // older than every ROB-resident store — so a ROB-forward byte (sf*/sg*)
+    // wins per byte, an sb byte fills the rest, and the dcache supplies the
+    // remainder (merged in alu_wrap). The compare uses the load's PHYSICAL
+    // address (sb entries hold PAs): bare PA==VA; under VM the slot-0 load's
+    // TLB-hit translation (dmu_dmem_addr) is combinational on the issue
+    // cycle and feeds ONLY this data path (alu i_fwd), never the issue/ren
+    // gates — no comb loop. On a TLB-miss cycle dmu_dmem_addr is
+    // meaningless, but the load is not acked then (dmem_mmu_busy) and a
+    // polluted mask only suppresses an MSHR capture (conservative). A store
+    // committing THIS cycle (sb_push) is folded in LAST: it is the newest
+    // committed writer of its bytes and may not be in the registered arrays
+    // yet (the ROB net usually still covers it that cycle, but not a VM
+    // alias — the ROB compares VAs, this layer compares PAs).
+    // One always_comb per byte, mirroring the S5.1 ROB nets (fused
+    // accumulators falsely trip the combinational_loop diagnostic).
+    // ============================================================
+    let sbf_pa: logic<64> = if dmem_vm_on ? dmu_dmem_addr : agu_addr_iss;
+    var sbf0_v: logic; var sbf0_b: logic<8>;
+    var sbf1_v: logic; var sbf1_b: logic<8>;
+    var sbf2_v: logic; var sbf2_b: logic<8>;
+    var sbf3_v: logic; var sbf3_b: logic<8>;
+    var sbf4_v: logic; var sbf4_b: logic<8>;
+    var sbf5_v: logic; var sbf5_b: logic<8>;
+    var sbf6_v: logic; var sbf6_b: logic<8>;
+    var sbf7_v: logic; var sbf7_b: logic<8>;
+    always_comb {
+        sbf0_v = 1'b0; sbf0_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd0;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf0_v = 1'b1; sbf0_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf0_v = 1'b1; sbf0_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf1_v = 1'b0; sbf1_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd1;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf1_v = 1'b1; sbf1_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf1_v = 1'b1; sbf1_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf2_v = 1'b0; sbf2_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd2;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf2_v = 1'b1; sbf2_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf2_v = 1'b1; sbf2_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf3_v = 1'b0; sbf3_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd3;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf3_v = 1'b1; sbf3_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf3_v = 1'b1; sbf3_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf4_v = 1'b0; sbf4_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd4;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf4_v = 1'b1; sbf4_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf4_v = 1'b1; sbf4_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf5_v = 1'b0; sbf5_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd5;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf5_v = 1'b1; sbf5_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf5_v = 1'b1; sbf5_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf6_v = 1'b0; sbf6_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd6;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf6_v = 1'b1; sbf6_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf6_v = 1'b1; sbf6_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbf7_v = 1'b0; sbf7_b = 8'd0;
+        if stld_fwd_en {
+            let ba: logic<64> = sbf_pa + 64'd7;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbf7_v = 1'b1; sbf7_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbf7_v = 1'b1; sbf7_b = d[7:0];
+            }
+        }
+    }
+    assign stld_fwd_data = {
+        if sf7_v ? sf7_b : sbf7_b, if sf6_v ? sf6_b : sbf6_b, if sf5_v ? sf5_b : sbf5_b,
+        if sf4_v ? sf4_b : sbf4_b, if sf3_v ? sf3_b : sbf3_b, if sf2_v ? sf2_b : sbf2_b,
+        if sf1_v ? sf1_b : sbf1_b, if sf0_v ? sf0_b : sbf0_b
+    };
+    assign stld_fwd_mask = {
+        sf7_v || sbf7_v, sf6_v || sbf6_v, sf5_v || sbf5_v, sf4_v || sbf4_v,
+        sf3_v || sbf3_v, sf2_v || sbf2_v, sf1_v || sbf1_v, sf0_v || sbf0_v
+    };
+    // Slot-1 twin (bare mode only — ld2_complete requires !dmem_vm_on, so the
+    // PA is the AGU VA and no translation is involved).
+    var sbg0_v: logic; var sbg0_b: logic<8>;
+    var sbg1_v: logic; var sbg1_b: logic<8>;
+    var sbg2_v: logic; var sbg2_b: logic<8>;
+    var sbg3_v: logic; var sbg3_b: logic<8>;
+    var sbg4_v: logic; var sbg4_b: logic<8>;
+    var sbg5_v: logic; var sbg5_b: logic<8>;
+    var sbg6_v: logic; var sbg6_b: logic<8>;
+    var sbg7_v: logic; var sbg7_b: logic<8>;
+    always_comb {
+        sbg0_v = 1'b0; sbg0_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd0;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg0_v = 1'b1; sbg0_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg0_v = 1'b1; sbg0_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg1_v = 1'b0; sbg1_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd1;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg1_v = 1'b1; sbg1_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg1_v = 1'b1; sbg1_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg2_v = 1'b0; sbg2_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd2;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg2_v = 1'b1; sbg2_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg2_v = 1'b1; sbg2_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg3_v = 1'b0; sbg3_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd3;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg3_v = 1'b1; sbg3_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg3_v = 1'b1; sbg3_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg4_v = 1'b0; sbg4_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd4;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg4_v = 1'b1; sbg4_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg4_v = 1'b1; sbg4_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg5_v = 1'b0; sbg5_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd5;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg5_v = 1'b1; sbg5_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg5_v = 1'b1; sbg5_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg6_v = 1'b0; sbg6_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd6;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg6_v = 1'b1; sbg6_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg6_v = 1'b1; sbg6_b = d[7:0];
+            }
+        }
+    }
+    always_comb {
+        sbg7_v = 1'b0; sbg7_b = 8'd0;
+        if stld_fwd_en2 {
+            let ba: logic<64> = agu_addr_iss2 + 64'd7;
+            for i in 0..SB_N {
+                if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
+                    let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
+                    sbg7_v = 1'b1; sbg7_b = d[7:0];
+                }
+            }
+            if sb_push && sb_pa[63:3] == ba[63:3] && st_wstrb[ba[2:0]] {
+                let d: logic<64> = st_wdata >> {ba[2:0], 3'b000};
+                sbg7_v = 1'b1; sbg7_b = d[7:0];
+            }
+        }
+    }
+    assign stld_fwd_data2 = {
+        if sg7_v ? sg7_b : sbg7_b, if sg6_v ? sg6_b : sbg6_b, if sg5_v ? sg5_b : sbg5_b,
+        if sg4_v ? sg4_b : sbg4_b, if sg3_v ? sg3_b : sbg3_b, if sg2_v ? sg2_b : sbg2_b,
+        if sg1_v ? sg1_b : sbg1_b, if sg0_v ? sg0_b : sbg0_b
+    };
+    assign stld_fwd_mask2 = {
+        sg7_v || sbg7_v, sg6_v || sbg6_v, sg5_v || sbg5_v, sg4_v || sbg4_v,
+        sg3_v || sbg3_v, sg2_v || sbg2_v, sg1_v || sbg1_v, sg0_v || sbg0_v
+    };
 
     inst u_dmem_mmu: dmem_mmu (
         clk                          ,
@@ -4216,25 +4542,11 @@ pub module heliodor_core #(
     // fill-safe. Same-address load-load order is naturally kept (if the older
     // load missed this line, the younger can't hit it), and stores never write
     // the arrays mid-fill (IDLE-only write-through + store drain).
-    // S20: hold a slot-1 load whose dword span may overlap a buffered store
-    // (the buffer does not forward; bare mode so PA == agu_addr_iss2).
-    var sb_ld_ovl2: logic;
-    let sb_ld2_dw0: logic<61> = agu_addr_iss2[63:3];
-    let sb_ld2_dw1: logic<61> = agu_addr_iss2[63:3] + 61'd1;
-    always_comb {
-        sb_ld_ovl2 = 1'b0;
-        for i in 0..SB_N {
-            if (i as 4) <: sb_cnt {
-                if sb_line[i] == sb_ld2_dw0[60:3] && sb_lmap[i][sb_ld2_dw0[2:0]] {
-                    sb_ld_ovl2 = 1'b1;
-                }
-                if sb_line[i] == sb_ld2_dw1[60:3] && sb_lmap[i][sb_ld2_dw1[2:0]] {
-                    sb_ld_ovl2 = 1'b1;
-                }
-            }
-        }
-    }
-    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !redirect_fire && !i_dcache_inv_valid && !sb_ld_ovl2;
+    // S27: the S20 buffered-store overlap hold is gone — the slot-1 sb
+    // forward layer (sbg*, merged into stld_fwd_*2) overrides the hit data
+    // with any pending sb bytes, so an overlapping slot-1 load completes
+    // with the correct value (bare mode, PA == agu_addr_iss2).
+    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !redirect_fire && !i_dcache_inv_valid;
     assign issue2_fire = iq_issue_valid2 && (!issue2_is_load || ld2_complete);
 
     // ============================================================
