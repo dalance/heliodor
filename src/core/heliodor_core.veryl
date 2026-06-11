@@ -1169,8 +1169,10 @@ pub module heliodor_core #(
     var mshrb_funct3_q : logic<3>        ;
     var mshrb_data_q   : logic<64>       ;
     var mshr_rec_addr  : logic<64>       ; // = the capturing load's PA/VA (bare)
-    var mshr_abort_poison: logic         ; // aborted-fill pulse → rob poison port
-    var mshr_poison_idx: logic<ROB_IDX_W>; // owner entry's rob idx (abort poison)
+    var mshr_abort_poison: logic         ; // entry-A poison pulse → rob poison port
+    var mshr_poison_idx: logic<ROB_IDX_W>; // entry A's rob idx
+    var mshr_abort_poison2: logic         ; // entry-B poison pulse (S24.1 2nd port)
+    var mshr_poison_idx2: logic<ROB_IDX_W>; // entry B's rob idx
     // S10.4b: replay injection active — a QUEUED entry's address is driven
     // onto the dcache CPU port (no fill in flight). While high, slot-0 dmem
     // readers yield the port (iss_dc_ok), so dc_hit_safe is the REPLAY
@@ -2320,6 +2322,8 @@ pub module heliodor_core #(
         i_lq_rec_funct3      : iq_issue_op.base.mem_funct3,
         i_load_poison_v      : mshr_abort_poison    ,
         i_load_poison_idx    : mshr_poison_idx      ,
+        i_load_poison_v2     : mshr_abort_poison2   ,
+        i_load_poison_idx2   : mshr_poison_idx2     ,
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
@@ -3590,6 +3594,13 @@ pub module heliodor_core #(
     // two still left a reproducing leak), so VM loads are held whenever ANY
     // committed store is still buffered. Bare mode keeps the precise scan.
     // Refining this hold back to a precise gate is a known follow-up.
+    // S24.1 note: the conservative VM hold (the dmem_vm_on && !sb_empty term)
+    // is no longer needed for CORRECTNESS — the "4th leak path" it masked was
+    // a Veryl-sim evaluation artifact, not RTL (Verilator passes N2/N4 boots
+    // with the hold removed and the MSHR sb-overlap poison closing the real
+    // windows, N2 −4.4%). It STAYS until the simulator bug is fixed upstream:
+    // the native sim mis-simulates the hold-removed configuration, and the
+    // regression flow depends on native Linux-boot runs.
     assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_is_load && sb_ld_ovl)
         || (issue_is_load && dmem_vm_on && !sb_empty)
         || (issue_is_load && sb_cnt >= 4'd3)
@@ -4207,9 +4218,34 @@ pub module heliodor_core #(
                 }
             }
         }
+        // S24.1: a store entering the buffer THIS cycle (sb_push) is not in the
+        // registered sb_addr scan yet — an MSHR writeback (or replay hit) firing
+        // this same cycle would return pre-store data unpoisoned (observed on
+        // a Verilator N2 boot: an LD completed 0 from a fill while the committed
+        // store of the same dword pushed into the sb). Fold the pushing entry
+        // in. sb_push fans in from the MMU translate (sb_vm_ok), but every
+        // consumer of these ovl signals is edge-triggered or completion-side,
+        // never the dcache i_ren fan-in, so this closes no comb loop.
+        if sb_push && sb_pa[11:3] == mshra_addr_q[11:3] {
+            sb_mshra_ovl = 1'b1;
+        }
+        if sb_push && sb_pa[11:3] == mshrb_addr_q[11:3] {
+            sb_mshrb_ovl = 1'b1;
+        }
     }
-    assign mshr_abort_poison = ((mshra_v_q && mshra_own_q && !mshra_done_q && (dc_fill_aborted || sb_mshra_ovl)) || (mshrb_v_q && mshrb_own_q && !mshrb_done_q && (dc_fill_aborted || sb_mshrb_ovl)));
-    assign mshr_poison_idx   = if mshra_own_q ? mshra_rob_idx_q : mshrb_rob_idx_q;
+    // S24.1: the sb-overlap arm also poisons a DONE entry (fill data latched,
+    // waiting for a CDB writeback slot). The old form required own_q &&
+    // !done_q, but fill_done clears own_q, so a store buffered during the
+    // done-wait (or pushing the same cycle the writeback fires) retired the
+    // pre-store fill data unpoisoned. A QUEUED (not own, not done) entry needs
+    // no overlap poison: it has no data yet, its replay-hit completion is held
+    // by replay_sb_ovl until the store drains, and a later own-fill goes
+    // through the filling-window arm. Per-entry poison ports: one entry's fill
+    // abort and the other's writeback-cycle overlap can coincide.
+    assign mshr_abort_poison  = mshra_v_q && ((mshra_own_q && !mshra_done_q && (dc_fill_aborted || sb_mshra_ovl)) || (mshra_done_q && sb_mshra_ovl));
+    assign mshr_abort_poison2 = mshrb_v_q && ((mshrb_own_q && !mshrb_done_q && (dc_fill_aborted || sb_mshrb_ovl)) || (mshrb_done_q && sb_mshrb_ovl));
+    assign mshr_poison_idx    = mshra_rob_idx_q;
+    assign mshr_poison_idx2   = mshrb_rob_idx_q;
     // Phase 8 S10.4a: pipe-0 hit-under-miss qualifier (see iss_dc_ok). The
     // forwarded-bytes merge (stld_fwd_*) works on a hit completion exactly as
     // it does outside a fill, so fwd_mask!=0 loads are NOT excluded here (only
