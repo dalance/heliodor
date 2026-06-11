@@ -51,25 +51,37 @@ pub module memory_bus #(
     // silently dropped because the pipeline assumed 1-cycle MMIO.
     o_mmio_grant: output logic [N_HARTS],
 
-    // Phase 5: DRAM bus arbitration (single shared port).
-    // Per-hart dcache request bundles + amo_inflight (priority lock).
-    // When any hart asserts amo_inflight, only that hart wins grants
-    // until amo_inflight drops — gives bus-atomic AMO RMW windows.
-    i_dmem_addr   : input  logic<64> [N_HARTS],
-    i_dmem_wdata  : input  logic<64> [N_HARTS],
-    i_dmem_wstrb  : input  logic<8>  [N_HARTS],
-    i_dmem_wen    : input  logic     [N_HARTS],
-    i_dmem_ren    : input  logic     [N_HARTS],
-    i_dmem_req    : input  logic     [N_HARTS],
+    // Phase 5 / S23: DRAM bus arbitration, now TWO independent channels —
+    // READ (dcache fills / miss reads) and WRITE (write-through stores +
+    // drains) — each with its own per-hart request/grant and rotation.
+    // The downstream DRAM port is still single: READS (fills) keep their
+    // pre-split priority; the SoC computes i_wgrant_ok (= the read channel
+    // does not need DRAM this cycle — L2 read-hit or idle — minus
+    // same-peripheral conflicts) and the WRITE grant is gated on it, so
+    // drains fill only the read channel's free slots.
+    // The AMO lock spans BOTH channels: while a hart holds it, only that
+    // hart is granted on either channel (read the old value, commit the
+    // write, with no remote write in between).
+    i_dmemr_addr  : input  logic<64> [N_HARTS],
+    i_dmemr_ren   : input  logic     [N_HARTS],
+    i_dmemr_req   : input  logic     [N_HARTS],
+    i_dmemw_addr  : input  logic<64> [N_HARTS],
+    i_dmemw_wdata : input  logic<64> [N_HARTS],
+    i_dmemw_wstrb : input  logic<8>  [N_HARTS],
+    i_dmemw_wen   : input  logic     [N_HARTS],
+    i_dmemw_req   : input  logic     [N_HARTS],
     i_amo_inflight: input  logic     [N_HARTS],
-    o_dmem_grant  : output logic     [N_HARTS],
-    o_dmem_addr   : output logic<64>          ,
-    o_dmem_wdata  : output logic<64>          ,
-    o_dmem_wstrb  : output logic<8>           ,
-    o_dmem_wen    : output logic              ,
-    o_dmem_ren    : output logic              ,
-    // Invalidate broadcast: address granted hart wrote, exposed to all harts
-    // as inv pulse for cache coherence.
+    i_wgrant_ok   : input  logic              ,
+    o_dmemr_grant : output logic     [N_HARTS],
+    o_dmemw_grant : output logic     [N_HARTS],
+    o_dmemr_addr  : output logic<64>          ,
+    o_dmemr_ren   : output logic              ,
+    o_dmemw_addr  : output logic<64>          ,
+    o_dmemw_wdata : output logic<64>          ,
+    o_dmemw_wstrb : output logic<8>           ,
+    o_dmemw_wen   : output logic              ,
+    // Invalidate broadcast: address the granted hart wrote (write channel),
+    // exposed to all harts as an inv pulse for cache coherence.
     o_dmem_inv_valid: output logic    ,
     o_dmem_inv_addr : output logic<64>,
 ) {
@@ -127,39 +139,49 @@ pub module memory_bus #(
         assign o_mmio_grant[0] = grant_h0 && active0;
         assign o_mmio_grant[1] = grant_h1 && active1;
 
-        // Phase 5 DRAM arbitration (N=2). amo_inflight gives priority lock
-        // for the holder; otherwise round-robin (track last-granted hart and
-        // give the OTHER one priority next cycle when both request).
-        // Burst self-holds because dcache keeps i_dmem_req high through an
-        // 8-cycle FILL — and during those bursts only one hart usually has
-        // a request, so the alternation only triggers when both contend.
-        // M9.4 SMP AMO atomicity + S15 FAIRNESS (mirrors gen_n4): the holder
-        // keeps the lock until ITS amo_inflight drops (no mid-RMW preemption);
-        // ACQUISITION goes through the round-robin, so an AMO-dense hart
-        // cannot re-grab the lock back-to-back and starve the other hart's
-        // plain requests.
-        var last_granted_h0: logic; // 1 => hart0 was served last
-        var amo_holder_q   : logic; // 0 => hart0 holds, 1 => hart1 holds
-        var amo_held_q     : logic;
+        // Phase 5 / S23 DRAM arbitration (N=2), two channels. Round-robin
+        // per channel; the AMO lock (acquired through the READ rotation —
+        // an AMO RMW starts with its forced-miss read) pins BOTH channels
+        // to the holder until its amo_inflight drops.
+        var last_granted_r_h0: logic; // 1 => hart0 was served last (read ch)
+        var last_granted_w_h0: logic; // 1 => hart0 was served last (write ch)
+        var amo_holder_q     : logic; // 0 => hart0 holds, 1 => hart1 holds
+        var amo_held_q       : logic;
         let amo_hold_valid_2: logic = amo_held_q && (if amo_holder_q ? i_amo_inflight[1] : i_amo_inflight[0]);
-        let want0           : logic = i_dmem_req[0] || i_amo_inflight[0];
-        let want1           : logic = i_dmem_req[1] || i_amo_inflight[1];
-        let any_want        : logic = want0 || want1;
-        // Round-robin winner (1 = hart1): alternate when both want the bus.
-        let rr_idx_2        : logic = if want0 && want1 ? last_granted_h0 : want1;
-        let amo_acquire_2   : logic = !amo_hold_valid_2 && any_want && (if rr_idx_2 ? i_amo_inflight[1] : i_amo_inflight[0]);
-        let gsel_h1         : logic = if amo_hold_valid_2 ? amo_holder_q : rr_idx_2;
-        let gvalid_2        : logic = amo_hold_valid_2 || any_want;
-        let dmem_grant_h0   : logic = gvalid_2 && !gsel_h1;
-        let dmem_grant_h1   : logic = gvalid_2 && gsel_h1;
-        assign o_dmem_grant[0] = dmem_grant_h0 && i_dmem_req[0];
-        assign o_dmem_grant[1] = dmem_grant_h1 && i_dmem_req[1];
+        let wantr0          : logic = i_dmemr_req[0] || i_amo_inflight[0];
+        let wantr1          : logic = i_dmemr_req[1] || i_amo_inflight[1];
+        let any_wantr       : logic = wantr0 || wantr1;
+        let rr_r_idx        : logic = if wantr0 && wantr1 ? last_granted_r_h0 : wantr1;
+        let amo_acquire_2   : logic = !amo_hold_valid_2 && any_wantr && (if rr_r_idx ? i_amo_inflight[1] : i_amo_inflight[0]);
+        let gselr_h1        : logic = if amo_hold_valid_2 ? amo_holder_q : rr_r_idx;
+        let gvalidr_2       : logic = amo_hold_valid_2 || any_wantr;
+        let dmemr_grant_h0  : logic = gvalidr_2 && !gselr_h1;
+        let dmemr_grant_h1  : logic = gvalidr_2 && gselr_h1;
+        assign o_dmemr_grant[0] = dmemr_grant_h0 && i_dmemr_req[0];
+        assign o_dmemr_grant[1] = dmemr_grant_h1 && i_dmemr_req[1];
+
+        let wantw0        : logic = i_dmemw_req[0];
+        let wantw1        : logic = i_dmemw_req[1];
+        let any_wantw     : logic = wantw0 || wantw1;
+        let rr_w_idx      : logic = if wantw0 && wantw1 ? last_granted_w_h0 : wantw1;
+        let gselw_h1      : logic = if amo_hold_valid_2 ? amo_holder_q : rr_w_idx;
+        let gvalidw_2     : logic = amo_hold_valid_2 || any_wantw;
+        let dmemw_grant_h0: logic = gvalidw_2 && !gselw_h1;
+        let dmemw_grant_h1: logic = gvalidw_2 && gselw_h1;
+        assign o_dmemw_grant[0] = dmemw_grant_h0 && i_dmemw_req[0] && i_wgrant_ok;
+        assign o_dmemw_grant[1] = dmemw_grant_h1 && i_dmemw_req[1] && i_wgrant_ok;
 
         always_ff (clk, rst) {
             if_reset {
-                last_granted_h0 = 1'b0;
-            } else if !amo_hold_valid_2 && any_want {
-                last_granted_h0 = !rr_idx_2;
+                last_granted_r_h0 = 1'b0;
+                last_granted_w_h0 = 1'b0;
+            } else {
+                if !amo_hold_valid_2 && any_wantr {
+                    last_granted_r_h0 = !rr_r_idx;
+                }
+                if !amo_hold_valid_2 && any_wantw {
+                    last_granted_w_h0 = !rr_w_idx;
+                }
             }
         }
 
@@ -170,27 +192,26 @@ pub module memory_bus #(
             } else {
                 amo_held_q = amo_hold_valid_2 || amo_acquire_2;
                 if amo_acquire_2 {
-                    amo_holder_q = rr_idx_2;
+                    amo_holder_q = rr_r_idx;
                 }
             }
         }
 
-        // Single-port DRAM mux. When neither hart actually has a live
-        // transaction (just amo_lock holding), o_dmem_wen/o_dmem_ren are 0
-        // because the granted hart's i_dmem_wen/i_dmem_ren are 0.
-        assign o_dmem_addr  = if dmem_grant_h0 ? i_dmem_addr[0] : i_dmem_addr[1];
-        assign o_dmem_wdata = if dmem_grant_h0 ? i_dmem_wdata[0] : i_dmem_wdata[1];
-        assign o_dmem_wstrb = if dmem_grant_h0 ? i_dmem_wstrb[0] : i_dmem_wstrb[1];
-        assign o_dmem_wen   = (dmem_grant_h0 && i_dmem_wen[0] && i_dmem_req[0])
-            || (dmem_grant_h1 && i_dmem_wen[1] && i_dmem_req[1]);
-        assign o_dmem_ren   = (dmem_grant_h0 && i_dmem_ren[0] && i_dmem_req[0])
-            || (dmem_grant_h1 && i_dmem_ren[1] && i_dmem_req[1]);
+        // Per-channel downstream muxes.
+        assign o_dmemr_addr = if dmemr_grant_h0 ? i_dmemr_addr[0] : i_dmemr_addr[1];
+        assign o_dmemr_ren  = ((dmemr_grant_h0 && i_dmemr_ren[0] && i_dmemr_req[0])
+            || (dmemr_grant_h1 && i_dmemr_ren[1] && i_dmemr_req[1]));
+        assign o_dmemw_addr  = if dmemw_grant_h0 ? i_dmemw_addr[0] : i_dmemw_addr[1];
+        assign o_dmemw_wdata = if dmemw_grant_h0 ? i_dmemw_wdata[0] : i_dmemw_wdata[1];
+        assign o_dmemw_wstrb = if dmemw_grant_h0 ? i_dmemw_wstrb[0] : i_dmemw_wstrb[1];
+        assign o_dmemw_wen   = ((dmemw_grant_h0 && i_dmemw_wen[0] && i_dmemw_req[0])
+            || (dmemw_grant_h1 && i_dmemw_wen[1] && i_dmemw_req[1])) && i_wgrant_ok;
 
         // Invalidate broadcast: any cycle the granted hart writes DRAM,
         // pulse invalidate so the other hart drops the line.
-        assign o_dmem_inv_valid = o_dmem_wen;
-        assign o_dmem_inv_addr  = o_dmem_addr;
-    } else if N_HARTS == 4 :gen_n4 {
+        assign o_dmem_inv_valid = o_dmemw_wen;
+        assign o_dmem_inv_addr  = o_dmemw_addr;
+        } else if N_HARTS == 4 :gen_n4 {
         // 4-way round-robin (Phase 6.A.1). Same fairness shape as gen_n2 —
         // track last-granted hart index, give the OTHER three priority
         // through a priority encoder over rotated candidates. AMO lock has
@@ -256,50 +277,61 @@ pub module memory_bus #(
             assign o_mmio_grant[h] = grant_valid_mmio && (grant_idx_mmio == (h as 2)) && active_mmio[h];
         }
 
-        // ---- DMEM arbitration ----
-        // M9.4 SMP AMO atomicity + S15 FAIRNESS. Once a hart holds the AMO
-        // bus lock it KEEPS it until ITS amo_inflight drops (read -> commit
-        // write under one tenure; prevents the M9.4 mid-RMW preemption
-        // lost-update). ACQUISITION, however, goes through the same
-        // round-robin as plain requests: the old scheme (any inflight =>
-        // lock NOW, lowest id wins) let two harts running AMO-dense loops
-        // trade the lock seamlessly (re-acquired the same cycle the previous
-        // holder released) and starve every other hart's plain request
-        // FOREVER - observed as the N=4 post-S15 boot hang: two harts spin
-        // in AMO loops waiting on a flag that the bus-starved other harts
-        // can never write. Now a hart with amo_inflight gets the lock only
-        // when the rotation reaches it, so each RMW tenure is bounded and
-        // every requester is served. amo_holder_q/amo_held_q stay
-        // registered, so no comb loop forms (grant -> dcache -> core
-        // o_amo_inflight is registered in the core).
+        // ---- DMEM arbitration (S23: two channels) ----
+        // M9.4 SMP AMO atomicity + S15 FAIRNESS, extended to the split bus.
+        // The lock is ACQUIRED through the read-channel rotation (an AMO RMW
+        // starts with its forced-miss read) and, while held, pins BOTH
+        // channels to the holder (no remote write can slip into the RMW
+        // window through the independent write channel).
         var amo_holder_q  : logic<2>;
         var amo_held_q    : logic   ;
         let amo_hold_valid: logic    = amo_held_q && i_amo_inflight[amo_holder_q];
 
-        // Round-robin over "wants the bus" = a live dcache request OR an AMO
-        // RMW window asking for the lock (its forced-miss read request
-        // follows within a couple of cycles).
-        var last_granted_dmem_idx: logic<2>    ;
-        var cand_dmem            : logic<2> [4];
-        for p in 0..4 :gen_cand_dmem {
-            assign cand_dmem[p] = last_granted_dmem_idx + (p as 2) + 2'd1;
+        // Read-channel rotation over "wants the read channel" = a live fill /
+        // miss read OR an AMO RMW window asking for the lock.
+        var last_granted_r_idx: logic<2>    ;
+        var cand_r            : logic<2> [4];
+        for p in 0..4 :gen_cand_r {
+            assign cand_r[p] = last_granted_r_idx + (p as 2) + 2'd1;
         }
-        var sel_found_dmem: logic    [4];
-        var sel_idx_dmem  : logic<2> [4];
-        for p in 0..4 :gen_sel_dmem {
+        var sel_found_r: logic    [4];
+        var sel_idx_r  : logic<2> [4];
+        for p in 0..4 :gen_sel_r {
             if p == 0 :gen_first {
-                assign sel_found_dmem[p] = i_dmem_req[cand_dmem[p]] || i_amo_inflight[cand_dmem[p]];
-                assign sel_idx_dmem[p]   = cand_dmem[p];
+                assign sel_found_r[p] = i_dmemr_req[cand_r[p]] || i_amo_inflight[cand_r[p]];
+                assign sel_idx_r[p]   = cand_r[p];
             } else :gen_rest {
-                assign sel_found_dmem[p] = sel_found_dmem[p - 1] || i_dmem_req[cand_dmem[p]] || i_amo_inflight[cand_dmem[p]];
-                assign sel_idx_dmem[p]   = if sel_found_dmem[p - 1] ? sel_idx_dmem[p - 1] : cand_dmem[p];
+                assign sel_found_r[p] = sel_found_r[p - 1] || i_dmemr_req[cand_r[p]] || i_amo_inflight[cand_r[p]];
+                assign sel_idx_r[p]   = if sel_found_r[p - 1] ? sel_idx_r[p - 1] : cand_r[p];
             }
         }
-        let rr_found_n4   : logic    = sel_found_dmem[3];
-        let rr_idx_n4     : logic<2> = sel_idx_dmem[3];
-        let amo_acquire_n4: logic    = !amo_hold_valid && rr_found_n4 && i_amo_inflight[rr_idx_n4];
-        let dmem_grant_valid_n4: logic    = if amo_hold_valid ? 1'b1 : rr_found_n4;
-        let dmem_grant_idx_n4  : logic<2> = if amo_hold_valid ? amo_holder_q : rr_idx_n4;
+        let rr_r_found    : logic    = sel_found_r[3];
+        let rr_r_idx_n4   : logic<2> = sel_idx_r[3];
+        let amo_acquire_n4: logic    = !amo_hold_valid && rr_r_found && i_amo_inflight[rr_r_idx_n4];
+        let dmemr_grant_valid: logic    = if amo_hold_valid ? 1'b1 : rr_r_found;
+        let dmemr_grant_idx  : logic<2> = if amo_hold_valid ? amo_holder_q : rr_r_idx_n4;
+
+        // Write-channel rotation over live write requests.
+        var last_granted_w_idx: logic<2>    ;
+        var cand_w            : logic<2> [4];
+        for p in 0..4 :gen_cand_w {
+            assign cand_w[p] = last_granted_w_idx + (p as 2) + 2'd1;
+        }
+        var sel_found_w: logic    [4];
+        var sel_idx_w  : logic<2> [4];
+        for p in 0..4 :gen_sel_w {
+            if p == 0 :gen_first {
+                assign sel_found_w[p] = i_dmemw_req[cand_w[p]];
+                assign sel_idx_w[p]   = cand_w[p];
+            } else :gen_rest {
+                assign sel_found_w[p] = sel_found_w[p - 1] || i_dmemw_req[cand_w[p]];
+                assign sel_idx_w[p]   = if sel_found_w[p - 1] ? sel_idx_w[p - 1] : cand_w[p];
+            }
+        }
+        let rr_w_found       : logic    = sel_found_w[3];
+        let rr_w_idx_n4      : logic<2> = sel_idx_w[3];
+        let dmemw_grant_valid: logic    = if amo_hold_valid ? 1'b1 : rr_w_found;
+        let dmemw_grant_idx  : logic<2> = if amo_hold_valid ? amo_holder_q : rr_w_idx_n4;
 
         always_ff (clk, rst) {
             if_reset {
@@ -308,31 +340,41 @@ pub module memory_bus #(
             } else {
                 amo_held_q = amo_hold_valid || amo_acquire_n4;
                 if amo_acquire_n4 {
-                    amo_holder_q = rr_idx_n4;
+                    amo_holder_q = rr_r_idx_n4;
                 }
             }
         }
         always_ff (clk, rst) {
             if_reset {
-                last_granted_dmem_idx = 2'd3;
-            } else if !amo_hold_valid && rr_found_n4 {
-                // Advance the rotation past the winner - including a lock
-                // acquisition, so after the tenure the NEXT hart is served.
-                last_granted_dmem_idx = rr_idx_n4;
+                last_granted_r_idx = 2'd3;
+                last_granted_w_idx = 2'd3;
+            } else {
+                if !amo_hold_valid && rr_r_found {
+                    // Advance the rotation past the winner - including a lock
+                    // acquisition, so after the tenure the NEXT hart is served.
+                    last_granted_r_idx = rr_r_idx_n4;
+                }
+                if !amo_hold_valid && rr_w_found {
+                    last_granted_w_idx = rr_w_idx_n4;
+                }
             }
         }
 
-        for h in 0..4 :gen_dgrant_n4 {
-            assign o_dmem_grant[h] = dmem_grant_valid_n4 && (dmem_grant_idx_n4 == (h as 2)) && i_dmem_req[h];
+        for h in 0..4 :gen_rgrant_n4 {
+            assign o_dmemr_grant[h] = dmemr_grant_valid && (dmemr_grant_idx == (h as 2)) && i_dmemr_req[h];
+        }
+        for h in 0..4 :gen_wgrant_n4 {
+            assign o_dmemw_grant[h] = dmemw_grant_valid && (dmemw_grant_idx == (h as 2)) && i_dmemw_req[h] && i_wgrant_ok;
         }
 
-        assign o_dmem_addr      = i_dmem_addr[dmem_grant_idx_n4];
-        assign o_dmem_wdata     = i_dmem_wdata[dmem_grant_idx_n4];
-        assign o_dmem_wstrb     = i_dmem_wstrb[dmem_grant_idx_n4];
-        assign o_dmem_wen       = dmem_grant_valid_n4 && i_dmem_wen[dmem_grant_idx_n4] && i_dmem_req[dmem_grant_idx_n4];
-        assign o_dmem_ren       = dmem_grant_valid_n4 && i_dmem_ren[dmem_grant_idx_n4] && i_dmem_req[dmem_grant_idx_n4];
-        assign o_dmem_inv_valid = o_dmem_wen;
-        assign o_dmem_inv_addr  = o_dmem_addr;
+        assign o_dmemr_addr     = i_dmemr_addr[dmemr_grant_idx];
+        assign o_dmemr_ren      = dmemr_grant_valid && i_dmemr_ren[dmemr_grant_idx] && i_dmemr_req[dmemr_grant_idx];
+        assign o_dmemw_addr     = i_dmemw_addr[dmemw_grant_idx];
+        assign o_dmemw_wdata    = i_dmemw_wdata[dmemw_grant_idx];
+        assign o_dmemw_wstrb    = i_dmemw_wstrb[dmemw_grant_idx];
+        assign o_dmemw_wen      = dmemw_grant_valid && i_dmemw_wen[dmemw_grant_idx] && i_dmemw_req[dmemw_grant_idx] && i_wgrant_ok;
+        assign o_dmem_inv_valid = o_dmemw_wen;
+        assign o_dmem_inv_addr  = o_dmemw_addr;
     } else :gen_arb {
         // Generic N=1 / N>=5 path (lowest-id-wins, no fairness).
         var active: logic [N_HARTS];
@@ -377,8 +419,8 @@ pub module memory_bus #(
             assign o_mmio_grant[h] = grant_valid && (grant_idx == (h as 3)) && active[h];
         }
 
-        // Phase 5 DRAM arbitration N>=3 (untested; future N=4 use).
-        // amo_inflight wins; otherwise lowest-id requesting hart.
+        // Phase 5 / S23 DRAM arbitration, generic N (N=1 and N>=5):
+        // lowest-id per channel; the AMO lock pins both channels.
         var amo_found : logic    [N_HARTS];
         var amo_idx_st: logic<3> [N_HARTS];
         for h in 0..N_HARTS :gen_amo {
@@ -393,29 +435,47 @@ pub module memory_bus #(
         let amo_lock  : logic    = amo_found[N_HARTS - 1];
         let amo_holder: logic<3> = amo_idx_st[N_HARTS - 1];
 
-        var dreq_found : logic    [N_HARTS];
-        var dreq_idx_st: logic<3> [N_HARTS];
-        for h in 0..N_HARTS :gen_dreq {
+        var rreq_found : logic    [N_HARTS];
+        var rreq_idx_st: logic<3> [N_HARTS];
+        for h in 0..N_HARTS :gen_rreq {
             if h == 0 :gen_first {
-                assign dreq_found[h]  = i_dmem_req[h];
-                assign dreq_idx_st[h] = 3'd0;
+                assign rreq_found[h]  = i_dmemr_req[h];
+                assign rreq_idx_st[h] = 3'd0;
             } else :gen_rest {
-                assign dreq_found[h]  = dreq_found[h - 1] || i_dmem_req[h];
-                assign dreq_idx_st[h] = if dreq_found[h - 1] ? dreq_idx_st[h - 1] : h as 3;
+                assign rreq_found[h]  = rreq_found[h - 1] || i_dmemr_req[h];
+                assign rreq_idx_st[h] = if rreq_found[h - 1] ? rreq_idx_st[h - 1] : h as 3;
             }
         }
-        let dmem_grant_valid: logic    = if amo_lock ? 1'b1 : dreq_found[N_HARTS - 1];
-        let dmem_grant_idx  : logic<3> = if amo_lock ? amo_holder : dreq_idx_st[N_HARTS - 1];
+        let dmemr_grant_valid: logic    = if amo_lock ? 1'b1 : rreq_found[N_HARTS - 1];
+        let dmemr_grant_idx  : logic<3> = if amo_lock ? amo_holder : rreq_idx_st[N_HARTS - 1];
 
-        for h in 0..N_HARTS :gen_dgrant {
-            assign o_dmem_grant[h] = dmem_grant_valid && (h == dmem_grant_idx) && i_dmem_req[h];
+        var wreq_found : logic    [N_HARTS];
+        var wreq_idx_st: logic<3> [N_HARTS];
+        for h in 0..N_HARTS :gen_wreq {
+            if h == 0 :gen_first {
+                assign wreq_found[h]  = i_dmemw_req[h];
+                assign wreq_idx_st[h] = 3'd0;
+            } else :gen_rest {
+                assign wreq_found[h]  = wreq_found[h - 1] || i_dmemw_req[h];
+                assign wreq_idx_st[h] = if wreq_found[h - 1] ? wreq_idx_st[h - 1] : h as 3;
+            }
         }
-        assign o_dmem_addr      = i_dmem_addr[dmem_grant_idx];
-        assign o_dmem_wdata     = i_dmem_wdata[dmem_grant_idx];
-        assign o_dmem_wstrb     = i_dmem_wstrb[dmem_grant_idx];
-        assign o_dmem_wen       = dmem_grant_valid && i_dmem_wen[dmem_grant_idx] && i_dmem_req[dmem_grant_idx];
-        assign o_dmem_ren       = dmem_grant_valid && i_dmem_ren[dmem_grant_idx] && i_dmem_req[dmem_grant_idx];
-        assign o_dmem_inv_valid = o_dmem_wen;
-        assign o_dmem_inv_addr  = o_dmem_addr;
+        let dmemw_grant_valid: logic    = if amo_lock ? 1'b1 : wreq_found[N_HARTS - 1];
+        let dmemw_grant_idx  : logic<3> = if amo_lock ? amo_holder : wreq_idx_st[N_HARTS - 1];
+
+        for h in 0..N_HARTS :gen_rgrant {
+            assign o_dmemr_grant[h] = dmemr_grant_valid && (h == dmemr_grant_idx) && i_dmemr_req[h];
+        }
+        for h in 0..N_HARTS :gen_wgrant {
+            assign o_dmemw_grant[h] = dmemw_grant_valid && (h == dmemw_grant_idx) && i_dmemw_req[h] && i_wgrant_ok;
+        }
+        assign o_dmemr_addr     = i_dmemr_addr[dmemr_grant_idx];
+        assign o_dmemr_ren      = dmemr_grant_valid && i_dmemr_ren[dmemr_grant_idx] && i_dmemr_req[dmemr_grant_idx];
+        assign o_dmemw_addr     = i_dmemw_addr[dmemw_grant_idx];
+        assign o_dmemw_wdata    = i_dmemw_wdata[dmemw_grant_idx];
+        assign o_dmemw_wstrb    = i_dmemw_wstrb[dmemw_grant_idx];
+        assign o_dmemw_wen      = dmemw_grant_valid && i_dmemw_wen[dmemw_grant_idx] && i_dmemw_req[dmemw_grant_idx] && i_wgrant_ok;
+        assign o_dmem_inv_valid = o_dmemw_wen;
+        assign o_dmem_inv_addr  = o_dmemw_addr;
     }
 }

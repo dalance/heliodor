@@ -113,35 +113,50 @@ pub module heliodor_soc_smp #(
     var c_dmem_wstrb_hi: logic<8>  [N_HARTS];
     var c_dmem_req     : logic     [N_HARTS];
     var c_amo_inflight : logic     [N_HARTS];
+    // S23: per-hart write-channel wires (write-through + store drain).
+    var c_dmemw_addr   : logic<64> [N_HARTS];
+    var c_dmemw_req    : logic     [N_HARTS];
 
     // Per-hart MMIO address decode (mirrors the standalone tb / N=1 SoC).
     var in_dram : logic [N_HARTS];
     var in_clint: logic [N_HARTS];
     var in_uart : logic [N_HARTS];
+    var in_dram_w : logic [N_HARTS];
+    var in_clint_w: logic [N_HARTS];
+    var in_uart_w : logic [N_HARTS];
     for h in 0..N_HARTS :gen_dec {
-        assign in_dram[h]  = c_dmem_addr[h][31];
-        assign in_clint[h] = c_dmem_addr[h][31:24] == 8'h02;
-        assign in_uart[h]  = c_dmem_addr[h][31:28] == 4'h1;
+        assign in_dram[h]    = c_dmem_addr[h][31];
+        assign in_clint[h]   = c_dmem_addr[h][31:24] == 8'h02;
+        assign in_uart[h]    = c_dmem_addr[h][31:28] == 4'h1;
+        // S23: the write channel carries its own address.
+        assign in_dram_w[h]  = c_dmemw_addr[h][31];
+        assign in_clint_w[h] = c_dmemw_addr[h][31:24] == 8'h02;
+        assign in_uart_w[h]  = c_dmemw_addr[h][31:28] == 4'h1;
     }
 
     // Per-hart DRAM request bundle into the memory_bus arbiter. wen/ren/wstrb are
     // gated to DRAM only (MMIO is decoded here, not in the bus); req covers both
     // so the single grant serialises DRAM and MMIO accesses.
-    var bus_in_addr : logic<64> [N_HARTS];
+    var bus_in_raddr: logic<64> [N_HARTS];
+    var bus_in_ren  : logic     [N_HARTS];
+    var bus_in_rreq : logic     [N_HARTS];
+    var bus_in_waddr: logic<64> [N_HARTS];
     var bus_in_wdata: logic<64> [N_HARTS];
     var bus_in_wstrb: logic<8>  [N_HARTS];
     var bus_in_wen  : logic     [N_HARTS];
-    var bus_in_ren  : logic     [N_HARTS];
-    var bus_in_req  : logic     [N_HARTS];
+    var bus_in_wreq : logic     [N_HARTS];
     var bus_in_amo  : logic     [N_HARTS];
-    var bus_dgrant  : logic     [N_HARTS]; // arbiter -> per-hart grant
+    var bus_dgrant  : logic     [N_HARTS]; // arbiter -> per-hart READ grant
+    var bus_wgrant  : logic     [N_HARTS]; // arbiter -> per-hart WRITE grant
     for h in 0..N_HARTS :gen_busin {
-        assign bus_in_addr[h]  = c_dmem_addr[h];
-        assign bus_in_wdata[h] = c_dmem_wdata[h];
-        assign bus_in_wstrb[h] = if in_dram[h] ? c_dmem_wstrb[h] : 8'd0;
-        assign bus_in_wen[h]   = c_dmem_wen[h] && in_dram[h];
+        assign bus_in_raddr[h] = c_dmem_addr[h];
         assign bus_in_ren[h]   = c_dmem_ren[h] && in_dram[h];
-        assign bus_in_req[h]   = c_dmem_req[h];
+        assign bus_in_rreq[h]  = c_dmem_req[h];
+        assign bus_in_waddr[h] = c_dmemw_addr[h];
+        assign bus_in_wdata[h] = c_dmem_wdata[h];
+        assign bus_in_wstrb[h] = if in_dram_w[h] ? c_dmem_wstrb[h] : 8'd0;
+        assign bus_in_wen[h]   = c_dmem_wen[h] && in_dram_w[h];
+        assign bus_in_wreq[h]  = c_dmemw_req[h];
         assign bus_in_amo[h]   = c_amo_inflight[h];
     }
 
@@ -167,12 +182,27 @@ pub module heliodor_soc_smp #(
         assign bus_stall_mem[h]  = 1'b0;
     }
 
-    // memory_bus DRAM arbiter outputs (granted, single downstream port → L2).
-    var bus_dram_addr : logic<64>;
+    // memory_bus DRAM arbiter outputs (S23: per-channel downstream → L2).
+    var bus_dramr_addr: logic<64>;
+    var bus_dramw_addr: logic<64>;
     var bus_dram_wdata: logic<64>;
     var bus_dram_wstrb: logic<8> ;
     var bus_dram_wen  : logic    ;
-    var bus_dram_ren  : logic    ;
+    // S23: write-grant qualification — the downstream DRAM port is single
+    // and reads (fills) keep their pre-split priority. A write proceeds only
+    // when the granted read needs no DRAM cycle (L2 word hit, non-DRAM
+    // target, or no read at all); a write to a peripheral being read the
+    // same cycle is also held (the peripheral has one address port).
+    var l2_rhit_w: logic;
+    var bus_dramr_ren: logic;
+    let w_in_clint: logic = bus_dramw_addr[31:24] == 8'h02;
+    let w_in_uart : logic = bus_dramw_addr[31:28] == 4'h1;
+    var clint_wen_w: logic;
+    var clint_ren_w: logic;
+    var uart_wen_w : logic;
+    var uart_ren_w : logic;
+    let wgrant_ok: logic = !(bus_dramr_ren && !l2_rhit_w)
+        && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart);
     var bus_inv_valid : logic    ;
     var bus_inv_addr  : logic<64>;
 
@@ -200,19 +230,24 @@ pub module heliodor_soc_smp #(
         o_mmio_wen_uart : _             ,
         o_mmio_ren_uart : _             ,
         o_mmio_grant    : _             ,
-        i_dmem_addr     : bus_in_addr   ,
-        i_dmem_wdata    : bus_in_wdata  ,
-        i_dmem_wstrb    : bus_in_wstrb  ,
-        i_dmem_wen      : bus_in_wen    ,
-        i_dmem_ren      : bus_in_ren    ,
-        i_dmem_req      : bus_in_req    ,
+        i_dmemr_addr    : bus_in_raddr  ,
+        i_dmemr_ren     : bus_in_ren    ,
+        i_dmemr_req     : bus_in_rreq   ,
+        i_dmemw_addr    : bus_in_waddr  ,
+        i_dmemw_wdata   : bus_in_wdata  ,
+        i_dmemw_wstrb   : bus_in_wstrb  ,
+        i_dmemw_wen     : bus_in_wen    ,
+        i_dmemw_req     : bus_in_wreq   ,
         i_amo_inflight  : bus_in_amo    ,
-        o_dmem_grant    : bus_dgrant    ,
-        o_dmem_addr     : bus_dram_addr ,
-        o_dmem_wdata    : bus_dram_wdata,
-        o_dmem_wstrb    : bus_dram_wstrb,
-        o_dmem_wen      : bus_dram_wen  ,
-        o_dmem_ren      : bus_dram_ren  ,
+        i_wgrant_ok     : wgrant_ok     ,
+        o_dmemr_grant   : bus_dgrant    ,
+        o_dmemw_grant   : bus_wgrant    ,
+        o_dmemr_addr    : bus_dramr_addr,
+        o_dmemr_ren     : bus_dramr_ren ,
+        o_dmemw_addr    : bus_dramw_addr,
+        o_dmemw_wdata   : bus_dram_wdata,
+        o_dmemw_wstrb   : bus_dram_wstrb,
+        o_dmemw_wen     : bus_dram_wen  ,
         o_dmem_inv_valid: bus_inv_valid ,
         o_dmem_inv_addr : bus_inv_addr  ,
     );
@@ -224,7 +259,7 @@ pub module heliodor_soc_smp #(
     var core_inv_addr : logic<64> [N_HARTS];
     let inv_v: logic = bus_inv_valid && bus_inv_addr[31];
     for h in 0..N_HARTS :gen_inv {
-        assign core_inv_valid[h] = inv_v && !(bus_dgrant[h] && bus_in_wen[h]);
+        assign core_inv_valid[h] = inv_v && !(bus_wgrant[h] && bus_in_wen[h]);
         assign core_inv_addr[h]  = bus_inv_addr;
     }
 
@@ -239,7 +274,7 @@ pub module heliodor_soc_smp #(
         dram_wdata_hi = 64'd0;
         dram_wstrb_hi = 8'd0;
         for h in 0..N_HARTS {
-            if bus_dgrant[h] && in_dram[h] {
+            if bus_wgrant[h] && in_dram_w[h] {
                 l2_wstrb_hi   = c_dmem_wstrb_hi[h];
                 dram_wdata_hi = c_dmem_wdata_hi[h];
                 dram_wstrb_hi = c_dmem_wstrb_hi[h];
@@ -252,13 +287,15 @@ pub module heliodor_soc_smp #(
     inst u_l2: l2cache (
         clk                        ,
         rst                        ,
-        i_addr     : bus_dram_addr ,
+        i_raddr    : bus_dramr_addr,
+        i_ren      : bus_dramr_ren ,
+        o_rdata    : l2_rdata      ,
+        o_rhit     : l2_rhit_w     ,
+        i_waddr    : bus_dramw_addr,
         i_wdata    : bus_dram_wdata,
         i_wstrb    : bus_dram_wstrb,
         i_wstrb_hi : l2_wstrb_hi   ,
         i_wen      : bus_dram_wen  ,
-        i_ren      : bus_dram_ren  ,
-        o_rdata    : l2_rdata      ,
         o_mem_addr : o_dmem_addr   ,
         o_mem_wdata: o_dmem_wdata  ,
         o_mem_wstrb: o_dmem_wstrb  ,
@@ -272,23 +309,19 @@ pub module heliodor_soc_smp #(
     // Shared CLINT / UART driven by the granted core's decoded MMIO access.
     // Enables are an OR-reduction (only the granted core has c_dmem_wen/ren=1);
     // address/wdata come from the bus-muxed granted request.
-    var clint_wen_w: logic;
-    var clint_ren_w: logic;
-    var uart_wen_w : logic;
-    var uart_ren_w : logic;
     always_comb {
         clint_wen_w = 1'b0;
         clint_ren_w = 1'b0;
         uart_wen_w  = 1'b0;
         uart_ren_w  = 1'b0;
         for h in 0..N_HARTS {
-            if c_dmem_wen[h] && in_clint[h] {
+            if c_dmem_wen[h] && in_clint_w[h] {
                 clint_wen_w = 1'b1;
             }
             if c_dmem_ren[h] && in_clint[h] {
                 clint_ren_w = 1'b1;
             }
-            if c_dmem_wen[h] && in_uart[h] {
+            if c_dmem_wen[h] && in_uart_w[h] {
                 uart_wen_w = 1'b1;
             }
             if c_dmem_ren[h] && in_uart[h] {
@@ -306,7 +339,7 @@ pub module heliodor_soc_smp #(
     ) (
         clk                              ,
         rst                              ,
-        i_addr     : bus_dram_addr[15:0] ,
+        i_addr     : if clint_wen_w ? bus_dramw_addr[15:0] : bus_dramr_addr[15:0],
         i_wdata    : bus_dram_wdata      ,
         i_wen      : clint_wen_w         ,
         i_ren      : clint_ren_w         ,
@@ -321,7 +354,7 @@ pub module heliodor_soc_smp #(
     inst u_uart: uart (
         clk                             ,
         rst                             ,
-        i_addr    : bus_dram_addr[2:0]  ,
+        i_addr    : if uart_wen_w ? bus_dramw_addr[2:0] : bus_dramr_addr[2:0],
         i_wdata   : bus_dram_wdata[7:0] ,
         i_wen     : uart_wen_w          ,
         i_ren     : uart_ren_w          ,
@@ -373,6 +406,9 @@ pub module heliodor_soc_smp #(
             o_dmem_wstrb_hi   : c_dmem_wstrb_hi[h],
             o_dmem_req        : c_dmem_req[h]     ,
             i_dmem_grant      : bus_dgrant[h]     ,
+            o_dmemw_addr      : c_dmemw_addr[h]   ,
+            o_dmemw_req       : c_dmemw_req[h]    ,
+            i_dmemw_grant     : bus_wgrant[h]     ,
             i_dcache_inv_valid: core_inv_valid[h] ,
             i_dcache_inv_addr : core_inv_addr[h]  ,
             o_amo_inflight    : c_amo_inflight[h] ,

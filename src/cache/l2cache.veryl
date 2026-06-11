@@ -30,19 +30,30 @@
 pub module l2cache (
     clk: input clock,
     rst: input reset,
-    // Upper interface (from memory_bus — the granted hart's request)
-    i_addr : input logic<64>,
+    // Upper READ interface (S23: from memory_bus's read channel — the
+    // granted hart's fill / miss read). o_rhit is the word-hit verdict on
+    // i_raddr, exported COMBINATIONALLY (independent of i_ren) so the SoC
+    // can qualify read grants: a read that hits L2 needs no DRAM cycle and
+    // may proceed even while the write channel owns the single DRAM port.
+    i_raddr: input  logic<64>,
+    i_ren  : input  logic    ,
+    o_rdata: output logic<64>,
+    o_rhit : output logic    ,
+    // Upper WRITE interface (S23: from memory_bus's write channel — the
+    // granted hart's write-through store). Always forwards to DRAM.
+    i_waddr: input logic<64>,
     i_wdata: input logic<64>,
     i_wstrb: input logic<8> ,
     // M8.D.2: hi-side strobe for a misaligned 2-dword STORE (v4 SoC). When
     // nonzero the store's hi dword is written to DRAM via a SoC bypass that
     // skips L2, so L2's cached copy of the touched line(s) would go stale.
     // Non-v4 instantiations tie this to 0 (the invalidate path never fires).
-    i_wstrb_hi: input  logic<8> ,
-    i_wen     : input  logic    ,
-    i_ren     : input  logic    ,
-    o_rdata   : output logic<64>,
-    // Lower interface (to SoC-level DRAM port)
+    i_wstrb_hi: input logic<8>,
+    i_wen     : input logic   ,
+    // Lower interface (to SoC-level DRAM port — still SINGLE-ported. The
+    // write-through write owns it whenever i_wen is up; a read that needs
+    // DRAM (L2 miss) must not be granted that cycle — the SoC's rgrant_ok
+    // term enforces it, so o_mem_ren && i_wen never coexist).
     o_mem_addr : output logic<64>,
     o_mem_wdata: output logic<64>,
     o_mem_wstrb: output logic<8> ,
@@ -53,10 +64,16 @@ pub module l2cache (
     // -----------------------------------------------------------------
     // Address decomposition
     // -----------------------------------------------------------------
-    let req_tag   : logic<49> = i_addr[63:15];
-    let req_index : logic<9>  = i_addr[14:6];
-    let req_offset: logic<3>  = i_addr[5:3];
+    // Read-side decode (i_raddr) — drives lookup, install, PLRU.
+    let req_tag   : logic<49> = i_raddr[63:15];
+    let req_index : logic<9>  = i_raddr[14:6];
+    let req_offset: logic<3>  = i_raddr[5:3];
     let data_idx  : logic<12> = {req_index, req_offset};
+    // Write-side decode (i_waddr) — drives the write-hit merge.
+    let w_tag     : logic<49> = i_waddr[63:15];
+    let w_index   : logic<9>  = i_waddr[14:6];
+    let w_offset  : logic<3>  = i_waddr[5:3];
+    let w_data_idx: logic<12> = {w_index, w_offset};
 
     // -----------------------------------------------------------------
     // Storage — 4 separate banks (one per way)
@@ -101,6 +118,13 @@ pub module l2cache (
 
     // tag_match: line-level (line valid AND tag matches) — controls
     // write-hit and "same-line miss" (word missing on existing line).
+    // Write-side line match (i_waddr).
+    let w_tm_0  : logic = lv_0[w_index] && (tag_0[w_index] == w_tag);
+    let w_tm_1  : logic = lv_1[w_index] && (tag_1[w_index] == w_tag);
+    let w_tm_2  : logic = lv_2[w_index] && (tag_2[w_index] == w_tag);
+    let w_tm_3  : logic = lv_3[w_index] && (tag_3[w_index] == w_tag);
+    let w_any_tm: logic = w_tm_0 || w_tm_1 || w_tm_2 || w_tm_3;
+
     let tm_0  : logic = cur_lv_0 && (cur_tag_0 == req_tag);
     let tm_1  : logic = cur_lv_1 && (cur_tag_1 == req_tag);
     let tm_2  : logic = cur_lv_2 && (cur_tag_2 == req_tag);
@@ -132,7 +156,7 @@ pub module l2cache (
     // (i_addr) and the i_addr+8 line, and skip the byte-merge below. A later
     // read refills the merged bytes from DRAM (which holds both halves).
     let mis_store: logic     = i_wen && (i_wstrb_hi != 8'd0);
-    let nxt_addr : logic<64> = i_addr + 64'd8;
+    let nxt_addr : logic<64> = i_waddr + 64'd8;
     let nxt_tag  : logic<49> = nxt_addr[63:15];
     let nxt_index: logic<9>  = nxt_addr[14:6];
     let nxt_lv_0 : logic     = lv_0[nxt_index];
@@ -162,18 +186,23 @@ pub module l2cache (
     // -----------------------------------------------------------------
     // DRAM bus driving
     // -----------------------------------------------------------------
-    assign o_mem_addr  = i_addr;
+    assign o_mem_addr  = if i_wen ? i_waddr : i_raddr;
     assign o_mem_wdata = i_wdata;
     assign o_mem_wstrb = i_wstrb;
     assign o_mem_wen   = i_wen;
-    assign o_mem_ren   = read_miss;
+    assign o_mem_ren   = read_miss && !i_wen; // !i_wen is belt-and-suspenders (see header)
 
     assign o_rdata = if read_hit ? hit_data : i_mem_rdata;
+    assign o_rhit  = any_wh;
 
     // -----------------------------------------------------------------
     // Byte-merge for write hit
     // -----------------------------------------------------------------
-    let cur_data_hit: logic<64> = if tm_0 ? cur_data_0 : if tm_1 ? cur_data_1 : if tm_2 ? cur_data_2 : cur_data_3;
+    let w_cur_data_0: logic<64> = data_0[w_data_idx];
+    let w_cur_data_1: logic<64> = data_1[w_data_idx];
+    let w_cur_data_2: logic<64> = data_2[w_data_idx];
+    let w_cur_data_3: logic<64> = data_3[w_data_idx];
+    let cur_data_hit: logic<64> = if w_tm_0 ? w_cur_data_0 : if w_tm_1 ? w_cur_data_1 : if w_tm_2 ? w_cur_data_2 : w_cur_data_3;
     let write_merged: logic<64> = {
         if i_wstrb[7] ? i_wdata[63:56] : cur_data_hit[63:56], if i_wstrb[6] ? i_wdata[55:48] : cur_data_hit[55:48],
         if i_wstrb[5] ? i_wdata[47:40] : cur_data_hit[47:40], if i_wstrb[4] ? i_wdata[39:32] : cur_data_hit[39:32],
@@ -181,11 +210,19 @@ pub module l2cache (
         if i_wstrb[1] ? i_wdata[15:8] : cur_data_hit[15:8], if i_wstrb[0] ? i_wdata[7:0] : cur_data_hit[7:0],
     };
 
-    // PLRU update target — way that was accessed (hit or new install).
-    let access_way: logic<2> = if read_hit ? hit_way : install_way;
-    // A misaligned store only invalidates — no install/merge — so it must not
-    // touch PLRU (mis_store excluded from the write-hit term).
-    let access_valid: logic = read_hit || read_miss || (i_wen && any_tm && !mis_store);
+    // PLRU update targets — the read side (hit or install) and, S23, the
+    // write side on its own index (write hits kept updating PLRU across the
+    // split; dropping them measurably changed L2 replacement). Same-set
+    // collisions resolve write-last (accuracy-only).
+    let access_way  : logic<2> = if read_hit ? hit_way : install_way;
+    let access_valid: logic    = read_hit || read_miss;
+    let w_tm_way    : logic<2> = if w_tm_0 ? 2'd0 : if w_tm_1 ? 2'd1 : if w_tm_2 ? 2'd2 : 2'd3;
+    let w_plru_bits : logic<3> = plru[w_index];
+    let w_new_plru  : logic<3> = {
+        !w_tm_way[1], if !w_tm_way[1] ? !w_tm_way[0] : w_plru_bits[1],
+        if w_tm_way[1] ? !w_tm_way[0] : w_plru_bits[0],
+    };
+    let w_access_valid: logic = i_wen && w_any_tm && !mis_store;
 
     // -----------------------------------------------------------------
     // PLRU bit update — point AWAY from accessed way.
@@ -215,12 +252,16 @@ pub module l2cache (
                 plru[i] = 3'b0;
             }
         } else {
-            // PLRU update on any access (hit or install).
+            // PLRU update on any access (hit or install); write hits after
+            // reads so a same-set collision resolves write-last.
             if access_valid {
                 plru[req_index] = new_plru;
             }
+            if w_access_valid {
+                plru[w_index] = w_new_plru;
+            }
 
-            if read_miss {
+            if i_ren && !any_wh {
                 // Install in install_way: same-line OR-in valid bit, else
                 // start fresh. Per-way conditional needed because each
                 // way has its own bank.
@@ -258,21 +299,26 @@ pub module l2cache (
                     wv_3[req_index]  = new_wv;
                     data_3[data_idx] = i_mem_rdata;
                 }
-            } else if mis_store {
+            }
+            // S23: the write channel is independent of the read-side install
+            // above. A same-line concurrent install+merge cannot happen: an
+            // install implies an L2 read MISS, and the SoC's rgrant_ok never
+            // grants a missing read while the write channel is active.
+            if mis_store {
                 // M8.D.2: misaligned store — invalidate the lo line and the
                 // i_addr+8 line in any way that holds them (the hi dword
                 // bypassed L2 to DRAM). No merge.
-                if tm_0 {
-                    lv_0[req_index] = 1'b0;
+                if w_tm_0 {
+                    lv_0[w_index] = 1'b0;
                 }
-                if tm_1 {
-                    lv_1[req_index] = 1'b0;
+                if w_tm_1 {
+                    lv_1[w_index] = 1'b0;
                 }
-                if tm_2 {
-                    lv_2[req_index] = 1'b0;
+                if w_tm_2 {
+                    lv_2[w_index] = 1'b0;
                 }
-                if tm_3 {
-                    lv_3[req_index] = 1'b0;
+                if w_tm_3 {
+                    lv_3[w_index] = 1'b0;
                 }
                 if ntm_0 {
                     lv_0[nxt_index] = 1'b0;
@@ -286,16 +332,16 @@ pub module l2cache (
                 if ntm_3 {
                     lv_3[nxt_index] = 1'b0;
                 }
-            } else if i_wen && any_tm {
-                // Write hit on tm_way.
-                if tm_way == 2'd0 {
-                    data_0[data_idx] = write_merged;
-                } else if tm_way == 2'd1 {
-                    data_1[data_idx] = write_merged;
-                } else if tm_way == 2'd2 {
-                    data_2[data_idx] = write_merged;
+            } else if i_wen && w_any_tm {
+                // Write hit on the write-side tm way.
+                if w_tm_0 {
+                    data_0[w_data_idx] = write_merged;
+                } else if w_tm_1 {
+                    data_1[w_data_idx] = write_merged;
+                } else if w_tm_2 {
+                    data_2[w_data_idx] = write_merged;
                 } else {
-                    data_3[data_idx] = write_merged;
+                    data_3[w_data_idx] = write_merged;
                 }
             }
         }
