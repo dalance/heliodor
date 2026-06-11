@@ -43,17 +43,20 @@ pub module heliodor_core #(
     i_iptw_rdata: input  logic<64>,
 
     // Data memory (M5+; M1 holds these inactive)
-    o_dmem_addr : output logic<64>,
-    o_dmem_wdata: output logic<64>,
-    i_dmem_rdata: input  logic<64>,
+    // S25: the write channel carries a 64B LINE (8 dword lanes + per-lane
+    // byte strobes) per transaction; a slow/MMIO store is a one-lane line
+    // write at o_dmemw_addr[5:3] (the address keeps its byte offset).
+    o_dmem_addr : output logic<64>    ,
+    o_dmem_wdata: output logic<64> [8],
+    i_dmem_rdata: input  logic<64>    ,
     // M8: combinational read of the NEXT dword (addr+8 aligned) — used
     // by alu_wrap for misaligned LD/LW/LH that span 2 dwords. Toy
     // memories drive it from the next dram slot; real caches will
     // synthesize via 2 fetches.
     i_dmem_rdata_next: input  logic<64>,
-    o_dmem_wen       : output logic    ,
-    o_dmem_ren       : output logic    ,
-    o_dmem_wstrb     : output logic<8> ,
+    o_dmem_wen       : output logic        ,
+    o_dmem_ren       : output logic        ,
+    o_dmem_wstrb     : output logic<8>  [8],
     // M8: hi-side write for misaligned STOREs that span 2 dwords.
     // Tests use this to write the carryover bytes into addr+8.
     o_dmem_wdata_hi: output logic<64>,
@@ -475,11 +478,20 @@ pub module heliodor_core #(
     var sb_push : logic;
     var sb_vm_ok: logic; // VM arm of the classifier (TLB-hit translate ready)
     var sb_pa   : logic<64>;
+    // S25 write-combining: entries are cache LINES (64B), not dwords. A push
+    // whose PA matches a live entry's line MERGES into that entry's dword lane
+    // (byte-granular strobe OR) instead of allocating — a streaming store
+    // sequence collapses to one entry per line, and a full buffer still
+    // accepts merging stores. sb_lmap is the per-entry lane-occupancy bitmap
+    // (bit l = lane l has any byte pending); all overlap scans test
+    // line-match + lane bit, which is exactly the old dword granularity.
     const SB_N: u32 = 4;
-    var sb_addr  : logic<64> [SB_N];
-    var sb_data  : logic<64> [SB_N];
-    var sb_strb  : logic<8>  [SB_N];
-    var sb_cnt   : logic<4>         ;
+    var sb_line : logic<58> [SB_N]    ; // PA[63:6] per entry
+    var sb_data : logic<64> [SB_N * 8]; // entry i lane l = [i*8+l]
+    var sb_strb : logic<8>  [SB_N * 8];
+    var sb_lmap : logic<8>  [SB_N]    ;
+    var sb_cnt  : logic<4>            ;
+    var sb_merge_ok: logic; // this cycle's push can merge (rob_commit_ack reads it)
     var sb_ld_ovl: logic            ; // issuing load's dword span may hit the buffer
     var sb_st_ovl: logic            ; // slow store's dword span may hit the buffer
     assign sb_full  = sb_cnt == 4'd4;
@@ -2253,7 +2265,7 @@ pub module heliodor_core #(
     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay
         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
         && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
-        && !(c_is_store && sb_elig && sb_full)
+        && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
         && !(c_serial && !sb_empty);
     // Phase 8 S1: 2-wide commit. commit2_fire is a var assigned LATE (after all
     // the slot-0 redirect conditions: trap/mret/sret/satp/mispredict/sc-replay)
@@ -3619,11 +3631,18 @@ pub module heliodor_core #(
     // normal slot-0 path whose gates scan the RIGHT address. The compare
     // uses only registers (walk_vaddr_q, sb state) — no comb loop.
     var sb_walk_ovl: logic;
+    let sb_wk_dw0  : logic<9> = walk_vaddr_q[11:3];
+    let sb_wk_dw1  : logic<9> = walk_vaddr_q[11:3] + 9'd1;
     always_comb {
         sb_walk_ovl = 1'b0;
         for i in 0..SB_N {
-            if (i as 4) <: sb_cnt && (sb_addr[i][11:3] == walk_vaddr_q[11:3] || sb_addr[i][11:3] == walk_vaddr_q[11:3] + 9'd1) {
-                sb_walk_ovl = 1'b1;
+            if (i as 4) <: sb_cnt {
+                if sb_line[i][5:0] == sb_wk_dw0[8:3] && sb_lmap[i][sb_wk_dw0[2:0]] {
+                    sb_walk_ovl = 1'b1;
+                }
+                if sb_line[i][5:0] == sb_wk_dw1[8:3] && sb_lmap[i][sb_wk_dw1[2:0]] {
+                    sb_walk_ovl = 1'b1;
+                }
             }
         }
     }
@@ -3822,7 +3841,28 @@ pub module heliodor_core #(
     assign sb_elig = fast_store || sb_vm_ok;
     assign c_store_mmio = (if dmem_vm_on ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40;
     assign sb_pa   = if dmem_vm_on ? dmu_dmem_addr : c_store_addr;
-    assign sb_push = sb_elig && !sb_full;
+    // S25 drain: the HEAD entry leaves as ONE line-wide transaction through
+    // the dcache drain port (all 8 lanes + strobes); the ack pops the entry.
+    let sb_pop: logic = dc_sdrain_ack;
+    // S25: line-match the pushing store against live entries. The head entry
+    // is not a merge target on its pop cycle (its lanes are leaving the
+    // buffer this edge); the store allocates a fresh entry instead. A merging
+    // store is accepted even when the buffer is FULL — no new entry needed.
+    var sb_match_v  : logic   ;
+    var sb_match_idx: logic<2>;
+    always_comb {
+        sb_match_v   = 1'b0;
+        sb_match_idx = 2'd0;
+        for i in 0..SB_N {
+            if (i as 4) <: sb_cnt && sb_line[i] == sb_pa[63:6] {
+                sb_match_v   = 1'b1;
+                sb_match_idx = i as 2;
+            }
+        }
+    }
+    assign sb_merge_ok = sb_match_v && !(sb_match_idx == 2'd0 && sb_pop);
+    assign sb_push     = sb_elig && (sb_merge_ok || !sb_full);
+    let sb_alloc: logic = sb_push && !sb_merge_ok;
     // The issuing load's dword span vs the buffered entries. Compared by 4KB
     // page offset ([11:3], translation-invariant — the S15 trick) on the AGU
     // VA, NOT the translated PA: dmu_dmem_addr is combinationally entangled
@@ -3835,57 +3875,111 @@ pub module heliodor_core #(
     // false-hold rate on adjacent-dword store/load pairs.
     let sb_ld_sz   : logic<4> = 4'd1 << iq_issue_op.base.mem_funct3[1:0];
     let sb_ld_spans: logic    = ({1'b0, agu_addr_iss[2:0]} + sb_ld_sz) >: 4'd8;
+    let sb_ld_dw0  : logic<9> = agu_addr_iss[11:3];
+    let sb_ld_dw1  : logic<9> = agu_addr_iss[11:3] + 9'd1;
     always_comb {
         sb_ld_ovl = 1'b0;
         for i in 0..SB_N {
-            if (i as 4) <: sb_cnt && (sb_addr[i][11:3] == agu_addr_iss[11:3] || (sb_ld_spans && sb_addr[i][11:3] == agu_addr_iss[11:3] + 9'd1)) {
-                sb_ld_ovl = 1'b1;
+            if (i as 4) <: sb_cnt {
+                if sb_line[i][5:0] == sb_ld_dw0[8:3] && sb_lmap[i][sb_ld_dw0[2:0]] {
+                    sb_ld_ovl = 1'b1;
+                }
+                if sb_ld_spans && sb_line[i][5:0] == sb_ld_dw1[8:3] && sb_lmap[i][sb_ld_dw1[2:0]] {
+                    sb_ld_ovl = 1'b1;
+                }
             }
         }
     }
     // The committing SLOW store's dword span vs the buffered entries (same
     // page-offset trick, on the pre-translation c_store_addr — loop-free).
     // dword+1 always checked (covers the misaligned hi-dword bypass).
+    let sb_st_dw0: logic<9> = c_store_addr[11:3];
+    let sb_st_dw1: logic<9> = c_store_addr[11:3] + 9'd1;
     always_comb {
         sb_st_ovl = 1'b0;
         for i in 0..SB_N {
-            if (i as 4) <: sb_cnt && (sb_addr[i][11:3] == c_store_addr[11:3] || sb_addr[i][11:3] == c_store_addr[11:3] + 9'd1) {
-                sb_st_ovl = 1'b1;
+            if (i as 4) <: sb_cnt {
+                if sb_line[i][5:0] == sb_st_dw0[8:3] && sb_lmap[i][sb_st_dw0[2:0]] {
+                    sb_st_ovl = 1'b1;
+                }
+                if sb_line[i][5:0] == sb_st_dw1[8:3] && sb_lmap[i][sb_st_dw1[2:0]] {
+                    sb_st_ovl = 1'b1;
+                }
             }
         }
     }
-    // 4-entry shift FIFO of committed {PA, data, strobe} stores, drained
+    // 4-line shift FIFO of committed stores (S25 write-combining), drained
     // oldest-first through the dcache store-drain port (i_saddr) whenever the
     // fill engine is idle and the bus grants. Entries are COMMITTED state —
     // never flushed by a redirect/trap.
-    let sb_pop: logic = dc_sdrain_ack;
+    //
+    // Merge helpers — all read PRE-EDGE register state; the FF block applies
+    // them at the post-shift slot. sb_merge_ok excludes the head's POP cycle,
+    // so a merge never targets an entry whose lanes are leaving this edge.
+    let sb_mlane   : logic<3>  = sb_pa[5:3];
+    let sb_midx_pre: logic<5>  = {sb_match_idx, sb_mlane};
+    let sb_mold    : logic<64> = sb_data[sb_midx_pre];
+    let sb_mnew    : logic<64> = {
+        if st_wstrb[7] ? st_wdata[63:56] : sb_mold[63:56], if st_wstrb[6] ? st_wdata[55:48] : sb_mold[55:48],
+        if st_wstrb[5] ? st_wdata[47:40] : sb_mold[47:40], if st_wstrb[4] ? st_wdata[39:32] : sb_mold[39:32],
+        if st_wstrb[3] ? st_wdata[31:24] : sb_mold[31:24], if st_wstrb[2] ? st_wdata[23:16] : sb_mold[23:16],
+        if st_wstrb[1] ? st_wdata[15:8] : sb_mold[15:8], if st_wstrb[0] ? st_wdata[7:0] : sb_mold[7:0]
+    };
+    let sb_mstrb: logic<8> = sb_strb[sb_midx_pre] | st_wstrb;
+    let sb_mlmap: logic<8> = sb_lmap[sb_match_idx] | (8'd1 << sb_mlane);
     always_ff (clk, rst) {
         if_reset {
             sb_cnt = 4'd0;
             for i in 0..SB_N {
-                sb_addr[i] = 64'd0;
-                sb_data[i] = 64'd0;
-                sb_strb[i] = 8'd0;
+                sb_line[i] = 58'd0;
+                sb_lmap[i] = 8'd0;
+                for l in 0..8 {
+                    sb_data[i * 8 + l] = 64'd0;
+                    sb_strb[i * 8 + l] = 8'd0;
+                }
             }
         } else {
             if sb_pop {
                 for i in 0..3 {
-                    sb_addr[i] = sb_addr[i + 1];
-                    sb_data[i] = sb_data[i + 1];
-                    sb_strb[i] = sb_strb[i + 1];
-                }
-            }
-            if sb_push {
-                let widx: logic<4> = sb_cnt - (if sb_pop ? 4'd1 : 4'd0);
-                for i in 0..4 {
-                    if widx == (i as 4) {
-                        sb_addr[i] = sb_pa;
-                        sb_data[i] = st_wdata;
-                        sb_strb[i] = st_wstrb;
+                    sb_line[i] = sb_line[i + 1];
+                    sb_lmap[i] = sb_lmap[i + 1];
+                    for l in 0..8 {
+                        sb_data[i * 8 + l] = sb_data[(i + 1) * 8 + l];
+                        sb_strb[i * 8 + l] = sb_strb[(i + 1) * 8 + l];
                     }
                 }
             }
-            sb_cnt = sb_cnt + (if sb_push ? 4'd1 : 4'd0) - (if sb_pop ? 4'd1 : 4'd0);
+            if sb_push {
+                if sb_merge_ok {
+                    let midx: logic<2> = sb_match_idx - (if sb_pop ? 2'd1 : 2'd0);
+                    sb_data[{midx, sb_mlane}] = sb_mnew;
+                    sb_strb[{midx, sb_mlane}] = sb_mstrb;
+                    sb_lmap[midx]             = sb_mlmap;
+                } else {
+                    let widx: logic<4> = sb_cnt - (if sb_pop ? 4'd1 : 4'd0);
+                    for i in 0..SB_N {
+                        if widx == (i as 4) {
+                            sb_line[i] = sb_pa[63:6];
+                            sb_lmap[i] = 8'd1 << sb_mlane;
+                            for l in 0..8 {
+                                sb_strb[i * 8 + l] = 8'd0;
+                            }
+                            sb_data[{(i as 2), sb_mlane}] = st_wdata;
+                            sb_strb[{(i as 2), sb_mlane}] = st_wstrb;
+                        }
+                    }
+                }
+            }
+            sb_cnt = sb_cnt + (if sb_alloc ? 4'd1 : 4'd0) - (if sb_pop ? 4'd1 : 4'd0);
+        }
+    }
+    // S25: head-entry lanes, wired to the dcache line-drain port.
+    var sb_head_data: logic<64> [8];
+    var sb_head_strb: logic<8>  [8];
+    always_comb {
+        for l in 0..8 {
+            sb_head_data[l] = sb_data[l];
+            sb_head_strb[l] = sb_strb[l];
         }
     }
 
@@ -4028,12 +4122,12 @@ pub module heliodor_core #(
     // and the !replay_q term in core_dmem_ren keeps a NEW walk from starting
     // mid-replay.
     let replay_drive: logic = replay_q && !store_drive && dmem_mmu_idle;
-    var dc_mem_addr : logic<64>;
-    var dc_mem_wdata: logic<64>;
-    var dc_mem_wen  : logic    ;
-    var dc_mem_ren  : logic    ;
-    var dc_mem_wstrb: logic<8> ;
-    var dc_mem_req  : logic    ;
+    var dc_mem_addr : logic<64>    ;
+    var dc_mem_wdata: logic<64> [8]; // S25: write-channel line lanes
+    var dc_mem_wen  : logic        ;
+    var dc_mem_ren  : logic        ;
+    var dc_mem_wstrb: logic<8>  [8];
+    var dc_mem_req  : logic        ;
     var dc_memw_addr: logic<64>; // S23: write-channel address
     var dc_memw_req : logic    ;
     // Phase 8 S10.1: non-blocking miss (MSHR) interface, consumed by the MSHR
@@ -4069,13 +4163,13 @@ pub module heliodor_core #(
         // Phase 8 S6/S20: 2nd write port (store-drain), now fed by the
         // committed-store buffer head (oldest entry) instead of the live
         // committing store. o_sdrain_ack pops the entry.
-        i_saddr          : sb_addr[0]                     ,
+        i_saddr          : {sb_line[0], 6'd0}             ,
         i_swen           : !sb_empty                      ,
         // S20.2: near-full buffer (or a head store already blocked on room)
         // escalates the drain over new fill starts.
         i_sdrain_urgent  : sb_cnt >= 4'd3                 ,
-        i_swdata         : sb_data[0]                     ,
-        i_swstrb         : sb_strb[0]                     ,
+        i_swdata         : sb_head_data                   ,
+        i_swstrb         : sb_head_strb                   ,
         o_sdrain_ack     : dc_sdrain_ack                  ,
         o_rdata2         : dcache_rdata2                  ,
         o_rdata2_next    : dcache_rdata2_next            ,
@@ -4125,11 +4219,18 @@ pub module heliodor_core #(
     // S20: hold a slot-1 load whose dword span may overlap a buffered store
     // (the buffer does not forward; bare mode so PA == agu_addr_iss2).
     var sb_ld_ovl2: logic;
+    let sb_ld2_dw0: logic<61> = agu_addr_iss2[63:3];
+    let sb_ld2_dw1: logic<61> = agu_addr_iss2[63:3] + 61'd1;
     always_comb {
         sb_ld_ovl2 = 1'b0;
         for i in 0..SB_N {
-            if (i as 4) <: sb_cnt && (sb_addr[i][63:3] == agu_addr_iss2[63:3] || sb_addr[i][63:3] == agu_addr_iss2[63:3] + 61'd1) {
-                sb_ld_ovl2 = 1'b1;
+            if (i as 4) <: sb_cnt {
+                if sb_line[i] == sb_ld2_dw0[60:3] && sb_lmap[i][sb_ld2_dw0[2:0]] {
+                    sb_ld_ovl2 = 1'b1;
+                }
+                if sb_line[i] == sb_ld2_dw1[60:3] && sb_lmap[i][sb_ld2_dw1[2:0]] {
+                    sb_ld_ovl2 = 1'b1;
+                }
             }
         }
     }
@@ -4199,15 +4300,17 @@ pub module heliodor_core #(
     // re-executes the load through the normal, sb-checked path).
     var sb_mshra_ovl: logic;
     var sb_mshrb_ovl: logic;
+    let sb_ma_dw: logic<9> = mshra_addr_q[11:3];
+    let sb_mb_dw: logic<9> = mshrb_addr_q[11:3];
     always_comb {
         sb_mshra_ovl = 1'b0;
         sb_mshrb_ovl = 1'b0;
         for i in 0..SB_N {
             if (i as 4) <: sb_cnt {
-                if sb_addr[i][11:3] == mshra_addr_q[11:3] {
+                if sb_line[i][5:0] == sb_ma_dw[8:3] && sb_lmap[i][sb_ma_dw[2:0]] {
                     sb_mshra_ovl = 1'b1;
                 }
-                if sb_addr[i][11:3] == mshrb_addr_q[11:3] {
+                if sb_line[i][5:0] == sb_mb_dw[8:3] && sb_lmap[i][sb_mb_dw[2:0]] {
                     sb_mshrb_ovl = 1'b1;
                 }
             }
@@ -4440,11 +4543,13 @@ pub module heliodor_core #(
     // M8.C: o_dmem is now purely the dcache mem side — imem PTW moved to the
     // dedicated o_iptw bus, so no arbiter mux here anymore. S23: read channel
     // on o_dmem_addr/ren, write channel on o_dmemw_addr + wen/wdata/wstrb.
-    assign o_dmem_addr   = dc_mem_addr;
-    assign o_dmem_wdata  = dc_mem_wdata;
-    assign o_dmem_wen    = dc_mem_wen;
-    assign o_dmem_ren    = dc_mem_ren;
-    assign o_dmem_wstrb  = dc_mem_wstrb;
+    assign o_dmem_addr = dc_mem_addr;
+    for l in 0..8 :gen_dmemw_lane {
+        assign o_dmem_wdata[l] = dc_mem_wdata[l];
+        assign o_dmem_wstrb[l] = dc_mem_wstrb[l];
+    }
+    assign o_dmem_wen = dc_mem_wen;
+    assign o_dmem_ren = dc_mem_ren;
     assign o_dmemw_addr  = dc_memw_addr;
     assign o_dmemw_req   = dc_memw_req;
     // M8: hi-side carry for a misaligned STORE that spans into the next dword.

@@ -41,9 +41,13 @@ pub module l2cache (
     o_rhit : output logic    ,
     // Upper WRITE interface (S23: from memory_bus's write channel — the
     // granted hart's write-through store). Always forwards to DRAM.
-    i_waddr: input logic<64>,
-    i_wdata: input logic<64>,
-    i_wstrb: input logic<8> ,
+    // S25 write-combining: a write is a full 64B LINE — 8 dword lanes with
+    // per-lane byte strobes. A single-dword write (slow store / MMIO) has
+    // one populated lane; i_waddr keeps its byte offset for those (the
+    // misaligned hi-dword invalidate below decodes i_waddr+8).
+    i_waddr: input logic<64>    ,
+    i_wdata: input logic<64> [8],
+    i_wstrb: input logic<8>  [8],
     // M8.D.2: hi-side strobe for a misaligned 2-dword STORE (v4 SoC). When
     // nonzero the store's hi dword is written to DRAM via a SoC bypass that
     // skips L2, so L2's cached copy of the touched line(s) would go stale.
@@ -54,12 +58,12 @@ pub module l2cache (
     // write-through write owns it whenever i_wen is up; a read that needs
     // DRAM (L2 miss) must not be granted that cycle — the SoC's rgrant_ok
     // term enforces it, so o_mem_ren && i_wen never coexist).
-    o_mem_addr : output logic<64>,
-    o_mem_wdata: output logic<64>,
-    o_mem_wstrb: output logic<8> ,
-    o_mem_wen  : output logic    ,
-    o_mem_ren  : output logic    ,
-    i_mem_rdata: input  logic<64>,
+    o_mem_addr : output logic<64>    ,
+    o_mem_wdata: output logic<64> [8],
+    o_mem_wstrb: output logic<8>  [8],
+    o_mem_wen  : output logic        ,
+    o_mem_ren  : output logic        ,
+    i_mem_rdata: input  logic<64>    ,
 ) {
     // -----------------------------------------------------------------
     // Address decomposition
@@ -69,11 +73,10 @@ pub module l2cache (
     let req_index : logic<9>  = i_raddr[14:6];
     let req_offset: logic<3>  = i_raddr[5:3];
     let data_idx  : logic<12> = {req_index, req_offset};
-    // Write-side decode (i_waddr) — drives the write-hit merge.
-    let w_tag     : logic<49> = i_waddr[63:15];
-    let w_index   : logic<9>  = i_waddr[14:6];
-    let w_offset  : logic<3>  = i_waddr[5:3];
-    let w_data_idx: logic<12> = {w_index, w_offset};
+    // Write-side decode (i_waddr) — drives the write-hit merge. S25: lanes
+    // carry the dword offsets; only the line part of i_waddr is decoded.
+    let w_tag  : logic<49> = i_waddr[63:15];
+    let w_index: logic<9>  = i_waddr[14:6];
 
     // -----------------------------------------------------------------
     // Storage — 4 separate banks (one per way)
@@ -186,29 +189,41 @@ pub module l2cache (
     // -----------------------------------------------------------------
     // DRAM bus driving
     // -----------------------------------------------------------------
-    assign o_mem_addr  = if i_wen ? i_waddr : i_raddr;
-    assign o_mem_wdata = i_wdata;
-    assign o_mem_wstrb = i_wstrb;
-    assign o_mem_wen   = i_wen;
-    assign o_mem_ren   = read_miss && !i_wen; // !i_wen is belt-and-suspenders (see header)
+    assign o_mem_addr = if i_wen ? i_waddr : i_raddr;
+    for l in 0..8 :gen_memw_lane {
+        assign o_mem_wdata[l] = i_wdata[l];
+        assign o_mem_wstrb[l] = i_wstrb[l];
+    }
+    assign o_mem_wen = i_wen;
+    assign o_mem_ren = read_miss && !i_wen; // !i_wen is belt-and-suspenders (see header)
 
     assign o_rdata = if read_hit ? hit_data : i_mem_rdata;
     assign o_rhit  = any_wh;
 
     // -----------------------------------------------------------------
-    // Byte-merge for write hit
+    // Byte-merge for write hit — per lane (S25). Lanes with wstrb==0 keep
+    // the cached dword (the FF block skips them anyway).
     // -----------------------------------------------------------------
-    let w_cur_data_0: logic<64> = data_0[w_data_idx];
-    let w_cur_data_1: logic<64> = data_1[w_data_idx];
-    let w_cur_data_2: logic<64> = data_2[w_data_idx];
-    let w_cur_data_3: logic<64> = data_3[w_data_idx];
-    let cur_data_hit: logic<64> = if w_tm_0 ? w_cur_data_0 : if w_tm_1 ? w_cur_data_1 : if w_tm_2 ? w_cur_data_2 : w_cur_data_3;
-    let write_merged: logic<64> = {
-        if i_wstrb[7] ? i_wdata[63:56] : cur_data_hit[63:56], if i_wstrb[6] ? i_wdata[55:48] : cur_data_hit[55:48],
-        if i_wstrb[5] ? i_wdata[47:40] : cur_data_hit[47:40], if i_wstrb[4] ? i_wdata[39:32] : cur_data_hit[39:32],
-        if i_wstrb[3] ? i_wdata[31:24] : cur_data_hit[31:24], if i_wstrb[2] ? i_wdata[23:16] : cur_data_hit[23:16],
-        if i_wstrb[1] ? i_wdata[15:8] : cur_data_hit[15:8], if i_wstrb[0] ? i_wdata[7:0] : cur_data_hit[7:0],
-    };
+    var write_merged: logic<64> [8];
+    always_comb {
+        for l in 0..8 {
+            let w_lold: logic<64> = if w_tm_0 ?
+                data_0[{w_index, l as 3}]
+            : if w_tm_1 ?
+                data_1[{w_index, l as 3}]
+            : if w_tm_2 ?
+                data_2[{w_index, l as 3}]
+            :
+                data_3[{w_index, l as 3}]
+            ;
+            write_merged[l] = {
+                if i_wstrb[l][7] ? i_wdata[l][63:56] : w_lold[63:56], if i_wstrb[l][6] ? i_wdata[l][55:48] : w_lold[55:48],
+                if i_wstrb[l][5] ? i_wdata[l][47:40] : w_lold[47:40], if i_wstrb[l][4] ? i_wdata[l][39:32] : w_lold[39:32],
+                if i_wstrb[l][3] ? i_wdata[l][31:24] : w_lold[31:24], if i_wstrb[l][2] ? i_wdata[l][23:16] : w_lold[23:16],
+                if i_wstrb[l][1] ? i_wdata[l][15:8] : w_lold[15:8], if i_wstrb[l][0] ? i_wdata[l][7:0] : w_lold[7:0],
+            };
+        }
+    }
 
     // PLRU update targets — the read side (hit or install) and, S23, the
     // write side on its own index (write hits kept updating PLRU across the
@@ -333,15 +348,19 @@ pub module l2cache (
                     lv_3[nxt_index] = 1'b0;
                 }
             } else if i_wen && w_any_tm {
-                // Write hit on the write-side tm way.
-                if w_tm_0 {
-                    data_0[w_data_idx] = write_merged;
-                } else if w_tm_1 {
-                    data_1[w_data_idx] = write_merged;
-                } else if w_tm_2 {
-                    data_2[w_data_idx] = write_merged;
-                } else {
-                    data_3[w_data_idx] = write_merged;
+                // Write hit on the write-side tm way — merge every populated lane.
+                for l in 0..8 {
+                    if i_wstrb[l] != 8'd0 {
+                        if w_tm_0 {
+                            data_0[{w_index, l as 3}] = write_merged[l];
+                        } else if w_tm_1 {
+                            data_1[{w_index, l as 3}] = write_merged[l];
+                        } else if w_tm_2 {
+                            data_2[{w_index, l as 3}] = write_merged[l];
+                        } else {
+                            data_3[{w_index, l as 3}] = write_merged[l];
+                        }
+                    }
                 }
             }
         }

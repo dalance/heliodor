@@ -62,6 +62,9 @@ pub module dcache #(
     // drain shares the single bus o_mem_*: a load-miss FILL/read wins, the
     // store drain waits (o_sdrain_ack=0, store held at the ROB head). Tie
     // i_swen=0 to disable the port entirely (no behavioral effect).
+    // S25 write-combining: the drain delivers a full 64B LINE per ack —
+    // i_saddr is line-aligned, i_swdata/i_swstrb carry 8 dword lanes (lanes
+    // with wstrb==0 are dont-care). One bus transaction per line.
     i_saddr     : input  logic<64>,
     i_swen      : input  logic    ,
     // Phase 8 S20.2: drain URGENCY. When high (the core's store buffer is
@@ -70,8 +73,8 @@ pub module dcache #(
     // and this hart's miss read is suppressed, which also satisfies the
     // SoC's wgrant_ok (no own read needing DRAM) so the write goes through.
     i_sdrain_urgent: input logic,
-    i_swdata    : input  logic<64>,
-    i_swstrb    : input  logic<8> ,
+    i_swdata    : input  logic<64> [8],
+    i_swstrb    : input  logic<8>  [8],
     o_sdrain_ack: output logic    ,
     o_rdata: output logic<64>,
     // M8.B: combinational read of the NEXT dword (at (i_addr&~7)+8), for v4
@@ -108,10 +111,14 @@ pub module dcache #(
     o_memr_addr : output logic<64>,
     o_memr_ren  : output logic    ,
     i_mem_rdata : input  logic<64>,
-    o_memw_addr : output logic<64>,
-    o_memw_wdata: output logic<64>,
-    o_memw_wstrb: output logic<8> ,
-    o_memw_wen  : output logic    ,
+    // S25: the write channel carries a LINE (8 dword lanes + per-lane byte
+    // strobes). An i_wen write (slow store / AMO / MMIO) occupies the single
+    // lane at i_addr[5:3]; o_memw_addr keeps i_addr's byte offset for the
+    // SoC's MMIO decode. A drain puts all of i_swdata/i_swstrb on the lanes.
+    o_memw_addr : output logic<64>    ,
+    o_memw_wdata: output logic<64> [8],
+    o_memw_wstrb: output logic<8>  [8],
+    o_memw_wen  : output logic        ,
     // Invalidate port (memory_bus → dcache, multi-hart coherence).
     // Asserted by memory_bus when another core writes a line. The dcache
     // invalidates any matching way at i_inv_addr's index/tag. If a fill is
@@ -322,8 +329,6 @@ pub module dcache #(
     // ============================================================
     let stag       : logic<TAG_W> = i_saddr[63:INDEX_W + 6];
     let sindex     : logic<INDEX_W> = i_saddr[INDEX_W + 5:6];
-    let soffset    : logic<3>  = i_saddr[5:3];
-    let sdata_idx  : logic<INDEX_W + 3>  = {sindex, soffset};
     // S23: drains now run DURING fills (separate write channel), so exclude
     // the way being filled from the drain hit (its tag is the dying line's;
     // a merge into it could survive into the NEW line if its dword was
@@ -584,35 +589,41 @@ pub module dcache #(
             // writes touch a different line so the two never share a cell.
             if store_can_drain {
                 if scache_hit {
-                    let sold   : logic<64> = if shit_0 ?
-                        data_0[sdata_idx]
-                    : if shit_1 ?
-                        data_1[sdata_idx]
-                    : if shit_2 ?
-                        data_2[sdata_idx]
-                    :
-                        data_3[sdata_idx]
-                    ;
-                    let smerged: logic<64> = {
-                        if i_swstrb[7] ? i_swdata[63:56] : sold[63:56],
-                        if i_swstrb[6] ? i_swdata[55:48] : sold[55:48],
-                        if i_swstrb[5] ? i_swdata[47:40] : sold[47:40],
-                        if i_swstrb[4] ? i_swdata[39:32] : sold[39:32],
-                        if i_swstrb[3] ? i_swdata[31:24] : sold[31:24],
-                        if i_swstrb[2] ? i_swdata[23:16] : sold[23:16], if i_swstrb[1] ? i_swdata[15:8] : sold[15:8],
-                        if i_swstrb[0] ? i_swdata[7:0] : sold[7:0]
-                    };
-                    if shit_0 {
-                        data_0[sdata_idx] = smerged;
-                    }
-                    if shit_1 {
-                        data_1[sdata_idx] = smerged;
-                    }
-                    if shit_2 {
-                        data_2[sdata_idx] = smerged;
-                    }
-                    if shit_3 {
-                        data_3[sdata_idx] = smerged;
+                    // S25: merge every populated lane of the line into the
+                    // hit way (one array write per occupied dword).
+                    for l in 0..8 {
+                        if i_swstrb[l] != 8'd0 {
+                            let sold   : logic<64> = if shit_0 ?
+                                data_0[{sindex, l as 3}]
+                            : if shit_1 ?
+                                data_1[{sindex, l as 3}]
+                            : if shit_2 ?
+                                data_2[{sindex, l as 3}]
+                            :
+                                data_3[{sindex, l as 3}]
+                            ;
+                            let smerged: logic<64> = {
+                                if i_swstrb[l][7] ? i_swdata[l][63:56] : sold[63:56],
+                                if i_swstrb[l][6] ? i_swdata[l][55:48] : sold[55:48],
+                                if i_swstrb[l][5] ? i_swdata[l][47:40] : sold[47:40],
+                                if i_swstrb[l][4] ? i_swdata[l][39:32] : sold[39:32],
+                                if i_swstrb[l][3] ? i_swdata[l][31:24] : sold[31:24],
+                                if i_swstrb[l][2] ? i_swdata[l][23:16] : sold[23:16], if i_swstrb[l][1] ? i_swdata[l][15:8] : sold[15:8],
+                                if i_swstrb[l][0] ? i_swdata[l][7:0] : sold[7:0]
+                            };
+                            if shit_0 {
+                                data_0[{sindex, l as 3}] = smerged;
+                            }
+                            if shit_1 {
+                                data_1[{sindex, l as 3}] = smerged;
+                            }
+                            if shit_2 {
+                                data_2[{sindex, l as 3}] = smerged;
+                            }
+                            if shit_3 {
+                                data_3[{sindex, l as 3}] = smerged;
+                            }
+                        }
                     }
                 } else {
                     // Store miss: write-through to DRAM (o_memw below),
@@ -720,8 +731,7 @@ pub module dcache #(
     ;
     assign o_memr_ren = if filling ? 1'b1 : if i_ren && !cache_hit && i_memr_grant && !drain_urgent ? 1'b1 : 1'b0;
 
-    assign o_memw_addr  = if i_wen ? i_addr : i_saddr;
-    assign o_memw_wdata = if i_wen ? i_wdata : if store_can_drain ? i_swdata : '0;
+    assign o_memw_addr = if i_wen ? i_addr : i_saddr;
 
     // Suppress write-through on cache miss when AMO (ren && wen) to prevent
     // corrupting DRAM before the fill reads the old value.
@@ -729,8 +739,26 @@ pub module dcache #(
     // Phase 5: only emit DRAM write strobe when the write channel is granted.
     // The i_wen path stays IDLE-only (its cache-side update above runs in the
     // IDLE arm; gating keeps the local merge and the DRAM emission lockstep).
-    assign o_memw_wen   = if amo_miss ? 1'b0 : (i_wen && state == State::IDLE && i_memw_grant) || store_can_drain;
-    assign o_memw_wstrb = if i_wen && state == State::IDLE && i_memw_grant && !amo_miss ? i_wstrb : if store_can_drain ? i_swstrb : '0;
+    // S25: per-lane line write. The i_wen dword rides its i_addr[5:3] lane.
+    let wen_lane : logic<3> = i_addr[5:3];
+    let wen_fires: logic    = i_wen && state == State::IDLE && i_memw_grant && !amo_miss;
+    for l in 0..8 :gen_memw_lane {
+        assign o_memw_wdata[l] = if i_wen ?
+            (if wen_lane == (l as 3) ? i_wdata : '0)
+        : if store_can_drain ?
+            i_swdata[l]
+        :
+            '0
+        ;
+        assign o_memw_wstrb[l] = if i_wen ?
+            (if wen_fires && wen_lane == (l as 3) ? i_wstrb : '0)
+        : if store_can_drain ?
+            i_swstrb[l]
+        :
+            '0
+        ;
+    }
+    assign o_memw_wen = if amo_miss ? 1'b0 : (i_wen && state == State::IDLE && i_memw_grant) || store_can_drain;
 
     // Channel requests. memory_bus arbitrates among harts per channel.
     let want_fill_start: logic = miss; // IDLE+miss
