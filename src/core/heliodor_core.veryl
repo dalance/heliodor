@@ -461,6 +461,29 @@ pub module heliodor_core #(
     // dcache_stall. dc_sdrain_ack is the dcache's o_sdrain_ack (instance below).
     var fast_store   : logic;
     var dc_sdrain_ack: logic;
+    // Phase 8 S20: committed-store buffer. A retiring aligned plain DRAM
+    // store (bare, or VM with a same-cycle TLB-hit translation) is absorbed
+    // into a small FIFO and retires IMMEDIATELY — even while a dcache fill or
+    // a missing bus grant would have held it at the ROB head (the probe put
+    // that head-block at 156K cycles ≈ 1.8% of the N=1 boot, virtually all of
+    // it stores). The buffer drains in order through the S6 store-drain port
+    // in the background. sb_elig/sb_full/sb_empty are forward-declared for
+    // rob_commit_ack; the buffer itself lives next to the commit store path.
+    var sb_elig : logic; // head store can be absorbed (classifier)
+    var sb_full : logic;
+    var sb_empty: logic;
+    var sb_push : logic;
+    var sb_vm_ok: logic; // VM arm of the classifier (TLB-hit translate ready)
+    var sb_pa   : logic<64>;
+    const SB_N: u32 = 4;
+    var sb_addr  : logic<64> [SB_N];
+    var sb_data  : logic<64> [SB_N];
+    var sb_strb  : logic<8>  [SB_N];
+    var sb_cnt   : logic<4>         ;
+    var sb_ld_ovl: logic            ; // issuing load's dword span may hit the buffer
+    var sb_st_ovl: logic            ; // slow store's dword span may hit the buffer
+    assign sb_full  = sb_cnt == 4'd4;
+    assign sb_empty = sb_cnt == 4'd0;
 
     var c_inst_w    : logic<16>;
     var c_expanded_w: logic<32>;
@@ -2200,7 +2223,36 @@ pub module heliodor_core #(
     // WITHOUT EVER DRIVING ITS WRITE — a committed store silently lost. Only
     // reachable once S15 lets a speculative load start a PTW while an older
     // store is committing (pre-S15 VM blocked every load behind every store).
-    let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !(c_is_store && !fast_store && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q))) && !(c_is_store && !fast_store && dcache_stall) && !(fast_store && !dc_sdrain_ack);
+    // Phase 8 S20: stores split three ways at retire.
+    //  - sb_elig (aligned plain DRAM store, translation ready): retires the
+    //    moment the store buffer has room (sb_push fires the same cycle) —
+    //    no dcache_stall / bus-grant wait.
+    //  - slow store (!sb_elig: AMO/SC, misaligned, MMIO, VM TLB-miss): the
+    //    pre-S20 gates, PLUS !sb_empty — its i_wen write must not reach the
+    //    bus before the OLDER buffered stores drain (write-order inversion).
+    //  - serializing ops also wait for the buffer to drain: FENCE orders our
+    //    stores for other harts, FENCE.I against our own re-fetch,
+    //    SFENCE/satp against the page-table walker.
+    // S20.2: ONLY those — the original "all CSR/MRET/SRET" superset made
+    // every interrupt-path CSR op at N=4 pay a contention-bound drain wait
+    // (part of the boot +13%); plain CSRs have no store-ordering semantics.
+    let c_serial: logic = rob_commit_entry.is_fence || rob_commit_entry.is_fence_i || rob_commit_entry.is_sfence || (rob_commit_entry.is_csr && c_csr_addr == 12'h180);
+    // S20R: an MMIO (non-DRAM) store is a DOORBELL — firmware writes a DRAM
+    // mailbox then rings CLINT msip with no fence between (legal on the old
+    // never-reordering pipeline). If the doorbell passes the buffered
+    // mailbox store, the woken hart reads a stale mailbox and parks forever
+    // (the N=2 wedge: hart1 stuck in the FW wait loop, trap1=0). Treat every
+    // MMIO store like an AMO release: wait for the buffer to fully drain.
+    var c_store_mmio: logic; // assigned at the store-buffer block (needs dmu_dmem_addr)
+    // The slow-store order gate is OVERLAP-only for plain stores (RVWMO lets
+    // different-address stores become visible out of order without a fence);
+    // an AMO/SC keeps the full-empty wait (release semantics: all prior
+    // stores must be visible before it).
+    let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay
+        && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
+        && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+        && !(c_is_store && sb_elig && sb_full)
+        && !(c_serial && !sb_empty);
     // Phase 8 S1: 2-wide commit. commit2_fire is a var assigned LATE (after all
     // the slot-0 redirect conditions: trap/mret/sret/satp/mispredict/sc-replay)
     // so it can also require that slot-0 does NOT redirect — otherwise the head+1
@@ -3425,10 +3477,11 @@ pub module heliodor_core #(
     // Phase 8 S6: route a committing BARE-mode aligned PLAIN store to the
     // separate dcache store-drain port (i_saddr/i_swen). Excludes AMO/LR/SC
     // (c_is_amo — RMW on the combined port, SMP-critical) and misaligned
-    // straddling stores (st_wstrb_hi != 0 — the hi-dword bypass path). Under
-    // Sv39 (dmem_vm_on) stores translate at commit through dmem_mmu and stay on
-    // i_wen. The drained fast store does NOT use load_walk_busy (bare ⇒ no walk).
-    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0;
+    // straddling stores (st_wstrb_hi != 0 — the hi-dword bypass path).
+    // Phase 8 S20: also excludes non-DRAM (MMIO) targets — fast stores now
+    // retire through the store BUFFER, and only DRAM lines are buffered; a
+    // bare MMIO store falls back to the blocking i_wen path (its pre-S6 route).
+    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0 && c_store_addr[63:25] == 39'h40;
 
     // Core dmem view (pre-MMU virtual address)
     //
@@ -3503,7 +3556,44 @@ pub module heliodor_core #(
     // coexist with the fast store. The AMO read is held in the IQ until the older
     // fast store commits (its data is then in the dcache). issue_amo_read covers
     // AMO + LR (not SC, which is a store).
-    assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && fast_store);
+    // Phase 8 S20: the buffer does NOT forward — a load whose dword span may
+    // overlap a buffered (committed, not yet drained) store is simply HELD in
+    // the IQ until the buffer drains those bytes into the dcache (a few
+    // cycles). The compare is on the load's translated address (dmu_dmem_addr
+    // — only meaningful on a load-driving cycle, and the other arms block the
+    // non-load-driving cycles anyway), conservatively covering dword and
+    // dword+1 (misaligned spans). AMO/LR reads (no forward network at all)
+    // wait for the buffer to be fully empty, including a same-cycle push.
+    // The AMO arm uses commit_store_fire (not sb_push — that reaches through
+    // the MMU's translated address and would close a comb loop into
+    // core_dmem_ren): an AMO/LR read waits out ANY retiring store, which
+    // covers the same-cycle buffer push.
+    // S20.2 (N4 +13% fix): a full !sb_empty wait for EVERY AMO convoyed the
+    // 4-hart lock traffic — an acquiring hart's AMO waited out its own drain
+    // (bus-grant bound) on every lock op. RVWMO only requires prior-store
+    // visibility for a RELEASE (rl, instr[25]); a plain/acquire AMO needs
+    // just its own RMW bytes to be drained, which sb_ld_ovl already enforces
+    // (issue_is_load includes AMO reads, compared on the AGU page offset).
+    // Linux's unlock is fence+store (the FENCE gate drains), so rl AMOs are
+    // rare; LR carries its rl bit the same way.
+    // S20.2 watermark back-pressure: pre-S20 a pending store suppressed the
+    // whole load stream (store_drive arm) — an implicit but STRONG drain
+    // priority. The buffer drops that coupling for its retire win, but at
+    // N=4 contention-stretched fills then chain back-to-back and the drain
+    // (IDLE-only) starves into a permanent sb_full retire stall. Restore the
+    // old priority ONLY under pressure: at the high watermark, hold new
+    // loads so the current fill is the last of the chain and the drain gets
+    // its slots. At N=1 drains are fast and the watermark is rarely hit.
+    // S20R: under VM the precise overlap gates leak through at least two
+    // paths (decoupled-walk data reads scan the wrong address; an MSHR
+    // fill's data predates a store buffered mid-fill — and plugging those
+    // two still left a reproducing leak), so VM loads are held whenever ANY
+    // committed store is still buffered. Bare mode keeps the precise scan.
+    // Refining this hold back to a precise gate is a known follow-up.
+    assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_is_load && sb_ld_ovl)
+        || (issue_is_load && dmem_vm_on && !sb_empty)
+        || (issue_is_load && sb_cnt >= 4'd3)
+        || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])));
     // Phase 8 S10.5: !replay_q — no NEW dmem-MMU request while a queued-MSHR
     // replay drives the dcache port. Without this, a TLB-missing load selected
     // on slot-0 starts a PTW walk on a replay cycle (walk_v_q is not set yet,
@@ -3513,7 +3603,26 @@ pub module heliodor_core #(
     // a corrupted translation (observed as a wild jump into the _etext/
     // .init.text padding hole, N=2 trap-loop timeout). An already-in-flight
     // walk (mmu_walk_inflight) still owns the port; replay defers to it.
-    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || mmu_walk_inflight;
+    // S20R: the decoupled-walk arm BYPASSES load_blocks_on_store (the IQ may
+    // have moved to a different op mid-walk, so sb_ld_ovl scans the wrong
+    // address) — a store committed into the buffer DURING the walk made the
+    // post-walk data read return the pre-store value (the N=2 ra=0 oops).
+    // While a buffered store overlaps the walked VA's dwords, drop the
+    // walk arm's i_ren: the PTE reads ride the MMU's own ptw_req term (not
+    // i_ren), so the walk still completes and fills the TLB; busy then
+    // drops, the walk owner clears, and the load re-issues through the
+    // normal slot-0 path whose gates scan the RIGHT address. The compare
+    // uses only registers (walk_vaddr_q, sb state) — no comb loop.
+    var sb_walk_ovl: logic;
+    always_comb {
+        sb_walk_ovl = 1'b0;
+        for i in 0..SB_N {
+            if (i as 4) <: sb_cnt && (sb_addr[i][11:3] == walk_vaddr_q[11:3] || sb_addr[i][11:3] == walk_vaddr_q[11:3] + 9'd1) {
+                sb_walk_ovl = 1'b1;
+            }
+        }
+    }
+    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || (mmu_walk_inflight && !sb_walk_ovl);
     let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
     // M9.4 SMP: mark the AMO/LR data read so the dcache forces a coherent,
     // bus-serialized re-fill instead of returning a possibly-stale cache HIT
@@ -3693,6 +3802,88 @@ pub module heliodor_core #(
     var dmu_dmem_wen  : logic    ;
     var dmu_dmem_ren  : logic    ;
     var dmu_dmem_wstrb: logic<8> ;
+
+    // ============================================================
+    // Phase 8 S20: committed-store buffer (declarations up front near
+    // fast_store; design note at rob_commit_ack).
+    // ============================================================
+    // VM arm of the classifier: a committing aligned plain store whose
+    // translation is ready THIS cycle (TLB hit: store_drive presents the VA
+    // to dmem_mmu and o_busy is low) and whose PA is in DRAM. A TLB-missing
+    // store stays a slow store — its walk runs via the normal commit path,
+    // the PTE gets cached, and the retry cycle lands here.
+    assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on && st_wstrb_hi == 8'd0
+        && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && dmu_dmem_addr[63:25] == 39'h40;
+    assign sb_elig = fast_store || sb_vm_ok;
+    assign c_store_mmio = (if dmem_vm_on ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40;
+    assign sb_pa   = if dmem_vm_on ? dmu_dmem_addr : c_store_addr;
+    assign sb_push = sb_elig && !sb_full;
+    // The issuing load's dword span vs the buffered entries. Compared by 4KB
+    // page offset ([11:3], translation-invariant — the S15 trick) on the AGU
+    // VA, NOT the translated PA: dmu_dmem_addr is combinationally entangled
+    // with i_ren and this term feeds core_dmem_ren (a PA compare closes a
+    // comb loop through the MMU). A page-offset match is a superset of a true
+    // PA overlap, so a false match only HOLDS the load a few cycles (the
+    // buffer does not forward; the entry drains and the load re-issues).
+    // dword+1 is checked only when the load actually spans into it
+    // (byte offset + size > 8) — an unconditional +1 check doubled the
+    // false-hold rate on adjacent-dword store/load pairs.
+    let sb_ld_sz   : logic<4> = 4'd1 << iq_issue_op.base.mem_funct3[1:0];
+    let sb_ld_spans: logic    = ({1'b0, agu_addr_iss[2:0]} + sb_ld_sz) >: 4'd8;
+    always_comb {
+        sb_ld_ovl = 1'b0;
+        for i in 0..SB_N {
+            if (i as 4) <: sb_cnt && (sb_addr[i][11:3] == agu_addr_iss[11:3] || (sb_ld_spans && sb_addr[i][11:3] == agu_addr_iss[11:3] + 9'd1)) {
+                sb_ld_ovl = 1'b1;
+            }
+        }
+    }
+    // The committing SLOW store's dword span vs the buffered entries (same
+    // page-offset trick, on the pre-translation c_store_addr — loop-free).
+    // dword+1 always checked (covers the misaligned hi-dword bypass).
+    always_comb {
+        sb_st_ovl = 1'b0;
+        for i in 0..SB_N {
+            if (i as 4) <: sb_cnt && (sb_addr[i][11:3] == c_store_addr[11:3] || sb_addr[i][11:3] == c_store_addr[11:3] + 9'd1) {
+                sb_st_ovl = 1'b1;
+            }
+        }
+    }
+    // 4-entry shift FIFO of committed {PA, data, strobe} stores, drained
+    // oldest-first through the dcache store-drain port (i_saddr) whenever the
+    // fill engine is idle and the bus grants. Entries are COMMITTED state —
+    // never flushed by a redirect/trap.
+    let sb_pop: logic = dc_sdrain_ack;
+    always_ff (clk, rst) {
+        if_reset {
+            sb_cnt = 4'd0;
+            for i in 0..SB_N {
+                sb_addr[i] = 64'd0;
+                sb_data[i] = 64'd0;
+                sb_strb[i] = 8'd0;
+            }
+        } else {
+            if sb_pop {
+                for i in 0..3 {
+                    sb_addr[i] = sb_addr[i + 1];
+                    sb_data[i] = sb_data[i + 1];
+                    sb_strb[i] = sb_strb[i + 1];
+                }
+            }
+            if sb_push {
+                let widx: logic<4> = sb_cnt - (if sb_pop ? 4'd1 : 4'd0);
+                for i in 0..4 {
+                    if widx == (i as 4) {
+                        sb_addr[i] = sb_pa;
+                        sb_data[i] = st_wdata;
+                        sb_strb[i] = st_wstrb;
+                    }
+                }
+            }
+            sb_cnt = sb_cnt + (if sb_push ? 4'd1 : 4'd0) - (if sb_pop ? 4'd1 : 4'd0);
+        }
+    }
+
     inst u_dmem_mmu: dmem_mmu (
         clk                          ,
         rst                          ,
@@ -3759,7 +3950,17 @@ pub module heliodor_core #(
     // ============================================================
     // B.3 dcache hints. dc_st_wstrb_hi: hi strobe for a committing misaligned
     // STORE (drives BOTH the dcache line-invalidation and the tb bypass below).
-    let dc_st_wstrb_hi: logic<8> = if commit_store_fire ? st_wstrb_hi : 8'd0;
+    // S20R: the hi strobe must pair with ITS OWN i_wen write — the SoC keys
+    // the +8 hi-side DRAM/L2 bypass on "this hart holds the W grant", and
+    // with the store buffer a DRAIN can hold that grant while a misaligned
+    // store sits at commit with its i_wen still suppressed (VM walk /
+    // translation pending). The unpaired strobe then writes the pending
+    // store's hi bytes at DRAIN_ADDR+8 — random committed-memory corruption
+    // (observed: N=2 kernel wedged walking a corrupted hash chain). Gate the
+    // strobe on the dcache's EFFECTIVE i_wen, so it is nonzero only on
+    // cycles the lo write itself can own the W channel.
+    let dc_i_wen      : logic    = dmu_dmem_wen && !sb_vm_ok && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl);
+    let dc_st_wstrb_hi: logic<8> = if dc_i_wen ? st_wstrb_hi : 8'd0;
     // dc_load_next: the issuing LOAD's data spans into the next dword
     // (byte_off + size > 8); the dcache fills the next line when it crosses one.
     let dc_byte_off: logic<3> = dmu_dmem_addr[2:0];
@@ -3845,7 +4046,11 @@ pub module heliodor_core #(
         // unaffected — replay_drive excludes store_drive, so i_wen=0 then).
         i_addr           : if replay_drive ? replay_addr : dmu_dmem_addr,
         i_wdata          : dmu_dmem_wdata                ,
-        i_wen            : dmu_dmem_wen                  ,
+        // S20: a buffered (sb_vm_ok) store must not ALSO write through i_wen,
+        // and a slow store's write may not pass an older buffered store to
+        // the SAME dwords (overlap; AMO additionally needs full-empty — its
+        // retire ack holds with the same condition, see rob_commit_ack).
+        i_wen            : dc_i_wen                      ,
         i_ren            : dmu_dmem_ren || replay_drive  ,
         i_wstrb          : dmu_dmem_wstrb                ,
         i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
@@ -3856,13 +4061,16 @@ pub module heliodor_core #(
         i_addr2          : dc_addr2                       ,
         i_ren2           : dc_ren2                        ,
         i_load_next2     : dc_load_next2                  ,
-        // Phase 8 S6: 2nd write port (store-drain). A committing bare aligned
-        // plain store (fast_store) writes here while a load reads i_addr/i_ren.
-        // i_swen=fast_store gates the port; the addr/data/strb are ignored when 0.
-        i_saddr          : c_store_addr                   ,
-        i_swen           : fast_store                     ,
-        i_swdata         : st_wdata                       ,
-        i_swstrb         : st_wstrb                       ,
+        // Phase 8 S6/S20: 2nd write port (store-drain), now fed by the
+        // committed-store buffer head (oldest entry) instead of the live
+        // committing store. o_sdrain_ack pops the entry.
+        i_saddr          : sb_addr[0]                     ,
+        i_swen           : !sb_empty                      ,
+        // S20.2: near-full buffer (or a head store already blocked on room)
+        // escalates the drain over new fill starts.
+        i_sdrain_urgent  : sb_cnt >= 4'd3                 ,
+        i_swdata         : sb_data[0]                     ,
+        i_swstrb         : sb_strb[0]                     ,
         o_sdrain_ack     : dc_sdrain_ack                  ,
         o_rdata2         : dcache_rdata2                  ,
         o_rdata2_next    : dcache_rdata2_next            ,
@@ -3909,7 +4117,18 @@ pub module heliodor_core #(
     // fill-safe. Same-address load-load order is naturally kept (if the older
     // load missed this line, the younger can't hit it), and stores never write
     // the arrays mid-fill (IDLE-only write-through + store drain).
-    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !redirect_fire && !i_dcache_inv_valid;
+    // S20: hold a slot-1 load whose dword span may overlap a buffered store
+    // (the buffer does not forward; bare mode so PA == agu_addr_iss2).
+    var sb_ld_ovl2: logic;
+    always_comb {
+        sb_ld_ovl2 = 1'b0;
+        for i in 0..SB_N {
+            if (i as 4) <: sb_cnt && (sb_addr[i][63:3] == agu_addr_iss2[63:3] || sb_addr[i][63:3] == agu_addr_iss2[63:3] + 61'd1) {
+                sb_ld_ovl2 = 1'b1;
+            }
+        }
+    }
+    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !redirect_fire && !i_dcache_inv_valid && !sb_ld_ovl2;
     assign issue2_fire = iq_issue_valid2 && (!issue2_is_load || ld2_complete);
 
     // ============================================================
@@ -3968,7 +4187,28 @@ pub module heliodor_core #(
     assign mshr_capture = mshr_capture_own || mshr_capture_que;
     // rob LQ-record / abort-poison port feeds (vars declared near mshr_cdb).
     assign mshr_rec_addr     = dmu_dmem_addr;
-    assign mshr_abort_poison = ((mshra_v_q && mshra_own_q && !mshra_done_q) || (mshrb_v_q && mshrb_own_q && !mshrb_done_q)) && dc_fill_aborted;
+    // S20R: a committed store buffered DURING the fill (or before a queued
+    // replay's hit) overlaps the captured load — the fill/dcache data
+    // predates the store and the issue-time sb scan can no longer help, so
+    // poison the completion like an aborted fill (S9.3 commit replay
+    // re-executes the load through the normal, sb-checked path).
+    var sb_mshra_ovl: logic;
+    var sb_mshrb_ovl: logic;
+    always_comb {
+        sb_mshra_ovl = 1'b0;
+        sb_mshrb_ovl = 1'b0;
+        for i in 0..SB_N {
+            if (i as 4) <: sb_cnt {
+                if sb_addr[i][11:3] == mshra_addr_q[11:3] {
+                    sb_mshra_ovl = 1'b1;
+                }
+                if sb_addr[i][11:3] == mshrb_addr_q[11:3] {
+                    sb_mshrb_ovl = 1'b1;
+                }
+            }
+        }
+    }
+    assign mshr_abort_poison = ((mshra_v_q && mshra_own_q && !mshra_done_q && (dc_fill_aborted || sb_mshra_ovl)) || (mshrb_v_q && mshrb_own_q && !mshrb_done_q && (dc_fill_aborted || sb_mshrb_ovl)));
     assign mshr_poison_idx   = if mshra_own_q ? mshra_rob_idx_q : mshrb_rob_idx_q;
     // Phase 8 S10.4a: pipe-0 hit-under-miss qualifier (see iss_dc_ok). The
     // forwarded-bytes merge (stld_fwd_*) works on a hit completion exactly as
@@ -3989,7 +4229,8 @@ pub module heliodor_core #(
     let mshra_squashed: logic = mshra_v_q && (redirect_fire || (early_redir_fire_q && (mshra_age >: s10_early_age)));
     let mshrb_squashed: logic = mshrb_v_q && (redirect_fire || (early_redir_fire_q && (mshrb_age >: s10_early_age)));
     // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).
-    let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid;
+    let replay_sb_ovl  : logic = if replay_is_a ? sb_mshra_ovl : sb_mshrb_ovl;
+    let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid && !replay_sb_ovl;
     let replay_claim   : logic = replay_drive && dc_miss_valid;
     // Fill completion routes to the OWNING entry.
     // S14.2: dc_fill_ready fires the owner's completion EARLY — critical-word-

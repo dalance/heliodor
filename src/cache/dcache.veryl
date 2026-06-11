@@ -64,6 +64,12 @@ pub module dcache #(
     // i_swen=0 to disable the port entirely (no behavioral effect).
     i_saddr     : input  logic<64>,
     i_swen      : input  logic    ,
+    // Phase 8 S20.2: drain URGENCY. When high (the core's store buffer is
+    // near full and about to block retire), the pending drain takes the next
+    // slot BEFORE a new demand-miss fill may start: the fill start is held
+    // and this hart's miss read is suppressed, which also satisfies the
+    // SoC's wgrant_ok (no own read needing DRAM) so the write goes through.
+    i_sdrain_urgent: input logic,
     i_swdata    : input  logic<64>,
     i_swstrb    : input  logic<8> ,
     o_sdrain_ack: output logic    ,
@@ -358,9 +364,21 @@ pub module dcache #(
     // commit/miss interleaving). The split still buys the cross-hart case:
     // hart B's drain is granted during hart A's fill whenever A's transfer
     // hits the L2 (the wgrant_ok term), which the old single channel never
-    // allowed. drain_fill_conflict is redundant under IDLE&&!miss but kept
-    // for when mid-fill drains return (S20 store-buffer recovery).
-    let want_store     : logic = i_swen && state == State::IDLE && !miss && !drain_fill_conflict;
+    // allowed.
+    // S20.2 collision fix: the drain must YIELD to a same-cycle i_wen write —
+    // the o_memw mux gives i_wen priority, so a coincident drain would
+    // o_sdrain_ack (popping the buffered store) while the bus carried the
+    // i_wen address: the buffered store would be lost without ever reaching
+    // memory (the N=4 secondary-bringup wedge). With the live committing
+    // store this could not happen (i_wen and i_swen were exclusive); the
+    // buffer drains asynchronously to commit, so it can.
+    // S20.2 urgency: when urgent, the drain also wins over a pending demand
+    // miss — the fill start is held (drain_urgent gates the IDLE→FILL
+    // transition and the miss read below) and the drain takes the slot. A
+    // same-line conflict drops want_store (and so drain_urgent), letting the
+    // fill proceed — no mutual block.
+    let want_store     : logic = i_swen && state == State::IDLE && !i_wen && (!miss || i_sdrain_urgent) && !drain_fill_conflict;
+    let drain_urgent   : logic = want_store && i_sdrain_urgent;
     let store_can_drain: logic = want_store && i_memw_grant;
     assign o_sdrain_ack = store_can_drain;
 
@@ -410,7 +428,8 @@ pub module dcache #(
                     // starts (independent write channel) — the FILL-state inv
                     // check below sees state==IDLE this cycle and would miss
                     // it, so seed fill_aborted from the same-cycle invalidate.
-                    if miss && i_memr_grant {
+                    // S20.2: a fill start yields to an URGENT drain this cycle.
+                    if miss && i_memr_grant && !drain_urgent {
                         fill_index   = f_index;
                         fill_tag     = f_tag;
                         fill_way     = victim_way;
@@ -699,7 +718,7 @@ pub module dcache #(
     :
         {f_tag, f_index, 3'd0, 3'b000}
     ;
-    assign o_memr_ren = if filling ? 1'b1 : if i_ren && !cache_hit && i_memr_grant ? 1'b1 : 1'b0;
+    assign o_memr_ren = if filling ? 1'b1 : if i_ren && !cache_hit && i_memr_grant && !drain_urgent ? 1'b1 : 1'b0;
 
     assign o_memw_addr  = if i_wen ? i_addr : i_saddr;
     assign o_memw_wdata = if i_wen ? i_wdata : if store_can_drain ? i_swdata : '0;
@@ -727,7 +746,9 @@ pub module dcache #(
     // o_fill_complete excludes an aborted fill (remote-write i_inv during the
     // fill): the line stays Invalid and the filled data may be stale, so the
     // MSHR consumer must NOT complete the load from o_fill_rdata — it replays.
-    assign o_miss_valid    = miss && i_memr_grant;
+    // S20.2: no fill-start pulse when an urgent drain preempted the start —
+    // an MSHR capture without its fill would strand the load.
+    assign o_miss_valid    = miss && i_memr_grant && !drain_urgent;
     assign o_fill_complete = state == State::DONE && !fill_aborted;
     assign o_fill_aborted  = state == State::DONE && fill_aborted;
     // S14.2: owner early restart. With critical-word-first the demanded dword
