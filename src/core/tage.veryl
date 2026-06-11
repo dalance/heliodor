@@ -1,0 +1,310 @@
+// Phase 8 S22: TAGE-lite conditional-branch direction predictor.
+//
+// The base gshare BHT (13-bit history) tops out on branches that correlate
+// with history older than 13 branches or with patterns the single table
+// aliases — the S22 probe put conditional-direction mispredicts at ~70K
+// events (~6.3% of the N=1 boot). TAGE adds tagged tables indexed by
+// geometrically longer history folds ({8, 21, 55} here); the prediction
+// comes from the longest-history table whose tag matches (the provider),
+// falling back to the base BHT. Entries are allocated on a mispredict in a
+// table longer than the provider, so long-history entries exist only for
+// branches the short tables actually get wrong.
+//
+// Training needs no ROB-carried state (same proof shape as the S18 iBTB):
+// at commit, the PRE-update committed long history equals the op's
+// fetch-time speculative history (older branches have all committed; a
+// mispredicted older branch would have squashed this op), so each table's
+// index/tag is recomputed from the committed history and the tables are
+// re-read through a dedicated train port. The re-read provider can differ
+// from the fetch-time provider when an intervening commit retrained the
+// same entry — accuracy-only, like the spec-history restore approximation.
+pub module tage #(
+    param IDX_W : u32 = 10, // log2(entries) per tagged table
+    param TAG_W : u32 = 8 ,
+    param HIST_W: u32 = 55, // longest history fold
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Lookup (combinational, fetch). i_hist is the speculative long GHR;
+    // both slots of a fetch bundle share it (same approximation as the BHT
+    // dual lookup sharing spec_ghr).
+    i_pc   : input  logic<64>    ,
+    i_hist : input  logic<HIST_W>,
+    o_hit  : output logic        ,
+    o_taken: output logic        ,
+
+    // 2nd lookup port (slot-1 PC of a 2-wide fetch bundle).
+    i_pc2   : input  logic<64>,
+    o_hit2  : output logic    ,
+    o_taken2: output logic    ,
+
+    // Train (commit): a conditional branch retired. i_train_hist is the
+    // PRE-update committed long history (== the op's fetch-time spec
+    // history); i_train_mispred is the fetch-time DIRECTION mispredict;
+    // i_train_base_pred is the base BHT's prediction at the op's carried
+    // gshare index (the altpred fallback for the useful-bit update).
+    i_train_en       : input logic        ,
+    i_train_pc       : input logic<64>    ,
+    i_train_hist     : input logic<HIST_W>,
+    i_train_taken    : input logic        ,
+    i_train_mispred  : input logic        ,
+    i_train_base_pred: input logic        ,
+) {
+    const ENTRIES: u32 = 1 << IDX_W;
+
+    // Table 1: hist 8 / Table 2: hist 21 / Table 3: hist 55. Per-field plain
+    // arrays (same sim-bug avoidance as the fetch buffer).
+    var t1_v  : logic        [ENTRIES];
+    var t1_tag: logic<TAG_W> [ENTRIES];
+    var t1_ctr: logic<2>     [ENTRIES];
+    var t1_u  : logic        [ENTRIES];
+    var t2_v  : logic        [ENTRIES];
+    var t2_tag: logic<TAG_W> [ENTRIES];
+    var t2_ctr: logic<2>     [ENTRIES];
+    var t2_u  : logic        [ENTRIES];
+    var t3_v  : logic        [ENTRIES];
+    var t3_tag: logic<TAG_W> [ENTRIES];
+    var t3_ctr: logic<2>     [ENTRIES];
+    var t3_u  : logic        [ENTRIES];
+
+    // History folds. Index fold = XOR of IDX_W-wide chunks of hist[L-1:0];
+    // tag fold = XOR of TAG_W-wide chunks. The index also folds two PC
+    // slices so distinct sites spread across the table.
+    function f10_h8 (h: input logic<HIST_W>) -> logic<10> {
+        return {2'b00, h[7:0]};
+    }
+    function f10_h21 (h: input logic<HIST_W>) -> logic<10> {
+        return h[9:0] ^ h[19:10] ^ {9'b0_0000_0000, h[20]};
+    }
+    function f10_h55 (h: input logic<HIST_W>) -> logic<10> {
+        return h[9:0] ^ h[19:10] ^ h[29:20] ^ h[39:30] ^ h[49:40] ^ {5'b0_0000, h[54:50]};
+    }
+    function f8_h8 (h: input logic<HIST_W>) -> logic<8> {
+        return h[7:0];
+    }
+    function f8_h21 (h: input logic<HIST_W>) -> logic<8> {
+        return h[7:0] ^ h[15:8] ^ {3'b000, h[20:16]};
+    }
+    function f8_h55 (h: input logic<HIST_W>) -> logic<8> {
+        return h[7:0] ^ h[15:8] ^ h[23:16] ^ h[31:24] ^ h[39:32] ^ h[47:40] ^ {1'b0, h[54:48]};
+    }
+
+    // ---------------- lookup port 0 ----------------
+    let lk1_idx: logic<10>    = i_pc[10:1] ^ i_pc[20:11] ^ f10_h8(i_hist);
+    let lk2_idx: logic<10>    = i_pc[10:1] ^ i_pc[20:11] ^ f10_h21(i_hist);
+    let lk3_idx: logic<10>    = i_pc[10:1] ^ i_pc[20:11] ^ f10_h55(i_hist);
+    let lk1_tag: logic<TAG_W> = i_pc[8:1] ^ f8_h8(i_hist);
+    let lk2_tag: logic<TAG_W> = i_pc[8:1] ^ f8_h21(i_hist);
+    let lk3_tag: logic<TAG_W> = i_pc[8:1] ^ f8_h55(i_hist);
+    let lk1_hit: logic        = t1_v[lk1_idx] && t1_tag[lk1_idx] == lk1_tag;
+    let lk2_hit: logic        = t2_v[lk2_idx] && t2_tag[lk2_idx] == lk2_tag;
+    let lk3_hit: logic        = t3_v[lk3_idx] && t3_tag[lk3_idx] == lk3_tag;
+
+    // Use-alt-on-newly-allocated: a just-allocated entry (weak ctr, u==0)
+    // has no track record yet; its altpred (next-longest hit, else the base
+    // predictor via o_hit=0) can be the better choice. Whether it actually
+    // is depends on the workload (steady code: trust the new entry; noisy
+    // data-dependent branches: trust the alt), so a global 4-bit counter
+    // adapts the policy from commit-time outcomes (Seznec's USE_ALT_ON_NA).
+    var use_alt_q: logic<4>;
+    let use_alt  : logic    = use_alt_q[3];
+    let na1: logic = use_alt && !t1_u[lk1_idx] && (t1_ctr[lk1_idx] == 2'b01 || t1_ctr[lk1_idx] == 2'b10);
+    let na2: logic = use_alt && !t2_u[lk2_idx] && (t2_ctr[lk2_idx] == 2'b01 || t2_ctr[lk2_idx] == 2'b10);
+    let na3: logic = use_alt && !t3_u[lk3_idx] && (t3_ctr[lk3_idx] == 2'b01 || t3_ctr[lk3_idx] == 2'b10);
+    let p1: logic = t1_ctr[lk1_idx][1];
+    let p2: logic = t2_ctr[lk2_idx][1];
+    let p3: logic = t3_ctr[lk3_idx][1];
+    assign o_hit = if lk3_hit ?
+        (!na3 || lk2_hit || lk1_hit)
+    : if lk2_hit ?
+        (!na2 || lk1_hit)
+    : if lk1_hit ?
+        !na1
+    :
+        1'b0
+    ;
+    assign o_taken = if lk3_hit && !na3 ?
+        p3
+    : if lk3_hit ?
+        (if lk2_hit ? p2 : p1)
+    : if lk2_hit && !na2 ?
+        p2
+    :
+        p1
+    ;
+
+    // ---------------- lookup port 1 ----------------
+    let lk1_idx2: logic<10>    = i_pc2[10:1] ^ i_pc2[20:11] ^ f10_h8(i_hist);
+    let lk2_idx2: logic<10>    = i_pc2[10:1] ^ i_pc2[20:11] ^ f10_h21(i_hist);
+    let lk3_idx2: logic<10>    = i_pc2[10:1] ^ i_pc2[20:11] ^ f10_h55(i_hist);
+    let lk1_tag2: logic<TAG_W> = i_pc2[8:1] ^ f8_h8(i_hist);
+    let lk2_tag2: logic<TAG_W> = i_pc2[8:1] ^ f8_h21(i_hist);
+    let lk3_tag2: logic<TAG_W> = i_pc2[8:1] ^ f8_h55(i_hist);
+    let lk1_hit2: logic        = t1_v[lk1_idx2] && t1_tag[lk1_idx2] == lk1_tag2;
+    let lk2_hit2: logic        = t2_v[lk2_idx2] && t2_tag[lk2_idx2] == lk2_tag2;
+    let lk3_hit2: logic        = t3_v[lk3_idx2] && t3_tag[lk3_idx2] == lk3_tag2;
+
+    let na1_2: logic = use_alt && !t1_u[lk1_idx2] && (t1_ctr[lk1_idx2] == 2'b01 || t1_ctr[lk1_idx2] == 2'b10);
+    let na2_2: logic = use_alt && !t2_u[lk2_idx2] && (t2_ctr[lk2_idx2] == 2'b01 || t2_ctr[lk2_idx2] == 2'b10);
+    let na3_2: logic = use_alt && !t3_u[lk3_idx2] && (t3_ctr[lk3_idx2] == 2'b01 || t3_ctr[lk3_idx2] == 2'b10);
+    let p1_2: logic = t1_ctr[lk1_idx2][1];
+    let p2_2: logic = t2_ctr[lk2_idx2][1];
+    let p3_2: logic = t3_ctr[lk3_idx2][1];
+    assign o_hit2 = if lk3_hit2 ?
+        (!na3_2 || lk2_hit2 || lk1_hit2)
+    : if lk2_hit2 ?
+        (!na2_2 || lk1_hit2)
+    : if lk1_hit2 ?
+        !na1_2
+    :
+        1'b0
+    ;
+    assign o_taken2 = if lk3_hit2 && !na3_2 ?
+        p3_2
+    : if lk3_hit2 ?
+        (if lk2_hit2 ? p2_2 : p1_2)
+    : if lk2_hit2 && !na2_2 ?
+        p2_2
+    :
+        p1_2
+    ;
+
+    // ---------------- train port (commit re-read) ----------------
+    let tr1_idx: logic<10>    = i_train_pc[10:1] ^ i_train_pc[20:11] ^ f10_h8(i_train_hist);
+    let tr2_idx: logic<10>    = i_train_pc[10:1] ^ i_train_pc[20:11] ^ f10_h21(i_train_hist);
+    let tr3_idx: logic<10>    = i_train_pc[10:1] ^ i_train_pc[20:11] ^ f10_h55(i_train_hist);
+    let tr1_tag: logic<TAG_W> = i_train_pc[8:1] ^ f8_h8(i_train_hist);
+    let tr2_tag: logic<TAG_W> = i_train_pc[8:1] ^ f8_h21(i_train_hist);
+    let tr3_tag: logic<TAG_W> = i_train_pc[8:1] ^ f8_h55(i_train_hist);
+    let tr1_hit: logic        = t1_v[tr1_idx] && t1_tag[tr1_idx] == tr1_tag;
+    let tr2_hit: logic        = t2_v[tr2_idx] && t2_tag[tr2_idx] == tr2_tag;
+    let tr3_hit: logic        = t3_v[tr3_idx] && t3_tag[tr3_idx] == tr3_tag;
+
+    // Provider = longest matching table (0 = base BHT). altpred = the next
+    // matching shorter table's prediction, else the base prediction.
+    let tr_prov: logic<2> = if tr3_hit ? 2'd3 : if tr2_hit ? 2'd2 : if tr1_hit ? 2'd1 : 2'd0;
+    let tr_prov_pred: logic = if tr3_hit ? t3_ctr[tr3_idx][1] : if tr2_hit ? t2_ctr[tr2_idx][1] : t1_ctr[tr1_idx][1];
+    let tr_na_prov: logic = if tr3_hit ?
+        (!t3_u[tr3_idx] && (t3_ctr[tr3_idx] == 2'b01 || t3_ctr[tr3_idx] == 2'b10))
+    : if tr2_hit ?
+        (!t2_u[tr2_idx] && (t2_ctr[tr2_idx] == 2'b01 || t2_ctr[tr2_idx] == 2'b10))
+    :
+        (!t1_u[tr1_idx] && (t1_ctr[tr1_idx] == 2'b01 || t1_ctr[tr1_idx] == 2'b10))
+    ;
+    let tr_alt_pred: logic = if tr3_hit ?
+        (if tr2_hit ? t2_ctr[tr2_idx][1] : if tr1_hit ? t1_ctr[tr1_idx][1] : i_train_base_pred)
+    : if tr2_hit ?
+        (if tr1_hit ? t1_ctr[tr1_idx][1] : i_train_base_pred)
+    :
+        i_train_base_pred
+    ;
+
+    // Allocation: on a direction mispredict, claim a useful==0 entry in a
+    // table longer than the provider. An 8-bit LFSR picks longest-first 1/4
+    // of the time so allocations spread into T2/T3 (deterministic
+    // shortest-first starves the longer tables).
+    var lfsr: logic<8>;
+    let can1: logic = tr_prov == 2'd0 && !t1_u[tr1_idx];
+    let can2: logic = tr_prov <: 2'd2 && !t2_u[tr2_idx];
+    let can3: logic = tr_prov <: 2'd3 && !t3_u[tr3_idx];
+    let alloc_rev: logic = lfsr[1:0] == 2'b11;
+    let alloc1: logic = if alloc_rev ? (can1 && !can2 && !can3) : can1;
+    let alloc2: logic = if alloc_rev ? (can2 && !can3) : (can2 && !can1);
+    let alloc3: logic = if alloc_rev ? can3 : (can3 && !can1 && !can2);
+    let alloc_none: logic = !can1 && !can2 && !can3;
+    let alloc_ctr : logic<2> = if i_train_taken ? 2'b10 : 2'b01;
+
+    // Periodic useful-bit decay: clear all u every 2^18 trains so stale
+    // entries do not block allocation forever.
+    var u_tick: logic<18>;
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..ENTRIES {
+                t1_v[i]   = 1'b0;
+                t1_tag[i] = '0;
+                t1_ctr[i] = 2'b01;
+                t1_u[i]   = 1'b0;
+                t2_v[i]   = 1'b0;
+                t2_tag[i] = '0;
+                t2_ctr[i] = 2'b01;
+                t2_u[i]   = 1'b0;
+                t3_v[i]   = 1'b0;
+                t3_tag[i] = '0;
+                t3_ctr[i] = 2'b01;
+                t3_u[i]   = 1'b0;
+            }
+            lfsr      = 8'ha5;
+            u_tick    = 18'd0;
+            use_alt_q = 4'd8;
+        } else if i_train_en {
+            lfsr   = {lfsr[6:0], lfsr[7] ^ lfsr[5] ^ lfsr[4] ^ lfsr[3]};
+            u_tick = u_tick + 18'd1;
+            // Adapt the use-alt-on-NA policy: when a newly-allocated provider
+            // and its altpred disagree, learn which side tends to be right.
+            if tr_prov != 2'd0 && tr_na_prov && tr_prov_pred != tr_alt_pred {
+                if tr_alt_pred == i_train_taken {
+                    use_alt_q = if use_alt_q == 4'hf ? 4'hf : use_alt_q + 4'd1;
+                } else {
+                    use_alt_q = if use_alt_q == 4'h0 ? 4'h0 : use_alt_q - 4'd1;
+                }
+            }
+            if u_tick == 18'h3ffff {
+                for i in 0..ENTRIES {
+                    t1_u[i] = 1'b0;
+                    t2_u[i] = 1'b0;
+                    t3_u[i] = 1'b0;
+                }
+            }
+            // Provider update: counter toward the outcome; useful tracks
+            // whether the provider beat the altpred when they disagreed.
+            if tr_prov == 2'd3 {
+                t3_ctr[tr3_idx] = if i_train_taken ? (if t3_ctr[tr3_idx] == 2'b11 ? 2'b11 : t3_ctr[tr3_idx] + 2'd1) : (if t3_ctr[tr3_idx] == 2'b00 ? 2'b00 : t3_ctr[tr3_idx] - 2'd1);
+                if tr_prov_pred != tr_alt_pred {
+                    t3_u[tr3_idx] = tr_prov_pred == i_train_taken;
+                }
+            } else if tr_prov == 2'd2 {
+                t2_ctr[tr2_idx] = if i_train_taken ? (if t2_ctr[tr2_idx] == 2'b11 ? 2'b11 : t2_ctr[tr2_idx] + 2'd1) : (if t2_ctr[tr2_idx] == 2'b00 ? 2'b00 : t2_ctr[tr2_idx] - 2'd1);
+                if tr_prov_pred != tr_alt_pred {
+                    t2_u[tr2_idx] = tr_prov_pred == i_train_taken;
+                }
+            } else if tr_prov == 2'd1 {
+                t1_ctr[tr1_idx] = if i_train_taken ? (if t1_ctr[tr1_idx] == 2'b11 ? 2'b11 : t1_ctr[tr1_idx] + 2'd1) : (if t1_ctr[tr1_idx] == 2'b00 ? 2'b00 : t1_ctr[tr1_idx] - 2'd1);
+                if tr_prov_pred != tr_alt_pred {
+                    t1_u[tr1_idx] = tr_prov_pred == i_train_taken;
+                }
+            }
+            // Allocate on a mispredict (a longer-history entry may separate
+            // the paths the provider conflates). No candidate → age the
+            // longer tables' entries instead so a later mispredict can claim
+            // one.
+            if i_train_mispred {
+                if alloc1 {
+                    t1_v[tr1_idx]   = 1'b1;
+                    t1_tag[tr1_idx] = tr1_tag;
+                    t1_ctr[tr1_idx] = alloc_ctr;
+                    t1_u[tr1_idx]   = 1'b0;
+                } else if alloc2 {
+                    t2_v[tr2_idx]   = 1'b1;
+                    t2_tag[tr2_idx] = tr2_tag;
+                    t2_ctr[tr2_idx] = alloc_ctr;
+                    t2_u[tr2_idx]   = 1'b0;
+                } else if alloc3 {
+                    t3_v[tr3_idx]   = 1'b1;
+                    t3_tag[tr3_idx] = tr3_tag;
+                    t3_ctr[tr3_idx] = alloc_ctr;
+                    t3_u[tr3_idx]   = 1'b0;
+                } else if alloc_none && tr_prov != 2'd3 {
+                    if tr_prov == 2'd0 {
+                        t1_u[tr1_idx] = 1'b0;
+                    }
+                    if tr_prov <: 2'd2 {
+                        t2_u[tr2_idx] = 1'b0;
+                    }
+                    t3_u[tr3_idx] = 1'b0;
+                }
+            }
+        }
+    }
+}
