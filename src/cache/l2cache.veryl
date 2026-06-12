@@ -36,7 +36,32 @@
 // (same set, victim way) is ordered merge-first/install-last below, so the
 // install wins the array cells — the merge's bytes belonged to the dying
 // line and are already in DRAM (write-through), so nothing is lost.
-pub module l2cache (
+//
+// P9.2: INCLUSIVE DIRECTORY. Each L2 line carries a sharers bitmask (which
+// harts' L1 D$ may hold the line). mem_ctrl maintains it through this
+// module's ports:
+//   - i_cadd_v: add i_cadd_hart as a sharer of the c-port line (a lookup-hit
+//     grant). mem_ctrl retries a lookup that collides with a same-cycle
+//     write to the line, so a cadd never races a same-line write update.
+//   - i_inst_hart: the installed line's sharer set becomes {hart} (plus the
+//     old sharers when the line was already present — a second hart gathered
+//     the same line and the in-place overwrite must not drop the first).
+//   - install victim preview (o_iv_*, comb on i_inst_addr): the line the
+//     install would evict + its sharers, so mem_ctrl back-invalidates them
+//     (inclusion). Victim selection EXCLUDES lines with an active mem_ctrl
+//     slot (i_busy_*) — evicting a line mid-transaction would let the
+//     requesting L1 complete a fill the directory no longer covers.
+//     o_iv_blocked = no eligible way this cycle (mem_ctrl holds the install).
+//   - write side: o_w_sharers / o_w_sharers_hi expose the sharer masks of
+//     the write line (and its +8 line for a misaligned store) so mem_ctrl
+//     emits PRECISE invalidates; the directory keeps only the writer's bit
+//     on a write hit (the other copies are invalidated), and clears the
+//     mask(s) on the misaligned invalidate path.
+// The directory may OVER-approximate (an L1 that silently dropped a clean
+// line stays listed): that costs spurious invalidates, never correctness.
+pub module l2cache #(
+    param N_HARTS: u32 = 1,
+) (
     clk: input clock,
     rst: input reset,
     // P9.1 lookup/copy port (mem_ctrl): combinational full-line lookup at
@@ -45,10 +70,49 @@ pub module l2cache (
     i_cren : input  logic        ,
     o_chit : output logic        ,
     o_cdata: output logic<64> [8],
+    // P9.2 directory: lookup-grant sharer add (same line as i_caddr).
+    // i_cadd_own: the grant is an OWNERSHIP grant (RFO / sole-sharer E) —
+    // the entry becomes owned with mask {hart} (mem_ctrl invalidates the
+    // other sharers the same cycle for the RFO case).
+    i_cadd_v   : input  logic          ,
+    i_cadd_hart: input  logic<3>       ,
+    i_cadd_own : input  logic          ,
+    o_c_sharers: output logic<N_HARTS> ,
+    o_c_owned  : output logic          , // c-port line is OWNED (E/M in an L1)
     // P9.1 full-line install port (mem_ctrl: gathered DRAM line).
     i_inst_v   : input logic        ,
     i_inst_addr: input logic<64>    ,
     i_inst_data: input logic<64> [8],
+    // P9.2 directory: installing hart + victim preview (comb on i_inst_addr)
+    // + active-transaction lines excluded from victim selection.
+    i_inst_hart : input  logic<3>           ,
+    o_iv_valid  : output logic              , // install would evict a valid line
+    o_iv_addr   : output logic<64>          ,
+    o_iv_sharers: output logic<N_HARTS>     ,
+    o_iv_owned  : output logic              , // Phase B: victim OWNED → recall first
+    o_iv_blocked: output logic              , // no eligible way this cycle
+    // Phase B: sharers already on the install line (in-place overwrite case;
+    // 0 when the line is absent). mem_ctrl downgrades the grant to S when
+    // another hart is listed.
+    o_inst_oldshr: output logic<N_HARTS>    ,
+    i_busy_line : input  logic<58> [N_HARTS],
+    i_busy_v    : input  logic     [N_HARTS],
+    // P9.2 directory: writer hart + sharer masks / ownership of the write
+    // target line(s). i_w_wb marks an L1 WRITEBACK (eviction/recall/flush):
+    // full-line merge, and the writer LEAVES the sharer set (owner cleared)
+    // instead of becoming its sole member.
+    i_w_hart      : input  logic<3>          ,
+    i_w_wb        : input  logic             ,
+    o_w_sharers   : output logic<N_HARTS>    ,
+    o_w_sharers_hi: output logic<N_HARTS>    ,
+    o_w_owned     : output logic             ,
+    o_w_owned_hi  : output logic             ,
+    // Phase B: recall-engine CLEAN-ACK ownership clear — the probed owner
+    // had no dirty copy (silent E drop / clean invalidate), so no WB will
+    // arrive; drop it from the directory here.
+    i_eclr_v   : input logic    ,
+    i_eclr_addr: input logic<64>,
+    i_eclr_hart: input logic<3> ,
     // Upper WRITE interface (S23: from memory_bus's write channel — the
     // granted hart's write-through store). Always forwards to DRAM.
     // S25 write-combining: a write is a full 64B LINE — 8 dword lanes with
@@ -102,6 +166,36 @@ pub module l2cache (
     var data_2: logic<64> [4096];
     var data_3: logic<64> [4096];
     var plru  : logic<3>  [512] ; // tree-PLRU per set
+    // P9.2 directory: per-line sharer bitmask (meaningful only while lv_*) +
+    // OWNED bit (Phase B: the mask is one-hot = the owner; its L1 state is E
+    // or M — a recall finds out which).
+    var shr_0: logic<N_HARTS> [512];
+    var shr_1: logic<N_HARTS> [512];
+    var shr_2: logic<N_HARTS> [512];
+    var shr_3: logic<N_HARTS> [512];
+    var own_0: logic [512];
+    var own_1: logic [512];
+    var own_2: logic [512];
+    var own_3: logic [512];
+
+    // One-hot of a hart index (i_*_hart ports are logic<3> regardless of N).
+    var cadd_oh: logic<N_HARTS>;
+    var inst_oh: logic<N_HARTS>;
+    var w_oh   : logic<N_HARTS>;
+    var eclr_oh: logic<N_HARTS>;
+    for h in 0..N_HARTS :gen_hart_oh {
+        assign cadd_oh[h] = i_cadd_hart == (h as 3);
+        assign inst_oh[h] = i_inst_hart == (h as 3);
+        assign w_oh[h]    = i_w_hart == (h as 3);
+        assign eclr_oh[h] = i_eclr_hart == (h as 3);
+    }
+    // Engine clean-ack decode.
+    let e_tag  : logic<49> = i_eclr_addr[63:15];
+    let e_index: logic<9>  = i_eclr_addr[14:6];
+    let etm_0  : logic     = lv_0[e_index] && (tag_0[e_index] == e_tag);
+    let etm_1  : logic     = lv_1[e_index] && (tag_1[e_index] == e_tag);
+    let etm_2  : logic     = lv_2[e_index] && (tag_2[e_index] == e_tag);
+    let etm_3  : logic     = lv_3[e_index] && (tag_3[e_index] == e_tag);
 
     // -----------------------------------------------------------------
     // Lookup port: per-way line hit + full-line copy.
@@ -115,6 +209,29 @@ pub module l2cache (
     let c_way: logic<2> = if ctm_0 ? 2'd0 : if ctm_1 ? 2'd1 : if ctm_2 ? 2'd2 : 2'd3;
 
     assign o_chit = any_ctm;
+    // P9.2: sharers of the c-port line (0 on miss).
+    assign o_c_sharers = if ctm_0 ?
+        shr_0[c_index]
+    : if ctm_1 ?
+        shr_1[c_index]
+    : if ctm_2 ?
+        shr_2[c_index]
+    : if ctm_3 ?
+        shr_3[c_index]
+    :
+        '0
+    ;
+    assign o_c_owned = if ctm_0 ?
+        own_0[c_index]
+    : if ctm_1 ?
+        own_1[c_index]
+    : if ctm_2 ?
+        own_2[c_index]
+    : if ctm_3 ?
+        own_3[c_index]
+    :
+        1'b0
+    ;
     for l in 0..8 :gen_cdata {
         assign o_cdata[l] = if ctm_0 ?
             data_0[{c_index, l as 3}]
@@ -154,9 +271,63 @@ pub module l2cache (
     let ntm_2    : logic     = lv_2[nxt_index] && (tag_2[nxt_index] == nxt_tag);
     let ntm_3    : logic     = lv_3[nxt_index] && (tag_3[nxt_index] == nxt_tag);
 
+    // P9.2: sharer masks of the write line (and the +8 line) for mem_ctrl's
+    // precise invalidate emission. 0 on a miss (no L1 holds it — inclusion).
+    assign o_w_sharers = if w_tm_0 ?
+        shr_0[w_index]
+    : if w_tm_1 ?
+        shr_1[w_index]
+    : if w_tm_2 ?
+        shr_2[w_index]
+    : if w_tm_3 ?
+        shr_3[w_index]
+    :
+        '0
+    ;
+    assign o_w_sharers_hi = if ntm_0 ?
+        shr_0[nxt_index]
+    : if ntm_1 ?
+        shr_1[nxt_index]
+    : if ntm_2 ?
+        shr_2[nxt_index]
+    : if ntm_3 ?
+        shr_3[nxt_index]
+    :
+        '0
+    ;
+    // Phase B: ownership of the write target line(s) — feeds the SoC's
+    // write-grant VETO (a non-WB write to a line owned by ANOTHER hart must
+    // recall it first, or the owner's later writeback would bury this write).
+    assign o_w_owned = if w_tm_0 ?
+        own_0[w_index]
+    : if w_tm_1 ?
+        own_1[w_index]
+    : if w_tm_2 ?
+        own_2[w_index]
+    : if w_tm_3 ?
+        own_3[w_index]
+    :
+        1'b0
+    ;
+    assign o_w_owned_hi = if ntm_0 ?
+        own_0[nxt_index]
+    : if ntm_1 ?
+        own_1[nxt_index]
+    : if ntm_2 ?
+        own_2[nxt_index]
+    : if ntm_3 ?
+        own_3[nxt_index]
+    :
+        1'b0
+    ;
+
     // -----------------------------------------------------------------
     // Install victim selection — same-line way (overwrite in place) first,
-    // then invalid way, then PLRU.
+    // then invalid way, then a non-BUSY valid way (PLRU's pick when it is
+    // not busy, else the first non-busy way). P9.2: a way is BUSY when its
+    // line has an active mem_ctrl transaction (i_busy_*) — evicting it
+    // would break inclusion for the L1 fill in flight. All four ways busy
+    // ⇒ o_iv_blocked, mem_ctrl holds the install and retries.
     // -----------------------------------------------------------------
     let itm_0: logic = lv_0[in_index] && (tag_0[in_index] == in_tag);
     let itm_1: logic = lv_1[in_index] && (tag_1[in_index] == in_tag);
@@ -165,11 +336,108 @@ pub module l2cache (
     let i_any_tm: logic    = itm_0 || itm_1 || itm_2 || itm_3;
     let itm_way : logic<2> = if itm_0 ? 2'd0 : if itm_1 ? 2'd1 : if itm_2 ? 2'd2 : 2'd3;
 
+    // Per-way busy: a valid line matching any active transaction line.
+    var way_busy: logic [4];
+    var bm_0    : logic [N_HARTS];
+    var bm_1    : logic [N_HARTS];
+    var bm_2    : logic [N_HARTS];
+    var bm_3    : logic [N_HARTS];
+    for h in 0..N_HARTS :gen_busy_m {
+        assign bm_0[h] = i_busy_v[h] && (i_busy_line[h] == {tag_0[in_index], in_index});
+        assign bm_1[h] = i_busy_v[h] && (i_busy_line[h] == {tag_1[in_index], in_index});
+        assign bm_2[h] = i_busy_v[h] && (i_busy_line[h] == {tag_2[in_index], in_index});
+        assign bm_3[h] = i_busy_v[h] && (i_busy_line[h] == {tag_3[in_index], in_index});
+    }
+    var bany_0: logic;
+    var bany_1: logic;
+    var bany_2: logic;
+    var bany_3: logic;
+    always_comb {
+        bany_0 = 1'b0;
+        bany_1 = 1'b0;
+        bany_2 = 1'b0;
+        bany_3 = 1'b0;
+        for h in 0..N_HARTS {
+            if bm_0[h] {
+                bany_0 = 1'b1;
+            }
+            if bm_1[h] {
+                bany_1 = 1'b1;
+            }
+            if bm_2[h] {
+                bany_2 = 1'b1;
+            }
+            if bm_3[h] {
+                bany_3 = 1'b1;
+            }
+        }
+    }
+    assign way_busy[0] = lv_0[in_index] && bany_0;
+    assign way_busy[1] = lv_1[in_index] && bany_1;
+    assign way_busy[2] = lv_2[in_index] && bany_2;
+    assign way_busy[3] = lv_3[in_index] && bany_3;
+
     let i_plru_bits: logic<3> = plru[in_index];
     let i_has_inv  : logic    = !lv_0[in_index] || !lv_1[in_index] || !lv_2[in_index] || !lv_3[in_index];
     let i_inv_way  : logic<2> = if !lv_0[in_index] ? 2'd0 : if !lv_1[in_index] ? 2'd1 : if !lv_2[in_index] ? 2'd2 : 2'd3;
     let i_plru_way : logic<2> = {i_plru_bits[2], if !i_plru_bits[2] ? i_plru_bits[1] : i_plru_bits[0]};
-    let install_way: logic<2> = if i_any_tm ? itm_way : if i_has_inv ? i_inv_way : i_plru_way;
+    let plru_ok: logic = !(if i_plru_way == 2'd0 ?
+        way_busy[0]
+    : if i_plru_way == 2'd1 ?
+        way_busy[1]
+    : if i_plru_way == 2'd2 ?
+        way_busy[2]
+    :
+        way_busy[3]
+    );
+    let any_nonbusy: logic    = !way_busy[0] || !way_busy[1] || !way_busy[2] || !way_busy[3];
+    let nonbusy_way: logic<2> = if !way_busy[0] ? 2'd0 : if !way_busy[1] ? 2'd1 : if !way_busy[2] ? 2'd2 : 2'd3;
+    let evict_way  : logic<2> = if plru_ok ? i_plru_way : nonbusy_way;
+    let install_way: logic<2> = if i_any_tm ? itm_way : if i_has_inv ? i_inv_way : evict_way;
+
+    // Victim preview: an install would EVICT a valid, different-tag line.
+    assign o_iv_blocked = !i_any_tm && !i_has_inv && !any_nonbusy;
+    assign o_iv_valid   = !i_any_tm && !i_has_inv && any_nonbusy;
+    let iv_tag: logic<49> = if evict_way == 2'd0 ?
+        tag_0[in_index]
+    : if evict_way == 2'd1 ?
+        tag_1[in_index]
+    : if evict_way == 2'd2 ?
+        tag_2[in_index]
+    :
+        tag_3[in_index]
+    ;
+    assign o_iv_addr    = {iv_tag, in_index, 6'd0};
+    assign o_iv_sharers = if evict_way == 2'd0 ?
+        shr_0[in_index]
+    : if evict_way == 2'd1 ?
+        shr_1[in_index]
+    : if evict_way == 2'd2 ?
+        shr_2[in_index]
+    :
+        shr_3[in_index]
+    ;
+    assign o_iv_owned = o_iv_valid && (if evict_way == 2'd0 ?
+        own_0[in_index]
+    : if evict_way == 2'd1 ?
+        own_1[in_index]
+    : if evict_way == 2'd2 ?
+        own_2[in_index]
+    :
+        own_3[in_index]
+    );
+    // Phase B: sharers already on the install line (in-place overwrite).
+    assign o_inst_oldshr = if itm_0 ?
+        shr_0[in_index]
+    : if itm_1 ?
+        shr_1[in_index]
+    : if itm_2 ?
+        shr_2[in_index]
+    : if itm_3 ?
+        shr_3[in_index]
+    :
+        '0
+    ;
 
     // -----------------------------------------------------------------
     // DRAM bus driving — P9.1: write passthrough only.
@@ -232,13 +500,65 @@ pub module l2cache (
     always_ff (clk, rst) {
         if_reset {
             for i in 0..512 {
-                lv_0[i] = 1'b0;
-                lv_1[i] = 1'b0;
-                lv_2[i] = 1'b0;
-                lv_3[i] = 1'b0;
-                plru[i] = 3'b0;
+                lv_0[i]  = 1'b0;
+                lv_1[i]  = 1'b0;
+                lv_2[i]  = 1'b0;
+                lv_3[i]  = 1'b0;
+                plru[i]  = 3'b0;
+                shr_0[i] = '0;
+                shr_1[i] = '0;
+                shr_2[i] = '0;
+                shr_3[i] = '0;
+                own_0[i] = 1'b0;
+                own_1[i] = 1'b0;
+                own_2[i] = 1'b0;
+                own_3[i] = 1'b0;
             }
         } else {
+            // P9.2 directory: lookup-grant sharer add (mem_ctrl guarantees no
+            // same-cycle same-line write — it retries the lookup on a write
+            // collision — and the install path below cannot touch this line's
+            // way: an active-slot line is excluded from victim selection and
+            // a same-line install never happens while the slot is in LOOKUP).
+            // Phase B: an OWNERSHIP grant (i_cadd_own) makes the mask {hart}
+            // — mem_ctrl invalidated the other sharers this same cycle.
+            if i_cadd_v {
+                if ctm_0 {
+                    shr_0[c_index] = if i_cadd_own ? cadd_oh : shr_0[c_index] | cadd_oh;
+                    own_0[c_index] = i_cadd_own;
+                }
+                if ctm_1 {
+                    shr_1[c_index] = if i_cadd_own ? cadd_oh : shr_1[c_index] | cadd_oh;
+                    own_1[c_index] = i_cadd_own;
+                }
+                if ctm_2 {
+                    shr_2[c_index] = if i_cadd_own ? cadd_oh : shr_2[c_index] | cadd_oh;
+                    own_2[c_index] = i_cadd_own;
+                }
+                if ctm_3 {
+                    shr_3[c_index] = if i_cadd_own ? cadd_oh : shr_3[c_index] | cadd_oh;
+                    own_3[c_index] = i_cadd_own;
+                }
+            }
+            // Phase B: recall-engine clean-ack — drop the probed owner.
+            if i_eclr_v {
+                if etm_0 {
+                    shr_0[e_index] = shr_0[e_index] & ~eclr_oh;
+                    own_0[e_index] = 1'b0;
+                }
+                if etm_1 {
+                    shr_1[e_index] = shr_1[e_index] & ~eclr_oh;
+                    own_1[e_index] = 1'b0;
+                }
+                if etm_2 {
+                    shr_2[e_index] = shr_2[e_index] & ~eclr_oh;
+                    own_2[e_index] = 1'b0;
+                }
+                if etm_3 {
+                    shr_3[e_index] = shr_3[e_index] & ~eclr_oh;
+                    own_3[e_index] = 1'b0;
+                }
+            }
             // PLRU updates: lookup hit, then install, then write hit (a
             // same-set collision resolves last-writer-wins; accuracy-only).
             if c_access_valid {
@@ -256,32 +576,73 @@ pub module l2cache (
             if mis_store {
                 // M8.D.2: misaligned store — invalidate the lo line and the
                 // i_addr+8 line in any way that holds them (the hi dword
-                // bypassed L2 to DRAM). No merge.
+                // bypassed L2 to DRAM). No merge. P9.2: clear the sharer
+                // masks too (mem_ctrl invalidates all listed sharers this
+                // cycle — both lines leave the L2, so no L1 may keep them).
                 if w_tm_0 {
-                    lv_0[w_index] = 1'b0;
+                    lv_0[w_index]  = 1'b0;
+                    shr_0[w_index] = '0;
+                    own_0[w_index] = 1'b0;
                 }
                 if w_tm_1 {
-                    lv_1[w_index] = 1'b0;
+                    lv_1[w_index]  = 1'b0;
+                    shr_1[w_index] = '0;
+                    own_1[w_index] = 1'b0;
                 }
                 if w_tm_2 {
-                    lv_2[w_index] = 1'b0;
+                    lv_2[w_index]  = 1'b0;
+                    shr_2[w_index] = '0;
+                    own_2[w_index] = 1'b0;
                 }
                 if w_tm_3 {
-                    lv_3[w_index] = 1'b0;
+                    lv_3[w_index]  = 1'b0;
+                    shr_3[w_index] = '0;
+                    own_3[w_index] = 1'b0;
                 }
                 if ntm_0 {
-                    lv_0[nxt_index] = 1'b0;
+                    lv_0[nxt_index]  = 1'b0;
+                    shr_0[nxt_index] = '0;
+                    own_0[nxt_index] = 1'b0;
                 }
                 if ntm_1 {
-                    lv_1[nxt_index] = 1'b0;
+                    lv_1[nxt_index]  = 1'b0;
+                    shr_1[nxt_index] = '0;
+                    own_1[nxt_index] = 1'b0;
                 }
                 if ntm_2 {
-                    lv_2[nxt_index] = 1'b0;
+                    lv_2[nxt_index]  = 1'b0;
+                    shr_2[nxt_index] = '0;
+                    own_2[nxt_index] = 1'b0;
                 }
                 if ntm_3 {
-                    lv_3[nxt_index] = 1'b0;
+                    lv_3[nxt_index]  = 1'b0;
+                    shr_3[nxt_index] = '0;
+                    own_3[nxt_index] = 1'b0;
                 }
             } else if i_wen && w_any_tm {
+                // P9.2: directory update. A WRITEBACK (i_w_wb) removes the
+                // writer (its L1 invalidated the line — eviction / recall /
+                // flush) and clears ownership. A normal write keeps only the
+                // writer's bit (mem_ctrl precisely invalidates the others
+                // this cycle); ownership survives only if the writer was the
+                // owner (a write to a line owned by ANOTHER hart is vetoed
+                // at the grant and recalled first).
+                if w_tm_0 {
+                    shr_0[w_index] = if i_w_wb ? shr_0[w_index] & ~w_oh : shr_0[w_index] & w_oh;
+                    own_0[w_index] = if i_w_wb ? 1'b0 : own_0[w_index] && ((shr_0[w_index] & w_oh) != '0);
+                }
+                if w_tm_1 {
+                    shr_1[w_index] = if i_w_wb ? shr_1[w_index] & ~w_oh : shr_1[w_index] & w_oh;
+                    own_1[w_index] = if i_w_wb ? 1'b0 : own_1[w_index] && ((shr_1[w_index] & w_oh) != '0);
+                }
+                if w_tm_2 {
+                    shr_2[w_index] = if i_w_wb ? shr_2[w_index] & ~w_oh : shr_2[w_index] & w_oh;
+                    own_2[w_index] = if i_w_wb ? 1'b0 : own_2[w_index] && ((shr_2[w_index] & w_oh) != '0);
+                }
+                if w_tm_3 {
+                    shr_3[w_index] = if i_w_wb ? shr_3[w_index] & ~w_oh : shr_3[w_index] & w_oh;
+                    own_3[w_index] = if i_w_wb ? 1'b0 : own_3[w_index] && ((shr_3[w_index] & w_oh) != '0);
+                }
                 // Write hit on the write-side tm way — merge every populated lane.
                 for l in 0..8 {
                     if i_wstrb[l] != 8'd0 {
@@ -299,28 +660,42 @@ pub module l2cache (
             }
 
             // P9.1: full-line install (gathered DRAM line from mem_ctrl).
+            // P9.2: the directory entry becomes {installer} — plus the old
+            // sharers on an in-place overwrite (defensive: per-line accept
+            // blocking should make that case unreachable). Phase B: the
+            // installer takes OWNERSHIP (E for a read miss, M-capable for an
+            // RFO) unless another hart is still listed (then mem_ctrl also
+            // downgrades the grant to S via o_inst_oldshr).
             if i_inst_v {
                 if install_way == 2'd0 {
                     tag_0[in_index] = in_tag;
                     lv_0[in_index]  = 1'b1;
+                    shr_0[in_index] = if i_any_tm ? shr_0[in_index] | inst_oh : inst_oh;
+                    own_0[in_index] = !i_any_tm || ((shr_0[in_index] & ~inst_oh) == '0);
                     for l in 0..8 {
                         data_0[{in_index, l as 3}] = i_inst_data[l];
                     }
                 } else if install_way == 2'd1 {
                     tag_1[in_index] = in_tag;
                     lv_1[in_index]  = 1'b1;
+                    shr_1[in_index] = if i_any_tm ? shr_1[in_index] | inst_oh : inst_oh;
+                    own_1[in_index] = !i_any_tm || ((shr_1[in_index] & ~inst_oh) == '0);
                     for l in 0..8 {
                         data_1[{in_index, l as 3}] = i_inst_data[l];
                     }
                 } else if install_way == 2'd2 {
                     tag_2[in_index] = in_tag;
                     lv_2[in_index]  = 1'b1;
+                    shr_2[in_index] = if i_any_tm ? shr_2[in_index] | inst_oh : inst_oh;
+                    own_2[in_index] = !i_any_tm || ((shr_2[in_index] & ~inst_oh) == '0);
                     for l in 0..8 {
                         data_2[{in_index, l as 3}] = i_inst_data[l];
                     }
                 } else {
                     tag_3[in_index] = in_tag;
                     lv_3[in_index]  = 1'b1;
+                    shr_3[in_index] = if i_any_tm ? shr_3[in_index] | inst_oh : inst_oh;
+                    own_3[in_index] = !i_any_tm || ((shr_3[in_index] & ~inst_oh) == '0);
                     for l in 0..8 {
                         data_3[{in_index, l as 3}] = i_inst_data[l];
                     }

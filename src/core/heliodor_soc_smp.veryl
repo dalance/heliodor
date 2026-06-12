@@ -166,6 +166,42 @@ pub module heliodor_soc_smp #(
     var l2_inst_addr : logic<64>          ;
     var l2_inst_data : logic<64> [8]      ;
     var l2_mem_addr  : logic<64>          ;
+    // P9.2: directory wires (mem_ctrl <-> l2cache) + precise invalidates.
+    var l2_cadd_v    : logic              ;
+    var l2_cadd_hart : logic<3>           ;
+    var l2_cadd_own  : logic              ;
+    var l2_c_sharers : logic<N_HARTS>     ;
+    var l2_c_owned   : logic              ;
+    var l2_inst_hart : logic<3>           ;
+    var l2_inst_oldshr: logic<N_HARTS>    ;
+    var l2_iv_valid  : logic              ;
+    var l2_iv_addr   : logic<64>          ;
+    var l2_iv_sharers: logic<N_HARTS>     ;
+    var l2_iv_owned  : logic              ;
+    var l2_iv_blocked: logic              ;
+    var ctrl_busy_line: logic<58> [N_HARTS];
+    var ctrl_busy_v   : logic     [N_HARTS];
+    var l2_w_sharers   : logic<N_HARTS>   ;
+    var l2_w_sharers_hi: logic<N_HARTS>   ;
+    var l2_w_owned     : logic            ;
+    var l2_w_owned_hi  : logic            ;
+    var ctrl_inv1_v   : logic     [N_HARTS];
+    var ctrl_inv1_addr: logic<64>          ;
+    var ctrl_inv2_v   : logic     [N_HARTS];
+    var ctrl_inv2_addr: logic<64>          ;
+    // P9.2 Phase B: write-back / MESI wires.
+    var c_dmemw_wb    : logic     [N_HARTS]; // core → bus: writeback flag
+    var c_dmem_rfo    : logic     [N_HARTS]; // core → mem_ctrl: store fill = RFO
+    var ctrl_hexcl    : logic     [N_HARTS]; // mem_ctrl → core: grant state
+    var ctrl_probe_v  : logic     [N_HARTS]; // recall engine probes
+    var ctrl_probe_addr: logic<64>         ;
+    var ctrl_probe_self: logic             ;
+    var core_probe_ack: logic     [N_HARTS];
+    var ctrl_eclr_v   : logic              ;
+    var ctrl_eclr_addr: logic<64>          ;
+    var ctrl_eclr_hart: logic<3>           ;
+    var bus_dramw_wb  : logic              ; // bus: selected write is a WB
+    var bus_dramw_sel : logic<3>           ; // bus: write-channel selected hart
     for h in 0..N_HARTS :gen_busin {
         assign bus_in_raddr[h] = c_dmem_addr[h];
         // P9.1: the bus read channel now arbitrates LEGACY (non-DRAM: MMIO /
@@ -228,10 +264,47 @@ pub module heliodor_soc_smp #(
     var clint_ren_w: logic;
     var uart_wen_w : logic;
     var uart_ren_w : logic;
-    let wgrant_ok: logic = !ctrl_mem_busy && !legacy_ext_read
+    // P9.2 Phase B: write-grant OWNERSHIP VETO. A non-WB write whose target
+    // line (lo, or the +8 line of a misaligned store) is OWNED by a hart
+    // other than the writer must wait — the owner's dirty copy is the only
+    // truth and its later writeback would bury this write. The veto holds
+    // the grant and asks the recall engine to fetch the line home first.
+    // All inputs are selection-based (pre-grant): the bus's write-channel
+    // hart selection is independent of i_wgrant_ok.
+    var wv_sel_oh: logic<N_HARTS>;
+    var wv_hi    : logic         ;
+    var wv_req_on: logic         ;
+    always_comb {
+        wv_hi     = 1'b0;
+        wv_req_on = 1'b0;
+        for h in 0..N_HARTS {
+            wv_sel_oh[h] = bus_dramw_sel == (h as 3);
+            if bus_dramw_sel == (h as 3) {
+                wv_hi = c_dmem_wstrb_hi[h] != 8'd0;
+                // Intent, NOT the fired write enable (c_dmem_wen asserts only
+                // WITH its grant — using it here would close a comb loop
+                // through wgrant_ok). req + non-WB + DRAM target suffices.
+                wv_req_on = c_dmemw_req[h] && in_dram_w[h];
+            }
+        }
+    }
+    let wv_lo_veto: logic = wv_req_on && !bus_dramw_wb && l2_w_owned && ((l2_w_sharers & ~wv_sel_oh) != '0);
+    let wv_hi_veto: logic = wv_req_on && !bus_dramw_wb && wv_hi && l2_w_owned_hi && ((l2_w_sharers_hi & ~wv_sel_oh) != '0);
+    let w_veto    : logic = wv_lo_veto || wv_hi_veto;
+    var wv_owner: logic<3>;
+    always_comb {
+        wv_owner = 3'd0;
+        for h in 0..N_HARTS {
+            if (wv_lo_veto && l2_w_sharers[h]) || (!wv_lo_veto && l2_w_sharers_hi[h]) {
+                wv_owner = h as 3;
+            }
+        }
+    }
+    let wv_addr_hi: logic<64> = bus_dramw_addr + 64'd8;
+    let wv_line   : logic<58> = if wv_lo_veto ? bus_dramw_addr[63:6] : wv_addr_hi[63:6];
+
+    let wgrant_ok: logic = !ctrl_mem_busy && !legacy_ext_read && !w_veto
         && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart);
-    var bus_inv_valid : logic    ;
-    var bus_inv_addr  : logic<64>;
 
     inst u_bus: memory_bus #(
         N_HARTS: N_HARTS,
@@ -265,6 +338,7 @@ pub module heliodor_soc_smp #(
         i_dmemw_wstrb   : bus_in_wstrb  ,
         i_dmemw_wen     : bus_in_wen    ,
         i_dmemw_req     : bus_in_wreq   ,
+        i_dmemw_wb      : c_dmemw_wb    , // P9.2: writeback flag
         i_amo_inflight  : bus_in_amo    ,
         o_amo_lock_held : bus_amo_locked,
         i_wgrant_ok     : wgrant_ok     ,
@@ -276,19 +350,31 @@ pub module heliodor_soc_smp #(
         o_dmemw_wdata   : bus_dram_wdata,
         o_dmemw_wstrb   : bus_dram_wstrb,
         o_dmemw_wen     : bus_dram_wen  ,
-        o_dmem_inv_valid: bus_inv_valid ,
-        o_dmem_inv_addr : bus_inv_addr  ,
+        o_dmemw_wb      : bus_dramw_wb  , // P9.2: selected write is a WB
+        o_dmemw_sel     : bus_dramw_sel , // P9.2: write-channel selection
+        o_dmem_inv_valid: _             , // P9.2: precise inv via mem_ctrl
+        o_dmem_inv_addr : _             ,
     );
 
-    // Coherence broadcast: a granted DRAM write invalidates the matching L1 line
-    // in every OTHER core. Filter the writer (it owns the line). DRAM-only
-    // (addr[31]) so MMIO "writes" never spuriously invalidate.
+    // P9.2: PRECISE invalidation. The all-hart write broadcast is gone — the
+    // L2 directory (sharer masks) tells mem_ctrl exactly which harts cache a
+    // written/evicted line, and mem_ctrl drives the two per-hart invalidate
+    // ports directly. The bus's legacy broadcast outputs are discarded.
     var core_inv_valid: logic     [N_HARTS];
     var core_inv_addr : logic<64> [N_HARTS];
-    let inv_v: logic = bus_inv_valid && bus_inv_addr[31];
     for h in 0..N_HARTS :gen_inv {
-        assign core_inv_valid[h] = inv_v && !(bus_wgrant[h] && bus_in_wen[h]);
-        assign core_inv_addr[h]  = bus_inv_addr;
+        assign core_inv_valid[h] = ctrl_inv1_v[h];
+        assign core_inv_addr[h]  = ctrl_inv1_addr;
+    }
+    // P9.2: writer hart index for the directory (one-hot write grant → idx).
+    var w_hart_idx: logic<3>;
+    always_comb {
+        w_hart_idx = 3'd0;
+        for h in 0..N_HARTS {
+            if bus_wgrant[h] {
+                w_hart_idx = h as 3;
+            }
+        }
     }
 
     // Misaligned-store hi-side (addr+8): carried per-hart by the core, not by the
@@ -324,15 +410,50 @@ pub module heliodor_soc_smp #(
         i_hdram       : in_dram             ,
         o_hgrant      : ctrl_hgrant         ,
         o_hrdata      : ctrl_hrdata         ,
+        i_hrfo        : c_dmem_rfo          , // P9.2: store fill = RFO
+        o_hexcl       : ctrl_hexcl          , // P9.2: grant state to the L1
+        i_amo_locked  : bus_amo_locked      , // P9.2: RFO lock gating
         o_bus_rreq    : ctrl_bus_rreq       ,
         i_bus_rgrant  : bus_dgrant          ,
         o_l2_caddr    : l2_caddr            ,
         o_l2_cren     : l2_cren             ,
         i_l2_chit     : l2_chit             ,
         i_l2_cdata    : l2_cdata            ,
+        o_cadd_v      : l2_cadd_v           , // P9.2: directory maintenance
+        o_cadd_hart   : l2_cadd_hart        ,
+        o_cadd_own    : l2_cadd_own         ,
+        i_l2_c_shr    : l2_c_sharers        ,
+        i_l2_c_owned  : l2_c_owned          ,
         o_l2_inst_v   : l2_inst_v           ,
         o_l2_inst_addr: l2_inst_addr        ,
         o_l2_inst_data: l2_inst_data        ,
+        o_inst_hart   : l2_inst_hart        ,
+        i_iv_valid    : l2_iv_valid         ,
+        i_iv_addr     : l2_iv_addr          ,
+        i_iv_sharers  : l2_iv_sharers       ,
+        i_iv_owned    : l2_iv_owned         ,
+        i_iv_blocked  : l2_iv_blocked       ,
+        i_inst_oldshr : l2_inst_oldshr      ,
+        o_busy_line   : ctrl_busy_line      ,
+        o_busy_v      : ctrl_busy_v         ,
+        i_w_hart      : w_hart_idx          ,
+        i_w_wb        : bus_dramw_wb        ,
+        i_w_shr       : l2_w_sharers        ,
+        i_w_shr_hi    : l2_w_sharers_hi     ,
+        o_probe_v     : ctrl_probe_v        , // P9.2: recall engine
+        o_probe_addr  : ctrl_probe_addr     ,
+        o_probe_self  : ctrl_probe_self     ,
+        i_probe_ack   : core_probe_ack      ,
+        o_eclr_v      : ctrl_eclr_v         ,
+        o_eclr_addr   : ctrl_eclr_addr      ,
+        o_eclr_hart   : ctrl_eclr_hart      ,
+        i_wv_req      : w_veto              ,
+        i_wv_line     : wv_line             ,
+        i_wv_hart     : wv_owner            ,
+        o_inv1_v      : ctrl_inv1_v         ,
+        o_inv1_addr   : ctrl_inv1_addr      ,
+        o_inv2_v      : ctrl_inv2_v         ,
+        o_inv2_addr   : ctrl_inv2_addr      ,
         o_mem_addr    : ctrl_mem_addr       ,
         o_mem_ren     : ctrl_mem_ren        ,
         i_mem_rdata   : i_dmem_rdata        ,
@@ -345,16 +466,41 @@ pub module heliodor_soc_smp #(
     // Shared L2 (P9.1 line-granular): lookup/copy + line install from
     // mem_ctrl; write side keeps the bus write channel; lower interface is
     // write-passthrough only.
-    inst u_l2: l2cache (
+    inst u_l2: l2cache #(
+        N_HARTS: N_HARTS,
+    ) (
         clk                        ,
         rst                        ,
         i_caddr    : l2_caddr      ,
         i_cren     : l2_cren       ,
         o_chit     : l2_chit       ,
         o_cdata    : l2_cdata      ,
+        i_cadd_v   : l2_cadd_v     , // P9.2: directory
+        i_cadd_hart: l2_cadd_hart  ,
+        i_cadd_own : l2_cadd_own   ,
+        o_c_sharers: l2_c_sharers  ,
+        o_c_owned  : l2_c_owned    ,
         i_inst_v   : l2_inst_v     ,
         i_inst_addr: l2_inst_addr  ,
         i_inst_data: l2_inst_data  ,
+        i_inst_hart : l2_inst_hart ,
+        o_iv_valid  : l2_iv_valid  ,
+        o_iv_addr   : l2_iv_addr   ,
+        o_iv_sharers: l2_iv_sharers,
+        o_iv_owned  : l2_iv_owned  ,
+        o_iv_blocked: l2_iv_blocked,
+        o_inst_oldshr: l2_inst_oldshr,
+        i_busy_line : ctrl_busy_line,
+        i_busy_v    : ctrl_busy_v  ,
+        i_w_hart      : w_hart_idx     ,
+        i_w_wb        : bus_dramw_wb   ,
+        o_w_sharers   : l2_w_sharers   ,
+        o_w_sharers_hi: l2_w_sharers_hi,
+        o_w_owned     : l2_w_owned     ,
+        o_w_owned_hi  : l2_w_owned_hi  ,
+        i_eclr_v   : ctrl_eclr_v   ,
+        i_eclr_addr: ctrl_eclr_addr,
+        i_eclr_hart: ctrl_eclr_hart,
         i_waddr    : bus_dramw_addr,
         i_wdata    : bus_dram_wdata,
         i_wstrb    : bus_dram_wstrb,
@@ -473,8 +619,9 @@ pub module heliodor_soc_smp #(
             assign c_dmem_wstrb[h * 8 + l] = core_wstrb[l];
         }
         inst u_core: heliodor_core #(
-            RESET_PC: RESET_PC,
-            HART_ID : h as 8  ,
+            RESET_PC    : RESET_PC,
+            HART_ID     : h as 8  ,
+            SMP_COHERENT: 1       , // P9.2: eviction → ROB CoRR poison
         ) (
             clk                                   ,
             rst                                   ,
@@ -499,8 +646,17 @@ pub module heliodor_soc_smp #(
             o_dmemw_addr      : c_dmemw_addr[h]   ,
             o_dmemw_req       : c_dmemw_req[h]    ,
             i_dmemw_grant     : bus_wgrant[h]     ,
+            o_dmemw_wb        : c_dmemw_wb[h]     , // P9.2: writeback flag
+            o_dmem_rfo        : c_dmem_rfo[h]     , // P9.2: store fill = RFO
+            i_dmem_fill_excl  : ctrl_hexcl[h]     , // P9.2: home grant state
+            i_dcache_probe_v   : ctrl_probe_v[h]  , // P9.2: recall probe
+            i_dcache_probe_addr: ctrl_probe_addr  ,
+            i_dcache_probe_self: ctrl_probe_self  ,
+            o_dcache_probe_ack : core_probe_ack[h],
             i_dcache_inv_valid: core_inv_valid[h] ,
             i_dcache_inv_addr : core_inv_addr[h]  ,
+            i_dcache_inv2_valid: ctrl_inv2_v[h]   , // P9.2: precise-inv 2nd port
+            i_dcache_inv2_addr : ctrl_inv2_addr   ,
             o_amo_inflight    : c_amo_inflight[h] ,
             i_amo_locked      : bus_amo_locked[h] ,
             i_irq_timer_m     : clint_t_irq[h]    ,

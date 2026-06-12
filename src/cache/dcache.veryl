@@ -1,7 +1,27 @@
 // 4-way set-associative data cache
 // Size = 2^INDEX_W sets × 4 ways × 64B lines (8 doublewords per line):
 // INDEX_W=4 → 4KB, 6 → 16KB (default), 7 → 32KB.
-// Write-through, no-write-allocate
+//
+// P9.2: WRITE-BACK with MESI line states for the store-drain path. Each
+// line carries valid + excl (E/M: sole copy at the directory) + dirty (M):
+//   - a drain (i_swen) that hits an EXCL way merges locally and acks with
+//     NO bus transaction (the write-channel traffic collapse this phase is
+//     about); the line goes M (dirty).
+//   - a drain that misses (or hits a mere S copy) raises a READ-FOR-
+//     OWNERSHIP fill (o_memr_rfo): the home invalidates the other sharers
+//     and grants M-capability; the S copy's way doubles as the fill victim
+//     (overwrite in place). The drain retries after the fill and merges.
+//   - the i_wen path (AMO/LR-SC stores, misaligned, MMIO, slow stores)
+//     stays WRITE-THROUGH (the home merges + precisely invalidates).
+//   - every invalidation of a possibly-DIRTY line detours through the
+//     single-entry WRITEBACK BUFFER (capture + invalidate, then drain the
+//     full line over the write channel with o_memw_wb set): fill victims,
+//     AMO force-miss, misaligned self-invalidates, PROBES (recalls from
+//     the home: dirty → WB, clean → o_probe_ack), and the FLUSH sweep
+//     (i_flush_req: FENCE.I / SFENCE.VMA / satp — write back + invalidate
+//     every dirty line so the tb-direct ifetch/I-PTW see current DRAM).
+//   - i_fill_excl (the home's grant, sampled at fill completion) decides
+//     E/M-capable vs S.
 // Non-blocking for loads: MSHR absorbs load miss, pipeline continues.
 // Replacement: pseudo-LRU (3-bit tree per set)
 //
@@ -110,6 +130,12 @@ pub module dcache #(
     // (the old single port serialized them — the S20 residual bottleneck).
     o_memr_addr : output logic<64>,
     o_memr_ren  : output logic    ,
+    // P9.2: the current read request/transaction is a READ-FOR-OWNERSHIP
+    // (store fill); the home invalidates the other sharers and grants M.
+    o_memr_rfo  : output logic    ,
+    // P9.2: grant state from the home (1 = E/M-capable, 0 = S), sampled at
+    // fill completion. Single-hart harnesses tie 1.
+    i_fill_excl : input  logic    ,
     i_mem_rdata : input  logic<64>,
     // S25: the write channel carries a LINE (8 dword lanes + per-lane byte
     // strobes). An i_wen write (slow store / AMO / MMIO) occupies the single
@@ -119,6 +145,26 @@ pub module dcache #(
     o_memw_wdata: output logic<64> [8],
     o_memw_wstrb: output logic<8>  [8],
     o_memw_wen  : output logic        ,
+    // P9.2: the write-channel transaction is a WRITEBACK (full dirty line
+    // from the writeback buffer; the home merges it and clears ownership —
+    // no invalidates). The buffer outranks a same-cycle i_wen write.
+    o_memw_wb   : output logic        ,
+    // P9.2: PROBE port (recall from the home): invalidate the line; a dirty
+    // copy is written back (the WB completes the recall), a clean/absent
+    // one answers o_probe_ack. Held by the engine until answered.
+    i_probe_v   : input  logic    ,
+    i_probe_addr: input  logic<64>,
+    // The recall was requested by THIS hart's own transaction (stale
+    // self-owner entry at the home): answer it without aborting the
+    // in-flight fill — that fill is the recall's own requester.
+    i_probe_self: input  logic    ,
+    o_probe_ack : output logic    ,
+    // P9.2: FLUSH sweep (level request → level done): write back +
+    // invalidate every dirty line. The core raises it for FENCE.I /
+    // SFENCE.VMA / satp writes at the commit head (store buffer already
+    // empty) and gates the retire ack on o_flush_done.
+    i_flush_req : input  logic,
+    o_flush_done: output logic,
     // Invalidate port (memory_bus → dcache, multi-hart coherence).
     // Asserted by memory_bus when another core writes a line. The dcache
     // invalidates any matching way at i_inv_addr's index/tag. If a fill is
@@ -126,6 +172,35 @@ pub module dcache #(
     // completes without setting valid (line stays Invalid).
     i_inv_valid: input logic    ,
     i_inv_addr : input logic<64>,
+    // P9.2: second invalidate port — under precise invalidation a granted
+    // misaligned store invalidates its lo and hi lines in the SAME cycle
+    // (two different lines, one address port each). Applied identically to
+    // port 1, including the mid-fill abort latch and the completion-cycle
+    // fold. Tie i_inv2_valid=0 where unused.
+    i_inv2_valid: input logic    ,
+    i_inv2_addr : input logic<64>,
+    // P9.2: combinational line-presence checks (core: LR/SC reservation and
+    // SC watch). Present = cached in a way that is not the mid-fill victim,
+    // or being filled un-aborted. Under precise invalidation a remote write
+    // to a line NOT cached here produces no invalidate pulse, so the core
+    // clears its reservation the moment the line leaves this cache —
+    // rsv_valid ⇒ line present ⇒ the directory lists this hart ⇒ every
+    // remote write to it is observed.
+    i_chk_addr    : input  logic<64>,
+    o_chk_present : output logic    ,
+    i_chk2_addr   : input  logic<64>,
+    o_chk2_present: output logic    ,
+    // P9.2: local line-DEPARTURE events (this cycle a valid line is being
+    // dropped: fill victim, store-miss victim, misaligned self-invalidate,
+    // AMO force-miss). The core feeds them to the ROB's CoRR poison scan —
+    // under precise invalidation a remote write to a line that already left
+    // this cache produces no invalidate pulse, so executed-uncommitted load
+    // records on a departing line must be poisoned at departure time. Two
+    // ports: the sources of each are mutually exclusive per cycle.
+    o_evict1_v   : output logic    ,
+    o_evict1_addr: output logic<64>,
+    o_evict2_v   : output logic    ,
+    o_evict2_addr: output logic<64>,
     // Bus arbitration — one request/grant pair per channel. State advances
     // only when the matching channel is granted; non-granted cycles stall.
     o_memr_req  : output logic,
@@ -156,6 +231,24 @@ pub module dcache #(
     var data_1 : logic<64>     [SETS * 8];
     var data_2 : logic<64>     [SETS * 8];
     var data_3 : logic<64>     [SETS * 8];
+    // P9.2 MESI state alongside valid: excl (E/M — sole copy, may be
+    // written locally) and dirty (M — must be written back on departure).
+    // Meaningful only while the way is valid; fills rewrite both.
+    var excl_0 : logic [SETS];
+    var excl_1 : logic [SETS];
+    var excl_2 : logic [SETS];
+    var excl_3 : logic [SETS];
+    var dirty_0: logic [SETS];
+    var dirty_1: logic [SETS];
+    var dirty_2: logic [SETS];
+    var dirty_3: logic [SETS];
+
+    // P9.2: single-entry WRITEBACK BUFFER (capture-and-invalidate of a dirty
+    // line; drained over the write channel with o_memw_wb). At most one
+    // capture per cycle (arbitrated where the captures fire).
+    var wb_v   : logic        ;
+    var wb_line: logic<58>    ;
+    var wb_data: logic<64> [8];
 
     // Pseudo-LRU tree: 3 bits per set
     // bit[2]: root → 0=left(way 0,1), 1=right(way 2,3)
@@ -188,6 +281,9 @@ pub module dcache #(
     // sequential stages, breaking the cycle.
     let inv_hits_active: logic = i_inv_valid && (i_wen || i_ren) && cache_hit && (index == i_inv_addr[INDEX_W + 5:6])
         && (tag == i_inv_addr[63:INDEX_W + 6]);
+    // P9.2: same race on the second invalidate port.
+    let inv2_hits_active: logic = i_inv2_valid && (i_wen || i_ren) && cache_hit && (index == i_inv2_addr[INDEX_W + 5:6])
+        && (tag == i_inv2_addr[63:INDEX_W + 6]);
 
     // Hit way select
     let hit_way: logic<2> = if hit_0 ? 2'd0 : if hit_1 ? 2'd1 : if hit_2 ? 2'd2 : 2'd3;
@@ -212,6 +308,7 @@ pub module dcache #(
     var fill_way     : logic<2> ; // which way to fill
     var fill_offset  : logic<3> ; // original miss dword offset (for MSHR re-read)
     var fill_aborted : logic    ; // remote invalidate hit the line being filled
+    var fill_rfo     : logic    ; // P9.2: this fill is a read-for-ownership (store)
     // Phase 8 S14.2: critical-word-first. The fill bursts the 8 dwords
     // starting at the MISSING dword (fill_offset) and wraps, so the demand
     // word is transfer #0 — the owner's early writeback (o_fill_data_ready)
@@ -237,6 +334,11 @@ pub module dcache #(
     // Invalidate decode (combinational from request port)
     let inv_tag  : logic<TAG_W> = i_inv_addr[63:INDEX_W + 6];
     let inv_index: logic<INDEX_W> = i_inv_addr[INDEX_W + 5:6];
+    let inv2_tag  : logic<TAG_W> = i_inv2_addr[63:INDEX_W + 6];
+    let inv2_index: logic<INDEX_W> = i_inv2_addr[INDEX_W + 5:6];
+    // Any-port invalidate pulse on the line being filled (mid-fill abort).
+    let inv_fill_hit: logic = (i_inv_valid && state == State::FILL && fill_index == inv_index && fill_tag == inv_tag)
+        || (i_inv2_valid && state == State::FILL && fill_index == inv2_index && fill_tag == inv2_tag);
 
     // CPU request present
     let cpu_req: logic = i_wen || i_ren;
@@ -256,6 +358,26 @@ pub module dcache #(
     let next_hit_3    : logic     = valid_3[next_index] && tags_3[next_index] == next_tag;
     let next_line_hit : logic     = next_hit_0 || next_hit_1 || next_hit_2 || next_hit_3;
 
+    let filling: logic = state == State::FILL;
+
+    // ------------------------------------------------------------------
+    // Store-drain decode (P9.2: moved up — the store-RFO fill shares the
+    // fill path below). Combinational tag-match on i_saddr, independent of
+    // the i_addr read port.
+    // ------------------------------------------------------------------
+    let stag       : logic<TAG_W>   = i_saddr[63:INDEX_W + 6];
+    let sindex     : logic<INDEX_W> = i_saddr[INDEX_W + 5:6];
+    // S23: exclude the way being filled (its tag is the dying line's).
+    let fill_busy_s: logic = filling && fill_index == sindex;
+    let shit_0     : logic = valid_0[sindex] && tags_0[sindex] == stag && !(fill_busy_s && fill_way == 2'd0);
+    let shit_1     : logic = valid_1[sindex] && tags_1[sindex] == stag && !(fill_busy_s && fill_way == 2'd1);
+    let shit_2     : logic = valid_2[sindex] && tags_2[sindex] == stag && !(fill_busy_s && fill_way == 2'd2);
+    let shit_3     : logic = valid_3[sindex] && tags_3[sindex] == stag && !(fill_busy_s && fill_way == 2'd3);
+    let scache_hit : logic = shit_0 || shit_1 || shit_2 || shit_3;
+    // P9.2: the drain may merge locally (no bus) only into an EXCL (E/M) way.
+    let s_hit_excl: logic = (shit_0 && excl_0[sindex]) || (shit_1 && excl_1[sindex])
+        || (shit_2 && excl_2[sindex]) || (shit_3 && excl_3[sindex]);
+
     // Miss handling. A normal read miss fills the i_addr line (lo_miss). A
     // misaligned LOAD whose next dword crosses into a DIFFERENT line needs that
     // next line filled too: once the lo line is cached (cache_hit), hi_miss
@@ -265,15 +387,48 @@ pub module dcache #(
     let hi_miss: logic = i_ren && i_load_next && !next_same_line && cache_hit && !next_line_hit && state == State::IDLE;
     let miss   : logic = lo_miss || hi_miss;
 
-    // Fill target: the lo line normally, or the next line for a hi_miss (lo
-    // already cached, so lo_miss is 0). i_ren-only, so stores/AMO use the lo
-    // line (fill_is_hi stays 0).
-    let fill_is_hi: logic     = hi_miss && !lo_miss;
-    let f_index   : logic<INDEX_W> = if fill_is_hi ? next_index : index;
-    let f_tag     : logic<TAG_W> = if fill_is_hi ? next_tag : tag;
-    let f_offset  : logic<3>  = if fill_is_hi ? next_offset : offset;
+    // P9.2: a FULL-LINE drain entry (all 64 bytes strobed — memset/memcpy
+    // write-combining) keeps the posted WRITE-THROUGH path: an RFO would
+    // serialize a ~12-40-cycle fill per line for data the store overwrites
+    // entirely (observed as a >5x Linux-boot slowdown). The home invalidates
+    // the other sharers as for any write; our own (S) copy is invalidated
+    // at the fire below.
+    var s_full_line: logic;
+    always_comb {
+        s_full_line = 1'b1;
+        for l in 0..8 {
+            if i_swstrb[l] != 8'hff {
+                s_full_line = 1'b0;
+            }
+        }
+    }
 
-    // PLRU victim selection for the fill-target index.
+    // P9.2: store-RFO fill want — a pending PARTIAL-line drain that cannot
+    // merge (miss, or an S copy without write permission) raises a
+    // read-for-ownership fill of the drain line. Arbitration keeps the
+    // S20.2 shape: a load miss goes first unless the store buffer is
+    // near-full (urgent).
+    let srfo_want: logic = i_swen && (state == State::IDLE) && !i_wen && !s_hit_excl && !s_full_line;
+    let srfo_sel : logic = srfo_want && (!miss || i_sdrain_urgent);
+    let load_sel : logic = miss && !(srfo_want && i_sdrain_urgent);
+
+    // Fill target: the drain line for a store-RFO, else the lo line, or the
+    // next line for a hi_miss (lo already cached, so lo_miss is 0).
+    let f_rfo     : logic          = srfo_sel;
+    let fill_is_hi: logic          = hi_miss && !lo_miss;
+    let f_index   : logic<INDEX_W> = if f_rfo ? sindex : if fill_is_hi ? next_index : index;
+    let f_tag     : logic<TAG_W>   = if f_rfo ? stag : if fill_is_hi ? next_tag : tag;
+    let f_offset  : logic<3>       = if f_rfo ? 3'd0 : if fill_is_hi ? next_offset : offset;
+
+    // PLRU victim selection for the fill-target index. P9.2: a way already
+    // holding the fill line (an S copy being upgraded by a store-RFO) is
+    // overwritten IN PLACE — never double-allocate.
+    let fm_0: logic = valid_0[f_index] && tags_0[f_index] == f_tag;
+    let fm_1: logic = valid_1[f_index] && tags_1[f_index] == f_tag;
+    let fm_2: logic = valid_2[f_index] && tags_2[f_index] == f_tag;
+    let fm_3: logic = valid_3[f_index] && tags_3[f_index] == f_tag;
+    let f_match    : logic    = fm_0 || fm_1 || fm_2 || fm_3;
+    let f_match_way: logic<2> = if fm_0 ? 2'd0 : if fm_1 ? 2'd1 : if fm_2 ? 2'd2 : 2'd3;
     let plru_bits  : logic<3> = plru[f_index];
     let has_invalid: logic    = !valid_0[f_index] || !valid_1[f_index] || !valid_2[f_index] || !valid_3[f_index];
     let invalid_way: logic<2> = if !valid_0[f_index] ?
@@ -286,9 +441,58 @@ pub module dcache #(
         2'd3
     ;
     let plru_way   : logic<2> = {plru_bits[2], if !plru_bits[2] ? plru_bits[1] : plru_bits[0]};
-    let victim_way : logic<2> = if has_invalid ? invalid_way : plru_way;
+    let victim_way : logic<2> = if f_match ? f_match_way : if has_invalid ? invalid_way : plru_way;
 
-    let filling: logic = state == State::FILL;
+    // Victim line state (capture decision at fill start).
+    let vic_valid: logic = if victim_way == 2'd0 ?
+        valid_0[f_index]
+    : if victim_way == 2'd1 ?
+        valid_1[f_index]
+    : if victim_way == 2'd2 ?
+        valid_2[f_index]
+    :
+        valid_3[f_index]
+    ;
+    let vic_tag: logic<TAG_W> = if victim_way == 2'd0 ?
+        tags_0[f_index]
+    : if victim_way == 2'd1 ?
+        tags_1[f_index]
+    : if victim_way == 2'd2 ?
+        tags_2[f_index]
+    :
+        tags_3[f_index]
+    ;
+    let vic_dirty: logic = vic_valid && (if victim_way == 2'd0 ?
+        dirty_0[f_index]
+    : if victim_way == 2'd1 ?
+        dirty_1[f_index]
+    : if victim_way == 2'd2 ?
+        dirty_2[f_index]
+    :
+        dirty_3[f_index]
+    );
+    var vic_data: logic<64> [8];
+    for l in 0..8 :gen_vic_data {
+        assign vic_data[l] = if victim_way == 2'd0 ?
+            data_0[{f_index, l as 3}]
+        : if victim_way == 2'd1 ?
+            data_1[{f_index, l as 3}]
+        : if victim_way == 2'd2 ?
+            data_2[{f_index, l as 3}]
+        :
+            data_3[{f_index, l as 3}]
+        ;
+    }
+    // A dirty victim needs the writeback buffer; while it is busy the fill
+    // start is HELD — and so is its bus request (grant ⇒ fill-start
+    // invariant, see want_fill_start). The fill is ALSO held while the
+    // buffer holds the very line being fetched: the home would serve the
+    // PRE-writeback data, and a WB carries no invalidate so nothing aborts
+    // the stale fill (observed as ra/s0 restored as ZEROS from a stack line
+    // evicted dirty and immediately reloaded → kernel Oops at pc 0).
+    let fill_blocked_wb: logic = wb_v && (vic_dirty || (wb_line == {f_tag, f_index}));
+    // The IDLE→FILL transition fires this cycle.
+    let fill_start_fire: logic = (load_sel || srfo_sel) && !fill_blocked_wb && i_memr_grant;
 
     // Phase 8 S14.1: streaming (early restart) on the pipe-0 read port. Fill
     // dword k commits to the data array at the granted FILL cycle where
@@ -309,7 +513,8 @@ pub module dcache #(
     let stream_line  : logic<58> = {fill_tag, fill_index};
     let stream_hit0  : logic     = s14_st_en && filling && stream_line == {tag, index}
         && stream_rel <: fill_count && !fill_aborted
-        && !(i_inv_valid && {inv_tag, inv_index} == stream_line);
+        && !(i_inv_valid && {inv_tag, inv_index} == stream_line)
+        && !(i_inv2_valid && {inv2_tag, inv2_index} == stream_line);
     let stream_rdata0: logic<64> = if fill_way == 2'd0 ?
         rdata_0
     : if fill_way == 2'd1 ?
@@ -321,71 +526,199 @@ pub module dcache #(
     ;
 
     // ============================================================
-    // Phase 8 S6: store-drain (2nd write port) decode. Combinational tag-match
-    // on i_saddr, independent of the i_addr read port. The actual data-array
-    // write happens in the IDLE state of the always_ff below (mutually exclusive
-    // with the i_wen write at the core level — a store fires EITHER i_wen or
-    // i_swen, never both). Tie i_swen=0 ⇒ want_store/store_can_drain=0 ⇒ no effect.
+    // P9.2 store drain = LOCAL MERGE into an owned (E/M) way — no bus
+    // transaction, no grant. The decode lives up at the fill-selection
+    // section (shit_* / s_hit_excl); a drain that cannot merge raises the
+    // store-RFO fill there instead (srfo_sel). A same-cycle PROBE of the
+    // drain line wins over the merge (the recall must not lose the bytes:
+    // the merge retries after the refetched ownership).
     // ============================================================
-    let stag       : logic<TAG_W> = i_saddr[63:INDEX_W + 6];
-    let sindex     : logic<INDEX_W> = i_saddr[INDEX_W + 5:6];
-    // S23: drains now run DURING fills (separate write channel), so exclude
-    // the way being filled from the drain hit (its tag is the dying line's;
-    // a merge into it could survive into the NEW line if its dword was
-    // already transferred) — same per-way exclusion as the port-2 reads.
-    let fill_busy_s: logic     = filling && fill_index == sindex;
-    let shit_0     : logic     = valid_0[sindex] && tags_0[sindex] == stag && !(fill_busy_s && fill_way == 2'd0);
-    let shit_1     : logic     = valid_1[sindex] && tags_1[sindex] == stag && !(fill_busy_s && fill_way == 2'd1);
-    let shit_2     : logic     = valid_2[sindex] && tags_2[sindex] == stag && !(fill_busy_s && fill_way == 2'd2);
-    let shit_3     : logic     = valid_3[sindex] && tags_3[sindex] == stag && !(fill_busy_s && fill_way == 2'd3);
-    let scache_hit : logic     = shit_0 || shit_1 || shit_2 || shit_3;
-    // Victim way for a store MISS (write-through, no-allocate → invalidate the
-    // victim so a later load refills the merged bytes from DRAM).
-    let s_has_invalid: logic    = !valid_0[sindex] || !valid_1[sindex] || !valid_2[sindex] || !valid_3[sindex];
-    let s_invalid_way: logic<2> = if !valid_0[sindex] ?
-        2'd0
-    : if !valid_1[sindex] ?
-        2'd1
-    : if !valid_2[sindex] ?
-        2'd2
+    let drain_probe_clash: logic = i_probe_v && (i_probe_addr[63:6] == i_saddr[63:6]);
+    // A same-cycle fill START in the drain's SET must win: its victim could
+    // be the very way this merge writes — the capture would snapshot the
+    // pre-merge data and the fill then overwrites the line, silently losing
+    // an ACKED store (a litmus MP violation when it was a fence-ordered
+    // flag's predecessor). The merge retries next cycle.
+    let drain_fill_set_clash: logic = fill_start_fire && (f_index == sindex);
+    // A same-cycle AMO FORCE-MISS on the drain's line must win too: it
+    // captures/invalidates the line this edge, so a coincident merge would
+    // write into the dying way — an ACKED store silently lost (the sb's
+    // AMO-overlap issue gate is dword-granular and misses same-line /
+    // different-dword AMOs; observed as tsk->stack keeping the memcpy'd
+    // init_task value → copy_thread memset zeroing the LIVE boot stack →
+    // kernel Oops at pc 0). The drain retries: the line is gone, the
+    // store-RFO refetches it AFTER the captured writeback drains
+    // (fill_blocked_wb), and the merge lands on top.
+    let drain_amo_clash: logic = amo_force_trigger && (tag == stag) && (index == sindex);
+    let store_can_drain: logic = i_swen && state == State::IDLE && !i_wen && s_hit_excl
+        && !drain_probe_clash && !drain_fill_set_clash && !drain_amo_clash;
+    // P9.2: full-line WRITE-THROUGH drain (see s_full_line). Fires on its
+    // write-channel grant; the writeback buffer outranks it there, and a
+    // same-cycle fill start in the set must win (shared departure-event
+    // port + its victim could be our S copy's way).
+    let want_store_wt: logic = i_swen && state == State::IDLE && !i_wen && !s_hit_excl && s_full_line
+        && !drain_probe_clash;
+    let wt_fires: logic = want_store_wt && i_memw_grant && !wb_v && !fill_start_fire;
+    assign o_sdrain_ack = store_can_drain || wt_fires;
+
+    // ==================================================================
+    // P9.2: dirty-line bookkeeping + WRITEBACK-BUFFER capture arbitration
+    // (one capture per cycle; the fill-start capture is guaranteed free by
+    // fill_blocked_wb, the others defer). Priority: fill > AMO force >
+    // probe > misaligned detour > flush — the AMO-before-probe order breaks
+    // a would-be comb cycle through the shared departure-event port.
+    // ==================================================================
+    // i_addr line's hit way: dirty flag + full-line data (AMO force-miss
+    // capture and the misaligned-store lo-line capture share this decode).
+    let hit_dirty: logic = (hit_0 && dirty_0[index]) || (hit_1 && dirty_1[index])
+        || (hit_2 && dirty_2[index]) || (hit_3 && dirty_3[index]);
+    var hitway_data: logic<64> [8];
+    for l in 0..8 :gen_hitway_data {
+        assign hitway_data[l] = if hit_0 ?
+            data_0[{index, l as 3}]
+        : if hit_1 ?
+            data_1[{index, l as 3}]
+        : if hit_2 ?
+            data_2[{index, l as 3}]
+        :
+            data_3[{index, l as 3}]
+        ;
+    }
+    // Misaligned-store hi line (i_addr+8).
+    let next_hit_dirty: logic = (next_hit_0 && dirty_0[next_index]) || (next_hit_1 && dirty_1[next_index])
+        || (next_hit_2 && dirty_2[next_index]) || (next_hit_3 && dirty_3[next_index]);
+    var nexthit_data: logic<64> [8];
+    for l in 0..8 :gen_nexthit_data {
+        assign nexthit_data[l] = if next_hit_0 ?
+            data_0[{next_index, l as 3}]
+        : if next_hit_1 ?
+            data_1[{next_index, l as 3}]
+        : if next_hit_2 ?
+            data_2[{next_index, l as 3}]
+        :
+            data_3[{next_index, l as 3}]
+        ;
+    }
+    // A misaligned store whose touched line(s) are DIRTY detours them
+    // through the writeback buffer first (the self-invalidate would lose
+    // the dirty bytes); the write itself is held meanwhile.
+    let mis_active       : logic = i_wen && (state == State::IDLE) && (i_wstrb_hi != 8'd0);
+    let mis_lo_dirty     : logic = mis_active && cache_hit && hit_dirty;
+    let mis_hi_dirty     : logic = mis_active && next_line_hit && next_hit_dirty;
+    let mis_dirty_pending: logic = mis_lo_dirty || mis_hi_dirty;
+
+    // Probe decode (recall): any-way match on i_probe_addr. The mid-fill
+    // victim way is NOT excluded — its dirty bytes (if any) were captured
+    // at the fill start, so a probe finds it clean and may invalidate it.
+    let p_tag  : logic<TAG_W>   = i_probe_addr[63:INDEX_W + 6];
+    let p_index: logic<INDEX_W> = i_probe_addr[INDEX_W + 5:6];
+    let phit_0 : logic = valid_0[p_index] && tags_0[p_index] == p_tag;
+    let phit_1 : logic = valid_1[p_index] && tags_1[p_index] == p_tag;
+    let phit_2 : logic = valid_2[p_index] && tags_2[p_index] == p_tag;
+    let phit_3 : logic = valid_3[p_index] && tags_3[p_index] == p_tag;
+    let p_any  : logic = phit_0 || phit_1 || phit_2 || phit_3;
+    let p_dirty: logic = (phit_0 && dirty_0[p_index]) || (phit_1 && dirty_1[p_index])
+        || (phit_2 && dirty_2[p_index]) || (phit_3 && dirty_3[p_index]);
+    var p_data: logic<64> [8];
+    for l in 0..8 :gen_p_data {
+        assign p_data[l] = if phit_0 ?
+            data_0[{p_index, l as 3}]
+        : if phit_1 ?
+            data_1[{p_index, l as 3}]
+        : if phit_2 ?
+            data_2[{p_index, l as 3}]
+        :
+            data_3[{p_index, l as 3}]
+        ;
+    }
+    // The probed line already sits in the writeback buffer (evicted, WB in
+    // flight): no ack — that WB completes the recall at the home.
+    let probe_wb_wait: logic = wb_v && (wb_line == i_probe_addr[63:6]);
+    // The probed line is being FILLED here: the tag arrays don't show it yet
+    // (they would answer "absent" → ack → the home drops this hart from the
+    // directory → the write that triggered the recall sends no invalidate →
+    // the fill completes with the PRE-write line = stale-forever; observed
+    // as the litmus MP+fence (1,0) violation). ABORT the fill with the ack:
+    // the load replays and refetches the post-write line. EXCEPT for a
+    // SELF-recall (i_probe_self): the fill is the recall's own requester
+    // and the home serializes any real writer behind the engine — aborting
+    // would re-arm the stale owner via the same grant and livelock.
+    let p_fill_hit: logic = filling && (fill_index == p_index) && (fill_tag == p_tag) && !i_probe_self;
+
+    // Flush sweep decode (scan counter: {set, way}).
+    var fl_active: logic           ;
+    var fl_idx   : logic<INDEX_W + 2>;
+    var fl_done_q: logic           ;
+    let fl_set: logic<INDEX_W> = fl_idx[INDEX_W + 1:2];
+    let fl_way: logic<2>       = fl_idx[1:0];
+    let fl_valid: logic = if fl_way == 2'd0 ?
+        valid_0[fl_set]
+    : if fl_way == 2'd1 ?
+        valid_1[fl_set]
+    : if fl_way == 2'd2 ?
+        valid_2[fl_set]
     :
-        2'd3
+        valid_3[fl_set]
     ;
-    let s_plru_bits  : logic<3> = plru[sindex];
-    let s_plru_way   : logic<2> = {s_plru_bits[2], if !s_plru_bits[2] ? s_plru_bits[1] : s_plru_bits[0]};
-    let s_victim_way : logic<2> = if s_has_invalid ? s_invalid_way : s_plru_way;
-    // S23: the drain has its own bus channel, so it coexists with a fill —
-    // EXCEPT on the fill's own line: a drain there mid-fill can't merge (the
-    // way is excluded above) and the in-flight transfers may pre-date the
-    // DRAM write, so the completed line would carry the pre-store dword.
-    // Same-cycle fill START to the drain line is blocked for the same reason
-    // (transfer 0 would comb-read DRAM before the write lands). The fill
-    // wins; the store retries (bounded — the fill completes in 8 grants).
-    let drain_fill_conflict: logic = (filling && fill_index == sindex && fill_tag == stag)
-        || (state == State::IDLE && miss && f_index == sindex && f_tag == stag);
-    // S23: within a hart the drain keeps its pre-split serialization (IDLE,
-    // no pending miss) — letting it run mid-fill was measured cycle-NEGATIVE
-    // at N=1 (second-order timing: stores retiring during fills perturb the
-    // commit/miss interleaving). The split still buys the cross-hart case:
-    // hart B's drain is granted during hart A's fill whenever A's transfer
-    // hits the L2 (the wgrant_ok term), which the old single channel never
-    // allowed.
-    // S20.2 collision fix: the drain must YIELD to a same-cycle i_wen write —
-    // the o_memw mux gives i_wen priority, so a coincident drain would
-    // o_sdrain_ack (popping the buffered store) while the bus carried the
-    // i_wen address: the buffered store would be lost without ever reaching
-    // memory (the N=4 secondary-bringup wedge). With the live committing
-    // store this could not happen (i_wen and i_swen were exclusive); the
-    // buffer drains asynchronously to commit, so it can.
-    // S20.2 urgency: when urgent, the drain also wins over a pending demand
-    // miss — the fill start is held (drain_urgent gates the IDLE→FILL
-    // transition and the miss read below) and the drain takes the slot. A
-    // same-line conflict drops want_store (and so drain_urgent), letting the
-    // fill proceed — no mutual block.
-    let want_store     : logic = i_swen && state == State::IDLE && !i_wen && (!miss || i_sdrain_urgent) && !drain_fill_conflict;
-    let drain_urgent   : logic = want_store && i_sdrain_urgent;
-    let store_can_drain: logic = want_store && i_memw_grant;
-    assign o_sdrain_ack = store_can_drain;
+    let fl_dirty: logic = fl_valid && (if fl_way == 2'd0 ?
+        dirty_0[fl_set]
+    : if fl_way == 2'd1 ?
+        dirty_1[fl_set]
+    : if fl_way == 2'd2 ?
+        dirty_2[fl_set]
+    :
+        dirty_3[fl_set]
+    );
+    let fl_tag: logic<TAG_W> = if fl_way == 2'd0 ?
+        tags_0[fl_set]
+    : if fl_way == 2'd1 ?
+        tags_1[fl_set]
+    : if fl_way == 2'd2 ?
+        tags_2[fl_set]
+    :
+        tags_3[fl_set]
+    ;
+    var fl_data: logic<64> [8];
+    for l in 0..8 :gen_fl_data {
+        assign fl_data[l] = if fl_way == 2'd0 ?
+            data_0[{fl_set, l as 3}]
+        : if fl_way == 2'd1 ?
+            data_1[{fl_set, l as 3}]
+        : if fl_way == 2'd2 ?
+            data_2[{fl_set, l as 3}]
+        :
+            data_3[{fl_set, l as 3}]
+        ;
+    }
+
+    // i_wen write fire (the local merge and the bus write must coincide):
+    // the writeback buffer outranks it on the channel, and a misaligned
+    // store waits out its dirty detours.
+    let amo_miss : logic = i_ren && i_wen && !cache_hit;
+    let wen_fires: logic = i_wen && state == State::IDLE && i_memw_grant && !amo_miss
+        && !wb_v && !mis_dirty_pending;
+    let wb_fire: logic = wb_v && i_memw_grant;
+
+    // Capture arbitration + departure events (fill_start_fire is defined up
+    // at the fill-selection section).
+    let cap_fill_go: logic = fill_start_fire && vic_dirty;
+    let cap_amo_go     : logic = amo_force_trigger && hit_dirty && !wb_v && !cap_fill_go;
+    let amo_force_evt  : logic = amo_force_trigger && (!hit_dirty || cap_amo_go);
+    let ev_mis_hi      : logic = wen_fires && (i_wstrb_hi != 8'd0) && next_line_hit;
+    let probe_act      : logic = i_probe_v && !probe_wb_wait && !ev_mis_hi && !amo_force_evt;
+    let cap_probe_go   : logic = probe_act && p_dirty && !wb_v && !cap_fill_go && !cap_amo_go;
+    assign o_probe_ack = probe_act && !p_dirty;
+    let cap_mis_go    : logic = mis_dirty_pending && !wb_v && !cap_fill_go && !cap_amo_go && !cap_probe_go;
+    let cap_mis_hi_sel: logic = !mis_lo_dirty; // lo line first, then hi
+    let ev_fill_vic   : logic = fill_start_fire && vic_valid && (vic_tag != f_tag);
+    let ev_mis_lo     : logic = wen_fires && (i_wstrb_hi != 8'd0) && cache_hit;
+    let ev_drain_wt   : logic = wt_fires && scache_hit; // own S copy dropped
+    let cap_flush_want: logic = fl_active && fl_dirty;
+    let cap_flush_go  : logic = cap_flush_want && !wb_v && !cap_fill_go && !cap_amo_go
+        && !cap_probe_go && !cap_mis_go && !(ev_fill_vic || ev_mis_lo || ev_drain_wt);
+    let fl_step      : logic = fl_active && (!cap_flush_want || cap_flush_go);
+    let probe_depart : logic = probe_act && ((p_any && (!p_dirty || cap_probe_go)) || p_fill_hit);
+    assign o_flush_done = fl_done_q && !wb_v;
 
     always_ff (clk, rst) {
         if_reset {
@@ -396,12 +729,29 @@ pub module dcache #(
             fill_way     = 2'd0;
             fill_offset  = 3'd0;
             fill_aborted = 1'b0;
+            fill_rfo     = 1'b0;
             amo_filled_q = 1'b0;
+            wb_v         = 1'b0;
+            wb_line      = '0;
+            fl_active    = 1'b0;
+            fl_idx       = '0;
+            fl_done_q    = 1'b0;
+            for l in 0..8 {
+                wb_data[l] = 64'd0;
+            }
             for i in 0..SETS {
                 valid_0[i] = 1'b0;
                 valid_1[i] = 1'b0;
                 valid_2[i] = 1'b0;
                 valid_3[i] = 1'b0;
+                excl_0[i]  = 1'b0;
+                excl_1[i]  = 1'b0;
+                excl_2[i]  = 1'b0;
+                excl_3[i]  = 1'b0;
+                dirty_0[i] = 1'b0;
+                dirty_1[i] = 1'b0;
+                dirty_2[i] = 1'b0;
+                dirty_3[i] = 1'b0;
             }
         } else {
             case state {
@@ -411,18 +761,46 @@ pub module dcache #(
                     // re-fills from the bus under the amo_inflight lock (coherent).
                     // i_wen=0 for an AMO read phase, so this never races the write
                     // block below; miss=0 here (still a hit) so no fill starts yet.
+                    // P9.2: a DIRTY hit detours through the writeback buffer
+                    // (cap_amo_go arbitration) — the invalidate waits with it.
                     if amo_force_trigger {
-                        if hit_0 {
-                            valid_0[index] = 1'b0;
-                        }
-                        if hit_1 {
-                            valid_1[index] = 1'b0;
-                        }
-                        if hit_2 {
-                            valid_2[index] = 1'b0;
-                        }
-                        if hit_3 {
-                            valid_3[index] = 1'b0;
+                        if hit_dirty {
+                            if cap_amo_go {
+                                wb_v    = 1'b1;
+                                wb_line = {tag, index};
+                                for l in 0..8 {
+                                    wb_data[l] = hitway_data[l];
+                                }
+                                if hit_0 {
+                                    valid_0[index] = 1'b0;
+                                    dirty_0[index] = 1'b0;
+                                }
+                                if hit_1 {
+                                    valid_1[index] = 1'b0;
+                                    dirty_1[index] = 1'b0;
+                                }
+                                if hit_2 {
+                                    valid_2[index] = 1'b0;
+                                    dirty_2[index] = 1'b0;
+                                }
+                                if hit_3 {
+                                    valid_3[index] = 1'b0;
+                                    dirty_3[index] = 1'b0;
+                                }
+                            }
+                        } else {
+                            if hit_0 {
+                                valid_0[index] = 1'b0;
+                            }
+                            if hit_1 {
+                                valid_1[index] = 1'b0;
+                            }
+                            if hit_2 {
+                                valid_2[index] = 1'b0;
+                            }
+                            if hit_3 {
+                                valid_3[index] = 1'b0;
+                            }
                         }
                     }
                     // Phase 5: gate fill start and write-through on bus grant.
@@ -433,20 +811,47 @@ pub module dcache #(
                     // starts (independent write channel) — the FILL-state inv
                     // check below sees state==IDLE this cycle and would miss
                     // it, so seed fill_aborted from the same-cycle invalidate.
-                    // S20.2: a fill start yields to an URGENT drain this cycle.
-                    if miss && i_memr_grant && !drain_urgent {
+                    // P9.2: load misses and store-RFO fills share this path
+                    // (load_sel/srfo_sel selection); a DIRTY victim is
+                    // captured into the writeback buffer here (guaranteed
+                    // free — fill_blocked_wb holds the start otherwise).
+                    if fill_start_fire {
+                        if vic_dirty {
+                            wb_v    = 1'b1;
+                            wb_line = {vic_tag, f_index};
+                            for l in 0..8 {
+                                wb_data[l] = vic_data[l];
+                            }
+                            if victim_way == 2'd0 {
+                                dirty_0[f_index] = 1'b0;
+                            }
+                            if victim_way == 2'd1 {
+                                dirty_1[f_index] = 1'b0;
+                            }
+                            if victim_way == 2'd2 {
+                                dirty_2[f_index] = 1'b0;
+                            }
+                            if victim_way == 2'd3 {
+                                dirty_3[f_index] = 1'b0;
+                            }
+                        }
                         fill_index   = f_index;
                         fill_tag     = f_tag;
                         fill_way     = victim_way;
                         fill_offset  = f_offset;
                         fill_count   = 3'd0;
-                        fill_aborted = i_inv_valid && inv_index == f_index && inv_tag == f_tag;
-                        state        = State::FILL;
+                        fill_rfo     = f_rfo;
+                        fill_aborted = (i_inv_valid && inv_index == f_index && inv_tag == f_tag)
+                            || (i_inv2_valid && inv2_index == f_index && inv2_tag == f_tag);
+                        state = State::FILL;
                     }
-                    // Write-through: update cache on write hit, invalidate on miss.
-                    // Only commit the cache change + DRAM write when granted so
-                    // the local update and the DRAM emission stay in lockstep.
-                    if i_wen && i_memw_grant {
+                    // Write-through (i_wen: AMO/LR-SC, misaligned, MMIO, slow
+                    // stores): update cache on write hit. Only commit the
+                    // cache change + DRAM write when the write actually fires
+                    // (wen_fires: granted, buffer not occupying the channel,
+                    // no pending misaligned dirty detour) so the local merge
+                    // and the DRAM emission stay in lockstep.
+                    if wen_fires {
                         if i_wstrb_hi != 8'd0 {
                             // M8.B (B.3): misaligned 2-dword STORE. tb gets the
                             // lo dword (mem-side write-through below, o_mem_wen)
@@ -509,21 +914,11 @@ pub module dcache #(
                             if hit_3 {
                                 data_3[data_idx] = merged;
                             }
-                        } else {
-                            // Invalidate the way that would be selected if this were a read miss
-                            if victim_way == 2'd0 {
-                                valid_0[index] = 1'b0;
-                            }
-                            if victim_way == 2'd1 {
-                                valid_1[index] = 1'b0;
-                            }
-                            if victim_way == 2'd2 {
-                                valid_2[index] = 1'b0;
-                            }
-                            if victim_way == 2'd3 {
-                                valid_3[index] = 1'b0;
-                            }
                         }
+                        // P9.2: a write-through MISS needs no local action
+                        // (the pre-P9.2 victim invalidate was a no-allocate
+                        // artifact; under MESI it would evict an innocent —
+                        // possibly dirty — line for nothing).
                     }
                 }
                 State::FILL: {
@@ -539,7 +934,9 @@ pub module dcache #(
                     // hart held the AMO bus lock — the burst needed per-beat bus
                     // grants — so the litmus barrier never hit this; with
                     // mem_ctrl's bus-independent STREAM beats it does.)
-                    let inv_hits_done: logic = i_inv_valid && inv_index == fill_index && inv_tag == fill_tag;
+                    // P9.2: either inv port + a same-cycle PROBE of the fill
+                    // line (same completion-edge fold as the P9.1 inv fix).
+                    let inv_hits_done: logic = inv_fill_hit || (probe_act && p_fill_hit);
                     if i_memr_grant {
                         if fill_way == 2'd0 {
                             data_0[fill_data_idx] = i_mem_rdata;
@@ -557,21 +954,32 @@ pub module dcache #(
                             // Fill complete. If a remote invalidate hit this line
                             // mid-fill, leave valid=0 so the next access misses
                             // and re-fills. Tag write is harmless either way.
+                            // P9.2: latch the home's grant state (E/M vs S);
+                            // the line starts CLEAN (dirty comes from drain
+                            // merges only).
                             if fill_way == 2'd0 {
                                 tags_0[fill_index]  = fill_tag;
                                 valid_0[fill_index] = !fill_aborted && !inv_hits_done;
+                                excl_0[fill_index]  = i_fill_excl;
+                                dirty_0[fill_index] = 1'b0;
                             }
                             if fill_way == 2'd1 {
                                 tags_1[fill_index]  = fill_tag;
                                 valid_1[fill_index] = !fill_aborted && !inv_hits_done;
+                                excl_1[fill_index]  = i_fill_excl;
+                                dirty_1[fill_index] = 1'b0;
                             }
                             if fill_way == 2'd2 {
                                 tags_2[fill_index]  = fill_tag;
                                 valid_2[fill_index] = !fill_aborted && !inv_hits_done;
+                                excl_2[fill_index]  = i_fill_excl;
+                                dirty_2[fill_index] = 1'b0;
                             }
                             if fill_way == 2'd3 {
                                 tags_3[fill_index]  = fill_tag;
                                 valid_3[fill_index] = !fill_aborted && !inv_hits_done;
+                                excl_3[fill_index]  = i_fill_excl;
+                                dirty_3[fill_index] = 1'b0;
                             }
                             state = State::DONE;
                         } else {
@@ -587,70 +995,229 @@ pub module dcache #(
                 }
             }
 
-            // Phase 8 S6/S23: store-drain WRITE (separate i_saddr port).
-            // Mirrors the i_wen hit/miss logic on sindex/sdata_idx with
-            // i_swdata/i_swstrb. Aligned plain stores only (no i_swstrb_hi
-            // straddle path — the core keeps misaligned stores on i_wen).
-            // Mutually exclusive with the i_wen block at the core level, so no
-            // same-element double write. No PLRU update (replacement-policy
-            // only). S23: moved OUT of the IDLE arm — the drain now also runs
-            // mid-FILL/DONE for non-conflicting lines (want_store excludes the
-            // fill line; shit_* exclude the fill way), and the fill's array
-            // writes touch a different line so the two never share a cell.
+            // P9.2 store drain = LOCAL MERGE into the owned (E/M) way — the
+            // line goes M (dirty); NO bus transaction. A drain that cannot
+            // merge raised the store-RFO fill instead (the IDLE arm above).
+            // Aligned plain stores only; mutually exclusive with the i_wen
+            // block at the core level. No PLRU update (replacement-policy
+            // only).
             if store_can_drain {
-                if scache_hit {
-                    // S25: merge every populated lane of the line into the
-                    // hit way (one array write per occupied dword).
+                for l in 0..8 {
+                    if i_swstrb[l] != 8'd0 {
+                        let sold   : logic<64> = if shit_0 ?
+                            data_0[{sindex, l as 3}]
+                        : if shit_1 ?
+                            data_1[{sindex, l as 3}]
+                        : if shit_2 ?
+                            data_2[{sindex, l as 3}]
+                        :
+                            data_3[{sindex, l as 3}]
+                        ;
+                        let smerged: logic<64> = {
+                            if i_swstrb[l][7] ? i_swdata[l][63:56] : sold[63:56],
+                            if i_swstrb[l][6] ? i_swdata[l][55:48] : sold[55:48],
+                            if i_swstrb[l][5] ? i_swdata[l][47:40] : sold[47:40],
+                            if i_swstrb[l][4] ? i_swdata[l][39:32] : sold[39:32],
+                            if i_swstrb[l][3] ? i_swdata[l][31:24] : sold[31:24],
+                            if i_swstrb[l][2] ? i_swdata[l][23:16] : sold[23:16], if i_swstrb[l][1] ? i_swdata[l][15:8] : sold[15:8],
+                            if i_swstrb[l][0] ? i_swdata[l][7:0] : sold[7:0]
+                        };
+                        if shit_0 {
+                            data_0[{sindex, l as 3}] = smerged;
+                        }
+                        if shit_1 {
+                            data_1[{sindex, l as 3}] = smerged;
+                        }
+                        if shit_2 {
+                            data_2[{sindex, l as 3}] = smerged;
+                        }
+                        if shit_3 {
+                            data_3[{sindex, l as 3}] = smerged;
+                        }
+                    }
+                }
+                if shit_0 {
+                    dirty_0[sindex] = 1'b1;
+                }
+                if shit_1 {
+                    dirty_1[sindex] = 1'b1;
+                }
+                if shit_2 {
+                    dirty_2[sindex] = 1'b1;
+                }
+                if shit_3 {
+                    dirty_3[sindex] = 1'b1;
+                }
+            }
+
+            // P9.2: full-line WRITE-THROUGH drain — drop our own (clean S)
+            // copy; the home merges the line and invalidates the other
+            // sharers. Keeping the local copy would leave it stale against
+            // the bytes the home just took.
+            if wt_fires {
+                if shit_0 {
+                    valid_0[sindex] = 1'b0;
+                }
+                if shit_1 {
+                    valid_1[sindex] = 1'b0;
+                }
+                if shit_2 {
+                    valid_2[sindex] = 1'b0;
+                }
+                if shit_3 {
+                    valid_3[sindex] = 1'b0;
+                }
+            }
+
+            // P9.2: misaligned-store dirty detour — capture+invalidate one
+            // dirty touched line per cycle (lo first); the write itself is
+            // held until both lines are clean (wen_fires gating).
+            if cap_mis_go {
+                wb_v = 1'b1;
+                if !cap_mis_hi_sel {
+                    wb_line = {tag, index};
                     for l in 0..8 {
-                        if i_swstrb[l] != 8'd0 {
-                            let sold   : logic<64> = if shit_0 ?
-                                data_0[{sindex, l as 3}]
-                            : if shit_1 ?
-                                data_1[{sindex, l as 3}]
-                            : if shit_2 ?
-                                data_2[{sindex, l as 3}]
-                            :
-                                data_3[{sindex, l as 3}]
-                            ;
-                            let smerged: logic<64> = {
-                                if i_swstrb[l][7] ? i_swdata[l][63:56] : sold[63:56],
-                                if i_swstrb[l][6] ? i_swdata[l][55:48] : sold[55:48],
-                                if i_swstrb[l][5] ? i_swdata[l][47:40] : sold[47:40],
-                                if i_swstrb[l][4] ? i_swdata[l][39:32] : sold[39:32],
-                                if i_swstrb[l][3] ? i_swdata[l][31:24] : sold[31:24],
-                                if i_swstrb[l][2] ? i_swdata[l][23:16] : sold[23:16], if i_swstrb[l][1] ? i_swdata[l][15:8] : sold[15:8],
-                                if i_swstrb[l][0] ? i_swdata[l][7:0] : sold[7:0]
-                            };
-                            if shit_0 {
-                                data_0[{sindex, l as 3}] = smerged;
-                            }
-                            if shit_1 {
-                                data_1[{sindex, l as 3}] = smerged;
-                            }
-                            if shit_2 {
-                                data_2[{sindex, l as 3}] = smerged;
-                            }
-                            if shit_3 {
-                                data_3[{sindex, l as 3}] = smerged;
-                            }
+                        wb_data[l] = hitway_data[l];
+                    }
+                    if hit_0 {
+                        valid_0[index] = 1'b0;
+                        dirty_0[index] = 1'b0;
+                    }
+                    if hit_1 {
+                        valid_1[index] = 1'b0;
+                        dirty_1[index] = 1'b0;
+                    }
+                    if hit_2 {
+                        valid_2[index] = 1'b0;
+                        dirty_2[index] = 1'b0;
+                    }
+                    if hit_3 {
+                        valid_3[index] = 1'b0;
+                        dirty_3[index] = 1'b0;
+                    }
+                } else {
+                    wb_line = {next_tag, next_index};
+                    for l in 0..8 {
+                        wb_data[l] = nexthit_data[l];
+                    }
+                    if next_hit_0 {
+                        valid_0[next_index] = 1'b0;
+                        dirty_0[next_index] = 1'b0;
+                    }
+                    if next_hit_1 {
+                        valid_1[next_index] = 1'b0;
+                        dirty_1[next_index] = 1'b0;
+                    }
+                    if next_hit_2 {
+                        valid_2[next_index] = 1'b0;
+                        dirty_2[next_index] = 1'b0;
+                    }
+                    if next_hit_3 {
+                        valid_3[next_index] = 1'b0;
+                        dirty_3[next_index] = 1'b0;
+                    }
+                }
+            }
+
+            // P9.2: PROBE (recall). A dirty copy is captured+invalidated
+            // (the WB completes the recall at the home); a clean one is
+            // invalidated with a same-cycle o_probe_ack. probe_act defers
+            // to same-cycle users of the shared departure-event port.
+            if probe_act {
+                if p_dirty {
+                    if cap_probe_go {
+                        wb_v    = 1'b1;
+                        wb_line = i_probe_addr[63:6];
+                        for l in 0..8 {
+                            wb_data[l] = p_data[l];
+                        }
+                        if phit_0 {
+                            valid_0[p_index] = 1'b0;
+                            dirty_0[p_index] = 1'b0;
+                        }
+                        if phit_1 {
+                            valid_1[p_index] = 1'b0;
+                            dirty_1[p_index] = 1'b0;
+                        }
+                        if phit_2 {
+                            valid_2[p_index] = 1'b0;
+                            dirty_2[p_index] = 1'b0;
+                        }
+                        if phit_3 {
+                            valid_3[p_index] = 1'b0;
+                            dirty_3[p_index] = 1'b0;
                         }
                     }
                 } else {
-                    // Store miss: write-through to DRAM (o_memw below),
-                    // invalidate the victim way (no-allocate).
-                    if s_victim_way == 2'd0 {
-                        valid_0[sindex] = 1'b0;
+                    if phit_0 {
+                        valid_0[p_index] = 1'b0;
                     }
-                    if s_victim_way == 2'd1 {
-                        valid_1[sindex] = 1'b0;
+                    if phit_1 {
+                        valid_1[p_index] = 1'b0;
                     }
-                    if s_victim_way == 2'd2 {
-                        valid_2[sindex] = 1'b0;
+                    if phit_2 {
+                        valid_2[p_index] = 1'b0;
                     }
-                    if s_victim_way == 2'd3 {
-                        valid_3[sindex] = 1'b0;
+                    if phit_3 {
+                        valid_3[p_index] = 1'b0;
                     }
                 }
+                // The probed line is mid-FILL here: abort it (see p_fill_hit).
+                if p_fill_hit {
+                    fill_aborted = 1'b1;
+                }
+            }
+
+            // P9.2: FLUSH sweep (FENCE.I / SFENCE.VMA / satp): write back +
+            // invalidate every dirty line; clean lines stay. One step per
+            // cycle; a dirty target holds the scan until its capture wins
+            // the buffer + departure-event arbitration.
+            if !i_flush_req {
+                fl_active = 1'b0;
+                fl_done_q = 1'b0;
+                fl_idx    = '0;
+            } else if !fl_active && !fl_done_q {
+                fl_active = 1'b1;
+                fl_idx    = '0;
+            } else if fl_active {
+                if cap_flush_go {
+                    wb_v    = 1'b1;
+                    wb_line = {fl_tag, fl_set};
+                    for l in 0..8 {
+                        wb_data[l] = fl_data[l];
+                    }
+                    if fl_way == 2'd0 {
+                        valid_0[fl_set] = 1'b0;
+                        dirty_0[fl_set] = 1'b0;
+                    }
+                    if fl_way == 2'd1 {
+                        valid_1[fl_set] = 1'b0;
+                        dirty_1[fl_set] = 1'b0;
+                    }
+                    if fl_way == 2'd2 {
+                        valid_2[fl_set] = 1'b0;
+                        dirty_2[fl_set] = 1'b0;
+                    }
+                    if fl_way == 2'd3 {
+                        valid_3[fl_set] = 1'b0;
+                        dirty_3[fl_set] = 1'b0;
+                    }
+                }
+                if fl_step {
+                    if fl_idx == '1 {
+                        fl_active = 1'b0;
+                        fl_done_q = 1'b1;
+                    } else {
+                        fl_idx = fl_idx + 1;
+                    }
+                }
+            }
+
+            // P9.2: writeback-buffer drain (the buffer outranks i_wen on the
+            // write channel; captures never coincide with the fire — they
+            // all require the buffer free).
+            if wb_fire {
+                wb_v = 1'b0;
             }
 
             // Update PLRU on cache hit (point tree AWAY from accessed way)
@@ -682,6 +1249,24 @@ pub module dcache #(
                     valid_3[inv_index] = 1'b0;
                 }
                 if state == State::FILL && fill_index == inv_index && fill_tag == inv_tag {
+                    fill_aborted = 1'b1;
+                }
+            }
+            // P9.2: second invalidate port — identical handling.
+            if i_inv2_valid {
+                if valid_0[inv2_index] && tags_0[inv2_index] == inv2_tag {
+                    valid_0[inv2_index] = 1'b0;
+                }
+                if valid_1[inv2_index] && tags_1[inv2_index] == inv2_tag {
+                    valid_1[inv2_index] = 1'b0;
+                }
+                if valid_2[inv2_index] && tags_2[inv2_index] == inv2_tag {
+                    valid_2[inv2_index] = 1'b0;
+                }
+                if valid_3[inv2_index] && tags_3[inv2_index] == inv2_tag {
+                    valid_3[inv2_index] = 1'b0;
+                }
+                if state == State::FILL && fill_index == inv2_index && fill_tag == inv2_tag {
                     fill_aborted = 1'b1;
                 }
             }
@@ -730,69 +1315,66 @@ pub module dcache #(
     assign o_rdata_next      = if next_same_line ? next_rdata_same : next_rdata_xline;
     assign o_rdata_next_miss = i_ren && (if next_same_line ? !cache_hit : !next_line_hit);
 
-    // Memory interface — S23 split. READ channel: fill bursts + the miss-start
-    // read. WRITE channel: i_wen write-through (IDLE-only, unchanged) + the
-    // store drain. i_wen and i_swen are mutually exclusive at the core, so
-    // the two write-channel sources never both fire.
+    // Memory interface — S23 split, P9.2 rework.
+    // READ channel: fill bursts + the fill-start read (load miss or
+    // store-RFO; o_memr_rfo tells the home to grant ownership).
+    // WRITE channel: the WRITEBACK BUFFER (full dirty line, o_memw_wb) and
+    // the i_wen write-through — the buffer outranks i_wen on a granted
+    // cycle. Drains no longer touch this channel (local merges).
     assign o_memr_addr = if filling ?
         {fill_tag, fill_index, fill_woff, 3'b000}
     :
         {f_tag, f_index, 3'd0, 3'b000}
     ;
-    assign o_memr_ren = if filling ? 1'b1 : if i_ren && !cache_hit && i_memr_grant && !drain_urgent ? 1'b1 : 1'b0;
+    assign o_memr_ren = if filling ? 1'b1 : if fill_start_fire ? 1'b1 : 1'b0;
+    assign o_memr_rfo = if filling ? fill_rfo : f_rfo;
 
-    assign o_memw_addr = if i_wen ? i_addr : i_saddr;
+    assign o_memw_addr = if wb_v ? {wb_line, 6'd0} : if i_wen ? i_addr : i_saddr;
+    assign o_memw_wb   = wb_v;
 
-    // Suppress write-through on cache miss when AMO (ren && wen) to prevent
-    // corrupting DRAM before the fill reads the old value.
-    let amo_miss: logic = i_ren && i_wen && !cache_hit;
-    // Phase 5: only emit DRAM write strobe when the write channel is granted.
-    // The i_wen path stays IDLE-only (its cache-side update above runs in the
-    // IDLE arm; gating keeps the local merge and the DRAM emission lockstep).
-    // S25: per-lane line write. The i_wen dword rides its i_addr[5:3] lane.
-    let wen_lane : logic<3> = i_addr[5:3];
-    let wen_fires: logic    = i_wen && state == State::IDLE && i_memw_grant && !amo_miss;
+    // S25: per-lane line write. The i_wen dword rides its i_addr[5:3] lane;
+    // a writeback / full-line drain carries all 8 lanes.
+    let wen_lane: logic<3> = i_addr[5:3];
     for l in 0..8 :gen_memw_lane {
-        assign o_memw_wdata[l] = if i_wen ?
+        assign o_memw_wdata[l] = if wb_v ?
+            wb_data[l]
+        : if i_wen ?
             (if wen_lane == (l as 3) ? i_wdata : '0)
-        : if store_can_drain ?
-            i_swdata[l]
         :
-            '0
+            i_swdata[l]
         ;
-        assign o_memw_wstrb[l] = if i_wen ?
+        assign o_memw_wstrb[l] = if wb_v ?
+            8'hff
+        : if i_wen ?
             (if wen_fires && wen_lane == (l as 3) ? i_wstrb : '0)
-        : if store_can_drain ?
+        : if wt_fires ?
             i_swstrb[l]
         :
             '0
         ;
     }
-    assign o_memw_wen = if amo_miss ? 1'b0 : (i_wen && state == State::IDLE && i_memw_grant) || store_can_drain;
+    assign o_memw_wen = wb_fire || wen_fires || wt_fires;
 
     // Channel requests. memory_bus arbitrates among harts per channel.
-    // P9.1: the fill-start request is suppressed while an urgent drain
-    // preempts the start (drain_urgent) — the split-transaction read
-    // controller (mem_ctrl) treats a granted request as a committed
-    // transaction, so a grant must ALWAYS coincide with the IDLE→FILL
-    // transition. (Pre-P9.1 the unused grant was harmless; now it would
-    // open a transaction with no consumer.)
-    let want_fill_start: logic = miss && !drain_urgent; // IDLE+miss, not preempted
-    let want_write     : logic = i_wen && !amo_miss && state == State::IDLE;
+    // The fill-start request is suppressed while the writeback buffer holds
+    // a dirty victim's only copy (fill_blocked_wb) — mem_ctrl treats a
+    // granted request as a committed transaction, so a grant must ALWAYS
+    // coincide with the IDLE→FILL transition.
+    let want_fill_start: logic = (load_sel || srfo_sel) && !fill_blocked_wb;
+    let want_write     : logic = i_wen && !amo_miss && state == State::IDLE && !mis_dirty_pending;
     assign o_memr_req = filling || want_fill_start;
-    assign o_memw_req = want_write || want_store;
+    assign o_memw_req = wb_v || want_write || want_store_wt;
 
     // Non-blocking miss interface (Phase 8 S10). o_miss_valid pulses on the
-    // cycle the fill actually STARTS (miss && grant — the IDLE→FILL edge), not
-    // on the raw miss: without the grant the FSM stays IDLE and needs i_ren
-    // held to keep requesting the bus, so a core that captured the load into
-    // an MSHR on the raw miss and dropped i_ren would strand the fill.
+    // cycle a LOAD fill actually STARTS (the IDLE→FILL edge), not on the raw
+    // miss: without the grant the FSM stays IDLE and needs i_ren held to
+    // keep requesting the bus, so a core that captured the load into an
+    // MSHR on the raw miss and dropped i_ren would strand the fill. P9.2:
+    // store-RFO fills never pulse it (no load to capture).
     // o_fill_complete excludes an aborted fill (remote-write i_inv during the
     // fill): the line stays Invalid and the filled data may be stale, so the
     // MSHR consumer must NOT complete the load from o_fill_rdata — it replays.
-    // S20.2: no fill-start pulse when an urgent drain preempted the start —
-    // an MSHR capture without its fill would strand the load.
-    assign o_miss_valid    = miss && i_memr_grant && !drain_urgent;
+    assign o_miss_valid = load_sel && !fill_blocked_wb && i_memr_grant;
     assign o_fill_complete = state == State::DONE && !fill_aborted;
     assign o_fill_aborted  = state == State::DONE && fill_aborted;
     // S14.2: owner early restart. With critical-word-first the demanded dword
@@ -801,7 +1383,8 @@ pub module dcache #(
     // and the same-cycle invalidate race on the fill line; without cwf the
     // demand dword's transfer slot is offset-dependent, so this stays 0.
     assign o_fill_data_ready = s14_cwf_en && filling && fill_count != 3'd0 && !fill_aborted
-        && !(i_inv_valid && {inv_tag, inv_index} == stream_line);
+        && !(i_inv_valid && {inv_tag, inv_index} == stream_line)
+        && !(i_inv2_valid && {inv2_tag, inv2_index} == stream_line);
     // Phase 8 S10.4a: fill-safe PIPE-0 hit on i_addr — the same per-way
     // victim exclusion the port-2 read got in S10.2 (mid-FILL the filling way
     // carries a stale tag over partially-overwritten data; every other way is
@@ -897,12 +1480,75 @@ pub module dcache #(
     let hi_ok2: logic = !i_load_next2 || next_same_line2 || next_line_hit2;
     assign o_hit2 = i_ren2 && cache_hit2 && hi_ok2;
 
+    // ============================================================
+    // P9.2: local line-departure events (see the port note). The component
+    // signals are defined in the capture-arbitration section; mutual
+    // exclusion per port:
+    //   ev1: fill-start victim (i_ren or i_swen path — no granted i_wen
+    //        action those cycles), OR misaligned-store self-invalidates
+    //        (the final-write cycle's clean invalidate ev_mis_lo, or a
+    //        dirty-detour capture cap_mis_go — write held, so never both),
+    //        OR a flush capture (defers to all of the above).
+    //   ev2: misaligned-store hi self-invalidate, OR the AMO force-miss
+    //        invalidate, OR a probe invalidate (probe_act defers to the
+    //        other two).
+    // ============================================================
+    assign o_evict1_v = ev_fill_vic || ev_mis_lo || cap_mis_go || ev_drain_wt || cap_flush_go;
+    assign o_evict1_addr = if ev_fill_vic ?
+        {vic_tag, f_index, 6'd0}
+    : if ev_mis_lo ?
+        {tag, index, 6'd0}
+    : if cap_mis_go ?
+        (if cap_mis_hi_sel ? {next_tag, next_index, 6'd0} : {tag, index, 6'd0})
+    : if ev_drain_wt ?
+        {stag, sindex, 6'd0}
+    :
+        {fl_tag, fl_set, 6'd0}
+    ;
+    assign o_evict2_v    = ev_mis_hi || amo_force_evt || probe_depart;
+    assign o_evict2_addr = if ev_mis_hi ?
+        {next_tag, next_index, 6'd0}
+    : if amo_force_evt ?
+        {tag, index, 6'd0}
+    :
+        {i_probe_addr[63:6], 6'd0}
+    ;
+
+    // ============================================================
+    // P9.2: line-presence checks (combinational, registered state only — a
+    // same-cycle invalidate pulse drops presence on the NEXT cycle; the
+    // core's own same-cycle inv compares cover that window). The mid-fill
+    // victim way is NOT present (its old line is unreadable and dies at
+    // completion); the line being filled IS present unless aborted.
+    // ============================================================
+    let chk_tag      : logic<TAG_W>   = i_chk_addr[63:INDEX_W + 6];
+    let chk_index    : logic<INDEX_W> = i_chk_addr[INDEX_W + 5:6];
+    let fill_busy_chk: logic          = filling && fill_index == chk_index;
+    let chk_hit      : logic          = (valid_0[chk_index] && tags_0[chk_index] == chk_tag && !(fill_busy_chk && fill_way == 2'd0))
+        || (valid_1[chk_index] && tags_1[chk_index] == chk_tag && !(fill_busy_chk && fill_way == 2'd1))
+        || (valid_2[chk_index] && tags_2[chk_index] == chk_tag && !(fill_busy_chk && fill_way == 2'd2))
+        || (valid_3[chk_index] && tags_3[chk_index] == chk_tag && !(fill_busy_chk && fill_way == 2'd3));
+    assign o_chk_present = chk_hit || (filling && {fill_tag, fill_index} == {chk_tag, chk_index} && !fill_aborted);
+
+    let chk2_tag      : logic<TAG_W>   = i_chk2_addr[63:INDEX_W + 6];
+    let chk2_index    : logic<INDEX_W> = i_chk2_addr[INDEX_W + 5:6];
+    let fill_busy_chk2: logic          = filling && fill_index == chk2_index;
+    let chk2_hit      : logic          = (valid_0[chk2_index] && tags_0[chk2_index] == chk2_tag && !(fill_busy_chk2 && fill_way == 2'd0))
+        || (valid_1[chk2_index] && tags_1[chk2_index] == chk2_tag && !(fill_busy_chk2 && fill_way == 2'd1))
+        || (valid_2[chk2_index] && tags_2[chk2_index] == chk2_tag && !(fill_busy_chk2 && fill_way == 2'd2))
+        || (valid_3[chk2_index] && tags_3[chk2_index] == chk2_tag && !(fill_busy_chk2 && fill_way == 2'd3));
+    assign o_chk2_present = chk2_hit || (filling && {fill_tag, fill_index} == {chk2_tag, chk2_index} && !fill_aborted);
+
+
+
     // Stall on miss, during fill, DONE, and writes during fill.
     // Fill state stalls all accesses (original conservative behavior).
     // Phase 5: also stall while waiting for bus grant on a write-through.
     let write_during_fill: logic = filling && i_wen;
-    let write_wait_grant : logic = state == State::IDLE && i_wen && !amo_miss && !i_memw_grant;
+    // P9.2: the write FIRES only via wen_fires (buffer priority + misaligned
+    // dirty detours included), so the stall covers all its hold reasons.
+    let write_wait_grant: logic = state == State::IDLE && i_wen && !amo_miss && !wen_fires;
     assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
-        || inv_hits_active || amo_force_trigger;
+        || inv_hits_active || inv2_hits_active || amo_force_trigger;
 
 }

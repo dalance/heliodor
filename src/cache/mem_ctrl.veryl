@@ -46,6 +46,28 @@
 // fill — the dcache suppresses o_memr_req while an urgent store drain
 // preempts the fill start (see dcache want_fill_start), so a granted request
 // implies the IDLE→FILL transition fires that cycle.
+//
+// P9.2 (MESI home): transactions carry an RFO flag (read-for-ownership, the
+// dcache's store fill) and complete with a grant STATE (o_hexcl: E/M-capable
+// vs S). New rules:
+//  - PER-LINE SERIALIZATION: an accept is blocked while another slot or the
+//    recall engine is active on the same line — this is what makes directory
+//    updates race-free and (with the lock gating) keeps AMOs atomic.
+//  - RFO accepts are blocked while ANOTHER hart holds the bus AMO lock: a
+//    store becoming visible through an ownership grant (no write-channel
+//    traffic) must not land inside a locked RMW window.
+//  - LOOKUP hit on an OWNED line (any owner, incl. the requester itself
+//    after a silent E drop): the RECALL ENGINE probes the owner; a dirty
+//    copy comes back as a WB on the write channel (the home merges it and
+//    clears ownership), a clean one answers probe_ack (ownership cleared
+//    via o_eclr). The slot re-looks-up until the line is unowned.
+//  - LOOKUP hit, not owned: READ grants E (sole sharer → cadd_own) or S;
+//    RFO grants M-capability — the other sharers are invalidated through
+//    the inv-port arbitration (lookup waits for a free port).
+//  - INSTALL: an OWNED victim is recalled before the eviction (engine);
+//    grants are E/M (the installer becomes owner).
+//  - The recall engine also serves the SoC's WRITE-GRANT VETO (a non-WB
+//    write targeting a line owned by another hart).
 pub module mem_ctrl #(
     param N_HARTS  : u32 = 1 ,
     param DRAM_WAIT: u32 = 20, // accept -> gather start (DRAM latency model), >= 1
@@ -60,6 +82,12 @@ pub module mem_ctrl #(
     i_hdram : input  logic     [N_HARTS],
     o_hgrant: output logic     [N_HARTS],
     o_hrdata: output logic<64> [N_HARTS],
+    // P9.2: read-for-ownership flag (store fill) + grant state to the L1
+    // (sampled at fill completion: 1 = E/M-capable, 0 = S).
+    i_hrfo : input  logic [N_HARTS],
+    o_hexcl: output logic [N_HARTS],
+    // P9.2: bus AMO-lock tenure per hart (RFO accept gating).
+    i_amo_locked: input logic [N_HARTS],
     // Bus side: read-channel cycle requests (gather beats + legacy reads).
     // The memory_bus arbitrates these with its existing rotation + AMO lock.
     o_bus_rreq  : output logic [N_HARTS],
@@ -69,10 +97,61 @@ pub module mem_ctrl #(
     o_l2_cren : output logic        ,
     i_l2_chit : input  logic        ,
     i_l2_cdata: input  logic<64> [8],
+    // P9.2 directory: lookup-grant sharer add (line = o_l2_caddr) + the
+    // c-port directory verdict (sharers / owned) and ownership-grant flag.
+    o_cadd_v     : output logic          ,
+    o_cadd_hart  : output logic<3>       ,
+    o_cadd_own   : output logic          ,
+    i_l2_c_shr   : input  logic<N_HARTS> ,
+    i_l2_c_owned : input  logic          ,
     // L2 full-line install port (gathered DRAM line).
     o_l2_inst_v   : output logic        ,
     o_l2_inst_addr: output logic<64>    ,
     o_l2_inst_data: output logic<64> [8],
+    // P9.2 directory: installing hart + L2 victim preview (comb on the
+    // install address) + this module's active-transaction lines (excluded
+    // from L2 victim selection — see l2cache header).
+    o_inst_hart : output logic<3>           ,
+    i_iv_valid  : input  logic              ,
+    i_iv_addr   : input  logic<64>          ,
+    i_iv_sharers: input  logic<N_HARTS>     ,
+    i_iv_owned  : input  logic              , // Phase B: victim owned → recall
+    i_iv_blocked: input  logic              ,
+    i_inst_oldshr: input logic<N_HARTS>     , // Phase B: in-place install sharers
+    o_busy_line : output logic<58> [N_HARTS],
+    o_busy_v    : output logic     [N_HARTS],
+    // P9.2: writer hart + sharer masks of the granted write's line(s), for
+    // precise invalidate emission (replaces the all-hart broadcast).
+    // i_w_wb: the write is an L1 WRITEBACK — no invalidates (the home just
+    // absorbs the dirty line; the writer already invalidated its copy).
+    i_w_hart  : input logic<3>      ,
+    i_w_wb    : input logic         ,
+    i_w_shr   : input logic<N_HARTS>,
+    i_w_shr_hi: input logic<N_HARTS>,
+    // P9.2 Phase B recall engine: per-hart probe (recall the line — WB if
+    // dirty, invalidate either way) + clean ack; directory owner clear on a
+    // clean ack; the SoC's write-veto recall request (line + owner).
+    o_probe_v   : output logic     [N_HARTS],
+    o_probe_addr: output logic<64>          ,
+    // The recall was requested by the probed hart's OWN transaction (stale
+    // self-owner entry): the L1 must NOT abort its in-flight fill of the
+    // line — that fill IS the recall's requester (abort = livelock).
+    o_probe_self: output logic              ,
+    i_probe_ack : input  logic     [N_HARTS],
+    o_eclr_v    : output logic              ,
+    o_eclr_addr : output logic<64>          ,
+    o_eclr_hart : output logic<3>           ,
+    i_wv_req    : input  logic              ,
+    i_wv_line   : input  logic<58>          ,
+    i_wv_hart   : input  logic<3>           ,
+    // P9.2: per-hart precise invalidates, two ports (a granted misaligned
+    // store needs lo+hi in the same cycle). Port arbitration: write events
+    // first (posted, cannot wait), then the install-side event (back-inv /
+    // gather-abort — the install HOLDS until its event gets a port).
+    o_inv1_v   : output logic     [N_HARTS],
+    o_inv1_addr: output logic<64>           ,
+    o_inv2_v   : output logic     [N_HARTS],
+    o_inv2_addr: output logic<64>           ,
     // External DRAM read port (one dword per gather cycle, comb response).
     o_mem_addr : output logic<64>,
     o_mem_ren  : output logic    ,
@@ -99,23 +178,88 @@ pub module mem_ctrl #(
     let w_line_hi: logic<58> = w_addr_hi[63:6];
 
     // Cross-hart visible slot state (each element driven by its own slot).
-    var st_all  : logic<3>  [N_HARTS]    ;
-    var line_all: logic<58> [N_HARTS]    ;
-    var gcnt_all: logic<3>  [N_HARTS]    ;
-    var iok_all : logic     [N_HARTS]    ;
-    var buf_all : logic<64> [N_HARTS * 8];
+    var st_all     : logic<3>  [N_HARTS]    ;
+    var line_all   : logic<58> [N_HARTS]    ;
+    var gcnt_all   : logic<3>  [N_HARTS]    ;
+    var iok_all    : logic     [N_HARTS]    ;
+    var conf_all   : logic     [N_HARTS]    ;
+    var rfo_all    : logic     [N_HARTS]    ; // P9.2: slot transaction is an RFO
+    var inst_go_all: logic     [N_HARTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
+    var lk_go_all  : logic     [N_HARTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
+    var lk_excl_w  : logic                  ; // P9.2: grant state for the lookup go
+    var inst_excl_w: logic     [N_HARTS]    ; // P9.2: grant state at install go
+    var buf_all    : logic<64> [N_HARTS * 8];
+
+    // P9.2 Phase B: recall engine state (registered; probes are asserted
+    // while busy, completion = clean probe-ack OR the owner's WB arriving on
+    // the write channel).
+    var eng_busy: logic    ;
+    var eng_line: logic<58>;
+    var eng_hart: logic<3> ;
+    var eng_self: logic    ; // requester == probed owner (lk self-recall)
+
+    // P9.2: active-transaction lines for the L2's victim exclusion.
+    for h in 0..N_HARTS :gen_busy {
+        assign o_busy_v[h]    = st_all[h] != ST_IDLE;
+        assign o_busy_line[h] = line_all[h];
+    }
+
+    // P9.2: the L2 lookup port serves ONE slot per cycle — the lowest-id slot
+    // in LOOKUP is selected; the others (a retrying slot can coexist with a
+    // freshly-accepted one) hold and retry. Selection depends only on
+    // registered slot state — gating ACCEPTS on a retry would create a comb
+    // cycle (retry ← granted write ← wgrant_ok ← read-channel state ← accept
+    // grant).
+    var lk_sel_all: logic [N_HARTS];
+    var lk_found  : logic [N_HARTS];
+    for h in 0..N_HARTS :gen_lksel {
+        if h == 0 :gen_first {
+            assign lk_sel_all[h] = st_all[h] == ST_LOOKUP;
+            assign lk_found[h]   = lk_sel_all[h];
+        } else :gen_rest {
+            assign lk_sel_all[h] = (st_all[h] == ST_LOOKUP) && !lk_found[h - 1];
+            assign lk_found[h]   = lk_found[h - 1] || lk_sel_all[h];
+        }
+    }
+
+    // P9.2 Phase B: per-line accept blocking (another slot or the recall
+    // engine active on the requested line) + RFO lock gating (no ownership
+    // grant to a hart while ANOTHER hart holds the bus AMO lock).
+    var acc_line_busy: logic [N_HARTS];
+    var acc_lock_blk : logic [N_HARTS];
+    always_comb {
+        for h in 0..N_HARTS {
+            acc_line_busy[h] = eng_busy && (eng_line == i_haddr[h][63:6]);
+            acc_lock_blk[h]  = 1'b0;
+            for g in 0..N_HARTS {
+                if g != h {
+                    if (st_all[g] != ST_IDLE) && (line_all[g] == i_haddr[h][63:6]) {
+                        acc_line_busy[h] = 1'b1;
+                    }
+                    if i_amo_locked[g] {
+                        acc_lock_blk[h] = 1'b1;
+                    }
+                }
+            }
+        }
+    }
 
     // Accept arbitration: at most one accept per cycle (the L2 lookup port is
     // single), lowest-id wins. Accept conflicts are 1-cycle and rare; the real
     // serialization (gather beats) goes through the bus's fair rotation.
     var acc_found: logic [N_HARTS];
     var accept   : logic [N_HARTS];
+    var acc_ok   : logic [N_HARTS];
+    for h in 0..N_HARTS :gen_accok {
+        assign acc_ok[h] = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h]
+            && !acc_line_busy[h] && !(i_hrfo[h] && acc_lock_blk[h]);
+    }
     for h in 0..N_HARTS :gen_acc {
         if h == 0 :gen_first {
-            assign accept[h]    = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h];
+            assign accept[h]    = acc_ok[h];
             assign acc_found[h] = accept[h];
         } else :gen_rest {
-            assign accept[h]    = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h] && !acc_found[h - 1];
+            assign accept[h]    = acc_ok[h] && !acc_found[h - 1];
             assign acc_found[h] = acc_found[h - 1] || accept[h];
         }
     }
@@ -128,18 +272,22 @@ pub module mem_ctrl #(
         var gcnt_q: logic<3>     ;
         var scnt_q: logic<3>     ;
         var iok_q : logic        ;
+        var rfo_q : logic        ; // P9.2: transaction is a read-for-ownership
+        var excl_q: logic        ; // P9.2: grant state (E/M vs S), set at grant
         var buf_q : logic<64> [8];
 
         assign st_all[h]   = st_q;
         assign line_all[h] = line_q;
         assign gcnt_all[h] = gcnt_q;
         assign iok_all[h]  = iok_q;
+        assign rfo_all[h]  = rfo_q;
         for l in 0..8 :gen_buf_exp {
             assign buf_all[h * 8 + l] = buf_q[l];
         }
 
         // Write conflict against this slot's line (lo or misaligned-hi line).
         let conflict: logic = i_w_valid && ((w_line == line_q) || (i_w_hi && (w_line_hi == line_q)));
+        assign conf_all[h] = conflict;
 
         always_ff (clk, rst) {
             if_reset {
@@ -149,6 +297,8 @@ pub module mem_ctrl #(
                 gcnt_q = 3'd0;
                 scnt_q = 3'd0;
                 iok_q  = 1'b0;
+                rfo_q  = 1'b0;
+                excl_q = 1'b0;
                 for l in 0..8 {
                     buf_q[l] = 64'd0;
                 }
@@ -161,17 +311,25 @@ pub module mem_ctrl #(
                             gcnt_q = 3'd0;
                             scnt_q = 3'd0;
                             iok_q  = 1'b1;
+                            rfo_q  = i_hrfo[h];
+                            excl_q = 1'b0;
                             st_q   = ST_LOOKUP;
                         }
                     }
                     ST_LOOKUP: {
-                        if i_l2_chit {
+                        // P9.2: the grant decision (selection, write-snoop
+                        // retry, OWNED recall wait, RFO sharer-invalidate
+                        // port wait, grant state) is computed at module
+                        // level — lk_go_all/lk_excl_w. On a verified MISS
+                        // the slot heads for DRAM.
+                        if lk_go_all[h] {
                             for l in 0..8 {
                                 buf_q[l] = i_l2_cdata[l];
                             }
+                            excl_q = lk_excl_w;
                             wcnt_q = 8'd0;
                             st_q   = ST_HWAIT;
-                        } else {
+                        } else if lk_sel_all[h] && !conflict && !i_l2_chit {
                             wcnt_q = 8'd0;
                             st_q   = ST_DWAIT;
                         }
@@ -204,8 +362,21 @@ pub module mem_ctrl #(
                         }
                     }
                     ST_INSTALL: {
-                        scnt_q = 3'd0;
-                        st_q   = ST_STREAM;
+                        // P9.2: INSTALL can HOLD (back-inv / abort-inv port
+                        // arbitration, blocked or OWNED victim, or another
+                        // INSTALL slot ahead) — advance only on inst_go for
+                        // this slot, and keep folding write conflicts into
+                        // iok meanwhile. The grant state is latched here
+                        // (installer becomes owner unless an in-place
+                        // overwrite finds other sharers listed).
+                        if inst_go_all[h] {
+                            excl_q = inst_excl_w[h];
+                            scnt_q = 3'd0;
+                            st_q   = ST_STREAM;
+                        }
+                        if conflict {
+                            iok_q = 1'b0;
+                        }
                     }
                     ST_STREAM: {
                         scnt_q = scnt_q + 3'd1;
@@ -227,22 +398,105 @@ pub module mem_ctrl #(
         // Beat data: the addressed dword of the slot buffer (the dcache walks
         // its critical-word-first order through i_haddr during STREAM).
         assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
+        // P9.2: grant state to the L1 (sampled at fill completion).
+        assign o_hexcl[h] = excl_q;
 
         // Bus cycle requests: gather beats + legacy reads.
         assign o_bus_rreq[h] = legacy || (st_q == ST_GATHER);
     }
 
-    // L2 lookup mux: at most one slot is in LOOKUP (accepts are 1/cycle).
+    // L2 lookup mux: the SELECTED lookup slot (lowest-id; a retrying slot
+    // can coexist with a freshly-accepted one). P9.2: a successful HIT
+    // lookup also pulses the directory sharer add for the requesting hart.
+    // The cadd outputs live in their OWN comb block: they read i_l2_chit,
+    // which is combinational on o_l2_caddr — one block for both would look
+    // like a comb cycle at block granularity.
     always_comb {
         o_l2_caddr = 64'd0;
         o_l2_cren  = 1'b0;
         for h in 0..N_HARTS {
-            if st_all[h] == ST_LOOKUP {
+            if lk_sel_all[h] {
                 o_l2_caddr = {line_all[h], 6'd0};
                 o_l2_cren  = 1'b1;
             }
         }
     }
+    // ------------------------------------------------------------------
+    // P9.2 Phase B lookup grant decision (module level, for the selected
+    // lookup slot):
+    //   - OWNED line → wait (the recall engine is requested below; the slot
+    //     re-looks-up after the recall clears ownership).
+    //   - RFO with other sharers → the sharer invalidates need an inv port
+    //     (lowest arbitration priority — wait until granted).
+    //   - grant state: RFO or sole-sharer READ ⇒ E/M (cadd_own), else S.
+    // ------------------------------------------------------------------
+    var lk_v : logic         ;
+    var lk_oh: logic<N_HARTS>;
+    var lk_h : logic<3>      ;
+    always_comb {
+        lk_v  = 1'b0;
+        lk_oh = '0;
+        lk_h  = 3'd0;
+        for h in 0..N_HARTS {
+            if lk_sel_all[h] {
+                lk_v     = 1'b1;
+                lk_oh[h] = 1'b1;
+                lk_h     = h as 3;
+            }
+        }
+    }
+    var lk_rfo: logic;
+    var lk_cf : logic;
+    always_comb {
+        lk_rfo = 1'b0;
+        lk_cf  = 1'b0;
+        for h in 0..N_HARTS {
+            if lk_sel_all[h] {
+                lk_rfo = rfo_all[h];
+                lk_cf  = conf_all[h];
+            }
+        }
+    }
+    let lk_others  : logic<N_HARTS> = i_l2_c_shr & ~lk_oh;
+    let lk_hit_ok  : logic          = lk_v && !lk_cf && i_l2_chit && !i_l2_c_owned;
+    let lk_need_inv: logic          = lk_hit_ok && lk_rfo && (lk_others != '0);
+    // lk_inv_granted comes from the inv-port arbitration below (var).
+    var lk_inv_granted: logic;
+    let lk_go: logic = lk_hit_ok && (!lk_need_inv || lk_inv_granted);
+    // Grant policy: at N>1 a lookup-hit READ gets S even as the sole sharer
+    // — an E grant here makes two read-spinning harts invalidate each other
+    // through recalls every iteration (barrier/lock spin ping-pong). E is
+    // granted only at INSTALL (DRAM first touch) and by RFO. At N=1 there
+    // is no spinner to ping and silent E→M matters for store performance,
+    // so the sole-sharer E grant stays (the self-recall it can regenerate
+    // is answered without aborting the requester's own fill — probe-self).
+    assign lk_excl_w = lk_rfo || (N_HARTS == 1);
+    for h in 0..N_HARTS :gen_lkgo {
+        assign lk_go_all[h] = lk_sel_all[h] && lk_go;
+    }
+    // Recall request: lookup hit on an OWNED line (owner = the one-hot mask).
+    let lk_recall_req: logic = lk_v && !lk_cf && i_l2_chit && i_l2_c_owned;
+    var lk_owner: logic<3>;
+    always_comb {
+        lk_owner = 3'd0;
+        for h in 0..N_HARTS {
+            if i_l2_c_shr[h] {
+                lk_owner = h as 3;
+            }
+        }
+    }
+
+    always_comb {
+        o_cadd_v    = 1'b0;
+        o_cadd_hart = 3'd0;
+        for h in 0..N_HARTS {
+            if lk_go_all[h] {
+                o_cadd_v    = 1'b1;
+                o_cadd_hart = h as 3;
+            }
+        }
+    }
+    assign o_cadd_own = lk_excl_w;
 
     // External gather mux: at most one slot holds the bus read grant.
     always_comb {
@@ -257,24 +511,196 @@ pub module mem_ctrl #(
     }
     assign o_mem_busy = o_mem_ren;
 
-    // L2 install mux: gathers serialize on the external port, so at most one
-    // slot can be in INSTALL on any cycle. A same-cycle write conflict on the
-    // install line suppresses it (the registered iok_q covers earlier ones).
+    // ------------------------------------------------------------------
+    // P9.2 install stage. INSTALL slots can now WAIT (inv-port arbitration /
+    // blocked victim), so several slots may sit in INSTALL — the lowest-id
+    // one is selected and the rest hold. The selected slot needs, before it
+    // may stream:
+    //   - a real install (iok && no same-cycle conflict): an eligible L2 way
+    //     (!i_iv_blocked) and, when the chosen victim has sharers, an inv
+    //     port for the BACK-INVALIDATE (inclusion).
+    //   - a suppressed install (gather/install-window write conflict): an
+    //     inv port for the ABORT invalidate to the requester — its L1 fill
+    //     must not complete with the stale gathered line (under precise
+    //     invalidation no write-side inv reaches it: the line was never
+    //     entered into the directory).
+    // ------------------------------------------------------------------
+    var inst_sel_v: logic    ;
+    var inst_sel_h: logic<3> ;
     always_comb {
-        o_l2_inst_v    = 1'b0;
+        inst_sel_v = 1'b0;
+        inst_sel_h = 3'd0;
+        for h in 0..N_HARTS {
+            if (st_all[h] == ST_INSTALL) && !inst_sel_v {
+                inst_sel_v = 1'b1;
+                inst_sel_h = h as 3;
+            }
+        }
+    }
+    var inst_line   : logic<58>     ;
+    var inst_do     : logic         ; // selected slot installs (vs abort)
+    always_comb {
+        inst_line = '0;
+        inst_do   = 1'b0;
+        for h in 0..N_HARTS {
+            if inst_sel_v && (inst_sel_h == (h as 3)) {
+                inst_line = line_all[h];
+                inst_do   = iok_all[h] && !conf_all[h];
+            }
+        }
+    }
+    var inst_sel_oh: logic<N_HARTS>;
+    for h in 0..N_HARTS :gen_inst_oh {
+        assign inst_sel_oh[h] = inst_sel_v && (inst_sel_h == (h as 3));
+    }
+
+    // Precise-invalidate events and the two-port arbitration.
+    // Write events are POSTED (same cycle as the granted write — they keep
+    // the pre-P9.2 "invalidate lands with the write" timing); the install
+    // event holds until a port frees.
+    var w_hart_oh: logic<N_HARTS>;
+    for h in 0..N_HARTS :gen_w_oh {
+        assign w_hart_oh[h] = i_w_hart == (h as 3);
+    }
+    // lo-line write inv: a misaligned store kills the line at the home (the
+    // hi dword bypassed it), so ALL sharers drop it; a plain write keeps the
+    // writer's own copy (its L1 merged the data itself). Phase B: a WB
+    // (eviction/recall/flush) invalidates nobody — the writer already
+    // dropped its copy and no other sharer exists (it was the owner).
+    let ev_w1_mask: logic<N_HARTS> = if i_w_hi ? i_w_shr : i_w_shr & ~w_hart_oh;
+    let ev_w1_v   : logic          = i_w_valid && !i_w_wb && (ev_w1_mask != '0);
+    let ev_w2_mask: logic<N_HARTS> = i_w_shr_hi;
+    let ev_w2_v   : logic          = i_w_valid && !i_w_wb && i_w_hi && (ev_w2_mask != '0);
+
+    // An OWNED victim is NOT back-invalidated — the recall engine fetches
+    // its (possibly dirty) copy home first; a plain invalidate would drop
+    // modified data on the floor (observed: h0's freshly-stored mem_map
+    // pointer line, owned-M, killed by the back-inv sent while the install
+    // sat blocked WAITING for that very recall → stale reload → N=2 boot
+    // Oops). After the recall the re-evaluated victim is unowned.
+    let inst_need_backinv: logic = inst_do && i_iv_valid && !i_iv_owned && (i_iv_sharers != '0);
+    let inst_need_inv    : logic          = inst_sel_v && (inst_need_backinv || !inst_do);
+    let ev_i_addr        : logic<64>      = if inst_do ? i_iv_addr : {inst_line, 6'd0};
+    let ev_i_mask        : logic<N_HARTS> = if inst_do ? i_iv_sharers : inst_sel_oh;
+    let inst_inv_granted : logic          = inst_need_inv && !(ev_w1_v && ev_w2_v);
+
+    // Port 1: write lo > install > lookup-RFO.
+    // Port 2: write hi > install (when port 1 is taken) > lookup-RFO.
+    let i_on_p1: logic = !ev_w1_v && inst_need_inv;
+    let i_on_p2: logic = ev_w1_v && !ev_w2_v && inst_need_inv;
+    // Lookup-RFO sharer invalidate: lowest priority — takes whichever port
+    // remains free this cycle.
+    let l_on_p1: logic = !ev_w1_v && !inst_need_inv && lk_need_inv;
+    let l_on_p2: logic = !l_on_p1 && !ev_w2_v && !i_on_p2 && lk_need_inv;
+    assign lk_inv_granted = l_on_p1 || l_on_p2;
+    var lk_line: logic<58>;
+    always_comb {
+        lk_line = '0;
+        for h in 0..N_HARTS {
+            if lk_sel_all[h] {
+                lk_line = line_all[h];
+            }
+        }
+    }
+    assign o_inv1_addr = if ev_w1_v ? {w_line, 6'd0} : if i_on_p1 ? ev_i_addr : {lk_line, 6'd0};
+    assign o_inv2_addr = if ev_w2_v ? {w_line_hi, 6'd0} : if i_on_p2 ? ev_i_addr : {lk_line, 6'd0};
+    for h in 0..N_HARTS :gen_inv_out {
+        assign o_inv1_v[h] = if ev_w1_v ? ev_w1_mask[h] : if i_on_p1 ? ev_i_mask[h] : (l_on_p1 && lk_others[h]);
+        assign o_inv2_v[h] = if ev_w2_v ? ev_w2_mask[h] : if i_on_p2 ? ev_i_mask[h] : (l_on_p2 && lk_others[h]);
+    }
+
+    // Go/hold for the selected INSTALL slot. Phase B: an OWNED victim must
+    // be recalled before the eviction (engine request below).
+    let inst_blocked: logic = (inst_do && (i_iv_blocked || i_iv_owned)) || (inst_need_inv && !inst_inv_granted);
+    for h in 0..N_HARTS :gen_inst_go {
+        assign inst_go_all[h] = inst_sel_oh[h] && !inst_blocked;
+    }
+    // Phase B: grant state at install — the installer becomes owner (E for a
+    // read miss, M-capable for an RFO) unless an in-place overwrite finds
+    // other harts still listed.
+    for h in 0..N_HARTS :gen_inst_excl {
+        assign inst_excl_w[h] = rfo_all[h] || ((i_inst_oldshr & ~inst_sel_oh) == '0);
+    }
+    // Victim-recall owner (one-hot victim sharer mask).
+    var iv_owner: logic<3>;
+    always_comb {
+        iv_owner = 3'd0;
+        for h in 0..N_HARTS {
+            if i_iv_sharers[h] {
+                iv_owner = h as 3;
+            }
+        }
+    }
+    let iv_recall_req: logic = inst_sel_v && inst_do && i_iv_valid && i_iv_owned;
+
+    // ------------------------------------------------------------------
+    // P9.2 Phase B: recall engine. One outstanding recall; requesters by
+    // priority: write-veto (a posted write is stalled at its grant) >
+    // install victim > lookup. Completion: the probed owner's WB for the
+    // line arrives on the write channel (dirty copy — the home merges it
+    // and clears ownership), or the owner answers probe_ack (clean copy /
+    // already gone / WB already in its buffer ⇒ wait for that WB instead),
+    // upon which o_eclr drops it from the directory.
+    // ------------------------------------------------------------------
+    let eng_done_ack: logic = eng_busy && i_probe_ack[eng_hart];
+    let eng_done_wb : logic = eng_busy && i_w_valid && i_w_wb && (w_line == eng_line);
+    let eng_start   : logic = !eng_busy && (i_wv_req || iv_recall_req || lk_recall_req);
+    always_ff (clk, rst) {
+        if_reset {
+            eng_busy = 1'b0;
+            eng_line = '0;
+            eng_hart = 3'd0;
+            eng_self = 1'b0;
+        } else if eng_start {
+            eng_busy = 1'b1;
+            if i_wv_req {
+                eng_line = i_wv_line;
+                eng_hart = i_wv_hart;
+                eng_self = 1'b0;
+            } else if iv_recall_req {
+                eng_line = i_iv_addr[63:6];
+                eng_hart = iv_owner;
+                eng_self = 1'b0;
+            } else {
+                eng_line = lk_line;
+                eng_hart = lk_owner;
+                eng_self = lk_owner == lk_h;
+            }
+        } else if eng_done_ack || eng_done_wb {
+            eng_busy = 1'b0;
+        }
+    }
+    for h in 0..N_HARTS :gen_probe {
+        assign o_probe_v[h] = eng_busy && (eng_hart == (h as 3));
+    }
+    assign o_probe_addr = {eng_line, 6'd0};
+    assign o_probe_self = eng_self;
+    assign o_eclr_v     = eng_done_ack && !eng_done_wb;
+    assign o_eclr_addr  = {eng_line, 6'd0};
+    assign o_eclr_hart  = eng_hart;
+
+
+    // L2 install mux: the selected slot only. The ADDRESS/HART/DATA muxes
+    // are kept in their own comb block, separate from o_l2_inst_v: the L2's
+    // victim preview is combinational on i_inst_addr and feeds back into
+    // inst_blocked → o_l2_inst_v; assigning both in one block would look
+    // like a comb cycle at block granularity (the address itself depends
+    // only on registered slot state).
+    always_comb {
         o_l2_inst_addr = 64'd0;
+        o_inst_hart    = 3'd0;
         for l in 0..8 {
             o_l2_inst_data[l] = 64'd0;
         }
         for h in 0..N_HARTS {
-            if st_all[h] == ST_INSTALL {
-                let i_conf: logic = i_w_valid && ((w_line == line_all[h]) || (i_w_hi && (w_line_hi == line_all[h])));
-                o_l2_inst_v    = iok_all[h] && !i_conf;
+            if inst_sel_oh[h] {
                 o_l2_inst_addr = {line_all[h], 6'd0};
+                o_inst_hart    = h as 3;
                 for l in 0..8 {
                     o_l2_inst_data[l] = buf_all[h * 8 + l];
                 }
             }
         }
     }
+    assign o_l2_inst_v = inst_sel_v && inst_do && !inst_blocked;
 }

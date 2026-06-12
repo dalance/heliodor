@@ -25,6 +25,13 @@
 pub module heliodor_core #(
     param RESET_PC: u64 = 64'h80000000,
     param HART_ID : u8  = 0           , // M9: mhartid (for SMP); 0 for single-hart
+    // P9.2: SET TO 1 IN MULTI-HART SoCs. Feeds the dcache's local
+    // line-departure events into the ROB's CoRR poison scan — required for
+    // RVWMO read coherence under PRECISE invalidation (a remote write to a
+    // line that already left this L1 is invisible here). Single-hart
+    // configurations leave it 0: no remote writers exist, and the poison
+    // replays would only cost cycles.
+    param SMP_COHERENT: u8 = 0,
 ) (
     clk: input clock,
     rst: input reset,
@@ -79,6 +86,19 @@ pub module heliodor_core #(
     o_dmemw_addr : output logic<64>,
     o_dmemw_req  : output logic    ,
     i_dmemw_grant: input  logic    ,
+    // P9.2: write-channel WRITEBACK flag (dirty-line writeback from the
+    // dcache's buffer — the home merges it without invalidates) + the read
+    // channel's READ-FOR-OWNERSHIP flag and the home's grant state.
+    // Single-hart harnesses: tie i_dmem_fill_excl=1, discard the outputs.
+    o_dmemw_wb      : output logic,
+    o_dmem_rfo      : output logic,
+    i_dmem_fill_excl: input  logic,
+    // P9.2: PROBE (recall) port from the home + clean ack. Tie 0 / discard
+    // in single-hart harnesses.
+    i_dcache_probe_v   : input  logic    ,
+    i_dcache_probe_addr: input  logic<64>,
+    i_dcache_probe_self: input  logic    ,
+    o_dcache_probe_ack : output logic    ,
 
     // M9 SMP coherence: the SoC broadcasts every remote hart's granted DRAM
     // write here (filtered to exclude this hart's own write). It invalidates a
@@ -86,6 +106,12 @@ pub module heliodor_core #(
     // remote write hit the reserved address. Single-hart SoCs tie these to 0.
     i_dcache_inv_valid: input logic    ,
     i_dcache_inv_addr : input logic<64>,
+    // P9.2: second invalidate port. Under PRECISE invalidation (L2 directory)
+    // a granted remote misaligned store invalidates its lo and hi lines in
+    // the same cycle — two different line addresses. Applied to the dcache
+    // and all the same core-side consumers as port 1. Tie to 0 where unused.
+    i_dcache_inv2_valid: input logic    ,
+    i_dcache_inv2_addr : input logic<64>,
     // M9 SMP: high while this hart has an AMO/LR/SC mid-RMW (read captured at
     // issue, write pending at commit). Fed to memory_bus.i_amo_inflight so the
     // bus locks to this hart for the whole window → the RMW is bus-atomic.
@@ -472,6 +498,21 @@ pub module heliodor_core #(
     // dcache_stall. dc_sdrain_ack is the dcache's o_sdrain_ack (instance below).
     var fast_store   : logic;
     var dc_sdrain_ack: logic;
+    // P9.2: dcache presence checks + line-departure events (forward-declared;
+    // assigned at the dcache instance, consumed by the LR/SC reservation /
+    // SC-watch logic and the ROB CoRR poison ports above the instance).
+    var dc_rsv_present: logic    ;
+    var dc_scw_present: logic    ;
+    var dc_evict1_v   : logic    ;
+    var dc_evict1_addr: logic<64>;
+    var dc_evict2_v   : logic    ;
+    var dc_evict2_addr: logic<64>;
+    // P9.2 Phase B: dcache flush sweep handshake (FENCE.I / SFENCE.VMA /
+    // satp commit — write dirty lines back so the tb-direct instruction
+    // fetch / I-PTW see current DRAM). dc_flush_req is assigned at the
+    // commit-gate section; dc_flush_done gates the op's retire ack.
+    var dc_flush_req : logic;
+    var dc_flush_done: logic;
     // Phase 8 S20: committed-store buffer. A retiring aligned plain DRAM
     // store (bare, or VM with a same-cycle TLB-hit translation) is absorbed
     // into a small FIFO and retires IMMEDIATELY — even while a dcache fill or
@@ -1570,6 +1611,9 @@ pub module heliodor_core #(
     // reservation is then architectural; rsv_rob_q is stale). Gates sc_may_clear's
     // owner-committed escape — see the comment there.
     var rsv_committed_q: logic;
+    // P9.2: the reserved line has been seen present in the L1 since the
+    // owning LR (arms the presence-based clear — see the reservation FF).
+    var rsv_present_seen_q: logic;
 
     // M9.4 SMP: SC commit-time re-validation state (declared early so the
     // commit-redirect always_ff can read it; logic + comment near the
@@ -2276,6 +2320,16 @@ pub module heliodor_core #(
     // still in the store buffer, and the post-fence load read the world
     // before they were globally visible (the litmus SB+fence (0,0) outcome).
     let c_serial: logic = c_is_fence || c_is_fence_i || c_is_sfence || (c_is_csr && c_csr_addr == 12'h180);
+    // P9.2 (write-back D$): FENCE.I / SFENCE.VMA / satp writes additionally
+    // FLUSH the dcache (write back + invalidate every dirty line) before
+    // retiring — instruction fetch and the I-PTW read DRAM directly (tb
+    // ports), so dirty data must reach it at these architectural sync
+    // points. Plain FENCE needs no flush: store visibility between harts is
+    // carried by the coherence protocol itself. The sweep starts once the
+    // store buffer has drained (its drains create dirty lines) and the
+    // retire ack below waits for dc_flush_done.
+    let c_flush_op: logic = rob_commit_valid && (c_is_fence_i || c_is_sfence || (c_is_csr && c_csr_addr == 12'h180));
+    assign dc_flush_req = c_flush_op && sb_empty;
     // S20R: an MMIO (non-DRAM) store is a DOORBELL — firmware writes a DRAM
     // mailbox then rings CLINT msip with no fence between (legal on the old
     // never-reordering pipeline). If the doorbell passes the buffered
@@ -2291,7 +2345,8 @@ pub module heliodor_core #(
         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
         && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
-        && !(c_serial && !sb_empty);
+        && !(c_serial && !sb_empty)
+        && !(c_flush_op && !dc_flush_done); // P9.2: dirty-line sweep done
     // Phase 8 S1: 2-wide commit. commit2_fire is a var assigned LATE (after all
     // the slot-0 redirect conditions: trap/mret/sret/satp/mispredict/sc-replay)
     // so it can also require that slot-0 does NOT redirect — otherwise the head+1
@@ -2357,9 +2412,17 @@ pub module heliodor_core #(
         i_lq_rec_idx         : iq_iss_rob_idx       ,
         i_lq_rec_addr        : mshr_rec_addr        ,
         i_lq_rec_funct3      : iq_issue_op.base.mem_funct3,
-        // P9.0 CoRR: remote-invalidate poison (same broadcast the dcache gets).
+        // P9.0 CoRR: remote-invalidate poison (same pulses the dcache gets).
         i_inv_valid          : i_dcache_inv_valid   ,
         i_inv_addr           : i_dcache_inv_addr    ,
+        // P9.2: 2nd precise-inv port + local line-departure events — every
+        // way a line leaves the L1 poisons executed loads on it (CoRR).
+        i_inv2_valid         : i_dcache_inv2_valid  ,
+        i_inv2_addr          : i_dcache_inv2_addr   ,
+        i_evict1_valid       : dc_evict1_v && (SMP_COHERENT != 0),
+        i_evict1_addr        : dc_evict1_addr       ,
+        i_evict2_valid       : dc_evict2_v && (SMP_COHERENT != 0),
+        i_evict2_addr        : dc_evict2_addr       ,
         i_load_poison_v      : mshr_abort_poison    ,
         i_load_poison_idx    : mshr_poison_idx      ,
         i_load_poison_v2     : mshr_abort_poison2   ,
@@ -3039,6 +3102,7 @@ pub module heliodor_core #(
     assign o_dbg_x3   = arch_regs[3];
     assign o_dbg_pc   = c_pc;
 
+
     // ============================================================
     // Retire stream (lane A only in M1)
     // ============================================================
@@ -3379,6 +3443,18 @@ pub module heliodor_core #(
             rsv_committed_q = 1'b1;
         }
     }
+    // P9.2: arm the presence-based reservation clear only once the reserved
+    // line has actually been observed PRESENT (the owning LR's force-miss
+    // fill landed). Reset by each new LR.
+    always_ff (clk, rst) {
+        if_reset {
+            rsv_present_seen_q = 1'b0;
+        } else if issue_is_lr && iq_issue_ack {
+            rsv_present_seen_q = 1'b0;
+        } else if rsv_valid_q && dc_rsv_present {
+            rsv_present_seen_q = 1'b1;
+        }
+    }
     always_ff (clk, rst) {
         if_reset {
             rsv_valid_q = 1'b0;
@@ -3415,11 +3491,24 @@ pub module heliodor_core #(
             rsv_valid_q = 1'b1;
             rsv_addr_q  = agu_addr_iss;
             rsv_rob_q   = iq_iss_rob_idx;
-        } else if i_dcache_inv_valid && i_dcache_inv_addr[63:3] == rsv_addr_q[63:3] {
+        } else if (i_dcache_inv_valid && i_dcache_inv_addr[63:3] == rsv_addr_q[63:3])
+            || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:3] == rsv_addr_q[63:3]) {
             // M9 SMP: a remote hart's store hit our reserved dword — kill the
             // reservation so a following SC fails (matches RVWMO). dword-granular
             // (not line) to avoid false-sharing livelock. Placed after the LR set
             // so a fresh LR this cycle wins over a remote write to the OLD addr.
+            // P9.2: port 2 covers a remote misaligned store's hi line.
+            rsv_valid_q = 1'b0;
+        } else if rsv_present_seen_q && !dc_rsv_present {
+            // P9.2 (precise invalidation): the reserved LINE left the L1 —
+            // evicted locally or invalidated remotely. From here on a remote
+            // write to it produces NO pulse on this hart (the directory no
+            // longer lists us), so the reservation must die with the line:
+            // rsv_valid ⇒ line present ⇒ every remote write is observed.
+            // rsv_present_seen_q arms the clear only after the owning LR's
+            // own force-miss fill has brought the line in (presence is 0
+            // between the force-invalidate and the fill — clearing there
+            // would kill every fresh reservation and livelock LR/SC loops).
             rsv_valid_q = 1'b0;
         } else if issue_is_sc && iq_issue_ack {
             // M9.4 SMP: the SC consumes the reservation, but ONLY if it is program-
@@ -3463,8 +3552,14 @@ pub module heliodor_core #(
     // A matched SC issues this cycle (it will fire a store at commit):
     let sc_exec_match  : logic = issue_is_sc && iq_issue_ack && issue_addr_match;
     // A remote write hits the watched SC's reserved dword (dword-granular,
-    // matching the reservation grain at the remote-clear above):
-    let sc_remote_hit  : logic = sc_watch_valid_q && i_dcache_inv_valid && i_dcache_inv_addr[63:3] == sc_watch_addr_q[63:3];
+    // matching the reservation grain at the remote-clear above). P9.2: also
+    // poison when the watched LINE leaves the L1 (presence drop) — from then
+    // on remote writes to it are invisible here (precise invalidation), so
+    // the watch can no longer be trusted; the replayed SC fails cleanly.
+    // (The line is present when the watch starts: sc_match required a valid
+    // reservation, and rsv_valid ⇒ present.)
+    let sc_remote_hit: logic = sc_watch_valid_q && ((i_dcache_inv_valid && i_dcache_inv_addr[63:3] == sc_watch_addr_q[63:3])
+        || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:3] == sc_watch_addr_q[63:3]) || !dc_scw_present);
     // The watched SC is the op committing this cycle:
     let sc_watch_commit: logic = sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q;
     // Poisoned watched SC at its commit -> replay (fail it):
@@ -3498,7 +3593,12 @@ pub module heliodor_core #(
             sc_watch_addr_q  = agu_addr_iss;
             sc_watch_rob_q   = iq_iss_rob_idx;
             // Same-cycle remote write to the new SC's line also poisons it.
-            sc_poison_q      = i_dcache_inv_valid && i_dcache_inv_addr[63:3] == agu_addr_iss[63:3];
+            // P9.2: + 2nd inv port; + the line already absent at issue (the
+            // presence-clear arm races this SC's issue — dc_rsv_present IS
+            // the SC line's presence here, since issue_addr_match held).
+            sc_poison_q = (i_dcache_inv_valid && i_dcache_inv_addr[63:3] == agu_addr_iss[63:3])
+                || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:3] == agu_addr_iss[63:3])
+                || (rsv_present_seen_q && !dc_rsv_present);
         } else if sc_watch_commit {
             sc_watch_valid_q = 1'b0;
             sc_poison_q      = 1'b0;
@@ -3542,7 +3642,17 @@ pub module heliodor_core #(
     // Phase 8 S20: also excludes non-DRAM (MMIO) targets — fast stores now
     // retire through the store BUFFER, and only DRAM lines are buffered; a
     // bare MMIO store falls back to the blocking i_wen path (its pre-S6 route).
-    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0 && c_store_addr[63:25] == 39'h40;
+    // P9.2 (write-back D$): the tohost pages (PA 0x8000_0xxx..0x8000_3xxx —
+    // riscv-tests place tohost after .text, so it lands at 0x1000/0x2000/
+    // 0x3000 depending on the test's size; litmus uses 0x1000 — and PA
+    // 0x8000_8xxx for the benchmarks) are excluded: the harnesses watch the
+    // DRAM array, and a buffered store would merge into an owned L1 line
+    // without ever reaching it. Those stores keep the write-through i_wen
+    // path (correct everywhere, just slower; in the Linux boot this window
+    // is OpenSBI text/data, which writes it rarely).
+    let st_tohost_page: logic = (c_store_addr[31:14] == 18'h20000) || (c_store_addr[31:12] == 20'h80008);
+    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0
+        && c_store_addr[63:25] == 39'h40 && !st_tohost_page;
 
     // Core dmem view (pre-MMU virtual address)
     //
@@ -3893,7 +4003,8 @@ pub module heliodor_core #(
     // store stays a slow store — its walk runs via the normal commit path,
     // the PTE gets cached, and the retry cycle lands here.
     assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on && st_wstrb_hi == 8'd0
-        && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && dmu_dmem_addr[63:25] == 39'h40;
+        && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && dmu_dmem_addr[63:25] == 39'h40
+        && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008)); // P9.2: tohost pages stay write-through
     assign sb_elig = fast_store || sb_vm_ok;
     assign c_store_mmio = (if dmem_vm_on ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40;
     assign sb_pa   = if dmem_vm_on ? dmu_dmem_addr : c_store_addr;
@@ -4559,13 +4670,35 @@ pub module heliodor_core #(
 
         o_memr_addr      : dc_mem_addr                   ,
         o_memr_ren       : dc_mem_ren                    ,
+        o_memr_rfo       : o_dmem_rfo                    , // P9.2: store fill = RFO
+        i_fill_excl      : i_dmem_fill_excl              , // P9.2: home grant state
         i_mem_rdata      : i_dmem_rdata                  ,
         o_memw_addr      : dc_memw_addr                  , // S23: write channel
         o_memw_wdata     : dc_mem_wdata                  ,
         o_memw_wstrb     : dc_mem_wstrb                  ,
         o_memw_wen       : dc_mem_wen                    ,
+        o_memw_wb        : o_dmemw_wb                    , // P9.2: writeback flag
+        i_probe_v        : i_dcache_probe_v              , // P9.2: recall probe
+        i_probe_addr     : i_dcache_probe_addr           ,
+        i_probe_self     : i_dcache_probe_self           ,
+        o_probe_ack      : o_dcache_probe_ack            ,
+        i_flush_req      : dc_flush_req                  , // P9.2: fence.i/sfence/satp sweep
+        o_flush_done     : dc_flush_done                 ,
         i_inv_valid      : i_dcache_inv_valid            , // M9 SMP: remote-write coherence
         i_inv_addr       : i_dcache_inv_addr             ,
+        i_inv2_valid     : i_dcache_inv2_valid           , // P9.2: precise-inv 2nd port
+        i_inv2_addr      : i_dcache_inv2_addr            ,
+        // P9.2: line-presence checks — LR/SC reservation + SC watch. The core
+        // clears/poisons them the moment the line leaves the L1 (under
+        // precise invalidation an uncached line gets no remote-write pulse).
+        i_chk_addr       : rsv_addr_q                    ,
+        o_chk_present    : dc_rsv_present                ,
+        i_chk2_addr      : sc_watch_addr_q               ,
+        o_chk2_present   : dc_scw_present                ,
+        o_evict1_v       : dc_evict1_v                   , // P9.2: line-departure events
+        o_evict1_addr    : dc_evict1_addr                , //       (ROB CoRR poison scan)
+        o_evict2_v       : dc_evict2_v                   ,
+        o_evict2_addr    : dc_evict2_addr                ,
         o_memr_req       : dc_mem_req                    ,
         i_memr_grant     : i_dmem_grant                  ,
         o_memw_req       : dc_memw_req                   ,
@@ -4591,7 +4724,7 @@ pub module heliodor_core #(
     // forward layer (sbg*, merged into stld_fwd_*2) overrides the hit data
     // with any pending sb bytes, so an overlapping slot-1 load completes
     // with the correct value (bare mode, PA == agu_addr_iss2).
-    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !redirect_fire && !i_dcache_inv_valid;
+    let ld2_complete: logic = issue2_is_load && !dmem_vm_on && dcache_hit2 && !redirect_fire && !i_dcache_inv_valid && !i_dcache_inv2_valid;
     assign issue2_fire = iq_issue_valid2 && (!issue2_is_load || ld2_complete);
 
     // ============================================================
@@ -4646,7 +4779,7 @@ pub module heliodor_core #(
     // dc_miss_valid / dc_hit_safe) belongs to the replayed entry, not to an
     // issuing load (which iss_dc_ok holds anyway).
     let mshr_capture_own: logic = s10_flip_en && !replay_q && dc_miss_valid && mshr_plain_load && mshr_free_ok;
-    let mshr_capture_que: logic = s10_flip_en && !replay_q && !dc_miss_valid && dcache_stall && !dc_hit_safe && !i_dcache_inv_valid && mshr_plain_load && mshr_free_ok;
+    let mshr_capture_que: logic = s10_flip_en && !replay_q && !dc_miss_valid && dcache_stall && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid && mshr_plain_load && mshr_free_ok;
     assign mshr_capture = mshr_capture_own || mshr_capture_que;
     // rob LQ-record / abort-poison port feeds (vars declared near mshr_cdb).
     assign mshr_rec_addr     = dmu_dmem_addr;
@@ -4711,7 +4844,7 @@ pub module heliodor_core #(
     // translation hit a permission fault (then the MMU drops o_dmem_ren, so
     // dc_hit_safe=0 and this term cannot fire anyway — !dmem_mmu_fault makes
     // it explicit).
-    assign ld0_hum_ok = iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dc_load_next && dc_hit_safe && !redirect_fire && !i_dcache_inv_valid;
+    assign ld0_hum_ok = iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dc_load_next && dc_hit_safe && !redirect_fire && !i_dcache_inv_valid && !i_dcache_inv2_valid;
     // Per-entry squash (see header comment).
     let mshra_age    : logic<ROB_IDX_W> = mshra_rob_idx_q - rob_head_idx;
     let mshrb_age    : logic<ROB_IDX_W> = mshrb_rob_idx_q - rob_head_idx;
@@ -4720,7 +4853,7 @@ pub module heliodor_core #(
     let mshrb_squashed: logic = mshrb_v_q && (redirect_fire || (early_redir_fire_q && (mshrb_age >: s10_early_age)));
     // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).
     let replay_sb_ovl  : logic = if replay_is_a ? sb_mshra_ovl : sb_mshrb_ovl;
-    let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid && !replay_sb_ovl;
+    let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid && !replay_sb_ovl;
     let replay_claim   : logic = replay_drive && dc_miss_valid;
     // Fill completion routes to the OWNING entry.
     // S14.2: dc_fill_ready fires the owner's completion EARLY — critical-word-
