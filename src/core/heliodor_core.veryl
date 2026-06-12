@@ -90,6 +90,14 @@ pub module heliodor_core #(
     // issue, write pending at commit). Fed to memory_bus.i_amo_inflight so the
     // bus locks to this hart for the whole window → the RMW is bus-atomic.
     o_amo_inflight: output logic,
+    // P9.0: high while the memory_bus AMO lock is HELD BY THIS HART (the
+    // bus's registered tenure; the acquire cycle is excluded). The AMO/LR
+    // value-capture is gated on it — asserting o_amo_inflight alone does NOT
+    // mean we own the lock (another inflight hart may win the rotation), and
+    // a capture that needs no bus grant (cache hit / pre-lock fill) would
+    // otherwise read a value a remote locked RMW is about to overwrite.
+    // Single-hart SoCs / harnesses tie this to 1.
+    i_amo_locked: input logic,
 
     // M8.C: external IRQ pins (CLINT / PLIC). Drive low if no SoC.
     i_irq_timer_m: input logic,
@@ -1638,7 +1646,17 @@ pub module heliodor_core #(
             amo_read_pending_q = iq_issue_valid && iq_iss_is_amo;
         }
     }
-    let amo_issue_lock_ok: logic = !iq_iss_is_amo || amo_read_pending_q;
+    // P9.0: the capture additionally requires the bus lock to be HELD BY US
+    // (i_amo_locked). amo_read_pending_q only guarantees our inflight is
+    // visible to the bus — with >2 harts contending, another inflight hart
+    // can win the acquisition rotation, and if our read is servable WITHOUT
+    // a bus grant (cache hit, or a fill that ran in a no-holder window) we
+    // captured a value the lock holder's RMW then overwrote: the litmus N=4
+    // barrier amoadd read count=0, two remote locked RMWs landed (1, 2), and
+    // our stale 0+1=1 commit-write clobbered them → barrier livelock. The IQ
+    // keeps the AMO selected while the capture waits, so inflight stays up
+    // and the FCFS rotation eventually grants us the lock — no deadlock.
+    let amo_issue_lock_ok: logic = !iq_iss_is_amo || (amo_read_pending_q && i_amo_locked);
     assign o_amo_inflight = amo_read_pending_q || rob_has_pending_amo;
     // Phase 8 S10.3: dcache_stall now gates ONLY ops that read the dcache at
     // issue (loads incl. FP loads, and AMO/LR/SC value-capture reads). Stores
@@ -2178,6 +2196,7 @@ pub module heliodor_core #(
     var c_is_sret     : logic           ;
     var c_is_sfence   : logic           ;
     var c_is_fence_i  : logic           ; // M8.A FENCE.I → icache flush
+    var c_is_fence    : logic           ; // P9.0: plain FENCE (drain-wait gate)
     var c_is_ifault   : logic           ;
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
@@ -2250,7 +2269,13 @@ pub module heliodor_core #(
     // S20.2: ONLY those — the original "all CSR/MRET/SRET" superset made
     // every interrupt-path CSR op at N=4 pay a contention-bound drain wait
     // (part of the boot +13%); plain CSRs have no store-ordering semantics.
-    let c_serial: logic = rob_commit_entry.is_fence || rob_commit_entry.is_fence_i || rob_commit_entry.is_sfence || (rob_commit_entry.is_csr && c_csr_addr == 12'h180);
+    // P9.0 FIX: read the DEDICATED shadow-sourced commit outputs, NOT
+    // rob_commit_entry fields — is_fence/is_fence_i/is_sfence/is_csr were
+    // never assembled into o_commit_entry (constant 0), so this whole
+    // serializing drain-wait was dead: a FENCE retired with its older stores
+    // still in the store buffer, and the post-fence load read the world
+    // before they were globally visible (the litmus SB+fence (0,0) outcome).
+    let c_serial: logic = c_is_fence || c_is_fence_i || c_is_sfence || (c_is_csr && c_csr_addr == 12'h180);
     // S20R: an MMIO (non-DRAM) store is a DOORBELL — firmware writes a DRAM
     // mailbox then rings CLINT msip with no fence between (legal on the old
     // never-reordering pipeline). If the doorbell passes the buffered
@@ -2332,6 +2357,9 @@ pub module heliodor_core #(
         i_lq_rec_idx         : iq_iss_rob_idx       ,
         i_lq_rec_addr        : mshr_rec_addr        ,
         i_lq_rec_funct3      : iq_issue_op.base.mem_funct3,
+        // P9.0 CoRR: remote-invalidate poison (same broadcast the dcache gets).
+        i_inv_valid          : i_dcache_inv_valid   ,
+        i_inv_addr           : i_dcache_inv_addr    ,
         i_load_poison_v      : mshr_abort_poison    ,
         i_load_poison_idx    : mshr_poison_idx      ,
         i_load_poison_v2     : mshr_abort_poison2   ,
@@ -2388,6 +2416,7 @@ pub module heliodor_core #(
         o_commit_is_sret     : c_is_sret            ,
         o_commit_is_sfence   : c_is_sfence          ,
         o_commit_is_fence_i  : c_is_fence_i         ,
+        o_commit_is_fence    : c_is_fence           ,
         o_commit_is_ifault   : c_is_ifault          ,
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_is_sfault   : c_is_sfault          ,

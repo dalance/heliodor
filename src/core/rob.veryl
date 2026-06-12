@@ -91,6 +91,11 @@ pub module rob #(
     i_lq_rec_idx   : input logic<ROB_IDX_W>,
     i_lq_rec_addr  : input logic<64>       ,
     i_lq_rec_funct3: input logic<3>        ,
+    // P9.0 CoRR: remote-write invalidate broadcast (PA). Poisons every
+    // executed, uncommitted load record in the invalidated line — see the
+    // inv_viol_w scan. Single-hart cores tie i_inv_valid to 0.
+    i_inv_valid: input logic    ,
+    i_inv_addr : input logic<64>,
     // Phase 8 S10.3: external load-poison injection. An MSHR fill ABORTED by a
     // remote-write invalidate (SMP) still completes the load — but with
     // potentially-stale data, so the core poisons it here and the S9.3 commit
@@ -217,6 +222,13 @@ pub module rob #(
     o_commit_is_sret    : output logic           ,
     o_commit_is_sfence  : output logic           ,
     o_commit_is_fence_i : output logic           , // M8.A FENCE.I → icache flush
+    // P9.0: plain FENCE at the head, as a DEDICATED output (shadow-sourced).
+    // The core's serializing drain-wait (c_serial) previously read
+    // rob_commit_entry.is_fence etc. — fields NEVER assembled into
+    // o_commit_entry (constant 0) — so FENCE/FENCE.I/SFENCE/satp committed
+    // WITHOUT waiting for the store buffer to drain: the SB+fence (0,0)
+    // forbidden outcome test_litmus_4hart caught.
+    o_commit_is_fence   : output logic           ,
     o_commit_is_ifault  : output logic           ,
     o_commit_is_lfault  : output logic           ,
     o_commit_is_sfault  : output logic           ,
@@ -394,9 +406,15 @@ pub module rob #(
     // slot-1 — the replay is triggered only from the commit HEAD (slot-0), so a
     // poisoned head+1 load must wait to become the head. Without this it would
     // silently retire its stale value alongside slot-0 and never replay.
+    // P9.0: a plain FENCE must NOT retire via slot-1 either — the core's
+    // serializing-commit gate (c_serial: wait for the committed-store buffer
+    // to drain) only guards the HEAD slot. A "sw x; fence rw,rw" pair
+    // committing together let the fence vanish with the store still buffered,
+    // so a younger load read memory before the store was globally visible —
+    // the SB+fence (0,0) forbidden outcome caught by test_litmus_4hart.
     let c2_simple: logic = sh_valid[head1_idx] && sh_rw[head1_idx]
         && !sh_is_store[head1_idx] && !sh_is_amo[head1_idx] && !sh_is_csr[head1_idx]
-        && !sh_is_sfence[head1_idx] && !sh_is_fence_i[head1_idx]
+        && !sh_is_sfence[head1_idx] && !sh_is_fence_i[head1_idx] && !sh_is_fence[head1_idx]
         && !sh_is_ecall[head1_idx] && !sh_is_ebreak[head1_idx]
         && !sh_is_mret[head1_idx] && !sh_is_sret[head1_idx]
         && !sh_is_lfault[head1_idx] && !sh_is_sfault[head1_idx] && !sh_is_ifault[head1_idx]
@@ -471,6 +489,7 @@ pub module rob #(
     assign o_commit_is_sret      = sh_is_sret[head_idx];
     assign o_commit_is_sfence    = sh_is_sfence[head_idx];
     assign o_commit_is_fence_i   = sh_is_fence_i[head_idx];
+    assign o_commit_is_fence     = sh_is_fence[head_idx]; // P9.0 (see port note)
     assign o_commit_is_ifault    = sh_is_ifault[head_idx];
     assign o_commit_is_lfault    = sh_is_lfault[head_idx];
     assign o_commit_is_sfault    = sh_is_sfault[head_idx];
@@ -751,6 +770,30 @@ pub module rob #(
                 && st_known && (st_age <: aq_age) && aq_ovl {
                 recq_self_viol_w = 1'b1;
             }
+        }
+    }
+
+    // P9.0: remote-invalidate poison scan (CoRR / multi-copy read ordering).
+    // A remote write that invalidates a dcache line makes every EXECUTED,
+    // uncommitted load record to that line potentially "too old": an OLDER
+    // same-address load executing later reads the NEW value and the pair
+    // retires new-then-old — the CoWW/CoRR value reversal test_litmus_4hart
+    // caught as (r1,r2)=(2,0). Poison every executed load whose recorded PA
+    // falls in the invalidated line; the S9.3 commit replay re-reads it
+    // coherently. The load record holds a PA (see the S15 note in the
+    // store-resolve scan) and i_inv_addr is a PA, so an exact line compare
+    // is valid in both bare and VM modes. Loads recording THIS cycle are
+    // folded in from the live record ports (their sh_load_done lands next
+    // edge, so a same-cycle invalidate would otherwise miss them).
+    var inv_viol_w: logic [ROB_DEPTH];
+    always_comb {
+        for i in 0..ROB_DEPTH {
+            let ld_now0: logic     = i_cdb_valid && i_cdb_is_load && !i_cdb_is_lfault && ((i as ROB_IDX_W) == i_cdb_rob_idx);
+            let ld_now1: logic     = i_cdb2_valid && i_cdb2_is_load && ((i as ROB_IDX_W) == i_cdb2_rob_idx);
+            let ld_rec : logic     = i_lq_rec_valid && ((i as ROB_IDX_W) == i_lq_rec_idx);
+            let ld_seen: logic     = sh_valid[i] && (sh_load_done[i] || ld_now0 || ld_now1 || ld_rec);
+            let la     : logic<64> = if ld_now0 ? i_cdb_store_addr : (if ld_now1 ? i_cdb2_store_addr : (if ld_rec ? i_lq_rec_addr : sh_load_addr[i]));
+            inv_viol_w[i] = i_inv_valid && ld_seen && !sh_load_poison[i] && la[63:6] == i_inv_addr[63:6];
         }
     }
 
@@ -1091,6 +1134,14 @@ pub module rob #(
             // poison is correctly re-cleared. Dead until the S9.4 flip.
             for i in 0..ROB_DEPTH {
                 if load_viol_w[i] {
+                    sh_load_poison[i] = 1'b1;
+                }
+            }
+            // P9.0: remote-invalidate poison (CoRR) — see the inv_viol_w scan.
+            // Placed before the partial-squash (same re-clear guarantee as the
+            // store-resolve poison above).
+            for i in 0..ROB_DEPTH {
+                if inv_viol_w[i] {
                     sh_load_poison[i] = 1'b1;
                 }
             }
