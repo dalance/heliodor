@@ -84,13 +84,15 @@ heliodor/
      rv64uf/ud FP tests in `tb/test_arch_fp.veryl` are NOT `#[ignore]` and run here,
      on the OoO core). Fix any failures before proceeding.
   2. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (~37M cycles, minutes). N=1 single-hart is `--ignored --test test_soc_linux_boot`.
+     (~11.7M cycles, ~2 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
+     (~8.6M cycles, ~40 s).
   3. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
-     (~52M cycles, ~1h).
+     (~16M cycles, ~8 min). Cycle counts drift with perf work — treat large
+     unexplained jumps as regressions (N=4 has a ±1M timing band).
 - **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
   (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`, `test_coremark`)
   that print cycles + retired instructions (IPC = instret / cycles, frozen at
-  `tohost`). NOT a regression gate (IPC tuning is out of scope) — run
+  `tohost`). NOT a regression gate — run
   individually, e.g. `veryl test --ignored --test test_dhrystone`. Current
   numbers are in README.md. CoreMark runs ITERATIONS=1 with the upstream EEMBC
   sources vendored under `test/c/coremark/` (port layer: core_portme.*,
