@@ -114,9 +114,9 @@ pub module heliodor_soc #(
     let _unused_uart_irq: logic = uart_irq;
 
     // Shared L2 cache on the DRAM path (M8.D.2). The L2 sits between the SoC's
-    // DRAM decode and the external DRAM port (o_dmem_*). DRAM reads are served
-    // from L2 (l2_rdata); a miss forwards to the tb's DRAM combinationally.
-    var l2_rdata: logic<64>;
+    // DRAM decode and the external DRAM port (o_dmem_*). P9.1: DRAM reads are
+    // split transactions owned by mem_ctrl (L2 line hit after HIT_WAIT, DRAM
+    // gather after DRAM_WAIT); only writes pass through the L2 combinationally.
 
     // M8.D.3: single-hart memory_bus DRAM arbiter between the core and L2. The
     // arbiter mux carries the core's DRAM request to the L2; it exists to
@@ -141,12 +141,16 @@ pub module heliodor_soc #(
     var bus_dram_wstrb: logic<8>  [8];
     var bus_dram_wen  : logic        ;
     // S23: write-grant qualification — single downstream DRAM port, reads
-    // (fills) keep priority; see the SMP SoC for the full rationale. At N=1
-    // this is what lets the hart's own store drain run DURING its own fill
-    // burst (in the burst's L2-hit / idle DRAM slots).
-    var l2_rhit_w: logic;
+    // keep priority. P9.1: a write is held while mem_ctrl gathers a line from
+    // DRAM (ctrl_mem_busy) and while a legacy (firmware-ROM) read owns the
+    // external port this cycle; CLINT/UART read/write address-port conflicts
+    // keep their original terms.
     var bus_dramr_ren: logic;
-    let wgrant_ok: logic = !(bus_dramr_ren && !l2_rhit_w)
+    var ctrl_mem_busy: logic;
+    let r_in_clint    : logic = bus_dramr_addr[31:24] == 8'h02;
+    let r_in_uart     : logic = bus_dramr_addr[31:28] == 4'h1;
+    let legacy_ext_read: logic = bus_dramr_ren && !r_in_clint && !r_in_uart;
+    let wgrant_ok: logic = !ctrl_mem_busy && !legacy_ext_read
         && !(c_dmem_ren && in_clint && in_clint_w) && !(c_dmem_ren && in_uart && in_uart_w);
     // Per-hart (N=1) DRAM request bundles into the arbiter (per channel).
     var bus_in_raddr: logic<64> [1];
@@ -160,9 +164,33 @@ pub module heliodor_soc #(
     var bus_in_amo  : logic     [1];
     var bus_dgrant  : logic     [1]; // arbiter -> per-hart READ grant
     var bus_wgrant  : logic     [1]; // arbiter -> per-hart WRITE grant
+    // mem_ctrl <-> SoC wires (P9.1 split-transaction DRAM reads).
+    var ctrl_bus_rreq : logic     [1];
+    var ctrl_hgrant   : logic     [1];
+    var ctrl_hrdata   : logic<64> [1];
+    var ctrl_hreq     : logic     [1];
+    var ctrl_haddr    : logic<64> [1];
+    var ctrl_hdram    : logic     [1];
+    var ctrl_mem_addr : logic<64>    ;
+    var ctrl_mem_ren  : logic        ;
+    var l2_caddr      : logic<64>    ;
+    var l2_cren       : logic        ;
+    var l2_chit       : logic        ;
+    var l2_cdata      : logic<64> [8];
+    var l2_inst_v     : logic        ;
+    var l2_inst_addr  : logic<64>    ;
+    var l2_inst_data  : logic<64> [8];
+    var l2_mem_addr   : logic<64>    ;
+    assign ctrl_hreq[0]  = c_dmem_req;
+    assign ctrl_haddr[0] = c_dmem_addr;
+    assign ctrl_hdram[0] = in_dram;
+    assign c_dmem_grant  = ctrl_hgrant[0]; // P9.1: grant now comes from mem_ctrl
     assign bus_in_raddr[0] = c_dmem_addr;
-    assign bus_in_ren[0]   = c_dmem_ren && in_dram;
-    assign bus_in_rreq[0]  = c_dmem_req;
+    // P9.1: the bus read channel now arbitrates LEGACY (non-DRAM: MMIO /
+    // firmware-ROM) combinational reads plus mem_ctrl's DRAM gather beats;
+    // DRAM read transactions themselves are accepted/streamed by mem_ctrl.
+    assign bus_in_ren[0]   = c_dmem_ren && !in_dram;
+    assign bus_in_rreq[0]  = ctrl_bus_rreq[0];
     assign bus_in_waddr[0] = c_dmemw_addr;
     for l in 0..8 :gen_busw_lane {
         assign bus_in_wdata[l] = c_dmem_wdata[l];
@@ -171,7 +199,8 @@ pub module heliodor_soc #(
     assign bus_in_wen[0] = c_dmem_wen && in_dram_w;
     assign bus_in_wreq[0]  = c_dmemw_req;
     assign bus_in_amo[0]   = c_amo_inflight; // M9.0: live AMO lock (no-op at N=1)
-    assign c_dmem_grant    = bus_dgrant[0]; // M9.0: live arbiter grant (see note above)
+    // P9.1: the READ grant to the core comes from mem_ctrl (accept pulse +
+    // stream beats + legacy passthrough); bus_dgrant feeds mem_ctrl instead.
     assign c_dmemw_grant   = bus_wgrant[0];
     // Tied-off MMIO request bundle (MMIO is SoC-decoded, not bus-arbitrated).
     var bus_mmio_paddr: logic<32> [1];
@@ -193,8 +222,17 @@ pub module heliodor_soc #(
     assign bus_uart_sel[0]   = 1'b0;
     assign bus_stall_mem[0]  = 1'b0;
 
-    // Load data back to the core: CLINT / UART / DRAM (via L2).
-    let core_dmem_rdata: logic<64> = if in_clint ? clint_rdata : if in_uart ? {56'd0, uart_rdata} : l2_rdata;
+    // Load data back to the core: CLINT / UART / DRAM (mem_ctrl stream beat) /
+    // firmware-ROM (external comb port, legacy path).
+    let core_dmem_rdata: logic<64> = if in_clint ?
+        clint_rdata
+    : if in_uart ?
+        {56'd0, uart_rdata}
+    : if in_dram ?
+        ctrl_hrdata[0]
+    :
+        i_dmem_rdata
+    ;
 
     inst u_core: heliodor_core #(
         RESET_PC: RESET_PC,
@@ -281,31 +319,79 @@ pub module heliodor_soc #(
         o_dmem_inv_addr : _             ,
     );
 
-    // DRAM path through the shared L2 (M8.D.2/.3). The L2's upper interface
-    // takes the arbiter's granted DRAM request (already MMIO-gated upstream);
-    // its lower interface drives the external DRAM port to the tb. i_wstrb_hi
-    // (direct from the core — the bus does not carry the hi-side) tells the L2
-    // about a misaligned store whose hi dword bypasses it (below), so it can
+    // P9.1: split-transaction DRAM read controller. Accepts the core's DRAM
+    // read request (fill start), looks the line up in the L2, and serves the
+    // 8 beats after the modeled latency (HIT_WAIT for an L2 hit, DRAM_WAIT +
+    // an 8-cycle gather for a miss, the gathered line installing into the
+    // L2). Legacy (MMIO / firmware-ROM) reads pass through combinationally
+    // on the bus's read-channel grant, exactly as pre-P9.1.
+    inst u_mctrl: mem_ctrl #(
+        N_HARTS: 1,
+    ) (
+        clk                            ,
+        rst                            ,
+        i_hreq        : ctrl_hreq      ,
+        i_haddr       : ctrl_haddr     ,
+        i_hdram       : ctrl_hdram     ,
+        o_hgrant      : ctrl_hgrant    ,
+        o_hrdata      : ctrl_hrdata    ,
+        o_bus_rreq    : ctrl_bus_rreq  ,
+        i_bus_rgrant  : bus_dgrant     ,
+        o_l2_caddr    : l2_caddr       ,
+        o_l2_cren     : l2_cren        ,
+        i_l2_chit     : l2_chit        ,
+        i_l2_cdata    : l2_cdata       ,
+        o_l2_inst_v   : l2_inst_v      ,
+        o_l2_inst_addr: l2_inst_addr   ,
+        o_l2_inst_data: l2_inst_data   ,
+        o_mem_addr    : ctrl_mem_addr  ,
+        o_mem_ren     : ctrl_mem_ren   ,
+        i_mem_rdata   : i_dmem_rdata   ,
+        o_mem_busy    : ctrl_mem_busy  ,
+        i_w_valid     : bus_dram_wen   ,
+        i_w_addr      : bus_dramw_addr ,
+        i_w_hi        : if in_dram_w ? c_dmem_wstrb_hi != 8'd0 : 1'b0,
+    );
+
+    // Shared L2 (M8.D.2, P9.1 line-granular). Lookup/copy + line install are
+    // driven by mem_ctrl; the write side keeps the bus write channel and its
+    // lower interface is now write-passthrough only. i_wstrb_hi (direct from
+    // the core — the bus does not carry the hi-side) tells the L2 about a
+    // misaligned store whose hi dword bypasses it (below), so it can
     // invalidate the stale line(s).
     inst u_l2: l2cache (
         clk                                               ,
         rst                                               ,
-        i_raddr    : bus_dramr_addr                       ,
-        i_ren      : bus_dramr_ren                        ,
-        o_rdata    : l2_rdata                             ,
-        o_rhit     : l2_rhit_w                            ,
+        i_caddr    : l2_caddr                             ,
+        i_cren     : l2_cren                              ,
+        o_chit     : l2_chit                              ,
+        o_cdata    : l2_cdata                             ,
+        i_inst_v   : l2_inst_v                            ,
+        i_inst_addr: l2_inst_addr                         ,
+        i_inst_data: l2_inst_data                         ,
         i_waddr    : bus_dramw_addr                       ,
         i_wdata    : bus_dram_wdata                       ,
         i_wstrb    : bus_dram_wstrb                       ,
         i_wstrb_hi : if in_dram_w ? c_dmem_wstrb_hi : 8'd0,
         i_wen      : bus_dram_wen                         ,
-        o_mem_addr : o_dmem_addr                        ,
-        o_mem_wdata: o_dmem_wdata                       ,
-        o_mem_wstrb: o_dmem_wstrb                       ,
-        o_mem_wen  : o_dmem_wen                         ,
-        o_mem_ren  : o_dmem_ren                         ,
-        i_mem_rdata: i_dmem_rdata                       ,
+        o_mem_addr : l2_mem_addr                          ,
+        o_mem_wdata: o_dmem_wdata                         ,
+        o_mem_wstrb: o_dmem_wstrb                         ,
+        o_mem_wen  : o_dmem_wen                           ,
     );
+
+    // External DRAM port muxing. The three users are mutually exclusive by
+    // construction: a gather beat (ctrl_mem_busy) blocks writes through
+    // wgrant_ok and excludes a same-cycle legacy read (single read grant);
+    // wgrant_ok also blocks writes on legacy firmware-ROM read cycles.
+    assign o_dmem_addr = if ctrl_mem_busy ?
+        ctrl_mem_addr
+    : if o_dmem_wen ?
+        l2_mem_addr
+    :
+        bus_dramr_addr
+    ;
+    assign o_dmem_ren = ctrl_mem_ren || legacy_ext_read;
 
     // Misaligned-store hi-side carry (addr+8) bypasses L2 straight to DRAM; the
     // L2 invalidate (driven by i_wstrb_hi) keeps its cached copy from going

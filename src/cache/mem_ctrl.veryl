@@ -1,0 +1,280 @@
+// P9.1: split-transaction DRAM read controller.
+//
+// Sits between the per-hart L1 read channels and the shared L2 / external
+// DRAM port, replacing the old combinational same-cycle read path. A DRAM
+// line read is now a TRANSACTION with a modeled latency:
+//
+//   ACCEPT  : the hart's read request (a dcache fill start) is accepted with
+//             a 1-cycle o_hgrant pulse — the dcache latches its FILL state on
+//             it and then sits in FILL waiting for beats (it only advances on
+//             granted cycles, which is exactly the pre-P9.1 contract).
+//   LOOKUP  : the next cycle, the line is looked up in the shared L2 (full
+//             64B-line hit since P9.1 — the L2's lazy per-word fills are gone).
+//   L2 hit  : the line is copied into the slot buffer; after HIT_WAIT cycles
+//             (L2 access latency model) the 8 beats stream to the hart.
+//   L2 miss : after DRAM_WAIT cycles (DRAM row/CAS latency model) the line is
+//             gathered from the external DRAM port, one dword per granted
+//             read-channel cycle (the memory_bus rotation arbitrates gather
+//             beats across harts and keeps the AMO-lock pinning semantics),
+//             then installed into the L2 as a full line, then streamed.
+//   STREAM  : o_hgrant held for 8 consecutive cycles; o_hrdata serves the
+//             dword the hart addresses each cycle (i_haddr[5:3]), so the
+//             dcache's critical-word-first wrap order works unchanged.
+//
+// One slot per hart (an L1 dcache has a single fill FSM, so one outstanding
+// line read per hart is the structural maximum). Slots progress independently:
+// hart B's L2-hit fill streams while hart A waits out its DRAM latency —
+// the "multiple outstanding" half of P9.1. Only the shared resources
+// serialize: the L2 lookup port (implicitly 1/cycle — accepts are 1/cycle),
+// the external DRAM port (gather beats via the bus read-channel rotation),
+// and the L2 install port (gathers serialize, so installs cannot collide).
+//
+// Non-DRAM (MMIO / firmware-ROM) reads keep the legacy combinational path:
+// their bus request/grant passes straight through (o_bus_rreq / o_hgrant),
+// preserving the pre-P9.1 single-cycle behavior — the SoC muxes their read
+// data (CLINT/UART/external comb port) per hart, not this module's o_hrdata.
+//
+// Write-conflict snoop: a granted DRAM write (write-through, still 1-cycle
+// posted) that lands on a line being GATHERED or INSTALLED clears install_ok —
+// the gathered copy may pre-date the write, so it must not be installed into
+// the L2 (the requesting L1 discards its own copy through the existing
+// invalidate-broadcast fill-abort and refetches). Writes during DWAIT are
+// harmless (they hit DRAM before the gather reads it), and writes during
+// HWAIT/STREAM never install anything.
+//
+// Protocol invariant relied upon: an accept grant ALWAYS starts the dcache
+// fill — the dcache suppresses o_memr_req while an urgent store drain
+// preempts the fill start (see dcache want_fill_start), so a granted request
+// implies the IDLE→FILL transition fires that cycle.
+pub module mem_ctrl #(
+    param N_HARTS  : u32 = 1 ,
+    param DRAM_WAIT: u32 = 20, // accept -> gather start (DRAM latency model), >= 1
+    param HIT_WAIT : u32 = 2 , // L2 copy -> stream start (L2 latency model), >= 1
+) (
+    clk: input clock,
+    rst: input reset,
+    // Hart side (read channel, per hart): request/addr from the dcache,
+    // i_hdram = SoC's DRAM decode of the addr. o_hgrant feeds i_memr_grant.
+    i_hreq  : input  logic     [N_HARTS],
+    i_haddr : input  logic<64> [N_HARTS],
+    i_hdram : input  logic     [N_HARTS],
+    o_hgrant: output logic     [N_HARTS],
+    o_hrdata: output logic<64> [N_HARTS],
+    // Bus side: read-channel cycle requests (gather beats + legacy reads).
+    // The memory_bus arbitrates these with its existing rotation + AMO lock.
+    o_bus_rreq  : output logic [N_HARTS],
+    i_bus_rgrant: input  logic [N_HARTS],
+    // L2 line lookup/copy port (combinational hit + 8-dword line read).
+    o_l2_caddr: output logic<64>    ,
+    o_l2_cren : output logic        ,
+    i_l2_chit : input  logic        ,
+    i_l2_cdata: input  logic<64> [8],
+    // L2 full-line install port (gathered DRAM line).
+    o_l2_inst_v   : output logic        ,
+    o_l2_inst_addr: output logic<64>    ,
+    o_l2_inst_data: output logic<64> [8],
+    // External DRAM read port (one dword per gather cycle, comb response).
+    o_mem_addr : output logic<64>,
+    o_mem_ren  : output logic    ,
+    i_mem_rdata: input  logic<64>,
+    o_mem_busy : output logic    , // gather beat this cycle -> SoC holds writes
+    // Write snoop: the granted DRAM write this cycle (line + misaligned
+    // hi-side flag, which also writes the line at i_w_addr+8).
+    i_w_valid: input logic    ,
+    i_w_addr : input logic<64>,
+    i_w_hi   : input logic    ,
+) {
+    // Slot states.
+    const ST_IDLE   : logic<3> = 3'd0;
+    const ST_LOOKUP : logic<3> = 3'd1;
+    const ST_HWAIT  : logic<3> = 3'd2;
+    const ST_DWAIT  : logic<3> = 3'd3;
+    const ST_GATHER : logic<3> = 3'd4;
+    const ST_INSTALL: logic<3> = 3'd5;
+    const ST_STREAM : logic<3> = 3'd6;
+
+    // Write-snoop line decode (the +8 line covers the misaligned hi-side).
+    let w_line   : logic<58> = i_w_addr[63:6];
+    let w_addr_hi: logic<64> = i_w_addr + 64'd8;
+    let w_line_hi: logic<58> = w_addr_hi[63:6];
+
+    // Cross-hart visible slot state (each element driven by its own slot).
+    var st_all  : logic<3>  [N_HARTS]    ;
+    var line_all: logic<58> [N_HARTS]    ;
+    var gcnt_all: logic<3>  [N_HARTS]    ;
+    var iok_all : logic     [N_HARTS]    ;
+    var buf_all : logic<64> [N_HARTS * 8];
+
+    // Accept arbitration: at most one accept per cycle (the L2 lookup port is
+    // single), lowest-id wins. Accept conflicts are 1-cycle and rare; the real
+    // serialization (gather beats) goes through the bus's fair rotation.
+    var acc_found: logic [N_HARTS];
+    var accept   : logic [N_HARTS];
+    for h in 0..N_HARTS :gen_acc {
+        if h == 0 :gen_first {
+            assign accept[h]    = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h];
+            assign acc_found[h] = accept[h];
+        } else :gen_rest {
+            assign accept[h]    = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h] && !acc_found[h - 1];
+            assign acc_found[h] = acc_found[h - 1] || accept[h];
+        }
+    }
+
+    // Per-hart slot.
+    for h in 0..N_HARTS :gen_slot {
+        var st_q  : logic<3>     ;
+        var line_q: logic<58>    ;
+        var wcnt_q: logic<8>     ;
+        var gcnt_q: logic<3>     ;
+        var scnt_q: logic<3>     ;
+        var iok_q : logic        ;
+        var buf_q : logic<64> [8];
+
+        assign st_all[h]   = st_q;
+        assign line_all[h] = line_q;
+        assign gcnt_all[h] = gcnt_q;
+        assign iok_all[h]  = iok_q;
+        for l in 0..8 :gen_buf_exp {
+            assign buf_all[h * 8 + l] = buf_q[l];
+        }
+
+        // Write conflict against this slot's line (lo or misaligned-hi line).
+        let conflict: logic = i_w_valid && ((w_line == line_q) || (i_w_hi && (w_line_hi == line_q)));
+
+        always_ff (clk, rst) {
+            if_reset {
+                st_q   = ST_IDLE;
+                line_q = '0;
+                wcnt_q = 8'd0;
+                gcnt_q = 3'd0;
+                scnt_q = 3'd0;
+                iok_q  = 1'b0;
+                for l in 0..8 {
+                    buf_q[l] = 64'd0;
+                }
+            } else {
+                case st_q {
+                    ST_IDLE: {
+                        if accept[h] {
+                            line_q = i_haddr[h][63:6];
+                            wcnt_q = 8'd0;
+                            gcnt_q = 3'd0;
+                            scnt_q = 3'd0;
+                            iok_q  = 1'b1;
+                            st_q   = ST_LOOKUP;
+                        }
+                    }
+                    ST_LOOKUP: {
+                        if i_l2_chit {
+                            for l in 0..8 {
+                                buf_q[l] = i_l2_cdata[l];
+                            }
+                            wcnt_q = 8'd0;
+                            st_q   = ST_HWAIT;
+                        } else {
+                            wcnt_q = 8'd0;
+                            st_q   = ST_DWAIT;
+                        }
+                    }
+                    ST_HWAIT: {
+                        wcnt_q = wcnt_q + 8'd1;
+                        if wcnt_q == (HIT_WAIT - 1) as 8 {
+                            scnt_q = 3'd0;
+                            st_q   = ST_STREAM;
+                        }
+                    }
+                    ST_DWAIT: {
+                        wcnt_q = wcnt_q + 8'd1;
+                        if wcnt_q == (DRAM_WAIT - 1) as 8 {
+                            gcnt_q = 3'd0;
+                            st_q   = ST_GATHER;
+                        }
+                    }
+                    ST_GATHER: {
+                        if i_bus_rgrant[h] {
+                            buf_q[gcnt_q] = i_mem_rdata;
+                            if gcnt_q == 3'd7 {
+                                st_q = ST_INSTALL;
+                            } else {
+                                gcnt_q = gcnt_q + 3'd1;
+                            }
+                        }
+                        if conflict {
+                            iok_q = 1'b0;
+                        }
+                    }
+                    ST_INSTALL: {
+                        scnt_q = 3'd0;
+                        st_q   = ST_STREAM;
+                    }
+                    ST_STREAM: {
+                        scnt_q = scnt_q + 3'd1;
+                        if scnt_q == 3'd7 {
+                            st_q = ST_IDLE;
+                        }
+                    }
+                    default: {
+                        st_q = ST_IDLE;
+                    }
+                }
+            }
+        }
+
+        // Hart-facing grant: accept pulse, the 8 stream beats, or the legacy
+        // (non-DRAM) combinational passthrough of the bus grant.
+        let legacy: logic = i_hreq[h] && !i_hdram[h];
+        assign o_hgrant[h] = accept[h] || (st_q == ST_STREAM) || (legacy && i_bus_rgrant[h]);
+        // Beat data: the addressed dword of the slot buffer (the dcache walks
+        // its critical-word-first order through i_haddr during STREAM).
+        assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
+
+        // Bus cycle requests: gather beats + legacy reads.
+        assign o_bus_rreq[h] = legacy || (st_q == ST_GATHER);
+    }
+
+    // L2 lookup mux: at most one slot is in LOOKUP (accepts are 1/cycle).
+    always_comb {
+        o_l2_caddr = 64'd0;
+        o_l2_cren  = 1'b0;
+        for h in 0..N_HARTS {
+            if st_all[h] == ST_LOOKUP {
+                o_l2_caddr = {line_all[h], 6'd0};
+                o_l2_cren  = 1'b1;
+            }
+        }
+    }
+
+    // External gather mux: at most one slot holds the bus read grant.
+    always_comb {
+        o_mem_addr = 64'd0;
+        o_mem_ren  = 1'b0;
+        for h in 0..N_HARTS {
+            if (st_all[h] == ST_GATHER) && i_bus_rgrant[h] {
+                o_mem_addr = {line_all[h], gcnt_all[h], 3'b000};
+                o_mem_ren  = 1'b1;
+            }
+        }
+    }
+    assign o_mem_busy = o_mem_ren;
+
+    // L2 install mux: gathers serialize on the external port, so at most one
+    // slot can be in INSTALL on any cycle. A same-cycle write conflict on the
+    // install line suppresses it (the registered iok_q covers earlier ones).
+    always_comb {
+        o_l2_inst_v    = 1'b0;
+        o_l2_inst_addr = 64'd0;
+        for l in 0..8 {
+            o_l2_inst_data[l] = 64'd0;
+        }
+        for h in 0..N_HARTS {
+            if st_all[h] == ST_INSTALL {
+                let i_conf: logic = i_w_valid && ((w_line == line_all[h]) || (i_w_hi && (w_line_hi == line_all[h])));
+                o_l2_inst_v    = iok_all[h] && !i_conf;
+                o_l2_inst_addr = {line_all[h], 6'd0};
+                for l in 0..8 {
+                    o_l2_inst_data[l] = buf_all[h * 8 + l];
+                }
+            }
+        }
+    }
+}

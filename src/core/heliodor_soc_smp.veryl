@@ -152,10 +152,27 @@ pub module heliodor_soc_smp #(
     var bus_amo_locked: logic   [N_HARTS]    ; // P9.0: bus AMO-lock tenure per hart
     var bus_dgrant  : logic     [N_HARTS]    ; // arbiter -> per-hart READ grant
     var bus_wgrant  : logic     [N_HARTS]    ; // arbiter -> per-hart WRITE grant
+    // P9.1: mem_ctrl <-> SoC wires (split-transaction DRAM reads).
+    var ctrl_bus_rreq: logic     [N_HARTS];
+    var ctrl_hgrant  : logic     [N_HARTS];
+    var ctrl_hrdata  : logic<64> [N_HARTS];
+    var ctrl_mem_addr: logic<64>          ;
+    var ctrl_mem_ren : logic              ;
+    var l2_caddr     : logic<64>          ;
+    var l2_cren      : logic              ;
+    var l2_chit      : logic              ;
+    var l2_cdata     : logic<64> [8]      ;
+    var l2_inst_v    : logic              ;
+    var l2_inst_addr : logic<64>          ;
+    var l2_inst_data : logic<64> [8]      ;
+    var l2_mem_addr  : logic<64>          ;
     for h in 0..N_HARTS :gen_busin {
         assign bus_in_raddr[h] = c_dmem_addr[h];
-        assign bus_in_ren[h]   = c_dmem_ren[h] && in_dram[h];
-        assign bus_in_rreq[h]  = c_dmem_req[h];
+        // P9.1: the bus read channel now arbitrates LEGACY (non-DRAM: MMIO /
+        // firmware-ROM) combinational reads plus mem_ctrl's DRAM gather
+        // beats; DRAM read transactions are accepted/streamed by mem_ctrl.
+        assign bus_in_ren[h]   = c_dmem_ren[h] && !in_dram[h];
+        assign bus_in_rreq[h]  = ctrl_bus_rreq[h];
         assign bus_in_waddr[h] = c_dmemw_addr[h];
         for l in 0..8 :gen_busin_lane {
             assign bus_in_wdata[h * 8 + l] = c_dmem_wdata[h * 8 + l];
@@ -195,19 +212,23 @@ pub module heliodor_soc_smp #(
     var bus_dram_wstrb: logic<8>  [8];
     var bus_dram_wen  : logic        ;
     // S23: write-grant qualification — the downstream DRAM port is single
-    // and reads (fills) keep their pre-split priority. A write proceeds only
-    // when the granted read needs no DRAM cycle (L2 word hit, non-DRAM
-    // target, or no read at all); a write to a peripheral being read the
-    // same cycle is also held (the peripheral has one address port).
-    var l2_rhit_w: logic;
+    // and reads keep their pre-split priority. P9.1: a write is held while
+    // mem_ctrl gathers a line from DRAM (ctrl_mem_busy) and while a legacy
+    // (firmware-ROM) read owns the external port this cycle; a write to a
+    // peripheral being read the same cycle is also held (the peripheral has
+    // one address port).
     var bus_dramr_ren: logic;
+    var ctrl_mem_busy: logic;
     let w_in_clint: logic = bus_dramw_addr[31:24] == 8'h02;
     let w_in_uart : logic = bus_dramw_addr[31:28] == 4'h1;
+    let r_in_clint: logic = bus_dramr_addr[31:24] == 8'h02;
+    let r_in_uart : logic = bus_dramr_addr[31:28] == 4'h1;
+    let legacy_ext_read: logic = bus_dramr_ren && !r_in_clint && !r_in_uart;
     var clint_wen_w: logic;
     var clint_ren_w: logic;
     var uart_wen_w : logic;
     var uart_ren_w : logic;
-    let wgrant_ok: logic = !(bus_dramr_ren && !l2_rhit_w)
+    let wgrant_ok: logic = !ctrl_mem_busy && !legacy_ext_read
         && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart);
     var bus_inv_valid : logic    ;
     var bus_inv_addr  : logic<64>;
@@ -289,29 +310,75 @@ pub module heliodor_soc_smp #(
         }
     }
 
-    // Shared L2 on the DRAM path (granted request → L2 → external DRAM port).
-    var l2_rdata: logic<64>;
+    // P9.1: split-transaction DRAM read controller (see the N=1 SoC /
+    // mem_ctrl headers). Per-hart slots: one outstanding line read per hart;
+    // gather beats are arbitrated through the bus's read-channel rotation
+    // (which keeps the AMO-lock pinning + the S20R anti-starvation shape).
+    inst u_mctrl: mem_ctrl #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk                                 ,
+        rst                                 ,
+        i_hreq        : c_dmem_req          ,
+        i_haddr       : c_dmem_addr         ,
+        i_hdram       : in_dram             ,
+        o_hgrant      : ctrl_hgrant         ,
+        o_hrdata      : ctrl_hrdata         ,
+        o_bus_rreq    : ctrl_bus_rreq       ,
+        i_bus_rgrant  : bus_dgrant          ,
+        o_l2_caddr    : l2_caddr            ,
+        o_l2_cren     : l2_cren             ,
+        i_l2_chit     : l2_chit             ,
+        i_l2_cdata    : l2_cdata            ,
+        o_l2_inst_v   : l2_inst_v           ,
+        o_l2_inst_addr: l2_inst_addr        ,
+        o_l2_inst_data: l2_inst_data        ,
+        o_mem_addr    : ctrl_mem_addr       ,
+        o_mem_ren     : ctrl_mem_ren        ,
+        i_mem_rdata   : i_dmem_rdata        ,
+        o_mem_busy    : ctrl_mem_busy       ,
+        i_w_valid     : bus_dram_wen        ,
+        i_w_addr      : bus_dramw_addr      ,
+        i_w_hi        : l2_wstrb_hi != 8'd0 ,
+    );
+
+    // Shared L2 (P9.1 line-granular): lookup/copy + line install from
+    // mem_ctrl; write side keeps the bus write channel; lower interface is
+    // write-passthrough only.
     inst u_l2: l2cache (
         clk                        ,
         rst                        ,
-        i_raddr    : bus_dramr_addr,
-        i_ren      : bus_dramr_ren ,
-        o_rdata    : l2_rdata      ,
-        o_rhit     : l2_rhit_w     ,
+        i_caddr    : l2_caddr      ,
+        i_cren     : l2_cren       ,
+        o_chit     : l2_chit       ,
+        o_cdata    : l2_cdata      ,
+        i_inst_v   : l2_inst_v     ,
+        i_inst_addr: l2_inst_addr  ,
+        i_inst_data: l2_inst_data  ,
         i_waddr    : bus_dramw_addr,
         i_wdata    : bus_dram_wdata,
         i_wstrb    : bus_dram_wstrb,
         i_wstrb_hi : l2_wstrb_hi   ,
         i_wen      : bus_dram_wen  ,
-        o_mem_addr : o_dmem_addr   ,
+        o_mem_addr : l2_mem_addr   ,
         o_mem_wdata: o_dmem_wdata  ,
         o_mem_wstrb: o_dmem_wstrb  ,
         o_mem_wen  : o_dmem_wen    ,
-        o_mem_ren  : o_dmem_ren    ,
-        i_mem_rdata: i_dmem_rdata  ,
     );
     assign o_dmem_wdata_hi = dram_wdata_hi;
     assign o_dmem_wstrb_hi = dram_wstrb_hi;
+
+    // External DRAM port muxing — the three users are mutually exclusive by
+    // construction (gather beats and legacy firmware-ROM reads block writes
+    // through wgrant_ok; the single read grant excludes gather vs legacy).
+    assign o_dmem_addr = if ctrl_mem_busy ?
+        ctrl_mem_addr
+    : if o_dmem_wen ?
+        l2_mem_addr
+    :
+        bus_dramr_addr
+    ;
+    assign o_dmem_ren = ctrl_mem_ren || legacy_ext_read;
 
     // Shared CLINT / UART driven by the granted core's decoded MMIO access.
     // Enables are an OR-reduction (only the granted core has c_dmem_wen/ren=1);
@@ -374,12 +441,20 @@ pub module heliodor_soc_smp #(
     );
     let _unused_uart_irq: logic = uart_irq;
 
-    // Per-hart load data: CLINT / UART / DRAM (via L2). A non-granted core's
-    // dcache is stalled (o_stall) and never latches l2_rdata destined for the
-    // granted core, so sharing l2_rdata across harts is safe.
+    // Per-hart load data: CLINT / UART / DRAM (mem_ctrl per-hart stream
+    // beat) / firmware-ROM (external comb port, legacy path — only the
+    // granted hart's dcache advances on it).
     var core_dmem_rdata: logic<64> [N_HARTS];
     for h in 0..N_HARTS :gen_rdata {
-        assign core_dmem_rdata[h] = if in_clint[h] ? clint_rdata : if in_uart[h] ? {56'd0, uart_rdata} : l2_rdata;
+        assign core_dmem_rdata[h] = if in_clint[h] ?
+            clint_rdata
+        : if in_uart[h] ?
+            {56'd0, uart_rdata}
+        : if in_dram[h] ?
+            ctrl_hrdata[h]
+        :
+            i_dmem_rdata
+        ;
     }
 
     // N cores. HART_ID = loop index → mhartid. imem/iptw per-hart (tb-served).
@@ -419,7 +494,8 @@ pub module heliodor_soc_smp #(
             o_dmem_wdata_hi   : c_dmem_wdata_hi[h],
             o_dmem_wstrb_hi   : c_dmem_wstrb_hi[h],
             o_dmem_req        : c_dmem_req[h]     ,
-            i_dmem_grant      : bus_dgrant[h]     ,
+            i_dmem_grant      : ctrl_hgrant[h]    , // P9.1: mem_ctrl grant
+
             o_dmemw_addr      : c_dmemw_addr[h]   ,
             o_dmemw_req       : c_dmemw_req[h]    ,
             i_dmemw_grant     : bus_wgrant[h]     ,

@@ -51,8 +51,13 @@ non-blocking private L1 caches, a shared L2, and 1/2/4-hart SMP. Stock Linux
     non-blocking (2 MSHRs, hit-under-miss, critical-word-first fill with early
     restart), a second hit-only read port for dual loads, and separate
     read / write bus channels
-  - Shared L2: 128 KB, 4-way, 64 B line, write-through, tree-PLRU, per-word
-    valid bits; sits between `memory_bus` and the DRAM port
+  - Shared L2: 128 KB, 4-way, 64 B line, line-granular, write-through,
+    tree-PLRU; looked up / installed by the split-transaction read controller
+  - Split-transaction DRAM reads (`mem_ctrl`): a line fill is a tagged
+    per-hart transaction with modeled latency — L2 hit ≈ 4 cycles to first
+    beat, L2 miss ≈ 30 (DRAM wait + 8-beat gather), one outstanding line read
+    per hart progressing independently; writes stay 1-cycle posted
+    write-through and contend with gathers for the DRAM port
 - **SMP** (`heliodor_soc_smp #(N_HARTS = 1 / 2 / 4)`)
   - N private cores share one `memory_bus` DRAM arbiter (independent read /
     write channels), the L2, and the CLINT / PLIC / UART
@@ -65,10 +70,10 @@ non-blocking private L1 caches, a shared L2, and 1/2/4-hart SMP. Stock Linux
 
 | Suite                                                                       | Result |
 |-----------------------------------------------------------------------------|--------|
-| Default `veryl test` (unit + inline arch suites, on the OoO core)           | 152 passed, 0 failed (18 ignored) |
-| Linux 5.15 boot, 1-hart (`--ignored --test test_soc_linux_boot`)            | pass (~8.6M cycles) |
-| Linux 5.15 boot, 2-hart (`--ignored --test test_soc_smp_linux_boot_2hart`)  | pass (~11.7M cycles) |
-| Linux 5.15 boot, 4-hart (`--ignored --test test_soc_smp_linux_boot_4hart`)  | pass (~16.0M cycles) |
+| Default `veryl test` (unit + inline arch suites + N=2 litmus, on the OoO core) | 153 passed, 0 failed (19 ignored) |
+| Linux 5.15 boot, 1-hart (`--ignored --test test_soc_linux_boot`)            | pass (~9.1M cycles) |
+| Linux 5.15 boot, 2-hart (`--ignored --test test_soc_smp_linux_boot_2hart`)  | pass (~12.3M cycles) |
+| Linux 5.15 boot, 4-hart (`--ignored --test test_soc_smp_linux_boot_4hart`)  | pass (~16.6M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
 (integer + privileged) and rv64uf / ud (FP), hand-maintained in
@@ -158,3 +163,4 @@ as of Phase 8:
 | 6     | 4-hart SMP (`gen_n4` round-robin, SBI HSM HART_START tuned for `wait_for_completion` timing) + shared 128KB 4-way L2 with tree-PLRU | complete |
 | 7     | Clean-slate OoO redesign: a from-scratch 1-wide pure-Tomasulo + PRF core that replaces the earlier OoO datapath, re-validated to RV64GC + 1/2/4-hart SMP Linux boot | complete |
 | 8     | Microarchitecture build-out on the Phase 7 core: 2-wide superscalar (fetch / rename / issue / commit), branch prediction (BTB + gshare + TAGE-lite + indirect BTB + RAS, execute-time early redirect), non-blocking L1s (MSHRs, hit-under-miss, critical-word-first), memory-dependence speculation + replay, committed-store buffer with line write-combining and store-to-load forwarding, split read/write bus channels — 1-hart boot 26M → 8.6M cycles, 4-hart 52M → 16M | complete |
+| 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller with modeled latency + line-granular L2 (P9.1); next: write-back D$ + MESI directory, cache-to-cache transfer, in-cache AMO/LR-SC, N=8 + L2 banking, PLIC wiring + ASID | in progress |
