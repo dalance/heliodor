@@ -83,10 +83,14 @@ heliodor/
      the rv64ui/um/ua/mi/si arch tests in `tb/test_arch_common.veryl` and the
      rv64uf/ud FP tests in `tb/test_arch_fp.veryl` are NOT `#[ignore]` and run here,
      on the OoO core). Fix any failures before proceeding.
-  2. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
+  2. `veryl test --ignored --test test_litmus_4hart` — P9.0 RVWMO litmus battery
+     at N=4 (IRIW + 4-way barrier/bus stress; ~2.8M cycles). The N=2 battery
+     (`test_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is
+     a memory-model bug — see `test/litmus/litmus.S` for the tohost encoding.
+  3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
      (~11.7M cycles, ~2 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
      (~8.6M cycles, ~40 s).
-  3. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
+  4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
      (~16M cycles, ~8 min). Cycle counts drift with perf work — treat large
      unexplained jumps as regressions (N=4 has a ±1M timing band).
 - **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
@@ -153,6 +157,7 @@ modules `veryl build` emits to `tb/*.sv`:
 | `tb_soc_linux_boot.sv`               | N=1    | `heliodor_test_soc_linux_boot_harness`   |
 | `tb_soc_smp_linux_boot_2hart.sv`     | N=2    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=2) |
 | `tb_soc_smp_linux_boot_4hart.sv`     | N=4    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=4) |
+| `tb_litmus_4hart.sv`                 | N=4    | `heliodor_test_litmus_harness` #(N_HARTS=4) (P9.0 RVWMO litmus) |
 
 Build + run (from the project root, so the harness `$readmemh` paths resolve):
 

@@ -1,0 +1,326 @@
+// P9.0: RVWMO litmus-test suite on the SMP SoC.
+//
+// Runs test/litmus/litmus_n{2,4}.hex (built by `make -C test/litmus`): all
+// harts boot at 0x80000000, run the litmus battery (CoRR / CoWW / MP / SB /
+// LB / IRIW variants + AMO atomicity + LR/SC mutual exclusion) with a
+// barrier-framed, jitter-offset iteration loop, and accumulate an outcome
+// histogram in DRAM. Hart0 checks the forbidden-outcome table and writes
+// tohost: 1 = PASS; even values encode the violating (test<<8|slot) or a
+// trap mcause. See test/litmus/litmus.S for the test list and encodings.
+//
+// The harness mirrors test_soc_smp_linux_boot_harness (per-hart ifetch/PTW
+// arrays + the single arbitrated data port with S25 line-write lanes) but
+// serves DRAM only (no firmware ROM; RESET_PC = 0x8000_0000) and watches the
+// riscv-tests tohost word at PA 0x80001000. On completion (pass OR fail) it
+// dumps every non-zero histogram slot so the observed outcome distribution —
+// including ALLOWED weak outcomes like SB-plain (0,0) — is visible per run.
+module test_litmus_harness #(
+    param N_HARTS : u32    = 2                            ,
+    param HEX_DRAM: string = "test/litmus/litmus_n2.hex"  ,
+) (
+    clk        : input clock                  ,
+    rst        : input reset                  ,
+    o_pass     : output logic                 ,
+    o_fail     : output logic                 ,
+    o_tohost   : output logic<32>             ,
+    o_cy       : output logic<32>             ,
+    o_pc_all   : output logic<64> [N_HARTS]   ,
+    o_ret_all  : output logic<32> [N_HARTS]   ,
+    o_trapc_all: output logic<32> [N_HARTS]   ,
+    o_bar_cnt  : output logic<32>             ,
+    o_bar_sense: output logic<32>             ,
+) {
+    // Per-hart instruction fetch + PTW (tb-served from DRAM).
+    var imem_addr : logic<64> [N_HARTS];
+    var imem_rdata: logic<32> [N_HARTS];
+    var imem_ren  : logic     [N_HARTS];
+    var iptw_addr : logic<64> [N_HARTS];
+    var iptw_req  : logic     [N_HARTS];
+    var iptw_rdata: logic<64> [N_HARTS];
+    // Shared data port (arbitrated inside the SoC). S25: writes are LINE
+    // transactions — 8 dword lanes + per-lane byte strobes.
+    var dmem_addr    : logic<64>    ;
+    var dmem_wdata   : logic<64> [8];
+    var dmem_rdata   : logic<64>    ;
+    var dmem_wen     : logic        ;
+    var dmem_ren     : logic        ;
+    var dmem_wstrb   : logic<8>  [8];
+    var dmem_wdata_hi: logic<64>    ;
+    var dmem_wstrb_hi: logic<8>     ;
+    var uart_tx_v    : logic        ;
+    var uart_tx_d    : logic<8>     ;
+    var dbg_r3       : logic<64> [N_HARTS];
+    var dbg_pc       : logic<64> [N_HARTS];
+    var dbg_retire_v : logic     [N_HARTS];
+    var dbg_trap_fire: logic     [N_HARTS];
+
+    inst dut: heliodor_soc_smp #(
+        N_HARTS : N_HARTS      ,
+        RESET_PC: 64'h8000_0000,
+    ) (
+        clk                           ,
+        rst                           ,
+        o_imem_addr    : imem_addr    ,
+        i_imem_rdata   : imem_rdata   ,
+        o_imem_ren     : imem_ren     ,
+        o_iptw_addr    : iptw_addr    ,
+        o_iptw_req     : iptw_req     ,
+        i_iptw_rdata   : iptw_rdata   ,
+        o_dmem_addr    : dmem_addr    ,
+        o_dmem_wdata   : dmem_wdata   ,
+        i_dmem_rdata   : dmem_rdata   ,
+        o_dmem_wen     : dmem_wen     ,
+        o_dmem_ren     : dmem_ren     ,
+        o_dmem_wstrb   : dmem_wstrb   ,
+        o_dmem_wdata_hi: dmem_wdata_hi,
+        o_dmem_wstrb_hi: dmem_wstrb_hi,
+        o_uart_tx_valid: uart_tx_v    ,
+        o_uart_tx_data : uart_tx_d    ,
+        o_dbg_r3       : dbg_r3       ,
+        o_dbg_pc       : dbg_pc       ,
+        o_dbg_retire_v : dbg_retire_v ,
+        o_dbg_trap_fire: dbg_trap_fire,
+    );
+
+    // DRAM (32 MB window, same decode as the Linux-boot harness).
+    var dram: logic<32> [8388608];
+    initial {
+        $readmemh(HEX_DRAM, dram);
+    }
+
+    // Per-hart instruction fetch + PTW: DRAM only (bare M-mode program).
+    for h in 0..N_HARTS :gen_fetch {
+        let dram_imem_idx: logic<23> = imem_addr[h][24:2];
+        assign imem_rdata[h] = if imem_addr[h][31] ? dram[dram_imem_idx] : 32'd0;
+
+        let dram_iptw_lo: logic<23> = {iptw_addr[h][24:3], 1'b0};
+        let dram_iptw_hi: logic<23> = {iptw_addr[h][24:3], 1'b1};
+        assign iptw_rdata[h] = if iptw_addr[h][31] ? {dram[dram_iptw_hi], dram[dram_iptw_lo]} : 64'd0;
+    }
+    let _unused_imem_ren: logic = imem_ren[0];
+    let _unused_iptw_req: logic = iptw_req[0];
+    let _unused_dmem_ren: logic = dmem_ren;
+    let _unused_uart    : logic = uart_tx_v & (uart_tx_d == 8'd0);
+    let _unused_r3      : logic = dbg_r3[0][0];
+
+    // Shared data reads: DRAM only (CLINT + UART served inside the SoC).
+    let in_dram        : logic     = dmem_addr[31];
+    let dram_dmem_lo   : logic<23> = {dmem_addr[24:3], 1'b0};
+    let dram_dmem_hi   : logic<23> = {dmem_addr[24:3], 1'b1};
+    let dram_dmem_nx_lo: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b0};
+    let dram_dmem_nx_hi: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b1};
+    assign dmem_rdata = if in_dram ? {dram[dram_dmem_hi], dram[dram_dmem_lo]} : 64'd0;
+
+    // Shared DRAM write (S25: line lanes + misaligned hi-side carry).
+    always_ff (clk, rst) {
+        if_reset {} else if dmem_wen && in_dram {
+            for l in 0..8 {
+                if dmem_wstrb[l] != 8'd0 {
+                    let w_lo : logic<23> = {dmem_addr[24:6], l as 3, 1'b0};
+                    let w_hi : logic<23> = {dmem_addr[24:6], l as 3, 1'b1};
+                    let w_old: logic<64> = {dram[w_hi], dram[w_lo]};
+                    let w_new: logic<64> = {
+                        if dmem_wstrb[l][7] ? dmem_wdata[l][63:56] : w_old[63:56],
+                        if dmem_wstrb[l][6] ? dmem_wdata[l][55:48] : w_old[55:48],
+                        if dmem_wstrb[l][5] ? dmem_wdata[l][47:40] : w_old[47:40],
+                        if dmem_wstrb[l][4] ? dmem_wdata[l][39:32] : w_old[39:32],
+                        if dmem_wstrb[l][3] ? dmem_wdata[l][31:24] : w_old[31:24],
+                        if dmem_wstrb[l][2] ? dmem_wdata[l][23:16] : w_old[23:16],
+                        if dmem_wstrb[l][1] ? dmem_wdata[l][15:8] : w_old[15:8],
+                        if dmem_wstrb[l][0] ? dmem_wdata[l][7:0] : w_old[7:0]
+                    };
+                    dram[w_lo] = w_new[31:0];
+                    dram[w_hi] = w_new[63:32];
+                }
+            }
+            // misaligned hi-side (next dword)
+            if dmem_wstrb_hi[0] {
+                dram[dram_dmem_nx_lo][7:0] = dmem_wdata_hi[7:0];
+            }
+            if dmem_wstrb_hi[1] {
+                dram[dram_dmem_nx_lo][15:8] = dmem_wdata_hi[15:8];
+            }
+            if dmem_wstrb_hi[2] {
+                dram[dram_dmem_nx_lo][23:16] = dmem_wdata_hi[23:16];
+            }
+            if dmem_wstrb_hi[3] {
+                dram[dram_dmem_nx_lo][31:24] = dmem_wdata_hi[31:24];
+            }
+            if dmem_wstrb_hi[4] {
+                dram[dram_dmem_nx_hi][7:0] = dmem_wdata_hi[39:32];
+            }
+            if dmem_wstrb_hi[5] {
+                dram[dram_dmem_nx_hi][15:8] = dmem_wdata_hi[47:40];
+            }
+            if dmem_wstrb_hi[6] {
+                dram[dram_dmem_nx_hi][23:16] = dmem_wdata_hi[55:48];
+            }
+            if dmem_wstrb_hi[7] {
+                dram[dram_dmem_nx_hi][31:24] = dmem_wdata_hi[63:56];
+            }
+        }
+    }
+
+    // tohost watch (PA 0x80001000 = word index 1024).
+    let tohost: logic<32> = dram[1024];
+    assign o_tohost = tohost;
+    // Barrier state watch (PA 0x80002000 count / 0x80002040 sense): the probe
+    // prints these to localize a barrier livelock (DRAM flipped but a hart
+    // spins = lost invalidate; count stuck short of N = lost arrive).
+    assign o_bar_cnt   = dram[2048];
+    assign o_bar_sense = dram[2064];
+    assign o_pass   = tohost == 32'd1;
+    assign o_fail   = (tohost != 32'd0) && (tohost != 32'd1);
+
+    // Cycle counter + per-hart retire/trap counters (liveness probes).
+    var cy       : logic<32>;
+    var ret_arr  : logic<32> [N_HARTS];
+    var trapc_arr: logic<32> [N_HARTS];
+    always_ff (clk, rst) {
+        if_reset {
+            cy = 32'd0;
+            for h in 0..N_HARTS {
+                ret_arr[h]   = 32'd0;
+                trapc_arr[h] = 32'd0;
+            }
+        } else {
+            cy = cy + 32'd1;
+            for h in 0..N_HARTS {
+                if dbg_retire_v[h] {
+                    ret_arr[h] = ret_arr[h] + 32'd1;
+                }
+                if dbg_trap_fire[h] {
+                    trapc_arr[h] = trapc_arr[h] + 32'd1;
+                }
+            }
+        }
+    }
+    assign o_cy        = cy;
+    assign o_pc_all    = dbg_pc;
+    assign o_ret_all   = ret_arr;
+    assign o_trapc_all = trapc_arr;
+
+    // On completion (tohost goes non-zero, pass or fail) dump every non-zero
+    // histogram slot: word[0x80004000 + test*64 + slot*4] = observation count.
+    // This makes the outcome DISTRIBUTION visible (e.g. SB-plain test 9 slot 0
+    // shows whether the store buffer's allowed weak outcome was exercised).
+    var dumped: logic;
+    always_ff (clk, rst) {
+        if_reset {
+            dumped = 1'b0;
+        } else if !dumped && tohost != 32'd0 {
+            dumped = 1'b1;
+            $display("[litmus] tohost=%h histogram (test/slot/count):", tohost);
+            for t in 0..11 {
+                for s in 0..16 {
+                    if dram[4096 + t * 16 + s] != 32'd0 {
+                        $display("[litmus]   test=%h slot=%h count=%h", t, s, dram[4096 + t * 16 + s]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// N=2: tests 0..9 (no IRIW). Fast enough for the default suite: the whole
+// battery is ~3M cycles. Forbidden-outcome details are in test/litmus/litmus.S.
+#[test(test_litmus_2hart)]
+module test_litmus_2hart {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass     : logic         ;
+    var fail     : logic         ;
+    var tohost   : logic<32>     ;
+    var cy       : logic<32>     ;
+    var pc_all   : logic<64> [2] ;
+    var ret_all  : logic<32> [2] ;
+    var trapc_all: logic<32> [2] ;
+
+    inst harness: test_litmus_harness #(
+        N_HARTS : 2                          ,
+        HEX_DRAM: "test/litmus/litmus_n2.hex",
+    ) (
+        clk                   ,
+        rst                   ,
+        o_pass     : pass     ,
+        o_fail     : fail     ,
+        o_tohost   : tohost   ,
+        o_cy       : cy       ,
+        o_pc_all   : pc_all   ,
+        o_ret_all  : ret_all  ,
+        o_trapc_all: trapc_all,
+    );
+
+    initial {
+        rst.assert(clk);
+        // Budget 30M cycles; the battery finishes in ~3M. The periodic probe
+        // shows per-hart PC + retire counts: a frozen retire = a deadlock
+        // (e.g. a hart stuck in the barrier) — never extend to mask it.
+        for _i in 0..3000 {
+            clk.next(10000);
+            if _i % 500 == 0 {
+                $display("  [litmus n2 probe] cy=%h pc=[%h %h] ret=[%h %h] trap=[%h %h]", cy, pc_all[0], pc_all[1], ret_all[0], ret_all[1], trapc_all[0], trapc_all[1]);
+            }
+            if pass || fail {
+                break;
+            }
+        }
+        $display("litmus(N=2): cy=%h tohost=%h pass=%b", cy, tohost, pass);
+        $assert(pass, "litmus(N=2): forbidden outcome observed or timeout (tohost: 1=pass, ((test<<8|slot)<<4)|2=violation, (mcause<<8)|0xE0=trap, 0=timeout)");
+        $finish();
+    }
+}
+
+// N=4: adds IRIW+fence (test 10); harts 2/3 also stress the barrier/bus on
+// the 2-hart tests. #[ignore] (N=4 sim is slow); run with:
+//   veryl test --ignored --test test_litmus_4hart
+#[test(test_litmus_4hart)]
+#[ignore]
+module test_litmus_4hart {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass     : logic         ;
+    var fail     : logic         ;
+    var tohost   : logic<32>     ;
+    var cy       : logic<32>     ;
+    var pc_all   : logic<64> [4] ;
+    var ret_all  : logic<32> [4] ;
+    var trapc_all: logic<32> [4] ;
+    var bar_cnt  : logic<32>     ;
+    var bar_sense: logic<32>     ;
+
+    inst harness: test_litmus_harness #(
+        N_HARTS : 4                          ,
+        HEX_DRAM: "test/litmus/litmus_n4.hex",
+    ) (
+        clk                   ,
+        rst                   ,
+        o_pass     : pass     ,
+        o_fail     : fail     ,
+        o_tohost   : tohost   ,
+        o_cy       : cy       ,
+        o_pc_all   : pc_all   ,
+        o_ret_all  : ret_all  ,
+        o_trapc_all: trapc_all,
+        o_bar_cnt  : bar_cnt  ,
+        o_bar_sense: bar_sense,
+    );
+
+    initial {
+        rst.assert(clk);
+        for _i in 0..3000 {
+            clk.next(10000);
+            if _i % 500 == 0 {
+                $display("  [litmus n4 probe] cy=%h pc=[%h %h %h %h] ret=[%h %h %h %h] bar=%h sense=%h", cy, pc_all[0], pc_all[1], pc_all[2], pc_all[3], ret_all[0], ret_all[1], ret_all[2], ret_all[3], bar_cnt, bar_sense);
+            }
+            if pass || fail {
+                break;
+            }
+        }
+        $display("litmus(N=4): cy=%h tohost=%h pass=%b", cy, tohost, pass);
+        $assert(pass, "litmus(N=4): forbidden outcome observed or timeout (tohost: 1=pass, ((test<<8|slot)<<4)|2=violation, (mcause<<8)|0xE0=trap, 0=timeout)");
+        $finish();
+    }
+}
