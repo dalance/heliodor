@@ -162,6 +162,16 @@ pub module mem_ctrl #(
     i_w_valid: input logic    ,
     i_w_addr : input logic<64>,
     i_w_hi   : input logic    ,
+    // P9.3 c2c: the granted write's data lanes. A slot waiting in LOOKUP on
+    // an owned line captures the recall's WB directly off the write channel
+    // (owner-to-requester transfer through the home) instead of re-looking
+    // the merged line up — see the c2c block below.
+    i_w_lanes: input logic<64> [8],
+    // P9.3 c2c: requester directory add, coinciding with the captured WB.
+    // The L2 applies it after the WB's owner-clear on the same edge.
+    o_w_cadd_v   : output logic   ,
+    o_w_cadd_hart: output logic<3>,
+    o_w_cadd_own : output logic   ,
 ) {
     // Slot states.
     const ST_IDLE   : logic<3> = 3'd0;
@@ -219,6 +229,37 @@ pub module mem_ctrl #(
         } else :gen_rest {
             assign lk_sel_all[h] = (st_all[h] == ST_LOOKUP) && !lk_found[h - 1];
             assign lk_found[h]   = lk_found[h - 1] || lk_sel_all[h];
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // P9.3 c2c transfer: a slot waiting in LOOKUP on line L (the verdict
+    // keeps coming back OWNED while the recall engine works) captures a
+    // granted WB to L straight off the write channel: the WB carries the
+    // owner's current (dirty) copy, so the buffer takes it and the slot
+    // streams — no re-lookup, no HWAIT. The directory is fixed up the same
+    // edge: the WB merge clears the old owner, o_w_cadd_* adds the
+    // requester (owned for an RFO; S for a READ, the same anti-ping-pong
+    // policy as the lookup grant). The writer's own slot is excluded
+    // (self-recall / own-eviction WB keeps the re-lookup path). No lk_go
+    // race exists: a WB for L implies the directory still shows L owned
+    // this cycle, so lk_hit_ok is false.
+    // ------------------------------------------------------------------
+    var c2c_go_all: logic [N_HARTS];
+    for h in 0..N_HARTS :gen_c2c {
+        assign c2c_go_all[h] = (st_all[h] == ST_LOOKUP) && i_w_valid && i_w_wb
+            && (w_line == line_all[h]) && (i_w_hart != (h as 3));
+    }
+    always_comb {
+        o_w_cadd_v    = 1'b0;
+        o_w_cadd_hart = 3'd0;
+        o_w_cadd_own  = 1'b0;
+        for h in 0..N_HARTS {
+            if c2c_go_all[h] {
+                o_w_cadd_v    = 1'b1;
+                o_w_cadd_hart = h as 3;
+                o_w_cadd_own  = rfo_all[h] || (N_HARTS == 1);
+            }
         }
     }
 
@@ -322,7 +363,16 @@ pub module mem_ctrl #(
                         // port wait, grant state) is computed at module
                         // level — lk_go_all/lk_excl_w. On a verified MISS
                         // the slot heads for DRAM.
-                        if lk_go_all[h] {
+                        // P9.3: a recall WB for this slot's line is captured
+                        // directly (c2c) — straight to STREAM.
+                        if c2c_go_all[h] {
+                            for l in 0..8 {
+                                buf_q[l] = i_w_lanes[l];
+                            }
+                            excl_q = rfo_q || (N_HARTS == 1);
+                            scnt_q = 3'd0;
+                            st_q   = ST_STREAM;
+                        } else if lk_go_all[h] {
                             for l in 0..8 {
                                 buf_q[l] = i_l2_cdata[l];
                             }
