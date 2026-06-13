@@ -70,21 +70,67 @@ op instead. Eligibility = cacheable DRAM and not a tohost page (same
 exclusions as the fast-store classifier); ineligible AMO/SC writes keep
 the legacy write-through path.
 
+### AMO/LR/SC issue at the ROB head only
+
+An AMO/LR/SC read takes no part in store-to-load forwarding, so it must
+not pass an *executed-but-uncommitted* older store to the same bytes —
+under write-through the old force-miss re-fill's latency happened to
+order it (the older store reached the committed-store buffer first); an
+owned-line hit reads instantly and exposed the hole (rv64ua amomax/amomin
+subtest 4: `sw x0` then `amomax` read stale). `iq_int` now blocks an
+AMO/LR/SC unless it is the ROB head, where every older op has retired and
+the committed-store-buffer overlap gate covers the rest.
+
+An AMO/LR read is *also* held while a younger load's **PTW walk owns the
+dmem port** (`mmu_walk_inflight`, folded into `load_blocks_on_store`):
+during a walk the dcache `i_addr` is the walk's VA, so `dc_amo_read` is 0
+(no ownership enforcement) and the AMO would capture the *walk's* read
+instead of upgrading its own line. With force-miss gone this is no longer
+masked — the AMO armed its watch on a stale S line and its commit write
+then wedged needing E/M (observed: N=2 boot per-cpu `amoadd.d`). The SC
+*write* needs no such gate — `store_drive` overrides the walk-VA pin at
+commit, so the in-cache SC merge always sees the SC's own address.
+
 ### Atomicity backstop: the AMO watch (mirror of the SC watch)
 
 Ownership can be lost between capture and commit (a remote RFO recalls
 the line, our own younger load evicts it, …). A registered per-hart
-watch — armed at the AMO read's issue ack with the line address, cleared
-at commit/redirect — poisons when the line departs (presence-check port
-+ inv/evict events, the same sources as `sc_watch`). A poisoned AMO at
-the head suppresses its store and **replays from its own PC**
-(`commit_amo_replay`, the `commit_sc_replay` shape): the re-executed AMO
-re-acquires ownership and re-reads. If the watch is clean at the commit
-write, the line was owned continuously ⇒ the RMW is atomic.
+watch — armed at the AMO read's issue ack with the line **PA** — poisons
+when the line departs (presence-check port + inv/evict events, the same
+sources as `sc_watch`). A poisoned AMO at the head suppresses its store
+and **replays from its own PC** (`commit_amo_replay`, the
+`commit_sc_replay` shape): the re-executed AMO re-acquires ownership and
+re-reads. If the watch is clean at the commit write, the line was owned
+continuously ⇒ the RMW is atomic.
 
-SC keeps its existing watch/poison/replay; its commit write just becomes
-the local merge (LR took the line E, so a still-present reservation means
-we still own it; presence loss already poisons via `sc_watch`).
+**Clear on RETIRE, not head arrival.** Because the read now issues at the
+head (above), `amo_exec_capture` fires while the AMO is already the head,
+so clearing the watch on `rob_commit_valid` would wipe it the cycle after
+it arms — before the in-cache commit write completes. The watch therefore
+clears on `rob_commit_ack` (the actual retire); the replay trigger stays
+on head-arrival + poison. Without this, an AMO whose owned line departs
+while its commit write stalls at the head wedges with no poison/replay
+(observed: N=2 boot per-cpu `amoadd.d`, `dcache_stall` stuck, watch
+already self-cleared). `sc_watch` gets the same ack-based clear.
+
+LR/SC reservations are tracked by **PA** (`rsv_pa_q`, latched from the LR
+read's translated address) — the L1 is PIPT, so the pre-P9.3 VA-based
+inv/presence compares could never match under Sv39. SC keeps its
+watch/poison/replay; its commit write becomes the local merge (LR took
+the line E, so a still-present reservation means we still own it).
+
+### Forward progress: the ownership pin self-arms in the dcache
+
+The pin (deferring a remote recall of the RMW line) **self-arms inside
+the dcache** at the cycle an AMO/LR read gets its data — an RFO fill
+completing (`DONE && fill_rfo`) or an E/M hit on a *new* line. A
+core-driven pin (gated on the reservation-seen flag) armed 2-3 cycles
+too late: a remote recall landing in the LR→read→arm gap stole the line
+every spin iteration (LR/SC livelock, litmus test 8). A spin re-reading
+the *same* line must not refresh the pin (else a remote recall starves
+past the bound); the saturating counter (limit 64) bounds the defer so no
+deadlock cycle through the single recall engine can close, and the pin
+releases early when the RMW's commit write lands.
 
 ### Forward progress: a bounded ownership pin
 

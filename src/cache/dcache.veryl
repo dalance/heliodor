@@ -16,7 +16,7 @@
 //   - every invalidation of a possibly-DIRTY line detours through the
 //     single-entry WRITEBACK BUFFER (capture + invalidate, then drain the
 //     full line over the write channel with o_memw_wb set): fill victims,
-//     AMO force-miss, misaligned self-invalidates, PROBES (recalls from
+//     misaligned self-invalidates, PROBES (recalls from
 //     the home: dirty → WB, clean → o_probe_ack), and the FLUSH sweep
 //     (i_flush_req: FENCE.I / SFENCE.VMA / satp — write back + invalidate
 //     every dirty line so the tb-direct ifetch/I-PTW see current DRAM).
@@ -36,6 +36,14 @@ pub module dcache #(
     i_addr : input  logic<64>,
     i_wdata: input  logic<64>,
     i_wen  : input  logic    ,
+    // P9.3 in-cache AMO: the i_wen write is an AMO/SC commit write to a
+    // cacheable line — merge it LOCALLY into the owned (E/M) way (line → M)
+    // with no write-channel transaction. It fires only while the line is
+    // owned here; if the line departed since the value capture the write
+    // holds (o_stall) and the core's watch poisons → commit replay drops
+    // the request. Ineligible writes (MMIO / tohost pages) tie 0 and keep
+    // the write-through path.
+    i_wen_excl: input logic,
     i_ren  : input  logic    ,
     i_wstrb: input  logic<8> ,
     // M8.B (B.3): hi-side strobe for a misaligned STORE that spans into the
@@ -49,14 +57,13 @@ pub module dcache #(
     // fills the next line too (a second sequential fill) so o_rdata_next is
     // valid before o_stall drops. Same-line spans need no extra fill. Tie 0.
     i_load_next: input logic,
-    // M9.4 SMP: this read is an AMO/LR value-capture (read-for-RMW). The bus
-    // amo_inflight lock serializes AMOs across harts, but a cache HIT returns
-    // data without a bus grant — so a hart locked out of the bus (not the
-    // amo_holder) could read a STALE cached value while a lower-id holder is
-    // mid-RMW, producing a lost update (observed as the N=4 stop_machine
-    // multi_cpu_stop ack-counter never reaching EXIT). On an AMO read that
-    // HITS, force the line to miss (invalidate + re-fill via the bus) so the
-    // value is fetched coherently under the lock. See amo_force_trigger below.
+    // P9.3 in-cache AMO: this read is an AMO/LR value-capture (read-for-RMW)
+    // and requires OWNERSHIP. An E/M hit serves locally (an owned copy is the
+    // only copy — coherent by construction); an S hit or a miss raises an RFO
+    // fill (in-place upgrade for the S case) and serves after DONE. The M9.4
+    // force-miss + bus-lock protocol is gone: RMW atomicity = ownership held
+    // from this read to the commit write (i_wen_excl), backstopped by the
+    // core's watch/replay when the line departs in between.
     i_amo_read: input logic,
     // Phase 8 S5.2: 2nd hit-only READ port (dual-issue loads, bare mode). A
     // purely combinational, additive read of the SAME tag/data arrays — no
@@ -190,6 +197,9 @@ pub module dcache #(
     o_chk_present : output logic    ,
     i_chk2_addr   : input  logic<64>,
     o_chk2_present: output logic    ,
+    // P9.3: third presence port — the core's AMO watch (RMW window).
+    i_chk3_addr   : input  logic<64>,
+    o_chk3_present: output logic    ,
     // P9.2: local line-DEPARTURE events (this cycle a valid line is being
     // dropped: fill victim, store-miss victim, misaligned self-invalidate,
     // AMO force-miss). The core feeds them to the ROB's CoRR poison scan —
@@ -319,17 +329,13 @@ pub module dcache #(
     let fill_woff    : logic<3> = if s14_cwf_en ? fill_offset + fill_count : fill_count;
     let fill_data_idx: logic<INDEX_W + 3>  = {fill_index, fill_woff};
 
-    // M9.4 SMP AMO coherence: an AMO/LR read that HITS the cache must not return
-    // a possibly-stale line (a non-amo_holder hart is locked out of the bus but
-    // a hit needs no grant). Force such a read to miss: invalidate the hit way
-    // (registered below), which makes the next cycle a normal lo_miss → fill via
-    // the bus under the amo_inflight lock → coherent value. amo_filled_q is a
-    // one-shot guard: after that forced re-fill the line is fresh, so the
-    // post-fill hit must NOT re-trigger the force (else it loops forever). It is
-    // set when the fill completes for the pending AMO read and cleared when the
-    // AMO read request drops.
-    var amo_filled_q     : logic;
-    let amo_force_trigger: logic = i_amo_read && i_ren && cache_hit && state == State::IDLE && !amo_filled_q;
+    // P9.3 in-cache AMO: an AMO/LR read serves from an OWNED (E/M) hit; an S
+    // hit must first be upgraded by an RFO fill of the same line (in place —
+    // the S way doubles as the fill victim via f_match below). amo_upg folds
+    // into `miss`, so the fill selection and o_stall handle it like any miss.
+    let hit_excl: logic = (hit_0 && excl_0[index]) || (hit_1 && excl_1[index])
+        || (hit_2 && excl_2[index]) || (hit_3 && excl_3[index]);
+    let amo_upg: logic = i_amo_read && i_ren && cache_hit && !hit_excl && (state == State::IDLE);
 
     // Invalidate decode (combinational from request port)
     let inv_tag  : logic<TAG_W> = i_inv_addr[63:INDEX_W + 6];
@@ -361,6 +367,25 @@ pub module dcache #(
     let filling: logic = state == State::FILL;
 
     // ------------------------------------------------------------------
+    // P9.3: bounded ownership PIN (forward progress for the in-cache RMW
+    // and the LR→SC window). The pin self-arms the cycle an AMO/LR read
+    // gets its data — an RFO fill completing (DONE) or an E/M hit on a NEW
+    // line (a spin re-reading the same line must NOT refresh the pin, or a
+    // remote recall starves past the bound). While armed and the saturating
+    // counter is under 64, a PROBE of the pinned line is DEFERRED (not
+    // answered; the recall engine waits). The bound keeps the defer from
+    // closing a deadlock cycle through the single engine; past it the probe
+    // proceeds and the core's watch/replay keeps correctness. The pin
+    // releases early when the RMW's commit write lands (wenl_fires) so the
+    // waiting hart gets the line immediately.
+    // (pin_arm_*/wenl_fires/hit_excl are defined below; declared-by-use is
+    // fine for the FF, the lets live near their inputs.)
+    // ------------------------------------------------------------------
+    var pin_cnt_q : logic<7> ;
+    var pin_line_q: logic<58>;
+    let probe_pinned: logic = !pin_cnt_q[6] && (i_probe_addr[63:6] == pin_line_q) && !i_probe_self;
+
+    // ------------------------------------------------------------------
     // Store-drain decode (P9.2: moved up — the store-RFO fill shares the
     // fill path below). Combinational tag-match on i_saddr, independent of
     // the i_addr read port.
@@ -385,7 +410,8 @@ pub module dcache #(
     // high until the data is present.
     let lo_miss: logic = i_ren && !cache_hit && state == State::IDLE;
     let hi_miss: logic = i_ren && i_load_next && !next_same_line && cache_hit && !next_line_hit && state == State::IDLE;
-    let miss   : logic = lo_miss || hi_miss;
+    // P9.3: an AMO read's S-hit upgrade is a miss for fill/stall purposes.
+    let miss   : logic = lo_miss || hi_miss || amo_upg;
 
     // P9.2: a FULL-LINE drain entry (all 64 bytes strobed — memset/memcpy
     // write-combining) keeps the posted WRITE-THROUGH path: an RFO would
@@ -414,11 +440,12 @@ pub module dcache #(
 
     // Fill target: the drain line for a store-RFO, else the lo line, or the
     // next line for a hi_miss (lo already cached, so lo_miss is 0).
-    let f_rfo     : logic          = srfo_sel;
+    // P9.3: an AMO/LR read's fill (miss or S upgrade) is an RFO too.
+    let f_rfo     : logic          = srfo_sel || (load_sel && i_amo_read);
     let fill_is_hi: logic          = hi_miss && !lo_miss;
-    let f_index   : logic<INDEX_W> = if f_rfo ? sindex : if fill_is_hi ? next_index : index;
-    let f_tag     : logic<TAG_W>   = if f_rfo ? stag : if fill_is_hi ? next_tag : tag;
-    let f_offset  : logic<3>       = if f_rfo ? 3'd0 : if fill_is_hi ? next_offset : offset;
+    let f_index   : logic<INDEX_W> = if srfo_sel ? sindex : if fill_is_hi ? next_index : index;
+    let f_tag     : logic<TAG_W>   = if srfo_sel ? stag : if fill_is_hi ? next_tag : tag;
+    let f_offset  : logic<3>       = if srfo_sel ? 3'd0 : if fill_is_hi ? next_offset : offset;
 
     // PLRU victim selection for the fill-target index. P9.2: a way already
     // holding the fill line (an S copy being upgraded by a store-RFO) is
@@ -533,25 +560,20 @@ pub module dcache #(
     // drain line wins over the merge (the recall must not lose the bytes:
     // the merge retries after the refetched ownership).
     // ============================================================
-    let drain_probe_clash: logic = i_probe_v && (i_probe_addr[63:6] == i_saddr[63:6]);
+    // P9.3: a PINNED (deferred) probe does not clash — it acts only after
+    // the pin releases, and the eventual capture includes the merged bytes.
+    let drain_probe_clash: logic = i_probe_v && !probe_pinned && (i_probe_addr[63:6] == i_saddr[63:6]);
     // A same-cycle fill START in the drain's SET must win: its victim could
     // be the very way this merge writes — the capture would snapshot the
     // pre-merge data and the fill then overwrites the line, silently losing
     // an ACKED store (a litmus MP violation when it was a fence-ordered
     // flag's predecessor). The merge retries next cycle.
     let drain_fill_set_clash: logic = fill_start_fire && (f_index == sindex);
-    // A same-cycle AMO FORCE-MISS on the drain's line must win too: it
-    // captures/invalidates the line this edge, so a coincident merge would
-    // write into the dying way — an ACKED store silently lost (the sb's
-    // AMO-overlap issue gate is dword-granular and misses same-line /
-    // different-dword AMOs; observed as tsk->stack keeping the memcpy'd
-    // init_task value → copy_thread memset zeroing the LIVE boot stack →
-    // kernel Oops at pc 0). The drain retries: the line is gone, the
-    // store-RFO refetches it AFTER the captured writeback drains
-    // (fill_blocked_wb), and the merge lands on top.
-    let drain_amo_clash: logic = amo_force_trigger && (tag == stag) && (index == sindex);
+    // (P9.3: the AMO force-miss is gone — an AMO read no longer invalidates
+    // a hit line, so the old drain_amo_clash same-cycle hazard no longer
+    // exists; an AMO read's S-upgrade fill is covered by the fill-set clash.)
     let store_can_drain: logic = i_swen && state == State::IDLE && !i_wen && s_hit_excl
-        && !drain_probe_clash && !drain_fill_set_clash && !drain_amo_clash;
+        && !drain_probe_clash && !drain_fill_set_clash;
     // P9.2: full-line WRITE-THROUGH drain (see s_full_line). Fires on its
     // write-channel grant; the writeback buffer outranks it there, and a
     // same-cycle fill start in the set must win (shared departure-event
@@ -693,28 +715,59 @@ pub module dcache #(
 
     // i_wen write fire (the local merge and the bus write must coincide):
     // the writeback buffer outranks it on the channel, and a misaligned
-    // store waits out its dirty detours.
+    // store waits out its dirty detours. P9.3: an in-cache AMO/SC commit
+    // write (i_wen_excl) never touches the channel — see wenl_fires below.
     let amo_miss : logic = i_ren && i_wen && !cache_hit;
-    let wen_fires: logic = i_wen && state == State::IDLE && i_memw_grant && !amo_miss
+    let wen_fires: logic = i_wen && !i_wen_excl && state == State::IDLE && i_memw_grant && !amo_miss
         && !wb_v && !mis_dirty_pending;
     let wb_fire: logic = wb_v && i_memw_grant;
 
+    // P9.3: in-cache AMO/SC commit write — merge LOCALLY into the owned
+    // (E/M) way, line → M. Same-cycle losers: a fill start in the set (its
+    // victim could be this way), an UNPINNED probe of the line (the recall
+    // must capture pre- or post-merge atomically — the merge retries or the
+    // core replays), and the same-cycle invalidate races. If the line is no
+    // longer owned here the write HOLDS (o_stall); the core's watch poisons
+    // and the commit replay drops the request.
+    let wenl_probe_clash: logic = i_probe_v && !probe_pinned && (i_probe_addr[63:6] == i_addr[63:6]);
+    let wenl_fires: logic = i_wen && i_wen_excl && (state == State::IDLE) && hit_excl
+        && !(fill_start_fire && (f_index == index)) && !wenl_probe_clash
+        && !inv_hits_active && !inv2_hits_active;
+
+    // P9.3 pin arming (see the pin block above) + counter.
+    let pin_arm_fill: logic = (state == State::DONE) && fill_rfo && i_amo_read && !fill_aborted;
+    let pin_arm_hit : logic = i_amo_read && i_ren && (state == State::IDLE) && cache_hit && hit_excl
+        && ({tag, index} != pin_line_q);
+    always_ff (clk, rst) {
+        if_reset {
+            pin_cnt_q  = 7'h40; // saturated — no pin out of reset
+            pin_line_q = '0;
+        } else if pin_arm_fill || pin_arm_hit {
+            pin_line_q = if pin_arm_hit ? {tag, index} : {fill_tag, fill_index};
+            pin_cnt_q  = '0;
+        } else if wenl_fires && (i_addr[63:6] == pin_line_q) {
+            // RMW committed — release so the waiting hart gets the line.
+            pin_cnt_q = 7'h40;
+        } else if !pin_cnt_q[6] {
+            pin_cnt_q = pin_cnt_q + 7'd1;
+        }
+    }
+
     // Capture arbitration + departure events (fill_start_fire is defined up
-    // at the fill-selection section).
+    // at the fill-selection section). P9.3: the AMO force-miss arms are gone;
+    // a PINNED probe (probe_pinned) is deferred entirely.
     let cap_fill_go: logic = fill_start_fire && vic_dirty;
-    let cap_amo_go     : logic = amo_force_trigger && hit_dirty && !wb_v && !cap_fill_go;
-    let amo_force_evt  : logic = amo_force_trigger && (!hit_dirty || cap_amo_go);
     let ev_mis_hi      : logic = wen_fires && (i_wstrb_hi != 8'd0) && next_line_hit;
-    let probe_act      : logic = i_probe_v && !probe_wb_wait && !ev_mis_hi && !amo_force_evt;
-    let cap_probe_go   : logic = probe_act && p_dirty && !wb_v && !cap_fill_go && !cap_amo_go;
+    let probe_act      : logic = i_probe_v && !probe_wb_wait && !ev_mis_hi && !probe_pinned;
+    let cap_probe_go   : logic = probe_act && p_dirty && !wb_v && !cap_fill_go;
     assign o_probe_ack = probe_act && !p_dirty;
-    let cap_mis_go    : logic = mis_dirty_pending && !wb_v && !cap_fill_go && !cap_amo_go && !cap_probe_go;
+    let cap_mis_go    : logic = mis_dirty_pending && !wb_v && !cap_fill_go && !cap_probe_go;
     let cap_mis_hi_sel: logic = !mis_lo_dirty; // lo line first, then hi
     let ev_fill_vic   : logic = fill_start_fire && vic_valid && (vic_tag != f_tag);
     let ev_mis_lo     : logic = wen_fires && (i_wstrb_hi != 8'd0) && cache_hit;
     let ev_drain_wt   : logic = wt_fires && scache_hit; // own S copy dropped
     let cap_flush_want: logic = fl_active && fl_dirty;
-    let cap_flush_go  : logic = cap_flush_want && !wb_v && !cap_fill_go && !cap_amo_go
+    let cap_flush_go  : logic = cap_flush_want && !wb_v && !cap_fill_go
         && !cap_probe_go && !cap_mis_go && !(ev_fill_vic || ev_mis_lo || ev_drain_wt);
     let fl_step      : logic = fl_active && (!cap_flush_want || cap_flush_go);
     let probe_depart : logic = probe_act && ((p_any && (!p_dirty || cap_probe_go)) || p_fill_hit);
@@ -730,7 +783,6 @@ pub module dcache #(
             fill_offset  = 3'd0;
             fill_aborted = 1'b0;
             fill_rfo     = 1'b0;
-            amo_filled_q = 1'b0;
             wb_v         = 1'b0;
             wb_line      = '0;
             fl_active    = 1'b0;
@@ -756,53 +808,8 @@ pub module dcache #(
         } else {
             case state {
                 State::IDLE: {
-                    // M9.4 SMP: force an AMO/LR read-HIT to miss by invalidating
-                    // the hit way. Next cycle cache_hit drops → lo_miss → the line
-                    // re-fills from the bus under the amo_inflight lock (coherent).
-                    // i_wen=0 for an AMO read phase, so this never races the write
-                    // block below; miss=0 here (still a hit) so no fill starts yet.
-                    // P9.2: a DIRTY hit detours through the writeback buffer
-                    // (cap_amo_go arbitration) — the invalidate waits with it.
-                    if amo_force_trigger {
-                        if hit_dirty {
-                            if cap_amo_go {
-                                wb_v    = 1'b1;
-                                wb_line = {tag, index};
-                                for l in 0..8 {
-                                    wb_data[l] = hitway_data[l];
-                                }
-                                if hit_0 {
-                                    valid_0[index] = 1'b0;
-                                    dirty_0[index] = 1'b0;
-                                }
-                                if hit_1 {
-                                    valid_1[index] = 1'b0;
-                                    dirty_1[index] = 1'b0;
-                                }
-                                if hit_2 {
-                                    valid_2[index] = 1'b0;
-                                    dirty_2[index] = 1'b0;
-                                }
-                                if hit_3 {
-                                    valid_3[index] = 1'b0;
-                                    dirty_3[index] = 1'b0;
-                                }
-                            }
-                        } else {
-                            if hit_0 {
-                                valid_0[index] = 1'b0;
-                            }
-                            if hit_1 {
-                                valid_1[index] = 1'b0;
-                            }
-                            if hit_2 {
-                                valid_2[index] = 1'b0;
-                            }
-                            if hit_3 {
-                                valid_3[index] = 1'b0;
-                            }
-                        }
-                    }
+                    // (P9.3: the M9.4 AMO force-miss invalidate is gone — an
+                    // AMO/LR read serves from an owned hit or RFO-fills.)
                     // Phase 5: gate fill start and write-through on bus grant.
                     // Without grant we hold the IDLE state and stall the pipe;
                     // memory_bus arbitrates between harts and holds grant for
@@ -919,6 +926,45 @@ pub module dcache #(
                         // (the pre-P9.2 victim invalidate was a no-allocate
                         // artifact; under MESI it would evict an innocent —
                         // possibly dirty — line for nothing).
+                    }
+                    // P9.3: in-cache AMO/SC commit write — merge into the
+                    // owned way, line goes M. Aligned single-dword by ISA
+                    // (wstrb_hi never set for AMO/SC).
+                    if wenl_fires {
+                        let lold   : logic<64> = if hit_0 ?
+                            rdata_0
+                        : if hit_1 ?
+                            rdata_1
+                        : if hit_2 ?
+                            rdata_2
+                        :
+                            rdata_3
+                        ;
+                        let lmerged: logic<64> = {
+                            if i_wstrb[7] ? i_wdata[63:56] : lold[63:56],
+                            if i_wstrb[6] ? i_wdata[55:48] : lold[55:48],
+                            if i_wstrb[5] ? i_wdata[47:40] : lold[47:40],
+                            if i_wstrb[4] ? i_wdata[39:32] : lold[39:32],
+                            if i_wstrb[3] ? i_wdata[31:24] : lold[31:24],
+                            if i_wstrb[2] ? i_wdata[23:16] : lold[23:16], if i_wstrb[1] ? i_wdata[15:8] : lold[15:8],
+                            if i_wstrb[0] ? i_wdata[7:0] : lold[7:0]
+                        };
+                        if hit_0 {
+                            data_0[data_idx] = lmerged;
+                            dirty_0[index]   = 1'b1;
+                        }
+                        if hit_1 {
+                            data_1[data_idx] = lmerged;
+                            dirty_1[index]   = 1'b1;
+                        }
+                        if hit_2 {
+                            data_2[data_idx] = lmerged;
+                            dirty_2[index]   = 1'b1;
+                        }
+                        if hit_3 {
+                            data_3[data_idx] = lmerged;
+                            dirty_3[index]   = 1'b1;
+                        }
                     }
                 }
                 State::FILL: {
@@ -1271,15 +1317,6 @@ pub module dcache #(
                 }
             }
 
-            // M9.4 SMP: AMO force-miss one-shot guard. Set when the forced
-            // re-fill for the pending AMO read completes (DONE) — the line is now
-            // fresh, so the post-fill hit must not re-trigger amo_force_trigger.
-            // Cleared when the AMO read request drops (next AMO re-arms the guard).
-            if !i_amo_read {
-                amo_filled_q = 1'b0;
-            } else if state == State::DONE {
-                amo_filled_q = 1'b1;
-            }
         }
     }
 
@@ -1361,7 +1398,7 @@ pub module dcache #(
     // granted request as a committed transaction, so a grant must ALWAYS
     // coincide with the IDLE→FILL transition.
     let want_fill_start: logic = (load_sel || srfo_sel) && !fill_blocked_wb;
-    let want_write     : logic = i_wen && !amo_miss && state == State::IDLE && !mis_dirty_pending;
+    let want_write     : logic = i_wen && !i_wen_excl && !amo_miss && state == State::IDLE && !mis_dirty_pending;
     assign o_memr_req = filling || want_fill_start;
     assign o_memw_req = wb_v || want_write || want_store_wt;
 
@@ -1505,11 +1542,9 @@ pub module dcache #(
     :
         {fl_tag, fl_set, 6'd0}
     ;
-    assign o_evict2_v    = ev_mis_hi || amo_force_evt || probe_depart;
+    assign o_evict2_v    = ev_mis_hi || probe_depart;
     assign o_evict2_addr = if ev_mis_hi ?
         {next_tag, next_index, 6'd0}
-    : if amo_force_evt ?
-        {tag, index, 6'd0}
     :
         {i_probe_addr[63:6], 6'd0}
     ;
@@ -1539,6 +1574,16 @@ pub module dcache #(
         || (valid_3[chk2_index] && tags_3[chk2_index] == chk2_tag && !(fill_busy_chk2 && fill_way == 2'd3));
     assign o_chk2_present = chk2_hit || (filling && {fill_tag, fill_index} == {chk2_tag, chk2_index} && !fill_aborted);
 
+    // P9.3: third presence port (AMO watch).
+    let chk3_tag      : logic<TAG_W>   = i_chk3_addr[63:INDEX_W + 6];
+    let chk3_index    : logic<INDEX_W> = i_chk3_addr[INDEX_W + 5:6];
+    let fill_busy_chk3: logic          = filling && fill_index == chk3_index;
+    let chk3_hit      : logic          = (valid_0[chk3_index] && tags_0[chk3_index] == chk3_tag && !(fill_busy_chk3 && fill_way == 2'd0))
+        || (valid_1[chk3_index] && tags_1[chk3_index] == chk3_tag && !(fill_busy_chk3 && fill_way == 2'd1))
+        || (valid_2[chk3_index] && tags_2[chk3_index] == chk3_tag && !(fill_busy_chk3 && fill_way == 2'd2))
+        || (valid_3[chk3_index] && tags_3[chk3_index] == chk3_tag && !(fill_busy_chk3 && fill_way == 2'd3));
+    assign o_chk3_present = chk3_hit || (filling && {fill_tag, fill_index} == {chk3_tag, chk3_index} && !fill_aborted);
+
 
 
     // Stall on miss, during fill, DONE, and writes during fill.
@@ -1547,8 +1592,12 @@ pub module dcache #(
     let write_during_fill: logic = filling && i_wen;
     // P9.2: the write FIRES only via wen_fires (buffer priority + misaligned
     // dirty detours included), so the stall covers all its hold reasons.
-    let write_wait_grant: logic = state == State::IDLE && i_wen && !amo_miss && !wen_fires;
+    // P9.3: an in-cache AMO/SC commit write holds until its local merge
+    // fires; if the line departed it holds until the core's commit replay
+    // drops the request.
+    let write_wait_grant: logic = state == State::IDLE && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
+    let write_wait_local: logic = state == State::IDLE && i_wen && i_wen_excl && !wenl_fires;
     assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
-        || inv_hits_active || inv2_hits_active || amo_force_trigger;
+        || write_wait_local || inv_hits_active || inv2_hits_active;
 
 }

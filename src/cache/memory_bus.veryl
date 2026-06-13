@@ -59,9 +59,6 @@ pub module memory_bus #(
     // does not need DRAM this cycle — L2 read-hit or idle — minus
     // same-peripheral conflicts) and the WRITE grant is gated on it, so
     // drains fill only the read channel's free slots.
-    // The AMO lock spans BOTH channels: while a hart holds it, only that
-    // hart is granted on either channel (read the old value, commit the
-    // write, with no remote write in between).
     // S25 write-combining: the write channel carries a full 64B LINE per
     // transaction — 8 dword lanes with per-lane byte strobes (hart h lane l
     // = flat index h*8+l). A single-dword write (slow store / MMIO) is a
@@ -77,14 +74,8 @@ pub module memory_bus #(
     // P9.2: per-hart WRITEBACK flag (an L1 dirty-line writeback rides the
     // write channel; the home merges it without invalidates).
     i_dmemw_wb    : input  logic     [N_HARTS]    ,
-    i_amo_inflight: input  logic     [N_HARTS]    ,
-    // P9.0: per-hart "this hart HOLDS the AMO lock NOW" (registered tenure
-    // only — the acquire cycle is excluded, because the write channel is not
-    // yet pinned that cycle). The core gates the AMO/LR value-CAPTURE on
-    // this: capturing on a mere cache hit while ANOTHER hart held the lock
-    // let a full remote RMW land between our read and our commit-write
-    // (litmus N=4 barrier amoadd lost-update livelock).
-    o_amo_lock_held: output logic    [N_HARTS]    ,
+    // (P9.3: the bus-wide AMO lock ports are gone — RMW atomicity moved
+    // into the L1 via MESI ownership; see dcache/heliodor_core.)
     i_wgrant_ok   : input  logic                  ,
     o_dmemr_grant : output logic     [N_HARTS]    ,
     o_dmemw_grant : output logic     [N_HARTS]    ,
@@ -160,34 +151,20 @@ pub module memory_bus #(
         assign o_mmio_grant[1] = grant_h1 && active1;
 
         // Phase 5 / S23 DRAM arbitration (N=2), two channels. Round-robin
-        // per channel; the AMO lock (acquired through the READ rotation —
-        // an AMO RMW starts with its forced-miss read) pins BOTH channels
-        // to the holder until its amo_inflight drops.
+        // per channel. P9.3: the bus-wide AMO lock is GONE — RMW atomicity
+        // now comes from MESI ownership in the L1 (in-cache AMO) with the
+        // core's watch/replay backstop, so neither channel is ever pinned.
         var last_granted_r_h0: logic; // 1 => hart0 was served last (read ch)
         var last_granted_w_h0: logic; // 1 => hart0 was served last (write ch)
-        var amo_holder_q     : logic; // 0 => hart0 holds, 1 => hart1 holds
-        var amo_held_q       : logic;
-        let amo_hold_valid_2: logic = amo_held_q && (if amo_holder_q ? i_amo_inflight[1] : i_amo_inflight[0]);
-        // S20R: the rotation's "wants" include WRITE requests. The AMO lock
-        // is acquired through this rotation; if writes were invisible to it
-        // (the S23 split moved them to their own channel), a hart spinning
-        // on AMOs re-acquired the lock back-to-back and a remote hart's
-        // pending drain — possibly its lock-RELEASE store sitting in the
-        // store buffer — starved forever (observed: N=2 boot wedge). A
-        // write-only hart taking a rotation slot simply yields the read
-        // channel for that cycle and gets its write through lock-free.
-        let wantr0          : logic = i_dmemr_req[0] || i_dmemw_req[0] || i_amo_inflight[0];
-        let wantr1          : logic = i_dmemr_req[1] || i_dmemw_req[1] || i_amo_inflight[1];
+        // S20R note kept for the rotation shape: the read rotation's "wants"
+        // include WRITE requests so a write-only hart takes (and yields) a
+        // rotation slot — fairness across the two channels.
+        let wantr0          : logic = i_dmemr_req[0] || i_dmemw_req[0];
+        let wantr1          : logic = i_dmemr_req[1] || i_dmemw_req[1];
         let any_wantr       : logic = wantr0 || wantr1;
         let rr_r_idx        : logic = if wantr0 && wantr1 ? last_granted_r_h0 : wantr1;
-        let amo_acquire_2   : logic = !amo_hold_valid_2 && any_wantr && (if rr_r_idx ? i_amo_inflight[1] : i_amo_inflight[0]);
-        // P9.0: registered tenure only (acquire cycle excluded — see port note).
-        assign o_amo_lock_held[0] = amo_hold_valid_2 && !amo_holder_q;
-        assign o_amo_lock_held[1] = amo_hold_valid_2 && amo_holder_q;
-        let gselr_h1        : logic = if amo_hold_valid_2 ? amo_holder_q : rr_r_idx;
-        let gvalidr_2       : logic = amo_hold_valid_2 || any_wantr;
-        let dmemr_grant_h0  : logic = gvalidr_2 && !gselr_h1;
-        let dmemr_grant_h1  : logic = gvalidr_2 && gselr_h1;
+        let dmemr_grant_h0  : logic = any_wantr && !rr_r_idx;
+        let dmemr_grant_h1  : logic = any_wantr && rr_r_idx;
         assign o_dmemr_grant[0] = dmemr_grant_h0 && i_dmemr_req[0];
         assign o_dmemr_grant[1] = dmemr_grant_h1 && i_dmemr_req[1];
 
@@ -195,17 +172,8 @@ pub module memory_bus #(
         let wantw1        : logic = i_dmemw_req[1];
         let any_wantw     : logic = wantw0 || wantw1;
         let rr_w_idx      : logic = if wantw0 && wantw1 ? last_granted_w_h0 : wantw1;
-        // P9.2: a NON-HOLDER WRITEBACK pierces the AMO-lock pinning — a
-        // recall triggered by the locked hart's own (vetoed) commit write
-        // may need the other hart's WB to drain first, and that WB needs
-        // this channel: pinning it to the holder deadlocks the pair. A WB
-        // cannot violate the RMW window (the force-miss recall flushed any
-        // WB of the target line before the value capture).
-        let wb_pierce_2: logic = if amo_holder_q ? (wantw0 && i_dmemw_wb[0]) : (wantw1 && i_dmemw_wb[1]);
-        let gselw_h1   : logic = if amo_hold_valid_2 ? (if wb_pierce_2 ? !amo_holder_q : amo_holder_q) : rr_w_idx;
-        let gvalidw_2     : logic = amo_hold_valid_2 || any_wantw;
-        let dmemw_grant_h0: logic = gvalidw_2 && !gselw_h1;
-        let dmemw_grant_h1: logic = gvalidw_2 && gselw_h1;
+        let dmemw_grant_h0: logic = any_wantw && !rr_w_idx;
+        let dmemw_grant_h1: logic = any_wantw && rr_w_idx;
         assign o_dmemw_grant[0] = dmemw_grant_h0 && i_dmemw_req[0] && i_wgrant_ok;
         assign o_dmemw_grant[1] = dmemw_grant_h1 && i_dmemw_req[1] && i_wgrant_ok;
 
@@ -214,23 +182,11 @@ pub module memory_bus #(
                 last_granted_r_h0 = 1'b0;
                 last_granted_w_h0 = 1'b0;
             } else {
-                if !amo_hold_valid_2 && any_wantr {
+                if any_wantr {
                     last_granted_r_h0 = !rr_r_idx;
                 }
-                if !amo_hold_valid_2 && any_wantw {
+                if any_wantw {
                     last_granted_w_h0 = !rr_w_idx;
-                }
-            }
-        }
-
-        always_ff (clk, rst) {
-            if_reset {
-                amo_held_q   = 1'b0;
-                amo_holder_q = 1'b0;
-            } else {
-                amo_held_q = amo_hold_valid_2 || amo_acquire_2;
-                if amo_acquire_2 {
-                    amo_holder_q = rr_r_idx;
                 }
             }
         }
@@ -320,17 +276,10 @@ pub module memory_bus #(
         }
 
         // ---- DMEM arbitration (S23: two channels) ----
-        // M9.4 SMP AMO atomicity + S15 FAIRNESS, extended to the split bus.
-        // The lock is ACQUIRED through the read-channel rotation (an AMO RMW
-        // starts with its forced-miss read) and, while held, pins BOTH
-        // channels to the holder (no remote write can slip into the RMW
-        // window through the independent write channel).
-        var amo_holder_q  : logic<2>;
-        var amo_held_q    : logic   ;
-        let amo_hold_valid: logic    = amo_held_q && i_amo_inflight[amo_holder_q];
-
+        // P9.3: the bus-wide AMO lock is GONE (RMW atomicity = L1 ownership
+        // + the core's watch/replay backstop). Plain per-channel rotation.
         // Read-channel rotation over "wants the read channel" = a live fill /
-        // miss read OR an AMO RMW window asking for the lock.
+        // miss read (write requests participate for fairness — S20R shape).
         var last_granted_r_idx: logic<2>    ;
         var cand_r            : logic<2> [4];
         for p in 0..4 :gen_cand_r {
@@ -340,24 +289,17 @@ pub module memory_bus #(
         var sel_idx_r  : logic<2> [4];
         for p in 0..4 :gen_sel_r {
             if p == 0 :gen_first {
-                // S20R: write requests participate too (see the gen_n2 note —
-                // lock re-acquisition must not starve a pending drain).
-                assign sel_found_r[p] = i_dmemr_req[cand_r[p]] || i_dmemw_req[cand_r[p]] || i_amo_inflight[cand_r[p]];
+                assign sel_found_r[p] = i_dmemr_req[cand_r[p]] || i_dmemw_req[cand_r[p]];
                 assign sel_idx_r[p]   = cand_r[p];
             } else :gen_rest {
-                assign sel_found_r[p] = sel_found_r[p - 1] || i_dmemr_req[cand_r[p]] || i_dmemw_req[cand_r[p]] || i_amo_inflight[cand_r[p]];
+                assign sel_found_r[p] = sel_found_r[p - 1] || i_dmemr_req[cand_r[p]] || i_dmemw_req[cand_r[p]];
                 assign sel_idx_r[p]   = if sel_found_r[p - 1] ? sel_idx_r[p - 1] : cand_r[p];
             }
         }
         let rr_r_found    : logic    = sel_found_r[3];
         let rr_r_idx_n4   : logic<2> = sel_idx_r[3];
-        let amo_acquire_n4: logic    = !amo_hold_valid && rr_r_found && i_amo_inflight[rr_r_idx_n4];
-        // P9.0: registered tenure only (acquire cycle excluded — see port note).
-        for h in 0..4 :gen_lockheld_n4 {
-            assign o_amo_lock_held[h] = amo_hold_valid && (amo_holder_q == (h as 2));
-        }
-        let dmemr_grant_valid: logic    = if amo_hold_valid ? 1'b1 : rr_r_found;
-        let dmemr_grant_idx  : logic<2> = if amo_hold_valid ? amo_holder_q : rr_r_idx_n4;
+        let dmemr_grant_valid: logic    = rr_r_found;
+        let dmemr_grant_idx  : logic<2> = rr_r_idx_n4;
 
         // Write-channel rotation over live write requests.
         var last_granted_w_idx: logic<2>    ;
@@ -378,45 +320,18 @@ pub module memory_bus #(
         }
         let rr_w_found: logic    = sel_found_w[3];
         let rr_w_idx_n4: logic<2> = sel_idx_w[3];
-        // P9.2: non-holder WRITEBACKs pierce the lock pinning (see gen_n2).
-        var wb_pierce_v_n4: logic    ;
-        var wb_pierce_i_n4: logic<2> ;
-        always_comb {
-            wb_pierce_v_n4 = 1'b0;
-            wb_pierce_i_n4 = 2'd0;
-            for h in 0..4 {
-                if i_dmemw_req[h] && i_dmemw_wb[h] && (amo_holder_q != (h as 2)) && !wb_pierce_v_n4 {
-                    wb_pierce_v_n4 = 1'b1;
-                    wb_pierce_i_n4 = h as 2;
-                }
-            }
-        }
-        let dmemw_grant_valid: logic    = if amo_hold_valid ? 1'b1 : rr_w_found;
-        let dmemw_grant_idx  : logic<2> = if amo_hold_valid ? (if wb_pierce_v_n4 ? wb_pierce_i_n4 : amo_holder_q) : rr_w_idx_n4;
-
-        always_ff (clk, rst) {
-            if_reset {
-                amo_held_q   = 1'b0;
-                amo_holder_q = 2'd0;
-            } else {
-                amo_held_q = amo_hold_valid || amo_acquire_n4;
-                if amo_acquire_n4 {
-                    amo_holder_q = rr_r_idx_n4;
-                }
-            }
-        }
+        let dmemw_grant_valid: logic    = rr_w_found;
+        let dmemw_grant_idx  : logic<2> = rr_w_idx_n4;
 
         always_ff (clk, rst) {
             if_reset {
                 last_granted_r_idx = 2'd3;
                 last_granted_w_idx = 2'd3;
             } else {
-                if !amo_hold_valid && rr_r_found {
-                    // Advance the rotation past the winner - including a lock
-                    // acquisition, so after the tenure the NEXT hart is served.
+                if rr_r_found {
                     last_granted_r_idx = rr_r_idx_n4;
                 }
-                if !amo_hold_valid && rr_w_found {
+                if rr_w_found {
                     last_granted_w_idx = rr_w_idx_n4;
                 }
             }
@@ -486,27 +401,7 @@ pub module memory_bus #(
         }
 
         // Phase 5 / S23 DRAM arbitration, generic N (N=1 and N>=5):
-        // lowest-id per channel; the AMO lock pins both channels.
-        var amo_found : logic    [N_HARTS];
-        var amo_idx_st: logic<3> [N_HARTS];
-        for h in 0..N_HARTS :gen_amo {
-            if h == 0 :gen_first {
-                assign amo_found[h]  = i_amo_inflight[h];
-                assign amo_idx_st[h] = 3'd0;
-            } else :gen_rest {
-                assign amo_found[h]  = amo_found[h - 1] || i_amo_inflight[h];
-                assign amo_idx_st[h] = if amo_found[h - 1] ? amo_idx_st[h - 1] : h as 3;
-            }
-        }
-        let amo_lock  : logic    = amo_found[N_HARTS - 1];
-        let amo_holder: logic<3> = amo_idx_st[N_HARTS - 1];
-        // P9.0: generic arm (N=1 / N>=5, lowest-id lock — combinational, so
-        // the "tenure" is simply being the current lowest-id inflight hart;
-        // at N=1 this reduces to lock_held[0] = inflight[0], no extra delay).
-        for h in 0..N_HARTS :gen_lockheld {
-            assign o_amo_lock_held[h] = amo_lock && (amo_holder == (h as 3));
-        }
-
+        // lowest-id per channel. P9.3: the AMO lock is gone (see gen_n2).
         var rreq_found : logic    [N_HARTS];
         var rreq_idx_st: logic<3> [N_HARTS];
         for h in 0..N_HARTS :gen_rreq {
@@ -518,8 +413,8 @@ pub module memory_bus #(
                 assign rreq_idx_st[h] = if rreq_found[h - 1] ? rreq_idx_st[h - 1] : h as 3;
             }
         }
-        let dmemr_grant_valid: logic    = if amo_lock ? 1'b1 : rreq_found[N_HARTS - 1];
-        let dmemr_grant_idx  : logic<3> = if amo_lock ? amo_holder : rreq_idx_st[N_HARTS - 1];
+        let dmemr_grant_valid: logic    = rreq_found[N_HARTS - 1];
+        let dmemr_grant_idx  : logic<3> = rreq_idx_st[N_HARTS - 1];
 
         var wreq_found : logic    [N_HARTS];
         var wreq_idx_st: logic<3> [N_HARTS];
@@ -532,21 +427,8 @@ pub module memory_bus #(
                 assign wreq_idx_st[h] = if wreq_found[h - 1] ? wreq_idx_st[h - 1] : h as 3;
             }
         }
-        // P9.2: non-holder WRITEBACKs pierce the lock pinning (see gen_n2).
-        var wb_pierce_v_g: logic    ;
-        var wb_pierce_i_g: logic<3> ;
-        always_comb {
-            wb_pierce_v_g = 1'b0;
-            wb_pierce_i_g = 3'd0;
-            for h in 0..N_HARTS {
-                if i_dmemw_req[h] && i_dmemw_wb[h] && (amo_holder != (h as 3)) && !wb_pierce_v_g {
-                    wb_pierce_v_g = 1'b1;
-                    wb_pierce_i_g = h as 3;
-                }
-            }
-        }
-        let dmemw_grant_valid: logic    = if amo_lock ? 1'b1 : wreq_found[N_HARTS - 1];
-        let dmemw_grant_idx  : logic<3> = if amo_lock ? (if wb_pierce_v_g ? wb_pierce_i_g : amo_holder) : wreq_idx_st[N_HARTS - 1];
+        let dmemw_grant_valid: logic    = wreq_found[N_HARTS - 1];
+        let dmemw_grant_idx  : logic<3> = wreq_idx_st[N_HARTS - 1];
 
         for h in 0..N_HARTS :gen_rgrant {
             assign o_dmemr_grant[h] = dmemr_grant_valid && (h == dmemr_grant_idx) && i_dmemr_req[h];

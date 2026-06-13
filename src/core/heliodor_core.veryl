@@ -112,18 +112,8 @@ pub module heliodor_core #(
     // and all the same core-side consumers as port 1. Tie to 0 where unused.
     i_dcache_inv2_valid: input logic    ,
     i_dcache_inv2_addr : input logic<64>,
-    // M9 SMP: high while this hart has an AMO/LR/SC mid-RMW (read captured at
-    // issue, write pending at commit). Fed to memory_bus.i_amo_inflight so the
-    // bus locks to this hart for the whole window → the RMW is bus-atomic.
-    o_amo_inflight: output logic,
-    // P9.0: high while the memory_bus AMO lock is HELD BY THIS HART (the
-    // bus's registered tenure; the acquire cycle is excluded). The AMO/LR
-    // value-capture is gated on it — asserting o_amo_inflight alone does NOT
-    // mean we own the lock (another inflight hart may win the rotation), and
-    // a capture that needs no bus grant (cache hit / pre-lock fill) would
-    // otherwise read a value a remote locked RMW is about to overwrite.
-    // Single-hart SoCs / harnesses tie this to 1.
-    i_amo_locked: input logic,
+    // (P9.3: the M9.4 o_amo_inflight / i_amo_locked bus-lock ports are gone —
+    // RMW atomicity is in-cache: L1 ownership + the AMO-watch commit replay.)
 
     // M8.C: external IRQ pins (CLINT / PLIC). Drive low if no SoC.
     i_irq_timer_m: input logic,
@@ -503,6 +493,10 @@ pub module heliodor_core #(
     // SC-watch logic and the ROB CoRR poison ports above the instance).
     var dc_rsv_present: logic    ;
     var dc_scw_present: logic    ;
+    var dc_amo_present: logic    ; // P9.3: AMO-watch line presence (chk3)
+    // P9.3: declared early — the rsv / AMO-watch PA latches (always_ff
+    // blocks well above the dmem_mmu inst) read the translated address.
+    var dmu_dmem_addr : logic<64>;
     var dc_evict1_v   : logic    ;
     var dc_evict1_addr: logic<64>;
     var dc_evict2_v   : logic    ;
@@ -1546,7 +1540,6 @@ pub module heliodor_core #(
     var issue2_fire          : logic                    ;
     var rob_has_pending_store: logic                    ;
     var rob_has_pending_xlate: logic                    ; // M9.A.298 translation-barrier
-    var rob_has_pending_amo  : logic                    ; // M9 SMP: AMO RMW bus lock
     // Phase 8 S5.1 store-to-load: age-relative gate (from u_rob) + the ROB's
     // per-entry store shadow (FF-derived). The byte-granular forward is computed
     // HERE in the core (below, after agu_addr_iss) — the ROB store arrays and
@@ -1602,6 +1595,13 @@ pub module heliodor_core #(
 
     var rsv_valid_q: logic    ;
     var rsv_addr_q : logic<64>;
+    // P9.3: the reservation's PHYSICAL address, latched from the LR read's
+    // translated dmem address. The dcache presence check and the precise-inv
+    // compares are PA-based (the L1 is PIPT) — under Sv39 the old VA-based
+    // compares could never match, leaving VM reservations effectively
+    // unclearable by remote writes. rsv_addr_q (VA) stays for the SC's own
+    // program-order address match (sc_match / issue_addr_match).
+    var rsv_pa_q: logic<64>;
     // M9.4 SMP: the rob_idx of the LR that set the reservation. Used by the age gate
     // in sc_may_clear so an OoO-reordered OLDER sc.w (issuing after a YOUNGER lr.w,
     // e.g. when its result op was delayed by a force-miss fill under N=4 bus
@@ -1617,11 +1617,22 @@ pub module heliodor_core #(
 
     // M9.4 SMP: SC commit-time re-validation state (declared early so the
     // commit-redirect always_ff can read it; logic + comment near the
-    // reservation always_ff below).
+    // reservation always_ff below). P9.3: sc_watch_addr_q holds the PA
+    // (= rsv_pa_q at arm) — presence/inv tracking is PA-based.
     var sc_watch_valid_q: logic           ;
     var sc_watch_addr_q : logic<64>       ;
     var sc_watch_rob_q  : logic<ROB_IDX_W>;
     var sc_poison_q     : logic           ;
+    // P9.3: AMO watch — the in-cache RMW window [value capture → commit
+    // write]. Armed at the AMO read's issue ack with the translated PA;
+    // poisoned when the line departs the L1 (presence / precise-inv /
+    // departure events); a poisoned AMO at commit suppresses its store and
+    // replays from its own PC (commit_amo_replay — the sc_watch shape).
+    // While clean it also drives the dcache's bounded ownership PIN.
+    var amo_watch_valid_q: logic           ;
+    var amo_watch_pa_q   : logic<64>       ;
+    var amo_watch_rob_q  : logic<ROB_IDX_W>;
+    var amo_poison_q     : logic           ;
 
     // M5.D.2: dmem_mmu busy stall — issue is held while MMU is in PTW
     // / dcache-stall. In Bare mode busy stays 0 so behavior is
@@ -1669,39 +1680,11 @@ pub module heliodor_core #(
     let cdb_dest_is_fp: logic = if fpu_cdb.valid ? !iqf_iss_wr_int : iq_iss_fp_ld;
     // rs2 operand fed to the ALU: FP store data from prf_fp, else int rs2.
     let alu_rs2_data: logic<64> = if iq_iss_fp_st ? prf_fp_store_data : prf_rs2_data;
-    // M9 SMP: bus-atomic AMO lock. An AMO/LR/SC computes its write value from a
-    // memory READ at issue and writes it at COMMIT; no remote hart may write the
-    // location in between. o_amo_inflight feeds memory_bus.i_amo_inflight, which
-    // locks the shared bus to this hart across that window. Coverage is split to
-    // stay comb-loop-free (o_amo_inflight must NOT depend on i_dmem_grant, or
-    // o_amo_inflight→grant→dcache_stall→issue→o_amo_inflight would close a loop):
-    //   - amo_read_pending_q: registered from the grant-independent IQ select.
-    //     We DELAY the AMO's value-capture by one cycle (amo_issue_lock_ok gates
-    //     the alu i_issue_valid + iq_issue_ack) so the lock is already asserted
-    //     the cycle the AMO actually reads. Only AMOs whose operands are ready
-    //     are selected, so this never locks behind a remote-dependent spin.
-    //   - rob_has_pending_amo: registered ROB scan (sh_rw), holds the lock from
-    //     the read until commit and is squash-safe (a flushed AMO leaves the scan).
-    var amo_read_pending_q: logic;
-    always_ff (clk, rst) {
-        if_reset {
-            amo_read_pending_q = 1'b0;
-        } else {
-            amo_read_pending_q = iq_issue_valid && iq_iss_is_amo;
-        }
-    }
-    // P9.0: the capture additionally requires the bus lock to be HELD BY US
-    // (i_amo_locked). amo_read_pending_q only guarantees our inflight is
-    // visible to the bus — with >2 harts contending, another inflight hart
-    // can win the acquisition rotation, and if our read is servable WITHOUT
-    // a bus grant (cache hit, or a fill that ran in a no-holder window) we
-    // captured a value the lock holder's RMW then overwrote: the litmus N=4
-    // barrier amoadd read count=0, two remote locked RMWs landed (1, 2), and
-    // our stale 0+1=1 commit-write clobbered them → barrier livelock. The IQ
-    // keeps the AMO selected while the capture waits, so inflight stays up
-    // and the FCFS rotation eventually grants us the lock — no deadlock.
-    let amo_issue_lock_ok: logic = !iq_iss_is_amo || (amo_read_pending_q && i_amo_locked);
-    assign o_amo_inflight = amo_read_pending_q || rob_has_pending_amo;
+    // P9.3 in-cache AMO: the M9.4 bus-atomic AMO lock (amo_read_pending_q /
+    // amo_issue_lock_ok / o_amo_inflight) is GONE. The AMO/LR read acquires
+    // the line E/M in the L1 (RFO), the commit write merges locally, and a
+    // line departure inside the RMW window poisons the AMO watch (below) for
+    // a commit-time replay — no bus-wide serialization, no issue bubble.
     // Phase 8 S10.3: dcache_stall now gates ONLY ops that read the dcache at
     // issue (loads incl. FP loads, and AMO/LR/SC value-capture reads). Stores
     // (AGU-only at issue; their write drains at commit, separately gated),
@@ -1725,7 +1708,7 @@ pub module heliodor_core #(
         cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : alu_cdb;
     }
     inst u_alu: alu_wrap (
-        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && amo_issue_lock_ok && !load_blocks_on_store,
+        i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -1836,7 +1819,7 @@ pub module heliodor_core #(
     // fill-start cycle (mshr_capture) even though dcache_stall holds — its
     // writeback is deferred to the MSHR; u_alu.i_issue_valid stays suppressed
     // that cycle (iss_dc_ok=0 for a load under stall), so no CDB write happens.
-    let iq_issue_ack: logic = (iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && amo_issue_lock_ok && !load_blocks_on_store) || mshr_capture;
+    let iq_issue_ack: logic = (iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store) || mshr_capture;
 
     // ============================================================
     // PRF
@@ -2458,7 +2441,6 @@ pub module heliodor_core #(
         o_commit_store_funct3: c_store_funct3       ,
         o_has_pending_store  : rob_has_pending_store,
         o_has_pending_xlate  : rob_has_pending_xlate,
-        o_has_pending_amo    : rob_has_pending_amo  ,
         // Phase 8 S5.1 store-to-load gate + per-entry store shadow (forwarded to
         // alu_wrap for the local byte-network).
         o_block_store_exists : rob_block_store_exists,
@@ -3037,6 +3019,13 @@ pub module heliodor_core #(
             // `commit_sc_replay` let is defined later, near the SC-watch logic).
             redirect_fire_q = 1'b1;
             redirect_pc_q   = c_pc;
+        } else if amo_watch_valid_q && rob_commit_valid && rob_commit_idx == amo_watch_rob_q && amo_poison_q {
+            // P9.3: a poisoned in-cache AMO (its line departed between the
+            // value capture and the commit write) — store suppressed,
+            // re-fetch the AMO so it re-acquires ownership and re-reads.
+            // (= commit_amo_replay, inlined like the SC arm above.)
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = c_pc;
         } else if rob_commit_valid && c_load_poison {
             // Phase 8 S9: a poisoned LOAD at commit — re-fetch its own PC so it
             // re-executes against the now-committed older store (correct data),
@@ -3459,6 +3448,7 @@ pub module heliodor_core #(
         if_reset {
             rsv_valid_q = 1'b0;
             rsv_addr_q  = 64'd0;
+            rsv_pa_q    = 64'd0;
             rsv_rob_q   = '0;
         } else if commit_trap || commit_mret || commit_sret || commit_csrw_satp {
             // M9.4 SMP: clear the LR/SC reservation only on ARCHITECTURAL control
@@ -3480,24 +3470,29 @@ pub module heliodor_core #(
             // amo_at_head restricts AMO/LR/SC issue to the non-speculative ROB head.
             rsv_valid_q = 1'b0;
         } else if issue_is_lr && iq_issue_ack {
-            // M9 SMP: gate the reservation updates on iq_issue_ack (ACTUAL issue),
-            // not bare selection. The AMO/LR/SC issue is now delayed one cycle by
-            // amo_issue_lock_ok (bus-lock bubble); a selection-time clear would
-            // fire DURING that bubble, one cycle before the SC's sc_match check
-            // in alu_wrap (which runs at the delayed issue) — clearing the
-            // reservation before its own check, so every SC failed. Tying these
-            // to iq_issue_ack keeps the clear and the check on the same cycle:
-            // sc_match reads the pre-edge reservation, the clear applies the edge.
+            // M9 SMP: gate the reservation updates on iq_issue_ack (ACTUAL
+            // issue), not bare selection — a selection-time update can fire
+            // on a cycle the op does not actually issue (e.g. a dcache-stall
+            // hold), desynchronizing it from the SC's sc_match check in
+            // alu_wrap. Tying these to iq_issue_ack keeps the clear and the
+            // check on the same cycle: sc_match reads the pre-edge
+            // reservation, the clear applies the edge. (P9.3: the M9.4
+            // bus-lock issue bubble this note used to describe is gone.)
             rsv_valid_q = 1'b1;
             rsv_addr_q  = agu_addr_iss;
-            rsv_rob_q   = iq_iss_rob_idx;
-        } else if (i_dcache_inv_valid && i_dcache_inv_addr[63:3] == rsv_addr_q[63:3])
-            || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:3] == rsv_addr_q[63:3]) {
-            // M9 SMP: a remote hart's store hit our reserved dword — kill the
-            // reservation so a following SC fails (matches RVWMO). dword-granular
-            // (not line) to avoid false-sharing livelock. Placed after the LR set
-            // so a fresh LR this cycle wins over a remote write to the OLD addr.
-            // P9.2: port 2 covers a remote misaligned store's hi line.
+            // P9.3: the LR read drives the dmem port this cycle, so
+            // dmu_dmem_addr is its TRANSLATED PA (== VA in bare mode).
+            rsv_pa_q  = dmu_dmem_addr;
+            rsv_rob_q = iq_iss_rob_idx;
+        } else if (i_dcache_inv_valid && i_dcache_inv_addr[63:6] == rsv_pa_q[63:6])
+            || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == rsv_pa_q[63:6]) {
+            // M9 SMP: a remote hart's store hit our reserved line — kill the
+            // reservation so a following SC fails (matches RVWMO). Placed
+            // after the LR set so a fresh LR this cycle wins over a remote
+            // write to the OLD addr. P9.2: port 2 covers a remote misaligned
+            // store's hi line. P9.3: PA-compare, LINE-granular (the precise
+            // inv pulses are line-aligned — the old [63:3] dword compare
+            // only ever matched dword 0; presence covers the rest anyway).
             rsv_valid_q = 1'b0;
         } else if rsv_present_seen_q && !dc_rsv_present {
             // P9.2 (precise invalidation): the reserved LINE left the L1 —
@@ -3551,23 +3546,54 @@ pub module heliodor_core #(
     // rsv_valid_q so the commit-redirect always_ff can read them.)
     // A matched SC issues this cycle (it will fire a store at commit):
     let sc_exec_match  : logic = issue_is_sc && iq_issue_ack && issue_addr_match;
-    // A remote write hits the watched SC's reserved dword (dword-granular,
-    // matching the reservation grain at the remote-clear above). P9.2: also
-    // poison when the watched LINE leaves the L1 (presence drop) — from then
-    // on remote writes to it are invisible here (precise invalidation), so
-    // the watch can no longer be trusted; the replayed SC fails cleanly.
-    // (The line is present when the watch starts: sc_match required a valid
-    // reservation, and rsv_valid ⇒ present.)
-    let sc_remote_hit: logic = sc_watch_valid_q && ((i_dcache_inv_valid && i_dcache_inv_addr[63:3] == sc_watch_addr_q[63:3])
-        || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:3] == sc_watch_addr_q[63:3]) || !dc_scw_present);
-    // The watched SC is the op committing this cycle:
-    let sc_watch_commit: logic = sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q;
-    // Poisoned watched SC at its commit -> replay (fail it):
-    let commit_sc_replay: logic = sc_watch_commit && sc_poison_q;
+    // A remote write hits the watched SC's reserved line. P9.2: also poison
+    // when the watched LINE leaves the L1 (presence drop) — from then on
+    // remote writes to it are invisible here (precise invalidation), so the
+    // watch can no longer be trusted; the replayed SC fails cleanly.
+    // P9.3: sc_watch_addr_q is the PA (= rsv_pa_q at arm; same location —
+    // issue_addr_match held), line-granular like the rsv clear above.
+    let sc_remote_hit: logic = sc_watch_valid_q && ((i_dcache_inv_valid && i_dcache_inv_addr[63:6] == sc_watch_addr_q[63:6])
+        || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == sc_watch_addr_q[63:6]) || !dc_scw_present);
+    // The watched SC is at the ROB head this cycle (the replay trigger):
+    let sc_at_head: logic = sc_watch_valid_q && rob_commit_valid && rob_commit_idx == sc_watch_rob_q;
+    // Poisoned watched SC at the head -> replay (fail it):
+    let commit_sc_replay: logic = sc_at_head && sc_poison_q;
+    // P9.3: clear the SC watch only on its actual RETIRE (rob_commit_ack),
+    // not on head arrival — same reason as amo_watch_retire (the at-head SC
+    // issue makes execute coincide with the head, so a valid-based clear
+    // would wipe the watch before the in-cache SC store completes).
+    let sc_watch_retire: logic = sc_watch_valid_q && rob_commit_ack && rob_commit_idx == sc_watch_rob_q;
+    // ============================================================
+    // P9.3: AMO watch — the in-cache RMW atomicity backstop (sc_watch
+    // shape). The AMO read captured its value from an OWNED (E/M) line; if
+    // that line departs the L1 before the commit write (remote RFO recall,
+    // own eviction, …), the captured value may be stale — POISON the AMO,
+    // suppress its store at commit and replay from its own PC. The
+    // re-executed AMO re-acquires ownership and re-reads. If the watch is
+    // clean at commit, ownership was held continuously ⇒ the RMW is atomic.
+    // ============================================================
+    let issue_is_realamo: logic = issue_is_amo && !issue_is_lr && !issue_is_sc;
+    let amo_exec_capture: logic = issue_is_realamo && iq_issue_ack;
+    let amo_remote_hit  : logic = amo_watch_valid_q && ((i_dcache_inv_valid && i_dcache_inv_addr[63:6] == amo_watch_pa_q[63:6])
+        || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == amo_watch_pa_q[63:6]) || !dc_amo_present);
+    // The watched AMO is at the ROB head this cycle (may not retire yet —
+    // its commit write can stall waiting on the line / sb drain):
+    let amo_at_head      : logic = amo_watch_valid_q && rob_commit_valid && rob_commit_idx == amo_watch_rob_q;
+    // Poisoned watched AMO at the head -> replay (re-acquire + re-read):
+    let commit_amo_replay: logic = amo_at_head && amo_poison_q;
+    // P9.3: the watch CLEARS only on the AMO's actual RETIRE (rob_commit_ack),
+    // NOT on mere head arrival. With the at-head AMO-issue restriction the
+    // read executes WHILE the AMO is the head, so a rob_commit_valid clear
+    // would wipe the watch the cycle after it arms — before the commit write
+    // completes — leaving the RMW unprotected if the line departs while the
+    // store stalls at the head (observed: N=2 boot per-cpu amoadd.d wedge,
+    // dcache_stall stuck, watch already cleared, no poison/replay). An
+    // ack-based clear keeps the watch live across the whole stall window.
+    let amo_watch_retire : logic = amo_watch_valid_q && rob_commit_ack && rob_commit_idx == amo_watch_rob_q;
     // Phase 8 S1: slot-0 (head) triggers a redirect this cycle? If so the head+1
     // op is wrong-path (will be squashed) and must NOT retire in slot-1. Mirrors
     // every arm of the commit redirect always_ff.
-    let commit_redirect: logic = commit_trap || commit_mret || commit_sret || c_bp_mispredict || commit_sc_replay || commit_load_replay || commit_csrw_satp || commit_fence_i_pulse;
+    let commit_redirect: logic = commit_trap || commit_mret || commit_sret || c_bp_mispredict || commit_sc_replay || commit_amo_replay || commit_load_replay || commit_csrw_satp || commit_fence_i_pulse;
     // Slot-1 retires only when slot-0 actually retires (rob_commit_ack), slot-0
     // does not redirect, and head+1 is a simple integer op (c2_valid from ROB).
     // Phase 8 S8.E: suppress the 2-wide commit on an early-squash cycle. c2_valid is
@@ -3590,16 +3616,19 @@ pub module heliodor_core #(
             sc_poison_q      = 1'b0;
         } else if sc_exec_match {
             sc_watch_valid_q = 1'b1;
-            sc_watch_addr_q  = agu_addr_iss;
-            sc_watch_rob_q   = iq_iss_rob_idx;
+            // P9.3: track the PA — the reservation's PA is this SC's PA
+            // (issue_addr_match ⇒ same VA ⇒ same translation; sfence/satp
+            // in between are serializing and clear the reservation).
+            sc_watch_addr_q = rsv_pa_q;
+            sc_watch_rob_q  = iq_iss_rob_idx;
             // Same-cycle remote write to the new SC's line also poisons it.
             // P9.2: + 2nd inv port; + the line already absent at issue (the
             // presence-clear arm races this SC's issue — dc_rsv_present IS
             // the SC line's presence here, since issue_addr_match held).
-            sc_poison_q = (i_dcache_inv_valid && i_dcache_inv_addr[63:3] == agu_addr_iss[63:3])
-                || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:3] == agu_addr_iss[63:3])
+            sc_poison_q = (i_dcache_inv_valid && i_dcache_inv_addr[63:6] == rsv_pa_q[63:6])
+                || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == rsv_pa_q[63:6])
                 || (rsv_present_seen_q && !dc_rsv_present);
-        } else if sc_watch_commit {
+        } else if sc_watch_retire {
             sc_watch_valid_q = 1'b0;
             sc_poison_q      = 1'b0;
         } else if sc_remote_hit {
@@ -3607,10 +3636,44 @@ pub module heliodor_core #(
         }
     }
 
+    // P9.3: AMO watch state (see the commit_amo_replay block above).
+    always_ff (clk, rst) {
+        if_reset {
+            amo_watch_valid_q = 1'b0;
+            amo_watch_pa_q    = 64'd0;
+            amo_watch_rob_q   = '0;
+            amo_poison_q      = 1'b0;
+        } else if redirect_fire_q {
+            // Any flush (incl. this fix's own replay) clears the watch.
+            amo_watch_valid_q = 1'b0;
+            amo_poison_q      = 1'b0;
+        } else if amo_exec_capture {
+            amo_watch_valid_q = 1'b1;
+            // The AMO read drives the dmem port this cycle — dmu_dmem_addr
+            // is its translated PA (the L1/presence tracking is PIPT).
+            amo_watch_pa_q  = dmu_dmem_addr;
+            amo_watch_rob_q = iq_iss_rob_idx;
+            // Same-cycle departure of the captured line poisons immediately
+            // (the registered presence port still checks the OLD watch
+            // address this cycle): both precise-inv ports + both dcache
+            // line-departure event ports, line-granular on the PA.
+            amo_poison_q = (i_dcache_inv_valid && i_dcache_inv_addr[63:6] == dmu_dmem_addr[63:6])
+                || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == dmu_dmem_addr[63:6])
+                || (dc_evict1_v && dc_evict1_addr[63:6] == dmu_dmem_addr[63:6])
+                || (dc_evict2_v && dc_evict2_addr[63:6] == dmu_dmem_addr[63:6]);
+        } else if amo_watch_retire {
+            amo_watch_valid_q = 1'b0;
+            amo_poison_q      = 1'b0;
+        } else if amo_remote_hit {
+            amo_poison_q = 1'b1;
+        }
+    }
+
     // STORE write fires at commit when the head entry is a store.
     // M6.B.4: suppress a faulted/FS-disabled FP store's memory write.
     // M9.4: suppress a poisoned SC's store (it is being replayed to fail).
-    let commit_store_fire: logic = rob_commit_valid && c_is_store && !c_illegal && !commit_priv_illegal && !commit_sc_replay;
+    // P9.3: a poisoned AMO's store is suppressed the same way (replayed).
+    let commit_store_fire: logic = rob_commit_valid && c_is_store && !c_illegal && !commit_priv_illegal && !commit_sc_replay && !commit_amo_replay;
 
     // funct3 → wstrb (size mask) shifted by byte offset (lo 3 bits)
     let st_byte_off : logic<3> = c_store_addr[2:0];
@@ -3776,7 +3839,16 @@ pub module heliodor_core #(
     assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && sb_ld_ovl)
         || (issue_is_load && !issue_amo_read && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
         || (issue_is_load && sb_cnt >= 4'd3)
-        || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])));
+        || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])))
+        // P9.3: an AMO/LR read must NOT issue while a younger load's PTW walk
+        // owns the dmem port (mmu_walk_inflight) — the dcache i_addr is the
+        // walk's VA then, so dc_amo_read is 0 (no ownership enforcement) and
+        // the AMO would capture the WALK's read instead of upgrading its own
+        // S line to E. With force-miss gone (P9.3), an owned-line hit serves
+        // instantly and exposed this: the AMO armed its watch on a stale S
+        // line, then its commit write wedged (needs E/M) with no poison
+        // (the line is present). Hold the read until the walk drains.
+        || (issue_amo_read && mmu_walk_inflight);
     // Phase 8 S10.5: !replay_q — no NEW dmem-MMU request while a queued-MSHR
     // replay drives the dcache port. Without this, a TLB-missing load selected
     // on slot-0 starts a PTW walk on a replay cycle (walk_v_q is not set yet,
@@ -3814,15 +3886,15 @@ pub module heliodor_core #(
     }
     let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || (mmu_walk_inflight && !sb_walk_ovl);
     let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
-    // M9.4 SMP: mark the AMO/LR data read so the dcache forces a coherent,
-    // bus-serialized re-fill instead of returning a possibly-stale cache HIT
-    // while this hart is locked out of the bus by a lower-id amo_holder (the
-    // N=4 stop_machine lost-update root cause). Excludes the PTE-walk read
-    // (mmu_walk_inflight drives core_dmem_ren for the walk, not the AMO) and
-    // redirect/flush cycles. SC is not an issue_amo_read so it is unaffected.
-    // Phase 8 S6: also suppress while the AMO read is held behind a committing
-    // fast store (load_blocks_on_store) so it neither reads stale data nor fires
-    // amo_force_trigger (invalidate + re-fill) on a line the fast store is writing.
+    // P9.3: mark the AMO/LR data read so the dcache serves it only from an
+    // OWNED (E/M) line — an S hit or a miss raises an RFO fill first (the
+    // in-cache RMW: the commit write then merges locally; a departure in
+    // between poisons the AMO watch for a commit replay). Excludes the
+    // PTE-walk read (mmu_walk_inflight drives core_dmem_ren for the walk,
+    // not the AMO) and redirect/flush cycles. SC is not an issue_amo_read.
+    // Phase 8 S6: also suppress while the AMO read is held behind a
+    // committing fast store (load_blocks_on_store) so it does not read
+    // stale data on a line the fast store is writing.
     let dc_amo_read    : logic    = issue_amo_read && !mmu_walk_inflight && !redirect_fire && !load_blocks_on_store;
 
     // ============================================================
@@ -3987,7 +4059,8 @@ pub module heliodor_core #(
     // for forward use by iq_int gate and alu_wrap fault inputs.
     var dmem_mmu_rdv: logic;
     // Internal dmem signals from dmem_mmu, muxed below with imem PTW.
-    var dmu_dmem_addr : logic<64>;
+    // (dmu_dmem_addr is declared up near the presence-check vars — the
+    // P9.3 rsv/AMO-watch PA latches read it from earlier always_ff blocks.)
     var dmu_dmem_wdata: logic<64>;
     var dmu_dmem_wen  : logic    ;
     var dmu_dmem_ren  : logic    ;
@@ -4542,6 +4615,19 @@ pub module heliodor_core #(
     // cycles the lo write itself can own the W channel.
     let dc_i_wen      : logic    = dmu_dmem_wen && !sb_vm_ok && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl);
     let dc_st_wstrb_hi: logic<8> = if dc_i_wen ? st_wstrb_hi : 8'd0;
+    // P9.3: in-cache AMO/SC commit write — eligible when the committing
+    // store is an AMO/SC to a cacheable DRAM PA outside the tohost pages
+    // (mirrors the fast-store / sb_vm_ok exclusions: the harnesses watch
+    // the DRAM array, and MMIO is uncacheable). The dcache merges it into
+    // the owned line locally (no write channel); ineligible AMO/SC writes
+    // keep the write-through path.
+    let st_pa_w      : logic<64> = if dmem_vm_on ? dmu_dmem_addr : c_store_addr;
+    let st_pa_tohost : logic     = (st_pa_w[31:14] == 18'h20000) || (st_pa_w[31:12] == 20'h80008);
+    let dc_wen_excl  : logic     = c_is_amo && !c_store_mmio && !st_pa_tohost;
+    // (P9.3: the ownership pin is dcache-internal — it self-arms at the
+    // AMO/LR read's data arrival, which closes the issue→pin arming gap a
+    // core-driven pin had: remote recalls landing in that 2-3 cycle window
+    // stole the reservation every spin iteration — LR/SC livelock.)
     // dc_load_next: the issuing LOAD's data spans into the next dword
     // (byte_off + size > 8); the dcache fills the next line when it crosses one.
     let dc_byte_off: logic<3> = dmu_dmem_addr[2:0];
@@ -4632,11 +4718,12 @@ pub module heliodor_core #(
         // the SAME dwords (overlap; AMO additionally needs full-empty — its
         // retire ack holds with the same condition, see rob_commit_ack).
         i_wen            : dc_i_wen                      ,
+        i_wen_excl       : dc_wen_excl                   , // P9.3: in-cache AMO/SC local merge
         i_ren            : dmu_dmem_ren || replay_drive  ,
         i_wstrb          : dmu_dmem_wstrb                ,
         i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
         i_load_next      : dc_load_next && !replay_drive , // B.3: misaligned cross-line load fill
-        i_amo_read       : dc_amo_read && !replay_drive  , // M9.4: AMO/LR read → force coherent re-fill
+        i_amo_read       : dc_amo_read && !replay_drive  , // P9.3: AMO/LR read → ownership (RFO)
         // Phase 8 S5.2: 2nd hit-only read port (dual-issue loads). Tied off in
         // step 1; wired to the slot-1 load AGU/result in steps 2-3.
         i_addr2          : dc_addr2                       ,
@@ -4691,10 +4778,12 @@ pub module heliodor_core #(
         // P9.2: line-presence checks — LR/SC reservation + SC watch. The core
         // clears/poisons them the moment the line leaves the L1 (under
         // precise invalidation an uncached line gets no remote-write pulse).
-        i_chk_addr       : rsv_addr_q                    ,
+        i_chk_addr       : rsv_pa_q                      , // P9.3: PA-based (PIPT)
         o_chk_present    : dc_rsv_present                ,
-        i_chk2_addr      : sc_watch_addr_q               ,
+        i_chk2_addr      : sc_watch_addr_q               , // (holds the PA since P9.3)
         o_chk2_present   : dc_scw_present                ,
+        i_chk3_addr      : amo_watch_pa_q                , // P9.3: AMO watch
+        o_chk3_present   : dc_amo_present                ,
         o_evict1_v       : dc_evict1_v                   , // P9.2: line-departure events
         o_evict1_addr    : dc_evict1_addr                , //       (ROB CoRR poison scan)
         o_evict2_v       : dc_evict2_v                   ,
