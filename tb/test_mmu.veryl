@@ -185,6 +185,8 @@ module test_mmu_asid_harness (
     o_a1    : output logic<64>,
     o_a2    : output logic<64>,
     o_g2    : output logic<64>,
+    o_ss    : output logic<64>, // selective-flush: survivor read (marker_A)
+    o_sf    : output logic<64>, // selective-flush: flushed read (marker_B)
 ) {
     import csr_pkg::*;
 
@@ -196,6 +198,11 @@ module test_mmu_asid_harness (
     var satp_val  : logic<64>;
     var priv_val  : PrivLevel ;
     var busy      : logic    ;
+    var sf        : logic    ; // SFENCE.VMA pulse
+    var sf_vaddr  : logic<64>;
+    var sf_asid   : logic<16>;
+    var sf_rs1z   : logic    ;
+    var sf_rs2z   : logic    ;
 
     inst dut: dmem_mmu (
         clk                      ,
@@ -216,6 +223,11 @@ module test_mmu_asid_harness (
         i_priv       : priv_val  ,
         i_sum        : 1'b1      ,
         i_mxr        : 1'b0      ,
+        i_sfence         : sf      ,
+        i_sfence_vaddr   : sf_vaddr,
+        i_sfence_asid    : sf_asid ,
+        i_sfence_rs1_zero: sf_rs1z ,
+        i_sfence_rs2_zero: sf_rs2z ,
         o_busy       : busy      ,
         o_fault      : _         ,
         o_fault_store: _         ,
@@ -231,6 +243,11 @@ module test_mmu_asid_harness (
     var a1_rd   : logic<64>; // ASID-1 read of VA 0x40000000 (expect marker_A)
     var a2_rd   : logic<64>; // ASID-2 read of VA 0x40000000 (expect marker_B)
     var g2_rd   : logic<64>; // ASID-2 read of the GLOBAL VA (expect marker_G)
+    // Selective SFENCE.VMA: after a non-matching ASID fence the ASID-1 entry
+    // SURVIVES (HIT → its cached PA 0x3000 = marker_A); after the matching ASID
+    // fence it is FLUSHED (re-walk → the remapped PTE PA 0x4000 = marker_B).
+    var sf_surv : logic<64>;
+    var sf_flsh : logic<64>;
 
     always_ff (clk, rst) {
         if_reset {
@@ -244,6 +261,13 @@ module test_mmu_asid_harness (
             a1_rd    = '0;
             a2_rd    = '0;
             g2_rd    = '0;
+            sf       = 1'b0;
+            sf_vaddr = '0;
+            sf_asid  = '0;
+            sf_rs1z  = 1'b0;
+            sf_rs2z  = 1'b0;
+            sf_surv  = '0;
+            sf_flsh  = '0;
             for i in 0..4096 {
                 mem[i] = 64'd0;
             }
@@ -270,6 +294,7 @@ module test_mmu_asid_harness (
             mem[2560] = 64'h6767_6767_6767_6767; // marker_G @ PA 0x8000_5000
         } else {
             ren = 1'b0;
+            sf  = 1'b0;
             if !busy {
                 tc = tc + 8'd1;
             }
@@ -303,9 +328,52 @@ module test_mmu_asid_harness (
                     ren   = 1'b1;
                     phase = 2'd3;
                 }
+                // The g2 walk has settled by now; capture it here (robust to the
+                // busy-fall timing) before switching ASID. Then back to ASID 1
+                // and stop the busy-fall capture (phase 0).
+                8'd11: {
+                    g2_rd    = rdata;
+                    satp_val = {4'd8, 16'd1, 44'd0};
+                    phase    = 2'd0;
+                }
+                // SFENCE.VMA(x0, asid=2): flush ASID 2 only — the ASID-1 entry
+                // (VA 0x4000_0000 → cached PA 0x3000) must SURVIVE.
+                8'd12: {
+                    sf      = 1'b1;
+                    sf_rs1z = 1'b1; // rs1 == x0 (all addresses)
+                    sf_rs2z = 1'b0; // rs2 != x0 (ASID-qualified)
+                    sf_asid = 16'd2;
+                }
+                // Read VA under ASID 1 → HIT the survivor → PA 0x3000 = marker_A.
+                8'd14: {
+                    vaddr = 64'h0000_0000_4000_0000;
+                    ren   = 1'b1;
+                }
+                8'd15: {
+                    sf_surv = rdata;
+                }
+                // SFENCE.VMA(x0, asid=1): now flush ASID 1 → the entry is gone.
+                8'd16: {
+                    sf      = 1'b1;
+                    sf_rs1z = 1'b1;
+                    sf_rs2z = 1'b0;
+                    sf_asid = 16'd1;
+                }
+                // Read VA under ASID 1 → MISS → re-walk the remapped PTE →
+                // PA 0x4000 = marker_B.
+                8'd18: {
+                    vaddr = 64'h0000_0000_4000_0000;
+                    ren   = 1'b1;
+                }
+                8'd19: {
+                    sf_flsh = rdata;
+                }
                 default: {}
             }
-            // Capture each read's result when its walk/access settles.
+            // Capture each walking read's result when its walk settles (a1/a2/g2
+            // are cold/isolation misses → walks). The selective-flush reads
+            // (sf_surv hit / sf_flsh walk) are captured at tc+1 above, where
+            // o_rdata holds the settled result for both hit and walk.
             if was_busy && !busy {
                 if phase == 2'd1 {
                     a1_rd = rdata;
@@ -324,9 +392,13 @@ module test_mmu_asid_harness (
     assign o_a1   = a1_rd;
     assign o_a2   = a2_rd;
     assign o_g2   = g2_rd;
+    assign o_ss   = sf_surv;
+    assign o_sf   = sf_flsh;
     assign o_pass = a1_rd == 64'hAAAA_AAAA_AAAA_AAAA
         && a2_rd == 64'hBBBB_BBBB_BBBB_BBBB
-        && g2_rd == 64'h6767_6767_6767_6767;
+        && g2_rd == 64'h6767_6767_6767_6767
+        && sf_surv == 64'hAAAA_AAAA_AAAA_AAAA  // ASID-2 fence left ASID-1 alone
+        && sf_flsh == 64'hBBBB_BBBB_BBBB_BBBB; // ASID-1 fence flushed it
 }
 
 #[test(test_mmu_asid)]
@@ -338,6 +410,8 @@ module test_mmu_asid {
     var a1  : logic<64>;
     var a2  : logic<64>;
     var g2  : logic<64>;
+    var ss  : logic<64>;
+    var sf  : logic<64>;
 
     inst harness: test_mmu_asid_harness (
         clk           ,
@@ -346,16 +420,18 @@ module test_mmu_asid {
         o_a1  : a1    ,
         o_a2  : a2    ,
         o_g2  : g2    ,
+        o_ss  : ss    ,
+        o_sf  : sf    ,
     );
 
     initial {
         rst.assert(clk);
-        for _i in 0..80 {
+        for _i in 0..140 {
             clk.next(1);
         }
-        $display("mmu_asid: a1=%h a2=%h g2=%h pass=%b", a1, a2, g2, pass);
-        $assert(pass, "TLB ASID isolation test failed");
-        $display("TLB ASID isolation test passed");
+        $display("mmu_asid: a1=%h a2=%h g2=%h surv=%h flsh=%h pass=%b", a1, a2, g2, ss, sf, pass);
+        $assert(pass, "TLB ASID isolation / selective-flush test failed");
+        $display("TLB ASID isolation + selective SFENCE.VMA test passed");
         $finish();
     }
 }
