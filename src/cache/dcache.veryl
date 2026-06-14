@@ -45,6 +45,13 @@ pub module dcache #(
     // the write-through path.
     i_wen_excl: input logic,
     i_ren  : input  logic    ,
+    // P9.5: this READ is an uncached MMIO load. Do a SINGLE exact-address bus
+    // read (i_addr, byte offset preserved) — no line fill, no array/MESI
+    // install — and surface i_mem_rdata as o_rdata on the granted cycle. The
+    // core asserts it for loads to non-DRAM (MMIO) physical addresses; the
+    // device read-enable (o_memr_ren) then pulses only on the grant so a
+    // read-with-side-effect (e.g. a PLIC claim) fires exactly once.
+    i_uncached: input logic,
     i_wstrb: input  logic<8> ,
     // M8.B (B.3): hi-side strobe for a misaligned STORE that spans into the
     // next dword. Nonzero ⇒ the store also writes (i_addr&~7)+8 via the core's
@@ -266,11 +273,14 @@ pub module dcache #(
     // bit[0]: right child → 0=way 2, 1=way 3
     var plru: logic<3> [SETS];
 
-    // Cache lookup: per-way hit
-    let hit_0    : logic = valid_0[index] && tags_0[index] == tag;
-    let hit_1    : logic = valid_1[index] && tags_1[index] == tag;
-    let hit_2    : logic = valid_2[index] && tags_2[index] == tag;
-    let hit_3    : logic = valid_3[index] && tags_3[index] == tag;
+    // Cache lookup: per-way hit. P9.5: an uncached MMIO load never hits (it must
+    // do a fresh single bus read and not alias a stale cached line), so suppress
+    // every way's hit for it — this also forces o_rdata to the i_mem_rdata path
+    // and keeps it off lo_miss / PLRU / hit_safe below.
+    let hit_0    : logic = valid_0[index] && tags_0[index] == tag && !i_uncached;
+    let hit_1    : logic = valid_1[index] && tags_1[index] == tag && !i_uncached;
+    let hit_2    : logic = valid_2[index] && tags_2[index] == tag && !i_uncached;
+    let hit_3    : logic = valid_3[index] && tags_3[index] == tag && !i_uncached;
     let cache_hit: logic = hit_0 || hit_1 || hit_2 || hit_3;
 
     // Same-cycle remote invalidate stall (multi-hart coherence).
@@ -408,10 +418,15 @@ pub module dcache #(
     // next line filled too: once the lo line is cached (cache_hit), hi_miss
     // triggers a SECOND sequential fill of the next line. Both keep o_stall
     // high until the data is present.
-    let lo_miss: logic = i_ren && !cache_hit && state == State::IDLE;
+    let lo_miss: logic = i_ren && !cache_hit && !i_uncached && state == State::IDLE;
     let hi_miss: logic = i_ren && i_load_next && !next_same_line && cache_hit && !next_line_hit && state == State::IDLE;
     // P9.3: an AMO read's S-hit upgrade is a miss for fill/stall purposes.
     let miss   : logic = lo_miss || hi_miss || amo_upg;
+    // P9.5: an uncached MMIO read is "active" while its single bus read is
+    // outstanding. It stays in IDLE (never enters FILL — excluded from lo_miss
+    // above), so nothing is fetched line-wise or installed. o_memr_req holds the
+    // request; o_memr_ren pulses only on the grant (below).
+    let uncached_active: logic = i_uncached && i_ren && state == State::IDLE;
 
     // P9.2: a FULL-LINE drain entry (all 64 bytes strobed — memset/memcpy
     // write-combining) keeps the posted WRITE-THROUGH path: an RFO would
@@ -1342,7 +1357,7 @@ pub module dcache #(
     // hit (S14.1; the raw hits are all 0 then — the new line's tag is not
     // written yet and the victim's old tag cannot equal it), from memory
     // during fill (legacy fallback, gated by o_data_valid at the consumers).
-    assign o_rdata = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
+    assign o_rdata = if uncached_active ? i_mem_rdata : if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
 
     // M8.B: next-dword read for misaligned 2-dword loads (decode moved up to the
     // miss-handling section). Same line ⇒ reuse the lo-access hit way; cross line
@@ -1376,13 +1391,18 @@ pub module dcache #(
     // WRITE channel: the WRITEBACK BUFFER (full dirty line, o_memw_wb) and
     // the i_wen write-through — the buffer outranks i_wen on a granted
     // cycle. Drains no longer touch this channel (local merges).
-    assign o_memr_addr = if filling ?
+    // P9.5: an uncached read drives the EXACT byte address (offset preserved, so
+    // a 0x..4 register hits its own decode) and only asserts the device read on
+    // the granted cycle.
+    assign o_memr_addr = if uncached_active ?
+        i_addr
+    : if filling ?
         {fill_tag, fill_index, fill_woff, 3'b000}
     :
         {f_tag, f_index, 3'd0, 3'b000}
     ;
-    assign o_memr_ren = if filling ? 1'b1 : if fill_start_fire ? 1'b1 : 1'b0;
-    assign o_memr_rfo = if filling ? fill_rfo : f_rfo;
+    assign o_memr_ren = if uncached_active ? i_memr_grant : if filling ? 1'b1 : if fill_start_fire ? 1'b1 : 1'b0;
+    assign o_memr_rfo = if uncached_active ? 1'b0 : if filling ? fill_rfo : f_rfo;
 
     assign o_memw_addr = if wb_v ? {wb_line, 6'd0} : if i_wen ? i_addr : i_saddr;
     assign o_memw_wb   = wb_v;
@@ -1417,7 +1437,7 @@ pub module dcache #(
     // coincide with the IDLE→FILL transition.
     let want_fill_start: logic = (load_sel || srfo_sel) && !fill_blocked_wb;
     let want_write     : logic = i_wen && !i_wen_excl && !amo_miss && state == State::IDLE && !mis_dirty_pending;
-    assign o_memr_req = filling || want_fill_start;
+    assign o_memr_req = filling || want_fill_start || uncached_active;
     assign o_memw_req = wb_v || want_write || want_store_wt;
 
     // Non-blocking miss interface (Phase 8 S10). o_miss_valid pulses on the
@@ -1456,7 +1476,7 @@ pub module dcache #(
     // MISS/FILL, o_rdata mirrors shared bus rdata which may be another
     // hart's transaction; consumers (e.g. memory.veryl amo_saved_rdata)
     // must gate on this to avoid mid-fill stale captures.
-    assign o_data_valid = cache_hit || (state == State::DONE);
+    assign o_data_valid = cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant);
 
     // Re-read filled data at original miss offset (valid during DONE)
     let fill_rdata_idx: logic<INDEX_W + 3> = {fill_index, fill_offset};
@@ -1616,6 +1636,6 @@ pub module dcache #(
     let write_wait_grant: logic = state == State::IDLE && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
     let write_wait_local: logic = state == State::IDLE && i_wen && i_wen_excl && !wenl_fires;
     assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
-        || write_wait_local || inv_hits_active || inv2_hits_active;
+        || write_wait_local || inv_hits_active || inv2_hits_active || (uncached_active && !i_memr_grant);
 
 }

@@ -8,7 +8,18 @@ LDFLAGS = -T bare.ld -nostdlib
 HEX_DIR = ../hex
 ELF2HEX = python3 bin2hex.py
 
-all: $(HEX_DIR)/hello_c.hex $(HEX_DIR)/hello_str.hex
+all: $(HEX_DIR)/hello_c.hex $(HEX_DIR)/hello_str.hex $(HEX_DIR)/smode_plic_test.hex
+
+# P9.5: S-mode PLIC external-interrupt directed test (CSR-heavy → needs zicsr).
+$(HEX_DIR)/smode_plic_test.hex: smode_plic_test.elf
+	$(OBJCOPY) -O binary $< smode_plic_test.bin
+	$(ELF2HEX) smode_plic_test.bin $@
+
+smode_plic_test.elf: smode_plic_test.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+smode_plic_test.o: smode_plic_test.S
+	$(CC) -march=rv64im_zicsr -mabi=lp64 -nostdlib -nostartfiles -ffreestanding -c -o $@ $<
 
 $(HEX_DIR)/hello_c.hex: hello.elf
 	$(OBJCOPY) -O binary $< hello.bin

@@ -122,17 +122,21 @@ pub module heliodor_soc_smp #(
     var in_dram : logic [N_HARTS];
     var in_clint: logic [N_HARTS];
     var in_uart : logic [N_HARTS];
+    var in_plic : logic [N_HARTS];
     var in_dram_w : logic [N_HARTS];
     var in_clint_w: logic [N_HARTS];
     var in_uart_w : logic [N_HARTS];
+    var in_plic_w : logic [N_HARTS];
     for h in 0..N_HARTS :gen_dec {
         assign in_dram[h]    = c_dmem_addr[h][31];
         assign in_clint[h]   = c_dmem_addr[h][31:24] == 8'h02;
         assign in_uart[h]    = c_dmem_addr[h][31:28] == 4'h1;
+        assign in_plic[h]    = c_dmem_addr[h][31:24] == 8'h0c; // P9.5: PLIC
         // S23: the write channel carries its own address.
         assign in_dram_w[h]  = c_dmemw_addr[h][31];
         assign in_clint_w[h] = c_dmemw_addr[h][31:24] == 8'h02;
         assign in_uart_w[h]  = c_dmemw_addr[h][31:28] == 4'h1;
+        assign in_plic_w[h]  = c_dmemw_addr[h][31:24] == 8'h0c;
     }
 
     // Per-hart DRAM request bundle into the memory_bus arbiter. wen/ren/wstrb are
@@ -256,13 +260,19 @@ pub module heliodor_soc_smp #(
     var ctrl_mem_busy: logic;
     let w_in_clint: logic = bus_dramw_addr[31:24] == 8'h02;
     let w_in_uart : logic = bus_dramw_addr[31:28] == 4'h1;
+    let w_in_plic : logic = bus_dramw_addr[31:24] == 8'h0c; // P9.5: PLIC
     let r_in_clint: logic = bus_dramr_addr[31:24] == 8'h02;
     let r_in_uart : logic = bus_dramr_addr[31:28] == 4'h1;
-    let legacy_ext_read: logic = bus_dramr_ren && !r_in_clint && !r_in_uart;
+    let r_in_plic : logic = bus_dramr_addr[31:24] == 8'h0c;
+    // P9.5: PLIC reads are internal MMIO (served by plic_rdata), not legacy
+    // firmware-ROM reads — exclude them from driving the external read port.
+    let legacy_ext_read: logic = bus_dramr_ren && !r_in_clint && !r_in_uart && !r_in_plic;
     var clint_wen_w: logic;
     var clint_ren_w: logic;
     var uart_wen_w : logic;
     var uart_ren_w : logic;
+    var plic_wen_w : logic;
+    var plic_ren_w : logic;
     // P9.2 Phase B: write-grant OWNERSHIP VETO. A non-WB write whose target
     // line (lo, or the +8 line of a misaligned store) is OWNED by a hart
     // other than the writer must wait — the owner's dirty copy is the only
@@ -303,7 +313,8 @@ pub module heliodor_soc_smp #(
     let wv_line   : logic<58> = if wv_lo_veto ? bus_dramw_addr[63:6] : wv_addr_hi[63:6];
 
     let wgrant_ok: logic = !ctrl_mem_busy && !legacy_ext_read && !w_veto
-        && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart);
+        && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart)
+        && !(plic_ren_w && w_in_plic);
 
     inst u_bus: memory_bus #(
         N_HARTS: N_HARTS,
@@ -537,6 +548,8 @@ pub module heliodor_soc_smp #(
         clint_ren_w = 1'b0;
         uart_wen_w  = 1'b0;
         uart_ren_w  = 1'b0;
+        plic_wen_w  = 1'b0;
+        plic_ren_w  = 1'b0;
         for h in 0..N_HARTS {
             if c_dmem_wen[h] && in_clint_w[h] {
                 clint_wen_w = 1'b1;
@@ -549,6 +562,12 @@ pub module heliodor_soc_smp #(
             }
             if c_dmem_ren[h] && in_uart[h] {
                 uart_ren_w = 1'b1;
+            }
+            if c_dmem_wen[h] && in_plic_w[h] {
+                plic_wen_w = 1'b1;
+            }
+            if c_dmem_ren[h] && in_plic[h] {
+                plic_ren_w = 1'b1;
             }
         }
     }
@@ -588,9 +607,32 @@ pub module heliodor_soc_smp #(
         i_rx_valid: 1'b0                ,
         o_irq     : uart_irq            ,
     );
-    let _unused_uart_irq: logic = uart_irq;
 
-    // Per-hart load data: CLINT / UART / DRAM (mem_ctrl per-hart stream
+    // P9.5: shared PLIC (base 0x0C00_0000). N_HARTS*2 contexts (M+S per hart).
+    // The UART is PLIC source 10 (device tree serial@10000000 interrupts=<10>).
+    // The granted hart's decoded MMIO access drives the single register port
+    // (address mux mirrors the CLINT/UART pattern); o_irq_m/s feed each core's
+    // MEIP/SEIP. Linux services device IRQs from S-mode → o_irq_s drives SEIP.
+    var plic_rdata: logic<64>          ;
+    var plic_irq_m: logic     [N_HARTS];
+    var plic_irq_s: logic     [N_HARTS];
+    let plic_src  : logic<32> = {21'd0, uart_irq, 10'd0}; // bit 10 = UART
+    inst u_plic: plic #(
+        N_HARTS: N_HARTS,
+    ) (
+        clk                       ,
+        rst                       ,
+        i_src  : plic_src         ,
+        i_addr : if plic_wen_w ? bus_dramw_addr[23:0] : bus_dramr_addr[23:0],
+        i_wdata: bus_dram_wdata[bus_dramw_addr[5:3]], // S25: one-lane line write
+        i_wen  : plic_wen_w       ,
+        i_ren  : plic_ren_w       ,
+        o_rdata: plic_rdata       ,
+        o_irq_m: plic_irq_m       ,
+        o_irq_s: plic_irq_s       ,
+    );
+
+    // Per-hart load data: CLINT / UART / PLIC / DRAM (mem_ctrl per-hart stream
     // beat) / firmware-ROM (external comb port, legacy path — only the
     // granted hart's dcache advances on it).
     var core_dmem_rdata: logic<64> [N_HARTS];
@@ -599,6 +641,8 @@ pub module heliodor_soc_smp #(
             clint_rdata
         : if in_uart[h] ?
             {56'd0, uart_rdata}
+        : if in_plic[h] ?
+            plic_rdata
         : if in_dram[h] ?
             ctrl_hrdata[h]
         :
@@ -663,7 +707,8 @@ pub module heliodor_soc_smp #(
             i_irq_timer_m     : clint_t_irq[h]    ,
             i_mtime           : clint_mtime       ,
             i_irq_sw_m        : clint_s_irq[h]    ,
-            i_irq_ext_m       : 1'b0              ,
+            i_irq_ext_m       : plic_irq_m[h]     , // P9.5: PLIC M-ext (MEIP)
+            i_irq_ext_s       : plic_irq_s[h]     , // P9.5: PLIC S-ext (SEIP)
             o_dbg_x3          : o_dbg_r3[h]        ,
             o_dbg_pc          : o_dbg_pc[h]        ,
             o_dbg_retire_v_a  : o_dbg_retire_v[h]  ,
