@@ -168,3 +168,194 @@ module test_mmu {
         $finish ();
     }
 }
+
+// P9.5: TLB ASID isolation unit test.
+//
+// Maps the SAME VA (0x40000000, a 4KB page) to DIFFERENT physical pages under
+// two ASIDs, with NO SFENCE.VMA between the address-space switches — the exact
+// pattern ASID-enabled Linux uses on a context switch. The walk for ASID 1
+// caches a non-global TLB entry (VA→PA_A); the read under ASID 2 must NOT use
+// that stale entry — it must miss and re-walk to PA_B. A correct ASID-tagged
+// TLB returns marker_B; a TLB that ignores ASID would return the stale
+// marker_A. Also checks a GLOBAL (G=1) mapping is shared across both ASIDs.
+module test_mmu_asid_harness (
+    clk     : input  clock    ,
+    rst     : input  reset    ,
+    o_pass  : output logic    ,
+    o_a1    : output logic<64>,
+    o_a2    : output logic<64>,
+    o_g2    : output logic<64>,
+) {
+    import csr_pkg::*;
+
+    var vaddr     : logic<64>;
+    var ren       : logic    ;
+    var rdata     : logic<64>;
+    var dmem_addr : logic<64>;
+    var dmem_rdata: logic<64>;
+    var satp_val  : logic<64>;
+    var priv_val  : PrivLevel ;
+    var busy      : logic    ;
+
+    inst dut: dmem_mmu (
+        clk                      ,
+        rst                      ,
+        i_vaddr      : vaddr     ,
+        i_wdata      : 64'd0     ,
+        i_wen        : 1'b0      ,
+        i_ren        : ren       ,
+        i_wstrb      : 8'd0      ,
+        o_rdata      : rdata     ,
+        o_dmem_addr  : dmem_addr ,
+        o_dmem_wdata : _         ,
+        i_dmem_rdata : dmem_rdata,
+        o_dmem_wen   : _         ,
+        o_dmem_ren   : _         ,
+        o_dmem_wstrb : _         ,
+        i_satp       : satp_val  ,
+        i_priv       : priv_val  ,
+        i_sum        : 1'b1      ,
+        i_mxr        : 1'b0      ,
+        o_busy       : busy      ,
+        o_fault      : _         ,
+        o_fault_store: _         ,
+    );
+
+    // 32 KB behavioural memory (8 pages), combinational read.
+    var mem: logic<64> [4096];
+    assign dmem_rdata = mem[dmem_addr[14:3]];
+
+    var tc      : logic<8> ;
+    var phase   : logic<2> ; // which read is in flight (1=asid1,2=asid2,3=global)
+    var was_busy: logic    ;
+    var a1_rd   : logic<64>; // ASID-1 read of VA 0x40000000 (expect marker_A)
+    var a2_rd   : logic<64>; // ASID-2 read of VA 0x40000000 (expect marker_B)
+    var g2_rd   : logic<64>; // ASID-2 read of the GLOBAL VA (expect marker_G)
+
+    always_ff (clk, rst) {
+        if_reset {
+            tc       = 8'd0;
+            vaddr    = '0;
+            ren      = 1'b0;
+            satp_val = '0;
+            priv_val = PrivLevel::MACHINE;
+            phase    = 2'd0;
+            was_busy = 1'b0;
+            a1_rd    = '0;
+            a2_rd    = '0;
+            g2_rd    = '0;
+            for i in 0..4096 {
+                mem[i] = 64'd0;
+            }
+            // Page table (satp.PPN = 0, root PT at PA 0):
+            //   root[1] (VA 0x4000_0000, VPN2=1) → non-leaf L1 @ PA 0x1000
+            mem[1]    = 64'h401; // PPN=1, V
+            //   L1[0] → non-leaf L0 @ PA 0x2000
+            mem[512]  = 64'h801; // PPN=2, V
+            //   L0[0] → leaf 4KB page @ PA 0x3000, flags V|R|W|A|D (G=0)
+            mem[1024] = 64'hCC7; // PPN=3, 0xC7
+            //   root[2] (VA 0x8000_0000, VPN2=2) → GLOBAL leaf gigapage @ PA
+            //   0x8000_0000, flags V|R|W|A|D|G (G=1). PPN must be 1GB-aligned.
+            mem[2]    = 64'h2000_00E7; // PPN=0x80000, 0xE7 (G set)
+            // Data pages:
+            mem[1536] = 64'hAAAA_AAAA_AAAA_AAAA; // PA 0x3000 = marker_A
+            mem[2048] = 64'hBBBB_BBBB_BBBB_BBBB; // PA 0x4000 = marker_B
+            // GLOBAL gigapage maps VA 0x8000_0000 → PA 0x8000_0000; the dword
+            // there is mem[(0x8000_0000>>3) & 0xFFF]... but that aliases low
+            // memory. Place marker_G where the gigapage read lands: PA
+            // 0x8000_0000 → mem[dmem_addr[14:3]] = mem[0]. Avoid clobbering the
+            // root PT (mem[0..2]); instead read the global page at VA
+            // 0x8000_3000 → PA 0x8000_3000 → mem[1536]? collides. Use VA
+            // 0x8000_5000 → PA 0x8000_5000 → mem[(0x5000>>3)=2560].
+            mem[2560] = 64'h6767_6767_6767_6767; // marker_G @ PA 0x8000_5000
+        } else {
+            ren = 1'b0;
+            if !busy {
+                tc = tc + 8'd1;
+            }
+            case tc {
+                // ASID 1: read VA 0x4000_0000 → walks to PA 0x3000 = marker_A.
+                8'd2: {
+                    satp_val = {4'd8, 16'd1, 44'd0};
+                    priv_val = PrivLevel::SUPERVISOR;
+                }
+                8'd4: {
+                    vaddr = 64'h0000_0000_4000_0000;
+                    ren   = 1'b1;
+                    phase = 2'd1;
+                }
+                // Remap L0[0] → PA 0x4000 and switch to ASID 2 (NO sfence).
+                8'd6: {
+                    mem[1024] = 64'h10C7; // PPN=4, 0xC7
+                    satp_val  = {4'd8, 16'd2, 44'd0};
+                }
+                // ASID 2: read VA 0x4000_0000 → must MISS the ASID-1 entry and
+                // re-walk to PA 0x4000 = marker_B (isolation).
+                8'd8: {
+                    vaddr = 64'h0000_0000_4000_0000;
+                    ren   = 1'b1;
+                    phase = 2'd2;
+                }
+                // ASID 2: read the GLOBAL VA 0x8000_5000 → must HIT/translate
+                // via the G=1 gigapage = marker_G (global shared across ASIDs).
+                8'd10: {
+                    vaddr = 64'h0000_0000_8000_5000;
+                    ren   = 1'b1;
+                    phase = 2'd3;
+                }
+                default: {}
+            }
+            // Capture each read's result when its walk/access settles.
+            if was_busy && !busy {
+                if phase == 2'd1 {
+                    a1_rd = rdata;
+                }
+                if phase == 2'd2 {
+                    a2_rd = rdata;
+                }
+                if phase == 2'd3 {
+                    g2_rd = rdata;
+                }
+            }
+            was_busy = busy;
+        }
+    }
+
+    assign o_a1   = a1_rd;
+    assign o_a2   = a2_rd;
+    assign o_g2   = g2_rd;
+    assign o_pass = a1_rd == 64'hAAAA_AAAA_AAAA_AAAA
+        && a2_rd == 64'hBBBB_BBBB_BBBB_BBBB
+        && g2_rd == 64'h6767_6767_6767_6767;
+}
+
+#[test(test_mmu_asid)]
+module test_mmu_asid {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass: logic    ;
+    var a1  : logic<64>;
+    var a2  : logic<64>;
+    var g2  : logic<64>;
+
+    inst harness: test_mmu_asid_harness (
+        clk           ,
+        rst           ,
+        o_pass: pass  ,
+        o_a1  : a1    ,
+        o_a2  : a2    ,
+        o_g2  : g2    ,
+    );
+
+    initial {
+        rst.assert(clk);
+        for _i in 0..80 {
+            clk.next(1);
+        }
+        $display("mmu_asid: a1=%h a2=%h g2=%h pass=%b", a1, a2, g2, pass);
+        $assert(pass, "TLB ASID isolation test failed");
+        $display("TLB ASID isolation test passed");
+        $finish();
+    }
+}
