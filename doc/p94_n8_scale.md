@@ -80,13 +80,36 @@ is **rebuilt** with `CONFIG_NR_CPUS=8` (committed config:
   all 8 harts to arrive (NH=8 baked in), so it is a direct starvation test
   of the round-robin arm. PASS, all 8 harts' retire counts climbing — the
   N=8 coherence + arbiter fairness are validated.
-- **N=8 Linux boot** (`test_soc_smp_linux_boot_8hart`): all 8 cpus come
-  online — the kernel prints `smp: Brought up 1 node, 8 CPUs` and runs
-  multi-core. It then **hangs in post-bringup init**: every cpu sits in the
-  idle loop (`do_idle` / `rcu_idle_enter|exit`) with kernel_init (PID 1)
-  blocked in `do_initcalls`, so `/init` never runs and SBI shutdown is not
-  reached. Since litmus N=8 passes, this is a firmware/kernel integration
-  issue, not an RTL coherence bug — pending further debug. `#[ignore]`.
+- **N=8 Linux boot** (`test_soc_smp_linux_boot_8hart`): PASS — boots to SBI
+  shutdown (`Run /init as init process` → `reboot: Power down`, hart0 x3==0xAA
+  at ~25M cycles). `#[ignore]` (long).
+
+### The N=8 CLINT bug (fixed)
+
+The first N=8 boot brought all 8 cpus online but then hung in post-bringup
+init — every cpu idle, kernel_init blocked in `do_initcalls`. The root cause
+was a one-bit width truncation in the CLINT's hart-range check:
+
+```veryl
+let msip_hart_in_range: logic = msip_hart <: N_HARTS as 3;   // BUG
+```
+
+`N_HARTS as 3` truncates `N_HARTS == 8` to `0` (8 = `0b1000`, low 3 bits =
+`000`), so the check is `msip_hart <: 0` = **always false** at exactly N=8.
+`is_msip`/`is_mtimecmp` were then false for every access, and the CLINT
+**silently dropped every msip and mtimecmp write** — no IPIs and no timer
+interrupts were ever delivered. The boot limped along only because WFI is a
+NOP (idle cpus busy-poll, so HART_START woke via the scratch `jump_addr` poll
+and reschedules via `need_resched`); the first thing that strictly needs an
+IPI — `kthread_create`'s wakeup of kthreadd in `oom_init`, then a synchronous
+`smp_call_function_single` — wedged. litmus N=8 passed throughout because it
+never touches the CLINT. N=1/2/4 were unaffected because `1/2/4 as 3` don't
+truncate; only `8 as 3` does.
+
+Fix (`clint.veryl`): compare in 4 bits —
+`({1'b0, msip_hart} as 4) <: (N_HARTS as 4)` — so N_HARTS up to 8 (the SoC
+instantiates N in {1,2,4,8}) compares correctly. With the fix the standard
+NR_CPUS=8 kernel boots with no kernel-side workarounds.
 
 ## L2 banking (P9.4.1, future)
 
