@@ -15,6 +15,13 @@ pub module icache #(
     i_addr      : input  logic<64>,
     i_ren       : input  logic    ,
     i_flush     : input  logic    , // FENCE.I: invalidate all entries
+    // P9.6: the current fetch PA is cacheable DRAM. A NON-cacheable fetch
+    // (firmware/boot-ROM/MMIO, outside the DRAM window) bypasses the cache
+    // entirely — it is served combinationally from the legacy passthrough port
+    // (o_imem_*), with no lookup/fill/training. The real SoC fetches only DRAM;
+    // this keeps the ROM-resident bare-core unit tests (and any future firmware
+    // region) working without a coherent line fill of an un-recallable region.
+    i_dram      : input  logic    ,
     o_rdata     : output logic<32>,
     o_rdata_next: output logic<32>, // next 32-bit word (for straddled 4-byte instrs at halfword boundary)
     // Phase 8 S4: high when o_rdata_next holds valid data this cycle (the next
@@ -24,10 +31,22 @@ pub module icache #(
     // only when this is set, else it delivers just what o_rdata alone provides.
     o_rdata_next_valid: output logic,
     o_stall     : output logic    ,
-    // Memory side (32-bit read interface)
+    // Memory side — P9.6: coherent line fill through mem_ctrl's L2 read
+    // transaction (UNCOUNTED read: recall-on-owned delivers current data, no
+    // directory add/install). o_mem_req requests a fill; the accept grant
+    // (i_mem_grant while idle) starts it; 8 STREAM grants each deliver one
+    // 64-bit dword (two 32-bit words). o_fill_done pulses on completion.
     o_mem_addr : output logic<64>,
-    i_mem_rdata: input  logic<32>,
-    o_mem_ren  : output logic    ,
+    i_mem_rdata: input  logic<64>,
+    o_mem_req  : output logic    ,
+    i_mem_grant: input  logic    ,
+    o_fill_done: output logic    ,
+    // P9.6: legacy passthrough port for a NON-cacheable fetch (i_dram=0). A
+    // single combinational 32-bit read at i_addr, delivered straight to o_rdata
+    // (no caching). Served by the SoC/tb the way o_imem was before P9.6.
+    o_imem_addr : output logic<64>,
+    i_imem_rdata: input  logic<32>,
+    o_imem_ren  : output logic    ,
 ) {
     // Derived geometry. Line addresses ({tag, index} concatenations) are always
     // 58 bits (= PA[63:6]) regardless of INDEX_W.
@@ -47,8 +66,12 @@ pub module icache #(
     // of the line being filled become readable as they arrive, so fetch chases
     // the fill pointer instead of waiting out the whole 16-word fill. All 0 =
     // the original blocking icache, bit-identical.
+    // P9.6: prefetch is now OFF. With fills routed through mem_ctrl (shared with
+    // the D-cache read port), a speculative prefetch HOLDS the single per-hart
+    // slot for a whole transaction and blocks a subsequent demand D-cache fill —
+    // measured net-negative on boot (N=1 13.84M→13.30M, N=2 18.77M→17.25M).
     let s11_huf_en: logic = 1'b1;
-    let s11_pf_en : logic = 1'b1;
+    let s11_pf_en : logic = 1'b0;
     let s11_st_en : logic = 1'b1;
 
     // Cache storage: 4 ways
@@ -84,22 +107,26 @@ pub module icache #(
     let rdata_2: logic<32> = data_2[data_idx];
     let rdata_3: logic<32> = data_3[data_idx];
 
-    // Fill state
+    // Fill state. P9.6: fill_count now counts 8 DWORD beats (0..7); each granted
+    // beat writes two adjacent 32-bit words. fill_aborted (mirrors the dcache):
+    // a FENCE.I mid-fill drains the mem_ctrl slot but leaves the line invalid.
     var filling      : logic         ;
-    var fill_count   : logic<4>      ; // 0..15, which word to fill
+    var fill_count   : logic<3>      ; // 0..7, which dword beat to fill
     var fill_index   : logic<INDEX_W>; // index being filled
     var fill_tag     : logic<TAG_W>  ; // tag being filled
     var fill_way     : logic<2>      ; // which way to fill
-    let fill_data_idx: logic<INDEX_W + 4> = {fill_index, fill_count};
-    // Phase 8 S11.2: next-line prefetch state. fill_is_pf marks the in-flight
-    // fill as a prefetch (no demand waits on it → abortable); pf_pending/pf_line
-    // hold the queued prefetch candidate (a 58-bit line address {tag, index}).
-    var fill_is_pf: logic    ;
+    var fill_aborted : logic         ; // FENCE.I hit the in-flight fill
+    let fill_widx_lo : logic<INDEX_W + 4> = {fill_index, fill_count, 1'b0};
+    let fill_widx_hi : logic<INDEX_W + 4> = {fill_index, fill_count, 1'b1};
+    // Phase 8 S11.2: next-line prefetch state. pf_pending/pf_line hold the
+    // queued prefetch candidate (a 58-bit line address {tag, index}).
     var pf_pending: logic    ;
     var pf_line   : logic<58>;
 
     // Miss: read request, not hit, not already filling
-    let miss: logic = i_ren && !cache_hit && !filling;
+    // P9.6: only a cacheable (DRAM) fetch misses into a fill; a non-cacheable
+    // fetch is served by the passthrough port instead.
+    let miss: logic = i_ren && !cache_hit && !filling && i_dram;
 
     // Phase 8 S11.1: hit-under-fill. During a line fill the victim way still
     // carries the OLD line's tag+valid (rewritten only at fill completion) while
@@ -124,7 +151,8 @@ pub module icache #(
     // line BEING FILLED are already readable — deliver them from the fill way
     // instead of stalling until the whole 16-word fill completes. The fill way's
     // tag/valid are not set yet; identification is by fill_line == cur_line.
-    let stream_hit_cur: logic     = s11_st_en && filling && fill_line == cur_line && offset <: fill_count;
+    let stream_hit_cur: logic     = s11_st_en && filling && !fill_aborted && fill_line == cur_line
+        && offset <: {fill_count, 1'b0};
     let stream_rdata  : logic<32> = if fill_way == 2'd0 ?
         rdata_0
     : if fill_way == 2'd1 ?
@@ -180,7 +208,7 @@ pub module icache #(
 
     // Straddle miss detection
     let straddled_4byte: logic = i_addr[1] && o_rdata[17:16] == 2'b11;
-    let straddle_miss  : logic = i_ren && cache_hit && !next_same_line && !next_hit && !filling && straddled_4byte;
+    let straddle_miss  : logic = i_ren && cache_hit && !next_same_line && !next_hit && !filling && straddled_4byte && i_dram;
 
     // PLRU victim for straddle miss (different index)
     let straddle_plru    : logic<3> = plru[next_index];
@@ -211,7 +239,8 @@ pub module icache #(
     let straddle_line     : logic<58> = {next_tag, next_index};
     // S11.3: streaming for the NEXT word (same line: next_tag/next_index equal
     // tag/index, so this also covers the same-line successor word).
-    let stream_hit_next: logic     = s11_st_en && filling && fill_line == straddle_line && next_offset <: fill_count;
+    let stream_hit_next: logic     = s11_st_en && filling && !fill_aborted && fill_line == straddle_line
+        && next_offset <: {fill_count, 1'b0};
     let stream_rdata_next: logic<32> = if fill_way == 2'd0 ?
         next_rdata_0
     : if fill_way == 2'd1 ?
@@ -254,7 +283,7 @@ pub module icache #(
     // sequential successor is absent → queue a prefetch (covers sequential runs
     // through cached code, where no fill-completion chain event occurs).
     let pf_tail_trig: logic = i_ren && eff_cache_hit && offset >= 4'd8
-        && !cur_last_in_page && !nl_present;
+        && !cur_last_in_page && !nl_present && i_dram;
     // Prefetch start lookup (FSM idle): is the queued line already cached?
     let pf_tag    : logic<TAG_W>   = pf_line[57:INDEX_W];
     let pf_index  : logic<INDEX_W> = pf_line[INDEX_W - 1:0];
@@ -277,127 +306,123 @@ pub module icache #(
     ;
     let pf_plru_way: logic<2> = {pf_plru[2], if !pf_plru[2] ? pf_plru[1] : pf_plru[0]};
     let pf_victim  : logic<2> = if pf_invalid ? pf_inv_way : pf_plru_way;
-    // Abort an in-flight PREFETCH fill when a demand (fetch line, or the
-    // straddle next-line) misses and the prefetch is not itself servicing it —
-    // the demand fill then starts next cycle instead of waiting out the
-    // prefetch. The abandoned victim way is left INVALID (its old data words
-    // may already be overwritten).
-    let pf_abort: logic = filling && fill_is_pf
-        && ((demand0_missing && cur_line != fill_line)
-        || (demand1_missing && straddle_line != fill_line));
+    // P9.6: fill-request selection (priority miss > straddle > prefetch). The
+    // fill is LATCHED on the accept grant (mem_ctrl), not started unconditionally.
+    // A prefetch fill is NOT aborted for a later demand — it runs to completion
+    // so the mem_ctrl slot stays in lockstep with `filling` (an early drop would
+    // leave the slot streaming to no one); the demand waits the few beats out.
+    let req_is_miss    : logic          = miss;
+    let req_is_straddle: logic          = !miss && straddle_miss;
+    let req_is_pf      : logic          = !miss && !straddle_miss && s11_pf_en && pf_pending && !pf_present;
+    let ic_fill_want   : logic          = req_is_miss || req_is_straddle || req_is_pf;
+    let req_index      : logic<INDEX_W> = if miss ? index : if straddle_miss ? next_index : pf_index;
+    let req_tag        : logic<TAG_W>   = if miss ? tag : if straddle_miss ? next_tag : pf_tag;
+    let req_way        : logic<2>       = if miss ? victim_way : if straddle_miss ? straddle_victim : pf_victim;
+    let req_line       : logic<58>      = {req_tag, req_index};
 
     always_ff (clk, rst) {
         if_reset {
-            filling    = 1'b0;
-            fill_count = 4'd0;
-            fill_index = 4'd0;
-            fill_tag   = '0;
-            fill_way   = 2'd0;
-            fill_is_pf = 1'b0;
-            pf_pending = 1'b0;
-            pf_line    = '0;
+            filling      = 1'b0;
+            fill_count   = 3'd0;
+            fill_index   = '0;
+            fill_tag     = '0;
+            fill_way     = 2'd0;
+            fill_aborted = 1'b0;
+            pf_pending   = 1'b0;
+            pf_line      = '0;
             for i in 0..SETS {
                 valid_0[i] = 1'b0;
                 valid_1[i] = 1'b0;
                 valid_2[i] = 1'b0;
                 valid_3[i] = 1'b0;
             }
-        } else if i_flush {
-            for i in 0..SETS {
-                valid_0[i] = 1'b0;
-                valid_1[i] = 1'b0;
-                valid_2[i] = 1'b0;
-                valid_3[i] = 1'b0;
+        } else {
+            // FENCE.I: invalidate every line. An in-flight fill is marked aborted
+            // — we still DRAIN its mem_ctrl beats so the slot stays in lockstep
+            // with `filling` — and left INVALID at completion (fin_valid below).
+            if i_flush {
+                for i in 0..SETS {
+                    valid_0[i] = 1'b0;
+                    valid_1[i] = 1'b0;
+                    valid_2[i] = 1'b0;
+                    valid_3[i] = 1'b0;
+                }
+                pf_pending = 1'b0;
+                if filling {
+                    fill_aborted = 1'b1;
+                }
             }
-            filling    = 1'b0;
-            pf_pending = 1'b0;
-        } else if filling {
-            if pf_abort {
-                // S11.2: abandon the prefetch fill for a demand miss. The victim
-                // way's data words may already be overwritten — leave it invalid.
-                if fill_way == 2'd0 {
-                    valid_0[fill_index] = 1'b0;
-                }
-                if fill_way == 2'd1 {
-                    valid_1[fill_index] = 1'b0;
-                }
-                if fill_way == 2'd2 {
-                    valid_2[fill_index] = 1'b0;
-                }
-                if fill_way == 2'd3 {
-                    valid_3[fill_index] = 1'b0;
-                }
-                filling = 1'b0;
-            } else {
-                // Fill one word per cycle from memory
-                if fill_way == 2'd0 {
-                    data_0[fill_data_idx] = i_mem_rdata;
-                }
-                if fill_way == 2'd1 {
-                    data_1[fill_data_idx] = i_mem_rdata;
-                }
-                if fill_way == 2'd2 {
-                    data_2[fill_data_idx] = i_mem_rdata;
-                }
-                if fill_way == 2'd3 {
-                    data_3[fill_data_idx] = i_mem_rdata;
-                }
-                if fill_count == 4'd15 {
-                    // Fill complete: update tag and valid
+
+            if filling {
+                // Grant-gated dword beat: write two 32-bit words per granted beat
+                // (mem_ctrl streams buf[addr[5:3]] = dword fill_count).
+                if i_mem_grant {
                     if fill_way == 2'd0 {
-                        tags_0[fill_index]  = fill_tag;
-                        valid_0[fill_index] = 1'b1;
+                        data_0[fill_widx_lo] = i_mem_rdata[31:0];
+                        data_0[fill_widx_hi] = i_mem_rdata[63:32];
                     }
                     if fill_way == 2'd1 {
-                        tags_1[fill_index]  = fill_tag;
-                        valid_1[fill_index] = 1'b1;
+                        data_1[fill_widx_lo] = i_mem_rdata[31:0];
+                        data_1[fill_widx_hi] = i_mem_rdata[63:32];
                     }
                     if fill_way == 2'd2 {
-                        tags_2[fill_index]  = fill_tag;
-                        valid_2[fill_index] = 1'b1;
+                        data_2[fill_widx_lo] = i_mem_rdata[31:0];
+                        data_2[fill_widx_hi] = i_mem_rdata[63:32];
                     }
                     if fill_way == 2'd3 {
-                        tags_3[fill_index]  = fill_tag;
-                        valid_3[fill_index] = 1'b1;
+                        data_3[fill_widx_lo] = i_mem_rdata[31:0];
+                        data_3[fill_widx_hi] = i_mem_rdata[63:32];
                     }
-                    filling = 1'b0;
-                    // S11.2 chain: queue a prefetch of the sequential successor
-                    // of the line just filled (demand and prefetch alike), unless
-                    // it crosses a 4KB page (PA+64 is not the VA successor's PA).
-                    if s11_pf_en && fill_line[5:0] != 6'h3f {
-                        pf_pending = 1'b1;
-                        pf_line    = fill_line + 58'd1;
+                    if fill_count == 3'd7 {
+                        // Fill complete: update tag, and set valid unless a FENCE.I
+                        // hit the fill (this cycle or earlier) — then leave invalid.
+                        let fin_valid: logic = !fill_aborted && !i_flush;
+                        if fill_way == 2'd0 {
+                            tags_0[fill_index]  = fill_tag;
+                            valid_0[fill_index] = fin_valid;
+                        }
+                        if fill_way == 2'd1 {
+                            tags_1[fill_index]  = fill_tag;
+                            valid_1[fill_index] = fin_valid;
+                        }
+                        if fill_way == 2'd2 {
+                            tags_2[fill_index]  = fill_tag;
+                            valid_2[fill_index] = fin_valid;
+                        }
+                        if fill_way == 2'd3 {
+                            tags_3[fill_index]  = fill_tag;
+                            valid_3[fill_index] = fin_valid;
+                        }
+                        filling      = 1'b0;
+                        fill_aborted = 1'b0;
+                        // S11.2 chain: queue a prefetch of the sequential successor
+                        // of the line just filled, unless it crosses a 4KB page
+                        // (PA+64 is not the VA successor's PA under Sv39).
+                        if s11_pf_en && fill_line[5:0] != 6'h3f {
+                            pf_pending = 1'b1;
+                            pf_line    = fill_line + 58'd1;
+                        }
+                    } else {
+                        fill_count = fill_count + 3'd1;
                     }
-                } else {
-                    fill_count = fill_count + 4'd1;
+                }
+            } else {
+                // Idle: start the selected fill on its accept grant (mem_ctrl
+                // pulses i_mem_grant once on accept, then 8 times for STREAM).
+                if i_mem_grant && ic_fill_want {
+                    fill_index   = req_index;
+                    fill_tag     = req_tag;
+                    fill_way     = req_way;
+                    fill_count   = 3'd0;
+                    fill_aborted = 1'b0;
+                    filling      = 1'b1;
+                }
+                // Consume a queued prefetch once it already landed in the cache,
+                // or its own fill just got accepted above.
+                if pf_pending && (pf_present || (req_is_pf && i_mem_grant)) {
+                    pf_pending = 1'b0;
                 }
             }
-        } else if miss {
-            fill_index = index;
-            fill_tag   = tag;
-            fill_way   = victim_way;
-            fill_count = 4'd0;
-            filling    = 1'b1;
-            fill_is_pf = 1'b0;
-        } else if straddle_miss {
-            fill_index = next_index;
-            fill_tag   = next_tag;
-            fill_way   = straddle_victim;
-            fill_count = 4'd0;
-            filling    = 1'b1;
-            fill_is_pf = 1'b0;
-        } else if s11_pf_en && pf_pending {
-            // S11.2: the fill FSM is idle and no demand wants it — start the
-            // queued prefetch (skip if the line landed in the cache meanwhile).
-            if !pf_present {
-                fill_index = pf_index;
-                fill_tag   = pf_tag;
-                fill_way   = pf_victim;
-                fill_count = 4'd0;
-                filling    = 1'b1;
-                fill_is_pf = 1'b1;
-            }
-            pf_pending = 1'b0;
         }
 
         // S11.2 tail-hit trigger: queue a prefetch while fetch streams through
@@ -414,7 +439,7 @@ pub module icache #(
         // S11.1: with hit-under-fill, hits delivered DURING a fill train the
         // PLRU too (fill_way/fill_index are latched, so this never perturbs the
         // in-flight fill). Flip off keeps the original !filling gate.
-        if eff_cache_hit && i_ren && (s11_huf_en || !filling) {
+        if eff_cache_hit && i_ren && i_dram && (s11_huf_en || !filling) {
             if eff_hit_way[1] == 1'b0 {
                 // Accessed way 0 or 1 → root points right, update left child
                 plru[index][2] = 1'b1;
@@ -434,7 +459,10 @@ pub module icache #(
     // hazard unit overrides cache_stall and IF/ID can latch garbage.
     // NOP is safe: decode produces a bubble, fetch will retry once the
     // fill completes.
-    assign o_rdata = if eff_hit_0 ?
+    // P9.6: a non-cacheable fetch is served straight from the passthrough port.
+    assign o_rdata = if !i_dram ?
+        i_imem_rdata
+    : if eff_hit_0 ?
         rdata_0
     : if eff_hit_1 ?
         rdata_1
@@ -449,8 +477,12 @@ pub module icache #(
     ;
 
     // Next word: for straddled instruction support. S11.1: fill-aware hits —
-    // identical to the raw hits whenever no fill is in flight.
-    assign o_rdata_next = if next_same_line ?
+    // identical to the raw hits whenever no fill is in flight. P9.6: a
+    // non-cacheable fetch has no next word (v4 resolves straddles via the
+    // explicit 2-cycle re-fetch, so o_rdata_next is unused there anyway).
+    assign o_rdata_next = if !i_dram ?
+        32'd0
+    : if next_same_line ?
         // Same line: use same hit way (or the streaming fill way)
         (if eff_hit_0 ?
             data_0[next_data_idx]
@@ -483,7 +515,9 @@ pub module icache #(
     // Phase 8 S4: next-word validity. Same line → valid on a current-line hit
     // (S11.3: same-line stream_hit_next implies the current word streams too);
     // cross line → valid only if the next line is also cached or streaming.
-    assign o_rdata_next_valid = if next_same_line ?
+    assign o_rdata_next_valid = if !i_dram ?
+        1'b0
+    : if next_same_line ?
         (eff_cache_hit || stream_hit_next)
     :
         (eff_next_hit_cross || stream_hit_next)
@@ -493,14 +527,27 @@ pub module icache #(
     // S11.1 hit-under-fill: stall only while a word the fetch DEMANDS this cycle
     // (the addressed line, or the straddle next-line word) is undeliverable —
     // hits on other lines keep flowing during a fill.
-    assign o_stall = if s11_huf_en ?
+    // P9.6: a non-cacheable fetch never stalls (combinational passthrough read).
+    assign o_stall = if !i_dram ?
+        1'b0
+    : if s11_huf_en ?
         (demand0_missing || demand1_missing)
     :
         (filling || miss || straddle_miss)
     ;
 
-    // Memory address: during fill, sequential word addresses
-    assign o_mem_addr = if filling ? {fill_tag, fill_index, fill_count, 2'b00} : i_addr;
+    // Memory address: during fill, the dword address — mem_ctrl streams
+    // buf[addr[5:3]] each granted beat, so [5:3] = fill_count walks dwords 0..7.
+    // While idle-and-requesting, the selected fill line (dword 0).
+    assign o_mem_addr = if filling ? {fill_tag, fill_index, fill_count, 3'b000} : {req_line, 6'd0};
 
-    assign o_mem_ren = i_ren || filling;
+    // P9.6: hold the request while a fill is in flight (mem_ctrl ignores it
+    // post-accept) or a new fill is wanted; pulse o_fill_done on the 8th beat.
+    assign o_mem_req   = filling || ic_fill_want;
+    assign o_fill_done = filling && i_mem_grant && fill_count == 3'd7;
+
+    // P9.6: legacy passthrough — a non-cacheable fetch reads its 32-bit word
+    // combinationally at i_addr (no transaction, no caching).
+    assign o_imem_addr = i_addr;
+    assign o_imem_ren  = i_ren && !i_dram;
 }

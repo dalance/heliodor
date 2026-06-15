@@ -92,6 +92,10 @@ pub module heliodor_core #(
     // Single-hart harnesses: tie i_dmem_fill_excl=1, discard the outputs.
     o_dmemw_wb      : output logic,
     o_dmem_rfo      : output logic,
+    // P9.6: the read-channel request is an I-cache fill (UNCOUNTED coherent
+    // read — recall-on-owned, no directory add/install). The I-cache fill
+    // shares this hart's mem_ctrl read port with the D-cache (D has priority).
+    o_dmem_iread    : output logic,
     i_dmem_fill_excl: input  logic,
     // P9.2: PROBE (recall) port from the home + clean ack. Tie 0 / discard
     // in single-hart harnesses.
@@ -1148,19 +1152,40 @@ pub module heliodor_core #(
     //   - o_rdata_next is unused: v4 resolves halfword-straddled 32-bit instrs
     //     via the explicit 2-cycle re-fetch (fetch_vaddr+2), not a combo probe.
     // ============================================================
+    // P9.6: the I-cache fill now rides this hart's mem_ctrl L2 read transaction
+    // (coherent — recall-on-owned). It SHARES the D-cache read port through the
+    // arbiter below (assigned after the dcache inst, where dc_mem_req is in
+    // scope). ic_grant is forward-referenced; ic_mem_*/ic_fill_done are driven
+    // by this inst and consumed by the arbiter.
+    var ic_mem_addr : logic<64>;
+    var ic_mem_req  : logic    ;
+    var ic_grant    : logic    ;
+    var ic_fill_done: logic    ;
+    var ic_owns     : logic    ; // arbiter: I-cache owns the read port (txn in flight)
+    var ic_route    : logic    ; // arbiter: route the shared read port to the I-cache
+    // P9.6: the fetch PA is cacheable iff inside the DRAM window (PA[63:25]==0x40,
+    // the same boundary as dc_uncached). A non-DRAM fetch (firmware/boot-ROM)
+    // bypasses the cache and is served from the legacy o_imem passthrough.
+    let ic_dram: logic = imem_paddr_w[63:25] == 39'h40;
     inst u_icache: icache (
         clk                              ,
         rst                              ,
         i_addr      : imem_paddr_w       ,
         i_ren       : imem_valid_w       ,
         i_flush     : commit_fence_i_pulse,
+        i_dram      : ic_dram            ,
         o_rdata     : icache_rdata       ,
         o_rdata_next: icache_rdata_next  ,
         o_rdata_next_valid: icache_rdata_next_valid,
         o_stall     : icache_stall       ,
-        o_mem_addr  : o_imem_addr        ,
-        i_mem_rdata : i_imem_rdata       ,
-        o_mem_ren   : o_imem_ren         ,
+        o_mem_addr  : ic_mem_addr        ,
+        i_mem_rdata : i_dmem_rdata        , // P9.6: 64-bit dword stream (shared D port)
+        o_mem_req   : ic_mem_req         ,
+        i_mem_grant : ic_grant           ,
+        o_fill_done : ic_fill_done       ,
+        o_imem_addr : o_imem_addr        , // P9.6: non-DRAM passthrough
+        i_imem_rdata: i_imem_rdata       ,
+        o_imem_ren  : o_imem_ren         ,
     );
     let _unused_icache_rdata_next: logic<32> = icache_rdata_next;
     let _unused_icache_rdata_next_valid: logic = icache_rdata_next_valid;
@@ -4730,6 +4755,8 @@ pub module heliodor_core #(
     var dc_mem_ren  : logic        ;
     var dc_mem_wstrb: logic<8>  [8];
     var dc_mem_req  : logic        ;
+    var dc_mem_rfo  : logic        ; // P9.6: dcache RFO (muxed into o_dmem_rfo)
+    var dc_grant    : logic        ; // P9.6: read-port grant demuxed to the dcache
     var dc_memw_addr: logic<64>; // S23: write-channel address
     var dc_memw_req : logic    ;
     // Phase 8 S10.1: non-blocking miss (MSHR) interface, consumed by the MSHR
@@ -4800,7 +4827,7 @@ pub module heliodor_core #(
 
         o_memr_addr      : dc_mem_addr                   ,
         o_memr_ren       : dc_mem_ren                    ,
-        o_memr_rfo       : o_dmem_rfo                    , // P9.2: store fill = RFO
+        o_memr_rfo       : dc_mem_rfo                    , // P9.2: store fill = RFO (P9.6: muxed below)
         i_fill_excl      : i_dmem_fill_excl              , // P9.2: home grant state
         i_mem_rdata      : i_dmem_rdata                  ,
         o_memw_addr      : dc_memw_addr                  , // S23: write channel
@@ -4832,7 +4859,7 @@ pub module heliodor_core #(
         o_evict2_v       : dc_evict2_v                   ,
         o_evict2_addr    : dc_evict2_addr                ,
         o_memr_req       : dc_mem_req                    ,
-        i_memr_grant     : i_dmem_grant                  ,
+        i_memr_grant     : dc_grant                      , // P9.6: demuxed read-port grant
         o_memw_req       : dc_memw_req                   ,
         i_memw_grant     : i_dmemw_grant                 ,
     );
@@ -5162,24 +5189,53 @@ pub module heliodor_core #(
         mshr_cdb.fault_vaddr  = '0;
     }
 
-    // M8.C: o_dmem is now purely the dcache mem side — imem PTW moved to the
-    // dedicated o_iptw bus, so no arbiter mux here anymore. S23: read channel
-    // on o_dmem_addr/ren, write channel on o_dmemw_addr + wen/wdata/wstrb.
-    assign o_dmem_addr = dc_mem_addr;
+    // ============================================================
+    // P9.6: D/I read-port arbiter. The I-cache fill (an UNCOUNTED coherent read
+    // through mem_ctrl) shares this hart's single L2 read transaction port with
+    // the D-cache. The D-cache (loads / store-RFO / uncached MMIO) has strict
+    // priority; the I-cache sneaks in only when the D-cache is not requesting.
+    // ic_owns LATCHES the port for the whole transaction (accept → 8 STREAM
+    // beats) so a mid-transaction D-cache request waits — mem_ctrl has one slot
+    // per hart, and switching the port mid-stream would strand the I-fill.
+    //   - ic_route: combinational routing this cycle.
+    //   - set ic_owns on the I-cache's accept grant; clear on its fill-done pulse.
+    //   - the FENCE.I drain keeps the I-cache `filling` (hence ic_owns) in
+    //     lockstep with mem_ctrl's slot, so ic_fill_done always fires.
+    // ============================================================
+    assign ic_route = ic_owns || (ic_mem_req && !dc_mem_req);
+    assign ic_grant = i_dmem_grant && ic_route;
+    assign dc_grant = i_dmem_grant && !ic_route;
+    always_ff (clk, rst) {
+        if_reset {
+            ic_owns = 1'b0;
+        } else {
+            if ic_owns {
+                if ic_fill_done {
+                    ic_owns = 1'b0;
+                }
+            } else if ic_mem_req && !dc_mem_req && i_dmem_grant {
+                ic_owns = 1'b1;
+            }
+        }
+    }
+
+    // S23: read channel on o_dmem_addr/ren, write channel on o_dmemw_addr +
+    // wen/wdata/wstrb. P9.6: the read channel is muxed (I-cache when ic_route).
+    assign o_dmem_addr   = if ic_route ? ic_mem_addr : dc_mem_addr;
+    assign o_dmem_ren    = if ic_route ? 1'b0 : dc_mem_ren; // I-fill is DRAM (no MMIO ren)
+    assign o_dmem_req    = if ic_route ? ic_mem_req : dc_mem_req;
+    assign o_dmem_rfo    = if ic_route ? 1'b0 : dc_mem_rfo; // I-read is never RFO
+    assign o_dmem_iread  = ic_route;
     for l in 0..8 :gen_dmemw_lane {
         assign o_dmem_wdata[l] = dc_mem_wdata[l];
         assign o_dmem_wstrb[l] = dc_mem_wstrb[l];
     }
     assign o_dmem_wen = dc_mem_wen;
-    assign o_dmem_ren = dc_mem_ren;
     assign o_dmemw_addr  = dc_memw_addr;
     assign o_dmemw_req   = dc_memw_req;
     // M8: hi-side carry for a misaligned STORE that spans into the next dword.
     assign o_dmem_wdata_hi = st_wdata_hi;
     assign o_dmem_wstrb_hi = dc_st_wstrb_hi;
-    // M9 SMP: assert the bus request whenever the dcache needs the dmem bus
-    // (fill / write-through / grant-wait).
-    assign o_dmem_req      = dc_mem_req;
 
     // i_dmem_rdata_next (top-level next-dword) is superseded by the dcache's
     // own o_rdata_next; keep the port for tb compatibility.
