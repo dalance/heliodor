@@ -331,6 +331,9 @@ pub module heliodor_core #(
     var dmu_pbmt_unc : logic                ; // P10 Svpbmt: data MMU NC/IO translation
     var csr_adue     : logic                ; // P10 Svadu: menvcfg.ADUE (HW A/D update)
     var dmu_ad_wb    : logic                ; // P10 Svadu: data MMU A/D write-back active
+    var csr_pmm_m    : logic             <2>; // P10 Supm: mseccfg.PMM (M-mode pointer mask)
+    var csr_pmm_s    : logic             <2>; // P10 Supm: menvcfg.PMM (S-mode)
+    var csr_pmm_u    : logic             <2>; // P10 Ssnpm: senvcfg.PMM (U-mode)
     var csr_mpp      : logic             <2>;
     var csr_tvm      : logic                ;
     var csr_tsr      : logic                ;
@@ -361,6 +364,19 @@ pub module heliodor_core #(
     // mode); under an MMU the same PA aliases across VAs and MMIO would be
     // wrongly forwarded, so loads fall back to baseline store-ordering there.
     let dmem_vm_on: logic = satp_shadow[63:60] == 4'd8 && dmem_eff_priv != csr_pkg::PrivLevel::MACHINE;
+
+    // P10 Supm/Ssnpm: select the pointer-masking mode by the data access's
+    // effective privilege (M→mseccfg, S→menvcfg, U→senvcfg). The masked bits are
+    // sign-extended when the address is a translated VA (dmem_vm_on), else zeroed
+    // (bare PA). Fed to both ALU AGUs; PMM=0 at reset makes it a no-op.
+    let pm_mode: logic<2> = if dmem_eff_priv == csr_pkg::PrivLevel::MACHINE ?
+        csr_pmm_m
+    : if dmem_eff_priv == csr_pkg::PrivLevel::SUPERVISOR ?
+        csr_pmm_s
+    :
+        csr_pmm_u
+    ;
+    let pm_va: logic = dmem_vm_on;
 
     // M5.D.2: forward declaration for IQ-issue/CDB stall gate; driven
     // by the dmem_mmu inst near end of file. Bare mode keeps this at 0.
@@ -1793,6 +1809,8 @@ pub module heliodor_core #(
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
         i_rs1_data        : prf_rs1_data                                        ,
         i_rs2_data        : alu_rs2_data                                        ,
+        i_pm_mode         : pm_mode                                            ,
+        i_pm_va           : pm_va                                              ,
         // M8.B: LOAD result + next-dword come from the dcache (combinational
         // hit data). On a miss dcache_stall=1 gates i_issue_valid above so the
         // CDB write is suppressed until the fill lands; the IQ keeps the op
@@ -1853,6 +1871,8 @@ pub module heliodor_core #(
         i_issue_rob_idx   : iq_iss_rob_idx2 , // S3.b: slot-1 rob idx
         i_rs1_data        : prf_rs1_data2   ,
         i_rs2_data        : prf_rs2_data2   ,
+        i_pm_mode         : pm_mode         , // P10 pointer masking (slot-1 bare loads)
+        i_pm_va           : pm_va           ,
         i_load_data       : dcache_rdata2   , // S5.2: 2nd dcache read
         i_load_data_next  : dcache_rdata2_next,
         i_fwd_data        : stld_fwd_data2  , // S5.2: 2nd forward network
@@ -2891,6 +2911,9 @@ pub module heliodor_core #(
         o_mstatus_fs  : csr_fs       ,
         o_menvcfg_pbmte: csr_pbmte   ,
         o_menvcfg_adue : csr_adue    ,
+        o_pmm_m        : csr_pmm_m   ,
+        o_pmm_s        : csr_pmm_s   ,
+        o_pmm_u        : csr_pmm_u   ,
         i_sret_fire   : commit_sret  ,
         i_trap_to_s   : trap_to_s    ,
         // M8.C: external IRQ pins from harness (tie low when unused).
@@ -3261,14 +3284,34 @@ pub module heliodor_core #(
     // Use per-field outputs from iq_int (struct-field READ has sim bug).
     let amo_is_sc_iss : logic     = iq_iss_amo_funct5 == 5'b00011;
     let agu_imm_iss   : logic<64> = if iq_iss_is_amo ? 64'd0 : iq_issue_op.base.imm;
-    let agu_addr_iss  : logic<64> = prf_rs1_data + agu_imm_iss;
+    // P10 Supm/Ssnpm: the actual load/AMO access address sent to the MMU/dcache
+    // comes from here (not u_alu's internal agu), so it must get the same pointer
+    // masking u_alu applies — otherwise the access and u_alu's data formatting /
+    // fault VA would diverge. PMM=0 → agu_addr_iss == agu_raw_iss (no-op).
+    let agu_raw_iss   : logic<64> = prf_rs1_data + agu_imm_iss;
+    var agu_addr_iss  : logic<64>;
+    always_comb {
+        case pm_mode {
+            2'b10  : agu_addr_iss = {(if pm_va ? agu_raw_iss[56] : 1'b0) repeat 7, agu_raw_iss[56:0]};
+            2'b11  : agu_addr_iss = {(if pm_va ? agu_raw_iss[47] : 1'b0) repeat 16, agu_raw_iss[47:0]};
+            default: agu_addr_iss = agu_raw_iss;
+        }
+    }
     let issue_amo_read: logic     = iq_issue_valid && iq_iss_is_amo && !amo_is_sc_iss;
     let issue_is_load : logic     = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_read;
     // Phase 8 S5.2: slot-1 (pipe-1) LOAD effective address for the 2nd dcache read
     // port. alu_wrap (u_alu2) re-derives the same agu internally; this drives the
     // dcache i_addr2 and the 2nd forward network. Slot-1 never issues AMO/STORE
     // (pipe1_ok), so the immediate is always the load offset (no AMO-zero case).
-    let agu_addr_iss2 : logic<64> = prf_rs1_data2 + iq_issue_op2.base.imm;
+    let agu_raw_iss2  : logic<64> = prf_rs1_data2 + iq_issue_op2.base.imm;
+    var agu_addr_iss2 : logic<64>; // P10 pointer masking (matches u_alu2 / slot-0)
+    always_comb {
+        case pm_mode {
+            2'b10  : agu_addr_iss2 = {(if pm_va ? agu_raw_iss2[56] : 1'b0) repeat 7, agu_raw_iss2[56:0]};
+            2'b11  : agu_addr_iss2 = {(if pm_va ? agu_raw_iss2[47] : 1'b0) repeat 16, agu_raw_iss2[47:0]};
+            default: agu_addr_iss2 = agu_raw_iss2;
+        }
+    }
     let issue2_is_load: logic     = iq_issue_valid2 && iq_iss_is_load2;
 
     // ============================================================
