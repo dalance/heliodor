@@ -1,7 +1,28 @@
 # P9.6 — Coherent instruction side (I-cache + I-PTW through the L2)
 
-Design note. **Not yet implemented** — this captures the analysis and the plan
-so the implementation can start with a clear target. (Session 2026-06-15.)
+Design note. **✅ IMPLEMENTED (2026-06-15)** — but with the *lighter* variant,
+not the full directory-tracked design this note recommends below. The sections
+2 (parallel `ishr_` I-sharer mask) and 5's precise I-cache invalidate were NOT
+built: the I-cache and I-PTW reads go through `mem_ctrl` as **UNCOUNTED reads**
+(recall-on-owned gives current data) with **no directory tracking** — I-cache
+staleness is handled by `FENCE.I` (the RISC-V fetch contract), no weaker than
+the prior flush. Phases:
+- **Phase 1** (`2dc7416`): I-cache fill 16×32b→8×64b grant-gated through `mem_ctrl`
+  (`i_iread`, no cadd/install); D/IS read-port arbiter in the core; non-DRAM
+  (ROM/firmware) fetch stays an uncached `o_imem` passthrough (`i_dram` select);
+  prefetch OFF (counterproductive on the shared port).
+- **Phase 2** (`012e1db`): I-PTW PTE reads through the same IS read port (a
+  coherent dword read), `o_iptw` retired. (Not the dcache route 4(a) — the
+  dcache CPU port was judged too bug-prone to touch; the mem_ctrl route is
+  isolated. Key fix: latch the read addr — a redirect mid-read else corrupts
+  the captured PTE.)
+- **Phase 3** (`a9879cb`): retire the D$ flush sweep via core param
+  `COHERENT_IFETCH` (SoC=1, bare harnesses=0 since they have no recall).
+
+Result: N=1 12.34M→10.15M (-17.7%), N=2 15.76M→13.88M (-11.9%), N=4 ~neutral
+(shared-port I-fetch contention scales with N). See the `project_phase9_p96_*`
+memory for the as-built detail. The "Target design" below is the original
+(heavier) plan, kept for the analysis.
 
 ## Goal
 
