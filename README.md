@@ -9,8 +9,9 @@ boots a mainline Linux 5.15 SMP kernel through OpenSBI to SBI shutdown.
 The core is a 2-wide superscalar, PRF-based out-of-order machine with in-order
 (up to 2-wide) commit. It implements **RV64IMAFDC_Zicsr_Zifencei** at all three
 privilege levels (M/S/U) with Sv39 virtual memory, branch prediction,
-non-blocking private L1 caches, a shared L2, and 1/2/4-hart SMP. Stock Linux
-5.15 boots on all three hart counts and reaches SBI SRST shutdown.
+non-blocking write-back private L1 caches kept coherent through a shared L2
+with an inclusive MESI directory, and 1/2/4/8-hart SMP. Stock Linux 5.15 boots on
+all four hart counts (1/2/4/8) and reaches SBI SRST shutdown.
 
 ## Architecture
 
@@ -45,24 +46,32 @@ non-blocking private L1 caches, a shared L2, and 1/2/4-hart SMP. Stock Linux
   instruction / data MMUs, `SFENCE.VMA`)
 - **Caches** (`src/cache/`)
   - L1 I-cache: 16 KB, 4-way, 64 B line, tree-PLRU, non-blocking
-    (hit-under-fill, next-line prefetch, streaming), single-cycle assembly of
-    instructions straddling a line boundary
-  - L1 D-cache: 16 KB, 4-way, 64 B line, write-through / no-write-allocate,
+    (hit-under-fill, streaming), single-cycle assembly of instructions
+    straddling a line boundary; fills coherently through the L2 (recall-on-owned)
+    so self-modified code is seen after a FENCE.I with no flush sweep
+  - L1 D-cache: 16 KB, 4-way, 64 B line, write-back with a MESI-style inclusive
+    L2 directory (per-line ownership, read-for-ownership store fills, dirty
+    writeback / recall on eviction; full-line stores stay posted write-through),
     non-blocking (2 MSHRs, hit-under-miss, critical-word-first fill with early
     restart), a second hit-only read port for dual loads, and separate
     read / write bus channels
-  - Shared L2: 128 KB, 4-way, 64 B line, line-granular, write-through,
-    tree-PLRU; looked up / installed by the split-transaction read controller
+  - Shared L2: 128 KB, 4-way, 64 B line, line-granular, write-through to DRAM,
+    tree-PLRU, with the inclusive coherence directory (per-hart sharer mask +
+    owner bit); looked up / installed by the split-transaction read controller
   - Split-transaction DRAM reads (`mem_ctrl`): a line fill is a tagged
     per-hart transaction with modeled latency — L2 hit ≈ 4 cycles to first
     beat, L2 miss ≈ 30 (DRAM wait + 8-beat gather), one outstanding line read
     per hart progressing independently; writes stay 1-cycle posted
     write-through and contend with gathers for the DRAM port
-- **SMP** (`heliodor_soc_smp #(N_HARTS = 1 / 2 / 4)`)
+- **SMP** (`heliodor_soc_smp #(N_HARTS = 1 / 2 / 4 / 8)`)
   - N private cores share one `memory_bus` DRAM arbiter (independent read /
     write channels), the L2, and the CLINT / PLIC / UART
-  - Coherence via write-through + same-cycle line-granular invalidate
-    broadcast; LR/SC and AMO are serialized through the bus arbiter
+  - Coherence via the L2 inclusive directory: write-back L1 D-caches with
+    precise invalidate, owner recall (cache-to-cache transfer), and in-cache
+    AMO / LR-SC (no bus lock). The instruction side is coherent too — I-cache
+    fills and the instruction page-table walker read through the L2 with recall,
+    so FENCE.I / SFENCE.VMA / satp need no D$ flush sweep. RVWMO is checked by a
+    litmus harness
 - **Peripherals** (`src/peripheral/`): CLINT, PLIC, UART
 - **Boot**: mainline Linux 5.15 SMP via the bundled OpenSBI M-mode firmware
 
@@ -70,10 +79,11 @@ non-blocking private L1 caches, a shared L2, and 1/2/4-hart SMP. Stock Linux
 
 | Suite                                                                       | Result |
 |-----------------------------------------------------------------------------|--------|
-| Default `veryl test` (unit + inline arch suites + N=2 litmus, on the OoO core) | 153 passed, 0 failed (19 ignored) |
-| Linux 5.15 boot, 1-hart (`--ignored --test test_soc_linux_boot`)            | pass (~9.1M cycles) |
-| Linux 5.15 boot, 2-hart (`--ignored --test test_soc_smp_linux_boot_2hart`)  | pass (~12.3M cycles) |
-| Linux 5.15 boot, 4-hart (`--ignored --test test_soc_smp_linux_boot_4hart`)  | pass (~16.6M cycles) |
+| Default `veryl test` (unit + inline arch suites + N=2 litmus, on the OoO core) | 155 passed, 0 failed (21 ignored) |
+| Linux 5.15 boot, 1-hart (`--ignored --test test_soc_linux_boot`)            | pass (~10.2M cycles) |
+| Linux 5.15 boot, 2-hart (`--ignored --test test_soc_smp_linux_boot_2hart`)  | pass (~13.9M cycles) |
+| Linux 5.15 boot, 4-hart (`--ignored --test test_soc_smp_linux_boot_4hart`)  | pass (~20.0M cycles) |
+| Linux 5.15 boot, 8-hart (`--ignored --test test_soc_smp_linux_boot_8hart`)  | pass (~26.9M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
 (integer + privileged) and rv64uf / ud (FP), hand-maintained in
@@ -136,10 +146,11 @@ cd veryl && cargo build --profile release-verylup
 Then from the project root:
 
 ```bash
-veryl/target/release-verylup/veryl test                                                  # 152 tests
+veryl/target/release-verylup/veryl test                                                  # 155 tests
 veryl/target/release-verylup/veryl test --ignored --test test_soc_linux_boot             # 1-hart Linux boot
 veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_2hart   # 2-hart SMP Linux boot
 veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_4hart   # 4-hart SMP Linux boot
+veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_8hart   # 8-hart SMP Linux boot
 ```
 
 The `riscv-tests` arch hex files are committed under `test/riscv-arch-test/build/`;
@@ -151,7 +162,7 @@ steps, Verilator cross-check).
 ## Development Phases
 
 Development history — the **Architecture** section above describes the design
-as of Phase 8:
+as of Phase 9:
 
 | Phase | Scope                                    | Status       |
 |-------|------------------------------------------|--------------|
@@ -163,4 +174,4 @@ as of Phase 8:
 | 6     | 4-hart SMP (`gen_n4` round-robin, SBI HSM HART_START tuned for `wait_for_completion` timing) + shared 128KB 4-way L2 with tree-PLRU | complete |
 | 7     | Clean-slate OoO redesign: a from-scratch 1-wide pure-Tomasulo + PRF core that replaces the earlier OoO datapath, re-validated to RV64GC + 1/2/4-hart SMP Linux boot | complete |
 | 8     | Microarchitecture build-out on the Phase 7 core: 2-wide superscalar (fetch / rename / issue / commit), branch prediction (BTB + gshare + TAGE-lite + indirect BTB + RAS, execute-time early redirect), non-blocking L1s (MSHRs, hit-under-miss, critical-word-first), memory-dependence speculation + replay, committed-store buffer with line write-combining and store-to-load forwarding, split read/write bus channels — 1-hart boot 26M → 8.6M cycles, 4-hart 52M → 16M | complete |
-| 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller with modeled latency + line-granular L2 (P9.1); next: write-back D$ + MESI directory, cache-to-cache transfer, in-cache AMO/LR-SC, N=8 + L2 banking, PLIC wiring + ASID | in progress |
+| 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller + line-granular L2 (P9.1), write-back D$ + MESI inclusive directory (P9.2), cache-to-cache transfer + in-cache AMO/LR-SC (P9.3), N=8 SMP boot (P9.4), PLIC wiring + uncached MMIO + TLB ASID + selective SFENCE.VMA (P9.5), coherent instruction side — I-cache + I-PTW through L2, FENCE.I/SFENCE flush sweep retired (P9.6) | complete |
