@@ -149,6 +149,9 @@ pub module csr #(
     const ADDR_SCAUSE    : logic<12> = 12'h142;
     const ADDR_STVAL     : logic<12> = 12'h143;
     const ADDR_SIP       : logic<12> = 12'h144;
+    // P10 Sscofpmf: supervisor count-overflow register (read-only view of the
+    // mhpmevent OF bits, masked by mcounteren).
+    const ADDR_SCOUNTOVF : logic<12> = 12'hDA0;
     // P10 Sstc: supervisor timer compare + machine env config (STCE = bit 63).
     const ADDR_STIMECMP  : logic<12> = 12'h14D;
     const ADDR_MENVCFG   : logic<12> = 12'h30A;
@@ -214,8 +217,10 @@ pub module csr #(
     // sstatus visible bits: SIE(1), SPIE(5), SPP(8), FS(14:13), XS(16:15),
     // SUM(18), MXR(19), UXL(33:32), SD(63). UXL is read-only for RV64.
     const SSTATUS_MASK: logic<64> = 64'h8000_0003_000d_e162;
-    // sie/sip visible bits: SSIE/SSIP(1), STIE/STIP(5), SEIE/SEIP(9)
-    const SI_MASK: logic<64> = 64'h0000_0000_0000_0222;
+    // sie/sip visible bits: SSIE/SSIP(1), STIE/STIP(5), SEIE/SEIP(9),
+    // and P10 Sscofpmf LCOFIE/LCOFIP(13) so a delegated counter-overflow
+    // interrupt is visible/clearable through sie/sip.
+    const SI_MASK: logic<64> = 64'h0000_0000_0000_2222;
     // RV64 SXL/UXL = 2 (XLEN=64), required by spec for RV64 cores.
     const MSTATUS_XL_RO: logic<64> = 64'h0000_000a_0000_0000;
     // SSTATUS UXL bits only ([33:32])
@@ -230,6 +235,17 @@ pub module csr #(
     let stip_hw  : logic     = sstc_en && (i_mtime >= stimecmp);
     let stip_eff : logic     = if sstc_en ? stip_hw : mip[5];
     let mip_read : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
+
+    // P10 Sscofpmf: scountovf aggregates the mhpmevent[n].OF (bit 63) of
+    // counters 3..31 into bit n, masked by mcounteren[n] (a counter the
+    // supervisor may not read shows 0). Read-only.
+    var scountovf_val: logic<64>;
+    always_comb {
+        scountovf_val = 64'd0;
+        for n in 3..32 {
+            scountovf_val[n] = mhpmevent[n][63] && mcounteren[n];
+        }
+    }
 
     // === Combinational read ===
     var rd_data_w: logic<64>;
@@ -254,6 +270,7 @@ pub module csr #(
             ADDR_SCAUSE    : rd_data_w = scause;
             ADDR_STVAL     : rd_data_w = stval;
             ADDR_SIP       : rd_data_w = mip_read & SI_MASK;
+            ADDR_SCOUNTOVF : rd_data_w = scountovf_val; // P10 Sscofpmf (read-only)
             ADDR_STIMECMP  : rd_data_w = stimecmp;
             ADDR_MENVCFG   : rd_data_w = menvcfg;
             ADDR_MCOUNTEREN: rd_data_w = mcounteren;
@@ -322,6 +339,8 @@ pub module csr #(
             m_cause_w = 6'd1;
         } else if m_irqs_visible[5] {
             m_cause_w = 6'd5;
+        } else if m_irqs_visible[13] {
+            m_cause_w = 6'd13; // P10 Sscofpmf LCOFI (below the standard interrupts)
         } else {
             m_cause_w = 6'd0;
         }
@@ -334,6 +353,8 @@ pub module csr #(
             s_cause_w = 6'd1;
         } else if s_irqs_visible[5] {
             s_cause_w = 6'd5;
+        } else if s_irqs_visible[13] {
+            s_cause_w = 6'd13; // P10 Sscofpmf LCOFI
         } else {
             s_cause_w = 6'd0;
         }
@@ -542,10 +563,25 @@ pub module csr #(
                 let sel    : logic<4>  = ev_sel[3:0];
                 let sel_m1 : logic<4>  = sel - 4'd1;
                 let ev_idx : logic<3>  = sel_m1[2:0];
-                let ev_hit : logic     = sel != 4'd0 && sel <= 4'd8 && i_hpm_events[ev_idx];
+                // P10 Sscofpmf: per-mode counting filter. MINH(62)/SINH(61)/
+                // UINH(60) inhibit counting in M/S/U mode (VS/VU 59/58 unused —
+                // no hypervisor). All reset to 0, so legacy code counts as before.
+                let inhibit: logic = (priv == csr_pkg::PrivLevel::MACHINE && ev_sel[62])
+                    || (priv == csr_pkg::PrivLevel::SUPERVISOR && ev_sel[61])
+                    || (priv == csr_pkg::PrivLevel::USER && ev_sel[60]);
+                let ev_hit : logic     = sel != 4'd0 && sel <= 4'd8 && i_hpm_events[ev_idx] && !inhibit;
                 let c_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPMC_LO + (n as 12) - 12'd3);
+                let e_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPME_LO + (n as 12) - 12'd3);
                 if ev_hit && !c_wr {
+                    // P10 Sscofpmf: detect wrap (all-1s → 0) on this increment;
+                    // set the event's OF (bit 63) sticky and pend LCOFI (mip[13]).
+                    // A same-cycle event-CSR write owns OF, so suppress the set.
+                    let will_wrap: logic = mhpmcounter[n] == 64'hFFFFFFFFFFFFFFFF;
                     mhpmcounter[n] = mhpmcounter[n] + 64'd1;
+                    if will_wrap && !e_wr {
+                        mhpmevent[n][63] = 1'b1; // OF
+                        mip[13]          = 1'b1; // LCOFIP (sticky until SW clears)
+                    }
                 }
             }
         }
