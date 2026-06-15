@@ -17,6 +17,15 @@
  *   0x10       : Base extension
  *   0x54494D45 : Timer extension (TIME)
  *   0x53525354 : System Reset extension (SRST)
+ *   0x4442434E : Debug Console extension (DBCN) — needed by Linux >=6.x
+ *                earlycon=sbi, which prefers DBCN over legacy putchar.
+ *
+ * Build-time options:
+ *   -DRVA23_MENVCFG : program menvcfg with STCE (Sstc), PBMTE (Svpbmt),
+ *                     ADUE (Svadu), CBZE/CBCFE/CBIE (Zicboz/Zicbom) so a
+ *                     RVA23-aware kernel (>=6.x) can drive those features.
+ *                     MUST stay off for the Linux 5.15 boot (STCE makes
+ *                     mip.STIP hardware-driven, breaking the SBI timer path).
  */
 
     .section .text.start, "ax"
@@ -54,6 +63,7 @@
 #define SBI_EXT_HSM             0x48534D    /* "HSM" */
 #define SBI_EXT_IPI             0x735049    /* "sPI" — inter-processor IRQ */
 #define SBI_EXT_RFENCE          0x52464E43  /* "RFNC" — remote fence */
+#define SBI_EXT_DBCN            0x4442434E  /* "DBCN" — debug console */
 #define SBI_LEGACY_SEND_IPI     0x04        /* legacy IPI (a0 = mask ptr in S-mode VA) */
 
 /* ============================================================
@@ -89,6 +99,16 @@ _start:
     /* Allow S-mode to read counters (TIME/CYCLE/INSTRET) */
     li t0, 7
     csrw mcounteren, t0
+
+#ifdef RVA23_MENVCFG
+    /* RVA23: enable Sstc (STCE/63), Svpbmt (PBMTE/62), Svadu (ADUE/61) and
+     * Zicboz/Zicbom (CBZE/7, CBCFE/6, CBIE=01/4) for S-mode. Gated: the 5.15
+     * boot leaves this off so the firmware SBI timer path keeps driving STIP. */
+    li   t0, 7
+    slli t0, t0, 61              /* STCE | PBMTE | ADUE */
+    ori  t0, t0, 0xD0           /* CBZE | CBCFE | CBIE=01 (cbo.inval->flush) */
+    csrw 0x30a, t0
+#endif
 
     /* Delegate misaligned load/store(4,6), illegal(2), ecall-U(8),
      * inst/load/store page fault(12,13,15) to S-mode. */
@@ -380,6 +400,9 @@ m_handle_ecall:
      * architectures during early boot. */
     li t0, SBI_EXT_RFENCE
     beq a7, t0, sbi_rfence_stub
+    /* DBCN extension (0x4442434E) — debug console for earlycon=sbi */
+    li t0, SBI_EXT_DBCN
+    beq a7, t0, sbi_dbcn
 
     /* Unknown: SBI_ERR_NOT_SUPPORTED (-2) */
     li a0, -2
@@ -520,6 +543,8 @@ sbi_base_probe_extension:
     beq t3, t0, 1f                  /* IPI (sPI) */
     li t0, SBI_EXT_RFENCE
     beq t3, t0, 1f                  /* RFENCE */
+    li t0, SBI_EXT_DBCN
+    beq t3, t0, 1f                  /* DBCN */
     j sbi_return                    /* not available */
 1:  li a1, 1                        /* available */
     j sbi_return
@@ -597,6 +622,54 @@ sbi_rfence_stub:
     li a0, 0
     li a1, 0
     j sbi_return
+
+/* ---- SBI: Debug Console extension (EID 0x4442434E) ----
+ * FID 0: console_write(num_bytes=a0, base_lo=a1, base_hi=a2)
+ *        Writes num_bytes from the physical buffer at a1 to the UART.
+ *        On RV64 the whole address is in base_lo; base_hi must be 0.
+ * FID 1: console_write_byte(byte=a0) — single byte to UART.
+ * FID 2: console_read(...) — no input device, report 0 bytes read.
+ * Buffer addresses are physical, so M-mode loads reach them directly.
+ * Linux >=6.x earlycon=sbi prefers DBCN over the legacy putchar path. */
+sbi_dbcn:
+    li   t0, 0
+    beq  a6, t0, sbi_dbcn_write
+    li   t0, 1
+    beq  a6, t0, sbi_dbcn_write_byte
+    li   t0, 2
+    beq  a6, t0, sbi_dbcn_read
+    li   a0, -2                 /* SBI_ERR_NOT_SUPPORTED */
+    li   a1, 0
+    j    sbi_return
+
+sbi_dbcn_write:
+    mv   t4, a0                 /* save num_bytes for the return value */
+    mv   t1, a1                 /* physical buffer pointer */
+    mv   t2, a0                 /* remaining count */
+    li   t0, UART_BASE
+    beqz t2, .Ldbcn_w_done
+.Ldbcn_w_loop:
+    lb   t3, 0(t1)
+    sb   t3, 0(t0)
+    addi t1, t1, 1
+    addi t2, t2, -1
+    bnez t2, .Ldbcn_w_loop
+.Ldbcn_w_done:
+    li   a0, 0                  /* SBI_SUCCESS */
+    mv   a1, t4                 /* bytes written = num_bytes */
+    j    sbi_return
+
+sbi_dbcn_write_byte:
+    li   t0, UART_BASE
+    sb   a0, 0(t0)
+    li   a0, 0                  /* SBI_SUCCESS */
+    li   a1, 0
+    j    sbi_return
+
+sbi_dbcn_read:
+    li   a0, 0                  /* SBI_SUCCESS */
+    li   a1, 0                  /* 0 bytes read (no console input) */
+    j    sbi_return
 
 /* ---- SBI: Hart State Management extension (EID 0x48534D) ---- */
 sbi_hsm:
@@ -749,6 +822,14 @@ _secondary_park:
     /* Allow S-mode counter access */
     li    t1, 7
     csrw  mcounteren, t1
+
+#ifdef RVA23_MENVCFG
+    /* RVA23 menvcfg (see hart-0 path). Per-hart CSR, so set on secondaries too. */
+    li    t1, 7
+    slli  t1, t1, 61            /* STCE | PBMTE | ADUE */
+    ori   t1, t1, 0xD0          /* CBZE | CBCFE | CBIE=01 */
+    csrw  0x30a, t1
+#endif
 
     /* Same delegation as hart 0 (medeleg + mideleg) */
     li    t1, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 8) | (1 << 12) | (1 << 13) | (1 << 15)
