@@ -141,6 +141,9 @@ pub module csr #(
     const ADDR_SCAUSE    : logic<12> = 12'h142;
     const ADDR_STVAL     : logic<12> = 12'h143;
     const ADDR_SIP       : logic<12> = 12'h144;
+    // P10 Sstc: supervisor timer compare + machine env config (STCE = bit 63).
+    const ADDR_STIMECMP  : logic<12> = 12'h14D;
+    const ADDR_MENVCFG   : logic<12> = 12'h30A;
     const ADDR_MCYCLE    : logic<12> = 12'hB00;
     const ADDR_MINSTRET  : logic<12> = 12'hB02;
     const ADDR_TIME      : logic<12> = 12'hC01; // user time (== mtime)
@@ -180,6 +183,10 @@ pub module csr #(
     var scause    : logic<64>;
     var stval     : logic<64>;
     var scounteren: logic<64>;
+    // P10 Sstc registers. stimecmp resets to all-1s so the timer never fires
+    // until S-/M-mode programs it; menvcfg.STCE (bit 63) gates the feature.
+    var stimecmp  : logic<64>;
+    var menvcfg   : logic<64>;
     // sstatus visible bits: SIE(1), SPIE(5), SPP(8), FS(14:13), XS(16:15),
     // SUM(18), MXR(19), UXL(33:32), SD(63). UXL is read-only for RV64.
     const SSTATUS_MASK: logic<64> = 64'h8000_0003_000d_e162;
@@ -189,6 +196,16 @@ pub module csr #(
     const MSTATUS_XL_RO: logic<64> = 64'h0000_000a_0000_0000;
     // SSTATUS UXL bits only ([33:32])
     const SSTATUS_XL_RO: logic<64> = 64'h0000_0002_0000_0000;
+
+    // P10 Sstc effective STIP. When menvcfg.STCE=1 the supervisor timer
+    // interrupt-pending bit (mip[5]) is hardware-driven by time>=stimecmp and
+    // the software-written mip.STIP is ignored; when STCE=0 it is the plain
+    // software-written bit (legacy SBI-timer path, unchanged). mip_read feeds
+    // the mip/sip CSR read so software observes the effective pending state.
+    let sstc_en  : logic     = menvcfg[63];
+    let stip_hw  : logic     = sstc_en && (i_mtime >= stimecmp);
+    let stip_eff : logic     = if sstc_en ? stip_hw : mip[5];
+    let mip_read : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
 
     // === Combinational read ===
     var rd_data_w: logic<64>;
@@ -212,7 +229,9 @@ pub module csr #(
             ADDR_SEPC      : rd_data_w = sepc;
             ADDR_SCAUSE    : rd_data_w = scause;
             ADDR_STVAL     : rd_data_w = stval;
-            ADDR_SIP       : rd_data_w = mip & SI_MASK;
+            ADDR_SIP       : rd_data_w = mip_read & SI_MASK;
+            ADDR_STIMECMP  : rd_data_w = stimecmp;
+            ADDR_MENVCFG   : rd_data_w = menvcfg;
             ADDR_MEDELEG   : rd_data_w = medeleg;
             ADDR_MIDELEG   : rd_data_w = mideleg;
             ADDR_MIE       : rd_data_w = mie;
@@ -221,7 +240,7 @@ pub module csr #(
             ADDR_MEPC      : rd_data_w = mepc;
             ADDR_MCAUSE    : rd_data_w = mcause;
             ADDR_MTVAL     : rd_data_w = mtval;
-            ADDR_MIP       : rd_data_w = mip;
+            ADDR_MIP       : rd_data_w = mip_read;
             ADDR_PMPCFG0   : rd_data_w = pmpcfg0;
             ADDR_PMPADDR0  : rd_data_w = pmpaddr0;
             ADDR_SATP      : rd_data_w = satp;
@@ -236,8 +255,12 @@ pub module csr #(
     // M8.C IRQ pending logic. mip[h/w-driven bits] OR with i_irq_*; the
     // CSR-written value still flows because mip is RW (handler clears).
     // mip layout: bit 1=SSIP, 3=MSIP, 5=STIP, 7=MTIP, 9=SEIP, 11=MEIP.
-    let mip_eff : logic<64> = mip | (if i_irq_sw_m ? 64'h0008 : 64'd0) | (if i_irq_timer_m ? 64'h0080 : 64'd0)
+    // mip_raw ORs the pin-driven hardware sources (MSIP/MTIP/MEIP/SEIP) into
+    // the software-written mip; the STIP bit (5) is then overridden by the
+    // Sstc effective value (software-written when STCE=0, time>=stimecmp when 1).
+    let mip_raw : logic<64> = mip | (if i_irq_sw_m ? 64'h0008 : 64'd0) | (if i_irq_timer_m ? 64'h0080 : 64'd0)
         | (if i_irq_ext_m ? 64'h0800 : 64'd0) | (if i_irq_ext_s ? 64'h0200 : 64'd0);
+    let mip_eff : logic<64> = (mip_raw & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
     let mie_pend: logic<64> = mip_eff & mie;
     // M-mode global enable: MIE for M-priv; always enabled if priv < M.
     // S-mode global enable: SIE for S-priv (only when not delegated to M).
@@ -339,6 +362,8 @@ pub module csr #(
             scause     = 64'd0;
             stval      = 64'd0;
             scounteren = 64'd0;
+            stimecmp   = 64'hFFFF_FFFF_FFFF_FFFF;
+            menvcfg    = 64'd0;
         } else {
             // M9.A.304: snapshot priv BEFORE any trap/mret/sret update below.
             priv_prev = priv;
@@ -429,6 +454,10 @@ pub module csr #(
                     ADDR_SEPC      : sepc       = i_wr_data;
                     ADDR_SCAUSE    : scause     = i_wr_data;
                     ADDR_STVAL     : stval      = i_wr_data;
+                    // P10 Sstc. stimecmp is RW from M-mode and (when STCE=1)
+                    // from S-mode; menvcfg.STCE enables the hardware STIP path.
+                    ADDR_STIMECMP  : stimecmp   = i_wr_data;
+                    ADDR_MENVCFG   : menvcfg    = i_wr_data;
                     default        : {}
                 }
             }
