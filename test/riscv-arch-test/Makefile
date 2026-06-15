@@ -13,7 +13,7 @@ CC       := riscv64-unknown-elf-gcc
 OBJCOPY  := riscv64-unknown-elf-objcopy
 BIN2HEX  := python3 ../c/bin2hex.py
 
-CFLAGS := -march=rv64g_zba_zbb_zbs -mabi=lp64 -nostdlib -nostartfiles -static \
+CFLAGS := -march=rv64g_zba_zbb_zbs_zicbom_zicboz -mabi=lp64 -nostdlib -nostartfiles -static \
           -mcmodel=medany -fvisibility=hidden \
           -I$(ENV)/p -I$(ENV) -I$(UPSTREAM)/isa/macros/scalar
 LDFLAGS := -T $(ENV)/p/link.ld
@@ -21,9 +21,9 @@ LDFLAGS := -T $(ENV)/p/link.ld
 BUILD := build
 
 # Test suites (all auto-discovered from upstream/isa/<suite>/*.S)
-# Phase 10: B extension (Zba/Zbb/Zbs) — march above gains zba_zbb_zbs, suites below.
+# Phase 10: B extension (Zba/Zbb/Zbs) + CMO (Zicbom/Zicboz) — march above, suites below.
 SUITES := rv64ui rv64um rv64ua rv64uc rv64uf rv64ud rv64mi rv64si \
-          rv64uzba rv64uzbb rv64uzbs
+          rv64uzba rv64uzbb rv64uzbs rv64mzicbo
 
 define SUITE_template
 $(1)_NAMES := $$(patsubst $$(UPSTREAM)/isa/$(1)/%.S,%,$$(wildcard $$(UPSTREAM)/isa/$(1)/*.S))

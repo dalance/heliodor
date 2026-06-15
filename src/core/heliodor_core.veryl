@@ -1431,6 +1431,7 @@ pub module heliodor_core #(
         rob_alloc_entry.sfence_rs2 = dec_op.rs2_arch;
         rob_alloc_entry.is_fence_i = dec_op.is_fence_i;
         rob_alloc_entry.is_fence  = dec_op.is_fence;
+        rob_alloc_entry.is_cbo_zero = dec_op.is_cbo_zero;
         rob_alloc_entry.is_amo    = dec_op.is_amo;
     }
 
@@ -1571,6 +1572,7 @@ pub module heliodor_core #(
         rob_alloc_entry2.sfence_rs2     = dec_op2.rs2_arch;
         rob_alloc_entry2.is_fence_i     = dec_op2.is_fence_i;
         rob_alloc_entry2.is_fence       = dec_op2.is_fence;
+        rob_alloc_entry2.is_cbo_zero    = dec_op2.is_cbo_zero;
         rob_alloc_entry2.is_amo         = dec_op2.is_amo;
     }
 
@@ -2296,6 +2298,7 @@ pub module heliodor_core #(
     var c_sfence_rs2  : logic<5>        ; // P9.5: SFENCE.VMA rs2 (ASID reg) at head
     var c_is_fence_i  : logic           ; // M8.A FENCE.I → icache flush
     var c_is_fence    : logic           ; // P9.0: plain FENCE (drain-wait gate)
+    var c_is_cbo_zero : logic           ; // P10 Zicboz cbo.zero at commit
     var c_is_ifault   : logic           ;
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
@@ -2541,6 +2544,7 @@ pub module heliodor_core #(
         o_commit_sfence_rs2  : c_sfence_rs2         ,
         o_commit_is_fence_i  : c_is_fence_i         ,
         o_commit_is_fence    : c_is_fence           ,
+        o_commit_is_cbo_zero : c_is_cbo_zero        ,
         o_commit_is_ifault   : c_is_ifault          ,
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_is_sfault   : c_is_sfault          ,
@@ -3789,7 +3793,9 @@ pub module heliodor_core #(
     let st_mask_ext : logic<16>  = ({8'd0, st_mask_base} as 16) << st_byte_off;
     let st_wdata_ext: logic<128> = ({64'd0, c_store_data} as 128) << ({4'd0, st_byte_off, 3'b000} as 7);
     let st_wstrb    : logic<8>   = st_mask_ext[7:0];
-    let st_wstrb_hi : logic<8>   = st_mask_ext[15:8];
+    // P10 cbo.zero acts on the whole line (offset irrelevant) — force the
+    // misalign hi-strobe to 0 so it classifies as an SB-eligible line store.
+    let st_wstrb_hi : logic<8>   = if c_is_cbo_zero ? 8'd0 : st_mask_ext[15:8];
     let st_wdata    : logic<64>  = st_wdata_ext[63:0];
     let st_wdata_hi : logic<64>  = st_wdata_ext[127:64];
 
@@ -3809,8 +3815,11 @@ pub module heliodor_core #(
     // path (correct everywhere, just slower; in the Linux boot this window
     // is OpenSBI text/data, which writes it rarely).
     let st_tohost_page: logic = (c_store_addr[31:14] == 18'h20000) || (c_store_addr[31:12] == 20'h80008);
+    // P10 cbo.zero is exempt from the tohost-page exclusion: it is a full-line
+    // write (no partial merge that could hide from the harness), and the harness
+    // only watches the tohost word — so it may buffer like any DRAM line store.
     assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0
-        && c_store_addr[63:25] == 39'h40 && !st_tohost_page;
+        && c_store_addr[63:25] == 39'h40 && (!st_tohost_page || c_is_cbo_zero);
 
     // Core dmem view (pre-MMU virtual address)
     //
@@ -4195,7 +4204,9 @@ pub module heliodor_core #(
             }
         }
     }
-    assign sb_merge_ok = sb_match_v && !(sb_match_idx == 2'd0 && sb_pop);
+    // P10 cbo.zero always allocates a fresh full-line entry (never merges into a
+    // partial entry); in-order drain makes the younger zero entry win.
+    assign sb_merge_ok = sb_match_v && !(sb_match_idx == 2'd0 && sb_pop) && !c_is_cbo_zero;
     assign sb_push     = sb_elig && (sb_merge_ok || !sb_full);
     let sb_alloc: logic = sb_push && !sb_merge_ok;
     // The issuing AMO/LR read's dword span vs the buffered entries (S27:
@@ -4298,12 +4309,21 @@ pub module heliodor_core #(
                     for i in 0..SB_N {
                         if widx == (i as 4) {
                             sb_line[i] = sb_pa[63:6];
-                            sb_lmap[i] = 8'd1 << sb_mlane;
-                            for l in 0..8 {
-                                sb_strb[i * 8 + l] = 8'd0;
+                            if c_is_cbo_zero {
+                                // P10 Zicboz: fill the whole 64B line with zero.
+                                sb_lmap[i] = 8'hFF;
+                                for l in 0..8 {
+                                    sb_data[i * 8 + l] = 64'd0;
+                                    sb_strb[i * 8 + l] = 8'hFF;
+                                }
+                            } else {
+                                sb_lmap[i] = 8'd1 << sb_mlane;
+                                for l in 0..8 {
+                                    sb_strb[i * 8 + l] = 8'd0;
+                                }
+                                sb_data[{(i as 2), sb_mlane}] = st_wdata;
+                                sb_strb[{(i as 2), sb_mlane}] = st_wstrb;
                             }
-                            sb_data[{(i as 2), sb_mlane}] = st_wdata;
-                            sb_strb[{(i as 2), sb_mlane}] = st_wstrb;
                         }
                     }
                 }
