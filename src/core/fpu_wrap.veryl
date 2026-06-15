@@ -76,6 +76,315 @@ pub module fpu_wrap #(
     let d1: logic<64> = fwd_fp_rs1;
     let d2: logic<64> = fwd_fp_rs2;
 
+    // ============================================================
+    // P10 Zfhmin: half-precision (binary16) conversions. Each produces a
+    // (result, fflags) pair referenced by the FpuOp case blocks below, mirroring
+    // how the arithmetic submodules feed fp_*_result / fp_*_fflags. Widening
+    // (h→s/d) is exact; narrowing (s/d→h) rounds with G/R/S + tininess (UF).
+    // The half rs1 is NaN-boxed in the low 16 bits (upper 48 all-1); an
+    // improperly boxed operand reads as a canonical half NaN.
+    // ============================================================
+    let h_nanboxed: logic     = fwd_fp_rs1[63:16] == 48'hFFFFFFFFFFFF;
+    let h_val     : logic<16> = if h_nanboxed ? fwd_fp_rs1[15:0] : fpu_pkg::CANONICAL_NAN_H;
+
+    var cvt_s_h_res: logic<64>;
+    var cvt_s_h_fl : logic<5> ;
+    var cvt_d_h_res: logic<64>;
+    var cvt_d_h_fl : logic<5> ;
+    var cvt_h_s_res: logic<64>;
+    var cvt_h_s_fl : logic<5> ;
+    var cvt_h_d_res: logic<64>;
+    var cvt_h_d_fl : logic<5> ;
+
+    // FCVT.S.H : half → single (widening, exact). NaN-boxed single result.
+    always_comb {
+        let hs    : logic     = h_val[15];
+        let he    : logic<5>  = h_val[14:10];
+        let hm    : logic<10> = h_val[9:0];
+        let h_snan: logic     = he == 5'h1F && hm[9] == 1'b0 && hm[8:0] != 9'd0;
+        cvt_s_h_fl  = 5'd0;
+        cvt_s_h_res = {32'hFFFFFFFF, fpu_pkg::CANONICAL_NAN_S};
+        if he == 5'h1F && hm != 10'd0 {
+            if h_snan {
+                cvt_s_h_fl = 5'b10000; // NV on signaling NaN
+            }
+        } else if he == 5'h1F {
+            cvt_s_h_res = {32'hFFFFFFFF, hs, 8'hFF, 23'd0}; // Inf
+        } else if he == 5'd0 && hm == 10'd0 {
+            cvt_s_h_res = {32'hFFFFFFFF, hs, 31'd0}; // Zero
+        } else if he == 5'd0 {
+            // Subnormal half → normal single. Normalize hm: find leading one.
+            var hlz: logic<5>;
+            hlz = 5'd10;
+            for i in 0..10 {
+                if hm[9 - i] == 1'b1 && hlz == 5'd10 {
+                    hlz = i as 5;
+                }
+            }
+            let sh_amt: logic<5>  = hlz + 5'd1;
+            let frac23: logic<23> = ({hm, 13'd0}) << sh_amt;
+            let sexp  : logic<8>  = 8'd112 - {3'd0, hlz};
+            cvt_s_h_res = {32'hFFFFFFFF, hs, sexp, frac23};
+        } else {
+            // Normal half → normal single. exp bias adjust = 127-15 = 112.
+            cvt_s_h_res = {32'hFFFFFFFF, hs, ({3'd0, he} + 8'd112), hm, 13'd0};
+        }
+    }
+
+    // FCVT.D.H : half → double (widening, exact).
+    always_comb {
+        let hs    : logic     = h_val[15];
+        let he    : logic<5>  = h_val[14:10];
+        let hm    : logic<10> = h_val[9:0];
+        let h_snan: logic     = he == 5'h1F && hm[9] == 1'b0 && hm[8:0] != 9'd0;
+        cvt_d_h_fl  = 5'd0;
+        cvt_d_h_res = fpu_pkg::CANONICAL_NAN_D;
+        if he == 5'h1F && hm != 10'd0 {
+            if h_snan {
+                cvt_d_h_fl = 5'b10000;
+            }
+        } else if he == 5'h1F {
+            cvt_d_h_res = {hs, 11'h7FF, 52'd0}; // Inf
+        } else if he == 5'd0 && hm == 10'd0 {
+            cvt_d_h_res = {hs, 63'd0}; // Zero
+        } else if he == 5'd0 {
+            // Subnormal half → normal double.
+            var hlz: logic<5>;
+            hlz = 5'd10;
+            for i in 0..10 {
+                if hm[9 - i] == 1'b1 && hlz == 5'd10 {
+                    hlz = i as 5;
+                }
+            }
+            let sh_amt: logic<5>  = hlz + 5'd1;
+            let frac52: logic<52> = ({hm, 42'd0}) << sh_amt;
+            let dexp  : logic<11> = 11'd1008 - {6'd0, hlz};
+            cvt_d_h_res = {hs, dexp, frac52};
+        } else {
+            // Normal half → normal double. exp bias adjust = 1023-15 = 1008.
+            cvt_d_h_res = {hs, ({6'd0, he} + 11'd1008), hm, 42'd0};
+        }
+    }
+
+    // FCVT.H.S : single → half (narrowing, rounded). NaN-boxed half result.
+    always_comb {
+        let xs   : logic     = s1_val[31];
+        let xe   : logic<8>  = s1_val[30:23];
+        let xm   : logic<23> = s1_val[22:0];
+        let x_snan: logic    = xe == 8'hFF && xm[22] == 1'b0 && xm[21:0] != 22'd0;
+        cvt_h_s_fl  = 5'd0;
+        cvt_h_s_res = {48'hFFFFFFFFFFFF, fpu_pkg::CANONICAL_NAN_H};
+        if xe == 8'hFF && xm != 23'd0 {
+            if x_snan {
+                cvt_h_s_fl = 5'b10000;
+            }
+        } else if xe == 8'hFF {
+            cvt_h_s_res = {48'hFFFFFFFFFFFF, xs, 5'h1F, 10'd0}; // Inf
+        } else if xe == 8'd0 || xe <: 8'd103 {
+            // True zero, or magnitude below the smallest half subnormal (2^-24):
+            // round toward 0 / nearest gives signed zero. Inexact unless exact 0.
+            cvt_h_s_res = {48'hFFFFFFFFFFFF, xs, 15'd0};
+            if !(xe == 8'd0 && xm == 23'd0) {
+                // tiny nonzero → underflow + inexact (RDN/RUP could round to min
+                // subnormal, handled in the subnormal path for xe>=103).
+                cvt_h_s_fl = 5'b00011;
+            }
+        } else {
+            // het = single biased exp - 112 (half-vs-single bias diff).
+            let het: logic<12> = {4'd0, xe} - 12'd112;
+            // Round bits: keep top 10 mantissa bits xm[22:13]; G=xm[12], R=xm[11],
+            // S = OR of xm[10:0], L = xm[13] (kept-LSB for ties-to-even).
+            let g  : logic = xm[12];
+            let r  : logic = xm[11];
+            let s  : logic = xm[10:0] != 11'd0;
+            let l  : logic = xm[13];
+            var ru : logic;
+            case fp_rm_resolved {
+                3'b000 : ru = g && (r || s || l);
+                3'b001 : ru = 1'b0;
+                3'b010 : ru = xs && (g || r || s);
+                3'b011 : ru = !xs && (g || r || s);
+                3'b100 : ru = g;
+                default: ru = g && (r || s || l);
+            }
+            // overflow result selector (inf vs max-normal) by rounding mode.
+            var ovf_inf: logic;
+            case fp_rm_resolved {
+                3'b001 : ovf_inf = 1'b0;
+                3'b010 : ovf_inf = xs;
+                3'b011 : ovf_inf = !xs;
+                default: ovf_inf = 1'b1;
+            }
+            let ovf_res: logic<16> = if ovf_inf ? {xs, 5'h1F, 10'd0} : {xs, 5'h1E, 10'h3FF};
+            if !het[11] && het >= 12'd31 {
+                cvt_h_s_res = {48'hFFFFFFFFFFFF, ovf_res};
+                cvt_h_s_fl  = 5'b00101; // OF + NX
+            } else if het[11] == 1'b1 || het == 12'd0 {
+                // Subnormal half result. Shift {1,xm} right; capture G/R/S.
+                let sub_mant : logic<24> = {1'b1, xm};
+                let sub_shift: logic<12> = 12'd11 - het;
+                var shifted   : logic<24>;
+                var sub_sticky: logic    ;
+                if sub_shift >: 12'd23 {
+                    shifted    = 24'd0;
+                    sub_sticky = sub_mant != 24'd0;
+                } else {
+                    shifted = sub_mant >> sub_shift[4:0];
+                    let m_mask: logic<24> = (24'd1 << sub_shift[4:0]) - 24'd1;
+                    sub_sticky = (sub_mant & m_mask) != 24'd0;
+                }
+                let sg : logic = shifted[2];
+                let sr : logic = shifted[1];
+                let ss : logic = shifted[0] || sub_sticky;
+                let sl : logic = shifted[3];
+                var sru: logic;
+                case fp_rm_resolved {
+                    3'b000 : sru = sg && (sr || ss || sl);
+                    3'b001 : sru = 1'b0;
+                    3'b010 : sru = xs && (sg || sr || ss);
+                    3'b011 : sru = !xs && (sg || sr || ss);
+                    3'b100 : sru = sg;
+                    default: sru = sg && (sr || ss || sl);
+                }
+                let sub_frac: logic<11> = {1'b0, shifted[12:3]} + {10'd0, sru};
+                if sub_frac[10] {
+                    cvt_h_s_res = {48'hFFFFFFFFFFFF, xs, 5'd1, 10'd0}; // rounded up to min normal
+                } else {
+                    cvt_h_s_res = {48'hFFFFFFFFFFFF, xs, 5'd0, sub_frac[9:0]};
+                }
+                if sg || sr || ss {
+                    cvt_h_s_fl = 5'b00011; // UF + NX (tiny + inexact)
+                }
+            } else {
+                // Normal half result.
+                let mant_r: logic<12> = {2'b01, xm[22:13]} + {11'd0, ru};
+                if mant_r[11] {
+                    let het2: logic<12> = het + 12'd1;
+                    if het2 >= 12'd31 {
+                        cvt_h_s_res = {48'hFFFFFFFFFFFF, ovf_res};
+                        cvt_h_s_fl  = 5'b00101;
+                    } else {
+                        cvt_h_s_res = {48'hFFFFFFFFFFFF, xs, het2[4:0], 10'd0};
+                        if g || r || s {
+                            cvt_h_s_fl = 5'b00001;
+                        }
+                    }
+                } else {
+                    cvt_h_s_res = {48'hFFFFFFFFFFFF, xs, het[4:0], mant_r[9:0]};
+                    if g || r || s {
+                        cvt_h_s_fl = 5'b00001;
+                    }
+                }
+            }
+        }
+    }
+
+    // FCVT.H.D : double → half (narrowing, rounded).
+    always_comb {
+        let xs    : logic     = d1[63];
+        let xe    : logic<11> = d1[62:52];
+        let xm    : logic<52> = d1[51:0];
+        let x_snan: logic     = xe == 11'h7FF && xm[51] == 1'b0 && xm[50:0] != 51'd0;
+        cvt_h_d_fl  = 5'd0;
+        cvt_h_d_res = {48'hFFFFFFFFFFFF, fpu_pkg::CANONICAL_NAN_H};
+        if xe == 11'h7FF && xm != 52'd0 {
+            if x_snan {
+                cvt_h_d_fl = 5'b10000;
+            }
+        } else if xe == 11'h7FF {
+            cvt_h_d_res = {48'hFFFFFFFFFFFF, xs, 5'h1F, 10'd0};
+        } else if xe == 11'd0 || xe <: 11'd999 {
+            cvt_h_d_res = {48'hFFFFFFFFFFFF, xs, 15'd0};
+            if !(xe == 11'd0 && xm == 52'd0) {
+                cvt_h_d_fl = 5'b00011;
+            }
+        } else {
+            // het = double biased exp - 1008 (half-vs-double bias diff).
+            let het: logic<12> = {1'b0, xe} - 12'd1008;
+            // keep top 10 mantissa bits xm[51:42]; G=xm[41], R=xm[40],
+            // S = OR xm[39:0], L = xm[42].
+            let g: logic = xm[41];
+            let r: logic = xm[40];
+            let s: logic = xm[39:0] != 40'd0;
+            let l: logic = xm[42];
+            var ru: logic;
+            case fp_rm_resolved {
+                3'b000 : ru = g && (r || s || l);
+                3'b001 : ru = 1'b0;
+                3'b010 : ru = xs && (g || r || s);
+                3'b011 : ru = !xs && (g || r || s);
+                3'b100 : ru = g;
+                default: ru = g && (r || s || l);
+            }
+            var ovf_inf: logic;
+            case fp_rm_resolved {
+                3'b001 : ovf_inf = 1'b0;
+                3'b010 : ovf_inf = xs;
+                3'b011 : ovf_inf = !xs;
+                default: ovf_inf = 1'b1;
+            }
+            let ovf_res: logic<16> = if ovf_inf ? {xs, 5'h1F, 10'd0} : {xs, 5'h1E, 10'h3FF};
+            if !het[11] && het >= 12'd31 {
+                cvt_h_d_res = {48'hFFFFFFFFFFFF, ovf_res};
+                cvt_h_d_fl  = 5'b00101;
+            } else if het[11] == 1'b1 || het == 12'd0 {
+                let sub_mant : logic<53> = {1'b1, xm};
+                let sub_shift: logic<12> = 12'd40 - het;
+                var shifted   : logic<53>;
+                var sub_sticky: logic    ;
+                if sub_shift >: 12'd52 {
+                    shifted    = 53'd0;
+                    sub_sticky = sub_mant != 53'd0;
+                } else {
+                    shifted = sub_mant >> sub_shift[5:0];
+                    let m_mask: logic<53> = (53'd1 << sub_shift[5:0]) - 53'd1;
+                    sub_sticky = (sub_mant & m_mask) != 53'd0;
+                }
+                let sg : logic = shifted[2];
+                let sr : logic = shifted[1];
+                let ss : logic = shifted[0] || sub_sticky;
+                let sl : logic = shifted[3];
+                var sru: logic;
+                case fp_rm_resolved {
+                    3'b000 : sru = sg && (sr || ss || sl);
+                    3'b001 : sru = 1'b0;
+                    3'b010 : sru = xs && (sg || sr || ss);
+                    3'b011 : sru = !xs && (sg || sr || ss);
+                    3'b100 : sru = sg;
+                    default: sru = sg && (sr || ss || sl);
+                }
+                let sub_frac: logic<11> = {1'b0, shifted[12:3]} + {10'd0, sru};
+                if sub_frac[10] {
+                    cvt_h_d_res = {48'hFFFFFFFFFFFF, xs, 5'd1, 10'd0};
+                } else {
+                    cvt_h_d_res = {48'hFFFFFFFFFFFF, xs, 5'd0, sub_frac[9:0]};
+                }
+                if sg || sr || ss {
+                    cvt_h_d_fl = 5'b00011;
+                }
+            } else {
+                let mant_r: logic<12> = {2'b01, xm[51:42]} + {11'd0, ru};
+                if mant_r[11] {
+                    let het2: logic<12> = het + 12'd1;
+                    if het2 >= 12'd31 {
+                        cvt_h_d_res = {48'hFFFFFFFFFFFF, ovf_res};
+                        cvt_h_d_fl  = 5'b00101;
+                    } else {
+                        cvt_h_d_res = {48'hFFFFFFFFFFFF, xs, het2[4:0], 10'd0};
+                        if g || r || s {
+                            cvt_h_d_fl = 5'b00001;
+                        }
+                    }
+                } else {
+                    cvt_h_d_res = {48'hFFFFFFFFFFFF, xs, het[4:0], mant_r[9:0]};
+                    if g || r || s {
+                        cvt_h_d_fl = 5'b00001;
+                    }
+                }
+            }
+        }
+    }
+
     // Signed-order encodings for ordered FP compares (FMIN/FMAX/FLT/FLE):
     //   positive (sign=0): XOR 0x8000..00 (flip MSB)
     //   negative (sign=1): XOR 0xFFFF..FF (bit invert)
@@ -670,6 +979,12 @@ pub module fpu_wrap #(
                 }
                 // e in (150, 158): left-shift only, exact.
             }
+            // P10 Zfhmin: half conversions carry the flags computed above
+            // (FMV.X.H / FMV.H.X never set flags → covered by default).
+            FpuOp::FCVT_S_H: fpu_fflags_comb = cvt_s_h_fl;
+            FpuOp::FCVT_D_H: fpu_fflags_comb = cvt_d_h_fl;
+            FpuOp::FCVT_H_S: fpu_fflags_comb = cvt_h_s_fl;
+            FpuOp::FCVT_H_D: fpu_fflags_comb = cvt_h_d_fl;
             default: fpu_fflags_comb = 5'd0;
         }
     }
@@ -891,6 +1206,15 @@ pub module fpu_wrap #(
             FpuOp::FMV_X_D : fpu_result = d1;
             FpuOp::FMV_W_X : fpu_result = {32'hFFFFFFFF, fwd_rs1[31:0]}; // NaN-box
             FpuOp::FMV_D_X : fpu_result = fwd_rs1;
+            // P10 Zfhmin: half moves. FMV.X.H sign-extends the low 16 bits to
+            // XLEN; FMV.H.X NaN-boxes the int's low 16 bits into the FP reg.
+            FpuOp::FMV_X_H : fpu_result = {fwd_fp_rs1[15] repeat 48, fwd_fp_rs1[15:0]};
+            FpuOp::FMV_H_X : fpu_result = {48'hFFFFFFFFFFFF, fwd_rs1[15:0]};
+            // P10 Zfhmin: half conversions (computed above).
+            FpuOp::FCVT_S_H: fpu_result = cvt_s_h_res;
+            FpuOp::FCVT_D_H: fpu_result = cvt_d_h_res;
+            FpuOp::FCVT_H_S: fpu_result = cvt_h_s_res;
+            FpuOp::FCVT_H_D: fpu_result = cvt_h_d_res;
 
             // FCLASS: classify FP value into 10-bit mask
             FpuOp::FCLASS_S: {
