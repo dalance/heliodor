@@ -15,6 +15,10 @@ pub module mmu (
     o_valid: output logic    ,
     o_fault: output logic    ,
     o_busy : output logic    ,
+    // P10 Svpbmt: this translation maps to non-cacheable memory (PBMT NC/IO).
+    // Mirrors o_paddr's TLB-hit/walk mux. 0 when VM off (the PA-based MMIO
+    // window still routes bare/M-mode device accesses uncached in the core).
+    o_uncached: output logic,
     // M9.A.296: pulse high the cycle a NEW PTW starts (TLB miss in IDLE).
     // Lets an OoO core bind the walk to the requesting load's rob_idx for
     // correct page-fault attribution across back-to-back walks.
@@ -30,6 +34,10 @@ pub module mmu (
     // mstatus permission bits
     i_sum: input logic, // Supervisor User Memory access
     i_mxr: input logic, // Make eXecutable Readable
+    // P10 Svpbmt: menvcfg.PBMTE. When 1, the leaf PTE's PBMT field (bits 62:61)
+    // is interpreted (01=NC / 10=IO → uncached; 11=reserved → fault); when 0 the
+    // field is ignored (current behaviour), keeping this inert for legacy code.
+    i_pbmte: input logic,
     // Page table walk memory interface
     o_ptw_addr : output logic<64>,
     o_ptw_req  : output logic    ,
@@ -98,6 +106,7 @@ pub module mmu (
     // translation. A full SFENCE.VMA still flushes everything (conservative).
     var tlb_asid  : logic<16> [16];
     var tlb_global: logic     [16];
+    var tlb_unc   : logic     [16]; // P10 Svpbmt: NC/IO (non-cacheable) translation
 
     // TLB lookup (combinational)
     var tlb_hit    : logic    ;
@@ -107,6 +116,7 @@ pub module mmu (
     var tlb_hit_w  : logic    ;
     var tlb_hit_x  : logic    ;
     var tlb_hit_u  : logic    ;
+    var tlb_hit_unc: logic    ; // P10 Svpbmt
     var tlb_hit_lvl: logic<2> ;
 
     always_comb {
@@ -118,6 +128,7 @@ pub module mmu (
         tlb_hit_x   = 1'b0;
         tlb_hit_u   = 1'b0;
         tlb_hit_lvl = 2'd0;
+        tlb_hit_unc = 1'b0;
 
         for i in 0..16 {
             // Match based on page level:
@@ -138,6 +149,7 @@ pub module mmu (
                 tlb_hit_x   = tlb_perm_x[i];
                 tlb_hit_u   = tlb_perm_u[i];
                 tlb_hit_lvl = tlb_level[i];
+                tlb_hit_unc = tlb_unc[i];
             }
         }
     }
@@ -226,7 +238,9 @@ pub module mmu (
     // A must be set; D must be set for stores.
     // Superpage: level-1 requires PPN[0]=0, level-2 requires PPN[1:0]=0.
     let leaf_valid: logic = i_ptw_data[0] && (i_ptw_data[1] || i_ptw_data[3]) && i_ptw_data[6]
-        && (!i_store || i_ptw_data[7]);
+        && (!i_store || i_ptw_data[7])
+        // P10 Svpbmt: PBMT==11 is reserved → fault (only when PBMTE enables it).
+        && !(i_pbmte && i_ptw_data[62:61] == 2'b11);
 
     always_ff (clk, rst) {
         if_reset {
@@ -397,6 +411,9 @@ pub module mmu (
                     // P9.5: tag with the walk's ASID + the leaf's global bit.
                     tlb_asid[tlb_replace_idx]   = walk_asid;
                     tlb_global[tlb_replace_idx] = leaf_global;
+                    // P10 Svpbmt: cache the NC/IO memory type. pte holds the leaf
+                    // PTE; PBMT 01/10 → non-cacheable (only when PBMTE enables it).
+                    tlb_unc[tlb_replace_idx]    = i_pbmte && (pte[62:61] == 2'b01 || pte[62:61] == 2'b10);
                     tlb_replace_idx             = tlb_replace_idx + 4'd1;
                     state                       = State::IDLE;
                 }
@@ -456,6 +473,11 @@ pub module mmu (
 
     // Outputs: TLB hit takes priority over PTW result
     assign o_paddr = if !vm_enabled ? i_vaddr : if tlb_hit && state == State::IDLE ? tlb_pa : pa;
+
+    // P10 Svpbmt: NC/IO memory type for the current translation. Mirrors the
+    // o_paddr TLB-hit/walk mux. pte_unc covers the just-walked leaf (DONE path).
+    let pte_unc: logic = i_pbmte && (pte[62:61] == 2'b01 || pte[62:61] == 2'b10);
+    assign o_uncached = if !vm_enabled ? 1'b0 : if tlb_hit && state == State::IDLE ? tlb_hit_unc : pte_unc;
 
     assign o_valid = if !vm_enabled ?
         i_req
