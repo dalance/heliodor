@@ -1099,6 +1099,18 @@ pub module heliodor_core #(
     // and FAULTs. Next cycle, the imem_fault_w is latched against the NEW
     // PC (post-redirect) as a spurious instr page fault. Cause: ~290K cy
     // wasted per char emission as the S-mode handler "fixes" the non-fault.
+    // P9.6 phase 2: the I-PTW PTE reads are now COHERENT — routed through the
+    // same mem_ctrl uncounted read as the I-cache fill (recall-on-owned brings a
+    // modified PTE home), NOT the old non-coherent o_iptw bus. The FSM + arbiter
+    // live after the dcache inst (where i_dmem_rdata/the grant are in scope);
+    // iptw_data / iptw_done_q are forward-referenced here.
+    var iptw_data  : logic<64>;
+    var iptw_done_q: logic    ;
+    var iptw_done_a: logic<61>; // dword of the captured PTE (matches o_ptw_addr while valid)
+    // The captured PTE is valid ONLY while it matches the MMU's current request
+    // dword — the moment the walk advances (o_ptw_addr changes) the still-set
+    // iptw_done_q must NOT re-validate the stale PTE for the new level.
+    let iptw_pte_valid: logic = iptw_done_q && imem_ptw_addr_w[63:3] == iptw_done_a;
     inst u_imem_mmu: imem_mmu (
         clk                        ,
         rst                        ,
@@ -1114,11 +1126,9 @@ pub module heliodor_core #(
         i_mxr     : csr_mxr        ,
         o_ptw_addr: imem_ptw_addr_w,
         o_ptw_req : imem_ptw_req_w ,
-        // M8.C: dedicated IPTW bus. PTE reads come back on i_iptw_rdata (was
-        // i_dmem_rdata, muxed onto o_dmem). o_iptw_addr/req are driven below.
-        // Toy memory: combinational read so PTW data is valid the same cycle.
-        i_ptw_data    : i_iptw_rdata       ,
-        i_ptw_valid   : imem_ptw_req_w     ,
+        // P9.6 phase 2: PTE comes back from the coherent IS read FSM below.
+        i_ptw_data    : iptw_data          ,
+        i_ptw_valid   : iptw_pte_valid     ,
         i_icache_stall: icache_stall       , // M8.A: hold MMU/TLB during icache fill
         i_sfence      : commit_sfence_pulse,
         i_sfence_vaddr   : sfence_vaddr   , // P9.5: selective flush operands
@@ -1131,11 +1141,12 @@ pub module heliodor_core #(
     let _unused_imem_valid: logic = imem_valid_w;
     let _unused_imem_busy : logic = imem_busy_w;
 
-    // M8.C: dedicated instruction-PTW bus (split out of the dmem port). The
-    // IMMU walk drives o_iptw_addr/req; PTE data returns on i_iptw_rdata. This
-    // removes the imem-PTW-vs-dcache contention on o_dmem entirely.
-    assign o_iptw_addr = imem_ptw_addr_w;
-    assign o_iptw_req  = imem_ptw_req_w;
+    // P9.6 phase 2: the dedicated o_iptw bus is retired — PTE reads go through
+    // mem_ctrl/L2 (coherent). Tie it off; the tb's combinational iptw serving
+    // is dead (the SoC fetches only DRAM PTEs through the shared read port).
+    assign o_iptw_addr = 64'd0;
+    assign o_iptw_req  = 1'b0;
+    let _unused_iptw_rdata: logic<64> = i_iptw_rdata;
 
     // ============================================================
     // M8.A: L1 instruction cache, inserted between imem_mmu (imem_paddr_w)
@@ -1161,8 +1172,17 @@ pub module heliodor_core #(
     var ic_mem_req  : logic    ;
     var ic_grant    : logic    ;
     var ic_fill_done: logic    ;
-    var ic_owns     : logic    ; // arbiter: I-cache owns the read port (txn in flight)
-    var ic_route    : logic    ; // arbiter: route the shared read port to the I-cache
+    var ic_owns     : logic    ; // arbiter: instruction side owns the read port (txn in flight)
+    var ic_route    : logic    ; // arbiter: route the shared read port to the instruction side
+    // P9.6 phase 2: the instruction side has TWO consumers of the shared read
+    // port — the I-cache fill and the I-PTW PTE read. is_ptw_q latches which one
+    // owns the in-flight transaction; the I-PTW FSM state (busy/cnt) is below.
+    var is_ptw_q    : logic    ; // in-flight IS txn is the I-PTW's (vs the I-fill's)
+    var iptw_busy   : logic    ; // I-PTW PTE read accepted, streaming
+    var iptw_cnt    : logic<3> ; // I-PTW stream beat counter
+    var iptw_addr_q : logic<64>; // LATCHED PTE addr for the in-flight read (a
+    //                              redirect can change imem_ptw_addr_w mid-read;
+    //                              the captured dword must track the read's addr)
     // P9.6: the fetch PA is cacheable iff inside the DRAM window (PA[63:25]==0x40,
     // the same boundary as dc_uncached). A non-DRAM fetch (firmware/boot-ROM)
     // bypasses the cache and is served from the legacy o_imem passthrough.
@@ -5190,41 +5210,99 @@ pub module heliodor_core #(
     }
 
     // ============================================================
-    // P9.6: D/I read-port arbiter. The I-cache fill (an UNCOUNTED coherent read
-    // through mem_ctrl) shares this hart's single L2 read transaction port with
-    // the D-cache. The D-cache (loads / store-RFO / uncached MMIO) has strict
-    // priority; the I-cache sneaks in only when the D-cache is not requesting.
-    // ic_owns LATCHES the port for the whole transaction (accept → 8 STREAM
-    // beats) so a mid-transaction D-cache request waits — mem_ctrl has one slot
-    // per hart, and switching the port mid-stream would strand the I-fill.
-    //   - ic_route: combinational routing this cycle.
-    //   - set ic_owns on the I-cache's accept grant; clear on its fill-done pulse.
-    //   - the FENCE.I drain keeps the I-cache `filling` (hence ic_owns) in
-    //     lockstep with mem_ctrl's slot, so ic_fill_done always fires.
+    // P9.6: D / instruction-side (IS) read-port arbiter. The IS = the I-cache
+    // fill OR the I-PTW PTE read (phase 2) — both UNCOUNTED coherent reads
+    // (recall-on-owned) through this hart's single mem_ctrl L2 read transaction
+    // port. The D-cache (loads / store-RFO / uncached MMIO) has strict priority;
+    // the IS sneaks in only when the D-cache is not requesting. ic_owns LATCHES
+    // the port for the whole transaction (accept → 8 STREAM beats); is_ptw_q
+    // latches WHICH IS consumer owns it. IS sub-arbiter = I-PTW > I-fill (a fetch
+    // translates then fetches, so they are sequential; priority just orders a
+    // rare overlap). A mid-transaction D request waits — mem_ctrl has one slot
+    // per hart, and switching the port mid-stream would strand the read.
     // ============================================================
-    assign ic_route = ic_owns || (ic_mem_req && !dc_mem_req);
-    assign ic_grant = i_dmem_grant && ic_route;
+    // I-PTW request: the imem MMU wants a PTE and we have not delivered it yet.
+    let iptw_off    : logic<3>  = imem_ptw_addr_w[5:3];
+    let iptw_mem_req: logic     = imem_ptw_req_w && !iptw_busy && !iptw_done_q;
+    // Active IS consumer this cycle: the latched one during a txn, else the
+    // priority pick (I-PTW first).
+    let is_ptw      : logic     = if ic_owns ? is_ptw_q : iptw_mem_req;
+    let is_req      : logic     = iptw_mem_req || ic_mem_req;
+    // The I-PTW read holds addr[5:3]=iptw_off so every STREAM beat carries the
+    // PTE dword (mem_ctrl serves buf[addr[5:3]]); the I-fill drives its own addr.
+    let iptw_rd_addr: logic<64> = {imem_ptw_addr_w[63:6], iptw_off, 3'b000};
+    // During the read use the LATCHED addr (a mid-read redirect changes
+    // imem_ptw_addr_w → iptw_off, which would re-point mem_ctrl's beat to the
+    // wrong dword of the latched line and corrupt the captured PTE).
+    let is_mem_addr : logic<64> = if is_ptw ? (if iptw_busy ? iptw_addr_q : iptw_rd_addr) : ic_mem_addr;
+    assign ic_route = ic_owns || (is_req && !dc_mem_req);
+    let is_grant    : logic     = i_dmem_grant && ic_route;
+    let iptw_grant  : logic     = is_grant && is_ptw;  // STREAM beat for the I-PTW
+    assign ic_grant = is_grant && !is_ptw;             // STREAM beat for the I-fill
     assign dc_grant = i_dmem_grant && !ic_route;
+    let iptw_fill_done: logic   = iptw_busy && iptw_grant && iptw_cnt == 3'd7;
+    let is_done       : logic   = if is_ptw_q ? iptw_fill_done : ic_fill_done;
     always_ff (clk, rst) {
         if_reset {
-            ic_owns = 1'b0;
+            ic_owns  = 1'b0;
+            is_ptw_q = 1'b0;
         } else {
             if ic_owns {
-                if ic_fill_done {
+                if is_done {
                     ic_owns = 1'b0;
                 }
-            } else if ic_mem_req && !dc_mem_req && i_dmem_grant {
-                ic_owns = 1'b1;
+            } else if is_req && !dc_mem_req && i_dmem_grant {
+                ic_owns  = 1'b1;
+                is_ptw_q = is_ptw;
+            }
+        }
+    }
+
+    // I-PTW PTE read FSM: capture the addressed dword across the 8-beat stream
+    // (every beat carries buf[iptw_off] since the addr is held), then hold
+    // iptw_done_q (= the MMU's i_ptw_valid) until the MMU advances to a new walk
+    // step (a different PTE dword) or finishes the walk.
+    always_ff (clk, rst) {
+        if_reset {
+            iptw_busy   = 1'b0;
+            iptw_cnt    = 3'd0;
+            iptw_data   = 64'd0;
+            iptw_done_q = 1'b0;
+            iptw_done_a = '0;
+            iptw_addr_q = 64'd0;
+        } else {
+            if iptw_busy {
+                if iptw_grant {
+                    iptw_data = i_dmem_rdata;
+                    if iptw_cnt == 3'd7 {
+                        iptw_busy   = 1'b0;
+                        iptw_done_q = 1'b1;
+                        iptw_done_a = iptw_addr_q[63:3]; // the read's latched addr
+                    } else {
+                        iptw_cnt = iptw_cnt + 3'd1;
+                    }
+                }
+            } else {
+                // Accept for the I-PTW (the IS port granted while I-PTW is the pick).
+                if !ic_owns && is_ptw && is_req && !dc_mem_req && i_dmem_grant {
+                    iptw_busy   = 1'b1;
+                    iptw_cnt    = 3'd0;
+                    iptw_addr_q = iptw_rd_addr; // latch the read addr for the txn
+                }
+                // Release the delivered PTE once the MMU moves to a new step.
+                if iptw_done_q && (!imem_ptw_req_w || imem_ptw_addr_w[63:3] != iptw_done_a) {
+                    iptw_done_q = 1'b0;
+                }
             }
         }
     }
 
     // S23: read channel on o_dmem_addr/ren, write channel on o_dmemw_addr +
-    // wen/wdata/wstrb. P9.6: the read channel is muxed (I-cache when ic_route).
-    assign o_dmem_addr   = if ic_route ? ic_mem_addr : dc_mem_addr;
-    assign o_dmem_ren    = if ic_route ? 1'b0 : dc_mem_ren; // I-fill is DRAM (no MMIO ren)
-    assign o_dmem_req    = if ic_route ? ic_mem_req : dc_mem_req;
-    assign o_dmem_rfo    = if ic_route ? 1'b0 : dc_mem_rfo; // I-read is never RFO
+    // wen/wdata/wstrb. P9.6: the read channel is muxed (instruction side when ic_route).
+    assign o_dmem_addr   = if ic_route ? is_mem_addr : dc_mem_addr;
+    assign o_dmem_ren    = if ic_route ? 1'b0 : dc_mem_ren; // IS read is DRAM (no MMIO ren)
+    assign o_dmem_req    = if ic_route ? is_req : dc_mem_req;
+    assign o_dmem_rfo    = if ic_route ? 1'b0 : dc_mem_rfo; // IS read is never RFO
     assign o_dmem_iread  = ic_route;
     for l in 0..8 :gen_dmemw_lane {
         assign o_dmem_wdata[l] = dc_mem_wdata[l];
