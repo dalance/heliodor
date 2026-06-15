@@ -2,7 +2,15 @@
 // Performs 3-level page table walk using data memory interface.
 // Includes a 16-entry fully-associative TLB for fast translation.
 // Stalls the pipeline during page table walk on TLB miss.
-pub module mmu (
+pub module mmu #(
+    // P10 Svadu: 1 = this MMU performs hardware A/D write-back (the data side,
+    // which owns a write channel through the dcache). 0 = lazy-relax only: with
+    // ADUE the leaf no longer faults on A=0 / D=0, but the bits are NOT written
+    // back (the instruction side's PTW port is a read-only coherent stream with
+    // no write channel — see heliodor_core's iptw FSM). The leaf still
+    // translates; the A bit is simply left stale on a fetch-only access.
+    param WRITE_AD: u8 = 1,
+) (
     clk: input clock,
     rst: input reset,
     // Translation request
@@ -38,9 +46,21 @@ pub module mmu (
     // is interpreted (01=NC / 10=IO → uncached; 11=reserved → fault); when 0 the
     // field is ignored (current behaviour), keeping this inert for legacy code.
     i_pbmte: input logic,
+    // P10 Svadu: menvcfg.ADUE. When 1, the leaf PTE's A (and, for stores, D)
+    // bits are updated by hardware instead of faulting: a leaf with A=0 / D=0
+    // no longer faults, and (when WRITE_AD=1) the walk writes the updated PTE
+    // back to memory. When 0 the legacy Svade behaviour (fault on A=0 / D=0)
+    // is kept, so this is inert for existing code and the boot kernel.
+    i_adue: input logic,
     // Page table walk memory interface
     o_ptw_addr : output logic<64>,
     o_ptw_req  : output logic    ,
+    // P10 Svadu: A/D write-back. o_ptw_wen pulses while the FSM is in WRITE_AD,
+    // driving a full-dword store of o_ptw_wdata (the A/D-updated leaf PTE) to
+    // o_ptw_addr (which still holds the leaf PTE's address). The wrapper routes
+    // it onto the dmem write port; i_ptw_data carries the read data as before.
+    o_ptw_wen  : output logic    ,
+    o_ptw_wdata: output logic<64>,
     i_ptw_data : input  logic<64>,
     i_ptw_valid: input  logic    ,
     // Downstream stall: keep DONE state active while dcache is filling
@@ -188,6 +208,7 @@ pub module mmu (
         DONE = 3'd4, // Translation complete, waiting for data access
         FAULT = 3'd5,
         FAULT2 = 3'd6, // 1-cycle delay after FAULT (let fetch PC update)
+        WRITE_AD = 3'd7, // P10 Svadu: writing the A/D-updated leaf PTE back
     }
 
     var state  : State    ;
@@ -234,13 +255,23 @@ pub module mmu (
     // must use the walk's ASID, not a drifted current value).
     var walk_asid    : logic<16>;
 
-    // Leaf PTE validity: check A/D bits and superpage alignment
-    // A must be set; D must be set for stores.
+    // Leaf PTE validity: valid + leaf (R or X) + PBMT not reserved, plus the
+    // A/D requirement. With Svade (i_adue=0) the A bit must be set and, for a
+    // store, the D bit too — otherwise fault. With Svadu (i_adue=1) an A=0 /
+    // D=0 leaf no longer faults; hardware updates the bits instead.
     // Superpage: level-1 requires PPN[0]=0, level-2 requires PPN[1:0]=0.
-    let leaf_valid: logic = i_ptw_data[0] && (i_ptw_data[1] || i_ptw_data[3]) && i_ptw_data[6]
-        && (!i_store || i_ptw_data[7])
+    let ad_ok     : logic = i_ptw_data[6] && (!i_store || i_ptw_data[7]);
+    let leaf_valid: logic = i_ptw_data[0] && (i_ptw_data[1] || i_ptw_data[3])
+        && (ad_ok || i_adue)
         // P10 Svpbmt: PBMT==11 is reserved → fault (only when PBMTE enables it).
         && !(i_pbmte && i_ptw_data[62:61] == 2'b11);
+    // P10 Svadu: this leaf needs an A/D write-back. Only the data side
+    // (WRITE_AD=1) writes the bits back; the i-side just relaxes the fault.
+    let need_ad_wb: logic = (WRITE_AD != 0) && i_adue && !ad_ok;
+    // The leaf PTE with A (and, for a store, D) set — used as both the
+    // write-back data and the cached/DONE PTE, so the TLB write permission
+    // (pte_w && pte_d) reflects the freshly-set D bit.
+    let pte_ad_new: logic<64> = i_ptw_data | 64'h40 | (if i_store ? 64'h80 : 64'd0);
 
     always_ff (clk, rst) {
         if_reset {
@@ -272,7 +303,7 @@ pub module mmu (
                 }
             }
             state = State::IDLE;
-        } else if i_redirect && state != State::IDLE && state != State::DONE {
+        } else if i_redirect && state != State::IDLE && state != State::DONE && state != State::WRITE_AD {
             // Pipeline redirect (misprediction/trap): cancel in-flight PTW.
             // The fetch address has changed, so continuing the walk would
             // register the old PTE under the new VPN — TLB poisoning.
@@ -319,7 +350,13 @@ pub module mmu (
                                 leaf_level   = 2'd2;
                                 leaf_pte_ppn = i_ptw_data[53:10];
                                 leaf_global  = i_ptw_data[5];
-                                state        = State::DONE;
+                                // P10 Svadu: A/D update needed → write-back first.
+                                if need_ad_wb {
+                                    pte   = pte_ad_new;
+                                    state = State::WRITE_AD;
+                                } else {
+                                    state = State::DONE;
+                                }
                             }
                         } else {
                             // Non-leaf: follow to level 1
@@ -344,7 +381,13 @@ pub module mmu (
                                 leaf_level   = 2'd1;
                                 leaf_pte_ppn = i_ptw_data[53:10];
                                 leaf_global  = i_ptw_data[5];
-                                state        = State::DONE;
+                                // P10 Svadu: A/D update needed → write-back first.
+                                if need_ad_wb {
+                                    pte   = pte_ad_new;
+                                    state = State::WRITE_AD;
+                                } else {
+                                    state = State::DONE;
+                                }
                             }
                         } else {
                             let next_ppn    : logic<44> = i_ptw_data[53:10];
@@ -376,13 +419,25 @@ pub module mmu (
                                     leaf_level   = 2'd0;
                                     leaf_pte_ppn = {i_ptw_data[53:14], walk_vpn0[3:0]};
                                     leaf_global  = i_ptw_data[5];
-                                    state        = State::DONE;
+                                    // P10 Svadu: A/D update needed → write-back first.
+                                    if need_ad_wb {
+                                        pte   = pte_ad_new;
+                                        state = State::WRITE_AD;
+                                    } else {
+                                        state = State::DONE;
+                                    }
                                 }
                             } else {
                                 leaf_level   = 2'd0;
                                 leaf_pte_ppn = i_ptw_data[53:10];
                                 leaf_global  = i_ptw_data[5];
-                                state        = State::DONE;
+                                // P10 Svadu: A/D update needed → write-back first.
+                                if need_ad_wb {
+                                    pte   = pte_ad_new;
+                                    state = State::WRITE_AD;
+                                } else {
+                                    state = State::DONE;
+                                }
                             }
                         } else {
                             // Non-leaf at level 0 is invalid
@@ -426,6 +481,18 @@ pub module mmu (
                 }
                 State::FAULT2: {
                     state = State::IDLE;
+                }
+                State::WRITE_AD: {
+                    // P10 Svadu: hold here while the A/D-updated PTE is written
+                    // back (o_ptw_wen + o_ptw_wdata below; ptw_addr_reg still
+                    // holds the leaf PTE address). The wrapper's dcache accepts
+                    // the write the cycle i_stall drops — the same handshake the
+                    // PTE reads use via i_ptw_valid — after which the translation
+                    // completes. pte already carries the updated A/D bits, so the
+                    // DONE TLB fill records the freshly-set D in its write perm.
+                    if !i_stall {
+                        state = State::DONE;
+                    }
                 }
                 default: {
                     state = State::IDLE;
@@ -524,6 +591,10 @@ pub module mmu (
     assign o_idle       = state == State::IDLE;
     assign o_ptw_addr   = ptw_addr_reg;
     assign o_ptw_req    = state == State::LEVEL2 || state == State::LEVEL1 || state == State::LEVEL0;
+    // P10 Svadu: A/D write-back drive. pte holds the A/D-updated leaf PTE; the
+    // address is o_ptw_addr (= ptw_addr_reg, still the leaf PTE address).
+    assign o_ptw_wen    = state == State::WRITE_AD;
+    assign o_ptw_wdata  = pte;
 
     // M9.A.303 debug
     assign o_dbg_pte      = pte;
