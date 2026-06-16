@@ -52,6 +52,21 @@ pub module mmu #(
     // back to memory. When 0 the legacy Svade behaviour (fault on A=0 / D=0)
     // is kept, so this is inert for existing code and the boot kernel.
     i_adue: input logic,
+    // === Phase 11-H two-stage translation ===
+    // i_virt = this access is virtualized (V=1, VS/VU mode). When set, the walk
+    // performs nested VS-stage (i_vsatp, Sv39) → G-stage (i_hgatp, Sv39x4)
+    // translation instead of the single-stage i_satp walk: each VS-stage PTE is
+    // itself a guest-physical address that the G-stage translates before the
+    // memory read. The V=1 path does NOT use the TLB (it walks every access), so
+    // the single-stage path (i_virt=0) is byte-identical to before. i_satp / the
+    // whole existing FSM remain the V=0 behaviour.
+    i_virt : input logic     ,
+    i_vsatp: input logic <64>,
+    i_hgatp: input logic <64>,
+    // A two-stage fault that occurred in the G-stage (guest-physical) walk, so
+    // the core can raise a guest-page-fault (cause 20/21/23) instead of a plain
+    // VS-stage page-fault (12/13/15). Core cause routing is H3; surfaced now.
+    o_gstage_fault: output logic,
     // Page table walk memory interface
     o_ptw_addr : output logic<64>,
     o_ptw_req  : output logic    ,
@@ -105,8 +120,27 @@ pub module mmu #(
     // VPN for TLB tag (27 bits = VPN[2] || VPN[1] || VPN[0])
     let vpn_full: logic<27> = i_vaddr[38:12];
 
-    // Translation enabled: Sv39 mode and not in M-mode
-    let vm_enabled: logic = satp_mode == SATP_MODE_SV39 && i_priv != PrivLevel::MACHINE;
+    // === Phase 11-H two-stage decode ===
+    // hgatp: MODE[63:60] (8 = Sv39x4), VMID[57:44], PPN[43:0]. Sv39x4's root
+    // page table is 4x wider, so the top index spans 11 bits (GPA[40:30]).
+    const HGATP_MODE_SV39X4: logic<4> = 4'd8;
+    let hgatp_mode: logic<4>  = i_hgatp[63:60];
+    let hgatp_ppn : logic<44> = i_hgatp[43:0];
+    let vsatp_mode: logic<4>  = i_vsatp[63:60];
+    let vsatp_ppn : logic<44> = i_vsatp[43:0];
+    // A virtualized access (V=1) that is not in M-mode. VS-stage paging is on
+    // when vsatp=Sv39; G-stage when hgatp=Sv39x4. two_stage = either is on; when
+    // both are Bare the access is identity (handled by the passthrough mux).
+    let v_active : logic = i_virt && i_priv != PrivLevel::MACHINE;
+    let vs_on    : logic = v_active && vsatp_mode == SATP_MODE_SV39;
+    let g_on     : logic = v_active && hgatp_mode == HGATP_MODE_SV39X4;
+    let two_stage: logic = vs_on || g_on;
+
+    // Translation enabled (single-stage, V=0): Sv39 mode and not in M-mode. The
+    // whole existing FSM/TLB/output logic keys off this, so gating it on !i_virt
+    // makes the single-stage path inert under virtualization (the two-stage path
+    // takes over) while leaving V=0 byte-identical.
+    let vm_enabled: logic = !i_virt && satp_mode == SATP_MODE_SV39 && i_priv != PrivLevel::MACHINE;
 
     // ============================================================
     // TLB: 16-entry fully-associative
@@ -156,7 +190,9 @@ pub module mmu #(
             // Level 1 (2MB): match VPN[2:1] (bits 26:9)
             // Level 0 (4KB): match all VPN[2:0] (bits 26:0)
             let asid_ok : logic = tlb_global[i] || tlb_asid[i] == satp_asid;
-            let match_ok: logic = tlb_valid[i] && asid_ok
+            // Phase 11-H: the TLB holds only V=0 (single-stage) entries; a
+            // virtualized access (i_virt) always misses and walks two-stage.
+            let match_ok: logic = tlb_valid[i] && asid_ok && !i_virt
                 && ((tlb_level[i] == 2'd2 && tlb_vpn[i][26:18] == vpn_full[26:18])
                     || (tlb_level[i] == 2'd1 && tlb_vpn[i][26:9] == vpn_full[26:9])
                     || (tlb_level[i] == 2'd0 && tlb_vpn[i] == vpn_full));
@@ -200,15 +236,26 @@ pub module mmu #(
     // ============================================================
     // Page table walk state machine
     // ============================================================
-    enum State: logic<3> {
-        IDLE = 3'd0,
-        LEVEL2 = 3'd1, // Reading level-2 PTE
-        LEVEL1 = 3'd2, // Reading level-1 PTE
-        LEVEL0 = 3'd3, // Reading level-0 PTE
-        DONE = 3'd4, // Translation complete, waiting for data access
-        FAULT = 3'd5,
-        FAULT2 = 3'd6, // 1-cycle delay after FAULT (let fetch PC update)
-        WRITE_AD = 3'd7, // P10 Svadu: writing the A/D-updated leaf PTE back
+    enum State: logic<4> {
+        IDLE = 4'd0,
+        LEVEL2 = 4'd1, // Reading level-2 PTE
+        LEVEL1 = 4'd2, // Reading level-1 PTE
+        LEVEL0 = 4'd3, // Reading level-0 PTE
+        DONE = 4'd4, // Translation complete, waiting for data access
+        FAULT = 4'd5,
+        FAULT2 = 4'd6, // 1-cycle delay after FAULT (let fetch PC update)
+        WRITE_AD = 4'd7, // P10 Svadu: writing the A/D-updated leaf PTE back
+        // Phase 11-H two-stage (V=1) states. The G-stage sub-walk (GST_*) reads
+        // G-stage PTEs at host PAs directly; VS_RD reads the VS-stage PTE at the
+        // host PA the G-stage just produced; TS_DONE/TS_FAULT mirror DONE/FAULT
+        // for the two-stage result (no TLB fill in V=1).
+        GST_L2 = 4'd8,
+        GST_L1 = 4'd9,
+        GST_L0 = 4'd10,
+        VS_RD = 4'd11,
+        TS_DONE = 4'd12,
+        TS_FAULT = 4'd13,
+        TS_FAULT2 = 4'd14,
     }
 
     var state  : State    ;
@@ -255,6 +302,21 @@ pub module mmu #(
     // must use the walk's ASID, not a drifted current value).
     var walk_asid    : logic<16>;
 
+    // === Phase 11-H two-stage walk registers (used only when i_virt) ===
+    // The VS-stage descends vsatp's page table over the guest VA; every VS PTE
+    // it must read lives at a guest PA, which the G-stage sub-walk (over hgatp)
+    // translates to a host PA first. g_after_fin marks whether the current
+    // G-stage result is the final HPA (g_after_fin=1) or a VS PTE host address
+    // to read next (g_after_fin=0). No TLB is used in V=1 (walk every access).
+    var ts_gva     : logic<64>; // latched guest VA being translated
+    var ts_is_store: logic    ; // latched access type (leaf perm + A/D)
+    var ts_is_fetch: logic    ;
+    var vs_lvl     : logic<2> ; // current VS-stage level (2..0)
+    var g_in_gpa   : logic<64>; // guest PA the G-stage sub-walk is translating
+    var g_after_fin: logic    ; // 1 = G result is final HPA; 0 = a VS PTE host addr
+    var ts_hpa     : logic<64>; // final host PA result
+    var ts_gflt    : logic    ; // the latched two-stage fault was in the G-stage
+
     // Leaf PTE validity: valid + leaf (R or X) + PBMT not reserved, plus the
     // A/D requirement. With Svade (i_adue=0) the A bit must be set and, for a
     // store, the D bit too — otherwise fault. With Svadu (i_adue=1) an A=0 /
@@ -273,6 +335,41 @@ pub module mmu #(
     // (pte_w && pte_d) reflects the freshly-set D bit.
     let pte_ad_new: logic<64> = i_ptw_data | 64'h40 | (if i_store ? 64'h80 : 64'd0);
 
+    // === Phase 11-H two-stage helpers ===
+    // Incoming PTE (i_ptw_data) field views, shared by the G-stage and VS-stage
+    // walk transitions (the PTE format is identical at both stages).
+    let in_v   : logic     = i_ptw_data[0];
+    let in_r   : logic     = i_ptw_data[1];
+    let in_w   : logic     = i_ptw_data[2];
+    let in_x   : logic     = i_ptw_data[3];
+    let in_u   : logic     = i_ptw_data[4];
+    let in_a   : logic     = i_ptw_data[6];
+    let in_d   : logic     = i_ptw_data[7];
+    let in_leaf: logic     = i_ptw_data[1] || i_ptw_data[3];
+    let in_ppn : logic<44> = i_ptw_data[53:10];
+    // VS-stage VPN fields from the latched guest VA (Sv39: 9/9/9).
+    let ts_vpn1: logic<9> = ts_gva[29:21];
+    let ts_vpn0: logic<9> = ts_gva[20:12];
+    // G-stage VPN fields from the GPA under translation (Sv39x4: 11/9/9).
+    let g_vpn1 : logic<9> = g_in_gpa[29:21];
+    let g_vpn0 : logic<9> = g_in_gpa[20:12];
+    // G-stage permission for the current sub-walk. When g_after_fin the access is
+    // the real one (fetch/store/load); otherwise it is an implicit load of a
+    // VS-stage PTE. G-stage pages must be user (U=1); SUM does not apply.
+    let g_rwx_ok: logic = if g_after_fin ?
+        (if ts_is_fetch ? in_x : if ts_is_store ? in_w : (in_r || (i_mxr && in_x)))
+    :
+        (in_r || (i_mxr && in_x))
+    ;
+    let g_ad_ok : logic = in_a && (!(g_after_fin && ts_is_store) || in_d);
+    let g_perm_ok: logic = g_rwx_ok && in_u && g_ad_ok;
+    // VS-stage leaf permission for the real access (uses VS-mode sum/mxr, which
+    // the core supplies on i_sum/i_mxr when i_virt).
+    let vs_rwx_ok: logic = if ts_is_fetch ? in_x : if ts_is_store ? in_w : (in_r || (i_mxr && in_x));
+    let vs_u_ok  : logic = if i_priv == PrivLevel::USER ? in_u : (if in_u ? (i_sum && !ts_is_fetch) : 1'b1);
+    let vs_ad_ok : logic = in_a && (!ts_is_store || in_d);
+    let vs_perm_ok: logic = vs_rwx_ok && vs_u_ok && vs_ad_ok;
+
     always_ff (clk, rst) {
         if_reset {
             state           = State::IDLE;
@@ -286,6 +383,15 @@ pub module mmu #(
             walk_page_off   = 12'd0;
             walk_asid       = 16'd0;
             tlb_replace_idx = 4'd0;
+            // Phase 11-H two-stage registers.
+            ts_gva      = 64'd0;
+            ts_is_store = 1'b0;
+            ts_is_fetch = 1'b0;
+            vs_lvl      = 2'd0;
+            g_in_gpa    = 64'd0;
+            g_after_fin = 1'b0;
+            ts_hpa      = 64'd0;
+            ts_gflt     = 1'b0;
         } else if i_sfence {
             // SFENCE.VMA: invalidate the selected TLB entries (see the port
             // comment). A wildcard rs1/rs2 (x0) widens the match to all VAs /
@@ -303,8 +409,10 @@ pub module mmu #(
                 }
             }
             state = State::IDLE;
-        } else if i_redirect && state != State::IDLE && state != State::DONE && state != State::WRITE_AD {
+        } else if i_redirect && state != State::IDLE && state != State::DONE && state != State::WRITE_AD && state != State::TS_DONE {
             // Pipeline redirect (misprediction/trap): cancel in-flight PTW.
+            // Phase 11-H: a two-stage walk (GST_*/VS_RD) is also safely abortable
+            // (no TLB to poison in V=1); TS_DONE, like DONE, holds a valid result.
             // The fetch address has changed, so continuing the walk would
             // register the old PTE under the new VPN — TLB poisoning.
             // EXCEPTION: DONE state already has a valid PTE for its latched
@@ -332,6 +440,40 @@ pub module mmu #(
                         walk_page_off = page_off;
                         walk_asid     = satp_asid;
                         state         = State::LEVEL2;
+                    } else if i_req && two_stage {
+                        // Phase 11-H: start a two-stage walk. Latch the access.
+                        // The first GPA to G-translate is either the VS L2 PTE
+                        // address (vsatp.PPN*4096 + VPN2*8) or, if vsatp is Bare,
+                        // the GVA itself. Compute it into a local: g_in_gpa is a
+                        // register, so reading it back this same cycle would see
+                        // its OLD value under non-blocking assignment.
+                        let first_gpa: logic<64> = if vs_on ?
+                            {8'd0, vsatp_ppn, 12'd0} + {52'd0, i_vaddr[38:30], 3'd0}
+                        :
+                            i_vaddr
+                        ;
+                        ts_gva      = i_vaddr;
+                        ts_is_store = i_store;
+                        ts_is_fetch = i_fetch;
+                        ts_gflt     = 1'b0;
+                        vs_lvl      = 2'd2;
+                        g_in_gpa    = first_gpa;
+                        g_after_fin = if vs_on ? 1'b0 : 1'b1;
+                        if g_on {
+                            ptw_addr_reg = {8'd0, hgatp_ppn, 12'd0} + {50'd0, first_gpa[40:30], 3'd0};
+                            state        = State::GST_L2;
+                        } else if vs_on {
+                            // hgatp Bare: G-stage identity. The VS PTE host addr
+                            // equals its guest PA — read it directly.
+                            ptw_addr_reg = first_gpa;
+                            state        = State::VS_RD;
+                        } else {
+                            // Both stages Bare under V=1: identity. (two_stage is
+                            // false here, so this branch is unreachable; kept for
+                            // totality.) Treat as a 1-cycle done.
+                            ts_hpa = i_vaddr;
+                            state  = State::TS_DONE;
+                        }
                     }
                 }
                 State::LEVEL2: {
@@ -494,6 +636,146 @@ pub module mmu #(
                         state = State::DONE;
                     }
                 }
+                // ===== Phase 11-H two-stage (V=1) walk =====
+                // G-stage sub-walk: read G PTEs at host PAs (ptw_addr_reg). On a
+                // leaf, build the host PA and either finish (g_after_fin → TS_DONE)
+                // or hand the host address of a VS PTE to VS_RD. A G-stage fault
+                // sets ts_gflt (guest-page-fault).
+                State::GST_L2: {
+                    if i_ptw_valid {
+                        if !in_v {
+                            ts_gflt = 1'b1;
+                            state   = State::TS_FAULT;
+                        } else if in_leaf {
+                            if !g_perm_ok || in_ppn[17:0] != 18'd0 {
+                                ts_gflt = 1'b1;
+                                state   = State::TS_FAULT;
+                            } else {
+                                let g_hpa: logic<64> = {8'd0, in_ppn[43:18], g_in_gpa[29:0]};
+                                if g_after_fin {
+                                    ts_hpa = g_hpa;
+                                    state  = State::TS_DONE;
+                                } else {
+                                    ptw_addr_reg = g_hpa;
+                                    state        = State::VS_RD;
+                                }
+                            }
+                        } else {
+                            ptw_addr_reg = {8'd0, in_ppn, 12'd0} + {52'd0, g_vpn1, 3'd0};
+                            state        = State::GST_L1;
+                        }
+                    }
+                }
+                State::GST_L1: {
+                    if i_ptw_valid {
+                        if !in_v {
+                            ts_gflt = 1'b1;
+                            state   = State::TS_FAULT;
+                        } else if in_leaf {
+                            if !g_perm_ok || in_ppn[8:0] != 9'd0 {
+                                ts_gflt = 1'b1;
+                                state   = State::TS_FAULT;
+                            } else {
+                                let g_hpa: logic<64> = {8'd0, in_ppn[43:9], g_in_gpa[20:0]};
+                                if g_after_fin {
+                                    ts_hpa = g_hpa;
+                                    state  = State::TS_DONE;
+                                } else {
+                                    ptw_addr_reg = g_hpa;
+                                    state        = State::VS_RD;
+                                }
+                            }
+                        } else {
+                            ptw_addr_reg = {8'd0, in_ppn, 12'd0} + {52'd0, g_vpn0, 3'd0};
+                            state        = State::GST_L0;
+                        }
+                    }
+                }
+                State::GST_L0: {
+                    if i_ptw_valid {
+                        if !in_v || !in_leaf || !g_perm_ok {
+                            ts_gflt = 1'b1;
+                            state   = State::TS_FAULT;
+                        } else {
+                            let g_hpa: logic<64> = {8'd0, in_ppn, g_in_gpa[11:0]};
+                            if g_after_fin {
+                                ts_hpa = g_hpa;
+                                state  = State::TS_DONE;
+                            } else {
+                                ptw_addr_reg = g_hpa;
+                                state        = State::VS_RD;
+                            }
+                        }
+                    }
+                }
+                // VS-stage PTE read (at the host PA the G-stage produced). A leaf
+                // gives the final guest PA, which is then G-translated (g_after_fin
+                // =1). A non-leaf descends to the next VS level, whose PTE is again
+                // a guest PA that the G-stage must translate. VS faults: ts_gflt=0.
+                State::VS_RD: {
+                    if i_ptw_valid {
+                        if !in_v {
+                            ts_gflt = 1'b0;
+                            state   = State::TS_FAULT;
+                        } else if in_leaf {
+                            let vs_align_bad: logic = (vs_lvl == 2'd2 && in_ppn[17:0] != 18'd0)
+                                || (vs_lvl == 2'd1 && in_ppn[8:0] != 9'd0);
+                            if !vs_perm_ok || vs_align_bad {
+                                ts_gflt = 1'b0;
+                                state   = State::TS_FAULT;
+                            } else {
+                                let gpa_fin: logic<64> = if vs_lvl == 2'd2 ?
+                                    {8'd0, in_ppn[43:18], ts_gva[29:0]}
+                                : if vs_lvl == 2'd1 ?
+                                    {8'd0, in_ppn[43:9], ts_gva[20:0]}
+                                :
+                                    {8'd0, in_ppn, ts_gva[11:0]}
+                                ;
+                                g_in_gpa    = gpa_fin;
+                                g_after_fin = 1'b1;
+                                if g_on {
+                                    ptw_addr_reg = {8'd0, hgatp_ppn, 12'd0} + {50'd0, gpa_fin[40:30], 3'd0};
+                                    state        = State::GST_L2;
+                                } else {
+                                    ts_hpa = gpa_fin;
+                                    state  = State::TS_DONE;
+                                }
+                            }
+                        } else if vs_lvl == 2'd0 {
+                            // Non-leaf at the lowest VS level is invalid.
+                            ts_gflt = 1'b0;
+                            state   = State::TS_FAULT;
+                        } else {
+                            let nidx    : logic<9>  = if vs_lvl == 2'd2 ? ts_vpn1 : ts_vpn0;
+                            let next_gpa: logic<64> = {8'd0, in_ppn, 12'd0} + {52'd0, nidx, 3'd0};
+                            g_in_gpa    = next_gpa;
+                            vs_lvl      = vs_lvl - 2'd1;
+                            g_after_fin = 1'b0;
+                            if g_on {
+                                ptw_addr_reg = {8'd0, hgatp_ppn, 12'd0} + {50'd0, next_gpa[40:30], 3'd0};
+                                state        = State::GST_L2;
+                            } else {
+                                ptw_addr_reg = next_gpa;
+                                state        = State::VS_RD;
+                            }
+                        }
+                    }
+                }
+                State::TS_DONE: {
+                    // Two-stage translation complete. Hold the result (o_paddr=
+                    // ts_hpa, o_valid) while the core still requests this exact
+                    // access; drop to IDLE once it deasserts i_req or moves to a
+                    // new VA, so the next access re-walks. No TLB fill in V=1.
+                    if !i_req || i_vaddr != ts_gva {
+                        state = State::IDLE;
+                    }
+                }
+                State::TS_FAULT: {
+                    state = State::TS_FAULT2;
+                }
+                State::TS_FAULT2: {
+                    state = State::IDLE;
+                }
                 default: {
                     state = State::IDLE;
                 }
@@ -538,8 +820,16 @@ pub module mmu #(
     // with mismatched i_vaddr.
     let walk_va_match: logic = walk_vpn_full == vpn_full;
 
-    // Outputs: TLB hit takes priority over PTW result
-    assign o_paddr = if !vm_enabled ? i_vaddr : if tlb_hit && state == State::IDLE ? tlb_pa : pa;
+    // Outputs: TLB hit takes priority over PTW result. Phase 11-H: a virtualized
+    // access (vm_enabled=0 because !i_virt is false) returns the two-stage host
+    // PA (ts_hpa, valid in TS_DONE) when any stage is on, else passes through.
+    assign o_paddr = if !vm_enabled ?
+        (if two_stage ? ts_hpa : i_vaddr)
+    : if tlb_hit && state == State::IDLE ?
+        tlb_pa
+    :
+        pa
+    ;
 
     // P10 Svpbmt: NC/IO memory type for the current translation. Mirrors the
     // o_paddr TLB-hit/walk mux. pte_unc covers the just-walked leaf (DONE path).
@@ -565,7 +855,7 @@ pub module mmu #(
     ;
 
     assign o_valid = if !vm_enabled ?
-        i_req
+        (if two_stage ? (state == State::TS_DONE && i_vaddr == ts_gva) : i_req)
     : if tlb_hit && state == State::IDLE ?
         (i_req && tlb_perm_ok)
     :
@@ -585,13 +875,16 @@ pub module mmu #(
     // VA). v1 (in-order) holds i_vaddr stable through the walk stall, so
     // walk_va_match is always 1 at its faults — no behavior change for v1.
     let _fault_out: logic = if !vm_enabled ?
-        1'b0
+        (if two_stage ? (state == State::TS_FAULT) : 1'b0)
     : if tlb_hit && state == State::IDLE ?
         (i_req && !tlb_perm_ok)
     :
         ((state == State::FAULT || (state == State::DONE && !perm_ok)) && walk_va_match)
     ;
     assign o_fault = _fault_out;
+    // Phase 11-H: distinguish a G-stage (guest-physical) fault so the core can
+    // raise a guest-page-fault (cause 20/21/23) rather than a VS-stage one.
+    assign o_gstage_fault = state == State::TS_FAULT && ts_gflt;
     // Debug: trace MMU faults (limited)
 
 
@@ -599,16 +892,25 @@ pub module mmu #(
     // but combinationally o_busy must already be high to prevent the
     // pipeline from advancing PC during the 1-cycle IDLE→LEVEL2 gap.
     let tlb_miss_start: logic = state == State::IDLE && i_req && vm_enabled && !tlb_hit;
+    // Phase 11-H two-stage: the IDLE→walk gap + the walk states must hold busy
+    // (mirrors the single-stage logic). TS_DONE/IDLE are NOT busy (the core
+    // performs the data access then); TS_FAULT/TS_FAULT2 are busy like FAULT.
+    let ts_miss_start: logic = state == State::IDLE && i_req && two_stage;
+    let ts_busy      : logic = two_stage && (ts_miss_start
+        || state == State::GST_L2 || state == State::GST_L1 || state == State::GST_L0
+        || state == State::VS_RD || state == State::TS_FAULT || state == State::TS_FAULT2);
     // FAULT and FAULT2 must be busy to prevent pipeline from
     // advancing during fault handling (otherwise sfence.vma in ID
     // fires and resets the TLB, causing an infinite fault loop).
-    assign o_busy       = vm_enabled && ((state != State::IDLE && state != State::DONE) || tlb_miss_start);
-    assign o_walk_start = tlb_miss_start;
+    assign o_busy       = (vm_enabled && ((state != State::IDLE && state != State::DONE) || tlb_miss_start)) || ts_busy;
+    assign o_walk_start = tlb_miss_start || ts_miss_start;
     // M9.3: IDLE = no walk physically owns the port (purely from the `state`
     // register; independent of i_vaddr/tlb_hit, so loop-free for the consumer).
     assign o_idle       = state == State::IDLE;
     assign o_ptw_addr   = ptw_addr_reg;
-    assign o_ptw_req    = state == State::LEVEL2 || state == State::LEVEL1 || state == State::LEVEL0;
+    assign o_ptw_req    = state == State::LEVEL2 || state == State::LEVEL1 || state == State::LEVEL0
+        || state == State::GST_L2 || state == State::GST_L1 || state == State::GST_L0
+        || state == State::VS_RD;
     // P10 Svadu: A/D write-back drive. pte holds the A/D-updated leaf PTE; the
     // address is o_ptw_addr (= ptw_addr_reg, still the leaf PTE address).
     assign o_ptw_wen    = state == State::WRITE_AD;
