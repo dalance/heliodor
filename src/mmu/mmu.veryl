@@ -144,6 +144,18 @@ pub module mmu #(
     let g_on     : logic = v_active && hgatp_mode == HGATP_MODE_SV39X4;
     let two_stage: logic = vs_on || g_on;
 
+    // Phase 11-H V=1 TLB tag sources: VMID (hgatp[57:44]) distinguishes guests;
+    // VS-ASID (vsatp[59:44]) distinguishes the guest's own address spaces. The
+    // combined two-stage TLB below tags each cached GVA->HPA entry with both.
+    let hgatp_vmid: logic<14> = i_hgatp[57:44];
+    let vsatp_asid: logic<16> = i_vsatp[59:44];
+    // The V=1 TLB serves (and fills) only the fully-virtualized case: both the
+    // VS-stage and G-stage active, and not an HLVX access (which checks X on a
+    // read — never cached). When the guest disables its own paging (vsatp Bare)
+    // the entries go inert (GPA-direct accesses re-walk), so a vsatp mode switch
+    // needs no extra flush.
+    let v1_lookup_en: logic = vs_on && g_on && !i_hlvx;
+
     // Translation enabled (single-stage, V=0): Sv39 mode and not in M-mode. The
     // whole existing FSM/TLB/output logic keys off this, so gating it on !i_virt
     // makes the single-stage path inert under virtualization (the two-stage path
@@ -242,6 +254,84 @@ pub module mmu #(
     var tlb_replace_idx: logic<4>;
 
     // ============================================================
+    // Phase 11-H V=1 TLB: 32-entry combined two-stage cache
+    // ============================================================
+    // Caches the final guest-VA -> host-PA translation produced by a successful
+    // two-stage walk (VS-stage Sv39 + G-stage Sv39x4), so a steady-state guest
+    // does not re-walk every fetch/load/store (each two-stage walk is ~10-15
+    // dependent memory reads). Tagged by {VMID, VS-ASID, guest VPN}; the effective
+    // page level is min(VS leaf level, G leaf level) and the stored host PPN +
+    // level reconstruct the HPA exactly as the single-stage TLB does. Permissions
+    // are the per-stage AND (VS perm & G perm), with each stage's D folded into W.
+    // A lookup HITS only when the combined permission allows the access; a tag
+    // match that fails the permission check falls through to a full walk, which
+    // re-derives the correctly-attributed VS-/G-stage fault — so this TLB never
+    // produces a fault itself. Flushed wholesale on any SFENCE.VMA / HFENCE (guest
+    // VS-stage fence, or the hypervisor's HFENCE.VVMA/GVMA — both reach the MMU as
+    // i_sfence; see decoder.veryl).
+    var v1_valid : logic     [32];
+    var v1_vpn   : logic<27> [32];
+    var v1_vmid  : logic<14> [32];
+    var v1_asid  : logic<16> [32];
+    var v1_global: logic     [32]; // VS leaf G bit (global within the guest)
+    var v1_level : logic<2>  [32]; // effective leaf level (min of the two stages)
+    var v1_ppn   : logic<44> [32]; // host PPN (4KB-granular)
+    var v1_r     : logic     [32]; // combined R (VS.r & G.r)
+    var v1_w     : logic     [32]; // combined W, D folded ((VS.w&VS.d)&(G.w&G.d))
+    var v1_x     : logic     [32]; // combined X (VS.x & G.x)
+    var v1_u     : logic     [32]; // VS leaf U (G leaf U is always 1)
+    var v1_repl  : logic<5>      ; // round-robin replacement pointer
+
+    var v1_match  : logic    ;
+    var v1_hit_ppn: logic<44>;
+    var v1_hit_r  : logic    ;
+    var v1_hit_w  : logic    ;
+    var v1_hit_x  : logic    ;
+    var v1_hit_u  : logic    ;
+    var v1_hit_lvl: logic<2> ;
+    always_comb {
+        v1_match   = 1'b0;
+        v1_hit_ppn = 44'd0;
+        v1_hit_r   = 1'b0;
+        v1_hit_w   = 1'b0;
+        v1_hit_x   = 1'b0;
+        v1_hit_u   = 1'b0;
+        v1_hit_lvl = 2'd0;
+        for i in 0..32 {
+            let asid_ok: logic = v1_global[i] || v1_asid[i] == vsatp_asid;
+            let m      : logic = v1_valid[i] && v1_lookup_en && v1_vmid[i] == hgatp_vmid && asid_ok
+                && ((v1_level[i] == 2'd2 && v1_vpn[i][26:18] == vpn_full[26:18])
+                    || (v1_level[i] == 2'd1 && v1_vpn[i][26:9] == vpn_full[26:9])
+                    || (v1_level[i] == 2'd0 && v1_vpn[i] == vpn_full));
+            if m {
+                v1_match   = 1'b1;
+                v1_hit_ppn = v1_ppn[i];
+                v1_hit_r   = v1_r[i];
+                v1_hit_w   = v1_w[i];
+                v1_hit_x   = v1_x[i];
+                v1_hit_u   = v1_u[i];
+                v1_hit_lvl = v1_level[i];
+            }
+        }
+    }
+
+    // Reconstruct the host PA from the matched entry (same level mux as V=0).
+    var v1_pa: logic<64>;
+    always_comb {
+        case v1_hit_lvl {
+            2'd2   : v1_pa = {8'b0, v1_hit_ppn[43:18], i_vaddr[29:0]};
+            2'd1   : v1_pa = {8'b0, v1_hit_ppn[43:9], i_vaddr[20:0]};
+            default: v1_pa = {8'b0, v1_hit_ppn, page_off};
+        }
+    }
+    // Combined permission check. A tag match that fails this is NOT a hit — it
+    // falls through to a full walk for correct VS-/G-stage fault attribution.
+    let v1_read_ok: logic = v1_hit_r || (i_mxr && v1_hit_x);
+    let v1_rwx_ok : logic = if i_fetch ? v1_hit_x : if i_store ? v1_hit_w : v1_read_ok;
+    let v1_u_ok   : logic = if i_priv == PrivLevel::USER ? v1_hit_u : (if v1_hit_u ? (i_sum && !i_fetch) : 1'b1);
+    let v1_hit    : logic = v1_match && v1_rwx_ok && v1_u_ok;
+
+    // ============================================================
     // Page table walk state machine
     // ============================================================
     enum State: logic<4> {
@@ -325,6 +415,21 @@ pub module mmu #(
     var g_after_fin: logic    ; // 1 = G result is final HPA; 0 = a VS PTE host addr
     var ts_hpa     : logic<64>; // final host PA result
     var ts_gflt    : logic    ; // the latched two-stage fault was in the G-stage
+    // V=1 TLB fill context, latched alongside the walk. ts_fill_ok gates the fill
+    // on the both-stages-active, non-HLVX case (mirrors v1_lookup_en at walk
+    // start). vs_leaf_* capture the VS-stage leaf's level / permissions / global
+    // bit when the VS leaf is found (VS_RD); they are combined with the final
+    // G-stage leaf's permissions at fill time (the GST_* g_after_fin branch).
+    var ts_vmid    : logic<14>;
+    var ts_vs_asid : logic<16>;
+    var ts_fill_ok : logic    ;
+    var vs_leaf_lvl: logic<2> ;
+    var vs_leaf_r  : logic    ;
+    var vs_leaf_w  : logic    ;
+    var vs_leaf_x  : logic    ;
+    var vs_leaf_u  : logic    ;
+    var vs_leaf_d  : logic    ;
+    var vs_leaf_g  : logic    ;
 
     // Leaf PTE validity: valid + leaf (R or X) + PBMT not reserved, plus the
     // A/D requirement. With Svade (i_adue=0) the A bit must be set and, for a
@@ -402,6 +507,21 @@ pub module mmu #(
             g_after_fin = 1'b0;
             ts_hpa      = 64'd0;
             ts_gflt     = 1'b0;
+            // V=1 TLB
+            for i in 0..32 {
+                v1_valid[i] = 1'b0;
+            }
+            v1_repl     = 5'd0;
+            ts_vmid     = 14'd0;
+            ts_vs_asid  = 16'd0;
+            ts_fill_ok  = 1'b0;
+            vs_leaf_lvl = 2'd0;
+            vs_leaf_r   = 1'b0;
+            vs_leaf_w   = 1'b0;
+            vs_leaf_x   = 1'b0;
+            vs_leaf_u   = 1'b0;
+            vs_leaf_d   = 1'b0;
+            vs_leaf_g   = 1'b0;
         } else if i_sfence {
             // SFENCE.VMA: invalidate the selected TLB entries (see the port
             // comment). A wildcard rs1/rs2 (x0) widens the match to all VAs /
@@ -417,6 +537,14 @@ pub module mmu #(
                 if va_match && asid_match {
                     tlb_valid[i] = 1'b0;
                 }
+            }
+            // Phase 11-H: any SFENCE.VMA / HFENCE flushes the whole V=1 TLB. This
+            // is conservative (full flush regardless of operands), but correct for
+            // every case that can stale a guest translation: a guest VS-stage
+            // fence, and the hypervisor's HFENCE.VVMA/GVMA (both arrive here as
+            // i_sfence — see decoder.veryl).
+            for i in 0..32 {
+                v1_valid[i] = 1'b0;
             }
             state = State::IDLE;
         } else if i_redirect && state != State::IDLE && state != State::DONE && state != State::WRITE_AD && state != State::TS_DONE {
@@ -450,7 +578,7 @@ pub module mmu #(
                         walk_page_off = page_off;
                         walk_asid     = satp_asid;
                         state         = State::LEVEL2;
-                    } else if i_req && two_stage {
+                    } else if i_req && two_stage && !v1_hit {
                         // Phase 11-H: start a two-stage walk. Latch the access.
                         // The first GPA to G-translate is either the VS L2 PTE
                         // address (vsatp.PPN*4096 + VPN2*8) or, if vsatp is Bare,
@@ -467,6 +595,10 @@ pub module mmu #(
                         ts_is_fetch = i_fetch;
                         ts_is_xperm = i_hlvx;
                         ts_gflt     = 1'b0;
+                        // V=1 TLB fill context for this walk.
+                        ts_vmid     = hgatp_vmid;
+                        ts_vs_asid  = vsatp_asid;
+                        ts_fill_ok  = vs_on && g_on && !i_hlvx;
                         vs_lvl      = 2'd2;
                         g_in_gpa    = first_gpa;
                         g_after_fin = if vs_on ? 1'b0 : 1'b1;
@@ -665,6 +797,22 @@ pub module mmu #(
                                 let g_hpa: logic<64> = {8'd0, in_ppn[43:18], g_in_gpa[29:0]};
                                 if g_after_fin {
                                     ts_hpa = g_hpa;
+                                    if ts_fill_ok {
+                                        // G gigapage: effective level = min(VS, 2) = VS.
+                                        let eff_lvl: logic<2> = vs_leaf_lvl;
+                                        v1_valid[v1_repl]  = 1'b1;
+                                        v1_vpn[v1_repl]    = ts_gva[38:12];
+                                        v1_vmid[v1_repl]   = ts_vmid;
+                                        v1_asid[v1_repl]   = ts_vs_asid;
+                                        v1_global[v1_repl] = vs_leaf_g;
+                                        v1_level[v1_repl]  = eff_lvl;
+                                        v1_ppn[v1_repl]    = g_hpa[55:12];
+                                        v1_r[v1_repl]      = vs_leaf_r && in_r;
+                                        v1_w[v1_repl]      = (vs_leaf_w && vs_leaf_d) && (in_w && in_d);
+                                        v1_x[v1_repl]      = vs_leaf_x && in_x;
+                                        v1_u[v1_repl]      = vs_leaf_u;
+                                        v1_repl            = v1_repl + 5'd1;
+                                    }
                                     state  = State::TS_DONE;
                                 } else {
                                     ptw_addr_reg = g_hpa;
@@ -690,6 +838,22 @@ pub module mmu #(
                                 let g_hpa: logic<64> = {8'd0, in_ppn[43:9], g_in_gpa[20:0]};
                                 if g_after_fin {
                                     ts_hpa = g_hpa;
+                                    if ts_fill_ok {
+                                        // G megapage: effective level = min(VS, 1).
+                                        let eff_lvl: logic<2> = if vs_leaf_lvl == 2'd0 ? 2'd0 : 2'd1;
+                                        v1_valid[v1_repl]  = 1'b1;
+                                        v1_vpn[v1_repl]    = ts_gva[38:12];
+                                        v1_vmid[v1_repl]   = ts_vmid;
+                                        v1_asid[v1_repl]   = ts_vs_asid;
+                                        v1_global[v1_repl] = vs_leaf_g;
+                                        v1_level[v1_repl]  = eff_lvl;
+                                        v1_ppn[v1_repl]    = g_hpa[55:12];
+                                        v1_r[v1_repl]      = vs_leaf_r && in_r;
+                                        v1_w[v1_repl]      = (vs_leaf_w && vs_leaf_d) && (in_w && in_d);
+                                        v1_x[v1_repl]      = vs_leaf_x && in_x;
+                                        v1_u[v1_repl]      = vs_leaf_u;
+                                        v1_repl            = v1_repl + 5'd1;
+                                    }
                                     state  = State::TS_DONE;
                                 } else {
                                     ptw_addr_reg = g_hpa;
@@ -711,6 +875,22 @@ pub module mmu #(
                             let g_hpa: logic<64> = {8'd0, in_ppn, g_in_gpa[11:0]};
                             if g_after_fin {
                                 ts_hpa = g_hpa;
+                                if ts_fill_ok {
+                                    // G 4KB leaf: effective level = min(VS, 0) = 0.
+                                    let eff_lvl: logic<2> = 2'd0;
+                                    v1_valid[v1_repl]  = 1'b1;
+                                    v1_vpn[v1_repl]    = ts_gva[38:12];
+                                    v1_vmid[v1_repl]   = ts_vmid;
+                                    v1_asid[v1_repl]   = ts_vs_asid;
+                                    v1_global[v1_repl] = vs_leaf_g;
+                                    v1_level[v1_repl]  = eff_lvl;
+                                    v1_ppn[v1_repl]    = g_hpa[55:12];
+                                    v1_r[v1_repl]      = vs_leaf_r && in_r;
+                                    v1_w[v1_repl]      = (vs_leaf_w && vs_leaf_d) && (in_w && in_d);
+                                    v1_x[v1_repl]      = vs_leaf_x && in_x;
+                                    v1_u[v1_repl]      = vs_leaf_u;
+                                    v1_repl            = v1_repl + 5'd1;
+                                }
                                 state  = State::TS_DONE;
                             } else {
                                 ptw_addr_reg = g_hpa;
@@ -744,6 +924,15 @@ pub module mmu #(
                                 ;
                                 g_in_gpa    = gpa_fin;
                                 g_after_fin = 1'b1;
+                                // Capture VS leaf level/perms/global for the V=1
+                                // TLB fill (combined with the G leaf at fill time).
+                                vs_leaf_lvl = vs_lvl;
+                                vs_leaf_r   = in_r;
+                                vs_leaf_w   = in_w;
+                                vs_leaf_x   = in_x;
+                                vs_leaf_u   = in_u;
+                                vs_leaf_d   = in_d;
+                                vs_leaf_g   = i_ptw_data[5];
                                 if g_on {
                                     ptw_addr_reg = {8'd0, hgatp_ppn, 12'd0} + {50'd0, gpa_fin[40:30], 3'd0};
                                     state        = State::GST_L2;
@@ -834,8 +1023,11 @@ pub module mmu #(
     // Outputs: TLB hit takes priority over PTW result. Phase 11-H: a virtualized
     // access (vm_enabled=0 because !i_virt is false) returns the two-stage host
     // PA (ts_hpa, valid in TS_DONE) when any stage is on, else passes through.
+    // Phase 11-H: a V=1 TLB hit (combined two-stage translation cached) serves
+    // the host PA in IDLE with no walk, exactly like the V=0 tlb_hit fast path.
+    let v1_hit_idle: logic = v1_hit && state == State::IDLE;
     assign o_paddr = if !vm_enabled ?
-        (if two_stage ? ts_hpa : i_vaddr)
+        (if v1_hit_idle ? v1_pa : if two_stage ? ts_hpa : i_vaddr)
     : if tlb_hit && state == State::IDLE ?
         tlb_pa
     :
@@ -866,7 +1058,7 @@ pub module mmu #(
     ;
 
     assign o_valid = if !vm_enabled ?
-        (if two_stage ? (state == State::TS_DONE && i_vaddr == ts_gva) : i_req)
+        (if v1_hit_idle ? i_req : if two_stage ? (state == State::TS_DONE && i_vaddr == ts_gva) : i_req)
     : if tlb_hit && state == State::IDLE ?
         (i_req && tlb_perm_ok)
     :
@@ -908,7 +1100,7 @@ pub module mmu #(
     // Phase 11-H two-stage: the IDLE→walk gap + the walk states must hold busy
     // (mirrors the single-stage logic). TS_DONE/IDLE are NOT busy (the core
     // performs the data access then); TS_FAULT/TS_FAULT2 are busy like FAULT.
-    let ts_miss_start: logic = state == State::IDLE && i_req && two_stage;
+    let ts_miss_start: logic = state == State::IDLE && i_req && two_stage && !v1_hit;
     let ts_busy      : logic = two_stage && (ts_miss_start
         || state == State::GST_L2 || state == State::GST_L1 || state == State::GST_L0
         || state == State::VS_RD || state == State::TS_FAULT || state == State::TS_FAULT2);
