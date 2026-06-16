@@ -349,6 +349,7 @@ pub module heliodor_core #(
     var csr_vsatp    : logic             <64>;
     var csr_vs_sum   : logic                ; // vsstatus.SUM (VS-stage)
     var csr_vs_mxr   : logic                ; // vsstatus.MXR (VS-stage)
+    var csr_spvp     : logic                ; // hstatus.SPVP (HLV/HSV priv: 1=VS,0=VU)
     // Phase 11-H3: VS trap delegation.
     var csr_virt_prev: logic                ; // registered V snapshot (eval-order safe)
     var csr_hedeleg  : logic             <64>;
@@ -383,8 +384,25 @@ pub module heliodor_core #(
     // csr_virt directly (M-mode fetch is never virtualized). VS-stage permission
     // bits come from the guest sstatus (vsstatus) when the access is virtualized.
     let dmem_eff_virt: logic = if csr_mprv && csr_priv == csr_pkg::PrivLevel::MACHINE ? csr_mpv : csr_virt;
-    let dmem_sum     : logic = if dmem_eff_virt ? csr_vs_sum : csr_sum;
-    let dmem_mxr     : logic = if dmem_eff_virt ? csr_vs_mxr : csr_mxr;
+    // Phase 11-H HLV/HSV: the op currently driving the dmem port is a hypervisor
+    // virtual-memory access (per-op two-stage translation, even at V=0). Driven
+    // (var + assign) near the dmem MMU where the issue/commit/walk sources are in
+    // scope. dmem_op_hlvx flags the HLVX execute-permission read. Both 0 unless an
+    // HLV/HSV is the driving op, so V=0 / ordinary behaviour is byte-identical.
+    var dmem_op_hlv  : logic                ;
+    var dmem_op_hlvx : logic                ;
+    // A data access is virtualized (two-stage) when V/MPV says so OR it is an
+    // HLV/HSV. SUM/MXR then come from the guest sstatus (vsstatus).
+    let dmem_virt2   : logic = dmem_eff_virt || dmem_op_hlv;
+    let dmem_sum     : logic = if dmem_virt2 ? csr_vs_sum : csr_sum;
+    let dmem_mxr     : logic = if dmem_virt2 ? csr_vs_mxr : csr_mxr;
+    // HLV/HSV run with the privilege selected by hstatus.SPVP (1=VS supervisor,
+    // 0=VU user); ordinary accesses keep the MPRV-effective priv.
+    let dmem_mmu_priv: csr_pkg::PrivLevel = if dmem_op_hlv ?
+        (if csr_spvp ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER)
+    :
+        dmem_eff_priv
+    ;
     let imem_sum     : logic = if csr_virt ? csr_vs_sum : csr_sum;
     let imem_mxr     : logic = if csr_virt ? csr_vs_mxr : csr_mxr;
 
@@ -397,6 +415,14 @@ pub module heliodor_core #(
     // (two-stage), so it too must be conservative — OR it in (safe; V=0 inert).
     let dmem_vm_on: logic = (satp_shadow[63:60] == 4'd8 && dmem_eff_priv != csr_pkg::PrivLevel::MACHINE)
         || dmem_eff_virt;
+    // Phase 11-H: an HLV/HSV is also a translated VA access (VA != PA), so the
+    // store/load address-selection + fast-store gates must treat it as VM. This is
+    // kept SEPARATE from dmem_vm_on because dmem_vm_on feeds the ROB's
+    // i_conservative; folding the per-op flag there closes a combinational loop
+    // (dmem_op_hlv → i_conservative → ROB block scan → commit → dmem_op_hlv). The
+    // op-aware form below is used only by leaf store/forward gates that never feed
+    // back into dmem_op_hlv. 0 unless an HLV/HSV drives the port.
+    let dmem_vm_on_op: logic = dmem_vm_on || dmem_op_hlv;
 
     // P10 Supm/Ssnpm: select the pointer-masking mode by the data access's
     // effective privilege (M→mseccfg, S→menvcfg, U→senvcfg). The masked bits are
@@ -440,6 +466,12 @@ pub module heliodor_core #(
     var walk_vaddr_q     : logic<64>;
     var walk_is_store_q  : logic    ; // M9.A.299: walk started by a commit-store
     var walk_pc_q        : logic<64>; // M9.3 inject-linkage probe: PC of the load that started the walk
+    // Phase 11-H HLV/HLVX: a LOAD walk's per-op virt flags, latched at walk start
+    // so they stay stable across the multi-cycle two-stage walk (the issuing IQ
+    // slot is gated off during dmem_mmu_busy). Store walks read c_is_mem_virt
+    // directly (store_drive holds it), so these only matter for load walks.
+    var walk_hlv_q       : logic    ;
+    var walk_hlvx_q      : logic    ;
     // M9.3 SMP: physical PTW-walk-in-progress, tracked INDEPENDENTLY of the owner
     // (walk_v_q clears on a redirect; walk_phys_q does not). walk_phys_q && !walk_v_q
     // at a fault ⇒ an ORPHAN walk (its owner was squashed mid-walk) — its fault must
@@ -1516,6 +1548,9 @@ pub module heliodor_core #(
         rob_alloc_entry.is_fence  = dec_op.is_fence;
         rob_alloc_entry.is_cbo_zero = dec_op.is_cbo_zero;
         rob_alloc_entry.is_amo    = dec_op.is_amo;
+        // Phase 11-H HLV/HSV: carry the two-stage marker so a committing HSV store
+        // drives the dmem MMU in two-stage mode + any HLV/HSV fault sets GVA.
+        rob_alloc_entry.is_mem_virt = dec_op.hlv;
     }
 
     // RenamedOp
@@ -1661,6 +1696,9 @@ pub module heliodor_core #(
         rob_alloc_entry2.is_fence       = dec_op2.is_fence;
         rob_alloc_entry2.is_cbo_zero    = dec_op2.is_cbo_zero;
         rob_alloc_entry2.is_amo         = dec_op2.is_amo;
+        // Phase 11-H: slot-1 is ALU-only (no LOAD/STORE), so this is always 0;
+        // assigned for struct completeness.
+        rob_alloc_entry2.is_mem_virt    = dec_op2.hlv;
     }
 
     // ============================================================
@@ -2392,6 +2430,7 @@ pub module heliodor_core #(
     var c_result_data : logic<64>       ;
     var c_is_store    : logic           ;
     var c_is_amo      : logic           ; // Phase 8 S6: head is AMO/LR/SC (vs plain store)
+    var c_is_mem_virt : logic           ; // Phase 11-H HLV/HSV: committing head is a 2-stage access
     var c_store_addr  : logic<64>       ;
     var c_store_data  : logic<64>       ;
     var c_store_funct3: logic<3>        ;
@@ -2645,6 +2684,7 @@ pub module heliodor_core #(
         o_commit_result_data : c_result_data        ,
         o_commit_is_store    : c_is_store           ,
         o_commit_is_amo      : c_is_amo             ,
+        o_commit_mem_virt    : c_is_mem_virt        , // Phase 11-H HLV/HSV
         o_commit_store_addr  : c_store_addr         ,
         o_commit_store_data  : c_store_data         ,
         o_commit_store_funct3: c_store_funct3       ,
@@ -2979,7 +3019,11 @@ pub module heliodor_core #(
     // (c_fault_gpa); a store guest-page-fault reads the live dmem_mmu_gpa at
     // commit. htval = GPA >> 2.
     let trap_htval    : logic<64> = (if c_is_lfault || c_is_ifault ? c_fault_gpa : dmem_mmu_gpa) >> 2;
-    let trap_gva      : logic     = csr_virt_prev && (c_is_lfault || c_is_sfault_eff || c_is_ifault);
+    // Phase 11-H: an HLV/HSV memory fault is taken in HS-mode (V=0, so virt_prev
+    // is 0) but stval still holds a GUEST virtual address → set GVA. c_is_mem_virt
+    // marks the committing op as an HLV/HSV (load fault via ROB shadow, store
+    // fault commit-time). A guest's own fault uses csr_virt_prev as before.
+    let trap_gva      : logic     = (csr_virt_prev || c_is_mem_virt) && (c_is_lfault || c_is_sfault_eff || c_is_ifault);
 
     // ============================================================
     // CSR file
@@ -3061,6 +3105,7 @@ pub module heliodor_core #(
         o_vsatp        : csr_vsatp   ,
         o_vsstatus_sum : csr_vs_sum  ,
         o_vsstatus_mxr : csr_vs_mxr  ,
+        o_hstatus_spvp : csr_spvp    , // Phase 11-H HLV/HSV effective priv select
         // Phase 11-H3 VS trap delegation.
         o_virt_prev    : csr_virt_prev,
         o_hedeleg      : csr_hedeleg ,
@@ -4046,7 +4091,10 @@ pub module heliodor_core #(
     // P10 cbo.zero is exempt from the tohost-page exclusion: it is a full-line
     // write (no partial merge that could hide from the harness), and the harness
     // only watches the tohost word — so it may buffer like any DRAM line store.
-    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && st_wstrb_hi == 8'd0
+    // Phase 11-H: an HSV store (c_is_mem_virt) is translated (VA != PA) and must
+    // never take the fast (bare-PA) path. Use c_is_mem_virt directly — NOT
+    // dmem_vm_on_op — so fast_store→store_drive→dmem_op_hlv stays loop-free.
+    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && !c_is_mem_virt && st_wstrb_hi == 8'd0
         && c_store_addr[63:25] == 39'h40 && (!st_tohost_page || c_is_cbo_zero);
 
     // Core dmem view (pre-MMU virtual address)
@@ -4264,6 +4312,8 @@ pub module heliodor_core #(
             walk_vaddr_q    = 64'd0;
             walk_is_store_q = 1'b0;
             walk_pc_q       = 64'd0;
+            walk_hlv_q      = 1'b0;
+            walk_hlvx_q     = 1'b0;
         } else if early_redir_fire_q {
             // Phase 8 S8.E: an early redirect's PARTIAL squash rewinds tail to
             // branch_idx+1, so the squashed wrong-path rob_idx is REUSED by the
@@ -4295,6 +4345,13 @@ pub module heliodor_core #(
             walk_vaddr_q = core_dmem_vaddr;
             // M9.3 inject-linkage probe: PC of the load that starts this walk.
             walk_pc_q    = iq_issue_op.base.pc;
+            // Phase 11-H: latch the walk's HLV/HLVX flags so the two-stage walk
+            // keeps i_virt/i_priv/i_hlvx stable after the issuing IQ slot is gated
+            // off. A store walk (commit_store_fire) takes its flag from the ROB
+            // head (c_is_mem_virt); a load walk from the issuing op. HLVX is
+            // load-only, so a store walk latches 0.
+            walk_hlv_q   = if commit_store_fire ? c_is_mem_virt : iq_issue_op.base.hlv;
+            walk_hlvx_q  = if commit_store_fire ? 1'b0 : iq_issue_op.base.hlvx;
             // M9.A.299: a walk driven by a commit-store is a STORE walk. Its
             // fault is delivered via commit_store_sfault (commit-time), NOT the
             // load inject port — and walk_rob_q (= issue idx) is meaningless for
@@ -4327,6 +4384,31 @@ pub module heliodor_core #(
     // (walk_v_q cleared by an intervening redirect). Its VA belongs to a
     // squashed wrong-path load, so the fault is spurious and must be dropped.
     let orphan_walk_fault: logic = dmem_mmu_fault && walk_phys_q && !walk_v_q;
+
+    // Phase 11-H HLV/HLVX/HSV: the per-op two-stage flag of the op currently
+    // driving the dmem port, mirroring the core_dmem_vaddr priority (store_drive >
+    // mmu_walk_inflight > issuing load). A committing HSV store reads c_is_mem_virt
+    // (held by store_drive); a walk reads the latched walk_hlv_q (covers load AND
+    // store walks); the issuing-load cycle reads iq_issue_op.base.hlv. Loop-free
+    // because dmem_vm_on no longer includes dmem_op_hlv, so store_drive (→
+    // fast_store → dmem_vm_on) does not feed back here. 0 unless an HLV/HSV drives
+    // the port, so every ordinary V=0 access is byte-identical.
+    assign dmem_op_hlv = if store_drive ?
+        c_is_mem_virt
+    : if mmu_walk_inflight ?
+        walk_hlv_q
+    :
+        iq_issue_op.base.hlv
+    ;
+    // HLVX is load-only (stores never check X). Latched walk_hlvx_q across a load
+    // walk; iq_issue_op.base.hlvx on the issuing cycle; a store is never HLVX.
+    assign dmem_op_hlvx = if store_drive ?
+        1'b0
+    : if mmu_walk_inflight ?
+        walk_hlvx_q
+    :
+        iq_issue_op.base.hlvx
+    ;
     // Deliver the load fault to the walk owner when a LOAD walk faults. Store
     // walk faults (walk_is_store_q) are handled at commit (commit_store_sfault).
     assign lfault_inj_v = dmem_mmu_fault && walk_v_q && !walk_is_store_q;
@@ -4407,13 +4489,15 @@ pub module heliodor_core #(
     // to dmem_mmu and o_busy is low) and whose PA is in DRAM. A TLB-missing
     // store stays a slow store — its walk runs via the normal commit path,
     // the PTE gets cached, and the retry cycle lands here.
-    assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on && st_wstrb_hi == 8'd0
+    // Phase 11-H: dmem_vm_on_op folds an HSV store into the VM store-buffer path
+    // (translated PA = dmu_dmem_addr).
+    assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
         && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && dmu_dmem_addr[63:25] == 39'h40
         && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008)); // P9.2: tohost pages stay write-through
     assign sb_elig = fast_store || sb_vm_ok;
-    assign c_store_mmio = ((if dmem_vm_on ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40)
-        || (dmem_vm_on && dmu_pbmt_unc); // P10 Svpbmt: NC/IO store is uncached
-    assign sb_pa   = if dmem_vm_on ? dmu_dmem_addr : c_store_addr;
+    assign c_store_mmio = ((if dmem_vm_on_op ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40)
+        || (dmem_vm_on_op && dmu_pbmt_unc); // P10 Svpbmt: NC/IO store is uncached
+    assign sb_pa   = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
     // S25 drain: the HEAD entry leaves as ONE line-wide transaction through
     // the dcache drain port (all 8 lanes + strobes); the ack pops the entry.
     let sb_pop: logic = dc_sdrain_ack;
@@ -4588,7 +4672,7 @@ pub module heliodor_core #(
     // One always_comb per byte, mirroring the S5.1 ROB nets (fused
     // accumulators falsely trip the combinational_loop diagnostic).
     // ============================================================
-    let sbf_pa: logic<64> = if dmem_vm_on ? dmu_dmem_addr : agu_addr_iss;
+    let sbf_pa: logic<64> = if dmem_vm_on_op ? dmu_dmem_addr : agu_addr_iss; // Phase 11-H: HLV load → translated PA
     var sbf0_v: logic; var sbf0_b: logic<8>;
     var sbf1_v: logic; var sbf1_b: logic<8>;
     var sbf2_v: logic; var sbf2_b: logic<8>;
@@ -4903,17 +4987,20 @@ pub module heliodor_core #(
         i_satp      : satp_shadow    ,
         // Effective priv for dmem accesses: when mstatus.MPRV is set,
         // loads/stores use mstatus.MPP's priv level for translation
-        // (RISC-V priv spec). Used by rv64si-dirty etc.
-        i_priv       : dmem_eff_priv   ,
+        // (RISC-V priv spec). Used by rv64si-dirty etc. Phase 11-H: an HLV/HSV
+        // overrides this to the hstatus.SPVP-selected VS/VU priv (dmem_mmu_priv).
+        i_priv       : dmem_mmu_priv   ,
         i_sum        : dmem_sum         ,
         i_mxr        : dmem_mxr         ,
         i_pbmte      : csr_pbmte       ,
         i_adue       : csr_adue        ,
-        // Phase 11-H two-stage data translation. dmem_eff_virt folds MPRV+MPV.
-        // G-stage cause routing is H3 → discard the gstage-fault flag for now.
-        i_virt        : dmem_eff_virt  ,
+        // Phase 11-H two-stage data translation. dmem_virt2 = MPRV+MPV-effective V
+        // OR an explicit HLV/HSV (dmem_op_hlv), so a hypervisor virtual-memory
+        // access translates two-stage even while the core itself runs at V=0/HS.
+        i_virt        : dmem_virt2     ,
         i_vsatp       : csr_vsatp      ,
         i_hgatp       : csr_hgatp      ,
+        i_hlvx        : dmem_op_hlvx   , // HLVX.HU/.WU: read checks execute (X)
         o_gstage_fault: dmem_mmu_gstage,
         o_fault_gpa   : dmem_mmu_gpa   ,
         o_uncached   : dmu_pbmt_unc    ,
@@ -4987,7 +5074,7 @@ pub module heliodor_core #(
     // the DRAM array, and MMIO is uncacheable). The dcache merges it into
     // the owned line locally (no write channel); ineligible AMO/SC writes
     // keep the write-through path.
-    let st_pa_w      : logic<64> = if dmem_vm_on ? dmu_dmem_addr : c_store_addr;
+    let st_pa_w      : logic<64> = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr; // Phase 11-H HSV → translated PA
     let st_pa_tohost : logic     = (st_pa_w[31:14] == 18'h20000) || (st_pa_w[31:12] == 20'h80008);
     let dc_wen_excl  : logic     = c_is_amo && !c_store_mmio && !st_pa_tohost && !dmu_ad_wb;
     // (P9.3: the ownership pin is dcache-internal — it self-arms at the
@@ -5083,7 +5170,7 @@ pub module heliodor_core #(
     // P10 Svpbmt: a translated NC/IO page (dmu_pbmt_unc) is uncached even when
     // its PA falls inside the cacheable DRAM window.
     let dc_uncached: logic = dmu_dmem_ren && !replay_drive && !dc_amo_read
-        && ((dmu_dmem_addr[63:25] != 39'h40) || (dmem_vm_on && dmu_pbmt_unc));
+        && ((dmu_dmem_addr[63:25] != 39'h40) || (dmem_vm_on_op && dmu_pbmt_unc)); // Phase 11-H: HLV NC page
     inst u_dcache: dcache (
         clk                                              ,
         rst                                              ,
