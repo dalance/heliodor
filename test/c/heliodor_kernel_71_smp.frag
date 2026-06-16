@@ -17,15 +17,17 @@
 CONFIG_64BIT=y
 CONFIG_MMU=y
 CONFIG_RISCV_ISA_C=y
-# FPU: left off (tinyconfig default), matching the 5.15 and 6.6 boots. The kernel
-# itself is soft-float and the raw-syscall init uses no FP, so the boot does not
-# need it. NB: enabling CONFIG_FPU=y wedges the N>=2 boot in __schedule's FP
-# context switch (__fstate_save/__fstate_restore) — a heliodor FP-SMP-context
-# -switch issue first exposed here (5.15/6.6 were both FP-off, so this path had
-# never run under SMP Linux). heliodor's FPU itself passes the rv64uf/ud arch
-# suite; the directed FP tests just don't exercise save/restore across a context
-# switch. Deferred as a separate follow-up.
-# CONFIG_FPU is not set
+# FPU: ON. This is the first heliodor Linux boot with userspace FP (5.15/6.6 and
+# the initial 7.1 boot were all FP-off). Enabling it exposed — and we fixed — two
+# real heliodor RTL bugs, both reachable only with FP context switches under SMP:
+#   1. FP-SMP wedge in __schedule's __fstate_save/restore: cdb_dest_is_fp did not
+#      mirror the lane-0 CDB mux priority (fpu > mshr > alu), so an MSHR int-load
+#      completion was misclassified FP-dest while the IQ presented an FP load —
+#      its int PRF write + IQ wakeup were dropped and the consumer wedged forever.
+#   2. Compressed FP load/store (C.FLD/C.FSD/C.FLDSP/C.FSDSP) were never decoded
+#      in c_expander → init's first FP context restore trapped illegal.
+# With both fixed, N=1/2/4 boot to SBI shutdown (acdfim) at ~the FP-off cycle cost.
+CONFIG_FPU=y
 
 # === RISC-V SBI / timer / intc ===
 CONFIG_RISCV_SBI=y
