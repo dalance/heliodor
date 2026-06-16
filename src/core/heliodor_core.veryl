@@ -412,6 +412,11 @@ pub module heliodor_core #(
     var dmem_mmu_busy   : logic;
     var dmem_mmu_fault  : logic;
     var dmem_mmu_fault_s: logic;
+    // Phase 11-H3c: the current dmem fault is a G-stage (guest-physical) fault,
+    // and the faulting guest PA (for htval). Valid alongside dmem_mmu_fault(_s)
+    // — used at commit for a store guest-page-fault (cause 23). 0 while V=0.
+    var dmem_mmu_gstage : logic;
+    var dmem_mmu_gpa    : logic<64>;
     var dmem_walk_start : logic; // M9.A.296: PTW-start pulse (1 cy at IDLE→walk)
     var dmem_mmu_idle   : logic; // M9.3: dmem MMU FSM is IDLE (no walk owns port)
     // M9.A.303 debug: dmem PTW / faulting-PTE / TLB-hit snoop
@@ -1190,7 +1195,8 @@ pub module heliodor_core #(
         i_virt        : csr_virt   ,
         i_vsatp       : csr_vsatp  ,
         i_hgatp       : csr_hgatp  ,
-        o_gstage_fault: _          ,
+        o_gstage_fault: _          , // Phase 11-H3c: instruction guest-page-fault deferred
+        o_fault_gpa   : _          ,
         o_ptw_addr: imem_ptw_addr_w,
         o_ptw_req : imem_ptw_req_w ,
         // P9.6 phase 2: PTE comes back from the coherent IS read FSM below.
@@ -2383,6 +2389,9 @@ pub module heliodor_core #(
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
     var c_fault_vaddr : logic<64>       ;
+    // Phase 11-H3c: committing load fault's G-stage flag + faulting guest PA.
+    var c_fault_gstage: logic           ;
+    var c_fault_gpa   : logic<64>       ;
     // M9.3 inject-linkage probe (debug): head entry's recorded walk-start PC
     // and inject-delivered flag.
     var commit_dbg_walk_pc: logic<64>   ;
@@ -2586,6 +2595,10 @@ pub module heliodor_core #(
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
+        // Phase 11-H3c: the MMU is in TS_FAULT this cycle (lfault_inj_v implies
+        // dmem_mmu_fault), so its gstage/gpa outputs correspond to this walk.
+        i_lfault_inj_gstage  : dmem_mmu_gstage      ,
+        i_lfault_inj_gpa     : dmem_mmu_gpa         ,
         i_lfault_inj_pc      : walk_pc_q            ,
         o_commit_valid       : rob_commit_valid     ,
         o_commit_entry       : rob_commit_entry     ,
@@ -2642,6 +2655,8 @@ pub module heliodor_core #(
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_is_sfault   : c_is_sfault          ,
         o_commit_fault_vaddr : c_fault_vaddr        ,
+        o_commit_fault_gstage: c_fault_gstage       ,
+        o_commit_fault_gpa   : c_fault_gpa          ,
         o_commit_dbg_walk_pc : commit_dbg_walk_pc   ,
         o_commit_dbg_inj     : commit_dbg_inj       ,
         o_commit_is_fp_dest  : c_is_fp_dest         ,
@@ -2872,9 +2887,18 @@ pub module heliodor_core #(
         if c_is_ifault || inject_fake_ifault {
             excp_cause = 64'd12; // instruction page fault
         } else if c_is_lfault {
-            excp_cause = 64'd13; // load page fault
+            // Phase 11-H3c: a load fault that occurred in the G-stage of a guest
+            // (two-stage) walk is a load guest-page-fault (cause 21), not a plain
+            // load page-fault (13). c_fault_gstage is ROB-carried from the inject.
+            // Inert at V=0 (the G-stage never runs → c_fault_gstage is 0).
+            excp_cause = if c_fault_gstage ? 64'd21 : 64'd13;
         } else if c_is_sfault_eff {
-            excp_cause = 64'd15; // store/AMO page fault
+            // Phase 11-H3c: a store/AMO fault that occurred in the G-stage of a
+            // two-stage (guest) walk is a store guest-page-fault (cause 23), not a
+            // plain store page-fault (15). dmem_mmu_gstage is valid alongside the
+            // commit-time store fault (dmem_mmu_fault_s). Inert at V=0 (the G-stage
+            // never runs, so dmem_mmu_gstage is 0 → cause stays 15).
+            excp_cause = if commit_store_sfault && dmem_mmu_gstage ? 64'd23 : 64'd15;
         } else if c_illegal || commit_priv_illegal {
             excp_cause = 64'd2; // illegal instruction (incl. TVM/TSR commit trap)
         } else if c_is_ebreak {
@@ -2917,6 +2941,16 @@ pub module heliodor_core #(
     :
         trap_deleg_s
     ;
+    // Phase 11-H3c: guest-page-fault info for the csr trap entry. htval = the
+    // faulting guest PA >> 2; for a store guest-page-fault (cause 23) the GPA is
+    // dmem_mmu_gpa, valid at commit alongside the store fault (load/ifetch GPAs
+    // are increment 2/3). trap_gva flags that stval/mtval holds a guest VA — set
+    // for any memory fault taken out of a guest (csr applies it on HS/M traps).
+    // Inert at V=0 (csr_virt_prev is 0, so trap_gva is 0).
+    // A load guest-page-fault carries its GPA in the ROB (c_fault_gpa); a store
+    // guest-page-fault reads the live dmem_mmu_gpa at commit. htval = GPA >> 2.
+    let trap_htval    : logic<64> = (if c_is_lfault ? c_fault_gpa : dmem_mmu_gpa) >> 2;
+    let trap_gva      : logic     = csr_virt_prev && (c_is_lfault || c_is_sfault_eff || c_is_ifault);
 
     // ============================================================
     // CSR file
@@ -3010,6 +3044,8 @@ pub module heliodor_core #(
         i_sret_fire   : commit_sret  ,
         i_trap_to_s   : trap_to_s    ,
         i_trap_to_vs  : trap_to_vs   ,
+        i_htval       : trap_htval   ,
+        i_trap_gva    : trap_gva     ,
         // M8.C: external IRQ pins from harness (tie low when unused).
         i_irq_timer_m: i_irq_timer_m                   ,
         i_irq_sw_m   : i_irq_sw_m                      ,
@@ -4849,7 +4885,8 @@ pub module heliodor_core #(
         i_virt        : dmem_eff_virt  ,
         i_vsatp       : csr_vsatp      ,
         i_hgatp       : csr_hgatp      ,
-        o_gstage_fault: _              ,
+        o_gstage_fault: dmem_mmu_gstage,
+        o_fault_gpa   : dmem_mmu_gpa   ,
         o_uncached   : dmu_pbmt_unc    ,
         o_ad_writeback: dmu_ad_wb      , // P10 Svadu: A/D write-back this cycle
         o_busy       : dmem_mmu_busy   ,
