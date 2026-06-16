@@ -2,16 +2,21 @@
 
 RV64GC RISC-V processor core written in [Veryl](https://veryl-lang.org/). It is a
 from-scratch out-of-order design (Tomasulo with a physical register file) that
-boots a mainline Linux 5.15 SMP kernel through OpenSBI to SBI shutdown.
+boots mainline Linux (5.15, the 6.6 LTS, and 7.1) SMP kernels through OpenSBI to
+SBI shutdown.
 
 ## Status
 
 The core is a 2-wide superscalar, PRF-based out-of-order machine with in-order
-(up to 2-wide) commit. It implements **RV64IMAFDC_Zicsr_Zifencei** at all three
-privilege levels (M/S/U) with Sv39 virtual memory, branch prediction,
-non-blocking write-back private L1 caches kept coherent through a shared L2
-with an inclusive MESI directory, and 1/2/4/8-hart SMP. Stock Linux 5.15 boots on
-all four hart counts (1/2/4/8) and reaches SBI SRST shutdown.
+(up to 2-wide) commit. It implements **RV64GC** plus the **RVA23** ISA extensions
+(excluding the vector and hypervisor families) at all three privilege levels
+(M/S/U) with Sv39 virtual memory, branch prediction, non-blocking write-back
+private L1 caches kept coherent through a shared L2 with an inclusive MESI
+directory, and 1/2/4/8-hart SMP. Stock Linux reaches SBI SRST shutdown on every
+hart count: the 5.15 baseline on 1/2/4/8, plus the **6.6 LTS** and **7.1** kernels
+on 1/2/4 — the latter two discover and exercise the RVA23 extensions from the
+device tree (Sstc, Svpbmt, Svnapot, Svadu, Svinval, Zawrs, Zicbom/Zicboz, Zbb, …)
+and run **userspace floating point** across SMP context switches.
 
 ## Architecture
 
@@ -39,11 +44,25 @@ all four hart counts (1/2/4/8) and reaches SBI SRST shutdown.
   - Function units: 2 ALU/branch lanes (`alu_wrap`) and FPU (`fpu_wrap`:
     FP add / multiply / divide / sqrt, single + double). Integer divide and FP
     divide/sqrt are multi-cycle and non-blocking.
-- **ISA**: **RV64IMAFDC_Zicsr_Zifencei** — M (mul/div), A (LR/SC + AMO), F/D
-  (single + double FP), C (compressed, expanded in fetch by `c_expander`)
+- **ISA**: **RV64GC** base (RV64IMAFDC_Zicsr_Zifencei) — M (mul/div), A (LR/SC +
+  AMO), F/D (single + double FP), C (compressed, incl. compressed FP load/store,
+  expanded in fetch by `c_expander`) — extended to the **RVA23 application /
+  supervisor profile** (the vector V and hypervisor H families excluded):
+  - Bit-manipulation **Zba/Zbb/Zbs**; data-independent-latency **Zkt**
+  - **Zfa** (additional FP) and **Zfhmin** (minimal half-precision: binary16
+    conversions + load/store/move)
+  - **Zicond** (conditional zero), **Zawrs** (wait-on-reservation-set)
+  - Cache-block ops **Zicbom**/**Zicboz**/**Zicbop**; compressed **Zcb**
+  - May-be-ops **Zimop**/**Zcmop**; hints **Zihintpause**/**Zihintntl**
+  - Counters **Zicntr**/**Zihpm**; pointer masking **Supm/Ssnpm** (`PMM` in
+    mseccfg/menvcfg/senvcfg)
 - **Privilege & virtual memory**: Machine / Supervisor / User; Sv39 with a
-  16-entry fully-associative TLB and a hardware 3-level page-table walk (separate
-  instruction / data MMUs, `SFENCE.VMA`)
+  16-entry fully-associative TLB (ASID-tagged) and a hardware 3-level page-table
+  walk (separate instruction / data MMUs, `SFENCE.VMA` + fine-grained **Svinval**).
+  Sv39 honors **Svnapot** (64 KB NAPOT), **Svpbmt** (page-based memory types),
+  and both **Svade** (A/D page-fault) and **Svadu** (hardware A/D update via
+  `menvcfg.ADUE`). Supervisor extensions: **Sstc** (`stimecmp`) and **Sscofpmf**
+  (HPM count-overflow interrupt + mode-based filtering)
 - **Caches** (`src/cache/`)
   - L1 I-cache: 16 KB, 4-way, 64 B line, tree-PLRU, non-blocking
     (hit-under-fill, streaming), single-cycle assembly of instructions
@@ -73,23 +92,26 @@ all four hart counts (1/2/4/8) and reaches SBI SRST shutdown.
     so FENCE.I / SFENCE.VMA / satp need no D$ flush sweep. RVWMO is checked by a
     litmus harness
 - **Peripherals** (`src/peripheral/`): CLINT, PLIC, UART
-- **Boot**: mainline Linux 5.15 SMP via the bundled OpenSBI M-mode firmware
+- **Boot**: mainline Linux (5.15 / 6.6 LTS / 7.1) SMP via the bundled OpenSBI
+  M-mode firmware
 
 ## Verification
 
 | Suite                                                                       | Result |
 |-----------------------------------------------------------------------------|--------|
-| Default `veryl test` (unit + inline arch suites + N=2 litmus, on the OoO core) | 155 passed, 0 failed (21 ignored) |
-| Linux 5.15 boot, 1-hart (`--ignored --test test_soc_linux_boot`)            | pass (~10.2M cycles) |
-| Linux 5.15 boot, 2-hart (`--ignored --test test_soc_smp_linux_boot_2hart`)  | pass (~13.9M cycles) |
-| Linux 5.15 boot, 4-hart (`--ignored --test test_soc_smp_linux_boot_4hart`)  | pass (~20.0M cycles) |
-| Linux 5.15 boot, 8-hart (`--ignored --test test_soc_smp_linux_boot_8hart`)  | pass (~26.9M cycles) |
+| Default `veryl test` (unit + inline arch suites + Phase-10 directed tests + N=2 litmus, on the OoO core) | 213 passed, 0 failed (27 ignored) |
+| Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~10.2 / 13.9 / 20.0 / 26.9M cycles) |
+| Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~18.6 / 25.5 / 33.6M cycles) |
+| Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~16.8 / 19.2 / 23.6M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
 (integer + privileged) and rv64uf / ud (FP), hand-maintained in
 `tb/test_arch_common.veryl` and `tb/test_arch_fp.veryl`; they are not `#[ignore]`,
-so they run as part of the default `veryl test`. The Linux boot is additionally
-cross-checked on Verilator (see `CLAUDE.md`).
+so they run as part of the default `veryl test`. The Linux boots are `#[ignore]`d
+(run them by name, e.g. `--test test_soc_smp_linux_boot_71_2hart`); the 7.1 kernel
+is built with `CONFIG_FPU=y`, so its boot drives the FP unit through real kernel
+context switches. The boot is additionally cross-checked on Verilator and a second
+codegen backend (cc / cranelift) — see `CLAUDE.md`.
 
 ## Microbenchmarks
 
@@ -146,11 +168,11 @@ cd veryl && cargo build --profile release-verylup
 Then from the project root:
 
 ```bash
-veryl/target/release-verylup/veryl test                                                  # 155 tests
-veryl/target/release-verylup/veryl test --ignored --test test_soc_linux_boot             # 1-hart Linux boot
-veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_2hart   # 2-hart SMP Linux boot
-veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_4hart   # 4-hart SMP Linux boot
-veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_8hart   # 8-hart SMP Linux boot
+veryl/target/release-verylup/veryl test                                                  # 213 tests
+veryl/target/release-verylup/veryl test --ignored --test test_soc_linux_boot             # 1-hart Linux 5.15 boot
+veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_4hart   # 4-hart SMP Linux 5.15 boot
+veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_66_2hart # 2-hart SMP Linux 6.6 boot
+veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_71_2hart # 2-hart SMP Linux 7.1 boot (RVA23 + FP)
 ```
 
 The `riscv-tests` arch hex files are committed under `test/riscv-arch-test/build/`;
@@ -162,7 +184,7 @@ steps, Verilator cross-check).
 ## Development Phases
 
 Development history — the **Architecture** section above describes the design
-as of Phase 9:
+as of Phase 10:
 
 | Phase | Scope                                    | Status       |
 |-------|------------------------------------------|--------------|
@@ -175,3 +197,4 @@ as of Phase 9:
 | 7     | Clean-slate OoO redesign: a from-scratch 1-wide pure-Tomasulo + PRF core that replaces the earlier OoO datapath, re-validated to RV64GC + 1/2/4-hart SMP Linux boot | complete |
 | 8     | Microarchitecture build-out on the Phase 7 core: 2-wide superscalar (fetch / rename / issue / commit), branch prediction (BTB + gshare + TAGE-lite + indirect BTB + RAS, execute-time early redirect), non-blocking L1s (MSHRs, hit-under-miss, critical-word-first), memory-dependence speculation + replay, committed-store buffer with line write-combining and store-to-load forwarding, split read/write bus channels — 1-hart boot 26M → 8.6M cycles, 4-hart 52M → 16M | complete |
 | 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller + line-granular L2 (P9.1), write-back D$ + MESI inclusive directory (P9.2), cache-to-cache transfer + in-cache AMO/LR-SC (P9.3), N=8 SMP boot (P9.4), PLIC wiring + uncached MMIO + TLB ASID + selective SFENCE.VMA (P9.5), coherent instruction side — I-cache + I-PTW through L2, FENCE.I/SFENCE flush sweep retired (P9.6) | complete |
+| 10    | RVA23-profile ISA extensions (vector V / hypervisor H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, hint bundle (Zihintpause/Zihintntl/Zicbop/Zimop/Zcmop), Zcb, system bundle (Zawrs/Svinval/Zkt), MMU bundle (Svnapot/Svpbmt/Svadu), Zfhmin, Sscofpmf, Supm/Ssnpm. Validated on real mainline kernels: upgraded the boot from 5.15 to the 6.6 LTS and 7.1, which discover the extensions from the device tree and exercise them (Sstc timer, Svpbmt ioremap, Zicboz clear_page, Zbb, hardware unaligned). Enabling userspace FP on 7.1 exposed and fixed two SMP-only RTL bugs — an FP-context-switch wedge (MSHR int-load completion misclassified FP-dest on the CDB mux) and missing compressed FP load/store (C.FLD/C.FSD/C.FLDSP/C.FSDSP) | complete |
