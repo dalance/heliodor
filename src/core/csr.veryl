@@ -232,6 +232,8 @@ pub module csr #(
     const ADDR_VSTVAL    : logic<12> = 12'h243;
     const ADDR_VSIP      : logic<12> = 12'h244;
     const ADDR_VSATP     : logic<12> = 12'h280;
+    // Phase 11-H Sstc-in-VS: the guest's supervisor timer compare.
+    const ADDR_VSTIMECMP : logic<12> = 12'h24D;
     // P10 Zicntr/Zihpm: counter-enable + HPM counter/event ranges. The HPM
     // counter index is the low 5 bits of the address (e.g. mhpmcounter3 0xB03
     // → 3, mhpmevent3 0x323 → 3, hpmcounter3 0xC03 → 3).
@@ -324,6 +326,9 @@ pub module csr #(
     var vscause   : logic<64>;
     var vstval    : logic<64>;
     var vsatp     : logic<64>;
+    // Phase 11-H Sstc-in-VS: the guest's stimecmp. Resets to all-1s (never fires
+    // until the guest programs it); enabled by menvcfg.STCE & henvcfg.STCE.
+    var vstimecmp : logic<64>;
     // P10 Zicntr/Zihpm. mcounteren is stored (no access-control trap is enforced
     // yet). mhpmcounter[3..31] count the event selected by mhpmevent[3..31];
     // indices 0..2 are unused (cycle/time/instret have dedicated registers).
@@ -355,22 +360,36 @@ pub module csr #(
     let stip_eff : logic     = if sstc_en ? stip_hw : mip[5];
     let mip_read : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
 
+    // Phase 11-H Sstc-in-VS: the guest's supervisor-timer-pending (VSTIP) is
+    // hardware-driven when Sstc is enabled for the guest — menvcfg.STCE AND
+    // henvcfg.STCE — and fires when guest time (mtime + htimedelta) reaches the
+    // guest compare vstimecmp. When disabled, VSTIP falls back to the
+    // software-injected hvip.VSTIP (the legacy SBI-timer-into-guest path). Inert
+    // at V=0 / pre-virtualization: a non-virtualizing kernel leaves henvcfg.STCE=0
+    // so vstip_eff == hvip[6] == 0 (byte-identical to before).
+    let vsstc_en : logic     = menvcfg[63] && henvcfg[63];
+    let vstip_hw : logic     = vsstc_en && ((i_mtime + htimedelta) >= vstimecmp);
+    let vstip_eff: logic     = if vsstc_en ? vstip_hw : hvip[6];
+
     // Phase 11-H3b: vsip is the guest's S-view of the pending VS interrupts; it
     // has no storage of its own. Each guest sip bit aliases the corresponding
     // VS interrupt in hvip — vsip.SSIP(1)=hvip.VSSIP(2), vsip.STIP(5)=hvip.VSTIP
     // (6), vsip.SEIP(9)=hvip.VSEIP(10) — but only while that interrupt is
     // delegated to VS by hideleg (else the guest reads 0). vsip.SSIP is writable
     // and clears/sets hvip.VSSIP (see the SIP/VSIP write path); STIP/SEIP are
-    // read-only here. (vstimecmp/hgeip hardware sources are deferred.)
+    // read-only here. STIP reflects the effective VSTIP (the vstimecmp hardware
+    // source when Sstc-in-VS is on, else hvip.VSTIP); the SEIP/hgeip
+    // guest-external hardware source is still deferred.
     let vsip_view: logic<64> = (if hideleg[2] && hvip[2] ? 64'h0002 : 64'd0)
-        | (if hideleg[6] && hvip[6] ? 64'h0020 : 64'd0)
+        | (if hideleg[6] && vstip_eff ? 64'h0020 : 64'd0)
         | (if hideleg[10] && hvip[10] ? 64'h0200 : 64'd0);
-    // hip is the HS-mode view of the pending VS interrupts: VSSIP(2)/VSTIP(6)/
-    // VSEIP(10) reflect hvip (and, when added, the vstimecmp/hgeip hardware
-    // sources); SGEIP(12) is the OR of hgeip&hgeie (no guest-external irqs yet,
-    // so 0). It has no storage — VSSIP is writable through the hvip alias.
+    // hip is the HS-mode view of the pending VS interrupts: VSSIP(2)/VSEIP(10)
+    // reflect hvip and VSTIP(6) reflects the effective VSTIP (vstimecmp hardware
+    // source when Sstc-in-VS is on, else hvip.VSTIP); SGEIP(12) is the OR of
+    // hgeip&hgeie (no guest-external irqs yet, so 0). It has no storage — VSSIP is
+    // writable through the hvip alias.
     let hip_view: logic<64> = (if hvip[2] ? 64'h0004 : 64'd0)
-        | (if hvip[6] ? 64'h0040 : 64'd0)
+        | (if vstip_eff ? 64'h0040 : 64'd0)
         | (if hvip[10] ? 64'h0400 : 64'd0);
 
     // P10 Sscofpmf: scountovf aggregates the mhpmevent[n].OF (bit 63) of
@@ -437,6 +456,7 @@ pub module csr #(
             ADDR_VSTVAL    : rd_data_w = vstval;
             ADDR_VSIP      : rd_data_w = vsip_view;
             ADDR_VSATP     : rd_data_w = vsatp;
+            ADDR_VSTIMECMP : rd_data_w = vstimecmp; // Phase 11-H Sstc-in-VS
             ADDR_MCOUNTEREN: rd_data_w = mcounteren;
             ADDR_MEDELEG   : rd_data_w = medeleg;
             ADDR_MIDELEG   : rd_data_w = mideleg;
@@ -482,6 +502,9 @@ pub module csr #(
                 ADDR_STVAL   : rd_data_w = vstval;
                 ADDR_SIP     : rd_data_w = vsip_view;
                 ADDR_SATP    : rd_data_w = vsatp;
+                // Phase 11-H Sstc-in-VS: the guest's stimecmp (0x14D) aliases
+                // vstimecmp when V=1.
+                ADDR_STIMECMP: rd_data_w = vstimecmp;
                 // Phase 11-H3b: a guest read of `time` observes guest time =
                 // mtime + htimedelta (the hypervisor's per-guest time offset).
                 ADDR_TIME    : rd_data_w = i_mtime + htimedelta;
@@ -549,15 +572,18 @@ pub module csr #(
         }
     }
     // Phase 11-H3b: VS-level interrupt delivery into VS-mode. Pending bits come
-    // from hvip (software injection via the hypervisor; the VSTIP vstimecmp timer
-    // and VSEIP hgeip guest-external sources are a deferred follow-up). They are
+    // from hvip (software injection via the hypervisor) plus, for VSTIP, the
+    // hardware vstimecmp source (Sstc-in-VS); the VSEIP hgeip guest-external
+    // source is a deferred follow-up. They are
     // enabled by the guest in vsie at the S-positions 1/5/9 (which is what the
     // guest writes through sie), delegated to VS by hideleg at the VS-positions
     // 2/6/10, and globally gated by V=1 with (VU, or VS and vsstatus.SIE). The
     // delivered cause is converted to the standard supervisor number the guest
     // expects (VSEIP→9, VSTIP→5, VSSIP→1), priority SEI>SSI>STI as for HS.
     let vs_pend_sei: logic = hvip[10] && hideleg[10] && vsie[9];
-    let vs_pend_sti: logic = hvip[6] && hideleg[6] && vsie[5];
+    // Phase 11-H Sstc-in-VS: the guest timer pending uses the effective VSTIP
+    // (hardware vstimecmp when Sstc-for-guest is on, else software hvip.VSTIP).
+    let vs_pend_sti: logic = vstip_eff && hideleg[6] && vsie[5];
     let vs_pend_ssi: logic = hvip[2] && hideleg[2] && vsie[1];
     let vs_irq_gate: logic = virt && ((priv == csr_pkg::PrivLevel::USER)
         || (priv == csr_pkg::PrivLevel::SUPERVISOR && vsstatus[1] == 1'b1));
@@ -691,6 +717,7 @@ pub module csr #(
             vscause    = 64'd0;
             vstval     = 64'd0;
             vsatp      = 64'd0;
+            vstimecmp  = 64'hFFFF_FFFF_FFFF_FFFF; // Phase 11-H Sstc-in-VS: never fires until set
             mcounteren = 64'd0;
             for i in 0..32 {
                 mhpmcounter[i] = 64'd0;
@@ -824,7 +851,7 @@ pub module csr #(
             } else if i_wr_en && virt && (i_wr_addr == ADDR_SSTATUS || i_wr_addr == ADDR_SIE
                 || i_wr_addr == ADDR_SIP || i_wr_addr == ADDR_STVEC || i_wr_addr == ADDR_SSCRATCH
                 || i_wr_addr == ADDR_SEPC || i_wr_addr == ADDR_SCAUSE || i_wr_addr == ADDR_STVAL
-                || i_wr_addr == ADDR_SATP) {
+                || i_wr_addr == ADDR_SATP || i_wr_addr == ADDR_STIMECMP) {
                 // Phase 11-H: VS-mode S-CSR write aliasing — the guest's writes
                 // to the S-CSR addresses update the VS shadow registers. This
                 // whole branch is dead while V=0 (boot never enters a guest), so
@@ -842,6 +869,8 @@ pub module csr #(
                     ADDR_SCAUSE  : vscause   = i_wr_data;
                     ADDR_STVAL   : vstval    = i_wr_data;
                     ADDR_SATP    : vsatp     = i_wr_data;
+                    // Phase 11-H Sstc-in-VS: the guest's stimecmp aliases vstimecmp.
+                    ADDR_STIMECMP: vstimecmp = i_wr_data;
                     default      : {}
                 }
             } else if i_wr_en {
@@ -910,6 +939,7 @@ pub module csr #(
                     ADDR_VSCAUSE   : vscause    = i_wr_data;
                     ADDR_VSTVAL    : vstval     = i_wr_data;
                     ADDR_VSATP     : vsatp      = i_wr_data;
+                    ADDR_VSTIMECMP : vstimecmp  = i_wr_data; // Phase 11-H Sstc-in-VS
                     ADDR_MCOUNTEREN: mcounteren = i_wr_data;
                     default        : {
                         // P10 Zihpm: mhpmcounter / mhpmevent writes (index =
