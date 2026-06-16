@@ -66,11 +66,18 @@ void enter_guest(u64 sepc, u64 a0, u64 a1);    /* hv_start.S */
 
 /* Handle one SBI call (ECALL-from-VS). Frame holds the guest GPRs (frame[i]=xi);
  * a0..a7 = frame[10..17]. On return a0/a1 in the frame carry SBI error/value. */
+static int sbi_trace = 0;
 static void sbi_dispatch(u64 *frame) {
     u64 eid = frame[17], fid = frame[16];
     u64 a0 = frame[10], a1 = frame[11], a2 = frame[12];
     (void) a2;
     u64 err = 0, val = 0;
+    if (sbi_trace < 60) {
+        sbi_trace++;
+        uart_puts("[sbi eid="); uart_hex(eid);
+        uart_puts(" fid="); uart_hex(fid);
+        uart_puts(" sepc="); uart_hex(CSRR("sepc")); uart_putc('\n');
+    }
 
     switch (eid) {
     case SBI_DBCN:
@@ -137,6 +144,9 @@ void hv_trap(u64 *frame) {
     uart_puts("\n[HV] unexpected trap scause="); uart_hex(scause);
     uart_puts(" sepc="); uart_hex(CSRR("sepc"));
     uart_puts(" stval="); uart_hex(CSRR("stval"));
+    uart_puts(" htval="); uart_hex(CSRR("0x643") << 2);   /* faulting guest PA */
+    uart_puts("\n     vsatp="); uart_hex(CSRR("0x280"));   /* guest page table */
+    uart_puts(" hstatus="); uart_hex(CSRR("0x600"));
     uart_putc('\n');
     hv_fail(scause);
 }
