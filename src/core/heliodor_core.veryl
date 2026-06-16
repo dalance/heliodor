@@ -345,6 +345,11 @@ pub module heliodor_core #(
     var csr_vsatp    : logic             <64>;
     var csr_vs_sum   : logic                ; // vsstatus.SUM (VS-stage)
     var csr_vs_mxr   : logic                ; // vsstatus.MXR (VS-stage)
+    // Phase 11-H3: VS trap delegation.
+    var csr_virt_prev: logic                ; // registered V snapshot (eval-order safe)
+    var csr_hedeleg  : logic             <64>;
+    var csr_hideleg  : logic             <64>;
+    var csr_vstvec   : logic             <64>;
     // M9: satp shadow latched on sfence.vma. Linux head.S sets satp without
     // a preceding sfence, expecting the previous TLB/satp to remain effective
     // until the next sfence (QEMU-compatible behavior). v4's narrow IFU
@@ -2873,9 +2878,13 @@ pub module heliodor_core #(
             // misrouted S-mode ECALLs to M-mode (cosim first divergence cy 630K).
             excp_cause = 64'd11; // ECALL from M
         } else if csr_priv_prev == csr_pkg::PrivLevel::SUPERVISOR {
-            excp_cause = 64'd9; // ECALL from S
+            // Phase 11-H3: ECALL from VS-mode (priv=S with V=1) is cause 10,
+            // distinct from ECALL-from-HS (cause 9). It is a hypercall and is
+            // never delegated to VS (hedeleg[10] is read-only 0) — it traps to
+            // HS/M for the hypervisor to service.
+            excp_cause = if csr_virt_prev ? 64'd10 : 64'd9;
         } else {
-            excp_cause = 64'd8; // ECALL from U
+            excp_cause = 64'd8; // ECALL from U / VU
         }
     }
     let trap_cause: logic<64> = if commit_irq ? csr_irq_cause : excp_cause;
@@ -2884,10 +2893,17 @@ pub module heliodor_core #(
     // the trap is taken in S-mode. For IRQ traps, csr supplies o_irq_to_s.
     // (csr_medeleg_w forward-declared near pc_q.)
     let trap_cause_bit: logic = csr_medeleg_w[excp_cause[5:0]];
+    // Phase 11-H3: a synchronous exception in VS/VU (virt_prev) that is delegated
+    // PAST M (medeleg) AND past HS (hedeleg) is taken in VS-mode. Interrupts to VS
+    // (virtual interrupts) are a later step, so trap_to_vs is sync-only for now.
+    let trap_deleg_s  : logic = trap_cause_bit && (csr_priv_prev != csr_pkg::PrivLevel::MACHINE);
+    let trap_to_vs    : logic = !commit_irq && csr_virt_prev && trap_deleg_s && csr_hedeleg[excp_cause[5:0]];
+    // Delivered to an S-level handler (HS or VS). trap_to_vs picks VS; otherwise
+    // HS. For IRQs, csr supplies o_irq_to_s (always HS for now).
     let trap_to_s     : logic = if commit_irq ?
         csr_irq_to_s
     :
-        (trap_cause_bit && (csr_priv_prev != csr_pkg::PrivLevel::MACHINE))
+        trap_deleg_s
     ;
 
     // ============================================================
@@ -2970,11 +2986,17 @@ pub module heliodor_core #(
         o_vsatp        : csr_vsatp   ,
         o_vsstatus_sum : csr_vs_sum  ,
         o_vsstatus_mxr : csr_vs_mxr  ,
+        // Phase 11-H3 VS trap delegation.
+        o_virt_prev    : csr_virt_prev,
+        o_hedeleg      : csr_hedeleg ,
+        o_hideleg      : csr_hideleg ,
+        o_vstvec       : csr_vstvec  ,
         o_pmm_m        : csr_pmm_m   ,
         o_pmm_s        : csr_pmm_s   ,
         o_pmm_u        : csr_pmm_u   ,
         i_sret_fire   : commit_sret  ,
         i_trap_to_s   : trap_to_s    ,
+        i_trap_to_vs  : trap_to_vs   ,
         // M8.C: external IRQ pins from harness (tie low when unused).
         i_irq_timer_m: i_irq_timer_m                   ,
         i_irq_sw_m   : i_irq_sw_m                      ,
@@ -3044,7 +3066,8 @@ pub module heliodor_core #(
     // (tvec[0]=0): all traps → base.  Vectored mode (tvec[0]=1): interrupts →
     // base + 4*cause_number; synchronous exceptions still → base.  (RISC-V
     // priv spec; matches v1 heliodor_core.veryl trap_target.)
-    let trap_tvec_sel : logic<64> = if trap_to_s ? csr_stvec : csr_mtvec;
+    // Phase 11-H3: a trap delegated to VS uses vstvec (the guest's trap vector).
+    let trap_tvec_sel : logic<64> = if trap_to_vs ? csr_vstvec : if trap_to_s ? csr_stvec : csr_mtvec;
     let trap_tvec_base: logic<64> = trap_tvec_sel & 64'hffff_ffff_ffff_fffc;
     let trap_target   : logic<64> = if trap_tvec_sel[0] && commit_irq ?
         trap_tvec_base + {48'd0, trap_cause[13:0], 2'b00}
