@@ -104,6 +104,9 @@ pub module csr #(
     o_hedeleg     : output logic<64>,
     o_hideleg     : output logic<64>,
     o_vstvec      : output logic<64>,
+    // Phase 11-H3b: vsepc is the VS-mode trap return address (used by a VS-mode
+    // SRET, which the core selects over sepc when V=1).
+    o_vsepc       : output logic<64>,
     // P10 Supm/Ssnpm pointer masking: the PMM field (bits 33:32) per priv level —
     // mseccfg.PMM for M, menvcfg.PMM for S, senvcfg.PMM for U. 00=off, 10=PMLEN7,
     // 11=PMLEN16, 01=reserved. The core picks one by the effective access priv.
@@ -131,7 +134,11 @@ pub module csr #(
     // stage to fire an interrupt trap when no synchronous trap fires).
     o_irq_pending: output logic    ,
     o_irq_cause  : output logic<64>, // MSB set + cause num
-    o_irq_to_s   : output logic    , // delegated to S-mode
+    o_irq_to_s   : output logic    , // delegated to S-mode (HS)
+    // Phase 11-H3b: the pending interrupt is a virtual VS-level interrupt to be
+    // delivered into VS-mode (V=1). Mutually exclusive with o_irq_to_s; takes
+    // lowest priority (an M- or HS-targeted interrupt forces a guest exit first).
+    o_irq_to_vs  : output logic    ,
 
     // commit_instret pulse (for counter increment)
     i_instret_en: input logic,
@@ -287,7 +294,6 @@ pub module csr #(
     var hedeleg   : logic<64>;
     var hideleg   : logic<64>;
     var hie       : logic<64>;
-    var hip       : logic<64>;
     var hvip      : logic<64>;
     var hgeie     : logic<64>;
     var htval     : logic<64>;
@@ -296,8 +302,10 @@ pub module csr #(
     var htimedelta: logic<64>;
     var henvcfg   : logic<64>;
     var hgatp     : logic<64>;
-    // VS-level CSRs (guest supervisor state). vsstatus/vsie/vsip mirror the
-    // sstatus/sie/sip layout; the rest are standalone like their S-mode peers.
+    // VS-level CSRs (guest supervisor state). vsstatus mirrors the sstatus
+    // layout; vsie holds the guest's interrupt enables; the rest are standalone
+    // like their S-mode peers. vsip has no storage — it is a view of hvip
+    // (see vsip_view below).
     var vsstatus  : logic<64>;
     var vsie      : logic<64>;
     var vstvec    : logic<64>;
@@ -305,7 +313,6 @@ pub module csr #(
     var vsepc     : logic<64>;
     var vscause   : logic<64>;
     var vstval    : logic<64>;
-    var vsip      : logic<64>;
     var vsatp     : logic<64>;
     // P10 Zicntr/Zihpm. mcounteren is stored (no access-control trap is enforced
     // yet). mhpmcounter[3..31] count the event selected by mhpmevent[3..31];
@@ -337,6 +344,24 @@ pub module csr #(
     let stip_hw  : logic     = sstc_en && (i_mtime >= stimecmp);
     let stip_eff : logic     = if sstc_en ? stip_hw : mip[5];
     let mip_read : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
+
+    // Phase 11-H3b: vsip is the guest's S-view of the pending VS interrupts; it
+    // has no storage of its own. Each guest sip bit aliases the corresponding
+    // VS interrupt in hvip — vsip.SSIP(1)=hvip.VSSIP(2), vsip.STIP(5)=hvip.VSTIP
+    // (6), vsip.SEIP(9)=hvip.VSEIP(10) — but only while that interrupt is
+    // delegated to VS by hideleg (else the guest reads 0). vsip.SSIP is writable
+    // and clears/sets hvip.VSSIP (see the SIP/VSIP write path); STIP/SEIP are
+    // read-only here. (vstimecmp/hgeip hardware sources are deferred.)
+    let vsip_view: logic<64> = (if hideleg[2] && hvip[2] ? 64'h0002 : 64'd0)
+        | (if hideleg[6] && hvip[6] ? 64'h0020 : 64'd0)
+        | (if hideleg[10] && hvip[10] ? 64'h0200 : 64'd0);
+    // hip is the HS-mode view of the pending VS interrupts: VSSIP(2)/VSTIP(6)/
+    // VSEIP(10) reflect hvip (and, when added, the vstimecmp/hgeip hardware
+    // sources); SGEIP(12) is the OR of hgeip&hgeie (no guest-external irqs yet,
+    // so 0). It has no storage — VSSIP is writable through the hvip alias.
+    let hip_view: logic<64> = (if hvip[2] ? 64'h0004 : 64'd0)
+        | (if hvip[6] ? 64'h0040 : 64'd0)
+        | (if hvip[10] ? 64'h0400 : 64'd0);
 
     // P10 Sscofpmf: scountovf aggregates the mhpmevent[n].OF (bit 63) of
     // counters 3..31 into bit n, masked by mcounteren[n] (a counter the
@@ -382,7 +407,7 @@ pub module csr #(
             ADDR_HEDELEG   : rd_data_w = hedeleg;
             ADDR_HIDELEG   : rd_data_w = hideleg;
             ADDR_HIE       : rd_data_w = hie;
-            ADDR_HIP       : rd_data_w = hip;
+            ADDR_HIP       : rd_data_w = hip_view;
             ADDR_HVIP      : rd_data_w = hvip;
             ADDR_HGEIE     : rd_data_w = hgeie;
             ADDR_HGEIP     : rd_data_w = 64'd0; // no guest external irqs yet (RO)
@@ -400,7 +425,7 @@ pub module csr #(
             ADDR_VSEPC     : rd_data_w = vsepc;
             ADDR_VSCAUSE   : rd_data_w = vscause;
             ADDR_VSTVAL    : rd_data_w = vstval;
-            ADDR_VSIP      : rd_data_w = vsip & SI_MASK;
+            ADDR_VSIP      : rd_data_w = vsip_view;
             ADDR_VSATP     : rd_data_w = vsatp;
             ADDR_MCOUNTEREN: rd_data_w = mcounteren;
             ADDR_MEDELEG   : rd_data_w = medeleg;
@@ -445,8 +470,11 @@ pub module csr #(
                 ADDR_SEPC    : rd_data_w = vsepc;
                 ADDR_SCAUSE  : rd_data_w = vscause;
                 ADDR_STVAL   : rd_data_w = vstval;
-                ADDR_SIP     : rd_data_w = vsip & SI_MASK;
+                ADDR_SIP     : rd_data_w = vsip_view;
                 ADDR_SATP    : rd_data_w = vsatp;
+                // Phase 11-H3b: a guest read of `time` observes guest time =
+                // mtime + htimedelta (the hypervisor's per-guest time offset).
+                ADDR_TIME    : rd_data_w = i_mtime + htimedelta;
                 default      : {}
             }
         }
@@ -466,7 +494,12 @@ pub module csr #(
     let m_irqs_visible: logic<64> = mie_pend & ~mideleg;
     let s_irqs_visible: logic<64> = mie_pend & mideleg;
     let m_irq_gate    : logic     = (priv != csr_pkg::PrivLevel::MACHINE) || (mstatus[3] == 1'b1);
-    let s_irq_gate    : logic     = (priv == csr_pkg::PrivLevel::USER)
+    // HS (supervisor) interrupts target HS-mode (priv=S, V=0). They are taken
+    // whenever the hart runs strictly below HS — U-mode (V=0), or any V=1 mode
+    // (VS/VU, which the guest exit would escalate out of) — or at HS itself with
+    // mstatus.SIE. The `|| virt` term is the Phase 11-H3b addition; it is inert
+    // while V=0 (boot never virtualizes), so the M/S routing stays byte-identical.
+    let s_irq_gate    : logic     = (priv == csr_pkg::PrivLevel::USER) || virt
         || (priv == csr_pkg::PrivLevel::SUPERVISOR && mstatus[1] == 1'b1);
     let m_irq_active  : logic     = m_irq_gate && (m_irqs_visible != 64'd0);
     let s_irq_active  : logic     = s_irq_gate && (s_irqs_visible != 64'd0);
@@ -505,9 +538,44 @@ pub module csr #(
             s_cause_w = 6'd0;
         }
     }
-    assign o_irq_pending = m_irq_active || s_irq_active;
+    // Phase 11-H3b: VS-level interrupt delivery into VS-mode. Pending bits come
+    // from hvip (software injection via the hypervisor; the VSTIP vstimecmp timer
+    // and VSEIP hgeip guest-external sources are a deferred follow-up). They are
+    // enabled by the guest in vsie at the S-positions 1/5/9 (which is what the
+    // guest writes through sie), delegated to VS by hideleg at the VS-positions
+    // 2/6/10, and globally gated by V=1 with (VU, or VS and vsstatus.SIE). The
+    // delivered cause is converted to the standard supervisor number the guest
+    // expects (VSEIP→9, VSTIP→5, VSSIP→1), priority SEI>SSI>STI as for HS.
+    let vs_pend_sei: logic = hvip[10] && hideleg[10] && vsie[9];
+    let vs_pend_sti: logic = hvip[6] && hideleg[6] && vsie[5];
+    let vs_pend_ssi: logic = hvip[2] && hideleg[2] && vsie[1];
+    let vs_irq_gate: logic = virt && ((priv == csr_pkg::PrivLevel::USER)
+        || (priv == csr_pkg::PrivLevel::SUPERVISOR && vsstatus[1] == 1'b1));
+    let vs_irq_active: logic = vs_irq_gate && (vs_pend_sei || vs_pend_sti || vs_pend_ssi);
+    var vs_cause_w: logic<6>;
+    always_comb {
+        if vs_pend_sei {
+            vs_cause_w = 6'd9;
+        } else if vs_pend_ssi {
+            vs_cause_w = 6'd1;
+        } else if vs_pend_sti {
+            vs_cause_w = 6'd5;
+        } else {
+            vs_cause_w = 6'd0;
+        }
+    }
+    // Priority across levels: M > HS > VS. A pending M- or HS-targeted interrupt
+    // takes precedence (and, while V=1, forces a guest exit) over a VS interrupt.
+    assign o_irq_pending = m_irq_active || s_irq_active || vs_irq_active;
     assign o_irq_to_s    = !m_irq_active && s_irq_active;
-    assign o_irq_cause   = if m_irq_active ? {1'b1, 57'd0, m_cause_w} : {1'b1, 57'd0, s_cause_w};
+    assign o_irq_to_vs   = !m_irq_active && !s_irq_active && vs_irq_active;
+    assign o_irq_cause   = if m_irq_active ?
+        {1'b1, 57'd0, m_cause_w}
+    : if s_irq_active ?
+        {1'b1, 57'd0, s_cause_w}
+    :
+        {1'b1, 57'd0, vs_cause_w}
+    ;
 
     assign o_rd_data      = rd_data_w;
     assign o_mtvec        = mtvec;
@@ -526,6 +594,7 @@ pub module csr #(
     assign o_hedeleg      = hedeleg;
     assign o_hideleg      = hideleg;
     assign o_vstvec       = vstvec;
+    assign o_vsepc        = vsepc;
     assign o_mstatus_sum  = mstatus[18];
     assign o_mstatus_mxr  = mstatus[19];
     assign o_mstatus_mprv = mstatus[17];
@@ -595,7 +664,6 @@ pub module csr #(
             hedeleg    = 64'd0;
             hideleg    = 64'd0;
             hie        = 64'd0;
-            hip        = 64'd0;
             hvip       = 64'd0;
             hgeie      = 64'd0;
             htval      = 64'd0;
@@ -611,7 +679,6 @@ pub module csr #(
             vsepc      = 64'd0;
             vscause    = 64'd0;
             vstval     = 64'd0;
-            vsip       = 64'd0;
             vsatp      = 64'd0;
             mcounteren = 64'd0;
             for i in 0..32 {
@@ -706,6 +773,15 @@ pub module csr #(
                 // MPP ← U (00)
                 mstatus[12] = 1'b0;
                 mstatus[11] = 1'b0;
+            } else if i_sret_fire && virt {
+                // Phase 11-H3b: a VS-mode SRET (V=1) operates on vsstatus, not
+                // mstatus, and V stays 1 (the guest returns to VS/VU). vsstatus:
+                // SIE ← SPIE, SPIE ← 1; priv ← SPP (1=VS, 0=VU); SPP ← U. The
+                // return PC is vsepc (selected by the core). hstatus is untouched.
+                vsstatus[1] = vsstatus[5];
+                vsstatus[5] = 1'b1;
+                priv        = if vsstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
+                vsstatus[8] = 1'b0;
             } else if i_sret_fire {
                 // sstatus: SIE ← SPIE, SPIE ← 1; priv ← SPP (1=S, 0=U); SPP ← U
                 mstatus[1] = mstatus[5];
@@ -715,8 +791,7 @@ pub module csr #(
                 // Phase 11-H: an HS-mode SRET restores V ← hstatus.SPV, then
                 // clears SPV. When SPV=1 this enters a guest (priv = SPP gives
                 // VS/VU under the SUPERVISOR/USER encoding). Inert at V=0 (SPV=0
-                // → V stays 0). A VS-mode SRET (V=1, operating on vsstatus) is
-                // H3 — this HS path is only reached with V=0.
+                // → V stays 0). A VS-mode SRET (V=1) takes the branch above.
                 virt       = hstatus[7];
                 hstatus[7] = 1'b0;
             } else if i_wr_en && virt && (i_wr_addr == ADDR_SSTATUS || i_wr_addr == ADDR_SIE
@@ -730,7 +805,10 @@ pub module csr #(
                 case i_wr_addr {
                     ADDR_SSTATUS : vsstatus  = (vsstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK);
                     ADDR_SIE     : vsie      = (vsie & ~SI_MASK) | (i_wr_data & SI_MASK);
-                    ADDR_SIP     : vsip      = (vsip & ~SI_MASK) | (i_wr_data & SI_MASK);
+                    // Phase 11-H3b: the guest's sip.SSIP write aliases hvip.VSSIP
+                    // (the one writable VS-interrupt-pending bit); STIP/SEIP are
+                    // read-only in sip, so the rest of the write is dropped.
+                    ADDR_SIP     : hvip[2]   = i_wr_data[1];
                     ADDR_STVEC   : vstvec    = i_wr_data;
                     ADDR_SSCRATCH: vsscratch = i_wr_data;
                     ADDR_SEPC    : vsepc     = i_wr_data;
@@ -781,8 +859,12 @@ pub module csr #(
                     ADDR_HEDELEG   : hedeleg    = i_wr_data;
                     ADDR_HIDELEG   : hideleg    = i_wr_data;
                     ADDR_HIE       : hie        = i_wr_data;
-                    ADDR_HIP       : hip        = i_wr_data;
-                    ADDR_HVIP      : hvip       = i_wr_data;
+                    // Phase 11-H3b: hip.VSSIP (bit 2) is a writable alias of
+                    // hvip.VSSIP; the rest of hip is read-only (a view of the
+                    // pending VS interrupts, see hip_view).
+                    ADDR_HIP       : hvip[2]    = i_wr_data[2];
+                    // hvip writable bits are VSSIP(2)/VSTIP(6)/VSEIP(10) only.
+                    ADDR_HVIP      : hvip       = i_wr_data & 64'h0000_0000_0000_0444;
                     ADDR_HGEIE     : hgeie      = i_wr_data;
                     ADDR_HTVAL     : htval      = i_wr_data;
                     ADDR_HTINST    : htinst     = i_wr_data;
@@ -793,7 +875,8 @@ pub module csr #(
                     // Phase 11-H VS-level CSR writes (own addresses).
                     ADDR_VSSTATUS  : vsstatus   = (vsstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK);
                     ADDR_VSIE      : vsie       = (vsie & ~SI_MASK) | (i_wr_data & SI_MASK);
-                    ADDR_VSIP      : vsip       = (vsip & ~SI_MASK) | (i_wr_data & SI_MASK);
+                    // vsip.SSIP aliases hvip.VSSIP (see the SIP-alias write above).
+                    ADDR_VSIP      : hvip[2]    = i_wr_data[1];
                     ADDR_VSTVEC    : vstvec     = i_wr_data;
                     ADDR_VSSCRATCH : vsscratch  = i_wr_data;
                     ADDR_VSEPC     : vsepc      = i_wr_data;
