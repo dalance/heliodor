@@ -101,12 +101,22 @@ _start:
     csrw mcounteren, t0
 
 #ifdef RVA23_MENVCFG
-    /* RVA23: enable Sstc (STCE/63), Svpbmt (PBMTE/62), Svadu (ADUE/61) and
-     * Zicboz/Zicbom (CBZE/7, CBCFE/6, CBIE=01/4) for S-mode. Gated: the 5.15
-     * boot leaves this off so the firmware SBI timer path keeps driving STIP. */
-    li   t0, 7
-    slli t0, t0, 61              /* STCE | PBMTE | ADUE */
-    ori  t0, t0, 0xD0           /* CBZE | CBCFE | CBIE=01 (cbo.inval->flush) */
+    /* RVA23: enable Sstc (STCE/63), Svpbmt (PBMTE/62) and Zicboz/Zicbom
+     * (CBZE/7, CBCFE/6, CBIE=01/4) for S-mode. Gated: the 5.15 boot leaves
+     * this off so the firmware SBI timer path keeps driving STIP.
+     * Svadu (ADUE/61) is split out behind -DRVA23_ADUE because a kernel
+     * without Svadu support (e.g. 6.6) does software A/D, so it is not needed
+     * there. (NB: ADUE is NOT what blocks the 6.6 SMP boot — that storm is a
+     * separate heliodor d-side PTW dcache read bug and reproduces with ADUE
+     * off; keep the gate purely as a Svadu on/off control for 7.1.) */
+    li   t0, 3
+    slli t0, t0, 62             /* STCE(63) | PBMTE(62) */
+#ifdef RVA23_ADUE
+    li   t1, 1
+    slli t1, t1, 61            /* ADUE(61) — Svadu hardware A/D update */
+    or   t0, t0, t1
+#endif
+    ori  t0, t0, 0xD0          /* CBZE | CBCFE | CBIE=01 (cbo.inval->flush) */
     csrw 0x30a, t0
 #endif
 
@@ -825,9 +835,14 @@ _secondary_park:
 
 #ifdef RVA23_MENVCFG
     /* RVA23 menvcfg (see hart-0 path). Per-hart CSR, so set on secondaries too. */
-    li    t1, 7
-    slli  t1, t1, 61            /* STCE | PBMTE | ADUE */
-    ori   t1, t1, 0xD0          /* CBZE | CBCFE | CBIE=01 */
+    li    t1, 3
+    slli  t1, t1, 62           /* STCE | PBMTE */
+#ifdef RVA23_ADUE
+    li    t2, 1
+    slli  t2, t2, 61           /* ADUE */
+    or    t1, t1, t2
+#endif
+    ori   t1, t1, 0xD0         /* CBZE | CBCFE | CBIE=01 */
     csrw  0x30a, t1
 #endif
 
