@@ -343,6 +343,10 @@ pub module heliodor_core #(
     var csr_tsr      : logic                ;
     var csr_fs       : logic             <2>; // mstatus.FS (00=Off → FP illegal)
     var csr_vs_fs    : logic             <2>; // vsstatus.FS (guest FP unit state)
+    // Phase 12 V0: vector unit state (mstatus.VS) + architectural vtype/vl feedback.
+    var csr_vs       : logic             <2>; // mstatus.VS (00=Off → vector illegal)
+    var csr_vtype    : logic            <64>;
+    var csr_vl       : logic            <64>;
     // Phase 11-H: virtualization state for two-stage MMU translation.
     var csr_virt     : logic                ; // current V bit
     var csr_mpv      : logic                ; // mstatus.MPV (MPRV-effective V)
@@ -1467,10 +1471,31 @@ pub module heliodor_core #(
     var rob_full     : logic           ;
     var iq_alloc_rdy : logic           ;
 
+    // Phase 12 V0: Vector unit (vector_unit.veryl) datapath signals.
+    var vu_alloc_rdy  : logic                    ;
+    var vu_cdb_valid  : logic                    ;
+    var vu_cdb_has_rd : logic                    ;
+    var vu_cdb_pdst   : logic<PRF_INT_W>         ;
+    var vu_cdb_data   : logic<64>                ;
+    var vu_cdb_rob_idx: logic<ROB_IDX_W>         ;
+    var vu_cdb_vset_wen: logic                   ;
+    var vu_cdb_vtype  : logic<64>                ;
+    var vu_cdb_vl     : logic<64>                ;
+    var vu_scalar_pdst: logic<PRF_INT_W>         ;
+    var vu_scalar_data: logic<64>                ;
+    var vu_vs1_addr   : logic<vector_pkg::VRF_W> ;
+    var vu_vs1_data   : logic<vector_pkg::VLEN>  ;
+    var vu_vs2_addr   : logic<vector_pkg::VRF_W> ;
+    var vu_vs2_data   : logic<vector_pkg::VLEN>  ;
+    var vu_vd_addr    : logic<vector_pkg::VRF_W> ;
+    var vu_vd_wen     : logic                    ;
+    var vu_vd_data    : logic<vector_pkg::VLEN>  ;
+    var vu_cdb        : CdbBus                   ;
+
     // M6: route IQ-readiness to iq_fp for FPU ops, iq_int otherwise; require
     // the int free-list for an int dest and the FP free-list for an FP dest.
     let resources_avail: logic = !rob_full
-        && (if dec_op.is_fpu_op ? iqf_alloc_rdy : iq_alloc_rdy)
+        && (if dec_op.is_vec ? vu_alloc_rdy : if dec_op.is_fpu_op ? iqf_alloc_rdy : iq_alloc_rdy)
         && (!dec_op.has_rd || !free_empty)
         && (!dec_op.fp_writes_fp || !fp_free_empty);
     assign stall_dr = if_v_q && !resources_avail;
@@ -1560,6 +1585,8 @@ pub module heliodor_core #(
         // Phase 11-H HLV/HSV: carry the two-stage marker so a committing HSV store
         // drives the dmem MMU in two-stage mode + any HLV/HSV fault sets GVA.
         rob_alloc_entry.is_mem_virt = dec_op.hlv;
+        // Phase 12 V0: vector op marker (commit-time VS-disabled trap + slot-1 gate).
+        rob_alloc_entry.is_vec = dec_op.is_vec;
     }
 
     // RenamedOp
@@ -1595,7 +1622,12 @@ pub module heliodor_core #(
         && !dec_op2.is_load && !dec_op2.is_store && !dec_op2.is_amo
         && !dec_op2.is_csr && !dec_op2.is_branch && !dec_op2.is_jal && !dec_op2.is_jalr
         && !dec_op2.is_ecall && !dec_op2.is_ebreak && !dec_op2.is_mret && !dec_op2.is_sret
-        && !dec_op2.is_sfence && !dec_op2.is_fence_i && !dec_op2.illegal;
+        && !dec_op2.is_sfence && !dec_op2.is_fence_i && !dec_op2.illegal
+        // Phase 12 V0: a vector op (incl. vset*vl/vmv.x.s, which DO write an int rd)
+        // must never take the integer-only slot-1 path — it has to reach the VU via
+        // slot-0. Without this a has_rd vector op renames as a plain int ALU op and
+        // bypasses the VU (vtype/vl never update → every vector op sees vl=0).
+        && !dec_op2.is_vec;
     // S4b.2: 2-wide rename LIVE. slot-1 renames alongside slot-0 when: slot-0
     // fires (rename_fire), the slot-1 op is a simple int ALU op (dec_op2_eligible),
     // the FIFO holds the 2nd record (fb_count >= 2), and there is room for a 2nd
@@ -1665,6 +1697,7 @@ pub module heliodor_core #(
         rob_alloc_entry2.has_rd         = dec_op2.has_rd;
         rob_alloc_entry2.is_fp_dest     = dec_op2.fp_writes_fp;
         rob_alloc_entry2.is_fp          = dec_op2.is_fp;
+        rob_alloc_entry2.is_vec         = dec_op2.is_vec;
         rob_alloc_entry2.fflags         = 5'd0;
         rob_alloc_entry2.fflags_wen     = 1'b0;
         rob_alloc_entry2.result_written = 1'b0;
@@ -1896,7 +1929,13 @@ pub module heliodor_core #(
     // to the FP PRF (line ~2118). The consumer of that load never woke → it sat
     // at the ROB head forever (observed: __schedule FP context switch wedge at
     // 0x800df482, FP-on N=2 boot). FP-off never triggers it (iq_iss_fp_ld==0).
-    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? !iqf_iss_wr_int : if mshr_cdb.valid ? 1'b0 : iq_iss_fp_ld;
+    // Phase 12 V0: the VU writeback (vu_cdb) sits at LOWEST priority on lane 0 —
+    // it drives the bus only when the scalar pipe is idle (vu_cdb_free). Its dest
+    // is integer or none (never FP), so when it wins the mux cdb_dest_is_fp=0
+    // (the `alu_cdb.valid ? iq_iss_fp_ld : 1'b0` tail covers VU + idle cycles;
+    // when alu_cdb.valid it is the original iq_iss_fp_ld, so byte-identical).
+    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? !iqf_iss_wr_int : if mshr_cdb.valid ? 1'b0 : if alu_cdb.valid ? iq_iss_fp_ld : 1'b0;
+    let vu_cdb_free   : logic = !fpu_cdb.valid && !mshr_cdb.valid && !alu_cdb.valid;
     // rs2 operand fed to the ALU: FP store data from prf_fp, else int rs2.
     let alu_rs2_data: logic<64> = if iq_iss_fp_st ? prf_fp_store_data : prf_rs2_data;
     // P9.3 in-cache AMO: the M9.4 bus-atomic AMO lock (amo_read_pending_q /
@@ -1923,8 +1962,32 @@ pub module heliodor_core #(
     // Phase 8 S10.1: lane-0 priority FPU > MSHR (deferred load fill) > ALU.
     // The MSHR holds its completion (mshr_done_q) until the FPU lane is free,
     // and the ALU yields issue/ack the cycle the MSHR writes back (gates below).
+    // Phase 12 V0: assemble the VU writeback as a CdbBus (no store/load/csr/fault
+    // side-bands — a vector op only writes the int PRF (vmv.x.s/vset*vl) or just
+    // sets result_written (vadd)).
     always_comb {
-        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : alu_cdb;
+        vu_cdb.valid       = vu_cdb_valid;
+        vu_cdb.has_rd      = vu_cdb_has_rd;
+        vu_cdb.pdst        = vu_cdb_pdst;
+        vu_cdb.data        = vu_cdb_data;
+        vu_cdb.rob_idx     = vu_cdb_rob_idx;
+        vu_cdb.mispredict  = 1'b0;
+        vu_cdb.redirect_pc = 64'd0;
+        vu_cdb.is_store    = 1'b0;
+        vu_cdb.store_addr  = 64'd0;
+        vu_cdb.store_data  = 64'd0;
+        vu_cdb.store_funct3 = 3'd0;
+        vu_cdb.is_load     = 1'b0;
+        vu_cdb.is_csr      = 1'b0;
+        vu_cdb.csr_addr    = 12'd0;
+        vu_cdb.csr_wdata   = 64'd0;
+        vu_cdb.csr_illegal = 1'b0;
+        vu_cdb.is_lfault   = 1'b0;
+        vu_cdb.is_sfault   = 1'b0;
+        vu_cdb.fault_vaddr = 64'd0;
+    }
+    always_comb {
+        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : if alu_cdb.valid ? alu_cdb : vu_cdb;
     }
     inst u_alu: alu_wrap (
         i_issue_valid     : iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store,
@@ -2061,6 +2124,8 @@ pub module heliodor_core #(
         o_rd4_data: prf_rs1_data2                            ,
         i_rd5_pdst: iq_iss_rs2_pdst2                         ,
         o_rd5_data: prf_rs2_data2                            ,
+        i_rd6_pdst: vu_scalar_pdst                           , // Phase 12 V0: VU scalar
+        o_rd6_data: vu_scalar_data                           ,
         i_wr_en   : cdb.valid && cdb.has_rd && !cdb_dest_is_fp,
         i_wr_pdst : cdb.pdst                                 ,
         i_wr_data : cdb.data                                 ,
@@ -2333,7 +2398,7 @@ pub module heliodor_core #(
     inst u_iq: iq_int (
         clk                                               ,
         rst                                               ,
-        i_alloc_en          : rename_fire && !dec_op.is_fpu_op    ,
+        i_alloc_en          : rename_fire && !dec_op.is_fpu_op && !dec_op.is_vec,
         i_alloc_op          : ren_op                      ,
         o_alloc_rdy         : iq_alloc_rdy                ,
         // Phase 8 S2: slot-1 alloc (integer-only; gated off via rename_fire2=0
@@ -2399,6 +2464,81 @@ pub module heliodor_core #(
         // than the resolved branch (age via the shared S4c head-relative metric).
         i_squash_en         : s8_restore_en               ,
         i_squash_idx        : s8_restore_idx              ,
+    );
+
+    // ============================================================
+    // Phase 12 V0: Vector unit + vector register file
+    // ============================================================
+    inst u_vrf: vrf #(
+        VRF_N: vector_pkg::VRF_N,
+        VRF_W: vector_pkg::VRF_W,
+        VLEN : vector_pkg::VLEN ,
+    ) (
+        clk                    ,
+        rst                    ,
+        i_rd1_addr: vu_vs1_addr,
+        o_rd1_data: vu_vs1_data,
+        i_rd2_addr: vu_vs2_addr,
+        o_rd2_data: vu_vs2_data,
+        i_wr_en   : vu_vd_wen  ,
+        i_wr_addr : vu_vd_addr ,
+        i_wr_data : vu_vd_data ,
+    );
+    inst u_vu: vector_unit #(
+        VRF_W    : vector_pkg::VRF_W,
+        VLEN     : vector_pkg::VLEN ,
+        PRF_W    : PRF_INT_W        ,
+        ROB_IDX_W: ROB_IDX_W        ,
+    ) (
+        clk                                                                  ,
+        rst                                                                  ,
+        // Dispatch (in-order push from rename; gated on a non-illegal vec op).
+        i_alloc_en          : rename_fire && dec_op.is_vec && !dec_op.illegal,
+        i_alloc_vec_op      : dec_op.vec_op                                  ,
+        i_alloc_instr       : dec_op.instr                                   ,
+        i_alloc_vd          : dec_op.rd_arch                                 ,
+        i_alloc_vs1         : dec_op.rs1_arch                                ,
+        i_alloc_vs2         : dec_op.rs2_arch                                ,
+        i_alloc_uses_scalar : dec_op.vec_uses_scalar                        ,
+        i_alloc_scalar_pdst : rs1_pdst                                      ,
+        i_alloc_scalar_ready: iq_int_fp_query_rdy                           , // rs1 readiness
+        i_alloc_has_rd      : dec_op.has_rd                                 , // int rd (vmv.x.s/vset)
+        i_alloc_rd_pdst     : ren_rd_pdst                                   ,
+        i_alloc_rob_idx     : rob_alloc_idx                                 ,
+        o_alloc_rdy         : vu_alloc_rdy                                  ,
+        // Int CDB snoop (merged lane 0 + pipe-1) — wakes the scalar operand.
+        i_cdb_int_valid     : cdb.valid && !cdb_dest_is_fp && cdb.has_rd     ,
+        i_cdb_int_pdst      : cdb.pdst                                      ,
+        i_cdb2_valid        : alu_cdb2.valid                                ,
+        i_cdb2_has_rd       : alu_cdb2.has_rd                               ,
+        i_cdb2_pdst         : alu_cdb2.pdst                                 ,
+        // Non-speculative execution gate (FIFO head must be the ROB head).
+        i_rob_head_idx      : rob_head_idx                                  ,
+        // Int PRF scalar read (combinational at execute).
+        o_scalar_pdst       : vu_scalar_pdst                                ,
+        i_scalar_data       : vu_scalar_data                               ,
+        // VRF interface.
+        o_vs1_addr          : vu_vs1_addr                                   ,
+        i_vs1_data          : vu_vs1_data                                  ,
+        o_vs2_addr          : vu_vs2_addr                                   ,
+        i_vs2_data          : vu_vs2_data                                  ,
+        o_vd_addr           : vu_vd_addr                                    ,
+        o_vd_wen            : vu_vd_wen                                    ,
+        o_vd_data           : vu_vd_data                                   ,
+        // CDB writeback (lowest priority — only when the scalar pipe is idle).
+        i_cdb_free          : vu_cdb_free                                   ,
+        o_cdb_valid         : vu_cdb_valid                                  ,
+        o_cdb_has_rd        : vu_cdb_has_rd                                 ,
+        o_cdb_pdst          : vu_cdb_pdst                                   ,
+        o_cdb_data          : vu_cdb_data                                   ,
+        o_cdb_rob_idx       : vu_cdb_rob_idx                                ,
+        o_cdb_vset_wen      : vu_cdb_vset_wen                               ,
+        o_cdb_vtype         : vu_cdb_vtype                                  ,
+        o_cdb_vl            : vu_cdb_vl                                     ,
+        // Architectural vtype/vl restore on flush.
+        i_csr_vtype         : csr_vtype                                     ,
+        i_csr_vl            : csr_vl                                        ,
+        i_flush             : redirect_fire                                 ,
     );
 
     // ============================================================
@@ -2472,6 +2612,11 @@ pub module heliodor_core #(
     var c_is_fp       : logic           ;
     var c_fflags      : logic<5>        ;
     var c_fflags_wen  : logic           ;
+    // Phase 12 V0: vector commit drain (VS-disabled trap + vset*vl config update).
+    var c_is_vec      : logic           ;
+    var c_vset_wen    : logic           ;
+    var c_vtype       : logic<64>       ;
+    var c_vl          : logic<64>       ;
     // Phase 8 S9: the head load was poisoned (memory-order violation) → replay.
     var c_load_poison : logic           ;
 
@@ -2636,6 +2781,10 @@ pub module heliodor_core #(
         i_cdb_fault_gpa      : dmem_mmu_gpa         ,
         i_cdb_fflags         : fpu_fflags           , // M6: from FPU (only valid when FP wrote back)
         i_cdb_fflags_wen     : fpu_fflags_wen       ,
+        // Phase 12 V0: vset*vl new config from the VU (latched at its CDB writeback).
+        i_cdb_vset_wen       : vu_cdb_vset_wen      ,
+        i_cdb_vtype          : vu_cdb_vtype         ,
+        i_cdb_vl             : vu_cdb_vl            ,
         // Phase 8 S3: 2nd CDB writeback (pipe-1 = ALU/branch). Silent in S3.a.
         i_cdb2_valid         : alu_cdb2.valid       ,
         i_cdb2_rob_idx       : alu_cdb2.rob_idx     ,
@@ -2738,6 +2887,10 @@ pub module heliodor_core #(
         o_commit_is_fp       : c_is_fp              ,
         o_commit_fflags      : c_fflags             ,
         o_commit_fflags_wen  : c_fflags_wen         ,
+        o_commit_is_vec      : c_is_vec             ,
+        o_commit_vset_wen    : c_vset_wen           ,
+        o_commit_vtype       : c_vtype              ,
+        o_commit_vl          : c_vl                 ,
         o_commit_idx         : rob_commit_idx       ,
         o_commit_load_poison : c_load_poison        , // Phase 8 S9
         i_commit_ack         : rob_commit_ack       ,
@@ -2796,6 +2949,10 @@ pub module heliodor_core #(
     // V=1-only term → byte-identical at V=0 (csr_virt=0 drops the added clause).
     let commit_fp_disabled : logic = rob_commit_valid && c_is_fp
         && (csr_fs == 2'b00 || (csr_virt && csr_vs_fs == 2'b00));
+    // Phase 12 V0: a vector instruction committing while mstatus.VS == Off (vector
+    // unit disabled) raises an illegal-instruction trap (cause 2), same machinery
+    // as commit_fp_disabled. Inert for non-vector code (c_is_vec=0).
+    let commit_vec_disabled: logic = rob_commit_valid && c_is_vec && csr_vs == 2'b00;
     // Phase 11-H B: HLV/HLVX/HSV (c_is_mem_virt) are valid only in M, HS-S, or
     // HS-U with hstatus.HU=1. Executed in VS/VU (V=1) they raise a VIRTUAL
     // instruction exception (cause 22); executed in HS-U with HU=0 they raise an
@@ -2825,7 +2982,7 @@ pub module heliodor_core #(
     // Combined virtual-instruction (cause 22) sources.
     let commit_virt_instr  : logic = commit_hlv_vi || commit_vs_csr_vi || commit_vtvm_trap || commit_vtsr_trap;
     let commit_priv_illegal: logic = commit_tvm_trap || commit_tsr_trap || commit_fp_disabled
-        || commit_virt_instr || commit_hlv_illegal;
+        || commit_virt_instr || commit_hlv_illegal || commit_vec_disabled;
     // M9.3 SMP FIX (cosim-pinned free-list double-alloc): gate the commit-side
     // architectural mutations on the actual RETIRE (rob_commit_ack), NOT on
     // rob_commit_valid. A store-class op held at the ROB head keeps
@@ -3181,6 +3338,13 @@ pub module heliodor_core #(
         o_mstatus_tvm : csr_tvm      ,
         o_mstatus_tsr : csr_tsr      ,
         o_mstatus_fs  : csr_fs       ,
+        // Phase 12 V0: vector state + config feedback.
+        o_mstatus_vs  : csr_vs       ,
+        i_vset_wr     : rob_commit_valid && c_vset_wen && !c_illegal && !commit_priv_illegal,
+        i_set_vtype   : c_vtype      ,
+        i_set_vl      : c_vl         ,
+        o_vtype       : csr_vtype    ,
+        o_vl          : csr_vl       ,
         o_menvcfg_pbmte: csr_pbmte   ,
         o_menvcfg_adue : csr_adue    ,
         // Phase 11-H two-stage MMU state.

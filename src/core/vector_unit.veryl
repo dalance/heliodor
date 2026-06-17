@@ -1,0 +1,357 @@
+// Phase 12 V0: decoupled, in-order Vector Unit (VU).
+//
+// The VU owns the vector config state (vtype/vl, working copies) and drives the
+// VRF (vrf.veryl). It receives vector instructions from rename in PROGRAM ORDER
+// into a small in-order FIFO and executes them one at a time, head first — the
+// VRF is not renamed, so vector source operands are always the values the VU
+// itself wrote earlier in program order (no vector-operand wakeup needed). Only
+// the scalar (integer) operand of vadd.vx / vset*vl needs wakeup, which it gets
+// from the integer CDB exactly like iq_fp's int→fp source.
+//
+// Completion rides the lane-0 CDB at LOWEST priority (the VU drives the bus only
+// when the scalar pipe is idle, i_cdb_free). A vector-dest op (vadd) drives the
+// CDB with has_rd=0 to set the ROB's result_written; a vector→scalar op
+// (vmv.x.s, vset*vl) drives it with has_rd=1 to write the integer PRF + wake int
+// consumers + set result_written, exactly like an fcvt.w.s (FP→INT) writeback.
+//
+// V0 subset: vsetvli / vsetivli, vadd.{vv,vx,vi}, vmv.x.s. VLEN=128, ELEN=64.
+// Tail / masked-off elements are written as 0 (refined to vta/vma in V2).
+pub module vector_unit #(
+    param VRF_W    : u32 = 5  ,
+    param VLEN     : u32 = 128 ,
+    param PRF_W    : u32 = 6  , // integer PRF index width
+    param ROB_IDX_W: u32 = 5  ,
+    param FIFO_N   : u32 = 8  ,
+    param FIFO_W   : u32 = 3  ,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // ---- Dispatch (in-order push from rename) -------------------------------
+    i_alloc_en          : input  logic                ,
+    i_alloc_vec_op      : input  vector_pkg::VecOp    ,
+    i_alloc_instr       : input  logic         <32>   , // for immediate fields
+    i_alloc_vd          : input  logic         <VRF_W>, // rd field (vector dest / int rd)
+    i_alloc_vs1         : input  logic         <VRF_W>, // rs1 field (vector src1)
+    i_alloc_vs2         : input  logic         <VRF_W>, // rs2 field (vector src2)
+    i_alloc_uses_scalar : input  logic                , // reads int rs1
+    i_alloc_scalar_pdst : input  logic         <PRF_W>,
+    i_alloc_scalar_ready: input  logic                , // initial int-rs1 readiness
+    i_alloc_has_rd      : input  logic                , // writes int rd (!= x0)
+    i_alloc_rd_pdst     : input  logic         <PRF_W>,
+    i_alloc_rob_idx     : input  logic         <ROB_IDX_W>,
+    o_alloc_rdy         : output logic                , // FIFO has a free slot
+
+    // ---- Integer CDB snoop (wake the scalar operand) ------------------------
+    // Lane 0 = the merged CDB (includes the VU's own int writeback, so a
+    // vset*vl/vmv.x.s result wakes a younger vector op's scalar source).
+    i_cdb_int_valid: input logic       , // cdb.valid && !cdb_dest_is_fp && cdb.has_rd
+    i_cdb_int_pdst : input logic<PRF_W>,
+    i_cdb2_valid   : input logic       , // pipe-1 (always int)
+    i_cdb2_has_rd  : input logic       ,
+    i_cdb2_pdst    : input logic<PRF_W>,
+
+    // ---- Integer PRF scalar read (combinational, at execute) ----------------
+    o_scalar_pdst: output logic<PRF_W>,
+    i_scalar_data: input  logic<64>   ,
+
+    // ---- VRF interface (combinational read, registered write) ---------------
+    o_vs1_addr: output logic<VRF_W>,
+    i_vs1_data: input  logic<VLEN> ,
+    o_vs2_addr: output logic<VRF_W>,
+    i_vs2_data: input  logic<VLEN> ,
+    o_vd_addr : output logic<VRF_W>,
+    o_vd_wen  : output logic       ,
+    o_vd_data : output logic<VLEN> ,
+
+    // ---- Non-speculative execution gate -------------------------------------
+    // The VRF is NOT renamed, so a wrong-path vector op's VRF write could not be
+    // rolled back. The VU therefore executes its head op only once that op is the
+    // ROB head (all older ops committed → it is non-speculative and cannot be
+    // squashed by an older mispredict; a younger mispredict flushes the FIFO
+    // before this op ever reaches the head). Correctness-first; throughput is a
+    // later-sub-phase concern (execute-driven per ReOVE).
+    i_rob_head_idx: input logic<ROB_IDX_W>,
+
+    // ---- CDB writeback grant + output (lowest priority on lane 0) -----------
+    i_cdb_free   : input  logic            , // scalar pipe idle this cycle
+    o_cdb_valid  : output logic            ,
+    o_cdb_has_rd : output logic            ,
+    o_cdb_pdst   : output logic<PRF_W>     ,
+    o_cdb_data   : output logic<64>        ,
+    o_cdb_rob_idx: output logic<ROB_IDX_W> ,
+    // vset*vl carries the new vtype/vl to the ROB shadow → CSR at commit.
+    o_cdb_vset_wen: output logic       ,
+    o_cdb_vtype   : output logic<64>   ,
+    o_cdb_vl      : output logic<64>   ,
+
+    // ---- Architectural vtype/vl restore on flush (committed values) ---------
+    i_csr_vtype: input logic<64>,
+    i_csr_vl   : input logic<64>,
+
+    // ---- Flush (commit-time redirect) ---------------------------------------
+    i_flush: input logic,
+) {
+    import vector_pkg::*;
+
+    // ---- In-order FIFO state ------------------------------------------------
+    var occupied   : logic                [FIFO_N];
+    var fifo_op    : vector_pkg::VecOp     [FIFO_N];
+    var fifo_instr : logic            <32> [FIFO_N];
+    var fifo_vd    : logic         <VRF_W> [FIFO_N];
+    var fifo_vs1   : logic         <VRF_W> [FIFO_N];
+    var fifo_vs2   : logic         <VRF_W> [FIFO_N];
+    var fifo_uses_s: logic                 [FIFO_N];
+    var fifo_s_pdst: logic         <PRF_W> [FIFO_N];
+    var fifo_s_rdy : logic                 [FIFO_N];
+    var fifo_has_rd: logic                 [FIFO_N];
+    var fifo_rd_pd : logic         <PRF_W> [FIFO_N];
+    var fifo_rob   : logic     <ROB_IDX_W> [FIFO_N];
+    var head       : logic         <FIFO_W>;
+    var count      : logic       <FIFO_W+1>; // 0..FIFO_N
+
+    // ---- Working vector config (architectural-as-executed; in-order) --------
+    var vtype_q: logic<64>;
+    var vl_q   : logic<64>;
+
+    // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
+    // its top bit is set (count == FIFO_N); otherwise a slot is free.
+    let has_free: logic = !count[FIFO_W];
+    assign o_alloc_rdy = has_free;
+
+    // ---- Head fields --------------------------------------------------------
+    let h_op    : vector_pkg::VecOp = fifo_op[head];
+    let h_instr : logic        <32> = fifo_instr[head];
+    let h_vd    : logic     <VRF_W> = fifo_vd[head];
+    let h_vs1   : logic     <VRF_W> = fifo_vs1[head];
+    let h_vs2   : logic     <VRF_W> = fifo_vs2[head];
+    let h_uses_s: logic             = fifo_uses_s[head];
+    let h_s_pdst: logic     <PRF_W> = fifo_s_pdst[head];
+    let h_s_rdy : logic             = fifo_s_rdy[head];
+    let h_has_rd: logic             = fifo_has_rd[head];
+    let h_rd_pd : logic     <PRF_W> = fifo_rd_pd[head];
+    let h_rob   : logic <ROB_IDX_W> = fifo_rob[head];
+
+    let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
+    let h_is_vadd: logic = (h_op == VecOp::VADD_VV) || (h_op == VecOp::VADD_VX) || (h_op == VecOp::VADD_VI);
+    let h_is_vmv : logic = h_op == VecOp::VMV_X_S;
+
+    // Current SEW / vl (8-bit element count; vl <= VLMAX <= 128).
+    let vsew: logic<3> = vtype_q[5:3];
+    let vl8 : logic<8> = vl_q[7:0];
+
+    // ---- vset*vl: requested vtype, VLMAX, AVL, granted vl -------------------
+    var vtype_req: logic<64>;
+    always_comb {
+        if h_op == VecOp::VSETIVLI {
+            vtype_req = {54'd0, h_instr[29:20]};
+        } else {
+            vtype_req = {53'd0, h_instr[30:20]};
+        }
+    }
+    let req_vsew : logic<3> = vtype_req[5:3];
+    let req_vlmul: logic<3> = vtype_req[2:0];
+    // Reserved configs → vill (SEW > 64 = ELEN, or LMUL encoding 100).
+    let vill: logic = (req_vsew >= 3'd4) || (req_vlmul == 3'd4);
+    // Elements per vector register at this SEW (16/8/4/2 for SEW 8/16/32/64).
+    let vlen_div_sew: logic<8> = 8'd16 >> req_vsew;
+    var vlmax: logic<8>;
+    always_comb {
+        if req_vlmul[2] == 1'b0 {
+            // integer LMUL: *1/*2/*4/*8
+            vlmax = vlen_div_sew << req_vlmul[1:0];
+        } else {
+            // fractional LMUL: /8, /4, /2 for vlmul 101/110/111
+            let fshift: logic<4> = 4'd8 - {1'b0, req_vlmul};
+            vlmax = vlen_div_sew >> fshift;
+        }
+    }
+    let vlmax64: logic<64> = {56'd0, vlmax};
+    // AVL: vsetivli uimm[19:15]; vsetvli x[rs1] (rs1==x0 → VLMAX, except keep-vl).
+    var avl: logic<64>;
+    always_comb {
+        if h_op == VecOp::VSETIVLI {
+            avl = {59'd0, h_instr[19:15]};
+        } else if h_vs1 == 5'd0 {
+            avl = vlmax64; // rs1==x0: request VLMAX (keep-vl handled in vl_new)
+        } else {
+            avl = i_scalar_data; // x[rs1]
+        }
+    }
+    let keep_vl: logic = (h_op == VecOp::VSETVLI) && (h_vs1 == 5'd0) && (h_vd == 5'd0);
+    var vl_new: logic<64>;
+    always_comb {
+        if vill {
+            vl_new = 64'd0;
+        } else if keep_vl {
+            vl_new = vl_q;
+        } else if avl >: vlmax64 {
+            vl_new = vlmax64;
+        } else {
+            vl_new = avl;
+        }
+    }
+    let vtype_new: logic<64> = if vill ? {1'b1, 63'd0} : {56'd0, vtype_req[7:0]};
+
+    // ---- vadd: per-SEW element add over VLEN (tail/inactive → 0) -------------
+    let bop64: logic<64> = if h_op == VecOp::VADD_VX ? i_scalar_data
+        : if h_op == VecOp::VADD_VI ? {h_instr[19] repeat 59, h_instr[19:15]} : 64'd0;
+    var vadd_res: logic<VLEN>;
+    always_comb {
+        vadd_res = {1'b0 repeat VLEN};
+        case vsew {
+            3'd0: {
+                for i in 0..16 {
+                    if (i as 8) <: vl8 {
+                        let bl: logic<8> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*8+:8] : bop64[7:0];
+                        let s : logic<8> = i_vs2_data[i*8+:8] + bl;
+                        vadd_res[i*8+:8] = s;
+                    }
+                }
+            }
+            3'd1: {
+                for i in 0..8 {
+                    if (i as 8) <: vl8 {
+                        let bl: logic<16> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*16+:16] : bop64[15:0];
+                        let s : logic<16> = i_vs2_data[i*16+:16] + bl;
+                        vadd_res[i*16+:16] = s;
+                    }
+                }
+            }
+            3'd2: {
+                for i in 0..4 {
+                    if (i as 8) <: vl8 {
+                        let bl: logic<32> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*32+:32] : bop64[31:0];
+                        let s : logic<32> = i_vs2_data[i*32+:32] + bl;
+                        vadd_res[i*32+:32] = s;
+                    }
+                }
+            }
+            default: {
+                for i in 0..2 {
+                    if (i as 8) <: vl8 {
+                        let bl: logic<64> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*64+:64] : bop64;
+                        let s : logic<64> = i_vs2_data[i*64+:64] + bl;
+                        vadd_res[i*64+:64] = s;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- vmv.x.s: x[rd] = sign-extend(vs2[element 0], SEW) ------------------
+    var vmv_res: logic<64>;
+    always_comb {
+        case vsew {
+            3'd0   : vmv_res = {i_vs2_data[7] repeat 56, i_vs2_data[7:0]};
+            3'd1   : vmv_res = {i_vs2_data[15] repeat 48, i_vs2_data[15:0]};
+            3'd2   : vmv_res = {i_vs2_data[31] repeat 32, i_vs2_data[31:0]};
+            default: vmv_res = i_vs2_data[63:0];
+        }
+    }
+
+    // ---- Execute the head (combinational) -----------------------------------
+    let scalar_ok: logic = !h_uses_s || h_s_rdy;
+    let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
+    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush;
+
+    let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
+
+    assign o_scalar_pdst = h_s_pdst;
+    assign o_vs1_addr    = h_vs1;
+    assign o_vs2_addr    = h_vs2;
+    assign o_vd_addr     = h_vd;
+    assign o_vd_wen      = fire && h_is_vadd;
+    assign o_vd_data     = vadd_res;
+
+    assign o_cdb_valid    = fire;
+    assign o_cdb_has_rd   = fire && h_has_rd; // vadd has_rd=0; vset/vmv carry int rd
+    assign o_cdb_pdst     = h_rd_pd;
+    assign o_cdb_data     = h_cdb_data;
+    assign o_cdb_rob_idx  = h_rob;
+    assign o_cdb_vset_wen = fire && h_is_vset;
+    assign o_cdb_vtype    = vtype_new;
+    assign o_cdb_vl       = vl_new;
+
+    // ---- FIFO maintenance + config update -----------------------------------
+    let do_alloc: logic = i_alloc_en && has_free;
+    let tail    : logic<FIFO_W> = head + count[FIFO_W-1:0];
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..FIFO_N {
+                occupied[i]    = 1'b0;
+                fifo_op[i]     = vector_pkg::VecOp::NONE;
+                fifo_instr[i]  = 32'd0;
+                fifo_vd[i]     = 5'd0;
+                fifo_vs1[i]    = 5'd0;
+                fifo_vs2[i]    = 5'd0;
+                fifo_uses_s[i] = 1'b0;
+                fifo_s_pdst[i] = 6'd0;
+                fifo_s_rdy[i]  = 1'b0;
+                fifo_has_rd[i] = 1'b0;
+                fifo_rd_pd[i]  = 6'd0;
+                fifo_rob[i]    = 5'd0;
+            }
+            head    = 0;
+            count   = 0;
+            vtype_q = 64'd0;
+            vl_q    = 64'd0;
+        } else if i_flush {
+            // Drop all speculative vector ops; restore config from the committed
+            // (architectural) vtype/vl held in the CSR file.
+            for i in 0..FIFO_N {
+                occupied[i] = 1'b0;
+            }
+            head    = 0;
+            count   = 0;
+            vtype_q = i_csr_vtype;
+            vl_q    = i_csr_vl;
+        } else {
+            // Scalar-operand wakeup (int CDB snoop, both lanes).
+            for i in 0..FIFO_N {
+                if occupied[i] && fifo_uses_s[i] && !fifo_s_rdy[i] {
+                    if (i_cdb_int_valid && fifo_s_pdst[i] == i_cdb_int_pdst)
+                        || (i_cdb2_valid && i_cdb2_has_rd && fifo_s_pdst[i] == i_cdb2_pdst) {
+                        fifo_s_rdy[i] = 1'b1;
+                    }
+                }
+            }
+            // Issue/complete the head.
+            if fire {
+                occupied[head] = 1'b0;
+                if h_is_vset {
+                    vtype_q = vtype_new;
+                    vl_q    = vl_new;
+                }
+            }
+            // Allocate at the tail.
+            if do_alloc {
+                occupied[tail]    = 1'b1;
+                fifo_op[tail]     = i_alloc_vec_op;
+                fifo_instr[tail]  = i_alloc_instr;
+                fifo_vd[tail]     = i_alloc_vd;
+                fifo_vs1[tail]    = i_alloc_vs1;
+                fifo_vs2[tail]    = i_alloc_vs2;
+                fifo_uses_s[tail] = i_alloc_uses_scalar;
+                fifo_s_pdst[tail] = i_alloc_scalar_pdst;
+                fifo_has_rd[tail] = i_alloc_has_rd;
+                fifo_rd_pd[tail]  = i_alloc_rd_pdst;
+                fifo_rob[tail]    = i_alloc_rob_idx;
+                // Initial scalar readiness: core-supplied, or same-cycle int CDB.
+                fifo_s_rdy[tail] = (!i_alloc_uses_scalar) || i_alloc_scalar_ready
+                    || (i_cdb_int_valid && i_cdb_int_pdst == i_alloc_scalar_pdst)
+                    || (i_cdb2_valid && i_cdb2_has_rd && i_cdb2_pdst == i_alloc_scalar_pdst);
+            }
+            // Head/count update (pop + push are independent slots).
+            if fire && !do_alloc {
+                head  = head + 1;
+                count = count - 1;
+            } else if !fire && do_alloc {
+                count = count + 1;
+            } else if fire && do_alloc {
+                head = head + 1; // count unchanged
+            }
+        }
+    }
+}

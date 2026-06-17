@@ -84,6 +84,9 @@ pub module csr #(
     o_mstatus_tvm : output logic   , // Trap Virtual Memory (satp/sfence.vma in S-mode)
     o_mstatus_tsr : output logic   , // Trap SRET (sret in S-mode)
     o_mstatus_fs  : output logic<2>, // FP unit state (00=Off → FP traps illegal)
+    // Phase 12 V0: mstatus.VS (bits 10:9) — vector unit state (00=Off → vector
+    // instructions trap illegal). Same encoding/role as FS for the V extension.
+    o_mstatus_vs  : output logic<2>,
     o_menvcfg_pbmte: output logic  , // P10 Svpbmt: menvcfg.PBMTE (bit 62)
     o_menvcfg_adue : output logic  , // P10 Svadu: menvcfg.ADUE (bit 61, HW A/D update)
     // Phase 11-H: virtualization state for two-stage MMU translation. o_virt is
@@ -170,6 +173,16 @@ pub module csr #(
     i_fflags_set: input  logic   ,
     i_fflags    : input  logic<5>,
 
+    // Phase 12 V0: Vector CSR config. The VU computes the granted vl + the new
+    // vtype for a vset*vl op; at that op's commit the core pulses i_vset_wr and
+    // the architectural vl/vtype update here (and vstart clears). o_vtype/o_vl
+    // feed back to the VU so it can restore its working config on a flush.
+    i_vset_wr  : input  logic    ,
+    i_set_vtype: input  logic<64>,
+    i_set_vl   : input  logic<64>,
+    o_vtype    : output logic<64>,
+    o_vl       : output logic<64>,
+
     // P10 Zihpm: per-cycle event bus. Each mhpmcounter selects one of these via
     // its mhpmevent[3:0] (1..8 → bit 0..7; 0 = counter frozen). Event meaning:
     //   1 branch-mispredict  2 redirect       3 front-end-idle  4 dispatch-stall
@@ -180,6 +193,15 @@ pub module csr #(
     const ADDR_FFLAGS  : logic<12> = 12'h001;
     const ADDR_FRM     : logic<12> = 12'h002;
     const ADDR_FCSR    : logic<12> = 12'h003;
+    // Phase 12 V0: Vector CSRs. vstart/vxsat/vxrm/vcsr are RW; vl/vtype/vlenb are
+    // read-only (vl/vtype written by vset*vl; vlenb is a constant = VLEN/8).
+    const ADDR_VSTART  : logic<12> = 12'h008;
+    const ADDR_VXSAT   : logic<12> = 12'h009;
+    const ADDR_VXRM    : logic<12> = 12'h00A;
+    const ADDR_VCSR    : logic<12> = 12'h00F;
+    const ADDR_VL      : logic<12> = 12'hC20;
+    const ADDR_VTYPE   : logic<12> = 12'hC21;
+    const ADDR_VLENB   : logic<12> = 12'hC22;
     const ADDR_MHARTID : logic<12> = 12'hF14;
     const ADDR_MSTATUS : logic<12> = 12'h300;
     const ADDR_MISA    : logic<12> = 12'h301;
@@ -299,6 +321,13 @@ pub module csr #(
     var minstret: logic<64>;
     // M6: fcsr — bits [7:5] = frm (rounding mode), [4:0] = fflags (NV DZ OF UF NX)
     var fcsr: logic<64>;
+    // Phase 12 V0: Vector CSR storage. vlenb is a constant (VLEN/8 = 16 B).
+    var vstart: logic<64>;
+    var vxsat : logic<64>; // bit 0
+    var vxrm  : logic<64>; // bits 1:0
+    var vl    : logic<64>;
+    var vtype : logic<64>;
+    const VLENB_CONST: logic<64> = vector_pkg::VLENB as 64;
     // M5.D S-mode independent CSRs (sstatus/sie/sip are views of mstatus/mie/mip)
     var stvec     : logic<64>;
     var sscratch  : logic<64>;
@@ -433,6 +462,14 @@ pub module csr #(
             ADDR_FFLAGS    : rd_data_w = {59'd0, fcsr[4:0]};
             ADDR_FRM       : rd_data_w = {61'd0, fcsr[7:5]};
             ADDR_FCSR      : rd_data_w = {56'd0, fcsr[7:0]};
+            // Phase 12 V0: Vector CSRs.
+            ADDR_VSTART    : rd_data_w = vstart;
+            ADDR_VXSAT     : rd_data_w = {63'd0, vxsat[0]};
+            ADDR_VXRM      : rd_data_w = {62'd0, vxrm[1:0]};
+            ADDR_VCSR      : rd_data_w = {61'd0, vxrm[1:0], vxsat[0]};
+            ADDR_VL        : rd_data_w = vl;
+            ADDR_VTYPE     : rd_data_w = vtype;
+            ADDR_VLENB     : rd_data_w = VLENB_CONST;
             ADDR_MHARTID   : rd_data_w = {56'd0, HART_ID};
             ADDR_MSTATUS   : rd_data_w = mstatus | MSTATUS_XL_RO;
             // RV64 MXL=2 in [63:62]; extensions: A=bit 0, H=bit 7, I=bit 8,
@@ -702,6 +739,10 @@ pub module csr #(
     assign o_mstatus_tsr  = mstatus[22];
     assign o_mstatus_fs   = mstatus[14:13];
     assign o_frm          = fcsr[7:5];
+    // Phase 12 V0: vector state + config feedback.
+    assign o_mstatus_vs   = mstatus[10:9];
+    assign o_vtype        = vtype;
+    assign o_vl           = vl;
 
     // === Registered writes + trap entry + counters ===
     always_ff (clk, rst) {
@@ -737,6 +778,12 @@ pub module csr #(
             mcycle     = 64'd0;
             minstret   = 64'd0;
             fcsr       = 64'd0;
+            // Phase 12 V0: vector CSRs reset to 0 (vl=0, vtype=0 → SEW8/LMUL1).
+            vstart     = 64'd0;
+            vxsat      = 64'd0;
+            vxrm       = 64'd0;
+            vl         = 64'd0;
+            vtype      = 64'd0;
             stvec      = 64'd0;
             sscratch   = 64'd0;
             sepc       = 64'd0;
@@ -936,6 +983,14 @@ pub module csr #(
                     ADDR_FFLAGS    : fcsr[4:0] = i_wr_data[4:0];
                     ADDR_FRM       : fcsr[7:5] = i_wr_data[2:0];
                     ADDR_FCSR      : fcsr[7:0] = i_wr_data[7:0];
+                    // Phase 12 V0: vector RW CSRs (vl/vtype/vlenb are read-only).
+                    ADDR_VSTART    : vstart = i_wr_data;
+                    ADDR_VXSAT     : vxsat  = {63'd0, i_wr_data[0]};
+                    ADDR_VXRM      : vxrm   = {62'd0, i_wr_data[1:0]};
+                    ADDR_VCSR      : {
+                        vxsat = {63'd0, i_wr_data[0]};
+                        vxrm  = {62'd0, i_wr_data[2:1]};
+                    }
                     ADDR_MSTATUS   : mstatus  = i_wr_data;
                     ADDR_MEDELEG   : medeleg  = i_wr_data;
                     ADDR_MIDELEG   : mideleg  = i_wr_data | MIDELEG_RO1; // bits 2/6/10 RO-1
@@ -1026,6 +1081,14 @@ pub module csr #(
             if i_fflags_set {
                 fcsr[4:0]      = fcsr[4:0] | i_fflags;
                 mstatus[14:13] = 2'b11; // FS = Dirty
+            }
+            // Phase 12 V0: commit of a vset*vl op updates the architectural vl /
+            // vtype and clears vstart (1-wide commit makes this mutually exclusive
+            // with the CSR-write / trap / mret / sret cases above).
+            if i_vset_wr {
+                vtype  = i_set_vtype;
+                vl     = i_set_vl;
+                vstart = 64'd0;
             }
             // Free-running counters. Per RISC-V priv spec, a CSR write
             // to minstret/mcycle suppresses the increment that the
