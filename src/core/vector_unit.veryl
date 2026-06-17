@@ -56,13 +56,18 @@ pub module vector_unit #(
     i_scalar_data: input  logic<64>   ,
 
     // ---- VRF interface (combinational read, registered write) ---------------
-    o_vs1_addr: output logic<VRF_W>,
-    i_vs1_data: input  logic<VLEN> ,
-    o_vs2_addr: output logic<VRF_W>,
-    i_vs2_data: input  logic<VLEN> ,
-    o_vd_addr : output logic<VRF_W>,
-    o_vd_wen  : output logic       ,
-    o_vd_data : output logic<VLEN> ,
+    // Four read ports: vs1, vs2, mask (always v0), old-vd (for vta/vma merge).
+    o_vs1_addr  : output logic<VRF_W>,
+    i_vs1_data  : input  logic<VLEN> ,
+    o_vs2_addr  : output logic<VRF_W>,
+    i_vs2_data  : input  logic<VLEN> ,
+    o_mask_addr : output logic<VRF_W>,
+    i_mask_data : input  logic<VLEN> ,
+    o_vdold_addr: output logic<VRF_W>,
+    i_vdold_data: input  logic<VLEN> ,
+    o_vd_addr   : output logic<VRF_W>,
+    o_vd_wen    : output logic       ,
+    o_vd_data   : output logic<VLEN> ,
 
     // ---- Non-speculative execution gate -------------------------------------
     // The VRF is NOT renamed, so a wrong-path vector op's VRF write could not be
@@ -132,6 +137,35 @@ pub module vector_unit #(
 ) {
     import vector_pkg::*;
 
+    // ---- Per-element integer ALU (V2a), parameterized by element width W ----
+    // a = vs2[i]; b = the second operand (vs1[i] / x[rs1] / sign-extended imm5),
+    // already truncated to W; op = funct6 (inst[31:26]). Shift amount masks b to
+    // log2(W) bits (W is a power of two, so W-1 is the mask).
+    function valu::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        let sh   : logic<W> = b & (W - 1);
+        let sra_r: logic<W> = $signed(a) >>> sh; // arithmetic right shift (signed)
+        return case op {
+            6'b000000: a + b,                                // vadd
+            6'b000010: a - b,                                // vsub
+            6'b000011: b - a,                                // vrsub
+            6'b000100: if a <: b ? a : b,                    // vminu
+            6'b000101: if $signed(a) <: $signed(b) ? a : b,  // vmin
+            6'b000110: if a <: b ? b : a,                    // vmaxu
+            6'b000111: if $signed(a) <: $signed(b) ? b : a,  // vmax
+            6'b001001: a & b,                                // vand
+            6'b001010: a | b,                                // vor
+            6'b001011: a ^ b,                                // vxor
+            6'b100101: a << sh,                              // vsll
+            6'b101000: a >> sh,                              // vsrl
+            6'b101001: sra_r,                                // vsra
+            default  : a,
+        };
+    }
+
     // ---- In-order FIFO state ------------------------------------------------
     var occupied   : logic                [FIFO_N];
     var fifo_op    : vector_pkg::VecOp     [FIFO_N];
@@ -184,8 +218,15 @@ pub module vector_unit #(
     let h_rob   : logic <ROB_IDX_W> = fifo_rob[head];
 
     let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
-    let h_is_vadd: logic = (h_op == VecOp::VADD_VV) || (h_op == VecOp::VADD_VX) || (h_op == VecOp::VADD_VI);
+    let h_is_valu: logic = h_op == VecOp::VALU;
     let h_is_vmv : logic = h_op == VecOp::VMV_X_S;
+    // OPIVx operand mode + op: funct3 (inst[14:12]) = VV(000)/VX(100)/VI(011);
+    // funct6 (inst[31:26]) selects the integer ALU op. vm (inst[25]) = unmasked.
+    let h_funct3 : logic<3> = h_instr[14:12];
+    let h_funct6 : logic<6> = h_instr[31:26];
+    let h_is_vv  : logic    = h_funct3 == 3'b000;
+    let h_is_vx  : logic    = h_funct3 == 3'b100;
+    let h_alu_vm : logic    = h_instr[25];
     // V1 unit-stride memory ops.
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
@@ -252,46 +293,49 @@ pub module vector_unit #(
     }
     let vtype_new: logic<64> = if vill ? {1'b1, 63'd0} : {56'd0, vtype_req[7:0]};
 
-    // ---- vadd: per-SEW element add over VLEN (tail/inactive → 0) -------------
-    let bop64: logic<64> = if h_op == VecOp::VADD_VX ? i_scalar_data
-        : if h_op == VecOp::VADD_VI ? {h_instr[19] repeat 59, h_instr[19:15]} : 64'd0;
-    var vadd_res: logic<VLEN>;
+    // ---- Integer ALU (OPIVV/VX/VI): per-SEW element compute over VLEN -------
+    // a = vs2[i]; second operand b = vs1[i] (VV) / x[rs1] (VX) / sign-extended
+    // imm5 (VI). Active = (i < vl) && (vm || v0[i]); inactive and tail elements
+    // keep the old vd value (undisturbed — a spec-compliant choice for the
+    // agnostic policies too, refined for explicit 1s-fill later if needed).
+    let bbcast: logic<64> = if h_is_vx ? i_scalar_data : {h_instr[19] repeat 59, h_instr[19:15]};
+    var valu_res: logic<VLEN>;
     always_comb {
-        vadd_res = {1'b0 repeat VLEN};
+        valu_res = i_vdold_data; // default: inactive/tail = undisturbed
         case vsew {
             3'd0: {
                 for i in 0..16 {
-                    if (i as 8) <: vl8 {
-                        let bl: logic<8> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*8+:8] : bop64[7:0];
-                        let s : logic<8> = i_vs2_data[i*8+:8] + bl;
-                        vadd_res[i*8+:8] = s;
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
+                        let a: logic<8> = i_vs2_data[i*8+:8];
+                        let b: logic<8> = if h_is_vv ? i_vs1_data[i*8+:8] : bbcast[7:0];
+                        valu_res[i*8+:8] = valu::<8>(a, b, h_funct6);
                     }
                 }
             }
             3'd1: {
                 for i in 0..8 {
-                    if (i as 8) <: vl8 {
-                        let bl: logic<16> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*16+:16] : bop64[15:0];
-                        let s : logic<16> = i_vs2_data[i*16+:16] + bl;
-                        vadd_res[i*16+:16] = s;
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
+                        let a: logic<16> = i_vs2_data[i*16+:16];
+                        let b: logic<16> = if h_is_vv ? i_vs1_data[i*16+:16] : bbcast[15:0];
+                        valu_res[i*16+:16] = valu::<16>(a, b, h_funct6);
                     }
                 }
             }
             3'd2: {
                 for i in 0..4 {
-                    if (i as 8) <: vl8 {
-                        let bl: logic<32> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*32+:32] : bop64[31:0];
-                        let s : logic<32> = i_vs2_data[i*32+:32] + bl;
-                        vadd_res[i*32+:32] = s;
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
+                        let a: logic<32> = i_vs2_data[i*32+:32];
+                        let b: logic<32> = if h_is_vv ? i_vs1_data[i*32+:32] : bbcast[31:0];
+                        valu_res[i*32+:32] = valu::<32>(a, b, h_funct6);
                     }
                 }
             }
             default: {
                 for i in 0..2 {
-                    if (i as 8) <: vl8 {
-                        let bl: logic<64> = if h_op == VecOp::VADD_VV ? i_vs1_data[i*64+:64] : bop64;
-                        let s : logic<64> = i_vs2_data[i*64+:64] + bl;
-                        vadd_res[i*64+:64] = s;
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
+                        let a: logic<64> = i_vs2_data[i*64+:64];
+                        let b: logic<64> = if h_is_vv ? i_vs1_data[i*64+:64] : bbcast;
+                        valu_res[i*64+:64] = valu::<64>(a, b, h_funct6);
                     }
                 }
             }
@@ -314,7 +358,7 @@ pub module vector_unit #(
     // base = x[rs1] (scalar), mask = v0 (read on the vs1 port with addr 0),
     // store data = vs3 = vd field (read on the vs2 port).
     let m_base : logic<64>   = i_scalar_data;
-    let m_mask : logic<VLEN> = i_vs1_data;
+    let m_mask : logic<VLEN> = i_mask_data;
     let m_vs3  : logic<VLEN> = i_vs2_data;
     let m_vl8  : logic<8>    = vl_q[7:0];
     let eew_mask: logic<64> = case h_eew_log {
@@ -362,11 +406,13 @@ pub module vector_unit #(
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
 
     assign o_scalar_pdst = h_s_pdst;
-    assign o_vs1_addr    = if h_is_mem ? 5'd0 : h_vs1; // v0 mask for mem ops
-    assign o_vs2_addr    = if h_is_mem ? h_vd : h_vs2; // vs3 store data for mem ops
+    assign o_vs1_addr    = h_vs1;                      // VV source 1 (unused for mem)
+    assign o_vs2_addr    = if h_is_mem ? h_vd : h_vs2; // vs3 store data (mem) / source 2 (arith)
+    assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem)
+    assign o_vdold_addr  = h_vd;                       // old dest (vta/vma merge)
     assign o_vd_addr     = h_vd;
-    assign o_vd_wen      = (fire && h_is_vadd) || (mem_cdb_fire && h_is_vle && !fault_q);
-    assign o_vd_data     = if h_is_mem ? vacc : vadd_res;
+    assign o_vd_wen      = (fire && h_is_valu) || (mem_cdb_fire && h_is_vle && !fault_q);
+    assign o_vd_data     = if h_is_mem ? vacc : valu_res;
 
     assign o_cdb_valid    = fire || mem_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
