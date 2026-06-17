@@ -3,20 +3,29 @@
 RV64GC RISC-V processor core written in [Veryl](https://veryl-lang.org/). It is a
 from-scratch out-of-order design (Tomasulo with a physical register file) that
 boots mainline Linux (5.15, the 6.6 LTS, and 7.1) SMP kernels through OpenSBI to
-SBI shutdown.
+SBI shutdown, and runs a full **guest Linux** under a bare-metal **type-1
+hypervisor** using the RISC-V **hypervisor (H) extension**.
 
 ## Status
 
 The core is a 2-wide superscalar, PRF-based out-of-order machine with in-order
 (up to 2-wide) commit. It implements **RV64GC** plus the **RVA23** ISA extensions
-(excluding the vector and hypervisor families) at all three privilege levels
-(M/S/U) with Sv39 virtual memory, branch prediction, non-blocking write-back
-private L1 caches kept coherent through a shared L2 with an inclusive MESI
-directory, and 1/2/4/8-hart SMP. Stock Linux reaches SBI SRST shutdown on every
-hart count: the 5.15 baseline on 1/2/4/8, plus the **6.6 LTS** and **7.1** kernels
-on 1/2/4 — the latter two discover and exercise the RVA23 extensions from the
-device tree (Sstc, Svpbmt, Svnapot, Svadu, Svinval, Zawrs, Zicbom/Zicboz, Zbb, …)
-and run **userspace floating point** across SMP context switches.
+(excluding only the vector family) at all four privilege levels
+(M / HS / VS / VU) with Sv39 virtual memory, branch prediction, non-blocking
+write-back private L1 caches kept coherent through a shared L2 with an inclusive
+MESI directory, and 1/2/4/8-hart SMP. Stock Linux reaches SBI SRST shutdown on
+every hart count: the 5.15 baseline on 1/2/4/8, plus the **6.6 LTS** and **7.1**
+kernels on 1/2/4 — the latter two discover and exercise the RVA23 extensions from
+the device tree (Sstc, Svpbmt, Svnapot, Svadu, Svinval, Zawrs, Zicbom/Zicboz,
+Zbb, …) and run **userspace floating point** across SMP context switches.
+
+The **hypervisor (H) extension** (`misa.H`) adds the virtualized HS/VS/VU modes
+with **two-stage address translation** (guest VS-stage Sv39 nested through a
+host G-stage Sv39x4, VMID/ASID-tagged TLB), the `HLV`/`HLVX`/`HSV` hypervisor
+memory accesses, guest-page-fault reporting (`htval`/`mtval2`), virtual-interrupt
+delivery, and **Sstc-in-VS** guest timers. A small self-written type-1 hypervisor
+uses it to boot an unmodified guest Linux all the way to its own userspace and
+SBI shutdown.
 
 ## Architecture
 
@@ -47,7 +56,7 @@ and run **userspace floating point** across SMP context switches.
 - **ISA**: **RV64GC** base (RV64IMAFDC_Zicsr_Zifencei) — M (mul/div), A (LR/SC +
   AMO), F/D (single + double FP), C (compressed, incl. compressed FP load/store,
   expanded in fetch by `c_expander`) — extended to the **RVA23 application /
-  supervisor profile** (the vector V and hypervisor H families excluded):
+  supervisor profile** (only the vector V family excluded):
   - Bit-manipulation **Zba/Zbb/Zbs**; data-independent-latency **Zkt**
   - **Zfa** (additional FP) and **Zfhmin** (minimal half-precision: binary16
     conversions + load/store/move)
@@ -63,6 +72,16 @@ and run **userspace floating point** across SMP context switches.
   and both **Svade** (A/D page-fault) and **Svadu** (hardware A/D update via
   `menvcfg.ADUE`). Supervisor extensions: **Sstc** (`stimecmp`) and **Sscofpmf**
   (HPM count-overflow interrupt + mode-based filtering)
+- **Hypervisor (H) extension** (`src/mmu/`, `src/core/csr.veryl`): the
+  virtualized **HS / VS / VU** modes and the `V` state bit on top of M/S/U. Full
+  HS/VS CSR set; **two-stage translation** — a guest VS-stage Sv39 walk nested
+  through a host G-stage Sv39x4, cached in a combined VMID + VS-ASID-tagged TLB;
+  `HLV`/`HLVX`/`HSV` hypervisor virtual-memory accesses with their mode-traps;
+  the guest-page-fault trio (instruction 20 / load 21 / store 23) with
+  `htval`/`htinst` (HS) and `mtval2`/`mtinst` (M); virtual-interrupt delivery
+  (`hvip` into VS, plus non-delegated VS interrupts taken by HS); `htimedelta`
+  and **Sstc-in-VS** (`vstimecmp`) guest timers; `hstatus.VTVM`/`VTSR` guest-op
+  interception and VS-mode CSR isolation; `HFENCE.VVMA`/`GVMA`
 - **Caches** (`src/cache/`)
   - L1 I-cache: 16 KB, 4-way, 64 B line, tree-PLRU, non-blocking
     (hit-under-fill, streaming), single-cycle assembly of instructions
@@ -99,19 +118,25 @@ and run **userspace floating point** across SMP context switches.
 
 | Suite                                                                       | Result |
 |-----------------------------------------------------------------------------|--------|
-| Default `veryl test` (unit + inline arch suites + Phase-10 directed tests + N=2 litmus, on the OoO core) | 213 passed, 0 failed (27 ignored) |
+| Default `veryl test` (unit + inline arch suites + Phase-10/11 directed tests + N=2 litmus, on the OoO core) | 230 passed, 0 failed (28 ignored) |
 | Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~10.2 / 13.9 / 20.0 / 26.9M cycles) |
 | Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~18.6 / 25.5 / 33.6M cycles) |
 | Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~16.8 / 19.2 / 23.6M cycles) |
+| **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (~21.4M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
 (integer + privileged) and rv64uf / ud (FP), hand-maintained in
 `tb/test_arch_common.veryl` and `tb/test_arch_fp.veryl`; they are not `#[ignore]`,
-so they run as part of the default `veryl test`. The Linux boots are `#[ignore]`d
-(run them by name, e.g. `--test test_soc_smp_linux_boot_71_2hart`); the 7.1 kernel
-is built with `CONFIG_FPU=y`, so its boot drives the FP unit through real kernel
-context switches. The boot is additionally cross-checked on Verilator and a second
-codegen backend (cc / cranelift) — see `CLAUDE.md`.
+so they run as part of the default `veryl test`. The default run also includes the
+Phase-11 hypervisor directed tests (two-stage walk, guest-page-faults, HLV/HSV
+and their mode-traps, Sstc-in-VS, VS-mode CSR isolation, `VTVM`/`VTSR`,
+non-delegated VS interrupts, `mtval2`, and an end-to-end mini-hypervisor). The
+Linux boots are `#[ignore]`d (run them by name, e.g.
+`--test test_soc_smp_linux_boot_71_2hart`, or `--test test_soc_hvlinux` for the
+guest boot); the 7.1 kernel is built with `CONFIG_FPU=y`, so its boot drives the
+FP unit through real kernel context switches. The boot is additionally
+cross-checked on Verilator and a second codegen backend (cc / cranelift) — see
+`CLAUDE.md`.
 
 ## Microbenchmarks
 
@@ -184,7 +209,7 @@ steps, Verilator cross-check).
 ## Development Phases
 
 Development history — the **Architecture** section above describes the design
-as of Phase 10:
+as of Phase 11:
 
 | Phase | Scope                                    | Status       |
 |-------|------------------------------------------|--------------|
@@ -198,3 +223,4 @@ as of Phase 10:
 | 8     | Microarchitecture build-out on the Phase 7 core: 2-wide superscalar (fetch / rename / issue / commit), branch prediction (BTB + gshare + TAGE-lite + indirect BTB + RAS, execute-time early redirect), non-blocking L1s (MSHRs, hit-under-miss, critical-word-first), memory-dependence speculation + replay, committed-store buffer with line write-combining and store-to-load forwarding, split read/write bus channels — 1-hart boot 26M → 8.6M cycles, 4-hart 52M → 16M | complete |
 | 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller + line-granular L2 (P9.1), write-back D$ + MESI inclusive directory (P9.2), cache-to-cache transfer + in-cache AMO/LR-SC (P9.3), N=8 SMP boot (P9.4), PLIC wiring + uncached MMIO + TLB ASID + selective SFENCE.VMA (P9.5), coherent instruction side — I-cache + I-PTW through L2, FENCE.I/SFENCE flush sweep retired (P9.6) | complete |
 | 10    | RVA23-profile ISA extensions (vector V / hypervisor H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, hint bundle (Zihintpause/Zihintntl/Zicbop/Zimop/Zcmop), Zcb, system bundle (Zawrs/Svinval/Zkt), MMU bundle (Svnapot/Svpbmt/Svadu), Zfhmin, Sscofpmf, Supm/Ssnpm. Validated on real mainline kernels: upgraded the boot from 5.15 to the 6.6 LTS and 7.1, which discover the extensions from the device tree and exercise them (Sstc timer, Svpbmt ioremap, Zicboz clear_page, Zbb, hardware unaligned). Enabling userspace FP on 7.1 exposed and fixed two SMP-only RTL bugs — an FP-context-switch wedge (MSHR int-load completion misclassified FP-dest on the CDB mux) and missing compressed FP load/store (C.FLD/C.FSD/C.FLDSP/C.FSDSP) | complete |
+| 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation with a VMID/VS-ASID-tagged TLB, HLV/HLVX/HSV (+ mode-traps), the guest-page-fault trio (20/21/23) with htval/mtval2, virtual-interrupt delivery (hvip into VS + non-delegated VS interrupts taken by HS), htimedelta + Sstc-in-VS guest timers, hstatus.VTVM/VTSR guest-op interception, VS-mode CSR isolation, and the mideleg/hedeleg read-only conformance bits. Brought up incrementally against per-feature directed tests, then validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (cross-checked on the Veryl sim and Verilator). The vector V family is deferred to a later phase | complete |
