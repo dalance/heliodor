@@ -89,6 +89,44 @@ pub module vector_unit #(
     i_csr_vtype: input logic<64>,
     i_csr_vl   : input logic<64>,
 
+    // ---- V1: unit-stride vector memory port ---------------------------------
+    // The VU drives the shared dmem port (highest priority) when a vector
+    // load/store is at the ROB head and the scalar memory path is quiescent
+    // (i_mem_idle). It streams one element per access; the element address is
+    // base + i*EEW/8. Loads accumulate into the VRF dest; stores read vs3.
+    // A faulting element rides vu_cdb's is_lfault/is_sfault and sets vstart.
+    o_mem_port_req: output logic       , // VU holds the port (block scalar load issue)
+    o_mem_active  : output logic       , // drive the dmem port THIS cycle
+    o_mem_vaddr   : output logic<64>   ,
+    o_mem_is_load : output logic       ,
+    o_mem_is_store: output logic       ,
+    o_mem_funct3  : output logic<3>    , // dcache size: 000/001/010/011 = 1/2/4/8 B
+    o_mem_wdata   : output logic<64>   , // store data, positioned at vaddr[2:0]
+    o_mem_wstrb   : output logic<8>    , // store byte strobe, positioned
+    i_mem_idle    : input  logic       , // scalar mem path quiescent (sb empty, no walk/busy)
+    i_mem_ready   : input  logic       , // current element's access completes this cycle
+    i_mem_rdata   : input  logic<64>   , // load dword (dcache_rdata)
+    i_mem_fault   : input  logic       , // load page/access fault
+    i_mem_fault_st: input  logic       , // store page/access fault
+    // vstart resume element. V1 always restarts a faulting unit-stride op from
+    // element 0 (idempotent), so this is currently informational only.
+    i_csr_vstart  : input  logic<64>   ,
+    // ---- Memory fault + vstart, carried on the vu_cdb writeback -------------
+    // A faulting element rides the (lowest-priority lane-0) vu_cdb just like a
+    // scalar load/store fault: the ROB records is_lfault/is_sfault + fault_vaddr
+    // and the commit stage raises cause 13/15. o_cdb_vstart_wen pulses on every
+    // retiring vector mem op to set vstart (= faulting element, else 0).
+    o_cdb_is_lfault : output logic     ,
+    o_cdb_is_sfault : output logic     ,
+    o_cdb_fault_vaddr: output logic<64>,
+    o_cdb_vstart_wen: output logic     ,
+    o_cdb_vstart    : output logic<64> ,
+    // o_cdb_vstore marks a retiring (non-faulting) vector STORE so the ROB can
+    // force a commit-time redirect: it overwrote cache lines that younger
+    // speculative loads may have already read, so they must be squashed and
+    // re-fetched (Rule B vector-store / younger-load memory ordering).
+    o_cdb_vstore    : output logic     ,
+
     // ---- Flush (commit-time redirect) ---------------------------------------
     i_flush: input logic,
 ) {
@@ -114,6 +152,19 @@ pub module vector_unit #(
     var vtype_q: logic<64>;
     var vl_q   : logic<64>;
 
+    // ---- V1 unit-stride memory FSM ------------------------------------------
+    // States: 0=IDLE, 1=ARM (own the dmem port, drain the scalar mem path),
+    // 2=ACCESS (stream one element per access), 3=DONE (drive vu_cdb + retire).
+    // The head FIFO fields stay stable for the whole op (it is not popped until
+    // DONE), so EEW/vm/base/mask/vs3 are read combinationally — only the
+    // streaming state (element index, load accumulator, fault) is registered.
+    var mem_state : logic<2> ;
+    var velem     : logic<8> ; // current element index (0 .. vl)
+    var vacc      : logic<VLEN>; // load accumulator (tail / masked-off stay 0)
+    var fault_q   : logic    ; // the op faulted at vstart_q
+    var fault_va_q: logic<64>;
+    var vstart_q  : logic<8> ;
+
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
     let has_free: logic = !count[FIFO_W];
@@ -135,6 +186,14 @@ pub module vector_unit #(
     let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
     let h_is_vadd: logic = (h_op == VecOp::VADD_VV) || (h_op == VecOp::VADD_VX) || (h_op == VecOp::VADD_VI);
     let h_is_vmv : logic = h_op == VecOp::VMV_X_S;
+    // V1 unit-stride memory ops.
+    let h_is_vle: logic = h_op == VecOp::VLE;
+    let h_is_vse: logic = h_op == VecOp::VSE;
+    let h_is_mem: logic = h_is_vle || h_is_vse;
+    // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
+    // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
+    let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
+    let h_vm     : logic    = h_instr[25];
 
     // Current SEW / vl (8-bit element count; vl <= VLMAX <= 128).
     let vsew: logic<3> = vtype_q[5:3];
@@ -250,28 +309,91 @@ pub module vector_unit #(
         }
     }
 
+    // ---- V1 unit-stride memory: addressing + element packing ----------------
+    // Operands are stable for the whole op (the head is not popped until DONE):
+    // base = x[rs1] (scalar), mask = v0 (read on the vs1 port with addr 0),
+    // store data = vs3 = vd field (read on the vs2 port).
+    let m_base : logic<64>   = i_scalar_data;
+    let m_mask : logic<VLEN> = i_vs1_data;
+    let m_vs3  : logic<VLEN> = i_vs2_data;
+    let m_vl8  : logic<8>    = vl_q[7:0];
+    let eew_mask: logic<64> = case h_eew_log {
+        2'd0   : 64'h0000_0000_0000_00ff,
+        2'd1   : 64'h0000_0000_0000_ffff,
+        2'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let eew_strb: logic<8> = case h_eew_log {
+        2'd0   : 8'b0000_0001,
+        2'd1   : 8'b0000_0011,
+        2'd2   : 8'b0000_1111,
+        default: 8'b1111_1111,
+    };
+    // Element address = base + velem*(EEW/8); offsets into the dword / the reg.
+    let velem_byteoff: logic<8>  = velem << h_eew_log;
+    let m_vaddr      : logic<64> = m_base + {56'd0, velem_byteoff};
+    let m_byteoff    : logic<3>  = m_vaddr[2:0];
+    let m_byteshift  : logic<6>  = {m_byteoff, 3'b000}; // *8 → bit offset in dword
+    let elem_shamt   : logic<3>  = 3'd3 + {1'b0, h_eew_log}; // log2(EEW in bits)
+    let elem_bitoff  : logic<8>  = velem << elem_shamt; // velem*EEW (≤120 at EEW=SEW)
+    // Mask: vm=1 unmasked; else v0[velem]. (Shift then bit0 — no dynamic select.)
+    let m_mask_sh: logic<VLEN> = m_mask >> velem;
+    let m_active : logic       = h_vm || m_mask_sh[0];
+    // Load: extract element from the dcache dword, OR it into the accumulator.
+    let ld_raw    : logic<64>   = i_mem_rdata >> m_byteshift;
+    let ld_el     : logic<64>   = ld_raw & eew_mask;
+    let ld_shifted: logic<VLEN> = ({64'd0, ld_el} as VLEN) << elem_bitoff;
+    let vacc_next : logic<VLEN> = vacc | ld_shifted;
+    // Store: extract element from vs3, position into the dword.
+    let m_vs3_sh: logic<VLEN> = m_vs3 >> elem_bitoff;
+    let st_el   : logic<64>   = m_vs3_sh[63:0] & eew_mask;
+    let st_wd   : logic<64>   = st_el << m_byteshift;
+    let st_sb   : logic<8>    = eew_strb << m_byteoff;
+
     // ---- Execute the head (combinational) -----------------------------------
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
-    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush;
+    // Arith ops (vset/vadd/vmv) fire in one combinational cycle; memory ops
+    // (vle/vse) stream through the FSM below and retire from its DONE state.
+    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && !h_is_mem;
+    let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
+    let vu_pop      : logic = fire || mem_cdb_fire;
 
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
 
     assign o_scalar_pdst = h_s_pdst;
-    assign o_vs1_addr    = h_vs1;
-    assign o_vs2_addr    = h_vs2;
+    assign o_vs1_addr    = if h_is_mem ? 5'd0 : h_vs1; // v0 mask for mem ops
+    assign o_vs2_addr    = if h_is_mem ? h_vd : h_vs2; // vs3 store data for mem ops
     assign o_vd_addr     = h_vd;
-    assign o_vd_wen      = fire && h_is_vadd;
-    assign o_vd_data     = vadd_res;
+    assign o_vd_wen      = (fire && h_is_vadd) || (mem_cdb_fire && h_is_vle && !fault_q);
+    assign o_vd_data     = if h_is_mem ? vacc : vadd_res;
 
-    assign o_cdb_valid    = fire;
-    assign o_cdb_has_rd   = fire && h_has_rd; // vadd has_rd=0; vset/vmv carry int rd
+    assign o_cdb_valid    = fire || mem_cdb_fire;
+    assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
     assign o_cdb_pdst     = h_rd_pd;
     assign o_cdb_data     = h_cdb_data;
     assign o_cdb_rob_idx  = h_rob;
     assign o_cdb_vset_wen = fire && h_is_vset;
     assign o_cdb_vtype    = vtype_new;
     assign o_cdb_vl       = vl_new;
+
+    // ---- Memory port outputs (V1 unit-stride) -------------------------------
+    assign o_mem_port_req  = (mem_state == 2'd1) || (mem_state == 2'd2);
+    assign o_mem_active    = (mem_state == 2'd2) && m_active;
+    assign o_mem_vaddr     = m_vaddr;
+    assign o_mem_is_load   = o_mem_active && h_is_vle;
+    assign o_mem_is_store  = o_mem_active && h_is_vse;
+    assign o_mem_funct3    = {1'b0, h_eew_log};
+    assign o_mem_wdata     = st_wd;
+    assign o_mem_wstrb     = st_sb;
+
+    // ---- Fault / vstart / vstore (ride the vu_cdb writeback) ----------------
+    assign o_cdb_is_lfault   = mem_cdb_fire && fault_q && h_is_vle;
+    assign o_cdb_is_sfault   = mem_cdb_fire && fault_q && h_is_vse;
+    assign o_cdb_fault_vaddr = fault_va_q;
+    assign o_cdb_vstart_wen  = mem_cdb_fire;
+    assign o_cdb_vstart      = if fault_q ? {56'd0, vstart_q} : 64'd0;
+    assign o_cdb_vstore      = mem_cdb_fire && h_is_vse && !fault_q;
 
     // ---- FIFO maintenance + config update -----------------------------------
     let do_alloc: logic = i_alloc_en && has_free;
@@ -297,16 +419,26 @@ pub module vector_unit #(
             count   = 0;
             vtype_q = 64'd0;
             vl_q    = 64'd0;
+            mem_state  = 2'd0;
+            velem      = 8'd0;
+            vacc       = {1'b0 repeat VLEN};
+            fault_q    = 1'b0;
+            fault_va_q = 64'd0;
+            vstart_q   = 8'd0;
         } else if i_flush {
             // Drop all speculative vector ops; restore config from the committed
-            // (architectural) vtype/vl held in the CSR file.
+            // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
+            // memory op (its element writes are idempotent unit-stride accesses;
+            // it re-fetches and re-executes from element 0).
             for i in 0..FIFO_N {
                 occupied[i] = 1'b0;
             }
-            head    = 0;
-            count   = 0;
-            vtype_q = i_csr_vtype;
-            vl_q    = i_csr_vl;
+            head       = 0;
+            count      = 0;
+            vtype_q    = i_csr_vtype;
+            vl_q       = i_csr_vl;
+            mem_state  = 2'd0;
+            fault_q    = 1'b0;
         } else {
             // Scalar-operand wakeup (int CDB snoop, both lanes).
             for i in 0..FIFO_N {
@@ -317,10 +449,65 @@ pub module vector_unit #(
                     }
                 }
             }
-            // Issue/complete the head.
-            if fire {
+            // Memory FSM (vle/vse): stream one element per access, head first.
+            case mem_state {
+                2'd0: {
+                    // IDLE: launch when a mem op is the ROB head with its base ready.
+                    if (count != 0) && at_head && h_is_mem && scalar_ok {
+                        velem   = 8'd0;
+                        vacc    = {1'b0 repeat VLEN};
+                        fault_q = 1'b0;
+                        if m_vl8 == 8'd0 {
+                            mem_state = 2'd3; // empty op: nothing to access
+                        } else {
+                            mem_state = 2'd1; // ARM: drain the scalar mem path
+                        }
+                    }
+                }
+                2'd1: {
+                    // ARM: own the port; wait for the scalar mem path to quiesce.
+                    if i_mem_idle {
+                        mem_state = 2'd2;
+                    }
+                }
+                2'd2: {
+                    // ACCESS: process element velem (active → drive the port).
+                    if m_active {
+                        if (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st) {
+                            fault_q    = 1'b1;
+                            fault_va_q = m_vaddr;
+                            vstart_q   = velem;
+                            mem_state  = 2'd3;
+                        } else if i_mem_ready {
+                            if h_is_vle {
+                                vacc = vacc_next;
+                            }
+                            if velem + 8'd1 >= m_vl8 {
+                                mem_state = 2'd3;
+                            } else {
+                                velem = velem + 8'd1;
+                            }
+                        }
+                    } else {
+                        // masked-off element: skip (load element stays 0), advance.
+                        if velem + 8'd1 >= m_vl8 {
+                            mem_state = 2'd3;
+                        } else {
+                            velem = velem + 8'd1;
+                        }
+                    }
+                }
+                2'd3: {
+                    // DONE: retire on the vu_cdb writeback (vu_pop below).
+                    if i_cdb_free {
+                        mem_state = 2'd0;
+                    }
+                }
+            }
+            // Issue/complete the head (arith fire OR mem-op retire).
+            if vu_pop {
                 occupied[head] = 1'b0;
-                if h_is_vset {
+                if fire && h_is_vset {
                     vtype_q = vtype_new;
                     vl_q    = vl_new;
                 }
@@ -344,12 +531,12 @@ pub module vector_unit #(
                     || (i_cdb2_valid && i_cdb2_has_rd && i_cdb2_pdst == i_alloc_scalar_pdst);
             }
             // Head/count update (pop + push are independent slots).
-            if fire && !do_alloc {
+            if vu_pop && !do_alloc {
                 head  = head + 1;
                 count = count - 1;
-            } else if !fire && do_alloc {
+            } else if !vu_pop && do_alloc {
                 count = count + 1;
-            } else if fire && do_alloc {
+            } else if vu_pop && do_alloc {
                 head = head + 1; // count unchanged
             }
         }

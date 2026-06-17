@@ -1491,6 +1491,27 @@ pub module heliodor_core #(
     var vu_vd_wen     : logic                    ;
     var vu_vd_data    : logic<vector_pkg::VLEN>  ;
     var vu_cdb        : CdbBus                   ;
+    // Phase 12 V1: VU memory port (unit-stride vle/vse).
+    var vu_mem_port_req : logic     ;
+    var vu_mem_active   : logic     ;
+    var vu_mem_vaddr    : logic<64> ;
+    var vu_mem_is_load  : logic     ;
+    var vu_mem_is_store : logic     ;
+    var vu_mem_funct3   : logic<3>  ;
+    var vu_mem_wdata    : logic<64> ;
+    var vu_mem_wstrb    : logic<8>  ;
+    var vu_cdb_is_lfault : logic     ;
+    var vu_cdb_is_sfault : logic     ;
+    var vu_cdb_fault_vaddr: logic<64>;
+    var vu_cdb_vstart_wen: logic     ;
+    var vu_cdb_vstart    : logic<64> ;
+    var vu_cdb_vstore    : logic     ;
+    // VU memory-port arbitration (assigned after the dmem_mmu/dcache outputs).
+    var vu_mem_idle    : logic   ;
+    var vu_mem_ready   : logic   ;
+    var vu_mem_fault   : logic   ;
+    var vu_mem_fault_st: logic   ;
+    var csr_vstart     : logic<64>;
 
     // M6: route IQ-readiness to iq_fp for FPU ops, iq_int otherwise; require
     // the int free-list for an int dest and the FP free-list for an FP dest.
@@ -1982,9 +2003,10 @@ pub module heliodor_core #(
         vu_cdb.csr_addr    = 12'd0;
         vu_cdb.csr_wdata   = 64'd0;
         vu_cdb.csr_illegal = 1'b0;
-        vu_cdb.is_lfault   = 1'b0;
-        vu_cdb.is_sfault   = 1'b0;
-        vu_cdb.fault_vaddr = 64'd0;
+        // V1: a faulting vector mem op rides the vu_cdb's load/store fault path.
+        vu_cdb.is_lfault   = vu_cdb_is_lfault;
+        vu_cdb.is_sfault   = vu_cdb_is_sfault;
+        vu_cdb.fault_vaddr = vu_cdb_fault_vaddr;
     }
     always_comb {
         cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : if alu_cdb.valid ? alu_cdb : vu_cdb;
@@ -2535,11 +2557,39 @@ pub module heliodor_core #(
         o_cdb_vset_wen      : vu_cdb_vset_wen                               ,
         o_cdb_vtype         : vu_cdb_vtype                                  ,
         o_cdb_vl            : vu_cdb_vl                                     ,
+        // V1 unit-stride memory port.
+        o_mem_port_req      : vu_mem_port_req                               ,
+        o_mem_active        : vu_mem_active                                 ,
+        o_mem_vaddr         : vu_mem_vaddr                                  ,
+        o_mem_is_load       : vu_mem_is_load                               ,
+        o_mem_is_store      : vu_mem_is_store                             ,
+        o_mem_funct3        : vu_mem_funct3                                ,
+        o_mem_wdata         : vu_mem_wdata                                 ,
+        o_mem_wstrb         : vu_mem_wstrb                                 ,
+        i_mem_idle          : vu_mem_idle                                  ,
+        i_mem_ready         : vu_mem_ready                                 ,
+        i_mem_rdata         : dcache_rdata                                 ,
+        i_mem_fault         : vu_mem_fault                                 ,
+        i_mem_fault_st      : vu_mem_fault_st                              ,
+        i_csr_vstart        : csr_vstart                                   ,
+        o_cdb_is_lfault     : vu_cdb_is_lfault                            ,
+        o_cdb_is_sfault     : vu_cdb_is_sfault                            ,
+        o_cdb_fault_vaddr   : vu_cdb_fault_vaddr                          ,
+        o_cdb_vstart_wen    : vu_cdb_vstart_wen                           ,
+        o_cdb_vstart        : vu_cdb_vstart                               ,
+        o_cdb_vstore        : vu_cdb_vstore                               ,
         // Architectural vtype/vl restore on flush.
         i_csr_vtype         : csr_vtype                                     ,
         i_csr_vl            : csr_vl                                        ,
         i_flush             : redirect_fire                                 ,
     );
+
+    // ---- VU memory-port arbitration signals (V1) ----------------------------
+    // The VU owns the dmem port (highest priority) while a vle/vse streams. The
+    // gating signals (vu_mem_idle / vu_mem_ready / vu_mem_fault*) are assigned
+    // below, after the dmem_mmu + dcache outputs they depend on are defined; the
+    // vars are declared up with the other vu_* state so the VU instance above
+    // can reference them.
 
     // ============================================================
     // ROB
@@ -2617,6 +2667,10 @@ pub module heliodor_core #(
     var c_vset_wen    : logic           ;
     var c_vtype       : logic<64>       ;
     var c_vl          : logic<64>       ;
+    // Phase 12 V1: committing vector mem op vstart write + vector-store redirect.
+    var c_vstart_wen  : logic           ;
+    var c_vstart      : logic<64>       ;
+    var c_vstore      : logic           ;
     // Phase 8 S9: the head load was poisoned (memory-order violation) → replay.
     var c_load_poison : logic           ;
 
@@ -2785,6 +2839,9 @@ pub module heliodor_core #(
         i_cdb_vset_wen       : vu_cdb_vset_wen      ,
         i_cdb_vtype          : vu_cdb_vtype         ,
         i_cdb_vl             : vu_cdb_vl            ,
+        i_cdb_vstart_wen     : vu_cdb_vstart_wen    ,
+        i_cdb_vstart         : vu_cdb_vstart        ,
+        i_cdb_vstore         : vu_cdb_vstore        ,
         // Phase 8 S3: 2nd CDB writeback (pipe-1 = ALU/branch). Silent in S3.a.
         i_cdb2_valid         : alu_cdb2.valid       ,
         i_cdb2_rob_idx       : alu_cdb2.rob_idx     ,
@@ -2891,6 +2948,9 @@ pub module heliodor_core #(
         o_commit_vset_wen    : c_vset_wen           ,
         o_commit_vtype       : c_vtype              ,
         o_commit_vl          : c_vl                 ,
+        o_commit_vstart_wen  : c_vstart_wen         ,
+        o_commit_vstart      : c_vstart             ,
+        o_commit_vstore      : c_vstore             ,
         o_commit_idx         : rob_commit_idx       ,
         o_commit_load_poison : c_load_poison        , // Phase 8 S9
         i_commit_ack         : rob_commit_ack       ,
@@ -3148,6 +3208,11 @@ pub module heliodor_core #(
     // P9.1 FIX: ack-based (c_serial — see the commit_csrwr note above).
     assign commit_fence_i_pulse = rob_commit_ack && c_is_fence_i;
 
+    // Phase 12 V1: a non-faulting vector STORE retiring → force a commit-time
+    // redirect (squash younger speculative loads). c_vstore is set only for a
+    // successful store (a faulting store traps via commit_trap instead).
+    let commit_vstore: logic = rob_commit_ack && c_vstore;
+
     // M9: satp shadow latch (see declaration above). Updated on either
     // SFENCE.VMA commit OR csrw satp commit. The latter is non-standard
     // but kernel head.S requires it (see commit_csrw_satp comment above).
@@ -3345,6 +3410,12 @@ pub module heliodor_core #(
         i_set_vl      : c_vl         ,
         o_vtype       : csr_vtype    ,
         o_vl          : csr_vl       ,
+        // Phase 12 V1: a committing vector mem op writes vstart (fault element,
+        // else 0). Gated like i_vset_wr (a VS-disabled / priv-illegal vector op
+        // traps before reaching here and must not perturb vstart).
+        i_vstart_wr   : rob_commit_valid && c_vstart_wen && !c_illegal && !commit_priv_illegal && !commit_vec_disabled,
+        i_vstart_val  : c_vstart     ,
+        o_vstart      : csr_vstart   ,
         o_menvcfg_pbmte: csr_pbmte   ,
         o_menvcfg_adue : csr_adue    ,
         // Phase 11-H two-stage MMU state.
@@ -3646,6 +3717,15 @@ pub module heliodor_core #(
             // fence commits. Full flush + refetch through the just-flushed
             // icache, mirroring the csrw-satp implicit redirect. FENCE.I has no
             // RVC form, so the successor is always c_pc+4.
+            redirect_fire_q = 1'b1;
+            redirect_pc_q   = c_pc + 64'd4;
+        } else if commit_vstore {
+            // Phase 12 V1: a committing vector STORE overwrote cache lines that
+            // younger speculative loads may already have read with stale data.
+            // The VU streams stores non-speculatively at the ROB head, so all
+            // such loads are younger — squash them and re-fetch from the next PC
+            // (Rule B vector-store / younger-load ordering, correctness-first;
+            // a precise replay is a later optimization). Vector ops are 4 bytes.
             redirect_fire_q = 1'b1;
             redirect_pc_q   = c_pc + 64'd4;
         } else {
@@ -4390,9 +4470,14 @@ pub module heliodor_core #(
     // dmem_mmu_idle is the MMU's `state` register (== IDLE), combinationally
     // independent of i_vaddr/core_dmem_vaddr, so no combinational loop is formed.
     let mmu_walk_inflight: logic   = load_walk_busy && !dmem_mmu_idle;
-    let core_dmem_vaddr: logic<64> = if store_drive ? c_store_addr : if mmu_walk_inflight ? walk_vaddr_q : agu_addr_iss;
-    let core_dmem_wdata: logic<64> = st_wdata;
-    let core_dmem_wen  : logic     = store_drive;
+    // Phase 12 V1: the VU owns the dmem port (highest priority) while it streams
+    // a unit-stride vector load/store. vu_mem_active is a registered FSM state
+    // and only asserts when the scalar mem path is quiescent (vu_mem_idle gated
+    // the start), so it never races store_drive (the vector op is the ROB head =
+    // no scalar store committing) or an in-flight walk.
+    let core_dmem_vaddr: logic<64> = if vu_mem_active ? vu_mem_vaddr : if store_drive ? c_store_addr : if mmu_walk_inflight ? walk_vaddr_q : agu_addr_iss;
+    let core_dmem_wdata: logic<64> = if vu_mem_active ? vu_mem_wdata : st_wdata;
+    let core_dmem_wen  : logic     = if vu_mem_active ? vu_mem_is_store : store_drive;
     // M9.A.316: do NOT let a speculative LOAD request the dmem MMU on a
     // redirect cycle. The IQ flush is registered, so on the redirect cycle the
     // IQ still holds wrong-path ops and the issue logic can select one; if that
@@ -4481,7 +4566,10 @@ pub module heliodor_core #(
         // instantly and exposed this: the AMO armed its watch on a stale S
         // line, then its commit write wedged (needs E/M) with no poison
         // (the line is present). Hold the read until the walk drains.
-        || (issue_amo_read && mmu_walk_inflight);
+        || (issue_amo_read && mmu_walk_inflight)
+        // Phase 12 V1: hold scalar load/AMO issue while the VU owns the dmem port
+        // (vu_mem_port_req). Registered, so no combinational loop into issue.
+        || ((issue_is_load || issue_amo_read) && vu_mem_port_req);
     // Phase 8 S10.5: !replay_q — no NEW dmem-MMU request while a queued-MSHR
     // replay drives the dcache port. Without this, a TLB-missing load selected
     // on slot-0 starts a PTW walk on a replay cycle (walk_v_q is not set yet,
@@ -4517,8 +4605,8 @@ pub module heliodor_core #(
             }
         }
     }
-    let core_dmem_ren  : logic    = (issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || (mmu_walk_inflight && !sb_walk_ovl);
-    let core_dmem_wstrb: logic<8> = if store_drive ? st_wstrb : 8'd0;
+    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || (mmu_walk_inflight && !sb_walk_ovl));
+    let core_dmem_wstrb: logic<8> = if vu_mem_active ? vu_mem_wstrb : if store_drive ? st_wstrb : 8'd0;
     // P9.3: mark the AMO/LR data read so the dcache serves it only from an
     // OWNED (E/M) line — an S hit or a miss raises an RFO fill first (the
     // in-cache RMW: the commit write then merges locally; a departure in
@@ -4594,7 +4682,9 @@ pub module heliodor_core #(
             // walk's leaf fault was mis-attributed to a valid kernel load
             // (spurious page fault at VA 0x80616198, ~34663-cy Oops loop).
             walk_v_q     = 1'b1;
-            walk_rob_q   = iq_iss_rob_idx;
+            // Phase 12 V1: a VU-driven walk belongs to the vector mem op at the
+            // ROB head (the VU does not issue through the IQ). Inert at V=0.
+            walk_rob_q   = if vu_mem_active ? rob_head_idx : iq_iss_rob_idx;
             walk_vaddr_q = core_dmem_vaddr;
             // M9.3 inject-linkage probe: PC of the load that starts this walk.
             walk_pc_q    = iq_issue_op.base.pc;
@@ -4664,7 +4754,10 @@ pub module heliodor_core #(
     ;
     // Deliver the load fault to the walk owner when a LOAD walk faults. Store
     // walk faults (walk_is_store_q) are handled at commit (commit_store_sfault).
-    assign lfault_inj_v = dmem_mmu_fault && walk_v_q && !walk_is_store_q;
+    // Phase 12 V1: a VU-driven access's fault is delivered by the VU on its own
+    // vu_cdb (is_lfault/is_sfault → the vector op's ROB entry); suppress the
+    // walk-owner inject path for it to avoid a double delivery. Inert at V=0.
+    assign lfault_inj_v = dmem_mmu_fault && walk_v_q && !walk_is_store_q && !vu_mem_active;
     // Suppress the CDB's is_lfault when it would mis-attribute the owner's
     // fault to a different (current-issue) rob_idx. If the current issue IS
     // the owner, or there is no tracked walk (e.g. a direct TLB-permission
@@ -5320,7 +5413,8 @@ pub module heliodor_core #(
     // misaligned store or AMO at the ROB head would otherwise leak its
     // st_wstrb_hi / c_is_amo into the PTE write and corrupt it / hang the walk).
     let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_ok && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)) || dmu_ad_wb;
-    let dc_st_wstrb_hi: logic<8> = if dmu_ad_wb ? 8'd0 : if dc_i_wen ? st_wstrb_hi : 8'd0;
+    // Phase 12 V1: a VU unit-stride store element is single-dword (no hi-strobe).
+    let dc_st_wstrb_hi: logic<8> = if vu_mem_active ? 8'd0 : if dmu_ad_wb ? 8'd0 : if dc_i_wen ? st_wstrb_hi : 8'd0;
     // P9.3: in-cache AMO/SC commit write — eligible when the committing
     // store is an AMO/SC to a cacheable DRAM PA outside the tohost pages
     // (mirrors the fast-store / sb_vm_ok exclusions: the harnesses watch
@@ -5512,6 +5606,19 @@ pub module heliodor_core #(
         o_memw_req       : dc_memw_req                   ,
         i_memw_grant     : i_dmemw_grant                 ,
     );
+
+    // ---- Phase 12 V1: VU memory-port arbitration (placed here so all the
+    // dmem_mmu / dcache / MSHR / store-buffer sources it reads are defined) ----
+    // vu_mem_idle: the scalar mem path is quiescent (store buffer drained → a
+    // vector load sees current memory; no PTW walk; MMU idle; no queued MSHR
+    // replay or outstanding scalar miss; dcache not stalling). The VU then owns
+    // the port exclusively and streams elements with blocking accesses (it never
+    // uses the MSHR for its own misses). All but dcache_stall are registered;
+    // dcache_stall only gates the VU's registered FSM transition → no comb loop.
+    assign vu_mem_idle     = sb_empty && !walk_v_q && dmem_mmu_idle && !replay_q && !mshra_v_q && !mshrb_v_q && !dcache_stall;
+    assign vu_mem_ready    = !dcache_stall && !dmem_mmu_busy;
+    assign vu_mem_fault    = dmem_mmu_fault;
+    assign vu_mem_fault_st = dmem_mmu_fault_s;
 
     // Phase 8 S5.2: slot-1 LOAD completion. A bare-mode slot-1 load completes on
     // pipe-1 only when the 2nd port HITS, not on a redirect (wrong-path), and
