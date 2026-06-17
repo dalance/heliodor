@@ -159,6 +159,7 @@ modules `veryl build` emits to `tb/*.sv`:
 | `tb_soc_smp_linux_boot_4hart.sv`     | N=4    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=4) |
 | `tb_soc_smp_linux_boot_8hart.sv`     | N=8    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=8) |
 | `tb_litmus_4hart.sv`                 | N=4    | `heliodor_test_litmus_harness` #(N_HARTS=4) (P9.0 RVWMO litmus) |
+| `tb_soc_hvlinux.sv`                  | V=1    | `heliodor_test_soc_hvlinux_harness` (P11-H5.2b type-1 hypervisor + guest Linux; `make -C test/hv GUEST=Image GUEST_DTB=guest.dtb` first) |
 
 Build + run (from the project root, so the harness `$readmemh` paths resolve):
 
