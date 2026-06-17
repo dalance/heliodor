@@ -2880,14 +2880,21 @@ pub module heliodor_core #(
     // reaching its store-fault subtest). Boot is unaffected: OpenSBI firmware
     // never writes a MODE=8 satp in M-mode; the kernel's first Sv39 enable is
     // in S-mode, so the hack still fires for Linux.
-    // Phase 11-H5: a GUEST's `csrw satp` (V=1, aliasing vsatp) must NOT take this
-    // V=0-only narrow-IFU/QEMU-satp hack — the fake trap drops the vsatp write
-    // (the csr's trap path wins over its write path), so the guest's paging never
-    // engages. A guest writes vsatp directly and engages normally (the two-stage
-    // MMU reads vsatp_shadow, latched atomically at this commit). Gated on
-    // !csr_virt, so the V=0 boot path is byte-identical.
+    // Phase 11-H5.2b: a GUEST's `csrw satp` (V=1, aliasing vsatp) needs the SAME
+    // narrow-IFU/satp-switch hack as V=0. Linux head.S's relocate_enable_mmu does
+    // two back-to-back `csrw satp` (trampoline pgd, then the real swapper pgd) and
+    // relies on the fetch right after the FIRST one FAULTING to the high-half stvec
+    // (the low-half PC is no longer mapped). Our narrow + lazy MMU does not take
+    // that fault on its own, so we synthesize it here for V=1 too — delivered as a
+    // VS instruction page-fault (cause 12, hedeleg[12]=1) to the guest's vstvec.
+    // The fake trap drops the vsatp REGISTER write (the csr's trap path wins over
+    // its write path), but the vsatp_shadow latch below takes c_csr_wdata (the
+    // intended value), so the guest's paging still engages. 6bde0f2 gated this off
+    // for V=1 and left vsatp_shadow one-behind, which hung the guest in the
+    // trampoline (stuck at the 2nd `csrw satp`). V=0 is byte-identical: it already
+    // fired for V=0 (csr_virt=0), and removing the gate only adds the V=1 case.
     let inject_fake_ifault: logic = commit_csrw_satp && !first_satp_done && c_csr_wdata[63:60] == 4'd8 && csr_priv
-        != csr_pkg::PrivLevel::MACHINE && !csr_virt;
+        != csr_pkg::PrivLevel::MACHINE;
     always_ff (clk, rst) {
         if_reset {
             first_satp_done = 1'b0;
@@ -2949,9 +2956,22 @@ pub module heliodor_core #(
         if_reset {
             satp_shadow  = 64'd0;
             vsatp_shadow = 64'd0;
-        } else if commit_sfence_pulse || commit_csrw_satp {
+        } else if commit_csrw_satp {
+            // satp_shadow keeps csr_satp (the OLD value — the register update is
+            // NBA); the V=0 narrow-IFU hack + the following sfence re-sync make this
+            // work. Phase 11-H5.2b: vsatp_shadow instead takes c_csr_wdata (the
+            // value being WRITTEN this cycle, == what the vsatp register receives),
+            // so the guest's two-stage MMU sees the new vsatp immediately after the
+            // implicit csrw-satp redirect. relocate_enable_mmu does two back-to-back
+            // `csrw satp` with no sfence between, so a one-behind vsatp_shadow walked
+            // the trampoline pgd after the swapper switch and hung. The
+            // inject_fake_ifault path drops the vsatp REGISTER write (trap wins over
+            // write), but c_csr_wdata still carries the intended value here.
             satp_shadow  = csr_satp;
-            vsatp_shadow = csr_vsatp;  // Phase 11-H5: VS-stage shadow (V=1 guest paging)
+            vsatp_shadow = c_csr_wdata;
+        } else if commit_sfence_pulse {
+            satp_shadow  = csr_satp;
+            vsatp_shadow = csr_vsatp;  // sfence re-syncs to the (now-updated) vsatp
         }
     }
 
