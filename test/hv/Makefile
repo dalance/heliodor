@@ -41,8 +41,12 @@ guest_bare.bin: guest_bare.elf
 	$(OBJCOPY) -O binary $< guest_bare.bin
 
 # ---- DRAM image: hypervisor @0, guest @0x600000, dtb @0x1000000 (if given) ----
+# DTB host offset 0x1400000 == guest-physical 0x81000000 (GUEST_DTB_GPA in hv.c):
+# the G-stage maps guest-phys G -> host (G + 0x400000), so the guest's DTB at
+# guest-phys 0x81000000 lives at host 0x81400000. (Was 0x1000000, off by the
+# 0x400000 G-stage offset, so the guest read a zero region instead of the DTB.)
 hv_dram.hex: hv.bin $(GUEST) $(if $(GUEST_DTB),$(GUEST_DTB),)
-	$(MKHEX) $@ 0:hv.bin 0x600000:$(GUEST) $(if $(GUEST_DTB),0x1000000:$(GUEST_DTB),)
+	$(MKHEX) $@ 0:hv.bin 0x600000:$(GUEST) $(if $(GUEST_DTB),0x1400000:$(GUEST_DTB),)
 
 dump-hv: hv.elf
 	$(OBJDUMP) -d $<

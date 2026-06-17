@@ -30,8 +30,10 @@ _start:
     slli t0, t0, 61
     csrw 0x30A, t0                   # menvcfg
 
-    # mstatus: MPP=01 (S-mode), MPIE=1, SIE=1
-    li   t0, (1 << 11) | (1 << 7) | (1 << 5) | (1 << 1)
+    # mstatus: MPP=01 (S-mode), MPIE=1, SPIE=1, SIE=1, FS=01 (Initial: FP on).
+    # FS!=0 is the global FP gate; without it every guest FP instruction (e.g.
+    # __fstate_restore's `fld` after the guest sets vsstatus.FS) traps illegal.
+    li   t0, (1 << 11) | (1 << 7) | (1 << 5) | (1 << 1) | (1 << 13)
     csrw mstatus, t0
 
     li   t0, 0x80000000              # HS hypervisor entry
