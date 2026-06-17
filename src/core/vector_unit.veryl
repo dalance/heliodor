@@ -187,6 +187,43 @@ pub module vector_unit #(
         };
     }
 
+    // ---- Per-element integer multiply / divide (V2c, OPMVV/OPMVX) -----------
+    // a = vs2[i]; b = vs1[i] (VV) / x[rs1] (VX); op = funct6 (100xxx). The
+    // high-half multiplies need the full 2*W-bit product, so the operands are
+    // sign- / zero-extended to 2*W before the (unsigned) multiply: the low 2*W
+    // bits of an extended-operand product hold the correctly-signed result.
+    // div/rem follow the scalar ALU (alu.veryl): divide-by-zero gives an
+    // all-ones quotient and a dividend remainder; signed overflow (most-negative
+    // / -1) wraps to the dividend with remainder 0 (matches the RISC-V spec).
+    function vmuldiv::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        let a_s  : logic<W * 2> = {a[W - 1] repeat W, a};
+        let b_s  : logic<W * 2> = {b[W - 1] repeat W, b};
+        let a_u  : logic<W * 2> = {1'b0 repeat W, a};
+        let b_u  : logic<W * 2> = {1'b0 repeat W, b};
+        let p_ss : logic<W * 2> = a_s * b_s; // signed   × signed
+        let p_uu : logic<W * 2> = a_u * b_u; // unsigned × unsigned
+        let p_su : logic<W * 2> = a_s * b_u; // signed   × unsigned
+        let div_u: logic<W>     = if b == 0 ? {1'b1 repeat W} : a / b;
+        let div_s: logic<W>     = if b == 0 ? {1'b1 repeat W} : ($signed(a) / $signed(b)) as W;
+        let rem_u: logic<W>     = if b == 0 ? a : a % b;
+        let rem_s: logic<W>     = if b == 0 ? a : ($signed(a) % $signed(b)) as W;
+        return case op {
+            6'b100101: p_uu[W - 1:0],     // vmul    (low W bits; sign-agnostic)
+            6'b100111: p_ss[W * 2 - 1:W], // vmulh   (signed   × signed,   high)
+            6'b100100: p_uu[W * 2 - 1:W], // vmulhu  (unsigned × unsigned, high)
+            6'b100110: p_su[W * 2 - 1:W], // vmulhsu (signed   × unsigned, high)
+            6'b100000: div_u,             // vdivu
+            6'b100001: div_s,             // vdiv
+            6'b100010: rem_u,             // vremu
+            6'b100011: rem_s,             // vrem
+            default  : p_uu[W - 1:0],
+        };
+    }
+
     // ---- In-order FIFO state ------------------------------------------------
     var occupied   : logic                [FIFO_N];
     var fifo_op    : vector_pkg::VecOp     [FIFO_N];
@@ -241,12 +278,16 @@ pub module vector_unit #(
     let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
     let h_is_valu: logic = h_op == VecOp::VALU;
     let h_is_vmv : logic = h_op == VecOp::VMV_X_S;
-    // OPIVx operand mode + op: funct3 (inst[14:12]) = VV(000)/VX(100)/VI(011);
-    // funct6 (inst[31:26]) selects the integer ALU op. vm (inst[25]) = unmasked.
+    // OPIVx/OPMVx operand mode + op: funct6 (inst[31:26]) selects the op; funct3
+    // (inst[14:12]) the operand mode. VV reads vs1[i] (OPIVV=000 / OPMVV=010 →
+    // bit2=0,bit0=0); VX reads x[rs1] (OPIVX=100 / OPMVX=110 → bit2=1,bit0=0);
+    // VI uses imm5 (OPIVI=011). OPMVV/OPMVX (funct3[1:0]==10) carry the V2c
+    // integer mul/div ops. vm (inst[25]) = unmasked.
     let h_funct3 : logic<3> = h_instr[14:12];
     let h_funct6 : logic<6> = h_instr[31:26];
-    let h_is_vv  : logic    = h_funct3 == 3'b000;
-    let h_is_vx  : logic    = h_funct3 == 3'b100;
+    let h_is_vv  : logic    = !h_funct3[2] && !h_funct3[0];
+    let h_is_vx  : logic    = h_funct3[2] && !h_funct3[0];
+    let h_is_opm : logic    = h_funct3[1:0] == 2'b10;
     let h_alu_vm : logic    = h_instr[25];
     // V2b op categories (within VALU): integer compare (funct6 011xxx → mask
     // register result) and merge/vmv.v (funct6 010111 → element select).
@@ -339,7 +380,7 @@ pub module vector_unit #(
                         if h_is_merge {
                             valu_res[i*8+:8] = if act ? b : a;
                         } else if act {
-                            valu_res[i*8+:8] = valu::<8>(a, b, h_funct6);
+                            valu_res[i*8+:8] = if h_is_opm ? vmuldiv::<8>(a, b, h_funct6) : valu::<8>(a, b, h_funct6);
                         }
                     }
                 }
@@ -353,7 +394,7 @@ pub module vector_unit #(
                         if h_is_merge {
                             valu_res[i*16+:16] = if act ? b : a;
                         } else if act {
-                            valu_res[i*16+:16] = valu::<16>(a, b, h_funct6);
+                            valu_res[i*16+:16] = if h_is_opm ? vmuldiv::<16>(a, b, h_funct6) : valu::<16>(a, b, h_funct6);
                         }
                     }
                 }
@@ -367,7 +408,7 @@ pub module vector_unit #(
                         if h_is_merge {
                             valu_res[i*32+:32] = if act ? b : a;
                         } else if act {
-                            valu_res[i*32+:32] = valu::<32>(a, b, h_funct6);
+                            valu_res[i*32+:32] = if h_is_opm ? vmuldiv::<32>(a, b, h_funct6) : valu::<32>(a, b, h_funct6);
                         }
                     }
                 }
@@ -381,7 +422,7 @@ pub module vector_unit #(
                         if h_is_merge {
                             valu_res[i*64+:64] = if act ? b : a;
                         } else if act {
-                            valu_res[i*64+:64] = valu::<64>(a, b, h_funct6);
+                            valu_res[i*64+:64] = if h_is_opm ? vmuldiv::<64>(a, b, h_funct6) : valu::<64>(a, b, h_funct6);
                         }
                     }
                 }
