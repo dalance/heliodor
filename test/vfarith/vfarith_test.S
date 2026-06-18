@@ -121,6 +121,41 @@ _start:
     CK 8,  0xBF800000, fail11    # active 2: -1.0
     CK 12, 0xDEAD0003, fail11    # inactive 3: sentinel undisturbed
 
+    # --- .vf forms: FP scalar f[rs1] = 2.0 broadcast (v4 = a still loaded) ---
+    li   t1, 0x40000000; sw t1, 64(a3)     # 2.0f in memory
+    flw  fa0, 64(a3)                        # fa0 = 2.0
+    vsetvli t0, x0, e32, m1                 # SEW=32, vl=4
+    vfadd.vf v8, v4, fa0                     # a + 2.0
+    vse32.v v8, (a2)
+    CK 0,  0x40400000, fail16    # 3.0
+    CK 4,  0x40800000, fail16    # 4.0
+    CK 8,  0x3F000000, fail16    # 0.5
+    CK 12, 0x40C00000, fail16    # 6.0
+    vfsub.vf v8, v4, fa0                     # a - 2.0
+    vse32.v v8, (a2)
+    CK 0,  0xBF800000, fail17    # -1.0
+    CK 4,  0x00000000, fail17    # 0.0
+    CK 8,  0xC0600000, fail17    # -3.5
+    CK 12, 0x40000000, fail17    # 2.0
+    vfrsub.vf v8, v4, fa0                    # 2.0 - a (reverse)
+    vse32.v v8, (a2)
+    CK 0,  0x3F800000, fail18    # 1.0
+    CK 4,  0x00000000, fail18    # 0.0
+    CK 8,  0x40600000, fail18    # 3.5
+    CK 12, 0xC0000000, fail18    # -2.0
+    vfmul.vf v8, v4, fa0                     # a * 2.0
+    vse32.v v8, (a2)
+    CK 0,  0x40000000, fail19    # 2.0
+    CK 4,  0x40800000, fail19    # 4.0
+    CK 8,  0xC0400000, fail19    # -3.0
+    CK 12, 0x41000000, fail19    # 8.0
+    vfsgnj.vf v8, v4, fa0                    # mag a, sign(+2.0) = + all
+    vse32.v v8, (a2)
+    CK 0,  0x3F800000, fail20    # +1.0
+    CK 4,  0x40000000, fail20    # +2.0
+    CK 8,  0x3FC00000, fail20    # +1.5
+    CK 12, 0x40800000, fail20    # +4.0
+
     # --- double precision vfadd (SEW=64, vl=2) ---
     li   a0, 0x80010100
     li   a1, 0x80010140
@@ -138,6 +173,12 @@ _start:
     vse64.v v8, (a2)
     CK64 0, 0x4008000000000000, fail13   # 3.0
     CK64 8, 0x4014000000000000, fail13   # 5.0
+    # double .vf: vfadd.vf with FP scalar 2.0 (v4 = [1.0, 2.0])
+    li t1,0x4000000000000000; sd t1,16(a0); fld fa1, 16(a0)
+    vfadd.vf v8, v4, fa1
+    vse64.v v8, (a2)
+    CK64 0, 0x4008000000000000, fail16b  # 1.0+2.0 = 3.0
+    CK64 8, 0x4010000000000000, fail16b  # 2.0+2.0 = 4.0
 
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
@@ -172,3 +213,9 @@ fail12: li t0,12; sw t0,0(t3); 120: j 120b
 fail13: li t0,13; sw t0,0(t3); 130: j 130b
 fail14: li t0,14; sw t0,0(t3); 140: j 140b
 fail15: li t0,15; sw t0,0(t3); 150: j 150b
+fail16: li t0,16; sw t0,0(t3); 160: j 160b
+fail17: li t0,17; sw t0,0(t3); 170: j 170b
+fail18: li t0,18; sw t0,0(t3); 180: j 180b
+fail19: li t0,19; sw t0,0(t3); 190: j 190b
+fail20: li t0,20; sw t0,0(t3); 200: j 200b
+fail16b: li t0,21; sw t0,0(t3); 210: j 210b

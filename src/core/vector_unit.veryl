@@ -37,6 +37,11 @@ pub module vector_unit #(
     i_alloc_uses_scalar : input  logic                , // reads int rs1
     i_alloc_scalar_pdst : input  logic         <PRF_W>,
     i_alloc_scalar_ready: input  logic                , // initial int-rs1 readiness
+    // V3b: FP scalar operand for .vf ops (vfadd.vf etc.). The renamed f[rs1]
+    // physical reg, captured at alloc; the VU reads it from prf_fp at execute.
+    // No readiness tracking is needed — the VU runs at the ROB head, so f[rs1]'s
+    // producer has committed and the value is in prf_fp.
+    i_alloc_fscalar_pdst: input  logic         <PRF_W>,
     i_alloc_has_rd      : input  logic                , // writes int rd (!= x0)
     i_alloc_rd_pdst     : input  logic         <PRF_W>,
     i_alloc_rob_idx     : input  logic         <ROB_IDX_W>,
@@ -54,6 +59,10 @@ pub module vector_unit #(
     // ---- Integer PRF scalar read (combinational, at execute) ----------------
     o_scalar_pdst: output logic<PRF_W>,
     i_scalar_data: input  logic<64>   ,
+
+    // ---- FP PRF scalar read (combinational, at execute; V3b .vf ops) --------
+    o_fscalar_pdst: output logic<PRF_W>,
+    i_fscalar_data: input  logic<64>   ,
 
     // ---- VRF interface (combinational read, registered write) ---------------
     // Four read ports: vs1, vs2, mask (always v0), old-vd (for vta/vma merge).
@@ -306,6 +315,7 @@ pub module vector_unit #(
     var fifo_uses_s: logic                 [FIFO_N];
     var fifo_s_pdst: logic         <PRF_W> [FIFO_N];
     var fifo_s_rdy : logic                 [FIFO_N];
+    var fifo_fs_pd : logic         <PRF_W> [FIFO_N]; // V3b: FP scalar pdst (.vf)
     var fifo_has_rd: logic                 [FIFO_N];
     var fifo_rd_pd : logic         <PRF_W> [FIFO_N];
     var fifo_rob   : logic     <ROB_IDX_W> [FIFO_N];
@@ -374,6 +384,7 @@ pub module vector_unit #(
     let h_uses_s: logic             = fifo_uses_s[head];
     let h_s_pdst: logic     <PRF_W> = fifo_s_pdst[head];
     let h_s_rdy : logic             = fifo_s_rdy[head];
+    let h_fs_pd : logic     <PRF_W> = fifo_fs_pd[head]; // V3b FP scalar pdst
     let h_has_rd: logic             = fifo_has_rd[head];
     let h_rd_pd : logic     <PRF_W> = fifo_rd_pd[head];
     let h_rob   : logic <ROB_IDX_W> = fifo_rob[head];
@@ -410,8 +421,12 @@ pub module vector_unit #(
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
     let h_is_mem: logic = h_is_vle || h_is_vse;
-    // V3a vector FP arithmetic (OPFVV .vv).
+    // V3a/V3b vector FP arithmetic (OPFVV .vv / OPFVF .vf). .vf (funct3=101)
+    // takes its second operand from the FP scalar f[rs1]; vfrsub.vf (funct6
+    // 100111) is .vf-only and swaps the FPU operands (f[rs1] - vs2).
     let h_is_fp: logic = h_op == VecOp::VFALU;
+    let h_is_vf: logic = h_is_fp && (h_funct3 == 3'b101);
+    let fp_rsub: logic = h_is_fp && (h_funct6 == 6'b100111);
     // V2d LMUL>1: EMUL register groups walked per VALU op (integer LMUL 1/2/4/8
     // → 1/2/4/8 groups; fractional LMUL → 1). For a same-width ALU/merge/mul-div
     // op this is the destination register count (one written per group). A
@@ -813,10 +828,16 @@ pub module vector_unit #(
     let fp_mask_sh : logic<VLEN>  = i_mask_data >> fp_elem;
     let fp_active  : logic        = h_vm || fp_mask_sh[0];
     // Element operands. For SEW=32 each is NaN-boxed into the FPU's 64-bit input.
-    let fp_a_sh: logic<VLEN> = i_vs2_data >> fp_bitoff;
-    let fp_b_sh: logic<VLEN> = i_vs1_data >> fp_bitoff;
-    let fp_s1  : logic<64>   = if fp_double ? fp_a_sh[63:0] : {32'hffffffff, fp_a_sh[31:0]};
-    let fp_s2  : logic<64>   = if fp_double ? fp_b_sh[63:0] : {32'hffffffff, fp_b_sh[31:0]};
+    // vs2[i] is always a vector source; the second operand is vs1[i] (.vv) or the
+    // FP scalar f[rs1] (.vf). vfrsub.vf swaps the operands (f[rs1] - vs2).
+    let fp_a_sh   : logic<VLEN> = i_vs2_data >> fp_bitoff;
+    let fp_b_sh   : logic<VLEN> = i_vs1_data >> fp_bitoff;
+    let fp_velem_a: logic<64>   = if fp_double ? fp_a_sh[63:0] : {32'hffffffff, fp_a_sh[31:0]};
+    let fp_velem_b: logic<64>   = if fp_double ? fp_b_sh[63:0] : {32'hffffffff, fp_b_sh[31:0]};
+    let fp_scalar : logic<64>   = if fp_double ? i_fscalar_data : {32'hffffffff, i_fscalar_data[31:0]};
+    let fp_s2_op  : logic<64>   = if h_is_vf ? fp_scalar : fp_velem_b;
+    let fp_s1     : logic<64>   = if fp_rsub ? fp_scalar : fp_velem_a;
+    let fp_s2     : logic<64>   = if fp_rsub ? fp_velem_a : fp_s2_op;
     // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
     // and vfsgnj take magnitude/sign from vs2/vs1, matching s1=vs2, s2=vs1.
     var fp_fpu_op: fpu_pkg::FpuOp;
@@ -831,6 +852,7 @@ pub module vector_unit #(
                 6'b001001: fp_fpu_op = fpu_pkg::FpuOp::FSGNJN_D;
                 6'b001010: fp_fpu_op = fpu_pkg::FpuOp::FSGNJX_D;
                 6'b100100: fp_fpu_op = fpu_pkg::FpuOp::FMUL_D;
+                6'b100111: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D; // vfrsub.vf (operands swapped)
                 default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
             }
         } else {
@@ -843,6 +865,7 @@ pub module vector_unit #(
                 6'b001001: fp_fpu_op = fpu_pkg::FpuOp::FSGNJN_S;
                 6'b001010: fp_fpu_op = fpu_pkg::FpuOp::FSGNJX_S;
                 6'b100100: fp_fpu_op = fpu_pkg::FpuOp::FMUL_S;
+                6'b100111: fp_fpu_op = fpu_pkg::FpuOp::FSUB_S; // vfrsub.vf (operands swapped)
                 default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
             }
         }
@@ -924,7 +947,8 @@ pub module vector_unit #(
     let vw_src    : logic<VRF_W> = {3'd0, va_reg[2:1]};
     let vn_dst    : logic<VRF_W> = h_vd + vw_src;
     let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
-    assign o_scalar_pdst = h_s_pdst;
+    assign o_scalar_pdst  = h_s_pdst;
+    assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_fp ? fp_vs2_vrf : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
@@ -981,6 +1005,7 @@ pub module vector_unit #(
                 fifo_vs2[i]    = 5'd0;
                 fifo_uses_s[i] = 1'b0;
                 fifo_s_pdst[i] = 6'd0;
+                fifo_fs_pd[i]  = 6'd0;
                 fifo_s_rdy[i]  = 1'b0;
                 fifo_has_rd[i] = 1'b0;
                 fifo_rd_pd[i]  = 6'd0;
@@ -1158,6 +1183,7 @@ pub module vector_unit #(
                 fifo_vs2[tail]    = i_alloc_vs2;
                 fifo_uses_s[tail] = i_alloc_uses_scalar;
                 fifo_s_pdst[tail] = i_alloc_scalar_pdst;
+                fifo_fs_pd[tail]  = i_alloc_fscalar_pdst; // V3b FP scalar (.vf)
                 fifo_has_rd[tail] = i_alloc_has_rd;
                 fifo_rd_pd[tail]  = i_alloc_rd_pdst;
                 fifo_rob[tail]    = i_alloc_rob_idx;
