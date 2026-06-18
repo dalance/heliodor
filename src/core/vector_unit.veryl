@@ -263,6 +263,10 @@ pub module vector_unit #(
     // source group base+va_reg and writing the dest group base+va_reg. va_reg
     // walks 0 .. va_nregs-1; the final group rides the vu_cdb (result_written).
     var va_reg: logic<3>; // current register-group index
+    // Compare LMUL>1: mask-bit accumulator across the EMUL source groups. Seeded
+    // from the old mask dest on group 0 (inactive / tail bits undisturbed); each
+    // group splices its element bits in, and the final group writes the mask reg.
+    var va_acc: logic<VLEN>;
 
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
@@ -304,10 +308,12 @@ pub module vector_unit #(
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
     let h_is_mem: logic = h_is_vle || h_is_vse;
-    // V2d LMUL>1: EMUL destination register groups for a same-width VALU op
-    // (integer LMUL 1/2/4/8 → 1/2/4/8 regs; fractional LMUL → 1). A compare
-    // writes a single mask register regardless of LMUL, so its group count is
-    // forced to 1 (LMUL>1 compare — multi-source accumulation — is deferred).
+    // V2d LMUL>1: EMUL register groups walked per VALU op (integer LMUL 1/2/4/8
+    // → 1/2/4/8 groups; fractional LMUL → 1). For a same-width ALU/merge/mul-div
+    // op this is the destination register count (one written per group). A
+    // compare reads EMUL source groups but writes a SINGLE mask register, so it
+    // walks the same group count while accumulating mask bits into va_acc and
+    // writing the mask only on the final group.
     let h_vlmul: logic<3> = vtype_q[2:0];
     var emul    : logic<4>;
     always_comb {
@@ -317,7 +323,7 @@ pub module vector_unit #(
             emul = 4'd1 << h_vlmul[1:0]; // 1/2/4/8
         }
     }
-    let va_nregs: logic<4> = if h_is_cmp ? 4'd1 : emul;
+    let va_nregs: logic<4> = emul;
     // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
     // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
     let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
@@ -460,40 +466,59 @@ pub module vector_unit #(
     }
 
     // ---- Integer compare (OPIVV/VX/VI, funct6 011xxx): mask register result.
-    // Bit i = compare(vs2[i], b) for active elements; inactive body + tail mask
+    // Bit g = compare(vs2[g], b) for active elements; inactive body + tail mask
     // bits stay undisturbed (a spec-compliant agnostic choice). The result packs
-    // one bit per element into the low bits of vd, independent of SEW.
-    var cmp_res: logic<VLEN>;
+    // one bit per element into the low bits of the single mask dest, independent
+    // of SEW. LMUL>1: each group va_reg contributes elems_per_reg bits at global
+    // offset base; the running mask seeds from the old dest on group 0 and from
+    // va_acc afterwards. A group's bits are computed into vcmp_grp (active →
+    // compare, inactive/tail → the prior bit) then spliced into [base, base+epr).
+    let cmp_seed: logic<VLEN> = if va_reg == 3'd0 ? i_vdold_data : va_acc;
+    var vcmp_grp: logic<16>;
+    var cmp_res : logic<VLEN>;
     always_comb {
-        cmp_res = i_vdold_data; // default: inactive/tail mask bits undisturbed
+        vcmp_grp = 16'd0;
+        cmp_res  = cmp_seed;
         case vsew {
             3'd0: {
+                let base   : logic<8>    = {1'b0, va_reg, 4'd0}; // va_reg * 16
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base; // prior bits for this group
                 for i in 0..16 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
-                        cmp_res[i] = vcmp::<8>(i_vs2_data[i*8+:8], if h_is_vv ? i_vs1_data[i*8+:8] : bbcast[7:0], h_funct6);
-                    }
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<8>(i_vs2_data[i*8+:8], if h_is_vv ? i_vs1_data[i*8+:8] : bbcast[7:0], h_funct6) : seed_sh[i];
                 }
+                cmp_res = (cmp_seed & ~({112'd0, 16'hffff} << base)) | ({112'd0, vcmp_grp} << base);
             }
             3'd1: {
+                let base   : logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..8 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
-                        cmp_res[i] = vcmp::<16>(i_vs2_data[i*16+:16], if h_is_vv ? i_vs1_data[i*16+:16] : bbcast[15:0], h_funct6);
-                    }
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<16>(i_vs2_data[i*16+:16], if h_is_vv ? i_vs1_data[i*16+:16] : bbcast[15:0], h_funct6) : seed_sh[i];
                 }
+                cmp_res = (cmp_seed & ~({120'd0, 8'hff} << base)) | ({112'd0, vcmp_grp} << base);
             }
             3'd2: {
+                let base   : logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..4 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
-                        cmp_res[i] = vcmp::<32>(i_vs2_data[i*32+:32], if h_is_vv ? i_vs1_data[i*32+:32] : bbcast[31:0], h_funct6);
-                    }
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<32>(i_vs2_data[i*32+:32], if h_is_vv ? i_vs1_data[i*32+:32] : bbcast[31:0], h_funct6) : seed_sh[i];
                 }
+                cmp_res = (cmp_seed & ~({124'd0, 4'hf} << base)) | ({112'd0, vcmp_grp} << base);
             }
             default: {
+                let base   : logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..2 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) {
-                        cmp_res[i] = vcmp::<64>(i_vs2_data[i*64+:64], if h_is_vv ? i_vs1_data[i*64+:64] : bbcast, h_funct6);
-                    }
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<64>(i_vs2_data[i*64+:64], if h_is_vv ? i_vs1_data[i*64+:64] : bbcast, h_funct6) : seed_sh[i];
                 }
+                cmp_res = (cmp_seed & ~({126'd0, 2'h3} << base)) | ({112'd0, vcmp_grp} << base);
             }
         }
     }
@@ -568,17 +593,19 @@ pub module vector_unit #(
     let vu_pop      : logic = fire || va_fire || mem_cdb_fire;
 
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
-    // Current register group for source / dest addressing (compare keeps va_reg
-    // at 0, so vd+va_reg == vd = its single mask destination).
-    let va_grp: logic<VRF_W> = h_vd + {2'd0, va_reg};
+    // Register group for source / dest addressing. A compare reads source group
+    // base+va_reg but writes its SINGLE mask register (h_vd), only on the final
+    // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
+    let va_grp : logic<VRF_W> = h_vd + {2'd0, va_reg};
+    let cmp_wen: logic        = va_fire && h_is_cmp; // compare: write mask on last group only
 
     assign o_scalar_pdst = h_s_pdst;
     assign o_vs1_addr    = h_vs1 + {2'd0, va_reg};     // VV source-1 group (unused for mem)
     assign o_vs2_addr    = if h_is_mem ? h_vd : (h_vs2 + {2'd0, va_reg}); // vs3 (mem) / src2 group
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem)
-    assign o_vdold_addr  = va_grp;                     // old dest group (vta/vma merge)
-    assign o_vd_addr     = va_grp;
-    assign o_vd_wen      = ((va_step || va_fire) && h_is_valu) || (mem_cdb_fire && h_is_vle && !fault_q);
+    assign o_vdold_addr  = if h_is_cmp ? h_vd : va_grp; // compare: single mask dest / else dest group
+    assign o_vd_addr     = if h_is_cmp ? h_vd : va_grp;
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (va_step || va_fire))) || (mem_cdb_fire && h_is_vle && !fault_q);
     assign o_vd_data     = if h_is_mem ? vacc : if h_is_cmp ? cmp_res : valu_res;
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire;
@@ -639,6 +666,7 @@ pub module vector_unit #(
             fault_va_q = 64'd0;
             vstart_q   = 8'd0;
             va_reg     = 3'd0;
+            va_acc     = {1'b0 repeat VLEN};
         } else if i_flush {
             // Drop all speculative vector ops; restore config from the committed
             // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
@@ -654,6 +682,7 @@ pub module vector_unit #(
             mem_state  = 2'd0;
             fault_q    = 1'b0;
             va_reg     = 3'd0;
+            va_acc     = {1'b0 repeat VLEN};
         } else {
             // Scalar-operand wakeup (int CDB snoop, both lanes).
             for i in 0..FIFO_N {
@@ -721,6 +750,10 @@ pub module vector_unit #(
             }
             // Arith register-group advance (V2d LMUL>1): step intermediate
             // groups; the op stays at the FIFO head until va_fire pops it.
+            // Compare accumulates the running mask into va_acc each group.
+            if h_is_cmp && (va_step || va_fire) {
+                va_acc = cmp_res;
+            }
             if va_step {
                 va_reg = va_reg + 3'd1;
             } else if va_fire {
