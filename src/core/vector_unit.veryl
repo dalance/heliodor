@@ -132,6 +132,16 @@ pub module vector_unit #(
     // re-fetched (Rule B vector-store / younger-load memory ordering).
     o_cdb_vstore    : output logic     ,
 
+    // ---- V3 vector FP: rounding mode in, accrued fflags out -----------------
+    // Vector FP ops always round with fcsr.frm (the encoding carries no rm
+    // field), so the VU passes DYN to its fpu_wrap and supplies i_frm. The
+    // per-element IEEE exception flags OR-accumulate across the op and ride the
+    // vu_cdb writeback into the ROB; the core routes them to fcsr at commit,
+    // exactly like a scalar FP op's fflags.
+    i_frm           : input  logic<3>,
+    o_cdb_fflags    : output logic<5>,
+    o_cdb_fflags_wen: output logic   ,
+
     // ---- Flush (commit-time redirect) ---------------------------------------
     i_flush: input logic,
 ) {
@@ -334,6 +344,22 @@ pub module vector_unit #(
     // full dest register as {high-half, vn_lo}.
     var vn_lo: logic<64>;
 
+    // ---- V3 vector FP element-serial state ----------------------------------
+    // FP arithmetic shares ONE fpu_wrap instance (an FPU per element would be
+    // far too large), so elements stream one per cycle. fp_state: 0=IDLE,
+    // 1=COMPUTE, 2=DONE. fp_elem is the global element index; fp_acc accumulates
+    // the current destination register (active results spliced over the old vd,
+    // so tail / masked-off stay undisturbed); fp_fflags_q OR-accumulates the
+    // per-element IEEE flags across the whole op. vfpu_* receive the shared
+    // fpu_wrap outputs (combinational result for the single-cycle V3a ops).
+    var fp_state   : logic<2>            ;
+    var fp_elem    : logic<8>            ;
+    var fp_acc     : logic<VLEN>         ;
+    var fp_fflags_q: logic<5>            ;
+    var vfpu_cdb   : pipeline_pkg::CdbBus;
+    var vfpu_fflags: logic<5>            ;
+    var vfpu_busy  : logic               ;
+
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
     let has_free: logic = !count[FIFO_W];
@@ -384,6 +410,8 @@ pub module vector_unit #(
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
     let h_is_mem: logic = h_is_vle || h_is_vse;
+    // V3a vector FP arithmetic (OPFVV .vv).
+    let h_is_fp: logic = h_op == VecOp::VFALU;
     // V2d LMUL>1: EMUL register groups walked per VALU op (integer LMUL 1/2/4/8
     // → 1/2/4/8 groups; fractional LMUL → 1). For a same-width ALU/merge/mul-div
     // op this is the destination register count (one written per group). A
@@ -763,6 +791,102 @@ pub module vector_unit #(
     let st_wd   : logic<64>   = st_el << m_byteshift;
     let st_sb   : logic<8>    = eew_strb << m_byteoff;
 
+    // ---- V3a vector FP arithmetic (OPFVV .vv): element-serial datapath ------
+    // The op streams one element per cycle through the shared fpu_wrap below.
+    // SEW = 32 (single, NaN-boxed into the FPU's 64-bit operand) / 64 (double).
+    // vsew is log2(SEW in bytes), so the element geometry reuses the unit-stride
+    // memory formulas (elements-per-register, in-register bit offset) with vsew
+    // in place of EEW. Element values are extracted with a dynamic shift (no
+    // dynamic part-select). For .vv the second operand is vs1[i].
+    let fp_double  : logic        = vsew == 3'd3;             // SEW=64 → double
+    let fp_epr8    : logic<8>     = 8'd16 >> vsew;            // elements per register
+    let fp_eshift  : logic<3>     = 3'd4 - {1'b0, vsew[1:0]}; // log2(fp_epr)
+    let fp_eshamt  : logic<3>     = 3'd3 + {1'b0, vsew[1:0]}; // log2(SEW in bits)
+    let fp_reg     : logic<8>     = fp_elem >> fp_eshift;     // register index (0..EMUL-1)
+    let fp_local   : logic<8>     = fp_elem & (fp_epr8 - 8'd1);
+    let fp_reg_vrf : logic<VRF_W> = h_vd  + fp_reg[VRF_W - 1:0];
+    let fp_vs2_vrf : logic<VRF_W> = h_vs2 + fp_reg[VRF_W - 1:0];
+    let fp_vs1_vrf : logic<VRF_W> = h_vs1 + fp_reg[VRF_W - 1:0];
+    let fp_bitoff  : logic<8>     = fp_local << fp_eshamt;    // element bit offset in register
+    let fp_reg_last: logic        = ((fp_local + 8'd1) >= fp_epr8) || ((fp_elem + 8'd1) >= vl8);
+    // Mask: vm=1 unmasked; else v0[fp_elem]. (Shift then bit 0 — no dynamic select.)
+    let fp_mask_sh : logic<VLEN>  = i_mask_data >> fp_elem;
+    let fp_active  : logic        = h_vm || fp_mask_sh[0];
+    // Element operands. For SEW=32 each is NaN-boxed into the FPU's 64-bit input.
+    let fp_a_sh: logic<VLEN> = i_vs2_data >> fp_bitoff;
+    let fp_b_sh: logic<VLEN> = i_vs1_data >> fp_bitoff;
+    let fp_s1  : logic<64>   = if fp_double ? fp_a_sh[63:0] : {32'hffffffff, fp_a_sh[31:0]};
+    let fp_s2  : logic<64>   = if fp_double ? fp_b_sh[63:0] : {32'hffffffff, fp_b_sh[31:0]};
+    // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
+    // and vfsgnj take magnitude/sign from vs2/vs1, matching s1=vs2, s2=vs1.
+    var fp_fpu_op: fpu_pkg::FpuOp;
+    always_comb {
+        if fp_double {
+            case h_funct6 {
+                6'b000000: fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
+                6'b000010: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D;
+                6'b000100: fp_fpu_op = fpu_pkg::FpuOp::FMIN_D;
+                6'b000110: fp_fpu_op = fpu_pkg::FpuOp::FMAX_D;
+                6'b001000: fp_fpu_op = fpu_pkg::FpuOp::FSGNJ_D;
+                6'b001001: fp_fpu_op = fpu_pkg::FpuOp::FSGNJN_D;
+                6'b001010: fp_fpu_op = fpu_pkg::FpuOp::FSGNJX_D;
+                6'b100100: fp_fpu_op = fpu_pkg::FpuOp::FMUL_D;
+                default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
+            }
+        } else {
+            case h_funct6 {
+                6'b000000: fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
+                6'b000010: fp_fpu_op = fpu_pkg::FpuOp::FSUB_S;
+                6'b000100: fp_fpu_op = fpu_pkg::FpuOp::FMIN_S;
+                6'b000110: fp_fpu_op = fpu_pkg::FpuOp::FMAX_S;
+                6'b001000: fp_fpu_op = fpu_pkg::FpuOp::FSGNJ_S;
+                6'b001001: fp_fpu_op = fpu_pkg::FpuOp::FSGNJN_S;
+                6'b001010: fp_fpu_op = fpu_pkg::FpuOp::FSGNJX_S;
+                6'b100100: fp_fpu_op = fpu_pkg::FpuOp::FMUL_S;
+                default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
+            }
+        }
+    }
+    // Shared FP compute unit: one element per cycle. The result + fflags are
+    // combinational this cycle for the single-cycle V3a ops (div/sqrt, which
+    // would gate on o_fpu_busy, arrive in a later sub-phase). Vector FP always
+    // rounds with fcsr.frm → pass DYN so fpu_wrap resolves it from i_frm.
+    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active;
+    inst u_vfpu: fpu_wrap #(
+        PRF_W    : PRF_W    ,
+        ROB_IDX_W: ROB_IDX_W,
+    ) (
+        clk                                  ,
+        rst                                  ,
+        i_issue_valid     : fp_issue_v       ,
+        i_fpu_op          : fp_fpu_op        ,
+        i_fp_rm           : 3'b111           , // DYN → use i_frm
+        i_fli_idx         : 5'd0             ,
+        i_frm             : i_frm            ,
+        i_issue_rd_pdst   : '0               ,
+        i_issue_rob_idx   : '0               ,
+        i_issue_has_rd    : 1'b0             ,
+        i_issue_writes_int: 1'b0             ,
+        i_s1_data         : fp_s1            ,
+        i_s2_data         : fp_s2            ,
+        i_s3_data         : 64'd0            ,
+        i_int_rs1_data    : 64'd0            ,
+        i_flush           : i_flush          ,
+        o_fpu_busy        : vfpu_busy        ,
+        o_cdb             : vfpu_cdb         ,
+        o_fflags          : vfpu_fflags      ,
+        o_fflags_wen      : _                ,
+    );
+    // Per-element result → SEW-wide, spliced into the register accumulator at
+    // fp_bitoff (active) or leaving the old vd in place (inactive / tail).
+    let fp_res_vlen: logic<VLEN> = if fp_double ? {64'd0, vfpu_cdb.data} : {96'd0, vfpu_cdb.data[31:0]};
+    let fp_sew_mask: logic<VLEN> = if fp_double ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
+    let fp_acc_base: logic<VLEN> = if fp_local == 8'd0 ? i_vdold_data : fp_acc;
+    let fp_acc_next: logic<VLEN> = if fp_active ? ((fp_acc_base & ~(fp_sew_mask << fp_bitoff)) | (fp_res_vlen << fp_bitoff)) : fp_acc_base;
+    // VRF write of a completed register during COMPUTE; retire from DONE.
+    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_reg_last;
+    let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
+
     // ---- Execute the head (combinational) -----------------------------------
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
@@ -778,7 +902,9 @@ pub module vector_unit #(
     let va_step : logic = va_run && !va_last;              // intermediate group (no CDB)
     // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
     let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
-    let vu_pop      : logic = fire || va_fire || mem_cdb_fire;
+    // FP arithmetic (vfadd/...) streams through its own element-serial FSM,
+    // also retiring from DONE (fp_cdb_fire, defined with the FP datapath above).
+    let vu_pop      : logic = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     // Load VRF write (V2d-3): a register's accumulated value is written when its
     // last element is processed during ACCESS — no fault, element completed.
     let mem_fault_now: logic = (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st);
@@ -799,15 +925,15 @@ pub module vector_unit #(
     let vn_dst    : logic<VRF_W> = h_vd + vw_src;
     let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
     assign o_scalar_pdst = h_s_pdst;
-    assign o_vs1_addr    = if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}); // shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})); // widen-half / .w-full / narrow / src2
-    assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem)
-    assign o_vdold_addr  = if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp); // mask / narrow dest / group
-    assign o_vd_addr     = if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)); // load / mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr;
-    assign o_vd_data     = if h_is_mem ? ld_write : if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res));
+    assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
+    assign o_vs2_addr    = if h_is_fp ? fp_vs2_vrf : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP / widen-half / .w-full / narrow / src2
+    assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
+    assign o_vdold_addr  = if h_is_fp ? fp_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)); // FP elem reg / mask / narrow dest / group
+    assign o_vd_addr     = if h_is_fp ? fp_reg_vrf : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // FP / load / mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr;
+    assign o_vd_data     = if h_is_fp ? fp_acc_next : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))));
 
-    assign o_cdb_valid    = fire || va_fire || mem_cdb_fire;
+    assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
     assign o_cdb_pdst     = h_rd_pd;
     assign o_cdb_data     = h_cdb_data;
@@ -833,6 +959,12 @@ pub module vector_unit #(
     assign o_cdb_vstart_wen  = mem_cdb_fire;
     assign o_cdb_vstart      = if fault_q ? {56'd0, vstart_q} : 64'd0;
     assign o_cdb_vstore      = mem_cdb_fire && h_is_vse && !fault_q;
+
+    // ---- V3 vector FP fflags (ride the vu_cdb writeback) --------------------
+    // The accrued per-op flags pulse to the ROB on the FP op's retirement; the
+    // core routes them into fcsr at commit (muxed against the scalar FPU's).
+    assign o_cdb_fflags     = fp_fflags_q;
+    assign o_cdb_fflags_wen = fp_cdb_fire;
 
     // ---- FIFO maintenance + config update -----------------------------------
     let do_alloc: logic = i_alloc_en && has_free;
@@ -867,6 +999,10 @@ pub module vector_unit #(
             va_reg     = 3'd0;
             va_acc     = {1'b0 repeat VLEN};
             vn_lo      = 64'd0;
+            fp_state    = 2'd0;
+            fp_elem     = 8'd0;
+            fp_acc      = {1'b0 repeat VLEN};
+            fp_fflags_q = 5'd0;
         } else if i_flush {
             // Drop all speculative vector ops; restore config from the committed
             // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
@@ -884,6 +1020,8 @@ pub module vector_unit #(
             va_reg     = 3'd0;
             va_acc     = {1'b0 repeat VLEN};
             vn_lo      = 64'd0;
+            // Abandon any in-flight FP op; idempotent, re-executes from element 0.
+            fp_state    = 2'd0;
         } else {
             // Scalar-operand wakeup (int CDB snoop, both lanes).
             for i in 0..FIFO_N {
@@ -941,6 +1079,49 @@ pub module vector_unit #(
                     // DONE: retire on the vu_cdb writeback (vu_pop below).
                     if i_cdb_free {
                         mem_state = 2'd0;
+                    }
+                }
+            }
+            // FP arithmetic FSM (vfadd/.../vfmul): stream one element per cycle
+            // through the shared fpu_wrap, head first. fp_acc accumulates the
+            // current destination register (written at its boundary via
+            // fp_reg_wr / fp_acc_next) and fp_fflags_q OR-accumulates the flags.
+            case fp_state {
+                2'd0: {
+                    // IDLE: launch when an FP op is the ROB head (no scalar source
+                    // for .vv, so scalar_ok is always met).
+                    if (count != 0) && at_head && h_is_fp && scalar_ok {
+                        fp_elem     = 8'd0;
+                        fp_acc      = {1'b0 repeat VLEN};
+                        fp_fflags_q = 5'd0;
+                        if vl8 == 8'd0 {
+                            fp_state = 2'd2; // empty op: nothing to compute
+                        } else {
+                            fp_state = 2'd1;
+                        }
+                    }
+                }
+                2'd1: {
+                    // COMPUTE: process element fp_elem this cycle (single-cycle FPU
+                    // for V3a; a multi-cycle op would hold here on vfpu_busy).
+                    if !vfpu_busy {
+                        if fp_active {
+                            fp_fflags_q = fp_fflags_q | vfpu_fflags;
+                        }
+                        // Accumulate this element; reset at a register boundary
+                        // (the next register re-seeds from its old vd at local 0).
+                        fp_acc = if fp_reg_last ? {1'b0 repeat VLEN} : fp_acc_next;
+                        if fp_elem + 8'd1 >= vl8 {
+                            fp_state = 2'd2;
+                        } else {
+                            fp_elem = fp_elem + 8'd1;
+                        }
+                    }
+                }
+                2'd2: {
+                    // DONE: retire on the vu_cdb writeback (vu_pop below).
+                    if i_cdb_free {
+                        fp_state = 2'd0;
                     }
                 }
             }
