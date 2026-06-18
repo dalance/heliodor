@@ -425,9 +425,15 @@ pub module vector_unit #(
     // takes its second operand from the FP scalar f[rs1]. The reverse .vf forms
     // vfrsub.vf (100111 = f[rs1]-vs2) and vfrdiv.vf (100001 = f[rs1]/vs2) swap
     // the FPU operands (s1=scalar, s2=vs2).
-    let h_is_fp: logic = h_op == VecOp::VFALU;
-    let h_is_vf: logic = h_is_fp && (h_funct3 == 3'b101);
-    let fp_swap: logic = h_is_fp && (h_funct6 == 6'b100111 || h_funct6 == 6'b100001);
+    let h_is_fp  : logic = h_op == VecOp::VFALU;
+    let h_is_vf  : logic = h_is_fp && (h_funct3 == 3'b101);
+    // V3d: FP compare (funct6 011xxx) → 1-bit-per-element mask register result.
+    let h_is_fcmp: logic = h_is_fp && (h_funct6[5:3] == 3'b011);
+    // Reverse / swapped-operand forms: vfrsub.vf (100111), vfrdiv.vf (100001),
+    // and the .vf-only compares vmfgt (011101) / vmfge (011111), which are
+    // computed as f[rs1] < / <= vs2 with the FPU operands swapped.
+    let fp_swap  : logic = h_is_fp && (h_funct6 == 6'b100111 || h_funct6 == 6'b100001
+        || h_funct6 == 6'b011101 || h_funct6 == 6'b011111);
     // V2d LMUL>1: EMUL register groups walked per VALU op (integer LMUL 1/2/4/8
     // → 1/2/4/8 groups; fractional LMUL → 1). For a same-width ALU/merge/mul-div
     // op this is the destination register count (one written per group). A
@@ -857,6 +863,12 @@ pub module vector_unit #(
                 6'b100000: fp_fpu_op = fpu_pkg::FpuOp::FDIV_D; // vfdiv
                 6'b100001: fp_fpu_op = fpu_pkg::FpuOp::FDIV_D; // vfrdiv.vf (operands swapped)
                 6'b010011: fp_fpu_op = fpu_pkg::FpuOp::FSQRT_D; // vfsqrt.v (unary)
+                6'b011000: fp_fpu_op = fpu_pkg::FpuOp::FEQ_D; // vmfeq
+                6'b011100: fp_fpu_op = fpu_pkg::FpuOp::FEQ_D; // vmfne (result inverted)
+                6'b011001: fp_fpu_op = fpu_pkg::FpuOp::FLE_D; // vmfle
+                6'b011011: fp_fpu_op = fpu_pkg::FpuOp::FLT_D; // vmflt
+                6'b011101: fp_fpu_op = fpu_pkg::FpuOp::FLT_D; // vmfgt.vf (operands swapped)
+                6'b011111: fp_fpu_op = fpu_pkg::FpuOp::FLE_D; // vmfge.vf (operands swapped)
                 default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
             }
         } else {
@@ -873,6 +885,12 @@ pub module vector_unit #(
                 6'b100000: fp_fpu_op = fpu_pkg::FpuOp::FDIV_S; // vfdiv
                 6'b100001: fp_fpu_op = fpu_pkg::FpuOp::FDIV_S; // vfrdiv.vf (operands swapped)
                 6'b010011: fp_fpu_op = fpu_pkg::FpuOp::FSQRT_S; // vfsqrt.v (unary)
+                6'b011000: fp_fpu_op = fpu_pkg::FpuOp::FEQ_S; // vmfeq
+                6'b011100: fp_fpu_op = fpu_pkg::FpuOp::FEQ_S; // vmfne (result inverted)
+                6'b011001: fp_fpu_op = fpu_pkg::FpuOp::FLE_S; // vmfle
+                6'b011011: fp_fpu_op = fpu_pkg::FpuOp::FLT_S; // vmflt
+                6'b011101: fp_fpu_op = fpu_pkg::FpuOp::FLT_S; // vmfgt.vf (operands swapped)
+                6'b011111: fp_fpu_op = fpu_pkg::FpuOp::FLE_S; // vmfge.vf (operands swapped)
                 default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
             }
         }
@@ -920,8 +938,23 @@ pub module vector_unit #(
     let fp_sew_mask: logic<VLEN> = if fp_double ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
     let fp_acc_base: logic<VLEN> = if fp_local == 8'd0 ? i_vdold_data : fp_acc;
     let fp_acc_next: logic<VLEN> = if fp_active ? ((fp_acc_base & ~(fp_sew_mask << fp_bitoff)) | (fp_res_vlen << fp_bitoff)) : fp_acc_base;
-    // VRF write of a completed register during COMPUTE; retire from DONE.
-    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_reg_last;
+    // FP compare (funct6 011xxx): the FPU returns the boolean in bit 0 (FEQ/FLT/
+    // FLE); vmfne (011100) inverts it. The result packs 1 bit per element at bit
+    // position fp_elem (global) into a SINGLE mask register (vd) — inactive / tail
+    // bits stay undisturbed from the old mask. The mask accumulator reuses fp_acc,
+    // seeded from the old mask on element 0, and is written once at the last
+    // element (no per-register write, unlike the SEW-wide arithmetic accumulator).
+    let fp_cmp_raw  : logic       = vfpu_cdb.data[0];
+    let fp_cmp_res  : logic       = if h_funct6 == 6'b011100 ? !fp_cmp_raw : fp_cmp_raw; // vmfne inverts
+    let fp_mask_base: logic<VLEN> = if fp_elem == 8'd0 ? i_vdold_data : fp_acc;
+    let fp_mask_bit : logic<VLEN> = {127'd0, fp_cmp_res} << fp_elem;
+    let fp_mask_clr : logic<VLEN> = {127'd0, 1'b1} << fp_elem;
+    let fp_mask_next: logic<VLEN> = if fp_active ? ((fp_mask_base & ~fp_mask_clr) | fp_mask_bit) : fp_mask_base;
+    let fp_last_elem: logic       = (fp_elem + 8'd1) >= vl8;
+    // VRF writes during COMPUTE: arithmetic writes a completed register at its
+    // boundary; a compare writes its single mask register once at the last element.
+    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && !h_is_fcmp && fp_reg_last;
+    let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_fcmp && fp_last_elem;
     let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
 
     // ---- Execute the head (combinational) -----------------------------------
@@ -966,10 +999,10 @@ pub module vector_unit #(
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_fp ? fp_vs2_vrf : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_fp ? fp_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)); // FP elem reg / mask / narrow dest / group
-    assign o_vd_addr     = if h_is_fp ? fp_reg_vrf : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // FP / load / mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr;
-    assign o_vd_data     = if h_is_fp ? fp_acc_next : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))));
+    assign o_vdold_addr  = if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)); // FP mask/elem reg / int mask / narrow dest / group
+    assign o_vd_addr     = if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // FP mask/elem / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr;
+    assign o_vd_data     = if h_is_fp ? (if h_is_fcmp ? fp_mask_next : fp_acc_next) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
@@ -1142,14 +1175,20 @@ pub module vector_unit #(
                 }
                 2'd1: {
                     // COMPUTE: process element fp_elem this cycle (single-cycle FPU
-                    // for V3a; a multi-cycle op would hold here on vfpu_busy).
+                    // for arithmetic/compare; FDIV.D/FSQRT.D hold here on vfpu_busy).
                     if !vfpu_busy {
                         if fp_active {
                             fp_fflags_q = fp_fflags_q | vfpu_fflags;
                         }
-                        // Accumulate this element; reset at a register boundary
-                        // (the next register re-seeds from its old vd at local 0).
-                        fp_acc = if fp_reg_last ? {1'b0 repeat VLEN} : fp_acc_next;
+                        // A compare accumulates the running mask in fp_acc (no
+                        // reset — one mask register spans the whole op); arithmetic
+                        // accumulates the SEW-wide register value, resetting at each
+                        // register boundary (the next register re-seeds from old vd).
+                        if h_is_fcmp {
+                            fp_acc = fp_mask_next;
+                        } else {
+                            fp_acc = if fp_reg_last ? {1'b0 repeat VLEN} : fp_acc_next;
+                        }
                         if fp_elem + 8'd1 >= vl8 {
                             fp_state = 2'd2;
                         } else {

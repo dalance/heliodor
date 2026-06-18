@@ -269,6 +269,53 @@ _start:
     li   t6, 0x08                   # DZ (bit 3)
     bne  t5, t6, fail28
 
+    # ===================== V3d: FP compare → mask =====================
+    # ca = [1.0, 2.0, -1.5, 4.0]   cb = [2.0, 2.0, -1.5, 1.0]
+    # mask read back via vmv.x.s + andi 0xF (1 bit per element, low 4 bits).
+    .macro CKM exp, failL
+        vmv.x.s t5, v10; andi t5, t5, 0xF; li t6, \exp; bne t5, t6, \failL
+    .endm
+    li   a0, 0x80010700          # ca
+    li   a1, 0x80010740          # cb
+    li t1,0x3F800000; sw t1,0(a0);  li t1,0x40000000; sw t1,4(a0)
+    li t1,0xBFC00000; sw t1,8(a0);  li t1,0x40800000; sw t1,12(a0)
+    li t1,0x40000000; sw t1,0(a1);  li t1,0x40000000; sw t1,4(a1)
+    li t1,0xBFC00000; sw t1,8(a1);  li t1,0x3F800000; sw t1,12(a1)
+    li t1,0x40000000; sw t1,64(a0); flw fa0, 64(a0)  # fa0 = 2.0
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a0)             # v4 = ca
+    vle32.v v6, (a1)             # v6 = cb
+    # --- .vv compares ---
+    vmfeq.vv v10, v4, v6
+    CKM 0x6, fail29              # [0,1,1,0]
+    vmflt.vv v10, v4, v6
+    CKM 0x1, fail30              # [1,0,0,0]
+    vmfle.vv v10, v4, v6
+    CKM 0x7, fail31              # [1,1,1,0]
+    vmfne.vv v10, v4, v6
+    CKM 0x9, fail32              # [1,0,0,1]
+    # --- .vf compares (scalar 2.0) ---
+    vmfeq.vf v10, v4, fa0
+    CKM 0x2, fail33              # [0,1,0,0]
+    vmflt.vf v10, v4, fa0
+    CKM 0x5, fail34              # [1,0,1,0]
+    vmfgt.vf v10, v4, fa0
+    CKM 0x8, fail35              # [0,0,0,1]
+    vmfge.vf v10, v4, fa0
+    CKM 0xA, fail36              # [0,1,0,1]
+    # double-precision compare (SEW=64): cad=[1.0,2.0], cbd=[2.0,2.0]
+    li   a0, 0x80010780
+    li t1,0x3FF0000000000000; sd t1,0(a0)   # 1.0
+    li t1,0x4000000000000000; sd t1,8(a0)   # 2.0
+    li t1,0x4000000000000000; sd t1,16(a0)  # 2.0
+    li t1,0x4000000000000000; sd t1,24(a0)  # 2.0
+    vsetvli t0, x0, e64, m1      # vl=2
+    vle64.v v4, (a0)
+    addi a1, a0, 16
+    vle64.v v6, (a1)
+    vmflt.vv v10, v4, v6         # [1<2?1, 2<2?0] = 0b01 = 0x1
+    vmv.x.s t5, v10; andi t5, t5, 0x3; li t6, 0x1; bne t5, t6, fail36
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -315,3 +362,11 @@ fail25: li t0,25; sw t0,0(t3); 250: j 250b
 fail26: li t0,26; sw t0,0(t3); 260: j 260b
 fail27: li t0,27; sw t0,0(t3); 270: j 270b
 fail28: li t0,28; sw t0,0(t3); 280: j 280b
+fail29: li t0,29; sw t0,0(t3); 290: j 290b
+fail30: li t0,30; sw t0,0(t3); 300: j 300b
+fail31: li t0,31; sw t0,0(t3); 310: j 310b
+fail32: li t0,32; sw t0,0(t3); 320: j 320b
+fail33: li t0,33; sw t0,0(t3); 330: j 330b
+fail34: li t0,34; sw t0,0(t3); 340: j 340b
+fail35: li t0,35; sw t0,0(t3); 350: j 350b
+fail36: li t0,36; sw t0,0(t3); 360: j 360b
