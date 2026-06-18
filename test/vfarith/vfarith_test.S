@@ -521,6 +521,55 @@ _start:
     CK64 0, 0x401C000000000000, fail55   # 7.0
     CK64 8, 0x4020000000000000, fail55   # 8.0
 
+    # ================ V3i: widening FP (single -> double) =============
+    # vs2 = [1.5, 2.5, -3.0, 4.0], vs1 = [0.5, 0.5, 1.0, -2.0] (single)
+    li   a0, 0x80010C00          # vs2
+    li   a1, 0x80010C40          # vs1
+    li   a2, 0x80010C80          # dst (4 doubles = 2 regs)
+    li t1,0x3FC00000; sw t1,0(a0);  li t1,0x40200000; sw t1,4(a0)
+    li t1,0xC0400000; sw t1,8(a0);  li t1,0x40800000; sw t1,12(a0)
+    li t1,0x3F000000; sw t1,0(a1);  li t1,0x3F000000; sw t1,4(a1)
+    li t1,0x3F800000; sw t1,8(a1);  li t1,0xC0000000; sw t1,12(a1)
+    vsetvli t0, x0, e32, m1      # SEW=32, vl=4
+    vle32.v v4, (a0)             # vs2
+    vle32.v v6, (a1)             # vs1
+    # vfwadd.vv: (double)vs2 + (double)vs1 -> [2.0, 3.0, -2.0, 2.0]
+    vfwadd.vv v8, v4, v6
+    vsetvli t0, x0, e64, m2      # read 4 doubles back (v8,v9)
+    vse64.v v8, (a2)
+    CK64 0,  0x4000000000000000, fail56   # 2.0
+    CK64 8,  0x4008000000000000, fail56   # 3.0
+    CK64 16, 0xC000000000000000, fail56   # -2.0
+    CK64 24, 0x4000000000000000, fail56   # 2.0
+    # vfwsub.vv: vs2 - vs1 -> [1.0, 2.0, -4.0, 6.0]
+    vsetvli t0, x0, e32, m1
+    vfwsub.vv v8, v4, v6
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x3FF0000000000000, fail57   # 1.0
+    CK64 8,  0x4000000000000000, fail57   # 2.0
+    CK64 16, 0xC010000000000000, fail57   # -4.0
+    CK64 24, 0x4018000000000000, fail57   # 6.0
+    # vfwmul.vv: vs2 * vs1 -> [0.75, 1.25, -3.0, -8.0]
+    vsetvli t0, x0, e32, m1
+    vfwmul.vv v8, v4, v6
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x3FE8000000000000, fail58   # 0.75
+    CK64 8,  0x3FF4000000000000, fail58   # 1.25
+    CK64 16, 0xC008000000000000, fail58   # -3.0
+    CK64 24, 0xC020000000000000, fail58   # -8.0
+    # vfwadd.vf: vs2 + 0.5 -> [2.0, 3.0, -2.5, 4.5]
+    li t1,0x3F000000; sw t1,64(a0); flw fa1, 64(a0)   # 0.5
+    vsetvli t0, x0, e32, m1
+    vfwadd.vf v8, v4, fa1
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x4000000000000000, fail59   # 2.0
+    CK64 8,  0x4008000000000000, fail59   # 3.0
+    CK64 16, 0xC004000000000000, fail59   # -2.5
+    CK64 24, 0x4012000000000000, fail59   # 4.5
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -594,3 +643,7 @@ fail52: li t0,52; sw t0,0(t3); 520: j 520b
 fail53: li t0,53; sw t0,0(t3); 530: j 530b
 fail54: li t0,54; sw t0,0(t3); 540: j 540b
 fail55: li t0,55; sw t0,0(t3); 550: j 550b
+fail56: li t0,56; sw t0,0(t3); 560: j 560b
+fail57: li t0,57; sw t0,0(t3); 570: j 570b
+fail58: li t0,58; sw t0,0(t3); 580: j 580b
+fail59: li t0,59; sw t0,0(t3); 590: j 590b

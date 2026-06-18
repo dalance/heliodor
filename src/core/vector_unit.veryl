@@ -309,6 +309,45 @@ pub module vector_unit #(
         return res[W - 1:0];
     }
 
+    // ---- V3i widening FP: single -> double (exact) --------------------------
+    // Widening FP arithmetic computes in double, so each single operand is
+    // reformatted to double first. The widening is exact: normals just rebias the
+    // exponent (e + 896 = e - 127 + 1023) and left-pad the mantissa; subnormals
+    // normalize via a leading-one search; zero/inf/NaN pass through.
+    function s2d (x: input logic<32>) -> logic<64> {
+        let xs: logic     = x[31];
+        let xe: logic<8>  = x[30:23];
+        let xm: logic<23> = x[22:0];
+        var r : logic<64>;
+        if xe == 8'd0 {
+            if xm == 23'd0 {
+                r = {xs, 63'd0}; // signed zero
+            } else {
+                // Subnormal single -> normal double. Find the leading one.
+                var lz: logic<5>;
+                lz = 5'd23;
+                for i in 0..23 {
+                    if xm[22 - i] == 1'b1 && lz == 5'd23 {
+                        lz = i as 5;
+                    }
+                }
+                // Double exp = (22-lz) + 874 = 896 - lz; drop the leading one.
+                let dexp: logic<11> = 11'd896 - {6'd0, lz};
+                let frac: logic<23> = xm << (lz + 5'd1);
+                r = {xs, dexp, frac, 29'd0};
+            }
+        } else if xe == 8'hFF {
+            if xm == 23'd0 {
+                r = {xs, 11'h7FF, 52'd0}; // infinity
+            } else {
+                r = {xs, 11'h7FF, xm, 29'd0}; // NaN (payload preserved)
+            }
+        } else {
+            r = {xs, ({3'd0, xe} + 11'd896), xm, 29'd0}; // normal
+        }
+        return r;
+    }
+
     // ---- In-order FIFO state ------------------------------------------------
     var occupied   : logic                [FIFO_N];
     var fifo_op    : vector_pkg::VecOp     [FIFO_N];
@@ -450,6 +489,10 @@ pub module vector_unit #(
     // element as an accumuland. funct6[2] picks the multiplicand pairing
     // (1 = macc: vs1*vs2 + vd ; 0 = madd: vs1*vd + vs2).
     let h_is_fma: logic = h_is_fp && (h_funct6[5:3] == 3'b101);
+    // V3i: widening FP add/sub/mul (.vv/.vf): vfwadd(110000)/vfwsub(110010)/
+    // vfwmul(111000). Result EEW = 2*SEW (single -> double), so the destination
+    // uses 2*SEW geometry (one source register pair -> two dest registers).
+    let h_is_fwiden: logic = h_is_fp && (h_funct6 == 6'b110000 || h_funct6 == 6'b110010 || h_funct6 == 6'b111000);
     // Reverse / swapped-operand forms: vfrsub.vf (100111), vfrdiv.vf (100001),
     // and the .vf-only compares vmfgt (011101) / vmfge (011111), which are
     // computed as f[rs1] < / <= vs2 with the FPU operands swapped.
@@ -879,14 +922,31 @@ pub module vector_unit #(
     let fma_mul_a : logic<64>   = if h_is_vf ? fp_scalar : fp_velem_b;
     let fma_mul_b : logic<64>   = if h_funct6[2] ? fp_velem_a : fp_vd_elem; // macc: vs2 / madd: vd
     let fma_add   : logic<64>   = if h_funct6[2] ? fp_vd_elem : fp_velem_a; // macc: vd / madd: vs2
-    let fp_s1     : logic<64>   = if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a);
-    let fp_s2     : logic<64>   = if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op);
+    // V3i widening: convert the single source operands to double (exact) and run
+    // the double FPU op. vfwadd/vfwsub = vs2 +/- vs1, vfwmul = vs2*vs1 (s1=vs2).
+    let fw_vs2_s  : logic<32>   = fp_a_sh[31:0];
+    let fw_vs1_s  : logic<32>   = if h_is_vf ? i_fscalar_data[31:0] : fp_b_sh[31:0];
+    var fw_s1d    : logic<64>;
+    var fw_s2d    : logic<64>;
+    always_comb {
+        fw_s1d = s2d(fw_vs2_s);
+        fw_s2d = s2d(fw_vs1_s);
+    }
+    let fp_s1     : logic<64>   = if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a));
+    let fp_s2     : logic<64>   = if h_is_fwiden ? fw_s2d : (if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op));
     let fp_s3     : logic<64>   = if h_is_fma ? fma_add : 64'd0;
     // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
     // and vfsgnj take magnitude/sign from vs2/vs1, matching s1=vs2, s2=vs1.
     var fp_fpu_op: fpu_pkg::FpuOp;
     always_comb {
-        if fp_double {
+        if h_is_fwiden {
+            // Widening always computes in double (operands are s2d-converted).
+            case h_funct6 {
+                6'b110010: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D; // vfwsub
+                6'b111000: fp_fpu_op = fpu_pkg::FpuOp::FMUL_D; // vfwmul
+                default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_D; // vfwadd (110000)
+            }
+        } else if fp_double {
             case h_funct6 {
                 6'b000000: fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
                 6'b000010: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D;
@@ -1000,10 +1060,19 @@ pub module vector_unit #(
     // into the register accumulator at fp_bitoff.
     let fp_wval    : logic<64>   = if h_is_fmerge ? (if fp_active ? fp_scalar : fp_velem_a) : vfpu_cdb.data;
     let fp_wr_elem : logic       = h_is_fmerge || fp_active;
-    let fp_res_vlen: logic<VLEN> = if fp_double ? {64'd0, fp_wval} : {96'd0, fp_wval[31:0]};
-    let fp_sew_mask: logic<VLEN> = if fp_double ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
-    let fp_acc_base: logic<VLEN> = if fp_local == 8'd0 ? i_vdold_data : fp_acc;
-    let fp_acc_next: logic<VLEN> = if fp_wr_elem ? ((fp_acc_base & ~(fp_sew_mask << fp_bitoff)) | (fp_res_vlen << fp_bitoff)) : fp_acc_base;
+    // Destination element geometry. Widening writes 2*SEW (double) elements, two
+    // per register (one source register pair -> two dest registers); everything
+    // else writes SEW elements at the source geometry (fp_reg / fp_bitoff). For a
+    // widening op the result is the full 64-bit double from the FPU.
+    let fp_res_vlen: logic<VLEN>  = if (fp_double || h_is_fwiden) ? {64'd0, fp_wval} : {96'd0, fp_wval[31:0]};
+    let fp_dmask   : logic<VLEN>  = if (fp_double || h_is_fwiden) ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
+    let fp_dbitoff : logic<8>     = if h_is_fwiden ? (if fp_elem[0] ? 8'd64 : 8'd0) : fp_bitoff;
+    let fp_dlocal0 : logic        = if h_is_fwiden ? !fp_elem[0] : (fp_local == 8'd0);
+    let fp_dreg    : logic<8>     = if h_is_fwiden ? (fp_elem >> 1) : fp_reg;
+    let fp_dreg_last: logic       = if h_is_fwiden ? (fp_elem[0] || ((fp_elem + 8'd1) >= vl8)) : fp_reg_last;
+    let fp_dreg_vrf: logic<VRF_W> = h_vd + fp_dreg[VRF_W - 1:0];
+    let fp_acc_base: logic<VLEN>  = if fp_dlocal0 ? i_vdold_data : fp_acc;
+    let fp_acc_next: logic<VLEN>  = if fp_wr_elem ? ((fp_acc_base & ~(fp_dmask << fp_dbitoff)) | (fp_res_vlen << fp_dbitoff)) : fp_acc_base;
     // FP compare (funct6 011xxx): the FPU returns the boolean in bit 0 (FEQ/FLT/
     // FLE); vmfne (011100) inverts it. The result packs 1 bit per element at bit
     // position fp_elem (global) into a SINGLE mask register (vd) — inactive / tail
@@ -1019,7 +1088,7 @@ pub module vector_unit #(
     let fp_last_elem: logic       = (fp_elem + 8'd1) >= vl8;
     // VRF writes during COMPUTE: arithmetic writes a completed register at its
     // boundary; a compare writes its single mask register once at the last element.
-    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && !h_is_fcmp && fp_reg_last;
+    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && !h_is_fcmp && fp_dreg_last;
     let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_fcmp && fp_last_elem;
     let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
 
@@ -1068,8 +1137,8 @@ pub module vector_unit #(
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_fp ? fp_vs2_vrf : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / FP mask/elem reg / int mask / narrow dest / group
-    assign o_vd_addr     = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / FP / load / int mask / narrow / arith
+    assign o_vdold_addr  = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if h_is_fcmp ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / FP mask|elem|widen-dst reg / int mask / narrow dest / group
+    assign o_vd_addr     = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if h_is_fcmp ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / FP / load / int mask / narrow / arith
     assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || sf_wr;
     assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : fp_acc_next) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))));
 
@@ -1258,7 +1327,7 @@ pub module vector_unit #(
                         if h_is_fcmp {
                             fp_acc = fp_mask_next;
                         } else {
-                            fp_acc = if fp_reg_last ? {1'b0 repeat VLEN} : fp_acc_next;
+                            fp_acc = if fp_dreg_last ? {1'b0 repeat VLEN} : fp_acc_next;
                         }
                         if fp_elem + 8'd1 >= vl8 {
                             fp_state = 2'd2;
