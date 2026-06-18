@@ -343,6 +343,47 @@ _start:
     CK 8,  0x41100000, fail38
     CK 12, 0x41100000, fail38
 
+    # ================ V3f: vfmv.s.f / vfmv.f.s ========================
+    # vfmv.s.f: vd[0] <- f[rs1], rest undisturbed.
+    li   a0, 0x80010900
+    li t1,0xAAAA0000; sw t1,0(a0);  li t1,0xAAAA0001; sw t1,4(a0)
+    li t1,0xAAAA0002; sw t1,8(a0);  li t1,0xAAAA0003; sw t1,12(a0)
+    li t1,0x41100000; sw t1,64(a0); flw fa5, 64(a0)  # fa5 = 9.0
+    li   a2, 0x80010080
+    vsetvli t0, x0, e32, m1
+    vle32.v v8, (a0)             # v8 = sentinel
+    vfmv.s.f v8, fa5             # v8[0] = 9.0
+    vse32.v v8, (a2)
+    CK 0,  0x41100000, fail39    # 9.0
+    CK 4,  0xAAAA0001, fail39    # undisturbed
+    CK 8,  0xAAAA0002, fail39    # undisturbed
+    CK 12, 0xAAAA0003, fail39    # undisturbed
+    # vfmv.f.s: f[rd] <- vs2[0] (single).
+    li   a1, 0x80010940
+    li t1,0x40E00000; sw t1,0(a1)           # 7.0
+    li t1,0x11110000; sw t1,4(a1)
+    vle32.v v4, (a1)
+    vfmv.f.s fa6, v4             # fa6 = v4[0] = 7.0
+    li   a2, 0x80010980
+    fsw  fa6, 0(a2)
+    lwu  t5, 0(a2); li t6, 0x40E00000; bne t5, t6, fail40
+    # vfmv.f.s double
+    li t1,0x401C000000000000; sd t1,0(a1)   # 7.0 double
+    vsetvli t0, x0, e64, m1
+    vle64.v v4, (a1)
+    vfmv.f.s fa6, v4            # fa6 = 7.0 (double)
+    fsd  fa6, 0(a2)
+    ld   t5, 0(a2); li t6, 0x401C000000000000; bne t5, t6, fail41
+    # vfmv.s.f double: v8[0] <- f[rs1], v8[1] undisturbed
+    li t1,0x4022000000000000; sd t1,16(a1); fld fa5, 16(a1)  # 9.0 double
+    li t1,0xBBBB000000000000; sd t1,0(a0);  li t1,0xBBBB000000000001; sd t1,8(a0)
+    vle64.v v8, (a0)
+    vfmv.s.f v8, fa5           # v8[0] = 9.0 (double)
+    li   a2, 0x80010180
+    vse64.v v8, (a2)
+    CK64 0, 0x4022000000000000, fail42   # 9.0
+    CK64 8, 0xBBBB000000000001, fail42   # undisturbed
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -399,3 +440,7 @@ fail35: li t0,35; sw t0,0(t3); 350: j 350b
 fail36: li t0,36; sw t0,0(t3); 360: j 360b
 fail37: li t0,37; sw t0,0(t3); 370: j 370b
 fail38: li t0,38; sw t0,0(t3); 380: j 380b
+fail39: li t0,39; sw t0,0(t3); 390: j 390b
+fail40: li t0,40; sw t0,0(t3); 400: j 400b
+fail41: li t0,41; sw t0,0(t3); 410: j 410b
+fail42: li t0,42; sw t0,0(t3); 420: j 420b

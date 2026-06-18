@@ -42,7 +42,8 @@ pub module vector_unit #(
     // No readiness tracking is needed — the VU runs at the ROB head, so f[rs1]'s
     // producer has committed and the value is in prf_fp.
     i_alloc_fscalar_pdst: input  logic         <PRF_W>,
-    i_alloc_has_rd      : input  logic                , // writes int rd (!= x0)
+    i_alloc_has_rd      : input  logic                , // writes a scalar rd (int or FP)
+    i_alloc_rd_is_fp    : input  logic                , // the scalar rd is an FP reg (vfmv.f.s)
     i_alloc_rd_pdst     : input  logic         <PRF_W>,
     i_alloc_rob_idx     : input  logic         <ROB_IDX_W>,
     o_alloc_rdy         : output logic                , // FIFO has a free slot
@@ -150,6 +151,9 @@ pub module vector_unit #(
     i_frm           : input  logic<3>,
     o_cdb_fflags    : output logic<5>,
     o_cdb_fflags_wen: output logic   ,
+    // V3f: vfmv.f.s writes the scalar FP register file. When the VU drives this
+    // writeback, the core must route cdb.pdst/data to prf_fp (cdb_dest_is_fp).
+    o_cdb_fp_dest   : output logic   ,
 
     // ---- Flush (commit-time redirect) ---------------------------------------
     i_flush: input logic,
@@ -317,6 +321,7 @@ pub module vector_unit #(
     var fifo_s_rdy : logic                 [FIFO_N];
     var fifo_fs_pd : logic         <PRF_W> [FIFO_N]; // V3b: FP scalar pdst (.vf)
     var fifo_has_rd: logic                 [FIFO_N];
+    var fifo_rd_fp : logic                 [FIFO_N]; // V3f: scalar rd is FP (vfmv.f.s)
     var fifo_rd_pd : logic         <PRF_W> [FIFO_N];
     var fifo_rob   : logic     <ROB_IDX_W> [FIFO_N];
     var head       : logic         <FIFO_W>;
@@ -386,12 +391,16 @@ pub module vector_unit #(
     let h_s_rdy : logic             = fifo_s_rdy[head];
     let h_fs_pd : logic     <PRF_W> = fifo_fs_pd[head]; // V3b FP scalar pdst
     let h_has_rd: logic             = fifo_has_rd[head];
+    let h_rd_fp : logic             = fifo_rd_fp[head]; // V3f scalar rd is FP
     let h_rd_pd : logic     <PRF_W> = fifo_rd_pd[head];
     let h_rob   : logic <ROB_IDX_W> = fifo_rob[head];
 
     let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
     let h_is_valu: logic = h_op == VecOp::VALU;
     let h_is_vmv : logic = h_op == VecOp::VMV_X_S;
+    // V3f FP scalar <-> element-0 moves (single-cycle, like vmv.x.s / vset).
+    let h_is_vfmv_sf: logic = h_op == VecOp::VFMV_S_F; // vd[0] <- f[rs1] (VRF write)
+    let h_is_vfmv_fs: logic = h_op == VecOp::VFMV_F_S; // f[rd] <- vs2[0] (FP CDB)
     // OPIVx/OPMVx operand mode + op: funct6 (inst[31:26]) selects the op; funct3
     // (inst[14:12]) the operand mode. VV reads vs1[i] (OPIVV=000 / OPMVV=010 →
     // bit2=0,bit0=0); VX reads x[rs1] (OPIVX=100 / OPMVX=110 → bit2=1,bit0=0);
@@ -761,6 +770,14 @@ pub module vector_unit #(
             default: vmv_res = i_vs2_data[63:0];
         }
     }
+    // ---- V3f FP scalar moves ------------------------------------------------
+    // vfmv.f.s: f[rd] = vs2[element 0] (NaN-boxed for SEW=32, raw for SEW=64).
+    let fp_mv_res: logic<64> = if vsew == 3'd3 ? i_vs2_data[63:0] : {32'hffffffff, i_vs2_data[31:0]};
+    // vfmv.s.f: vd[0] = f[rs1], the rest of vd undisturbed. Splice the SEW-wide
+    // scalar (vector elements are not NaN-boxed) into element 0 of the old vd.
+    let sf_mask: logic<VLEN> = if vsew == 3'd3 ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
+    let sf_val : logic<VLEN> = if vsew == 3'd3 ? {64'd0, i_fscalar_data} : {96'd0, i_fscalar_data[31:0]};
+    let sf_res : logic<VLEN> = (i_vdold_data & ~sf_mask) | sf_val;
 
     // ---- V1 unit-stride memory: addressing + element packing ----------------
     // Operands are stable for the whole op (the head is not popped until DONE):
@@ -972,7 +989,7 @@ pub module vector_unit #(
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
     // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
-    let h_is_1cyc: logic = h_is_vset || h_is_vmv;
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs;
     let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
@@ -992,7 +1009,10 @@ pub module vector_unit #(
     let mem_elem_done: logic = (mem_state == 2'd2) && ((m_active && i_mem_ready && !mem_fault_now) || !m_active);
     let mem_ld_wr    : logic = mem_elem_done && h_is_vle && reg_last;
 
-    let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
+    let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : if h_is_vfmv_fs ? fp_mv_res : 64'd0;
+    // vfmv.s.f writes vd[0] in the (single-cycle) fire path; suppress the write
+    // when vl == 0 (the move is a no-op then).
+    let sf_wr: logic = fire && h_is_vfmv_sf && (vl8 != 8'd0);
     // Register group for source / dest addressing. A compare reads source group
     // base+va_reg but writes its SINGLE mask register (h_vd), only on the final
     // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
@@ -1010,13 +1030,14 @@ pub module vector_unit #(
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_fp ? fp_vs2_vrf : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)); // FP mask/elem reg / int mask / narrow dest / group
-    assign o_vd_addr     = if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // FP mask/elem / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr;
-    assign o_vd_data     = if h_is_fp ? (if h_is_fcmp ? fp_mask_next : fp_acc_next) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))));
+    assign o_vdold_addr  = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / FP mask/elem reg / int mask / narrow dest / group
+    assign o_vd_addr     = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if h_is_fcmp ? h_vd : fp_reg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / FP / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || sf_wr;
+    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : fp_acc_next) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
-    assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
+    assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
+    assign o_cdb_fp_dest  = fire && h_rd_fp;  // vfmv.f.s → write prf_fp (cdb_dest_is_fp)
     assign o_cdb_pdst     = h_rd_pd;
     assign o_cdb_data     = h_cdb_data;
     assign o_cdb_rob_idx  = h_rob;
@@ -1066,6 +1087,7 @@ pub module vector_unit #(
                 fifo_fs_pd[i]  = 6'd0;
                 fifo_s_rdy[i]  = 1'b0;
                 fifo_has_rd[i] = 1'b0;
+                fifo_rd_fp[i]  = 1'b0;
                 fifo_rd_pd[i]  = 6'd0;
                 fifo_rob[i]    = 5'd0;
             }
@@ -1249,6 +1271,7 @@ pub module vector_unit #(
                 fifo_s_pdst[tail] = i_alloc_scalar_pdst;
                 fifo_fs_pd[tail]  = i_alloc_fscalar_pdst; // V3b FP scalar (.vf)
                 fifo_has_rd[tail] = i_alloc_has_rd;
+                fifo_rd_fp[tail]  = i_alloc_rd_is_fp;
                 fifo_rd_pd[tail]  = i_alloc_rd_pdst;
                 fifo_rob[tail]    = i_alloc_rob_idx;
                 // Initial scalar readiness: core-supplied, or same-cycle int CDB.
