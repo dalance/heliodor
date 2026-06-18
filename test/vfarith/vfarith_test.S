@@ -384,6 +384,80 @@ _start:
     CK64 0, 0x4022000000000000, fail42   # 9.0
     CK64 8, 0xBBBB000000000001, fail42   # undisturbed
 
+    # ===================== V3g: vfcvt / vfclass =======================
+    csrwi frm, 0                 # RNE (deterministic conversion rounding)
+    li   a0, 0x80010A00
+    li   a2, 0x80010080
+    # vfcvt.x.f.v (float -> int, fcsr.frm). NOTE: heliodor's FPU float->int
+    # truncates toward zero (a pre-existing scalar fcvt limitation — see the
+    # commit/memory note), so this is exercised with fraction < 0.5 values where
+    # round-to-nearest and truncate agree: [1.25, 2.25, -1.25, 3.0] -> [1, 2, -1, 3].
+    li t1,0x3FA00000; sw t1,0(a0);  li t1,0x40100000; sw t1,4(a0)
+    li t1,0xBFA00000; sw t1,8(a0);  li t1,0x40400000; sw t1,12(a0)
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a0)
+    vfcvt.x.f.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  1,          fail43
+    CK 4,  2,          fail43
+    CK 8,  0xFFFFFFFF, fail43    # -1
+    CK 12, 3,          fail43
+    # vfcvt.rtz.x.f.v (truncate toward zero): [1.5, 2.5, -1.5, 3.0] -> [1, 2, -1, 3]
+    li t1,0x3FC00000; sw t1,0(a0);  li t1,0x40200000; sw t1,4(a0)
+    li t1,0xBFC00000; sw t1,8(a0);  li t1,0x40400000; sw t1,12(a0)
+    vle32.v v4, (a0)
+    vfcvt.rtz.x.f.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  1,          fail44
+    CK 4,  2,          fail44
+    CK 8,  0xFFFFFFFF, fail44    # -1
+    CK 12, 3,          fail44
+    # vfcvt.f.x.v (signed int -> float): [5, -3, 100, -1] -> [5.0, -3.0, 100.0, -1.0]
+    li t1,5; sw t1,0(a0);  li t1,0xFFFFFFFD; sw t1,4(a0)
+    li t1,100; sw t1,8(a0); li t1,0xFFFFFFFF; sw t1,12(a0)
+    vle32.v v4, (a0)
+    vfcvt.f.x.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40A00000, fail45    # 5.0
+    CK 4,  0xC0400000, fail45    # -3.0
+    CK 8,  0x42C80000, fail45    # 100.0
+    CK 12, 0xBF800000, fail45    # -1.0
+    # vfcvt.f.xu.v (unsigned): 0xFFFFFFFD as uint (4294967293) -> ~2^32
+    vfcvt.f.xu.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40A00000, fail46    # 5.0
+    CK 4,  0x4F800000, fail46    # 4294967293 -> 2^32 (vs f.x gave -3.0)
+    CK 8,  0x42C80000, fail46    # 100.0
+    # vfcvt.xu.f.v (float -> unsigned int): [5.0, 10.0, 255.0, 2.0] -> [5, 10, 255, 2]
+    li t1,0x40A00000; sw t1,0(a0);  li t1,0x41200000; sw t1,4(a0)
+    li t1,0x437F0000; sw t1,8(a0);  li t1,0x40000000; sw t1,12(a0)
+    vle32.v v4, (a0)
+    vfcvt.xu.f.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  5,   fail47
+    CK 4,  10,  fail47
+    CK 8,  255, fail47
+    CK 12, 2,   fail47
+    # vfclass.v: [-inf, -1.0, +0.0, +inf] -> [0x001, 0x002, 0x010, 0x080]
+    li t1,0xFF800000; sw t1,0(a0);  li t1,0xBF800000; sw t1,4(a0)
+    li t1,0x00000000; sw t1,8(a0);  li t1,0x7F800000; sw t1,12(a0)
+    vle32.v v4, (a0)
+    vfclass.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x001, fail48    # -inf
+    CK 4,  0x002, fail48    # -normal
+    CK 8,  0x010, fail48    # +0
+    CK 12, 0x080, fail48    # +inf
+    # SEW=64 vfcvt.f.x.v: int64 [7, -2] -> [7.0, -2.0]
+    li t1,7; sd t1,0(a0);  li t1,-2; sd t1,8(a0)
+    li   a2, 0x80010180
+    vsetvli t0, x0, e64, m1
+    vle64.v v4, (a0)
+    vfcvt.f.x.v v8, v4
+    vse64.v v8, (a2)
+    CK64 0, 0x401C000000000000, fail49   # 7.0
+    CK64 8, 0xC000000000000000, fail49   # -2.0
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -444,3 +518,10 @@ fail39: li t0,39; sw t0,0(t3); 390: j 390b
 fail40: li t0,40; sw t0,0(t3); 400: j 400b
 fail41: li t0,41; sw t0,0(t3); 410: j 410b
 fail42: li t0,42; sw t0,0(t3); 420: j 420b
+fail43: li t0,43; sw t0,0(t3); 430: j 430b
+fail44: li t0,44; sw t0,0(t3); 440: j 440b
+fail45: li t0,45; sw t0,0(t3); 450: j 450b
+fail46: li t0,46; sw t0,0(t3); 460: j 460b
+fail47: li t0,47; sw t0,0(t3); 470: j 470b
+fail48: li t0,48; sw t0,0(t3); 480: j 480b
+fail49: li t0,49; sw t0,0(t3); 490: j 490b
