@@ -180,6 +180,95 @@ _start:
     CK64 0, 0x4008000000000000, fail16b  # 1.0+2.0 = 3.0
     CK64 8, 0x4010000000000000, fail16b  # 2.0+2.0 = 4.0
 
+    # ===================== V3c: vfdiv / vfsqrt =========================
+    # single-precision (single-cycle) div family. p / q chosen exact.
+    li   a0, 0x80010400          # p (numerator)
+    li   a1, 0x80010440          # q (denominator)
+    li   a2, 0x80010080          # dst
+    li t1,0x40800000; sw t1,0(a0)   # 4.0
+    li t1,0x41000000; sw t1,4(a0)   # 8.0
+    li t1,0x40000000; sw t1,8(a0)   # 2.0
+    li t1,0x3F800000; sw t1,12(a0)  # 1.0
+    li t1,0x40000000; sw t1,0(a1)   # 2.0
+    li t1,0x40800000; sw t1,4(a1)   # 4.0
+    li t1,0x40800000; sw t1,8(a1)   # 4.0
+    li t1,0x3F000000; sw t1,12(a1)  # 0.5
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a0)             # v4 = p
+    vle32.v v6, (a1)             # v6 = q
+    vfdiv.vv v8, v4, v6          # p / q
+    vse32.v v8, (a2)
+    CK 0,  0x40000000, fail22    # 4/2 = 2.0
+    CK 4,  0x40000000, fail22    # 8/4 = 2.0
+    CK 8,  0x3F000000, fail22    # 2/4 = 0.5
+    CK 12, 0x40000000, fail22    # 1/0.5 = 2.0
+    vfdiv.vf v8, v4, fa0         # p / 2.0 (fa0 = 2.0 from earlier)
+    vse32.v v8, (a2)
+    CK 0,  0x40000000, fail23    # 4/2 = 2.0
+    CK 4,  0x40800000, fail23    # 8/2 = 4.0
+    CK 8,  0x3F800000, fail23    # 2/2 = 1.0
+    CK 12, 0x3F000000, fail23    # 1/2 = 0.5
+    li t1,0x41000000; sw t1,64(a0); flw fa2, 64(a0)  # fa2 = 8.0
+    vfrdiv.vf v8, v4, fa2        # 8.0 / p (reverse)
+    vse32.v v8, (a2)
+    CK 0,  0x40000000, fail24    # 8/4 = 2.0
+    CK 4,  0x3F800000, fail24    # 8/8 = 1.0
+    CK 8,  0x40800000, fail24    # 8/2 = 4.0
+    CK 12, 0x41000000, fail24    # 8/1 = 8.0
+    # vfsqrt.v (single) — perfect squares
+    li t1,0x40800000; sw t1,0(a0)   # 4.0
+    li t1,0x41800000; sw t1,4(a0)   # 16.0
+    li t1,0x42800000; sw t1,8(a0)   # 64.0
+    li t1,0x3F800000; sw t1,12(a0)  # 1.0
+    vle32.v v4, (a0)
+    vfsqrt.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40000000, fail25    # sqrt(4)  = 2.0
+    CK 4,  0x40800000, fail25    # sqrt(16) = 4.0
+    CK 8,  0x41000000, fail25    # sqrt(64) = 8.0
+    CK 12, 0x3F800000, fail25    # sqrt(1)  = 1.0
+
+    # double-precision (MULTI-CYCLE busy path) div + sqrt
+    li   a0, 0x80010500
+    li   a2, 0x80010180
+    li t1,0x4010000000000000; sd t1,0(a0)   # 4.0
+    li t1,0x4020000000000000; sd t1,8(a0)   # 8.0
+    li t1,0x4000000000000000; sd t1,16(a0)  # 2.0
+    li t1,0x4010000000000000; sd t1,24(a0)  # 4.0
+    vsetvli t0, x0, e64, m1      # SEW=64, vl=2
+    vle64.v v4, (a0)             # [4.0, 8.0]
+    addi a1, a0, 16
+    vle64.v v6, (a1)             # [2.0, 4.0]
+    vfdiv.vv v8, v4, v6          # [4/2, 8/4] = [2.0, 2.0]  (FDIV.D, 57cy each)
+    vse64.v v8, (a2)
+    CK64 0, 0x4000000000000000, fail26   # 2.0
+    CK64 8, 0x4000000000000000, fail26   # 2.0
+    li t1,0x4030000000000000; sd t1,0(a0)   # 16.0
+    li t1,0x4050000000000000; sd t1,8(a0)   # 64.0
+    vle64.v v4, (a0)
+    vfsqrt.v v8, v4              # [sqrt(16), sqrt(64)] = [4.0, 8.0]  (FSQRT.D)
+    vse64.v v8, (a2)
+    CK64 0, 0x4010000000000000, fail27   # 4.0
+    CK64 8, 0x4020000000000000, fail27   # 8.0
+
+    # div-by-zero fflags: 1.0 / 0.0 = +inf, sets DZ (bit 3 = 0x08)
+    li   a0, 0x80010600          # dividend vector (vs2)
+    li   a1, 0x80010640          # divisor vector  (vs1)
+    li   a2, 0x80010680          # dst
+    li t1,0x3F800000; sw t1,0(a0)   # 1.0
+    li t1,0x00000000; sw t1,0(a1)   # 0.0
+    csrw fflags, x0
+    li   t1, 1
+    vsetvli t0, t1, e32, m1         # vl = 1
+    vle32.v v4, (a0)                # v4[0] = 1.0
+    vle32.v v6, (a1)                # v6[0] = 0.0
+    vfdiv.vv v8, v4, v6             # 1.0 / 0.0 = +inf
+    vse32.v v8, (a2)
+    lwu  t5, 0(a2); li t6, 0x7F800000; bne t5, t6, fail28   # +inf
+    csrr t5, fflags
+    li   t6, 0x08                   # DZ (bit 3)
+    bne  t5, t6, fail28
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -219,3 +308,10 @@ fail18: li t0,18; sw t0,0(t3); 180: j 180b
 fail19: li t0,19; sw t0,0(t3); 190: j 190b
 fail20: li t0,20; sw t0,0(t3); 200: j 200b
 fail16b: li t0,21; sw t0,0(t3); 210: j 210b
+fail22: li t0,22; sw t0,0(t3); 220: j 220b
+fail23: li t0,23; sw t0,0(t3); 230: j 230b
+fail24: li t0,24; sw t0,0(t3); 240: j 240b
+fail25: li t0,25; sw t0,0(t3); 250: j 250b
+fail26: li t0,26; sw t0,0(t3); 260: j 260b
+fail27: li t0,27; sw t0,0(t3); 270: j 270b
+fail28: li t0,28; sw t0,0(t3); 280: j 280b
