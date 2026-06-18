@@ -224,6 +224,31 @@ pub module vector_unit #(
         };
     }
 
+    // ---- Per-element widening add/sub/mul (V2d-4, OPMVV/OPMVX funct6 11xxxx) -
+    // a, b are SEW-wide source elements; the result is 2*W (= 2*SEW). Operands
+    // are sign-/zero-extended to 2*W per signedness before the op (the low 2*W
+    // bits of the extended product hold the correctly-signed widening product).
+    function vwiden::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W * 2> {
+        let a_s: logic<W * 2> = {a[W - 1] repeat W, a};
+        let b_s: logic<W * 2> = {b[W - 1] repeat W, b};
+        let a_u: logic<W * 2> = {1'b0 repeat W, a};
+        let b_u: logic<W * 2> = {1'b0 repeat W, b};
+        return case op {
+            6'b110000: a_u + b_u, // vwaddu
+            6'b110001: a_s + b_s, // vwadd
+            6'b110010: a_u - b_u, // vwsubu
+            6'b110011: a_s - b_s, // vwsub
+            6'b111000: a_u * b_u, // vwmulu
+            6'b111010: a_s * b_u, // vwmulsu
+            6'b111011: a_s * b_s, // vwmul
+            default  : a_u + b_u,
+        };
+    }
+
     // ---- In-order FIFO state ------------------------------------------------
     var occupied   : logic                [FIFO_N];
     var fifo_op    : vector_pkg::VecOp     [FIFO_N];
@@ -304,6 +329,9 @@ pub module vector_unit #(
     // register result) and merge/vmv.v (funct6 010111 → element select).
     let h_is_cmp  : logic = h_funct6[5:3] == 3'b011;
     let h_is_merge: logic = h_funct6 == 6'b010111;
+    // V2d-4 widening (OPMVV/OPMVX funct6 11xxxx): result EEW = 2*SEW, so the
+    // destination spans 2*EMUL registers (one source group → two dest groups).
+    let h_is_widen: logic = h_is_opm && (h_funct6[5:4] == 2'b11);
     // V1 unit-stride memory ops.
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
@@ -323,7 +351,8 @@ pub module vector_unit #(
             emul = 4'd1 << h_vlmul[1:0]; // 1/2/4/8
         }
     }
-    let va_nregs: logic<4> = emul;
+    // Widening walks 2*EMUL destination groups; all others walk EMUL.
+    let va_nregs: logic<4> = if h_is_widen ? {emul[2:0], 1'b0} : emul;
     // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
     // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
     let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
@@ -523,6 +552,53 @@ pub module vector_unit #(
         }
     }
 
+    // ---- Widening (V2d-4): dest group va_reg holds VLEN/(2*SEW) results of 2*SEW
+    // from one half of source register h_vs2+(va_reg>>1). The half offset in bits
+    // is always VLEN/2 = 64 (= elems_per_dreg * SEW), so the half is selected by a
+    // constant shift (no dynamic part-select). Even dest groups take the low half,
+    // odd the high half. Global element index = va_reg * elems_per_dreg + j.
+    let vw_vs2_half: logic<64> = if va_reg[0] ? i_vs2_data[127:64] : i_vs2_data[63:0];
+    let vw_vs1_half: logic<64> = if va_reg[0] ? i_vs1_data[127:64] : i_vs1_data[63:0];
+    var vw_res: logic<VLEN>;
+    always_comb {
+        vw_res = i_vdold_data; // inactive / tail = undisturbed
+        case vsew {
+            3'd0: { // SEW=8 → 16-bit results, 8 per dest register
+                let gbase: logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..8 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a: logic<8> = vw_vs2_half[j*8+:8];
+                        let b: logic<8> = if h_is_vv ? vw_vs1_half[j*8+:8] : i_scalar_data[7:0];
+                        vw_res[j*16+:16] = vwiden::<8>(a, b, h_funct6);
+                    }
+                }
+            }
+            3'd1: { // SEW=16 → 32-bit results, 4 per dest register
+                let gbase: logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..4 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a: logic<16> = vw_vs2_half[j*16+:16];
+                        let b: logic<16> = if h_is_vv ? vw_vs1_half[j*16+:16] : i_scalar_data[15:0];
+                        vw_res[j*32+:32] = vwiden::<16>(a, b, h_funct6);
+                    }
+                }
+            }
+            default: { // SEW=32 → 64-bit results, 2 per dest register
+                let gbase: logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..2 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a: logic<32> = vw_vs2_half[j*32+:32];
+                        let b: logic<32> = if h_is_vv ? vw_vs1_half[j*32+:32] : i_scalar_data[31:0];
+                        vw_res[j*64+:64] = vwiden::<32>(a, b, h_funct6);
+                    }
+                }
+            }
+        }
+    }
+
     // ---- vmv.x.s: x[rd] = sign-extend(vs2[element 0], SEW) ------------------
     var vmv_res: logic<64>;
     always_comb {
@@ -618,14 +694,16 @@ pub module vector_unit #(
     let va_grp : logic<VRF_W> = h_vd + {2'd0, va_reg};
     let cmp_wen: logic        = va_fire && h_is_cmp; // compare: write mask on last group only
 
+    // Widening reads one source group per two dest groups (vsN + va_reg>>1).
+    let vw_src: logic<VRF_W> = {3'd0, va_reg[2:1]};
     assign o_scalar_pdst = h_s_pdst;
-    assign o_vs1_addr    = h_vs1 + {2'd0, va_reg};     // VV source-1 group (unused for mem)
-    assign o_vs2_addr    = if h_is_mem ? mem_reg_vrf : (h_vs2 + {2'd0, va_reg}); // vs3 reg / src2 group
+    assign o_vs1_addr    = if h_is_widen ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}); // VV src-1 (group / widen half-pair)
+    assign o_vs2_addr    = if h_is_mem ? mem_reg_vrf : (if h_is_widen ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})); // vs3 reg / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem)
     assign o_vdold_addr  = if h_is_cmp ? h_vd : va_grp; // compare: single mask dest / else dest group
     assign o_vd_addr     = if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : va_grp); // load dest reg / arith
     assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (va_step || va_fire))) || mem_ld_wr;
-    assign o_vd_data     = if h_is_mem ? ld_write : if h_is_cmp ? cmp_res : valu_res;
+    assign o_vd_data     = if h_is_mem ? ld_write : if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : valu_res);
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
