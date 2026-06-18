@@ -257,6 +257,13 @@ pub module vector_unit #(
     var fault_va_q: logic<64>;
     var vstart_q  : logic<8> ;
 
+    // ---- V2d arithmetic register-group iteration (LMUL>1) -------------------
+    // Same-width ALU/merge/mul-div span EMUL = LMUL destination registers; the
+    // VU processes one register group per cycle (register-serial), reading the
+    // source group base+va_reg and writing the dest group base+va_reg. va_reg
+    // walks 0 .. va_nregs-1; the final group rides the vu_cdb (result_written).
+    var va_reg: logic<3>; // current register-group index
+
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
     let has_free: logic = !count[FIFO_W];
@@ -297,6 +304,20 @@ pub module vector_unit #(
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
     let h_is_mem: logic = h_is_vle || h_is_vse;
+    // V2d LMUL>1: EMUL destination register groups for a same-width VALU op
+    // (integer LMUL 1/2/4/8 → 1/2/4/8 regs; fractional LMUL → 1). A compare
+    // writes a single mask register regardless of LMUL, so its group count is
+    // forced to 1 (LMUL>1 compare — multi-source accumulation — is deferred).
+    let h_vlmul: logic<3> = vtype_q[2:0];
+    var emul    : logic<4>;
+    always_comb {
+        if h_vlmul[2] {
+            emul = 4'd1; // fractional LMUL
+        } else {
+            emul = 4'd1 << h_vlmul[1:0]; // 1/2/4/8
+        }
+    }
+    let va_nregs: logic<4> = if h_is_cmp ? 4'd1 : emul;
     // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
     // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
     let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
@@ -372,9 +393,11 @@ pub module vector_unit #(
         valu_res = i_vdold_data; // default: inactive/tail = undisturbed
         case vsew {
             3'd0: {
+                let base: logic<8>    = {1'b0, va_reg, 4'd0}; // va_reg * 16 elements
+                let msk : logic<VLEN> = i_mask_data >> base;  // v0 bits for this group
                 for i in 0..16 {
-                    if (i as 8) <: vl8 {
-                        let act: logic    = h_alu_vm || i_mask_data[i];
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic    = h_alu_vm || msk[i];
                         let a  : logic<8> = i_vs2_data[i*8+:8];
                         let b  : logic<8> = if h_is_vv ? i_vs1_data[i*8+:8] : bbcast[7:0];
                         if h_is_merge {
@@ -386,9 +409,11 @@ pub module vector_unit #(
                 }
             }
             3'd1: {
+                let base: logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk : logic<VLEN> = i_mask_data >> base;
                 for i in 0..8 {
-                    if (i as 8) <: vl8 {
-                        let act: logic     = h_alu_vm || i_mask_data[i];
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic     = h_alu_vm || msk[i];
                         let a  : logic<16> = i_vs2_data[i*16+:16];
                         let b  : logic<16> = if h_is_vv ? i_vs1_data[i*16+:16] : bbcast[15:0];
                         if h_is_merge {
@@ -400,9 +425,11 @@ pub module vector_unit #(
                 }
             }
             3'd2: {
+                let base: logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk : logic<VLEN> = i_mask_data >> base;
                 for i in 0..4 {
-                    if (i as 8) <: vl8 {
-                        let act: logic     = h_alu_vm || i_mask_data[i];
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic     = h_alu_vm || msk[i];
                         let a  : logic<32> = i_vs2_data[i*32+:32];
                         let b  : logic<32> = if h_is_vv ? i_vs1_data[i*32+:32] : bbcast[31:0];
                         if h_is_merge {
@@ -414,9 +441,11 @@ pub module vector_unit #(
                 }
             }
             default: {
+                let base: logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk : logic<VLEN> = i_mask_data >> base;
                 for i in 0..2 {
-                    if (i as 8) <: vl8 {
-                        let act: logic     = h_alu_vm || i_mask_data[i];
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic     = h_alu_vm || msk[i];
                         let a  : logic<64> = i_vs2_data[i*64+:64];
                         let b  : logic<64> = if h_is_vv ? i_vs1_data[i*64+:64] : bbcast;
                         if h_is_merge {
@@ -524,24 +553,35 @@ pub module vector_unit #(
     // ---- Execute the head (combinational) -----------------------------------
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
-    // Arith ops (vset/vadd/vmv) fire in one combinational cycle; memory ops
-    // (vle/vse) stream through the FSM below and retire from its DONE state.
-    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && !h_is_mem;
+    // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv;
+    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
+    // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
+    // cycle. Intermediate groups write the VRF with no CDB; the last group
+    // (va_last) rides the vu_cdb (result_written) and needs i_cdb_free.
+    let va_run  : logic = (count != 0) && at_head && scalar_ok && !i_flush && h_is_valu;
+    let va_last : logic = ({1'b0, va_reg} + 4'd1) >= va_nregs;
+    let va_fire : logic = va_run && va_last && i_cdb_free; // final group + writeback
+    let va_step : logic = va_run && !va_last;              // intermediate group (no CDB)
+    // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
     let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
-    let vu_pop      : logic = fire || mem_cdb_fire;
+    let vu_pop      : logic = fire || va_fire || mem_cdb_fire;
 
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
+    // Current register group for source / dest addressing (compare keeps va_reg
+    // at 0, so vd+va_reg == vd = its single mask destination).
+    let va_grp: logic<VRF_W> = h_vd + {2'd0, va_reg};
 
     assign o_scalar_pdst = h_s_pdst;
-    assign o_vs1_addr    = h_vs1;                      // VV source 1 (unused for mem)
-    assign o_vs2_addr    = if h_is_mem ? h_vd : h_vs2; // vs3 store data (mem) / source 2 (arith)
+    assign o_vs1_addr    = h_vs1 + {2'd0, va_reg};     // VV source-1 group (unused for mem)
+    assign o_vs2_addr    = if h_is_mem ? h_vd : (h_vs2 + {2'd0, va_reg}); // vs3 (mem) / src2 group
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem)
-    assign o_vdold_addr  = h_vd;                       // old dest (vta/vma merge)
-    assign o_vd_addr     = h_vd;
-    assign o_vd_wen      = (fire && h_is_valu) || (mem_cdb_fire && h_is_vle && !fault_q);
+    assign o_vdold_addr  = va_grp;                     // old dest group (vta/vma merge)
+    assign o_vd_addr     = va_grp;
+    assign o_vd_wen      = ((va_step || va_fire) && h_is_valu) || (mem_cdb_fire && h_is_vle && !fault_q);
     assign o_vd_data     = if h_is_mem ? vacc : if h_is_cmp ? cmp_res : valu_res;
 
-    assign o_cdb_valid    = fire || mem_cdb_fire;
+    assign o_cdb_valid    = fire || va_fire || mem_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
     assign o_cdb_pdst     = h_rd_pd;
     assign o_cdb_data     = h_cdb_data;
@@ -598,6 +638,7 @@ pub module vector_unit #(
             fault_q    = 1'b0;
             fault_va_q = 64'd0;
             vstart_q   = 8'd0;
+            va_reg     = 3'd0;
         } else if i_flush {
             // Drop all speculative vector ops; restore config from the committed
             // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
@@ -612,6 +653,7 @@ pub module vector_unit #(
             vl_q       = i_csr_vl;
             mem_state  = 2'd0;
             fault_q    = 1'b0;
+            va_reg     = 3'd0;
         } else {
             // Scalar-operand wakeup (int CDB snoop, both lanes).
             for i in 0..FIFO_N {
@@ -676,6 +718,13 @@ pub module vector_unit #(
                         mem_state = 2'd0;
                     }
                 }
+            }
+            // Arith register-group advance (V2d LMUL>1): step intermediate
+            // groups; the op stays at the FIFO head until va_fire pops it.
+            if va_step {
+                va_reg = va_reg + 3'd1;
+            } else if va_fire {
+                va_reg = 3'd0;
             }
             // Issue/complete the head (arith fire OR mem-op retire).
             if vu_pop {
