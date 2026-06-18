@@ -570,6 +570,50 @@ _start:
     CK64 16, 0xC004000000000000, fail59   # -2.5
     CK64 24, 0x4012000000000000, fail59   # 4.5
 
+    # ============ V3j: widening .w forms (vfwadd.w / vfwsub.w) ============
+    # vs2 is ALREADY double; only vs1 / f[rs1] is widened from single.
+    # vs2 (double) = [10.5, 20.5, -3.0, 4.0], vs1 (single) = [0.5, 0.5, 1.0, -2.0]
+    li   a0, 0x80010D00          # vs2 (4 doubles = 2 regs)
+    li   a1, 0x80010D40          # vs1 (4 singles = 1 reg)
+    li   a2, 0x80010D80          # dst (4 doubles = 2 regs)
+    li t1,0x4025000000000000; sd t1,0(a0)    # 10.5
+    li t1,0x4034800000000000; sd t1,8(a0)    # 20.5
+    li t1,0xC008000000000000; sd t1,16(a0)   # -3.0
+    li t1,0x4010000000000000; sd t1,24(a0)   # 4.0
+    li t1,0x3F000000; sw t1,0(a1);  li t1,0x3F000000; sw t1,4(a1)   # 0.5, 0.5
+    li t1,0x3F800000; sw t1,8(a1);  li t1,0xC0000000; sw t1,12(a1)  # 1.0, -2.0
+    vsetvli t0, x0, e64, m2      # load vs2 doubles into v4,v5
+    vle64.v v4, (a0)
+    vsetvli t0, x0, e32, m1      # load vs1 singles ; SEW=32 is the narrow width for .w
+    vle32.v v6, (a1)
+    # vfwadd.wv: vs2 + (double)vs1 -> [11.0, 21.0, -2.0, 2.0]
+    vfwadd.wv v8, v4, v6
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x4026000000000000, fail60   # 11.0
+    CK64 8,  0x4035000000000000, fail60   # 21.0
+    CK64 16, 0xC000000000000000, fail60   # -2.0
+    CK64 24, 0x4000000000000000, fail60   # 2.0
+    # vfwsub.wv: vs2 - (double)vs1 -> [10.0, 20.0, -4.0, 6.0]
+    vsetvli t0, x0, e32, m1
+    vfwsub.wv v8, v4, v6
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x4024000000000000, fail61   # 10.0
+    CK64 8,  0x4034000000000000, fail61   # 20.0
+    CK64 16, 0xC010000000000000, fail61   # -4.0
+    CK64 24, 0x4018000000000000, fail61   # 6.0
+    # vfwadd.wf: vs2 + (double)0.5 -> [11.0, 21.0, -2.5, 4.5]
+    li t1,0x3F000000; sw t1,64(a0); flw fa1, 64(a0)   # 0.5 single
+    vsetvli t0, x0, e32, m1
+    vfwadd.wf v8, v4, fa1
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x4026000000000000, fail62   # 11.0
+    CK64 8,  0x4035000000000000, fail62   # 21.0
+    CK64 16, 0xC004000000000000, fail62   # -2.5
+    CK64 24, 0x4012000000000000, fail62   # 4.5
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -647,3 +691,6 @@ fail56: li t0,56; sw t0,0(t3); 560: j 560b
 fail57: li t0,57; sw t0,0(t3); 570: j 570b
 fail58: li t0,58; sw t0,0(t3); 580: j 580b
 fail59: li t0,59; sw t0,0(t3); 590: j 590b
+fail60: li t0,60; sw t0,0(t3); 600: j 600b
+fail61: li t0,61; sw t0,0(t3); 610: j 610b
+fail62: li t0,62; sw t0,0(t3); 620: j 620b
