@@ -458,6 +458,69 @@ _start:
     CK64 0, 0x401C000000000000, fail49   # 7.0
     CK64 8, 0xC000000000000000, fail49   # -2.0
 
+    # ===================== V3h: FMA ===================================
+    # vd = [1,2,3,4], vs1 = [2,2,2,2], vs2 = [3,3,3,3]
+    li   a0, 0x80010B00          # vd
+    li   a1, 0x80010B40          # vs1
+    li   a3, 0x80010B80          # vs2
+    li   a2, 0x80010080          # dst
+    li t1,0x3F800000; sw t1,0(a0);  li t1,0x40000000; sw t1,4(a0)
+    li t1,0x40400000; sw t1,8(a0);  li t1,0x40800000; sw t1,12(a0)
+    li t1,0x40000000; sw t1,0(a1); sw t1,4(a1); sw t1,8(a1); sw t1,12(a1)   # 2.0
+    li t1,0x40400000; sw t1,0(a3); sw t1,4(a3); sw t1,8(a3); sw t1,12(a3)   # 3.0
+    vsetvli t0, x0, e32, m1
+    vle32.v v6, (a1)             # vs1 = 2.0
+    vle32.v v4, (a3)             # vs2 = 3.0
+    # vfmacc.vv: vd += vs1*vs2 -> [1+6, 2+6, 3+6, 4+6] = [7, 8, 9, 10]
+    vle32.v v8, (a0)
+    vfmacc.vv v8, v6, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40E00000, fail50    # 7.0
+    CK 4,  0x41000000, fail50    # 8.0
+    CK 8,  0x41100000, fail50    # 9.0
+    CK 12, 0x41200000, fail50    # 10.0
+    # vfmadd.vv: vd = vs1*vd + vs2 -> [2*1+3, 2*2+3, 2*3+3, 2*4+3] = [5, 7, 9, 11]
+    vle32.v v8, (a0)
+    vfmadd.vv v8, v6, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40A00000, fail51    # 5.0
+    CK 4,  0x40E00000, fail51    # 7.0
+    CK 8,  0x41100000, fail51    # 9.0
+    CK 12, 0x41300000, fail51    # 11.0
+    # vfmsac.vv: vd = vs1*vs2 - vd -> [6-1, 6-2, 6-3, 6-4] = [5, 4, 3, 2]
+    vle32.v v8, (a0)
+    vfmsac.vv v8, v6, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40A00000, fail52    # 5.0
+    CK 4,  0x40800000, fail52    # 4.0
+    CK 8,  0x40400000, fail52    # 3.0
+    CK 12, 0x40000000, fail52    # 2.0
+    # vfnmacc.vv: vd = -(vs1*vs2) - vd -> [-7, -8, -9, -10]
+    vle32.v v8, (a0)
+    vfnmacc.vv v8, v6, v4
+    vse32.v v8, (a2)
+    CK 0,  0xC0E00000, fail53    # -7.0
+    CK 4,  0xC1000000, fail53    # -8.0
+    CK 12, 0xC1200000, fail53    # -10.0
+    # vfmacc.vf: vd += f[rs1]*vs2, f[rs1] = 2.0 -> [1+6, ..., 4+6] = [7,8,9,10]
+    li t1,0x40000000; sw t1,64(a0); flw fa0, 64(a0)   # fa0 = 2.0
+    vle32.v v8, (a0)
+    vfmacc.vf v8, fa0, v4
+    vse32.v v8, (a2)
+    CK 0,  0x40E00000, fail54    # 7.0
+    CK 12, 0x41200000, fail54    # 10.0
+    # SEW=64 vfmacc.vv: vd=[1,2], vs1=[2,2], vs2=[3,3] -> [7, 8]
+    li t1,0x3FF0000000000000; sd t1,0(a0);  li t1,0x4000000000000000; sd t1,8(a0)
+    li t1,0x4000000000000000; sd t1,0(a1); sd t1,8(a1)
+    li t1,0x4008000000000000; sd t1,0(a3); sd t1,8(a3)
+    li   a2, 0x80010180
+    vsetvli t0, x0, e64, m1
+    vle64.v v6, (a1); vle64.v v4, (a3); vle64.v v8, (a0)
+    vfmacc.vv v8, v6, v4
+    vse64.v v8, (a2)
+    CK64 0, 0x401C000000000000, fail55   # 7.0
+    CK64 8, 0x4020000000000000, fail55   # 8.0
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -525,3 +588,9 @@ fail46: li t0,46; sw t0,0(t3); 460: j 460b
 fail47: li t0,47; sw t0,0(t3); 470: j 470b
 fail48: li t0,48; sw t0,0(t3); 480: j 480b
 fail49: li t0,49; sw t0,0(t3); 490: j 490b
+fail50: li t0,50; sw t0,0(t3); 500: j 500b
+fail51: li t0,51; sw t0,0(t3); 510: j 510b
+fail52: li t0,52; sw t0,0(t3); 520: j 520b
+fail53: li t0,53; sw t0,0(t3); 530: j 530b
+fail54: li t0,54; sw t0,0(t3); 540: j 540b
+fail55: li t0,55; sw t0,0(t3); 550: j 550b
