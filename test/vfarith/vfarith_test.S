@@ -316,6 +316,33 @@ _start:
     vmflt.vv v10, v4, v6         # [1<2?1, 2<2?0] = 0b01 = 0x1
     vmv.x.s t5, v10; andi t5, t5, 0x3; li t6, 0x1; bne t5, t6, fail36
 
+    # ================ V3e: vfmerge.vfm / vfmv.v.f =====================
+    # vs2 = [1.0, 2.0, -1.5, 4.0], scalar f[rs1] = 9.0, v0 mask = 0b0101.
+    li   a0, 0x80010800          # vs2
+    li t1,0x3F800000; sw t1,0(a0);  li t1,0x40000000; sw t1,4(a0)
+    li t1,0xBFC00000; sw t1,8(a0);  li t1,0x40800000; sw t1,12(a0)
+    li   a3, 0x80010840
+    li t1,0x05; sb t1,0(a3)                 # mask 0b0101 (elems 0,2 active)
+    li t1,0x41100000; sw t1,16(a3); flw fa5, 16(a3)  # fa5 = 9.0
+    li   a2, 0x80010080
+    li   t1, 1
+    vsetvli t0, t1, e8, m1                  # load mask byte into v0
+    vle8.v  v0, (a3)
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a0)             # v4 = vs2
+    vfmerge.vfm v8, v4, fa5, v0  # active → 9.0, inactive → vs2
+    vse32.v v8, (a2)
+    CK 0,  0x41100000, fail37    # active: 9.0
+    CK 4,  0x40000000, fail37    # inactive: vs2[1] = 2.0
+    CK 8,  0x41100000, fail37    # active: 9.0
+    CK 12, 0x40800000, fail37    # inactive: vs2[3] = 4.0
+    vfmv.v.f v8, fa5             # broadcast 9.0 to all
+    vse32.v v8, (a2)
+    CK 0,  0x41100000, fail38
+    CK 4,  0x41100000, fail38
+    CK 8,  0x41100000, fail38
+    CK 12, 0x41100000, fail38
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -370,3 +397,5 @@ fail33: li t0,33; sw t0,0(t3); 330: j 330b
 fail34: li t0,34; sw t0,0(t3); 340: j 340b
 fail35: li t0,35; sw t0,0(t3); 350: j 350b
 fail36: li t0,36; sw t0,0(t3); 360: j 360b
+fail37: li t0,37; sw t0,0(t3); 370: j 370b
+fail38: li t0,38; sw t0,0(t3); 380: j 380b

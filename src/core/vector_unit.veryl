@@ -429,6 +429,10 @@ pub module vector_unit #(
     let h_is_vf  : logic = h_is_fp && (h_funct3 == 3'b101);
     // V3d: FP compare (funct6 011xxx) → 1-bit-per-element mask register result.
     let h_is_fcmp: logic = h_is_fp && (h_funct6[5:3] == 3'b011);
+    // V3e: vfmerge.vfm / vfmv.v.f (funct6 010111) — a data select (no FPU), so it
+    // neither issues the shared FPU nor accrues fflags. Every body element is
+    // written (active → f[rs1], inactive → vs2); only the tail stays undisturbed.
+    let h_is_fmerge: logic = h_is_fp && (h_funct6 == 6'b010111);
     // Reverse / swapped-operand forms: vfrsub.vf (100111), vfrdiv.vf (100001),
     // and the .vf-only compares vmfgt (011101) / vmfge (011111), which are
     // computed as f[rs1] < / <= vs2 with the FPU operands swapped.
@@ -899,7 +903,9 @@ pub module vector_unit #(
     // combinational this cycle for the single-cycle V3a ops (div/sqrt, which
     // would gate on o_fpu_busy, arrive in a later sub-phase). Vector FP always
     // rounds with fcsr.frm → pass DYN so fpu_wrap resolves it from i_frm.
-    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active;
+    // Merge is a pure data select, so it must not issue the shared FPU (no
+    // spurious fflags / busy). Arithmetic and compare issue it for active elements.
+    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge;
     inst u_vfpu: fpu_wrap #(
         PRF_W    : PRF_W    ,
         ROB_IDX_W: ROB_IDX_W,
@@ -932,12 +938,17 @@ pub module vector_unit #(
         o_fflags          : vfpu_fflags      ,
         o_fflags_wen      : _                ,
     );
-    // Per-element result → SEW-wide, spliced into the register accumulator at
-    // fp_bitoff (active) or leaving the old vd in place (inactive / tail).
-    let fp_res_vlen: logic<VLEN> = if fp_double ? {64'd0, vfpu_cdb.data} : {96'd0, vfpu_cdb.data[31:0]};
+    // Per-element write value (SEW-wide). Arithmetic/div/sqrt use the FPU result;
+    // a merge selects f[rs1] (active) or vs2[i] (inactive) — no FPU. A merge
+    // writes EVERY body element (fp_wr_elem=1), while arithmetic leaves inactive /
+    // tail elements undisturbed (fp_wr_elem = active). The chosen value is spliced
+    // into the register accumulator at fp_bitoff.
+    let fp_wval    : logic<64>   = if h_is_fmerge ? (if fp_active ? fp_scalar : fp_velem_a) : vfpu_cdb.data;
+    let fp_wr_elem : logic       = h_is_fmerge || fp_active;
+    let fp_res_vlen: logic<VLEN> = if fp_double ? {64'd0, fp_wval} : {96'd0, fp_wval[31:0]};
     let fp_sew_mask: logic<VLEN> = if fp_double ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
     let fp_acc_base: logic<VLEN> = if fp_local == 8'd0 ? i_vdold_data : fp_acc;
-    let fp_acc_next: logic<VLEN> = if fp_active ? ((fp_acc_base & ~(fp_sew_mask << fp_bitoff)) | (fp_res_vlen << fp_bitoff)) : fp_acc_base;
+    let fp_acc_next: logic<VLEN> = if fp_wr_elem ? ((fp_acc_base & ~(fp_sew_mask << fp_bitoff)) | (fp_res_vlen << fp_bitoff)) : fp_acc_base;
     // FP compare (funct6 011xxx): the FPU returns the boolean in bit 0 (FEQ/FLT/
     // FLE); vmfne (011100) inverts it. The result packs 1 bit per element at bit
     // position fp_elem (global) into a SINGLE mask register (vd) — inactive / tail
@@ -1177,7 +1188,7 @@ pub module vector_unit #(
                     // COMPUTE: process element fp_elem this cycle (single-cycle FPU
                     // for arithmetic/compare; FDIV.D/FSQRT.D hold here on vfpu_busy).
                     if !vfpu_busy {
-                        if fp_active {
+                        if fp_active && !h_is_fmerge {
                             fp_fflags_q = fp_fflags_q | vfpu_fflags;
                         }
                         // A compare accumulates the running mask in fp_acc (no
