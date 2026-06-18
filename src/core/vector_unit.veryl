@@ -554,22 +554,36 @@ pub module vector_unit #(
         2'd2   : 8'b0000_1111,
         default: 8'b1111_1111,
     };
-    // Element address = base + velem*(EEW/8); offsets into the dword / the reg.
-    let velem_byteoff: logic<8>  = velem << h_eew_log;
-    let m_vaddr      : logic<64> = m_base + {56'd0, velem_byteoff};
-    let m_byteoff    : logic<3>  = m_vaddr[2:0];
-    let m_byteshift  : logic<6>  = {m_byteoff, 3'b000}; // *8 → bit offset in dword
-    let elem_shamt   : logic<3>  = 3'd3 + {1'b0, h_eew_log}; // log2(EEW in bits)
-    let elem_bitoff  : logic<8>  = velem << elem_shamt; // velem*EEW (≤120 at EEW=SEW)
+    // V2d-3 LMUL>1: the unit-stride op spans EMUL = ceil(vl*EEW/VLEN) registers.
+    // velem is the GLOBAL element index; the byte address uses it directly, while
+    // the register index (mem_reg) and in-register offset (mem_local) partition
+    // it by elems-per-register (mem_epr = VLEN/EEW). Loads accumulate a register's
+    // elements into vacc and write h_vd+mem_reg when it completes; stores read
+    // source register h_vd+mem_reg element by element.
+    let mem_epr8   : logic<8>     = 8'd16 >> h_eew_log;        // elements per 128b register
+    let epr_shift  : logic<3>     = 3'd4 - {1'b0, h_eew_log};  // log2(mem_epr)
+    let mem_reg    : logic<8>     = velem >> epr_shift;        // register index (0 .. EMUL-1)
+    let mem_local  : logic<8>     = velem & (mem_epr8 - 8'd1); // element within the register
+    let mem_reg_vrf: logic<VRF_W> = h_vd + mem_reg[VRF_W - 1:0];
+    // This element completes its register (last in-register element, or last vl).
+    let reg_last : logic = ((mem_local + 8'd1) >= mem_epr8) || ((velem + 8'd1) >= m_vl8);
+    // Element byte address (global velem) + dword / in-register bit offsets.
+    let m_vaddr     : logic<64> = m_base + ({56'd0, velem} << h_eew_log);
+    let m_byteoff   : logic<3>  = m_vaddr[2:0];
+    let m_byteshift : logic<6>  = {m_byteoff, 3'b000};      // *8 → bit offset in dword
+    let elem_shamt  : logic<3>  = 3'd3 + {1'b0, h_eew_log}; // log2(EEW in bits)
+    let elem_bitoff : logic<8>  = mem_local << elem_shamt;  // in-register element bit offset
     // Mask: vm=1 unmasked; else v0[velem]. (Shift then bit0 — no dynamic select.)
     let m_mask_sh: logic<VLEN> = m_mask >> velem;
     let m_active : logic       = h_vm || m_mask_sh[0];
-    // Load: extract element from the dcache dword, OR it into the accumulator.
+    // Load: extract the element from the dcache dword; ld_write is the current
+    // register's accumulator including this element (masked-off → contributes 0).
     let ld_raw    : logic<64>   = i_mem_rdata >> m_byteshift;
     let ld_el     : logic<64>   = ld_raw & eew_mask;
     let ld_shifted: logic<VLEN> = ({64'd0, ld_el} as VLEN) << elem_bitoff;
-    let vacc_next : logic<VLEN> = vacc | ld_shifted;
-    // Store: extract element from vs3, position into the dword.
+    let ld_contrib: logic<VLEN> = if m_active ? ld_shifted : {1'b0 repeat VLEN};
+    let ld_write  : logic<VLEN> = vacc | ld_contrib;
+    // Store: extract the element from the current source register (vs3 = h_vd+mem_reg).
     let m_vs3_sh: logic<VLEN> = m_vs3 >> elem_bitoff;
     let st_el   : logic<64>   = m_vs3_sh[63:0] & eew_mask;
     let st_wd   : logic<64>   = st_el << m_byteshift;
@@ -591,6 +605,11 @@ pub module vector_unit #(
     // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
     let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
     let vu_pop      : logic = fire || va_fire || mem_cdb_fire;
+    // Load VRF write (V2d-3): a register's accumulated value is written when its
+    // last element is processed during ACCESS — no fault, element completed.
+    let mem_fault_now: logic = (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st);
+    let mem_elem_done: logic = (mem_state == 2'd2) && ((m_active && i_mem_ready && !mem_fault_now) || !m_active);
+    let mem_ld_wr    : logic = mem_elem_done && h_is_vle && reg_last;
 
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : 64'd0;
     // Register group for source / dest addressing. A compare reads source group
@@ -601,12 +620,12 @@ pub module vector_unit #(
 
     assign o_scalar_pdst = h_s_pdst;
     assign o_vs1_addr    = h_vs1 + {2'd0, va_reg};     // VV source-1 group (unused for mem)
-    assign o_vs2_addr    = if h_is_mem ? h_vd : (h_vs2 + {2'd0, va_reg}); // vs3 (mem) / src2 group
+    assign o_vs2_addr    = if h_is_mem ? mem_reg_vrf : (h_vs2 + {2'd0, va_reg}); // vs3 reg / src2 group
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem)
     assign o_vdold_addr  = if h_is_cmp ? h_vd : va_grp; // compare: single mask dest / else dest group
-    assign o_vd_addr     = if h_is_cmp ? h_vd : va_grp;
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (va_step || va_fire))) || (mem_cdb_fire && h_is_vle && !fault_q);
-    assign o_vd_data     = if h_is_mem ? vacc : if h_is_cmp ? cmp_res : valu_res;
+    assign o_vd_addr     = if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : va_grp); // load dest reg / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (va_step || va_fire))) || mem_ld_wr;
+    assign o_vd_data     = if h_is_mem ? ld_write : if h_is_cmp ? cmp_res : valu_res;
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv carry int rd
@@ -716,24 +735,19 @@ pub module vector_unit #(
                 }
                 2'd2: {
                     // ACCESS: process element velem (active → drive the port).
-                    if m_active {
-                        if (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st) {
-                            fault_q    = 1'b1;
-                            fault_va_q = m_vaddr;
-                            vstart_q   = velem;
-                            mem_state  = 2'd3;
-                        } else if i_mem_ready {
-                            if h_is_vle {
-                                vacc = vacc_next;
-                            }
-                            if velem + 8'd1 >= m_vl8 {
-                                mem_state = 2'd3;
-                            } else {
-                                velem = velem + 8'd1;
-                            }
+                    if m_active && mem_fault_now {
+                        fault_q    = 1'b1;
+                        fault_va_q = m_vaddr;
+                        vstart_q   = velem;
+                        mem_state  = 2'd3;
+                    } else if (m_active && i_mem_ready) || !m_active {
+                        // Element processed (active completed, or masked-off skip).
+                        // Loads accumulate into vacc; at a register boundary the
+                        // completed register is written via the VRF port this cycle
+                        // (mem_ld_wr / ld_write) and the accumulator resets.
+                        if h_is_vle {
+                            vacc = if reg_last ? {1'b0 repeat VLEN} : ld_write;
                         }
-                    } else {
-                        // masked-off element: skip (load element stays 0), advance.
                         if velem + 8'd1 >= m_vl8 {
                             mem_state = 2'd3;
                         } else {
