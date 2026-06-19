@@ -151,6 +151,11 @@ pub module vector_unit #(
     i_frm           : input  logic<3>,
     o_cdb_fflags    : output logic<5>,
     o_cdb_fflags_wen: output logic   ,
+    // V5a: fixed-point saturating ops OR a sticky bit into vxsat. The accrued
+    // "this op saturated" bit rides the vu_cdb writeback into the ROB; the core
+    // ORs it into the vxsat CSR at commit, exactly like an FP op's fflags.
+    o_cdb_vxsat     : output logic   ,
+    o_cdb_vxsat_wen : output logic   ,
     // V3f: vfmv.f.s writes the scalar FP register file. When the VU drives this
     // writeback, the core must route cdb.pdst/data to prf_fp (cdb_dest_is_fp).
     o_cdb_fp_dest   : output logic   ,
@@ -687,6 +692,9 @@ pub module vector_unit #(
     // from the old mask dest on group 0 (inactive / tail bits undisturbed); each
     // group splices its element bits in, and the final group writes the mask reg.
     var va_acc: logic<VLEN>;
+    // V5a saturating add/sub: OR-accumulate the per-group saturation across the
+    // EMUL groups (seeded 0 at group 0); the final group drives o_cdb_vxsat.
+    var vxsat_acc: logic;
     // Narrowing: the low half of the dest register (computed on the even source
     // step from source register va_reg) is held until the odd step writes the
     // full dest register as {high-half, vn_lo}.
@@ -971,8 +979,10 @@ pub module vector_unit #(
     // (vmv.v.* has vm=1 → all active → broadcast b); tail stays undisturbed.
     let bbcast: logic<64> = if h_is_vx ? i_scalar_data : {h_instr[19] repeat 59, h_instr[19:15]};
     var valu_res: logic<VLEN>;
+    var vsat_grp: logic; // V5a: any active satadd element saturated in this group
     always_comb {
         valu_res = i_vdold_data; // default: inactive/tail = undisturbed
+        vsat_grp = 1'b0;
         case vsew {
             3'd0: {
                 let base: logic<8>    = {1'b0, va_reg, 4'd0}; // va_reg * 16 elements
@@ -988,6 +998,9 @@ pub module vector_unit #(
                             if h_is_satadd {
                                 let sr: logic<9> = vsatas::<8>(a, b, h_funct6[1], h_funct6[0]);
                                 valu_res[i*8+:8] = sr[7:0];
+                                if sr[8] {
+                                    vsat_grp = 1'b1;
+                                }
                             } else {
                                 valu_res[i*8+:8] = if h_is_opm ? vmuldiv::<8>(a, b, h_funct6) : valu::<8>(a, b, h_funct6);
                             }
@@ -1009,6 +1022,9 @@ pub module vector_unit #(
                             if h_is_satadd {
                                 let sr: logic<17> = vsatas::<16>(a, b, h_funct6[1], h_funct6[0]);
                                 valu_res[i*16+:16] = sr[15:0];
+                                if sr[16] {
+                                    vsat_grp = 1'b1;
+                                }
                             } else {
                                 valu_res[i*16+:16] = if h_is_opm ? vmuldiv::<16>(a, b, h_funct6) : valu::<16>(a, b, h_funct6);
                             }
@@ -1030,6 +1046,9 @@ pub module vector_unit #(
                             if h_is_satadd {
                                 let sr: logic<33> = vsatas::<32>(a, b, h_funct6[1], h_funct6[0]);
                                 valu_res[i*32+:32] = sr[31:0];
+                                if sr[32] {
+                                    vsat_grp = 1'b1;
+                                }
                             } else {
                                 valu_res[i*32+:32] = if h_is_opm ? vmuldiv::<32>(a, b, h_funct6) : valu::<32>(a, b, h_funct6);
                             }
@@ -1051,6 +1070,9 @@ pub module vector_unit #(
                             if h_is_satadd {
                                 let sr: logic<65> = vsatas::<64>(a, b, h_funct6[1], h_funct6[0]);
                                 valu_res[i*64+:64] = sr[63:0];
+                                if sr[64] {
+                                    vsat_grp = 1'b1;
+                                }
                             } else {
                                 valu_res[i*64+:64] = if h_is_opm ? vmuldiv::<64>(a, b, h_funct6) : valu::<64>(a, b, h_funct6);
                             }
@@ -1933,6 +1955,9 @@ pub module vector_unit #(
     // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
     let va_grp : logic<VRF_W> = h_vd + {2'd0, va_reg};
     let cmp_wen: logic        = va_fire && h_is_cmp; // compare: write mask on last group only
+    // V5a: running saturation including this group (seed 0 at group 0). The final
+    // group's value rides the vu_cdb to OR into vxsat at commit.
+    let vxsat_now: logic = (if va_reg == 3'd0 ? 1'b0 : vxsat_acc) | vsat_grp;
 
     // Widening/narrowing pair a source register with two of the other side
     // (vw_src = va_reg>>1). Narrowing writes dest reg h_vd+vw_src on odd steps,
@@ -1983,6 +2008,10 @@ pub module vector_unit #(
     // core routes them into fcsr at commit (muxed against the scalar FPU's).
     assign o_cdb_fflags     = fp_fflags_q;
     assign o_cdb_fflags_wen = fp_cdb_fire;
+    // V5a: a retiring saturating op (final group) ORs its accrued saturation into
+    // the vxsat CSR at commit.
+    assign o_cdb_vxsat      = vxsat_now;
+    assign o_cdb_vxsat_wen  = va_fire && h_is_satadd;
 
     // ---- FIFO maintenance + config update -----------------------------------
     let do_alloc: logic = i_alloc_en && has_free;
@@ -2034,6 +2063,7 @@ pub module vector_unit #(
             vstart_q   = 8'd0;
             va_reg     = 3'd0;
             va_acc     = {1'b0 repeat VLEN};
+            vxsat_acc  = 1'b0;
             vn_lo      = 64'd0;
             fp_state    = 2'd0;
             fp_elem     = 8'd0;
@@ -2230,6 +2260,11 @@ pub module vector_unit #(
             // Compare accumulates the running mask into va_acc each group.
             if h_is_cmp && (va_step || va_fire) {
                 va_acc = cmp_res;
+            }
+            // V5a: accumulate the saturation across the EMUL groups (intermediate
+            // groups latch into vxsat_acc; the final group drives o_cdb_vxsat).
+            if h_is_satadd && va_step {
+                vxsat_acc = vxsat_now;
             }
             // Narrowing: latch the low-half result on each even source step.
             if h_is_narrow && va_step && !va_reg[0] {

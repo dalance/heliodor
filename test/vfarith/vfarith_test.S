@@ -1851,6 +1851,23 @@ _start:
     CK 0, 0x7FFFFFFF, fail229   # MAX_INT + 1 -> sat MAX
     CK 4, 0x80000000, fail229   # MIN_INT + (-1) -> sat MIN
 
+    # --- vxsat sticky flag: clear, non-saturating leaves 0, saturating sets 1 ---
+    li   a0, 0x80011F00
+    li   a2, 0x80011F80
+    csrw vxsat, x0
+    li t1, 50; sb t1, 0(a0)
+    li t2,1; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 30; vsadd.vx v8,v4,t1     # 50+30=80, no saturation
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,80; bne t5,t6, fail230   # result 80
+    csrr t5, vxsat; bne t5, x0, fail230          # vxsat still 0
+    li t1, 100; sb t1, 0(a0)
+    li t2,1; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 50; vsadd.vx v8,v4,t1     # 100+50=150 -> saturate
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x7F; bne t5,t6, fail231  # result sat MAX
+    csrr t5, vxsat; li t6,1; bne t5,t6, fail231   # vxsat now 1
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -2083,3 +2100,5 @@ fail226: li t0,226; sw t0,0(t3); 2260: j 2260b
 fail227: li t0,227; sw t0,0(t3); 2270: j 2270b
 fail228: li t0,228; sw t0,0(t3); 2280: j 2280b
 fail229: li t0,229; sw t0,0(t3); 2290: j 2290b
+fail230: li t0,230; sw t0,0(t3); 2300: j 2300b
+fail231: li t0,231; sw t0,0(t3); 2310: j 2310b
