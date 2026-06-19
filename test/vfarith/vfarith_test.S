@@ -995,6 +995,42 @@ _start:
     lbu t5,0(a2); li t6,0x88; bne t5,t6, fail101         # body byte0 = AA & CC
     lbu t5,1(a2); li t6,0xFF; bne t5,t6, fail101         # tail byte1 undisturbed
 
+    # ===== V4d: vcpop.m / vfirst.m (mask reductions to scalar int rd) =====
+    # v4 holds the source mask bits. Active = (i<vl) && (vm||v0[i]); count/scan
+    # the set source bits. vcpop → number set; vfirst → lowest index (or -1).
+    li   a0, 0x80010A00
+    li t1, 0;    sd t1,0(a0); sd t1,8(a0)                # clear 16 bytes
+    li t1, 0xA8; sb t1,0(a0)                             # byte0 = bits 3,5,7
+    li t1, 0x03; sb t1,1(a0)                             # byte1 = bits 8,9
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v4, (a0)
+
+    li t2, 8;  vsetvli t0, t2, e8, m1                    # first 8 bits = 0xA8
+    vcpop.m  t5, v4; li t6, 3;  bne t5, t6, fail102      # bits 3,5,7 → 3
+    vfirst.m t5, v4; li t6, 3;  bne t5, t6, fail103      # lowest set = 3
+
+    li t2, 10; vsetvli t0, t2, e8, m1                    # first 10 bits
+    vcpop.m  t5, v4; li t6, 5;  bne t5, t6, fail104      # 3 + bits 8,9 → 5
+
+    li t2, 3;  vsetvli t0, t2, e8, m1                    # vl=3 → bits 0,1,2 (none)
+    vcpop.m  t5, v4; li t6, 0;  bne t5, t6, fail105      # tail not counted
+    vfirst.m t5, v4; li t6, -1; bne t5, t6, fail106      # none active set → -1
+
+    li t1, 0;  sd t1,0(a0); sd t1,8(a0)                  # all-zero source
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v4, (a0)
+    li t2, 8;  vsetvli t0, t2, e8, m1
+    vcpop.m  t5, v4; li t6, 0;  bne t5, t6, fail107
+    vfirst.m t5, v4; li t6, -1; bne t5, t6, fail108
+
+    # masked: source v4 byte0 = 0xFF, v0 mask byte0 = 0x0A (elements 1,3 active).
+    li t1, 0xFF; sb t1,0(a0); li t1,0; sb t1,1(a0); sd t1,8(a0)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v4, (a0)
+    li   a1, 0x80010A80
+    li t1, 0x0A; sb t1,0(a1)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v0, (a1)   # v0[0] = 0x0A
+    li t2, 8;  vsetvli t0, t2, e8, m1
+    vcpop.m  t5, v4, v0.t; li t6, 2; bne t5, t6, fail109 # active set: 1,3 → 2
+    vfirst.m t5, v4, v0.t; li t6, 1; bne t5, t6, fail110 # lowest active set = 1
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1099,3 +1135,12 @@ fail98:  li t0,98;  sw t0,0(t3); 980:  j 980b
 fail99:  li t0,99;  sw t0,0(t3); 990:  j 990b
 fail100: li t0,100; sw t0,0(t3); 1000: j 1000b
 fail101: li t0,101; sw t0,0(t3); 1010: j 1010b
+fail102: li t0,102; sw t0,0(t3); 1020: j 1020b
+fail103: li t0,103; sw t0,0(t3); 1030: j 1030b
+fail104: li t0,104; sw t0,0(t3); 1040: j 1040b
+fail105: li t0,105; sw t0,0(t3); 1050: j 1050b
+fail106: li t0,106; sw t0,0(t3); 1060: j 1060b
+fail107: li t0,107; sw t0,0(t3); 1070: j 1070b
+fail108: li t0,108; sw t0,0(t3); 1080: j 1080b
+fail109: li t0,109; sw t0,0(t3); 1090: j 1090b
+fail110: li t0,110; sw t0,0(t3); 1100: j 1100b
