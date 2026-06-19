@@ -714,6 +714,10 @@ pub module vector_unit #(
     // V4e-1: mask set-prefix ops (vmsbf/vmsof/vmsif). Single-cycle mask→mask;
     // vs1[1:0] (h_instr[16:15]) selects 01=vmsbf / 10=vmsof / 11=vmsif.
     let h_is_vmspre : logic = h_op == VecOp::VMSPRE;
+    // V4e-2: viota.m / vid.v. Register-serial (SEW elements, EMUL dest groups);
+    // vs1 field bit 0 (h_instr[15]) selects vid.v (1) vs viota.m (0).
+    let h_is_viota  : logic = h_op == VecOp::VIOTA;
+    let h_is_vid    : logic = h_is_viota && h_instr[15];
     // OPIVx/OPMVx operand mode + op: funct6 (inst[31:26]) selects the op; funct3
     // (inst[14:12]) the operand mode. VV reads vs1[i] (OPIVV=000 / OPMVV=010 →
     // bit2=0,bit0=0); VX reads x[rs1] (OPIVX=100 / OPMVX=110 → bit2=1,bit0=0);
@@ -1204,6 +1208,78 @@ pub module vector_unit #(
         }
     }
 
+    // ---- V4e-2 viota.m / vid.v (register-serial, SEW elements) --------------
+    // viota.m writes the exclusive prefix-sum of active source-mask (vs2) bits to
+    // each active element; vid.v writes each element's own index (vs2 unused).
+    // The source mask vs2 is a single register (not LMUL-scaled); the dest spans
+    // EMUL registers, one per group va_reg. The running sum is recomputed from
+    // element 0 each group (seed = popcount of eligible source bits before this
+    // group's base), then a local prefix within the group. The prefix value is at
+    // most vl <= 128, so an 8-bit accumulator (zero-extended to SEW) suffices.
+    // Inactive / tail elements stay undisturbed. base = va_reg * (VLEN/SEW).
+    let iota_base: logic<8> = case vsew {
+        3'd0   : {1'b0, va_reg, 4'd0}, // *16
+        3'd1   : {2'd0, va_reg, 3'd0}, // *8
+        3'd2   : {3'd0, va_reg, 2'd0}, // *4
+        default: {4'd0, va_reg, 1'b0}, // *2 (SEW=64)
+    };
+    let iota_msk: logic<VLEN> = i_mask_data >> iota_base; // v0 bits for this group
+    let iota_vs2: logic<VLEN> = i_vs2_data >> iota_base;  // source bits for this group
+    var viota_res: logic<VLEN>;
+    var iota_run : logic<8>;
+    always_comb {
+        viota_res = i_vdold_data; // inactive / tail = undisturbed
+        // seed = count of active source bits with global index < base
+        iota_run = 8'd0;
+        for gi in 0..VLEN {
+            if ((gi as 8) <: iota_base) && ((gi as 8) <: vl8) && (h_alu_vm || i_mask_data[gi]) && i_vs2_data[gi] {
+                iota_run = iota_run + 8'd1;
+            }
+        }
+        case vsew {
+            3'd0: { // SEW=8 → 16 elements per register
+                for k in 0..16 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*8+:8] = if h_is_vid ? (iota_base + (k as 8)) : iota_run;
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+            3'd1: { // SEW=16 → 8 elements per register
+                for k in 0..8 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*16+:16] = if h_is_vid ? {8'd0, iota_base + (k as 8)} : {8'd0, iota_run};
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+            3'd2: { // SEW=32 → 4 elements per register
+                for k in 0..4 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*32+:32] = if h_is_vid ? {24'd0, iota_base + (k as 8)} : {24'd0, iota_run};
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+            default: { // SEW=64 → 2 elements per register
+                for k in 0..2 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*64+:64] = if h_is_vid ? {56'd0, iota_base + (k as 8)} : {56'd0, iota_run};
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- V1 unit-stride memory: addressing + element packing ----------------
     // Operands are stable for the whole op (the head is not popped until DONE):
     // base = x[rs1] (scalar), mask = v0 (read on the vs1 port with addr 0),
@@ -1563,7 +1639,7 @@ pub module vector_unit #(
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
     // (va_last) rides the vu_cdb (result_written) and needs i_cdb_free.
-    let va_run  : logic = (count != 0) && at_head && scalar_ok && !i_flush && h_is_valu;
+    let va_run  : logic = (count != 0) && at_head && scalar_ok && !i_flush && (h_is_valu || h_is_viota);
     let va_last : logic = ({1'b0, va_reg} + 4'd1) >= va_nregs;
     let va_fire : logic = va_run && va_last && i_cdb_free; // final group + writeback
     let va_step : logic = va_run && !va_last;              // intermediate group (no CDB)
@@ -1601,12 +1677,12 @@ pub module vector_unit #(
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_fp ? (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP (.w vs2=dest geom) / widen-half / .w-full / narrow / src2
+    assign o_vs2_addr    = if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})))); // viota source mask (1 reg) / FP (.w vs2=dest geom) / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr;
-    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))))));
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr;
+    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd

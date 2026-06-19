@@ -1083,6 +1083,61 @@ _start:
     vmsof.m v8, v4, v0.t; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
     lbu t5,0(a2); li t6,0x08; bne t5,t6, fail118
 
+    # ===== V4e-2: viota.m / vid.v (prefix-sum / element index) =====
+    li   a2, 0x80010C00
+    # vid.v: vd[i] = i. e8 m1, vl=8 → bytes 0..7 = 0,1,...,7.
+    li t2, 8; vsetvli t0, t2, e8, m1
+    vid.v v8; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0; bne t5,t6, fail119
+    lbu t5,3(a2); li t6,3; bne t5,t6, fail119
+    lbu t5,7(a2); li t6,7; bne t5,t6, fail119
+
+    # vid.v LMUL=2 (e8 m2): vl=32 → v8[0..15], v9[16..31].
+    li t2, 32; vsetvli t0, t2, e8, m2
+    vid.v v8; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,0;  bne t5,t6, fail120
+    lbu t5,15(a2); li t6,15; bne t5,t6, fail120
+    lbu t5,16(a2); li t6,16; bne t5,t6, fail121
+    lbu t5,31(a2); li t6,31; bne t5,t6, fail121
+
+    # vid.v SEW=32 (e32 m1): vl=4 → words 0,1,2,3.
+    li t2, 4; vsetvli t0, t2, e32, m1
+    vid.v v8; vse32.v v8,(a2)
+    CK 0,  0, fail122
+    CK 4,  1, fail122
+    CK 8,  2, fail122
+    CK 12, 3, fail122
+
+    # viota.m: source mask v2 byte0 = 0x25 (bits 0,2,5). vl=8 → 0,1,1,2,2,2,3,3.
+    li   a0, 0x80010C80
+    li t1, 0; sd t1,0(a0); sd t1,8(a0)
+    li t1, 0x25; sb t1,0(a0)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v2,(a0)
+    li t2, 8; vsetvli t0,t2,e8,m1
+    viota.m v8, v2; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0; bne t5,t6, fail123
+    lbu t5,1(a2); li t6,1; bne t5,t6, fail123
+    lbu t5,3(a2); li t6,2; bne t5,t6, fail124
+    lbu t5,5(a2); li t6,2; bne t5,t6, fail124
+    lbu t5,6(a2); li t6,3; bne t5,t6, fail125
+    lbu t5,7(a2); li t6,3; bne t5,t6, fail125
+
+    # masked viota.m: v0 = 0x0A (active 1,3), source v2 byte0 = 0x0A. v8 preset
+    # 0x77 → active 1,3 written (0,1), inactive elements undisturbed (0x77).
+    li t1, 0x0A; sb t1,0(a0); li t1,0; sb t1,1(a0); sd t1,8(a0)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v2,(a0)
+    li   a1, 0x80010CC0
+    li t1, 0x0A; sb t1,0(a1)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v0,(a1)
+    li t1, 0x7777777777777777; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2, 8; vsetvli t0,t2,e8,m1
+    viota.m v8, v2, v0.t; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x77; bne t5,t6, fail126   # inactive undisturbed
+    lbu t5,1(a2); li t6,0x00; bne t5,t6, fail126   # active: 0 set before
+    lbu t5,3(a2); li t6,0x01; bne t5,t6, fail127   # active: elem1 set before
+    lbu t5,2(a2); li t6,0x77; bne t5,t6, fail127   # inactive undisturbed
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1204,3 +1259,12 @@ fail115: li t0,115; sw t0,0(t3); 1150: j 1150b
 fail116: li t0,116; sw t0,0(t3); 1160: j 1160b
 fail117: li t0,117; sw t0,0(t3); 1170: j 1170b
 fail118: li t0,118; sw t0,0(t3); 1180: j 1180b
+fail119: li t0,119; sw t0,0(t3); 1190: j 1190b
+fail120: li t0,120; sw t0,0(t3); 1200: j 1200b
+fail121: li t0,121; sw t0,0(t3); 1210: j 1210b
+fail122: li t0,122; sw t0,0(t3); 1220: j 1220b
+fail123: li t0,123; sw t0,0(t3); 1230: j 1230b
+fail124: li t0,124; sw t0,0(t3); 1240: j 1240b
+fail125: li t0,125; sw t0,0(t3); 1250: j 1250b
+fail126: li t0,126; sw t0,0(t3); 1260: j 1260b
+fail127: li t0,127; sw t0,0(t3); 1270: j 1270b
