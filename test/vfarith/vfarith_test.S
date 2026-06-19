@@ -1868,6 +1868,77 @@ _start:
     lbu t5,0(a2); li t6,0x7F; bne t5,t6, fail231  # result sat MAX
     csrr t5, vxsat; li t6,1; bne t5,t6, fail231   # vxsat now 1
 
+    # ===== V5b: fixed-point averaging add/sub (vaaddu/vaadd/vasubu/vasub) =====
+    li   a0, 0x80012000   # a (vs2)
+    li   a1, 0x80012040   # b (vs1)
+    li   a2, 0x80012080   # dst
+    csrwi vxrm, 0         # rnu (round-to-nearest-up)
+
+    # vaaddu.vv (unsigned): [200,201,100,7] + [100,100,50,8], avg with rnu.
+    li t1, 0x0764C9C8; sw t1, 0(a0)
+    li t1, 0x08326464; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vaaddu.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,150; bne t5,t6, fail232   # avg(200,100)=150
+    lbu t5,1(a2); li t6,151; bne t5,t6, fail232   # avg(201,100)=150.5 -> rnu 151
+    lbu t5,2(a2); li t6,75;  bne t5,t6, fail233   # avg(100,50)=75
+    lbu t5,3(a2); li t6,8;   bne t5,t6, fail233   # avg(7,8)=7.5 -> rnu 8
+
+    # vaadd.vv (signed): [10,-10,-3,7] + [20,-20,-4,8].
+    li t1, 0x07FDF60A; sw t1, 0(a0)
+    li t1, 0x08FCEC14; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vaadd.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,15;   bne t5,t6, fail234   # avg(10,20)=15
+    lbu t5,1(a2); li t6,0xF1; bne t5,t6, fail234   # avg(-10,-20)=-15
+    lbu t5,2(a2); li t6,0xFD; bne t5,t6, fail235   # avg(-3,-4)=-3.5 -> rnu -3
+    lbu t5,3(a2); li t6,8;    bne t5,t6, fail235   # avg(7,8)=7.5 -> rnu 8
+
+    # vasubu.vv (unsigned): [100,10,50,9] - [40,20,50,8].
+    li t1, 0x09320A64; sw t1, 0(a0)
+    li t1, 0x08321428; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vasubu.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,30;   bne t5,t6, fail236   # avg(60)=30
+    lbu t5,1(a2); li t6,0xFB; bne t5,t6, fail236   # (10-20) modular >>1 = 0xFB
+    lbu t5,2(a2); li t6,0;    bne t5,t6, fail237   # avg(0)=0
+    lbu t5,3(a2); li t6,1;    bne t5,t6, fail237   # avg(1)=0.5 -> rnu 1
+
+    # vasub.vv (signed): [100,10,-10,9] - [40,20,10,8].
+    li t1, 0x09F60A64; sw t1, 0(a0)
+    li t1, 0x080A1428; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vasub.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,30;   bne t5,t6, fail238   # avg(60)=30
+    lbu t5,1(a2); li t6,0xFB; bne t5,t6, fail238   # avg(-10)=-5
+    lbu t5,2(a2); li t6,0xF6; bne t5,t6, fail239   # avg(-20)=-10
+    lbu t5,3(a2); li t6,1;    bne t5,t6, fail239   # avg(1)=0.5 -> rnu 1
+
+    # vxrm = rdn (truncate): vaaddu [201,7] + [100,8] -> [150, 7].
+    csrwi vxrm, 2
+    li t1, 0x000007C9; sw t1, 0(a0)
+    li t1, 0x00000864; sw t1, 0(a1)
+    li t2,2; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vaaddu.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,150; bne t5,t6, fail240   # 150.5 -> rdn 150
+    lbu t5,1(a2); li t6,7;   bne t5,t6, fail240   # 7.5 -> rdn 7
+
+    # vxrm = rne (round-to-nearest-even): vaaddu [201,203] + [100,100] -> [150,152].
+    csrwi vxrm, 1
+    li t1, 0x0000CBC9; sw t1, 0(a0)
+    li t1, 0x00006464; sw t1, 0(a1)
+    li t2,2; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vaaddu.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,150; bne t5,t6, fail241   # 150.5 -> rne 150 (even)
+    lbu t5,1(a2); li t6,152; bne t5,t6, fail241   # 151.5 -> rne 152 (even)
+    csrwi vxrm, 0         # restore rnu
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -2102,3 +2173,13 @@ fail228: li t0,228; sw t0,0(t3); 2280: j 2280b
 fail229: li t0,229; sw t0,0(t3); 2290: j 2290b
 fail230: li t0,230; sw t0,0(t3); 2300: j 2300b
 fail231: li t0,231; sw t0,0(t3); 2310: j 2310b
+fail232: li t0,232; sw t0,0(t3); 2320: j 2320b
+fail233: li t0,233; sw t0,0(t3); 2330: j 2330b
+fail234: li t0,234; sw t0,0(t3); 2340: j 2340b
+fail235: li t0,235; sw t0,0(t3); 2350: j 2350b
+fail236: li t0,236; sw t0,0(t3); 2360: j 2360b
+fail237: li t0,237; sw t0,0(t3); 2370: j 2370b
+fail238: li t0,238; sw t0,0(t3); 2380: j 2380b
+fail239: li t0,239; sw t0,0(t3); 2390: j 2390b
+fail240: li t0,240; sw t0,0(t3); 2400: j 2400b
+fail241: li t0,241; sw t0,0(t3); 2410: j 2410b
