@@ -778,7 +778,11 @@ pub module vector_unit #(
     // 2*SEW; funct6[0] selects signed (vwredsum) vs unsigned element extension.
     let h_is_iwred: logic = h_is_fp && (h_funct3 == 3'b000) && (h_funct6[5:1] == 5'b11000);
     let h_is_anyired: logic = h_is_ired || h_is_iwred;
-    let h_is_red : logic = h_is_fred || h_is_anyired;
+    // V4g-2: FP widening reduction (OPFVV .vs funct6 110001 vfwredusum / 110011
+    // vfwredosum). The 2*SEW (double) accumulator folds s2d-widened single vs2
+    // elements via FADD_D; the seed vs1[0] is already 2*SEW. Both fold serially.
+    let h_is_fwred: logic = h_is_fp && (h_funct3 == 3'b001) && (h_funct6 == 6'b110001 || h_funct6 == 6'b110011);
+    let h_is_red : logic = h_is_fred || h_is_fwred || h_is_anyired;
     // V3d: FP compare (funct6 011xxx) → 1-bit-per-element mask register result.
     let h_is_fcmp: logic = h_is_fp && (h_funct6[5:3] == 3'b011);
     // V3e: vfmerge.vfm / vfmv.v.f (funct6 010111) — a data select (no FPU), so it
@@ -1614,8 +1618,12 @@ pub module vector_unit #(
     let fw_vd_d   : logic<64>   = fw_vd_dsh[63:0]; // V3j widening-FMA addend (old vd, double)
     let fw_s1d    : logic<64>   = if h_is_fwiden_w ? fw_vs2_d : s2d(fw_vs2_s);
     let fw_s2d    : logic<64>   = s2d(fw_vs1_s);
-    let fp_s1     : logic<64>   = if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a)));
-    let fp_s2     : logic<64>   = if h_is_fred ? fp_velem_a : (if h_is_fwiden ? fw_s2d : (if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op)));
+    // V4g-2 FP widening reduction: s1 is the double accumulator (seeded from the
+    // 2*SEW vs1[0]), s2 is the s2d-widened single vs2 element. FpuOp = FADD_D.
+    let fp_wred_s1: logic<64>   = if fp_elem == 8'd0 ? i_vs1_data[63:0] : red_acc;
+    let red_w_s2d : logic<64>   = s2d(fw_vs2_s);
+    let fp_s1     : logic<64>   = if h_is_fwred ? fp_wred_s1 : (if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a))));
+    let fp_s2     : logic<64>   = if h_is_fwred ? red_w_s2d : (if h_is_fred ? fp_velem_a : (if h_is_fwiden ? fw_s2d : (if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op))));
     let fp_s3     : logic<64>   = if h_is_fwfma ? fw_vd_d : (if h_is_fma ? fma_add : 64'd0);
     // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
     // and vfsgnj take magnitude/sign from vs2/vs1, matching s1=vs2, s2=vs1.
@@ -1650,6 +1658,10 @@ pub module vector_unit #(
                 6'b111111           : fp_fpu_op = fpu_pkg::FpuOp::FNMSUB_D; // vfwnmsac
                 default             : fp_fpu_op = fpu_pkg::FpuOp::FADD_D; // vfwadd / vfwadd.w (110000/110100)
             }
+        } else if h_is_fwred {
+            // V4g-2 FP widening reduction: always a double add of the widened
+            // element into the double accumulator (usum and osum both fold here).
+            fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
         } else if fp_double {
             case h_funct6 {
                 6'b000000: fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
@@ -1822,8 +1834,11 @@ pub module vector_unit #(
     // keep the accumulator (seeded from vs1[0] on element 0). At the last element
     // this is the vd[0] result; only element 0 of vd is written (SEW-wide splice),
     // the rest staying tail-undisturbed.
-    let red_fold   : logic<64>    = if fp_double ? vfpu_cdb.data : {32'hffffffff, vfpu_cdb.data[31:0]};
-    let red_final  : logic<64>    = if h_is_anyired ? red_int_final : (if fp_active ? red_fold : (if fp_elem == 8'd0 ? red_seed : red_acc));
+    // FP widening reduction produces a double result (no NaN-box); its seed is
+    // the 2*SEW vs1[0] (not the SEW-NaN-boxed red_seed).
+    let red_fold   : logic<64>    = if (fp_double || h_is_fwred) ? vfpu_cdb.data : {32'hffffffff, vfpu_cdb.data[31:0]};
+    let red_seed_e : logic<64>    = if h_is_fwred ? i_vs1_data[63:0] : red_seed;
+    let red_final  : logic<64>    = if h_is_anyired ? red_int_final : (if fp_active ? red_fold : (if fp_elem == 8'd0 ? red_seed_e : red_acc));
     let red_sew_mask: logic<64>   = case vsew {
         3'd0   : 64'h0000_0000_0000_00ff,
         3'd1   : 64'h0000_0000_0000_ffff,
@@ -1836,7 +1851,7 @@ pub module vector_unit #(
         3'd1   : 64'h0000_0000_ffff_ffff,
         default: 64'hffff_ffff_ffff_ffff,
     };
-    let red_res_mask: logic<64>   = if h_is_iwred ? red_wsew_mask : red_sew_mask;
+    let red_res_mask: logic<64>   = if (h_is_iwred || h_is_fwred) ? red_wsew_mask : red_sew_mask;
     let fp_red_vd  : logic<VLEN>  = {i_vdold_data[127:64], (i_vdold_data[63:0] & ~red_res_mask) | (red_final & red_res_mask)};
     // VRF writes during COMPUTE: arithmetic writes a completed register at its
     // boundary; a compare / reduction writes its single dest element at the last.

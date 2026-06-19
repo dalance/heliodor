@@ -1414,6 +1414,35 @@ _start:
     li t2,8; vsetvli t0,t2,e16,m1; vse16.v v8,(a2)
     lwu t5,0(a2); li t6,6100; bne t5,t6, fail167
 
+    # ===== V4g-2: vfwredusum.vs / vfwredosum.vs (FP widening reduction) =====
+    li   a0, 0x80011300   # vs2 single data
+    li   a1, 0x80011340   # vs1 double seed
+    li   a2, 0x80011380   # dst
+    li   a3, 0x800113C0   # mask
+    li t1, 0x3F800000; sw t1,0(a0); li t1,0x40000000; sw t1,4(a0)   # 1.0, 2.0
+    li t1, 0x40400000; sw t1,8(a0); li t1,0x40800000; sw t1,12(a0)  # 3.0, 4.0
+    li t2,4; vsetvli t0,t2,e32,m1; vle32.v v4,(a0)
+    li t1, 0x4024000000000000; sd t1,0(a1)             # seed (2*SEW double) = 10.0
+    li t2,2; vsetvli t0,t2,e64,m1; vle64.v v6,(a1)      # vs1[0] (double) = 10.0
+    li t2,4; vsetvli t0,t2,e32,m1
+    vfwredusum.vs v8,v4,v6
+    vse32.v v8,(a2)
+    ld t5,0(a2); li t6,0x4034000000000000; bne t5,t6, fail168   # 10 + (1+2+3+4) = 20.0
+
+    # vfwredosum (ordered) same data → 20.0.
+    li t2,4; vsetvli t0,t2,e32,m1
+    vfwredosum.vs v8,v4,v6
+    vse32.v v8,(a2)
+    ld t5,0(a2); li t6,0x4034000000000000; bne t5,t6, fail169   # 20.0
+
+    # masked vfwredusum: v0 = 0x05 (active 0,2) → 10 + 1.0 + 3.0 = 14.0.
+    li t1, 0x05; sb t1,0(a3)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v0,(a3)
+    li t2,4; vsetvli t0,t2,e32,m1
+    vfwredusum.vs v8,v4,v6,v0.t
+    vse32.v v8,(a2)
+    ld t5,0(a2); li t6,0x402C000000000000; bne t5,t6, fail170   # 14.0
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1584,3 +1613,6 @@ fail164: li t0,164; sw t0,0(t3); 1640: j 1640b
 fail165: li t0,165; sw t0,0(t3); 1650: j 1650b
 fail166: li t0,166; sw t0,0(t3); 1660: j 1660b
 fail167: li t0,167; sw t0,0(t3); 1670: j 1670b
+fail168: li t0,168; sw t0,0(t3); 1680: j 1680b
+fail169: li t0,169; sw t0,0(t3); 1690: j 1690b
+fail170: li t0,170; sw t0,0(t3); 1700: j 1700b
