@@ -691,6 +691,71 @@ _start:
     CK64 16, 0x4008000000000000, fail67   # 3.0
     CK64 24, 0xC008000000000000, fail67   # -3.0
 
+    # ============ V3j: widening conversions (vfwcvt.*, SEW=32 -> 64) ============
+    li   a0, 0x80011000          # FP source (single)
+    li   a1, 0x80011040          # int source (signed)
+    li   a3, 0x80011080          # uint source
+    li   a2, 0x80011100          # dst (double / int64 = 2 regs)
+    li t1,0x3FC00000; sw t1,0(a0);  li t1,0x40200000; sw t1,4(a0)   # 1.5, 2.5
+    li t1,0x40600000; sw t1,8(a0);  li t1,0x40800000; sw t1,12(a0)  # 3.5, 4.0
+    li t1,0x0000000A; sw t1,0(a1);  li t1,0xFFFFFFFB; sw t1,4(a1)   # 10, -5
+    li t1,0x00000064; sw t1,8(a1);  li t1,0xFFFFFFFF; sw t1,12(a1)  # 100, -1
+    li t1,0x0000000A; sw t1,0(a3);  li t1,0x00000014; sw t1,4(a3)   # 10, 20
+    li t1,0x00000064; sw t1,8(a3);  li t1,0x00000001; sw t1,12(a3)  # 100, 1
+    # vfwcvt.f.f.v: single -> double [1.5, 2.5, 3.5, 4.0]
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a0)
+    vfwcvt.f.f.v v8, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x3FF8000000000000, fail68   # 1.5
+    CK64 8,  0x4004000000000000, fail68   # 2.5
+    CK64 16, 0x400C000000000000, fail68   # 3.5
+    CK64 24, 0x4010000000000000, fail68   # 4.0
+    # vfwcvt.x.f.v: single -> int64 (truncate) [1, 2, 3, 4]
+    vsetvli t0, x0, e32, m1
+    vfwcvt.x.f.v v8, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x0000000000000001, fail69   # 1
+    CK64 8,  0x0000000000000002, fail69   # 2
+    CK64 16, 0x0000000000000003, fail69   # 3
+    CK64 24, 0x0000000000000004, fail69   # 4
+    # vfwcvt.xu.f.v: single -> uint64 (truncate) [1, 2, 3, 4]
+    vsetvli t0, x0, e32, m1
+    vfwcvt.xu.f.v v8, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x0000000000000001, fail70   # 1
+    CK64 24, 0x0000000000000004, fail70   # 4
+    # vfwcvt.rtz.x.f.v: single -> int64 RTZ [1, 2, 3, 4]
+    vsetvli t0, x0, e32, m1
+    vfwcvt.rtz.x.f.v v8, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x0000000000000001, fail71   # 1
+    CK64 16, 0x0000000000000003, fail71   # 3
+    # vfwcvt.f.x.v: int32 -> double [10.0, -5.0, 100.0, -1.0]
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a1)
+    vfwcvt.f.x.v v8, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x4024000000000000, fail72   # 10.0
+    CK64 8,  0xC014000000000000, fail72   # -5.0
+    CK64 16, 0x4059000000000000, fail72   # 100.0
+    CK64 24, 0xBFF0000000000000, fail72   # -1.0
+    # vfwcvt.f.xu.v: uint32 -> double [10.0, 20.0, 100.0, 1.0]
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a3)
+    vfwcvt.f.xu.v v8, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x4024000000000000, fail73   # 10.0
+    CK64 8,  0x4034000000000000, fail73   # 20.0
+    CK64 16, 0x4059000000000000, fail73   # 100.0
+    CK64 24, 0x3FF0000000000000, fail73   # 1.0
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -776,3 +841,9 @@ fail64: li t0,64; sw t0,0(t3); 640: j 640b
 fail65: li t0,65; sw t0,0(t3); 650: j 650b
 fail66: li t0,66; sw t0,0(t3); 660: j 660b
 fail67: li t0,67; sw t0,0(t3); 670: j 670b
+fail68: li t0,68; sw t0,0(t3); 680: j 680b
+fail69: li t0,69; sw t0,0(t3); 690: j 690b
+fail70: li t0,70; sw t0,0(t3); 700: j 700b
+fail71: li t0,71; sw t0,0(t3); 710: j 710b
+fail72: li t0,72; sw t0,0(t3); 720: j 720b
+fail73: li t0,73; sw t0,0(t3); 730: j 730b
