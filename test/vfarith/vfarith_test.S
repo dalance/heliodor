@@ -1488,6 +1488,100 @@ _start:
     CK 8,  0x447A0000, fail176   # 1000.0
     CK 12, 0xBF800000, fail176   # -1.0
 
+    # ===== V4i-1: LMUL>1 slide (vslideup/down, vslide1up/down), e8 m2 =====
+    # VLMAX=32, src v4/v5 = bytes [1..32], dst v8/v9. Exercises cross-register
+    # source reads + cross-register dest writes + 0-fill past VLMAX + slide1 fill.
+    li   a0, 0x80011500
+    li   a2, 0x80011540
+    li t1, 0x0807060504030201; sd t1,0(a0)    # 1..8
+    li t1, 0x100F0E0D0C0B0A09; sd t1,8(a0)     # 9..16
+    li t1, 0x1817161514131211; sd t1,16(a0)    # 17..24
+    li t1, 0x201F1E1D1C1B1A19; sd t1,24(a0)    # 25..32
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v4,(a0)
+
+    # vslideup.vx off=5, vl=30, dst preset 0xEE → prefix[0,5) + tail[30,32) intact.
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,30; vsetvli t0,t2,e8,m2
+    li t4,5; vslideup.vx v8,v4,t4
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,0xEE; bne t5,t6, fail177   # prefix undisturbed
+    lbu t5,4(a2);  li t6,0xEE; bne t5,t6, fail177
+    lbu t5,5(a2);  li t6,1;    bne t5,t6, fail178    # vs2[0]
+    lbu t5,16(a2); li t6,12;   bne t5,t6, fail178    # dst reg1 local0 = vs2[11]
+    lbu t5,21(a2); li t6,17;   bne t5,t6, fail179    # src reg1: vs2[16]
+    lbu t5,29(a2); li t6,25;   bne t5,t6, fail179    # vs2[24]
+    lbu t5,30(a2); li t6,0xEE; bne t5,t6, fail180    # tail undisturbed
+    lbu t5,31(a2); li t6,0xEE; bne t5,t6, fail180
+
+    # vslidedown.vx off=5, vl=30 → vd[i]=vs2[i+5], 0 past VLMAX=32.
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,30; vsetvli t0,t2,e8,m2
+    li t4,5; vslidedown.vx v8,v4,t4
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,6;    bne t5,t6, fail181    # vs2[5]
+    lbu t5,11(a2); li t6,17;   bne t5,t6, fail181    # vs2[16] (src reg1)
+    lbu t5,26(a2); li t6,32;   bne t5,t6, fail182    # vs2[31] (last)
+    lbu t5,27(a2); li t6,0;    bne t5,t6, fail182    # vs2[32] past VLMAX → 0
+    lbu t5,29(a2); li t6,0;    bne t5,t6, fail183    # 0-fill
+    lbu t5,30(a2); li t6,0xEE; bne t5,t6, fail183    # tail undisturbed
+
+    # vslide1up.vx fill=0x77, vl=20.
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,20; vsetvli t0,t2,e8,m2
+    li t1,0x77; vslide1up.vx v8,v4,t1
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,0x77; bne t5,t6, fail184    # fill
+    lbu t5,1(a2);  li t6,1;    bne t5,t6, fail184    # vs2[0]
+    lbu t5,16(a2); li t6,16;   bne t5,t6, fail185    # vs2[15] (dst reg1)
+    lbu t5,19(a2); li t6,19;   bne t5,t6, fail185    # vs2[18]
+    lbu t5,20(a2); li t6,0xEE; bne t5,t6, fail186    # tail undisturbed
+
+    # vslide1down.vx fill=0x88, vl=20 → vd[i]=vs2[i+1], vd[19]=0x88.
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,20; vsetvli t0,t2,e8,m2
+    li t1,0x88; vslide1down.vx v8,v4,t1
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,2;    bne t5,t6, fail187    # vs2[1]
+    lbu t5,15(a2); li t6,17;   bne t5,t6, fail187    # vs2[16] (src reg1)
+    lbu t5,18(a2); li t6,20;   bne t5,t6, fail188    # vs2[19]
+    lbu t5,19(a2); li t6,0x88; bne t5,t6, fail188    # fill at vl-1
+
+    # masked vslideup.vx off=5, vl=30, v0=0xAAAAAAAA (odd elements active), dst 0.
+    li   a3, 0x80011600
+    li t1,0xAAAAAAAA; sd t1,0(a3); li t1,0; sd t1,8(a3)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v0,(a3)
+    li t1,0; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,30; vsetvli t0,t2,e8,m2
+    li t4,5; vslideup.vx v8,v4,t4,v0.t
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,3(a2);  li t6,0;  bne t5,t6, fail189    # active but i<off → undisturbed
+    lbu t5,5(a2);  li t6,1;  bne t5,t6, fail189    # active, vs2[0]
+    lbu t5,6(a2);  li t6,0;  bne t5,t6, fail190    # inactive → undisturbed
+    lbu t5,16(a2); li t6,0;  bne t5,t6, fail190    # inactive (dst reg1) → undisturbed
+    lbu t5,17(a2); li t6,13; bne t5,t6, fail191    # active vs2[12] (dst reg1)
+
+    # SEW=32 m2: VLMAX=8, src words [0x100..0x800], slideup.vx off=3, vl=8.
+    li   a0, 0x80011680
+    li t1,0x0000020000000100; sd t1,0(a0)
+    li t1,0x0000040000000300; sd t1,8(a0)
+    li t1,0x0000060000000500; sd t1,16(a0)
+    li t1,0x0000080000000700; sd t1,24(a0)
+    li t2,8; vsetvli t0,t2,e32,m2; vle32.v v4,(a0)
+    li t1,0xCCCCCCCCCCCCCCCC; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e32,m2
+    li t4,3; vslideup.vx v8,v4,t4
+    li t2,8; vsetvli t0,t2,e32,m2; vse32.v v8,(a2)
+    CK 0,  0xCCCCCCCC, fail192   # prefix undisturbed
+    CK 12, 0x100, fail193        # vs2[0] (dst reg0 local3)
+    CK 16, 0x200, fail193        # vs2[1] (dst reg1 local0)
+    CK 28, 0x500, fail194        # vs2[4] (src reg1)
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1667,3 +1761,21 @@ fail173: li t0,173; sw t0,0(t3); 1730: j 1730b
 fail174: li t0,174; sw t0,0(t3); 1740: j 1740b
 fail175: li t0,175; sw t0,0(t3); 1750: j 1750b
 fail176: li t0,176; sw t0,0(t3); 1760: j 1760b
+fail177: li t0,177; sw t0,0(t3); 1770: j 1770b
+fail178: li t0,178; sw t0,0(t3); 1780: j 1780b
+fail179: li t0,179; sw t0,0(t3); 1790: j 1790b
+fail180: li t0,180; sw t0,0(t3); 1800: j 1800b
+fail181: li t0,181; sw t0,0(t3); 1810: j 1810b
+fail182: li t0,182; sw t0,0(t3); 1820: j 1820b
+fail183: li t0,183; sw t0,0(t3); 1830: j 1830b
+fail184: li t0,184; sw t0,0(t3); 1840: j 1840b
+fail185: li t0,185; sw t0,0(t3); 1850: j 1850b
+fail186: li t0,186; sw t0,0(t3); 1860: j 1860b
+fail187: li t0,187; sw t0,0(t3); 1870: j 1870b
+fail188: li t0,188; sw t0,0(t3); 1880: j 1880b
+fail189: li t0,189; sw t0,0(t3); 1890: j 1890b
+fail190: li t0,190; sw t0,0(t3); 1900: j 1900b
+fail191: li t0,191; sw t0,0(t3); 1910: j 1910b
+fail192: li t0,192; sw t0,0(t3); 1920: j 1920b
+fail193: li t0,193; sw t0,0(t3); 1930: j 1930b
+fail194: li t0,194; sw t0,0(t3); 1940: j 1940b

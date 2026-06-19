@@ -679,6 +679,19 @@ pub module vector_unit #(
     var vfpu_fflags: logic<5>            ;
     var vfpu_busy  : logic               ;
 
+    // ---- V4i permute (slide/vrgather/vcompress) element-serial state --------
+    // These ops can move an element across register groups, so for LMUL>1 a
+    // single-cycle whole-register datapath is impossible — a destination element
+    // may source an arbitrary register. The VU therefore walks one element per
+    // cycle (pelem), accumulating each destination register and writing it at its
+    // boundary, exactly like the FP / memory FSMs (this also covers LMUL=1, just
+    // multi-cycle). pm_acc is the current dest-register accumulator; pm_j is
+    // vcompress's running output element position. pm_state: 0=IDLE,1=COMPUTE,2=DONE.
+    var pm_state: logic<2>   ;
+    var pelem   : logic<8>   ; // global element walk index
+    var pm_acc  : logic<VLEN>; // current destination register accumulator
+    var pm_j    : logic<8>   ; // vcompress running output element index
+
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
     let has_free: logic = !count[FIFO_W];
@@ -1305,77 +1318,77 @@ pub module vector_unit #(
         }
     }
 
-    // ---- V4f-1/2 vslide{,1}up / vslide{,1}down (single-cycle, LMUL=1) --------
-    // The whole source register is shifted by off*SEW bits (left for up, right
-    // for down) so element i picks up vs2[i-off] / vs2[i+off]; the shift fills 0
-    // for out-of-range positions. The result is then merged element-wise over the
-    // old vd so inactive / tail elements (and, for slideup, the [0,off) prefix)
-    // stay undisturbed. For the plain slides off = x[rs1] (.vx) or uimm5 (.vi),
-    // capped at VLMAX (off >= VLMAX makes slideup write nothing, slidedown all 0).
-    // V4f-2 slide1 (OPMVX/OPFVF funct3 110/101) is slide-by-one that injects a
-    // scalar at the vacated end: vslide1up vd[0] = x[rs1]/f[rs1], vslide1down
-    // vd[vl-1] = x[rs1]/f[rs1]; every active element is written (no undisturbed
-    // prefix). The fill is the int scalar (.vx) or the FP scalar (.vf, low SEW).
+    // ---- V4i permute (slide / vrgather / vcompress): element-serial datapath -
+    // Shared geometry for the dest-walk permute ops. SEW elements, EMUL register
+    // groups: VLMAX = (elements per register) * EMUL. The walk index pelem maps to
+    // a destination register (pm_dreg) and an in-register element (pm_dlocal); the
+    // element value is spliced into the accumulator pm_acc at pm_dbitoff and the
+    // register is written at its boundary (pm_dreg_lst), seeding from the old vd at
+    // the first element so inactive / tail / undisturbed elements stay intact.
+    let pm_epr8   : logic<8>     = 8'd16 >> vsew;            // elements per 128b register
+    let pm_eshift : logic<3>     = 3'd4 - {1'b0, vsew[1:0]}; // log2(elems per register)
+    let pm_eshamt : logic<3>     = 3'd3 + {1'b0, vsew[1:0]}; // log2(SEW in bits)
+    let pm_emul_lg: logic<2>     = if h_vlmul[2] ? 2'd0 : h_vlmul[1:0]; // log2(EMUL), 0 if fractional
+    let pm_vlmax8 : logic<8>     = pm_epr8 << pm_emul_lg;    // VLMAX (<= 128)
+    let pm_sew_msk: logic<64>    = case vsew {
+        3'd0   : 64'h0000_0000_0000_00ff,
+        3'd1   : 64'h0000_0000_0000_ffff,
+        3'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    // Destination element geometry (dest-walk: write vd[pelem]).
+    let pm_dreg    : logic<8>     = pelem >> pm_eshift;
+    let pm_dlocal  : logic<8>     = pelem & (pm_epr8 - 8'd1);
+    let pm_dbitoff : logic<8>     = pm_dlocal << pm_eshamt;
+    let pm_dreg_vrf: logic<VRF_W> = h_vd + pm_dreg[VRF_W - 1:0];
+    let pm_dreg_1st: logic        = pm_dlocal == 8'd0;       // first element of a dest register
+    let pm_dreg_lst: logic        = ((pm_dlocal + 8'd1) >= pm_epr8) || ((pelem + 8'd1) >= vl8);
+    // Mask (v0): vm=1 unmasked, else v0[pelem]. (Shift then bit 0 — no dynamic select.)
+    let pm_mask_sh : logic<VLEN>  = i_mask_data >> pelem;
+    let pm_active  : logic        = h_vm || pm_mask_sh[0];
+
+    // ---- slide (vslide{,1}up / vslide{,1}down) source addressing ------------
+    // off = x[rs1] (.vx) / uimm5 (.vi) / 1 (slide1), capped at VLMAX (off >= VLMAX
+    // makes slideup write nothing, slidedown all 0). slideup picks vs2[pelem-off]
+    // (written only for pelem >= off; the [0,off) prefix is undisturbed); slidedown
+    // picks vs2[pelem+off] (0-fill when pelem+off >= VLMAX). slide1 is slide-by-one
+    // that injects a scalar at the vacated end (up: elem 0; down: elem vl-1) and
+    // writes every active element. The fill is the int scalar (.vx) or FP (.vf).
     let h_is_slide1: logic = h_is_slide && (h_funct3 == 3'b110 || h_funct3 == 3'b101);
     let h_slide1_fp: logic = h_is_slide && (h_funct3 == 3'b101); // vfslide1.vf
-    let slide_fill : logic<64> = if h_slide1_fp ? i_fscalar_data : i_scalar_data;
-    let vlmax_el : logic<8> = case vsew {
+    let vlmax_el   : logic<8> = case vsew {
         3'd0   : 8'd16,
         3'd1   : 8'd8,
         3'd2   : 8'd4,
         default: 8'd2,
     };
-    let slide_off_raw: logic<64> = if h_is_vx ? i_scalar_data : {59'd0, h_instr[19:15]};
-    let slide_off    : logic<8>  = if slide_off_raw >= {56'd0, vlmax_el} ? vlmax_el : slide_off_raw[7:0];
-    // effective element offset (slide1 is always by one); last element index.
-    let slide_eoff: logic<8> = if h_is_slide1 ? 8'd1 : slide_off;
-    let vl_last   : logic<8> = vl8 - 8'd1;
-    // shift amount in bits = eoff * SEW, built by concatenation (max 128).
-    let slide_sh: logic<8> = case vsew {
-        3'd0   : {slide_eoff[4:0], 3'd0}, // * 8
-        3'd1   : {slide_eoff[3:0], 4'd0}, // * 16
-        3'd2   : {slide_eoff[2:0], 5'd0}, // * 32
-        default: {slide_eoff[1:0], 6'd0}, // * 64
-    };
-    let slide_shifted: logic<VLEN> = if h_slide_dn ? (i_vs2_data >> slide_sh) : (i_vs2_data << slide_sh);
-    var slide_res: logic<VLEN>;
-    always_comb {
-        slide_res = i_vdold_data; // inactive / tail / slideup-prefix = undisturbed
-        case vsew {
-            3'd0: { // SEW=8 → 16 elements
-                for i in 0..16 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_is_slide1 || h_slide_dn || !((i as 8) <: slide_off)) {
-                        let fl: logic = h_is_slide1 && (if h_slide_dn ? ((i as 8) == vl_last) : (i == 0));
-                        slide_res[i*8+:8] = if fl ? slide_fill[7:0] : slide_shifted[i*8+:8];
-                    }
-                }
-            }
-            3'd1: { // SEW=16 → 8 elements
-                for i in 0..8 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_is_slide1 || h_slide_dn || !((i as 8) <: slide_off)) {
-                        let fl: logic = h_is_slide1 && (if h_slide_dn ? ((i as 8) == vl_last) : (i == 0));
-                        slide_res[i*16+:16] = if fl ? slide_fill[15:0] : slide_shifted[i*16+:16];
-                    }
-                }
-            }
-            3'd2: { // SEW=32 → 4 elements
-                for i in 0..4 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_is_slide1 || h_slide_dn || !((i as 8) <: slide_off)) {
-                        let fl: logic = h_is_slide1 && (if h_slide_dn ? ((i as 8) == vl_last) : (i == 0));
-                        slide_res[i*32+:32] = if fl ? slide_fill[31:0] : slide_shifted[i*32+:32];
-                    }
-                }
-            }
-            default: { // SEW=64 → 2 elements
-                for i in 0..2 {
-                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_is_slide1 || h_slide_dn || !((i as 8) <: slide_off)) {
-                        let fl: logic = h_is_slide1 && (if h_slide_dn ? ((i as 8) == vl_last) : (i == 0));
-                        slide_res[i*64+:64] = if fl ? slide_fill[63:0] : slide_shifted[i*64+:64];
-                    }
-                }
-            }
-        }
-    }
+    let pm_off_raw : logic<64> = if h_is_slide1 ? 64'd1 : (if h_is_vx ? i_scalar_data : {59'd0, h_instr[19:15]});
+    let pm_off     : logic<8>  = if pm_off_raw >= {56'd0, pm_vlmax8} ? pm_vlmax8 : pm_off_raw[7:0];
+    let pm_up_ok   : logic     = pelem >= pm_off;                 // slideup element written?
+    let pm_dn_sum  : logic<9>  = {1'b0, pelem} + {1'b0, pm_off};
+    let pm_dn_ok   : logic     = pm_dn_sum <: {1'b0, pm_vlmax8};  // slidedown element in range?
+    let pm_sidx    : logic<8>  = if h_slide_dn ? pm_dn_sum[7:0] : (pelem - pm_off);
+    let pm_sreg    : logic<8>  = pm_sidx >> pm_eshift;
+    let pm_slocal  : logic<8>  = pm_sidx & (pm_epr8 - 8'd1);
+    let pm_sbitoff : logic<8>  = pm_slocal << pm_eshamt;
+    let pm_vl_last : logic<8>  = vl8 - 8'd1;
+    let pm_fill_at : logic     = h_is_slide1 && (if h_slide_dn ? (pelem == pm_vl_last) : (pelem == 8'd0));
+    let pm_fill_val: logic<64> = if h_slide1_fp ? i_fscalar_data : i_scalar_data;
+    let pm_slide_raw: logic<VLEN> = i_vs2_data >> pm_sbitoff;     // vs2[src] at bit 0
+    let pm_slide_el : logic<64>   = if pm_fill_at ? pm_fill_val : (if h_slide_dn ? (if pm_dn_ok ? pm_slide_raw[63:0] : 64'd0) : pm_slide_raw[63:0]);
+    let pm_slide_wr : logic       = pm_active && (h_is_slide1 || h_slide_dn || pm_up_ok);
+
+    // ---- per-op source register + element value + write enable --------------
+    // (slide for now; vrgather / vcompress add their branches in V4i-2 / V4i-3.)
+    let pm_src_reg: logic<8>   = pm_sreg;       // vs2 register to read this cycle
+    let pm_el_val : logic<64>  = pm_slide_el;   // source element value (low SEW bits)
+    let pm_wr_el  : logic      = pm_slide_wr;   // write this destination element?
+    // Splice the element into the dest-register accumulator (seed from old vd at
+    // the first element of each register; undisturbed elements keep the seed).
+    let pm_res_vlen: logic<VLEN> = ({64'd0, pm_el_val & pm_sew_msk} as VLEN) << pm_dbitoff;
+    let pm_dmask_v : logic<VLEN> = ({64'd0, pm_sew_msk} as VLEN) << pm_dbitoff;
+    let pm_acc_base: logic<VLEN> = if pm_dreg_1st ? i_vdold_data : pm_acc;
+    let pm_acc_next: logic<VLEN> = if pm_wr_el ? ((pm_acc_base & ~pm_dmask_v) | pm_res_vlen) : pm_acc_base;
 
     // ---- V4f-3 vrgather (single-cycle, LMUL=1) ------------------------------
     // vd[i] = vs2[idx] where idx = vs1[i] (.vv, read at the dest element's SEW),
@@ -1891,8 +1904,13 @@ pub module vector_unit #(
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
     // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
-    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre || h_is_slide || h_is_vrg || h_is_comp;
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre || h_is_vrg || h_is_comp;
     let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
+    // V4i permute (slide; vrgather / vcompress added later): element-serial via the
+    // pm_state FSM below, retiring from DONE (pm_cdb_fire). Handles all LMUL.
+    let h_is_perm  : logic = h_is_slide;
+    let pm_reg_wr  : logic = (pm_state == 2'd1) && pm_dreg_lst; // write dest register at its boundary
+    let pm_cdb_fire: logic = h_is_perm && (pm_state == 2'd2) && i_cdb_free && !i_flush;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
     // (va_last) rides the vu_cdb (result_written) and needs i_cdb_free.
@@ -1904,7 +1922,7 @@ pub module vector_unit #(
     let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
     // FP arithmetic (vfadd/...) streams through its own element-serial FSM,
     // also retiring from DONE (fp_cdb_fire, defined with the FP datapath above).
-    let vu_pop      : logic = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
+    let vu_pop      : logic = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
     // Load VRF write (V2d-3): a register's accumulated value is written when its
     // last element is processed during ACCESS — no fault, element completed.
     let mem_fault_now: logic = (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st);
@@ -1919,7 +1937,6 @@ pub module vector_unit #(
     // register in the fire path.
     let vmask_wr : logic = fire && h_is_vmask;
     let vmspre_wr: logic = fire && h_is_vmspre;
-    let slide_wr : logic = fire && h_is_slide;
     let vrg_wr   : logic = fire && h_is_vrg;
     let comp_wr  : logic = fire && h_is_comp;
     // Register group for source / dest addressing. A compare reads source group
@@ -1937,14 +1954,14 @@ pub module vector_unit #(
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})))); // viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
+    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
-    assign o_vd_addr     = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || slide_wr || vrg_wr || comp_wr;
-    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_slide ? slide_res : (if h_is_vrg ? vrg_res : (if h_is_comp ? comp_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))))))))));
+    assign o_vdold_addr  = if h_is_perm ? pm_dreg_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
+    assign o_vd_addr     = if h_is_perm ? pm_dreg_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr || vrg_wr || comp_wr;
+    assign o_vd_data     = if h_is_perm ? pm_acc_next : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_vrg ? vrg_res : (if h_is_comp ? comp_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))))))))));
 
-    assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
+    assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
     assign o_cdb_fp_dest  = fire && h_rd_fp;  // vfmv.f.s → write prf_fp (cdb_dest_is_fp)
     assign o_cdb_pdst     = h_rd_pd;
@@ -2034,6 +2051,10 @@ pub module vector_unit #(
             fp_acc      = {1'b0 repeat VLEN};
             fp_fflags_q = 5'd0;
             red_acc     = 64'd0;
+            pm_state    = 2'd0;
+            pelem       = 8'd0;
+            pm_acc      = {1'b0 repeat VLEN};
+            pm_j        = 8'd0;
         } else if i_flush {
             // Drop all speculative vector ops; restore config from the committed
             // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
@@ -2053,6 +2074,9 @@ pub module vector_unit #(
             vn_lo      = 64'd0;
             // Abandon any in-flight FP op; idempotent, re-executes from element 0.
             fp_state    = 2'd0;
+            // Abandon any in-flight permute op (idempotent: re-reads the same
+            // unrenamed VRF sources and re-writes the dest from element 0).
+            pm_state    = 2'd0;
         } else {
             // Scalar-operand wakeup (int CDB snoop, both lanes).
             for i in 0..FIFO_N {
@@ -2164,6 +2188,43 @@ pub module vector_unit #(
                     // DONE: retire on the vu_cdb writeback (vu_pop below).
                     if i_cdb_free {
                         fp_state = 2'd0;
+                    }
+                }
+            }
+            // Permute FSM (slide / vrgather / vcompress): walk one element per
+            // cycle, accumulating each destination register and writing it at its
+            // boundary (pm_reg_wr / pm_acc_next via the VRF port this cycle). The
+            // accumulator resets at the boundary; the next register re-seeds from
+            // the old vd (so inactive / tail / undisturbed elements stay intact).
+            case pm_state {
+                2'd0: {
+                    // IDLE: launch when a permute op is the ROB head with its
+                    // scalar operand ready (slide.vx / slide1; .vv / .vf need none).
+                    if (count != 0) && at_head && h_is_perm && scalar_ok {
+                        pelem  = 8'd0;
+                        pm_acc = {1'b0 repeat VLEN};
+                        pm_j   = 8'd0;
+                        if vl8 == 8'd0 {
+                            pm_state = 2'd2; // empty op: nothing to do
+                        } else {
+                            pm_state = 2'd1;
+                        }
+                    }
+                }
+                2'd1: {
+                    // COMPUTE: process element pelem; write the completed dest
+                    // register at its boundary and reset the accumulator.
+                    pm_acc = if pm_dreg_lst ? {1'b0 repeat VLEN} : pm_acc_next;
+                    if pelem + 8'd1 >= vl8 {
+                        pm_state = 2'd2;
+                    } else {
+                        pelem = pelem + 8'd1;
+                    }
+                }
+                2'd2: {
+                    // DONE: retire on the vu_cdb writeback (vu_pop below).
+                    if i_cdb_free {
+                        pm_state = 2'd0;
                     }
                 }
             }
