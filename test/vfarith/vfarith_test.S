@@ -1214,6 +1214,63 @@ _start:
     CK 8,  0x22222222, fail139   # vs2[1]
     CK 12, 0x33333333, fail139   # vs2[2]
 
+    # ===== V4f-2: vslide1up/down.vx + vfslide1up/down.vf =====
+    li   a0, 0x80010F00
+    li   a2, 0x80010F40
+    li t1, 0x50463C32281E140A; sd t1,0(a0)   # [10,20,...,80]
+    li t2,8; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+
+    # vslide1up.vx fill=99 → [99,10,20,30,40,50,60,70].
+    li t1, 99; vslide1up.vx v8,v4,t1
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,99; bne t5,t6, fail140   # fill
+    lbu t5,1(a2); li t6,10; bne t5,t6, fail140   # vs2[0]
+    lbu t5,7(a2); li t6,70; bne t5,t6, fail141   # vs2[6]
+
+    # vslide1down.vx fill=99 → [20,30,40,50,60,70,80,99].
+    li t2,8; vsetvli t0,t2,e8,m1
+    li t1, 99; vslide1down.vx v8,v4,t1
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,20; bne t5,t6, fail142   # vs2[1]
+    lbu t5,6(a2); li t6,80; bne t5,t6, fail142   # vs2[7]
+    lbu t5,7(a2); li t6,99; bne t5,t6, fail143   # fill at vl-1
+
+    # masked vslide1up.vx v0=0x0B (active 0,1,3), fill=99, v8 preset 0.
+    li   a3, 0x80010F30
+    li t1, 0x0B; sb t1,0(a3)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v0,(a3)
+    li t1,0; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e8,m1
+    li t1,99; vslide1up.vx v8,v4,t1,v0.t
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,99; bne t5,t6, fail144   # active, fill
+    lbu t5,1(a2); li t6,10; bne t5,t6, fail144   # active, vs2[0]
+    lbu t5,2(a2); li t6,0;  bne t5,t6, fail145   # inactive, undisturbed
+    lbu t5,3(a2); li t6,30; bne t5,t6, fail145   # active, vs2[2]
+
+    # vfslide1up.vf SEW=32, v4=[1.0,2.0,3.0,4.0], fill f[rs1]=9.0.
+    li   a0, 0x80010F80
+    li t1, 0x3F800000; sw t1,0(a0); li t1,0x40000000; sw t1,4(a0)
+    li t1, 0x40400000; sw t1,8(a0); li t1,0x40800000; sw t1,12(a0)
+    li t2,4; vsetvli t0,t2,e32,m1; vle32.v v4,(a0)
+    li t1, 0x41100000; fmv.w.x fa0, t1          # 9.0
+    vfslide1up.vf v8,v4,fa0
+    vse32.v v8,(a2)
+    CK 0,  0x41100000, fail146   # 9.0 fill
+    CK 4,  0x3F800000, fail146   # 1.0
+    CK 8,  0x40000000, fail147   # 2.0
+    CK 12, 0x40400000, fail147   # 3.0
+
+    # vfslide1down.vf → [2.0,3.0,4.0,9.0].
+    li t2,4; vsetvli t0,t2,e32,m1
+    vfslide1down.vf v8,v4,fa0
+    vse32.v v8,(a2)
+    CK 0,  0x40000000, fail148   # 2.0
+    CK 4,  0x40400000, fail148   # 3.0
+    CK 8,  0x40800000, fail149   # 4.0
+    CK 12, 0x41100000, fail149   # 9.0 fill at vl-1
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1356,3 +1413,13 @@ fail136: li t0,136; sw t0,0(t3); 1360: j 1360b
 fail137: li t0,137; sw t0,0(t3); 1370: j 1370b
 fail138: li t0,138; sw t0,0(t3); 1380: j 1380b
 fail139: li t0,139; sw t0,0(t3); 1390: j 1390b
+fail140: li t0,140; sw t0,0(t3); 1400: j 1400b
+fail141: li t0,141; sw t0,0(t3); 1410: j 1410b
+fail142: li t0,142; sw t0,0(t3); 1420: j 1420b
+fail143: li t0,143; sw t0,0(t3); 1430: j 1430b
+fail144: li t0,144; sw t0,0(t3); 1440: j 1440b
+fail145: li t0,145; sw t0,0(t3); 1450: j 1450b
+fail146: li t0,146; sw t0,0(t3); 1460: j 1460b
+fail147: li t0,147; sw t0,0(t3); 1470: j 1470b
+fail148: li t0,148; sw t0,0(t3); 1480: j 1480b
+fail149: li t0,149; sw t0,0(t3); 1490: j 1490b
