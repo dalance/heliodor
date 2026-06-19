@@ -1582,6 +1582,102 @@ _start:
     CK 16, 0x200, fail193        # vs2[1] (dst reg1 local0)
     CK 28, 0x500, fail194        # vs2[4] (src reg1)
 
+    # ===== V4i-2: LMUL>1 vrgather (.vv/.vx/.vi), e8 m2 (VLMAX=32) =====
+    # src v4/v5 = bytes [1..32] (value=idx+1), index v6/v7, dst v8/v9. Exercises
+    # cross-register index reads + cross-register source reads + idx>=VLMAX → 0.
+    li   a0, 0x80011700   # src
+    li   a4, 0x80011740   # index
+    li   a2, 0x80011780   # dst
+    li t1, 0x0807060504030201; sd t1,0(a0)
+    li t1, 0x100F0E0D0C0B0A09; sd t1,8(a0)
+    li t1, 0x1817161514131211; sd t1,16(a0)
+    li t1, 0x201F1E1D1C1B1A19; sd t1,24(a0)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v4,(a0)
+    # index = [0,16,31,5,8,24,12,28, 1,17,2,18,40,3,19,7, 6,22,14,30,...]
+    li t1, 0x1C0C1808051F1000; sd t1,0(a4)
+    li t1, 0x0713032812021101; sd t1,8(a4)
+    li t1, 0x000000001E0E1606; sd t1,16(a4)
+    li t1, 0; sd t1,24(a4)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v6,(a4)
+
+    # vrgather.vv vl=20, dst preset 0xEE.
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,20; vsetvli t0,t2,e8,m2
+    vrgather.vv v8,v4,v6
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,1;    bne t5,t6, fail195   # vs2[0]
+    lbu t5,1(a2);  li t6,17;   bne t5,t6, fail195   # vs2[16] (src reg1)
+    lbu t5,2(a2);  li t6,32;   bne t5,t6, fail196   # vs2[31] (src reg1)
+    lbu t5,12(a2); li t6,0;    bne t5,t6, fail196   # idx 40 >= VLMAX → 0
+    lbu t5,15(a2); li t6,8;    bne t5,t6, fail197   # vs2[7]
+    lbu t5,16(a2); li t6,7;    bne t5,t6, fail197   # dst reg1: vs2[6]
+    lbu t5,17(a2); li t6,23;   bne t5,t6, fail198   # dst reg1: vs2[22]
+    lbu t5,19(a2); li t6,31;   bne t5,t6, fail198   # vs2[30]
+    lbu t5,20(a2); li t6,0xEE; bne t5,t6, fail199   # tail undisturbed
+
+    # vrgather.vx idx=20 (broadcast) → vs2[20]=21.
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,20; vsetvli t0,t2,e8,m2
+    li t1,20; vrgather.vx v8,v4,t1
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,21; bne t5,t6, fail199    # vs2[20]
+    lbu t5,16(a2); li t6,21; bne t5,t6, fail200    # dst reg1
+    lbu t5,19(a2); li t6,21; bne t5,t6, fail200
+
+    # vrgather.vx idx=50 (>= VLMAX=32) → all 0.
+    li t2,20; vsetvli t0,t2,e8,m2
+    li t1,50; vrgather.vx v8,v4,t1
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,0; bne t5,t6, fail201     # oob → 0
+    lbu t5,19(a2); li t6,0; bne t5,t6, fail201
+
+    # vrgather.vi idx=30 → vs2[30]=31 broadcast.
+    li t2,20; vsetvli t0,t2,e8,m2
+    vrgather.vi v8,v4,30
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,31; bne t5,t6, fail202    # vs2[30]
+    lbu t5,17(a2); li t6,31; bne t5,t6, fail202    # dst reg1
+
+    # masked vrgather.vv v0=0xAAAAAAAA (odd active), dst preset 0.
+    li   a3, 0x800117C0
+    li t1,0xAAAAAAAA; sd t1,0(a3); li t1,0; sd t1,8(a3)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v0,(a3)
+    li t1,0; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,20; vsetvli t0,t2,e8,m2
+    vrgather.vv v8,v4,v6,v0.t
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,0;  bne t5,t6, fail203    # inactive (idx0) → undisturbed
+    lbu t5,1(a2);  li t6,17; bne t5,t6, fail203    # active vs2[16]
+    lbu t5,16(a2); li t6,0;  bne t5,t6, fail204    # inactive (dst reg1)
+    lbu t5,17(a2); li t6,23; bne t5,t6, fail204    # active vs2[22] (dst reg1)
+
+    # SEW=32 m2 vrgather.vv: VLMAX=8, src words [0x11..0x88], idx [7,0,4,3,1,6,2,5].
+    li   a0, 0x80011800
+    li   a4, 0x80011840
+    li   a2, 0x80011880
+    li t1,0x0000002200000011; sd t1,0(a0)
+    li t1,0x0000004400000033; sd t1,8(a0)
+    li t1,0x0000006600000055; sd t1,16(a0)
+    li t1,0x0000008800000077; sd t1,24(a0)
+    li t2,8; vsetvli t0,t2,e32,m2; vle32.v v4,(a0)
+    li t1,0x0000000000000007; sd t1,0(a4)
+    li t1,0x0000000300000004; sd t1,8(a4)
+    li t1,0x0000000600000001; sd t1,16(a4)
+    li t1,0x0000000500000002; sd t1,24(a4)
+    li t2,8; vsetvli t0,t2,e32,m2; vle32.v v6,(a4)
+    li t1,0xCCCCCCCCCCCCCCCC; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e32,m2
+    vrgather.vv v8,v4,v6
+    li t2,8; vsetvli t0,t2,e32,m2; vse32.v v8,(a2)
+    CK 0,  0x88, fail205    # vs2[7]
+    CK 4,  0x11, fail205    # vs2[0]
+    CK 16, 0x22, fail206    # vs2[1] (dst reg1)
+    CK 28, 0x66, fail206    # vs2[5] (src reg1)
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1779,3 +1875,15 @@ fail191: li t0,191; sw t0,0(t3); 1910: j 1910b
 fail192: li t0,192; sw t0,0(t3); 1920: j 1920b
 fail193: li t0,193; sw t0,0(t3); 1930: j 1930b
 fail194: li t0,194; sw t0,0(t3); 1940: j 1940b
+fail195: li t0,195; sw t0,0(t3); 1950: j 1950b
+fail196: li t0,196; sw t0,0(t3); 1960: j 1960b
+fail197: li t0,197; sw t0,0(t3); 1970: j 1970b
+fail198: li t0,198; sw t0,0(t3); 1980: j 1980b
+fail199: li t0,199; sw t0,0(t3); 1990: j 1990b
+fail200: li t0,200; sw t0,0(t3); 2000: j 2000b
+fail201: li t0,201; sw t0,0(t3); 2010: j 2010b
+fail202: li t0,202; sw t0,0(t3); 2020: j 2020b
+fail203: li t0,203; sw t0,0(t3); 2030: j 2030b
+fail204: li t0,204; sw t0,0(t3); 2040: j 2040b
+fail205: li t0,205; sw t0,0(t3); 2050: j 2050b
+fail206: li t0,206; sw t0,0(t3); 2060: j 2060b
