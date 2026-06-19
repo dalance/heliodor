@@ -1731,6 +1731,55 @@ _start:
     CK 16, 0x77, fail212        # packed[4]=vs2[6] (dst reg1, src reg1)
     CK 20, 0xCCCCCCCC, fail213  # past packed count -> undisturbed
 
+    # ===== V4i-4: vrgatherei16.vv (16-bit index regardless of SEW) =====
+    # e8 m1: VLMAX=16, src v4=[1..16], 16-bit index v6/v7 (8 idx/reg -> spans 2 regs).
+    li   a0, 0x80011B00   # src
+    li   a4, 0x80011B40   # index (16-bit elements)
+    li   a2, 0x80011B80   # dst
+    li t1, 0x0807060504030201; sd t1,0(a0)   # 1..8
+    li t1, 0x100F0E0D0C0B0A09; sd t1,8(a0)    # 9..16
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    # index = [3,0,15,8, 1,5,12,7, 2,10,4,14, 6,20,9,11] as 16-bit LE.
+    li t1, 0x0008000F00000003; sd t1,0(a4)
+    li t1, 0x0007000C00050001; sd t1,8(a4)
+    li t1, 0x000E0004000A0002; sd t1,16(a4)
+    li t1, 0x000B000900140006; sd t1,24(a4)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v6,(a4)
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,16; vsetvli t0,t2,e8,m1
+    vrgatherei16.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2);  li t6,4;  bne t5,t6, fail214   # vs2[3]
+    lbu t5,2(a2);  li t6,16; bne t5,t6, fail214   # vs2[15]
+    lbu t5,7(a2);  li t6,8;  bne t5,t6, fail215   # vs2[7] (last idx of v6)
+    lbu t5,8(a2);  li t6,3;  bne t5,t6, fail215   # vs2[2] (first idx of v7 = index reg cross)
+    lbu t5,13(a2); li t6,0;  bne t5,t6, fail216   # idx 20 >= VLMAX -> 0
+    lbu t5,15(a2); li t6,12; bne t5,t6, fail216   # vs2[11]
+
+    # e32 m2: VLMAX=8, 16-bit index narrower than SEW (8 idx in 1 reg v6), cross-reg.
+    li   a0, 0x80011C00
+    li   a4, 0x80011C40
+    li   a2, 0x80011C80
+    li t1,0x0000002200000011; sd t1,0(a0)
+    li t1,0x0000004400000033; sd t1,8(a0)
+    li t1,0x0000006600000055; sd t1,16(a0)
+    li t1,0x0000008800000077; sd t1,24(a0)
+    li t2,8; vsetvli t0,t2,e32,m2; vle32.v v4,(a0)
+    # index = [7,0,4,3, 1,6,2,5] as 16-bit LE.
+    li t1,0x0003000400000007; sd t1,0(a4)
+    li t1,0x0005000200060001; sd t1,8(a4)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a4)
+    li t1,0xCCCCCCCCCCCCCCCC; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e32,m2
+    vrgatherei16.vv v8,v4,v6
+    li t2,8; vsetvli t0,t2,e32,m2; vse32.v v8,(a2)
+    CK 0,  0x88, fail217   # vs2[7]
+    CK 4,  0x11, fail217   # vs2[0]
+    CK 16, 0x22, fail218   # vs2[1] (dst reg1)
+    CK 28, 0x66, fail218   # vs2[5] (src reg1)
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1947,3 +1996,8 @@ fail210: li t0,210; sw t0,0(t3); 2100: j 2100b
 fail211: li t0,211; sw t0,0(t3); 2110: j 2110b
 fail212: li t0,212; sw t0,0(t3); 2120: j 2120b
 fail213: li t0,213; sw t0,0(t3); 2130: j 2130b
+fail214: li t0,214; sw t0,0(t3); 2140: j 2140b
+fail215: li t0,215; sw t0,0(t3); 2150: j 2150b
+fail216: li t0,216; sw t0,0(t3); 2160: j 2160b
+fail217: li t0,217; sw t0,0(t3); 2170: j 2170b
+fail218: li t0,218; sw t0,0(t3); 2180: j 2180b
