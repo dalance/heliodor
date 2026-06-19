@@ -1339,6 +1339,41 @@ _start:
     CK 8,  0x22222222, fail158   # vs2[1]
     CK 12, 0x11111111, fail158   # vs2[0]
 
+    # ===== V4f-4: vcompress.vm (LMUL=1) =====
+    li   a0, 0x80011100      # vs2 data
+    li   a1, 0x80011140      # vs1 compress mask
+    li   a2, 0x80011180      # dst
+    li t1, 0x50463C32281E140A; sd t1,0(a0)   # v4 = [10,20,...,80]
+    li t2,8; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 0xB5; sb t1,0(a1)                  # mask bits 0,2,4,5,7
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a1)
+    li t1, 0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e8,m1
+    vcompress.vm v8,v4,v6
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,10;   bne t5,t6, fail159   # vs2[0]
+    lbu t5,1(a2); li t6,30;   bne t5,t6, fail159   # vs2[2]
+    lbu t5,2(a2); li t6,50;   bne t5,t6, fail160   # vs2[4]
+    lbu t5,3(a2); li t6,60;   bne t5,t6, fail160   # vs2[5]
+    lbu t5,4(a2); li t6,80;   bne t5,t6, fail161   # vs2[7]
+    lbu t5,5(a2); li t6,0xEE; bne t5,t6, fail161   # past count → undisturbed
+
+    # SEW=32 vcompress mask=0x0A (keep elements 1,3), v8 preset 0xCCCCCCCC.
+    li t1, 0x2222222211111111; sd t1,0(a0)
+    li t1, 0x4444444433333333; sd t1,8(a0)
+    li t2,4; vsetvli t0,t2,e32,m1; vle32.v v4,(a0)
+    li t1, 0x0A; sb t1,0(a1)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a1)
+    li t1, 0xCCCCCCCCCCCCCCCC; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,4; vsetvli t0,t2,e32,m1
+    vcompress.vm v8,v4,v6
+    vse32.v v8,(a2)
+    CK 0,  0x22222222, fail162   # vs2[1]
+    CK 4,  0x44444444, fail162   # vs2[3]
+    CK 8,  0xCCCCCCCC, fail163   # past count → undisturbed
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1500,3 +1535,8 @@ fail155: li t0,155; sw t0,0(t3); 1550: j 1550b
 fail156: li t0,156; sw t0,0(t3); 1560: j 1560b
 fail157: li t0,157; sw t0,0(t3); 1570: j 1570b
 fail158: li t0,158; sw t0,0(t3); 1580: j 1580b
+fail159: li t0,159; sw t0,0(t3); 1590: j 1590b
+fail160: li t0,160; sw t0,0(t3); 1600: j 1600b
+fail161: li t0,161; sw t0,0(t3); 1610: j 1610b
+fail162: li t0,162; sw t0,0(t3); 1620: j 1620b
+fail163: li t0,163; sw t0,0(t3); 1630: j 1630b
