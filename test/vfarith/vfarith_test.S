@@ -1138,6 +1138,82 @@ _start:
     lbu t5,3(a2); li t6,0x01; bne t5,t6, fail127   # active: elem1 set before
     lbu t5,2(a2); li t6,0x77; bne t5,t6, fail127   # inactive undisturbed
 
+    # ===== V4f-1: vslideup / vslidedown (.vx/.vi, LMUL=1) =====
+    li   a0, 0x80010D00
+    li   a2, 0x80010D40
+    # v4 = [10,20,...,160] (16 bytes, e8)
+    li t1, 0x50463C32281E140A; sd t1, 0(a0)   # 10,20,30,40,50,60,70,80
+    li t1, 0xA0968C82786E645A; sd t1, 8(a0)   # 90,100,...,160
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+
+    # vslideup.vx off=2, vl=8, v8 preset 0xEE → [EE,EE,10,20,30,40,50,60].
+    li t1, 0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e8,m1
+    li t4,2; vslideup.vx v8,v4,t4
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0xEE; bne t5,t6, fail128   # [0,off) undisturbed
+    lbu t5,1(a2); li t6,0xEE; bne t5,t6, fail128
+    lbu t5,2(a2); li t6,10;   bne t5,t6, fail129   # vs2[0]
+    lbu t5,7(a2); li t6,60;   bne t5,t6, fail129   # vs2[5]
+
+    # vslidedown.vx off=2, vl=8 → [30,40,50,60,70,80,90,100] (reads past vl).
+    li t2,8; vsetvli t0,t2,e8,m1
+    li t4,2; vslidedown.vx v8,v4,t4
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,30;  bne t5,t6, fail130   # vs2[2]
+    lbu t5,5(a2); li t6,80;  bne t5,t6, fail130   # vs2[7]
+    lbu t5,6(a2); li t6,90;  bne t5,t6, fail131   # vs2[8]
+    lbu t5,7(a2); li t6,100; bne t5,t6, fail131   # vs2[9]
+
+    # vslidedown.vx off=12, vl=8 → vs2[12..15] then 0 (past VLMAX=16).
+    li t2,8; vsetvli t0,t2,e8,m1
+    li t4,12; vslidedown.vx v8,v4,t4
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,130; bne t5,t6, fail132   # vs2[12]
+    lbu t5,3(a2); li t6,160; bne t5,t6, fail132   # vs2[15]
+    lbu t5,4(a2); li t6,0;   bne t5,t6, fail133   # vs2[16] past end → 0
+    lbu t5,7(a2); li t6,0;   bne t5,t6, fail133
+
+    # vslideup.vi off=3, vl=8, v8 preset 0xCC → [CC,CC,CC,10,20,30,40,50].
+    li t1, 0xCCCCCCCCCCCCCCCC; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e8,m1
+    vslideup.vi v8,v4,3
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,2(a2); li t6,0xCC; bne t5,t6, fail134   # prefix undisturbed
+    lbu t5,3(a2); li t6,10;   bne t5,t6, fail134   # vs2[0]
+    lbu t5,7(a2); li t6,50;   bne t5,t6, fail135   # vs2[4]
+
+    # masked vslideup.vx off=2, v0=0xAA (active 1,3,5,7), v8 preset 0.
+    li   a3, 0x80010D80
+    li t1, 0xAA; sb t1,0(a3)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v0,(a3)
+    li t1, 0; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e8,m1
+    li t4,2; vslideup.vx v8,v4,t4,v0.t
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,1(a2); li t6,0;  bne t5,t6, fail136   # active but i<off → undisturbed
+    lbu t5,3(a2); li t6,20; bne t5,t6, fail136   # vs2[1]
+    lbu t5,5(a2); li t6,40; bne t5,t6, fail137   # vs2[3]
+    lbu t5,4(a2); li t6,0;  bne t5,t6, fail137   # inactive → undisturbed
+
+    # SEW=32 vslideup.vx off=1, vl=4, v8 preset 0xAAAAAAAA words.
+    li   a0, 0x80010E00
+    li t1, 0x2222222211111111; sd t1,0(a0)
+    li t1, 0x4444444433333333; sd t1,8(a0)
+    li t2,4; vsetvli t0,t2,e32,m1; vle32.v v4,(a0)
+    li t1, 0xAAAAAAAAAAAAAAAA; sd t1,0(a2); sd t1,8(a2)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2,4; vsetvli t0,t2,e32,m1
+    li t4,1; vslideup.vx v8,v4,t4
+    vse32.v v8,(a2)
+    CK 0,  0xAAAAAAAA, fail138   # undisturbed
+    CK 4,  0x11111111, fail138   # vs2[0]
+    CK 8,  0x22222222, fail139   # vs2[1]
+    CK 12, 0x33333333, fail139   # vs2[2]
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1268,3 +1344,15 @@ fail124: li t0,124; sw t0,0(t3); 1240: j 1240b
 fail125: li t0,125; sw t0,0(t3); 1250: j 1250b
 fail126: li t0,126; sw t0,0(t3); 1260: j 1260b
 fail127: li t0,127; sw t0,0(t3); 1270: j 1270b
+fail128: li t0,128; sw t0,0(t3); 1280: j 1280b
+fail129: li t0,129; sw t0,0(t3); 1290: j 1290b
+fail130: li t0,130; sw t0,0(t3); 1300: j 1300b
+fail131: li t0,131; sw t0,0(t3); 1310: j 1310b
+fail132: li t0,132; sw t0,0(t3); 1320: j 1320b
+fail133: li t0,133; sw t0,0(t3); 1330: j 1330b
+fail134: li t0,134; sw t0,0(t3); 1340: j 1340b
+fail135: li t0,135; sw t0,0(t3); 1350: j 1350b
+fail136: li t0,136; sw t0,0(t3); 1360: j 1360b
+fail137: li t0,137; sw t0,0(t3); 1370: j 1370b
+fail138: li t0,138; sw t0,0(t3); 1380: j 1380b
+fail139: li t0,139; sw t0,0(t3); 1390: j 1390b

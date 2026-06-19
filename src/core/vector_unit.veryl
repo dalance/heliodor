@@ -718,6 +718,10 @@ pub module vector_unit #(
     // vs1 field bit 0 (h_instr[15]) selects vid.v (1) vs viota.m (0).
     let h_is_viota  : logic = h_op == VecOp::VIOTA;
     let h_is_vid    : logic = h_is_viota && h_instr[15];
+    // V4f-1: vector slide (single-cycle, LMUL=1). funct6[0] = h_instr[26] = down
+    // (001111) vs up (001110). The offset is x[rs1] (.vx) or uimm5 (vs1, .vi).
+    let h_is_slide  : logic = h_op == VecOp::VSLIDE;
+    let h_slide_dn  : logic = h_instr[26];
     // OPIVx/OPMVx operand mode + op: funct6 (inst[31:26]) selects the op; funct3
     // (inst[14:12]) the operand mode. VV reads vs1[i] (OPIVV=000 / OPMVV=010 →
     // bit2=0,bit0=0); VX reads x[rs1] (OPIVX=100 / OPMVX=110 → bit2=1,bit0=0);
@@ -1280,6 +1284,64 @@ pub module vector_unit #(
         }
     }
 
+    // ---- V4f-1 vslideup / vslidedown (single-cycle, LMUL=1) -----------------
+    // The whole source register is shifted by off*SEW bits (left for up, right
+    // for down) so element i picks up vs2[i-off] / vs2[i+off]; the shift fills 0
+    // for out-of-range positions. The result is then merged element-wise over the
+    // old vd so inactive / tail elements (and, for slideup, the [0,off) prefix)
+    // stay undisturbed. off = x[rs1] (.vx) or uimm5 (.vi), capped at VLMAX (an
+    // offset >= VLMAX makes slideup write nothing and slidedown read all 0).
+    let vlmax_el : logic<8> = case vsew {
+        3'd0   : 8'd16,
+        3'd1   : 8'd8,
+        3'd2   : 8'd4,
+        default: 8'd2,
+    };
+    let slide_off_raw: logic<64> = if h_is_vx ? i_scalar_data : {59'd0, h_instr[19:15]};
+    let slide_off    : logic<8>  = if slide_off_raw >= {56'd0, vlmax_el} ? vlmax_el : slide_off_raw[7:0];
+    // shift amount in bits = off * SEW, built by concatenation (max 128).
+    let slide_sh: logic<8> = case vsew {
+        3'd0   : {slide_off[4:0], 3'd0}, // * 8
+        3'd1   : {slide_off[3:0], 4'd0}, // * 16
+        3'd2   : {slide_off[2:0], 5'd0}, // * 32
+        default: {slide_off[1:0], 6'd0}, // * 64
+    };
+    let slide_shifted: logic<VLEN> = if h_slide_dn ? (i_vs2_data >> slide_sh) : (i_vs2_data << slide_sh);
+    var slide_res: logic<VLEN>;
+    always_comb {
+        slide_res = i_vdold_data; // inactive / tail / slideup-prefix = undisturbed
+        case vsew {
+            3'd0: { // SEW=8 → 16 elements
+                for i in 0..16 {
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_slide_dn || !((i as 8) <: slide_off)) {
+                        slide_res[i*8+:8] = slide_shifted[i*8+:8];
+                    }
+                }
+            }
+            3'd1: { // SEW=16 → 8 elements
+                for i in 0..8 {
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_slide_dn || !((i as 8) <: slide_off)) {
+                        slide_res[i*16+:16] = slide_shifted[i*16+:16];
+                    }
+                }
+            }
+            3'd2: { // SEW=32 → 4 elements
+                for i in 0..4 {
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_slide_dn || !((i as 8) <: slide_off)) {
+                        slide_res[i*32+:32] = slide_shifted[i*32+:32];
+                    }
+                }
+            }
+            default: { // SEW=64 → 2 elements
+                for i in 0..2 {
+                    if ((i as 8) <: vl8) && (h_alu_vm || i_mask_data[i]) && (h_slide_dn || !((i as 8) <: slide_off)) {
+                        slide_res[i*64+:64] = slide_shifted[i*64+:64];
+                    }
+                }
+            }
+        }
+    }
+
     // ---- V1 unit-stride memory: addressing + element packing ----------------
     // Operands are stable for the whole op (the head is not popped until DONE):
     // base = x[rs1] (scalar), mask = v0 (read on the vs1 port with addr 0),
@@ -1634,7 +1696,7 @@ pub module vector_unit #(
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
     // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
-    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre;
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre || h_is_slide;
     let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
@@ -1662,6 +1724,7 @@ pub module vector_unit #(
     // register in the fire path.
     let vmask_wr : logic = fire && h_is_vmask;
     let vmspre_wr: logic = fire && h_is_vmspre;
+    let slide_wr : logic = fire && h_is_slide;
     // Register group for source / dest addressing. A compare reads source group
     // base+va_reg but writes its SINGLE mask register (h_vd), only on the final
     // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
@@ -1681,8 +1744,8 @@ pub module vector_unit #(
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr;
-    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))))))));
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || slide_wr;
+    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_slide ? slide_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
