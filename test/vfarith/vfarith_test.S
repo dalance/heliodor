@@ -848,6 +848,57 @@ _start:
     CK64 0, 0x3FDFE00000000000, fail80     # rec(2.0)
     CK64 8, 0x3FFFE00000000000, fail80     # rec(0.5)
 
+    # ===== V4a: FP reductions (vfredusum/vfredosum/vfredmin/vfredmax .vs) =====
+    # vd[0] = vs1[0] OP reduce(vs2[0..vl-1]); the rest of vd stays tail-undisturbed.
+    li   a0, 0x80010500                    # vs2 (4 x f32)
+    li   a1, 0x80010540                    # vs1 (seed at element 0)
+    li   a2, 0x80010580                    # dst
+    li   a3, 0x800105C0                    # mask byte
+    li t1,0x3F800000; sw t1,0(a0);  li t1,0x40000000; sw t1,4(a0)   # 1.0, 2.0
+    li t1,0xBFC00000; sw t1,8(a0);  li t1,0x40800000; sw t1,12(a0)  # -1.5, 4.0
+    li t1,0x3F000000; sw t1,0(a1)                                  # seed 0.5 at vs1[0]
+    vsetvli t0, x0, e32, m1                # vl = 4
+    vle32.v v4, (a0)                       # v4 = a (vs2)
+    vle32.v v6, (a1)                       # v6[0] = seed (vs1)
+
+    vfredusum.vs v8, v4, v6                # 0.5 + 1.0 + 2.0 - 1.5 + 4.0
+    vse32.v v8, (a2)
+    CK 0, 0x40C00000, fail81               # 6.0
+    vfredosum.vs v8, v4, v6                # ordered → same sequential sum
+    vse32.v v8, (a2)
+    CK 0, 0x40C00000, fail82               # 6.0
+    vfredmin.vs v8, v4, v6                 # min(0.5, 1.0, 2.0, -1.5, 4.0)
+    vse32.v v8, (a2)
+    CK 0, 0xBFC00000, fail83               # -1.5
+    vfredmax.vs v8, v4, v6                 # max(...)
+    vse32.v v8, (a2)
+    CK 0, 0x40800000, fail84               # 4.0
+
+    # masked vfredusum: v0 = 0x0A (elements 1,3 active) → 0.5 + 2.0 + 4.0
+    li t1, 0x0A; sb t1, 0(a3)
+    vsetvli t0, x0, e8, m1
+    vle8.v v0, (a3)                        # v0[0] = 0x0A
+    vsetvli t0, x0, e32, m1                # vl = 4
+    vfredusum.vs v8, v4, v6, v0.t
+    vse32.v v8, (a2)
+    CK 0, 0x40D00000, fail85               # 6.5
+
+    # SEW=64 reductions (vl = 2)
+    li   a0, 0x80010600
+    li   a1, 0x80010640
+    li t1,0x3FF0000000000000; sd t1,0(a0)  # 1.0
+    li t1,0x4000000000000000; sd t1,8(a0)  # 2.0
+    li t1,0x3FE0000000000000; sd t1,0(a1)  # seed 0.5
+    vsetvli t0, x0, e64, m1                # vl = 2
+    vle64.v v4, (a0)
+    vle64.v v6, (a1)
+    vfredusum.vs v8, v4, v6
+    vse64.v v8, (a2)
+    CK64 0, 0x400C000000000000, fail86     # 3.5
+    vfredmax.vs v8, v4, v6
+    vse64.v v8, (a2)
+    CK64 0, 0x4000000000000000, fail86     # 2.0
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -931,3 +982,9 @@ fail77: li t0,77; sw t0,0(t3); 770: j 770b
 fail78: li t0,78; sw t0,0(t3); 780: j 780b
 fail79: li t0,79; sw t0,0(t3); 790: j 790b
 fail80: li t0,80; sw t0,0(t3); 800: j 800b
+fail81: li t0,81; sw t0,0(t3); 810: j 810b
+fail82: li t0,82; sw t0,0(t3); 820: j 820b
+fail83: li t0,83; sw t0,0(t3); 830: j 830b
+fail84: li t0,84; sw t0,0(t3); 840: j 840b
+fail85: li t0,85; sw t0,0(t3); 850: j 850b
+fail86: li t0,86; sw t0,0(t3); 860: j 860b
