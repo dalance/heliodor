@@ -705,6 +705,9 @@ pub module vector_unit #(
     // V3f FP scalar <-> element-0 moves (single-cycle, like vmv.x.s / vset).
     let h_is_vfmv_sf: logic = h_op == VecOp::VFMV_S_F; // vd[0] <- f[rs1] (VRF write)
     let h_is_vfmv_fs: logic = h_op == VecOp::VFMV_F_S; // f[rd] <- vs2[0] (FP CDB)
+    // V4c: mask-register logical (OPMVV .mm, funct6 011xxx). Single-cycle whole-
+    // register bitwise op vd = vs2 OP vs1 over the first vl bits (tail undisturbed).
+    let h_is_vmask  : logic = h_op == VecOp::VMLOGIC;
     // OPIVx/OPMVx operand mode + op: funct6 (inst[31:26]) selects the op; funct3
     // (inst[14:12]) the operand mode. VV reads vs1[i] (OPIVV=000 / OPMVV=010 →
     // bit2=0,bit0=0); VX reads x[rs1] (OPIVX=100 / OPMVX=110 → bit2=1,bit0=0);
@@ -1126,6 +1129,24 @@ pub module vector_unit #(
     let sf_val : logic<VLEN> = if vsew == 3'd3 ? {64'd0, i_fscalar_data} : {96'd0, i_fscalar_data[31:0]};
     let sf_res : logic<VLEN> = (i_vdold_data & ~sf_mask) | sf_val;
 
+    // ---- V4c mask-register logical (single-cycle, whole register) -----------
+    // vd = vs2 OP vs1 (a=vs1, b=vs2) over the first vl bits; the tail (bits >= vl)
+    // stays undisturbed. vl_mask has the low vl bits set (all-ones when vl==VLEN).
+    let vmask_op  : logic<VLEN> = case h_funct6 {
+        6'b011000: i_vs2_data & ~i_vs1_data,   // vmandn  (vs2 & ~vs1)
+        6'b011001: i_vs2_data & i_vs1_data,    // vmand
+        6'b011010: i_vs2_data | i_vs1_data,    // vmor
+        6'b011011: i_vs2_data ^ i_vs1_data,    // vmxor
+        6'b011100: i_vs2_data | ~i_vs1_data,   // vmorn   (vs2 | ~vs1)
+        6'b011101: ~(i_vs2_data & i_vs1_data), // vmnand
+        6'b011110: ~(i_vs2_data | i_vs1_data), // vmnor
+        6'b011111: ~(i_vs2_data ^ i_vs1_data), // vmxnor
+        default  : i_vs2_data & i_vs1_data,
+    };
+    let vl_sh     : logic<VLEN> = {127'd0, 1'b1} << vl8[6:0];
+    let vl_mask   : logic<VLEN> = if vl8 >= 8'd128 ? {1'b1 repeat VLEN} : (vl_sh - {127'd0, 1'b1});
+    let vmask_res : logic<VLEN> = (vmask_op & vl_mask) | (i_vdold_data & ~vl_mask);
+
     // ---- V1 unit-stride memory: addressing + element packing ----------------
     // Operands are stable for the whole op (the head is not popped until DONE):
     // base = x[rs1] (scalar), mask = v0 (read on the vs1 port with addr 0),
@@ -1480,7 +1501,7 @@ pub module vector_unit #(
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
     // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
-    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs;
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask;
     let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
@@ -1504,6 +1525,8 @@ pub module vector_unit #(
     // vfmv.s.f writes vd[0] in the (single-cycle) fire path; suppress the write
     // when vl == 0 (the move is a no-op then).
     let sf_wr: logic = fire && h_is_vfmv_sf && (vl8 != 8'd0);
+    // V4c mask logical writes its single dest mask register in the fire path.
+    let vmask_wr: logic = fire && h_is_vmask;
     // Register group for source / dest addressing. A compare reads source group
     // base+va_reg but writes its SINGLE mask register (h_vd), only on the final
     // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
@@ -1521,10 +1544,10 @@ pub module vector_unit #(
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_fp ? (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP (.w vs2=dest geom) / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / FP mask|red|elem|widen-dst reg / int mask / narrow dest / group
-    assign o_vd_addr     = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr;
-    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))));
+    assign o_vdold_addr  = if (h_is_vfmv_sf || h_is_vmask) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / mask logical / FP mask|red|elem|widen-dst / int mask / narrow / group
+    assign o_vd_addr     = if (h_is_vfmv_sf || h_is_vmask) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / mask logical / FP / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr;
+    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd

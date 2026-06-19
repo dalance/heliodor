@@ -964,6 +964,37 @@ _start:
     vse64.v v8, (a2)
     CK64 0, 0x0000000000000C1C, fail93     # 3100
 
+    # ===== V4c: mask-register logical ops (.mm) =====
+    # vs2 = v4 (all bytes 0xAA), vs1 = v2 (all bytes 0xCC). vl=128 (e8 m8) → all
+    # 128 mask bits are body. AA op CC per the 8 logical ops.
+    li   a0, 0x80010900
+    li   a1, 0x80010940
+    li   a2, 0x80010980
+    li t1, 0xAAAAAAAAAAAAAAAA; sd t1,0(a0); sd t1,8(a0)
+    li t1, 0xCCCCCCCCCCCCCCCC; sd t1,0(a1); sd t1,8(a1)
+    li t2, 16
+    vsetvli t0, t2, e8, m1                  # load 16 bytes (128 bits) per mask reg
+    vle8.v v4, (a0)
+    vle8.v v2, (a1)
+    vsetvli t0, x0, e8, m8                  # vl = VLMAX = 128 (whole mask is body)
+    vmand.mm  v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0x88; bne t5,t6, fail94
+    vmor.mm   v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0xEE; bne t5,t6, fail95
+    vmxor.mm  v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0x66; bne t5,t6, fail96
+    vmnand.mm v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0x77; bne t5,t6, fail97
+    vmnor.mm  v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0x11; bne t5,t6, fail98
+    vmxnor.mm v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0x99; bne t5,t6, fail99
+    vmandn.mm v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0x22; bne t5,t6, fail100
+    vmorn.mm  v8, v4, v2; vse8.v v8, (a2); lbu t5,0(a2); li t6,0xBB; bne t5,t6, fail100
+
+    # tail undisturbed: pre-load v8 = 0xFF, vl=8 → only byte 0 is body, byte 1.. tail
+    li t1, 0xFFFFFFFFFFFFFFFF; sd t1,0(a2); sd t1,8(a2)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v8, (a2)   # v8 = 0xFF x16
+    li t2, 8;  vsetvli t0, t2, e8, m1                    # vl = 8
+    vmand.mm v8, v4, v2
+    li t2, 16; vsetvli t0, t2, e8, m1; vse8.v v8, (a2)
+    lbu t5,0(a2); li t6,0x88; bne t5,t6, fail101         # body byte0 = AA & CC
+    lbu t5,1(a2); li t6,0xFF; bne t5,t6, fail101         # tail byte1 undisturbed
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1060,3 +1091,11 @@ fail90: li t0,90; sw t0,0(t3); 900: j 900b
 fail91: li t0,91; sw t0,0(t3); 910: j 910b
 fail92: li t0,92; sw t0,0(t3); 920: j 920b
 fail93: li t0,93; sw t0,0(t3); 930: j 930b
+fail94:  li t0,94;  sw t0,0(t3); 940:  j 940b
+fail95:  li t0,95;  sw t0,0(t3); 950:  j 950b
+fail96:  li t0,96;  sw t0,0(t3); 960:  j 960b
+fail97:  li t0,97;  sw t0,0(t3); 970:  j 970b
+fail98:  li t0,98;  sw t0,0(t3); 980:  j 980b
+fail99:  li t0,99;  sw t0,0(t3); 990:  j 990b
+fail100: li t0,100; sw t0,0(t3); 1000: j 1000b
+fail101: li t0,101; sw t0,0(t3); 1010: j 1010b
