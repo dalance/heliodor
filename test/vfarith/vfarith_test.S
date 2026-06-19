@@ -1780,6 +1780,77 @@ _start:
     CK 16, 0x22, fail218   # vs2[1] (dst reg1)
     CK 28, 0x66, fail218   # vs2[5] (src reg1)
 
+    # ===== V5a: fixed-point saturating add/sub (vsaddu/vsadd/vssubu/vssub) =====
+    li   a0, 0x80011D00   # a (vs2)
+    li   a1, 0x80011D40   # b (vs1)
+    li   a2, 0x80011D80   # dst
+
+    # vsadd.vv (signed): [100,-100,50,127] + [50,-50,50,1], e8 vl=4.
+    li t1, 0x7F329C64; sw t1, 0(a0)   # 0x64,0x9C,0x32,0x7F
+    li t1, 0x0132CE32; sw t1, 0(a1)   # 0x32,0xCE,0x32,0x01
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vsadd.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x7F; bne t5,t6, fail219   # 100+50 -> sat MAX
+    lbu t5,1(a2); li t6,0x80; bne t5,t6, fail219   # -100+-50 -> sat MIN
+    lbu t5,2(a2); li t6,0x64; bne t5,t6, fail220   # 50+50=100
+    lbu t5,3(a2); li t6,0x7F; bne t5,t6, fail220   # 127+1 -> sat MAX
+
+    # vsaddu.vv (unsigned): [200,100,255,10] + [100,50,1,20].
+    li t1, 0x0AFF64C8; sw t1, 0(a0)
+    li t1, 0x14013264; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vsaddu.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0xFF; bne t5,t6, fail221   # 200+100 -> sat 255
+    lbu t5,1(a2); li t6,0x96; bne t5,t6, fail221   # 100+50=150
+    lbu t5,2(a2); li t6,0xFF; bne t5,t6, fail222   # 255+1 -> sat 255
+    lbu t5,3(a2); li t6,0x1E; bne t5,t6, fail222   # 10+20=30
+
+    # vssub.vv (signed): [100,-100,50,-128] - [-50,50,30,1].
+    li t1, 0x80329C64; sw t1, 0(a0)
+    li t1, 0x011E32CE; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vssub.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x7F; bne t5,t6, fail223   # 100-(-50)=150 -> sat MAX
+    lbu t5,1(a2); li t6,0x80; bne t5,t6, fail223   # -100-50=-150 -> sat MIN
+    lbu t5,2(a2); li t6,0x14; bne t5,t6, fail224   # 50-30=20
+    lbu t5,3(a2); li t6,0x80; bne t5,t6, fail224   # -128-1 -> sat MIN
+
+    # vssubu.vv (unsigned): [50,200,100,0] - [100,50,100,1].
+    li t1, 0x0064C832; sw t1, 0(a0)
+    li t1, 0x01643264; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vssubu.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0;    bne t5,t6, fail225   # 50-100 -> sat 0
+    lbu t5,1(a2); li t6,0x96; bne t5,t6, fail225   # 200-50=150
+    lbu t5,2(a2); li t6,0;    bne t5,t6, fail226   # 100-100=0
+    lbu t5,3(a2); li t6,0;    bne t5,t6, fail226   # 0-1 -> sat 0
+
+    # vsadd.vx (signed, scalar=127): [1,2,-128,3] + 127.
+    li t1, 0x03800201; sw t1, 0(a0)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 127; vsadd.vx v8,v4,t1
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x7F; bne t5,t6, fail227   # 1+127 -> sat MAX
+    lbu t5,1(a2); li t6,0x7F; bne t5,t6, fail227   # 2+127 -> sat MAX
+    lbu t5,2(a2); li t6,0xFF; bne t5,t6, fail228   # -128+127=-1
+    lbu t5,3(a2); li t6,0x7F; bne t5,t6, fail228   # 3+127 -> sat MAX
+
+    # SEW=32 vsadd.vv: [MAX_INT, MIN_INT] + [1, -1].
+    li   a0, 0x80011E00
+    li   a1, 0x80011E40
+    li   a2, 0x80011E80
+    li t1, 0x800000007FFFFFFF; sd t1,0(a0)   # 0x7FFFFFFF, 0x80000000
+    li t1, 0xFFFFFFFF00000001; sd t1,0(a1)   # 1, -1
+    li t2,2; vsetvli t0,t2,e32,m1; vle32.v v4,(a0); vle32.v v6,(a1)
+    vsadd.vv v8,v4,v6
+    vse32.v v8,(a2)
+    CK 0, 0x7FFFFFFF, fail229   # MAX_INT + 1 -> sat MAX
+    CK 4, 0x80000000, fail229   # MIN_INT + (-1) -> sat MIN
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -2001,3 +2072,14 @@ fail215: li t0,215; sw t0,0(t3); 2150: j 2150b
 fail216: li t0,216; sw t0,0(t3); 2160: j 2160b
 fail217: li t0,217; sw t0,0(t3); 2170: j 2170b
 fail218: li t0,218; sw t0,0(t3); 2180: j 2180b
+fail219: li t0,219; sw t0,0(t3); 2190: j 2190b
+fail220: li t0,220; sw t0,0(t3); 2200: j 2200b
+fail221: li t0,221; sw t0,0(t3); 2210: j 2210b
+fail222: li t0,222; sw t0,0(t3); 2220: j 2220b
+fail223: li t0,223; sw t0,0(t3); 2230: j 2230b
+fail224: li t0,224; sw t0,0(t3); 2240: j 2240b
+fail225: li t0,225; sw t0,0(t3); 2250: j 2250b
+fail226: li t0,226; sw t0,0(t3); 2260: j 2260b
+fail227: li t0,227; sw t0,0(t3); 2270: j 2270b
+fail228: li t0,228; sw t0,0(t3); 2280: j 2280b
+fail229: li t0,229; sw t0,0(t3); 2290: j 2290b
