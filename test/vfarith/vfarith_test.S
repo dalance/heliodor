@@ -1678,6 +1678,59 @@ _start:
     CK 16, 0x22, fail206    # vs2[1] (dst reg1)
     CK 28, 0x66, fail206    # vs2[5] (src reg1)
 
+    # ===== V4i-3: LMUL>1 vcompress.vm, e8 m2 (VLMAX=32) =====
+    # src v4/v5 = bytes [1..32], compress mask v6, dst v8/v9. mask selects 18
+    # elements that cross the dst register boundary (packed pos 16 -> dst reg1)
+    # and read sources from both src registers.
+    li   a0, 0x80011900   # src
+    li   a4, 0x80011940   # mask
+    li   a2, 0x80011980   # dst
+    li t1, 0x0807060504030201; sd t1,0(a0)
+    li t1, 0x100F0E0D0C0B0A09; sd t1,8(a0)
+    li t1, 0x1817161514131211; sd t1,16(a0)
+    li t1, 0x201F1E1D1C1B1A19; sd t1,24(a0)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v4,(a0)
+    # mask bits {0,2,3,5,8,9,11,13,16,17,19,21,24,25,27,29,30,31} = 0xEB2B2B2D.
+    li t1, 0xEB2B2B2D; sd t1,0(a4); li t1,0; sd t1,8(a4)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a4)
+    li t1,0xEEEEEEEEEEEEEEEE; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,32; vsetvli t0,t2,e8,m2
+    vcompress.vm v8,v4,v6
+    li t2,32; vsetvli t0,t2,e8,m2; vse8.v v8,(a2)
+    # packed = [1,3,4,6,9,10,12,14,17,18,20,22,25,26,28,30,31,32]
+    lbu t5,0(a2);  li t6,1;    bne t5,t6, fail207   # packed[0]=vs2[0]
+    lbu t5,1(a2);  li t6,3;    bne t5,t6, fail207   # packed[1]=vs2[2]
+    lbu t5,7(a2);  li t6,14;   bne t5,t6, fail208   # packed[7]=vs2[13]
+    lbu t5,15(a2); li t6,30;   bne t5,t6, fail208   # packed[15]=vs2[29] (last of dst reg0)
+    lbu t5,16(a2); li t6,31;   bne t5,t6, fail209   # packed[16]=vs2[30] (dst reg1, src reg1)
+    lbu t5,17(a2); li t6,32;   bne t5,t6, fail209   # packed[17]=vs2[31]
+    lbu t5,18(a2); li t6,0xEE; bne t5,t6, fail210   # past packed count -> undisturbed
+    lbu t5,31(a2); li t6,0xEE; bne t5,t6, fail210
+
+    # SEW=32 m2 vcompress: VLMAX=8, src words [0x11..0x88], mask {0,2,3,5,6}=0x6D.
+    li   a0, 0x80011A00
+    li   a4, 0x80011A40
+    li   a2, 0x80011A80
+    li t1,0x0000002200000011; sd t1,0(a0)
+    li t1,0x0000004400000033; sd t1,8(a0)
+    li t1,0x0000006600000055; sd t1,16(a0)
+    li t1,0x0000008800000077; sd t1,24(a0)
+    li t2,8; vsetvli t0,t2,e32,m2; vle32.v v4,(a0)
+    li t1,0x6D; sd t1,0(a4)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a4)
+    li t1,0xCCCCCCCCCCCCCCCC; sd t1,0(a2); sd t1,8(a2); sd t1,16(a2); sd t1,24(a2)
+    li t2,32; vsetvli t0,t2,e8,m2; vle8.v v8,(a2)
+    li t2,8; vsetvli t0,t2,e32,m2
+    vcompress.vm v8,v4,v6
+    li t2,8; vsetvli t0,t2,e32,m2; vse32.v v8,(a2)
+    # packed = vs2[0,2,3,5,6] = [0x11,0x33,0x44,0x66,0x77]
+    CK 0,  0x11, fail211        # packed[0]
+    CK 4,  0x33, fail211        # packed[1]=vs2[2]
+    CK 12, 0x66, fail212        # packed[3]=vs2[5]
+    CK 16, 0x77, fail212        # packed[4]=vs2[6] (dst reg1, src reg1)
+    CK 20, 0xCCCCCCCC, fail213  # past packed count -> undisturbed
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1887,3 +1940,10 @@ fail203: li t0,203; sw t0,0(t3); 2030: j 2030b
 fail204: li t0,204; sw t0,0(t3); 2040: j 2040b
 fail205: li t0,205; sw t0,0(t3); 2050: j 2050b
 fail206: li t0,206; sw t0,0(t3); 2060: j 2060b
+fail207: li t0,207; sw t0,0(t3); 2070: j 2070b
+fail208: li t0,208; sw t0,0(t3); 2080: j 2080b
+fail209: li t0,209; sw t0,0(t3); 2090: j 2090b
+fail210: li t0,210; sw t0,0(t3); 2100: j 2100b
+fail211: li t0,211; sw t0,0(t3); 2110: j 2110b
+fail212: li t0,212; sw t0,0(t3); 2120: j 2120b
+fail213: li t0,213; sw t0,0(t3); 2130: j 2130b

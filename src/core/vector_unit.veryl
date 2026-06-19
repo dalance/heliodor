@@ -1389,8 +1389,9 @@ pub module vector_unit #(
     let pm_vrg_el    : logic<64>   = if pm_idx_oob ? 64'd0 : pm_vrg_raw[63:0];
 
     // ---- per-op source register + element value + write enable --------------
-    // (slide / vrgather; vcompress adds its branch in V4i-3.)
-    let pm_src_reg: logic<8>   = if h_is_vrg ? pm_g_sreg : pm_sreg;     // vs2 register to read
+    // slide / vrgather are dest-walk (write vd[pelem]); vcompress is source-walk
+    // (read vs2[pelem], its source register is the pelem-based pm_dreg).
+    let pm_src_reg: logic<8>   = if h_is_comp ? pm_dreg : (if h_is_vrg ? pm_g_sreg : pm_sreg); // vs2 register to read
     let pm_el_val : logic<64>  = if h_is_vrg ? pm_vrg_el : pm_slide_el; // source element value (low SEW bits)
     let pm_wr_el  : logic      = if h_is_vrg ? pm_active : pm_slide_wr; // write this destination element?
     // Splice the element into the dest-register accumulator (seed from old vd at
@@ -1400,56 +1401,24 @@ pub module vector_unit #(
     let pm_acc_base: logic<VLEN> = if pm_dreg_1st ? i_vdold_data : pm_acc;
     let pm_acc_next: logic<VLEN> = if pm_wr_el ? ((pm_acc_base & ~pm_dmask_v) | pm_res_vlen) : pm_acc_base;
 
-
-    // ---- V4f-4 vcompress.vm (single-cycle, LMUL=1) --------------------------
-    // vs1 is a bit-per-element mask; each vs2 element whose mask bit is set is
-    // packed densely into the low elements of vd (comp_j is the running output
-    // index). Elements past the packed count stay undisturbed (old vd). The op
-    // is unmasked (vs1 IS the control), so v0 is not consulted.
-    var comp_res: logic<VLEN>;
-    var comp_j  : logic<8>;
-    always_comb {
-        comp_res = i_vdold_data; // tail (past packed count) = undisturbed
-        comp_j   = 8'd0;
-        case vsew {
-            3'd0: { // SEW=8 → up to 16 elements
-                for i in 0..16 {
-                    if ((i as 8) <: vl8) && i_vs1_data[i] {
-                        let base: logic<8> = {comp_j[4:0], 3'd0}; // comp_j * 8
-                        comp_res[base+:8] = i_vs2_data[i*8+:8];
-                        comp_j = comp_j + 8'd1;
-                    }
-                }
-            }
-            3'd1: { // SEW=16 → up to 8 elements
-                for i in 0..8 {
-                    if ((i as 8) <: vl8) && i_vs1_data[i] {
-                        let base: logic<8> = {comp_j[3:0], 4'd0}; // comp_j * 16
-                        comp_res[base+:16] = i_vs2_data[i*16+:16];
-                        comp_j = comp_j + 8'd1;
-                    }
-                }
-            }
-            3'd2: { // SEW=32 → up to 4 elements
-                for i in 0..4 {
-                    if ((i as 8) <: vl8) && i_vs1_data[i] {
-                        let base: logic<8> = {comp_j[2:0], 5'd0}; // comp_j * 32
-                        comp_res[base+:32] = i_vs2_data[i*32+:32];
-                        comp_j = comp_j + 8'd1;
-                    }
-                }
-            }
-            default: { // SEW=64 → up to 2 elements
-                for i in 0..2 {
-                    if ((i as 8) <: vl8) && i_vs1_data[i] {
-                        let base: logic<8> = {comp_j[1:0], 6'd0}; // comp_j * 64
-                        comp_res[base+:64] = i_vs2_data[i*64+:64];
-                        comp_j = comp_j + 8'd1;
-                    }
-                }
-            }
-        }
-    }
+    // ---- vcompress.vm (vs1 = bit-per-element compress mask) -----------------
+    // Source-walk: for each source element pelem with vs1[pelem]=1, write vs2[pelem]
+    // to the running output position pm_j via a read-modify-write of the dest
+    // register h_vd + pm_j/epr. Elements past the packed count stay undisturbed
+    // (the RMW reads back the dest register's previous-cycle value, so only the
+    // packed positions are overwritten). Unmasked — vs1 IS the control (no v0).
+    let pm_cmask_sh  : logic<VLEN>  = i_vs1_data >> pelem;
+    let pm_cm        : logic        = pm_cmask_sh[0];
+    let pm_c_dreg    : logic<8>     = pm_j >> pm_eshift;
+    let pm_c_dlocal  : logic<8>     = pm_j & (pm_epr8 - 8'd1);
+    let pm_c_dbitoff : logic<8>     = pm_c_dlocal << pm_eshamt;
+    let pm_c_dreg_vrf: logic<VRF_W> = h_vd + pm_c_dreg[VRF_W - 1:0];
+    let pm_c_src     : logic<VLEN>  = i_vs2_data >> pm_dbitoff; // vs2[pelem] at bit 0
+    let pm_c_res     : logic<VLEN>  = (i_vdold_data & ~(({64'd0, pm_sew_msk} as VLEN) << pm_c_dbitoff)) | (({64'd0, pm_c_src[63:0] & pm_sew_msk} as VLEN) << pm_c_dbitoff);
+    // Permute destination register + write data: compress is pm_j-based RMW;
+    // slide / vrgather are the pelem-based accumulator written at register boundaries.
+    let pm_dst_vrf   : logic<VRF_W> = if h_is_comp ? pm_c_dreg_vrf : pm_dreg_vrf;
+    let pm_vd_data   : logic<VLEN>  = if h_is_comp ? pm_c_res : pm_acc_next;
 
     // ---- V1 unit-stride memory: addressing + element packing ----------------
     // Operands are stable for the whole op (the head is not popped until DONE):
@@ -1861,12 +1830,14 @@ pub module vector_unit #(
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
     let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
     // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
-    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre || h_is_comp;
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre;
     let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
-    // V4i permute (slide / vrgather; vcompress added later): element-serial via the
-    // pm_state FSM below, retiring from DONE (pm_cdb_fire). Handles all LMUL.
-    let h_is_perm  : logic = h_is_slide || h_is_vrg;
-    let pm_reg_wr  : logic = (pm_state == 2'd1) && pm_dreg_lst; // write dest register at its boundary
+    // V4i permute (slide / vrgather / vcompress): element-serial via the pm_state
+    // FSM below, retiring from DONE (pm_cdb_fire). Handles all LMUL. The VRF write
+    // is the dest-register boundary (slide / vrgather) or every compressed element
+    // (vcompress RMW at the running output position).
+    let h_is_perm  : logic = h_is_slide || h_is_vrg || h_is_comp;
+    let pm_reg_wr  : logic = (pm_state == 2'd1) && (if h_is_comp ? pm_cm : pm_dreg_lst);
     let pm_cdb_fire: logic = h_is_perm && (pm_state == 2'd2) && i_cdb_free && !i_flush;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
@@ -1894,7 +1865,6 @@ pub module vector_unit #(
     // register in the fire path.
     let vmask_wr : logic = fire && h_is_vmask;
     let vmspre_wr: logic = fire && h_is_vmspre;
-    let comp_wr  : logic = fire && h_is_comp;
     // Register group for source / dest addressing. A compare reads source group
     // base+va_reg but writes its SINGLE mask register (h_vd), only on the final
     // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
@@ -1909,13 +1879,13 @@ pub module vector_unit #(
     let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
-    assign o_vs1_addr    = if h_is_perm ? (h_vs1 + pm_dreg[VRF_W - 1:0]) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}))); // vrgather index reg / FP elem reg / shift/src1 half-pair
+    assign o_vs1_addr    = if h_is_perm ? (if h_is_comp ? h_vs1 : (h_vs1 + pm_dreg[VRF_W - 1:0])) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}))); // vcompress mask reg / vrgather index reg / FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_perm ? pm_dreg_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
-    assign o_vd_addr     = if h_is_perm ? pm_dreg_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr || comp_wr;
-    assign o_vd_data     = if h_is_perm ? pm_acc_next : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_comp ? comp_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res))))))))));
+    assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
+    assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
+    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
@@ -2168,9 +2138,17 @@ pub module vector_unit #(
                     }
                 }
                 2'd1: {
-                    // COMPUTE: process element pelem; write the completed dest
-                    // register at its boundary and reset the accumulator.
-                    pm_acc = if pm_dreg_lst ? {1'b0 repeat VLEN} : pm_acc_next;
+                    // COMPUTE: process element pelem. slide / vrgather accumulate
+                    // the dest register and write it at the boundary; vcompress RMWs
+                    // the dest register on each selected element and advances the
+                    // running output position pm_j (the VRF write is pm_reg_wr above).
+                    if h_is_comp {
+                        if pm_cm {
+                            pm_j = pm_j + 8'd1;
+                        }
+                    } else {
+                        pm_acc = if pm_dreg_lst ? {1'b0 repeat VLEN} : pm_acc_next;
+                    }
                     if pelem + 8'd1 >= vl8 {
                         pm_state = 2'd2;
                     } else {
