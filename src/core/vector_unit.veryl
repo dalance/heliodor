@@ -797,6 +797,11 @@ pub module vector_unit #(
     // Unary; result is 64-bit (double or 2*SEW int), so it uses the 2*SEW dest
     // geometry. vs1[2:0] selects the FCVT op (see the FpuOp map below).
     let h_is_fwcvt: logic = h_is_fp && (h_funct6 == 6'b010010) && (h_instr[19:18] == 2'b01);
+    // V4h: vfncvt.* (VFUNARY0 010010, vs1[4:3]==10): narrowing convert, 2*SEW
+    // source (double / int64) -> SEW dest (single / int32). Mirror of vfwcvt:
+    // the source is read at the 2*SEW (double) geometry while the dest is the
+    // normal same-width SEW geometry. vs1[2:0] selects the FCVT op.
+    let h_is_fncvt: logic = h_is_fp && (h_funct6 == 6'b010010) && (h_instr[19:18] == 2'b10);
     // V3j-4: vfrsqrt7.v (VFUNARY1 010011, vs1=00100) / vfrec7.v (vs1=00101) — the
     // 7-bit reciprocal-square-root / reciprocal estimates. Same-width, OPFVV-only,
     // unary; computed by a table ROM in the VU (the shared FPU has no such op), so
@@ -1618,11 +1623,16 @@ pub module vector_unit #(
     let fw_vd_d   : logic<64>   = fw_vd_dsh[63:0]; // V3j widening-FMA addend (old vd, double)
     let fw_s1d    : logic<64>   = if h_is_fwiden_w ? fw_vs2_d : s2d(fw_vs2_s);
     let fw_s2d    : logic<64>   = s2d(fw_vs1_s);
+    // V4h vfncvt: the 2*SEW source element (double / int64) is read at the wide
+    // geometry — source register h_vs2 + (fp_elem>>1), bit offset (fp_elem&1)*64.
+    let fn_sbitoff: logic<8>    = if fp_elem[0] ? 8'd64 : 8'd0;
+    let fn_src_sh : logic<VLEN> = i_vs2_data >> fn_sbitoff;
+    let fncvt_src : logic<64>   = fn_src_sh[63:0];
     // V4g-2 FP widening reduction: s1 is the double accumulator (seeded from the
     // 2*SEW vs1[0]), s2 is the s2d-widened single vs2 element. FpuOp = FADD_D.
     let fp_wred_s1: logic<64>   = if fp_elem == 8'd0 ? i_vs1_data[63:0] : red_acc;
     let red_w_s2d : logic<64>   = s2d(fw_vs2_s);
-    let fp_s1     : logic<64>   = if h_is_fwred ? fp_wred_s1 : (if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a))));
+    let fp_s1     : logic<64>   = if h_is_fncvt ? fncvt_src : (if h_is_fwred ? fp_wred_s1 : (if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a)))));
     let fp_s2     : logic<64>   = if h_is_fwred ? red_w_s2d : (if h_is_fred ? fp_velem_a : (if h_is_fwiden ? fw_s2d : (if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op))));
     let fp_s3     : logic<64>   = if h_is_fwfma ? fw_vd_d : (if h_is_fma ? fma_add : 64'd0);
     // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
@@ -1657,6 +1667,21 @@ pub module vector_unit #(
                 6'b111110           : fp_fpu_op = fpu_pkg::FpuOp::FMSUB_D;  // vfwmsac
                 6'b111111           : fp_fpu_op = fpu_pkg::FpuOp::FNMSUB_D; // vfwnmsac
                 default             : fp_fpu_op = fpu_pkg::FpuOp::FADD_D; // vfwadd / vfwadd.w (110000/110100)
+            }
+        } else if h_is_fncvt {
+            // V4h narrowing conversion vfncvt.* (2*SEW source -> SEW dest). vs1[2:0]
+            // = h_instr[17:15]: 000 xu.f (double->uint32) / 001 x.f (double->int32) /
+            // 010 f.xu (uint64->single) / 011 f.x (int64->single) / 100 f.f
+            // (double->single) / 101 rod.f.f (round-odd, approximated) / 110 rtz.xu.f
+            // / 111 rtz.x.f. (FP->int truncates per the shared fpu_wrap RTZ limit.)
+            case h_instr[17:15] {
+                3'b000  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_WU_D; // xu.f
+                3'b001  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_W_D;  // x.f
+                3'b010  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_LU; // f.xu
+                3'b011  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_L;  // f.x
+                3'b110  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_WU_D; // rtz.xu.f
+                3'b111  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_W_D;  // rtz.x.f
+                default : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_D;  // f.f / rod.f.f
             }
         } else if h_is_fwred {
             // V4g-2 FP widening reduction: always a double add of the widened
@@ -1771,8 +1796,10 @@ pub module vector_unit #(
         i_s2_data         : fp_s2            ,
         i_s3_data         : fp_s3            , // V3h FMA addend (old vd / vs2)
         // V3g int->FP vfcvt reads the vreg element as the FPU's INT operand
-        // (the SEW-wide integer at the current element). Ignored by FP-input ops.
-        i_int_rs1_data    : fp_a_sh[63:0]    ,
+        // (the SEW-wide integer at the current element). V4h vfncvt int->FP reads
+        // the 2*SEW (int64) element at the wide source geometry. FP-input ops
+        // ignore this.
+        i_int_rs1_data    : if h_is_fncvt ? fncvt_src : fp_a_sh[63:0],
         i_flush           : i_flush          ,
         o_fpu_busy        : vfpu_busy        ,
         o_cdb             : vfpu_cdb         ,
@@ -1910,7 +1937,7 @@ pub module vector_unit #(
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})))); // viota source mask (1 reg) / FP (.w vs2=dest geom) / widen-half / .w-full / narrow / src2
+    assign o_vs2_addr    = if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})))); // viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith

@@ -1443,6 +1443,51 @@ _start:
     vse32.v v8,(a2)
     ld t5,0(a2); li t6,0x402C000000000000; bne t5,t6, fail170   # 14.0
 
+    # ===== V4h: vfncvt.* (narrowing FP convert, 2*SEW src -> SEW dst) =====
+    li   a0, 0x80011400   # double / int64 source (spans v4,v5 at e64 m2)
+    li   a2, 0x80011480   # dst
+    # vfncvt.f.f.w: double [1,2,3,4] -> single.
+    li t1, 0x3FF0000000000000; sd t1,0(a0)    # 1.0
+    li t1, 0x4000000000000000; sd t1,8(a0)    # 2.0
+    li t1, 0x4008000000000000; sd t1,16(a0)   # 3.0
+    li t1, 0x4010000000000000; sd t1,24(a0)   # 4.0
+    li t2,4; vsetvli t0,t2,e64,m2; vle64.v v4,(a0)   # v4,v5 = 4 doubles
+    li t2,4; vsetvli t0,t2,e32,m1                     # dst SEW=32
+    vfncvt.f.f.w v8,v4
+    vse32.v v8,(a2)
+    CK 0,  0x3F800000, fail171   # 1.0f
+    CK 4,  0x40000000, fail171   # 2.0f
+    CK 8,  0x40400000, fail172   # 3.0f
+    CK 12, 0x40800000, fail172   # 4.0f
+
+    # vfncvt.x.f.w: double [3.5,-2.5,100.0,7.9] -> int32 (truncate).
+    li t1, 0x400C000000000000; sd t1,0(a0)    # 3.5
+    li t1, 0xC004000000000000; sd t1,8(a0)    # -2.5
+    li t1, 0x4059000000000000; sd t1,16(a0)   # 100.0
+    li t1, 0x401FCCCCCCCCCCCD; sd t1,24(a0)   # 7.9
+    li t2,4; vsetvli t0,t2,e64,m2; vle64.v v4,(a0)
+    li t2,4; vsetvli t0,t2,e32,m1
+    vfncvt.x.f.w v8,v4
+    vse32.v v8,(a2)
+    CK 0,  3, fail173            # trunc(3.5)
+    CK 4,  0xFFFFFFFE, fail173   # trunc(-2.5) = -2
+    CK 8,  100, fail174
+    CK 12, 7, fail174            # trunc(7.9)
+
+    # vfncvt.f.x.w: int64 [10,-20,1000,-1] -> single.
+    li t1, 10;   sd t1,0(a0)
+    li t1, -20;  sd t1,8(a0)
+    li t1, 1000; sd t1,16(a0)
+    li t1, -1;   sd t1,24(a0)
+    li t2,4; vsetvli t0,t2,e64,m2; vle64.v v4,(a0)
+    li t2,4; vsetvli t0,t2,e32,m1
+    vfncvt.f.x.w v8,v4
+    vse32.v v8,(a2)
+    CK 0,  0x41200000, fail175   # 10.0
+    CK 4,  0xC1A00000, fail175   # -20.0
+    CK 8,  0x447A0000, fail176   # 1000.0
+    CK 12, 0xBF800000, fail176   # -1.0
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1616,3 +1661,9 @@ fail167: li t0,167; sw t0,0(t3); 1670: j 1670b
 fail168: li t0,168; sw t0,0(t3); 1680: j 1680b
 fail169: li t0,169; sw t0,0(t3); 1690: j 1690b
 fail170: li t0,170; sw t0,0(t3); 1700: j 1700b
+fail171: li t0,171; sw t0,0(t3); 1710: j 1710b
+fail172: li t0,172; sw t0,0(t3); 1720: j 1720b
+fail173: li t0,173; sw t0,0(t3); 1730: j 1730b
+fail174: li t0,174; sw t0,0(t3); 1740: j 1740b
+fail175: li t0,175; sw t0,0(t3); 1750: j 1750b
+fail176: li t0,176; sw t0,0(t3); 1760: j 1760b
