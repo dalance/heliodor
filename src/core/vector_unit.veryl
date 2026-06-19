@@ -215,6 +215,29 @@ pub module vector_unit #(
         };
     }
 
+    // ---- Per-element integer reduction fold (V4b), parameterized by width -----
+    // Folds the running accumulator a with the next source element b for the
+    // OPMVV .vs reductions (funct6 0000xx): sum / and / or / xor / minu / min /
+    // maxu / max. (and/or/xor use funct6 0000001/010/011, distinct from the
+    // element-wise vand/vor/vxor 001001/010/011 — hence a dedicated map.)
+    function vredop::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        return case op {
+            6'b000000: a + b,                                // vredsum
+            6'b000001: a & b,                                // vredand
+            6'b000010: a | b,                                // vredor
+            6'b000011: a ^ b,                                // vredxor
+            6'b000100: if a <: b ? a : b,                    // vredminu
+            6'b000101: if $signed(a) <: $signed(b) ? a : b,  // vredmin
+            6'b000110: if a <: b ? b : a,                    // vredmaxu
+            6'b000111: if $signed(a) <: $signed(b) ? b : a,  // vredmax
+            default  : a + b,
+        };
+    }
+
     // ---- Per-element integer multiply / divide (V2c, OPMVV/OPMVX) -----------
     // a = vs2[i]; b = vs1[i] (VV) / x[rs1] (VX); op = funct6 (100xxx). The
     // high-half multiplies need the full 2*W-bit product, so the operands are
@@ -724,6 +747,12 @@ pub module vector_unit #(
     // serial FSM folds one vs2 element per cycle into the scalar red_acc, seeded
     // from vs1[0]. usum/osum both fold sequentially (a valid unordered order).
     let h_is_fred: logic = h_is_fp && (h_funct3 == 3'b001) && (h_funct6[5:3] == 3'b000) && h_funct6[0];
+    // V4b: integer reductions (OPMVV .vs, funct6 0000xx: vredsum/vredand/vredor/
+    // vredxor/vredminu/vredmin/vredmaxu/vredmax). Same horizontal fold as the FP
+    // reductions, routed to VFALU so it reuses the element-serial walk + red_acc,
+    // but the per-element fold is combinational (no FPU, no fflags, no NaN-box).
+    let h_is_ired: logic = h_is_fp && (h_funct3 == 3'b010) && (h_funct6[5:3] == 3'b000);
+    let h_is_red : logic = h_is_fred || h_is_ired;
     // V3d: FP compare (funct6 011xxx) → 1-bit-per-element mask register result.
     let h_is_fcmp: logic = h_is_fp && (h_funct6[5:3] == 3'b011);
     // V3e: vfmerge.vfm / vfmv.v.f (funct6 010111) — a data select (no FPU), so it
@@ -1188,6 +1217,18 @@ pub module vector_unit #(
     // current vs2 element. (At element 0 fp_reg=0, so i_vs1_data is the vs1 reg.)
     let red_seed  : logic<64>   = if fp_double ? i_vs1_data[63:0] : {32'hffffffff, i_vs1_data[31:0]};
     let fp_red_s1 : logic<64>   = if fp_elem == 8'd0 ? red_seed : red_acc;
+    // V4b integer reduction fold: combinational, no FPU. The accumulator (low SEW
+    // bits) is seeded from vs1[0] on element 0, then folded with the raw vs2
+    // element via vredop, per SEW. Inactive elements keep the accumulator.
+    let red_iacc  : logic<64>   = if fp_elem == 8'd0 ? i_vs1_data[63:0] : red_acc;
+    let red_ielem : logic<64>   = fp_a_sh[63:0];
+    let red_ifold : logic<64>   = case vsew {
+        3'd0   : {56'd0, vredop::<8>(red_iacc[7:0], red_ielem[7:0], h_funct6)},
+        3'd1   : {48'd0, vredop::<16>(red_iacc[15:0], red_ielem[15:0], h_funct6)},
+        3'd2   : {32'd0, vredop::<32>(red_iacc[31:0], red_ielem[31:0], h_funct6)},
+        default: vredop::<64>(red_iacc[63:0], red_ielem[63:0], h_funct6),
+    };
+    let red_int_final: logic<64> = if fp_active ? red_ifold : red_iacc;
     // V3h FMA operands: multiplicand a = vs1 (.vv) / f[rs1] (.vf); macc multiplies
     // by vs2 and accumulates the old vd, madd multiplies by vd and accumulates vs2.
     let fp_vd_sh  : logic<VLEN> = i_vdold_data >> fp_bitoff;
@@ -1327,7 +1368,7 @@ pub module vector_unit #(
     // rounds with fcsr.frm → pass DYN so fpu_wrap resolves it from i_frm.
     // Merge is a pure data select, so it must not issue the shared FPU (no
     // spurious fflags / busy). Arithmetic and compare issue it for active elements.
-    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest;
+    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest && !h_is_ired;
     inst u_vfpu: fpu_wrap #(
         PRF_W    : PRF_W    ,
         ROB_IDX_W: ROB_IDX_W,
@@ -1414,18 +1455,25 @@ pub module vector_unit #(
     let fp_mask_clr : logic<VLEN> = {127'd0, 1'b1} << fp_elem;
     let fp_mask_next: logic<VLEN> = if fp_active ? ((fp_mask_base & ~fp_mask_clr) | fp_mask_bit) : fp_mask_base;
     let fp_last_elem: logic       = (fp_elem + 8'd1) >= vl8;
-    // V4a reduction: the running fold this cycle (NaN-boxed for SEW=32). Active
-    // element -> fold the FPU result; inactive -> keep the accumulator (seeded
-    // from vs1[0] on element 0). At the last element this is the vd[0] result;
-    // only element 0 of vd is written, the rest staying tail-undisturbed.
+    // V4a/V4b reduction: the running fold this cycle. FP folds the (NaN-boxed)
+    // FPU result; integer folds combinationally via red_int_final. Inactive ->
+    // keep the accumulator (seeded from vs1[0] on element 0). At the last element
+    // this is the vd[0] result; only element 0 of vd is written (SEW-wide splice),
+    // the rest staying tail-undisturbed.
     let red_fold   : logic<64>    = if fp_double ? vfpu_cdb.data : {32'hffffffff, vfpu_cdb.data[31:0]};
-    let red_final  : logic<64>    = if fp_active ? red_fold : (if fp_elem == 8'd0 ? red_seed : red_acc);
-    let fp_red_vd  : logic<VLEN>  = if fp_double ? {i_vdold_data[127:64], red_final[63:0]} : {i_vdold_data[127:32], red_final[31:0]};
+    let red_final  : logic<64>    = if h_is_ired ? red_int_final : (if fp_active ? red_fold : (if fp_elem == 8'd0 ? red_seed : red_acc));
+    let red_sew_mask: logic<64>   = case vsew {
+        3'd0   : 64'h0000_0000_0000_00ff,
+        3'd1   : 64'h0000_0000_0000_ffff,
+        3'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let fp_red_vd  : logic<VLEN>  = {i_vdold_data[127:64], (i_vdold_data[63:0] & ~red_sew_mask) | (red_final & red_sew_mask)};
     // VRF writes during COMPUTE: arithmetic writes a completed register at its
     // boundary; a compare / reduction writes its single dest element at the last.
-    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && !h_is_fcmp && !h_is_fred && fp_dreg_last;
+    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && !h_is_fcmp && !h_is_red && fp_dreg_last;
     let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_fcmp && fp_last_elem;
-    let fp_red_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_fred && fp_last_elem;
+    let fp_red_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_red && fp_last_elem;
     let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
 
     // ---- Execute the head (combinational) -----------------------------------
@@ -1473,10 +1521,10 @@ pub module vector_unit #(
     assign o_vs1_addr    = if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})); // FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_fp ? (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))); // FP (.w vs2=dest geom) / widen-half / .w-full / narrow / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_fred) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / FP mask|red|elem|widen-dst reg / int mask / narrow dest / group
-    assign o_vd_addr     = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_fred) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / FP / load / int mask / narrow / arith
+    assign o_vdold_addr  = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))); // vfmv.s.f / FP mask|red|elem|widen-dst reg / int mask / narrow dest / group
+    assign o_vd_addr     = if h_is_vfmv_sf ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // vfmv.s.f / FP / load / int mask / narrow / arith
     assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr;
-    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_fred ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))));
+    assign o_vd_data     = if h_is_vfmv_sf ? sf_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
@@ -1670,8 +1718,9 @@ pub module vector_unit #(
                     // COMPUTE: process element fp_elem this cycle (single-cycle FPU
                     // for arithmetic/compare; FDIV.D/FSQRT.D hold here on vfpu_busy).
                     if !vfpu_busy {
-                        if fp_active && !h_is_fmerge {
-                            // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU).
+                        if fp_active && !h_is_fmerge && !h_is_ired {
+                            // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU);
+                            // integer reductions (h_is_ired) accrue no FP flags.
                             fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : vfpu_fflags);
                         }
                         // A compare accumulates the running mask in fp_acc (no
@@ -1681,7 +1730,7 @@ pub module vector_unit #(
                         // boundary (the next register re-seeds from old vd).
                         if h_is_fcmp {
                             fp_acc = fp_mask_next;
-                        } else if h_is_fred {
+                        } else if h_is_red {
                             red_acc = red_final;
                         } else {
                             fp_acc = if fp_dreg_last ? {1'b0 repeat VLEN} : fp_acc_next;

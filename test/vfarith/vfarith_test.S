@@ -899,6 +899,71 @@ _start:
     vse64.v v8, (a2)
     CK64 0, 0x4000000000000000, fail86     # 2.0
 
+    # ===== V4b: integer reductions (vredsum/and/or/xor/minu/min/maxu/max .vs) =====
+    li   a0, 0x80010700                    # vs2 array
+    li   a1, 0x80010740                    # vs1 seed
+    li   a2, 0x80010780                    # dst
+    li   a3, 0x800107C0                    # mask byte
+    li t1,10; sw t1,0(a0);  li t1,20; sw t1,4(a0)
+    li t1,30; sw t1,8(a0);  li t1,40; sw t1,12(a0)
+    li t1,5;  sw t1,0(a1)                   # seed 5
+    vsetvli t0, x0, e32, m1                # vl = 4
+    vle32.v v4, (a0)
+    vle32.v v6, (a1)
+    vredsum.vs  v8, v4, v6; vse32.v v8, (a2); CK 0, 0x00000069, fail87   # 5+10+20+30+40=105
+    vredand.vs  v8, v4, v6; vse32.v v8, (a2); CK 0, 0x00000000, fail88   # 5&10&...=0
+    vredor.vs   v8, v4, v6; vse32.v v8, (a2); CK 0, 0x0000003F, fail89   # OR
+    vredxor.vs  v8, v4, v6; vse32.v v8, (a2); CK 0, 0x0000002D, fail90   # XOR
+    vredminu.vs v8, v4, v6; vse32.v v8, (a2); CK 0, 0x00000005, fail91   # min unsigned
+    vredmaxu.vs v8, v4, v6; vse32.v v8, (a2); CK 0, 0x00000028, fail91   # 40
+
+    # signed min/max with negatives: b = [-1, -100, 50, 2], seed = 10
+    li t1,-1;   sw t1,0(a0);  li t1,-100; sw t1,4(a0)
+    li t1,50;   sw t1,8(a0);  li t1,2;    sw t1,12(a0)
+    li t1,10;   sw t1,0(a1)
+    vle32.v v4, (a0)
+    vle32.v v6, (a1)
+    vredmin.vs v8, v4, v6; vse32.v v8, (a2); CK 0, 0xFFFFFF9C, fail92    # -100
+    vredmax.vs v8, v4, v6; vse32.v v8, (a2); CK 0, 0x00000032, fail92    # 50
+
+    # masked vredsum (v0 = 0x0A → elements 1,3): seed + a[1] + a[3]
+    li t1,10; sw t1,0(a0);  li t1,20; sw t1,4(a0)
+    li t1,30; sw t1,8(a0);  li t1,40; sw t1,12(a0)
+    li t1,5;  sw t1,0(a1)
+    li t1,0x0A; sb t1,0(a3)
+    vsetvli t0, x0, e8, m1
+    vle8.v v0, (a3)                        # v0[0] = 0x0A
+    vsetvli t0, x0, e32, m1                # vl = 4
+    vle32.v v4, (a0)
+    vle32.v v6, (a1)
+    vredsum.vs v8, v4, v6, v0.t
+    vse32.v v8, (a2)
+    CK 0, 0x00000041, fail92               # 5 + 20 + 40 = 65
+
+    # SEW=8 vredsum: c = 1..8, seed = 0 (vl = 8)
+    li t1,1; sb t1,0(a0); li t1,2; sb t1,1(a0); li t1,3; sb t1,2(a0); li t1,4; sb t1,3(a0)
+    li t1,5; sb t1,4(a0); li t1,6; sb t1,5(a0); li t1,7; sb t1,6(a0); li t1,8; sb t1,7(a0)
+    li t1,0; sb t1,0(a1)
+    li t2, 8
+    vsetvli t0, t2, e8, m1                 # vl = 8
+    vle8.v v4, (a0)
+    vle8.v v6, (a1)
+    vredsum.vs v8, v4, v6
+    vse8.v v8, (a2)
+    lbu t5, 0(a2); li t6, 0x24; bne t5, t6, fail93    # 36
+
+    # SEW=64 vredsum: d = [1000, 2000], seed = 100 (vl = 2)
+    li   a0, 0x80010800
+    li   a1, 0x80010840
+    li t1,1000; sd t1,0(a0);  li t1,2000; sd t1,8(a0)
+    li t1,100;  sd t1,0(a1)
+    vsetvli t0, x0, e64, m1                # vl = 2
+    vle64.v v4, (a0)
+    vle64.v v6, (a1)
+    vredsum.vs v8, v4, v6
+    vse64.v v8, (a2)
+    CK64 0, 0x0000000000000C1C, fail93     # 3100
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -988,3 +1053,10 @@ fail83: li t0,83; sw t0,0(t3); 830: j 830b
 fail84: li t0,84; sw t0,0(t3); 840: j 840b
 fail85: li t0,85; sw t0,0(t3); 850: j 850b
 fail86: li t0,86; sw t0,0(t3); 860: j 860b
+fail87: li t0,87; sw t0,0(t3); 870: j 870b
+fail88: li t0,88; sw t0,0(t3); 880: j 880b
+fail89: li t0,89; sw t0,0(t3); 890: j 890b
+fail90: li t0,90; sw t0,0(t3); 900: j 900b
+fail91: li t0,91; sw t0,0(t3); 910: j 910b
+fail92: li t0,92; sw t0,0(t3); 920: j 920b
+fail93: li t0,93; sw t0,0(t3); 930: j 930b
