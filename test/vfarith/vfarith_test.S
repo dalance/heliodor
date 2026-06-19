@@ -771,6 +771,83 @@ _start:
     li   t6, 0x05                          # OF (bit2) | NX (bit0)
     bne  t5, t6, fail15
 
+    # ===== V3j-4: vfrsqrt7.v / vfrec7.v (7-bit reciprocal/rsqrt estimates) =====
+    csrwi frm, 0                           # RNE (deterministic vfrec7 overflow rounding)
+    li   a0, 0x80010300
+    li   a2, 0x80010380
+
+    # --- vfrsqrt7.v single: [1.0, 4.0, 0.25, 100.0] ---
+    li t1,0x3F800000; sw t1,0(a0);  li t1,0x40800000; sw t1,4(a0)
+    li t1,0x3E800000; sw t1,8(a0);  li t1,0x42C80000; sw t1,12(a0)
+    vsetvli t0, x0, e32, m1
+    vle32.v v4, (a0)
+    vfrsqrt7.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x3F7F0000, fail74              # rsqrt(1.0)
+    CK 4,  0x3EFF0000, fail74              # rsqrt(4.0)
+    CK 8,  0x3FFF0000, fail74              # rsqrt(0.25)
+    CK 12, 0x3DCC0000, fail74              # rsqrt(100.0)
+
+    # --- vfrsqrt7.v single special: -1.0 → NaN+NV, +0 → +inf+DZ, +inf → +0 ---
+    li t1,0xBF800000; sw t1,0(a0);  li t1,0x00000000; sw t1,4(a0)
+    li t1,0x00000000; sw t1,8(a0);  li t1,0x7F800000; sw t1,12(a0)
+    csrw fflags, x0
+    vle32.v v4, (a0)
+    vfrsqrt7.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x7FC00000, fail75              # rsqrt(-1.0) = canonical NaN
+    CK 4,  0x7F800000, fail75              # rsqrt(+0)   = +inf
+    CK 8,  0x7F800000, fail75              # rsqrt(+0)   = +inf
+    CK 12, 0x00000000, fail75              # rsqrt(+inf) = +0
+    csrr t5, fflags
+    li   t6, 0x18                          # NV (-1.0) | DZ (+0)
+    bne  t5, t6, fail76
+
+    # --- vfrec7.v single: [1.0, 2.0, 0.5, -2.0] ---
+    li t1,0x3F800000; sw t1,0(a0);  li t1,0x40000000; sw t1,4(a0)
+    li t1,0x3F000000; sw t1,8(a0);  li t1,0xC0000000; sw t1,12(a0)
+    vle32.v v4, (a0)
+    vfrec7.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x3F7F0000, fail77              # rec(1.0)
+    CK 4,  0x3EFF0000, fail77              # rec(2.0)
+    CK 8,  0x3FFF0000, fail77              # rec(0.5)
+    CK 12, 0xBEFF0000, fail77              # rec(-2.0)
+
+    # --- vfrec7.v single special: +0 → +inf+DZ, -inf → -0, min subnormal → +inf+OF|NX ---
+    li t1,0x00000000; sw t1,0(a0);  li t1,0xFF800000; sw t1,4(a0)
+    li t1,0x00000001; sw t1,8(a0);  li t1,0x3F800000; sw t1,12(a0)
+    csrw fflags, x0
+    vle32.v v4, (a0)
+    vfrec7.v v8, v4
+    vse32.v v8, (a2)
+    CK 0,  0x7F800000, fail78              # rec(+0)            = +inf
+    CK 4,  0x80000000, fail78              # rec(-inf)          = -0
+    CK 8,  0x7F800000, fail78              # rec(min subnormal) = +inf (overflow, RNE)
+    CK 12, 0x3F7F0000, fail78              # rec(1.0)
+    csrr t5, fflags
+    li   t6, 0x0D                          # DZ (+0) | OF|NX (subnormal overflow)
+    bne  t5, t6, fail79
+
+    # --- vfrsqrt7.v / vfrec7.v double (SEW=64, vl=2) ---
+    li   a0, 0x80010400
+    li   a2, 0x80010480
+    li t1,0x3FF0000000000000; sd t1,0(a0)  # 1.0
+    li t1,0x4010000000000000; sd t1,8(a0)  # 4.0
+    vsetvli t0, x0, e64, m1
+    vle64.v v4, (a0)
+    vfrsqrt7.v v8, v4
+    vse64.v v8, (a2)
+    CK64 0, 0x3FEFE00000000000, fail80     # rsqrt(1.0)
+    CK64 8, 0x3FDFE00000000000, fail80     # rsqrt(4.0)
+    li t1,0x4000000000000000; sd t1,0(a0)  # 2.0
+    li t1,0x3FE0000000000000; sd t1,8(a0)  # 0.5
+    vle64.v v4, (a0)
+    vfrec7.v v8, v4
+    vse64.v v8, (a2)
+    CK64 0, 0x3FDFE00000000000, fail80     # rec(2.0)
+    CK64 8, 0x3FFFE00000000000, fail80     # rec(0.5)
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -847,3 +924,10 @@ fail70: li t0,70; sw t0,0(t3); 700: j 700b
 fail71: li t0,71; sw t0,0(t3); 710: j 710b
 fail72: li t0,72; sw t0,0(t3); 720: j 720b
 fail73: li t0,73; sw t0,0(t3); 730: j 730b
+fail74: li t0,74; sw t0,0(t3); 740: j 740b
+fail75: li t0,75; sw t0,0(t3); 750: j 750b
+fail76: li t0,76; sw t0,0(t3); 760: j 760b
+fail77: li t0,77; sw t0,0(t3); 770: j 770b
+fail78: li t0,78; sw t0,0(t3); 780: j 780b
+fail79: li t0,79; sw t0,0(t3); 790: j 790b
+fail80: li t0,80; sw t0,0(t3); 800: j 800b
