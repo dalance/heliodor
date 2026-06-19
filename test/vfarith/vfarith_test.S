@@ -614,6 +614,83 @@ _start:
     CK64 16, 0xC004000000000000, fail62   # -2.5
     CK64 24, 0x4012000000000000, fail62   # 4.5
 
+    # ============ V3j: widening FP FMA (vfwmacc family, .vv/.vf) ============
+    # Both multiplicands are single (s2d-widened); the accumulator is the old vd
+    # (already double, read at dest geometry). vd op= vs1*vs2.
+    # vs1 = [2.0, 3.0, -1.0, 0.5], vs2 = [1.5, 2.0, 4.0, -2.0] (single)
+    # vd  = [10.0, 20.0, -5.0, 1.0] (double accumulator, reloaded each test)
+    li   a0, 0x80010E00          # vs1 (single)
+    li   a1, 0x80010E40          # vs2 (single)
+    li   a3, 0x80010E80          # vd init (double = 2 regs)
+    li   a2, 0x80010F00          # dst (double = 2 regs)
+    li t1,0x40000000; sw t1,0(a0);  li t1,0x40400000; sw t1,4(a0)
+    li t1,0xBF800000; sw t1,8(a0);  li t1,0x3F000000; sw t1,12(a0)
+    li t1,0x3FC00000; sw t1,0(a1);  li t1,0x40000000; sw t1,4(a1)
+    li t1,0x40800000; sw t1,8(a1);  li t1,0xC0000000; sw t1,12(a1)
+    li t1,0x4024000000000000; sd t1,0(a3)    # 10.0
+    li t1,0x4034000000000000; sd t1,8(a3)    # 20.0
+    li t1,0xC014000000000000; sd t1,16(a3)   # -5.0
+    li t1,0x3FF0000000000000; sd t1,24(a3)   # 1.0
+    vsetvli t0, x0, e32, m1
+    vle32.v v6, (a0)             # vs1
+    vle32.v v4, (a1)             # vs2
+    # vfwmacc.vv: vd += vs1*vs2 -> [13.0, 26.0, -9.0, 0.0]
+    vsetvli t0, x0, e64, m2
+    vle64.v v8, (a3)
+    vsetvli t0, x0, e32, m1
+    vfwmacc.vv v8, v6, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x402A000000000000, fail63   # 13.0
+    CK64 8,  0x403A000000000000, fail63   # 26.0
+    CK64 16, 0xC022000000000000, fail63   # -9.0
+    CK64 24, 0x0000000000000000, fail63   # 0.0
+    # vfwnmacc.vv: vd = -(vs1*vs2) - vd -> [-13.0, -26.0, 9.0, 0.0]
+    vsetvli t0, x0, e64, m2
+    vle64.v v8, (a3)
+    vsetvli t0, x0, e32, m1
+    vfwnmacc.vv v8, v6, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0xC02A000000000000, fail64   # -13.0
+    CK64 8,  0xC03A000000000000, fail64   # -26.0
+    CK64 16, 0x4022000000000000, fail64   # 9.0
+    CK64 24, 0x0000000000000000, fail64   # 0.0
+    # vfwmsac.vv: vd = (vs1*vs2) - vd -> [-7.0, -14.0, 1.0, -2.0]
+    vsetvli t0, x0, e64, m2
+    vle64.v v8, (a3)
+    vsetvli t0, x0, e32, m1
+    vfwmsac.vv v8, v6, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0xC01C000000000000, fail65   # -7.0
+    CK64 8,  0xC02C000000000000, fail65   # -14.0
+    CK64 16, 0x3FF0000000000000, fail65   # 1.0
+    CK64 24, 0xC000000000000000, fail65   # -2.0
+    # vfwnmsac.vv: vd = -(vs1*vs2) + vd -> [7.0, 14.0, -1.0, 2.0]
+    vsetvli t0, x0, e64, m2
+    vle64.v v8, (a3)
+    vsetvli t0, x0, e32, m1
+    vfwnmsac.vv v8, v6, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x401C000000000000, fail66   # 7.0
+    CK64 8,  0x402C000000000000, fail66   # 14.0
+    CK64 16, 0xBFF0000000000000, fail66   # -1.0
+    CK64 24, 0x4000000000000000, fail66   # 2.0
+    # vfwmacc.vf: vd += 2.0*vs2 -> [13.0, 24.0, 3.0, -3.0]
+    flw fa1, 0(a0)               # 2.0 (= vs1[0])
+    vsetvli t0, x0, e64, m2
+    vle64.v v8, (a3)
+    vsetvli t0, x0, e32, m1
+    vfwmacc.vf v8, fa1, v4
+    vsetvli t0, x0, e64, m2
+    vse64.v v8, (a2)
+    CK64 0,  0x402A000000000000, fail67   # 13.0
+    CK64 8,  0x4038000000000000, fail67   # 24.0
+    CK64 16, 0x4008000000000000, fail67   # 3.0
+    CK64 24, 0xC008000000000000, fail67   # -3.0
+
     # --- fflags accrual: max_float + max_float = +inf, sets OF|NX (0x05) ---
     li   a0, 0x80010200
     li   a2, 0x80010280
@@ -694,3 +771,8 @@ fail59: li t0,59; sw t0,0(t3); 590: j 590b
 fail60: li t0,60; sw t0,0(t3); 600: j 600b
 fail61: li t0,61; sw t0,0(t3); 610: j 610b
 fail62: li t0,62; sw t0,0(t3); 620: j 620b
+fail63: li t0,63; sw t0,0(t3); 630: j 630b
+fail64: li t0,64; sw t0,0(t3); 640: j 640b
+fail65: li t0,65; sw t0,0(t3); 650: j 650b
+fail66: li t0,66; sw t0,0(t3); 660: j 660b
+fail67: li t0,67; sw t0,0(t3); 670: j 670b
