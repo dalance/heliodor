@@ -1374,6 +1374,46 @@ _start:
     CK 4,  0x44444444, fail162   # vs2[3]
     CK 8,  0xCCCCCCCC, fail163   # past count → undisturbed
 
+    # ===== V4g-1: vwredsumu.vs / vwredsum.vs (integer widening reduction) =====
+    li   a0, 0x80011200   # vs2 data
+    li   a1, 0x80011240   # vs1 seed
+    li   a2, 0x80011280   # dst
+    # vwredsumu SEW=8: [10,20,...,80], 16-bit seed = 5 → 5 + 360 = 365.
+    li t1, 0x50463C32281E140A; sd t1,0(a0)
+    li t2,8; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 5; sh t1,0(a1)                       # vs1[0] (2*SEW=16-bit) = 5
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a1)
+    li t2,8; vsetvli t0,t2,e8,m1
+    vwredsumu.vs v8,v4,v6
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lhu t5,0(a2); li t6,365; bne t5,t6, fail164
+
+    # negative data [-1,-2,-3,-4], seed 100. unsigned widens to 0xFF.. → 1114.
+    li t1, 0xFCFDFEFF; sw t1,0(a0)              # bytes -1,-2,-3,-4
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1,100; sh t1,0(a1)
+    li t2,16; vsetvli t0,t2,e8,m1; vle8.v v6,(a1)
+    li t2,4; vsetvli t0,t2,e8,m1
+    vwredsumu.vs v8,v4,v6
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lhu t5,0(a2); li t6,1114; bne t5,t6, fail165   # 100+255+254+253+252
+    # signed sign-extends: 100 + (-1-2-3-4) = 90.
+    li t2,4; vsetvli t0,t2,e8,m1
+    vwredsum.vs v8,v4,v6
+    li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lhu t5,0(a2); li t6,90; bne t5,t6, fail166
+
+    # SEW=16 vwredsumu: [1000,2000,3000], 32-bit seed 100 → 6100.
+    li t1, 0x07D003E8; sw t1,0(a0)              # 1000, 2000
+    li t1, 0x0BB8; sh t1,4(a0)                  # 3000
+    li t2,3; vsetvli t0,t2,e16,m1; vle16.v v4,(a0)
+    li t1,100; sw t1,0(a1)                      # seed (2*SEW=32-bit)
+    li t2,8; vsetvli t0,t2,e16,m1; vle16.v v6,(a1)
+    li t2,3; vsetvli t0,t2,e16,m1
+    vwredsumu.vs v8,v4,v6
+    li t2,8; vsetvli t0,t2,e16,m1; vse16.v v8,(a2)
+    lwu t5,0(a2); li t6,6100; bne t5,t6, fail167
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1540,3 +1580,7 @@ fail160: li t0,160; sw t0,0(t3); 1600: j 1600b
 fail161: li t0,161; sw t0,0(t3); 1610: j 1610b
 fail162: li t0,162; sw t0,0(t3); 1620: j 1620b
 fail163: li t0,163; sw t0,0(t3); 1630: j 1630b
+fail164: li t0,164; sw t0,0(t3); 1640: j 1640b
+fail165: li t0,165; sw t0,0(t3); 1650: j 1650b
+fail166: li t0,166; sw t0,0(t3); 1660: j 1660b
+fail167: li t0,167; sw t0,0(t3); 1670: j 1670b
