@@ -1031,6 +1031,58 @@ _start:
     vcpop.m  t5, v4, v0.t; li t6, 2; bne t5, t6, fail109 # active set: 1,3 → 2
     vfirst.m t5, v4, v0.t; li t6, 1; bne t5, t6, fail110 # lowest active set = 1
 
+    # ===== V4e-1: vmsbf.m / vmsof.m / vmsif.m (mask set-prefix) =====
+    # v4 source mask byte0 = 0x28 (bits 3,5 set; first set = bit 3). vl=8 → the
+    # result byte0 is body. vmsbf=before-first (0x07), vmsif=incl-first (0x0F),
+    # vmsof=only-first (0x08). Read back the dest mask register as a byte.
+    li   a0, 0x80010B00
+    li   a2, 0x80010B40
+    li t1, 0;    sd t1,0(a0); sd t1,8(a0)
+    li t1, 0x28; sb t1,0(a0)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v4, (a0)
+    li t2, 8;  vsetvli t0, t2, e8, m1                    # vl = 8 (bits 0..7 body)
+    vmsbf.m v8, v4; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x07; bne t5,t6, fail111
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsif.m v8, v4; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x0F; bne t5,t6, fail112
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsof.m v8, v4; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x08; bne t5,t6, fail113
+
+    # no source bit set: vmsbf fills all active body with 1 (0xFF), vmsof = 0.
+    li t1, 0; sd t1,0(a0); sd t1,8(a0)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v4, (a0)
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsbf.m v8, v4; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0xFF; bne t5,t6, fail114
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsof.m v8, v4; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x00; bne t5,t6, fail115
+
+    # masked: v0 mask = 0x0A (active 1,3), v4 byte0 = 0x08 (bit 3 set). Inactive
+    # elements are skipped in the first-set search and left undisturbed (v8 = 0).
+    # vmsbf → bit1=1 (active, before set@3) → 0x02; vmsif → bits1,3 → 0x0A;
+    # vmsof → bit3 → 0x08.
+    li t1, 0x08; sb t1,0(a0); li t1,0; sb t1,1(a0); sd t1,8(a0)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v4, (a0)
+    li   a1, 0x80010B80
+    li t1, 0x0A; sb t1,0(a1)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v0, (a1)   # v0[0] = 0x0A
+    li t1, 0; sd t1,0(a2); sd t1,8(a2)
+    li t2, 16; vsetvli t0, t2, e8, m1; vle8.v v8, (a2)   # v8 = 0 (undisturbed base)
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsbf.m v8, v4, v0.t; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x02; bne t5,t6, fail116
+    li t1, 0; sd t1,0(a2); li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsif.m v8, v4, v0.t; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x0A; bne t5,t6, fail117
+    li t1, 0; sd t1,0(a2); li t2,16; vsetvli t0,t2,e8,m1; vle8.v v8,(a2)
+    li t2, 8; vsetvli t0,t2,e8,m1
+    vmsof.m v8, v4, v0.t; li t2,16; vsetvli t0,t2,e8,m1; vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x08; bne t5,t6, fail118
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -1144,3 +1196,11 @@ fail107: li t0,107; sw t0,0(t3); 1070: j 1070b
 fail108: li t0,108; sw t0,0(t3); 1080: j 1080b
 fail109: li t0,109; sw t0,0(t3); 1090: j 1090b
 fail110: li t0,110; sw t0,0(t3); 1100: j 1100b
+fail111: li t0,111; sw t0,0(t3); 1110: j 1110b
+fail112: li t0,112; sw t0,0(t3); 1120: j 1120b
+fail113: li t0,113; sw t0,0(t3); 1130: j 1130b
+fail114: li t0,114; sw t0,0(t3); 1140: j 1140b
+fail115: li t0,115; sw t0,0(t3); 1150: j 1150b
+fail116: li t0,116; sw t0,0(t3); 1160: j 1160b
+fail117: li t0,117; sw t0,0(t3); 1170: j 1170b
+fail118: li t0,118; sw t0,0(t3); 1180: j 1180b
