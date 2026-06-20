@@ -1939,6 +1939,61 @@ _start:
     lbu t5,1(a2); li t6,152; bne t5,t6, fail241   # 151.5 -> rne 152 (even)
     csrwi vxrm, 0         # restore rnu
 
+    # ===== V5c: scaling (rounding) right shift (vssrl / vssra) =====
+    li   a0, 0x80012100   # a (vs2 = value)
+    li   a1, 0x80012140   # b (vs1 = shift amount)
+    li   a2, 0x80012180   # dst
+    csrwi vxrm, 0         # rnu
+
+    # vssrl.vv (logical): [0xFF,0x81,0x40,0x07] >> [1,1,2,1], rnu.
+    li t1, 0x074081FF; sw t1, 0(a0)
+    li t1, 0x01020101; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vssrl.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x80; bne t5,t6, fail242   # 255>>1=127.5 -> rnu 128
+    lbu t5,1(a2); li t6,0x41; bne t5,t6, fail242   # 129>>1=64.5 -> rnu 65
+    lbu t5,2(a2); li t6,0x10; bne t5,t6, fail243   # 64>>2=16 (no round)
+    lbu t5,3(a2); li t6,0x04; bne t5,t6, fail243   # 7>>1=3.5 -> rnu 4
+
+    # vssra.vv (arithmetic): [-128,-1,64,-7] >> [1,1,1,1], rnu.
+    li t1, 0xF940FF80; sw t1, 0(a0)
+    li t1, 0x01010101; sw t1, 0(a1)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    vssra.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0xC0; bne t5,t6, fail244   # -128>>1=-64
+    lbu t5,1(a2); li t6,0x00; bne t5,t6, fail244   # -1>>1=-0.5 -> rnu 0
+    lbu t5,2(a2); li t6,0x20; bne t5,t6, fail245   # 64>>1=32
+    lbu t5,3(a2); li t6,0xFD; bne t5,t6, fail245   # -7>>1=-3.5 -> rnu -3
+
+    # vssrl.vx (scalar shift=2): [0xFF,0x05,0x40,0x06] >> 2, rnu.
+    li t1, 0x064005FF; sw t1, 0(a0)
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 2; vssrl.vx v8,v4,t1
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x40; bne t5,t6, fail246   # 255>>2=63.75 -> rnu 64
+    lbu t5,1(a2); li t6,0x01; bne t5,t6, fail246   # 5>>2=1.25 -> rnu 1
+    lbu t5,2(a2); li t6,0x10; bne t5,t6, fail247   # 64>>2=16
+    lbu t5,3(a2); li t6,0x02; bne t5,t6, fail247   # 6>>2=1.5 -> rnu 2
+
+    # vssrl.vi (imm shift=1, vxrm=rdn truncate): [0xFF,0x07] >> 1.
+    csrwi vxrm, 2
+    li t1, 0x000007FF; sw t1, 0(a0)
+    li t2,2; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    vssrl.vi v8,v4,1
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x7F; bne t5,t6, fail248   # 255>>1 truncate 127
+    lbu t5,1(a2); li t6,0x03; bne t5,t6, fail248   # 7>>1 truncate 3
+
+    # vssrl.vx shift=0 (no shift, no rounding): 0xAB >> 0 = 0xAB.
+    csrwi vxrm, 0
+    li t1, 0xAB; sb t1, 0(a0)
+    li t2,1; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    li t1, 0; vssrl.vx v8,v4,t1
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0xAB; bne t5,t6, fail249   # unchanged
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -2183,3 +2238,11 @@ fail238: li t0,238; sw t0,0(t3); 2380: j 2380b
 fail239: li t0,239; sw t0,0(t3); 2390: j 2390b
 fail240: li t0,240; sw t0,0(t3); 2400: j 2400b
 fail241: li t0,241; sw t0,0(t3); 2410: j 2410b
+fail242: li t0,242; sw t0,0(t3); 2420: j 2420b
+fail243: li t0,243; sw t0,0(t3); 2430: j 2430b
+fail244: li t0,244; sw t0,0(t3); 2440: j 2440b
+fail245: li t0,245; sw t0,0(t3); 2450: j 2450b
+fail246: li t0,246; sw t0,0(t3); 2460: j 2460b
+fail247: li t0,247; sw t0,0(t3); 2470: j 2470b
+fail248: li t0,248; sw t0,0(t3); 2480: j 2480b
+fail249: li t0,249; sw t0,0(t3); 2490: j 2490b
