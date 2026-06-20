@@ -437,6 +437,47 @@ pub module vector_unit #(
         return res[W - 1:0];
     }
 
+    // ---- Per-element narrowing clip (V5d, OPIVV/VX/VI funct6 10111x) ---------
+    // vnclipu/vnclip: roundoff the 2*W source right by the shift amount (per vxrm,
+    // like vssh but on 2*W bits) then saturate the result to W bits. Returns
+    // {sat, result[W-1:0]}: sat=1 if clipped (OR-accumulated into vxsat).
+    // sgn = funct6[0] (0 = unsigned vnclipu, 1 = signed vnclip).
+    function vnclip::<W: u32> (
+        a   : input logic<W * 2>,
+        sh  : input logic<W>    ,
+        sgn : input logic       ,
+        vxrm: input logic<2>    ,
+    ) -> logic<W + 1> {
+        let amt: logic<W>     = sh & ((W * 2) - 1);
+        let sra: logic<W * 2> = $signed(a) >>> amt;
+        let srl: logic<W * 2> = a >> amt;
+        let shv: logic<W * 2> = if sgn ? sra : srl;
+        let r_lsb: logic = shv[0];
+        let nz   : logic = amt != 0;
+        let dropped: logic<W * 2> = a << ((W * 2) - amt);
+        let r_rnd: logic = nz & dropped[W * 2 - 1];
+        let r_stk: logic = nz & |dropped[W * 2 - 2:0];
+        let r: logic = case vxrm {
+            2'b00  : r_rnd,
+            2'b01  : r_rnd & (r_stk | r_lsb),
+            2'b10  : 1'b0,
+            default: (!r_lsb) & (r_rnd | r_stk),
+        };
+        let rounded: logic<W * 2> = shv + {1'b0 repeat (W * 2 - 1), r};
+        // Unsigned clip to [0, 2^W-1]: overflow if any bit at or above W is set.
+        let u_ovf: logic    = |rounded[W * 2 - 1:W];
+        let u_res: logic<W> = if u_ovf ? {1'b1 repeat W} : rounded[W - 1:0];
+        // Signed clip to [-2^(W-1), 2^(W-1)-1]: overflow unless the high W+1 bits
+        // are a clean sign-extension of bit W-1. Saturate to MIN/MAX by true sign.
+        let s_hi : logic<W + 1> = rounded[W * 2 - 1:W - 1];
+        let s_ovf: logic = !((s_hi == {1'b0 repeat (W + 1)}) || (s_hi == {1'b1 repeat (W + 1)}));
+        let s_sat: logic<W> = if rounded[W * 2 - 1] ? {1'b1, 1'b0 repeat (W - 1)} : {1'b0, 1'b1 repeat (W - 1)};
+        let s_res: logic<W> = if s_ovf ? s_sat : rounded[W - 1:0];
+        let res: logic<W> = if sgn ? s_res : u_res;
+        let sat: logic     = if sgn ? s_ovf : u_ovf;
+        return {sat, res};
+    }
+
     // ---- V3i widening FP: single -> double (exact) --------------------------
     // Widening FP arithmetic computes in double, so each single operand is
     // reformatted to double first. The widening is exact: normals just rebias the
@@ -881,6 +922,12 @@ pub module vector_unit #(
     // 2*SEW, so two source registers feed one SEW dest register (the inverse of
     // widening). funct6[0] = arithmetic (vnsra) vs logical (vnsrl).
     let h_is_narrow: logic = !h_is_opm && (h_funct6[5:1] == 5'b10110);
+    // V5d narrowing fixed-point clip (OPIV* funct6 10111x = vnclipu/vnclip): same
+    // 2*SEW→SEW narrowing geometry as vnsrl/vnsra, but rounded (vxrm) and saturated
+    // (vxsat). funct6[0] = signed (vnclip) vs unsigned (vnclipu). h_is_narr drives
+    // the shared narrowing geometry for both.
+    let h_is_vnclip: logic = !h_is_opm && (h_funct6[5:1] == 5'b10111);
+    let h_is_narr  : logic = h_is_narrow || h_is_vnclip;
     // V1 unit-stride memory ops.
     let h_is_vle: logic = h_op == VecOp::VLE;
     let h_is_vse: logic = h_op == VecOp::VSE;
@@ -978,7 +1025,7 @@ pub module vector_unit #(
         }
     }
     // Widening walks 2*EMUL dest groups; narrowing 2*EMUL source steps; else EMUL.
-    let va_nregs: logic<4> = if (h_is_widen || h_is_narrow) ? {emul[2:0], 1'b0} : emul;
+    let va_nregs: logic<4> = if (h_is_widen || h_is_narr) ? {emul[2:0], 1'b0} : emul;
     // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
     // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
     let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
@@ -1286,8 +1333,10 @@ pub module vector_unit #(
     let vn_vs1_half: logic<64> = if va_reg[0] ? i_vs1_data[127:64] : i_vs1_data[63:0];
     let vn_old_half: logic<64> = if va_reg[0] ? i_vdold_data[127:64] : i_vdold_data[63:0];
     var vn_step: logic<64>;
+    var vnc_grp: logic; // V5d: any active vnclip element saturated in this step
     always_comb {
         vn_step = vn_old_half; // inactive / tail = undisturbed
+        vnc_grp = 1'b0;
         case vsew {
             3'd0: { // SEW=8 ← 16-bit source, 8 results per step
                 let gbase: logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
@@ -1296,7 +1345,15 @@ pub module vector_unit #(
                     if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
                         let a : logic<16> = i_vs2_data[j*16+:16];
                         let sh: logic<8>  = if h_is_vv ? vn_vs1_half[j*8+:8] : (if h_is_vx ? i_scalar_data[7:0] : {3'd0, h_instr[19:15]});
-                        vn_step[j*8+:8] = vnshift::<8>(a, sh, h_funct6[0]);
+                        if h_is_vnclip {
+                            let cr: logic<9> = vnclip::<8>(a, sh, h_funct6[0], i_vxrm);
+                            vn_step[j*8+:8] = cr[7:0];
+                            if cr[8] {
+                                vnc_grp = 1'b1;
+                            }
+                        } else {
+                            vn_step[j*8+:8] = vnshift::<8>(a, sh, h_funct6[0]);
+                        }
                     }
                 }
             }
@@ -1307,7 +1364,15 @@ pub module vector_unit #(
                     if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
                         let a : logic<32> = i_vs2_data[j*32+:32];
                         let sh: logic<16> = if h_is_vv ? vn_vs1_half[j*16+:16] : (if h_is_vx ? i_scalar_data[15:0] : {11'd0, h_instr[19:15]});
-                        vn_step[j*16+:16] = vnshift::<16>(a, sh, h_funct6[0]);
+                        if h_is_vnclip {
+                            let cr: logic<17> = vnclip::<16>(a, sh, h_funct6[0], i_vxrm);
+                            vn_step[j*16+:16] = cr[15:0];
+                            if cr[16] {
+                                vnc_grp = 1'b1;
+                            }
+                        } else {
+                            vn_step[j*16+:16] = vnshift::<16>(a, sh, h_funct6[0]);
+                        }
                     }
                 }
             }
@@ -1318,7 +1383,15 @@ pub module vector_unit #(
                     if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
                         let a : logic<64> = i_vs2_data[j*64+:64];
                         let sh: logic<32> = if h_is_vv ? vn_vs1_half[j*32+:32] : (if h_is_vx ? i_scalar_data[31:0] : {27'd0, h_instr[19:15]});
-                        vn_step[j*32+:32] = vnshift::<32>(a, sh, h_funct6[0]);
+                        if h_is_vnclip {
+                            let cr: logic<33> = vnclip::<32>(a, sh, h_funct6[0], i_vxrm);
+                            vn_step[j*32+:32] = cr[31:0];
+                            if cr[32] {
+                                vnc_grp = 1'b1;
+                            }
+                        } else {
+                            vn_step[j*32+:32] = vnshift::<32>(a, sh, h_funct6[0]);
+                        }
                     }
                 }
             }
@@ -2044,7 +2117,9 @@ pub module vector_unit #(
     let cmp_wen: logic        = va_fire && h_is_cmp; // compare: write mask on last group only
     // V5a: running saturation including this group (seed 0 at group 0). The final
     // group's value rides the vu_cdb to OR into vxsat at commit.
-    let vxsat_now: logic = (if va_reg == 3'd0 ? 1'b0 : vxsat_acc) | vsat_grp;
+    // V5a/V5d: per-group saturation comes from satadd (vsat_grp) or vnclip (vnc_grp).
+    let vsat_step: logic = if h_is_vnclip ? vnc_grp : vsat_grp;
+    let vxsat_now: logic = (if va_reg == 3'd0 ? 1'b0 : vxsat_acc) | vsat_step;
 
     // Widening/narrowing pair a source register with two of the other side
     // (vw_src = va_reg>>1). Narrowing writes dest reg h_vd+vw_src on odd steps,
@@ -2054,13 +2129,13 @@ pub module vector_unit #(
     let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
-    assign o_vs1_addr    = if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narrow) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}))); // vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
+    assign o_vs1_addr    = if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}))); // vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
-    assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narrow ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narrow ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
-    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narrow ? {vn_step, vn_lo} : valu_res)))))))));
+    assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
+    assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narr ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
+    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : valu_res)))))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
@@ -2098,7 +2173,7 @@ pub module vector_unit #(
     // V5a: a retiring saturating op (final group) ORs its accrued saturation into
     // the vxsat CSR at commit.
     assign o_cdb_vxsat      = vxsat_now;
-    assign o_cdb_vxsat_wen  = va_fire && h_is_satadd;
+    assign o_cdb_vxsat_wen  = va_fire && (h_is_satadd || h_is_vnclip);
 
     // ---- FIFO maintenance + config update -----------------------------------
     let do_alloc: logic = i_alloc_en && has_free;
@@ -2348,13 +2423,13 @@ pub module vector_unit #(
             if h_is_cmp && (va_step || va_fire) {
                 va_acc = cmp_res;
             }
-            // V5a: accumulate the saturation across the EMUL groups (intermediate
-            // groups latch into vxsat_acc; the final group drives o_cdb_vxsat).
-            if h_is_satadd && va_step {
+            // V5a/V5d: accumulate the saturation across the EMUL groups / narrowing
+            // steps (intermediate ones latch vxsat_acc; the final drives o_cdb_vxsat).
+            if (h_is_satadd || h_is_vnclip) && va_step {
                 vxsat_acc = vxsat_now;
             }
             // Narrowing: latch the low-half result on each even source step.
-            if h_is_narrow && va_step && !va_reg[0] {
+            if h_is_narr && va_step && !va_reg[0] {
                 vn_lo = vn_step;
             }
             if va_step {

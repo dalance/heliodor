@@ -1994,6 +1994,53 @@ _start:
     vse8.v v8,(a2)
     lbu t5,0(a2); li t6,0xAB; bne t5,t6, fail249   # unchanged
 
+    # ===== V5d: narrowing clip vnclipu/vnclip (2*SEW -> SEW, round + saturate) =====
+    li   a0, 0x80012200   # source (2*SEW = e16)
+    li   a2, 0x80012280   # dst (SEW = e8)
+    csrwi vxrm, 0         # rnu
+
+    # vnclipu.wi shift=4 (unsigned): src e16 [0x00F8,0x1000,0x0044,0x0FFF].
+    li t1, 0x100000F8; sw t1, 0(a0)   # 0x00F8, 0x1000
+    li t1, 0x0FFF0044; sw t1, 4(a0)   # 0x0044, 0x0FFF
+    li t2,4; vsetvli t0,t2,e16,m1; vle16.v v4,(a0)
+    csrwi vxsat, 0
+    li t2,4; vsetvli t0,t2,e8,m1
+    vnclipu.wi v8,v4,4
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x10; bne t5,t6, fail250   # 248>>4=15.5 -> rnu 16
+    lbu t5,1(a2); li t6,0xFF; bne t5,t6, fail250   # 4096>>4=256 -> clip 255
+    lbu t5,2(a2); li t6,0x04; bne t5,t6, fail251   # 68>>4=4
+    lbu t5,3(a2); li t6,0xFF; bne t5,t6, fail251   # 4095>>4 round 256 -> clip 255
+    csrr t5, vxsat; li t6,1; bne t5,t6, fail252    # vxsat set (clipped)
+
+    # vnclip.wi shift=4 (signed): src e16 [-8, 2048, -2048, 2064].
+    li t1, 0x0800FFF8; sw t1, 0(a0)   # 0xFFF8(-8), 0x0800(2048)
+    li t1, 0x0810F800; sw t1, 4(a0)   # 0xF800(-2048), 0x0810(2064)
+    li t2,4; vsetvli t0,t2,e16,m1; vle16.v v4,(a0)
+    csrwi vxsat, 0
+    li t2,4; vsetvli t0,t2,e8,m1
+    vnclip.wi v8,v4,4
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x00; bne t5,t6, fail253   # -8>>4=-0.5 -> rnu 0
+    lbu t5,1(a2); li t6,0x7F; bne t5,t6, fail253   # 2048>>4=128 -> clip MAX 127
+    lbu t5,2(a2); li t6,0x80; bne t5,t6, fail254   # -2048>>4=-128 (in range)
+    lbu t5,3(a2); li t6,0x7F; bne t5,t6, fail254   # 2064>>4=129 -> clip MAX 127
+    csrr t5, vxsat; li t6,1; bne t5,t6, fail255    # vxsat set
+
+    # vnclip.wx shift=8 (signed, scalar) — no saturation, vxsat stays 0.
+    li t1, 0xFF000100; sw t1, 0(a0)   # 0x0100(256), 0xFF00(-256)
+    li t1, 0x7F000200; sw t1, 4(a0)   # 0x0200(512), 0x7F00(32512)
+    li t2,4; vsetvli t0,t2,e16,m1; vle16.v v4,(a0)
+    csrwi vxsat, 0
+    li t2,4; vsetvli t0,t2,e8,m1
+    li t1, 8; vnclip.wx v8,v4,t1
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x01; bne t5,t6, fail256   # 256>>8=1
+    lbu t5,1(a2); li t6,0xFF; bne t5,t6, fail256   # -256>>8=-1
+    lbu t5,2(a2); li t6,0x02; bne t5,t6, fail257   # 512>>8=2
+    lbu t5,3(a2); li t6,0x7F; bne t5,t6, fail257   # 32512>>8=127 (in range)
+    csrr t5, vxsat; bne t5, x0, fail257            # vxsat stays 0 (no clip)
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -2246,3 +2293,11 @@ fail246: li t0,246; sw t0,0(t3); 2460: j 2460b
 fail247: li t0,247; sw t0,0(t3); 2470: j 2470b
 fail248: li t0,248; sw t0,0(t3); 2480: j 2480b
 fail249: li t0,249; sw t0,0(t3); 2490: j 2490b
+fail250: li t0,250; sw t0,0(t3); 2500: j 2500b
+fail251: li t0,251; sw t0,0(t3); 2510: j 2510b
+fail252: li t0,252; sw t0,0(t3); 2520: j 2520b
+fail253: li t0,253; sw t0,0(t3); 2530: j 2530b
+fail254: li t0,254; sw t0,0(t3); 2540: j 2540b
+fail255: li t0,255; sw t0,0(t3); 2550: j 2550b
+fail256: li t0,256; sw t0,0(t3); 2560: j 2560b
+fail257: li t0,257; sw t0,0(t3); 2570: j 2570b
