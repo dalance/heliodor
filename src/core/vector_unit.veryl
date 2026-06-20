@@ -831,6 +831,7 @@ pub module vector_unit #(
     var fault_q   : logic    ; // the op faulted at vstart_q
     var fault_va_q: logic<64>;
     var vstart_q  : logic<8> ;
+    var seg_field : logic<3> ; // V5j segment: current field (0 .. nf), outer loop
 
     // ---- V2d arithmetic register-group iteration (LMUL>1) -------------------
     // Same-width ALU/merge/mul-div span EMUL = LMUL destination registers; the
@@ -1004,6 +1005,13 @@ pub module vector_unit #(
     // (like unit-stride). Disjoint from indexed (inst[26]=1) and unit-stride
     // family (inst[27]=0).
     let h_is_strided : logic    = h_is_mem && h_instr[27] && !h_instr[26];
+    // V5j segment: unit-stride family (mop=00, lumop=00000) with nf>0. Each
+    // element is a struct of NF = nf+1 fields; field f of element i lives at
+    // base + (i*NF + f)*EEW and lands in register vd+f, element i. Walked
+    // field-outer / element-inner so each field register fills as a stride-NF*EEW
+    // strided load (reusing the unit-stride per-register accumulate). LMUL=1.
+    let h_is_segment : logic    = h_is_mem && (h_instr[27:26] == 2'b00) && (h_lumop == 5'b00000) && (h_nf != 3'd0);
+    let seg_nf1      : logic<8> = {5'd0, h_nf} + 8'd1; // NF = nf+1 ∈ {2..8}
     // V3a/V3b/V3c vector FP arithmetic (OPFVV .vv / OPFVF .vf). .vf (funct3=101)
     // takes its second operand from the FP scalar f[rs1]. The reverse .vf forms
     // vfrsub.vf (100111 = f[rs1]-vs2) and vfrdiv.vf (100001 = f[rs1]/vs2) swap
@@ -1800,8 +1808,10 @@ pub module vector_unit #(
     // source register h_vd+mem_reg element by element.
     let mem_epr8   : logic<8>     = 8'd16 >> data_eew_log;        // data elements per 128b register
     let epr_shift  : logic<3>     = 3'd4 - {1'b0, data_eew_log};  // log2(mem_epr)
-    let mem_reg    : logic<8>     = velem >> epr_shift;        // data register index (0 .. EMUL-1)
-    let mem_local  : logic<8>     = velem & (mem_epr8 - 8'd1); // element within the data register
+    // Segment: register = field (vd + seg_field), in-register offset = velem
+    // (each field register holds vl elements). Other modes: LMUL>1 register span.
+    let mem_reg    : logic<8>     = if h_is_segment ? {5'd0, seg_field} : (velem >> epr_shift); // data register index
+    let mem_local  : logic<8>     = if h_is_segment ? velem : (velem & (mem_epr8 - 8'd1));      // element within the data register
     let mem_reg_vrf: logic<VRF_W> = h_vd + mem_reg[VRF_W - 1:0];
     // Indexed addressing: the per-element byte offset is vs2[velem] read at the
     // INDEX EEW (instruction width field, h_eew_log). The index vector spans its
@@ -1835,7 +1845,9 @@ pub module vector_unit #(
     // Plus dword / in-register bit offsets (data geometry).
     let velem64     : logic<64> = {56'd0, velem};
     let stride_off  : logic<64> = i_scalar2_data * velem64; // low 64 bits (wrap-around correct)
-    let m_vaddr     : logic<64> = if h_is_indexed ? (m_base + idx_val) : (if h_is_strided ? (m_base + stride_off) : (m_base + ({56'd0, velem} << data_eew_log)));
+    // Segment linear element index: velem*NF + seg_field (field-outer walk).
+    let seg_lin     : logic<64> = (velem64 * {56'd0, seg_nf1}) + {61'd0, seg_field};
+    let m_vaddr     : logic<64> = if h_is_indexed ? (m_base + idx_val) : (if h_is_strided ? (m_base + stride_off) : (if h_is_segment ? (m_base + (seg_lin << data_eew_log)) : (m_base + ({56'd0, velem} << data_eew_log))));
     let m_byteoff   : logic<3>  = m_vaddr[2:0];
     let m_byteshift : logic<6>  = {m_byteoff, 3'b000};         // *8 → bit offset in dword
     let elem_shamt  : logic<3>  = 3'd3 + {1'b0, data_eew_log}; // log2(data EEW in bits)
@@ -2358,6 +2370,7 @@ pub module vector_unit #(
             vl_q    = 64'd0;
             mem_state  = 2'd0;
             velem      = 8'd0;
+            seg_field  = 3'd0;
             vacc       = {1'b0 repeat VLEN};
             fault_q    = 1'b0;
             fault_va_q = 64'd0;
@@ -2412,9 +2425,10 @@ pub module vector_unit #(
                 2'd0: {
                     // IDLE: launch when a mem op is the ROB head with its base ready.
                     if (count != 0) && at_head && h_is_mem && scalar_ok {
-                        velem   = 8'd0;
-                        vacc    = {1'b0 repeat VLEN};
-                        fault_q = 1'b0;
+                        velem     = 8'd0;
+                        seg_field = 3'd0;
+                        vacc      = {1'b0 repeat VLEN};
+                        fault_q   = 1'b0;
                         if m_vl8 == 8'd0 {
                             mem_state = 2'd3; // empty op: nothing to access
                         } else {
@@ -2444,7 +2458,14 @@ pub module vector_unit #(
                             vacc = if reg_last ? {1'b0 repeat VLEN} : ld_write;
                         }
                         if velem + 8'd1 >= m_vl8 {
-                            mem_state = 2'd3;
+                            // Field complete. For a segment op, advance to the next
+                            // field's element 0 (field-outer walk); otherwise done.
+                            if h_is_segment && (seg_field != h_nf) {
+                                seg_field = seg_field + 3'd1;
+                                velem     = 8'd0;
+                            } else {
+                                mem_state = 2'd3;
+                            }
                         } else {
                             velem = velem + 8'd1;
                         }
