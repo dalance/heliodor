@@ -832,6 +832,12 @@ pub module vector_unit #(
     var fault_va_q: logic<64>;
     var vstart_q  : logic<8> ;
     var seg_field : logic<3> ; // V5j segment: current field (0 .. nf), outer loop
+    // V6 vleff (fault-only-first): when an element > 0 of a vle<eew>ff.v would
+    // fault, the op does NOT trap — vl is trimmed to that element index (only the
+    // fault-free prefix is loaded) and execution continues. ff_trim_q marks such
+    // a retiring vleff; ff_vl_q carries the trimmed vl (= the faulting element).
+    var ff_trim_q : logic    ;
+    var ff_vl_q   : logic<8> ;
 
     // ---- V2d arithmetic register-group iteration (LMUL>1) -------------------
     // Same-width ALU/merge/mul-div span EMUL = LMUL destination registers; the
@@ -1012,6 +1018,10 @@ pub module vector_unit #(
     // strided load (reusing the unit-stride per-register accumulate). LMUL=1.
     let h_is_segment : logic    = h_is_mem && (h_instr[27:26] == 2'b00) && (h_lumop == 5'b00000) && (h_nf != 3'd0);
     let seg_nf1      : logic<8> = {5'd0, h_nf} + 8'd1; // NF = nf+1 ∈ {2..8}
+    // V6 fault-only-first (vle<eew>ff.v): unit-stride family, lumop = 10000, load
+    // only. Addressing / element packing / evl (= vl) are identical to unit-stride;
+    // the only difference is the fault response (trim vl instead of trapping).
+    let h_is_ff      : logic    = h_is_vle && (h_lumop == 5'b10000);
     // V3a/V3b/V3c vector FP arithmetic (OPFVV .vv / OPFVF .vf). .vf (funct3=101)
     // takes its second operand from the FP scalar f[rs1]. The reverse .vf forms
     // vfrsub.vf (100111 = f[rs1]-vs2) and vfrdiv.vf (100001 = f[rs1]/vs2) swap
@@ -2242,6 +2252,10 @@ pub module vector_unit #(
     let va_step : logic = va_run && !va_last;              // intermediate group (no CDB)
     // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
     let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
+    // A retiring vleff that trimmed vl writes the new vl at commit. It reuses the
+    // vset writeback path (sh_vset / o_commit_vtype/vl in the ROB → CSR), carrying
+    // the unchanged vtype (vtype_q) and the trimmed vl (ff_vl_q).
+    let ff_trim_retire: logic = mem_cdb_fire && ff_trim_q;
     // FP arithmetic (vfadd/...) streams through its own element-serial FSM,
     // also retiring from DONE (fp_cdb_fire, defined with the FP datapath above).
     let vu_pop      : logic = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
@@ -2250,6 +2264,13 @@ pub module vector_unit #(
     let mem_fault_now: logic = (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st);
     let mem_elem_done: logic = (mem_state == 2'd2) && ((m_active && i_mem_ready && !mem_fault_now) || !m_active);
     let mem_ld_wr    : logic = mem_elem_done && h_is_vle && reg_last;
+    // vleff trim write: the faulting element ends the load mid-register, so the
+    // current register's fault-free prefix (in vacc, elements [reg_base, velem))
+    // must be committed now. Only when mem_local != 0 (the partial register holds
+    // at least one loaded element); a fault exactly at a register boundary leaves
+    // the (entirely-tail) register untouched, matching the unit-stride convention.
+    let mem_trim_wr  : logic = (mem_state == 2'd2) && m_active && mem_fault_now && h_is_ff && (velem != 8'd0) && (mem_local != 8'd0);
+    let mem_wr_data  : logic<VLEN> = if mem_trim_wr ? vacc : ld_write;
 
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : if h_is_vfmv_fs ? fp_mv_res : if h_is_vcpop ? vcpop_res : 64'd0;
     // vfmv.s.f writes vd[0] in the (single-cycle) fire path; suppress the write
@@ -2284,8 +2305,8 @@ pub module vector_unit #(
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
-    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narr ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
-    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? ld_write : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : valu_res)))))))));
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narr ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || mem_trim_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
+    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? mem_wr_data : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : valu_res)))))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
@@ -2293,9 +2314,9 @@ pub module vector_unit #(
     assign o_cdb_pdst     = h_rd_pd;
     assign o_cdb_data     = h_cdb_data;
     assign o_cdb_rob_idx  = h_rob;
-    assign o_cdb_vset_wen = fire && h_is_vset;
-    assign o_cdb_vtype    = vtype_new;
-    assign o_cdb_vl       = vl_new;
+    assign o_cdb_vset_wen = (fire && h_is_vset) || ff_trim_retire;
+    assign o_cdb_vtype    = if ff_trim_retire ? vtype_q : vtype_new;
+    assign o_cdb_vl       = if ff_trim_retire ? {56'd0, ff_vl_q} : vl_new;
 
     // ---- Memory port outputs (V1 unit-stride) -------------------------------
     assign o_mem_port_req  = (mem_state == 2'd1) || (mem_state == 2'd2);
@@ -2375,6 +2396,8 @@ pub module vector_unit #(
             fault_q    = 1'b0;
             fault_va_q = 64'd0;
             vstart_q   = 8'd0;
+            ff_trim_q  = 1'b0;
+            ff_vl_q    = 8'd0;
             va_reg     = 3'd0;
             va_acc     = {1'b0 repeat VLEN};
             vxsat_acc  = 1'b0;
@@ -2402,6 +2425,7 @@ pub module vector_unit #(
             vl_q       = i_csr_vl;
             mem_state  = 2'd0;
             fault_q    = 1'b0;
+            ff_trim_q  = 1'b0;
             va_reg     = 3'd0;
             va_acc     = {1'b0 repeat VLEN};
             vn_lo      = 64'd0;
@@ -2429,6 +2453,7 @@ pub module vector_unit #(
                         seg_field = 3'd0;
                         vacc      = {1'b0 repeat VLEN};
                         fault_q   = 1'b0;
+                        ff_trim_q = 1'b0;
                         if m_vl8 == 8'd0 {
                             mem_state = 2'd3; // empty op: nothing to access
                         } else {
@@ -2445,10 +2470,21 @@ pub module vector_unit #(
                 2'd2: {
                     // ACCESS: process element velem (active → drive the port).
                     if m_active && mem_fault_now {
-                        fault_q    = 1'b1;
-                        fault_va_q = m_vaddr;
-                        vstart_q   = velem;
-                        mem_state  = 2'd3;
+                        if h_is_ff && (velem != 8'd0) {
+                            // Fault-only-first: an element > 0 faulted. Trim vl to
+                            // this element (the fault-free prefix [0, velem) stays
+                            // loaded — its partial register is written this cycle via
+                            // mem_trim_wr) and retire WITHOUT a trap.
+                            ff_trim_q = 1'b1;
+                            ff_vl_q   = velem;
+                            mem_state = 2'd3;
+                        } else {
+                            // vle/vse fault, or vleff faulting on element 0: trap.
+                            fault_q    = 1'b1;
+                            fault_va_q = m_vaddr;
+                            vstart_q   = velem;
+                            mem_state  = 2'd3;
+                        }
                     } else if (m_active && i_mem_ready) || !m_active {
                         // Element processed (active completed, or masked-off skip).
                         // Loads accumulate into vacc; at a register boundary the
@@ -2603,6 +2639,10 @@ pub module vector_unit #(
                 if fire && h_is_vset {
                     vtype_q = vtype_new;
                     vl_q    = vl_new;
+                } else if ff_trim_retire {
+                    // vleff trimmed vl: update the VU's working copy so younger
+                    // vector ops (popped after this) see the new vl immediately.
+                    vl_q = {56'd0, ff_vl_q};
                 }
             }
             // Allocate at the tail.
