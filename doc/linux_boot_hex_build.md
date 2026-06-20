@@ -189,3 +189,109 @@ Update the address in `test/c/linux_boot_fw.S` and rebuild firmware hex (Step 3)
 - The kernel `.config` is NOT committed to the repo. Back it up separately.
 - `linux_dram_real.hex` is ~11 MB and committed to `test/hex/`.
 - DRAM size (32MB) must match DTS `reg` field and test harness array size.
+
+## V-enabled kernel build (CONFIG_RISCV_ISA_V) — toolchain version pitfalls
+
+Building a `CONFIG_RISCV_ISA_V=y` kernel (e.g. the `test_soc_linux_boot_71v`
+gold-standard vector boot) needs THREE toolchain capabilities that, in this
+environment, NO single toolchain provides — so the build mixes two toolchains
+and patches two kernel Kconfig lines. This is the recurring trial-and-error; use
+the recipe + symptom table below to skip straight to the answer. Tool *versions*
+and *prefixes* are given (they matter); absolute install paths are environment-
+specific and intentionally omitted — locate them with `which` / by `--version`.
+
+### The conflict
+
+Two relevant toolchain families:
+- **bare-metal** `riscv64-unknown-elf-*` — newer (gcc 14.2 / **binutils 2.43**).
+- **linux-gnu** `riscv64-unknown-linux-gnu-*` — older (gcc 11.1 / **binutils 2.37**).
+
+| Capability needed | elf 2.43 | linux-gnu 2.37 |
+|---|---|---|
+| Assemble RVV 1.0 (`vsetvli`, `vle8ff.v`, …) — needs binutils ≥ 2.38 | ✅ | ❌ (`unrecognized opcode`) |
+| Link the vDSO shared object (`ld -shared`) | ❌ `-shared not supported` (newlib elf target) | ✅ |
+| Kconfig `TOOLCHAIN_HAS_V` gate `LD_VERSION >= 23800` (ld ≥ 2.38) | ✅ | ❌ |
+
+The vector *instructions* are turned into bytes by `as` (so **CC** must be the
+2.43 elf gcc); the *linker* only sees them as opcode bytes, so **LD** can be the
+2.37 linux-gnu ld — and it is the only one here that can `-shared`-link the vDSO.
+
+### Recipe
+
+1. **Mixed toolchain**: build with `CROSS_COMPILE=<elf-prefix>-` (so cc/as/objcopy/
+   ar/nm are the elf 2.43 tools) but override **`LD=<linux-gnu-ld>`** (the only
+   `-shared`-capable linker). I.e. `make ARCH=riscv CROSS_COMPILE=riscv64-unknown-elf- LD=<…linux-gnu-ld> …`.
+
+2. **`KCFLAGS=-mno-relax KAFLAGS=-mno-relax`**. as 2.43 emits `R_RISCV_ALIGN`
+   relaxation relocs that ld 2.37 cannot relax; they survive into the vDSO and the
+   `dynamic relocations are not supported` check deletes `vdso.so.dbg`. `-mno-relax`
+   stops them being emitted. Safe: vmlinux already links with `--no-relax`.
+
+3. **Disable the getrandom vDSO.** gcc 14 lowers struct copies in the getrandom
+   vDSO glue to external `memcpy` calls → `R_RISCV_JUMP_SLOT memcpy` dynamic reloc
+   → the same vDSO check fails. It is auto-`select`ed, so gate it off in
+   `arch/riscv/Kconfig`: append `&& BROKEN` to
+   `select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT`, then `make olddefconfig`.
+
+4. **Relax the `TOOLCHAIN_HAS_V` LD-version gate.** In `arch/riscv/Kconfig`,
+   `config TOOLCHAIN_HAS_V` carries `depends on LD_IS_LLD || LD_VERSION >= 23800`.
+   With the 2.37 linux-gnu LD this is false, so `olddefconfig` silently DROPS
+   `CONFIG_RISCV_ISA_V` (which `depends on TOOLCHAIN_HAS_V`) — the build then has NO
+   vector support even though `.config` looked right earlier. Remove that
+   `depends on` line, re-run `make olddefconfig` (with the same `LD=`), and confirm
+   both `CONFIG_RISCV_ISA_V=y` in `.config` AND `#define CONFIG_RISCV_ISA_V 1` in
+   `include/generated/autoconf.h`.
+
+Then `make … CROSS_COMPILE LD KCFLAGS KAFLAGS Image`. For a *usable* userspace
+vector path also set `CONFIG_RISCV_ISA_V_DEFAULT_ENABLE=y`, and advertise `v` in
+the DT (both `riscv,isa` and `riscv,isa-extensions`).
+
+### Symptom → cause
+
+| Build / boot symptom | Cause / fix |
+|---|---|
+| `ld: -shared not supported` at the `VDSOLD` step | LD is a bare-metal `*-elf-ld`; override `LD=` with a `*-linux-gnu-ld` (step 1). |
+| `vdso.so.dbg: dynamic relocations are not supported` | `R_RISCV_ALIGN` (as/ld relax mismatch → step 2) or `R_RISCV_JUMP_SLOT memcpy` (getrandom vDSO → step 3). Identify with `readelf -rW vdso.so.dbg`. |
+| `__vdso_rt_sigreturn_offset undeclared` in `signal.c` (incremental build) | `include/generated/vdso-offsets.h` is empty because the vDSO failed to (re)build — fix the vDSO link first (steps 2–3), don't chase signal.c. |
+| Kernel boots but `riscv: base ISA extensions acdfim` (no `v`) and userspace dies `unhandled signal 4` (SIGILL) at the first vector insn | `CONFIG_RISCV_ISA_V` got dropped (TOOLCHAIN_HAS_V failed the LD-version gate, step 4). Verify `autoconf.h` has `CONFIG_RISCV_ISA_V 1`. The DT `v` is parsed but `riscv_ext_vector_float_validate` rejects it whenever `!IS_ENABLED(CONFIG_RISCV_ISA_V)`. |
+
+> The Kconfig edits (steps 3–4) are workarounds for THIS toolchain pairing, not
+> upstream-correct changes — keep them local to the kernel build tree (they live
+> outside the heliodor repo, under the gitignored kernel source).
+
+### Userspace vector /init + test assets
+
+`test/c/linux_init_vec.c` is the V-boot `/init`: it runs a userspace RVV self-test
+(`vsetvli` + `vle32` + `vadd.vv` + `vmul.vx` + `vse32`, results verified) and only
+issues `reboot(POWER_OFF)` if the vector results are correct — so the boot reaching
+SBI shutdown (`x3 == 0xAA`) proves the VU works end-to-end under Linux (first-use
+trap → lazy enable → context save/restore across syscalls). Build it freestanding
+with the V march **and `-mno-relax`**:
+
+```bash
+riscv64-unknown-elf-gcc -nostdlib -nostartfiles -Ttext=0x10000 \
+    -march=rv64gcv -mabi=lp64d -O2 -mno-relax -o <initramfs>/init test/c/linux_init_vec.c
+```
+
+`-mno-relax` is REQUIRED: without it the linker relaxes the static-array addresses
+(`va`/`vb`/`vc`) to **gp-relative** (`addi a6, gp, …`), but a `-nostartfiles` binary
+never initializes `gp`, so the `vse32` store lands at `gp(0) + offset` → store page
+fault (SIGSEGV, `badaddr` near `0xffff…`). `-mno-relax` keeps PC-relative addressing.
+
+Then rebuild the embedded cpio and re-link the kernel (the cpio is embedded via
+`CONFIG_INITRAMFS_SOURCE`, so the init change needs a kernel re-link, not a full
+rebuild), and assemble the hex like `mkhex71.py` but with the V DTB:
+
+- DT: `test/c/heliodor_71v.dts` (adds `v` to `riscv,isa` + `riscv,isa-extensions`).
+- Firmware: `test/c/linux_boot_fw.S` with `-DDTB_ADDR=0x80300000 -DHART_LOTTERY_PA=<hart_lottery PA from System.map> -DRVA23_MENVCFG -DRVA23_ADUE` → `test/hex/linux_boot_fw_71v.hex`.
+- DRAM: V-kernel `Image` @ 0 + `heliodor_71v.dtb` @ `0x300000` → `test/hex/linux_dram_71v.hex`.
+- Test: `veryl test --ignored --test test_soc_linux_boot_71v` (expect `x3 == 0xAA`).
+
+### A heliodor bug this boot uncovered: sstatus.VS
+
+The first V-enabled boot SIGILL'd / panicked because heliodor's `SSTATUS_MASK`
+(`src/core/csr.veryl`) omitted the **VS field (bits 10:9)**, so Linux's
+`riscv_v_enable()` — a `csr_set(sstatus, SR_VS)` from S-mode — was silently dropped
+and vector could never be enabled in S-mode. The M-mode directed tests set
+`mstatus.VS` (a different write mask) and so never exercised this path. Fix: add
+`0x600` to `SSTATUS_MASK`. Inert at V=0 (VS stays 0 with no vector op).
