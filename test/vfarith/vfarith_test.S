@@ -2041,6 +2041,37 @@ _start:
     lbu t5,3(a2); li t6,0x7F; bne t5,t6, fail257   # 32512>>8=127 (in range)
     csrr t5, vxsat; bne t5, x0, fail257            # vxsat stays 0 (no clip)
 
+    # ===== V5e: fractional saturating multiply vsmul (signed Q(SEW-1)) =====
+    li   a0, 0x80012300   # a (vs2)
+    li   a1, 0x80012340   # b (vs1)
+    li   a2, 0x80012380   # dst
+    csrwi vxrm, 0         # rnu
+
+    # vsmul.vv (e8 Q7): a=[0.5,-1.0,~1,0.5] b=[0.5,-1.0,~1,-0.5].
+    li t1, 0x407F8040; sw t1, 0(a0)   # 0x40,0x80,0x7F,0x40
+    li t1, 0xC07F8040; sw t1, 0(a1)   # 0x40,0x80,0x7F,0xC0
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0); vle8.v v6,(a1)
+    csrwi vxsat, 0
+    vsmul.vv v8,v4,v6
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x20; bne t5,t6, fail258   # 0.5*0.5=0.25
+    lbu t5,1(a2); li t6,0x7F; bne t5,t6, fail258   # -1*-1=+1 -> sat MAX
+    lbu t5,2(a2); li t6,0x7E; bne t5,t6, fail259   # 127*127>>7=126
+    lbu t5,3(a2); li t6,0xE0; bne t5,t6, fail259   # 0.5*-0.5=-0.25
+    csrr t5, vxsat; li t6,1; bne t5,t6, fail260    # vxsat set (MIN*MIN)
+
+    # vsmul.vx (scalar = 0x40 = 0.5): a=[0.5,~1,-1.0,-0.5].
+    li t1, 0xC0807F40; sw t1, 0(a0)   # 0x40,0x7F,0x80,0xC0
+    li t2,4; vsetvli t0,t2,e8,m1; vle8.v v4,(a0)
+    csrwi vxsat, 0
+    li t1, 0x40; vsmul.vx v8,v4,t1
+    vse8.v v8,(a2)
+    lbu t5,0(a2); li t6,0x20; bne t5,t6, fail261   # 0.5*0.5=0.25
+    lbu t5,1(a2); li t6,0x40; bne t5,t6, fail261   # 127*64>>7=63.5 -> rnu 64
+    lbu t5,2(a2); li t6,0xC0; bne t5,t6, fail262   # -1.0*0.5=-0.5
+    lbu t5,3(a2); li t6,0xE0; bne t5,t6, fail262   # -0.5*0.5=-0.25
+    csrr t5, vxsat; bne t5, x0, fail263            # vxsat stays 0 (no sat)
+
     li   t0, 1
     sw   t0, 0(t3)
 0:  j    0b
@@ -2301,3 +2332,9 @@ fail254: li t0,254; sw t0,0(t3); 2540: j 2540b
 fail255: li t0,255; sw t0,0(t3); 2550: j 2550b
 fail256: li t0,256; sw t0,0(t3); 2560: j 2560b
 fail257: li t0,257; sw t0,0(t3); 2570: j 2570b
+fail258: li t0,258; sw t0,0(t3); 2580: j 2580b
+fail259: li t0,259; sw t0,0(t3); 2590: j 2590b
+fail260: li t0,260; sw t0,0(t3); 2600: j 2600b
+fail261: li t0,261; sw t0,0(t3); 2610: j 2610b
+fail262: li t0,262; sw t0,0(t3); 2620: j 2620b
+fail263: li t0,263; sw t0,0(t3); 2630: j 2630b
