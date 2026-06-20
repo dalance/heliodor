@@ -42,6 +42,11 @@ pub module vector_unit #(
     // No readiness tracking is needed — the VU runs at the ROB head, so f[rs1]'s
     // producer has committed and the value is in prf_fp.
     i_alloc_fscalar_pdst: input  logic         <PRF_W>,
+    // V5h: SECOND int scalar operand for strided ops (vlse/vsse stride = x[rs2]).
+    // The renamed rs2 physical reg, captured at alloc; read from prf_int at the
+    // ROB head. Like the FP .vf scalar, no readiness tracking — at the head the
+    // stride producer has committed and the value is in prf_int.
+    i_alloc_scalar2_pdst: input  logic         <PRF_W>,
     i_alloc_has_rd      : input  logic                , // writes a scalar rd (int or FP)
     i_alloc_rd_is_fp    : input  logic                , // the scalar rd is an FP reg (vfmv.f.s)
     i_alloc_rd_pdst     : input  logic         <PRF_W>,
@@ -64,6 +69,10 @@ pub module vector_unit #(
     // ---- FP PRF scalar read (combinational, at execute; V3b .vf ops) --------
     o_fscalar_pdst: output logic<PRF_W>,
     i_fscalar_data: input  logic<64>   ,
+
+    // ---- 2nd int PRF scalar read (combinational, at head; V5h strided stride)
+    o_scalar2_pdst: output logic<PRF_W>,
+    i_scalar2_data: input  logic<64>   ,
 
     // ---- VRF interface (combinational read, registered write) ---------------
     // Four read ports: vs1, vs2, mask (always v0), old-vd (for vta/vma merge).
@@ -798,6 +807,7 @@ pub module vector_unit #(
     var fifo_s_pdst: logic         <PRF_W> [FIFO_N];
     var fifo_s_rdy : logic                 [FIFO_N];
     var fifo_fs_pd : logic         <PRF_W> [FIFO_N]; // V3b: FP scalar pdst (.vf)
+    var fifo_s2_pd : logic         <PRF_W> [FIFO_N]; // V5h: 2nd int scalar pdst (strided stride)
     var fifo_has_rd: logic                 [FIFO_N];
     var fifo_rd_fp : logic                 [FIFO_N]; // V3f: scalar rd is FP (vfmv.f.s)
     var fifo_rd_pd : logic         <PRF_W> [FIFO_N];
@@ -885,6 +895,7 @@ pub module vector_unit #(
     let h_s_pdst: logic     <PRF_W> = fifo_s_pdst[head];
     let h_s_rdy : logic             = fifo_s_rdy[head];
     let h_fs_pd : logic     <PRF_W> = fifo_fs_pd[head]; // V3b FP scalar pdst
+    let h_s2_pd : logic     <PRF_W> = fifo_s2_pd[head]; // V5h 2nd int scalar pdst (stride)
     let h_has_rd: logic             = fifo_has_rd[head];
     let h_rd_fp : logic             = fifo_rd_fp[head]; // V3f scalar rd is FP
     let h_rd_pd : logic     <PRF_W> = fifo_rd_pd[head];
@@ -988,6 +999,11 @@ pub module vector_unit #(
     // field is the INDEX EEW; the data EEW is SEW (vtype). Each element's address
     // is base + vs2[i] (a per-element gather/scatter).
     let h_is_indexed : logic    = h_is_mem && h_instr[26];
+    // V5h strided: mop = 10 (inst[27]=1, inst[26]=0). The per-element byte stride
+    // is x[rs2] (the 2nd int scalar, i_scalar2_data); data EEW is the width field
+    // (like unit-stride). Disjoint from indexed (inst[26]=1) and unit-stride
+    // family (inst[27]=0).
+    let h_is_strided : logic    = h_is_mem && h_instr[27] && !h_instr[26];
     // V3a/V3b/V3c vector FP arithmetic (OPFVV .vv / OPFVF .vf). .vf (funct3=101)
     // takes its second operand from the FP scalar f[rs1]. The reverse .vf forms
     // vfrsub.vf (100111 = f[rs1]-vs2) and vfrdiv.vf (100001 = f[rs1]/vs2) swap
@@ -1806,9 +1822,13 @@ pub module vector_unit #(
     let m_vl8    : logic<8> = if h_is_wholereg ? (wr_nreg8 * mem_epr8) : (if h_is_maskmem ? ((vl_q[7:0] + 8'd7) >> 3) : vl_q[7:0]);
     // This element completes its register (last in-register element, or last vl).
     let reg_last : logic = ((mem_local + 8'd1) >= mem_epr8) || ((velem + 8'd1) >= m_vl8);
-    // Element byte address: indexed = base + vs2[velem]; contiguous modes =
-    // base + velem*EEW. Plus dword / in-register bit offsets (data geometry).
-    let m_vaddr     : logic<64> = if h_is_indexed ? (m_base + idx_val) : (m_base + ({56'd0, velem} << data_eew_log));
+    // Element byte address: indexed = base + vs2[velem]; strided = base +
+    // velem*stride (x[rs2], signed byte stride — the low 64 bits of the product
+    // are correct for wrap-around); unit-stride/whole-reg/mask = base + velem*EEW.
+    // Plus dword / in-register bit offsets (data geometry).
+    let velem64     : logic<64> = {56'd0, velem};
+    let stride_off  : logic<64> = i_scalar2_data * velem64; // low 64 bits (wrap-around correct)
+    let m_vaddr     : logic<64> = if h_is_indexed ? (m_base + idx_val) : (if h_is_strided ? (m_base + stride_off) : (m_base + ({56'd0, velem} << data_eew_log)));
     let m_byteoff   : logic<3>  = m_vaddr[2:0];
     let m_byteshift : logic<6>  = {m_byteoff, 3'b000};         // *8 → bit offset in dword
     let elem_shamt  : logic<3>  = 3'd3 + {1'b0, data_eew_log}; // log2(data EEW in bits)
@@ -2239,6 +2259,7 @@ pub module vector_unit #(
     let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
+    assign o_scalar2_pdst = h_s2_pd; // V5h strided stride: prf_int 2nd read address
     assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
@@ -2317,6 +2338,7 @@ pub module vector_unit #(
                 fifo_uses_s[i] = 1'b0;
                 fifo_s_pdst[i] = 6'd0;
                 fifo_fs_pd[i]  = 6'd0;
+                fifo_s2_pd[i]  = 6'd0;
                 fifo_s_rdy[i]  = 1'b0;
                 fifo_has_rd[i] = 1'b0;
                 fifo_rd_fp[i]  = 1'b0;
@@ -2566,6 +2588,7 @@ pub module vector_unit #(
                 fifo_uses_s[tail] = i_alloc_uses_scalar;
                 fifo_s_pdst[tail] = i_alloc_scalar_pdst;
                 fifo_fs_pd[tail]  = i_alloc_fscalar_pdst; // V3b FP scalar (.vf)
+                fifo_s2_pd[tail]  = i_alloc_scalar2_pdst; // V5h strided stride (x[rs2])
                 fifo_has_rd[tail] = i_alloc_has_rd;
                 fifo_rd_fp[tail]  = i_alloc_rd_is_fp;
                 fifo_rd_pd[tail]  = i_alloc_rd_pdst;
