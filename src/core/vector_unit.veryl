@@ -982,6 +982,12 @@ pub module vector_unit #(
     let h_nf         : logic<3> = h_instr[31:29];
     let h_is_wholereg: logic    = h_is_mem && (h_lumop == 5'b01000);
     let h_is_maskmem : logic    = h_is_mem && (h_lumop == 5'b01011);
+    // V5g indexed gather/scatter: mop (inst[27:26]) 01 (unordered) / 11 (ordered)
+    // — both serialize identically in the in-order VU. inst[24:20] is the index
+    // vector vs2 (read on the otherwise-free vs1 port). The instruction width
+    // field is the INDEX EEW; the data EEW is SEW (vtype). Each element's address
+    // is base + vs2[i] (a per-element gather/scatter).
+    let h_is_indexed : logic    = h_is_mem && h_instr[26];
     // V3a/V3b/V3c vector FP arithmetic (OPFVV .vv / OPFVF .vf). .vf (funct3=101)
     // takes its second operand from the FP scalar f[rs1]. The reverse .vf forms
     // vfrsub.vf (100111 = f[rs1]-vs2) and vfrdiv.vf (100001 = f[rs1]/vs2) swap
@@ -1746,13 +1752,18 @@ pub module vector_unit #(
     let m_base : logic<64>   = i_scalar_data;
     let m_mask : logic<VLEN> = i_mask_data;
     let m_vs3  : logic<VLEN> = i_vs2_data;
-    let eew_mask: logic<64> = case h_eew_log {
+    // Data element width. For indexed gather/scatter the element width is SEW
+    // (vtype) while the instruction width field gives the INDEX width; every
+    // other mode's data EEW is the width field (h_eew_log), so this is identical
+    // to h_eew_log unless indexed (keeps unit-stride/whole-reg/mask byte-exact).
+    let data_eew_log: logic<2> = if h_is_indexed ? vsew[1:0] : h_eew_log;
+    let eew_mask: logic<64> = case data_eew_log {
         2'd0   : 64'h0000_0000_0000_00ff,
         2'd1   : 64'h0000_0000_0000_ffff,
         2'd2   : 64'h0000_0000_ffff_ffff,
         default: 64'hffff_ffff_ffff_ffff,
     };
-    let eew_strb: logic<8> = case h_eew_log {
+    let eew_strb: logic<8> = case data_eew_log {
         2'd0   : 8'b0000_0001,
         2'd1   : 8'b0000_0011,
         2'd2   : 8'b0000_1111,
@@ -1764,11 +1775,30 @@ pub module vector_unit #(
     // it by elems-per-register (mem_epr = VLEN/EEW). Loads accumulate a register's
     // elements into vacc and write h_vd+mem_reg when it completes; stores read
     // source register h_vd+mem_reg element by element.
-    let mem_epr8   : logic<8>     = 8'd16 >> h_eew_log;        // elements per 128b register
-    let epr_shift  : logic<3>     = 3'd4 - {1'b0, h_eew_log};  // log2(mem_epr)
-    let mem_reg    : logic<8>     = velem >> epr_shift;        // register index (0 .. EMUL-1)
-    let mem_local  : logic<8>     = velem & (mem_epr8 - 8'd1); // element within the register
+    let mem_epr8   : logic<8>     = 8'd16 >> data_eew_log;        // data elements per 128b register
+    let epr_shift  : logic<3>     = 3'd4 - {1'b0, data_eew_log};  // log2(mem_epr)
+    let mem_reg    : logic<8>     = velem >> epr_shift;        // data register index (0 .. EMUL-1)
+    let mem_local  : logic<8>     = velem & (mem_epr8 - 8'd1); // element within the data register
     let mem_reg_vrf: logic<VRF_W> = h_vd + mem_reg[VRF_W - 1:0];
+    // Indexed addressing: the per-element byte offset is vs2[velem] read at the
+    // INDEX EEW (instruction width field, h_eew_log). The index vector spans its
+    // own register group (idx_reg / idx_local at the index EEW) and is read on the
+    // free vs1 port. Zero-extended (indices are unsigned byte offsets).
+    let idx_epr8   : logic<8>     = 8'd16 >> h_eew_log;
+    let idx_eprsh  : logic<3>     = 3'd4 - {1'b0, h_eew_log};
+    let idx_reg    : logic<8>     = velem >> idx_eprsh;
+    let idx_local  : logic<8>     = velem & (idx_epr8 - 8'd1);
+    let idx_shamt  : logic<3>     = 3'd3 + {1'b0, h_eew_log};
+    let idx_bitoff : logic<8>     = idx_local << idx_shamt;
+    let idx_reg_vrf: logic<VRF_W> = h_vs2 + idx_reg[VRF_W - 1:0];
+    let idx_eew_msk: logic<64>    = case h_eew_log {
+        2'd0   : 64'h0000_0000_0000_00ff,
+        2'd1   : 64'h0000_0000_0000_ffff,
+        2'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let idx_raw    : logic<VLEN>  = i_vs1_data >> idx_bitoff;
+    let idx_val    : logic<64>    = idx_raw[63:0] & idx_eew_msk;
     // Effective element count (evl). Unit-stride uses vl; whole-register transfers
     // NREG full registers (NREG * elems-per-register, independent of vl); mask
     // transfers ceil(vl/8) bytes (EEW=8 → elems-per-register handled as bytes).
@@ -1776,12 +1806,13 @@ pub module vector_unit #(
     let m_vl8    : logic<8> = if h_is_wholereg ? (wr_nreg8 * mem_epr8) : (if h_is_maskmem ? ((vl_q[7:0] + 8'd7) >> 3) : vl_q[7:0]);
     // This element completes its register (last in-register element, or last vl).
     let reg_last : logic = ((mem_local + 8'd1) >= mem_epr8) || ((velem + 8'd1) >= m_vl8);
-    // Element byte address (global velem) + dword / in-register bit offsets.
-    let m_vaddr     : logic<64> = m_base + ({56'd0, velem} << h_eew_log);
+    // Element byte address: indexed = base + vs2[velem]; contiguous modes =
+    // base + velem*EEW. Plus dword / in-register bit offsets (data geometry).
+    let m_vaddr     : logic<64> = if h_is_indexed ? (m_base + idx_val) : (m_base + ({56'd0, velem} << data_eew_log));
     let m_byteoff   : logic<3>  = m_vaddr[2:0];
-    let m_byteshift : logic<6>  = {m_byteoff, 3'b000};      // *8 → bit offset in dword
-    let elem_shamt  : logic<3>  = 3'd3 + {1'b0, h_eew_log}; // log2(EEW in bits)
-    let elem_bitoff : logic<8>  = mem_local << elem_shamt;  // in-register element bit offset
+    let m_byteshift : logic<6>  = {m_byteoff, 3'b000};         // *8 → bit offset in dword
+    let elem_shamt  : logic<3>  = 3'd3 + {1'b0, data_eew_log}; // log2(data EEW in bits)
+    let elem_bitoff : logic<8>  = mem_local << elem_shamt;     // in-register element bit offset
     // Mask: vm=1 unmasked; else v0[velem]. (Shift then bit0 — no dynamic select.)
     // Whole-register and mask transfers are always unmasked (every element active).
     let m_mask_sh: logic<VLEN> = m_mask >> velem;
@@ -2208,7 +2239,7 @@ pub module vector_unit #(
     let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
     assign o_scalar_pdst  = h_s_pdst;
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
-    assign o_vs1_addr    = if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg}))); // vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
+    assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
@@ -2232,7 +2263,7 @@ pub module vector_unit #(
     assign o_mem_vaddr     = m_vaddr;
     assign o_mem_is_load   = o_mem_active && h_is_vle;
     assign o_mem_is_store  = o_mem_active && h_is_vse;
-    assign o_mem_funct3    = {1'b0, h_eew_log};
+    assign o_mem_funct3    = {1'b0, data_eew_log};
     assign o_mem_wdata     = st_wd;
     assign o_mem_wstrb     = st_sb;
 
