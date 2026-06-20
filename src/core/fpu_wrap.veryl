@@ -63,6 +63,30 @@ pub module fpu_wrap #(
     // Resolve rounding mode: use frm CSR when instruction specifies DYN
     let fp_rm_resolved: logic<3> = if i_fp_rm == 3'b111 ? i_frm : i_fp_rm;
 
+    // FP→int round-up decision for the magnitude. `sign` is the source sign
+    // (so RDN/RUP can round the magnitude away/toward zero correctly), guard is
+    // the bit just below the integer LSB, sticky is the OR of all bits below
+    // guard, and lsb is the integer's least-significant bit (for RNE ties).
+    function fcvt_round_up (
+        rm    : input logic<3>,
+        sign  : input logic   ,
+        guard : input logic   ,
+        sticky: input logic   ,
+        lsbit : input logic   ,
+    ) -> logic {
+        var ret: logic;
+        case rm {
+            3'b000 : ret = guard && (sticky || lsbit); // RNE
+            3'b001 : ret = 1'b0;                        // RTZ
+            3'b010 : ret = sign && (guard || sticky); // RDN: toward -inf
+            3'b011 : ret = !sign && (guard || sticky); // RUP: toward +inf
+            3'b100 : ret = guard;                     // RMM: nearest, ties to max magnitude
+            default: ret = guard && (sticky || lsbit);
+        }
+        return ret;
+    }
+
+
     // NaN-boxing helpers for single-precision (use forwarded data)
     let fp_s1      : logic<32> = fwd_fp_rs1[31:0];
     let fp_s2      : logic<32> = fwd_fp_rs2[31:0];
@@ -682,6 +706,9 @@ pub module fpu_wrap #(
     // FP fflags selection (combinational) — selects the right submodule's
     // fflags based on the current fpu_op. FMIN/FMAX/FCMP synthesize NV
     // directly from operand classification.
+    // int→FP inexactness, computed alongside the value (reuses the rounding
+    // guard/round/sticky bits) and consumed by the fflags block to raise NX.
+    var cvt_int_nx     : logic    ;
     var fpu_fflags_comb: logic<5>;
     always_comb {
         fpu_fflags_comb = 5'd0;
@@ -985,6 +1012,13 @@ pub module fpu_wrap #(
             FpuOp::FCVT_D_H: fpu_fflags_comb = cvt_d_h_fl;
             FpuOp::FCVT_H_S: fpu_fflags_comb = cvt_h_s_fl;
             FpuOp::FCVT_H_D: fpu_fflags_comb = cvt_h_d_fl;
+            // int → FP: NX when the value path had to round (cvt_int_nx is set in
+            // the value always_comb from that op's guard/round/sticky bits).
+            FpuOp::FCVT_S_W, FpuOp::FCVT_S_WU, FpuOp::FCVT_S_L, FpuOp::FCVT_S_LU, FpuOp::FCVT_D_L, FpuOp::FCVT_D_LU: {
+                if cvt_int_nx {
+                    fpu_fflags_comb = 5'b00001;
+                }
+            }
             default: fpu_fflags_comb = 5'd0;
         }
     }
@@ -993,6 +1027,7 @@ pub module fpu_wrap #(
     var fpu_result: logic<64>;
     always_comb {
         fpu_result = 64'd0;
+        cvt_int_nx = 1'b0;
         case i_fpu_op {
             // FSGNJ: result sign = rs2 sign, magnitude = rs1
             FpuOp::FSGNJ_S : fpu_result = {32'hFFFFFFFF, s2_val[31], s1_val[30:0]};
@@ -1386,6 +1421,7 @@ pub module fpu_wrap #(
                     csw_r  = csw_norm[7];
                     csw_s  = csw_norm[6:0] != 7'd0;
                     csw_l  = csw_norm[9];
+                    cvt_int_nx = csw_g || csw_r || csw_s;
                     var csw_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : csw_ru = csw_g && (csw_r || csw_s || csw_l);
@@ -1428,6 +1464,7 @@ pub module fpu_wrap #(
                     cswu_r  = cswu_n[7];
                     cswu_s  = cswu_n[6:0] != 7'd0;
                     cswu_l  = cswu_n[9];
+                    cvt_int_nx = cswu_g || cswu_r || cswu_s;
                     var cswu_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : cswu_ru = cswu_g && (cswu_r || cswu_s || cswu_l);
@@ -1478,6 +1515,7 @@ pub module fpu_wrap #(
                     csl_r  = csl_sh[38];
                     csl_s  = csl_sh[37:0] != 38'd0;
                     csl_l  = csl_sh[40];
+                    cvt_int_nx = csl_g || csl_r || csl_s;
                     var csl_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : csl_ru = csl_g && (csl_r || csl_s || csl_l);
@@ -1520,6 +1558,7 @@ pub module fpu_wrap #(
                     cslu_r  = cslu_sh[38];
                     cslu_s  = cslu_sh[37:0] != 38'd0;
                     cslu_l  = cslu_sh[40];
+                    cvt_int_nx = cslu_g || cslu_r || cslu_s;
                     var cslu_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : cslu_ru = cslu_g && (cslu_r || cslu_s || cslu_l);
@@ -1560,12 +1599,24 @@ pub module fpu_wrap #(
                     fws_sig = {1'b1, fws_m};
                     var fws_abs: logic<32>;
                     if fws_e >: 8'd150 {
-                        // Left-shift case (e in (150, 158)): 2^24..2^31
+                        // Left-shift case (e in (150, 158)): 2^24..2^31 — exact,
+                        // no fraction bits, so no rounding.
                         let fws_ls : logic<8> = fws_e - 8'd150;
                         fws_abs = {8'd0, fws_sig} << fws_ls[4:0];
                     } else {
-                        let fws_rs : logic<8> = 8'd150 - fws_e;
-                        fws_abs = {8'd0, fws_sig} >> fws_rs[4:0];
+                        // Right-shift case (e in [127,150]): |x| < 2^24, so the
+                        // rounded magnitude can never overflow int32. Round the
+                        // dropped fraction bits per the active rounding mode
+                        // instead of truncating (RTZ).
+                        let fws_rs  : logic<8>  = 8'd150 - fws_e;
+                        let fws_tr  : logic<32> = {8'd0, fws_sig} >> fws_rs[4:0];
+                        let fws_rsm1: logic<8>  = fws_rs - 8'd1;
+                        let fws_gm  : logic<24> = if fws_rs == 8'd0 ? 24'd0 : 24'd1 << fws_rsm1[4:0];
+                        let fws_sm  : logic<24> = if fws_rs == 8'd0 ? 24'd0 : (24'd1 << fws_rsm1[4:0]) - 24'd1;
+                        let fws_g   : logic     = (fws_sig & fws_gm) != 24'd0;
+                        let fws_st  : logic     = (fws_sig & fws_sm) != 24'd0;
+                        let fws_ru  : logic     = fcvt_round_up(fp_rm_resolved, s1_val[31], fws_g, fws_st, fws_tr[0]);
+                        fws_abs = fws_tr + {31'd0, fws_ru};
                     }
                     var fws_r32: logic<32>;
                     fws_r32 = fws_abs;
@@ -1591,12 +1642,20 @@ pub module fpu_wrap #(
                     fwus_sig = {1'b1, fwus_m};
                     var fwus_abs: logic<32>;
                     if fwus_e >: 8'd150 {
-                        // Left-shift: 2^31 <= value < 2^32.
+                        // Left-shift: 2^31 <= value < 2^32 — exact.
                         let ls      : logic<8> = fwus_e - 8'd150;
                         fwus_abs = {8'd0, fwus_sig} << ls[4:0];
                     } else {
-                        let rs      : logic<8> = 8'd150 - fwus_e;
-                        fwus_abs = {8'd0, fwus_sig} >> rs[4:0];
+                        // Right-shift: |x| < 2^24 (positive in this branch).
+                        let rs       : logic<8>  = 8'd150 - fwus_e;
+                        let tr       : logic<32> = {8'd0, fwus_sig} >> rs[4:0];
+                        let rsm1     : logic<8>  = rs - 8'd1;
+                        let gm       : logic<24> = if rs == 8'd0 ? 24'd0 : 24'd1 << rsm1[4:0];
+                        let sm       : logic<24> = if rs == 8'd0 ? 24'd0 : (24'd1 << rsm1[4:0]) - 24'd1;
+                        let g        : logic     = (fwus_sig & gm) != 24'd0;
+                        let st       : logic     = (fwus_sig & sm) != 24'd0;
+                        let ru       : logic     = fcvt_round_up(fp_rm_resolved, 1'b0, g, st, tr[0]);
+                        fwus_abs = tr + {31'd0, ru};
                     }
                     // RV64 sign-extends the 32-bit unsigned result to 64 bits.
                     fpu_result = {fwus_abs[31] repeat 32, fwus_abs};
@@ -1626,9 +1685,16 @@ pub module fpu_wrap #(
                         fls_ls  = fls_e - 8'd150;
                         fls_abs = {40'd0, fls_sig} << fls_ls;
                     } else {
-                        var fls_rs : logic<8>;
-                        fls_rs  = 8'd150 - fls_e;
-                        fls_abs = {40'd0, fls_sig} >> fls_rs;
+                        // Right-shift: |x| < 2^24, round per active mode.
+                        let fls_rs  : logic<8>  = 8'd150 - fls_e;
+                        let fls_tr  : logic<64> = {40'd0, fls_sig} >> fls_rs;
+                        let fls_rsm1: logic<8>  = fls_rs - 8'd1;
+                        let fls_gm  : logic<24> = if fls_rs == 8'd0 ? 24'd0 : 24'd1 << fls_rsm1[4:0];
+                        let fls_sm  : logic<24> = if fls_rs == 8'd0 ? 24'd0 : (24'd1 << fls_rsm1[4:0]) - 24'd1;
+                        let fls_g   : logic     = (fls_sig & fls_gm) != 24'd0;
+                        let fls_st  : logic     = (fls_sig & fls_sm) != 24'd0;
+                        let fls_ru  : logic     = fcvt_round_up(fp_rm_resolved, s1_val[31], fls_g, fls_st, fls_tr[0]);
+                        fls_abs = fls_tr + {63'd0, fls_ru};
                     }
                     if s1_val[31] {
                         fpu_result = ~fls_abs + 64'd1;
@@ -1655,9 +1721,16 @@ pub module fpu_wrap #(
                         flus_ls  = flus_e - 8'd150;
                         flus_abs = {40'd0, flus_sig} << flus_ls;
                     } else {
-                        var flus_rs : logic<8>;
-                        flus_rs  = 8'd150 - flus_e;
-                        flus_abs = {40'd0, flus_sig} >> flus_rs;
+                        // Right-shift: |x| < 2^24 (positive), round per mode.
+                        let flus_rs  : logic<8>  = 8'd150 - flus_e;
+                        let flus_tr  : logic<64> = {40'd0, flus_sig} >> flus_rs;
+                        let flus_rsm1: logic<8>  = flus_rs - 8'd1;
+                        let flus_gm  : logic<24> = if flus_rs == 8'd0 ? 24'd0 : 24'd1 << flus_rsm1[4:0];
+                        let flus_sm  : logic<24> = if flus_rs == 8'd0 ? 24'd0 : (24'd1 << flus_rsm1[4:0]) - 24'd1;
+                        let flus_g   : logic     = (flus_sig & flus_gm) != 24'd0;
+                        let flus_st  : logic     = (flus_sig & flus_sm) != 24'd0;
+                        let flus_ru  : logic     = fcvt_round_up(fp_rm_resolved, 1'b0, flus_g, flus_st, flus_tr[0]);
+                        flus_abs = flus_tr + {63'd0, flus_ru};
                     }
                     fpu_result = flus_abs;
                 }
@@ -1885,6 +1958,7 @@ pub module fpu_wrap #(
                     cl_g     = cl_shifted[10];
                     cl_r     = cl_shifted[9];
                     cl_s     = cl_shifted[8:0] != 9'd0;
+                    cvt_int_nx = cl_g || cl_r || cl_s;
                     var cl_lsb_v: logic;
                     cl_lsb_v = cl_shifted[11];
                     var cl_round: logic;
@@ -1930,6 +2004,7 @@ pub module fpu_wrap #(
                     clu_g       = clu_shifted[10];
                     clu_r       = clu_shifted[9];
                     clu_s       = clu_shifted[8:0] != 9'd0;
+                    cvt_int_nx = clu_g || clu_r || clu_s;
                     var clu_lsb_v  : logic;
                     clu_lsb_v   = clu_shifted[11];
                     var clu_round  : logic;
@@ -1981,13 +2056,27 @@ pub module fpu_wrap #(
                         let ls    : logic<11> = fw_e - 11'd1075;
                         fw_abs = {11'd0, fw_sig} << ls[5:0];
                     } else {
-                        let rs    : logic<11> = 11'd1075 - fw_e;
-                        fw_abs = {11'd0, fw_sig} >> rs[5:0];
+                        // Right-shift: round the dropped fraction per the mode.
+                        let rs     : logic<11> = 11'd1075 - fw_e;
+                        let tr     : logic<64> = {11'd0, fw_sig} >> rs[5:0];
+                        let rsm1   : logic<11> = rs - 11'd1;
+                        let gm     : logic<53> = if rs == 11'd0 ? 53'd0 : 53'd1 << rsm1[5:0];
+                        let sm     : logic<53> = if rs == 11'd0 ? 53'd0 : (53'd1 << rsm1[5:0]) - 53'd1;
+                        let g      : logic     = (fw_sig & gm) != 53'd0;
+                        let st     : logic     = (fw_sig & sm) != 53'd0;
+                        let ru     : logic     = fcvt_round_up(fp_rm_resolved, fw_s, g, st, tr[0]);
+                        fw_abs = tr + {63'd0, ru};
                     }
                     var fw_result32: logic<32>;
-                    fw_result32 = fw_abs[31:0];
-                    if fw_s {
-                        fw_result32 = ~fw_result32 + 32'd1;
+                    // Rounding a value just below 2^31 up to 2^31 overflows a
+                    // positive int32 → saturate to INT32_MAX (negative −2^31 is
+                    // exactly representable, so only the positive side clamps).
+                    if !fw_s && fw_abs[31] {
+                        fw_result32 = 32'h7FFFFFFF;
+                    } else if fw_s {
+                        fw_result32 = ~fw_abs[31:0] + 32'd1;
+                    } else {
+                        fw_result32 = fw_abs[31:0];
                     }
                     fpu_result = {fw_result32[31] repeat 32, fw_result32};
                 }
@@ -2060,9 +2149,21 @@ pub module fpu_wrap #(
                         fwu_abs = {11'd0, fwu_sig} << ls[5:0];
                     } else {
                         let rs     : logic<11> = 11'd1075 - fwu_e;
-                        fwu_abs = {11'd0, fwu_sig} >> rs[5:0];
+                        let tr     : logic<64> = {11'd0, fwu_sig} >> rs[5:0];
+                        let rsm1   : logic<11> = rs - 11'd1;
+                        let gm     : logic<53> = if rs == 11'd0 ? 53'd0 : 53'd1 << rsm1[5:0];
+                        let sm     : logic<53> = if rs == 11'd0 ? 53'd0 : (53'd1 << rsm1[5:0]) - 53'd1;
+                        let g      : logic     = (fwu_sig & gm) != 53'd0;
+                        let st     : logic     = (fwu_sig & sm) != 53'd0;
+                        let ru     : logic     = fcvt_round_up(fp_rm_resolved, 1'b0, g, st, tr[0]);
+                        fwu_abs = tr + {63'd0, ru};
                     }
-                    fpu_result = {fwu_abs[31] repeat 32, fwu_abs[31:0]};
+                    // Rounding up just below 2^32 overflows uint32 → UINT32_MAX.
+                    if fwu_abs[32] {
+                        fpu_result = 64'hFFFFFFFFFFFFFFFF;
+                    } else {
+                        fpu_result = {fwu_abs[31] repeat 32, fwu_abs[31:0]};
+                    }
                 }
             }
             FpuOp::FCVT_L_D: {
@@ -2096,7 +2197,16 @@ pub module fpu_wrap #(
                         fl_lshift = fl_e - 11'd1075;
                         fl_abs    = {11'd0, fl_sig} << fl_lshift;
                     } else {
-                        fl_abs = {11'd0, fl_sig} >> fl_shift;
+                        // Right-shift: |x| < 2^52, round per active mode (the
+                        // rounded magnitude can never overflow int64 here).
+                        let fl_tr  : logic<64> = {11'd0, fl_sig} >> fl_shift;
+                        let fl_rsm1: logic<11> = fl_shift - 11'd1;
+                        let fl_gm  : logic<53> = if fl_shift == 11'd0 ? 53'd0 : 53'd1 << fl_rsm1[5:0];
+                        let fl_sm  : logic<53> = if fl_shift == 11'd0 ? 53'd0 : (53'd1 << fl_rsm1[5:0]) - 53'd1;
+                        let fl_g   : logic     = (fl_sig & fl_gm) != 53'd0;
+                        let fl_st  : logic     = (fl_sig & fl_sm) != 53'd0;
+                        let fl_ru  : logic     = fcvt_round_up(fp_rm_resolved, fl_s, fl_g, fl_st, fl_tr[0]);
+                        fl_abs = fl_tr + {63'd0, fl_ru};
                     }
                     if fl_s {
                         fpu_result = ~fl_abs + 64'd1;
@@ -2128,7 +2238,15 @@ pub module fpu_wrap #(
                         flu_lshift = flu_e - 11'd1075;
                         flu_abs    = {11'd0, flu_sig} << flu_lshift;
                     } else {
-                        flu_abs = {11'd0, flu_sig} >> flu_shift;
+                        // Right-shift: |x| < 2^52 (positive), round per mode.
+                        let flu_tr  : logic<64> = {11'd0, flu_sig} >> flu_shift;
+                        let flu_rsm1: logic<11> = flu_shift - 11'd1;
+                        let flu_gm  : logic<53> = if flu_shift == 11'd0 ? 53'd0 : 53'd1 << flu_rsm1[5:0];
+                        let flu_sm  : logic<53> = if flu_shift == 11'd0 ? 53'd0 : (53'd1 << flu_rsm1[5:0]) - 53'd1;
+                        let flu_g   : logic     = (flu_sig & flu_gm) != 53'd0;
+                        let flu_st  : logic     = (flu_sig & flu_sm) != 53'd0;
+                        let flu_ru  : logic     = fcvt_round_up(fp_rm_resolved, 1'b0, flu_g, flu_st, flu_tr[0]);
+                        flu_abs = flu_tr + {63'd0, flu_ru};
                     }
                     fpu_result = flu_abs;
                 }

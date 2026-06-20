@@ -712,21 +712,21 @@ _start:
     CK64 8,  0x4004000000000000, fail68   # 2.5
     CK64 16, 0x400C000000000000, fail68   # 3.5
     CK64 24, 0x4010000000000000, fail68   # 4.0
-    # vfwcvt.x.f.v: single -> int64 (truncate) [1, 2, 3, 4]
+    # vfwcvt.x.f.v: single -> int64, fcsr.frm=RNE: [1.5,2.5,3.5,4.0] -> [2,2,4,4]
     vsetvli t0, x0, e32, m1
     vfwcvt.x.f.v v8, v4
     vsetvli t0, x0, e64, m2
     vse64.v v8, (a2)
-    CK64 0,  0x0000000000000001, fail69   # 1
-    CK64 8,  0x0000000000000002, fail69   # 2
-    CK64 16, 0x0000000000000003, fail69   # 3
-    CK64 24, 0x0000000000000004, fail69   # 4
-    # vfwcvt.xu.f.v: single -> uint64 (truncate) [1, 2, 3, 4]
+    CK64 0,  0x0000000000000002, fail69   # round(1.5)=2
+    CK64 8,  0x0000000000000002, fail69   # round(2.5)=2 (ties to even)
+    CK64 16, 0x0000000000000004, fail69   # round(3.5)=4 (ties to even)
+    CK64 24, 0x0000000000000004, fail69   # 4.0
+    # vfwcvt.xu.f.v: single -> uint64, RNE: [1.5,2.5,3.5,4.0] -> [2,2,4,4]
     vsetvli t0, x0, e32, m1
     vfwcvt.xu.f.v v8, v4
     vsetvli t0, x0, e64, m2
     vse64.v v8, (a2)
-    CK64 0,  0x0000000000000001, fail70   # 1
+    CK64 0,  0x0000000000000002, fail70   # round(1.5)=2
     CK64 24, 0x0000000000000004, fail70   # 4
     # vfwcvt.rtz.x.f.v: single -> int64 RTZ [1, 2, 3, 4]
     vsetvli t0, x0, e32, m1
@@ -1460,7 +1460,7 @@ _start:
     CK 8,  0x40400000, fail172   # 3.0f
     CK 12, 0x40800000, fail172   # 4.0f
 
-    # vfncvt.x.f.w: double [3.5,-2.5,100.0,7.9] -> int32 (truncate).
+    # vfncvt.x.f.w: double [3.5,-2.5,100.0,7.9] -> int32, fcsr.frm=RNE.
     li t1, 0x400C000000000000; sd t1,0(a0)    # 3.5
     li t1, 0xC004000000000000; sd t1,8(a0)    # -2.5
     li t1, 0x4059000000000000; sd t1,16(a0)   # 100.0
@@ -1469,10 +1469,10 @@ _start:
     li t2,4; vsetvli t0,t2,e32,m1
     vfncvt.x.f.w v8,v4
     vse32.v v8,(a2)
-    CK 0,  3, fail173            # trunc(3.5)
-    CK 4,  0xFFFFFFFE, fail173   # trunc(-2.5) = -2
+    CK 0,  4, fail173            # round(3.5)=4 (ties to even)
+    CK 4,  0xFFFFFFFE, fail173   # round(-2.5)=-2 (ties to even)
     CK 8,  100, fail174
-    CK 12, 7, fail174            # trunc(7.9)
+    CK 12, 8, fail174            # round(7.9)=8
 
     # vfncvt.f.x.w: int64 [10,-20,1000,-1] -> single.
     li t1, 10;   sd t1,0(a0)
