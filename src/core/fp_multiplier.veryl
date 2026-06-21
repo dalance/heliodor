@@ -10,6 +10,44 @@ pub module fp_multiplier (
     var result: logic<64>;
     var fflags: logic<5> ;
 
+    // Overflow result per rounding mode (IEEE/RISC-V): RNE/RMM -> inf,
+    // RTZ -> max normal, RDN -> +max/-inf, RUP -> +inf/-max.
+    function ovf_d (
+        rm : input logic<3>,
+        sgn: input logic   ,
+    ) -> logic<64> {
+        var r  : logic<64>;
+        let inf: logic<64> = {sgn, 11'h7FF, 52'd0};
+        let mx : logic<64> = {sgn, 11'h7FE, 52'hFFFFFFFFFFFFF};
+        case rm {
+            3'b001 : r = mx;
+            3'b010 : r = if sgn ? inf : mx;
+            3'b011 : r = if sgn ? mx : inf;
+            default: r = inf;
+        }
+        return r;
+    }
+
+    function round_up_fn (
+        rm : input logic<3>,
+        sgn: input logic   ,
+        g  : input logic   ,
+        rr : input logic   ,
+        ss : input logic   ,
+        ll : input logic   ,
+    ) -> logic {
+        var ru: logic;
+        case rm {
+            3'b000 : ru = g && (rr || ss || ll);
+            3'b001 : ru = 1'b0;
+            3'b010 : ru = sgn && (g || rr || ss);
+            3'b011 : ru = !sgn && (g || rr || ss);
+            3'b100 : ru = g;
+            default: ru = g && (rr || ss || ll);
+        }
+        return ru;
+    }
+
     always_comb {
         // Extract fields
         var sa: logic    ;
@@ -138,140 +176,94 @@ pub module fp_multiplier (
             var mid_carry: logic;
             mid_carry = mid_sum <: pp_lh; // unsigned overflow
 
-            // product bits [105:52] = pp_hh + mid_sum[63:26] + carry_from_lower
+            // product[51:26] = mid_lo[25:0]; the carry-out at bit 26 (mid_lo[26])
+            // propagates into product[52] = upper[0].
+            var mid_lo: logic<64>;
+            mid_lo = {38'd0, pp_ll[51:26]} + {38'd0, mid_sum[25:0]};
+
+            // product bits [105:52] = pp_hh + mid_sum[63:26] + carry_from_lower.
+            // carry_from_lower is the bit-26 carry of the low add = mid_lo[26].
+            // (The old `(pp_ll[63:26]+mid_sum[25:0]) <: pp_ll[63:26]` 64-bit
+            // wraparound test was always 0 — that sum is < 2^27 and never wraps —
+            // so product[52] silently dropped this carry, giving an off-by-one
+            // (e.g. a wrong guard bit) in the rounded result for ~half of inputs.)
             var lower_carry: logic;
-            lower_carry = (pp_ll[63:26] + mid_sum[25:0]) <: pp_ll[63:26];
+            lower_carry = mid_lo[26];
 
             var upper: logic<64>;
             upper = pp_hh + {37'd0, mid_sum[63:26]} + {63'd0, mid_carry} + {63'd0, lower_carry};
 
-            // product[55:52] = upper[3:0], product[51:26] = (pp_ll[63:26] + mid_sum[25:0])[25:0]
-            var mid_lo: logic<64>;
-            mid_lo = {38'd0, pp_ll[51:26]} + {38'd0, mid_sum[25:0]};
+            // Full 106-bit product, reconstructed exactly.
+            // product[105:52]=upper[53:0], [51:26]=mid_lo[25:0], [25:0]=pp_ll[25:0]
+            let prod106: logic<106> = {upper[53:0], mid_lo[25:0], pp_ll[25:0]};
 
-            // Assemble top 56 bits of product for normalization
-            // Product is at most 106 bits. Implicit bits: 1.xx * 1.yy = [1,4).xx
-            // So product[105] or product[104] has the leading 1
-            // product[105:52] = upper[53:0]
-            // product[51:26]  = mid_lo[25:0]
-            // product[25:0]   = pp_ll[25:0]
-
-            // We need the top ~56 bits for rounding
-            var prod_top   : logic<56>;
-            var prod_sticky: logic    ;
-
-            if upper[53] {
-                // Product >= 2.0: leading 1 at bit 105
-                // Take bits [105:50] = upper[53:0] with lower bits as sticky
-                prod_top    = {upper[53:0], mid_lo[25:24]};
-                prod_sticky = mid_lo[23:0] != 24'd0 || pp_ll[25:0] != 26'd0;
-            } else {
-                // Product in [1.0, 2.0): leading 1 at bit 104
-                // Take bits [104:49]
-                prod_top    = {upper[52:0], mid_lo[25:23]};
-                prod_sticky = mid_lo[22:0] != 23'd0 || pp_ll[25:0] != 26'd0;
-            }
-
-            // Result exponent
-            var r_exp: logic<13>;
-            if upper[53] {
-                r_exp = ea_eff + eb_eff - 13'd1023 + 13'd1; // extra +1 for product >= 2
-            } else {
-                r_exp = ea_eff + eb_eff - 13'd1023;
-            }
-
-            // Normalize subnormal products (leading zeros in prod_top)
-            // For normal * normal, prod_top[55] should be 1
-            // For subnormal inputs, we may need to normalize
-            // Shift left so leading 1 lands at bit 55. Sentinel 56
-            // means "no leading 1 found".
-            var norm_shift: logic<6>;
-            norm_shift = 6'd56;
-            for i in 0..56 {
-                if prod_top[55 - i] == 1'b1 && norm_shift == 6'd56 {
-                    norm_shift = i[5:0];
+            // Leading-one normalize so the leading 1 lands at bit 105. Working on
+            // the FULL product (not a 56-bit window) keeps the low significand
+            // bits when one operand is subnormal and the leading 1 sits far below
+            // bit 105 — the old prod_top[105:50] window dropped them to sticky.
+            var lead_shift: logic<7>;
+            lead_shift = 7'd106;
+            for i in 0..106 {
+                if prod106[105 - i] == 1'b1 && lead_shift == 7'd106 {
+                    lead_shift = i[6:0];
                 }
             }
-            if norm_shift == 6'd56 {
-                norm_shift = 6'd55;
+            if lead_shift == 7'd106 {
+                lead_shift = 7'd105;
             }
-            var norm_mant: logic<56>;
-            norm_mant = prod_top << norm_shift;
-            var norm_exp : logic<13>;
-            norm_exp  = r_exp - {7'd0, norm_shift};
+            let prod_norm: logic<106> = prod106 << lead_shift;
+            // 1.0*1.0 -> prod106=2^104, lead_shift=1 -> biased 1023.
+            let biased: logic<13> = ea_eff + eb_eff - 13'd1022 - {6'd0, lead_shift};
 
-            // Check for subnormal result. norm_exp is a width-13 SIGNED value
-            // (range ~-1076 .. +3069); use a signed compare so deeply-negative
-            // (underflow) exponents are caught here and flushed to zero rather
-            // than wrapping to a large unsigned value and hitting the overflow
-            // path below (→ ∞).
-            var final_mant: logic<56>;
-            var final_exp : logic<13>;
-            if $signed(norm_exp) <= 13'sd0 {
-                // Subnormal output
-                var sub_shift  : logic<13>;
-                sub_shift   = 13'd1 - norm_exp;
-                var sub_shift_c: logic<6>;
-                if sub_shift >: 13'd56 {
-                    sub_shift_c = 6'd56;
+            // 56-bit significand: [55:3]=53-bit (implicit+frac), [2:0]=G,R,S
+            let nm: logic<56> = {prod_norm[105:51], prod_norm[50] | (prod_norm[49:0] != 50'd0)};
+
+            // Unbounded rounding -> tininess (after rounding) for the UF flag.
+            let ru0  : logic     = round_up_fn(i_rm, r_sign, nm[2], nm[1], nm[0], nm[3]);
+            let sig0 : logic<54> = {1'b0, nm[55:3]} + {53'd0, ru0};
+            let exp_u: logic<13> = biased + {12'd0, sig0[53]};
+            let tiny : logic     = $signed(exp_u) <= 13'sd0;
+
+            if $signed(biased) >= 13'sd1 {
+                // normal result
+                let nx    : logic = nm[2] || nm[1] || nm[0];
+                var efield: logic<13>;
+                var frac  : logic<52>;
+                if sig0[53] == 1'b1 {
+                    efield = biased + 13'd1;
+                    frac   = 52'd0;
                 } else {
-                    sub_shift_c = sub_shift[5:0];
+                    efield = biased;
+                    frac   = sig0[51:0];
                 }
-                var sub_sticky : logic;
-                sub_sticky  = (norm_mant & ((56'd1 << sub_shift_c) - 56'd1)) != 56'd0;
-                final_mant  = norm_mant >> sub_shift_c;
-                final_mant  = {final_mant[55:1], final_mant[0] | sub_sticky | prod_sticky};
-                final_exp   = 13'd0;
-                prod_sticky = 1'b0; // already folded in
+                if $signed(efield) >= 13'sd2047 {
+                    result = ovf_d(i_rm, r_sign);
+                    fflags  = 5'b00101; // OF | NX
+                } else {
+                    result = {r_sign, efield[10:0], frac};
+                    if nx {
+                        fflags = 5'b00001;
+                    }
+                }
             } else {
-                final_mant  = {norm_mant[55:1], norm_mant[0] | prod_sticky};
-                final_exp   = norm_exp;
-                prod_sticky = 1'b0;
-            }
-
-            // Rounding: G=bit2, R=bit1, S=bit0
-            var g      : logic;
-            var r      : logic;
-            var s      : logic;
-            var bit_lsb: logic;
-            g       = final_mant[2];
-            r       = final_mant[1];
-            s       = final_mant[0];
-            bit_lsb = final_mant[3];
-
-            var round_up: logic;
-            case i_rm {
-                3'b000 : round_up = g && (r || s || bit_lsb); // RNE
-                3'b001 : round_up = 1'b0; // RTZ
-                3'b010 : round_up = r_sign && (g || r || s); // RDN
-                3'b011 : round_up = !r_sign && (g || r || s); // RUP
-                3'b100 : round_up = g; // RMM
-                default: round_up = g && (r || s || bit_lsb);
-            }
-
-            var rounded: logic<53>;
-            rounded = final_mant[55:3] + {52'd0, round_up};
-
-            // Check if rounding caused carry
-            if rounded[52] && !final_mant[55] {
-                final_exp = final_exp + 13'd1;
-            }
-
-            var nx: logic;
-            nx = g || r || s;
-
-            // Overflow
-            if final_exp >= 13'd2047 {
-                result = {r_sign, 11'h7FF, 52'd0};
-                fflags = 5'b00101; // OF | NX
-            } else {
-                result = {r_sign, final_exp[10:0], rounded[51:0]};
-                if nx {
+                // subnormal result: bounded rounding for the value, `tiny` for UF
+                let ss    : logic<13> = 13'd1 - biased;
+                let scl   : logic<6>  = if $signed(ss) >: 13'sd56 ? 6'd56 : ss[5:0];
+                let sm    : logic<56> = nm >> scl;
+                let stk   : logic     = (nm & ((56'd1 << scl) - 56'd1)) != 56'd0;
+                let nms   : logic<56> = {sm[55:1], sm[0] | stk};
+                let nx_sub: logic     = nms[2] || nms[1] || nms[0];
+                let ru1   : logic     = round_up_fn(i_rm, r_sign, nms[2], nms[1], nms[0], nms[3]);
+                let sig1  : logic<54> = {1'b0, nms[55:3]} + {53'd0, ru1};
+                let efield: logic<13> = {12'd0, sig1[52]};
+                let frac  : logic<52> = sig1[51:0];
+                result = {r_sign, efield[10:0], frac};
+                if nx_sub {
                     fflags = 5'b00001;
-                } // NX
-                if final_exp == 13'd0 && nx {
-                    fflags = 5'b00011;
-                } // UF | NX
+                }
+                if tiny && nx_sub {
+                    fflags = 5'b00011; // UF | NX
+                }
             }
         }
     }
