@@ -61,7 +61,7 @@ clean (`Zicbom`/`Zicboz` need `CACHE_BLOCK_SIZE=64` +
 treats `cbo.inval/clean/flush` as legal no-ops, so `cbo.inval` never discards
 dirty data; the `Misalign*` suites just need `MISALIGNED_LDST=true`).
 
-### Privileged / virtual-memory suites (in progress)
+### Privileged / virtual-memory suites (complete)
 
 The `priv/` suites (`Svnapot`, `Svpbmt`, `Svade`/`Svadu`, `Svinval`, `Svbare`,
 …) run in S/U-mode and mode-switch via `mret`. They were unblocked by defining
@@ -74,21 +74,35 @@ Enabling it does **not** regress the 506 M-mode suites (re-verified 506/0). The
 DUT config also needs Sv39-only (`sail.json` `Sv48` → false) and the
 `Svnapot`/`Svpbmt`/`Svadu`/`Svinval` flags enabled.
 
-Result so far: **`Svnapot` 4/4, `Svade` 2/2** pass; `Svbare` 2/3, `Svpbmt` 2/4.
-**7 tests fail — all real heliodor RTL bugs** the suite caught (to fix next):
+Result: **priv 17/17** — `Svnapot` 4/4, `Svade` 2/2, `Svbare` 3/3, `Svpbmt` 4/4,
+`Svinval` 2/2, `Svadu` 2/2. The suite caught **7 real heliodor RTL bugs, all now
+fixed**:
 
-| failing | bug |
+| was failing | bug (fix commit) |
 |---|---|
-| `Svinval` (×2) | `SFENCE.W.INVAL`/`SFENCE.INVAL.IR` are decoded as unconditional NOPs, so they don't raise illegal-instruction in U-mode (they are S-mode ops). They must trap in U-mode but, unlike `SFENCE.VMA`/`SINVAL.VMA`, must **not** be trapped by `mstatus.TVM` — so they need a privilege-checked path distinct from `is_sfence`. |
-| `Svpbmt` nonleaf (×2) | `PBMT != 0` in a **non-leaf** PTE is reserved and must raise a page fault; heliodor ignores it. |
-| `Svadu` (×2) | hardware A/D update (`menvcfg.ADUE`) diverges from the reference across the A/D-bit combinations. |
-| `Svbare` mprv (×1) | `mstatus.MPRV` with `MPP = S/U` and `satp = Bare` — effective-privilege load/store path diverges. |
+| `Svpbmt` nonleaf (×2) | `PBMT != 0` (or reserved `N`) in a **non-leaf** Sv39 PTE is reserved → page fault (`4bb654f`). |
+| `Svinval` (×2) | `SFENCE.W.INVAL`/`SFENCE.INVAL.IR` must raise illegal in U-mode but, unlike `SFENCE.VMA`, must **not** be trapped by `mstatus.TVM` — a privilege-checked path (`is_svinval_fence`) distinct from `is_sfence`; landed with `mstatus.SD` + illegal-instruction `mtval` (`178cbba`). |
+| `Svbare` mprv (×1) | `mstatus.MPRV` + `MPP=S/U` + `satp=Bare` effective-privilege path — fixed as a side effect of the SD / `mtval` work (`178cbba`). |
+| `Svadu` (×2) | hardware A/D update: the instruction-fetch A-bit write-back is injected coherently through the dcache store-drain port (`98100fc`). |
 
-These suites are **not** in the default `make` EXT yet (the default stays green
-at 506); generate them with `make -C test/act EXT="Svnapot Svpbmt Svade Svadu
-Svinval Svbare"`. The **vector V** suites are absent from this upstream clone.
-**Zacas** and **Zabha** are RVA23-mandatory but **not implemented** in heliodor
-(a real gap, not just untested).
+These suites are **not** in the default `make` EXT (the default stays green at
+506); generate them with `make -C test/act EXT="Svnapot Svpbmt Svade Svadu
+Svinval Svbare"`.
+
+### Zabha (byte/halfword atomics)
+
+**`Zabha` 18/18.** heliodor now implements the byte/halfword AMOs
+(`amo{add,and,or,xor,swap,min,max,minu,maxu}.{b,h}`). The AMO compute datapath
+in `alu_wrap.veryl` was generalized from 2 widths (`.W`/`.D`) to 4
+(`.B`/`.H`/`.W`/`.D`): the target sub-word is right-aligned out of the 8-byte
+load by the byte offset, both operands are zero/sign-extended at the access
+width (so one 64-bit datapath + comparator serves every width), and the new
+sub-word stays right-aligned so the existing 4-size commit-time wstrb generator
+writes exactly the target bytes; `rd` gets the sign-extended old sub-word.
+Generate with `make -C test/act EXT="Zabha"` (`Zabha` enabled in `heliodor.yaml`
++ `sail.json`). The **vector V** suites are absent from this upstream clone, and
+**`Zacas`** (compare-and-swap — needs an `rd`-as-source read in the OoO core)
+remains the one RVA23-mandatory scalar gap left.
 
 Two framework-integration fixes were needed to generate these. (1) The upstream
 `make` wants `EXTENSIONS` **comma-separated** and strips all spaces, so the

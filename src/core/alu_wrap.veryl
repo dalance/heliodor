@@ -239,101 +239,69 @@ pub module alu_wrap #(
     }
 
     // ============================================================
-    // M5.A: AMO compute. Old value = i_load_data (W: sign-ext low 32;
-    // D: full 64). New value depends on amo_funct5:
-    //   AMOSWAP=00001: new = rs2
-    //   AMOADD =00000: new = old + rs2
-    //   AMOXOR =00100: new = old ^ rs2
-    //   AMOAND =01100: new = old & rs2
-    //   AMOOR  =01000: new = old | rs2
-    //   AMOMIN =10000: new = min_signed(old, rs2)
-    //   AMOMAX =10100: new = max_signed(old, rs2)
-    //   AMOMINU=11000: new = min_unsigned(old, rs2)
-    //   AMOMAXU=11100: new = max_unsigned(old, rs2)
-    //   LR     =00010: just load (no write at commit)
+    // M5.A AMO compute, generalized to Zabha widths .B(f3=000)/.H(001) on
+    // top of .W(010)/.D(011). The target sub-word is right-aligned out of the
+    // 8-byte i_load_data by the byte offset, so the RMW always runs on the low
+    // `width` bits. New value (low `width` bits authoritative) by amo_funct5:
+    //   AMOSWAP=00001: new = rs2          AMOMIN =10000: min_signed(old, rs2)
+    //   AMOADD =00000: new = old + rs2    AMOMAX =10100: max_signed(old, rs2)
+    //   AMOXOR =00100: new = old ^ rs2    AMOMINU=11000: min_unsigned(old, rs2)
+    //   AMOAND =01100: new = old & rs2    AMOMAXU=11100: max_unsigned(old, rs2)
+    //   AMOOR  =01000: new = old | rs2    LR     =00010: just load (no commit wr)
     //   SC     =00011: write rs2 (single-hart always succeeds)
-    // For .W variants compute happens on low 32 bits; result is truncated
-    // to 32 on STORE side; rd gets sign-extended 32-bit old.
+    // rd gets the sign-extended old sub-word; the 4-size commit-time wstrb
+    // generator writes exactly the target bytes.
     // ============================================================
-    let amo_w_addr_off: logic     = agu_addr[2]; // .W can address either half of 8B word
-    let amo_w_old_raw : logic<32> = if amo_w_addr_off ? i_load_data[63:32] : i_load_data[31:0];
-    let amo_w_old_sext: logic<32> = if amo_w_old_raw[31] ? 32'hffff_ffff : 32'd0;
-    // amo_is_w derived from mem_funct3 (010=.W, 011=.D).
-    let amo_is_w_local: logic     = i_issue_op.base.mem_funct3 == 3'b010;
-    let amo_old_64    : logic<64> = if amo_is_w_local ? {amo_w_old_sext, amo_w_old_raw} : i_load_data;
-    let amo_b_32      : logic<32> = i_rs2_data[31:0];
-    let amo_b_64      : logic<64> = i_rs2_data;
-    let amo_old_32    : logic<32> = amo_w_old_raw;
+    let amo_byte_off: logic<3>  = agu_addr[2:0];
+    let amo_old_algn: logic<64> = i_load_data >> {amo_byte_off, 3'b000};
+    let amo_old_b   : logic<8>  = amo_old_algn[7:0];
+    let amo_old_h   : logic<16> = amo_old_algn[15:0];
+    let amo_old_w   : logic<32> = amo_old_algn[31:0];
+    let amo_b_b     : logic<8>  = i_rs2_data[7:0];
+    let amo_b_h     : logic<16> = i_rs2_data[15:0];
+    let amo_b_w     : logic<32> = i_rs2_data[31:0];
+    // Zero- / sign-extend both operands to 64 bits at the access width so one
+    // 64-bit datapath + comparator is correct for every width (default = .D).
+    let amo_old_ze: logic<64> = if f3 == 3'b000 ? {56'd0, amo_old_b} : if f3 == 3'b001 ? {48'd0, amo_old_h} : if f3 == 3'b010 ? {32'd0, amo_old_w} : i_load_data;
+    let amo_old_se: logic<64> = if f3 == 3'b000 ? {amo_old_b[7] repeat 56, amo_old_b} : if f3 == 3'b001 ? {amo_old_h[15] repeat 48, amo_old_h} : if f3 == 3'b010 ? {amo_old_w[31] repeat 32, amo_old_w} : i_load_data;
+    let amo_b_ze  : logic<64> = if f3 == 3'b000 ? {56'd0, amo_b_b} : if f3 == 3'b001 ? {48'd0, amo_b_h} : if f3 == 3'b010 ? {32'd0, amo_b_w} : i_rs2_data;
+    let amo_b_se  : logic<64> = if f3 == 3'b000 ? {amo_b_b[7] repeat 56, amo_b_b} : if f3 == 3'b001 ? {amo_b_h[15] repeat 48, amo_b_h} : if f3 == 3'b010 ? {amo_b_w[31] repeat 32, amo_b_w} : i_rs2_data;
 
-    let amo_lt_w : logic = $signed(amo_old_32) <: $signed(amo_b_32);
-    let amo_lt_d : logic = $signed(amo_old_64) <: $signed(amo_b_64);
-    let amo_ltu_w: logic = amo_old_32 <: amo_b_32;
-    let amo_ltu_d: logic = amo_old_64 <: amo_b_64;
+    let amo_lt : logic = $signed(amo_old_se) <: $signed(amo_b_se);
+    let amo_ltu: logic = amo_old_ze <: amo_b_ze;
 
-    var amo_new_d: logic<64>;
-    var amo_new_w: logic<32>;
+    // New value, right-aligned in the low `width` bits. ADD/bit-ops use the
+    // zero-extended operands (low bits are width-correct; carry past the width
+    // is masked off by the store wstrb); MIN/MAX select the extended operand.
+    var amo_new_64: logic<64>;
     always_comb {
         case i_amo_funct5 {
-            5'b00001: {
-                amo_new_d = amo_b_64;
-                amo_new_w = amo_b_32;
-            } // SWAP
-            5'b00000: {
-                amo_new_d = amo_old_64 + amo_b_64;
-                amo_new_w = amo_old_32 + amo_b_32;
-            } // ADD
-            5'b00100: {
-                amo_new_d = amo_old_64 ^ amo_b_64;
-                amo_new_w = amo_old_32 ^ amo_b_32;
-            } // XOR
-            5'b01100: {
-                amo_new_d = amo_old_64 & amo_b_64;
-                amo_new_w = amo_old_32 & amo_b_32;
-            } // AND
-            5'b01000: {
-                amo_new_d = amo_old_64 | amo_b_64;
-                amo_new_w = amo_old_32 | amo_b_32;
-            } // OR
-            5'b10000: {
-                amo_new_d = if amo_lt_d ? amo_old_64 : amo_b_64;
-                amo_new_w = if amo_lt_w ? amo_old_32 : amo_b_32;
-            } // MIN
-            5'b10100: {
-                amo_new_d = if amo_lt_d ? amo_b_64 : amo_old_64;
-                amo_new_w = if amo_lt_w ? amo_b_32 : amo_old_32;
-            } // MAX
-            5'b11000: {
-                amo_new_d = if amo_ltu_d ? amo_old_64 : amo_b_64;
-                amo_new_w = if amo_ltu_w ? amo_old_32 : amo_b_32;
-            } // MINU
-            5'b11100: {
-                amo_new_d = if amo_ltu_d ? amo_b_64 : amo_old_64;
-                amo_new_w = if amo_ltu_w ? amo_b_32 : amo_old_32;
-            } // MAXU
-            5'b00011: {
-                amo_new_d = amo_b_64;
-                amo_new_w = amo_b_32;
-            } // SC: data = rs2
-            default: {
-                amo_new_d = amo_b_64;
-                amo_new_w = amo_b_32;
-            }
+            5'b00001: amo_new_64 = amo_b_ze; // SWAP
+            5'b00000: amo_new_64 = amo_old_ze + amo_b_ze; // ADD
+            5'b00100: amo_new_64 = amo_old_ze ^ amo_b_ze; // XOR
+            5'b01100: amo_new_64 = amo_old_ze & amo_b_ze; // AND
+            5'b01000: amo_new_64 = amo_old_ze | amo_b_ze; // OR
+            5'b10000: amo_new_64 = if amo_lt ? amo_old_se : amo_b_se; // MIN
+            5'b10100: amo_new_64 = if amo_lt ? amo_b_se : amo_old_se; // MAX
+            5'b11000: amo_new_64 = if amo_ltu ? amo_old_ze : amo_b_ze; // MINU
+            5'b11100: amo_new_64 = if amo_ltu ? amo_b_ze : amo_old_ze; // MAXU
+            5'b00011: amo_new_64 = amo_b_ze; // SC: data = rs2
+            default : amo_new_64 = amo_b_ze;
         }
     }
-    // 64-bit STORE data for AMO: leave un-positioned. The commit-time
-    // wstrb generator shifts the wdata by byte_off*8, so we must NOT
-    // pre-shift here (otherwise double-shift loses bits). For .W just
-    // duplicate the new 32-bit value in both halves so whichever half
-    // wstrb selects has the right value; for .D the full 64-bit value.
-    let amo_store_data_64: logic<64> = if amo_is_w_local ? {amo_new_w, amo_new_w} : amo_new_d;
+    // STORE data for AMO: keep the new sub-word right-aligned. The commit-time
+    // wstrb generator shifts store_data left by byte_off*8 and masks to the
+    // funct3-derived target bytes, so a right-aligned value lands correctly for
+    // every width (.B/.H/.W/.D) — no pre-shift here.
+    let amo_store_data_64: logic<64> = amo_new_64;
 
-    // AMO/LR rd value = old value (sign-ext for .W). SC rd value =
-    // 0 (success) when reservation valid and address matches, else 1.
+    // AMO/LR rd value = old sub-word, sign-extended at the access width. SC rd
+    // value = 0 (success) when reservation valid and address matches, else 1.
     let amo_is_sc: logic     = i_amo_funct5 == 5'b00011;
     let amo_is_lr: logic     = i_amo_funct5 == 5'b00010;
     let sc_match : logic     = i_rsv_valid && i_rsv_addr == agu_addr;
     let sc_wb    : logic<64> = if sc_match ? 64'd0 : 64'd1;
-    let amo_wb   : logic<64> = if amo_is_sc ? sc_wb : amo_old_64;
+    let amo_wb   : logic<64> = if amo_is_sc ? sc_wb : amo_old_se;
 
     // Whether to drive a STORE at commit: AMO* (not LR/SC) always;
     // SC only if reservation matched.
