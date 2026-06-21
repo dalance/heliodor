@@ -19,6 +19,12 @@ veryl test --ignored --test test_act_f              # run one suite (substring)
 veryl test --ignored --test test_act_               # run all generated suites
 ```
 
+> The ELF-generation step (`make … elfs`) uses Python multiprocessing, which
+> needs `AF_UNIX` sockets. A restrictive sandbox blocks those
+> (`PermissionError: Operation not permitted`) — run `make -C test/act` outside
+> the sandbox (e.g. Claude Code `/sandbox` off). The toolchain fetch, the Veryl
+> sim, and everything else run fine sandboxed.
+
 `make` clones the framework, drops in the heliodor DUT config, runs the Sail +
 uv + UDB pipeline to produce ELFs, then `gen_suite.py` converts each ELF to
 `test/hex/act_<ext>_<name>.hex` and writes `tb/test_act_<ext>.veryl` (one

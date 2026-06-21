@@ -20,11 +20,13 @@ CC="${RISCV_LINUX_PREFIX:-riscv64-unknown-linux-gnu-}"
 command -v "${CC}gcc" >/dev/null || { echo "need ${CC}gcc on PATH — source toolchain/env.sh"; exit 1; }
 
 # ---- per-variant parameters -------------------------------------------------
+# march note: binutils >= 2.38 requires `zicsr` to be explicit in -march for CSR
+# instructions, so the firmware/init use rv64imac_zicsr (rv64gcv already implies it).
 case "$variant" in
-  515) ksrc=v5.15; dts=heliodor.dts;     init=linux_init.c;     imarch=rv64imac; fwdef="";                          dtb_addr=0x80AB9000 ;;
-  66)  ksrc=v6.6;  dts=heliodor_66.dts;  init=linux_init.c;     imarch=rv64imac; fwdef="";                          dtb_addr=0x80300000 ;;
-  71)  ksrc=v7.1;  dts=heliodor_71.dts;  init=linux_init.c;     imarch=rv64imac; fwdef="-DRVA23_MENVCFG -DRVA23_ADUE"; dtb_addr=0x80300000 ;;
-  71v) ksrc=v7.1;  dts=heliodor_71v.dts; init=linux_init_vec.c; imarch=rv64gcv;  fwdef="-DRVA23_MENVCFG -DRVA23_ADUE"; dtb_addr=0x80300000 ;;
+  515) ksrc=v5.15; dts=heliodor.dts;     init=linux_init.c;     imarch=rv64imac_zicsr; fwdef="";                          dtb_addr=0x80AB9000 ;;
+  66)  ksrc=v6.6;  dts=heliodor_66.dts;  init=linux_init.c;     imarch=rv64imac_zicsr; fwdef="";                          dtb_addr=0x80300000 ;;
+  71)  ksrc=v7.1;  dts=heliodor_71.dts;  init=linux_init.c;     imarch=rv64imac_zicsr; fwdef="-DRVA23_MENVCFG -DRVA23_ADUE"; dtb_addr=0x80300000 ;;
+  71v) ksrc=v7.1;  dts=heliodor_71v.dts; init=linux_init_vec.c; imarch=rv64gcv;        fwdef="-DRVA23_MENVCFG -DRVA23_ADUE"; dtb_addr=0x80300000 ;;
   *)   echo "unknown variant '$variant'"; exit 1 ;;
 esac
 
@@ -66,7 +68,7 @@ echo "hart_lottery = $hart_lottery"
 dtc -I dts -O dtb -o "$bd/heliodor.dtb" "$here/dts/$dts"
 
 # ---- 4. firmware hex ---------------------------------------------------------
-"${CC}gcc" -nostdlib -nostartfiles -Ttext=0x0 -march=rv64imac -mabi=lp64 \
+"${CC}gcc" -nostdlib -nostartfiles -Ttext=0x0 -march=rv64imac_zicsr -mabi=lp64 \
   -DDTB_ADDR=$dtb_addr -DHART_LOTTERY_PA=$hart_lottery $fwdef \
   -o "$bd/fw.elf" "$here/fw/linux_boot_fw.S"
 "${CC}objcopy" -O binary "$bd/fw.elf" "$bd/fw.bin"
