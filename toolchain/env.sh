@@ -11,7 +11,7 @@ _tc_prepend() { [ -d "$1" ] && case ":$PATH:" in *":$1:"*) ;; *) PATH="$1:$PATH"
 # Compilers (riscv-collab archives have bin/ at the root after strip).
 _tc_prepend "$_tc_root/elf/bin"
 _tc_prepend "$_tc_root/linux/bin"
-# Sail: archive layout varies — add both root and bin/.
+# Sail (fetched with strip=1 → bin/ at the root).
 _tc_prepend "$_tc_root/sail"
 _tc_prepend "$_tc_root/sail/bin"
 # uv: single binary at the root after strip.

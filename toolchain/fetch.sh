@@ -76,7 +76,9 @@ fetch_one() {
 targets=("$@")
 [[ ${#targets[@]} -eq 0 ]] && targets=(all)
 [[ "${targets[0]}" == "all" ]] && targets=(elf linux sail uv)
-for t in "${targets[@]}"; do fetch_one "$t"; done
+rc=0
+for t in "${targets[@]}"; do fetch_one "$t" || { echo "[$t] FAILED" >&2; rc=1; }; done
+[[ $rc -eq 0 ]] || echo "(some components failed — see above)" >&2
 
 echo
 echo "Now: source toolchain/env.sh   # puts the tools on PATH"
