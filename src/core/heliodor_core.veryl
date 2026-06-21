@@ -1560,6 +1560,7 @@ pub module heliodor_core #(
     always_comb {
         rob_alloc_entry.valid          = 1'b1;
         rob_alloc_entry.pc             = if_pc_q;
+        rob_alloc_entry.instr          = dec_op.instr;
         rob_alloc_entry.rd_arch        = dec_op.rd_arch;
         // M6: dest pdst is the FP pdst for FP-dest ops, else the int pdst
         // (rd_pdst/old_rd_pdst are reused; is_fp_dest routes commit).
@@ -1616,6 +1617,7 @@ pub module heliodor_core #(
         rob_alloc_entry.is_mret   = dec_op.is_mret;
         rob_alloc_entry.is_sret   = dec_op.is_sret;
         rob_alloc_entry.is_sfence = dec_op.is_sfence;
+        rob_alloc_entry.is_svinval_fence = dec_op.is_svinval_fence;
         rob_alloc_entry.sfence_rs1 = dec_op.rs1_arch; // P9.5: SFENCE.VMA VA/ASID regs
         rob_alloc_entry.sfence_rs2 = dec_op.rs2_arch;
         rob_alloc_entry.is_fence_i = dec_op.is_fence_i;
@@ -1731,6 +1733,7 @@ pub module heliodor_core #(
     always_comb {
         rob_alloc_entry2.valid          = 1'b1;
         rob_alloc_entry2.pc             = if_pc_q1;
+        rob_alloc_entry2.instr          = dec_op2.instr;
         rob_alloc_entry2.rd_arch        = dec_op2.rd_arch;
         rob_alloc_entry2.rd_pdst        = new_rd_pdst2;
         rob_alloc_entry2.old_rd_pdst    = s1_old_rd_pdst;
@@ -1772,6 +1775,7 @@ pub module heliodor_core #(
         rob_alloc_entry2.is_mret        = dec_op2.is_mret;
         rob_alloc_entry2.is_sret        = dec_op2.is_sret;
         rob_alloc_entry2.is_sfence      = dec_op2.is_sfence;
+        rob_alloc_entry2.is_svinval_fence = dec_op2.is_svinval_fence;
         rob_alloc_entry2.sfence_rs1     = dec_op2.rs1_arch; // P9.5
         rob_alloc_entry2.sfence_rs2     = dec_op2.rs2_arch;
         rob_alloc_entry2.is_fence_i     = dec_op2.is_fence_i;
@@ -2661,6 +2665,7 @@ pub module heliodor_core #(
     // Per-field commit signals (sim-bug workaround for cross-module
     // struct-port; mirror of rob_commit_entry.X).
     var c_pc          : logic<64>       ;
+    var c_instr       : logic<32>       ; // head instruction encoding (illegal-instr mtval)
     var c_rd_arch     : logic<5>        ;
     var c_rd_pdst     : logic<PRF_INT_W>;
     var c_old_rd_pdst : logic<PRF_INT_W>;
@@ -2700,6 +2705,7 @@ pub module heliodor_core #(
     var c_is_mret     : logic           ;
     var c_is_sret     : logic           ;
     var c_is_sfence   : logic           ;
+    var c_is_svinval_fence: logic       ; // Svinval fence at head (U-mode illegal)
     var c_sfence_rs1  : logic<5>        ; // P9.5: SFENCE.VMA rs1 (VA reg) at head
     var c_sfence_rs2  : logic<5>        ; // P9.5: SFENCE.VMA rs2 (ASID reg) at head
     var c_is_fence_i  : logic           ; // M8.A FENCE.I → icache flush
@@ -2954,6 +2960,7 @@ pub module heliodor_core #(
         o_commit_valid       : rob_commit_valid     ,
         o_commit_entry       : rob_commit_entry     ,
         o_commit_pc          : c_pc                 ,
+        o_commit_instr       : c_instr              ,
         o_commit_rd_arch     : c_rd_arch            ,
         o_commit_rd_pdst     : c_rd_pdst            ,
         o_commit_old_rd_pdst : c_old_rd_pdst        ,
@@ -2998,6 +3005,7 @@ pub module heliodor_core #(
         o_commit_is_mret     : c_is_mret            ,
         o_commit_is_sret     : c_is_sret            ,
         o_commit_is_sfence   : c_is_sfence          ,
+        o_commit_is_svinval_fence: c_is_svinval_fence,
         o_commit_sfence_rs1  : c_sfence_rs1         , // P9.5
         o_commit_sfence_rs2  : c_sfence_rs2         ,
         o_commit_is_fence_i  : c_is_fence_i         ,
@@ -3113,8 +3121,20 @@ pub module heliodor_core #(
         && csr_priv == csr_pkg::PrivLevel::SUPERVISOR && c_is_sret;
     // Combined virtual-instruction (cause 22) sources.
     let commit_virt_instr  : logic = commit_hlv_vi || commit_vs_csr_vi || commit_vtvm_trap || commit_vtsr_trap;
+    // Svinval: the sfence-class instructions are S-mode privileged, so executing
+    // any of them in U-mode raises an illegal-instruction trap (cause 2) with the
+    // side effects suppressed — same commit-time machinery as the TVM trap.
+    //  - SFENCE.VMA / SINVAL.VMA (c_is_sfence): also trapped in S-mode by TVM
+    //    (commit_tvm_trap above); here we add the U-mode case.
+    //  - SFENCE.W.INVAL / SFENCE.INVAL.IR (c_is_svinval_fence): NOT trapped by
+    //    TVM (a NOP in M/S), illegal only in U-mode — hence the separate flag.
+    // Gated on !csr_virt: at V=1 the VS/VU-mode behaviour is governed by the
+    // hypervisor controls (commit_vtvm_trap), leaving the guest path byte-
+    // identical. The ACT4 priv suites run at V=0.
+    let commit_sfence_u_illegal : logic = rob_commit_valid && !csr_virt
+        && csr_priv == csr_pkg::PrivLevel::USER && (c_is_sfence || c_is_svinval_fence);
     let commit_priv_illegal: logic = commit_tvm_trap || commit_tsr_trap || commit_fp_disabled
-        || commit_virt_instr || commit_hlv_illegal || commit_vec_disabled;
+        || commit_virt_instr || commit_hlv_illegal || commit_vec_disabled || commit_sfence_u_illegal;
     // M9.3 SMP FIX (cosim-pinned free-list double-alloc): gate the commit-side
     // architectural mutations on the actual RETIRE (rob_commit_ack), NOT on
     // rob_commit_valid. A store-class op held at the ROB head keeps
@@ -3271,7 +3291,7 @@ pub module heliodor_core #(
     let commit_mret: logic = rob_commit_valid && c_is_mret;
     let commit_sret: logic = rob_commit_valid && c_is_sret && !commit_tsr_trap && !commit_vtsr_trap;
     // P9.1 FIX: ack-based (c_serial — see the commit_csrwr note above).
-    assign commit_sfence_pulse = rob_commit_ack && c_is_sfence && !commit_tvm_trap && !commit_vtvm_trap;
+    assign commit_sfence_pulse = rob_commit_ack && c_is_sfence && !commit_tvm_trap && !commit_vtvm_trap && !commit_sfence_u_illegal;
 
     // M8.A: FENCE.I commit pulse → flush the icache. Fired at commit so all
     // prior stores (self-modifying code) have updated memory before the
@@ -3453,6 +3473,14 @@ pub module heliodor_core #(
             c_store_addr
         : if c_is_sfault ?
             c_fault_vaddr
+        : if (c_illegal || commit_priv_illegal) && !commit_virt_instr ?
+            // Illegal-instruction (cause 2): mtval/stval = the faulting
+            // instruction encoding (RISC-V priv spec — Sail writes it, and ACT4
+            // checks it). commit_virt_instr (cause 22) is excluded; it keeps the
+            // legacy tval=0 used by the hypervisor path. For an RVC illegal op
+            // c_instr is the expander's 32-bit form; the priv suites use 32-bit
+            // privileged instructions, so this matches their golden signature.
+            {32'd0, c_instr}
         :
             64'd0
         ,
