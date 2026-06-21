@@ -1108,6 +1108,59 @@ pub module fpu_wrap #(
             FpuOp::FCVT_D_H: fpu_fflags_comb = cvt_d_h_fl;
             FpuOp::FCVT_H_S: fpu_fflags_comb = cvt_h_s_fl;
             FpuOp::FCVT_H_D: fpu_fflags_comb = cvt_h_d_fl;
+            // FCVT.D.S (single → double): exact widening; only NV on sNaN input.
+            FpuOp::FCVT_D_S: {
+                if s1_is_nan && s1_val[22] == 1'b0 {
+                    fpu_fflags_comb = 5'b10000;
+                }
+            }
+            // FCVT.S.D (double → single): narrowing — NV on sNaN, OF on overflow,
+            // NX on any precision loss, UF on a tiny (subnormal) inexact result.
+            FpuOp::FCVT_S_D: {
+                let e: logic<11> = d1[62:52];
+                let m: logic<52> = d1[51:0];
+                if e == 11'h7FF {
+                    if m != 52'd0 && m[51] == 1'b0 {
+                        fpu_fflags_comb = 5'b10000; // sNaN
+                    }
+                } else if e == 11'd0 && m == 52'd0 {
+                    // zero: exact
+                } else {
+                    var se: logic<12>;
+                    if e == 11'd0 {
+                        se = 12'd1 - 12'd896;
+                    } else {
+                        se = {1'b0, e} - 12'd896;
+                    }
+                    if $signed(se) >= 12'sd255 {
+                        fpu_fflags_comb = 5'b00101; // OF | NX
+                    } else if $signed(se) <= 12'sd0 {
+                        // Subnormal single: inexact iff any bit below the kept
+                        // 23-bit fraction (incl. the GRS) is set → UF|NX.
+                        let imp      : logic      = if e == 11'd0 ? 1'b0 : 1'b1;
+                        let sub_mant : logic<53>  = {imp, m};
+                        let sub_shift: logic<12>  = 12'd27 - se;
+                        var lost     : logic      ;
+                        if sub_shift >: 12'd52 {
+                            lost = sub_mant != 53'd0;
+                        } else {
+                            let ks  : logic<6>  = sub_shift[5:0];
+                            let shf : logic<53> = sub_mant >> ks;
+                            let msk : logic<53> = (53'd1 << ks) - 53'd1;
+                            let lb  : logic     = (sub_mant & msk) != 53'd0;
+                            lost = shf[2] || shf[1] || shf[0] || lb;
+                        }
+                        if lost {
+                            fpu_fflags_comb = 5'b00011; // UF | NX
+                        }
+                    } else {
+                        // Normal single: inexact iff the dropped low 29 bits != 0.
+                        if m[28:0] != 29'd0 {
+                            fpu_fflags_comb = 5'b00001;
+                        }
+                    }
+                }
+            }
             // int → FP: NX when the conversion has to round. int_to_fp_inexact
             // takes (raw, is_signed, is_word/32-bit src, is_dbl/double dst).
             FpuOp::FCVT_S_W: if int_to_fp_inexact(fwd_rs1, 1'b1, 1'b1, 1'b0) {
@@ -1467,6 +1520,23 @@ pub module fpu_wrap #(
                  else if ce == 8'd0 && cm == 23'd0 {
                     fpu_result = {cs, 63'd0};
                 } // Zero
+                 else if ce == 8'd0 {
+                    // Subnormal single → always a NORMAL double (exact). Subnormals
+                    // have no implicit 1, so normalize: drop leading zeros + the
+                    // leading 1, and lower the exponent accordingly. (Was treated
+                    // like a normal with an implicit 1 → wrong value.)
+                    var sd_lz: logic<5>;
+                    sd_lz = 5'd23;
+                    for i in 0..23 {
+                        if cm[22 - i] == 1'b1 && sd_lz == 5'd23 {
+                            sd_lz = i[4:0];
+                        }
+                    }
+                    let sd_sh  : logic<5>  = sd_lz + 5'd1;
+                    let sd_frac: logic<23> = cm << sd_sh;
+                    let sd_de  : logic<11> = 11'd896 - {6'd0, sd_lz};
+                    fpu_result = {cs, sd_de, sd_frac, 29'd0};
+                } // Subnormal
                  else {
                     let de        : logic<11> = {3'd0, ce} + 11'd896; // bias adjust: 1023-127=896
                     fpu_result = {cs, de, cm, 29'd0};
@@ -1937,6 +2007,17 @@ pub module fpu_wrap #(
                     var s_mant_r: logic<25>;
                     s_mant_r = {1'b0, imp, sd_mant[51:29]} + {24'd0, s_round};
 
+                    // Overflow result per rounding mode (RNE/RMM→inf, RTZ→max,
+                    // RDN→+max/-inf, RUP→+inf/-max).
+                    let sd_inf: logic<32> = {sd_sign, 8'hFF, 23'd0};
+                    let sd_max: logic<32> = {sd_sign, 8'hFE, 23'h7FFFFF};
+                    var sd_ovf: logic<32>;
+                    case fp_rm_resolved {
+                        3'b001 : sd_ovf = sd_max;
+                        3'b010 : sd_ovf = if sd_sign ? sd_inf : sd_max;
+                        3'b011 : sd_ovf = if sd_sign ? sd_max : sd_inf;
+                        default: sd_ovf = sd_inf;
+                    }
                     // se is a signed 12-bit value (can be negative when
                     // the double exponent is below the single minimum).
                     // Use the MSB as the sign bit for the "<= 0" check.
@@ -1997,13 +2078,13 @@ pub module fpu_wrap #(
                             fpu_result = {32'hFFFFFFFF, sd_sign, 8'd0, sub_frac[22:0]};
                         }
                     } else if se >= 12'd255 {
-                        // Overflow → infinity
-                        fpu_result = {32'hFFFFFFFF, sd_sign, 8'hFF, 23'd0};
+                        // Overflow → inf or max-normal per rounding mode
+                        fpu_result = {32'hFFFFFFFF, sd_ovf};
                     } else if s_mant_r[24] {
                         // Rounding caused carry into new bit → exp + 1
                         let new_se: logic<12> = se + 12'd1;
                         if new_se >= 12'd255 {
-                            fpu_result = {32'hFFFFFFFF, sd_sign, 8'hFF, 23'd0};
+                            fpu_result = {32'hFFFFFFFF, sd_ovf};
                         } else {
                             fpu_result = {32'hFFFFFFFF, sd_sign, new_se[7:0], s_mant_r[23:1]};
                         }
