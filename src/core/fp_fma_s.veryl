@@ -1,0 +1,294 @@
+// IEEE 754 single-precision fused multiply-add: round(a*b +/- c) with a SINGLE
+// rounding. Combinational. Handles normals, subnormals, zeros, infinities, NaNs.
+//
+// Operation select:
+//   i_neg_p  negate the product  (a*b)        -> -(a*b)
+//   i_sub_c  negate the addend   (+c)         -> -c
+// so the four RISC-V FMAs map as:
+//   FMADD  =  a*b + c   neg_p=0 sub_c=0
+//   FMSUB  =  a*b - c   neg_p=0 sub_c=1
+//   FNMSUB = -a*b + c   neg_p=1 sub_c=0
+//   FNMADD = -a*b - c   neg_p=1 sub_c=1
+//
+// Datapath: the full 48-bit product sig_a*sig_b is kept exactly and the 24-bit
+// addend significand is aligned into an 80-bit fixed-point window anchored at
+// max(product_msb, addend_msb). The larger term always left-shifts (lossless);
+// the smaller term right-shifts with a sticky bit. The two terms are added in
+// two's complement, the magnitude is normalized (leading-one search) and rounded
+// exactly once. This is the IEEE fusedMultiplyAdd, not the non-fused
+// round(round(a*b)+c).
+pub module fp_fma_s (
+    i_a     : input  logic<32>,
+    i_b     : input  logic<32>,
+    i_c     : input  logic<32>,
+    i_neg_p : input  logic    ,
+    i_sub_c : input  logic    ,
+    i_rm    : input  logic<3> ,
+    o_result: output logic<32>,
+    o_fflags: output logic<5> ,
+) {
+    var result: logic<32>;
+    var fflags: logic<5> ;
+
+    // Align a 48-bit significand into the 80-bit window. `sh` is the signed
+    // left-shift (bit 12 = sign); negative => right shift with sticky. Returns
+    // {aligned[79:0], sticky}.
+    function align48 (
+        sig: input logic<48>,
+        sh : input logic<13>,
+    ) -> logic<81> {
+        var al: logic<80>;
+        var st: logic    ;
+        let ext: logic<80> = {32'd0, sig};
+        if sh[12] == 1'b0 {
+            // non-negative: left shift (lossless by construction)
+            al = ext << sh[6:0];
+            st = 1'b0;
+        } else {
+            let rs: logic<13> = ~sh + 13'd1; // -sh
+            if rs >= 13'd48 {
+                al = 80'd0;
+                st = sig != 48'd0;
+            } else {
+                let rsu : logic<6>  = rs[5:0];
+                let mask: logic<48> = (48'd1 << rsu) - 48'd1;
+                al = ext >> rsu;
+                st = (sig & mask) != 48'd0;
+            }
+        }
+        return {al, st};
+    }
+
+    // Round decision for a significand whose LSB is `ll`, with guard `g`, round
+    // `rr` and sticky `ss`, in rounding mode `rm` for a result of sign `sgn`.
+    function round_up_fn (
+        rm : input logic<3>,
+        sgn: input logic   ,
+        g  : input logic   ,
+        rr : input logic   ,
+        ss : input logic   ,
+        ll : input logic   ,
+    ) -> logic {
+        var ru: logic;
+        case rm {
+            3'b000 : ru = g && (rr || ss || ll);
+            3'b001 : ru = 1'b0;
+            3'b010 : ru = sgn && (g || rr || ss);
+            3'b011 : ru = !sgn && (g || rr || ss);
+            3'b100 : ru = g;
+            default: ru = g && (rr || ss || ll);
+        }
+        return ru;
+    }
+
+    always_comb {
+        // ---- decode ----
+        let sa: logic     = i_a[31];
+        let ea: logic<8>  = i_a[30:23];
+        let ma: logic<23> = i_a[22:0];
+        let sb: logic     = i_b[31];
+        let eb: logic<8>  = i_b[30:23];
+        let mb: logic<23> = i_b[22:0];
+        let sc: logic     = i_c[31];
+        let ec: logic<8>  = i_c[30:23];
+        let mc: logic<23> = i_c[22:0];
+
+        let a_zero: logic = ea == 8'd0 && ma == 23'd0;
+        let b_zero: logic = eb == 8'd0 && mb == 23'd0;
+        let c_zero: logic = ec == 8'd0 && mc == 23'd0;
+        let a_inf : logic = ea == 8'hFF && ma == 23'd0;
+        let b_inf : logic = eb == 8'hFF && mb == 23'd0;
+        let c_inf : logic = ec == 8'hFF && mc == 23'd0;
+        let a_nan : logic = ea == 8'hFF && ma != 23'd0;
+        let b_nan : logic = eb == 8'hFF && mb != 23'd0;
+        let c_nan : logic = ec == 8'hFF && mc != 23'd0;
+        let a_snan: logic = a_nan && ma[22] == 1'b0;
+        let b_snan: logic = b_nan && mb[22] == 1'b0;
+        let c_snan: logic = c_nan && mc[22] == 1'b0;
+        let a_sub : logic = ea == 8'd0 && ma != 23'd0;
+        let b_sub : logic = eb == 8'd0 && mb != 23'd0;
+        let c_sub : logic = ec == 8'd0 && mc != 23'd0;
+
+        // signs after applying the negate controls
+        let prod_sign: logic = sa ^ sb ^ i_neg_p;
+        let c_sign   : logic = sc ^ i_sub_c;
+
+        let inf_zero: logic = (a_inf && b_zero) || (a_zero && b_inf);
+
+        let qnan: logic<32> = 32'h7FC00000;
+
+        result = 32'd0;
+        fflags = 5'd0;
+
+        if a_nan || b_nan || c_nan {
+            // NaN operand: canonical qNaN. NV if any sNaN, or inf*0 also present.
+            result = qnan;
+            if a_snan || b_snan || c_snan || inf_zero {
+                fflags = 5'b10000;
+            }
+        } else if inf_zero {
+            // 0 * inf (no NaN inputs): invalid
+            result = qnan;
+            fflags  = 5'b10000;
+        } else if a_inf || b_inf {
+            // product is +/-inf (other operand finite nonzero)
+            if c_inf && (prod_sign != c_sign) {
+                result = qnan; // inf - inf
+                fflags  = 5'b10000;
+            } else {
+                result = {prod_sign, 8'hFF, 23'd0};
+            }
+        } else if c_inf {
+            // finite product + inf addend
+            result = {c_sign, 8'hFF, 23'd0};
+        } else if a_zero || b_zero {
+            // product is zero, all finite
+            if c_zero {
+                let zsign: logic = if prod_sign == c_sign ? prod_sign : if i_rm == 3'b010 ? 1'b1 : 1'b0;
+                result = {zsign, 31'd0};
+            } else {
+                // result = +/- c (exact)
+                result = {c_sign, i_c[30:0]};
+            }
+        } else {
+            // ---- MAIN PATH: product nonzero finite, c finite (maybe zero) ----
+            let sig_a: logic<24> = if a_sub ? {1'b0, ma} : {1'b1, ma};
+            let sig_b: logic<24> = if b_sub ? {1'b0, mb} : {1'b1, mb};
+            let sig_c: logic<24> = if c_sub || c_zero ? {1'b0, mc} : {1'b1, mc};
+
+            let ext_a: logic<48> = {24'd0, sig_a};
+            let ext_b: logic<48> = {24'd0, sig_b};
+            var prod : logic<48>;
+            prod = ext_a * ext_b;
+
+            // effective biased exponents (subnormal/zero -> 1)
+            let a_e10: logic<10> = if a_sub ? 10'd1 : {2'd0, ea};
+            let b_e10: logic<10> = if b_sub ? 10'd1 : {2'd0, eb};
+            let c_e10: logic<10> = if c_sub || c_zero ? 10'd1 : {2'd0, ec};
+
+            // LSB exponents (signed, 12-bit two's complement)
+            //   product value = prod * 2^pe,  pe = ea_eff + eb_eff - 300
+            //   addend  value = sig_c * 2^ce, ce = ec_eff - 150
+            let pe: logic<12> = {2'd0, a_e10} + {2'd0, b_e10} - 12'd300;
+            let ce: logic<12> = {2'd0, c_e10} - 12'd150;
+
+            // anchor on the larger MSB estimate (product spans 48 bits, addend 24)
+            let p_top    : logic<12> = pe + 12'd47;
+            let c_top    : logic<12> = ce + 12'd23;
+            let c_top_eff: logic<12> = if c_zero ? 12'h800 : c_top; // -2048 sentinel
+            let top_exp  : logic<12> = if $signed(p_top) >= $signed(c_top_eff) ? p_top : c_top_eff;
+            let lsb_w    : logic<12> = top_exp - 12'd78;
+
+            let shift_p: logic<13> = {pe[11], pe} - {lsb_w[11], lsb_w};
+            let shift_c: logic<13> = {ce[11], ce} - {lsb_w[11], lsb_w};
+
+            let ap: logic<81> = align48(prod, shift_p);
+            let ac: logic<81> = align48({24'd0, sig_c}, shift_c);
+
+            // {align[79:0], sticky} -> field with sticky in bit 0
+            let field_p: logic<81> = ap;
+            let field_c: logic<81> = ac;
+
+            // signed (two's complement) add in 84 bits
+            let ext_p   : logic<84> = {3'd0, field_p};
+            let ext_c   : logic<84> = {3'd0, field_c};
+            let signed_p: logic<84> = if prod_sign ? ~ext_p + 84'd1 : ext_p;
+            let signed_c: logic<84> = if c_sign ? ~ext_c + 84'd1 : ext_c;
+            let sum_s   : logic<84> = signed_p + signed_c;
+
+            let res_sign: logic     = sum_s[83];
+            let sum_mag : logic<84> = if sum_s[83] ? ~sum_s + 84'd1 : sum_s;
+
+            if sum_mag == 84'd0 {
+                // exact cancellation to zero (nonzero operands) -> +0, -0 in RDN
+                let zsign: logic = if i_rm == 3'b010 ? 1'b1 : 1'b0;
+                result = {zsign, 31'd0};
+            } else {
+                // normalize: leading-one search
+                var lzc: logic<7>;
+                lzc = 7'd84;
+                for i in 0..84 {
+                    if sum_mag[83 - i] == 1'b1 && lzc == 7'd84 {
+                        lzc = i[6:0];
+                    }
+                }
+                let norm: logic<84> = sum_mag << lzc;
+                // weight of bit j of sum_mag is 2^(lsb_w-1+j); leading bit at
+                // 83-lzc => biased exp = (lsb_w-1 + 83-lzc) + 127 = lsb_w + 209 - lzc
+                let biased: logic<12> = lsb_w + 12'd209 - {5'd0, lzc};
+
+                // 27-bit normalized significand: [26:3] = 24-bit (implicit +
+                // frac), [2:0] = G,R,S. This is the exact result normalized with
+                // an UNBOUNDED exponent (no subnormal flush yet).
+                let nm: logic<27> = {norm[83:60], norm[59], norm[58], norm[57:0] != 58'd0};
+
+                // --- unbounded rounding: determines tininess (after rounding) ---
+                // Round the normalized significand as if the exponent range were
+                // unbounded. If that carries, the exponent grows by 1. The result
+                // is "tiny" (underflow candidate) iff the unbounded-rounded
+                // exponent is below the smallest normal (biased <= 0).
+                let ru0  : logic     = round_up_fn(i_rm, res_sign, nm[2], nm[1], nm[0], nm[3]);
+                let sig0 : logic<25> = {1'b0, nm[26:3]} + {24'd0, ru0};
+                let exp_u: logic<12> = biased + {11'd0, sig0[24]};
+                let tiny : logic     = $signed(exp_u) <= 12'sd0;
+
+                if $signed(biased) >= 12'sd1 {
+                    // ---- normal result (exact result >= smallest normal) ----
+                    let nx    : logic = nm[2] || nm[1] || nm[0];
+                    var efield: logic<12>;
+                    var frac  : logic<23>;
+                    if sig0[24] == 1'b1 {
+                        efield = biased + 12'd1;
+                        frac   = 23'd0;
+                    } else {
+                        efield = biased;
+                        frac   = sig0[22:0];
+                    }
+                    if $signed(efield) >= 12'sd255 {
+                        let inf_r : logic<32> = {res_sign, 8'hFF, 23'd0};
+                        let maxn  : logic<32> = {res_sign, 8'hFE, 23'h7FFFFF};
+                        var ov_res: logic<32>;
+                        case i_rm {
+                            3'b001 : ov_res = maxn;
+                            3'b010 : ov_res = if res_sign ? inf_r : maxn;
+                            3'b011 : ov_res = if res_sign ? maxn : inf_r;
+                            default: ov_res = inf_r;
+                        }
+                        result = ov_res;
+                        fflags  = 5'b00101; // OF | NX
+                    } else {
+                        result = {res_sign, efield[7:0], frac};
+                        if nx {
+                            fflags = 5'b00001;
+                        }
+                    }
+                } else {
+                    // ---- subnormal result (exact result < smallest normal) ----
+                    // Store with the BOUNDED rounding (shift to the subnormal grid
+                    // first, then round). The stored value may still round up to
+                    // the smallest normal (efield = 1); UF is governed by the
+                    // unbounded `tiny` test, not by the stored exponent.
+                    let ss    : logic<12> = 12'd1 - biased;
+                    let scl   : logic<6>  = if $signed(ss) >: 12'sd27 ? 6'd27 : ss[5:0];
+                    let sm    : logic<27> = nm >> scl;
+                    let stk   : logic     = (nm & ((27'd1 << scl) - 27'd1)) != 27'd0;
+                    let nms   : logic<27> = {sm[26:1], sm[0] | stk};
+                    let nx_sub: logic     = nms[2] || nms[1] || nms[0];
+                    let ru1   : logic     = round_up_fn(i_rm, res_sign, nms[2], nms[1], nms[0], nms[3]);
+                    let sig1  : logic<25> = {1'b0, nms[26:3]} + {24'd0, ru1};
+                    let efield: logic<12> = {11'd0, sig1[23]};
+                    let frac  : logic<23> = sig1[22:0];
+                    result = {res_sign, efield[7:0], frac};
+                    if nx_sub {
+                        fflags = 5'b00001;
+                    }
+                    if tiny && nx_sub {
+                        fflags = 5'b00011; // UF | NX
+                    }
+                }
+            }
+        }
+    }
+    assign o_result = result;
+    assign o_fflags = fflags;
+}
