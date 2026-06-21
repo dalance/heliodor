@@ -61,12 +61,34 @@ clean (`Zicbom`/`Zicboz` need `CACHE_BLOCK_SIZE=64` +
 treats `cbo.inval/clean/flush` as legal no-ops, so `cbo.inval` never discards
 dirty data; the `Misalign*` suites just need `MISALIGNED_LDST=true`).
 
-Still uncovered: the **privileged / virtual-memory** suites (`Sv`, `Svnapot`,
-`Svpbmt`, `Svade`/`Svadu`, `Svinval`, `pmp`, `Exceptions*`) — heliodor
-implements all of these, but they need an S-mode + page-table harness (the
-current `test_arch_common_harness` runs M-mode). The **vector V** suites are
-absent from this upstream clone. **Zacas** and **Zabha** are RVA23-mandatory but
-**not implemented** in heliodor (a real gap, not just untested).
+### Privileged / virtual-memory suites (in progress)
+
+The `priv/` suites (`Svnapot`, `Svpbmt`, `Svade`/`Svadu`, `Svinval`, `Svbare`,
+…) run in S/U-mode and mode-switch via `mret`. They were unblocked by defining
+**`STANDARD_SM_SUPPORTED`** in `rvmodel_macros.h`: heliodor implements the
+mandatory M-mode spec (it boots Linux), so it uses the framework's standard Sm
+boot + trap-handler infrastructure (the prolog that initializes `mscratch`, the
+trampolines, `xtvec`, the `GOTO_*MODE` calls). Without it `mscratch` stays 0 and
+the tests' mode-switch loads fault into a trap loop — even on the Sail reference.
+Enabling it does **not** regress the 506 M-mode suites (re-verified 506/0). The
+DUT config also needs Sv39-only (`sail.json` `Sv48` → false) and the
+`Svnapot`/`Svpbmt`/`Svadu`/`Svinval` flags enabled.
+
+Result so far: **`Svnapot` 4/4, `Svade` 2/2** pass; `Svbare` 2/3, `Svpbmt` 2/4.
+**7 tests fail — all real heliodor RTL bugs** the suite caught (to fix next):
+
+| failing | bug |
+|---|---|
+| `Svinval` (×2) | `SFENCE.W.INVAL`/`SFENCE.INVAL.IR` are decoded as unconditional NOPs, so they don't raise illegal-instruction in U-mode (they are S-mode ops). They must trap in U-mode but, unlike `SFENCE.VMA`/`SINVAL.VMA`, must **not** be trapped by `mstatus.TVM` — so they need a privilege-checked path distinct from `is_sfence`. |
+| `Svpbmt` nonleaf (×2) | `PBMT != 0` in a **non-leaf** PTE is reserved and must raise a page fault; heliodor ignores it. |
+| `Svadu` (×2) | hardware A/D update (`menvcfg.ADUE`) diverges from the reference across the A/D-bit combinations. |
+| `Svbare` mprv (×1) | `mstatus.MPRV` with `MPP = S/U` and `satp = Bare` — effective-privilege load/store path diverges. |
+
+These suites are **not** in the default `make` EXT yet (the default stays green
+at 506); generate them with `make -C test/act EXT="Svnapot Svpbmt Svade Svadu
+Svinval Svbare"`. The **vector V** suites are absent from this upstream clone.
+**Zacas** and **Zabha** are RVA23-mandatory but **not implemented** in heliodor
+(a real gap, not just untested).
 
 Two framework-integration fixes were needed to generate these. (1) The upstream
 `make` wants `EXTENSIONS` **comma-separated** and strips all spaces, so the

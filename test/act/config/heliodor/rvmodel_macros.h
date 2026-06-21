@@ -11,6 +11,14 @@
         .align 8; .global fromhost; fromhost: .dword 0;     \
         .popsection;
 
+// heliodor implements the mandatory M-mode spec (full M/S/U, CSRs, traps — it
+// boots Linux), so use the framework's standard Sm boot + trap-handler
+// infrastructure. This is required for the privileged / virtual-memory suites
+// (they mode-switch via mret and rely on the prolog initializing mscratch, the
+// trampolines, xtvec, etc.); without it mscratch stays 0 and the tests' mode-
+// switch loads fault into a trap loop. Same as the spike/sail rv64-max configs.
+#define STANDARD_SM_SUPPORTED
+
 ##### STARTUP #####
 
 # Perform boot operations. Can be empty or left undefined unless needed for
