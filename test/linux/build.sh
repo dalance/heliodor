@@ -45,24 +45,44 @@ mkdir -p "$bd/initramfs/dev"
   -o "$bd/initramfs/init" "$here/init/$init"
 ( cd "$bd/initramfs" && find . | cpio -o -H newc 2>/dev/null ) > "$bd/initramfs.cpio"
 
-# ---- 2. kernel Image (single toolchain, no LD override / Kconfig patches) ----
-# Merge the variant config fragment, then build. binutils >= 2.43 has RVV `as`,
-# `ld -shared` for the vDSO, and ld >= 2.38 so TOOLCHAIN_HAS_V auto-detects.
-frag="$here/configs/heliodor_kernel.frag"
-[ "$variant" = 71v ] && frag="$here/configs/heliodor_kernel.frag"   # adjust per-variant frag as needed
-make -C "$KERNEL_SRC" ARCH=riscv CROSS_COMPILE="$CC" O="$bd/kbuild" defconfig
-if [ -f "$frag" ]; then
-  "$KERNEL_SRC/scripts/kconfig/merge_config.sh" -O "$bd/kbuild" "$bd/kbuild/.config" "$frag"
+# ---- 2. kernel Image (single toolchain) -------------------------------------
+# binutils >= 2.43 has RVV `as`, `ld -shared` for the vDSO, and ld >= 2.38 so
+# Kconfig TOOLCHAIN_HAS_V auto-detects — no elf/linux mix, no LD override, no
+# TOOLCHAIN_HAS_V LD-version patch (those were the old workarounds). The ONE
+# remaining edit is disabling the getrandom vDSO: gcc lowers a struct copy in
+# getrandom.o to `memcpy`, producing a JUMP_SLOT dynamic reloc the vDSO link
+# rejects. That is a gcc-codegen issue (unrelated to ld); gate it off.
+grep -q 'VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT && BROKEN' "$KERNEL_SRC/arch/riscv/Kconfig" || \
+  sed -i 's/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO && 64BIT$/select VDSO_GETRANDOM if HAVE_GENERIC_VDSO \&\& 64BIT \&\& BROKEN/' \
+    "$KERNEL_SRC/arch/riscv/Kconfig"
+
+# Config: a committed full snapshot (configs/heliodor_kernel_<variant>.config) if
+# present (e.g. 71v with V enabled), else defconfig + a fragment.
+snap="$here/configs/heliodor_kernel_${variant}.config"
+mkdir -p "$bd/kbuild"
+if [ -f "$snap" ]; then
+  cp "$snap" "$bd/kbuild/.config"
+else
+  make -C "$KERNEL_SRC" ARCH=riscv CROSS_COMPILE="$CC" O="$bd/kbuild" defconfig
+  [ -f "$here/configs/heliodor_kernel.frag" ] && \
+    "$KERNEL_SRC/scripts/kconfig/merge_config.sh" -O "$bd/kbuild" "$bd/kbuild/.config" "$here/configs/heliodor_kernel.frag"
 fi
 # Point the embedded initramfs at our cpio.
 "$KERNEL_SRC/scripts/config" --file "$bd/kbuild/.config" \
   --set-str INITRAMFS_SOURCE "$bd/initramfs.cpio"
 make -C "$KERNEL_SRC" ARCH=riscv CROSS_COMPILE="$CC" O="$bd/kbuild" olddefconfig
 make -C "$KERNEL_SRC" ARCH=riscv CROSS_COMPILE="$CC" O="$bd/kbuild" -j"$(nproc)" Image
+grep -q 'CONFIG_RISCV_ISA_V=y' "$bd/kbuild/.config" || echo "WARNING: CONFIG_RISCV_ISA_V not set"
 
 image="$bd/kbuild/arch/riscv/boot/Image"
-hart_lottery="$(awk '/ hart_lottery$/{print "0x"$1}' "$bd/kbuild/System.map" | head -1)"
-echo "hart_lottery = $hart_lottery"
+# hart_lottery: System.map holds a virtual address on a VA-mapped kernel; the
+# firmware needs the physical address (PA = VA - PAGE_OFFSET + DRAM_BASE).
+hl="$(awk '/ hart_lottery$/{print $1}' "$bd/kbuild/System.map" | head -1)"
+case "$hl" in
+  ffffffff8*) hart_lottery="$(printf '0x%x' $(( 0x$hl - 0xffffffff80000000 + 0x80000000 )))" ;;
+  *)          hart_lottery="0x$hl" ;;
+esac
+echo "hart_lottery VA=$hl -> PA=$hart_lottery"
 
 # ---- 3. DTB ------------------------------------------------------------------
 dtc -I dts -O dtb -o "$bd/heliodor.dtb" "$here/dts/$dts"

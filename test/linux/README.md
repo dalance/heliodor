@@ -36,19 +36,27 @@ elf-CC + linux-LD **mix** plus two kernel Kconfig patches
 (`VDSO_GETRANDOM`/`-mno-relax`, and dropping the `TOOLCHAIN_HAS_V` LD-version
 `depends on`).
 
-**The pinned `toolchain/linux` (riscv-collab 2026.x, binutils 2.43) has all
-three.** So `build.sh` uses one `CROSS_COMPILE` with no `LD=` override and no
-Kconfig edits. The only remaining flag is `-mno-relax` on the freestanding
-`/init` — a genuine requirement (a `-nostartfiles` binary never inits `gp`, so
-gp-relative relaxation of its static arrays would fault), not a toolchain
-workaround.
+**The pinned `toolchain/linux` (riscv-collab 2026.06.06, GCC 16 / binutils
+2.46) has all three.** So `build.sh` uses one `CROSS_COMPILE` with **no `LD=`
+override and no `TOOLCHAIN_HAS_V` LD-version patch** — `ld` 2.46 ≥ 23800, so
+`CONFIG_RISCV_ISA_V=y` survives `olddefconfig`. (Validated: a clean v7.1 tree +
+the pinned toolchain keeps `CONFIG_TOOLCHAIN_HAS_V=y` with the Kconfig
+unpatched, and the built V kernel boots on heliodor to `x3 == 0xAA`.)
 
-> If a future toolchain/kernel pairing resurfaces the vDSO `dynamic relocations
-> are not supported` error (gcc lowering struct copies to `memcpy` in the
-> getrandom vDSO), the fallback is to gate `VDSO_GETRANDOM` off in
-> `arch/riscv/Kconfig`. The full history of the old mixed-toolchain recipe +
-> symptom→cause table is in git (`doc/linux_boot_hex_build.md` before this
-> commit).
+**One workaround remains, and it is NOT an ld issue:** `build.sh` gates
+`VDSO_GETRANDOM` off in `arch/riscv/Kconfig`. gcc lowers a struct copy in the
+getrandom vDSO (`getrandom.o`) to a `memcpy` call → an `R_RISCV_JUMP_SLOT memcpy`
+dynamic reloc, which the vDSO link rejects (`dynamic relocations are not
+supported`). `-mno-relax` does **not** fix this (it is a gcc-codegen issue, not
+the old as/ld relax mismatch). Disabling the getrandom vDSO is harmless (the
+syscall fallback is used). `-mno-relax` is still needed on the freestanding
+`/init` (a `-nostartfiles` binary never inits `gp`).
+
+> Net vs. the old setup: the elf/linux **mix** and the **TOOLCHAIN_HAS_V
+> LD-version patch** are gone (the ld-version problem is solved); only the
+> getrandom-vDSO gate (a gcc-codegen workaround) survives. The full history of
+> the old mixed-toolchain recipe + symptom→cause table is in git
+> (`doc/linux_boot_hex_build.md` before this commit).
 
 ## Key facts
 

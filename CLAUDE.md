@@ -79,9 +79,11 @@ source toolchain/env.sh     # put them on PATH (+ ACT4 env)
 ```
 
 - `elf/` riscv64-unknown-elf-gcc (GCC 16) — ACT4, riscv-tests, directed/bare hex.
-- `linux/` riscv64-unknown-linux-gnu-gcc (GCC 16, **binutils 2.43**) — the Linux
+- `linux/` riscv64-unknown-linux-gnu-gcc (GCC 16, **binutils 2.46**) — the Linux
   build. A single recent linux-gnu toolchain has RVV `as` + `ld -shared` +
-  `ld` ≥ 2.38, so the V-kernel build needs no elf/linux mix or Kconfig patches.
+  `ld` ≥ 2.38, so the V-kernel build drops the old elf/linux mix and the
+  TOOLCHAIN_HAS_V LD-version patch (only a getrandom-vDSO gate remains — a
+  gcc-codegen issue, not ld; see test/linux/README.md).
 - `sail/`, `uv/` — ACT4 reference model + Python env. Ruby/UDB use system Ruby.
 
 Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
