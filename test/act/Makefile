@@ -26,9 +26,22 @@ CFG_SRC    := $(HERE)/config/heliodor
 CFG_DST    := $(UPSTREAM)/config/cores/heliodor
 JOBS       ?= $(shell nproc)
 
-# Default set: the scalar suites heliodor currently passes/exercises. Extend with
-# e.g. EXT="B Zfa V" as those configs are verified.
-EXT        ?= I M Zaamo Zalrsc Zca Zcd Zicsr Zifencei F D
+# Default set: every scalar suite heliodor passes (472/472). Combined-extension
+# suites are named by their test DIRECTORY (e.g. ZfaF, ZcbZba) — see README.
+# Tokens are space-separated here (readable + fed to gen_suite.py) and translated
+# to commas for the framework below (EXT_CSV).
+EXT        ?= I M Zaamo Zalrsc Zca Zcd Zicsr Zifencei Zicntr F D \
+              Zba Zbb Zbs Zcb ZcbM ZcbZba ZcbZbb Zcmop Zimop Zicond \
+              Zihintntl ZihintntlZca Zihintpause ZfaF ZfaD Zfhmin ZfhminD
+
+# The upstream framework wants EXTENSIONS comma-separated and strips all spaces
+# from the value (so a space-separated list collapses to one bogus token and
+# matches nothing). EXT stays space-separated for readability + gen_suite.py;
+# translate to commas for the framework invocation below.
+empty      :=
+space      := $(empty) $(empty)
+comma      := ,
+EXT_CSV    := $(subst $(space),$(comma),$(strip $(EXT)))
 
 export OBJCOPY  := riscv64-unknown-elf-objcopy
 export ACT_WORK := $(UPSTREAM)/work/heliodor
@@ -61,7 +74,7 @@ elfs: framework
 	@command -v riscv64-unknown-elf-gcc >/dev/null || { echo "elf gcc not on PATH — source toolchain/env.sh"; exit 1; }
 	@command -v sail_riscv_sim >/dev/null || { echo "sail_riscv_sim not on PATH — source toolchain/env.sh"; exit 1; }
 	cd "$(UPSTREAM)" && uv run make \
-	  EXTENSIONS="$(EXT)" \
+	  EXTENSIONS="$(EXT_CSV)" \
 	  CONFIG_FILES=config/cores/heliodor/test_config.yaml \
 	  JOBS=$(JOBS)
 

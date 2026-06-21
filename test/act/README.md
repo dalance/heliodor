@@ -37,7 +37,7 @@ gitignored — regenerate with `make`.
 |------|---------|
 | `rvmodel_macros.h` | HALT writes `tohost=1` then **`fence.i`** (heliodor write-backs/invalidates dcache so the harness sees it in DRAM) |
 | `link.ld` | pins `.tohost` to **0x80001000** (a write-through region; floating high addresses sit in write-back dcache and never reach DRAM) → `TOHOST_IDX = 1024` |
-| `heliodor.yaml` | UDB config (RVA20S64-based, Sv39 only; extend for RVA23) |
+| `heliodor.yaml` | UDB config (RVA20S64 base + the implemented RVA23 scalar exts: Zba/Zbb/Zbs, Zcb, Zcmop/Zimop, Zicond, Zihintntl/Zihintpause, Zfa, Zfhmin) |
 | `sail.json` | Sail reference config |
 | `test_config.yaml` | compiler / objdump / `sail_riscv_sim` / udb / linker (all resolved from PATH) |
 
@@ -46,9 +46,41 @@ The harness module is `test_arch_common_harness` in `tb/test_arch_common.veryl`
 
 ## Status (2026-06-21)
 
-ACT4 **327/327**: integer/atomic/compressed/CSR **129/129**, rv64uf **82/82**,
-rv64ud **114/114**, Zicntr **2/2**. The last 3 F misses were a real heliodor
-RTL bug — **now fixed** (see below).
+ACT4 **472/472**. On top of the original base+FP **327** (integer/atomic/
+compressed/CSR **129/129**, rv64uf **82/82**, rv64ud **114/114**, Zicntr
+**2/2**), the RVA23 scalar extensions heliodor implements are now covered too:
+**Zba/Zbb/Zbs** (bit-manip) 8/24/8, **Zcb** (+`ZcbM`/`ZcbZba`/`ZcbZbb`) 12,
+**Zcmop** 8, **Zimop** 40, **Zicond** 2, **Zihintntl** (+`ZihintntlZca`) 8,
+**Zihintpause** 1, **Zfa** (`ZfaF`/`ZfaD`) 22, **Zfhmin** (`Zfhmin`/`ZfhminD`)
+12. The new suites caught one real heliodor RTL bug — **now fixed** (FCVT.H.S, see
+below); bit-manip / compressed / hints / Zicond / Zfa were clean on first run.
+
+Two framework-integration fixes were needed to generate these. (1) The upstream
+`make` wants `EXTENSIONS` **comma-separated** and strips all spaces, so the
+heliodor `Makefile` now translates the space-separated `EXT` to commas
+(`EXT_CSV`); a space-separated value silently collapsed to one bogus token and
+matched nothing. (2) The `--extensions` filter matches the **test directory
+name**, so combined-extension suites are requested by their dir name
+(`ZfaF`, `ZfaD`, `ZcbZba`, …), not the base name (`Zfa`, `Zcb`).
+
+The **FCVT.H.S** (single → half) miss was a real heliodor RTL bug in
+`fpu_wrap.veryl`, **now fixed**: the narrowing path flushed *every* input with
+biased single exponent `< 103` straight to signed zero. But an input with
+`xe == 102` (magnitude in `[2^-25, 2^-24)`) is closer to the smallest half
+subnormal than to zero, so RNE must round it **up to `0x0001`**, not down to
+`0x0000`. Repro (RNE): `fcvt.h.s` of `0x335e20be` (≈5.17e-8) gave `0x0000`,
+should be `0x0001`. Fix: drop the `xe < 103` flush and let the tiny **normal**
+inputs (`xe` 1..102) fall through to the existing subnormal-rounding path, which
+already rounds correctly for every mode; keep an explicit `xe == 0` arm for true
+zero and single-subnormal inputs (the latter now also rounds to ±min-subnormal
+under RDN/RUP). Verified exhaustively in a Python model of the RTL vs. an exact
+`Fraction` reference (≈2 M conversions, 5 rounding modes, 0 value/flag
+mismatches), then on hardware: `Zfhmin`/`ZfhminD` 12/12, default `veryl test`
+250/0.
+
+### Earlier fixes
+
+The original 3 F misses were a real heliodor RTL bug — **now fixed** (see below).
 
 The 3 F misses (`fcvt.w.s` / `fcvt.wu.s` / `fclass.s`, the `cp_fs1` `rd=x0`
 subtest) were a **real heliodor RTL bug, now fixed**: an FP→int / `fclass`
