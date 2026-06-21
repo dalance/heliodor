@@ -86,6 +86,45 @@ pub module fpu_wrap #(
         return ret;
     }
 
+    // int → FP inexactness (NX): 1 when the integer value cannot be represented
+    // exactly in the destination format, i.e. the conversion has to round. The
+    // magnitude (|raw|) is normalised so its leading 1 sits at bit 63; the bits
+    // below the kept significand (24-bit single → low 40 bits, 53-bit double →
+    // low 11 bits) are the guard/round/sticky — nonzero means inexact.
+    function int_to_fp_inexact (
+        raw      : input logic<64>,
+        is_signed: input logic    ,
+        is_word  : input logic    , // 32-bit source (else 64-bit)
+        is_dbl   : input logic    , // double destination (else single)
+    ) -> logic {
+        var mag: logic<64>;
+        if is_word {
+            if is_signed && raw[31] {
+                mag = {32'd0, ~raw[31:0] + 32'd1};
+            } else {
+                mag = {32'd0, raw[31:0]};
+            }
+        } else {
+            if is_signed && raw[63] {
+                mag = ~raw + 64'd1;
+            } else {
+                mag = raw;
+            }
+        }
+        if mag == 64'd0 {
+            return 1'b0;
+        }
+        var lz: logic<7>;
+        lz = 7'd64;
+        for i in 0..64 {
+            if mag[63 - i] == 1'b1 && lz == 7'd64 {
+                lz = i[6:0];
+            }
+        }
+        let norm: logic<64> = mag << lz;
+        return if is_dbl ? norm[10:0] != 11'd0 : norm[39:0] != 40'd0;
+    }
+
 
     // NaN-boxing helpers for single-precision (use forwarded data)
     let fp_s1      : logic<32> = fwd_fp_rs1[31:0];
@@ -706,9 +745,6 @@ pub module fpu_wrap #(
     // FP fflags selection (combinational) — selects the right submodule's
     // fflags based on the current fpu_op. FMIN/FMAX/FCMP synthesize NV
     // directly from operand classification.
-    // int→FP inexactness, computed alongside the value (reuses the rounding
-    // guard/round/sticky bits) and consumed by the fflags block to raise NX.
-    var cvt_int_nx     : logic    ;
     var fpu_fflags_comb: logic<5>;
     always_comb {
         fpu_fflags_comb = 5'd0;
@@ -1012,12 +1048,25 @@ pub module fpu_wrap #(
             FpuOp::FCVT_D_H: fpu_fflags_comb = cvt_d_h_fl;
             FpuOp::FCVT_H_S: fpu_fflags_comb = cvt_h_s_fl;
             FpuOp::FCVT_H_D: fpu_fflags_comb = cvt_h_d_fl;
-            // int → FP: NX when the value path had to round (cvt_int_nx is set in
-            // the value always_comb from that op's guard/round/sticky bits).
-            FpuOp::FCVT_S_W, FpuOp::FCVT_S_WU, FpuOp::FCVT_S_L, FpuOp::FCVT_S_LU, FpuOp::FCVT_D_L, FpuOp::FCVT_D_LU: {
-                if cvt_int_nx {
-                    fpu_fflags_comb = 5'b00001;
-                }
+            // int → FP: NX when the conversion has to round. int_to_fp_inexact
+            // takes (raw, is_signed, is_word/32-bit src, is_dbl/double dst).
+            FpuOp::FCVT_S_W: if int_to_fp_inexact(fwd_rs1, 1'b1, 1'b1, 1'b0) {
+                fpu_fflags_comb = 5'b00001;
+            }
+            FpuOp::FCVT_S_WU: if int_to_fp_inexact(fwd_rs1, 1'b0, 1'b1, 1'b0) {
+                fpu_fflags_comb = 5'b00001;
+            }
+            FpuOp::FCVT_S_L: if int_to_fp_inexact(fwd_rs1, 1'b1, 1'b0, 1'b0) {
+                fpu_fflags_comb = 5'b00001;
+            }
+            FpuOp::FCVT_S_LU: if int_to_fp_inexact(fwd_rs1, 1'b0, 1'b0, 1'b0) {
+                fpu_fflags_comb = 5'b00001;
+            }
+            FpuOp::FCVT_D_L: if int_to_fp_inexact(fwd_rs1, 1'b1, 1'b0, 1'b1) {
+                fpu_fflags_comb = 5'b00001;
+            }
+            FpuOp::FCVT_D_LU: if int_to_fp_inexact(fwd_rs1, 1'b0, 1'b0, 1'b1) {
+                fpu_fflags_comb = 5'b00001;
             }
             default: fpu_fflags_comb = 5'd0;
         }
@@ -1027,7 +1076,6 @@ pub module fpu_wrap #(
     var fpu_result: logic<64>;
     always_comb {
         fpu_result = 64'd0;
-        cvt_int_nx = 1'b0;
         case i_fpu_op {
             // FSGNJ: result sign = rs2 sign, magnitude = rs1
             FpuOp::FSGNJ_S : fpu_result = {32'hFFFFFFFF, s2_val[31], s1_val[30:0]};
@@ -1421,7 +1469,6 @@ pub module fpu_wrap #(
                     csw_r  = csw_norm[7];
                     csw_s  = csw_norm[6:0] != 7'd0;
                     csw_l  = csw_norm[9];
-                    cvt_int_nx = csw_g || csw_r || csw_s;
                     var csw_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : csw_ru = csw_g && (csw_r || csw_s || csw_l);
@@ -1464,7 +1511,6 @@ pub module fpu_wrap #(
                     cswu_r  = cswu_n[7];
                     cswu_s  = cswu_n[6:0] != 7'd0;
                     cswu_l  = cswu_n[9];
-                    cvt_int_nx = cswu_g || cswu_r || cswu_s;
                     var cswu_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : cswu_ru = cswu_g && (cswu_r || cswu_s || cswu_l);
@@ -1515,7 +1561,6 @@ pub module fpu_wrap #(
                     csl_r  = csl_sh[38];
                     csl_s  = csl_sh[37:0] != 38'd0;
                     csl_l  = csl_sh[40];
-                    cvt_int_nx = csl_g || csl_r || csl_s;
                     var csl_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : csl_ru = csl_g && (csl_r || csl_s || csl_l);
@@ -1558,7 +1603,6 @@ pub module fpu_wrap #(
                     cslu_r  = cslu_sh[38];
                     cslu_s  = cslu_sh[37:0] != 38'd0;
                     cslu_l  = cslu_sh[40];
-                    cvt_int_nx = cslu_g || cslu_r || cslu_s;
                     var cslu_ru: logic;
                     case fp_rm_resolved {
                         3'b000 : cslu_ru = cslu_g && (cslu_r || cslu_s || cslu_l);
@@ -1958,7 +2002,6 @@ pub module fpu_wrap #(
                     cl_g     = cl_shifted[10];
                     cl_r     = cl_shifted[9];
                     cl_s     = cl_shifted[8:0] != 9'd0;
-                    cvt_int_nx = cl_g || cl_r || cl_s;
                     var cl_lsb_v: logic;
                     cl_lsb_v = cl_shifted[11];
                     var cl_round: logic;
@@ -2004,7 +2047,6 @@ pub module fpu_wrap #(
                     clu_g       = clu_shifted[10];
                     clu_r       = clu_shifted[9];
                     clu_s       = clu_shifted[8:0] != 9'd0;
-                    cvt_int_nx = clu_g || clu_r || clu_s;
                     var clu_lsb_v  : logic;
                     clu_lsb_v   = clu_shifted[11];
                     var clu_round  : logic;
