@@ -37,7 +37,7 @@ gitignored — regenerate with `make`.
 |------|---------|
 | `rvmodel_macros.h` | HALT writes `tohost=1` then **`fence.i`** (heliodor write-backs/invalidates dcache so the harness sees it in DRAM) |
 | `link.ld` | pins `.tohost` to **0x80001000** (a write-through region; floating high addresses sit in write-back dcache and never reach DRAM) → `TOHOST_IDX = 1024` |
-| `heliodor.yaml` | UDB config (RVA20S64 base + the implemented RVA23 scalar exts: Zba/Zbb/Zbs, Zcb, Zcmop/Zimop, Zicond, Zihintntl/Zihintpause, Zfa, Zfhmin) |
+| `heliodor.yaml` | UDB config (RVA20S64 base + implemented RVA23 exts: Zba/Zbb/Zbs, Zcb, Zcmop/Zimop, Zicond, Zihintntl/Zihintpause, Zfa, Zfhmin, Zicbom/Zicboz/Zicbop, Zihpm, Zmmul + `MISALIGNED_LDST`/`CACHE_BLOCK_SIZE` params) |
 | `sail.json` | Sail reference config |
 | `test_config.yaml` | compiler / objdump / `sail_riscv_sim` / udb / linker (all resolved from PATH) |
 
@@ -46,14 +46,27 @@ The harness module is `test_arch_common_harness` in `tb/test_arch_common.veryl`
 
 ## Status (2026-06-21)
 
-ACT4 **472/472**. On top of the original base+FP **327** (integer/atomic/
+ACT4 **506/506**. On top of the original base+FP **327** (integer/atomic/
 compressed/CSR **129/129**, rv64uf **82/82**, rv64ud **114/114**, Zicntr
 **2/2**), the RVA23 scalar extensions heliodor implements are now covered too:
 **Zba/Zbb/Zbs** (bit-manip) 8/24/8, **Zcb** (+`ZcbM`/`ZcbZba`/`ZcbZbb`) 12,
 **Zcmop** 8, **Zimop** 40, **Zicond** 2, **Zihintntl** (+`ZihintntlZca`) 8,
 **Zihintpause** 1, **Zfa** (`ZfaF`/`ZfaD`) 22, **Zfhmin** (`Zfhmin`/`ZfhminD`)
-12. The new suites caught one real heliodor RTL bug — **now fixed** (FCVT.H.S, see
-below); bit-manip / compressed / hints / Zicond / Zfa were clean on first run.
+12 — these caught one real RTL bug (FCVT.H.S, **now fixed**, see below);
+everything else was clean on first run. The cache-block / counter / misaligned
+suites are covered too: **Zicbom** 3, **Zicboz** 1, **Zicbop** 3, **Zihpm** 2,
+**Zmmul** 5, **Misalign**/`MisalignD`/`MisalignF`/`MisalignZca` 8/2/2/8 — all
+clean (`Zicbom`/`Zicboz` need `CACHE_BLOCK_SIZE=64` +
+`FORCE_UPGRADE_CBO_INVAL_TO_FLUSH=true`: heliodor's coherent write-back design
+treats `cbo.inval/clean/flush` as legal no-ops, so `cbo.inval` never discards
+dirty data; the `Misalign*` suites just need `MISALIGNED_LDST=true`).
+
+Still uncovered: the **privileged / virtual-memory** suites (`Sv`, `Svnapot`,
+`Svpbmt`, `Svade`/`Svadu`, `Svinval`, `pmp`, `Exceptions*`) — heliodor
+implements all of these, but they need an S-mode + page-table harness (the
+current `test_arch_common_harness` runs M-mode). The **vector V** suites are
+absent from this upstream clone. **Zacas** and **Zabha** are RVA23-mandatory but
+**not implemented** in heliodor (a real gap, not just untested).
 
 Two framework-integration fixes were needed to generate these. (1) The upstream
 `make` wants `EXTENSIONS` **comma-separated** and strips all spaces, so the

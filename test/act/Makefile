@@ -32,7 +32,9 @@ JOBS       ?= $(shell nproc)
 # to commas for the framework below (EXT_CSV).
 EXT        ?= I M Zaamo Zalrsc Zca Zcd Zicsr Zifencei Zicntr F D \
               Zba Zbb Zbs Zcb ZcbM ZcbZba ZcbZbb Zcmop Zimop Zicond \
-              Zihintntl ZihintntlZca Zihintpause ZfaF ZfaD Zfhmin ZfhminD
+              Zihintntl ZihintntlZca Zihintpause ZfaF ZfaD Zfhmin ZfhminD \
+              Zicbom Zicboz Zicbop Zihpm Zmmul \
+              Misalign MisalignD MisalignF MisalignZca
 
 # The upstream framework wants EXTENSIONS comma-separated and strips all spaces
 # from the value (so a space-separated list collapses to one bogus token and
