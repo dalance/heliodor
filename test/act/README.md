@@ -46,30 +46,30 @@ The harness module is `test_arch_common_harness` in `tb/test_arch_common.veryl`
 
 ## Status (2026-06-21)
 
-ACT4 **324/327**: integer/atomic/compressed/CSR **129/129**, rv64uf **79/82**,
-rv64ud **114/114**, Zicntr **fixed**. The 3 remaining F misses are a confirmed
-**real heliodor RTL bug** (see below) — NOT a test-binary issue.
+ACT4 **327/327**: integer/atomic/compressed/CSR **129/129**, rv64uf **82/82**,
+rv64ud **114/114**, Zicntr **2/2**. The last 3 F misses were a real heliodor
+RTL bug — **now fixed** (see below).
 
-The 3 remaining misses (`fcvt.w.s` / `fcvt.wu.s` / `fclass.s`) are a **real
-heliodor RTL bug**: an FP→int / `fclass` instruction with **`rd=x0`** leaks its
-result to a *nearby* reader of `x0` instead of returning hardwired zero. The
-failing subtest is `cp_fs1` `rd=x0` (e.g. `fcvt.w.s x0, f12`); the signature
-golden for that slot is correctly **0** (the `0xbaaaaaad…` in the RVCP "Bad
-Value" is a cosmetic artifact of the `rd=x0` failure-reporter, not the golden —
-the golden in the ELF is `0`). The bug is **transient/timing-dependent**: a
-dependent read 0–1 instructions after the FP→int op sees the leaked result,
-≥2 instructions away sees the correct 0; it is also value-dependent (varies
-with the FP→int latency). **Disambiguation done**: the same self-checking ELF
-**passes on the Sail reference**, **fails on all three Veryl-sim backends (cc /
-cranelift / interpret)**, and **also fails on Verilator** (standard SV NBA) —
-so it is a real RTL bug, not a Veryl-sim artifact. The architectural x0 paths
-(RAT skips r0, PRF-write / IQ-wakeup / intra-bundle rename bypass all gate on
-`has_rd` & `rd!=0`) are correct on inspection, so the leaking path is a
-non-obvious same-cycle forwarding corner — root-cause + fix pending (needs
-waveform debug). The double-precision counterparts (`fcvt.w.d` / `fcvt.wu.d` /
-`fclass.d`) pass only because their `rd=x0` subtests happen to convert to 0 (or
-land outside the leak window). Repro: `fcvt.w.s x0, f0` with `f0=0xc5606eda`
-(→ −3591) then `addi x7, x0, 1` → `x7 != 1` (x0 leaked).
+The 3 F misses (`fcvt.w.s` / `fcvt.wu.s` / `fclass.s`, the `cp_fs1` `rd=x0`
+subtest) were a **real heliodor RTL bug, now fixed**: an FP→int / `fclass`
+instruction with **`rd=x0`** wrote its result back to `prf[0]` (the arch-zero
+hard tie) and a *nearby* reader of `x0` then saw the result instead of hardwired
+zero. Root cause: the FP issue-queue `has_rd` dispatch
+(`heliodor_core.veryl`) was `fp_writes_fp || fp_writes_int` — it skipped the
+`rd!=0` gate that the integer path applies (`dec_op.has_rd = reg_wen && rd!=0`),
+so an FP→int op to `x0` still drove `cdb.has_rd=1` and corrupted `prf[0]`. Fix:
+gate the `fp_writes_int` term by `rd_arch != 0` (`fp_writes_fp` needs no gate —
+`f0` is a real FP register). The bug was **transient/value-dependent** (a read
+0–1 instructions later saw the leak, ≥2 away saw 0; FP→int latency shifted the
+window), which is why the double-precision `fcvt.w.d` / `fcvt.wu.d` / `fclass.d`
+`rd=x0` subtests happened to pass. **Diagnosis trail**: the signature golden for
+the slot is correctly `0` (the `0xbaaaaaad…` in the RVCP "Bad Value" is a
+cosmetic artifact of the `rd=x0` failure-reporter); the self-checking ELF
+**passes on Sail** but failed on **all three Veryl-sim backends AND Verilator**
+(SV NBA) → a real RTL bug, not a sim artifact. Repro (pre-fix): `fcvt.w.s x0,
+f0` with `f0=0xc5606eda` (→ −3591) then `addi x7, x0, 1` → `x7 != 1`. Verified:
+all 3 F tests pass; default `veryl test` 250/0; N=1 boot 4/4; N=2 SMP boot;
+litmus-4hart — all green.
 
 The 2 `Zicntr` misses **were a harness gap, now fixed** (`gen_suite.py` sets
 `MTIME_EN=1` for the Zicntr suite). The `cp_cntr` `time` subtest reads the
