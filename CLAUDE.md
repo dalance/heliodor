@@ -58,9 +58,34 @@ heliodor/
 │   └── pkg/                # Shared packages & type definitions
 ├── tb/                     # Testbenches (Veryl native test)
 ├── test/                   # RISC-V ISA tests, hex programs, C benchmarks
+│   ├── riscv-arch-test/    # riscv-tests ISA suites (upstream clone + built hex)
+│   ├── act/                # ACT4 (riscv-arch-test) RVA23 compliance (see test/act/README.md)
+│   └── linux/              # Linux boot image build (sources + build.sh; see test/linux/README.md)
+├── toolchain/              # Pinned prebuilt cross toolchains — fetch.sh/env.sh, binaries gitignored
 ├── doc/                    # Documentation
 └── veryl/                  # Veryl compiler — local clone, gitignored (see Veryl Toolchain)
 ```
+
+## Cross Toolchains (`toolchain/`)
+
+RISC-V cross compilers + the ACT4 Sail reference are **fetched as pinned
+prebuilt binaries**, not assumed on `$PATH` (same policy as the gitignored
+`veryl/` clone). Only `toolchain/{versions.env,fetch.sh,env.sh,README.md}` are
+committed; the binaries are gitignored.
+
+```bash
+toolchain/fetch.sh all      # download + extract (elf gcc, linux gcc, Sail, uv)
+source toolchain/env.sh     # put them on PATH (+ ACT4 env)
+```
+
+- `elf/` riscv64-unknown-elf-gcc (GCC 16) — ACT4, riscv-tests, directed/bare hex.
+- `linux/` riscv64-unknown-linux-gnu-gcc (GCC 16, **binutils 2.43**) — the Linux
+  build. A single recent linux-gnu toolchain has RVV `as` + `ld -shared` +
+  `ld` ≥ 2.38, so the V-kernel build needs no elf/linux mix or Kconfig patches.
+- `sail/`, `uv/` — ACT4 reference model + Python env. Ruby/UDB use system Ruby.
+
+Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
+(glibc 2.34, run on EL9). See `toolchain/README.md`.
 
 ## Development Conventions
 
