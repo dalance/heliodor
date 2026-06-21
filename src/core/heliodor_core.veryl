@@ -1211,6 +1211,13 @@ pub module heliodor_core #(
     // imem_fault_w forward-declared with the fetch latch above.
     var imem_ptw_addr_w: logic<64>;
     var imem_ptw_req_w : logic    ;
+    // P10 Svadu: instruction-side A-bit write-back (imem_mmu WRITE_AD). The write
+    // is routed through the d-cache store-drain port (see the dcache inst). These
+    // are forward-referenced by the imem_mmu inst; imem_aw_ack is assigned after
+    // the dcache (where dc_sdrain_ack is in scope).
+    var imem_ptw_wen_w  : logic    ;
+    var imem_ptw_wdata_w: logic<64>;
+    var imem_aw_ack     : logic    ;
     // Fetch addr advances by 2 during straddle so the next word lands
     // on the next cycle; in normal cycles it tracks pc_q.
     let fetch_vaddr: logic<64> = if straddle_q ? pc_q + 64'd2 : pc_q;
@@ -1262,6 +1269,10 @@ pub module heliodor_core #(
         // P9.6 phase 2: PTE comes back from the coherent IS read FSM below.
         i_ptw_data    : iptw_data          ,
         i_ptw_valid   : iptw_pte_valid     ,
+        // P10 Svadu: A-bit write-back routed through the d-cache store-drain port.
+        o_ptw_wen       : imem_ptw_wen_w   ,
+        o_ptw_wdata     : imem_ptw_wdata_w ,
+        i_ptw_write_done: imem_aw_ack      ,
         i_icache_stall: icache_stall       , // M8.A: hold MMU/TLB during icache fill
         i_sfence      : commit_sfence_pulse,
         i_sfence_vaddr   : sfence_vaddr   , // P9.5: selective flush operands
@@ -4947,9 +4958,16 @@ pub module heliodor_core #(
     assign c_store_mmio = ((if dmem_vm_on_op ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40)
         || (dmem_vm_on_op && dmu_pbmt_unc); // P10 Svpbmt: NC/IO store is uncached
     assign sb_pa   = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
+    // P10 Svadu: the instruction-side A-bit write-back borrows the store-drain
+    // port, but ONLY while the store buffer is empty (SB drain has priority). The
+    // PTE dword sits at lane imem_ptw_addr_w[5:3] of its 64B line.
+    let imem_aw_grant: logic    = imem_ptw_wen_w && sb_empty;
+    let imem_aw_lane : logic<3> = imem_ptw_addr_w[5:3];
     // S25 drain: the HEAD entry leaves as ONE line-wide transaction through
     // the dcache drain port (all 8 lanes + strobes); the ack pops the entry.
-    let sb_pop: logic = dc_sdrain_ack;
+    // Gate the pop with !imem_aw_grant so an A-bit-write ack (which fires while
+    // sb_empty) never underflows sb_cnt.
+    let sb_pop: logic = dc_sdrain_ack && !imem_aw_grant;
     // S25: line-match the pushing store against live entries. The head entry
     // is not a merge target on its pop cycle (its lanes are leaving the
     // buffer this edge); the store allocates a fresh entry instead. A merging
@@ -5621,6 +5639,30 @@ pub module heliodor_core #(
     // its PA falls inside the cacheable DRAM window.
     let dc_uncached: logic = dmu_dmem_ren && !replay_drive && !dc_amo_read
         && ((dmu_dmem_addr[63:25] != 39'h40) || (dmem_vm_on_op && dmu_pbmt_unc)); // Phase 11-H: HLV NC page
+    // P10 Svadu: build the store-drain port inputs — the instruction-side A-bit
+    // write-back (imem_aw_grant) takes the port when the store buffer is empty,
+    // else the normal committed-store-buffer drain. The A-write puts the updated
+    // PTE on its single dword lane (imem_aw_lane) with a 0xFF strobe, all other
+    // lanes idle, so the d-cache merges just the PTE into the owned line.
+    var sdrain_swdata: logic<64> [8];
+    var sdrain_swstrb: logic<8>  [8];
+    always_comb {
+        for l in 0..8 {
+            sdrain_swdata[l] = sb_head_data[l];
+            sdrain_swstrb[l] = sb_head_strb[l];
+        }
+        if imem_aw_grant {
+            for l in 0..8 {
+                sdrain_swdata[l] = 64'd0;
+                sdrain_swstrb[l] = 8'd0;
+            }
+            sdrain_swdata[imem_aw_lane] = imem_ptw_wdata_w;
+            sdrain_swstrb[imem_aw_lane] = 8'hFF;
+        }
+    }
+    let sdrain_saddr  : logic<64> = if imem_aw_grant ? {imem_ptw_addr_w[63:6], 6'd0} : {sb_line[0], 6'd0};
+    let sdrain_swen   : logic     = imem_aw_grant || !sb_empty;
+    let sdrain_urgent : logic     = imem_aw_grant || (sb_cnt >= 4'd3);
     inst u_dcache: dcache (
         clk                                              ,
         rst                                              ,
@@ -5648,13 +5690,13 @@ pub module heliodor_core #(
         // Phase 8 S6/S20: 2nd write port (store-drain), now fed by the
         // committed-store buffer head (oldest entry) instead of the live
         // committing store. o_sdrain_ack pops the entry.
-        i_saddr          : {sb_line[0], 6'd0}             ,
-        i_swen           : !sb_empty                      ,
+        i_saddr          : sdrain_saddr                   ,
+        i_swen           : sdrain_swen                    ,
         // S20.2: near-full buffer (or a head store already blocked on room)
         // escalates the drain over new fill starts.
-        i_sdrain_urgent  : sb_cnt >= 4'd3                 ,
-        i_swdata         : sb_head_data                   ,
-        i_swstrb         : sb_head_strb                   ,
+        i_sdrain_urgent  : sdrain_urgent                  ,
+        i_swdata         : sdrain_swdata                  ,
+        i_swstrb         : sdrain_swstrb                  ,
         o_sdrain_ack     : dc_sdrain_ack                  ,
         o_rdata2         : dcache_rdata2                  ,
         o_rdata2_next    : dcache_rdata2_next            ,
@@ -5709,6 +5751,11 @@ pub module heliodor_core #(
         o_memw_req       : dc_memw_req                   ,
         i_memw_grant     : i_dmemw_grant                 ,
     );
+
+    // P10 Svadu: the instruction-side A-bit write-back is accepted the cycle the
+    // store-drain port acks while the i-side owns it. This pulses imem_mmu's
+    // i_ptw_write_done so its WRITE_AD state advances to DONE and the fetch resumes.
+    assign imem_aw_ack = imem_aw_grant && dc_sdrain_ack;
 
     // ---- Phase 12 V1: VU memory-port arbitration (placed here so all the
     // dmem_mmu / dcache / MSHR / store-buffer sources it reads are defined) ----
