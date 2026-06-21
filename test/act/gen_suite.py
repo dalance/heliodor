@@ -30,6 +30,10 @@ def gen(ext):
     if not elfs:
         print(f"  [{ext}] no ELFs found under {ACT_WORK}/elfs/**/{ext}/"); return None
     os.makedirs(BINDIR, exist_ok=True)
+    # Zicntr reads `time` (CLINT mtime) and checks that it *increments* between
+    # two reads. The arch harness freezes i_mtime at 0 unless MTIME_EN=1, so the
+    # increment check would otherwise fail (cycle/instret advance regardless).
+    mtime_line = ["        MTIME_EN  : 1'b1,"] if extlc == "zicntr" else []
     mods = []
     for elf in elfs:
         base = os.path.basename(elf)[:-4]                       # e.g. I-addi-00
@@ -62,6 +66,7 @@ def gen(ext):
             f"    inst h: test_arch_common_harness #(",
             f'        HEX_FILE  : "{hexf}",',
             f"        TOHOST_IDX: 1024,",
+            *mtime_line,
             f"    ) (",
             f"        clk             ,",
             f"        rst             ,",

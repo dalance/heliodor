@@ -46,14 +46,34 @@ The harness module is `test_arch_common_harness` in `tb/test_arch_common.veryl`
 
 ## Status (2026-06-21)
 
-ACT4 **322/327**: integer/atomic/compressed/CSR **129/129**, rv64uf **79/82**,
-rv64ud **114/114**. All real-RTL FP bugs the suite exercises are fixed.
+ACT4 **324/327**: integer/atomic/compressed/CSR **129/129**, rv64uf **79/82**,
+rv64ud **114/114**, Zicntr **fixed**. The 3 remaining F misses are a confirmed
+**real heliodor RTL bug** (see below) — NOT a test-binary issue.
 
-The 5 remaining misses are **not** RTL bugs:
-- `fcvt.w.s` / `fcvt.wu.s` / `fclass.s` — the `cp_fs1` `rd=x0` subtests have a
-  **canary reference value** baked into those F test binaries (the equivalent
-  double-precision tests pass, so the heliodor result is correct). Likely a
-  signature-width quirk in the reference generation; revisit when bumping the
-  framework.
-- `Zicntr` (2) — `cycle`/`instret` reads differ non-deterministically between
-  heliodor and Sail; not comparable, not a bug.
+The 3 remaining misses (`fcvt.w.s` / `fcvt.wu.s` / `fclass.s`) are a **real
+heliodor RTL bug**: an FP→int / `fclass` instruction with **`rd=x0`** leaks its
+result to a *nearby* reader of `x0` instead of returning hardwired zero. The
+failing subtest is `cp_fs1` `rd=x0` (e.g. `fcvt.w.s x0, f12`); the signature
+golden for that slot is correctly **0** (the `0xbaaaaaad…` in the RVCP "Bad
+Value" is a cosmetic artifact of the `rd=x0` failure-reporter, not the golden —
+the golden in the ELF is `0`). The bug is **transient/timing-dependent**: a
+dependent read 0–1 instructions after the FP→int op sees the leaked result,
+≥2 instructions away sees the correct 0; it is also value-dependent (varies
+with the FP→int latency). **Disambiguation done**: the same self-checking ELF
+**passes on the Sail reference**, **fails on all three Veryl-sim backends (cc /
+cranelift / interpret)**, and **also fails on Verilator** (standard SV NBA) —
+so it is a real RTL bug, not a Veryl-sim artifact. The architectural x0 paths
+(RAT skips r0, PRF-write / IQ-wakeup / intra-bundle rename bypass all gate on
+`has_rd` & `rd!=0`) are correct on inspection, so the leaking path is a
+non-obvious same-cycle forwarding corner — root-cause + fix pending (needs
+waveform debug). The double-precision counterparts (`fcvt.w.d` / `fcvt.wu.d` /
+`fclass.d`) pass only because their `rd=x0` subtests happen to convert to 0 (or
+land outside the leak window). Repro: `fcvt.w.s x0, f0` with `f0=0xc5606eda`
+(→ −3591) then `addi x7, x0, 1` → `x7 != 1` (x0 leaked).
+
+The 2 `Zicntr` misses **were a harness gap, now fixed** (`gen_suite.py` sets
+`MTIME_EN=1` for the Zicntr suite). The `cp_cntr` `time` subtest reads the
+`time` CSR twice and checks it *increments*; the arch harness froze `i_mtime`
+at 0 (`MTIME_EN=0` default), so `time` never ticked even though the core's
+`time` CSR is correct (Linux boots on its timer). Driving the harness'
+free-running mtime makes both pass.
