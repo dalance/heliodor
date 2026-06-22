@@ -624,6 +624,11 @@ pub module heliodor_core #(
     // fast store's retire on dc_sdrain_ack (the store drained) rather than
     // dcache_stall. dc_sdrain_ack is the dcache's o_sdrain_ack (instance below).
     var fast_store   : logic;
+    // PMP (Smpmp): a fast (bare-mode store-drain) store bypasses the dmem_mmu
+    // i_wen path, so it needs its own commit-time physical-address PMP check.
+    // fast_store_acc_fault asserts when that store's PA is denied (cause 7); it
+    // suppresses the store-buffer push and drives the commit store-fault path.
+    var fast_store_acc_fault: logic;
     var dc_sdrain_ack: logic;
     // P9.2: dcache presence checks + line-departure events (forward-declared;
     // assigned at the dcache instance, consumed by the LR/SC reservation /
@@ -2070,7 +2075,13 @@ pub module heliodor_core #(
     // the dcache port (!replay_q) — during a replay cycle i_addr is the
     // replayed entry's, so dc_hit_safe is not the issuing load's verdict.
     let iss_reads_dmem: logic = iq_issue_op.base.is_load || iq_iss_is_amo;
-    let iss_dc_ok     : logic = !iss_reads_dmem || (!replay_q && (!dcache_stall || ld0_hum_ok));
+    // PMP (Smpmp): a load denied by PMP must issue its fault IMMEDIATELY, even if
+    // the dcache is mid-fill (dcache_stall) — it never reads the dcache (its
+    // o_dmem_ren is suppressed), so it must not wait for the fill, and must not
+    // be captured into an MSHR for replay (see mshr_capture below). Without this
+    // the denied load stalls behind an unrelated fill, gets replay-captured, and
+    // its replay drives the protected line into the dcache (deadlock).
+    let iss_dc_ok     : logic = !iss_reads_dmem || (!replay_q && (!dcache_stall || ld0_hum_ok || dmem_mmu_acc_fault));
     // Phase 8 S10.1: lane-0 priority FPU > MSHR (deferred load fill) > ALU.
     // The MSHR holds its completion (mshr_done_q) until the FPU lane is free,
     // and the ALU yields issue/ack the cycle the MSHR writes back (gates below).
@@ -3390,8 +3401,10 @@ pub module heliodor_core #(
     // section below) to keep declaration order valid. dmem_mmu_fault_s already
     // implies i_wen (= commit_store_fire), so this only fires on a real store.
     // PMP: a commit-translated store can also take a PMP access fault (cause 7).
-    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && dmem_mmu_acc_fault_s && !dmem_mmu_fault_s;
-    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || dmem_mmu_acc_fault_s);
+    // fast_store_acc_fault covers the fast (bare store-drain) path, which does
+    // not flow through the dmem_mmu and so is not covered by dmem_mmu_acc_fault_s.
+    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((dmem_mmu_acc_fault_s && !dmem_mmu_fault_s) || fast_store_acc_fault);
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || dmem_mmu_acc_fault_s || fast_store_acc_fault);
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
     let commit_excp        : logic = rob_commit_valid
         && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault
@@ -4715,6 +4728,22 @@ pub module heliodor_core #(
     assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && !c_is_mem_virt && st_wstrb_hi == 8'd0
         && c_store_addr[63:25] == 39'h40 && (!st_tohost_page || c_is_cbo_zero);
 
+    // PMP (Smpmp): a fast store drains via the store-buffer / i_saddr port and
+    // never reaches the dmem_mmu's i_wen PMP check, so check its bare PA here.
+    // c_store_addr is the physical address (fast_store is bare-mode only). On a
+    // deny the store-buffer push is suppressed and a store access fault (cause 7)
+    // is raised through the commit store-fault path.
+    var fast_store_pmp_deny: logic;
+    inst u_pmp_fast_store: pmp_check (
+        i_addr   : c_store_addr ,
+        i_acc    : 2'd1         , // write
+        i_priv   : dmem_mmu_priv,
+        i_pmpcfg : csr_pmpcfg   ,
+        i_pmpaddr: csr_pmpaddr  ,
+        o_fault  : fast_store_pmp_deny,
+    );
+    assign fast_store_acc_fault = fast_store && fast_store_pmp_deny;
+
     // Core dmem view (pre-MMU virtual address)
     //
     // M9.A.303: a STORE committing at the ROB head must NOT hijack the dmem
@@ -5134,7 +5163,10 @@ pub module heliodor_core #(
     assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
         && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && dmu_dmem_addr[63:25] == 39'h40
         && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008)); // P9.2: tohost pages stay write-through
-    assign sb_elig = fast_store || sb_vm_ok;
+    // PMP (Smpmp): a fast store that fails its PA check must NOT be absorbed by
+    // the store buffer (its write is suppressed; it traps instead, like a page-
+    // faulting store whose sb_vm_ok is 0).
+    assign sb_elig = (fast_store || sb_vm_ok) && !fast_store_acc_fault;
     assign c_store_mmio = ((if dmem_vm_on_op ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40)
         || (dmem_vm_on_op && dmu_pbmt_unc); // P10 Svpbmt: NC/IO store is uncached
     assign sb_pa   = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
@@ -6023,7 +6055,10 @@ pub module heliodor_core #(
     // (this is also why the LQ-record PA-vs-VA unit mismatch is benign — the
     // violation scan structurally cannot fire under VM, and fwd_mask is
     // always 0 there).
-    let mshr_plain_load: logic = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    // PMP (Smpmp): exclude a PMP-denied load (dmem_mmu_acc_fault), like a page-
+    // faulting load (dmem_mmu_fault) — it commits its fault and must never be
+    // captured for replay (its replay would drive the protected line into cache).
+    let mshr_plain_load: logic = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dmem_mmu_acc_fault && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
     let mshr_free_ok    : logic = !mshra_v_q || !mshrb_v_q;
     let mshr_alloc_a    : logic = !mshra_v_q;
     // !replay_q on both: on a replay cycle the dcache port (and so

@@ -157,16 +157,41 @@ Generate with `make -C test/act EXT="Zacas ZacasZabha"` (`Zacas` enabled in
 `heliodor.yaml` + `sail.json`; `ZacasZabha` needs both `Zacas` and `Zabha`). With
 this, **all RVA23-mandatory scalar atomics are covered**.
 
+### PMP (Smpmp) enforcement — PMPS 9/9 (run on Verilator)
+
+heliodor enforces PMP on the load / store / fetch paths (16 entries, OFF / TOR /
+NA4 / NAPOT matching, lowest-match priority, R/W/X, lock bits, M-mode bypass of
+unlocked entries; combinational `src/mmu/pmp_check.veryl`, boot-safe all-OFF =
+inactive). Three real RTL bugs were fixed to make the **PMPS suite pass 9/9**
+(cfg_A_off, cfg_XWR, csr_access, mprv_check_01/02, napot_legal_lxwr_01/02,
+tor_legal_lxwr_01/02): (1) `medeleg` is fully writable so an access fault
+(cause 1/5/7) is **delegated to the S-mode trap handler** as the Sail reference
+does (the framework sets `medeleg=0x0FCB0FF`); (2) a **bare-mode fast store** (it
+drains via the dcache store-drain port, bypassing the `dmem_mmu` `i_wen` PMP
+check) gets a dedicated commit-time `pmp_check` on its PA; (3) a **PMP-denied
+load** suppresses its dcache read (`o_dmem_ren`) and is excluded from MSHR replay
+so it cannot deadlock the dcache on a fill it must never perform.
+
+> ⚠️ **Run PMPS on Verilator, not the native Veryl sim.** All three Veryl-sim
+> backends (cc / cranelift / interpret) **hang** during the PMP-active M-mode
+> cleanup (the success-path `io_write_str`/halt) — a Veryl-simulator convergence
+> bug, **not** an RTL bug: Verilator (real SV NBA, no UNOPTFLAT) passes all nine
+> cleanly. Build/run via `sim/verilator/tb_act_pmps_cfg_xwr.sv` (one test) or
+> `sim/verilator/run_pmp_all.sh` (all nine; re-templates one wrapper per hex).
+> Generate the hex with `make -C test/act EXT="pmp/pmp64/PMPS"` (or the dir the
+> PMPS ELFs land under). Still TODO: `SvPMP` (PTW PMP — PTE reads need a PMP
+> check), `PMPU`/`PMPSm`, and the Veryl-sim convergence fix (to run natively).
+
 ### Remaining suites (each needs a feature heliodor doesn't yet implement)
 
 The suites still uncovered all require a sizeable feature, or are absent from the
 upstream clone — they are NOT a matter of generating/running more tests:
 
-- **PMP** (`pmp`, `SvPMP` 16, `SvPMPZicbo` 32, `SvaduPMP` 8) — heliodor has only
-  the `pmpcfg0`/`pmpaddr0` CSRs with **no enforcement**. Passing these needs full
-  PMP enforcement (16 entries, OFF/TOR/NA4/NAPOT matching, R/W/X checks with
-  lowest-match priority + lock bits + M-mode bypass) wired into the load / store /
-  fetch / page-table-walk paths — a substantial RTL feature.
+- **PMP, the VM/cache variants** (`SvPMP` 16, `SvPMPZicbo` 32, `SvaduPMP` 8) — the
+  base `PMPS` suite passes 9/9 (see "PMP (Smpmp) enforcement" above), but these add
+  PMP on the **page-table-walk path** (the implicit PTE reads need their own PMP
+  check) plus the Svadu A/D write-back, which heliodor's PMP integration does not
+  yet cover.
 - **`ExceptionsSv` / `ExceptionsSvZaamo` / `ExceptionsSvZalrsc` / `SvZicbo`** (the
   `_Umode` + access-fault cases) — these `LI(a0, RVMODEL_ACCESS_FAULT_ADDRESS)` a
   PA that must raise an **access fault**, but heliodor raises no load/store/fetch
