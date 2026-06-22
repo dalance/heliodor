@@ -313,6 +313,7 @@ pub module heliodor_core #(
     var fb_pred_index  : logic<13> [FB_DEPTH];
     var fb_ghr_fold    : logic     [FB_DEPTH]; // S22: spec_ghr_l folded this instance at delivery
     var fb_ifault      : logic     [FB_DEPTH];
+    var fb_iacc        : logic     [FB_DEPTH]; // PMP: per-slot instruction access fault
     // Phase 11-H3d: per-entry G-stage-fault flag + faulting guest PA for an
     // instruction guest-page-fault. Latched with fb_ifault at push.
     var fb_ifault_gstage: logic    [FB_DEPTH];
@@ -335,6 +336,8 @@ pub module heliodor_core #(
     var dmu_pbmt_unc : logic                ; // P10 Svpbmt: data MMU NC/IO translation
     var csr_adue     : logic                ; // P10 Svadu: menvcfg.ADUE (HW A/D update)
     var dmu_ad_wb    : logic                ; // P10 Svadu: data MMU A/D write-back active
+    var csr_pmpcfg   : logic<64> [2]        ; // PMP (Smpmp): pmpcfg0/pmpcfg2
+    var csr_pmpaddr  : logic<64> [16]       ; // PMP (Smpmp): pmpaddr0..15
     var csr_pmm_m    : logic             <2>; // P10 Supm: mseccfg.PMM (M-mode pointer mask)
     var csr_pmm_s    : logic             <2>; // P10 Supm: menvcfg.PMM (S-mode)
     var csr_pmm_u    : logic             <2>; // P10 Ssnpm: senvcfg.PMM (U-mode)
@@ -455,6 +458,8 @@ pub module heliodor_core #(
     var dmem_mmu_busy   : logic;
     var dmem_mmu_fault  : logic;
     var dmem_mmu_fault_s: logic;
+    var dmem_mmu_acc_fault  : logic; // PMP (Smpmp) load access fault (cause 5)
+    var dmem_mmu_acc_fault_s: logic; // PMP (Smpmp) store access fault (cause 7)
     // Phase 11-H3c: the current dmem fault is a G-stage (guest-physical) fault,
     // and the faulting guest PA (for htval). Valid alongside dmem_mmu_fault(_s)
     // — used at commit for a store guest-page-fault (cause 23). 0 while V=0.
@@ -492,6 +497,7 @@ pub module heliodor_core #(
     // hart1's bus contention stretches walks long enough to outlive a redirect.
     var walk_phys_q      : logic    ;
     var lfault_inj_v     : logic    ; // fault delivery to walk owner this cycle
+    var lfault_inj_acc   : logic    ; // PMP: the injected walk fault is an access fault
     var rob_cdb_is_lfault: logic    ; // cdb.is_lfault with mis-attribution removed
     // M5.D: medeleg needed by trap_to_s computation in commit stage.
     var csr_medeleg_w: logic<64>;
@@ -559,9 +565,12 @@ pub module heliodor_core #(
     var straddle_q    : logic    ;
     var straddle_low_q: logic<16>;
     var if_ifault_q   : logic    ; // instruction page fault latched at fetch
+    var if_iacc_q     : logic    ; // PMP: instruction access fault (cause 1) at fetch
+    var if_iacc_q1    : logic    ; // PMP: instruction access fault for the 2nd alloc slot
     // imem_mmu outputs forward-declared so the fetch latch can sample
     // them. Actual assignment happens at the imem_mmu inst below.
     var imem_fault_w: logic;
+    var imem_acc_fault_w: logic; // PMP: instruction access fault from imem_mmu
     // Phase 11-H3d: the fetch fault was a G-stage (guest-physical) fault, and the
     // faulting guest PA — for an instruction guest-page-fault (cause 20, htval).
     var imem_gstage_w: logic;
@@ -1113,6 +1122,7 @@ pub module heliodor_core #(
                 // straddle resolves a 32-bit instr, so is_rvc=0 in that case.
                 fb_is_rvc[fb_tail]       = !straddle_q && curr_is_rvc;
                 fb_ifault[fb_tail]       = imem_fault_w;
+                fb_iacc[fb_tail]         = imem_acc_fault_w;
                 fb_ifault_gstage[fb_tail] = imem_gstage_w;
                 fb_ifault_gpa[fb_tail]   = imem_gpa_w;
                 fb_pred_next_pc[fb_tail] = pred_next_pc_bp;
@@ -1127,6 +1137,7 @@ pub module heliodor_core #(
                 fb_instr[fb_tail1]        = s1_instr;
                 fb_is_rvc[fb_tail1]       = s1_is_rvc;
                 fb_ifault[fb_tail1]       = 1'b0;
+                fb_iacc[fb_tail1]         = 1'b0; // slot-1 same page as slot-0 → no PMP fault
                 fb_ifault_gstage[fb_tail1] = 1'b0; // slot-1 never faults (same page as slot-0)
                 fb_ifault_gpa[fb_tail1]   = 64'd0;
                 fb_pred_next_pc[fb_tail1] = pred_next_pc1;
@@ -1176,6 +1187,9 @@ pub module heliodor_core #(
     assign if_pred_index_q = if fb_count != 4'd0 ? fb_pred_index[fb_head] : bht_lk_index;
     let if_ghr_fold_q: logic     = if fb_count != 4'd0 ? fb_ghr_fold[fb_head] : (btb_hit && btb_is_cond);
     assign if_ifault_q     = if fb_count != 4'd0 ? fb_ifault[fb_head] : imem_fault_w;
+    // PMP: instruction access fault, mirroring if_ifault_q (driven by the imem
+    // PMP check; see imem_acc_fault_w / fb_iacc).
+    assign if_iacc_q       = if fb_count != 4'd0 ? fb_iacc[fb_head] : imem_acc_fault_w;
     // Phase 11-H3d: the gstage/gpa travelling with if_ifault_q (same mux).
     let if_ifault_gstage_q: logic     = if fb_count != 4'd0 ? fb_ifault_gstage[fb_head] : imem_gstage_w;
     let if_ifault_gpa_q   : logic<64> = if fb_count != 4'd0 ? fb_ifault_gpa[fb_head] : imem_gpa_w;
@@ -1197,6 +1211,7 @@ pub module heliodor_core #(
     let if_pred_index_q1  : logic<13> = if fb_count >= 4'd2 ? fb_pred_index[fb_head_p1] : if fb_count == 4'd1 ? bht_lk_index : bht_lk_index1;
     let if_ghr_fold_q1    : logic     = if fb_count >= 4'd2 ? fb_ghr_fold[fb_head_p1] : if fb_count == 4'd1 ? (btb_hit && btb_is_cond) : (btb_hit2 && btb_is_cond2);
     let if_ifault_q1      : logic     = if fb_count >= 4'd2 ? fb_ifault[fb_head_p1] : if fb_count == 4'd1 ? imem_fault_w : 1'b0;
+    assign if_iacc_q1     = if fb_count >= 4'd2 ? fb_iacc[fb_head_p1] : if fb_count == 4'd1 ? imem_acc_fault_w : 1'b0;
 
     // ============================================================
     // M5.C: imem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
@@ -1250,6 +1265,7 @@ pub module heliodor_core #(
         o_paddr   : imem_paddr_w   ,
         o_valid   : imem_valid_w   ,
         o_fault   : imem_fault_w   ,
+        o_acc_fault: imem_acc_fault_w,
         o_busy    : imem_busy_w    ,
         i_satp    : satp_shadow    ,
         i_priv    : csr_priv       ,
@@ -1257,6 +1273,8 @@ pub module heliodor_core #(
         i_mxr     : imem_mxr       ,
         i_pbmte   : csr_pbmte      ,
         i_adue    : csr_adue       ,
+        i_pmpcfg  : csr_pmpcfg     ,
+        i_pmpaddr : csr_pmpaddr    ,
         // Phase 11-H two-stage fetch translation. csr_virt is the fetch's V
         // (M-mode fetch is never virtualized). G-stage cause is H3 → discard.
         i_virt        : csr_virt   ,
@@ -1605,8 +1623,11 @@ pub module heliodor_core #(
         // actually used for this op's prediction) so commit trains that entry.
         rob_alloc_entry.pred_index     = if_pred_index_q;
         rob_alloc_entry.ghr_fold       = if_ghr_fold_q;
-        rob_alloc_entry.illegal        = dec_op.illegal || if_ifault_q;
-        rob_alloc_entry.is_ifault      = if_ifault_q;
+        // PMP: an instruction ACCESS fault rides the instruction-fault delivery
+        // path (is_ifault + illegal), and fault_acc overrides the cause to 1.
+        rob_alloc_entry.illegal        = dec_op.illegal || if_ifault_q || if_iacc_q;
+        rob_alloc_entry.is_ifault      = if_ifault_q || if_iacc_q;
+        rob_alloc_entry.fault_acc      = if_iacc_q; // PMP: fetch access fault (cause 1)
         // Phase 11-H3d: carry the fetch G-stage-fault flag + guest PA for an
         // instruction guest-page-fault (cause 20 + htval). 0 unless V=1 fetch.
         rob_alloc_entry.ifault_gstage  = if_ifault_gstage_q;
@@ -1783,8 +1804,9 @@ pub module heliodor_core #(
         rob_alloc_entry2.is_ret         = dec_op2.is_jalr && (dec_op2.rs1_arch == 5'd1 || dec_op2.rs1_arch == 5'd5) && !(dec_op2.rd_arch == 5'd1 || dec_op2.rd_arch == 5'd5);
         rob_alloc_entry2.pred_index     = if_pred_index_q1;
         rob_alloc_entry2.ghr_fold       = if_ghr_fold_q1;
-        rob_alloc_entry2.illegal        = dec_op2.illegal || if_ifault_q1;
-        rob_alloc_entry2.is_ifault      = if_ifault_q1;
+        rob_alloc_entry2.illegal        = dec_op2.illegal || if_ifault_q1 || if_iacc_q1;
+        rob_alloc_entry2.is_ifault      = if_ifault_q1 || if_iacc_q1;
+        rob_alloc_entry2.fault_acc      = if_iacc_q1; // PMP: fetch access fault
         // Phase 11-H3d: slot-1 shares slot-0's fetch line/page, so it never takes
         // a separate fetch fault — its instruction guest-page-fault info is 0.
         rob_alloc_entry2.ifault_gstage  = 1'b0;
@@ -2077,6 +2099,7 @@ pub module heliodor_core #(
         // V1: a faulting vector mem op rides the vu_cdb's load/store fault path.
         vu_cdb.is_lfault   = vu_cdb_is_lfault;
         vu_cdb.is_sfault   = vu_cdb_is_sfault;
+        vu_cdb.fault_acc   = 1'b0; // PMP: vector accesses don't drive a PMP fault yet
         vu_cdb.fault_vaddr = vu_cdb_fault_vaddr;
     }
     always_comb {
@@ -2102,6 +2125,8 @@ pub module heliodor_core #(
         i_fwd_mask        : stld_fwd_mask                                       ,
         i_dmem_fault      : dmem_mmu_fault                                      ,
         i_dmem_fault_s    : dmem_mmu_fault_s                                    ,
+        i_dmem_acc_fault  : dmem_mmu_acc_fault                                  ,
+        i_dmem_acc_fault_s: dmem_mmu_acc_fault_s                                ,
         i_csr_data        : csr_rd_data                                         ,
         i_rsv_valid       : rsv_valid_q                                         ,
         i_rsv_addr        : rsv_addr_q                                          ,
@@ -2160,6 +2185,8 @@ pub module heliodor_core #(
         i_fwd_mask        : stld_fwd_mask2  ,
         i_dmem_fault      : 1'b0            ,
         i_dmem_fault_s    : 1'b0            ,
+        i_dmem_acc_fault  : 1'b0            ,
+        i_dmem_acc_fault_s: 1'b0            ,
         i_csr_data        : 64'd0           , // pipe-1: no CSR
         i_rsv_valid       : 1'b0            ,
         i_rsv_addr        : 64'd0           ,
@@ -2783,6 +2810,7 @@ pub module heliodor_core #(
     var c_is_ifault   : logic           ;
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
+    var c_fault_acc   : logic           ; // PMP: committing fault is an access fault
     var c_fault_vaddr : logic<64>       ;
     // Phase 11-H3c: committing load fault's G-stage flag + faulting guest PA.
     var c_fault_gstage: logic           ;
@@ -2985,6 +3013,7 @@ pub module heliodor_core #(
         i_cdb_csr_illegal    : cdb.csr_illegal      ,
         i_cdb_is_lfault      : rob_cdb_is_lfault    ,
         i_cdb_is_sfault      : cdb.is_sfault        ,
+        i_cdb_fault_acc      : cdb.fault_acc        ,
         i_cdb_fault_vaddr    : cdb.fault_vaddr      ,
         // Phase 11-H A2: live MMU gstage/gpa for the CDB fault-delivery path.
         i_cdb_fault_gstage   : dmem_mmu_gstage      ,
@@ -3041,6 +3070,7 @@ pub module heliodor_core #(
         i_lfault_inj_v       : lfault_inj_v         ,
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
+        i_lfault_inj_acc     : lfault_inj_acc       ,
         // Phase 11-H3c: the MMU is in TS_FAULT this cycle (lfault_inj_v implies
         // dmem_mmu_fault), so its gstage/gpa outputs correspond to this walk.
         i_lfault_inj_gstage  : dmem_mmu_gstage      ,
@@ -3106,6 +3136,7 @@ pub module heliodor_core #(
         o_commit_is_cbo_zero : c_is_cbo_zero        ,
         o_commit_is_ifault   : c_is_ifault          ,
         o_commit_is_lfault   : c_is_lfault          ,
+        o_commit_fault_acc   : c_fault_acc          ,
         o_commit_is_sfault   : c_is_sfault          ,
         o_commit_fault_vaddr : c_fault_vaddr        ,
         o_commit_fault_gstage: c_fault_gstage       ,
@@ -3358,7 +3389,9 @@ pub module heliodor_core #(
     // Defined from primitives (not commit_store_fire, which is in the dmem
     // section below) to keep declaration order valid. dmem_mmu_fault_s already
     // implies i_wen (= commit_store_fire), so this only fires on a real store.
-    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && dmem_mmu_fault_s;
+    // PMP: a commit-translated store can also take a PMP access fault (cause 7).
+    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && dmem_mmu_acc_fault_s && !dmem_mmu_fault_s;
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || dmem_mmu_acc_fault_s);
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
     let commit_excp        : logic = rob_commit_valid
         && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault
@@ -3435,7 +3468,9 @@ pub module heliodor_core #(
             // instruction page-fault (12). inject_fake_ifault is the V=0 satp-
             // switch hack (never G-stage), so this only upgrades a real V=1 fetch
             // fault. c_fault_gstage is ROB-carried from alloc. Inert at V=0.
-            excp_cause = if c_is_ifault && c_fault_gstage ? 64'd20 : 64'd12;
+            // PMP: an instruction ACCESS fault is cause 1 (priority over the
+            // page/guest-page-fault encodings, which never co-occur with it).
+            excp_cause = if c_fault_acc ? 64'd1 : if c_is_ifault && c_fault_gstage ? 64'd20 : 64'd12;
         } else if commit_virt_instr {
             // Phase 11-H B: virtual instruction (22) — an HLV/HLVX/HSV in VS/VU, or
             // a VS/VU access to a hypervisor/VS-level CSR. Priority over the access
@@ -3451,14 +3486,18 @@ pub module heliodor_core #(
             // (two-stage) walk is a load guest-page-fault (cause 21), not a plain
             // load page-fault (13). c_fault_gstage is ROB-carried from the inject.
             // Inert at V=0 (the G-stage never runs → c_fault_gstage is 0).
-            excp_cause = if c_fault_gstage ? 64'd21 : 64'd13;
+            // PMP: a load ACCESS fault is cause 5 (else load page/guest-page-fault).
+            excp_cause = if c_fault_acc ? 64'd5 : if c_fault_gstage ? 64'd21 : 64'd13;
         } else if c_is_sfault_eff {
             // Phase 11-H3c: a store/AMO fault that occurred in the G-stage of a
             // two-stage (guest) walk is a store guest-page-fault (cause 23), not a
             // plain store page-fault (15). dmem_mmu_gstage is valid alongside the
             // commit-time store fault (dmem_mmu_fault_s). Inert at V=0 (the G-stage
             // never runs, so dmem_mmu_gstage is 0 → cause stays 15).
-            excp_cause = if commit_store_sfault && dmem_mmu_gstage ? 64'd23 : 64'd15;
+            // PMP: a store/AMO ACCESS fault is cause 7 (c_fault_acc covers an
+            // AMO store fault tracked via the ROB; commit_store_sacc covers a
+            // commit-translated plain store).
+            excp_cause = if c_fault_acc || commit_store_sacc ? 64'd7 : if commit_store_sfault && dmem_mmu_gstage ? 64'd23 : 64'd15;
         } else if c_illegal || commit_priv_illegal {
             excp_cause = 64'd2; // illegal instruction (incl. TVM/TSR commit trap)
         } else if c_is_ebreak {
@@ -3611,6 +3650,8 @@ pub module heliodor_core #(
         o_vstart      : csr_vstart   ,
         o_menvcfg_pbmte: csr_pbmte   ,
         o_menvcfg_adue : csr_adue    ,
+        o_pmpcfg       : csr_pmpcfg  ,
+        o_pmpaddr      : csr_pmpaddr ,
         // Phase 11-H two-stage MMU state.
         o_virt         : csr_virt    ,
         o_mstatus_mpv  : csr_mpv     ,
@@ -5007,7 +5048,10 @@ pub module heliodor_core #(
     // Phase 12 V1: a VU-driven access's fault is delivered by the VU on its own
     // vu_cdb (is_lfault/is_sfault → the vector op's ROB entry); suppress the
     // walk-owner inject path for it to avoid a double delivery. Inert at V=0.
-    assign lfault_inj_v = dmem_mmu_fault && walk_v_q && !walk_is_store_q && !vu_mem_active;
+    assign lfault_inj_v = (dmem_mmu_fault || dmem_mmu_acc_fault) && walk_v_q && !walk_is_store_q && !vu_mem_active;
+    // PMP: when the walk-owner fault is a PMP access fault (and not a page fault),
+    // tag the injected fault so commit raises a load access fault (cause 5).
+    assign lfault_inj_acc = dmem_mmu_acc_fault && !dmem_mmu_fault;
     // Suppress the CDB's is_lfault when it would mis-attribute the owner's
     // fault to a different (current-issue) rob_idx. If the current issue IS
     // the owner, or there is no tracked walk (e.g. a direct TLB-permission
@@ -5597,6 +5641,8 @@ pub module heliodor_core #(
         i_mxr        : dmem_mxr         ,
         i_pbmte      : csr_pbmte       ,
         i_adue       : csr_adue        ,
+        i_pmpcfg     : csr_pmpcfg      ,
+        i_pmpaddr    : csr_pmpaddr     ,
         // Phase 11-H two-stage data translation. dmem_virt2 = MPRV+MPV-effective V
         // OR an explicit HLV/HSV (dmem_op_hlv), so a hypervisor virtual-memory
         // access translates two-stage even while the core itself runs at V=0/HS.
@@ -5611,6 +5657,8 @@ pub module heliodor_core #(
         o_busy       : dmem_mmu_busy   ,
         o_fault      : dmem_mmu_fault  ,
         o_fault_store: dmem_mmu_fault_s,
+        o_acc_fault      : dmem_mmu_acc_fault  ,
+        o_acc_fault_store: dmem_mmu_acc_fault_s,
         o_rdata_valid: dmem_mmu_rdv    ,
         o_walk_start : dmem_walk_start , // M9.A.296: PTW-start pulse for F2 owner re-latch
         o_idle       : dmem_mmu_idle   , // M9.3: gate the load-walk VA pin on a REAL in-flight walk
@@ -6232,6 +6280,7 @@ pub module heliodor_core #(
         mshr_cdb.cas_q_mem_hi = '0;
         mshr_cdb.is_lfault    = 1'b0;
         mshr_cdb.is_sfault    = 1'b0;
+        mshr_cdb.fault_acc    = 1'b0;
         mshr_cdb.fault_vaddr  = '0;
     }
 

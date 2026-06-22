@@ -89,6 +89,9 @@ pub module csr #(
     o_mstatus_vs  : output logic<2>,
     o_menvcfg_pbmte: output logic  , // P10 Svpbmt: menvcfg.PBMTE (bit 62)
     o_menvcfg_adue : output logic  , // P10 Svadu: menvcfg.ADUE (bit 61, HW A/D update)
+    // PMP (Smpmp): config (pmpcfg0/pmpcfg2) + 16 addresses, for the PMP checker.
+    o_pmpcfg       : output logic<64> [2] ,
+    o_pmpaddr      : output logic<64> [16],
     // Phase 11-H: virtualization state for two-stage MMU translation. o_virt is
     // the current V bit; o_mstatus_mpv (mstatus[39]) lets the core form the
     // MPRV-effective V for data accesses. hgatp/vsatp drive the G/VS stages, and
@@ -219,6 +222,8 @@ pub module csr #(
     const ADDR_MSTATUS : logic<12> = 12'h300;
     const ADDR_MISA    : logic<12> = 12'h301;
     const ADDR_MEDELEG : logic<12> = 12'h302;
+    // medeleg WARL: access-fault causes (1/5/7) are read-only zero (not delegatable).
+    const MEDELEG_ACCFAULT_MASK: logic<64> = 64'hFFFF_FFFF_FFFF_FF5D;
     const ADDR_MIDELEG : logic<12> = 12'h303;
     // Phase 11-H B: VS-interrupt bits (VSSIP=2, VSTIP=6, VSEIP=10) are read-only
     // one in mideleg when the H extension is implemented.
@@ -236,7 +241,13 @@ pub module csr #(
     const ADDR_MTVAL2  : logic<12> = 12'h34B;
     const ADDR_MIP     : logic<12> = 12'h344;
     const ADDR_PMPCFG0 : logic<12> = 12'h3A0;
-    const ADDR_PMPADDR0: logic<12> = 12'h3B0;
+    const ADDR_PMPCFG2 : logic<12> = 12'h3A2;
+    const ADDR_PMPADDR0 : logic<12> = 12'h3B0;
+    const ADDR_PMPADDR15: logic<12> = 12'h3BF;
+    // PMP address field is PHYS_ADDR_WIDTH-2 = 54 bits (addr[55:2]); granularity
+    // G=0 (4-byte, NA4 supported). Reserved pmpcfg bits [6:5] read 0.
+    const PMPADDR_MASK : logic<64> = 64'h003F_FFFF_FFFF_FFFF; // [53:0]
+    const PMPCFG_BYTE_MASK: logic<8> = 8'h9F;                 // clear bits 6:5
     const ADDR_SATP    : logic<12> = 12'h180;
     // M5.D S-mode CSRs
     const ADDR_SSTATUS   : logic<12> = 12'h100;
@@ -327,8 +338,10 @@ pub module csr #(
     var mip     : logic<64>;
     var medeleg : logic<64>;
     var mideleg : logic<64>;
-    var pmpcfg0 : logic<64>;
-    var pmpaddr0: logic<64>;
+    // PMP (Smpmp): 16 entries. pmpcfg[0]=pmpcfg0 (entries 0-7), pmpcfg[1]=pmpcfg2
+    // (entries 8-15); RV64 has no pmpcfg1/3. pmpaddr[0..15] hold addr[55:2].
+    var pmpcfg  : logic<64> [2] ;
+    var pmpaddr : logic<64> [16];
     var satp    : logic<64>;
     var mcycle  : logic<64>;
     var minstret: logic<64>;
@@ -557,8 +570,8 @@ pub module csr #(
             ADDR_MTINST    : rd_data_w = mtinst;
             ADDR_MTVAL2    : rd_data_w = mtval2;
             ADDR_MIP       : rd_data_w = mip_read;
-            ADDR_PMPCFG0   : rd_data_w = pmpcfg0;
-            ADDR_PMPADDR0  : rd_data_w = pmpaddr0;
+            ADDR_PMPCFG0   : rd_data_w = pmpcfg[0];
+            ADDR_PMPCFG2   : rd_data_w = pmpcfg[1];
             ADDR_SATP      : rd_data_w = satp;
             ADDR_MCYCLE    : rd_data_w = mcycle;
             ADDR_MINSTRET  : rd_data_w = minstret;
@@ -573,6 +586,8 @@ pub module csr #(
                     rd_data_w = mhpmcounter[i_rd_addr[4:0]]; // hpmcounterN URO alias
                 } else if i_rd_addr >= ADDR_MHPME_LO && i_rd_addr <= ADDR_MHPME_HI {
                     rd_data_w = mhpmevent[i_rd_addr[4:0]];
+                } else if i_rd_addr >= ADDR_PMPADDR0 && i_rd_addr <= ADDR_PMPADDR15 {
+                    rd_data_w = pmpaddr[i_rd_addr[3:0]];
                 } else {
                     rd_data_w = 64'd0;
                 }
@@ -722,6 +737,27 @@ pub module csr #(
         {1'b1, 57'd0, vs_cause_w}
     ;
 
+    // PMP per-entry config bytes (entry e -> pmpcfg[e/8] byte e%8) and the
+    // pmpaddr write-lock. pmpaddr[e] is read-only if its own entry is locked, OR
+    // if the next entry is a locked TOR (entry e+1 reads pmpaddr[e] as its lower
+    // bound, so locking it must freeze this address too).
+    var pmp_cfgb       : logic<8> [16];
+    var pmp_addr_locked: logic    [16];
+    always_comb {
+        for e in 0..16 {
+            pmp_cfgb[e] = pmpcfg[e / 8][(e % 8) * 8+:8];
+        }
+        for e in 0..16 {
+            if e == 15 {
+                pmp_addr_locked[e] = pmp_cfgb[15][7];
+            } else {
+                pmp_addr_locked[e] = pmp_cfgb[e][7] || (pmp_cfgb[e + 1][7] && pmp_cfgb[e + 1][4:3] == 2'd1);
+            }
+        }
+    }
+    assign o_pmpcfg       = pmpcfg;
+    assign o_pmpaddr      = pmpaddr;
+
     assign o_rd_data      = rd_data_w;
     assign o_mtvec        = mtvec;
     assign o_mepc         = mepc;
@@ -801,8 +837,11 @@ pub module csr #(
             // Phase 11-H B: with H implemented, mideleg bits 2/6/10 (VSSIP/VSTIP/
             // VSEIP) are read-only one — VS interrupts are always delegated to HS.
             mideleg    = MIDELEG_RO1;
-            pmpcfg0    = 64'd0;
-            pmpaddr0   = 64'd0;
+            pmpcfg[0]  = 64'd0;
+            pmpcfg[1]  = 64'd0;
+            for pi in 0..16 {
+                pmpaddr[pi] = 64'd0;
+            }
             satp       = 64'd0;
             mcycle     = 64'd0;
             minstret   = 64'd0;
@@ -1021,7 +1060,12 @@ pub module csr #(
                         vxrm  = {62'd0, i_wr_data[2:1]};
                     }
                     ADDR_MSTATUS   : mstatus  = i_wr_data;
-                    ADDR_MEDELEG   : medeleg  = i_wr_data;
+                    // medeleg WARL: the access-fault exceptions (instruction 1,
+                    // load 5, store/AMO 7) are NOT delegatable — they always trap
+                    // to M-mode (matches the Sail reference; the ACT4 priv trap
+                    // handler reads mcause for an access fault, so it must run in
+                    // M-mode). These bits read as 0.
+                    ADDR_MEDELEG   : medeleg  = i_wr_data & MEDELEG_ACCFAULT_MASK;
                     ADDR_MIDELEG   : mideleg  = i_wr_data | MIDELEG_RO1; // bits 2/6/10 RO-1
                     ADDR_MIE       : mie      = i_wr_data;
                     ADDR_MTVEC     : mtvec    = i_wr_data;
@@ -1032,8 +1076,18 @@ pub module csr #(
                     ADDR_MTINST    : mtinst   = i_wr_data;
                     ADDR_MTVAL2    : mtval2   = i_wr_data;
                     ADDR_MIP       : mip      = i_wr_data;
-                    ADDR_PMPCFG0   : pmpcfg0  = i_wr_data;
-                    ADDR_PMPADDR0  : pmpaddr0 = i_wr_data;
+                    // PMP cfg: per-byte WARL — a locked byte (L=1) is read-only;
+                    // reserved bits [6:5] are cleared on write.
+                    ADDR_PMPCFG0   : for b in 0..8 {
+                        if !pmpcfg[0][b * 8 + 7] {
+                            pmpcfg[0][b * 8+:8] = i_wr_data[b * 8+:8] & PMPCFG_BYTE_MASK;
+                        }
+                    }
+                    ADDR_PMPCFG2   : for b in 0..8 {
+                        if !pmpcfg[1][b * 8 + 7] {
+                            pmpcfg[1][b * 8+:8] = i_wr_data[b * 8+:8] & PMPCFG_BYTE_MASK;
+                        }
+                    }
                     ADDR_SATP      : satp     = i_wr_data;
                     ADDR_MCYCLE    : mcycle   = i_wr_data;
                     ADDR_MINSTRET  : minstret = i_wr_data;
@@ -1100,6 +1154,11 @@ pub module csr #(
                             mhpmcounter[i_wr_addr[4:0]] = i_wr_data;
                         } else if i_wr_addr >= ADDR_MHPME_LO && i_wr_addr <= ADDR_MHPME_HI {
                             mhpmevent[i_wr_addr[4:0]] = i_wr_data;
+                        } else if i_wr_addr >= ADDR_PMPADDR0 && i_wr_addr <= ADDR_PMPADDR15 {
+                            // pmpaddr WARL: 54-bit field; locked entry is read-only.
+                            if !pmp_addr_locked[i_wr_addr[3:0]] {
+                                pmpaddr[i_wr_addr[3:0]] = i_wr_data & PMPADDR_MASK;
+                            }
                         }
                     }
                 }
