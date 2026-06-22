@@ -157,7 +157,7 @@ Generate with `make -C test/act EXT="Zacas ZacasZabha"` (`Zacas` enabled in
 `heliodor.yaml` + `sail.json`; `ZacasZabha` needs both `Zacas` and `Zabha`). With
 this, **all RVA23-mandatory scalar atomics are covered**.
 
-### PMP (Smpmp) enforcement — PMPS 9/9 (run on Verilator)
+### PMP (Smpmp) enforcement — PMPS 9/9 (native Veryl sim + Verilator)
 
 heliodor enforces PMP on the load / store / fetch paths (16 entries, OFF / TOR /
 NA4 / NAPOT matching, lowest-match priority, R/W/X, lock bits, M-mode bypass of
@@ -172,15 +172,51 @@ check) gets a dedicated commit-time `pmp_check` on its PA; (3) a **PMP-denied
 load** suppresses its dcache read (`o_dmem_ren`) and is excluded from MSHR replay
 so it cannot deadlock the dcache on a fill it must never perform.
 
-> ⚠️ **Run PMPS on Verilator, not the native Veryl sim.** All three Veryl-sim
-> backends (cc / cranelift / interpret) **hang** during the PMP-active M-mode
-> cleanup (the success-path `io_write_str`/halt) — a Veryl-simulator convergence
-> bug, **not** an RTL bug: Verilator (real SV NBA, no UNOPTFLAT) passes all nine
-> cleanly. Build/run via `sim/verilator/tb_act_pmps_cfg_xwr.sv` (one test) or
-> `sim/verilator/run_pmp_all.sh` (all nine; re-templates one wrapper per hex).
-> Generate the hex with `make -C test/act EXT="pmp/pmp64/PMPS"` (or the dir the
-> PMPS ELFs land under). Still TODO: `SvPMP` (PTW PMP — PTE reads need a PMP
-> check), `PMPU`/`PMPSm`, and the Veryl-sim convergence fix (to run natively).
+PMPS 9/9 passes on the **native Veryl sim** (`veryl test --ignored --test
+test_act_pmps`, `tohost=1 pass=1`) on the **cc** and **cranelift** backends; the
+**interpret** backend agrees but is the slowest reference path (~7 min per test).
+`--backend-validate` (cc vs cranelift) shows no divergence, and Verilator (real
+SV NBA, no UNOPTFLAT) also passes all nine. Generate the hex with `make -C
+test/act EXT="pmp/pmp64/PMPS"` (or the dir the PMPS ELFs land under); a Verilator
+cross-check is available via `sim/verilator/tb_act_pmps_cfg_xwr.sv` (one test) or
+`sim/verilator/run_pmp_all.sh` (all nine; re-templates one wrapper per hex).
+>
+> A previously-reported "native Veryl sim hangs on the PMP-active M-mode cleanup"
+> was a **stale `veryl` binary**, not a sim bug — a clean rebuild of veryl HEAD
+> (`cargo build --profile release-verylup`) runs all nine natively. Always
+> rebuild veryl after touching its source before trusting a native-sim result.
+> Still TODO: `SvPMP` (PTW PMP — PTE reads need a PMP check), `PMPU`/`PMPSm`.
+
+### LR/SC & AMO PMP + misaligned atomics — PMPZalrsc 1/1, PMPZaamo 1/1
+
+**`PMPZaamo` 1/1 + `PMPZalrsc` 1/1.** Atomics (LR/SC/AMO) on a PMP-protected,
+write-denied region must fault, and a *misaligned* atomic must fault too — both
+as access faults, matching the Sail reference. Two real RTL gaps were closed:
+
+- **SC write-permission, reservation-independent.** A store-conditional whose
+  reservation is invalid clears its store flag at execute, so it never reaches
+  the commit-time exclusive-write `pmp_check` (which is gated by the store
+  firing). The spec / Sail still require a store access fault (cause 7) when the
+  SC's address is W-denied, *regardless of the reservation* (Sail translates the
+  SC address for Write before consulting the reservation). heliodor now runs a
+  dedicated issue-time `pmp_check` on the SC's bare PA (`u_pmp_sc_issue`) and
+  folds a deny into the SC's CDB store-fault (`alu_wrap` `i_sc_acc_fault`) — the
+  recorded `is_sfault`/`fault_acc` trap cause 7 at commit even with no store.
+- **Misaligned atomics → access fault (cause 5 LR / 7 SC·AMO).** heliodor
+  handles misaligned *plain* loads/stores in hardware, but atomics must be
+  naturally aligned. `alu_wrap` now computes `amo_misalign` from the funct3 width
+  (`.W` needs `addr[1:0]==0`, `.D` needs `addr[2:0]==0`, Zabha `.H`/`.Q` likewise)
+  and routes it to the existing access-fault path — `is_lfault` for an LR
+  (cause 5), `is_sfault` for an SC/AMO (cause 7) — and suppresses the commit
+  store so a faulting misaligned AMO/SC never writes memory. This matches Sail,
+  which for atomics takes the access-fault path, **not** the cause-4/6
+  misaligned-address path (verified against `sail_riscv_sim --trace-exception`:
+  every PMPZalrsc trap is a load/store-amo **access** fault).
+
+Generate with `make -C test/act EXT="PMPZaamo PMPZalrsc"`. Regression-safe
+(default 250/0, all atomic suites — `zalrsc` 4/4, `zaamo` 18/18, `zacas` 5/5,
+`zabha` 18/18 — and the PMP suites unchanged): the new checks are inert for
+aligned atomics and all-OFF PMP (boot / litmus).
 
 ### Remaining suites (each needs a feature heliodor doesn't yet implement)
 

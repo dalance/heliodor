@@ -51,6 +51,13 @@ pub module alu_wrap #(
     // distinct from the page fault above. Mutually exclusive with i_dmem_fault.
     i_dmem_acc_fault  : input logic,
     i_dmem_acc_fault_s: input logic,
+    // PMP (Smpmp) WRITE-permission denial for an SC at issue. An SC whose
+    // reservation is invalid clears its store flag (no commit-time store, so
+    // u_pmp_amo_commit never runs), yet the spec/ACT4 still require a store
+    // access fault (cause 7) when the SC's address is W-denied — regardless of
+    // the reservation. The core checks the SC's bare PA at issue and routes the
+    // deny here; we fold it into the CDB store-fault. Bare-mode SC only.
+    i_sc_acc_fault: input logic,
     // M8: next dword for misaligned LH/LW/LD that span 2 dwords.
     i_load_data_next: input logic<64>,
     // Phase 8 S5.1 store-to-load forward. The byte-network is computed in the CORE
@@ -333,12 +340,27 @@ pub module alu_wrap #(
     let amo_is_lr: logic     = i_amo_funct5 == 5'b00010;
     let sc_match : logic     = i_rsv_valid && i_rsv_addr == agu_addr;
     let sc_wb    : logic<64> = if sc_match ? 64'd0 : 64'd1;
+    // Atomics (LR/SC/AMO, incl. Zabha .B/.H and Zacas .Q) must be naturally
+    // aligned. A misaligned atomic raises an ACCESS fault — cause 5 (LR, load)
+    // or 7 (SC/AMO, store) — matching the Sail reference, which for atomics
+    // takes the access-fault path, NOT the cause-4/6 misaligned-address path.
+    // Width from funct3; heliodor otherwise handles misaligned plain
+    // loads/stores in hardware, so this is the only place atomics get gated.
+    // It also suppresses the commit store (amo_commit_store) so a faulting
+    // misaligned AMO/SC never writes memory.
+    let amo_misalign: logic = i_is_amo && (
+        if f3 == 3'b000 ? 1'b0                      // .B never misaligns
+        : if f3 == 3'b001 ? (agu_addr[0] != 1'b0)   // .H
+        : if f3 == 3'b010 ? (agu_addr[1:0] != 2'd0) // .W
+        : if f3 == 3'b011 ? (agu_addr[2:0] != 3'd0) // .D
+        : (agu_addr[3:0] != 4'd0)                   // .Q (amocas.q, 16-byte)
+    );
     let amo_wb   : logic<64> = if amo_is_sc ? sc_wb : amo_old_se;
 
     // Whether to drive a STORE at commit: AMO* (not LR/SC) always;
     // SC only if reservation matched; amocas only when the compare matched
     // (a mismatching CAS leaves memory unchanged).
-    let amo_commit_store: logic = i_is_amo && !amo_is_lr && (!amo_is_sc || sc_match) && (!amo_is_cas || amocas_match || amo_is_cas_q);
+    let amo_commit_store: logic = i_is_amo && !amo_is_lr && (!amo_is_sc || sc_match) && (!amo_is_cas || amocas_match || amo_is_cas_q) && !amo_misalign;
 
     // ============================================================
     // M4: CSR compute. csr_operand = csr_imm ? rs1_arch[4:0] : rs1
@@ -438,15 +460,31 @@ pub module alu_wrap #(
     assign o_cdb.csr_illegal = i_issue_valid && i_is_csr && ((csr_ro && csr_would_wr) || !csr_priv_ok);
     // M5.D dmem MMU page faults. AMO/SC count as stores. LR / plain LOAD
     // count as loads. Fault VA = the AGU-computed effective address.
-    let mem_is_store_kind: logic = i_issue_op.base.is_store || (i_is_amo && !amo_is_lr);
-    let mem_is_load_kind : logic = i_issue_op.base.is_load || (i_is_amo && amo_is_lr);
-    assign o_cdb.is_lfault   = i_issue_valid && mem_is_load_kind && (i_dmem_fault || i_dmem_acc_fault);
-    assign o_cdb.is_sfault   = i_issue_valid && mem_is_store_kind && (i_dmem_fault_s || i_dmem_acc_fault_s);
+    // An AMO (not LR) is a read-modify-write: the decoder sets BOTH mem_ren and
+    // mem_wen, so base.is_load is 1, but the access is store-class for faults.
+    // Exclude it from load-kind so its fault is reported as a STORE/AMO fault
+    // (cause 7 access / 15 page), not a load fault (cause 5 / 13).
+    let amo_not_lr       : logic = i_is_amo && !amo_is_lr;
+    let mem_is_store_kind: logic = i_issue_op.base.is_store || amo_not_lr;
+    let mem_is_load_kind : logic = (i_issue_op.base.is_load && !amo_not_lr) || (i_is_amo && amo_is_lr);
+    // PMP/Smpmp: the AMO's dmem access drives the LOAD pmp signals (its RMW read
+    // presents i_wen=0 → pmp_acc=R), so a fault arrives on i_dmem_fault /
+    // i_dmem_acc_fault. Route it to the store/AMO fault. (dmem_mmu additionally
+    // checks W for an AMO so a W-denied / R-allowed region also faults here.)
+    let amo_rd_fault     : logic = amo_not_lr && (i_dmem_fault || i_dmem_acc_fault);
+    assign o_cdb.is_lfault   = i_issue_valid && mem_is_load_kind && (i_dmem_fault || i_dmem_acc_fault || amo_misalign);
+    assign o_cdb.is_sfault   = i_issue_valid && ((mem_is_store_kind && (i_dmem_fault_s || i_dmem_acc_fault_s)) || amo_rd_fault || i_sc_acc_fault || (amo_not_lr && amo_misalign));
     // PMP access fault flag (cause 5/7 instead of 13/15). Page fault wins, so
-    // only set when there is NO page fault on the same access.
+    // only set when there is NO page fault on the same access. i_sc_acc_fault is
+    // a pure PMP denial (no page fault possible — bare-mode SC), so it is an
+    // access fault unconditionally; a misaligned atomic (amo_misalign) is an
+    // access fault too — cause 5/7 selected by is_lfault vs is_sfault above.
     assign o_cdb.fault_acc   = i_issue_valid
         && ((mem_is_load_kind && i_dmem_acc_fault && !i_dmem_fault)
-            || (mem_is_store_kind && i_dmem_acc_fault_s && !i_dmem_fault_s));
+            || (mem_is_store_kind && i_dmem_acc_fault_s && !i_dmem_fault_s)
+            || (amo_not_lr && i_dmem_acc_fault && !i_dmem_fault)
+            || i_sc_acc_fault
+            || amo_misalign);
     assign o_cdb.fault_vaddr = agu_addr;
 
     assign o_dbg_alu_pc       = i_issue_op.base.pc;

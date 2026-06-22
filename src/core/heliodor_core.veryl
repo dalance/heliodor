@@ -460,6 +460,10 @@ pub module heliodor_core #(
     var dmem_mmu_fault_s: logic;
     var dmem_mmu_acc_fault  : logic; // PMP (Smpmp) load access fault (cause 5)
     var dmem_mmu_acc_fault_s: logic; // PMP (Smpmp) store access fault (cause 7)
+    // PMP (Smpmp) WRITE-permission denial for an SC at issue (forward-declared:
+    // the pipe-0 alu_wrap inst consumes it but it is assigned near the AGU /
+    // issue-SC logic far below). See u_pmp_sc_issue.
+    var sc_issue_acc_fault: logic;
     // Phase 11-H3c: the current dmem fault is a G-stage (guest-physical) fault,
     // and the faulting guest PA (for htval). Valid alongside dmem_mmu_fault(_s)
     // — used at commit for a store guest-page-fault (cause 23). 0 while V=0.
@@ -629,6 +633,12 @@ pub module heliodor_core #(
     // fast_store_acc_fault asserts when that store's PA is denied (cause 7); it
     // suppresses the store-buffer push and drives the commit store-fault path.
     var fast_store_acc_fault: logic;
+    // PMP (Smpmp): an SC (and any AMO reaching commit) writes via the dcache
+    // exclusive port (c_is_amo is excluded from fast_store / sb_vm_ok), so its
+    // store PA needs a dedicated commit-time WRITE PMP check (cause 7). For an
+    // AMO this is redundant (the RMW read already faulted on an R/W denial via
+    // dmem_mmu); for an SC it is the only write-permission check.
+    var amo_commit_acc_fault: logic;
     var dc_sdrain_ack: logic;
     // P9.2: dcache presence checks + line-departure events (forward-declared;
     // assigned at the dcache instance, consumed by the LR/SC reservation /
@@ -735,7 +745,11 @@ pub module heliodor_core #(
     // imem_valid_w == i_req == 1, so no slowdown.
     // M8.A: also hold delivery while the icache is filling a miss. On a fault
     // i_ren=0 (no lookup) so icache_stall=0 — the fault still delivers.
-    let fetch_ready: logic = !needs_straddle_slow && (imem_valid_w || imem_fault_w) && !icache_stall;
+    // SvPMP: a PTE-read PMP denial faults the walk as an instruction ACCESS fault
+    // (imem_acc_fault_w) with neither valid nor page-fault set (the walk never
+    // completed) — include it so the fetch advances and delivers cause 1 rather
+    // than stalling forever on a walk that can never produce a translation.
+    let fetch_ready: logic = !needs_straddle_slow && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && !icache_stall;
 
     // ============================================================
     // Phase 8 M2: branch prediction (BTB + bimodal BHT) — frontend redirect.
@@ -2138,6 +2152,7 @@ pub module heliodor_core #(
         i_dmem_fault_s    : dmem_mmu_fault_s                                    ,
         i_dmem_acc_fault  : dmem_mmu_acc_fault                                  ,
         i_dmem_acc_fault_s: dmem_mmu_acc_fault_s                                ,
+        i_sc_acc_fault    : sc_issue_acc_fault                                  ,
         i_csr_data        : csr_rd_data                                         ,
         i_rsv_valid       : rsv_valid_q                                         ,
         i_rsv_addr        : rsv_addr_q                                          ,
@@ -2198,6 +2213,7 @@ pub module heliodor_core #(
         i_dmem_fault_s    : 1'b0            ,
         i_dmem_acc_fault  : 1'b0            ,
         i_dmem_acc_fault_s: 1'b0            ,
+        i_sc_acc_fault    : 1'b0            , // pipe-1: no AMO/SC
         i_csr_data        : 64'd0           , // pipe-1: no CSR
         i_rsv_valid       : 1'b0            ,
         i_rsv_addr        : 64'd0           ,
@@ -3403,8 +3419,8 @@ pub module heliodor_core #(
     // PMP: a commit-translated store can also take a PMP access fault (cause 7).
     // fast_store_acc_fault covers the fast (bare store-drain) path, which does
     // not flow through the dmem_mmu and so is not covered by dmem_mmu_acc_fault_s.
-    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((dmem_mmu_acc_fault_s && !dmem_mmu_fault_s) || fast_store_acc_fault);
-    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || dmem_mmu_acc_fault_s || fast_store_acc_fault);
+    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((dmem_mmu_acc_fault_s && !dmem_mmu_fault_s) || fast_store_acc_fault || amo_commit_acc_fault);
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || dmem_mmu_acc_fault_s || fast_store_acc_fault || amo_commit_acc_fault);
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
     let commit_excp        : logic = rob_commit_valid
         && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault
@@ -4744,6 +4760,43 @@ pub module heliodor_core #(
     );
     assign fast_store_acc_fault = fast_store && fast_store_pmp_deny;
 
+    // PMP (Smpmp): commit-time WRITE check for the dcache exclusive-write path
+    // (AMO/SC). Bare uses the physical c_store_addr; a VM access uses the
+    // translated dmu_dmem_addr (sb_pa's mux). On a deny the exclusive write is
+    // suppressed and a store/AMO access fault (cause 7) is raised at commit.
+    var amo_commit_pmp_deny: logic;
+    inst u_pmp_amo_commit: pmp_check (
+        i_addr   : if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr,
+        i_acc    : 2'd1         , // write
+        i_priv   : dmem_mmu_priv,
+        i_pmpcfg : csr_pmpcfg   ,
+        i_pmpaddr: csr_pmpaddr  ,
+        o_fault  : amo_commit_pmp_deny,
+    );
+    assign amo_commit_acc_fault = commit_store_fire && c_is_amo && amo_commit_pmp_deny;
+
+    // PMP (Smpmp): an SC whose reservation is INVALID clears its store flag at
+    // execute (alu_wrap amo_commit_store=0 → c_is_store=0 at commit), so it
+    // never reaches the commit-time exclusive-write PMP check (u_pmp_amo_commit,
+    // gated by commit_store_fire). Yet an SC to a W-denied region must STILL
+    // raise a store access fault (cause 7) regardless of the reservation
+    // (Sail / ACT4 PMPZalrsc cfg_wr). Check the SC's WRITE permission at ISSUE
+    // on its bare physical address (agu_addr_iss; AMO imm=0 so this is rs1) and
+    // route the deny into the SC's CDB store-fault via alu_wrap (i_sc_acc_fault)
+    // — the recorded is_sfault/fault_acc trap with cause 7 at commit even though
+    // c_is_store is 0. Bare only: a VM SC translates and the commit-time check
+    // covers the matched (storing) path; a VA here would mis-check PMP.
+    var sc_issue_pmp_deny: logic;
+    inst u_pmp_sc_issue: pmp_check (
+        i_addr   : agu_addr_iss ,
+        i_acc    : 2'd1         , // write
+        i_priv   : dmem_mmu_priv,
+        i_pmpcfg : csr_pmpcfg   ,
+        i_pmpaddr: csr_pmpaddr  ,
+        o_fault  : sc_issue_pmp_deny,
+    );
+    assign sc_issue_acc_fault = issue_is_sc && !dmem_vm_on_op && sc_issue_pmp_deny;
+
     // Core dmem view (pre-MMU virtual address)
     //
     // M9.A.303: a STORE committing at the ROB head must NOT hijack the dmem
@@ -4792,6 +4845,11 @@ pub module heliodor_core #(
     let core_dmem_vaddr: logic<64> = if vu_mem_active ? vu_mem_vaddr : if store_drive ? c_store_addr : if mmu_walk_inflight ? walk_vaddr_q : agu_addr_iss;
     let core_dmem_wdata: logic<64> = if vu_mem_active ? vu_mem_wdata : st_wdata;
     let core_dmem_wen  : logic     = if vu_mem_active ? vu_mem_is_store : store_drive;
+    // PMP (Smpmp): the dmem port carries a real AMO's RMW read (agu_addr_iss) only
+    // when no store/walk/vector access overrides it — match core_dmem_vaddr's
+    // agu_addr_iss arm. Tells dmem_mmu to also require WRITE permission so an AMO
+    // to a W-denied region faults (cause 7 via alu_wrap's amo-fault routing).
+    let core_dmem_is_amo: logic = issue_is_realamo && !vu_mem_active && !store_drive && !mmu_walk_inflight;
     // M9.A.316: do NOT let a speculative LOAD request the dmem MMU on a
     // redirect cycle. The IQ flush is registered, so on the redirect cycle the
     // IQ still holds wrong-path ops and the issue logic can select one; if that
@@ -5161,7 +5219,7 @@ pub module heliodor_core #(
     // Phase 11-H: dmem_vm_on_op folds an HSV store into the VM store-buffer path
     // (translated PA = dmu_dmem_addr).
     assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
-        && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && dmu_dmem_addr[63:25] == 39'h40
+        && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && !dmem_mmu_acc_fault_s && dmu_dmem_addr[63:25] == 39'h40
         && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008)); // P9.2: tohost pages stay write-through
     // PMP (Smpmp): a fast store that fails its PA check must NOT be absorbed by
     // the store buffer (its write is suppressed; it traps instead, like a page-
@@ -5675,6 +5733,7 @@ pub module heliodor_core #(
         i_adue       : csr_adue        ,
         i_pmpcfg     : csr_pmpcfg      ,
         i_pmpaddr    : csr_pmpaddr     ,
+        i_is_amo     : core_dmem_is_amo,
         // Phase 11-H two-stage data translation. dmem_virt2 = MPRV+MPV-effective V
         // OR an explicit HLV/HSV (dmem_op_hlv), so a hypervisor virtual-memory
         // access translates two-stage even while the core itself runs at V=0/HS.
@@ -5760,7 +5819,7 @@ pub module heliodor_core #(
     // keep the write-through path.
     let st_pa_w      : logic<64> = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr; // Phase 11-H HSV → translated PA
     let st_pa_tohost : logic     = (st_pa_w[31:14] == 18'h20000) || (st_pa_w[31:12] == 20'h80008);
-    let dc_wen_excl  : logic     = c_is_amo && !c_store_mmio && !st_pa_tohost && !dmu_ad_wb;
+    let dc_wen_excl  : logic     = c_is_amo && !c_store_mmio && !st_pa_tohost && !dmu_ad_wb && !amo_commit_acc_fault;
     // (P9.3: the ownership pin is dcache-internal — it self-arms at the
     // AMO/LR read's data arrival, which closes the issue→pin arming gap a
     // core-driven pin had: remote recalls landing in that 2-3 cycle window

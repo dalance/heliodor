@@ -22,6 +22,12 @@ pub module mmu #(
     o_paddr: output logic<64>,
     o_valid: output logic    ,
     o_fault: output logic    ,
+    // PMP (Smpmp): the page-table walk read a PTE whose physical address is
+    // denied by PMP (SvPMP `pmp_on_pte`). The walk faults as an ACCESS fault
+    // (cause 1/5/7 by the original access type) rather than a page fault; the
+    // wrapper masks o_fault and routes this to its o_acc_fault. Asserted with
+    // o_fault (so o_fault stays the "walk failed" signal that drives o_busy).
+    o_acc_fault: output logic,
     o_busy : output logic    ,
     // P10 Svpbmt: this translation maps to non-cacheable memory (PBMT NC/IO).
     // Mirrors o_paddr's TLB-hit/walk mux. 0 when VM off (the PA-based MMIO
@@ -39,6 +45,11 @@ pub module mmu #(
     // SATP register
     i_satp: input logic             <64>,
     i_priv: input csr_pkg::PrivLevel    ,
+    // PMP (Smpmp): config + addresses, for the implicit PTE-read protection check
+    // performed on every page-table-walk memory access (SvPMP). The PTE reads use
+    // the privilege of the original access (i_priv) and the read permission (R).
+    i_pmpcfg : input logic<64> [2] ,
+    i_pmpaddr: input logic<64> [16],
     // mstatus permission bits
     i_sum: input logic, // Supervisor User Memory access
     i_mxr: input logic, // Make eXecutable Readable
@@ -382,6 +393,22 @@ pub module mmu #(
     // PTW address computation
     var ptw_addr_reg: logic<64>;
 
+    // PMP (Smpmp) SvPMP: set when the walk faults because a PTE-read physical
+    // address (o_ptw_addr = ptw_addr_reg) is PMP-denied. Distinguishes the FAULT
+    // state as an ACCESS fault (cause 1/5/7) from a page fault; cleared at each
+    // new walk start. `pte_pmp_deny` is the combinational PMP verdict on the PTE
+    // address currently being read.
+    var walk_acc_fault: logic;
+    var pte_pmp_deny  : logic;
+    inst u_ptw_pmp: pmp_check (
+        i_addr   : ptw_addr_reg,
+        i_acc    : 2'd0        , // implicit PTE read = R permission
+        i_priv                 ,
+        i_pmpcfg               ,
+        i_pmpaddr              ,
+        o_fault  : pte_pmp_deny,
+    );
+
     // Track which level the leaf PTE was found at
     var leaf_level: logic<2>;
 
@@ -517,6 +544,7 @@ pub module mmu #(
             leaf_level      = 2'd0;
             leaf_pte_ppn    = 44'd0;
             leaf_global     = 1'b0;
+            walk_acc_fault  = 1'b0;
             walk_vpn_full   = 27'd0;
             walk_vpn1       = 9'd0;
             walk_vpn0       = 9'd0;
@@ -595,6 +623,8 @@ pub module mmu #(
                         // TLB miss: start page table walk
                         // PTE address = satp.PPN * 4096 + VPN[2] * 8
                         ptw_addr_reg = {8'b0, satp_ppn, vpn2, 3'b000};
+                        // SvPMP: each fresh walk starts with no PTE access fault.
+                        walk_acc_fault = 1'b0;
                         // Latch the walk's VA components so subsequent
                         // levels and the TLB write at DONE use the original
                         // VA, not whatever i_vaddr drifts to during the walk.
@@ -648,7 +678,12 @@ pub module mmu #(
                 State::LEVEL2: {
                     if i_ptw_valid {
                         pte = i_ptw_data;
-                        if i_ptw_data[0] == 1'b0 {
+                        if pte_pmp_deny {
+                            // SvPMP: this PTE's physical address is PMP-denied →
+                            // ACCESS fault (cause by access type), not page fault.
+                            walk_acc_fault = 1'b1;
+                            state          = State::FAULT;
+                        } else if i_ptw_data[0] == 1'b0 {
                             // Invalid PTE
                             state = State::FAULT;
                         } else if i_ptw_data[1] || i_ptw_data[3] {
@@ -683,7 +718,11 @@ pub module mmu #(
                 State::LEVEL1: {
                     if i_ptw_valid {
                         pte = i_ptw_data;
-                        if i_ptw_data[0] == 1'b0 {
+                        if pte_pmp_deny {
+                            // SvPMP: PMP-denied PTE read → access fault.
+                            walk_acc_fault = 1'b1;
+                            state          = State::FAULT;
+                        } else if i_ptw_data[0] == 1'b0 {
                             state = State::FAULT;
                         } else if i_ptw_data[1] || i_ptw_data[3] {
                             // Leaf PTE at level 1 (2MB megapage)
@@ -716,7 +755,11 @@ pub module mmu #(
                 State::LEVEL0: {
                     if i_ptw_valid {
                         pte = i_ptw_data;
-                        if i_ptw_data[0] == 1'b0 {
+                        if pte_pmp_deny {
+                            // SvPMP: PMP-denied PTE read → access fault.
+                            walk_acc_fault = 1'b1;
+                            state          = State::FAULT;
+                        } else if i_ptw_data[0] == 1'b0 {
                             state = State::FAULT;
                         } else if i_ptw_data[1] || i_ptw_data[3] {
                             // Leaf PTE at level 0 (4KB page, or 64KB NAPOT if N=1).
@@ -1137,6 +1180,12 @@ pub module mmu #(
         ((state == State::FAULT || (state == State::DONE && !perm_ok)) && walk_va_match)
     ;
     assign o_fault = _fault_out;
+    // SvPMP: the walk failed because a PTE read was PMP-denied. Gate strictly on
+    // the FAULT state (not the broader _fault_out, which also covers TLB-hit and
+    // DONE leaf-permission PAGE faults) so a stale walk_acc_fault from a previous
+    // walk can never re-route a later page fault as an access fault. The wrapper
+    // treats this as an ACCESS fault and masks the page fault (o_fault && !acc).
+    assign o_acc_fault = (state == State::FAULT) && walk_va_match && walk_acc_fault;
     // Phase 11-H: distinguish a G-stage (guest-physical) fault so the core can
     // raise a guest-page-fault (cause 20/21/23) rather than a VS-stage one.
     assign o_gstage_fault = state == State::TS_FAULT && ts_gflt;

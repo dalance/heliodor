@@ -27,6 +27,10 @@ pub module dmem_mmu (
     // PMP (Smpmp): config + addresses, for the physical-address protection check.
     i_pmpcfg     : input  logic             <64> [2] ,
     i_pmpaddr    : input  logic             <64> [16],
+    // PMP: the current data access is an AMO (read-modify-write). An AMO needs
+    // BOTH read and write permission, so its PMP check must also test W (the RMW
+    // read presents i_wen=0, which would otherwise only check R).
+    i_is_amo     : input  logic             ,
     // Phase 11-H two-stage translation (V=1, VS/VU data accesses).
     i_virt       : input  logic             ,
     i_vsatp      : input  logic         <64>,
@@ -90,6 +94,7 @@ pub module dmem_mmu (
     var ptw_paddr: logic<64>;
     var ptw_valid: logic    ;
     var ptw_fault: logic    ;
+    var ptw_acc_fault: logic; // SvPMP: walk faulted on a PMP-denied PTE read
     var ptw_busy : logic    ;
     var ptw_addr : logic<64>;
     var ptw_req  : logic    ;
@@ -106,11 +111,14 @@ pub module dmem_mmu (
         o_paddr     : ptw_paddr   ,
         o_valid     : ptw_valid   ,
         o_fault     : ptw_fault   ,
+        o_acc_fault : ptw_acc_fault,
         o_busy      : ptw_busy    ,
         o_walk_start: o_walk_start,
         o_idle      : o_idle      ,
         i_satp                    ,
         i_priv                    ,
+        i_pmpcfg                  ,
+        i_pmpaddr                 ,
         i_sum                     ,
         i_mxr                     ,
         i_pbmte                   ,
@@ -192,8 +200,11 @@ pub module dmem_mmu (
     // (fault must be visible to trap logic without stall masking it)
     assign o_busy        = vm_enabled && !ptw_fault
         && (ptw_busy || (mem_req && !ptw_valid));
-    assign o_fault       = vm_enabled && ptw_fault;
-    assign o_fault_store = vm_enabled && ptw_fault && i_wen;
+    // SvPMP: a PMP-denied PTE read makes the walk fault as an ACCESS fault, not a
+    // page fault — mask the page-fault outputs and route it via o_acc_fault below.
+    let pte_acc_fault: logic = vm_enabled && ptw_acc_fault;
+    assign o_fault       = vm_enabled && ptw_fault && !pte_acc_fault;
+    assign o_fault_store = vm_enabled && ptw_fault && i_wen && !pte_acc_fault;
 
     // PMP check on the FINAL data access (Bare PA, or the translated PA once the
     // walk has produced it). The implicit PTE reads during a walk are checked
@@ -211,8 +222,26 @@ pub module dmem_mmu (
         i_pmpaddr          ,
         o_fault  : pmp_deny,
     );
-    assign acc_deny          = pmp_active && pmp_deny;
-    assign o_acc_fault       = acc_deny;
-    assign o_acc_fault_store = acc_deny && i_wen;
+    // PMP: an AMO additionally requires WRITE permission. Its RMW read presents
+    // i_wen=0 (so u_pmp above checks only R); check W here and OR the denial in,
+    // so a W-denied / R-allowed region faults the AMO too. The fault is reported
+    // on the LOAD signal (o_acc_fault) — the AMO drives i_ren — and the core's
+    // alu_wrap routes an AMO's load-side fault to a store/AMO access fault (7).
+    var pmp_deny_amo_w: logic;
+    inst u_pmp_amo_w: pmp_check (
+        i_addr   : pmp_pa       ,
+        i_acc    : 2'd1         , // write
+        i_priv                  ,
+        i_pmpcfg                ,
+        i_pmpaddr               ,
+        o_fault  : pmp_deny_amo_w,
+    );
+    assign acc_deny          = pmp_active && (pmp_deny || (i_is_amo && pmp_deny_amo_w));
+    // SvPMP: the data-access PMP denial (acc_deny, on the final PA) OR a PTE-read
+    // PMP denial during the walk (pte_acc_fault) both raise an access fault of the
+    // original type (cause 5 load / 7 store). They are disjoint in time (acc_deny
+    // needs ptw_valid; pte_acc_fault fires mid-walk before ptw_valid).
+    assign o_acc_fault       = acc_deny || pte_acc_fault;
+    assign o_acc_fault_store = (acc_deny || pte_acc_fault) && i_wen;
 
 }
