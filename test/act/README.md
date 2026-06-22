@@ -100,9 +100,40 @@ width (so one 64-bit datapath + comparator serves every width), and the new
 sub-word stays right-aligned so the existing 4-size commit-time wstrb generator
 writes exactly the target bytes; `rd` gets the sign-extended old sub-word.
 Generate with `make -C test/act EXT="Zabha"` (`Zabha` enabled in `heliodor.yaml`
-+ `sail.json`). The **vector V** suites are absent from this upstream clone, and
-**`Zacas`** (compare-and-swap — needs an `rd`-as-source read in the OoO core)
-remains the one RVA23-mandatory scalar gap left.
++ `sail.json`).
+
+### Zacas (compare-and-swap, incl. 128-bit pair)
+
+**`Zacas` 3/3 + `ZacasZabha` 2/2** — `amocas.{b,h,w,d,q}`. amocas is invasive in an
+OoO core: it reads `rd` as a THIRD source (the comparison/expected value) and
+`amocas.q` operates on the 128-bit even/odd register pair `rd:rd+1` / `rs2:rs2+1`.
+
+- **`amocas.{b,h,w,d}`** (single register). The comparison value is the OLD value
+  of `rd` — which is exactly the physical register `rat[rd]` captures at rename as
+  `old_rd_pdst`. Since an AMO issues only at the ROB head, that value's producer
+  has committed, so it is always ready (no IQ wakeup tracking): a spare `prf_int`
+  read port (`rd8`, fed by a new `iq_int` `o_issue_rd_old_pdst`) supplies it to
+  `alu_wrap` as `i_rd_cmp_data`. `alu_wrap` compares at the access width and gates
+  the commit store on the match (a mismatching CAS leaves memory unchanged); `rd`
+  gets the sign-extended old sub-word via the normal writeback.
+- **`amocas.q`** (128-bit pair) is handled as a serializing op. It does not rename
+  `rd:rd+1`; at execute it loads the 128-bit value (lo via `i_load_data`, hi via
+  `i_load_data_next` — 16-byte aligned ⇒ one cache line) and carries it to commit.
+  Register operands are read at commit from the architectural file (`arch_regs`,
+  authoritative at the ROB head): compare `{rd+1,rd}` vs the loaded pair, and on a
+  match store `{rs2+1,rs2}` via a 128-bit extension of the in-cache AMO merge
+  (`dcache.veryl` `i_wen_excl_q`/`i_wdata_hi` writes the adjacent lane). The old
+  pair is written into `rd:rd+1` in place (two commit-time `prf_int` write ports +
+  `arch_regs`), then a commit flush re-fetches so younger readers see the new
+  values. The read is held until the store buffer drains (its two-dword read isn't
+  covered by the single-dword store-overlap gate). **x0 rule:** when a pair BASE is
+  `x0` the WHOLE pair reads as 0 (`rd=x0` ⇒ compare `{0,0}` + no writeback; `rs2=x0`
+  ⇒ store `{0,0}`).
+
+Generate with `make -C test/act EXT="Zacas ZacasZabha"` (`Zacas` enabled in
+`heliodor.yaml` + `sail.json`; `ZacasZabha` needs both `Zacas` and `Zabha`). With
+this, **all RVA23-mandatory scalar atomics are covered**; the **vector V** suites
+are absent from this upstream clone (the one remaining RVA23 gap).
 
 Two framework-integration fixes were needed to generate these. (1) The upstream
 `make` wants `EXTENSIONS` **comma-separated** and strips all spaces, so the

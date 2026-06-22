@@ -74,6 +74,14 @@ pub module alu_wrap #(
     // outputs, plus is_amo_w derived from mem_funct3.
     i_is_amo    : input logic   ,
     i_amo_funct5: input logic<5>,
+    // Zacas (amocas) — the comparison/expected value is the OLD architectural
+    // value of rd (amocas reads rd as a third source). The core reads it from
+    // prf[old_rd_pdst] and supplies it here. amocas writes the new value (rs2)
+    // to memory only when mem == rd_cmp at the access width, and returns the old
+    // memory value to rd (sign-extended). An AMO issues only at the ROB head, so
+    // old_rd_pdst's producer has already committed — this value is always ready
+    // (no IQ wakeup tracking needed). Unused for non-CAS AMOs.
+    i_rd_cmp_data: input logic<64>,
     // M5.D per-field CSR inputs (same workaround).
     i_is_csr  : input logic                 ,
     i_csr_addr: input logic             <12>,
@@ -270,6 +278,25 @@ pub module alu_wrap #(
     let amo_lt : logic = $signed(amo_old_se) <: $signed(amo_b_se);
     let amo_ltu: logic = amo_old_ze <: amo_b_ze;
 
+    // Zacas (amocas, funct5=00101): zero-extend the rd comparison value at the
+    // access width (same framing as amo_old_ze) so the equality test is
+    // width-correct (.B/.H/.W compare only the low byte/half/word). On a match
+    // the store fires with new value = rs2 (amo_new_64 below); on a mismatch the
+    // store is suppressed (amo_commit_store). rd always gets the old memory
+    // sub-word (amo_wb = amo_old_se), so the program observes the loaded value.
+    let amo_cmp_ze  : logic<64> = if f3 == 3'b000 ? {56'd0, i_rd_cmp_data[7:0]} : if f3 == 3'b001 ? {48'd0, i_rd_cmp_data[15:0]} : if f3 == 3'b010 ? {32'd0, i_rd_cmp_data[31:0]} : i_rd_cmp_data;
+    let amo_is_cas  : logic     = i_amo_funct5 == 5'b00101;
+    let amocas_match: logic     = amo_old_ze == amo_cmp_ze;
+    // Zacas amocas.q (funct5=00101, funct3=100): the full 128-bit compare, store
+    // data and pair writeback happen at COMMIT (operands read from arch_regs).
+    // Here at execute we only LOAD the 128-bit value (lo = i_load_data = mem[addr],
+    // hi = i_load_data_next = mem[addr+8]; the access is 16-byte aligned so both
+    // dwords share one cache line) and carry it to the ROB. The 64-bit amocas
+    // store gate (amocas_match) is bypassed for .q — the store is always MARKED
+    // (so the commit store machinery runs) and the commit side gates it on the
+    // 128-bit match.
+    let amo_is_cas_q: logic = amo_is_cas && f3 == 3'b100;
+
     // New value, right-aligned in the low `width` bits. ADD/bit-ops use the
     // zero-extended operands (low bits are width-correct; carry past the width
     // is masked off by the store wstrb); MIN/MAX select the extended operand.
@@ -286,6 +313,7 @@ pub module alu_wrap #(
             5'b11000: amo_new_64 = if amo_ltu ? amo_old_ze : amo_b_ze; // MINU
             5'b11100: amo_new_64 = if amo_ltu ? amo_b_ze : amo_old_ze; // MAXU
             5'b00011: amo_new_64 = amo_b_ze; // SC: data = rs2
+            5'b00101: amo_new_64 = amo_b_ze; // CAS: new value = rs2 (committed only on match)
             default : amo_new_64 = amo_b_ze;
         }
     }
@@ -304,8 +332,9 @@ pub module alu_wrap #(
     let amo_wb   : logic<64> = if amo_is_sc ? sc_wb : amo_old_se;
 
     // Whether to drive a STORE at commit: AMO* (not LR/SC) always;
-    // SC only if reservation matched.
-    let amo_commit_store: logic = i_is_amo && !amo_is_lr && (!amo_is_sc || sc_match);
+    // SC only if reservation matched; amocas only when the compare matched
+    // (a mismatching CAS leaves memory unchanged).
+    let amo_commit_store: logic = i_is_amo && !amo_is_lr && (!amo_is_sc || sc_match) && (!amo_is_cas || amocas_match || amo_is_cas_q);
 
     // ============================================================
     // M4: CSR compute. csr_operand = csr_imm ? rs1_arch[4:0] : rs1
@@ -377,8 +406,14 @@ pub module alu_wrap #(
     // For AMO/SC: store the computed amo_store_data_64; otherwise rs2.
     assign o_cdb.store_data = if i_is_amo ? amo_store_data_64 : i_rs2_data;
     // For AMO: funct3 carries width — .W (010) vs .D (011) — matches
-    // SW/SD encoding so the existing wstrb generator handles it.
-    assign o_cdb.store_funct3 = f3;
+    // SW/SD encoding so the existing wstrb generator handles it. amocas.q
+    // (f3=100) stores 16 bytes: the LO dword uses the SD (011) width here; the
+    // HI dword is written by the dcache 128-bit exclusive-merge extension.
+    assign o_cdb.store_funct3 = if amo_is_cas_q ? 3'b011 : f3;
+    // Zacas amocas.q: carry the loaded 128-bit value to the ROB for the
+    // commit-time compare / pair writeback (is_cas_q is tagged at ROB alloc).
+    assign o_cdb.cas_q_mem_lo = i_load_data;
+    assign o_cdb.cas_q_mem_hi = i_load_data_next;
     assign o_cdb.is_csr       = i_issue_valid && i_is_csr;
     assign o_cdb.csr_addr     = i_csr_addr;
     assign o_cdb.csr_wdata    = csr_new_val;
