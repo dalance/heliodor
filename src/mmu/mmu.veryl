@@ -162,6 +162,14 @@ pub module mmu #(
     // takes over) while leaving V=0 byte-identical.
     let vm_enabled: logic = !i_virt && satp_mode == SATP_MODE_SV39 && i_priv != PrivLevel::MACHINE;
 
+    // Sv39 requires the VA's high bits [63:39] to be a sign-extension of bit 38;
+    // any other VA is non-canonical and faults before the walk even begins. The
+    // TLB tags only VA[38:12], so a non-canonical VA could alias (and spuriously
+    // hit) a cached canonical entry — hence this gates the whole single-stage
+    // translation (TLB-hit fast path AND walk start), not just the walk. Only
+    // single-stage VM applies (the two-stage / V=1 path uses its own GVA rules).
+    let va_noncanonical: logic = vm_enabled && (i_vaddr[63:39] != {i_vaddr[38] repeat 25});
+
     // ============================================================
     // TLB: 16-entry fully-associative
     // ============================================================
@@ -437,15 +445,28 @@ pub module mmu #(
     // D=0 leaf no longer faults; hardware updates the bits instead.
     // Superpage: level-1 requires PPN[0]=0, level-2 requires PPN[1:0]=0.
     let ad_ok     : logic = i_ptw_data[6] && (!i_store || i_ptw_data[7]);
+    // PTE bits [60:54] are reserved in Sv39 and must be zero in EVERY PTE (leaf
+    // or non-leaf); a non-zero value is a reserved encoding → page fault.
+    let pte_rsvd_hi: logic = i_ptw_data[60:54] != 7'd0;
+    // W=1 with R=0 (X W R encodings 010 / 110) is reserved-for-future-use →
+    // page fault, regardless of level or X. (A real pointer PTE is 000.)
+    let pte_wr_rsvd: logic = i_ptw_data[2] && !i_ptw_data[1];
+    // P10 Svpbmt: the leaf PBMT field (62:61). When PBMTE=1 only 11 is reserved
+    // (01/10 select NC/IO); when PBMTE=0 Svpbmt is off and ANY non-zero PBMT is
+    // a reserved encoding → fault (the Sv `svpbmt_disabled` suite checks this).
+    let pbmt_rsvd  : logic = if i_pbmte ? (i_ptw_data[62:61] == 2'b11) : (i_ptw_data[62:61] != 2'b00);
     let leaf_valid: logic = i_ptw_data[0] && (i_ptw_data[1] || i_ptw_data[3])
         && (ad_ok || i_adue)
-        // P10 Svpbmt: PBMT==11 is reserved → fault (only when PBMTE enables it).
-        && !(i_pbmte && i_ptw_data[62:61] == 2'b11);
-    // A non-leaf (pointer) PTE must leave the leaf-only fields clear: the N bit
-    // (Svnapot, 63) and — when PBMTE enables Svpbmt — the PBMT field (62:61).
-    // A non-zero value there is a reserved encoding → page fault. (PBMT and N
-    // are only architecturally meaningful in leaf PTEs.)
-    let nonleaf_reserved: logic = i_ptw_data[63] || (i_pbmte && i_ptw_data[62:61] != 2'b00);
+        && !pbmt_rsvd && !pte_rsvd_hi && !pte_wr_rsvd;
+    // A non-leaf (pointer) PTE must leave the leaf-only fields clear, else the
+    // encoding is reserved → page fault: the N bit (Svnapot, 63), the PBMT field
+    // (62:61), the D/A/U bits (7/6/4 — leaf-only; G at bit 5 IS allowed and
+    // propagates), the reserved bits [60:54], and W (a pointer has W=0; W set
+    // with R=0/X=0 is the reserved 010 encoding). (N/PBMT/D/A/U are only
+    // architecturally meaningful in leaf PTEs.)
+    let nonleaf_reserved: logic = i_ptw_data[63] || i_ptw_data[62:61] != 2'b00
+        || i_ptw_data[7] || i_ptw_data[6] || i_ptw_data[4]
+        || pte_rsvd_hi || i_ptw_data[2];
     // P10 Svadu: this leaf needs an A/D write-back. Only the data side
     // (WRITE_AD=1) writes the bits back; the i-side just relaxes the fault.
     let need_ad_wb: logic = (WRITE_AD != 0) && i_adue && !ad_ok;
@@ -570,7 +591,7 @@ pub module mmu #(
         } else {
             case state {
                 State::IDLE: {
-                    if i_req && vm_enabled && !tlb_hit {
+                    if i_req && vm_enabled && !tlb_hit && !va_noncanonical {
                         // TLB miss: start page table walk
                         // PTE address = satp.PPN * 4096 + VPN[2] * 8
                         ptw_addr_reg = {8'b0, satp_ppn, vpn2, 3'b000};
@@ -1068,7 +1089,9 @@ pub module mmu #(
         1'b0
     ;
 
-    assign o_valid = if !vm_enabled ?
+    assign o_valid = if va_noncanonical ?
+        1'b0
+    : if !vm_enabled ?
         (if v1_hit_idle ? i_req : if two_stage ? (state == State::TS_DONE && i_vaddr == ts_gva) : i_req)
     : if tlb_hit && state == State::IDLE ?
         (i_req && tlb_perm_ok)
@@ -1102,7 +1125,11 @@ pub module mmu #(
     // exact analog of walk_va_match for the nested walk): a drifted current
     // i_vaddr suppresses the stale fault and holds busy (ts_busy keeps TS_FAULT/
     // TS_FAULT2 busy), so the mmu drains FAULT->IDLE and re-walks the current VA.
-    let _fault_out: logic = if !vm_enabled ?
+    let _fault_out: logic = if va_noncanonical ?
+        // Non-canonical Sv39 VA: fault immediately on the request, bypassing
+        // both the TLB-hit fast path and the walk (see va_noncanonical).
+        i_req
+    : if !vm_enabled ?
         (if two_stage ? (state == State::TS_FAULT && i_vaddr == ts_gva) : 1'b0)
     : if tlb_hit && state == State::IDLE ?
         (i_req && !tlb_perm_ok)
@@ -1121,7 +1148,7 @@ pub module mmu #(
     // TLB miss in IDLE: state transitions to LEVEL2 on the clock edge,
     // but combinationally o_busy must already be high to prevent the
     // pipeline from advancing PC during the 1-cycle IDLE→LEVEL2 gap.
-    let tlb_miss_start: logic = state == State::IDLE && i_req && vm_enabled && !tlb_hit;
+    let tlb_miss_start: logic = state == State::IDLE && i_req && vm_enabled && !tlb_hit && !va_noncanonical;
     // Phase 11-H two-stage: the IDLE→walk gap + the walk states must hold busy
     // (mirrors the single-stage logic). TS_DONE/IDLE are NOT busy (the core
     // performs the data access then); TS_FAULT/TS_FAULT2 are busy like FAULT.

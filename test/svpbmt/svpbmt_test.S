@@ -1,26 +1,33 @@
 # P10 Svpbmt: page-based memory types (PTE[62:61] = PBMT).
 #
 # The cache-bypass effect of NC/IO cannot be observed in software on heliodor's
-# coherent core, so this test pins the *interpretation* of the PBMT field, which
-# is what the change adds:
-#   - menvcfg.PBMTE gates interpretation: with PBMTE=0 a PBMT=11 PTE is treated
-#     as an ordinary (cacheable) leaf — no fault.
-#   - With PBMTE=1, PBMT=11 is reserved and raises a page fault.
-#   - With PBMTE=1, PBMT=01 (NC) is a valid leaf — no fault.
+# coherent core, so this test pins the *interpretation* of the PBMT field:
+#   - menvcfg.PBMTE gates Svpbmt. With PBMTE=0 the implementation behaves as
+#     though Svpbmt were not implemented: PBMT (bits 62:61) is then a reserved
+#     PTE field and ANY non-zero value raises a page fault. A PBMT=0 leaf still
+#     translates normally.
+#   - With PBMTE=1, PBMT=01 (NC) / 10 (IO) are valid leaf encodings (no fault)
+#     and PBMT=11 is reserved -> page fault.
+# (This matches the Sail reference / ACT4 `Sv/sv39_svpbmt_disabled` suite. An
+# earlier version of this test wrongly assumed PBMTE=0 *ignored* PBMT.)
 #
-# M-mode throughout (MPRV=1/MPP=S translates loads). A phase register (s4)
-# tells the trap handler whether a fault is expected. tohost @ 0x80001000.
-# 1 = PASS, 10 = FAIL.
+# M-mode throughout (MPRV=1/MPP=S translates loads). The trap handler signals a
+# load page fault in s5 and resumes the M-mode flow via `jr mepc+4` (NOT mret:
+# trap entry overwrites MPP with M, which would make MPRV use M-mode — no
+# translation — for every later load; the handler restores MPP=S and jr keeps us
+# in M-mode). .option norvc keeps every load 4 bytes so mepc+4 is exact, so all
+# scenarios chain in one run. tohost @ 0x80001000: 1 = PASS, 10 = FAIL.
 #
 #   VA 0x40000000 (VPN0=0, L0[0]) -> PA 0x80020000, PBMT=01 (NC)
 #   VA 0x40001000 (VPN0=1, L0[1]) -> PA 0x80021000, PBMT=11 (reserved)
+#   VA 0x40002000 (VPN0=2, L0[2]) -> PA 0x80022000, PBMT=00 (normal)
 
     .section .text.init
+    .option norvc
     .globl _start
 _start:
     la   t0, mtrap
     csrw mtvec, t0
-    li   s4, 0                   # phase 0: a fault is unexpected
 
     # ---- data ----
     li   t0, 0x80020000
@@ -28,6 +35,9 @@ _start:
     sd   t1, 0(t0)
     li   t0, 0x80021000
     li   t1, 0xB1B1
+    sd   t1, 0(t0)
+    li   t0, 0x80022000
+    li   t1, 0xCECE
     sd   t1, 0(t0)
 
     # ---- page tables ----
@@ -43,6 +53,9 @@ _start:
     li   t0, 0x80012008          # L0[1] -> PA 0x80021000, PBMT=11 (reserved)
     li   t1, 0x60000000200084C7
     sd   t1, 0(t0)
+    li   t0, 0x80012010          # L0[2] -> PA 0x80022000, PBMT=00 (normal)
+    li   t1, 0x00000000200088C7
+    sd   t1, 0(t0)
 
     # ---- enable Sv39 (PBMTE still 0) ----
     li   t0, 0x8000000000080010
@@ -53,11 +66,25 @@ _start:
     li   t0, 0x20800
     csrs mstatus, t0
 
-    # ---- gating: PBMTE=0 -> PBMT=11 ignored, normal cacheable load works ----
+    # ---- PBMTE=0: a PBMT=0 leaf translates normally (no fault) ----
+    li   s5, 0
+    li   a0, 0x40002000
+    ld   a1, 0(a0)               # must NOT fault
+    bnez s5, fail
+    li   t1, 0xCECE
+    bne  a1, t1, fail            # cacheable path -> reads the value we wrote
+
+    # ---- PBMTE=0: PBMT=01 is reserved (Svpbmt off) -> page fault ----
+    li   s5, 0
+    li   a0, 0x40000000
+    ld   a1, 0(a0)               # must fault
+    beqz s5, fail                # no fault -> bug
+
+    # ---- PBMTE=0: PBMT=11 is reserved (Svpbmt off) -> page fault ----
+    li   s5, 0
     li   a0, 0x40001000
-    ld   a1, 0(a0)               # must NOT fault (phase 0)
-    li   t1, 0xB1B1
-    bne  a1, t1, fail            # cached path -> reads the value we wrote
+    ld   a1, 0(a0)               # must fault
+    beqz s5, fail
 
     # ---- enable PBMTE ----
     li   t0, 1
@@ -65,38 +92,42 @@ _start:
     csrs menvcfg, t0
     sfence.vma zero, zero        # flush TLB so PBMT is re-interpreted
 
-    # ---- acceptance: PBMT=01 (NC) is a valid leaf -> no fault ----
+    # ---- PBMTE=1: PBMT=01 (NC) is a valid leaf -> no fault ----
+    li   s5, 0
     li   a0, 0x40000000
-    ld   a1, 0(a0)               # must NOT fault (phase 0); value not checked
-                                 # (uncached vs cached data is not comparable)
+    ld   a1, 0(a0)               # must NOT fault; value not checked
+    bnez s5, fail                # (uncached vs cached data not comparable)
 
-    # ---- reserved fault: PBMTE=1 + PBMT=11 -> page fault ----
-    li   s4, 1                   # phase 1: a fault is now expected = PASS
+    # ---- PBMTE=1: PBMT=11 -> reserved -> page fault ----
+    li   s5, 0
     li   a0, 0x40001000
-    ld   a1, 0(a0)               # must fault -> mtrap
-    j    fail                    # no fault -> bug
+    ld   a1, 0(a0)               # must fault
+    beqz s5, fail
+
+    # ---- all scenarios matched -> PASS ----
+    li   t0, 0x20000
+    csrc mstatus, t0             # MPRV off
+    li   t0, 1
+    li   t1, 0x80001000
+    sw   t0, 0(t1)
+1:  j    1b
 
 mtrap:
     csrr t6, mcause
     li   t5, 13                  # load page fault
     bne  t6, t5, fail_trap
-    bnez s4, trap_pass           # phase 1 + load page fault -> expected
-    # (phase 0 + fault falls through to fail_trap = unexpected)
-fail_trap:
-    li   t0, 0x20000
-    csrc mstatus, t0
-    li   t0, 10
-    li   t1, 0x80001000
-    sw   t0, 0(t1)
-1:  j    1b
-trap_pass:
-    li   t0, 0x20000
-    csrc mstatus, t0
-    li   t0, 1
-    li   t1, 0x80001000
-    sw   t0, 0(t1)
-2:  j    2b
+    li   s5, 1                   # signal: a load page fault occurred
+    # Trap entry forced MPP=M; restore MPP=S so MPRV keeps translating loads as
+    # S-mode after we resume. We stay in M-mode (jr, not mret).
+    li   t0, 0x1800
+    csrc mstatus, t0             # clear MPP
+    li   t0, 0x800
+    csrs mstatus, t0             # MPP = S (MPRV already 1)
+    csrr t0, mepc
+    addi t0, t0, 4               # skip the faulting (4-byte) load
+    jr   t0
 
+fail_trap:
 fail:
     li   t0, 0x20000
     csrc mstatus, t0

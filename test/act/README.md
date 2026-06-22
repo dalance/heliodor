@@ -61,7 +61,11 @@ clean (`Zicbom`/`Zicboz` need `CACHE_BLOCK_SIZE=64` +
 treats `cbo.inval/clean/flush` as legal no-ops, so `cbo.inval` never discards
 dirty data; the `Misalign*` suites just need `MISALIGNED_LDST=true`).
 
-### Privileged / virtual-memory suites (complete)
+### Privileged / virtual-memory suites
+
+The mode-switching `priv/` suites (run in S/U-mode via `mret`) total **50/50**:
+the `Svnapot`/`Svade`/`Svbare`/`Svpbmt`/`Svinval`/`Svadu` group below (**17/17**)
+plus the general Sv39 `Sv` suite (**33/33**).
 
 The `priv/` suites (`Svnapot`, `Svpbmt`, `Svade`/`Svadu`, `Svinval`, `Svbare`,
 …) run in S/U-mode and mode-switch via `mret`. They were unblocked by defining
@@ -85,8 +89,27 @@ fixed**:
 | `Svbare` mprv (×1) | `mstatus.MPRV` + `MPP=S/U` + `satp=Bare` effective-privilege path — fixed as a side effect of the SD / `mtval` work (`178cbba`). |
 | `Svadu` (×2) | hardware A/D update: the instruction-fetch A-bit write-back is injected coherently through the dcache store-drain port (`98100fc`). |
 
+### General Sv39 page-table suite (`Sv`)
+
+The big `Sv` suite (134 tests, of which **33 are the sv39_* subset** heliodor's
+Sv39-only config generates — the sv32/sv48/sv57 and svnapot/svpbmt-disabled-when-
+implemented variants are filtered out) exercises every Sv39 PTE corner case:
+canonical VAs, invalid/global/misaligned/RSW PTEs, `mstatus.MPRV`/`MXR`/`SUM`,
+reserved fields, and non-leaf PTE rules. **`Sv` 33/33.** It caught **5 more real
+heliodor MMU RTL bugs in `src/mmu/mmu.veryl`, all now fixed** — the walk accepted
+several reserved/illegal Sv39 encodings that the spec (and the Sail reference)
+require to page-fault:
+
+| was failing | bug |
+|---|---|
+| `sv39_canonical` (×2) | A non-canonical Sv39 VA (bits [63:39] not a sign-extension of bit 38) must fault before the walk; heliodor ignored [63:39]. Fixed with `va_noncanonical`, which gates the TLB-hit fast path AND the walk start (the TLB tags only VA[38:12], so a non-canonical VA could otherwise alias a cached entry). |
+| `sv39_nleaf_pte_DAU` (×2) | A non-leaf (pointer) PTE with `D`/`A`/`U` set is a reserved encoding → fault; heliodor followed the pointer. (`G` at bit 5 IS allowed on non-leaf and still propagates.) |
+| `sv39_pte_reserved_field` (×1) | PTE bits [60:54] are reserved and must be zero in every PTE → fault. |
+| `sv39_pte_reserved_rwx` (×2) | The `W=1,R=0` R/W/X encodings (010 / 110) are reserved → fault, at any level (heliodor treated 010 as a pointer and 110 as an executable leaf, looping / mis-translating instead of faulting). |
+| `sv39_svpbmt_disabled` (×1) | With `menvcfg.PBMTE=0` the implementation behaves as if Svpbmt were not implemented, so a **non-zero PBMT field is reserved → fault** (heliodor only faulted PBMT==11 and only when PBMTE=1). This also corrected heliodor's own directed `test/svpbmt/svpbmt_test.S`, which had assumed PBMTE=0 *ignored* PBMT — the spec/Sail fault, so the test now expects it. |
+
 These suites are **not** in the default `make` EXT (the default stays green at
-506); generate them with `make -C test/act EXT="Svnapot Svpbmt Svade Svadu
+506); generate them with `make -C test/act EXT="Sv Svnapot Svpbmt Svade Svadu
 Svinval Svbare"`.
 
 ### Zabha (byte/halfword atomics)
@@ -132,8 +155,26 @@ OoO core: it reads `rd` as a THIRD source (the comparison/expected value) and
 
 Generate with `make -C test/act EXT="Zacas ZacasZabha"` (`Zacas` enabled in
 `heliodor.yaml` + `sail.json`; `ZacasZabha` needs both `Zacas` and `Zabha`). With
-this, **all RVA23-mandatory scalar atomics are covered**; the **vector V** suites
-are absent from this upstream clone (the one remaining RVA23 gap).
+this, **all RVA23-mandatory scalar atomics are covered**.
+
+### Remaining suites (each needs a feature heliodor doesn't yet implement)
+
+The suites still uncovered all require a sizeable feature, or are absent from the
+upstream clone — they are NOT a matter of generating/running more tests:
+
+- **PMP** (`pmp`, `SvPMP` 16, `SvPMPZicbo` 32, `SvaduPMP` 8) — heliodor has only
+  the `pmpcfg0`/`pmpaddr0` CSRs with **no enforcement**. Passing these needs full
+  PMP enforcement (16 entries, OFF/TOR/NA4/NAPOT matching, R/W/X checks with
+  lowest-match priority + lock bits + M-mode bypass) wired into the load / store /
+  fetch / page-table-walk paths — a substantial RTL feature.
+- **`ExceptionsSv` / `ExceptionsSvZaamo` / `ExceptionsSvZalrsc` / `SvZicbo`** (the
+  `_Umode` + access-fault cases) — these `LI(a0, RVMODEL_ACCESS_FAULT_ADDRESS)` a
+  PA that must raise an **access fault**, but heliodor raises no load/store/fetch
+  access fault (cause 1/5/7) for an unmapped/PMA-denied PA (the address is left
+  `#undef` in `config/heliodor/rvmodel_macros.h` for this reason). Passing these
+  needs PMA / access-fault support. (Sv39-translation `_Smode` cases that don't
+  use that address are covered by the `Sv` suite above.)
+- **Vector V** — absent from this upstream clone (no V test directory).
 
 Two framework-integration fixes were needed to generate these. (1) The upstream
 `make` wants `EXTENSIONS` **comma-separated** and strips all spaces, so the
