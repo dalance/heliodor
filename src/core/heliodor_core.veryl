@@ -460,6 +460,7 @@ pub module heliodor_core #(
     var dmem_mmu_fault_s: logic;
     var dmem_mmu_acc_fault  : logic; // PMP (Smpmp) load access fault (cause 5)
     var dmem_mmu_acc_fault_s: logic; // PMP (Smpmp) store access fault (cause 7)
+    var dmem_mmu_pte_acc_fault: logic; // SvPMP: PMP-denied PTE READ on the walk (cbo_m keeps this)
     // PMP (Smpmp) WRITE-permission denial for an SC at issue (forward-declared:
     // the pipe-0 alu_wrap inst consumes it but it is assigned near the AGU /
     // issue-SC logic far below). See u_pmp_sc_issue.
@@ -639,6 +640,11 @@ pub module heliodor_core #(
     // AMO this is redundant (the RMW read already faulted on an R/W denial via
     // dmem_mmu); for an SC it is the only write-permission check.
     var amo_commit_acc_fault: logic;
+    // PMP (Smpmp): cbo.clean/flush/inval take a store access fault (cause 7) only
+    // when the block has NEITHER read NOR write permission (R-or-W rule, per
+    // Sail) — assigned from a dedicated R+W pmp_check pair near the other
+    // commit-time PMP checks. Forward-declared so commit_store_sacc/sfault read it.
+    var cbo_m_acc_fault: logic;
     var dc_sdrain_ack: logic;
     // P9.2: dcache presence checks + line-departure events (forward-declared;
     // assigned at the dcache instance, consumed by the LR/SC reservation /
@@ -1678,6 +1684,7 @@ pub module heliodor_core #(
         rob_alloc_entry.is_fence_i = dec_op.is_fence_i;
         rob_alloc_entry.is_fence  = dec_op.is_fence;
         rob_alloc_entry.is_cbo_zero = dec_op.is_cbo_zero;
+        rob_alloc_entry.is_cbo_m  = dec_op.is_cbo_m;
         rob_alloc_entry.is_amo    = dec_op.is_amo;
         // Zacas amocas.q: tag + the rd+1 old pdst (read via the slot-1 RAT port,
         // overridden to rd+1 below; slot-1 co-rename is suppressed for amocas.q).
@@ -1849,6 +1856,7 @@ pub module heliodor_core #(
         rob_alloc_entry2.is_fence_i     = dec_op2.is_fence_i;
         rob_alloc_entry2.is_fence       = dec_op2.is_fence;
         rob_alloc_entry2.is_cbo_zero    = dec_op2.is_cbo_zero;
+        rob_alloc_entry2.is_cbo_m       = dec_op2.is_cbo_m;
         rob_alloc_entry2.is_amo         = dec_op2.is_amo;
         // Zacas amocas.q is slot-0 only; assigned for struct completeness.
         rob_alloc_entry2.is_cas_q       = dec_op2.is_cas_q;
@@ -2834,6 +2842,7 @@ pub module heliodor_core #(
     var c_is_fence_i  : logic           ; // M8.A FENCE.I → icache flush
     var c_is_fence    : logic           ; // P9.0: plain FENCE (drain-wait gate)
     var c_is_cbo_zero : logic           ; // P10 Zicboz cbo.zero at commit
+    var c_is_cbo_m    : logic           ; // P10 Zicbom cbo.clean/flush/inval at commit
     var c_is_ifault   : logic           ;
     var c_is_lfault   : logic           ;
     var c_is_sfault   : logic           ;
@@ -3161,6 +3170,7 @@ pub module heliodor_core #(
         o_commit_is_fence_i  : c_is_fence_i         ,
         o_commit_is_fence    : c_is_fence           ,
         o_commit_is_cbo_zero : c_is_cbo_zero        ,
+        o_commit_is_cbo_m    : c_is_cbo_m           ,
         o_commit_is_ifault   : c_is_ifault          ,
         o_commit_is_lfault   : c_is_lfault          ,
         o_commit_fault_acc   : c_fault_acc          ,
@@ -3419,8 +3429,14 @@ pub module heliodor_core #(
     // PMP: a commit-translated store can also take a PMP access fault (cause 7).
     // fast_store_acc_fault covers the fast (bare store-drain) path, which does
     // not flow through the dmem_mmu and so is not covered by dmem_mmu_acc_fault_s.
-    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((dmem_mmu_acc_fault_s && !dmem_mmu_fault_s) || fast_store_acc_fault || amo_commit_acc_fault);
-    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || dmem_mmu_acc_fault_s || fast_store_acc_fault || amo_commit_acc_fault);
+    // P10 Zicbom: cbo.clean/flush/inval fault only on LEAF R-AND-W denial
+    // (cbo_m_acc_fault); the dmem_mmu's W-only LEAF store access fault is
+    // suppressed for cbo_m (!c_is_cbo_m) so it does not over-fault a W-denied /
+    // R-present block. But a PMP-denied PTE READ on the walk (dmem_mmu_pte_acc_fault)
+    // ALWAYS faults a cbo_m (independent of the leaf R-or-W rule), and a genuine
+    // PAGE fault (dmem_mmu_fault_s) on a cbo_m still traps (cause 15).
+    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((dmem_mmu_acc_fault_s && !dmem_mmu_fault_s && (!c_is_cbo_m || dmem_mmu_pte_acc_fault)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || (dmem_mmu_acc_fault_s && (!c_is_cbo_m || dmem_mmu_pte_acc_fault)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
     let commit_excp        : logic = rob_commit_valid
         && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault
@@ -4703,10 +4719,13 @@ pub module heliodor_core #(
     // next-dword write via o_dmem_wstrb_hi / o_dmem_wdata_hi.
     let st_mask_ext : logic<16>  = ({8'd0, st_mask_base} as 16) << st_byte_off;
     let st_wdata_ext: logic<128> = ({64'd0, c_store_data} as 128) << ({4'd0, st_byte_off, 3'b000} as 7);
-    let st_wstrb    : logic<8>   = st_mask_ext[7:0];
+    // P10 cbo.clean/flush/inval (cbo_m) is a PMP-check-only NOP: force a zero
+    // store-strobe so the committing "store" writes nothing (its only effect is
+    // the commit-time R-or-W PMP check below).
+    let st_wstrb    : logic<8>   = if c_is_cbo_m ? 8'd0 : st_mask_ext[7:0];
     // P10 cbo.zero acts on the whole line (offset irrelevant) — force the
     // misalign hi-strobe to 0 so it classifies as an SB-eligible line store.
-    let st_wstrb_hi : logic<8>   = if c_is_cbo_zero ? 8'd0 : st_mask_ext[15:8];
+    let st_wstrb_hi : logic<8>   = if c_is_cbo_zero || c_is_cbo_m ? 8'd0 : st_mask_ext[15:8];
     // Zacas amocas.q: the LO store data is rs2 (read from arch_regs at commit),
     // not the captured c_store_data; store_funct3 is SD so st_wstrb is 0xFF and
     // st_byte_off is 0 (16-byte aligned). The HI dword (rs2+1) goes to the dcache
@@ -4758,7 +4777,10 @@ pub module heliodor_core #(
         i_pmpaddr: csr_pmpaddr  ,
         o_fault  : fast_store_pmp_deny,
     );
-    assign fast_store_acc_fault = fast_store && fast_store_pmp_deny;
+    // cbo.clean/flush/inval (cbo_m) reach this as a bare zero-strobe fast store,
+    // but they fault on R-AND-W denial (not W-only) — handled by cbo_m_acc_fault
+    // below, so exclude them from this W-only check.
+    assign fast_store_acc_fault = fast_store && fast_store_pmp_deny && !c_is_cbo_m;
 
     // PMP (Smpmp): commit-time WRITE check for the dcache exclusive-write path
     // (AMO/SC). Bare uses the physical c_store_addr; a VM access uses the
@@ -4796,6 +4818,34 @@ pub module heliodor_core #(
         o_fault  : sc_issue_pmp_deny,
     );
     assign sc_issue_acc_fault = issue_is_sc && !dmem_vm_on_op && sc_issue_pmp_deny;
+
+    // PMP (Smpmp): cbo.clean/flush/inval (Zicbom) are cache-maintenance NOPs in
+    // this coherent design, but they must take a store/AMO access fault (cause 7)
+    // when the block has NEITHER read NOR write permission — the R-or-W rule the
+    // Sail reference applies (cbo.zero is W-only and already faults via the store
+    // path; clean/flush/inval fault only when BOTH R and W are denied). Two
+    // pmp_checks (R, W) on the cbo PA — bare = c_store_addr, paged = the
+    // dmem_mmu-translated dmu_dmem_addr — fault iff both deny.
+    let cbo_m_addr: logic<64> = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
+    var cbo_m_pmp_deny_r: logic;
+    var cbo_m_pmp_deny_w: logic;
+    inst u_pmp_cbo_m_r: pmp_check (
+        i_addr   : cbo_m_addr   ,
+        i_acc    : 2'd0         , // read
+        i_priv   : dmem_mmu_priv,
+        i_pmpcfg : csr_pmpcfg   ,
+        i_pmpaddr: csr_pmpaddr  ,
+        o_fault  : cbo_m_pmp_deny_r,
+    );
+    inst u_pmp_cbo_m_w: pmp_check (
+        i_addr   : cbo_m_addr   ,
+        i_acc    : 2'd1         , // write
+        i_priv   : dmem_mmu_priv,
+        i_pmpcfg : csr_pmpcfg   ,
+        i_pmpaddr: csr_pmpaddr  ,
+        o_fault  : cbo_m_pmp_deny_w,
+    );
+    assign cbo_m_acc_fault = rob_commit_valid && c_is_cbo_m && !c_illegal && cbo_m_pmp_deny_r && cbo_m_pmp_deny_w;
 
     // Core dmem view (pre-MMU virtual address)
     //
@@ -5750,6 +5800,7 @@ pub module heliodor_core #(
         o_fault_store: dmem_mmu_fault_s,
         o_acc_fault      : dmem_mmu_acc_fault  ,
         o_acc_fault_store: dmem_mmu_acc_fault_s,
+        o_pte_acc_fault  : dmem_mmu_pte_acc_fault,
         o_rdata_valid: dmem_mmu_rdv    ,
         o_walk_start : dmem_walk_start , // M9.A.296: PTW-start pulse for F2 owner re-latch
         o_idle       : dmem_mmu_idle   , // M9.3: gate the load-walk VA pin on a REAL in-flight walk

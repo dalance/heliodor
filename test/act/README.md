@@ -218,6 +218,29 @@ Generate with `make -C test/act EXT="PMPZaamo PMPZalrsc"`. Regression-safe
 `zabha` 18/18 — and the PMP suites unchanged): the new checks are inert for
 aligned atomics and all-OFF PMP (boot / litmus).
 
+### CBO PMP — PMPZicbo 4/4, SvPMPZicbo pa_zicbom fixed (6/8)
+
+**`PMPZicbo` 4/4** (was 3/4) and **`SvPMPZicbo` 6/8** (was 4/8). cbo.zero is
+already a store-class op (W-checked → cause 7), but cbo.clean/flush/inval were
+bare no-ops and so never took a PMP access fault. The Sail reference faults them
+on the **R-or-W** rule (cause 7 when the block has NEITHER read nor write
+permission — distinct from cbo.zero's W-only), verified with
+`sail_riscv_sim --trace-exception`. heliodor now decodes cbo.clean/flush/inval as
+`is_cbo_m`: routed through the store AGU/MMU (for address plumbing + the paged
+walk) with a forced zero store-strobe (writes nothing), then a dedicated
+commit-time R-AND-W `pmp_check` pair raises cause 7. The dmem_mmu's W-only leaf
+store fault is suppressed for cbo_m, but a PMP-denied **PTE read** on the walk
+(`o_pte_acc_fault`) still faults it. Regression-safe (default 250/0, N1 boot 4/4;
+Linux issues cbo.* and they now retire as zero-strobe stores).
+
+> Remaining `SvPMPZicbo` 2/8 = `pte_zicbom` (Smode/Umode): three back-to-back
+> `cbo.clean/flush/inval` to the same VA after an `sfence.vma` whose page-table
+> PTE is PMP-denied. heliodor faults only the FIRST of the three (the
+> `pte_zicboz` variant has just one `cbo.zero` per region and passes); the 2nd/3rd
+> repeated faulting walk to the same VA does not re-fault. This is an MMU
+> repeated-walk corner (independent of the cbo_m PMP path, which is correct — the
+> first walk of every region faults right), not yet root-caused.
+
 ### Remaining suites (each needs a feature heliodor doesn't yet implement)
 
 The suites still uncovered all require a sizeable feature, or are absent from the
