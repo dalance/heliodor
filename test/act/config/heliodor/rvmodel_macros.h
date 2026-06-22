@@ -85,7 +85,10 @@
 
 ##### Access Fault #####
 
-// #define RVMODEL_ACCESS_FAULT_ADDRESS 0x50000000
+// heliodor PMA hole: 0x5000_0000 is outside the backed map (DRAM pa[31] / CLINT
+// 0x02 / UART 0x1 / PLIC 0x0C), so a load/store/fetch to it raises an access
+// fault (cause 5/7/1). Enables the ExceptionsSv* access-fault suites.
+#define RVMODEL_ACCESS_FAULT_ADDRESS 0x50000000
 
 ##### Machine Interrupts #####
 #define RVMODEL_MAX_CYCLES_PER_TIMER_TICK 1
