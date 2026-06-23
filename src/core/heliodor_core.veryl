@@ -496,6 +496,8 @@ pub module heliodor_core #(
     var walk_rob_q       : logic<5> ;
     var walk_vaddr_q     : logic<64>;
     var walk_is_store_q  : logic    ; // M9.A.299: walk started by a commit-store
+    var walk_is_amo_q    : logic    ; // walk started by an AMO (non-LR) read → store/AMO fault, not load
+    var walk_is_misalign_q: logic   ; // walk started by a misaligned atomic → force ACCESS fault (not page)
     var walk_pc_q        : logic<64>; // M9.3 inject-linkage probe: PC of the load that started the walk
     // Phase 11-H HLV/HLVX: a LOAD walk's per-op virt flags, latched at walk start
     // so they stay stable across the multi-cycle two-stage walk (the issuing IQ
@@ -3117,6 +3119,7 @@ pub module heliodor_core #(
         i_lfault_inj_rob     : walk_rob_q           ,
         i_lfault_inj_vaddr   : walk_vaddr_q         ,
         i_lfault_inj_acc     : lfault_inj_acc       ,
+        i_lfault_inj_is_amo  : walk_is_amo_q        ,
         // Phase 11-H3c: the MMU is in TS_FAULT this cycle (lfault_inj_v implies
         // dmem_mmu_fault), so its gstage/gpa outputs correspond to this walk.
         i_lfault_inj_gstage  : dmem_mmu_gstage      ,
@@ -4155,6 +4158,20 @@ pub module heliodor_core #(
     }
     let issue_amo_read: logic     = iq_issue_valid && iq_iss_is_amo && !amo_is_sc_iss;
     let issue_is_load : logic     = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_read;
+    // A misaligned atomic must ACCESS-fault (cause 5 LR / 7 AMO) regardless of
+    // the page mapping — Sail checks alignment before translation, so an unmapped
+    // VA never page-faults. heliodor still walks (via the AMO read), so when that
+    // walk faults we must force the injected fault to an ACCESS fault (mirrors
+    // alu_wrap's amo_misalign, which already covers the walk-succeeds path at
+    // issue). Width from mem_funct3; low bits survive pointer masking, so
+    // agu_addr_iss[3:0] is correct. (B/.B never misaligns.)
+    let iss_amo_misalign: logic = iq_iss_is_amo && (
+        if iq_issue_op.base.mem_funct3 == 3'b000 ? 1'b0
+        : if iq_issue_op.base.mem_funct3 == 3'b001 ? (agu_addr_iss[0] != 1'b0)
+        : if iq_issue_op.base.mem_funct3 == 3'b010 ? (agu_addr_iss[1:0] != 2'd0)
+        : if iq_issue_op.base.mem_funct3 == 3'b011 ? (agu_addr_iss[2:0] != 3'd0)
+        : (agu_addr_iss[3:0] != 4'd0)
+    );
     // Phase 8 S5.2: slot-1 (pipe-1) LOAD effective address for the 2nd dcache read
     // port. alu_wrap (u_alu2) re-derives the same agu internally; this drives the
     // dcache i_addr2 and the 2nd forward network. Slot-1 never issues AMO/STORE
@@ -5117,6 +5134,8 @@ pub module heliodor_core #(
             walk_rob_q      = 5'd0;
             walk_vaddr_q    = 64'd0;
             walk_is_store_q = 1'b0;
+            walk_is_amo_q   = 1'b0;
+            walk_is_misalign_q = 1'b0;
             walk_pc_q       = 64'd0;
             walk_hlv_q      = 1'b0;
             walk_hlvx_q     = 1'b0;
@@ -5167,6 +5186,12 @@ pub module heliodor_core #(
             // lfault_inj_v below does not inject a SPURIOUS load fault into that
             // stale rob_idx when the store walk faults.
             walk_is_store_q = commit_store_fire;
+            // A real AMO (non-LR/SC) read drives a LOAD walk (walk_is_store_q=0),
+            // but its eventual walk fault is a STORE/AMO fault (cause 7/15). Latch
+            // AMO-ness so the lfault inject routes it to is_sfault, not is_lfault.
+            walk_is_amo_q   = issue_is_realamo && !commit_store_fire;
+            // A misaligned atomic's walk fault must be reported as an ACCESS fault.
+            walk_is_misalign_q = iss_amo_misalign && !commit_store_fire;
         } else if redirect_fire_q {
             walk_v_q = 1'b0;
         } else if walk_v_q && !dmem_mmu_busy {
@@ -5225,7 +5250,10 @@ pub module heliodor_core #(
     assign lfault_inj_v = (dmem_mmu_fault || dmem_mmu_acc_fault) && walk_v_q && !walk_is_store_q && !vu_mem_active;
     // PMP: when the walk-owner fault is a PMP access fault (and not a page fault),
     // tag the injected fault so commit raises a load access fault (cause 5).
-    assign lfault_inj_acc = dmem_mmu_acc_fault && !dmem_mmu_fault;
+    // A misaligned atomic forces an ACCESS fault even when the walk page-faults
+    // (Sail checks alignment pre-translation, so an unmapped misaligned atomic
+    // takes cause 5/7, not 13/15).
+    assign lfault_inj_acc = (dmem_mmu_acc_fault && !dmem_mmu_fault) || walk_is_misalign_q;
     // Suppress the CDB's is_lfault when it would mis-attribute the owner's
     // fault to a different (current-issue) rob_idx. If the current issue IS
     // the owner, or there is no tracked walk (e.g. a direct TLB-permission
