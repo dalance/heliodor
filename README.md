@@ -1,31 +1,27 @@
 # Heliodor
 
-RV64GC RISC-V processor core written in [Veryl](https://veryl-lang.org/). It is a
-from-scratch out-of-order design (Tomasulo with a physical register file) that
-boots mainline Linux (5.15, the 6.6 LTS, and 7.1) SMP kernels through OpenSBI to
-SBI shutdown, and runs a full **guest Linux** under a bare-metal **type-1
-hypervisor** using the RISC-V **hypervisor (H) extension**.
+**Heliodor** is a from-scratch, out-of-order RV64 RISC-V application-processor core
+written in [Veryl](https://veryl-lang.org/). It implements the complete **RVA23**
+profile — RV64GC, the scalar extensions, the **vector (V)** extension, and the
+**hypervisor (H)** extension — across all privilege modes (M / HS / VS / VU), and
+boots unmodified mainline Linux: the **5.15**, **6.6 LTS**, and **7.1** SMP kernels
+(1–8 harts) through OpenSBI to SBI shutdown, plus a full **guest Linux** under a
+self-written bare-metal **type-1 hypervisor**.
 
 ## Status
 
-The core is a 2-wide superscalar, PRF-based out-of-order machine with in-order
-(up to 2-wide) commit. It implements **RV64GC** plus the **RVA23** ISA extensions
-(excluding only the vector family) at all four privilege levels
-(M / HS / VS / VU) with Sv39 virtual memory, branch prediction, non-blocking
-write-back private L1 caches kept coherent through a shared L2 with an inclusive
-MESI directory, and 1/2/4/8-hart SMP. Stock Linux reaches SBI SRST shutdown on
-every hart count: the 5.15 baseline on 1/2/4/8, plus the **6.6 LTS** and **7.1**
-kernels on 1/2/4 — the latter two discover and exercise the RVA23 extensions from
-the device tree (Sstc, Svpbmt, Svnapot, Svadu, Svinval, Zawrs, Zicbom/Zicboz,
-Zbb, …) and run **userspace floating point** across SMP context switches.
+A 2-wide superscalar, PRF-based out-of-order core (Tomasulo + physical register
+file, 32-entry ROB, branch prediction) with non-blocking write-back L1 caches kept
+coherent through a MESI-directory L2, Sv39 virtual memory, and 1/2/4/8-hart SMP. A
+decoupled in-order **vector unit** (RVV 1.0, VLEN = 128) and the hypervisor's
+**two-stage MMU** sit alongside the scalar OoO datapath; the **Architecture**
+section below describes the design in full.
 
-The **hypervisor (H) extension** (`misa.H`) adds the virtualized HS/VS/VU modes
-with **two-stage address translation** (guest VS-stage Sv39 nested through a
-host G-stage Sv39x4, VMID/ASID-tagged TLB), the `HLV`/`HLVX`/`HSV` hypervisor
-memory accesses, guest-page-fault reporting (`htval`/`mtval2`), virtual-interrupt
-delivery, and **Sstc-in-VS** guest timers. A small self-written type-1 hypervisor
-uses it to boot an unmodified guest Linux all the way to its own userspace and
-SBI shutdown.
+It is machine-checked against the official RISC-V Architectural Compliance Tests
+(`riscv-arch-test` / ACT4, Sail golden reference) and validated by booting mainline
+Linux SMP — including a 7.1 kernel that discovers and exercises the RVA23 vector,
+FP, and privileged extensions from the device tree — and a guest Linux under its
+own type-1 hypervisor. See **Verification**.
 
 ## Architecture
 
@@ -53,11 +49,24 @@ SBI shutdown.
   - Function units: 2 ALU/branch lanes (`alu_wrap`) and FPU (`fpu_wrap`:
     FP add / multiply / divide / sqrt, single + double). Integer divide and FP
     divide/sqrt are multi-cycle and non-blocking.
+- **Vector unit (V)** (`src/core/vector_unit.veryl`, `vrf.veryl`): the RVV 1.0
+  extension in a **decoupled, in-order** vector unit (ReOVE-style) that owns the
+  32 × 128-bit architectural vector register file and the vector config
+  (`vtype`/`vl`/`vstart`/`vcsr`). Vector ops enter from rename in program order
+  and execute in order — the VRF is not renamed and not tracked by the OoO scalar
+  issue queues; only the scalar operand of `vadd.vx` / `vset*vl` wakes from the
+  integer CDB, and completion rides the lane-0 CDB at lowest priority. VLEN = 128,
+  ELEN = 64; integer + single/double FP, all LMUL; `vset{i}vl{i}`, unit-stride /
+  strided / indexed / segment / fault-only-first loads and stores, masking, and
+  widening / narrowing
 - **ISA**: **RV64GC** base (RV64IMAFDC_Zicsr_Zifencei) — M (mul/div), A (LR/SC +
   AMO), F/D (single + double FP), C (compressed, incl. compressed FP load/store,
-  expanded in fetch by `c_expander`) — extended to the **RVA23 application /
-  supervisor profile** (only the vector V family excluded):
+  expanded in fetch by `c_expander`) — extended to the full **RVA23 application /
+  supervisor profile**:
+  - The **vector (V)** extension (RVV 1.0) — see *Vector unit* below
   - Bit-manipulation **Zba/Zbb/Zbs**; data-independent-latency **Zkt**
+  - Atomics: **Zacas** (compare-and-swap, incl. the 128-bit even-odd
+    `amocas.q`) and **Zabha** (byte / halfword AMO)
   - **Zfa** (additional FP) and **Zfhmin** (minimal half-precision: binary16
     conversions + load/store/move)
   - **Zicond** (conditional zero), **Zawrs** (wait-on-reservation-set)
@@ -68,6 +77,8 @@ SBI shutdown.
 - **Privilege & virtual memory**: Machine / Supervisor / User; Sv39 with a
   16-entry fully-associative TLB (ASID-tagged) and a hardware 3-level page-table
   walk (separate instruction / data MMUs, `SFENCE.VMA` + fine-grained **Svinval**).
+  **PMP** (Smpmp) physical-memory protection — region checks enforced on every
+  load / store / fetch / AMO and on page-table-walk reads, plus PMA-hole faults.
   Sv39 honors **Svnapot** (64 KB NAPOT), **Svpbmt** (page-based memory types),
   and both **Svade** (A/D page-fault) and **Svadu** (hardware A/D update via
   `menvcfg.ADUE`). Supervisor extensions: **Sstc** (`stimecmp`) and **Sscofpmf**
@@ -118,16 +129,19 @@ SBI shutdown.
 
 | Suite                                                                       | Result |
 |-----------------------------------------------------------------------------|--------|
-| Default `veryl test` (unit + inline arch suites + Phase-10/11 directed tests + N=2 litmus, on the OoO core) | 230 passed, 0 failed (28 ignored) |
+| Default `veryl test` (unit + inline arch suites + Phase-10/11/12 directed tests + N=2 litmus, on the OoO core) | 250 passed, 0 failed |
+| **RVA23 scalar compliance** — ACT4 (`riscv-arch-test`, Sail-signed golden reference), run via `make -C test/act` | pass: integer / atomic (+Zacas/Zabha) / FP / Zb*/Zc* / Zfa / Zfhmin / Zicbo* / PMP (Smpmp/SvPMP) / Sv* / Exceptions — see `test/act/README.md` |
 | Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~10.2 / 13.9 / 20.0 / 26.9M cycles) |
 | Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~18.6 / 25.5 / 33.6M cycles) |
 | Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~16.8 / 19.2 / 23.6M cycles) |
+| Linux **7.1 + Vector** boot (`test_soc_linux_boot_71v`, V-aware kernel)      | pass (~17.8M cycles, 1-hart) |
 | **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (~21.4M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
-(integer + privileged) and rv64uf / ud (FP), hand-maintained in
-`tb/test_arch_common.veryl` and `tb/test_arch_fp.veryl`; they are not `#[ignore]`,
-so they run as part of the default `veryl test`. The default run also includes the
+(integer + privileged), rv64uf / ud (FP), and the **vector (RVV)** suites,
+hand-maintained in `tb/test_arch_common.veryl` (integer / privileged / vector) and
+`tb/test_arch_fp.veryl` (FP); they are not `#[ignore]`, so they run as part of the
+default `veryl test`. The default run also includes the
 Phase-11 hypervisor directed tests (two-stage walk, guest-page-faults, HLV/HSV
 and their mode-traps, Sstc-in-VS, VS-mode CSR isolation, `VTVM`/`VTSR`,
 non-delegated VS interrupts, `mtval2`, and an end-to-end mini-hypervisor). The
@@ -147,20 +161,26 @@ interrupts). CoreMark is the upstream EEMBC source (vendored under
 
 | Benchmark  | Cycles  | Instret | IPC   |
 |------------|---------|---------|-------|
-| CoreMark   | 277,275 | 374,359 | 1.350 |
-| Dhrystone  | 211,500 | 273,242 | 1.292 |
-| memcpy     |  80,118 | 102,052 | 1.274 |
-| multiply   |  20,629 |  27,397 | 1.328 |
-| median     |   6,776 |   6,875 | 1.015 |
+| CoreMark   | 276,893 | 374,357 | 1.352 |
+| Dhrystone  | 210,037 | 273,241 | 1.301 |
+| memcpy     |  80,099 | 102,051 | 1.274 |
+| multiply   |  20,612 |  27,397 | 1.329 |
+| median     |   6,790 |   6,875 | 1.013 |
+
+CoreMark score: at ITERATIONS=1 the frequency-independent figure
+CoreMark/MHz = iterations × 10⁶ / cycles ≈ **3.61**. Because the harness times the
+whole program and runs a single iteration, the one-time setup is not amortized, so
+this is a conservative lower bound on the steady-state (multi-iteration)
+CoreMark/MHz rather than an official score.
 
 Run individually (all `#[ignore]`):
 
 ```bash
-veryl/target/release-verylup/veryl test --ignored --test test_coremark
-veryl/target/release-verylup/veryl test --ignored --test test_dhrystone
-veryl/target/release-verylup/veryl test --ignored --test test_bench_memcpy
-veryl/target/release-verylup/veryl test --ignored --test test_bench_multiply
-veryl/target/release-verylup/veryl test --ignored --test test_bench_median
+veryl test --ignored --test test_coremark
+veryl test --ignored --test test_dhrystone
+veryl test --ignored --test test_bench_memcpy
+veryl test --ignored --test test_bench_multiply
+veryl test --ignored --test test_bench_median
 ```
 
 The benchmark hex files are committed under `test/hex/`; rebuild them (requires
@@ -171,7 +191,7 @@ and `make -C test/c/coremark`.
 
 ```
 src/
-├── core/         OoO core: fetch/decode/rename, PRF/RAT/ROB/IQ, ALU, FPU, CSR, SoC
+├── core/         OoO core: fetch/decode/rename, PRF/RAT/ROB/IQ, ALU, FPU, vector unit, CSR, SoC
 ├── cache/        I-cache / D-cache / shared L2 / memory_bus arbiter
 ├── mmu/          Sv39 MMU (instruction / data) + TLB
 ├── peripheral/   CLINT, PLIC, UART
@@ -183,33 +203,29 @@ veryl/            Veryl compiler (local clone, gitignored)
 
 ## Build & Test
 
-Veryl is a local clone (gitignored, not a submodule); clone and build it first:
+Install [Veryl](https://veryl-lang.org/) (e.g. via `verylup`) — heliodor builds on
+upstream Veryl. Then from the project root:
 
 ```bash
-git clone https://github.com/veryl-lang/veryl.git veryl
-cd veryl && cargo build --profile release-verylup
-```
-
-Then from the project root:
-
-```bash
-veryl/target/release-verylup/veryl test                                                  # 213 tests
-veryl/target/release-verylup/veryl test --ignored --test test_soc_linux_boot             # 1-hart Linux 5.15 boot
-veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_4hart   # 4-hart SMP Linux 5.15 boot
-veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_66_2hart # 2-hart SMP Linux 6.6 boot
-veryl/target/release-verylup/veryl test --ignored --test test_soc_smp_linux_boot_71_2hart # 2-hart SMP Linux 7.1 boot (RVA23 + FP)
+veryl test                                                  # unit + arch suites + directed tests
+veryl test --ignored --test test_soc_linux_boot             # 1-hart Linux 5.15 boot
+veryl test --ignored --test test_soc_smp_linux_boot_4hart   # 4-hart SMP Linux 5.15 boot
+veryl test --ignored --test test_soc_smp_linux_boot_66_2hart # 2-hart SMP Linux 6.6 boot
+veryl test --ignored --test test_soc_smp_linux_boot_71_2hart # 2-hart SMP Linux 7.1 boot (RVA23 + FP)
+veryl test --ignored --test test_soc_hvlinux                 # guest Linux under a type-1 hypervisor (H ext, two-stage MMU)
 ```
 
 The `riscv-tests` arch hex files are committed under `test/riscv-arch-test/build/`;
 rebuild them with `make -C test/riscv-arch-test` (requires `riscv64-unknown-elf-gcc`).
 
-See `CLAUDE.md` for the development workflow (Veryl toolchain modes, regression
+See `CLAUDE.md` for the development workflow (the Veryl compiler is also kept as a
+gitignored local clone there for compiler hacking; toolchain modes, regression
 steps, Verilator cross-check).
 
 ## Development Phases
 
 Development history — the **Architecture** section above describes the design
-as of Phase 11:
+as of Phase 12:
 
 | Phase | Scope                                    | Status       |
 |-------|------------------------------------------|--------------|
@@ -223,4 +239,5 @@ as of Phase 11:
 | 8     | Microarchitecture build-out on the Phase 7 core: 2-wide superscalar (fetch / rename / issue / commit), branch prediction (BTB + gshare + TAGE-lite + indirect BTB + RAS, execute-time early redirect), non-blocking L1s (MSHRs, hit-under-miss, critical-word-first), memory-dependence speculation + replay, committed-store buffer with line write-combining and store-to-load forwarding, split read/write bus channels — 1-hart boot 26M → 8.6M cycles, 4-hart 52M → 16M | complete |
 | 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller + line-granular L2 (P9.1), write-back D$ + MESI inclusive directory (P9.2), cache-to-cache transfer + in-cache AMO/LR-SC (P9.3), N=8 SMP boot (P9.4), PLIC wiring + uncached MMIO + TLB ASID + selective SFENCE.VMA (P9.5), coherent instruction side — I-cache + I-PTW through L2, FENCE.I/SFENCE flush sweep retired (P9.6) | complete |
 | 10    | RVA23-profile ISA extensions (vector V / hypervisor H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, hint bundle (Zihintpause/Zihintntl/Zicbop/Zimop/Zcmop), Zcb, system bundle (Zawrs/Svinval/Zkt), MMU bundle (Svnapot/Svpbmt/Svadu), Zfhmin, Sscofpmf, Supm/Ssnpm. Validated on real mainline kernels: upgraded the boot from 5.15 to the 6.6 LTS and 7.1, which discover the extensions from the device tree and exercise them (Sstc timer, Svpbmt ioremap, Zicboz clear_page, Zbb, hardware unaligned). Enabling userspace FP on 7.1 exposed and fixed two SMP-only RTL bugs — an FP-context-switch wedge (MSHR int-load completion misclassified FP-dest on the CDB mux) and missing compressed FP load/store (C.FLD/C.FSD/C.FLDSP/C.FSDSP) | complete |
-| 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation with a VMID/VS-ASID-tagged TLB, HLV/HLVX/HSV (+ mode-traps), the guest-page-fault trio (20/21/23) with htval/mtval2, virtual-interrupt delivery (hvip into VS + non-delegated VS interrupts taken by HS), htimedelta + Sstc-in-VS guest timers, hstatus.VTVM/VTSR guest-op interception, VS-mode CSR isolation, and the mideleg/hedeleg read-only conformance bits. Brought up incrementally against per-feature directed tests, then validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (cross-checked on the Veryl sim and Verilator). The vector V family is deferred to a later phase | complete |
+| 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation with a VMID/VS-ASID-tagged TLB, HLV/HLVX/HSV (+ mode-traps), the guest-page-fault trio (20/21/23) with htval/mtval2, virtual-interrupt delivery (hvip into VS + non-delegated VS interrupts taken by HS), htimedelta + Sstc-in-VS guest timers, hstatus.VTVM/VTSR guest-op interception, VS-mode CSR isolation, and the mideleg/hedeleg read-only conformance bits. Brought up incrementally against per-feature directed tests, then validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (cross-checked on the Veryl sim and Verilator). The vector V family lands in Phase 12 | complete |
+| 12    | **Vector (V) extension (RVV 1.0)** — completing the RVA23 profile — plus full **architectural-compliance verification**. Added a decoupled, in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL): `vset{i}vl{i}`, integer / FP arithmetic (incl. multiply/divide, compares/merge, widening/narrowing, reductions), masking, and unit-stride / strided / indexed / segment / fault-only-first loads & stores; a V-enabled 7.1 kernel discovers and exercises it. The vector unit is verified by heliodor's inline **RVV arch suites** (`tb/test_arch_common.veryl`); the **scalar** RVA23 profile is machine-checked against the official RISC-V Architectural Compliance Tests (ACT4 / `riscv-arch-test`, Sail golden reference — which has no vector suite) across integer / atomic / FP / compressed / CSR / Zb\* / Zc\* / Zfa / Zfhmin / Zicbo\* / PMP / Sv\* / Exceptions. The compliance pass closed the scalar atomic gaps it surfaced (**Zabha** byte/half AMO, full **Zacas** incl. the 128-bit `amocas.q`), added **PMP** (Smpmp / SvPMP) region enforcement (load/store/fetch/AMO + PTE walks, PMA-hole faults), and fixed numerous real **FPU** bugs and several **Veryl simulator/analyzer bugs — fixed and upstreamed** to veryl-lang/veryl, so heliodor now builds on pristine upstream Veryl. See `test/act/README.md` | complete |
