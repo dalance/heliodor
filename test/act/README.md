@@ -7,7 +7,9 @@ mechanism reports pass/fail (`tohost == 1` ⇒ the self-check passed).
 
 This mirrors `test/riscv-arch-test/` (the older riscv-tests integration): the
 upstream framework is a gitignored clone, the generated artifacts are not
-committed, and the flow is reproducible from pinned tools.
+committed, and the flow is reproducible from pinned tools. The framework clone
+itself is pinned to an exact commit (`ACT_COMMIT` in the `Makefile`) — see
+[Framework version pin](#framework-version-pin).
 
 ## Build + run
 
@@ -25,11 +27,29 @@ veryl test --ignored --test test_act_               # run all generated suites
 > the sandbox (e.g. Claude Code `/sandbox` off). The toolchain fetch, the Veryl
 > sim, and everything else run fine sandboxed.
 
-`make` clones the framework, drops in the heliodor DUT config, runs the Sail +
-uv + UDB pipeline to produce ELFs, then `gen_suite.py` converts each ELF to
-`test/hex/act_<ext>_<name>.hex` and writes `tb/test_act_<ext>.veryl` (one
-`#[test] #[ignore]` module per ELF). Both the hex and the Veryl modules are
-gitignored — regenerate with `make`.
+`make` fetches the framework at the pinned commit, drops in the heliodor DUT
+config, runs the Sail + uv + UDB pipeline to produce ELFs, then `gen_suite.py`
+converts each ELF to `test/hex/act_<ext>_<name>.hex` and writes
+`tb/test_act_<ext>.veryl` (one `#[test] #[ignore]` module per ELF). Both the hex
+and the Veryl modules are gitignored — regenerate with `make`.
+
+## Framework version pin
+
+`riscv/riscv-arch-test`'s default branch `act4` is the moving development tip
+(no semver release tags — only rolling `ctp-release-*` tags), so a bare
+`git clone` would drift: a clean rebuild could pull different test sources / Sail
+signatures and shift the pass/fail counts. The `Makefile` therefore pins the
+framework to an exact commit via `ACT_COMMIT` and a shallow fetch-by-sha
+(`git init` + `fetch --depth 1 origin <sha>` + `checkout FETCH_HEAD`).
+
+- **Pinned commit:** `06568893b9fc8b27b3eb69037caed2fa06886ee3` (`act4`,
+  2026-06-20) — the framework behind the status table below.
+- **Bumping:** edit `ACT_COMMIT`, then `make -C test/act distclean` (removes the
+  clone) and re-`make` to repin. `make` warns if an existing clone's `HEAD` does
+  not match `ACT_COMMIT`.
+- The binary tools (`sail_riscv_sim` 0.12, `riscv64-unknown-elf-gcc`, `uv`) are
+  separately pinned by sha256 in `toolchain/versions.env`; the framework's Python
+  and Ruby deps are pinned by its own `uv.lock` / `Gemfile.lock` at this commit.
 
 ## heliodor DUT config (`config/heliodor/`)
 

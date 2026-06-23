@@ -22,6 +22,15 @@ HERE       := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 REPO       := $(abspath $(HERE)/../..)
 UPSTREAM   := $(HERE)/upstream/riscv-arch-test-act
 UPSTREAM_URL := https://github.com/riscv/riscv-arch-test
+
+# Pinned framework commit. `riscv/riscv-arch-test`'s default branch `act4` is the
+# moving development tip (no semver release tags — only rolling `ctp-release-*`),
+# so a bare `git clone` would drift: a clean rebuild could pull different test
+# sources / Sail signatures and shift the pass/fail counts. Pin to an exact commit
+# so the documented results are reproducible on demand. Bump deliberately (then
+# `make distclean` to repin), not by accident.
+ACT_COMMIT := 06568893b9fc8b27b3eb69037caed2fa06886ee3
+
 CFG_SRC    := $(HERE)/config/heliodor
 CFG_DST    := $(UPSTREAM)/config/cores/heliodor
 JOBS       ?= $(shell nproc)
@@ -51,11 +60,23 @@ export ACT_WORK := $(UPSTREAM)/work/heliodor
 .PHONY: all upstream config framework elfs hex clean distclean
 all: hex
 
-# 1. Clone the ACT4 framework (not committed — like test/riscv-arch-test/upstream).
+# 1. Fetch the ACT4 framework at the PINNED commit (not committed — like
+#    test/riscv-arch-test/upstream). Shallow fetch-by-sha keeps it a one-commit
+#    checkout while guaranteeing the exact $(ACT_COMMIT). If a clone already
+#    exists at a different commit, warn instead of silently mutating it.
 upstream:
 	@if [ ! -d "$(UPSTREAM)/.git" ]; then \
-	  echo "Cloning $(UPSTREAM_URL) ..."; \
-	  git clone --depth 1 $(UPSTREAM_URL) "$(UPSTREAM)"; \
+	  echo "Fetching $(UPSTREAM_URL) @ $(ACT_COMMIT) ..."; \
+	  git init -q "$(UPSTREAM)"; \
+	  git -C "$(UPSTREAM)" remote add origin $(UPSTREAM_URL); \
+	  git -C "$(UPSTREAM)" fetch -q --depth 1 origin $(ACT_COMMIT); \
+	  git -C "$(UPSTREAM)" checkout -q FETCH_HEAD; \
+	fi
+	@have=$$(git -C "$(UPSTREAM)" rev-parse HEAD 2>/dev/null); \
+	if [ "$$have" != "$(ACT_COMMIT)" ]; then \
+	  echo "WARNING: $(UPSTREAM) is at $$have,"; \
+	  echo "         but the pin is $(ACT_COMMIT)."; \
+	  echo "         Run 'make -C test/act distclean' then re-make to repin."; \
 	fi
 
 # 2. Drop the heliodor DUT config into the framework's config/cores/.
