@@ -10,6 +10,13 @@ pub module mmu #(
     // no write channel — see heliodor_core's iptw FSM). The leaf still
     // translates; the A bit is simply left stale on a fetch-only access.
     param WRITE_AD: u8 = 1,
+    // PMA: when 1, a PTE read whose physical address hits no backed memory
+    // region (a "hole") raises an access fault (cause 1/5/7) instead of reading
+    // garbage and page-faulting on the bogus PTE. Default 0 (boot/SoC put no
+    // page table in a hole); only the ACT4 arch harness enables it. Mirrors the
+    // wrapper's final-PA pma_hole. (ACT4 SvZicbo: a non-leaf PTE points the next
+    // level into a hole, so the PTE read itself access-faults.)
+    param PMA_FAULT: bit = 0,
 ) (
     clk: input clock,
     rst: input reset,
@@ -18,6 +25,10 @@ pub module mmu #(
     i_req  : input logic    ,
     i_store: input logic    , // 1=store, 0=load/fetch
     i_fetch: input logic    , // 1=instruction fetch
+    // Zicbom cbo.clean/flush/inval: routed as a store (i_store=1) for address
+    // plumbing, but its page permission is R-OR-W (not strict W) and it neither
+    // requires nor sets the D bit. i_cbo=1 selects those relaxed semantics.
+    i_cbo  : input logic    ,
     // Translation result
     o_paddr: output logic<64>,
     o_valid: output logic    ,
@@ -262,7 +273,7 @@ pub module mmu #(
     // TLB hit permission check (RISC-V Sv39 spec compliant)
     // R/W/X permission with MXR: MXR=1 makes X pages readable
     let tlb_read_ok: logic = tlb_hit_r || (i_mxr && tlb_hit_x);
-    let tlb_rwx_ok : logic = if i_fetch ? tlb_hit_x : if i_store ? tlb_hit_w : tlb_read_ok;
+    let tlb_rwx_ok : logic = if i_cbo ? (tlb_hit_r || tlb_hit_w) : if i_fetch ? tlb_hit_x : if i_store ? tlb_hit_w : tlb_read_ok;
     // U-bit check:
     //   U=1 (user page): U-mode OK; S-mode needs SUM=1, never executable by S
     //   U=0 (supervisor page): S-mode OK; U-mode never
@@ -346,7 +357,7 @@ pub module mmu #(
     // Combined permission check. A tag match that fails this is NOT a hit — it
     // falls through to a full walk for correct VS-/G-stage fault attribution.
     let v1_read_ok: logic = v1_hit_r || (i_mxr && v1_hit_x);
-    let v1_rwx_ok : logic = if i_fetch ? v1_hit_x : if i_store ? v1_hit_w : v1_read_ok;
+    let v1_rwx_ok : logic = if i_cbo ? (v1_hit_r || v1_hit_w) : if i_fetch ? v1_hit_x : if i_store ? v1_hit_w : v1_read_ok;
     let v1_u_ok   : logic = if i_priv == PrivLevel::USER ? v1_hit_u : (if v1_hit_u ? (i_sum && !i_fetch) : 1'b1);
     let v1_hit    : logic = v1_match && v1_rwx_ok && v1_u_ok;
 
@@ -421,6 +432,11 @@ pub module mmu #(
         i_pmpaddr                ,
         o_fault  : pte_pmp_deny_w,
     );
+    // PMA: the PTE being read this level lives at ptw_addr_reg; if that PA is
+    // unbacked (a hole) the implicit read access-faults (same backing map as the
+    // wrapper's final-PA pma_hole: DRAM pa[31] / CLINT 0x02 / UART 0x1 / PLIC
+    // 0x0C). Treated like a PMP-deny → walk_acc_fault. PMA_FAULT=0 → inert.
+    let pte_pma_hole: logic = PMA_FAULT && !(ptw_addr_reg[31] || ptw_addr_reg[31:24] == 8'h02 || ptw_addr_reg[31:28] == 4'h1 || ptw_addr_reg[31:24] == 8'h0c);
 
     // Track which level the leaf PTE was found at
     var leaf_level: logic<2>;
@@ -484,7 +500,9 @@ pub module mmu #(
     // store, the D bit too — otherwise fault. With Svadu (i_adue=1) an A=0 /
     // D=0 leaf no longer faults; hardware updates the bits instead.
     // Superpage: level-1 requires PPN[0]=0, level-2 requires PPN[1:0]=0.
-    let ad_ok     : logic = i_ptw_data[6] && (!i_store || i_ptw_data[7]);
+    // A cbo is treated as a read for A/D: it needs A but not D (it does not dirty
+    // the page), so only a genuine store (i_store && !i_cbo) requires the D bit.
+    let ad_ok     : logic = i_ptw_data[6] && (!(i_store && !i_cbo) || i_ptw_data[7]);
     // PTE bits [60:54] are reserved in Sv39 and must be zero in EVERY PTE (leaf
     // or non-leaf); a non-zero value is a reserved encoding → page fault.
     let pte_rsvd_hi: logic = i_ptw_data[60:54] != 7'd0;
@@ -513,7 +531,7 @@ pub module mmu #(
     // The leaf PTE with A (and, for a store, D) set — used as both the
     // write-back data and the cached/DONE PTE, so the TLB write permission
     // (pte_w && pte_d) reflects the freshly-set D bit.
-    let pte_ad_new: logic<64> = i_ptw_data | 64'h40 | (if i_store ? 64'h80 : 64'd0);
+    let pte_ad_new: logic<64> = i_ptw_data | 64'h40 | (if i_store && !i_cbo ? 64'h80 : 64'd0);
 
     // === Phase 11-H two-stage helpers ===
     // Incoming PTE (i_ptw_data) field views, shared by the G-stage and VS-stage
@@ -691,9 +709,10 @@ pub module mmu #(
                 State::LEVEL2: {
                     if i_ptw_valid {
                         pte = i_ptw_data;
-                        if pte_pmp_deny {
-                            // SvPMP: this PTE's physical address is PMP-denied →
-                            // ACCESS fault (cause by access type), not page fault.
+                        if pte_pmp_deny || pte_pma_hole {
+                            // SvPMP/PMA: this PTE's physical address is PMP-denied
+                            // or unbacked (hole) → ACCESS fault (cause by access
+                            // type), not page fault.
                             walk_acc_fault = 1'b1;
                             state          = State::FAULT;
                         } else if i_ptw_data[0] == 1'b0 {
@@ -735,8 +754,9 @@ pub module mmu #(
                 State::LEVEL1: {
                     if i_ptw_valid {
                         pte = i_ptw_data;
-                        if pte_pmp_deny {
-                            // SvPMP: PMP-denied PTE read → access fault.
+                        if pte_pmp_deny || pte_pma_hole {
+                            // SvPMP/PMA: PMP-denied or unbacked (hole) PTE read →
+                            // access fault.
                             walk_acc_fault = 1'b1;
                             state          = State::FAULT;
                         } else if i_ptw_data[0] == 1'b0 {
@@ -776,8 +796,9 @@ pub module mmu #(
                 State::LEVEL0: {
                     if i_ptw_valid {
                         pte = i_ptw_data;
-                        if pte_pmp_deny {
-                            // SvPMP: PMP-denied PTE read → access fault.
+                        if pte_pmp_deny || pte_pma_hole {
+                            // SvPMP/PMA: PMP-denied or unbacked (hole) PTE read →
+                            // access fault.
                             walk_acc_fault = 1'b1;
                             state          = State::FAULT;
                         } else if i_ptw_data[0] == 1'b0 {
@@ -1108,7 +1129,7 @@ pub module mmu #(
 
     // PTW result permission check (same logic as TLB hit)
     let ptw_read_ok: logic = pte_r || (i_mxr && pte_x);
-    let ptw_rwx_ok : logic = if i_fetch ? pte_x : if i_store ? pte_w : ptw_read_ok;
+    let ptw_rwx_ok : logic = if i_cbo ? (pte_r || pte_w) : if i_fetch ? pte_x : if i_store ? pte_w : ptw_read_ok;
     let ptw_u_ok   : logic = if i_priv == PrivLevel::USER ? pte_u : (if pte_u ? (i_sum && !i_fetch) : 1'b1);
     let perm_ok    : logic = ptw_rwx_ok && ptw_u_ok;
 
