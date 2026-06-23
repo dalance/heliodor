@@ -111,9 +111,15 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      rv64uf/ud FP tests in `tb/test_arch_fp.veryl` are NOT `#[ignore]` and run here,
      on the OoO core). Fix any failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart` — P9.0 RVWMO litmus battery
-     at N=4 (IRIW + 4-way barrier/bus stress; ~2.5M cycles). The N=2 battery
-     (`test_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is
-     a memory-model bug — see `test/litmus/litmus.S` for the tohost encoding.
+     at N=4 (IRIW + 4-way barrier/bus stress; **~5.2M cycles** — was ~2.5M at P9.1;
+     P9.3.B `7beb31a` retired the bus-wide AMO lock for in-cache MESI atomics, so
+     the contended-atomic litmus now pays line-bounce/RFO cost — by design, not a
+     regression; N=2 is ~2.1M). On this shared box that is ~10 min, and its probe
+     prints only every 5M cycles, so a PASS shows one `cy=0x2710` line then the
+     `litmus(N=4): … pass=1` line — "stuck at cy=0x2710" for minutes is NORMAL, not
+     a hang. The N=2 battery (`test_litmus_2hart`) already runs in step 1. Any
+     forbidden-outcome hit is a memory-model bug — see `test/litmus/litmus.S` for
+     the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
      (~12.3M cycles, ~2 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
      (~9.1M cycles, ~40 s).
