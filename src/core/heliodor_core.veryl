@@ -4450,6 +4450,27 @@ pub module heliodor_core #(
     let issue_is_amo    : logic = iq_issue_valid && iq_iss_is_amo;
     let issue_is_st     : logic = iq_issue_valid && iq_issue_op.base.is_store;
     let issue_addr_match: logic = rsv_valid_q && rsv_addr_q == agu_addr_iss;
+    // ACT4 ExceptionsSvZalrsc: a reservation-INVALID SC must still translate-for-
+    // write and ACCESS/PAGE-fault when the translation fails — Sail translates for
+    // Write reservation-INDEPENDENTLY, so an SC to a hole / unmapped / W-denied PA
+    // faults (cause 7 access / 15 page) regardless of whether the reservation holds.
+    // A MATCHED SC already faults via its commit store walk (pmpzalrsc / SvPMP);
+    // the gap is the FAILING SC (issue_addr_match=0), which clears its store flag
+    // (amo_commit_store=0 → c_is_store=0) so it never drives a commit walk and never
+    // fault-checks — it just returns rd=1. FIX: drive a load-style TRANSLATION walk
+    // at issue (the well-tested AMO owner path — same as ExceptionsSvZaamo), and
+    // route its fault to is_sfault via walk_is_amo_q (cause 7/15). A misaligned
+    // failing SC is excluded (alu_wrap's amo_misalign already access-faults it).
+    // For an aligned failing SC to a NORMAL PA (a lost reservation in SMP) the walk
+    // hits the TLB, raises no fault, and the SC returns rd=1 exactly as before.
+    // PAGED-MODE ONLY (dmem_vm_on_op): in BARE mode there is no translation (VA==PA)
+    // and a failing SC's PMP/PMA fault is already raised at issue by u_pmp_sc_issue
+    // (sc_issue_acc_fault below), so a bare SC must NOT drive a dcache read here —
+    // that extra bare-mode port access perturbed the LR/SC reservation timing and
+    // wedged the RVWMO litmus battery (bare-metal, no paging). Gating on
+    // dmem_vm_on_op makes this complementary to the bare u_pmp_sc_issue check and
+    // keeps every bare-mode SC byte-identical (boot's bare phase + all litmus).
+    let issue_sc_walk   : logic = issue_is_sc && !issue_addr_match && !iss_amo_misalign && dmem_vm_on_op;
     // M9.4 SMP: an SC may consume (clear) the reservation only if BOTH (a) it is
     // program-order AFTER its owner LR (age = distance from the ROB head), so an
     // OoO-reordered OLDER sc.w cannot wipe a YOUNGER lr.w's reservation, AND (b) its
@@ -4954,7 +4975,10 @@ pub module heliodor_core #(
     // when no store/walk/vector access overrides it — match core_dmem_vaddr's
     // agu_addr_iss arm. Tells dmem_mmu to also require WRITE permission so an AMO
     // to a W-denied region faults (cause 7 via alu_wrap's amo-fault routing).
-    let core_dmem_is_amo: logic = issue_is_realamo && !vu_mem_active && !store_drive && !mmu_walk_inflight;
+    // A failing SC's translation walk (issue_sc_walk) is store-semantics too: ask
+    // the MMU to check W so a W-denied region faults, matching Sail's translate-for-
+    // write. The walk drives agu_addr_iss (the SC's VA) on the same i_ren cycle.
+    let core_dmem_is_amo: logic = (issue_is_realamo || issue_sc_walk) && !vu_mem_active && !store_drive && !mmu_walk_inflight;
     // Zicbom: the dmem port is driving a cbo.clean/flush/inval's commit-time walk
     // (store-routed, so core_dmem_wen is high while it holds the ROB head). Tells
     // the MMU to use the relaxed R-OR-W cbo page permission instead of W.
@@ -5092,7 +5116,15 @@ pub module heliodor_core #(
             }
         }
     }
-    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || (mmu_walk_inflight && !sb_walk_ovl));
+    // ACT4 ExceptionsSvZalrsc: a failing SC drives a load-style translation walk at
+    // issue (own owner re-latch, like the AMO read) purely to fault-check. It does
+    // NOT do dc_amo_read (no RFO) — the read data is discarded (the SC reads nothing),
+    // only the walk fault matters, so a stale store-buffer read is harmless and no
+    // store-overlap hold is needed. The SC is at the ROB head (amo_at_head), so it
+    // is the oldest op: store_drive / mmu_walk_inflight / replay are naturally idle;
+    // the gates below are defensive port arbitration only.
+    let sc_walk_drive  : logic    = issue_sc_walk && !redirect_fire && !store_drive && !replay_q && !mmu_walk_inflight && !vu_mem_port_req;
+    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || sc_walk_drive || (mmu_walk_inflight && !sb_walk_ovl));
     let core_dmem_wstrb: logic<8> = if vu_mem_active ? vu_mem_wstrb : if store_drive ? st_wstrb : 8'd0;
     // P9.3: mark the AMO/LR data read so the dcache serves it only from an
     // OWNED (E/M) line — an S hit or a miss raises an RFO fill first (the
@@ -5194,7 +5226,10 @@ pub module heliodor_core #(
             // A real AMO (non-LR/SC) read drives a LOAD walk (walk_is_store_q=0),
             // but its eventual walk fault is a STORE/AMO fault (cause 7/15). Latch
             // AMO-ness so the lfault inject routes it to is_sfault, not is_lfault.
-            walk_is_amo_q   = issue_is_realamo && !commit_store_fire;
+            // A failing SC's translation walk (issue_sc_walk) is store-semantics too:
+            // route its fault to is_sfault (cause 7 access / 15 page), matching Sail's
+            // store/amo-access-fault on the reservation-independent translate-for-write.
+            walk_is_amo_q   = (issue_is_realamo || issue_sc_walk) && !commit_store_fire;
             // A misaligned atomic's walk fault must be reported as an ACCESS fault.
             walk_is_misalign_q = iss_amo_misalign && !commit_store_fire;
         } else if redirect_fire_q {
