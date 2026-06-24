@@ -1,0 +1,227 @@
+// RV64M integer divide/remainder, radix-4 iterative (two quotient bits per RUN
+// cycle). Replaces the former single-cycle combinational dividers in `alu`
+// (the `/` and `%` operators) — those synthesize to a ~64-deep ripple and were
+// the longest combinational path in the core. Bit-exact with the RISC-V M
+// semantics: DIV/DIVU/REM/REMU + the W (32-bit) variants, including the
+// divide-by-zero and signed-overflow (INT_MIN / -1) special cases.
+//
+// Compute FSM only (i_valid / o_valid / o_busy); the per-op completion latch +
+// CDB assembly live in the core, mirroring the FDIV.D / FSQRT.D handshake.
+// Latency: 1 (capture + normalize) + 32 (RUN, two iters each = 64) + 1 (DONE) = 34.
+pub module int_divider (
+    clk: input clock,
+    rst: input reset,
+
+    i_valid : input logic             , // start (pulse)
+    i_alu_op: input alu_pkg::AluOp    ,
+    i_a     : input logic         <64>,
+    i_b     : input logic         <64>,
+    i_flush : input logic             , // abort current operation
+
+    o_result: output logic<64>,
+    o_valid : output logic    , // result ready (1-cycle pulse)
+    o_busy  : output logic    , // divider occupied
+) {
+    import alu_pkg::AluOp;
+
+    enum State: logic<2> {
+        IDLE = 2'd0,
+        RUN = 2'd1,
+        DONE = 2'd2,
+    }
+
+    var state: State   ;
+    var count: logic<6>;
+
+    // Operand-derived state captured at IDLE, held stable through RUN/DONE.
+    var reg_dsr           : logic<64>; // divisor magnitude (unsigned)
+    var reg_is_rem        : logic    ;
+    var reg_is_w          : logic    ;
+    var reg_res_sgn       : logic    ; // result is negative
+    var reg_has_special   : logic    ; // divide-by-zero or signed overflow
+    var reg_special_result: logic<64>;
+
+    // Iteration state, advanced two restoring-division steps per RUN cycle.
+    var it_rem : logic<64>; // running remainder (settles < divisor < 2^64)
+    var it_quot: logic<64>; // running quotient (shifted in MSB-first)
+    var it_dvd : logic<64>; // dividend shift register (MSB consumed per step)
+
+    assign o_busy = state != State::IDLE;
+
+    // 32 RUN cycles (two quotient bits each = 64) then DONE.
+    const RUN_LAST: logic<6> = 6'd31;
+
+    // ====================================================================
+    // Setup: classify the op, form unsigned dividend/divisor magnitudes, and
+    // pre-compute the special-case results. Combinational off i_a/i_b/i_alu_op;
+    // sampled into the reg_*/it_* registers when IDLE accepts a job.
+    // ====================================================================
+    let su_is_w     : logic = i_alu_op == AluOp::DIVW || i_alu_op == AluOp::DIVUW || i_alu_op == AluOp::REMW || i_alu_op
+        == AluOp::REMUW;
+    let su_is_signed: logic = i_alu_op == AluOp::DIV || i_alu_op == AluOp::REM || i_alu_op == AluOp::DIVW || i_alu_op
+        == AluOp::REMW;
+    let su_is_rem   : logic = i_alu_op == AluOp::REM || i_alu_op == AluOp::REMU || i_alu_op == AluOp::REMW || i_alu_op
+        == AluOp::REMUW;
+
+    let su_a_sgn: logic = su_is_signed && (if su_is_w ? i_a[31] : i_a[63]);
+    let su_b_sgn: logic = su_is_signed && (if su_is_w ? i_b[31] : i_b[63]);
+
+    let su_a_neg32: logic<32> = (~i_a[31:0]) + 32'd1;
+    let su_a_neg64: logic<64> = (~i_a) + 64'd1;
+    let su_b_neg32: logic<32> = (~i_b[31:0]) + 32'd1;
+    let su_b_neg64: logic<64> = (~i_b) + 64'd1;
+
+    // Unsigned magnitudes (zero-extended to 64 bits for the W variants).
+    let su_dvd: logic<64> = if su_is_w ?
+        (if su_a_sgn ? {32'd0, su_a_neg32} : {32'd0, i_a[31:0]})
+    :
+        (if su_a_sgn ? su_a_neg64 : i_a)
+    ;
+    let su_dsr: logic<64> = if su_is_w ?
+        (if su_b_sgn ? {32'd0, su_b_neg32} : {32'd0, i_b[31:0]})
+    :
+        (if su_b_sgn ? su_b_neg64 : i_b)
+    ;
+
+    let su_res_sgn: logic = if su_is_rem ? su_a_sgn : (su_a_sgn ^ su_b_sgn);
+
+    // Special cases (RISC-V M): divide-by-zero and signed overflow (MIN / -1).
+    let su_b_is_zero  : logic = if su_is_w ? (i_b[31:0] == 32'd0) : (i_b == 64'd0);
+    let su_a_is_min   : logic = su_is_signed
+        && (if su_is_w ? (i_a[31:0] == 32'h8000_0000) : (i_a == 64'h8000_0000_0000_0000));
+    let su_b_is_m1    : logic = su_is_signed
+        && (if su_is_w ? (i_b[31:0] == 32'hFFFF_FFFF) : (i_b == 64'hFFFF_FFFF_FFFF_FFFF));
+    let su_overflow   : logic = su_a_is_min && su_b_is_m1;
+    let su_has_special: logic = su_b_is_zero || su_overflow;
+
+    // Divide-by-zero: quotient = all-ones, remainder = dividend.
+    // Overflow: quotient = MIN, remainder = 0. (W results are sign-extended.)
+    let su_dz_result     : logic<64> = if su_is_rem ?
+        (if su_is_w ? {i_a[31] repeat 32, i_a[31:0]} : i_a)
+    :
+        64'hFFFF_FFFF_FFFF_FFFF
+    ;
+    let su_ov_result     : logic<64> = if su_is_rem ?
+        64'd0
+    :
+        (if su_is_w ? 64'hFFFF_FFFF_8000_0000 : 64'h8000_0000_0000_0000)
+    ;
+    let su_special_result: logic<64> = if su_b_is_zero ? su_dz_result : su_ov_result;
+
+    // ====================================================================
+    // Two restoring-division steps per RUN cycle (radix-4). Each step shifts the
+    // remainder left, brings in the next dividend MSB, conditionally subtracts
+    // the divisor, and emits one quotient bit into the low bits of it_quot.
+    // ====================================================================
+    var nxt_rem : logic<64>;
+    var nxt_quot: logic<64>;
+    var nxt_dvd : logic<64>;
+
+    always_comb {
+        // step 1
+        var rem_sh1: logic<65>;
+        var ge1    : logic    ;
+        var rem1   : logic<65>;
+        rem_sh1 = {it_rem, it_dvd[63]};
+        ge1     = rem_sh1 >= {1'b0, reg_dsr};
+        rem1    = if ge1 ? rem_sh1 - {1'b0, reg_dsr} : rem_sh1;
+        // step 2
+        var rem_sh2: logic<65>;
+        var ge2    : logic    ;
+        var rem2   : logic<65>;
+        rem_sh2 = {rem1[63:0], it_dvd[62]};
+        ge2     = rem_sh2 >= {1'b0, reg_dsr};
+        rem2    = if ge2 ? rem_sh2 - {1'b0, reg_dsr} : rem_sh2;
+
+        nxt_rem  = rem2[63:0];
+        nxt_dvd  = {it_dvd[61:0], 2'b00};
+        nxt_quot = {it_quot[61:0], ge1, ge2};
+    }
+
+    // ====================================================================
+    // Finalize: apply the result sign + W sign-extension to the magnitude, or
+    // select the special-case result. Combinational off the iteration/setup
+    // registers; sampled into o_result in DONE.
+    // ====================================================================
+    var fin_result: logic<64>;
+
+    always_comb {
+        var res_mag   : logic<64>;
+        var res_neg32 : logic<32>;
+        var res_neg64 : logic<64>;
+        var res_sgn_v : logic<64>;
+        res_mag    = if reg_is_rem ? it_rem : it_quot;
+        res_neg32  = (~res_mag[31:0]) + 32'd1;
+        res_neg64  = (~res_mag) + 64'd1;
+        res_sgn_v  = if reg_is_w ?
+            (if reg_res_sgn ? {res_neg32[31] repeat 32, res_neg32} : {res_mag[31] repeat 32, res_mag[31:0]})
+        :
+            (if reg_res_sgn ? res_neg64 : res_mag)
+        ;
+        fin_result = if reg_has_special ? reg_special_result : res_sgn_v;
+    }
+
+    // ====================================================================
+    // FSM: capture + normalize (IDLE), two restoring-division iterations per
+    // RUN cycle, present the result (DONE).
+    // ====================================================================
+    always_ff (clk, rst) {
+        if_reset {
+            state              = State::IDLE;
+            count              = '0;
+            reg_dsr            = '0;
+            reg_is_rem         = '0;
+            reg_is_w           = '0;
+            reg_res_sgn        = '0;
+            reg_has_special    = '0;
+            reg_special_result = '0;
+            it_rem             = '0;
+            it_quot            = '0;
+            it_dvd             = '0;
+            o_result           = '0;
+            o_valid            = 1'b0;
+        } else if i_flush {
+            state   = State::IDLE;
+            count   = '0;
+            o_valid = 1'b0;
+        } else {
+            o_valid = 1'b0; // default: pulse
+
+            case state {
+                State::IDLE: {
+                    if i_valid {
+                        reg_dsr            = su_dsr;
+                        reg_is_rem         = su_is_rem;
+                        reg_is_w           = su_is_w;
+                        reg_res_sgn        = su_res_sgn;
+                        reg_has_special    = su_has_special;
+                        reg_special_result = su_special_result;
+                        it_rem             = '0;
+                        it_quot            = '0;
+                        it_dvd             = su_dvd;
+                        count              = '0;
+                        state              = State::RUN;
+                    }
+                }
+                State::RUN: {
+                    it_rem  = nxt_rem;
+                    it_quot = nxt_quot;
+                    it_dvd  = nxt_dvd;
+                    if count == RUN_LAST {
+                        state = State::DONE;
+                    } else {
+                        count = count + 6'd1;
+                    }
+                }
+                State::DONE: {
+                    o_result = fin_result;
+                    o_valid  = 1'b1;
+                    state    = State::IDLE;
+                }
+                default: {
+                    state = State::IDLE;
+                }
+            }
+        }
+    }
+}
