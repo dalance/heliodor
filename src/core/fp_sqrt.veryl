@@ -1,8 +1,8 @@
 // IEEE 754 double-precision floating-point square root
-// True iterative digit-by-digit sqrt: one result bit per RUN cycle, so the
-// combinational path is a single 64-bit compare/subtract instead of the former
-// 56-deep unrolled chain. Bit-exact and same 57-cycle latency as before.
-// Latency: 1 (capture + normalize + iter 0) + 55 (RUN, iters 1..55) + 1 (DONE) = 57.
+// Iterative digit-by-digit sqrt, radix-4 (two result bits per RUN cycle), so
+// the combinational path is two chained 64-bit compare/subtracts instead of the
+// former 56-deep unrolled chain. Bit-exact with the original digit-recurrence.
+// Latency: 1 (capture + normalize) + 28 (RUN, two iters each) + 1 (DONE) = 30.
 pub module fp_sqrt (
     clk: input clock,
     rst: input reset,
@@ -33,27 +33,26 @@ pub module fp_sqrt (
     var reg_special_result: logic<64>;
     var reg_special_fflags: logic<5> ;
 
-    // Iteration state, advanced one digit per RUN cycle.
+    // Iteration state, advanced two digits per RUN cycle.
     var it_q  : logic<56>; // running result digits
     var it_rem: logic<64>; // running remainder
     var it_rad: logic<56>; // radicand shift register (2 bits consumed per step)
 
     assign o_busy = state != State::IDLE;
 
-    const RUN_LAST: logic<6> = 6'd54;
+    // 28 RUN cycles (two digits each = 56) then DONE — 30 total.
+    const RUN_LAST: logic<6> = 6'd27;
 
     // ====================================================================
-    // Setup: unpack/classify the live operand, normalize, form the radicand
-    // and result exponent, and perform the FIRST sqrt iteration. Combinational
-    // off i_a; sampled into the reg_*/it_* registers when IDLE accepts a job.
+    // Setup: unpack/classify the live operand, normalize, and form the
+    // radicand + result exponent. Combinational off i_a; sampled into the
+    // reg_*/it_* registers when IDLE accepts a job.
     // ====================================================================
     var su_is_special    : logic    ;
     var su_special_result: logic<64>;
     var su_special_fflags: logic<5> ;
     var su_r_exp         : logic<13>;
-    var su_q             : logic<56>;
-    var su_rem           : logic<64>;
-    var su_rad           : logic<56>;
+    var su_radicand      : logic<56>;
 
     always_comb {
         var sa: logic    ;
@@ -80,9 +79,7 @@ pub module fp_sqrt (
         su_special_result = 64'd0;
         su_special_fflags = 5'd0;
         su_r_exp          = 13'd0;
-        su_q              = 56'd0;
-        su_rem            = 64'd0;
-        su_rad            = 56'd0;
+        su_radicand       = 56'd0;
 
         if a_is_nan {
             su_is_special     = 1'b1;
@@ -150,6 +147,7 @@ pub module fp_sqrt (
                 radicand_hi = {1'b0, sig_a, 2'b00};
             }
             // Lower 56 bits are all zeros (extended precision)
+            su_radicand = radicand_hi;
 
             // Result exponent
             var r_exp: logic<13>;
@@ -170,21 +168,42 @@ pub module fp_sqrt (
                 }
             }
             su_r_exp = r_exp;
-
-            // Digit-by-digit square root, first iteration (q=0, rem=0,
-            // rad_shift=radicand_hi). Each step processes 2 radicand bits and
-            // produces 1 result bit; 56 steps total (this one + 55 in RUN).
-            // rad_bits = radicand_hi[55:54]; rem = {62'd0, rad_bits};
-            // trial = {6'd0, q=0, 2'b01} = 64'd1.
-            su_rad = {radicand_hi[53:0], 2'b00};
-            if {62'd0, radicand_hi[55:54]} >= 64'd1 {
-                su_rem = {62'd0, radicand_hi[55:54]} - 64'd1;
-                su_q   = 56'd1;
-            } else {
-                su_rem = {62'd0, radicand_hi[55:54]};
-                su_q   = 56'd0;
-            }
         }
+    }
+
+    // ====================================================================
+    // Two digit-by-digit iterations per RUN cycle (radix-4). Each step takes
+    // the next 2 radicand bits, trial-subtracts (q<<2)|1, and shifts one
+    // result bit into q (the radicand register is consumed top-first).
+    // ====================================================================
+    var nxt_q  : logic<56>;
+    var nxt_rem: logic<64>;
+    var nxt_rad: logic<56>;
+
+    always_comb {
+        // step 1
+        var rem_sh1: logic<64>;
+        var trial1 : logic<64>;
+        var ge1    : logic    ;
+        var q1     : logic<56>;
+        var rem1   : logic<64>;
+        var rad1   : logic<56>;
+        rem_sh1 = {it_rem[61:0], it_rad[55:54]};
+        trial1  = {6'd0, it_q, 2'b01};
+        ge1     = rem_sh1 >= trial1;
+        rem1    = if ge1 ? rem_sh1 - trial1 : rem_sh1;
+        q1      = {it_q[54:0], ge1};
+        rad1    = {it_rad[53:0], 2'b00};
+        // step 2
+        var rem_sh2: logic<64>;
+        var trial2 : logic<64>;
+        var ge2    : logic    ;
+        rem_sh2 = {rem1[61:0], rad1[55:54]};
+        trial2  = {6'd0, q1, 2'b01};
+        ge2     = rem_sh2 >= trial2;
+        nxt_rem = if ge2 ? rem_sh2 - trial2 : rem_sh2;
+        nxt_q   = {q1[54:0], ge2};
+        nxt_rad = {rad1[53:0], 2'b00};
     }
 
     // ====================================================================
@@ -286,8 +305,8 @@ pub module fp_sqrt (
     }
 
     // ====================================================================
-    // FSM: capture + normalize + iter 0 (IDLE), one sqrt iteration per RUN
-    // cycle, present the result (DONE).
+    // FSM: capture + normalize (IDLE), two sqrt iterations per RUN cycle,
+    // present the result (DONE).
     // ====================================================================
     always_ff (clk, rst) {
         if_reset {
@@ -319,25 +338,17 @@ pub module fp_sqrt (
                         reg_is_special     = su_is_special;
                         reg_special_result = su_special_result;
                         reg_special_fflags = su_special_fflags;
-                        it_q               = su_q;
-                        it_rem             = su_rem;
-                        it_rad             = su_rad;
+                        it_q               = '0;
+                        it_rem             = '0;
+                        it_rad             = su_radicand;
                         count              = '0;
                         state              = State::RUN;
                     }
                 }
                 State::RUN: {
-                    // One digit-by-digit iteration. trial = (q << 2) | 1;
-                    // the remainder takes the next 2 radicand bits (the top of
-                    // it_rad, which is shifted out AFTER it is consumed here).
-                    if {it_rem[61:0], it_rad[55:54]} >= {6'd0, it_q, 2'b01} {
-                        it_rem = {it_rem[61:0], it_rad[55:54]} - {6'd0, it_q, 2'b01};
-                        it_q   = {it_q[54:0], 1'b1};
-                    } else {
-                        it_rem = {it_rem[61:0], it_rad[55:54]};
-                        it_q   = {it_q[54:0], 1'b0};
-                    }
-                    it_rad = {it_rad[53:0], 2'b00};
+                    it_q   = nxt_q;
+                    it_rem = nxt_rem;
+                    it_rad = nxt_rad;
                     if count == RUN_LAST {
                         state = State::DONE;
                     } else {

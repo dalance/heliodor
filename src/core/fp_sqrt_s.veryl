@@ -1,13 +1,61 @@
 // IEEE 754 single-precision floating-point square root
-// Combinational. Handles normals, subnormals, zeros, infinities, NaNs.
+// Iterative digit-by-digit sqrt, radix-4 (two result bits per RUN cycle), so
+// the combinational path is two chained 32-bit compare/subtracts instead of the
+// former 27-deep unrolled chain. Bit-exact with the original digit-recurrence.
+// Latency: 1 (capture + normalize + iter 0) + 13 (RUN, two iters each) + 1 (DONE) = 15.
 pub module fp_sqrt_s (
-    i_a     : input  logic<32>,
-    i_rm    : input  logic<3> ,
+    clk: input clock,
+    rst: input reset,
+
+    i_valid: input logic    ,
+    i_a    : input logic<32>,
+    i_rm   : input logic<3> ,
+    i_flush: input logic    ,
+
     o_result: output logic<32>,
     o_fflags: output logic<5> ,
+    o_valid : output logic    ,
+    o_busy  : output logic    ,
 ) {
-    var result: logic<32>;
-    var fflags: logic<5> ;
+    enum State: logic<2> {
+        IDLE = 2'd0,
+        RUN = 2'd1,
+        DONE = 2'd2,
+    }
+
+    var state    : State   ;
+    var count    : logic<5>;
+    var latched_m: logic<3>;
+
+    // Operand-derived state captured at IDLE and held stable through RUN/DONE.
+    var reg_r_exp         : logic<10>;
+    var reg_is_special    : logic    ;
+    var reg_special_result: logic<32>;
+    var reg_special_fflags: logic<5> ;
+
+    // Iteration state, advanced two digits per RUN cycle.
+    var it_q  : logic<27>; // running result digits
+    var it_rem: logic<32>; // running remainder
+    var it_rad: logic<27>; // radicand shift register (2 bits consumed per step)
+
+    assign o_busy = state != State::IDLE;
+
+    // 13 RUN cycles (two digits each = 26, + iter 0 in IDLE = 27) then DONE — 15 total.
+    const RUN_LAST: logic<5> = 5'd12;
+
+    // ====================================================================
+    // Setup: unpack/classify the live operand, normalize, form the radicand
+    // and result exponent, and perform the FIRST sqrt iteration (folded into
+    // IDLE so RUN runs an even 26 iterations at two per cycle). Combinational
+    // off i_a; sampled into reg_*/it_* when IDLE accepts a job.
+    // ====================================================================
+    var su_is_special    : logic    ;
+    var su_special_result: logic<32>;
+    var su_special_fflags: logic<5> ;
+    var su_r_exp         : logic<10>;
+    var su_q             : logic<27>;
+    var su_rem           : logic<32>;
+    var su_rad           : logic<27>;
 
     always_comb {
         var sa: logic    ;
@@ -28,21 +76,30 @@ pub module fp_sqrt_s (
         a_is_snan = a_is_nan && ma[22] == 1'b0;
         a_is_sub  = ea == 8'd0 && ma != 23'd0;
 
-        result = 32'd0;
-        fflags = 5'd0;
+        su_is_special     = 1'b0;
+        su_special_result = 32'd0;
+        su_special_fflags = 5'd0;
+        su_r_exp          = 10'd0;
+        su_q              = 27'd0;
+        su_rem            = 32'd0;
+        su_rad            = 27'd0;
 
         if a_is_nan {
-            result = 32'h7FC00000;
+            su_is_special     = 1'b1;
+            su_special_result = 32'h7FC00000;
             if a_is_snan {
-                fflags = 5'b10000;
+                su_special_fflags = 5'b10000;
             }
         } else if sa && !a_is_zero {
-            result = 32'h7FC00000;
-            fflags = 5'b10000;
+            su_is_special     = 1'b1;
+            su_special_result = 32'h7FC00000;
+            su_special_fflags = 5'b10000;
         } else if a_is_inf {
-            result = {1'b0, 8'hFF, 23'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {1'b0, 8'hFF, 23'd0};
         } else if a_is_zero {
-            result = {sa, 31'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {sa, 31'd0};
         } else {
             var ea_eff: logic<10>;
             if a_is_sub {
@@ -73,7 +130,6 @@ pub module fp_sqrt_s (
             unbiased = ea_eff - 10'd127;
 
             // Radicand setup: 27 bits (24 sig + 3 for rounding)
-            // Use shift register for sequential bit extraction
             var radicand_hi: logic<27>;
             if unbiased[0] {
                 radicand_hi = {sig_a, 3'b000};
@@ -97,29 +153,78 @@ pub module fp_sqrt_s (
                     r_exp = unbiased / 10'd2 + 10'd127;
                 }
             }
+            su_r_exp = r_exp;
 
-            // Digit-by-digit sqrt: 27 iterations for 27-bit result
-            var q        : logic<27>;
-            var rem      : logic<32>;
-            var rad_shift: logic<27>;
-            q         = 27'd0;
-            rem       = 32'd0;
-            rad_shift = radicand_hi;
-
-            for _i in 0..27 {
-                var rad_bits : logic<2>;
-                rad_bits  = rad_shift[26:25];
-                rad_shift = {rad_shift[24:0], 2'b00};
-                rem       = {rem[29:0], rad_bits};
-                var trial    : logic<32>;
-                trial     = {3'd0, q, 2'b01};
-                if rem >= trial {
-                    rem = rem - trial;
-                    q   = {q[25:0], 1'b1};
-                } else {
-                    q = {q[25:0], 1'b0};
-                }
+            // Digit-by-digit sqrt, first iteration (q=0, rem=0,
+            // rad_shift=radicand_hi). trial = {3'd0, q=0, 2'b01} = 32'd1.
+            su_rad = {radicand_hi[24:0], 2'b00};
+            if {30'd0, radicand_hi[26:25]} >= 32'd1 {
+                su_rem = {30'd0, radicand_hi[26:25]} - 32'd1;
+                su_q   = 27'd1;
+            } else {
+                su_rem = {30'd0, radicand_hi[26:25]};
+                su_q   = 27'd0;
             }
+        }
+    }
+
+    // ====================================================================
+    // Two digit-by-digit iterations per RUN cycle (radix-4). Each step takes
+    // the next 2 radicand bits, trial-subtracts (q<<2)|1, and shifts one
+    // result bit into q (the radicand register is consumed top-first).
+    // ====================================================================
+    var nxt_q  : logic<27>;
+    var nxt_rem: logic<32>;
+    var nxt_rad: logic<27>;
+
+    always_comb {
+        // step 1
+        var rem_sh1: logic<32>;
+        var trial1 : logic<32>;
+        var ge1    : logic    ;
+        var q1     : logic<27>;
+        var rem1   : logic<32>;
+        var rad1   : logic<27>;
+        rem_sh1 = {it_rem[29:0], it_rad[26:25]};
+        trial1  = {3'd0, it_q, 2'b01};
+        ge1     = rem_sh1 >= trial1;
+        rem1    = if ge1 ? rem_sh1 - trial1 : rem_sh1;
+        q1      = {it_q[25:0], ge1};
+        rad1    = {it_rad[24:0], 2'b00};
+        // step 2
+        var rem_sh2: logic<32>;
+        var trial2 : logic<32>;
+        var ge2    : logic    ;
+        rem_sh2 = {rem1[29:0], rad1[26:25]};
+        trial2  = {3'd0, q1, 2'b01};
+        ge2     = rem_sh2 >= trial2;
+        nxt_rem = if ge2 ? rem_sh2 - trial2 : rem_sh2;
+        nxt_q   = {q1[25:0], ge2};
+        nxt_rad = {rad1[24:0], 2'b00};
+    }
+
+    // ====================================================================
+    // Finalize: assemble the rounded result from the final result digits /
+    // remainder. Combinational off the iteration/setup registers; sampled into
+    // o_result in DONE.
+    // ====================================================================
+    var fin_result: logic<32>;
+    var fin_fflags: logic<5> ;
+
+    always_comb {
+        fin_result = 32'd0;
+        fin_fflags = 5'd0;
+
+        if reg_is_special {
+            fin_result = reg_special_result;
+            fin_fflags = reg_special_fflags;
+        } else {
+            var q    : logic<27>;
+            var rem  : logic<32>;
+            var r_exp: logic<10>;
+            q     = it_q;
+            rem   = it_rem;
+            r_exp = reg_r_exp;
 
             var sq_mant: logic<27>;
             if q[26] {
@@ -158,7 +263,7 @@ pub module fp_sqrt_s (
             s        = sq_mant[0];
             bit_lsb  = sq_mant[3];
             var round_up: logic;
-            case i_rm {
+            case latched_m {
                 3'b000 : round_up = g && (r || s || bit_lsb);
                 3'b001 : round_up = 1'b0;
                 3'b010 : round_up = 1'b0;
@@ -168,30 +273,91 @@ pub module fp_sqrt_s (
             }
             // 25-bit so a round-up that overflows the 24-bit significand
             // (0xFFFFFF + 1 = 0x1000000) lands in bit 24 and bumps the exponent.
-            // (The old 24-bit add dropped that carry — e.g. sqrt(FLT_MAX) under
-            // RUP gave 2^63 instead of 2^64.) sqrt results are always normal, so
-            // the old `!sq_mant[26]` normalization case never applies.
-            var rounded : logic<25>;
-            rounded  = {1'b0, sq_mant[26:3]} + {24'd0, round_up};
+            // sqrt results are always normal, so the old `!sq_mant[26]`
+            // normalization case never applies.
+            var rounded: logic<25>;
+            rounded = {1'b0, sq_mant[26:3]} + {24'd0, round_up};
             if rounded[24] {
                 r_exp = r_exp + 10'd1;
             }
             var nx: logic;
             nx = g || r || s;
             if r_exp >= 10'd255 {
-                result = {1'b0, 8'hFF, 23'd0};
-                fflags = 5'b00101;
+                fin_result = {1'b0, 8'hFF, 23'd0};
+                fin_fflags = 5'b00101;
             } else {
-                result = {1'b0, r_exp[7:0], rounded[22:0]};
+                fin_result = {1'b0, r_exp[7:0], rounded[22:0]};
                 if nx {
-                    fflags = 5'b00001;
+                    fin_fflags = 5'b00001;
                 }
                 if r_exp == 10'd0 && nx {
-                    fflags = 5'b00011;
+                    fin_fflags = 5'b00011;
                 }
             }
         }
     }
-    assign o_result = result;
-    assign o_fflags = fflags;
+
+    // ====================================================================
+    // FSM: capture + normalize + iter 0 (IDLE), two sqrt iterations per RUN
+    // cycle, present the result (DONE).
+    // ====================================================================
+    always_ff (clk, rst) {
+        if_reset {
+            state              = State::IDLE;
+            count              = '0;
+            latched_m          = '0;
+            reg_r_exp          = '0;
+            reg_is_special     = '0;
+            reg_special_result = '0;
+            reg_special_fflags = '0;
+            it_q               = '0;
+            it_rem             = '0;
+            it_rad             = '0;
+            o_result           = '0;
+            o_fflags           = '0;
+            o_valid            = 1'b0;
+        } else if i_flush {
+            state   = State::IDLE;
+            count   = '0;
+            o_valid = 1'b0;
+        } else {
+            o_valid = 1'b0;
+
+            case state {
+                State::IDLE: {
+                    if i_valid {
+                        latched_m          = i_rm;
+                        reg_r_exp          = su_r_exp;
+                        reg_is_special     = su_is_special;
+                        reg_special_result = su_special_result;
+                        reg_special_fflags = su_special_fflags;
+                        it_q               = su_q;
+                        it_rem             = su_rem;
+                        it_rad             = su_rad;
+                        count              = '0;
+                        state              = State::RUN;
+                    }
+                }
+                State::RUN: {
+                    it_q   = nxt_q;
+                    it_rem = nxt_rem;
+                    it_rad = nxt_rad;
+                    if count == RUN_LAST {
+                        state = State::DONE;
+                    } else {
+                        count = count + 5'd1;
+                    }
+                }
+                State::DONE: {
+                    o_result = fin_result;
+                    o_fflags = fin_fflags;
+                    o_valid  = 1'b1;
+                    state    = State::IDLE;
+                }
+                default: {
+                    state = State::IDLE;
+                }
+            }
+        }
+    }
 }

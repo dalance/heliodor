@@ -1,14 +1,50 @@
 // IEEE 754 single-precision floating-point divider
-// Combinational. Handles normals, subnormals, zeros, infinities, NaNs.
+// Iterative restoring divider, radix-4 (two quotient bits per RUN cycle), so
+// the combinational path is two chained 32-bit subtract/compares instead of the
+// former 26-deep unrolled chain. Bit-exact with the original restoring math.
+// Latency: 1 (capture + normalize) + 13 (RUN, two iters each) + 1 (DONE) = 15.
 pub module fp_divider_s (
-    i_a     : input  logic<32>,
-    i_b     : input  logic<32>,
-    i_rm    : input  logic<3> ,
+    clk: input clock,
+    rst: input reset,
+
+    i_valid: input logic    , // start new division (pulse)
+    i_a    : input logic<32>,
+    i_b    : input logic<32>,
+    i_rm   : input logic<3> ,
+    i_flush: input logic    , // abort current operation
+
     o_result: output logic<32>,
     o_fflags: output logic<5> ,
+    o_valid : output logic    , // result ready (1-cycle pulse)
+    o_busy  : output logic    , // divider occupied
 ) {
-    var result: logic<32>;
-    var fflags: logic<5> ;
+    enum State: logic<2> {
+        IDLE = 2'd0,
+        RUN = 2'd1,
+        DONE = 2'd2,
+    }
+
+    var state    : State   ;
+    var count    : logic<5>;
+    var latched_m: logic<3>;
+
+    // Operand-derived state captured at IDLE and held stable through RUN/DONE.
+    var reg_sig_b         : logic<24>; // normalized divisor (iteration compare/subtract)
+    var reg_ea_eff        : logic<10>;
+    var reg_eb_eff        : logic<10>;
+    var reg_r_sign        : logic    ;
+    var reg_is_special    : logic    ;
+    var reg_special_result: logic<32>;
+    var reg_special_fflags: logic<5> ;
+
+    // Iteration state, advanced two restoring-division steps per RUN cycle.
+    var it_rem : logic<32>; // running remainder
+    var it_quot: logic<27>; // running quotient (bit 26 set at init, 25..0 shifted in)
+
+    assign o_busy = state != State::IDLE;
+
+    // 13 RUN cycles (two quotient bits each = 26) then DONE — 15 total.
+    const RUN_LAST: logic<5> = 5'd12;
 
     // Overflow result per rounding mode (IEEE/RISC-V): RNE/RMM -> inf,
     // RTZ -> max normal, RDN -> +max/-inf, RUP -> +inf/-max.
@@ -28,21 +64,36 @@ pub module fp_divider_s (
         return r;
     }
 
+    // ====================================================================
+    // Setup: unpack/classify the live operands, normalize, produce the
+    // special-case result and the pre-loop initial remainder + top quotient
+    // bit. Combinational off i_a/i_b; sampled into reg_*/it_* when IDLE accepts.
+    // ====================================================================
+    var su_is_special    : logic    ;
+    var su_special_result: logic<32>;
+    var su_special_fflags: logic<5> ;
+    var su_ea_eff        : logic<10>;
+    var su_eb_eff        : logic<10>;
+    var su_r_sign        : logic    ;
+    var su_sig_b         : logic<24>;
+    var su_init_rem      : logic<32>;
+    var su_init_quot     : logic<27>;
+
     always_comb {
-        var sa    : logic    ;
-        var ea    : logic<8> ;
-        var ma    : logic<23>;
-        var sb    : logic    ;
-        var eb    : logic<8> ;
-        var mb    : logic<23>;
-        sa     = i_a[31];
-        ea     = i_a[30:23];
-        ma     = i_a[22:0];
-        sb     = i_b[31];
-        eb     = i_b[30:23];
-        mb     = i_b[22:0];
-        var r_sign: logic;
-        r_sign = sa ^ sb;
+        var sa: logic    ;
+        var ea: logic<8> ;
+        var ma: logic<23>;
+        var sb: logic    ;
+        var eb: logic<8> ;
+        var mb: logic<23>;
+        sa = i_a[31];
+        ea = i_a[30:23];
+        ma = i_a[22:0];
+        sb = i_b[31];
+        eb = i_b[30:23];
+        mb = i_b[22:0];
+
+        su_r_sign = sa ^ sb;
 
         var a_is_zero: logic;
         var b_is_zero: logic;
@@ -65,31 +116,43 @@ pub module fp_divider_s (
         a_is_sub  = ea == 8'd0 && ma != 23'd0;
         b_is_sub  = eb == 8'd0 && mb != 23'd0;
 
-        result = 32'd0;
-        fflags = 5'd0;
+        su_is_special     = 1'b0;
+        su_special_result = 32'd0;
+        su_special_fflags = 5'd0;
+        su_ea_eff         = 10'd0;
+        su_eb_eff         = 10'd0;
+        su_sig_b          = 24'd0;
+        su_init_rem       = 32'd0;
+        su_init_quot      = 27'd0;
 
         if a_is_nan || b_is_nan {
-            result = 32'h7FC00000;
+            su_is_special     = 1'b1;
+            su_special_result = 32'h7FC00000;
             if a_is_snan || b_is_snan {
-                fflags = 5'b10000;
+                su_special_fflags = 5'b10000;
             }
         } else if a_is_inf && b_is_inf {
-            result = 32'h7FC00000;
-            fflags = 5'b10000;
+            su_is_special     = 1'b1;
+            su_special_result = 32'h7FC00000;
+            su_special_fflags = 5'b10000;
         } else if a_is_inf {
-            result = {r_sign, 8'hFF, 23'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {su_r_sign, 8'hFF, 23'd0};
         } else if b_is_inf {
-            result = {r_sign, 31'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {su_r_sign, 31'd0};
         } else if b_is_zero {
+            su_is_special = 1'b1;
             if a_is_zero {
-                result = 32'h7FC00000;
-                fflags = 5'b10000;
+                su_special_result = 32'h7FC00000;
+                su_special_fflags = 5'b10000;
             } else {
-                result = {r_sign, 8'hFF, 23'd0};
-                fflags = 5'b01000;
+                su_special_result = {su_r_sign, 8'hFF, 23'd0};
+                su_special_fflags = 5'b01000;
             }
         } else if a_is_zero {
-            result = {r_sign, 31'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {su_r_sign, 31'd0};
         } else {
             var ea_eff: logic<10>;
             var eb_eff: logic<10>;
@@ -140,32 +203,70 @@ pub module fp_divider_s (
                 eb_eff = eb_eff - {5'd0, lzb};
             }
 
-            // Long division: 27-bit quotient (24 + 3 for G/R/S).
-            // Pre-subtract once if sig_a >= sig_b so that the loop
-            // invariant `remainder < sig_b` holds at the top of each
-            // iteration. Otherwise (for ratios in (1.5, 2)) the first
-            // shift would push remainder beyond 2*sig_b and a single
-            // per-iter subtract would leave it still >= sig_b, yielding
-            // a completely wrong quotient.
-            var remainder: logic<32>;
-            var quotient : logic<27>;
-            quotient  = 27'd0;
+            su_ea_eff = ea_eff;
+            su_eb_eff = eb_eff;
+            su_sig_b  = sig_b;
+
+            // Pre-loop step (sets quotient[26]); the restoring loop invariant
+            // `remainder < sig_b` then holds at the top of each RUN iteration.
+            var q26: logic;
             if sig_a >= sig_b {
-                remainder    = {8'd0, sig_a - sig_b};
-                quotient[26] = 1'b1;
+                su_init_rem = {8'd0, sig_a - sig_b};
+                q26         = 1'b1;
             } else {
-                remainder = {8'd0, sig_a};
+                su_init_rem = {8'd0, sig_a};
+                q26         = 1'b0;
             }
-            for i in 0..26 {
-                remainder = {remainder[30:0], 1'b0};
-                if remainder >= {8'd0, sig_b} {
-                    remainder        = remainder - {8'd0, sig_b};
-                    quotient[25 - i] = 1'b1;
-                }
-            }
+            su_init_quot = {q26, 26'd0};
+        }
+    }
+
+    // ====================================================================
+    // Two restoring-division steps per RUN cycle (radix-4). Each step shifts
+    // the remainder left, conditionally subtracts the divisor, and emits one
+    // quotient bit into the low 26 bits of it_quot (bit 26 is preserved).
+    // ====================================================================
+    var nxt_rem : logic<32>;
+    var nxt_quot: logic<27>;
+
+    always_comb {
+        var r1      : logic<32>;
+        var b1      : logic    ;
+        var r1b     : logic<32>;
+        var r2      : logic<32>;
+        var b2      : logic    ;
+        r1       = {it_rem[30:0], 1'b0};
+        b1       = r1 >= {8'd0, reg_sig_b};
+        r1b      = if b1 ? r1 - {8'd0, reg_sig_b} : r1;
+        r2       = {r1b[30:0], 1'b0};
+        b2       = r2 >= {8'd0, reg_sig_b};
+        nxt_rem  = if b2 ? r2 - {8'd0, reg_sig_b} : r2;
+        nxt_quot = {it_quot[26], it_quot[23:0], b1, b2};
+    }
+
+    // ====================================================================
+    // Finalize: assemble the rounded result from the final remainder /
+    // quotient. Combinational off the iteration/setup registers; sampled into
+    // o_result in DONE.
+    // ====================================================================
+    var fin_result: logic<32>;
+    var fin_fflags: logic<5> ;
+
+    always_comb {
+        fin_result = 32'd0;
+        fin_fflags = 5'd0;
+
+        if reg_is_special {
+            fin_result = reg_special_result;
+            fin_fflags = reg_special_fflags;
+        } else {
+            var quotient : logic<27>;
+            var remainder: logic<32>;
+            quotient  = it_quot;
+            remainder = it_rem;
 
             var q_exp : logic<10>;
-            q_exp  = ea_eff - eb_eff + 10'd127;
+            q_exp  = reg_ea_eff - reg_eb_eff + 10'd127;
             var q_mant: logic<27>;
             if quotient[26] {
                 q_mant = quotient;
@@ -208,35 +309,100 @@ pub module fp_divider_s (
             s        = q_mant[0];
             bit_lsb  = q_mant[3];
             var round_up: logic;
-            case i_rm {
+            case latched_m {
                 3'b000 : round_up = g && (r || s || bit_lsb);
                 3'b001 : round_up = 1'b0;
-                3'b010 : round_up = r_sign && (g || r || s);
-                3'b011 : round_up = !r_sign && (g || r || s);
+                3'b010 : round_up = reg_r_sign && (g || r || s);
+                3'b011 : round_up = !reg_r_sign && (g || r || s);
                 3'b100 : round_up = g;
                 default: round_up = g && (r || s || bit_lsb);
             }
-            var rounded : logic<24>;
-            rounded  = q_mant[26:3] + {23'd0, round_up};
+            var rounded: logic<24>;
+            rounded = q_mant[26:3] + {23'd0, round_up};
             if rounded[23] && !q_mant[26] {
                 q_exp = q_exp + 10'd1;
             }
             var nx: logic;
             nx = g || r || s;
             if q_exp >= 10'd255 {
-                result = ovf_s(i_rm, r_sign);
-                fflags = 5'b00101;
+                fin_result = ovf_s(latched_m, reg_r_sign);
+                fin_fflags = 5'b00101;
             } else {
-                result = {r_sign, q_exp[7:0], rounded[22:0]};
+                fin_result = {reg_r_sign, q_exp[7:0], rounded[22:0]};
                 if nx {
-                    fflags = 5'b00001;
+                    fin_fflags = 5'b00001;
                 }
                 if q_exp == 10'd0 && nx {
-                    fflags = 5'b00011;
+                    fin_fflags = 5'b00011;
                 }
             }
         }
     }
-    assign o_result = result;
-    assign o_fflags = fflags;
+
+    // ====================================================================
+    // FSM: capture + normalize (IDLE), two restoring-division iterations per
+    // RUN cycle, present the result (DONE).
+    // ====================================================================
+    always_ff (clk, rst) {
+        if_reset {
+            state              = State::IDLE;
+            count              = '0;
+            latched_m          = '0;
+            reg_sig_b          = '0;
+            reg_ea_eff         = '0;
+            reg_eb_eff         = '0;
+            reg_r_sign         = '0;
+            reg_is_special     = '0;
+            reg_special_result = '0;
+            reg_special_fflags = '0;
+            it_rem             = '0;
+            it_quot            = '0;
+            o_result           = '0;
+            o_fflags           = '0;
+            o_valid            = 1'b0;
+        } else if i_flush {
+            state   = State::IDLE;
+            count   = '0;
+            o_valid = 1'b0;
+        } else {
+            o_valid = 1'b0;
+
+            case state {
+                State::IDLE: {
+                    if i_valid {
+                        latched_m          = i_rm;
+                        reg_sig_b          = su_sig_b;
+                        reg_ea_eff         = su_ea_eff;
+                        reg_eb_eff         = su_eb_eff;
+                        reg_r_sign         = su_r_sign;
+                        reg_is_special     = su_is_special;
+                        reg_special_result = su_special_result;
+                        reg_special_fflags = su_special_fflags;
+                        it_rem             = su_init_rem;
+                        it_quot            = su_init_quot;
+                        count              = '0;
+                        state              = State::RUN;
+                    }
+                }
+                State::RUN: {
+                    it_rem  = nxt_rem;
+                    it_quot = nxt_quot;
+                    if count == RUN_LAST {
+                        state = State::DONE;
+                    } else {
+                        count = count + 5'd1;
+                    }
+                }
+                State::DONE: {
+                    o_result = fin_result;
+                    o_fflags = fin_fflags;
+                    o_valid  = 1'b1;
+                    state    = State::IDLE;
+                }
+                default: {
+                    state = State::IDLE;
+                }
+            }
+        }
+    }
 }
