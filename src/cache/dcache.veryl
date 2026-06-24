@@ -240,7 +240,6 @@ pub module dcache #(
     let tag     : logic<TAG_W> = i_addr[63:INDEX_W + 6];
     let index   : logic<INDEX_W> = i_addr[INDEX_W + 5:6];
     let offset  : logic<3>  = i_addr[5:3];
-    let data_idx: logic<INDEX_W + 3>  = {index, offset};
 
     // Cache storage: 4 ways
     var valid_0: logic         [SETS];
@@ -251,10 +250,13 @@ pub module dcache #(
     var tags_1 : logic<TAG_W>  [SETS];
     var tags_2 : logic<TAG_W>  [SETS];
     var tags_3 : logic<TAG_W>  [SETS];
-    var data_0 : logic<64>     [SETS * 8]; // SETS × 8 dwords
-    var data_1 : logic<64>     [SETS * 8];
-    var data_2 : logic<64>     [SETS * 8];
-    var data_3 : logic<64>     [SETS * 8];
+    // Line-width data arrays: one 512-bit word per set (8 × 64-bit dwords),
+    // so each way reads/writes a whole line through a single port — the shape
+    // a line-wide SRAM macro + external dword merge logic infers as RAM.
+    var data_0 : logic<512>    [SETS];
+    var data_1 : logic<512>    [SETS];
+    var data_2 : logic<512>    [SETS];
+    var data_3 : logic<512>    [SETS];
     // P9.2 MESI state alongside valid: excl (E/M — sole copy, may be
     // written locally) and dirty (M — must be written back on departure).
     // Meaningful only while the way is valid; fills rewrite both.
@@ -279,6 +281,59 @@ pub module dcache #(
     // bit[1]: left child → 0=way 0, 1=way 1
     // bit[0]: right child → 0=way 2, 1=way 3
     var plru: logic<3> [SETS];
+
+    // Line-width data helpers: select / replace one 64-bit dword in a 512-bit
+    // cache line, and byte-enable-merge a store into a dword. Whole-line writes
+    // are read-modify-write (the SRAM has no sub-word write port); dynamic
+    // part-select is avoided in favor of an 8-way constant mux.
+    function rd_dword (
+        line: input logic<512>,
+        off : input logic<3>  ,
+    ) -> logic<64> {
+        return case off {
+            3'd0   : line[63:0],
+            3'd1   : line[127:64],
+            3'd2   : line[191:128],
+            3'd3   : line[255:192],
+            3'd4   : line[319:256],
+            3'd5   : line[383:320],
+            3'd6   : line[447:384],
+            3'd7   : line[511:448],
+            default: line[63:0],
+        };
+    }
+    function wr_dword (
+        line: input logic<512>,
+        off : input logic<3>  ,
+        dw  : input logic<64> ,
+    ) -> logic<512> {
+        return {
+            if off == 3'd7 ? dw : line[511:448],
+            if off == 3'd6 ? dw : line[447:384],
+            if off == 3'd5 ? dw : line[383:320],
+            if off == 3'd4 ? dw : line[319:256],
+            if off == 3'd3 ? dw : line[255:192],
+            if off == 3'd2 ? dw : line[191:128],
+            if off == 3'd1 ? dw : line[127:64],
+            if off == 3'd0 ? dw : line[63:0],
+        };
+    }
+    function merge_dword (
+        old: input logic<64>,
+        be : input logic<8> ,
+        nw : input logic<64>,
+    ) -> logic<64> {
+        return {
+            if be[7] ? nw[63:56] : old[63:56],
+            if be[6] ? nw[55:48] : old[55:48],
+            if be[5] ? nw[47:40] : old[47:40],
+            if be[4] ? nw[39:32] : old[39:32],
+            if be[3] ? nw[31:24] : old[31:24],
+            if be[2] ? nw[23:16] : old[23:16],
+            if be[1] ? nw[15:8] : old[15:8],
+            if be[0] ? nw[7:0] : old[7:0],
+        };
+    }
 
     // Cache lookup: per-way hit. P9.5: an uncached MMIO load never hits (it must
     // do a fresh single bus read and not alias a stale cached line), so suppress
@@ -316,10 +371,10 @@ pub module dcache #(
     let hit_way: logic<2> = if hit_0 ? 2'd0 : if hit_1 ? 2'd1 : if hit_2 ? 2'd2 : 2'd3;
 
     // Read data from hit way
-    let rdata_0: logic<64> = data_0[data_idx];
-    let rdata_1: logic<64> = data_1[data_idx];
-    let rdata_2: logic<64> = data_2[data_idx];
-    let rdata_3: logic<64> = data_3[data_idx];
+    let rdata_0: logic<64> = rd_dword(data_0[index], offset);
+    let rdata_1: logic<64> = rd_dword(data_1[index], offset);
+    let rdata_2: logic<64> = rd_dword(data_2[index], offset);
+    let rdata_3: logic<64> = rd_dword(data_3[index], offset);
 
     // State machine for line fill
     enum State: logic<2> {
@@ -344,7 +399,6 @@ pub module dcache #(
     // addresses through, so the wrapped order is safe end-to-end.
     let s14_cwf_en   : logic    = 1'b1;
     let fill_woff    : logic<3> = if s14_cwf_en ? fill_offset + fill_count : fill_count;
-    let fill_data_idx: logic<INDEX_W + 3>  = {fill_index, fill_woff};
 
     // P9.3 in-cache AMO: an AMO/LR read serves from an OWNED (E/M) hit; an S
     // hit must first be upgraded by an RFO fill of the same line (in place —
@@ -374,7 +428,6 @@ pub module dcache #(
     let next_offset   : logic<3>  = next_addr[5:3];
     let next_tag      : logic<TAG_W> = next_addr[63:INDEX_W + 6];
     let next_same_line: logic     = offset != 3'd7;
-    let next_data_idx : logic<INDEX_W + 3>  = {next_index, next_offset};
     let next_hit_0    : logic     = valid_0[next_index] && tags_0[next_index] == next_tag;
     let next_hit_1    : logic     = valid_1[next_index] && tags_1[next_index] == next_tag;
     let next_hit_2    : logic     = valid_2[next_index] && tags_2[next_index] == next_tag;
@@ -523,13 +576,13 @@ pub module dcache #(
     var vic_data: logic<64> [8];
     for l in 0..8 :gen_vic_data {
         assign vic_data[l] = if victim_way == 2'd0 ?
-            data_0[{f_index, l as 3}]
+            data_0[f_index][l*64 +: 64]
         : if victim_way == 2'd1 ?
-            data_1[{f_index, l as 3}]
+            data_1[f_index][l*64 +: 64]
         : if victim_way == 2'd2 ?
-            data_2[{f_index, l as 3}]
+            data_2[f_index][l*64 +: 64]
         :
-            data_3[{f_index, l as 3}]
+            data_3[f_index][l*64 +: 64]
         ;
     }
     // A dirty victim needs the writeback buffer; while it is busy the fill
@@ -619,13 +672,13 @@ pub module dcache #(
     var hitway_data: logic<64> [8];
     for l in 0..8 :gen_hitway_data {
         assign hitway_data[l] = if hit_0 ?
-            data_0[{index, l as 3}]
+            data_0[index][l*64 +: 64]
         : if hit_1 ?
-            data_1[{index, l as 3}]
+            data_1[index][l*64 +: 64]
         : if hit_2 ?
-            data_2[{index, l as 3}]
+            data_2[index][l*64 +: 64]
         :
-            data_3[{index, l as 3}]
+            data_3[index][l*64 +: 64]
         ;
     }
     // Misaligned-store hi line (i_addr+8).
@@ -634,13 +687,13 @@ pub module dcache #(
     var nexthit_data: logic<64> [8];
     for l in 0..8 :gen_nexthit_data {
         assign nexthit_data[l] = if next_hit_0 ?
-            data_0[{next_index, l as 3}]
+            data_0[next_index][l*64 +: 64]
         : if next_hit_1 ?
-            data_1[{next_index, l as 3}]
+            data_1[next_index][l*64 +: 64]
         : if next_hit_2 ?
-            data_2[{next_index, l as 3}]
+            data_2[next_index][l*64 +: 64]
         :
-            data_3[{next_index, l as 3}]
+            data_3[next_index][l*64 +: 64]
         ;
     }
     // A misaligned store whose touched line(s) are DIRTY detours them
@@ -666,13 +719,13 @@ pub module dcache #(
     var p_data: logic<64> [8];
     for l in 0..8 :gen_p_data {
         assign p_data[l] = if phit_0 ?
-            data_0[{p_index, l as 3}]
+            data_0[p_index][l*64 +: 64]
         : if phit_1 ?
-            data_1[{p_index, l as 3}]
+            data_1[p_index][l*64 +: 64]
         : if phit_2 ?
-            data_2[{p_index, l as 3}]
+            data_2[p_index][l*64 +: 64]
         :
-            data_3[{p_index, l as 3}]
+            data_3[p_index][l*64 +: 64]
         ;
     }
     // The probed line already sits in the writeback buffer (evicted, WB in
@@ -733,13 +786,13 @@ pub module dcache #(
     var fl_data: logic<64> [8];
     for l in 0..8 :gen_fl_data {
         assign fl_data[l] = if fl_way == 2'd0 ?
-            data_0[{fl_set, l as 3}]
+            data_0[fl_set][l*64 +: 64]
         : if fl_way == 2'd1 ?
-            data_1[{fl_set, l as 3}]
+            data_1[fl_set][l*64 +: 64]
         : if fl_way == 2'd2 ?
-            data_2[{fl_set, l as 3}]
+            data_2[fl_set][l*64 +: 64]
         :
-            data_3[{fl_set, l as 3}]
+            data_3[fl_set][l*64 +: 64]
         ;
     }
 
@@ -930,26 +983,18 @@ pub module dcache #(
                             :
                                 rdata_3
                             ;
-                            let merged: logic<64> = {
-                                if i_wstrb[7] ? i_wdata[63:56] : old[63:56],
-                                if i_wstrb[6] ? i_wdata[55:48] : old[55:48],
-                                if i_wstrb[5] ? i_wdata[47:40] : old[47:40],
-                                if i_wstrb[4] ? i_wdata[39:32] : old[39:32],
-                                if i_wstrb[3] ? i_wdata[31:24] : old[31:24],
-                                if i_wstrb[2] ? i_wdata[23:16] : old[23:16], if i_wstrb[1] ? i_wdata[15:8] : old[15:8],
-                                if i_wstrb[0] ? i_wdata[7:0] : old[7:0]
-                            };
+                            let merged: logic<64> = merge_dword(old, i_wstrb, i_wdata);
                             if hit_0 {
-                                data_0[data_idx] = merged;
+                                data_0[index] = wr_dword(data_0[index], offset, merged);
                             }
                             if hit_1 {
-                                data_1[data_idx] = merged;
+                                data_1[index] = wr_dword(data_1[index], offset, merged);
                             }
                             if hit_2 {
-                                data_2[data_idx] = merged;
+                                data_2[index] = wr_dword(data_2[index], offset, merged);
                             }
                             if hit_3 {
-                                data_3[data_idx] = merged;
+                                data_3[index] = wr_dword(data_3[index], offset, merged);
                             }
                         }
                         // P9.2: a write-through MISS needs no local action
@@ -970,48 +1015,33 @@ pub module dcache #(
                         :
                             rdata_3
                         ;
-                        let lmerged: logic<64> = {
-                            if i_wstrb[7] ? i_wdata[63:56] : lold[63:56],
-                            if i_wstrb[6] ? i_wdata[55:48] : lold[55:48],
-                            if i_wstrb[5] ? i_wdata[47:40] : lold[47:40],
-                            if i_wstrb[4] ? i_wdata[39:32] : lold[39:32],
-                            if i_wstrb[3] ? i_wdata[31:24] : lold[31:24],
-                            if i_wstrb[2] ? i_wdata[23:16] : lold[23:16], if i_wstrb[1] ? i_wdata[15:8] : lold[15:8],
-                            if i_wstrb[0] ? i_wdata[7:0] : lold[7:0]
-                        };
+                        let lmerged: logic<64> = merge_dword(lold, i_wstrb, i_wdata);
+                        // Zacas amocas.q also writes the HI dword (i_addr+8). 16-byte
+                        // aligned ⇒ same owned line, so dword offset+1 stays in-line.
+                        // Both dwords ride ONE whole-line write — a second write to
+                        // the same line element would last-write-wins and drop the lo.
+                        // (The two wr_dword calls go through a `let` so they are not
+                        // nested — a nested same-function call cannot be inlined.)
+                        let aq_off_hi: logic<3> = offset + 3'd1;
                         if hit_0 {
-                            data_0[data_idx] = lmerged;
-                            dirty_0[index]   = 1'b1;
+                            let base0: logic<512> = wr_dword(data_0[index], offset, lmerged);
+                            data_0[index]  = if i_wen_excl_q ? wr_dword(base0, aq_off_hi, i_wdata_hi) : base0;
+                            dirty_0[index] = 1'b1;
                         }
                         if hit_1 {
-                            data_1[data_idx] = lmerged;
-                            dirty_1[index]   = 1'b1;
+                            let base1: logic<512> = wr_dword(data_1[index], offset, lmerged);
+                            data_1[index]  = if i_wen_excl_q ? wr_dword(base1, aq_off_hi, i_wdata_hi) : base1;
+                            dirty_1[index] = 1'b1;
                         }
                         if hit_2 {
-                            data_2[data_idx] = lmerged;
-                            dirty_2[index]   = 1'b1;
+                            let base2: logic<512> = wr_dword(data_2[index], offset, lmerged);
+                            data_2[index]  = if i_wen_excl_q ? wr_dword(base2, aq_off_hi, i_wdata_hi) : base2;
+                            dirty_2[index] = 1'b1;
                         }
                         if hit_3 {
-                            data_3[data_idx] = lmerged;
-                            dirty_3[index]   = 1'b1;
-                        }
-                        // Zacas amocas.q: also write the HI dword into the adjacent
-                        // lane (i_addr+8). 16-byte aligned ⇒ same owned line, so
-                        // data_idx+1 stays in-line (no index/way change).
-                        if i_wen_excl_q {
-                            let hi_idx: logic<INDEX_W + 3> = data_idx + 1;
-                            if hit_0 {
-                                data_0[hi_idx] = i_wdata_hi;
-                            }
-                            if hit_1 {
-                                data_1[hi_idx] = i_wdata_hi;
-                            }
-                            if hit_2 {
-                                data_2[hi_idx] = i_wdata_hi;
-                            }
-                            if hit_3 {
-                                data_3[hi_idx] = i_wdata_hi;
-                            }
+                            let base3: logic<512> = wr_dword(data_3[index], offset, lmerged);
+                            data_3[index]  = if i_wen_excl_q ? wr_dword(base3, aq_off_hi, i_wdata_hi) : base3;
+                            dirty_3[index] = 1'b1;
                         }
                     }
                 }
@@ -1032,17 +1062,19 @@ pub module dcache #(
                     // line (same completion-edge fold as the P9.1 inv fix).
                     let inv_hits_done: logic = inv_fill_hit || (probe_act && p_fill_hit);
                     if i_memr_grant {
+                        // Per-beat RMW: drop dword fill_woff of this beat into the
+                        // line, accumulating across the 8-beat burst.
                         if fill_way == 2'd0 {
-                            data_0[fill_data_idx] = i_mem_rdata;
+                            data_0[fill_index] = wr_dword(data_0[fill_index], fill_woff, i_mem_rdata);
                         }
                         if fill_way == 2'd1 {
-                            data_1[fill_data_idx] = i_mem_rdata;
+                            data_1[fill_index] = wr_dword(data_1[fill_index], fill_woff, i_mem_rdata);
                         }
                         if fill_way == 2'd2 {
-                            data_2[fill_data_idx] = i_mem_rdata;
+                            data_2[fill_index] = wr_dword(data_2[fill_index], fill_woff, i_mem_rdata);
                         }
                         if fill_way == 2'd3 {
-                            data_3[fill_data_idx] = i_mem_rdata;
+                            data_3[fill_index] = wr_dword(data_3[fill_index], fill_woff, i_mem_rdata);
                         }
                         if fill_count == 3'd7 {
                             // Fill complete. If a remote invalidate hit this line
@@ -1096,39 +1128,39 @@ pub module dcache #(
             // block at the core level. No PLRU update (replacement-policy
             // only).
             if store_can_drain {
-                for l in 0..8 {
-                    if i_swstrb[l] != 8'd0 {
-                        let sold   : logic<64> = if shit_0 ?
-                            data_0[{sindex, l as 3}]
-                        : if shit_1 ?
-                            data_1[{sindex, l as 3}]
-                        : if shit_2 ?
-                            data_2[{sindex, l as 3}]
-                        :
-                            data_3[{sindex, l as 3}]
-                        ;
-                        let smerged: logic<64> = {
-                            if i_swstrb[l][7] ? i_swdata[l][63:56] : sold[63:56],
-                            if i_swstrb[l][6] ? i_swdata[l][55:48] : sold[55:48],
-                            if i_swstrb[l][5] ? i_swdata[l][47:40] : sold[47:40],
-                            if i_swstrb[l][4] ? i_swdata[l][39:32] : sold[39:32],
-                            if i_swstrb[l][3] ? i_swdata[l][31:24] : sold[31:24],
-                            if i_swstrb[l][2] ? i_swdata[l][23:16] : sold[23:16], if i_swstrb[l][1] ? i_swdata[l][15:8] : sold[15:8],
-                            if i_swstrb[l][0] ? i_swdata[l][7:0] : sold[7:0]
-                        };
-                        if shit_0 {
-                            data_0[{sindex, l as 3}] = smerged;
-                        }
-                        if shit_1 {
-                            data_1[{sindex, l as 3}] = smerged;
-                        }
-                        if shit_2 {
-                            data_2[{sindex, l as 3}] = smerged;
-                        }
-                        if shit_3 {
-                            data_3[{sindex, l as 3}] = smerged;
-                        }
-                    }
+                // Build the whole merged line combinationally (each populated lane
+                // byte-merges, the rest pass through), then one line write per hit
+                // way — the SRAM has no sub-word write port.
+                let s_old_line: logic<512> = if shit_0 ?
+                    data_0[sindex]
+                : if shit_1 ?
+                    data_1[sindex]
+                : if shit_2 ?
+                    data_2[sindex]
+                :
+                    data_3[sindex]
+                ;
+                let new_s_line: logic<512> = {
+                    if i_swstrb[7] != 8'd0 ? merge_dword(s_old_line[511:448], i_swstrb[7], i_swdata[7]) : s_old_line[511:448],
+                    if i_swstrb[6] != 8'd0 ? merge_dword(s_old_line[447:384], i_swstrb[6], i_swdata[6]) : s_old_line[447:384],
+                    if i_swstrb[5] != 8'd0 ? merge_dword(s_old_line[383:320], i_swstrb[5], i_swdata[5]) : s_old_line[383:320],
+                    if i_swstrb[4] != 8'd0 ? merge_dword(s_old_line[319:256], i_swstrb[4], i_swdata[4]) : s_old_line[319:256],
+                    if i_swstrb[3] != 8'd0 ? merge_dword(s_old_line[255:192], i_swstrb[3], i_swdata[3]) : s_old_line[255:192],
+                    if i_swstrb[2] != 8'd0 ? merge_dword(s_old_line[191:128], i_swstrb[2], i_swdata[2]) : s_old_line[191:128],
+                    if i_swstrb[1] != 8'd0 ? merge_dword(s_old_line[127:64], i_swstrb[1], i_swdata[1]) : s_old_line[127:64],
+                    if i_swstrb[0] != 8'd0 ? merge_dword(s_old_line[63:0], i_swstrb[0], i_swdata[0]) : s_old_line[63:0]
+                };
+                if shit_0 {
+                    data_0[sindex] = new_s_line;
+                }
+                if shit_1 {
+                    data_1[sindex] = new_s_line;
+                }
+                if shit_2 {
+                    data_2[sindex] = new_s_line;
+                }
+                if shit_3 {
+                    data_3[sindex] = new_s_line;
                 }
                 if shit_0 {
                     dirty_0[sindex] = 1'b1;
@@ -1390,22 +1422,22 @@ pub module dcache #(
     // o_rdata_next_miss = a read is active and the next dword's line is not
     // cached (informational; the hi_miss path already stalls cross-line loads).
     let next_rdata_same : logic<64> = if hit_0 ?
-        data_0[next_data_idx]
+        rd_dword(data_0[next_index], next_offset)
     : if hit_1 ?
-        data_1[next_data_idx]
+        rd_dword(data_1[next_index], next_offset)
     : if hit_2 ?
-        data_2[next_data_idx]
+        rd_dword(data_2[next_index], next_offset)
     :
-        data_3[next_data_idx]
+        rd_dword(data_3[next_index], next_offset)
     ;
     let next_rdata_xline: logic<64> = if next_hit_0 ?
-        data_0[next_data_idx]
+        rd_dword(data_0[next_index], next_offset)
     : if next_hit_1 ?
-        data_1[next_data_idx]
+        rd_dword(data_1[next_index], next_offset)
     : if next_hit_2 ?
-        data_2[next_data_idx]
+        rd_dword(data_2[next_index], next_offset)
     :
-        data_3[next_data_idx]
+        rd_dword(data_3[next_index], next_offset)
     ;
     assign o_rdata_next      = if next_same_line ? next_rdata_same : next_rdata_xline;
     assign o_rdata_next_miss = i_ren && (if next_same_line ? !cache_hit : !next_line_hit);
@@ -1504,15 +1536,14 @@ pub module dcache #(
     assign o_data_valid = cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant);
 
     // Re-read filled data at original miss offset (valid during DONE)
-    let fill_rdata_idx: logic<INDEX_W + 3> = {fill_index, fill_offset};
     assign o_fill_rdata = if fill_way == 2'd0 ?
-        data_0[fill_rdata_idx]
+        rd_dword(data_0[fill_index], fill_offset)
     : if fill_way == 2'd1 ?
-        data_1[fill_rdata_idx]
+        rd_dword(data_1[fill_index], fill_offset)
     : if fill_way == 2'd2 ?
-        data_2[fill_rdata_idx]
+        rd_dword(data_2[fill_index], fill_offset)
     :
-        data_3[fill_rdata_idx]
+        rd_dword(data_3[fill_index], fill_offset)
     ;
 
     // ============================================================
@@ -1522,7 +1553,6 @@ pub module dcache #(
     let tag2      : logic<TAG_W> = i_addr2[63:INDEX_W + 6];
     let index2    : logic<INDEX_W> = i_addr2[INDEX_W + 5:6];
     let offset2   : logic<3>  = i_addr2[5:3];
-    let data_idx2 : logic<INDEX_W + 3>  = {index2, offset2};
     // Phase 8 S10.2 (hit-under-miss): mid-FILL the victim way (fill_way at
     // fill_index) still carries its OLD tag + valid while its DATA words are
     // being overwritten — a port-2 hit on that way would return corrupted
@@ -1537,10 +1567,10 @@ pub module dcache #(
     let hit2_2    : logic     = valid_2[index2] && tags_2[index2] == tag2 && !(fill_busy2 && fill_way == 2'd2);
     let hit2_3    : logic     = valid_3[index2] && tags_3[index2] == tag2 && !(fill_busy2 && fill_way == 2'd3);
     let cache_hit2: logic     = hit2_0 || hit2_1 || hit2_2 || hit2_3;
-    let rdata2_0  : logic<64> = data_0[data_idx2];
-    let rdata2_1  : logic<64> = data_1[data_idx2];
-    let rdata2_2  : logic<64> = data_2[data_idx2];
-    let rdata2_3  : logic<64> = data_3[data_idx2];
+    let rdata2_0  : logic<64> = rd_dword(data_0[index2], offset2);
+    let rdata2_1  : logic<64> = rd_dword(data_1[index2], offset2);
+    let rdata2_2  : logic<64> = rd_dword(data_2[index2], offset2);
+    let rdata2_3  : logic<64> = rd_dword(data_3[index2], offset2);
     assign o_rdata2 = if hit2_0 ? rdata2_0 : if hit2_1 ? rdata2_1 : if hit2_2 ? rdata2_2 : rdata2_3;
     // Next-dword for a misaligned 2-dword 2nd load (mirror of o_rdata_next).
     let next_addr2     : logic<64> = {i_addr2[63:3], 3'b000} + 64'd8;
@@ -1548,7 +1578,6 @@ pub module dcache #(
     let next_offset2   : logic<3>  = next_addr2[5:3];
     let next_tag2      : logic<TAG_W> = next_addr2[63:INDEX_W + 6];
     let next_same_line2: logic     = offset2 != 3'd7;
-    let next_data_idx2 : logic<INDEX_W + 3>  = {next_index2, next_offset2};
     // S10.2: same victim-way exclusion for the next-line hit (cross-dword span).
     let fill_busy2_next: logic     = filling && fill_index == next_index2;
     let next_hit2_0    : logic     = valid_0[next_index2] && tags_0[next_index2] == next_tag2 && !(fill_busy2_next && fill_way == 2'd0);
@@ -1557,22 +1586,22 @@ pub module dcache #(
     let next_hit2_3    : logic     = valid_3[next_index2] && tags_3[next_index2] == next_tag2 && !(fill_busy2_next && fill_way == 2'd3);
     let next_line_hit2 : logic     = next_hit2_0 || next_hit2_1 || next_hit2_2 || next_hit2_3;
     let next_rdata2_same : logic<64> = if hit2_0 ?
-        data_0[next_data_idx2]
+        rd_dword(data_0[next_index2], next_offset2)
     : if hit2_1 ?
-        data_1[next_data_idx2]
+        rd_dword(data_1[next_index2], next_offset2)
     : if hit2_2 ?
-        data_2[next_data_idx2]
+        rd_dword(data_2[next_index2], next_offset2)
     :
-        data_3[next_data_idx2]
+        rd_dword(data_3[next_index2], next_offset2)
     ;
     let next_rdata2_xline: logic<64> = if next_hit2_0 ?
-        data_0[next_data_idx2]
+        rd_dword(data_0[next_index2], next_offset2)
     : if next_hit2_1 ?
-        data_1[next_data_idx2]
+        rd_dword(data_1[next_index2], next_offset2)
     : if next_hit2_2 ?
-        data_2[next_data_idx2]
+        rd_dword(data_2[next_index2], next_offset2)
     :
-        data_3[next_data_idx2]
+        rd_dword(data_3[next_index2], next_offset2)
     ;
     assign o_rdata2_next = if next_same_line2 ? next_rdata2_same : next_rdata2_xline;
     // Hit iff the lo line is cached AND (no span / span in same line / next line
