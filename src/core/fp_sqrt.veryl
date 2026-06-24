@@ -1,6 +1,8 @@
 // IEEE 754 double-precision floating-point square root
-// Multi-cycle FSM wrapper around the combinational math (preserves bit-exactness).
-// Latency: 1 (capture) + 55 (RUN) + 1 (DONE) = 57 cycles from i_valid to o_valid.
+// True iterative digit-by-digit sqrt: one result bit per RUN cycle, so the
+// combinational path is a single 64-bit compare/subtract instead of the former
+// 56-deep unrolled chain. Bit-exact and same 57-cycle latency as before.
+// Latency: 1 (capture + normalize + iter 0) + 55 (RUN, iters 1..55) + 1 (DONE) = 57.
 pub module fp_sqrt (
     clk: input clock,
     rst: input reset,
@@ -21,29 +23,46 @@ pub module fp_sqrt (
         DONE = 2'd2,
     }
 
-    var state    : State    ;
-    var count    : logic<6> ;
-    var latched_a: logic<64>;
-    var latched_m: logic<3> ;
+    var state    : State   ;
+    var count    : logic<6>;
+    var latched_m: logic<3>;
+
+    // Operand-derived state captured at IDLE and held stable through RUN/DONE.
+    var reg_r_exp         : logic<13>;
+    var reg_is_special    : logic    ;
+    var reg_special_result: logic<64>;
+    var reg_special_fflags: logic<5> ;
+
+    // Iteration state, advanced one digit per RUN cycle.
+    var it_q  : logic<56>; // running result digits
+    var it_rem: logic<64>; // running remainder
+    var it_rad: logic<56>; // radicand shift register (2 bits consumed per step)
 
     assign o_busy = state != State::IDLE;
 
     const RUN_LAST: logic<6> = 6'd54;
 
     // ====================================================================
-    // Combinational sqrt math operating on LATCHED operand — unchanged.
+    // Setup: unpack/classify the live operand, normalize, form the radicand
+    // and result exponent, and perform the FIRST sqrt iteration. Combinational
+    // off i_a; sampled into the reg_*/it_* registers when IDLE accepts a job.
     // ====================================================================
-    var comb_result: logic<64>;
-    var comb_fflags: logic<5> ;
+    var su_is_special    : logic    ;
+    var su_special_result: logic<64>;
+    var su_special_fflags: logic<5> ;
+    var su_r_exp         : logic<13>;
+    var su_q             : logic<56>;
+    var su_rem           : logic<64>;
+    var su_rad           : logic<56>;
 
     always_comb {
         var sa: logic    ;
         var ea: logic<11>;
         var ma: logic<52>;
 
-        sa = latched_a[63];
-        ea = latched_a[62:52];
-        ma = latched_a[51:0];
+        sa = i_a[63];
+        ea = i_a[62:52];
+        ma = i_a[51:0];
 
         var a_is_zero: logic;
         var a_is_inf : logic;
@@ -57,22 +76,31 @@ pub module fp_sqrt (
         a_is_snan = a_is_nan && ma[51] == 1'b0;
         a_is_sub  = ea == 11'd0 && ma != 52'd0;
 
-        comb_result = 64'd0;
-        comb_fflags = 5'd0;
+        su_is_special     = 1'b0;
+        su_special_result = 64'd0;
+        su_special_fflags = 5'd0;
+        su_r_exp          = 13'd0;
+        su_q              = 56'd0;
+        su_rem            = 64'd0;
+        su_rad            = 56'd0;
 
         if a_is_nan {
-            comb_result = 64'h7FF8_0000_0000_0000;
+            su_is_special     = 1'b1;
+            su_special_result = 64'h7FF8_0000_0000_0000;
             if a_is_snan {
-                comb_fflags = 5'b10000;
+                su_special_fflags = 5'b10000;
             }
         } else if sa && !a_is_zero {
             // sqrt(negative) = NaN
-            comb_result = 64'h7FF8_0000_0000_0000;
-            comb_fflags = 5'b10000;
+            su_is_special     = 1'b1;
+            su_special_result = 64'h7FF8_0000_0000_0000;
+            su_special_fflags = 5'b10000;
         } else if a_is_inf {
-            comb_result = {1'b0, 11'h7FF, 52'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {1'b0, 11'h7FF, 52'd0};
         } else if a_is_zero {
-            comb_result = {sa, 63'd0};
+            su_is_special     = 1'b1;
+            su_special_result = {sa, 63'd0};
         } else {
             // Normal/subnormal positive value
             var ea_eff: logic<13>;
@@ -141,38 +169,46 @@ pub module fp_sqrt (
                     r_exp = unbiased / 13'd2 + 13'd1023;
                 }
             }
+            su_r_exp = r_exp;
 
-            // Digit-by-digit square root algorithm
-            // For each iteration: process 2 bits of radicand, produce 1 bit of result
-            // 56 iterations → 56-bit result
-            // Use shift register for sequential bit extraction
-            var q        : logic<56>;
-            var rem      : logic<64>;
-            var rad_shift: logic<56>; // shift register for radicand bits
-            q         = 56'd0;
-            rem       = 64'd0;
-            rad_shift = radicand_hi;
-
-            for _i in 0..56 {
-                // Get next 2 bits from shift register (MSB first)
-                var rad_bits : logic<2>;
-                rad_bits  = rad_shift[55:54];
-                rad_shift = {rad_shift[53:0], 2'b00};
-
-                // Shift remainder left by 2 and append radicand bits
-                rem = {rem[61:0], rad_bits};
-
-                // Trial subtraction: (q << 2) | 1
-                var trial: logic<64>;
-                trial = {6'd0, q, 2'b01};
-
-                if rem >= trial {
-                    rem = rem - trial;
-                    q   = {q[54:0], 1'b1};
-                } else {
-                    q = {q[54:0], 1'b0};
-                }
+            // Digit-by-digit square root, first iteration (q=0, rem=0,
+            // rad_shift=radicand_hi). Each step processes 2 radicand bits and
+            // produces 1 result bit; 56 steps total (this one + 55 in RUN).
+            // rad_bits = radicand_hi[55:54]; rem = {62'd0, rad_bits};
+            // trial = {6'd0, q=0, 2'b01} = 64'd1.
+            su_rad = {radicand_hi[53:0], 2'b00};
+            if {62'd0, radicand_hi[55:54]} >= 64'd1 {
+                su_rem = {62'd0, radicand_hi[55:54]} - 64'd1;
+                su_q   = 56'd1;
+            } else {
+                su_rem = {62'd0, radicand_hi[55:54]};
+                su_q   = 56'd0;
             }
+        }
+    }
+
+    // ====================================================================
+    // Finalize: assemble the rounded result from the final result digits /
+    // remainder. Combinational off the iteration/setup registers; sampled
+    // into o_result in DONE.
+    // ====================================================================
+    var fin_result: logic<64>;
+    var fin_fflags: logic<5> ;
+
+    always_comb {
+        fin_result = 64'd0;
+        fin_fflags = 5'd0;
+
+        if reg_is_special {
+            fin_result = reg_special_result;
+            fin_fflags = reg_special_fflags;
+        } else {
+            var q    : logic<56>;
+            var rem  : logic<64>;
+            var r_exp: logic<13>;
+            q     = it_q;
+            rem   = it_rem;
+            r_exp = reg_r_exp;
 
             // q now has 56 bits of sqrt result
             // q[55] should be 1 for normalized result
@@ -226,8 +262,8 @@ pub module fp_sqrt (
             }
             // 54-bit so a round-up overflowing the 53-bit significand bumps the
             // exponent (the old 53-bit add dropped that carry — cf. fp_sqrt_s).
-            var rounded : logic<54>;
-            rounded  = {1'b0, sq_mant[55:3]} + {53'd0, round_up};
+            var rounded: logic<54>;
+            rounded = {1'b0, sq_mant[55:3]} + {53'd0, round_up};
             if rounded[53] {
                 r_exp = r_exp + 13'd1;
             }
@@ -235,32 +271,39 @@ pub module fp_sqrt (
             nx = g || r || s;
 
             if r_exp >= 13'd2047 {
-                comb_result = {1'b0, 11'h7FF, 52'd0};
-                comb_fflags = 5'b00101;
+                fin_result = {1'b0, 11'h7FF, 52'd0};
+                fin_fflags = 5'b00101;
             } else {
-                comb_result = {1'b0, r_exp[10:0], rounded[51:0]};
+                fin_result = {1'b0, r_exp[10:0], rounded[51:0]};
                 if nx {
-                    comb_fflags = 5'b00001;
+                    fin_fflags = 5'b00001;
                 }
                 if r_exp == 13'd0 && nx {
-                    comb_fflags = 5'b00011;
+                    fin_fflags = 5'b00011;
                 }
             }
         }
     }
 
     // ====================================================================
-    // FSM: sequences the multi-cycle result presentation.
+    // FSM: capture + normalize + iter 0 (IDLE), one sqrt iteration per RUN
+    // cycle, present the result (DONE).
     // ====================================================================
     always_ff (clk, rst) {
         if_reset {
-            state     = State::IDLE;
-            count     = '0;
-            latched_a = '0;
-            latched_m = '0;
-            o_result  = '0;
-            o_fflags  = '0;
-            o_valid   = 1'b0;
+            state              = State::IDLE;
+            count              = '0;
+            latched_m          = '0;
+            reg_r_exp          = '0;
+            reg_is_special     = '0;
+            reg_special_result = '0;
+            reg_special_fflags = '0;
+            it_q               = '0;
+            it_rem             = '0;
+            it_rad             = '0;
+            o_result           = '0;
+            o_fflags           = '0;
+            o_valid            = 1'b0;
         } else if i_flush {
             state   = State::IDLE;
             count   = '0;
@@ -271,13 +314,30 @@ pub module fp_sqrt (
             case state {
                 State::IDLE: {
                     if i_valid {
-                        latched_a = i_a;
-                        latched_m = i_rm;
-                        count     = '0;
-                        state     = State::RUN;
+                        latched_m          = i_rm;
+                        reg_r_exp          = su_r_exp;
+                        reg_is_special     = su_is_special;
+                        reg_special_result = su_special_result;
+                        reg_special_fflags = su_special_fflags;
+                        it_q               = su_q;
+                        it_rem             = su_rem;
+                        it_rad             = su_rad;
+                        count              = '0;
+                        state              = State::RUN;
                     }
                 }
                 State::RUN: {
+                    // One digit-by-digit iteration. trial = (q << 2) | 1;
+                    // the remainder takes the next 2 radicand bits (the top of
+                    // it_rad, which is shifted out AFTER it is consumed here).
+                    if {it_rem[61:0], it_rad[55:54]} >= {6'd0, it_q, 2'b01} {
+                        it_rem = {it_rem[61:0], it_rad[55:54]} - {6'd0, it_q, 2'b01};
+                        it_q   = {it_q[54:0], 1'b1};
+                    } else {
+                        it_rem = {it_rem[61:0], it_rad[55:54]};
+                        it_q   = {it_q[54:0], 1'b0};
+                    }
+                    it_rad = {it_rad[53:0], 2'b00};
                     if count == RUN_LAST {
                         state = State::DONE;
                     } else {
@@ -285,8 +345,8 @@ pub module fp_sqrt (
                     }
                 }
                 State::DONE: {
-                    o_result = comb_result;
-                    o_fflags = comb_fflags;
+                    o_result = fin_result;
+                    o_fflags = fin_fflags;
                     o_valid  = 1'b1;
                     state    = State::IDLE;
                 }
