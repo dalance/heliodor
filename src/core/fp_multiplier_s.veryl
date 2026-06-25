@@ -1,6 +1,13 @@
 // IEEE 754 single-precision floating-point multiplier
-// Combinational. Handles normals, subnormals, zeros, infinities, NaNs.
-pub module fp_multiplier_s (
+// Handles normals, subnormals, zeros, infinities, NaNs.
+// PIPE: 0 = combinational (legacy, byte-identical); 1 = 2-stage (result valid N+1).
+// The datapath is cut after the 24x24 product (stage 1) / before normalize+round
+// (stage 2); PIPE=0 bypasses the midpoint register → identical combinational result.
+pub module fp_multiplier_s #(
+    param PIPE: u32 = 0,
+) (
+    clk     : input  clock     ,
+    rst     : input  reset     ,
     i_a     : input  logic<32>,
     i_b     : input  logic<32>,
     i_rm    : input  logic<3> ,
@@ -8,8 +15,6 @@ pub module fp_multiplier_s (
     o_fflags: output logic<5> ,
 ) {
     import fpu_pkg::*;
-    var result: logic<32>;
-    var fflags: logic<5> ;
 
     // Overflow result per rounding mode (IEEE/RISC-V): RNE/RMM -> inf,
     // RTZ -> max normal, RDN -> +max/-inf, RUP -> +inf/-max.
@@ -29,13 +34,20 @@ pub module fp_multiplier_s (
         return r;
     }
 
+    // ===== Stage 1: unpack / classify / special-case resolve / 24x24 multiply =====
+    var s1_done: logic    ;
+    var s1_res : logic<32>;
+    var s1_ffl : logic<5> ;
+    var s1_prod: logic<48>; // 48-bit product (normal path)
+    var s1_esum: logic<11>; // {1'b0,ea_eff}+{1'b0,eb_eff} (normal path)
+    var s1_sign: logic    ;
     always_comb {
-        var sa    : logic    ;
-        var ea    : logic<8> ;
-        var ma    : logic<23>;
-        var sb    : logic    ;
-        var eb    : logic<8> ;
-        var mb    : logic<23>;
+        var sa: logic    ;
+        var ea: logic<8> ;
+        var ma: logic<23>;
+        var sb: logic    ;
+        var eb: logic<8> ;
+        var mb: logic<23>;
         sa     = i_a[31];
         ea     = i_a[30:23];
         ma     = i_a[22:0];
@@ -66,83 +78,129 @@ pub module fp_multiplier_s (
         a_is_sub  = ea == 8'd0 && ma != 23'd0;
         b_is_sub  = eb == 8'd0 && mb != 23'd0;
 
+        var ea_eff: logic<10>;
+        var eb_eff: logic<10>;
+        if a_is_sub {
+            ea_eff = 10'd1;
+        } else {
+            ea_eff = {2'd0, ea};
+        }
+        if b_is_sub {
+            eb_eff = 10'd1;
+        } else {
+            eb_eff = {2'd0, eb};
+        }
+        var sig_a: logic<24>;
+        var sig_b: logic<24>;
+        if a_is_sub {
+            sig_a = {1'b0, ma};
+        } else {
+            sig_a = {1'b1, ma};
+        }
+        if b_is_sub {
+            sig_b = {1'b0, mb};
+        } else {
+            sig_b = {1'b1, mb};
+        }
+
+        // 24x24 → 48-bit product using 48-bit partial products
+        var wide_a : logic<48>;
+        var wide_b : logic<48>;
+        wide_a  = {24'd0, sig_a};
+        wide_b  = {24'd0, sig_b};
+        var product: logic<48>;
+        product = wide_a * wide_b;
+
+        // Stage-1 outputs to the midpoint
+        s1_prod = product;
+        s1_esum = {1'b0, ea_eff} + {1'b0, eb_eff};
+        s1_sign = r_sign;
+        s1_done = 1'b0;
+        s1_res  = 32'd0;
+        s1_ffl  = 5'd0;
+
+        if a_is_nan || b_is_nan {
+            s1_done = 1'b1;
+            s1_res  = 32'h7FC00000;
+            if a_is_snan || b_is_snan {
+                s1_ffl = 5'b10000;
+            }
+        } else if a_is_inf || b_is_inf {
+            s1_done = 1'b1;
+            if (a_is_inf && b_is_zero) || (b_is_inf && a_is_zero) {
+                s1_res = 32'h7FC00000;
+                s1_ffl = 5'b10000;
+            } else {
+                s1_res = {r_sign, 8'hFF, 23'd0};
+            }
+        } else if a_is_zero || b_is_zero {
+            s1_done = 1'b1;
+            s1_res  = {r_sign, 31'd0};
+        } else {
+            s1_done = 1'b0; // normal/subnormal: stage 2
+        }
+    }
+
+    // ===== Midpoint register (cut) + PIPE=0 bypass =====
+    var s1_done_q: logic    ;
+    var s1_res_q : logic<32>;
+    var s1_ffl_q : logic<5> ;
+    var s1_prod_q: logic<48>;
+    var s1_esum_q: logic<11>;
+    var s1_sign_q: logic    ;
+    var s1_rm_q  : logic<3> ;
+    always_ff (clk, rst) {
+        if_reset {
+            s1_done_q = 1'b0;
+            s1_res_q  = 32'd0;
+            s1_ffl_q  = 5'd0;
+            s1_prod_q = 48'd0;
+            s1_esum_q = 11'd0;
+            s1_sign_q = 1'b0;
+            s1_rm_q   = 3'd0;
+        } else {
+            s1_done_q = s1_done;
+            s1_res_q  = s1_res;
+            s1_ffl_q  = s1_ffl;
+            s1_prod_q = s1_prod;
+            s1_esum_q = s1_esum;
+            s1_sign_q = s1_sign;
+            s1_rm_q   = i_rm;
+        }
+    }
+    let s1_done_sel: logic    = if PIPE == 1 ? s1_done_q : s1_done;
+    let s1_res_sel : logic<32> = if PIPE == 1 ? s1_res_q : s1_res;
+    let s1_ffl_sel : logic<5>  = if PIPE == 1 ? s1_ffl_q : s1_ffl;
+    let s1_prod_sel: logic<48> = if PIPE == 1 ? s1_prod_q : s1_prod;
+    let s1_esum_sel: logic<11> = if PIPE == 1 ? s1_esum_q : s1_esum;
+    let s1_sign_sel: logic     = if PIPE == 1 ? s1_sign_q : s1_sign;
+    let s1_rm_sel  : logic<3>  = if PIPE == 1 ? s1_rm_q : i_rm;
+
+    // ===== Stage 2: normalize + round =====
+    var result: logic<32>;
+    var fflags: logic<5> ;
+    always_comb {
         result = 32'd0;
         fflags = 5'd0;
 
-        if a_is_nan || b_is_nan {
-            result = 32'h7FC00000;
-            if a_is_snan || b_is_snan {
-                fflags = 5'b10000;
-            }
-        } else if a_is_inf || b_is_inf {
-            if (a_is_inf && b_is_zero) || (b_is_inf && a_is_zero) {
-                result = 32'h7FC00000;
-                fflags = 5'b10000;
-            } else {
-                result = {r_sign, 8'hFF, 23'd0};
-            }
-        } else if a_is_zero || b_is_zero {
-            result = {r_sign, 31'd0};
+        if s1_done_sel {
+            result = s1_res_sel;
+            fflags = s1_ffl_sel;
         } else {
-            var ea_eff: logic<10>;
-            var eb_eff: logic<10>;
-            if a_is_sub {
-                ea_eff = 10'd1;
-            } else {
-                ea_eff = {2'd0, ea};
-            }
-            if b_is_sub {
-                eb_eff = 10'd1;
-            } else {
-                eb_eff = {2'd0, eb};
-            }
-            var sig_a: logic<24>;
-            var sig_b: logic<24>;
-            if a_is_sub {
-                sig_a = {1'b0, ma};
-            } else {
-                sig_a = {1'b1, ma};
-            }
-            if b_is_sub {
-                sig_b = {1'b0, mb};
-            } else {
-                sig_b = {1'b1, mb};
-            }
-
-            // 24x24 → 48-bit product using 32-bit partial products
-            var wide_a : logic<48>;
-            var wide_b : logic<48>;
-            wide_a  = {24'd0, sig_a};
-            wide_b  = {24'd0, sig_b};
-            var product: logic<48>;
-            product = wide_a * wide_b;
-
-            // Normalize full 48-bit product so leading 1 lands at
-            // bit 47. lead_shift = 48 is the sentinel for "no bit
-            // found" (product == 0, which can't happen here because
-            // zero operands are handled above).
-            let lz48: logic<9> = clz::<48>(product);
+            // Normalize full 48-bit product so leading 1 lands at bit 47.
+            let lz48: logic<9> = clz::<48>(s1_prod_sel);
             var lead_shift: logic<6>;
             lead_shift = lz48[5:0];
             if lead_shift == 6'd48 {
                 lead_shift = 6'd47;
             }
             var prod_norm: logic<48>;
-            prod_norm = product << lead_shift;
-            // exp = ea+eb-127+1 (treat significand as 1.xx × 2^47)
-            //       - lead_shift (we shifted leading from some bit
-            //       into bit 47 which counts as one "extra" 2^0).
-            // Width-11 so the biased result exponent stays representable as a
-            // SIGNED value: it ranges from ~-171 (deep underflow) to +636
-            // (overflow). A width-10 unsigned value wrapped negative exponents
-            // to large positives, so the `<= 0` underflow test below missed
-            // them and they fell through to the overflow path (→ ∞ instead of
-            // flush-to-zero). Detect underflow with a signed compare.
+            prod_norm = s1_prod_sel << lead_shift;
+            // exp = ea+eb-127+1 - lead_shift; width-11 signed (see legacy comment).
             var r_exp: logic<11>;
-            r_exp = {1'b0, ea_eff} + {1'b0, eb_eff} - 11'd126 - {5'd0, lead_shift};
+            r_exp = s1_esum_sel - 11'd126 - {5'd0, lead_shift};
 
-            // Extract 27 bits for mantissa + GRS: bits [47:21]
-            // with the remaining [20:0] folded into sticky.
+            // Extract 27 bits for mantissa + GRS: bits [47:21] + sticky [20:0].
             var norm_m     : logic<27>;
             norm_m      = prod_norm[47:21];
             var prod_sticky: logic;
@@ -161,7 +219,7 @@ pub module fp_multiplier_s (
                 } else {
                     sc = ss[4:0];
                 }
-                var st         : logic;
+                var st: logic;
                 st          = (norm_m & ((27'd1 << sc) - 27'd1)) != 27'd0;
                 final_m     = norm_m >> sc;
                 final_m     = {final_m[26:1], final_m[0] | st | prod_sticky};
@@ -173,35 +231,35 @@ pub module fp_multiplier_s (
                 prod_sticky = 1'b0;
             }
 
-            var g       : logic;
-            var r       : logic;
-            var s       : logic;
-            var bit_lsb : logic;
-            g        = final_m[2];
-            r        = final_m[1];
-            s        = final_m[0];
-            bit_lsb  = final_m[3];
+            var g      : logic;
+            var r      : logic;
+            var s      : logic;
+            var bit_lsb: logic;
+            g       = final_m[2];
+            r       = final_m[1];
+            s       = final_m[0];
+            bit_lsb = final_m[3];
             var round_up: logic;
-            case i_rm {
+            case s1_rm_sel {
                 3'b000 : round_up = g && (r || s || bit_lsb);
                 3'b001 : round_up = 1'b0;
-                3'b010 : round_up = r_sign && (g || r || s);
-                3'b011 : round_up = !r_sign && (g || r || s);
+                3'b010 : round_up = s1_sign_sel && (g || r || s);
+                3'b011 : round_up = !s1_sign_sel && (g || r || s);
                 3'b100 : round_up = g;
                 default: round_up = g && (r || s || bit_lsb);
             }
-            var rounded : logic<24>;
-            rounded  = final_m[26:3] + {23'd0, round_up};
+            var rounded: logic<24>;
+            rounded = final_m[26:3] + {23'd0, round_up};
             if rounded[23] && !final_m[26] {
                 final_e = final_e + 10'd1;
             }
             var nx: logic;
             nx = g || r || s;
             if final_e >= 10'd255 {
-                result = ovf_s(i_rm, r_sign);
+                result = ovf_s(s1_rm_sel, s1_sign_sel);
                 fflags = 5'b00101;
             } else {
-                result = {r_sign, final_e[7:0], rounded[22:0]};
+                result = {s1_sign_sel, final_e[7:0], rounded[22:0]};
                 if nx {
                     fflags = 5'b00001;
                 }
@@ -211,6 +269,7 @@ pub module fp_multiplier_s (
             }
         }
     }
+
     assign o_result = result;
     assign o_fflags = fflags;
 }

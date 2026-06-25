@@ -1,6 +1,13 @@
 // IEEE 754 double-precision floating-point multiplier
-// Combinational (single-cycle). Handles normals, subnormals, zeros, infinities, NaNs.
-pub module fp_multiplier (
+// Handles normals, subnormals, zeros, infinities, NaNs.
+// PIPE: 0 = combinational (legacy, byte-identical); 1 = 2-stage (result valid N+1).
+// The datapath is cut after the 53x53 product (stage 1) / before normalize+round
+// (stage 2); PIPE=0 bypasses the midpoint register → identical combinational result.
+pub module fp_multiplier #(
+    param PIPE: u32 = 0,
+) (
+    clk     : input  clock     ,
+    rst     : input  reset     ,
     i_a     : input  logic<64>,
     i_b     : input  logic<64>,
     i_rm    : input  logic<3> , // rounding mode
@@ -8,8 +15,6 @@ pub module fp_multiplier (
     o_fflags: output logic<5> , // {NV, DZ, OF, UF, NX}
 ) {
     import fpu_pkg::*;
-    var result: logic<64>;
-    var fflags: logic<5> ;
 
     // Overflow result per rounding mode (IEEE/RISC-V): RNE/RMM -> inf,
     // RTZ -> max normal, RDN -> +max/-inf, RUP -> +inf/-max.
@@ -49,6 +54,13 @@ pub module fp_multiplier (
         return ru;
     }
 
+    // ===== Stage 1: unpack / classify / special-case resolve / 53x53 multiply =====
+    var s1_done: logic     ; // result fully resolved here (special case)
+    var s1_res : logic<64> ; // resolved result (valid when s1_done)
+    var s1_ffl : logic<5>  ; // resolved fflags (valid when s1_done)
+    var s1_prod: logic<106>; // 106-bit product (normal path)
+    var s1_esum: logic<13> ; // ea_eff + eb_eff (normal path)
+    var s1_sign: logic     ; // result sign
     always_comb {
         // Extract fields
         var sa: logic    ;
@@ -92,131 +104,166 @@ pub module fp_multiplier (
         a_is_sub  = ea == 11'd0 && ma != 52'd0;
         b_is_sub  = eb == 11'd0 && mb != 52'd0;
 
+        // Effective exponents (subnormals have biased exp = 1)
+        var ea_eff: logic<13>;
+        var eb_eff: logic<13>;
+        if a_is_sub {
+            ea_eff = 13'd1;
+        } else {
+            ea_eff = {2'd0, ea};
+        }
+        if b_is_sub {
+            eb_eff = 13'd1;
+        } else {
+            eb_eff = {2'd0, eb};
+        }
+
+        // Significands with implicit bit (53 bits)
+        var sig_a: logic<53>;
+        var sig_b: logic<53>;
+        if a_is_sub {
+            sig_a = {1'b0, ma};
+        } else {
+            sig_a = {1'b1, ma};
+        }
+        if b_is_sub {
+            sig_b = {1'b0, mb};
+        } else {
+            sig_b = {1'b1, mb};
+        }
+
+        // 53x53 → 106-bit product via 26/27-bit partial products
+        var aH: logic<64>;
+        var aL: logic<64>;
+        var bH: logic<64>;
+        var bL: logic<64>;
+        aH = {37'd0, sig_a[52:26]};
+        aL = {38'd0, sig_a[25:0]};
+        bH = {37'd0, sig_b[52:26]};
+        bL = {38'd0, sig_b[25:0]};
+
+        var pp_ll: logic<64>;
+        var pp_lh: logic<64>;
+        var pp_hl: logic<64>;
+        var pp_hh: logic<64>;
+        pp_ll = aL * bL;
+        pp_lh = aL * bH;
+        pp_hl = aH * bL;
+        pp_hh = aH * bH;
+
+        var mid_sum: logic<64>;
+        mid_sum = pp_lh + pp_hl;
+
+        var mid_carry: logic;
+        mid_carry = mid_sum <: pp_lh; // unsigned overflow
+
+        var mid_lo: logic<64>;
+        mid_lo = {38'd0, pp_ll[51:26]} + {38'd0, mid_sum[25:0]};
+
+        var lower_carry: logic;
+        lower_carry = mid_lo[26];
+
+        var upper: logic<64>;
+        upper = pp_hh + {37'd0, mid_sum[63:26]} + {63'd0, mid_carry} + {63'd0, lower_carry};
+
+        // Full 106-bit product, reconstructed exactly.
+        let prod106: logic<106> = {upper[53:0], mid_lo[25:0], pp_ll[25:0]};
+
+        // Stage-1 outputs to the midpoint
+        s1_prod = prod106;
+        s1_esum = ea_eff + eb_eff;
+        s1_sign = r_sign;
+        s1_done = 1'b0;
+        s1_res  = 64'd0;
+        s1_ffl  = 5'd0;
+
+        // === Special cases (resolved in stage 1) ===
+        if a_is_nan || b_is_nan {
+            s1_done = 1'b1;
+            s1_res  = 64'h7FF8_0000_0000_0000; // canonical qNaN
+            if a_is_snan || b_is_snan {
+                s1_ffl = 5'b10000;
+            }
+        } else if a_is_inf || b_is_inf {
+            s1_done = 1'b1;
+            if (a_is_inf && (b_is_zero)) || (b_is_inf && (a_is_zero)) {
+                // inf * 0 = NaN
+                s1_res = 64'h7FF8_0000_0000_0000;
+                s1_ffl = 5'b10000; // NV
+            } else {
+                s1_res = {r_sign, 11'h7FF, 52'd0}; // signed infinity
+            }
+        } else if a_is_zero || b_is_zero {
+            s1_done = 1'b1;
+            s1_res  = {r_sign, 63'd0}; // signed zero
+        } else {
+            s1_done = 1'b0; // normal/subnormal: stage 2
+        }
+    }
+
+    // ===== Midpoint register (cut) + PIPE=0 bypass =====
+    var s1_done_q: logic     ;
+    var s1_res_q : logic<64> ;
+    var s1_ffl_q : logic<5>  ;
+    var s1_prod_q: logic<106>;
+    var s1_esum_q: logic<13> ;
+    var s1_sign_q: logic     ;
+    var s1_rm_q  : logic<3>  ;
+    always_ff (clk, rst) {
+        if_reset {
+            s1_done_q = 1'b0;
+            s1_res_q  = 64'd0;
+            s1_ffl_q  = 5'd0;
+            s1_prod_q = 106'd0;
+            s1_esum_q = 13'd0;
+            s1_sign_q = 1'b0;
+            s1_rm_q   = 3'd0;
+        } else {
+            s1_done_q = s1_done;
+            s1_res_q  = s1_res;
+            s1_ffl_q  = s1_ffl;
+            s1_prod_q = s1_prod;
+            s1_esum_q = s1_esum;
+            s1_sign_q = s1_sign;
+            s1_rm_q   = i_rm;
+        }
+    }
+    let s1_done_sel: logic     = if PIPE == 1 ? s1_done_q : s1_done;
+    let s1_res_sel : logic<64> = if PIPE == 1 ? s1_res_q : s1_res;
+    let s1_ffl_sel : logic<5>  = if PIPE == 1 ? s1_ffl_q : s1_ffl;
+    let s1_prod_sel: logic<106> = if PIPE == 1 ? s1_prod_q : s1_prod;
+    let s1_esum_sel: logic<13> = if PIPE == 1 ? s1_esum_q : s1_esum;
+    let s1_sign_sel: logic     = if PIPE == 1 ? s1_sign_q : s1_sign;
+    let s1_rm_sel  : logic<3>  = if PIPE == 1 ? s1_rm_q : i_rm;
+
+    // ===== Stage 2: normalize + round =====
+    var result: logic<64>;
+    var fflags: logic<5> ;
+    always_comb {
         result = 64'd0;
         fflags = 5'd0;
 
-        // === Special cases ===
-        if a_is_nan || b_is_nan {
-            result = 64'h7FF8_0000_0000_0000; // canonical qNaN
-            if a_is_snan || b_is_snan {
-                fflags = 5'b10000;
-            }
-        } else if a_is_inf || b_is_inf {
-            if (a_is_inf && (b_is_zero)) || (b_is_inf && (a_is_zero)) {
-                // inf * 0 = NaN
-                result = 64'h7FF8_0000_0000_0000;
-                fflags = 5'b10000; // NV
-            } else {
-                result = {r_sign, 11'h7FF, 52'd0}; // signed infinity
-            }
-        } else if a_is_zero || b_is_zero {
-            result = {r_sign, 63'd0}; // signed zero
+        if s1_done_sel {
+            result = s1_res_sel;
+            fflags = s1_ffl_sel;
         } else {
             // === Normal/subnormal multiplication ===
-
-            // Effective exponents (subnormals have biased exp = 1)
-            var ea_eff: logic<13>;
-            var eb_eff: logic<13>;
-            if a_is_sub {
-                ea_eff = 13'd1;
-            } else {
-                ea_eff = {2'd0, ea};
-            }
-            if b_is_sub {
-                eb_eff = 13'd1;
-            } else {
-                eb_eff = {2'd0, eb};
-            }
-
-            // Significands with implicit bit (53 bits)
-            var sig_a: logic<53>;
-            var sig_b: logic<53>;
-            if a_is_sub {
-                sig_a = {1'b0, ma};
-            } else {
-                sig_a = {1'b1, ma};
-            }
-            if b_is_sub {
-                sig_b = {1'b0, mb};
-            } else {
-                sig_b = {1'b1, mb};
-            }
-
-            // 53x53 → 106-bit product
-            // Use 64-bit partial products to compute the full 106-bit result
-            // sig_a = aH(27) : aL(26)
-            // sig_b = bH(27) : bL(26)
-            // product = aH*bH << 52 + (aH*bL + aL*bH) << 26 + aL*bL
-            var aH: logic<64>;
-            var aL: logic<64>;
-            var bH: logic<64>;
-            var bL: logic<64>;
-            aH = {37'd0, sig_a[52:26]};
-            aL = {38'd0, sig_a[25:0]};
-            bH = {37'd0, sig_b[52:26]};
-            bL = {38'd0, sig_b[25:0]};
-
-            var pp_ll: logic<64>;
-            var pp_lh: logic<64>;
-            var pp_hl: logic<64>;
-            var pp_hh: logic<64>;
-            pp_ll = aL * bL;
-            pp_lh = aL * bH;
-            pp_hl = aH * bL;
-            pp_hh = aH * bH;
-
-            // Combine: product[105:0]
-            // pp_ll contributes to bits [51:0]
-            // pp_lh + pp_hl contribute to bits [79:26]
-            // pp_hh contributes to bits [105:52]
-            // We need bits [105:50] for rounding (56 bits + sticky from [49:0])
-            var mid_sum: logic<64>;
-            mid_sum = pp_lh + pp_hl;
-
-            // Carry from mid_sum addition
-            var mid_carry: logic;
-            mid_carry = mid_sum <: pp_lh; // unsigned overflow
-
-            // product[51:26] = mid_lo[25:0]; the carry-out at bit 26 (mid_lo[26])
-            // propagates into product[52] = upper[0].
-            var mid_lo: logic<64>;
-            mid_lo = {38'd0, pp_ll[51:26]} + {38'd0, mid_sum[25:0]};
-
-            // product bits [105:52] = pp_hh + mid_sum[63:26] + carry_from_lower.
-            // carry_from_lower is the bit-26 carry of the low add = mid_lo[26].
-            // (The old `(pp_ll[63:26]+mid_sum[25:0]) <: pp_ll[63:26]` 64-bit
-            // wraparound test was always 0 — that sum is < 2^27 and never wraps —
-            // so product[52] silently dropped this carry, giving an off-by-one
-            // (e.g. a wrong guard bit) in the rounded result for ~half of inputs.)
-            var lower_carry: logic;
-            lower_carry = mid_lo[26];
-
-            var upper: logic<64>;
-            upper = pp_hh + {37'd0, mid_sum[63:26]} + {63'd0, mid_carry} + {63'd0, lower_carry};
-
-            // Full 106-bit product, reconstructed exactly.
-            // product[105:52]=upper[53:0], [51:26]=mid_lo[25:0], [25:0]=pp_ll[25:0]
-            let prod106: logic<106> = {upper[53:0], mid_lo[25:0], pp_ll[25:0]};
-
-            // Leading-one normalize so the leading 1 lands at bit 105. Working on
-            // the FULL product (not a 56-bit window) keeps the low significand
-            // bits when one operand is subnormal and the leading 1 sits far below
-            // bit 105 — the old prod_top[105:50] window dropped them to sticky.
-            let lz106: logic<9> = clz::<106>(prod106);
+            // Leading-one normalize so the leading 1 lands at bit 105.
+            let lz106: logic<9> = clz::<106>(s1_prod_sel);
             var lead_shift: logic<7>;
             lead_shift = lz106[6:0];
             if lead_shift == 7'd106 {
                 lead_shift = 7'd105;
             }
-            let prod_norm: logic<106> = prod106 << lead_shift;
+            let prod_norm: logic<106> = s1_prod_sel << lead_shift;
             // 1.0*1.0 -> prod106=2^104, lead_shift=1 -> biased 1023.
-            let biased: logic<13> = ea_eff + eb_eff - 13'd1022 - {6'd0, lead_shift};
+            let biased: logic<13> = s1_esum_sel - 13'd1022 - {6'd0, lead_shift};
 
             // 56-bit significand: [55:3]=53-bit (implicit+frac), [2:0]=G,R,S
             let nm: logic<56> = {prod_norm[105:51], prod_norm[50] | (prod_norm[49:0] != 50'd0)};
 
             // Unbounded rounding -> tininess (after rounding) for the UF flag.
-            let ru0  : logic     = round_up_fn(i_rm, r_sign, nm[2], nm[1], nm[0], nm[3]);
+            let ru0  : logic     = round_up_fn(s1_rm_sel, s1_sign_sel, nm[2], nm[1], nm[0], nm[3]);
             let sig0 : logic<54> = {1'b0, nm[55:3]} + {53'd0, ru0};
             let exp_u: logic<13> = biased + {12'd0, sig0[53]};
             let tiny : logic     = $signed(exp_u) <= 13'sd0;
@@ -234,10 +281,10 @@ pub module fp_multiplier (
                     frac   = sig0[51:0];
                 }
                 if $signed(efield) >= 13'sd2047 {
-                    result = ovf_d(i_rm, r_sign);
-                    fflags  = 5'b00101; // OF | NX
+                    result = ovf_d(s1_rm_sel, s1_sign_sel);
+                    fflags = 5'b00101; // OF | NX
                 } else {
-                    result = {r_sign, efield[10:0], frac};
+                    result = {s1_sign_sel, efield[10:0], frac};
                     if nx {
                         fflags = 5'b00001;
                     }
@@ -250,11 +297,11 @@ pub module fp_multiplier (
                 let stk   : logic     = (nm & ((56'd1 << scl) - 56'd1)) != 56'd0;
                 let nms   : logic<56> = {sm[55:1], sm[0] | stk};
                 let nx_sub: logic     = nms[2] || nms[1] || nms[0];
-                let ru1   : logic     = round_up_fn(i_rm, r_sign, nms[2], nms[1], nms[0], nms[3]);
+                let ru1   : logic     = round_up_fn(s1_rm_sel, s1_sign_sel, nms[2], nms[1], nms[0], nms[3]);
                 let sig1  : logic<54> = {1'b0, nms[55:3]} + {53'd0, ru1};
                 let efield: logic<13> = {12'd0, sig1[52]};
                 let frac  : logic<52> = sig1[51:0];
-                result = {r_sign, efield[10:0], frac};
+                result = {s1_sign_sel, efield[10:0], frac};
                 if nx_sub {
                     fflags = 5'b00001;
                 }

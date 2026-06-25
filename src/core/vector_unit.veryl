@@ -859,6 +859,14 @@ pub module vector_unit #(
     // per-element IEEE flags across the whole op. vfpu_* receive the shared
     // fpu_wrap outputs (combinational result for the single-cycle V3a ops).
     var fp_state   : logic<2>            ;
+    // fp-pipeline: the shared fpu_wrap (u_vfpu) is PIPE=1 (2-stage), so a fast
+    // (arith/cmp) element's result lands one cycle after its operands are
+    // presented. fp_ph sequences each COMPUTE element: 0 = present (drive
+    // operands; fp_elem stable), 1 = capture (accumulate the now-ready result,
+    // advance). Holding fp_elem across both phases keeps all dest geometry /
+    // vdold addressing correct with no extra pipelining (throughput halves for
+    // now; a later streaming step recovers it). div/sqrt still wait on vfpu_busy.
+    var fp_ph      : logic               ;
     var fp_elem    : logic<8>            ;
     var fp_acc     : logic<VLEN>         ;
     var fp_fflags_q: logic<5>            ;
@@ -2127,6 +2135,7 @@ pub module vector_unit #(
     inst u_vfpu: fpu_wrap #(
         PRF_W    : PRF_W    ,
         ROB_IDX_W: ROB_IDX_W,
+        PIPE     : 1        , // 2-stage FP arith; VU streams via fp_ph (present/capture)
     ) (
         clk                                  ,
         rst                                  ,
@@ -2161,6 +2170,9 @@ pub module vector_unit #(
         o_cdb             : vfpu_cdb         ,
         o_fflags          : vfpu_fflags      ,
         o_fflags_wen      : _                ,
+        // PIPE=0 here (combinational, same-cycle result); the VU routes its own
+        // dest via vu_cdb_fp_dest, so this pipelined dest-is-fp is unused.
+        o_dest_is_fp      : _                ,
     );
     // V3j-4 vfrsqrt7/vfrec7: the element estimate + its fflags come from the table
     // ROMs (no FPU). vfrec7 rounds overflow per fcsr.frm (i_frm). Single results
@@ -2238,9 +2250,11 @@ pub module vector_unit #(
     let fp_red_vd  : logic<VLEN>  = {i_vdold_data[127:64], (i_vdold_data[63:0] & ~red_res_mask) | (red_final & red_res_mask)};
     // VRF writes during COMPUTE: arithmetic writes a completed register at its
     // boundary; a compare / reduction writes its single dest element at the last.
-    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && !h_is_fcmp && !h_is_red && fp_dreg_last;
-    let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_fcmp && fp_last_elem;
-    let fp_red_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && h_is_red && fp_last_elem;
+    // fp-pipeline: writes fire on the CAPTURE phase (fp_ph=1), when the streamed
+    // element's result is valid — not when its operands are presented (fp_ph=0).
+    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && !h_is_fcmp && !h_is_red && fp_dreg_last;
+    let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && h_is_fcmp && fp_last_elem;
+    let fp_red_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && h_is_red && fp_last_elem;
     let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
 
     // ---- Execute the head (combinational) -----------------------------------
@@ -2484,6 +2498,7 @@ pub module vector_unit #(
             dv_lane     = 5'd0;
             dv_acc      = {1'b0 repeat VLEN};
             fp_state    = 2'd0;
+            fp_ph       = 1'b0;
             fp_elem     = 8'd0;
             fp_acc      = {1'b0 repeat VLEN};
             fp_fflags_q = 5'd0;
@@ -2608,6 +2623,7 @@ pub module vector_unit #(
                     // for .vv, so scalar_ok is always met).
                     if (count != 0) && at_head && h_is_fp && scalar_ok {
                         fp_elem     = 8'd0;
+                        fp_ph       = 1'b0;
                         fp_acc      = {1'b0 repeat VLEN};
                         fp_fflags_q = 5'd0;
                         if vl8 == 8'd0 {
@@ -2618,30 +2634,41 @@ pub module vector_unit #(
                     }
                 }
                 2'd1: {
-                    // COMPUTE: process element fp_elem this cycle (single-cycle FPU
-                    // for arithmetic/compare; FDIV.D/FSQRT.D hold here on vfpu_busy).
+                    // COMPUTE: element fp_elem streams through u_vfpu (PIPE=1). A
+                    // fast (arith/cmp/est/merge) op presents in fp_ph=0 and its
+                    // result is captured in fp_ph=1; fp_elem is stable across both,
+                    // so all the per-element geometry stays valid. FDIV.D/FSQRT.D
+                    // hold here on vfpu_busy (they then fall through fp_ph=0→1 once
+                    // their latched result is ready, captured the next cycle).
                     if !vfpu_busy {
-                        if fp_active && !h_is_fmerge && !h_is_anyired {
-                            // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU);
-                            // integer reductions (h_is_anyired) accrue no FP flags.
-                            fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : vfpu_fflags);
-                        }
-                        // A compare accumulates the running mask in fp_acc (no
-                        // reset — one mask register spans the whole op); a reduction
-                        // folds into the scalar red_acc; arithmetic accumulates the
-                        // SEW-wide register value, resetting at each register
-                        // boundary (the next register re-seeds from old vd).
-                        if h_is_fcmp {
-                            fp_acc = fp_mask_next;
-                        } else if h_is_red {
-                            red_acc = red_final;
+                        if fp_ph == 1'b0 {
+                            // present phase: operands driven this cycle; capture next.
+                            fp_ph = 1'b1;
                         } else {
-                            fp_acc = if fp_dreg_last ? {1'b0 repeat VLEN} : fp_acc_next;
-                        }
-                        if fp_elem + 8'd1 >= vl8 {
-                            fp_state = 2'd2;
-                        } else {
-                            fp_elem = fp_elem + 8'd1;
+                            // capture phase: the result for fp_elem is now valid.
+                            if fp_active && !h_is_fmerge && !h_is_anyired {
+                                // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU);
+                                // integer reductions (h_is_anyired) accrue no FP flags.
+                                fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : vfpu_fflags);
+                            }
+                            // A compare accumulates the running mask in fp_acc (no
+                            // reset — one mask register spans the whole op); a reduction
+                            // folds into the scalar red_acc; arithmetic accumulates the
+                            // SEW-wide register value, resetting at each register
+                            // boundary (the next register re-seeds from old vd).
+                            if h_is_fcmp {
+                                fp_acc = fp_mask_next;
+                            } else if h_is_red {
+                                red_acc = red_final;
+                            } else {
+                                fp_acc = if fp_dreg_last ? {1'b0 repeat VLEN} : fp_acc_next;
+                            }
+                            fp_ph = 1'b0;
+                            if fp_elem + 8'd1 >= vl8 {
+                                fp_state = 2'd2;
+                            } else {
+                                fp_elem = fp_elem + 8'd1;
+                            }
                         }
                     }
                 }

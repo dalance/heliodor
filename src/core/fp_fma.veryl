@@ -1,5 +1,5 @@
 // IEEE 754 double-precision fused multiply-add: round(a*b +/- c) with a SINGLE
-// rounding. Combinational. Handles normals, subnormals, zeros, infinities, NaNs.
+// rounding. Handles normals, subnormals, zeros, infinities, NaNs.
 //
 // Operation select (same as fp_fma_s):
 //   i_neg_p  negate the product   i_sub_c  negate the addend
@@ -12,7 +12,16 @@
 // right-shifts with a sticky bit. The two are added in two's complement, the
 // magnitude normalized and rounded exactly once. Underflow uses tininess
 // detected AFTER rounding with an unbounded exponent (RISC-V/IEEE 754).
-pub module fp_fma (
+//
+// PIPE: 0 = combinational (legacy, byte-identical); 1 = 2-stage (result valid N+1).
+// The datapath is cut after the aligned two's-complement add (stage 1) / before
+// the leading-one normalize + round (stage 2); PIPE=0 bypasses the midpoint
+// register → identical combinational result.
+pub module fp_fma #(
+    param PIPE: u32 = 0,
+) (
+    clk     : input  clock     ,
+    rst     : input  reset     ,
     i_a     : input  logic<64>,
     i_b     : input  logic<64>,
     i_c     : input  logic<64>,
@@ -23,8 +32,6 @@ pub module fp_fma (
     o_fflags: output logic<5> ,
 ) {
     import fpu_pkg::*;
-    var result: logic<64>;
-    var fflags: logic<5> ;
 
     // Align a 106-bit significand into the 168-bit window. `sh` is the signed
     // left-shift (bit 14 = sign); negative => right shift with sticky. Returns
@@ -74,6 +81,13 @@ pub module fp_fma (
         return ru;
     }
 
+    // ===== Stage 1: decode / special-case resolve / multiply + align + add =====
+    var s1_done    : logic     ;
+    var s1_res     : logic<64> ;
+    var s1_ffl     : logic<5>  ;
+    var s1_sum_mag : logic<172>;
+    var s1_res_sign: logic     ;
+    var s1_lsb_w   : logic<14> ;
     always_comb {
         let sa: logic     = i_a[63];
         let ea: logic<11> = i_a[62:52];
@@ -108,157 +122,216 @@ pub module fp_fma (
 
         let qnan: logic<64> = 64'h7FF8000000000000;
 
+        // ---- main-path datapath (computed unconditionally; used when !s1_done) ----
+        let sig_a: logic<53> = if a_sub ? {1'b0, ma} : {1'b1, ma};
+        let sig_b: logic<53> = if b_sub ? {1'b0, mb} : {1'b1, mb};
+        let sig_c: logic<53> = if c_sub || c_zero ? {1'b0, mc} : {1'b1, mc};
+
+        // 53x53 -> 106-bit product via 26/27-bit partial products
+        let aH: logic<64> = {37'd0, sig_a[52:26]};
+        let aL: logic<64> = {38'd0, sig_a[25:0]};
+        let bH: logic<64> = {37'd0, sig_b[52:26]};
+        let bL: logic<64> = {38'd0, sig_b[25:0]};
+        let pp_ll: logic<64> = aL * bL;
+        let pp_lh: logic<64> = aL * bH;
+        let pp_hl: logic<64> = aH * bL;
+        let pp_hh: logic<64> = aH * bH;
+        let mid   : logic<64>  = pp_lh + pp_hl;
+        let term_hh: logic<106> = {pp_hh[53:0], 52'd0};
+        let term_md: logic<106> = {16'd0, mid, 26'd0};
+        let term_ll: logic<106> = {54'd0, pp_ll[51:0]};
+        let prod   : logic<106> = term_hh + term_md + term_ll;
+
+        let a_e11: logic<11> = if a_sub ? 11'd1 : ea;
+        let b_e11: logic<11> = if b_sub ? 11'd1 : eb;
+        let c_e11: logic<11> = if c_sub || c_zero ? 11'd1 : ec;
+
+        // product value = prod * 2^pe,  pe = ea_eff + eb_eff - 2150
+        // addend  value = sig_c * 2^ce, ce = ec_eff - 1075
+        let pe: logic<14> = {3'd0, a_e11} + {3'd0, b_e11} - 14'd2150;
+        let ce: logic<14> = {3'd0, c_e11} - 14'd1075;
+
+        let p_top    : logic<14> = pe + 14'd105;
+        let c_top    : logic<14> = ce + 14'd52;
+        let c_top_eff: logic<14> = if c_zero ? 14'h2000 : c_top; // -8192 sentinel
+        let top_exp  : logic<14> = if $signed(p_top) >= $signed(c_top_eff) ? p_top : c_top_eff;
+        let lsb_w    : logic<14> = top_exp - 14'd166;
+
+        let shift_p: logic<15> = {pe[13], pe} - {lsb_w[13], lsb_w};
+        let shift_c: logic<15> = {ce[13], ce} - {lsb_w[13], lsb_w};
+
+        let ap: logic<169> = align106(prod, shift_p);
+        let ac: logic<169> = align106({53'd0, sig_c}, shift_c);
+
+        let ext_p   : logic<172> = {3'd0, ap};
+        let ext_c   : logic<172> = {3'd0, ac};
+        let signed_p: logic<172> = if prod_sign ? ~ext_p + 172'd1 : ext_p;
+        let signed_c: logic<172> = if c_sign ? ~ext_c + 172'd1 : ext_c;
+        let sum_s   : logic<172> = signed_p + signed_c;
+
+        let res_sign: logic      = sum_s[171];
+        let sum_mag : logic<172> = if sum_s[171] ? ~sum_s + 172'd1 : sum_s;
+
+        // Stage-1 outputs to the midpoint
+        s1_sum_mag  = sum_mag;
+        s1_res_sign = res_sign;
+        s1_lsb_w    = lsb_w;
+        s1_done     = 1'b0;
+        s1_res      = 64'd0;
+        s1_ffl      = 5'd0;
+
+        if a_nan || b_nan || c_nan {
+            s1_done = 1'b1;
+            s1_res  = qnan;
+            if a_snan || b_snan || c_snan || inf_zero {
+                s1_ffl = 5'b10000;
+            }
+        } else if inf_zero {
+            s1_done = 1'b1;
+            s1_res  = qnan;
+            s1_ffl  = 5'b10000;
+        } else if a_inf || b_inf {
+            s1_done = 1'b1;
+            if c_inf && (prod_sign != c_sign) {
+                s1_res = qnan; // inf - inf
+                s1_ffl = 5'b10000;
+            } else {
+                s1_res = {prod_sign, 11'h7FF, 52'd0};
+            }
+        } else if c_inf {
+            s1_done = 1'b1;
+            s1_res  = {c_sign, 11'h7FF, 52'd0};
+        } else if a_zero || b_zero {
+            s1_done = 1'b1;
+            if c_zero {
+                let zsign: logic = if prod_sign == c_sign ? prod_sign : if i_rm == 3'b010 ? 1'b1 : 1'b0;
+                s1_res = {zsign, 63'd0};
+            } else {
+                s1_res = {c_sign, i_c[62:0]};
+            }
+        } else {
+            // MAIN PATH: normalize + round deferred to stage 2.
+            s1_done = 1'b0;
+        }
+    }
+
+    // ===== Midpoint register (cut) + PIPE=0 bypass =====
+    var s1_done_q    : logic     ;
+    var s1_res_q     : logic<64> ;
+    var s1_ffl_q     : logic<5>  ;
+    var s1_sum_mag_q : logic<172>;
+    var s1_res_sign_q: logic     ;
+    var s1_lsb_w_q   : logic<14> ;
+    var s1_rm_q      : logic<3>  ;
+    always_ff (clk, rst) {
+        if_reset {
+            s1_done_q     = 1'b0;
+            s1_res_q      = 64'd0;
+            s1_ffl_q      = 5'd0;
+            s1_sum_mag_q  = 172'd0;
+            s1_res_sign_q = 1'b0;
+            s1_lsb_w_q    = 14'd0;
+            s1_rm_q       = 3'd0;
+        } else {
+            s1_done_q     = s1_done;
+            s1_res_q      = s1_res;
+            s1_ffl_q      = s1_ffl;
+            s1_sum_mag_q  = s1_sum_mag;
+            s1_res_sign_q = s1_res_sign;
+            s1_lsb_w_q    = s1_lsb_w;
+            s1_rm_q       = i_rm;
+        }
+    }
+    let s1_done_sel    : logic      = if PIPE == 1 ? s1_done_q : s1_done;
+    let s1_res_sel     : logic<64>  = if PIPE == 1 ? s1_res_q : s1_res;
+    let s1_ffl_sel     : logic<5>   = if PIPE == 1 ? s1_ffl_q : s1_ffl;
+    let s1_sum_mag_sel : logic<172> = if PIPE == 1 ? s1_sum_mag_q : s1_sum_mag;
+    let s1_res_sign_sel: logic      = if PIPE == 1 ? s1_res_sign_q : s1_res_sign;
+    let s1_lsb_w_sel   : logic<14>  = if PIPE == 1 ? s1_lsb_w_q : s1_lsb_w;
+    let s1_rm_sel      : logic<3>   = if PIPE == 1 ? s1_rm_q : i_rm;
+
+    // ===== Stage 2: leading-one normalize + round =====
+    var result: logic<64>;
+    var fflags: logic<5> ;
+    always_comb {
         result = 64'd0;
         fflags = 5'd0;
 
-        if a_nan || b_nan || c_nan {
-            result = qnan;
-            if a_snan || b_snan || c_snan || inf_zero {
-                fflags = 5'b10000;
-            }
-        } else if inf_zero {
-            result = qnan;
-            fflags  = 5'b10000;
-        } else if a_inf || b_inf {
-            if c_inf && (prod_sign != c_sign) {
-                result = qnan; // inf - inf
-                fflags  = 5'b10000;
-            } else {
-                result = {prod_sign, 11'h7FF, 52'd0};
-            }
-        } else if c_inf {
-            result = {c_sign, 11'h7FF, 52'd0};
-        } else if a_zero || b_zero {
-            if c_zero {
-                let zsign: logic = if prod_sign == c_sign ? prod_sign : if i_rm == 3'b010 ? 1'b1 : 1'b0;
-                result = {zsign, 63'd0};
-            } else {
-                result = {c_sign, i_c[62:0]};
-            }
+        if s1_done_sel {
+            result = s1_res_sel;
+            fflags = s1_ffl_sel;
+        } else if s1_sum_mag_sel == 172'd0 {
+            let zsign: logic = if s1_rm_sel == 3'b010 ? 1'b1 : 1'b0;
+            result = {zsign, 63'd0};
         } else {
-            // ---- MAIN PATH: product nonzero finite, c finite (maybe zero) ----
-            let sig_a: logic<53> = if a_sub ? {1'b0, ma} : {1'b1, ma};
-            let sig_b: logic<53> = if b_sub ? {1'b0, mb} : {1'b1, mb};
-            let sig_c: logic<53> = if c_sub || c_zero ? {1'b0, mc} : {1'b1, mc};
+            let lz172: logic<9> = clz::<172>(s1_sum_mag_sel);
+            let lzc  : logic<8> = lz172[7:0];
+            let norm : logic<172> = s1_sum_mag_sel << lzc;
+            // biased exp = lsb_w + 1193 - lzc
+            let biased: logic<14> = s1_lsb_w_sel + 14'd1193 - {6'd0, lzc};
 
-            // 53x53 -> 106-bit product via 26/27-bit partial products
-            let aH: logic<64> = {37'd0, sig_a[52:26]};
-            let aL: logic<64> = {38'd0, sig_a[25:0]};
-            let bH: logic<64> = {37'd0, sig_b[52:26]};
-            let bL: logic<64> = {38'd0, sig_b[25:0]};
-            let pp_ll: logic<64> = aL * bL;
-            let pp_lh: logic<64> = aL * bH;
-            let pp_hl: logic<64> = aH * bL;
-            let pp_hh: logic<64> = aH * bH;
-            let mid   : logic<64>  = pp_lh + pp_hl;
-            let term_hh: logic<106> = {pp_hh[53:0], 52'd0};
-            let term_md: logic<106> = {16'd0, mid, 26'd0};
-            let term_ll: logic<106> = {54'd0, pp_ll[51:0]};
-            let prod   : logic<106> = term_hh + term_md + term_ll;
+            // 56-bit normalized significand: [55:3] = 53-bit, [2:0] = G,R,S
+            let nm: logic<56> = {norm[171:119], norm[118], norm[117], norm[116:0] != 117'd0};
 
-            let a_e11: logic<11> = if a_sub ? 11'd1 : ea;
-            let b_e11: logic<11> = if b_sub ? 11'd1 : eb;
-            let c_e11: logic<11> = if c_sub || c_zero ? 11'd1 : ec;
+            // unbounded rounding determines tininess (after rounding)
+            let ru0  : logic     = round_up_fn(s1_rm_sel, s1_res_sign_sel, nm[2], nm[1], nm[0], nm[3]);
+            let sig0 : logic<54> = {1'b0, nm[55:3]} + {53'd0, ru0};
+            let exp_u: logic<14> = biased + {13'd0, sig0[53]};
+            let tiny : logic     = $signed(exp_u) <= 14'sd0;
 
-            // product value = prod * 2^pe,  pe = ea_eff + eb_eff - 2150
-            // addend  value = sig_c * 2^ce, ce = ec_eff - 1075
-            let pe: logic<14> = {3'd0, a_e11} + {3'd0, b_e11} - 14'd2150;
-            let ce: logic<14> = {3'd0, c_e11} - 14'd1075;
-
-            let p_top    : logic<14> = pe + 14'd105;
-            let c_top    : logic<14> = ce + 14'd52;
-            let c_top_eff: logic<14> = if c_zero ? 14'h2000 : c_top; // -8192 sentinel
-            let top_exp  : logic<14> = if $signed(p_top) >= $signed(c_top_eff) ? p_top : c_top_eff;
-            let lsb_w    : logic<14> = top_exp - 14'd166;
-
-            let shift_p: logic<15> = {pe[13], pe} - {lsb_w[13], lsb_w};
-            let shift_c: logic<15> = {ce[13], ce} - {lsb_w[13], lsb_w};
-
-            let ap: logic<169> = align106(prod, shift_p);
-            let ac: logic<169> = align106({53'd0, sig_c}, shift_c);
-
-            let ext_p   : logic<172> = {3'd0, ap};
-            let ext_c   : logic<172> = {3'd0, ac};
-            let signed_p: logic<172> = if prod_sign ? ~ext_p + 172'd1 : ext_p;
-            let signed_c: logic<172> = if c_sign ? ~ext_c + 172'd1 : ext_c;
-            let sum_s   : logic<172> = signed_p + signed_c;
-
-            let res_sign: logic      = sum_s[171];
-            let sum_mag : logic<172> = if sum_s[171] ? ~sum_s + 172'd1 : sum_s;
-
-            if sum_mag == 172'd0 {
-                let zsign: logic = if i_rm == 3'b010 ? 1'b1 : 1'b0;
-                result = {zsign, 63'd0};
-            } else {
-                let lz172: logic<9> = clz::<172>(sum_mag);
-                let lzc  : logic<8> = lz172[7:0];
-                let norm : logic<172> = sum_mag << lzc;
-                // weight of bit j is 2^(lsb_w-1+j); leading at 171-lzc =>
-                // biased exp = (lsb_w-1 + 171-lzc) + 1023 = lsb_w + 1193 - lzc
-                let biased: logic<14> = lsb_w + 14'd1193 - {6'd0, lzc};
-
-                // 56-bit normalized significand: [55:3] = 53-bit, [2:0] = G,R,S
-                let nm: logic<56> = {norm[171:119], norm[118], norm[117], norm[116:0] != 117'd0};
-
-                // unbounded rounding determines tininess (after rounding)
-                let ru0  : logic     = round_up_fn(i_rm, res_sign, nm[2], nm[1], nm[0], nm[3]);
-                let sig0 : logic<54> = {1'b0, nm[55:3]} + {53'd0, ru0};
-                let exp_u: logic<14> = biased + {13'd0, sig0[53]};
-                let tiny : logic     = $signed(exp_u) <= 14'sd0;
-
-                if $signed(biased) >= 14'sd1 {
-                    // ---- normal result ----
-                    let nx    : logic = nm[2] || nm[1] || nm[0];
-                    var efield: logic<14>;
-                    var frac  : logic<52>;
-                    if sig0[53] == 1'b1 {
-                        efield = biased + 14'd1;
-                        frac   = 52'd0;
-                    } else {
-                        efield = biased;
-                        frac   = sig0[51:0];
-                    }
-                    if $signed(efield) >= 14'sd2047 {
-                        let inf_r : logic<64> = {res_sign, 11'h7FF, 52'd0};
-                        let maxn  : logic<64> = {res_sign, 11'h7FE, 52'hFFFFFFFFFFFFF};
-                        var ov_res: logic<64>;
-                        case i_rm {
-                            3'b001 : ov_res = maxn;
-                            3'b010 : ov_res = if res_sign ? inf_r : maxn;
-                            3'b011 : ov_res = if res_sign ? maxn : inf_r;
-                            default: ov_res = inf_r;
-                        }
-                        result = ov_res;
-                        fflags  = 5'b00101; // OF | NX
-                    } else {
-                        result = {res_sign, efield[10:0], frac};
-                        if nx {
-                            fflags = 5'b00001;
-                        }
-                    }
+            if $signed(biased) >= 14'sd1 {
+                // ---- normal result ----
+                let nx    : logic = nm[2] || nm[1] || nm[0];
+                var efield: logic<14>;
+                var frac  : logic<52>;
+                if sig0[53] == 1'b1 {
+                    efield = biased + 14'd1;
+                    frac   = 52'd0;
                 } else {
-                    // ---- subnormal result ----
-                    let ss    : logic<14> = 14'd1 - biased;
-                    let scl   : logic<6>  = if $signed(ss) >: 14'sd56 ? 6'd56 : ss[5:0];
-                    let sm    : logic<56> = nm >> scl;
-                    let stk   : logic     = (nm & ((56'd1 << scl) - 56'd1)) != 56'd0;
-                    let nms   : logic<56> = {sm[55:1], sm[0] | stk};
-                    let nx_sub: logic     = nms[2] || nms[1] || nms[0];
-                    let ru1   : logic     = round_up_fn(i_rm, res_sign, nms[2], nms[1], nms[0], nms[3]);
-                    let sig1  : logic<54> = {1'b0, nms[55:3]} + {53'd0, ru1};
-                    let efield: logic<14> = {13'd0, sig1[52]};
-                    let frac  : logic<52> = sig1[51:0];
-                    result = {res_sign, efield[10:0], frac};
-                    if nx_sub {
+                    efield = biased;
+                    frac   = sig0[51:0];
+                }
+                if $signed(efield) >= 14'sd2047 {
+                    let inf_r : logic<64> = {s1_res_sign_sel, 11'h7FF, 52'd0};
+                    let maxn  : logic<64> = {s1_res_sign_sel, 11'h7FE, 52'hFFFFFFFFFFFFF};
+                    var ov_res: logic<64>;
+                    case s1_rm_sel {
+                        3'b001 : ov_res = maxn;
+                        3'b010 : ov_res = if s1_res_sign_sel ? inf_r : maxn;
+                        3'b011 : ov_res = if s1_res_sign_sel ? maxn : inf_r;
+                        default: ov_res = inf_r;
+                    }
+                    result = ov_res;
+                    fflags  = 5'b00101; // OF | NX
+                } else {
+                    result = {s1_res_sign_sel, efield[10:0], frac};
+                    if nx {
                         fflags = 5'b00001;
                     }
-                    if tiny && nx_sub {
-                        fflags = 5'b00011; // UF | NX
-                    }
+                }
+            } else {
+                // ---- subnormal result ----
+                let ss    : logic<14> = 14'd1 - biased;
+                let scl   : logic<6>  = if $signed(ss) >: 14'sd56 ? 6'd56 : ss[5:0];
+                let sm    : logic<56> = nm >> scl;
+                let stk   : logic     = (nm & ((56'd1 << scl) - 56'd1)) != 56'd0;
+                let nms   : logic<56> = {sm[55:1], sm[0] | stk};
+                let nx_sub: logic     = nms[2] || nms[1] || nms[0];
+                let ru1   : logic     = round_up_fn(s1_rm_sel, s1_res_sign_sel, nms[2], nms[1], nms[0], nms[3]);
+                let sig1  : logic<54> = {1'b0, nms[55:3]} + {53'd0, ru1};
+                let efield: logic<14> = {13'd0, sig1[52]};
+                let frac  : logic<52> = sig1[51:0];
+                result = {s1_res_sign_sel, efield[10:0], frac};
+                if nx_sub {
+                    fflags = 5'b00001;
+                }
+                if tiny && nx_sub {
+                    fflags = 5'b00011; // UF | NX
                 }
             }
         }
     }
+
     assign o_result = result;
     assign o_fflags = fflags;
 }
