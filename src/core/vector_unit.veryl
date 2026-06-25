@@ -395,23 +395,44 @@ pub module vector_unit #(
         b : input logic<W>,
         op: input logic<6>,
     ) -> logic<W> {
-        let a_s  : logic<W * 2> = {a[W - 1] repeat W, a};
-        let b_s  : logic<W * 2> = {b[W - 1] repeat W, b};
-        let a_u  : logic<W * 2> = {1'b0 repeat W, a};
-        let b_u  : logic<W * 2> = {1'b0 repeat W, b};
-        let p_ss : logic<W * 2> = a_s * b_s; // signed   × signed
-        let p_uu : logic<W * 2> = a_u * b_u; // unsigned × unsigned
-        let p_su : logic<W * 2> = a_s * b_u; // signed   × unsigned
         // The vdivu/vdiv/vremu/vrem cases (funct6 1000xx) are handled by the
-        // multi-cycle int_divider FU (element-serial), not here — the combinational
-        // `/` `%` were the deepest path in the vector unit. This function now only
+        // multi-cycle int_divider FU (element-serial), not here. This function
         // serves the multiply cases (1001xx).
+        //
+        // Fmax: build ONE unsigned W×W→2W product from half-width partials and
+        // derive the signed high halves by correction, instead of three
+        // sign-/zero-extended (2W)×(2W) array multiplies (the old p_ss/p_su were
+        // the deepest combinational path in the core — a 128×128 signed array for
+        // SEW=64). Mirrors the scalar RV64M MULH path in alu.veryl exactly, so it
+        // is bit-identical; no IPC cost (still combinational). Partials:
+        //   a = aH·2^(W/2) + aL,  b = bH·2^(W/2) + bL  (halves zero-extended to W)
+        //   prod = pp_hh·2^W + (pp_lh+pp_hl)·2^(W/2) + pp_ll
+        let aL: logic<W> = {1'b0 repeat (W / 2), a[W / 2 - 1:0]};
+        let aH: logic<W> = {1'b0 repeat (W / 2), a[W - 1:W / 2]};
+        let bL: logic<W> = {1'b0 repeat (W / 2), b[W / 2 - 1:0]};
+        let bH: logic<W> = {1'b0 repeat (W / 2), b[W - 1:W / 2]};
+        let pp_ll: logic<W> = aL * bL;
+        let pp_lh: logic<W> = aL * bH;
+        let pp_hl: logic<W> = aH * bL;
+        let pp_hh: logic<W> = aH * bH;
+        let mid_v : logic<W> = pp_lh + pp_hl;
+        let mid_of: logic<W> = if mid_v <: pp_lh ? (1 as W) << (W / 2) : '0; // carry out of mid sum
+        let mid_hi: logic<W> = mid_v >> (W / 2);
+        let lo_v  : logic<W> = pp_ll + (mid_v << (W / 2)); // = low W bits of the product (vmul)
+        let lo_of : logic<W> = if lo_v <: pp_ll ? (1 as W) : '0;
+        let hi_u  : logic<W> = pp_hh + mid_hi + mid_of + lo_of; // high W of UNSIGNED product (vmulhu)
+        // Signed-from-unsigned high-half corrections (standard identity):
+        // (signed)high = (unsigned)high − [a<0]·b − [b<0]·a.
+        let adj_a: logic<W> = {a[W - 1] repeat W} & b;
+        let adj_b: logic<W> = {b[W - 1] repeat W} & a;
+        let hi_ss: logic<W> = hi_u - adj_a - adj_b; // vmulh   (signed   × signed)
+        let hi_su: logic<W> = hi_u - adj_a;         // vmulhsu (signed   × unsigned)
         return case op {
-            6'b100101: p_uu[W - 1:0],     // vmul    (low W bits; sign-agnostic)
-            6'b100111: p_ss[W * 2 - 1:W], // vmulh   (signed   × signed,   high)
-            6'b100100: p_uu[W * 2 - 1:W], // vmulhu  (unsigned × unsigned, high)
-            6'b100110: p_su[W * 2 - 1:W], // vmulhsu (signed   × unsigned, high)
-            default  : p_uu[W - 1:0],
+            6'b100101: lo_v,  // vmul    (low W bits; sign-agnostic)
+            6'b100111: hi_ss, // vmulh   (signed   × signed,   high)
+            6'b100100: hi_u,  // vmulhu  (unsigned × unsigned, high)
+            6'b100110: hi_su, // vmulhsu (signed   × unsigned, high)
+            default  : lo_v,
         };
     }
 
@@ -1611,17 +1632,22 @@ pub module vector_unit #(
     };
     let iota_msk: logic<VLEN> = i_mask_data >> iota_base; // v0 bits for this group
     let iota_vs2: logic<VLEN> = i_vs2_data >> iota_base;  // source bits for this group
+    // Fmax: the seed (count of eligible source bits with global index < base)
+    // was a VLEN(=128)-deep serial increment loop — the deepest combinational
+    // path in the vector unit (head -> viota_res -> vrf MSB). Build the eligible
+    // predicate in parallel and reduce it with a tree popcount (fpu_pkg's
+    // popcount64 on each 64-bit half), bit-identical to the serial count.
+    let iota_active   : logic<VLEN> = if h_alu_vm ? {1'b1 repeat VLEN} : i_mask_data;
+    let iota_base_mask: logic<VLEN> = if iota_base >= 8'd128 ? {1'b1 repeat VLEN} : (({127'd0, 1'b1} << iota_base[6:0]) - {127'd0, 1'b1});
+    let iota_seed_pred: logic<VLEN> = i_vs2_data & iota_base_mask & vl_mask & iota_active;
+    let iota_seed     : logic<8>    = {1'b0, popcount64(iota_seed_pred[63:0])} + {1'b0, popcount64(iota_seed_pred[127:64])};
     var viota_res: logic<VLEN>;
     var iota_run : logic<8>;
     always_comb {
         viota_res = i_vdold_data; // inactive / tail = undisturbed
-        // seed = count of active source bits with global index < base
-        iota_run = 8'd0;
-        for gi in 0..VLEN {
-            if ((gi as 8) <: iota_base) && ((gi as 8) <: vl8) && (h_alu_vm || i_mask_data[gi]) && i_vs2_data[gi] {
-                iota_run = iota_run + 8'd1;
-            }
-        }
+        // seed = count of active source bits with global index < base (parallel
+        // tree popcount; replaces the old VLEN-deep serial increment loop).
+        iota_run = iota_seed;
         case vsew {
             3'd0: { // SEW=8 → 16 elements per register
                 for k in 0..16 {
