@@ -50,7 +50,8 @@ own type-1 hypervisor. See **Verification**.
     FP add / multiply / divide / sqrt, single + double). Integer divide and FP
     divide/sqrt are multi-cycle and non-blocking.
 - **Vector unit (V)** (`src/core/vector_unit.veryl`, `vrf.veryl`): the RVV 1.0
-  extension in a **decoupled, in-order** vector unit (ReOVE-style) that owns the
+  extension in a **decoupled, in-order** vector unit (ReOVE-style — see
+  [References](#references)) that owns the
   32 × 128-bit architectural vector register file and the vector config
   (`vtype`/`vl`/`vstart`/`vcsr`). Vector ops enter from rename in program order
   and execute in order — the VRF is not renamed and not tracked by the OoO scalar
@@ -241,3 +242,12 @@ as of Phase 12:
 | 10    | RVA23-profile ISA extensions (vector V / hypervisor H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, hint bundle (Zihintpause/Zihintntl/Zicbop/Zimop/Zcmop), Zcb, system bundle (Zawrs/Svinval/Zkt), MMU bundle (Svnapot/Svpbmt/Svadu), Zfhmin, Sscofpmf, Supm/Ssnpm. Validated on real mainline kernels: upgraded the boot from 5.15 to the 6.6 LTS and 7.1, which discover the extensions from the device tree and exercise them (Sstc timer, Svpbmt ioremap, Zicboz clear_page, Zbb, hardware unaligned). Enabling userspace FP on 7.1 exposed and fixed two SMP-only RTL bugs — an FP-context-switch wedge (MSHR int-load completion misclassified FP-dest on the CDB mux) and missing compressed FP load/store (C.FLD/C.FSD/C.FLDSP/C.FSDSP) | complete |
 | 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation with a VMID/VS-ASID-tagged TLB, HLV/HLVX/HSV (+ mode-traps), the guest-page-fault trio (20/21/23) with htval/mtval2, virtual-interrupt delivery (hvip into VS + non-delegated VS interrupts taken by HS), htimedelta + Sstc-in-VS guest timers, hstatus.VTVM/VTSR guest-op interception, VS-mode CSR isolation, and the mideleg/hedeleg read-only conformance bits. Brought up incrementally against per-feature directed tests, then validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (cross-checked on the Veryl sim and Verilator). The vector V family lands in Phase 12 | complete |
 | 12    | **Vector (V) extension (RVV 1.0)** — completing the RVA23 profile — plus full **architectural-compliance verification**. Added a decoupled, in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL): `vset{i}vl{i}`, integer / FP arithmetic (incl. multiply/divide, compares/merge, widening/narrowing, reductions), masking, and unit-stride / strided / indexed / segment / fault-only-first loads & stores; a V-enabled 7.1 kernel discovers and exercises it. The vector unit is verified by heliodor's inline **RVV arch suites** (`tb/test_arch_common.veryl`); the **scalar** RVA23 profile is machine-checked against the official RISC-V Architectural Compliance Tests (ACT4 / `riscv-arch-test`, Sail golden reference — which has no vector suite) across integer / atomic / FP / compressed / CSR / Zb\* / Zc\* / Zfa / Zfhmin / Zicbo\* / PMP / Sv\* / Exceptions. The compliance pass closed the scalar atomic gaps it surfaced (**Zabha** byte/half AMO, full **Zacas** incl. the 128-bit `amocas.q`), added **PMP** (Smpmp / SvPMP) region enforcement (load/store/fetch/AMO + PTE walks, PMA-hole faults), and fixed numerous real **FPU** bugs and several **Veryl simulator/analyzer bugs — fixed and upstreamed** to veryl-lang/veryl, so heliodor now builds on pristine upstream Veryl. See `test/act/README.md` | complete |
+
+## References
+
+- **[ReOVE]** Masayuki Kimura and Ryota Shioya, "ReOVE: Restricted Out-of-Order
+  Execution for Superscalar Processors with Vector Extension," in *Proc. ACM/IEEE
+  International Symposium on Low Power Electronics and Design (ISLPED '24)*,
+  Newport Beach, CA, USA, 2024.
+  DOI: [10.1145/3665314.3670805](https://doi.org/10.1145/3665314.3670805). The
+  decoupled, in-order vector unit follows this scheme.
