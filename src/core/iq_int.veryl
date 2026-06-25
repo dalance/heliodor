@@ -252,16 +252,27 @@ pub module iq_int #(
     // slot — position-based select deferred high-slot loads and cost load-use
     // stalls. LOADs are blocked when i_block_loads is high UNLESS at ROB head
     // (oldest, so no older STORE can be pending).
-    var issue_idx   : logic<IQ_W>;
-    var has_issuable: logic      ;
-    var iss_best_age: logic<ROB_IDX_W>;
+    // Fmax tree-ize: pairwise-argmin of two packed candidates. Pack layout =
+    // {valid(1), age(ROB_IDX_W=5), idx(IQ_W=3)} = 9 bits (the 5'd0/3'd0 literals
+    // elsewhere in this module assume the same widths). argmin over a tie-free
+    // age key (rob_idx is unique → ages are unique), so a balanced reduction is
+    // bit-identical to the old linear running-argmin — same transform the FP LZC
+    // tree-ize used. Picks the valid candidate with the smaller age.
+    function pick_oldest (
+        a: input logic<9>,
+        b: input logic<9>,
+    ) -> logic<9> {
+        return if !a[8] ? b : if !b[8] ? a : if a[7:3] <: b[7:3] ? a : b;
+    }
+    // Phase 8 S4c: OLDEST-ready issue. Was a linear O(IQ_N) running-argmin that,
+    // together with the rob oldest-blocker scan it depends on, formed the ~32ns
+    // head of the synth critical path (rob_head → this select → AGU → dmem).
+    // Now a per-entry candidate build + balanced pairwise-argmin tree.
+    var cand0: logic<9> [IQ_N];
     always_comb {
-        issue_idx    = 3'd0;
-        has_issuable = 1'b0;
-        iss_best_age = 5'd0;
         for i in 0..IQ_N {
-            let at_head: logic = sh_rob_idx[i] == i_rob_head_idx;
-            let age: logic<ROB_IDX_W> = sh_rob_idx[i] - i_rob_head_idx;
+            let at_head: logic            = sh_rob_idx[i] == i_rob_head_idx;
+            let age    : logic<ROB_IDX_W> = sh_rob_idx[i] - i_rob_head_idx;
             // Phase 8 S5.1: a LOAD is blocked iff the OLDEST store-ordering
             // blocker (unknown-addr plain store / AMO) is older than it
             // (i_block_store_age strictly less than the load's age). at_head is
@@ -286,14 +297,21 @@ pub module iq_int #(
             let blocked: logic = ((sh_is_load[i] || sh_is_amo[i]) && i_block_store_exists && (i_block_store_age <: age))
                 || (sh_is_amo[i] && !at_head)
                 || ((sh_is_load[i] || sh_is_amo[i]) && i_block_mem_xlate && !at_head) || (sh_is_csr[i] && !at_head);
-            let ready: logic = occupied[i] && rs1_rdy[i] && rs2_rdy[i] && !blocked;
-            if ready && (!has_issuable || age <: iss_best_age) {
-                issue_idx    = i as IQ_W;
-                iss_best_age = age;
-                has_issuable = 1'b1;
-            }
+            let ready  : logic = occupied[i] && rs1_rdy[i] && rs2_rdy[i] && !blocked;
+            cand0[i] = {ready, age, i as IQ_W};
         }
     }
+    // balanced pairwise-argmin tree (IQ_N = 8 → depth 3). Intermediate lets per
+    // level (Veryl mis-flags nested same-function calls as recursion).
+    let iss0_a0     : logic<9> = pick_oldest(cand0[0], cand0[1]);
+    let iss0_a1     : logic<9> = pick_oldest(cand0[2], cand0[3]);
+    let iss0_a2     : logic<9> = pick_oldest(cand0[4], cand0[5]);
+    let iss0_a3     : logic<9> = pick_oldest(cand0[6], cand0[7]);
+    let iss0_b0     : logic<9> = pick_oldest(iss0_a0, iss0_a1);
+    let iss0_b1     : logic<9> = pick_oldest(iss0_a2, iss0_a3);
+    let iss0_win    : logic<9> = pick_oldest(iss0_b0, iss0_b1);
+    let has_issuable: logic       = iss0_win[8];
+    let issue_idx   : logic<IQ_W> = if iss0_win[8] ? iss0_win[2:0] : 3'd0;
     assign o_issue_valid      = has_issuable;
     assign o_issue_op         = ops[issue_idx];
     assign o_issue_rs1_pdst    = sh_rs1_pdst[issue_idx];
@@ -330,33 +348,17 @@ pub module iq_int #(
     // age-ordered scan (tier-1) where a load competes with ALU was tried — only
     // -0.18% extra on Dhrystone vs the slot-waste risk of a non-completing load, so
     // fallback-only is kept.)
-    var issue_idx2   : logic<IQ_W>;
-    var has_issuable2: logic      ;
-    var issue_idx2A   : logic<IQ_W>    ;
-    var has_issuable2A: logic          ;
-    var iss2A_best_age: logic<ROB_IDX_W>;
-    var issue_idx2L   : logic<IQ_W>    ;
-    var has_issuable2L: logic          ;
-    var iss2L_best_age: logic<ROB_IDX_W>;
+    var cand2A: logic<9> [IQ_N];
+    var cand2L: logic<9> [IQ_N];
     always_comb {
-        issue_idx2A    = 3'd0;
-        has_issuable2A = 1'b0;
-        iss2A_best_age = 5'd0;
-        issue_idx2L    = 3'd0;
-        has_issuable2L = 1'b0;
-        iss2L_best_age = 5'd0;
         for i in 0..IQ_N {
-            let at_head: logic         = sh_rob_idx[i] == i_rob_head_idx;
+            let at_head: logic            = sh_rob_idx[i] == i_rob_head_idx;
             let age    : logic<ROB_IDX_W> = sh_rob_idx[i] - i_rob_head_idx;
             // Tier A: ALU-class (no load/store/amo/csr/fp).
             let pipe1_ok: logic = !sh_is_load[i] && !sh_is_store[i] && !sh_is_amo[i]
                 && !sh_is_csr[i] && !sh_fp_ld[i] && !sh_fp_st[i] && !sh_is_div[i];
             let ready2A: logic = occupied[i] && rs1_rdy[i] && rs2_rdy[i] && pipe1_ok && ((i as IQ_W) != issue_idx);
-            if has_issuable && ready2A && (!has_issuable2A || age <: iss2A_best_age) {
-                issue_idx2A    = i as IQ_W;
-                iss2A_best_age = age;
-                has_issuable2A = 1'b1;
-            }
+            cand2A[i] = {ready2A, age, i as IQ_W};
             // Tier L: a plain integer LOAD (not AMO/FP), blocked by the same
             // store-ordering / xlate-barrier gate slot-0 uses for loads.
             let ld_blocked: logic = (i_block_store_exists && (i_block_store_age <: age))
@@ -364,16 +366,29 @@ pub module iq_int #(
             let ready2L: logic = occupied[i] && rs1_rdy[i] && rs2_rdy[i]
                 && sh_is_load[i] && !sh_is_amo[i] && !sh_fp_ld[i]
                 && !ld_blocked && ((i as IQ_W) != issue_idx);
-            if has_issuable && ready2L && (!has_issuable2L || age <: iss2L_best_age) {
-                issue_idx2L    = i as IQ_W;
-                iss2L_best_age = age;
-                has_issuable2L = 1'b1;
-            }
+            cand2L[i] = {ready2L, age, i as IQ_W};
         }
     }
-    assign has_issuable2 = has_issuable2A || has_issuable2L;
-    assign issue_idx2    = if has_issuable2A ? issue_idx2A : issue_idx2L;
-    assign o_issue_valid2    = has_issuable2;
+    // balanced pairwise-argmin trees; each gated by has_issuable (slot-0 issued).
+    let win2A_a0      : logic<9> = pick_oldest(cand2A[0], cand2A[1]);
+    let win2A_a1      : logic<9> = pick_oldest(cand2A[2], cand2A[3]);
+    let win2A_a2      : logic<9> = pick_oldest(cand2A[4], cand2A[5]);
+    let win2A_a3      : logic<9> = pick_oldest(cand2A[6], cand2A[7]);
+    let win2A_b0      : logic<9> = pick_oldest(win2A_a0, win2A_a1);
+    let win2A_b1      : logic<9> = pick_oldest(win2A_a2, win2A_a3);
+    let win2A         : logic<9> = pick_oldest(win2A_b0, win2A_b1);
+    let win2L_a0      : logic<9> = pick_oldest(cand2L[0], cand2L[1]);
+    let win2L_a1      : logic<9> = pick_oldest(cand2L[2], cand2L[3]);
+    let win2L_a2      : logic<9> = pick_oldest(cand2L[4], cand2L[5]);
+    let win2L_a3      : logic<9> = pick_oldest(cand2L[6], cand2L[7]);
+    let win2L_b0      : logic<9> = pick_oldest(win2L_a0, win2L_a1);
+    let win2L_b1      : logic<9> = pick_oldest(win2L_a2, win2L_a3);
+    let win2L         : logic<9> = pick_oldest(win2L_b0, win2L_b1);
+    let has_issuable2A: logic       = has_issuable && win2A[8];
+    let has_issuable2L: logic       = has_issuable && win2L[8];
+    let has_issuable2 : logic       = has_issuable2A || has_issuable2L;
+    let issue_idx2    : logic<IQ_W> = if has_issuable2A ? win2A[2:0] : win2L[2:0];
+    assign o_issue_valid2 = has_issuable2;
     assign o_issue_op2       = ops[issue_idx2];
     assign o_issue_rs1_pdst2 = sh_rs1_pdst[issue_idx2];
     assign o_issue_rs2_pdst2 = sh_rs2_pdst[issue_idx2];
