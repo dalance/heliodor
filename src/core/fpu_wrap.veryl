@@ -875,16 +875,6 @@ pub module fpu_wrap #(
         o_fflags: fr_s_sum_fflags,
     );
     var fr_s_int: logic<32>;
-    inst u_fround_s_sub: fp_adder_s (
-        clk                     ,
-        rst                     ,
-        i_a     : fr_s_sum      ,
-        i_b     : fr_s_magic    ,
-        i_sub   : 1'b1          ,
-        i_rm    : fp_rm_resolved,
-        o_result: fr_s_int      ,
-        o_fflags: _             ,
-    );
     let fr_d_magic     : logic<64> = {d1[63], 11'd1075, 52'd0};
     var fr_d_sum       : logic<64>;
     var fr_d_sum_fflags: logic<5> ;
@@ -899,16 +889,93 @@ pub module fpu_wrap #(
         o_fflags: fr_d_sum_fflags,
     );
     var fr_d_int: logic<64>;
-    inst u_fround_d_sub: fp_adder (
-        clk                     ,
-        rst                     ,
-        i_a     : fr_d_sum      ,
-        i_b     : fr_d_magic    ,
-        i_sub   : 1'b1          ,
-        i_rm    : fp_rm_resolved,
-        o_result: fr_d_int      ,
-        o_fflags: _             ,
+    // fp-pipeline: PIPE=1 splits the rint trick across the two stages. The
+    // rounding add (above) lands in stage 1 and its sum is registered here, so
+    // the exact magic-subtract (below) runs in stage 2 — the two chained adders
+    // were otherwise the whole ~28ns stage-1 critical path. PIPE=0 leaves both
+    // adders combinational in stage 1 (byte-identical, used by the fround unit
+    // tests). FROUND fflags depend only on the stage-1 add, so they stay on the
+    // cheap-fflags path; only the result is finalized in stage 2.
+    var fr_s_sum_q: logic<32>;
+    var fr_d_sum_q: logic<64>;
+    var fr_d1_q   : logic<64>;
+    var fr_s1v_q  : logic<32>;
+    var fr_rm_q   : logic<3> ;
+    always_ff (clk, rst) {
+        if_reset {
+            fr_s_sum_q = 32'd0;
+            fr_d_sum_q = 64'd0;
+            fr_d1_q    = 64'd0;
+            fr_s1v_q   = 32'd0;
+            fr_rm_q    = 3'd0;
+        } else {
+            fr_s_sum_q = fr_s_sum;
+            fr_d_sum_q = fr_d_sum;
+            fr_d1_q    = d1;
+            fr_s1v_q   = s1_val;
+            fr_rm_q    = fp_rm_resolved;
+        }
+    }
+    // Subtract operands: live (PIPE=0, stage 1) or registered (PIPE=1, stage 2).
+    // The magic and rm are re-derived from the registered input so they stay
+    // aligned with the registered sum. The subtract is exact, so rm is inert.
+    let fr_s_sub_a: logic<32> = if PIPE == 1 ? fr_s_sum_q : fr_s_sum;
+    let fr_s_sub_b: logic<32> = if PIPE == 1 ? {fr_s1v_q[31], 8'd150, 23'd0} : fr_s_magic;
+    let fr_d_sub_a: logic<64> = if PIPE == 1 ? fr_d_sum_q : fr_d_sum;
+    let fr_d_sub_b: logic<64> = if PIPE == 1 ? {fr_d1_q[63], 11'd1075, 52'd0} : fr_d_magic;
+    let fr_sub_rm : logic<3>  = if PIPE == 1 ? fr_rm_q : fp_rm_resolved;
+    inst u_fround_s_sub: fp_adder_s (
+        clk           ,
+        rst           ,
+        i_a     : fr_s_sub_a,
+        i_b     : fr_s_sub_b,
+        i_sub   : 1'b1      ,
+        i_rm    : fr_sub_rm ,
+        o_result: fr_s_int  ,
+        o_fflags: _         ,
     );
+    inst u_fround_d_sub: fp_adder (
+        clk           ,
+        rst           ,
+        i_a     : fr_d_sub_a,
+        i_b     : fr_d_sub_b,
+        i_sub   : 1'b1      ,
+        i_rm    : fr_sub_rm ,
+        o_result: fr_d_int  ,
+        o_fflags: _         ,
+    );
+    // FROUND result finalize, shared by the PIPE=0 stage-1 result mux and the
+    // PIPE=1 stage-2 result mux. The special cases (NaN / |x|>=2^prec / rounds-
+    // to-zero) use the input aligned with the sub operand: live in stage 1,
+    // registered in stage 2. Bit-identical to the original inline finalize.
+    let fr_in_s1v : logic<32> = if PIPE == 1 ? fr_s1v_q : s1_val;
+    let fr_in_d1  : logic<64> = if PIPE == 1 ? fr_d1_q : d1;
+    let fr_in_snan: logic     = fr_in_s1v[30:23] == 8'hFF && fr_in_s1v[22:0] != 23'd0;
+    let fr_in_dnan: logic     = fr_in_d1[62:52] == 11'h7FF && fr_in_d1[51:0] != 52'd0;
+    var fround_s_final: logic<64>;
+    always_comb {
+        if fr_in_snan {
+            fround_s_final = {32'hFFFFFFFF, 32'h7FC00000}; // canonical NaN
+        } else if fr_in_s1v[30:23] >= 8'd150 {
+            fround_s_final = {32'hFFFFFFFF, fr_in_s1v}; // |x|>=2^23 / inf → integral
+        } else if fr_s_int[30:0] == 31'd0 {
+            fround_s_final = {32'hFFFFFFFF, fr_in_s1v[31], 31'd0}; // rounds to zero → keep sign
+        } else {
+            fround_s_final = {32'hFFFFFFFF, fr_s_int};
+        }
+    }
+    var fround_d_final: logic<64>;
+    always_comb {
+        if fr_in_dnan {
+            fround_d_final = 64'h7FF8000000000000;
+        } else if fr_in_d1[62:52] >= 11'd1075 {
+            fround_d_final = fr_in_d1; // |x|>=2^52 / inf → integral
+        } else if fr_d_int[62:0] == 63'd0 {
+            fround_d_final = {fr_in_d1[63], 63'd0}; // rounds to zero → keep sign
+        } else {
+            fround_d_final = fr_d_int;
+        }
+    }
 
     // NaN detection
     let s1_is_nan: logic = s1_val[30:23] == 8'hFF && s1_val[22:0] != 23'd0;
@@ -1439,27 +1506,13 @@ pub module fpu_wrap #(
                 }
             }
             // P10 Zfa FROUND/FROUNDNX: round to integral via the rint adder trick.
+            // PIPE=1 finalizes in stage 2 (fround_*_final via the s2_data mux);
+            // the stage-1 value here is a dead placeholder. PIPE=0 finalizes here.
             FpuOp::FROUND_S, FpuOp::FROUNDNX_S: {
-                if s1_is_nan {
-                    fpu_result = {32'hFFFFFFFF, 32'h7FC00000}; // canonical NaN
-                } else if s1_val[30:23] >= 8'd150 {
-                    fpu_result = {32'hFFFFFFFF, s1_val}; // |x|>=2^23 / inf → integral
-                } else if fr_s_int[30:0] == 31'd0 {
-                    fpu_result = {32'hFFFFFFFF, s1_val[31], 31'd0}; // rounds to zero → keep sign
-                } else {
-                    fpu_result = {32'hFFFFFFFF, fr_s_int};
-                }
+                fpu_result = if PIPE == 1 ? 64'd0 : fround_s_final;
             }
             FpuOp::FROUND_D, FpuOp::FROUNDNX_D: {
-                if d1_is_nan {
-                    fpu_result = 64'h7FF8000000000000;
-                } else if d1[62:52] >= 11'd1075 {
-                    fpu_result = d1; // |x|>=2^52 / inf → integral
-                } else if fr_d_int[62:0] == 63'd0 {
-                    fpu_result = {d1[63], 63'd0}; // rounds to zero → keep sign
-                } else {
-                    fpu_result = fr_d_int;
-                }
+                fpu_result = if PIPE == 1 ? 64'd0 : fround_d_final;
             }
 
             // P10 Zfa FLI.S / FLI.D: load one of 32 constants selected by the
@@ -2721,6 +2774,17 @@ pub module fpu_wrap #(
             FpuOp::FMADD_S, FpuOp::FMSUB_S, FpuOp::FNMADD_S, FpuOp::FNMSUB_S: {
                 s2_data   = {32'hFFFFFFFF, fp_fma_s_result};
                 s2_fflags = fp_fma_s_fflags;
+            }
+            // P10 Zfa FROUND: the rint magic-subtract runs in stage 2 (see the
+            // fround pipeline split). The result is finalized here; the fflags
+            // come from the stage-1 add via the cheap-fflags path (unchanged).
+            FpuOp::FROUND_S, FpuOp::FROUNDNX_S: {
+                s2_data   = fround_s_final;
+                s2_fflags = s2_cheap_fflags;
+            }
+            FpuOp::FROUND_D, FpuOp::FROUNDNX_D: {
+                s2_data   = fround_d_final;
+                s2_fflags = s2_cheap_fflags;
             }
             default: {
                 s2_data   = s2_cheap_result;
