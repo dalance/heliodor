@@ -455,3 +455,67 @@ build → `default` 251/0 (bare-mode loads, the first real signal) → N1 boot
 N2/N4 → N2/N4 SMP boot → Verilator SMP cross-check. Per point (2), step-1's
 ordering surface is small, but the dmem port + SB overlap are touched, so the SMP
 gates stay mandatory before declaring step-1 done.
+
+## 11. Implementation outcome + handoff to a multi-front pipelining session (2026-06-26)
+
+step-1 AND step-1.5 are **implemented, functionally correct, and parked on branch
+`lsu-phase1-wip`** (commits `2e93dc4` step-1, `58e8b42` step-1.5; the branch also
+carries the PMP tree-ize `dc1152b` that landed on master). They are **NOT merged** —
+measured to be net-negative on their own. Kept as **groundwork for a serious
+multi-front pipelining session** (the user's stated next goal: if the global CP
+roughly halves, a moderate IPC loss is acceptable).
+
+**What works (verified):** the 2-stage plain-load split (Stage A capture → Stage B
+`lsr_drive` dcache read → `lsu_cdb` completion), VA/PA-separated LSR, block-on-miss,
+age-based wrong-path squash, the two latched-vs-live fixes (FP-dest via
+`lsr_fp_ld_q`, G-stage htval via `lsr_gstage_q/gpa_q`), and step-1.5's flexible
+lane-1 routing (non-fault/non-FP loads write back on the pipe-1 `alu_cdb2` port).
+Gates green: `veryl build` (no comb loop), default 251/0 (incl litmus N=2), N1 boot
+4/4 (Sv39 + V-boot), N2 SMP boot (step-1), FP dual-backend. **NOT yet run** for the
+current step-1.5 tree: litmus N=4, N2/N4 SMP, Verilator SMP — run these first when
+resuming.
+
+**The measured reality (why it's net-negative as a standalone change):**
+- **CP is a multi-front plateau at ~25.5 ns.** After the PMP win the top cones sit
+  within ~0.5 ns: `sh_load_poison` 25.455 (load datapath, what step-1 cuts),
+  `n_inflight` ~25.1 (issue→commit free-list, fed by the issue↔commit MMU-port
+  share), `redirect_pc_q` ~25.1 (branch redirect), `load_viol_cnt` ~25.0. All cross
+  the SAME shared front (rob_head → blk_cand argmin → issue-select → PRF → AGU →
+  MMU TLB → PMP → dcache, ~16.5 ns). So cutting ONE cone (step-1) drops the global
+  CP only **26.195 → 25.845 (−1.3 %)** — `n_inflight` is right behind. §8's
+  "13–14 ns" is unreachable by the LSU split alone.
+- **IPC cost ≈ −26 % (boot), NOT recoverable by lane tricks.** NOT writeback
+  contention (step-1.5's flexible lane proved it — boot 11.52M → 11.47M, ~0 %). The
+  real cost is **(1) load-use latency 1→2** (inherent to any 2-stage load,
+  irrecoverable) and **(2) the LSR 1-deep consecutive-load bubble** (`lsr_accept =
+  !lsr_v_q` → load streams run at 1 load / 2 cycles). (2) is recoverable with
+  back-to-back capture (`lsr_accept = !lsr_v_q || lsr_complete`) BUT needs careful
+  MMU-port handling (a TLB-hit/bare load N+1 may capture the cycle load N reads, but
+  a TLB-missing N+1 must not start a PTW walk into the dcache the LSR is reading —
+  `core_dmem_ren`'s `!lsr_v_q` gate currently blocks all of it; relax it only for
+  the no-walk case). (1) remains regardless.
+
+**Why a multi-front pipelining session can still win:** to halve the global CP you
+must pipeline / restructure the SHARED FRONT and SEVERAL cones together, not just
+the load tail. Candidate cuts (each its own stage boundary + IPC implication):
+  1. **Load datapath** — step-1 (this branch). load-use +1.
+  2. **n_inflight / issue↔commit MMU-port share** (M9.A.303, `heliodor_core.veryl`
+     ~5093-5136 `core_dmem_vaddr` mux): the commit-side free-list pop depends
+     combinationally on the issuing load's MMU translate. Decoupling (separate
+     commit-translate path, or register the commit decision) cuts `n_inflight`.
+  3. **Shared front-end** (rob_head → blk_cand argmin → IQ issue-select, ~8 ns): a
+     register between issue-select and AGU cuts the shared front of ALL cones —
+     likely the highest-leverage cut (helps every endpoint); cost = +1 issue→exec.
+  4. **Branch redirect** (`redirect_pc_q`): +1 mispredict penalty.
+Pipeline the front (3) + the load tail (1) + n_inflight (2) together and the global
+CP can move toward the back-half (~13 ns) — the only path to a ~halving. Budget the
+IPC: load-use +1, issue +1, mispredict +1 — a few-% to ~10-15 % IPC for a ~45 % CP
+cut may be the trade worth signing up for.
+
+**Resume checklist:** (a) decide the stage plan — START WITH THE SHARED FRONT (3):
+most leverage, independent of the LSU ordering risk; (b) for the LSU itself, finish
+the held gates (litmus N=4, N2/N4 SMP, Verilator) on this branch before extending;
+(c) tools = the equivalence-testbench pattern (`tb/test_vmspre.veryl`) + synth
+`--dump-timing --timing-paths N`; (d) `[[project_heliodor_lsu_pipelining]]` +
+`[[project_heliodor_long_comb_path_reduction]]` in memory carry the full trail. The
+2-stage LSU here is a working, tested starting point — extend it, don't rebuild it.
