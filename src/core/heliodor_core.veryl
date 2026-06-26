@@ -1461,6 +1461,17 @@ pub module heliodor_core #(
     // muxed onto lane 0 below MSHR priority. Assigned in the int_divider block
     // after u_alu; held until it wins the lane (FPU/MSHR yield), mirroring MSHR.
     var int_div_cdb: CdbBus;
+    // Phase 0 LSU extraction (doc/lsu_pipeline_plan.md): plain loads (is_load &&
+    // !is_amo) write back on their own lane via u_lsu instead of riding alu_cdb.
+    // Muxed onto lane 0 just below alu_cdb; mutually exclusive with alu_cdb (a
+    // load op never drives alu_cdb and vice versa), so the relative order is a
+    // no-op for the winner — it only needs a slot above vu_cdb (as the load had).
+    var lsu_cdb: CdbBus;
+    // Issue-cycle data effective address (rs1 + imm, pointer-masked). Declared
+    // here (forward-ref) so u_lsu — which needs it for the load byte offset /
+    // fault VA / LQ-record VA — can read it; assigned in an always_comb further
+    // down (after agu_raw_iss / pm_mode are in scope).
+    var agu_addr_iss: logic<64>;
     // Phase 8 S10.3: MSHR capture pulse (forward-ref var, assigned in the MSHR
     // block) — the issuing load misses, the fill starts, and the load is acked
     // OUT of the IQ with its writeback deferred to fill completion.
@@ -2094,8 +2105,8 @@ pub module heliodor_core #(
     // FP move routes cdb.pdst/data to prf_fp, and V=0 (no vfmv.f.s) is
     // byte-identical (the tail is 0 exactly as before; when alu_cdb.valid the
     // original iq_iss_fp_ld is used unchanged).
-    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? fpu_dest_is_fp : if mshr_cdb.valid ? 1'b0 : if int_div_cdb.valid ? 1'b0 : if alu_cdb.valid ? iq_iss_fp_ld : vu_cdb_fp_dest;
-    let vu_cdb_free   : logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb.valid;
+    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? fpu_dest_is_fp : if mshr_cdb.valid ? 1'b0 : if int_div_cdb.valid ? 1'b0 : if alu_cdb.valid ? iq_iss_fp_ld : if lsu_cdb.valid ? iq_iss_fp_ld : vu_cdb_fp_dest;
+    let vu_cdb_free   : logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb.valid && !lsu_cdb.valid;
     // rs2 operand fed to the ALU: FP store data from prf_fp, else int rs2.
     let alu_rs2_data: logic<64> = if iq_iss_fp_st ? prf_fp_store_data : prf_rs2_data;
     // P9.3 in-cache AMO: the M9.4 bus-atomic AMO lock (amo_read_pending_q /
@@ -2157,7 +2168,7 @@ pub module heliodor_core #(
         vu_cdb.fault_vaddr = vu_cdb_fault_vaddr;
     }
     always_comb {
-        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : if int_div_cdb.valid ? int_div_cdb : if alu_cdb.valid ? alu_cdb : vu_cdb;
+        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : if int_div_cdb.valid ? int_div_cdb : if alu_cdb.valid ? alu_cdb : if lsu_cdb.valid ? lsu_cdb : vu_cdb;
     }
     // DIV/REM (incl. W variants) are routed to the multi-cycle int_divider FU
     // (below), so gate this ALU off for them — u_alu must never drive alu_cdb
@@ -2170,8 +2181,12 @@ pub module heliodor_core #(
         || iq_issue_op.base.alu_op == alu_pkg::AluOp::DIVUW
         || iq_issue_op.base.alu_op == alu_pkg::AluOp::REMW
         || iq_issue_op.base.alu_op == alu_pkg::AluOp::REMUW;
+    // Phase 0 LSU extraction: a slot-0 PLAIN load (is_load && !is_amo) writes
+    // back via u_lsu on lsu_cdb, so u_alu is gated OFF for it (and u_lsu gated ON
+    // under the identical issue condition). AMO/LR/SC (is_amo) stay on u_alu.
+    let iss_is_plain_load: logic = iq_issue_op.base.is_load && !iq_iss_is_amo;
     inst u_alu: alu_wrap (
-        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store,
+        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -2216,6 +2231,32 @@ pub module heliodor_core #(
         o_dbg_alu_alu_out : dbg_alu_alu_out                                     ,
         o_dbg_alu_instr   : dbg_alu_instr                                       ,
         o_dbg_alu_imm     : dbg_alu_imm                                         ,
+    );
+
+    // ---- Phase 0 LSU: plain-load writeback lane ----
+    // u_lsu drives lsu_cdb for a slot-0 plain load under the SAME issue gate as
+    // u_alu used (u_alu is gated off for the load via !iss_is_plain_load), so the
+    // load writes back bit-identically — just on lsu_cdb instead of alu_cdb. The
+    // load value, store→load forward overlay and fault flags are formed exactly as
+    // the old alu_wrap load path did. AGU (agu_addr_iss), forward bytes
+    // (stld_fwd_*) and the dcache read (dcache_rdata) stay in the core.
+    inst u_lsu: lsu (
+        i_valid         : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && iss_is_plain_load,
+        i_has_rd        : iq_issue_op.base.has_rd     ,
+        i_fp_ld         : iq_iss_fp_ld                ,
+        i_pdst          : iq_iss_rd_pdst              ,
+        i_rob_idx       : iq_iss_rob_idx              ,
+        i_funct3        : iq_issue_op.base.mem_funct3 ,
+        i_pc            : iq_issue_op.base.pc         ,
+        i_agu_addr      : agu_addr_iss                ,
+        i_rs2_data      : alu_rs2_data                ,
+        i_load_data     : dcache_rdata                ,
+        i_load_data_next: dcache_rdata_next           ,
+        i_fwd_data      : stld_fwd_data               ,
+        i_fwd_mask      : stld_fwd_mask               ,
+        i_dmem_fault    : dmem_mmu_fault              ,
+        i_dmem_acc_fault: dmem_mmu_acc_fault          ,
+        o_cdb           : lsu_cdb                     ,
     );
 
     // ---- Multi-cycle integer DIV/REM FU + per-op completion latch ----
@@ -4254,7 +4295,7 @@ pub module heliodor_core #(
     // masking u_alu applies — otherwise the access and u_alu's data formatting /
     // fault VA would diverge. PMM=0 → agu_addr_iss == agu_raw_iss (no-op).
     let agu_raw_iss   : logic<64> = prf_rs1_data + agu_imm_iss;
-    var agu_addr_iss  : logic<64>;
+    // agu_addr_iss declared earlier (forward-ref for u_lsu); assigned here.
     always_comb {
         case pm_mode {
             2'b10  : agu_addr_iss = {(if pm_va ? agu_raw_iss[56] : 1'b0) repeat 7, agu_raw_iss[56:0]};

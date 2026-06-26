@@ -1,0 +1,125 @@
+// LSU — Load/Store Unit (Phase 0 of doc/lsu_pipeline_plan.md).
+//
+// Phase 0 extracts the PLAIN-LOAD data path out of `alu_wrap` and onto its own
+// CDB lane (`lsu_cdb`), byte-identical to the old `alu_wrap` load path. This
+// localizes the load datapath so the later Stage-A→B pipeline register becomes
+// an internal module boundary, and — by giving loads their own writeback lane —
+// removes the lane-0 structural hazard the 2-stage load would otherwise face
+// (Stage-B load vs Stage-A ALU). AMO / LR / SC / STORE stay in `alu_wrap` (the
+// blocking path); only plain loads (`is_load && !is_amo`) flow through here.
+//
+// Single-cycle today: the load value is formed exactly as the old `alu_wrap`
+// did — a 128-bit window {next,cur} >> byte_off*8, store→load forward overlay
+// (i_fwd_*), then funct3 sign/zero-extend, with FLH/FLW NaN-boxing for FP loads.
+// Phase 1 adds the Stage register inside this module.
+pub module lsu #(
+    param PRF_W    : u32 = 6,
+    param ROB_IDX_W: u32 = 5,
+) (
+    // Plain-load issue-cycle valid. The core gates this identically to the old
+    // u_alu.i_issue_valid path, restricted to plain loads (is_load && !is_amo),
+    // so a load drives `lsu_cdb` exactly when it used to drive `alu_cdb`.
+    i_valid  : input logic            ,
+    i_has_rd : input logic            , // integer rd present (base.has_rd)
+    i_fp_ld  : input logic            , // FP load (FLH/FLW/FLD) → FP regfile
+    i_pdst   : input logic<PRF_W>     ,
+    i_rob_idx: input logic<ROB_IDX_W> ,
+    i_funct3 : input logic<3>         , // mem_funct3: width + sign/zero-extend
+    i_pc     : input logic<64>        , // for redirect_pc = pc+4 (CDB-bit parity)
+    // Effective address (= core agu_addr_iss): byte offset + fault VA + LQ-record VA.
+    i_agu_addr: input logic<64>,
+    i_rs2_data: input logic<64>, // store_data (dead for a load; carried for CDB parity)
+    // Cache read data (current + next dword for the misalign window).
+    i_load_data     : input logic<64>,
+    i_load_data_next: input logic<64>,
+    // Store→load forward bytes (in the natural load frame) + mask (computed in core).
+    i_fwd_data: input logic<64>,
+    i_fwd_mask: input logic<8> ,
+    // dmem page fault (cause 13) / PMP access fault (cause 5) for this load.
+    i_dmem_fault    : input logic,
+    i_dmem_acc_fault: input logic,
+    // CDB output (the load lane).
+    o_cdb: output pipeline_pkg::CdbBus,
+) {
+    // LOAD funct3 sub-decode (sign / zero extend, byte / half / word / dword),
+    // identical to the old alu_wrap formatting. byte_off selects the dword window.
+    let byte_off    : logic<3>   = i_agu_addr[2:0];
+    let ld_shift_amt: logic<7>   = {byte_off, 3'b000} as 7;
+    let ld_concat   : logic<128> = {i_load_data_next, i_load_data};
+    let ld_shifted_w: logic<128> = ld_concat >> ld_shift_amt;
+    let ld_shifted  : logic<64>  = ld_shifted_w[63:0];
+    // Merge the core-computed forward bytes over the dcache bytes. i_fwd_data is
+    // already in the naturally-aligned load frame (byte p = addr agu_addr+p,
+    // matching ld_shifted), so this is 8 constant-slice selects.
+    let ld_merged: logic<64> = {
+        if i_fwd_mask[7] ? i_fwd_data[63:56] : ld_shifted[63:56],
+        if i_fwd_mask[6] ? i_fwd_data[55:48] : ld_shifted[55:48],
+        if i_fwd_mask[5] ? i_fwd_data[47:40] : ld_shifted[47:40],
+        if i_fwd_mask[4] ? i_fwd_data[39:32] : ld_shifted[39:32],
+        if i_fwd_mask[3] ? i_fwd_data[31:24] : ld_shifted[31:24],
+        if i_fwd_mask[2] ? i_fwd_data[23:16] : ld_shifted[23:16],
+        if i_fwd_mask[1] ? i_fwd_data[15:8] : ld_shifted[15:8],
+        if i_fwd_mask[0] ? i_fwd_data[7:0] : ld_shifted[7:0]
+    };
+    let ld_b_raw : logic<8>  = ld_merged[7:0];
+    let ld_h_raw : logic<16> = ld_merged[15:0];
+    let ld_w_raw : logic<32> = ld_merged[31:0];
+    let ld_d     : logic<64> = ld_merged;
+    let ld_b_sext: logic<56> = if ld_b_raw[7] ? 56'hff_ffff_ffff_ffff : 56'd0;
+    let ld_h_sext: logic<48> = if ld_h_raw[15] ? 48'hffff_ffff_ffff : 48'd0;
+    let ld_w_sext: logic<32> = if ld_w_raw[31] ? 32'hffff_ffff : 32'd0;
+    let ld_lb    : logic<64> = {ld_b_sext, ld_b_raw};
+    let ld_lh    : logic<64> = {ld_h_sext, ld_h_raw};
+    let ld_lw    : logic<64> = {ld_w_sext, ld_w_raw};
+    let ld_lbu   : logic<64> = {56'd0, ld_b_raw};
+    let ld_lhu   : logic<64> = {48'd0, ld_h_raw};
+    let ld_lwu   : logic<64> = {32'd0, ld_w_raw};
+
+    var load_data_sel: logic<64>;
+    always_comb {
+        case i_funct3 {
+            3'b000 : load_data_sel = ld_lb; // LB
+            3'b001 : load_data_sel = ld_lh; // LH
+            3'b010 : load_data_sel = ld_lw; // LW
+            3'b011 : load_data_sel = ld_d; // LD
+            3'b100 : load_data_sel = ld_lbu; // LBU
+            3'b101 : load_data_sel = ld_lhu; // LHU
+            3'b110 : load_data_sel = ld_lwu; // LWU
+            default: load_data_sel = ld_d;
+        }
+    }
+    // FLH (funct3=001) NaN-boxes the 16-bit half (upper 48 bits all 1s); FLW
+    // (010) boxes the 32-bit word (upper 32 bits all 1s); FLD (011) is a full
+    // dword like an integer LD. Integer loads ignore i_fp_ld.
+    let fp_load_result: logic<64> = if i_fp_ld && i_funct3 == 3'b001 ? {48'hffff_ffff_ffff, ld_h_raw}
+    : if i_fp_ld && i_funct3 == 3'b010 ? {32'hffff_ffff, ld_w_raw} : load_data_sel;
+
+    // CDB drive — reproduces, bit-for-bit, the CdbBus the old alu_wrap emitted
+    // for a plain load. A load is never a control op (mispredict=0; redirect_pc =
+    // pc+4 = the old resolved_target for a non-control op). store_addr/store_funct3
+    // carry the load's VA/size for the Phase 8 S9 Load-Queue record; store_data
+    // (= rs2) and cas_q_mem_* (= the loaded dwords) are dead for a plain load but
+    // carried verbatim so the ROB shadow latches identical bits.
+    assign o_cdb.valid        = i_valid;
+    assign o_cdb.has_rd       = i_valid && (i_has_rd || i_fp_ld);
+    assign o_cdb.pdst         = i_pdst;
+    assign o_cdb.data         = fp_load_result;
+    assign o_cdb.rob_idx      = i_rob_idx;
+    assign o_cdb.mispredict   = 1'b0;
+    assign o_cdb.redirect_pc  = i_pc + 64'd4;
+    assign o_cdb.is_store     = 1'b0;
+    assign o_cdb.store_addr   = i_agu_addr;
+    assign o_cdb.store_data   = i_rs2_data;
+    assign o_cdb.store_funct3 = i_funct3;
+    assign o_cdb.cas_q_mem_lo  = i_load_data;
+    assign o_cdb.cas_q_mem_hi  = i_load_data_next;
+    assign o_cdb.is_load      = i_valid;
+    assign o_cdb.is_csr       = 1'b0;
+    assign o_cdb.csr_addr     = 12'd0;
+    assign o_cdb.csr_wdata    = 64'd0;
+    assign o_cdb.csr_illegal  = 1'b0;
+    assign o_cdb.is_lfault    = i_valid && (i_dmem_fault || i_dmem_acc_fault);
+    assign o_cdb.is_sfault    = 1'b0;
+    assign o_cdb.fault_acc    = i_valid && i_dmem_acc_fault && !i_dmem_fault;
+    assign o_cdb.fault_vaddr  = i_agu_addr;
+}
