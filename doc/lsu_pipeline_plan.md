@@ -383,3 +383,75 @@ LSR-block; the store-buffer overlap checks (`sb_ld_ovl`, `replay_sb_ovl` `:6506`
 now see a Stage-B-old load; two-in-flight (LSR Stage-B + Stage-A translate) on the
 dcache vs MMU/PTW port (plan §4.5 priority). Litmus N4 + Verilator SMP are the
 decisive gates — budget `$display`-trace debugging.
+
+### Phase 1 step-1 — refined implementation plan (2026-06-26, the concrete wiring)
+
+The scaffold commit `e46ac07` declared the 12 LSR registers (above). This
+subsection records the precise wiring decisions worked out before the datapath
+rewire — points NOT in the conceptual plan above. **Read this before coding.**
+
+**(1) The lane-0 structural hazard is solved by BLOCK-ON-ISSUE, not a separate
+lane.** A Stage-B load (driving `lsu_cdb`) and a Stage-A slot-0 op (ALU/store/the
+*next* plain load) would both want slot-0 resources in the same cycle. Step-1
+resolves this the same way the MSHR does: **`!lsr_v_q` gates ALL slot-0 issue** —
+`u_alu i_issue_valid`, the non-div/non-load branch of `iq_issue_ack`, and the
+plain-load capture itself all stop while the LSR is occupied. This costs one
+issue bubble per load (IPC hit) but is correct and simple. A dedicated
+non-blocking lane (two loads truly overlapped) is **step-1.5**, deferred.
+
+**(2) 🔑 Byproduct of block-on-issue: step-1 does NOT touch `rob.veryl` at all.**
+Because block-on-issue serializes the Stage-B load against any slot-0 store, the
+violation/fold windows (`rob.veryl:826-834,941-945`) keep seeing the Stage-B load
+through CDB lane-0 exactly as they see today's single-cycle load — the live-load
+record still arrives via the same `i_cdb*_is_load`/`i_lq_rec_*` ports, just one
+cycle later, with the slot-0 store provably not co-issued. **The §4.2/§4.3/§10
+"re-time the LQ record / fold windows" work belongs to step-3 (non-blocking),
+not step-1.** This collapses the ordering risk of step-1 dramatically: the gates
+that matter for step-1 are bare-load `default` + Sv39 N1 boot, not litmus.
+
+**(3) Synth-wall reality (measured, recorded so we don't over-promise §8).**
+Killing the LSU cone does NOT get global CP to the §8 "13–14 ns": with the LSU
+path cut, the global critical path only relaxes to **~25.125 ns at
+`redirect_pc_q`** (≈ −4% from 26.195). The §8 target is unreachable by the LSU
+split alone — `redirect_pc_q` and the fp div/sqrt seed (`reg_r_exp` ~14 ns, now
+secondary) are the next walls. Treat step-1's payoff as **architectural
+groundwork + a few-percent CP**, not the headline −47%. Re-measure after the
+rewire to confirm `redirect_pc_q` is the real new #1.
+
+**(4) The concrete edit list (~11 sites).** All in `heliodor_core.veryl` unless
+noted; line numbers are pre-rewire (`e46ac07`):
+  1. **LSR regs:** add `lsr_unc_q` (uncached flag, `dmem_mmu`'s `o_uncached`
+     latched) to the 12 scaffold fields — Stage B needs it for the dcache
+     `i_uncached` arm.
+  2. **Comb signals (new):** `lsr_accept = !lsr_v_q` (issue may capture);
+     `lsr_fault = lsr_fault_pg_q || lsr_fault_acc_q`; `lsr_drive` (Stage-B dcache
+     arm — model on `replay_drive` `:6194`); `lane0_hi_free` / `lsr_complete`
+     (Stage-B writeback fires); `lsr_dc_load_next`; `lsr_capture` (Stage-A latch
+     enable); `lsr_squashed` (flush, reuse MSHR squash logic).
+  3. **LSR `always_ff`:** capture on `lsr_capture`, drain on `lsr_complete`,
+     squash on flush (`lsr_squashed`).
+  4. **`u_alu`:** gate `i_issue_valid` (and slot-0 issue arms) with `!lsr_v_q`
+     (block-on-issue, point 1).
+  5. **`u_lsu` inputs:** switch from Stage-A combinational signals to Stage-B —
+     `i_valid=lsr_complete`, registered metadata (`lsr_*_q`),
+     `i_agu_addr=lsr_vaddr_q`, `i_load_data=dcache_rdata`, Stage-B forward,
+     `i_dmem_fault*=lsr_fault_*_q`.
+  6. **`iq_issue_ack`:** branch a plain load into `lsr_capture` (acks OUT of the
+     IQ at Stage A, like `mshr_capture` folds in at `:2421`).
+  7. **Forward-gen retiming:** the 16 per-byte `always_comb` sf0..7
+     (`:4347-4543`): `agu_addr_iss`→`lsr_vaddr_q`, `stld_fwd_en`→`lsr_v_q`,
+     `age`→`lsr_rob_idx_q`. (The slot-1 `sg*` generators stay as-is.)
+  8. **SB forward layer** (`:5654-5817`): same retime to `lsr_vaddr_q`.
+  9. **`core_dmem_ren`** (`:5273`): the issuing-load read term → AMO-read only
+     (`issue_is_load`→`issue_amo_read`); plain-load read now driven by `lsr_drive`.
+ 10. **`dcache` arm:** `i_addr`/`i_ren`/`i_load_next`/`i_uncached` muxed from the
+     `lsr_drive` Stage-B drive (model on the `replay_drive` muxes at `:6252`).
+ 11. **`mshr_plain_load`** (`:6426`): disable for step-1 (LSR blocks on miss;
+     non-blocking MSHR-from-Stage-B is step-2).
+
+**(5) Gate order (escalate only on green, [[feedback_regression_cadence]]):**
+build → `default` 251/0 (bare-mode loads, the first real signal) → N1 boot
+(`test_soc_linux_boot`, exercises Sv39 translate + the port arbitration) → litmus
+N2/N4 → N2/N4 SMP boot → Verilator SMP cross-check. Per point (2), step-1's
+ordering surface is small, but the dmem port + SB overlap are touched, so the SMP
+gates stay mandatory before declaring step-1 done.
