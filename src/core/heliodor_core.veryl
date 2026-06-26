@@ -1534,6 +1534,19 @@ pub module heliodor_core #(
     var lsr_rs2_q      : logic<64>       ; // store_data CDB parity
     var lsr_fault_pg_q : logic           ; // Stage-A page fault (dmem_mmu_fault)
     var lsr_fault_acc_q: logic           ; // Stage-A PMP access fault
+    var lsr_unc_q      : logic           ; // Stage-A uncached/MMIO (dc_uncached) → Stage-B i_uncached
+    var lsr_gstage_q   : logic           ; // Phase 11-H: Stage-A two-stage G-stage fault (cause 21/23 + htval)
+    var lsr_gpa_q      : logic<64>       ; // Phase 11-H: Stage-A faulting guest PA (htval)
+    // Phase 1 LSU 2-stage control (combinational; forward-declared so the EARLY
+    // issue gates / dcache port muxes can read them — assigned after the dcache
+    // instance / replay_drive where store_drive, dmem_mmu_idle, redirect_fire are
+    // in scope). lsr_capture deliberately EXCLUDES iss_dc_ok (the dcache_stall
+    // term): the Stage-A read is suppressed (no miss to wait on), so a dcache_stall
+    // dependency here would close a comb loop (i_ren depends on lsr_capture).
+    var lsr_capture    : logic           ; // Stage-A latch enable + IQ ack (this cycle)
+    var lsr_drive      : logic           ; // Stage-B owns the dcache read port
+    var lsr_complete   : logic           ; // Stage-B writeback fires (→ u_lsu.i_valid)
+    var lsr_dc_load_next: logic          ; // Stage-B misaligned cross-line fill
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -2124,7 +2137,13 @@ pub module heliodor_core #(
     // FP move routes cdb.pdst/data to prf_fp, and V=0 (no vfmv.f.s) is
     // byte-identical (the tail is 0 exactly as before; when alu_cdb.valid the
     // original iq_iss_fp_ld is used unchanged).
-    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? fpu_dest_is_fp : if mshr_cdb.valid ? 1'b0 : if int_div_cdb.valid ? 1'b0 : if alu_cdb.valid ? iq_iss_fp_ld : if lsu_cdb.valid ? iq_iss_fp_ld : vu_cdb_fp_dest;
+    // Phase 1 LSU 2-stage: when lsu_cdb wins, the completing load's FP-ness is the
+    // LSR's LATCHED flag (lsr_fp_ld_q), NOT the op the IQ presents at Stage B
+    // (iq_iss_fp_ld) — those differ once the load is decoupled from issue. Using the
+    // current-issue flag routed FP loads to the INT regfile (all rv64uf/ud/zfhmin/
+    // vfarith load+arith tests failed). alu_cdb never carries an FP load now (plain
+    // loads ride lsu_cdb), so its iq_iss_fp_ld branch is dead-0 and stays as-is.
+    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? fpu_dest_is_fp : if mshr_cdb.valid ? 1'b0 : if int_div_cdb.valid ? 1'b0 : if alu_cdb.valid ? iq_iss_fp_ld : if lsu_cdb.valid ? lsr_fp_ld_q : vu_cdb_fp_dest;
     let vu_cdb_free   : logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb.valid && !lsu_cdb.valid;
     // rs2 operand fed to the ALU: FP store data from prf_fp, else int rs2.
     let alu_rs2_data: logic<64> = if iq_iss_fp_st ? prf_fp_store_data : prf_rs2_data;
@@ -2205,7 +2224,11 @@ pub module heliodor_core #(
     // under the identical issue condition). AMO/LR/SC (is_amo) stay on u_alu.
     let iss_is_plain_load: logic = iq_issue_op.base.is_load && !iq_iss_is_amo;
     inst u_alu: alu_wrap (
-        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load,
+        // Phase 1 LSU 2-stage: block ALL slot-0 issue while a plain load occupies
+        // the LSR (lsr_v_q) — u_alu (alu_cdb), the int divider and lsu_cdb share the
+        // lane-0 cdb mux, so the Stage-B load writeback (lsu_cdb) cannot contend
+        // with a Stage-A ALU writeback. Costs one issue bubble per load (step-1).
+        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !lsr_v_q,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -2259,23 +2282,28 @@ pub module heliodor_core #(
     // load value, store→load forward overlay and fault flags are formed exactly as
     // the old alu_wrap load path did. AGU (agu_addr_iss), forward bytes
     // (stld_fwd_*) and the dcache read (dcache_rdata) stay in the core.
+    // Phase 1 LSU 2-stage: u_lsu now reads the STAGE-B registered metadata (lsr_*_q)
+    // and the Stage-B dcache read / re-pointed forward net; it fires when the LSR
+    // completes (lsr_complete = hit/uncached read landed, or a Stage-A fault). The
+    // dcache read at lsr_paddr_q (lsr_drive) puts the load data on dcache_rdata, and
+    // the forward net (sf*/sbf*) is re-pointed to lsr_vaddr_q/lsr_paddr_q below.
     inst u_lsu: lsu (
-        i_valid         : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && iss_is_plain_load,
-        i_has_rd        : iq_issue_op.base.has_rd     ,
-        i_fp_ld         : iq_iss_fp_ld                ,
-        i_pdst          : iq_iss_rd_pdst              ,
-        i_rob_idx       : iq_iss_rob_idx              ,
-        i_funct3        : iq_issue_op.base.mem_funct3 ,
-        i_pc            : iq_issue_op.base.pc         ,
-        i_agu_addr      : agu_addr_iss                ,
-        i_rs2_data      : alu_rs2_data                ,
-        i_load_data     : dcache_rdata                ,
-        i_load_data_next: dcache_rdata_next           ,
-        i_fwd_data      : stld_fwd_data               ,
-        i_fwd_mask      : stld_fwd_mask               ,
-        i_dmem_fault    : dmem_mmu_fault              ,
-        i_dmem_acc_fault: dmem_mmu_acc_fault          ,
-        o_cdb           : lsu_cdb                     ,
+        i_valid         : lsr_complete    ,
+        i_has_rd        : lsr_has_rd_q     ,
+        i_fp_ld         : lsr_fp_ld_q      ,
+        i_pdst          : lsr_pdst_q       ,
+        i_rob_idx       : lsr_rob_idx_q    ,
+        i_funct3        : lsr_funct3_q     ,
+        i_pc            : lsr_pc_q         ,
+        i_agu_addr      : lsr_vaddr_q      ,
+        i_rs2_data      : lsr_rs2_q        ,
+        i_load_data     : dcache_rdata     ,
+        i_load_data_next: dcache_rdata_next,
+        i_fwd_data      : stld_fwd_data    ,
+        i_fwd_mask      : stld_fwd_mask    ,
+        i_dmem_fault    : lsr_fault_pg_q   ,
+        i_dmem_acc_fault: lsr_fault_acc_q  ,
+        o_cdb           : lsu_cdb          ,
     );
 
     // ---- Multi-cycle integer DIV/REM FU + per-op completion latch ----
@@ -2293,7 +2321,7 @@ pub module heliodor_core #(
     var int_div_owner_q   : logic<ROB_IDX_W>;
     let int_div_done_for_me: logic = int_div_done_q && iq_iss_rob_idx == int_div_owner_q;
     let int_div_start      : logic = iq_issue_valid && iss_is_div && !redirect_fire
-        && !int_div_busy_w && !int_div_started && !int_div_done_for_me;
+        && !int_div_busy_w && !int_div_started && !int_div_done_for_me && !lsr_v_q; // block-on-issue (lane-0 share)
     inst u_int_div: int_divider (
         clk                              ,
         rst                              ,
@@ -2435,9 +2463,13 @@ pub module heliodor_core #(
     // A DIV/REM stays at the iq_int head (operand-held) until the int_divider FU
     // completes AND wins lane 0 (FPU/MSHR have priority) — then it acks out as its
     // result writes back on int_div_cdb. Non-div ops use the existing handshake.
+    // Phase 1 LSU 2-stage: a plain load no longer acks on the normal path — it acks
+    // OUT of the IQ when it latches the LSR (lsr_capture, Stage A), exactly like the
+    // MSHR capture folds in. The normal path is additionally gated by !lsr_v_q so no
+    // OTHER slot-0 op acks/leaves the IQ while a load occupies the LSR (block-on-issue).
     let iq_issue_ack: logic = if iss_is_div ?
         (int_div_cdb.valid && !fpu_cdb.valid && !mshr_cdb.valid)
-    : ((iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store) || mshr_capture);
+    : ((iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !lsr_v_q) || lsr_capture || mshr_capture);
 
     // ============================================================
     // PRF
@@ -3230,8 +3262,13 @@ pub module heliodor_core #(
         i_cdb_fault_acc      : cdb.fault_acc        ,
         i_cdb_fault_vaddr    : cdb.fault_vaddr      ,
         // Phase 11-H A2: live MMU gstage/gpa for the CDB fault-delivery path.
-        i_cdb_fault_gstage   : dmem_mmu_gstage      ,
-        i_cdb_fault_gpa      : dmem_mmu_gpa         ,
+        // Phase 1 LSU 2-stage: a plain load delivers its G-stage fault flag + GPA via
+        // lsu_cdb at Stage B, when the LIVE dmem_mmu_gstage/gpa no longer reflect it
+        // (the MMU moved on). Use the LATCHED LSR values for the lsu_cdb winner; an
+        // AMO/store fault (alu_cdb) or a vector load fault (vu_cdb) is single-cycle,
+        // so its live MMU gstage/gpa is correct (unchanged).
+        i_cdb_fault_gstage   : if lsu_cdb.valid ? lsr_gstage_q : dmem_mmu_gstage,
+        i_cdb_fault_gpa      : if lsu_cdb.valid ? lsr_gpa_q : dmem_mmu_gpa,
         // M6 + V3: FP exception flags accrued into fcsr at commit. Keyed by
         // cdb.rob_idx, so the source must follow the lane-0 mux winner. The
         // scalar FPU has highest priority (fpu_fflags_wen ⟹ fpu_cdb.valid ⟹ it
@@ -4387,8 +4424,14 @@ pub module heliodor_core #(
     // constant slices. stld_fwd_data is in the natural load frame (byte p = addr
     // agu_addr_iss+p, matching alu_wrap's ld_shifted); stld_fwd_mask gates it.
     // ============================================================
-    let stld_fwd_age: logic<ROB_IDX_W> = iq_iss_rob_idx - rob_head_idx;
-    let stld_fwd_en : logic              = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo;
+    // Phase 1 LSU 2-stage: the store→load forward network (ROB sf* + SB sbf* below)
+    // is computed at STAGE B against the LSR's registered VA/PA and age — it is
+    // active throughout the load's Stage B (lsr_v_q) and consumed on the completing
+    // cycle. Older stores that committed between the load's Stage A and Stage B moved
+    // from the ROB shadow into the SB; the combined ROB+SB net still covers them, so
+    // the forward stays complete (just evaluated one cycle later than at issue).
+    let stld_fwd_age: logic<ROB_IDX_W> = lsr_rob_idx_q - rob_head_idx;
+    let stld_fwd_en : logic              = lsr_v_q;
     assign ls_addr = rob_store_addr;
     assign ls_data = rob_store_data;
     assign ls_f3   = rob_store_funct3;
@@ -4408,7 +4451,7 @@ pub module heliodor_core #(
         sf0_v = 1'b0; sf0_age = '0; sf0_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd0;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd0;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4419,7 +4462,7 @@ pub module heliodor_core #(
         sf1_v = 1'b0; sf1_age = '0; sf1_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd1;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd1;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4430,7 +4473,7 @@ pub module heliodor_core #(
         sf2_v = 1'b0; sf2_age = '0; sf2_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd2;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd2;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4441,7 +4484,7 @@ pub module heliodor_core #(
         sf3_v = 1'b0; sf3_age = '0; sf3_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd3;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd3;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4452,7 +4495,7 @@ pub module heliodor_core #(
         sf4_v = 1'b0; sf4_age = '0; sf4_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd4;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd4;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4463,7 +4506,7 @@ pub module heliodor_core #(
         sf5_v = 1'b0; sf5_age = '0; sf5_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd5;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd5;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4474,7 +4517,7 @@ pub module heliodor_core #(
         sf6_v = 1'b0; sf6_age = '0; sf6_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd6;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd6;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -4485,7 +4528,7 @@ pub module heliodor_core #(
         sf7_v = 1'b0; sf7_age = '0; sf7_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss + 64'd7;
+            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd7;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -5289,7 +5332,13 @@ pub module heliodor_core #(
     // is the oldest op: store_drive / mmu_walk_inflight / replay are naturally idle;
     // the gates below are defensive port arbitration only.
     let sc_walk_drive  : logic    = issue_sc_walk && !redirect_fire && !store_drive && !replay_q && !mmu_walk_inflight && !vu_mem_port_req;
-    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q) || sc_walk_drive || (mmu_walk_inflight && !sb_walk_ovl));
+    // Phase 1 LSU 2-stage: a plain load drives core_dmem_ren only at Stage A (to run
+    // the MMU translate); while it is in Stage B (lsr_v_q) the issue-load term is
+    // gated off so the next selected (but not-yet-issued, block-on-issue) load does
+    // NOT start a fresh PTW walk that would steal the port from the LSR's Stage-B
+    // read (mmu_walk_inflight would drop dmem_mmu_idle → lsr_drive). The actual
+    // Stage-B dcache read is driven by lsr_drive at the dcache i_ren mux.
+    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q && !lsr_v_q) || sc_walk_drive || (mmu_walk_inflight && !sb_walk_ovl));
     let core_dmem_wstrb: logic<8> = if vu_mem_active ? vu_mem_wstrb : if store_drive ? st_wstrb : 8'd0;
     // P9.3: mark the AMO/LR data read so the dcache serves it only from an
     // OWNED (E/M) line — an S hit or a miss raises an RFO fill first (the
@@ -5729,7 +5778,10 @@ pub module heliodor_core #(
     // One always_comb per byte, mirroring the S5.1 ROB nets (fused
     // accumulators falsely trip the combinational_loop diagnostic).
     // ============================================================
-    let sbf_pa: logic<64> = if dmem_vm_on_op ? dmu_dmem_addr : agu_addr_iss; // Phase 11-H: HLV load → translated PA
+    // Phase 1 LSU 2-stage: the SB forward layer compares PHYSICAL addresses, so it
+    // uses the LSR's registered PA (lsr_paddr_q = the Stage-A translated PA in both
+    // bare and VM modes), keyed by lsr_v_q (stld_fwd_en) at Stage B.
+    let sbf_pa: logic<64> = lsr_paddr_q;
     var sbf0_v: logic; var sbf0_b: logic<8>;
     var sbf1_v: logic; var sbf1_b: logic<8>;
     var sbf2_v: logic; var sbf2_b: logic<8>;
@@ -6211,6 +6263,34 @@ pub module heliodor_core #(
     // and the !replay_q term in core_dmem_ren keeps a NEW walk from starting
     // mid-replay.
     let replay_drive: logic = replay_q && !store_drive && dmem_mmu_idle;
+
+    // ============================================================
+    // Phase 1 LSU 2-stage: Load Stage Register control (assigned here so
+    // store_drive / dmem_mmu_idle / redirect_fire are in scope; the signals are
+    // forward-declared near the LSR regs and read by the EARLY issue gates / dcache
+    // muxes). A plain load is cut into Stage A (capture) and Stage B (drive+complete).
+    // ============================================================
+    let lsr_fault : logic = lsr_fault_pg_q || lsr_fault_acc_q;
+    // Stage A: a plain load that has finished translate+PMP (!dmem_mmu_busy) and is
+    // otherwise free to issue latches the LSR and acks OUT of the IQ — the SAME gate
+    // the old single-cycle u_lsu.i_valid used, MINUS iss_dc_ok (the Stage-A dcache
+    // read is suppressed, so there is no miss to wait on, and including dcache_stall
+    // here would close a comb loop: i_ren depends on lsr_capture). Requires the LSR
+    // free (!lsr_v_q) — block-on-issue.
+    assign lsr_capture = iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block
+        && !fpu_cdb.valid && !mshr_cdb.valid && !load_blocks_on_store && iss_is_plain_load
+        && !lsr_v_q && !replay_q && !redirect_fire && !early_redir_fire_q;
+    // Stage B: own the dcache read port. Mirror replay_drive's port arbitration
+    // (yield to a committing store's write and to any in-flight MMU walk); a faulting
+    // load needs no read (it completes from the latched fault).
+    assign lsr_drive = lsr_v_q && !lsr_fault && !store_drive && dmem_mmu_idle && !replay_q;
+    // Stage B misaligned cross-line span, from the latched funct3 + PA byte offset.
+    let lsr_ld_bytes: logic<5> = if lsr_funct3_q[1:0] == 2'b00 ? 5'd1
+        : if lsr_funct3_q[1:0] == 2'b01 ? 5'd2
+        : if lsr_funct3_q[1:0] == 2'b10 ? 5'd4 : 5'd8;
+    let lsr_span_sum: logic<6> = ({3'b0, lsr_paddr_q[2:0]} as 6) + ({1'b0, lsr_ld_bytes} as 6);
+    assign lsr_dc_load_next = lsr_v_q && (lsr_span_sum >: 6'd8) && !lsr_unc_q;
+
     var dc_mem_addr : logic<64>    ;
     var dc_mem_wdata: logic<64> [8]; // S25: write-channel line lanes
     var dc_mem_wen  : logic        ;
@@ -6268,7 +6348,11 @@ pub module heliodor_core #(
         rst                                              ,
         // S10.4b: a replay drive overrides the READ address (the write path is
         // unaffected — replay_drive excludes store_drive, so i_wen=0 then).
-        i_addr           : if replay_drive ? replay_addr : dmu_dmem_addr,
+        // Phase 1 LSU 2-stage: a Stage-B load drive (lsr_drive) overrides the READ
+        // address with the LSR's registered PA (the write path is unaffected —
+        // lsr_drive excludes store_drive, so i_wen=0 then). lsr_drive and replay_drive
+        // are mutually exclusive (the MSHR is disabled for plain loads in step-1).
+        i_addr           : if lsr_drive ? lsr_paddr_q : if replay_drive ? replay_addr : dmu_dmem_addr,
         i_wdata          : dmu_dmem_wdata                ,
         // S20: a buffered (sb_vm_ok) store must not ALSO write through i_wen,
         // and a slow store's write may not pass an older buffered store to
@@ -6278,11 +6362,16 @@ pub module heliodor_core #(
         i_wen_excl       : dc_wen_excl                   , // P9.3: in-cache AMO/SC local merge
         i_wen_excl_q     : dc_wen_excl_q                 , // Zacas amocas.q: also write hi dword
         i_wdata_hi       : cas_q_new_hi                  , // Zacas amocas.q: hi dword (rs2+1)
-        i_ren            : dmu_dmem_ren || replay_drive  ,
-        i_uncached       : dc_uncached                   , // P9.5: MMIO single-beat read
+        // Phase 1 LSU 2-stage: the plain load's Stage-A data read is SUPPRESSED
+        // (!lsr_capture) so the dcache stays OUT of the Stage-A cone (cut after
+        // translate+PMP); the Stage-B read is driven by lsr_drive instead. The MMU
+        // still translates (core_dmem_ren), and PTW PTE reads (dmem_mmu_busy, so
+        // lsr_capture=0) pass through unaffected.
+        i_ren            : (dmu_dmem_ren && !lsr_capture) || replay_drive || lsr_drive,
+        i_uncached       : if lsr_drive ? lsr_unc_q : (dc_uncached && !lsr_capture), // P9.5: MMIO single-beat read (Stage B uses the latched flag)
         i_wstrb          : dmu_dmem_wstrb                ,
         i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
-        i_load_next      : dc_load_next && !replay_drive && !dc_uncached, // B.3: misaligned cross-line load fill
+        i_load_next      : if lsr_drive ? lsr_dc_load_next : (dc_load_next && !replay_drive && !dc_uncached && !lsr_capture), // B.3: misaligned cross-line load fill (Stage B uses the latched span)
         i_amo_read       : dc_amo_read && !replay_drive  , // P9.3: AMO/LR read → ownership (RFO)
         // Phase 8 S5.2: 2nd hit-only read port (dual-issue loads). Tied off in
         // step 1; wired to the slot-1 load AGU/result in steps 2-3.
@@ -6442,7 +6531,13 @@ pub module heliodor_core #(
     // PMP (Smpmp): exclude a PMP-denied load (dmem_mmu_acc_fault), like a page-
     // faulting load (dmem_mmu_fault) — it commits its fault and must never be
     // captured for replay (its replay would drive the protected line into cache).
-    let mshr_plain_load: logic = iq_issue_valid && iq_iss_is_load && !iq_iss_is_amo && !iq_iss_fp_ld && !dmem_mmu_fault && !dmem_mmu_acc_fault && !dc_load_next && stld_fwd_mask == 8'd0 && !dmem_mmu_busy && !load_walk_block && !load_blocks_on_store && !redirect_fire && !early_redir_fire_q;
+    // Phase 1 LSU 2-stage step-1: every plain load now flows through the LSR, which
+    // BLOCKS on a Stage-B miss (lsr_drive re-reads each cycle, completing when the
+    // fill lands). So the non-blocking MSHR capture for plain loads is disabled —
+    // the whole MSHR/replay path (mshr_cdb, replay_q) goes dead. Non-blocking
+    // MSHR-from-Stage-B is step-2. (AMO/LR never used mshr_plain_load.)
+    let mshr_plain_load: logic = 1'b0;
+    let _unused_mshr_pl: logic = iq_iss_is_load && dc_load_next && (stld_fwd_mask == 8'd0); // keep deps referenced
     let mshr_free_ok    : logic = !mshra_v_q || !mshrb_v_q;
     let mshr_alloc_a    : logic = !mshra_v_q;
     // !replay_q on both: on a replay cycle the dcache port (and so
@@ -6521,6 +6616,72 @@ pub module heliodor_core #(
     let s10_early_age: logic<ROB_IDX_W> = early_redir_idx_q - rob_head_idx;
     let mshra_squashed: logic = mshra_v_q && (redirect_fire || (early_redir_fire_q && (mshra_age >: s10_early_age)));
     let mshrb_squashed: logic = mshrb_v_q && (redirect_fire || (early_redir_fire_q && (mshrb_age >: s10_early_age)));
+
+    // ============================================================
+    // Phase 1 LSU 2-stage: LSR completion + squash + state.
+    // ============================================================
+    // Stage-B read landed: a cached hit, an uncached MMIO bus-read return, or a
+    // misaligned cross-line fill — all signalled by dcache_stall dropping while the
+    // LSR drives the port (mirrors the single-cycle iss_dc_ok = !dcache_stall path,
+    // minus the now-moot hit-under-miss / acc-fault terms: block-on-issue means the
+    // LSR is the only in-flight plain load, so dcache_stall is THIS read's verdict).
+    let lsr_read_done: logic = lsr_drive && !dcache_stall;
+    let lsr_age      : logic<ROB_IDX_W> = lsr_rob_idx_q - rob_head_idx;
+    // Wrong-path squash (mirror the MSHR): a full precise redirect flushes every
+    // in-flight op; an early partial redirect squashes only ops YOUNGER than the
+    // resolved branch (age > the branch's age) — so a correct-path older load that a
+    // younger pipe-1 branch mispredicts is NOT squashed.
+    let lsr_squashed : logic = lsr_v_q && (redirect_fire || (early_redir_fire_q && (lsr_age >: s10_early_age)));
+    // Complete: a faulting load needs no read (delivers the latched fault); else the
+    // Stage-B read landed. Suppressed on a squash (the writeback would hit a flushed
+    // ROB entry). YIELDS lane 0 to fpu_cdb/mshr_cdb (which sit above lsu_cdb in the
+    // mux): the single-cycle load gated issue on these; the 2-stage load gates the
+    // Stage-B WRITEBACK on them instead (the read keeps driving — continuous, like
+    // the held single-cycle load — so the data is ready the cycle the lane frees;
+    // an uncached read does not re-trigger its side effect on the re-drive). alu_cdb
+    // / int_div_cdb can't fire during Stage B (block-on-issue), so they need no term.
+    assign lsr_complete = lsr_v_q && (lsr_fault || lsr_read_done) && !lsr_squashed && !fpu_cdb.valid && !mshr_cdb.valid;
+    always_ff (clk, rst) {
+        if_reset {
+            lsr_v_q         = 1'b0;
+            lsr_vaddr_q     = 64'd0;
+            lsr_paddr_q     = 64'd0;
+            lsr_pdst_q      = '0;
+            lsr_rob_idx_q   = '0;
+            lsr_funct3_q    = 3'd0;
+            lsr_has_rd_q    = 1'b0;
+            lsr_fp_ld_q     = 1'b0;
+            lsr_pc_q        = 64'd0;
+            lsr_rs2_q       = 64'd0;
+            lsr_fault_pg_q  = 1'b0;
+            lsr_fault_acc_q = 1'b0;
+            lsr_unc_q       = 1'b0;
+            lsr_gstage_q    = 1'b0;
+            lsr_gpa_q       = 64'd0;
+        } else {
+            if lsr_squashed {
+                lsr_v_q = 1'b0;
+            } else if lsr_capture {
+                lsr_v_q         = 1'b1;
+                lsr_vaddr_q     = agu_addr_iss;          // VA: byte offset + forward + LQ-record
+                lsr_paddr_q     = dmu_dmem_addr;         // PA: dcache read only
+                lsr_pdst_q      = iq_iss_rd_pdst;
+                lsr_rob_idx_q   = iq_iss_rob_idx;
+                lsr_funct3_q    = iq_issue_op.base.mem_funct3;
+                lsr_has_rd_q    = iq_issue_op.base.has_rd;
+                lsr_fp_ld_q     = iq_iss_fp_ld;
+                lsr_pc_q        = iq_issue_op.base.pc;
+                lsr_rs2_q       = alu_rs2_data;
+                lsr_fault_pg_q  = dmem_mmu_fault;
+                lsr_fault_acc_q = dmem_mmu_acc_fault;
+                lsr_unc_q       = dc_uncached;
+                lsr_gstage_q    = dmem_mmu_gstage; // Phase 11-H: two-stage fault attribution (htval)
+                lsr_gpa_q       = dmem_mmu_gpa;
+            } else if lsr_complete {
+                lsr_v_q = 1'b0;
+            }
+        }
+    }
     // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).
     let replay_sb_ovl  : logic = if replay_is_a ? sb_mshra_ovl : sb_mshrb_ovl;
     let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid && !replay_sb_ovl;
