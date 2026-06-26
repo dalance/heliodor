@@ -297,3 +297,89 @@ Target after both: global CP ≈ **13–14 ns** (≈ another −47% from 26.24 n
 - ⚠️ RVCP `$display` is space-separated → use `grep -a`. ⚠️ avoid `veryl fmt`
   whole-repo reformat (hand-format). ⚠️ commit to master, co-author +
   Claude-Session trailer.
+
+## 10. Implementation log + grounded Phase-1 plan (2026-06-26)
+
+### Phase 0 — DONE (commit `9fc2927`, byte-identical)
+
+Extracted the plain-load datapath into `src/core/lsu.veryl` on its own CDB lane
+(`lsu_cdb`). A slot-0 plain load (`is_load && !is_amo`) now drives `lsu_cdb`
+instead of `alu_cdb` under the IDENTICAL issue gate: `u_alu` is gated off via
+`!iss_is_plain_load`, `u_lsu` gated on by `iss_is_plain_load`. `lsu` reproduces
+the old alu_wrap load `CdbBus` bit-for-bit. `lsu_cdb` sits at the same lane-0
+priority (below `alu_cdb`, above `vu_cdb`) in three places that MUST stay in
+sync: the `cdb` mux (`:2171`), `cdb_dest_is_fp` (`:2108`), `vu_cdb_free`
+(`:2109`). `agu_addr_iss` was forward-declared (`:~1470`) so `u_lsu` reads it.
+AMO/LR/SC/STORE stay on the `alu_wrap` blocking path. Gates all green: default
+251/0, N1 boot cy-exact 4/4, backend-validate dcache+rv64u 152/0, litmus N4,
+N2+N4 SMP boot.
+
+### Phase 1 — grounded plan (the LSR is a guaranteed-1-deep MSHR)
+
+**Key discovery: the existing MSHR+replay machinery IS a deferred-load-completion
+pipeline, and the LSR mirrors it.** Today a missing load is captured into the
+MSHR (`mshr_rec_addr = dmu_dmem_addr`, acked OUT of the IQ), the fill happens,
+then `replay_drive` re-reads the dcache at a *registered* address (`replay_addr`,
+dcache `i_addr` mux at `:6252`: `if replay_drive ? replay_addr : dmu_dmem_addr`)
+and the load completes via the deferred `mshr_cdb` (lane-0, FPU>MSHR priority,
+`:6655`). **The LSR is the same pattern but fires for EVERY plain load at a fixed
+1-cycle latency** — so reuse the `replay_drive`/`mshr_cdb` templates directly.
+
+Flow becomes `issue → LSR(Stage A) → dcache read(Stage B) → {hit: lsu_cdb,
+miss: existing fill}`. The "dcache read → hit/miss" half is UNCHANGED; it just
+reads the LSR's registered address instead of the issuing load's combinational
+one.
+
+**LSR registers** (declare near the MSHR regs `:1484`, mirror their field set):
+`lsr_v_q`, `lsr_vaddr_q` (= `agu_addr_iss`, the VA — feeds lsu byte_off +
+store_addr/LQ-record + the forward-gen compare vs store VAs), `lsr_paddr_q` (=
+`dmu_dmem_addr`, the translated PA — feeds ONLY the dcache read), `lsr_pdst_q`,
+`lsr_rob_idx_q`, `lsr_funct3_q`, `lsr_has_rd_q`, `lsr_fp_ld_q`, `lsr_pc_q` (CDB
+redirect_pc=pc+4 parity), `lsr_rs2_q` (= `alu_rs2_data`, store_data parity),
+`lsr_fault_page_q` (`dmem_mmu_fault`), `lsr_fault_acc_q` (`dmem_mmu_acc_fault`).
+Keep VA and PA separate: dcache reads PA, everything else (byte_off[2:0] is
+page-offset-preserved so VA==PA there, forward, LQ-record) uses VA — matching
+today (forward gen `:4347` uses `agu_addr_iss` while the dcache reads
+`dmu_dmem_addr`).
+
+**Stage A (issue):** a plain load that passes the issue gates latches the above
+into the LSR and ACKs OUT of the IQ (like `mshr_capture` folds into
+`iq_issue_ack` at `:2421`). The MMU still translates (`dmu_dmem_addr`); the
+dcache is NOT read this cycle — remove the issuing-load term from `core_dmem_ren`
+(`:5273`) and drive the read from the LSR instead. Issue is additionally gated by
+"LSR can accept" = `!lsr_v_q || lsr_drains_this_cycle`.
+
+**Stage B:** `lsr_drive` (model on `replay_drive` `:6194`) drives dcache
+`i_addr = lsr_paddr_q`, `i_ren=1` when the port is free (`!store_drive &&
+dmem_mmu_idle`, same guard as replay). Re-point the 16 forward-gen `always_comb`
+(`:4347-4543`) and `stld_fwd_en` from `agu_addr_iss`/`iq_iss_*` to
+`lsr_vaddr_q`/`lsr_v_q`. `u_lsu` inputs switch from Stage-A combinational signals
+to: `i_valid=lsr_v_q`, registered metadata, `i_agu_addr=lsr_vaddr_q`,
+`i_load_data=dcache_rdata` (Stage-B read), `i_fwd_*`=Stage-B forward,
+`i_dmem_fault*`=registered. Completion = `lsu_cdb` (already its own lane). On a
+Stage-B miss the existing dcache fill machinery runs; **step-1 simplification:
+the LSR BLOCKS on a miss** (holds, re-reads each cycle via `lsr_drive` driving
+the fill, completes when `dc_hit_safe` after fill) — disable `mshr_plain_load`
+(`:6426`) for now. Non-blocking (MSHR-from-Stage-B) is step 2.
+
+**Step ordering (each layer must boot before the next):**
+1. Datapath split + block-on-miss (above). Gate: default 251/0 (bare-mode loads),
+   then N1 boot (Sv39). The forward/LR-SC/AMO/violation interactions all assume
+   issue-cycle address — re-check each. AMO/LR/SC stay single-cycle in `alu_wrap`
+   (NOT through the LSR); only plain loads pipeline. Their reservation
+   (`rsv_pa_q=dmu_dmem_addr` `:4714`) and watch (`amo_watch_pa_q` `:4881`) stay
+   Stage-A — fine, they don't use the LSR.
+2. MSHR capture from Stage B (re-source `mshr_capture`/`mshr_rec_addr` from the
+   LSR; re-enable non-blocking). Gate: `test_dcache*`, N1 boot, microbenchmarks.
+3. Memory-ordering re-time (LQ record at Stage-B completion not issue
+   `:3246`/`rob.veryl:1330`; the `rob.veryl:826-834,941-945` same-cycle fold
+   windows shift by one — re-derive). Gate: litmus N2(default)+N4, N2/N4 SMP,
+   Verilator SMP.
+4. synth `--dump-timing`: confirm the LSU cluster drops to ~13 ns; record IPC
+   (boot cy deltas — load-use latency 1→2 raises them a few %).
+
+**Risks:** `dcache_stall`/`replay_q`/`fill_busy_q` (`:6527`) interaction with the
+LSR-block; the store-buffer overlap checks (`sb_ld_ovl`, `replay_sb_ovl` `:6506`)
+now see a Stage-B-old load; two-in-flight (LSR Stage-B + Stage-A translate) on the
+dcache vs MMU/PTW port (plan §4.5 priority). Litmus N4 + Verilator SMP are the
+decisive gates — budget `$display`-trace debugging.
