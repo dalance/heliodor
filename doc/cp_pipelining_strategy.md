@@ -1,0 +1,150 @@
+# Critical-Path Reduction Strategy — Deep Pipelining (IPC tradeoffs accepted)
+
+Planning doc seeded 2026-06-26 for a fresh strategic session. The user has decided
+to **allow large-scale structural changes and accept IPC tradeoffs** to push the
+critical path (CP) below the current ~25 ns floor. This doc frames the design space
+and the established facts so the next session can decide a direction, not re-derive
+them. Companion: `doc/lsu_pipeline_plan.md` (§11), memory
+`project_heliodor_lsu_pipelining` + `project_heliodor_long_comb_path_reduction`.
+
+---
+
+## 0. Where we are (why no-IPC work is exhausted)
+
+The no-IPC-cost CP campaign took `veryl synth` CP **104 → 25.5 ns** (LZC tree-ize,
+FROUND/PMP/MMU-TLB/hpm/`vmspre` retimings, all bit-exact). That well is **dry**.
+
+This session proved the remaining ~25 ns is **not** removable without IPC cost:
+- The wall is a **multi-front plateau**: `n_inflight` 25.1 / `redirect_pc_q` 24.6 /
+  `mip` / `mhpm*` — the whole **commit cluster** — all sit within ~0.5 ns.
+- They are fed by one **shared front** (below). Cutting one cone is whack-a-mole.
+- The decisive experiment: making the slow-store commit-drain stall **fully clean**
+  (registered state only, no load contamination) dropped CP **25.105 → 24.775 ns
+  (−1.3 %)**. So the store-drain stall is *not* the bottleneck — the commit cluster
+  is fed by the shared front through **several** exclusivity-masked inputs
+  (store-drain stall, **SB ordering** `sb_st_ovl/sb_merge_ok` via `sb_match`←dcache
+  fill, `dmem_mmu_busy`). Cleaning one shifts the path to the next.
+- A registered (+1-cycle) commit drain **breaks SMP AMO atomicity** (litmus N=2
+  barrier `amoadd` lost-update → wedge); verified this session.
+
+**Conclusion: the ~25 ns CP is the cost of "the shared front reaching the commit
+cluster." No-IPC cleaning cannot remove it. Only pipelining can.**
+
+---
+
+## 1. The ~25 ns critical path (grounded, `veryl synth`)
+
+One long combinational chain from the ROB head pointer to the commit-cluster FFs:
+
+```
+head[FF Q]
+  → ROB block-store argmin   u_rob.blk_cand        ~0.0→3.5 ns
+  → IQ oldest-ready select   u_iq.iss0_a3          ~3.5→6.3 ns
+  → PRF read                 u_prf.prf             ~6.3→9.0 ns
+  → AGU (rs1+imm)            agu_addr_iss          ~9.0→9.9 ns
+  → MMU TLB translate        u_dmem_mmu...pa       ~9.9→14  ns
+  → PMP                      u_pmp_amo_w           ~14 →15.6 ns
+  → dcache tag + RAM         u_dcache.hit_*/RAM    ~15.6→21 ns
+  → commit cluster           rob_commit_ack →      ~21 →25.1 ns
+                             n_inflight / redirect / mip / mhpm
+```
+
+`~16.5 ns` front (head→dcache) + `~4–9 ns` cone tails. **Every** endpoint (load
+data `sh_load_poison`, free-list `n_inflight`, branch `redirect_pc_q`, CSR `mip`,
+hpm) rides this front. The front is shared by ALU, load, branch, and commit.
+
+---
+
+## 2. The load-bearing constraint: single-cycle issue=execute=broadcast
+
+- **ALU executes and broadcasts in the issue cycle** — `alu_wrap` has *zero*
+  `always_ff`; `o_cdb.valid = i_issue_valid`.
+- **Wakeup is broadcast-based, NOT latency-scheduled** — `iq_int` snoops the live
+  CDB and sets `rs*_rdy` combinationally (`iq_int.veryl:457`). There is no
+  `LOAD_LATENCY` table; a consumer issues the cycle after the actual broadcast.
+
+This is the **key enabler** (mixed FU latencies "just work"; the MSHR late-fill and
+the LSU 2-stage split need no scheduling) **and the key constraint**: *any* register
+placed in the issue→execute→broadcast path delays the broadcast by 1 cycle, and
+because wakeup keys off the broadcast, **every dependent edge gains +1 cycle** →
+dependent ALU chains run at **½ throughput** — unless wakeup is rebuilt to be
+latency-speculative. (This is exactly why the handoff §11 "shared-front register"
+cut #3 is poisonous as-is, and why the LSU 2-stage split was net-negative.)
+
+---
+
+## 3. Strategic directions (all accept structural change / IPC cost)
+
+### A. Latency-speculative wakeup + pipelined execute  ← canonical deep-OoO; recommended
+Rebuild `iq_int` scheduling: wake a consumer at the **producer's grant (select)**
+using the producer's **known FU latency**, so the consumer is selected to arrive at
+execute exactly when the bypass is ready. Requires:
+- a **bypass network** spanning the new execute register,
+- **replay / cancel** on mis-speculation — a load that misses (variable latency)
+  must squash the speculatively-woken dependents and re-wake them on the real fill.
+  (This is the machinery heliodor deliberately AVOIDS today via broadcast wakeup.)
+
+Then registers can split `select | regread | AGU/translate | dcache | writeback`.
+The IPC-preserving floor becomes the **select→wakeup→select loop** (blk_cand argmin
++ issue-select, ~6–8 ns) → CP target **~8 ns (≈3×)**.
+- **IPC cost**: small if speculation is right — dependent ALU stays 1/cycle;
+  load-use +1–2; the only real loss is mis-speculation replays (load misses) and
+  the deeper mispredict/flush penalty.
+- **Effort / risk**: MAJOR. New replay path + full SMP re-validation (litmus N4,
+  N2/N4 SMP boot, Verilator) at each stage. Multi-session.
+- **This is the only direction that meaningfully cuts CP without large IPC loss.**
+
+### B. Pipeline the front, keep broadcast wakeup (accept the IPC hit)
+Register `select | execute` with no scheduler change. Simple, but dependent ALU
+chains halve (~30–50 % IPC loss on ALU-bound code). The step-1.5 LSU experiment
+showed even a **load-only** +1 cycle was net-negative; an ALU-wide +1 is far worse.
+**Not recommended** — almost certainly net-negative throughput.
+
+### C. Physical dmem-port separation (load vs store-commit)   ← complementary partial win
+Give the store-commit / SB-drain path its own translate + tag (a duplicate MMU-lite
++ dcache-tag read), so the **commit cluster stops reading the load's shared front**.
+Cuts the `n_inflight / redirect / mip / mhpm` coupling to the load (the actual top
+cones). The load datapath (`sh_load_poison`) and the head→issue-select front (shared
+by ALU/load) remain. **Area cost**, lower risk than A, doesn't need wakeup changes.
+Pairs well with A (A cuts the front; C frees the commit cluster).
+
+### D. Pipeline only the commit cluster (front→commit register)
+Register `rob_commit_ack → cluster`. **Tried this session → broke SMP AMO atomicity**
+(the commit point must be atomic with the in-cache AMO write; a +1-cycle slip lets a
+remote hit interleave). Salvageable only for the *non-atomic* commit path with
+precise-exception/recovery re-engineering, and even then the ~21 ns front to the
+commit decision remains. Low value alone.
+
+---
+
+## 4. Recommendation to seed the discussion
+
+Commit to **Direction A** (latency-speculative wakeup) as the backbone — it is the
+standard way to deepen an OoO pipeline and the only path to a real halving without
+gutting IPC. Sequence it incrementally with the existing assets:
+1. Build speculative wakeup + replay for a **single** new register (`select|regread`),
+   keep everything else single-cycle, validate the full SMP/litmus matrix.
+2. Add the **AGU/translate | dcache** split — reuse the **step-1 LSU 2-stage** work
+   on branch `lsu-phase1-wip` (it is a working, tested 2-stage load; extend, don't
+   rebuild).
+3. Layer **Direction C** (dmem-port separation) to free the commit cluster.
+4. Re-baseline IPC (boot cycles, CoreMark/Dhrystone) at each step; the trade is
+   "a few-% to ~10–15 % IPC for ~3× CP" — decide the acceptable IPC budget up front.
+
+**Hard gates at every step** (memory-ordering is not separable): default `veryl test`
+251/0 + `--backend-validate` + N1 boot cy + litmus N2/N4 + N2/N4 SMP boot + Verilator
+SMP. The +1-cycle-commit failure this session is the cautionary tale: SMP atomicity
+breaks silently on single-hart tests and only litmus/SMP catches it.
+
+---
+
+## 5. Open questions for the strategic session
+- IPC budget: what boot-cycle / CoreMark regression is acceptable for a ~3× CP?
+- Scope of the wakeup rebuild: full latency-speculative scheduler, or a narrower
+  "1-deep speculative" that only covers the new register?
+- Is `veryl synth`'s CP the right target at all, or should a real STA flow with
+  false-path constraints set the goal? (This session showed `veryl synth` cannot
+  see the exclusivity-masked false paths — a real flow would report a lower CP for
+  the *current* design, changing the baseline the pipelining is measured against.)
+- Do we keep the `lsu-phase1-wip` 2-stage load as the seed (yes — it works), and
+  fold the new front stages around it?
