@@ -208,6 +208,17 @@ pub module iq_int #(
 
     var prf_ready: logic [PRF_N];
 
+    // CP front-pipeline (FRONT_PIPE fix A, cp_front_pipeline_plan.md): the FR
+    // present-readiness bitmap. Set ONLY at the REAL CDB broadcast (a producer that
+    // actually executed), never at the SCHEDULED grant. prf_ready (above) drives
+    // SELECTION (a consumer is woken/seeded early so it enters the FR 1-cycle-behind
+    // = 1/cycle), but a scheduled producer can STALL in the FR (lane-0 yields to
+    // FPU/MSHR/MMU-walk) and land its result late. prf_done gates the FR PRESENT:
+    // an FR'd op only drives o_issue_valid once its int sources have really landed,
+    // so a stalled producer holds the consumer instead of feeding it a stale read
+    // — speculative selection, confirmed execute, no replay (plan §I3 fix A).
+    var prf_done : logic [PRF_N];
+
     // CP front-pipeline (FRONT_PIPE, cp_front_pipeline_plan.md I2): the front
     // register — register the o_issue_* outputs so the issue-select cone ends here
     // (cycle N) and the registered bundle drives the core's regread/AGU/MMU/dcache
@@ -344,12 +355,24 @@ pub module iq_int #(
     let iss0_win    : logic<9> = pick_oldest(iss0_b0, iss0_b1);
     let has_issuable: logic       = iss0_win[8];
     let issue_idx   : logic<IQ_W> = if iss0_win[8] ? iss0_win[2:0] : 3'd0;
+    // CP front-pipeline (FRONT_PIPE fix A): FR present-readiness. An FR'd op drives
+    // o_issue_valid only once its INT sources have really executed (prf_done) — a
+    // scheduled producer that stalled in the FR has prf_done=0, so its consumer
+    // holds here instead of reading a stale PRF value (plan §I3 fix A). rs1 is
+    // always int; rs2 is int unless FP store data (fp_st — broadcast-woken from the
+    // FP CDB, already really ready when selected, so skip the int check). No-source
+    // ops (LUI/AUIPC/…) present immediately. Defined here (before the o_issue_valid
+    // assign) — Veryl forbids referring to a let before its definition.
+    let fr0_src_done: logic = (!fr0_op_q.base.has_rs1 || prf_done[fr0_op_q.rs1_pdst])
+        && (fr0_op_q.base.fp_st || !fr0_op_q.base.has_rs2 || prf_done[fr0_op_q.rs2_pdst]);
+    let fr1_src_done: logic = (!fr1_op_q.base.has_rs1 || prf_done[fr1_op_q.rs1_pdst])
+        && (fr1_op_q.base.fp_st || !fr1_op_q.base.has_rs2 || prf_done[fr1_op_q.rs2_pdst]);
     // CP front-pipeline: o_issue_* = FRONT_PIPE ? registered FR : live select. The
     // per-field FR reads are STATIC field reads of the (non-array) fr0_op_q, so they
     // are safe — the sh_* shadow arrays only worked around the *dynamic*-index
     // struct-field-read bug. fr0_op_q.<f> == sh_<f>[issue_idx] for the captured op
     // (both come from i_alloc_op), so FRONT_PIPE=0 is exactly today's output.
-    assign o_issue_valid      = if FRONT_PIPE ? fr0_valid_q : has_issuable;
+    assign o_issue_valid      = if FRONT_PIPE ? (fr0_valid_q && fr0_src_done) : has_issuable;
     assign o_issue_op         = if FRONT_PIPE ? fr0_op_q : ops[issue_idx];
     assign o_issue_rs1_pdst    = if FRONT_PIPE ? fr0_op_q.rs1_pdst : sh_rs1_pdst[issue_idx];
     assign o_issue_rs2_pdst    = if FRONT_PIPE ? fr0_op_q.rs2_pdst : sh_rs2_pdst[issue_idx];
@@ -425,7 +448,7 @@ pub module iq_int #(
     let has_issuable2L: logic       = has_issuable && win2L[8];
     let has_issuable2 : logic       = has_issuable2A || has_issuable2L;
     let issue_idx2    : logic<IQ_W> = if has_issuable2A ? win2A[2:0] : win2L[2:0];
-    assign o_issue_valid2 = if FRONT_PIPE ? fr1_valid_q : has_issuable2;
+    assign o_issue_valid2 = if FRONT_PIPE ? (fr1_valid_q && fr1_src_done) : has_issuable2;
     assign o_issue_op2       = if FRONT_PIPE ? fr1_op_q : ops[issue_idx2];
     assign o_issue_rs1_pdst2 = if FRONT_PIPE ? fr1_op_q.rs1_pdst : sh_rs1_pdst[issue_idx2];
     assign o_issue_rs2_pdst2 = if FRONT_PIPE ? fr1_op_q.rs2_pdst : sh_rs2_pdst[issue_idx2];
@@ -508,6 +531,7 @@ pub module iq_int #(
                 // (any rename clears their ready bit before issue depends
                 // on them).
                 prf_ready[i] = 1'b1;
+                prf_done[i]  = 1'b1; // FR fix A: same initial state (RAT identity is "executed")
             }
             // CP front-pipeline: FR starts empty (dead when FRONT_PIPE=0).
             fr0_valid_q = 1'b0;
@@ -531,6 +555,7 @@ pub module iq_int #(
             // Gate by has_rd to suppress false wakeups from non-rd ops.
             if i_cdb_valid && i_cdb_has_rd {
                 prf_ready[i_cdb_pdst] = 1'b1;
+                prf_done[i_cdb_pdst]  = 1'b1; // FR fix A: real execute landed
                 for i in 0..IQ_N {
                     if occupied[i] && sh_rs1_pdst[i] == i_cdb_pdst {
                         rs1_rdy[i] = 1'b1;
@@ -546,6 +571,7 @@ pub module iq_int #(
             // given pdst is produced by exactly one lane so the two never race.
             if i_cdb2_valid && i_cdb2_has_rd {
                 prf_ready[i_cdb2_pdst] = 1'b1;
+                prf_done[i_cdb2_pdst]  = 1'b1; // FR fix A: real execute landed (pipe-1)
                 for i in 0..IQ_N {
                     if occupied[i] && sh_rs1_pdst[i] == i_cdb2_pdst {
                         rs1_rdy[i] = 1'b1;
@@ -601,11 +627,13 @@ pub module iq_int #(
             // that depend on it see "not ready" until producer writes back.
             if i_rename_set_pending {
                 prf_ready[i_rename_pdst] = 1'b0;
+                prf_done[i_rename_pdst]  = 1'b0; // FR fix A: new producer has not executed
             }
             // Phase 8 S2: slot-1 rename clears its own new pdst's ready bit
             // (2-wide rename). Gated off (i_rename_set_pending2=0) until S4.
             if i_rename_set_pending2 {
                 prf_ready[i_rename_pdst2] = 1'b0;
+                prf_done[i_rename_pdst2]  = 1'b0; // FR fix A: new producer has not executed (slot-1)
             }
             // Issue: free the slot once the op leaves the IQ. slot0_grant folds to
             // (i_issue_ack && has_issuable) when FRONT_PIPE=0 (today); when FRONT_PIPE
