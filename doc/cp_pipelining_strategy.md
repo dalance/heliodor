@@ -178,18 +178,42 @@ scheduled (granted-but-not-broadcast) producers so newly-allocated consumers see
 correctly.
 
 ### Sequencing — on branch `lsu-phase1-wip` (the load is already 2-staged here, so
-the commit cluster `n_inflight` is #1 and each front cut MOVES the headline; on
-master the load masks everything). Risk-ascending:
+each front cut MOVES the headline; on master the load masks everything).
+Risk-ascending:
 1. **load-split** — DONE (`2e93dc4`/`58e8b42`). load-use +1.
-2. **Direction C** — store-commit / dmem-port separation (`cp_direction_c_port_separation_plan.md`,
-   C1 = extend the load-decoupled store-drain port for slow stores). Cuts the
-   `n_inflight`/`redirect`/`mhpm` commit cluster (#1 on this branch). Area, ~0 IPC.
-3. **scheduled-wakeup FRONT pipeline** — register `select | regread/AGU` (`iq_int`
-   output → execute), issue-grant scheduled wakeup for ALU, bypass net. The BIG
-   lever (cuts the ~9.7 ns shared front of ALL cones). IPC: issue +1 absorbed by
-   scheduling; load-use already +1.
+2. ~~Direction C — store-commit / dmem-port separation~~ — **ABANDONED 2026-06-27
+   (commit `af1dcd4`).** Implemented + fully validated three variants (drain-ack:
+   CP +1.4 ns regression; pin-active gate: SMP livelock; amo_owned_q gate: correct,
+   all atomicity green, but +0.25 ns CP / +1.8 % N4 IPC). DECISIVE synth experiment:
+   forcing the WHOLE commit cone off the dcache (slow `dcache_stall` AND fast
+   `sb_merge_ok`) drops CP only 25.1 → 23.8 (−1.3 ns), residual = the load's own
+   issue→execute datapath. So commit-side decoupling is capped at ≤1.3 ns —
+   `dcache_stall` was never the bottleneck. See `cp_direction_c_port_separation_plan.md`
+   §7-8 + patches `cp_c1_amo_drain_routing.patch` / `cp_amo_owned_step.patch`. SKIP.
+3. **scheduled-wakeup FRONT pipeline** ← **THE NEXT STEP (the big lever).** Register
+   `select | regread/AGU` (`iq_int` output → execute), issue-grant scheduled wakeup
+   for fixed-latency FUs (ALU), keep CDB-broadcast for loads, bypass net spanning the
+   register (see the §6 "scheduled wakeup WITHOUT replay" refinement above). Cuts the
+   ~9.7 ns shared front of ALL cones (the issue-select → MMU → dcache megacone is the
+   real wall — §7.1 of the Direction C doc segments it: issue-select 7.3 + MMU/PMP 6.5
+   + dcache 4.6, all already tree-optimized). IPC: issue +1 absorbed by scheduling;
+   load-use already +1. This is the ONLY path below ~24 ns.
 4. branch redirect / VU / further front splits.
 
 Gates at every step: default 251/0 + `--backend-validate` + N1 boot cy + litmus
-N2/N4 + N2/N4 SMP + Verilator SMP. Headline CP is NOT expected to move much until
-step 3 lands; that is accepted.
+N2/N4 + N2/N4 SMP + Verilator SMP. (Verilator is currently blocked by a pre-existing
+veryl SV-emission bug — `heliodor_fpu_pkg::__clz__16` from mmu.veryl's `clz::<16>` is
+not monomorphized into fpu_pkg.sv; unrelated to this work, fix in the veryl clone.)
+
+### START HERE (next session) — scheduled-wakeup front pipeline
+1. Read §2 (the single-cycle issue=execute=broadcast constraint) + §3.A + the
+   "scheduled wakeup WITHOUT replay" refinement above — that is the design.
+2. Grep `iq_int.veryl:457-490` (the broadcast wakeup) and the issue-select / grant
+   logic; identify where to insert the front register (`iq_int` issue output →
+   AGU/regread → execute) and where the bypass must span it.
+3. Decide the IPC budget FIRST (acceptable boot-cy / CoreMark regression) — the front
+   register adds +1 to every dependency edge UNLESS scheduled wakeup keeps fixed-
+   latency ALU chains 1/cycle. Getting the scheduled wakeup + bypass right is the
+   whole game; a naive front register without it ≈ halves dependent-ALU IPC.
+4. Re-synth after the register lands to confirm the ~9.7 ns front actually splits and
+   the new headline is the back half (~13-16 ns), then run the full gate ladder.
