@@ -194,9 +194,26 @@ megacone (`n_inflight`: head → prf → MMU-TLB → … → n_inflight) is the 
 **State now:** three dead/parked params — `SCHED_WAKEUP` (I1), `FRONT_PIPE` (I2),
 `VFP_PIPE` — all cycle-exact at default 0. The committed CP is still 25.105.
 
+**FR fix A — DONE (`a0f79a4`, built dead).** `prf_done` bitmap (set only at the real
+CDB broadcast, cleared at rename, NOT at the scheduled grant) gates the FR present
+(`o_issue_valid{,2}`) on the FR'd op's int sources being prf_done. Speculative
+SELECTION (scheduled wakeup, 1/cycle), confirmed EXECUTE (waits for the real
+producer) — no stale read, no replay. Cycle-exact at FRONT_PIPE=0 (251/0).
+
+**FLIP STATUS (temp FRONT_PIPE=1 + SCHED_WAKEUP=1, NOT committed): 221 pass / 30
+fail.** Fix A works — the 30 are NOT stale reads but the **+1-shift memory-ordering
+corners** the plan anticipated. Evidence: `rv64ui-bltu` HANGS (tohost=0; fast under
+SCHED=1 so not a timeout) → a **branch-redirect / early-squash (s8) +1-timing**
+corner in the CORE (the core assumes the branch resolves in the issue cycle; the FR
+delays it +1). SCHED_WAKEUP=0 instead gives 61/190 — mostly TIMEOUTS (no scheduled
+wakeup → FR halves dependent-ALU throughput), confirming scheduled wakeup works. The
+FR datapath itself can't deadlock on dataflow (dependent ops can't co-issue across
+FR0/FR1), so the 30 are core-side +1-timing assumptions. **Next: iterative corner
+debug — start with the branch redirect/squash path (bltu/bgeu), then amo/LR-SC,
+misalign, csr, fcvt. This is the multi-session corner work I3 warned of.**
+
 **Remaining to realize the 20.4 floor:**
-1. **FR fix A** (the FR-drain readiness gate) — required for the FRONT_PIPE flip to
-   be functionally correct. This is the bulk of the remaining work.
+1. ~~FR fix A~~ DONE. The +1-shift core corners (30 fails) are now the work.
 2. The eventual flip enables all three params together + the full gate ladder.
 3. **Next front after 20.4** = the `n_inflight` commit/load megacone back-half
    (head → prf → AGU → MMU → dcache → commit). That is the load-2-stage LSU / the
