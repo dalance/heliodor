@@ -1,0 +1,185 @@
+diff --git a/src/cache/dcache.veryl b/src/cache/dcache.veryl
+index 09b6164..fb0a983 100644
+--- a/src/cache/dcache.veryl
++++ b/src/cache/dcache.veryl
+@@ -214,6 +214,23 @@ pub module dcache #(
+     // P9.3: third presence port — the core's AMO watch (RMW window).
+     i_chk3_addr   : input  logic<64>,
+     o_chk3_present: output logic    ,
++    // Direction C §7.3: REGISTERED predictors that let the core gate an AMO/SC
++    // commit on guaranteed-merge preconditions instead of the live dcache_stall
++    // (which carries the issuing load's miss → the ~25 ns commit cone). During
++    // the AMO commit loads are blocked and the line is pin-owned, so the
++    // wenl_fires merge cannot be clashed — IDLE + pin ⇒ it fires this cycle.
++    o_state_idle      : output logic, // state == IDLE (short FF compare, no i_addr/miss)
++    // The AMO-watch line (i_chk3_addr) is E/M-OWNED here. Computed on the watch's
++    // REGISTERED PA (not the live i_addr/miss port), so the core registers it into
++    // amo_owned_q and gates the AMO commit on the registered ownership — the pin
++    // is left untouched (it still defers probes for forward progress), so there is
++    // no consecutive-AMO deadlock (ownership persists across back-to-back AMOs).
++    o_amo_owned       : output logic,
++    // A same-cycle UNPINNED probe is recalling the AMO-watch line — wenl_fires
++    // would clash, so the core holds the retire this cycle (the probe departs the
++    // line → amo_watch poisons → replay). Live but short (a probe-addr compare, no
++    // tag-RAM read). While the pin is active probe_pinned suppresses this.
++    o_amo_probe_clash : output logic,
+     // P9.2: local line-DEPARTURE events (this cycle a valid line is being
+     // dropped: fill victim, store-miss victim, misaligned self-invalidate,
+     // AMO force-miss). The core feeds them to the ROB's CoRR poison scan —
+@@ -1675,6 +1692,19 @@ pub module dcache #(
+         || (valid_2[chk3_index] && tags_2[chk3_index] == chk3_tag && !(fill_busy_chk3 && fill_way == 2'd2))
+         || (valid_3[chk3_index] && tags_3[chk3_index] == chk3_tag && !(fill_busy_chk3 && fill_way == 2'd3));
+     assign o_chk3_present = chk3_hit || (filling && {fill_tag, fill_index} == {chk3_tag, chk3_index} && !fill_aborted);
++    // Direction C §7.3: AMO commit-gate predictors. o_state_idle is a 2-bit
++    // compare off the state FF (no i_addr, no miss). o_amo_owned = the AMO-watch
++    // line is E/M-owned (chk3 hit in an excl way) — a tag read on the watch's
++    // REGISTERED PA (not the live load i_addr), so the core registers it. The
++    // mid-fill victim way is excluded as in chk3_hit; a line being RFO-filled is
++    // not yet owned (excl set only at DONE), so it correctly reads 0 until owned.
++    let chk3_excl: logic = (valid_0[chk3_index] && tags_0[chk3_index] == chk3_tag && excl_0[chk3_index] && !(fill_busy_chk3 && fill_way == 2'd0))
++        || (valid_1[chk3_index] && tags_1[chk3_index] == chk3_tag && excl_1[chk3_index] && !(fill_busy_chk3 && fill_way == 2'd1))
++        || (valid_2[chk3_index] && tags_2[chk3_index] == chk3_tag && excl_2[chk3_index] && !(fill_busy_chk3 && fill_way == 2'd2))
++        || (valid_3[chk3_index] && tags_3[chk3_index] == chk3_tag && excl_3[chk3_index] && !(fill_busy_chk3 && fill_way == 2'd3));
++    assign o_state_idle      = state == State::IDLE;
++    assign o_amo_owned       = chk3_excl;
++    assign o_amo_probe_clash = i_probe_v && !probe_pinned && (i_probe_addr[63:6] == i_chk3_addr[63:6]);
+ 
+ 
+ 
+diff --git a/src/core/heliodor_core.veryl b/src/core/heliodor_core.veryl
+index 6b16a55..c483bfc 100644
+--- a/src/core/heliodor_core.veryl
++++ b/src/core/heliodor_core.veryl
+@@ -663,6 +663,14 @@ pub module heliodor_core #(
+     var dc_rsv_present: logic    ;
+     var dc_scw_present: logic    ;
+     var dc_amo_present: logic    ; // P9.3: AMO-watch line presence (chk3)
++    // Direction C §7.3: registered predictors so the AMO/SC commit gate uses
++    // guaranteed-merge preconditions (state IDLE + pin-owned) instead of the
++    // live dcache_stall (the issuing load's miss cone). Assigned at the dcache
++    // instance, read in rob_commit_ack and the pin-expiry replay.
++    var dc_state_idle     : logic;
++    var dc_amo_owned      : logic; // AMO-watch line is E/M-owned (live chk3-excl)
++    var dc_amo_probe_clash: logic; // same-cycle unpinned probe of the AMO-watch line
++    var amo_owned_q       : logic; // Direction C §7.3: registered dc_amo_owned (gate predictor)
+     // P9.3: declared early — the rsv / AMO-watch PA latches (always_ff
+     // blocks well above the dmem_mmu inst) read the translated address.
+     var dmu_dmem_addr : logic<64>;
+@@ -2085,6 +2093,13 @@ pub module heliodor_core #(
+     var amo_watch_pa_q   : logic<64>       ;
+     var amo_watch_rob_q  : logic<ROB_IDX_W>;
+     var amo_poison_q     : logic           ;
++    // Direction C §7.3: REGISTERED "the watched AMO is an in-cache-merge (pinned)
++    // op" flag, latched at the AMO read from its translated PA. Used to qualify
++    // the pin-lapse replay WITHOUT the live amo_incache_merge (whose c_store_mmio
++    // → dmem_vm_on_op → store_drive → commit_store_fire → commit_amo_replay path
++    // would form a combinational loop). The gate's live amo_incache_merge does
++    // not loop (rob_commit_ack does not feed the dmem path).
++    var amo_incache_q    : logic           ;
+ 
+     // M5.D.2: dmem_mmu busy stall — issue is held while MMU is in PTW
+     // / dcache-stall. In Bare mode busy stays 0 so behavior is
+@@ -3158,6 +3173,12 @@ pub module heliodor_core #(
+     // register state intact for the replay (the redirect rolls back its rename).
+     // amo_watch_valid_q / amo_watch_rob_q / amo_poison_q are forward-declared vars
+     // (the equivalent `amo_at_head && amo_poison_q` let is defined later).
++    // Direction C §7.3: the committing op is the WATCHED in-cache real-AMO — the
++    // only kind that arms amo_watch (so amo_owned_q tracks ITS line) and merges
++    // via wenl_fires. SC (sc_watch, not amo_watch), MMIO/tohost AMOs
++    // (amo_incache_q=0) and misaligned stores fall through to the dcache_stall
++    // gate. All-registered, so no live tag compare reaches the gate.
++    let amo_at_head_incache: logic = amo_watch_valid_q && (rob_commit_idx == amo_watch_rob_q) && amo_incache_q;
+     let commit_amo_replay: logic = amo_watch_valid_q && rob_commit_valid
+         && rob_commit_idx == amo_watch_rob_q && amo_poison_q;
+     // S15: the slow-store retire must also wait out an in-flight LOAD walk
+@@ -3216,7 +3237,22 @@ pub module heliodor_core #(
+     // stores must be visible before it).
+     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !commit_amo_replay
+         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
+-        && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
++        // Direction C §7.3: an in-cache-merge AMO commits off the dcache_stall
++        // cone. Its wenl_fires merge is GUARANTEED this cycle once the dcache is
++        // IDLE and the line is E/M-owned with no clashing probe: loads are blocked
++        // during the commit (no fill clash), an E/M line takes no bus inv, and a
++        // recall probe is caught by dc_amo_probe_clash. So the retire gate uses
++        // the REGISTERED dc_state_idle + amo_owned_q (and the short live
++        // probe-clash) instead of dcache_stall (which carries the issuing load's
++        // miss). amo_owned_q persists across back-to-back AMOs (no pin-release
++        // dependence); a departed/probed line holds here and amo_watch poisons →
++        // commit_amo_replay re-fetches. Kept as ONE term (a mux) so the
++        // rob_commit_ack AND-tree depth matches baseline. SC, MMIO/tohost AMOs and
++        // misaligned stores keep the dcache_stall gate.
++        && !(c_is_store && !sb_elig && (if amo_at_head_incache ?
++            !sb_empty || !(dc_state_idle && amo_owned_q && !dc_amo_probe_clash)
++        :
++            dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
+         && !(c_serial && !sb_empty)
+         && !(c_flush_op && !dc_flush_done && (COHERENT_IFETCH == 0)); // P9.2 sweep (P9.6: gone when coherent)
+@@ -4208,11 +4244,14 @@ pub module heliodor_core #(
+             // `commit_sc_replay` let is defined later, near the SC-watch logic).
+             redirect_fire_q = 1'b1;
+             redirect_pc_q   = c_pc;
+-        } else if amo_watch_valid_q && rob_commit_valid && rob_commit_idx == amo_watch_rob_q && amo_poison_q {
++        } else if commit_amo_replay {
+             // P9.3: a poisoned in-cache AMO (its line departed between the
+             // value capture and the commit write) — store suppressed,
+             // re-fetch the AMO so it re-acquires ownership and re-reads.
+-            // (= commit_amo_replay, inlined like the SC arm above.)
++            // Uses the commit_amo_replay let directly (rather than re-inlining the
++            // condition) so the redirect arm and the rob_commit_ack gate stay in
++            // lockstep — a divergence would leave the AMO neither retiring nor
++            // redirecting = stuck.
+             redirect_fire_q = 1'b1;
+             redirect_pc_q   = c_pc;
+         } else if rob_commit_valid && c_load_poison {
+@@ -4960,6 +4999,7 @@ pub module heliodor_core #(
+             amo_watch_pa_q    = 64'd0;
+             amo_watch_rob_q   = '0;
+             amo_poison_q      = 1'b0;
++            amo_incache_q     = 1'b0;
+         } else if redirect_fire_q {
+             // Any flush (incl. this fix's own replay) clears the watch.
+             amo_watch_valid_q = 1'b0;
+@@ -4970,6 +5010,10 @@ pub module heliodor_core #(
+             // is its translated PA (the L1/presence tracking is PIPT).
+             amo_watch_pa_q  = dmu_dmem_addr;
+             amo_watch_rob_q = iq_iss_rob_idx;
++            // Direction C §7.3: latch whether this AMO is in-cache-merge (pinned)
++            // — cacheable DRAM PA outside the tohost pages, from the read's PA.
++            amo_incache_q = (dmu_dmem_addr[63:25] == 39'h40)
++                && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008));
+             // Same-cycle departure of the captured line poisons immediately
+             // (the registered presence port still checks the OLD watch
+             // address this cycle): both precise-inv ports + both dcache
+@@ -4986,6 +5030,20 @@ pub module heliodor_core #(
+         }
+     }
+ 
++    // Direction C §7.3: register the AMO-watch line's E/M ownership so the commit
++    // gate gates on it (registered) rather than the live dcache_stall. Sampled
++    // every cycle on the watch's PA (dc_amo_owned); only consumed when the watch
++    // is valid + at the head. amo_owned_q stays asserted across back-to-back AMOs
++    // to the same line (ownership persists), so there is no pin-release deadlock;
++    // a departure drops dc_amo_owned AND sets amo_poison_q → replay.
++    always_ff (clk, rst) {
++        if_reset {
++            amo_owned_q = 1'b0;
++        } else {
++            amo_owned_q = dc_amo_owned;
++        }
++    }
++
+     // Zacas amocas.q commit-time operands. amocas.q is serializing (issues at the
+     // ROB head), so at its commit the architectural register file (arch_regs) is
+     // authoritative for the rd:rd+1 compare pair and the rs2:rs2+1 new pair. rs2
+@@ -6461,6 +6519,9 @@ pub module heliodor_core #(
+         o_chk2_present   : dc_scw_present                ,
+         i_chk3_addr      : amo_watch_pa_q                , // P9.3: AMO watch
+         o_chk3_present   : dc_amo_present                ,
++        o_state_idle     : dc_state_idle                 , // Direction C §7.3: AMO commit-gate predictors
++        o_amo_owned      : dc_amo_owned                  ,
++        o_amo_probe_clash: dc_amo_probe_clash            ,
+         o_evict1_v       : dc_evict1_v                   , // P9.2: line-departure events
+         o_evict1_addr    : dc_evict1_addr                , //       (ROB CoRR poison scan)
+         o_evict2_v       : dc_evict2_v                   ,

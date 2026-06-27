@@ -1,0 +1,227 @@
+diff --git a/src/cache/dcache.veryl b/src/cache/dcache.veryl
+index 09b6164..768dbc2 100644
+--- a/src/cache/dcache.veryl
++++ b/src/cache/dcache.veryl
+@@ -116,7 +116,19 @@ pub module dcache #(
+     i_sdrain_urgent: input logic,
+     i_swdata    : input  logic<64> [8],
+     i_swstrb    : input  logic<8>  [8],
++    // Direction C (C1): the store-drain port doubles as the load-decoupled
++    // commit port for an in-cache AMO/SC RMW. When i_swen_excl is high the
++    // drain is an EXCLUSIVE merge (mirrors the old main-port wenl_fires): it
++    // merges into the OWNED (E/M) line only, NEVER raises a store-RFO fill (a
++    // departed line is left for the core's amo_watch to poison+replay), and
++    // releases the ownership pin. The lanes carry the RMW dword(s) exactly as a
++    // plain drain (lane i_saddr[5:3] = result; amocas.q also lane+1 = rs2+1).
++    i_swen_excl : input  logic    ,
+     o_sdrain_ack: output logic    ,
++    // Direction C: the exclusive (AMO/SC) drain merge fired this cycle — the
++    // core's drain-routed AMO commit gates on this (load-decoupled) instead of
++    // o_stall. Distinct from o_sdrain_ack (which also pops the plain buffer).
++    o_excl_drain_ack: output logic,
+     o_rdata: output logic<64>,
+     // M8.B: combinational read of the NEXT dword (at (i_addr&~7)+8), for v4
+     // misaligned loads that span two dwords (mirrors the old i_dmem_rdata_next).
+@@ -509,7 +521,11 @@ pub module dcache #(
+     // read-for-ownership fill of the drain line. Arbitration keeps the
+     // S20.2 shape: a load miss goes first unless the store buffer is
+     // near-full (urgent).
+-    let srfo_want: logic = i_swen && (state == State::IDLE) && !i_wen && !s_hit_excl && !s_full_line;
++    // Direction C: an EXCLUSIVE (AMO/SC) drain NEVER raises a store-RFO fill —
++    // ownership must have been held continuously since the RMW read (else the
++    // captured value is stale). A departed line leaves store_can_drain low; the
++    // core's amo_watch has already poisoned it, so the commit replays instead.
++    let srfo_want: logic = i_swen && !i_swen_excl && (state == State::IDLE) && !i_wen && !s_hit_excl && !s_full_line;
+     let srfo_sel : logic = srfo_want && (!miss || i_sdrain_urgent);
+     let load_sel : logic = miss && !(srfo_want && i_sdrain_urgent);
+ 
+@@ -647,8 +663,19 @@ pub module dcache #(
+     // (P9.3: the AMO force-miss is gone — an AMO read no longer invalidates
+     // a hit line, so the old drain_amo_clash same-cycle hazard no longer
+     // exists; an AMO read's S-upgrade fill is covered by the fill-set clash.)
++    // Direction C: for an EXCLUSIVE (AMO/SC) drain, mirror wenl_fires' same-
++    // cycle remote-invalidate guard on the drain line — a merge into a line
++    // being invalidated this edge would write data the inv then drops, silently
++    // committing a lost atomic. (A plain drain holds an E/M line, so a bus inv
++    // cannot hit it — the recall comes as a probe, already covered above; the
++    // guard is gated on i_swen_excl so plain-drain behaviour is unchanged.)
++    let sdrain_inv_clash: logic = i_swen_excl
++        && ((i_inv_valid && (sindex == inv_index) && (stag == inv_tag))
++            || (i_inv2_valid && (sindex == inv2_index) && (stag == inv2_tag)));
+     let store_can_drain: logic = i_swen && state == State::IDLE && !i_wen && s_hit_excl
+-        && !drain_probe_clash && !drain_fill_set_clash;
++        && !drain_probe_clash && !drain_fill_set_clash && !sdrain_inv_clash;
++    // Direction C: the exclusive AMO/SC merge fired this cycle.
++    assign o_excl_drain_ack = store_can_drain && i_swen_excl;
+     // P9.2: full-line WRITE-THROUGH drain (see s_full_line). Fires on its
+     // write-channel grant; the writeback buffer outranks it there, and a
+     // same-cycle fill start in the set must win (shared departure-event
+@@ -828,8 +855,11 @@ pub module dcache #(
+         } else if pin_arm_fill || pin_arm_hit {
+             pin_line_q = if pin_arm_hit ? {tag, index} : {fill_tag, fill_index};
+             pin_cnt_q  = '0;
+-        } else if wenl_fires && (i_addr[63:6] == pin_line_q) {
++        } else if (wenl_fires && (i_addr[63:6] == pin_line_q))
++            || (store_can_drain && i_swen_excl && (i_saddr[63:6] == pin_line_q)) {
+             // RMW committed — release so the waiting hart gets the line.
++            // Direction C: the AMO/SC commit merge now rides the store-drain
++            // port (store_can_drain && i_swen_excl), so release on it too.
+             pin_cnt_q = 7'h40;
+         } else if !pin_cnt_q[6] {
+             pin_cnt_q = pin_cnt_q + 7'd1;
+diff --git a/src/core/heliodor_core.veryl b/src/core/heliodor_core.veryl
+index 6b16a55..918a7b8 100644
+--- a/src/core/heliodor_core.veryl
++++ b/src/core/heliodor_core.veryl
+@@ -657,6 +657,19 @@ pub module heliodor_core #(
+     // commit-time PMP checks. Forward-declared so commit_store_sacc/sfault read it.
+     var cbo_m_acc_fault: logic;
+     var dc_sdrain_ack: logic;
++    // Direction C (C1): an in-cache AMO/SC commit merge now rides the load-
++    // decoupled store-drain port (i_saddr/i_swen_excl) instead of the main
++    // i_wen path, so its retire gates on dc_excl_drain_ack (the merge fired)
++    // rather than dcache_stall (which carries the issuing load's miss — the
++    // ~25 ns commit critical-path cone). amo_drain_eligible = the AMO/SC set
++    // routed there (cacheable DRAM, the old in-cache dc_wen_excl set); both are
++    // forward-declared for rob_commit_ack and assigned at the dcache instance.
++    var dc_excl_drain_ack : logic;
++    var amo_drain_eligible: logic;
++    // The AMO/SC actually drives the drain port this cycle (committing + buffer
++    // drained). Forward-declared so imem_aw_grant (the I-PTW A-bit write-back,
++    // which shares the single drain port) can yield to it.
++    var amo_drain_route   : logic;
+     // P9.2: dcache presence checks + line-departure events (forward-declared;
+     // assigned at the dcache instance, consumed by the LR/SC reservation /
+     // SC-watch logic and the ROB CoRR poison ports above the instance).
+@@ -3216,7 +3229,20 @@ pub module heliodor_core #(
+     // stores must be visible before it).
+     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !commit_amo_replay
+         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
+-        && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
++        // Direction C: a drain-routed AMO/SC retires off the dcache_stall cone.
++        // Kept as ONE slow-store term (an inner mux, NOT extra AND inputs) so the
++        // rob_commit_ack → n_inflight AND-tree depth matches baseline. For a
++        // drain-eligible AMO/SC: hold on release order (!sb_empty — it drives the
++        // port only when the buffer drained) OR until its exclusive merge lands
++        // (amo_drain_route && !dc_excl_drain_ack). amo_drain_route is 0 for a cas_q
++        // whose compare MISMATCHES (no store), so it retires after the release wait
++        // — no deadlock on an ack that never comes; a departed line keeps the ack
++        // low → amo_watch poisons → commit_amo_replay re-fetches. Everything else
++        // (misaligned, MMIO, tohost/MMIO AMOs) keeps the dcache_stall gate.
++        && !(c_is_store && !sb_elig && (if amo_drain_eligible ?
++            !sb_empty || (amo_drain_route && !dc_excl_drain_ack)
++        :
++            dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
+         && !(c_serial && !sb_empty)
+         && !(c_flush_op && !dc_flush_done && (COHERENT_IFETCH == 0)); // P9.2 sweep (P9.6: gone when coherent)
+@@ -5628,13 +5654,18 @@ pub module heliodor_core #(
+     // P10 Svadu: the instruction-side A-bit write-back borrows the store-drain
+     // port, but ONLY while the store buffer is empty (SB drain has priority). The
+     // PTE dword sits at lane imem_ptw_addr_w[5:3] of its 64B line.
+-    let imem_aw_grant: logic    = imem_ptw_wen_w && sb_empty;
++    // Direction C: a drain-routed AMO/SC commit merge also borrows the port when
++    // sb_empty; it outranks the A-bit write-back (it sits at the ROB head and
++    // gates retire), so yield imem_aw_grant to it (the I-PTW holds its request).
++    let imem_aw_grant: logic    = imem_ptw_wen_w && sb_empty && !amo_drain_route;
+     let imem_aw_lane : logic<3> = imem_ptw_addr_w[5:3];
+     // S25 drain: the HEAD entry leaves as ONE line-wide transaction through
+     // the dcache drain port (all 8 lanes + strobes); the ack pops the entry.
+     // Gate the pop with !imem_aw_grant so an A-bit-write ack (which fires while
+-    // sb_empty) never underflows sb_cnt.
+-    let sb_pop: logic = dc_sdrain_ack && !imem_aw_grant;
++    // sb_empty) never underflows sb_cnt. Direction C: an AMO/SC drain merge also
++    // raises o_sdrain_ack, but it only fires while sb_empty — gate the pop on
++    // !sb_empty so it never pops a (necessarily empty) buffer.
++    let sb_pop: logic = dc_sdrain_ack && !imem_aw_grant && !sb_empty;
+     // S25: line-match the pushing store against live entries. The head entry
+     // is not a merge target on its pop cycle (its lanes are leaving the
+     // buffer this edge); the store allocates a fresh entry instead. A merging
+@@ -6213,18 +6244,27 @@ pub module heliodor_core #(
+     // excl-merge must both be suppressed for it (a concurrently-committing
+     // misaligned store or AMO at the ROB head would otherwise leak its
+     // st_wstrb_hi / c_is_amo into the PTE write and corrupt it / hang the walk).
+-    let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_ok && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)) || dmu_ad_wb;
++    // Direction C: a drain-routed AMO/SC no longer takes the main i_wen path
++    // (its merge rides the store-drain port below) — exclude amo_drain_route.
++    let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_ok && !amo_drain_route && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)) || dmu_ad_wb;
+     // Phase 12 V1: a VU unit-stride store element is single-dword (no hi-strobe).
+     let dc_st_wstrb_hi: logic<8> = if vu_mem_active ? 8'd0 : if dmu_ad_wb ? 8'd0 : if dc_i_wen ? st_wstrb_hi : 8'd0;
+-    // P9.3: in-cache AMO/SC commit write — eligible when the committing
+-    // store is an AMO/SC to a cacheable DRAM PA outside the tohost pages
+-    // (mirrors the fast-store / sb_vm_ok exclusions: the harnesses watch
+-    // the DRAM array, and MMIO is uncacheable). The dcache merges it into
+-    // the owned line locally (no write channel); ineligible AMO/SC writes
+-    // keep the write-through path.
++    // P9.3 / Direction C: an in-cache AMO/SC commit merge — eligible when the
++    // committing store is an AMO/SC to a cacheable DRAM PA outside the tohost
++    // pages (mirrors the fast-store / sb_vm_ok exclusions: the harnesses watch
++    // the DRAM array, and MMIO is uncacheable). The merge now rides the load-
++    // decoupled store-drain port (amo_drain_route below), so the old main-port
++    // exclusive write (dc_wen_excl → wenl_fires) is retired (held at 0);
++    // ineligible AMO/SC writes (MMIO / tohost) keep the i_wen write-through.
+     let st_pa_w      : logic<64> = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr; // Phase 11-H HSV → translated PA
+     let st_pa_tohost : logic     = (st_pa_w[31:14] == 18'h20000) || (st_pa_w[31:12] == 20'h80008);
+-    let dc_wen_excl  : logic     = c_is_amo && !c_store_mmio && !st_pa_tohost && !dmu_ad_wb && !amo_commit_acc_fault;
++    assign amo_drain_eligible = c_is_amo && !c_store_mmio && !st_pa_tohost && !dmu_ad_wb && !amo_commit_acc_fault;
++    // The AMO actually DRIVES the drain port this cycle: it is committing
++    // (dmu_dmem_wen = store_drive for an AMO) and the store buffer has drained
++    // (release order — all older stores globally visible first; also frees the
++    // single drain port, which serves the SB drain while !sb_empty).
++    assign amo_drain_route = dmu_dmem_wen && amo_drain_eligible && sb_empty;
++    let dc_wen_excl    : logic = 1'b0; // Direction C: main-port excl merge retired
+     // (P9.3: the ownership pin is dcache-internal — it self-arms at the
+     // AMO/LR read's data arrival, which closes the issue→pin arming gap a
+     // core-driven pin had: remote recalls landing in that 2-3 cycle window
+@@ -6352,6 +6392,7 @@ pub module heliodor_core #(
+     // else the normal committed-store-buffer drain. The A-write puts the updated
+     // PTE on its single dword lane (imem_aw_lane) with a 0xFF strobe, all other
+     // lanes idle, so the d-cache merges just the PTE into the owned line.
++    let amo_drain_off: logic<3> = st_pa_w[5:3]; // Direction C: AMO/SC dword lane
+     var sdrain_swdata: logic<64> [8];
+     var sdrain_swstrb: logic<8>  [8];
+     always_comb {
+@@ -6367,9 +6408,31 @@ pub module heliodor_core #(
+             sdrain_swdata[imem_aw_lane] = imem_ptw_wdata_w;
+             sdrain_swstrb[imem_aw_lane] = 8'hFF;
+         }
++        // Direction C: a drain-routed AMO/SC commit merge — the RMW result rides
++        // its own dword lane (st_pa_w[5:3]), amocas.q's hi half rides lane+1
++        // (16-byte aligned ⇒ same line). All other lanes idle (partial merge),
++        // so the dcache merges just the RMW dword(s) into the owned line.
++        // amo_drain_route ⇒ sb_empty ⇒ no SB head to drain, and it is mutually
++        // exclusive with imem_aw_grant (which yields to it).
++        if amo_drain_route {
++            for l in 0..8 {
++                sdrain_swdata[l] = 64'd0;
++                sdrain_swstrb[l] = 8'd0;
++            }
++            sdrain_swdata[amo_drain_off] = dmu_dmem_wdata;
++            sdrain_swstrb[amo_drain_off] = dmu_dmem_wstrb;
++            if c_is_cas_q {
++                sdrain_swdata[amo_drain_off + 3'd1] = cas_q_new_hi;
++                sdrain_swstrb[amo_drain_off + 3'd1] = 8'hFF;
++            }
++        }
+     }
+-    let sdrain_saddr  : logic<64> = if imem_aw_grant ? {imem_ptw_addr_w[63:6], 6'd0} : {sb_line[0], 6'd0};
+-    let sdrain_swen   : logic     = imem_aw_grant || !sb_empty;
++    let sdrain_saddr  : logic<64> = if amo_drain_route ? {st_pa_w[63:6], 6'd0} : if imem_aw_grant ? {imem_ptw_addr_w[63:6], 6'd0} : {sb_line[0], 6'd0};
++    let sdrain_swen   : logic     = imem_aw_grant || !sb_empty || amo_drain_route;
++    // Direction C: flag the exclusive (AMO/SC) merge so the dcache holds E/M-only
++    // (no store-RFO), guards the same-cycle inv, releases the ownership pin, and
++    // raises o_excl_drain_ack (the AMO's load-decoupled commit gate).
++    let sdrain_swen_excl: logic   = amo_drain_route;
+     let sdrain_urgent : logic     = imem_aw_grant || (sb_cnt >= 4'd3);
+     inst u_dcache: dcache (
+         clk                                              ,
+@@ -6416,7 +6479,9 @@ pub module heliodor_core #(
+         i_sdrain_urgent  : sdrain_urgent                  ,
+         i_swdata         : sdrain_swdata                  ,
+         i_swstrb         : sdrain_swstrb                  ,
++        i_swen_excl      : sdrain_swen_excl               , // Direction C: AMO/SC exclusive commit merge
+         o_sdrain_ack     : dc_sdrain_ack                  ,
++        o_excl_drain_ack : dc_excl_drain_ack              , // Direction C: AMO/SC drain merge fired
+         o_rdata2         : dcache_rdata2                  ,
+         o_rdata2_next    : dcache_rdata2_next            ,
+         o_hit2           : dcache_hit2                    ,
