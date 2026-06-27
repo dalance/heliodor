@@ -28,19 +28,40 @@ test` **251/0**. Companion: `cp_pipelining_strategy.md`, `lsu_pipeline_plan.md` 
   `u_lsu` forms `lsu_cdb` → writeback (lane 1 `lsr_lane1_fire`, else lane 0).
   Load-use latency = 2 (broadcast wakeup at N+1, consumer selectable N+2).
 
-### 1.2 Target — one front register, "Option A" (register pdsts, regread AFTER)
-Insert a **front register (FR)** at the `u_iq` issue output → execute boundary that
-holds the *issued op's pdsts + control* (NOT operands — regread stays after the FR).
+### 1.2 Target — one front register INSIDE `iq_int` (register the o_issue_* outputs)
+Insert the **front register (FR) inside `iq_int`**, registering the `o_issue_*`
+outputs: the select cone (`rob_head → blk_cand → iss0 argmin → issue_idx`) ends at
+the FR in cycle N; the registered bundle drives `o_issue_*` in cycle N+1, so the
+core's regread→AGU→MMU→dcache→commit starts from the registered output next cycle.
 
-- **ALU op**: cycle N — issue-select picks, captures into FR (select cone alone in
-  cycle N). Cycle N+1 — FR drives `u_prf` read → `u_alu` → `o_cdb` broadcast.
-- **Plain load**: cycle N — select → FR. Cycle N+1 — AGU+translate (old Stage A) →
-  LSR. Cycle N+2 — dcache (old Stage B) → writeback. (Load-use 2 → **3**, +1.)
+This is **far better than rewiring the 183 core `iq_iss_*` sites** (the first draft
+of this plan): it is LOCALIZED to `iq_int`, the core execute datapath is UNTOUCHED,
+and `FRONT_PIPE=0` folds to today's behavior with **no completeness risk** (nothing
+in the core to "miss" — a missed core site would pass byte-identical at FRONT_PIPE=0
+yet break at flip-on, which the localized approach avoids entirely).
 
-Why "Option A" (register pdsts, regread after the FR) and not "register operands":
-registering operands keeps regread in the select cone (no CP win) and needs an
-operand bypass. Registering pdsts moves the whole regread→AGU→…→dcache chain into
-the post-FR cycle and **isolates the select cone** — which is the point.
+- **ALU op**: cycle N — select picks, captures into FR (select cone alone). Cycle
+  N+1 — FR presents `o_issue_*` → core regread/`u_alu` → `o_cdb` broadcast.
+- **Plain load**: cycle N — select → FR. Cycle N+1 — FR presents → AGU+translate
+  (old LSR Stage A) → LSR. Cycle N+2 — dcache (old Stage B) → wb. (Load-use 2→**3**.)
+
+**Register the whole `RenamedOp` struct + valid per slot** (`fr0_op_q`/`fr0_valid_q`,
+`fr1_op_q`/`fr1_valid_q`), NOT 26 per-field regs: capturing `ops[issue_idx]` (a
+whole-struct dynamic read, already safe — `o_issue_op` does it) into a non-array reg
+makes every `o_issue_<field>` a STATIC field read of `fr_op_q` (safe; the shadow
+arrays only worked around the *dynamic*-index struct-field-read bug). Per-field
+output = `FRONT_PIPE ? fr_op_q.<field> : sh_<field>[issue_idx]`.
+
+**The FR must be UNIFORM across BOTH issue slots.** A slot-0-only FR is INCORRECT:
+a slot-0-FR'd producer (result in PRF at N+2) feeding a slot-1 single-cycle consumer
+(reads PRF at N+1) would read one cycle early. With both slots FR'd, every consumer
+reads at select+1 and scheduled wakeup (wake at grant) is uniformly correct (§1.4).
+
+The FR is a 1-deep stall-capable handshake register per slot: capture when the slot
+selects AND the FR is empty-or-draining (`!fr_valid_q || i_issue_ack`); free the IQ
+slot on capture (not on the core ack); drain on the core ack; clear on flush /
+younger-than-branch partial squash. (Slot-1 can also stall — `issue2_fire` gates on
+slot-1 load completion + `lsr_lane1_fire`, core 6516 — so both slots are symmetric.)
 
 ### 1.3 Scheduled wakeup WITHOUT replay — split by FU latency class
 A naive FR adds +1 to every dependency edge → dependent ALU chains at ½ throughput.
@@ -109,13 +130,13 @@ N1 boot cy unchanged. (Live correctness validated at I3, where the FR makes the
 timing right; enabling SCHED_WAKEUP alone — without the FR — is wrong by design and
 must stay off.)
 
-**I2 — front register infrastructure in the core, gated OFF (`FRONT_PIPE=0` →
-pass-through wire, byte-identical).** Route the execute datapath's `iq_iss_*` /
-`iq_issue_*` reads through a new `fr_*` bundle = `FRONT_PIPE ? fr_*_q : iq_iss_*`.
-With FRONT_PIPE=0 this is a pure wire ⇒ byte-identical build. This is the bulky
-mechanical rewiring, done in a SAFE (byte-identical) step. Gate: byte-identical +
-default 251/0 + N1 boot cy. (Big diff; consider doing the memory side — LR/SC,
-store buffer, dc_amo_read, replay — in its own sub-commit from the ALU/csr side.)
+**I2 — front register INSIDE `iq_int`, gated OFF (`FRONT_PIPE=0` → today's combo
+pass-through, cycle-exact).** Register the `o_issue_*` outputs (whole-`RenamedOp`
+struct + valid per slot, both slots — §1.2). `o_issue_* = FRONT_PIPE ? fr_op_q.* :
+sh_*[issue_idx]`; `o_issue_valid = FRONT_PIPE ? fr_valid_q : has_issuable`. Re-key
+the IQ-slot free + the I1 scheduled wakeup to `slot_grant = FRONT_PIPE ? fr_capture
+: (has_issuable && i_issue_ack)` (folds to today at FRONT_PIPE=0). Core UNTOUCHED.
+Gate: default 251/0 + N1 boot cy unchanged + synth CP 25.105 unchanged (dead).
 
 **I3 — flip ON: `FRONT_PIPE=1` + `SCHED_WAKEUP=1`.** The real timing change. Debug
 through the FULL gate ladder. Re-synth to confirm the select cone split and the new
