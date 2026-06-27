@@ -202,10 +202,14 @@ Risk-ascending:
    consumer's PRF read by exactly one cycle; they cancel (plan §1.4 proof).**
    - **I1 DONE (`caf8d89`):** grant-time scheduled wakeup in `iq_int`, param-gated
      DEAD (`SCHED_WAKEUP=0`, cycle-exact; synth CP 25.105/n_inflight[5] unchanged).
-   - **I2 NEXT:** front-register infrastructure in the core, gated OFF
-     (`FRONT_PIPE=0` → pass-through wire, byte-identical) — the bulky mechanical
-     rewiring of the execute datapath's `iq_iss_*` reads, done safely.
-   - **I3:** flip ON (`FRONT_PIPE=1` + `SCHED_WAKEUP=1`), full gate ladder, re-synth.
+   - **I2 DONE (`243e3bb`):** front register INSIDE `iq_int` (register the
+     `o_issue_*` outputs; whole-`RenamedOp` reg + valid per slot, both slots),
+     gated DEAD (`FRONT_PIPE=0` → live combinational select = today). Core execute
+     datapath UNTOUCHED — far better than the 183-site core rewire (no completeness
+     risk). Cycle-exact: default 251/0, N1 boot cy identical, synth CP 25.105 unch.
+   - **I3 NEXT:** flip ON (`FRONT_PIPE=1` + `SCHED_WAKEUP=1`), full gate ladder,
+     re-synth (expect the select cone to split, new headline ~17-18 ns). Debug the
+     +1-shift memory-ordering corners (replay / store-to-load fwd / LR-SC / xlate).
 4. branch redirect / VU / further front splits.
 
 Gates at every step: default 251/0 + `--backend-validate` + N1 boot cy + litmus
