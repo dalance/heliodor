@@ -23,6 +23,15 @@ pub module vector_unit #(
     param ROB_IDX_W: u32 = 5  ,
     param FIFO_N   : u32 = 8  ,
     param FIFO_W   : u32 = 3  ,
+    // CP: FP operand pipeline. The COMPUTE present-phase drives the VRF operand
+    // fetch (FIFO read -> decode -> element select -> forward, ~10.5 ns) AND
+    // u_vfpu stage-1 (~13 ns) in one combinational cycle (the synth top cone when
+    // the scalar front register is on). VFP_PIPE=1 inserts a FETCH phase that
+    // registers the u_vfpu operands, splitting the fetch from stage-1 (~23.6 ->
+    // ~13 ns). Cost: +1 cycle per FP element (3 phases vs 2). Built DEAD (=0):
+    // fp_fetched_q is never set, so the FSM stays the 2-phase present/capture and
+    // o_/u_vfpu inputs take the live combinational operands = today (cycle-exact).
+    param VFP_PIPE : bit = 0  ,
 ) (
     clk: input clock,
     rst: input reset,
@@ -868,6 +877,15 @@ pub module vector_unit #(
     // now; a later streaming step recovers it). div/sqrt still wait on vfpu_busy.
     var fp_ph      : logic               ;
     var fp_elem    : logic<8>            ;
+    // CP (VFP_PIPE): registered u_vfpu operands + the FETCH-done flag. When
+    // VFP_PIPE, each COMPUTE element first spends a FETCH cycle (fp_fetched_q 0->1)
+    // that latches the operands here; present/capture then run on the registered
+    // copies. Dead when VFP_PIPE=0 (fp_fetched_q never set).
+    var fp_s1_q     : logic<64>          ;
+    var fp_s2_q     : logic<64>          ;
+    var fp_s3_q     : logic<64>          ;
+    var fp_int_rs1_q: logic<64>          ;
+    var fp_fetched_q: logic              ;
     var fp_acc     : logic<VLEN>         ;
     var fp_fflags_q: logic<5>            ;
     var red_acc    : logic<64>           ; // V4a reduction scalar accumulator (NaN-boxed for SEW=32)
@@ -2137,7 +2155,17 @@ pub module vector_unit #(
     // rounds with fcsr.frm → pass DYN so fpu_wrap resolves it from i_frm.
     // Merge is a pure data select, so it must not issue the shared FPU (no
     // spurious fflags / busy). Arithmetic and compare issue it for active elements.
-    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest && !h_is_anyired;
+    // CP (VFP_PIPE): the resolved u_vfpu int operand (registered in the FETCH
+    // phase alongside fp_s1/2/3). Live when VFP_PIPE=0.
+    let fp_int_rs1: logic<64> = if h_is_fncvt ? fncvt_src : fp_a_sh[63:0];
+    // u_vfpu operands: registered (FETCH-phase copy) when VFP_PIPE, else live.
+    let fpu_s1     : logic<64> = if VFP_PIPE ? fp_s1_q : fp_s1;
+    let fpu_s2     : logic<64> = if VFP_PIPE ? fp_s2_q : fp_s2;
+    let fpu_s3     : logic<64> = if VFP_PIPE ? fp_s3_q : fp_s3;
+    let fpu_int_rs1: logic<64> = if VFP_PIPE ? fp_int_rs1_q : fp_int_rs1;
+    // CP (VFP_PIPE): only issue to u_vfpu AFTER the FETCH phase has registered the
+    // operands (fp_fetched_q). VFP_PIPE=0 -> the gate is always true (today).
+    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest && !h_is_anyired && (!VFP_PIPE || fp_fetched_q);
     inst u_vfpu: fpu_wrap #(
         PRF_W    : PRF_W    ,
         ROB_IDX_W: ROB_IDX_W,
@@ -2163,14 +2191,14 @@ pub module vector_unit #(
         i_issue_rob_idx   : fp_elem[ROB_IDX_W - 1:0],
         i_issue_has_rd    : 1'b0             ,
         i_issue_writes_int: 1'b0             ,
-        i_s1_data         : fp_s1            ,
-        i_s2_data         : fp_s2            ,
-        i_s3_data         : fp_s3            , // V3h FMA addend (old vd / vs2)
+        i_s1_data         : fpu_s1           ,
+        i_s2_data         : fpu_s2           ,
+        i_s3_data         : fpu_s3           , // V3h FMA addend (old vd / vs2)
         // V3g int->FP vfcvt reads the vreg element as the FPU's INT operand
         // (the SEW-wide integer at the current element). V4h vfncvt int->FP reads
         // the 2*SEW (int64) element at the wide source geometry. FP-input ops
         // ignore this.
-        i_int_rs1_data    : if h_is_fncvt ? fncvt_src : fp_a_sh[63:0],
+        i_int_rs1_data    : fpu_int_rs1      ,
         i_flush           : i_flush          ,
         o_fpu_busy        : vfpu_busy        ,
         o_cdb             : vfpu_cdb         ,
@@ -2506,6 +2534,11 @@ pub module vector_unit #(
             fp_state    = 2'd0;
             fp_ph       = 1'b0;
             fp_elem     = 8'd0;
+            fp_fetched_q = 1'b0;
+            fp_s1_q     = 64'd0;
+            fp_s2_q     = 64'd0;
+            fp_s3_q     = 64'd0;
+            fp_int_rs1_q = 64'd0;
             fp_acc      = {1'b0 repeat VLEN};
             fp_fflags_q = 5'd0;
             red_acc     = 64'd0;
@@ -2630,6 +2663,7 @@ pub module vector_unit #(
                     if (count != 0) && at_head && h_is_fp && scalar_ok {
                         fp_elem     = 8'd0;
                         fp_ph       = 1'b0;
+                        fp_fetched_q = 1'b0; // CP (VFP_PIPE): first element starts with a FETCH
                         fp_acc      = {1'b0 repeat VLEN};
                         fp_fflags_q = 5'd0;
                         if vl8 == 8'd0 {
@@ -2647,7 +2681,18 @@ pub module vector_unit #(
                     // hold here on vfpu_busy (they then fall through fp_ph=0→1 once
                     // their latched result is ready, captured the next cycle).
                     if !vfpu_busy {
-                        if fp_ph == 1'b0 {
+                        if VFP_PIPE && !fp_fetched_q {
+                            // CP (VFP_PIPE) FETCH phase: latch the u_vfpu operands so
+                            // the long VRF-fetch -> stage-1 chain is split across two
+                            // cycles. u_vfpu is not issued yet (fp_issue_v gated on
+                            // fp_fetched_q); present runs next cycle on the registered
+                            // copies. Dead when VFP_PIPE=0.
+                            fp_s1_q      = fp_s1;
+                            fp_s2_q      = fp_s2;
+                            fp_s3_q      = fp_s3;
+                            fp_int_rs1_q = fp_int_rs1;
+                            fp_fetched_q = 1'b1;
+                        } else if fp_ph == 1'b0 {
                             // present phase: operands driven this cycle; capture next.
                             fp_ph = 1'b1;
                         } else {
@@ -2670,6 +2715,7 @@ pub module vector_unit #(
                                 fp_acc = if fp_dreg_last ? {1'b0 repeat VLEN} : fp_acc_next;
                             }
                             fp_ph = 1'b0;
+                            fp_fetched_q = 1'b0; // CP (VFP_PIPE): next element re-fetches
                             if fp_elem + 8'd1 >= vl8 {
                                 fp_state = 2'd2;
                             } else {
