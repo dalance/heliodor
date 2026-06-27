@@ -148,3 +148,48 @@ breaks silently on single-hart tests and only litmus/SMP catches it.
   the *current* design, changing the baseline the pipelining is measured against.)
 - Do we keep the `lsu-phase1-wip` 2-stage load as the seed (yes — it works), and
   fold the new front stages around it?
+
+---
+
+## 6. COMMITTED PROGRAM (2026-06-27) — deep pipeline, accept net-IPC, no retreat
+
+User directive (verbatim intent): *we must do the structural change that ultimately
+LARGELY reduces CP; intermediate steps with NO CP gain are expected and accepted
+(the multi-front wall only drops once EVERY front is crushed); IPC loss is judged
+NET against CP reduction — refusing IPC loss in isolation means doing nothing.* This
+supersedes the timid "no-IPC micro-fix → no CP gain → retreat" loop of prior
+sessions. The program below is committed; we persist through no-gain intermediates.
+
+### Key technical refinement — scheduled wakeup WITHOUT replay
+The §A concern ("front register needs replay/cancel for load-miss mis-speculation")
+is AVOIDABLE. Split wakeup by FU latency class:
+- **Fixed-latency FUs (ALU, etc.) → issue-grant SCHEDULED wakeup.** When the
+  producer is GRANTED (selected) at cycle N, set its consumers' `rs*_rdy` for
+  selection at N+1 (not at the broadcast). With a front register the producer's
+  result is bypassable when the consumer reaches execute, so dependent ALU chains
+  stay 1/cycle. Deterministic latency ⇒ never mis-schedules ⇒ **no replay**.
+- **Variable-latency FUs (loads) → keep the existing CDB-broadcast snoop**
+  (`iq_int.veryl:457-490`). Load consumers wake on the REAL broadcast (load-use
+  latency, no speculation) ⇒ nothing to squash ⇒ **no replay**.
+This removes the riskiest machinery. Needs: (1) the front pipeline register,
+(2) issue-grant scheduled wakeup for fixed-latency producers in `iq_int`,
+(3) a bypass network spanning the register. The `prf_ready` bitmap must also reflect
+scheduled (granted-but-not-broadcast) producers so newly-allocated consumers seed
+correctly.
+
+### Sequencing — on branch `lsu-phase1-wip` (the load is already 2-staged here, so
+the commit cluster `n_inflight` is #1 and each front cut MOVES the headline; on
+master the load masks everything). Risk-ascending:
+1. **load-split** — DONE (`2e93dc4`/`58e8b42`). load-use +1.
+2. **Direction C** — store-commit / dmem-port separation (`cp_direction_c_port_separation_plan.md`,
+   C1 = extend the load-decoupled store-drain port for slow stores). Cuts the
+   `n_inflight`/`redirect`/`mhpm` commit cluster (#1 on this branch). Area, ~0 IPC.
+3. **scheduled-wakeup FRONT pipeline** — register `select | regread/AGU` (`iq_int`
+   output → execute), issue-grant scheduled wakeup for ALU, bypass net. The BIG
+   lever (cuts the ~9.7 ns shared front of ALL cones). IPC: issue +1 absorbed by
+   scheduling; load-use already +1.
+4. branch redirect / VU / further front splits.
+
+Gates at every step: default 251/0 + `--backend-validate` + N1 boot cy + litmus
+N2/N4 + N2/N4 SMP + Verilator SMP. Headline CP is NOT expected to move much until
+step 3 lands; that is accepted.
