@@ -138,10 +138,47 @@ the IQ-slot free + the I1 scheduled wakeup to `slot_grant = FRONT_PIPE ? fr_capt
 : (has_issuable && i_issue_ack)` (folds to today at FRONT_PIPE=0). Core UNTOUCHED.
 Gate: default 251/0 + N1 boot cy unchanged + synth CP 25.105 unchanged (dead).
 
-**I3 — flip ON: `FRONT_PIPE=1` + `SCHED_WAKEUP=1`.** The real timing change. Debug
-through the FULL gate ladder. Re-synth to confirm the select cone split and the new
-~17-18 ns headline. Expect iterations on memory-ordering corners (the +1 shift
-interacts with replay / store-to-load forward / LR-SC / xlate-barrier timing).
+**I3 — flip ON: `FRONT_PIPE=1` + `SCHED_WAKEUP=1`.** The real timing change.
+
+**I3 MEASUREMENT (2026-06-27, flip not committed — see the correctness gap below).**
+Synth with both params on: **CP 25.105 → 23.580 ns**, and the endpoint MOVED from
+`u_fl.n_inflight[5]` (the issue→commit megacone) to `u_vu.u_vfpu.u_fround_d_add`
+(`s1_exp_sel/s1_sum_sel → fr_d_sum_q[51]`) — the **vector FP FROUND adder**. So the
+front register DID cut the issue→commit megacone off the top; it fell BELOW 23.58
+(by the Direction-C residual reasoning — that experiment bottomed the load
+issue→execute path at 23.8 *with* the select cone in series; removing the ~7 ns
+select cone puts the megacone at ~16-18). The headline only moved −6 % because the
+**vector FROUND front (23.58)** sits right under it — a separate, crushable cone.
+**Implication: the FR's real benefit (megacone 25→~18) is MASKED until the FP front
++ the 18-23 band are also crushed.** Multi-front, exactly as the program expects.
+
+**CORRECTNESS GAP found at I3 (the "no replay" assumption is FALSE for slot-0).**
+Plan §1.4 requires a scheduled-wakeup producer to traverse the FR in exactly 1
+non-stalling cycle. **Slot-0 ALU ops CAN stall in the FR**: `iq_issue_ack` (core
+2498) deasserts on `fpu_cdb.valid` / `mshr_cdb.valid` / `dmem_mmu_busy` (lane-0
+yields to FP/MSHR completions and MMU walks). When a scheduled-woken ALU producer
+stalls, its result lands late and the consumer — selected 1-cycle-behind on the
+schedule — reads PRF STALE. (Slot-1/pipe-1 ALU never stalls, so only slot-0 is
+affected, but slot-0 is the common path.) This needs one of:
+- **(fix A) FR-drain readiness gate** — make the FR a 1-entry reservation station:
+  add a `prf_done` bitmap set ONLY at the real CDB broadcast (not at the scheduled
+  grant), and gate each FR's drain/present on `(!has_rs1||prf_done[rs1])&&(!has_rs2
+  ||prf_done[rs2])` (+ the FP-store rs2 / load / AMO source variants). Scheduled
+  wakeup still selects the consumer early (into the FR); the FR holds it until its
+  sources REALLY landed, then presents — no stale read, no squash, no replay. In the
+  no-stall common case `prf_done` is set exactly when the consumer reaches the FR, so
+  it drains immediately (1/cycle preserved). This is the right fix; it is the bulk of
+  the remaining work.
+- (fix B) replay/cancel — the machinery the program set out to avoid. Not preferred.
+
+**Sequencing question this raises (for the user):** the FR's headline payoff is
+masked by the vector FROUND front (23.58), which is likely a CHEAP no-IPC win
+(2-stage pipeline it like the scalar FROUND `acb8fd0`, or tree-ize the s1 select).
+Crushing the FP fronts (23.58 + the 18-23 band) FIRST would expose more of the FR's
+benefit before paying the FR-drain-readiness complexity + the load-use/mispredict
+IPC. The I1/I2 groundwork stays in place (dead) for the flip once fix A lands.
+
+Re-confirm at the eventual flip: full gate ladder + re-synth.
 
 **I4 — second register / commit-cluster freeing.** Once the back half is the wall,
 add the next split (post-MMU, or Direction-C port separation for the commit cluster).
