@@ -190,14 +190,22 @@ Risk-ascending:
    issue→execute datapath. So commit-side decoupling is capped at ≤1.3 ns —
    `dcache_stall` was never the bottleneck. See `cp_direction_c_port_separation_plan.md`
    §7-8 + patches `cp_c1_amo_drain_routing.patch` / `cp_amo_owned_step.patch`. SKIP.
-3. **scheduled-wakeup FRONT pipeline** ← **THE NEXT STEP (the big lever).** Register
+3. **scheduled-wakeup FRONT pipeline** ← **IN PROGRESS (the big lever).** Register
    `select | regread/AGU` (`iq_int` output → execute), issue-grant scheduled wakeup
-   for fixed-latency FUs (ALU), keep CDB-broadcast for loads, bypass net spanning the
-   register (see the §6 "scheduled wakeup WITHOUT replay" refinement above). Cuts the
-   ~9.7 ns shared front of ALL cones (the issue-select → MMU → dcache megacone is the
-   real wall — §7.1 of the Direction C doc segments it: issue-select 7.3 + MMU/PMP 6.5
-   + dcache 4.6, all already tree-optimized). IPC: issue +1 absorbed by scheduling;
-   load-use already +1. This is the ONLY path below ~24 ns.
+   for fixed-latency FUs (ALU), keep CDB-broadcast for loads. Cuts the ~9.7 ns shared
+   front of ALL cones (the issue-select → MMU → dcache megacone is the real wall —
+   §7.1 of the Direction C doc segments it: issue-select 7.3 + MMU/PMP 6.5 + dcache
+   4.6, all already tree-optimized). IPC: issue +1 absorbed by scheduling; load-use
+   +1. This is the ONLY path below ~24 ns. **Concrete RTL plan + staged increments
+   (I1-I4): `cp_front_pipeline_plan.md`. NO operand bypass is needed — the scheduled
+   wakeup sets `ready` exactly one cycle before the result lands and the FR delays the
+   consumer's PRF read by exactly one cycle; they cancel (plan §1.4 proof).**
+   - **I1 DONE (`caf8d89`):** grant-time scheduled wakeup in `iq_int`, param-gated
+     DEAD (`SCHED_WAKEUP=0`, cycle-exact; synth CP 25.105/n_inflight[5] unchanged).
+   - **I2 NEXT:** front-register infrastructure in the core, gated OFF
+     (`FRONT_PIPE=0` → pass-through wire, byte-identical) — the bulky mechanical
+     rewiring of the execute datapath's `iq_iss_*` reads, done safely.
+   - **I3:** flip ON (`FRONT_PIPE=1` + `SCHED_WAKEUP=1`), full gate ladder, re-synth.
 4. branch redirect / VU / further front splits.
 
 Gates at every step: default 251/0 + `--backend-validate` + N1 boot cy + litmus
