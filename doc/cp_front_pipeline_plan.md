@@ -201,16 +201,33 @@ SELECTION (scheduled wakeup, 1/cycle), confirmed EXECUTE (waits for the real
 producer) — no stale read, no replay. Cycle-exact at FRONT_PIPE=0 (251/0).
 
 **FLIP STATUS (temp FRONT_PIPE=1 + SCHED_WAKEUP=1, NOT committed): 221 pass / 30
-fail.** Fix A works — the 30 are NOT stale reads but the **+1-shift memory-ordering
-corners** the plan anticipated. Evidence: `rv64ui-bltu` HANGS (tohost=0; fast under
-SCHED=1 so not a timeout) → a **branch-redirect / early-squash (s8) +1-timing**
-corner in the CORE (the core assumes the branch resolves in the issue cycle; the FR
-delays it +1). SCHED_WAKEUP=0 instead gives 61/190 — mostly TIMEOUTS (no scheduled
-wakeup → FR halves dependent-ALU throughput), confirming scheduled wakeup works. The
-FR datapath itself can't deadlock on dataflow (dependent ops can't co-issue across
-FR0/FR1), so the 30 are core-side +1-timing assumptions. **Next: iterative corner
-debug — start with the branch redirect/squash path (bltu/bgeu), then amo/LR-SC,
-misalign, csr, fcvt. This is the multi-session corner work I3 warned of.**
+fail.** Fix A works (not stale reads). SCHED_WAKEUP=0 gives 61/190 (mostly TIMEOUTS —
+without scheduled wakeup the FR halves dependent-ALU throughput → confirms scheduled
+wakeup works).
+
+**ROOT CAUSE LOCALIZED (bltu deadlock trace).** Bisection: FRONT_PIPE=1 +
+SCHED_WAKEUP=1 + **`s8e_flip_en=0` (early redirect OFF) → 247/4**. So the
+**early-redirect (s8.E execute-time branch redirect) + FR interaction causes 26 of
+the 30 failures.** Traced bltu (deadlocks ~cy197, ROB full):
+- The ROB head is a **CSR write to mstatus (0x300), `rob_commit_valid=0` (never
+  marked DONE), but NOT in the IQ and NOT in the FR — it VANISHED.** It left the IQ
+  but never executed and never re-issued, so the head can't commit; the in-flight
+  mstatus write keeps the xlate barrier high and downstream CSR ops (blocked
+  `!at_head`) pile up → ROB fills → deadlock. The vanish happens during the
+  early-redirect burst (cy 138-196).
+- **Leading hypothesis (VERIFY next):** the FR frees the IQ slot at CAPTURE (before
+  execute, via `slot_grant`), so there is a window where an op lives only in the FR.
+  If the early-redirect recovery drops/diverts it (or the ROB-pointer recovery is
+  inconsistent with the FR's extra stage) before it executes, the ROB entry is
+  orphaned with no IQ/FR copy to complete it. (Note: a pure younger-than-branch
+  squash should drop FR + ROB consistently — so the bug is more likely a head/at_head
+  or recovery-ordering edge specific to the early redirect, not the plain squash.)
+
+**Next: fix the early-redirect + FR orphan (the 26-failure dominant bug).** Options
+to investigate: keep the IQ slot occupied until the op DRAINS (executes) so a dropped
+FR op re-issues; or make the early-redirect ROB recovery account for the in-FR op; or
+re-insert a squash-dropped FR op. Then the remaining 4 non-early-redirect corners
+(amo/LR-SC, misalign, csr, fcvt — surfaced with early redirect off). Multi-session.
 
 **Remaining to realize the 20.4 floor:**
 1. ~~FR fix A~~ DONE. The +1-shift core corners (30 fails) are now the work.
