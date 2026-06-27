@@ -22,6 +22,14 @@ pub module iq_int #(
     param PRF_N    : u32 = 64,
     param PRF_W    : u32 = 6 ,
     param ROB_IDX_W: u32 = 5 ,
+    // CP front-pipeline (cp_front_pipeline_plan.md, I1): issue-grant SCHEDULED
+    // wakeup for fixed-latency (pipe1_ok) producers. When 1, a granted ALU-class
+    // op wakes its consumers + sets prf_ready at the GRANT edge (one cycle before
+    // its CDB broadcast), so a front register that delays the consumer's PRF read
+    // by one cycle keeps dependent ALU chains 1/cycle (the +1 FR depth is hidden).
+    // Built DEAD (=0, byte-identical) until the front register lands — enabling it
+    // WITHOUT the front register wakes consumers a cycle early and is WRONG.
+    param SCHED_WAKEUP: bit = 0,
 ) (
     clk: input clock,
     rst: input reset,
@@ -166,6 +174,11 @@ pub module iq_int #(
     var sh_rs2_pdst   : logic         <PRF_W>     [IQ_N];
     var sh_rd_pdst    : logic         <PRF_W>     [IQ_N];
     var sh_rd_old_pdst: logic         <PRF_W>     [IQ_N]; // Zacas: amocas compare value pdst
+    // CP front-pipeline (SCHED_WAKEUP): has_rd mirror of the issued op, so the
+    // grant-time scheduled wakeup gates false wakeups on link-less branches /
+    // stores (same reason the CDB snoop gates on i_cdb_has_rd). Shadowed like the
+    // other tags to avoid the dynamic-index struct-field READ on ops[idx].base.
+    var sh_has_rd     : logic                     [IQ_N];
     var sh_rob_idx   : logic         <ROB_IDX_W> [IQ_N];
     var sh_is_load   : logic                     [IQ_N];
     // Phase 8 S3.b: store flag mirror — pipe-1 eligibility excludes stores
@@ -396,6 +409,21 @@ pub module iq_int #(
     assign o_issue_rob_idx2  = sh_rob_idx[issue_idx2];
     assign o_issue_is_load2  = sh_is_load[issue_idx2];
 
+    // CP front-pipeline (SCHED_WAKEUP): grant-time fixed-latency producer detect.
+    // A slot-0 grant is fixed-latency iff the issued op is pipe1_ok (ALU-class:
+    // no load/store/amo/csr/fp/div). A slot-1 grant is fixed-latency iff it took
+    // the ALU tier (has_issuable2A) — the load tier (has_issuable2L) is
+    // variable-latency and stays on the CDB-broadcast snoop. sh_has_rd gates false
+    // wakeups on link-less branches (their sh_rd_pdst has no real data, like a
+    // non-rd CDB op). Grant = the op actually leaves the IQ (ack && has_issuable).
+    let iss0_pipe1     : logic        = !sh_is_load[issue_idx] && !sh_is_store[issue_idx]
+        && !sh_is_amo[issue_idx] && !sh_is_csr[issue_idx]
+        && !sh_fp_ld[issue_idx] && !sh_fp_st[issue_idx] && !sh_is_div[issue_idx];
+    let sched_wake0_en  : logic        = has_issuable && i_issue_ack && iss0_pipe1 && sh_has_rd[issue_idx];
+    let sched_wake0_pdst: logic<PRF_W> = sh_rd_pdst[issue_idx];
+    let sched_wake1_en  : logic        = has_issuable2A && i_issue_ack2 && sh_has_rd[issue_idx2];
+    let sched_wake1_pdst: logic<PRF_W> = sh_rd_pdst[issue_idx2];
+
     // Phase 8 S4b: intra-bundle RAW. When slot-1 (the younger op of a 2-wide
     // rename bundle) sources slot-0's just-renamed int dest, the core's rename
     // bypass routes slot-1's rs pdst to slot-0's new pdst (== i_rename_pdst). At
@@ -419,6 +447,7 @@ pub module iq_int #(
                 sh_rs2_pdst[i]   = 6'd0;
                 sh_rd_pdst[i]    = 6'd0;
                 sh_rd_old_pdst[i] = 6'd0;
+                sh_has_rd[i]     = 1'b0;
                 sh_rob_idx[i]    = 5'd0;
                 sh_is_load[i]    = 1'b0;
                 sh_is_store[i]   = 1'b0;
@@ -488,6 +517,40 @@ pub module iq_int #(
                     }
                 }
             }
+            // CP front-pipeline (I1): grant-time SCHEDULED wakeup of fixed-latency
+            // producers (cp_front_pipeline_plan.md §1.3-1.4). Mirrors the CDB snoop
+            // but keyed on the GRANTED ALU-class producer's pdst — one cycle BEFORE
+            // its CDB broadcast. Set here (before rename-clear/alloc) so a consumer
+            // renamed THIS cycle seeds ready from prf_ready, exactly like the CDB
+            // snoop. With a front register delaying the consumer's PRF read by one
+            // cycle, "ready visible at N+1" lines up with "result in PRF at N+2" —
+            // dependent ALU chains stay 1/cycle, no operand bypass needed. Built
+            // DEAD (SCHED_WAKEUP=0) until the front register lands; enabling it
+            // without the FR wakes consumers a cycle early and is WRONG.
+            if SCHED_WAKEUP {
+                if sched_wake0_en {
+                    prf_ready[sched_wake0_pdst] = 1'b1;
+                    for i in 0..IQ_N {
+                        if occupied[i] && sh_rs1_pdst[i] == sched_wake0_pdst {
+                            rs1_rdy[i] = 1'b1;
+                        }
+                        if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == sched_wake0_pdst {
+                            rs2_rdy[i] = 1'b1;
+                        }
+                    }
+                }
+                if sched_wake1_en {
+                    prf_ready[sched_wake1_pdst] = 1'b1;
+                    for i in 0..IQ_N {
+                        if occupied[i] && sh_rs1_pdst[i] == sched_wake1_pdst {
+                            rs1_rdy[i] = 1'b1;
+                        }
+                        if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == sched_wake1_pdst {
+                            rs2_rdy[i] = 1'b1;
+                        }
+                    }
+                }
+            }
             // Rename clears prf_ready[new_pdst] so subsequent renames
             // that depend on it see "not ready" until producer writes back.
             if i_rename_set_pending {
@@ -515,6 +578,7 @@ pub module iq_int #(
                 sh_rs2_pdst[free_idx]   = i_alloc_op.rs2_pdst;
                 sh_rd_pdst[free_idx]    = i_alloc_op.rd_pdst;
                 sh_rd_old_pdst[free_idx] = i_alloc_op.old_rd_pdst;
+                sh_has_rd[free_idx]     = i_alloc_op.base.has_rd;
                 sh_rob_idx[free_idx]    = i_alloc_op.rob_idx;
                 sh_is_load[free_idx]    = i_alloc_op.base.is_load;
                 sh_is_store[free_idx]   = i_alloc_op.base.is_store;
@@ -561,6 +625,7 @@ pub module iq_int #(
                 sh_rs2_pdst[free_idx2]   = i_alloc_op2.rs2_pdst;
                 sh_rd_pdst[free_idx2]    = i_alloc_op2.rd_pdst;
                 sh_rd_old_pdst[free_idx2] = i_alloc_op2.old_rd_pdst;
+                sh_has_rd[free_idx2]     = i_alloc_op2.base.has_rd;
                 sh_rob_idx[free_idx2]    = i_alloc_op2.rob_idx;
                 sh_is_load[free_idx2]    = i_alloc_op2.base.is_load;
                 sh_is_store[free_idx2]   = i_alloc_op2.base.is_store;
