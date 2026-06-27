@@ -171,12 +171,36 @@ affected, but slot-0 is the common path.) This needs one of:
   the remaining work.
 - (fix B) replay/cancel — the machinery the program set out to avoid. Not preferred.
 
-**Sequencing question this raises (for the user):** the FR's headline payoff is
-masked by the vector FROUND front (23.58), which is likely a CHEAP no-IPC win
-(2-stage pipeline it like the scalar FROUND `acb8fd0`, or tree-ize the s1 select).
-Crushing the FP fronts (23.58 + the 18-23 band) FIRST would expose more of the FR's
-benefit before paying the FR-drain-readiness complexity + the load-use/mispredict
-IPC. The I1/I2 groundwork stays in place (dead) for the flip once fix A lands.
+**Sequencing decision (user chose "crush FP front first").** The FP front turned
+out NOT to be a cheap tree-ize: the 23.58 ns cone is the VU COMPUTE present-phase
+running the VRF operand fetch (~10.5 ns) AND u_vfpu stage-1 (~13 ns) in ONE comb
+cycle; the element-selects/forwarding are already barrel shifts (no linear scan
+left). The cut is **VU FP operand pipelining** — see VFP_PIPE below.
+
+**VFP_PIPE (vector_unit, `a6cead6`, built dead).** Insert a FETCH phase that
+registers the u_vfpu operands (`fp_s1/2/3_q`, `fp_int_rs1_q`) before present, via a
+separate `fp_fetched_q` flag (not a widened `fp_ph`) so VFP_PIPE=0 is cycle-exact.
+Cost when on: +1 cycle/FP element (3 phases vs 2 — vector FP only, rare in the gate
+workloads). **Convergence measured (all 3 params temp-on, synth):**
+
+```
+baseline 25.105  →  FRONT_PIPE only 23.580  →  FRONT_PIPE + VFP_PIPE 20.395 ns   (−18.7%)
+```
+
+VFP_PIPE crushes the vector FROUND cone below 20.4; the FR-isolated commit/load
+megacone (`n_inflight`: head → prf → MMU-TLB → … → n_inflight) is the new floor at
+**20.4 ns**, confirming the ~18-20 estimate. **The campaign converges.**
+
+**State now:** three dead/parked params — `SCHED_WAKEUP` (I1), `FRONT_PIPE` (I2),
+`VFP_PIPE` — all cycle-exact at default 0. The committed CP is still 25.105.
+
+**Remaining to realize the 20.4 floor:**
+1. **FR fix A** (the FR-drain readiness gate) — required for the FRONT_PIPE flip to
+   be functionally correct. This is the bulk of the remaining work.
+2. The eventual flip enables all three params together + the full gate ladder.
+3. **Next front after 20.4** = the `n_inflight` commit/load megacone back-half
+   (head → prf → AGU → MMU → dcache → commit). That is the load-2-stage LSU / the
+   Direction-C commit-port separation territory — another pipeline, another IPC step.
 
 Re-confirm at the eventual flip: full gate ladder + re-synth.
 
