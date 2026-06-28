@@ -1602,6 +1602,22 @@ pub module heliodor_core #(
     // retire/redirect so the next store starts with its own translate cycle). Dead
     // at MEM_PIPE=0 (the gate is MEM_PIPE-conditioned; the reg is unread).
     var store_fetched_q: logic;
+    // CP M3b: AMO/LR read 2-cycle handshake. A real AMO + LR (issue_amo_read, which
+    // excludes SC) reads the dcache combinationally at execute (alu_wrap amo_old_algn
+    // = i_load_data = dcache_rdata). At MEM_PIPE=1 the dcache reads the AMO's PA only
+    // the NEXT cycle (the registered m_pa_q), so the execute-cycle dcache_rdata is the
+    // PRIOR access's data. amo_fetched_q gives the AMO/LR a FETCH cycle (drive read ->
+    // MMU translate -> M-stage latches PA + amo_read) before the ACCESS cycle (dcache
+    // reads the latched PA -> dcache_rdata = the AMO value -> alu_wrap computes the
+    // RMW). amo_fetch_hold suppresses iq_issue_ack + u_alu completion in the fetch
+    // cycle; it clears whenever the AMO is not driving its read (port lost to a VU
+    // op / committing store / blocked) so a re-fetch re-latches the right PA, and on
+    // ack/redirect so back-to-back AMOs each re-fetch. The AMO commit WRITE is a slow
+    // store (c_is_store && !sb_elig) already covered by M3a's store_fetched_q. SC
+    // reads nothing (no dc_amo_read) and its store rides the M3a path, so it is not
+    // held. Dead at MEM_PIPE=0 (amo_fetch_hold is MEM_PIPE-gated; the reg is unread).
+    var amo_fetched_q  : logic;
+    var amo_fetch_hold : logic;
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -2290,7 +2306,7 @@ pub module heliodor_core #(
         // gated by !lsr_v_q: they READ the dcache at issue (dc_amo_read) and would
         // collide with the LSR's Stage-B read port. (A fault/FP load that DOES ride
         // lane 0 yields to alu_cdb via lsr_lane0_free, so no writeback is lost.)
-        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo),
+        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -2543,7 +2559,7 @@ pub module heliodor_core #(
     // OTHER slot-0 op acks/leaves the IQ while a load occupies the LSR (block-on-issue).
     let iq_issue_ack: logic = if iss_is_div ?
         (int_div_cdb.valid && !fpu_cdb.valid && !mshr_cdb.valid)
-    : ((iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo)) || lsr_capture || mshr_capture);
+    : ((iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold) || lsr_capture || mshr_capture);
 
     // ============================================================
     // PRF
@@ -3264,8 +3280,10 @@ pub module heliodor_core #(
     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !commit_amo_replay
         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
         // CP M3a: a slow store's dcache write happens the cycle AFTER it translates
-        // (the M-stage latches the PA), so hold retire for the translate cycle.
-        && !(MEM_PIPE && c_is_store && !sb_elig && !store_fetched_q)
+        // (the M-stage latches the PA), so hold retire for the translate cycle. CP
+        // M3b: AMO/SC commits write LIVE (amo_commit_live) and retire single-cycle, so
+        // they are excluded (!c_is_amo) from this translate-cycle hold.
+        && !(MEM_PIPE && c_is_store && !sb_elig && !c_is_amo && !store_fetched_q)
         && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
         && !(c_serial && !sb_empty)
@@ -5428,6 +5446,12 @@ pub module heliodor_core #(
     // committing fast store (load_blocks_on_store) so it does not read
     // stale data on a line the fast store is writing.
     let dc_amo_read    : logic    = issue_amo_read && !mmu_walk_inflight && !redirect_fire && !load_blocks_on_store;
+    // CP M3b: hold the AMO/LR execute until its ACCESS cycle. The ACCESS cycle is
+    // "the AMO drove its read last cycle (amo_fetched_q) AND still drives it now
+    // (dc_amo_read) AND its translate is done (!dmem_mmu_busy)" — only then does the
+    // dcache read the latched AMO PA and dcache_rdata carry the AMO value. Anything
+    // else (the fetch cycle, a stolen port, an unfinished translate) is held.
+    assign amo_fetch_hold = MEM_PIPE && issue_amo_read && !(amo_fetched_q && dc_amo_read && !dmem_mmu_busy);
 
     // ============================================================
     // M9.A.294 (F2): load-fault attribution fix.
@@ -6436,16 +6460,42 @@ pub module heliodor_core #(
     // post-translate DATA access is registered into the M-stage). Non-walk cycles
     // read the M-stage. The walk PTE read is plain (no uncached/load-next/amo/excl/
     // hi-strobe); the A/D write-back is the only walk write (dmu_ad_wb, 0xFF strobe).
-    let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : m_pa_q) : dmu_dmem_addr;
-    let dmem_ren_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : m_ren_q) : (dmu_dmem_ren && !lsr_capture);
+    // CP M3b: the AMO/SC COMMIT WRITE must stay SINGLE-CYCLE (live), like MEM_PIPE=0.
+    // Registering it through the M-stage (M3a, the +1-cycle translate→write slip)
+    // breaks the in-cache RMW atomicity: a remote recall landing on the registered
+    // write cycle still merges the stale value (the live hit_excl gate vs the M-staged
+    // input skew) while the poison only registers a cycle later — the watch is already
+    // cleared, no replay, increment lost (litmus N=2 amoadd wedge). A real AMO / SC
+    // commit (store_drive && c_is_amo; LR never store_drives) therefore drives the
+    // dcache write LIVE off the commit store path — the write, its hit_excl ownership
+    // gate, the poison check (commit_store_fire excludes the registered replay) and
+    // the retire all coincide in one cycle, exactly the byte-identical MEM_PIPE=0
+    // behavior. Plain slow stores keep the M3a 2-cycle path (no atomicity). The AMO
+    // commit write address is the same line the AMO read+pinned, so the dcache pin
+    // still protects the read→write window. The READ-side M-stage (amo_fetched_q) is
+    // unaffected (the commit cycle is not a read cycle: amo_fetched_q / m_ren are 0).
+    let amo_commit_live: logic = store_drive && c_is_amo;
+    let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? dmu_dmem_addr : m_pa_q)) : dmu_dmem_addr;
+    // CP M3b: the AMO read must be a SINGLE RFO pulse at its ACCESS cycle, not a
+    // sustained access. The AMO is held at the issue port for both its fetch and
+    // access cycles, so dc_amo_read (and thus m_ren_q / m_amo_read_q) stays asserted
+    // through the access cycle — the unconditional M-stage capture would then re-drive
+    // the dcache the cycle AFTER the AMO completes (amo_fetched_q already cleared by
+    // the ack), a spurious tail RFO that RE-ACQUIRES the just-departed line and masks
+    // a remote recall from the AMO watch (the litmus N=2 amoadd lost-update wedge).
+    // Gate the M-stage AMO access off in that tail cycle: m_amo_tail = a registered
+    // AMO read that is no longer in its access window (amo_fetched_q dropped). The
+    // genuine access cycle (and a sustained miss-fill) keeps amo_fetched_q=1.
+    let m_amo_tail   : logic     = m_amo_read_q && !amo_fetched_q;
+    let dmem_ren_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live)) : (dmu_dmem_ren && !lsr_capture);
     let dmem_unc_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_unc_q) : (dc_uncached && !lsr_capture);
     let dmem_lnext_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_lnext_q) : (dc_load_next && !dc_uncached && !lsr_capture);
-    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : m_wen_q) : dc_i_wen;
-    let dmem_wstrb_m : logic<8>  = if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : m_wstrb_q) : dmu_dmem_wstrb;
-    let dmem_wstrbhi_m: logic<8> = if MEM_PIPE ? (if ptw_dc_active ? 8'd0 : m_wstrbhi_q) : dc_st_wstrb_hi;
-    let dmem_wdata_m : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_wdata : m_wdata_q) : dmu_dmem_wdata;
-    let dmem_amord_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_amo_read_q) : dc_amo_read;
-    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_wen_excl_q) : dc_wen_excl;
+    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? dc_i_wen : m_wen_q)) : dc_i_wen;
+    let dmem_wstrb_m : logic<8>  = if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : (if amo_commit_live ? dmu_dmem_wstrb : m_wstrb_q)) : dmu_dmem_wstrb;
+    let dmem_wstrbhi_m: logic<8> = if MEM_PIPE ? (if ptw_dc_active ? 8'd0 : (if amo_commit_live ? dc_st_wstrb_hi : m_wstrbhi_q)) : dc_st_wstrb_hi;
+    let dmem_wdata_m : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_wdata : (if amo_commit_live ? dmu_dmem_wdata : m_wdata_q)) : dmu_dmem_wdata;
+    let dmem_amord_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (m_amo_read_q && amo_fetched_q)) : dc_amo_read;
+    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? dc_wen_excl : m_wen_excl_q)) : dc_wen_excl;
     let dmem_addr2_m : logic<64> = if MEM_PIPE ? m_addr2_q    : dc_addr2;
     let dmem_ren2_m  : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_ren2_q) : dc_ren2;
     let dmem_lnext2_m: logic     = if MEM_PIPE ? m_lnext2_q   : dc_load_next2;
@@ -6566,6 +6616,7 @@ pub module heliodor_core #(
     assign vu_mem_ready    = !dcache_stall && !dmem_mmu_busy;
     assign vu_mem_fault    = dmem_mmu_fault;
     assign vu_mem_fault_st = dmem_mmu_fault_s;
+
 
     // Phase 8 S5.2: slot-1 LOAD completion. A bare-mode slot-1 load completes on
     // pipe-1 only when the 2nd port HITS, not on a redirect (wrong-path), and
@@ -6846,6 +6897,22 @@ pub module heliodor_core #(
             } else if store_drive && !sb_elig && !dmem_mmu_busy {
                 store_fetched_q = 1'b1;
             }
+        }
+    }
+    // CP M3b: AMO/LR fetch-cycle marker. Set the cycle the AMO/LR drives its read
+    // with the translate done (dc_amo_read && !dmem_mmu_busy: the M-stage latched the
+    // AMO's PA + amo_read this cycle, so next cycle the dcache reads it). Clear on the
+    // AMO's actual ack (it completed), on a redirect, OR whenever it stops driving its
+    // read (!dc_amo_read: port lost to a VU op / committing store, or blocked) — then
+    // a fresh fetch cycle re-latches the right PA before the access. Dead at
+    // MEM_PIPE=0 (amo_fetch_hold, the only reader, is MEM_PIPE-gated).
+    always_ff (clk, rst) {
+        if_reset {
+            amo_fetched_q = 1'b0;
+        } else if redirect_fire || (issue_amo_read && iq_issue_ack) || !dc_amo_read {
+            amo_fetched_q = 1'b0;
+        } else {
+            amo_fetched_q = !dmem_mmu_busy;
         }
     }
     // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).

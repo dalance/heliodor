@@ -220,8 +220,46 @@ MEM_PIPE=0. Gates: default 251/0 (incl litmus N2), N1 boot 4/4 cy byte-identical
 🔬 Flip-test: 224→**235/251** (+11): all plain-store + misaligned + zfhmin tests now
 PASS. Remaining 16 = AMO/LR-SC (all amo*, lrsc) + litmus_2hart → M3b.
 
-**M3b — AMO / LR-SC read-at-execute + reservation timing (NEXT, the atomicity core).**
-16 flip failures = all amo* + lrsc + litmus_2hart.
+**M3b — AMO / LR-SC read-at-execute + LIVE commit write. ✅ DONE (dead).** The 16
+flip failures (all amo* + lrsc + litmus_2hart) are fixed by TWO sub-fixes:
+
+🔧 **(1) `amo_fetched_q` — AMO/LR 2-cycle read handshake.** A real AMO + LR
+(`issue_amo_read`, excludes SC) is HELD at the issue port for a FETCH cycle (drive read
+→ MMU translate → M-stage latches PA + amo_read) before its ACCESS cycle (dcache reads
+the latched PA → `dcache_rdata` = the AMO value → alu_wrap computes the RMW). `amo_fetch_hold`
+suppresses iq_issue_ack + u_alu completion in the fetch cycle; cleared when the AMO stops
+driving its read (`!dc_amo_read`: port lost / blocked) so a re-fetch re-latches the right
+PA, and on ack/redirect so back-to-back AMOs each re-fetch. Tail-RFO elimination: the held
+issue keeps `dc_amo_read` (→ `m_amo_read_q`/`m_ren_q`) asserted through the access cycle, so
+the unconditional M-stage capture re-drives the dcache the cycle AFTER the AMO completes — a
+spurious tail RFO that RE-ACQUIRES the departed line and masks a remote recall from the watch.
+Gated off via `m_amo_tail` (dmem_ren_m) + `amo_fetched_q` (dmem_amord_m).
+
+🔧 **(2) LIVE AMO/SC commit write (`amo_commit_live`) — the §3.D atomicity fix.** 🚨 The
+original M3b plan (let M3a's `store_fetched_q` give the AMO commit write a translate cycle)
+is WRONG and breaks SMP atomicity: at MEM_PIPE=1 a registered (M-staged) AMO commit write
+fires the cycle AFTER it latches, and a remote recall landing on that write cycle still merges
+the STALE value — the dcache's `wenl_fires` gates on a LIVE `hit_excl` while the write-enable
+is the registered M-stage input, and the two SKEW (chk3 says departed, hit_excl says owned),
+so the write lands AND the watch poison only registers the next cycle, too late: the watch is
+already cleared, no replay, the increment is LOST. Manifested as the litmus N=2 sense-reversing
+barrier wedge — both harts amoadd-read old=0, neither becomes the releaser, both spin forever at
+0x800007b8 (DRAM `count` stuck at 1; root-caused with a per-event `$display` trace of ARM /
+REMOTEHIT / WRITE on the barrier line). FIX: a real AMO / SC commit (`store_drive && c_is_amo`;
+LR never store_drives) drives the dcache write LIVE off the commit store path
+(`amo_commit_live ? dmu_dmem_addr/dc_i_wen/dc_wen_excl/… : m_*_q`), so the write, its hit_excl
+ownership gate, the poison check (commit_store_fire excludes the registered replay) and the
+retire all COINCIDE in one cycle — byte-identical to MEM_PIPE=0. AMOs are excluded from the
+M3a `store_fetched_q` retire gate (`!c_is_amo`) and from the M-stage read at their commit
+cycle (`!amo_commit_live` on dmem_ren_m). Plain slow stores keep the M3a 2-cycle path.
+(Gating the registered write by a LIVE recall signal instead would close a dcache
+i_wen→o_chk3_present→amo_remote_hit combinational loop — the live-write approach avoids it.)
+
+🔬 **Flip gates ALL GREEN: default 251/251, litmus N2 (cy 2.27M, 46 replays = recall races
+now poison→replay) + N4 (cy 5.4M), N2 SMP Linux boot (cy ~16.5M).** DEAD (MEM_PIPE=0):
+default 251/0 + N1 boot cy byte-identical (all fixes are MEM_PIPE-gated).
+
+— (historical root-cause notes below) —
 
 🔬 **Root cause CONFIRMED (the AMO read at execute is stale):** `alu_wrap` computes the
 AMO RMW combinationally from `i_load_data` (= `dcache_rdata`) AT the execute cycle
@@ -276,9 +314,22 @@ it. Run litmus N2 + N2 SMP every M3/M4 sub-step.
 - 2026-06-28: **M2.5 DONE (dead, committed).** Clean walk-dcache bundle from dmem_mmu;
   live PTW under MEM_PIPE. Gates: default 251/0, N1 boot 4/4 cy byte-identical, synth
   20.375. Flip: 19/19 vector PASS; full default 224/27, the 27 = exactly the M3 scope.
-- Next: **M3 (scalar slow-store + AMO/LR-SC commit retire)** — gate `rob_commit_ack`
-  (and the AMO watch / LR-SC reservation timing) on the M-stage dcache write landing,
-  mirroring `lsr_complete` for loads. The 27 flip failures are the to-do list; litmus
-  N2/N4 + SMP boot every sub-step (the SMP atomicity risk). Then M4 (flip + corners).
-  Reminder: post-flip floor is the VU-INTEGER datapath (~16.5 ns); pushing below that
-  needs a separate VU-integer operand pipeline (à la VFP_PIPE), out of scope here.
+- 2026-06-28: **M3a DONE (dead, committed `f4f1e3d`).** `store_fetched_q` slow-store
+  commit 2-cycle retire gate. Flip default 224→235/251 (all plain-store + misaligned +
+  zfhmin pass); remaining 16 = AMO/LR-SC + litmus_2hart.
+- 2026-06-28: **M3b DONE (dead, committed).** AMO/LR `amo_fetched_q` 2-cycle read
+  handshake + tail-RFO elimination + **LIVE AMO/SC commit write** (`amo_commit_live`).
+  🚨 The planned "let M3a's store_fetched_q give the AMO commit a translate cycle" was
+  WRONG: a registered M-staged AMO commit write fires stale on a remote recall (the
+  live-hit_excl vs registered-input skew) with the poison registering too late — the
+  litmus N=2 sense-barrier lost-update wedge (root-caused via $display trace of the
+  DRAM `count` at 0x80002000). Fix = AMO/SC commits write SINGLE-CYCLE LIVE off the
+  commit store path, byte-identical to MEM_PIPE=0 (write + hit_excl + poison + retire
+  coincide). Gates: **flip default 251/251, litmus N2 (2.27M) + N4 (5.4M), N2 SMP
+  Linux boot (16.5M) all pass** (see §5 M3b). DEAD (MEM_PIPE=0): default 251/0, N1
+  boot cy byte-identical, synth unchanged. All in `src/core/heliodor_core.veryl`.
+- Next: **M4 — flip ON (`MEM_PIPE=1`).** All 27 flip failures fixed (M3a+M3b); the flip
+  atomicity matrix is green. M4 = set `MEM_PIPE=1` permanently + re-synth (expect CP
+  20.4→~16.5) + the full regression at the new IPC point (boot cy + CoreMark/Dhrystone)
+  + Verilator SMP. Reminder: post-flip floor is the VU-INTEGER datapath (~16.5 ns);
+  pushing below that needs a separate VU-integer operand pipeline (à la VFP_PIPE), OOS here.
