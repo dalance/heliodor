@@ -167,9 +167,34 @@ path. ⇒ §4's 11.5 estimate omitted this VU-integer front; the realistic MEM_P
 payoff (with M2/M3 correctness) is ~16.5 ns unless the VU-integer datapath is also
 pipelined. Committed DEAD at MEM_PIPE=0 (CP/cy byte-identical).
 
-**M2 — VU 2-cycle handshake under MEM_PIPE.** vu_mem_ready / mem_state absorb the
-extra cycle; i_mem_rdata reads the dcache the cycle after translate. Still dead at
-MEM_PIPE=0. Flip-test VU in isolation (vector tests + V-boot).
+**M2 — VU 2-cycle handshake under MEM_PIPE. ✅ DONE.** `mem_fetched_q` in
+`vector_unit` splits each ACTIVE element into a FETCH (drive vaddr → MMU translate →
+the core's M-stage latches the PA) and an ACCESS (the dcache reads the latched PA;
+the result lands) cycle — the exact `fp_fetched_q`/VFP_PIPE pattern. `param MEM_PIPE`
+passed from the core's `const MEM_PIPE` (one source of truth). The VU drives the same
+element for both cycles; the FETCH-cycle dcache re-read of the prior (cached) element
+hits (idempotent re-write for stores), so `i_mem_ready` in FETCH = `!dmem_mmu_busy` =
+"translate done" → no new port needed. Masked-off elements skip the FETCH (complete
+immediately). Dead at MEM_PIPE=0 (`mem_fetched_q` never set → single-cycle = today).
+
+Gates (MEM_PIPE=0): default 251/0, N1 boot 4/4 cy byte-identical (incl. V-boot
+012e46d0), synth 20.395 unchanged.
+
+🔬 **Flip-test (temp MEM_PIPE=1): 18/19 vector arch tests PASS — the VU handshake
+works.** The 1 failure is `test_arch_vleff`, the ONLY vector test that enables Sv39
+paging (it sets a page-boundary fault). The VU FSM is fine; the failure is the **PTW
+page-walk interacting with the M-stage**: at MEM_PIPE=1 the walk's PTE reads go
+through the dcache via the registered M-stage (+1 cycle), but the MMU walk FSM expects
+MEM_PIPE=0 timing → wrong/stale PTE → hang (tohost=0). This is a GENERAL flip blocker
+(every TLB-miss walk, so V-boot + all VM code), NOT a VU bug. ⇒ added step **M2.5**.
+
+**M2.5 — PTW walk + M-stage (NEW, the vleff blocker).** The MMU walk drives PTE
+addresses on `dmu_dmem_addr` while `dmem_mmu_busy`; those reads must NOT be delayed by
+the M-stage. Naive bypass (`dmem_mmu_busy ? dmu_dmem_addr : m_pa_q`) re-introduces the
+TLB-hit cone (dmu_dmem_addr carries it) → un-cuts the megacone. Options: (a) expose
+the MMU walk PTE pointer as a SEPARATE short-path output and feed it live to the
+dcache when `dmem_mmu_busy` (keeps the data PA registered, walk live, cone cut); (b)
+register the PTE read too and teach the MMU walk FSM the +1 latency. (a) is cleaner.
 
 **M3 — slow-store + AMO commit retire gates on M-stage write completion.** The
 high-risk atomicity work. rob_commit_ack must wait for the M-stage dcache write
@@ -193,9 +218,11 @@ it. Run litmus N2 + N2 SMP every M3/M4 sub-step.
   7.1=01206420 / smoke=00b630a0), synth 20.395/206lv/head→n_inflight UNCHANGED.
   Temp-flip synth = 20.395→16.470 (megacone cut, new front = VU-integer datapath
   head→vrf — see §5 M1 finding). All in `src/core/heliodor_core.veryl`.
-- Next: **M2 (VU 2-cycle handshake)** — but reconsider ordering given the M1 finding:
-  the post-flip floor is the VU-INTEGER datapath (head→fifo→decode→VRF→bbcast→vrf,
-  16.5 ns), which is ALSO the M2 path (the VU is the thing that must absorb the extra
-  cycle). M2's VU handshake change + a VU-integer operand register (à la VFP_PIPE)
-  may be the same work. Decide M2 scope: (a) just the mem 2-cycle handshake, or
-  (b) also register the VU integer operand stage to push the front below 16.5.
+- 2026-06-28: **M2 DONE (dead, committed).** `mem_fetched_q` VU 2-cycle handshake,
+  `param MEM_PIPE` from the core. Gates: default 251/0, N1 boot 4/4 cy byte-identical,
+  synth 20.395 unchanged. Flip-test: 18/19 vector tests pass (VU handshake validated);
+  vleff fails on the PTW-walk M-stage interaction → new step M2.5.
+- Next: **M2.5 (PTW walk + M-stage)** — the vleff/V-boot blocker; must precede any
+  full flip. Then M3 (scalar store/AMO commit retire), then M4 (flip + corners).
+  Reminder: post-flip floor is the VU-INTEGER datapath (~16.5 ns); pushing below that
+  needs a separate VU-integer operand pipeline (à la VFP_PIPE), out of scope here.
