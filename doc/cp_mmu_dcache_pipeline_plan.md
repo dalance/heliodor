@@ -220,11 +220,36 @@ MEM_PIPE=0. Gates: default 251/0 (incl litmus N2), N1 boot 4/4 cy byte-identical
 🔬 Flip-test: 224→**235/251** (+11): all plain-store + misaligned + zfhmin tests now
 PASS. Remaining 16 = AMO/LR-SC (all amo*, lrsc) + litmus_2hart → M3b.
 
-**M3b — AMO / LR-SC commit retire + watch/reservation timing (NEXT, the atomicity
-core).** The AMO read (execute) and write (commit) each gain a cycle; `amo_watch_pa_q`
-latches from the M-stage PA; the pin / poison / LR-SC reservation timing shifts +1 and
-must stay coherent. The 16 flip failures (amo*/lrsc/litmus_2hart) are the to-do list.
-Gate ladder EVERY sub-step: default + litmus N2/N4 + N2/N4 SMP boot (SMP atomicity).
+**M3b — AMO / LR-SC read-at-execute + reservation timing (NEXT, the atomicity core).**
+16 flip failures = all amo* + lrsc + litmus_2hart.
+
+🔬 **Root cause CONFIRMED (the AMO read at execute is stale):** `alu_wrap` computes the
+AMO RMW combinationally from `i_load_data` (= `dcache_rdata`) AT the execute cycle
+(`amo_old_algn = i_load_data >> {amo_byte_off,3'b0}`, `alu_wrap.veryl:275`; old→rd,
+new→commit-write). At MEM_PIPE=1 the dcache reads the AMO's PA only the NEXT cycle (the
+registered `m_pa_q`), so at the execute cycle `dcache_rdata` is the PRIOR access's data
+→ wrong old value → wrong result + wrong commit-write. Need a 2-cycle AMO read
+handshake (translate cycle → read+compute cycle), the LSR pattern but for the alu_wrap
+blocking AMO. (The AMO commit WRITE side — `dc_wen_excl`→`m_wen_excl_q`, M1 — is c_is_store
+&& !sb_elig, so M3a's `store_fetched_q` ALREADY gives it a translate cycle; verify that
+suffices.) LR loads have the same execute-read staleness; SC writes via the store path.
+
+Signal map (file:line, heliodor_core.veryl unless noted):
+- AMO read at execute: `dc_amo_read` 5430 → `i_amo_read` 6481 (= `dmem_amord_m && !replay_drive`;
+  at flip `dmem_amord_m`=`m_amo_read_q`, +1). alu_wrap old-value read: `amo_old_algn`
+  `alu_wrap.veryl:275` (reads `i_load_data`=`dcache_rdata`, combinational).
+- AMO watch (FINE — issue-time translated PA, combinational, no M-stage): `amo_watch_pa_q`
+  5021 = `dmu_dmem_addr` on `amo_exec_capture` 4945; `i_chk3_addr` 6540, `dc_amo_present` 6541.
+- AMO commit write: `dc_wen_excl` 6282 → `i_wen_excl`/`dmem_wexcl_m` (M1, +1). Retire gate:
+  `commit_amo_replay` 3208, `rob_commit_ack` 3264 (M3a `store_fetched_q` term applies).
+- LR/SC: `sc_walk_drive` 5412, reservation `rsv_pa_q`/`sc_watch_addr_q` (`i_chk_addr`/`i_chk2_addr`
+  6.5k). `dc_amo_read` excludes SC (SC reads nothing; only the fault-walk matters).
+- Likely approach: a `amo_fetched_q` (mirror `mem_fetched_q`/`store_fetched_q`) that holds
+  the alu_wrap AMO/LR execute one cycle so it reads `dcache_rdata` AFTER the M-stage access.
+  The AMO is at the ROB head (oldest) so the execute handshake is simpler than a general load.
+
+Gate ladder EVERY sub-step: default + litmus N2/N4 + N2/N4 SMP boot (SMP atomicity — the
++1cy-commit amoadd wedge, cp_pipelining_strategy.md §3.D, is invisible single-hart).
 
 **M4 — flip ON (`MEM_PIPE=1`) + full corner-debug.** Expect memory-ordering
 corners (the FR flip's lesson: trace with $display, bisect with sub-params).
