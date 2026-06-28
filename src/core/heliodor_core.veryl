@@ -1573,7 +1573,7 @@ pub module heliodor_core #(
     // lsr_capture live and the megacone uncut — measured: only -0.18 ns). The
     // LSR/replay Stage-B drives (already registered) and the commit-side store/AMO
     // terms stay live and OR over the M-stage; those are the back-half cone.
-    const MEM_PIPE: bit = 0;
+    const MEM_PIPE: bit = 1;
     var m_pa_q       : logic<64>; // = dmu_dmem_addr (translated PA)
     var m_ren_q      : logic    ; // = dmu_dmem_ren && !lsr_capture (execute read term)
     var m_unc_q      : logic    ; // = dc_uncached && !lsr_capture
@@ -1618,6 +1618,21 @@ pub module heliodor_core #(
     // held. Dead at MEM_PIPE=0 (amo_fetch_hold is MEM_PIPE-gated; the reg is unread).
     var amo_fetched_q  : logic;
     var amo_fetch_hold : logic;
+    // CP M3b/M4: atomic-commit translation capture (recover the CP the live AMO/SC
+    // commit write costs). The LIVE commit write (amo_commit_live) is atomic but routes
+    // the commit-cycle dcache write through the live MMU TLB + AMO-write PMP (the
+    // megacone: head -> u_dmem_mmu -> u_pmp_amo_w -> dc_i_wen -> dcache -> dcache_stall
+    // -> rob_commit_ack -> n_inflight, ~11.5 ns of the path). But a real AMO / SC
+    // ALREADY translated its address and passed the R+W PMP at its READ (dmem_mmu
+    // acc_deny includes i_is_amo && pmp_deny_amo_w; a deny faults the op at execute, so
+    // it never reaches the commit write). So the commit write needs NO live MMU/PMP —
+    // capture the read-time PA + "write permitted" + "cacheable in-cache-merge" and
+    // drive the dcache write off those registers (single-cycle, still live-hit_excl
+    // atomic). Captured at the atomic's read/issue (ac_capture). Dead at MEM_PIPE=0
+    // (only read inside the MEM_PIPE amo_commit_live mux arms).
+    var ac_pa_q    : logic<64>; // atomic commit-write PA (= dmu_dmem_addr at read)
+    var ac_wok_q   : logic    ; // atomic R+W PMP + translation OK (= !acc_fault && !fault)
+    var ac_wexcl_q : logic    ; // atomic line is cacheable (in-cache merge, not MMIO/tohost)
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -5053,6 +5068,25 @@ pub module heliodor_core #(
             amo_poison_q = 1'b1;
         }
     }
+    // CP M3b/M4: capture the atomic's read-time translation for its commit write (see
+    // the ac_*_q decls). A real AMO or SC (issue_is_amo && !issue_is_lr — LR never
+    // writes at commit) latches its translated PA, R+W-PMP/translation OK, and
+    // cacheable-merge status when it issues (the cycle dmu_dmem_addr / the fault flags
+    // hold the atomic's). The atomic is at the ROB head (serialized), so the registers
+    // stay valid from issue to commit. Cacheable = DRAM (PA[63:25]==0x40) && !Svpbmt-NC
+    // && not a tohost page (mirrors c_store_mmio / st_pa_tohost on the read PA).
+    always_ff (clk, rst) {
+        if_reset {
+            ac_pa_q    = 64'd0;
+            ac_wok_q   = 1'b0;
+            ac_wexcl_q = 1'b0;
+        } else if issue_is_amo && !issue_is_lr && iq_issue_ack {
+            ac_pa_q    = dmu_dmem_addr;
+            ac_wok_q   = !dmem_mmu_acc_fault && !dmem_mmu_fault;
+            ac_wexcl_q = (dmu_dmem_addr[63:25] == 39'h40) && !dmu_pbmt_unc
+                && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008));
+        }
+    }
 
     // Zacas amocas.q commit-time operands. amocas.q is serializing (issues at the
     // ROB head), so at its commit the architectural register file (arch_regs) is
@@ -6475,7 +6509,16 @@ pub module heliodor_core #(
     // still protects the read→write window. The READ-side M-stage (amo_fetched_q) is
     // unaffected (the commit cycle is not a read cycle: amo_fetched_q / m_ren are 0).
     let amo_commit_live: logic = store_drive && c_is_amo;
-    let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? dmu_dmem_addr : m_pa_q)) : dmu_dmem_addr;
+    // CP M4: the AMO/SC commit write drives the dcache off the READ-TIME registers
+    // (ac_*_q), not the live MMU/PMP — cutting the megacone while staying single-cycle
+    // (live hit_excl) atomic. Address = ac_pa_q; write-enable = "committing & buffer
+    // drained & permitted" (store_drive && sb_empty && ac_wok_q, all MMU-independent;
+    // sb_empty is the AMO release-order gate that dc_i_wen folds in via !sb_empty);
+    // in-cache-merge mode = ac_wexcl_q (cacheable). A faulting atomic never reaches
+    // here (ac_wok_q=0 also belts it). For MMIO (ac_wexcl_q=0) the write is a plain
+    // write-through (i_wen, !i_wen_excl), as at MEM_PIPE=0.
+    let amo_cwr_en   : logic     = store_drive && sb_empty && ac_wok_q;
+    let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? ac_pa_q : m_pa_q)) : dmu_dmem_addr;
     // CP M3b: the AMO read must be a SINGLE RFO pulse at its ACCESS cycle, not a
     // sustained access. The AMO is held at the issue port for both its fetch and
     // access cycles, so dc_amo_read (and thus m_ren_q / m_amo_read_q) stays asserted
@@ -6490,12 +6533,12 @@ pub module heliodor_core #(
     let dmem_ren_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live)) : (dmu_dmem_ren && !lsr_capture);
     let dmem_unc_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_unc_q) : (dc_uncached && !lsr_capture);
     let dmem_lnext_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_lnext_q) : (dc_load_next && !dc_uncached && !lsr_capture);
-    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? dc_i_wen : m_wen_q)) : dc_i_wen;
+    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? amo_cwr_en : m_wen_q)) : dc_i_wen;
     let dmem_wstrb_m : logic<8>  = if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : (if amo_commit_live ? dmu_dmem_wstrb : m_wstrb_q)) : dmu_dmem_wstrb;
     let dmem_wstrbhi_m: logic<8> = if MEM_PIPE ? (if ptw_dc_active ? 8'd0 : (if amo_commit_live ? dc_st_wstrb_hi : m_wstrbhi_q)) : dc_st_wstrb_hi;
     let dmem_wdata_m : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_wdata : (if amo_commit_live ? dmu_dmem_wdata : m_wdata_q)) : dmu_dmem_wdata;
     let dmem_amord_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (m_amo_read_q && amo_fetched_q)) : dc_amo_read;
-    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? dc_wen_excl : m_wen_excl_q)) : dc_wen_excl;
+    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? (amo_cwr_en && ac_wexcl_q) : m_wen_excl_q)) : dc_wen_excl;
     let dmem_addr2_m : logic<64> = if MEM_PIPE ? m_addr2_q    : dc_addr2;
     let dmem_ren2_m  : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_ren2_q) : dc_ren2;
     let dmem_lnext2_m: logic     = if MEM_PIPE ? m_lnext2_q   : dc_load_next2;

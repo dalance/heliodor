@@ -328,8 +328,28 @@ it. Run litmus N2 + N2 SMP every M3/M4 sub-step.
   coincide). Gates: **flip default 251/251, litmus N2 (2.27M) + N4 (5.4M), N2 SMP
   Linux boot (16.5M) all pass** (see §5 M3b). DEAD (MEM_PIPE=0): default 251/0, N1
   boot cy byte-identical, synth unchanged. All in `src/core/heliodor_core.veryl`.
-- Next: **M4 — flip ON (`MEM_PIPE=1`).** All 27 flip failures fixed (M3a+M3b); the flip
-  atomicity matrix is green. M4 = set `MEM_PIPE=1` permanently + re-synth (expect CP
-  20.4→~16.5) + the full regression at the new IPC point (boot cy + CoreMark/Dhrystone)
-  + Verilator SMP. Reminder: post-flip floor is the VU-INTEGER datapath (~16.5 ns);
-  pushing below that needs a separate VU-integer operand pipeline (à la VFP_PIPE), OOS here.
+- 2026-06-29: **M4 DONE — flip ON (`MEM_PIPE=1`, committed) + the AMO-commit-megacone fix.**
+  🚨 The first flip re-synth was only **20.395→20.215** (no real gain): M3b's LIVE AMO/SC commit write
+  (needed for atomicity) routes the commit-cycle dcache write through the live MMU TLB +
+  AMO-write PMP (`head→u_dmem_mmu→u_pmp_amo_w→commit_store_fire→dc_i_wen→u_dcache→
+  rob_commit_ack→n_inflight`) — re-introducing the megacone the M-stage cut. FIX (Option C,
+  user-chosen): a real AMO / SC ALREADY translated + passed the R+W PMP at its READ (a deny
+  faults it at execute, so it never reaches the commit write), so the commit write needs NO
+  live MMU/PMP. New read-time registers `ac_pa_q` (PA), `ac_wok_q` (R+W PMP + translation OK),
+  `ac_wexcl_q` (cacheable in-cache-merge) captured at the atomic's issue; the AMO/SC commit
+  write drives the dcache off them (`amo_commit_live ? ac_pa_q / (store_drive && sb_empty &&
+  ac_wok_q) / ac_wexcl_q : m_*_q`) — single-cycle, live-hit_excl atomic, MMU-independent.
+  🔬 **synth 20.215→17.040 ns (−16% vs the committed 20.4)**, endpoint still head→n_inflight
+  (a residual ~0.5 ns commit-write path remains vs the M1 16.47 VU-integer floor — out of
+  this fix's scope). Cycle-IDENTICAL to the live-write M3b at flip (litmus N2 0x22a330, N4
+  0x530200, N2 SMP 0xfc6160, N4 SMP 0x1568f50 all match) → atomically equivalent, just
+  registered. **Flip gate ladder ALL GREEN: default 251/251, --backend-validate 251/0 (cc vs
+  cranelift), litmus N2 + N4, N2 + N4 SMP Linux boot.** DEAD sanity (MEM_PIPE=0): N1 7.1/7.1V
+  boot cy byte-identical (01206420 / 012e46d0). **IPC cost (flip vs the committed 20.4 baseline)
+  is small: N1 7.1 boot 01206420→01210060 (+0.2%), litmus N2 +1.8%, N2/N4 SMP boot ~0%,
+  Dhrystone IPC 1.155→1.114** (load-use is unaffected — plain loads use the FR's LSR, not the
+  M-stage; only store-commit / VU-element / AMO take +1 cy, hidden by the OoO core). 🏁
+  **Committed: CP 25.105 (campaign start) → 20.395 (FR) → 17.040 ns (MEM_PIPE) — the headline
+  now MOVES.** Reminder: the residual ~16.5 floor (endpoint still head→n_inflight, a ~0.5 ns
+  commit-write path) and below is the VU-INTEGER datapath; cutting further needs a separate
+  VU-integer operand pipeline (à la VFP_PIPE), OOS here.
