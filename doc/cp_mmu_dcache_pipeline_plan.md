@@ -209,9 +209,22 @@ amo*, lrsc, sw/sd_misaligned/ma_addr, litmus_2hart, zfhmin[FP st_ld]). Cleanly s
 M3: the slow store writes the registered PA one cycle late but rob_commit_ack retires
 it immediately. Loads (LSR) + VU + walks are all correct at flip.
 
-**M3 — slow-store + AMO commit retire gates on M-stage write completion.** The
-high-risk atomicity work. rob_commit_ack must wait for the M-stage dcache write
-(mirror lsr_complete). amo_watch_pa_q / pin / LR-SC shift +1 coherently.
+**M3a — slow-store commit 2-cycle retire gate. ✅ DONE.** `store_fetched_q` gives a
+slow store (`c_is_store && !sb_elig`, the i_wen path) a translate cycle (M-stage
+latches PA+wen) before its dcache write cycle: a new `rob_commit_ack` term
+`!(MEM_PIPE && c_is_store && !sb_elig && !store_fetched_q)` holds retire for the
+translate cycle. `store_fetched_q` sets when the slow store drives + `!dmem_mmu_busy`,
+clears on retire/redirect (so the next store gets its own translate cycle). The write
+cycle's dup re-write of the prior store is idempotent (same M-stage tuple). Dead at
+MEM_PIPE=0. Gates: default 251/0 (incl litmus N2), N1 boot 4/4 cy byte-identical.
+🔬 Flip-test: 224→**235/251** (+11): all plain-store + misaligned + zfhmin tests now
+PASS. Remaining 16 = AMO/LR-SC (all amo*, lrsc) + litmus_2hart → M3b.
+
+**M3b — AMO / LR-SC commit retire + watch/reservation timing (NEXT, the atomicity
+core).** The AMO read (execute) and write (commit) each gain a cycle; `amo_watch_pa_q`
+latches from the M-stage PA; the pin / poison / LR-SC reservation timing shifts +1 and
+must stay coherent. The 16 flip failures (amo*/lrsc/litmus_2hart) are the to-do list.
+Gate ladder EVERY sub-step: default + litmus N2/N4 + N2/N4 SMP boot (SMP atomicity).
 
 **M4 — flip ON (`MEM_PIPE=1`) + full corner-debug.** Expect memory-ordering
 corners (the FR flip's lesson: trace with $display, bisect with sub-params).
