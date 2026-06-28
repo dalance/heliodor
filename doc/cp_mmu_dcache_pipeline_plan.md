@@ -188,13 +188,26 @@ through the dcache via the registered M-stage (+1 cycle), but the MMU walk FSM e
 MEM_PIPE=0 timing → wrong/stale PTE → hang (tohost=0). This is a GENERAL flip blocker
 (every TLB-miss walk, so V-boot + all VM code), NOT a VU bug. ⇒ added step **M2.5**.
 
-**M2.5 — PTW walk + M-stage (NEW, the vleff blocker).** The MMU walk drives PTE
-addresses on `dmu_dmem_addr` while `dmem_mmu_busy`; those reads must NOT be delayed by
-the M-stage. Naive bypass (`dmem_mmu_busy ? dmu_dmem_addr : m_pa_q`) re-introduces the
-TLB-hit cone (dmu_dmem_addr carries it) → un-cuts the megacone. Options: (a) expose
-the MMU walk PTE pointer as a SEPARATE short-path output and feed it live to the
-dcache when `dmem_mmu_busy` (keeps the data PA registered, walk live, cone cut); (b)
-register the PTE read too and teach the MMU walk FSM the +1 latency. (a) is cleaner.
+**M2.5 — PTW walk + M-stage (the vleff blocker). ✅ DONE (option a).** `dmem_mmu`
+exposes a CLEAN short-path walk-dcache bundle — `o_ptw_dc_active` (= `vm && (ptw_req
+|| ptw_wen)`), `o_ptw_dc_ren`, `o_ptw_dc_addr` (= `ptw_addr`), `o_ptw_dc_wdata` (=
+`ptw_wdata`) — with NO TLB-hit/PMP cone (unlike `dmu_dmem_addr`, which muxes
+`ptw_paddr`). At MEM_PIPE=1 the core's `dmem_*_m` selectors route the dcache LIVE off
+this bundle while `ptw_dc_active` (walk read = plain cached read; A/D write = `dmu_ad_wb`
++ 0xFF strobe), else the M-stage. The multi-cycle walk thus keeps its MEM_PIPE=0 timing
+(only the post-translate DATA access is registered), and `m_pa_q` naturally holds
+`ptw_paddr` at the walk-complete cycle — aligned with the VU's FETCH/ACCESS so the data
+access reads the right PA. Megacone stays cut (ptw_addr is short).
+
+Gates (MEM_PIPE=0): default 251/0, N1 boot 4/4 cy byte-identical, synth 20.375 (-0.02
+ns mapping noise from the dead MMU-output fanout on ptw_addr; 206lv/head->n_inflight).
+
+Flip-test (temp MEM_PIPE=1): all 19/19 vector tests PASS (vleff fixed). Full default
+suite at flip = 224/251 pass, 27 fail — and the 27 are EXACTLY the scalar store +
+AMO/LR-SC + misaligned-store + litmus-N2 tests (sb/sh/sw/sd/st_ld/ld_st/ma_data, all
+amo*, lrsc, sw/sd_misaligned/ma_addr, litmus_2hart, zfhmin[FP st_ld]). Cleanly scopes
+M3: the slow store writes the registered PA one cycle late but rob_commit_ack retires
+it immediately. Loads (LSR) + VU + walks are all correct at flip.
 
 **M3 — slow-store + AMO commit retire gates on M-stage write completion.** The
 high-risk atomicity work. rob_commit_ack must wait for the M-stage dcache write
@@ -222,7 +235,12 @@ it. Run litmus N2 + N2 SMP every M3/M4 sub-step.
   `param MEM_PIPE` from the core. Gates: default 251/0, N1 boot 4/4 cy byte-identical,
   synth 20.395 unchanged. Flip-test: 18/19 vector tests pass (VU handshake validated);
   vleff fails on the PTW-walk M-stage interaction → new step M2.5.
-- Next: **M2.5 (PTW walk + M-stage)** — the vleff/V-boot blocker; must precede any
-  full flip. Then M3 (scalar store/AMO commit retire), then M4 (flip + corners).
+- 2026-06-28: **M2.5 DONE (dead, committed).** Clean walk-dcache bundle from dmem_mmu;
+  live PTW under MEM_PIPE. Gates: default 251/0, N1 boot 4/4 cy byte-identical, synth
+  20.375. Flip: 19/19 vector PASS; full default 224/27, the 27 = exactly the M3 scope.
+- Next: **M3 (scalar slow-store + AMO/LR-SC commit retire)** — gate `rob_commit_ack`
+  (and the AMO watch / LR-SC reservation timing) on the M-stage dcache write landing,
+  mirroring `lsr_complete` for loads. The 27 flip failures are the to-do list; litmus
+  N2/N4 + SMP boot every sub-step (the SMP atomicity risk). Then M4 (flip + corners).
   Reminder: post-flip floor is the VU-INTEGER datapath (~16.5 ns); pushing below that
   needs a separate VU-integer operand pipeline (à la VFP_PIPE), out of scope here.
