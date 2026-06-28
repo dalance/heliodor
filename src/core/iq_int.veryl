@@ -29,11 +29,11 @@ pub module iq_int #(
     // by one cycle keeps dependent ALU chains 1/cycle (the +1 FR depth is hidden).
     // Built DEAD (=0, byte-identical) until the front register lands — enabling it
     // WITHOUT the front register wakes consumers a cycle early and is WRONG.
-    param SCHED_WAKEUP: bit = 0,
+    param SCHED_WAKEUP: bit = 1,
     // CP front-pipeline (I2): register the o_issue_* outputs (the front register).
     // When 0, o_issue_* fall back to the live combinational select = today's
     // behavior (the FR regs stay invalid). Flips to 1 with SCHED_WAKEUP at I3.
-    param FRONT_PIPE: bit = 0,
+    param FRONT_PIPE: bit = 1,
 ) (
     clk: input clock,
     rst: input reset,
@@ -285,7 +285,16 @@ pub module iq_int #(
     assign o_alloc_rdy2 = has_free_slot2;
 
     // M6: combinational int PRF-ready query (for iq_fp int-source readiness).
-    assign o_fp_int_query_rdy = prf_ready[i_fp_int_query_pdst];
+    // CP front-pipeline (SCHED_WAKEUP): use prf_DONE, not prf_ready. The scheduled
+    // wakeup sets prf_ready one cycle EARLY (at the producer's grant) to hide the FR
+    // depth for FR-delayed INT consumers in this queue. But iq_fp has NO front
+    // register — an int→fp op reads the integer PRF combinationally the cycle it
+    // issues. Seeding its int-source readiness from the EARLY prf_ready lets it issue
+    // before the producer's real CDB broadcast wrote the PRF → stale int operand
+    // (e.g. rv64uf-fdiv subtest 6 when the producer stalls in the FR). prf_done is
+    // set ONLY at the real broadcast, so the int→fp op waits for the value to truly
+    // land. When SCHED_WAKEUP=0 prf_done == prf_ready (no early set) → byte-identical.
+    assign o_fp_int_query_rdy = prf_done[i_fp_int_query_pdst];
 
     // Phase 8 S4c: OLDEST-ready issue (was lowest-IQ-slot-index). Pick the ready
     // unblocked entry with the smallest age = (rob_idx - rob_head) in ROB_IDX_W
@@ -445,7 +454,15 @@ pub module iq_int #(
     let win2L_b1      : logic<9> = pick_oldest(win2L_a2, win2L_a3);
     let win2L         : logic<9> = pick_oldest(win2L_b0, win2L_b1);
     let has_issuable2A: logic       = has_issuable && win2A[8];
-    let has_issuable2L: logic       = has_issuable && win2L[8];
+    // CP front-pipeline: Tier L (slot-1 LOADS, S5.2) is DISABLED under FRONT_PIPE.
+    // A slot-1 load completes only on a same-cycle dcache hit (ld2_complete); on a
+    // miss the baseline holds it in the IQ and re-issues. But the FR frees the IQ
+    // slot at capture, so a missing load captured into fr1 has no retry path and
+    // DEADLOCKS (it can become the ROB head while stuck in fr1, which has no MSHR).
+    // Loads are also variable-latency — outside the scheduled-wakeup fixed-latency
+    // set (pipe1_ok). So under FRONT_PIPE all loads take slot-0 (the LSR 2-stage,
+    // which has proper miss/MSHR handling); fr1 only ever holds pipe1_ok ALU ops.
+    let has_issuable2L: logic       = has_issuable && win2L[8] && !FRONT_PIPE;
     let has_issuable2 : logic       = has_issuable2A || has_issuable2L;
     let issue_idx2    : logic<IQ_W> = if has_issuable2A ? win2A[2:0] : win2L[2:0];
     assign o_issue_valid2 = if FRONT_PIPE ? (fr1_valid_q && fr1_src_done) : has_issuable2;
@@ -757,35 +774,46 @@ pub module iq_int #(
             // CP front-pipeline (I2): FR capture / drain / partial-squash. Dead when
             // FRONT_PIPE=0 (fr*_valid_q never set → o_issue_* take the live select).
             // capture refills (and overrides a same-cycle drain so the FR runs
-            // 1/cycle); else drain empties; then a partial squash drops the held op
+            // 1/cycle); else drain empties; else a partial squash drops the held op
             // if it is YOUNGER than the resolving branch — mirroring the IQ squash
-            // above, and catching a just-captured younger op (check runs after
-            // capture). ops[issue_idx] is the live select (issue_idx != free_idx, so
+            // above. ops[issue_idx] is the live select (issue_idx != free_idx, so
             // alloc never aliases it).
             if FRONT_PIPE {
+                // CP front-pipeline (FR squash, NBA-correct). capture/drain/squash
+                // MUST be mutually exclusive: this is an always_ff, so reads of
+                // fr0_op_q/fr0_valid_q in a later statement see the PRE-edge value
+                // (NBA), not a same-cycle capture. The old code captured (fr0_op_q <=
+                // new) then ran the squash reading the OLD fr0_op_q's age but writing
+                // fr0_valid_q — when a capture and a younger-than-branch OLD occupant
+                // coincided, the squash's `fr0_valid_q <= 0` clobbered the capture's
+                // `<= 1`, ORPHANING the just-captured op (it left the IQ at fr_capture
+                // but its FR valid bit was cleared). The fix: decide validity from the
+                // op that will ACTUALLY occupy the FR this cycle — the captured op
+                // (squash it by ITS own age) on capture, else the held op (squash by
+                // its age) on hold. A simultaneous drain (refill) is subsumed by the
+                // capture branch; the drained old op already executed combinationally.
+                let sq_br_age: logic<ROB_IDX_W> = i_squash_idx - i_rob_head_idx;
                 if fr_capture0 {
+                    let cap_age0: logic<ROB_IDX_W> = ops[issue_idx].rob_idx - i_rob_head_idx;
                     fr0_op_q    = ops[issue_idx];
-                    fr0_valid_q = 1'b1;
+                    fr0_valid_q = !(i_squash_en && (cap_age0 >: sq_br_age));
                 } else if fr_drain0 {
                     fr0_valid_q = 1'b0;
-                }
-                if i_squash_en && fr0_valid_q {
-                    let fr0_age   : logic<ROB_IDX_W> = fr0_op_q.rob_idx - i_rob_head_idx;
-                    let sq_br_age0: logic<ROB_IDX_W> = i_squash_idx - i_rob_head_idx;
-                    if fr0_age >: sq_br_age0 {
+                } else if i_squash_en && fr0_valid_q {
+                    let hold_age0: logic<ROB_IDX_W> = fr0_op_q.rob_idx - i_rob_head_idx;
+                    if hold_age0 >: sq_br_age {
                         fr0_valid_q = 1'b0;
                     }
                 }
                 if fr_capture1 {
+                    let cap_age1: logic<ROB_IDX_W> = ops[issue_idx2].rob_idx - i_rob_head_idx;
                     fr1_op_q    = ops[issue_idx2];
-                    fr1_valid_q = 1'b1;
+                    fr1_valid_q = !(i_squash_en && (cap_age1 >: sq_br_age));
                 } else if fr_drain1 {
                     fr1_valid_q = 1'b0;
-                }
-                if i_squash_en && fr1_valid_q {
-                    let fr1_age   : logic<ROB_IDX_W> = fr1_op_q.rob_idx - i_rob_head_idx;
-                    let sq_br_age1: logic<ROB_IDX_W> = i_squash_idx - i_rob_head_idx;
-                    if fr1_age >: sq_br_age1 {
+                } else if i_squash_en && fr1_valid_q {
+                    let hold_age1: logic<ROB_IDX_W> = fr1_op_q.rob_idx - i_rob_head_idx;
+                    if hold_age1 >: sq_br_age {
                         fr1_valid_q = 1'b0;
                     }
                 }

@@ -238,6 +238,69 @@ re-insert a squash-dropped FR op. Then the remaining 4 non-early-redirect corner
 
 Re-confirm at the eventual flip: full gate ladder + re-synth.
 
+---
+
+## CAMPAIGN CONVERGED — all 3 params FLIPPED ON, committed (CP 25.105 → 20.395 ns, −18.7%)
+
+The 30-fail flip is RESOLVED. The 30 were three distinct +1-shift corners, all
+genuine consequences of the FR freeing the IQ slot at capture / the FR's extra
+stage, all now fixed. SCHED_WAKEUP, FRONT_PIPE, VFP_PIPE are now default 1.
+
+**Corner 1 — FR squash NBA hazard (early-redirect, 26/30).** The leading
+hypothesis above was right in spirit (op orphaned, lives only in the FR) but the
+mechanism is an **NBA read-old-write-new** in the squash, not a recovery-ordering
+edge. capture/drain/squash were NOT mutually exclusive: in an `always_ff`, the
+squash's `if i_squash_en && fr0_valid_q { … fr0_op_q.rob_idx … }` reads the
+PRE-edge fr0_op_q (NBA), so on a refill cycle (capture + drain of the OLD
+occupant) where the old occupant is younger-than-branch, the squash decided
+"drop" from the OLD op's age and ran `fr0_valid_q <= 0` AFTER the capture's
+`<= 1` → the just-captured op (a CSR at the ROB head in the bltu trace) got
+valid=0 while already freed from the IQ → orphan → head can't commit → deadlock.
+Fix: one mutually-exclusive if/else-if — capture decides validity from the
+CAPTURED op's age, hold decides from the held op's age. (`iq_int.veryl`.)
+
+**Corner 2 — slot-1 loads + FR deadlock (ma_data, litmus N=2).** Tier-L
+(slot-1/pipe-1 LOADS, S5.2) complete only on a same-cycle dcache hit; on a miss
+the baseline holds them in the IQ and re-issues. The FR frees the IQ slot at
+capture, so a missed load captured into fr1 has no retry path — it can become the
+ROB head while stuck in fr1 (which has no MSHR) → deadlock. Loads are also
+variable-latency, outside the scheduled-wakeup fixed-latency set. Fix: disable
+Tier-L under FRONT_PIPE; all loads take slot-0 (the LSR 2-stage + MSHR). fr1 then
+only ever holds pipe1_ok ALU ops. (`iq_int.veryl`.)
+
+**Corner 3 — FP div/sqrt owner-exact broadcast (rv64uf-fdiv subtest 6).** A
+wrong-path long-latency div/sqrt started the fpu_wrap FSM (owner_q = its
+rob_idx). The EARLY redirect squashed it but does NOT assert `i_flush` (i_flush =
+commit redirect only), so the FSM kept running and latched `done_q` with the
+STALE owner. The broadcast gated on bare `done_q` (`ds_done`) then fired the
+stale result tagged with the CURRENT iq_fp head's rob_idx (≠ owner), writing a
+wrong-path fsqrt's NV flag into that entry's ROB slot → leaked into the committed
+fcsr → subtest 6's `bne a1,a2` (fflags==0 check) failed. Found via SCHED_WAKEUP=0
+bisection (passes) → inner-FSM `$display` (owner=27 while head=8). Fix: gate
+`ds_done` on `done_for_me` (owner == head). Normal path owner==head ⇒ unchanged.
+(`fpu_wrap.veryl`.)
+
+**Bonus — iq_fp int-source seed uses prf_DONE not prf_ready.** Scheduled wakeup
+sets prf_ready a cycle early to hide the FR depth for FR-delayed INT consumers;
+iq_fp has no FR, so it must seed int-source readiness from the real-broadcast
+prf_done (else an int→fp op renamed in the early window reads a stale int
+operand). SCHED_WAKEUP=0 ⇒ prf_done == prf_ready ⇒ byte-identical. (`iq_int.veryl`.)
+
+**Gate ladder (all 3 params on): GREEN.** default 251/0 · backend-validate (cc vs
+cranelift) 251/0 · N1 boot 4/4 (incl 7.1 V-boot) · litmus N=4 pass (5.42M, no
+forbidden outcome) · N=2 SMP boot pass (16.5M) · N=4 SMP boot pass · synth
+**20.395 ns / 206 levels / endpoint head[0]→n_inflight[5]**.
+
+**IPC cost (net vs the −18.7% CP, per the committed program).** microbench smoke
+~11.47M → 11.94M (+4%; load-use +1, mispredict +1). N=2 SMP ~15.87M → 16.5M
+(+4%). V-boot cy unchanged (vector FP rare in boot, so VFP_PIPE's +1/element is
+invisible there).
+
+**Next front after 20.4 = the n_inflight commit/load megacone back-half**
+(head → prf → AGU → MMU → dcache → commit). Now the synth endpoint. Future work:
+load-2-stage LSU back half / Direction-C-style commit-port separation — another
+pipeline + IPC step.
+
 **I4 — second register / commit-cluster freeing.** Once the back half is the wall,
 add the next split (post-MMU, or Direction-C port separation for the commit cluster).
 
