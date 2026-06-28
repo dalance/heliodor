@@ -1556,6 +1556,37 @@ pub module heliodor_core #(
     // registers (no issue2_fire dep) → no comb loop with the pipe-1 issue path.
     var lsr_to_lane1   : logic           ; // load destined for lane 1 (non-fault, non-FP)
     var lsr_lane1_fire : logic           ; // load completes on lane 1 this cycle
+    // ============================================================
+    // CP MMU->dcache pipeline (cp_mmu_dcache_pipeline_plan.md, M1): a unified
+    // dmem "M-stage" register that captures the MMU+PMP output (the translated PA
+    // and the derived dcache control) so the dcache access can happen the NEXT
+    // cycle, for ALL memory paths (VU mem / slow-store-commit / AMO), the way the
+    // LSR already does it for plain loads. Param-gated DEAD: at MEM_PIPE=0 the
+    // dcache reads the LIVE MMU output (today's behavior, byte-identical) and these
+    // regs feed nothing (synth DCEs them); at 1 the dcache reads the registered
+    // M-stage values. M1 only adds the register + the dcache read-mux arm; the VU
+    // 2-cycle handshake (M2) and the store/AMO commit retire gate (M3) follow.
+    // The M-stage captures the EFFECTIVE (post-gating) dcache execute-path inputs,
+    // not the raw MMU outputs: i_ren/i_uncached/i_load_next fold in lsr_capture, so
+    // at flip the dcache reads PURELY registered values and the head->MMU->PMP cone
+    // is fully cut at this register (registering i_addr alone leaves dc_load_next /
+    // lsr_capture live and the megacone uncut — measured: only -0.18 ns). The
+    // LSR/replay Stage-B drives (already registered) and the commit-side store/AMO
+    // terms stay live and OR over the M-stage; those are the back-half cone.
+    const MEM_PIPE: bit = 0;
+    var m_pa_q       : logic<64>; // = dmu_dmem_addr (translated PA)
+    var m_ren_q      : logic    ; // = dmu_dmem_ren && !lsr_capture (execute read term)
+    var m_unc_q      : logic    ; // = dc_uncached && !lsr_capture
+    var m_lnext_q    : logic    ; // = dc_load_next && !dc_uncached && !lsr_capture
+    var m_wen_q      : logic    ; // = dc_i_wen (effective write-enable, pre-dcache)
+    var m_wstrb_q    : logic<8> ; // = dmu_dmem_wstrb
+    var m_wstrbhi_q  : logic<8> ; // = dc_st_wstrb_hi (misaligned-store hi invalidate)
+    var m_wdata_q    : logic<64>; // = dmu_dmem_wdata
+    var m_amo_read_q : logic    ; // = dc_amo_read
+    var m_wen_excl_q : logic    ; // = dc_wen_excl
+    var m_addr2_q    : logic<64>; // = dc_addr2 (slot-1 hit-only load port)
+    var m_ren2_q     : logic    ; // = dc_ren2
+    var m_lnext2_q   : logic    ; // = dc_load_next2
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -6371,6 +6402,24 @@ pub module heliodor_core #(
     let sdrain_saddr  : logic<64> = if imem_aw_grant ? {imem_ptw_addr_w[63:6], 6'd0} : {sb_line[0], 6'd0};
     let sdrain_swen   : logic     = imem_aw_grant || !sb_empty;
     let sdrain_urgent : logic     = imem_aw_grant || (sb_cnt >= 4'd3);
+    // CP MMU->dcache pipeline (M1): the dcache stage-M inputs. At MEM_PIPE=0 these
+    // are the LIVE MMU+PMP outputs (today, byte-identical); at 1 they are the
+    // registered M-stage values (the dcache accesses the cycle after translate).
+    // The LSR/replay drives keep their own registered addresses in both arms (the
+    // M-stage coexists with the LSR for plain loads in M1; folding is M4 work).
+    let dmem_pa_m    : logic<64> = if MEM_PIPE ? m_pa_q       : dmu_dmem_addr;
+    let dmem_ren_m   : logic     = if MEM_PIPE ? m_ren_q      : (dmu_dmem_ren && !lsr_capture);
+    let dmem_unc_m   : logic     = if MEM_PIPE ? m_unc_q      : (dc_uncached && !lsr_capture);
+    let dmem_lnext_m : logic     = if MEM_PIPE ? m_lnext_q    : (dc_load_next && !dc_uncached && !lsr_capture);
+    let dmem_wen_m   : logic     = if MEM_PIPE ? m_wen_q      : dc_i_wen;
+    let dmem_wstrb_m : logic<8>  = if MEM_PIPE ? m_wstrb_q    : dmu_dmem_wstrb;
+    let dmem_wstrbhi_m: logic<8> = if MEM_PIPE ? m_wstrbhi_q  : dc_st_wstrb_hi;
+    let dmem_wdata_m : logic<64> = if MEM_PIPE ? m_wdata_q    : dmu_dmem_wdata;
+    let dmem_amord_m : logic     = if MEM_PIPE ? m_amo_read_q : dc_amo_read;
+    let dmem_wexcl_m : logic     = if MEM_PIPE ? m_wen_excl_q : dc_wen_excl;
+    let dmem_addr2_m : logic<64> = if MEM_PIPE ? m_addr2_q    : dc_addr2;
+    let dmem_ren2_m  : logic     = if MEM_PIPE ? m_ren2_q     : dc_ren2;
+    let dmem_lnext2_m: logic     = if MEM_PIPE ? m_lnext2_q   : dc_load_next2;
     inst u_dcache: dcache (
         clk                                              ,
         rst                                              ,
@@ -6380,14 +6429,14 @@ pub module heliodor_core #(
         // address with the LSR's registered PA (the write path is unaffected —
         // lsr_drive excludes store_drive, so i_wen=0 then). lsr_drive and replay_drive
         // are mutually exclusive (the MSHR is disabled for plain loads in step-1).
-        i_addr           : if lsr_drive ? lsr_paddr_q : if replay_drive ? replay_addr : dmu_dmem_addr,
-        i_wdata          : dmu_dmem_wdata                ,
+        i_addr           : if lsr_drive ? lsr_paddr_q : if replay_drive ? replay_addr : dmem_pa_m,
+        i_wdata          : dmem_wdata_m                  ,
         // S20: a buffered (sb_vm_ok) store must not ALSO write through i_wen,
         // and a slow store's write may not pass an older buffered store to
         // the SAME dwords (overlap; AMO additionally needs full-empty — its
         // retire ack holds with the same condition, see rob_commit_ack).
-        i_wen            : dc_i_wen                      ,
-        i_wen_excl       : dc_wen_excl                   , // P9.3: in-cache AMO/SC local merge
+        i_wen            : dmem_wen_m                    ,
+        i_wen_excl       : dmem_wexcl_m                  , // P9.3: in-cache AMO/SC local merge
         i_wen_excl_q     : dc_wen_excl_q                 , // Zacas amocas.q: also write hi dword
         i_wdata_hi       : cas_q_new_hi                  , // Zacas amocas.q: hi dword (rs2+1)
         // Phase 1 LSU 2-stage: the plain load's Stage-A data read is SUPPRESSED
@@ -6395,17 +6444,17 @@ pub module heliodor_core #(
         // translate+PMP); the Stage-B read is driven by lsr_drive instead. The MMU
         // still translates (core_dmem_ren), and PTW PTE reads (dmem_mmu_busy, so
         // lsr_capture=0) pass through unaffected.
-        i_ren            : (dmu_dmem_ren && !lsr_capture) || replay_drive || lsr_drive,
-        i_uncached       : if lsr_drive ? lsr_unc_q : (dc_uncached && !lsr_capture), // P9.5: MMIO single-beat read (Stage B uses the latched flag)
-        i_wstrb          : dmu_dmem_wstrb                ,
-        i_wstrb_hi       : dc_st_wstrb_hi                , // B.3: misaligned store → invalidate
-        i_load_next      : if lsr_drive ? lsr_dc_load_next : (dc_load_next && !replay_drive && !dc_uncached && !lsr_capture), // B.3: misaligned cross-line load fill (Stage B uses the latched span)
-        i_amo_read       : dc_amo_read && !replay_drive  , // P9.3: AMO/LR read → ownership (RFO)
+        i_ren            : dmem_ren_m || replay_drive || lsr_drive, // execute term (incl. !lsr_capture) folded into dmem_ren_m
+        i_uncached       : if lsr_drive ? lsr_unc_q : dmem_unc_m, // P9.5: MMIO single-beat read (Stage B uses the latched flag)
+        i_wstrb          : dmem_wstrb_m                  ,
+        i_wstrb_hi       : dmem_wstrbhi_m                , // B.3: misaligned store → invalidate
+        i_load_next      : if lsr_drive ? lsr_dc_load_next : (dmem_lnext_m && !replay_drive), // B.3: misaligned cross-line load fill (Stage B uses the latched span)
+        i_amo_read       : dmem_amord_m && !replay_drive , // P9.3: AMO/LR read → ownership (RFO)
         // Phase 8 S5.2: 2nd hit-only read port (dual-issue loads). Tied off in
         // step 1; wired to the slot-1 load AGU/result in steps 2-3.
-        i_addr2          : dc_addr2                       ,
-        i_ren2           : dc_ren2                        ,
-        i_load_next2     : dc_load_next2                  ,
+        i_addr2          : dmem_addr2_m                   ,
+        i_ren2           : dmem_ren2_m                    ,
+        i_load_next2     : dmem_lnext2_m                  ,
         // Phase 8 S6/S20: 2nd write port (store-drain), now fed by the
         // committed-store buffer head (oldest entry) instead of the live
         // committing store. o_sdrain_ack pops the entry.
@@ -6716,6 +6765,42 @@ pub module heliodor_core #(
             } else if lsr_complete {
                 lsr_v_q = 1'b0;
             }
+        }
+    }
+    // CP MMU->dcache pipeline (M1): capture the MMU+PMP output each cycle. At
+    // MEM_PIPE=1 the dcache reads these the next cycle (dmem_*_m above). M1
+    // registers unconditionally (the registered = live, delayed one cycle); the
+    // capture-enable gating that holds the value across a dcache stall is M2/M3
+    // handshake work. At MEM_PIPE=0 these feed nothing (synth DCEs them).
+    always_ff (clk, rst) {
+        if_reset {
+            m_pa_q       = 64'd0;
+            m_ren_q      = 1'b0;
+            m_unc_q      = 1'b0;
+            m_lnext_q    = 1'b0;
+            m_wen_q      = 1'b0;
+            m_wstrb_q    = 8'd0;
+            m_wstrbhi_q  = 8'd0;
+            m_wdata_q    = 64'd0;
+            m_amo_read_q = 1'b0;
+            m_wen_excl_q = 1'b0;
+            m_addr2_q    = 64'd0;
+            m_ren2_q     = 1'b0;
+            m_lnext2_q   = 1'b0;
+        } else {
+            m_pa_q       = dmu_dmem_addr;
+            m_ren_q      = dmu_dmem_ren && !lsr_capture;
+            m_unc_q      = dc_uncached && !lsr_capture;
+            m_lnext_q    = dc_load_next && !dc_uncached && !lsr_capture;
+            m_wen_q      = dc_i_wen;
+            m_wstrb_q    = dmu_dmem_wstrb;
+            m_wstrbhi_q  = dc_st_wstrb_hi;
+            m_wdata_q    = dmu_dmem_wdata;
+            m_amo_read_q = dc_amo_read;
+            m_wen_excl_q = dc_wen_excl;
+            m_addr2_q    = dc_addr2;
+            m_ren2_q     = dc_ren2;
+            m_lnext2_q   = dc_load_next2;
         }
     }
     // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).

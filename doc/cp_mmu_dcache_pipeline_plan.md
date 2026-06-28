@@ -138,10 +138,34 @@ issue→execute, which is the right end.)
 
 ## 5. Staged increments (each green through its gate ladder)
 
-**M1 — M-stage register + dcache read-mux, param-gated DEAD (`MEM_PIPE=0`).** Add
-the regs + the `if MEM_PIPE ? m_*_q : …` arms on the dcache i_addr/i_ren/i_uncached
-/i_wen/i_wdata/i_wstrb. Capture from the MMU output each cycle. Gate: build
-byte-identical + default 251/0 + N1 boot cy unchanged + synth 20.395 unchanged.
+**M1 — M-stage register + dcache read-mux, param-gated DEAD (`MEM_PIPE=0`). ✅ DONE.**
+Add the regs + the `if MEM_PIPE ? m_*_q : …` arms on the dcache inputs. Capture from
+the MMU output each cycle. Gate: build byte-identical + default 251/0 + N1 boot cy
+unchanged + synth 20.395 unchanged.
+
+🔑 **Key finding — register the EFFECTIVE (post-gating) execute-path inputs, NOT the
+raw MMU outputs.** First cut registered only `dmu_dmem_addr`→i_addr (+ raw ren/wen/
+wstrb/wdata/unc/amo). Temp-flip synth: only **20.395→20.215** (−0.18) — the megacone
+was NOT cut, because `i_load_next`/`i_ren`/`i_uncached` still carried LIVE head-cone
+terms (`dc_load_next`/`dc_uncached`/`lsr_capture` from the live PA byte-offset). The
+synth trace showed PMP `acc_deny`→`dmu_dmem_ren`→`dc_uncached`→`dc_load_next`→
+`i_ren`→dcache still intact. **Fix: capture the effective terms** (`m_ren_q` =
+`dmu_dmem_ren && !lsr_capture`, `m_unc_q` = `dc_uncached && !lsr_capture`, `m_lnext_q`
+= `dc_load_next && !dc_uncached && !lsr_capture`), plus the slot-1 hit-only load port
+(`m_addr2_q`/`m_ren2_q`/`m_lnext2_q`) and the misaligned-store hi strobe
+(`m_wstrbhi_q`). Then at flip the dcache reads PURELY registered values; the LSR/
+replay Stage-B drives and commit-side store/AMO terms (the back-half cone) stay live
+and OR over the M-stage. Register set = 13 fields (216 FF bits).
+
+🔬 **Temp-flip synth (MEM_PIPE=1, NOT functionally correct — VU/store/AMO handshakes
+are M2/M3) = 20.395 → 16.470 ns (−19.3%), 141 levels, new endpoint head[0]→`vrf[63]`.**
+The memory megacone IS cut. **But the new floor is ~16.5 ns, NOT the plan's ~11.5** —
+the exposed front is an entirely VU-INTERNAL integer datapath: head→`fifo_instr`→
+`h_funct6` decode→`h_vs1/h_vs2`→VRF read (`i_vs1_data`)→`bbcast`→`vrf` write. That is
+a separate pipelining target (a VU-integer analogue of the VFP_PIPE), not a memory
+path. ⇒ §4's 11.5 estimate omitted this VU-integer front; the realistic MEM_PIPE
+payoff (with M2/M3 correctness) is ~16.5 ns unless the VU-integer datapath is also
+pipelined. Committed DEAD at MEM_PIPE=0 (CP/cy byte-identical).
 
 **M2 — VU 2-cycle handshake under MEM_PIPE.** vu_mem_ready / mem_state absorb the
 extra cycle; i_mem_rdata reads the dcache the cycle after translate. Still dead at
@@ -162,5 +186,16 @@ it. Run litmus N2 + N2 SMP every M3/M4 sub-step.
 
 ## 6. Status
 - 2026-06-28: plan seeded after the FR campaign converged (commit `48b147a`, CP
-  25.105→20.395). Map done (§2). Implementation not started.
-- Next: M1 (M-stage register, dead). Then M2/M3/M4.
+  25.105→20.395). Map done (§2).
+- 2026-06-28: **M1 DONE (dead, committed).** M-stage register (13 fields, effective
+  execute-path dcache inputs) + dcache read-mux, `const MEM_PIPE: bit = 0`. Gates:
+  default 251/0, N1 boot 4/4 (cy byte-identical 7.1V=012e46d0 / 6.6=013ec190 /
+  7.1=01206420 / smoke=00b630a0), synth 20.395/206lv/head→n_inflight UNCHANGED.
+  Temp-flip synth = 20.395→16.470 (megacone cut, new front = VU-integer datapath
+  head→vrf — see §5 M1 finding). All in `src/core/heliodor_core.veryl`.
+- Next: **M2 (VU 2-cycle handshake)** — but reconsider ordering given the M1 finding:
+  the post-flip floor is the VU-INTEGER datapath (head→fifo→decode→VRF→bbcast→vrf,
+  16.5 ns), which is ALSO the M2 path (the VU is the thing that must absorb the extra
+  cycle). M2's VU handshake change + a VU-integer operand register (à la VFP_PIPE)
+  may be the same work. Decide M2 scope: (a) just the mem 2-cycle handshake, or
+  (b) also register the VU integer operand stage to push the front below 16.5.
