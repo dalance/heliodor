@@ -130,3 +130,40 @@ inline `test_arch_v*` vector · litmus N2/N4 · N2/N4 SMP boot. Cycle counts:
 the campaign is NOT cycle-exact for vector ops (element latency +1) — verify
 vector correctness, not cycle identity; scalar boot cy should stay identical
 (VU dead) as the no-regression check.
+
+## Implementation result (param `VINT_PIPE`, vector_unit.veryl)
+
+Implemented + flipped. **CP 17.040 → 15.300 ns (−10.2%)**, not the 14.565 the
+FF table above predicted. The gap is structural, not a bug:
+
+- **cut #1** = a FETCH phase in the permute COMPUTE FSM (`pm_need_fetch =
+  VINT_PIPE && h_is_perm`) that registers the UNIFIED source register
+  (`pm_src_reg`) + in-register offset (`pm_src_bitoff`) + OOB, so `o_vs2_addr`
+  starts at a register for vrgather AND slide (the first flip pinned at 15.87 ns
+  via a false combine: slide's `scalar→sidx→sreg` source address feeding the
+  VRF read whose data feeds the integer ALU `bbcast/valu` — mutually exclusive
+  ops veryl synth doesn't prune). vcompress takes the same FETCH for uniformity.
+- **cut #2** = a VADDR phase in the mem ACCESS FSM that latches `m_vaddr` into
+  `mem_va_q` with `o_mem_active` gated off (the VADDR gap is safe — the port is
+  held so scalar load issue is blocked, and the VU op is the ROB head so no
+  scalar store commits), then the FETCH drives the REGISTERED VA into the MMU.
+  The store write stays M-staged and lands the correct PA in ACCESS.
+
+After both cuts the VU is no longer the bottleneck — the endpoint moves to the
+**scalar commit-store megacone** (`commit_store_fire → core_dmem_vaddr → MMU →
+n_inflight`) at 15.300 ns. The FF table's 14.565 registered the SHARED
+`core_dmem_vaddr` (the MMU input), which also cuts the scalar store-commit VA;
+my cut #2 only registers the VU's own `mem_va_q`. Cutting the scalar
+store-commit VA = deferring the commit decision by a cycle = the commit
+pipeline, which the MEM_PIPE campaign proved breaks SMP atomicity (the +1 cy
+amoadd wedge). So **15.300 ns is the real VU-campaign floor; 14.565 needs the
+separate, SMP-risky commit-store pipeline** (next front).
+
+**IPC cost (measured):** N1 7.1-V boot cy 013c5090 → 013cc5c0 = **+0.13 %** (the
+kernel uses little vector mem/permute). Permute / vector-mem ops are +1 cy/elem,
+hidden by OoO in scalar-dominated workloads.
+
+**Gates (flip, all green):** default 252/0 · ACT4 696/696 · backend-validate
+vector 20/20 (cc/cranelift) · vector 20/20 (incl. new `test_arch_vperm`) ·
+N1 7.1-V boot · litmus N2/N4 · N2/N4 SMP boot. Dead (VINT_PIPE=0): default
+252/0 · synth 17.040 unchanged · N1 boot cy byte-identical.
