@@ -100,6 +100,29 @@ dead param scaffold (`VINT_PIPE` etc., built at 0 = cycle-exact)
   measurement — MEM_PIPE's S-mode+paging corner proved the default ladder is
   not sufficient.
 
+## Validated synth measurements (FF-insertion, this session) — the campaign is de-risked
+
+Temp registers inserted (synth-only, reverted) to measure the achievable floor:
+
+| cut(s) registered                          | CP (ns) | endpoint                | exposed front |
+|--------------------------------------------|---------|-------------------------|---------------|
+| none (committed)                           | 17.040  | head → n_inflight[5]    | VU mem path   |
+| MMU input VA (`core_dmem_vaddr`)           | 16.470  | head → vrf[63]          | VU compute    |
+| VRF rd-addr (`vu_vs2_addr`)                | 17.040  | head → n_inflight[5]    | VU mem (back) |
+| **BOTH** (MMU input + VRF rd-addr)         | **14.565** | **pc_q → rs1_rdy[0]** | **scalar issue/wakeup** |
+
+So: the two VU fronts mask each other (cut one, the other re-emerges at ~16.5–17);
+cut **both** → **14.565 ns (−14.5%)** and the endpoint leaves the VU entirely for
+the scalar front-end (`pc_q → … → rs1_rdy`, the rename/issue/scheduled-wakeup
+dependency). That scalar path (14.57 ns) is the floor *after* this campaign — the
+next front beyond VU. The "register `vu_vs2_addr`" cut is a uniform VRF-read
+pipeline stage (all vector reads +1 cy); the proper impl may instead be a
+permute-specific FETCH (gather-index register) if vrgather is the only deep
+dynamic read — to be decided when implementing cut #1.
+
+**Conclusion: the VU pipeline is worth ~2.5 ns (−14.5%) but ONLY if both fronts
+are cut together** (a one-front cut moves the headline 0.0–0.6 ns = mole-whack).
+
 ## Verification gates (per flip)
 
 default 251/0 · **ACT4 696/696** · backend-validate · N1 boot 4/4 (incl 7.1-V) ·
