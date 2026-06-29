@@ -1574,16 +1574,29 @@ pub module heliodor_core #(
     // LSR/replay Stage-B drives (already registered) and the commit-side store/AMO
     // terms stay live and OR over the M-stage; those are the back-half cone.
     const MEM_PIPE: bit = 1;
-    // CP commit-store pre-translate (cp_commit_store_pretranslate_plan.md): capture the
-    // store's issue-time translated PA into the ROB and drain it at commit, removing the
-    // MMU from the commit-store front (head -> commit_store_fire -> AGU -> MMU ->
-    // {n_inflight, dcache fill valid_*}). Built DEAD (=0): the ROB fields are captured
-    // (store_pretx_*), but the commit drain that reads them is wired in P3, so =0 is
-    // byte-identical (the capture is written-but-unread).
+    // CP commit-store pre-translate (cp_commit_store_pretranslate_plan.md): at a store's
+    // EXECUTE cycle the dmem MMU's TLB is side-effect-free probed (dmem_sprobe_*) for the
+    // store's VA; a clean store-permitted cacheable DRAM hit latches its PA into the ROB
+    // (store_pretx_*), and at commit the store drains that registered PA instead of
+    // re-running the MMU — removing the head -> commit_store_fire -> AGU -> MMU ->
+    // {n_inflight, dcache fill valid_*} sweep from the commit-store front. Anything that
+    // is not a clean hit (miss / W/D/U/PMP/PMA deny / uncached / non-canonical / virt /
+    // mid-walk / pending xlate-change) does NOT capture and falls back to commit
+    // translation. NOTE: an EARLIER plan revision wrongly assumed the store's PA was
+    // already produced at issue "for free"; it is not — a plain store asserts no MMU
+    // request at execute (mem_req=0), so its dmu_dmem_addr is the untranslated VA. The
+    // active TLB probe (dmem_sprobe_*) is what actually produces the PA. Built DEAD (=0):
+    // the ROB fields are captured but the commit drain that reads them is wired in P3, so
+    // =0 is byte-identical (the capture is written-but-unread).
     const STORE_PRETRANSLATE: bit = 0;
     var store_pretx_pa    : logic<64>;
     var store_pretx_xfault: logic    ;
     var store_pretx_valid : logic    ;
+    // CP commit-store pre-translate: the dmem MMU's side-effect-free STORE TLB probe of
+    // core_dmem_vaddr (= the store's VA at its execute cycle). pa = the hit PA; ok = a
+    // clean store fast-path hit (see dmem_mmu o_sprobe_*).
+    var dmem_sprobe_pa: logic<64>;
+    var dmem_sprobe_ok: logic    ;
     var m_pa_q       : logic<64>; // = dmu_dmem_addr (translated PA)
     var m_ren_q      : logic    ; // = dmu_dmem_ren && !lsr_capture (execute read term)
     var m_unc_q      : logic    ; // = dc_uncached && !lsr_capture
@@ -3154,6 +3167,10 @@ pub module heliodor_core #(
     var c_store_addr  : logic<64>       ;
     var c_store_data  : logic<64>       ;
     var c_store_funct3: logic<3>        ;
+    // CP commit-store pre-translate (P3): head store's pre-translated PA/fault/valid.
+    var c_store_pa      : logic<64>     ;
+    var c_store_xfault  : logic         ;
+    var c_store_pa_valid: logic         ;
     var c_is_csr      : logic           ;
     var c_csr_addr    : logic<12>       ;
     var c_csr_wdata   : logic<64>       ;
@@ -3483,6 +3500,9 @@ pub module heliodor_core #(
         o_commit_store_addr  : c_store_addr         ,
         o_commit_store_data  : c_store_data         ,
         o_commit_store_funct3: c_store_funct3       ,
+        o_commit_store_pa      : c_store_pa         ,
+        o_commit_store_xfault  : c_store_xfault     ,
+        o_commit_store_pa_valid: c_store_pa_valid   ,
         o_has_pending_store  : rob_has_pending_store,
         o_has_pending_xlate  : rob_has_pending_xlate,
         // Phase 8 S5.1 store-to-load gate + per-entry store shadow (forwarded to
@@ -5330,17 +5350,21 @@ pub module heliodor_core #(
     // the MMU to check W so a W-denied region faults, matching Sail's translate-for-
     // write. The walk drives agu_addr_iss (the SC's VA) on the same i_ren cycle.
     let core_dmem_is_amo: logic = (issue_is_realamo || issue_sc_walk) && !vu_mem_active && !store_drive && !mmu_walk_inflight;
-    // CP commit-store pre-translate (P1 capture): latch the issue-time translated PA +
-    // store fault into the ROB when the lane-0 CDB op is a store whose OWN VA the MMU
-    // translated this cycle (core_dmem_vaddr == agu_addr_iss: no store-commit / PTW-walk
-    // / VU override), the translate completed (!dmem_mmu_busy = TLB hit, no PTW), and no
-    // older translation-state change is in flight (rob_has_pending_xlate). Unread at
-    // STORE_PRETRANSLATE=0; the commit drain that uses sh_store_pa is wired in P3.
-    assign store_pretx_pa     = dmu_dmem_addr;
-    assign store_pretx_xfault = dmem_mmu_fault_s || dmem_mmu_acc_fault_s;
-    assign store_pretx_valid  = cdb.valid && cdb.is_store
+    // CP commit-store pre-translate (capture): latch the dmem MMU's side-effect-free
+    // STORE TLB probe (dmem_sprobe_pa/ok) into the ROB when the lane-0 CDB op is a plain
+    // store (not AMO) whose OWN VA is on the dmem port this cycle (core_dmem_vaddr ==
+    // agu_addr_iss: no store-commit / PTW-walk / VU override drives the port), the probe
+    // is a clean store fast-path hit (dmem_sprobe_ok: V=0 TLB hit, store W&D + U perm,
+    // cacheable, PMP-W ok, backed PA, IDLE), and no translation-state change is in flight
+    // (rob_has_pending_xlate: a stale-across-satp/SFENCE store falls back to commit). The
+    // probe PA equals what the commit-time store_drive translation would produce for this
+    // VA. Faults always fall back (sprobe_ok=0 on any deny), so xfault is constant 0.
+    // Unread at STORE_PRETRANSLATE=0; the commit drain that uses sh_store_pa is in P3.
+    assign store_pretx_pa     = dmem_sprobe_pa;
+    assign store_pretx_xfault = 1'b0;
+    assign store_pretx_valid  = cdb.valid && cdb.is_store && !iq_iss_is_amo
         && !store_drive && !mmu_walk_inflight && !vu_mem_active
-        && !dmem_mmu_busy && !rob_has_pending_xlate;
+        && dmem_sprobe_ok && !rob_has_pending_xlate;
     // Zicbom: the dmem port is driving a cbo.clean/flush/inval's commit-time walk
     // (store-routed, so core_dmem_wen is high while it holds the ROB head). Tells
     // the MMU to use the relaxed R-OR-W cbo page permission instead of W.
@@ -6290,6 +6314,8 @@ pub module heliodor_core #(
         o_rdata_valid: dmem_mmu_rdv    ,
         o_walk_start : dmem_walk_start , // M9.A.296: PTW-start pulse for F2 owner re-latch
         o_idle       : dmem_mmu_idle   , // M9.3: gate the load-walk VA pin on a REAL in-flight walk
+        o_sprobe_pa  : dmem_sprobe_pa  , // CP commit-store pre-translate: STORE TLB probe PA
+        o_sprobe_ok  : dmem_sprobe_ok  , // CP commit-store pre-translate: clean store fast-path hit
 
         // M8.B: stall the dmem MMU walk while the dcache is filling a PTE-read
         // miss — the walk must not advance (i_ptw_valid) until the PTE is cached.
