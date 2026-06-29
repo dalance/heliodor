@@ -41,6 +41,16 @@ pub module vector_unit #(
     // Passed from the core's `const MEM_PIPE` so the two stay in sync. Built DEAD
     // (=0): mem_fetched_q is never set -> single-cycle element = today (cycle-exact).
     param MEM_PIPE : bit = 0  ,
+    // CP: VU integer/permute datapath pipeline (cp_vu_datapath_pipeline_plan.md,
+    // cut #1). vrgather's per-element source addressing is a data-dependent chained
+    // VRF read: vs1 -> idx -> source-register select -> the dynamic vs2 read (the
+    // ~7.8 ns VU-compute floor). VINT_PIPE=1 inserts a FETCH phase in the permute
+    // COMPUTE FSM that registers the gather addressing (pm_g_sreg/sbitoff/oob) off
+    // the live vs1 read, so the deep vs2 read drives off the REGISTERED index the
+    // next cycle (the o_vs2_addr output now starts at a register, not at vs1). Cost:
+    // +1 cycle per vrgather element. Built DEAD (=0): pm_fetched_q is never set, so
+    // the permute FSM stays single-cycle and the addressing is live = cycle-exact.
+    param VINT_PIPE: bit = 0  ,
 ) (
     clk: input clock,
     rst: input reset,
@@ -924,6 +934,15 @@ pub module vector_unit #(
     var pelem   : logic<8>   ; // global element walk index
     var pm_acc  : logic<VLEN>; // current destination register accumulator
     var pm_j    : logic<8>   ; // vcompress running output element index
+    // CP (VINT_PIPE): registered vrgather gather addressing + the FETCH-done flag.
+    // When VINT_PIPE, each vrgather COMPUTE element first spends a FETCH cycle
+    // (pm_fetched_q 0->1) that latches the source register / element offset / OOB
+    // computed from the live vs1->idx read; the present cycle then drives the deep
+    // vs2 read off these registers. Dead when VINT_PIPE=0 (pm_fetched_q never set).
+    var pm_g_sreg_q   : logic<8>;
+    var pm_g_sbitoff_q: logic<8>;
+    var pm_idx_oob_q  : logic   ;
+    var pm_fetched_q  : logic   ;
 
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
@@ -1806,13 +1825,22 @@ pub module vector_unit #(
     let pm_g_sreg    : logic<8>    = pm_vrg_idx[7:0] >> pm_eshift;
     let pm_g_slocal  : logic<8>    = pm_vrg_idx[7:0] & (pm_epr8 - 8'd1);
     let pm_g_sbitoff : logic<8>    = pm_g_slocal << pm_eshamt;
-    let pm_vrg_raw   : logic<VLEN> = i_vs2_data >> pm_g_sbitoff; // vs2[idx] at bit 0
-    let pm_vrg_el    : logic<64>   = if pm_idx_oob ? 64'd0 : pm_vrg_raw[63:0];
+    // CP (VINT_PIPE): the deep vs2 read + element extract use the REGISTERED
+    // gather addressing (latched in the FETCH cycle off the live vs1->idx read), so
+    // the dynamic read starts at a register. Live (VINT_PIPE=0) = single-cycle today.
+    let pm_g_sbitoff_e: logic<8>    = if VINT_PIPE ? pm_g_sbitoff_q : pm_g_sbitoff;
+    let pm_idx_oob_e  : logic       = if VINT_PIPE ? pm_idx_oob_q : pm_idx_oob;
+    let pm_vrg_raw   : logic<VLEN> = i_vs2_data >> pm_g_sbitoff_e; // vs2[idx] at bit 0
+    let pm_vrg_el    : logic<64>   = if pm_idx_oob_e ? 64'd0 : pm_vrg_raw[63:0];
 
     // ---- per-op source register + element value + write enable --------------
     // slide / vrgather are dest-walk (write vd[pelem]); vcompress is source-walk
     // (read vs2[pelem], its source register is the pelem-based pm_dreg).
-    let pm_src_reg: logic<8>   = if h_is_comp ? pm_dreg : (if h_is_vrg ? pm_g_sreg : pm_sreg); // vs2 register to read
+    // CP (VINT_PIPE): vrgather's vs2 source register comes from the REGISTERED
+    // gather index, so o_vs2_addr (-> the VRF read) starts at a register, not at the
+    // live vs1->idx chain. Live (VINT_PIPE=0) = today.
+    let pm_g_sreg_e: logic<8>  = if VINT_PIPE ? pm_g_sreg_q : pm_g_sreg;
+    let pm_src_reg: logic<8>   = if h_is_comp ? pm_dreg : (if h_is_vrg ? pm_g_sreg_e : pm_sreg); // vs2 register to read
     let pm_el_val : logic<64>  = if h_is_vrg ? pm_vrg_el : pm_slide_el; // source element value (low SEW bits)
     let pm_wr_el  : logic      = if h_is_vrg ? pm_active : pm_slide_wr; // write this destination element?
     // Splice the element into the dest-register accumulator (seed from old vd at
@@ -2312,7 +2340,12 @@ pub module vector_unit #(
     // is the dest-register boundary (slide / vrgather) or every compressed element
     // (vcompress RMW at the running output position).
     let h_is_perm  : logic = h_is_slide || h_is_vrg || h_is_comp;
-    let pm_reg_wr  : logic = (pm_state == 2'd1) && (if h_is_comp ? pm_cm : pm_dreg_lst);
+    // CP (VINT_PIPE): only vrgather needs the FETCH cycle (its source read is the
+    // data-dependent vs1->idx->vs2 chain); slide/vcompress stay single-cycle.
+    let pm_need_fetch: logic = VINT_PIPE && h_is_vrg;
+    // The dest-register VRF write only fires in the present cycle (not the FETCH
+    // cycle, where pm_fetched_q is still 0 and the registered index is stale).
+    let pm_reg_wr  : logic = (pm_state == 2'd1) && (!pm_need_fetch || pm_fetched_q) && (if h_is_comp ? pm_cm : pm_dreg_lst);
     let pm_cdb_fire: logic = h_is_perm && (pm_state == 2'd2) && i_cdb_free && !i_flush;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
@@ -2557,6 +2590,7 @@ pub module vector_unit #(
             pelem       = 8'd0;
             pm_acc      = {1'b0 repeat VLEN};
             pm_j        = 8'd0;
+            pm_fetched_q = 1'b0;
         } else if i_flush {
             // Drop all speculative vector ops; restore config from the committed
             // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
@@ -2584,6 +2618,7 @@ pub module vector_unit #(
             // Abandon any in-flight permute op (idempotent: re-reads the same
             // unrenamed VRF sources and re-writes the dest from element 0).
             pm_state    = 2'd0;
+            pm_fetched_q = 1'b0;
         } else {
             // Scalar-operand wakeup (int CDB snoop, both lanes).
             for i in 0..FIFO_N {
@@ -2769,6 +2804,7 @@ pub module vector_unit #(
                         pelem  = 8'd0;
                         pm_acc = {1'b0 repeat VLEN};
                         pm_j   = 8'd0;
+                        pm_fetched_q = 1'b0; // CP (VINT_PIPE): first element starts with a FETCH
                         if vl8 == 8'd0 {
                             pm_state = 2'd2; // empty op: nothing to do
                         } else {
@@ -2781,17 +2817,28 @@ pub module vector_unit #(
                     // the dest register and write it at the boundary; vcompress RMWs
                     // the dest register on each selected element and advances the
                     // running output position pm_j (the VRF write is pm_reg_wr above).
-                    if h_is_comp {
-                        if pm_cm {
-                            pm_j = pm_j + 8'd1;
+                    if pm_need_fetch && !pm_fetched_q {
+                        // CP (VINT_PIPE) FETCH phase: latch the gather addressing
+                        // computed from the live vs1->idx read so the deep vs2 read
+                        // runs next cycle off the registers. No write, no advance.
+                        pm_g_sreg_q    = pm_g_sreg;
+                        pm_g_sbitoff_q = pm_g_sbitoff;
+                        pm_idx_oob_q   = pm_idx_oob;
+                        pm_fetched_q   = 1'b1;
+                    } else {
+                        if h_is_comp {
+                            if pm_cm {
+                                pm_j = pm_j + 8'd1;
+                            }
+                        } else {
+                            pm_acc = if pm_dreg_lst ? {1'b0 repeat VLEN} : pm_acc_next;
                         }
-                    } else {
-                        pm_acc = if pm_dreg_lst ? {1'b0 repeat VLEN} : pm_acc_next;
-                    }
-                    if pelem + 8'd1 >= vl8 {
-                        pm_state = 2'd2;
-                    } else {
-                        pelem = pelem + 8'd1;
+                        pm_fetched_q = 1'b0; // CP (VINT_PIPE): next element re-fetches
+                        if pelem + 8'd1 >= vl8 {
+                            pm_state = 2'd2;
+                        } else {
+                            pelem = pelem + 8'd1;
+                        }
                     }
                 }
                 2'd2: {
