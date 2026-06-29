@@ -28,6 +28,26 @@ this doc is the cold-start resume point. Read this + `cp_pipelining_strategy.md`
   (PRF/VRF/ROB/RAT/SB/MSHR/TLB are flop-based — unlimited ports are legitimate
   there, standard cells, no SRAM compiler).
 
+### ⚡ Phase-0 findings (2026-06-30) — re-measured + FF-insertion experiment
+- **28-RAM inventory done** → `doc/sram_inventory.md`. L2 is excluded (it lives in
+  the SoC above `heliodor_core`). Two structures the plan assumed flop actually
+  infer as RAM: `iq_int.ops` (8×309 2R2W — **keep flop**) and `mmu.v1_ppn`
+  (32×44 1R3W ×2 — trivial 1RW). Hardest: dcache data (64×512 **9R4W**), dcache tags
+  (64×52 **13R1W**), bht (8192×2 4R2W).
+- **Keystone design doc done** → `doc/speculative_wakeup_design.md` (execute staging,
+  scheduled wakeup, replay; staged no-replay-first then replay-if-budget-demands).
+- **IPC budget set by the user: ~10–15 %** (boot-cy / CoreMark / Dhrystone). Gates
+  the campaign; Phase F structure growth runs in parallel as needed.
+- 🔑 **CORRECTION to "Phase C dcache sync-read cuts the `valid_*` front".** It does
+  NOT. FF-insertion proof: registering all six dcache READ outputs left the **top-60
+  paths byte-identical** (headline `n_inflight` 15.300; `valid_1` 14.870 = 55/60).
+  The dcache **read** is a deep-floor front (≤14.565), not the headline. Both
+  headline fronts share the **commit-store front** `head → commit_store_fire →
+  AGU → dmem_vaddr → MMU translate → {n_inflight, dcache fill `valid_*`}` — stores
+  translate **at commit**. **→ First headline-moving lever = stage that front
+  (pre-translate stores at execute, latch PA into the SB), flipped together with the
+  keystone's execute staging.** Details: `speculative_wakeup_design.md §1.0, §9.1`.
+
 ## The keystone: scheduler decouple (latency-speculative wakeup + replay)
 
 The fundamental floor is `rs1_rdy` — the **single-cycle issue=execute=broadcast=
