@@ -848,6 +848,15 @@ pub module vector_unit #(
     // streaming state (element index, load accumulator, fault) is registered.
     var mem_state : logic<2> ;
     var mem_fetched_q: logic ; // CP (MEM_PIPE): element is in its ACCESS phase (FETCH done)
+    // CP (VINT_PIPE cut #2): the registered element VA + a VADDR-done flag. When
+    // MEM_PIPE && VINT_PIPE, each active mem element first spends a VADDR cycle
+    // (mem_va_ready_q 0->1) that latches m_vaddr (the strided-address multiply /
+    // indexed offset add) into mem_va_q WITHOUT driving the port (o_mem_active=0);
+    // the FETCH cycle then drives the REGISTERED VA into the shared MMU, so the MMU
+    // input starts at a register, not at the velem*stride multiply. Dead when
+    // VINT_PIPE=0 (mem_va_ready_q never set -> the FETCH drives live m_vaddr = today).
+    var mem_va_q     : logic<64>;
+    var mem_va_ready_q: logic   ;
     var velem     : logic<8> ; // current element index (0 .. vl)
     var vacc      : logic<VLEN>; // load accumulator (tail / masked-off stay 0)
     var fault_q   : logic    ; // the op faulted at vstart_q
@@ -934,15 +943,19 @@ pub module vector_unit #(
     var pelem   : logic<8>   ; // global element walk index
     var pm_acc  : logic<VLEN>; // current destination register accumulator
     var pm_j    : logic<8>   ; // vcompress running output element index
-    // CP (VINT_PIPE): registered vrgather gather addressing + the FETCH-done flag.
-    // When VINT_PIPE, each vrgather COMPUTE element first spends a FETCH cycle
-    // (pm_fetched_q 0->1) that latches the source register / element offset / OOB
-    // computed from the live vs1->idx read; the present cycle then drives the deep
-    // vs2 read off these registers. Dead when VINT_PIPE=0 (pm_fetched_q never set).
-    var pm_g_sreg_q   : logic<8>;
-    var pm_g_sbitoff_q: logic<8>;
-    var pm_idx_oob_q  : logic   ;
-    var pm_fetched_q  : logic   ;
+    // CP (VINT_PIPE cut #1): registered permute source addressing + the FETCH-done
+    // flag. When VINT_PIPE, each permute COMPUTE element first spends a FETCH cycle
+    // (pm_fetched_q 0->1) that latches the vs2 source register (pm_src_reg) and the
+    // in-register element offset (pm_src_bitoff) + OOB; the present cycle then drives
+    // o_vs2_addr (-> the VRF read) and the element extract off these REGISTERS, so
+    // the deep source-addressing chain (vrgather's vs1->idx, slide's scalar->sidx)
+    // ends at a register and the VRF read is the next segment. This cuts the worst
+    // VU-compute path (the data-dependent source read feeding the integer ALU /
+    // permute splice). Dead when VINT_PIPE=0 (pm_fetched_q never set).
+    var pm_src_reg_q   : logic<8>;
+    var pm_src_bitoff_q: logic<8>;
+    var pm_idx_oob_q   : logic   ;
+    var pm_fetched_q   : logic   ;
 
     // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
     // its top bit is set (count == FIFO_N); otherwise a slot is free.
@@ -1803,7 +1816,7 @@ pub module vector_unit #(
     let pm_vl_last : logic<8>  = vl8 - 8'd1;
     let pm_fill_at : logic     = h_is_slide1 && (if h_slide_dn ? (pelem == pm_vl_last) : (pelem == 8'd0));
     let pm_fill_val: logic<64> = if h_slide1_fp ? i_fscalar_data : i_scalar_data;
-    let pm_slide_raw: logic<VLEN> = i_vs2_data >> pm_sbitoff;     // vs2[src] at bit 0
+    let pm_slide_raw: logic<VLEN> = i_vs2_data >> (if VINT_PIPE ? pm_src_bitoff_q : pm_sbitoff); // vs2[src] at bit 0 (registered offset under VINT_PIPE)
     let pm_slide_el : logic<64>   = if pm_fill_at ? pm_fill_val : (if h_slide_dn ? (if pm_dn_ok ? pm_slide_raw[63:0] : 64'd0) : pm_slide_raw[63:0]);
     let pm_slide_wr : logic       = pm_active && (h_is_slide1 || h_slide_dn || pm_up_ok);
 
@@ -1825,22 +1838,20 @@ pub module vector_unit #(
     let pm_g_sreg    : logic<8>    = pm_vrg_idx[7:0] >> pm_eshift;
     let pm_g_slocal  : logic<8>    = pm_vrg_idx[7:0] & (pm_epr8 - 8'd1);
     let pm_g_sbitoff : logic<8>    = pm_g_slocal << pm_eshamt;
-    // CP (VINT_PIPE): the deep vs2 read + element extract use the REGISTERED
-    // gather addressing (latched in the FETCH cycle off the live vs1->idx read), so
-    // the dynamic read starts at a register. Live (VINT_PIPE=0) = single-cycle today.
-    let pm_g_sbitoff_e: logic<8>    = if VINT_PIPE ? pm_g_sbitoff_q : pm_g_sbitoff;
-    let pm_idx_oob_e  : logic       = if VINT_PIPE ? pm_idx_oob_q : pm_idx_oob;
-    let pm_vrg_raw   : logic<VLEN> = i_vs2_data >> pm_g_sbitoff_e; // vs2[idx] at bit 0
-    let pm_vrg_el    : logic<64>   = if pm_idx_oob_e ? 64'd0 : pm_vrg_raw[63:0];
+    // CP (VINT_PIPE): the deep vs2 read + element extract use the REGISTERED gather
+    // addressing (latched in the FETCH cycle off the live vs1->idx read), so the
+    // dynamic read starts at a register. Live (VINT_PIPE=0) = single-cycle today.
+    let pm_vrg_raw   : logic<VLEN> = i_vs2_data >> (if VINT_PIPE ? pm_src_bitoff_q : pm_g_sbitoff); // vs2[idx] at bit 0
+    let pm_vrg_el    : logic<64>   = if (if VINT_PIPE ? pm_idx_oob_q : pm_idx_oob) ? 64'd0 : pm_vrg_raw[63:0];
 
     // ---- per-op source register + element value + write enable --------------
     // slide / vrgather are dest-walk (write vd[pelem]); vcompress is source-walk
     // (read vs2[pelem], its source register is the pelem-based pm_dreg).
-    // CP (VINT_PIPE): vrgather's vs2 source register comes from the REGISTERED
-    // gather index, so o_vs2_addr (-> the VRF read) starts at a register, not at the
-    // live vs1->idx chain. Live (VINT_PIPE=0) = today.
-    let pm_g_sreg_e: logic<8>  = if VINT_PIPE ? pm_g_sreg_q : pm_g_sreg;
-    let pm_src_reg: logic<8>   = if h_is_comp ? pm_dreg : (if h_is_vrg ? pm_g_sreg_e : pm_sreg); // vs2 register to read
+    let pm_src_reg: logic<8>   = if h_is_comp ? pm_dreg : (if h_is_vrg ? pm_g_sreg : pm_sreg); // vs2 register to read (live)
+    // CP (VINT_PIPE): the vs2 source register feeding o_vs2_addr (-> the VRF read)
+    // comes from the REGISTERED copy, so the read starts at a register, not at the
+    // deep source-addressing chain. Live (VINT_PIPE=0) = today.
+    let pm_src_reg_e: logic<8> = if VINT_PIPE ? pm_src_reg_q : pm_src_reg;
     let pm_el_val : logic<64>  = if h_is_vrg ? pm_vrg_el : pm_slide_el; // source element value (low SEW bits)
     let pm_wr_el  : logic      = if h_is_vrg ? pm_active : pm_slide_wr; // write this destination element?
     // Splice the element into the dest-register accumulator (seed from old vd at
@@ -1862,7 +1873,7 @@ pub module vector_unit #(
     let pm_c_dlocal  : logic<8>     = pm_j & (pm_epr8 - 8'd1);
     let pm_c_dbitoff : logic<8>     = pm_c_dlocal << pm_eshamt;
     let pm_c_dreg_vrf: logic<VRF_W> = h_vd + pm_c_dreg[VRF_W - 1:0];
-    let pm_c_src     : logic<VLEN>  = i_vs2_data >> pm_dbitoff; // vs2[pelem] at bit 0
+    let pm_c_src     : logic<VLEN>  = i_vs2_data >> (if VINT_PIPE ? pm_src_bitoff_q : pm_dbitoff); // vs2[pelem] at bit 0 (registered offset under VINT_PIPE)
     let pm_c_res     : logic<VLEN>  = (i_vdold_data & ~(({64'd0, pm_sew_msk} as VLEN) << pm_c_dbitoff)) | (({64'd0, pm_c_src[63:0] & pm_sew_msk} as VLEN) << pm_c_dbitoff);
     // Permute destination register + write data: compress is pm_j-based RMW;
     // slide / vrgather are the pelem-based accumulator written at register boundaries.
@@ -2340,9 +2351,13 @@ pub module vector_unit #(
     // is the dest-register boundary (slide / vrgather) or every compressed element
     // (vcompress RMW at the running output position).
     let h_is_perm  : logic = h_is_slide || h_is_vrg || h_is_comp;
-    // CP (VINT_PIPE): only vrgather needs the FETCH cycle (its source read is the
-    // data-dependent vs1->idx->vs2 chain); slide/vcompress stay single-cycle.
-    let pm_need_fetch: logic = VINT_PIPE && h_is_vrg;
+    // CP (VINT_PIPE): every permute element spends a FETCH cycle. vrgather's source
+    // read is the data-dependent vs1->idx->vs2 chain and slide's is the scalar->sidx
+    // chain — both feed o_vs2_addr deeply; registering the source register/offset for
+    // the whole family cuts the worst VU-compute path (source addr -> VRF read -> ALU
+    // false combine). vcompress's source is pelem-based (shallow) but takes the same
+    // FETCH for a uniform element loop.
+    let pm_need_fetch: logic = VINT_PIPE && h_is_perm;
     // The dest-register VRF write only fires in the present cycle (not the FETCH
     // cycle, where pm_fetched_q is still 0 and the registered index is stale).
     let pm_reg_wr  : logic = (pm_state == 2'd1) && (!pm_need_fetch || pm_fetched_q) && (if h_is_comp ? pm_cm : pm_dreg_lst);
@@ -2471,7 +2486,7 @@ pub module vector_unit #(
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_scalar2_pdst = h_s2_pd; // V5h strided stride: prf_int 2nd read address
     assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
+    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
@@ -2490,8 +2505,16 @@ pub module vector_unit #(
 
     // ---- Memory port outputs (V1 unit-stride) -------------------------------
     assign o_mem_port_req  = (mem_state == 2'd1) || (mem_state == 2'd2);
-    assign o_mem_active    = (mem_state == 2'd2) && m_active;
-    assign o_mem_vaddr     = m_vaddr;
+    // CP (VINT_PIPE cut #2): the VADDR cycle (mem_va_ready_q=0) registers the VA
+    // but does NOT drive the port — o_mem_active is gated off so the dcache stays
+    // idle (no translate/read/write). The port is still HELD (o_mem_port_req=1, so
+    // scalar load issue is blocked) and the VU op is the ROB head (so a scalar
+    // store can't commit) — the VADDR gap is safe. FETCH/ACCESS drive normally.
+    assign o_mem_active    = (mem_state == 2'd2) && m_active && (!(MEM_PIPE && VINT_PIPE) || mem_va_ready_q);
+    // The MMU input VA is the registered copy when cut #2 is on (the element VA is
+    // stable across VADDR/FETCH/ACCESS — velem doesn't advance — so this only cuts
+    // the timing path, not the value).
+    assign o_mem_vaddr     = if (MEM_PIPE && VINT_PIPE) ? mem_va_q : m_vaddr;
     assign o_mem_is_load   = o_mem_active && h_is_vle;
     assign o_mem_is_store  = o_mem_active && h_is_vse;
     assign o_mem_funct3    = {1'b0, data_eew_log};
@@ -2561,6 +2584,7 @@ pub module vector_unit #(
             vl_q    = 64'd0;
             mem_state  = 2'd0;
             mem_fetched_q = 1'b0;
+            mem_va_ready_q = 1'b0;
             velem      = 8'd0;
             seg_field  = 3'd0;
             vacc       = {1'b0 repeat VLEN};
@@ -2605,6 +2629,7 @@ pub module vector_unit #(
             vl_q       = i_csr_vl;
             mem_state  = 2'd0;
             mem_fetched_q = 1'b0;
+            mem_va_ready_q = 1'b0;
             fault_q    = 1'b0;
             ff_trim_q  = 1'b0;
             va_reg     = 3'd0;
@@ -2640,6 +2665,7 @@ pub module vector_unit #(
                         fault_q   = 1'b0;
                         ff_trim_q = 1'b0;
                         mem_fetched_q = 1'b0; // CP (MEM_PIPE): first element starts with a FETCH
+                        mem_va_ready_q = 1'b0; // CP (VINT_PIPE cut #2): first element starts with a VADDR
                         if m_vl8 == 8'd0 {
                             mem_state = 2'd3; // empty op: nothing to access
                         } else {
@@ -2655,7 +2681,15 @@ pub module vector_unit #(
                 }
                 2'd2: {
                     // ACCESS: process element velem (active → drive the port).
-                    if m_active && mem_fault_now {
+                    if MEM_PIPE && VINT_PIPE && m_active && !mem_va_ready_q {
+                        // CP (VINT_PIPE cut #2) VADDR phase: latch the element VA so
+                        // the MMU input is a register next cycle. o_mem_active is
+                        // gated off this cycle (no translate/fault/access yet), so the
+                        // fault check below runs only once the FETCH cycle drives the
+                        // registered VA into the MMU. No port drive, no element advance.
+                        mem_va_q       = m_vaddr;
+                        mem_va_ready_q = 1'b1;
+                    } else if m_active && mem_fault_now {
                         if h_is_ff && (velem != 8'd0) {
                             // Fault-only-first: an element > 0 faulted. Trim vl to
                             // this element (the fault-free prefix [0, velem) stays
@@ -2703,6 +2737,7 @@ pub module vector_unit #(
                             velem = velem + 8'd1;
                         }
                         mem_fetched_q = 1'b0; // CP (MEM_PIPE): next element re-fetches
+                        mem_va_ready_q = 1'b0; // CP (VINT_PIPE cut #2): next element re-VADDRs
                     }
                 }
                 2'd3: {
@@ -2818,13 +2853,15 @@ pub module vector_unit #(
                     // the dest register on each selected element and advances the
                     // running output position pm_j (the VRF write is pm_reg_wr above).
                     if pm_need_fetch && !pm_fetched_q {
-                        // CP (VINT_PIPE) FETCH phase: latch the gather addressing
-                        // computed from the live vs1->idx read so the deep vs2 read
-                        // runs next cycle off the registers. No write, no advance.
-                        pm_g_sreg_q    = pm_g_sreg;
-                        pm_g_sbitoff_q = pm_g_sbitoff;
-                        pm_idx_oob_q   = pm_idx_oob;
-                        pm_fetched_q   = 1'b1;
+                        // CP (VINT_PIPE) FETCH phase: latch the permute source
+                        // addressing (the unified source register + its in-register
+                        // element offset + the vrgather OOB flag) computed from the
+                        // live source-addressing chain, so the deep vs2 read + extract
+                        // run next cycle off the registers. No write, no advance.
+                        pm_src_reg_q    = pm_src_reg;
+                        pm_src_bitoff_q = if h_is_comp ? pm_dbitoff : (if h_is_vrg ? pm_g_sbitoff : pm_sbitoff);
+                        pm_idx_oob_q    = pm_idx_oob;
+                        pm_fetched_q    = 1'b1;
                     } else {
                         if h_is_comp {
                             if pm_cm {
