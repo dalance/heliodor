@@ -36,9 +36,38 @@ serialized-commit tail, riding the shared `head → AGU → MMU → dcache` fron
 **not** traverse the issue-select FR — the FR registered the *issue* half of the
 front; the *commit-store* half is a separate combinational sweep from `head`.
 
+### 1.0a ⚡ MEASURED (2026-06-30, `--timing-paths 80`) — the front is a ~200-PATH WALL, not a headline
+
+The commit-store/dcache-fill front is not just *the headline* — it is the **entire top
+~200 endpoints**. The top-80 are ALL `head[0] → n_inflight[0..5]` (15.01–15.300) and
+`head[0] → valid_1[0..63]` / `valid_3[*]` (**14.870, every bit of two 64-bit dcache
+way-valid words**). `rs1_rdy` (14.565) does **not** appear in the top-80 — it is masked by
+this wall. **Consequence:** the keystone (and Phase B, and everything ≤14.565) is *invisible
+to synth CP* until the **whole** `head → MMU → {n_inflight, valid_*}` front is cut — n_inflight
+**and** the ~128 `valid_*` dcache-fill bits together. The commit-store pre-translate P3
+experiment (`cp_commit_store_pretranslate_plan.md §4.1`) cut the plain-store `n_inflight`
+piece to 14.890 but left the `valid_*` fill front and the AMO residual standing — so the wall
+barely moved. **Cutting this wall = pre-translate plain stores (2-cycle SB push for the
+non-pre-translated) + AMO pre-translate/registration + the dcache fill/invalidate fed from a
+registered PA.** Only then does `rs1_rdy` surface and the keystone's CP become measurable.
+
+### 1.0b ⚠️ The keystone's CDB-register has a writeback-arbitration conflict (naive E1 is INCORRECT)
+
+Registering `alu_cdb` (the E1 step) is **not** a simple flop: the unified CDB is a single
+broadcast lane arbitrated `fpu > mshr > int_div > alu > lsu > vu` (`core.veryl:2323`). Today
+the ALU broadcasts **combinationally at its issue cycle N**, and issue is gated on
+`!fpu_cdb.valid && !mshr_cdb.valid` *at N* — so no conflict. If `alu_cdb` is registered it
+broadcasts at **N+1**, where a NEW higher-priority FU result (fpu/mshr completing at N+1,
+which N's issue gate could not see) wins the mux → **the registered ALU result is silently
+DROPPED**. So E1 needs a **writeback buffer / arbitration** (give the registered ALU result a
+guaranteed slot, or a 1–2 entry WB queue that holds it until the lane is free) — this is part
+of the "80 % difficulty," not a detail. The DEAD scaffold (`EX_PIPE=0`, combinational) is
+byte-identical, but the **flip** cannot be correct without resolving this.
+
 `rs1_rdy` (`iq_int.veryl:171`, **14.565 ns**) — the issue/wakeup loop, the
 *fundamental floor* this keystone targets — sits **below** the headline and does
-**not** appear in the top-12. Two consequences that shape the whole campaign:
+**not** appear in the top-12 (in fact not in the top-80, §1.0a). Two consequences that
+shape the whole campaign:
 
 1. **The keystone alone will not move the 15.300 headline.** Registering execute /
    the CDB cuts the `rs1_rdy` front, but the commit-store (`n_inflight`) and
