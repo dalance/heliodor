@@ -1635,12 +1635,17 @@ pub module heliodor_core #(
     var dmem_sprobe_pa: logic<64>;
     var dmem_sprobe_ok: logic    ;
     var m_pa_q       : logic<64>; // = dmu_dmem_addr (translated PA)
-    // CP commit-store pre-translate (P5a change B): the committing store's translate
-    // FAULT (page or PMP/PMA access), registered alongside m_pa_q. A non-pre-translated
-    // VM store is held one cycle (store_fetched_q); cycle N+1 it SB-pushes the registered
-    // m_pa_q ONLY when it did not fault (else the registered fault drives the trap). Dead
-    // at STORE_PRETRANSLATE=0 (sb_2cyc_ok ties 0 → unread → DCE).
-    var m_fault_q    : logic    ; // = dmem_mmu_fault || dmem_mmu_acc_fault_s (store translate fault)
+    // CP commit-store pre-translate (P5a change B + trap-deferral): the committing
+    // store's translate FAULT components, registered alongside m_pa_q. A non-pre-
+    // translated VM store is held one cycle (store_fetched_q); cycle N+1 it SB-pushes the
+    // registered m_pa_q ONLY when it did not fault (m_fault_q), else the REGISTERED fault
+    // (page m_spage_q / access m_sacc_q / G-stage m_gstage_q) drives the commit trap —
+    // taking the live MMU fault off the commit_excp / n_inflight cone. Dead at
+    // STORE_PRETRANSLATE=0 (the _eff selectors collapse to the live faults → byte-id).
+    var m_fault_q    : logic    ; // = m_spage_q || m_sacc_q (store translate fault, for sb_2cyc_ok gate)
+    var m_spage_q    : logic    ; // = dmem_mmu_fault_s    (store page fault, cause 15)
+    var m_sacc_q     : logic    ; // = dmem_mmu_acc_fault_s (store access fault, cause 7)
+    var m_gstage_q   : logic    ; // = dmem_mmu_gstage      (two-stage G-stage flag, cause 23)
     var m_ren_q      : logic    ; // = dmu_dmem_ren && !lsr_capture (execute read term)
     var m_unc_q      : logic    ; // = dc_uncached && !lsr_capture
     var m_lnext_q    : logic    ; // = dc_load_next && !dc_uncached && !lsr_capture
@@ -3872,8 +3877,25 @@ pub module heliodor_core #(
     // R-present block. But a PMP-denied PTE READ on the walk (dmem_mmu_pte_acc_fault)
     // ALWAYS faults a cbo_m (independent of the leaf R-or-W rule), and a genuine
     // PAGE fault (dmem_mmu_fault_s) on a cbo_m still traps (cause 15).
-    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((dmem_mmu_acc_fault_s && !dmem_mmu_fault_s && (!c_is_cbo_m || dmem_mmu_pte_acc_fault || dmem_mmu_pma_hole)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
-    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (dmem_mmu_fault_s || (dmem_mmu_acc_fault_s && (!c_is_cbo_m || dmem_mmu_pte_acc_fault || dmem_mmu_pma_hole)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
+    // CP commit-store pre-translate (P5b trap-deferral): for a committing plain VM store
+    // on the pre-translate path, the page/access/G-stage fault feeding the commit trap
+    // comes from a REGISTERED source instead of the live MMU. A store_xlate_dfr store is
+    // either pre-translated (committed in 1 cycle, clean by construction → fault 0), held
+    // and not yet at its retire cycle (store_fetched_q=0 → fault DEFERRED to 0), or held
+    // at its retire cycle (store_fetched_q=1 → fault = m_spage_q/m_sacc_q/m_gstage_q,
+    // registered at the cycle-N translate). In every non-store_fetched_q case the fault is
+    // 0, so `store_fetched_q ? m_*_q : 0` captures all three without referencing the late
+    // c_pretx_fast. This takes the live MMU fault (dmem_mmu_*_s, the ~5.7 ns TLB+PMP cone)
+    // off the commit_excp → n_inflight path. AMO, bare/fast, and cbo stores keep the LIVE
+    // fault. At STORE_PRETRANSLATE=0, store_xlate_dfr ≡ 0 → the _eff signals are exactly
+    // the live faults = byte-identical. (Uses only ROB-registered / early-available
+    // signals; commit_store_fire/c_pretx_fast are defined later in the store-buffer block.)
+    let store_xlate_dfr: logic = STORE_PRETRANSLATE && rob_commit_valid && c_is_store && !c_illegal && !c_is_amo && dmem_vm_on_op && !c_is_cbo_zero && !c_is_cbo_m;
+    let sfault_pg_eff  : logic = if !store_xlate_dfr ? dmem_mmu_fault_s     : if store_fetched_q ? m_spage_q  : 1'b0;
+    let sfault_acc_eff : logic = if !store_xlate_dfr ? dmem_mmu_acc_fault_s : if store_fetched_q ? m_sacc_q   : 1'b0;
+    let sfault_gs_eff  : logic = if !store_xlate_dfr ? dmem_mmu_gstage      : if store_fetched_q ? m_gstage_q : 1'b0;
+    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((sfault_acc_eff && !sfault_pg_eff && (!c_is_cbo_m || dmem_mmu_pte_acc_fault || dmem_mmu_pma_hole)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (sfault_pg_eff || (sfault_acc_eff && (!c_is_cbo_m || dmem_mmu_pte_acc_fault || dmem_mmu_pma_hole)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
     let commit_excp        : logic = rob_commit_valid
         && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault
@@ -3979,7 +4001,7 @@ pub module heliodor_core #(
             // PMP: a store/AMO ACCESS fault is cause 7 (c_fault_acc covers an
             // AMO store fault tracked via the ROB; commit_store_sacc covers a
             // commit-translated plain store).
-            excp_cause = if c_fault_acc || commit_store_sacc ? 64'd7 : if commit_store_sfault && dmem_mmu_gstage ? 64'd23 : 64'd15;
+            excp_cause = if c_fault_acc || commit_store_sacc ? 64'd7 : if commit_store_sfault && sfault_gs_eff ? 64'd23 : 64'd15;
         } else if c_illegal || commit_priv_illegal {
             excp_cause = 64'd2; // illegal instruction (incl. TVM/TSR commit trap)
         } else if c_is_ebreak {
@@ -5329,7 +5351,11 @@ pub module heliodor_core #(
     // (m_fault_q: a faulting held store traps from the registered fault, never pushes).
     let m_pa_cacheable: logic = (m_pa_q[63:25] == 39'h40)
         && !((m_pa_q[31:14] == 18'h20000) || (m_pa_q[31:12] == 20'h80008));
-    let sb_2cyc_ok: logic = STORE_PRETRANSLATE && store_fetched_q && m_pa_cacheable && !m_fault_q;
+    // A MISALIGNED held store (m_wstrbhi_q != 0) must NOT SB-push — it needs the M-stage
+    // 2-line write/invalidate (dc_i_wen path), so exclude it here (else it would both
+    // SB-push and M-stage-write the same store). Aligned cacheable held stores have
+    // dc_i_wen=0 (sb_vm_live_ok=1) → dc_st_wstrb_hi=0 → m_wstrbhi_q=0.
+    let sb_2cyc_ok: logic = STORE_PRETRANSLATE && store_fetched_q && m_pa_cacheable && !m_fault_q && (m_wstrbhi_q == 8'd0);
     // The effective committing-store PA: the registered probe PA for a pre-translated
     // store, the registered M-stage PA for a 2-cycle held cacheable store, else the live
     // mux (VM → dmu_dmem_addr, bare → c_store_addr). At STORE_PRETRANSLATE=0 (c_pretx_fast
@@ -7098,6 +7124,9 @@ pub module heliodor_core #(
         if_reset {
             m_pa_q       = 64'd0;
             m_fault_q    = 1'b0;
+            m_spage_q    = 1'b0;
+            m_sacc_q     = 1'b0;
+            m_gstage_q   = 1'b0;
             m_ren_q      = 1'b0;
             m_unc_q      = 1'b0;
             m_lnext_q    = 1'b0;
@@ -7112,7 +7141,10 @@ pub module heliodor_core #(
             m_lnext2_q   = 1'b0;
         } else {
             m_pa_q       = dmu_dmem_addr;
-            m_fault_q    = dmem_mmu_fault || dmem_mmu_acc_fault_s;
+            m_spage_q    = dmem_mmu_fault_s;
+            m_sacc_q     = dmem_mmu_acc_fault_s;
+            m_gstage_q   = dmem_mmu_gstage;
+            m_fault_q    = dmem_mmu_fault_s || dmem_mmu_acc_fault_s;
             m_ren_q      = dmu_dmem_ren && !lsr_capture;
             m_unc_q      = dc_uncached && !lsr_capture;
             m_lnext_q    = dc_load_next && !dc_uncached && !lsr_capture;
