@@ -201,10 +201,20 @@ into `i_conservative`** (`:442-449`, to break a `dmem_op_hlv→i_conservative→
 dmem_op_hlv` combinational loop). So an HSV store (VA 0x2000 ≠ PA) does not make a following
 bare load to the SAME PA (VA 0x80030000 == PA, non-conservative) wait/forward; with the
 baseline timing the HSV commits before the load reads (passes), but A1.0's re-timing lets the
-load read stale. This is a real latent bug ANY timing perturbation could trip — **it must be
-fixed before the bundle flip** (a separate core-ordering task: give HLV/HSV a *registered*
-per-ROB-entry conservative-blocker flag so the ROB block scan treats it as a blocker without
-the combinational loop). Narrow (HSV-specific; all non-HSV tests + all boots pass).
+load read stale. This is a real latent bug ANY timing perturbation could trip. Narrow
+(HSV-specific; all non-HSV tests + all boots pass).
+
+✅ **FIXED (commit `7efed5d`).** An in-flight HLV/HSV store (`sh_is_store && sh_mem_virt`;
+`sh_mem_virt` already == the op's `hlv` marker — set ONLY for HLV/HSV, not ordinary V=1
+accesses) is now an **unconditional ROB block-scan blocker** (`rob.veryl:755`): younger loads
+wait until it commits, then read via the PA-based committed-store buffer. No new per-entry flag
+needed (sh_mem_virt existed); the comb loop is sidestepped because the blocker is a *registered*
+ROB-entry property, not the live `dmem_op_hlv`. HLV loads (is_store=0) excluded; ordinary V=1
+stores (sh_mem_virt=0) keep S15 offset-compare + replay → no guest perf regression. One added
+term, byte-identical for non-HSV. Validation: default **252/0 at BOTH SEL_PIPE=0 and SEL_PIPE=1**
+(hlv PASS both, both backends — the A1.0-exposed hole is closed); hv boot (full hypervisor Linux)
+PASS cy=0165f8a0; N1 boot 4/4 all cy cycle-exact with baseline. The A1.0 bundle-flip prerequisite
+is cleared.
 
 **A1.1 — the 1/cycle recovery (next sub-step, the `speculative`/freeze/squash half), DEFERRED
 to the bundle flip:** to claw back the +1-cy dependent-issue at `SEL_PIPE=1`, add the
