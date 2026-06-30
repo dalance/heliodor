@@ -52,6 +52,28 @@ decode/rename floor (~7.0 ns).
 Trajectory: `14.565 → ~7.6` (A, icache sync-read) `→ ~7.0` (B, imem staging) → then the
 decode/rename/allocate cone (and the execute/wakeup keystone, finally unmasked) is the floor.
 
+### 2.1 🚨 MEASURED (2026-06-30) — cut A is only −0.435 ns; 13.8–14.6 is a DENSE MULTI-FRONT wall
+The icache-sync-read scaffold was built (param `ICACHE_SYNC_READ`, DEAD=0 byte-identical, CP
+14.565 unchanged) and **synth-flipped (=1): CP 14.565 → 14.130 (−0.435 ns only, NOT ~7.6).**
+The segment prediction (~7.6) was wrong because the front end was **not** alone at 14.565 — the
+13.8–14.6 band is a dense multi-front wall, and cutting the front-end front merely surfaces the
+ones right behind it:
+- `head → n_inflight[5]` **14.130** — the **plain-store commit translation** (`head →
+  commit_store_fire → dmem_vaddr → u_dmem_mmu TLB → … → n_inflight`). The AMO-wstrb wall cut
+  removed the *AMO* contribution; the **plain store still translates live at commit** → this is
+  the W1 pre-translate target (`cp_commit_store_pretranslate_plan.md`), NOT a free cut.
+- `head → vrf[*]` **13.880** — the **vector commit writeback** (VRF write from the ROB head).
+- the `commit_cnt/sh_valid/entries` cluster **14.315** (dispatch/commit fan-out).
+
+**→ Consequence.** A single front-end cut (icache sync-read) buys ~0.4 ns for a **real IPC cost**
+(the icache becomes 1-cycle latency) — a poor trade. The free, byte-identical wins (the AMO-wstrb
+wall) are **exhausted**; every remaining 13.8–14.6 front needs genuine pipelining (front-end =
+icache/imem, commit = plain-store pre-translate, vector = VRF writeback), each with its own IPC
+cost. Below 13.8 needs the fronts cut **together** (the campaign's "flip multiple fronts at once"),
+then deeper still (imem MMU ~5 ns, dmem MMU, decode/rename, vector) for the 7.5 ns goal — the full
+multi-session deep-pipeline campaign. The icache scaffold was reverted (not worth flipping alone);
+rebuild it as part of a coordinated front-end+commit+vector flip when that effort is undertaken.
+
 ## 3. The icache sync-read scaffold (A) — methodology
 
 Mirror the proven dcache-sync-read / MEM_PIPE pattern (`DCACHE_SYNC_READ`-style):
