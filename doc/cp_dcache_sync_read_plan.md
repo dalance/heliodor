@@ -1,9 +1,48 @@
 # Phase C — dcache synchronous-read (the commit-store→dcache wall body)
 
-The next structural boundary below the MEM_PIPE PA-latch. **MEASURED 2026-06-30**
+> ## 🚨 MEASURED CORRECTION (2026-06-30, gate trace of the ACTUAL binding path) — §1's premise below is REFUTED
+>
+> A clean `--dump-timing --timing-paths 1` trace of path #1 at FETCH_REG=1
+> (`head → n_inflight[5]`, **14.130 ns = the global CP**) shows it **does NOT touch
+> the dcache at all.** The path is:
+> ```
+> head → commit reg-read → commit_store_fire                       (2.96)
+>   → store AGU/VA → u_dmem_mmu.u_mmu TLB translate (tlb_vpn/level/valid)  (~3.8)  ← biggest
+>   → u_pmp_amo_w (PMP-W permission) → pmp_deny → dmem_mmu_acc_fault_s     (~1.9)  ← 2nd
+>   → commit eligibility (sb_elig/c_is_store/rob_commit_valid)
+>   → rob_commit_ack → commit_trap/redirect                              (~2.25)
+>   → do_push2 → u_fl.n_inflight                                          (~2.0)
+> ```
+> n_inflight **diverges from the dcache after the MMU** — it goes MMU → PMP-W →
+> commit-trap → free-list, never reaching the cache. The §1 claim "the n_inflight
+> 14.130 path shares the same head→commit_store→MMU→**dcache** front" is **false**:
+> that was the masked `rs1_rdy` 12.920 path (the dcache fill cone leaks there via
+> grant-gating), **1.2 ns BELOW the binding wall.**
+>
+> **Front map at FETCH_REG=1 (top-250 endpoints, gate-trace authoritative):**
+> | front | ns | paths | what |
+> |---|---|---|---|
+> | `n_inflight` | 14.130 | 4 | commit-store **live MMU+PMP** translation (NOT dcache) |
+> | `vrf` | 13.880 | 246+ | vector VRF writeback (dominant by count) |
+> | `rs1_rdy`/dcache | ~12.9 | masked | scheduler loop + **dcache fill cone** = this doc's target |
+>
+> → The dcache is the **masked 3rd front**, behind commit-store *and* the 246-path
+> vrf. Per "optimise for structure not CP" the dcache sync-read remains a valid
+> SRAM-migration step, but: (a) its §1 CP-justification for the complex **shape (b)**
+> (register the fill cone to cut `dcache_stall`) is gone — `dcache_stall` is on the
+> masked 12.9 path, not the 14.13 wall — so **shape (a)** (the genuine SRAM data-read
+> migration, 9R→1R way-mux register) is now the cleaner variant; (b) it is **deferred**
+> — the user chose the **commit-store pre-translate** front (the actual binding wall,
+> `cp_commit_store_pretranslate_plan.md`) as the next structural step. This doc's §2–9
+> below still hold for the eventual dcache work; only §1's "dcache is the binding
+> front" framing is wrong.
+
+The next structural boundary below the MEM_PIPE PA-latch. ~~**MEASURED 2026-06-30**
 (gate trace, after the AS-b refutation): the binding wall — `head→n_inflight`
 14.130 ns at FETCH_REG=1, *and* the same front leaking into the scheduler as
-`head→rs1_rdy` 12.920 — is the **dcache LOOKUP**, not the MMU and not the select.
+`head→rs1_rdy` 12.920 — is the **dcache LOOKUP**, not the MMU and not the select.~~
+**(struck — see the correction banner above; n_inflight is the commit-store MMU+PMP,
+not the dcache.)**
 
 This doc plans the dcache **synchronous read** (= the SRAM migration of the dcache
 arrays, `sram_inventory.md` rows 1/2). It is one front of the *coordinated*

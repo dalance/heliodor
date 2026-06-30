@@ -1,11 +1,39 @@
 # CP — commit-store pre-translate (the first headline-moving lever)
 
+> ## ▶️ ACTIVE FRONT (2026-06-30, user-chosen after the Phase-C gate-trace refutation)
+>
+> The user chose **this front** as the next structural step over Phase C dcache and
+> the vrf. Reason: a clean gate trace at **FETCH_REG=1** confirms the binding wall
+> `head → n_inflight[5]` (**14.130 ns**, the global CP once the front-end is staged)
+> is **exactly this path** — commit-store **live MMU TLB (~3.8 ns) + PMP-W (~1.9 ns)**
+> → fault → commit-trap → free-list. The dcache is NOT on it; it is the masked 3rd
+> front 1.2 ns below (`cp_dcache_sync_read_plan.md` correction banner). The 2nd front
+> is `vrf` 13.880 (vector, 246+ paths). So cutting this front alone caps at ≈13.88
+> (vrf) — a ~0.25 ns CP move — but it IS the FINAL-structure gap: **store address
+> translation belongs at execute (Stage-A), not commit.** Build it for the structure
+> (the P1' probe `7598185` is the down-payment); the CP follows in the coordinated
+> bundle once vrf + the rest also move.
+>
+> **The hard part is NOT the pre-translate — it is the fallback.** §4.1 proved the
+> naive flip (`sb_vm_ok = c_pretx_fast`, force every non-pre-translated VM store onto
+> the slow M-stage path) **breaks the Linux boot**: a cacheable DRAM store has never
+> completed via the M-stage *dcache write* (it always SB-pushes after the TLB fills),
+> so it is lost → corruption. The correct fallback is a **2-cycle registered SB push**
+> (§9 below, NEW): a non-pre-translated cacheable VM store translates+registers its PA
+> in commit cycle N and SB-pushes the **registered** PA in cycle N+1 — a new path,
+> distinct from the M-stage slow write, so no store ever SB-pushes with a live-MMU PA
+> in the same cycle the free-list/`n_inflight` reads. Only then does the MMU leave the
+> front (modulo the AMO commit-translation residual, atomicity-bound).
+
 Concrete RTL plan for the **first measurable-CP step** of the deep-pipeline campaign
 (`deep_pipeline_sram_plan.md`). Phase-0 FF-insertion proved the 15.300 ns headline is
 the **commit-store front**, not the dcache read (`speculative_wakeup_design.md §9.1`).
 This plan removes the MMU from that front.
 
 Entry: master `bf1287c`, CP **15.300 ns**, endpoint `head → n_inflight[5]`.
+(Re-measured 2026-06-30 at FETCH_REG=1 after the AMO-wstrb wall cut `66c0f14`: the same
+front is now `head → n_inflight[5]` **14.130 ns** — the AMO strobe that dominated 15.300
+is gone, exposing the **plain-store** commit MMU+PMP translation as the binding wall.)
 
 ---
 
@@ -266,3 +294,94 @@ referenced at `core.veryl:~3746`) are the precise-fault canaries — run them.
   i_cdb_store_addr.
 - Precedent: `cp_direction_c_port_separation_plan.md` (commit-port separation, the
   ≤1.3 ns commit-tail bound — this plan instead cuts the *front*, the actual prize).
+
+## 8. Live measurement at FETCH_REG=1 (2026-06-30, the active-front re-grounding)
+
+`--dump-timing --timing-paths 1`, FETCH_REG=1 (front-end staged, so the wall is
+exposed), STORE_PRETRANSLATE=0, master tree. Path #1 `head → n_inflight[5]` 14.130 ns:
+
+| range (ns) | sub-cone | ~ns |
+|---|---|---|
+| 0.00→2.96 | head → commit reg-read → `c_is_cas_q` → `commit_store_fire` | 2.96 |
+| 3.11→7.18 | store VA → `u_dmem_mmu.u_mmu` TLB (`tlb_vpn`/`tlb_level`/`tlb_valid`/`tlb_hit_ppn`/`pa`) | **~3.8** |
+| 7.71→9.59 | `u_pmp_amo_w` (store-write PMP, shared plain+AMO) → `pmp_deny` | **~1.9** |
+| 9.59→9.88 | `acc_deny` → `dmem_mmu_acc_fault_s` | ~0.3 |
+| 9.98→12.13 | `commit_store_fire`/`sb_elig`/`c_is_store` → `rob_commit_valid`/`ack` → `commit_csrw_satp`/`c_illegal` → `commit_excp`/`commit_trap`/`commit_redirect` → `do_push2` | ~2.25 |
+| 12.51→14.13 | `u_fl.n_inflight` counter update | ~2.0 |
+
+**MMU TLB (~3.8) + PMP-W (~1.9) = ~5.7 ns of the 14.13** — the chunk pre-translate
+removes (replaced by a registered-PA/-fault read). The store-write PMP `u_pmp_amo_w`
+is **shared** by plain stores and AMO, so the **AMO residual** (commit-translated,
+single-cycle, atomicity-bound) keeps a near-identical path alive after the plain-store
+cut — the ≈2.7 % cap of §4.1. The 2nd front is `vrf` 13.880 (vector, 246+ paths), so
+even a full plain-store cut lands at max(AMO-residual, 13.880). **CP leverage is small;
+the value is the FINAL-structure boundary (store xlate → execute).**
+
+## 9. The boot-corner-correct fallback — 2-cycle registered SB push (the part P3 lacked)
+
+§4.1's flip broke boot because `sb_vm_ok = c_pretx_fast` forced a non-pre-translated
+**cacheable** VM store onto the M-stage slow path, whose cycle-N+1 action is a **dcache
+write** — a cacheable store has never completed that way (it SB-pushes after the TLB
+fills), so it was lost. The fix **reuses the existing M-stage 2-cycle handshake**
+(`store_fetched_q` + `m_pa_q`, `core.veryl:1637`/`7074`) but **routes a cacheable held
+store's cycle-N+1 action to an SB push from the registered `m_pa_q`** instead of the
+dcache write.
+
+### 9.1 The store-commit classes after the flip
+| class | gate (all registered/cheap — NO live MMU) | cycle-N | cycle-N+1 |
+|---|---|---|---|
+| bare `fast_store` | `fast_store` | SB push, PA=`c_store_addr` | — (1-cy) |
+| **pretx VM** `c_pretx_fast` | §3.6 (`c_store_pa_valid` ROB FF) | SB push, PA=`c_store_pa` | — (1-cy) |
+| **non-pretx VM cacheable** | `!sb_elig` ∧ VM ∧ !AMO ∧ aligned ∧ (m_pa_q DRAM) | **translate, hold** (set `store_fetched_q`) | **SB push, PA=`m_pa_q`** ← NEW |
+| MMIO / misaligned / TLB-miss | `!sb_elig` (existing) | translate, hold | M-stage dcache write (existing) |
+| AMO / SC | `c_is_amo` | commit-translate (live, atomicity) | — (1-cy, unchanged) |
+
+The two changes:
+- **(A) `sb_vm_ok = c_pretx_fast`** (§3.6): the live-MMU 1-cycle fast retire is removed.
+  Non-pretx VM cacheable stores become `!sb_elig` → they fall into the `store_fetched_q`
+  2-cycle handshake automatically. The `rob_commit_ack` M3a hold-gate (`core:3399`,
+  `!(… && !sb_elig && !c_is_amo && !store_fetched_q)`) now uses the registered `sb_elig`
+  (= `fast_store || c_pretx_fast`) — **no live MMU on the n_inflight gate.**
+- **(B) cycle-N+1 SB-push routing** (NEW): in the `store_fetched_q` retire cycle, if the
+  registered `m_pa_q` is **cacheable DRAM** (`m_pa_q[63:25]==39'h40 && !tohost`), fire an
+  SB push with `sb_pa = m_pa_q`, `sb_vm_ok_2cyc = 1`, and the store data/strobe from the
+  ROB head (`c_store_data`/`c_store_wstrb` — the head has not advanced during the hold),
+  and **suppress** the M-stage dcache write for it. MMIO/tohost held stores keep the
+  M-stage write (existing). So: `sb_pa = c_pretx_fast ? c_store_pa : (store_fetched_q &&
+  m_pa_cacheable ? m_pa_q : c_store_addr)` and `sb_vm_ok = c_pretx_fast || (store_fetched_q
+  && m_pa_cacheable && !m_fault_q)` — all registered.
+
+### 9.2 Why n_inflight leaves the MMU
+No store retires from the **live** MMU in one cycle: pretx retires from the ROB FF
+`c_store_pa`; non-pretx holds one cycle (`store_fetched_q`, the gate registered) and
+retires from `m_pa_q` (registered). The live `!dmem_mmu_busy` only feeds the
+`store_fetched_q` D input (cycle N), and the store does not retire in cycle N, so n_inflight
+in cycle N never depends on the live MMU. The AMO commit-translate residual (single-cycle,
+atomicity) is the remaining live-MMU n_inflight contributor (§8) → the ≈2.7 % cap.
+
+### 9.3 IPC
+Every **non-pretx** VM cacheable store now costs +1 commit cycle (was 1, now 2). The
+pretx hit-rate (TLB warm at execute) bounds this; P1' saw 240/240 probe==commit on a
+boot, so the rate is high. Measure boot-cy / CoreMark / Dhrystone (≤10–15 % budget).
+
+### 9.4 Corners (the full ladder is mandatory — store ordering is not separable)
+- **SB drain / forward consistency** when the held store's port is freed to a concurrent
+  load in cycle N (the SB push is one cycle later — a younger load must still forward
+  correctly or stall). Reuse the existing `sb_st_ovl` / forward machinery.
+- **store→store ordering**: two back-to-back non-pretx stores each take 2 cycles; in-order
+  commit preserves order, but verify the SB merge (`sb_merge_ok`) across the +1 slip.
+- **fault precision**: a non-pretx store that **faults** at commit translate (cycle N)
+  must trap, not SB-push — gate (B) on `!m_fault_q` and deliver the registered fault.
+- **SMP atomicity**: AMO/SC stay 1-cycle commit-translate (unchanged). litmus N2/N4 + SMP.
+- **stale xlate** (§3.4): the pretx capture is `!rob_has_pending_xlate`-gated; the
+  non-pretx fallback translates at commit (after older xlate-changes retired) — safe.
+
+### 9.5 Staging
+- **P5a (DEAD scaffold, byte-identical):** add the registered `m_fault_q` + the
+  `m_pa_cacheable` decode + the gate-(B) SB-push wiring, all under `STORE_PRETRANSLATE=0`
+  so `sb_vm_ok`/`sb_pa` keep their live-MMU form (the new terms unread). Verify default
+  252/0 + N1 boot cy exact + synth CP 14.565 unchanged.
+- **P5b (flip):** `STORE_PRETRANSLATE=1` → changes (A)+(B) active. Synth-measure (expect
+  n_inflight → max(AMO-residual, vrf 13.880)). Full ladder + IPC.
+- **P6 (optional, atomicity-hard):** AMO/SC PA pre-translate (W2) to remove the residual —
+  translate at execute, keep only the atomic RMW *write* at commit. Deferred.
