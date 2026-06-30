@@ -177,6 +177,35 @@ the register is correctly placed IN the loop (the scaffold works), and that reac
 IQ to shorten the argmin half). The global CP is unchanged (the loop is masked under
 n_inflight/vrf) — its true floor is a bundle-flip measurement (§6 dependency).
 
+**SEL_PIPE=1 standalone flip — IPC cost measured + ONE corner exposed (throwaway flip, reverted).**
+A1.0's late wakeup loses the SCHED_WAKEUP head-start (dependent ALU chains fall back to the CDB
+snoop), so the cost is a +1-cy dependent issue. Measured on Linux boot (cy, vs SEL_PIPE=0):
+
+| boot | SEL_PIPE=0 | SEL_PIPE=1 | Δ |
+|---|---|---|---|
+| 7.1 | 0x1210060 | 0x1265790 | **+1.85 %** |
+| 7.1 V | 0x13cc5c0 | 0x1421cf0 | **+1.7 %** |
+| 6.6 | 0x13ee8a0 | 0x1590050 | **+8.2 %** |
+
+So the head-start matters (6.6 is dependent-chain-heavy) → **A1.1 (the 1/cycle recovery) is
+justified, not optional.** Functionally the SEL_PIPE=1 flip is clean — default **251/0 (only
+`test_arch_hlv` fails)**, all 4 boots PASS — so the +1-cy late wakeup is safe everywhere EXCEPT:
+
+🚨 **`test_arch_hlv` wrong-result at SEL_PIPE=1 (RTL, BOTH backends `tohost=0x100`=fail1) — a
+PRE-EXISTING latent core ordering hole exposed by the re-timing, NOT an A1.0 defect.** fail1 is
+`hsv.d t3,(GVA 0x2000)` then a cross-check `ld t1,(HPA 0x80030000)` (the GVA two-stage-maps to
+that HPA) → `bne t1,t3`. Store-to-load disambiguation is VA-based and **only sound when VA==PA**
+(`heliodor_core.veryl:433-437`): under an MMU it falls back to conservative ordering via
+`dmem_vm_on → ROB i_conservative`, BUT an **HLV/HSV (`dmem_op_hlv`) is deliberately NOT folded
+into `i_conservative`** (`:442-449`, to break a `dmem_op_hlv→i_conservative→ROB-scan→commit→
+dmem_op_hlv` combinational loop). So an HSV store (VA 0x2000 ≠ PA) does not make a following
+bare load to the SAME PA (VA 0x80030000 == PA, non-conservative) wait/forward; with the
+baseline timing the HSV commits before the load reads (passes), but A1.0's re-timing lets the
+load read stale. This is a real latent bug ANY timing perturbation could trip — **it must be
+fixed before the bundle flip** (a separate core-ordering task: give HLV/HSV a *registered*
+per-ROB-entry conservative-blocker flag so the ROB block scan treats it as a blocker without
+the combinational loop). Narrow (HSV-specific; all non-HSV tests + all boots pass).
+
 **A1.1 — the 1/cycle recovery (next sub-step, the `speculative`/freeze/squash half), DEFERRED
 to the bundle flip:** to claw back the +1-cy dependent-issue at `SEL_PIPE=1`, add the
 speculative wakeup off the LIVE pick at N (so the critical dependent is still woken same-cycle)
