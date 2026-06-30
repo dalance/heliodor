@@ -1635,6 +1635,12 @@ pub module heliodor_core #(
     var dmem_sprobe_pa: logic<64>;
     var dmem_sprobe_ok: logic    ;
     var m_pa_q       : logic<64>; // = dmu_dmem_addr (translated PA)
+    // CP commit-store pre-translate (P5a change B): the committing store's translate
+    // FAULT (page or PMP/PMA access), registered alongside m_pa_q. A non-pre-translated
+    // VM store is held one cycle (store_fetched_q); cycle N+1 it SB-pushes the registered
+    // m_pa_q ONLY when it did not fault (else the registered fault drives the trap). Dead
+    // at STORE_PRETRANSLATE=0 (sb_2cyc_ok ties 0 → unread → DCE).
+    var m_fault_q    : logic    ; // = dmem_mmu_fault || dmem_mmu_acc_fault_s (store translate fault)
     var m_ren_q      : logic    ; // = dmu_dmem_ren && !lsr_capture (execute read term)
     var m_unc_q      : logic    ; // = dc_uncached && !lsr_capture
     var m_lnext_q    : logic    ; // = dc_load_next && !dc_uncached && !lsr_capture
@@ -5313,11 +5319,23 @@ pub module heliodor_core #(
         && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
         && c_store_pa[63:25] == 39'h40
         && !((c_store_pa[31:14] == 18'h20000) || (c_store_pa[31:12] == 20'h80008));
+    // CP commit-store pre-translate (P5a, change B — DEAD at STORE_PRETRANSLATE=0):
+    // a non-pre-translated VM cacheable store that missed the execute-time probe is
+    // held one cycle by the existing M-stage handshake (store_fetched_q) — its PA
+    // translates live in cycle N and registers into m_pa_q. In the retire cycle it
+    // SB-pushes that REGISTERED m_pa_q instead of doing the M-stage dcache write (which
+    // loses a cacheable store — the §4.1 P3 boot corner). sb_2cyc_ok fires only when the
+    // registered PA is cacheable DRAM (not tohost) and the translate did not fault
+    // (m_fault_q: a faulting held store traps from the registered fault, never pushes).
+    let m_pa_cacheable: logic = (m_pa_q[63:25] == 39'h40)
+        && !((m_pa_q[31:14] == 18'h20000) || (m_pa_q[31:12] == 20'h80008));
+    let sb_2cyc_ok: logic = STORE_PRETRANSLATE && store_fetched_q && m_pa_cacheable && !m_fault_q;
     // The effective committing-store PA: the registered probe PA for a pre-translated
-    // store, else the live mux (VM → dmu_dmem_addr, bare → c_store_addr). At
-    // STORE_PRETRANSLATE=0 this is exactly the old `dmem_vm_on_op ? dmu_dmem_addr :
+    // store, the registered M-stage PA for a 2-cycle held cacheable store, else the live
+    // mux (VM → dmu_dmem_addr, bare → c_store_addr). At STORE_PRETRANSLATE=0 (c_pretx_fast
+    // ≡ sb_2cyc_ok ≡ 0) this is exactly the old `dmem_vm_on_op ? dmu_dmem_addr :
     // c_store_addr` mux.
-    let c_store_eff_pa: logic<64> = if c_pretx_fast ? c_store_pa : if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
+    let c_store_eff_pa: logic<64> = if c_pretx_fast ? c_store_pa : if sb_2cyc_ok ? m_pa_q : if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
 
     // PMP (Smpmp): commit-time WRITE check for the dcache exclusive-write path
     // (AMO/SC). Bare uses the physical c_store_addr; a VM access uses the
@@ -5861,9 +5879,16 @@ pub module heliodor_core #(
     // the PTE gets cached, and the retry cycle lands here.
     // Phase 11-H: dmem_vm_on_op folds an HSV store into the VM store-buffer path
     // (translated PA = dmu_dmem_addr).
-    assign sb_vm_ok = commit_store_fire && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
+    // CP commit-store pre-translate (P5a change A+B): the LIVE cacheable-VM TLB-hit
+    // condition. It still gates dc_i_wen below (so a cacheable store is never routed to
+    // the M-stage dcache write path), but the SB-push ELIGIBILITY (sb_vm_ok) is now a
+    // REGISTERED-PA classifier: a pre-translated store (c_pretx_fast, 1-cycle) or a held
+    // store's retire cycle (sb_2cyc_ok, the registered m_pa_q). At STORE_PRETRANSLATE=0
+    // sb_vm_ok ≡ sb_vm_live_ok (the original expression) = byte-identical.
+    let sb_vm_live_ok: logic = commit_store_fire && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
         && !load_walk_busy && !dmem_mmu_busy && !dmem_mmu_fault && !dmem_mmu_acc_fault_s && dmu_dmem_addr[63:25] == 39'h40
         && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008)); // P9.2: tohost pages stay write-through
+    assign sb_vm_ok = if STORE_PRETRANSLATE ? (c_pretx_fast || sb_2cyc_ok) : sb_vm_live_ok;
     // PMP (Smpmp): a fast store that fails its PA check must NOT be absorbed by
     // the store buffer (its write is suppressed; it traps instead, like a page-
     // faulting store whose sb_vm_ok is 0).
@@ -6471,7 +6496,12 @@ pub module heliodor_core #(
     // excl-merge must both be suppressed for it (a concurrently-committing
     // misaligned store or AMO at the ROB head would otherwise leak its
     // st_wstrb_hi / c_is_amo into the PTE write and corrupt it / hang the walk).
-    let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_ok && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)) || dmu_ad_wb;
+    // CP commit-store pre-translate (P5a change B): gate on the LIVE cacheable condition
+    // (sb_vm_live_ok), NOT the registered-PA push-elig sb_vm_ok — so a non-pre-translated
+    // cacheable VM store still suppresses the M-stage dcache write at its live-translate
+    // cycle and is instead SB-pushed (from the registered m_pa_q) on its retire cycle.
+    // At STORE_PRETRANSLATE=0 sb_vm_live_ok ≡ sb_vm_ok = byte-identical.
+    let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_live_ok && !(if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)) || dmu_ad_wb;
     // Phase 12 V1: a VU unit-stride store element is single-dword (no hi-strobe).
     let dc_st_wstrb_hi: logic<8> = if vu_mem_active ? 8'd0 : if dmu_ad_wb ? 8'd0 : if dc_i_wen ? st_wstrb_hi : 8'd0;
     // P9.3: in-cache AMO/SC commit write — eligible when the committing
@@ -7067,6 +7097,7 @@ pub module heliodor_core #(
     always_ff (clk, rst) {
         if_reset {
             m_pa_q       = 64'd0;
+            m_fault_q    = 1'b0;
             m_ren_q      = 1'b0;
             m_unc_q      = 1'b0;
             m_lnext_q    = 1'b0;
@@ -7081,6 +7112,7 @@ pub module heliodor_core #(
             m_lnext2_q   = 1'b0;
         } else {
             m_pa_q       = dmu_dmem_addr;
+            m_fault_q    = dmem_mmu_fault || dmem_mmu_acc_fault_s;
             m_ren_q      = dmu_dmem_ren && !lsr_capture;
             m_unc_q      = dc_uncached && !lsr_capture;
             m_lnext_q    = dc_load_next && !dc_uncached && !lsr_capture;
