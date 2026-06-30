@@ -234,6 +234,35 @@ pub module iq_int #(
     var fr1_op_q   : pipeline_pkg::RenamedOp;
     var fr1_valid_q: logic                  ;
 
+    // A-LOOP A1 (cp_a_loop_plan.md §3, "pipelined select"): split the ~12.9 ns /
+    // 126-level select→wakeup loop into two clock cycles. The loop is
+    //   rs*_rdy → cand0/argmin → sched_wake0 (sh_rd_pdst[issue_idx] dyn-mux →
+    //            per-entry compare) → rs*_rdy (FF D)
+    // and is the keystone scheduler floor (cp_a_sched_scheduler_pipeline_plan.md §6:
+    // 126 levels, no incremental lever, can only be PIPELINED, not shortened). Register
+    // the SCHEDULED-WAKEUP pdst after the argmin + sh_rd_pdst[pick] dyn-mux:
+    //   stage 1 (deep)    = cand0/argmin + sh_rd_pdst[issue_idx]   → sel_wake0_pdst_q
+    //   stage 2 (shallow) = sel_wake0_pdst_q → per-entry compare → rs*_rdy write
+    // so the deepest half (the age-argmin + the dyn-mux) is one cycle and the wakeup
+    // tail (~0.2 ns, §3) is the next. DEAD at SEL_PIPE=0: the registers feed nothing
+    // (DCE'd) and the wakeup applies the LIVE sched_wake0/1 — byte-identical to today.
+    //
+    // At SEL_PIPE=1 the wakeup is one cycle LATE relative to the producer's grant. A
+    // late wakeup is CONSERVATIVE: it only delays a consumer's selection, never lets it
+    // read a stale operand (it now coincides with the producer's real CDB broadcast, so
+    // the CDB snoop would have woken it anyway). The cost is the SCHED_WAKEUP head-start
+    // (dependent ALU chains fall back to the CDB snoop = +1-cy dependent issue, an IPC
+    // hit). The 1/cycle RECOVERY — a speculative wakeup off the LIVE pick at N + a
+    // pick-freeze + mispick-squash (§3 pieces 2/4) — is the next sub-step (A1.1),
+    // flipped in the coordinated bundle (cp_a_loop_plan.md §6 measurement dependency).
+    // The grant (FR capture / IQ-slot free) stays LIVE at N here; only the wakeup
+    // (the in-loop half) is pipelined.
+    const SEL_PIPE: bit = 0;
+    var sel_wake0_en_q  : logic       ;
+    var sel_wake0_pdst_q: logic<PRF_W>;
+    var sel_wake1_en_q  : logic       ;
+    var sel_wake1_pdst_q: logic<PRF_W>;
+
     // DIV/REM (incl. the W variants) decode of the two alloc ops — recorded into
     // sh_is_div so the pipe-1 select can exclude them.
     let alloc_is_div: logic = i_alloc_op.base.alu_op == alu_pkg::AluOp::DIV
@@ -555,6 +584,11 @@ pub module iq_int #(
             fr1_valid_q = 1'b0;
             fr0_op_q    = '0;
             fr1_op_q    = '0;
+            // A-LOOP A1 (SEL_PIPE): the pipelined-wakeup register starts empty.
+            sel_wake0_en_q   = 1'b0;
+            sel_wake0_pdst_q = 6'd0;
+            sel_wake1_en_q   = 1'b0;
+            sel_wake1_pdst_q = 6'd0;
         } else if i_flush {
             for i in 0..IQ_N {
                 occupied[i] = 1'b0;
@@ -562,6 +596,12 @@ pub module iq_int #(
             // CP front-pipeline: a commit-time redirect squashes the in-flight FR op.
             fr0_valid_q = 1'b0;
             fr1_valid_q = 1'b0;
+            // A-LOOP A1 (SEL_PIPE): a commit-time redirect squashes the in-flight
+            // pipelined wakeup — a flushed producer must not wake a (now-cleared)
+            // consumer late. Clearing the enable suffices (pdst is don't-care when
+            // disabled). Dead at SEL_PIPE=0 (the register feeds nothing).
+            sel_wake0_en_q = 1'b0;
+            sel_wake1_en_q = 1'b0;
             // PRF-ready bitmap state survives flush — recovery_fire on
             // free_list reclaims squashed pdsts; the ready bits on those
             // reclaimed pdsts remain whatever they were (the next rename
@@ -617,28 +657,45 @@ pub module iq_int #(
             // DEAD (SCHED_WAKEUP=0) until the front register lands; enabling it
             // without the FR wakes consumers a cycle early and is WRONG.
             if SCHED_WAKEUP {
-                if sched_wake0_en {
-                    prf_ready[sched_wake0_pdst] = 1'b1;
+                // A-LOOP A1 (SEL_PIPE): apply the PIPELINED (registered) wakeup pdst at
+                // =1 (stage 2 of the split loop), else the LIVE sched_wake (=0,
+                // byte-identical). At =1 sw*_q is the producer picked LAST cycle (NBA
+                // pre-edge), so the wakeup lands one cycle later (see the SEL_PIPE decl).
+                let sw0_en  : logic        = if SEL_PIPE ? sel_wake0_en_q : sched_wake0_en;
+                let sw0_pdst: logic<PRF_W> = if SEL_PIPE ? sel_wake0_pdst_q : sched_wake0_pdst;
+                let sw1_en  : logic        = if SEL_PIPE ? sel_wake1_en_q : sched_wake1_en;
+                let sw1_pdst: logic<PRF_W> = if SEL_PIPE ? sel_wake1_pdst_q : sched_wake1_pdst;
+                if sw0_en {
+                    prf_ready[sw0_pdst] = 1'b1;
                     for i in 0..IQ_N {
-                        if occupied[i] && sh_rs1_pdst[i] == sched_wake0_pdst {
+                        if occupied[i] && sh_rs1_pdst[i] == sw0_pdst {
                             rs1_rdy[i] = 1'b1;
                         }
-                        if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == sched_wake0_pdst {
+                        if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == sw0_pdst {
                             rs2_rdy[i] = 1'b1;
                         }
                     }
                 }
-                if sched_wake1_en {
-                    prf_ready[sched_wake1_pdst] = 1'b1;
+                if sw1_en {
+                    prf_ready[sw1_pdst] = 1'b1;
                     for i in 0..IQ_N {
-                        if occupied[i] && sh_rs1_pdst[i] == sched_wake1_pdst {
+                        if occupied[i] && sh_rs1_pdst[i] == sw1_pdst {
                             rs1_rdy[i] = 1'b1;
                         }
-                        if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == sched_wake1_pdst {
+                        if occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == sw1_pdst {
                             rs2_rdy[i] = 1'b1;
                         }
                     }
                 }
+                // A-LOOP A1 (SEL_PIPE): pipeline-register the scheduled-wakeup pdst —
+                // the cycle-N argmin + sh_rd_pdst[issue_idx] dyn-mux lands here
+                // (stage-1 boundary); the compare + rs*_rdy write above reads it next
+                // cycle (stage 2). Written unconditionally (the LIVE sched_wake* is a
+                // comb let); DEAD at SEL_PIPE=0 (read nowhere → DCE).
+                sel_wake0_en_q   = sched_wake0_en;
+                sel_wake0_pdst_q = sched_wake0_pdst;
+                sel_wake1_en_q   = sched_wake1_en;
+                sel_wake1_pdst_q = sched_wake1_pdst;
             }
             // Rename clears prf_ready[new_pdst] so subsequent renames
             // that depend on it see "not ready" until producer writes back.

@@ -119,10 +119,73 @@ replay) if budget demands.**
 1. **A-EXE flip** (A0) — solve §1.0b, flip EX_PIPE, full ladder. The down-payment + surfaces
    the CDB-snoop A-LOOP will need cut.
 2. **A1 DEAD scaffold** — select register + `speculative` bit + pick-freeze, param-gated
-   (`SEL_PIPE=0` byte-identical). FF-insertion: confirm the loop splits.
+   (`SEL_PIPE=0` byte-identical). FF-insertion: confirm the loop splits. **✅ A1.0 landed
+   (the loop-split core — register the scheduled-wakeup pdst). A1.1 (1/cycle recovery)
+   pending — see §9.**
 3. **A1 flip in the bundle** — measure the loop floor (~6.5 ns?); IPC.
 4. **A2** — load speculative wakeup + replay, if needed for the load-use IPC.
 5. **AF** — collapsing IQ, if the select half is still binding.
+
+## 9. ✅ A1.0 implementation status (2026-07-01) — the loop-split core landed DEAD
+
+`SEL_PIPE` scaffold (`iq_int.veryl`, `const SEL_PIPE: bit = 0`). User chose "A1 pipelined-
+select scaffold" (over A-EXE flip / vrf VALU_PIPE) as the next FINAL-structure increment.
+
+**What landed (the unambiguous loop-split half — register the wakeup):** the keystone loop is
+`rs*_rdy → cand0/argmin → sched_wake0 (sh_rd_pdst[issue_idx] dyn-mux → per-entry compare) →
+rs*_rdy`. A1.0 registers the SCHEDULED-WAKEUP pdst/en (`sel_wake{0,1}_pdst_q`/`_en_q`) AFTER
+the argmin + `sh_rd_pdst[pick]` dyn-mux:
+- stage 1 (deep)   = `cand0/argmin + sh_rd_pdst[issue_idx]` → `sel_wake0_pdst_q`
+- stage 2 (shallow) = `sel_wake0_pdst_q → per-entry compare → rs*_rdy` write
+The SCHED_WAKEUP application reads `if SEL_PIPE ? sel_wake*_q : sched_wake*`; the register is
+written unconditionally (a comb `let`) and cleared on reset + `i_flush` (a squashed producer
+must not wake late). **The grant (FR capture / IQ-slot free) stays LIVE at N** — only the
+in-loop wakeup half is pipelined here, so there is NO second grant-pipeline stage (no extra
+issue latency, no retain-until-confirmed `pending` needed for A1.0).
+
+**Why this is the right first cut, not the §1 "wakeup off live pick":** §1's 1/cycle design
+keeps the wakeup combinational off the LIVE argmin at N (deep, in-loop) and pipelines the
+*grant* — but the grant is NOT in the §6 12.9 ns path (`head → … → argmin → sched_wake0 →
+rs1_rdy`), so pipelining it alone would not split the measured loop. Registering the WAKEUP
+pdst *is* a register inside that exact path → it splits the 126-level loop. The cost: at
+`SEL_PIPE=1` the wakeup lands one cycle LATE (it coincides with the producer's real CDB
+broadcast, so the CDB snoop would have woken the consumer anyway — **conservative, never a
+stale read**, only the +1-cy dependent-issue IPC of losing the SCHED_WAKEUP head-start).
+
+**Validation (DEAD = byte-identical at SEL_PIPE=0):** `veryl check` clean (the only warnings
+are the pre-existing dcache/icache `missing_reset` on RAM arrays + `dmem_wstrb`; the new
+`sel_wake*_q` are reset). default **252/0**, litmus N=2 **cy=0022a330** (identical to
+baseline), N1 boot **4/4** (linux 7.1 **cy=01210060** — cycle-exact with baseline),
+**backend-validate 252/0** (cc vs cranelift no divergence). DEAD scaffold is byte-identical.
+
+**FF-insertion synth — the loop SPLITS (confirmed, `veryl synth --top heliodor_core
+--dump-timing --timing-paths N`, throwaway flips reverted):** the wakeup loop is masked under
+the upper band, so it is read at `FETCH_REG=1` (which cuts the front-end allocate path so
+`rs1_rdy`'s dominant path becomes the wakeup loop, exactly the §6 setup):
+
+| config (FETCH_REG=1 +) | `head → rs1_rdy[0]` | global top (unchanged) |
+|---|---|---|
+| SEL_PIPE=0 | **12.920 ns / 126 levels** (#7778) — the §6 loop, reproduced exactly | n_inflight 14.130 · vrf 13.880 |
+| **SEL_PIPE=1** | **< 11.080 ns** (absent from the top 25 000 paths; was #7778 at 12.920) — **dropped ≥ 1.84 ns / ≥ 15 levels** | n_inflight 14.130 · vrf 13.880 (identical) |
+
+The registered `sel_wake0_pdst_q` carries the stage-1 (argmin + `sh_rd_pdst[pick]` dyn-mux)
+boundary; it too is < 11.080 (an anonymous endpoint), so the **new loop floor is the argmin /
+ROB-block-scan half (~11 ns)** — the wakeup tail registered cleanly OUT of `rs1_rdy`. This is
+the expected partial cut from a SINGLE register in a 126-level distributed loop: it confirms
+the register is correctly placed IN the loop (the scaffold works), and that reaching the
+~6.5 ns target needs A1.1 (speculative wakeup off the live pick) + AF (collapsing/age-ordered
+IQ to shorten the argmin half). The global CP is unchanged (the loop is masked under
+n_inflight/vrf) — its true floor is a bundle-flip measurement (§6 dependency).
+
+**A1.1 — the 1/cycle recovery (next sub-step, the `speculative`/freeze/squash half), DEFERRED
+to the bundle flip:** to claw back the +1-cy dependent-issue at `SEL_PIPE=1`, add the
+speculative wakeup off the LIVE pick at N (so the critical dependent is still woken same-cycle)
++ the per-entry `speculative` bit + the pick-freeze (1-entry select latch held until grant) +
+the mispick-squash (live-pick ≠ confirmed-grant). This is §3 pieces 2/4 and is where the
+genuine speculation/replay risk lives — it co-flips and is SMP/litmus-validated in the
+coordinated bundle (§6 measurement dependency), not standalone. A1.0 is the byte-identical
+foundation it builds on. The FF-insertion synth at `SEL_PIPE=1` (this/next session) measures
+whether stage-1 (argmin+dyn-mux) is now the ~6.5 ns half it should be.
 
 ## 8. Anchors
 - `iq_int.veryl:324-366` select (cand/argmin/issue_idx) · `:384-401` o_issue_* (the grant) ·
