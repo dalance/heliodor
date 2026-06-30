@@ -116,14 +116,28 @@ vrf stayed 13.880. So the commit-store front is a 4-path adjunct worth **−0.25
 "diminishing / capped" conclusion (`cp_commit_store_pretranslate_plan.md §4.1`); it also breaks boot
 (forced-slow path) and was reverted (not committed). **The binding front is the VU datapath.**
 
-**▶️ Corrected next high-value target = cut the VU datapath (vrf).** It is the 500+-path dominant
-front; top-500 are ALL vrf, so everything below 13.880 (incl. the keystone `rs1_rdy`) is masked by it.
-The cut is **VU writeback / compute pipelining** (`vector_unit.veryl` `o_vd_data` @2494, the VRF write,
-the `head → h_vd` commit gate — extend VINT_PIPE/VFP_PIPE; the recurring VU-datapath floor, see
-`project_heliodor_lsu_pipelining`). Cutting it exposes whatever is below (a big drop, or another dense
-layer — unmeasured). The commit-store P3 (−0.25 ns) is a minor adjunct, deferred. Coordinated-flip
-priority: **{FETCH_REG (done, DEAD) + VU-datapath (vrf) cut}**; the keystone (Phase A) stays masked
-below the VU front.
+**▶️ DIRECTION CHANGE (2026-06-30, user: "optimise for the FINAL structure, not short-term CP" → agreed).**
+The vrf front is the 500+-path dominant synth front (top-500 are ALL vrf), BUT it is the **VU
+side-unit's own writeback** — cutting it lowers the synth number without advancing the **scalar core
+structure** (depth / keystone). Picking it because it is the binding synth front is exactly the
+CP-driven mole-whacking to avoid. The vrf (and commit-store) cuts ARE needed eventually (the VU can't
+cap CP at 13.880 for the ~7.5 ns goal), but they are **mechanical front-pipelining, post-keystone**,
+not foundational.
+
+**The foundational direction is the KEYSTONE (Phase A): latency-speculative wakeup + replay —
+decoupling select from execute.** Today the scalar core fuses issue=execute=broadcast=wakeup into one
+cycle ("Stage IE"); splitting it is the only way to a 10+-stage scalar pipe, "everything depends on
+it" (`deep_pipeline_sram_plan.md` Sequencing — Phase A FIRST), and it is ~80 % of the campaign
+difficulty (replay + SMP). It is **masked** below the vrf/commit-store wall, so it shows **no
+short-term CP** — which is fine under "not chasing short-term CP." `speculative_wakeup_design.md §1.1`
+says to revisit Phase A *after* the front end is pipelined — FETCH_REG did that, so **now** is the
+time. **Keep FETCH_REG** (a genuine front-end stage + a good de-risking warm-up). To avoid building
+the keystone "blind", use **throwaway FF-insertion** of the vrf/commit-store fronts to expose the
+keystone floor for a measurement *target* only (do not commit the side-unit cuts).
+
+**Next = start the Phase A keystone RTL** (read `speculative_wakeup_design.md`; seed = the
+`lsu-phase1-wip` 2-stage load + LSR; mind §1.0b's CDB-register writeback-arbitration conflict). The
+vrf / commit-store cuts are deferred to post-keystone mechanical front-pipelining.
 
 ## 3. The icache sync-read scaffold (A) — methodology (SUPERSEDED by §2.2 — keep for the SRAM phase)
 
