@@ -465,6 +465,38 @@ cycle-exact) → synth FF-insertion measure → flip → corner-debug.
   (§5.5), param-gated DEAD (`LOAD_SPEC=0`). FLIP with the **full SMP/litmus matrix**
   at each sub-step. Highest risk.
 
+### 8.1 ✅ A-EXE implementation status (2026-06-30) — E1 + E2 landed DEAD; E3 FLIP deferred to the bundle
+
+- **E1 ✅ committed `4ff4b54`** (`const EX_PIPE: bit = 0`): the lane-0 EX register
+  `alu_cdb_q` + `alu_cdb_eff = EX_PIPE ? alu_cdb_q : alu_cdb`; the 5 direct lane-0
+  arbitration readers + the unified `cdb` mux consume `alu_cdb_eff`; cleared on
+  redirect_fire. Byte-identical (default 252/0, synth CP 14.565 unchanged = DCE'd, N1
+  boot cy=01210060 exact).
+- **E2 ✅ committed** (operand bypass): `prf_rs{1,2}_data{,2}_b` forward `alu_cdb_q.data`
+  to u_alu/u_alu2/int_div when `iq_iss_rs*_pdst == alu_cdb_q.pdst` (gated on `EX_PIPE &&
+  alu_cdb_q.valid && has_rd`). DEAD at 0 (folds to the live PRF read). Byte-identical
+  (252/0, N1 boot cy exact).
+- **E3 (FLIP) ⏸️ DEFERRED to the coordinated bundle — NOT a clean register; the §1.0b
+  "80 %" is real.** Designing E3 surfaced that a registered ALU result that loses the lane
+  must be **held + backpressured**, and the only 1-deep-bounded backpressure (stall the FR
+  drain / u_alu issue on `ex_can_accept`) **replays the issue-time side-effects** of a
+  stalled op: `issue_amo_read` (`core.veryl:4577`) and the LR/SC/store issue gates key on
+  the LIVE `iq_issue_valid`, so a stalled AMO/LR/SC **re-drives its dcache RFO read every
+  held cycle** — exactly the SMP-atomicity-sensitive hazard §7 warns about. Plus the
+  squash-flush timing (a held result of an early-squashed younger op broadcasts one cycle
+  before redirect_fire clears `alu_cdb_q` — the `em0_live` gate covers the spurious
+  redirect, but the PRF/ROB writeback to the reclaimed pdst needs litmus/ACT4 to confirm
+  harmless). Options for E3 when undertaken: (a) full backpressure with **all** issue-side-
+  effects gated on the drain (invasive); (b) **stage only side-effect-free pure-ALU results**
+  in the EX register, keep AMO/LR/SC/CSR/branch LIVE on a parallel arm (cleaner, but a
+  live+registered two-arm lane-0 mux); (c) a deeper WB completion queue + bounded backpressure.
+  **Decision: A-EXE FLIP is CP-NEUTRAL today** (masked below the A-SCHED ~12.9 ns scheduler
+  floor), so flipping it alone pays IPC + this SMP-debug for **zero CP gain** — against the
+  campaign's "flip in bundles, single flips aren't worth it" rule. **E1/E2 stay committed as
+  the flip-ready structural scaffold; the E3 flip happens in the coordinated bundle** (with
+  A-SCHED + the commit-store/vrf wall cut), where the CP payoff justifies the arbitration
+  debug and the +1-cy IPC is paid once for a real gain.
+
 ---
 
 ## 9. The E0 warm-up scaffold (dcache synchronous read) — concrete
