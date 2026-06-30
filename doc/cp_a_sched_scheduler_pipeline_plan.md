@@ -11,6 +11,70 @@ masked loop; all throwaway probes reverted, tree clean). No A-SCHED RTL yet.
 
 ---
 
+## 0. 🚨🚨 MEASURED CORRECTION — AS-b is NOT the lever (gate trace, 2026-06-30)
+
+I implemented AS-b as a DEAD param-gate (`AGE_MATRIX`, byte-identical: default 252/0,
+synth 14.565 unchanged with the matrix flops DCE'd, N1 7.1 boot cy=01210060 exact) and ran
+the de-risking flip. **The matrix is bit-exact** (AGE_MATRIX=1 → litmus N2 cy=0022a330,
+*identical* to the argmin) but **it does NOT move the select loop**: at FETCH_REG=1,
+`rs1_rdy[0]` is **12.920 ns** with the argmin (126 levels) and **12.920 ns** with the matrix
+(123 levels) — **3 gate levels, 0 ns**. The age-argmin tree was never the binding depth.
+
+**Why — the `--dump-timing` gate trace of the `head[0] → rs1_rdy[0]` 12.920 path:**
+
+```
+0.00  head[0] (FF Q)
+      → commit (sh_rd_arch → arch_regs → c_cas_q_mem_hi → c_is_cas_q)
+2.96  → commit_store_fire
+      → iq_issue_op → dmem_eff_priv → u_dmem_mmu (vm_enabled) → m_pa_q → dmem_pa_m
+4.41  → u_dcache.i_addr
+4.94  → RAM Q            (dcache TAG read)
+      → next_tag compare → next_hit → miss → srfo_want → index
+7.00  → RAM Q            (dcache 2nd read)
+      → f_tag → fm_0 → plru_way → victim_way → vic_valid → vic_dirty → fill_blocked_wb
+      → load_sel → filling → dc_mem_req → o_dmem_iread → i_dmem_grant → fill_start_fire
+      → i_wen → wenl_fires → state
+10.13 → dcache_stall → replay_q → iss_reads_dmem → iq_issue_valid
+10.84 → fr0_valid_q → has_issuable → slot0_grant
+11.27 → prf_ready (×7 mux2 cascade = the wakeup-WRITE arbitration)
+12.47 → i_alloc_op → rs1_rdy (×3 mux)
+12.92  rs1_rdy[0] (FF D)
+```
+
+**~10.5 ns of the 12.9 (80 %) is the `commit-store → MMU → dcache` WALL** — the *same* front
+that binds `n_inflight` (14.130) and `valid_*` — leaking into the scheduler through the
+**grant-gating** (`dcache_stall → iss_reads_dmem → iq_issue_valid → slot0_grant`). The
+remaining ~2.4 ns is the **wakeup tail** (the `prf_ready` write-arbitration mux cascade +
+the `rs1_rdy` write mux). **The SELECT (argmin/matrix `has_issuable`) is a side input to
+`slot0_grant`, off the binding path — the argmin is a *tiny* fraction.**
+
+**Conclusions (these supersede §1/§3 below):**
+1. **AS-b (age-matrix select) is REFUTED as a CP lever** — depth-neutral (3 levels, 0 ns),
+   CP-neutral, and the select is not the binding path. It is not FINAL-structure-advancing
+   either (it adds 64 FF + maintenance for an argmin that is already cheap on a tie-free
+   key). The AS-b scaffold was **reverted** (not committed). The plan's "AS-b is the lever /
+   the only road to ~7.5 ns" was wrong.
+2. **AS-a (dependency-matrix wakeup) targets the ~2.4 ns wakeup tail** — that tail is real
+   (the `prf_ready` cascade + `rs1_rdy` mux), *bigger* than the doc's "~0.2 ns", but it is
+   masked behind the grant-gating + the wall, so it is not first either.
+3. **The scheduler's actual CP contribution is AS-c (decouple grant-gating)** — but the
+   grant-gating *is* the dcache wall leaking in, and cutting it only exposes the CDB-snoop
+   (12.320, cut by **A-EXE**), with the global CP still pinned by the wall (14.130). So the
+   scheduler region only moves **inside the coordinated bundle** with the commit-store/dcache
+   wall (Phase C dcache sync-read) + A-EXE. There is **no scheduler-only lever**.
+4. The probe-based reasoning in §1.1 (which ranked the argmin as the lever) read the
+   *logical* loop; the **gate trace reads the physical path** and overrules it. The earlier
+   probe results are consistent once re-read as multi-path masking at the `rs1_rdy` endpoint:
+   path-1 grant-gating (12.920, dcache wall), path-2 CDB-snoop (12.320, A-EXE), path-3 the
+   select loop (≤ 12.3, below both — which is why AS-b never showed).
+
+**▶️ The corrected next move is NOT in this file** — it is the coordinated deep-pipeline
+flip (commit-store/dcache wall = Phase C dcache synchronous-read SRAM pipe, + A-EXE CDB
+register, + the front-end and vector fronts), per `deep_pipeline_sram_plan.md`. A-SCHED has
+no standalone lever; fold AS-c into that bundle if/when the wall is cut.
+
+---
+
 ## 1. The measured floor (MEASURED 2026-06-30, not assumed)
 
 With FETCH_REG=1 (front end cut) the `rs1_rdy[0]` worst path is **12.920 ns / 126 levels,
