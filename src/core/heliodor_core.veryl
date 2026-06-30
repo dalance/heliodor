@@ -5300,6 +5300,25 @@ pub module heliodor_core #(
     let fast_store_pma_hole: logic = PMA_FAULT && !(c_store_addr[31] || c_store_addr[31:24] == 8'h02 || c_store_addr[31:28] == 4'h1 || c_store_addr[31:24] == 8'h0c);
     assign fast_store_acc_fault = fast_store && (fast_store_pmp_deny || fast_store_pma_hole) && !c_is_cbo_m;
 
+    // CP commit-store pre-translate (P5a, change A — DEAD at STORE_PRETRANSLATE=0):
+    // a committing PLAIN VM cacheable store whose PA was already produced at execute
+    // by the side-effect-free TLB probe (sh_store_pa[head] = c_store_pa, a ROB FF).
+    // When set, the SB push / MMIO classify / commit decision drain this REGISTERED
+    // PA instead of re-running the live MMU at commit — taking the MMU off the
+    // n_inflight/valid_* front (cp_commit_store_pretranslate_plan §3.6/§9). AMO/SC,
+    // misaligned (st_wstrb_hi), and MMIO PAs are excluded (commit-translate stays).
+    // The `STORE_PRETRANSLATE &&` prefix const-folds this to 0 in the DEAD build, so
+    // every consumer below collapses to its live-MMU form = byte-identical.
+    let c_pretx_fast: logic = STORE_PRETRANSLATE && commit_store_fire && c_store_pa_valid
+        && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0
+        && c_store_pa[63:25] == 39'h40
+        && !((c_store_pa[31:14] == 18'h20000) || (c_store_pa[31:12] == 20'h80008));
+    // The effective committing-store PA: the registered probe PA for a pre-translated
+    // store, else the live mux (VM → dmu_dmem_addr, bare → c_store_addr). At
+    // STORE_PRETRANSLATE=0 this is exactly the old `dmem_vm_on_op ? dmu_dmem_addr :
+    // c_store_addr` mux.
+    let c_store_eff_pa: logic<64> = if c_pretx_fast ? c_store_pa : if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
+
     // PMP (Smpmp): commit-time WRITE check for the dcache exclusive-write path
     // (AMO/SC). Bare uses the physical c_store_addr; a VM access uses the
     // translated dmu_dmem_addr (sb_pa's mux). On a deny the exclusive write is
@@ -5849,9 +5868,14 @@ pub module heliodor_core #(
     // the store buffer (its write is suppressed; it traps instead, like a page-
     // faulting store whose sb_vm_ok is 0).
     assign sb_elig = (fast_store || sb_vm_ok) && !fast_store_acc_fault;
-    assign c_store_mmio = ((if dmem_vm_on_op ? dmu_dmem_addr[63:25] : c_store_addr[63:25]) != 39'h40)
-        || (dmem_vm_on_op && dmu_pbmt_unc); // P10 Svpbmt: NC/IO store is uncached
-    assign sb_pa   = if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
+    // CP commit-store pre-translate (P5a): classify from the EFFECTIVE PA (registered
+    // probe PA for a pre-translated store, else the live mux). A c_pretx_fast store is
+    // cacheable DRAM by probe construction, so its Svpbmt-NC arm is masked. At
+    // STORE_PRETRANSLATE=0 (c_pretx_fast≡0, c_store_eff_pa≡the live mux) this is the
+    // original expression byte-for-byte.
+    assign c_store_mmio = (c_store_eff_pa[63:25] != 39'h40)
+        || (dmem_vm_on_op && !c_pretx_fast && dmu_pbmt_unc); // P10 Svpbmt: NC/IO store is uncached
+    assign sb_pa   = c_store_eff_pa;
     // P10 Svadu: the instruction-side A-bit write-back borrows the store-drain
     // port, but ONLY while the store buffer is empty (SB drain has priority). The
     // PTE dword sits at lane imem_ptw_addr_w[5:3] of its 64B line.
