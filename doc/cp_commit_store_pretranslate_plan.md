@@ -385,3 +385,38 @@ boot, so the rate is high. Measure boot-cy / CoreMark / Dhrystone (≤10–15 % 
   n_inflight → max(AMO-residual, vrf 13.880)). Full ladder + IPC.
 - **P6 (optional, atomicity-hard):** AMO/SC PA pre-translate (W2) to remove the residual —
   translate at execute, keep only the atomic RMW *write* at commit. Deferred.
+
+### 9.6 P5a built + P5b flip experiment (2026-06-30) — boot corner FIXED, CP needs the trap-deferral
+
+- **P5a DEAD scaffold complete + byte-identical** (commits `808b806` change A, `2850a52`
+  change B): default 252/0, litmus N2 cy=0022a330, N1 7.1 boot cy=01210060 (exact) +
+  V-boot cy=013cc5c0, synth CP 14.565 unchanged. The scaffold is kept DEAD
+  (STORE_PRETRANSLATE=0) — flip-ready, like the A-EXE E1/E2 scaffolds.
+- **P5b flip experiment (STORE_PRETRANSLATE=1, then reverted):**
+  - ✅ **The §4.1 P3 boot corner is FIXED.** default 252/0; **5.15 smoke boot pass=1
+    (cy=00c265a0); 6.6 boot pass=1 (cy=01496ff0)** — a full ~21.6 M-cycle paging boot to
+    shutdown. A non-pre-translated cacheable VM store now SB-pushes the registered m_pa_q
+    (change B) instead of the lost M-stage dcache write (P3). (The 7.1 model's cc recompile
+    of its large embedded image is pathologically slow after a source change — not run to
+    completion; the 6.6 full paging boot is the decisive evidence.)
+  - **IPC:** 5.15 smoke cy 0x00b6a5d0 → 0x00c265a0 ≈ **+6 %** (every non-pretx VM store
+    costs +1 commit cycle). Inside the ~10–15 % budget but high — the pretx hit-rate is
+    lower than hoped (many stores miss the execute-time probe: cold TLB / port busy at
+    execute). Characterise + improve (e.g. probe earlier / wider) before a permanent flip.
+  - 🔑 **change A+B alone is CP-NEUTRAL.** The commit fault-check `commit_store_sfault`
+    (`core.veryl:3876`) still reads the **live** `dmem_mmu_fault_s`/`dmem_mmu_acc_fault_s`
+    → `c_is_sfault_eff` → `commit_excp` → `rob_commit_ack` → `n_inflight`. So the live MMU
+    stays on the n_inflight path via the **fault check**, even though the PA drain is now
+    registered. **The CP cut needs the trap-deferral** (route the committing store's fault
+    through the registered `c_store_xfault` for pretx / `m_fault_q` for 2-cycle, gating the
+    live `dmem_mmu_*_s` arm of `commit_store_sfault` with `!c_pretx_fast && !sb_2cyc_ok`).
+  - And even with the trap-deferral, the **AMO commit-translate residual**
+    (`amo_commit_acc_fault`, live PMP on `dmu_dmem_addr`, single-cycle by atomicity) keeps
+    a near-identical n_inflight path → the ≈2.7 % cap of §4.1, capped further by vrf 13.880.
+
+**→ State: change A+B is a verified, flip-ready DEAD scaffold (the structural Stage-A store
+translate + the boot-corner-correct fallback). The CP-relevant flip = change A+B +
+trap-deferral (§9.6), folded into the coordinated bundle with vrf / the AMO W2 residual /
+the rest — a single-front flip here is CP-neutral-to-≈0.25 ns and costs ~6 % IPC, so it is
+not worth flipping standalone.** Next concrete step toward CP: the trap-deferral, then
+measure n_inflight at FETCH_REG=1.
