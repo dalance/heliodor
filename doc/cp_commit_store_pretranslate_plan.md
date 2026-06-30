@@ -28,42 +28,100 @@ time-multiplexed `vu_mem > store-commit(store_drive) > PTW-walk > load-issue(agu
 the commit critical path. `store_drive = commit_store_fire && !load_walk_busy &&
 !fast_store` (`core:5286`).
 
-## 2. The key enabler — the MMU **already translates the store's VA at issue**
+## 2. ⚠️ CORRECTED (2026-06-30) — the store does **NOT** translate at issue; an active TLB **probe** is needed
 
-A store issues on **slot-0** (the only mem-capable issue lane; slot-1/pipe-1 excludes
-load/store/amo). At its issue cycle, `core_dmem_vaddr = agu_addr_iss` = the store's
-`rs1+imm` (no `store_drive` yet) → the MMU produces `dmu_dmem_addr` = the store's **PA**
-— and today that result is **discarded** (a store does not touch the dcache at issue;
-it re-translates at commit). The store's **VA** is already captured into the ROB at
-execute (`rob.veryl:1258 sh_store_addr[i_cdb_rob_idx] = i_cdb_store_addr`).
+> **The original §2 premise below was FALSE and is kept struck-through for the record.**
+> A plain store on slot-0 asserts **no MMU request** at execute: `core_dmem_ren` excludes
+> stores and `core_dmem_wen = store_drive` is 0 until commit, so `mem_req = i_wen||i_ren = 0`.
+> With no request the dmem MMU passes the VA straight through (`mmu.veryl:198`
+> `o_dmem_addr = i_vaddr` when `!ptw_valid`), so `dmu_dmem_addr` at a store's execute is the
+> **untranslated VA**, not the PA. Proven empirically: a paging boot with a capture-vs-commit
+> checker showed **every** captured store MISMATCH (cap = `0xffffffff8…` kernel VA, live =
+> `0x80……` PA). `core.veryl:~3760` states it directly: "A STORE translates only at commit …
+> its CDB-time is_sfault is always 0 for them."
+>
+> ~~Pre-translate = capture the issue-time `dmu_dmem_addr` (PA) … the store already drives
+> the one MMU at its slot-0 issue~~ — **wrong: the MMU is not driven at issue.**
 
-> **Pre-translate = capture the issue-time `dmu_dmem_addr` (PA) + fault into the ROB,
-> then drain that PA at commit instead of re-running the MMU.** No new MMU port: the
-> store already drives the one MMU at its slot-0 issue, and at most one mem op issues
-> per cycle, so there is zero added port pressure.
+**The real mechanism (matches `speculative_wakeup_design.md §9.1` "pre-translate stores AT
+EXECUTE"): a side-effect-free STORE TLB probe.** The dmem MMU's TLB lookup (`tlb_hit`,
+`tlb_pa`, `tlb_perm_w`, `tlb_u_ok`) is **pure combinational on `i_vaddr`** — it is computed
+regardless of `mem_req`; only the *output mux* gates `o_dmem_addr` on `ptw_valid`. So expose
+the TLB-hit translation as new outputs **`o_sprobe_pa` / `o_sprobe_ok`** (mmu → dmem_mmu →
+core), evaluated with **store semantics** (W with D folded at fill: `tlb_perm_w = pte_w &&
+pte_d`; U via the same `tlb_u_ok`; cacheable; canonical; IDLE; V=0 single-stage; + a PMP-W
+and PMA-backing check on the probe PA in dmem_mmu). At a store's execute cycle
+`core_dmem_vaddr` already carries the store's VA (confirmed: `cap_pa == c_store_addr`), so
+the probe yields the store's PA — **the exact PA the commit translation would produce**.
+
+> **Pre-translate = at execute, latch the side-effect-free TLB-probe PA (`dmem_sprobe_pa`)
+> into the ROB when `dmem_sprobe_ok` (clean store-permitted cacheable hit) and no
+> translation-state change is in flight; at commit drain that registered PA.** No new MMU
+> port (combinational TLB read, no request); anything not a clean hit falls back to commit
+> translation. ✅ **Implemented + verified DEAD (commit `7598185`, P1'): probe = commit
+> translation on 240/240 boot stores, 0 mismatch, cy byte-identical.**
+
+### 2.1 ⚠️ The synth-CP crux discovered in P1' — the fallback must ALSO leave the fast front
+
+The 15.300 front is specifically the **fast `sb_vm_ok` store**: a clean TLB-hit DRAM store
+that **translates AND commits in one cycle** (`head → commit_store_fire → MMU TLB hit →
+sb_vm_ok → rob_commit_ack → n_inflight`, and the dcache fill/invalidate → `valid_*`). Slow
+stores (AMO/SC, misaligned, MMIO, TLB-miss) already take ≥2 cycles via the M-stage
+(`store_fetched_q`, MEM_PIPE M3a) and are **not** on this front.
+
+`veryl synth` reports the **worst-case** path, so pre-translating the *common* store while a
+*non-pre-translated* `sb_vm_ok` store can still translate-and-commit in one cycle leaves the
+MMU on the front → **the headline would not drop.** Therefore the flip must **force every
+non-pre-translated VM store onto the slow (registered, ≥2-cycle) path**, i.e. redefine
+`sb_vm_ok` to admit **only** pre-translated DRAM stores (`c_pretx_fast`, §3.6). A VM store
+that hit the TLB at commit but was not pre-translated at execute (entry filled in between)
+then commits one cycle slower — a small, bounded IPC cost inside the campaign budget. This
+is the behavioral change that makes the cut real; it is also why the flip needs the full
+SMP/litmus/ACT4 ladder (store-commit timing + ordering change).
 
 ## 3. Design
 
-### 3.1 New ROB per-entry state (captured at execute / CDB edge)
-- `sh_store_pa[rob_idx]` ← `dmu_dmem_addr` (the issue-time translated PA).
-- `sh_store_xfault[rob_idx]` ← `dmem_mmu_fault_s || dmem_mmu_acc_fault_s` (store page /
-  access fault, latched at issue) + the fault sub-fields needed for `mtval`/`htval`
-  (gpa/gstage) already plumbed for loads.
-- `sh_store_pa_valid[rob_idx]` ← issue-time translation was **complete and usable**
-  (TLB hit, not a PTW-walk-in-progress, not blocked — see §3.3).
+### 3.1 ROB per-entry state (captured at execute / CDB edge) — ✅ IMPLEMENTED (P1')
+- `sh_store_pa[rob_idx]` ← `dmem_sprobe_pa` (the **active TLB-probe** PA, not `dmu_dmem_addr`).
+- `sh_store_pa_valid[rob_idx]` ← `cdb.is_store && !iq_iss_is_amo && !store_drive &&
+  !mmu_walk_inflight && !vu_mem_active && dmem_sprobe_ok && !rob_has_pending_xlate`
+  (a clean store fast-path probe hit on the store's own VA, no in-flight xlate change).
+- `sh_store_xfault` ← **constant 0**: faults never pre-translate (any W/D/U/PMP/PMA deny
+  makes `dmem_sprobe_ok=0` → fall back to the commit walk, which raises the precise fault
+  exactly as today). The field is kept for plumbing symmetry but is dead; drop it if a
+  later cleanup wants to.
 
-Captured on the **same CDB write** that already writes `sh_store_addr` — gate by
-"this CDB op is a store AND its issue-cycle MMU translated its own VA" (the executing
-store on lane-0 is the op whose `agu_addr_iss` the MMU saw).
+Captured on the **same CDB write** that writes `sh_store_addr` (the executing store on
+lane-0, whose `agu_addr_iss == core_dmem_vaddr` this cycle is what the probe sees).
 
-### 3.2 Commit drain uses the pre-translated PA
-At commit, for a **pre-translated plain store** (`sh_store_pa_valid[head]`):
-- `c_store_pa = sh_store_pa[head]` drives the SB push (`sb_pa`/`sb_line`) directly.
-- **`store_drive` no longer asserts the MMU** for this store → `core_dmem_vaddr` stays
-  on the load-issue path; the `head → … → MMU → {n_inflight, valid_*}` sweep is gone.
-- The precise store fault is raised at commit from `sh_store_xfault[head]` (the fault
-  was *detected* at issue, *delivered* at commit — same precise-trap timing as today;
-  `core.veryl:~3746` already special-cases store-fault delivery at commit).
+### 3.2 Commit drain uses the pre-translated PA — ▶️ P3 (flip)
+At commit, for a **pre-translated plain DRAM store** (`c_pretx_fast`, §3.6):
+- `c_store_pa = sh_store_pa[head]` (a ROB FF, plumbed via `o_commit_store_pa`) feeds the
+  SB push (`sb_pa`) and the MMIO classifier (`c_store_mmio`) directly — via a
+  `c_store_eff_pa = c_pretx_fast ? c_store_pa : (dmem_vm_on_op ? dmu_dmem_addr : c_store_addr)`
+  mux at each consumer.
+- **`store_drive` no longer asserts the MMU/dcache port** for this store: split it into
+  `store_drive_mmu = store_drive && !c_pretx_fast` and use `store_drive_mmu` for
+  `core_dmem_vaddr` / `core_dmem_wen` / `core_dmem_wstrb` and the load-blocking / port
+  gates (a `c_pretx_fast` store frees the port — it goes to the SB, not the dcache). The
+  store still *retires* as a store (the role-2 `store_drive`/`commit_store_fire` stays).
+- No store fault is delivered for a `c_pretx_fast` store (it was a clean hit by
+  construction); faulting stores are never `c_pretx_fast`.
+
+### 3.6 The flip's eligibility gate `c_pretx_fast` and the forced-slow fallback
+```
+c_pretx_fast = STORE_PRETRANSLATE && commit_store_fire && c_store_pa_valid
+            && !c_is_amo && dmem_vm_on_op && st_wstrb_hi == 8'd0      // aligned single-dword
+            && c_store_pa[63:25] == 39'h40                            // DRAM
+            && !(c_store_pa[31:14]==18'h20000 || c_store_pa[31:12]==20'h80008); // not tohost
+sb_vm_ok = c_pretx_fast;   // <-- the semantic change: ONLY pre-translated DRAM stores are fast
+```
+Replacing the live-MMU `sb_vm_ok` with `c_pretx_fast` forces every **non**-pre-translated
+VM store (TLB-miss-at-execute, HSV V=1, uncached, misaligned, stale-xlate fallback) onto the
+slow `!sb_elig` M-stage path (`store_fetched_q`, ≥2-cycle, MMU-translated + registered) — so
+**no** store translates-and-commits in one cycle and the MMU leaves the `n_inflight`/`valid_*`
+front (§2.1). MMIO pre-translated stores (`c_store_pa` not DRAM) are not `c_pretx_fast` →
+slow path with the live MMU (unchanged), so `store_drive_mmu` stays asserted for them.
 
 ### 3.3 Scope — plain `sb_elig` stores only (first cut)
 Pre-translate **plain cacheable/MMIO stores** (the `sb_elig = fast_store || sb_vm_ok`
@@ -110,17 +168,75 @@ translation that crossed an older translation-state change.
 
 ## 4. Staging (param-gate DEAD → flip → corner-debug)
 
-- **P1 (dead):** add `sh_store_pa` / `sh_store_xfault` / `sh_store_pa_valid` ROB fields
-  + capture logic, param-gated `STORE_PRETRANSLATE: bit = 0`. At 0 the fields are
-  written but **unread** (commit still uses `store_drive`/MMU) → cycle-exact,
-  byte-identical (N1 boot cy match). Synth CP unchanged.
-- **P2 (dead bypass):** wire the commit drain to *optionally* use `sh_store_pa` under
-  the param, still 0. Confirm dead.
-- **P3 (flip):** `STORE_PRETRANSLATE=1`. Commit drains the pre-translated PA; remove
-  `store_drive`'s MMU access for the pre-translated class. **Full gate ladder.**
-  Corner-debug: the translation-state-change fallback (§3.4), store-fault precise
-  delivery, the `sb_vm_ok`/`sb_elig` interaction, MMIO classification (`c_store_mmio`
-  needs the PA — now from `sh_store_pa`), and the fast_store/bare path (unchanged).
+- ~~**P1 (dead, `1661bed`):**~~ captured `dmu_dmem_addr` — **WRONG (the VA, §2)**; superseded.
+- ✅ **P1' (dead, `7598185`):** add the side-effect-free STORE TLB probe (`mmu.o_sprobe_*`,
+  `dmem_mmu` PMP-W/PMA gate) and capture `dmem_sprobe_pa` into the ROB; plumb the commit-side
+  `o_commit_store_pa/xfault/pa_valid` → `c_store_*`. `STORE_PRETRANSLATE=0` → fields/outputs
+  written-but-unread → **byte-identical** (default 252/0; N1 boot 4/4, 7.1 cy=0x01210060).
+  Verified: a temp capture-vs-commit checker showed **240 MATCH / 0 MISMATCH** — the probe PA
+  equals the commit translation on every clean store.
+- ▶️ **P3 (flip) — NEXT, the high-risk step:**
+  1. Define `c_pretx_fast` (§3.6) and `c_store_eff_pa`; route `c_store_eff_pa` into `sb_pa`
+     and `c_store_mmio` (in place of the `dmem_vm_on_op ? dmu_dmem_addr : c_store_addr` mux).
+  2. `sb_vm_ok = c_pretx_fast` (the forced-slow-fallback semantic change, §2.1/§3.6).
+  3. `store_drive_mmu = store_drive && !c_pretx_fast`; use it for `core_dmem_vaddr` /
+     `core_dmem_wen` / `core_dmem_wstrb` and the `!store_drive` load-blocking / port gates
+     (`load_blocks_on_store`, `core_dmem_ren`, `sc_walk_drive`, `replay_drive`, `lsr_drive`,
+     `core_dmem_is_amo`). Keep role-2 `store_drive`/`commit_store_fire` for retire/SB-push.
+  4. Confirm the dcache fill/invalidate (`valid_*`) path is not driven by a `c_pretx_fast`
+     store (it goes to the SB, not the dcache); if it is, feed it `c_store_eff_pa`.
+  5. `STORE_PRETRANSLATE=1`. **Synth-measure** (expect `n_inflight` 15.300 + `valid_*` 14.870
+     to drop off the MMU; new headline ≈ `redirect_pc_q` 14.8 / `rs1_rdy` 14.565).
+  6. **Full gate ladder** (memory ordering is not separable): default 251/0 ·
+     `--backend-validate` · **ACT4 696/696 (ESSENTIAL — S-mode + Sv39 store page/access
+     faults are exactly this path)** · litmus N2/N4 · N2/N4 SMP boot · Verilator SMP.
+  7. **IPC**: boot-cy / CoreMark / Dhrystone (non-pre-translated VM stores now 1 cycle
+     slower; expect small, inside the ~10–15 % budget).
+  Corner-debug watch-list: stale-xlate fallback (§3.4, gated at capture by
+  `!rob_has_pending_xlate`), MMIO classification from `c_store_eff_pa`, HSV (V=1) stores
+  forced slow, the SB push/forward consistency when the port is freed to a concurrent load,
+  and SMP store ordering / atomicity (litmus).
+
+### 4.1 ⚡ P3 flip EXPERIMENT (2026-06-30) — measured **15.300 → 14.890** but REVERTED (two blockers)
+
+The flip above was implemented and measured, then reverted to `STORE_PRETRANSLATE=0`
+(tree back at P1' `7598185`). Two findings:
+
+1. **Synth: only −0.41 ns (15.300 → 14.890, −2.7 %).** The cut removed the plain-store
+   `sb_vm_ok` MMU dependency, but the worst path is STILL `head → commit_store_fire →
+   store_drive_mmu (mux select) → core_dmem_vaddr → MMU tlb → pa → u_pmp_amo_w → … →
+   n_inflight`. **The residual is the AMO/SC + slow-store commit translation feeding the
+   commit fault → commit decision → free-list.** AMO/SC translate at commit single-cycle
+   by atomicity constraint (proven: a +1-cy AMO commit slip breaks SMP atomicity), so this
+   tail is NOT pipelinable the way a plain store is. The dense plateau right below (14.870
+   `valid_*`, 14.8 `redirect_pc_q`, **14.565 `rs1_rdy` keystone floor**) means even crushing
+   the *entire* commit-store front caps at ≈14.5 — i.e. the whole lever is worth ≈5 % and is
+   gated by the **keystone**, not by this front.
+
+2. **Functional: the flip BREAKS the Linux boot** (kernel panic, cause 13 load page fault,
+   `cy=0x02aea540`, x3≠0xAA) although default `veryl test` 252/0 (arch + litmus N2) passes.
+   Root cause: `sb_vm_ok = c_pretx_fast` forces a **non-pre-translated cacheable VM store**
+   (TLB-hit at commit but not at execute) onto the slow `!sb_elig` M-stage path — but that
+   path was only ever exercised for MMIO / misaligned / TLB-miss stores; a cacheable DRAM
+   store has **never** completed via the M-stage write (it always went through the SB after
+   the TLB filled). The M-stage cacheable write does not write-allocate/SB-merge correctly →
+   lost store → memory corruption → the load fault. **The slow path is NOT a correct
+   substitute for the SB fast path for cacheable stores.**
+
+**→ Correct redesign (if pursued):** a non-pre-translated cacheable VM store must still go
+to the **SB**, but via a **2-cycle registered SB push** (translate + register PA in cycle N,
+SB-push the registered PA in cycle N+1) — a NEW path, distinct from the M-stage slow write —
+so no store SB-pushes with a live-MMU PA in the same cycle. Only then does the front fully
+leave the MMU (modulo the AMO residual). This is materially more work than the flip above,
+for a ≈2.7 % headline (≈5 % if the AMO residual is also pre-translated, atomicity-hard).
+
+**→ Strategic read:** the 14.4–15.3 ns band is a dense multi-front wall **capped by the
+`rs1_rdy` 14.565 keystone floor**. Picking individual fronts (commit-store) yields sub-1 ns
+each with diminishing returns and real correctness risk. The campaign's actual lever is the
+**keystone** (`speculative_wakeup_design.md`, Phase A). Keep P1' (the verified probe) as a
+down-payment; sequence the commit-store *completion* (2-cycle SB push + AMO pre-translate)
+AFTER the keystone, or fold it into the keystone's execute-staging flip.
+
 - **P4:** re-synth → expect `n_inflight`/`valid_*` to drop off the MMU; new headline
   is whatever front is next (likely the load-issue `agu_addr_iss → MMU` — shared with
   the keystone — or `redirect_pc_q`). Measure IPC (boot-cy/CoreMark/Dhrystone).
