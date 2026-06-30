@@ -99,21 +99,31 @@ registered path; the bypass was pure latency optimization). Committed **DEAD (=0
 as the validated front-end stage — to be flipped in the coordinated multi-front flip, NOT alone
 (−0.435 ns alone is the "poor trade" §2.1 warned about).
 
-### 2.3 🔑 The binding constraint after FETCH_REG = the commit-store front (Phase E) — NON-deferrable
-With the front end cut, the highest front is **`head → n_inflight[5]` 14.130 = the plain-store
-**commit-time MMU translate** (`commit_store_fire → AGU → dmem_vaddr → u_dmem_mmu TLB (~4 ns) →
-u_pmp_amo_w PMP (~1.5 ns) → … → rob_commit_ack → n_inflight`). Below it: `head → vrf` 13.880 (vector
-commit writeback). **Consequence: no front-end / keystone / vector work can drop CP below 14.130 —
-`n_inflight` (Phase E) is the cap.** The deep-pipeline plan defers Phase E to *last* (SMP-bound, "low
-leverage ≤1.3 ns") — but that bound was the *commit-port* tail; the **MMU-translate head** (~6 ns of
-the cone) is the real chunk and it is the **binding** front now. So the coordinated flip MUST include
-the commit-store cut. Its scaffold already exists **DEAD**: `STORE_PRETRANSLATE` (`:1612`) +
-`dmem_mmu` `o_sprobe_*` (side-effect-free store TLB probe → latch PA in the ROB at execute). The hard
-part is the **P3 commit-drain wiring** (drain the registered PA at commit instead of re-translating) —
-the earlier P3 flip broke boot (non-pre-translated cacheable stores forced to the slow M-stage → store
-loss) and was reverted. **Next structural target = re-implement the P3 commit-drain without the
-store-loss boot break**, then flip {FETCH_REG + STORE_PRETRANSLATE-P3 + vector} together. That is the
-coordinated multi-front flip; the keystone (Phase A, execute/wakeup) stays masked below it.
+### 2.3 🔑 The binding front after FETCH_REG = the VECTOR datapath (vrf), NOT the commit-store (MEASURED)
+With the front end cut, the wall is two fronts:
+- `head → n_inflight[*]` **14.130** (4 paths) = the plain-store **commit-time MMU translate**
+  (`commit_store_fire → dmem_vaddr → u_dmem_mmu TLB → u_pmp PMP → rob_commit_ack → n_inflight`).
+- `head → vrf[*]` **13.880** (**500+ paths — the dominant front**) = the **VU datapath**
+  `head → u_vu.h_vd (vector dest) → u_vrf.vrf read (old vd) → [vector compute ~8.7 ns] →
+  i_vdold_data → vrf write`. **NOT the commit-store cone** (an earlier trace misread path #5's
+  `commit_store_fire` arm; re-tracing under a crude P3 confirmed the vrf worst path is the VU
+  compute→writeback, untouched by the commit-store cut).
+
+**MEASURED — the commit-store P3 is only −0.25 ns, capped by vrf.** A crude `STORE_PRETRANSLATE` flip
+(c_pretx_fast → drain the registered `c_store_pa`, gate `store_drive_mmu` / `commit_store_sfault` /
+`sb_pa` / `sb_vm_ok`) on top of FETCH_REG cut `n_inflight` 14.130 → gone, **CP 14.130 → 13.880** — and
+vrf stayed 13.880. So the commit-store front is a 4-path adjunct worth **−0.25 ns**, exactly the §4.1
+"diminishing / capped" conclusion (`cp_commit_store_pretranslate_plan.md §4.1`); it also breaks boot
+(forced-slow path) and was reverted (not committed). **The binding front is the VU datapath.**
+
+**▶️ Corrected next high-value target = cut the VU datapath (vrf).** It is the 500+-path dominant
+front; top-500 are ALL vrf, so everything below 13.880 (incl. the keystone `rs1_rdy`) is masked by it.
+The cut is **VU writeback / compute pipelining** (`vector_unit.veryl` `o_vd_data` @2494, the VRF write,
+the `head → h_vd` commit gate — extend VINT_PIPE/VFP_PIPE; the recurring VU-datapath floor, see
+`project_heliodor_lsu_pipelining`). Cutting it exposes whatever is below (a big drop, or another dense
+layer — unmeasured). The commit-store P3 (−0.25 ns) is a minor adjunct, deferred. Coordinated-flip
+priority: **{FETCH_REG (done, DEAD) + VU-datapath (vrf) cut}**; the keystone (Phase A) stays masked
+below the VU front.
 
 ## 3. The icache sync-read scaffold (A) — methodology (SUPERSEDED by §2.2 — keep for the SRAM phase)
 
