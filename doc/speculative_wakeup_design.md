@@ -163,6 +163,54 @@ through the ALU to the readiness flop.
 > "wall masks the loop" pattern the AMO-wstrb wall just exhibited. The `EX_PIPE` scaffold
 > was reverted (premise invalid); revisit Phase A after the front end is cut.
 
+### 1.1c 🚨🚨🚨 MEASURED (2026-06-30, after FETCH_REG) — the keystone floor is the SELECT→WAKEUP LOOP, and "register the CDB" is mis-aimed a THIRD time
+
+FETCH_REG cut the front-end allocate path (§2.2 of `cp_frontend_pipeline_plan.md`). With
+`FETCH_REG=1` synth-flipped and the masking fronts read past via `--timing-paths 14000`, the
+`rs1_rdy[0]` worst path is now **12.920 ns (126 levels), sourced from `head[0]`** — it is the
+**scheduled-wakeup SELECT loop**, NOT the execute/CDB-broadcast cone:
+
+```
+head_idx[FF]
+  → (rob.veryl:741) age_i = i − head_idx  →  is_block (per ROB entry)
+  → blk_cand → pick_oldest_blk balanced-argmin tree (DEPTH 5, 32 entries) → o_block_store_age
+  → (iq_int.veryl:349) blocked = block_store_exists && (block_store_age <: age)   [load-ordering gate]
+  → ready = occupied & rs1_rdy & rs2_rdy & !blocked  →  cand0
+  → pick_oldest balanced-argmin tree (DEPTH 3, IQ_N=8)  →  issue_idx
+  → sched_wake0_pdst = sh_rd_pdst[issue_idx]  →  == sh_rs1_pdst[i]  →  rs1_rdy[i][FF].D
+```
+
+**The binding floor is TWO argmin trees in SERIES** — the ROB oldest-store-blocker scan
+(depth-5) feeding the IQ oldest-ready select (depth-3) — plus two head-relative age subtracts
+and a short wakeup tail. This is precisely the "select→wakeup→select loop" §1.1 (line 166)
+names as the ~7.5 ns *target* — and it measures **12.920**, not 7.5.
+
+**Two decisive confirmations that "register the CDB" (E1) does NOT touch it:**
+1. **Source = `head[0]`.** Only the SELECT path (age/blocked/at_head) depends on the ROB head.
+   The CDB-snoop wakeup and the allocate seed do not — so a flop on `alu_cdb` cannot shorten a
+   head-sourced path.
+2. **`SCHED_WAKEUP=0` makes `rs1_rdy` VANISH from the top-14000 (floor 11.74).** Removing the
+   scheduled-wakeup writes drops `rs1_rdy`'s worst path below 11.74 — i.e. the CDB-snoop +
+   allocate cone (the E1 lever's target) is **< 11.74**, well under the 12.920 select loop. The
+   residual head-sourced IQ endpoint is `occupied[*]` at 11.800 (the select half alone).
+
+**→ Structural conclusion (NOT a CP verdict).** Reading this by *structure* (not "which front
+is the binding synth number" — that lens is the mole-whacking 43abb9d retired): the measurement
+**decomposes the fused "Stage IE"** into its real pipeline shape. The CDB-register lever (the old
+E1 first step) targets the EXECUTE half (< 11.74), which is a **genuine, foundational stage
+boundary the deep pipe needs** — its being CP-neutral today (masked below the scheduler) is *fine*
+and expected, NOT a reason to reject it. What the measurement *adds* is that the **SCHEDULER half**
+(this 12.920 select→wakeup loop = the two serial argmin trees + the load-ordering block gate) is a
+**separate, binding pipeline stage** that the old plan under-scoped, and it is **two distinct
+problems** — the loop must close in 1 cycle (latency-speculative wakeup + replay), *and* the
+select-logic depth (~12 ns ROB block-scan + IQ argmin) exceeds the ~7.5 ns stage budget
+**independently of replay**. The keystone is therefore re-scoped into **A-EXE / A-LOOP / A-SCHED**
+(see `deep_pipeline_sram_plan.md` "The keystone (REVISED)" + the FINAL target microarchitecture);
+A-SCHED (scheduler-logic pipelining: register the ROB block-scan into its own stage, keep
+atomic/fence/cbo blockers live, lean on the existing violation→replay) is **promoted from this
+section's out-of-scope footnote to a first-class component** because it is the binding stage.
+Build A-EXE first (foundational, structure not CP); A-SCHED is the gate to ~7.5 ns.
+
 ### 1.1 What the select→wakeup→select loop is (the ~7.5 ns target)
 After the CDB is registered, the IPC-preserving floor is the single-cycle loop that
 *must* stay one cycle for back-to-back dependent ALU ops to issue 1/cycle:
@@ -258,6 +306,13 @@ A load's latency is **data-dependent**: hit = fixed (e.g. 3–4 cy), miss = unkn
 ---
 
 ## 4. Staged plan: no-replay first, replay only if the budget demands it
+
+> **Re-scope (2026-06-30, §1.1c):** this section's **A.1 = A-EXE** (execute staging) and
+> **A.2 = A-LOOP** (latency-speculative wakeup + replay). It is **missing A-SCHED** — the
+> scheduler-logic pipelining (ROB block-scan stage + IQ-argmin reduction) that the §1.1c
+> measurement showed is the binding ~12.9 ns stage. A.1/A.2 below remain valid for the
+> A-EXE/A-LOOP components; **A-SCHED is the added first-class component** (own staged plan
+> TODO). Sequencing across the three is in `deep_pipeline_sram_plan.md` "Sequencing & risk".
 
 Given the **~10–15 % IPC budget**, the design sequences the *risk* deliberately:
 

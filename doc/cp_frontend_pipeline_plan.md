@@ -139,6 +139,17 @@ keystone floor for a measurement *target* only (do not commit the side-unit cuts
 `lsu-phase1-wip` 2-stage load + LSR; mind §1.0b's CDB-register writeback-arbitration conflict). The
 vrf / commit-store cuts are deferred to post-keystone mechanical front-pipelining.
 
+**🔧 REVISED (2026-06-30, after measuring the keystone floor — `speculative_wakeup_design.md §1.1c`
++ `deep_pipeline_sram_plan.md` "The keystone (REVISED)").** Exposing the keystone floor (FETCH_REG=1
++ read past the wall) measured `rs1_rdy` = **12.920**, sourced from `head` = the **scheduler
+select→wakeup loop** (two serial argmin trees), NOT the execute/CDB cone (< 11.74). So "register the
+CDB" (the literal E1 above) is the EXECUTE half — a real, foundational stage boundary, but **not the
+binding stage** and CP-neutral today. The keystone is re-scoped into **A-EXE** (execute staging — the
+E1/E2 work here), **A-SCHED** (scheduler-logic pipelining — the binding ~12.9 ns stage, PROMOTED from
+a footnote), **A-LOOP** (latency-speculative wakeup + replay). **Build A-EXE first for the STRUCTURE
+(not a CP number); A-SCHED is the gate to ~7.5 ns.** Full revised plan + FINAL stage list in
+`deep_pipeline_sram_plan.md`.
+
 ## 3. The icache sync-read scaffold (A) — methodology (SUPERSEDED by §2.2 — keep for the SRAM phase)
 
 Mirror the proven dcache-sync-read / MEM_PIPE pattern (`DCACHE_SYNC_READ`-style):
