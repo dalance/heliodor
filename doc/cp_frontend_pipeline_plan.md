@@ -74,7 +74,48 @@ then deeper still (imem MMU ~5 ns, dmem MMU, decode/rename, vector) for the 7.5 
 multi-session deep-pipeline campaign. The icache scaffold was reverted (not worth flipping alone);
 rebuild it as part of a coordinated front-end+commit+vector flip when that effort is undertaken.
 
-## 3. The icache sync-read scaffold (A) — methodology
+### 2.2 ✅ FETCH_REG — the front-end cut, done CLEANER than icache sync-read (the FB *is* the IF/ID reg)
+The icache sync-read (§3) was the wrong tool. The fetch engine **already** has the IF/ID register:
+the **fetch buffer (FB)**. The 14.565 cone stays combinational only because of the **S17 bypass /
+S17.2 fall-through** — when the FB is empty (the common post-redirect/post-miss case) decode reads the
+**live** fetch (`if_instr_q = fb_count!=0 ? fb_instr[fb_head] : fetched_instr`, and slot-1
+`if_instr_q1 … : s1_instr`), so `pc_q → imem_mmu → icache → cexp → decode → rename` runs in one cycle.
+The `--dump-timing` trace confirms the worst path goes through the **slot-1 bypass arm**
+`icache_rdata → u_cexp1 → s1_instr → u_dec2 → rename_fire → …` — which is why the §1.25 "remove the
+bypass" experiment (−0.2 ns only) **missed it**: it dropped the *valid* (`if_v_q`) but not the mux's
+live arm, so the combinational `s1_instr → u_dec2` path survived.
+
+**`const FETCH_REG` (`heliodor_core.veryl:1218`)** structurally removes the bypass/fall-through *arms*
+(`if FETCH_REG ? fb_*[fb_head{,_p1}] : <existing S17 mux>` — const-folds: at 0 the bypass mux is
+unchanged = byte-identical, at 1 decode/rename read **only** the registered FB head). No icache change,
+no block-fetch redesign — the fetch FSM (pc_q advance, combinational icache read for RVC length /
+prediction) is **untouched**; the FB it already pushes into becomes the genuine F|D stage boundary.
+
+**MEASURED (flip = 1):** CP **14.565 → 14.130 ns** (= the icache-sync-read number, achieved without
+touching the icache), endpoint moves to `head → n_inflight[5]` (commit-store) / `head → vrf`
+(vector). Gate: default **252/0** (litmus N=2 incl), **N1 Linux boot 4/4** — the flip is functionally
+CLEAN on the first try (no straddle/redirect/slot-1 corner, because the FB already handled the
+registered path; the bypass was pure latency optimization). Committed **DEAD (=0)**, byte-identical,
+as the validated front-end stage — to be flipped in the coordinated multi-front flip, NOT alone
+(−0.435 ns alone is the "poor trade" §2.1 warned about).
+
+### 2.3 🔑 The binding constraint after FETCH_REG = the commit-store front (Phase E) — NON-deferrable
+With the front end cut, the highest front is **`head → n_inflight[5]` 14.130 = the plain-store
+**commit-time MMU translate** (`commit_store_fire → AGU → dmem_vaddr → u_dmem_mmu TLB (~4 ns) →
+u_pmp_amo_w PMP (~1.5 ns) → … → rob_commit_ack → n_inflight`). Below it: `head → vrf` 13.880 (vector
+commit writeback). **Consequence: no front-end / keystone / vector work can drop CP below 14.130 —
+`n_inflight` (Phase E) is the cap.** The deep-pipeline plan defers Phase E to *last* (SMP-bound, "low
+leverage ≤1.3 ns") — but that bound was the *commit-port* tail; the **MMU-translate head** (~6 ns of
+the cone) is the real chunk and it is the **binding** front now. So the coordinated flip MUST include
+the commit-store cut. Its scaffold already exists **DEAD**: `STORE_PRETRANSLATE` (`:1612`) +
+`dmem_mmu` `o_sprobe_*` (side-effect-free store TLB probe → latch PA in the ROB at execute). The hard
+part is the **P3 commit-drain wiring** (drain the registered PA at commit instead of re-translating) —
+the earlier P3 flip broke boot (non-pre-translated cacheable stores forced to the slow M-stage → store
+loss) and was reverted. **Next structural target = re-implement the P3 commit-drain without the
+store-loss boot break**, then flip {FETCH_REG + STORE_PRETRANSLATE-P3 + vector} together. That is the
+coordinated multi-front flip; the keystone (Phase A, execute/wakeup) stays masked below it.
+
+## 3. The icache sync-read scaffold (A) — methodology (SUPERSEDED by §2.2 — keep for the SRAM phase)
 
 Mirror the proven dcache-sync-read / MEM_PIPE pattern (`DCACHE_SYNC_READ`-style):
 - `param ICACHE_SYNC_READ: bit = 0` (DEAD = today's combinational read).
