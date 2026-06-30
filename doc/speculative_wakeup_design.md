@@ -47,9 +47,23 @@ to synth CP* until the **whole** `head → MMU → {n_inflight, valid_*}` front 
 **and** the ~128 `valid_*` dcache-fill bits together. The commit-store pre-translate P3
 experiment (`cp_commit_store_pretranslate_plan.md §4.1`) cut the plain-store `n_inflight`
 piece to 14.890 but left the `valid_*` fill front and the AMO residual standing — so the wall
-barely moved. **Cutting this wall = pre-translate plain stores (2-cycle SB push for the
+barely moved. ~~**Cutting this wall = pre-translate plain stores (2-cycle SB push for the
 non-pre-translated) + AMO pre-translate/registration + the dcache fill/invalidate fed from a
-registered PA.** Only then does `rs1_rdy` surface and the keystone's CP become measurable.
+registered PA.**~~ Only then does `rs1_rdy` surface and the keystone's CP become measurable.
+
+> ✅✅ **SUPERSEDED (2026-06-30) — the wall was ONE dead AMO signal, NOT a multi-front
+> pre-translate problem.** Tracing path #1 to the gate showed the whole `head → MMU →
+> {n_inflight, valid_*}` wall rides the AMO commit's `dmem_wstrbhi_m` arm (`core.veryl:6601`):
+> at `MEM_PIPE=1` the AMO commit already drains a registered PA (`ac_pa_q`)/write-OK
+> (`ac_wok_q`), and the ONE straggler was `dmem_wstrbhi_m`'s `amo_commit_live ? dc_st_wstrb_hi`
+> arm — and `dc_st_wstrb_hi = dc_i_wen ? st_wstrb_hi : 0` pulls the live MMU `acc_fault`
+> through `sb_vm_ok`. That single live net fed BOTH the `n_inflight` (dcache stall cone →
+> `rob_commit_ack`) and the `valid_*` (dcache fill) endpoints = the entire wall. It is
+> **functionally dead**: a committing atomic is always aligned, so `st_wstrb_hi ≡ 0`. Tying
+> the arm to `8'd0` is **byte-identical** (default 252/0, N1 boot 4/4 with 7.1 cy=01210060
+> matching baseline) and drops **15.300 → 14.565** in one line — no pre-translate, no IPC
+> cost. `rs1_rdy` now surfaces; the keystone is measurable. See
+> `cp_cut_the_wall_plan.md §7`.
 
 ### 1.0b ⚠️ The keystone's CDB-register has a writeback-arbitration conflict (naive E1 is INCORRECT)
 

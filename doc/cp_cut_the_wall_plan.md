@@ -103,3 +103,49 @@ synth CP + IPC, judged NET.
 - P1' probe: `mmu.o_sprobe_*` / `dmem_mmu.o_sprobe_*` / `store_pretx_*` (`7598185`).
 - `cp_commit_store_pretranslate_plan.md §2.1/§4.1` (the premise correction + P3 result).
 - `speculative_wakeup_design.md §1.0a/§1.0b` (the 200-path wall + CDB-register conflict).
+
+## 7. ✅✅ RESULT (2026-06-30) — the wall was ONE dead AMO signal; cut byte-identically, 15.300 → 14.565
+
+**The W1/W2/W3 pre-translate framing above was unnecessary.** Tracing the real worst path
+(`--dump-timing`) showed the 15.300 `n_inflight` endpoint (and the 14.870 `valid_*` plateau)
+does **not** ride a plain-store translation — it rides the **AMO commit's `dmem_wstrbhi_m`
+arm** (`core.veryl:6601`):
+
+```
+head → arch_regs (amocas.q compare) → commit_store_fire
+     → core_dmem_vaddr → u_dmem_mmu TLB → PMP-W → dmem_mmu_acc_fault_s
+     → sb_vm_ok → dc_i_wen → dc_st_wstrb_hi                 ← the LIVE MMU dependency
+     → [mux dmem_wstrbhi_m: amo_commit_live ? dc_st_wstrb_hi : m_wstrbhi_q]
+     → u_dcache.i_wstrb_hi → mis_active → dcache state/stall
+     → rob_commit_ack → commit_excp → n_inflight (15.300)   AND  → valid_* (14.870)
+```
+
+At `MEM_PIPE=1` the AMO commit already drains a **registered** PA (`ac_pa_q`) and a
+registered write-OK (`ac_wok_q`); the address/wen/wdata left the MMU in M3b/M4. The **one**
+straggler was `dmem_wstrbhi_m`, whose `amo_commit_live` arm still pulled the **live**
+`dc_st_wstrb_hi`. And `dc_st_wstrb_hi = dc_i_wen ? st_wstrb_hi : 0`, where `dc_i_wen` pulls
+the live MMU `acc_fault` through `sb_vm_ok`. That single live net **was the entire wall** —
+both the `n_inflight` (via the dcache stall cone → `rob_commit_ack`) and the `valid_*`
+(via the dcache fill) endpoints.
+
+**It is functionally dead.** A committing AMO/SC is ALWAYS naturally aligned (a misaligned
+atomic faults at issue, never reaching `amo_commit_live`), so `st_wstrb_hi = st_mask_ext[15:8]`
+is provably 0 (the mask never straddles a dword); amocas.q's hi dword sits in the same 64B
+line (16B-aligned) and writes via `i_wen_excl_q`/`cas_q_new_hi`, not the misaligned hi-strobe.
+So `dc_st_wstrb_hi ≡ 0` whenever `amo_commit_live`.
+
+**Fix (one line, `core.veryl:6601`):** tie the atomic arm to constant `8'd0`:
+```
+dmem_wstrbhi_m = MEM_PIPE ? (ptw_dc_active ? 0 : (amo_commit_live ? 8'd0 : m_wstrbhi_q)) : dc_st_wstrb_hi;
+```
+**Synth: 15.300 → 14.565 ns** (the whole `head → MMU → {n_inflight, valid_*}` wall drops to
+the `pc_q → rs1_rdy` keystone floor in one shot). **Byte-identical**: default `veryl test`
+252/0 (incl. litmus N2 + rv64ua), N1 boot 4/4 with **7.1 cy=01210060 matching the pre-fix
+baseline exactly**, litmus N4 + N2 SMP boot byte-identical (atomicity unaffected — only a
+provably-0 strobe changed). No pre-translate, no IPC cost, no 2-cycle SB push.
+
+**→ Consequence:** the wall is gone; `rs1_rdy` (14.565) now surfaces and the **keystone**
+(`speculative_wakeup_design.md`, the campaign's real ~80 % lever) is finally measurable on
+synth CP. W1 (plain-store pre-translate) and the P1' probe scaffold (`7598185`) are
+**unnecessary for the wall** and can be dropped or repurposed; the plain-store `n_inflight`
+front was never the headline. Next: the keystone (execute-staging / scheduled wakeup).
