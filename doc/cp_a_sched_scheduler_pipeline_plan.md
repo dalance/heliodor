@@ -188,6 +188,50 @@ budget). Methodology = the proven DEAD-gate → FF-insertion measure → bundle-
 
 ---
 
+## 6. 🚨🚨🚨 FRESH RE-ATTACK (2026-07-01) — the keystone floor is ~12.9 ns / 126 levels, NO incremental lever; 7.5 needs A-LOOP
+
+User chose "re-attack the keystone" after the vrf/dense-band finding (`cp_vrf_cut_plan.md`),
+on the hypothesis that the context had changed: the wall (commit-store/dcache/vrf) is now
+*cuttable*, so the select→wakeup loop should be the actual floor and might have a lever once
+exposed. I measured this directly by **stacking the cuts** that mask the loop and reading
+where the scheduler region lands. Four synth runs (all throwaway, reverted, tree clean):
+
+| config (FETCH_REG=1 +) | rs1_rdy / IQ-select region | masked by |
+|---|---|---|
+| baseline | rs1_rdy 12.920 (grant-gating = wall leak) | — |
+| EX_PIPE=1 (cut CDB-snoop) | rs1_rdy < top (not in top-400) | vrf 13.88 + FP `fr_*_sum_q` + the EX_PIPE `s2_cheap_fflags` 17.49 artifact |
+| + grant-gating cut (sched_wake from `has_issuable`) | rs1_rdy still masked | same |
+| **+ commit-store(STORE_PRETRANSLATE=1) + vrf(register VALU operands)** | **`head → [N][0]` 12.930 / 126 levels** (the IQ select-region nets; rs1_rdy below it) | `s2_cheap_fflags` 17.49 · mhpmcounter (351) · `fr_*_sum_q` · redirect 59 |
+
+🎯 **The keystone select→wakeup region is robustly ~12.9 ns / 126 levels** — identical to the
+original masked rs1_rdy 12.920. Cutting the *entire* wall (commit-store + vrf) + CDB-snoop +
+grant-gating did **not** drop it below ~12.9. So the "the wall was masking a short loop"
+hypothesis is **FALSE**: the loop's own logic is ~12.9 ns / 126 levels deep, and the wall
+just happened to leak in at the same height via grant-gating. The keystone is the deepest
+floor, masked under EVERYTHING (commit-store 14.13 · vrf 13.88 · FP fround · HPM · CDB-snoop
+12.32 · redirect 13.35), and it does not get shorter when they are removed.
+
+**And there is no incremental lever** (this is the load-bearing conclusion):
+- AS-b (age-matrix select) is depth-neutral (§0): the argmin is ~3 of the 126 levels.
+- AS-a (wakeup tail / dependency-matrix) is ~0.2 ns (§3): the `prf_ready` write is a few levels.
+- AS-c (grant-gating) is the wall leak, not the loop's own depth.
+- So the **126 levels are DISTRIBUTED** across the select→wakeup datapath (age-subtract,
+  cand/ready build, the per-entry rs*_rdy writes, the 2-wide alloc interplay) — no single
+  hotspot a DEAD-param cut removes. Halving it to ~75 levels / ~7.5 ns is not an incremental
+  edit; it is a **structural IQ/scheduler redesign**: a collapsing/age-ordered IQ + the
+  **A-LOOP latency-speculative wakeup + replay** (the campaign's "80 % difficulty",
+  `speculative_wakeup_design.md §5/§7`) that lets the loop be *pipelined* without losing
+  1/cycle dependent issue.
+
+🏁 **Campaign-level conclusion (data-backed, the decision gate fires):** the realistic
+achievable floor via front-cutting + a collapsed-loop is the scheduler depth **~12–12.9 ns**
+(`deep_pipeline_sram_plan.md` "If A-SCHED proves infeasible within the IPC/SMP budget, the
+realistic goal revises to the IS-stage depth (~12 ns), not 7.5 ns"). **7.5 ns is gated on the
+A-LOOP speculative-wakeup+replay redesign** — not an incremental lever, a multi-session
+megaproject with full SMP/litmus re-verification. The keystone cannot be attacked in
+isolation either: it is masked under the whole bundle, so even *measuring* a candidate lever
+needs the bundle cut first.
+
 ## 5. Anchors
 - `iq_int.veryl:324-366` cand0 build + pick_oldest age-argmin + issue_idx; `:500-503`
   sched_wake0/1; `:573-642` the rs*_rdy writes (CDB-snoop + sched_wake).
