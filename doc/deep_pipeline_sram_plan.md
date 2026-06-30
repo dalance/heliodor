@@ -75,26 +75,34 @@ first-class structural components:
 - **A-EXE — execute staging** (`FR_Q → PRF read → ALU → CDB-broadcast → wakeup`,
   **< 11.7 ns**): register the CDB / split regread|execute|writeback into stages, with a
   bypass network; the existing grant-time scheduled wakeup keeps fixed-latency dependent
-  ALU 1/cycle (no replay). A genuine, foundational stage boundary the deep pipe needs —
-  **but NOT the binding delay**: it is already *below* the scheduler, so it is CP-neutral
-  today (masked). The old plan's "Phase A register-the-CDB first" lever lives here. Lower
-  risk. Build it for the STRUCTURE, not for a CP number.
+  ALU 1/cycle (no replay). A genuine, foundational stage boundary the deep pipe needs.
+  CP-neutral *alone* (the CDB-snoop it cuts, 12.32, is masked below the sched_wake loop,
+  12.92) — **but MEASURED to be the front right behind A-SCHED**: once A-SCHED shortens the
+  loop, A-EXE cuts the surfaced CDB-snoop, so the two flip **together** (see A-SCHED). The
+  old plan's "Phase A register-the-CDB first" lever lives here. Lower risk. Scaffold E1/E2
+  committed (`4ff4b54`/`a4dc093`); the EX_PIPE=1 flip's §1.0b arbitration lands in the bundle.
 - **A-LOOP — latency-speculative wakeup + replay** (break the select→wakeup *loop*):
   the loop must close in **one cycle** for back-to-back dependent issue. Variable-latency
   producers (load hit/miss, div, fp) force the loop to wait the full deepened pipe unless
   the scheduler wakes consumers at the producer's *expected* latency and **replays** on
   misspeculation (load miss). This is the plan's original "80 % difficulty" (replay
   correctness + SMP). **But it breaks the LOOP — it does not shorten the select LOGIC.**
-- **A-SCHED — scheduler-logic pipelining** (the binding stage depth, **~12.9 ns**, was a
-  footnote — now FIRST-CLASS): the select-stage *combinational logic* is
-  `head → ROB load-ordering block-scan (depth-5 argmin, rob.veryl:741) → IQ oldest-ready
-  select (depth-3 argmin, iq_int.veryl:324) → sched_wake → rs*_rdy` — **two argmin trees
-  in series**, ~12.9 ns, which **exceeds the ~7.5 ns stage budget independently of replay**
-  (replay shortens no gate on this path; `EX_PIPE`/CDB-register touches none of it — source
-  is `head`, structurally disjoint from the execute cone). Reaching 7.5 needs this logic
-  **pipelined**: move the ROB block-scan to its own stage (register the block age, lean on
-  the existing load-store violation→replay for the rare stale plain-store window, keep
-  atomic/fence/cbo.zero blockers LIVE for SMP), and/or reduce/speculate the IQ argmin.
+- **A-SCHED — scheduler-logic shortening** (the binding stage depth, **~12.9 ns**, was a
+  footnote — now FIRST-CLASS; full design + measurements in `cp_a_sched_scheduler_pipeline_plan.md`):
+  the select→wakeup loop `head → age-subtract → IQ oldest-ready age-argmin (iq_int:358) →
+  issue_idx → wakeup-tail → rs*_rdy`. **MEASURED (throwaway probes):** the **ROB block-scan is
+  NOT the lever** (registering `o_block_store_age` = −3 levels, ~0 — *corrects* the earlier
+  "pipeline the ROB block-scan" idea), the grant-gating (→ dcache) is only −0.6 ns, and the
+  loop must be **SHORTENED, not pipelined** (pipelining the select loses ½ the dependent-issue
+  throughput and just surfaces the CDB-snoop — see below). Levers: **dependency-matrix wakeup**
+  (shorten the wakeup tail, IPC-neutral/bit-exact) + **age-ordered/collapsing IQ** (replace the
+  age-argmin with a priority-encode) + grant-gating decouple; speculative pipelined select only
+  as a last resort (co-design with A-LOOP).
+  - 🎯 **A-SCHED and A-EXE are a COORDINATED PAIR** (measured): cutting the sched_wake loop
+    (A-SCHED, 12.92) **surfaces the CDB-snoop** (`…→ execute → cdb → rs_rdy`, **12.32**), which
+    **A-EXE cuts** (register the CDB). So **A-EXE is NOT CP-neutral** — it is the front right
+    behind the loop. The bundle is **A-SCHED + A-EXE + the 13.22 IQ/RS cluster + the commit
+    wall, flipped together.** (The committed A-EXE scaffold `4ff4b54`/`a4dc093` is this front's tool.)
 
 **→ Consequence for the goal.** ~7.5 ns is reachable, **but ONLY with A-SCHED.** A-EXE and
 A-LOOP do not break A-SCHED; without A-SCHED the realistic floor (once the commit-store /
