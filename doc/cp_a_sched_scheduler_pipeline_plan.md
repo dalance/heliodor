@@ -65,30 +65,43 @@ last-resort AS-d, since it costs the replay machinery.)
 ## 3. Levers (measure-first; each a DEAD param-gate → FF-insertion → flip)
 
 The loop = `head → age-subtract → age-argmin → issue_idx → wakeup-tail → rs_rdy`, plus the
-grant-gating side input. Shorten each piece:
+grant-gating side input.
 
-- **AS-a — dependency-matrix wakeup (shorten the WAKEUP TAIL).** Today the tail is
-  `issue_idx → sh_rd_pdst[issue_idx]` (8:1 dyn-mux) `→ == sh_rs1_pdst[i]` (8× 6-bit eq)
-  `→ rs_rdy`. Precompute, from REGISTERED tags, a match matrix `M[prod_slot][cons_slot] =
-  (sh_rd_pdst[prod] == sh_rs1_pdst[cons])` in parallel (off the loop); the tail becomes
-  `wake[cons] = OR_prod (grant_onehot[prod] & M[prod][cons])` — a 1-hot AND-OR, removing the
-  dyn-mux + comparators from the loop. Classic CAM/matrix scheduler. IPC-neutral, bit-exact.
-- **AS-b — age-ordered / collapsing IQ (shorten the SELECT ARGMIN).** Today "oldest ready" is
-  an argmin over `age = rob_idx − head` (head-relative subtract on every entry + a depth-3
-  age-compare tree). If IQ entries are kept in **age order** (a collapsing/shifting queue, or
-  an age-matrix), "oldest ready" = **priority-encode of the ready bitmap** (~log N, no
-  subtract, no age-compare). The big structural change; removes the dominant select depth.
-- **AS-c — decouple the grant-gating (−0.6 ns).** `slot0_grant`→`fr_drain0`→`i_issue_ack`
-  pulls `iss_dc_ok` (dcache_stall / MMU) into the loop. Make the *wakeup* not wait on the
-  current FR op's memory verdict (the scheduled wake can fire on the argmin pick; a producer
-  that later can't drain is already covered by the `prf_done` present-guard). Small but free.
-- **AS-d — pipelined/speculative select (LAST resort).** Only if AS-a/b/c don't reach budget:
+> **🚨 Ranked by MEASURED/analyzed impact (2026-06-30) — the SELECT argmin dominates, the
+> wakeup tail does NOT.** Probe-2 (live argmin+tail, no grant-gating) = 12.320; probe-3
+> (registered select) pushed the sched_wake tail *below* the CDB-snoop floor (12.320) — i.e.
+> the tail is NOT the binding part of the loop; the **age-argmin is**. So **AS-b is the real
+> lever**; **AS-a (wakeup tail) is the SMALLEST** (~1–2 gate levels / ~0.2 ns — the matrix
+> swaps a dyn-mux+compare for an onehot+AND-OR of comparable depth, since the producer here is
+> a *slot* not a value). Do NOT start with AS-a. Order: **AS-c (free) → AS-b (the lever) →
+> AS-d (if forced)**; AS-a only as cleanup if the matrix infra is wanted for AS-d.
+
+- **AS-b — age-ordered IQ / age-matrix (shorten the SELECT ARGMIN — THE LEVER).** Today
+  "oldest ready" is an argmin over `age = rob_idx − head` (per-entry head-relative subtract +
+  a depth-3 age-compare tree). Replace with an **age-matrix** `M[i][j]=entry i older than j`
+  (8×8, REGISTERED, maintained on alloc — youngest row=0, col=occupied): then
+  `oldest_ready[i] = ready[i] && AND_{j≠i}(!ready[j] || M[i][j])` — a registered-matrix
+  AND-reduction, **removing the age-compare tree from the loop** (keep the `age` value only for
+  the `blocked` compare, which is shallow). DEAD param-gate (`AGE_MATRIX=0` → the argmin,
+  byte-identical). Must be **bit-exact to the argmin's oldest-ready pick** (SMP/load-ordering).
+  High risk: the matrix maintenance on the 2-wide alloc + the slot-1 select must match exactly.
+- **AS-c — decouple the grant-gating (−0.6 ns, measured).** `slot0_grant`→`fr_drain0`→
+  `i_issue_ack` pulls `iss_dc_ok` (dcache_stall / MMU) into the loop. Make the *wakeup* not wait
+  on the current FR op's memory verdict (fire on the argmin pick; a producer that can't drain is
+  covered by the `prf_done` present-guard). Small; ⚠️ correctness-subtle (the early-wake +
+  present-guard + FR head-of-line must be litmus/boot-validated — NOT free as first thought).
+- **AS-d — pipelined/speculative select (LAST resort).** Only if AS-b/c don't reach budget:
   register the select, speculatively wake from the live pick to keep 1/cycle, squash on
-  mis-pick. This is co-designed with **A-LOOP** (shared speculative-wakeup + poison + SMP).
+  mis-pick. Co-designed with **A-LOOP** (shared speculative-wakeup + poison + SMP).
+- **AS-a — dependency-matrix wakeup (the wakeup TAIL — SMALLEST, ~0.2 ns).** Precompute
+  `M[prod][cons]=(sh_rd_pdst[prod]==sh_rs1_pdst[cons])` off the loop; tail becomes
+  `wake[cons]=OR_prod(grant_onehot[prod] & M[prod][cons])`. Bit-exact, IPC-neutral, but the
+  measurement says it barely moves the loop (the argmin, not the tail, binds). Cleanup only.
 
-**Sequencing:** AS-a (matrix, IPC-neutral, lower risk) + AS-c (free) first; measure the
-residual; AS-b (age-ordered IQ) if the argmin still binds; AS-d only if forced. Each lands
-as a DEAD param-gate, measured by FF-insertion, flipped **in the bundle with A-EXE**.
+**Sequencing (corrected):** **AS-b (age-matrix select) is the lever** — start there. AS-c
+(grant-gating, −0.6) alongside if its present-guard correctness validates. AS-a (wakeup tail)
+is cleanup (~0.2 ns), not first. AS-d only if forced. Each lands as a DEAD param-gate, measured
+by FF-insertion, flipped **in the bundle with A-EXE** (the surfaced CDB-snoop front).
 
 ---
 
