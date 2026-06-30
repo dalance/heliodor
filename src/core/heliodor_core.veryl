@@ -1473,6 +1473,22 @@ pub module heliodor_core #(
     let ren_old_rd_pdst: logic<PRF_FP_W> = if ren_dst_is_fp ? fp_old_rd_pdst : old_rd_pdst;
     // Merged CDB (ALU and FPU are mutually exclusive: at most one valid/cycle).
     var alu_cdb: CdbBus;
+    // ============================================================
+    // A-EXE (keystone execute staging — deep_pipeline_sram_plan "The keystone
+    // (REVISED)"): register the lane-0 ALU CDB so the writeback/broadcast is driven
+    // from a flop (an EX|WB stage boundary) instead of combinationally from the FR
+    // output. Param-gated DEAD: at EX_PIPE=0 the unified mux + arbitration read the
+    // LIVE alu_cdb (today's behavior, byte-identical) and alu_cdb_q feeds nothing
+    // (synth DCEs it); at 1 they read the REGISTERED alu_cdb_q — the ALU result lands
+    // one cycle later, so dependent ALU chains need the bypass network (E2) and a
+    // registered result can lose the lane to a higher-priority FU completing the next
+    // cycle, needing the §1.0b CDB writeback-arbitration buffer (E3). E1 adds only the
+    // register + the effective-arm; alu_cdb_eff is what every arbitration/mux reader
+    // consumes (the 5 direct alu_cdb reads below, and `cdb` via the mux). Cleared on
+    // redirect_fire so a squashed op's staged result never broadcasts (dead at =0).
+    const EX_PIPE: bit = 0;
+    var alu_cdb_q: CdbBus;
+    let alu_cdb_eff: CdbBus = if EX_PIPE ? alu_cdb_q : alu_cdb;
     var fpu_cdb: CdbBus;
     // Phase 8 S10.1: deferred MSHR writeback (non-blocking load-miss fill
     // completion). Assigned in the MSHR block after the dcache instance;
@@ -2278,8 +2294,8 @@ pub module heliodor_core #(
     // loads ride lsu_cdb), so its iq_iss_fp_ld branch is dead-0 and stays as-is.
     // step-1.5: a lane-1-destined load (lsr_to_lane1) does NOT ride lane 0, so its
     // lsu_cdb arm is masked out of the lane-0 mux / dest-fp / vu-free terms here.
-    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? fpu_dest_is_fp : if mshr_cdb.valid ? 1'b0 : if int_div_cdb.valid ? 1'b0 : if alu_cdb.valid ? iq_iss_fp_ld : if (lsu_cdb.valid && !lsr_to_lane1) ? lsr_fp_ld_q : vu_cdb_fp_dest;
-    let vu_cdb_free   : logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb.valid && !(lsu_cdb.valid && !lsr_to_lane1);
+    let cdb_dest_is_fp: logic = if fpu_cdb.valid ? fpu_dest_is_fp : if mshr_cdb.valid ? 1'b0 : if int_div_cdb.valid ? 1'b0 : if alu_cdb_eff.valid ? iq_iss_fp_ld : if (lsu_cdb.valid && !lsr_to_lane1) ? lsr_fp_ld_q : vu_cdb_fp_dest;
+    let vu_cdb_free   : logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb_eff.valid && !(lsu_cdb.valid && !lsr_to_lane1);
     // rs2 operand fed to the ALU: FP store data from prf_fp, else int rs2.
     let alu_rs2_data: logic<64> = if iq_iss_fp_st ? prf_fp_store_data : prf_rs2_data;
     // P9.3 in-cache AMO: the M9.4 bus-atomic AMO lock (amo_read_pending_q /
@@ -2341,7 +2357,7 @@ pub module heliodor_core #(
         vu_cdb.fault_vaddr = vu_cdb_fault_vaddr;
     }
     always_comb {
-        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : if int_div_cdb.valid ? int_div_cdb : if alu_cdb.valid ? alu_cdb : if (lsu_cdb.valid && !lsr_to_lane1) ? lsu_cdb : vu_cdb;
+        cdb = if fpu_cdb.valid ? fpu_cdb : if mshr_cdb.valid ? mshr_cdb : if int_div_cdb.valid ? int_div_cdb : if alu_cdb_eff.valid ? alu_cdb_eff : if (lsu_cdb.valid && !lsr_to_lane1) ? lsu_cdb : vu_cdb;
     }
     // DIV/REM (incl. W variants) are routed to the multi-cycle int_divider FU
     // (below), so gate this ALU off for them — u_alu must never drive alu_cdb
@@ -2411,6 +2427,20 @@ pub module heliodor_core #(
         o_dbg_alu_instr   : dbg_alu_instr                                       ,
         o_dbg_alu_imm     : dbg_alu_imm                                         ,
     );
+
+    // A-EXE EX register: capture the lane-0 ALU CDB every cycle (the EX|WB stage
+    // boundary). Cleared on a commit-time redirect so a flushed op's staged result
+    // never broadcasts. DEAD at EX_PIPE=0 (alu_cdb_q feeds nothing → DCE); the
+    // bypass (E2) + WB-arbitration (E3) land before the EX_PIPE=1 flip.
+    always_ff (clk, rst) {
+        if_reset {
+            alu_cdb_q = '0;
+        } else if redirect_fire {
+            alu_cdb_q = '0;
+        } else {
+            alu_cdb_q = alu_cdb;
+        }
+    }
 
     // ---- Phase 0 LSU: plain-load writeback lane ----
     // u_lsu drives lsu_cdb for a slot-0 plain load under the SAME issue gate as
@@ -6937,7 +6967,7 @@ pub module heliodor_core #(
     // yield to the lane-0 occupants above lsu_cdb in the mux (fpu/mshr/int_div/alu).
     // Reads only registers (lsr_fault_*/lsr_fp_ld_q) → no comb loop with pipe-1.
     assign lsr_to_lane1 = !lsr_fault_pg_q && !lsr_fault_acc_q && !lsr_fp_ld_q;
-    let lsr_lane0_free: logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb.valid;
+    let lsr_lane0_free: logic = !fpu_cdb.valid && !mshr_cdb.valid && !int_div_cdb.valid && !alu_cdb_eff.valid;
     // Complete: a faulting load needs no read (delivers the latched fault); else the
     // Stage-B read landed. Suppressed on a squash (the writeback would hit a flushed
     // ROB entry). The read keeps driving continuously while waiting for the lane, so
@@ -7410,12 +7440,12 @@ pub module heliodor_core #(
     // (deadlock). Restrict early-mispredict to genuinely live entries: age < size.
     // (5-bit age intermediate + zero-extended compare — the inline subtraction form
     // mis-evaluates under the Veryl cc sim; see the rob.veryl squash note.)
-    let em0_age: logic<ROB_IDX_W> = alu_cdb.rob_idx - rob_head_idx;
+    let em0_age: logic<ROB_IDX_W> = alu_cdb_eff.rob_idx - rob_head_idx;
     let em1_age: logic<ROB_IDX_W> = alu_cdb2.rob_idx - rob_head_idx;
     let em0_live: logic = {3'b000, em0_age} <: rob_size;
     let em1_live: logic = {3'b000, em1_age} <: rob_size;
-    let early_mispredict0: logic = alu_cdb.valid && em0_live && rob_is_control[alu_cdb.rob_idx]
-        && (alu_cdb.redirect_pc != rob_pred_next_pc[alu_cdb.rob_idx]);
+    let early_mispredict0: logic = alu_cdb_eff.valid && em0_live && rob_is_control[alu_cdb_eff.rob_idx]
+        && (alu_cdb_eff.redirect_pc != rob_pred_next_pc[alu_cdb_eff.rob_idx]);
     let early_mispredict1: logic = alu_cdb2.valid && em1_live && rob_is_control[alu_cdb2.rob_idx]
         && (alu_cdb2.redirect_pc != rob_pred_next_pc[alu_cdb2.rob_idx]);
     let early_mispred_inc: logic<32> =
