@@ -129,6 +129,40 @@ through the ALU to the readiness flop.
 > Then the CDB-snoop path collapses to `EX_reg[Q] → compare → rs1_rdy[D]` (short),
 > and the new floor is the **select→wakeup→select loop** the FR already isolates.
 
+> 🚨🚨 **MEASURED CORRECTION (2026-06-30, after the wall cut `66c0f14`) — the above cone
+> is NOT the rs1_rdy critical path. The keystone (register the CDB) does NOT cut 14.565.**
+> Once the AMO-wstrb wall fell (15.300 → 14.565), `--dump-timing` shows the actual
+> `rs1_rdy[0]` worst path is the **FRONT-END fetch→decode→rename→allocate sweep**, not the
+> execute/broadcast/wakeup cone:
+> ```
+> pc_q[34][FF] → u_imem_mmu V=1 two-stage TLB (v1_vpn→v1_level→v1_valid→v1_hit, ~5.0 ns)
+>   → imem_paddr → u_icache hit_3 (~1.3 ns)
+>   → u_cexp (compressed-instr expand) → u_dec.opcode (DECODE, ~4.5 ns)
+>   → stall_dr → u_fl.i_pop_en (free-list pop = pdst alloc)
+>   → u_iq.i_rename_pdst2 → u_iq.prf_ready[*] → rs1_rdy[0][FF].D   (14.565 ns, 138 levels)
+> ```
+> `rs1_rdy[i]` has TWO write paths in the `iq_int` always_ff: (1) the CDB-snoop (wakeup,
+> what §1.1 analyzed) and (2) the **allocate** path that *initializes* a freshly-dispatched
+> op's `rs1_rdy` from `prf_ready` at the cycle it enters the IQ. The **allocate** path —
+> the entire single-cycle front-end from the fetch PC through the imem MMU, icache, cexp,
+> decode, rename and free-list to the IQ write — is the critical one; the CDB-snoop is far
+> shorter. EMPIRICALLY CONFIRMED: a DEAD-then-flipped `EX_PIPE` scaffold that registers
+> `alu_cdb` (the §1.1 cone) leaves `rs1_rdy` at **14.565 unchanged** (and surfaces an
+> unrelated FROUND FP cone at ~16.7 — a parallel front, plus a synth re-balance artifact).
+> So the keystone's "register the CDB" lever is mis-aimed at the current netlist.
+>
+> **→ Corrected campaign order.** The 14.565 floor is the **shallow (single-cycle) front
+> end**: `pc → imem-MMU-translate → icache → cexp/decode → rename/free-list → IQ-allocate`
+> is ONE combinational cycle (no IF/ID register). The real next lever is **Phase D /
+> front-end pipelining** — split fetch (pc→MMU→icache→raw instr, ~6.7 ns) from
+> decode/rename/allocate (~7.9 ns) with an IF/ID register, which roughly halves 14.565 to
+> ~8 ns. The imem MMU V=1 (hypervisor two-stage) TLB is the single largest chunk (~5 ns) —
+> registering the instruction-fetch translation (mirror of the dmem-side work) is the
+> highest-value sub-cut. The **execute/wakeup keystone (Phase A) stays masked** below this
+> front-end floor and becomes the lever only AFTER the front end is pipelined — same
+> "wall masks the loop" pattern the AMO-wstrb wall just exhibited. The `EX_PIPE` scaffold
+> was reverted (premise invalid); revisit Phase A after the front end is cut.
+
 ### 1.1 What the select→wakeup→select loop is (the ~7.5 ns target)
 After the CDB is registered, the IPC-preserving floor is the single-cycle loop that
 *must* stay one cycle for back-to-back dependent ALU ops to issue 1/cycle:
