@@ -420,3 +420,36 @@ trap-deferral (§9.6), folded into the coordinated bundle with vrf / the AMO W2 
 the rest — a single-front flip here is CP-neutral-to-≈0.25 ns and costs ~6 % IPC, so it is
 not worth flipping standalone.** Next concrete step toward CP: the trap-deferral, then
 measure n_inflight at FETCH_REG=1.
+
+### 9.7 Trap-deferral built + flip-measured (2026-06-30, commit `1a7178f`) — cuts to vrf 13.880, NOT AMO-capped
+
+The trap-deferral (the CP-relevant piece) is implemented DEAD (byte-identical) and
+flip-validated:
+- **It cuts n_inflight as predicted.** A throwaway (defer the live plain fault) AND the
+  real trap-deferral both give, at FETCH_REG=1 + STORE_PRETRANSLATE=1: `head → n_inflight`
+  14.130 **disappears**, top = `head → vrf` **13.880**. 🔑 **NOT AMO-capped** — §4.1's worry
+  was wrong: the AMO-wstrb wall cut (`66c0f14`) had already lowered the AMO commit-translate
+  path below vrf, so the commit-store front cleanly cuts 14.130 → vrf 13.880 (−0.25 ns). The
+  AMO W2 (P6) is **not** needed to reach vrf.
+- **Implementation** (`core.veryl`): register the store fault components m_spage_q (page,
+  cause 15) / m_sacc_q (access, cause 7) / m_gstage_q (G-stage, cause 23) alongside m_pa_q;
+  `store_xlate_dfr` = a committing plain VM store (not AMO/bare/cbo); `sfault_{pg,acc,gs}_eff
+  = store_xlate_dfr ? (store_fetched_q ? m_*_q : 0) : live`. A held store traps from the
+  registered fault at its retire cycle; pretx/mid-translate have fault 0 (clean/deferred).
+  No c_pretx_fast/commit_store_fire dependency (those are late lets; the fault is 0 in all
+  non-store_fetched_q cases, so they are unnecessary). commit_store_sacc/sfault + excp_cause
+  rewired to the _eff signals. cbo stays live (its special R-AND-W / pte-acc fault rules are
+  untouched — and cbo is rare, so its residual live path is below vrf in practice).
+- **Also fixed** a change-B flip-correctness bug: sb_2cyc_ok now excludes a MISALIGNED held
+  store (m_wstrbhi_q != 0) so it takes the M-stage 2-line write, not a (double-handling)
+  SB push.
+- **Validation (DEAD byte-identical + flip functional):** DEAD — default 252/0, N1 7.1 boot
+  cy=01210060 exact, synth CP 14.565 unchanged. FLIP — default 252/0, litmus N2 cy=0022a330,
+  and **142 ACT4 store-fault canaries PASS** (sv 70 [incl. SvaduPMP], svade 2, exceptionssv
+  10 [incl. Zaamo], pmps 60 [PMP-W S-mode]) — the precise Sv page/access + PMP-W fault tests
+  the trap-deferral most risks. Reverted to DEAD (STORE_PRETRANSLATE=0); the permanent flip
+  waits for the vrf bundle.
+- **Remaining before a permanent flip:** full ACT4 696, litmus N4, N2/N4 SMP boot, Verilator,
+  full boots, IPC (boot-cy / CoreMark / Dhrystone; ~+6 % seen on the 5.15 smoke). All folded
+  into the coordinated bundle flip (commit-store + **vrf** + front-end), since the front caps
+  at vrf 13.880 alone.
