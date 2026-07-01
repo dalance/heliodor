@@ -242,3 +242,50 @@ needs the bundle cut first.
   (A-EXE status), §5/§7 (A-LOOP replay, for AS-d).
 - Measure: `veryl synth --top heliodor_core --timing-paths N`; expose the masked loop with
   `FETCH_REG=1` (revert after — it is a committed DEAD scaffold).
+
+## 7. ✅ RE-MEASURED post-A2 (2026-07-02) — the loop is 11.79/126 lv, MASKED under a dense wall; §6's "no lever" REFINED — the 126 lv decompose, block-store scan (37 lv) is the biggest single chunk
+
+After A2 (wake-on-select, commit `6436a0d`) removed the dcache grant-gating leak, the scheduler
+select→wakeup loop is `rs1_rdy` = **11.790 ns / 126 levels** (was 12.920 pre-A2; the −1.13 is the
+dcache leaving, §11.5/§11.7). MEASURED with `FETCH_REG=1 + STORE_PRETRANSLATE=1 + LOAD_SPEC=1`
+(wake-on-select), `--timing-paths 25000` (reverted, tree clean).
+
+**A-SCHED is now MASKED, CP-neutral (a structural piece, not a synth-number mover).** The 12.0–13.4
+band above `rs1_rdy` 11.79 is NOT the select loop — it is `redirect_pc_q` (13.35), `mip` (13.33),
+`mhpmcounter/mhpmevent` (12.93), `hpm_ovf_pend` (12.86), `arch_regs` (12.68) = the **commit / CSR /
+HPM / redirect wall**, under `vrf` 13.880 + `n_inflight` (commit-store) 13.55–13.84. So §6's
+"`head → [N][0]` 12.930" was the HPM/redirect nets, NOT the loop. The loop sits ~2 ns BELOW the wall
+→ shortening it moves NO global CP until the whole commit/CSR/redirect/vrf wall is also cut (the
+bundle). Build A-SCHED for the FINAL structure (per the campaign philosophy), measured by throwaway
+FF-insertion.
+
+**126-level decomposition (rs1_rdy[0] path, grouped):**
+| segment | levels | what |
+|---|---|---|
+| **`blk_cand` (ROB block-store scan)** | **~37** | oldest unknown-addr store/fence/HSV blocker (load-ordering) → `i_block_store_age`/`_exists` → `cand0.blocked` |
+| `iss` + `win` + `cand` (argmin) | ~39 | slot-0 `pick_oldest` age-argmin (depth 3) + slot-1 `win2A/win2L` trees + cand build |
+| `prf_ready` + `rs*_rdy` write + `sched_wake` | ~14 | the wakeup tail |
+| `i_block_store_age` + misc | ~12 | age wiring into cand |
+
+**→ §6's "no incremental lever, 126 distributed" is REFINED: the block-store scan (37 lv) is the
+biggest single chunk, and §6's probe missed it** (§1.1 registered `o_block_store_age`, the OUTPUT,
+→ −3 lv; the 37 lv are INSIDE `blk_cand` + the `pick_oldest_blk` tree, feeding BOTH age and exists).
+
+**The block-store scan IS a lever (byte-exact restructure), grounded:** `rob.veryl:740-793`. Today =
+per-entry `age_i = i − head_idx` (5-bit subtract ×32) → `blk_cand[i]={is_block,age}` → depth-5
+`pick_oldest_blk` tree (each node ~7 lv: 5-bit age-compare + 3 nested muxes) = ~37 lv. The tree
+STRUCTURE is already balanced; the depth is `5 × 7`. The min-age blocker = the OLDEST (closest to
+head) blocking entry = **the first set bit of `is_block` scanning CIRCULARLY from `head_idx`**.
+Restructure: `is_block` vector (head-INDEPENDENT) → **barrel-rotate by `head_idx`** (~5 lv) →
+**priority-encode lowest set bit** (~5 lv tree) → position = `o_block_store_age`, OR-reduce = `_exists`.
+~10–15 lv vs 37 → **~22 lv (~2 ns) off the loop, BYTE-EXACT** (same oldest-blocker; `is_block` is
+unchanged, only the min-reduction is replaced by rotate+priority-encode). Load-ordering-critical →
+full ladder (default · backend-validate · **ACT4** · litmus N2/N4 · N2/N4 SMP) even though byte-exact.
+DEAD param-gate (`BLK_ROT=0` = the age-tree, byte-identical).
+
+**Remaining after the block-scan cut:** the argmin (~39 lv) — AS-b (age-matrix) is depth-neutral (§0),
+so the argmin needs a genuinely different structure (or A-SCHED accepts ~89 lv). The wakeup tail
+(~14 lv) is AS-a (small). So the realistic A-SCHED sequence is **BLK_ROT (block-scan rotate+priomux,
+−22 lv, byte-exact) FIRST** (the biggest, cleanest chunk), then re-measure the argmin as the new
+binding segment. `blk_cand` anchor: `rob.veryl:740-793` (`blk_cand`, `pick_oldest_blk`, `blk_r16..2`,
+`blk_win`, `o_block_store_age`/`_exists`).
