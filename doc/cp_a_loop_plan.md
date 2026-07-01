@@ -356,3 +356,48 @@ the FR-HoL corner) is a bundle-flip measurement.
 - Predictor detection + register: near the `sel_wake0_pdst_q` write (`:690-698`).
 - Spec-wake application: after the `SCHED_WAKEUP` block (`:659-699`), gated `SPEC_WAKE`.
 - `prf_done` present-gate (the no-replay guarantee): `:404-407` `fr0_src_done`, `:615,631`.
+
+### 10.7 ✅ MEASURED (2026-07-01) — the spec-wake lane IS shallow (CP), and the =1 flip is DEADLOCK-limited (§10.4), NOT stale-read (§10.1 holds)
+
+Throwaway flips (reverted; the committed scaffold stays DEAD). Two independent results:
+
+**CP (FF-insertion synth, `FETCH_REG=1 + SEL_PIPE=1 + SPEC_WAKE=1`, `--timing-paths
+25000`, threshold = 11.080 ns):**
+
+| endpoint | path | reading |
+|---|---|---|
+| global CP | 14.130 ns `head→n_inflight[5]` | UNCHANGED (loop masked under n_inflight/vrf) |
+| `rs1_rdy` / `rs2_rdy` | **absent** (< 11.080) | same as SEL_PIPE=1 alone → **SPEC_WAKE does NOT re-deepen the loop** |
+| `gp_wake0_pdst_q` (the spec-wake predictor reg) | **absent** (< 11.080) | the predictor stage (aw0-reg → detect + pick_oldest tree → reg) is SHALLOW |
+| `sel_wake0_en_q` | 11.200 ns (#21053) | the A1.0 stage-1 (argmin) half, unchanged |
+
+→ The grandparent spec-wake is register→compare shallow as designed (§10.3): it keeps the
+loop split (~11 ns argmin + shallow wakeup) and adds NO new deep path. Reaching ~6.5 ns
+still needs AF (shorten the ~11 ns argmin half, `§9`).
+
+**Functional (`SEL_PIPE=1 + SPEC_WAKE=1`, no FETCH_REG needed):** SEL_PIPE=1 ALONE is
+**252/0**; adding SPEC_WAKE=1 → **217/252, 35 fail**. The failures are HANGS, not wrong
+values: a failing test (`rv64ui-st_ld`) has `tohost=0` (never completed = timeout),
+litmus N=2 runs to its `cy=0x1c9c380` cap with `tohost=0`. **tohost=0 = deadlock, not a
+mis-computed result.** So:
+- **§10.1 holds** (no stale reads — every failure is a hang, never a wrong `tohost` value).
+  The `prf_done` PRESENT-hold really is airtight; a spec-woken ALU consumer never
+  mis-computes.
+- **The gating corner is exactly §10.4: the FR head-of-line DEADLOCK.** A spec-woken
+  consumer is SELECTED early, captured into the FR, and FREES its IQ slot (`iq_int:716`);
+  it then HOLDS on `prf_done[producer]`. If the producer it waits on needs that same FR
+  slot to execute (both FR slots can wedge on producers that each need the other's slot),
+  no one drains → deadlock. This is why the note deferred `=1` correctness to the bundle:
+  it needs **retain-until-confirmed** (`§5.3(a)`: do not free the IQ slot at spec-select,
+  keep it re-issuable) + a **speculation depth bound** (`§5.5`: only spec-wake when the FR
+  can drain), co-designed with Phase-F IQ growth.
+
+**Refinement landed from the measurement:** the spec-wake is now restricted to
+FIXED-LATENCY ALU-class CONSUMERS (`spec_ok` = not load/store/amo/csr/fp) — a memory-op
+consumer spec-woken breaks its issue-side-effects/ordering (measured: `lh`/`amoxor`
+failed even harder without the gate). This is the correct §10.1 scoping, but it is NOT
+sufficient alone (the deadlock is a producer/FR-slot problem, independent of consumer
+class). IPC recovery (the +1.7..8.2 % A1.0 cost) is therefore NOT yet measurable — it
+needs the §10.4 retain/bound to make `=1` boot. The scaffold (with `spec_ok`) is the
+byte-identical structural seed; the retain-until-confirmed + depth bound is the next
+sub-step, and it co-flips/SMP-validates in the bundle.
