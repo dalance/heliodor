@@ -607,3 +607,63 @@ argmin (b), then AF).
 - IPC of retain-until-confirmed (IQ occupancy ↑ → may need Phase-F IQ growth) vs. the parked
   lsu-phase1 finding that the 2-stage load was net-negative on the OLD ~25 ns wall (re-measure on
   the current floor; the negative there was mole-whacking, not the structure).
+
+### 11.5 ✅ MEASURED (2026-07-01) — the leak is TWO plain-load dcache-completion edges (BOTH slot grants), not one; cutting both → rs1_rdy 12.920→11.790, dcache GONE, argmin front (b) exposed
+
+Ran the §11.4 disambiguation (loop exposed via `FETCH_REG=1 + STORE_PRETRANSLATE=1`, `--dump-timing
+--timing-paths 25000`; committed default confirmed 14.565 before/after, tree byte-clean). #5670
+reproduced exactly: `head → rs1_rdy[0]` **12.920 / 126 lv**, and its trace matched §10.11 (commit-store
+front → `m_pa_q` → `u_dcache.i_addr` → tag/hit/miss/victim/fill/state ~6 ns → `dcache_stall` → grant →
+`prf_ready` → `rs1_rdy`). Three throwaway STA cuts (all reverted) pinned the leak:
+
+| cut | rs1_rdy | what left |
+|---|---|---|
+| — (baseline, loop exposed) | **12.920** | slot-0 grant leak visible |
+| `iss_dc_ok = 1'b1` (const) | **12.320** | slot-0 edge gone; **slot-1 edge surfaces** |
+| + `lsr_read_done = lsr_drive` (drop `!dcache_stall`) | **11.790** | **dcache GONE**; argmin front (b) surfaces |
+
+**Method correction (important):** the first attempt forced `iss_dc_ok=1` for plain loads by ORing a
+`(is_load && !is_amo)` term in — this did NOTHING to STA (12.920→12.950). In static timing, `iss_dc_ok
+= A || plain_load || (dcache term)` still has the `dcache_stall → iss_dc_ok` topological edge; ORing a
+parallel signal does not cut a path (STA follows ALL paths, blind to the fact `plain_load==1` would
+functionally mask the dcache term). To cut a path in STA you must make the signal **structurally**
+dcache-independent (const, or delete the term). The A2 RTL must likewise make the grant *structurally*
+not-in-the-dcache-cone, not merely add an override.
+
+**The two leak edges (both = the in-flight PLAIN LOAD's dcache completion gating the FR drain / grant;
+NOT AMO — AMO is head-serialized and off this path):**
+- **(a1) slot-0:** `dcache_stall → iss_dc_ok (`:2358`) → iq_issue_ack (`:2682`) → fr_drain0 →
+  fr_capture0 = slot0_grant (`iq_int:543-547`) → sched_wake0 → prf_ready → rs1_rdy`. Worth ~0.6 ns.
+- **(a2) slot-1:** `dcache_stall → lsr_read_done (`= lsr_drive && !dcache_stall`, `:7057`) → lsr_complete
+  (`:7075`) → lsr_lane1_fire (`:7076`) → issue2_fire (`= …&& !lsr_lane1_fire`, `:6913`, drives
+  `i_issue_ack2`) → fr_drain1 → fr_capture1 = slot1_grant (`iq_int:544/546/548`) → sched_wake1 →
+  prf_ready → rs1_rdy`. Worth ~0.53 ns more. This is the SLOT-1 TWIN of (a1) — the flexible lane-1
+  load-completion path (`lsr_to_lane1` = non-fault, non-FP plain load; `lsr_read_done` is its Stage-B
+  dcache read landing). **§11.2 only named slot-0 / `iss_dc_ok`/`!lsr_v_q`; the slot-1 `lsr_lane1_fire →
+  issue2_fire → fr_drain1` edge is co-equal and MUST also be decoupled.**
+
+With both cut, the residual **11.790 / 126 lv** path is dcache-free and is EXACTLY the argmin loop
+(front (b), §10.11): `iss0 argmin tree (slot-0 select) → issue_idx → cand2A build → win2A argmin tree →
+has_issuable → sh_rd_pdst → sched_wake1_pdst → prf_ready → rs1_rdy`. That is AF's target, masked under
+(a) until now.
+
+**Consequences for A2 (scope refinement):**
+1. A2 must decouple **BOTH** slot grants from the in-flight plain-load's dcache completion:
+   - slot-0: `fr_drain0`/`slot0_grant` must not wait on `iss_dc_ok` (the load-dcache term) — grant at
+     Stage-A select.
+   - slot-1: `fr_drain1`/`slot1_grant` (via `i_issue_ack2 = issue2_fire`) must not wait on
+     `lsr_lane1_fire`'s `lsr_read_done`/`dcache_stall` — the lane-1 load's grant/slot-free must fire on
+     select, retained-until-confirmed, replay on miss.
+   Retain-until-confirmed + speculative consumer wakeup + poison (§11.2) is the mechanism for both; the
+   scaffold's grant-reroute (§11.4 step) must cover slot-1 as well as slot-0.
+2. Expected A2 CP effect (loop-exposed): rs1_rdy **12.920 → ~11.790** (−1.13 ns / −8.7 %), removing the
+   dcache from the scheduler wakeup loop entirely. The **argmin front (b) at ~11.79** then becomes the
+   scheduler floor → AF (age-ordered/collapsing IQ) is the next lever after A2, exactly the A1→A2→AF
+   order. Global CP stays 13.880 (vrf) throughout — A2's win is STRUCTURAL (dcache out of the loop),
+   realized as CP only in the vrf+front-end bundle co-flip (§6), per the campaign's "advance FINAL
+   structure, not the throttling synth number" guidance.
+3. Open-Q1 answered: LSR is **1-deep** (`lsr_capture` requires `!lsr_v_q`, `:6635`), and the normal
+   ack-path block-on-issue is **AMO-only** on master (`!(lsr_v_q && iq_iss_is_amo)`, `:2682/2415` — the
+   `!lsr_v_q` comment is stale; a non-AMO ALU op DOES ack out while a load sits in the LSR via the
+   flexible lane-1 route). So the load-vs-load 1-deep block (`lsr_capture`'s `!lsr_v_q`) is the depth
+   constraint A2 must lift (retain-until-confirmed IQ, not the 1-deep LSR).
