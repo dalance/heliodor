@@ -712,3 +712,55 @@ byte-identical + synth-neutral at =0. Pieces 2 (AMO retain) and 3 (slot-1 load s
 substantive keystone work and co-flip with the retain/poison substrate. Sequence: piece 1 scaffold →
 piece 3 (load spec+poison+retain, the "80 %") → piece 2 (AMO FR-decouple) → co-flip measure (target
 rs1_rdy 12.920→~11.790, dcache out of the scheduler loop; argmin front (b) ~11.79 next → AF).
+
+### 11.7 🎉 MEASURED (2026-07-01) — WAKE-ON-SELECT collapses A2 to one change: fire the scheduled wake on has_issuable (select), not slot_grant. dcache leaves the loop, NO retain/poison/AMO-decouple needed for CP
+
+Before building the retain/poison keystone (pieces 2/3), a throwaway reframed the leak. The dcache
+reaches `rs1_rdy` because the **scheduled wakeup fires on `slot_grant`** (`sched_wake0_en = slot0_grant
+&& iss0_pipe1 && sh_has_rd`, `iq_int:580`), and `slot0_grant = fr_capture0 = has_issuable &&
+(!fr0_valid_q || fr_drain0) && !i_flush` carries `fr_drain0` (→ `i_issue_ack`/`iss_dc_ok`/dcache) and
+`slot1_grant` carries `fr_drain1` (→ `lsr_lane1_fire`/dcache). But the wake does not NEED the grant —
+it only needs the producer to be **selected** (won the argmin). Firing it on `has_issuable` /
+`has_issuable2A` (the dcache-free argmin front) instead removes `fr_drain` (hence the dcache) from the
+wake cone entirely.
+
+Throwaway (loop exposed, `FETCH_REG=1+STORE_PRETRANSLATE=1`, LOAD_SPEC=0/piece-1 dead):
+```
+sched_wake0_en = has_issuable   && iss0_pipe1 && sh_has_rd[issue_idx]    // was slot0_grant && …
+sched_wake1_en = has_issuable2A && sh_has_rd[issue_idx2]                 // was slot1_grant && has_issuable2A && …
+```
+→ **rs1_rdy 12.920 → 11.790**, **dcache GONE** (0 nodes; path = `has_issuable → sched_wake → prf_ready
+→ rs1_rdy` = the argmin front (b)). IDENTICAL to the §11.5 "both edges cut" 11.790. So wake-on-select
+achieves the FULL slot-0 + slot-1 decouple in one change — **no retain-until-confirmed, no poison
+vector, no AMO FR-decouple needed for the CP win.** Committed synth stays **14.565** (scheduler loop
+masked under the front-end at FETCH_REG=0 → CP-neutral at committed default).
+
+**Why it is correct (the A1.1 §10.1 invariant does the work):** the wake sets `rs*_rdy` EARLY, but a
+spec-woken consumer captured into the FR still HOLDS on `fr_src_done = prf_done` (the producer's REAL
+CDB broadcast) — never a stale read. And unlike A1.1's `gp_wake` (which predicts FUTURE winners and can
+wake a consumer before its producer, → the §10.4 deadlock), wake-on-select fires only off the ACTUAL
+current argmin winners; the **oldest-first argmin guarantees a producer is captured into the FR before
+its (younger) consumer**, so no consumer ever holds the FR slot its producer needs → no §10.4 deadlock.
+Flush is handled at the application layer (the `sw0`/`sw1` write is in the `else` (not-flush) branch,
+`iq_int:750/799`; the flush branch clears `sel_wake*_en_q`/`gp_wake*_en_q`), so dropping `!i_flush` from
+the comb `sched_wake*_en` is safe — the final form restores `!i_flush` anyway for clarity/parity.
+
+**Functional (raw wake-on-select, committed params):** default **252/0** (litmus N2 cy=0022a330,
+unchanged) + N1 boot 4/4, and **IPC IMPROVED** — 7.1 cy 01210060→0120d950, 7.1V 013cc5c0→012e6de0
+(−4.4 %), 6.6 unchanged. (The early wake recovers the A1.0 +1cy scheduled-wake latency for the
+FR-occupancy case.) Ladder (raw =1): **litmus N4 PASS** (cy=00532910 — the hardest ordering/contention
+stress, no deadlock, no forbidden outcome); N2/N4 SMP boots **progressing normally** (kernel PCs
+advancing, traps++, NOT hung) but timed out under box load (re-run to completion + backend-validate +
+ACT4 pending — ACT4 needs `make -C test/act`).
+
+**Committed (LOAD_SPEC=0, gated, byte-identical): `3eeef8c` sibling — this commit.** Verified DEAD-clean
+at =0: synth **14.565** UNCHANGED, default **252/0** (litmus N2 cy=0022a330), N1 boot 4/4 cycle-exact
+(smoke 00b6a5d0, 7.1 01210060, 7.1V 013cc5c0, 6.6 013ee8a0). The =1 wake-on-select is the A2 mechanism,
+validated (litmus N4 + 252/0 + N1 boots + IPC↑) — the full =1 ladder (SMP completion, backend-validate,
+ACT4) co-flips with the bundle.
+
+**Consequence for the roadmap:** A2's CP goal is met by wake-on-select alone, gated under LOAD_SPEC
+(with piece 1 as harmless subsumed groundwork — the wake no longer routes through fr_drain0). Pieces 2
+(AMO FR-decouple) and 3 (retain-until-confirmed + poison) are now **optional IPC optimisations, not
+CP-required** — the "80 % hard part" is BYPASSED for the scheduler-loop decouple. The next floor is the
+argmin front (b) ~11.79 → AF, exactly the A1→A2→AF order.
