@@ -526,3 +526,84 @@ independently forces LSU/dcache pipelining for the 7.5 target regardless of the 
 the A-LOOP "80 % hard part" (genuine load replay, SMP/litmus-sensitive) — see `speculative_
 wakeup_design.md §5/§7` + the parked `lsu-phase1-wip` (2-stage load groundwork) + `cp_dcache_
 sync_read_plan` (Phase C sync-read).
+
+## 11. A2 — decouple the LOAD grant-gating leak (user-chosen 2026-07-01, the binding front)
+
+User chose A2 (over dcache-sync-read / AF) after §10.11 identified the leak as the visible
+binding scheduler front. This section grounds the decouple in the exact code the §10.11 trace
+walks through.
+
+### 11.1 The leak, grounded (heliodor_core.veryl + iq_int.veryl)
+
+The scheduled early-wakeup is ALREADY load-excluded — `sched_wake0_en = slot0_grant &&
+iss0_pipe1 && sh_has_rd[issue_idx]` (`iq_int:557-560`), and `iss0_pipe1` excludes
+load/store/amo/csr/fp/div. So a LOAD never *produces* a sched_wake. The leak is instead the
+**GRANT itself** feeding the sched_wake of the *next* (ALU) op, through the 1-deep FR:
+- `slot0_grant = FRONT_PIPE ? fr_capture0 : …` and `fr_capture0 = has_issuable &&
+  (!fr0_valid_q || fr_drain0) && !i_flush`, with `fr_drain0 = fr0_valid_q && i_issue_ack`
+  (`iq_int:543-547`).
+- `i_issue_ack` (= core `iq_issue_ack`, `heliodor_core.veryl:2682`) is dcache-gated:
+  `(… && iss_dc_ok && … && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold)
+  || lsr_capture || mshr_capture`, and `iss_dc_ok = !iss_reads_dmem || (!replay_q &&
+  (!dcache_stall || ld0_hum_ok || dmem_mmu_acc_fault))` (`:2358`), `iss_reads_dmem = is_load ||
+  is_amo` (`:2351`).
+So when the FR occupant / current issue is a **dcache-stalling load or AMO**, `i_issue_ack=0`
+→ `fr_drain0=0` → `fr_capture0=0` → `slot0_grant=0` → the *next* op's `sched_wake0` stalls →
+`rs1_rdy` late. That is `dcache_stall → iss_dc_ok → i_issue_ack → fr_drain0 → fr_capture0 →
+slot0_grant → sched_wake0 → prf_ready → rs1_rdy` = the 126-level path. Plain loads already ack
+out via `lsr_capture` (Stage-A LSR latch, NOT dcache-gated) — but the LSR is **1-deep +
+block-on-issue** (the `!lsr_v_q`-style gates + `!iss_is_plain_load` on the normal path hold the
+IQ while a load occupies the LSR), so a stalled load in the LSR still back-pressures the drain.
+
+### 11.2 The decouple (what A2 must change)
+
+Make the **grant / FR-drain / IQ-slot-free independent of an in-flight load/AMO's
+dcache-complete**, so `slot0_grant` (hence the following ALU `sched_wake`) fires on schedule and
+the dcache leaves the loop. Reusing the A-LOOP §3 pieces:
+1. **Retain-until-confirmed IQ (§3.3)** — a load *grants* (fires `slot0_grant`, captures into the
+   LSR/FR, frees the select slot for the next op) at Stage-A **without** waiting for the dcache;
+   the entry is retained (not freed) until the load's completion is CONFIRMED (hit / fill), and a
+   miss **squashes** it (re-select). This removes the `!lsr_v_q` block-on-issue + the `iss_dc_ok`
+   drain-gate from `slot0_grant`.
+2. **Speculative consumer wakeup + poison (§3.2/§3.4)** — a load's consumers wake at
+   grant+`HIT_LATENCY` (assume hit) via the speculative tier (`speculative` bit = `ready=1,
+   done=0`, NOT `prf_done`), so they SELECT early but HOLD in the FR on `fr0_src_done` (prf_done)
+   exactly like A1.1's ALU spec-wake. On a **dcache miss** the load poisons its pdst → woken
+   consumers self-squash (transitive) → re-wake on fill. The A1.1 `prf_ready`/`prf_done` split +
+   the FR present-hold is the reusable substrate; A2 adds the **poison vector** (`PRF_N`) and the
+   **selective squash** loads (not ALU) need because their misspeculation is a real value-miss,
+   not just a pick change.
+3. **Depth bound (§3.5)** — ≤1–2 outstanding speculative loads; beyond, fall back to
+   broadcast-wake (bounds replay storms + poison fan-out).
+
+### 11.3 SMP / correctness (non-negotiable, §5/§7)
+
+- **AMO/LR/SC never speculate** — they issue at ROB head, commit single-cycle (the proven
+  +1cy-breaks-atomicity constraint). The AMO branch of the leak stays dcache-gated (rare: head-
+  serialized), so A2 targets the **plain-load** leak; the AMO residual is accepted (or a later
+  step). Keep `!(lsr_v_q && iq_iss_is_amo)` / `amo_fetch_hold` as-is.
+- **Replayed loads re-observe coherence** — a squashed load re-reads through dcache/MESI FRESH
+  (no stale Stage-B latch), re-evaluating `i_block_*` store-ordering at re-issue.
+- **The select-slot free must not deadlock** — a retained entry whose confirm never comes must be
+  bounded / released on back-pressure. Gate ladder EVERY step: default 252/0 · backend-validate ·
+  **ACT4 696** (MEM_PIPE lesson) · litmus N2/N4 · N2/N4 SMP · Verilator. Dual metric CP + IPC.
+
+### 11.4 First step (next session) + open questions
+
+**First scaffold step:** a DEAD param (`LOAD_SPEC`/`A2_PIPE`, =0 byte-identical) that (i) adds the
+per-entry `speculative` bit + the `PRF_N` poison vector regs (reset-clean, const-gated D per the
+§10.10 rule so the DEAD state is synth-neutral), and (ii) routes a plain-load grant so
+`slot0_grant`/slot-free no longer wait on `iss_dc_ok`/`!lsr_v_q` — measured by FF-insertion (loop
+exposed via `FETCH_REG=1+STORE_PRETRANSLATE=1`, the §10.11 setup) to confirm the dcache leaves
+the `rs1_rdy` path (target: the 12.920 path's ~7.3 ns dcache segment drops out; residual = the
+argmin (b), then AF).
+
+**Open questions to resolve at implementation (from the code read, not yet pinned):**
+- Exact current LSR depth/semantics in master vs. `lsu-phase1-wip` — how much 2-stage groundwork
+  (Stage-A `lsr_capture`, `lsr_v_q`, Stage-B) is already live, and whether block-on-issue is
+  full or AMO-only (`iq_issue_ack` shows `!(lsr_v_q && iq_iss_is_amo)`, comment says `!lsr_v_q`).
+- Whether the leaked `iq_issue_valid` in the trace is the AMO path or the plain-load `iss_dc_ok`
+  residual (disambiguate by a throwaway: force `iss_dc_ok=1` for plain loads and re-measure #5670).
+- IPC of retain-until-confirmed (IQ occupancy ↑ → may need Phase-F IQ growth) vs. the parked
+  lsu-phase1 finding that the 2-stage load was net-negative on the OLD ~25 ns wall (re-measure on
+  the current floor; the negative there was mole-whacking, not the structure).
