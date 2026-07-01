@@ -223,8 +223,28 @@ speculative wakeup off the LIVE pick at N (so the critical dependent is still wo
 the mispick-squash (live-pick ≠ confirmed-grant). This is §3 pieces 2/4 and is where the
 genuine speculation/replay risk lives — it co-flips and is SMP/litmus-validated in the
 coordinated bundle (§6 measurement dependency), not standalone. A1.0 is the byte-identical
-foundation it builds on. The FF-insertion synth at `SEL_PIPE=1` (this/next session) measures
-whether stage-1 (argmin+dyn-mux) is now the ~6.5 ns half it should be.
+foundation it builds on.
+
+🔑 **A1.1 mechanism — the subtlety the A1.0 measurement forces (READ THIS before implementing).**
+A1.0 split the loop UNBALANCED: `rs1_rdy` dropped 12.920 → < 11.080, but stage-1
+(argmin + ROB-block-scan + `sh_rd_pdst[pick]` dyn-mux → `sel_wake0_pdst_q`) is itself < 11.080
+— i.e. the argmin half is still ~11 ns, NOT ~6.5. So the wakeup tail was never the deep part;
+the ARGMIN is. Consequence for A1.1: the naive §3-piece-2 phrasing "speculative wakeup off the
+LIVE pick at N" does **not** recover 1/cycle *cheaply* — the live pick IS the argmin output, so
+waking off it re-introduces the full ~11 ns argmin cone into the loop (exactly the 12.9 ns path
+A1.0 just registered out). A wakeup that is BOTH 1/cycle AND shallow must be **decoupled from
+the current-cycle argmin**. Two real options (pick in the next session):
+- **Grandparent-style latency-speculative wakeup** (the classic): wake a consumer off a
+  *registered* producer-ISSUE event (the producer that granted last cycle → `sel_wake0_pdst_q`,
+  which A1.0 already registers), predicting the parent issues on schedule; confirm at the
+  parent's real grant, squash+re-wake on mispredict. Shallow (register→compare) AND keeps
+  dependent issue flowing — but the prediction can be wrong (parent's other operand not ready),
+  hence the `speculative` bit + squash + poison (→ A2 load replay reuses the same machinery).
+- **AF — collapsing / age-ordered IQ** (`§4 AF`): replace the age-argmin with a position-encoded
+  priority select so stage-1 itself drops from ~11 ns to a priority-encode. This attacks the
+  argmin depth directly rather than speculating around it. Bigger structural change.
+A1.0's `sel_wake0_pdst_q` (the registered producer pdst) is already the right hook for the
+grandparent scheme. The `speculative`/freeze/squash of §3 pieces 2/4 attach here.
 
 ## 8. Anchors
 - `iq_int.veryl:324-366` select (cand/argmin/issue_idx) · `:384-401` o_issue_* (the grant) ·
