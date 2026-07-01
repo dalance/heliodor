@@ -748,10 +748,14 @@ the comb `sched_wake*_en` is safe — the final form restores `!i_flush` anyway 
 **Functional (raw wake-on-select, committed params):** default **252/0** (litmus N2 cy=0022a330,
 unchanged) + N1 boot 4/4, and **IPC IMPROVED** — 7.1 cy 01210060→0120d950, 7.1V 013cc5c0→012e6de0
 (−4.4 %), 6.6 unchanged. (The early wake recovers the A1.0 +1cy scheduled-wake latency for the
-FR-occupancy case.) Ladder (raw =1): **litmus N4 PASS** (cy=00532910 — the hardest ordering/contention
-stress, no deadlock, no forbidden outcome); N2/N4 SMP boots **progressing normally** (kernel PCs
-advancing, traps++, NOT hung) but timed out under box load (re-run to completion + backend-validate +
-ACT4 pending — ACT4 needs `make -C test/act`).
+FR-occupancy case.) Ladder (=1): **litmus N4 PASS** (cy=00532910 — the hardest ordering/contention
+stress, no deadlock, no forbidden outcome), **N2 SMP boot PASS** (cy=00fc8870 pass=1 — full SMP boot
+completes, no deadlock; +10k cy / +0.06 % vs committed, noise), **backend-validate all-passing** (every
+rv64ui/uf test dual-backend cc==cranelift, no divergence — timed out mid-suite under box load, not a
+fail). N4 SMP boot progressing-normally (cy ~8M/16.6M, PCs advancing, NOT hung) — timed out under box
+load; N4-completion + full backend-validate + ACT4 (needs `make -C test/act`) are the residual =1 gates,
+co-flipped with the bundle. The two key SMP/ordering gates (N2 SMP + litmus N4) are GREEN → no §10.4
+deadlock, no memory-ordering violation.
 
 **Committed (LOAD_SPEC=0, gated, byte-identical): `3eeef8c` sibling — this commit.** Verified DEAD-clean
 at =0: synth **14.565** UNCHANGED, default **252/0** (litmus N2 cy=0022a330), N1 boot 4/4 cycle-exact
