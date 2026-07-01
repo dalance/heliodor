@@ -667,3 +667,48 @@ has_issuable → sh_rd_pdst → sched_wake1_pdst → prf_ready → rs1_rdy`. Tha
    `!lsr_v_q` comment is stale; a non-AMO ALU op DOES ack out while a load sits in the LSR via the
    flexible lane-1 route). So the load-vs-load 1-deep block (`lsr_capture`'s `!lsr_v_q`) is the depth
    constraint A2 must lift (retain-until-confirmed IQ, not the 1-deep LSR).
+
+### 11.6 ✅ MEASURED (2026-07-01) — the AMO residual is CO-DEEP (§11.3 "accept it" is wrong for CP); A2 must FR-decouple AMOs too + grounded implementation
+
+Follow-up STA cut (loop exposed, both slot-1 cut + slot-0 gated dcache-free for every NON-AMO op:
+`iss_dc_ok = if iq_iss_is_amo ? <orig dcache-gated> : 1'b1`): **rs1_rdy = 12.950**, dcache STILL on the
+path (61 dcache nodes; `dcache_stall → iss_dc_ok(amo branch) → iq_issue_ack → fr_drain0 → slot0_grant`).
+So keeping the AMO dcache-gated per §11.3 leaves the slot-0 grant **co-deep** — STA takes the worst
+op-type, so the AMO residual FULLY masks the plain-load decouple. **§11.3's "accept the AMO residual"
+is correct for IPC (AMOs are rare, head-serialized) but WRONG for CP/synth** (worst-case path). To move
+the scheduler floor off 12.9, A2 must cut the AMO grant path structurally too.
+
+Root cause: an AMO in `fr0` that dcache-stalls holds `fr_drain0 = 0` (it must NOT ack out — there is no
+AMO holding structure, so it stays in fr0 to re-drive its RFO), which blocks the next op's `slot0_grant`
+on the AMO's own dcache. Unavoidable with the 1-deep FR + no AMO retain. NOT a speculation problem (§11.3
+correctly bars AMO speculation) — a FR-occupancy problem.
+
+**A2 = THREE decouples, ALL required for the measured 11.790 (not "plain-load first, AMO later"):**
+1. **slot-0 plain-load** — already functionally dcache-independent (acks via `lsr_capture`, retains in
+   LSR→MSHR on miss). Pure STA artifact: `fr_drain0` uses `i_issue_ack = iq_issue_ack`, whose cone holds
+   the `iss_dc_ok` normal-path branch (= 0 for a plain load via `!iss_is_plain_load`, but STA-visible).
+   Fix: give the FR-drain a **dcache-free drain-ack** — for a load-in-fr0, drain on `lsr_capture` /
+   `mshr_capture` only, not the iss_dc_ok normal branch.
+2. **slot-0 AMO** — the new structure A2 adds: a **retain-until-confirmed FR-decouple** for AMO. The
+   AMO drains `fr0` into a Stage-B AMO-holding reg at select (freeing fr0 for the next op), is retained
+   in the IQ, and completes single-cycle at the ROB head from the holding reg (M3b `amo_fetched_q` /
+   `amo_commit_live` semantics preserved). NO consumer speculation, NO poison — the AMO result is not
+   spec-woken; only its FR-occupancy is decoupled.
+3. **slot-1 plain-load** — `fr_drain1 = fr1_valid_q && i_issue_ack2`, `i_issue_ack2 = issue2_fire`
+   gated by `lsr_lane1_fire` (dcache via `lsr_read_done`). Fix: the lane-1 load's grant / slot-free
+   fires on select, retained-until-confirmed, replay + poison on miss (the plain-load spec path).
+
+**Shared substrate (reuse A1.1):** retain-until-confirmed IQ (do not free the entry at spec-select;
+keep it re-selectable) + the plain-load **poison vector** (`PRF_N`, new) for load-consumer
+misspeculation + the A1.1 `prf_ready`/`prf_done` split + FR present-hold. AMO reuses ONLY the retain
+(no poison). Depth bound ≤1–2 outstanding spec loads (§3.5). All the SMP/litmus constraints of §11.3
+hold: AMO/LR/SC single-cycle commit unchanged, replayed loads re-observe coherence fresh.
+
+**Scaffold plan (LOAD_SPEC=0 byte-identical, any new reg's D const-gated per §10.10):** the pieces do
+NOT cleanly separate into a trivial "regs first" step (a DEAD poison vector with const-0 D just DCEs =
+dead weight). The first LANDABLE increment is the **slot-0 plain-load FR-drain re-route** (piece 1) —
+it is nearly free (loads already retain), touches only the drain-ack structure, and is independently
+byte-identical + synth-neutral at =0. Pieces 2 (AMO retain) and 3 (slot-1 load spec+poison) are the
+substantive keystone work and co-flip with the retain/poison substrate. Sequence: piece 1 scaffold →
+piece 3 (load spec+poison+retain, the "80 %") → piece 2 (AMO FR-decouple) → co-flip measure (target
+rs1_rdy 12.920→~11.790, dcache out of the scheduler loop; argmin front (b) ~11.79 next → AF).
