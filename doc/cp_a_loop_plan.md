@@ -472,4 +472,57 @@ a coordinated-bundle decision (§6). Remaining before that: ACT4 (S-mode paging)
 Verilator. **The next major CP lever is AF (age-ordered/collapsing IQ) to shorten the ~11 ns
 argmin half** — its trigger (the select half still binding after pipelining, §4) is now
 confirmed. retain-until-confirmed / A2 load replay stay deferred (only if the ALU-class
-budget or load-use demands).
+budget or load-use demands). **[SUPERSEDED by §10.11 — the visible binding scheduler front is
+the LOAD grant-gating leak (A2), not the argmin (AF); see below.]**
+
+### 10.10 ✅ A1.1 DEAD scaffold was NOT synth-CP-neutral — gp_wake reg-D gate (2026-07-01, commit `d0c2be9`)
+
+Measuring the committed default (`FETCH_REG=SEL_PIPE=SPEC_WAKE=0`, all DEAD) exposed a
+regression A1.1 (`f9f5644`) shipped: the synth #1 was **16.780 ns / 176 levels →
+gp_wake1_pdst_q**, not the documented 14.565. The predictor wrote `gp_wake{0,1}_q`
+UNCONDITIONALLY on the theory that at `SPEC_WAKE=0` the register Q is unused → the cone
+"const-folds / DCEs away". True in SIM (Q unused → byte-identical) but FALSE in `veryl synth`:
+**the synthesizer does NOT DCE an unused REGISTER, only the fanout of its Q.** So the recursive
+2-lane predictor cone (`… → rs1_rdy → cand_gp0 → gp0 argmin → cand_gp1 → gp1 argmin (the
+recursion = TWO argmins in series) → sh_rd_pdst dyn-mux → gp_wake1_pdst_q`) still drove the FF
+D — a 16.780 ns DEAD path that became the committed synth #1. Fix: gate the D with the const
+param — `gp_wake*_q = if SPEC_WAKE ? <pred> : 0`. Restores 16.780 → **14.565** (`pc_q →
+rs1_rdy`, the pre-A-LOOP floor); default 252/0, litmus N=2 cy=0022a330 (byte-identical).
+**Methodology rule for the campaign: a DEAD param-gated scaffold that adds a NEW register whose
+D-cone does not mirror a live signal is NOT synth-CP-neutral unless the D itself is const-gated.
+Sim-byte-identical is necessary but not sufficient — always synth the committed DEAD state.**
+(`sel_wake` is safe: its D = `sched_wake0_pdst`, a live signal, so its dead cone already exists.)
+
+### 10.11 🎯 MEASURED plan-revision — the binding scheduler front is the LOAD grant-gating leak (A2), NOT the argmin (AF)
+
+With the baseline clean (§10.10), the `rs1_rdy` scheduler floor was decomposed by exposing the
+loop (`FETCH_REG=1 + STORE_PRETRANSLATE=1` → #5670 `head → rs1_rdy[0]` **12.920 ns / 126 levels**,
+reproducing §9 exactly). Reading the full trace **overturns the "next = AF" assumption**: the
+126-level path is NOT the argmin/age/block-scan. It is the **DCACHE (~7.3 ns) leaking into the
+loop via grant-gating**:
+```
+head → commit_store_fire → dmem_mmu → m_pa_q → u_dcache.i_addr → [RAM Q ×2 + tag-cmp + next_hit
++ miss + victim_way + vic_dirty + fill_blocked + filling + dcache_stall]  (~3.1→10.1 ns, dcache)
+→ replay_q → iss_reads_dmem → iq_issue_valid → slot0_grant → prf_ready (dyn-mux ×8) → rs1_rdy
+```
+i.e. commit-store front (~3.1) + **dcache RAM/miss/fill/stall (~7.3)** + sched_wake tail (~2.5).
+The **argmin (cand0/iss0_win), age-subtract, and ROB block-scan (blk_win) are NOT on this path.**
+Entry-93's "126 levels distributed (age-subtract/cand/argmin)" was measured only AFTER a throwaway
+*grant-gating cut* removed exactly this leak — so there are **TWO co-equal ~12.9 ns fronts to
+`rs1_rdy`**:
+- **(a) the LOAD grant-gating leak** — `dcache_stall → iq_issue_valid → slot0_grant → sched_wake
+  → rs1_rdy`: a load's own single-cycle AGU→MMU→dcache access gates its consumers' scheduled
+  wakeup. Cured by **A2** (load speculative wakeup + replay: wake the consumer off SELECT assuming
+  load-hit, replay on miss → the dcache leaves the scheduler loop) + eventually dcache pipelining
+  (sync-read SRAM) for the ~7.3 ns blob itself. This is the **VISIBLE binding front**.
+- **(b) the argmin loop** — age-subtract + cand0 + argmin + dyn-mux + rs*_rdy write. Cured by
+  **AF** (collapsing/age-ordered IQ). MASKED under (a).
+
+**Consequence: AF alone cannot move the scheduler floor below ~12.9** — front (a) is co-binding
+and AF does not touch it. This **confirms the roadmap order A1 → A2 → AF** (not "next = AF"):
+the load grant-gating leak (A2) is the binding front and must be decoupled first; AF's argmin is
+masked under it. `dcache ~7.3 ns` (nearly the whole 7.5 budget in one combinational blob) also
+independently forces LSU/dcache pipelining for the 7.5 target regardless of the scheduler. A2 is
+the A-LOOP "80 % hard part" (genuine load replay, SMP/litmus-sensitive) — see `speculative_
+wakeup_design.md §5/§7` + the parked `lsu-phase1-wip` (2-stage load groundwork) + `cp_dcache_
+sync_read_plan` (Phase C sync-read).
