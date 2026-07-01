@@ -278,13 +278,21 @@ pub module iq_int #(
     // never a stale read. The one remaining corner (FR head-of-line block if a
     // mis-predicted producer is slow) is §10.4, deferred to the bundle co-flip.
     //
-    // DEAD at SPEC_WAKE=0: gp_wake0_*_q are written unconditionally but READ only inside
+    // DEAD at SPEC_WAKE=0: gp_wake*_*_q are written unconditionally but READ only inside
     // the `if SPEC_WAKE` block → const-folded away / DCE'd, byte-identical to A1.0.
-    // Scaffold scope = slot-0 only (§10.5); slot-1 + recursive chaining + the bound are
-    // documented next sub-steps. Flipped WITH SEL_PIPE in the coordinated bundle.
+    //
+    // §10.8 COMPLETE A1.1 (2026-07-01): TWO grandparent lanes + RECURSIVE chaining. The
+    // predictor scans entries made newly-ready by ANY of this cycle's +1cy/spec wakes
+    // {aw0, aw1 (both scheduled/sel slots), gp0, gp1 (last cycle's speculative wakes —
+    // the recursion)} and registers the OLDEST TWO ALU-producers → gp_wake0/gp_wake1.
+    // Slot-1 covers the 2-wide issue; recursion carries a dependent chain > 1 grandparent
+    // hop (a spec-woken op becomes ready → predicts the next hop). Deadlock-safe: only
+    // ALU-class producers (prod_ok, executable on EITHER FR slot) are registered (§10.8).
     const SPEC_WAKE: bit = 0;
     var gp_wake0_en_q  : logic       ;
     var gp_wake0_pdst_q: logic<PRF_W>;
+    var gp_wake1_en_q  : logic       ;
+    var gp_wake1_pdst_q: logic<PRF_W>;
 
     // DIV/REM (incl. the W variants) decode of the two alloc ops — recorded into
     // sh_is_div so the pipe-1 select can exclude them.
@@ -554,41 +562,57 @@ pub module iq_int #(
     let sched_wake1_en  : logic        = slot1_grant && has_issuable2A && sh_has_rd[issue_idx2];
     let sched_wake1_pdst: logic<PRF_W> = sh_rd_pdst[issue_idx2];
 
-    // A-LOOP A1.1 (SPEC_WAKE, cp_a_loop_plan.md §10.2): the grandparent PREDICTOR. aw0
-    // = the wake actually APPLIED to rs*_rdy this cycle (the SEL_PIPE mux, mirroring the
-    // always_ff `sw0`). An entry becomes NEWLY-FULLY-READY when aw0 wakes its last
-    // pending operand; it is then predicted to be SELECTED next cycle, so its rd_pdst is
-    // registered (gp_wake0_pdst_q) and next cycle used to pre-wake ITS consumers a cycle
-    // early. The register breaks the loop before the argmin (§10.3): at SEL_PIPE=1 aw0 is
-    // sel_wake0_pdst_q (a register), so the detection is register→compare→argmin-tree→
-    // register — no live select cone. DEAD at SPEC_WAKE=0 (feeds gp_wake0_*_q, read only
-    // in the gated block). Slot-0 only in this scaffold (§10.5).
+    // A-LOOP A1.1 (SPEC_WAKE, cp_a_loop_plan.md §10.2/§10.8): the grandparent PREDICTOR.
+    // aw0/aw1 = the SCHEDULED wakes actually APPLIED to rs*_rdy this cycle for the two
+    // issue slots (the SEL_PIPE mux, mirroring the always_ff `sw0`/`sw1`). An entry
+    // becomes NEWLY-FULLY-READY when this cycle's wakes complete its last pending operand;
+    // it is then predicted to be SELECTED next cycle, so its rd_pdst is registered and
+    // next cycle used to pre-wake ITS consumers a cycle early. The register breaks the
+    // loop before the argmin (§10.3): at SEL_PIPE=1 aw0/aw1 are registers, so the
+    // detection is register→compare→argmin-tree→register — no live select cone.
+    //
+    // §10.8 COMPLETE: the wake set also includes last cycle's SPECULATIVE wakes
+    // (gp_wake0/gp_wake1, restricted to ALU-class consumers like the application) — this
+    // is the RECURSION that carries a dependent chain > 1 grandparent hop. Registers the
+    // OLDEST TWO ALU-producers (gp_wake0 = oldest, gp_wake1 = 2nd, mirroring issue_idx /
+    // issue_idx2) so the 2-wide issue is covered. DEAD at SPEC_WAKE=0 (feeds gp_wake*_*_q,
+    // read only in the gated block; the gp-wake terms are further SPEC_WAKE-gated).
     let aw0_en  : logic        = if SEL_PIPE ? sel_wake0_en_q : sched_wake0_en;
     let aw0_pdst: logic<PRF_W> = if SEL_PIPE ? sel_wake0_pdst_q : sched_wake0_pdst;
+    let aw1_en  : logic        = if SEL_PIPE ? sel_wake1_en_q : sched_wake1_en;
+    let aw1_pdst: logic<PRF_W> = if SEL_PIPE ? sel_wake1_pdst_q : sched_wake1_pdst;
     var cand_gp0: logic<9> [IQ_N];
     always_comb {
         for i in 0..IQ_N {
-            let age      : logic<ROB_IDX_W> = sh_rob_idx[i] - i_rob_head_idx;
-            let woke0_rs1: logic            = aw0_en && occupied[i] && sh_rs1_pdst[i] == aw0_pdst;
-            let woke0_rs2: logic            = aw0_en && occupied[i] && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == aw0_pdst;
-            // Predict only off FIXED-LATENCY ALU-class PRODUCERS (§10.4 deadlock fix). A
+            let age    : logic<ROB_IDX_W> = sh_rob_idx[i] - i_rob_head_idx;
+            // consumer class the SPECULATIVE wake actually touches (matches the always_ff
+            // application) — so the recursion's readiness projection is consistent.
+            let spec_ok: logic = !sh_is_load[i] && !sh_is_store[i] && !sh_is_amo[i]
+                && !sh_is_csr[i] && !sh_fp_ld[i] && !sh_fp_st[i];
+            // rs1 woken THIS cycle by a scheduled wake (aw0/aw1) OR — for ALU consumers —
+            // by last cycle's speculative grandparent wake (gp0/gp1 = the recursion).
+            let w1_aw: logic = (aw0_en && sh_rs1_pdst[i] == aw0_pdst) || (aw1_en && sh_rs1_pdst[i] == aw1_pdst);
+            let w1_gp: logic = SPEC_WAKE && spec_ok
+                && ((gp_wake0_en_q && sh_rs1_pdst[i] == gp_wake0_pdst_q) || (gp_wake1_en_q && sh_rs1_pdst[i] == gp_wake1_pdst_q));
+            let woke_rs1: logic = occupied[i] && (w1_aw || w1_gp);
+            let w2_aw: logic = !sh_rs2_is_fp[i] && ((aw0_en && sh_rs2_pdst[i] == aw0_pdst) || (aw1_en && sh_rs2_pdst[i] == aw1_pdst));
+            let w2_gp: logic = SPEC_WAKE && spec_ok && !sh_rs2_is_fp[i]
+                && ((gp_wake0_en_q && sh_rs2_pdst[i] == gp_wake0_pdst_q) || (gp_wake1_en_q && sh_rs2_pdst[i] == gp_wake1_pdst_q));
+            let woke_rs2: logic = occupied[i] && (w2_aw || w2_gp);
+            // Predict only off FIXED-LATENCY ALU-class PRODUCERS (§10.8 deadlock fix). A
             // spec-woken consumer HOLDS the FR until prf_done[producer]; if that producer
             // is a slot-0-only memory op (load/amo/csr) OR a many-cycle div, it can wedge
-            // the FR (the consumer occupies the slot the producer needs, or holds it for
-            // ~34cy). An ALU/branch/mul producer executes on EITHER FR slot, so the
-            // consumer always drains — no wedge. This is A1.1's scope (ALU-class, no load
-            // speculation); load-producer prediction is A2 (needs replay + a depth bound).
-            let prod_ok  : logic = !sh_is_load[i] && !sh_is_store[i] && !sh_is_amo[i]
-                && !sh_is_csr[i] && !sh_fp_ld[i] && !sh_fp_st[i] && !sh_is_div[i];
-            // newly-fully-ready THIS cycle: was not already ready, is ready after aw0,
-            // and aw0 is what completed it (has_rd → its rd_pdst is a real producer).
-            let becomes  : logic = occupied[i] && sh_has_rd[i] && prod_ok && !(rs1_rdy[i] && rs2_rdy[i])
-                && (rs1_rdy[i] || woke0_rs1) && (rs2_rdy[i] || woke0_rs2) && (woke0_rs1 || woke0_rs2);
+            // the FR. An ALU/branch/mul producer executes on EITHER FR slot, so the
+            // consumer always drains — no wedge. (load-producer prediction is A2.)
+            let prod_ok: logic = spec_ok && !sh_is_div[i];
+            // newly-fully-ready THIS cycle: was not already ready, is ready after the
+            // wakes, and a wake completed it (has_rd → its rd_pdst is a real producer).
+            let becomes: logic = occupied[i] && sh_has_rd[i] && prod_ok && !(rs1_rdy[i] && rs2_rdy[i])
+                && (rs1_rdy[i] || woke_rs1) && (rs2_rdy[i] || woke_rs2) && (woke_rs1 || woke_rs2);
             cand_gp0[i] = {becomes, age, i as IQ_W};
         }
     }
-    // pick the OLDEST newly-ready entry (reuse the pick_oldest argmin tree) → its rd_pdst
-    // is the grandparent prediction to register.
+    // pick the OLDEST newly-ready ALU producer (lane 0) via the pick_oldest argmin tree.
     let gp0_a0  : logic<9> = pick_oldest(cand_gp0[0], cand_gp0[1]);
     let gp0_a1  : logic<9> = pick_oldest(cand_gp0[2], cand_gp0[3]);
     let gp0_a2  : logic<9> = pick_oldest(cand_gp0[4], cand_gp0[5]);
@@ -599,6 +623,24 @@ pub module iq_int #(
     let gp0_idx : logic<IQ_W>  = gp0_win[2:0];
     let gp_wake0_en  : logic        = gp0_win[8];
     let gp_wake0_pdst: logic<PRF_W> = sh_rd_pdst[gp0_idx];
+    // §10.8 lane 1: the 2nd-oldest newly-ready ALU producer (mask lane-0's pick), so the
+    // 2-wide issue has both grandparents. Mirrors the issue_idx2 second-pick pattern.
+    var cand_gp1: logic<9> [IQ_N];
+    always_comb {
+        for i in 0..IQ_N {
+            cand_gp1[i] = if gp_wake0_en && ((i as IQ_W) == gp0_idx) ? 9'd0 : cand_gp0[i];
+        }
+    }
+    let gp1_a0  : logic<9> = pick_oldest(cand_gp1[0], cand_gp1[1]);
+    let gp1_a1  : logic<9> = pick_oldest(cand_gp1[2], cand_gp1[3]);
+    let gp1_a2  : logic<9> = pick_oldest(cand_gp1[4], cand_gp1[5]);
+    let gp1_a3  : logic<9> = pick_oldest(cand_gp1[6], cand_gp1[7]);
+    let gp1_b0  : logic<9> = pick_oldest(gp1_a0, gp1_a1);
+    let gp1_b1  : logic<9> = pick_oldest(gp1_a2, gp1_a3);
+    let gp1_win : logic<9> = pick_oldest(gp1_b0, gp1_b1);
+    let gp1_idx : logic<IQ_W>  = gp1_win[2:0];
+    let gp_wake1_en  : logic        = gp1_win[8];
+    let gp_wake1_pdst: logic<PRF_W> = sh_rd_pdst[gp1_idx];
 
     // Phase 8 S4b: intra-bundle RAW. When slot-1 (the younger op of a 2-wide
     // rename bundle) sources slot-0's just-renamed int dest, the core's rename
@@ -658,9 +700,11 @@ pub module iq_int #(
             sel_wake0_pdst_q = 6'd0;
             sel_wake1_en_q   = 1'b0;
             sel_wake1_pdst_q = 6'd0;
-            // A-LOOP A1.1 (SPEC_WAKE): the grandparent predictor starts empty.
+            // A-LOOP A1.1 (SPEC_WAKE): the grandparent predictors start empty.
             gp_wake0_en_q   = 1'b0;
             gp_wake0_pdst_q = 6'd0;
+            gp_wake1_en_q   = 1'b0;
+            gp_wake1_pdst_q = 6'd0;
         } else if i_flush {
             for i in 0..IQ_N {
                 occupied[i] = 1'b0;
@@ -675,8 +719,9 @@ pub module iq_int #(
             sel_wake0_en_q = 1'b0;
             sel_wake1_en_q = 1'b0;
             // A-LOOP A1.1 (SPEC_WAKE): a flushed producer must not spec-wake a
-            // (now-cleared) consumer next cycle. Clearing the enable suffices.
+            // (now-cleared) consumer next cycle. Clearing the enables suffices.
             gp_wake0_en_q = 1'b0;
+            gp_wake1_en_q = 1'b0;
             // PRF-ready bitmap state survives flush — recovery_fire on
             // free_list reclaims squashed pdsts; the ready bits on those
             // reclaimed pdsts remain whatever they were (the next rename
@@ -783,7 +828,7 @@ pub module iq_int #(
             // mis-predicted consumer's PRESENT stays gated by the FR fr0_src_done
             // (prf_done = real broadcast): it SELECTs early then HOLDs, never stale-reads
             // (§10.1, ALU class = no replay). DEAD at SPEC_WAKE=0 (block removed).
-            if SPEC_WAKE && gp_wake0_en_q {
+            if SPEC_WAKE {
                 for i in 0..IQ_N {
                     // A1.1 speculation is restricted to FIXED-LATENCY ALU-class CONSUMERS
                     // (§10.1). A memory-op consumer (load/store/amo/csr/fp) must NOT be
@@ -795,19 +840,28 @@ pub module iq_int #(
                     // prf_done, so they are the only ones woken early.
                     let spec_ok: logic = !sh_is_load[i] && !sh_is_store[i] && !sh_is_amo[i]
                         && !sh_is_csr[i] && !sh_fp_ld[i] && !sh_fp_st[i];
-                    if occupied[i] && spec_ok && sh_rs1_pdst[i] == gp_wake0_pdst_q {
+                    // §10.8: apply BOTH grandparent lanes (gp0 = oldest, gp1 = 2nd-oldest
+                    // newly-ready producer) so the 2-wide issue's two producers both
+                    // pre-wake their consumers a cycle early.
+                    let m1: logic = (gp_wake0_en_q && sh_rs1_pdst[i] == gp_wake0_pdst_q)
+                        || (gp_wake1_en_q && sh_rs1_pdst[i] == gp_wake1_pdst_q);
+                    let m2: logic = (gp_wake0_en_q && sh_rs2_pdst[i] == gp_wake0_pdst_q)
+                        || (gp_wake1_en_q && sh_rs2_pdst[i] == gp_wake1_pdst_q);
+                    if occupied[i] && spec_ok && m1 {
                         rs1_rdy[i] = 1'b1;
                     }
-                    if occupied[i] && spec_ok && !sh_rs2_is_fp[i] && sh_rs2_pdst[i] == gp_wake0_pdst_q {
+                    if occupied[i] && spec_ok && !sh_rs2_is_fp[i] && m2 {
                         rs2_rdy[i] = 1'b1;
                     }
                 }
             }
-            // A-LOOP A1.1 (SPEC_WAKE): register the grandparent predictor (the comb
-            // detection above the always_ff). Written unconditionally; DEAD at
-            // SPEC_WAKE=0 (read only in the gated block above → DCE).
+            // A-LOOP A1.1 (SPEC_WAKE): register the two grandparent predictors (the comb
+            // detection above the always_ff). Written unconditionally; DEAD at SPEC_WAKE=0
+            // (read only in the gated block above → DCE).
             gp_wake0_en_q   = gp_wake0_en;
             gp_wake0_pdst_q = gp_wake0_pdst;
+            gp_wake1_en_q   = gp_wake1_en;
+            gp_wake1_pdst_q = gp_wake1_pdst;
             // Rename clears prf_ready[new_pdst] so subsequent renames
             // that depend on it see "not ready" until producer writes back.
             if i_rename_set_pending {

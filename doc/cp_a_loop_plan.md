@@ -434,8 +434,42 @@ scope (ALU-class, no load speculation → A2). div is excluded too (many-cycle �
 N2/N4 + N1 boots + N2 SMP). The predictor-ALU restriction avoids the *measured* deadlock and
 the ordering argument suggests it cannot wedge; **retain-until-confirmed (§5.3a) remains the
 rigorous belt-and-suspenders** for any rarer FR-HoL corner and is co-designed with Phase-F
-IQ growth. Remaining before a PERMANENT flip: ACT4 (S-mode paging), N4 SMP, Verilator; and
-the CP benefit is still MASKED (global CP 14.130, loop under n_inflight/vrf) so the permanent
-flip pays the ~+4% IPC for zero *measured* CP until the coordinated bundle cuts the masking
-fronts (§6). The scaffold stays DEAD-committed; slot-1 + recursive chaining is the next
-sub-step to close the IPC recovery.
+IQ growth.
+
+### 10.9 ✅ A1.1 COMPLETE (2026-07-01) — TWO lanes + RECURSIVE chaining; 6.6 IPC recovered ~82 %
+
+Extended the single-slot-0 hop to the full mechanism: the predictor now scans entries made
+newly-ready by ALL of this cycle's +1cy/spec wakes — `{aw0, aw1}` (both scheduled/sel slots)
+PLUS last cycle's speculative `{gp0, gp1}` (the RECURSION, gated to ALU consumers like the
+application) — and registers the **OLDEST TWO** ALU-producers `gp_wake0`/`gp_wake1`
+(mirroring `issue_idx`/`issue_idx2`); the spec-wake applies BOTH lanes. slot-1 covers the
+2-wide issue; recursion carries a dependent chain > 1 grandparent hop. Still ALU-producer-only
+(`prod_ok`), so the §10.8 deadlock-safety holds unchanged.
+
+**MEASURED (`SEL_PIPE=1 + SPEC_WAKE=1`, 2-lane + recursive):**
+- **Functional ladder green** (deadlock-free): default **252/0** · litmus N=2 pass
+  (`cy=0022a330`, now baseline-exact) · litmus N=4 pass (`cy=0x530200`) · N1 boots pass ·
+  **N2 SMP pass** (`cy=0x00fe3620`).
+- **CP still shallow** (FF-insertion synth, FETCH_REG=1): `gp_wake*` / `rs1_rdy` / `rs2_rdy`
+  all **absent < 11.080** (the recursion + slot-1 add no deep path), global CP 14.130 unchanged.
+- **IPC — the recovery largely closed:**
+
+  | boot | baseline | A1.0 | A1.1 slot-0 | **A1.1 2-lane+rec** | recovered |
+  |---|---|---|---|---|---|
+  | 6.6 | 0x13ee8a0 | 0x1590050 (+8.2%) | 0x14ccb50 (+4.35%) | **0x1437c80 (+1.44%)** | **~82 %** |
+  | 7.1-V | 0x13cc5c0 | 0x1421cf0 (+1.7%) | 0x1404830 (+1.1%) | **0x1406f40 (+1.15%)** | ~31 % |
+  | 7.1 | 0x1210060 | 0x1265790 (+1.85%) | 0x1265790 (0%) | **0x124f800 (+1.37%)** | ~26 % |
+
+  The heavy dependent-chain case (6.6) drops from +8.2 % to **+1.44 %** — the keystone's
+  1/cycle recovery is now essentially complete. Residuals are all ≤ +1.44 %, comfortably
+  inside the ~10-15 % campaign budget.
+
+**Status:** A1.1 (the grandparent speculative wakeup — the keystone's 1/cycle recovery) is
+FUNCTIONALLY COMPLETE and ladder-validated (default + litmus N2/N4 + N1 boots + N2 SMP) and
+its CP/IPC measured. Scaffold stays DEAD-committed (`SPEC_WAKE=0` byte-identical). The CP
+benefit is still MASKED (global CP 14.130, loop under n_inflight/vrf) — the PERMANENT flip is
+a coordinated-bundle decision (§6). Remaining before that: ACT4 (S-mode paging), N4 SMP,
+Verilator. **The next major CP lever is AF (age-ordered/collapsing IQ) to shorten the ~11 ns
+argmin half** — its trigger (the select half still binding after pipelining, §4) is now
+confirmed. retain-until-confirmed / A2 load replay stay deferred (only if the ALU-class
+budget or load-use demands).
