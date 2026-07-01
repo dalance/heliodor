@@ -253,3 +253,106 @@ grandparent scheme. The `speculative`/freeze/squash of §3 pieces 2/4 attach her
 - `speculative_wakeup_design.md §4` (no-replay-first staging), `§5` (replay mechanism), `§6`
   (latency tiers), `§7` (SMP). `cp_a_sched_scheduler_pipeline_plan.md §6` (the 126-level
   measurement — why pipeline not shorten). A-EXE: `heliodor_core.veryl EX_PIPE` + §1.0b.
+
+## 10. A1.1 design — grandparent speculative wakeup (the 1/cycle recovery), grounded
+
+User chose the **grandparent** option (2026-07-01, over AF collapsing-IQ) as the A1.1
+mechanism. This section is the code-grounded design; the scaffold is `SPEC_WAKE` in
+`iq_int.veryl`.
+
+### 10.1 The key simplification the A1.0 code already gives us (why ALU-class needs NO replay)
+
+`speculative_wakeup_design.md §6.1` + the existing FR: heliodor **already** does
+"speculative select, confirmed present, no replay." A consumer selected off the SCHEDULED
+wake is captured into the FR and its PRESENT is gated by `fr0_src_done = prf_done[sources]`
+(`iq_int.veryl:404-407`). `prf_done[P]` is set ONLY at P's REAL CDB broadcast
+(`:615,631`), never at a scheduled/speculative wake. So a consumer that was woken
+early **cannot read a stale operand** — if its producer has not really executed, the FR
+simply **holds** it (does not present). This is the whole no-replay guarantee, and it is
+INDEPENDENT of *how* `rs*_rdy` got set. Consequence:
+
+> **For the ALU/fixed-latency class, grandparent mis-speculation is resolved by HOLD
+> (FR + `prf_done`), not by squash/replay.** Waking a consumer early off a wrong
+> grandparent prediction only makes it *select* early; the FR holds it until the producer
+> truly executes. No stale read, no poison, no re-issue. The poison/squash machinery of
+> `§5` is for the LOAD class (A2), where a load MISS makes an *already-presented* operand
+> genuinely garbage. A1.1 (ALU) does not need it.
+
+### 10.2 The mechanism (grandparent = register the newly-ready op's pdst one cycle early)
+
+The A1.0 loop split is UNBALANCED: `rs1_rdy` dropped 12.9→<11.08 but stage-1
+(argmin + `sh_rd_pdst[pick]` dyn-mux → `sel_wake0_pdst_q`) is still ~11 ns, and the
+registered wake lands one cycle LATE (the +1.7..8.2 % IPC). The recovery must wake the
+consumer BOTH 1/cycle AND shallow → decoupled from the current-cycle argmin (`§9`).
+
+Timeline of a dependent ALU chain `O → P → C → D` (all in the IQ), SEL_PIPE=1+SPEC_WAKE=1:
+```
+T-2: O selected. sched_wake0(O) → registered → sel_wake0_pdst_q at T-1.
+T-1: apply sel_wake0_pdst_q = O.pdst → wake P (P now fully ready).
+     DETECT: P became newly-fully-ready via this wake → register P.rd_pdst → gp_wake0_pdst_q at T.
+T  : apply sel_wake0_pdst_q = P.pdst (conservative, P selected T-1) → wake C.
+     apply gp_wake0_pdst_q = P.rd_pdst (SPECULATIVE grandparent) → ALSO wake C, one cycle EARLIER
+        than the conservative wake would alone → C ready at T (not T+1).   ← the recovered cycle
+     DETECT: C newly-ready → register C.rd_pdst → gp_wake0_pdst_q at T+1.
+T+1: C selected. apply gp_wake0_pdst_q = C.rd_pdst → wake D early. …chain self-sustains 1/cycle.
+```
+The chain **primes itself**: once any op is scheduled-woken, the grandparent register
+carries the prediction forward so every subsequent op in the chain is spec-woken 1/cycle.
+Only the chain's ENTRY op (whose producer was not scheduled-woken — e.g. a load/div CDB
+broadcast, or a long-ago producer) still eats A1.0's +1cy. For tight ALU chains (the 6.6
+boot's +8.2 % case) that recovers nearly all of it.
+
+The **predictor** = "an entry made NEWLY-FULLY-READY by this cycle's applied wake":
+```
+becomes_ready0[i] = occupied[i] && sh_has_rd[i] && !(rs1_rdy[i] && rs2_rdy[i])
+                 && (rs1_rdy[i] || woke0_rs1[i]) && (rs2_rdy[i] || woke0_rs2[i])
+                 && (woke0_rs1[i] || woke0_rs2[i])
+```
+where `woke0_rs*[i]` = the applied conservative wake (`aw0 = SEL_PIPE ? sel_wake0_*_q :
+sched_wake0_*`) matches entry i's rs*. Pick the OLDEST such i (reuse the `pick_oldest`
+argmin tree over `{becomes_ready0[i], age, i}`) → `gp_wake0_pdst = sh_rd_pdst[that i]`,
+registered → `gp_wake0_pdst_q`. The prediction is "that op (now ready) is selected next
+cycle"; the grandparent wake pre-wakes ITS consumers a cycle early.
+
+### 10.3 Why the spec wake is shallow (the CP claim to FF-measure)
+
+- **Predictor stage** (cycle T): `aw0 (register/live) → becomes_ready0 compare + pick_oldest
+  tree (depth 3) → gp_wake0_pdst_q (register)`. Bounded, registered out — NOT the argmin.
+- **Spec-wake stage** (cycle T+1): `gp_wake0_pdst_q (register) → per-entry compare →
+  rs*_rdy write`. Register→compare, identical depth to A1.0 stage-2. Shallow.
+Neither stage contains the age-argmin/select cone, so the loop stays split at ~½ each
+(the FF-measure question: does `rs1_rdy` stay < 11 ns AND does the boot-cy +1cy recover?).
+
+### 10.4 The one remaining corner (deferred to the bundle co-flip, per §6)
+
+`prf_done`-hold is airtight for stale reads, but a spec-woken consumer selected early
+**occupies an FR slot** while it holds. If its (mis-predicted) producer is slow to be
+re-selected, the FR slot is head-of-line-blocked → a THROUGHPUT loss, and — if BOTH FR
+slots wedge on producers that each need the other's slot — a potential DEADLOCK. The
+resolution is `§5.3(a)` retain-until-confirmed + `§5.5` a speculation depth bound (only
+spec-wake when the FR can drain), co-designed with Phase-F IQ growth. Per `§6` this is
+validated at the coordinated bundle flip (SMP/litmus), not standalone. The scaffold builds
+the byte-identical structure; the bound/retain is the next sub-step.
+
+### 10.5 Scaffold scope (`SPEC_WAKE`, DEAD = byte-identical) and deferrals
+
+**In the scaffold (this increment):** slot-0 grandparent predictor register
+(`gp_wake0_{en,pdst}_q`) + the `becomes_ready0` detection + the slot-0 speculative-wake
+application lane, all gated `if SPEC_WAKE` (const 0). Byte-identical proof = A1.0's: the
+new registers are written unconditionally from comb detection but READ only inside the
+`if SPEC_WAKE` block → const-folded away / DCE'd at =0; `rs*_rdy` and all outputs are
+unaffected. The spec-wake sets `rs*_rdy` for EXISTING entries only (no `prf_ready` seed of
+new renames, no `prf_done` — PRESENT stays gated by the real broadcast).
+
+**Deferred (documented next sub-steps):** (1) slot-1 grandparent (mechanical mirror of
+slot-0 off `sw1`/`sched_wake1`); (2) recursive spec→spec chaining (register newly-ready
+detected off the spec-wake too, not just the conservative wake) for chains longer than one
+grandparent hop; (3) `rs*_spec` per-operand bits + the FR-HoL bound/retain (§10.4); (4)
+the A2 load poison/replay. The scaffold is the structural seed; correctness of `=1` (incl.
+the FR-HoL corner) is a bundle-flip measurement.
+
+### 10.6 Anchors (A1.1)
+- Applied conservative wake `aw0`: mirror of `iq_int.veryl:664-667` `sw0` at module level.
+- Predictor detection + register: near the `sel_wake0_pdst_q` write (`:690-698`).
+- Spec-wake application: after the `SCHED_WAKEUP` block (`:659-699`), gated `SPEC_WAKE`.
+- `prf_done` present-gate (the no-replay guarantee): `:404-407` `fr0_src_done`, `:615,631`.
