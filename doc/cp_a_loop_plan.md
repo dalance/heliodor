@@ -397,7 +397,45 @@ FIXED-LATENCY ALU-class CONSUMERS (`spec_ok` = not load/store/amo/csr/fp) — a 
 consumer spec-woken breaks its issue-side-effects/ordering (measured: `lh`/`amoxor`
 failed even harder without the gate). This is the correct §10.1 scoping, but it is NOT
 sufficient alone (the deadlock is a producer/FR-slot problem, independent of consumer
-class). IPC recovery (the +1.7..8.2 % A1.0 cost) is therefore NOT yet measurable — it
-needs the §10.4 retain/bound to make `=1` boot. The scaffold (with `spec_ok`) is the
-byte-identical structural seed; the retain-until-confirmed + depth bound is the next
-sub-step, and it co-flips/SMP-validates in the bundle.
+class).
+
+### 10.8 ✅ DEADLOCK FIXED (2026-07-01) — restrict the PREDICTOR to ALU-class producers; =1 now boots + IPC partially recovered
+
+The §10.4 FR head-of-line deadlock has a specific single root, found by the ordering
+argument: argmin is oldest-first, so **a producer is always OLDER than its consumer and is
+selected first**; a pure dependency chain drains from its (executed) root and cannot wedge.
+The one wedge is a consumer spec-woken off a **slot-0-only producer** (load/amo/csr) — the
+consumer holds `fr0` waiting `prf_done[producer]`, but that producer needs `fr0` to execute
+→ neither drains. An **ALU/branch/mul producer runs on EITHER FR slot**, so the consumer
+always drains (the producer takes the other slot). Fix = gate the predictor `becomes_ready0`
+with `prod_ok` (the `pipe1_ok` set: not load/store/amo/csr/fp/div). This is exactly A1.1's
+scope (ALU-class, no load speculation → A2). div is excluded too (many-cycle → long FR hold).
+
+**MEASURED (`SEL_PIPE=1 + SPEC_WAKE=1`, predictor+consumer both ALU-gated):**
+- **Deadlock GONE, full functional ladder green:** default **252/0** · litmus N=2 **pass**
+  (`cy=0022f150`) · litmus **N=4 pass** (`cy=0x530200`) · N1 boots 7.1/7.1-V/6.6 all pass ·
+  **N2 SMP boot pass** (`cy=0x00fef970`). The spec-wake touches only ALU dependency wakeups,
+  never the memory-ordering path, so SMP/litmus are unaffected (confirmed).
+- **IPC partially recovered** (boot cy, vs A1.0 = SEL_PIPE=1/SPEC_WAKE=0):
+
+  | boot | baseline | A1.0 | A1.1 | A1.1 residual | recovered |
+  |---|---|---|---|---|---|
+  | 7.1 | 0x1210060 | 0x1265790 (+1.85%) | 0x1265790 | +1.85 % | 0 % |
+  | 7.1-V | 0x13cc5c0 | 0x1421cf0 (+1.7%) | 0x1404830 | +1.1 % | ~34 % |
+  | **6.6** | 0x13ee8a0 | 0x1590050 (**+8.2%**) | 0x14ccb50 | **+4.35 %** | **~47 %** |
+
+  The grandparent recovers ~half of the heavy dependent-chain case (6.6). It is a SINGLE
+  slot-0 hop, so it does not recover everything: the rest is the deferred **slot-1
+  grandparent** (mirror off `sw1`) + **recursive spec→spec chaining** (register newly-ready
+  detected off the spec-wake, for chains > 1 grandparent hop). 7.1 recovers 0 % — its small
+  +1.85 % is not the ALU-chain kind the single-hop grandparent covers.
+
+**Status:** the `=1` flip is now FUNCTIONALLY VIABLE and ladder-validated (default + litmus
+N2/N4 + N1 boots + N2 SMP). The predictor-ALU restriction avoids the *measured* deadlock and
+the ordering argument suggests it cannot wedge; **retain-until-confirmed (§5.3a) remains the
+rigorous belt-and-suspenders** for any rarer FR-HoL corner and is co-designed with Phase-F
+IQ growth. Remaining before a PERMANENT flip: ACT4 (S-mode paging), N4 SMP, Verilator; and
+the CP benefit is still MASKED (global CP 14.130, loop under n_inflight/vrf) so the permanent
+flip pays the ~+4% IPC for zero *measured* CP until the coordinated bundle cuts the masking
+fronts (§6). The scaffold stays DEAD-committed; slot-1 + recursive chaining is the next
+sub-step to close the IPC recovery.
