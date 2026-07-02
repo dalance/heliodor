@@ -289,3 +289,33 @@ so the argmin needs a genuinely different structure (or A-SCHED accepts ~89 lv).
 −22 lv, byte-exact) FIRST** (the biggest, cleanest chunk), then re-measure the argmin as the new
 binding segment. `blk_cand` anchor: `rob.veryl:740-793` (`blk_cand`, `pick_oldest_blk`, `blk_r16..2`,
 `blk_win`, `o_block_store_age`/`_exists`).
+
+### 7.1 ✅ IMPLEMENTED + MEASURED (2026-07-02) — BLK_ROT rotate + native priority-encode, rs1_rdy 11.79→10.00 (−1.79 ns), BYTE-EXACT
+
+`rob.veryl` `const BLK_ROT`: `is_block_vec` (head-independent, collected in the existing blk_cand
+loop) → barrel-rotate RIGHT by `head_idx` (`{is_block_vec,is_block_vec} >> head_idx`, age-indexed) →
+isolate the lowest set bit (`x & -x`) → binary-encode via masked OR-reductions (`{|(&FFFF0000),
+|(&FF00FF00), |(&F0F0F0F0), |(&CCCCCCCC), |(&AAAAAAAA)}` for ROB_DEPTH=32) = `o_block_store_age`;
+`|is_block_vec` = `_exists`. The outputs mux `if BLK_ROT ? <rotate> : <blk_win age-tree>`.
+
+**First tried `clz::<32>(reverse(blk_age_vec))`** (the MMU pattern) → measured rs1_rdy 11.79→**11.080**
+(−0.71, block-scan 37→~29 lv): `clz::<W>` top-justifies to 256 bits and runs `clz256` (~24 lv), too
+deep. **Switched to the native 32-bit `x&-x` + masked-OR priority-encode** (~12 lv) → rs1_rdy
+11.79→**10.000 / 108 lv** (−1.79 ns, block-scan no longer the worst segment; the new rs1_rdy worst is
+`sh_csr_addr → argmin`). (`clz` generic can't take the module param `ROB_DEPTH` —
+`unresolvable_generic_expression`; the native encode also avoids that + the fpu_pkg import.)
+
+**BYTE-EXACT verified:** the oldest blocker (min age) = the first set `is_block` bit circularly from
+head = the lowest set bit of the head-rotated vector — identical to the age-tree's min. default
+**252/0** at BOTH BLK_ROT=0 and =1 (litmus N2 cy=0022a330 unchanged). Committed synth **14.565
+unchanged** at =1 (the block-scan→rs1_rdy loop is masked under the front-end). So BLK_ROT is a
+byte-exact, committed-CP-neutral structural cut of the (masked) scheduler loop — like the LZC/vmspre/
+PMP/MMU-TLB tree-izations, but on the block-store scan. Load-ordering-critical → full ladder confirmed
+byte-exactness: default **252/0** (=0/=1), **litmus N4 PASS**, **N2 SMP boot PASS cy=00fc6160 =
+cycle-EXACT to the committed baseline** (byte-exact through the full Sv39-paging Linux boot, unlike a
+timing change), backend-validate all-passing incl rv64ua atomics (box-load timeout, no divergence).
+ACT4 (needs `make -C test/act`) is the residual re-confirm but a cycle-exact change can't regress it.
+→ **committed PERMANENT at BLK_ROT=1** (byte-exact structural cut, like the LZC/vmspre/PMP/MMU-TLB
+tree-izations; the =0 age-tree stays as a DCE'd fallback). **The new binding loop segment is the
+argmin (`sh_csr_addr → iss/win`, ~108 lv / 10.0 ns)** — the next A-SCHED target (AS-b age-matrix is
+depth-neutral §0, so it needs a different structure).

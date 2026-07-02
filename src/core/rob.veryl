@@ -738,6 +738,9 @@ pub module rob #(
         return if !a[5] ? b : if !b[5] ? a : if a[4:0] <: b[4:0] ? a : b;
     }
     var blk_cand: logic<6> [ROB_DEPTH];
+    // A-SCHED BLK_ROT (cp_a_sched §7): the SAME is_block per entry, collected into a
+    // dense vector (head-INDEPENDENT) for the rotate+clz oldest-blocker below.
+    var is_block_vec: logic<ROB_DEPTH>;
     always_comb {
         for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
@@ -766,6 +769,7 @@ pub module rob #(
             // that any issue-timing perturbation (e.g. A-LOOP SEL_PIPE) can expose.
             let is_block: logic = sh_valid[i] && ((sh_is_store[i] && ((i_conservative && !s15_vm_spec_en) || sh_is_amo[i] || (!sh_rw[i] && !s9_speculate_en) || sh_mem_virt[i])) || sh_is_fence[i] || sh_is_cbo_zero[i]);
             blk_cand[i] = {is_block, age_i};
+            is_block_vec[i] = is_block;
         }
     }
     // balanced pairwise-argmin tree (ROB_DEPTH = 32 → depth 5): oldest blocker.
@@ -789,8 +793,33 @@ pub module rob #(
         }
         blk_win = pick_oldest_blk(blk_r2[0], blk_r2[1]);
     }
-    assign o_block_store_exists = blk_win[5];
-    assign o_block_store_age    = if blk_win[5] ? blk_win[4:0] : '0;
+    // A-SCHED BLK_ROT (cp_a_sched §7): oldest-blocker via rotate + native priority-encode,
+    // shallower than the depth-5 pick_oldest_blk age-tree (~37 lv → ~12 lv) and BYTE-EXACT.
+    // The oldest blocker = MIN age = the blocker closest to head = the FIRST set is_block
+    // bit scanning circularly from head_idx:
+    //   blk_age_vec[a] = is_block_vec[(head_idx + a) mod ROB_DEPTH]  (age-indexed, LSB=age0)
+    //     = a barrel-rotate of is_block_vec RIGHT by head_idx (double-width shift).
+    //   the LOWEST set bit of blk_age_vec = MIN age; isolate it (x & -x → one-hot) and
+    //   binary-encode via masked OR-reductions (log-depth; ROB_DEPTH=32 → 5-bit age).
+    // is_block_vec is head-independent → the head_idx dependency is ONE barrel-rotate,
+    // not a per-entry subtract threaded through 5 age-compare stages. Native 32-bit
+    // priority-encode, NOT clz256 (which top-justifies to 256 bits = deeper).
+    const BLK_ROT: bit = 1;
+    let blk_dbl    : logic<ROB_DEPTH * 2> = {is_block_vec, is_block_vec};
+    let blk_shf    : logic<ROB_DEPTH * 2> = blk_dbl >> head_idx;
+    let blk_age_vec: logic<ROB_DEPTH>     = blk_shf[ROB_DEPTH - 1:0];  // age-indexed (LSB=age0)
+    let blk_low_oh : logic<ROB_DEPTH>     = blk_age_vec & (~blk_age_vec + 1); // lowest set = oldest
+    let blk_rot_exists: logic             = |is_block_vec;
+    // binary-encode the one-hot lowest bit (masks = bit-b-set positions; ROB_DEPTH=32):
+    let blk_rot_age: logic<ROB_IDX_W> = {
+        |(blk_low_oh & 32'hFFFF_0000),
+        |(blk_low_oh & 32'hFF00_FF00),
+        |(blk_low_oh & 32'hF0F0_F0F0),
+        |(blk_low_oh & 32'hCCCC_CCCC),
+        |(blk_low_oh & 32'hAAAA_AAAA)
+    };
+    assign o_block_store_exists = if BLK_ROT ? blk_rot_exists : blk_win[5];
+    assign o_block_store_age    = if BLK_ROT ? (if blk_rot_exists ? blk_rot_age : '0) : (if blk_win[5] ? blk_win[4:0] : '0);
 
     // (b) Per-entry store shadow exposure for the alu_wrap forward byte-network.
     // o_store_fwdable[i] = entry i is a KNOWN forwardable plain store (executed,
