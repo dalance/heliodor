@@ -83,3 +83,46 @@ the IPC/SMP budget, the realistic goal revises to the IS-stage depth (~12 ns), n
   ~874–958, 2754 · `VFP_PIPE` 34 / `VINT_PIPE` 53 (the FETCH-phase precedent).
 - Measure: `veryl synth --top heliodor_core --dump-timing` at FETCH_REG=1 (+STORE_PRETRANSLATE=1
   to put vrf at #1).
+
+## 6. ✅ IMPLEMENTED + MEASURED (2026-07-02) — `VALU_PIPE` DEAD scaffold, flip cuts vrf 13.88 → GONE (top = n_inflight 13.84 cbo residual)
+
+`param VALU_PIPE` (`vector_unit.veryl:63`, DEAD default 0), matching the VFP_PIPE/VINT_PIPE
+FETCH-phase precedent. Registered operands `va_vs1_q`/`va_vs2_q` + `va_fetched_q`; a
+plain-valu/compare group first spends a FETCH cycle (`va_fetch_need`) that latches the VRF
+operands, and the compute (`va_step`/`va_fire`, gated on `va_ops_rdy`) runs next cycle off the
+registers. Widen/narrow/viota/divide keep live operands and DON'T fetch (`va_use_reg=0` for them:
+their SELECTED result is `vw_res`/`vn_step`/`viota_res`/`dv_acc`, not the `a*b` compute); **vdold
+stays LIVE** (the `valu_res` default / `cmp_seed`) so divide's inactive/tail lanes are correct
+without fetching. `va_vs2`/`va_vs1` swapped into `valu_res` + `vcmp` only (the §2 sites).
+
+🔑🔑 **CRUX — the operand alias MUST be PARAM-gated, not runtime-gated (the first attempt failed).**
+A first cut used `va_vs2 = if va_use_reg ? va_vs2_q : i_vs2_data` where `va_use_reg` is a *runtime*
+signal (exclude widen/div at runtime). Synth: **vrf did NOT drop (13.88 → 14.03, still `head →
+vrf`).** The gate trace showed the multiply cone feeding `i_vs2_data → va_vs2` (the mux's LIVE
+input) → valu_res → write: STA times the live input through the runtime mux and reports it — a
+**FALSE PATH** (it's only "live" when `va_use_reg=0` = widen/div, but then valu_res isn't the
+selected result; STA can't correlate the mux selects). This is exactly why VFP_PIPE/VINT_PIPE gate
+on the *param* (`if VFP_PIPE ?` folds to just the register — no mux, no false path). Fix: gate the
+alias on `VALU_PIPE` (param) → folds to `va_vs2_q` at =1. **Lesson: a datapath operand register is
+only effective if its select is a compile-time param (folds the mux away); a runtime `sel ? reg :
+live` mux leaves the live input as a false path that defeats the cut. Runtime exclusion belongs on
+the FETCH trigger / write-enable (control), NOT on the datapath mux.**
+
+**MEASURED (reverted, tree DEAD):**
+- DEAD (VALU_PIPE=0): synth **14.565 unchanged** (registers DCE via the `if VALU_PIPE` block-fold);
+  default **252/0** (litmus N2 cy=0022a330); N1 7.1V **vector** boot cy=013cc5c0 = cycle-EXACT.
+- FLIP (VALU_PIPE=1 alone): default **252/0** (the `test_arch_v*` vadd/vmul/vmseq exercise the
+  fetch phase); 7.1V vector boot pass=1, **cy=013cc5c0 UNCHANGED** = the VU has slack in the boot →
+  **~0 IPC cost on boots** (the VU integer datapath is not the boot bottleneck; +1 cy/group only
+  bites VU-bound microbenchmarks).
+- FLIP CP (FETCH_REG=1 + STORE_PRETRANSLATE=1 + VALU_PIPE=1): **vrf GONE from the top**, CP
+  13.880 → **13.840**, top = `head → n_inflight[5]` 13.840 (the cbo commit residual left LIVE in
+  the trap-deferral, §3 #1) then redirect_pc_q 13.35 / mip 13.33. **Exactly §3's dense-band
+  finding** (vrf drops below 13.35; the cbo residual is the next cap).
+
+**Committed DEAD** (like STORE_PRETRANSLATE/FETCH_REG). **▶️ Next cap = the cbo n_inflight residual
+13.84** (defer the live cbo commit fault, mirroring the plain-store trap-deferral `1a7178f`) → then
+`redirect_pc_q` 13.35. The coordinated bundle so far: FETCH_REG + STORE_PRETRANSLATE(+cbo) +
+VALU_PIPE → ~13.35 (14.565 → 13.35 ≈ −8%); the scheduler (9.52, A-SCHED) is well below. Full-ladder
+(backend-validate / ACT4 / litmus N4 / N2·N4 SMP / Verilator) is deferred to the permanent bundle
+flip.

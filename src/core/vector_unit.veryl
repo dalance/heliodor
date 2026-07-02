@@ -51,6 +51,16 @@ pub module vector_unit #(
     // +1 cycle per vrgather element. Built DEAD (=0): pm_fetched_q is never set, so
     // the permute FSM stays single-cycle and the addressing is live = cycle-exact.
     param VINT_PIPE: bit = 1  ,
+    // CP: VU same-width integer ALU/mul datapath pipeline (cp_vrf_cut_plan.md §2).
+    // The register-serial VALU compute reads the full VRF group (vs2/vs1/vdold) and
+    // runs the multiply/ALU (valu_res) or compare (cmp_res) in one cycle -> the vrf
+    // 13.88 ns front. VALU_PIPE=1 inserts a FETCH cycle per plain-valu/compare group
+    // that latches the operands into va_vs*_q; compute then runs next cycle off the
+    // registers, splitting VRF-read (~3 ns) | multiply+ALU+write (~10 ns). Cost:
+    // +1 cycle per plain-valu/compare group. Widen/narrow/viota/divide keep live
+    // operands (below the front; divide is int_divider-bound). Built DEAD (=0):
+    // va_fetched_q is never set, all operands fold to the live inputs = cycle-exact.
+    param VALU_PIPE: bit = 0  ,
 ) (
     clk: input clock,
     rst: input reset,
@@ -887,6 +897,13 @@ pub module vector_unit #(
     // step from source register va_reg) is held until the odd step writes the
     // full dest register as {high-half, vn_lo}.
     var vn_lo: logic<64>;
+    // CP (VALU_PIPE): the FETCH-phase registered VRF operands for the register-serial
+    // plain-valu / compare compute. Each such group first spends a FETCH cycle that
+    // latches vs2/vs1/vdold here; valu_res/cmp_res then run next cycle off these
+    // registers. va_fetched_q flags the fetch done. Dead when VALU_PIPE=0 (never set).
+    var va_vs1_q    : logic<VLEN>;
+    var va_vs2_q    : logic<VLEN>;
+    var va_fetched_q: logic      ;
 
     // ---- V3 vector FP element-serial state ----------------------------------
     // FP arithmetic shares ONE fpu_wrap instance (an FPU per element would be
@@ -1269,10 +1286,23 @@ pub module vector_unit #(
     // write EVERY body element, selecting b when active and vs2[i] otherwise
     // (vmv.v.* has vm=1 → all active → broadcast b); tail stays undisturbed.
     let bbcast: logic<64> = if h_is_vx ? i_scalar_data : {h_instr[19] repeat 59, h_instr[19:15]};
+    // CP (VALU_PIPE): the multiply/compare operands read these aliases. They are
+    // PARAM-gated (folds to va_vs*_q at VALU_PIPE=1, i_vs*_data at =0) so no runtime
+    // mux is left on the datapath — a runtime `va_use_reg ? reg : live` mux leaves a
+    // FALSE PATH (STA times the live input feeding the multiply, defeating the cut).
+    // Only plain-valu/compare groups fetch (va_use_reg, control-only below); those are
+    // the only ops whose SELECTED result reads a/b (widen->vw_res, narrow->vn_step,
+    // viota->viota_res, divide->dv_acc read live; valu_res's a*b is dead for them).
+    // vdold stays LIVE (the valu_res default / cmp_seed) so divide's inactive/tail
+    // lanes are correct without fetching. va_reg is stable across a group's
+    // fetch->compute, so the registered value equals the live read (latency-only cut).
+    let va_use_reg: logic       = VALU_PIPE && h_is_valu && !h_is_vdiv && !h_is_widen && !h_is_narr;
+    let va_vs2    : logic<VLEN> = if VALU_PIPE ? va_vs2_q : i_vs2_data;
+    let va_vs1    : logic<VLEN> = if VALU_PIPE ? va_vs1_q : i_vs1_data;
     var valu_res: logic<VLEN>;
     var vsat_grp: logic; // V5a: any active satadd element saturated in this group
     always_comb {
-        valu_res = i_vdold_data; // default: inactive/tail = undisturbed
+        valu_res = i_vdold_data; // default: inactive/tail = undisturbed (live: divide reads this)
         vsat_grp = 1'b0;
         case vsew {
             3'd0: {
@@ -1281,8 +1311,8 @@ pub module vector_unit #(
                 for i in 0..16 {
                     if (base + (i as 8)) <: vl8 {
                         let act: logic    = h_alu_vm || msk[i];
-                        let a  : logic<8> = i_vs2_data[i*8+:8];
-                        let b  : logic<8> = if h_is_vv ? i_vs1_data[i*8+:8] : bbcast[7:0];
+                        let a  : logic<8> = va_vs2[i*8+:8];
+                        let b  : logic<8> = if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0];
                         if h_is_merge {
                             valu_res[i*8+:8] = if act ? b : a;
                         } else if act {
@@ -1315,8 +1345,8 @@ pub module vector_unit #(
                 for i in 0..8 {
                     if (base + (i as 8)) <: vl8 {
                         let act: logic     = h_alu_vm || msk[i];
-                        let a  : logic<16> = i_vs2_data[i*16+:16];
-                        let b  : logic<16> = if h_is_vv ? i_vs1_data[i*16+:16] : bbcast[15:0];
+                        let a  : logic<16> = va_vs2[i*16+:16];
+                        let b  : logic<16> = if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0];
                         if h_is_merge {
                             valu_res[i*16+:16] = if act ? b : a;
                         } else if act {
@@ -1349,8 +1379,8 @@ pub module vector_unit #(
                 for i in 0..4 {
                     if (base + (i as 8)) <: vl8 {
                         let act: logic     = h_alu_vm || msk[i];
-                        let a  : logic<32> = i_vs2_data[i*32+:32];
-                        let b  : logic<32> = if h_is_vv ? i_vs1_data[i*32+:32] : bbcast[31:0];
+                        let a  : logic<32> = va_vs2[i*32+:32];
+                        let b  : logic<32> = if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0];
                         if h_is_merge {
                             valu_res[i*32+:32] = if act ? b : a;
                         } else if act {
@@ -1383,8 +1413,8 @@ pub module vector_unit #(
                 for i in 0..2 {
                     if (base + (i as 8)) <: vl8 {
                         let act: logic     = h_alu_vm || msk[i];
-                        let a  : logic<64> = i_vs2_data[i*64+:64];
-                        let b  : logic<64> = if h_is_vv ? i_vs1_data[i*64+:64] : bbcast;
+                        let a  : logic<64> = va_vs2[i*64+:64];
+                        let b  : logic<64> = if h_is_vv ? va_vs1[i*64+:64] : bbcast;
                         if h_is_merge {
                             valu_res[i*64+:64] = if act ? b : a;
                         } else if act {
@@ -1435,7 +1465,7 @@ pub module vector_unit #(
                 let seed_sh: logic<VLEN> = cmp_seed >> base; // prior bits for this group
                 for i in 0..16 {
                     let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<8>(i_vs2_data[i*8+:8], if h_is_vv ? i_vs1_data[i*8+:8] : bbcast[7:0], h_funct6) : seed_sh[i];
+                    vcmp_grp[i] = if do_c ? vcmp::<8>(va_vs2[i*8+:8], if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0], h_funct6) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({112'd0, 16'hffff} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1445,7 +1475,7 @@ pub module vector_unit #(
                 let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..8 {
                     let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<16>(i_vs2_data[i*16+:16], if h_is_vv ? i_vs1_data[i*16+:16] : bbcast[15:0], h_funct6) : seed_sh[i];
+                    vcmp_grp[i] = if do_c ? vcmp::<16>(va_vs2[i*16+:16], if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0], h_funct6) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({120'd0, 8'hff} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1455,7 +1485,7 @@ pub module vector_unit #(
                 let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..4 {
                     let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<32>(i_vs2_data[i*32+:32], if h_is_vv ? i_vs1_data[i*32+:32] : bbcast[31:0], h_funct6) : seed_sh[i];
+                    vcmp_grp[i] = if do_c ? vcmp::<32>(va_vs2[i*32+:32], if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0], h_funct6) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({124'd0, 4'hf} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1465,7 +1495,7 @@ pub module vector_unit #(
                 let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..2 {
                     let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<64>(i_vs2_data[i*64+:64], if h_is_vv ? i_vs1_data[i*64+:64] : bbcast, h_funct6) : seed_sh[i];
+                    vcmp_grp[i] = if do_c ? vcmp::<64>(va_vs2[i*64+:64], if h_is_vv ? va_vs1[i*64+:64] : bbcast, h_funct6) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({126'd0, 2'h3} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -2433,8 +2463,14 @@ pub module vector_unit #(
 
     let va_run  : logic = (count != 0) && at_head && scalar_ok && !i_flush && (h_is_valu || h_is_viota) && (!dv_op || dv_group_done);
     let va_last : logic = ({1'b0, va_reg} + 4'd1) >= va_nregs;
-    let va_fire : logic = va_run && va_last && i_cdb_free; // final group + writeback
-    let va_step : logic = va_run && !va_last;              // intermediate group (no CDB)
+    // CP (VALU_PIPE): a plain-valu/compare group first spends a FETCH cycle (latch the
+    // VRF operands into va_vs*_q); compute/retire waits on va_ops_rdy. Widen/narrow/
+    // viota/divide don't fetch (va_use_reg=0 for them) -> va_ops_rdy is immediately
+    // true (as today). Dead when VALU_PIPE=0 (va_use_reg=0 -> va_ops_rdy=1).
+    let va_ops_rdy   : logic = !va_use_reg || va_fetched_q;
+    let va_fetch_need: logic = va_use_reg && va_run && !va_fetched_q; // the FETCH cycle
+    let va_fire : logic = va_run && va_last && i_cdb_free && va_ops_rdy; // final group + writeback
+    let va_step : logic = va_run && !va_last && va_ops_rdy;             // intermediate group (no CDB)
     // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
     let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
     // A retiring vleff that trimmed vl writes the new vl at commit. It reuses the
@@ -2597,6 +2633,9 @@ pub module vector_unit #(
             va_acc     = {1'b0 repeat VLEN};
             vxsat_acc  = 1'b0;
             vn_lo      = 64'd0;
+            va_fetched_q = 1'b0;
+            va_vs1_q    = {1'b0 repeat VLEN};
+            va_vs2_q    = {1'b0 repeat VLEN};
             dv_lane     = 5'd0;
             dv_acc      = {1'b0 repeat VLEN};
             fp_state    = 2'd0;
@@ -2635,6 +2674,9 @@ pub module vector_unit #(
             va_reg     = 3'd0;
             va_acc     = {1'b0 repeat VLEN};
             vn_lo      = 64'd0;
+            // Abandon any in-flight plain-valu/compare fetch (idempotent: re-reads
+            // the same unrenamed VRF sources and re-fetches from group 0).
+            va_fetched_q = 1'b0;
             // Abandon any in-flight integer divide; idempotent, re-reads the
             // unrenamed VRF sources and re-iterates from lane 0.
             dv_lane     = 5'd0;
@@ -2883,6 +2925,21 @@ pub module vector_unit #(
                     if i_cdb_free {
                         pm_state = 2'd0;
                     }
+                }
+            }
+            // CP (VALU_PIPE): FETCH phase for the register-serial plain-valu/compare
+            // datapath. va_fetch_need holds on a group's first cycle: latch the VRF
+            // operands into va_vs*_q and set va_fetched_q, so the compute (va_step/
+            // va_fire, gated on va_ops_rdy) runs next cycle off the registers. The
+            // compute cycle clears va_fetched_q so the next group re-fetches. The
+            // whole block folds away when VALU_PIPE=0 (registers reset-only -> DCE).
+            if VALU_PIPE {
+                if va_fetch_need {
+                    va_vs1_q     = i_vs1_data;
+                    va_vs2_q     = i_vs2_data;
+                    va_fetched_q = 1'b1;
+                } else if va_step || va_fire {
+                    va_fetched_q = 1'b0;
                 }
             }
             // Arith register-group advance (V2d LMUL>1): step intermediate
