@@ -120,9 +120,32 @@ the FETCH trigger / write-enable (control), NOT on the datapath mux.**
   the trap-deferral, §3 #1) then redirect_pc_q 13.35 / mip 13.33. **Exactly §3's dense-band
   finding** (vrf drops below 13.35; the cbo residual is the next cap).
 
-**Committed DEAD** (like STORE_PRETRANSLATE/FETCH_REG). **▶️ Next cap = the cbo n_inflight residual
-13.84** (defer the live cbo commit fault, mirroring the plain-store trap-deferral `1a7178f`) → then
-`redirect_pc_q` 13.35. The coordinated bundle so far: FETCH_REG + STORE_PRETRANSLATE(+cbo) +
-VALU_PIPE → ~13.35 (14.565 → 13.35 ≈ −8%); the scheduler (9.52, A-SCHED) is well below. Full-ladder
-(backend-validate / ACT4 / litmus N4 / N2·N4 SMP / Verilator) is deferred to the permanent bundle
-flip.
+**Committed DEAD** (like STORE_PRETRANSLATE/FETCH_REG). Full-ladder (backend-validate / ACT4 /
+litmus N4 / N2·N4 SMP / Verilator) deferred to the permanent bundle flip.
+
+### 6.1 🚨 GATE-TRACED (2026-07-02) — the 13.84 cap is the dcache COMBINATIONAL TAG LOOKUP, not the cbo fault; VALU_PIPE nets only −0.04 alone, and the next front is Phase C (dcache sync-read), a different effort class
+
+Tracing the FLIP-CP path #1 (`head → n_inflight[5]` 13.840) to the gate: the dominant segment is
+**not** the cbo MMU fault — it is the **dcache combinational tag lookup ~5 ns**:
+`commit_store_fire → (priv → dmem_mmu → dmem_pa_m ~1.4 ns) → u_dcache.i_addr → tag RAM Q →
+next_tag/next_hit/next_line_hit → miss → lo_miss → srfo_want → index → f_tag/fm_0 → plru_way →
+victim_way → vic_valid/vic_dirty → fill_blocked_wb → load_sel → filling → dc_mem_req → o_dmem_iread
+→ i_dmem_grant → commit_excp → commit_trap → rob_commit_ack → n_inflight` (two `RAM Q +0.525`
+reads = tag-then-victim). So **deferring the cbo fault (the §6/§3 plan) does NOT cut 13.84** — the
+fault logic is a small tail; the body is the async dcache tag read + hit/miss/victim/fill cone. This
+is precisely the **Phase C dcache-synchronous-read** target (`cp_dcache_sync_read_plan.md §1`, "the
+commit-store→dcache wall body"; register the `64×52 13R1W` tag read, `sram_inventory.md` row 2).
+
+🔑🔑 **Strategic consequence — the "quick" WALL front-cuts are EXHAUSTED.** VALU_PIPE's bundle
+contribution is only **−0.04 ns** (vrf 13.88 → cbo 13.84 sits right underneath). front-end (FETCH_REG,
+scaffold) + commit-store fault (STORE_PRETRANSLATE trap-deferral, scaffold) + vrf (VALU_PIPE,
+scaffold) are the last *scaffold-flip* fronts. **Everything below 13.84 is a different effort class:**
+(1) the **dcache sync-read (Phase C)** — the 13.84 body AND the load-path dcache read, a major
+SMP-critical restructure of the hardest RAM (register the tag/way-mux, 2-stage tag-then-data, corners
+in `cp_dcache_sync_read_plan.md §5`), which is *also* the campaign's SRAM-migration goal; then
+(2) the **commit/CSR/redirect wall** (`redirect_pc_q` 13.35, `mip` 13.33, HPM 12.6–12.9) exposed
+below it. The permanent flip of the 3 current scaffolds alone (→13.84, −5 % CP for ~+7 % IPC, mostly
+STORE_PRETRANSLATE) is a **poor trade** — not worth committing until the dcache body is also cut.
+**▶️ Next major front = Phase C dcache synchronous-read** (`cp_dcache_sync_read_plan.md`; DEAD
+`DCACHE_SYNC_READ` scaffold like ICACHE_SYNC_READ, §6/§8). The scheduler (9.52, A-SCHED) stays well
+below the whole band.
