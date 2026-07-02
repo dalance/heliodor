@@ -206,3 +206,62 @@ exactly**:
 (+1 bubble), dual-issue slot-1 (`s1_instr`/`if_*_q1`). Full ladder + IPC at the bundle flip; the
 DEAD scaffold + measure is the per-session deliverable. Lower-risk than dcache (in-order front-end,
 no SMP atomicity). Anchors: §4 above + `d93c2e3` as the live template.
+
+## 6. ✅ DONE (2026-07-03) — `ICACHE_SYNC_READ` DEAD scaffold rebuilt + flip-measured; NEXT = step B (imem-MMU stage)
+
+Rebuilt the `ICACHE_SYNC_READ` DEAD scaffold (`icache.veryl`), mirroring the `DCACHE_SYNC_READ`
+(`d93c2e3`) template exactly. Registered the icache **read result** — the four CPU-side outputs
+`o_rdata` / `o_rdata_next` / `o_rdata_next_valid` / `o_stall` — via rename-to-`*_raw` (the live
+combinational read) + a reset-only `*_q` written only `if ICACHE_SYNC_READ` + the port redefined
+`assign o_rdata = ICACHE_SYNC_READ ? o_rdata_q : o_rdata_raw` (so the core routes to the effective
+value untouched — `icache_rdata`/`_next`/`_stall` in `heliodor_core.veryl` need no edit). Only
+internal consumer of a registered output is `straddled_4byte` (reads the `o_rdata` port = eff).
+
+**DEAD (=0) — all 4 gates green (byte-identical + synth-CP-neutral):**
+- default **252/0** (litmus N2 `cy=0022a330`, matches the `d93c2e3` bundle).
+- synth **14.565 ns unchanged**, **159948 FFs unchanged** vs baseline (the 66 new regs — o_rdata 32 +
+  o_rdata_next 32 + valid 1 + stall 1 — fully DCE'd; the write-fold const-gate methodology holds;
+  +68 pass-through mux gates only, off the critical path).
+- N1 boot cy-EXACT: 7.1 `01210060` / 6.6 `013ee8a0` / 7.1V `013cc5c0`.
+- **ACT4 696/696** (0 failed).
+
+**FF-insertion flip measure (throwaway, reverted):**
+- `ICACHE_SYNC_READ=1` alone (FETCH_REG=0): **14.565 → 14.130**; top-40 endpoints are ALL back-end
+  (`head → n_inflight` commit-store 14.13, `head → vrf` 13.88) — **zero pc_q front-end endpoints**.
+  So registering the icache read drops the whole front end (pc_q → rs1_rdy) from being the global CP
+  (14.565) to BELOW the 13.88 vrf/back-end wall. Reproduces §2.1's 14.130 and confirms the icache
+  read leaves the critical path.
+- `FETCH_REG=1 + ICACHE_SYNC_READ=1`: still **14.130** (back-end capped), and the front-end is not
+  in the top **80** endpoints — the fetch path is now deep below the wall. **Confirmed: the icache
+  read leaves the front-end fetch-half.** (The fetch-half absolute floor is ~7 ns, masked by the
+  13.88+ vrf/commit-store back-end wall — it cannot surface as a top endpoint until the whole
+  back-end is cut below ~7 ns, i.e. the full campaign; so it is measured indirectly below.)
+
+**Fetch-half decomposition (from the DEAD=0 `--dump-timing` of the 14.565 `pc_q → rs1_rdy` path —
+which IS the whole front end when nothing is registered):**
+
+| segment | range (ns) | length | component |
+|---|---|---|---|
+| **imem-MMU V=1 two-stage TLB** | 0.00 → 5.36 | **5.36** | `u_imem_mmu.u_mmu.v1_vpn→v1_level→v1_valid→v1_u→i_sum→v1_match→v1_hit→imem_paddr` |
+| icache RAM read | 5.36 → 5.885 | 0.525 | `RAM Q` (the `data_*` array IS inferred SRAM — sync-read-ready) |
+| icache tag/hit mux → cexp in | 5.885 → ~7.0 | ~1.1 | `u_icache.tag` compare + 4-way hit mux |
+| cexp (RVC expand) | 7.625 → 9.305 | ~1.68 | `u_cexp` |
+| decode | 9.305 → 11.355 | ~2.05 | `u_dec` |
+| rename / IQ allocate | 11.355 → 14.565 | ~3.21 | `iq_alloc_rdy → rename_fire → prf_ready → rs1_rdy` |
+
+The `ICACHE_SYNC_READ` register sits at the icache hit-mux output (~7 ns), splitting 14.565 into a
+**fetch-half ~7 ns (imem-MMU 5.36 dominant, 76%)** and a **decode-half ~7.5 ns (rename/allocate 3.21
++ decode 2.05 + cexp 1.68 dominant)** — roughly balanced (§2's 7.6/7.0 estimate was close; the
+icache RAM read is much cheaper than the 2.6 ns estimate because it is inferred SRAM). **§5's
+prediction is confirmed: the imem-MMU V=1 TLB (5.36 ns) is the fetch-half floor** — the single
+biggest contiguous chunk of the fetch path, dwarfing the 0.525 ns icache RAM read.
+
+**▶️ NEXT SESSION — step (B): the imem-MMU translate stage (F1).** Register `o_imem_paddr` (the
+5.36 ns V=1 two-stage TLB — the biggest single front-end chunk, and now the fetch-half floor). Pure
+pipeline reg (the TLB is flops, not SRAM — a rename-to-`*_raw` + reset-only `*_q` + `assign … = ? q
+: raw` param scaffold in `mmu.veryl` on the `o_paddr`/`o_valid`/`o_fault`/`o_acc_fault` outputs,
+DCE'd at 0, same const-gate methodology). This is the F1 stage of the FINAL diagram; it splits the
+fetch-half (imem translate | icache access). Note for after B: the **decode-half (~7.5 ns) is the
+co-equal front-end pole** — its floor is the rename/IQ-allocate cone (3.21 ns, `iq_alloc_rdy →
+rename_fire → prf_ready → rs1_rdy`), so a decode/rename stage is the third front-end lever. Anchors:
+`mmu.veryl:318-360` (V=1 TLB), §4, `d93c2e3` + this session's icache scaffold as the live templates.
