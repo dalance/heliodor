@@ -341,3 +341,62 @@ boot cy exact + synth CP unchanged/DCE), then FF-insertion measure the flip
 `n_inflight` 13.84 path → exposes `redirect_pc_q` 13.35. Full ladder (§7: ACT4 696 + litmus N4 +
 N2/N4 SMP + Verilator) + IPC (fold check: load-use latency unchanged) at the bundle flip.
 Multi-session build.
+
+### 10.2 ✅ IMPLEMENTED + MEASURED (2026-07-02) — `DCACHE_SYNC_READ` DEAD scaffold; flip DOES remove the dcache from `n_inflight`, but standalone only −0.13 ns (the commit-store MMU-fault/PMP-cbo-W residual is co-located)
+
+`const DCACHE_SYNC_READ` (`dcache.veryl:611`, DEAD default 0), pattern = VALU_PIPE (write-fold
+`if DCACHE_SYNC_READ` → reset-only regs DCE, `*_eff = ? *_q : *_raw` folds to `*_raw`). Registered
+the **fill/stall DECISION cone** (Stage-R result): `miss`, `load_sel`, `srfo_sel`,
+`fill_blocked_wb`, `f_index`, `f_tag`, `f_offset`, `f_rfo`, `victim_way`, `vic_valid`, `vic_dirty`,
+`vic_tag`. Rename-to-`_raw` + redefine-original-as-`_eff` → every downstream consumer
+(`o_memr_req`/`o_memr_addr`/`o_memr_rfo`/`o_memr_ren`/`o_stall`/`o_miss_valid`/`fill_start_fire` +
+the FSM fill capture) routes to `_eff` untouched; the upstream victim-computation (fm/plru/vic_*)
+stays `_raw`. The victim PAYLOAD `vic_data` stays live (a data write off the critical path; the
+real Stage-D re-reads it from registered `f_index`).
+
+**DEAD (=0) — byte-identical + synth-CP-neutral (all four gates GREEN):**
+- default **252/0** (litmus N2 cy=0022a330).
+- synth CP **14.565 unchanged** (138 lv, `pc_q→rs1_rdy`, 159948 FF) → the `*_q` regs DCE via the
+  write-fold (confirms the const-gate methodology).
+- N1 boot cy-EXACT: 7.1 cy=01210060, 7.1V cy=013cc5c0, 6.6 cy=013ee8a0, v4-smoke cy=00b6a5d0.
+- **ACT4 696/696** (the MEM_PIPE-class S-mode paging corners).
+
+**FLIP CP (FETCH_REG=1 + STORE_PRETRANSLATE=1 + VALU_PIPE=1 + DCACHE_SYNC_READ=1, throwaway,
+reverted):** top = `head → n_inflight[5]` **13.710** ns (was 13.840 at DCACHE_SYNC_READ=0). Gate
+trace of the 13.710 path — **ZERO dcache gates**:
+```
+commit_store_fire → agu_addr/dmem_vaddr → u_dmem_mmu.u_mmu.tlb_vpn/level/valid/perm/read_ok  ~3.7 (biggest)
+  → m_pa_q → c_store_addr → u_pmp_cbo_m_w.addr_word/mvec/lowest_oh/allow_w/is_m                ~1.9
+  → commit_store_fire → rob_commit_valid → commit_excp → commit_trap → rob_commit_ack
+  → u_fl.n_inflight (free-list saturating counter)                                             ~1.9 (fixed tail)
+```
+🔑 **The dcache tag→miss→srfo→victim→fill cone IS cut** (the §6.1 13.84 body is gone — its
+`i_addr/tag RAM/f_index/victim/fill_blocked_wb/dc_mem_req` gates no longer appear anywhere in the
+top-15). But CP moved only **13.840 → 13.710 (−0.13)** because the commit-store's **LIVE MMU-fault
++ PMP-`cbo_m_w`-W permission cone** — the STORE_PRETRANSLATE "cbo residual" (the fault path left
+live in the trap-deferral; the §10 correction banner's "commit-store live MMU+PMP", §3 dense-band
+"13.84(cbo)") — is a PARALLEL sub-path to the dcache that fed the same `commit_excp`, sitting right
+underneath at 13.71. Cutting the dcache sub-path just exposed it.
+
+**Exposed band (top-15 at the flip), dcache absent throughout:**
+| # | ns | endpoint | what |
+|---|---|---|---|
+| 1–5 | 13.42–13.71 | `n_inflight` | commit-store MMU-fault + PMP-cbo-W residual + free-list counter |
+| 6–9 | 13.22–13.23 | `s1_prod_q → s1_sum_q` (146 lv) | a registered-operand multiply tree (int/FP) |
+| 10–15 | 13.21 | `redirect_pc_q` | the redirect/mispredict-PC front (the §3 "redirect 13.35", now 13.21) |
+
+🎯 **Result: the dcache sync-read cut is REAL and structurally correct** (the SRAM-migration goal +
+a genuine pipeline stage = FINAL structure), but its **standalone CP is ~0** (−0.13) — the
+prediction "exposes redirect_pc_q 13.35" was optimistic: `redirect_pc_q` IS exposed (13.21) but the
+**commit-store MMU-fault/PMP-cbo-W residual (13.71) caps above it.** This is exactly the
+`cp_vrf_cut_plan.md §3` dense-band picture (every front worth ~0.05–0.5 ns, cumulative only in a
+coordinated bundle). Per "optimise for structure not CP", the scaffold is **committed DEAD** as a
+needed bundle component; a permanent flip waits for the bundle (front-end + commit-store(+cbo) + vrf
++ **dcache** + redirect), and the fold (§10.1, load-use unchanged) + full ladder (§7) apply then.
+
+**▶️ Next front candidate (data-backed):** the **commit-store MMU-fault + PMP-cbo-W residual**
+(the 13.71 body now exposed) — the live MMU permission (`tlb_valid/perm/read_ok` ~3.7) + the
+`u_pmp_cbo_m_w` PMP cone (~1.9) feeding `commit_excp`. STORE_PRETRANSLATE deferred the *store fault*
+but left this cbo/MMU-fault path live (§9.7 of `cp_commit_store_pretranslate_plan.md`). This is the
+true `n_inflight` cap once the dcache is registered; the free-list counter tail (~1.9) is the floor
+under it.
