@@ -256,3 +256,50 @@ N2/N4 + N2/N4 SMP boot (atomicity: AMO commit must stay live, §5.6) + Verilator
   (the PA-latch, done = MEM_PIPE); `deep_pipeline_sram_plan.md` (the bundle).
 - Measure: `veryl synth --top heliodor_core --dump-timing --timing-paths N`,
   FETCH_REG=1 to expose the wall (revert after).
+
+## 10. ✅ ACTIVE FRONT (2026-07-02) — user-selected after VALU_PIPE; design study, scaffold is next
+
+Confirmed as the next major front (user AskUserQuestion) after the "quick" WALL scaffold-flip
+fronts were exhausted: with FETCH_REG + STORE_PRETRANSLATE + VALU_PIPE all flipped, the top is
+`head → n_inflight` **13.840**, gate-traced (`cp_vrf_cut_plan.md §6.1`) to the **dcache combinational
+tag lookup ~5 ns** on the commit-store/cbo path — exactly this doc's target. This is the SRAM
+migration + a real pipeline stage (FINAL structure), a different effort class from the scaffold flips.
+
+**Structure studied (`dcache.veryl`, 1695 lines, SMP heart):**
+- `o_stall` (`:1692`) = `(state==FILL) || miss || (state==DONE) || write_during_fill ||
+  write_wait_grant || write_wait_local || inv_hits_active || inv2_hits_active ||
+  (uncached_active && !i_memr_grant)`. `state` is a REGISTER (shallow); the depth is **`miss`**
+  (= `!cache_hit`, the tag compare `:342-346`) feeding the fill-request→grant→stall chain.
+- The ~3.1 ns dominant cone (§1) is `miss → dc_mem_req → i_dmem_grant` (a **combinational round-trip
+  through the memory-bus arbiter**) `→ fill_start_fire (:597) → state`, plus `victim_way/vic_dirty/
+  fill_blocked_wb (:595)`. So the cut is NOT the array read (~0.9) — it is the **miss→fill-arb→stall
+  chain**, confirming §1/§3's "shape (b)".
+
+**Confirmed design (shape (b)):** Stage R (cycle N) reads `tags/valid` at `index`, computes and
+REGISTERS `{cache_hit, hit_way, miss, victim_way, vic_dirty, srfo_sel, f_index}` + the hit-way
+`data[index]` read (the 9R→1R way-mux, SRAM migration). Stage D (cycle N+1) runs
+`fill_start_fire`/`dc_mem_req`/`o_stall`/`rd_dword`/forward from those REGISTERS → the fill-arb/stall
+chain is a shallow tail off flops (the tag-compare→miss→fill combinational depth is broken across the
+register).
+
+**🔑 The two hard design questions to resolve BEFORE the scaffold (the bulk of the risk):**
+1. **MEM_PIPE fold (§4, the IPC crux).** Loads are already 2-stage (Stage-A latches `m_pa_q`/
+   `lsr_paddr_q`; Stage-B presents `i_addr=lsr_paddr_q`, `heliodor_core.veryl:6789`, combinational
+   lookup). If Stage R folds into Stage-A (present `index=m_pa_q[INDEX_W+5:6]` for the tag read the
+   same cycle the PA is latched, register hit_way into Stage-B), load-use latency is UNCHANGED
+   (IPC-free). If not, loads become 3-stage (load-use +1). **Resolve first** — read the exact
+   Stage-A/Stage-B timing of `m_pa_q`/`lsr_capture`/`lsr_drive`.
+2. **The fill/coherence Stage-R/Stage-D split (SMP-critical, §5).** The mid-fill abort
+   (`inv_fill_hit :417`), same-cycle remote invalidate (`inv_hits_active :364`), ownership pin
+   (`pin_cnt_q :454`), store-drain port (`scache_hit :463`), next-dword forward (`next_* :423`),
+   slot-1 hit port (`i_addr2/o_hit2`), and — atomicity-critical — the **AMO/LR in-cache RMW commit
+   write MUST stay a LIVE single-cycle write** (MEM_PIPE M3b: a +1cy M-stage AMO commit broke SMP
+   litmus; only the READ lookup may pipeline). Each must see the REGISTERED request or re-derive its
+   stall in Stage D.
+
+**▶️ Next-session first step:** resolve Q1 (the fold) by reading the MEM_PIPE M-stage timing, then
+build the `const DCACHE_SYNC_READ` DEAD scaffold (§6 pattern: `*_raw`/`*_q`/`*_eff`), verify
+byte-identical (default 252/0 + **ACT4** + N1 boot cy exact + synth CP unchanged/DCE), then
+FF-insertion measure the flip (FETCH_REG+STORE_PRETRANSLATE+VALU_PIPE+DCACHE_SYNC_READ) to confirm
+the dcache leaves the `n_inflight` 13.84 path → exposes `redirect_pc_q` 13.35. Full ladder (§7:
+ACT4 696 + litmus N4 + N2/N4 SMP + Verilator) at the bundle flip. This is a multi-session build.
