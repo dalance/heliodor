@@ -297,9 +297,47 @@ register).
    litmus; only the READ lookup may pipeline). Each must see the REGISTERED request or re-derive its
    stall in Stage D.
 
-**▶️ Next-session first step:** resolve Q1 (the fold) by reading the MEM_PIPE M-stage timing, then
-build the `const DCACHE_SYNC_READ` DEAD scaffold (§6 pattern: `*_raw`/`*_q`/`*_eff`), verify
-byte-identical (default 252/0 + **ACT4** + N1 boot cy exact + synth CP unchanged/DCE), then
-FF-insertion measure the flip (FETCH_REG+STORE_PRETRANSLATE+VALU_PIPE+DCACHE_SYNC_READ) to confirm
-the dcache leaves the `n_inflight` 13.84 path → exposes `redirect_pc_q` 13.35. Full ladder (§7:
-ACT4 696 + litmus N4 + N2/N4 SMP + Verilator) at the bundle flip. This is a multi-session build.
+### 10.1 ✅ Q1 (the MEM_PIPE fold) RESOLVED (2026-07-02) — the fold IS feasible & IPC-free; the load stays 2-stage, only the commit-store pays +1
+
+Read the load M-stage timing (`heliodor_core.veryl`):
+- **Stage-A** (`lsr_capture`, cycle N, `:1583`): latches `lsr_paddr_q = dmu_dmem_addr` (the MMU-
+  translated PA). **The dcache read is SUPPRESSED here** — deliberately, to avoid the comb loop
+  `i_ren → dcache miss → dcache_stall → iss_dc_ok (:2358) → issue gate → i_ren`. Critically,
+  `lsr_capture` EXCLUDES `iss_dc_ok`/`dcache_stall` (`:1580`), so the capture does NOT depend on the
+  stall.
+- **Stage-B** (`lsr_drive`, cycle N+1): `i_addr = lsr_paddr_q` (`:6789`) → the dcache lookup is
+  **combinational** (tag→hit→miss→fill→stall, the ~5 ns of §1) → forward → CDB.
+
+🔑 **The fold works.** `dmu_dmem_addr` (hence `index = dmu_dmem_addr[INDEX_W+5:6]`) is ALREADY
+available in Stage-A (it is what feeds `lsr_paddr_q`). So Stage-R (tag read + `hit_way`/`cache_hit`
+compute) can run in Stage-A and register its result into Stage-B; Stage-B then does the hit-way data
+read + forward + (on a registered miss) the fill — all from the REGISTERED hit. **Load-use latency is
+UNCHANGED (still 2 stages)** — Stage-R is folded into the existing Stage-A, not added as a 3rd stage.
+- **No comb loop:** the Stage-A tag read computes ONLY `hit`/`hit_way` (registered); it must NOT feed
+  `dcache_stall` (the fill/miss/stall stays in Stage-B/D off the registered miss). Since `lsr_capture`
+  already excludes `iss_dc_ok`, and the Stage-A hit doesn't generate a stall, the loop stays open.
+- **Stage-A budget:** Stage-A gains ≈ MMU (~1.1) + tag read+compare (~1.4) = ~2.5 ns of hit-compute —
+  well under the post-WALL target cycle (~9–13 ns), so the fold does NOT make Stage-A critical.
+- **Commit-store** (the actual 13.84 endpoint): a LIVE lookup today (`commit_store_fire → MMU →
+  dcache` in one cycle, not M-staged). It pays the +1 cycle (register its lookup result → the commit
+  gate `rob_commit_ack` reads it next cycle). Stores are buffered (SB) → not latency-critical →
+  **cheap IPC.** This is where the CP is cut.
+
+**→ Phase C can be nearly IPC-free** (loads folded into Stage-A; only the buffered commit-store pays
++1). The fallback (no fold — make the Stage-B load lookup 2-stage → load-use +1) is simpler but costs
+IPC; prefer the fold.
+
+**Scaffold structure (recommended):** register the lookup RESULT {`cache_hit`, `hit_way`, `miss`,
+`victim_way`, `vic_dirty`, `srfo_sel`, `f_index`} + the hit-way data read. For the load path, the
+Stage-R read is presented at the Stage-A index (`dmu_dmem_addr`) — this needs a Stage-A tag-read port
+into the dcache (or the core presents the index and the dcache registers the hit). For the
+commit-store, Stage-R is the commit-store's live lookup, registered before the commit gate. Q2 (the
+fill/coherence Stage-R/D split, §10 above) remains the SMP-critical implementation risk.
+
+**▶️ Next-session first step:** build the `const DCACHE_SYNC_READ` DEAD scaffold (§6 pattern:
+`*_raw`/`*_q`/`*_eff` on the lookup result), verify byte-identical (default 252/0 + **ACT4** + N1
+boot cy exact + synth CP unchanged/DCE), then FF-insertion measure the flip
+(FETCH_REG+STORE_PRETRANSLATE+VALU_PIPE+DCACHE_SYNC_READ) to confirm the dcache leaves the
+`n_inflight` 13.84 path → exposes `redirect_pc_q` 13.35. Full ladder (§7: ACT4 696 + litmus N4 +
+N2/N4 SMP + Verilator) + IPC (fold check: load-use latency unchanged) at the bundle flip.
+Multi-session build.
