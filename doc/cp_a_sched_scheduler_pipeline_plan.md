@@ -319,3 +319,27 @@ ACT4 (needs `make -C test/act`) is the residual re-confirm but a cycle-exact cha
 tree-izations; the =0 age-tree stays as a DCE'd fallback). **The new binding loop segment is the
 argmin (`sh_csr_addr → iss/win`, ~108 lv / 10.0 ns)** — the next A-SCHED target (AS-b age-matrix is
 depth-neutral §0, so it needs a different structure).
+
+### 7.2 ✅ IMPLEMENTED + MEASURED (2026-07-02) — ROB pending-xlate/store OR-reductions, rs1_rdy 10.0→9.52 (byte-exact)
+
+Tracing the BLK_ROT'd 10.0 ns rs1_rdy path (`sh_csr_addr → rs1_rdy`) exposed the NEXT linear scan:
+`o_has_pending_xlate` (`rob.veryl:687`) and `o_has_pending_store` (`:666`) were **loop-carried
+running-ORs** (`for i { if cond[i] { w = 1'b1 } }`) → a ~30-deep linear OR chain (the `sh_valid[0]`
+×30 `ao21` run in the path). `o_has_pending_xlate` feeds iq_int's `i_block_mem_xlate` → `cand0.blocked`
+→ select loop. Same anti-pattern as the old HPM-overflow OR (fixed in `b54125b`). Replaced with a
+per-entry bit-vector + a single reduction-OR (`|store_pend_vec` / `|xlate_pend_vec`, log-depth). BYTE-
+EXACT (OR is associative — same result).
+
+MEASURED (loop exposed): rs1_rdy 10.000/108 lv → **9.520/96 lv** (−0.48 ns; the xlate scan is no longer
+the worst segment, new worst = `sh_is_amo → argmin`). Byte-exact: default **252/0** (litmus N2
+cy=0022a330), synth **14.565** unchanged, N1 boot 4/4 cycle-exact (smoke 00b6a5d0, 7.1 01210060, 7.1V
+013cc5c0, 6.6 013ee8a0). Committed with BLK_ROT (no param — trivial byte-exact tree-ization like
+LZC/HPM). Load-ordering-critical → litmus N4 + N2 SMP ladder confirms.
+
+**Session cumulative scheduler-loop progress:** rs1_rdy **12.920 (pre-A2) → 11.790 (A2 wake-on-select)
+→ 10.000 (BLK_ROT) → 9.520 (OR-reductions)** = −3.4 ns / −26 %, all masked under the committed 14.565
+front-end (CP-neutral, structural). Toward the ~7.5 ns goal. Remaining loop segments: the argmin
+(`iss/win`, ~33 lv, AS-b depth-neutral → needs a different structure), the FR/wakeup tail, and the
+2-wide alloc interplay. The scheduler is now the SHALLOWEST front — the binding fronts for the CP goal
+are the WALL (vrf 13.88, commit-store 14.13, front-end 14.565, commit/CSR/redirect 12.6–13.8), which
+need their own pipelining (vrf / front-end / bundle).
