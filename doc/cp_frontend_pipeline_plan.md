@@ -175,3 +175,34 @@ Verilator) at the flip — the front end touches everything.
 - `mmu.veryl:318-360` imem MMU V=1 two-stage TLB (already clz-tree-ized — not a linear-scan win).
 - `speculative_wakeup_design.md §1.1` (the keystone-premise correction: rs1_rdy = the allocate path).
 - `deep_pipeline_sram_plan.md` (Phase C/D: caches sync-read; SRAM ⊂ pipelining).
+
+## 5. ▶️ NEXT SESSION (2026-07-03) — Option 1 selected: Phase D front-end, after the dcache scaffold + dense-band confirmation
+
+Phase C dcache `DCACHE_SYNC_READ` DEAD scaffold is committed (`d93c2e3`, `cp_dcache_sync_read_plan.md
+§10.2`). Its FF-insertion flip **empirically confirmed the dense-band** (cut the dcache off
+`n_inflight`, but −0.13 ns only — the commit-store MMU-fault/PMP-cbo-W residual sits right under).
+At the strategic fork (front-end / make-functional / A-SCHED / reassess), the **user chose Option 1
+= Phase D front-end** (the biggest unbuilt structural stage, lower-risk, the sync-read continuation).
+
+**Concrete first step (§2 cut order (A), §3 methodology):** rebuild the **`ICACHE_SYNC_READ` DEAD
+scaffold** — it was built once and reverted (§2.1: "rebuild as part of the coordinated flip"), so it
+is NOT in the tree today. Mirror the just-committed **`DCACHE_SYNC_READ` (`d93c2e3`) template
+exactly**:
+- Rename the icache lookup outputs (`tag`/`hit_*`/`icache_rdata` + the straddle/next window) to
+  `*_raw`, add `*_q` registers written ONLY under `if ICACHE_SYNC_READ` (reset-only → DCE at 0 =
+  synth-CP-neutral, the const-gate methodology rule), and `*_eff = ICACHE_SYNC_READ ? *_q : *_raw`
+  keeping the ORIGINAL names so decode (`u_cexp`/`u_dec`) routes to `*_eff` untouched.
+- **DEAD (=0) verify (mandatory 4 gates, as dcache):** default 252/0 · synth 14.565 unchanged (regs
+  DCE) · N1 boot cy-EXACT (7.1 `01210060` / 7.1V `013cc5c0`) · **ACT4 696/696**.
+- **FF-insertion flip measure** (FETCH_REG=1 + ICACHE_SYNC_READ=1, throwaway/revert): confirm the
+  icache read leaves the front-end fetch-half; expect the imem-MMU V=1 TLB (~5 ns) to become the
+  fetch-half floor (→ step B).
+- **Then (B) imem-MMU translate stage (F1)** — register `o_imem_paddr` (the ~5 ns V=1 two-stage TLB,
+  the biggest single front-end chunk). Pure pipeline reg (TLB is flops, not SRAM). This is the F1
+  stage of the FINAL diagram.
+
+**Corners at the eventual functional flip** (§3): straddle/cross-line fetch (`straddle_q`,
+`icache_rdata_next`), FB push/pop timing (icache now 1-cy later), branch-redirect fetch restart
+(+1 bubble), dual-issue slot-1 (`s1_instr`/`if_*_q1`). Full ladder + IPC at the bundle flip; the
+DEAD scaffold + measure is the per-session deliverable. Lower-risk than dcache (in-order front-end,
+no SMP atomicity). Anchors: §4 above + `d93c2e3` as the live template.
