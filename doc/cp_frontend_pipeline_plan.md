@@ -411,8 +411,35 @@ the VU-FP regression, then **(e)** the scalar issue/execute/scheduler wall under
 is finally unmasked. The front-end (Phase D) is done and off the critical path; the binding work is
 now squarely the **back-end** (commit-store Phase E + the FMA cleanup + a repaired keystone).
 
-## 10. ▶️ NEXT SESSION (user-selected "b", after /clear) — remove the DEAD FP FMA mul→add chain (`s1_prod → s1_sum` 13.23)
+## 10. ✅ DONE (2026-07-03, user-selected "b") — removed the DEAD FP FMA mul→add chain (`s1_prod → s1_sum` 13.23 is GONE)
 
+**Delivered.** `fpu_wrap.veryl`: dropped the FMA arm of both adder-input muxes so `u_fp_add_s` /
+`u_fp_adder` are pure FADD/FSUB units. Single: `add_s_a = s1_val; add_s_b = s2_val; add_s_sub =
+i_fpu_op == FpuOp::FSUB_S`. Double: `add_a = d1; add_b = d2; add_sub = i_fpu_op == FpuOp::FSUB_D`.
+The now-dead `is_fma_s` / `is_fma` / `fma_s_product` / `fma_s_sub` / `fma_product` / `fma_sub` `let`s
+were removed too (grep confirmed each had NO consumer beyond the cut mux arm; `s3_val` / `fwd_fp_rs3`
+stay — the fused `u_fp_fma_s` / `u_fp_fma` still read them; `fp_mul_s_result` / `fp_mul_result` stay —
+FMUL_S / FMUL_D still read them). Byte-identical: `fp_add_*_result` / `fflags` are read ONLY for
+FADD/FSUB (the FMA output/fflags muxes select the fused `fp_fma_*`), so the discarded adder output
+changing is unobservable.
+
+**Verified byte-identical (all green):** default **252/0** with `--backend-validate` (cc vs cranelift,
+no divergence — exercises FADD/FSUB/FMADD/FMSUB/FNMADD/FNMSUB single+double) · **ACT4 F 82/82** +
+**ACT4 D 114/114** · N1 boot cy-exact 7.1 `01210060` / 7.1V `013cc5c0` / 6.6 `013ee8a0`.
+
+**Synth confirmed — the 13.23 FMA front is GONE.** Re-ran the §9 mechanical bundle flip (front-end +
+commit-store + vrf + dcache + A-LOOP, EX_PIPE/LOAD_SPEC excluded), throwaway synth, reverted. Floor
+still **13.710** `head → n_inflight` (unchanged — the cut is masked, exactly the predicted
+structure-not-CP outcome). The exposed band is now **n_inflight 13.71 → redirect_pc_q 13.21 → mip[13]
+13.19**; the old **#2 `s1_prod → s1_sum` 13.23 no longer appears anywhere** in the 4000-endpoint dump
+(window bottom 12.55, so a 13.23 path would show if present — it does not). Dead FP path eliminated;
+the next FP-side front is now redirect_pc / mip, not the FMA chain.
+
+**Roadmap position unchanged:** global CP is still 13.710, gated by the **Phase E** commit/retire wall
+(`head → n_inflight`). Remaining to ~7.5 ns (per §9's `roadmap`): (a) Phase E commit staging, (c)
+redirect_pc, (d) fix EX_PIPE, then (e) the scalar issue/execute/scheduler wall. (b) is now done.
+
+### Original handoff (kept for reference)
 The §9 bundle-flip #2 front `s1_prod_q → s1_sum_q` **13.23 ns / 146 levels** was mis-labelled
 "integer multiplier" — CORRECTED: it is the **single-precision FMA multiply→add chain in
 `fpu_wrap.veryl`**, and it is a **DEAD path** removable byte-identically.
