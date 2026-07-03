@@ -2439,6 +2439,30 @@ pub module heliodor_core #(
     // back via u_lsu on lsu_cdb, so u_alu is gated OFF for it (and u_lsu gated ON
     // under the identical issue condition). AMO/LR/SC (is_amo) stay on u_alu.
     let iss_is_plain_load: logic = iq_issue_op.base.is_load && !iq_iss_is_amo;
+    // A-EXE E3 — writeback-arbitration via issue deferral (speculative_wakeup_design
+    // §1.0b). At EX_PIPE=1 a lane-0 ALU result registered THIS cycle (alu_cdb_q)
+    // broadcasts NEXT cycle, where a higher-priority FU (fpu > mshr > int_div, the
+    // unified-CDB mux at ~line 2425) newly winning would silently DROP it (the int
+    // PRF write rides cdb.pdst/data → the ALU result is lost → its consumer never
+    // wakes → ROB-head wedge). The existing issue gate (!fpu_cdb.valid &&
+    // !mshr_cdb.valid, at cycle N) protects only the SAME-cycle combinational
+    // broadcast (EX_PIPE=0). To preserve "a granted fixed-latency ALU op ALWAYS
+    // broadcasts at N+1" — the invariant the scheduled wakeup + E2 bypass rely on —
+    // defer the lane-0 issue at N whenever a higher-priority FU will drive the CDB
+    // at N+1. Conservative predictor (any FP activity in flight, any MSHR fill, or
+    // an int-divide in flight — each can land on the CDB next cycle); tightened for
+    // IPC at the EX_PIPE=1 flip. Threaded into BOTH u_alu.i_issue_valid AND
+    // iq_issue_ack so a deferred op stays in the IQ (no false wakeup, no lost op).
+    // DEAD at EX_PIPE=0 (ex3_defer folds to 0 → both gates byte-identical, DCE'd).
+    // int_div broadcasts at N+1 when its combinational done (int_div_valid_w,
+    // registered into int_div_done_q next cycle → int_div_cdb.valid) fires THIS
+    // cycle. int_div_valid_w is defined at the int_divider inst below, so forward-
+    // declare the predictor here and assign it right after that inst.
+    var ex3_int_div_next: logic;
+    let ex3_hipri_next: logic = iqf_issue_valid || fpu_busy || fpu_cdb.valid
+        || mshra_v_q || mshrb_v_q || mshr_cdb.valid
+        || ex3_int_div_next || int_div_cdb.valid;
+    let ex3_defer: logic = EX_PIPE && ex3_hipri_next;
     inst u_alu: alu_wrap (
         // Phase 1 step-1.5: slot-0 issues FREELY while a plain load is in Stage B
         // (lsr_v_q) — the load now writes back on lane 1 (flexible lane), so it no
@@ -2446,7 +2470,7 @@ pub module heliodor_core #(
         // gated by !lsr_v_q: they READ the dcache at issue (dc_amo_read) and would
         // collide with the LSR's Stage-B read port. (A fault/FP load that DOES ride
         // lane 0 yields to alu_cdb via lsr_lane0_free, so no writeback is lost.)
-        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold,
+        i_issue_valid     : iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold && !ex3_defer,
         i_issue_op        : iq_issue_op                                         ,
         i_issue_rd_pdst   : iq_iss_rd_pdst                                      ,
         i_issue_rob_idx   : iq_iss_rob_idx                                      ,
@@ -2566,6 +2590,10 @@ pub module heliodor_core #(
         o_valid : int_div_valid_w        ,
         o_busy  : int_div_busy_w         ,
     );
+    // A-EXE E3: int_div_valid_w (combinational done) THIS cycle ⇒ int_div_cdb.valid
+    // next cycle → the ex3_defer predictor above defers a lane-0 ALU issue so the
+    // registered ALU result is not dropped by int_div winning the CDB at N+1.
+    assign ex3_int_div_next = int_div_valid_w;
     always_ff (clk, rst) {
         if_reset {
             int_div_started  = 1'b0;
@@ -2713,7 +2741,7 @@ pub module heliodor_core #(
     // OTHER slot-0 op acks/leaves the IQ while a load occupies the LSR (block-on-issue).
     let iq_issue_ack: logic = if iss_is_div ?
         (int_div_cdb.valid && !fpu_cdb.valid && !mshr_cdb.valid)
-    : ((iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold) || lsr_capture || mshr_capture);
+    : ((iq_issue_valid && !dmem_mmu_busy && !load_walk_block && !fpu_cdb.valid && !mshr_cdb.valid && iss_dc_ok && !load_blocks_on_store && !iss_is_plain_load && !(lsr_v_q && iq_iss_is_amo) && !amo_fetch_hold && !ex3_defer) || lsr_capture || mshr_capture);
 
     // A-LOOP A2 piece 1 (cp_a_loop_plan.md §11.6): dcache-FREE FR-drain ack for iq_int.
     // BYTE-IDENTICAL to iq_issue_ack for every op: a plain load's ack is already just
