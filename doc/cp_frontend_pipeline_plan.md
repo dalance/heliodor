@@ -318,3 +318,51 @@ imem stage (5.36) is still the deepest fetch stage — a later step would split 
 itself (G-stage | VS-stage) if the front-end floor must go below ~5 ns for the 7.5 ns goal. Anchors:
 `iq_int.veryl` (rename/allocate), `u_dec`/`u_cexp` in `heliodor_core.veryl`, §4, `8344d0a`
 (ICACHE_SYNC_READ) + this session's `IMEM_MMU_STAGE` as the live templates.
+
+## 8. ✅ DONE (2026-07-03) — step C `DECODE_REG` (D|R boundary); Phase D front-end STRUCTURALLY COMPLETE
+
+Built the `DECODE_REG` DEAD scaffold in `heliodor_core.veryl` (the R-stage input register = the
+last unbuilt front-end boundary). MEASURED clarification first: the FB holds the **post-cexp**
+instruction (`fetched_instr = c_expanded_w`, pushed into `fb_instr`), so `u_cexp` sits in F2 (before
+the FB), and the FB (FETCH_REG) is the F|D reg. That leaves `if_instr_q → u_dec → dec_op →
+iq_alloc_rdy → rename_fire → prf_ready → rs1_rdy` = **decode (2.05) + rename/allocate (3.21) = ~5.3 ns
+fused in one cycle**, with NO register between D and R. `DECODE_REG` registers the **decode output**
+`dec_op` / `dec_op2` (the `DecodedOp` structs) — the minimal cut: those two structs ARE the D|R
+boundary (`dec_op` feeds `iq_alloc_rdy`/rename/ROB-alloc); the fetch metadata (`if_pc_q` / `if_v_q` /
+`if_ifault_q` / `if_iacc_q`) is NOT on the `rs1_rdy` critical path (it is rob-alloc payload) so it
+stays live — byte-identical at 0 either way. Pattern = EX_PIPE's `alu_cdb_q` (`var *_q: DecodedOp` +
+`let dec_op: DecodedOp = if DECODE_REG ? dec_op_q : dec_op_raw`, struct `'0` reset + whole-struct
+mux, both proven by the `alu_cdb_eff` precedent); the `*_raw` is the live `u_dec` output, the eff
+`let`s keep the ORIGINAL names `dec_op`/`dec_op2` so every rename/allocate consumer routes untouched.
+
+**DEAD (=0) — all 4 gates green:** default **252/0** (litmus N2 `cy=0022a330`); synth **14.565 ns +
+159948 FFs unchanged** (both `dec_op*_q` structs DCE'd; +164 mux gates only); N1 boot cy-EXACT (7.1
+`01210060` / 7.1V `013cc5c0` / 6.6 `013ee8a0`); **ACT4 696/696**.
+
+**FLIP measure (throwaway, reverted) — the cleanest of the three, because `dec_op_q` lands in the
+visible wall band:** `DECODE_REG=1` (FETCH_REG=0): global CP **14.130** (front-end front cut). The
+**`rs1_rdy[0]` source flips from `pc_q` (14.565) to `head` (12.920)** — direct proof the decode→rename
+path is cut off `rs1_rdy`, exposing the **scheduler select→wakeup loop (12.920, the keystone A-SCHED
+front)** underneath as the new `rs1_rdy` floor (matches the A-LOOP measurements). The new register
+shows as `pc_q → dec_op2_q` at **~11.9 ns** (118 levels) = the fetch+decode cone now terminating at
+the D|R flop. So `DECODE_REG` splits the ~5.3 ns decode+rename into **decode (2.05, F-side) | rename
+(3.21, R-side)**.
+
+**🏁 Phase D front-end structurally COMPLETE.** All four FINAL front-end stage boundaries are now
+DEAD-scaffolded and 4-gate-validated: **F1** imem translate (`IMEM_MMU_STAGE`, 5.36) | **F2** icache
+read (`ICACHE_SYNC_READ`, ~1.5) | **D** cexp+decode / F|D reg (`FETCH_REG`, cexp ~2 + decode 2.05) |
+**R** rename+allocate / D|R reg (`DECODE_REG`, 3.21). **Every front-end stage is ≤ 5.36 ns — already
+below the ~7.5 ns campaign target**, so the front end needs NO further splitting for 7.5 ns (the imem
+5.36 is the deepest and it is under budget; a G|VS TLB split is unnecessary unless the target drops).
+
+**▶️ The binding constraint is no longer the front end — it is the back-end wall + the keystone.**
+With the front end cut, the exposed fronts are the **back-end wall** (`head → n_inflight` commit-store
+14.13, `head → vrf` 13.88 — both already DEAD-scaffolded: STORE_PRETRANSLATE/trap-deferral, VALU_PIPE,
+DCACHE_SYNC_READ) and the **keystone scheduler loop** (`head → rs1_rdy` 12.920, A-SCHED lowers it to
+9.52; A-LOOP/A1.1 done). NEXT is a campaign-level decision (a phase transition, like the dcache
+dense-band fork): (a) advance the **keystone** (A-SCHED binding-stage / A-EXE regread-execute
+staging — the IS/RR/EX/WB loop, the actual gate to 7.5 ns), or (b) attempt the **coordinated bundle
+flip** now that front-end + commit-store + vrf + dcache + keystone scaffolds all exist, or (c) the
+deferred commit/retire (Phase E). Anchors: `deep_pipeline_sram_plan.md` (FINAL diagram + keystone),
+`cp_a_loop_plan.md` / `cp_a_sched_scheduler_pipeline_plan.md` (keystone), `8344d0a`/`31b9e89` +
+this `DECODE_REG` as the front-end live templates.
