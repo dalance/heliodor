@@ -366,3 +366,47 @@ flip** now that front-end + commit-store + vrf + dcache + keystone scaffolds all
 deferred commit/retire (Phase E). Anchors: `deep_pipeline_sram_plan.md` (FINAL diagram + keystone),
 `cp_a_loop_plan.md` / `cp_a_sched_scheduler_pipeline_plan.md` (keystone), `8344d0a`/`31b9e89` +
 this `DECODE_REG` as the front-end live templates.
+
+## 9. 🔬 BUNDLE-FLIP MEASUREMENT (2026-07-03, user-selected after Phase D) — the real CP is 13.710, capped by the un-scaffolded back-end
+
+With Phase D complete, all campaign DEAD scaffolds exist, so a throwaway synth-only flip of the whole
+bundle answers the long-masked question "what CP does the accumulated structure actually reach?"
+Flipped =1 together (reverted after): front-end (FETCH_REG, ICACHE_SYNC_READ, IMEM_MMU_STAGE,
+DECODE_REG) + commit-store (STORE_PRETRANSLATE) + vrf (VALU_PIPE) + dcache (DCACHE_SYNC_READ) +
+keystone (EX_PIPE, SEL_PIPE, SPEC_WAKE). Live already: MEM_PIPE, BLK_ROT (A-SCHED), VFP/VINT_PIPE.
+Excluded: LOAD_SPEC (incomplete A2).
+
+**Result — NOT ~7.5 ns. The bundle bottoms out at a dense back-end wall, and one scaffold regresses:**
+
+| config | CP | top endpoint(s) |
+|---|---|---|
+| DEAD baseline | 14.565 | `pc_q → rs1_rdy` (front-end sweep) |
+| **mechanical** (front-end + commit-store + vrf + dcache, **+A-LOOP**) | **13.710** | `head → n_inflight` (commit-store) + `s1_prod → s1_sum` (multiply) |
+| full bundle (+ EX_PIPE) | **17.490 (REGRESSION)** | `occupied → s2_cheap_fflags` / `fr_d_sum_q` (VU FP, 197 levels) |
+
+**Three findings:**
+1. **The real floor of every built scaffold is 13.710 ns** — only **−0.855** from the DEAD 14.565.
+   The exposed wall is a dense 13.0–13.7 band of **un-scaffolded back-end fronts**: `head →
+   n_inflight` **13.71** (the commit-store MMU-fault / PMP-cbo residual = the **Phase E** deferred
+   commit/retire body), the integer **multiplier** `s1_prod_q → s1_sum_q` **13.23** (single-cycle
+   multiply, never pipelined), and `head → redirect_pc` **13.21**. **NONE is the front end** — every
+   Phase D cut (and vrf/dcache/commit-store-pretranslate) is masked below 13.71. So Phase D advanced
+   the STRUCTURE but bought ~0 global CP, exactly the structure-not-CP situation, and the CP is now
+   gated by fronts the campaign has NOT yet staged.
+2. **A-LOOP (SEL_PIPE + SPEC_WAKE) is clean** — adding it leaves the wall at 13.710 (the spec-wake
+   lanes are shallow, as A1.1 measured).
+3. **EX_PIPE (A-EXE, the CDB register) is BROKEN at flip** — alone on the mechanical bundle it
+   REGRESSES to **17.490 ns** via a 197-level VU-FP path `occupied → s2_cheap_fflags` / `fr_d_sum_q`
+   (16.65–17.49). EX_PIPE was built (DEAD, const-gated so =0 synths clean at 14.565) but **never
+   flip-validated**; its =1 exposes/creates a long path into the vector FP datapath. It must be
+   root-caused (false path vs genuine bad staging of the CDB→VU-FP writeback) before the keystone can
+   join the bundle.
+
+**▶️ The measured roadmap to ~7.5 ns (what the bundle floor says is actually left):** cut the 13.71
+wall — **(a) Phase E** commit/retire staging (`head → n_inflight` 13.71, the current #1), **(b)
+integer multiplier pipelining** (`s1_prod → s1_sum` 13.23, a single-cycle multiply — a clean
+datapath pipeline, unlike the deferred/SMP-constrained Phase E), **(c)** redirect_pc, **(d) fix
+EX_PIPE** so the keystone execute/wakeup loop can bundle without the VU-FP regression, then **(e)**
+the scalar issue/execute/scheduler wall underneath (A-SCHED/A-EXE) is finally unmasked. The
+front-end (Phase D) is done and off the critical path; the binding work is now squarely the
+**back-end** (commit-store Phase E + multiplier + a repaired keystone).
