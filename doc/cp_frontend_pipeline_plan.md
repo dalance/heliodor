@@ -265,3 +265,56 @@ fetch-half (imem translate | icache access). Note for after B: the **decode-half
 co-equal front-end pole** — its floor is the rename/IQ-allocate cone (3.21 ns, `iq_alloc_rdy →
 rename_fire → prf_ready → rs1_rdy`), so a decode/rename stage is the third front-end lever. Anchors:
 `mmu.veryl:318-360` (V=1 TLB), §4, `d93c2e3` + this session's icache scaffold as the live templates.
+
+## 7. ✅ DONE (2026-07-03) — step B `IMEM_MMU_STAGE` DEAD scaffold; imem translate = F1; NEXT = the decode/rename half
+
+Built the `IMEM_MMU_STAGE` DEAD scaffold in **`imem_mmu.veryl`** (NOT the shared `mmu.veryl` — the
+i-side has its own wrapper module `imem_mmu` around `u_mmu`, so registering here touches ONLY the
+fetch path, never the dmem MMU / commit-store front). Registered the **translation result** — the 4
+output ports `o_paddr` / `o_valid` / `o_fault` / `o_acc_fault` — via rename-to-`*_raw` + reset-only
+`*_q` (`if IMEM_MMU_STAGE` write-fold) + `assign o_paddr = IMEM_MMU_STAGE ? o_paddr_q : o_paddr_raw`.
+The walk **handshake** (`o_busy`, the PTW port, Svadu A-bit write-back) and the V=1 **htval**
+side-info (`o_gstage_fault` / `o_fault_gpa`) stay LIVE — only the 4 result outputs are staged. None
+of the 4 has an internal reader (the PMP / PMA checks use the separate `fetch_pa` recompute, not
+`o_paddr`), so the cut is clean.
+
+**DEAD (=0) — all 4 gates green (byte-identical + synth-CP-neutral):**
+- default **252/0** (litmus N2 `cy=0022a330`).
+- synth **14.565 ns unchanged**, **159948 FFs unchanged** vs baseline (the 67 new regs — paddr 64 +
+  valid/fault/acc 1 each — fully DCE'd; +132 pass-through mux gates only, off CP).
+- N1 boot cy-EXACT: 7.1 `01210060` / 7.1V `013cc5c0` / 6.6 `013ee8a0`.
+- **ACT4 696/696**.
+
+**FLIP measure (throwaway, reverted) — a MASKED, pure-structural stage (as the campaign expects):**
+- Full-core `ICACHE_SYNC_READ=1 + IMEM_MMU_STAGE=1`: global CP **14.130 ns unchanged** (no
+  regression); FFs 160081 (= 159948 + icache o_rdata_q 66 + imem o_paddr_q 67, both scaffolds' regs
+  live at flip). The fetch stages (imem 5.36 ns, icache ~1 ns) are **> 4 ns below the back-end wall**
+  — a `--timing-paths 40000` dump bottoms out at **10.950 ns** (40 000 endpoints all in 10.95–14.13,
+  the vrf/commit/prf/tag back-end), so the fetch endpoints (5–7 ns) are hopelessly masked and produce
+  ZERO measurable global CP. Same structure-not-CP situation as the dcache (−0.13) and vrf (−0.04)
+  DEAD commits.
+- **Standalone `imem_mmu` synth (unmasked)**: CP **7.248 ns**, and at `IMEM_MMU_STAGE=1` the worst
+  endpoint moves from the comb output `v1_vpn → o_acc_fault[0]` to the **register** `v1_vpn →
+  o_acc_fault_q[0]` (FFs 4663 → 4730, +67) — direct proof the register **captures the translate
+  result** off the fetch path. (In the full core the fetch DATA path was 5.36 ns to `o_paddr`; the
+  isolated module's deepest of the 4 outputs is `o_acc_fault` at 7.248 ns = paddr + PMP-X +
+  pma_hole — registering all 4 together cuts the deepest too.)
+
+**Where the register lands (from step A's DEAD=0 `--dump-timing`, §6):** the imem-MMU V=1 two-stage
+TLB cone is `pc_q → u_mmu.v1_vpn → … → v1_hit → mmu_paddr → o_imem_paddr = 5.36 ns`. `IMEM_MMU_STAGE`
+puts the flop exactly on that 5.36 ns output, so the fetch-half splits into **imem translate (F1,
+5.36 ns) | icache access (~1 ns, the RAM read is inferred SRAM, cheap)** — the biggest single
+front-end chunk is now its own stage.
+
+**▶️ NEXT SESSION — the decode/rename half (F2/F3, the co-equal front-end pole).** After B, the two
+front-end poles are the **imem stage (5.36 ns, F1)** and the **decode-half (~7.5 ns)** — now the
+TALLER pole. Its floor is the **rename/IQ-allocate cone (3.21 ns, `iq_alloc_rdy → rename_fire →
+prf_ready → rs1_rdy`)** on top of decode (2.05) + cexp (1.68). The next lever is a decode|rename
+stage boundary: register the decoded-op / free-list-pop output so `cexp+decode` (F2) and
+`rename+IQ-allocate` (F3) are separate cycles. This is trickier than a cache/MMU output reg (rename
+allocates the free-list + writes the RAT + IQ — the allocate is stateful, not a pure passthrough), so
+it likely needs the same DEAD-scaffold discipline plus dispatch-timing corners at the flip. Note the
+imem stage (5.36) is still the deepest fetch stage — a later step would split the V=1 two-stage TLB
+itself (G-stage | VS-stage) if the front-end floor must go below ~5 ns for the 7.5 ns goal. Anchors:
+`iq_int.veryl` (rename/allocate), `u_dec`/`u_cexp` in `heliodor_core.veryl`, §4, `8344d0a`
+(ICACHE_SYNC_READ) + this session's `IMEM_MMU_STAGE` as the live templates.
