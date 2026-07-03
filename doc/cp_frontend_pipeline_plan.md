@@ -381,15 +381,16 @@ Excluded: LOAD_SPEC (incomplete A2).
 | config | CP | top endpoint(s) |
 |---|---|---|
 | DEAD baseline | 14.565 | `pc_q → rs1_rdy` (front-end sweep) |
-| **mechanical** (front-end + commit-store + vrf + dcache, **+A-LOOP**) | **13.710** | `head → n_inflight` (commit-store) + `s1_prod → s1_sum` (multiply) |
+| **mechanical** (front-end + commit-store + vrf + dcache, **+A-LOOP**) | **13.710** | `head → n_inflight` (commit-store) + `s1_prod → s1_sum` (**FP FMA dead chain**, see §10) |
 | full bundle (+ EX_PIPE) | **17.490 (REGRESSION)** | `occupied → s2_cheap_fflags` / `fr_d_sum_q` (VU FP, 197 levels) |
 
 **Three findings:**
 1. **The real floor of every built scaffold is 13.710 ns** — only **−0.855** from the DEAD 14.565.
    The exposed wall is a dense 13.0–13.7 band of **un-scaffolded back-end fronts**: `head →
    n_inflight` **13.71** (the commit-store MMU-fault / PMP-cbo residual = the **Phase E** deferred
-   commit/retire body), the integer **multiplier** `s1_prod_q → s1_sum_q` **13.23** (single-cycle
-   multiply, never pipelined), and `head → redirect_pc` **13.21**. **NONE is the front end** — every
+   commit/retire body), the **FP FMA `s1_prod_q → s1_sum_q` 13.23** (CORRECTED — NOT an integer
+   multiply; it is the single-precision FMA mul→add chain in `fpu_wrap`, and it turns out to be a
+   DEAD path, see §10), and `head → redirect_pc` **13.21**. **NONE is the front end** — every
    Phase D cut (and vrf/dcache/commit-store-pretranslate) is masked below 13.71. So Phase D advanced
    the STRUCTURE but bought ~0 global CP, exactly the structure-not-CP situation, and the CP is now
    gated by fronts the campaign has NOT yet staged.
@@ -403,10 +404,62 @@ Excluded: LOAD_SPEC (incomplete A2).
    join the bundle.
 
 **▶️ The measured roadmap to ~7.5 ns (what the bundle floor says is actually left):** cut the 13.71
-wall — **(a) Phase E** commit/retire staging (`head → n_inflight` 13.71, the current #1), **(b)
-integer multiplier pipelining** (`s1_prod → s1_sum` 13.23, a single-cycle multiply — a clean
-datapath pipeline, unlike the deferred/SMP-constrained Phase E), **(c)** redirect_pc, **(d) fix
-EX_PIPE** so the keystone execute/wakeup loop can bundle without the VU-FP regression, then **(e)**
-the scalar issue/execute/scheduler wall underneath (A-SCHED/A-EXE) is finally unmasked. The
-front-end (Phase D) is done and off the critical path; the binding work is now squarely the
-**back-end** (commit-store Phase E + multiplier + a repaired keystone).
+wall — **(a) Phase E** commit/retire staging (`head → n_inflight` 13.71, the current #1), **(b) remove
+the dead FP FMA mul→add chain** (`s1_prod → s1_sum` 13.23 — a byte-identical cut, NOT a pipeline; see
+§10), **(c)** redirect_pc, **(d) fix EX_PIPE** so the keystone execute/wakeup loop can bundle without
+the VU-FP regression, then **(e)** the scalar issue/execute/scheduler wall underneath (A-SCHED/A-EXE)
+is finally unmasked. The front-end (Phase D) is done and off the critical path; the binding work is
+now squarely the **back-end** (commit-store Phase E + the FMA cleanup + a repaired keystone).
+
+## 10. ▶️ NEXT SESSION (user-selected "b", after /clear) — remove the DEAD FP FMA mul→add chain (`s1_prod → s1_sum` 13.23)
+
+The §9 bundle-flip #2 front `s1_prod_q → s1_sum_q` **13.23 ns / 146 levels** was mis-labelled
+"integer multiplier" — CORRECTED: it is the **single-precision FMA multiply→add chain in
+`fpu_wrap.veryl`**, and it is a **DEAD path** removable byte-identically.
+
+**Root cause (verified).** `fpu_wrap` has TWO FMA implementations. The **fused** `u_fp_fma_s`
+(`fp_fma_s`) produces the real FMA result — the output mux selects `fp_fma_s_result` /
+`fp_fma_s_fflags` for FMADD_S/FMSUB_S/FNMADD_S/FNMSUB_S (lines ~1779-1782, ~2785-2786, ~1003). The
+separate adder `u_fp_add_s` (`fp_adder_s`) produces `fp_add_s_result` / `fp_add_s_fflags`, consumed
+**ONLY** for FADD_S/FSUB_S (lines ~1774-1775, ~2778, ~1000). BUT its input still routes the
+multiplier product during FMA:
+```
+let add_s_a  : logic<32> = if is_fma_s ? fma_s_product : s1_val;   // fpu_wrap.veryl:508
+let add_s_b  : logic<32> = if is_fma_s ? s3_val        : s2_val;   // :509
+let add_s_sub: logic     = if is_fma_s ? fma_s_sub : i_fpu_op == FpuOp::FSUB_S;  // :510
+```
+`fma_s_product = fp_mul_s_result` (the u_fp_mul_s output). So during an FMA, `fp_mul_s_result →
+fma_s_product → add_s_a → u_fp_add_s(...) → s1_sum_q` is a live combinational path (the 13.23), but
+`u_fp_add_s`'s **result and fflags are discarded** (the FMA uses the fused unit). This routing is
+**vestigial** — a leftover from before `u_fp_fma_s` was added; `u_fp_add_s` no longer needs to do the
+FMA add. The **double-precision** path is identical: `add_a = if is_fma ? fma_product : d1`
+(`fpu_wrap.veryl:838-840`); `fp_add_result` is FADD_D/FSUB_D-only (1759-1760, 2766), FMA_D uses
+`fp_fma_result` (1768-1771, 2774). The **vector unit has no such chain** (checked).
+
+**The fix (byte-identical CUT — the deliverable):** drop the FMA arm of the adder-input muxes so the
+adders are pure FADD/FSUB units:
+```
+let add_s_a  : logic<32> = s1_val;
+let add_s_b  : logic<32> = s2_val;
+let add_s_sub: logic     = i_fpu_op == FpuOp::FSUB_S;
+```
+and the double-precision `add_a = d1; add_b = d2; add_sub = i_fpu_op == FpuOp::FSUB_D;`. Keep
+`u_fp_mul_s` / `u_fp_mul` (still used for FMUL_S / FMUL_D). This severs `s1_prod → s1_sum`. It is
+byte-identical because `fp_add_*_result` / `fflags` are never read during FMA — the discarded adder
+output changing value is unobservable (even the PIPE=1 `s1_sum_q` register only feeds those unused
+outputs). First confirm `fma_s_product` / `fma_product` (and `fma_s_sub` / `fma_sub`, `s3_val` /
+`fwd_fp_rs3`) have NO other consumer than the adder input (grep) — if clean, they DCE after the cut.
+
+**Verify (the FMA/FADD paths must stay bit-exact):** default **252/0** (the rv64uf/ud FP arch tests
+in `tb/test_arch_fp.veryl` exercise FADD/FSUB/FMADD/FMSUB/FNMADD/FNMSUB single+double) · `veryl test
+--backend-validate` · **ACT4 F + D suites** (`veryl test --ignored --test test_act_f` / `test_act_d`)
+· N1 boot cy-exact (7.1 `01210060` / 7.1V `013cc5c0` / 6.6 `013ee8a0`). Then re-run the §9 mechanical
+bundle synth and confirm `s1_prod → s1_sum` 13.23 is GONE (the exposed #2 should drop to the ~13.2
+redirect_pc / other band). Anchors: `fpu_wrap.veryl:482-524` (single FMA + u_fp_add_s), `:828-854`
+(double), `:1000-1003` / `:1759-1782` / `:2766-2787` (output/fflags mux — the dead-during-FMA proof).
+
+**Caveat (structure-not-CP):** this cut is **masked** by the commit-store `n_inflight` 13.71 (Phase E,
+the bundle #1), so it does NOT move the global CP alone — it removes a genuine dead path / false
+timing front (design hygiene + unmasks the next FP-side front) and is the low-risk clean-datapath step
+the user picked. Moving the global CP below 13.71 still needs Phase E (or the multiplier/redirect/
+keystone fronts once 13.71 is cut).
