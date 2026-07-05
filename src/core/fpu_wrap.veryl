@@ -17,6 +17,14 @@ pub module fpu_wrap #(
     // CDB). 1 = 2-stage pipelined (arith units registered, metadata+result carried
     // to the next cycle; common ops uniformly latency 2; div/sqrt unchanged).
     param PIPE     : u32 = 0,
+    // A-EXE (EX_PIPE): 0 = FROUND stays 2-stage (byte-identical). 1 = the Zfa
+    // FROUND rounding-add is registered (PIPE:1), splitting FROUND into 3 stages
+    // (add-part1 | add-part2 | magic-sub) so the ~13ns combinational add leaves the
+    // synth CP; the op is then held at the iq_fp head one extra cycle (like div/sqrt)
+    // and broadcasts on the 3rd cycle. Wired from core's EX_PIPE (only needed there,
+    // where the const-prop that hid the fround-add path at EX_PIPE=0 is gone), so the
+    // EX_PIPE 0->1 flip activates the 3-stage FROUND together with the registered CDB.
+    param FROUND_PIPE: bit = 0,
 ) (
     clk: input clock,
     rst: input reset,
@@ -847,7 +855,9 @@ pub module fpu_wrap #(
     let fr_s_magic     : logic<32> = {s1_val[31], 8'd150, 23'd0};
     var fr_s_sum       : logic<32>;
     var fr_s_sum_fflags: logic<5> ;
-    inst u_fround_s_add: fp_adder_s (
+    inst u_fround_s_add: fp_adder_s #(
+        PIPE: FROUND_PIPE,
+    ) (
         clk                      ,
         rst                      ,
         i_a     : s1_val         ,
@@ -861,7 +871,9 @@ pub module fpu_wrap #(
     let fr_d_magic     : logic<64> = {d1[63], 11'd1075, 52'd0};
     var fr_d_sum       : logic<64>;
     var fr_d_sum_fflags: logic<5> ;
-    inst u_fround_d_add: fp_adder (
+    inst u_fround_d_add: fp_adder #(
+        PIPE: FROUND_PIPE,
+    ) (
         clk                      ,
         rst                      ,
         i_a     : d1             ,
@@ -1491,6 +1503,10 @@ pub module fpu_wrap #(
             // P10 Zfa FROUND/FROUNDNX: round to integral via the rint adder trick.
             // PIPE=1 finalizes in stage 2 (fround_*_final via the s2_data mux);
             // the stage-1 value here is a dead placeholder. PIPE=0 finalizes here.
+            // 3-stage (FROUND_PIPE=1) broadcasts held-at-head via a DEDICATED
+            // o_cdb.data arm (fround_data below), NOT fpu_result — keeping fpu_result
+            // dead here avoids routing the ~13ns magic-sub into s2_cheap_result (a
+            // dead-but-timed false path that would hold the synth CP at ~14.9ns).
             FpuOp::FROUND_S, FpuOp::FROUNDNX_S: {
                 fpu_result = if PIPE == 1 ? 64'd0 : fround_s_final;
             }
@@ -2670,7 +2686,39 @@ pub module fpu_wrap #(
         }
     }
 
-    assign o_fpu_busy = fp_div_busy_o || fp_sqrt_busy_o || fp_div_s_busy_o || fp_sqrt_s_busy_o;
+    // A-EXE FROUND 3-stage completion (FROUND_PIPE=1): the registered rounding-add
+    // spans 2 cycles + the magic-subtract a 3rd, so hold the op at the iq_fp head
+    // for 2 extra cycles (via o_fpu_busy, like div/sqrt) and broadcast on the 3rd.
+    // Held ⇒ operands + metadata (i_issue_rd_pdst/rob/has_rd) are stable, so the
+    // existing fr_*_sum_q / fr_*1*_q registers converge to the correct value by the
+    // 3rd cycle with no s2/s3 latch, and no common op is in flight to collide on the
+    // single CDB port (busy blocks issue, the same guarantee div/sqrt rely on).
+    // fround_active carries FROUND_PIPE, so at FROUND_PIPE=0 the whole FSM is inert
+    // (fround_busy/done = 0 → byte-identical). NOTE: fround_cnt_q is NOT DCE'd by
+    // veryl's simple synth at FROUND_PIPE=0 — unlike a same-module `const` (EX_PIPE,
+    // SPEC_WAKE), a submodule INSTANCE parameter is not const-propagated into the body,
+    // so the 2-bit counter survives in both fpu_wrap instances (+4 dead FFs, held at
+    // 0, off the critical path — a real synth tool folds them). This is CP-neutral
+    // (EX_PIPE=0 synth CP 14.745 unchanged), which is the invariant that matters.
+    let is_fround: logic = i_fpu_op == FpuOp::FROUND_S || i_fpu_op == FpuOp::FROUNDNX_S
+        || i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D;
+    let fround_active: logic = FROUND_PIPE && i_issue_valid && is_fround;
+    var fround_cnt_q: logic<2>;
+    always_ff (clk, rst) {
+        if_reset {
+            fround_cnt_q = 2'd0;
+        } else if i_flush {
+            fround_cnt_q = 2'd0;
+        } else if fround_active {
+            fround_cnt_q = if fround_cnt_q == 2'd2 ? 2'd0 : fround_cnt_q + 2'd1;
+        } else {
+            fround_cnt_q = 2'd0;
+        }
+    }
+    let fround_busy: logic = fround_active && fround_cnt_q != 2'd2; // hold on cycles 0,1
+    let fround_done: logic = fround_active && fround_cnt_q == 2'd2; // broadcast on cycle 2
+
+    assign o_fpu_busy = fp_div_busy_o || fp_sqrt_busy_o || fp_div_s_busy_o || fp_sqrt_s_busy_o || fround_busy;
 
     let is_div_sqrt: logic = is_fdiv_d || is_fsqrt_d || is_fdiv_s || is_fsqrt_s;
 
@@ -2727,7 +2775,10 @@ pub module fpu_wrap #(
             // Launch every non-div/sqrt op into stage 2; the arith units have
             // already been fed this cycle's operands and will present their
             // result next cycle, aligned with these registered cheap values.
-            s2_valid        = i_issue_valid && !is_div_sqrt;
+            // A 3-stage FROUND (FROUND_PIPE=1) is held at head and broadcasts via
+            // the fround_done path instead, so keep it out of stage 2 (else it would
+            // fire a stale/incomplete result at N+1).
+            s2_valid        = i_issue_valid && !is_div_sqrt && !(FROUND_PIPE && is_fround);
             s2_op           = i_fpu_op;
             s2_pdst         = i_issue_rd_pdst;
             s2_rob          = i_issue_rob_idx;
@@ -2787,16 +2838,22 @@ pub module fpu_wrap #(
         }
     }
 
-    // Final CDB fire + field select. PIPE=1: stage-2 op OR a div/sqrt completion
-    // (mutually exclusive). PIPE=0: legacy combinational single-cycle path.
-    // A commit-time flush squashes the in-flight stage-2 op (it is younger than
-    // the redirect cause) — gate the fire on !i_flush as the legacy path does.
-    let cdb_fire: logic = if PIPE == 1 ? ((s2_valid || cdb_fire_ds) && !i_flush) : cdb_fire_legacy;
+    // Final CDB fire + field select. PIPE=1: stage-2 op OR a div/sqrt completion OR
+    // a 3-stage FROUND completion (all mutually exclusive — a busy-held op blocks
+    // issue, so no s2 op is in flight when a held op completes). PIPE=0: legacy
+    // combinational single-cycle path. A commit-time flush squashes the in-flight
+    // op — gate the fire on !i_flush as the legacy path does.
+    let cdb_fire: logic = if PIPE == 1 ? ((s2_valid || cdb_fire_ds || fround_done) && !i_flush) : cdb_fire_legacy;
+
+    // 3-stage FROUND result (held-at-head): broadcast via this dedicated arm so the
+    // magic-sub cone lands on o_cdb.data (like the 2-stage s2_data path) and NOT on
+    // the s2_cheap_result register. Dead at FROUND_PIPE=0 (fround_done const 0 → DCE).
+    let fround_data: logic<64> = if i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D ? fround_d_final : fround_s_final;
 
     assign o_cdb.valid        = cdb_fire;
-    assign o_cdb.has_rd       = if PIPE == 1 ? ((s2_valid && s2_has_rd) || (cdb_fire_ds && i_issue_has_rd)) : (cdb_fire_legacy && i_issue_has_rd);
+    assign o_cdb.has_rd       = if PIPE == 1 ? ((s2_valid && s2_has_rd) || ((cdb_fire_ds || fround_done) && i_issue_has_rd)) : (cdb_fire_legacy && i_issue_has_rd);
     assign o_cdb.pdst         = if PIPE == 1 ? (if s2_valid ? s2_pdst : i_issue_rd_pdst) : i_issue_rd_pdst;
-    assign o_cdb.data         = if PIPE == 1 ? (if s2_valid ? s2_data : fpu_result) : fpu_result;
+    assign o_cdb.data         = if PIPE == 1 ? (if s2_valid ? s2_data : (if fround_done ? fround_data : fpu_result)) : fpu_result;
     assign o_cdb.rob_idx      = if PIPE == 1 ? (if s2_valid ? s2_rob : i_issue_rob_idx) : i_issue_rob_idx;
     assign o_cdb.mispredict   = 1'b0;
     assign o_cdb.redirect_pc  = 64'd0;
