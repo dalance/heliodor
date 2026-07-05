@@ -1,6 +1,15 @@
     .section ".text.init"
     .globl _start
 _start:
+    # Initialize global pointer. Linker relaxation rewrites the small-data
+    # global accesses to gp-relative form (assuming gp == __global_pointer$),
+    # so gp MUST be set up here — otherwise gp==0 sends every relaxed global
+    # to a wild, often-misaligned address (e.g. End_Time -> gp-2009).
+.option push
+.option norelax
+    la      gp, __global_pointer$
+.option pop
+
     # Set stack pointer
     la      sp, _stack_top
 

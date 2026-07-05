@@ -3,6 +3,7 @@ OBJCOPY  = riscv64-unknown-elf-objcopy
 
 UPSTREAM = ../../riscv-arch-test/upstream/benchmarks
 CFLAGS   = -march=rv64imafdc -mabi=lp64d -mcmodel=medany -O2 -nostdlib -nostartfiles \
+           -std=gnu17 \
            -ffreestanding -fno-builtin -fno-common \
            -Wno-implicit-function-declaration -Wno-implicit-int \
            -I$(UPSTREAM)/common -I$(UPSTREAM)/../../upstream/env \
