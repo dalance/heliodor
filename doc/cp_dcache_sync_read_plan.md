@@ -568,3 +568,36 @@ flips together with delta 5 for the functional read path).
 **▶️ Next step:** delta 5 (the §11.2 Stage-A tag-read port = register the hit INTO Stage-D from a Stage-A
 `dmu_dmem_addr` read → makes the demand read synchronous AND load-use-neutral, and completes delta 3's =1
 semantics), then the FF-insertion flip, then the coordinated bundle flip with the full §11.4 ladder + IPC.
+
+### 11.7 ✅ IMPLEMENTED + VERIFIED (2026-07-06) — delta 5 (the Stage-A tag-read port / load-use fold), byte-identical at =0
+
+The **Stage-A demand-load tag-read port** is in place (`§11.2(b)`, the load-use-neutral half of the flip).
+New dcache inputs `i_addr_r` / `i_ren_r`; the core drives them from the Stage-A latch:
+`i_addr_r = dmu_dmem_addr` (the translated PA that feeds `lsr_paddr_q`), `i_ren_r = lsr_capture` (the
+plain-load Stage-A enable). Inside the dcache, Stage-A reads tags/valid at `index_r = i_addr_r[…]`, computes
+`cache_hit_r` / `hit_way_r`, and **registers the demand hit** into the (delta-3) `dhit_*_q` — re-sourced
+from the Stage-A read: `dhit_v_q = i_ren_r && cache_hit_r`, `dhit_way_q = hit_way_r`,
+`dhit_line_q = {tag_r, index_r}`, `dhit_off_q = offset_r`, `dhit_inv_r_q = inv_r_at_a`. At Stage-B the demand
+hit delivers off flops — data from `dhit_rdata_d = rd_dword(data_{dhit_way_q}[dhit_index_d], dhit_off_q)`
+(the 9R→1R way-mux read = the future 1RW SRAM macro), `o_data_valid`/`o_hit_safe`/`o_rdata` all sourced from
+`dhit_v_q` under `DCACHE_SYNC_READ`, C3-revalidated. This is a **synchronous read with no extra load-use
+cycle** (the tag read is presented at Stage-A, one cycle before Stage-B delivery). Only the demand HIT folds
+to Stage-A; the miss/fill selection stays on the Stage-B port (deltas 1-2 — a miss is fill-latency-bound, so
+its registered-at-Stage-B fill start pays a negligible +1). Every changed output is
+`if DCACHE_SYNC_READ ? <=1 registered path> : <exact original>`, so `=0` is byte-identical.
+
+**DEAD (=0) verification — all green:**
+- default **252/0** (incl. the dcache unit tbs — the new ports are omitted there = tied 0 = Stage-A read off,
+  DCE); **litmus N2 `cy=0022a330`** (cycle-EXACT → SMP byte-identical).
+- synth **CP 14.745 ns / 141 levels / `pc_q→rs1_rdy` / 160511 FF — IDENTICAL** to the HEAD baseline
+  (`dhit_way_q`/`dhit_off_q` + the Stage-A tag-read cone DCE exactly; +114/1.16M comb gates = synth noise).
+  CP/FF/levels/endpoint all unchanged.
+- **N1 boot cy-EXACT:** 7.1 `01210060`, 6.6 `013ee8a0`, 7.1V `013cc5c0` (all == baseline).
+
+**▶️ Next step:** the **FF-insertion flip measurement** — a throwaway BUNDLE synth (front-end scaffolds
+`=1` to lower the ~14.745 rs1_rdy front so the back-end `n_inflight` 13.71 floor is exposed) + `DCACHE_SYNC_READ=1`,
+to confirm the deltas-1-5 refactor keeps the dcache cone OFF `n_inflight` (was −0.13 standalone in §10.2) and
+that the demand read is load-use-neutral. Then the **coordinated bundle flip** (the functional `=1`) with the
+full §11.4 ladder (litmus N2/N4 + N2/N4 SMP boot + Verilator + ACT4) + the IPC budget — the big SMP-critical
+step, not to be entered without the ladder. The remaining SRAM-macro half (data `9R→1R` way-mux macro, tags
+`13R→1R`) rides delta 5's registered `dhit_way_q` way-select.
