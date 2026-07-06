@@ -105,15 +105,22 @@ keystone campaign's de-risking warm-up are the **same RTL change**.
 - **Landscape after the predictors (independent port-narrowing vs bundle).** The
   independently-landable, byte-identical *port-narrowing* (replicate-for-reads while
   the read stays combinational) splits the remaining RAMs cleanly:
-  - **icache** (`icache.veryl`, tags `4R1W`, data `2R2W`) — the reads are at distinct
-    concurrent indices, so replication narrows them to 1R1W byte-identically, exactly
-    like the predictors. **This is the next independent landing candidate.** (Its
-    *synchronous-read* — the registered fetch stage — is the fetch-decouple bundle.)
+  - **icache** (`icache.veryl`, tags `4R1W`, data `2R2W`) — NOT a clean standalone
+    (checked 2026-07-06): the data `2W` is the fill's adjacent lo/hi 32-bit word writes
+    (`fill_widx_lo/hi`), so `1W` needs a **64-bit-dword widen** (SETS×8 × 64, rewriting
+    every 32-bit read extraction); the tags `4R` includes two prefetch reads
+    (`nl_index`/`pf_index`) feeding the OFF prefetch (`s11_pf_en=0`), so a clean `1R1W`
+    needs DCE-cleanup or absurd 4×-per-way replication. Both are intertwined with the
+    fetch read structure the **sync-read (fetch-decouple) bundle restructures anyway** →
+    **fold the icache port-narrowing INTO that bundle**, not a standalone landing.
   - **dcache** (tags `14R1W`, data `9R4W`) — CANNOT be independently narrowed: the 14
     tag / 9 data reads are genuinely concurrent at different indices (hit / victim /
-    next / probe / flush / store-drain / slot-1 / presence), so replication is absurd
-    (14 copies). It needs the *pipelined* Stage-R/Stage-D structure (fewer reads per
-    stage) = the sync-read functional flip = the coordinated bundle (§8, task #2).
+    next / probe / flush / store-drain / slot-1 / presence), so replication is absurd.
+    Needs the *pipelined* Stage-R/Stage-D structure = the sync-read functional flip =
+    the coordinated bundle (§8, task #2).
   - **mmu.v1_ppn / iq_int.ops** — keep-flop (above).
-  So: independent SRAM work remaining = **icache port-narrowing**; everything else is
-  bundle-coupled (dcache) or flop.
+  **So: the independent, byte-identical port-narrowing is COMPLETE with the predictors.**
+  All remaining SRAM work (dcache, icache) is bundle-coupled (the pipelined sync-read
+  restructure); v1_ppn / iq_int.ops are flop. The SRAM migration is back at the campaign
+  inflection: further progress = committing to a pipeline bundle (D$ load/commit §8, or
+  icache fetch-decouple) — the big SMP-critical / IPC-costing core work.
