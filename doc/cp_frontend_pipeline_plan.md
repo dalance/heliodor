@@ -566,3 +566,51 @@ same atomic-commit→trap cone) / `mip` 13.19 — all SMP-atomicity-constrained.
 the global CP below 13.71 now requires Phase E (Direction-C port separation for
 non-atomic commit; atomic commit stays single-cycle). Below that: `vrf` 12.49
 (VALU_PIPE done) and eventually the scalar issue/execute/scheduler wall (A-SCHED 9.52).
+
+## 13. ❌ REFUTED (2026-07-06) — Phase E via FAULT-DEFERRAL cannot cut the atomic megacone; the prior "FEASIBLE" conclusion was wrong (a runtime mux does not prune the shared live TLB)
+
+Implemented and **measured** the planned `AMO_XLATE_DFR` fault-deferral scaffold (register
+the committing atomic's read-time fault split — `ac_page_q`/`ac_acc_q`/`ac_gstage_q`,
+latched alongside `ac_wok_q` at issue — and, at commit, take `sfault_pg_eff`/`sfault_acc_eff`/
+`sfault_gs_eff` + `amo_commit_acc_fault` from those registers instead of the live MMU). The
+DEAD gate passed **byte-identical** (default 252/0, litmus N2 `cy=0022a330`, N1 boot cy-exact
+7.1 `01210060` / 7.1V `013cc5c0` / 6.6 `013ee8a0`, synth **14.745** `pc_q → rs1_rdy`). But the
+**FLIP bundle synth REFUTES the approach:**
+
+| bundle config (all §11 scaffolds =1, LOAD_SPEC=0) | `n_inflight` floor |
+|---|---|
+| baseline (`AMO_XLATE_DFR=0`) — reproduces §12 | **13.710** |
+| + fault-mux (`AMO_XLATE_DFR=1`) | **13.860** (+0.15, 137→138 lvl) |
+| + fault-mux + MMU-drive gating (`core_dmem_wen`/`vaddr` skip for deferred AMO) | **14.280** (+0.57, 143 lvl) |
+
+Deferral makes it **WORSE**, monotonically, because every runtime-gated arm ADDS a level
+without removing the live TLB. The `--dump-timing` cone under `AMO_XLATE_DFR=1` still runs
+`commit_store_fire → agu_addr_iss → core_dmem_vaddr → u_dmem_mmu.u_mmu.tlb_vpn (LIVE) → … →
+n_inflight`.
+
+**Root cause (fundamental, not a veryl-synth artifact):** the commit-store fault check shares
+the SINGLE `u_dmem_mmu` port with all data accesses, and `sfault_pg_eff = amo_xlate_dfr ?
+ac_page_q : dmem_mmu_fault_s` is a runtime 2:1 mux whose output delay is `max(inputs)+mux ≥
+dmem_mmu_fault_s (~13.7)`. `dmem_mmu_fault_s` is ONE wire whose arrival time is the VM TLB
+translate whenever `core_dmem_*` can carry a VM request — which it always can (shared port,
+runtime `store_drive`/`core_dmem_vaddr`). No runtime gate (`!amo_xlate_dfr`, `!c_is_amo`,
+`store_drive && !…`) can prune a *logically reachable* mux/AND arm, in veryl-synth OR any real
+tool. Deferral-via-mux **cannot be faster than its slowest input**.
+
+**Why STORE_PRETRANSLATE (§10) DID cut plain stores but this can't cut atomics:** the plain-
+store cut is NOT a runtime mux — a pretranslated store is `fast_store` and drains through the
+store buffer's SEPARATE `i_saddr` port (a physically distinct datapath, const-enabled by
+`STORE_PRETRANSLATE`), so it never routes through `core_dmem_vaddr → shared MMU`. An atomic's
+RMW needs the shared *coherent* dcache/MMU port and cannot use an SB-style side port — exactly
+what **Direction-C §8 abandoned at ≤1.3 ns as "atomicity-bound."** The prior session's
+"feasibility FEASIBLE" (memory milestone) conflated fault-deferral (runtime mux, does not
+prune) with port separation (physical, prunes but atomicity-bound for atomics). **It was
+wrong.** All `AMO_XLATE_DFR` code was reverted; tree is clean at `49163a5`.
+
+**Consequence — the bundle floor `n_inflight` 13.71 is a genuine wall for this uarch.** Taking
+the live TLB off the atomic commit cone requires a physically SEPARATE commit-translation port
+OR a true multi-cycle commit stage — both SMP-atomicity-bound (the M3b amoadd wedge: any +1 cy
+atomic-commit slip desyncs the litmus barrier). Cutting `vrf` 12.49 / A-SCHED 9.52 (below
+13.71, masked) does NOT move global CP while 13.71 stands. **This is a campaign inflection:
+the accumulated deep-pipe structure is CP-capped at ~13.7 ns until the atomic-commit port is
+physically separated — the hardest, most SMP-dangerous step, previously abandoned.**
