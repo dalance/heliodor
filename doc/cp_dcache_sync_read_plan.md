@@ -629,3 +629,31 @@ the dcache. **▶️ Next:** the SRAM-macro port narrowing (data `9R→1R` way-m
 `dhit_way_q`) is the byte-id SRAM-realism half; the FUNCTIONAL `=1` flip (load-use-neutral + commit-store +1)
 is the coordinated bundle with the full §11.4 SMP ladder + IPC budget — the big SMP-critical step, gated on
 the user (do NOT enter without the ladder).
+### 11.9 FUNCTIONAL `=1` flip — first attempt (2026-07-07): 2 bugs fixed (byte-id at 0), 1 arch bug remains (WIP)
+
+User chose the D$ functional flip (SRAM-realism / goal b). Enabled `DCACHE_SYNC_READ=1` and ran the arch
+suite. **Two real `=1`-path bugs found + fixed (both byte-identical at `=0` — verified 252/0 + litmus N2
+`cy=0022a330` + synth 14.745/141lv/160511 FF unchanged):**
+
+1. **The folded delivery must be gated to the FOLDED plain-load Stage-B only (`dhit_ren_q`).** delta 5's
+   `=1` outputs (`o_data_valid`/`o_hit_safe`/`o_rdata`) unconditionally sourced the registered `dhit`, but
+   `i_ren_r = lsr_capture` fires only for a plain-load Stage-A. Every OTHER accessor sharing the `i_addr`
+   port (AMO read, `replay_drive`, commit-store, slot-1, DONE re-read) then read `dhit` (=0) instead of its
+   own live data → the op never completed / read garbage (full-suite hang). Fix: `dhit_ren_q` = registered
+   `i_ren_r`; deliver `dhit` only when `dhit_ren_q`, else the LIVE path. (rv64ui-ld_st went red→green.)
+2. **Fill-safety: a folded hit on a mid-FILL line must fall to the live path (`dhit_use`).** A folded hit
+   whose line is being filled at Stage-D would read the mid-write data array. `dhit_use = dhit_ren_q &&
+   \!(filling && fill_index == dhit_index_d)` — mid-fill folds to the live path (whose `fill_busy0`
+   exclusion + `o_stall(FILL)` already handle it).
+
+**Remaining: `rv64ui-ld` subtest-5 fails (`tohost=5`) — SUBTLE, still WIP.** `lw`/`lwu`/`ld_st` pass;
+pure back-to-back `ld` fails on one subtest. Instrumented the folded delivery: **`dhit_rdata_d` ALWAYS
+equals the live `o_rdata_live`** when a folded hit delivers — so the bug is **NOT the folded data value**.
+The divergence must be in the load COMPLETION / `dc_hit_safe` timing / a pipeline-path difference the `=1`
+`o_hit_safe` (registered `dhit_v_q`, not the live `i_ren && \!i_amo && \!i_load_next && fill-safe` form)
+introduces — needs cycle-by-cycle core+dcache co-tracing. Noted for the next attempt.
+
+**State:** the `dhit_ren_q` + fill-safety fixes are committed (byte-id at 0, they harden delta 5's `=1`
+semantics for the eventual flip). `DCACHE_SYNC_READ=0` remains the default — **the `=1` functional flip is
+INCOMPLETE** (the ld bug + the full SMP ladder still ahead). The functional flip is confirmed to be the
+large, multi-bug SMP-critical effort the plan warned of; it is not a quick enable.

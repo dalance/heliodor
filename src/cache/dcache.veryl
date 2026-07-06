@@ -699,7 +699,15 @@ pub module dcache #(
     // matched the line at EITHER the Stage-R decide cycle (dhit_inv_r_q) or the
     // Stage-D delivery cycle (live i_inv*). DEAD at =0: dhit_*_q are reset-only
     // (DCE'd) and dhit_c3_squash const-folds to 0, so the outputs are byte-id.
+    // dhit_ren_q gates the Stage-D DELIVERY: only a FOLDED plain-load Stage-B read
+    // (its Stage-A tag read fired last cycle via i_ren_r) delivers off the registered
+    // dhit; every OTHER dcache accessor sharing the i_addr port this cycle (AMO read,
+    // replay_drive, commit-store, slot-1, DONE re-read) keeps the LIVE combinational
+    // path — so the sync-read fold does not steal their same-cycle data. Without this
+    // gate the =1 flip drives o_data_valid/o_rdata from dhit (=0 for a non-folded read)
+    // → the load never completes / reads garbage.
     var dhit_v_q    : logic                 ; // a demand-load hit is in-flight R→D
+    var dhit_ren_q  : logic                 ; // a folded plain-load read fired at Stage-A
     var dhit_way_q  : logic<2>              ; // the Stage-A hit way (data mux at Stage-D)
     var dhit_line_q : logic<TAG_W + INDEX_W>; // {tag, index} of the hit line
     var dhit_off_q  : logic<3>              ; // dword offset of the load
@@ -707,12 +715,14 @@ pub module dcache #(
     always_ff (clk, rst) {
         if_reset {
             dhit_v_q     = 1'b0;
+            dhit_ren_q   = 1'b0;
             dhit_way_q   = 2'd0;
             dhit_line_q  = '0;
             dhit_off_q   = 3'd0;
             dhit_inv_r_q = 1'b0;
         } else if DCACHE_SYNC_READ {
             dhit_v_q     = i_ren_r && cache_hit_r;
+            dhit_ren_q   = i_ren_r;
             dhit_way_q   = hit_way_r;
             dhit_line_q  = {tag_r, index_r};
             dhit_off_q   = offset_r;
@@ -725,6 +735,12 @@ pub module dcache #(
     // Stage-D data read: ONLY the registered hit way's data[index] (the 9R→1R
     // way-mux read that becomes the 1RW SRAM macro). index/off come from flops.
     let dhit_index_d: logic<INDEX_W> = dhit_line_q[INDEX_W - 1:0];
+    // Fill-safety: a folded hit whose line is being FILLED at Stage-D must NOT
+    // deliver off the (mid-write) data array — fall back to the LIVE path, whose
+    // o_hit_safe fill_busy0 exclusion + o_stall(FILL) handle mid-fill exactly as
+    // the live demand read does. Without this, a folded load hitting a mid-fill
+    // line reads a partially-written dword (observed: rv64ui-ld subtest-5 garbage).
+    let dhit_use    : logic = dhit_ren_q && !(filling && fill_index == dhit_index_d);
     let dhit_rdata_d: logic<64> = if dhit_way_q == 2'd0 ?
         rd_dword(data_0[dhit_index_d], dhit_off_q)
     : if dhit_way_q == 2'd1 ?
@@ -1555,7 +1571,8 @@ pub module dcache #(
     // during fill (legacy fallback, gated by o_data_valid at the consumers).
     // delta-5: at =1 the demand hit delivers off the registered Stage-A read
     // (dhit_rdata_d); miss/stream/uncached stay live. =0 arm = exact original.
-    assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_v_q ? dhit_rdata_d : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : (if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata);
+    let o_rdata_live: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
+    assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_use ? (if dhit_v_q ? dhit_rdata_d : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : o_rdata_live) : o_rdata_live;
 
     // M8.B: next-dword read for misaligned 2-dword loads (decode moved up to the
     // miss-handling section). Same line ⇒ reuse the lo-access hit way; cross line
@@ -1669,7 +1686,8 @@ pub module dcache #(
     let fill_busy0: logic = filling && fill_index == index;
     // delta-5: at =1 the fill-safe pipe-0 hit is the registered Stage-A hit,
     // C3-revalidated. =0 arm = exact original (no squash — const-0 at =0).
-    assign o_hit_safe = if DCACHE_SYNC_READ ? (dhit_v_q && !dhit_c3_squash) : (i_ren && !i_amo_read && !i_load_next && ((hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3)) || stream_hit0));
+    let o_hit_safe_live: logic = i_ren && !i_amo_read && !i_load_next && ((hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3)) || stream_hit0);
+    assign o_hit_safe = if DCACHE_SYNC_READ ? (if dhit_use ? (dhit_v_q && !dhit_c3_squash) : o_hit_safe_live) : o_hit_safe_live;
     // Phase 5 SMP fix: data is valid for this hart's request only when
     // the cache actually has the data (hit) or the fill just completed
     // (DONE state — filled doubleword is in data_X arrays). During
@@ -1678,7 +1696,7 @@ pub module dcache #(
     // must gate on this to avoid mid-fill stale captures.
     // delta-5: at =1 the demand-hit term is the registered Stage-A hit (dhit_v_q),
     // C3-revalidated; DONE/uncached stay live. =0 arm = exact pre-delta-3 original.
-    assign o_data_valid = if DCACHE_SYNC_READ ? ((dhit_v_q || (state == State::DONE) || (uncached_active && i_memr_grant)) && !dhit_c3_squash) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
+    assign o_data_valid = if DCACHE_SYNC_READ ? ((if dhit_use ? (dhit_v_q && !dhit_c3_squash) : cache_hit) || (state == State::DONE) || (uncached_active && i_memr_grant)) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
 
     // Re-read filled data at original miss offset (valid during DONE)
     assign o_fill_rdata = if fill_way == 2'd0 ?
