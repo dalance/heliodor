@@ -25,6 +25,12 @@ pub module fpu_wrap #(
     // where the const-prop that hid the fround-add path at EX_PIPE=0 is gone), so the
     // EX_PIPE 0->1 flip activates the 3-stage FROUND together with the registered CDB.
     param FROUND_PIPE: bit = 0,
+    // A-EXE (EX_PIPE): 0 = double-precision FMA stays 2-stage (byte-identical). 1 =
+    // the FMA's 53x53 mantissa multiply is registered before the align + add (fp_fma
+    // STAGE3), splitting the ~9ns combinational multiply->align->add->s1_sum_mag cone
+    // (the bundle #1 front, 13.86ns, surfaced only under EX_PIPE=1). Like FROUND_PIPE,
+    // the FMA op is held one extra cycle at the iq_fp head and broadcasts at N+2.
+    param FMA_PIPE3  : bit = 0,
 ) (
     clk: input clock,
     rst: input reset,
@@ -686,7 +692,8 @@ pub module fpu_wrap #(
     var fp_fma_result: logic<64>;
     var fp_fma_fflags: logic<5> ;
     inst u_fp_fma: fp_fma #(
-        PIPE: PIPE,
+        PIPE  : PIPE      ,
+        STAGE3: FMA_PIPE3 ,
     ) (
         clk                    ,
         rst                    ,
@@ -2718,7 +2725,35 @@ pub module fpu_wrap #(
     let fround_busy: logic = fround_active && fround_cnt_q != 2'd2; // hold on cycles 0,1
     let fround_done: logic = fround_active && fround_cnt_q == 2'd2; // broadcast on cycle 2
 
-    assign o_fpu_busy = fp_div_busy_o || fp_sqrt_busy_o || fp_div_s_busy_o || fp_sqrt_s_busy_o || fround_busy;
+    // A-EXE FMA 3-stage completion (FMA_PIPE3=1): the double-precision FMA gains a
+    // third stage (fp_fma STAGE3 registers the mantissa multiply before align+add), so
+    // its result is valid at N+2 instead of N+1. Hold the op at the iq_fp head for the
+    // 2 pre-broadcast cycles (via o_fpu_busy, exactly like FROUND) and broadcast on the
+    // 3rd cycle via fma_done. Held ⇒ inputs (d1/d2/fwd_fp_rs3/rm/metadata) are stable,
+    // so the registered stages converge and no other op collides on the CDB port. Only
+    // the double FMA is staged (its 172-bit s1_sum_mag is the 13.86 front); the single
+    // FMA (fp_fma_s) stays 2-stage. fma_active carries FMA_PIPE3, so at FMA_PIPE3=0 the
+    // FSM is inert (fma_busy/done = 0 → byte-identical). Like fround_cnt_q, this counter
+    // is a submodule-param dead-FF at FMA_PIPE3=0 (CP-neutral, real synth folds it).
+    let is_fma_d: logic = i_fpu_op == FpuOp::FMADD_D || i_fpu_op == FpuOp::FMSUB_D
+        || i_fpu_op == FpuOp::FNMADD_D || i_fpu_op == FpuOp::FNMSUB_D;
+    let fma_active: logic = FMA_PIPE3 && i_issue_valid && is_fma_d;
+    var fma_cnt_q: logic<2>;
+    always_ff (clk, rst) {
+        if_reset {
+            fma_cnt_q = 2'd0;
+        } else if i_flush {
+            fma_cnt_q = 2'd0;
+        } else if fma_active {
+            fma_cnt_q = if fma_cnt_q == 2'd2 ? 2'd0 : fma_cnt_q + 2'd1;
+        } else {
+            fma_cnt_q = 2'd0;
+        }
+    }
+    let fma_busy: logic = fma_active && fma_cnt_q != 2'd2; // hold on cycles 0,1
+    let fma_done: logic = fma_active && fma_cnt_q == 2'd2; // broadcast on cycle 2
+
+    assign o_fpu_busy = fp_div_busy_o || fp_sqrt_busy_o || fp_div_s_busy_o || fp_sqrt_s_busy_o || fround_busy || fma_busy;
 
     let is_div_sqrt: logic = is_fdiv_d || is_fsqrt_d || is_fdiv_s || is_fsqrt_s;
 
@@ -2778,7 +2813,7 @@ pub module fpu_wrap #(
             // A 3-stage FROUND (FROUND_PIPE=1) is held at head and broadcasts via
             // the fround_done path instead, so keep it out of stage 2 (else it would
             // fire a stale/incomplete result at N+1).
-            s2_valid        = i_issue_valid && !is_div_sqrt && !(FROUND_PIPE && is_fround);
+            s2_valid        = i_issue_valid && !is_div_sqrt && !(FROUND_PIPE && is_fround) && !(FMA_PIPE3 && is_fma_d);
             s2_op           = i_fpu_op;
             s2_pdst         = i_issue_rd_pdst;
             s2_rob          = i_issue_rob_idx;
@@ -2843,7 +2878,7 @@ pub module fpu_wrap #(
     // issue, so no s2 op is in flight when a held op completes). PIPE=0: legacy
     // combinational single-cycle path. A commit-time flush squashes the in-flight
     // op — gate the fire on !i_flush as the legacy path does.
-    let cdb_fire: logic = if PIPE == 1 ? ((s2_valid || cdb_fire_ds || fround_done) && !i_flush) : cdb_fire_legacy;
+    let cdb_fire: logic = if PIPE == 1 ? ((s2_valid || cdb_fire_ds || fround_done || fma_done) && !i_flush) : cdb_fire_legacy;
 
     // 3-stage FROUND result (held-at-head): broadcast via this dedicated arm so the
     // magic-sub cone lands on o_cdb.data (like the 2-stage s2_data path) and NOT on
@@ -2851,7 +2886,7 @@ pub module fpu_wrap #(
     let fround_data: logic<64> = if i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D ? fround_d_final : fround_s_final;
 
     assign o_cdb.valid        = cdb_fire;
-    assign o_cdb.has_rd       = if PIPE == 1 ? ((s2_valid && s2_has_rd) || ((cdb_fire_ds || fround_done) && i_issue_has_rd)) : (cdb_fire_legacy && i_issue_has_rd);
+    assign o_cdb.has_rd       = if PIPE == 1 ? ((s2_valid && s2_has_rd) || ((cdb_fire_ds || fround_done || fma_done) && i_issue_has_rd)) : (cdb_fire_legacy && i_issue_has_rd);
     assign o_cdb.pdst         = if PIPE == 1 ? (if s2_valid ? s2_pdst : i_issue_rd_pdst) : i_issue_rd_pdst;
     assign o_cdb.data         = if PIPE == 1 ? (if s2_valid ? s2_data : (if fround_done ? fround_data : fpu_result)) : fpu_result;
     assign o_cdb.rob_idx      = if PIPE == 1 ? (if s2_valid ? s2_rob : i_issue_rob_idx) : i_issue_rob_idx;

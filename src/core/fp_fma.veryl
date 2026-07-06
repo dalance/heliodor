@@ -18,7 +18,16 @@
 // the leading-one normalize + round (stage 2); PIPE=0 bypasses the midpoint
 // register → identical combinational result.
 pub module fp_fma #(
-    param PIPE: u32 = 0,
+    param PIPE  : u32 = 0,
+    // STAGE3 (A-EXE, EX_PIPE): 0 = 2-stage as before (byte-identical). 1 = a THIRD
+    // stage — the 53x53 mantissa multiply + exponent/align setup (stage 1a) is
+    // registered before the align + two's-complement add (stage 1b), splitting the
+    // ~9 ns combinational `multiply -> align -> add -> s1_sum_mag` cone (the bundle #1
+    // front, 13.86 ns, surfaced only under EX_PIPE=1). Requires PIPE==1. The op is
+    // held one extra cycle at the iq_fp head (fpu_wrap's fma FSM) and broadcasts at
+    // N+2. DEAD at STAGE3=0: the 1a register's D taps the already-computed live 1a
+    // nets (like fp_adder's s1_sum_q), so no new cone and the _sel muxes pick live.
+    param STAGE3: bit = 0,
 ) (
     clk     : input  clock     ,
     rst     : input  reset     ,
@@ -81,13 +90,19 @@ pub module fp_fma #(
         return ru;
     }
 
-    // ===== Stage 1: decode / special-case resolve / multiply + align + add =====
-    var s1_done    : logic     ;
-    var s1_res     : logic<64> ;
-    var s1_ffl     : logic<5>  ;
-    var s1_sum_mag : logic<172>;
-    var s1_res_sign: logic     ;
-    var s1_lsb_w   : logic<14> ;
+    // ===== Stage 1a: decode / special-case resolve / multiply + exponents =====
+    // The deep part (the 53x53 multiply -> `prod`) lives here; STAGE3 registers the
+    // 1a outputs before the align + add (stage 1b).
+    var s1a_prod     : logic<106>;
+    var s1a_shift_p  : logic<15> ;
+    var s1a_shift_c  : logic<15> ;
+    var s1a_sig_c    : logic<53> ;
+    var s1a_prod_sign: logic     ;
+    var s1a_c_sign   : logic     ;
+    var s1a_lsb_w    : logic<14> ;
+    var s1a_done     : logic     ;
+    var s1a_res      : logic<64> ;
+    var s1a_ffl      : logic<5>  ;
     always_comb {
         let sa: logic     = i_a[63];
         let ea: logic<11> = i_a[62:52];
@@ -157,62 +172,126 @@ pub module fp_fma #(
         let top_exp  : logic<14> = if $signed(p_top) >= $signed(c_top_eff) ? p_top : c_top_eff;
         let lsb_w    : logic<14> = top_exp - 14'd166;
 
-        let shift_p: logic<15> = {pe[13], pe} - {lsb_w[13], lsb_w};
-        let shift_c: logic<15> = {ce[13], ce} - {lsb_w[13], lsb_w};
-
-        let ap: logic<169> = align106(prod, shift_p);
-        let ac: logic<169> = align106({53'd0, sig_c}, shift_c);
-
-        let ext_p   : logic<172> = {3'd0, ap};
-        let ext_c   : logic<172> = {3'd0, ac};
-        let signed_p: logic<172> = if prod_sign ? ~ext_p + 172'd1 : ext_p;
-        let signed_c: logic<172> = if c_sign ? ~ext_c + 172'd1 : ext_c;
-        let sum_s   : logic<172> = signed_p + signed_c;
-
-        let res_sign: logic      = sum_s[171];
-        let sum_mag : logic<172> = if sum_s[171] ? ~sum_s + 172'd1 : sum_s;
-
-        // Stage-1 outputs to the midpoint
-        s1_sum_mag  = sum_mag;
-        s1_res_sign = res_sign;
-        s1_lsb_w    = lsb_w;
-        s1_done     = 1'b0;
-        s1_res      = 64'd0;
-        s1_ffl      = 5'd0;
+        // Stage-1a outputs (feed the align + add in stage 1b)
+        s1a_prod      = prod;
+        s1a_shift_p   = {pe[13], pe} - {lsb_w[13], lsb_w};
+        s1a_shift_c   = {ce[13], ce} - {lsb_w[13], lsb_w};
+        s1a_sig_c     = sig_c;
+        s1a_prod_sign = prod_sign;
+        s1a_c_sign    = c_sign;
+        s1a_lsb_w     = lsb_w;
+        s1a_done      = 1'b0;
+        s1a_res       = 64'd0;
+        s1a_ffl       = 5'd0;
 
         if a_nan || b_nan || c_nan {
-            s1_done = 1'b1;
-            s1_res  = qnan;
+            s1a_done = 1'b1;
+            s1a_res  = qnan;
             if a_snan || b_snan || c_snan || inf_zero {
-                s1_ffl = 5'b10000;
+                s1a_ffl = 5'b10000;
             }
         } else if inf_zero {
-            s1_done = 1'b1;
-            s1_res  = qnan;
-            s1_ffl  = 5'b10000;
+            s1a_done = 1'b1;
+            s1a_res  = qnan;
+            s1a_ffl  = 5'b10000;
         } else if a_inf || b_inf {
-            s1_done = 1'b1;
+            s1a_done = 1'b1;
             if c_inf && (prod_sign != c_sign) {
-                s1_res = qnan; // inf - inf
-                s1_ffl = 5'b10000;
+                s1a_res = qnan; // inf - inf
+                s1a_ffl = 5'b10000;
             } else {
-                s1_res = {prod_sign, 11'h7FF, 52'd0};
+                s1a_res = {prod_sign, 11'h7FF, 52'd0};
             }
         } else if c_inf {
-            s1_done = 1'b1;
-            s1_res  = {c_sign, 11'h7FF, 52'd0};
+            s1a_done = 1'b1;
+            s1a_res  = {c_sign, 11'h7FF, 52'd0};
         } else if a_zero || b_zero {
-            s1_done = 1'b1;
+            s1a_done = 1'b1;
             if c_zero {
                 let zsign: logic = if prod_sign == c_sign ? prod_sign : if i_rm == 3'b010 ? 1'b1 : 1'b0;
-                s1_res = {zsign, 63'd0};
+                s1a_res = {zsign, 63'd0};
             } else {
-                s1_res = {c_sign, i_c[62:0]};
+                s1a_res = {c_sign, i_c[62:0]};
             }
         } else {
             // MAIN PATH: normalize + round deferred to stage 2.
-            s1_done = 1'b0;
+            s1a_done = 1'b0;
         }
+    }
+
+    // ===== STAGE3 cut: register the 1a datapath (after the multiply, before align) =====
+    // DEAD at STAGE3=0: each _q's D taps its s1a_* which is already computed for the
+    // STAGE3=0 live path (so no new cone -> CP-neutral, like fp_adder's s1_sum_q), and
+    // s1a_*_sel selects the live value -> byte-identical.
+    var s1a_prod_q     : logic<106>;
+    var s1a_shift_p_q  : logic<15> ;
+    var s1a_shift_c_q  : logic<15> ;
+    var s1a_sig_c_q    : logic<53> ;
+    var s1a_prod_sign_q: logic     ;
+    var s1a_c_sign_q   : logic     ;
+    var s1a_lsb_w_q    : logic<14> ;
+    var s1a_done_q     : logic     ;
+    var s1a_res_q      : logic<64> ;
+    var s1a_ffl_q      : logic<5>  ;
+    always_ff (clk, rst) {
+        if_reset {
+            s1a_prod_q      = 106'd0;
+            s1a_shift_p_q   = 15'd0;
+            s1a_shift_c_q   = 15'd0;
+            s1a_sig_c_q     = 53'd0;
+            s1a_prod_sign_q = 1'b0;
+            s1a_c_sign_q    = 1'b0;
+            s1a_lsb_w_q     = 14'd0;
+            s1a_done_q      = 1'b0;
+            s1a_res_q       = 64'd0;
+            s1a_ffl_q       = 5'd0;
+        } else {
+            s1a_prod_q      = s1a_prod;
+            s1a_shift_p_q   = s1a_shift_p;
+            s1a_shift_c_q   = s1a_shift_c;
+            s1a_sig_c_q     = s1a_sig_c;
+            s1a_prod_sign_q = s1a_prod_sign;
+            s1a_c_sign_q    = s1a_c_sign;
+            s1a_lsb_w_q     = s1a_lsb_w;
+            s1a_done_q      = s1a_done;
+            s1a_res_q       = s1a_res;
+            s1a_ffl_q       = s1a_ffl;
+        }
+    }
+    let s1a_prod_sel     : logic<106> = if STAGE3 ? s1a_prod_q : s1a_prod;
+    let s1a_shift_p_sel  : logic<15>  = if STAGE3 ? s1a_shift_p_q : s1a_shift_p;
+    let s1a_shift_c_sel  : logic<15>  = if STAGE3 ? s1a_shift_c_q : s1a_shift_c;
+    let s1a_sig_c_sel    : logic<53>  = if STAGE3 ? s1a_sig_c_q : s1a_sig_c;
+    let s1a_prod_sign_sel: logic      = if STAGE3 ? s1a_prod_sign_q : s1a_prod_sign;
+    let s1a_c_sign_sel   : logic      = if STAGE3 ? s1a_c_sign_q : s1a_c_sign;
+    let s1a_lsb_w_sel    : logic<14>  = if STAGE3 ? s1a_lsb_w_q : s1a_lsb_w;
+    let s1a_done_sel     : logic      = if STAGE3 ? s1a_done_q : s1a_done;
+    let s1a_res_sel      : logic<64>  = if STAGE3 ? s1a_res_q : s1a_res;
+    let s1a_ffl_sel      : logic<5>   = if STAGE3 ? s1a_ffl_q : s1a_ffl;
+
+    // ===== Stage 1b: align the two significands + two's-complement add =====
+    var s1_done    : logic     ;
+    var s1_res     : logic<64> ;
+    var s1_ffl     : logic<5>  ;
+    var s1_sum_mag : logic<172>;
+    var s1_res_sign: logic     ;
+    var s1_lsb_w   : logic<14> ;
+    always_comb {
+        let ap: logic<169> = align106(s1a_prod_sel, s1a_shift_p_sel);
+        let ac: logic<169> = align106({53'd0, s1a_sig_c_sel}, s1a_shift_c_sel);
+
+        let ext_p   : logic<172> = {3'd0, ap};
+        let ext_c   : logic<172> = {3'd0, ac};
+        let signed_p: logic<172> = if s1a_prod_sign_sel ? ~ext_p + 172'd1 : ext_p;
+        let signed_c: logic<172> = if s1a_c_sign_sel ? ~ext_c + 172'd1 : ext_c;
+        let sum_s   : logic<172> = signed_p + signed_c;
+
+        s1_res_sign = sum_s[171];
+        s1_sum_mag  = if sum_s[171] ? ~sum_s + 172'd1 : sum_s;
+        s1_lsb_w    = s1a_lsb_w_sel;
+        s1_done     = s1a_done_sel;
+        s1_res      = s1a_res_sel;
+        s1_ffl      = s1a_ffl_sel;
     }
 
     // ===== Midpoint register (cut) + PIPE=0 bypass =====
