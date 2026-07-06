@@ -601,3 +601,31 @@ that the demand read is load-use-neutral. Then the **coordinated bundle flip** (
 full §11.4 ladder (litmus N2/N4 + N2/N4 SMP boot + Verilator + ACT4) + the IPC budget — the big SMP-critical
 step, not to be entered without the ladder. The remaining SRAM-macro half (data `9R→1R` way-mux macro, tags
 `13R→1R`) rides delta 5's registered `dhit_way_q` way-select.
+
+### 11.8 ✅ FF-insertion flip MEASURED (2026-07-06) — deltas 1-5 keep the dcache OFF `n_inflight`
+
+Throwaway BUNDLE synth (front-end `FETCH_REG`/`ICACHE_SYNC_READ`/`IMEM_MMU_STAGE`/`DECODE_REG` + keystone
+`EX_PIPE`/`SEL_PIPE`/`SPEC_WAKE` + `STORE_PRETRANSLATE` + `VALU_PIPE` + `DCACHE_SYNC_READ` all `=1`, LOAD_SPEC
+`=0`; params reverted after). Result:
+
+- **CP = 13.710 ns / 137 levels / `head → n_inflight[5]`** — EXACTLY the plan's expected bundle floor (§9,
+  §12). Unchanged by the deltas-3+5 refactor.
+- **The `n_inflight` cone is the live-MMU commit-store / atomic megacone**, NOT the dcache:
+  `u_dmem_mmu.u_mmu.tlb_*` (×24, the LIVE V=1 TLB) → `u_pmp_cbo_m_w.*` → `commit_store_fire` /
+  `commit_trap` / `rob_commit_ack` → `u_fl.n_inflight`. This is Phase E (the SMP-atomicity wall).
+- **No dcache demand-read gate on the cone** (no `data_*`/`tags_*`/`cache_hit`/`o_hit_safe`/`o_data_valid`
+  delivery). The one dcache-origin signal present, `dhit_line_q`, enters only via the shallow C3 term
+  `dhit_c3_squash → o_stall(dcache_stall) → rob_commit_ack` — the SAME shared commit gate the live
+  `inv_hits_active` already sits on, and shallow (flop→compare→AND ≈3 levels), not the 137-level binding
+  depth. So it does not lift the CP (13.710 unchanged).
+- Top endpoints below n_inflight: `redirect_pc_q` 13.210 (branch-mispredict-redirect arm of the same
+  commit→trap cone) — also Phase E. Everything the campaign built (front-end + keystone + vrf + dcache) is
+  masked below the 13.71 atomic-commit wall.
+
+**Reading:** the D$ synchronous-read structure (deltas 1-5) is complete and correct at `=0` (byte-identical)
+and, at the bundle `=1`, **cleanly off `n_inflight`** — the dcache is no longer any part of the CP floor. The
+remaining CP floor is the Phase-E retire/memory-ordering µarch (`deep_pipeline_status_and_replan.md` §4), not
+the dcache. **▶️ Next:** the SRAM-macro port narrowing (data `9R→1R` way-mux, tags `13R→1R`, riding delta 5's
+`dhit_way_q`) is the byte-id SRAM-realism half; the FUNCTIONAL `=1` flip (load-use-neutral + commit-store +1)
+is the coordinated bundle with the full §11.4 SMP ladder + IPC budget — the big SMP-critical step, gated on
+the user (do NOT enter without the ladder).
