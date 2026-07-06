@@ -183,3 +183,28 @@ genuinely needs live commit translation, then the only remaining lever is R3, an
 commit to that SMP-critical program or bank the CP work per `deep_pipeline_status_and_replan.md` §6.
 **This is a user decision** (the low-risk R1 premise is gone; what remains is R3-adjacent) — surface before
 building.
+
+### 6.2 L2 investigated (2026-07-07) — cbo.m IS execute-registerable, but the shared TLB means no single-requester CP win
+
+Read the cbo.m path: `cbo_m_addr = dmem_vm_on_op ? dmu_dmem_addr : c_store_addr` (`:5541`) is the **live**
+TLB PA; `u_pmp_cbo_m_r/w` (`:5544-5558`) PMP-check it; `cbo_m_acc_fault = c_is_cbo_m && cbo_m_pmp_deny_r &&
+cbo_m_pmp_deny_w` (`:5560`, R-AND-W deny — cbo.m's special fault, why it is excluded from the standard
+`sfault_*` deferral, not a fundamental live-translation need). cbo.m is a **management op (no RMW)**, so —
+unlike an atomic — its PA + fault **could** be registered at execute (like `m_pa_q`) and const-gated at
+commit. So L2 is structurally viable and lower-risk than the atomic.
+
+**But it does not move the CP alone.** cbo.m, atomics, and non-pretranslated stores **share the single
+`u_dmem_mmu` port/TLB**. The TLB output reaches `rob_commit_ack` through *whichever* of them re-checks at
+commit; cutting one requester (cbo.m) just leaves the live TLB on the retire gate via the next (atomic /
+the runtime-mux `sfault_pg_eff` for other stores). The TLB itself cannot be removed (loads' Stage-A needs
+it) — only its arrival at `rob_commit_ack` can, and that requires **every** commit-time store/atomic/cbo
+fault requester to read registered values. **So there is no independent low-risk sub-step that moves the
+CP; the whole slow-store-commit-fault decouple (L1 const-gate + L2 cbo.m + L3 atomic) is one R3-adjacent
+program**, its dominant cost the atomic (L3 = the §13-refuted, SMP-critical minefield).
+
+**Conclusion:** the campaign has reached the end of independent, low-/moderate-risk CP levers. Below 13.71 ns
+lies only the atomic-inclusive slow-store retire redesign (SMP-critical). The honest options are now the
+`deep_pipeline_status_and_replan.md` §6 set: **commit to the R3-adjacent program** (large, SMP-gated) **or
+bank the CP work** (all scaffolds built + verified; ~13.7 ns accepted as the current-µarch floor) **and
+pivot** to the SRAM-realism deliverable (goal b) or a consolidation/default-flip checkpoint. **User
+decision.**
