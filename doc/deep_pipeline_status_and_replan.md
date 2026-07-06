@@ -209,3 +209,20 @@ retire + LQ/SQ disambiguation would cost in area/IPC/SMP-complexity for heliodor
 §6.1 target decision with data instead of the stale 7.5 ns aspiration. Only commit to the retire
 redesign (the big one) once that study says it fits the budget. **Do not** keep hammering CP, and
 **do not** lower the target until the study is in.
+
+## 8. DECISION (2026-07-06) — the study is in; §6.1 resolved
+
+The paper study is done (`retire_memory_ordering_redesign_study.md`, commit `fdfeeef`), and the D$
+sync-read structure landed + measured off `n_inflight` (deltas 3+5 + §11.8 FF-insertion,
+`cp_dcache_sync_read_plan.md`). The study's data: the retire/memory-ordering redesign is the **only**
+lever below 13.71 ns, but its own ceiling is **~12.4 ns** (the dcache-internal fill/victim floor,
+Direction-C §8 measured) — **not** 7.5 ns; 7.5 ns needs the retire redesign **plus** memory-floor
+pipelining **plus** the A-SCHED scheduler exposure, a multi-phase program whose dominant cost is the
+SMP-correctness risk concentrated in R3 (atomic reorder / M3b minefield).
+
+**User decision (§6.1, 2026-07-06):** invoke the plan's own decision gate — **revise the near-term FINAL
+target to the IS-stage-depth ~12 ns / 6–7 stages**, achievable by the retire redesign's lower-risk
+two-thirds (R1 decoupled-retire + R2 translate-at-execute), and **hold 7.5 ns / 10-stage as the long-term
+aspiration** contingent on R3 clearing the SMP ladder + the memory-floor/scheduler phases. **Next: begin
+R1** (decoupled-retire + store queue) as a `DEAD` param scaffold (byte-identical at 0, the campaign's proven
+methodology), build + measure R1+R2 before committing to R3. Design in `cp_retire_decouple_plan.md`.

@@ -133,6 +133,12 @@ the "mechanical once split" part. The loop is the hard core. **If A-SCHED proves
 infeasible within the IPC/SMP budget, the realistic goal revises to the IS-stage depth
 (~12 ns / ~6–7 stages), not 7.5 ns** — an explicit decision gate, not a silent miss.
 
+> **GATE INVOKED (2026-07-06).** After the retire/memory-ordering paper study
+> (`retire_memory_ordering_redesign_study.md`) the near-term FINAL target is **revised to the IS-stage
+> depth ~12 ns / 6–7 stages** (7.5 ns held as a long-term aspiration). See
+> `deep_pipeline_status_and_replan.md` §8 for the decision + rationale; R1 (decoupled-retire + store
+> queue) design in `cp_retire_decouple_plan.md`.
+
 ## Phased roadmap
 
 - **Phase 0 — fix the targets.** Pick CP (~7.5 ns), depth (~10–12 stages), ROB
