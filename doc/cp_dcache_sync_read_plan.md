@@ -712,3 +712,30 @@ PASS at `=1`** (commit `04b8178`, byte-id at 0: 252/0, litmus N2 `cy=0022a330`).
 **4 `=1`-path fixes so far (all byte-id at 0):** `dhit_ren_q` gate, fill-safety, `i_ren_folded` strobe,
 `dhit_miss`. The plain-load path is correct; the AMO / misaligned / H clusters are the next work. The
 functional flip is a **multi-cluster SMP-critical effort** — each cluster a `=1`-path corner. `=0` default.
+
+### 11.11 AMO cluster investigated (2026-07-07) — the cold RFO-fill line loses ownership before the AMO read (deeper than the load miss-stall)
+
+Commit-diff on `rv64ua-amoadd_w` (`=1` vs `=0`): first divergence at `amoadd.w a4,a1,(a3)` @`0x1a8`
+(a3=`0x80002000`), committed `0x0500006f` at `=1` vs the correct old value `0x80000000` at `=0` — and the
+AMO **replays** (commits 3× at `=1`). The line was just written by `sw a0,0(a3)` (a0=`0x80000000`) at
+`0x1a4` — a COLD store (first access to `0x80002000`).
+
+Traced the AMO capture (`amo_exec_capture`): **first read `present=0` (line NOT owned), `rdata=…0500006f`
+(the stale/DRAM value, not the store's `0x80000000`), `sbempty=1`**; the replay reads `present=1` but
+`0x04fff86f` (= old`0x0500006f` + a1`0xfffff800` = the AMO's OWN prior write-back). So the store's
+`0x80000000` **never reached an owned dcache line before the AMO read** — the cold `sw`'s RFO fill / line
+ownership is lost by the AMO's read cycle at `=1`.
+
+**This is deeper than the plain-load miss-stall (`dhit_miss`).** The store's RFO fill + line ownership + the
+AMO's `amo_watch`/`present`/eviction all interact with deltas 1-2's REGISTERED fill selection at `=1`: the
+registered `srfo_sel`/`victim`/`ev_fill_vic` shift the fill/eviction timing, and the AMO reads before the
+store's RFO-owned line is established (or after a mis-timed eviction). It is the SAME "registered fill
+selection is a cycle late" root as the load bug, but on the **store-RFO / AMO-ownership** path, which is
+SMP-atomicity-critical (the `amo_watch`/poison machinery). A correct fix needs the store-RFO and AMO paths
+to see the fill/ownership at the right cycle — analogous to `dhit_miss` but for the non-folded commit-side
+accessors, and validated against the litmus/SMP ladder (not just the single-hart arch test).
+
+**Checkpoint (this session):** the plain-load path is complete (5 `=1`-path fixes, byte-id). The AMO
+cluster's root is identified (store-RFO/AMO ownership vs registered-fill timing) but its fix is a deeper,
+SMP-critical piece; misaligned + hypervisor + sv\* clusters also remain. The functional flip is confirmed a
+multi-session, multi-cluster SMP-critical effort. `DCACHE_SYNC_READ=0` default; tree clean.
