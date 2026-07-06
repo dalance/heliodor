@@ -16,9 +16,16 @@ reaches the SoC level (Phase C extends to L2 as 1R1W + fill buffering).
 ## Refinement to the plan's flop assumption
 `deep_pipeline_sram_plan.md` assumed "PRF/VRF/ROB/RAT/SB/MSHR/**TLB**/IQ stay flop."
 Two of those actually **infer as RAM** and appear below: `iq_int.ops` (8×309 2R2W)
-and `mmu.v1_ppn` (32×44 1R3W ×2). Recommendation: **keep `iq_int.ops` flop** (tiny +
-on the wakeup→select critical path); `mmu.v1_ppn` is a trivial 1RW. Everything else
-the plan called flop (valid/dirty/excl/plru meta, V=0 TLB, TAGE) is read
+and `mmu.v1_ppn` (32×44 1R3W ×2). Recommendation: **keep BOTH flop.** `iq_int.ops` is
+tiny + on the wakeup→select critical path. `mmu.v1_ppn` (⟵ REVISED 2026-07-06 from the
+earlier "trivial 1RW") is the **V=1 two-stage TLB's host-PPN store — a TLB, which the
+plan keeps flop**; at **32 entries** it is below any SRAM compiler's practical minimum
+(~64-128 words), so real PD maps it to flops regardless. veryl infers it as RAM only
+because of the 44-bit *width* (the sibling `v1_r/w/x/u/level` read the same `[v1_sel]`
+index but are too narrow to infer) — a model artifact, not a migration target; forcing
+a 1RW here would be a risky consolidation of the correctness-critical H-ext two-stage
+walk (GST_L2/L1/L0, each writing a level-dependent `g_hpa`) for a flop-anyway array.
+Everything else the plan called flop (valid/dirty/excl/plru meta, V=0 TLB, TAGE) is read
 *associatively every cycle* and correctly stays flop (never inferred as RAM).
 
 ## Geometry (all instances use module defaults)
@@ -91,6 +98,22 @@ keystone campaign's de-risking warm-up are the **same RTL change**.
     Byte-identical replication is the conservative default; dropping the slot-1 btb read
     (lose dual-issue btb prediction) would avoid the doubling — a future perf/area tuning.
   - Total inferred-RAM blocks 28 → **27** (btb −4, bht +3). Remaining non-1R1W:
-    dcache data `9R4W` / tags `14R1W` (bundle), icache data `2R2W` / tags `4R1W`
-    (fetch-decouple bundle), `mmu.v1_ppn 1R3W` (trivial 1RW, opportunistic),
+    dcache data `9R4W` / tags `14R1W`, icache data `2R2W` / tags `4R1W`,
+    `mmu.v1_ppn 1R3W` (**keep-flop** — TLB, 32-entry flop-territory; see §Refinement),
     `iq_int.ops 2R2W` (keep-flop).
+
+- **Landscape after the predictors (independent port-narrowing vs bundle).** The
+  independently-landable, byte-identical *port-narrowing* (replicate-for-reads while
+  the read stays combinational) splits the remaining RAMs cleanly:
+  - **icache** (`icache.veryl`, tags `4R1W`, data `2R2W`) — the reads are at distinct
+    concurrent indices, so replication narrows them to 1R1W byte-identically, exactly
+    like the predictors. **This is the next independent landing candidate.** (Its
+    *synchronous-read* — the registered fetch stage — is the fetch-decouple bundle.)
+  - **dcache** (tags `14R1W`, data `9R4W`) — CANNOT be independently narrowed: the 14
+    tag / 9 data reads are genuinely concurrent at different indices (hit / victim /
+    next / probe / flush / store-drain / slot-1 / presence), so replication is absurd
+    (14 copies). It needs the *pipelined* Stage-R/Stage-D structure (fewer reads per
+    stage) = the sync-read functional flip = the coordinated bundle (§8, task #2).
+  - **mmu.v1_ppn / iq_int.ops** — keep-flop (above).
+  So: independent SRAM work remaining = **icache port-narrowing**; everything else is
+  bundle-coupled (dcache) or flop.
