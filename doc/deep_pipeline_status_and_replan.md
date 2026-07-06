@@ -151,6 +151,38 @@ pipeline, and **(b)** migrate to realistic ASIC SRAM (1RW/1R1W synchronous). Cur
   **SRAM ⊂ pipeline deepening** (a synchronous SRAM read *is* a pipeline stage — the same flip).
   This is high-value remaining work that does NOT need the retire redesign first.
 
+### 5.1 Front-end architectural audit (does the front end have a commit-style wall or a forced/hacky cut?)
+
+Checked at this consolidation (user question, 2026-07-06). **No forced/hacky CP cuts are kept.**
+The front-end scaffolds are honest: `FETCH_REG` is fully functional (it reuses the fetch buffer
+= the existing IF/ID register; verified 252/0 + N1 boot on first flip). `ICACHE_SYNC_READ`,
+`IMEM_MMU_STAGE`, `DECODE_REG` are byte-identical DEAD at `=0`, and their `=1` flips are
+explicitly labelled **"FF-insertion measurement only, not functional"** — the functional work is
+named, not faked (`icache.veryl:549-553`). The one crude/forced-slow flip that ever existed
+(`STORE_PRETRANSLATE` forced-slow path) was on the commit side and was **reverted** (§2.3 of
+`cp_frontend_pipeline_plan.md`). The FROUND 3-stage fix deliberately **avoided** a dead-but-timed
+false path (used a dedicated CDB arm, not the fpu_result path). So there is no hidden CP debt.
+
+**But the front end DOES have ONE architectural item, analogous to the commit retire fusion:**
+the **fetch / branch-redirect loop is coupled to the combinational icache read.** Today the fetch
+FSM reads the icache combinationally to get RVC lengths + feed prediction + restart on redirect,
+all in one cycle. Making the icache **synchronous** (`ICACHE_SYNC_READ=1` — which *is* the I$ SRAM
+migration) is therefore not a free register: it needs functional restructuring of (i) straddle /
+cross-line fetch (a 2-halfword instr spanning a line reads the 1-cycle-late `o_rdata`), (ii) FB
+push/pop refill timing, and (iii) **branch-redirect → fetch restart (+1 bubble)**, and it carries
+a real **+1 branch-mispredict-penalty IPC cost** (`cp_frontend_pipeline_plan.md` §3). This is the
+front-end version of "the current single-cycle structure fuses what a deep pipe must decouple" —
+the standard fix is **decoupled fetch** (a fetch target queue with BTB-driven prediction running
+*ahead* of the icache read), exactly as real multi-GHz front ends do. `IMEM_MMU_STAGE` (F1) and
+`DECODE_REG` (D) are by contrast clean register stages (TLB is flops; prediction indexes the
+*virtual* PC, not the translate; decode-reg is a downstream boundary).
+
+**Plan (fold into (b), not a separate effort):** the I$ SRAM migration in the SRAM-migration phase
+**is** this fetch-loop decoupling — make it a first-class deliverable of that phase: sync-read I$ +
+straddle/FB/branch-redirect restructuring (toward decoupled fetch) + the IPC-budget measurement.
+It is independent of the commit wall and advances the FINAL front-end structure; do it as the I$
+step of (b).
+
 ---
 
 ## 6. Open decisions for the user (NOT decided here)
