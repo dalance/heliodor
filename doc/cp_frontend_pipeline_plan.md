@@ -490,3 +490,79 @@ the bundle #1), so it does NOT move the global CP alone — it removes a genuine
 timing front (design hygiene + unmasks the next FP-side front) and is the low-risk clean-datapath step
 the user picked. Moving the global CP below 13.71 still needs Phase E (or the multiplier/redirect/
 keystone fronts once 13.71 is cut).
+
+## 11. 🔬 CORRECTION (2026-07-06) — `redirect_pc` 13.21 is NOT an independent scalar stage; it is a terminal of the Phase E atomic-commit→trap megacone
+
+Roadmap item **(c) redirect_pc** (§9/§10) is **refuted by the gate trace.** The
+2026-07-06 bundle synth (FETCH_REG + DECODE_REG + ICACHE_SYNC_READ + IMEM_MMU_STAGE +
+STORE_PRETRANSLATE + DCACHE_SYNC_READ + EX_PIPE + SEL_PIPE + SPEC_WAKE + VALU_PIPE,
+throwaway, reverted) reproduces the §9 floor exactly (s1_sum_mag_q **13.86** ·
+n_inflight **13.71** · redirect_pc_q **13.21** · mip **13.19** · vrf 12.49). The
+`--dump-timing` cone of the worst `redirect_pc_q` endpoint (13.210) is:
+
+```
+head → CAS-detect (c_is_cas_q) → commit_store_fire → agu_addr_iss
+     → u_dmem_mmu.u_mmu.tlb… (LIVE Sv39 translate, ~4.3 ns) → m_pa_q → c_store_addr
+     → u_pmp_cbo_m_w (PMP, ~1.7 ns) → sfault_pg_eff → c_is_sfault
+     → csr_medeleg_w (delegation, ~1.3 ns) → trap_cause_bit → trap_to_s
+     → csr_mtvec → trap_tvec_base (~1 ns) → redirect_pc_q  (the commit_trap arm)
+```
+
+So `redirect_pc_q`'s binding depth is the **atomic (CAS/cbo) store's LIVE commit-time
+MMU translate → PMP → store-access-fault → trap delegation → trap-vector** path — the
+**same SMP-atomicity-constrained megacone as `n_inflight`** (STORE_PRETRANSLATE does
+NOT cut it: atomics keep the live translation, proven by the MEM_PIPE M3b amoadd
+wedge). The branch-mispredict arm (`c_bp_mispredict → c_arch_next_pc`, a stored ROB
+value) and the mret/sret arms (`csr_mepc` / `csr_vsepc`) are **shallow and not
+binding**. Registering `redirect_pc_q` (a `REDIRECT_PIPE` scaffold) would NOT cut
+13.21 — the depth is entirely UPSTREAM in the atomic-store→trap cone, which just
+relocates to feed the new register.
+
+**Consequences / plan revision:**
+- There is **no independent "redirect stage"** to build cheaply. In the FINAL
+  structure the redirect is a **commit-stage (C) output**; staging it is subsumed by
+  **Phase E** (commit/retire staging). `redirect_pc` / `n_inflight` / `mip` are ONE
+  cone (the atomic-commit→trap megacone), not three separate fronts.
+- The genuinely-**independent** back-end fronts are therefore only TWO:
+  **(1) FP-add EX staging** (`s1_sum_mag_q` 13.86, a self-contained side-unit, the
+  binding #1, surfaces only under EX_PIPE=1 where const-prop is lost) and
+  **(2) Phase E** (the commit/atomic/trap cluster — SMP-atomicity wall, plan defers LAST).
+- A `REDIRECT_PIPE` that registers only the mispredict/mret/sret arms is a legitimate
+  FINAL-structure stage boundary (the commit→PC edge) but is **CP-neutral AND does not
+  unmask anything** (the commit_trap arm still pins `redirect_pc_q` at 13.21) while
+  costing +1 mispredict penalty — lowest value of the three, not recommended now.
+
+## 12. ✅ DONE (2026-07-06, commit `fe49acc`) — 3-stage double-precision FMA (FMA_PIPE3) cuts the bundle #1 FP-add front (13.86 → new floor 13.71)
+
+Selected after §11 refuted redirect_pc as an independent front — of the two real
+independent back-end fronts (FP-add #1 side-unit, Phase E scalar-but-SMP), FP-add is
+the **gatekeeper**: the tallest, so global CP cannot drop until it is cut, and it is
+self-contained (zero SMP/commit interaction).
+
+**What the 13.86 front actually is (gate trace):** NOT an "FP adder" — it is the
+**double-precision FMA** stage-1 cone (`fp_fma.veryl`): 53×53 mantissa multiply →
+`prod` (106b) → align106 barrel shift → 172-bit two's-complement add →
+`s1_sum_mag_q`. Surfaces only under EX_PIPE=1 (const-prop gone). The multiply is
+~6–7 ns, the align+add ~2–3 ns.
+
+**The cut:** `fp_fma` gains `STAGE3` (wired `FMA_PIPE3: EX_PIPE`). Stage 1 is split
+AFTER the multiply — stage 1a (multiply + exponents + special-case) is registered
+(the `s1a_*_q` register, D taps the already-live 1a nets like `fp_adder`'s
+`s1_sum_q` ⇒ CP-neutral + byte-identical at STAGE3=0), stage 1b (align + add) reads
+the registered `prod`. `fpu_wrap` holds the double FMA one extra cycle (the `fma`
+FSM, a copy of the FROUND FSM) and broadcasts at N+2; `o_cdb.data`/`o_fflags`
+fallbacks already carry the held result. Single FMA (`fp_fma_s`) stays 2-stage.
+
+**Verify:** DEAD 3-gate at EX_PIPE=0 — default **252/0** (litmus N2 cy=0022a330),
+N1 boot cy-exact (7.1 `01210060` / 7.1V `013cc5c0` / 6.6 `013ee8a0`), synth CP
+**14.745** (rs1_rdy front-end floor, unchanged). Flip at EX_PIPE=1 — rv64ud 12/12 +
+rv64uf 11/11, and the bundle synth shows **`s1_sum_mag_q` 13.860 GONE → 11.74**
+(`s1a_prod_q` well below), new global floor **n_inflight 13.710** (the only endpoint
+≥ 13.70). +~280 dead FF at EX_PIPE=0 (submodule-param, CP-neutral, FROUND accounting).
+
+**Roadmap position:** the FP-add gatekeeper is removed. The exposed wall is now the
+**commit-store Phase E megacone** — `n_inflight` 13.71 / `redirect_pc` 13.21 (§11:
+same atomic-commit→trap cone) / `mip` 13.19 — all SMP-atomicity-constrained. To move
+the global CP below 13.71 now requires Phase E (Direction-C port separation for
+non-atomic commit; atomic commit stays single-cycle). Below that: `vrf` 12.49
+(VALU_PIPE done) and eventually the scalar issue/execute/scheduler wall (A-SCHED 9.52).
