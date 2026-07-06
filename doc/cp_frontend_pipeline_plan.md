@@ -614,3 +614,40 @@ atomic-commit slip desyncs the litmus barrier). Cutting `vrf` 12.49 / A-SCHED 9.
 13.71, masked) does NOT move global CP while 13.71 stands. **This is a campaign inflection:
 the accumulated deep-pipe structure is CP-capped at ~13.7 ns until the atomic-commit port is
 physically separated — the hardest, most SMP-dangerous step, previously abandoned.**
+
+### 13.1 — feasibility follow-up (CP-isolation): the fault check is NOT the megacone; a "register all commit faults" cut is worth only ~0.44 ns
+
+To test whether a *fault-registration* variant of Phase E (register bare + cbo commit faults
+too, so `dmem_mmu_fault_s` has zero commit consumers and could prune) has a winning path, the
+commit-store fault terms were FORCED to constant 0 in the bundle (functionally broken, CP-
+isolation only — the same method as Direction-C §8):
+
+| bundle, forced | `n_inflight` | delta |
+|---|---|---|
+| baseline | 13.710 | — |
+| `sfault_{pg,acc,gs}_eff = 0` | 13.630 | −0.08 |
+| **`commit_store_{sfault,sacc} = 0`** (ALL commit-store faults free) | **13.270** | **−0.44** |
+
+Even with **every** commit-store fault free, `n_inflight` only drops to 13.27. The `--dump-timing`
+residual cone is **NOT the fault path** — it is the store's RETIRE path:
+```
+head → commit_store_fire → agu_addr_iss → u_dmem_mmu.tlb (LIVE translate, ~4 ns)
+     → m_pa_q → c_store_addr → sb_line / sb_match → sb_merge_ok (store-buffer merge check
+     on the translated PA) → rob_commit_ack → do_push2 → u_fl.n_inflight
+```
+So the megacone is dominated by **live TLB translate → store-buffer merge-match (`sb_merge_ok`),
+NOT the fault check.** A committing store/atomic can only retire (free its ROB entry → `n_inflight`)
+once its translated PA has been matched against the store buffer — a coherence requirement that
+needs the live translation. This is EXACTLY Direction-C §8's finding: cutting the whole commit
+cone off dcache/MMU (including the fast-store-buffer `sb_merge_ok` via the MMU-translated PA →
+`sb_match`) buys only **~1.3 ns**, leaving a dcache-internal fill/victim floor (≈ `vrf` 12.49).
+
+**Verdict on Phase E / commit-side cutting: no winning path at acceptable cost/risk.** Fault
+registration ≤ 0.44 ns; the full commit-cone-off-MMU cut ≤ ~1.3 ns (→ ≈ 12.4, near `vrf`), at
+the highest SMP-atomicity risk, and it lands on the dcache-internal floor — matching Direction-C's
+2026-06-27 abandonment. The road to ~7.5 ns is NOT commit-side; it is the **issue→execute /
+scheduler** path (A-SCHED loop + the lsu-phase1 load split), which is masked below 13.71 and can
+only lower global CP AFTER the memory-side floor (~12.4) is itself pipelined (IPC cost). **The
+deep-pipe campaign is at strongly diminishing returns on CP: ~13.7 ns bundle, and each further
+step is ≤~1.3 ns for high SMP/IPC cost.** Decision deferred to the user (accept ~13.7 as the
+floor / revise the 7.5 target / a larger uarch redesign of the retire+memory path).
