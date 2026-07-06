@@ -123,3 +123,63 @@ N2/N4 + N2/N4 SMP boot + Verilator (NBA — caught the MEM_PIPE M-stage corners)
 **▶️ First step:** build the R2 shadow (`sh_store_pa`/`sh_store_fault` at execute) as a DEAD scaffold and
 verify byte-identical — the smallest piece that grounds the rest. Then R1's retire-gate swap, then the Q1
 measurement to decide the R3 dependency.
+
+---
+
+## 6. MEASURED (2026-07-07) — Q1 answered UP FRONT: R1+R2-plain is already built (STORE_PRETRANSLATE) and MASKED; the binding is the SLOW-store fault via a runtime-mux live TLB
+
+Before building the R2 shadow, the existing store machinery was read + the §11.8 bundle cone re-traced for
+store-type discriminators. **Two findings collapse the "low-risk R1+R2-plain" premise:**
+
+**(a) STORE_PRETRANSLATE already IS R1+R2 for the plain (fast) store.** `heliodor_core.veryl` already
+registers the plain VM store's PA (`m_pa_q`, `store_pretx_pa`) and fault (`m_spage_q`/`m_sacc_q`/`m_gstage_q`)
+at the execute/M-stage (`:1677-1696, :7293-7295`), and the commit reads them via `sfault_*_eff` (`:4020-4022`),
+`c_store_eff_pa` (`:5495`) → `sb_pa` (`:6060`) → the retire gate. So the intended R2 shadow +
+R1 retire-source-swap **exist** for plain stores; a fresh `sh_store_*` shadow would duplicate them.
+
+**(b) But it does NOT cut the live TLB — the deferral is a RUNTIME MUX (the §13 flaw), and the binding is
+the FAULT, not the PA.** Re-tracing the bundle `n_inflight` cone (STORE_PRETRANSLATE=1) for discriminators,
+the binding path is:
+```
+agu_addr_iss / c_store_addr → dmem_mmu.i_vaddr → LIVE TLB (dmem_mmu.u_mmu.tlb_* ×~40)
+   → sfault_pg_eff → u_pmp_cbo_m_w (the cbo.m PMP, ×20) → commit_trap → rob_commit_ack → n_inflight
+```
+It is the **fault check** (`sfault_pg_eff`), **not** the PA/merge (`c_store_eff_pa`/`sb_merge_ok`/`sb_pa`
+are absent from the cone). And `sfault_pg_eff = if !store_xlate_dfr ? dmem_mmu_fault_s : … m_spage_q` is a
+**runtime 2:1 mux** — exactly the `AMO_XLATE_DFR` refutation (`cp_frontend_pipeline_plan.md` §13): a runtime
+gate cannot prune the live arm, so `sfault_pg_eff`'s delay ≥ the live TLB **for every store sharing that
+wire**. Worse, `store_xlate_dfr` (`:4019`) **excludes `c_is_amo`, `c_is_cbo_zero`, `c_is_cbo_m`** — so the
+slow/management ops' fault is *unconditionally* the live TLB, and the `u_pmp_cbo_m_w` in the cone points at
+**cbo.m** (a cache-block-management op) as a concrete binding requester.
+
+**Consequence — Q1 answered: R1+R2 for plain stores does NOT move the bundle CP.** The plain fast-store
+decouple is already built (STORE_PRETRANSLATE) *and* is masked below the **slow-store commit-fault path**
+(cbo.m / atomic / TLB-miss), whose live TLB binds `rob_commit_ack` — kept there by a runtime mux, not
+prunable by FF-insertion. To move the CP below 13.71 the SLOW-store fault must come off the live TLB, which
+means **const-gating** the deferral (not a runtime mux) AND registering the cbo.m / atomic fault at
+execute — and for atomics that is the §13-refuted problem (the atomic re-drives the MMU at commit for its
+coherent RMW, not just the fault). **So R1's CP value is gated on R3 (the SMP/management-critical slow-store
+path), confirming the study's §4 finding. There is no independent low-risk R1+R2-plain CP win left.**
+
+### 6.1 Revised approach
+
+The honest levers below 13.71 are now clear, none of them "low-risk plain R1":
+
+- **(L1) Const-gate the fault deferral (fix the §13 runtime-mux flaw).** Replace `sfault_*_eff`'s
+  `if !store_xlate_dfr ? live : reg` runtime mux with a **const-gated** `if RETIRE_DECOUPLE ? reg : live`,
+  so the live arm DCEs — *but* only valid if the registered fault covers every store on that wire,
+  including cbo.m/atomic. Needs their execute-time fault registration (below). Measure whether even the
+  plain-store wire then drops (it may still be pinned by the shared slow-store requester).
+- **(L2) Register the cbo.m fault at execute.** cbo.m is a *management* op (no RMW) — its fault may be
+  execute-registerable like a plain store (unlike an atomic). Investigate why `store_xlate_dfr` excludes it;
+  if it is mere conservatism, extending the (const-gated) registration to cbo.m could cut the concrete
+  binding requester the cone named. **Lower-risk than the atomic and a concrete first target.**
+- **(L3) The atomic slow path = R3.** The §13-refuted RMW-re-drive; the SMP minefield; deferred.
+
+**▶️ Revised first step:** investigate **(L2)** — why cbo.m is excluded from `store_xlate_dfr`, and whether
+its commit fault can be registered at execute + const-gated. If yes, it is the smallest concrete CP lever
+(cuts the cone's named `u_pmp_cbo_m_w`/live-TLB requester) at lower SMP risk than the atomic. If cbo.m
+genuinely needs live commit translation, then the only remaining lever is R3, and the campaign should either
+commit to that SMP-critical program or bank the CP work per `deep_pipeline_status_and_replan.md` §6.
+**This is a user decision** (the low-risk R1 premise is gone; what remains is R3-adjacent) — surface before
+building.
