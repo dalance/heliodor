@@ -70,3 +70,27 @@ The dcache `valid_*` front (synth #6, 14.870) is cut by the **Phase-C dcache
 synchronous-read** migration (#1 above) — which is the **E0 warm-up scaffold** in
 `doc/speculative_wakeup_design.md §9`. So the SRAM migration's first step and the
 keystone campaign's de-risking warm-up are the **same RTL change**.
+
+## Migration status
+
+- **✅ Predictors → 1R1W (2026-07-06, byte-identical, `--dump-area`-confirmed).** The
+  branch-predictor SRAM arrays were narrowed to realistic **1R1W** (no compiler offers
+  the old 2R1W / 4R1W) by **replication-for-reads** — each read port gets its own copy,
+  the commit train writes all copies identically, so behavior is byte-identical (only
+  the port count / macro shape change; the read stays combinational — the synchronous
+  read is the fetch-decouple bundle). Verified: default 252/0, litmus N2 `cy=0022a330`,
+  **N1 boot cy-EXACT** (7.1 `01210060`, 6.6 `013ee8a0`, both == baseline).
+  - `btb` (`btb.veryl`): 6 arrays (target/tag/is_cond/call/ret/ind, 2R1W) → **one packed
+    `{meta,target,tag}` word ×2 copies = `4096×119 1R1W ×2`** (slot-0 reads `d0`, slot-1
+    reads `d1`). `valid` stays a reset flop array. Block count 6→2.
+  - `ibtb` (`ibtb.veryl`): target+tag (2R1W) → **`512×80 1R1W ×2`** (packed `{target,tag}`,
+    replicated). `valid` stays flop.
+  - `bht` (`bht.veryl`): `ctr` (3 lookup reads + train RMW) → **`8192×2 1R1W ×4`**
+    (`ctr_a/b/c/d`; copy d is the RMW read-old+write, same index). Block count 1→4.
+  - **Area note:** the btb slot-1 replication doubles a 4096-deep table (~3.95M um²).
+    Byte-identical replication is the conservative default; dropping the slot-1 btb read
+    (lose dual-issue btb prediction) would avoid the doubling — a future perf/area tuning.
+  - Total inferred-RAM blocks 28 → **27** (btb −4, bht +3). Remaining non-1R1W:
+    dcache data `9R4W` / tags `14R1W` (bundle), icache data `2R2W` / tags `4R1W`
+    (fetch-decouple bundle), `mmu.v1_ppn 1R3W` (trivial 1RW, opportunistic),
+    `iq_int.ops 2R2W` (keep-flop).
