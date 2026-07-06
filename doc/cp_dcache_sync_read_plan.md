@@ -400,3 +400,142 @@ needed bundle component; a permanent flip waits for the bundle (front-end + comm
 but left this cbo/MMU-fault path live (§9.7 of `cp_commit_store_pretranslate_plan.md`). This is the
 true `n_inflight` cap once the dcache is registered; the free-list counter tail (~1.9) is the floor
 under it.
+
+## 11. ✅ Q2 RESOLVED (2026-07-06) — the coherence Stage-R/Stage-D split design (the SMP-critical crux)
+
+Direction picked by the user (2026-07-06): pivot to the **SRAM migration** (`deep_pipeline_status_and_replan.md`
+§6.2 (ii)). The D$ is the plan's #1 SRAM target and its DEAD scaffold + Q1 (the IPC fold) are done; the
+one remaining gate before a *functional* flip is **Q2 — the fill/coherence Stage-R/Stage-D split** (§10's
+"the bulk of the implementation risk," flagged unresolved). This section resolves it against the full
+`dcache.veryl` (1765 lines) + the core-side load Stage-A/B driving.
+
+### 11.0 The governing principle (register the SELECTION, re-read the STATE)
+
+The current scaffold (§10.2) registers a **decision cone** that mixes two categories: the fill *selection*
+(which line / which victim way) **and** the victim's *payload/state* (`vic_valid_q`/`vic_dirty_q`/
+`vic_tag_q`, and `vic_data` is left live-but-wrong-indexed). Registering the payload is the **latent bug**
+in the =1 flip: between the Stage-R decision (cycle N) and the Stage-D fill start (cycle N+1) a concurrent
+coherence event can mutate the victim line — a **store-drain merging into the victim** (`store_can_drain`,
+`:1199`) flips its dirty bit, a **remote invalidate** clears its valid, a **probe** captures+invalidates
+it. A registered `vic_dirty_q=0` then skips the writeback of a line that became dirty in the window →
+**silently dropped store** (a litmus MP-class violation, exactly the class MEM_PIPE M3b guarded).
+
+**Principle.** Register **only the SELECTION** — the deep tag-compare→miss→srfo→victim-argmin cone that
+was the ~3.1 ns depth (§1):
+> `miss_q`, `load_sel_q`, `srfo_sel_q`, `f_index_q`, `f_tag_q`, `f_offset_q`, `f_rfo_q`, `victim_way_q`
+
+**Re-read / re-evaluate at Stage-D from the registered selection** (a *shallow* single-array-indexed-by-a-
+flop mux, ≈0.5 ns — does NOT re-introduce the deep cone, so the §10.2 CP cut survives):
+> `vic_valid`, `vic_dirty`, `vic_tag`, `vic_data` ← `dirty_X[f_index_q]` / `tags_X[f_index_q]` /
+> `data_X[f_index_q]` selected by `victim_way_q`; and the **fill-start GATING**
+> (`fill_blocked_wb` ← live `wb_v`/`wb_line`; `i_memr_grant` live; the same-cycle clashes).
+
+**Keep entirely LIVE (never pipelined):** the AMO/SC in-cache commit write (`wenl_fires`, §5.6 —
+atomicity-critical), the store-drain merge (`store_can_drain`), the next-dword / slot-1 / 3× presence
+reads, the probe & invalidate array mutations, the flush sweep, and the S14 streaming reads. These read
+registered arrays and mutate on their own live requests; the demand-lookup pipelining does not touch them.
+
+**Why this keeps CP:** the §10.2 measurement already proved registering `{miss, f_index, f_tag, victim_way,
+…}` removes the dcache gates from the `n_inflight` path. The Stage-D re-reads are `array[flop]`→mux (the
+same shape as the existing `o_fill_rdata` re-read at `:1608`, which is not on any top-15 front). So the cut
+is preserved and the correctness hole is closed.
+
+### 11.1 Corner-by-corner resolution (every dcache behaviour, classified)
+
+| # | behaviour (RTL) | stage | hazard from registered SELECTION | resolution |
+|---|---|---|---|---|
+| C1 | **victim writeback payload** (`vic_data`/`vic_dirty`/`vic_tag`/`vic_valid`, `:548-595`, capture `:977`) | **Stage-D re-read** | registered payload goes stale if a drain dirties / an inv or probe drops the victim in the R→D window → dropped dirty line | drop `vic_*_q` from the registered set; re-read `{valid,dirty,tag,data}_X[f_index_q]` by `victim_way_q` at the fill start. The writeback then carries **current** bytes. |
+| C2 | **fill-start gating** (`fill_blocked_wb`, `:595`,`:666`; `want_fill_start` `:1564`) | **Stage-D re-eval** | `wb_v` can set/clear in the R→D window; a stale `fill_blocked_wb_q=0` starts a fill while the WB buffer holds the fetched line → stale-fill (the `:592` bug) | re-eval `fill_blocked_wb = wb_v && (vic_dirty_reread || wb_line=={f_tag_q,f_index_q})` at Stage-D from live `wb_v` + registered selection. |
+| C3 | **demand HIT vs remote invalidate** (`inv_hits_active` `:364`; hit `:342`) | **Stage-D re-validate** | the fold reads tags at Stage-A (cy N−1) but delivers data at Stage-B (cy N); an inv landing at N−1 or N on the hit line makes the registered hit stale → the load reads a value older than a write it is ordered after | carry the Stage-A hit line ({tag,index}) to Stage-B; **squash the registered hit** (→ `o_stall` → replay/refetch) if `i_inv*_valid` matched that line at either the Stage-A tag-read cycle or the Stage-B delivery cycle. Same contract the live `inv_hits_active` enforces today, checked one stage later. |
+| C4 | **same-cycle clashes on fill start** (`drain_fill_set_clash` `:715`, `wenl_fires`'s `fill_start_fire && f_index==index` `:886`, `pin_arm_fill` `:890`) | **Stage-D, live-vs-registered** | none — these compare the LIVE drain/AMO request against the fill that *actually starts this cycle* | already correct with `f_index_q`: `fill_start_fire` fires at Stage-D from the registered selection; the live `sindex`/`index` clash against `f_index_q` is exactly "does this cycle's live request collide with the fill mutating arrays this cycle." No change. |
+| C5 | **AMO/LR in-cache RMW commit write** (`wenl_fires` `:885`, write `:1077`) | **LIVE (unchanged)** | must stay a single-cycle live write (M3b: a +1cy AMO commit desyncs SMP litmus) | the write path uses the **live** `i_addr` hit (`hit_excl`), never the registered fill decision. The AMO *read* value-capture serves from a live E/M hit; an S-hit/miss folds into `amo_upg`→`miss_q` (registered fill, fine). Keep the entire `wenl_*` block on the live port. |
+| C6 | **store-drain merge** (`scache_hit` `:471`, merge `:1199`) | **LIVE (unchanged)** | independent `i_saddr` tag-match; a live single-cycle merge | keep live. Its only interaction with the pipelined fill is C4's `drain_fill_set_clash` (already correct). A drain that cannot merge raises `srfo_sel` (registered fill) — fine. |
+| C7 | **mid-fill abort / completion-edge fold** (`inv_fill_hit` `:417`, `p_fill_hit` `:812`, `inv_hits_done` `:1132`) | **LIVE (unchanged)** | operates on the FSM regs (`fill_index`/`fill_tag`, set from `f_index_q`/`f_tag_q` at fill start), not the raw decision | unchanged — the abort machinery already keys off the latched fill line, which now originates from the registered selection. Correct by construction. |
+| C8 | **probe / recall, remote invalidate array writes** (`:1321`,`:1443`,`:1461`) | **LIVE (unchanged)** | mutate arrays on their own live ports | unchanged. They race the demand pipeline only via C1/C3, resolved there. |
+| C9 | **next-dword / slot-1 / 3× presence / streaming reads** (`:1493`,`:1634`,`:1723`,`:685`) | **LIVE (unchanged)** | pure combinational reads of registered arrays; no dependence on the demand decision | unchanged. Note the slot-1 (`i_addr2`) and presence ports already exclude the mid-fill victim way — that exclusion still holds. |
+| C10 | **eviction departure events** (`ev_fill_vic` `:918`→`o_evict1`) | **Stage-D (naturally)** | the victim departs when the fill *starts* (Stage-D); the poison scan must see the eviction the cycle the array is mutated | `ev_fill_vic` keys off `fill_start_fire`+`vic_valid`(re-read)+`vic_tag`(re-read)/`f_tag_q` → fires at Stage-D, the cycle the line actually leaves. Correct — eviction event is tied to the mutation, not the decision. |
+
+**Reading of the table:** exactly **three** corners need a change (C1 re-read the victim payload, C2 re-eval the
+WB block, C3 add the R→D hit re-validation); **all seven** coherence/atomicity corners the plan flagged as
+SMP-critical (§5, §10-Q2) either stay LIVE untouched (C5-C9) or are already correct because they key off the
+*latched fill line* / *actual array mutation* rather than the raw decision (C4, C7, C10). The AMO write —
+the one the plan singled out as unpipelineable — never enters the pipelined path.
+
+### 11.2 The fold interface (Q1's load-use-neutral path) — the one real interface change
+
+§10.1 resolved that the fold is IPC-free, but the **current scaffold does not implement it** — it registers
+the *Stage-B* decision (`i_addr=lsr_paddr_q` is driven at Stage-B by `lsr_drive`, `core:6772`), so a load's
+registered fill lands at Stage-B+1 = **load-use +1**. To get load-use-neutral, the Stage-R tag read must be
+presented at the **Stage-A index** so its hit is registered *into* Stage-B:
+
+- Stage-A has `dmu_dmem_addr` live (the MMU-translated PA that feeds `lsr_paddr_q`, `core:1612`), hence
+  `index = dmu_dmem_addr[INDEX_W+5:6]` is available a cycle before `lsr_drive`.
+- **Interface:** add a Stage-A **tag-read index** input to the dcache (or drive `i_addr` with `dmu_dmem_addr`
+  during Stage-A and register the hit inside the dcache). Stage-A reads tags→computes+registers
+  `{cache_hit, hit_way, miss_q, victim_way_q, f_*_q}`; Stage-B consumes them for the data read + fill.
+- **No comb loop** (§10.1): the Stage-A tag read produces only the registered hit; it must NOT feed
+  `dcache_stall` (the fill/miss/stall stays in Stage-B off `miss_q`). `lsr_capture` already excludes
+  `iss_dc_ok` (`core:6766`), so the loop stays open.
+- The **commit-store** path has no Stage-A to fold into (it is a live `commit_store_fire→MMU→dcache` in one
+  cycle, §10.1) → it takes the +1 (register its lookup, the commit gate reads it next cycle). Stores are
+  SB-buffered → cheap. **This is where the CP is cut** (the `n_inflight` endpoint), so the +1 is the point.
+
+So the functional flip is **two RTL pieces**: (a) the §11.0-§11.1 selection/re-read correction *inside*
+dcache (makes =1 correct but load-use +1), and (b) the Stage-A tag-read port (makes the load load-use-
+neutral). (a) is the SMP-critical part; (b) is a timing optimization that can land second.
+
+### 11.3 Scaffold-extension plan (concrete deltas to `dcache.veryl`)
+
+1. **Shrink the registered set** to the selection only: keep `miss_q,load_sel_q,srfo_sel_q,f_index_q,
+   f_tag_q,f_offset_q,f_rfo_q,victim_way_q`; **delete** `vic_valid_q,vic_dirty_q,vic_tag_q` (and the
+   half-done live `vic_data`).
+2. **Stage-D victim re-read** (new lets, gated `if DCACHE_SYNC_READ`): `vic_valid_d/vic_dirty_d/vic_tag_d/
+   vic_data_d = {valid,dirty,tags,data}_X[f_index_q]` by `victim_way_q`. Route the FILL-start capture
+   (`:978`) and `ev_fill_vic`/`o_evict1_addr` to the `_d` forms.
+3. **Stage-D `fill_blocked_wb`** re-eval from live `wb_v`/`wb_line` + `vic_dirty_d`.
+4. **R→D hit re-validation** (the fold, C3): register the demand hit line at Stage-R; at Stage-D squash it
+   (add to `o_stall`, drop `o_data_valid`/`o_hit_safe`) if `i_inv*` matched it in the window → replay.
+5. **Stage-A tag-read port** (11.2(b)) — core interface: a new `i_addr_r`/`i_ren_r` Stage-A index, or reuse
+   `i_addr` driven with `dmu_dmem_addr` during Stage-A. Register the hit inside dcache.
+6. Keep `DCACHE_SYNC_READ=0` default until the bundle; each delta is byte-identical at 0 (the `_d`/`_q`
+   forms fold to `_raw` via the const gate, DCE'd — the §10.2 methodology).
+
+### 11.4 Verification ladder + measurement (unchanged from §7, re-stated for the functional flip)
+
+The =1 flip is **not byte-identical** (commit-store +1; load-use neutral iff 11.2(b) lands). Two-axis:
+- **CP:** confirm the dcache cone stays out of `n_inflight` (was −0.13 standalone; real win is in the bundle
+  with the commit-store cbo/MMU-fault cut of §10.2's "next front").
+- **IPC (the gate):** load-use latency **unchanged** (fold check — the single most important number),
+  commit-store +1 (buffered, expect ≈0 boot-cy). Measure boot-cy / CoreMark / Dhrystone, ~10-15 % budget.
+- **Correctness (SMP-critical):** default 252/0 + backend-validate + **ACT4 696/696** (S-mode paging +
+  the store/load dcache-port collision) + litmus N2/N4 (the C1 dropped-dirty + C5 AMO-write classes) +
+  N2/N4 SMP boot + **Verilator** (NBA semantics — the tool that caught the MEM_PIPE M-stage corners the
+  Veryl sim masked). C1/C3 are the new-hazard classes; litmus MP + amoadd are the targeted probes.
+
+### 11.5 ✅ IMPLEMENTED + VERIFIED (2026-07-06) — deltas 1-2 (the C1/C2 selection/re-read correction), byte-identical at =0
+
+`dcache.veryl`: the scaffold registered set is **shrunk to the SELECTION only**
+(`miss_q,load_sel_q,srfo_sel_q,f_index_q,f_tag_q,f_offset_q,f_rfo_q,victim_way_q`; **dropped**
+`fill_blocked_wb_q,vic_valid_q,vic_dirty_q,vic_tag_q`). The victim state (`vic_valid/vic_dirty/vic_tag/
+vic_data`) and `fill_blocked_wb` are now **Stage-D re-reads** off the registered selection (`{valid,dirty,
+tags,data}_X[f_index]` by `victim_way`; `fill_blocked_wb = wb_v && (vic_dirty || wb_line=={f_tag,f_index})`).
+This closes the C1 dropped-dirty-victim + C2 stale-fill holes that a registered stale payload would open at
+=1, while staying byte-identical at =0 (the `_eff` `f_index`/`victim_way` fold to `*_raw`).
+
+**DEAD (=0) verification — all green:**
+- default **252/0**; **litmus N2 `cy=0022a330`** (cycle-EXACT vs §10.2's reference → SMP byte-identical).
+- synth **CP 14.745 ns / 141 levels / `pc_q→rs1_rdy` / 160507 FF — IDENTICAL** to the committed baseline
+  (the dropped `_q` regs DCE exactly; +151/1.16M gates = synth noise, CP/FF/levels unchanged → the
+  const-gate DCE methodology survives the restructure).
+- `veryl check`: no NEW errors (the 101 pre-existing "Not reset" on the data/tags memory arrays are a
+  known false-positive, identical count on baseline — `veryl check` is not a project gate; `veryl test` is).
+
+**▶️ Next step:** delta 3 (C3 R→D demand-hit re-validation — carry the Stage-A hit line to Stage-B, squash
+on an intervening `i_inv*`) and delta 5 (the §11.2 Stage-A tag-read port = the load-use-neutral fold), then
+the FF-insertion flip to confirm the dcache cone is still off `n_inflight`, then the coordinated bundle flip
+(front-end + commit-store cbo/MMU-fault + vrf + dcache + redirect) with the full §11.4 ladder + IPC. The
+array **port narrowing** (data 9R→1R way-mux macro, tags 13R→1R — the realistic 1RW/1R1W SRAM,
+`sram_inventory.md` rows 1-2) rides delta 1-2's registered way-select and is the SRAM-macro half of the
+same migration. Deltas 1-2 are DEAD at 0 → safe to ship as the scaffold-correctness fix ahead of the flip;
+the full N4-litmus / N2-N4 SMP-boot / Verilator ladder is the gate for the FUNCTIONAL (=1) flip, not this
+byte-identical refactor.
