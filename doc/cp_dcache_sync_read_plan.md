@@ -539,3 +539,32 @@ array **port narrowing** (data 9R→1R way-mux macro, tags 13R→1R — the real
 same migration. Deltas 1-2 are DEAD at 0 → safe to ship as the scaffold-correctness fix ahead of the flip;
 the full N4-litmus / N2-N4 SMP-boot / Verilator ladder is the gate for the FUNCTIONAL (=1) flip, not this
 byte-identical refactor.
+
+### 11.6 ✅ IMPLEMENTED + VERIFIED (2026-07-06) — delta 3 (the C3 R→D demand-hit re-validation), byte-identical at =0
+
+`dcache.veryl`: the **C3 re-validation machinery** is in place. A demand-load HIT that the synchronous
+read decides at Stage-R and delivers at Stage-D can go stale if a remote invalidate lands on that line in
+the R→D window (the load would then read a value OLDER than a write it is ordered after — the litmus
+MP class the LIVE `inv_hits_active` guards one stage earlier). The scaffold registers the hit's line and
+an "inv-hit-at-Stage-R" flag, then squashes the registered hit at Stage-D:
+> `dhit_v_q` = `i_ren && !i_amo_read && !i_uncached && cache_hit` (a demand-load hit in-flight R→D);
+> `dhit_line_q` = `{tag, index}`; `dhit_inv_r_q` = `inv_hits_active || inv2_hits_active` (Stage-R inv).
+> `dhit_inv_d` = live `i_inv*` matches `dhit_line_q` (Stage-D inv);
+> `dhit_c3_squash` = `DCACHE_SYNC_READ && dhit_v_q && (dhit_inv_r_q || dhit_inv_d)`.
+
+`dhit_c3_squash` is added to `o_stall` (→ replay/refetch) and drops `o_data_valid` / `o_hit_safe`. Same
+contract `inv_hits_active` enforces today, checked one stage later. delta 3 registers the hit LINE + squash
+only; it does NOT move the DATA read — the Stage-A tag/data read (which registers the hit INTO Stage-D and
+makes the =1 semantics complete + load-use-neutral) is delta 5, so at =1 delta 3 alone is still partial (it
+flips together with delta 5 for the functional read path).
+
+**DEAD (=0) verification — all green (matches deltas 1-2's byte-id signature):**
+- default **252/0**; **litmus N2 `cy=0022a330`** (cycle-EXACT vs §11.5 reference → SMP byte-identical).
+- synth **CP 14.745 ns / 141 levels / `pc_q→rs1_rdy` / 160511 FF — IDENTICAL** to the HEAD (`cdaebda`)
+  baseline (the `dhit_*_q` regs DCE exactly; +231/1.16M comb gates = synth noise, off the critical path —
+  the same category as deltas 1-2's +151). CP/FF/levels/endpoint all unchanged.
+- **N1 boot cy-EXACT:** 7.1 `01210060`, 6.6 `013ee8a0`, 7.1V `013cc5c0` (all == baseline).
+
+**▶️ Next step:** delta 5 (the §11.2 Stage-A tag-read port = register the hit INTO Stage-D from a Stage-A
+`dmu_dmem_addr` read → makes the demand read synchronous AND load-use-neutral, and completes delta 3's =1
+semantics), then the FF-insertion flip, then the coordinated bundle flip with the full §11.4 ladder + IPC.
