@@ -683,3 +683,32 @@ the committed load result (PRF at commit) against a `=0` reference, cycle-by-cyc
 subtest-5 failure is a deeper store-forwarding/load-path interaction, and the full SMP ladder is still ahead.
 The functional flip is confirmed to be a **multi-session SMP-critical effort**, not a single sitting.
 `DCACHE_SYNC_READ=0` stays default.
+
+### 11.10 ✅ subtest-5 ROOT-CAUSED + FIXED (2026-07-07) — the cold-miss registration gap; but the AMO/misaligned/H clusters remain
+
+The subtest-5 bug was **NOT store-forwarding** (that hypothesis was wrong). A **commit-diff** (trace every
+committed `rd` write, `=1` vs `=0`, first divergence) pinned it: the first `tdat` load `ld a4,0(sp)` at
+`0x1b4` (PA `0x80002000`) committed **0 at `=1`** vs `00ff…ff` at `=0`. Tracing its lifetime: at `=1` it
+completed in ONE cycle (`stall=0 rdone=1`) with pre-fill `rdata=0`.
+
+**Cause (4th `=1` bug):** the miss is registered (`miss = miss_q`, deltas 1-2's Stage-B compute), so it is a
+cycle LATE vs the Stage-A-folded hit (`dhit_v_q`). On the load's first Stage-B cycle BOTH `dhit_v_q=0`
+(Stage-A miss) AND `miss_q=0` (not yet) → `o_stall` dropped → premature completion with 0. **Fix:**
+`dhit_miss = dhit_ren_q && i_ren_folded && \!dhit_v_q && \!i_uncached` OR'd into `o_stall` — stalls that
+one-cycle gap; `miss_q` takes over next cycle, the fill runs, the live re-read delivers. **rv64ui-ld + ld_st
+PASS at `=1`** (commit `04b8178`, byte-id at 0: 252/0, litmus N2 `cy=0022a330`).
+
+**Remaining `=1` failures (functional flip still WIP — the full-suite `=1` run now completes, no hang):**
+- **rv64ua AMO suite (the big cluster)** — amoadd/and/or/xor/min/max/swap {_w,_d}. AMOs are NOT plain loads
+  (`i_ren_r = lsr_capture` is 0 for them → `dhit_*` off), so their dcache read is the LIVE path — the break
+  is a DIFFERENT `=1` interaction, likely the SAME miss-registration-a-cycle-late class for the AMO's
+  RFO/upgrade fill (`amo_upg → miss_q`) vs the single-cycle `amo_watch`/RMW-commit timing. Needs its own
+  trace.
+- **misaligned** (rv64mi ma_addr/sd_misaligned, rv64ui ma_data) — cross-dword loads (`i_load_next`); the
+  folded `o_hit_safe` does not exclude `i_load_next` (the live form does), and `o_rdata_next` stays live —
+  a folded misaligned load likely mis-delivers.
+- **hypervisor** (hlv/hgpf/htwostage/hmini/…), **sv\*** (svpbmt/svnapot/svadu), **vleff**, **sysb** — TBD.
+
+**4 `=1`-path fixes so far (all byte-id at 0):** `dhit_ren_q` gate, fill-safety, `i_ren_folded` strobe,
+`dhit_miss`. The plain-load path is correct; the AMO / misaligned / H clusters are the next work. The
+functional flip is a **multi-cluster SMP-critical effort** — each cluster a `=1`-path corner. `=0` default.
