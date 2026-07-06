@@ -657,3 +657,29 @@ introduces — needs cycle-by-cycle core+dcache co-tracing. Noted for the next a
 semantics for the eventual flip). `DCACHE_SYNC_READ=0` remains the default — **the `=1` functional flip is
 INCOMPLETE** (the ld bug + the full SMP ladder still ahead). The functional flip is confirmed to be the
 large, multi-bug SMP-critical effort the plan warned of; it is not a quick enable.
+
+**Update (2026-07-07, cont.) — 3rd fix + the ld bug is a DEEPER layer.** A 3rd `=1`-path bug fixed
+(byte-id at 0): **`i_ren_folded` delivery strobe.** `dhit_use` gated only on `dhit_ren_q` (registered
+`i_ren_r`) fired the folded delivery whenever a Stage-A read happened last cycle — but a STALLED `lsr_drive`
+(the Stage-B consume) means `i_ren=0` on the intervening cycle, so `o_hit_safe` asserted a cycle early on a
+non-consuming cycle (instrumented: `foldhs=1 livehs=0 iren=0`). Fix: a new dcache input `i_ren_folded`
+(= `lsr_drive`, the core's Stage-B consume strobe); `dhit_use = dhit_ren_q && i_ren_folded && fill-safe`.
+Instrumentation confirms the `o_hit_safe` divergence is then gone at `lsr_drive`. **Byte-id at 0 verified**
+(252/0, litmus N2 `cy=0022a330`, synth 14.745/141lv/160511 FF).
+
+**But `rv64ui-ld` subtest-5 STILL fails — the bug is in a layer the dcache-output diagnostics do not reach.**
+Traced every load completion (`lsr_complete`/`lsr_read_done`, hit-under-miss `dc_hit_safe`): **the ld test's
+`tdat` load values (`0x00ff…`) never appear on ANY dcache/LSR completion path** (only the passing `ld_st`
+test's `deadbeef…` loads do). So the failing `ld` loads complete via a path that does not surface
+`dcache_rdata` — most likely **store-to-load forwarding** (the harness may relocate `.data` via stores, or
+the forward network serves them) or a hit-under-miss/MSHR route. At `=1` the `o_hit_safe`/`o_stall` timing
+change plausibly perturbs when a store drains vs a load forwards. **This is a store-forwarding / load-path
+interaction, not the folded-delivery datapath** (which is proven value-correct: `dhit_rdata_d ≡ live`).
+It needs a dedicated session: trace the store-buffer drain + forward-network (`stld_fwd_*`, `sf`/`sbf`) +
+the committed load result (PRF at commit) against a `=0` reference, cycle-by-cycle.
+
+**Net (3 bugs fixed, byte-id; `=1` still incomplete):** the folded-delivery datapath is now correct
+(`dhit_ren_q` gate, fill-safety, `i_ren_folded` strobe — all committed byte-id at 0). The remaining
+subtest-5 failure is a deeper store-forwarding/load-path interaction, and the full SMP ladder is still ahead.
+The functional flip is confirmed to be a **multi-session SMP-critical effort**, not a single sitting.
+`DCACHE_SYNC_READ=0` stays default.
