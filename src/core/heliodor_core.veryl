@@ -653,6 +653,7 @@ pub module heliodor_core #(
     var icache_rdata_next: logic<32>;
     var icache_rdata_next_valid: logic; // Phase 8 S4: next-word present this cycle
     var icache_stall     : logic    ;
+    var icache_stall_comb: logic    ; // Shape-W: combinational demand-miss for the F0 stream
 
     // M8.B: D-cache outputs (instance after dmem_mmu, near end of file).
     // dcache_rdata replaces the combinational i_dmem_rdata for LOAD results
@@ -804,7 +805,10 @@ pub module heliodor_core #(
     // now (no bubble). This is the same {icache_rdata_next, icache_rdata} window the
     // slot-1 path already reads. RVC-mixed code with misaligned 32-bit instrs (e.g.
     // memcpy: 3 of 5 loop ops straddle → 37% i-fetch idle) is the big win.
-    let straddle_same_page : logic     = ic_pc[11:2] != 10'h3ff;
+    // At =1 the straddle high word is the next WORD FIFO dword — F0 fetched it with its own
+    // translation, so a cross-page straddle needs NO re-translate (unlike the =0 2-cycle path);
+    // "same page" is vacuously true (availability is ic_rdata_nv = ext_next_valid).
+    let straddle_same_page : logic     = if ICACHE_SYNC_READ ? 1'b1 : (ic_pc[11:2] != 10'h3ff);
     let straddle_oneshot   : logic     = needs_straddle && ic_rdata_nv && straddle_same_page;
     let needs_straddle_slow: logic     = needs_straddle && !straddle_oneshot;
     let straddle1_instr    : logic<32> = {ic_rdata_next[15:0], ic_rdata[31:16]};
@@ -846,12 +850,25 @@ pub module heliodor_core #(
     // (ic_rd_settled_q never sets: imem_valid_w=0 on a fault). The read-latency
     // stall only applies to a real lookup (hit/miss).
     let ic_rd_ok: logic = !ICACHE_SYNC_READ || ic_rd_settled_q || imem_fault_w || imem_acc_fault_w;
-    let fetch_ready: logic = !needs_straddle_slow && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && !icache_stall && ic_rd_ok;
-    // The straddle-prep step (below) holds pc_q but advances the icache address to
-    // fetch_vaddr = pc_q+2 (to read the high half's word), so under ICACHE_SYNC_READ
-    // it is a fetch-address change that costs one more settle cycle. Named here so
-    // ic_pc_advances (the settled-clear condition) sees it.
-    let ic_straddle_prep: logic = needs_straddle_slow && (imem_valid_w || imem_fault_w) && !icache_stall && ic_rd_ok;
+    // ── Shape-W extract deliver gate (=1) ── The WORD FIFO head dword is present AND is
+    // ext_pc_q's dword (post-redirect refill / F0 read latency hold it low until the dword
+    // lands = the redirect/miss bubble). Faults ride the FIFO entry (delivered in order).
+    let ext_head_dw   : logic<64> = {ext_pc_q[63:3], 3'b000};
+    let ext_head_match: logic     = ICACHE_SYNC_READ && (wf_count >= 4'd1) && (wf_pc[wf_head] == ext_head_dw);
+    // Fault bits: at =1 from the FIFO head entry; at =0 the live imem_mmu outputs.
+    let ic_ifault : logic     = if ICACHE_SYNC_READ ? (ext_head_match && wf_ifault[wf_head]) : imem_fault_w;
+    let ic_iacc   : logic     = if ICACHE_SYNC_READ ? (ext_head_match && wf_iacc[wf_head])   : imem_acc_fault_w;
+    let ic_gstage : logic     = if ICACHE_SYNC_READ ? (ext_head_match && wf_gstage[wf_head]) : imem_gstage_w;
+    let ic_gpa    : logic<64> = if ICACHE_SYNC_READ ? wf_gpa[wf_head] : imem_gpa_w;
+    // Deliver: =1 gates on the FIFO head (a fault entry delivers regardless of straddle);
+    // =0 keeps the old combinational-fetch readiness.
+    let fetch_ready: logic = if ICACHE_SYNC_READ ?
+        (ext_head_match && (ic_ifault || ic_iacc || !needs_straddle_slow))
+      : (!needs_straddle_slow && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && !icache_stall && ic_rd_ok);
+    // The =0 straddle-prep holds pc_q + advances fetch_vaddr to pc_q+2 for the high word.
+    // At =1 there is no such prep — the high word is a fetch-ahead FIFO dword (the straddle
+    // just waits via needs_straddle_slow), so ic_straddle_prep is OFF.
+    let ic_straddle_prep: logic = !ICACHE_SYNC_READ && needs_straddle_slow && (imem_valid_w || imem_fault_w) && !icache_stall && ic_rd_ok;
 
     // ============================================================
     // Phase 8 M2: branch prediction (BTB + bimodal BHT) — frontend redirect.
@@ -972,7 +989,7 @@ pub module heliodor_core #(
     let pred_next_pc1   : logic<64> = if predicted_taken1 ? pred_target1 : s1_pc + s1_len;
     // slot-1 delivery eligibility. slot-0 must be a clean (non-straddle, non-
     // fault) delivery that was NOT predicted taken (else slot-1 is wrong-path).
-    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !imem_fault_w && !predicted_taken;
+    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && !predicted_taken;
     // slot-1 needs the next word (rdata_next) unless it is an RVC sitting in the
     // slot-0 word (b1==1 && rvc). Using the next word requires it be in the SAME
     // cache line (→ same page as slot-0, so slot-1's fetch can't fault separately).
@@ -1241,23 +1258,39 @@ pub module heliodor_core #(
     // dependence → sequential code never bubbles). The extract-side pop + the predicted-
     // taken redirect arrive in W2; here the FIFO only fills (F0 holds when full). W3
     // hardens the =1 miss / PTW / fault back-pressure (this skeleton is dead at 0).
-    let wf_full   : logic = wf_count == 4'd8;
+    // Room for THIS present's push (lands next cycle) must account for the ALREADY in-flight
+    // push (wf_push_valid_q, from last cycle's present, lands this cycle). Without the
+    // wf_push_valid_q term, presenting at count==7 overflows: the in-flight push takes it to
+    // 8, then this present's push to 9 → FIFO corruption (only under sustained back-pressure,
+    // e.g. a long div / FP / atomic fills the FIFO — the W3 first-flip hang).
+    let wf_full   : logic = (wf_count + (if wf_push_valid_q ? 4'd1 : 4'd0)) >= 4'd8;
     // F0 presents a fetch when the translation resolved (or faulted), the read path is free,
     // and the FIFO has room. On a fault i_ren=0 so icache_stall=0 and a fault-marked entry
     // still pushes, delivering the fault in program order at extract.
-    let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall && !wf_full
+    // Gate on the COMBINATIONAL miss (icache_stall_comb) so F0 holds pc_fetch_q on the
+    // exact cycle its presented address misses; the registered icache_stall is a cycle late
+    // (the previous address' stall) and would stream past the miss. The push (wf_do_push)
+    // keeps the registered icache_stall — it aligns with the registered o_rdata arrival.
+    let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall_comb && !wf_full
         && (imem_valid_w || imem_fault_w || imem_acc_fault_w);
     // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
     // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
     let wf_do_push: logic = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall;
-    // W2 extract pointer: on a normal delivery ext_pc_q advances past the delivered bundle
+    // Extract pointer: on a normal delivery ext_pc_q advances past the delivered bundle
     // (slot-1's predicted next if the 2nd slot fired, else slot-0's). The extract POPS the
-    // WORD FIFO head dword when the advance leaves it (crosses the dword boundary). W3
-    // refines: pop 0/1/2 for a bundle spanning two dwords + the FIFO-availability deliver
-    // gate + the predicted-taken→F0 redirect. All DEAD at 0.
+    // WORD FIFO head dword when the advance leaves it (crosses the dword boundary; a bundle
+    // is <=8B so at most one dword is crossed per delivery).
     let ext_next_pc: logic<64> = if fb_push1 ? pred_next_pc1 : pred_next_pc_bp;
     let ext_pop    : logic     = ICACHE_SYNC_READ && fb_push0 && !straddle_q
         && (ext_next_pc[63:3] != ext_pc_q[63:3]);
+    // Predicted-taken → F0 redirect: the extract delivered a taken branch (slot-0, or a
+    // not-taken slot-0 + a taken slot-1), so the F0 stream — running sequentially past the
+    // branch — must re-steer pc_fetch_q to the target (dword-aligned = ext_next_pc's dword)
+    // and the WORD FIFO must flush its now-wrong-path words. Costs the taken +1 (the target
+    // dword is a cycle late), same as the =0 fetch. Commit/early redirect (any_redirect) has
+    // priority (older + authoritative). DEAD at 0.
+    let ext_taken_redir: logic = ICACHE_SYNC_READ && !any_redirect
+        && ((fb_push0 && predicted_taken) || (fb_push1 && predicted_taken1));
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q       = RESET_PC;
@@ -1271,17 +1304,20 @@ pub module heliodor_core #(
             // Write ONLY at =1 → at =0 every reg here is reset-only (holds its reset
             // constant) → DCE (the icache o_rdata_q idiom; a mux(control,const,hold) D
             // with an explicit =0 write survives simple DCE as an off-path flop).
-            // pc_fetch_q: redirect > early-redirect > stream-advance > hold. Dword-aligned.
+            // pc_fetch_q: redirect > early-redirect > predicted-taken > stream-advance > hold.
+            // Dword-aligned. The predicted-taken re-steer follows the extract's branch target.
             if redirect_fire {
                 pc_fetch_q = {redirect_pc[63:3], 3'b000};
             } else if early_redir_fire_q {
                 pc_fetch_q = {early_redir_pc_q[63:3], 3'b000};
+            } else if ext_taken_redir {
+                pc_fetch_q = {ext_next_pc[63:3], 3'b000};
             } else if f0_present {
                 pc_fetch_q = pc_fetch_q + 64'd8;
             }
-            // Push-pipeline register: the presented dword's PC + fault bits, delayed one
-            // cycle to land with its data. Cleared on a redirect (presented fetch is wrong-path).
-            wf_push_valid_q = f0_present && !any_redirect;
+            // Push-pipeline register: the presented dword's PC + fault bits, delayed one cycle
+            // to land with its data. Cleared on a redirect / taken re-steer (fetch is wrong-path).
+            wf_push_valid_q = f0_present && !any_redirect && !ext_taken_redir;
             if f0_present {
                 wf_push_pc_q     = pc_fetch_q;
                 wf_push_ifault_q = imem_fault_w;
@@ -1300,7 +1336,9 @@ pub module heliodor_core #(
             wf_count = 4'd0;
         } else if ICACHE_SYNC_READ {
             // Write ONLY at =1 → reset-only at =0 → the FIFO pointers + data arrays DCE.
-            if any_redirect {
+            // Flush on a commit/early redirect OR a predicted-taken re-steer (the buffered
+            // words after the taken branch are wrong-path; F0 refetches from the target).
+            if any_redirect || ext_taken_redir {
                 wf_head  = 3'd0;
                 wf_tail  = 3'd0;
                 wf_count = 4'd0;
@@ -1369,10 +1407,10 @@ pub module heliodor_core #(
                 // M7: track RVC-origin for the link register (pc+2 vs pc+4). A
                 // straddle resolves a 32-bit instr, so is_rvc=0 in that case.
                 fb_is_rvc[fb_tail]       = !straddle_q && curr_is_rvc;
-                fb_ifault[fb_tail]       = imem_fault_w;
-                fb_iacc[fb_tail]         = imem_acc_fault_w;
-                fb_ifault_gstage[fb_tail] = imem_gstage_w;
-                fb_ifault_gpa[fb_tail]   = imem_gpa_w;
+                fb_ifault[fb_tail]       = ic_ifault;
+                fb_iacc[fb_tail]         = ic_iacc;
+                fb_ifault_gstage[fb_tail] = ic_gstage;
+                fb_ifault_gpa[fb_tail]   = ic_gpa;
                 fb_pred_next_pc[fb_tail] = pred_next_pc_bp;
                 fb_pred_index[fb_tail]   = bht_lk_index;
                 fb_ghr_fold[fb_tail]     = btb_hit && btb_is_cond;
@@ -1451,13 +1489,13 @@ pub module heliodor_core #(
     assign if_pred_next_pc_q = if FETCH_REG ? fb_pred_next_pc[fb_head] : if fb_count != 4'd0 ? fb_pred_next_pc[fb_head] : pred_next_pc_bp;
     assign if_pred_index_q = if FETCH_REG ? fb_pred_index[fb_head] : if fb_count != 4'd0 ? fb_pred_index[fb_head] : bht_lk_index;
     let if_ghr_fold_q: logic     = if FETCH_REG ? fb_ghr_fold[fb_head] : if fb_count != 4'd0 ? fb_ghr_fold[fb_head] : (btb_hit && btb_is_cond);
-    assign if_ifault_q     = if FETCH_REG ? fb_ifault[fb_head] : if fb_count != 4'd0 ? fb_ifault[fb_head] : imem_fault_w;
+    assign if_ifault_q     = if FETCH_REG ? fb_ifault[fb_head] : if fb_count != 4'd0 ? fb_ifault[fb_head] : ic_ifault;
     // PMP: instruction access fault, mirroring if_ifault_q (driven by the imem
     // PMP check; see imem_acc_fault_w / fb_iacc).
-    assign if_iacc_q       = if FETCH_REG ? fb_iacc[fb_head] : if fb_count != 4'd0 ? fb_iacc[fb_head] : imem_acc_fault_w;
+    assign if_iacc_q       = if FETCH_REG ? fb_iacc[fb_head] : if fb_count != 4'd0 ? fb_iacc[fb_head] : ic_iacc;
     // Phase 11-H3d: the gstage/gpa travelling with if_ifault_q (same mux).
-    let if_ifault_gstage_q: logic     = if FETCH_REG ? fb_ifault_gstage[fb_head] : if fb_count != 4'd0 ? fb_ifault_gstage[fb_head] : imem_gstage_w;
-    let if_ifault_gpa_q   : logic<64> = if FETCH_REG ? fb_ifault_gpa[fb_head] : if fb_count != 4'd0 ? fb_ifault_gpa[fb_head] : imem_gpa_w;
+    let if_ifault_gstage_q: logic     = if FETCH_REG ? fb_ifault_gstage[fb_head] : if fb_count != 4'd0 ? fb_ifault_gstage[fb_head] : ic_gstage;
+    let if_ifault_gpa_q   : logic<64> = if FETCH_REG ? fb_ifault_gpa[fb_head] : if fb_count != 4'd0 ? fb_ifault_gpa[fb_head] : ic_gpa;
 
     // Phase 8 S4b: slot-1 (head+1) FIFO read for the 2nd decode/rename lane.
     // Combinational reads at fb_head+1 (wraps mod 8). Only meaningful when the
@@ -1479,8 +1517,8 @@ pub module heliodor_core #(
     let if_pred_next_pc_q1: logic<64> = if FETCH_REG ? fb_pred_next_pc[fb_head_p1] : if fb_count >= 4'd2 ? fb_pred_next_pc[fb_head_p1] : if fb_count == 4'd1 ? pred_next_pc_bp : pred_next_pc1;
     let if_pred_index_q1  : logic<13> = if FETCH_REG ? fb_pred_index[fb_head_p1] : if fb_count >= 4'd2 ? fb_pred_index[fb_head_p1] : if fb_count == 4'd1 ? bht_lk_index : bht_lk_index1;
     let if_ghr_fold_q1    : logic     = if FETCH_REG ? fb_ghr_fold[fb_head_p1] : if fb_count >= 4'd2 ? fb_ghr_fold[fb_head_p1] : if fb_count == 4'd1 ? (btb_hit && btb_is_cond) : (btb_hit2 && btb_is_cond2);
-    let if_ifault_q1      : logic     = if FETCH_REG ? fb_ifault[fb_head_p1] : if fb_count >= 4'd2 ? fb_ifault[fb_head_p1] : if fb_count == 4'd1 ? imem_fault_w : 1'b0;
-    assign if_iacc_q1     = if FETCH_REG ? fb_iacc[fb_head_p1] : if fb_count >= 4'd2 ? fb_iacc[fb_head_p1] : if fb_count == 4'd1 ? imem_acc_fault_w : 1'b0;
+    let if_ifault_q1      : logic     = if FETCH_REG ? fb_ifault[fb_head_p1] : if fb_count >= 4'd2 ? fb_ifault[fb_head_p1] : if fb_count == 4'd1 ? ic_ifault : 1'b0;
+    assign if_iacc_q1     = if FETCH_REG ? fb_iacc[fb_head_p1] : if fb_count >= 4'd2 ? fb_iacc[fb_head_p1] : if fb_count == 4'd1 ? ic_iacc : 1'b0;
 
     // ============================================================
     // M5.C: imem_mmu wrapper. Bare mode (M-mode or satp.MODE=0) is
@@ -1634,6 +1672,7 @@ pub module heliodor_core #(
         o_rdata_next: icache_rdata_next  ,
         o_rdata_next_valid: icache_rdata_next_valid,
         o_stall     : icache_stall       ,
+        o_stall_comb: icache_stall_comb  ,
         o_mem_addr  : ic_mem_addr        ,
         i_mem_rdata : i_dmem_rdata        , // P9.6: 64-bit dword stream (shared D port)
         o_mem_req   : ic_mem_req         ,
