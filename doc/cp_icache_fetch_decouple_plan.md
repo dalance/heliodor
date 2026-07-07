@@ -162,3 +162,29 @@ both registered, `pc_q` held → they align).
 
 **Committed at =0 (byte-id DEAD scaffold).** Next: debug the 4 corners at =1 (start with the higpf
 hang), then IPC (boot-cy / CoreMark / Dhrystone), then the SRAM narrowing (§6), then the full ladder.
+
+## 11. ✅ Increment 2 (2026-07-07) — the two arch corners; flip 248/4 → 251/1
+
+Two byte-identical corner fixes (both `ic_rd_ok`-gated → no-op at =0), arch suite now GREEN at =1:
+
+1. **`higpf` HANG = fault delivery.** A fetch FAULT (imem page/access/guest-page fault) has no icache
+   read (`i_ren=0`), but `ic_rd_settled_q` only sets on `imem_valid_w` (=0 on a fault), so the fault
+   never delivered → hang. Fix: `ic_rd_ok = … || imem_fault_w || imem_acc_fault_w` — a fault bypasses
+   the read-latency wait (delivers same-cycle, as at =0). (`higpf` → tohost=1.)
+
+2. **`vfarith` + `hvtiny` = the straddle read.** `fetch_vaddr = straddle_q ? pc_q+2 : pc_q`
+   (`core.veryl:1328`) — a straddle-prep step **holds pc_q but shifts the icache address to pc_q+2**
+   to read the high half's word. The settled logic tracked pc_q only, so it thought the read was
+   settled while the pc_q+2 word was still in flight → the straddled instr got `read(pc_q)` (a cycle
+   stale) instead of `read(pc_q+2)` = a wrong 32-bit instruction. Fix: `ic_pc_advances` now clears
+   settled on straddle-prep too (`ic_straddle_prep`), giving the pc_q+2 read its own settle cycle
+   (straddle becomes 3 cy under sync-read). (`vfarith`, `hvtiny` → tohost=1; both were the same bug.)
+
+**Verify:** DEAD (=0) **default 252/0** (both fixes are `ic_rd_ok`-gated / DCE'd). FLIP (both =1)
+**default suite 251/1** — the only fail is **`test_icache`** (the unit TB samples `rdata` at a fixed
+`tc` assuming the combinational contract; needs a sync-read-aware update for default-on, deferred —
+not an RTL bug). **The arch/boot/litmus suite is functionally green at =1.**
+
+**Next: IPC measurement** (the shape-N `present→deliver` bubble cost — N1 boot-cy / CoreMark /
+Dhrystone vs the ~10-15% budget; decides whether shape (S) streaming is needed), then the SRAM
+narrowing (§6), the full SMP ladder + Verilator, and the `test_icache` TB update, before default-on.
