@@ -124,3 +124,18 @@ keystone campaign's de-risking warm-up are the **same RTL change**.
   restructure); v1_ppn / iq_int.ops are flop. The SRAM migration is back at the campaign
   inflection: further progress = committing to a pipeline bundle (D$ load/commit §8, or
   icache fetch-decouple) — the big SMP-critical / IPC-costing core work.
+
+- **✅ D$ sync-read landed default-on + data 10R4W→8R4W (2026-07-07).** The `DCACHE_SYNC_READ=1`
+  functional flip is now the default (`dd9bf2a`) — the demand tag/data read is synchronous
+  (registered-address). Re-measured `--dump-area`: the flip *added* ports (staging, not narrowing)
+  — data `9R4W→10R4W`, tags `13R1W→15R1W`. One **byte-identical** narrowing then folds the five
+  write-back-buffer capture reads (fill-victim / probe / misaligned lo-hi / flush — mutually
+  exclusive by the `cap_*_go` priority chain) into a single shared `cap_data = data_{cap_way}[cap_index]`
+  port, dropping the data reads at `f_index`/`p_index`/`fl_set`: **data `10R4W → 8R4W`**
+  (CP 14.745 / FF 160644 both unchanged; N1 boot 7.1 cy-EXACT). See `cp_dcache_sync_read_plan.md §12`.
+  - **Tags stay 15R1W** — `vic_tag`(`f_index`)/`phit`(`p_index`) have non-capture consumers
+    (`ev_fill_vic`, `probe_depart`/`o_probe_ack`), so no clean capture-only fold.
+  - **8R → 1RW is the read-port arbitration flip** (demand + store-drain + fill-RMW + slot-1 +
+    next-forward genuinely concurrent → time-multiplex with stalls = functional, IPC cost, full SMP
+    ladder). Same SMP-critical class as the sync-read; the capture-fold is the byte-identical
+    down-payment toward the "banked 1RW + write-merge buffer" row-1 target.

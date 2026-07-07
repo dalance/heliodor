@@ -875,3 +875,65 @@ asserts an exact cycle count (all pass/x3-based) so nothing breaks; the approxim
 are within their bands. **Next (SRAM macro):** with the read synchronous, the array port narrowing (data
 9R→1R way-mux, tags 13R→1R — the 1RW/1R1W macro, `sram_inventory.md` rows 1-2) rides the registered
 way-select. The icache sync-read (fetch-loop decoupling) is the remaining front-end SRAM step.
+
+---
+
+## 12. SRAM macro — array port narrowing (2026-07-07, post-flip)
+
+### 12.1 ⚠️ Measurement first: the sync-read flip ADDED ports (9R4W→10R4W, 13R1W→15R1W)
+`--dump-area` on `heliodor_core` at the new `DCACHE_SYNC_READ=1` default (re-measured, the
+`sram_inventory.md` numbers were the pre-flip `c09f99c`):
+
+```
+64×512  10R4W  ×4   ← dcache data  (was 9R4W)
+64×52   15R1W  ×4   ← dcache tags  (was 13R1W)
+```
+
+The sync-read staging did **not** narrow the arrays — it *added* a demand read port each
+(`dhit_index_d` on data, `index_r`/Stage-A on tags) **on top of** the live combinational reads,
+which the non-folded fallback (`o_rdata_live`, AMO / `i_load_next`) and the store-RMW still need.
+So the earlier "port narrowing rides the registered way-select → 1RW/1R1W" framing was optimistic:
+the synth infers a read port **per distinct index net** (not per read *site* — the 6 `data_0[index]`
+reads are one port), and the demand read is only one of ten distinct index nets. **The real 1RW/1R1W
+narrowing is the read-port arbitration / time-multiplex restructure — the "hardest" inventory item,
+SMP-critical, a functional flip** (adds stalls, not byte-identical). The sync-read was the
+*precondition* (a synchronous demand read), not the narrowing itself.
+
+### 12.2 ✅ The byte-identical step available: fold the write-back-capture reads (data 10R→8R)
+The five write-back-buffer captures — fill-victim (`vic_data`@`f_index`), probe recall
+(`p_data`@`p_index`), misaligned-store lo/hi detour (`hitway_data`@`index` / `nexthit_data`@`next_index`),
+flush sweep (`fl_data`@`fl_set`) — are **mutually exclusive by the `cap_*_go` priority chain**
+(`cap_fill_go` > `cap_probe_go` > `cap_mis_go` > `cap_flush_go`, each `&& !`-excluding the higher ones;
+"one capture per cycle" per the `dcache.veryl` arbitration comment). Each per-source line read feeds
+**only** its `wb_data[l] = X[l]` capture. So they SHARE one line-read port: a single `cap_index` /
+`cap_way` priority mux (mirroring the same capture priority) drives one `cap_data = data_{cap_way}[cap_index]`
+read, and all five captures read `cap_data`. Byte-identical because at most one capture fires and the mux
+picks its index/way.
+
+This removes the data-array reads at `f_index` / `p_index` / `fl_set` (those indices are read *only* by
+the capture on the data array; `index` / `next_index` survive for demand / next-dword-forward):
+**`data_0..3` 10R4W → 8R4W.** The write-merge-buffer consolidation named in `sram_inventory.md` row 1 as
+part of the 1RW target.
+
+**Verification (byte-identical):**
+- ✅ default arch suite **252/0** (incl. litmus N2).
+- ✅ synth `heliodor_core` **14.745 ns / 141 levels / pc_q→rs1_rdy — IDENTICAL** to pre-narrowing;
+  **FF 160644 unchanged** (`cap_data` is comb, no new flops); comb area −8362 um² (the five per-source
+  muxes collapsed to one); `--dump-area` confirms **`64×512 8R4W ×4`**.
+- ✅ N1 Linux boot 4/4, **7.1 `cy=01217590` cycle-EXACT** to the `=1` baseline (real flush / eviction /
+  PTW paths through the capture logic); smoke `00b7b740`, 7.1V `013d8910`, 6.6 `01402120`, all `x3=0xAA`.
+- ⏳ litmus N4 / ACT4 696 / N2 SMP boot / Verilator — running (SMP-critical discipline for the
+  probe/flush coherence paths, even though the change is byte-identical by construction).
+
+### 12.3 Why tags stay 15R1W, and where 8R→1RW goes next
+The tag reads at `f_index` (`vic_tag`) and `p_index` (`phit`) have **non-capture consumers** —
+`vic_tag` feeds `ev_fill_vic` (`vic_tag != f_tag`) every cycle, `phit` feeds `probe_depart` /
+`o_probe_ack` / the `valid_N[p_index]` invalidation — so they can't fold into a capture-only port
+byte-identically. The tags narrowing belongs to the functional restructure.
+
+**The remaining 8R → 1RW/1R1W (the true SRAM macro) needs the read-port arbitration flip:** demand
+(`index`/`dhit_index_d`) + store-drain (`sindex`) + fill-RMW (`fill_index`) + slot-1 (`index2`) +
+next-forward (`next_index`/`next_index2`) are genuinely concurrent at different indices, so a single-port
+macro must time-multiplex them with stall arbitration — a functional change (IPC cost, full SMP ladder,
+coherence-relevant on the probe/store-drain ports). That is the same class of SMP-critical work as the
+sync-read flip; the capture-fold (§12.2) is the clean byte-identical down-payment.
