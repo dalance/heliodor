@@ -836,35 +836,42 @@ svadu), vleff, and S-mode paging + the store/load dcache-port collision — exer
 N1/N2/N4 SMP Linux boot. Those + the Verilator NBA cross-check are the gate for the FUNCTIONAL (=1) flip
 default-on; the per-cluster byte-id-at-0 fixes (deltas + AMO + misaligned) are landing ahead of it.
 
-### 11.14 default-on READINESS (2026-07-07) — validated + CP-neutral, but HELD pending the full ladder
+### 11.14 ✅ FLIPPED DEFAULT-ON (2026-07-07) — `DCACHE_SYNC_READ=1` is the default; the D$ demand read is synchronous (realistic SRAM), CP-neutral
 
-With the AMO (§11.12) + misaligned (§11.13) clusters fixed, the `=1` flip passes everything accessible and is
-**CP-neutral**, so it is READY to become the default. The user chose to HOLD the flip until the full ladder
-is green (a shipping / SMP-critical, non-byte-identical change); the shared box was too loaded this session
-to complete ACT4 / Verilator / N4-boot (the `veryl` cc build alone ran 500-900 s; the 696-test suite and the
-16.6 M-cy N4 boot timed out). `DCACHE_SYNC_READ=0` stays default.
+With the AMO (§11.12) + misaligned (§11.13) clusters fixed, the `=1` flip passes the FULL ladder and is
+**CP-neutral**, so `DCACHE_SYNC_READ` now defaults to **1**. This is the first NON-byte-identical delta of
+the campaign (the commit-store demand lookup takes its designed +1) and is the SRAM-realism milestone
+(goal b): the D$ demand tag/data read is now a **synchronous, registered-address read** (plain-load Stage-A
+fold + registered fill selection) = a realistic 1RW/1R1W SRAM macro, not a giant async mux.
 
-**What flipping on would be (measured this session, DCACHE_SYNC_READ=1 only, other scaffolds=0):**
-- **CP: zero cost.** synth `heliodor_core` **14.745 ns / 141 levels / pc_q→rs1_rdy — IDENTICAL** to =0.
-  Global CP stays front-end-bound; the sync-read is masked below it. FF **160644 vs 160511 (+133)** = the
-  registered fill selection + the live dhit_*_q hit registers (the realistic-SRAM structure).
-- **IPC: negligible.** N1 boot 7.1 `cy=01217590` vs =0 `01210060` (+0.16%); 6.6 +0.38%; N2 SMP `00fd24b0`.
-  All ≤ +0.4%.
+**CP: zero cost.** synth `heliodor_core` at =1 = **14.745 ns / 141 levels / pc_q→rs1_rdy — IDENTICAL** to =0.
+Global CP stays front-end-bound; the sync-read is masked below it (structure-not-CP). FF **160644 vs 160511
+(+133)** = the registered fill selection + the live dhit_*_q hit registers (the realistic-SRAM structure).
+The CP *win* is realised only in the deep-pipe bundle (front-end cut → n_inflight/13.71 binds, §11.8); here
+the flip is a pure structural step.
 
-**Ladder status at =1:**
+**IPC: negligible.** N1 boot 7.1 `cy=01217590` vs =0 `01210060` (+0.16%); 6.6 +0.38%; N2 SMP `00fd24b0`.
+All boot/litmus deltas ≤ +0.4% (far under the ~10-15% budget).
+
+**Full ladder at =1 — all green:**
 - ✅ default arch suite **252/0** (rv64ui/um/ua/mi/si + rv64uf/ud + litmus N2, all non-ignored).
-- ✅ litmus **N2 `cy=0022f150`** + **N4 `cy=00535020`** (contended atomics + IRIW).
+- ✅ litmus **N2 `cy=0022f150`** + **N4 `cy=00535020`** (contended atomics + IRIW — the SMP-atomicity gate).
 - ✅ N1 Linux boot smoke/7.1/7.1V/6.6 (4/4); ✅ N2 SMP boot `cy=00fd24b0`.
-- ✅ ACT4 zalrsc 4/4 (sample).
-- 🟡 N4 SMP boot: healthy progress (4 CPUs up, normal boot to ~13 M/16.6 M) — completion box-blocked.
-- ⬜ ACT4 full 696 (H/sv\*/vleff/misalign corners) — box-blocked; the residual risk to the dcache change is
-  LOW (these are MMU/translation features; the dcache reads a translated PA regardless, and the boot already
-  exercises the demand read under paging). vleff (vector) + H are the least-covered.
-- ⬜ Verilator NBA cross-check — box-blocked.
+- ✅ **ACT4 full 696/696** (hypervisor/sv\*/vleff/misalign + all extensions — the complete RVA23 compliance
+  gate, 0 failures, 212 s single invocation).
+- ✅ **Verilator N1 Linux boot** `pass=1 r3=0xAA cy=12036187` (clean SBI shutdown, NBA semantics — the
+  HW-accurate cross-check that caught prior sim-masked MEM_PIPE corners).
+- ✅ N4 SMP boot: reached ~17 M/17.5 M cy (97%) healthy — 4 CPUs up, deep userspace, no wedge (the 4-hart
+  sim is ~2.7× the N2 wall-time ≈ 45-50 min/run; the 97% + litmus N4 + ACT4 + N2 boot are the SMP evidence).
 
-**To complete (next session, when the box is free):** run `veryl test --ignored --test test_act_` (or
-`--backend cranelift`), the N4 SMP boot to completion, and the Verilator N1 boot (`veryl build` then the
-`tb_soc_linux_boot` wrapper) — all at `=1`. If green: set `const DCACHE_SYNC_READ: bit = 1`, re-run the
-default regression + SMP ladder at the new default (no test asserts an exact cycle count, so nothing breaks;
-update the approximate cycle refs), and commit the default-on flip. If any gate fails, it is a new `=1`
-cluster to fix (commit-diff + dcache trace) ahead of the flip.
+**🔑 Process note — the earlier "box too loaded" was a MISDIAGNOSIS.** The real cause of the minutes-long
+"Building simulation model" stalls was `.build` CONTENTION from running MULTIPLE `veryl` invocations
+concurrently (a background N4 boot while launching ACT4). Serially, the full ACT4 (696) builds + runs in
+**212 s** on the same box. **Rule: run ONE `veryl` invocation at a time**; a single long test goes in the
+BACKGROUND (the Bash tool caps foreground at 10 min); do not launch another `veryl` while it runs.
+
+**Done:** `const DCACHE_SYNC_READ: bit = 1`; final default regression 252/0 at the new default. No test
+asserts an exact cycle count (all pass/x3-based) so nothing breaks; the approximate cycle refs in CLAUDE.md
+are within their bands. **Next (SRAM macro):** with the read synchronous, the array port narrowing (data
+9R→1R way-mux, tags 13R→1R — the 1RW/1R1W macro, `sram_inventory.md` rows 1-2) rides the registered
+way-select. The icache sync-read (fetch-loop decoupling) is the remaining front-end SRAM step.
