@@ -220,3 +220,46 @@ read:
   in-word sequential pairs. Lower effort, recovers most of the bubble.
 Both keep the taken-branch/redirect +1 (unavoidable — the target's read is a cycle late). Decision
 for the next increment (present to user): word-granular vs guess+correct.
+
+## 13. Shape (S) design — decoupled fetch + F0 next-PC guess (user-selected 2026-07-07)
+
+**⚠️ Scope correction: (b) is NOT a small tweak to shape N — it is a decoupled fetch.** Shape N
+holds `pc_q` and lets the read catch up (`fetch_vaddr == pc_q`, one bubble/group). To STREAM, the
+read address must run *ahead* of the delivery, presenting the next word's read while the current word
+is delivered. The naive "present `pred_next` during a delivery" is a **combinational loop**
+(`fetch_vaddr → imem_mmu → imem_valid_w → fetch_ready → delivering → fetch_vaddr`), so the fetch
+address MUST be **registered** = the pc_present/pc_data decouple (plan §4).
+
+**Structure:**
+- **`pc_fetch_q`** (registered) — the address READ this cycle; drives `fetch_vaddr = pc_fetch_q`
+  (no comb loop: it is a flop). `o_rdata_q(T+1) = read(pc_fetch_q(T))`.
+- **`pc_data_q = pc_fetch_q` delayed one cycle** — the address DELIVERED this cycle (F1); the RVC
+  expand / straddle-combine / dual-issue / FB push / commit-PC all move to `pc_data_q`.
+- Each cycle `pc_fetch_q` advances to the **F0-predicted next fetch address**; `pc_data_q` follows.
+  Streaming = one delivery/cycle; the read pipeline is 1 deep.
+
+**The F0 prediction (the crux — runs on `pc_fetch_q`, WITHOUT the bytes):**
+- **Taken target: exact.** The BTB/BHT/TAGE/RAS/iBTB are address-only lookups on `pc_fetch_q` — they
+  give the taken target at F0 with no bytes. (Move the existing predictor from `pc_q` to `pc_fetch_q`.)
+- **Fall-through length: needs a GUESS.** `pc_fetch_q + len` needs the RVC length, which is in the
+  bytes (arrive at F1). Options:
+  - **Simple `+4` guess** (no extra HW): most fall-throughs advance 4 (one 32-bit / two RVC). Wrong on
+    a lone low-half RVC → F1 re-steers (bubble). Partial recovery; measure it first.
+  - **F0 predecode length-mark** (full recovery, extra HW): store per fetch-word a "low-half is RVC"
+    bit, computed at fill, in a **combinationally-read** side table indexed by `pc_fetch_q` (the
+    sync-read cache gives it only at F1, too late — so a separate small array, BTB-like). Exact
+    fall-through → no sequential bubble.
+- **F1 verify + re-steer:** when the real length/branch differs from the F0 guess, squash the wrong
+  F0 read and re-present (a bubble). Redirect/taken-branch keep the unavoidable +1.
+
+**Corners:** straddle (the high word is now a *fetch-ahead* quantity — re-time onto the F0/F1 split),
+dual-issue slot-1 (the 64-bit window is F1), the FB push (on `pc_data_q`), redirect restart (reset
+both `pc_fetch_q` and `pc_data_q`), stall/back-pressure (hold both). This touches the same fetch
+consumers shape N did, now on the F0/F1 boundary — **comparable to or bigger than the shape-N work.**
+
+**Increment plan:** (1) the `pc_fetch_q`/`pc_data_q` decouple skeleton (DEAD at 0) with a **simple +4
+guess**, move the predictor + consumers to the split; (2) verify the arch suite at =1, measure the
+IPC recovery vs shape N's +20-38%; (3) if a lone-RVC bubble still exceeds budget, add the F0 predecode
+length-mark; (4) SRAM narrowing (§6), full SMP ladder, TB update, default-on. **This is a fresh
+multi-session piece best started in a clean context** — the shape-N gate (`d24e75d`/`7a561fd`) stays
+the committed byte-id-at-0 scaffold; shape S replaces the settled-stall with the decoupled stream.
