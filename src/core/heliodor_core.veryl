@@ -330,6 +330,10 @@ pub module heliodor_core #(
     // extract. DEAD at ICACHE_SYNC_READ=0: pc_fetch_q + every FIFO write is const-gated →
     // DCE, byte-identical (the live path stays the combinational pc_q fetch). W1 lands the
     // read-decouple structure; the =1 miss/PTW/fault back-pressure corners are hardened in W3.
+    // Core-local mirror of icache.veryl's ICACHE_SYNC_READ (flip together). Declared here
+    // (ahead of the W2 extract-source muxes near the RVC decode) — the demand read is
+    // synchronous at =1; DEAD/byte-identical at 0.
+    const ICACHE_SYNC_READ: bit = 0;
     const WF_N: u32 = 8;
     var pc_fetch_q      : logic<64>;       // F0 dword-aligned fetch address (presented this cycle)
     var wf_data   : logic<64> [WF_N];      // the 64-bit dword {high word, low word}
@@ -349,6 +353,12 @@ pub module heliodor_core #(
     var wf_push_iacc_q  : logic;
     var wf_push_gstage_q: logic;
     var wf_push_gpa_q   : logic<64>;
+    // W2 extract stage: ext_pc_q is the slot-0 INSTRUCTION PC being decoded this cycle
+    // (replaces pc_q's extract role at =1; pc_q keeps only its now-vestigial fetch-FSM role,
+    // DCE'd at =1). It indexes the WORD FIFO head (wf_pc[wf_head] == ext_pc_q dword-aligned);
+    // the whole RVC/straddle/dual-issue/predict datapath reads it + the head dword via the
+    // ic_pc/ic_rdata/ic_rdata_next const-muxes below. DEAD at 0 (ext_pc_q reset-only → DCE).
+    var ext_pc_q : logic<64>;
 
     // Phase 8 S4a: fetch buffer (decode queue). Depth-8 FIFO of clean fetched
     // records. Per-field plain arrays (NOT an array of structs) so the
@@ -761,10 +771,29 @@ pub module heliodor_core #(
     var c_illegal_w1 : logic    ;
     inst u_cexp1: c_expander ( i_cinstr: c_inst_w1, o_instr: c_expanded_w1, o_illegal: c_illegal_w1 );
 
+    // ── Shape-W extract-stage source muxes (CP §14/§15 W2) — DEAD at 0 ──
+    // At =1 the extraction datapath reads the WORD FIFO head instead of the combinational
+    // icache read: ext_pc_q is the instruction PC, wf_data[wf_head] the dword at its dword-
+    // aligned PC. ext_pc_q[2] selects the low/high 32-bit word of the head dword (the
+    // icache_rdata-equivalent); the "next word" is the head dword's high word (ext_pc_q[2]=0)
+    // or the next FIFO entry's low word (ext_pc_q[2]=1). At =0 every mux picks the old
+    // combinational value → byte-identical. (Precise pop / same-line / fault-word corners: W3.)
+    let wf_head_data     : logic<64> = wf_data[wf_head];
+    let wf_head_next_data: logic<64> = wf_data[wf_head + 3'd1];
+    let ext_word     : logic<32> = if ext_pc_q[2] ? wf_head_data[63:32] : wf_head_data[31:0];
+    let ext_word_next: logic<32> = if ext_pc_q[2] ? wf_head_next_data[31:0] : wf_head_data[63:32];
+    // Next word present: within the head dword (ext_pc_q[2]=0) it always is; across the dword
+    // boundary (ext_pc_q[2]=1) the next FIFO entry must be buffered (wf_count >= 2).
+    let ext_next_valid: logic = if ext_pc_q[2] ? (wf_count >= 4'd2) : 1'b1;
+    let ic_pc         : logic<64> = if ICACHE_SYNC_READ ? ext_pc_q      : pc_q;
+    let ic_rdata      : logic<32> = if ICACHE_SYNC_READ ? ext_word      : icache_rdata;
+    let ic_rdata_next : logic<32> = if ICACHE_SYNC_READ ? ext_word_next : icache_rdata_next;
+    let ic_rdata_nv   : logic     = if ICACHE_SYNC_READ ? ext_next_valid : icache_rdata_next_valid;
+
     // Halfword pick for the non-straddle cases.
-    let curr_hw       : logic<16> = if pc_q[1] ? icache_rdata[31:16] : icache_rdata[15:0];
+    let curr_hw       : logic<16> = if ic_pc[1] ? ic_rdata[31:16] : ic_rdata[15:0];
     let curr_is_rvc   : logic     = curr_hw[1:0] != 2'b11;
-    let needs_straddle: logic     = !straddle_q && pc_q[1] && !curr_is_rvc;
+    let needs_straddle: logic     = !straddle_q && ic_pc[1] && !curr_is_rvc;
     // Phase 8 S7: single-cycle straddle resolution. A 32-bit instr at a halfword
     // boundary (pc_q[1], non-RVC) normally takes a 2-cycle re-fetch (straddle_q),
     // costing a fetch bubble (fetch_ready=0 the prep cycle). When the NEXT 32-bit
@@ -775,14 +804,14 @@ pub module heliodor_core #(
     // now (no bubble). This is the same {icache_rdata_next, icache_rdata} window the
     // slot-1 path already reads. RVC-mixed code with misaligned 32-bit instrs (e.g.
     // memcpy: 3 of 5 loop ops straddle → 37% i-fetch idle) is the big win.
-    let straddle_same_page : logic     = pc_q[11:2] != 10'h3ff;
-    let straddle_oneshot   : logic     = needs_straddle && icache_rdata_next_valid && straddle_same_page;
+    let straddle_same_page : logic     = ic_pc[11:2] != 10'h3ff;
+    let straddle_oneshot   : logic     = needs_straddle && ic_rdata_nv && straddle_same_page;
     let needs_straddle_slow: logic     = needs_straddle && !straddle_oneshot;
-    let straddle1_instr    : logic<32> = {icache_rdata_next[15:0], icache_rdata[31:16]};
+    let straddle1_instr    : logic<32> = {ic_rdata_next[15:0], ic_rdata[31:16]};
     assign c_inst_w = curr_hw;
 
     // Straddled 32-bit: low half saved last cycle + new fetch's low half.
-    let straddled_instr: logic<32> = {icache_rdata[15:0], straddle_low_q};
+    let straddled_instr: logic<32> = {ic_rdata[15:0], straddle_low_q};
 
     // Choose final 32-bit instr fed to decode.
     let fetched_instr: logic<32> = if straddle_q ?
@@ -794,7 +823,7 @@ pub module heliodor_core #(
     : if curr_is_rvc ?
         c_expanded_w
     :
-        icache_rdata
+        ic_rdata
     ; // pc[1]=0 + 32b (or 1-cycle straddle)
     let pc_advance   : logic<64> = if straddle_q ? 64'd4 : if curr_is_rvc ? 64'd2 : 64'd4;
 
@@ -808,10 +837,10 @@ pub module heliodor_core #(
     // (imem_acc_fault_w) with neither valid nor page-fault set (the walk never
     // completed) — include it so the fetch advances and delivers cause 1 rather
     // than stalling forever on a walk that can never produce a translation.
-    // ICACHE_SYNC_READ (core-local mirror of icache.veryl's const — flip together).
-    // Shape-N fetch decouple: hold fetch delivery for one cycle after pc_q settles
-    // so the synchronous icache read (a cycle late) lines up with pc_q.
-    const ICACHE_SYNC_READ: bit = 0;
+    // ICACHE_SYNC_READ (core-local mirror of icache.veryl's const — flip together) is
+    // declared up in the shape-W scaffold block (it now gates the W2 extract-source muxes,
+    // which precede this point). Shape-N held fetch delivery a cycle after pc_q settled;
+    // shape W (CP §14) supersedes that with the F0 stream + word FIFO + extract stage.
     // A fetch FAULT (imem page/access fault) needs no icache read (i_ren=0), so it
     // must deliver without waiting for the read to settle — else it hangs forever
     // (ic_rd_settled_q never sets: imem_valid_w=0 on a fault). The read-latency
@@ -845,7 +874,7 @@ pub module heliodor_core #(
     // tracks actual conditional-branch outcomes; on a flush spec <- committed.
     var spec_ghr     : logic<13>; // S13.3: widened to the full gshare index
     var committed_ghr: logic<13>;
-    let bht_lk_index : logic<13> = pc_q[13:1] ^ spec_ghr;
+    let bht_lk_index : logic<13> = ic_pc[13:1] ^ spec_ghr;
     // S22 TAGE-lite: tagged tables over geometrically longer history folds
     // override the base BHT direction when one hits (see tage.veryl). The
     // long history twins mirror spec_ghr/committed_ghr exactly (same shift
@@ -892,7 +921,7 @@ pub module heliodor_core #(
     let pred_use_ras   : logic     = btb_hit && btb_is_ret && ras_spec_valid;
     let pred_use_ibtb  : logic     = btb_hit && btb_is_ind && !pred_use_ras && ibtb_hit;
     let pred_target    : logic<64> = if pred_use_ras ? ras_spec_top : if pred_use_ibtb ? ibtb_target : btb_target;
-    let pred_next_pc_bp: logic<64> = if predicted_taken ? pred_target : pc_q + pc_advance;
+    let pred_next_pc_bp: logic<64> = if predicted_taken ? pred_target : ic_pc + pc_advance;
 
     // ============================================================
     // Phase 8 S4a.3: slot-1 (younger op of a 2-wide fetch bundle). Extracted
@@ -904,13 +933,13 @@ pub module heliodor_core #(
     // non-straddling the slot-1 start index b1 is 1 or 2 (never crosses out of
     // the window or into a different page — slot-1 using the next word is
     // restricted to same-line, hence same page as slot-0).
-    let fw_hw1: logic<16> = icache_rdata[31:16];     // window halfword 1
-    let fw_hw2: logic<16> = icache_rdata_next[15:0]; // window halfword 2
-    let fw_hw3: logic<16> = icache_rdata_next[31:16];// window halfword 3
+    let fw_hw1: logic<16> = ic_rdata[31:16];     // window halfword 1
+    let fw_hw2: logic<16> = ic_rdata_next[15:0]; // window halfword 2
+    let fw_hw3: logic<16> = ic_rdata_next[31:16];// window halfword 3
     // b1 = halfword index where slot-1 starts (clean case: curr_is_rvc == slot-0
     // is RVC). pc[1]=0,rvc→1 / pc[1]=0,32b→2 / pc[1]=1,rvc→2 (pc[1]=1,32b is a
     // straddle, excluded by slot1_eligible).
-    let s1_b1: logic<2> = (if pc_q[1] ? 2'd1 : 2'd0) + (if curr_is_rvc ? 2'd1 : 2'd2);
+    let s1_b1: logic<2> = (if ic_pc[1] ? 2'd1 : 2'd0) + (if curr_is_rvc ? 2'd1 : 2'd2);
     let s1_hw     : logic<16> = if s1_b1 == 2'd1 ? fw_hw1 : fw_hw2; // b1∈{1,2}
     let s1_hw_next: logic<16> = if s1_b1 == 2'd1 ? fw_hw2 : fw_hw3; // halfword b1+1
     let s1_is_rvc : logic     = s1_hw[1:0] != 2'b11;
@@ -923,7 +952,7 @@ pub module heliodor_core #(
     :
         s1_raw32
     ;
-    let s1_pc: logic<64> = pc_q + pc_advance; // = pc_q + slot-0 length (clean case)
+    let s1_pc: logic<64> = ic_pc + pc_advance; // = ic_pc + slot-0 length (clean case)
     let s1_len: logic<64> = if s1_is_rvc ? 64'd2 : 64'd4;
     // slot-1 prediction via the BTB/BHT 2nd read ports (lookup on s1_pc).
     var btb_hit2    : logic    ;
@@ -965,7 +994,7 @@ pub module heliodor_core #(
     // was wrong: it would not have closed the lost wakeup.) 152/0 with slot-1 on.
     let slot1_valid_gate: logic = 1'b1;
     let slot1_valid: logic = slot1_valid_gate && slot1_eligible
-        && (!s1_needs_next || (s1_same_line && icache_rdata_next_valid));
+        && (!s1_needs_next || (s1_same_line && ic_rdata_nv));
 
     // Phase 8 S4a: fetch buffer push/pop/full control.
     //   fb_pop   = rename drains the head this cycle (== rename_fire below;
@@ -1004,7 +1033,7 @@ pub module heliodor_core #(
     let s0_ras_pop : logic = fb_push0 && btb_hit && btb_is_ret;
     let s1_ras_push: logic = fb_push1 && btb_hit2 && btb_is_call2;
     let s1_ras_pop : logic = fb_push1 && btb_hit2 && btb_is_ret2;
-    let ras_push_addr : logic<64> = if s1_ras_push ? s1_pc + s1_len : pc_q + pc_advance;
+    let ras_push_addr : logic<64> = if s1_ras_push ? s1_pc + s1_len : ic_pc + pc_advance;
     let ras_spec_push : logic     = s0_ras_push || s1_ras_push;
     let ras_spec_pop  : logic     = s0_ras_pop || s1_ras_pop;
 
@@ -1035,7 +1064,7 @@ pub module heliodor_core #(
     inst u_btb: btb (
         clk                               ,
         rst                               ,
-        i_pc           : pc_q             ,
+        i_pc           : ic_pc            ,
         o_hit          : btb_hit          ,
         o_target       : btb_target       ,
         o_is_cond      : btb_is_cond      ,
@@ -1067,7 +1096,7 @@ pub module heliodor_core #(
         clk                             ,
         rst                             ,
         i_index       : ibtb_lk_idx0    ,
-        i_pc          : pc_q            ,
+        i_pc          : ic_pc           ,
         o_hit         : ibtb_hit        ,
         o_target      : ibtb_target     ,
         i_index2      : ibtb_lk_idx1    ,
@@ -1100,7 +1129,7 @@ pub module heliodor_core #(
     inst u_tage: tage (
         clk                                  ,
         rst                                  ,
-        i_pc             : pc_q              ,
+        i_pc             : ic_pc             ,
         i_hist           : spec_ghr_l        ,
         o_hit            : tage_hit          ,
         o_taken          : tage_taken        ,
@@ -1221,6 +1250,14 @@ pub module heliodor_core #(
     // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
     // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
     let wf_do_push: logic = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall;
+    // W2 extract pointer: on a normal delivery ext_pc_q advances past the delivered bundle
+    // (slot-1's predicted next if the 2nd slot fired, else slot-0's). The extract POPS the
+    // WORD FIFO head dword when the advance leaves it (crosses the dword boundary). W3
+    // refines: pop 0/1/2 for a bundle spanning two dwords + the FIFO-availability deliver
+    // gate + the predicted-taken→F0 redirect. All DEAD at 0.
+    let ext_next_pc: logic<64> = if fb_push1 ? pred_next_pc1 : pred_next_pc_bp;
+    let ext_pop    : logic     = ICACHE_SYNC_READ && fb_push0 && !straddle_q
+        && (ext_next_pc[63:3] != ext_pc_q[63:3]);
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q       = RESET_PC;
@@ -1277,8 +1314,32 @@ pub module heliodor_core #(
                     wf_gpa[wf_tail]    = wf_push_gpa_q;
                     wf_tail            = wf_tail + 3'd1;
                 }
-                // Extract-side pop arrives in W2; the FIFO count only grows here.
-                wf_count = wf_count + (if wf_do_push ? 4'd1 : 4'd0);
+                // Extract-side pop: the head dword is consumed when ext_pc_q crosses it.
+                if ext_pop {
+                    wf_head = wf_head + 3'd1;
+                }
+                wf_count = wf_count + (if wf_do_push ? 4'd1 : 4'd0) - (if ext_pop ? 4'd1 : 4'd0);
+            }
+        }
+    }
+    // W2 extract pointer register (the slot-0 instruction PC). Advances past the delivered
+    // bundle on a delivery (mirrors the fetch FSM's pc_q next-PC, now computed on ext_pc_q via
+    // ic_pc), reseeds on redirect / early-redirect. straddle_q (shared with the fetch FSM)
+    // still carries the 2-cycle straddle; W3 re-times straddle onto the FIFO's fetch-ahead
+    // high word and adds the FIFO-availability deliver gate + predicted-taken→F0 redirect.
+    // DEAD at 0: written ONLY under `else if ICACHE_SYNC_READ` → reset-only at 0 → DCE.
+    always_ff (clk, rst) {
+        if_reset {
+            ext_pc_q = RESET_PC;
+        } else if ICACHE_SYNC_READ {
+            if redirect_fire {
+                ext_pc_q = redirect_pc;
+            } else if early_redir_fire_q {
+                ext_pc_q = early_redir_pc_q;
+            } else if !fb_full {
+                if fetch_ready {
+                    ext_pc_q = ext_next_pc;
+                }
             }
         }
     }
@@ -1303,7 +1364,7 @@ pub module heliodor_core #(
             fb_count = 4'd0;
         } else {
             if fb_push0 {
-                fb_pc[fb_tail]           = pc_q;
+                fb_pc[fb_tail]           = ic_pc;
                 fb_instr[fb_tail]        = fetched_instr;
                 // M7: track RVC-origin for the link register (pc+2 vs pc+4). A
                 // straddle resolves a 32-bit instr, so is_rvc=0 in that case.
@@ -1384,7 +1445,7 @@ pub module heliodor_core #(
     // 1 ONLY the registered FB read survives (the live arm is structurally gone,
     // cutting the icache->cexp->decode combinational path).
     assign if_v_q          = (fb_count != 4'd0) || fb_bypass;
-    assign if_pc_q         = if FETCH_REG ? fb_pc[fb_head] : if fb_count != 4'd0 ? fb_pc[fb_head] : pc_q;
+    assign if_pc_q         = if FETCH_REG ? fb_pc[fb_head] : if fb_count != 4'd0 ? fb_pc[fb_head] : ic_pc;
     assign if_instr_q      = if FETCH_REG ? fb_instr[fb_head] : if fb_count != 4'd0 ? fb_instr[fb_head] : fetched_instr;
     assign if_is_rvc_q     = if FETCH_REG ? fb_is_rvc[fb_head] : if fb_count != 4'd0 ? fb_is_rvc[fb_head] : (!straddle_q && curr_is_rvc);
     assign if_pred_next_pc_q = if FETCH_REG ? fb_pred_next_pc[fb_head] : if fb_count != 4'd0 ? fb_pred_next_pc[fb_head] : pred_next_pc_bp;
@@ -1412,7 +1473,7 @@ pub module heliodor_core #(
     // out, cutting the s1_instr->u_dec2 critical path. rename_fire2 already
     // gates on fb_count>=2 at FETCH_REG=1 (fb_bypass2/fb_fall are 0).
     let fb_head_p1: logic<3> = fb_head + 3'd1;
-    let if_pc_q1          : logic<64> = if FETCH_REG ? fb_pc[fb_head_p1] : if fb_count >= 4'd2 ? fb_pc[fb_head_p1] : if fb_count == 4'd1 ? pc_q : s1_pc;
+    let if_pc_q1          : logic<64> = if FETCH_REG ? fb_pc[fb_head_p1] : if fb_count >= 4'd2 ? fb_pc[fb_head_p1] : if fb_count == 4'd1 ? ic_pc : s1_pc;
     let if_instr_q1       : logic<32> = if FETCH_REG ? fb_instr[fb_head_p1] : if fb_count >= 4'd2 ? fb_instr[fb_head_p1] : if fb_count == 4'd1 ? fetched_instr : s1_instr;
     let if_is_rvc_q1      : logic     = if FETCH_REG ? fb_is_rvc[fb_head_p1] : if fb_count >= 4'd2 ? fb_is_rvc[fb_head_p1] : if fb_count == 4'd1 ? (!straddle_q && curr_is_rvc) : s1_is_rvc;
     let if_pred_next_pc_q1: logic<64> = if FETCH_REG ? fb_pred_next_pc[fb_head_p1] : if fb_count >= 4'd2 ? fb_pred_next_pc[fb_head_p1] : if fb_count == 4'd1 ? pred_next_pc_bp : pred_next_pc1;
@@ -4367,7 +4428,7 @@ pub module heliodor_core #(
         // (if_v_q=1), that PC is if_pc_q; otherwise pc_q (= next to
         // fetch). Same approach as v1's ifid_pc selector at
         // heliodor_core.veryl:4366.
-        i_trap_pc: if commit_irq ? (if if_v_q ? if_pc_q : pc_q) : if inject_fake_ifault ? c_pc + 64'd4 : c_pc,
+        i_trap_pc: if commit_irq ? (if if_v_q ? if_pc_q : ic_pc) : if inject_fake_ifault ? c_pc + 64'd4 : c_pc,
         i_trap_cause: trap_cause,
         // mtval/stval for page faults carry the faulting VA; other
         // exception kinds leave it at 0 for now.
