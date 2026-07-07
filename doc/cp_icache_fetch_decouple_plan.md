@@ -122,3 +122,43 @@ This is a multi-session flip (the fetch loop is the core's most intricate region
   `:1142-1180` (FB push).
 - Templates: `DCACHE_SYNC_READ` (`dd9bf2a` flip + §11 cluster method), `FETCH_REG`/`IMEM_MMU_STAGE`
   (`cp_frontend_pipeline_plan.md §2.2/§7`).
+
+## 10. ✅ Increment 1 (2026-07-07) — the shape-N fetch gate; flip 21/231 → 248/4
+
+The shape-N insight that made this tractable: **holding `pc_q` until the read settles means
+`o_rdata_q == read(pc_q)` at delivery, so every combinational consumer (branch-predict / RVC /
+straddle / dual-issue) lines up automatically — no separate `pc_data_q` carrier is needed** (that is
+a shape-S concern). Shape N is therefore just a **one-cycle fetch-delivery stall after each pc_q
+change**.
+
+Implemented (`heliodor_core.veryl`, core-local `const ICACHE_SYNC_READ` mirroring `icache.veryl`'s —
+flipped together, like MEM_PIPE + DCACHE_SYNC_READ):
+- `var ic_rd_settled_q` — set the cycle after `pc_q` was held **with a valid translation**
+  (`imem_valid_w && !ic_pc_advances`), cleared the cycle `pc_q` advances
+  (`ic_pc_advances = any_redirect || (!fb_full && fetch_ready)`). Const-gated D
+  (`ICACHE_SYNC_READ ? … : 1'b0`) → CP-neutral (still +1 FF: veryl-synth keeps the const-0 flop, but
+  it is off the path).
+- `let ic_rd_ok = !ICACHE_SYNC_READ || ic_rd_settled_q` gates **`fetch_ready`** (covers fb_push0 /
+  slot-1 / the FSM deliver branch / the FETCH_REG bypass) **and the straddle-prep branch** — the two
+  consumers of the icache read.
+
+This correctly handles: the deliver→advance cadence (1 group / 2 cy), the branch-redirect restart
+(+1 bubble), the Sv39 PTW walk (settled waits for `imem_valid_w`), and the miss/fill (read + stall
+both registered, `pc_q` held → they align).
+
+**Verify:**
+- ✅ **DEAD (=0): default 252/0**; synth **14.745 / 141 lv / pc_q→rs1_rdy IDENTICAL** (CP-neutral),
+  FF 160645 (+1, the const-0 settled flop, off-path).
+- 🔬 **FLIP (both consts =1): default suite 248/4** (was **21/231** without the gate). The gate is
+  fundamentally correct. Remaining corners (next increment, cluster-by-cluster like the dcache flip):
+  - **`test_icache`** — the icache UNIT testbench asserts the OLD same-cycle read contract; with the
+    synchronous read it must expect the +1 latency (TB update, not an RTL bug — expected).
+  - **`vfarith`** tohost=0x32 (subtest 50 fails) — a specific vector-FP subtest's fetch pattern.
+  - **`higpf`** tohost=0 (**HANG** — highest priority: a stall/deadlock, likely a fetch corner where
+    the settled/redirect/fill interaction wedges in the H-ext guest-page-fault path).
+  - **`hvtiny`** tohost=0x501 (subtest fails).
+  IPC not yet measured (do after the corners are green). The `higpf` hang is the first debug target
+  (commit-PC trace: is fetch wedged, or a completion stall?).
+
+**Committed at =0 (byte-id DEAD scaffold).** Next: debug the 4 corners at =1 (start with the higpf
+hang), then IPC (boot-cy / CoreMark / Dhrystone), then the SRAM narrowing (§6), then the full ladder.
