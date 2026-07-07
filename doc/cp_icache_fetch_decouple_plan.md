@@ -345,3 +345,32 @@ form (the icache `o_rdata_q` idiom) DCEs to **+0 FF**.
 synth **14.745 ns / 141 lv / `pc_q[34]→rs1_rdy[0]` IDENTICAL**, **FF 160645 IDENTICAL (+0)** — a true
 dead scaffold. Next: **W2** introduces `ext_pc_q` + const-muxes every extraction/predictor source onto
 the FIFO head (still DEAD at 0).
+
+## 16. ✅ W2 (2026-07-08) — extract stage on the word FIFO (DEAD at 0), `ea09b72`
+
+The decode-decouple half. Introduced **`ext_pc_q`** (the slot-0 INSTRUCTION PC) and rerouted the
+ENTIRE extraction/predictor datapath to read the WORD FIFO head via const-muxes (old value at =0):
+- **`ext_word`/`ext_word_next`** — the 32-bit words at `ext_pc_q` from the head dword `wf_data[wf_head]`
+  (`ext_pc_q[2]` selects low/high; the next word is the head dword's high word or `wf_data[wf_head+1]`'s
+  low word). **`ext_next_valid`** — next word present (within-dword always; across needs `wf_count>=2`).
+- **`ic_pc`/`ic_rdata`/`ic_rdata_next`/`ic_rdata_nv`** `= SYNC ? ext_* : {pc_q, icache_rdata,
+  icache_rdata_next, icache_rdata_next_valid}`. Every consumer (`curr_hw`, RVC/straddle, `fetched_instr`,
+  slot-1 window + `s1_b1`/`s1_pc`, BTB/iBTB/TAGE `i_pc`, `bht_lk_index`, `pred_next_pc_bp`,
+  `ras_push_addr`, `fb_pc` push, the `if_pc_q`/`if_pc_q1`/`i_trap_pc` bypass fallbacks) reads the muxes.
+  `pc_q` keeps only its fetch-FSM writes (vestigial / DCE'd at =1); predictor stays instruction-granular.
+- **Extract pointer FSM** — `ext_pc_q` advances past the delivered bundle (`ext_next_pc`), reseeds on
+  redirect; the FIFO pops the head dword when the advance crosses it (`ext_pop`). Reset-only at 0 → DCE.
+- Moved `const ICACHE_SYNC_READ` up into the shape-W scaffold block (it now gates the extract-source
+  muxes near the RVC decode, which precede its old definition — Veryl requires define-before-use).
+
+**Verify:** byte-id at 0 = default **252/0**, litmus N=2 `cy=0x0022f150` (**cycle-EXACT**); synth
+**14.745 / 141 lv IDENTICAL, FF 160645 (+0)** — the const-muxes fold to the old sources at 0, so
+`ext_pc_q` + the FIFO reads DCE.
+
+**W3 (=1 bring-up, the functional core):** (1) replace `fetch_ready`'s F0-side `imem_valid_w`/`icache_stall`
+with a FIFO-availability deliver gate (head dword present, +next when the instr straddles / slot-1 needs
+it); (2) re-time straddle onto the FIFO's fetch-ahead high word (may drop the 2-cycle path — the next
+dword is already buffered); (3) pop 0/1/2 for a bundle spanning two dwords; (4) the **predicted-taken →
+F0 redirect + FIFO flush** (ext detects taken on `ext_pc_q`, steers `pc_fetch_q` to the target, drains the
+now-wrong-path words); (5) fault-word delivery + miss/PTW hold. Then flip both consts, run the arch suite
+cluster-by-cluster (like shape N's 21/231→248/4→251/1), measure IPC vs shape N's +20-38%.
