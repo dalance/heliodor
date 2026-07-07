@@ -324,3 +324,24 @@ F0 but the extract keeps draining the buffered words (that IS the streaming win)
 
 `pc_data_q` (§13) is subsumed by the word FIFO (the buffer IS the F0→extract decouple). The shape-N
 gate (`d24e75d`/`7a561fd`) stays the committed byte-id-at-0 baseline until W3 replaces the =1 path.
+
+## 15. ✅ W1 (2026-07-07) — F0 read stream + word FIFO skeleton (DEAD at 0), `ca6f736`
+
+The read-decouple half. Added (all const-gated, DEAD at 0):
+- **`pc_fetch_q`** — the F0 dword-aligned fetch address, presented to imem_mmu + icache via the
+  `fetch_vaddr` const-mux. Streams `+= 8` (one 64-bit dword) each fetch — NO length/branch dependence.
+  redirect / early-redirect reseed it (dword-aligned); F0 holds on FIFO-full / miss / `!imem_valid_w`.
+- **WORD FIFO** (`wf_data`/`wf_pc`/`wf_ifault`/`wf_iacc`/`wf_gstage`/`wf_gpa` + head/tail/count, `WF_N=8`):
+  each entry is the natural 64-bit icache window `{rdata_next, rdata}` at a dword-aligned PC.
+- **F0→push pipeline** (`wf_push_*_q`): the sync-read dword for `pc_fetch_q(T)` arrives at T+1, so the
+  presented PC + fault bits register one cycle to push alongside the arriving data.
+
+**DCE idiom (measured):** both `always_ff` write ONLY under `else if ICACHE_SYNC_READ` (no =0 write) →
+reset-only at =0 → the whole scaffold DCEs. An earlier `else if !ICACHE_SYNC_READ { =const }` form left
+the `mux(control,const,hold)` flops KEPT — **measured +75 off-path FF** (CP still 14.745). The reset-only
+form (the icache `o_rdata_q` idiom) DCEs to **+0 FF**.
+
+**Verify:** byte-id at 0 = default **252/0**, litmus N=2 `cy=0x0022f150` (**cycle-EXACT** vs baseline);
+synth **14.745 ns / 141 lv / `pc_q[34]→rs1_rdy[0]` IDENTICAL**, **FF 160645 IDENTICAL (+0)** — a true
+dead scaffold. Next: **W2** introduces `ext_pc_q` + const-muxes every extraction/predictor source onto
+the FIFO head (still DEAD at 0).
