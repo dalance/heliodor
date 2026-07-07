@@ -374,3 +374,35 @@ dword is already buffered); (3) pop 0/1/2 for a bundle spanning two dwords; (4) 
 F0 redirect + FIFO flush** (ext detects taken on `ext_pc_q`, steers `pc_fetch_q` to the target, drains the
 now-wrong-path words); (5) fault-word delivery + miss/PTW hold. Then flip both consts, run the arch suite
 cluster-by-cluster (like shape N's 21/231→248/4→251/1), measure IPC vs shape N's +20-38%.
+
+## 17. 🔬 W3 (2026-07-08) — =1 functional bring-up: arch **250/252** (DEAD at 0), `78355eb`
+
+Implemented all five =1 pieces (deliver gate / straddle re-time / pop / predicted-taken→F0 redirect /
+fault-word), const-gated → **byte-id at 0 (default 252/0, cy=0x0022f150 cycle-EXACT)**. Flipped both
+consts and drove the arch suite from **21/231 (shape-N first flip) → 250/252**.
+
+**Two RTL bugs found + fixed at =1:**
+1. **F0 miss hold** — `f0_present` must gate on the **combinational** demand-miss (new icache
+   `o_stall_comb = o_stall_raw`), NOT the registered `o_stall` (a cycle late → F0 streamed past the
+   miss → the first-flip whole-suite hang). The push keeps the registered stall (it aligns with the
+   registered `o_rdata` arrival). *This got basic fetch working (rv64ui add/etc PASS).*
+2. **WORD FIFO overflow** — `wf_full` must count the in-flight push: `wf_count + wf_push_valid_q >= 8`.
+   Presenting at count==7 else overflows (in-flight push → 8, this present's push → 9 → FIFO
+   corruption), ONLY under sustained back-pressure (a long div / FP / atomic fills the FIFO). *This
+   was the div/rem/FP/atomic hang cluster: **39 fails → 2** after the fix.*
+
+**Remaining 2 at =1 (NOT on the =0 baseline; the W3 tail):**
+- **`test_smode_plic`** — NON-cacheable fetch (boot ROM at PA 0, `ic_dram=0`): `o_rdata_next_raw=0`
+  there, so the dword FIFO's HIGH word is 0 → any instr in the high word decodes as 0 → hang
+  (`rd_cnt=0`, no progress). Fix: a **2-beat word-granular F0 for non-cacheable** (present dword-addr,
+  then +4, assemble the dword over 2 cycles). Boot-ROM only; arch/Linux fetch from DRAM (cacheable).
+- **N1 Linux boot** — hangs EARLY (no UART banner, cy≈44.8M vs ~12M baseline) at =1 while the arch
+  suite passes. A **SoC-only** corner (the arch harness passes) — likely the deeper shape-W prefetch
+  (word FIFO 8 dwords ahead) through the coherent L2 fill arbiter, or a stale-fetch sync event the
+  arch tests don't hit. **Next step: a commit-PC trace** (last committed PC before the hang) to
+  pinpoint — best in a fresh context. This BLOCKS the IPC measurement (the W3 payoff).
+- **`test_icache`** — unit TB asserts the old same-cycle contract (known; W4 TB update).
+
+**Status: shape-W is functionally proven on the OoO core (arch 250/252) but NOT yet Linux-boot-clean.**
+Consts stay 0 (baseline unchanged). Next: debug the Linux boot early hang (trace) → non-cacheable
+2-beat → IPC measurement → W4 (SRAM narrow, ladder, `test_icache` TB, default-on).
