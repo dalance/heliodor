@@ -188,3 +188,35 @@ not an RTL bug). **The arch/boot/litmus suite is functionally green at =1.**
 **Next: IPC measurement** (the shape-N `present→deliver` bubble cost — N1 boot-cy / CoreMark /
 Dhrystone vs the ~10-15% budget; decides whether shape (S) streaming is needed), then the SRAM
 narrowing (§6), the full SMP ladder + Verilator, and the `test_icache` TB update, before default-on.
+
+## 12. 🔬 IPC measured (2026-07-07) — shape (N) is +20–38%, OVER budget → shape (S) is needed
+
+N1 Linux boot cycles, `=1` (both consts) vs the `=0` baseline:
+
+| workload | =0 | =1 | Δ |
+|---|---|---|---|
+| smoke | 0x00b7b740 | 0x00f61fd0 | **+34.0%** |
+| linux 7.1 | 0x01217590 | 0x016d4ba0 | **+26.2%** |
+| linux 7.1V | 0x013d8910 | 0x017f4d00 | **+20.7%** |
+| linux 6.6 | 0x01402120 | 0x01bb1d80 | **+38.4%** |
+
+All boot variants pass functionally, but the shape-N `present→deliver` bubble (≈ ½ fetch bandwidth
+on sequential runs) costs **+20–38%** — well over the campaign's ~10–15 % IPC budget. Confirms §4's
+prediction and the "measure before investing in (S)" call: **shape N is correct but not shippable;
+shape (S) streaming is required to recover the sequential fetch bandwidth.**
+
+**Shape (S) — the streaming recovery (design for the next increment).** The bubble is entirely the
+sequential `present→deliver` gap: the next fetch address needs the just-read RVC length, so it can't
+be presented during the read cycle. To stream, present the next address **speculatively** during the
+read:
+- **Word-granular fetch + extraction (the real-core shape):** advance the fetch address by the
+  icache WORD (streamable, no length dependence), buffer the returned words, and extract/align the
+  variable-length instructions from the buffer. Decouples the read (word-granular) from the decode
+  (instruction-granular). Biggest change but the clean end state; the FB already buffers records.
+- **Next-address guess + correct (the lighter shape):** F0 presents `pc_q + guess` (e.g. +4, or a
+  1-bit-per-halfword length predecode of the just-read word) while reading `pc_q`; F1 checks the real
+  length/straddle and re-steers on a mismatch (a bubble only on a mis-guess, not every group). Keeps
+  the current instruction-granular fetch; a per-fetch-word predecode makes the guess exact for
+  in-word sequential pairs. Lower effort, recovers most of the bubble.
+Both keep the taken-branch/redirect +1 (unavoidable — the target's read is a cycle late). Decision
+for the next increment (present to user): word-granular vs guess+correct.
