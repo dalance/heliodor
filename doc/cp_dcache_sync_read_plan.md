@@ -739,3 +739,61 @@ accessors, and validated against the litmus/SMP ladder (not just the single-hart
 cluster's root is identified (store-RFO/AMO ownership vs registered-fill timing) but its fix is a deeper,
 SMP-critical piece; misaligned + hypervisor + sv\* clusters also remain. The functional flip is confirmed a
 multi-session, multi-cluster SMP-critical effort. `DCACHE_SYNC_READ=0` default; tree clean.
+
+### 11.12 ✅ AMO cluster FIXED (2026-07-07) — the non-folded read's OWN registered-miss stall gap (not the store's ownership)
+
+§11.11 framed the AMO break as "the cold store's RFO fill / line ownership is lost by the AMO's read
+cycle." A cycle-level dcache trace (gated on the `0x80002000` line) showed the root is one level shallower
+and is the **AMO read's OWN miss-stall gap** — the exact non-folded analogue of the plain-load `dhit_miss`
+bug (§11.10):
+
+```
+cy=179 amord=1 ren=1 radr=0x80002000 missR=1 miss=0 fsf=0 ostall=0 chit=0 chk3p=0   ← BUG cycle
+cy=180 wen=1  radr=0x80002000 lsel=1 missR=1 miss=1 fsf=1 ostall=1                    ← miss_q catches up
+```
+
+At cy179 the AMO read misses LIVE (`miss_raw=1`) but the registered `miss` (`miss_q`, deltas 1-2) is still
+0 (a cycle late), so `o_stall` drops. `o_stall → dcache_stall` combinationally (core:6973) and the AMO read
+completes on `!dcache_stall` (`iss_dc_ok`, core:2417) — so with the line ABSENT `iq_issue_ack` fires, the
+AMO watch arms with `present=0` (`o_chk3_present=0 → dc_amo_present=0 → amo_remote_hit`), the AMO is
+poisoned, and its RMW writes back a value computed from raw DRAM (the cold `sw`'s `0x80000000` never
+reached an owned line). It then replays on its own poisoned write, committing 3×.
+
+**Fix (`nf_gap_stall`, one `o_stall` term):** the folded plain-load covers this gap via `dhit_miss` off the
+registered Stage-A hit `dhit_v_q`; the non-folded accessors (AMO/replay reads that drive `i_addr` LIVE)
+have no Stage-A read, so gate on the LIVE miss instead:
+> `nf_read_now  = i_ren && !(dhit_ren_q && i_ren_folded)`  (a non-folded read this cycle)
+> `nf_gap_stall = DCACHE_SYNC_READ && nf_read_now && miss_raw`  (OR'd into `o_stall`)
+
+`miss_raw = lo_miss | hi_miss | amo_upg` requires `state==IDLE`, so it fires exactly on the genuine
+miss/upgrade cycle and drops during FILL/DONE.
+
+**🚨 The livelock lesson (one refutation):** the first attempt stalled the FIRST cycle of every NEW
+non-folded read unconditionally (a registered line-compare, no `miss_raw` gate). That passed single-hart
+amoadd_w but **livelocked litmus N2** — both harts wedged at the contended amoadd `0x800007a8`. Stalling a
+clean **hit-exclusive** AMO (which already owns the line and should complete in one cycle) opens a
+one-cycle window for the remote hart to recall the line before the RMW lands → neither hart ever makes
+progress. Gating on `miss_raw` is REQUIRED: an AMO with `miss_raw=0` (owns the line) keeps its 1-cycle fast
+path, so the MESI line-bounce still terminates. **SMP-atomicity rule: never stall a non-folded read that
+already owns its line — only the actual miss/upgrade.**
+
+**Verification:**
+- **=1 (functional):** single-hart amoadd_w PASS; **full rv64ua 19/19 PASS**; **litmus N2 `cy=0022f150`
+  pass=1** (no livelock); **litmus N4 `cy=00535020` pass=1** (IRIW + 4-way contended atomics). The full
+  default suite at =1 is now down to **one** failure — `rv64ui-ma_data` (the misaligned cluster, §11.10) —
+  the AMO cluster is gone.
+- **=0 (byte-identical):** default **252/0**; **litmus N2 `cy=0022a330`** cycle-EXACT; synth
+  `heliodor_core` **14.745 ns / 141 levels / pc_q→rs1_rdy / 160511 FF — IDENTICAL** to baseline
+  (`nf_gap_stall` const-folds to 0, `nf_read_now` is then dead → DCE; no new flops; +312/1.16M comb gates =
+  off-critical-path synth noise).
+- **CP structure (=1 bundle):** the full-scaffold bundle synth (all fronts=1, LOAD_SPEC=0) WITH the fix is
+  **13.710 ns / 137 levels / `head→n_inflight` — IDENTICAL** to the §11.8 reference floor. The top-8
+  endpoints are all `n_inflight` (13.71) / `redirect_pc_q` (13.21) — **no dcache signal appears**, so
+  `miss_raw` in `o_stall` stays MASKED (the dcache is still OFF `n_inflight`). The band-aid is CP-clean. A
+  Stage-A tag-read fold for AMOs (extend `i_ren_r` to AMO reads, `i_addr_r` already carries `dmu_dmem_addr`)
+  would give the AMO read full SRAM-realism (synchronous, no live `cache_hit`) but is NOT needed for CP —
+  a possible later polish, not a blocker.
+
+**Remaining `=1` clusters:** misaligned (`ma_data`/`ma_addr`/`sd_misaligned`, §11.10 root — the folded
+`o_hit_safe` does not exclude `i_load_next` + `o_rdata_next` stays live), hypervisor, sv\*, vleff, sysb.
+`DCACHE_SYNC_READ=0` default; tree clean after commit.
