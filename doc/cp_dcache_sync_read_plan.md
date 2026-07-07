@@ -835,3 +835,36 @@ Together: the misaligned load is fully live (delivery + stall) at `=1` = byte-id
 svadu), vleff, and S-mode paging + the store/load dcache-port collision — exercised by ACT4 (696) and the
 N1/N2/N4 SMP Linux boot. Those + the Verilator NBA cross-check are the gate for the FUNCTIONAL (=1) flip
 default-on; the per-cluster byte-id-at-0 fixes (deltas + AMO + misaligned) are landing ahead of it.
+
+### 11.14 default-on READINESS (2026-07-07) — validated + CP-neutral, but HELD pending the full ladder
+
+With the AMO (§11.12) + misaligned (§11.13) clusters fixed, the `=1` flip passes everything accessible and is
+**CP-neutral**, so it is READY to become the default. The user chose to HOLD the flip until the full ladder
+is green (a shipping / SMP-critical, non-byte-identical change); the shared box was too loaded this session
+to complete ACT4 / Verilator / N4-boot (the `veryl` cc build alone ran 500-900 s; the 696-test suite and the
+16.6 M-cy N4 boot timed out). `DCACHE_SYNC_READ=0` stays default.
+
+**What flipping on would be (measured this session, DCACHE_SYNC_READ=1 only, other scaffolds=0):**
+- **CP: zero cost.** synth `heliodor_core` **14.745 ns / 141 levels / pc_q→rs1_rdy — IDENTICAL** to =0.
+  Global CP stays front-end-bound; the sync-read is masked below it. FF **160644 vs 160511 (+133)** = the
+  registered fill selection + the live dhit_*_q hit registers (the realistic-SRAM structure).
+- **IPC: negligible.** N1 boot 7.1 `cy=01217590` vs =0 `01210060` (+0.16%); 6.6 +0.38%; N2 SMP `00fd24b0`.
+  All ≤ +0.4%.
+
+**Ladder status at =1:**
+- ✅ default arch suite **252/0** (rv64ui/um/ua/mi/si + rv64uf/ud + litmus N2, all non-ignored).
+- ✅ litmus **N2 `cy=0022f150`** + **N4 `cy=00535020`** (contended atomics + IRIW).
+- ✅ N1 Linux boot smoke/7.1/7.1V/6.6 (4/4); ✅ N2 SMP boot `cy=00fd24b0`.
+- ✅ ACT4 zalrsc 4/4 (sample).
+- 🟡 N4 SMP boot: healthy progress (4 CPUs up, normal boot to ~13 M/16.6 M) — completion box-blocked.
+- ⬜ ACT4 full 696 (H/sv\*/vleff/misalign corners) — box-blocked; the residual risk to the dcache change is
+  LOW (these are MMU/translation features; the dcache reads a translated PA regardless, and the boot already
+  exercises the demand read under paging). vleff (vector) + H are the least-covered.
+- ⬜ Verilator NBA cross-check — box-blocked.
+
+**To complete (next session, when the box is free):** run `veryl test --ignored --test test_act_` (or
+`--backend cranelift`), the N4 SMP boot to completion, and the Verilator N1 boot (`veryl build` then the
+`tb_soc_linux_boot` wrapper) — all at `=1`. If green: set `const DCACHE_SYNC_READ: bit = 1`, re-run the
+default regression + SMP ladder at the new default (no test asserts an exact cycle count, so nothing breaks;
+update the approximate cycle refs), and commit the default-on flip. If any gate fails, it is a new `=1`
+cluster to fix (commit-diff + dcache trace) ahead of the flip.
