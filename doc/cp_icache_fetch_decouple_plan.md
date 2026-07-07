@@ -263,3 +263,64 @@ IPC recovery vs shape N's +20-38%; (3) if a lone-RVC bubble still exceeds budget
 length-mark; (4) SRAM narrowing (§6), full SMP ladder, TB update, default-on. **This is a fresh
 multi-session piece best started in a clean context** — the shape-N gate (`d24e75d`/`7a561fd`) stays
 the committed byte-id-at-0 scaffold; shape S replaces the settled-stall with the decoupled stream.
+
+## 14. Shape (W) — word-granular decoupled fetch (user-selected 2026-07-07, SUPERSEDES §13's shape)
+
+**⚠️ §13's instruction-granular "+4 guess" is fundamentally SINGLE-ISSUE.** If `pc_fetch_q` advances
+one *instruction* per cycle (`+4` guess or a length-mark), it presents ONE fetch address per cycle,
+which can't feed the existing 2-wide dual-issue (slot-1) that delivers two instrs from one 64-bit
+`{rdata_next, rdata}` window. A "group-length guess" (2/4/6/8 B) keeps dual-issue but the guess mis-
+fires often (predecode-length-mark almost mandatory). Rather than patch §13, go straight to the
+**FINAL front-end structure** (per the campaign's "advance the FINAL pipeline structure, not the CP
+number"): **word-granular fetch, instruction-granular decode — the real-core front end.**
+
+**The key decoupling: the FETCH advance has NO length/branch dependence.** Fetch reads *words*, not
+instructions. `pc_fetch_q += WORD` every cycle (the sync-read latency vanishes into a buffer), so
+sequential code NEVER bubbles — the +20-38% is gone by construction. RVC length + straddle + dual-
+issue are all resolved DOWNSTREAM at extract, where the bytes are already buffered.
+
+**Structure — two decoupled stages around a raw WORD FIFO:**
+- **F0 (read stream):** `pc_fetch_q` = word-aligned fetch address (registered → no comb loop; drives
+  `fetch_vaddr`). Present to imem_mmu + icache; the sync-read word arrives next cycle and is PUSHED
+  into the **word FIFO** (`wf_data[32]` + `wf_pc` + fault bits per entry). `pc_fetch_q += 4` each
+  fetch cycle. HOLD on: word-FIFO full, icache miss/`o_stall`, Sv39 PTW walk (`!imem_valid_w`),
+  redirect-cycle. JUMP on: branch-redirect / early-redirect (→ redirect target, flush the FIFO) and
+  the extract stage's **predicted-taken** (→ pred target, flush the younger-than-branch words).
+- **Extract (decode-granular):** an **`ext_pc_q`** (the slot-0 instruction PC) indexes the word-FIFO
+  head; the ENTIRE existing extraction datapath — `curr_hw`/RVC-expand/straddle-combine/slot-1
+  dual-issue/BTB·BHT·TAGE·RAS·iBTB predictor — moves from reading `icache_rdata`+`pc_q` to reading
+  **the word-FIFO head words + `ext_pc_q`** (byte-identical map: `pc_q`→`ext_pc_q`,
+  `icache_rdata`→`wf_head`, `icache_rdata_next`→`wf_head_next`). It pushes decoded records into the
+  existing `fb_*` decode FIFO exactly as today. The predictor STAYS instruction-granular here (no BTB
+  re-index); a predicted-taken redirects F0 (the taken +1 is unavoidable — target word is a cycle
+  late — same as today), and the word FIFO buffers the read-ahead so the redirect costs only the +1.
+
+**Why this preserves the predictor + extraction wholesale:** every consumer keeps running on an
+instruction PC (`ext_pc_q`) and a 64-bit window (`{wf_head_next, wf_head}`), so RVC/straddle/slot-1/
+BTB/BHT/TAGE/RAS/iBTB logic is UNCHANGED in substance — only its *source* moves from the combinational
+icache read to the registered word FIFO. That is what removes the icache read from the fetch
+combinational cone (goal-(b) + the pipeline stage) without a predictor redesign.
+
+**Corners:** (a) **straddle across a word-FIFO boundary** — the high half is `wf_head_next`'s low half
+(the FIFO already buffers it → straddle may need NO extra cycle, unlike today's 2-cycle re-fetch); (b)
+**dual-issue** reads `{wf_head_next, wf_head}` (needs ≥2 words buffered); (c) **word-FIFO
+pop timing** — pop a word when `ext_pc_q` crosses its boundary (may pop 0/1/2 words per extract
+cycle for a straddle/dual bundle); (d) **flush** on redirect / predicted-taken drains both the word
+FIFO and re-seeds `pc_fetch_q`/`ext_pc_q`; (e) **fault words** — a faulting fetch pushes a fault-
+marked word (no data) so the extract delivers the fault in program order; (f) **MMU-walk / miss** hold
+F0 but the extract keeps draining the buffered words (that IS the streaming win).
+
+**Increment plan (byte-id at `ICACHE_SYNC_READ=0` throughout — the const gates every =1 arm):**
+- **W1 — word FIFO + F0 read stream skeleton (DEAD at 0).** Add `pc_fetch_q` + the word FIFO
+  (arrays, push from the sync-read word, F0 advance/hold/flush FSM). `fetch_vaddr` = const-mux to the
+  word-aligned `pc_fetch_q` at =1. Verify default 252/0 + synth CP-neutral. (The read-decouple half.)
+- **W2 — extract stage on the word FIFO (DEAD at 0).** Introduce `ext_pc_q`; const-mux every
+  extraction/predictor source (`pc_q`→`ext_pc_q`, `icache_rdata`→`wf_head`, `_next`→`wf_head_next`);
+  the extract's predicted-taken/redirect feeds F0's flush+reseed. Verify byte-id at 0.
+- **W3 — bring up `=1`:** flip both consts, run the arch suite, debug corners cluster-by-cluster
+  (straddle/dual-issue/flush/miss/PTW), then measure N1 boot-cy / CoreMark / Dhrystone vs shape N's
+  +20-38% and the ~10-15 % budget.
+- **W4 — SRAM narrowing (§6), full SMP ladder + Verilator, `test_icache` TB update, default-on.**
+
+`pc_data_q` (§13) is subsumed by the word FIFO (the buffer IS the F0→extract decouple). The shape-N
+gate (`d24e75d`/`7a561fd`) stays the committed byte-id-at-0 baseline until W3 replaces the =1 path.
