@@ -317,6 +317,39 @@ pub module heliodor_core #(
     // fetch_decouple_plan.md); DEAD at 0 (const-gated D → DCE, byte-identical).
     var ic_rd_settled_q  : logic     ;
 
+    // ── Shape-W (CP §14): word-granular decoupled fetch — F0 read stream + WORD FIFO ──
+    // The FINAL front-end structure under ICACHE_SYNC_READ=1: the icache demand read is
+    // synchronous (a cycle late), so decouple the READ (dword-granular) from the DECODE
+    // (instruction-granular). F0 streams pc_fetch_q += 8 (one 64-bit dword) every cycle
+    // and pushes each returned sync-read dword into this raw WORD FIFO; the extract stage
+    // (W2) drains it instruction-by-instruction — the whole RVC/straddle/dual-issue/predict
+    // datapath moves onto the FIFO head + ext_pc_q. The fetch advance has NO length/branch
+    // dependence, so sequential code never bubbles (removes shape-N's measured +20-38%).
+    // Each entry is the natural 64-bit icache window {rdata_next, rdata} at a dword-aligned
+    // PC (matches today's dual-issue window exactly), so one push/cycle sustains 2-wide
+    // extract. DEAD at ICACHE_SYNC_READ=0: pc_fetch_q + every FIFO write is const-gated →
+    // DCE, byte-identical (the live path stays the combinational pc_q fetch). W1 lands the
+    // read-decouple structure; the =1 miss/PTW/fault back-pressure corners are hardened in W3.
+    const WF_N: u32 = 8;
+    var pc_fetch_q      : logic<64>;       // F0 dword-aligned fetch address (presented this cycle)
+    var wf_data   : logic<64> [WF_N];      // the 64-bit dword {high word, low word}
+    var wf_pc     : logic<64> [WF_N];      // its dword-aligned PC
+    var wf_ifault : logic     [WF_N];      // imem page fault marker (no data)
+    var wf_iacc   : logic     [WF_N];      // imem access (PMP) fault marker
+    var wf_gstage : logic     [WF_N];      // H-ext guest-page fault marker
+    var wf_gpa    : logic<64> [WF_N];      // faulting guest PA (for htval)
+    var wf_head   : logic<3>;
+    var wf_tail   : logic<3>;
+    var wf_count  : logic<4>;
+    // F0→push pipeline: the sync-read dword for pc_fetch_q(T) arrives at T+1, so the PC +
+    // fault bits presented at T are registered one cycle to push alongside the arriving data.
+    var wf_push_valid_q : logic;           // a fetch was presented last cycle → push its dword now
+    var wf_push_pc_q    : logic<64>;
+    var wf_push_ifault_q: logic;
+    var wf_push_iacc_q  : logic;
+    var wf_push_gstage_q: logic;
+    var wf_push_gpa_q   : logic<64>;
+
     // Phase 8 S4a: fetch buffer (decode queue). Depth-8 FIFO of clean fetched
     // records. Per-field plain arrays (NOT an array of structs) so the
     // combinational head read is not subject to the Veryl-sim dynamic-index
@@ -1173,6 +1206,83 @@ pub module heliodor_core #(
         }
     }
 
+    // ── Shape-W F0 read stream (CP §14) — DEAD at ICACHE_SYNC_READ=0 ──
+    // Present pc_fetch_q (dword-aligned) to imem_mmu + icache; the sync-read dword lands
+    // next cycle and is pushed into the WORD FIFO. pc_fetch_q += 8 each fetch (no length
+    // dependence → sequential code never bubbles). The extract-side pop + the predicted-
+    // taken redirect arrive in W2; here the FIFO only fills (F0 holds when full). W3
+    // hardens the =1 miss / PTW / fault back-pressure (this skeleton is dead at 0).
+    let wf_full   : logic = wf_count == 4'd8;
+    // F0 presents a fetch when the translation resolved (or faulted), the read path is free,
+    // and the FIFO has room. On a fault i_ren=0 so icache_stall=0 and a fault-marked entry
+    // still pushes, delivering the fault in program order at extract.
+    let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall && !wf_full
+        && (imem_valid_w || imem_fault_w || imem_acc_fault_w);
+    // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
+    // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
+    let wf_do_push: logic = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall;
+    always_ff (clk, rst) {
+        if_reset {
+            pc_fetch_q       = RESET_PC;
+            wf_push_valid_q  = 1'b0;
+            wf_push_pc_q     = 64'd0;
+            wf_push_ifault_q = 1'b0;
+            wf_push_iacc_q   = 1'b0;
+            wf_push_gstage_q = 1'b0;
+            wf_push_gpa_q    = 64'd0;
+        } else if ICACHE_SYNC_READ {
+            // Write ONLY at =1 → at =0 every reg here is reset-only (holds its reset
+            // constant) → DCE (the icache o_rdata_q idiom; a mux(control,const,hold) D
+            // with an explicit =0 write survives simple DCE as an off-path flop).
+            // pc_fetch_q: redirect > early-redirect > stream-advance > hold. Dword-aligned.
+            if redirect_fire {
+                pc_fetch_q = {redirect_pc[63:3], 3'b000};
+            } else if early_redir_fire_q {
+                pc_fetch_q = {early_redir_pc_q[63:3], 3'b000};
+            } else if f0_present {
+                pc_fetch_q = pc_fetch_q + 64'd8;
+            }
+            // Push-pipeline register: the presented dword's PC + fault bits, delayed one
+            // cycle to land with its data. Cleared on a redirect (presented fetch is wrong-path).
+            wf_push_valid_q = f0_present && !any_redirect;
+            if f0_present {
+                wf_push_pc_q     = pc_fetch_q;
+                wf_push_ifault_q = imem_fault_w;
+                wf_push_iacc_q   = imem_acc_fault_w;
+                wf_push_gstage_q = imem_gstage_w;
+                wf_push_gpa_q    = imem_gpa_w;
+            }
+        }
+    }
+    // Word FIFO storage. Push the arriving dword; the extract-side pop (W2) drains it.
+    // Flushed on any redirect (wrong-path words younger than the resolved branch).
+    always_ff (clk, rst) {
+        if_reset {
+            wf_head  = 3'd0;
+            wf_tail  = 3'd0;
+            wf_count = 4'd0;
+        } else if ICACHE_SYNC_READ {
+            // Write ONLY at =1 → reset-only at =0 → the FIFO pointers + data arrays DCE.
+            if any_redirect {
+                wf_head  = 3'd0;
+                wf_tail  = 3'd0;
+                wf_count = 4'd0;
+            } else {
+                if wf_do_push {
+                    wf_data[wf_tail]   = {icache_rdata_next, icache_rdata};
+                    wf_pc[wf_tail]     = wf_push_pc_q;
+                    wf_ifault[wf_tail] = wf_push_ifault_q;
+                    wf_iacc[wf_tail]   = wf_push_iacc_q;
+                    wf_gstage[wf_tail] = wf_push_gstage_q;
+                    wf_gpa[wf_tail]    = wf_push_gpa_q;
+                    wf_tail            = wf_tail + 3'd1;
+                }
+                // Extract-side pop arrives in W2; the FIFO count only grows here.
+                wf_count = wf_count + (if wf_do_push ? 4'd1 : 4'd0);
+            }
+        }
+    }
+
     // ============================================================
     // Phase 8 S4a: fetch buffer (decode queue). The fetch engine pushes a clean
     // record (fb_push) and rename drains the head (fb_pop). The head is exposed
@@ -1333,7 +1443,10 @@ pub module heliodor_core #(
     var imem_aw_ack     : logic    ;
     // Fetch addr advances by 2 during straddle so the next word lands
     // on the next cycle; in normal cycles it tracks pc_q.
-    let fetch_vaddr: logic<64> = if straddle_q ? pc_q + 64'd2 : pc_q;
+    // Shape-W (CP §14): under ICACHE_SYNC_READ the fetch address is the F0 stream's
+    // dword-aligned pc_fetch_q (the read decouples from pc_q, which becomes the extract-
+    // stage instruction PC in W2). DEAD at 0 → the old combinational pc_q fetch (byte-id).
+    let fetch_vaddr: logic<64> = if ICACHE_SYNC_READ ? pc_fetch_q : (if straddle_q ? pc_q + 64'd2 : pc_q);
     // M9 (2026-05-25): gate i_req with !redirect_fire. On the redirect cycle,
     // pc_q still holds the OLD value (NBA — update at clock edge), so
     // fetch_vaddr presents the old VA to MMU. Without this gate, MMU at IDLE
