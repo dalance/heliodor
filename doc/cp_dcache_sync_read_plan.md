@@ -797,3 +797,41 @@ already owns its line — only the actual miss/upgrade.**
 **Remaining `=1` clusters:** misaligned (`ma_data`/`ma_addr`/`sd_misaligned`, §11.10 root — the folded
 `o_hit_safe` does not exclude `i_load_next` + `o_rdata_next` stays live), hypervisor, sv\*, vleff, sysb.
 `DCACHE_SYNC_READ=0` default; tree clean after commit.
+
+### 11.13 ✅ misaligned cluster FIXED (2026-07-07) — cross-line load: fold the delivery AND the stall onto the live path
+
+A cross-line misaligned load (`i_load_next` — offset[5:3]==7, so it spans line N dword-7 + line N+1 dword-0)
+needs BOTH dwords: `o_rdata` (lo) + the LIVE `o_rdata_next` (hi). Two `=1` bugs, both fixed by putting the
+misaligned load fully on the LIVE path (identical to `=0`):
+
+1. **Delivery** — the folded `dhit_use` path delivers only the registered LO dword (`dhit_rdata_d`, a cycle
+   old) and asserts `o_hit_safe` off `dhit_v_q`, but the live `o_hit_safe_live` EXCLUDES `i_load_next`
+   (a cross-dword span is never a single safe hit). Combining the folded lo with the live hi mis-delivers.
+   **Fix:** `dhit_use = ... && !i_load_next` — a misaligned load falls back to live delivery.
+2. **Stall** — commit-diff pinned `rv64ui-ma_data` to `lh 63(s0)` @`0x80000594` committing `0x003f` at `=1`
+   vs `0x403f` at `=0` (the HIGH byte 0x40, from line N+1, dropped to 0). The cross-line HIGH miss
+   (`hi_miss`, a `miss_raw` term) has the SAME registered-miss gap as the AMO: when the LO line HITS
+   (`dhit_v_q=1 → dhit_miss=0`) but the HI line misses (`hi_miss=1` live, `miss_q=0` a cycle late),
+   `o_stall` drops before line N+1 is filled → `o_rdata_next` reads 0. The AMO's `nf_gap_stall` didn't
+   cover it because a misaligned load is FOLDED (`nf_read_now=0`). **Fix:** extend `nf_read_now` to include
+   `i_load_next` — `nf_read_now = i_ren && (!(dhit_ren_q && i_ren_folded) || i_load_next)` — so
+   `nf_gap_stall = miss_raw` covers BOTH the lo- and hi-miss gaps.
+
+Together: the misaligned load is fully live (delivery + stall) at `=1` = byte-identical timing to `=0`.
+
+**Verification:**
+- **=1:** `rv64ui-ma_data` + `rv64mi-ma_addr` + `rv64mi-sd_misaligned` PASS. **The full default arch suite
+  is now 252/0 at `=1`** (rv64ui/um/ua/mi/si + rv64uf/ud + `test_litmus_2hart` all non-ignored → the AMO
+  cluster, litmus N2, and misaligned all pass at `=1` with no regression). The remaining `=1` clusters
+  (hypervisor / sv\* / vleff / paging) live in ACT4 / SMP boot, not the default suite.
+- **=0 (byte-identical):** default **252/0**; litmus N2 **`cy=0022a330`** cycle-EXACT; synth `heliodor_core`
+  **14.745 ns / 141 levels / pc_q→rs1_rdy / 160511 FF — IDENTICAL** (`dhit_use` is dead at =0 → the extra
+  `!i_load_next` DCEs; `nf_gap_stall` const-folds to 0). No new flops.
+- **CP structure:** unchanged from §11.12 (13.710 `head→n_inflight`) by construction — `nf_gap_stall`'s only
+  deep term is still `miss_raw` (the `|| i_load_next` just widens the shallow enable), and `dhit_use` only
+  SHRANK (added `!i_load_next`), so no new deep term reaches `o_stall`.
+
+**Remaining `=1` work (not in the default suite):** hypervisor (hlv/hgpf/htwostage), sv\* (svpbmt/svnapot/
+svadu), vleff, and S-mode paging + the store/load dcache-port collision — exercised by ACT4 (696) and the
+N1/N2/N4 SMP Linux boot. Those + the Verilator NBA cross-check are the gate for the FUNCTIONAL (=1) flip
+default-on; the per-cluster byte-id-at-0 fixes (deltas + AMO + misaligned) are landing ahead of it.
