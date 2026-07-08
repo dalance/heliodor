@@ -792,8 +792,26 @@ pub module heliodor_core #(
     // combinational value → byte-identical. (Precise pop / same-line / fault-word corners: W3.)
     let wf_head_data     : logic<64> = wf_data[wf_head];
     let wf_head_next_data: logic<64> = wf_data[wf_head + 3'd1];
-    let ext_word     : logic<32> = if ext_pc_q[2] ? wf_head_data[63:32] : wf_head_data[31:0];
-    let ext_word_next: logic<32> = if ext_pc_q[2] ? wf_head_next_data[31:0] : wf_head_data[63:32];
+    // ── FIFO read-around bypass (CP §19, W3.5) — recover the refill BUBBLE2 ──
+    // The dword F0 fetched this cycle arrives now as the REGISTERED icache_rdata (the sync-read
+    // result for last cycle's pc_fetch_q present) and is about to be pushed. If it is EXACTLY the
+    // dword the extract wants but the FIFO does not hold it yet (post-redirect / miss refill), read
+    // it DIRECTLY here instead of waiting the extra cycle for the FIFO register round-trip. This
+    // recovers ~1 cycle/taken-branch (the FIFO write→read latency) — the taken-branch refill that
+    // dominates the shape-W IPC residual (§18). icache_rdata is REGISTERED under sync-read, so this
+    // is register→extract, NOT the combinational read cone → CP-safe. DEAD at 0 (the whole ext_*
+    // block feeds only the ICACHE_SYNC_READ arm of ic_rdata → unused at 0 → DCE). ext_bypass ⟹
+    // wf_do_push (== wf_push_valid_q && !icache_stall), so the FIFO push/pop arithmetic is unaffected
+    // (the pushed dword is consumed via the bypass; it still lands in the FIFO for continued extract).
+    let wf_push_dword: logic<64> = if wf_push_nc_q ? {icache_rdata, f0_nc_lo_q} : {icache_rdata_next, icache_rdata};
+    let ext_bypass   : logic     = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall
+        && (wf_push_pc_q[63:3] == ext_pc_q[63:3]);
+    // Effective head dword: the arriving push when bypassing (FIFO not yet holding it), else the FIFO
+    // head. During a bypass wf_count is ~0, so the across-dword "next word" (wf_head_next_data) is
+    // correctly unavailable (ext_next_valid below), and slot-1/straddle just wait a cycle.
+    let ext_eff_head : logic<64> = if ext_bypass ? wf_push_dword : wf_head_data;
+    let ext_word     : logic<32> = if ext_pc_q[2] ? ext_eff_head[63:32] : ext_eff_head[31:0];
+    let ext_word_next: logic<32> = if ext_pc_q[2] ? wf_head_next_data[31:0] : ext_eff_head[63:32];
     // Next word present: within the head dword (ext_pc_q[2]=0) it always is; across the dword
     // boundary (ext_pc_q[2]=1) the next FIFO entry must be buffered (wf_count >= 2).
     let ext_next_valid: logic = if ext_pc_q[2] ? (wf_count >= 4'd2) : 1'b1;
@@ -866,15 +884,20 @@ pub module heliodor_core #(
     // lands = the redirect/miss bubble). Faults ride the FIFO entry (delivered in order).
     let ext_head_dw   : logic<64> = {ext_pc_q[63:3], 3'b000};
     let ext_head_match: logic     = ICACHE_SYNC_READ && (wf_count >= 4'd1) && (wf_pc[wf_head] == ext_head_dw);
-    // Fault bits: at =1 from the FIFO head entry; at =0 the live imem_mmu outputs.
-    let ic_ifault : logic     = if ICACHE_SYNC_READ ? (ext_head_match && wf_ifault[wf_head]) : imem_fault_w;
-    let ic_iacc   : logic     = if ICACHE_SYNC_READ ? (ext_head_match && wf_iacc[wf_head])   : imem_acc_fault_w;
-    let ic_gstage : logic     = if ICACHE_SYNC_READ ? (ext_head_match && wf_gstage[wf_head]) : imem_gstage_w;
-    let ic_gpa    : logic<64> = if ICACHE_SYNC_READ ? wf_gpa[wf_head] : imem_gpa_w;
-    // Deliver: =1 gates on the FIFO head (a fault entry delivers regardless of straddle);
-    // =0 keeps the old combinational-fetch readiness.
+    // §19 bypass: the wanted dword is available either from the FIFO head OR from this cycle's
+    // arriving push (read-around). ext_bypass ⟹ !ext_head_match in practice (a bypass fires only
+    // when the FIFO has drained to the fetch point), but they are OR'd for the deliver gate.
+    let ext_head_avail: logic     = ext_head_match || ext_bypass;
+    // Fault bits: at =1 from the FIFO head entry (or the bypassed arriving push); at =0 the live
+    // imem_mmu outputs. A faulting dword can be bypassed too (the fault delivers a cycle earlier).
+    let ic_ifault : logic     = if ICACHE_SYNC_READ ? (if ext_bypass ? wf_push_ifault_q : (ext_head_match && wf_ifault[wf_head])) : imem_fault_w;
+    let ic_iacc   : logic     = if ICACHE_SYNC_READ ? (if ext_bypass ? wf_push_iacc_q   : (ext_head_match && wf_iacc[wf_head]))   : imem_acc_fault_w;
+    let ic_gstage : logic     = if ICACHE_SYNC_READ ? (if ext_bypass ? wf_push_gstage_q : (ext_head_match && wf_gstage[wf_head])) : imem_gstage_w;
+    let ic_gpa    : logic<64> = if ICACHE_SYNC_READ ? (if ext_bypass ? wf_push_gpa_q : wf_gpa[wf_head]) : imem_gpa_w;
+    // Deliver: =1 gates on the FIFO head OR the §19 bypass (a fault entry delivers regardless of
+    // straddle); =0 keeps the old combinational-fetch readiness.
     let fetch_ready: logic = if ICACHE_SYNC_READ ?
-        (ext_head_match && (ic_ifault || ic_iacc || !needs_straddle_slow))
+        (ext_head_avail && (ic_ifault || ic_iacc || !needs_straddle_slow))
       : (!needs_straddle_slow && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && !icache_stall && ic_rd_ok);
     // The =0 straddle-prep holds pc_q + advances fetch_vaddr to pc_q+2 for the high word.
     // At =1 there is no such prep — the high word is a fetch-ahead FIFO dword (the straddle
