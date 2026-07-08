@@ -8,12 +8,14 @@ architectural wall). Lower SMP risk than the dcache flip (per-hart, in-order fro
 coherence/atomicity) but a WIDE surface (fetch / RVC / straddle / branch-predict / dual-issue).
 
 ## 1. State (2026-07-08)
-- **▶️ LATEST (§18, 2026-07-08): shape-W W3 is BOOT-CLEAN.** Non-cacheable 2-beat F0 fixed the boot
-  hang (firmware PA0 non-cacheable, high-word=0 loop) + `test_smode_plic` (same root) → arch **251/252**
-  (only `test_icache` unit-TB left = W4), N1 boot 5.15 + 6.6 PASS at =1, byte-id at 0 (252/0 + synth
-  14.745/FF160645 identical). **IPC measured: Dhrystone +29.7 %, CoreMark +17.1 %, boots +13–18 %** —
-  halves shape-N but over the ~10–15 % budget; residual = taken-branch word-FIFO-flush refill (all
-  `frontidl`). Recovery crossroads (§18): (a) FIFO bypass → ~budget, (b) fetch-directed prefetch, (c) accept.
+- **▶️ LATEST (§19, 2026-07-08): shape-W W3 is BOOT-CLEAN + within the IPC budget.** §18 non-cacheable
+  2-beat F0 fixed the boot hang + `test_smode_plic` (same root: firmware PA0 non-cacheable high-word=0 loop);
+  §19 FIFO read-around bypass recovered the taken-branch refill BUBBLE2. arch **251/252** (only `test_icache`
+  = W4), N1 boot 5.15/7.1/7.1v/6.6 PASS at =1, byte-id at 0 (252/0 + synth 14.745/FF160645 identical, +0 FF).
+  **IPC now within budget: Dhrystone +29.7 %→+15.3 %, CoreMark +17.1 %→+14.2 %, boot 5.15 +18.3 %→+12.8 %,
+  6.6 +13.3 %→+9.3 %** (Dhrystone frontidl 65432→15394). Residual = BUBBLE1 (inherent sync-read latency), only
+  (b) fetch-directed prefetch removes it → (b) deferred. **Next = W4** (SRAM narrow §6, SMP ladder + Verilator,
+  `test_icache` TB, default-on).
 - **`ICACHE_SYNC_READ` DEAD scaffold EXISTS** (`icache.veryl:556`, `const = 0`): registers the four
   CPU-side outputs `o_rdata` / `o_rdata_next` / `o_rdata_next_valid` / `o_stall` via
   rename-to-`*_raw` + reset-only `*_q` + `assign o_* = ICACHE_SYNC_READ ? *_q : *_raw`. Byte-identical
@@ -478,3 +480,44 @@ code but the taken-branch refill is now WORSE than =0.
 
 **Consts stay 0 (baseline unchanged).** Next (user decision): pursue (a) the FIFO bypass to reach the IPC
 budget, then W4 (SRAM narrow §6, full SMP ladder + Verilator, `test_icache` TB, default-on).
+
+## 19. ✅ FIFO read-around bypass (2026-07-08, user-selected recovery (a)) — shape-W now within the IPC budget
+
+**Recovered BUBBLE2 (the FIFO register round-trip on refill).** The taken-branch refill (§18) was ~2 bubbles:
+BUBBLE1 = the sync-read latency (the target dword is one cycle late — inherent), BUBBLE2 = the word-FIFO
+register round-trip (the arriving dword is pushed, then read back a cycle later). The bypass delivers the
+arriving dword the cycle it lands: when F0's just-fetched dword (the REGISTERED `icache_rdata` for last
+cycle's `pc_fetch_q`, about to be pushed) is EXACTLY the dword the extract wants but the FIFO does not hold
+it yet (post-redirect / miss refill), the extract reads it directly instead of waiting for the FIFO write→read.
+
+**Implementation (`heliodor_core.veryl`, const-gated, byte-id at 0):** `ext_bypass = ICACHE_SYNC_READ &&
+wf_push_valid_q && !icache_stall && (wf_push_pc_q[63:3] == ext_pc_q[63:3])` (the arriving push is the wanted
+dword). `ext_eff_head = ext_bypass ? wf_push_dword : wf_head_data` feeds `ext_word`/`ext_word_next`;
+`ext_head_avail = ext_head_match || ext_bypass` gates `fetch_ready`; the fault bits read the arriving push
+when bypassing. **No new FF** — the bypass is combinational over already-registered signals (`icache_rdata`
+is REGISTERED under sync-read, so this is register→extract, NOT the combinational read cone → CP-safe).
+Key invariants: `ext_bypass ⟹ wf_do_push` (the FIFO push/pop arithmetic is unchanged — the pushed dword is
+consumed via the bypass AND still lands in the FIFO for continued extraction); `ext_bypass ⟹ !ext_head_match`
+in practice (a bypass fires only when the FIFO has drained to the fetch point, so during normal streaming
+`wf_push_pc_q` = the far-ahead prefetch ≠ `ext_pc_q` → no spurious bypass); across-dword slot-1/straddle
+correctly waits (`wf_count ~0` during a bypass → `ext_next_valid` across = 0).
+
+**Verify — byte-id (=0):** default `veryl test` **252/0**; synth **14.745 ns / 141 lv / pc_q[34]→rs1_rdy[0] /
+FF 160645 IDENTICAL** (the whole ext_* block feeds only the `=1` arm of `ic_rdata` → DCE at 0).
+
+**Verify — functional (=1):** arch **251/252** (only `test_icache` = W4 TB); N1 boot 5.15/7.1/7.1v/6.6 all PASS.
+
+**🔬 IPC (=1 vs =0) — the bypass roughly halves the shape-W residual → within the ~10–15 % budget on real workloads:**
+
+| workload | =0 | shape-W no-bypass | **+ bypass** | frontidl (=0 / no-byp / byp) |
+|---|---|---|---|---|
+| Dhrystone | 230937 | +29.7 % | **+15.3 %** | 146 / 65432 / **15394** |
+| CoreMark | 327980 | +17.1 % | **+14.2 %** | — |
+| boot 5.15 | 0x00b7b740 | +18.3 % | **+12.8 %** (0x00cf36e0) | — |
+| boot 6.6 | 0x01402120 | +13.3 % | **+9.3 %** (0x015de250) | — |
+
+The Dhrystone front-end idle fell **65432 → 15394** (−76 %), confirming BUBBLE2 recovery. Real workloads
+(boots +9–13 %, CoreMark +14 %) are now within budget; branch-pathological Dhrystone sits at +15.3 % (its
+residual is BUBBLE1 = the inherent sync-read latency, which only (b) fetch-directed prefetch removes — so
+(b) is deferred, not needed for shippability). **Consts stay 0.** Next: W4 — SRAM narrowing (§6, the goal-(b)
+port payload), full SMP ladder + Verilator, `test_icache` TB update, then `ICACHE_SYNC_READ=1` default-on.
