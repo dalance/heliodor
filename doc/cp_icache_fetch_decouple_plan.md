@@ -550,3 +550,35 @@ byte-id). **Next debug step:** an ONSET trace (hart-1 fetch state — `ext_pc_q`
 `f0_nc_beat_q`/`straddle_q` — every cycle around the FIRST mid-instruction commit, bisect the cy where the
 +2 drift first appears) → identify the 2-beat straddle race → fix (byte-id at 0) → re-run the full ladder →
 resume W4 (`test_icache` TB, SRAM narrow §6, default-on).
+
+## 20.1 ⚠️ CORRECTION (2026-07-08) — the N4 culprit is the §19 BYPASS, not the 2-beat
+
+§20 wrongly blamed the 2-beat. The bypass-OFF isolation run (`ICACHE_BYPASS_EN=0`) I read as "still hangs"
+actually **PASSED** — I checked only its cy≈2M dense window (where the secondaries are NORMALLY still in the
+park loop; release happens ~30M) and misread the normal park loop as stuck. The "mid-instruction PCs" were an
+**objdump RVC-misalignment artifact** (greedy hex→bin disassembly drifted), not real corruption. Confirmed:
+
+| N4 SMP boot (=1) | result |
+|---|---|
+| bypass ON (§19) | **HANG** (100M timeout) |
+| bypass OFF (`ICACHE_BYPASS_EN=0`) | **PASS** `cy=0x01e5aff0` (31.8M) |
+
+So the **§19 FIFO read-around bypass has an N4-specific timing race** (N1/N2/litmus all pass with it ON;
+only N4 SMP boot fails — N4's shared-L2/bus contention shifts the refill timing into the racing corner).
+The bypass is combinational over registered signals and looked correct by inspection, so the race is subtle.
+
+**Partial-fix attempt (insufficient):** restricting the bypass to a TRUE refill — `ext_bypass &&=
+(wf_count == 0)` — on the theory that in a tight loop F0 re-fetches a still-buffered dword so `wf_push_pc_q`
+(the wrapped tail position) matches `ext_pc_q` (the head) while pointing at a different stream slot. This
+did move the failure: hart 0 booted **further** (past the banner, "Hardware name: Heliodor RV64GC (4-hart)")
+but the N4 SMP probe then showed **hart 0 stuck in a tight KERNEL loop at `0x800dda54` (cacheable/DRAM) with
+harts 1/2/3 re-parked in firmware** — an SMP-bringup deadlock (hart 0 spins waiting to online the secondaries;
+the secondaries wait in the park loop for hart 0's IPI). So the bypass race is **GENERAL — it corrupts a
+CACHEABLE kernel refill too**, not only the non-cacheable straddle; `wf_count==0` alone does NOT close it.
+
+**Next: a targeted ONSET trace of the bypass** — log `ext_bypass`/`ext_head_match`/`wf_push_pc_q[.]`/
+`ext_pc_q[.]`/`wf_count`/`ext_word` for hart 0 around the first divergence at `~0x800dda54` (cacheable, easier
+to reason about than the non-cacheable park loop), find the exact cycle the bypass delivers the wrong dword,
+and fix precisely. **Decision point (crossroads):** (a) properly fix the bypass race (keeps §19's within-budget
+IPC), or (b) revert §19 and default-on §18 (2-beat, N4-clean but IPC over budget — Dhrystone +29.7 %), treating
+the bypass as deferred IPC work. The committed tree is unaffected (consts 0, byte-id — the bypass DCEs at 0).
