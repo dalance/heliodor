@@ -353,6 +353,17 @@ pub module heliodor_core #(
     var wf_push_iacc_q  : logic;
     var wf_push_gstage_q: logic;
     var wf_push_gpa_q   : logic<64>;
+    // W3 non-cacheable 2-beat: a non-cacheable fetch (i_dram=0: boot ROM / MMIO) has NO next
+    // word — the icache passthrough returns only the single presented 32-bit word (o_rdata_next
+    // is 0). The dword-granular F0 would push {0, low_word}, so the high word (odd instr slot)
+    // decodes as 0 → the firmware hangs at its 2nd instruction (PA+4). Fix: for non-cacheable,
+    // F0 fetches WORD-granular over two beats — beat 0 presents the dword-low word, beat 1 the
+    // dword-high word (pc_fetch_q+4) — assembling the full dword before the push. Boot ROM only
+    // (arch/Linux run from cacheable DRAM), so the half-rate non-cacheable fetch is free.
+    var f0_nc_beat_q       : logic;        // 0 = presenting dword-low word, 1 = presenting high word
+    var f0_nc_lo_inflight_q: logic;        // a beat-0 (low-word) read was presented last cycle → capture now
+    var f0_nc_lo_q         : logic<32>;    // the captured dword-low word (from beat 0), held for the beat-1 push
+    var wf_push_nc_q       : logic;        // this pending push assembles {icache_rdata(high), f0_nc_lo_q(low)}
     // W2 extract stage: ext_pc_q is the slot-0 INSTRUCTION PC being decoded this cycle
     // (replaces pc_q's extract role at =1; pc_q keeps only its now-vestigial fetch-FSM role,
     // DCE'd at =1). It indexes the WORD FIFO head (wf_pc[wf_head] == ext_pc_q dword-aligned);
@@ -1271,11 +1282,22 @@ pub module heliodor_core #(
     // exact cycle its presented address misses; the registered icache_stall is a cycle late
     // (the previous address' stall) and would stream past the miss. The push (wf_do_push)
     // keeps the registered icache_stall — it aligns with the registered o_rdata arrival.
+    // Cacheable-region decode (fetch PA in the DRAM window). Defined here (ahead of its old
+    // spot at the icache inst) so the shape-W 2-beat non-cacheable F0 below can read it.
+    // imem_paddr_w is a forward-declared var (assigned by the imem_mmu inst further down).
+    let ic_dram: logic = imem_paddr_w[63:25] == 39'h40;
     let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall_comb && !wf_full
         && (imem_valid_w || imem_fault_w || imem_acc_fault_w);
     // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
     // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
     let wf_do_push: logic = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall;
+    // Non-cacheable 2-beat completion (W3). A present COMPLETES a dword — advances pc_fetch_q,
+    // arms the push — when it is: a cacheable fetch (ic_dram, one dword per present); a fault
+    // (delivered as a single fault-marked entry, no 2nd beat); or the SECOND beat of a non-
+    // cacheable fetch (f0_nc_beat_q). A non-cacheable, non-faulting FIRST beat (f0_nc_beat_q=0)
+    // only captures the low word — no push, no pc advance — and steps to beat 1.
+    let f0_fault    : logic = imem_fault_w || imem_acc_fault_w;
+    let f0_beat_done: logic = ic_dram || f0_fault || f0_nc_beat_q;
     // Extract pointer: on a normal delivery ext_pc_q advances past the delivered bundle
     // (slot-1's predicted next if the 2nd slot fired, else slot-0's). The extract POPS the
     // WORD FIFO head dword when the advance leaves it (crosses the dword boundary; a bundle
@@ -1293,37 +1315,61 @@ pub module heliodor_core #(
         && ((fb_push0 && predicted_taken) || (fb_push1 && predicted_taken1));
     always_ff (clk, rst) {
         if_reset {
-            pc_fetch_q       = RESET_PC;
-            wf_push_valid_q  = 1'b0;
-            wf_push_pc_q     = 64'd0;
-            wf_push_ifault_q = 1'b0;
-            wf_push_iacc_q   = 1'b0;
-            wf_push_gstage_q = 1'b0;
-            wf_push_gpa_q    = 64'd0;
+            pc_fetch_q          = RESET_PC;
+            wf_push_valid_q     = 1'b0;
+            wf_push_pc_q        = 64'd0;
+            wf_push_ifault_q    = 1'b0;
+            wf_push_iacc_q      = 1'b0;
+            wf_push_gstage_q    = 1'b0;
+            wf_push_gpa_q       = 64'd0;
+            f0_nc_beat_q        = 1'b0;
+            f0_nc_lo_inflight_q = 1'b0;
+            f0_nc_lo_q          = 32'd0;
+            wf_push_nc_q        = 1'b0;
         } else if ICACHE_SYNC_READ {
             // Write ONLY at =1 → at =0 every reg here is reset-only (holds its reset
             // constant) → DCE (the icache o_rdata_q idiom; a mux(control,const,hold) D
             // with an explicit =0 write survives simple DCE as an off-path flop).
             // pc_fetch_q: redirect > early-redirect > predicted-taken > stream-advance > hold.
-            // Dword-aligned. The predicted-taken re-steer follows the extract's branch target.
+            // Dword-aligned. A non-cacheable fetch advances only on its 2nd beat (f0_beat_done);
+            // the 1st (low-word) beat holds pc_fetch_q and steps f0_nc_beat_q to the high word.
             if redirect_fire {
-                pc_fetch_q = {redirect_pc[63:3], 3'b000};
+                pc_fetch_q   = {redirect_pc[63:3], 3'b000};
+                f0_nc_beat_q = 1'b0;
             } else if early_redir_fire_q {
-                pc_fetch_q = {early_redir_pc_q[63:3], 3'b000};
+                pc_fetch_q   = {early_redir_pc_q[63:3], 3'b000};
+                f0_nc_beat_q = 1'b0;
             } else if ext_taken_redir {
-                pc_fetch_q = {ext_next_pc[63:3], 3'b000};
+                pc_fetch_q   = {ext_next_pc[63:3], 3'b000};
+                f0_nc_beat_q = 1'b0;
             } else if f0_present {
-                pc_fetch_q = pc_fetch_q + 64'd8;
+                if f0_beat_done {
+                    pc_fetch_q   = pc_fetch_q + 64'd8;
+                    f0_nc_beat_q = 1'b0;
+                } else {
+                    f0_nc_beat_q = 1'b1; // non-cacheable low-word beat done → present the high word
+                }
             }
-            // Push-pipeline register: the presented dword's PC + fault bits, delayed one cycle
-            // to land with its data. Cleared on a redirect / taken re-steer (fetch is wrong-path).
-            wf_push_valid_q = f0_present && !any_redirect && !ext_taken_redir;
-            if f0_present {
+            // Low-word capture pipeline (non-cacheable 2-beat): a beat-0 present this cycle → its
+            // 32-bit word arrives next cycle as icache_rdata; latch it for the beat-1 assembly.
+            // A redirect / taken re-steer voids the in-flight low word (wrong-path).
+            f0_nc_lo_inflight_q = f0_present && !ic_dram && !f0_fault && !f0_nc_beat_q
+                && !any_redirect && !ext_taken_redir;
+            if f0_nc_lo_inflight_q {
+                f0_nc_lo_q = icache_rdata;
+            }
+            // Push-pipeline register: the COMPLETING fetch's dword PC + fault bits, delayed one
+            // cycle to land with its data. Only a beat-DONE present pushes (the low-word beat does
+            // not). Cleared on a redirect / taken re-steer (fetch is wrong-path). wf_push_nc_q
+            // flags a non-cacheable dword — its high word comes from f0_nc_lo_q + icache_rdata.
+            wf_push_valid_q = f0_present && f0_beat_done && !any_redirect && !ext_taken_redir;
+            if f0_present && f0_beat_done {
                 wf_push_pc_q     = pc_fetch_q;
                 wf_push_ifault_q = imem_fault_w;
                 wf_push_iacc_q   = imem_acc_fault_w;
                 wf_push_gstage_q = imem_gstage_w;
                 wf_push_gpa_q    = imem_gpa_w;
+                wf_push_nc_q     = !ic_dram && !f0_fault;
             }
         }
     }
@@ -1344,7 +1390,10 @@ pub module heliodor_core #(
                 wf_count = 4'd0;
             } else {
                 if wf_do_push {
-                    wf_data[wf_tail]   = {icache_rdata_next, icache_rdata};
+                    // Cacheable: the natural 64-bit icache window {high, low}. Non-cacheable
+                    // (wf_push_nc_q): assemble the dword from the beat-0 low word (f0_nc_lo_q)
+                    // and the beat-1 high word arriving now as icache_rdata.
+                    wf_data[wf_tail]   = if wf_push_nc_q ? {icache_rdata, f0_nc_lo_q} : {icache_rdata_next, icache_rdata};
                     wf_pc[wf_tail]     = wf_push_pc_q;
                     wf_ifault[wf_tail] = wf_push_ifault_q;
                     wf_iacc[wf_tail]   = wf_push_iacc_q;
@@ -1545,7 +1594,10 @@ pub module heliodor_core #(
     // Shape-W (CP §14): under ICACHE_SYNC_READ the fetch address is the F0 stream's
     // dword-aligned pc_fetch_q (the read decouples from pc_q, which becomes the extract-
     // stage instruction PC in W2). DEAD at 0 → the old combinational pc_q fetch (byte-id).
-    let fetch_vaddr: logic<64> = if ICACHE_SYNC_READ ? pc_fetch_q : (if straddle_q ? pc_q + 64'd2 : pc_q);
+    // Non-cacheable 2-beat (W3): beat 1 presents the dword-high word at pc_fetch_q+4 (the
+    // passthrough icache returns one word per present); f0_nc_beat_q is 0 in every cacheable
+    // fetch, so the +4 is exclusive to the boot-ROM / MMIO path.
+    let fetch_vaddr: logic<64> = if ICACHE_SYNC_READ ? (pc_fetch_q + (if f0_nc_beat_q ? 64'd4 : 64'd0)) : (if straddle_q ? pc_q + 64'd2 : pc_q);
     // M9 (2026-05-25): gate i_req with !redirect_fire. On the redirect cycle,
     // pc_q still holds the OLD value (NBA — update at clock edge), so
     // fetch_vaddr presents the old VA to MMU. Without this gate, MMU at IDLE
@@ -1660,7 +1712,8 @@ pub module heliodor_core #(
     // P9.6: the fetch PA is cacheable iff inside the DRAM window (PA[63:25]==0x40,
     // the same boundary as dc_uncached). A non-DRAM fetch (firmware/boot-ROM)
     // bypasses the cache and is served from the legacy o_imem passthrough.
-    let ic_dram: logic = imem_paddr_w[63:25] == 39'h40;
+    // (ic_dram is defined up near the shape-W F0 stream — the 2-beat non-cacheable
+    // fetch reads it before this icache instantiation, so it must precede it.)
     inst u_icache: icache (
         clk                              ,
         rst                              ,
