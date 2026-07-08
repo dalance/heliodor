@@ -582,3 +582,26 @@ to reason about than the non-cacheable park loop), find the exact cycle the bypa
 and fix precisely. **Decision point (crossroads):** (a) properly fix the bypass race (keeps §19's within-budget
 IPC), or (b) revert §19 and default-on §18 (2-beat, N4-clean but IPC over budget — Dhrystone +29.7 %), treating
 the bypass as deferred IPC work. The committed tree is unaffected (consts 0, byte-id — the bypass DCEs at 0).
+
+## 20.2 🔬 Onset trace (2026-07-09) — the bypass delivers a WRONG dword (data ≠ its own PC) in a redirect corner
+
+Onset trace at =1 with the `wf_count==0` partial fix (to reach the cacheable 0x800dda divergence): logged hart-0
+fetch DELIVERY (`fb_push0`) in the `0x800dda00`–`ff` window (`ext_pc_q`/`fetched_instr`/`ext_bypass`/`wf_count`/
+`wf_push_pc_q`). Findings (onset ≈ cy `0x745347`, ~7.6M):
+- The real kernel code there (from the actual **dram hex**) is a memcpy/memmove word+byte copy loop. hart 0
+  ends up stuck **2.13M×** in a corrupt loop `0x800dda44`–`0x800dda58` executing garbage — `csrr a5,time`
+  (`0xc01027f3`) at `0x800dda48` (mid-instruction), `div a5,a5,x0`, `ret`, `j -16` — bytes from ELSEWHERE.
+- The corrupt deliveries are **`byp=1`** with `wf_count==0` and `wf_push_pc_q[63:3] == ext_pc_q[63:3]` (the guard
+  holds\!), yet the delivered `fetched_instr` is for a DIFFERENT address. So `wf_push_dword` (= `{icache_rdata_next,
+  icache_rdata}`) does **not correspond to `wf_push_pc_q`** — the registered icache read is stale/for another PC.
+- The onset is preceded by **backward jumps (predicted-taken loop redirects) + bypass** back-to-back.
+
+So the race is a **data-staleness**: in a redirect/refill corner the bypass's `icache_rdata` is NOT the read of
+`wf_push_pc_q`, so it delivers a valid-PC-but-wrong-data dword → the RVC extractor drifts → cascade corruption.
+By static inspection `icache_rdata(T+1) = read(fetch_vaddr(T)) = read(pc_fetch_q(T)) = read(wf_push_pc_q)` for a
+cacheable fetch, so the skew must come from a specific redirect/miss timing the trace hasn't yet pinned (objdump
+RVC-drift on the raw hex makes exact-boundary comparison hard). **Onset log preserved:** `scratchpad/n4_onset.log`
+(718 MB, 8.5M `O0` lines). **Next (continue (a)):** bisect the exact onset cycle — dense-trace hart-0's
+`pc_fetch_q`/`fetch_vaddr`/`icache_stall`/`redirect`/`ext_taken_redir`/`wf_push_valid_q` for ~50 cycles around
+`0x745347` to catch the first stale-data bypass, then guard/fix it. **Fallback (b):** if intractable, revert §19
+and default-on §18 (2-beat, N4-clean, Dhrystone +29.7 %). The committed tree is unaffected (consts 0, byte-id).
