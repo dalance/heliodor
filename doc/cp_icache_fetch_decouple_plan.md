@@ -521,3 +521,32 @@ The Dhrystone front-end idle fell **65432 → 15394** (−76 %), confirming BUBB
 residual is BUBBLE1 = the inherent sync-read latency, which only (b) fetch-directed prefetch removes — so
 (b) is deferred, not needed for shippability). **Consts stay 0.** Next: W4 — SRAM narrowing (§6, the goal-(b)
 port payload), full SMP ladder + Verilator, `test_icache` TB update, then `ICACHE_SYNC_READ=1` default-on.
+
+## 20. 🚨 W4 SMP ladder (2026-07-08) — SMP boot **N=4 HANGS** at =1: a 2-beat non-cacheable straddle race (default-on BLOCKER)
+
+Ran the §7 SMP ladder at =1 (the gate for default-on). **litmus N2 ✓ / SMP boot N2 ✓ / litmus N4 ✓, but
+SMP boot N4 HANGS** (`cy=0x05f5e100`=100M timeout, hart0 x3 = a kernel VA not 0xAA). This is a real
+shape-W regression (byte-id at 0 guarantees =0 is the known-good baseline).
+
+**Diagnosis (per-hart commit-PC heartbeat + a dense hart-1 window trace):** hart 0 boots the kernel
+(kernel VAs, commits advancing); harts 1/2/3 are stuck **spinning in the M-mode firmware secondary-park
+loop** (`0x500`–`0x558`, NON-cacheable = the 2-beat path). Disassembling the actual **hex** (the `.elf` is
+stale — hex ≠ elf) shows the park loop is **RVC-mixed with many 32-bit instructions at 2-byte-but-not-
+4-byte offsets** (`ld`@0x516, `beq`@0x51a, `ld`@0x51e, `sd`@0x522 — all straddling). The dense trace shows
+hart-1 committing a stable loop that **mixes valid instruction starts with MID-INSTRUCTION PCs**
+(`0x51c`/`0x520`/`0x524`/`0x55e`/`0x562` = the straddle PCs + 2) → the fetch drifted +2 on a straddling
+32-bit instr (delivered as if RVC / wrong length), cascading into a corrupt loop that traps into
+`s_debug_trap` (`0x55c`, sets `gp=0xDD`) and wedges.
+
+**Isolation:** disabling the §19 bypass (`ICACHE_BYPASS_EN=0`) **still hangs** with the same corrupt loop →
+the bug is in the **2-beat non-cacheable path, NOT the bypass**. It is **timing-dependent** (N2 runs the
+identical park loop and PASSES; only N4 fails), so it is a RACE — N4's shared-L2/bus data contention
+(the park loop's mailbox `ld`/MSIP `sw`) shifts the branch/redirect timing and exposes a corner in the
+2-beat straddle assembly (within-dword straddle uses the beat-1 high word; across-dword uses the next FIFO
+dword — one path mis-delivers a straddling 32-bit instr under a specific arrival timing).
+
+**Status: default-on is BLOCKED on this N4 hang.** The committed baseline is unaffected (consts stay 0,
+byte-id). **Next debug step:** an ONSET trace (hart-1 fetch state — `ext_pc_q`/`pc_fetch_q`/`wf_count`/
+`f0_nc_beat_q`/`straddle_q` — every cycle around the FIRST mid-instruction commit, bisect the cy where the
++2 drift first appears) → identify the 2-beat straddle race → fix (byte-id at 0) → re-run the full ladder →
+resume W4 (`test_icache` TB, SRAM narrow §6, default-on).
