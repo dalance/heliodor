@@ -7,7 +7,13 @@ data consumption. Goal (b) SRAM-realism + the FINAL front-end pipeline structure
 architectural wall). Lower SMP risk than the dcache flip (per-hart, in-order front end, no
 coherence/atomicity) but a WIDE surface (fetch / RVC / straddle / branch-predict / dual-issue).
 
-## 1. State (2026-07-07)
+## 1. State (2026-07-08)
+- **▶️ LATEST (§18, 2026-07-08): shape-W W3 is BOOT-CLEAN.** Non-cacheable 2-beat F0 fixed the boot
+  hang (firmware PA0 non-cacheable, high-word=0 loop) + `test_smode_plic` (same root) → arch **251/252**
+  (only `test_icache` unit-TB left = W4), N1 boot 5.15 + 6.6 PASS at =1, byte-id at 0 (252/0 + synth
+  14.745/FF160645 identical). **IPC measured: Dhrystone +29.7 %, CoreMark +17.1 %, boots +13–18 %** —
+  halves shape-N but over the ~10–15 % budget; residual = taken-branch word-FIFO-flush refill (all
+  `frontidl`). Recovery crossroads (§18): (a) FIFO bypass → ~budget, (b) fetch-directed prefetch, (c) accept.
 - **`ICACHE_SYNC_READ` DEAD scaffold EXISTS** (`icache.veryl:556`, `const = 0`): registers the four
   CPU-side outputs `o_rdata` / `o_rdata_next` / `o_rdata_next_valid` / `o_stall` via
   rename-to-`*_raw` + reset-only `*_q` + `assign o_* = ICACHE_SYNC_READ ? *_q : *_raw`. Byte-identical
@@ -405,4 +411,70 @@ consts and drove the arch suite from **21/231 (shape-N first flip) → 250/252**
 
 **Status: shape-W is functionally proven on the OoO core (arch 250/252) but NOT yet Linux-boot-clean.**
 Consts stay 0 (baseline unchanged). Next: debug the Linux boot early hang (trace) → non-cacheable
-2-beat → IPC measurement → W4 (SRAM narrow, ladder, `test_icache` TB, default-on).
+2-beat → IPC measurement → W4 (SRAM narrow, ladder, `test_icache` TB, default-on). **[SUPERSEDED by §18.]**
+
+## 18. ✅ W3 boot-clean (2026-07-08) — non-cacheable 2-beat fixes BOTH the boot hang AND `test_smode_plic`; IPC measured
+
+**Root cause of the boot hang = the SAME non-cacheable dword bug as `test_smode_plic`, not a "deeper prefetch"
+corner.** A commit-PC trace (heartbeat on `rob_commit_ack`) showed the N1 boot stuck committing **PC `0x4`**
+forever at `icdram=0` (the firmware boot ROM at PA 0 — reset vector, M-mode, non-cacheable). Decode:
+PA `0x0` = `csrw mie,x0`, PA `0x4` = `auipc t0,0`, PA `0xC` = `csrw mtvec,t0`. Shape-W's F0 pushes the
+64-bit window `{o_rdata_next, o_rdata}`, but a non-cacheable icache read returns **`o_rdata_next = 0`**
+(the passthrough serves only the single presented word). So the dword at PA 0 = `{high=0, low=csrw}`;
+the extract runs PA 0 fine, then reads the **high word (PA 4) = 0** → decodes as an illegal RVC → trap to
+`mtvec` (still 0, `csrw mtvec` at PA 0xC never reached) → PA 0 → **infinite PA0→PA4(illegal)→trap loop**.
+The firmware runs from PA 0 non-cacheable, so the boot hangs at its 2nd instruction — the same failure
+`test_smode_plic` hit (boot-ROM fetch), which is why the arch suite (DRAM/cacheable fetch) passed 250/252.
+
+**Fix — non-cacheable 2-beat word-granular F0 (`heliodor_core.veryl`, const-gated, DEAD at 0).** A
+non-cacheable fetch has no next word, so F0 fetches WORD-granular over two beats and assembles the dword
+before the push: beat 0 presents the dword-low word (`pc_fetch_q`), latches it into `f0_nc_lo_q` when it
+arrives; beat 1 presents the high word (`pc_fetch_q+4`) and pushes `{icache_rdata(high), f0_nc_lo_q(low)}`.
+`f0_beat_done = ic_dram || f0_fault || f0_nc_beat_q` gates the pc-advance + push (cacheable = 1 dword/present;
+non-cacheable = 2 beats/dword; a fault = single fault-marked entry). New regs `f0_nc_beat_q` /
+`f0_nc_lo_inflight_q` / `f0_nc_lo_q` / `wf_push_nc_q` are written only under `else if ICACHE_SYNC_READ` →
+reset-only at 0 → DCE. Boot ROM / MMIO only (arch + Linux both fetch DRAM = cacheable), so the half-rate
+non-cacheable fetch is free. `ic_dram` moved up ahead of the F0 stream (referring-before-definition).
+
+**Verify — functional flip (=1):**
+- **N1 Linux boot 5.15 PASS** `cy=0x00d94900` (14.24M); **6.6 PASS** `cy=0x016adaa0` (23.78M) — was 44.8M hang.
+- **arch 250/252 → 251/252**: `test_smode_plic` now PASSES; the only remaining fail is `test_icache`
+  (unit TB asserts the old same-cycle contract — the known W4 TB update).
+
+**Verify — byte-id (=0, the committed baseline):** default `veryl test` **252/0**; synth **14.745 ns / 141 lv /
+`pc_q[34]→rs1_rdy[0]` IDENTICAL / FF 160645 (+0)** — the 2-beat regs DCE, a true dead scaffold.
+
+**🔬 IPC measured (=1 vs =0) — shape-W roughly HALVES shape-N's boot regression but is STILL over the
+~10–15 % budget on branch-dense code:**
+
+| workload | =0 | =1 shape-W | Δ shape-W | (§12 shape-N) |
+|---|---|---|---|---|
+| Dhrystone | 230937 | 299624 | **+29.7 %** | — |
+| CoreMark | 327980 | 383912 | **+17.1 %** | — |
+| boot 5.15 (smoke) | 0x00b7b740 | 0x00d94900 | **+18.3 %** | +34.0 % |
+| boot 6.6 | 0x01402120 | 0x016adaa0 | **+13.3 %** | +38.4 % |
+
+**The residual is almost entirely front-end idle**, NOT the back-end. Dhrystone counters (`=0 → =1`):
+`frontidl 146 → 65432` (**+65286**, ≈ the whole +68687-cycle delta), `commit0 52260 → 103600` (secondary
+starvation), `membusy 74869 → 75337` (flat). So §14's "sequential code never bubbles" **held** (a pure-
+sequential run has ~0 idle), but its "the taken +1 is unavoidable — same as today" was **optimistic**: at =1
+every **taken branch (predicted OR mispredicted) flushes the word FIFO** (`ext_taken_redir`, since F0 streamed
+sequentially past it) and refills the target through the **synchronous** icache — a ~2-cycle bubble
+(BUBBLE1 = the sync-read latency [unavoidable]; BUBBLE2 = the FIFO register round-trip
+[present→arrive→push→visible, removable]) vs =0's ~0–1-cycle combinational refill. Branch-dense Dhrystone
+(tiny functions = a taken branch every few instrs) pays +29.7 %; loop-dense CoreMark +17.1 %; boots +13–18 %.
+**The deep 8-dword prefetch is wasted on every taken branch** — the streaming win is real for straight-line
+code but the taken-branch refill is now WORSE than =0.
+
+**Recovery options (the W3 → shippable crossroads):**
+- **(a) FIFO read-around / bypass** — deliver the arriving dword the cycle it lands (`icache_rdata` is
+  REGISTERED under sync-read → a register→extract bypass, NOT the combinational read cone → CP-safe),
+  recovering BUBBLE2 (~1 cycle/taken-branch → Dhrystone ~+10 %, within budget). Smallest, lowest-risk win.
+- **(b) Fetch-directed prefetch** — F0 consults the BTB on `pc_fetch_q` and FOLLOWS predicted-taken
+  branches instead of streaming sequentially + flushing (the real-core decoupled front end: a BTB-driven
+  fetch-target stream). Eliminates the flush entirely; biggest redesign, the clean end state.
+- **(c) Accept shape-W as structural progress** — the icache combinational read is off the fetch cone (the
+  CP goal), at a +13–18 % real-workload IPC cost. Per the "structure over CP" campaign ethos, still progress.
+
+**Consts stay 0 (baseline unchanged).** Next (user decision): pursue (a) the FIFO bypass to reach the IPC
+budget, then W4 (SRAM narrow §6, full SMP ladder + Verilator, `test_icache` TB, default-on).
