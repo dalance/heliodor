@@ -91,6 +91,9 @@ pub module l2cache #(
     o_iv_sharers: output logic<N_HARTS>     ,
     o_iv_owned  : output logic              , // Phase B: victim OWNED → recall first
     o_iv_blocked: output logic              , // no eligible way this cycle
+    // P3.a L2 1R1W: a same-bank merge write is using the install's data port
+    // this cycle → mem_ctrl HOLDS the install (retry). 0 unless L2_PORTS_1R1W.
+    o_inst_port_busy: output logic          ,
     // Phase B: sharers already on the install line (in-place overwrite case;
     // 0 when the line is absent). mem_ctrl downgrades the grant to S when
     // another hart is listed.
@@ -233,6 +236,17 @@ pub module l2cache #(
     // CYCLE-IDENTICAL to =0 (data value + timing). At =0 the register DCEs (reset-only) and o_cdata ==
     // c_line_raw → byte-identical. Flip TOGETHER with mem_ctrl.veryl's L2_SYNC_READ (the capture-timing).
     const L2_SYNC_READ: bit = 1;
+    // ── L2 1R1W port collapse (goal-(b) SRAM realism, cp_l2_sync_read_plan.md §8) ──
+    // The data array (data_0..3) currently infers 512×512 2R2W: two reads (R1 lookup @c_index
+    // [sync], R2 merge-read-old @w_index) + two writes (W1 merge @w_index, W2 install @in_index).
+    // P3.a collapses the two WRITES to a single per-bank write port (2R2W → 2R1W) by MUXING the
+    // merge/install write into one write statement per bank. Correctness rests on merge and install
+    // NEVER co-firing: the SoC's wgrant_ok gate VETOES a bus write (store/WB) the cycle an install
+    // fires (const-gated there, flip TOGETHER), so the mux is unambiguous and no write is lost — the
+    // vetoed write retries next cycle via the existing dmemw-grant retry. At =0 the muxed block DCEs
+    // (reset-nothing / const-false) and the original two writes remain → byte-identical.
+    // P3.b (later) folds R2 onto the read port for the true 1R1W. Flip together with soc/soc_smp.
+    const L2_PORTS_1R1W: bit = 0;
     assign o_chit = any_ctm;
     // P9.2: sharers of the c-port line (0 on miss). Combinational (directory flop array).
     assign o_c_sharers = if ctm_0 ?
@@ -530,6 +544,52 @@ pub module l2cache #(
     let w_access_valid: logic = i_wen && w_any_tm && !mis_store;
 
     // -----------------------------------------------------------------
+    // Data-array write assembly — the merged write line (W1) and the
+    // gathered install line (W2), hoisted so both the =0 (two writes) and
+    // =1 (single muxed port) paths share them.
+    // -----------------------------------------------------------------
+    let w_merged_line: logic<512> = {
+        write_merged[7], write_merged[6], write_merged[5], write_merged[4],
+        write_merged[3], write_merged[2], write_merged[1], write_merged[0]
+    };
+    let inst_line: logic<512> = {
+        i_inst_data[7], i_inst_data[6], i_inst_data[5], i_inst_data[4],
+        i_inst_data[3], i_inst_data[2], i_inst_data[1], i_inst_data[0]
+    };
+    // W1 (merge) data-write condition — a write hit that is not a misaligned
+    // invalidate. (mis_store writes no data, only invalidates lv/shr/own.)
+    let mrg_data_wr: logic = i_wen && w_any_tm && !mis_store;
+    // P3.a 1R1W: each bank (data_0..3) is a SEPARATE array, so it gets its OWN
+    // 1RW write port. Bank k's write muxes {install→in_index/inst_line if the
+    // install targets k, else merge→w_index/w_merged_line}. Different-bank
+    // merge+install co-fire is fine (each bank writes its own port). The ONLY
+    // real port contention is the SAME bank (w_tm_way == install_way): there the
+    // install YIELDS to the merge via o_inst_port_busy (mem_ctrl holds/retries the
+    // install), so at most one of {merge, install} writes bank k per cycle.
+    let ins1rw_0: logic = i_inst_v && install_way == 2'd0;
+    let ins1rw_1: logic = i_inst_v && install_way == 2'd1;
+    let ins1rw_2: logic = i_inst_v && install_way == 2'd2;
+    let ins1rw_3: logic = i_inst_v && install_way == 2'd3;
+    let wr1rw_idx_0: logic<9>   = if ins1rw_0 ? in_index : w_index;
+    let wr1rw_idx_1: logic<9>   = if ins1rw_1 ? in_index : w_index;
+    let wr1rw_idx_2: logic<9>   = if ins1rw_2 ? in_index : w_index;
+    let wr1rw_idx_3: logic<9>   = if ins1rw_3 ? in_index : w_index;
+    let wr1rw_dat_0: logic<512> = if ins1rw_0 ? inst_line : w_merged_line;
+    let wr1rw_dat_1: logic<512> = if ins1rw_1 ? inst_line : w_merged_line;
+    let wr1rw_dat_2: logic<512> = if ins1rw_2 ? inst_line : w_merged_line;
+    let wr1rw_dat_3: logic<512> = if ins1rw_3 ? inst_line : w_merged_line;
+    let wr1rw_v_0: logic = (mrg_data_wr && w_tm_0) || ins1rw_0;
+    let wr1rw_v_1: logic = (mrg_data_wr && w_tm_1) || ins1rw_1;
+    let wr1rw_v_2: logic = (mrg_data_wr && w_tm_2) || ins1rw_2;
+    let wr1rw_v_3: logic = (mrg_data_wr && w_tm_3) || ins1rw_3;
+    // Install yields to a same-bank merge write. Computed WITHOUT i_inst_v (uses
+    // install_way, which is combinational on i_inst_addr = registered slot state)
+    // so it does NOT depend on the install decision → no comb loop when mem_ctrl
+    // folds it into inst_blocked. 0 at =0 (byte-identical). Only meaningful while
+    // an install is actually pending (else o_l2_inst_v is 0 regardless).
+    assign o_inst_port_busy = L2_PORTS_1R1W && mrg_data_wr && (w_tm_way == install_way);
+
+    // -----------------------------------------------------------------
     // Cache update
     // -----------------------------------------------------------------
     always_ff (clk, rst) {
@@ -683,19 +743,19 @@ pub module l2cache #(
                 // Write hit — one whole-line write into the matching way.
                 // write_merged already keeps the cached dword on every
                 // wstrb==0 lane, so the concatenated line carries the per-lane
-                // byte-merge (the SRAM has no sub-word write port).
-                let w_merged_line: logic<512> = {
-                    write_merged[7], write_merged[6], write_merged[5], write_merged[4],
-                    write_merged[3], write_merged[2], write_merged[1], write_merged[0]
-                };
-                if w_tm_0 {
-                    data_0[w_index] = w_merged_line;
-                } else if w_tm_1 {
-                    data_1[w_index] = w_merged_line;
-                } else if w_tm_2 {
-                    data_2[w_index] = w_merged_line;
-                } else {
-                    data_3[w_index] = w_merged_line;
+                // byte-merge (the SRAM has no sub-word write port). P3.a: at =1
+                // this data write moves to the shared muxed port below (this
+                // branch keeps only the directory update); at =0 it stays here.
+                if !L2_PORTS_1R1W {
+                    if w_tm_0 {
+                        data_0[w_index] = w_merged_line;
+                    } else if w_tm_1 {
+                        data_1[w_index] = w_merged_line;
+                    } else if w_tm_2 {
+                        data_2[w_index] = w_merged_line;
+                    } else {
+                        data_3[w_index] = w_merged_line;
+                    }
                 }
             }
 
@@ -707,36 +767,62 @@ pub module l2cache #(
             // RFO) unless another hart is still listed (then mem_ctrl also
             // downgrades the grant to S via o_inst_oldshr).
             if i_inst_v {
-                // Full-line install — one whole-line write of the gathered DRAM
-                // line (8 dwords concatenated).
-                let inst_line: logic<512> = {
-                    i_inst_data[7], i_inst_data[6], i_inst_data[5], i_inst_data[4],
-                    i_inst_data[3], i_inst_data[2], i_inst_data[1], i_inst_data[0]
-                };
+                // Full-line install. P3.a: the data write moves to the shared
+                // muxed port below at =1 (this branch keeps only tag/lv/shr/own);
+                // at =0 it stays here (inst_line hoisted to module scope).
                 if install_way == 2'd0 {
                     tag_0[in_index] = in_tag;
                     lv_0[in_index]  = 1'b1;
                     shr_0[in_index] = if i_any_tm ? shr_0[in_index] | inst_oh : inst_oh;
                     own_0[in_index] = !i_any_tm || ((shr_0[in_index] & ~inst_oh) == '0);
-                    data_0[in_index] = inst_line;
+                    if !L2_PORTS_1R1W {
+                        data_0[in_index] = inst_line;
+                    }
                 } else if install_way == 2'd1 {
                     tag_1[in_index] = in_tag;
                     lv_1[in_index]  = 1'b1;
                     shr_1[in_index] = if i_any_tm ? shr_1[in_index] | inst_oh : inst_oh;
                     own_1[in_index] = !i_any_tm || ((shr_1[in_index] & ~inst_oh) == '0);
-                    data_1[in_index] = inst_line;
+                    if !L2_PORTS_1R1W {
+                        data_1[in_index] = inst_line;
+                    }
                 } else if install_way == 2'd2 {
                     tag_2[in_index] = in_tag;
                     lv_2[in_index]  = 1'b1;
                     shr_2[in_index] = if i_any_tm ? shr_2[in_index] | inst_oh : inst_oh;
                     own_2[in_index] = !i_any_tm || ((shr_2[in_index] & ~inst_oh) == '0);
-                    data_2[in_index] = inst_line;
+                    if !L2_PORTS_1R1W {
+                        data_2[in_index] = inst_line;
+                    }
                 } else {
                     tag_3[in_index] = in_tag;
                     lv_3[in_index]  = 1'b1;
                     shr_3[in_index] = if i_any_tm ? shr_3[in_index] | inst_oh : inst_oh;
                     own_3[in_index] = !i_any_tm || ((shr_3[in_index] & ~inst_oh) == '0);
-                    data_3[in_index] = inst_line;
+                    if !L2_PORTS_1R1W {
+                        data_3[in_index] = inst_line;
+                    }
+                }
+            }
+
+            // P3.a 1R1W: the single shared per-bank data write port. Muxes the
+            // merge (W1 @w_index) and install (W2 @in_index) into ONE write per
+            // bank — the merge and install NEVER co-fire at =1 (SoC wgrant_ok
+            // vetoes the bus write the cycle an install fires), so wr1rw_v_* is
+            // a clean OR and wr1rw_idx/dat pick install-first. At =0 this whole
+            // block DCEs (const-false) and the original writes above stand.
+            if L2_PORTS_1R1W {
+                if wr1rw_v_0 {
+                    data_0[wr1rw_idx_0] = wr1rw_dat_0;
+                }
+                if wr1rw_v_1 {
+                    data_1[wr1rw_idx_1] = wr1rw_dat_1;
+                }
+                if wr1rw_v_2 {
+                    data_2[wr1rw_idx_2] = wr1rw_dat_2;
+                }
+                if wr1rw_v_3 {
+                    data_3[wr1rw_idx_3] = wr1rw_dat_3;
                 }
             }
         }
