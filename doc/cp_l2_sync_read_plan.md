@@ -124,12 +124,43 @@ mirror const (flip together).
   synth counts the array + output register separately; the RTL is now the canonical sync-SRAM read
   pattern (`c_line_q <= data[c_index]`) that a real SRAM compiler folds into a macro with an output
   register. The **synchronous read** (the "synchronous" of goal (b)) is done, cycle-identical + CP-neutral.
-- **P3 — (opt) L2 port reduction → 1R1W** (fold the 2nd read + serialize the 2 writes through a
-  write-merge buffer) so the array maps to a single-port SRAM macro, and L2 tags → 1R1W. Further work;
-  the read side is now sync (P2). The current change is **default-on-safe** (zero-cost, cycle-identical).
+- **P3 — L2 data port reduction 2R2W → 1R1W** (the true single-port SRAM macro). ▶️ NEXT (see §8).
 
 ## 7. Anchors
 - L2 lookup c-port (combinational read): `l2cache.veryl:216-260`.
 - mem_ctrl same-cycle consume: `:484-554` (`lk_hit_ok`/`lk_recall_req`), `:382` (`buf_q` capture).
 - Scaffold pattern: `icache.veryl:546-583` (`ICACHE_SYNC_READ`), `cp_dcache_sync_read_plan.md`.
 - Inventory + order: `sram_inventory.md` (L2 = SoC-level Phase-C extension), `deep_pipeline_status_and_replan.md` §5 goal (b).
+
+## 8. P3 spec — L2 data array 2R2W → 1R1W (the single-port SRAM macro)
+
+**Entry state (post-P2, committed `555a3ef`, L2_SYNC_READ=1 default-on):** the data lookup read is
+synchronous; the array still infers `512×512 2R2W ×4` because it has **4 accesses** (`l2cache.veryl`):
+| port | access | index | line |
+|---|---|---|---|
+| **R1** lookup | `data_*[c_index]` → `c_line_raw`/`c_line_q` (sync) | `c_index` | 262–268 |
+| **R2** write-hit merge read-old | `data_*[w_index][l*64+:64]` (o_w_line for the byte-merge) | `w_index` | 495–501 |
+| **W1** write-hit merge | `data_*[w_index] = w_merged_line` | `w_index` | 692–698 |
+| **W2** install (gathered DRAM line) | `data_*[in_index] = inst_line` | `in_index` | 721–739 |
+
+**Target 1R1W = 1 read port + 1 write port.** The two writes (W1 merge, W2 install) are already
+mutually structured but at different indices; the two reads (R1 lookup, R2 merge-read-old) are
+genuinely concurrent at different indices (`c_index` vs `w_index`) → the hard part (same as dcache
+§12.3's "read-port arbitration", `cp_dcache_sync_read_plan.md`).
+
+**Approach (functional flip, const-gated `L2_PORTS_1R1W`, DEAD→flip):**
+1. **R2 (merge read-old) folds onto the WRITE port as a read-modify-write.** A write-hit merge is a
+   read-old-then-write at the SAME index `w_index` → a 1R1W macro's write port with read-old (or a
+   2-cycle RMW: read `w_index` cycle N, write the merge cycle N+1). This removes R2 as a separate
+   read port → **1 read (lookup) + 1 write (merge/install, serialized)**. The write serialization
+   (W1 vs W2, different indices, rare collision) goes through a small **write-merge/arbitration
+   buffer** or a 1-cycle stall (installs already gate via `o_iv_*`/`inst_go`; add merge-vs-install
+   arbitration).
+2. **Verify:** this changes L2 write/merge timing → the **full SMP coherence ladder** (arch 252,
+   litmus N2/N4, SMP boot N2/N4, Verilator) + IPC (the RMW/arbitration may add stalls — measure).
+   Unlike P2 (cycle-identical), P3 is a genuine functional change (IPC cost expected, bounded).
+3. **Down-payment available:** the read side is already sync (P2), so R1 is macro-ready; P3 only
+   needs the R2-fold + write-arbitration.
+
+**Note (tags):** L2 tags (`512×49 5R1W`) + the directory (sharers/owned) stay flops — a real chip
+keeps the coherence directory associatively-read (registering it livelocks, §4.1). P3 is DATA-only.
