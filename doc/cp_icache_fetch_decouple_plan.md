@@ -605,3 +605,44 @@ RVC-drift on the raw hex makes exact-boundary comparison hard). **Onset log pres
 `pc_fetch_q`/`fetch_vaddr`/`icache_stall`/`redirect`/`ext_taken_redir`/`wf_push_valid_q` for ~50 cycles around
 `0x745347` to catch the first stale-data bypass, then guard/fix it. **Fallback (b):** if intractable, revert §19
 and default-on §18 (2-beat, N4-clean, Dhrystone +29.7 %). The committed tree is unaffected (consts 0, byte-id).
+
+## 21. 🔬 =1 synth CP measured (2026-07-09, user-chosen decider) — shape-W is net-NEGATIVE solo; the wall is the commit-store front → GATE shape-W, DE-PRIORITIZE the bypass
+
+Before sinking more into the §20.2 bypass race, the user chose to **measure the =1 synth CP first** — does shape-W's sync-read actually cut the front-end floor enough to pay for its IPC cost? Flipped BOTH consts to 1 (core §336 + icache §561), `veryl synth --top heliodor_core --dump-timing`, reverted to 0.
+
+| config | CP | levels | binding path | area (um²) |
+|---|---|---|---|---|
+| =0 (shipping) | 14.745 ns | 141 | `pc_q[34] → rs1_rdy[0]` (**front-end** fetch cone) | 18.895 M |
+| =1 (shape-W)  | **14.130 ns** | 146 | `head[0] → n_inflight[5]` (**back-end** commit) | 18.982 M (+87 K = the ~66 sync regs) |
+
+**The sync-read register DID split the front-end cone** — the binding root moved off `pc_q` (fetch) onto
+`head → ROB-commit → CAS/store detect → commit-store **dmem-MMU TLB** (3.1→7.6) → **PMP-W** (7.6→9.9) →
+commit-trap/redirect → free-list **n_inflight** counter (12.2→14.13)`. This EXACTLY reproduces
+`cp_commit_store_pretranslate_plan.md`'s FETCH_REG=1 wall (**14.130 ns, `head→n_inflight[5]`**) — same
+number, same path. The =0→=1 win is only **−0.615 ns (−4.2 %)**: the =0 baseline had drifted 14.565→14.745
+(front-end cone growth), all of which the register removes, landing on the hard back-end wall at 14.130.
+
+**Decisive economics — shape-W SOLO is net-NEGATIVE** (perf = clock × IPC; boot-5.15 IPC from §19):
+
+| | clock gain | boot IPC cost | net throughput |
+|---|---|---|---|
+| §18 default-on (N4-clean, shippable) | +4.35 % (14.745→14.130) | +18.3 % | ×1.0435 / 1.183 = **−11.8 %** |
+| §19 bypass (IF the race were fixed) | +4.35 % | +12.8 % | ×1.0435 / 1.128 = **−7.5 %** |
+
+Break-even needs the back-end wall ≤ 14.745/1.183 = **12.46 ns** (§18) / ≤ **13.07 ns** (§19) — the commit-store
+front must fall **≥1.67 / ≥1.06 ns below 14.130** before shape-W pays for itself. It does not, alone.
+
+**Decision (plan REVISED — the "advance the FINAL structure, not the binding synth number" rule):**
+1. **shape-W is BANKED: ready-but-GATED (consts stay 0).** §18 (2-beat, N4-clean) is the correct shippable
+   body and the front-end half of the deep-pipeline bundle. It does NOT go default-on in isolation.
+2. **The §19 bypass race is DE-PRIORITIZED** (not reverted — the code DCEs at 0). Even fixed it leaves shape-W
+   net-negative (−7.5 %); it is IPC-recovery for a stage that is not default-on. Not worth the §20.2 trace-hunt
+   now — the onset log + diagnosis stay parked for when the bundle makes shape-W profitable.
+3. **The real next structural target is the wall shape-W just re-exposed: the commit-store live-MMU/PMP front**
+   (`head→n_inflight`, 14.130) — already the user-chosen ACTIVE FRONT in `cp_commit_store_pretranslate_plan.md`:
+   **move store address translation from commit to execute (Stage-A).** shape-W + commit-store-pretranslate +
+   vrf (13.880, 2nd front) form the coordinated bundle whose CP headline only moves together.
+
+**Next:** resume `cp_commit_store_pretranslate_plan.md` (P1' probe `7598185` down-payment → the hard part: the
+§9 2-cycle registered-SB-push fallback that §4.1 proved is required — the naive commit-MMU-removal breaks the
+Linux boot). shape-W waits in the bundle; the bypass race stays parked.
