@@ -137,6 +137,17 @@ pub module l2cache #(
     // Non-v4 instantiations tie this to 0 (the invalidate path never fires).
     i_wstrb_hi: input logic<8>,
     i_wen     : input logic   ,
+    // P3.b (L2_READ_1R1W): a DRAM write is REQUESTED this cycle (pre-grant; the
+    // bus drives i_waddr with the selected write's addr independent of the grant).
+    // Lets l2cache speculatively read the write-hit's old line BEFORE granting so
+    // the merge write is atomic on a single read port. Tie 0 when L2_READ_1R1W=0.
+    i_w_req      : input  logic ,
+    // P3.b: raw pieces of the write-grant HOLD, combined at the SoC (like w_veto,
+    // to avoid a bundled output that trips the comb-loop analyzer). o_w_hit = the
+    // write hits L2 (needs a merge-read), gated by L2_READ_1R1W (0 at =0).
+    // o_w_spec_ready = the pending hit's old line is already spec-read (registered).
+    o_w_hit       : output logic ,
+    o_w_spec_ready: output logic ,
     // Lower interface — P9.1: write passthrough ONLY (DRAM reads moved to
     // mem_ctrl, which owns the external read port and its arbitration).
     o_mem_addr : output logic<64>    ,
@@ -247,6 +258,20 @@ pub module l2cache #(
     // (reset-nothing / const-false) and the original two writes remain → byte-identical.
     // P3.b (later) folds R2 onto the read port for the true 1R1W. Flip together with soc/soc_smp.
     const L2_PORTS_1R1W: bit = 1;
+    // ── L2 P3.b: fold R2 (merge-read-old) onto the sync read port → true 1R1W ──
+    // Today (P3.a) the data array is 2R1W: R1 lookup @c_index (sync c_line_q) + R2 merge-read-old
+    // @w_index (combinational, in write_merged). P3.b removes R2 as a separate read port by serving
+    // the write-hit merge's old line from the SAME sync read port (c_line_q). To keep the L2-write
+    // ATOMIC (directory + data same cycle — no stale-read window), the old line is read SPECULATIVELY
+    // one cycle BEFORE the store is accepted: on a cycle the read port is free (!i_cren = mem_ctrl not
+    // looking up) l2cache presents the selected store's w_index to the read port; the next cycle the
+    // old line is in c_line_q and the store is GRANTED (SoC wgrant_ok waits on o_w_spec_hold) →
+    // directory update + merged data write, atomically. Reading only when !i_cren keeps mem_ctrl's
+    // c_line_q timeline undisturbed (no mem_ctrl change). wgrant_ok gates on the REGISTERED spec-ready
+    // (+ w_any_tm/i_w_wb, comb on the pre-grant i_waddr) → no comb loop. At =0 the whole path DCEs
+    // (rd_sel_store=0 → rd_index==c_index, write_merged uses the combinational read) → byte-identical
+    // 2R1W. At =1 the array infers 1R1W. Flip TOGETHER with soc/soc_smp (i_w_req + wgrant_ok).
+    const L2_READ_1R1W: bit = 0;
     assign o_chit = any_ctm;
     // P9.2: sharers of the c-port line (0 on miss). Combinational (directory flop array).
     assign o_c_sharers = if ctm_0 ?
@@ -271,16 +296,59 @@ pub module l2cache #(
     :
         1'b0
     ;
-    // The DATA line — packed to one logic<512> (a line-wide macro's single read port).
-    let c_line_raw: logic<512> = if ctm_0 ?
-        data_0[c_index]
-    : if ctm_1 ?
-        data_1[c_index]
-    : if ctm_2 ?
-        data_2[c_index]
-    :
-        data_3[c_index]
-    ;
+    // Write-side line match (i_waddr) — the write-hit merge target. Hoisted
+    // above the DATA read so P3.b's read-port mux can select the write-hit way.
+    let w_tm_0  : logic    = lv_0[w_index] && (tag_0[w_index] == w_tag);
+    let w_tm_1  : logic    = lv_1[w_index] && (tag_1[w_index] == w_tag);
+    let w_tm_2  : logic    = lv_2[w_index] && (tag_2[w_index] == w_tag);
+    let w_tm_3  : logic    = lv_3[w_index] && (tag_3[w_index] == w_tag);
+    let w_any_tm: logic    = w_tm_0 || w_tm_1 || w_tm_2 || w_tm_3;
+    let w_tm_way: logic<2> = if w_tm_0 ? 2'd0 : if w_tm_1 ? 2'd1 : if w_tm_2 ? 2'd2 : 2'd3;
+
+    // ── P3.b read-port fold: the DATA array's SINGLE read port. rd_index/rd_way
+    // muxes {lookup @c_index/c_way, store spec-read @w_index/w_tm_way}. At =0
+    // (L2_READ_1R1W=0) rd_sel_store is const-false → rd_index==c_index,
+    // rd_way==c_way → byte-identical lookup read (the merge keeps its own
+    // combinational read below). At =1 a REQUESTED partial write-hit whose old
+    // line is not yet in c_line_q steals the read port on a free cycle
+    // (!i_cren = mem_ctrl not looking up), so next cycle the old line is in
+    // c_line_q and the store is granted (SoC waits on o_w_spec_hold).
+    // The spec FSM registers (rmw_spec_ready_q / rmw_spec_waddr_q) are below.
+    var rmw_spec_ready_q: logic     ;
+    var rmw_spec_waddr_q: logic<64> ;
+    // A requested partial write-hit that needs a byte-merge (WB = full line and
+    // misaligned = invalidate-only need no old-line read). i_w_req/i_w_wb/
+    // i_wstrb_hi are the SELECTED write's attributes (valid pre-grant).
+    let req_merge: logic = i_w_req && w_any_tm && !i_w_wb;
+    // The spec-read for the pending store is already in c_line_q (addr-matched).
+    let spec_ready : logic = rmw_spec_ready_q && (rmw_spec_waddr_q == i_waddr);
+    let do_spec_read: logic = L2_READ_1R1W && req_merge && !spec_ready && !i_cren;
+    let rd_sel_store: logic  = do_spec_read;
+    let rd_index    : logic<9> = if rd_sel_store ? w_index : c_index;
+    let rd_way      : logic<2> = if rd_sel_store ? w_tm_way : c_way;
+    // The DATA line. At =1 (L2_READ_1R1W) one read index net per bank — the
+    // muxed {lookup, store spec-read} port (a line-wide 1R macro). At =0 the
+    // original ctm-chain lookup read @c_index (gate-neutral, byte-identical; the
+    // rd_index/rd_way path DCEs). The merge keeps its own combinational read at =0.
+    let c_line_raw: logic<512> = if L2_READ_1R1W ? (
+        if rd_way == 2'd0 ?
+            data_0[rd_index]
+        : if rd_way == 2'd1 ?
+            data_1[rd_index]
+        : if rd_way == 2'd2 ?
+            data_2[rd_index]
+        :
+            data_3[rd_index]
+    ) : (
+        if ctm_0 ?
+            data_0[c_index]
+        : if ctm_1 ?
+            data_1[c_index]
+        : if ctm_2 ?
+            data_2[c_index]
+        :
+            data_3[c_index]
+    );
     var c_line_q: logic<512>;
     always_ff (clk, rst) {
         if_reset {
@@ -292,15 +360,17 @@ pub module l2cache #(
     for l in 0..8 :gen_cdata {
         assign o_cdata[l] = if L2_SYNC_READ ? c_line_q[l*64 +: 64] : c_line_raw[l*64 +: 64];
     }
-
-    // -----------------------------------------------------------------
-    // Write-side line match (i_waddr) — write-hit merge target.
-    // -----------------------------------------------------------------
-    let w_tm_0  : logic = lv_0[w_index] && (tag_0[w_index] == w_tag);
-    let w_tm_1  : logic = lv_1[w_index] && (tag_1[w_index] == w_tag);
-    let w_tm_2  : logic = lv_2[w_index] && (tag_2[w_index] == w_tag);
-    let w_tm_3  : logic = lv_3[w_index] && (tag_3[w_index] == w_tag);
-    let w_any_tm: logic = w_tm_0 || w_tm_1 || w_tm_2 || w_tm_3;
+    // P3.b: raw hold pieces — the SoC forms the grant hold as
+    // wv_req_on && o_w_hit && !o_w_spec_ready. o_w_hit encodes "a partial write-hit
+    // that needs a merge-read" (a WB is a full line, a misaligned store is
+    // invalidate-only → neither needs the old line). Combinational on the selected
+    // write's attributes (like l2_w_owned) → loop-safe. Gated (0 at =0).
+    // NB: i_wstrb_hi (the misaligned hi-strobe) is grant-gated at the SoC, so it
+    // must NOT appear here (it would close a comb loop through wgrant_ok). A
+    // misaligned store that hits simply takes one harmless spec-read cycle before
+    // its invalidate (its data write never fires — mrg_data_wr excludes mis_store).
+    assign o_w_hit        = L2_READ_1R1W && w_any_tm && !i_w_wb;
+    assign o_w_spec_ready = spec_ready;
 
     // -----------------------------------------------------------------
     // M8.D.2: misaligned-store hi-side invalidate (mirror of dcache B.3).
@@ -505,7 +575,15 @@ pub module l2cache #(
     var write_merged: logic<64> [8];
     always_comb {
         for l in 0..8 {
-            let w_lold: logic<64> = if w_tm_0 ?
+            // P3.b: at =1 the old line was spec-read into c_line_q one cycle before
+            // this (the grant) cycle — no separate w_index read port. At =0 the
+            // merge keeps its own combinational read (byte-identical, 2R1W). The
+            // merge only feeds the data write on the grant cycle, where c_line_q
+            // holds this store's spec-read old line (WB/miss don't reach here with
+            // wstrb==0 lanes that matter, so a stale c_line_q there is unused).
+            let w_lold: logic<64> = if L2_READ_1R1W ?
+                c_line_q[l*64 +: 64]
+            : if w_tm_0 ?
                 data_0[w_index][l*64 +: 64]
             : if w_tm_1 ?
                 data_1[w_index][l*64 +: 64]
@@ -535,7 +613,6 @@ pub module l2cache #(
         !install_way[1], if !install_way[1] ? !install_way[0] : i_plru_bits[1],
         if install_way[1] ? !install_way[0] : i_plru_bits[0],
     };
-    let w_tm_way   : logic<2> = if w_tm_0 ? 2'd0 : if w_tm_1 ? 2'd1 : if w_tm_2 ? 2'd2 : 2'd3;
     let w_plru_bits: logic<3> = plru[w_index];
     let w_new_plru : logic<3> = {
         !w_tm_way[1], if !w_tm_way[1] ? !w_tm_way[0] : w_plru_bits[1],
@@ -609,7 +686,21 @@ pub module l2cache #(
                 own_2[i] = 1'b0;
                 own_3[i] = 1'b0;
             }
+            rmw_spec_ready_q = 1'b0;
+            rmw_spec_waddr_q = 64'd0;
         } else {
+            // P3.b spec-read FSM (L2_READ_1R1W). Present a store's merge-read on a
+            // free read-port cycle (do_spec_read) → next cycle its old line is in
+            // c_line_q and spec_ready gates the grant. A granted write (i_wen)
+            // consumes/invalidates the pending spec. At =0 this DCEs (reset-only).
+            if L2_READ_1R1W {
+                if do_spec_read {
+                    rmw_spec_ready_q = 1'b1;
+                    rmw_spec_waddr_q = i_waddr;
+                } else if i_wen {
+                    rmw_spec_ready_q = 1'b0;
+                }
+            }
             // P9.2 directory: lookup-grant sharer add (mem_ctrl guarantees no
             // same-cycle same-line write — it retries the lookup on a write
             // collision — and the install path below cannot touch this line's
