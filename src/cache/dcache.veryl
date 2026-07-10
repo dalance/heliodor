@@ -351,6 +351,17 @@ pub module dcache #(
             if be[0] ? nw[7:0] : old[7:0],
         };
     }
+    // Expand an 8-bit byte-enable to a 64-bit bit-mask (each byte-enable bit
+    // replicated across its 8 data bits) — the byte-write-enable form of a
+    // store's per-byte strobe (DCACHE_DATA_1RW, mirrors L2's w_wmask).
+    function be_expand (
+        be: input logic<8>,
+    ) -> logic<64> {
+        return {
+            be[7] repeat 8, be[6] repeat 8, be[5] repeat 8, be[4] repeat 8,
+            be[3] repeat 8, be[2] repeat 8, be[1] repeat 8, be[0] repeat 8
+        };
+    }
 
     // Cache lookup: per-way hit. P9.5: an uncached MMIO load never hits (it must
     // do a fresh single bus read and not alias a stale cached line), so suppress
@@ -582,6 +593,21 @@ pub module dcache #(
     // fold (Stage-A tag port, §11.2) + the C3 R→D hit re-validation (§11.1 C3)
     // are the remaining functional work, so =1 is still partial.
     const DCACHE_SYNC_READ: bit = 1;
+    // goal-b SRAM: data-array write-port collapse to a true 1-write byte-write-
+    // enable SRAM. All four data writers (plain store-merge, AMO/SC commit, fill
+    // beat, store drain) are MUTUALLY EXCLUSIVE per cycle (store-merge/AMO/drain
+    // are state==IDLE + i_wen-exclusive; fill is state==FILL) and each targets a
+    // one-hot way, so per bank at most one writer fires. They collapse into ONE
+    // muxed write per bank: data_k[idx] = (data_k[idx] & ~msk) | (new & msk),
+    // where the retention read data_k[idx] folds into the SRAM byte-enable (the
+    // veryl byte-write-enable inference, same as L2 P3.b-B). This drops the four
+    // write ports to one AND folds the store-drain's old-line read (the only
+    // read at sindex) — data 8R4W → 7R1W. Byte-identical: the masked-write value
+    // equals wr_dword(old, off, merge_dword(...)) for every writer (see below).
+    // DEAD at 0 (the muxed block DCEs, the original four writes stand); at 1 the
+    // original writes DCE and the array is 7R1W. Cycle-identical (write values +
+    // timing unchanged, only the port shape changes).
+    const DCACHE_DATA_1RW: bit = 0;
     var miss_q      : logic         ;
     var load_sel_q  : logic         ;
     var srfo_sel_q  : logic         ;
@@ -1053,6 +1079,43 @@ pub module dcache #(
         ;
     }
 
+    // DCACHE_DATA_1RW: single muxed byte-write-enable write per data bank. The
+    // four writers are mutually exclusive per cycle, so one global (idx,new,msk)
+    // tuple describes whichever fires; only the per-bank fire (way select)
+    // differs. new/msk build the raw write data + per-byte mask so the SRAM
+    // byte-enable performs the merge with the retention read (data_k[idx]) at the
+    // write port — no separate old-line read (byte-identical to wr_dword+merge).
+    //   idle store (plain store-merge OR AMO/SC): dword `offset`, bytes i_wstrb;
+    //     amocas.q additionally writes the full hi dword (offset+1) = i_wdata_hi.
+    //   fill beat: full dword `fill_woff` = i_mem_rdata.
+    //   store drain: per-lane byte-merge (i_swstrb → mask, i_swdata → new).
+    let d1_idle_fire : logic = (wen_fires && i_wstrb_hi == 8'd0 && cache_hit) || wenl_fires;
+    let d1_fill_fire : logic = filling && i_memr_grant;
+    let d1_drain_fire: logic = store_can_drain;
+    let d1_aq_off_hi : logic<3> = offset + 3'd1;
+    let d1_amo_hi    : logic = wenl_fires && i_wen_excl_q;
+    let d1_idle_new  : logic<512> = wr_dword(512'd0, offset, i_wdata)
+     | (if d1_amo_hi ? wr_dword(512'd0, d1_aq_off_hi, i_wdata_hi) : 512'd0);
+    let d1_idle_msk  : logic<512> = wr_dword(512'd0, offset, be_expand(i_wstrb))
+     | (if d1_amo_hi ? wr_dword(512'd0, d1_aq_off_hi, {1'b1 repeat 64}) : 512'd0);
+    let d1_fill_new  : logic<512> = wr_dword(512'd0, fill_woff, i_mem_rdata);
+    let d1_fill_msk  : logic<512> = wr_dword(512'd0, fill_woff, {1'b1 repeat 64});
+    let d1_drain_new : logic<512> = {
+        i_swdata[7], i_swdata[6], i_swdata[5], i_swdata[4],
+        i_swdata[3], i_swdata[2], i_swdata[1], i_swdata[0]
+    };
+    let d1_drain_msk : logic<512> = {
+        be_expand(i_swstrb[7]), be_expand(i_swstrb[6]), be_expand(i_swstrb[5]), be_expand(i_swstrb[4]),
+        be_expand(i_swstrb[3]), be_expand(i_swstrb[2]), be_expand(i_swstrb[1]), be_expand(i_swstrb[0])
+    };
+    let d1_idx: logic<INDEX_W> = if d1_fill_fire ? fill_index : if d1_drain_fire ? sindex : index;
+    let d1_new: logic<512>     = if d1_fill_fire ? d1_fill_new : if d1_drain_fire ? d1_drain_new : d1_idle_new;
+    let d1_msk: logic<512>     = if d1_fill_fire ? d1_fill_msk : if d1_drain_fire ? d1_drain_msk : d1_idle_msk;
+    let d1_fire_0: logic = (d1_idle_fire && hit_0) || (d1_fill_fire && fill_way == 2'd0) || (d1_drain_fire && shit_0);
+    let d1_fire_1: logic = (d1_idle_fire && hit_1) || (d1_fill_fire && fill_way == 2'd1) || (d1_drain_fire && shit_1);
+    let d1_fire_2: logic = (d1_idle_fire && hit_2) || (d1_fill_fire && fill_way == 2'd2) || (d1_drain_fire && shit_2);
+    let d1_fire_3: logic = (d1_idle_fire && hit_3) || (d1_fill_fire && fill_way == 2'd3) || (d1_drain_fire && shit_3);
+
     always_ff (clk, rst) {
         if_reset {
             state        = State::IDLE;
@@ -1181,17 +1244,19 @@ pub module dcache #(
                                 rdata_3
                             ;
                             let merged: logic<64> = merge_dword(old, i_wstrb, i_wdata);
-                            if hit_0 {
-                                data_0[index] = wr_dword(data_0[index], offset, merged);
-                            }
-                            if hit_1 {
-                                data_1[index] = wr_dword(data_1[index], offset, merged);
-                            }
-                            if hit_2 {
-                                data_2[index] = wr_dword(data_2[index], offset, merged);
-                            }
-                            if hit_3 {
-                                data_3[index] = wr_dword(data_3[index], offset, merged);
+                            if !DCACHE_DATA_1RW {
+                                if hit_0 {
+                                    data_0[index] = wr_dword(data_0[index], offset, merged);
+                                }
+                                if hit_1 {
+                                    data_1[index] = wr_dword(data_1[index], offset, merged);
+                                }
+                                if hit_2 {
+                                    data_2[index] = wr_dword(data_2[index], offset, merged);
+                                }
+                                if hit_3 {
+                                    data_3[index] = wr_dword(data_3[index], offset, merged);
+                                }
                             }
                         }
                         // P9.2: a write-through MISS needs no local action
@@ -1221,23 +1286,31 @@ pub module dcache #(
                         // nested — a nested same-function call cannot be inlined.)
                         let aq_off_hi: logic<3> = offset + 3'd1;
                         if hit_0 {
-                            let base0: logic<512> = wr_dword(data_0[index], offset, lmerged);
-                            data_0[index]  = if i_wen_excl_q ? wr_dword(base0, aq_off_hi, i_wdata_hi) : base0;
+                            if !DCACHE_DATA_1RW {
+                                let base0: logic<512> = wr_dword(data_0[index], offset, lmerged);
+                                data_0[index] = if i_wen_excl_q ? wr_dword(base0, aq_off_hi, i_wdata_hi) : base0;
+                            }
                             dirty_0[index] = 1'b1;
                         }
                         if hit_1 {
-                            let base1: logic<512> = wr_dword(data_1[index], offset, lmerged);
-                            data_1[index]  = if i_wen_excl_q ? wr_dword(base1, aq_off_hi, i_wdata_hi) : base1;
+                            if !DCACHE_DATA_1RW {
+                                let base1: logic<512> = wr_dword(data_1[index], offset, lmerged);
+                                data_1[index] = if i_wen_excl_q ? wr_dword(base1, aq_off_hi, i_wdata_hi) : base1;
+                            }
                             dirty_1[index] = 1'b1;
                         }
                         if hit_2 {
-                            let base2: logic<512> = wr_dword(data_2[index], offset, lmerged);
-                            data_2[index]  = if i_wen_excl_q ? wr_dword(base2, aq_off_hi, i_wdata_hi) : base2;
+                            if !DCACHE_DATA_1RW {
+                                let base2: logic<512> = wr_dword(data_2[index], offset, lmerged);
+                                data_2[index] = if i_wen_excl_q ? wr_dword(base2, aq_off_hi, i_wdata_hi) : base2;
+                            }
                             dirty_2[index] = 1'b1;
                         }
                         if hit_3 {
-                            let base3: logic<512> = wr_dword(data_3[index], offset, lmerged);
-                            data_3[index]  = if i_wen_excl_q ? wr_dword(base3, aq_off_hi, i_wdata_hi) : base3;
+                            if !DCACHE_DATA_1RW {
+                                let base3: logic<512> = wr_dword(data_3[index], offset, lmerged);
+                                data_3[index] = if i_wen_excl_q ? wr_dword(base3, aq_off_hi, i_wdata_hi) : base3;
+                            }
                             dirty_3[index] = 1'b1;
                         }
                     }
@@ -1261,17 +1334,19 @@ pub module dcache #(
                     if i_memr_grant {
                         // Per-beat RMW: drop dword fill_woff of this beat into the
                         // line, accumulating across the 8-beat burst.
-                        if fill_way == 2'd0 {
-                            data_0[fill_index] = wr_dword(data_0[fill_index], fill_woff, i_mem_rdata);
-                        }
-                        if fill_way == 2'd1 {
-                            data_1[fill_index] = wr_dword(data_1[fill_index], fill_woff, i_mem_rdata);
-                        }
-                        if fill_way == 2'd2 {
-                            data_2[fill_index] = wr_dword(data_2[fill_index], fill_woff, i_mem_rdata);
-                        }
-                        if fill_way == 2'd3 {
-                            data_3[fill_index] = wr_dword(data_3[fill_index], fill_woff, i_mem_rdata);
+                        if !DCACHE_DATA_1RW {
+                            if fill_way == 2'd0 {
+                                data_0[fill_index] = wr_dword(data_0[fill_index], fill_woff, i_mem_rdata);
+                            }
+                            if fill_way == 2'd1 {
+                                data_1[fill_index] = wr_dword(data_1[fill_index], fill_woff, i_mem_rdata);
+                            }
+                            if fill_way == 2'd2 {
+                                data_2[fill_index] = wr_dword(data_2[fill_index], fill_woff, i_mem_rdata);
+                            }
+                            if fill_way == 2'd3 {
+                                data_3[fill_index] = wr_dword(data_3[fill_index], fill_woff, i_mem_rdata);
+                            }
                         }
                         if fill_count == 3'd7 {
                             // Fill complete. If a remote invalidate hit this line
@@ -1328,36 +1403,38 @@ pub module dcache #(
                 // Build the whole merged line combinationally (each populated lane
                 // byte-merges, the rest pass through), then one line write per hit
                 // way — the SRAM has no sub-word write port.
-                let s_old_line: logic<512> = if shit_0 ?
-                    data_0[sindex]
-                : if shit_1 ?
-                    data_1[sindex]
-                : if shit_2 ?
-                    data_2[sindex]
-                :
-                    data_3[sindex]
-                ;
-                let new_s_line: logic<512> = {
-                    if i_swstrb[7] != 8'd0 ? merge_dword(s_old_line[511:448], i_swstrb[7], i_swdata[7]) : s_old_line[511:448],
-                    if i_swstrb[6] != 8'd0 ? merge_dword(s_old_line[447:384], i_swstrb[6], i_swdata[6]) : s_old_line[447:384],
-                    if i_swstrb[5] != 8'd0 ? merge_dword(s_old_line[383:320], i_swstrb[5], i_swdata[5]) : s_old_line[383:320],
-                    if i_swstrb[4] != 8'd0 ? merge_dword(s_old_line[319:256], i_swstrb[4], i_swdata[4]) : s_old_line[319:256],
-                    if i_swstrb[3] != 8'd0 ? merge_dword(s_old_line[255:192], i_swstrb[3], i_swdata[3]) : s_old_line[255:192],
-                    if i_swstrb[2] != 8'd0 ? merge_dword(s_old_line[191:128], i_swstrb[2], i_swdata[2]) : s_old_line[191:128],
-                    if i_swstrb[1] != 8'd0 ? merge_dword(s_old_line[127:64], i_swstrb[1], i_swdata[1]) : s_old_line[127:64],
-                    if i_swstrb[0] != 8'd0 ? merge_dword(s_old_line[63:0], i_swstrb[0], i_swdata[0]) : s_old_line[63:0]
-                };
-                if shit_0 {
-                    data_0[sindex] = new_s_line;
-                }
-                if shit_1 {
-                    data_1[sindex] = new_s_line;
-                }
-                if shit_2 {
-                    data_2[sindex] = new_s_line;
-                }
-                if shit_3 {
-                    data_3[sindex] = new_s_line;
+                if !DCACHE_DATA_1RW {
+                    let s_old_line: logic<512> = if shit_0 ?
+                        data_0[sindex]
+                    : if shit_1 ?
+                        data_1[sindex]
+                    : if shit_2 ?
+                        data_2[sindex]
+                    :
+                        data_3[sindex]
+                    ;
+                    let new_s_line: logic<512> = {
+                        if i_swstrb[7] != 8'd0 ? merge_dword(s_old_line[511:448], i_swstrb[7], i_swdata[7]) : s_old_line[511:448],
+                        if i_swstrb[6] != 8'd0 ? merge_dword(s_old_line[447:384], i_swstrb[6], i_swdata[6]) : s_old_line[447:384],
+                        if i_swstrb[5] != 8'd0 ? merge_dword(s_old_line[383:320], i_swstrb[5], i_swdata[5]) : s_old_line[383:320],
+                        if i_swstrb[4] != 8'd0 ? merge_dword(s_old_line[319:256], i_swstrb[4], i_swdata[4]) : s_old_line[319:256],
+                        if i_swstrb[3] != 8'd0 ? merge_dword(s_old_line[255:192], i_swstrb[3], i_swdata[3]) : s_old_line[255:192],
+                        if i_swstrb[2] != 8'd0 ? merge_dword(s_old_line[191:128], i_swstrb[2], i_swdata[2]) : s_old_line[191:128],
+                        if i_swstrb[1] != 8'd0 ? merge_dword(s_old_line[127:64], i_swstrb[1], i_swdata[1]) : s_old_line[127:64],
+                        if i_swstrb[0] != 8'd0 ? merge_dword(s_old_line[63:0], i_swstrb[0], i_swdata[0]) : s_old_line[63:0]
+                    };
+                    if shit_0 {
+                        data_0[sindex] = new_s_line;
+                    }
+                    if shit_1 {
+                        data_1[sindex] = new_s_line;
+                    }
+                    if shit_2 {
+                        data_2[sindex] = new_s_line;
+                    }
+                    if shit_3 {
+                        data_3[sindex] = new_s_line;
+                    }
                 }
                 if shit_0 {
                     dirty_0[sindex] = 1'b1;
@@ -1370,6 +1447,29 @@ pub module dcache #(
                 }
                 if shit_3 {
                     dirty_3[sindex] = 1'b1;
+                }
+            }
+
+            // DCACHE_DATA_1RW: the single muxed byte-write-enable write per bank.
+            // At most one of {plain store-merge, AMO/SC, fill beat, store drain}
+            // fires this cycle, and each targets a one-hot way, so per bank at
+            // most one d1_fire_k is set. The masked write folds the retention read
+            // data_k[d1_idx] into the SRAM byte-enable → 1 write port + no old-line
+            // read (data 8R4W → 7R1W). Byte-identical to the four gated writes:
+            // for the firing bank data_k[d1_idx] IS the old line, and the mask
+            // reproduces wr_dword(old, off, merge_dword(...)) exactly.
+            if DCACHE_DATA_1RW {
+                if d1_fire_0 {
+                    data_0[d1_idx] = (data_0[d1_idx] & ~d1_msk) | (d1_new & d1_msk);
+                }
+                if d1_fire_1 {
+                    data_1[d1_idx] = (data_1[d1_idx] & ~d1_msk) | (d1_new & d1_msk);
+                }
+                if d1_fire_2 {
+                    data_2[d1_idx] = (data_2[d1_idx] & ~d1_msk) | (d1_new & d1_msk);
+                }
+                if d1_fire_3 {
+                    data_3[d1_idx] = (data_3[d1_idx] & ~d1_msk) | (d1_new & d1_msk);
                 }
             }
 
