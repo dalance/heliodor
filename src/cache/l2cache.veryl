@@ -369,16 +369,23 @@ pub module l2cache #(
     for l in 0..8 :gen_cdata {
         assign o_cdata[l] = if L2_SYNC_READ ? c_line_q[l*64 +: 64] : c_line_raw[l*64 +: 64];
     }
-    // P3.b: the write-hit merge's OLD line. At =1 it comes from the single sync
-    // read port (c_line_q, spec-read one cycle earlier — NO separate w_index read
-    // port). At =0 the merge keeps its own combinational read @w_index (the R2
-    // port). Const-guarded STATEMENT blocks (not a ternary) so the w_index read
-    // DCEs at =1 → the array reports exactly ONE read net (1R1W).
+    // P3.b: the write-hit merge's OLD line. This feeds ONLY the =0 two-write
+    // path (L2_PORTS_1R1W=0). At the default (=1) the merge is a byte-write-enable
+    // (P3.b-B): the SRAM byte-enable performs the merge with the retention read at
+    // the write port, so this separate @w_index read is not needed and DCEs — the
+    // array is 1R1W. (The dead L2_READ_1R1W spec-read scaffold sources it from
+    // c_line_q; that 2-cycle path was found non-atomic and is not viable.)
     var w_old_line: logic<512>;
     always_comb {
+        // P3.b-B byte-write-enable: at the default (L2_PORTS_1R1W=1) the merge is
+        // done by the SRAM byte-enable — the retention read is at the write port —
+        // so NO separate old-line read @w_index exists (this default constant
+        // stands, the data reads below DCE, and the array is 1R1W).
+        // w_old_line/w_merged_line feed only the =0 two-write path.
+        w_old_line = 512'd0;
         if L2_READ_1R1W {
             w_old_line = c_line_q;
-        } else {
+        } else if !L2_PORTS_1R1W {
             if w_tm_0 {
                 w_old_line = data_0[w_index];
             } else if w_tm_1 {
@@ -649,6 +656,29 @@ pub module l2cache #(
         i_inst_data[7], i_inst_data[6], i_inst_data[5], i_inst_data[4],
         i_inst_data[3], i_inst_data[2], i_inst_data[1], i_inst_data[0]
     };
+    // P3.b-B byte-write-enable: instead of read-merge-write (which needs an
+    // old-line read port = R2), the merge write hands the RAW write data plus a
+    // per-byte write mask to the SRAM byte-enable. w_raw_line is the unmerged
+    // write data; w_wstrb_line expands i_wstrb (one bit per byte) to 512 bits
+    // (each byte's mask replicated across its 8 bits) — the exact per-byte select
+    // write_merged does, but performed by the mask so no old-line read is needed.
+    let w_raw_line: logic<512> = {
+        i_wdata[7], i_wdata[6], i_wdata[5], i_wdata[4],
+        i_wdata[3], i_wdata[2], i_wdata[1], i_wdata[0]
+    };
+    var w_wmask: logic<64> [8];
+    always_comb {
+        for l in 0..8 {
+            w_wmask[l] = {
+                i_wstrb[l][7] repeat 8, i_wstrb[l][6] repeat 8, i_wstrb[l][5] repeat 8, i_wstrb[l][4] repeat 8,
+                i_wstrb[l][3] repeat 8, i_wstrb[l][2] repeat 8, i_wstrb[l][1] repeat 8, i_wstrb[l][0] repeat 8
+            };
+        }
+    }
+    let w_wstrb_line: logic<512> = {
+        w_wmask[7], w_wmask[6], w_wmask[5], w_wmask[4],
+        w_wmask[3], w_wmask[2], w_wmask[1], w_wmask[0]
+    };
     // W1 (merge) data-write condition — a write hit that is not a misaligned
     // invalidate. (mis_store writes no data, only invalidates lv/shr/own.)
     let mrg_data_wr: logic = i_wen && w_any_tm && !mis_store;
@@ -667,10 +697,24 @@ pub module l2cache #(
     let wr1rw_idx_1: logic<9>   = if ins1rw_1 ? in_index : w_index;
     let wr1rw_idx_2: logic<9>   = if ins1rw_2 ? in_index : w_index;
     let wr1rw_idx_3: logic<9>   = if ins1rw_3 ? in_index : w_index;
-    let wr1rw_dat_0: logic<512> = if ins1rw_0 ? inst_line : w_merged_line;
-    let wr1rw_dat_1: logic<512> = if ins1rw_1 ? inst_line : w_merged_line;
-    let wr1rw_dat_2: logic<512> = if ins1rw_2 ? inst_line : w_merged_line;
-    let wr1rw_dat_3: logic<512> = if ins1rw_3 ? inst_line : w_merged_line;
+    // P3.b-B byte-write-enable: the bank's masked write is
+    //   data_k[idx] = (data_k[idx] & ~msk) | (new & msk)
+    // where the RETENTION read data_k[idx] is at the WRITE index (= the merge's
+    // w_index or the install's in_index). A merge writes RAW data with mask=wstrb
+    // (the SRAM byte-enable performs the byte-merge — no old-line read port); an
+    // install writes the full line with mask=all-ones (the retained read is
+    // unused). Byte-identical to the read-merge form: for the firing merge bank
+    // data_k[w_index] IS the old line, so `(old & ~wstrb)|(raw & wstrb)` equals
+    // w_merged_line; for an install mask='1 selects new unconditionally. The
+    // synthesizer folds the retention read into the byte-enable → 1R1W.
+    let wr1rw_new_0: logic<512> = if ins1rw_0 ? inst_line : w_raw_line;
+    let wr1rw_new_1: logic<512> = if ins1rw_1 ? inst_line : w_raw_line;
+    let wr1rw_new_2: logic<512> = if ins1rw_2 ? inst_line : w_raw_line;
+    let wr1rw_new_3: logic<512> = if ins1rw_3 ? inst_line : w_raw_line;
+    let wr1rw_msk_0: logic<512> = if ins1rw_0 ? '1 : w_wstrb_line;
+    let wr1rw_msk_1: logic<512> = if ins1rw_1 ? '1 : w_wstrb_line;
+    let wr1rw_msk_2: logic<512> = if ins1rw_2 ? '1 : w_wstrb_line;
+    let wr1rw_msk_3: logic<512> = if ins1rw_3 ? '1 : w_wstrb_line;
     let wr1rw_v_0: logic = (mrg_data_wr && w_tm_0) || ins1rw_0;
     let wr1rw_v_1: logic = (mrg_data_wr && w_tm_1) || ins1rw_1;
     let wr1rw_v_2: logic = (mrg_data_wr && w_tm_2) || ins1rw_2;
@@ -920,16 +964,16 @@ pub module l2cache #(
             // block DCEs (const-false) and the original writes above stand.
             if L2_PORTS_1R1W {
                 if wr1rw_v_0 {
-                    data_0[wr1rw_idx_0] = wr1rw_dat_0;
+                    data_0[wr1rw_idx_0] = (data_0[wr1rw_idx_0] & ~wr1rw_msk_0) | (wr1rw_new_0 & wr1rw_msk_0);
                 }
                 if wr1rw_v_1 {
-                    data_1[wr1rw_idx_1] = wr1rw_dat_1;
+                    data_1[wr1rw_idx_1] = (data_1[wr1rw_idx_1] & ~wr1rw_msk_1) | (wr1rw_new_1 & wr1rw_msk_1);
                 }
                 if wr1rw_v_2 {
-                    data_2[wr1rw_idx_2] = wr1rw_dat_2;
+                    data_2[wr1rw_idx_2] = (data_2[wr1rw_idx_2] & ~wr1rw_msk_2) | (wr1rw_new_2 & wr1rw_msk_2);
                 }
                 if wr1rw_v_3 {
-                    data_3[wr1rw_idx_3] = wr1rw_dat_3;
+                    data_3[wr1rw_idx_3] = (data_3[wr1rw_idx_3] & ~wr1rw_msk_3) | (wr1rw_new_3 & wr1rw_msk_3);
                 }
             }
         }
