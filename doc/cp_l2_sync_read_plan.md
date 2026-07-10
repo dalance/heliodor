@@ -176,16 +176,45 @@ reorders same-bank L2 install-vs-store, shifting the non-barrier-deterministic N
 here FAVORABLY. A lost install would never reach clean SBI shutdown, so this is valid rescheduling,
 not dropped work). **Effectively FREE** (write ports halved, +0 CP, ≤0 IPC) → flipped **default-on**.
 
-### P3.b — read ports 2R→1R (R2-fold) ▶️ NEXT
+### P3.b — read ports 2R→1R (R2-fold) — ⚠️ SCAFFOLD DONE, FLIP BLOCKED (2 findings)
 
-**R2 (merge read-old) folds onto the read port as a read-modify-write.** A write-hit merge is a
-read-old-then-write at the SAME index `w_index` → a 2-cycle RMW: read `w_index` cycle N (via the
-sync read port, arbitrated against the R1 lookup — stall the lookup or the write), merge+write
-cycle N+1. This removes R2 as a separate read port → the true **1R1W** (1 read lookup + 1 write).
-The hard part (same as dcache §12.3's "read-port arbitration", `cp_dcache_sync_read_plan.md`) is
-serializing R1 (lookup, `c_index`) vs R2 (`w_index`) on the single read port; the bus write is
-back-pressurable via `wgrant_ok` (hold the store during its 2-cycle RMW). **Verify:** full SMP
-ladder + IPC (the lookup-stall may cost — measure). Down-payment: R1 is already sync (P2).
+**Scaffold ✅ (`ea0e823`, DEAD byte-identical, const `L2_READ_1R1W`).** Design = **atomic accept,
+no stale-read window**: a requested partial write-hit whose old line is not yet in `c_line_q` HOLDS
+the grant (SoC `wgrant_ok && !l2_w_spec_hold`, `l2_w_spec_hold = wv_req_on && o_w_hit &&
+!o_w_spec_ready`). l2cache speculatively reads the store's `w_index` on a **free** read-port cycle
+(`!i_cren` = mem_ctrl not looking up → the lookup's `c_line_q` timeline is undisturbed, **no
+mem_ctrl change**); the next cycle the old line is in `c_line_q` and the store is granted → directory
++ merged data write the SAME cycle (atomic). `write_merged` sources `w_lold` from `c_line_q` at =1.
+Two comb loops fixed: (a) the SoC hold uses RAW l2 pieces (`o_w_hit`/`o_w_spec_ready`) not a bundled
+output; (b) `o_w_hit` must NOT use `i_wstrb_hi` (grant-gated at the SoC via `bus_wgrant[h]`).
+Byte-identical at =0: default 252/0, synth 2R1W CP-neutral, N1 boots + N2 SMP boot cy-exact.
+
+**🚨 FLIP (=1) BLOCKED — two problems (2026-07-10):**
+1. **litmus N2 LIVELOCK** (`cy=01c9c380 tohost=0 pass=0` timeout — same signature as the P2 first
+   attempt). A coherence bug in the 2-cycle store. Prime suspect: an **install to the store's
+   `w_index` during the hold** (before the atomic accept). The spec-read at cycle M reads the OLD
+   line; if an install writes `w_index` at M's edge, the merge at M+1 (old + store dword) clobbers
+   the install. mem_ctrl's install-suppress is by the *granted* write, but during the hold the store
+   is NOT yet granted → the install is not suppressed. Need to suppress installs (or re-spec-read)
+   against the SELECTED (pre-grant) write line, or make the busy/held line block installs. Other
+   suspects: recall/WB interaction with the held store; the spec-read stealing a cycle a spinner needs.
+2. **synth shows `512×512 3R1W ×4`, NOT 1R1W** — the fold *added* read ports. The muxed read
+   (`c_line_raw = if L2_READ_1R1W ? way-mux(data_*[rd_index]) : ctm-chain(data_*[c_index])`) does NOT
+   collapse to 1 read port in veryl synth: at =1 the `rd_index` runtime mux reads at BOTH `w_index`
+   and `c_index`, AND the untaken ternary branches' reads (ctm `c_index`, `write_merged`'s
+   combinational `w_index`) are **not DCE'd for port inference**. Contrast P3.a's WRITE fold, which
+   DID collapse 2W→1W — because it used a **separate `if L2_PORTS_1R1W { muxed write } / if
+   !… { original writes }` block** (untaken block fully DCEs), not a `? :` ternary over two read
+   expressions. **Fix direction:** restructure the read like P3.a's write — a single `if
+   L2_READ_1R1W { c_line_q <= data_k[rd_index] } else { … original ctm read }`-style split so the
+   =1 path has exactly ONE read index net per bank and the =0 reads DCE at =1; verify with
+   `--dump-area` that it reports `1R1W` before chasing the livelock.
+
+**Order for the next session:** (i) fix the port structure first (get `--dump-area` to `1R1W` at =1,
+still byte-id at =0), THEN (ii) debug the livelock (install-vs-held-store race) with the litmus N2
+$display trace. The scaffold is committed at =0 (byte-id, safe); the flip const is the only change.
+The hard part is the same class as dcache §12.3's read-port arbitration (SMP-critical). IPC (the
+store 2-cycle RMW throttle) is measured after the flip is coherence-clean.
 
 **Note (tags):** L2 tags (`512×49 5R1W`) + the directory (sharers/owned) stay flops — a real chip
 keeps the coherence directory associatively-read (registering it livelocks, §4.1). P3 is DATA-only.
