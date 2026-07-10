@@ -189,32 +189,60 @@ Two comb loops fixed: (a) the SoC hold uses RAW l2 pieces (`o_w_hit`/`o_w_spec_r
 output; (b) `o_w_hit` must NOT use `i_wstrb_hi` (grant-gated at the SoC via `bus_wgrant[h]`).
 Byte-identical at =0: default 252/0, synth 2R1W CP-neutral, N1 boots + N2 SMP boot cy-exact.
 
-**🚨 FLIP (=1) BLOCKED — two problems (2026-07-10):**
-1. **litmus N2 LIVELOCK** (`cy=01c9c380 tohost=0 pass=0` timeout — same signature as the P2 first
-   attempt). A coherence bug in the 2-cycle store. Prime suspect: an **install to the store's
-   `w_index` during the hold** (before the atomic accept). The spec-read at cycle M reads the OLD
-   line; if an install writes `w_index` at M's edge, the merge at M+1 (old + store dword) clobbers
-   the install. mem_ctrl's install-suppress is by the *granted* write, but during the hold the store
-   is NOT yet granted → the install is not suppressed. Need to suppress installs (or re-spec-read)
-   against the SELECTED (pre-grant) write line, or make the busy/held line block installs. Other
-   suspects: recall/WB interaction with the held store; the spec-read stealing a cycle a spinner needs.
-2. **synth shows `512×512 3R1W ×4`, NOT 1R1W** — the fold *added* read ports. The muxed read
-   (`c_line_raw = if L2_READ_1R1W ? way-mux(data_*[rd_index]) : ctm-chain(data_*[c_index])`) does NOT
-   collapse to 1 read port in veryl synth: at =1 the `rd_index` runtime mux reads at BOTH `w_index`
-   and `c_index`, AND the untaken ternary branches' reads (ctm `c_index`, `write_merged`'s
-   combinational `w_index`) are **not DCE'd for port inference**. Contrast P3.a's WRITE fold, which
-   DID collapse 2W→1W — because it used a **separate `if L2_PORTS_1R1W { muxed write } / if
-   !… { original writes }` block** (untaken block fully DCEs), not a `? :` ternary over two read
-   expressions. **Fix direction:** restructure the read like P3.a's write — a single `if
-   L2_READ_1R1W { c_line_q <= data_k[rd_index] } else { … original ctm read }`-style split so the
-   =1 path has exactly ONE read index net per bank and the =0 reads DCE at =1; verify with
-   `--dump-area` that it reports `1R1W` before chasing the livelock.
+**Problem 2 (synth 3R1W) — ✅ FIXED (`8e01034`, 2026-07-10).** The muxed read as a `? :` ternary
+leaves BOTH sides' array reads in the netlist (untaken branch not DCE'd for port inference → 3
+read nets: `rd_index`, `c_index`, `w_index`). Restructured the read into const-guarded STATEMENT
+blocks (like P3.a's write fold): `if L2_READ_1R1W { c_line_raw = way-mux(data_*[rd_index]) } else {
+ctm-chain @c_index }`, and hoisted the merge's old line into a `w_old_line` var read the same way.
+The const-false block DCEs wholesale → **`--dump-area` reports `512×512 1R1W ×4` at =1** (2R1W at =0,
+byte-identical: default 252/0, litmus N2 `cy=0022f150` exact; CP 26.340 ns unchanged). Step (i) done.
 
-**Order for the next session:** (i) fix the port structure first (get `--dump-area` to `1R1W` at =1,
-still byte-id at =0), THEN (ii) debug the livelock (install-vs-held-store race) with the litmus N2
-$display trace. The scaffold is committed at =0 (byte-id, safe); the flip const is the only change.
-The hard part is the same class as dcache §12.3's read-port arbitration (SMP-critical). IPC (the
-store 2-cycle RMW throttle) is measured after the flip is coherence-clean.
+**Problem 1 (functional flip) — 🚫 BLOCKED, root cause is a REAL RTL non-atomicity in the 2-cycle
+store (2026-07-10 deep session).** Two distinct issues, in order:
+
+- **1a. Livelock = arbiter ROTATION THRASH (root cause CONFIRMED by trace, FIXABLE).** The
+  memory_bus write-channel round-robin advances `last_granted_w` on **selection (`any_wantw`) every
+  cycle, NOT on the actual grant** — so when both harts have pending write-hit stores the selection
+  oscillates 1:1 each cycle. The single-entry spec state (`rmw_spec_waddr_q`) is always for the store
+  selected LAST cycle, never the one selected NOW → `spec_ready` never coincides with the grant →
+  neither store grants = livelock (`cy=01c9c380` timeout). Trace was decisive: `waddr` alternated
+  `80002000`↔`80003000` every cycle, `cren=0` (NOT starvation), `specrd=1`, `specrdy=0` forever.
+  **Two independent fixes both work:** (i) a **write-RR pin** (freeze `last_granted_w` while the
+  selected store spec-holds, SoC `wsel_hold`), or (ii) a **per-hart spec cache** (index `spec_*_q` by
+  the pre-grant selected hart `i_w_sel_hart = bus_dramw_sel`, so each hart's spec-read persists across
+  the other's selection and the RR rotates freely). Both eliminate the livelock (30M timeout →
+  ~2.7M completion).
+
+- **1b. Underneath the livelock: litmus N2 test 5 (LB+datadep) FORBIDDEN OUTCOME (1,1) — a REAL RTL
+  bug in the 2-cycle store, INDEPENDENT of the arbiter.** Ruled out, one by one:
+  - **NOT stale old-line:** a dedicated `spec_line_q` register (decoupled from the shared `c_line_q`)
+    made ZERO difference — cy-exact `0x2959f0`.
+  - **NOT install-clobber (#1):** an install-to-spec'd-index detector fired **0 times**.
+  - **NOT stale-after-recall via write (#2):** a general spec-invalidation (clear the spec when ANY
+    muxed write — install OR recall WB — hits the spec'd index) made ZERO difference — cy-exact.
+  - **NOT the arbiter pin's reordering:** the **per-hart spec cache (pin REMOVED)** still fails —
+    `cy` shifted (`0x2932e0`) but SAME forbidden outcome. So the arbiter mechanism is exonerated.
+  - **NOT a cc-sim artifact:** `--backend cranelift` reproduces it **cy-exact** (`0x2932e0`). Both
+    backends agree ⇒ real RTL.
+  **Conclusion:** the bug is intrinsic to the **spec-read-at-M / grant-at-M+1 two-cycle store**. A
+  merely-delayed store is a legal RVWMO interleaving and could NOT create a forbidden outcome — so the
+  2-cycle window is **not truly atomic** w.r.t. coherence somewhere the merge/directory/invalidate
+  span the M→M+1 boundary. The "atomic accept, no stale-read window" premise of the P3.b design is
+  **false in practice**. The specific non-atomicity was not pinned by inspection (the data-path is
+  provably clean: merge value correct, spec-read never displaces a lookup capture since `do_spec_read`
+  requires `!i_cren`).
+
+**Verdict on the spec-read approach: NOT VIABLE.** A correct L2 data 1R1W needs a fundamentally
+different mechanism, e.g. (A) **line-lock the RMW** — hold the store's line locked (block recalls /
+installs / other-writes AND all reads of it) for the whole 2-cycle read-modify-write so the write is
+genuinely atomic (a real coherence addition, larger than dcache §12.3), or (B) a **byte-write-enable
+SRAM model** — give the 1R1W macro a per-lane write mask so a partial write needs no read-old at all
+(no R2, no spec-read, no 2-cycle) — but the RTL `data[i] = merge(data[i], …)` still reads `data[i]`,
+so whether veryl synth infers a byte-enabled 1RW vs a 2-port is an open question (check `conv/ram.rs`
+byte-enable inference). Option (B) is simpler and eliminates the whole bug class if synth cooperates.
+
+**IPC is moot** until the flip is coherence-clean; the port-fix (`8e01034`) already demonstrates the
+1R1W macro in synth, so the FINAL-structure realism goal is partially banked regardless.
 
 **Note (tags):** L2 tags (`512×49 5R1W`) + the directory (sharers/owned) stay flops — a real chip
 keeps the coherence directory associatively-read (registering it livelocks, §4.1). P3 is DATA-only.
