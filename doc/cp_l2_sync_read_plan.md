@@ -124,7 +124,8 @@ mirror const (flip together).
   synth counts the array + output register separately; the RTL is now the canonical sync-SRAM read
   pattern (`c_line_q <= data[c_index]`) that a real SRAM compiler folds into a macro with an output
   register. The **synchronous read** (the "synchronous" of goal (b)) is done, cycle-identical + CP-neutral.
-- **P3 — L2 data port reduction 2R2W → 1R1W** (the true single-port SRAM macro). ▶️ NEXT (see §8).
+- **P3 — L2 data port reduction 2R2W → 1R1W** (the true single-port SRAM macro). Split into
+  **P3.a** (write ports 2W→1W, ✅ DONE) + **P3.b** (read ports 2R→1R via R2-fold, ▶️ NEXT). See §8.
 
 ## 7. Anchors
 - L2 lookup c-port (combinational read): `l2cache.veryl:216-260`.
@@ -143,24 +144,48 @@ synchronous; the array still infers `512×512 2R2W ×4` because it has **4 acces
 | **W1** write-hit merge | `data_*[w_index] = w_merged_line` | `w_index` | 692–698 |
 | **W2** install (gathered DRAM line) | `data_*[in_index] = inst_line` | `in_index` | 721–739 |
 
-**Target 1R1W = 1 read port + 1 write port.** The two writes (W1 merge, W2 install) are already
-mutually structured but at different indices; the two reads (R1 lookup, R2 merge-read-old) are
-genuinely concurrent at different indices (`c_index` vs `w_index`) → the hard part (same as dcache
-§12.3's "read-port arbitration", `cp_dcache_sync_read_plan.md`).
+**Target 1R1W = 1 read port + 1 write port.** The two writes (W1 merge, W2 install) are at
+different indices; the two reads (R1 lookup, R2 merge-read-old) are genuinely concurrent at
+different indices (`c_index` vs `w_index`). Split into P3.a (writes 2→1) + P3.b (reads 2→1).
 
-**Approach (functional flip, const-gated `L2_PORTS_1R1W`, DEAD→flip):**
-1. **R2 (merge read-old) folds onto the WRITE port as a read-modify-write.** A write-hit merge is a
-   read-old-then-write at the SAME index `w_index` → a 1R1W macro's write port with read-old (or a
-   2-cycle RMW: read `w_index` cycle N, write the merge cycle N+1). This removes R2 as a separate
-   read port → **1 read (lookup) + 1 write (merge/install, serialized)**. The write serialization
-   (W1 vs W2, different indices, rare collision) goes through a small **write-merge/arbitration
-   buffer** or a 1-cycle stall (installs already gate via `o_iv_*`/`inst_go`; add merge-vs-install
-   arbitration).
-2. **Verify:** this changes L2 write/merge timing → the **full SMP coherence ladder** (arch 252,
-   litmus N2/N4, SMP boot N2/N4, Verilator) + IPC (the RMW/arbitration may add stalls — measure).
-   Unlike P2 (cycle-identical), P3 is a genuine functional change (IPC cost expected, bounded).
-3. **Down-payment available:** the read side is already sync (P2), so R1 is macro-ready; P3 only
-   needs the R2-fold + write-arbitration.
+### P3.a — write ports 2W→1W ✅ DONE (`c36cc2c` scaffold + flip)
+
+Each bank `data_0..3` is a SEPARATE array → its OWN 1RW write port. Bank k's write MUXES
+{install→`in_index`/`inst_line` if `install_way==k`, else merge→`w_index`/`w_merged_line`} into ONE
+per-bank write statement (const-gated `L2_PORTS_1R1W`, `l2cache.veryl`). A different-bank
+merge+install co-fire needs no arbitration (each bank writes its own port); the ONLY real contention
+is the **SAME bank** (`w_tm_way == install_way`), where the **install YIELDS to the merge** via a new
+`l2→mem_ctrl` signal `o_inst_port_busy` (folded into `inst_blocked` = hold+retry the install; the
+merge writes, the install retries next cycle). `o_inst_port_busy` is computed WITHOUT `i_inst_v`
+(from `install_way`, comb on the registered slot addr) so it does NOT close a comb loop through
+`o_l2_inst_v`.
+
+> ⚠️ First flip attempt vetoed the **bus write** via the SoC `wgrant_ok` gate on `l2_inst_v` — that
+> DID form a combinational loop (`o_l2_inst_v` depends on the bus write through mem_ctrl, so gating
+> the write grant on it loops). The install-yields design (write→install dependency) does not loop.
+
+**DEAD at =0 (byte-identical):** the muxed block DCEs, the original two writes stand,
+`o_inst_port_busy=0`. **Flip =1:** array infers `512×512 2R1W ×4` (was 2R2W). **Full ladder (=1):**
+default 252/0 (litmus N2 `cy=0022f150` exact); SoC synth CP **26.340 ns unchanged** (L2 off the
+critical path); N1 boots 4/4 **cy-EXACT** (`00b7b740`/`01217590`/`013d8910`/`01402120` — zero IPC);
+litmus N4 `cy=00535020` pass=1 (RVWMO exact); N2 SMP boot `cy=00fd24b0` pass=1 (net cy-exact — the
+mid-boot probe interleaving shifts, the install-yield IS a real functional change, but the
+barrier-synchronized boot converges to the same total cycle); N4 SMP boot `cy=01450320` pass=1
+(clean shutdown `r3=0xaa`; was `cy=015d6d20`=22.9M at =0 → 21.3M, **−1.6M/−7%**: the install-yield
+reorders same-bank L2 install-vs-store, shifting the non-barrier-deterministic N4-boot interleaving —
+here FAVORABLY. A lost install would never reach clean SBI shutdown, so this is valid rescheduling,
+not dropped work). **Effectively FREE** (write ports halved, +0 CP, ≤0 IPC) → flipped **default-on**.
+
+### P3.b — read ports 2R→1R (R2-fold) ▶️ NEXT
+
+**R2 (merge read-old) folds onto the read port as a read-modify-write.** A write-hit merge is a
+read-old-then-write at the SAME index `w_index` → a 2-cycle RMW: read `w_index` cycle N (via the
+sync read port, arbitrated against the R1 lookup — stall the lookup or the write), merge+write
+cycle N+1. This removes R2 as a separate read port → the true **1R1W** (1 read lookup + 1 write).
+The hard part (same as dcache §12.3's "read-port arbitration", `cp_dcache_sync_read_plan.md`) is
+serializing R1 (lookup, `c_index`) vs R2 (`w_index`) on the single read port; the bus write is
+back-pressurable via `wgrant_ok` (hold the store during its 2-cycle RMW). **Verify:** full SMP
+ladder + IPC (the lookup-stall may cost — measure). Down-payment: R1 is already sync (P2).
 
 **Note (tags):** L2 tags (`512×49 5R1W`) + the directory (sharers/owned) stay flops — a real chip
 keeps the coherence directory associatively-read (registering it livelocks, §4.1). P3 is DATA-only.
