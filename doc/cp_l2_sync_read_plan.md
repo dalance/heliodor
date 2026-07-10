@@ -244,5 +244,49 @@ byte-enable inference). Option (B) is simpler and eliminates the whole bug class
 **IPC is moot** until the flip is coherence-clean; the port-fix (`8e01034`) already demonstrates the
 1R1W macro in synth, so the FINAL-structure realism goal is partially banked regardless.
 
+### P3.b-B — byte-write-enable path — ⚙️ CHOSEN (user: "B"); it is a VERYL SYNTH FEATURE, not a tweak
+
+User picked (B). Investigation of `veryl/crates/synthesizer/` (`conv/ram.rs`, `conv.rs`,
+`conv/expression.rs`) — the "cheap `conv/ram.rs` check" — shows byte-write-enable is **not natively
+inferred** and needs a real feature. Findings:
+- `RamWritePort { addr, data, enable }` has **no per-bit mask** — only a whole-port write enable.
+- `read_pattern_ok` (ram.rs:201) counts one read port per distinct read-address SIGNATURE; `read_ram`
+  (expression.rs:368) ALLOCATES a `RamRead` port for each. A partial-write `data[i] = (data[i] & ~m) |
+  (d & m)` makes the RHS `data[i]` a read at index `i` → it becomes a read port. **That self-read IS
+  the 2R1W second port** (the R2 merge-read).
+- A gate NETLIST must compute the merged value, which needs the old bits → the read port is
+  unavoidable **unless** the macro carries a mask so the netlist passes `(d, m)` and skips the merge.
+- **Feature scope (the real work):** (1) add a dynamic per-bit `mask: Vec<NetId>` to `RamWritePort`;
+  (2) in `record_ram_write` (statement.rs:119), bit-decompose the synthesized RHS `src` — for each
+  bit, if `src[bit]` is the `RamRead` of `data[i][bit]` at the write's own index, that bit is RETAINED
+  (mask=0) and its read is dropped; otherwise written (mask=1, data=src[bit]); a masked write has ≥1
+  retained bit; (3) drop the now-orphaned retention read port from `read_pattern_ok`/`read_ram`
+  counting; (4) emit the byte-enable in the SV/area backend so `--dump-area` reports **1R1W** (the
+  masked write is still one write port). The heliodor merge is per-byte `wstrb ? wdata : old`, so the
+  extracted mask is DYNAMIC (= wstrb expanded). ~150-250 lines across 4-5 files + a synthetic-module
+  test (small reset-less array, one lookup read + one masked write → expect 1R1W).
+- **heliodor side (byte-identical):** the current P3.a merge reads `data[w_index]` (fixed) while the
+  muxed write is at `wr1rw_idx` (= `mux(in_index, w_index)`) — DIFFERENT nets, so the self-read won't
+  match the write index. Restructure the write so the RETENTION read is at the WRITE index
+  (`data[wr1rw_idx] = (data[wr1rw_idx] & ~mask) | (newdata & mask)`, merge → mask=wstrb, install →
+  mask=all-ones). For a merge `wr1rw_idx == w_index` so the old line is identical; for an install
+  mask=ff so the retained read is unused → byte-identical to `8e01034`. Then synth sees read index ==
+  write index → the feature folds R2 into the byte-write-enable → 1R1W.
+- **Why (B) beats the spec-read design:** the heliodor RTL stays the **single-cycle P3.a store**
+  (coherent, no 2-cycle window, none of the 1b non-atomicity). All the realism gain is in the SRAM
+  MODEL, none in the coherence path. ▶️ Next: build the veryl feature (validate on a synthetic module
+  first), then the heliodor restructure, then `--dump-area` = 1R1W + full ladder byte-id.
+- **PoC CONFIRMED (2026-07-10):** a synthetic `bwe_test` module — a reset-less `logic<512>[512]` with
+  one lookup read `data[i_raddr]` + one canonical masked write `data[i_waddr] = (data[i_waddr] &
+  ~i_wmask) | (i_wdata & i_wmask)` — synths to **`512×512 2R1W ×1`** today (the `data[i_waddr]`
+  retention read IS the 2nd port). Target after the feature: `1R1W`. Use the SAME canonical
+  `(old & ~m) | (d & m)` form in BOTH the PoC and the heliodor restructure so the feature detects ONE
+  pattern (not arbitrary per-byte muxes). **Key subtlety:** `record_ram_write` (statement.rs:136) gets
+  the ALREADY-synthesized `src` — the retention read is a `RamRead` port by then. So detect the
+  `(old & ~m) | (d & m)` pattern at the AIR level in the Assign handler BEFORE synthesizing the RHS
+  (synthesize only `d` and `m`, record a masked write, never allocate the retention read). `RamWritePort`
+  needs a `mask: Vec<NetId>`; the SV backend + area report count a byte-write-enable write as ONE write
+  port. Estimate: a focused dedicated session — a real veryl feature, not a session tail-end task.
+
 **Note (tags):** L2 tags (`512×49 5R1W`) + the directory (sharers/owned) stay flops — a real chip
 keeps the coherence directory associatively-read (registering it livelocks, §4.1). P3 is DATA-only.
