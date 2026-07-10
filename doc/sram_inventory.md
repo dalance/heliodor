@@ -139,3 +139,22 @@ keystone campaign's de-risking warm-up are the **same RTL change**.
     next-forward genuinely concurrent → time-multiplex with stalls = functional, IPC cost, full SMP
     ladder). Same SMP-critical class as the sync-read; the capture-fold is the byte-identical
     down-payment toward the "banked 1RW + write-merge buffer" row-1 target.
+
+- **✅ D$ data write-collapse → true 1-write byte-write-enable SRAM: 8R4W → 7R1W (2026-07-11,
+  `b5a9976`, cycle-identical).** The four data writers (plain store-merge, AMO/SC commit, fill
+  beat, store drain) are **mutually exclusive per cycle** (store-merge/AMO/drain are `state==IDLE`
+  + `i_wen`-exclusive; fill is `state==FILL`) and each targets a **one-hot** way, so per bank at
+  most one fires. They collapse into ONE muxed **byte-write-enable** write per bank
+  (`data_k[idx] = (data_k[idx] & ~msk) | (new & msk)`, `DCACHE_DATA_1RW`); the retention read
+  `data_k[idx]` folds into the SRAM byte-enable (same veryl inference as L2 P3.b-B), and the
+  store-drain old-line read — the **only** read at `sindex` — folds away too. Net: **write ports
+  4→1, one read dropped → data `64×512 8R4W → 7R1W ×4`** (FF 160645→157573). No priority resolution
+  (the writers never co-fire), so the masked write reproduces `wr_dword(old, off, merge_dword(...))`
+  exactly → cycle-identical. Verified: default 252/0, litmus N2 `0022f150` / N4 `00535020` (exact,
+  no RVWMO forbidden outcome), N1 boot 7.1v `013d8910` / 6.6 `01402120` (exact), SMP N2 boot PASS,
+  **Verilator N1 `12036187` (exact, independent SV-NBA ground truth)**.
+  - **Remaining for the D$ 1RW target: the read side.** After this, data is 7R1W — the 7 reads
+    (demand `index` / slot-1 `index2` / next-forward `next_index` / slot-1-next `next_index2` /
+    capture `cap_index` / fill-forward `fill_index` / sync-registered `dhit_index_d`) are genuinely
+    concurrent at distinct indices, so 7R→1R is the **read-port arbitration flip** (time-multiplex +
+    stalls = functional, IPC cost, SMP-critical, full ladder). The write side is now done (1W).
