@@ -608,6 +608,21 @@ pub module dcache #(
     // original writes DCE and the array is 7R1W. Cycle-identical (write values +
     // timing unchanged, only the port shape changes).
     const DCACHE_DATA_1RW: bit = 1;
+    // goal-b SRAM S0 (cp_dcache_sync_read_plan §13): read-port arbitration — the
+    // true 1R1W read side. The write side is done (7R1W above); this collapses the
+    // seven data READ-index nets (demand index_r/dhit_index_d, cap_index,
+    // next_index, fill_index, slot-1 index2/next_index2) onto ONE synchronous read
+    // port. Unlike the write-collapse the read flip is NOT byte-identical — it adds
+    // a stage/stalls (a real SRAM read is synchronous: present one index per cycle,
+    // data registered out next cycle). This DEAD scaffold (S0) reserves the const +
+    // the arbiter (priority mux, demand > cap > next > fill) + the single registered
+    // read output (rd1_data_*), and routes the demand registered read (dhit_rdata_d,
+    // R2) through it via the o_rdata const-mux. DEAD at 0: the mux folds to
+    // dhit_rdata_d, rd1_data_* is reset-only → DCE (its data_X[rd1_index] read has
+    // no consumer), so the array stays 7R1W = byte-identical. The non-folded /
+    // next-dword / slot-1 re-routing + the demand-yield stalls are the staged flip
+    // (§13.4 S1-S4). See §13 for the full design.
+    const DCACHE_DATA_READ_1R: bit = 0;
     var miss_q      : logic         ;
     var load_sel_q  : logic         ;
     var srfo_sel_q  : logic         ;
@@ -1707,14 +1722,70 @@ pub module dcache #(
         }
     }
 
+    // ============================================================
+    // goal-b SRAM S0 (cp_dcache_sync_read_plan §13): the single synchronous READ
+    // port (see the DCACHE_DATA_READ_1R const above). The arbiter presents ONE
+    // index per cycle (priority demand > cap > next > fill-DONE) and registers the
+    // four-way line read; the demand registered read (R2) is the first consumer.
+    // DEAD at 0 (rd1_data_* reset-only → DCE, the o_rdata const-mux folds to
+    // dhit_rdata_d). Slot-1 (index2/next_index2, defined below o_rdata) joins the
+    // arbiter in S4. Priority mux is byte-independent of which requester wins at 1.
+    // ============================================================
+    let rd1_req_demand: logic = i_ren_r; // Stage-A demand read (→ dhit at Stage-D)
+    let rd1_req_cap   : logic = cap_fill_go || cap_probe_go || cap_mis_go || cap_flush_go;
+    let rd1_req_next  : logic = i_ren && i_load_next; // cross-line misaligned hi dword
+    let rd1_index: logic<INDEX_W> = if rd1_req_demand ?
+        index_r
+    : if rd1_req_cap ?
+        cap_index
+    : if rd1_req_next ?
+        next_index
+    :
+        fill_index // fill-DONE re-read / benign idle default
+    ;
+    var rd1_data_0: logic<512>;
+    var rd1_data_1: logic<512>;
+    var rd1_data_2: logic<512>;
+    var rd1_data_3: logic<512>;
+    always_ff (clk, rst) {
+        if_reset {
+            rd1_data_0 = '0;
+            rd1_data_1 = '0;
+            rd1_data_2 = '0;
+            rd1_data_3 = '0;
+        } else if DCACHE_DATA_READ_1R {
+            rd1_data_0 = data_0[rd1_index];
+            rd1_data_1 = data_1[rd1_index];
+            rd1_data_2 = data_2[rd1_index];
+            rd1_data_3 = data_3[rd1_index];
+        }
+    }
+    // Demand registered read off the arbitrated port: the folded plain load's
+    // Stage-D delivery sourced from the SRAM output register (rd1_data_*, index
+    // presented last cycle) instead of the fake-flop comb read data_X[dhit_index_d].
+    let rd1_dhit_line: logic<512> = if dhit_way_q == 2'd0 ?
+        rd1_data_0
+    : if dhit_way_q == 2'd1 ?
+        rd1_data_1
+    : if dhit_way_q == 2'd2 ?
+        rd1_data_2
+    :
+        rd1_data_3
+    ;
+    let rd1_dhit_rdata: logic<64> = rd_dword(rd1_dhit_line, dhit_off_q);
+
     // Read data: from hit way on cache hit, from the fill way for a streaming
     // hit (S14.1; the raw hits are all 0 then — the new line's tag is not
     // written yet and the victim's old tag cannot equal it), from memory
     // during fill (legacy fallback, gated by o_data_valid at the consumers).
     // delta-5: at =1 the demand hit delivers off the registered Stage-A read
     // (dhit_rdata_d); miss/stream/uncached stay live. =0 arm = exact original.
+    // S0: the demand registered read routes through the arbitrated port
+    // (rd1_dhit_rdata) at DCACHE_DATA_READ_1R=1; the const-mux folds to
+    // dhit_rdata_d at 0 = byte-identical.
     let o_rdata_live: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
-    assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_use ? (if dhit_v_q ? dhit_rdata_d : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : o_rdata_live) : o_rdata_live;
+    let dhit_rdata_sel: logic<64> = if DCACHE_DATA_READ_1R ? rd1_dhit_rdata : dhit_rdata_d;
+    assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_use ? (if dhit_v_q ? dhit_rdata_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : o_rdata_live) : o_rdata_live;
 
     // M8.B: next-dword read for misaligned 2-dword loads (decode moved up to the
     // miss-handling section). Same line ⇒ reuse the lo-access hit way; cross line

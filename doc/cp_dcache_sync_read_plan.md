@@ -937,3 +937,122 @@ next-forward (`next_index`/`next_index2`) are genuinely concurrent at different 
 macro must time-multiplex them with stall arbitration — a functional change (IPC cost, full SMP ladder,
 coherence-relevant on the probe/store-drain ports). That is the same class of SMP-critical work as the
 sync-read flip; the capture-fold (§12.2) is the clean byte-identical down-payment.
+
+---
+
+## 13. The read-port arbitration (7R → 1R) — the true 1R1W SRAM (functional flip, THE hardest item)
+
+User-selected (2026-07-11 "次へ", after the write-collapse `b5a9976`) as the next campaign step: complete the
+D$ data array as a **true 1R1W SRAM**. The write side is done (`8R4W → 7R1W`, byte-write-enable, cycle-
+identical); this section designs the read side (`7R → 1R`).
+
+### 13.1 The 7 read-index nets (post-write-collapse, `--dump-area` = `64×512 7R1W ×4`)
+
+| # | index net | RTL site | produces | consumer (`o_*`) | timing | fires | port-yield cost |
+|---|---|---|---|---|---|---|---|
+| R1 | `index` = `i_addr[IW+5:6]` | `:402` `rdata_0..3` | live demand rdata + `stream_rdata0` | `o_rdata` (non-folded), `o_hit_safe` | **comb, same-cy** | every IDLE hit that is **non-folded** (AMO / misaligned / uncached) or streaming | — (demand, must serve) |
+| R2 | `dhit_index_d` = `dhit_line_q[IW-1:0]` (flop) | `:810` `dhit_rdata_d` | registered demand rdata | `o_rdata` (folded plain load) | **registered** (SRAM-shaped: address = `index_r` presented at Stage-A, read at Stage-D) | folded plain load, `DCACHE_SYNC_READ=1` | — (demand, the SRAM's natural registered read) |
+| R3 | `cap_index` (5-src priority mux `:1047`) | `:1070` `cap_data[0..7]` | full-line capture | writeback / probe-recall / flush / misaligned detour | comb but **rare** (priority chain, mutually exclusive) | fill-victim / probe / misaligned / flush | rare → stall cheap |
+| R4 | `next_index` = `index+8` | `:1724` `next_rdata_{same,xline}` | next-dword | `o_rdata_next` | **comb, same-cy** | misaligned **cross-line** load (`i_load_next`) | rare → 2-cy serialize |
+| R5 | `fill_index` (state reg) | `:1844` `o_fill_rdata` | filled dword at miss offset | `o_fill_rdata` (DONE) | registered (state-synced) | `State::DONE` completion cy | that load is already waiting → ~free |
+| R6 | `index2` = `i_addr2[IW+5:6]` | `:1875` `rdata2_0..3` | slot-1 demand | `o_rdata2`, `o_hit2` | **comb, same-cy** | slot-1 dual-issue load hit | **best-effort** — deny → `o_hit2=0` → pipe-0 fallback (no stall) |
+| R7 | `next_index2` = `index2+8` | `:1893` `next_rdata2_*` | slot-1 next-dword | `o_rdata2_next` | comb, same-cy | slot-1 misaligned | best-effort (with R6) |
+
+(The byte-write-enable RMW retention read `data_k[d1_idx]` at `:1463` folds into the **write** port's
+byte-enable — not a read port. R1 and R2 are the SAME logical demand read at two stages: R2 is the SRAM-
+shaped registered form, R1 is the combinational live form the real SRAM cannot provide.)
+
+### 13.2 Target and the governing principle
+
+**Target: 1R1W** (matches L2 data). One **write** port (already collapsed, byte-write-enable, independent)
++ one **read** port. Only the 7 *reads* contend; R/W do not (separate ports, a real 1R1W allows co-fire —
+mind the read-during-write-same-index hazard: model **read-old**, matching today's `always_ff` write-next-
+edge / read-sees-old semantics).
+
+**Principle — the demand read owns the port; everything else is time-multiplexed with a stall.** A real
+SRAM read is *synchronous*: present ONE index at cycle N, data registered out at N+1. The demand read (R2)
+is already this shape (address `index_r` @Stage-A → data @Stage-D). The flip makes the port present **one
+arbitrated index per cycle** and forces the other six reads onto it:
+- **R1 (live demand)** — eliminated. Its consumers (non-folded AMO/misaligned/uncached loads, streaming)
+  switch to the registered read; those accesses become 2-stage (present index, +1, read registered). They
+  are already multi-cycle-ish, so +1 is cheap. This is the deepest change (touches the AMO/misaligned/
+  uncached delivery that §11.11-11.13 fought).
+- **R3/R4/R5 (cap / next / fill-DONE)** — rare; when they need the port, **stall the demand pipe** one
+  cycle (present their index, demand waits). Often the demand pipe is *already* stalled in the state these
+  fire (FILL/DONE/capture/flush), so the added stall is frequently hidden.
+- **R6/R7 (slot-1)** — **best-effort**: grant only when the demand read is idle that cycle; else `o_hit2=0`
+  → the slot-1 load re-issues on pipe-0 (`ld2_complete` `core:7389`). No stall — pure loss of a dual-issue
+  load. Since slot-1 loads dual-issue *with* a slot-0 demand (same cycle), they almost always lose the
+  arbitration → dual-issue loads effectively disappear unless we **bank** (see 13.5). This is the largest
+  single IPC lever and the place to spend the optimization budget.
+
+**Arbitration priority (single read port):** `demand (index_r) > cap > next > fill-DONE > slot-1`.
+
+### 13.3 Per-read handling (the flip deltas)
+
+1. **Demand R1→R2 unify.** Route `o_rdata` / `o_hit_safe` / streaming entirely off the registered read.
+   Non-folded loads (AMO `i_amo_read`, cross-line `i_load_next`, `i_uncached`) currently use the LIVE
+   `o_rdata_live` (R1). Under the flip they must present their index to the port and read it registered
+   → they gain a Stage. Fold them the way §11.2(b) folded the plain load (a Stage-A `i_addr_r` read),
+   OR give them an explicit +1 stall (`nf_gap_stall` already stalls them a cycle on a registered-miss —
+   extend that to a registered-read cycle). **This is the SMP-critical delta** (AMO read-capture atomicity,
+   §11.11): the AMO value-capture must still see the owned line at the RMW window — verify the registered
+   read does not open a recall gap (litmus N2 amoadd is the probe).
+2. **next_index (R4) 2-cy serialize.** A cross-line misaligned load presents `index` at N (lo dword) and
+   `next_index` at N+1 (hi dword), stalling one cycle; assemble `o_rdata` + `o_rdata_next` across the two
+   registered reads. Same-line spans (`next_same_line`, `offset!=7`) already have `next_index==index` in
+   value → serve both dwords from the one registered line read (no extra cycle — the full 512-bit line is
+   registered, both dwords extract from it). **Only the cross-line case pays +1.**
+3. **cap_index (R3) stall-arbitrate.** The capture reads the victim/probe/flush line. Present `cap_index`
+   on the port that cycle (demand yields). The capture already coincides with fill-start / probe / flush —
+   states where the demand load is held — so this is mostly hidden. Keep the capture's *consumers*
+   (writeback buffer, `ev_fill_vic`) reading the registered line.
+4. **fill-DONE (R5) ~free.** `o_fill_rdata` at DONE: the missing load is waiting on this cycle; present
+   `fill_index` on the port at DONE, deliver registered. No net stall (the load was blocked anyway).
+5. **slot-1 (R6/R7) best-effort or bank.** Default: `o_hit2` additionally requires winning the port
+   (`rd1_gnt_slot1`); else `o_hit2=0`. Optimization (13.5): **bank by `index[0]`** so a slot-1 read to the
+   *other* bank co-fires with the demand read — recovers dual-issue at the cost of 2 banks (each a 32-entry
+   1R1W). Banking is the `sram_inventory.md` row-1 "banked 1RW" target; decide after measuring the
+   best-effort IPC hit.
+
+### 13.4 Increment sequence (DEAD scaffold → staged flip)
+
+Unlike the write-collapse, the read flip is **not** byte-identical (it adds stalls / a stage). Stage it by
+IPC-cost tier so each step is small and independently verifiable:
+
+- **S0 — DEAD scaffold (byte-identical, this session).** `const DCACHE_DATA_READ_1R: bit = 0;` + the single
+  read-port skeleton: `rd1_index` (priority mux of the 7 requesters), `rd1_way`, registered `rd1_data_q =
+  data_X[rd1_index]` (all gated `else if DCACHE_DATA_READ_1R` → reset-only at 0 → **DCE**, byte-identical),
+  and `rd1_stall` (=0 at 0). Verify: default 252/0, synth `7R1W` unchanged, FF unchanged (the §10.2 DCE
+  methodology). Establishes the const + arbiter net; no consumer re-routing yet.
+- **S1 — fold the rare reads (R3 cap, R5 fill-DONE).** Route their consumers off `rd1_data_q`; stall demand
+  when they win. Nearly free (they fire in already-stalled states). Full ladder.
+- **S2 — next_index (R4) 2-cy serialize.** Cross-line misaligned only. Full ladder + ma_data arch tests.
+- **S3 — demand R1→R2 unify (eliminate the live read).** The AMO/misaligned/uncached delivery onto the
+  registered port. SMP-critical (AMO atomicity). Full ladder + ACT4 696 + litmus N2/N4 + Verilator.
+- **S4 — slot-1 (R6/R7).** Best-effort first (measure the dual-issue-load IPC loss), then bank if the loss
+  exceeds budget. Full ladder.
+- **S5 — flip default-on** (`DCACHE_DATA_READ_1R=1`), `--dump-area` = `64×512 1R1W ×4`, retire the scaffold
+  const if clean.
+
+### 13.5 Verification ladder (dcache = SMP heart; every read touches coherence)
+
+Same discipline as §11.4 / the sync-read flip — the read port is on the LR/SC-reservation, AMO-watch, and
+probe/store-drain-visible paths:
+- **Correctness:** default 252/0 + backend-validate + **ACT4 696/696** (S-mode paging + store/load port
+  collision) + litmus N2/N4 (AMO atomicity + MP dropped-value classes) + N2/N4 SMP boot + **Verilator**
+  (NBA ground truth — caught the MEM_PIPE and L2-byte-write-enable corners the Veryl sim masked).
+- **IPC (the gate):** load-use latency **unchanged** for the common (folded plain load, already registered)
+  — the single most important number; the +1 falls only on AMO/misaligned/cross-line/cap and (if not
+  banked) dual-issue loads. Measure boot-cy / CoreMark / Dhrystone, ~10-15% budget. If slot-1 best-effort
+  blows the budget, bank by `index[0]` (13.3.5).
+
+### 13.6 Risks / open questions
+
+- **AMO atomicity (S3)** is the highest risk: the registered read must not desync the RMW ownership window
+  (§11.11 fought exactly this on the *stall* side). Probe = litmus N2 amoadd wedge.
+- **read-during-write same-index** hazard (R/W co-fire on one line): confirm the veryl-inferred 1R1W macro
+  models read-old (today's semantics). If it models read-new, the store-merge-then-load-same-line ordering
+  breaks — add an explicit bypass or a 1-cy stall.
+- **Banking (S4)** interacts with the write port (byte-write-enable) — a banked read + a full-line write
+  (fill) to the same bank still collide; the fill already stalls the demand, so likely fine, but re-measure.
