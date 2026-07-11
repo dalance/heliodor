@@ -1149,3 +1149,40 @@ without a stall — prefer a dedicated capture/bypass where the datum already ex
 (cap latches the victim line at the WB buffer; next same-line extracts from the demand's own registered
 line; slot-1 to the demand's line when `index2==index_r`). §13.3.4's stall model still applies where no
 such shortcut exists.
+
+### 13.9 ✅ S3 (2026-07-11) — R6/R7 slot-1 best-effort deny is FREE; banking is UNNECESSARY (6R1W → 4R1W)
+
+**Result.** The slot-1 dual-issue read port (R6 `index2` + R7 `next_index2`, the live combinational 2nd
+hit port) is **best-effort denied** under `DCACHE_DATA_READ_1R`: `o_hit2` is forced 0 so the core re-issues
+that load on pipe-0 (`ld2_complete`, no stall), and the `rdata2` / `next_rdata2` reads become const-guarded
+statement blocks that DCE at =1. `--dump-area` = `64×512 4R1W ×4` at =1 (from 6R1W — **two** ports dropped);
+DEAD at =0 (byte-identical). Taken ahead of the plan's S3 (R1-demand-unify) because cap/next/R1 are harder
+(coherence stall / S3-coupled) and slot-1 is coherence-risk-free (a pure read port, no state writes).
+
+**The key measurement — slot-1 deny costs ZERO IPC.** §13.3 called slot-1 "the largest single IPC lever"
+and expected banking (13.3.5) to be needed. It is not. At =1 vs the =0 baseline, cycle counts are
+**byte-for-byte identical** across every workload measured, including the load-heavy worst case:
+
+| workload | =0 cycles | =1 cycles | Δ |
+|---|---|---|---|
+| N1 boot 7.1 | `013d8910`* | `013d8910` | 0 |
+| Dhrystone | 230937 | 230937 | 0 |
+| CoreMark | 327980 | 327980 | 0 |
+| bench_memcpy | 87097 | 87097 | 0 |
+
+(*7.1V, cycle-exact; 7.1 also PASS.) So **dual-issue LOADS — two loads issue-ready in the same cycle —
+are rare enough that denying the second dcache read port is free**, even in memcpy (its loads/stores
+serialize through the LSU rather than pairing two loads into the dcache same cycle). **Banking is
+unnecessary**; best-effort deny is the final slot-1 handling. This retires 13.3.5's open question and the
+plan's worry that slot-1 would blow the IPC budget.
+
+**Verification.** DEAD at =0: default **252/0**, litmus N2 `0022f150`, synth `7R1W`, FF 157573, gates/CP
+neutral. =1: synth data `4R1W` (from 6R1W), FF 159685 (unchanged from S2 — deny adds no FF), default
+**252/0** (pipe-0 fallback correct), litmus N2 `0022f150`, boot 7.1/7.1V/Dhrystone/CoreMark/memcpy all
+cycle-exact. Committed at =0; SMP ladder deferred to the default-on flip (S5).
+
+**State: 8R1W → 4R1W.** Demand (S1) + fill (S2) + slot-1 (S3) folded, all IPC-free. The remaining 4 read
+ports at =1 are R1 (`index`, live demand), R3 (`cap_index`), R4 (`next_index`), and `rd1_index` (the
+consolidated demand). To reach true 1R: R1→R2 unify (SMP-critical, AMO atomicity — the plan's original S3)
+absorbs R4 (misaligned loads ride the live path), and R3 cap needs the WB-capture present-then-latch stall.
+These three are the coherence-critical remainder; the free wins are exhausted at 4R1W.
