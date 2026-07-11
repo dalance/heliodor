@@ -622,6 +622,13 @@ pub module dcache #(
     // no consumer), so the array stays 7R1W = byte-identical. The non-folded /
     // next-dword / slot-1 re-routing + the demand-yield stalls are the staged flip
     // (§13.4 S1-S4). See §13 for the full design.
+    //   S1 (5b4a72b): the demand read (dhit_rdata_d) is a const-guarded statement
+    //     block → at 1 it DCEs and the demand IS rd1_index (8R1W → 7R1W).
+    //   S2 (this commit): R5 fill-DONE (o_fill_rdata) is served from a captured
+    //     critical-word flop (fill_crit_q) instead of re-reading the array — the
+    //     old data_X[fill_index] read is a statement block that DCEs at 1 (7R1W →
+    //     6R1W). NOT via rd1_index: the early-restart (o_fill_data_ready) samples
+    //     combinationally, so a registered read is 1-cycle stale (§13.8).
     const DCACHE_DATA_READ_1R: bit = 0;
     var miss_q      : logic         ;
     var load_sel_q  : logic         ;
@@ -1924,16 +1931,50 @@ pub module dcache #(
     // C3-revalidated; DONE/uncached stay live. =0 arm = exact pre-delta-3 original.
     assign o_data_valid = if DCACHE_SYNC_READ ? ((if dhit_use ? (dhit_v_q && !dhit_c3_squash) : cache_hit) || (state == State::DONE) || (uncached_active && i_memr_grant)) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
 
-    // Re-read filled data at original miss offset (valid during DONE)
-    assign o_fill_rdata = if fill_way == 2'd0 ?
-        rd_dword(data_0[fill_index], fill_offset)
-    : if fill_way == 2'd1 ?
-        rd_dword(data_1[fill_index], fill_offset)
-    : if fill_way == 2'd2 ?
-        rd_dword(data_2[fill_index], fill_offset)
-    :
-        rd_dword(data_3[fill_index], fill_offset)
-    ;
+    // Re-read filled data at original miss offset (valid during DONE, and early
+    // from fill_count==1 via o_fill_data_ready).
+    // S2 (§13.8): the demanded dword IS the critical-word-first beat #0 transfer
+    // (fill_woff == fill_offset when fill_count == 0), so instead of re-reading the
+    // data array we CAPTURE i_mem_rdata at that beat into a 64-bit flop and deliver
+    // o_fill_rdata from it — exactly the critical-word buffer a real CWF fill uses.
+    // This drops the data_X[fill_index] read port (7R1W → 6R1W at =1) with a small
+    // flop instead of the shared read port: folding this early-restart read onto
+    // the arbitrated (registered) port is 1-cycle stale — o_fill_data_ready samples
+    // o_fill_rdata combinationally the cycle beat #0 becomes visible, but a
+    // registered SRAM read lags one cycle (and, heliodor being non-blocking, would
+    // also collide with a hit-under-miss demand read that same cycle). The capture
+    // matches the live read cycle-for-cycle: fill_crit_q at fill_count==1 equals
+    // data_X[fill_index][fill_offset] (beat #0 written at fill_count==0), and the
+    // demanded dword is written once, so it is stable through DONE.
+    //   The old combinational read is a const-guarded statement block (default 0
+    //   first, else if !DCACHE_DATA_READ_1R) so its data_X[fill_index] read port
+    //   DCEs at =1; the fill_crit_q write is DCACHE_DATA_READ_1R-gated so the flop
+    //   is reset-only → DCE at 0. The const-mux folds to fill_rdata_live at 0 =
+    //   byte-identical.
+    var fill_rdata_live: logic<64>;
+    always_comb {
+        fill_rdata_live = 64'd0;
+        if !DCACHE_DATA_READ_1R {
+            fill_rdata_live = if fill_way == 2'd0 ?
+                rd_dword(data_0[fill_index], fill_offset)
+            : if fill_way == 2'd1 ?
+                rd_dword(data_1[fill_index], fill_offset)
+            : if fill_way == 2'd2 ?
+                rd_dword(data_2[fill_index], fill_offset)
+            :
+                rd_dword(data_3[fill_index], fill_offset)
+            ;
+        }
+    }
+    var fill_crit_q: logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            fill_crit_q = 64'd0;
+        } else if DCACHE_DATA_READ_1R && filling && i_memr_grant && (fill_woff == fill_offset) {
+            fill_crit_q = i_mem_rdata; // CWF beat #0 = the demanded dword
+        }
+    }
+    assign o_fill_rdata = if DCACHE_DATA_READ_1R ? fill_crit_q : fill_rdata_live;
 
     // ============================================================
     // Phase 8 S5.2: 2nd hit-only READ port. Pure combinational mirror of the

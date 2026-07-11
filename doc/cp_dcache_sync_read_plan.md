@@ -1009,6 +1009,10 @@ arbitrated index per cycle** and forces the other six reads onto it:
    (writeback buffer, `ev_fill_vic`) reading the registered line.
 4. **fill-DONE (R5) ~free.** `o_fill_rdata` at DONE: the missing load is waiting on this cycle; present
    `fill_index` on the port at DONE, deliver registered. No net stall (the load was blocked anyway).
+   **⚠️ SUPERSEDED by §13.8:** this is WRONG — `o_fill_rdata` is also sampled *early* and *combinationally*
+   (`o_fill_data_ready`, critical-word-first, ~7cy before DONE), so a registered read is 1cy stale and the
+   boot hangs; and non-blocking hit-under-miss collides with the fill re-read on the shared port. R5 is
+   folded via a dedicated critical-word flop instead (§13.8, DONE, cycle-identical).
 5. **slot-1 (R6/R7) best-effort or bank.** Default: `o_hit2` additionally requires winning the port
    (`rd1_gnt_slot1`); else `o_hit2=0`. Optimization (13.5): **bank by `index[0]`** so a slot-1 read to the
    *other* bank co-fires with the demand read — recovers dual-issue at the cost of 2 banks (each a 32-entry
@@ -1094,3 +1098,54 @@ DCEs and the arbiter port (`rd1_index`) is the single consolidated demand read (
 `cap` / `fill-DONE` / `next` / `slot-1` fold into the same `rd1_index` time-mux (each: statement-block the
 old read + arbitrate/stall). The demand fold being cycle-identical means the foundation is proven; the
 remaining reads are the per-read arbitration/stall work (S1-S4), each with the full SMP ladder.
+
+### 13.8 ✅ S2 (2026-07-11) — R5 fill-DONE folds via a CRITICAL-WORD FLOP, not the arbiter port (7R1W → 6R1W, cycle-identical)
+
+**Result.** `o_fill_rdata` (R5, the miss re-read at `data_X[fill_index]`) is dropped from the SRAM by
+**capturing the critical-word-first beat #0 into a 64-bit flop** (`fill_crit_q`) and delivering
+`o_fill_rdata` from it, instead of routing it onto the arbitrated `rd1_index` port. `--dump-area` =
+`64×512 6R1W ×4` at =1 (from 7R1W); DEAD at =0 (byte-identical). This is the critical-word buffer a real
+critical-word-first fill already implies — the demanded dword arrives on the bus once (beat #0) and is
+re-delivered to the owner from a register, never re-read from the array.
+
+**Why NOT the arbiter port (the arbiter-routing attempt hangs the boot).** First tried the §13.7 recipe:
+route `o_fill_rdata` off the registered `rd1_data_*` (presenting `fill_index` during FILL/DONE) + statement-
+block the old read. It measured `6R1W` and passed **default 252/0 + litmus N2 `0022f150` cycle-exact** — but
+**every N1 Linux boot HUNG** (7.1/7.1v/6.6 all ran to the 100M-cycle cap, `x3 != 0xAA`). Root cause, two
+compounding facts the arch/litmus suites don't exercise:
+1. **The early restart samples combinationally.** The core latches `dc_fill_rdata` on `dc_fill_ready`
+   (= `o_fill_data_ready`, which rises at `fill_count==1`, i.e. the cycle beat #0 becomes *visible*) —
+   ~7 cycles *before* DONE (`heliodor_core:7688,7766` `mshr*_fill_done`). `o_fill_rdata` is read
+   **combinationally** the cycle the critical word lands. A *registered* SRAM read (`rd1_data`, index
+   presented last cycle) is **one cycle stale** at that sample → the MSHR latches the pre-fill dword →
+   the load completes with garbage → boot wedge. (litmus N2's loads complete via the replay path, not
+   the early-restart, so it stays cycle-exact — the same "litmus misses what boot hits" asymmetry as the
+   L2 byte-write-enable retention bug.)
+2. **Non-blocking → the fill re-read collides with hit-under-miss.** heliodor is non-blocking (MSHR a/b),
+   so during FILL the primary demand port serves *other* loads (`index_r != fill_index`). The single
+   arbitrated port cannot present both `fill_index` (for `o_fill_rdata`) and the hit-under-miss `index_r`
+   on the same cycle — forcing `fill_index` corrupts the concurrent demand read. So §13.3.4's "~free /
+   no net stall" was **wrong**: folding R5 onto the shared port needs a genuine stall.
+
+**The flop-capture sidesteps both.** `fill_crit_q = i_mem_rdata` when `filling && i_memr_grant &&
+fill_woff == fill_offset` (beat #0). It needs **no read port and no arbitration**, so it never collides
+with a hit-under-miss demand read, and it is not registered off the array so it is not a cycle stale.
+**Byte-identity:** `fill_crit_q` (visible from `fill_count==1`) equals `data_X[fill_index][fill_offset]`
+(beat #0 written at `fill_count==0`), and the demanded dword is written exactly once (CWF writes each dword
+once; stores only write in IDLE), so it is stable through DONE — matching the live read cycle-for-cycle at
+every sample point (early `dc_fill_ready` *and* `o_fill_complete` at DONE). Cost: one 64-bit flop (+64 FF).
+
+**Verification (=1 de-risk, matching the S1 `a115a35` rigor):** default **252/0**, litmus N2 `0022f150`,
+N1 boot **7.1 `01217590` / 7.1V `013d8910` / 6.6 `01402120` — all cycle-EXACT** to the =0 baseline (the
+boots that hung under the arbiter attempt). synth data `6R1W` (from 7R1W), FF 157573 → 159685 (+2048 = the
+S1 `rd1_data` demand port, +64 = `fill_crit_q`). Committed at =0 (byte-identical); the SMP ladder (litmus
+N4 / SMP boot / ACT4 / Verilator) is for the eventual default-on flip (S5).
+
+**Lesson for the remaining folds.** R5 was the plan's "nearly free" read, yet the naive arbiter fold hung
+the boot. The clean fold used a *dedicated register* (the natural critical-word buffer), not the shared
+read port. Re-examine cap (R3) / next (R4) / slot-1 (R6/R7) for the same: a read that is consumed
+combinationally at a write-visible or issue-decision edge cannot be served by the registered shared port
+without a stall — prefer a dedicated capture/bypass where the datum already exists off the array
+(cap latches the victim line at the WB buffer; next same-line extracts from the demand's own registered
+line; slot-1 to the demand's line when `index2==index_r`). §13.3.4's stall model still applies where no
+such shortcut exists.
