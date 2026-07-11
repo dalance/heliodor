@@ -1263,3 +1263,59 @@ SMP boot N2/N4 + **Verilator** (NBA ground truth). IPC: the +1 falls on non-fold
 and the Stage-A/Stage-B contention loser — measure boot-cy / CoreMark; the folded plain-load hot path
 (the common case) stays load-use-unchanged. The AMO clean-hit fast path must keep its 1-cycle progress
 (pin), else the contended-atomic litmus wedges.
+
+### 14.5 Progress + the 14.3-c implementation recipe (derived from the code, 2026-07-11)
+
+**Landed (DEAD at 0, byte-identical — the reroute infrastructure):**
+- **14.3-a (`9046e5f`)** — `rd1_req_nf` (non-folded reads present `index` below demand in the arbiter) +
+  nf-Stage-A regs `nf_v_q`/`nf_way_q`/`nf_off_q` + `rd1_nf_rdata` (the +1-late delivery source, still
+  unconsumed). synth 7R1W / FF 157573 / CP 14.745, default 252/0, litmus N2 `0022f150` — all exact.
+- **14.3-b (`d448b83`)** — misaligned same-line hi via `rd1_next_same = rd_dword(rd1_nf_line, nf_next_off_q)`;
+  `nf_next_off_q`/`nf_next_same_q` register next_offset/next_same_line so the +1-late delivery selects
+  same-vs-cross line consistently. Cross-line still reads live `next_rdata_xline` (joins 14.3-e). Byte-id at 0.
+
+**The 14.3-c crux — precise mechanism (read `heliodor_core.veryl:2054-2068` + `dcache.veryl:800-837,1034-1053`):**
+
+The AMO read is ALREADY 2-cycle in the core under MEM_PIPE=1 (M3b `amo_fetched_q`): a FETCH cycle (drive
+read → MMU translate → M-stage latches PA `m_pa_q` + `amo_read`) then an ACCESS cycle (dcache reads the
+registered `m_pa_q` → `dcache_rdata` = AMO value → alu_wrap does the RMW). **Crucially the dcache sees the
+AMO's index ONLY at the ACCESS cycle** (i_addr = m_pa_q), so there is no earlier cycle to pre-read from —
+the registered read fundamentally needs a **+1 within the dcache** (present `index` at ACCESS, deliver the
+registered dword at ACCESS+1). That +1 is exactly the stall the `nf_gap_stall = miss_raw` gate REFUSES to
+apply to a clean hit-excl AMO (dcache.veryl:820-822: stalling it opens a 1-cycle remote-recall window →
+contended-atomic LIVELOCK, litmus N2 wedge at `amoadd 0x800007a8`). **So 14.3-c re-introduces that stall
+on purpose and must close the window with the pin.**
+
+Why the pin closes it: `pin_arm_hit` (dcache.veryl:1040) is COMBINATIONAL on the current cycle's
+`i_amo_read && i_ren && IDLE && cache_hit && hit_excl` — it fires on the AMO's ACCESS cycle (N) whether or
+not that cycle stalls (i_ren/cache_hit/hit_excl are all held during the stall). So the pin arms at edge
+N→N+1 and is active through the registered-read delivery (N+1) AND the RMW write (N+2), releasing on
+`wenl_fires` (N+2→N+3). The only unpinned cycle is N (the request) — identical to today's =0 fast path,
+where N is also unpinned and the write at N+1 is pin-covered. The +1 merely shifts write N+1→N+2, still
+pinned. `pin_arm_hit`'s `{tag,index} != pin_line_q` guard prevents re-arm thrash at N+1 (already pinned).
+
+**The nf handshake (the intricate part — needs the back-to-back + port-contention cases right):**
+- **Port contention**: priority is demand > nf. A folded Stage-A demand read (`index_r`) wins the port over
+  a same-cycle non-folded read (`index`). So nf only "wins" when `nf_won = rd1_req_nf && !rd1_req_demand`;
+  otherwise it stalls extra until it wins.
+- **Sequencing (must handle gapless back-to-back nf reads to the same line / different offset)**: a bare
+  `nf_reg_stall = rd1_req_nf && !nf_v_q` MISDELIVERS a new read whose predecessor left `nf_v_q=1` (index
+  match is NOT "same read" — offset can differ). Use a toggling in-flight flag: register `nf_won_q = nf_won`;
+  `nf_reg_stall = rd1_req_nf && !nf_won_q`; register `nf_way_q`/`nf_off_q`/`nf_next_*` on the cycle nf WINS
+  the port (nf_won), aligned with `rd1_data_*` (loaded from `index` at that same edge). Trace: N (win,
+  stall, capture) → N+1 (nf_won_q=1, deliver `rd1_nf_rdata`, core completes) → N+2 (next nf read wins, its
+  own capture). Each nf read gets exactly one stall + one deliver; the toggle re-arms per read even with
+  i_ren held high. Verify the delivery-cycle clear so a stalled-by-other-source N+1 doesn't drop the flag.
+- **Delivery reroute (=1)**: `o_rdata` non-folded arm → `rd1_nf_rdata` (was `o_rdata_live`'s hit part);
+  `o_data_valid` non-folded (cache_hit) held 0 at N, 1 at N+1; `o_hit_safe` already excludes AMO/misaligned
+  so unaffected; `o_stall` gains `nf_reg_stall` (gated DCACHE_DATA_READ_1R). Streaming/mem-fallback part of
+  `o_rdata_live` stays for 14.3-d.
+- **Core coordination**: the dcache `o_stall` must hold `m_pa_q` (M-stage) stable across N→N+1 so the ACCESS
+  index is stable — verify `dcache_stall` feeds the M-stage hold (it gates `iss_dc_ok`/completion). The
+  core's `amo_fetch_hold` already sequences per-AMO re-fetch; the dcache +1 just lengthens the ACCESS.
+
+**Why 14.3-c is NOT a safe DEAD-at-0 commit**: unlike a/b (inert comb rewiring), c introduces STALL + STATE
+(nf_won_q toggle) + PIN timing — control logic whose entire correctness lives at =1. Byte-identity at 0
+proves nothing about it. c must be developed together with 14.3-d (streaming) to reach a =1-testable state,
+then temp-flipped =1 and validated on litmus N2/N4 amoadd (the livelock probe) + SMP boot + ACT4 + Verilator
+before committing. This is the make-or-break cohesive unit; it is design-first per the §11 methodology.
