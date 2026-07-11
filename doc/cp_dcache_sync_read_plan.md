@@ -1056,3 +1056,41 @@ probe/store-drain-visible paths:
   breaks — add an explicit bypass or a 1-cy stall.
 - **Banking (S4)** interacts with the write port (byte-write-enable) — a banked read + a full-line write
   (fill) to the same bank still collide; the fill already stalls the demand, so likely fine, but re-measure.
+
+### 13.7 ✅ De-risked (2026-07-11) — the demand read fold is CYCLE-IDENTICAL; port reduction needs statement-block gating
+
+Two findings from temp-flipping `DCACHE_DATA_READ_1R=1` on the S0 scaffold (`edda6e9`; reverted, tree
+stays =0):
+
+**(1) The demand hot-path read via the registered SRAM port is cycle-identical — the #1 risk (§13.6) is
+resolved.** With the folded plain load's `o_rdata` delivered from `rd1_data_*` (the arbitrated port's
+registered four-way line, index presented at Stage-A) instead of the fake-flop comb read
+`data_X[dhit_index_d]`, the full ladder is **cycle-EXACT**: default **252/0**, litmus N2 `cy=0022f150`
+(exact), N1 Linux boot **7.1 `01217590` / 7.1V `013d8910` / 6.6 `01402120` — all cycle-EXACT** to the =0
+baseline. So the **read-during-write same-index hazard is fully masked by the core's byte-granular
+store-to-load forwarding** for the demand load: `rd1_data` (registered at the presentation edge) is one
+write-generation staler than the comb read, but any store that wrote the load's dword in that window is
+supplied byte-exact by the SB forward layer, and a store to *other* bytes/dwords of the line leaves the
+load's dword unchanged (stale == current). The boot cy-exactness (not just litmus — the L2 byte-write-
+enable lesson was that litmus's full-word stores miss partial-byte retention bugs that boot's partial
+stores expose) is strong evidence the demand fold is correct, not merely test-lucky. **The hardest part
+of the read side — the demand hot path onto a synchronous SRAM read — is free.**
+
+**(2) Port reduction requires const-guarded STATEMENT blocks, not ternary gating (the L2 P3.b lesson,
+`8e01034`).** Routing a read's *consumer* to `rd1_data` does NOT drop its array read port: veryl's RAM
+inference (`conv/ram.rs`) counts a read port **per distinct array-index net, before global DCE**, so the
+old `let x = ...data_X[old_index]...` still infers a port even when `x` is downstream-dead. Measured at =1
+(demand routed via `rd1`, old reads left as ternary `let`s): synth = **`8R1W ×4`** (rd1 *added*, nothing
+dropped); wrapping `dhit_rdata_d` in a ternary `if DCACHE_DATA_READ_1R ? 0 : data_X[...]` still measured
+`8R1W`. To make an old read DCE at =1 it must become a **const-guarded statement block** — a `var` +
+`always_comb`/statement `if !DCACHE_DATA_READ_1R { x = data_X[idx] }` — exactly the ternary→statement-block
+conversion that fixed L2 P3.b Problem 2 (`3R1W → 1R1W`). So each fold is two parts: (a) route the consumer
+to `rd1_data` (cycle-identical for the demand, per (1)), and (b) convert the old fake-flop read to a
+statement block so the port DCEs at =1.
+
+**Refined S1 (next):** convert the demand read (`dhit_rdata_d`) to the statement-block form so at =1 it
+DCEs and the arbiter port (`rd1_index`) is the single consolidated demand read (7R at =1 = neutral vs the
+=0 7R — the demand read *is* `rd1_index`, not an extra port). The actual reduction below 7R then comes as
+`cap` / `fill-DONE` / `next` / `slot-1` fold into the same `rd1_index` time-mux (each: statement-block the
+old read + arbitrate/stall). The demand fold being cycle-identical means the foundation is proven; the
+remaining reads are the per-read arbitration/stall work (S1-S4), each with the full SMP ladder.
