@@ -1186,3 +1186,80 @@ ports at =1 are R1 (`index`, live demand), R3 (`cap_index`), R4 (`next_index`), 
 consolidated demand). To reach true 1R: R1→R2 unify (SMP-critical, AMO atomicity — the plan's original S3)
 absorbs R4 (misaligned loads ride the live path), and R3 cap needs the WB-capture present-then-latch stall.
 These three are the coherence-critical remainder; the free wins are exhausted at 4R1W.
+
+## 14. R1→R2 unify — eliminate the live demand read (4R1W → 2R1W), the §11.11-class SMP fold (user-selected 2026-07-11)
+
+Design-first, mirroring the §11 sync-read methodology (the hard SMP work is the design). R1 (`index`, the
+live combinational demand read `rdata_0..3`) + R4 (`next_index`, the misaligned hi-dword) are the last
+"fake-flop" reads a real SRAM cannot do. Folding them onto the registered `rd1_index` port is the plan's
+original S3 (the §13.6 highest-risk item). This section is the implementation design.
+
+### 14.1 What R1/R4 actually serve (post S1-S3)
+
+Under `DCACHE_SYNC_READ=1` the **folded** plain load already delivers off the registered read
+(`dhit_rdata_d` → `rd1_dhit_rdata`, S1). R1 remains alive for the **non-folded** accesses, which drive
+`i_addr` LIVE at Stage-B (no Stage-A `i_ren_r` strobe — the core excludes them, `dcache:100-104`):
+- **AMO reads** (`i_amo_read`): `o_rdata_live` at the RMW value-capture. **The atomicity crux.**
+- **Misaligned loads** (`i_load_next`, `dhit_use` excludes them): lo dword via `o_rdata_live` (R1) +
+  hi dword via `o_rdata_next` (R4, `next_rdata_same`/`_xline`).
+- **Streaming / hit-under-miss** (`stream_rdata0`, `dcache:882`): reads `rdata_0..3` (R1) selected by
+  `fill_way` — the early-restart from a partially-filled line during FILL.
+- **Uncached** loads use `i_mem_rdata`, NOT the array — so they do NOT keep R1 alive.
+
+So R1's consumers = {non-folded AMO/misaligned-lo hit delivery, streaming}; R4 = {misaligned hi dword}.
+DCE is all-or-nothing: R1 drops only when *every* consumer is off `rdata_0..3`; R4 drops only when both
+same-line and cross-line misaligned hi are off `next_index`.
+
+### 14.2 The two structural problems
+
+**(a) No Stage-A registration for non-folded → +1 stage + Stage-A/Stage-B port contention.** A folded load
+presents its PA one cycle early (`i_addr_r`/`i_ren_r` at `lsr_capture`) so its data is registered by
+Stage-B. Non-folded loads have no such early strobe — they read R1 combinationally at Stage-B. To serve
+them from the registered port they must **present `index` at Stage-B and read `rd1_data` at Stage-B+1**
+= a +1 stall, plus an internal nf-Stage-A registration (`nf_way_q`/`nf_off_q`/`nf_v_q`, mirroring
+`dhit_*_q`). Worse: on a back-to-back stream, cycle T carries load-N's non-folded Stage-B (wants
+`rd1_index=index`) AND load-(N+1)'s folded Stage-A (wants `rd1_index=index_r`) — a **single-port
+contention**. Priority demand(folded Stage-A) > nf, and the loser stalls a cycle. (This is why the arbiter
+exists; nf is a new requester below demand.)
+
+**(b) The AMO atomicity crux (§11.11 livelock).** `nf_gap_stall` today deliberately gates on `miss_raw`,
+NOT "a new non-folded read", because **stalling a clean hit-EXCLUSIVE AMO one cycle opens a window for the
+remote hart to recall the line before the RMW writes back → contended-atomic LIVELOCK** (observed: litmus
+N2 both harts wedged at `amoadd 0x800007a8`, `dcache:820-825`). A +1 *registered-read* stall re-introduces
+exactly that window on the AMO's clean-hit fast path. So the AMO cannot naively take the +1: the line must
+be **pinned** (`pin_line_q`/`pin_cnt_q`, `dcache:1030`) across the registered-read cycle so no recall lands
+between the read and the write-back. The pin already exists for the RMW itself (`pin_arm_hit` on a
+hit-excl AMO); extend/verify it to cover the extra read cycle. **This is the make-or-break** — the litmus
+N2/N4 amoadd/amoswap wedge is the probe.
+
+### 14.3 Staged implementation
+
+- **14.3-a — nf-Stage-A + arbiter nf request (DEAD scaffold).** Add `nf_v_q`/`nf_way_q`/`nf_off_q`
+  registered on a non-folded read (gated `DCACHE_DATA_READ_1R`, reset-only → DCE at 0), and
+  `rd1_req_nf` presenting `index` below demand priority. No delivery reroute yet → byte-identical at 0.
+- **14.3-b — misaligned same-line via registered-line extract (cycle-identical).** For a same-line span
+  (`next_same_line`, `offset!=7`), `next_index==index` in value, so the hi dword extracts from the SAME
+  registered line at `next_offset`: `o_rdata_next = rd_dword(rd1_line, next_off)`. Cycle-identical (full
+  512-bit line registered), no extra read. **Only cross-line pays** the +1 serialize (present `next_index`,
+  stall, read). This absorbs R4's same-line usage for free; cross-line joins the nf serialize.
+- **14.3-c — AMO pin-across-read (the crux).** Route the AMO value-capture through the registered read,
+  holding `pin_line_q` from the read cycle through the RMW write-back so no recall intervenes. Verify with
+  litmus N2/N4 amoadd; a clean hit-excl AMO must NOT lose its progress guarantee.
+- **14.3-d — streaming from the registered line.** `stream_rdata0` reads the (partially-filled) fill line;
+  under the fold it must come from the registered read of `fill_index`/`index` — overlaps the S2
+  `fill_crit_q` idea (the demanded dword is already captured). Reconcile: streaming may reuse `fill_crit_q`
+  for the demanded dword and the registered line for the rest.
+- **14.3-e — statement-block R1/R4 → 2R1W.** Once every consumer is off `rdata_0..3`/`next_index`, convert
+  them to `if !DCACHE_DATA_READ_1R` statement blocks so both ports DCE at 1. `--dump-area` = `2R1W`
+  (R1+R4 gone; leaves R3 `cap_index` + `rd1_index`).
+- **14.3-f — flip / then R3 cap → true 1R.** After R1→R2 unify lands (2R1W), only R3 cap remains for the
+  final 1R (§13 cap present-then-latch).
+
+### 14.4 Verification (the SMP heart — every step)
+
+Full ladder EACH stage: default 252/0 + **litmus N2/N4 amoadd/amoswap** (atomicity — the pin probe) +
+**ma_data / ma_addr arch** (misaligned lo+hi) + **ACT4 696** (S-mode paging load/store-port collision) +
+SMP boot N2/N4 + **Verilator** (NBA ground truth). IPC: the +1 falls on non-folded AMO/misaligned/streaming
+and the Stage-A/Stage-B contention loser — measure boot-cy / CoreMark; the folded plain-load hot path
+(the common case) stays load-use-unchanged. The AMO clean-hit fast path must keep its 1-cycle progress
+(pin), else the contended-atomic litmus wedges.
