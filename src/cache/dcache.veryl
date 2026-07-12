@@ -636,6 +636,15 @@ pub module dcache #(
     //     decides best-effort-vs-bank (§13.9). Taken ahead of the R1-demand-unify
     //     (cap/next/R1 are harder — coherence stall / S3-coupled).
     const DCACHE_DATA_READ_1R: bit = 0;
+    // Per-fold Verilator-bisect knobs (§14.6/§14.7): each gates ONE of the S1/S2/S3
+    // folds' DELIVERY so a Verilator/NBA hang can be isolated to a single fold while
+    // the others stay folded. They track DCACHE_DATA_READ_1R (so =0 is byte-identical);
+    // for a bisect, temp-set DCACHE_DATA_READ_1R=1 and override ONE of these to 0 to
+    // revert just that fold to its live read. (This is how §14.7's S1 NBA hang was
+    // pinned to the demand registered read.)
+    const S1_DEMAND: bit = DCACHE_DATA_READ_1R; // demand read: rd1_dhit_rdata (reg) vs dhit_rdata_d (live)
+    const S2_FILL  : bit = DCACHE_DATA_READ_1R; // fill-DONE: fill_crit_q (flop) vs fill_rdata_live
+    const S3_SLOT1 : bit = DCACHE_DATA_READ_1R; // slot-1: best-effort deny vs live 2nd hit port
     // 14.3-c isolation knob: gates ONLY the nf delivery/stall reroute (AMO/misaligned
     // -lo → registered read), separate from DCACHE_DATA_READ_1R which also gates the
     // S1/S2/S3 folds (demand/fill/slot-1) + the nf regs. Set to 0 (with DATA_READ_1R=1)
@@ -851,7 +860,7 @@ pub module dcache #(
     var dhit_rdata_d: logic<64>;
     always_comb {
         dhit_rdata_d = 64'd0; // =1: demand served by rd1_dhit_rdata
-        if !DCACHE_DATA_READ_1R {
+        if !S1_DEMAND {
             dhit_rdata_d = if dhit_way_q == 2'd0 ?
                 rd_dword(data_0[dhit_index_d], dhit_off_q)
             : if dhit_way_q == 2'd1 ?
@@ -1795,10 +1804,20 @@ pub module dcache #(
             rd1_data_2 = '0;
             rd1_data_3 = '0;
         } else if DCACHE_DATA_READ_1R {
-            rd1_data_0 = data_0[rd1_index];
-            rd1_data_1 = data_1[rd1_index];
-            rd1_data_2 = data_2[rd1_index];
-            rd1_data_3 = data_3[rd1_index];
+            // Write-forward bypass (§14.7 — the S1 NBA hang fix): a real 1R1W SRAM
+            // registered read is read-OLD w.r.t. a same-cycle write to the same index
+            // (NBA / Verilator). The =0 live read is read-NEW (it reads data_X
+            // combinationally at Stage-B, AFTER the store landed), so without this
+            // bypass rd1_data lags one write-generation for a store that writes the
+            // read line THIS cycle — a just-drained store the store buffer no longer
+            // forwards → a stale demand load → boot wedge on Verilator (the Veryl sim
+            // masks it by evaluating the write before the read = read-NEW). Forward
+            // the merged write per way when it fires to rd1_index (write-first). No new
+            // read port (same data_k[rd1_index] net + the already-computed d1_new/msk).
+            rd1_data_0 = if d1_fire_0 && (d1_idx == rd1_index) ? (data_0[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_0[rd1_index];
+            rd1_data_1 = if d1_fire_1 && (d1_idx == rd1_index) ? (data_1[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_1[rd1_index];
+            rd1_data_2 = if d1_fire_2 && (d1_idx == rd1_index) ? (data_2[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_2[rd1_index];
+            rd1_data_3 = if d1_fire_3 && (d1_idx == rd1_index) ? (data_3[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_3[rd1_index];
         }
     }
     // 14.3-c (§14.5): the nf handshake — deliver the non-folded AMO / misaligned-lo
@@ -1883,7 +1902,7 @@ pub module dcache #(
     let live_hit_rdata: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : rdata_3;
     let nf_hit_sel    : logic<64> = if DCACHE_NF_REROUTE && nf_reroute ? rd1_nf_rdata : live_hit_rdata;
     let o_rdata_live  : logic<64> = if cache_hit ? nf_hit_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
-    let dhit_rdata_sel: logic<64> = if DCACHE_DATA_READ_1R ? rd1_dhit_rdata : dhit_rdata_d;
+    let dhit_rdata_sel: logic<64> = if S1_DEMAND ? rd1_dhit_rdata : dhit_rdata_d;
     assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_use ? (if dhit_v_q ? dhit_rdata_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : o_rdata_live) : o_rdata_live;
 
     // M8.B: next-dword read for misaligned 2-dword loads (decode moved up to the
@@ -2046,7 +2065,7 @@ pub module dcache #(
     var fill_rdata_live: logic<64>;
     always_comb {
         fill_rdata_live = 64'd0;
-        if !DCACHE_DATA_READ_1R {
+        if !S2_FILL {
             fill_rdata_live = if fill_way == 2'd0 ?
                 rd_dword(data_0[fill_index], fill_offset)
             : if fill_way == 2'd1 ?
@@ -2062,11 +2081,11 @@ pub module dcache #(
     always_ff (clk, rst) {
         if_reset {
             fill_crit_q = 64'd0;
-        } else if DCACHE_DATA_READ_1R && filling && i_memr_grant && (fill_woff == fill_offset) {
+        } else if S2_FILL && filling && i_memr_grant && (fill_woff == fill_offset) {
             fill_crit_q = i_mem_rdata; // CWF beat #0 = the demanded dword
         }
     }
-    assign o_fill_rdata = if DCACHE_DATA_READ_1R ? fill_crit_q : fill_rdata_live;
+    assign o_fill_rdata = if S2_FILL ? fill_crit_q : fill_rdata_live;
 
     // ============================================================
     // Phase 8 S5.2: 2nd hit-only READ port. Pure combinational mirror of the
@@ -2106,7 +2125,7 @@ pub module dcache #(
         rdata2_1 = 64'd0;
         rdata2_2 = 64'd0;
         rdata2_3 = 64'd0;
-        if !DCACHE_DATA_READ_1R {
+        if !S3_SLOT1 {
             rdata2_0 = rd_dword(data_0[index2], offset2);
             rdata2_1 = rd_dword(data_1[index2], offset2);
             rdata2_2 = rd_dword(data_2[index2], offset2);
@@ -2132,7 +2151,7 @@ pub module dcache #(
     always_comb {
         next_rdata2_same  = 64'd0;
         next_rdata2_xline = 64'd0;
-        if !DCACHE_DATA_READ_1R {
+        if !S3_SLOT1 {
             next_rdata2_same = if hit2_0 ?
                 rd_dword(data_0[next_index2], next_offset2)
             : if hit2_1 ?
@@ -2158,7 +2177,7 @@ pub module dcache #(
     // also cached). i_ren2 gates the whole port. S3 (§13.9): at =1 slot-1 is
     // best-effort denied (o_hit2=0) so the shared 1R port never owes a 2nd read.
     let hi_ok2: logic = !i_load_next2 || next_same_line2 || next_line_hit2;
-    assign o_hit2 = !DCACHE_DATA_READ_1R && i_ren2 && cache_hit2 && hi_ok2;
+    assign o_hit2 = !S3_SLOT1 && i_ren2 && cache_hit2 && hi_ok2;
 
     // ============================================================
     // P9.2: local line-departure events (see the port note). The component

@@ -1378,3 +1378,46 @@ port-collision lesson: a non-folded stall must not fire when the port is yielded
 2. **14.3-d** streaming reroute (fill_crit_q + registered line) + cross-line hi serialize.
 3. **14.3-e** statement-block R1/R4 → DCE (`--dump-area` 2R1W).
 4. **14.3-f** flip default-on — GATED on (1) being fixed and the full ladder INCLUDING Verilator green.
+
+### 14.7 ✅ The S1/S2/S3 Verilator NBA hang ROOT-CAUSED + FIXED (2026-07-13) — read-during-write on the registered read; write-forward bypass
+
+The §14.6 blocker is resolved. Bisected with the per-fold isolation consts (`S1_DEMAND` / `S2_FILL` /
+`S3_SLOT1`, each gating one fold's delivery): with `DCACHE_DATA_READ_1R=1, S1_DEMAND=0` (S1 demand reverted
+to the live read, S2/S3 folded) the **Verilator N1 boot PASSES at the exact =0 baseline cy 12036187** →
+**the hang is S1, the demand registered read** (`rd1_data_* = data_X[rd1_index]`).
+
+**Root cause — read-during-write, read-OLD under NBA vs read-NEW on the Veryl sim.** At the folded load's
+Stage-B (cycle T+1) the two reads diverge for a store that writes the load's line at the Stage-A cycle T
+(landing at the T→T+1 edge):
+- **=0 live read** `dhit_rdata_d = data_X[dhit_index_d]` is combinational at Stage-B → reads data_X AFTER the
+  store landed = **read-NEW**.
+- **=1 registered read** `rd1_data <= data_X[rd1_index]` samples at the T→T+1 edge with the OLD (pre-edge)
+  data_X values = **read-OLD** — it misses the cycle-T store.
+
+The §13.7 de-risk ("boot cy-EXACT on the Veryl sim") held because **the Veryl sim evaluates the write before
+the read within an edge = read-NEW**, so the registered read saw the store and matched =0. **Verilator (true
+NBA) is read-OLD**, so the registered read lags one write-generation. The gap is a *just-drained* store: the
+store buffer forwards in-flight stores (§13.7's masking), but once a store DRAINS to data_X the SB no longer
+forwards it, and a load reading that line the same cycle gets the stale (pre-drain) value → a kernel spinlock
+never sees the release → boot wedge (r3=`ffffffff80a85b60`, cy 100M). litmus / ACT4 / N-hart boot on the
+**Veryl sim** all passed (read-NEW there), which is why "de-risked on the Veryl sim ≠ Verilator-clean".
+
+**Fix — a write-forward bypass on the registered read (write-first SRAM emulation).** In the `rd1_data_*`
+always_ff, when the byte-write-enable write fires to the read line this cycle, forward the merged value:
+`rd1_data_k <= (d1_fire_k && d1_idx == rd1_index) ? (data_k[rd1_index] & ~d1_msk) | (d1_new & d1_msk)
+: data_k[rd1_index]`. Under NBA the RHS `data_k[rd1_index]` is read-OLD; the merge reconstructs the post-write
+value, so `rd1_data` becomes read-NEW = matches the =0 live read. **No new read port** (same `data_k[rd1_index]`
+net + the already-computed `d1_new`/`d1_msk`); it is the standard external write-first bypass a real SRAM
+macro needs — realistic, not a hack. Reset-only → DCE at 0.
+
+**Validation:** =0 byte-identical (252/0, litmus N2 `0022f150`). =1 Veryl sim UNCHANGED (the bypass is a
+Veryl-sim NO-OP — it was already read-NEW): default 252/0, litmus N2 `00231860`, boot N1 ×4 (7.1 `01225ff0`
+/ 7.1v `013d8910` / 6.6 `013f5dd0`, cy IDENTICAL to the pre-bypass =1). **=1 Verilator N1 boot now PASSES**:
+S1/S2/S3 + bypass (nf off) = cy `12036187` (=0 baseline EXACT, the folds are cycle-identical on Verilator
+too); full stack S1/S2/S3 + 14.3-c reroute + bypass = cy `12048346` (+12k = the AMO/misaligned +1). **The
+whole =1 D$ read-port-narrowing path is Verilator-clean.** Committed DEAD (still not default-on: R1 does not
+DCE until 14.3-d/e). 🔑 Campaign process fix: **every fold flip must be Verilator-gated, not just Veryl-sim
+de-risked** — the sim's write-before-read masks read-during-write NBA hazards.
+
+**⏭️ Next:** 14.3-d (streaming) → 14.3-e (R1/R4 DCE → 2R1W) → 14.3-f (default-on, now with the Verilator
+gate satisfiable). Re-run the FULL Verilator ladder (SMP boot N2/N4, litmus) at 14.3-f time.
