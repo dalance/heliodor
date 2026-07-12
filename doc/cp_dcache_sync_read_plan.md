@@ -1414,9 +1414,10 @@ macro needs — realistic, not a hack. Reset-only → DCE at 0.
 Veryl-sim NO-OP — it was already read-NEW): default 252/0, litmus N2 `00231860`, boot N1 ×4 (7.1 `01225ff0`
 / 7.1v `013d8910` / 6.6 `013f5dd0`, cy IDENTICAL to the pre-bypass =1). **=1 Verilator N1 boot now PASSES**:
 S1/S2/S3 + bypass (nf off) = cy `12036187` (=0 baseline EXACT, the folds are cycle-identical on Verilator
-too); full stack S1/S2/S3 + 14.3-c reroute + bypass = cy `12048346` (+12k = the AMO/misaligned +1). **The
-whole =1 D$ read-port-narrowing path is Verilator-clean.** Committed DEAD (still not default-on: R1 does not
-DCE until 14.3-d/e). 🔑 Campaign process fix: **every fold flip must be Verilator-gated, not just Veryl-sim
+too); full stack S1/S2/S3 + 14.3-c reroute + bypass = cy `12048346` (+12k = the AMO/misaligned +1). **Verilator
+SMP N2 boot also PASSES** (full stack, cy `16590558`, "SMP(N=2) LINUX BOOT PASSED", x3=0xAA) — the bypass is
+correct under multi-hart NBA coherence, not just single-hart. **The whole =1 D$ read-port-narrowing path is
+Verilator-clean.** Committed DEAD (still not default-on: R1 does not DCE until 14.3-d/e). 🔑 Campaign process fix: **every fold flip must be Verilator-gated, not just Veryl-sim
 de-risked** — the sim's write-before-read masks read-during-write NBA hazards.
 
 **⏭️ Next:** 14.3-d (streaming) → 14.3-e (R1/R4 DCE → 2R1W) → 14.3-f (default-on, now with the Verilator
