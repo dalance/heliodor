@@ -636,6 +636,12 @@ pub module dcache #(
     //     decides best-effort-vs-bank (§13.9). Taken ahead of the R1-demand-unify
     //     (cap/next/R1 are harder — coherence stall / S3-coupled).
     const DCACHE_DATA_READ_1R: bit = 0;
+    // 14.3-c isolation knob: gates ONLY the nf delivery/stall reroute (AMO/misaligned
+    // -lo → registered read), separate from DCACHE_DATA_READ_1R which also gates the
+    // S1/S2/S3 folds (demand/fill/slot-1) + the nf regs. Set to 0 (with DATA_READ_1R=1)
+    // to run S1/S2/S3 at =1 with AMO/misaligned staying LIVE — isolates whether an
+    // NBA-semantics (Verilator) hang is in S1/S2/S3 or in the 14.3-c reroute.
+    const DCACHE_NF_REROUTE: bit = 0;
     var miss_q      : logic         ;
     var load_sel_q  : logic         ;
     var srfo_sel_q  : logic         ;
@@ -1795,45 +1801,59 @@ pub module dcache #(
             rd1_data_3 = data_3[rd1_index];
         }
     }
-    // 14.3-a nf-Stage-A registration (§14.2-a): a non-folded read presents `index`
-    // at Stage-B (rd1_req_nf above); its four-way line lands in rd1_data_* next
-    // cycle, so these regs carry the hit way / dword offset for the +1-late delivery
-    // (rerouted in 14.3-c/d). DEAD at 0 (else-if DCACHE_DATA_READ_1R → reset-only →
-    // DCE). rd1_nf_rdata below is the (still-unconsumed) delivery source that keeps
-    // these regs live until the reroute lands.
-    var nf_v_q        : logic   ; // a non-folded hit is registered (deliver next cycle)
-    var nf_way_q      : logic<2>; // the Stage-B hit way
-    var nf_off_q      : logic<3>; // the load's dword offset
-    var nf_next_off_q : logic<3>; // 14.3-b: the misaligned hi dword offset
-    var nf_next_same_q: logic   ; // 14.3-b: registered next_same_line (same/cross line)
+    // 14.3-c (§14.5): the nf handshake — deliver the non-folded AMO / misaligned-lo
+    // HIT dword from the registered read (rd1_data_*) instead of the live
+    // data_X[index] (R1). A non-folded read presents `index` at Stage-B (rd1_req_nf
+    // above); it WINS the single read port only when demand isn't requesting
+    // (priority demand > nf). nf_won_q marks "nf won last cycle → its four-way line
+    // is in rd1_data_*"; nf_addr_q records WHICH line, so a still-held request (same
+    // {tag,index}) delivers from the register and a NEW request to a different line
+    // re-reads (nf_reg_stall) rather than misdelivering the stale line. The reroute
+    // + stall apply ONLY to the blocking-path reads (i_amo_read / i_load_next, which
+    // o_hit_safe excludes): replay / streaming keep their LIVE delivery (they join
+    // 14.3-d/e; R1 stays alive until then). DEAD at 0 (else-if DCACHE_DATA_READ_1R →
+    // reset-only → DCE; nf_ready/nf_reg_stall const-fold to 0).
+    let nf_reroute: logic = i_amo_read || i_load_next; // blocking-path reads (not o_hit_safe)
+    let nf_won    : logic = rd1_req_nf && !rd1_req_demand; // nf takes the read port this cycle
+    var nf_won_q  : logic    ; // nf won the read port last cycle (line now in rd1_data_*)
+    var nf_addr_q : logic<58>; // {tag,index} of that registered nf line
     always_ff (clk, rst) {
         if_reset {
-            nf_v_q         = 1'b0;
-            nf_way_q       = 2'd0;
-            nf_off_q       = 3'd0;
-            nf_next_off_q  = 3'd0;
-            nf_next_same_q = 1'b0;
+            nf_won_q  = 1'b0;
+            nf_addr_q = '0;
         } else if DCACHE_DATA_READ_1R {
-            nf_v_q         = rd1_req_nf && cache_hit;
-            nf_way_q       = hit_way;
-            nf_off_q       = offset;
-            nf_next_off_q  = next_offset;
-            nf_next_same_q = next_same_line;
+            nf_won_q = nf_won;
+            if nf_won {
+                nf_addr_q = {tag, index};
+            }
         }
     }
-    // rd1_nf_rdata: the +1-late non-folded read result (the future delivery source,
-    // 14.3-c/d). Defined now so the nf-Stage-A regs have a consumer (no unused-var);
-    // it is itself DCE'd at 0 (nf_v_q reset-only, guarded by DCACHE_DATA_READ_1R).
-    let rd1_nf_line : logic<512> = if nf_way_q == 2'd0 ?
+    // nf_ready: the registered nf line is present AND is the current request's line,
+    // so the demanded dword extracts from it at the LIVE offset (the full 512-bit
+    // line is registered). Const-0 at 0.
+    let nf_ready: logic = DCACHE_DATA_READ_1R && nf_won_q && ({tag, index} == nf_addr_q);
+    // The +1 registered-read stall for an AMO/misaligned-lo HIT: hold until nf owns
+    // the line in rd1_data_* (nf_ready). Excludes streaming/miss (cache_hit=0 there;
+    // the miss path / nf_gap_stall covers those). Requires i_ren: nf can only make
+    // progress toward nf_ready when the read is actually driven (nf_won needs
+    // rd1_req_nf → i_ren); stalling while i_ren=0 (port yielded to a store) would
+    // deadlock (stall high, but nf can never win). The AMO clean-hit pin (pin_arm_hit,
+    // combinational on this same cycle) covers the extra cycle, so the +1 does NOT
+    // open a new remote-recall window — the §14.2-b make-or-break. Feeds o_stall.
+    let nf_reg_stall: logic = DCACHE_NF_REROUTE && i_ren && nf_reroute && cache_hit && !nf_ready;
+    // rd1_nf_line: the registered four-way line selected by the LIVE hit way (a
+    // {tag,index} match means the line is unchanged, so hit_way still names its way).
+    // rd1_nf_rdata / rd1_next_same (below) extract the lo / misaligned-hi dwords.
+    let rd1_nf_line : logic<512> = if hit_way == 2'd0 ?
         rd1_data_0
-    : if nf_way_q == 2'd1 ?
+    : if hit_way == 2'd1 ?
         rd1_data_1
-    : if nf_way_q == 2'd2 ?
+    : if hit_way == 2'd2 ?
         rd1_data_2
     :
         rd1_data_3
     ;
-    let rd1_nf_rdata: logic<64> = if DCACHE_DATA_READ_1R && nf_v_q ? rd_dword(rd1_nf_line, nf_off_q) : 64'd0;
+    let rd1_nf_rdata: logic<64> = rd_dword(rd1_nf_line, offset);
     // Demand registered read off the arbitrated port: the folded plain load's
     // Stage-D delivery sourced from the SRAM output register (rd1_data_*, index
     // presented last cycle) instead of the fake-flop comb read data_X[dhit_index_d].
@@ -1857,7 +1877,12 @@ pub module dcache #(
     // S0: the demand registered read routes through the arbitrated port
     // (rd1_dhit_rdata) at DCACHE_DATA_READ_1R=1; the const-mux folds to
     // dhit_rdata_d at 0 = byte-identical.
-    let o_rdata_live: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : if hit_3 ? rdata_3 : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
+    // 14.3-c: at =1 the AMO/misaligned-lo HIT dword comes from the registered read
+    // (rd1_nf_rdata, +1 late, gated on nf_reroute); replay/streaming and the miss/mem
+    // fallback stay live. At 0 nf_hit_sel folds to the live hit mux = exact original.
+    let live_hit_rdata: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : rdata_3;
+    let nf_hit_sel    : logic<64> = if DCACHE_NF_REROUTE && nf_reroute ? rd1_nf_rdata : live_hit_rdata;
+    let o_rdata_live  : logic<64> = if cache_hit ? nf_hit_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
     let dhit_rdata_sel: logic<64> = if DCACHE_DATA_READ_1R ? rd1_dhit_rdata : dhit_rdata_d;
     assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_use ? (if dhit_v_q ? dhit_rdata_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : o_rdata_live) : o_rdata_live;
 
@@ -1884,17 +1909,16 @@ pub module dcache #(
     :
         rd_dword(data_3[next_index], next_offset)
     ;
-    // 14.3-b (§14): at =1 the same-line misaligned hi dword extracts from the nf
-    // registered line (rd1_nf_line) at the registered next_offset — no separate
-    // data_X[next_index] read (this absorbs R4's same-line usage). The same/cross
-    // selection uses the registered nf_next_same_q so it aligns with the +1-late nf
-    // delivery. Cross-line still reads live next_rdata_xline here; it joins the nf
-    // +1 serialize in 14.3-e, and the whole reroute is validated at =1 only as a
-    // cohesive unit. At 0 this folds to the exact original (rd1_next_same DCE'd).
-    let rd1_next_same       : logic<64> = rd_dword(rd1_nf_line, nf_next_off_q);
-    let next_rdata_same_sel : logic<64> = if DCACHE_DATA_READ_1R ? rd1_next_same : next_rdata_same;
-    let next_same_line_sel  : logic     = if DCACHE_DATA_READ_1R ? nf_next_same_q : next_same_line;
-    assign o_rdata_next      = if next_same_line_sel ? next_rdata_same_sel : next_rdata_xline;
+    // 14.3-c (§14.5): at =1 the same-line misaligned hi dword extracts from the nf
+    // registered line (rd1_nf_line) at the LIVE next_offset (the {tag,index} match in
+    // nf_ready makes the full 512-bit line valid, so any dword is exact) — no separate
+    // data_X[next_index] read (this absorbs R4's same-line usage). Gated on nf_reroute
+    // (a misaligned load is i_load_next). CROSS-line hi still reads live
+    // next_rdata_xline here; it joins the nf +1 serialize in 14.3-e, and the reroute
+    // is validated at =1 only as a cohesive unit. At 0 folds to the exact original.
+    let rd1_next_same       : logic<64> = rd_dword(rd1_nf_line, next_offset);
+    let next_rdata_same_sel : logic<64> = if DCACHE_NF_REROUTE && nf_reroute ? rd1_next_same : next_rdata_same;
+    assign o_rdata_next      = if next_same_line ? next_rdata_same_sel : next_rdata_xline;
     assign o_rdata_next_miss = i_ren && (if next_same_line ? !cache_hit : !next_line_hit);
 
     // Memory interface — S23 split, P9.2 rework.
@@ -1993,7 +2017,11 @@ pub module dcache #(
     // must gate on this to avoid mid-fill stale captures.
     // delta-5: at =1 the demand-hit term is the registered Stage-A hit (dhit_v_q),
     // C3-revalidated; DONE/uncached stay live. =0 arm = exact pre-delta-3 original.
-    assign o_data_valid = if DCACHE_SYNC_READ ? ((if dhit_use ? (dhit_v_q && !dhit_c3_squash) : cache_hit) || (state == State::DONE) || (uncached_active && i_memr_grant)) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
+    // 14.3-c: the non-folded HIT valid (AMO/misaligned-lo) waits for the registered
+    // read (nf_ready) at =1 so it is held 0 on the request cycle and 1 on delivery;
+    // replay (also non-folded, but LIVE via o_hit_safe) keeps cache_hit. At 0 = cache_hit.
+    let nf_valid_hit: logic = if DCACHE_NF_REROUTE && nf_reroute ? (cache_hit && nf_ready) : cache_hit;
+    assign o_data_valid = if DCACHE_SYNC_READ ? ((if dhit_use ? (dhit_v_q && !dhit_c3_squash) : nf_valid_hit) || (state == State::DONE) || (uncached_active && i_memr_grant)) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
 
     // Re-read filled data at original miss offset (valid during DONE, and early
     // from fill_count==1 via o_fill_data_ready).
@@ -2213,6 +2241,6 @@ pub module dcache #(
     let write_wait_grant: logic = state == State::IDLE && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
     let write_wait_local: logic = state == State::IDLE && i_wen && i_wen_excl && !wenl_fires;
     assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
-        || write_wait_local || inv_hits_active || inv2_hits_active || dhit_c3_squash || dhit_miss || nf_gap_stall || (uncached_active && !i_memr_grant);
+        || write_wait_local || inv_hits_active || inv2_hits_active || dhit_c3_squash || dhit_miss || nf_gap_stall || nf_reg_stall || (uncached_active && !i_memr_grant);
 
 }

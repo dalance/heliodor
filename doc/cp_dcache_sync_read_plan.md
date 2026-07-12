@@ -1319,3 +1319,62 @@ pinned. `pin_arm_hit`'s `{tag,index} != pin_line_q` guard prevents re-arm thrash
 proves nothing about it. c must be developed together with 14.3-d (streaming) to reach a =1-testable state,
 then temp-flipped =1 and validated on litmus N2/N4 amoadd (the livelock probe) + SMP boot + ACT4 + Verilator
 before committing. This is the make-or-break cohesive unit; it is design-first per the §11 methodology.
+
+### 14.6 ✅ 14.3-c IMPLEMENTED + VALIDATED on the Veryl-sim ladder (2026-07-12) — the CRUX works; 🚨 but Verilator exposed a PRE-EXISTING S1/S2/S3 NBA hang
+
+Committed DEAD at 0 (byte-identical; `const DCACHE_DATA_READ_1R = 0`). The AMO/misaligned-lo reroute was
+temp-flipped =1, validated across the full Veryl-sim ladder, then reverted for the checkpoint. R1 does NOT
+DCE yet — replay/streaming/cross-line-hi stay LIVE (that is 14.3-d/e), so =1 today ADDS the rd1 read without
+removing R1 (worse area); it stays DEAD until the fold completes.
+
+**Design (refined from the §14.5 recipe):**
+- **Reroute narrowed to `nf_reroute = i_amo_read || i_load_next`** — only the blocking-path reads (the ones
+  `o_hit_safe_live` excludes via `!i_amo_read && !i_load_next`). 🔑 **Replay is ALSO non-folded but delivers
+  LIVE via `o_hit_safe`** (`i_ren = dmem_ren_m || replay_drive || lsr_drive`; a replayed load has `dhit_use=0`
+  so `rd1_req_nf=1`, yet it completes through `o_hit_safe_live`, +0). Rerouting it to the +1 registered read
+  while o_hit_safe stays live MISDELIVERS. So replay/streaming keep the live R1 read; R1 stays alive until
+  14.3-d/e fold them too. (Streaming = `cache_hit=0` mid-fill → excluded by the `cache_hit` gate anyway.)
+- **Line-match handshake (dropped the recipe's nf_off_q toggle)**: `nf_won = rd1_req_nf && !rd1_req_demand`;
+  register `nf_won_q` + `nf_addr_q = {tag,index}` on the winning cycle; `nf_ready = nf_won_q &&
+  ({tag,index}==nf_addr_q)`. Deliver `rd_dword(rd1_nf_line, offset)` at the LIVE offset from the registered
+  line selected by the LIVE `hit_way` (a {tag,index} match ⟹ same line, same way). Correct-by-construction:
+  gapless same-line-different-offset delivers (no extra stall); different-line stalls + re-reads. This
+  structurally avoids the misdelivery the recipe warned about and DROPS the nf_way_q/nf_off_q/nf_next_off_q/
+  nf_next_same_q/nf_v_q regs (superseding the 14.3-a/b scaffold SHAPE — a/b's regs are gone, their INTENT
+  stands). Same-line misaligned hi = `rd_dword(rd1_nf_line, next_offset)`; cross-line hi stays live.
+- **AMO pin**: `pin_arm_hit` (combinational on the ACCESS cycle) fires whether or not that cycle stalls, so
+  the +1 delivery cycle and the RMW write stay pin-covered — no new remote-recall window. Confirmed by litmus.
+
+**🚨 THE DEADLOCK BUG (found + fixed):** the first `nf_reg_stall = nf_reroute && cache_hit && !nf_ready`
+(no `i_ren`) HUNG ma_data / ld_st / vfarith. When a store took the port (`lsr_drive=0` → `i_ren=0`) while
+`nf_reroute && cache_hit` held, nf_reg_stall stayed high but `nf_won` (needs `rd1_req_nf` → `i_ren`) could
+never win → stall with no way to clear. Fix: **gate `nf_reg_stall` on `i_ren`** (the read must actually be
+driven for the +1 to make progress). This is the nf analogue of the M4 `m_store_wr_busy` store-vs-load
+port-collision lesson: a non-folded stall must not fire when the port is yielded to a store.
+
+**Verification (temp-flip =1, then reverted to =0):**
+- ✅ Veryl sim ladder ALL GREEN: default **252/0** · litmus N2 pass (cy=00231860, no forbidden) · **litmus N4
+  pass (cy=00535020 — IDENTICAL to the =0 baseline, no forbidden)** · **ACT4 696/0** (the M4 S-mode-paging
+  port-collision gate) · boot N1 ×4 (5.15 `00b7de50` / 7.1 `01225ff0` / 6.6 `013f5dd0` / 7.1v `013d8910`,
+  x3=0xAA) · boot N2 SMP (cy=`00fd4bc0`, pass). DEAD at 0: default 252/0, litmus N2 `0022f150` (byte-identical).
+- 🚨🚨 **Verilator N1 boot HANGS at =1** (r3=`ffffffff80a85b60`, cy 100M cap; a kernel-address wedge). The
+  Veryl sim (all backends) is green — the classic NBA-race-masked-by-the-sim pattern (cf. SMP LR/SC livelock,
+  L2 byte-write-enable JIT, MEM_PIPE). **ISOLATED via a new `const DCACHE_NF_REROUTE`** (gates ONLY the nf
+  delivery/stall; separate from `DCACHE_DATA_READ_1R` which gates S1/S2/S3 + the nf regs): with
+  `DCACHE_DATA_READ_1R=1, DCACHE_NF_REROUTE=0` (S1/S2/S3 on, my reroute OFF, AMO/misaligned LIVE) Verilator
+  **hangs at the IDENTICAL address** → **the hang is a PRE-EXISTING S1/S2/S3 (demand/fill/slot-1 fold) NBA
+  bug, NOT 14.3-c.** S1/S2/S3 were "de-risked on the Veryl sim" (boot cy-EXACT) but NEVER Verilator-tested
+  (deferred to "S5 default-on"); this session is the first `DCACHE_DATA_READ_1R=1` Verilator run and it
+  exposed the latent hang. **My 14.3-c reroute is exonerated.** The whole =1 path (goal-b D$ read-port
+  narrowing) is Verilator-blocked until the S1/S2/S3 NBA hang is root-caused.
+
+**⏭️ Next (priority order):**
+1. **🚨 ROOT-CAUSE the S1/S2/S3 Verilator/NBA hang** (blocks ALL of =1). Prime suspect: the arbitrated
+   registered read `rd1_data_* = data_X[rd1_index]` is read-OLD under NBA (correct SRAM), but the Veryl sim
+   may have delivered read-NEW, masking a load that needs the same-cycle write when store-to-load forwarding
+   doesn't cover it (§13.7 claimed cycle-identical on the Veryl sim ONLY). Add per-fold isolation consts
+   (S1 demand / S2 fill_crit / S3 slot-1) to bisect; instrument the wedge PC on Verilator. Both hang at the
+   SAME PC, so a single common root cause.
+2. **14.3-d** streaming reroute (fill_crit_q + registered line) + cross-line hi serialize.
+3. **14.3-e** statement-block R1/R4 → DCE (`--dump-area` 2R1W).
+4. **14.3-f** flip default-on — GATED on (1) being fixed and the full ladder INCLUDING Verilator green.
