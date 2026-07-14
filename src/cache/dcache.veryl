@@ -659,6 +659,17 @@ pub module dcache #(
     // to run S1/S2/S3 at =1 with AMO/misaligned staying LIVE — isolates whether an
     // NBA-semantics (Verilator) hang is in S1/S2/S3 or in the 14.3-c reroute.
     const DCACHE_NF_REROUTE: bit = 0;
+    // 14.3-e isolation knob: gates ONLY the REPLAY reroute (the non-folded ordinary
+    // cache-hit = an MSHR replay re-read, `data_X[index]` = R1's last live consumer).
+    // Tracks DCACHE_NF_REROUTE (active with the full stack) but separable so an
+    // NBA-semantics hang can be pinned to the replay fold vs the AMO/misaligned nf.
+    // Unlike AMO/misaligned (which complete via o_data_valid), a replay completes via
+    // o_hit_safe (same-cycle combinational capture: mshra_data_q=dcache_rdata). To fold
+    // it onto the +1 registered read, o_hit_safe is gated on nf_ready so the replay
+    // does NOT complete on the request cycle; the core holds replay_q (no hit → no
+    // retire, no fill → no claim, no re-capture while replay_q=1) and re-drives the
+    // stable MSHR address next cycle, when nf_ready delivers rd1_nf_rdata. See §14.9.
+    const DCACHE_NF_REPLAY: bit = DCACHE_NF_REROUTE;
     var miss_q      : logic         ;
     var load_sel_q  : logic         ;
     var srfo_sel_q  : logic         ;
@@ -1860,11 +1871,18 @@ pub module dcache #(
     // is in rd1_data_*"; nf_addr_q records WHICH line, so a still-held request (same
     // {tag,index}) delivers from the register and a NEW request to a different line
     // re-reads (nf_reg_stall) rather than misdelivering the stale line. The reroute
-    // + stall apply ONLY to the blocking-path reads (i_amo_read / i_load_next, which
-    // o_hit_safe excludes): replay / streaming keep their LIVE delivery (they join
-    // 14.3-d/e; R1 stays alive until then). DEAD at 0 (else-if DCACHE_DATA_READ_1R →
-    // reset-only → DCE; nf_ready/nf_reg_stall const-fold to 0).
-    let nf_reroute: logic = i_amo_read || i_load_next; // blocking-path reads (not o_hit_safe)
+    // + stall apply to the blocking-path reads (i_amo_read / i_load_next, which
+    // o_hit_safe excludes) AND — under DCACHE_NF_REPLAY (14.3-e) — the REPLAY
+    // (non-folded ordinary hit), R1's last live consumer. Streaming stays LIVE via
+    // fill_crit_q (14.3-d, cache_hit=0 so it never reaches nf_hit_sel/nf_reg_stall).
+    // DEAD at 0 (else-if DCACHE_DATA_READ_1R → reset-only → DCE; nf_ready/nf_reg_stall
+    // const-fold to 0).
+    // 14.3-e: the replay is a non-folded read (rd1_req_nf) that is neither AMO nor
+    // misaligned. rd1_req_nf ⊇ {AMO, misaligned}, so nf_reroute reduces to rd1_req_nf
+    // at DCACHE_NF_REPLAY=1 (the unified R1→R2 fold). Streaming (rd1_req_nf, cache_hit
+    // =0) is included but harmless — nf_hit_sel/nf_reg_stall are cache_hit-gated.
+    let nf_replay : logic = rd1_req_nf && !i_amo_read && !i_load_next; // MSHR replay re-read
+    let nf_reroute: logic = i_amo_read || i_load_next || (DCACHE_NF_REPLAY && nf_replay);
     let nf_won    : logic = rd1_req_nf && !rd1_req_demand; // nf takes the read port this cycle
     var nf_won_q  : logic    ; // nf won the read port last cycle (line now in rd1_data_*)
     var nf_addr_q : logic<58>; // {tag,index} of that registered nf line
@@ -2058,7 +2076,17 @@ pub module dcache #(
     let fill_busy0: logic = filling && fill_index == index;
     // delta-5: at =1 the fill-safe pipe-0 hit is the registered Stage-A hit,
     // C3-revalidated. =0 arm = exact original (no squash — const-0 at =0).
-    let o_hit_safe_live: logic = i_ren && !i_amo_read && !i_load_next && ((hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3)) || stream_hit0);
+    // 14.3-e: the replay hit is the only non-folded ordinary hit reaching
+    // o_hit_safe_live (AMO/misaligned are excluded above; streaming is cache_hit=0).
+    // When the replay's data comes from the +1 registered read (DCACHE_NF_REPLAY), it
+    // must NOT complete on the request cycle — gate the hit terms on nf_ready so
+    // o_hit_safe (→ replay_hit_fire, which captures dcache_rdata combinationally) fires
+    // the cycle rd1_nf_rdata is valid. The core holds replay_q and re-drives the stable
+    // MSHR address until then. Streaming stays +0 (fill_crit_q) → stream_hit0 ungated.
+    // At DCACHE_NF_REPLAY=0 nf_replay_ready folds to 1 = exact original.
+    let nf_replay_ready: logic = if DCACHE_NF_REPLAY ? nf_ready : 1'b1;
+    let hit_lo_safe    : logic = (hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3));
+    let o_hit_safe_live: logic = i_ren && !i_amo_read && !i_load_next && ((hit_lo_safe && nf_replay_ready) || stream_hit0);
     assign o_hit_safe = if DCACHE_SYNC_READ ? (if dhit_use ? (dhit_v_q && !dhit_c3_squash) : o_hit_safe_live) : o_hit_safe_live;
     // Phase 5 SMP fix: data is valid for this hart's request only when
     // the cache actually has the data (hit) or the fill just completed

@@ -1465,3 +1465,54 @@ which delivers LIVE via `o_hit_safe` — the §14.6 note flagged rerouting it as
 stays live). R4 (`data_X[next_index]`) still serves cross-line misaligned hi (`next_rdata_xline`, live).
 **⏭️ Next: 14.3-e** — fold the replay consumer + cross-line hi off R1/R4, then convert `rdata_X`/`next_rdata`
 to `if !DCACHE_DATA_READ_1R` statement blocks so both ports DCE (`--dump-area` 2R1W). Then 14.3-f default-on.
+
+### 14.9 ✅ 14.3-e replay reroute IMPLEMENTED + VALIDATED (2026-07-14) — R1's last consumer folds onto the registered read; Verilator-clean. R1 DCE deferred (a TB read-contract update)
+
+The **replay** (an MSHR miss re-read — the non-folded ordinary cache-hit) was R1's (`data_X[index]`) last
+live consumer. It now delivers from the registered read (`rd1_nf_rdata`, the 14.3-c nf line) instead of the
+live `live_hit_rdata`. Committed DEAD at 0; the new `const DCACHE_NF_REPLAY = DCACHE_NF_REROUTE` gates it
+(separable for a Verilator bisect).
+
+**The crux — a replay demands SAME-CYCLE completion, unlike AMO/misaligned.** The core samples
+`dcache_rdata` (= `o_rdata`) combinationally on `replay_hit_fire = replay_drive && dc_hit_safe`
+(`heliodor_core:7677,7763`). A registered read is +1 late, so the reroute would misdeliver on the request
+cycle. The fix: **gate the replay's `o_hit_safe` on `nf_ready`** (`o_hit_safe_live`'s hit terms →
+`hit_lo_safe && nf_replay_ready`) so the safe-hit does NOT assert until `rd1_nf_rdata` is valid. The core
+then holds `replay_q` and re-drives the *stable* MSHR address one cycle later, when `nf_ready` delivers the
+correct dword. This is sound because, on the un-ready cycle:
+- `dc_miss_valid` (= `o_miss_valid = load_sel && …`) is **0 on a hit** (`load_sel` needs a real miss), so
+  `replay_claim` cannot false-fire (`heliodor_core:7716`).
+- `replay_q` **persists** (no hit → no retire, no fill → no claim) and re-drives next cycle (`:7714-7722`).
+- `mshr_capture_*` requires `!replay_q`, so no spurious re-capture during the +1 (`:7456-7457`).
+During a replay the issue port is blocked (`iss_dc_ok` has `!replay_q`) and AMO/misaligned are gated
+`!replay_drive`, so nf always wins the read port — the +1 is a clean 2-cycle handshake. `nf_reroute` reduces
+to `rd1_req_nf` at DCACHE_NF_REPLAY=1 (the unified R1→R2 fold: AMO ∪ misaligned ∪ replay).
+
+**Validation — full ladder + Verilator, all green at =1:**
+- DEAD at 0: `veryl test` **252/0**, litmus N2 **`0022f150`** (byte-identical).
+- =1 Veryl sim: default **252/0** · litmus N2 **`0022f150`** · litmus N4 **`00535020`** (NO forbidden) ·
+  **ACT4 696/0** · boot N1 7.1 **`0122d520`** / 7.1v **`013e9a80`** · boot N2 SMP **`00fe5d30`**.
+- =1 **Verilator** (NBA ground truth): **N1 boot `12137740`** and **N2 SMP boot `16660573`** — both PASS
+  (x3==0xAA). The replay's +1 re-drive is NBA-correct single- AND multi-hart.
+- **IPC:** the replay +1 shows as a small boot slowdown (N1 7.1 +0x7530 ≈ 30 k cy / ~0.16 %; Verilator N1
+  +89 k / ~0.7 %; N2 SMP +0x11170 ≈ 70 k / ~0.4 %) — replays are post-miss, so the +1 rides an already-slow
+  path. Litmus N2 *dropped* to the =0 value (0022f150, was 00231860 at 14.3-d) — the replay serialization
+  changes the contended-atomic interleaving; it still PASSES (no forbidden), and litmus N4 is unchanged, so
+  it is a benign timing artifact of the stress test, not a reroute regression (boot cy *rising* confirms the
+  reroute engages).
+
+**🚨 R1 DCE deferred — a TB read-contract issue, not a design bug.** Converting `rdata_X` to a statement
+block (so `data_X[index]` DCEs → 3R1W) FAILS `test_cache_edge` at =1 while the full core ladder + Verilator
+pass. Root cause: `test_cache_edge` (a directed dcache TB) does not connect `i_ren_r`/`i_ren_folded` (all
+reads are non-folded) and samples `o_rdata` at **`i_ren=0`** (a passive read of the just-filled line at
+`tc=3/6/9`). With `i_ren=0`, `nf_replay=0` → `nf_reroute=0` → `nf_hit_sel` falls to `live_hit_rdata`
+(`rdata_X`); the reroute-only build keeps `rdata_X` live so it reads correctly, but the DCE build zeroes it.
+This is exactly the **fake-flop read the campaign is removing**: a realistic 1R1W SRAM cannot deliver
+combinational `o_rdata` for a held address without a driven read. The REAL core never samples `o_rdata` at
+`i_ren=0` (it always drives the read — `replay_hit_fire`/`o_hit_safe`/`o_data_valid` all need `i_ren`), so
+the fold is correct; only the TB's fake-flop sampling must be updated. R1 DCE is deferred to a focused
+follow-up that updates `test_cache_edge` to sample via a driven read (then `--dump-area` 3R1W).
+
+**⏭️ Next:** (1) update `test_cache_edge` to a driven-read sample + statement-block `rdata_X` → R1 DCE
+(4R1W→3R1W); (2) cross-line hi (`next_rdata_xline`, R4) nf serialize + statement-block `next_rdata` → R4 DCE
+(→2R1W); (3) 14.3-f default-on (Verilator ladder).
