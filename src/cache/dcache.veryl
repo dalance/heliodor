@@ -458,6 +458,10 @@ pub module dcache #(
     let next_hit_2    : logic     = valid_2[next_index] && tags_2[next_index] == next_tag;
     let next_hit_3    : logic     = valid_3[next_index] && tags_3[next_index] == next_tag;
     let next_line_hit : logic     = next_hit_0 || next_hit_1 || next_hit_2 || next_hit_3;
+    // Hit way of the NEXT line (cross-line misaligned hi dword) — the phase-1 read-port
+    // way select for the xline serialize (14.3-f). Only one way can hold {next_tag,
+    // next_index}, so this names the registered hi line's way in rd1_nf_line.
+    let next_hit_way  : logic<2>  = if next_hit_0 ? 2'd0 : if next_hit_1 ? 2'd1 : if next_hit_2 ? 2'd2 : 2'd3;
 
     let filling: logic = state == State::FILL;
 
@@ -667,6 +671,17 @@ pub module dcache #(
     // retire, no fill → no claim, no re-capture while replay_q=1) and re-drives the
     // stable MSHR address next cycle, when nf_ready delivers rd1_nf_rdata. See §14.9.
     const DCACHE_NF_REPLAY: bit = DCACHE_NF_REROUTE;
+    // 14.3-f isolation knob: gates ONLY the CROSS-LINE hi serialize (R4 =
+    // data_X[next_index], the last live consumer of the next-line read). A cross-line
+    // misaligned load needs BOTH the lo line (index) and the hi line (next_index) — two
+    // reads on one registered port, so they SERIALIZE: phase 0 registers the lo line
+    // (existing nf), phase 1 registers the hi line. The lo dword is captured
+    // (xline_lo_q) and held — with a §14.7 write-forward bypass for a store draining to
+    // the lo line during the hi read — so the final (unstalled) cycle delivers lo
+    // (xline_lo_q) + hi (from the registered hi line) TOGETHER, as the core's LSU
+    // samples o_rdata / o_rdata_next combinationally on the same cycle. Tracks
+    // DCACHE_NF_REROUTE but separable so an NBA hang can be pinned to the xline fold.
+    const DCACHE_NF_XLINE: bit = DCACHE_NF_REROUTE;
     // 14.3-e R1 DCE: R1 (rdata_0..3 = data_X[index], the live demand read) drops only
     // when EVERY consumer is off it — AMO/misaligned + replay via the nf reroute
     // (DCACHE_NF_REROUTE + DCACHE_NF_REPLAY), streaming via fill_crit_q (S4_STREAM);
@@ -677,6 +692,15 @@ pub module dcache #(
     // combinational held-address read at i_ren=0 (that fake-flop is what the 1R1W SRAM
     // removes) — the real core never samples o_rdata at i_ren=0; see §14.9.
     const DCACHE_R1_DCE: bit = DCACHE_NF_REROUTE && DCACHE_NF_REPLAY && S4_STREAM;
+    // 14.3-f R4 DCE: R4 (next_rdata_same / next_rdata_xline = data_X[next_index]) drops
+    // only when BOTH its consumers are off it — the same-line misaligned hi via the nf
+    // reroute (DCACHE_NF_REROUTE → rd1_next_same) and the CROSS-line hi via the xline
+    // serialize (DCACHE_NF_XLINE → rd1_next_same on the registered hi line). Gated on
+    // both so the §14.7 bisect configs keep next_rdata_* alive and correct. Only then
+    // may the two next-index reads DCE (STATEMENT blocks, not ternaries — the L2 P3.b
+    // lesson). With R1 (§14.10) and R4 dropped the data array is 2R1W (R2 rd1_index +
+    // R3 cap_index remain; R3 cap → true 1R is 14.3-f's follow-up).
+    const DCACHE_R4_DCE: bit = DCACHE_NF_REROUTE && DCACHE_NF_XLINE;
     // R1 read: default 0, else (if !DCACHE_R1_DCE) the live data_X[index] read. As a
     // statement block the four read ports DCE at DCACHE_R1_DCE=1.
     var rdata_0: logic<64>;
@@ -1840,6 +1864,20 @@ pub module dcache #(
     // dhit_rdata_d). Slot-1 (index2/next_index2, defined below o_rdata) joins the
     // arbiter in S4. Priority mux is byte-independent of which requester wins at 1.
     // ============================================================
+    // 14.3-f cross-line serialize state. A cross-line misaligned load (i_load_next,
+    // offset==7) with BOTH lines cached needs a SECOND registered read for the hi line
+    // (data_X[next_index]) — the last R4 consumer. xline_ph_q sequences the single
+    // registered port: phase 0 presents the lo line (index), phase 1 the hi line
+    // (next_index). xline_lo_q holds the captured lo dword (with a write-forward bypass)
+    // across the hi read so both deliver on the final cycle. DEAD at 0 (DCACHE_NF_XLINE
+    // → the phase never advances, nf_rd_* fold to the lo line = byte-identical).
+    var xline_ph_q: logic     ; // 0 = presenting lo (index), 1 = presenting hi (next_index)
+    var xline_lo_q: logic<64> ; // captured lo dword, held (bypassed) across the hi read
+    let xline_arm : logic     = DCACHE_NF_XLINE && i_ren && i_load_next && !next_same_line && cache_hit && next_line_hit;
+    // The nf read's current target line: lo (phase 0) or hi (phase 1, cross-line only).
+    let nf_rd_index: logic<INDEX_W> = if DCACHE_NF_XLINE && xline_ph_q ? next_index : index;
+    let nf_rd_tag  : logic<TAG_W>   = if DCACHE_NF_XLINE && xline_ph_q ? next_tag : tag;
+    let nf_rd_way  : logic<2>       = if DCACHE_NF_XLINE && xline_ph_q ? next_hit_way : hit_way;
     let rd1_req_demand: logic = i_ren_r; // Stage-A demand read (→ dhit at Stage-D)
     // 14.3-a (§14): the non-folded reads (AMO / misaligned-lo / streaming) have no
     // Stage-A strobe, so they present `index` LIVE at Stage-B here, below the folded
@@ -1853,7 +1891,7 @@ pub module dcache #(
     let rd1_index: logic<INDEX_W> = if rd1_req_demand ?
         index_r
     : if rd1_req_nf ?
-        index
+        nf_rd_index
     : if rd1_req_cap ?
         cap_index
     : if rd1_req_next ?
@@ -1910,7 +1948,8 @@ pub module dcache #(
     let nf_reroute: logic = i_amo_read || i_load_next || (DCACHE_NF_REPLAY && nf_replay);
     let nf_won    : logic = rd1_req_nf && !rd1_req_demand; // nf takes the read port this cycle
     var nf_won_q  : logic    ; // nf won the read port last cycle (line now in rd1_data_*)
-    var nf_addr_q : logic<58>; // {tag,index} of that registered nf line
+    var nf_addr_q : logic<58>; // {tag,index} of that registered nf line (lo or, in the
+    //                            xline serialize phase 1, the hi line — nf_rd_tag/index)
     always_ff (clk, rst) {
         if_reset {
             nf_won_q  = 1'b0;
@@ -1918,14 +1957,16 @@ pub module dcache #(
         } else if DCACHE_DATA_READ_1R {
             nf_won_q = nf_won;
             if nf_won {
-                nf_addr_q = {tag, index};
+                nf_addr_q = {nf_rd_tag, nf_rd_index};
             }
         }
     }
     // nf_ready: the registered nf line is present AND is the current request's line,
     // so the demanded dword extracts from it at the LIVE offset (the full 512-bit
-    // line is registered). Const-0 at 0.
-    let nf_ready: logic = DCACHE_DATA_READ_1R && nf_won_q && ({tag, index} == nf_addr_q);
+    // line is registered). In the xline serialize the target switches to {next_tag,
+    // next_index} in phase 1, so nf_ready re-asserts only once the hi line registers.
+    // Const-0 at 0.
+    let nf_ready: logic = DCACHE_DATA_READ_1R && nf_won_q && ({nf_rd_tag, nf_rd_index} == nf_addr_q);
     // The +1 registered-read stall for an AMO/misaligned-lo HIT: hold until nf owns
     // the line in rd1_data_* (nf_ready). Excludes streaming/miss (cache_hit=0 there;
     // the miss path / nf_gap_stall covers those). Requires i_ren: nf can only make
@@ -1934,15 +1975,20 @@ pub module dcache #(
     // deadlock (stall high, but nf can never win). The AMO clean-hit pin (pin_arm_hit,
     // combinational on this same cycle) covers the extra cycle, so the +1 does NOT
     // open a new remote-recall window — the §14.2-b make-or-break. Feeds o_stall.
-    let nf_reg_stall: logic = DCACHE_NF_REROUTE && i_ren && nf_reroute && cache_hit && !nf_ready;
-    // rd1_nf_line: the registered four-way line selected by the LIVE hit way (a
-    // {tag,index} match means the line is unchanged, so hit_way still names its way).
+    // nf_deliver_ready: for a cross-line load the read takes TWO registered reads (lo
+    // then hi), so the stall holds until the hi phase (xline_ph_q) is ready. Folds to
+    // nf_ready for every non-xline access (AMO / misaligned-lo / same-line / replay).
+    let nf_deliver_ready: logic = nf_ready && (!xline_arm || xline_ph_q);
+    let nf_reg_stall: logic = DCACHE_NF_REROUTE && i_ren && nf_reroute && cache_hit && !nf_deliver_ready;
+    // rd1_nf_line: the registered four-way line selected by the current read's hit way
+    // (a {tag,index} match means the line is unchanged, so the hit way still names it).
+    // In the xline serialize phase 1 nf_rd_way = next_hit_way selects the hi line.
     // rd1_nf_rdata / rd1_next_same (below) extract the lo / misaligned-hi dwords.
-    let rd1_nf_line : logic<512> = if hit_way == 2'd0 ?
+    let rd1_nf_line : logic<512> = if nf_rd_way == 2'd0 ?
         rd1_data_0
-    : if hit_way == 2'd1 ?
+    : if nf_rd_way == 2'd1 ?
         rd1_data_1
-    : if hit_way == 2'd2 ?
+    : if nf_rd_way == 2'd2 ?
         rd1_data_2
     :
         rd1_data_3
@@ -1962,6 +2008,45 @@ pub module dcache #(
     ;
     let rd1_dhit_rdata: logic<64> = rd_dword(rd1_dhit_line, dhit_off_q);
 
+    // 14.3-f cross-line serialize: sequence the single registered port over the two
+    // lines. Phase 0 presents the lo line (index) — the existing nf read; on nf_ready
+    // capture the lo dword (rd1_nf_rdata, already write-forward-bypassed for the
+    // same-cycle store via rd1_data_*) and advance to phase 1, which presents the hi
+    // line (next_index). While the lo dword is HELD it is kept current with a §14.7
+    // write-forward bypass for a store draining to the lo line (a d1_fire to the lo way
+    // at index — e.g. the concurrent store-drain at sindex==index): both the capture
+    // (base = rd1_nf_rdata, reflecting stores ≤ C-1) and every hold cycle (base =
+    // xline_lo_q) merge the this-cycle store so the delivery matches the =0 live read.
+    // Reset to phase 0 whenever not arming (load done / miss / not cross-line). DEAD at
+    // 0 (DCACHE_NF_XLINE → reset-only → DCE).
+    let xline_lo_wr      : logic     = ((d1_fire_0 && hit_way == 2'd0) || (d1_fire_1 && hit_way == 2'd1) || (d1_fire_2 && hit_way == 2'd2) || (d1_fire_3 && hit_way == 2'd3)) && (d1_idx == index);
+    let xline_lo_byp_cap : logic<64> = (rd1_nf_rdata & ~rd_dword(d1_msk, offset)) | (rd_dword(d1_new, offset) & rd_dword(d1_msk, offset));
+    let xline_lo_byp_hold: logic<64> = (xline_lo_q & ~rd_dword(d1_msk, offset)) | (rd_dword(d1_new, offset) & rd_dword(d1_msk, offset));
+    always_ff (clk, rst) {
+        if_reset {
+            xline_ph_q = 1'b0;
+            xline_lo_q = 64'd0;
+        } else if DCACHE_NF_XLINE {
+            if xline_arm {
+                if !xline_ph_q {
+                    if nf_ready {
+                        // phase 0 done: lo line registered. Capture the lo dword (merge a
+                        // store draining to the lo line THIS cycle) and start the hi read.
+                        xline_lo_q = if xline_lo_wr ? xline_lo_byp_cap : rd1_nf_rdata;
+                        xline_ph_q = 1'b1;
+                    }
+                } else {
+                    // phase 1: keep the held lo dword current while the hi line registers.
+                    if xline_lo_wr {
+                        xline_lo_q = xline_lo_byp_hold;
+                    }
+                }
+            } else {
+                xline_ph_q = 1'b0;
+            }
+        }
+    }
+
     // Read data: from hit way on cache hit, from the fill way for a streaming
     // hit (S14.1; the raw hits are all 0 then — the new line's tag is not
     // written yet and the victim's old tag cannot equal it), from memory
@@ -1975,7 +2060,10 @@ pub module dcache #(
     // (rd1_nf_rdata, +1 late, gated on nf_reroute); replay/streaming and the miss/mem
     // fallback stay live. At 0 nf_hit_sel folds to the live hit mux = exact original.
     let live_hit_rdata: logic<64> = if hit_0 ? rdata_0 : if hit_1 ? rdata_1 : if hit_2 ? rdata_2 : rdata_3;
-    let nf_hit_sel    : logic<64> = if DCACHE_NF_REROUTE && nf_reroute ? rd1_nf_rdata : live_hit_rdata;
+    // 14.3-f: in the xline serialize phase 1 the registered port holds the HI line, so
+    // the lo dword comes from the held xline_lo_q (o_stall keeps the core off it until
+    // the final delivery cycle, where lo = xline_lo_q and hi = rd1_next_same together).
+    let nf_hit_sel    : logic<64> = if DCACHE_NF_XLINE && xline_ph_q ? xline_lo_q : if DCACHE_NF_REROUTE && nf_reroute ? rd1_nf_rdata : live_hit_rdata;
     let o_rdata_live  : logic<64> = if cache_hit ? nf_hit_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata;
     let dhit_rdata_sel: logic<64> = if S1_DEMAND ? rd1_dhit_rdata : dhit_rdata_d;
     assign o_rdata = if uncached_active ? i_mem_rdata : if DCACHE_SYNC_READ ? (if dhit_use ? (if dhit_v_q ? dhit_rdata_sel : if stream_hit0 ? stream_rdata0 : i_mem_rdata) : o_rdata_live) : o_rdata_live;
@@ -1985,34 +2073,50 @@ pub module dcache #(
     // ⇒ pick the next line's hit way (filled by the hi_miss second fill above).
     // o_rdata_next_miss = a read is active and the next dword's line is not
     // cached (informational; the hi_miss path already stalls cross-line loads).
-    let next_rdata_same : logic<64> = if hit_0 ?
-        rd_dword(data_0[next_index], next_offset)
-    : if hit_1 ?
-        rd_dword(data_1[next_index], next_offset)
-    : if hit_2 ?
-        rd_dword(data_2[next_index], next_offset)
-    :
-        rd_dword(data_3[next_index], next_offset)
-    ;
-    let next_rdata_xline: logic<64> = if next_hit_0 ?
-        rd_dword(data_0[next_index], next_offset)
-    : if next_hit_1 ?
-        rd_dword(data_1[next_index], next_offset)
-    : if next_hit_2 ?
-        rd_dword(data_2[next_index], next_offset)
-    :
-        rd_dword(data_3[next_index], next_offset)
-    ;
+    // 14.3-f R4 DCE: both next-line reads (data_X[next_index]) as const-guarded
+    // STATEMENT blocks so the read port DCEs at DCACHE_R4_DCE=1 (a ternary let would
+    // NOT drop the port — the L2 P3.b lesson). At =1 the same-line hi comes from
+    // rd1_next_same (nf_reroute) and the cross-line hi from rd1_next_same on the
+    // registered hi line (the xline serialize), so neither block is consumed. Default 0.
+    var next_rdata_same : logic<64>;
+    var next_rdata_xline: logic<64>;
+    always_comb {
+        next_rdata_same  = 64'd0;
+        next_rdata_xline = 64'd0;
+        if !DCACHE_R4_DCE {
+            next_rdata_same = if hit_0 ?
+                rd_dword(data_0[next_index], next_offset)
+            : if hit_1 ?
+                rd_dword(data_1[next_index], next_offset)
+            : if hit_2 ?
+                rd_dword(data_2[next_index], next_offset)
+            :
+                rd_dword(data_3[next_index], next_offset)
+            ;
+            next_rdata_xline = if next_hit_0 ?
+                rd_dword(data_0[next_index], next_offset)
+            : if next_hit_1 ?
+                rd_dword(data_1[next_index], next_offset)
+            : if next_hit_2 ?
+                rd_dword(data_2[next_index], next_offset)
+            :
+                rd_dword(data_3[next_index], next_offset)
+            ;
+        }
+    }
     // 14.3-c (§14.5): at =1 the same-line misaligned hi dword extracts from the nf
     // registered line (rd1_nf_line) at the LIVE next_offset (the {tag,index} match in
     // nf_ready makes the full 512-bit line valid, so any dword is exact) — no separate
     // data_X[next_index] read (this absorbs R4's same-line usage). Gated on nf_reroute
-    // (a misaligned load is i_load_next). CROSS-line hi still reads live
-    // next_rdata_xline here; it joins the nf +1 serialize in 14.3-e, and the reroute
-    // is validated at =1 only as a cohesive unit. At 0 folds to the exact original.
+    // (a misaligned load is i_load_next).
+    // 14.3-f: the CROSS-line hi dword is served from rd1_next_same too — the xline
+    // serialize registers the HI line (nf_rd_way = next_hit_way) into rd1_nf_line by
+    // phase 1, so rd_dword(rd1_nf_line, next_offset) IS the hi dword on the delivery
+    // cycle (o_stall holds the core off it until then). Removes the last R4 read. At 0
+    // (DCACHE_NF_XLINE) folds back to the live next_rdata_xline = exact original.
     let rd1_next_same       : logic<64> = rd_dword(rd1_nf_line, next_offset);
     let next_rdata_same_sel : logic<64> = if DCACHE_NF_REROUTE && nf_reroute ? rd1_next_same : next_rdata_same;
-    assign o_rdata_next      = if next_same_line ? next_rdata_same_sel : next_rdata_xline;
+    assign o_rdata_next      = if next_same_line ? next_rdata_same_sel : if DCACHE_NF_XLINE ? rd1_next_same : next_rdata_xline;
     assign o_rdata_next_miss = i_ren && (if next_same_line ? !cache_hit : !next_line_hit);
 
     // Memory interface — S23 split, P9.2 rework.

@@ -1538,3 +1538,63 @@ to the 14.3-e reroute-only =1 (the DCE removes an unused read, so it is byte-ide
 
 **⏭️ Next:** cross-line hi (`next_rdata_xline`, R4) nf serialize + statement-block `next_rdata` → R4 DCE
 (3R1W→2R1W); then 14.3-f default-on (full Verilator ladder).
+
+### 14.11 ✅ R4 CROSS-LINE SERIALIZE + DCE LANDED (2026-07-14) — `data_X[next_index]` drops: 3R1W → 2R1W
+
+The last R4 consumer — a CROSS-line misaligned load's hi dword (`next_rdata_xline` = `data_X[next_index]`)
+— folds onto the single registered read port by SERIALIZING the two lines it needs. Committed DEAD at 0
+(byte-identical); the new `const DCACHE_NF_XLINE = DCACHE_NF_REROUTE` gates the serialize and
+`DCACHE_R4_DCE = DCACHE_NF_REROUTE && DCACHE_NF_XLINE` gates the port DCE (separable for a Verilator bisect).
+
+**The problem.** A same-line misaligned load reads ONE 512-bit line, so the nf registered read (14.3-c) yields
+both dwords (`rd1_nf_rdata` at `offset`, `rd1_next_same` at `next_offset`) from the SAME `rd1_nf_line`. A
+CROSS-line load (`offset==7`) needs the lo line (`index`) AND the hi line (`next_index`) — two reads, one
+registered port. The core's LSU samples `o_rdata` (lo) and `o_rdata_next` (hi) **combinationally on the SAME
+cycle** (`{i_load_data_next, i_load_data} >> byte_off*8` in `lsu.veryl`), so both must be valid together on
+the final delivery cycle; but the LSR re-drives the load every cycle while `dcache_stall=1` and completes on
+`!dcache_stall`, so extra stall cycles are free — only the *delivered data* must be right, not its latency.
+
+**The design (a 2-phase serialize with a held-dword write-forward bypass).**
+- **`xline_ph_q`** sequences the port: phase 0 presents the lo line (`index`, the existing nf read), phase 1
+  presents the hi line (`next_index`). `nf_rd_index`/`nf_rd_tag`/`nf_rd_way` switch the arbiter target +
+  `nf_addr_q`/`nf_ready`/`rd1_nf_line` way-select to the hi line in phase 1. `xline_arm` = a cross-line
+  misaligned load with BOTH lines cached; the phase advances 0→1 on the phase-0 `nf_ready` and resets to 0
+  when not arming (load done / miss / not cross-line).
+- **`xline_lo_q`** captures the lo dword at the phase-0 `nf_ready` and HOLDS it across the hi read (in phase 1
+  the registered port holds the HI line, so `rd1_nf_rdata` is no longer the lo). Delivery: `o_rdata =
+  xline_lo_q` (phase 1), `o_rdata_next = rd1_next_same` = `rd_dword(rd1_nf_line, next_offset)` on the
+  registered hi line — both on the final unstalled cycle.
+- **The held-dword hazard (the crux — same class as §14.7).** A store-drain (`d1_drain_fire` at `sindex`) can
+  land on the lo line WHILE `xline_lo_q` is held (the read port is busy on the hi line, so the §14.7 rd1_data
+  bypass — keyed on `rd1_index=next_index` — does NOT cover a write to `index`). So `xline_lo_q` carries its
+  OWN write-forward bypass: at the capture (`xline_lo_byp_cap`, base `rd1_nf_rdata`) and every hold cycle
+  (`xline_lo_byp_hold`, base `xline_lo_q`) it merges a `d1_fire` to the lo way at `index` for the this-cycle
+  store, so the held lo always equals the `=0` live read (`reflects stores ≤ C`).
+- **`nf_deliver_ready` = `nf_ready && (!xline_arm || xline_ph_q)`** extends `nf_reg_stall` through BOTH phases
+  (the stall no longer drops on the phase-0 lo-ready). Folds to `nf_ready` for every non-xline access
+  (AMO / misaligned-lo / same-line / replay) = byte-identical.
+- **No deadlock.** `rd1_req_demand = i_ren_r` (the folded Stage-A demand) is driven 0 by the core for a
+  non-folded misaligned load (the core excludes it, `dcache.veryl:809`), so nf wins the read port every
+  cycle in both phases — the priority-demand contention that a folded read would cause never arises here.
+
+**R4 DCE.** With both `next_rdata_same` (same-line, off via nf_reroute → `rd1_next_same`) and
+`next_rdata_xline` (cross-line, off via the xline serialize → `rd1_next_same`) converted to const-guarded
+STATEMENT blocks (`if !DCACHE_R4_DCE`), the four `data_X[next_index]` reads DCE at =1. With R1 (§14.10) and
+R4 gone the data array is **2R1W** (R2 `rd1_index` + R3 `cap_index` remain).
+
+**Validated — the FULL ladder + Verilator, all green.** `--dump-area` **`64×512 2R1W ×4`** (was 3R1W — R4
+gone). DEAD at 0: `veryl test` **252/0**, litmus N2 **`0022f150`** (byte-identical). =1 Veryl sim: default
+**252/0** · litmus N2 **`0022f150`** · litmus N4 **`00535020`** (NO forbidden) · **ACT4 696/0** (incl. the
+`misalign*` suites — cross-line misaligned in S-mode paging) · boot N1 7.1v **`013ec190`** / 6.6 **`01410b80`**
+· boot N2 SMP **`00fe5d30`**. =1 **Verilator** (the NBA ground truth — the §14.7 make-or-break gate): **N1
+boot `12144008`** and **N2 SMP boot `16662467`** — both PASS (x3==0xAA). The held-dword write-forward bypass
+is NBA-correct single- AND multi-hart. **IPC:** the cross-line serialize adds ~2-3 cy per cross-line
+misaligned load (rare), showing as a small boot slowdown ONLY on misaligned-heavy paths (N1 7.1v +0x2710 vs
+§14.10, Verilator N1 +0x67C8, N2 SMP +0x766); litmus N4 and the veryl-sim N2 SMP are unchanged (few/no
+cross-line misaligned loads). All-green includes the Veryl-sim ladder + both Verilator boots.
+
+**⏭️ Next: R3 cap → true 1R (2R1W → 1R1W).** The cap read (`cap_data` = `data_X[cap_index]`, R3) is the last
+non-arbitrated data read. Fold it onto `rd1_index` (the arbiter already has `rd1_req_cap` presenting
+`cap_index`; the 5 cap FSM latches are a present-then-latch that can ride the `+1` when demand stalls — watch
+the WB/probe-recall livelock) → statement-block `cap_data` → true 1R1W. Then **14.3-f default-on** (flip
+`DCACHE_DATA_READ_1R`/`DCACHE_NF_REROUTE` to 1 permanently, re-run the full Verilator ladder incl. N4).
