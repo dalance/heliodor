@@ -1598,3 +1598,32 @@ non-arbitrated data read. Fold it onto `rd1_index` (the arbiter already has `rd1
 `cap_index`; the 5 cap FSM latches are a present-then-latch that can ride the `+1` when demand stalls — watch
 the WB/probe-recall livelock) → statement-block `cap_data` → true 1R1W. Then **14.3-f default-on** (flip
 `DCACHE_DATA_READ_1R`/`DCACHE_NF_REROUTE` to 1 permanently, re-run the full Verilator ladder incl. N4).
+
+### 14.12 ✅ 14.3-f DEFAULT-ON (2026-07-14) — the 2R1W read side is the SHIPPED design (7R1W → 2R1W)
+
+`DCACHE_DATA_READ_1R` and `DCACHE_NF_REROUTE` flipped to **1 permanently** (user decision: bank the validated
+2R1W win now, do R3 cap → 1R1W as a follow-up). The whole staged read-fold stack is now live in the shipped
+design: **S1** demand (registered read) / **S2** fill-DONE (critical-word flop) / **S3** slot-1 (best-effort
+deny) / **14.3-c** AMO + misaligned-lo reroute / **14.3-d** streaming (fill_crit_q) / **14.3-e** replay
+reroute + R1 DCE / **14.3-f** cross-line serialize + R4 DCE. The dcache data array is a **2R1W** SRAM
+(R2 `rd1_index` arbitrated + R3 `cap_index`), down from the original 7R1W (the write side was already 1W via
+`DCACHE_DATA_1RW`). The per-fold bisect knobs (`S1_DEMAND`/`S2_FILL`/`S3_SLOT1`/`S4_STREAM`/
+`DCACHE_NF_REPLAY`/`DCACHE_NF_XLINE`) stay; set `DCACHE_DATA_READ_1R` back to 0 to restore the byte-identical
+7R1W live-read design for debugging.
+
+**This is a REAL design change (NOT byte-identical).** The synchronous registered read adds `+1` stalls to
+the non-folded paths (AMO / misaligned-lo / replay / cross-line serialize) — the small IPC cost the campaign
+accepts for the realistic-SRAM port reduction. The =1 behaviour was validated as a cohesive unit in
+§14.3-c..f + §14.10/§14.11; this flip just makes it the default, so the results carry over exactly.
+
+**Shipped baselines (=1, the new default).** `veryl test` **252/0** · litmus N2 **`0022f150`** · litmus N4
+**`00535020`** (no forbidden) · **ACT4 696/0** · boot N1 7.1v **`013ec190`** / 6.6 **`01410b80`** · boot N2
+SMP **`00fe5d30`** · boot N4 SMP **`015eccb0`**. **Verilator** (NBA ground truth): N1 boot **`12144008`**, N2
+SMP boot **`16662467`** — both PASS (x3==0xAA). (Prior =0 shipped baselines for reference: N2 SMP ~`00fd24b0`
+7R1W; the flip raises boot cy by the non-folded `+1` stalls.)
+
+**⏭️ Next: R3 cap → true 1R1W** (the final read fold). Present the victim/probe/mis/flush index during the
+preceding stall so the registered line is ready when the capture fires (present-then-latch). The eviction
+case is the crux: the fill overwrites the victim at `cap_index` from beat #0, so the victim MUST be registered
+BEFORE the fill's first write — present `f_index` during the miss/grant-wait stall (the "demand-stall hides
+the +1"), not at `fill_start_fire`. Then `cap_data` as a statement block → true **1R1W**.
