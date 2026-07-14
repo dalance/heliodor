@@ -645,6 +645,14 @@ pub module dcache #(
     const S1_DEMAND: bit = DCACHE_DATA_READ_1R; // demand read: rd1_dhit_rdata (reg) vs dhit_rdata_d (live)
     const S2_FILL  : bit = DCACHE_DATA_READ_1R; // fill-DONE: fill_crit_q (flop) vs fill_rdata_live
     const S3_SLOT1 : bit = DCACHE_DATA_READ_1R; // slot-1: best-effort deny vs live 2nd hit port
+    // 14.3-d (§14): streaming reroute. The mid-fill early-restart read (stream_rdata0
+    // = data_X[index], an R1 consumer) folds onto the S2 fill_crit_q flop: with CWF
+    // the streaming demand is the CRITICAL word (offset==fill_offset), whose value is
+    // exactly fill_crit_q (i_mem_rdata of beat #0 — the same equivalence S2 uses for
+    // o_fill_rdata). At =1 streaming serves ONLY the critical word from fill_crit_q
+    // (no R1 read); a non-critical stream hit (offset!=fill_offset) is DENIED and falls
+    // to the DONE path — best-effort, like S3 slot-1. Drops streaming's R1 dependency.
+    const S4_STREAM: bit = DCACHE_DATA_READ_1R; // streaming: fill_crit_q (critical only) vs data_X[index] (R1)
     // 14.3-c isolation knob: gates ONLY the nf delivery/stall reroute (AMO/misaligned
     // -lo → registered read), separate from DCACHE_DATA_READ_1R which also gates the
     // S1/S2/S3 folds (demand/fill/slot-1) + the nf regs. Set to 0 (with DATA_READ_1R=1)
@@ -873,6 +881,20 @@ pub module dcache #(
         }
     }
 
+    // S2 critical-word flop (§13.8): capture the demanded dword (fill_woff==
+    // fill_offset = CWF beat #0) so o_fill_rdata (DONE) and the 14.3-d streaming
+    // read source it from a flop instead of re-reading data_X[fill_index]. Defined
+    // here (before the streaming block that consumes it); the fill_rdata_live =0 arm
+    // + the o_fill_rdata const-mux stay below. Reset-only → DCE at 0.
+    var fill_crit_q: logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            fill_crit_q = 64'd0;
+        } else if S2_FILL && filling && i_memr_grant && (fill_woff == fill_offset) {
+            fill_crit_q = i_mem_rdata; // CWF beat #0 = the demanded dword
+        }
+    }
+
     // Phase 8 S14.1: streaming (early restart) on the pipe-0 read port. Fill
     // dword k commits to the data array at the granted FILL cycle where
     // fill_count==k, so dwords 0..fill_count-1 of the line BEING FILLED are
@@ -890,11 +912,20 @@ pub module dcache #(
     // (w - first_dword) mod 8 < fill_count.
     let stream_rel   : logic<3>  = offset - (if s14_cwf_en ? fill_offset : 3'd0);
     let stream_line  : logic<58> = {fill_tag, fill_index};
+    // 14.3-d (§14): at =1 restrict streaming to the CRITICAL word (stream_rel==0,
+    // i.e. offset==fill_offset) so stream_rdata0 folds onto fill_crit_q (below). A
+    // non-critical stream hit is denied here and completes via the DONE path — a
+    // best-effort deny (like S3 slot-1), so the R1 read drops. At 0 unrestricted =
+    // byte-identical.
     let stream_hit0  : logic     = s14_st_en && filling && stream_line == {tag, index}
         && stream_rel <: fill_count && !fill_aborted
+        && (!S4_STREAM || stream_rel == 3'd0)
         && !(i_inv_valid && {inv_tag, inv_index} == stream_line)
         && !(i_inv2_valid && {inv2_tag, inv2_index} == stream_line);
-    let stream_rdata0: logic<64> = if fill_way == 2'd0 ?
+    // 14.3-d: the streaming dword. At =1 stream_hit0 is critical-word only, and the
+    // critical word equals fill_crit_q (i_mem_rdata of beat #0), so serve the flop —
+    // no data_X[index] (R1) read. At 0 the live rdata_X hit mux = exact original.
+    let stream_rdata0_live: logic<64> = if fill_way == 2'd0 ?
         rdata_0
     : if fill_way == 2'd1 ?
         rdata_1
@@ -903,6 +934,7 @@ pub module dcache #(
     :
         rdata_3
     ;
+    let stream_rdata0: logic<64> = if S4_STREAM ? fill_crit_q : stream_rdata0_live;
 
     // ============================================================
     // P9.2 store drain = LOCAL MERGE into an owned (E/M) way — no bus
@@ -2075,14 +2107,6 @@ pub module dcache #(
             :
                 rd_dword(data_3[fill_index], fill_offset)
             ;
-        }
-    }
-    var fill_crit_q: logic<64>;
-    always_ff (clk, rst) {
-        if_reset {
-            fill_crit_q = 64'd0;
-        } else if S2_FILL && filling && i_memr_grant && (fill_woff == fill_offset) {
-            fill_crit_q = i_mem_rdata; // CWF beat #0 = the demanded dword
         }
     }
     assign o_fill_rdata = if S2_FILL ? fill_crit_q : fill_rdata_live;

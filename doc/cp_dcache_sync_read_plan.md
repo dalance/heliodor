@@ -1422,3 +1422,46 @@ de-risked** — the sim's write-before-read masks read-during-write NBA hazards.
 
 **⏭️ Next:** 14.3-d (streaming) → 14.3-e (R1/R4 DCE → 2R1W) → 14.3-f (default-on, now with the Verilator
 gate satisfiable). Re-run the FULL Verilator ladder (SMP boot N2/N4, litmus) at 14.3-f time.
+
+### 14.8 ✅ 14.3-d streaming reroute IMPLEMENTED + VALIDATED (2026-07-14) — the mid-fill early-restart read folds onto fill_crit_q, CYCLE-IDENTICAL, Verilator-clean
+
+Streaming (`stream_rdata0`, the hit-under-miss early-restart that reads the partially-filled line via
+`data_X[index]` = an R1 consumer) now sources the demanded dword from the S2 critical-word flop
+(`fill_crit_q`) instead of the live R1 read. Committed DEAD at 0 (byte-identical); the new `const S4_STREAM
+= DCACHE_DATA_READ_1R` gates it.
+
+**The equivalence (why fill_crit_q is exactly right).** With CWF (`s14_cwf_en=1`, always on) the fill bursts
+the demanded dword as beat #0, so a streaming demand is the CRITICAL word: `offset == fill_offset`, i.e.
+`stream_rel == 0`. Its value in the array is `data_{fill_way}[fill_index]` at dword `fill_offset` =
+`i_mem_rdata` of beat #0 = `fill_crit_q` — the SAME equivalence §13.8 (S2) already uses for `o_fill_rdata`.
+Timing lines up: `stream_hit0(critical)` needs `fill_count >= 1`, which becomes true at the same edge beat
+#0 writes `fill_crit_q`, and the flop holds stable through DONE.
+
+**Design:**
+- **`stream_hit0` restricted to the critical word at =1** (`&& (!S4_STREAM || stream_rel == 3'd0)`). A
+  non-critical stream hit (`offset != fill_offset`) is DENIED and completes via the DONE path — a
+  best-effort deny, like S3 slot-1. At 0 unrestricted = byte-identical.
+- **`stream_rdata0 = if S4_STREAM ? fill_crit_q : stream_rdata0_live`** (the live `rdata_X` hit mux renamed
+  to `stream_rdata0_live`, kept for the =0 arm). At =1 no `data_X[index]` read → streaming's R1 dependency
+  drops. (Ternary, not a statement block — the actual R1 port DCE waits for 14.3-e, which also needs the
+  replay consumer of `live_hit_rdata` off R1; converting the source `rdata_X` reads to `if !DCACHE_DATA_READ_1R`
+  statement blocks is 14.3-e's job.)
+- **`fill_crit_q` moved up** to before the streaming block (Veryl requires definition-before-reference for
+  module-level `let`/`var`; SV would allow the forward ref, Veryl does not). The `fill_rdata_live` =0 arm +
+  the `o_fill_rdata` const-mux stay in place (backward ref to the flop).
+
+**Validation — the FULL ladder, every result BYTE-IDENTICAL to the 14.3-c =1 baseline** (so the critical
+reroute is cycle-exact AND the non-critical deny NEVER fires — every streaming hit in the suite + all boots
+is the critical word, exactly as CWF predicts, so the deny is zero-IPC):
+- DEAD at 0: `veryl test` **252/0**, litmus N2 **`0022f150`** (byte-identical).
+- =1 Veryl sim: default **252/0** · litmus N2 **`00231860`** · litmus N4 **`00535020`** · **ACT4 696/0** ·
+  boot N1 7.1 **`01225ff0`** / 7.1v **`013d8910`** · boot N2 SMP **`00fd4bc0`** — ALL identical to 14.3-c =1.
+- =1 **Verilator** (the NBA ground truth — the §14.7 make-or-break gate): **N1 boot `12048346`** and
+  **N2 SMP boot `16590558`** — both PASS (x3==0xAA), both EXACT to the 14.7 full-stack baseline. Streaming
+  from the flop is Verilator-clean under single- and multi-hart NBA coherence.
+
+R1 (`data_X[index]`) at =1 now has ONE remaining consumer: `live_hit_rdata` (the **replay** non-folded hit,
+which delivers LIVE via `o_hit_safe` — the §14.6 note flagged rerouting it as misdelivering while o_hit_safe
+stays live). R4 (`data_X[next_index]`) still serves cross-line misaligned hi (`next_rdata_xline`, live).
+**⏭️ Next: 14.3-e** — fold the replay consumer + cross-line hi off R1/R4, then convert `rdata_X`/`next_rdata`
+to `if !DCACHE_DATA_READ_1R` statement blocks so both ports DCE (`--dump-area` 2R1W). Then 14.3-f default-on.
