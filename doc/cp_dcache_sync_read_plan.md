@@ -1516,3 +1516,25 @@ follow-up that updates `test_cache_edge` to sample via a driven read (then `--du
 **⏭️ Next:** (1) update `test_cache_edge` to a driven-read sample + statement-block `rdata_X` → R1 DCE
 (4R1W→3R1W); (2) cross-line hi (`next_rdata_xline`, R4) nf serialize + statement-block `next_rdata` → R4 DCE
 (→2R1W); (3) 14.3-f default-on (Verilator ladder).
+
+### 14.10 ✅ R1 DCE LANDED (2026-07-14) — `data_X[index]` drops: 4R1W → 3R1W
+
+`rdata_0..3` (the live demand read R1) converted to a const-guarded statement block gated on
+`DCACHE_R1_DCE = DCACHE_NF_REROUTE && DCACHE_NF_REPLAY && S4_STREAM` (all R1 consumers off — AMO/misaligned
++ replay rerouted, streaming on `fill_crit_q`, RMW-old dead at DCACHE_DATA_1RW=1; the `&&` of the three
+keeps the §14.7 bisect configs correct). At =1 the four `data_X[index]` read ports DCE.
+
+**`test_cache_edge` updated to the realistic-SRAM read model.** The §14.9 blocker: the TB sampled `o_rdata`
+at `i_ren=0` (a fake-flop held-address read the 1R1W SRAM removes). Rewrote its harness FSM to **drive
+`i_ren=1` and sample `o_rdata` on the completion cycle (`!o_stall` while driven)** — the demand fills, then
+the +1 nf registered-read handshake delivers the dword. Same conflict-miss + eviction + refill sequence,
+now via driven reads (matches how the real core always samples `o_rdata` under `i_ren=1`). Passes at =0 AND
+=1.
+
+**Validated:** `--dump-area` **`64×512 3R1W ×4`** (was 4R1W — R1 gone). DEAD at 0: `veryl test` **252/0**
+(incl. the rewritten `test_cache_edge`), litmus N2 **`0022f150`** (byte-identical). =1: **252/0**, litmus N2
+`0022f150`, boot N1 7.1 **`0122d520`** / 7.1v **`013e9a80`**, **Verilator N1 boot `12137740`** — all IDENTICAL
+to the 14.3-e reroute-only =1 (the DCE removes an unused read, so it is byte-identical, Verilator-clean).
+
+**⏭️ Next:** cross-line hi (`next_rdata_xline`, R4) nf serialize + statement-block `next_rdata` → R4 DCE
+(3R1W→2R1W); then 14.3-f default-on (full Verilator ladder).
