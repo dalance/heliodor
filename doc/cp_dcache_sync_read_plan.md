@@ -1795,3 +1795,63 @@ runtime. Set `TAG_SLOT1=0` (or `S3_SLOT1=0`) to restore the live slot-1 tag read
 workload). No full slow gate needed — this is DCE only (o_hit2 was already const-folded to 0), not a
 coherence change. Next: §15.2 (inv-match RMW fold) or §15.3 (probe/flush/victim arbitration onto a shared
 registered port) — both are real coherence changes and DO need the full slow gate + Verilator.
+
+### 15.4 Strategic finding (2026-07-15) — no easy tag folds remain; user picks the demand-tag split (§15.5)
+
+Investigating §15.2/§15.3 revealed there are **no more byte-identical or cheap folds** after §15.1:
+- **victim tag read** (`vic_valid`/`vic_tag`/`vic_dirty` at `f_index`) is **upstream** of the cap decision:
+  `cap_fill_go = fill_start_fire && vic_dirty` (`:1234`) → `cap_go_latch` → `cap_index`. Registering it would
+  break the cap-arbiter decision it feeds (circular). It needs a *present-early* read, not a +1 latch.
+- **probe** (`p_index` → `phit`/`p_dirty` → `probe_depart`/`o_probe_ack`/inv) and **inv** (`inv_index`/`inv2_index`
+  → the always_ff way-select RMW) both gate a same-cycle way-select/departure decision.
+- **presence-watch** (`chk`/`chk2`/`chk3` → `o_chk*_present`) gate the core's memory-model watch → a core
+  interface change to fold (hardest).
+
+Every remaining fold is a full-slow-gate coherence change, and the synth **area model shows zero change** for
+them (the tag RAM is priced by bit-capacity, not port count) — the win is purely SRAM *realism*, and none of
+them moves CP. Surfaced to the user (the campaign's headline is CP-halving, which the rare-read grind does not
+advance). **User chose: go directly to the demand-tag split (§15.5)** — the one tag fold that is also genuine
+deep-pipeline structure (it registers the hit into a stage), skipping the low-value §15.2/§15.3 grind.
+
+### 15.5 The demand-tag stage split (the tag R1→R2 unify — deep-pipeline structure)
+
+The Stage-B live `index` tag read (`hit_0..3` / `cache_hit` / `hit_way` / `hit_excl` / `hit_dirty`, `:379`+) is
+the last **hot** tag read: it gates o_hit/o_stall and feeds the miss/AMO/store/non-folded paths **live, same
+cycle**. The data reroute (§14.3-c..f) moved only the *data* to +1 while the *hit* stayed live (`nf_reg_stall`
+still keys on `cache_hit`, `:2135`). §15.5 moves the **hit itself** behind a registered tag read — a real
+pipeline stage (the hit is known one cycle later, off the SRAM's registered output). This is the deepest dcache
+change and the genuine deep-pipeline step; it is staged over multiple full-slow-gate flips.
+
+**The two demand tag reads** (the tag R1/R2 pair, exactly like the data R1/R2):
+- `index_r` (Stage-A, `:859`) → `cache_hit_r`/`hit_way_r` → registered into `dhit_*_q` (the folded plain-load
+  hit, decided a cycle early for load-use latency). The SRAM-registered-shaped read.
+- `index` (Stage-B, `:258`) → `cache_hit` etc. → the LIVE hit for every non-Stage-A accessor.
+
+**Staged reroutes (each a flip, full slow gate):**
+- **S0 (this) — the tag-read arbiter spine.** Register valid/tags/dirty/excl at `rd1_index` (the EXISTING data
+  arbiter index, already sequencing demand `index_r` / nf `index` / cap / next / fill) into `rt1_*`. A real
+  synchronous SRAM tag read (present rd1_index @N, four-way tag state @N+1). DEAD at 0 (`rt1_*` reset-only →
+  DCE; no consumer → tags stay 13R1W, byte-identical). Confirmed `--dump-area` 13R1W, gates/FFs unchanged.
+- **S1 — demand plain-load hit off `rt1` (drops `index_r`, 13R1W → 12R1W).** Source `dhit_*_q` from `rt1_*`
+  (registered tags at rd1_index = index_r, presented by rd1_req_demand) instead of the live `cache_hit_r`. The
+  hit is then a true 2-cycle SRAM read; `index_r`'s tag read DCEs. IPC: the hit is known at Stage-D not Stage-A
+  → the load-use fold (§11.2) shifts; measure. Needs the write-forward bypass (§14.7) once Verilator can hang.
+- **S2 — nf/miss/AMO/store hit off `rt1` (drops `index`, 12R1W → fewer).** Reroute `cache_hit` (the Stage-B
+  live hit) to the registered `rt1` hit for the non-folded accessors, aligned with the +1 data they already
+  take (`nf_reg_stall`). This is the SMP-critical finale (AMO atomicity, the §11.11/§14.14 crux class). Store
+  (`sindex`) and misaligned (`next_index`) may fold here or stay as their own arbiter phases.
+- Realistic end: the demand tag becomes registered (the deep-pipeline stage); store-drain / presence-watch may
+  remain as separate live ports → a small NR1W, not necessarily strict 1R1W.
+
+**Why S0 is only the spine:** there is no byte-identical *intermediate* — `rt1` with no consumer is fully
+DCE'd, and the first real consumer (S1) is a +1 hit-timing change (not byte-identical). So S0 reserves the
+infrastructure (the const + the registers + the arbiter piggyback) exactly like the data S0 (§13.7); the
+measurable reduction begins at S1 (a flip, full slow gate).
+
+#### 15.5-S0 ✅ IMPLEMENTED (2026-07-15) — the tag-read arbiter spine, byte-identical
+
+`const DCACHE_TAG_READ_1R = 0` (DEAD). `rt1_valid_0..3` / `rt1_tags_0..3` / `rt1_dirty_0..3` / `rt1_excl_0..3`
+register the four-way tag state at `rd1_index` in an `else if DCACHE_TAG_READ_1R` always_ff (reset-only at 0).
+`--dump-area`: tags `64×52 13R1W ×4` unchanged, gates 46589 / FFs 4311 unchanged (rt1 DCE'd) = byte-identical.
+Verified `veryl test` 252/0. Next: S1 (demand plain-load hit off rt1 → drops index_r) — a flip needing the full
+slow gate (Verilator N1/N2 + litmus N4 + SMP N2/N4 boot).
