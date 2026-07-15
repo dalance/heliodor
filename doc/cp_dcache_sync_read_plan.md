@@ -1707,3 +1707,91 @@ N1 +0x14690); the multi-hart boots are timing-dominated by inter-hart sync so SM
 the 2R1W baseline. The per-source bisect knobs (`CAP_FILL/PROBE/MIS/FLUSH_1R`) stay; set `DCACHE_CAP_1R=0` to
 restore the byte-identical 2R1W live-cap-read design. The dcache read side is DONE — the next SRAM front is
 the tag arrays (still 15R1W, `--dump-area` `64×52 15R1W ×4`).
+
+---
+
+## 15. The TAG array read-port reduction (`64×52 15R1W ×4` → …) — the last dcache SRAM front
+
+User-selected (2026-07-15 "次へ", after the data array reached true 1R1W in §14.14). The dcache
+**tag/valid/dirty/excl** array — `valid_0..3` / `tags_0..3` / `dirty_0..3` / `excl_0..3`, which the
+synth groups per way into `64×52` (the 52 = TAG_W + valid + dirty + excl) — is **`64×52 15R1W ×4`**
+(`veryl synth --top dcache --dump-area`). This is the SECOND (and last) dcache SRAM macro. The write
+side is already 1W (the four writers — fill / inv / store-dirty / drain — are mutually exclusive in the
+`always_ff` → one muxed write port); this section is the read side (15R → fewer).
+
+**Why tags are harder than data.** The data reads are all *eventually-consumed* (a registered read + a
+write-forward bypass reproduces the live value, §14.7), so every data read folded onto ONE arbitrated
+registered port. The tag reads mostly gate **combinational hit determination in the same cycle**
+(`cache_hit = valid_X[index] && tags_X[index]==tag` → `o_hit` / `o_stall`), which a synchronous SRAM read
+cannot serve (present index N, data at N+1). So the tag fold is the same SMP-critical class as §14 PLUS a
+comb-timing constraint — the reduction is staged and each real fold needs the **full slow gate**
+(Verilator N1/N2 + litmus N4 + SMP N2/N4 boot): a mis-timed tag/valid read is a silent coherence bug (a
+stale hit reads departed data; a stale presence-check drops a watch/poison → lost-update).
+
+### 15.1 The 15 read-index nets (`--dump-area` = `64×52 15R1W ×4`)
+
+Grouped by consumer + timing. "gates o_stall/o_hit" = combinational same-cycle critical.
+
+| # | net | RTL site | reads | consumer | timing | fires | fold class |
+|---|---|---|---|---|---|---|---|
+| T1a | `index` = `i_addr[IW+5:6]` | `:379` `hit_0..3`, `:441` `hit_excl`, `:1087` `hit_dirty` | demand hit (live) | `o_hit`, `o_stall`, non-folded delivery | **comb, same-cy** | every IDLE access | **demand — the survivor** (fold T1b onto it, or vice-versa) |
+| T1b | `index_r` = `i_addr_r[IW+5:6]` | `:862` `hit_r_0..3` | Stage-A registered hit | `dhit_*_q` (folded plain-load) | **registered** (SRAM-shaped, Stage-A→D) | every folded plain load | demand — the SRAM registered form (§11.7 groundwork) |
+| T2 | `sindex` = `i_saddr[IW+5:6]` | `:505` `shit_0..3`, `:511` `s_hit_excl` | store-drain hit | store-drain merge / evict | **comb, same-cy** | store-buffer drain | arbitrate onto demand w/ stall, OR keep live |
+| T3 | `next_index` = `index+8` | `:465` `next_hit_0..3`, `:1091` `next_hit_dirty` | misaligned hi-line hit | `o_rdata_next` path, cross-line evict | **comb, same-cy** | misaligned cross-line load | rare → serialize onto demand (§14.11-class) |
+| T4a | `f_index_raw` (mux `:559`) | `:566` `fm_0/1`, `:573` `has_invalid`, `:574` `invalid_way` | victim select | fill victim way + `o_evict1` | comb, during miss | fill start | during stall — arbitrate cheaply |
+| T4b | `f_index` (`f_index_q`/raw `:802`) | `:812-836` `vic_tag`/`vic_dirty` | writeback-victim capture | `ev_fill_vic`, `o_evict1_addr`, WB | comb, during fill | dirty eviction | during stall — arbitrate cheaply |
+| T5a | `index2` = `i_addr2[IW+5:6]` | `:2429` `hit2_0..3` | slot-1 demand hit | `o_hit2`, `o_rdata2` | comb, same-cy | slot-1 dual-issue load | **best-effort deny** (o_hit2 already 0 via S3_SLOT1) |
+| T5b | `next_index2` = `index2+8` | `:2467` `next_hit2_0..3` | slot-1 misaligned hit | `o_rdata2_next` | comb, same-cy | slot-1 misaligned | best-effort deny (with T5a) |
+| T6a | `chk_index` = `i_chk_addr[IW+5:6]` | `:2547` `chk_hit` | line-presence watch | `o_chk_present` (LR/SC watch) | comb, same-cy | watch active | presence-only — register OR time-mux (coherence-sensitive) |
+| T6b | `chk2_index` | `:2556` `chk2_hit` | 2nd presence watch | `o_chk2_present` | comb, same-cy | watch active | presence-only |
+| T6c | `chk3_index` | `:2566` `chk3_hit` | AMO-watch presence | `o_chk3_present` | comb, same-cy | AMO watch | presence-only |
+| T7a | `p_index` = `i_probe_addr[IW+5:6]` | `:1107` `phit_0/1`, `:1112` `p_dirty` | probe hit | `probe_depart`, `o_probe_ack`, inv | comb, same-cy | remote probe (rare) | arbitrate onto demand w/ stall |
+| T7b | `fl_set` = `fl_idx[IW+1:2]` | `:1141` `fl_set_clean`, `:1162` `fl_tag` | flush sweep | CMO flush WB + inv | comb, during flush | CMO.flush/clean | arbitrate (flush is a walk, already multi-cycle) |
+| T7c | `inv_index` = `i_inv_addr[IW+5:6]` | `:1901` (always_ff RMW) `valid_X[inv_index] && tags_X==inv_tag` | remote-inv match | next-edge invalidate | registered-write-side read | remote store inv (rare) | fold into the write port's RMW, OR arbitrate |
+| T7d | `inv2_index` = `i_inv2_addr[IW+5:6]` | `:1919` (always_ff RMW) | 2nd remote-inv match | next-edge invalidate | registered-write-side read | remote store inv (rare) | with T7c |
+
+(T1a/T1b are the SAME logical demand tag read at two stages — the exact tag analog of the data R1/R2 pair.
+`inv_hits_active` / `inv2_hits_active` at `:401`/`:404` compare `index == i_inv_addr[…]` — a comparison, not
+an array read; the actual `inv_index` array reads are the always_ff RMW guards at `:1901`/`:1919`.)
+
+### 15.2 Staged plan (cheapest / safest first)
+
+1. **§15.1 (T5) slot-1 tag deny — 15R1W → 13R1W. FREE, byte-identical. ← implemented (this session).** Slot-1
+   is already best-effort denied (`o_hit2 = !S3_SLOT1 && … = 0` at S3_SLOT1=1), so `hit2_*` / `next_hit2_*`
+   are dead at runtime; wrapping them in a `TAG_SLOT1` const block lets `valid_X[index2]` /
+   `tags_X[next_index2]` DCE. Exact tag analog of the S3 data-slot-1 deny (§13.9). Needs only the fast gate +
+   `--dump-area` (byte-identical, not a coherence change).
+2. **§15.2 (T7c/T7d) inv-match reads fold into the write RMW — 13R1W → 11R1W.** The `inv_index`/`inv2_index`
+   reads are already inside the `always_ff` (the invalidate RMW: read `valid&&tag==inv_tag`, conditionally
+   write `valid=0`). If the synth counts them as separate read ports, restructuring the guard so the read
+   shares the write port's address-mux (or precomputing the match one stage earlier) may drop them. Needs
+   study — the inv match is coherence-critical (a missed inv = stale hit). Full slow gate.
+3. **§15.3 (T7a/T7b/T4) probe / flush / victim reads arbitrate onto a shared registered port — the cap analog.**
+   Rare, mostly fire while the pipe is already stalled (fill / flush-walk / probe). A `+1`-latch arbiter (like
+   the data cap fold §14.14) presents their index, stalls demand one cycle, registers the tag. Coherence-
+   neutral if the invalidate/notify stay at the event cycle (only the tag SOURCE moves). Full slow gate.
+4. **§15.4 (T6) presence-watch reads.** Three concurrent presence queries (`o_chk*_present`) that gate the
+   core's memory-model watch. Options: register (1-cycle-late presence — needs the core's watch to tolerate a
+   stale-by-one presence, coherence-sensitive), or time-multiplex with core cooperation (drops i_chk2/i_chk3
+   ports — a cross-module change). Hardest coherence call; defer.
+5. **§15.5 (T1/T2/T3) demand + store-drain + misaligned onto the registered port — true 1R1W.** The §14-class
+   R1→R2 unify for tags: reroute the non-folded live-tag consumers (store-drain hit, AMO/replay, misaligned)
+   onto the Stage-A registered tag (`index_r`), accepting `+1` stalls. This is the deep, SMP-critical finale —
+   only after §15.2–15.4 shrink the surface. May land at a small NR1W (not strictly 1) if a presence port must
+   stay live.
+
+**Realistic end-state:** likely **2–4R1W** (demand-registered + maybe a live presence port + the arbitrated
+rare port), not necessarily a strict 1R1W — the comb presence-watch (T6) may resist folding without a core
+interface change. Each step past §15.1 is a coherence change → full slow gate (§13.5 ladder + Verilator).
+
+### 15.3 ✅ §15.1 IMPLEMENTED (2026-07-15) — slot-1 tag deny, 15R1W → 13R1W, byte-identical
+
+`const TAG_SLOT1 = S3_SLOT1` (default 1). `hit2_0..3` / `next_hit2_0..3` are now `var` + `always_comb` with
+`if !TAG_SLOT1 { … }` (default 0), so the `index2` / `next_index2` tag reads DCE. `--dump-area`:
+`64×52 15R1W ×4 → 13R1W ×4` (data array unchanged at `64×512 1R1W ×4`). Byte-identical: `o_hit2` was already
+0 (S3_SLOT1=1), so the gated `hit2_*` only feed `o_rdata2` / `o_rdata2_next` (consumed iff `o_hit2`) — dead at
+runtime. Set `TAG_SLOT1=0` (or `S3_SLOT1=0`) to restore the live slot-1 tag reads. Verified: `veryl test`
+**252/0** · litmus N2 `cy=00231860` (= the §14.14 shipped baseline, byte-identical on a multi-hart coherence
+workload). No full slow gate needed — this is DCE only (o_hit2 was already const-folded to 0), not a
+coherence change. Next: §15.2 (inv-match RMW fold) or §15.3 (probe/flush/victim arbitration onto a shared
+registered port) — both are real coherence changes and DO need the full slow gate + Verilator.
