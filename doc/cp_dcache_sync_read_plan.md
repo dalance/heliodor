@@ -1627,3 +1627,43 @@ preceding stall so the registered line is ready when the capture fires (present-
 case is the crux: the fill overwrites the victim at `cap_index` from beat #0, so the victim MUST be registered
 BEFORE the fill's first write — present `f_index` during the miss/grant-wait stall (the "demand-stall hides
 the +1"), not at `fill_start_fire`. Then `cap_data` as a statement block → true **1R1W**.
+
+### 14.13 🔬 R3 cap → 1R1W — feasibility + design (investigated 2026-07-15, NOT yet implemented)
+
+The cap read (`cap_data` = `data_X[cap_index]`, an 8-dword WHOLE-LINE read into the writeback buffer
+`wb_data`) is the last non-arbitrated data read (R3). Folding it onto `rd1_index` needs a per-source
+present-then-latch. A read-only FSM trace (the 5 sources: `cap_fill_go` evict / `cap_probe_go` recall /
+`cap_mis_go` misaligned-detour lo+hi / `cap_flush_go` sweep) found the fold is tractable but coherence-critical
+and needs **two distinct capture mechanisms** — this is qualitatively the hardest fold in §14:
+
+- **Fill (eviction) — present-early, coherence-neutral.** `f_index`/`victim_way` are already registered
+  (`f_index_q`/`victim_way_q`, DCACHE_SYNC_READ), and `fill_start_fire` is preceded by a grant-wait stall
+  (`= … && i_memr_grant`; the request precedes the grant by ≥1 cycle). So present `f_index_q`/`victim_way_q`
+  via a high-priority pre-fill arbiter request DURING the grant-wait; `rd1_data` holds the victim by
+  `fill_start_fire`; latch `wb_data` there (same cycle as `wb_v`, synchronized). The victim-integrity window
+  is exactly the fill-start cycle — the fill RMW overwrites `data_X[f_index]` from beat #0 (next cycle), so
+  the victim MUST be captured from the pre-registered read, never a +1-late read. The pre-fill request must
+  WIN the port during the stall (demand isn't progressing then, so give it priority).
+- **Probe / mis / flush — +1-latch with a `wb_data_ready` gate, coherence-neutral.** These fire
+  combinationally with NO preceding stall to present early. Present `cap_index` at the `cap_*_go` cycle
+  (the existing `rd1_req_cap`), latch `wb_data` from `rd1_data[cap_way_q]` the NEXT cycle. Keep `wb_v` /
+  the line invalidation / `o_evict1_v` / `o_probe_ack` AT `cap_*_go` (UNCHANGED — the line's DATA survives
+  invalidation, only `valid` clears, and no writer touches `cap_index` right after for these three). The
+  drain reads `wb_data` combinationally (`o_memw_wdata = wb_data` when `wb_v`, single-cycle full-line write
+  on `wb_fire = wb_v && i_memw_grant`); today `wb_v`+`wb_data` are set by the SAME NBA at `cap_*_go`, both
+  valid next cycle. With a +1 `wb_data` latch, gate `wb_fire` on a new `wb_data_ready` flag so the drain
+  can't read `wb_data` before it lands (≤1 extra drain cycle only if the write grant was instant). This
+  keeps ALL coherence timing at `cap_*_go`; only the drain's first beat may slip one cycle.
+
+Then `cap_data` → a `if !DCACHE_CAP_1R` statement block so `data_X[cap_index]` DCEs → **1R1W**.
+
+**Why it's the hard one (and needs the full slow gate).** Unlike R1/R4 (single-dword load delivery), cap is
+a whole-line writeback capture fused with line invalidation + the coherence eviction notify. The design above
+is coherence-NEUTRAL by construction (capture timing / notify / invalidate all stay at `cap_*_go`; only the
+data SOURCE changes and the drain's first beat may slip), but the failure modes (a stale writeback = silent
+dirty-data loss; a probe-recall or eviction-notify livelock) are exactly what only Verilator + the litmus N4
+battery + SMP boot catch — and those runs are ~15–55 min each on this box. Implement behind `DCACHE_CAP_1R=0`
+(byte-identical DEAD), then flip + run the FULL ladder incl. Verilator N1/N2 + litmus N4 + SMP N2/N4 boot.
+Alternative if the +1-latch coherence proves fragile: a uniform "+1-arm" that delays the WHOLE capture
+(wb_v + invalidate + notify + fill-start) by one cycle — simpler/atomic but shifts coherence timing +1 for
+the rare cap events (the memory-model livelock risk the campaign has flagged).
