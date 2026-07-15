@@ -1667,3 +1667,43 @@ battery + SMP boot catch — and those runs are ~15–55 min each on this box. I
 Alternative if the +1-latch coherence proves fragile: a uniform "+1-arm" that delays the WHOLE capture
 (wb_v + invalidate + notify + fill-start) by one cycle — simpler/atomic but shifts coherence timing +1 for
 the rare cap events (the memory-model livelock risk the campaign has flagged).
+
+### 14.14 ✅ R3 cap → 1R1W IMPLEMENTED + DEFAULT-ON (2026-07-15) — the dcache data array is TRUE 1R1W
+
+`DCACHE_CAP_1R=1` is the shipped default. The dcache data array is now **`64×512 1R1W ×4`** (`--dump-area`),
+down from 2R1W — the campaign's dcache-read goal (a true 1R1W SRAM macro) is complete. cap_data (R3, the
+whole-line writeback capture) folds onto the arbitrated registered read; its `data_X[cap_index]` reads DCE.
+
+**Deviation from the §14.13 sketch — a UNIFORM +1-latch for all four sources (fill included), not fill
+present-early.** §14.13 argued fill needs present-early (register the victim BEFORE `fill_start_fire`) because
+the fill overwrites the victim. But the +1-latch reads `rd1_data` — a REGISTERED (read-OLD) port: at the
+`cap_*_go` cycle C the arbiter presents `cap_index` at TOP priority, and next cycle `rd1_data` holds the line
+as it was DURING C. For fill the beat-0 write lands at C+1 (state==FILL) and `drain_fill_set_clash` bars a
+same-cycle store to `f_index`, so the registered line = the =0 live victim exactly — no present-early needed.
+This unifies all four sources (fill / probe / mis / flush) under one mechanism: set `wb_v`/invalidate/notify at
+C (UNCHANGED = coherence-neutral), latch `wb_data` (→ `wb_data_lat`) from `rd1_data[cap_way_q]` at C+1, gate
+the drain + channel request on `wb_data_rdy_q` (the writeback's first beat slips ≤1 cycle). `wb_folded_q`
+marks the current `wb_v` as fold-sourced so the o_memw_wdata mux + drain-ready gate pick `wb_data_lat`; a
+disabled/live source (bisect) keeps the combinational `wb_data` and drains immediately.
+
+**The port-priority crux (§14 flagged) + the KEY multi-hart bug.** cap takes the port at TOP priority (above
+demand and nf), so a preempted access must not misdeliver. A folded demand HIT preempted by the cap present
+replays via `dhit_cap_pre_q` → the dhit squash (o_stall + drop o_hit_safe/o_data_valid, like the C3 inv
+squash; bounded +1 since no new cap fires while `wb_v`). 🚨 The nf path (AMO / replay / misaligned) needed the
+same care: `nf_won = rd1_req_nf && !rd1_req_demand` ASSUMED nf wins when demand isn't requesting, but a cap
+capture now preempts nf too — without `&& !cap_go_latch` the stale `nf_won_q`/`nf_ready` deliver the CAP line
+to the preempted nf read. Single-hart boots + ACT4 + litmus N4 all PASSED with the bug present (litmus lines
+are clean → no dirty writeback → cap never engages; single-hart has no remote probes), so **only the SMP N2
+BOOT caught it** — a real-workload multi-hart wedge (both harts stuck, ~`05f5e100` timeout). Fix: exclude
+`cap_go_latch` from `nf_won` (the preempted nf then stalls via `nf_reg_stall` and re-wins the port next cycle).
+Lesson: litmus byte-identical ≠ cap-exercised; the SMP boot is the cap fold's real gate.
+
+**Verified — the full ladder, all green.** `veryl test` **252/0** · litmus N2 `00231860` / N4 `00535020` (no
+forbidden) · **ACT4 696/0** · boot N1 7.1v `013ee8a0` / 6.6 `014159a0` · SMP N2 `00fe5d30` · SMP N4
+`015eccb0` (both x3==0xAA). **Verilator** (NBA ground truth, the make-or-break): N1 `12158698`, N2 `16662135`
+— both PASS (x3==0xAA), so the +1-latch + preempt-squash + nf-stall are NBA-correct single- AND multi-hart.
+IPC: the non-folded `+1` drain slip on dirty evictions raises single-hart boot cy (N1 7.1v +0x2710, Verilator
+N1 +0x14690); the multi-hart boots are timing-dominated by inter-hart sync so SMP N2/N4 cy are unchanged from
+the 2R1W baseline. The per-source bisect knobs (`CAP_FILL/PROBE/MIS/FLUSH_1R`) stay; set `DCACHE_CAP_1R=0` to
+restore the byte-identical 2R1W live-cap-read design. The dcache read side is DONE — the next SRAM front is
+the tag arrays (still 15R1W, `--dump-area` `64×52 15R1W ×4`).
