@@ -292,6 +292,15 @@ pub module dcache #(
     var wb_v   : logic        ;
     var wb_line: logic<58>    ;
     var wb_data: logic<64> [8];
+    // 14.13 R3 cap → 1R1W: the +1-latch writeback-capture state (assigned in the
+    // cap-latch always_ff after rd1_data; declared here so the early wb_fire drain-ready
+    // gate can read wb_folded_q / wb_data_rdy_q). All reset-only → DCE at DCACHE_CAP_1R=0.
+    var cap_way_q     : logic<2>     ; // way of the folded cap capture (for rd1_cap_line)
+    var cap_pending_q : logic        ; // a +1-latch is due this cycle (set at cap_go_latch)
+    var wb_folded_q   : logic        ; // the current wb_v came from a FOLDED cap source
+    var wb_data_rdy_q : logic        ; // wb_data_lat holds the latched line (drain may fire)
+    var dhit_cap_pre_q: logic        ; // a folded demand HIT was preempted by the cap present
+    var wb_data_lat   : logic<64> [8]; // the +1-latched writeback data (folded source)
 
     // Pseudo-LRU tree: 3 bits per set
     // bit[2]: root → 0=left(way 0,1), 1=right(way 2,3)
@@ -709,6 +718,36 @@ pub module dcache #(
     // lesson). With R1 (§14.10) and R4 dropped the data array is 2R1W (R2 rd1_index +
     // R3 cap_index remain; R3 cap → true 1R is 14.3-f's follow-up).
     const DCACHE_R4_DCE: bit = DCACHE_NF_REROUTE && DCACHE_NF_XLINE;
+    // 14.13 R3 cap → true 1R1W (the FINAL read fold): the last non-arbitrated data read
+    // is cap_data = data_X[cap_index], the whole-line writeback-buffer capture (R3). Its
+    // five sources (fill-evict / probe-recall / misaligned-detour lo+hi / flush-sweep)
+    // are mutually exclusive per cycle (the cap_*_go priority chain), so they share ONE
+    // read. Fold cap_data onto rd1_index via a UNIFORM +1-latch: at the cap_*_go cycle C
+    // present cap_index on the arbiter with TOP priority (above demand — a preempted
+    // folded demand load replays via a dhit squash, dhit_cap_pre_q; cap events are rare)
+    // and set wb_v / invalidate / the evict/probe notify UNCHANGED at C; the NEXT cycle
+    // latch wb_data (→ wb_data_lat) from the registered read rd1_data[cap_way_q]. The
+    // drain gates on wb_data_rdy_q so the first writeback beat may slip ≤1 cycle.
+    // Coherence-neutral by construction (only the data SOURCE changes; invalidate + the
+    // evict/probe notify stay at cap_*_go). Fill is safe under the same +1-latch: the
+    // beat-0 fill write to the victim lands at C+1 (state==FILL) while rd1_data holds the
+    // read-OLD victim registered at C, and drain_fill_set_clash bars a same-cycle store
+    // to f_index, so the registered line = the =0 live victim exactly. Then cap_data DCEs
+    // (statement block) → true 1R1W. DEAD at 0 (byte-identical: cap_data stays the live
+    // read, the +1-latch path is reset-only → DCE, the priority mux folds to the original
+    // demand>nf>cap). NEEDS the full slow gate (Verilator N1/N2 + litmus N4 + SMP N2/N4
+    // boot): a stale writeback = silent dirty-data loss, a probe-recall/evict livelock.
+    const DCACHE_CAP_1R: bit = 0;
+    // Per-source bisect knobs (track DCACHE_CAP_1R): fold each cap source independently so
+    // a coherence failure can be pinned to one source. A disabled source keeps its LIVE
+    // cap_data capture (wb_folded_q=0 → the live wb_data drains immediately); cap_data DCEs
+    // only when ALL four are folded (DCACHE_CAP_DCE).
+    const CAP_FILL_1R : bit = DCACHE_CAP_1R; // fill-victim eviction writeback
+    const CAP_PROBE_1R: bit = DCACHE_CAP_1R; // probe-recall writeback
+    const CAP_MIS_1R  : bit = DCACHE_CAP_1R; // misaligned-store dirty detour (lo+hi)
+    const CAP_FLUSH_1R: bit = DCACHE_CAP_1R; // flush-sweep writeback
+    // cap_data DCE gate: only when every consumer is off the live read.
+    const DCACHE_CAP_DCE: bit = CAP_FILL_1R && CAP_PROBE_1R && CAP_MIS_1R && CAP_FLUSH_1R;
     // R1 read: default 0, else (if !DCACHE_R1_DCE) the live data_X[index] read. As a
     // statement block the four read ports DCE at DCACHE_R1_DCE=1.
     var rdata_0: logic<64>;
@@ -1136,7 +1175,12 @@ pub module dcache #(
     let amo_miss : logic = i_ren && i_wen && !cache_hit;
     let wen_fires: logic = i_wen && !i_wen_excl && state == State::IDLE && i_memw_grant && !amo_miss
         && !wb_v && !mis_dirty_pending;
-    let wb_fire: logic = wb_v && i_memw_grant;
+    // 14.13: a FOLDED cap writeback (wb_folded_q) drains only once its +1-latched data
+    // has landed (wb_data_rdy_q); a live writeback (=0 / a disabled cap source, wb_folded_q
+    // =0) drains as soon as wb_v is set, exactly as before. Byte-identical at CAP_1R=0
+    // (wb_folded_q const-0 → wb_drain_ok = wb_v).
+    let wb_drain_ok: logic = wb_v && (!wb_folded_q || wb_data_rdy_q);
+    let wb_fire: logic = wb_drain_ok && i_memw_grant;
 
     // P9.3: in-cache AMO/SC commit write — merge LOCALLY into the owned
     // (E/M) way, line → M. Same-cycle losers: a fill start in the set (its
@@ -1189,6 +1233,13 @@ pub module dcache #(
     let probe_depart : logic = probe_act && ((p_any && (!p_dirty || cap_probe_go)) || p_fill_hit);
     assign o_flush_done = fl_done_q && !wb_v;
 
+    // 14.13: the ENABLED cap sources' capture-go — the cycle-C trigger for the +1-latch
+    // fold (present cap_index at top arbiter priority this cycle, latch wb_data from the
+    // registered read next cycle). Per-source knobs so a disabled source stays LIVE. At
+    // DCACHE_CAP_1R=0 this is const-0 → the whole fold DCEs (byte-identical).
+    let cap_go_latch: logic = (CAP_FILL_1R && cap_fill_go) || (CAP_PROBE_1R && cap_probe_go)
+        || (CAP_MIS_1R && cap_mis_go) || (CAP_FLUSH_1R && cap_flush_go);
+
     // ── Phase C: SRAM port-narrowing — the shared write-back-capture read ──
     // The five writeback-buffer captures (fill-victim / probe / misaligned
     // lo+hi detour / flush) are mutually exclusive by the cap_*_go priority
@@ -1222,17 +1273,28 @@ pub module dcache #(
     :
         fl_way
     ;
+    // 14.13: at DCACHE_CAP_DCE=1 (all four cap sources folded onto the registered read)
+    // cap_data has no consumer — a STATEMENT block (default 0, guarded read) so the four
+    // data_X[cap_index] reads DCE = R3 drops → the data array is 1R1W (the ternary-let
+    // would NOT DCE — the L2 P3.b lesson). Byte-identical at 0 (the live per-source read).
     var cap_data: logic<64> [8];
-    for l in 0..8 :gen_cap_data {
-        assign cap_data[l] = if cap_way == 2'd0 ?
-            data_0[cap_index][l*64 +: 64]
-        : if cap_way == 2'd1 ?
-            data_1[cap_index][l*64 +: 64]
-        : if cap_way == 2'd2 ?
-            data_2[cap_index][l*64 +: 64]
-        :
-            data_3[cap_index][l*64 +: 64]
-        ;
+    always_comb {
+        for l in 0..8 {
+            cap_data[l] = 64'd0;
+        }
+        if !DCACHE_CAP_DCE {
+            for l in 0..8 {
+                cap_data[l] = if cap_way == 2'd0 ?
+                    data_0[cap_index][l*64 +: 64]
+                : if cap_way == 2'd1 ?
+                    data_1[cap_index][l*64 +: 64]
+                : if cap_way == 2'd2 ?
+                    data_2[cap_index][l*64 +: 64]
+                :
+                    data_3[cap_index][l*64 +: 64]
+                ;
+            }
+        }
     }
 
     // DCACHE_DATA_1RW: single muxed byte-write-enable write per data bank. The
@@ -1325,8 +1387,10 @@ pub module dcache #(
                         if vic_dirty {
                             wb_v    = 1'b1;
                             wb_line = {vic_tag, f_index};
-                            for l in 0..8 {
-                                wb_data[l] = cap_data[l];
+                            if !CAP_FILL_1R {
+                                for l in 0..8 {
+                                    wb_data[l] = cap_data[l];
+                                }
                             }
                             if victim_way == 2'd0 {
                                 dirty_0[f_index] = 1'b0;
@@ -1655,8 +1719,10 @@ pub module dcache #(
                 wb_v = 1'b1;
                 if !cap_mis_hi_sel {
                     wb_line = {tag, index};
-                    for l in 0..8 {
-                        wb_data[l] = cap_data[l];
+                    if !CAP_MIS_1R {
+                        for l in 0..8 {
+                            wb_data[l] = cap_data[l];
+                        }
                     }
                     if hit_0 {
                         valid_0[index] = 1'b0;
@@ -1676,8 +1742,10 @@ pub module dcache #(
                     }
                 } else {
                     wb_line = {next_tag, next_index};
-                    for l in 0..8 {
-                        wb_data[l] = cap_data[l];
+                    if !CAP_MIS_1R {
+                        for l in 0..8 {
+                            wb_data[l] = cap_data[l];
+                        }
                     }
                     if next_hit_0 {
                         valid_0[next_index] = 1'b0;
@@ -1707,8 +1775,10 @@ pub module dcache #(
                     if cap_probe_go {
                         wb_v    = 1'b1;
                         wb_line = i_probe_addr[63:6];
-                        for l in 0..8 {
-                            wb_data[l] = cap_data[l];
+                        if !CAP_PROBE_1R {
+                            for l in 0..8 {
+                                wb_data[l] = cap_data[l];
+                            }
                         }
                         if phit_0 {
                             valid_0[p_index] = 1'b0;
@@ -1762,8 +1832,10 @@ pub module dcache #(
                 if cap_flush_go {
                     wb_v    = 1'b1;
                     wb_line = {fl_tag, fl_set};
-                    for l in 0..8 {
-                        wb_data[l] = cap_data[l];
+                    if !CAP_FLUSH_1R {
+                        for l in 0..8 {
+                            wb_data[l] = cap_data[l];
+                        }
                     }
                     if fl_way == 2'd0 {
                         valid_0[fl_set] = 1'b0;
@@ -1896,7 +1968,14 @@ pub module dcache #(
     let rd1_req_nf    : logic = i_ren && !dhit_use && !i_uncached;
     let rd1_req_cap   : logic = cap_fill_go || cap_probe_go || cap_mis_go || cap_flush_go;
     let rd1_req_next  : logic = i_ren && i_load_next; // cross-line misaligned hi dword
-    let rd1_index: logic<INDEX_W> = if rd1_req_demand ?
+    // 14.13: an ENABLED cap capture (cap_go_latch) takes the port with TOP priority so
+    // its whole line registers into rd1_data for next cycle's wb_data latch; a folded
+    // demand load preempted here replays via the dhit squash (dhit_cap_pre_q). At
+    // DCACHE_CAP_1R=0 cap_go_latch=0, so cap falls back to its original low-priority slot
+    // (rd1_req_cap below) = byte-identical.
+    let rd1_index: logic<INDEX_W> = if cap_go_latch ?
+        cap_index
+    : if rd1_req_demand ?
         index_r
     : if rd1_req_nf ?
         nf_rd_index
@@ -1932,6 +2011,54 @@ pub module dcache #(
             rd1_data_1 = if d1_fire_1 && (d1_idx == rd1_index) ? (data_1[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_1[rd1_index];
             rd1_data_2 = if d1_fire_2 && (d1_idx == rd1_index) ? (data_2[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_2[rd1_index];
             rd1_data_3 = if d1_fire_3 && (d1_idx == rd1_index) ? (data_3[rd1_index] & ~d1_msk) | (d1_new & d1_msk) : data_3[rd1_index];
+        }
+    }
+    // ── 14.13: R3 cap → 1R1W — the +1-latch writeback capture off the registered read ──
+    // cap_go_latch presented cap_index at TOP priority last cycle, so rd1_data now holds
+    // the cap line; latch it into wb_data_lat (the folded writeback data). cap_way_q =
+    // the cap source's way (registered at cap_go_latch); rd1_cap_line = rd1_data[cap_way_q].
+    // wb_folded_q marks the current wb_v as fold-sourced (so the o_memw_wdata mux + the
+    // drain-ready gate pick wb_data_lat / wb_data_rdy_q; a disabled/live source keeps the
+    // combinational wb_data and drains immediately). dhit_cap_pre_q = a folded demand HIT
+    // preempted by the cap present, replayed next cycle via the dhit squash. DEAD at 0
+    // (DCACHE_CAP_1R=0 → the else-if never runs, all reset-only → DCE). The cap-latch vars
+    // are declared up by wb_data (the drain-ready gate wb_fire reads wb_folded_q/rdy).
+    let rd1_cap_line: logic<512> = if cap_way_q == 2'd0 ?
+        rd1_data_0
+    : if cap_way_q == 2'd1 ?
+        rd1_data_1
+    : if cap_way_q == 2'd2 ?
+        rd1_data_2
+    :
+        rd1_data_3
+    ;
+    always_ff (clk, rst) {
+        if_reset {
+            cap_way_q      = 2'd0;
+            cap_pending_q  = 1'b0;
+            wb_folded_q    = 1'b0;
+            wb_data_rdy_q  = 1'b0;
+            dhit_cap_pre_q = 1'b0;
+            for l in 0..8 {
+                wb_data_lat[l] = 64'd0;
+            }
+        } else if DCACHE_CAP_1R {
+            cap_pending_q  = cap_go_latch;
+            dhit_cap_pre_q = cap_go_latch && i_ren_r && cache_hit_r;
+            if cap_go_latch {
+                cap_way_q   = cap_way;
+                wb_folded_q = 1'b1;
+            }
+            if cap_pending_q {
+                for l in 0..8 {
+                    wb_data_lat[l] = rd1_cap_line[l*64 +: 64];
+                }
+                wb_data_rdy_q = 1'b1;
+            }
+            if wb_fire {
+                wb_data_rdy_q = 1'b0;
+                wb_folded_q   = 1'b0;
+            }
         }
     }
     // 14.3-c (§14.5): the nf handshake — deliver the non-folded AMO / misaligned-lo
@@ -2154,7 +2281,7 @@ pub module dcache #(
     let wen_lane: logic<3> = i_addr[5:3];
     for l in 0..8 :gen_memw_lane {
         assign o_memw_wdata[l] = if wb_v ?
-            wb_data[l]
+            (if wb_folded_q ? wb_data_lat[l] : wb_data[l]) // 14.13: folded cap → +1-latched line
         : if i_wen ?
             (if wen_lane == (l as 3) ? i_wdata : '0)
         :
@@ -2180,7 +2307,10 @@ pub module dcache #(
     let want_fill_start: logic = (load_sel || srfo_sel) && !fill_blocked_wb;
     let want_write     : logic = i_wen && !i_wen_excl && !amo_miss && state == State::IDLE && !mis_dirty_pending;
     assign o_memr_req = filling || want_fill_start || uncached_active;
-    assign o_memw_req = wb_v || want_write || want_store_wt;
+    // 14.13: a folded cap writeback withholds its channel request until its +1-latched
+    // data is ready (wb_drain_ok) so a grant never lands on an empty wb_data_lat (no
+    // phantom write). Byte-identical at CAP_1R=0 (wb_drain_ok = wb_v).
+    assign o_memw_req = wb_drain_ok || want_write || want_store_wt;
 
     // Non-blocking miss interface (Phase 8 S10). o_miss_valid pulses on the
     // cycle a LOAD fill actually STARTS (the IDLE→FILL edge), not on the raw
@@ -2224,7 +2354,7 @@ pub module dcache #(
     let nf_replay_ready: logic = if DCACHE_NF_REPLAY ? nf_ready : 1'b1;
     let hit_lo_safe    : logic = (hit_0 && !(fill_busy0 && fill_way == 2'd0)) || (hit_1 && !(fill_busy0 && fill_way == 2'd1)) || (hit_2 && !(fill_busy0 && fill_way == 2'd2)) || (hit_3 && !(fill_busy0 && fill_way == 2'd3));
     let o_hit_safe_live: logic = i_ren && !i_amo_read && !i_load_next && ((hit_lo_safe && nf_replay_ready) || stream_hit0);
-    assign o_hit_safe = if DCACHE_SYNC_READ ? (if dhit_use ? (dhit_v_q && !dhit_c3_squash) : o_hit_safe_live) : o_hit_safe_live;
+    assign o_hit_safe = if DCACHE_SYNC_READ ? (if dhit_use ? (dhit_v_q && !dhit_c3_squash && !dhit_cap_pre_q) : o_hit_safe_live) : o_hit_safe_live;
     // Phase 5 SMP fix: data is valid for this hart's request only when
     // the cache actually has the data (hit) or the fill just completed
     // (DONE state — filled doubleword is in data_X arrays). During
@@ -2237,7 +2367,7 @@ pub module dcache #(
     // read (nf_ready) at =1 so it is held 0 on the request cycle and 1 on delivery;
     // replay (also non-folded, but LIVE via o_hit_safe) keeps cache_hit. At 0 = cache_hit.
     let nf_valid_hit: logic = if DCACHE_NF_REROUTE && nf_reroute ? (cache_hit && nf_ready) : cache_hit;
-    assign o_data_valid = if DCACHE_SYNC_READ ? ((if dhit_use ? (dhit_v_q && !dhit_c3_squash) : nf_valid_hit) || (state == State::DONE) || (uncached_active && i_memr_grant)) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
+    assign o_data_valid = if DCACHE_SYNC_READ ? ((if dhit_use ? (dhit_v_q && !dhit_c3_squash && !dhit_cap_pre_q) : nf_valid_hit) || (state == State::DONE) || (uncached_active && i_memr_grant)) : (cache_hit || (state == State::DONE) || (uncached_active && i_memr_grant));
 
     // Re-read filled data at original miss offset (valid during DONE, and early
     // from fill_count==1 via o_fill_data_ready).
@@ -2449,6 +2579,6 @@ pub module dcache #(
     let write_wait_grant: logic = state == State::IDLE && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
     let write_wait_local: logic = state == State::IDLE && i_wen && i_wen_excl && !wenl_fires;
     assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
-        || write_wait_local || inv_hits_active || inv2_hits_active || dhit_c3_squash || dhit_miss || nf_gap_stall || nf_reg_stall || (uncached_active && !i_memr_grant);
+        || write_wait_local || inv_hits_active || inv2_hits_active || dhit_c3_squash || dhit_cap_pre_q || dhit_miss || nf_gap_stall || nf_reg_stall || (uncached_active && !i_memr_grant);
 
 }
