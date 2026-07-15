@@ -1853,5 +1853,42 @@ measurable reduction begins at S1 (a flip, full slow gate).
 `const DCACHE_TAG_READ_1R = 0` (DEAD). `rt1_valid_0..3` / `rt1_tags_0..3` / `rt1_dirty_0..3` / `rt1_excl_0..3`
 register the four-way tag state at `rd1_index` in an `else if DCACHE_TAG_READ_1R` always_ff (reset-only at 0).
 `--dump-area`: tags `64×52 13R1W ×4` unchanged, gates 46589 / FFs 4311 unchanged (rt1 DCE'd) = byte-identical.
-Verified `veryl test` 252/0. Next: S1 (demand plain-load hit off rt1 → drops index_r) — a flip needing the full
-slow gate (Verilator N1/N2 + litmus N4 + SMP N2/N4 boot).
+Verified `veryl test` 252/0.
+
+#### 15.5-S1 ✅ IMPLEMENTED (2026-07-15) — demand plain-load hit off rt1 (`const S5_DEMAND_TAG`)
+
+The demand hit is computed at Stage-D from `rt1` (registered tags at `rd1_index` = `index_r` via
+`rd1_req_demand`): `dhit_hit_d` / `dhit_way_d` mirror the Stage-A `cache_hit_r` / `hit_way_r` but off the
+register. `dhit_v` / `dhit_way` are the effective hit / way (rt1 at `S5_DEMAND_TAG=1`, the registered Stage-A
+`dhit_v_q` / `dhit_way_q` at 0); every consumer (`dhit_c3_squash`, `dhit_miss`, `o_rdata`, `o_hit_safe`,
+`o_data_valid`, `rd1_dhit_line`) routes through them. At =1 the Stage-A live tag read (`hit_r_*` /
+`cache_hit_r` / `hit_way_r`) is a const-guarded statement block that DCEs (`index_r` drops as a tag port).
+
+**Why CYCLE-IDENTICAL, no bypass (unlike the data S1).** The =0 demand hit is decided at Stage-A (cycle T)
+from the live tag — read-OLD w.r.t. T+1 writes (tag writes are registered). `rt1` (presented at T, registered)
+holds that SAME cycle-T tag. So `dhit_hit_d`(T+1) = `cache_hit_r`(T) exactly — no write-forward bypass is
+needed. (The data S1 needed one because its =0 live read was at Stage-B = read-NEW.) A demand read preempted
+at Stage-A (`cap_go_latch` steals the port → rt1 ≠ index_r's tags) is squashed by `dhit_cap_pre_q` (extended
+to fire on any preempted demand read at =1, dropping the `cache_hit_r` gate) → the dhit replay. The R→D inv
+re-validation (`dhit_c3_squash`) is unchanged (address compares). The `dhit_v`/`dhit_way`/`dhit_c3_squash`/
+`dhit_miss` defs move below the `rt1` always_ff (Veryl def-before-use; rt1 reads `rd1_index`).
+
+**Net port count is unchanged (13R1W).** Flipping rt1 live ADDS the `rd1_index` tag port while `index_r`
+drops → 13R1W stays 13R1W (+220 FFs = the 4-way registered tag/valid/dirty/excl, +504 gates for the compare;
+`--dump-area` confirms). This is the "sync-read flip adds ports (staging, not narrowing)" pattern (§12.1); the
+demand tag is now a true registered SRAM read (a real pipeline stage) and the port reduction lands at S2
+(folding the Stage-B `index` too).
+
+**Verified — CYCLE-IDENTICAL (every cy matches the §14.14 baseline), the FULL slow gate + Verilator.** DEAD
+scaffold (=0) committed `384bc79` (byte-identical, 252/0). The =1 flip default-on: `veryl test` **252/0** ·
+litmus N2 `00231860` / N4 `00535020` (no forbidden) · **ACT4 696/0** · N1 boot 7.1v `013ee8a0` / 6.6
+`014159a0` · N2 SMP boot `00fe5d30` · N4 SMP boot `015eccb0` (x3==0xAA) · **Verilator N1 `12158698` / N2
+`16662135`** (both PASS, x3==0xAA) — every cy byte-for-byte identical to the §14.14 shipped baseline, so the
+fold is cycle-identical AND NBA-correct single- AND multi-hart (the §14.7 gate: the tag demand hit is read-OLD
+at both =0 and =1, so no write-forward bypass is needed, confirmed on Verilator). `--dump-area` tags 13R1W
+(+220 FFs = the registered tag/valid/dirty/excl = the SRAM output register; the demand tag is now a true
+registered SRAM read = the deep-pipeline stage). One BADVLTPRAGMA comment fix (a comment line began with
+"Verilator" → Veryl emitted `/*verilator…*/`). Set `DCACHE_TAG_READ_1R=0` to restore the byte-identical
+live-Stage-A-hit design. Next: **S2** — fold the Stage-B live `index` hit (`cache_hit` / `hit_way` /
+`hit_excl` / `hit_dirty`, the nf/miss/AMO/store consumers) onto rt1 too → `index` drops → **13R1W → 12R1W**
+(the first actual port reduction; SMP-critical = AMO atomicity, the §11.11/§14.14 crux class).
