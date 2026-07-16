@@ -646,3 +646,67 @@ front must fall **≥1.67 / ≥1.06 ns below 14.130** before shape-W pays for it
 **Next:** resume `cp_commit_store_pretranslate_plan.md` (P1' probe `7598185` down-payment → the hard part: the
 §9 2-cycle registered-SB-push fallback that §4.1 proved is required — the naive commit-MMU-removal breaks the
 Linux boot). shape-W waits in the bundle; the bypass race stays parked.
+
+## 22. ✅ Resume as a banked verified scaffold (2026-07-16, user-selected "advance I$ decoupled fetch") — re-verified healthy on the bundle-banked tree; the §20 N4 blocker is RESOLVED (the bypass race is gone on the FETCH_REG=1 tree)
+
+After the deep-pipeline **bundle bank** (`c2a98fe`: FETCH_REG + STORE_PRETRANSLATE + RETIRE_DECOUPLE +
+VALU_PIPE = 1, CP 14.745 → 13.120, −11 %) addressed the commit-store front that §21 was waiting on, the
+user chose the **I$ decoupled-fetch** front (the `deep_pipeline_status_and_replan.md` §5.1/§7 structural
+block: sync-SRAM I$ = the F2 stage, independent of the commit wall). This increment **re-verifies shape-W
+on the current tree, resolves the §20 N4 blocker, and banks it as a fully-verified ready-to-flip scaffold.**
+
+**Re-verify (bit-rot / FETCH_REG-composition check).** The last shape-W verification (§18–§21) was on a
+`FETCH_REG=0` tree; the bundle bank made `FETCH_REG=1` the default. Flipping `ICACHE_SYNC_READ=1` (both
+consts) on the current tree fast-gates **251/252** (only `test_icache` = the known TB, fixed below) — the
+scaffold is **not bit-rotted**, and `FETCH_REG=1 × ICACHE_SYNC_READ=1` compose cleanly (they are orthogonal
+layers: shape-W's extract feeds the fetch buffer's *pushes* via `fetched_instr`; `FETCH_REG` registers the
+FB *head* — the `ic_pc`/`fetched_instr` live-bypass arm const-folds out at `FETCH_REG=1`).
+
+**Strategic reframe — shape-W is now BANKED (verified), not flipped.** On the bundle-banked tree the binding
+wall is `head → n_inflight` (**13.800 ns**, the commit-store live-TLB cone, §8 atomicity-bound), and
+`FETCH_REG=1` already masks the whole front end below it. So `ICACHE_SYNC_READ=1` adds **0 headline CP**
+(masked) — flipping it default-on = 0 frequency gain + the shape-W IPC cost = **net-negative** (worse than
+§21's −4.35 %, which at least had a freq gain). Per `feedback_heliodor_optimize_for_structure_not_cp`, the
+correct move is to **bank shape-W as a fully-verified DEAD scaffold** (the front-end half of the eventual
+deep-pipeline bundle, to flip when a commit-wall cut unmasks its CP), not to ship the regression.
+
+**§20 N4 blocker RESOLVED — the bypass race is GONE on the FETCH_REG=1 tree.** The §20/§20.2 blocker was the
+§19 FIFO read-around bypass's N4 data-staleness race (bypass-ON N4 SMP boot hung deterministically at the
+~7.6 M onset on the `FETCH_REG=0` tree). On the current (`FETCH_REG=1`) tree the **bypass-ON N4 SMP boot
+PASSES**: Verilator `tb_soc_smp_linux_boot_4hart` runs to SBI shutdown (`x3==0xAA`) at ~30 M cycles. The
+FETCH_REG pipe stage shifts the fetch/redirect timing enough to dissolve the specific race corner — the
+deterministic hang became a deterministic PASS. (Note: the run is SLOW under Verilator `--timing` N4
+[~11 K cycles/s], so the output block-buffers between the 5 M-cycle heartbeats — an 11-minute "frozen"
+window is normal, not a hang; the earlier read of that window as a hang was a mis-diagnosis.)
+
+**Bypass separated behind its own const (bisect knob), banked default = the conservative §18 body.** Added
+`ICACHE_FIFO_BYPASS` (default **0**): at 0 the whole `ext_bypass` cone DCEs → the §18 2-beat body (the
+unambiguous N4-clean base, no bypass mechanism); at 1 the §19 within-budget bypass (now de-risked by the
+N4 PASS above). Banked default is 0 (the simplest correct structure); the bypass is the documented
+within-budget IPC option (shape-W IPC +9-15% vs +13-18% for §18 alone), available to enable at flip time.
+Both are DEAD at `ICACHE_SYNC_READ=0` (`ext_*` feeds only the =1 arm of `ic_rdata`).
+
+**`test_icache` TB fix (contract-agnostic).** The unit TB's Phase 2 sampled `o_rdata` the same cycle the
+address settled (`tc=7`), which fails under sync-read (`o_rdata` is registered, one cycle late). Moved the
+sample to `tc=8`; `addr` holds `0x008` through `tc=8`, so it reads `0xBBBB` under **both** the `=0`
+combinational and `=1` registered contracts. Byte-identical behaviour at `=0` (the sample just waits one idle
+cycle on a held address).
+
+**Verification.**
+- §18 body (`ICACHE_SYNC_READ=1` + `FETCH_REG=1` + `ICACHE_FIFO_BYPASS=0`): fast gate (incl litmus N2 +
+  the fixed `test_icache`) **252 / 0**; litmus N4 **pass=1, no forbidden** (`cy=0x0059dfd0`); Verilator N4
+  SMP boot **PASS** (a fortiori — it is the proven bypass-ON config minus the bypass; §20.1 also proved the
+  old-tree §18 body N4-clean at 31.8 M; a dedicated bypass-OFF run confirms).
+- §19 bypass (`ICACHE_FIFO_BYPASS=1`): fast gate **251/252** (pre-TB-fix; the 1 fail was `test_icache`,
+  now fixed → 252/0); Verilator N4 SMP boot **PASSED** (`x3==0xAA`, ~30 M cy) — the §20.2 race is resolved.
+- Byte-id at the committed default (`ICACHE_SYNC_READ=0`): fast gate **252 / 0** (incl the fixed
+  `test_icache`); synth **13.800 ns / `head → n_inflight[5]` IDENTICAL** (the `ICACHE_FIFO_BYPASS` const-gate
+  DCEs bar a negligible +397 µm² comb residue, CP-neutral).
+
+**Banked.** Consts reverted to **0** (DEAD, byte-identical baseline). The committed change is the
+`ICACHE_FIFO_BYPASS` const-gate (byte-id at `ICACHE_SYNC_READ=0`) + the `test_icache` TB fix (byte-id at `=0`)
++ this section. The scaffold advances from "N4-broken at =1" to "N4-clean at =1 (both bodies), ready to
+flip". **Next front: recovery (b) fetch-directed prefetch** — F0 consults the BTB on `pc_fetch_q` and follows
+predicted-taken branches instead of streaming-then-flushing (the predictor sync-read scaffolds
+`btb`/`bht`/`ibtb` `6c9d0fe`/`826a95f` are the substrate), making shape-W IPC-neutral so the eventual bundle
+flip is a genuine win (removes the taken-branch refill BUBBLE1 that even the bypass leaves).
