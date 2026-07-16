@@ -280,3 +280,48 @@ Per §5: DEAD `=0` — default 252/0 + litmus N2 cy-exact + synth CP/FF/levels/e
 cy-exact. FUNCTIONAL `=1` — the FULL SMP ladder: litmus N2/N4 + N2/N4 SMP boot + Verilator (NBA — the M3b
 minefield surfaces only on multi-hart NBA) + ACT4 (S-mode paging + cbo.m + PMP suites) + the IPC budget.
 The `=1` flip is the gated step; the DEAD scaffolds land freely.
+
+### 7.4 L2/L3 feasibility — the fault-capturing translation problem (2026-07-16, post-S0 code read)
+
+Reading the store-pretranslate / MMU-port machinery to scope L2 surfaced a finding that shapes the whole
+L2/L3 design:
+
+**(a) The STORE_PRETRANSLATE probe captures only CLEAN PAs — it cannot register a fault.** The dmem MMU's
+side-effect-free TLB probe (`dmem_sprobe_pa/ok`, `:5973-5977`) latches a PA only on a clean store-permitted
+hit (`dmem_sprobe_ok`); **any deny / miss / uncached / mid-walk falls back to commit translation**, and
+`store_pretx_xfault` is a hard `1'b0` (`:5974`). So the existing probe is the WRONG tool for R3's fault
+decouple — R3 registers FAULTS, the probe registers only fault-free PAs.
+
+**(b) What S0 already covers, and what is left.** A plain VM store DOES translate at the MEM_PIPE M-stage
+(`store_fetched_q` 2-cycle hold), so `m_spage_q`/`m_sacc_q`/`m_gstage_q` (`:7625-7628`) already register its
+page/access/G-stage fault — the source S0's `=1` arm reads. **So after S0, plain VM stores are decoupled.**
+The residual LIVE commit-fault terms are all cbo.m / atomic / bare:
+  - `cbo_m_acc_fault` + `dmem_mmu_pte_acc_fault`/`pma_hole` (cbo.m-only) — cbo.m translates at **commit**
+    (`core_dmem_cbo = core_dmem_wen && c_is_cbo_m`, `store_drive`-routed, `:5981`); at execute it asserts no
+    dmem MMU ren/wen, so `m_*_q` do NOT hold its fault.
+  - `amo_commit_acc_fault` — the atomic re-drives the MMU at commit (§13).
+  - `fast_store_acc_fault` — a BARE PMP on `c_store_addr` (`:5790`, not through the TLB) → **non-binding**
+    (the §7.1 cone is the TLB path, not this); registering it is cleanup, not a CP lever.
+
+**(c) L2 (cbo.m) approach — route cbo.m through the M-stage translate, reuse `m_*_q`.** cbo.m is a NOP (no
+memory op), so a squashed cbo.m discards freely. Make cbo.m assert an execute-time dmem-MMU translate
+request (like a store's MEM_PIPE M-stage) so `m_spage_q`/`m_sacc_q` capture its page/access fault, and add
+an M-stage PMP R-AND-W check on `m_pa_q` registered into `m_cbom_pmp_q` (cbo.m's special R-AND-W deny rule,
+`:5905`). Const-gate `cbo_m_acc_fault` + the `pte_acc`/`pma_hole` terms to read the registered values at =1.
+**Caveat — the TLB-MISS case:** a TLB-hit cbo.m registers cleanly, but a TLB-MISS cbo.m needs a full walk;
+doing it at execute is a SPECULATIVE walk (squash-safe for a NOP, but contends with load walks + deepens
+cbo.m). If we instead keep the TLB-miss cbo.m on the commit fallback, the live TLB is NOT fully off the
+retire gate → the `=1` live arm cannot DCE → **no CP**. So L2's CP value requires cbo.m to ALWAYS translate
+at execute (speculative walk), not just on a TLB hit. **This is the crux to resolve before the L2 RTL.**
+
+**(d) L3 (atomic) — the §13 split + M3b.** Register the atomic's fault + PMP at execute (same M-stage route)
+but keep the coherent RMW LIVE at commit on the REGISTERED PA (the fault-at-execute / RMW-at-commit split
+§13 refuted for *deferral* but which R3 must implement as a *const-gate*). Highest risk: a +1 skew on the
+atomic commit write wedges litmus N2 amoadd (M3b, proven) — the RMW must stay single-cycle at commit.
+
+**(e) Consequence for staging + CP.** Every L2/L3 piece is byte-identical at `=0` and moves NO CP alone; the
+CP lands only at the full `RETIRE_DECOUPLE=1` flip once cbo.m AND atomic AND (for completeness) fast-store
+all read registered faults and the live TLB+PMP arm DCEs. The dominant new machinery is the **speculative
+execute-time walk** (cbo.m + atomic), which is A-LOOP-adjacent depth — confirming §6.2's "R3 is one
+SMP-critical program." **Recommended next RTL: L2 cbo.m** — the lower-risk of the two real requesters
+(NOP → squash-free, no RMW), starting with the M-stage-translate route + the speculative-walk decision (c).
