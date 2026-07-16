@@ -149,3 +149,44 @@ STORE_PRETRANSLATE) is a **poor trade** — not worth committing until the dcach
 **▶️ Next major front = Phase C dcache synchronous-read** (`cp_dcache_sync_read_plan.md`; DEAD
 `DCACHE_SYNC_READ` scaffold like ICACHE_SYNC_READ, §6/§8). The scheduler (9.52, A-SCHED) stays well
 below the whole band.
+
+## 7. ✅ RE-MEASURED (2026-07-16, post-Phase-C + post-R3 tree) — the full 5-scaffold bundle bottoms at 13.120, and the residual is the ATOMIC-commit LIVE TLB (not the dcache tag body — Phase C removed that)
+
+Confirming the vrf scaffold is still healthy and re-grounding §3/§6.1's dense-band finding in the
+CURRENT tree (Phase C dcache sync-read shipped, R3 S0/L2/L3 landed). VALU_PIPE was verified intact
+(2-week churn, no bit-rot): `veryl test` **252/0** at `VALU_PIPE=1` (arch-v vadd/vmul/vmseq exercise
+the FETCH phase). Then a throwaway all-five-front flip (`FETCH_REG + DECODE_REG + STORE_PRETRANSLATE +
+RETIRE_DECOUPLE + VALU_PIPE = 1`; reverted) measured with `synth --dump-timing`:
+
+| Config | headline | binding endpoint |
+|---|---|---|
+| default (all scaffolds 0) | **14.745** | `pc_q[34] → rs1_rdy[0]` (141 levels) — front-end→scheduler cone |
+| 5-scaffold bundle (all 1) | **13.120** | `head[0] → n_inflight[5]` (137 levels) — ATOMIC commit-store residual |
+
+**14.745 → 13.120 = −11 % CP** — BETTER than §6.1's pre-Phase-C prediction of ~13.84. Phase C's
+dcache sync-read (registered tag/data reads) shortened the commit-store→dcache body by ~0.7 ns, so
+the dcache tag lookup is no longer the cap.
+
+**🚨 The 13.120 residual is the ATOMIC (CAS/AMO) commit path through the LIVE dmem MMU TLB.** Gate
+trace of path #1: `head → sh_rd_arch → arch_regs → c_cas_q_mem_hi → c_is_cas_q → commit_store_fire →
+agu_addr_iss → dmem_vaddr → u_dmem_mmu.u_mmu.{tlb_vpn → tlb_valid → tlb_perm_x → tlb_hit_r →
+tlb_read_ok → tlb_rwx_ok} (LIVE TLB, ~3.4→7.3 ns) → mmu.state → vm_enabled → i_vaddr → dhit_line_q →
+c_store_addr → sb_line → sb_merge_ok → commit_csrw_satp → commit_excp → commit_trap → n_inflight`. So
+STORE_PRETRANSLATE + RETIRE_DECOUPLE take the PLAIN-store TLB off the retire gate (14.130 → 13.120),
+but the **atomic's commit-time TLB re-drive** (the §13/R3-L3 coherent-RMW re-translate the L3 flip
+left LIVE — L3 only sourced the AMO commit-PMP off `ac_pa_q`, not the MMU TLB itself) is the new cap.
+
+**Top-30 band (current tree):** #1-5 `n_inflight[1..5]` 12.83–13.12 (the atomic residual), #6-30
+`redirect_pc_q[*]` 12.53–12.63 + `mip[13]` 12.61 (the commit/CSR/redirect wall). So below the atomic
+residual the next front is redirect/CSR at ~12.6, and the rs1_rdy/scheduler keystone (§3, ~12.9 est.)
+is now interleaved — the whole band is compressed into 12.5–13.1.
+
+**🎯 Strategic consequence (updates §4's crossroads):** the "scaffold-flip fronts" are all built and
+verified (`FETCH_REG DECODE_REG STORE_PRETRANSLATE RETIRE_DECOUPLE VALU_PIPE`); flipping all five is
+a measured **−11 % CP (14.745 → 13.120)** for the cumulative +IPC of the five FETCH/pretranslate/
+decouple cycles. The next real lever below 13.120 is either (a) the **atomic-commit TLB decouple**
+(register the atomic's translated PA/permission at execute so the coherent RMW re-drive at commit
+reads a flop — the §13/L3 M3b minefield, the hardest SMP-atomicity work), or (b) the **redirect/CSR
+wall** (redirect_pc_q/mip ~12.6). The bundle flip itself is now a BETTER trade than §6.1's −5 %
+estimate (Phase C moved the floor down), but is still GATED on the full SMP ladder (litmus N2/N4 +
+SMP boot N2/N4 + Verilator NBA + ACT4 paging/PMP + IPC budget) and its cumulative IPC cost.

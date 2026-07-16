@@ -375,3 +375,185 @@ front is `vrf` (the `VALU_PIPE` scaffold), then the coordinated multi-front flip
 `STORE_PRETRANSLATE=1`) is the GATED step — it needs the full SMP ladder (litmus N2/N4 + N2/N4 SMP boot +
 Verilator NBA + ACT4 PMP/paging + IPC budget) before it can be enabled. Remaining scaffold-side: fast-store
 (non-binding bare PMP; register for completeness, but it does not pin the TLB).
+
+### 7.7 ✅ FULL 5-SCAFFOLD BUNDLE RE-MEASURED (2026-07-16) — 13.120 ns; the residual is the ATOMIC-commit LIVE TLB
+
+The "next front is vrf" above refers to the ALREADY-BUILT `VALU_PIPE` scaffold (`vector_unit.veryl:63`,
+committed DEAD 2026-07-02, `cp_vrf_cut_plan.md §6`) — NOT new work. All five front-cut scaffolds are built
+(`FETCH_REG DECODE_REG STORE_PRETRANSLATE RETIRE_DECOUPLE VALU_PIPE`). Re-verified VALU_PIPE healthy after
+the dcache+R3 churn (`veryl test` 252/0 at =1) and measured the full 5-flip bundle in the current tree:
+**14.745 → 13.120 ns (−11 %)**, binding = `head → n_inflight[5]`. Gate trace shows the residual is the
+**atomic (CAS/AMO) commit path re-driving the LIVE dmem MMU TLB** (`commit_store_fire → dmem_vaddr →
+u_dmem_mmu.tlb_* → … → n_inflight`) — the §13/L3 coherent-RMW re-translate that L3 left LIVE (L3 only
+sourced the AMO commit-PMP off `ac_pa_q`, not the TLB). So the plain-store TLB is off the retire gate, but
+the atomic's is not. Below it: redirect_pc_q/mip ~12.6. Full detail + the top-30 band in `cp_vrf_cut_plan.md
+§7`. **Next real lever below 13.120 = the atomic-commit TLB decouple (register the atomic's execute-time PA
++ permission so the commit RMW reads a flop — the hardest M3b SMP-atomicity work), or the redirect/CSR wall.**
+
+## 8. ❌ REFUTED BY MEASUREMENT (2026-07-16, user-selected "atomic-commit TLB decouple") — a runtime `c_is_amo` gate CANNOT prune the shared live-TLB→sb_merge; §13 re-confirmed in the post-Phase-C tree
+
+The user selected the atomic-commit TLB decouple. A code-based map (Explore) + two throwaway
+CP-isolation synths establish that the residual 13.120 ns atomic cone is a **shared, false-path wall**,
+not a surgically-cuttable requester — re-confirming `cp_frontend_pipeline_plan.md` §13 in the current tree.
+
+**The map.** Under the full bundle (`MEM_PIPE=1` + `RETIRE_DECOUPLE=1` + `STORE_PRETRANSLATE=1`) the
+atomic's commit-time live-TLB output `dmu_dmem_addr` has these consumers, ALL already registered EXCEPT one:
+- WRITE PA → `ac_pa_q` (MEM_PIPE, `:7260`) ✅ ; PMP → `ac_pa_q` (RETIRE_DECOUPLE, `:5880`) ✅ ;
+  page/access fault → `0` (RETIRE_DECOUPLE S0, atomic is `store_fetched_q=0`) ✅
+- **`sb_pa` (= `c_store_eff_pa`, `:5861`) → still `dmu_dmem_addr` for a VM atomic** ❌ — feeds `sb_match_v`/
+  `sb_merge_ok` → `rob_commit_ack`. But `sb_merge_ok` is MASKED for atomics (`sb_elig` requires `!c_is_amo`,
+  `:6434`; the atomic never merges). So the cone is a **FALSE PATH**: STA cannot correlate the `c_is_cas_q`
+  START with the `sb_elig=0` mask END, so it reports the live TLB. (`ac_pa_q` is captured at issue for every
+  real AMO/SC/CAS — `is_cas_q ⊂ is_amo`, `decode.veryl:188` — but not LR; and `ac_pa_q == dmu_dmem_addr`
+  for a correct serialized-head atomic, so any register-source is behaviourally identical.)
+
+**Two throwaway CP-isolation flips (bundle=1 + a new `ATOMIC_PA_DECOUPLE` const; reverted):**
+
+| config (on top of the 5-flip bundle @ 13.120) | headline | vs 13.120 |
+|---|---|---|
+| gate `c_store_eff_pa` → `if ATOMIC_PA_DECOUPLE && c_is_amo ? ac_pa_q : <live mux>` | **13.270** | **+0.15 WORSE** |
+| + also gate `store_drive &&= !(ATOMIC_PA_DECOUPLE && c_is_amo)` (atomic skips the commit MMU drive) | **13.350** | **+0.23 WORSE** |
+
+Both endpoints stay `head → n_inflight[5]`, **still CAS-started** (`c_cas_q_mem_hi → c_is_cas_q →
+commit_store_fire → dmem_vaddr → u_dmem_mmu.tlb_* → … → sb_merge_ok → rob_commit_ack → n_inflight`).
+
+**Root cause — the §13 refutation, exactly.** `c_is_amo` is a RUNTIME signal, so
+`if c_is_amo ? ac_pa_q : dmu_dmem_addr` is a 2:1 mux whose `dmu_dmem_addr` arm stays logically reachable
+(the `!c_is_amo` plain-store-miss path shares `c_store_eff_pa`) — STA cannot prune it and the extra mux
+ADDS a level. Gating `store_drive` fails the same way: `commit_store_fire → store_drive` drives the
+`core_dmem_vaddr` mux SELECT, so the arc `commit_store_fire → store_drive → mux → MMU` survives regardless
+of the select VALUE; `&& !c_is_amo` just deepens `store_drive`. **A runtime gate cannot prune a shared,
+logically-reachable live-TLB arm — precisely `cp_frontend_pipeline_plan.md` §13's "deferral-via-mux cannot
+be faster than its slowest input."**
+
+**Consequence.** The 13.120 residual is the SHARED live-TLB → `sb_merge_ok` coherence check (§13.1: even
+forcing all commit faults free bottoms at ~13.27; the whole-commit-cone-off-MMU cut buys only ~1.3 ns →
+~12.4, on the dcache-internal floor, at the highest SMP-atomicity risk). Cutting it needs a **CONST /
+physical separation** of the atomic commit path from the shared MMU/`sb_merge` net — a separate
+commit-translation port or a true multi-cycle commit stage (§13's M3b minefield, Direction-C §8 abandoned
+at ≤1.3 ns as atomicity-bound), NOT a scaffold-level runtime gate. **Verdict: the atomic-commit TLB
+decouple is refuted as a scaffold lever in the current tree.** The honest options below 13.120 are now the
+`deep_pipeline_status_and_replan.md` §6 set: (a) **bank the −11 % bundle** (`14.745 → 13.120`, all five
+scaffolds built + measured; flip is GATED on the full SMP ladder) and accept ~13.1 as the µarch floor;
+(b) the **redirect/CSR wall** (`redirect_pc_q`/`mip` ~12.6, a different front, masked below 13.120);
+(c) the **physical commit-path separation** (the largest, most SMP-dangerous redesign). Tree clean at
+`00b4818` (all experiment code reverted; only this doc + `cp_vrf_cut_plan.md §7` changed).
+
+## 9. 🚨 BUNDLE-FLIP FAST GATE (2026-07-16, user-selected "bank the −11 % bundle") — the bundle is NOT monolithic: R3-pair+VALU are FUNCTIONALLY CORRECT at =1, but the front-end registers are BROKEN (never functionally flipped)
+
+Flipping all five scaffolds to =1 (permanent, not throwaway) and running the FAST gate (`veryl test`)
+surfaces the key readiness fact: the DEAD scaffolds were verified byte-identical at =0 and CP-measured via
+throwaway SYNTH, but their =1 FUNCTIONAL correctness (together) was never tested. Result:
+
+| config (`veryl test`) | result |
+|---|---|
+| all five =1 (`FETCH_REG DECODE_REG STORE_PRETRANSLATE RETIRE_DECOUPLE VALU_PIPE`) | **23 / 229 FAIL** — pervasive HANG (`tohost=0`=timeout, even rv64ui-beq/lh) |
+| **front-end OFF** (`FETCH_REG=DECODE_REG=0`), `STORE_PRETRANSLATE=RETIRE_DECOUPLE=VALU_PIPE=1` | **252 / 0 PASS** |
+
+**So the 229 failures are ENTIRELY the front-end registers (`FETCH_REG`/`DECODE_REG`).** The SMP-critical
+retire pair (`STORE_PRETRANSLATE` + `RETIRE_DECOUPLE`) + `VALU_PIPE` are **functionally correct at =1** on
+the fast gate — R3's whole staged program (S0/L2/L3) works when flipped live. The front-end registers add a
+fetch/decode pipe stage whose +1-shift redirect/squash timing was never fixed (they are CP-measurement DEAD
+scaffolds), so mispredict/trap flushes wedge the pipe → pervasive timeout — exactly the class of the
+`lsu-phase1` FRONT-pipeline flip's "3 +1-shift corner fixes" (FR squash NBA hazard / slot-1-load+FR deadlock
+/ FP div-sqrt owner-exact broadcast, `project_heliodor_lsu_pipelining`).
+
+**Consequence for "bank the −11 %".** The −11 % (14.745 → 13.120) REQUIRES the front-end registers: without
+them the front-end→scheduler cone (14.745) MASKS the n_inflight wall, so R3-pair+VALU alone give 0 headline
+CP (§7.6). So banking the −11 % = **debugging the front-end registers' +1-shift redirect/squash corners** —
+a well-scoped but real multi-session task (the retire pair is already proven; only the front-end stage's
+control timing is unfinished). The two sub-bundles:
+- **R3-pair + VALU (3 scaffolds)** — functionally correct at =1 (fast gate), 0 headline CP alone (masked).
+  Bankable as a STRUCTURE flip (retire-decouple + VU pipe live) via the full SMP ladder, if the campaign
+  values the structure at 0 CP (per `feedback_heliodor_optimize_for_structure_not_cp`).
+- **front-end regs (2 scaffolds)** — unmask the −11 %, but need the +1-shift corner debug before they pass
+  even the fast gate. This is the gating work for the CP.
+
+## 10. 🎉 RESOLVED (2026-07-16, user-selected "front-end +1-shift corner debug") — DECODE_REG is NOT NEEDED for the −11 %; a 4-scaffold bundle (FETCH_REG alone, no DECODE_REG) hits 13.120 and is FUNCTIONALLY CORRECT
+
+Debugging the front-end registers (§9's gating work) surfaced a much better outcome than a hard pipeline-
+register fix:
+
+**Isolation (fast gate):**
+- `FETCH_REG=1` ALONE → **252 / 0 PASS.** FETCH_REG makes the fetch buffer a true F|D pipeline register;
+  decode reads `fb_instr[fb_head]` and the metadata reads `fb_pc[fb_head]` — **both from the same FB slot,
+  so op + metadata stay consistent** (just +1 fetch latency). Functionally correct as-is.
+- `DECODE_REG=1` ALONE → **FAIL** (vstr/amoxor/hint/hvsirq…). DECODE_REG registers `dec_op` but leaves the
+  fetch metadata LIVE and `fb_pop == rename_fire` (`:1059`/`:2227`), so `dec_op_q` (cycle T−1's decode) is
+  paired with `if_pc_q`/`if_v_q` (cycle T's FB head after the pop) → **metadata skew** (ROB entry gets op A
+  with PC B) → wrong redirect targets → pervasive hang. This is the documented "FF-insertion measurement
+  only, not functional" (`:1786-1791`); a real fix needs a valid/stall skid (register the metadata + split
+  `fb_pop` from `rename_fire` + flush).
+
+**The key measurement — DECODE_REG is MASKED, so it is not needed:**
+
+| bundle (synth `--dump-timing`) | headline | binding |
+|---|---|---|
+| 5-scaffold (incl. DECODE_REG) | 13.120 | `head → n_inflight[5]` |
+| **4-scaffold (FETCH_REG + STORE_PRETRANSLATE + RETIRE_DECOUPLE + VALU_PIPE, NO DECODE_REG)** | **13.120** | `head → n_inflight[5]` |
+
+**Identical.** DECODE_REG contributes ZERO to the headline — it cuts the `decode → rename` segment, but that
+segment is already BELOW the `n_inflight` wall (13.120), so it is masked. DECODE_REG would only matter if
+`n_inflight` were cut further — and §8 refuted that (the atomic `sb_merge` wall needs a physical commit-path
+separation). **So the hard DECODE_REG pipeline-register fix is AVOIDED: the −11 % (14.745 → 13.120) is
+delivered by the 4-scaffold bundle, all of which are functionally correct** (`veryl test` 252/0 with all four
+=1). `FETCH_REG` alone unmasks the wall exactly as well as `FETCH_REG+DECODE_REG` — the fetch-buffer register
+is the F|D stage that drops the front-end cone below the wall; the D|R stage (DECODE_REG) is redundant until
+the wall itself moves. **Next: the full SMP ladder (litmus N4 + SMP boot N2/N4 + Verilator NBA + ACT4
+paging/PMP + IPC budget) gates the 4-scaffold commit** (`DECODE_REG` stays DEAD =0). `DECODE_REG` remains a
+built-but-dead scaffold for a future sub-13.120 campaign.
+
+## 11. 🚧 SMP LADDER (2026-07-16) — GREEN except ONE ACT4 test: a latent R3-L2 cbo.m PMP-write fault-decouple bug at =1
+
+Ran the full SMP ladder on the 4-scaffold bundle (FETCH_REG + STORE_PRETRANSLATE + RETIRE_DECOUPLE +
+VALU_PIPE = 1, DECODE_REG = 0):
+
+| gate | result | IPC (=1 vs =0) |
+|---|---|---|
+| fast gate (252, incl litmus N2) | ✅ 252/0 | — |
+| N1 boot (smoke/7.1/7.1v/6.6) | ✅ 4/4 pass | +4–5 % (7.1v 20.9M→22.0M) |
+| SMP N2 boot | ✅ pass | +6.7 % (16.66M→17.78M) |
+| **litmus N4** (R3's SMP-ordering gate) | ✅ **no forbidden** | +0.2 % |
+| SMP N4 boot | ✅ pass | +1.3 % |
+| **ACT4 696** | ❌ **695/1** — `pmpzicbo_cbo_wr_01` fail (tohost=3) | — |
+
+**IPC verdict:** +4–7 % boot-cycle cost vs the −11 % CP (+12.4 % frequency) = **net ~+6–8 % faster** — a
+GOOD trade (not net-negative like shape-W). litmus N4 passing (no forbidden) is the key R3 SMP-safety proof:
+taking the plain-store live TLB off the retire gate does NOT break RVWMO under 4-hart stress.
+
+**The blocker — one ACT4 test:** `test_act_pmpzicbo_pmpzicbo_cbo_wr_01` (a cbo.m write to a PMP-protected
+region) fails at =1, **reproduced with `RETIRE_DECOUPLE=1` ALONE** (FETCH_REG=STORE_PRETRANSLATE=VALU_PIPE=0).
+So it is the R3-L2 cbo.m fault decouple: `cbo_m_acc_fault` (`:5941`) reads `if RETIRE_DECOUPLE ?
+(store_fetched_q ? (m_cbom_pmp_r_q && m_cbom_pmp_w_q) : 0) : (cbo_m_pmp_deny_r && cbo_m_pmp_deny_w)`, and
+the registered arm (`m_cbom_pmp_*_q` captured unconditionally every cycle at `:7686`) mis-delivers the
+R-AND-W PMP deny for this cbo.m at its commit cycle — the cbo write to a PMP-denied region does not trap.
+The DEAD scaffold was verified byte-id at =0 (ACT4 696/0) but the =1 cbo.m PMP path is NOT in the fast gate,
+so this latent bug survived. **This is a real R3 correctness bug that gates the commit; the fix is a focused
+debug of the cbo.m fault-decouple timing ($display the store_fetched_q / m_cbom_pmp_*_q / cbo_m_pmp_deny_*
+alignment at the cbo.m commit cycle).** MEM_PIPE=1 default; reproduce with
+`veryl test --ignored --test test_act_pmpzicbo_pmpzicbo_cbo_wr_01` at RETIRE_DECOUPLE=1. Tree reverted clean
+(`00b4818`, all scaffolds =0); the boot/litmus/IPC results above prove the other three scaffolds + R3's
+plain-store/atomic paths are correct — only the cbo.m PMP-write fault-decouple corner remains.
+
+## 12. ✅ FIXED + BANKED (2026-07-16) — the cbo.m fault-decouple bug root-caused ($display) and fixed; ACT4 696/0, bundle committable
+
+`$display` at the cbo.m commit (RETIRE_DECOUPLE=1) pinned it immediately:
+```
+CBOM pc=80002188 vm=0 priv=11 sfq=0 ack=1 | reg r=0 w=0 | live r=1 w=1 | fault=0 | caddr=80009000 cboaddr=80009000
+```
+A **BARE (M-mode, `vm=0`) cbo.m retires in ONE cycle (`ack=1`) with `store_fetched_q=0`** — it never rides
+the M3a 2-cycle handshake (that is a VM-walk thing). So `cbo_m_acc_fault`'s =1 arm `store_fetched_q ? reg :
+0` returned 0, dropping the (correct, `live r=1 w=1`) R-AND-W PMP deny; the registered `m_cbom_pmp_*_q` held
+the PREVIOUS op's deny (`reg r=0 w=0`, stale). §7.5's "cbo.m rides M3a store_fetched_q" holds only for the
+VM case.
+
+**Fix (`:5941`):** branch the =1 arm on `dmem_vm_on_op`. A bare cbo.m has `cbo_m_addr = c_store_addr`
+(ROB-registered, NOT the live TLB), so its live PMP deny is CP-neutral on `rob_commit_ack` and is the ONLY
+correct source when `store_fetched_q` never fires — use it. A VM cbo.m (`cbo_m_addr = dmu_dmem_addr`, live
+TLB) keeps the walk-cycle-registered `m_cbom_pmp_*_q` (gated by `store_fetched_q`), so the TLB stays off the
+retire gate. Byte-identical at `RETIRE_DECOUPLE=0` (the =0 arm is unchanged live deny).
+
+**Verified (4-scaffold bundle FETCH_REG + STORE_PRETRANSLATE + RETIRE_DECOUPLE + VALU_PIPE = 1, DECODE_REG =
+0):** `pmpzicbo_cbo_wr_01` now `tohost=1 pass=1`; **ACT4 696/0**; full boot/litmus ladder + IPC as §11. The
+−11 % bundle (14.745 → 13.120) is now fully green and committable. `DECODE_REG` stays a built-but-dead
+scaffold. This completes the "bank the bundle" goal.
