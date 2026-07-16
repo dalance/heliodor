@@ -2024,6 +2024,17 @@ pub module heliodor_core #(
     var m_spage_q    : logic    ; // = dmem_mmu_fault_s    (store page fault, cause 15)
     var m_sacc_q     : logic    ; // = dmem_mmu_acc_fault_s (store access fault, cause 7)
     var m_gstage_q   : logic    ; // = dmem_mmu_gstage      (two-stage G-stage flag, cause 23)
+    // R3 L2 (retire decouple, cbo.m): a VM cbo.m is c_is_store (mem_wen=1) + !sb_elig,
+    // so it already rides the M3a store_fetched_q 2-cycle commit — S0 registers its
+    // page/access fault via m_spage_q/m_sacc_q. These flops register the REMAINING
+    // cbo.m-specific commit-fault sources at the same translate cycle N (read at N+1
+    // under store_fetched_q), so RETIRE_DECOUPLE=1 takes their live TLB+PMP cone off
+    // rob_commit_ack too. Written unconditionally alongside m_spage_q; unread at
+    // RETIRE_DECOUPLE=0 → DCE (byte-identical). See §7.4 / commit_store_s* below.
+    var m_pte_acc_q  : logic    ; // = dmem_mmu_pte_acc_fault (cbo.m PTE-read PMP deny on the walk)
+    var m_pma_hole_q : logic    ; // = dmem_mmu_pma_hole      (cbo.m translated PA is a PMA hole)
+    var m_cbom_pmp_r_q: logic   ; // = cbo_m_pmp_deny_r       (cbo.m R-perm PMP deny)
+    var m_cbom_pmp_w_q: logic   ; // = cbo_m_pmp_deny_w       (cbo.m W-perm PMP deny)
     var m_ren_q      : logic    ; // = dmu_dmem_ren && !lsr_capture (execute read term)
     var m_unc_q      : logic    ; // = dc_uncached && !lsr_capture
     var m_lnext_q    : logic    ; // = dc_load_next && !dc_uncached && !lsr_capture
@@ -4357,16 +4368,26 @@ pub module heliodor_core #(
     // UNCONDITIONALLY the live MMU). RETIRE_DECOUPLE replaces it with a CONST gate:
     // at =1 the live arm DCEs and every store reads the registered fault. This is
     // the SMP-ordering heart, so it is staged (§7): S0 = this const-gated skeleton
-    // (the sfault_*_eff MMU-fault mux); L2 = register the cbo.m fault at execute;
-    // L3 = register the atomic fault (the §13 RMW-re-drive minefield). The =1 arm
-    // is only fully correct once L2/L3 land (cbo.m/atomic execute-translate); at =0
-    // it const-folds to the exact STORE_PRETRANSLATE runtime mux = byte-identical.
+    // (the sfault_*_eff MMU-fault mux); L2 = register the REMAINING cbo.m fault terms
+    // (pte_acc/pma_hole/R-AND-W PMP) at the M3a translate cycle N — a VM cbo.m already
+    // rides store_fetched_q (c_is_store + !sb_elig), so no execute translate is needed,
+    // just registering its walk-time fault the way m_spage_q registers the page fault;
+    // L3 = register the atomic fault (the §13 RMW-re-drive minefield). The =1 arm is
+    // only fully correct once L2/L3 land (cbo.m done here, atomic pending); at =0 it
+    // const-folds to the exact live/STORE_PRETRANSLATE mux = byte-identical.
     const RETIRE_DECOUPLE: bit = 0;
     let sfault_pg_eff  : logic = if RETIRE_DECOUPLE ? (if store_fetched_q ? m_spage_q  : 1'b0) : if !store_xlate_dfr ? dmem_mmu_fault_s     : if store_fetched_q ? m_spage_q  : 1'b0;
     let sfault_acc_eff : logic = if RETIRE_DECOUPLE ? (if store_fetched_q ? m_sacc_q   : 1'b0) : if !store_xlate_dfr ? dmem_mmu_acc_fault_s : if store_fetched_q ? m_sacc_q   : 1'b0;
     let sfault_gs_eff  : logic = if RETIRE_DECOUPLE ? (if store_fetched_q ? m_gstage_q : 1'b0) : if !store_xlate_dfr ? dmem_mmu_gstage      : if store_fetched_q ? m_gstage_q : 1'b0;
-    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((sfault_acc_eff && !sfault_pg_eff && (!c_is_cbo_m || dmem_mmu_pte_acc_fault || dmem_mmu_pma_hole)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
-    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (sfault_pg_eff || (sfault_acc_eff && (!c_is_cbo_m || dmem_mmu_pte_acc_fault || dmem_mmu_pma_hole)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
+    // R3 L2 (cbo.m): a VM cbo.m rides the M3a store_fetched_q 2-cycle commit (c_is_store
+    // + !sb_elig), so its page/access fault is ALREADY registered (m_spage_q/m_sacc_q via
+    // the sfault_*_eff above). These two are the REMAINING cbo.m-only commit-fault terms,
+    // registered at the same translate cycle N (m_pte_acc_q/m_pma_hole_q) and read at N+1
+    // under store_fetched_q. =0 folds to the live MMU-walk fault = byte-identical.
+    let pte_acc_eff : logic = if RETIRE_DECOUPLE ? (if store_fetched_q ? m_pte_acc_q  : 1'b0) : dmem_mmu_pte_acc_fault;
+    let pma_hole_eff: logic = if RETIRE_DECOUPLE ? (if store_fetched_q ? m_pma_hole_q : 1'b0) : dmem_mmu_pma_hole;
+    let commit_store_sacc  : logic = rob_commit_valid && c_is_store && !c_illegal && ((sfault_acc_eff && !sfault_pg_eff && (!c_is_cbo_m || pte_acc_eff || pma_hole_eff)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
+    let commit_store_sfault: logic = rob_commit_valid && c_is_store && !c_illegal && (sfault_pg_eff || (sfault_acc_eff && (!c_is_cbo_m || pte_acc_eff || pma_hole_eff)) || fast_store_acc_fault || amo_commit_acc_fault || cbo_m_acc_fault);
     let c_is_sfault_eff    : logic = c_is_sfault || commit_store_sfault;
     let commit_excp        : logic = rob_commit_valid
         && (c_illegal || c_is_ecall || c_is_ebreak || c_is_lfault || c_is_sfault_eff || inject_fake_ifault
@@ -5902,7 +5923,12 @@ pub module heliodor_core #(
         i_pmpaddr: csr_pmpaddr  ,
         o_fault  : cbo_m_pmp_deny_w,
     );
-    assign cbo_m_acc_fault = rob_commit_valid && c_is_cbo_m && !c_illegal && cbo_m_pmp_deny_r && cbo_m_pmp_deny_w;
+    // R3 L2 (cbo.m): the R-AND-W PMP deny is on cbo_m_addr (= the live TLB PA dmu_dmem_addr
+    // for a VM cbo.m) — the §7.1 binding requester (u_pmp_cbo_m_w on the live TLB). Register
+    // it at the M3a translate cycle N (m_cbom_pmp_r/w_q) and read at N+1 under store_fetched_q
+    // so RETIRE_DECOUPLE=1 takes it off rob_commit_ack. =0 folds to the live deny = byte-id.
+    assign cbo_m_acc_fault = rob_commit_valid && c_is_cbo_m && !c_illegal
+        && (if RETIRE_DECOUPLE ? (if store_fetched_q ? (m_cbom_pmp_r_q && m_cbom_pmp_w_q) : 1'b0) : (cbo_m_pmp_deny_r && cbo_m_pmp_deny_w));
 
     // Core dmem view (pre-MMU virtual address)
     //
@@ -7623,6 +7649,10 @@ pub module heliodor_core #(
             m_spage_q    = 1'b0;
             m_sacc_q     = 1'b0;
             m_gstage_q   = 1'b0;
+            m_pte_acc_q  = 1'b0;
+            m_pma_hole_q = 1'b0;
+            m_cbom_pmp_r_q = 1'b0;
+            m_cbom_pmp_w_q = 1'b0;
             m_ren_q      = 1'b0;
             m_unc_q      = 1'b0;
             m_lnext_q    = 1'b0;
@@ -7640,6 +7670,10 @@ pub module heliodor_core #(
             m_spage_q    = dmem_mmu_fault_s;
             m_sacc_q     = dmem_mmu_acc_fault_s;
             m_gstage_q   = dmem_mmu_gstage;
+            m_pte_acc_q  = dmem_mmu_pte_acc_fault;
+            m_pma_hole_q = dmem_mmu_pma_hole;
+            m_cbom_pmp_r_q = cbo_m_pmp_deny_r;
+            m_cbom_pmp_w_q = cbo_m_pmp_deny_w;
             m_fault_q    = dmem_mmu_fault_s || dmem_mmu_acc_fault_s;
             m_ren_q      = dmu_dmem_ren && !lsr_capture;
             m_unc_q      = dc_uncached && !lsr_capture;
