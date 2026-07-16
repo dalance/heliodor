@@ -325,3 +325,29 @@ all read registered faults and the live TLB+PMP arm DCEs. The dominant new machi
 execute-time walk** (cbo.m + atomic), which is A-LOOP-adjacent depth — confirming §6.2's "R3 is one
 SMP-critical program." **Recommended next RTL: L2 cbo.m** — the lower-risk of the two real requesters
 (NOP → squash-free, no RMW), starting with the M-stage-translate route + the speculative-walk decision (c).
+
+### 7.5 ✅ L2 IMPLEMENTED (2026-07-16) — cbo.m rides M3a; NO speculative walk (§7.4c corrected)
+
+Building L2 corrected §7.4(c)'s "speculative execute-time walk" concern — it was over-thought. **A VM cbo.m
+is `c_is_store` (`mem_wen=1`, `decoder:673`) + `!sb_elig` (VM ⇒ not a fast store), so it ALREADY rides the
+M3a `store_fetched_q` 2-cycle commit.** Its MMU walk still happens at commit exactly as before (the retire is
+stalled by `dmem_mmu_busy` during the walk); `store_fetched_q` sets the cycle N the walk completes
+(`!dmem_mmu_busy`), the fault is registered at N, and retire fires at N+1 from the flops. **No execute-time
+translate, no speculative walk** — just the +1 retire deferral M3a already pays for every slow store. So S0
+already registered cbo.m's page/access fault (`m_spage_q`/`m_sacc_q`); L2 adds the four REMAINING cbo.m-only
+sources at the same cycle N: `m_pte_acc_q`/`m_pma_hole_q` (walk PTE-PMP deny / PMA hole) and
+`m_cbom_pmp_r_q`/`m_cbom_pmp_w_q` (the R-AND-W PMP on the live TLB PA — the §7.1 binding requester
+`u_pmp_cbo_m_w`). `commit_store_sacc`/`sfault` route the walk-fault terms through `pte_acc_eff`/`pma_hole_eff`
+and `cbo_m_acc_fault`'s PMP through the flops, all `if RETIRE_DECOUPLE ? (store_fetched_q ? reg : 0) : live`.
+
+**Committed DEAD (`07843e8`), byte-identical:** veryl test 252/0, litmus N2 cy=00231860 (baseline-exact),
+synth headline 14.745 ns @ rs1_rdy (the flops DCE at 0). At `RETIRE_DECOUPLE=1` the cbo.m live TLB+PMP cone
+is now fully off `rob_commit_ack` (S0 page/access + L2 pte_acc/pma_hole/PMP).
+
+**Implication for L3 (atomic):** the same M3a insight likely applies — an AMO/SC commit write is a slow store
+(`c_is_store && !sb_elig`) that rides `store_fetched_q` too, so its page/access fault is already S0-registered;
+the residual is `amo_commit_acc_fault` (the AMO-write PMP `u_pmp_amo_commit` on the live PA). BUT the atomic
+differs from cbo.m: it does a REAL coherent RMW at commit (not a NOP), and M3b proved the commit WRITE must
+stay single-cycle (a +1 skew wedges litmus N2 amoadd). So L3 registers the AMO PMP deny at the translate
+cycle (like `m_cbom_pmp_*_q`) while the RMW write stays LIVE — verify the M3b atomicity holds on the full SMP
+ladder. Remaining after L3: fast-store (non-binding bare PMP), then the `RETIRE_DECOUPLE=1` flip + measure.
