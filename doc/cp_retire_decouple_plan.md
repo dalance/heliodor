@@ -344,10 +344,34 @@ and `cbo_m_acc_fault`'s PMP through the flops, all `if RETIRE_DECOUPLE ? (store_
 synth headline 14.745 ns @ rs1_rdy (the flops DCE at 0). At `RETIRE_DECOUPLE=1` the cbo.m live TLB+PMP cone
 is now fully off `rob_commit_ack` (S0 page/access + L2 pte_acc/pma_hole/PMP).
 
-**Implication for L3 (atomic):** the same M3a insight likely applies — an AMO/SC commit write is a slow store
-(`c_is_store && !sb_elig`) that rides `store_fetched_q` too, so its page/access fault is already S0-registered;
-the residual is `amo_commit_acc_fault` (the AMO-write PMP `u_pmp_amo_commit` on the live PA). BUT the atomic
-differs from cbo.m: it does a REAL coherent RMW at commit (not a NOP), and M3b proved the commit WRITE must
-stay single-cycle (a +1 skew wedges litmus N2 amoadd). So L3 registers the AMO PMP deny at the translate
-cycle (like `m_cbom_pmp_*_q`) while the RMW write stays LIVE — verify the M3b atomicity holds on the full SMP
-ladder. Remaining after L3: fast-store (non-binding bare PMP), then the `RETIRE_DECOUPLE=1` flip + measure.
+**Implication for L3 (atomic):** the atomic is NOT a `store_fetched_q` slow store — M3a EXCLUDES it
+(`!c_is_amo`, its commit write is single-cycle live `amo_commit_live`). But the M4 machinery already captured
+its read-time translated PA in `ac_pa_q` (held issue→commit, = the commit PA — it drives the write). So L3
+did NOT touch the write timing (no M3b risk): it sources the AMO commit-PMP address off the REGISTERED
+`ac_pa_q` (`u_pmp_amo_commit i_addr : if RETIRE_DECOUPLE ? ac_pa_q : <live>`), leaving the TLB off the retire
+gate while the RMW write stays live single-cycle. Committed DEAD `3183010` (byte-identical: 252/0, litmus N2
+cy=00231860, synth 14.745 ns @ rs1_rdy).
+
+### 7.6 ✅ MEASURED (2026-07-16) — the R3 flip CUTS the n_inflight wall (14.130 → 13.880, TLB off the retire gate)
+
+Throwaway synth flip (all four latent fronts on: `FETCH_REG` + `DECODE_REG` + `STORE_PRETRANSLATE` +
+`RETIRE_DECOUPLE` = 1; then reverted) confirms R3 achieves its goal:
+
+| Config | headline | binding front |
+|---|---|---|
+| default | 14.745 | front-end→scheduler cone (`pc_q → decode → rename → rs1_rdy`) |
+| + front-end register | 14.130 | **`n_inflight` commit-store wall** (`head → commit_store_fire → dmem_vaddr → live TLB → n_inflight`) |
+| + front-end + `RETIRE_DECOUPLE` (STORE_PRETRANSLATE=0) | 14.130 | STILL `n_inflight` — the STORE **PA** translate binds (RETIRE_DECOUPLE cuts only the FAULT; the plain-store PA is live at commit until STORE_PRETRANSLATE registers it) |
+| + front-end + `STORE_PRETRANSLATE` + `RETIRE_DECOUPLE` | **13.880** | **`n_inflight` GONE (0 of the top paths)** → `vrf` now binds |
+
+So **R3 needs its PARTNER `STORE_PRETRANSLATE`** (PA registered) to show CP — RETIRE_DECOUPLE registers the
+FAULT, STORE_PRETRANSLATE registers the PA; both are needed for the live TLB to leave `rob_commit_ack`.
+Together they cut the `n_inflight` commit-store wall from 14.130 to below 13.880 (the `vrf` front, previously
+masked, now binds). R3's own contribution is ~0.25 ns — modest, but it removes the wall that masked
+everything below it and takes the live TLB off the retire gate (the deep-pipeline structural goal). The next
+front is `vrf` (the `VALU_PIPE` scaffold), then the coordinated multi-front flip.
+
+**State:** S0 + L2 + L3 all committed DEAD + byte-identical. The `RETIRE_DECOUPLE=1` functional flip (with
+`STORE_PRETRANSLATE=1`) is the GATED step — it needs the full SMP ladder (litmus N2/N4 + N2/N4 SMP boot +
+Verilator NBA + ACT4 PMP/paging + IPC budget) before it can be enabled. Remaining scaffold-side: fast-store
+(non-binding bare PMP; register for completeness, but it does not pin the TLB).
