@@ -208,3 +208,75 @@ lies only the atomic-inclusive slow-store retire redesign (SMP-critical). The ho
 bank the CP work** (all scaffolds built + verified; ~13.7 ns accepted as the current-µarch floor) **and
 pivot** to the SRAM-realism deliverable (goal b) or a consolidation/default-flip checkpoint. **User
 decision.**
+
+---
+
+## 7. R3 COMMITTED (2026-07-16) — the concrete staged build plan
+
+**User decision (2026-07-16):** after the D$ tag-array SRAM sub-track reached its own end (tag §15.5-S2 =
+zero synth-area/CP payoff, tag RAM is bit-capacity-charged + 11 live SMP coherence/AMO consumers), pivot
+back to the CP front and **commit to R3** (the atomic-inclusive slow-store retire decouple) — the one lever
+that cuts the real wall.
+
+**Fresh measurement (2026-07-16, current default build, `synth --dump-timing`):** the default headline is
+**14.745 ns** — the fused front-end→scheduler cone `pc_q → decode(dec_op2) → rename_fire → alloc_op →
+rs1_rdy` (the 8 `u_iq.rs1_rdy[*]` endpoints), NOT the retire wall. A throwaway `FETCH_REG=1 + DECODE_REG=1`
+front-end-register flip drops it to **14.130 ns** and exposes exactly the **`n_inflight` commit-store
+megacone** (`head → commit_store_fire → AGU → MMU translate → n_inflight`) as the new binding front — the
+R3 wall. Below it: `vrf` 13.880, scheduler ~10 ns (all masked). **So the front-end/A-EXE/A-SCHED scaffolds
+shave only ~0.6 ns before hitting the R3 wall; R3 is the only lever below ~14.1 ns.** (`fp_divider`/`fp_sqrt`
+do NOT appear in the top-30 paths — a masked deep floor, not the headline; the earlier "easiest CP lever"
+guess was wrong.)
+
+### 7.1 The full LIVE commit-fault source inventory (everything on `rob_commit_ack` via commit_store_sacc/sfault, `:4353-4354`)
+
+R3 must make ALL SIX read execute-registered values so the live TLB+PMP cone DCEs off the retire gate:
+
+1. **`sfault_pg_eff` / `sfault_acc_eff` / `sfault_gs_eff`** (`:4350-4352`) — the MMU page/access/G-stage
+   fault, runtime-muxed `if !store_xlate_dfr ? live(dmem_mmu_*_s) : reg(m_spage_q/m_sacc_q/m_gstage_q)`.
+   Registered (M-stage `m_*_q`, `:7625-7628`) only for the plain STORE_PRETRANSLATE class; LIVE for
+   cbo.m / atomic / non-pretranslated stores.
+2. **`dmem_mmu_pte_acc_fault`** (`:534`) — live MMU-walk PTE-PMP deny (cbo.m keeps it live).
+3. **`dmem_mmu_pma_hole`** (`:535`) — live PMA hole on the translated PA (cbo.m keeps it live).
+4. **`fast_store_acc_fault`** (`:5790`) — fast (bare store-drain) PMP deny — a SEPARATE PMP path, not
+   through the dmem MMU.
+5. **`amo_commit_acc_fault`** (`:5840`) = `commit_store_fire && c_is_amo && amo_commit_pmp_deny` — the
+   atomic commit-time WRITE PMP (`u_pmp_amo_commit`, `:5832`, on LIVE `dmu_dmem_addr`).
+6. **`cbo_m_acc_fault`** (`:5890`) = `… && cbo_m_pmp_deny_r && cbo_m_pmp_deny_w` — cbo.m R-AND-W PMP deny
+   (`u_pmp_cbo_m_r/w`, `:5874-5888`, on LIVE `cbo_m_addr = dmu_dmem_addr`).
+
+**Why cbo.m/atomic are the hard part:** their PA/fault is computed at COMMIT (they re-drive the dmem MMU at
+commit — `cbo_m_addr`/`amo_commit` PMP inputs are the live `dmu_dmem_addr`). The M-stage `m_*_q` flops capture
+`dmu_dmem_addr` every cycle but at EXECUTE that port carries the load/plain-store, not the cbo.m/atomic. So
+registering their fault requires ROUTING them through the MMU at EXECUTE (like STORE_PRETRANSLATE does for
+plain stores) — a datapath change. For the ATOMIC, §13 refuted deferring the translate because the atomic
+ALSO re-drives the MMU at commit for its coherent RMW (not just the fault) — that is L3, the SMP minefield.
+
+### 7.2 Staged build sequence (each a full-slow-gate flip; DEAD scaffold → verify byte-id → flip)
+
+- **✅ S0 (2026-07-16) — the const-gate skeleton.** `const RETIRE_DECOUPLE: bit = 0` (`:4348`). The three
+  `sfault_*_eff` become `if RETIRE_DECOUPLE ? (store_fetched_q ? m_*_q : 0) : <the exact STORE_PRETRANSLATE
+  runtime mux>`. At =0 const-folds to the current mux = byte-identical (the live arm survives). Reserves the
+  const-gated structure exactly like the D$ §13.7 S0 spine; the =1 arm is only fully correct once L2/L3 land.
+- **L1 — const-gate the remaining `_eff` live terms + PMP-result registration groundwork.** Fold
+  `dmem_mmu_pte_acc_fault` / `dmem_mmu_pma_hole` and the PMP-deny results into registered M-stage flops
+  (`m_pte_acc_q` / `m_pma_hole_q`, captured at execute alongside `m_pa_q`), const-gated under
+  RETIRE_DECOUPLE. Byte-id at 0.
+- **L2 — cbo.m execute-translate + fault register.** cbo.m is a MANAGEMENT op (no RMW), so route its VA
+  through the dmem MMU at execute (extend the STORE_PRETRANSLATE probe to `c_is_cbo_m`) and register
+  `{cbo_m_pmp_deny_r, cbo_m_pmp_deny_w, m_pa}`; the commit reads the flops. Structurally viable, lower risk
+  than the atomic (§6.2). Does NOT move CP alone (shared TLB) — must land with L1+L3.
+- **L3 — atomic execute-translate + fault register (the SMP minefield).** Register the atomic's
+  `amo_commit_pmp_deny` + MMU fault at execute; the RMW re-drive at commit stays LIVE for the coherent
+  memory op but reads the REGISTERED PA/fault for the trap decision (the §13-refuted split: fault-at-execute,
+  RMW-at-commit-on-registered-PA). Highest risk = M3b atomicity (a +1 skew on the commit write wedges litmus
+  N2 amoadd — proven). Co-design + re-verify at each sub-step.
+- **L1-flip — const-gate on.** Once L1+L2+L3 register every requester, flip `RETIRE_DECOUPLE=1` so the live
+  TLB+PMP arm DCEs off `rob_commit_ack`. Measure the bundle CP (target ~12.4 ns memory floor).
+
+### 7.3 Verification ladder (retire = SMP-ordering heart)
+
+Per §5: DEAD `=0` — default 252/0 + litmus N2 cy-exact + synth CP/FF/levels/endpoint unchanged + N1 boot
+cy-exact. FUNCTIONAL `=1` — the FULL SMP ladder: litmus N2/N4 + N2/N4 SMP boot + Verilator (NBA — the M3b
+minefield surfaces only on multi-hart NBA) + ACT4 (S-mode paging + cbo.m + PMP suites) + the IPC budget.
+The `=1` flip is the gated step; the DEAD scaffolds land freely.
