@@ -163,19 +163,22 @@ R2 or whether the wall needs the deeper (R3) work.
 
 ---
 
-## 5. ✅ FLIP verification (2026-07-17) — GREEN on fast/ACT4/litmus-N4/SMP-N2/synth; one SMP-boot wedge FOUND + FIXED (c_store_mmio exec/retire split)
+## 5. ✅ FLIP verification (2026-07-17) — FULL LADDER GREEN, `SB_PA_REG=1` SHIPPED (−6 % CP); one SMP-boot wedge FOUND + FIXED (c_store_mmio exec/retire split)
 
 Ran the full-SMP-ladder gate on the `SB_PA_REG=1` flip (commits `f239d2f` scaffold + `e9a052b`
-fix). Result: the CP win is real and the flip is SMP-safe, after fixing one latent wedge.
+fix). Result: the CP win is real and the flip is SMP-safe, after fixing one latent wedge. **Every
+gate re-verified WITH the fix on the current tree — all green — so the flip is committed.**
 
 | gate | result |
 |---|---|
 | fast (`veryl test`, 252 + litmus N2) | ✅ **252/0**, litmus N2 cy=00236680 (cycle-EXACT vs =0 → functionally equivalent) |
-| ACT4 696 (paging/PMP/cbo/atomic) | ✅ **696/0** (pre-fix; cbo_wr_01 = the §11 precedent, PASS via the dedicated bare checker) |
-| litmus N4 (RVWMO) | ✅ **pass=1, NO forbidden** (pre-fix) — R1 SMP-ordering proof: the commit live-TLB off the retire gate does NOT break RVWMO at 4-hart |
-| synth CP | ✅ **12.965 ns (−6 %)** — with the fix, UNCHANGED (the fix is CP-neutral) |
+| ACT4 696 (paging/PMP/cbo/atomic) | ✅ **696/0** (re-verified WITH the fix; cbo_wr_01 = the §11 precedent, PASS via the dedicated bare checker) |
+| litmus N4 (RVWMO) | ✅ **pass=1, NO forbidden**, cy=00537730 (re-verified WITH the fix) — R1 SMP-ordering proof: the commit live-TLB off the retire gate does NOT break RVWMO at 4-hart |
+| synth CP | ✅ **12.965 ns (−6 %)** (`pc_q[34] → n_inflight[5]`, 137 levels) — with the fix, UNCHANGED (CP-neutral); the new front is the instruction-side MMU, exactly as §2.2 predicted |
 | **SMP boot N2** | ✅ **PASS with the fix** (probe matches =0 baseline cycle-for-cycle); **WEDGED without it** |
-| SMP boot N4 / Verilator N1·N2 | ⏳ remaining flip gates (+ ACT4 / litmus-N4 re-verify with the fix) |
+| **SMP boot N4** | ✅ **PASS, r3=0xAA, cy=0x1647200** (~23.36 M; two independent runs byte-identical → deterministic) |
+| **Verilator N1** (NBA) | ✅ **PASSED**, SBI shutdown / x3==0xAA, cy=13052883 |
+| **Verilator N2** (NBA, multi-hart) | ✅ **PASSED**, SBI shutdown / x3==0xAA, cy=17776159 — the retire-gate change is NBA-correct at 2-hart (the wedge's home turf) |
 
 ### 5.1 The wedge + fix — c_store_mmio is BOTH a retire gate AND a dcache-write input
 
@@ -198,11 +201,18 @@ registered `c_store_mmio` (CP). The exec classifier reaches `rob_commit_ack` onl
 multi-cycle dcache state/stall (not combinationally), so it is **CP-neutral** (synth stays 12.965 ns,
 verified). At =0 `c_store_mmio_x ≡ c_store_mmio` → byte-identical.
 
-### 5.2 Remaining before the `SB_PA_REG=1` flip commit
+### 5.2 ✅ SHIPPED — `SB_PA_REG=1` committed (the full ladder is green)
 
-The scaffold (`f239d2f` + `e9a052b`) is DEAD byte-identical and now correctly flippable. To ship the
-−6 % flip: (a) **re-verify ACT4 696 + litmus N4 WITH the fix** (the green runs above were pre-fix —
-the fix restored `dc_i_wen`/`dc_wen_excl` to =0-live behaviour, so they should still pass, but the RTL
-changed); (b) **SMP boot N4** + (c) **Verilator N1/N2** (NBA — retire-gate changes surface only on
-multi-hart NBA). Then flip `SB_PA_REG=1` (with `DECODE_REG` note: this flip is independent of the
-banked bundle). Alternative if a later gate fails: bank at 13.800 (the DEAD scaffold stays committed).
+All the gates §5.2 previously listed as remaining are now green **with the fix** on the current tree:
+(a) ACT4 696/0 + litmus N4 pass=1/no-forbidden re-verified WITH the fix; (b) SMP boot N4 PASS
+(r3=0xAA, cy=0x1647200, two runs byte-identical); (c) Verilator N1 + N2 PASSED (NBA-correct, SBI
+shutdown / x3==0xAA). synth re-confirmed **12.965 ns** on the committed flip. So `const SB_PA_REG:
+bit = 1` is committed — the last shared commit live-TLB requester (sb_pa + cbo.m PMP) is off
+`rob_commit_ack`, CP **13.800 → 12.965 (−6 %)** with IPC neutral (SMP-N2 boot is cycle-for-cycle
+identical to =0, so the flip is functionally equivalent, not merely byte-identical-at-0). The flip is
+independent of the banked bundle (`DECODE_REG` stays 0). Revert path if a regression later surfaces:
+`SB_PA_REG=0` restores the DEAD byte-identical scaffold.
+
+The new binding front is the **instruction-side MMU** (`pc_q[34] → … → n_inflight[5]`, 137 levels) —
+a DIFFERENT cone from the dmem-commit wall this piece cut. See §3 (R1b allocation-decouple / R2
+universal execute-translate) for the follow-on levers; the next CP front is the imem-MMU path.
