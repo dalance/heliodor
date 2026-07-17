@@ -1,5 +1,24 @@
 # Realistic-SRAM migration — 28-RAM inventory (`heliodor_core`)
 
+> ## ✅ PHASE-1 CLOSE-OUT (2026-07-17) — the realistic-SRAM migration (campaign goal ③) is DONE
+>
+> The tables below are the **Phase-0 baseline** (targets, on `c09f99c`). What SHIPPED (default-on,
+> full-SMP-ladder + Verilator N1/N2 verified — see `cp_dcache_sync_read_plan.md`, `cp_l2_sync_read_plan.md`,
+> `cp_dcache_data_write_collapse`):
+> - **D$ data array `64×512 ×4`: 9R4W → TRUE 1R1W** (`DCACHE_DATA_1RW` byte-write-enable +
+>   `DCACHE_DATA_READ_1R` read-fold + `DCACHE_CAP_1R` writeback-capture fold). Synchronous read = a stage.
+> - **D$ tag array `64×52 ×4`: 15R1W → 13R1W** + demand-hit from registered tags (`DCACHE_TAG_READ_1R`,
+>   §15.5-S1). Further port reduction (§15.5-S2, `index` fold → 12R1W) is un-built (a DEAD next step).
+> - **L2 data `512×512 ×4`: TRUE 1R1W** (byte-write-enable + `L2_PORTS_1R1W` write-collapse) + synchronous
+>   read (`L2_SYNC_READ`). L2 read-port fold (`L2_READ_1R1W`) is a DEAD scaffold (un-flipped).
+> - **Predictor tables** (btb/bht/ibtb) + **icache**: sync-read scaffolds BUILT but DEAD (`*_SYNC_READ=0`,
+>   `ICACHE_SYNC_READ=0`) — they flip with the Phase-D front-end deepening (a future program).
+>
+> Full knob map (live / dead-scaffold / bisect): **`doc/pipeline_knob_registry.md`**. Campaign status +
+> target revision: `deep_pipeline_status_and_replan.md` §8.2. The caches are on realistic 1RW/1R1W SRAM;
+> the remaining un-flipped folds (D$ tag §15.5-S2, L2 read-1R1W, predictor/icache sync) are documented DEAD
+> scaffolds for the front-end/L2 follow-on, not gaps in the shipped design.
+
 Phase-0 deliverable for the deep-pipeline + realistic-SRAM campaign
 (`doc/deep_pipeline_sram_plan.md`). Each of the 28 RAM blocks `veryl synth
 --top heliodor_core --dump-area` infers, mapped to its RTL declaration, with
