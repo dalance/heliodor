@@ -226,3 +226,23 @@ two-thirds (R1 decoupled-retire + R2 translate-at-execute), and **hold 7.5 ns / 
 aspiration** contingent on R3 clearing the SMP ladder + the memory-floor/scheduler phases. **Next: begin
 R1** (decoupled-retire + store queue) as a `DEAD` param scaffold (byte-identical at 0, the campaign's proven
 methodology), build + measure R1+R2 before committing to R3. Design in `cp_retire_decouple_plan.md`.
+
+### 8.1 RE-AFFIRMED (2026-07-17) — front-end scaffolding now EXHAUSTED; R1 is the sole remaining structural front
+
+Re-confirmed by the user after banking the **I$ decoupled-fetch (shape-W)** scaffold (`7127cb9`,
+`cp_icache_fetch_decouple_plan.md §22`) — the **last** maskable front-end SRAM stage (F2). The intervening
+work since 2026-07-06 (the deep-pipeline **bundle bank** `c2a98fe` = FETCH_REG+STORE_PRETRANSLATE+
+RETIRE_DECOUPLE+VALU_PIPE, −11 %; the D$/L2 sync-read + read-port collapses; shape-W) built/verified **every
+maskable CP scaffold** — front-end (F1/F2/D/R), execute keystone (A-EXE), scheduler (A-SCHED), and the SRAM
+migration (D$ 1R1W, L2 sync, I$ shape-W). A fresh `veryl synth --top heliodor_core` on the banked tree
+(2026-07-16) re-confirms the binding wall UNMOVED in KIND: **13.800 ns `head → commit_store_fire → live dmem
+TLB → n_inflight[5]`** (the absolute drifted 13.71→13.800 with the veryl/cell-model update; the cone is the
+same §1 retire megacone), with the `redirect_pc_q`/`mip` band ~0.5 ns below (masked, same cone tail). §8's
+`c_is_amo` runtime-gate refutation was re-verified this session (`cp_retire_decouple_plan.md §8`).
+
+**Consequence:** there is no longer any front-end/SRAM scaffold left to defer to — **R1 (decoupled-retire +
+store queue) is now the sole remaining structural lever**, and the near-term ~12 ns target hinges entirely on
+it. The decision stands: **sequence R1 → R2 as DEAD scaffolds (measure before R3); R3 (atomic reorder / M3b
+minefield) is the gated SMP-critical finale.** R1 is a fresh, large multi-session piece (a real store queue,
+not FF-insertion) best started in a clean context. The alternative (§6 item, un-chosen) — bank at ~13.8 and
+treat the retire redesign as a future separately-scoped program — remains available if R1 proves out of budget.
