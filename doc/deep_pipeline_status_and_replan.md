@@ -246,3 +246,28 @@ it. The decision stands: **sequence R1 → R2 as DEAD scaffolds (measure before 
 minefield) is the gated SMP-critical finale.** R1 is a fresh, large multi-session piece (a real store queue,
 not FF-insertion) best started in a clean context. The alternative (§6 item, un-chosen) — bank at ~13.8 and
 treat the retire redesign as a future separately-scoped program — remains available if R1 proves out of budget.
+
+### 8.2 ✅ REACHED (2026-07-17, user decision §6.2-D) — the near-term ~12 ns target is MET on the *real* floor; R1a shipped, the reported wall was a FALSE PATH
+
+R1a (`SB_PA_REG=1`, `aee7ecd`, −6 % headline 13.800→12.965) took the last shared commit live-TLB off
+`rob_commit_ack`. Then `cp_store_queue_plan.md` §6 proved (throwaway `ic_route = ic_owns`) that the
+`pc_q → n_inflight` 12.965 headline — and, by strong inference, the 13.800/13.120/14.130 headlines before
+it — is a **FALSE PATH** (a fetch-icache-miss → shared-dmem-port → commit-store stitch, not co-sensitizable).
+The **real** synth CP has been **~12.5 ns** for a while, bounded not by the retire µarch but by the **vector
+execute→writeback datapath**: two co-floors 0.02 ns apart — FP double (`fr_d1_q → fround_d_add → vrf`,
+12.510) and integer-vx (`head → prf → bbcast → valu_res → vrf`, 12.490) (`cp_vector_datapath_cut_plan.md`).
+
+The FP cut (`VFP_EX_PIPE`, `ef12620`, DEAD) is functionally correct at =1 (fast 252/0, `test_arch_vfarith`
+PASS) but moves the real CP only 12.510→12.490 (the vx co-floor is right behind), so it is **not worth
+flipping alone** against its +1–2-cycle-per-FP-element vector throughput cost. Moving below ~12.5 needs a
+**coordinated FP+vx vector-pipelining multi-cut** whose combined throughput cost must beat a ≤~0.5 ns CP gain
+— a poor trade unless vector-FP-heavy code dominates.
+
+**User decision (§6.2-D, 2026-07-17): the near-term ~12 ns / 6–7-stage FINAL target is REACHED on the real
+floor (12.49–12.51 ns).** The CP-reduction campaign has taken every scalar retire/commit/fetch + SRAM lever
+(14.745 → real ~12.5); R1a −6 % was the last high-value scalar ship. **The 7.5 ns / 10-stage aspiration stays
+long-term, now explicitly contingent on a SEPARATE program: coordinated FPU/vector-datapath pipelining
+(`cp_vector_datapath_cut_plan.md`, throughput-gated) + the ~12.4 ns memory floor (Direction-C §8) + R3 atomic
+reorder / scheduler phases.** The DEAD scaffolds (`SB_PA_REG` live; `VFP_EX_PIPE`, `MEM_PIPE`, the vx cut
+un-built) remain as the components of that future program. Optional metric-hygiene follow-on: §6.2-B (register
+`ic_route`/the dmem grant) to structurally break the false stitch so `synth` reports the real ~12.5.
