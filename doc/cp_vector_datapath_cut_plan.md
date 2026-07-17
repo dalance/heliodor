@@ -72,15 +72,28 @@ scalar retire scaffolding. **Gate the flip on a vector-workload IPC measurement,
    `:2756`), exactly like div/sqrt, and the VU `fp_ph` COMPUTE FSM already gates the CAPTURE/write on
    `!vfpu_busy` (`fp_reg_wr`, `:2368`) — so it waits the extra cycles automatically. The scaffold is just
    the const + the two param pass-throughs on the `u_vfpu` instantiation. Verified DEAD (=0): fast 252/0,
-   litmus N2 cy=00236680 (cycle-EXACT). Throwaway =1 synth confirmed `fr_d_sum_q` leaves the top-30.
-   **Remaining for the flip:** the FULL gate at `VFP_EX_PIPE=1` — fast (rv64uf/ud + any vector-FP arch),
-   ACT4 (F/D), the RVV Linux boot, AND a **vector-FP throughput measurement** (each FP element pays +1–2
-   cycles; confirm the CP win beats it, else this is the accepted floor per §3 / §6.2-D).
+   litmus N2 cy=00236680 (cycle-EXACT).
+
+   ⚠️ **=1 flip gate result (2026-07-17) — functionally correct, but NOT worth flipping alone.** At
+   `VFP_EX_PIPE=1`: fast **252/0** including `test_arch_vfarith` (the V3a vector FP arith test —
+   vfadd/vfmul single+double, which drives the u_vfpu fround/FMA) PASS, litmus N2 cy=00236680 (integer,
+   unchanged). So the +1–2-cycle FP hold via `o_fpu_busy` is functionally sound (the busy-gate auto-wait
+   works). **BUT the real CP barely moves.** Throwaway (`VFP_EX_PIPE=1` + `ic_route = ic_owns` to strip
+   the false headline): real CP = **12.490 ns** (`head → vrf`), vs. the =0 baseline real CP of 12.510
+   (`fr_d_sum_q`). **The FP cut moves the real CP only 0.020 ns (0.16 %)** — because the integer-vx path
+   (`head → prf → bbcast → valu_res → vrf`, 12.490) is a **co-floor** sitting 0.02 ns behind the FP path.
+   Removing the FP path just exposes it. **Decision: do NOT flip `VFP_EX_PIPE=1` alone** — a 0.02 ns gain
+   (masked anyway by the 12.965 false headline) cannot justify ANY vector-FP throughput cost. The DEAD
+   scaffold stays committed as a *component* of a future coordinated cut.
 2. **Integer vx cut** (2.2a) — register `bbcast` in the VALU fetch phase under a const; byte-identical
-   at 0. Measure. (Not yet started.)
-3. Both green + throughput acceptable → flip. If throughput loss > CP gain on vector workloads, this is
-   where the ~12 ns scalar floor is *accepted* (the FP/vector datapath is the memory-analog wall for the
-   vector unit) and the target is revised (`cp_store_queue_plan.md` §6.2 option D).
+   at 0. Measure. (Not yet started.) **This is now the GATING lever:** the FP cut only pays off when
+   PAIRED with this one, so BOTH co-floors (12.510 FP + 12.490 vx) drop together below the next real
+   floor. A coordinated FP+vx flip with a single throughput budget.
+3. Both green + throughput acceptable → flip TOGETHER. Given the FP-cut-alone result (0.02 ns), the
+   realistic outcome is increasingly **§6.2 option D**: the real CP floor is the vector datapath at
+   ~12.49–12.51 ns (two co-floors), the near-term ~12 ns target is met on the *real* floor, and pushing
+   below it needs the coordinated FP+vx multi-cut whose combined vector-throughput cost must be justified
+   against a ≤~0.5 ns CP gain — a poor trade unless a vector-FP-heavy workload dominates.
 
 **Note on the reported headline.** Until the `pc_q → n_inflight` false stitch is structurally broken
 (register `ic_route` / the dmem grant — `cp_store_queue_plan.md` §6.2 option B), `synth` will keep
