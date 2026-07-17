@@ -160,3 +160,49 @@ SB **allocation** from retire for IPC — dropping the `sb_full && !sb_merge_ok`
 **▶️ This turn:** build `SB_PA_REG` DEAD, verify byte-identical (fast gate), then the throwaway `=1`
 synth to answer §2.2 (does R1a move the CP?). That measurement decides whether R1 continues to R1b/
 R2 or whether the wall needs the deeper (R3) work.
+
+---
+
+## 5. ✅ FLIP verification (2026-07-17) — GREEN on fast/ACT4/litmus-N4/SMP-N2/synth; one SMP-boot wedge FOUND + FIXED (c_store_mmio exec/retire split)
+
+Ran the full-SMP-ladder gate on the `SB_PA_REG=1` flip (commits `f239d2f` scaffold + `e9a052b`
+fix). Result: the CP win is real and the flip is SMP-safe, after fixing one latent wedge.
+
+| gate | result |
+|---|---|
+| fast (`veryl test`, 252 + litmus N2) | ✅ **252/0**, litmus N2 cy=00236680 (cycle-EXACT vs =0 → functionally equivalent) |
+| ACT4 696 (paging/PMP/cbo/atomic) | ✅ **696/0** (pre-fix; cbo_wr_01 = the §11 precedent, PASS via the dedicated bare checker) |
+| litmus N4 (RVWMO) | ✅ **pass=1, NO forbidden** (pre-fix) — R1 SMP-ordering proof: the commit live-TLB off the retire gate does NOT break RVWMO at 4-hart |
+| synth CP | ✅ **12.965 ns (−6 %)** — with the fix, UNCHANGED (the fix is CP-neutral) |
+| **SMP boot N2** | ✅ **PASS with the fix** (probe matches =0 baseline cycle-for-cycle); **WEDGED without it** |
+| SMP boot N4 / Verilator N1·N2 | ⏳ remaining flip gates (+ ACT4 / litmus-N4 re-verify with the fix) |
+
+### 5.1 The wedge + fix — c_store_mmio is BOTH a retire gate AND a dcache-write input
+
+Pre-fix, the `SB_PA_REG=1` flip WEDGED the 2-hart SMP boot: hart1 stuck in firmware (PC ~0x510,
+`trap1=0`, never woken) — the **S20R MMIO-doorbell** signature (`:3872`). The =0 baseline boots clean
+(hart1 in the kernel, `trap1>0`), so the wedge is a real =1 bug. Root cause: `c_store_mmio`
+(`:6511`) is computed from the now-registered `c_store_eff_pa`, so at =1 it is **STALE during a slow
+store's translate cycle**. It feeds not only the term-3890 retire gate (where registered is correct
+*at the retire cycle* + off the live TLB = the CP win) but ALSO the **dcache write enables
+`dc_i_wen`/`dc_wen_excl`** (`:7114`/`:7125`), which are sampled at the **translate cycle N** (latched
+into `m_wen_q` for the N+1 write). A stale-DRAM MMIO classification there routes a VM MMIO store to
+the wrong drain-order path → it leaks past older buffered stores → the CLINT doorbell passes its
+mailbox → the woken hart parks. **Lesson: `c_store_mmio` has an exec role (dcache-write, needs the
+LIVE translate-cycle PA) and a retire role (term 3890, wants the registered PA for CP) — the two must
+be split, they are not the same PA.**
+
+**Fix (`e9a052b`):** `c_store_mmio_x` classifies from the LIVE translate-cycle PA (`c_store_pa_x =
+dmem_vm_on_op ? dmu_dmem_addr : c_store_addr`) and feeds `dc_i_wen`/`dc_wen_excl`; term 3890 keeps the
+registered `c_store_mmio` (CP). The exec classifier reaches `rob_commit_ack` only through the
+multi-cycle dcache state/stall (not combinationally), so it is **CP-neutral** (synth stays 12.965 ns,
+verified). At =0 `c_store_mmio_x ≡ c_store_mmio` → byte-identical.
+
+### 5.2 Remaining before the `SB_PA_REG=1` flip commit
+
+The scaffold (`f239d2f` + `e9a052b`) is DEAD byte-identical and now correctly flippable. To ship the
+−6 % flip: (a) **re-verify ACT4 696 + litmus N4 WITH the fix** (the green runs above were pre-fix —
+the fix restored `dc_i_wen`/`dc_wen_excl` to =0-live behaviour, so they should still pass, but the RTL
+changed); (b) **SMP boot N4** + (c) **Verilator N1/N2** (NBA — retire-gate changes surface only on
+multi-hart NBA). Then flip `SB_PA_REG=1` (with `DECODE_REG` note: this flip is independent of the
+banked bundle). Alternative if a later gate fails: bank at 13.800 (the DEAD scaffold stays committed).
