@@ -5865,12 +5865,35 @@ pub module heliodor_core #(
     // SB-push and M-stage-write the same store). Aligned cacheable held stores have
     // dc_i_wen=0 (sb_vm_live_ok=1) → dc_st_wstrb_hi=0 → m_wstrbhi_q=0.
     let sb_2cyc_ok: logic = STORE_PRETRANSLATE && store_fetched_q && m_pa_cacheable && !m_fault_q && (m_wstrbhi_q == 8'd0);
+    // R1 (store-queue / decoupled-retire, first CP-moving piece — the §8 "const/physical
+    // separation" the runtime-mux atomic-PA decouple could not deliver). SB_PA_REG=1
+    // DELETES the last live-TLB consumer on the retire gate: c_store_eff_pa (= sb_pa)'s
+    // `dmem_vm_on_op ? dmu_dmem_addr` arm. After RETIRE_DECOUPLE (fault/PMP off ac_pa_q)
+    // and STORE_PRETRANSLATE (plain-store PA registered), the residual 13.8 ns wall is the
+    // ATOMIC re-driving the live TLB into sb_pa → sb_merge_ok → rob_commit_ack (a FALSE
+    // PATH: sb_elig requires !c_is_amo so the atomic never merges — but STA cannot prune a
+    // logically-reachable shared live arm; cp_retire_decouple_plan §8). A RUNTIME
+    // `if c_is_amo ? ac_pa_q : dmu_dmem_addr` mux was REFUTED (§8: the live arm survives,
+    // +level). This is different: the live arm is DELETED (const-gate), replaced by two
+    // FLOPS. Every store that reaches the live arm (!c_pretx_fast && !sb_2cyc_ok &&
+    // dmem_vm_on_op) is either (a) a VM atomic → ac_pa_q (its read-time PA, held issue→
+    // commit); (b) a slow store at its M3a TRANSLATE cycle → HELD by rob_commit_ack (term
+    // 3889/dmem_mmu_busy), so sb_pa is don't-care (sb_elig=0 ⇒ no push); or (c) a VM
+    // MMIO/slow store at its RETIRE cycle → m_pa_q (the M-stage translate PA, valid because
+    // it rode store_fetched_q). So sb_pa's only FUNCTIONAL consumers on the live arm —
+    // c_store_mmio (term 3890) for MMIO, masked/held otherwise — read the CORRECT registered
+    // PA; sb_merge_ok is masked for every live-arm store (all !sb_elig). Registered-arm
+    // stores (c_pretx_fast/sb_2cyc_ok) are untouched. At SB_PA_REG=0 const-folds to
+    // dmu_dmem_addr = byte-identical. The =1 flip is the full-SMP-ladder-gated step (retire
+    // = memory-ordering heart). See doc/cp_store_queue_plan.md.
+    const SB_PA_REG: bit = 0;
     // The effective committing-store PA: the registered probe PA for a pre-translated
     // store, the registered M-stage PA for a 2-cycle held cacheable store, else the live
     // mux (VM → dmu_dmem_addr, bare → c_store_addr). At STORE_PRETRANSLATE=0 (c_pretx_fast
     // ≡ sb_2cyc_ok ≡ 0) this is exactly the old `dmem_vm_on_op ? dmu_dmem_addr :
     // c_store_addr` mux.
-    let c_store_eff_pa: logic<64> = if c_pretx_fast ? c_store_pa : if sb_2cyc_ok ? m_pa_q : if dmem_vm_on_op ? dmu_dmem_addr : c_store_addr;
+    let c_store_eff_pa: logic<64> = if c_pretx_fast ? c_store_pa : if sb_2cyc_ok ? m_pa_q
+        : if dmem_vm_on_op ? (if SB_PA_REG ? (if c_is_amo ? ac_pa_q : m_pa_q) : dmu_dmem_addr) : c_store_addr;
 
     // PMP (Smpmp): commit-time WRITE check for the dcache exclusive-write path
     // (AMO/SC). Bare uses the physical c_store_addr; a VM access uses the
@@ -5946,6 +5969,34 @@ pub module heliodor_core #(
         i_pmpaddr: csr_pmpaddr  ,
         o_fault  : cbo_m_pmp_deny_w,
     );
+    // R1 (SB_PA_REG): the shared u_pmp_cbo_m_r/w above sit on cbo_m_addr, a runtime mux
+    // (dmem_vm_on_op ? dmu_dmem_addr(LIVE TLB) : c_store_addr) — needed LIVE for the VM
+    // M-stage capture into m_cbom_pmp_*_q. But cbo_m_acc_fault's BARE arm reads that same
+    // shared deny, so STA cannot prune the live-TLB VM arm from the bare path → the cbo.m
+    // PMP is a shared-live-TLB FALSE PATH on rob_commit_ack (the residual 13.800 wall once
+    // sb_pa is off, measured). These DEDICATED bare checkers sit on c_store_addr ONLY (no
+    // TLB): for a bare cbo.m cbo_m_addr==c_store_addr so they are behaviourally identical,
+    // but STA-clean. At SB_PA_REG=1 the bare arm reads these; the shared u_pmp_cbo_m then
+    // feeds only the M-stage flop capture (path ends) → the live TLB leaves rob_commit_ack.
+    // Unread at SB_PA_REG=0 → DCE = byte-identical. See doc/cp_store_queue_plan.md.
+    var cbo_m_bare_deny_r: logic;
+    var cbo_m_bare_deny_w: logic;
+    inst u_pmp_cbo_m_bare_r: pmp_check (
+        i_addr   : c_store_addr  ,
+        i_acc    : 2'd0          , // read
+        i_priv   : dmem_mmu_priv ,
+        i_pmpcfg : csr_pmpcfg    ,
+        i_pmpaddr: csr_pmpaddr   ,
+        o_fault  : cbo_m_bare_deny_r,
+    );
+    inst u_pmp_cbo_m_bare_w: pmp_check (
+        i_addr   : c_store_addr  ,
+        i_acc    : 2'd1          , // write
+        i_priv   : dmem_mmu_priv ,
+        i_pmpcfg : csr_pmpcfg    ,
+        i_pmpaddr: csr_pmpaddr   ,
+        o_fault  : cbo_m_bare_deny_w,
+    );
     // R3 L2 (cbo.m): the R-AND-W PMP deny is on cbo_m_addr (= the live TLB PA dmu_dmem_addr
     // for a VM cbo.m) — the §7.1 binding requester (u_pmp_cbo_m_w on the live TLB). Register
     // it at the M3a translate cycle N (m_cbom_pmp_r/w_q) and read at N+1 under store_fetched_q
@@ -5959,7 +6010,7 @@ pub module heliodor_core #(
     // a PMP on a registered address (no live TLB on rob_commit_ack), so it is
     // CP-neutral, and it is the ONLY correct source when store_fetched_q never fires.
     assign cbo_m_acc_fault = rob_commit_valid && c_is_cbo_m && !c_illegal
-        && (if RETIRE_DECOUPLE ? (if dmem_vm_on_op ? (if store_fetched_q ? (m_cbom_pmp_r_q && m_cbom_pmp_w_q) : 1'b0) : (cbo_m_pmp_deny_r && cbo_m_pmp_deny_w)) : (cbo_m_pmp_deny_r && cbo_m_pmp_deny_w));
+        && (if RETIRE_DECOUPLE ? (if dmem_vm_on_op ? (if store_fetched_q ? (m_cbom_pmp_r_q && m_cbom_pmp_w_q) : 1'b0) : (if SB_PA_REG ? (cbo_m_bare_deny_r && cbo_m_bare_deny_w) : (cbo_m_pmp_deny_r && cbo_m_pmp_deny_w))) : (cbo_m_pmp_deny_r && cbo_m_pmp_deny_w));
 
     // Core dmem view (pre-MMU virtual address)
     //
