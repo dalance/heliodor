@@ -66,11 +66,18 @@ scalar retire scaffolding. **Gate the flip on a vector-workload IPC measurement,
 
 ## 4. Staging + method (DEAD scaffold, per campaign methodology)
 
-1. **FP cut first** (2.1) — smaller, uses existing `FROUND_PIPE`/`FMA_PIPE3`. Build the FSM extension
-   DEAD (a `VFP_EX_PIPE` const gating both the param pass-through and the extra FP element phase); at 0
-   byte-identical. Measure CP + vector-FP throughput.
+1. **FP cut first** (2.1) — ✅ **DEAD scaffold built + committed (`ef12620`, `const VFP_EX_PIPE = 0`).**
+   Key simplification discovered during build: **no FSM extension is needed.** `fpu_wrap` asserts
+   `o_fpu_busy` during the FROUND_PIPE/FMA_PIPE3 hold cycles (`o_fpu_busy = … || fround_busy || fma_busy`,
+   `:2756`), exactly like div/sqrt, and the VU `fp_ph` COMPUTE FSM already gates the CAPTURE/write on
+   `!vfpu_busy` (`fp_reg_wr`, `:2368`) — so it waits the extra cycles automatically. The scaffold is just
+   the const + the two param pass-throughs on the `u_vfpu` instantiation. Verified DEAD (=0): fast 252/0,
+   litmus N2 cy=00236680 (cycle-EXACT). Throwaway =1 synth confirmed `fr_d_sum_q` leaves the top-30.
+   **Remaining for the flip:** the FULL gate at `VFP_EX_PIPE=1` — fast (rv64uf/ud + any vector-FP arch),
+   ACT4 (F/D), the RVV Linux boot, AND a **vector-FP throughput measurement** (each FP element pays +1–2
+   cycles; confirm the CP win beats it, else this is the accepted floor per §3 / §6.2-D).
 2. **Integer vx cut** (2.2a) — register `bbcast` in the VALU fetch phase under a const; byte-identical
-   at 0. Measure.
+   at 0. Measure. (Not yet started.)
 3. Both green + throughput acceptable → flip. If throughput loss > CP gain on vector workloads, this is
    where the ~12 ns scalar floor is *accepted* (the FP/vector datapath is the memory-analog wall for the
    vector unit) and the target is revised (`cp_store_queue_plan.md` §6.2 option D).
