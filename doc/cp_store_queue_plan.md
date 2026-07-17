@@ -213,6 +213,65 @@ identical to =0, so the flip is functionally equivalent, not merely byte-identic
 independent of the banked bundle (`DECODE_REG` stays 0). Revert path if a regression later surfaces:
 `SB_PA_REG=0` restores the DEAD byte-identical scaffold.
 
-The new binding front is the **instruction-side MMU** (`pc_q[34] → … → n_inflight[5]`, 137 levels) —
-a DIFFERENT cone from the dmem-commit wall this piece cut. See §3 (R1b allocation-decouple / R2
-universal execute-translate) for the follow-on levers; the next CP front is the imem-MMU path.
+The reported worst path after the flip is `pc_q[34] → … → n_inflight[5]` (137 levels, 12.965 ns) —
+BUT §6 proves this is a **FALSE PATH**. The **real** post-flip CP floor is **~12.51 ns** (the FP /
+vector execution datapaths). See §6.
+
+---
+
+## 6. ⚠️ Post-flip CP characterization (2026-07-17) — the 12.965 headline is a FALSE PATH; the REAL scalar-core CP floor is ~12.51 ns (FP / vector datapaths)
+
+After the flip, `synth --timing-paths 30` shows a **tight cluster** at the top, NOT a single wall:
+
+| # | delay | levels | endpoint | verdict |
+|---|---|---|---|---|
+| #1–5 | 12.675–**12.965** | 132–137 | `pc_q[34] → n_inflight[1..5]` | **FALSE PATH** (proven below) |
+| #6–7 | 12.510 | 143 | `fr_d1_q[10] → fr_d_sum_q[51/52]` | **REAL** — FP double datapath (align/add/normalize/round) |
+| #8–30 | 12.490 | 111 | `head[0] → vrf[*]` | vector RF writeback (real-or-false TBD) |
+
+**The #1–5 `pc_q → n_inflight` family is a FALSE PATH — proven by a throwaway synth.** The full trace
+is: `pc_q` → imem MMU Sv39 translate (~5.4 ns) → icache tag RAM read → **icache MISS** → the shared
+dmem read-port arbiter `ic_route = ic_owns || (is_req && !dc_mem_req)` (`:8029`) → `i_dmem_grant` →
+`u_dcache.load_sel` → dcache `i_wen`/`state` → `c_is_store` → `rob_commit_ack` → `commit_csrw_satp`
+**and** `commit_trap` → free-list `do_push2` → `n_inflight`. It stitches the **store-commit front half**
+(a committing store waiting on the dcache port) with the **CSR-write / trap back half** — but a single
+committing instruction cannot be a store AND a satp-write AND a trap. STA over-approximates by fanning
+through control-signal cones that are not co-sensitizable. Throwaway test: replace `ic_route` with
+`ic_owns` (drop the `is_req` term = cut the icache-miss→port→dcache prefix), re-synth →
+**CP 12.965 → 12.510 ns and the entire `pc_q → n_inflight` family DISAPPEARS from the top-30** (new #1
+= the FP path). Reverted. Corroborating signal: the top-30 has **NO commit-register-rooted
+`n_inflight` path** — only `pc_q`-rooted ones — so the real store-commit→`n_inflight` path is
+sub-12.49; the fetch prefix alone inflates it to 12.9.
+
+### 6.1 Implications — the scalar retire/commit/fetch fronts are EXHAUSTED for *real* CP
+
+1. **fetch-decouple would be net-negative.** Registering the imem MMU / icache only removes this false
+   path; the real CP (12.51, FP/vector) does not move. This is exactly the §21 shape-W net-negative
+   trap — now *confirmed* for the fetch front. Do NOT pursue fetch-decouple for CP.
+2. **The n_inflight endpoint has masqueraded as the headline across many campaign states** (13.800,
+   13.120, 14.130 all reported `→ n_inflight`). Strong inference (not yet re-measured per state): those
+   headlines were also fetch/commit false stitches to the same endpoint, and the real scalar-core CP
+   floor has been ~12.5 for a while — the retire/store-queue scaffolding (R1a here, R3 before) moved
+   the FALSE-path *prefix* (dmem-side 13.800 → imem-side 12.965), not the real CP. R1a's STRUCTURAL win
+   (the live TLB off the retire gate = the memory-ordering heart) is real and independently valuable;
+   its 12.965 *number* was false-path-inflated.
+3. **The real CP floor is the FP / vector execution datapath.** `fr_d1_q → fr_d_sum_q` (143 levels) is
+   genuine deep FP double arithmetic; `head → vrf` (111 levels) is the vector-commit RF writeback (still
+   to be confirmed real vs. false). To move the REAL CP below ~12.5 the lever must pipeline the FPU /
+   vector datapath — a different, harder class of work than scalar retire scaffolding.
+
+### 6.2 The honest fork (revise-the-plan moment, per the optimize-for-structure principle)
+
+- **(A) FP / vector datapath pipelining** — attack the real 12.51 floor. First confirm `head → vrf`
+  real-vs-false (cheap throwaway, same method as §6), then pipeline `fr_d_sum_q` (FP add/FMA) and/or the
+  vector writeback. Hard, but the only lever that moves the *real* CP.
+- **(B) Structurally break the fetch↔commit false stitch** — register the shared-port arbitration
+  (`ic_route` / the dmem grant) so fetch-miss and commit-store are not combinationally coupled. Cleans
+  up the CP metric to show the real 12.51 AND is a genuine decouple; measure the IPC cost of the +1
+  arbitration latency. Does not lower the real CP but removes the misleading headline.
+- **(C) R1b / R2 store-queue continuation** — CP-neutral on the real floor, but real store-queue
+  structure / IPC progress (drop the `sb_full && !sb_merge_ok` retire stall). Consistent with
+  optimize-for-structure even though it will not move the 12.51 synth number.
+- **(D) Accept ~12.5 as the reached scalar floor and revise the §6.1/§8.1 target** — the near-term
+  ~12 ns goal is essentially met on the *real* floor (12.51 ≈ 12); the 7.5 ns aspiration was always
+  contingent on FPU/vector + memory-floor + R3 SMP work (a different program).
