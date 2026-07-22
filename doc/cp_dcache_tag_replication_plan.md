@@ -155,6 +155,26 @@ and flush (`fl_set`) fire during a demand stall, probe/inv are the coherence por
 real-chip **dual-tag** (CPU port + snoop port) via a small arbiter. Per-fold exclusivity proof +
 full gate, area-only (no CP/byte-id change). Not this stage.
 
+## ✅ icache + L2 tag replication (2026-07-22) — same method, all caches now 1R1W
+
+The `dcache_tagbank` submodule is reused (param `INDEX_W`/`TAG_W`) for the other two caches:
+
+- **icache tag `4R1W → 4×1R1W`** (`64×52 1R1W ×16`): demand (`index`) stays in-module; `next_index`
+  (straddle), `nl_index`/`pf_index` (prefetch) get their own instance. Fill write (`filling &&
+  i_mem_grant && last beat`) broadcast via `ftwe_*`. valid stays flop. Byte-identical: `veryl test`
+  252/0, litmus N2 `00236680`, SMP N2 boot `010f4d20` pass.
+
+- **L2 tag `5R1W → 5×1R1W`** (`512×49 1R1W ×20`): the install (`in_index`) read stays in-module
+  (→ 1R1W with the install write); `e_index`/`c_index`/`w_index`/`nxt_index` reads get their own
+  instance. The **install-way decision block** (`itm`/`way_busy`/`evict_way`/`install_way`) was
+  **relocated up front** (after the lv/tag/plru var decls, before the read sites) — a byte-identical
+  move of combinational `let` — so the install-write driver `l2_itwe_*` is defined before the tag
+  read sites (Veryl def-before-use). Byte-identical: 252/0, litmus N2 `00236680`. **Full slow gate
+  ✅ PASSED**: litmus N4 `00537730`, SMP N2 `010f4d20` / N4 `01647200`, Verilator N1/N2 (all x3==0xAA).
+
+**All cache tags (D$ / icache / L2) are now realistic 1R1W SRAM macros.** Same area follow-on
+(dual-tag merge of exclusive readers) applies to all three.
+
 ## Future (not this stage)
 - presence-watch reservation-flop (decision 2) → 7→4 copies.
 - way-packing (`64×208 ×1` vs `64×52 ×4`) is a macro-shape choice, orthogonal to port count.

@@ -16,13 +16,20 @@
 >   exclusive readers (victim/flush during a demand stall + a shared snoop port).
 > - **L2 data `512×512 ×4`: TRUE 1R1W** (byte-write-enable + `L2_PORTS_1R1W` write-collapse) + synchronous
 >   read (`L2_SYNC_READ`). L2 read-port fold (`L2_READ_1R1W`) is a DEAD scaffold (un-flipped).
-> - **Predictor tables** (btb/bht/ibtb) + **icache**: sync-read scaffolds BUILT but DEAD (`*_SYNC_READ=0`,
+> - **L2 tag `512×49`: 5R1W → ALL 1R1W** via REPLICATION (2026-07-22): install (`in_index`) read stays
+>   in-module (→ 1R1W with the install write); `e/c/w/nxt` reads → `dcache_tagbank` instances; the
+>   install-way decision block was relocated up front (byte-id combinational move for Veryl
+>   def-before-use). `--dump-area`: `512×49 1R1W ×20` (5 copies × 4 way).
+> - **icache tag `64×52`: 4R1W → ALL 1R1W** via REPLICATION (2026-07-22): demand (`index`) in-module,
+>   `next/nl/pf` reads → `dcache_tagbank` instances. `--dump-area`: `64×52 1R1W ×16` (4 copies × 4 way).
+> - **Predictor tables** (btb/bht/ibtb) + **icache data**: sync-read scaffolds BUILT but DEAD (`*_SYNC_READ=0`,
 >   `ICACHE_SYNC_READ=0`) — they flip with the Phase-D front-end deepening (a future program).
 >
 > Full knob map (live / dead-scaffold / bisect): **`doc/pipeline_knob_registry.md`**. Campaign status +
 > target revision: `deep_pipeline_status_and_replan.md` §8.2. The caches are on realistic 1RW/1R1W SRAM;
-> the remaining un-flipped folds (L2 read-1R1W, predictor/icache sync) are documented DEAD
-> scaffolds for the front-end/L2 follow-on, not gaps in the shipped design. (D$ tag is now ALL 1R1W
+> the remaining un-flipped folds (L2 read-1R1W, predictor/icache-data sync) are documented DEAD
+> scaffolds for the front-end/L2 follow-on, not gaps in the shipped design. (ALL cache tags — D$ /
+> icache / L2 — are now 1R1W via replication
 > via replication — the last D$ multi-port array is gone.)
 
 Phase-0 deliverable for the deep-pipeline + realistic-SRAM campaign

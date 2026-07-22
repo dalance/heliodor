@@ -221,18 +221,149 @@ pub module l2cache #(
     // Engine clean-ack decode.
     let e_tag  : logic<49> = i_eclr_addr[63:15];
     let e_index: logic<9>  = i_eclr_addr[14:6];
-    let etm_0  : logic     = lv_0[e_index] && (tag_0[e_index] == e_tag);
-    let etm_1  : logic     = lv_1[e_index] && (tag_1[e_index] == e_tag);
-    let etm_2  : logic     = lv_2[e_index] && (tag_2[e_index] == e_tag);
-    let etm_3  : logic     = lv_3[e_index] && (tag_3[e_index] == e_tag);
+    // ── Phase 13 L2 tag REPLICATION (cp_dcache_tag_replication_plan.md): install-way
+    // decision relocated here (AFTER the lv/tag/plru var decls, BEFORE the tag read
+    // sites; byte-identical move of combinational let). It reads the in-module tag_0..3
+    // at in_index (→ 1R1W with the install write); the OTHER tag reads (etm/ctm/w_tm/ntm)
+    // move to dcache_tagbank copies. Install tag write broadcast via l2_itwe_*.
+    let itm_0: logic = lv_0[in_index] && (tag_0[in_index] == in_tag);
+    let itm_1: logic = lv_1[in_index] && (tag_1[in_index] == in_tag);
+    let itm_2: logic = lv_2[in_index] && (tag_2[in_index] == in_tag);
+    let itm_3: logic = lv_3[in_index] && (tag_3[in_index] == in_tag);
+    let i_any_tm: logic    = itm_0 || itm_1 || itm_2 || itm_3;
+    let itm_way : logic<2> = if itm_0 ? 2'd0 : if itm_1 ? 2'd1 : if itm_2 ? 2'd2 : 2'd3;
+
+    // Per-way busy: a valid line matching any active transaction line.
+    var way_busy: logic [4];
+    var bm_0    : logic [N_HARTS];
+    var bm_1    : logic [N_HARTS];
+    var bm_2    : logic [N_HARTS];
+    var bm_3    : logic [N_HARTS];
+    for h in 0..N_HARTS :gen_busy_m {
+        assign bm_0[h] = i_busy_v[h] && (i_busy_line[h] == {tag_0[in_index], in_index});
+        assign bm_1[h] = i_busy_v[h] && (i_busy_line[h] == {tag_1[in_index], in_index});
+        assign bm_2[h] = i_busy_v[h] && (i_busy_line[h] == {tag_2[in_index], in_index});
+        assign bm_3[h] = i_busy_v[h] && (i_busy_line[h] == {tag_3[in_index], in_index});
+    }
+    var bany_0: logic;
+    var bany_1: logic;
+    var bany_2: logic;
+    var bany_3: logic;
+    always_comb {
+        bany_0 = 1'b0;
+        bany_1 = 1'b0;
+        bany_2 = 1'b0;
+        bany_3 = 1'b0;
+        for h in 0..N_HARTS {
+            if bm_0[h] {
+                bany_0 = 1'b1;
+            }
+            if bm_1[h] {
+                bany_1 = 1'b1;
+            }
+            if bm_2[h] {
+                bany_2 = 1'b1;
+            }
+            if bm_3[h] {
+                bany_3 = 1'b1;
+            }
+        }
+    }
+    assign way_busy[0] = lv_0[in_index] && bany_0;
+    assign way_busy[1] = lv_1[in_index] && bany_1;
+    assign way_busy[2] = lv_2[in_index] && bany_2;
+    assign way_busy[3] = lv_3[in_index] && bany_3;
+
+    let i_plru_bits: logic<3> = plru[in_index];
+    let i_has_inv  : logic    = !lv_0[in_index] || !lv_1[in_index] || !lv_2[in_index] || !lv_3[in_index];
+    let i_inv_way  : logic<2> = if !lv_0[in_index] ? 2'd0 : if !lv_1[in_index] ? 2'd1 : if !lv_2[in_index] ? 2'd2 : 2'd3;
+    let i_plru_way : logic<2> = {i_plru_bits[2], if !i_plru_bits[2] ? i_plru_bits[1] : i_plru_bits[0]};
+    let plru_ok: logic = !(if i_plru_way == 2'd0 ?
+        way_busy[0]
+    : if i_plru_way == 2'd1 ?
+        way_busy[1]
+    : if i_plru_way == 2'd2 ?
+        way_busy[2]
+    :
+        way_busy[3]
+    );
+    let any_nonbusy: logic    = !way_busy[0] || !way_busy[1] || !way_busy[2] || !way_busy[3];
+    let nonbusy_way: logic<2> = if !way_busy[0] ? 2'd0 : if !way_busy[1] ? 2'd1 : if !way_busy[2] ? 2'd2 : 2'd3;
+    let evict_way  : logic<2> = if plru_ok ? i_plru_way : nonbusy_way;
+    let install_way: logic<2> = if i_any_tm ? itm_way : if i_has_inv ? i_inv_way : evict_way;
+    // install tag-write driver (broadcast to all tag copies)
+    let l2_itwe_0: logic = i_inst_v && (install_way == 2'd0);
+    let l2_itwe_1: logic = i_inst_v && (install_way == 2'd1);
+    let l2_itwe_2: logic = i_inst_v && (install_way == 2'd2);
+    let l2_itwe_3: logic = i_inst_v && (install_way == 2'd3);
+    var ce_tag_0: logic<49>;
+    var ce_tag_1: logic<49>;
+    var ce_tag_2: logic<49>;
+    var ce_tag_3: logic<49>;
+    inst u_l2tag_e: dcache_tagbank #(
+        INDEX_W: 9 ,
+        TAG_W : 49,
+    ) (
+        clk                 ,
+        rst                 ,
+        i_t_we_0 : l2_itwe_0,
+        i_t_idx_0: in_index ,
+        i_t_val_0: in_tag   ,
+        i_t_we_1 : l2_itwe_1,
+        i_t_idx_1: in_index ,
+        i_t_val_1: in_tag   ,
+        i_t_we_2 : l2_itwe_2,
+        i_t_idx_2: in_index ,
+        i_t_val_2: in_tag   ,
+        i_t_we_3 : l2_itwe_3,
+        i_t_idx_3: in_index ,
+        i_t_val_3: in_tag   ,
+        i_ridx   : e_index  ,
+        o_tag_0  : ce_tag_0 ,
+        o_tag_1  : ce_tag_1 ,
+        o_tag_2  : ce_tag_2 ,
+        o_tag_3  : ce_tag_3 ,
+    );
+    let etm_0  : logic     = lv_0[e_index] && (ce_tag_0 == e_tag);
+    let etm_1  : logic     = lv_1[e_index] && (ce_tag_1 == e_tag);
+    let etm_2  : logic     = lv_2[e_index] && (ce_tag_2 == e_tag);
+    let etm_3  : logic     = lv_3[e_index] && (ce_tag_3 == e_tag);
 
     // -----------------------------------------------------------------
     // Lookup port: per-way line hit + full-line copy.
     // -----------------------------------------------------------------
-    let ctm_0  : logic = lv_0[c_index] && (tag_0[c_index] == c_tag);
-    let ctm_1  : logic = lv_1[c_index] && (tag_1[c_index] == c_tag);
-    let ctm_2  : logic = lv_2[c_index] && (tag_2[c_index] == c_tag);
-    let ctm_3  : logic = lv_3[c_index] && (tag_3[c_index] == c_tag);
+    var cc_tag_0: logic<49>;
+    var cc_tag_1: logic<49>;
+    var cc_tag_2: logic<49>;
+    var cc_tag_3: logic<49>;
+    inst u_l2tag_c: dcache_tagbank #(
+        INDEX_W: 9 ,
+        TAG_W : 49,
+    ) (
+        clk                 ,
+        rst                 ,
+        i_t_we_0 : l2_itwe_0,
+        i_t_idx_0: in_index ,
+        i_t_val_0: in_tag   ,
+        i_t_we_1 : l2_itwe_1,
+        i_t_idx_1: in_index ,
+        i_t_val_1: in_tag   ,
+        i_t_we_2 : l2_itwe_2,
+        i_t_idx_2: in_index ,
+        i_t_val_2: in_tag   ,
+        i_t_we_3 : l2_itwe_3,
+        i_t_idx_3: in_index ,
+        i_t_val_3: in_tag   ,
+        i_ridx   : c_index  ,
+        o_tag_0  : cc_tag_0 ,
+        o_tag_1  : cc_tag_1 ,
+        o_tag_2  : cc_tag_2 ,
+        o_tag_3  : cc_tag_3 ,
+    );
+    let ctm_0  : logic = lv_0[c_index] && (cc_tag_0 == c_tag);
+    let ctm_1  : logic = lv_1[c_index] && (cc_tag_1 == c_tag);
+    let ctm_2  : logic = lv_2[c_index] && (cc_tag_2 == c_tag);
+    let ctm_3  : logic = lv_3[c_index] && (cc_tag_3 == c_tag);
     let any_ctm: logic = ctm_0 || ctm_1 || ctm_2 || ctm_3;
 
     let c_way: logic<2> = if ctm_0 ? 2'd0 : if ctm_1 ? 2'd1 : if ctm_2 ? 2'd2 : 2'd3;
@@ -298,10 +429,38 @@ pub module l2cache #(
     ;
     // Write-side line match (i_waddr) — the write-hit merge target. Hoisted
     // above the DATA read so P3.b's read-port mux can select the write-hit way.
-    let w_tm_0  : logic    = lv_0[w_index] && (tag_0[w_index] == w_tag);
-    let w_tm_1  : logic    = lv_1[w_index] && (tag_1[w_index] == w_tag);
-    let w_tm_2  : logic    = lv_2[w_index] && (tag_2[w_index] == w_tag);
-    let w_tm_3  : logic    = lv_3[w_index] && (tag_3[w_index] == w_tag);
+    var cw_tag_0: logic<49>;
+    var cw_tag_1: logic<49>;
+    var cw_tag_2: logic<49>;
+    var cw_tag_3: logic<49>;
+    inst u_l2tag_w: dcache_tagbank #(
+        INDEX_W: 9 ,
+        TAG_W : 49,
+    ) (
+        clk                 ,
+        rst                 ,
+        i_t_we_0 : l2_itwe_0,
+        i_t_idx_0: in_index ,
+        i_t_val_0: in_tag   ,
+        i_t_we_1 : l2_itwe_1,
+        i_t_idx_1: in_index ,
+        i_t_val_1: in_tag   ,
+        i_t_we_2 : l2_itwe_2,
+        i_t_idx_2: in_index ,
+        i_t_val_2: in_tag   ,
+        i_t_we_3 : l2_itwe_3,
+        i_t_idx_3: in_index ,
+        i_t_val_3: in_tag   ,
+        i_ridx   : w_index  ,
+        o_tag_0  : cw_tag_0 ,
+        o_tag_1  : cw_tag_1 ,
+        o_tag_2  : cw_tag_2 ,
+        o_tag_3  : cw_tag_3 ,
+    );
+    let w_tm_0  : logic    = lv_0[w_index] && (cw_tag_0 == w_tag);
+    let w_tm_1  : logic    = lv_1[w_index] && (cw_tag_1 == w_tag);
+    let w_tm_2  : logic    = lv_2[w_index] && (cw_tag_2 == w_tag);
+    let w_tm_3  : logic    = lv_3[w_index] && (cw_tag_3 == w_tag);
     let w_any_tm: logic    = w_tm_0 || w_tm_1 || w_tm_2 || w_tm_3;
     let w_tm_way: logic<2> = if w_tm_0 ? 2'd0 : if w_tm_1 ? 2'd1 : if w_tm_2 ? 2'd2 : 2'd3;
 
@@ -422,10 +581,38 @@ pub module l2cache #(
     let nxt_addr : logic<64> = i_waddr + 64'd8;
     let nxt_tag  : logic<49> = nxt_addr[63:15];
     let nxt_index: logic<9>  = nxt_addr[14:6];
-    let ntm_0    : logic     = lv_0[nxt_index] && (tag_0[nxt_index] == nxt_tag);
-    let ntm_1    : logic     = lv_1[nxt_index] && (tag_1[nxt_index] == nxt_tag);
-    let ntm_2    : logic     = lv_2[nxt_index] && (tag_2[nxt_index] == nxt_tag);
-    let ntm_3    : logic     = lv_3[nxt_index] && (tag_3[nxt_index] == nxt_tag);
+    var cnx_tag_0: logic<49>;
+    var cnx_tag_1: logic<49>;
+    var cnx_tag_2: logic<49>;
+    var cnx_tag_3: logic<49>;
+    inst u_l2tag_nxt: dcache_tagbank #(
+        INDEX_W: 9 ,
+        TAG_W : 49,
+    ) (
+        clk                 ,
+        rst                 ,
+        i_t_we_0 : l2_itwe_0,
+        i_t_idx_0: in_index ,
+        i_t_val_0: in_tag   ,
+        i_t_we_1 : l2_itwe_1,
+        i_t_idx_1: in_index ,
+        i_t_val_1: in_tag   ,
+        i_t_we_2 : l2_itwe_2,
+        i_t_idx_2: in_index ,
+        i_t_val_2: in_tag   ,
+        i_t_we_3 : l2_itwe_3,
+        i_t_idx_3: in_index ,
+        i_t_val_3: in_tag   ,
+        i_ridx   : nxt_index,
+        o_tag_0  : cnx_tag_0,
+        o_tag_1  : cnx_tag_1,
+        o_tag_2  : cnx_tag_2,
+        o_tag_3  : cnx_tag_3,
+    );
+    let ntm_0    : logic     = lv_0[nxt_index] && (cnx_tag_0 == nxt_tag);
+    let ntm_1    : logic     = lv_1[nxt_index] && (cnx_tag_1 == nxt_tag);
+    let ntm_2    : logic     = lv_2[nxt_index] && (cnx_tag_2 == nxt_tag);
+    let ntm_3    : logic     = lv_3[nxt_index] && (cnx_tag_3 == nxt_tag);
 
     // P9.2: sharer masks of the write line (and the +8 line) for mem_ctrl's
     // precise invalidate emission. 0 on a miss (no L1 holds it — inclusion).
@@ -485,71 +672,9 @@ pub module l2cache #(
     // would break inclusion for the L1 fill in flight. All four ways busy
     // ⇒ o_iv_blocked, mem_ctrl holds the install and retries.
     // -----------------------------------------------------------------
-    let itm_0: logic = lv_0[in_index] && (tag_0[in_index] == in_tag);
-    let itm_1: logic = lv_1[in_index] && (tag_1[in_index] == in_tag);
-    let itm_2: logic = lv_2[in_index] && (tag_2[in_index] == in_tag);
-    let itm_3: logic = lv_3[in_index] && (tag_3[in_index] == in_tag);
-    let i_any_tm: logic    = itm_0 || itm_1 || itm_2 || itm_3;
-    let itm_way : logic<2> = if itm_0 ? 2'd0 : if itm_1 ? 2'd1 : if itm_2 ? 2'd2 : 2'd3;
-
-    // Per-way busy: a valid line matching any active transaction line.
-    var way_busy: logic [4];
-    var bm_0    : logic [N_HARTS];
-    var bm_1    : logic [N_HARTS];
-    var bm_2    : logic [N_HARTS];
-    var bm_3    : logic [N_HARTS];
-    for h in 0..N_HARTS :gen_busy_m {
-        assign bm_0[h] = i_busy_v[h] && (i_busy_line[h] == {tag_0[in_index], in_index});
-        assign bm_1[h] = i_busy_v[h] && (i_busy_line[h] == {tag_1[in_index], in_index});
-        assign bm_2[h] = i_busy_v[h] && (i_busy_line[h] == {tag_2[in_index], in_index});
-        assign bm_3[h] = i_busy_v[h] && (i_busy_line[h] == {tag_3[in_index], in_index});
-    }
-    var bany_0: logic;
-    var bany_1: logic;
-    var bany_2: logic;
-    var bany_3: logic;
-    always_comb {
-        bany_0 = 1'b0;
-        bany_1 = 1'b0;
-        bany_2 = 1'b0;
-        bany_3 = 1'b0;
-        for h in 0..N_HARTS {
-            if bm_0[h] {
-                bany_0 = 1'b1;
-            }
-            if bm_1[h] {
-                bany_1 = 1'b1;
-            }
-            if bm_2[h] {
-                bany_2 = 1'b1;
-            }
-            if bm_3[h] {
-                bany_3 = 1'b1;
-            }
-        }
-    }
-    assign way_busy[0] = lv_0[in_index] && bany_0;
-    assign way_busy[1] = lv_1[in_index] && bany_1;
-    assign way_busy[2] = lv_2[in_index] && bany_2;
-    assign way_busy[3] = lv_3[in_index] && bany_3;
-
-    let i_plru_bits: logic<3> = plru[in_index];
-    let i_has_inv  : logic    = !lv_0[in_index] || !lv_1[in_index] || !lv_2[in_index] || !lv_3[in_index];
-    let i_inv_way  : logic<2> = if !lv_0[in_index] ? 2'd0 : if !lv_1[in_index] ? 2'd1 : if !lv_2[in_index] ? 2'd2 : 2'd3;
-    let i_plru_way : logic<2> = {i_plru_bits[2], if !i_plru_bits[2] ? i_plru_bits[1] : i_plru_bits[0]};
-    let plru_ok: logic = !(if i_plru_way == 2'd0 ?
-        way_busy[0]
-    : if i_plru_way == 2'd1 ?
-        way_busy[1]
-    : if i_plru_way == 2'd2 ?
-        way_busy[2]
-    :
-        way_busy[3]
-    );
-    let any_nonbusy: logic    = !way_busy[0] || !way_busy[1] || !way_busy[2] || !way_busy[3];
-    let nonbusy_way: logic<2> = if !way_busy[0] ? 2'd0 : if !way_busy[1] ? 2'd1 : if !way_busy[2] ? 2'd2 : 2'd3;
-    let evict_way  : logic<2> = if plru_ok ? i_plru_way : nonbusy_way;
-    let install_way: logic<2> = if i_any_tm ? itm_way : if i_has_inv ? i_inv_way : evict_way;
+    // (install-way decision block relocated up front, just after in_index, so the tag
+    //  install-write driver l2_itwe_* is defined before the other tag read sites — see
+    //  the "L2 tag REPLICATION" block there. Byte-identical relocation of combinational let.)
 
     // Victim preview: an install would EVICT a valid, different-tag line.
     assign o_iv_blocked = !i_any_tm && !i_has_inv && !any_nonbusy;
