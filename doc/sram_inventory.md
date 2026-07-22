@@ -43,6 +43,30 @@
 > scaffolds for the front-end/L2 follow-on, not gaps in the shipped design. (ALL cache tags — D$ /
 > icache / L2 — are now 1R1W via replication
 > via replication — the last D$ multi-port array is gone.)
+>
+> ### 🔎 Remaining realistic (post icache-data 1R1W, 2026-07-22) — for the next session
+> **Port-count: DONE.** Every migratable RAM in `heliodor_core` is 1R1W; only keep-flop `mmu.v1_ppn`
+> (32×44 1R3W) + `iq_int.ops` (8×309 2R2W) are non-1R1W (both below SRAM-compiler minimum / on a
+> critical path → flop-territory, not targets). The genuinely-remaining realistic items:
+> 1. **Synchronous-read for the BIG data arrays.** A compiled SRAM is *clocked* — it samples the
+>    address at the edge (sense-amps clock-strobed), so a **combinational read whose address changes
+>    mid-cycle** can't map to it (→ register file / latch array). A read with a **registered** address
+>    IS a flow-through SRAM (the flow-through-vs-registered-output choice is then just access-time). D$
+>    data + L2 data already have registered-address reads (`DCACHE_SYNC_READ=1` / `L2_SYNC_READ=1`).
+>    **icache data (128 Kbit, the new `128×256 1R1W`) still reads at a combinational index** (`pc_q`→MMU
+>    →index, consumed same cycle) → clocked-SRAM realism wants it registered = a fetch stage
+>    (`ICACHE_SYNC_READ=0` DEAD scaffold), coupled to the fetch-decouple / deep-pipeline program
+>    (net-negative alone). This is THE remaining big-array realism gap.
+> 2. **Small arrays (tags 64×52, predictors) are fine as register files** (async-read RF is a realistic
+>    impl below the SRAM-compiler efficiency floor) — their sync-read is a CP/structure axis, NOT a
+>    realism gap. Do not chase it for realism's sake.
+> 3. **SoC-level sweep not done.** L2 data/tag are migrated, but `mem_ctrl` (fill buffers) + `memory_bus`
+>    are instantiated in `heliodor_soc{,_smp}` — OUTSIDE the `heliodor_core` 28-block synth. A
+>    **SoC-level `veryl synth --dump-area`** (top = the SoC) would reveal any remaining non-1R1W SoC RAM.
+>    This is the most concrete un-inventoried realistic item and a good next standalone move.
+> 4. **Area follow-on (efficiency, not port realism):** tag replication is copy-heavy (D$ tag = 52
+>    macros); a real-chip **dual-tag** (CPU port + snoop port via a small arbiter, merging the exclusive
+>    victim/flush/probe readers) cuts area. Per-fold exclusivity proof + full gate, area-only.
 
 Phase-0 deliverable for the deep-pipeline + realistic-SRAM campaign
 (`doc/deep_pipeline_sram_plan.md`). Each of the 28 RAM blocks `veryl synth
