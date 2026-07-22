@@ -56,14 +56,31 @@
 >    **icache data (128 Kbit, the new `128×256 1R1W`) still reads at a combinational index** (`pc_q`→MMU
 >    →index, consumed same cycle) → clocked-SRAM realism wants it registered = a fetch stage
 >    (`ICACHE_SYNC_READ=0` DEAD scaffold), coupled to the fetch-decouple / deep-pipeline program
->    (net-negative alone). This is THE remaining big-array realism gap.
+>    (net-negative alone). This is THE remaining big-array realism gap. **UPDATE 2026-07-22: the
+>    sync-read (registered = real clocked SRAM) structure is BUILT + VERIFIED-READY on this
+>    `128×256 1R1W` tree** — flipping `ICACHE_SYNC_READ=1` (the shape-W word-granular decoupled fetch)
+>    fast-gates **252/0** (arch + litmus N2) + **N2 SMP boot PASS** on the current repacked data array
+>    (`cp_icache_fetch_decouple_plan.md §23`: the repack + sync-read compose — the dword-aligned F0
+>    stream's next word is always in-block). So the realistic *structure* (128×256 1R1W read
+>    synchronously) is proven; it stays **banked at `=0`** because `FETCH_REG=1` masks the front-end
+>    cone → default-on adds 0 CP + pays the shape-W IPC cost (net-negative solo). Making the flip a real
+>    win = **(b) fetch-directed prefetch** (`§22` next front), the big front-end redesign.
 > 2. **Small arrays (tags 64×52, predictors) are fine as register files** (async-read RF is a realistic
 >    impl below the SRAM-compiler efficiency floor) — their sync-read is a CP/structure axis, NOT a
 >    realism gap. Do not chase it for realism's sake.
-> 3. **SoC-level sweep not done.** L2 data/tag are migrated, but `mem_ctrl` (fill buffers) + `memory_bus`
->    are instantiated in `heliodor_soc{,_smp}` — OUTSIDE the `heliodor_core` 28-block synth. A
->    **SoC-level `veryl synth --dump-area`** (top = the SoC) would reveal any remaining non-1R1W SoC RAM.
->    This is the most concrete un-inventoried realistic item and a good next standalone move.
+> 3. **✅ SoC-level sweep DONE (2026-07-22) — no remaining non-1R1W SoC RAM.** `veryl synth
+>    --top heliodor_soc --dump-area` (N=1) infers **111 RAM blocks in exactly 10 shapes**: the
+>    core inventory PLUS the shared L2 (`512×512 1R1W ×4` data + `512×49 1R1W ×20` tag — already
+>    migrated). Every migratable block is 1R1W; the ONLY non-1R1W blocks are the two documented
+>    keep-flops (`32×44 1R3W ×2` mmu.v1_ppn, `8×309 2R2W ×1` iq_int.ops). **`mem_ctrl` (per-hart
+>    `buf_q : logic<64>[8]` fill buffer) and `memory_bus` (arbiter `cand_*`/`sel_idx_*` selectors)
+>    infer as FLOPS, not RAM** — 8-deep is below the SRAM-compiler floor and the selects are
+>    associative, so they never become a RAM macro (nothing to migrate). Cross-checked on
+>    `--top heliodor_soc_smp` (N=2): **198 blocks, the SAME 10 shapes** — per-core RAMs replicate ×2
+>    (btb ×4 / D$ tag ×136 / D$ data ×8 / icache data ×8 / ibtb ×4 / bht ×8 / mmu ×4 / iq ×2),
+>    the shared L2 stays ×4 / ×20 (single instance), and `mem_ctrl`/`memory_bus` add ZERO new RAM at
+>    N=2 either. **Conclusion: the realistic-SRAM port-count migration is complete at BOTH core and
+>    SoC scope** — the SoC adds only the already-1R1W shared L2, no un-inventoried non-1R1W RAM exists.
 > 4. **Area follow-on (efficiency, not port realism):** tag replication is copy-heavy (D$ tag = 52
 >    macros); a real-chip **dual-tag** (CPU port + snoop port via a small arbiter, merging the exclusive
 >    victim/flush/probe readers) cuts area. Per-fold exclusivity proof + full gate, area-only.
