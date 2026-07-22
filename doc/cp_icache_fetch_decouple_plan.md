@@ -902,3 +902,15 @@ count/head wedges mid-loop. Likely fix: on an `ext_buf_mismatch` re-steer, ensur
 (it does re-seed `pc_fetch_q`, but verify the FTB doesn't immediately re-hit and re-loop), and/or gate
 `f0_ftb_hit` so a tight self-referential loop cannot monopolise the FIFO. Consts reverted to 0 (byte-id
 baseline unaffected).
+
+### 25.2 🔬 Forward-only restriction TESTED — does NOT fix litmus (rules out "backward-loop-specific")
+Hypothesis: the wedge is the backward `j 0x90` back-edge; restricting the FTB to FORWARD unconditional
+targets only (`ftb_train_en &&= pred_target[63:3] >: ic_pc[63:3]`, so the tight backward `j`-loop is never
+FTB-trained) would sidestep it. **Result (B1-alone, `BYPASS=0`): 251/252 — arch + FP ALL pass (incl
+`rv64mi_illegal`), but `litmus_2hart` N2 STILL times out** (`cy=0x01c9c380`, `tohost=0`). So the wedge is
+**NOT backward-loop-specific** — the ping-pong story in §25.1 is likely a SYMPTOM, not the root cause. The
+real B1 `f0_ftb_hit` bug is more fundamental (a forward unconditional target elsewhere in the litmus code,
+or a general FIFO/`ext_pc_q` interaction). Forward-only was reverted (adds complexity, doesn't fix). **The
+fetch-state trace (above) is now mandatory to find the true root cause** — reasoning + hypothesis-restriction
+have been exhausted. Reduce on litmus N2 (hart-0 wedge) with the per-cycle fetch-state dump, not the arch
+suite.
