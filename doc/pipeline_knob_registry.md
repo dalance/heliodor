@@ -35,7 +35,7 @@ whose components are the DEAD scaffolds below.
 | `DCACHE_DATA_READ_1R=1` | dcache:655 | D$ data read-port fold → **TRUE 1R1W** (with CAP_1R) |
 | `DCACHE_NF_REROUTE=1` | dcache:680 | non-folded (AMO/misaligned/replay/xline) → registered read |
 | `DCACHE_CAP_1R=1` | dcache:741 | writeback-capture read folds onto rd1_index → the FINAL 1R1W fold |
-| `DCACHE_TAG_READ_1R=1` | dcache:781 | D$ tag demand-hit from registered tags (a pipeline stage) |
+| `DCACHE_TAG_READ_1R=0` | dcache:781 | **REVERTED 2026-07-22** for tag REPLICATION — D$ tag is now **ALL 1R1W** via the `dcache_tagbank` submodule (12 instances + in-module demand copy), not the registered-demand stage. See `cp_dcache_tag_replication_plan.md` |
 | `L2_SYNC_READ=1` | l2cache:249, mem_ctrl:249 | L2 data synchronous read |
 | `L2_PORTS_1R1W=1` | l2cache:260 | L2 data write-port collapse 2R2W→2R1W |
 

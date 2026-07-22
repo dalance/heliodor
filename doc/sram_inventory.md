@@ -7,8 +7,13 @@
 > `cp_dcache_data_write_collapse`):
 > - **D$ data array `64×512 ×4`: 9R4W → TRUE 1R1W** (`DCACHE_DATA_1RW` byte-write-enable +
 >   `DCACHE_DATA_READ_1R` read-fold + `DCACHE_CAP_1R` writeback-capture fold). Synchronous read = a stage.
-> - **D$ tag array `64×52 ×4`: 15R1W → 13R1W** + demand-hit from registered tags (`DCACHE_TAG_READ_1R`,
->   §15.5-S1). Further port reduction (§15.5-S2, `index` fold → 12R1W) is un-built (a DEAD next step).
+> - **D$ tag array `64×52`: 13R1W → ALL 1R1W** via REPLICATION (2026-07-22, `dcache_tagbank`
+>   submodule, one instance per read index — demand stays in-module 1R1W; 12 instances for
+>   index_r / next / sindex / chk×3 / victim×2 / probe / flush / inv×2, all sharing the broadcast
+>   fill write). `--dump-area`: `64×52 1R1W ×52` (13 copies × 4 way). Byte-identical (252/0,
+>   litmus N2 `00236680` / N4, SMP N2/N4 boot, **Verilator N1/N2**). valid/dirty/excl stay flops
+>   (§Refinement). See `cp_dcache_tag_replication_plan.md`. Area follow-on: dual-tag merge of the
+>   exclusive readers (victim/flush during a demand stall + a shared snoop port).
 > - **L2 data `512×512 ×4`: TRUE 1R1W** (byte-write-enable + `L2_PORTS_1R1W` write-collapse) + synchronous
 >   read (`L2_SYNC_READ`). L2 read-port fold (`L2_READ_1R1W`) is a DEAD scaffold (un-flipped).
 > - **Predictor tables** (btb/bht/ibtb) + **icache**: sync-read scaffolds BUILT but DEAD (`*_SYNC_READ=0`,
@@ -16,8 +21,9 @@
 >
 > Full knob map (live / dead-scaffold / bisect): **`doc/pipeline_knob_registry.md`**. Campaign status +
 > target revision: `deep_pipeline_status_and_replan.md` §8.2. The caches are on realistic 1RW/1R1W SRAM;
-> the remaining un-flipped folds (D$ tag §15.5-S2, L2 read-1R1W, predictor/icache sync) are documented DEAD
-> scaffolds for the front-end/L2 follow-on, not gaps in the shipped design.
+> the remaining un-flipped folds (L2 read-1R1W, predictor/icache sync) are documented DEAD
+> scaffolds for the front-end/L2 follow-on, not gaps in the shipped design. (D$ tag is now ALL 1R1W
+> via replication — the last D$ multi-port array is gone.)
 
 Phase-0 deliverable for the deep-pipeline + realistic-SRAM campaign
 (`doc/deep_pipeline_sram_plan.md`). Each of the 28 RAM blocks `veryl synth
