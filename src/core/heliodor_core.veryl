@@ -364,6 +364,27 @@ pub module heliodor_core #(
     var f0_nc_lo_inflight_q: logic;        // a beat-0 (low-word) read was presented last cycle → capture now
     var f0_nc_lo_q         : logic<32>;    // the captured dword-low word (from beat 0), held for the beat-1 push
     var wf_push_nc_q       : logic;        // this pending push assembles {icache_rdata(high), f0_nc_lo_q(low)}
+
+    // ── (b) B1: fetch-directed prefetch — unconditional-branch FTB (cp_icache_fetch_decouple_plan.md §24) ──
+    // A small fetch-block table indexed by the F0 dword address (pc_fetch_q). It predicts an
+    // UNCONDITIONAL taken branch (JAL / direct always-taken) that lives WHOLLY within the block and
+    // its target, so F0 re-steers straight to the target as it fetches the branch dword — the target
+    // dword is prefetched ahead of extract, so the extract-side taken redirect finds it already
+    // buffered and does NOT flush → the taken-refill BUBBLE1 (§19) is removed for repeated
+    // unconditional branches (calls / gotos / JAL loops). Trained by extract on an unconditional-taken
+    // slot-0 delivery. A HINT only: extract stays authoritative — the flush is suppressed ONLY when the
+    // buffered next dword actually matches extract's predicted target (ext_diverge below), so a stale
+    // / aliased FTB entry costs at most a spurious flush, never correctness. Straddling branches (a
+    // 32-bit op at dword byte-offset 6) are NOT trained: F0's redirect would skip the sequential dword
+    // holding the branch's high half. DEAD at ICACHE_FETCH_DIRECTED=0 (only meaningful with
+    // ICACHE_SYNC_READ=1; every write is `else if ICACHE_FETCH_DIRECTED` → reset-only at 0 → DCE).
+    const ICACHE_FETCH_DIRECTED: bit = 0;
+    const FTB_IDX_W: u32 = 6;                       // 64 fetch-block entries
+    const FTB_N    : u32 = 1 << FTB_IDX_W;
+    const FTB_TAG_W: u32 = 64 - (FTB_IDX_W + 3);    // pc_fetch_q[63 : FTB_IDX_W+3]
+    var ftb_valid : logic           [FTB_N];
+    var ftb_tag   : logic<FTB_TAG_W> [FTB_N];
+    var ftb_target: logic<64>        [FTB_N];
     // W2 extract stage: ext_pc_q is the slot-0 INSTRUCTION PC being decoded this cycle
     // (replaces pc_q's extract role at =1; pc_q keeps only its now-vestigial fetch-FSM role,
     // DCE'd at =1). It indexes the WORD FIFO head (wf_pc[wf_head] == ext_pc_q dword-aligned);
@@ -1340,14 +1361,38 @@ pub module heliodor_core #(
     let ext_next_pc: logic<64> = if fb_push1 ? pred_next_pc1 : pred_next_pc_bp;
     let ext_pop    : logic     = ICACHE_SYNC_READ && fb_push0 && !straddle_q
         && (ext_next_pc[63:3] != ext_pc_q[63:3]);
+    // (b) B1: F0-side FTB lookup on the presented dword. A tag-matched hit predicts an
+    // unconditional taken branch wholly within this dword → F0 re-steers to the stored target
+    // (see the F0 FSM below). Combinational read of the small FTB register file on the flopped
+    // pc_fetch_q (a realistic async-read RF, below the SRAM-compiler floor — sram_inventory §2).
+    let ftb_lk_idx   : logic<FTB_IDX_W> = pc_fetch_q[FTB_IDX_W + 2:3];
+    let ftb_lk_tag   : logic<FTB_TAG_W> = pc_fetch_q[63:FTB_IDX_W + 3];
+    let f0_ftb_hit   : logic     = ICACHE_FETCH_DIRECTED && ftb_valid[ftb_lk_idx] && (ftb_tag[ftb_lk_idx] == ftb_lk_tag);
+    let f0_ftb_target: logic<64> = ftb_target[ftb_lk_idx];
     // Predicted-taken → F0 redirect: the extract delivered a taken branch (slot-0, or a
     // not-taken slot-0 + a taken slot-1), so the F0 stream — running sequentially past the
     // branch — must re-steer pc_fetch_q to the target (dword-aligned = ext_next_pc's dword)
     // and the WORD FIFO must flush its now-wrong-path words. Costs the taken +1 (the target
     // dword is a cycle late), same as the =0 fetch. Commit/early redirect (any_redirect) has
     // priority (older + authoritative). DEAD at 0.
-    let ext_taken_redir: logic = ICACHE_SYNC_READ && !any_redirect
-        && ((fb_push0 && predicted_taken) || (fb_push1 && predicted_taken1));
+    // (b) B1: two redirect reasons, OR'd (both flush + re-steer F0 to ext_next_pc):
+    //  (1) TAKEN branch (as the original shape-W: a taken slot-0, or a not-taken slot-0 + taken slot-1)
+    //      — F0 must fetch the target. SUPPRESSED only when F0 has ALREADY prefetched the exact target
+    //      (its FTB redirect ran ahead → the target dword is buffered at wf_head+1 == ext_next_pc): then
+    //      extract continues into it via the normal pop, no flush = the B1 BUBBLE1 win. If F0 did NOT
+    //      prefetch it (no/other FTB entry, or not yet buffered) the flush fires exactly as before —
+    //      REQUIRED, else the pop empties the FIFO and extract reads F0's wrong-path words as the target.
+    //  (2) F0-FTB DIVERGENCE on a non-taken delivery: F0 FTB-redirected off this dword but extract did
+    //      NOT take (stale FTB vs evicted BTB) → the buffered next dword (wf_head+1) is F0's wrong-path
+    //      target, ≠ extract's fall-through; re-steer to the fall-through. Proven-divergence only
+    //      (buffered AND different) so a normal catch-up cross (next dword not yet buffered) just stalls.
+    // Commit/early redirect (any_redirect) has priority. DEAD at 0 (carries ICACHE_SYNC_READ).
+    let wf_head_p1          : logic<3> = wf_head + 3'd1;
+    let f0_prefetched_target: logic    = (wf_count >= 4'd2) && (wf_pc[wf_head_p1][63:3] == ext_next_pc[63:3]);
+    let ext_deliver_taken   : logic    = (fb_push0 && predicted_taken) || (fb_push1 && predicted_taken1);
+    let ext_buf_mismatch    : logic    = ext_pop && (wf_count >= 4'd2) && (wf_pc[wf_head_p1][63:3] != ext_next_pc[63:3]);
+    let ext_taken_redir     : logic    = ICACHE_SYNC_READ && !any_redirect
+        && ((ext_deliver_taken && !f0_prefetched_target) || ext_buf_mismatch);
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -1379,7 +1424,11 @@ pub module heliodor_core #(
                 f0_nc_beat_q = 1'b0;
             } else if f0_present {
                 if f0_beat_done {
-                    pc_fetch_q   = pc_fetch_q + 64'd8;
+                    // (b) B1: an FTB hit on the just-completed dword re-steers F0 to the predicted
+                    // unconditional target (dword-aligned) instead of the sequential +8, so the
+                    // target is prefetched ahead of extract (removing the taken-refill bubble). DEAD
+                    // at ICACHE_FETCH_DIRECTED=0 (f0_ftb_hit is const-false → the mux folds to +8).
+                    pc_fetch_q   = if f0_ftb_hit ? {f0_ftb_target[63:3], 3'b000} : pc_fetch_q + 64'd8;
                     f0_nc_beat_q = 1'b0;
                 } else {
                     f0_nc_beat_q = 1'b1; // non-cacheable low-word beat done → present the high word
@@ -1462,6 +1511,32 @@ pub module heliodor_core #(
                 if fetch_ready {
                     ext_pc_q = ext_next_pc;
                 }
+            }
+        }
+    }
+    // (b) B1: FTB training. On an unconditional-taken slot-0 delivery (JAL / direct always-taken:
+    // btb_hit, not conditional / return / indirect → pred_target == btb_target, no speculative
+    // RAS/BHT/iBTB state to reproduce at F0), record {target} at the branch dword. EXCLUDE a
+    // straddling branch (a 32-bit op at dword byte-offset 6, ic_pc[2:1]==11): F0's redirect off
+    // that dword would skip the sequential dword carrying the branch's high half. Indexed by the
+    // branch's dword — the SAME index F0 reads on pc_fetch_q for the same dword. Only ftb_valid is
+    // reset (it gates the hit); tag/target infer as an SRAM-like RF, masked by valid=0. DEAD/DCE at
+    // ICACHE_FETCH_DIRECTED=0 (reset-only writes). A hint — extract stays authoritative (§24.4).
+    let ftb_train_en: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && fb_push0
+        && btb_hit && !btb_is_cond && !btb_is_ret && !btb_is_ind
+        && (curr_is_rvc || ic_pc[2:1] != 2'b11);
+    let ftb_tr_idx: logic<FTB_IDX_W> = ic_pc[FTB_IDX_W + 2:3];
+    let ftb_tr_tag: logic<FTB_TAG_W> = ic_pc[63:FTB_IDX_W + 3];
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..FTB_N {
+                ftb_valid[i] = 1'b0;
+            }
+        } else if ICACHE_FETCH_DIRECTED {
+            if ftb_train_en {
+                ftb_valid[ftb_tr_idx]  = 1'b1;
+                ftb_tag[ftb_tr_idx]    = ftb_tr_tag;
+                ftb_target[ftb_tr_idx] = pred_target;
             }
         }
     }

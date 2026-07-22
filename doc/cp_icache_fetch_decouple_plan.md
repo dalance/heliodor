@@ -710,3 +710,163 @@ flip". **Next front: recovery (b) fetch-directed prefetch** — F0 consults the 
 predicted-taken branches instead of streaming-then-flushing (the predictor sync-read scaffolds
 `btb`/`bht`/`ibtb` `6c9d0fe`/`826a95f` are the substrate), making shape-W IPC-neutral so the eventual bundle
 flip is a genuine win (removes the taken-branch refill BUBBLE1 that even the bypass leaves).
+
+## 23. ✅ Re-verify on the icache-data-1R1W tree (2026-07-22) — shape-W survives the `128×256 1R1W` repack; still flips clean
+
+The §22 bank was verified on a tree where the icache **data** array was still `1024×32 2R2W`. Since then
+`e04e4cf` repacked it to the realistic **`128×256 1R1W ×4`** 256-bit FETCH-BLOCK macro (the demand read
+serves the demand word + the same-block next word from one 1R port; `o_rdata_next` is now served ONLY when
+`next_in_block = offset[2:0] != 7`, else the core takes the 2-cycle re-fetch — see `cp_icache_data_1r1w_plan.md`).
+Shape-W reads the icache through the SAME `{o_rdata_next, o_rdata}` window, so the two changes could have
+interacted. **They compose cleanly** — re-verified by flipping both consts (`ICACHE_SYNC_READ=1`,
+`ICACHE_FIFO_BYPASS=0` = the §18 body) on the current tree:
+
+| gate (at `=1`, current icache-data-1R1W tree) | result |
+|---|---|
+| fast `veryl test` (arch rv64ui/um/ua/uc/mi/si + fp + litmus N2 + the fixed `test_icache`) | **252 / 0** (litmus N2 `cy=0x002e14e0`, no forbidden) |
+| N2 SMP Linux boot (`test_soc_smp_linux_boot_2hart`) | **PASS** (`1 passed, 0 failed`) |
+
+**Why it composes (the structural reason):** shape-W's F0 stream presents a **dword-aligned** `pc_fetch_q`
+(`+= 8`), so the demand word's `offset[0]=0` → `offset[2:0] ∈ {0,2,4,6}`, which is ALWAYS `!= 7` →
+`next_in_block` is always true → the 256-bit fetch-block ALWAYS serves the F0 window's next word. The
+repack's in-block restriction only drops the `offset[2:0]==7` next word, which a dword-aligned present never
+asks for. And shape-W's cross-dword straddle/dual-issue reads the NEXT word-FIFO **entry** (a separate pushed
+dword), not `o_rdata_next` — so the in-block restriction is invisible to it. The 2-beat non-cacheable path is
+unchanged (passthrough `i_imem_rdata`, no `o_rdata_next`). Result: **the realistic icache is now proven as a
+`128×256 1R1W` macro read SYNCHRONOUSLY** (registered address = a real clocked SRAM) — the front-end half of
+the deep-pipeline bundle, functionally green on the shipped data-array shape.
+
+**Still banked (consts back to 0), unchanged rationale:** on the `FETCH_REG=1` tree the binding wall is the
+commit-store `head → n_inflight` cone; `FETCH_REG` already masks the whole front end below it, so
+`ICACHE_SYNC_READ=1` adds **0 headline CP** and pays only the shape-W IPC cost (net-negative solo, §21/§22).
+Default-on still waits for **(b) fetch-directed prefetch** to make the flip IPC-neutral. This section adds no
+RTL change (the re-verify flip was reverted); it records that the banked scaffold is bit-rot-free against the
+current icache-data-1R1W substrate.
+
+**🔬 IPC + CP re-measured on the current tree (2026-07-22, `=1` + `ICACHE_FIFO_BYPASS=1` vs `=0`).** `instret`
+is identical at both (pure cycle overhead), so these are clean IPC deltas:
+
+| workload | `=0` | `=1`+bypass | IPC cost |
+|---|---|---|---|
+| Dhrystone (branch-dense) | 231724 | 268409 | **+15.8 %** |
+| CoreMark | 347693 | 384308 | **+10.5 %** |
+| N1 Linux boot 5.15 | `0x00c83200` (13.12 M) | `0x00dca460` (14.46 M) | **+10.2 %** |
+
+**Synth CP (`--top heliodor_core --dump-timing`):** `=0` **13.762 ns** (`pc_q[34] → n_inflight[5]`, 137 lv) →
+`=1`+bypass **12.805 ns** (`pc_fetch_q[34] → n_inflight[5]`, 136 lv). **The −0.96 ns is a FALSE-PATH artifact,
+NOT a real frequency gain:** the binding path chains the ENTIRE front end (`pc_q → imem-MMU iTLB walk → icache
+read/miss → iptw/dmem fill route → dcache state`) into the ENTIRE back end (`→ commit/CSR-satp → trap/redirect
+→ free-list n_inflight`) with no register between — a topological cone that can't be sensitized (the
+icache-miss-memory-request and commit-trap-redirect controlling values are mutually exclusive). §72b30ef already
+established the real CP floor is **~12.5 ns (FP/vector datapath)**, which the icache flip does NOT touch. So the
+flip's real frequency gain is **~0** (§22's masked conclusion holds), and default-on = **pure IPC cost ≈ −10 %
+throughput on real workloads** (−16 % Dhrystone). **User decision (2026-07-22): pursue (b) fetch-directed
+prefetch** to make shape-W IPC-neutral BEFORE any default-on flip (§24).
+
+## 24. Design — (b) fetch-directed prefetch (started 2026-07-22, user-selected)
+
+**Goal:** remove the taken-branch refill **BUBBLE1** (the residual shape-W IPC cost, §19) so the
+`ICACHE_SYNC_READ=1` flip becomes IPC-neutral → a genuine win to ship default-on. Today shape-W's F0
+streams **sequentially** (`pc_fetch_q += 8`) with NO branch awareness; the EXTRACT stage detects a
+predicted-taken branch on `ext_pc_q` and fires `ext_taken_redir` (`core.veryl:1349`) — which FLUSHES the
+word FIFO and re-steers F0 to the target, whose dword is then a cycle late (BUBBLE1). (b) makes **F0
+itself** follow predicted-taken branches so the FIFO fills with the taken-path words ahead of extract — no
+flush, no refill bubble.
+
+### 24.1 The core constraint — consistency (F0 prediction MUST match extract's)
+If F0's prediction and extract's independent prediction on the same PC ever **disagree**, extract's
+`ext_pc_q` stream diverges from F0's fetched stream → extract detects the mismatch and redirects = a
+**spurious flush**, defeating the purpose. So F0 must predict **identically** to extract. The safe way:
+F0 consults the **SAME predictor tables** extract uses (BTB/BHT/TAGE/RAS/iBTB), one+ cycle ahead, via the
+**predictor sync-read scaffolds** (`BTB_SYNC_READ`/`BHT_SYNC_READ`/`IBTB_SYNC_READ`, all `=0` DEAD — the
+`6c9d0fe`/`826a95f` substrate): a registered read makes the F0-ahead lookup timing-feasible.
+
+### 24.2 The three hard parts
+1. **Fetch-block granular vs instruction-granular.** F0 fetches a dword (2 words = up to 4 RVC instr);
+   the BTB is indexed by instruction PC. F0 must locate the FIRST taken branch WITHIN the dword and its
+   target, without decoding. Two options: (i) look up the BTB at all 4 halfword offsets of the dword
+   (4 read ports → more replication, area); (ii) a dedicated **fetch-block table (FTB)** indexed by
+   `pc_fetch_q[.:3]` storing `{valid, first-taken halfword-offset[1:0], target}`, trained from the SAME
+   taken events extract sees (1R1W, small). Recommend **(ii)** — but note FTB↔BTB eviction skew can cause
+   occasional spurious flushes (measure; the FTB is a hint, extract remains authoritative).
+2. **Speculative RAS at F0 (the hardest).** Returns use the speculative RAS stack (`ras_spec_top/valid`),
+   pushed/popped by extract. F0 running AHEAD would need its own speculative RAS mirror advanced at F0
+   push/pop time — a stateful structure that must stay consistent with extract's. Defer to a late stage.
+3. **TAGE / iBTB / spec_ghr at F0.** Conditional direction (TAGE/BHT on `spec_ghr`) and indirect targets
+   (iBTB on `spec_ind_hist`) also need F0-side lookups with consistent speculative history. Defer.
+
+### 24.3 Staged increment plan (each byte-id at 0, gated by a NEW `const ICACHE_FETCH_DIRECTED` — only
+active with `ICACHE_SYNC_READ=1`; DEAD/DCE at 0 like the shape-W consts)
+- **B1 — unconditional-only F0 redirect (minimal, the biggest single win).** F0 redirects ONLY for an
+  **unconditional** BTB-hit branch (`btb_hit && !is_cond && !is_ret && !is_ind` = JAL / direct always-taken)
+  — NO direction/RAS/iBTB dependence, so NO speculative state to reproduce at F0 (the reason to start here).
+  Structure: a small FTB (24.2-ii) trained on extract's unconditional-taken events; F0 reads it on
+  `pc_fetch_q`, and on a hit re-steers `pc_fetch_q` to the stored target (dword-aligned) instead of `+=8`,
+  suppressing the later `ext_taken_redir` flush for that branch (extract confirms the same unconditional
+  target → no divergence). Conditional / return / indirect branches keep flushing-on-extract (today's
+  path). **Measure the IPC recovery** (Dhrystone/CoreMark/boot) vs the §19 bypass baseline; JAL + loop
+  back-edges that are unconditional should recover a large slice.
+- **B2 — conditional direction.** Add an F0-side BHT/TAGE lookup + a consistent `spec_ghr` snapshot so F0
+  follows strongly-taken conditional branches (loop back-edges). The FTB entry flags `is_cond`; F0 gates
+  the redirect on the F0 BHT/TAGE. Hardest consistency: the `spec_ghr` update timing F0 vs extract.
+- **B3 — returns (F0 speculative RAS mirror).** The 24.2-2 hard part.
+- **B4 — indirect (F0 iBTB).**
+- **Bn — measure + flip:** once IPC-neutral (≈ 0 % on real workloads), run the full ladder (default 252/0
+  + litmus N4 + SMP boot N4 + Verilator N1/N2/N4) at `ICACHE_SYNC_READ=1 + ICACHE_FETCH_DIRECTED=1` and
+  take the bundle default-on — the genuine win (real clocked-SRAM icache-data, IPC-neutral).
+
+### 24.4 Verification
+Byte-id at every `ICACHE_SYNC_READ=0` (the FTB + F0 redirect feed only the `=1`/`FETCH_DIRECTED=1` arms →
+DCE). At `=1`: default suite cluster-by-cluster (like shape-N/W), then IPC measurement (the payoff metric),
+then the SMP ladder + Verilator. The predictor is a HINT — extract stays authoritative — so a wrong F0
+redirect is always caught (correctness is never at risk; only IPC, via a spurious flush).
+
+**Next: B1 — the unconditional-only F0 redirect scaffold (byte-id at 0).**
+
+## 25. 🔬 B1 implemented (2026-07-22) — byte-id at 0 verified; `=1` down to ONE corner (`rv64mi_illegal`)
+
+Implemented the B1 unconditional-only fetch-directed prefetch (`const ICACHE_FETCH_DIRECTED`, DEAD at 0):
+- **FTB storage** (`heliodor_core.veryl`): `ftb_valid/tag/target [64]` — a 64-entry tagged fetch-block table
+  (index `pc_fetch_q[8:3]`, tag `pc_fetch_q[63:9]`), a small async-read register file (realistic below the
+  SRAM floor — sram_inventory §2). Only `ftb_valid` is reset; tag/target are RF-style.
+- **Training**: on an unconditional-taken slot-0 delivery (`fb_push0 && btb_hit && !is_cond && !is_ret &&
+  !is_ind`, target `pred_target == btb_target`), EXCLUDING a straddling branch (`!curr_is_rvc &&
+  ic_pc[2:1]==2'b11`, whose high half lives in the sequential-next dword F0 would skip).
+- **F0 read + redirect**: `f0_ftb_hit` on `pc_fetch_q` re-steers the next `pc_fetch_q` to the stored target
+  (dword-aligned) instead of `+= 8`, prefetching the target ahead of extract.
+- **The redirect logic was REWORKED** from the shape-W `predicted_taken`-only flush to TWO OR'd reasons:
+  (1) taken branch, flush UNLESS F0 already prefetched the exact target (`f0_prefetched_target =
+  wf_count>=2 && wf_pc[head+1]==ext_next_pc` → the B1 bubble-suppress win); (2) `ext_buf_mismatch` — F0's
+  buffered next dword ≠ extract's authoritative next PC (catches a stale-FTB / evicted-BTB divergence on a
+  non-taken delivery). This authoritative buffered-PC comparison is what keeps the FTB a pure HINT.
+
+**A design bug found + fixed mid-bring-up:** the first attempt made the redirect a SINGLE general
+`ext_pop && buffered-mismatch`. That MISSED the force-redirect when a taken branch's target was not yet
+buffered (`wf_count<2`): the pop then emptied the FIFO and extract read F0's wrong-path sequential words as
+the target → 8 arch fails. The two-reason form (taken always redirects unless prefetched; mismatch as a
+separate catch) is correct.
+
+**Status:**
+- ✅ **Byte-id at the committed default** (`ICACHE_SYNC_READ=0`, `ICACHE_FETCH_DIRECTED=0`): fast `veryl test`
+  **252/0** (the FTB + the reworked `ext_taken_redir` all carry `ICACHE_SYNC_READ`/`FETCH_DIRECTED` → DCE).
+- 🔬 **`=1` (all three consts) fast gate: 250/252 — TWO corners.** All rv64ui/um/ua/uc/mi/si + FP + Zb arch
+  tests PASS **except**: (1) `test_arch_rv64mi_illegal` (`tohost=0`, hang); (2) `test_litmus_2hart` (forbidden
+  outcome OR timeout). Both point at a residual fetch-correctness bug in the B1 redirect/suppress path (litmus
+  is exquisitely sensitive to precise fetch/execute), NOT a mere mtvec corner. **Candidate causes to chase
+  next:** (a) a stale FTB re-steer on a reseed dword (`mtvec` / a litmus label) that the `ext_buf_mismatch`
+  recovery does not fully close — try gating `f0_ftb_hit` off for the first fetch after `any_redirect`, or
+  invalidating the FTB on `fence.i` / reseed; (b) the `f0_prefetched_target` suppression firing on a
+  COINCIDENTAL `wf_pc[head+1]==ext_next_pc` match where F0 did NOT actually FTB-redirect (a sequential match)
+  — this is safe by the earlier analysis ONLY if the head+1 data is truly the target's; re-audit the
+  straddle / slot-1 / same-dword-target interaction; (c) an ordering bug between the FTB redirect and the
+  non-cacheable 2-beat F0 (`f0_ftb_hit` must not fire mid-2-beat). **Debug method (doc's proven path):** a
+  commit-PC heartbeat trace of `rv64mi_illegal` at `=1`, then reduce with `ICACHE_FETCH_DIRECTED=1` +
+  `ICACHE_FIFO_BYPASS=0` to isolate the FTB from the bypass. **Consts reverted to 0 (byte-id baseline
+  unaffected — B1 is a DEAD scaffold at the committed default).**
+  - **⚠️ FIRST isolation step (may re-attribute litmus N2):** this `=1` run used `ICACHE_FIFO_BYPASS=1`, but
+    the §23 shape-W re-verify that got clean litmus N2 used `ICACHE_FIFO_BYPASS=0` (the §18 body). So the
+    litmus N2 failure is NOT yet attributed — it could be the **§19 bypass on the repacked icache-data tree**
+    (never re-verified with litmus N2 post-repack), not B1. Run `ICACHE_SYNC_READ=1 + ICACHE_FETCH_DIRECTED=0
+    + ICACHE_FIFO_BYPASS=1` first: if litmus N2 still fails, it is the BYPASS (a repacked-tree §19 regression,
+    independent of B1 — chase it separately, or ship B1 with bypass off); if it passes, litmus N2 is a B1 bug.
+    (`rv64mi_illegal` is almost certainly B1 — the §23 shape-W re-verify passed the full arch suite incl it.)
