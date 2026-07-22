@@ -62,7 +62,6 @@ pub module icache #(
     let tag     : logic<TAG_W>     = i_addr[63:INDEX_W + 6];
     let index   : logic<INDEX_W>   = i_addr[INDEX_W + 5:6];
     let offset  : logic<4>         = i_addr[5:2];
-    let data_idx: logic<INDEX_W + 4> = {index, offset};
 
     // Phase 8 S11 staged flips. s11_huf_en = hit-under-fill (S11.1): fetch keeps
     // hitting other lines while a fill is in flight (o_stall only when a demanded
@@ -79,6 +78,57 @@ pub module icache #(
     let s11_pf_en : logic = 1'b0;
     let s11_st_en : logic = 1'b1;
 
+    // ── icache DATA realistic 1R1W (cp_icache_data_1r1w_plan.md) ──
+    // The data array is a 256-bit FETCH-BLOCK 1R1W macro (`128×256 1R1W ×4`): a 64-byte line is
+    // 2 blocks of 256 bit (8 words). ONE 256-bit read per way (block {index, offset[3]}) serves
+    // the demand word + the next word WHEN it is in the SAME block (offset[2:0] != 7) — that
+    // covers slot-1 dual-issue and the S7 same-line single-cycle straddle for 15/16 word offsets
+    // (only offset 7 crosses a same-line block boundary). When the next word crosses the block
+    // boundary (offset[2:0]==7 → offset 7 same-line, offset 15 cross-line) it has no read port:
+    // o_rdata_next_valid is 0 and the core takes the always-correct 2-cycle re-fetch. Fill writes
+    // one 64-bit dword/beat as a masked 64-bit-of-256 slot-write (the retention read folds into
+    // the SRAM write-enable → 1W). The whole-line (512-bit) variant was validated byte-identical
+    // first (see the plan doc); this narrower block is a sim-speed / read-power tuning (loses
+    // same-line next only at offset[2:0]==7 — a much smaller IPC cost than the 128-bit block).
+
+    // 32-bit word `woff` (0..7) of a 256-bit block. A static 8:1 word mux (NOT a dynamic
+    // `block[woff*32 +: 32]` range select — the veryl area-synth backend rejects dynamic range
+    // select on a variable; the mux is what infers the SRAM read + word mux).
+    function rd_word (
+        blk : input logic<256>,
+        woff: input logic<3>  ,
+    ) -> logic<32> {
+        return if woff == 3'd0 ?
+            blk[31:0]
+        : if woff == 3'd1 ?
+            blk[63:32]
+        : if woff == 3'd2 ?
+            blk[95:64]
+        : if woff == 3'd3 ?
+            blk[127:96]
+        : if woff == 3'd4 ?
+            blk[159:128]
+        : if woff == 3'd5 ?
+            blk[191:160]
+        : if woff == 3'd6 ?
+            blk[223:192]
+        :
+            blk[255:224];
+    }
+    // A 256-bit block holding 64-bit dword `dw` at 64-bit slot `s` (0..3), else 0 — the fill
+    // write value / write-mask builder (block granular; mirrors dcache/L2 wr_dword).
+    function wr_slot (
+        s : input logic<2> ,
+        dw: input logic<64>,
+    ) -> logic<256> {
+        return {
+            if s == 2'd3 ? dw : 64'd0,
+            if s == 2'd2 ? dw : 64'd0,
+            if s == 2'd1 ? dw : 64'd0,
+            if s == 2'd0 ? dw : 64'd0,
+        };
+    }
+
     // Cache storage: 4 ways
     var valid_0: logic        [SETS]     ;
     var valid_1: logic        [SETS]     ;
@@ -88,10 +138,10 @@ pub module icache #(
     var tags_1 : logic<TAG_W> [SETS]     ;
     var tags_2 : logic<TAG_W> [SETS]     ;
     var tags_3 : logic<TAG_W> [SETS]     ;
-    var data_0 : logic<32>    [SETS * 16]; // SETS × 16 words
-    var data_1 : logic<32>    [SETS * 16];
-    var data_2 : logic<32>    [SETS * 16];
-    var data_3 : logic<32>    [SETS * 16];
+    var data_0 : logic<256>   [SETS * 2]  ; // 2 blocks/line × 256 bit (8 words) per block
+    var data_1 : logic<256>   [SETS * 2]  ;
+    var data_2 : logic<256>   [SETS * 2]  ;
+    var data_3 : logic<256>   [SETS * 2]  ;
 
     // Pseudo-LRU tree: 3 bits per set
     // bit[2]: root → 0=left(way 0,1), 1=right(way 2,3)
@@ -106,11 +156,18 @@ pub module icache #(
     let hit_3    : logic = valid_3[index] && tags_3[index] == tag;
     let cache_hit: logic = hit_0 || hit_1 || hit_2 || hit_3;
 
-    // Read data from hit way
-    let rdata_0: logic<32> = data_0[data_idx];
-    let rdata_1: logic<32> = data_1[data_idx];
-    let rdata_2: logic<32> = data_2[data_idx];
-    let rdata_3: logic<32> = data_3[data_idx];
+    // Demand block read — the single 1R port: the 256-bit block {index, offset[3]} per way.
+    // The demand word (offset[2:0]) AND the same-BLOCK next word (next_offset[2:0], below when
+    // offset[2:0] != 7) come from this one read; rdata_* is the demand word.
+    let d_blk: logic<INDEX_W + 1> = {index, offset[3]};
+    let dl_0: logic<256> = data_0[d_blk];
+    let dl_1: logic<256> = data_1[d_blk];
+    let dl_2: logic<256> = data_2[d_blk];
+    let dl_3: logic<256> = data_3[d_blk];
+    let rdata_0: logic<32> = rd_word(dl_0, offset[2:0]);
+    let rdata_1: logic<32> = rd_word(dl_1, offset[2:0]);
+    let rdata_2: logic<32> = rd_word(dl_2, offset[2:0]);
+    let rdata_3: logic<32> = rd_word(dl_3, offset[2:0]);
 
     // Fill state. P9.6: fill_count now counts 8 DWORD beats (0..7); each granted
     // beat writes two adjacent 32-bit words. fill_aborted (mirrors the dcache):
@@ -130,8 +187,11 @@ pub module icache #(
     let ftwe_2: logic = fill_tag_we && (fill_way == 2'd2);
     let ftwe_3: logic = fill_tag_we && (fill_way == 2'd3);
     var fill_aborted : logic         ; // FENCE.I hit the in-flight fill
-    let fill_widx_lo : logic<INDEX_W + 4> = {fill_index, fill_count, 1'b0};
-    let fill_widx_hi : logic<INDEX_W + 4> = {fill_index, fill_count, 1'b1};
+    // Fill beat write: dword fill_count → block fill_count[2], slot fill_count[1:0], via a
+    // masked 64-bit-of-256 slot-write (fill_dmsk = the write-enable). 2 words/beat, 1W port.
+    let f_blk     : logic<INDEX_W + 1> = {fill_index, fill_count[2]};
+    let fill_dnew : logic<256> = wr_slot(fill_count[1:0], i_mem_rdata);
+    let fill_dmsk : logic<256> = wr_slot(fill_count[1:0], {1'b1 repeat 64});
     // Phase 8 S11.2: next-line prefetch state. pf_pending/pf_line hold the
     // queued prefetch candidate (a 58-bit line address {tag, index}).
     var pf_pending: logic    ;
@@ -242,11 +302,19 @@ pub module icache #(
     :
         (next_hit_0 || next_hit_1 || next_hit_2 || next_hit_3)
     ;
-    let next_data_idx: logic<INDEX_W + 4> = {next_index, next_offset};
-    let next_rdata_0 : logic<32> = data_0[next_data_idx];
-    let next_rdata_1 : logic<32> = data_1[next_data_idx];
-    let next_rdata_2 : logic<32> = data_2[next_data_idx];
-    let next_rdata_3 : logic<32> = data_3[next_data_idx];
+    // Next word — SAME-BLOCK only: word next_offset[2:0] of the demand block (dl_*, from the
+    // single 1R read — no extra port). Valid only when next_in_block (offset[2:0] != 7): then
+    // next_offset is offset+1 within the same 256-bit block, serving slot-1 dual-issue, the S7
+    // same-line single-cycle straddle, and same-block streaming. When the next word crosses the
+    // block boundary (offset[2:0]==7 → offset 7 same-line, offset 15 cross-line) it is NOT served
+    // (no 2nd read) — o_rdata_next_valid is 0 (below) and the core resolves the straddle via its
+    // always-correct 2-cycle re-fetch. next_rdata_* is consumed only when valid; the out-of-block
+    // arms compute an unused (valid=0) value.
+    let next_in_block: logic = offset[2:0] != 3'd7;
+    let next_rdata_0 : logic<32> = rd_word(dl_0, next_offset[2:0]);
+    let next_rdata_1 : logic<32> = rd_word(dl_1, next_offset[2:0]);
+    let next_rdata_2 : logic<32> = rd_word(dl_2, next_offset[2:0]);
+    let next_rdata_3 : logic<32> = rd_word(dl_3, next_offset[2:0]);
 
     // Straddle miss detection
     let straddled_4byte: logic = i_addr[1] && o_rdata[17:16] == 2'b11;
@@ -277,7 +345,6 @@ pub module icache #(
     let eff_next_hit_1    : logic = next_hit_1 && !nfill_excl_1;
     let eff_next_hit_2    : logic = next_hit_2 && !nfill_excl_2;
     let eff_next_hit_3    : logic = next_hit_3 && !nfill_excl_3;
-    let eff_next_hit_cross: logic = eff_next_hit_0 || eff_next_hit_1 || eff_next_hit_2 || eff_next_hit_3;
     let straddle_line     : logic<58> = {next_tag, next_index};
     // S11.3: streaming for the NEXT word (same line: next_tag/next_index equal
     // tag/index, so this also covers the same-line successor word).
@@ -293,9 +360,12 @@ pub module icache #(
         next_rdata_3
     ;
     // A straddled 4-byte instr also demands the NEXT line's first word; it is
-    // missing when that cross-line word is not deliverable this cycle.
-    let demand1_missing: logic = i_ren && (eff_cache_hit || stream_hit_cur) && straddled_4byte && !next_same_line
-        && !(eff_next_hit_cross || stream_hit_next);
+    // missing when that cross-line word is not deliverable this cycle. With the 1R1W data
+    // array there is NO cross-line next-word read, so we never stall on it — demand1_missing
+    // is always 0 and the core's ic_straddle_prep (which requires !icache_stall) fires the
+    // always-correct 2-cycle re-fetch instead of hanging (a tag-cached next line would have
+    // no straddle_miss fill to clear such a stall). demand0 (the demand word) still stalls.
+    let demand1_missing: logic = 1'b0;
 
     // ============================================================
     // Phase 8 S11.2: next-line prefetch candidate + abort decisions.
@@ -452,24 +522,22 @@ pub module icache #(
             }
 
             if filling {
-                // Grant-gated dword beat: write two 32-bit words per granted beat
-                // (mem_ctrl streams buf[addr[5:3]] = dword fill_count).
+                // Grant-gated dword beat: masked slot-write of dword fill_count into block
+                // f_blk = {fill_index, fill_count[2]}, slot fill_count[1:0] (mem_ctrl streams
+                // buf[addr[5:3]] = dword fill_count). The retention read (data_k[f_blk] & ~msk)
+                // folds into the SRAM 64-bit write-enable — 1 write port.
                 if i_mem_grant {
                     if fill_way == 2'd0 {
-                        data_0[fill_widx_lo] = i_mem_rdata[31:0];
-                        data_0[fill_widx_hi] = i_mem_rdata[63:32];
+                        data_0[f_blk] = (data_0[f_blk] & ~fill_dmsk) | (fill_dnew & fill_dmsk);
                     }
                     if fill_way == 2'd1 {
-                        data_1[fill_widx_lo] = i_mem_rdata[31:0];
-                        data_1[fill_widx_hi] = i_mem_rdata[63:32];
+                        data_1[f_blk] = (data_1[f_blk] & ~fill_dmsk) | (fill_dnew & fill_dmsk);
                     }
                     if fill_way == 2'd2 {
-                        data_2[fill_widx_lo] = i_mem_rdata[31:0];
-                        data_2[fill_widx_hi] = i_mem_rdata[63:32];
+                        data_2[f_blk] = (data_2[f_blk] & ~fill_dmsk) | (fill_dnew & fill_dmsk);
                     }
                     if fill_way == 2'd3 {
-                        data_3[fill_widx_lo] = i_mem_rdata[31:0];
-                        data_3[fill_widx_hi] = i_mem_rdata[63:32];
+                        data_3[f_blk] = (data_3[f_blk] & ~fill_dmsk) | (fill_dnew & fill_dmsk);
                     }
                     if fill_count == 3'd7 {
                         // Fill complete: update tag, and set valid unless a FENCE.I
@@ -583,15 +651,16 @@ pub module icache #(
     let o_rdata_next_raw: logic<32> = if !i_dram ?
         32'd0
     : if next_same_line ?
-        // Same line: use same hit way (or the streaming fill way)
+        // Same line: use same hit way (or the streaming fill way). next_rdata_* is the
+        // same-line word next_offset of the demand line (== the former data_*[next_data_idx]).
         (if eff_hit_0 ?
-            data_0[next_data_idx]
+            next_rdata_0
         : if eff_hit_1 ?
-            data_1[next_data_idx]
+            next_rdata_1
         : if eff_hit_2 ?
-            data_2[next_data_idx]
+            next_rdata_2
         : if eff_hit_3 ?
-            data_3[next_data_idx]
+            next_rdata_3
         :
             stream_rdata_next
         )
@@ -615,12 +684,16 @@ pub module icache #(
     // Phase 8 S4: next-word validity. Same line → valid on a current-line hit
     // (S11.3: same-line stream_hit_next implies the current word streams too);
     // cross line → valid only if the next line is also cached or streaming.
+    // 1R1W data: the next word is served ONLY when it is in the demand block
+    // (next_in_block = offset[2:0] != 7; note this implies next_same_line). Out-of-block
+    // (offset 7 same-line, 15 cross-line) has no read port → validity 0, and the core takes
+    // the always-correct 2-cycle re-fetch. Served next word comes from the 1R demand read.
     let o_rdata_next_valid_raw: logic = if !i_dram ?
         1'b0
-    : if next_same_line ?
+    : if next_in_block ?
         (eff_cache_hit || stream_hit_next)
     :
-        (eff_next_hit_cross || stream_hit_next)
+        1'b0
     ;
 
     // Stall. Original blocking form: any miss or in-flight fill stalls fetch.

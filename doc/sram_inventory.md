@@ -22,8 +22,20 @@
 >   def-before-use). `--dump-area`: `512×49 1R1W ×20` (5 copies × 4 way).
 > - **icache tag `64×52`: 4R1W → ALL 1R1W** via REPLICATION (2026-07-22): demand (`index`) in-module,
 >   `next/nl/pf` reads → `dcache_tagbank` instances. `--dump-area`: `64×52 1R1W ×16` (4 copies × 4 way).
-> - **Predictor tables** (btb/bht/ibtb) + **icache data**: sync-read scaffolds BUILT but DEAD (`*_SYNC_READ=0`,
->   `ICACHE_SYNC_READ=0`) — they flip with the Phase-D front-end deepening (a future program).
+> - **icache data `1024×32 2R2W` → `128×256 1R1W ×4`** (2026-07-22, `cp_icache_data_1r1w_plan.md`): a
+>   256-bit FETCH-BLOCK 1R1W macro. The demand read is a 256-bit block (`{index, offset[3]}`, 8 words)
+>   serving the demand word + the same-block next word (`offset[2:0] != 7`, i.e. 15/16 offsets → slot-1
+>   dual-issue + S7 same-line straddle preserved); the 2nd read (next word) and the 2W (fill lo/hi) are
+>   BOTH eliminated — fill is a masked 64-bit-of-256 slot-write (1W). The cross-block/cross-line next word
+>   (`offset[2:0]==7` → offset 7 same-line, 15 cross-line) has no read port → the core resolves via its
+>   always-correct 2-cycle re-fetch (functional, small IPC cost). Width chosen by measurement (512-bit
+>   whole-line +0.2% IPC / ~6× sim; 128-bit +2.2% / ~1× sim; **256-bit** the balance). The whole-line
+>   `64×512 1R1W` variant was validated byte-identical first (repack cycle-exact). `--dump-area`:
+>   `128×256 1R1W ×4`. **Every icache storage array is now a realistic SRAM macro** (tag 1R1W + data 1R1W).
+> - **Predictor tables** (btb/bht/ibtb): sync-read scaffolds BUILT but DEAD (`*_SYNC_READ=0`) — they flip
+>   with the Phase-D front-end deepening (a future program). The icache `ICACHE_SYNC_READ` scaffold stays
+>   DEAD; the data array is a realistic 1R1W macro with or without it (sync-read = a pipelining axis,
+>   orthogonal to the port count).
 >
 > Full knob map (live / dead-scaffold / bisect): **`doc/pipeline_knob_registry.md`**. Campaign status +
 > target revision: `deep_pipeline_status_and_replan.md` §8.2. The caches are on realistic 1RW/1R1W SRAM;
@@ -133,18 +145,20 @@ keystone campaign's de-risking warm-up are the **same RTL change**.
     dcache data `9R4W` / tags `14R1W`, icache data `2R2W` / tags `4R1W`,
     `mmu.v1_ppn 1R3W` (**keep-flop** — TLB, 32-entry flop-territory; see §Refinement),
     `iq_int.ops 2R2W` (keep-flop).
+    - **UPDATE 2026-07-22:** dcache/icache/L2 tags → **all 1R1W** (replication); dcache data → TRUE
+      1R1W (sync-read + write-collapse); **icache data → `128×256 1R1W ×4`** (256-bit fetch-block).
+      The only remaining non-1R1W RAMs are the two **keep-flop** arrays (`mmu.v1_ppn`, `iq_int.ops`).
 
 - **Landscape after the predictors (independent port-narrowing vs bundle).** The
   independently-landable, byte-identical *port-narrowing* (replicate-for-reads while
   the read stays combinational) splits the remaining RAMs cleanly:
-  - **icache** (`icache.veryl`, tags `4R1W`, data `2R2W`) — NOT a clean standalone
-    (checked 2026-07-06): the data `2W` is the fill's adjacent lo/hi 32-bit word writes
-    (`fill_widx_lo/hi`), so `1W` needs a **64-bit-dword widen** (SETS×8 × 64, rewriting
-    every 32-bit read extraction); the tags `4R` includes two prefetch reads
-    (`nl_index`/`pf_index`) feeding the OFF prefetch (`s11_pf_en=0`), so a clean `1R1W`
-    needs DCE-cleanup or absurd 4×-per-way replication. Both are intertwined with the
-    fetch read structure the **sync-read (fetch-decouple) bundle restructures anyway** →
-    **fold the icache port-narrowing INTO that bundle**, not a standalone landing.
+  - **icache** (`icache.veryl`, tags `4R1W`, data `2R2W`) — ORIGINAL 2026-07-06 note: NOT a clean
+    1R1W standalone (data `2W` = fill lo/hi; tags `4R` includes OFF-prefetch reads). **RESOLVED
+    2026-07-22** WITHOUT the sync-read bundle: tags → 1R1W via replication (`dcache_tagbank`); data →
+    **`128×256 1R1W ×4`** by reading a 256-bit fetch-BLOCK (demand + same-block next from one read)
+    and a masked half-write fill (2W→1W). The cross-block/cross-line next word drops to the always-
+    correct 2-cycle re-fetch (small IPC cost) — no dword-widen-of-the-whole-line or the fetch-decouple
+    bundle was needed. See `cp_icache_data_1r1w_plan.md`.
   - **dcache** (tags `14R1W`, data `9R4W`) — CANNOT be independently narrowed: the 14
     tag / 9 data reads are genuinely concurrent at different indices (hit / victim /
     next / probe / flush / store-drain / slot-1 / presence), so replication is absurd.
