@@ -870,3 +870,35 @@ separate catch) is correct.
     + ICACHE_FIFO_BYPASS=1` first: if litmus N2 still fails, it is the BYPASS (a repacked-tree §19 regression,
     independent of B1 — chase it separately, or ship B1 with bypass off); if it passes, litmus N2 is a B1 bug.
     (`rv64mi_illegal` is almost certainly B1 — the §23 shape-W re-verify passed the full arch suite incl it.)
+
+### 25.1 🔬 Isolation DONE (2026-07-22) — the two corners are DIFFERENT bugs; both precisely located
+Ran the isolation matrix (all at `ICACHE_SYNC_READ=1`):
+
+| config | `rv64mi_illegal` | `litmus_2hart` N2 |
+|---|---|---|
+| `FETCH_DIRECTED=0, BYPASS=1` (shape-W + bypass, no B1) | — | **PASS** (`cy=0x00284880`) |
+| `FETCH_DIRECTED=1, BYPASS=0` (B1 alone) | **PASS** (`tohost=1`) | **HANG** |
+| `FETCH_DIRECTED=1, BYPASS=1` (B1 + bypass) | **HANG** | HANG |
+
+So:
+1. **`litmus_2hart` = a B1-ALONE bug (bypass-independent).** A retire-PC heartbeat shows **hart 0 wedges at
+   `pc=0x80000098` with only 133 retires (ret frozen)**, hart 1 runs. Disassembly: `0x98` is the tight delay
+   loop's UNCONDITIONAL back-edge `j 0x80000090` (loop = `90: beqz t0,9c / 94: addi t0,t0,-1 / 98: j 90`,
+   dwords `0x90`={beqz,addi} and `0x98`={j,li@9c}). This `j` is EXACTLY what B1 FTB-trains → **B1's FTB
+   redirect deadlocks a tight unconditional 2-dword loop.** The FTB makes F0 ping-pong `0x90↔0x98`; the loop
+   EXIT (`beqz` taken → `0x9c`, then sequential `0xa0`) needs dword `0xa0`, which F0 — FTB-looping — never
+   fetches, so `ext_buf_mismatch` must re-steer F0 to `0xa0`; a hole in that recovery (or an earlier
+   mid-loop wedge, since ret froze BEFORE the exit) deadlocks the pipe. **This is THE B1 bug to fix.**
+2. **`rv64mi_illegal` = a B1 + BYPASS INTERACTION** (passes at `FETCH_DIRECTED=1, BYPASS=0`). The §19 bypass
+   (`ext_bypass` delivers the arriving `wf_push_dword` when `wf_push_pc_q==ext_pc_q`) assumes F0's push is the
+   sequential continuation; B1's FTB redirect changes what F0 pushes, breaking that assumption. **Fix path:
+   develop/ship B1 with `BYPASS=0` first (the §18 body, N4-clean); reconcile the bypass with the FTB
+   redirect as a later step (or gate the bypass off when the pushed dword came from an FTB redirect).**
+
+**Next debug (B1 tight-loop wedge):** add temporary core debug ports (`pc_fetch_q`, `wf_count`, `wf_head`,
+`ext_pc_q`, `f0_ftb_hit`, `ext_taken_redir`) + a per-cycle trace around hart-0's `0x90/0x94/0x98/0x9c`
+window; find whether F0's FTB ping-pong starves the exit dword `0xa0` (recovery hole) or the FIFO
+count/head wedges mid-loop. Likely fix: on an `ext_buf_mismatch` re-steer, ensure F0 abandons the FTB loop
+(it does re-seed `pc_fetch_q`, but verify the FTB doesn't immediately re-hit and re-loop), and/or gate
+`f0_ftb_hit` so a tight self-referential loop cannot monopolise the FIFO. Consts reverted to 0 (byte-id
+baseline unaffected).
