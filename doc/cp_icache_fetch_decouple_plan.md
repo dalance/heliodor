@@ -980,3 +980,35 @@ vs the §19-bypass baseline** — B1 must be shown IPC-neutral-or-better BEFORE 
 gate `f0_no_ftb_q` only when the re-steer target is actually mid-dword (`redirect_pc[2:1] != 0`) so offset-0
 redirect targets keep their prefetch; and/or make the FTB store the branch halfword-offset so F0 can honour a
 redirect that lands at-or-before it. The §25.1-2 bypass↔FTB reconciliation is still deferred (ship BYPASS=0).
+
+### 25.4 ✅ IPC refinement + payoff measured (2026-07-23) — gate the FTB only on MID-dword redirect targets
+
+Implemented the §25.3 tuning: `f0_no_ftb_q` now gates the first FTB redirect ONLY when the re-steer target
+lands MID-dword (`<target>[2:1] != 0`) on each re-steer branch (redirect / early / ext_taken / f0_diverged).
+An offset-0 (dword-start) target enters at-or-before any branch in the dword, so F0's FTB redirect agrees
+with extract — keep the prefetch. Correctness is unchanged (`head1_seq` + `f0_diverged(B)` remain the safety
+net); re-verified GREEN at `=1`: fast `veryl test` **252/0** (litmus N2 pass), SMP boot **N2 + N4 PASS**.
+
+**IPC measured on the CURRENT tree** (instret identical per row ⟹ B1 is architecturally transparent and the
+cycle deltas are clean; `=1` = `ICACHE_SYNC_READ=1`, `FD` = `ICACHE_FETCH_DIRECTED`, all at `BYPASS=0`):
+
+| bench (instret) | `=0` | shape-W (FD=0) | B1-refined (FD=1) | B1 vs shape-W |
+|---|---|---|---|---|
+| Dhrystone (264,834) | 231,724 | 301,816 (+30.3 %) | 295,025 (+27.3 %) | **−2.25 %** |
+| CoreMark (374,357) | 347,693 | 392,844 (+13.0 %) | 390,572 (+12.3 %) | **−0.6 %** |
+| N4 SMP boot 5.15 | (~16.6 M) | ~31 M | ~31 M (PASS) | ≈ 0 |
+
+**Findings:**
+1. **B1 beats shape-W in the intended direction** — it removes the taken-branch refill bubble, so the gain is
+   larger on branch-dense Dhrystone (−2.25 %) than CoreMark (−0.6 %). Architecturally transparent (instret
+   unchanged), so this is a pure cycle win.
+2. **But the gain is small** — the DOMINANT `=1` cost is shape-W's read-latency (+30 % Dhry / +13 % CoreMark at
+   BYPASS=0), which B1 barely touches. **B1 alone does NOT make the flip IPC-neutral.**
+3. **The N4-boot ~31 M is NOT the FTB gate** (correcting §25.3's hypothesis): it is shape-W's read-latency on a
+   memory-bound 4-hart boot, and it is the SAME with the gate refined vs un-refined — B1 (transparent, only
+   removes bubbles) is neutral-to-slightly-better there, not the cause of the cost.
+4. **The bigger IPC lever is the §19 read-around bypass** — §23 measured it brings shape-W Dhry from +30 % to
+   **+15.8 %** — but it conflicts with the FTB redirect (§25.1-2). So the path to an IPC-neutral default-on is
+   the **bypass↔FTB reconciliation** (gate the bypass off when the pushed dword came from an FTB redirect, or
+   make the bypass FTB-aware), NOT more B1 tuning. B1 is now correctness-complete + a small correctly-directed
+   IPC gain; the bypass reconciliation is the next real increment before any default-on flip.
