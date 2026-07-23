@@ -1091,3 +1091,44 @@ bundle is +8-9% IPC** for a real clocked-SRAM icache — much closer to the §24
 close the remaining function-call/dispatch refill bubbles but require F0-side speculative state (the deferred
 "hard parts"). B2a is the last cheap increment; B3/B4 are the diminishing-returns tail. For default-on, the
 call is whether +8-9% is acceptable now (ship B1+B2a+BYPASS) or whether B3/B4 are worth their spec-state cost.
+
+## 27. ✅ DEFAULT-ON (2026-07-23, user decision) — the real clocked-SRAM icache bundle ships
+
+User flipped the icache real-SRAM read + fetch-directed prefetch bundle **default-on**. Five consts move
+to 1 at the committed default:
+- `ICACHE_SYNC_READ` (heliodor_core.veryl + icache.veryl) — the synchronous (registered-address) icache
+  demand read = a real clocked-SRAM macro (the goal, sram_inventory).
+- `ICACHE_FETCH_DIRECTED` — B1/B2a F0 fetch-directed prefetch (removes the taken-refill bubble).
+- `ICACHE_FTB_COND` — B2a conditional-branch FTB (loop back-edges).
+- `ICACHE_FIFO_BYPASS` — §19 FIFO read-around (the dominant IPC lever, reconciled with the FTB in §25.5).
+
+**Full regression at default-on — all GREEN:**
+| gate | result |
+|---|---|
+| fast `veryl test` (arch rv64ui/um/ua/uc/mi/si + fp + litmus N2) | **252 / 0** (litmus N2 `cy=0x282170`) |
+| litmus **N4** battery (`test_litmus_4hart`) | **PASS** (`cy=0x54fdd0`, no forbidden) |
+| SMP Linux boot **N2** (Veryl sim) | **PASS** (`cy=19,156,439`) |
+| SMP Linux boot **N4** (Veryl sim) | **PASS** (`cy=30,398,976`) |
+| SMP Linux boot **N2** on **Verilator** (real SV NBA) | **PASS** (`cy=19,156,439` — identical to the Veryl sim) |
+| byte-id with all five consts back to 0 | **252 / 0** (the scaffold still flips off cleanly) |
+
+The Veryl-sim and Verilator N2-boot completion cycles are **bit-identical (19,156,439)** — two independent
+sims agreeing end-to-end over a 19 M-cycle SMP boot is strong evidence the default-on fetch is correct.
+
+**IPC cost of the flip (the real clocked-SRAM trade), current tree, honest baseline:**
+| workload | `=0` (real branch baseline) | default-on | cost |
+|---|---|---|---|
+| Dhrystone | 231,724 | 251,423 | **+8.5 %** |
+| CoreMark | 347,693 | 375,210 | **+7.9 %** |
+| SMP boot N2 (completion cy) | 17,830,000 | 19,156,439 | **+7.5 %** |
+
+The boot cost tracks the microbenchmark IPC (~+8 %), NOT the +50-80 % a naive comparison against the STALE
+CLAUDE.md `~12.3 M` N2-boot figure suggested — that number predates the dcache-tag-replication branch's
+realistic-SRAM changes, which already moved the `=0` baseline to 17.83 M independent of this flip. Net: the
+real clocked-SRAM icache (a 128×256 1R1W macro read synchronously, vs the fictional 2R2W array) ships for a
+consistent **~+8 % IPC**, the B1+B2a+BYPASS bundle having brought the raw shape-W +30 % (Dhry, bypass-off)
+down to +8.5 %.
+
+**Remaining (optional, diminishing): B3/B4** — returns (F0 speculative-RAS mirror) + indirect (F0 iBTB), the
+§24.2 deferred spec-state hard parts, would trim the last few % (function-call/dispatch refill), bounded below
+by the cold-i-fetch floor. Not required for the shipped default-on bundle.

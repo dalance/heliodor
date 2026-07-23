@@ -105,13 +105,17 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
   To catch simulator/codegen bugs early, cross-check a suspicious result on a
   second backend (e.g. `--backend cranelift` or `--backend interpret`): two
   independent backends agreeing is strong evidence the RTL, not the sim, is at fault.
-- **Regression testing**: After modifying heliodor or veryl, run the multi-step regression:
+- **Regression testing**: After modifying heliodor or veryl, run the multi-step regression.
+  (The icache real-SRAM read + fetch-directed-prefetch bundle is **default-on** since 2026-07-23 —
+  `ICACHE_SYNC_READ`/`ICACHE_FETCH_DIRECTED`/`ICACHE_FTB_COND`/`ICACHE_FIFO_BYPASS` all default 1; see
+  `doc/cp_icache_fetch_decouple_plan.md` §27. It costs ~+8 % IPC, so the boot/litmus cycle counts below
+  are the post-flip baseline — the pre-flip figures were ~8 % lower.)
   1. `veryl test` — fast tests **+ the arch suite** (~150 tests, seconds-to-~minute;
      the rv64ui/um/ua/mi/si arch tests in `tb/test_arch_common.veryl` and the
      rv64uf/ud FP tests in `tb/test_arch_fp.veryl` are NOT `#[ignore]` and run here,
      on the OoO core). Fix any failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart` — P9.0 RVWMO litmus battery
-     at N=4 (IRIW + 4-way barrier/bus stress; **~5.2M cycles** — was ~2.5M at P9.1;
+     at N=4 (IRIW + 4-way barrier/bus stress; **~5.6M cycles** at icache default-on — was ~2.5M at P9.1;
      P9.3.B `7beb31a` retired the bus-wide AMO lock for in-cache MESI atomics, so
      the contended-atomic litmus now pays line-bounce/RFO cost — by design, not a
      regression; N=2 is ~2.1M). On this shared box that is ~10 min, and its probe
@@ -121,10 +125,10 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      forbidden-outcome hit is a memory-model bug — see `test/litmus/litmus.S` for
      the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (~12.3M cycles, ~2 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
-     (~9.1M cycles, ~40 s).
+     (~19.2M cycles, ~3 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
+     (~14.2M cycles, ~1 min).
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
-     (~16.6M cycles, ~10 min). Cycle counts drift with perf work — treat large
+     (~30.4M cycles, ~10 min). Cycle counts drift with perf work — treat large
      unexplained jumps as regressions (N=4 has a ±1M timing band).
 - **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
   (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`, `test_coremark`)
