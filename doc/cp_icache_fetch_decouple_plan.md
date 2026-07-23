@@ -1049,3 +1049,45 @@ push still pays the register round-trip). Closing the last +10-15% is a deeper f
 the bypass window / a 2nd fetch-ahead entry / prefetch depth), not a B1 or bypass-reconciliation issue. For a
 default-on decision the bundle is now a clean **+10-15% IPC for a real clocked-SRAM icache** — a user call on
 whether that trade (real SRAM macro vs 2R2W) is worth it, or whether to chase IPC-neutral first (§24.3-Bn).
+
+## 26. ✅ B2a — conditional-branch FTB prefetch (2026-07-23, user-selected: default-on ⇒ chase IPC-neutral)
+
+User chose to flip the icache real-SRAM read default-ON, so the residual +10-15% (§25.5) must come down.
+The residual is the taken-refill bubble on **conditional** branches (loop back-edges) that B1's
+unconditional-only FTB leaves. B2a extends the FTB to conditional branches — the minimal form of §24.3-B2
+that needs **no F0-side spec_ghr mirror** (the §24.2-3 "hardest consistency"):
+
+- **Storage:** the FTB entry gains `is_cond` + a 2-bit saturating **confidence** (`ftb_conf`). New const
+  `ICACHE_FTB_COND` (bisect knob) gates the whole extension; at 0 the FTB is B1 (unconditional-only) and
+  is_cond/conf DCE. DEAD at `ICACHE_FETCH_DIRECTED=0` regardless.
+- **Training** (on a slot-0 branch delivery `fb_push0`): unconditional → `{target, is_cond=0, conf=3}` (B1,
+  always followed). Conditional → confidence is trained on **extract's PREDICTED direction (`cond_taken0`)**,
+  NOT the committed outcome: taken bumps conf toward 3 (and stores the taken target), not-taken decays it.
+  Training on the prediction makes F0 track extract's OWN front-end, so a match ⟹ no spurious flush.
+- **F0 lookup:** an unconditional entry always re-steers F0 (B1); a conditional entry re-steers ONLY when
+  `conf==3` (strong-taken). So F0 follows strongly-biased conditionals (hot loops) and falls back to the
+  sequential stream (today's single taken-flush) on weakly-biased ones — no direction-history state at F0.
+- **Correctness is unchanged:** the FTB stays a HINT — a wrong F0 direction is caught by the same recovery
+  net (`ext_taken_redir` / `ext_buf_mismatch` / `f0_diverged` / the `head1_seq` guard). The 2-bit conf also
+  self-limits churn: one not-taken delivery drops conf below 3 and F0 stops following — no livelock.
+
+**Verified at the full default-on stack** (`ICACHE_SYNC_READ=1 + ICACHE_FETCH_DIRECTED=1 + ICACHE_FTB_COND=1
++ ICACHE_FIFO_BYPASS=1`): fast `veryl test` **252/0** (litmus N2 pass), SMP boot **N2 PASS**, **N4 PASS**.
+Byte-id at consts=0 (252/0).
+
+**IPC — B2a closes most of the residual** (current tree, instret identical per row):
+
+| bench (instret) | `=0` | B1+BYPASS | **B2a+BYPASS** | B2a vs `=0` |
+|---|---|---|---|---|
+| Dhrystone (264,834) | 231,724 | 265,926 (+14.8%) | **251,423** | **+8.5%** |
+| CoreMark (374,357) | 347,693 | 382,463 (+10.0%) | **375,210** | **+7.9%** |
+
+B2a recovers ~5.5 pt on Dhrystone (+14.8→+8.5%) and ~2.1 pt on CoreMark (+10.0→+7.9%) — the conditional
+loop back-edges are now prefetched, so the hot-loop iterations no longer flush. **The full B1+B2a+BYPASS
+bundle is +8-9% IPC** for a real clocked-SRAM icache — much closer to the §24 IPC-neutral goal.
+
+**Residual + next (B3/B4):** the last +8% is cold i-fetch (icache misses — not a prefetch target), plus
+**returns** (B3: needs the F0 speculative-RAS mirror, §24.2-2) and **indirect** (B4: F0 iBTB). Those two
+close the remaining function-call/dispatch refill bubbles but require F0-side speculative state (the deferred
+"hard parts"). B2a is the last cheap increment; B3/B4 are the diminishing-returns tail. For default-on, the
+call is whether +8-9% is acceptable now (ship B1+B2a+BYPASS) or whether B3/B4 are worth their spec-state cost.

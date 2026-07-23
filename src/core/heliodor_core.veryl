@@ -379,12 +379,23 @@ pub module heliodor_core #(
     // holding the branch's high half. DEAD at ICACHE_FETCH_DIRECTED=0 (only meaningful with
     // ICACHE_SYNC_READ=1; every write is `else if ICACHE_FETCH_DIRECTED` → reset-only at 0 → DCE).
     const ICACHE_FETCH_DIRECTED: bit = 0;
+    // (b) B2a: extend the FTB to CONDITIONAL branches (loop back-edges are the residual taken-refill
+    // bubble B1 leaves — B1 trains unconditional only). A conditional entry carries is_cond + a 2-bit
+    // saturating confidence trained on EXTRACT's predicted direction (cond_taken0), so F0 tracks
+    // extract's own predictor: F0 follows a conditional FTB hit ONLY when confidence is strong-taken
+    // (==3), matching extract on strongly-biased branches (loops) and falling back to sequential (no
+    // prefetch, today's flush) on weakly-biased ones — no spec_ghr mirror needed. A HINT: a wrong F0
+    // direction is still just a flush (§24.4). Gated by ICACHE_FTB_COND (bisect knob); at 0 the FTB is
+    // B1 (unconditional-only) and is_cond/conf DCE. DEAD at ICACHE_FETCH_DIRECTED=0.
+    const ICACHE_FTB_COND: bit = 0;
     const FTB_IDX_W: u32 = 6;                       // 64 fetch-block entries
     const FTB_N    : u32 = 1 << FTB_IDX_W;
     const FTB_TAG_W: u32 = 64 - (FTB_IDX_W + 3);    // pc_fetch_q[63 : FTB_IDX_W+3]
-    var ftb_valid : logic           [FTB_N];
-    var ftb_tag   : logic<FTB_TAG_W> [FTB_N];
-    var ftb_target: logic<64>        [FTB_N];
+    var ftb_valid  : logic           [FTB_N];
+    var ftb_tag    : logic<FTB_TAG_W> [FTB_N];
+    var ftb_target : logic<64>        [FTB_N];
+    var ftb_is_cond: logic           [FTB_N]; // B2a: entry predicts a CONDITIONAL branch
+    var ftb_conf   : logic<2>         [FTB_N]; // B2a: 2-bit saturating taken-confidence (3 = follow)
     // (b) B1: gate f0_ftb_hit for the FIRST F0 fetch after any re-steer (redirect / early /
     // ext_taken / f0_diverged). A re-steer target can land MID-dword (a branch/jump/trap
     // target past a branch the FTB trained on that same dword); if F0 then FTB-redirected off
@@ -1384,7 +1395,11 @@ pub module heliodor_core #(
     // pc_fetch_q (a realistic async-read RF, below the SRAM-compiler floor — sram_inventory §2).
     let ftb_lk_idx   : logic<FTB_IDX_W> = pc_fetch_q[FTB_IDX_W + 2:3];
     let ftb_lk_tag   : logic<FTB_TAG_W> = pc_fetch_q[63:FTB_IDX_W + 3];
-    let f0_ftb_hit   : logic     = ICACHE_FETCH_DIRECTED && ftb_valid[ftb_lk_idx] && (ftb_tag[ftb_lk_idx] == ftb_lk_tag);
+    // (b) B2a: a CONDITIONAL FTB entry re-steers F0 only when its confidence is strong-taken (==3);
+    // an unconditional entry (is_cond=0) always follows (B1). At ICACHE_FTB_COND=0 the is_cond/conf
+    // terms fold away (is_cond is never set) → B1 behaviour, is_cond/conf DCE.
+    let ftb_lk_follow: logic     = !ICACHE_FTB_COND || !ftb_is_cond[ftb_lk_idx] || (ftb_conf[ftb_lk_idx] == 2'd3);
+    let f0_ftb_hit   : logic     = ICACHE_FETCH_DIRECTED && ftb_valid[ftb_lk_idx] && (ftb_tag[ftb_lk_idx] == ftb_lk_tag) && ftb_lk_follow;
     let f0_ftb_target: logic<64> = ftb_target[ftb_lk_idx];
     // Predicted-taken → F0 redirect: the extract delivered a taken branch (slot-0, or a
     // not-taken slot-0 + a taken slot-1), so the F0 stream — running sequentially past the
@@ -1580,21 +1595,52 @@ pub module heliodor_core #(
     // branch's dword — the SAME index F0 reads on pc_fetch_q for the same dword. Only ftb_valid is
     // reset (it gates the hit); tag/target infer as an SRAM-like RF, masked by valid=0. DEAD/DCE at
     // ICACHE_FETCH_DIRECTED=0 (reset-only writes). A hint — extract stays authoritative (§24.4).
-    let ftb_train_en: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && fb_push0
-        && btb_hit && !btb_is_cond && !btb_is_ret && !btb_is_ind
+    // Any trainable branch delivery at slot-0: unconditional (B1) always; conditional too under
+    // ICACHE_FTB_COND (B2a). Returns/indirect excluded (need RAS/iBTB); straddling excluded (F0's
+    // redirect would skip the branch's high half). At ICACHE_FTB_COND=0 this folds to B1's
+    // `!btb_is_cond` gate → byte-identical to B1 (is_cond/conf writes are then dead → DCE).
+    let ftb_br_deliver: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && fb_push0
+        && btb_hit && !btb_is_ret && !btb_is_ind
+        && (!btb_is_cond || ICACHE_FTB_COND)
         && (curr_is_rvc || ic_pc[2:1] != 2'b11);
     let ftb_tr_idx: logic<FTB_IDX_W> = ic_pc[FTB_IDX_W + 2:3];
     let ftb_tr_tag: logic<FTB_TAG_W> = ic_pc[63:FTB_IDX_W + 3];
+    let ftb_tr_same: logic = ftb_valid[ftb_tr_idx] && (ftb_tag[ftb_tr_idx] == ftb_tr_tag);
     always_ff (clk, rst) {
         if_reset {
             for i in 0..FTB_N {
                 ftb_valid[i] = 1'b0;
             }
         } else if ICACHE_FETCH_DIRECTED {
-            if ftb_train_en {
-                ftb_valid[ftb_tr_idx]  = 1'b1;
-                ftb_tag[ftb_tr_idx]    = ftb_tr_tag;
-                ftb_target[ftb_tr_idx] = pred_target;
+            if ftb_br_deliver {
+                if !btb_is_cond {
+                    // Unconditional: always taken, always followed (conf=3, is_cond=0) — B1.
+                    ftb_valid[ftb_tr_idx]   = 1'b1;
+                    ftb_tag[ftb_tr_idx]     = ftb_tr_tag;
+                    ftb_target[ftb_tr_idx]  = pred_target;
+                    ftb_is_cond[ftb_tr_idx] = 1'b0;
+                    ftb_conf[ftb_tr_idx]    = 2'd3;
+                } else if cond_taken0 {
+                    // Conditional, extract predicts TAKEN: (re)store the target, bump confidence.
+                    // A same-dword conditional entry saturates up; a new/aliased slot inits weak-taken.
+                    ftb_valid[ftb_tr_idx]   = 1'b1;
+                    ftb_tag[ftb_tr_idx]     = ftb_tr_tag;
+                    ftb_target[ftb_tr_idx]  = pred_target;
+                    ftb_is_cond[ftb_tr_idx] = 1'b1;
+                    if ftb_tr_same && ftb_is_cond[ftb_tr_idx] {
+                        if ftb_conf[ftb_tr_idx] != 2'd3 {
+                            ftb_conf[ftb_tr_idx] = ftb_conf[ftb_tr_idx] + 2'd1;
+                        }
+                    } else {
+                        ftb_conf[ftb_tr_idx] = 2'd2;
+                    }
+                } else {
+                    // Conditional, extract predicts NOT-taken: decay only an existing conditional
+                    // entry for this dword (no target on a fall-through). At conf 0 F0 stops following.
+                    if ftb_tr_same && ftb_is_cond[ftb_tr_idx] && (ftb_conf[ftb_tr_idx] != 2'd0) {
+                        ftb_conf[ftb_tr_idx] = ftb_conf[ftb_tr_idx] - 2'd1;
+                    }
+                }
             }
         }
     }
