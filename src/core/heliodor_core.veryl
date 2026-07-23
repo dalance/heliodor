@@ -385,6 +385,14 @@ pub module heliodor_core #(
     var ftb_valid : logic           [FTB_N];
     var ftb_tag   : logic<FTB_TAG_W> [FTB_N];
     var ftb_target: logic<64>        [FTB_N];
+    // (b) B1: gate f0_ftb_hit for the FIRST F0 fetch after any re-steer (redirect / early /
+    // ext_taken / f0_diverged). A re-steer target can land MID-dword (a branch/jump/trap
+    // target past a branch the FTB trained on that same dword); if F0 then FTB-redirected off
+    // its re-entry dword it would (1) skip the sequential continuation extract still needs and
+    // (2) leave wf_pc[head+1] non-sequential, so extract's straddle / slot-1 across-dword read
+    // (wf_data[head+1]) would decode a WRONG high half. Suppressing the first-fetch redirect
+    // keeps the re-entry dword's successor SEQUENTIAL. DEAD/DCE at ICACHE_FETCH_DIRECTED=0.
+    var f0_no_ftb_q: logic;
     // W2 extract stage: ext_pc_q is the slot-0 INSTRUCTION PC being decoded this cycle
     // (replaces pc_q's extract role at =1; pc_q keeps only its now-vestigial fetch-FSM role,
     // DCE'd at =1). It indexes the WORD FIFO head (wf_pc[wf_head] == ext_pc_q dword-aligned);
@@ -845,9 +853,18 @@ pub module heliodor_core #(
     let ext_eff_head : logic<64> = if ext_bypass ? wf_push_dword : wf_head_data;
     let ext_word     : logic<32> = if ext_pc_q[2] ? ext_eff_head[63:32] : ext_eff_head[31:0];
     let ext_word_next: logic<32> = if ext_pc_q[2] ? wf_head_next_data[31:0] : ext_eff_head[63:32];
+    // (b) B1: head+1 is the SEQUENTIAL successor of head (dword contiguity). At
+    // ICACHE_FETCH_DIRECTED=0 F0 always streams +8 so this holds by construction; at =1 an FTB
+    // redirect can push a NON-sequential head+1 (a prefetched branch target). The across-dword
+    // next-word read (ext_word_next = wf_data[head+1], used by a dword-boundary straddle and by
+    // slot-1) MUST NOT consume such an entry — it would decode a WRONG high half / slot-1. DEAD
+    // (const-masked) at ICACHE_FETCH_DIRECTED=0 → byte-identical to shape-W.
+    let head1_seq: logic = wf_pc[wf_head + 3'd1][63:3] == wf_pc[wf_head][63:3] + 61'd1;
     // Next word present: within the head dword (ext_pc_q[2]=0) it always is; across the dword
-    // boundary (ext_pc_q[2]=1) the next FIFO entry must be buffered (wf_count >= 2).
-    let ext_next_valid: logic = if ext_pc_q[2] ? (wf_count >= 4'd2) : 1'b1;
+    // boundary (ext_pc_q[2]=1) the next FIFO entry must be buffered (wf_count >= 2) AND — under
+    // fetch-directed prefetch — be the sequential successor (else the straddle/slot-1 stalls and
+    // f0_diverged re-fetches this dword sequentially; see the recovery below).
+    let ext_next_valid: logic = if ext_pc_q[2] ? (wf_count >= 4'd2 && (!ICACHE_FETCH_DIRECTED || head1_seq)) : 1'b1;
     let ic_pc         : logic<64> = if ICACHE_SYNC_READ ? ext_pc_q      : pc_q;
     let ic_rdata      : logic<32> = if ICACHE_SYNC_READ ? ext_word      : icache_rdata;
     let ic_rdata_next : logic<32> = if ICACHE_SYNC_READ ? ext_word_next : icache_rdata_next;
@@ -1393,6 +1410,26 @@ pub module heliodor_core #(
     let ext_buf_mismatch    : logic    = ext_pop && (wf_count >= 4'd2) && (wf_pc[wf_head_p1][63:3] != ext_next_pc[63:3]);
     let ext_taken_redir     : logic    = ICACHE_SYNC_READ && !any_redirect
         && ((ext_deliver_taken && !f0_prefetched_target) || ext_buf_mismatch);
+    // (b) B1 divergence recovery — the HINT safety net (§24.4). An FTB redirect can steer F0 onto a
+    // WRONG-path dword that extract never reaches / consumes wrongly. Two cases, both recovered by a
+    // full flush + re-fetch of ext_pc_q's dword with the FTB gated (f0_no_ftb_q) so the re-fetch
+    // streams SEQUENTIALLY (head+1 = ext_pc_q_dword+8). The delivery-gated ext_buf_mismatch cannot
+    // catch these — it needs ext_pop ⟸ fb_push0, but both cases STALL extract (no delivery):
+    //  (A) head mismatch — extract's dword is not at the FIFO head and F0 is neither presenting it
+    //      (pc_fetch_q) nor has it in flight (wf_push_*_q); F0 ran off a wrong path. Guards exclude a
+    //      normal refill (empty FIFO post-flush, or F0 holding on ext's OWN dword during a miss/2-beat).
+    //  (B) straddle blocked — extract IS at the head dword but a dword-boundary straddle (offset 6,
+    //      32-bit) needs head+8, which head+1 is NOT (an FTB redirect made head+1 non-sequential).
+    //      ext_next_valid=0 (above) stalls the delivery so no WRONG high half is decoded; this
+    //      re-fetches the dword sequentially to supply the real head+8.
+    // DEAD/DCE at ICACHE_FETCH_DIRECTED=0.
+    let f0_diverged: logic = ICACHE_SYNC_READ && ICACHE_FETCH_DIRECTED && !any_redirect
+        && (
+            (!ext_head_match && (wf_count >= 4'd1)
+             && (pc_fetch_q[63:3] != ext_pc_q[63:3])
+             && !(wf_push_valid_q && (wf_push_pc_q[63:3] == ext_pc_q[63:3])))
+            || (ext_head_match && needs_straddle && ext_pc_q[2] && (wf_count >= 4'd2) && !head1_seq)
+        );
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -1406,6 +1443,7 @@ pub module heliodor_core #(
             f0_nc_lo_inflight_q = 1'b0;
             f0_nc_lo_q          = 32'd0;
             wf_push_nc_q        = 1'b0;
+            f0_no_ftb_q         = 1'b0;
         } else if ICACHE_SYNC_READ {
             // Write ONLY at =1 → at =0 every reg here is reset-only (holds its reset
             // constant) → DCE (the icache o_rdata_q idiom; a mux(control,const,hold) D
@@ -1416,20 +1454,34 @@ pub module heliodor_core #(
             if redirect_fire {
                 pc_fetch_q   = {redirect_pc[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
+                f0_no_ftb_q  = 1'b1; // re-steer target may be mid-dword — gate the first FTB redirect
             } else if early_redir_fire_q {
                 pc_fetch_q   = {early_redir_pc_q[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
+                f0_no_ftb_q  = 1'b1;
             } else if ext_taken_redir {
                 pc_fetch_q   = {ext_next_pc[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
+                f0_no_ftb_q  = 1'b1;
+            } else if f0_diverged {
+                // (b) B1 recovery: F0 diverged onto a wrong path; re-steer to extract's
+                // authoritative (stalled) dword. Mutually exclusive with ext_taken_redir
+                // (that needs a delivery; f0_diverged needs the stall) and independent of
+                // f0_present (fires even when wf_full blocks F0's own advance).
+                pc_fetch_q   = {ext_pc_q[63:3], 3'b000};
+                f0_nc_beat_q = 1'b0;
+                f0_no_ftb_q  = 1'b1;
             } else if f0_present {
                 if f0_beat_done {
                     // (b) B1: an FTB hit on the just-completed dword re-steers F0 to the predicted
                     // unconditional target (dword-aligned) instead of the sequential +8, so the
                     // target is prefetched ahead of extract (removing the taken-refill bubble). DEAD
                     // at ICACHE_FETCH_DIRECTED=0 (f0_ftb_hit is const-false → the mux folds to +8).
-                    pc_fetch_q   = if f0_ftb_hit ? {f0_ftb_target[63:3], 3'b000} : pc_fetch_q + 64'd8;
+                    // f0_no_ftb_q suppresses the redirect on the first fetch after a re-steer (the
+                    // mid-dword re-entry guard); it is consumed (cleared) by this completing fetch.
+                    pc_fetch_q   = if f0_ftb_hit && !f0_no_ftb_q ? {f0_ftb_target[63:3], 3'b000} : pc_fetch_q + 64'd8;
                     f0_nc_beat_q = 1'b0;
+                    f0_no_ftb_q  = 1'b0;
                 } else {
                     f0_nc_beat_q = 1'b1; // non-cacheable low-word beat done → present the high word
                 }
@@ -1438,7 +1490,7 @@ pub module heliodor_core #(
             // 32-bit word arrives next cycle as icache_rdata; latch it for the beat-1 assembly.
             // A redirect / taken re-steer voids the in-flight low word (wrong-path).
             f0_nc_lo_inflight_q = f0_present && !ic_dram && !f0_fault && !f0_nc_beat_q
-                && !any_redirect && !ext_taken_redir;
+                && !any_redirect && !ext_taken_redir && !f0_diverged;
             if f0_nc_lo_inflight_q {
                 f0_nc_lo_q = icache_rdata;
             }
@@ -1446,7 +1498,7 @@ pub module heliodor_core #(
             // cycle to land with its data. Only a beat-DONE present pushes (the low-word beat does
             // not). Cleared on a redirect / taken re-steer (fetch is wrong-path). wf_push_nc_q
             // flags a non-cacheable dword — its high word comes from f0_nc_lo_q + icache_rdata.
-            wf_push_valid_q = f0_present && f0_beat_done && !any_redirect && !ext_taken_redir;
+            wf_push_valid_q = f0_present && f0_beat_done && !any_redirect && !ext_taken_redir && !f0_diverged;
             if f0_present && f0_beat_done {
                 wf_push_pc_q     = pc_fetch_q;
                 wf_push_ifault_q = imem_fault_w;
@@ -1468,7 +1520,7 @@ pub module heliodor_core #(
             // Write ONLY at =1 → reset-only at =0 → the FIFO pointers + data arrays DCE.
             // Flush on a commit/early redirect OR a predicted-taken re-steer (the buffered
             // words after the taken branch are wrong-path; F0 refetches from the target).
-            if any_redirect || ext_taken_redir {
+            if any_redirect || ext_taken_redir || f0_diverged {
                 wf_head  = 3'd0;
                 wf_tail  = 3'd0;
                 wf_count = 4'd0;

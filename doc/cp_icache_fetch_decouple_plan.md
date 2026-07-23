@@ -823,7 +823,7 @@ redirect is always caught (correctness is never at risk; only IPC, via a spuriou
 
 **Next: B1 — the unconditional-only F0 redirect scaffold (byte-id at 0).**
 
-## 25. 🔬 B1 implemented (2026-07-22) — byte-id at 0 verified; `=1` down to ONE corner (`rv64mi_illegal`)
+## 25. ✅ B1 implemented (2026-07-22) — byte-id at 0; the `=1` corners ROOT-CAUSED + FIXED in §25.3 (litmus + arch + SMP boot N2/N4 all GREEN)
 
 Implemented the B1 unconditional-only fetch-directed prefetch (`const ICACHE_FETCH_DIRECTED`, DEAD at 0):
 - **FTB storage** (`heliodor_core.veryl`): `ftb_valid/tag/target [64]` — a 64-entry tagged fetch-block table
@@ -914,3 +914,69 @@ or a general FIFO/`ext_pc_q` interaction). Forward-only was reverted (adds compl
 fetch-state trace (above) is now mandatory to find the true root cause** — reasoning + hypothesis-restriction
 have been exhausted. Reduce on litmus N2 (hart-0 wedge) with the per-cycle fetch-state dump, not the arch
 suite.
+
+### 25.3 ✅ Root-caused + FIXED (2026-07-23) — mid-dword FTB re-entry; litmus + full arch + SMP boot N2/N4 GREEN at `=1`
+
+Built the mandated per-cycle fetch-state trace (a hart-0 change-detect `$display` of `{pc_fetch_q, ext_pc_q,
+wf_head, wf_count, f0_ftb_hit, ext_pop, ext_taken_redir, …}`, gated on `ICACHE_FETCH_DIRECTED && HART_ID==0`
++ a PC window, DEAD at 0). It pinned ONE root cause underlying BOTH the litmus wedge AND a newly-surfaced
+SMP-boot corruption (SMP boot was never run for B1 before — §25/§25.1 only gated arch+litmus).
+
+**Root cause — mid-dword FTB re-entry.** A commit/early redirect (or an `ext_taken_redir`, or a chained
+*suppressed* taken branch to a mid-dword target) lands MID-dword, PAST the unconditional branch that trained
+the FTB entry for that dword. F0, re-seeded to that dword, FTB-hits and jumps to the (now-irrelevant) trained
+target instead of continuing sequentially. The FTB is dword-granular so it CANNOT know extract entered past
+the branch. Two failure modes:
+- **litmus wedge (trace-confirmed, cy=0x24e–0x259):** loop `90:beqz 9c / 94:addi / 98:j 90`, dwords 0x90=
+  {beqz,addi} 0x98={j,li@9c}. The loop EXIT is a commit redirect to 0x9c (dword 0x98). F0 re-seeds to 0x98,
+  `FTB[0x98]=0x90` (the `j`) → F0 jumps 0x98→0x90, NEVER fetching 0xa0. Extract delivers li@9c then needs
+  0xa0 → head mismatch → STALL. The delivery-gated `ext_buf_mismatch` recovery can't fire during a stall (no
+  `fb_push0`) → deadlock (FIFO fills ping-pong 0x90/0x98, extract's 0xa0 never fetched). hart-0 froze at 0x98,
+  ret=133 — EXACTLY §25.1's symptom.
+- **SMP-boot corruption (data, not a wedge):** if the mid-dword re-entry dword ENDS in a straddling 32-bit
+  instruction (offset-6 low half), extract reads its high half from `wf_data[head+1]` which — after F0's FTB
+  redirect — is the NON-sequential target dword → a WRONG instruction decodes/executes → silent data
+  corruption. In N2 boot this mis-computed a pointer feeding `arch_spin_lock`; hart 0 span forever on a
+  never-free lock (pinned at kernel `0x80025af6`, `c.lw/c.bnez` test-and-set) and never brought up hart 1
+  (stuck at the SBI wait 0x500). A second instance sat in the timekeeping divide path (`0x800dd684`).
+
+**Why only unconditional branches / only mid-dword re-entry:** the FTB trains ONLY on unconditional taken
+branches, which decode ALWAYS takes on a full (offset-0) entry — so F0 and extract agree, and an offset-6
+straddle at a branch dword's tail is never reached on a sequential entry. Divergence is possible ONLY when
+extract enters the dword PAST the branch, which only a redirect (or a suppressed taken branch to a mid-dword
+target) does.
+
+**Fix — three mechanisms, all DEAD/DCE at `ICACHE_FETCH_DIRECTED=0` (byte-identical to shape-W):**
+1. **`f0_no_ftb_q` (the root fix):** gate the FIRST F0 FTB redirect after ANY re-steer (redirect / early /
+   `ext_taken_redir` / `f0_diverged`). The re-entry dword's successor stays SEQUENTIAL → both failure modes
+   closed at the source. (With this, `f0_diverged` fires **0×** on litmus/boot — prevention, not recovery.)
+2. **`head1_seq` + `ext_next_valid` guard:** the across-dword straddle / slot-1 read (`wf_data[head+1]`) is
+   honoured ONLY when head+1 is head's sequential successor (`wf_pc[head+1][63:3] == wf_pc[head][63:3]+1`). A
+   non-sequential head+1 STALLS the straddle (`needs_straddle_slow` → `fetch_ready=0`) instead of decoding a
+   WRONG high half. Covers slot-1 too (its `s1_needs_next` path already gates on `ic_rdata_nv=ext_next_valid`).
+3. **`f0_diverged` (the HINT safety net, §24.4):** a STALL-time recovery — full flush + re-fetch `ext_pc_q`'s
+   dword with `f0_no_ftb_q` set (→ sequential refill) — for (A) a head mismatch and (B) a straddle blocked by
+   a non-sequential head+1. Catches any residual divergence (e.g. a self-modifying-code / `fence.i` FTB
+   staleness corner) the delivery-gated `ext_buf_mismatch` cannot.
+
+**Verification at `=1` (`ICACHE_SYNC_READ=1 + ICACHE_FETCH_DIRECTED=1 + ICACHE_FIFO_BYPASS=0`, the B1-alone body):**
+
+| gate | result |
+|---|---|
+| fast `veryl test` (arch rv64ui/um/ua/uc/mi/si + fp + litmus N2) | **252 / 0** (litmus N2 `cy=0x2e14e0`, no forbidden; `rv64mi_illegal` PASS) |
+| N2 SMP Linux boot (`test_soc_smp_linux_boot_2hart`) | **PASS** (both harts reach SBI shutdown) |
+| N4 SMP Linux boot (`test_soc_smp_linux_boot_4hart`) | **PASS** (all 4 harts, `cy≈0x1d92cd0`) |
+
+So B1 is now **functionally correct at `=1`** — the §25.1 litmus + `rv64mi_illegal` corners AND the boot
+straddle corruption are all closed. Consts reverted to 0; the three mechanisms are committable **DEAD scaffold**
+(same staging as W1/W2/W3 + B1), fast `veryl test` **252/0** byte-identical at the committed default.
+
+**⚠️ IPC caution (deferred to §24.3-Bn — the payoff measurement):** N4 boot at `=1` ran `cy≈0x1d92cd0`
+(~30.9 M) vs the ~16.6 M committed-default baseline — a large cost. The `f0_no_ftb_q` gate fires on EVERY
+redirect (boot has frequent traps/IPIs/context-switches → the FTB prefetch is gated most of the time AND the
+guard/recovery add bubbles), so B1 as implemented is currently **IPC-counterproductive on redirect-dense SMP
+workloads**. Correctness is the milestone here; **the next step is the IPC re-measure (Dhrystone/CoreMark/boot)
+vs the §19-bypass baseline** — B1 must be shown IPC-neutral-or-better BEFORE any default-on flip. Likely tuning:
+gate `f0_no_ftb_q` only when the re-steer target is actually mid-dword (`redirect_pc[2:1] != 0`) so offset-0
+redirect targets keep their prefetch; and/or make the FTB store the branch halfword-offset so F0 can honour a
+redirect that lands at-or-before it. The §25.1-2 bypass↔FTB reconciliation is still deferred (ship BYPASS=0).
