@@ -1012,3 +1012,40 @@ cycle deltas are clean; `=1` = `ICACHE_SYNC_READ=1`, `FD` = `ICACHE_FETCH_DIRECT
    the **bypass↔FTB reconciliation** (gate the bypass off when the pushed dword came from an FTB redirect, or
    make the bypass FTB-aware), NOT more B1 tuning. B1 is now correctness-complete + a small correctly-directed
    IPC gain; the bypass reconciliation is the next real increment before any default-on flip.
+
+### 25.5 ✅ Bypass↔FTB reconciliation is DONE — for FREE via the §25.3 contiguity fix (2026-07-23)
+
+The §25.1-2 B1+BYPASS interaction (`rv64mi_illegal` + `litmus_2hart` both HANG at `FETCH_DIRECTED=1,
+BYPASS=1`) was measured BEFORE the §25.3 fix. Re-testing with the three contiguity mechanisms in place
+(`f0_no_ftb_q` + `head1_seq`/`ext_next_valid` guard + `f0_diverged`) shows the reconciliation **needs no new
+RTL** — the same contiguity invariants that fixed the plain-B1 wedge also close the bypass corner:
+- The bypass (`ext_bypass`) reads the arriving push `wf_push_dword` when `wf_push_pc_q==ext_pc_q`. `f0_diverged(A)`'s
+  in-flight guard `!(wf_push_valid_q && wf_push_pc_q==ext_pc_q)` is the EXACT bypass predicate, so f0_diverged
+  is correctly suppressed while the bypass is delivering ext_pc_q's dword (no double-steer).
+- During a bypass `wf_count≈0`, so the across-dword `head1_seq` guard is masked by its own `wf_count>=2` gate
+  (straddle/slot-1 just wait) — no misfire on the bypass's non-FIFO read.
+- `f0_no_ftb_q` keeps the F0 push stream contiguous through re-entries, so `wf_push_pc_q` genuinely is the
+  dword the bypass claims — the §25.1-2 "F0's push is not the sequential continuation" break is gone.
+
+**Verified at `=1 + FETCH_DIRECTED=1 + ICACHE_FIFO_BYPASS=1`:** fast `veryl test` **252/0** (`rv64mi_illegal`
+PASS, `litmus_2hart` N2 pass — both §25.1 hangs GONE), SMP boot **N2 PASS**, SMP boot **N4 PASS** (`cy≈29.0M`,
+slightly under the bypass-off `~30.9M`).
+
+**Full IPC stack (current tree, instret identical per row ⟹ clean cycle deltas):**
+
+| bench (instret) | `=0` | shape-W (FD0,BYP0) | B1 (FD1,BYP0) | **B1+BYPASS (FD1,BYP1)** |
+|---|---|---|---|---|
+| Dhrystone (264,834) | 231,724 | 301,816 (+30.3%) | 295,025 (+27.3%) | **265,926 (+14.8%)** |
+| CoreMark (374,357) | 347,693 | 392,844 (+13.0%) | 390,572 (+12.3%) | **382,463 (+10.0%)** |
+
+So the **bypass is the dominant IPC lever** (Dhry +30.3%→+14.8%), and **B1 stacks on top of it** — B1+BYPASS
+beats §23's bypass-only shape-W (Dhry 268,409/+15.8% → 265,926/+14.8%; CoreMark 384,308/+10.5% → 382,463/+10.0%)
+because B1 additionally removes the taken-branch refill flush the bypass alone still pays. **The full B1+BYPASS
+bundle is now FUNCTIONALLY VIABLE** (the §25.1-2 blocker is cleared) and is the best-IPC correct config.
+
+**Residual + next:** B1+BYPASS is still **+10-15%, NOT the §22/§24 IPC-neutral goal.** The residual is the
+shape-W read-latency the bypass cannot fully hide (a demand-fetch that misses the FIFO AND is not the arriving
+push still pays the register round-trip). Closing the last +10-15% is a deeper fetch-structure question (widen
+the bypass window / a 2nd fetch-ahead entry / prefetch depth), not a B1 or bypass-reconciliation issue. For a
+default-on decision the bundle is now a clean **+10-15% IPC for a real clocked-SRAM icache** — a user call on
+whether that trade (real SRAM macro vs 2R2W) is worth it, or whether to chase IPC-neutral first (§24.3-Bn).
