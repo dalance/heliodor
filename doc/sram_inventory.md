@@ -39,32 +39,30 @@
 >
 > Full knob map (live / dead-scaffold / bisect): **`doc/pipeline_knob_registry.md`**. Campaign status +
 > target revision: `deep_pipeline_status_and_replan.md` §8.2. The caches are on realistic 1RW/1R1W SRAM;
-> the remaining un-flipped folds (L2 read-1R1W, predictor/icache-data sync) are documented DEAD
-> scaffolds for the front-end/L2 follow-on, not gaps in the shipped design. (ALL cache tags — D$ /
-> icache / L2 — are now 1R1W via replication
-> via replication — the last D$ multi-port array is gone.)
+> **icache-data sync-read is now SHIPPED default-on (2026-07-23, §1 below)** — every big data array (D$ /
+> L2 / icache) reads at a registered address = a real clocked SRAM. The remaining un-flipped folds (L2
+> read-1R1W, predictor sync) are documented DEAD scaffolds for the L2/front-end deep-pipeline follow-on
+> (a CP/pipelining axis, NOT a port-count or clocked-SRAM realism gap). (ALL cache tags — D$ / icache /
+> L2 — are now 1R1W via replication — the last D$ multi-port array is gone.)
 >
 > ### 🔎 Remaining realistic (post icache-data 1R1W, 2026-07-22) — for the next session
 > **Port-count: DONE.** Every migratable RAM in `heliodor_core` is 1R1W; only keep-flop `mmu.v1_ppn`
 > (32×44 1R3W) + `iq_int.ops` (8×309 2R2W) are non-1R1W (both below SRAM-compiler minimum / on a
 > critical path → flop-territory, not targets). The genuinely-remaining realistic items:
-> 1. **Synchronous-read for the BIG data arrays.** A compiled SRAM is *clocked* — it samples the
->    address at the edge (sense-amps clock-strobed), so a **combinational read whose address changes
->    mid-cycle** can't map to it (→ register file / latch array). A read with a **registered** address
->    IS a flow-through SRAM (the flow-through-vs-registered-output choice is then just access-time). D$
->    data + L2 data already have registered-address reads (`DCACHE_SYNC_READ=1` / `L2_SYNC_READ=1`).
->    **icache data (128 Kbit, the new `128×256 1R1W`) still reads at a combinational index** (`pc_q`→MMU
->    →index, consumed same cycle) → clocked-SRAM realism wants it registered = a fetch stage
->    (`ICACHE_SYNC_READ=0` DEAD scaffold), coupled to the fetch-decouple / deep-pipeline program
->    (net-negative alone). This is THE remaining big-array realism gap. **UPDATE 2026-07-22: the
->    sync-read (registered = real clocked SRAM) structure is BUILT + VERIFIED-READY on this
->    `128×256 1R1W` tree** — flipping `ICACHE_SYNC_READ=1` (the shape-W word-granular decoupled fetch)
->    fast-gates **252/0** (arch + litmus N2) + **N2 SMP boot PASS** on the current repacked data array
->    (`cp_icache_fetch_decouple_plan.md §23`: the repack + sync-read compose — the dword-aligned F0
->    stream's next word is always in-block). So the realistic *structure* (128×256 1R1W read
->    synchronously) is proven; it stays **banked at `=0`** because `FETCH_REG=1` masks the front-end
->    cone → default-on adds 0 CP + pays the shape-W IPC cost (net-negative solo). Making the flip a real
->    win = **(b) fetch-directed prefetch** (`§22` next front), the big front-end redesign.
+> 1. **✅ Synchronous-read for the BIG data arrays — DONE (2026-07-23, icache SHIPPED default-on).**
+>    A compiled SRAM is *clocked* — it samples the address at the edge (sense-amps clock-strobed), so a
+>    **combinational read whose address changes mid-cycle** can't map to it (→ register file / latch
+>    array); a **registered**-address read IS a flow-through SRAM. D$ data + L2 data had registered
+>    reads (`DCACHE_SYNC_READ=1` / `L2_SYNC_READ=1`); **icache data was the LAST big-array gap** (it read
+>    at a combinational index). **Now closed:** `ICACHE_SYNC_READ=1` shipped default-on as part of the
+>    B1+B2a+BYPASS fetch-directed-prefetch bundle (`cp_icache_fetch_decouple_plan.md §27`,
+>    `feat(icache) 3f5681d`) — the icache demand read is now registered-address = a real clocked-SRAM
+>    macro. The §22 net-negative-solo problem was solved by making the flip a genuine win: B1/B2a F0
+>    fetch-directed prefetch removes the taken-refill bubble, so the bundle costs only **~+8 % IPC**
+>    (Dhry +8.5 % / CoreMark +7.9 % / SMP-boot N2 +7.5 %) for a real clocked-SRAM icache. Full regression
+>    GREEN incl. Verilator N2 boot (bit-identical completion cycle to the Veryl sim). **So ALL three big
+>    data arrays (D$ data, L2 data, icache data) now read at a registered address — the clocked-SRAM
+>    realism is complete for every big array.**
 > 2. **Small arrays (tags 64×52, predictors) are fine as register files** (async-read RF is a realistic
 >    impl below the SRAM-compiler efficiency floor) — their sync-read is a CP/structure axis, NOT a
 >    realism gap. Do not chase it for realism's sake.
