@@ -20,7 +20,7 @@ build.sh   one-toolchain build of a variant
 toolchain/fetch.sh linux && source toolchain/env.sh   # pinned linux-gnu gcc (binutils 2.43)
 # put the matching kernel source at test/linux/src/<ver>/ (gitignored), then:
 test/linux/build.sh 71v        # variant: 515 | 66 | 71 | 71v
-veryl test --ignored --test test_soc_linux_boot_71v    # expect x3 == 0xAA
+veryl test --ignored --test test_soc_71v_linux_boot    # expect x3 == 0xAA
 ```
 
 `build.sh` builds /init + initramfs, the kernel `Image`, the DTB, the firmware

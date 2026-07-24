@@ -135,7 +135,7 @@ own type-1 hypervisor. See **Verification**.
 | Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~10.2 / 13.9 / 20.0 / 26.9M cycles) |
 | Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~18.6 / 25.5 / 33.6M cycles) |
 | Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~16.8 / 19.2 / 23.6M cycles) |
-| Linux **7.1 + Vector** boot (`test_soc_linux_boot_71v`, V-aware kernel)      | pass (~17.8M cycles, 1-hart) |
+| Linux **7.1 + Vector** boot (`test_soc_71v_linux_boot`, V-aware kernel)      | pass (~17.8M cycles, 1-hart) |
 | **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (~21.4M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
@@ -147,7 +147,7 @@ Phase-11 hypervisor directed tests (two-stage walk, guest-page-faults, HLV/HSV
 and their mode-traps, Sstc-in-VS, VS-mode CSR isolation, `VTVM`/`VTSR`,
 non-delegated VS interrupts, `mtval2`, and an end-to-end mini-hypervisor). The
 Linux boots are `#[ignore]`d (run them by name, e.g.
-`--test test_soc_smp_linux_boot_71_2hart`, or `--test test_soc_hvlinux` for the
+`--test test_soc_71_smp_linux_boot_2hart`, or `--test test_soc_hvlinux` for the
 guest boot); the 7.1 kernel is built with `CONFIG_FPU=y`, so its boot drives the
 FP unit through real kernel context switches. The boot is additionally
 cross-checked on Verilator and a second codegen backend (cc / cranelift) — see
@@ -211,8 +211,8 @@ upstream Veryl. Then from the project root:
 veryl test                                                  # unit + arch suites + directed tests
 veryl test --ignored --test test_soc_linux_boot             # 1-hart Linux 5.15 boot
 veryl test --ignored --test test_soc_smp_linux_boot_4hart   # 4-hart SMP Linux 5.15 boot
-veryl test --ignored --test test_soc_smp_linux_boot_66_2hart # 2-hart SMP Linux 6.6 boot
-veryl test --ignored --test test_soc_smp_linux_boot_71_2hart # 2-hart SMP Linux 7.1 boot (RVA23 + FP)
+veryl test --ignored --test test_soc_66_smp_linux_boot_2hart # 2-hart SMP Linux 6.6 boot
+veryl test --ignored --test test_soc_71_smp_linux_boot_2hart # 2-hart SMP Linux 7.1 boot (RVA23 + FP)
 veryl test --ignored --test test_soc_hvlinux                 # guest Linux under a type-1 hypervisor (H ext, two-stage MMU)
 ```
 

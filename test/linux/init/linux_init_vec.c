@@ -1,4 +1,4 @@
-/* /init for the heliodor V-enabled Linux boot test (test_soc_linux_boot_71v).
+/* /init for the heliodor V-enabled Linux boot test (test_soc_71v_linux_boot).
  *
  * Same as linux_init.c (raw syscalls, no libc) but adds a USER-SPACE RISC-V
  * Vector self-test. The kernel was built with CONFIG_RISCV_ISA_V=y +
