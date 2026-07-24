@@ -1153,7 +1153,11 @@ pub module heliodor_core #(
     let pred_next_pc1   : logic<64> = if predicted_taken1 ? pred_target1 : s1_pc + s1_len;
     // slot-1 delivery eligibility. slot-0 must be a clean (non-straddle, non-
     // fault) delivery that was NOT predicted taken (else slot-1 is wrong-path).
-    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && !predicted_taken;
+    // F1 order-item-3 (A): at PRED_OVERRIDE=1 there is NO Stage-A prediction (predicted_taken
+    // here reads the STALE clocked output), so slot-1 is produced optimistically (assume slot-0
+    // not-taken) and SQUASHED at Stage-B if slot-0 resolves taken. Drop the !predicted_taken gate
+    // then. Byte-identical at 0 (the term folds back in via `!PRED_OVERRIDE`).
+    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && (PRED_OVERRIDE || !predicted_taken);
     // slot-1 needs the next word (rdata_next) unless it is an RVC sitting in the
     // slot-0 word (b1==1 && rvc). Using the next word requires it be in the SAME
     // cache line (→ same page as slot-0, so slot-1's fetch can't fault separately).
@@ -1207,6 +1211,32 @@ pub module heliodor_core #(
     let sb_ops       : logic<4> = if a_push1 ? 4'd2 : 4'd1;
     let sb_drain     : logic    = PRED_PIPE && a_valid && (fb_free >= sb_ops);
     let sb_can_accept: logic    = !a_valid || sb_drain;
+    // Stage-B (drain-cycle) resolved prediction. At PRED_OVERRIDE=1 the clocked predictor outputs
+    // (btb_hit/bht_taken/tage_*/ibtb_*/ras_spec_top → predicted_taken/pred_target above) are read
+    // combinationally on ic_pc=ext_pc_q, which on the bundle's ALIGNED drain cycle (T+1, one after
+    // Stage-A presented it) equals pred(a_pc). Only the fall-through PC is recomputed from the
+    // CAPTURED a_pc/a_s1_pc (the live pred_next_pc_bp uses ic_pc=ext_pc_q, already advanced past the
+    // held bundle). sb_next0/1 are the Stage-B next-PC used by the fb write / override. DEAD at 0.
+    //
+    // HOLD-DRIFT approximation (variant A): if the skid HOLDS a bundle > 1 cycle (fb full), Stage-A
+    // freezes ext_pc_q at the NEXT sequential PC, so the clocked outputs drift to pred(next) — the
+    // held bundle then resolves with its successor's prediction. This is ACCURACY-ONLY, never a
+    // correctness bug: every predictor output feeds only the speculative fetch path (fb next-PC,
+    // override, RAS, spec-history, FTB-train), all validated + corrected at commit. In practice a
+    // drifted branch ≈ predicted not-taken (the successor PC is usually not a BTB branch → sequential
+    // = the held bundle's own fall-through). Freezing the predictor output register during a hold
+    // (a per-module read-enable) would remove the drift; deferred — measure its IPC cost at 3a.4
+    // first (a combinational re-present of a_pc is impossible here: it closes a spurious comb loop
+    // pred-index → sb_hold → fb_free → rename_fire2 → slot1_valid → predicted_taken → pred-index that
+    // the FETCH_REG=1-dead fb_bypass2/fb_fall terms keep symbolically live).
+    let a_len0  : logic<64> = if a_is_rvc0 ? 64'd2 : 64'd4;   // slot-0 length (straddle/32b = 4)
+    let a_s1_len: logic<64> = if a_s1_is_rvc ? 64'd2 : 64'd4; // slot-1 length
+    let sb_next0: logic<64> = if predicted_taken  ? pred_target  : a_pc + a_len0;
+    let sb_next1: logic<64> = if predicted_taken1 ? pred_target1 : a_s1_pc + a_s1_len;
+    // Slot-1 is KILLED at Stage-B when slot-0 resolved taken (slot-1 is past the taken branch →
+    // wrong-path); the fb slot-1 write + count/tail advance suppress it, and the override re-steers
+    // to slot-0's target. DEAD at 0.
+    let sb_slot1_kill: logic = PRED_OVERRIDE && predicted_taken;
     // Phase 8 S4a.3: 2-wide push. fb_push0 = the slot-0 delivery (== the S4a.2
     // single push); fb_push1 = the slot-1 delivery (needs slot1_valid + room for
     // a 2nd record). slot-0 pushes to fb_tail, slot-1 to fb_tail+1.
@@ -1821,7 +1851,10 @@ pub module heliodor_core #(
     // (fb_push0/fb_push1). Byte-identical at 0 (the mux folds to the live push). The per-field
     // data-source muxes below fold likewise, so =0 emits today's exact write.
     let fb_wr0: logic = if PRED_PIPE ? (sb_drain && a_push0) : fb_push0;
-    let fb_wr1: logic = if PRED_PIPE ? (sb_drain && a_push1) : fb_push1;
+    // F1 order-item-3 (A): the drained slot-1 is suppressed when slot-0 resolved taken at Stage-B
+    // (sb_slot1_kill) — it sits past the taken branch. Folds to the order-item-2 form at
+    // PRED_OVERRIDE=0 (sb_slot1_kill const-false) → byte-identical.
+    let fb_wr1: logic = if PRED_PIPE ? (sb_drain && a_push1 && !sb_slot1_kill) : fb_push1;
     // Phase 8 S4a: fetch buffer (decode queue). The fetch engine pushes a clean
     // record (fb_push) and rename drains the head (fb_pop). The head is exposed
     // combinationally on the if_*_q names every downstream stage already reads.
@@ -1852,9 +1885,13 @@ pub module heliodor_core #(
                 fb_iacc[fb_tail]         = if PRED_PIPE ? a_iacc : ic_iacc;
                 fb_ifault_gstage[fb_tail] = if PRED_PIPE ? a_gstage : ic_gstage;
                 fb_ifault_gpa[fb_tail]   = if PRED_PIPE ? a_gpa : ic_gpa;
-                fb_pred_next_pc[fb_tail] = if PRED_PIPE ? a_pred_next_pc0 : pred_next_pc_bp;
+                // F1 order-item-3 (A): at PRED_OVERRIDE=1 the delivered prediction is resolved at
+                // Stage-B from the clocked outputs (sb_next0) + the live folded direction (aligned
+                // to a_pc at the drain); a_pred_index0 stays the Stage-A fetch-time index (correct).
+                // Both fold to the order-item-2 forms at 0 → byte-identical.
+                fb_pred_next_pc[fb_tail] = if PRED_OVERRIDE ? sb_next0 : (if PRED_PIPE ? a_pred_next_pc0 : pred_next_pc_bp);
                 fb_pred_index[fb_tail]   = if PRED_PIPE ? a_pred_index0 : bht_lk_index;
-                fb_ghr_fold[fb_tail]     = if PRED_PIPE ? a_ghr_fold0 : (btb_hit && btb_is_cond);
+                fb_ghr_fold[fb_tail]     = if PRED_OVERRIDE ? (btb_hit && btb_is_cond) : (if PRED_PIPE ? a_ghr_fold0 : (btb_hit && btb_is_cond));
             }
             // Phase 8 S4a.3: slot-1 record into fb_tail+1. slot-1 is delivered
             // only on a clean, non-faulting, not-predicted-taken slot-0, so its
@@ -1867,9 +1904,9 @@ pub module heliodor_core #(
                 fb_iacc[fb_tail1]         = 1'b0; // slot-1 same page as slot-0 → no PMP fault
                 fb_ifault_gstage[fb_tail1] = 1'b0; // slot-1 never faults (same page as slot-0)
                 fb_ifault_gpa[fb_tail1]   = 64'd0;
-                fb_pred_next_pc[fb_tail1] = if PRED_PIPE ? a_pred_next_pc1 : pred_next_pc1;
+                fb_pred_next_pc[fb_tail1] = if PRED_OVERRIDE ? sb_next1 : (if PRED_PIPE ? a_pred_next_pc1 : pred_next_pc1);
                 fb_pred_index[fb_tail1]   = if PRED_PIPE ? a_pred_index1 : bht_lk_index1;
-                fb_ghr_fold[fb_tail1]     = if PRED_PIPE ? a_ghr_fold1 : (btb_hit2 && btb_is_cond2);
+                fb_ghr_fold[fb_tail1]     = if PRED_OVERRIDE ? (btb_hit2 && btb_is_cond2) : (if PRED_PIPE ? a_ghr_fold1 : (btb_hit2 && btb_is_cond2));
             }
             fb_tail = fb_tail + (if fb_wr0 ? (if fb_wr1 ? 3'd2 : 3'd1) : 3'd0);
             // Phase 8 S4b: 2-wide drain. fb_pop2 (== rename_fire2) drains the
