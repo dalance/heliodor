@@ -14,8 +14,10 @@ A 2-wide superscalar, PRF-based out-of-order core (Tomasulo + physical register
 file, 32-entry ROB, branch prediction) with non-blocking write-back L1 caches kept
 coherent through a MESI-directory L2, Sv39 virtual memory, and 1/2/4/8-hart SMP. A
 decoupled in-order **vector unit** (RVV 1.0, VLEN = 128) and the hypervisor's
-**two-stage MMU** sit alongside the scalar OoO datapath; the **Architecture**
-section below describes the design in full.
+**two-stage MMU** sit alongside the scalar OoO datapath. Every cache RAM is a
+**tapeout-realistic clocked-SRAM macro** (1R1W / 1RW port shapes, registered-address
+reads); the icache runs a **fetch-directed prefetcher** (FTB) that keeps the clocked
+read's cost to ~+8 % IPC. The **Architecture** section below describes the design in full.
 
 It is machine-checked against the official RISC-V Architectural Compliance Tests
 (`riscv-arch-test` / ACT4, Sail golden reference) and validated by booting mainline
@@ -98,7 +100,11 @@ own type-1 hypervisor. See **Verification**.
   - L1 I-cache: 16 KB, 4-way, 64 B line, tree-PLRU, non-blocking
     (hit-under-fill, streaming), single-cycle assembly of instructions
     straddling a line boundary; fills coherently through the L2 (recall-on-owned)
-    so self-modified code is seen after a FENCE.I with no flush sweep
+    so self-modified code is seen after a FENCE.I with no flush sweep. The demand
+    read is a **synchronous (registered-address) clocked-SRAM** access decoupled
+    behind a **fetch-directed prefetcher** (an FTB that steers F0 to unconditional
+    and strongly-taken conditional branch targets ahead of extract), so the clocked
+    read costs only ~+8 % IPC
   - L1 D-cache: 16 KB, 4-way, 64 B line, write-back with a MESI-style inclusive
     L2 directory (per-line ownership, read-for-ownership store fills, dirty
     writeback / recall on eviction; full-line stores stay posted write-through),
@@ -113,6 +119,13 @@ own type-1 hypervisor. See **Verification**.
     beat, L2 miss ≈ 30 (DRAM wait + 8-beat gather), one outstanding line read
     per hart progressing independently; writes stay 1-cycle posted
     write-through and contend with gathers for the DRAM port
+  - **Realistic SRAM (Phase 13):** every cache array — D$ / icache / L2 tags and
+    data — is a real ASIC-SRAM port shape (**1R1W** via read-port replication for
+    tags, byte-write-enable write-collapse + registered-address read for the data
+    arrays), so all three big data arrays read at a **clocked** address. A `veryl
+    synth --dump-area` sweep confirms every migratable block is 1R1W at both core
+    and SMP-SoC scope (only two below-SRAM-floor arrays stay flop). See
+    `doc/sram_inventory.md`
 - **SMP** (`heliodor_soc_smp #(N_HARTS = 1 / 2 / 4 / 8)`)
   - N private cores share one `memory_bus` DRAM arbiter (independent read /
     write channels), the L2, and the CLINT / PLIC / UART
@@ -226,7 +239,7 @@ steps, Verilator cross-check).
 ## Development Phases
 
 Development history — the **Architecture** section above describes the design
-as of Phase 12:
+as of Phase 13:
 
 | Phase | Scope                                    | Status       |
 |-------|------------------------------------------|--------------|
@@ -239,9 +252,10 @@ as of Phase 12:
 | 7     | Clean-slate OoO redesign: a from-scratch 1-wide pure-Tomasulo + PRF core that replaces the earlier OoO datapath, re-validated to RV64GC + 1/2/4-hart SMP Linux boot | complete |
 | 8     | Microarchitecture build-out on the Phase 7 core: 2-wide superscalar (fetch / rename / issue / commit), branch prediction (BTB + gshare + TAGE-lite + indirect BTB + RAS, execute-time early redirect), non-blocking L1s (MSHRs, hit-under-miss, critical-word-first), memory-dependence speculation + replay, committed-store buffer with line write-combining and store-to-load forwarding, split read/write bus channels — 1-hart boot 26M → 8.6M cycles, 4-hart 52M → 16M | complete |
 | 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller + line-granular L2 (P9.1), write-back D$ + MESI inclusive directory (P9.2), cache-to-cache transfer + in-cache AMO/LR-SC (P9.3), N=8 SMP boot (P9.4), PLIC wiring + uncached MMIO + TLB ASID + selective SFENCE.VMA (P9.5), coherent instruction side — I-cache + I-PTW through L2, FENCE.I/SFENCE flush sweep retired (P9.6) | complete |
-| 10    | RVA23-profile ISA extensions (vector V / hypervisor H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, hint bundle (Zihintpause/Zihintntl/Zicbop/Zimop/Zcmop), Zcb, system bundle (Zawrs/Svinval/Zkt), MMU bundle (Svnapot/Svpbmt/Svadu), Zfhmin, Sscofpmf, Supm/Ssnpm. Validated on real mainline kernels: upgraded the boot from 5.15 to the 6.6 LTS and 7.1, which discover the extensions from the device tree and exercise them (Sstc timer, Svpbmt ioremap, Zicboz clear_page, Zbb, hardware unaligned). Enabling userspace FP on 7.1 exposed and fixed two SMP-only RTL bugs — an FP-context-switch wedge (MSHR int-load completion misclassified FP-dest on the CDB mux) and missing compressed FP load/store (C.FLD/C.FSD/C.FLDSP/C.FSDSP) | complete |
-| 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation with a VMID/VS-ASID-tagged TLB, HLV/HLVX/HSV (+ mode-traps), the guest-page-fault trio (20/21/23) with htval/mtval2, virtual-interrupt delivery (hvip into VS + non-delegated VS interrupts taken by HS), htimedelta + Sstc-in-VS guest timers, hstatus.VTVM/VTSR guest-op interception, VS-mode CSR isolation, and the mideleg/hedeleg read-only conformance bits. Brought up incrementally against per-feature directed tests, then validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (cross-checked on the Veryl sim and Verilator). The vector V family lands in Phase 12 | complete |
-| 12    | **Vector (V) extension (RVV 1.0)** — completing the RVA23 profile — plus full **architectural-compliance verification**. Added a decoupled, in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL): `vset{i}vl{i}`, integer / FP arithmetic (incl. multiply/divide, compares/merge, widening/narrowing, reductions), masking, and unit-stride / strided / indexed / segment / fault-only-first loads & stores; a V-enabled 7.1 kernel discovers and exercises it. The vector unit is verified by heliodor's inline **RVV arch suites** (`tb/test_arch_common.veryl`); the **scalar** RVA23 profile is machine-checked against the official RISC-V Architectural Compliance Tests (ACT4 / `riscv-arch-test`, Sail golden reference — which has no vector suite) across integer / atomic / FP / compressed / CSR / Zb\* / Zc\* / Zfa / Zfhmin / Zicbo\* / PMP / Sv\* / Exceptions. The compliance pass closed the scalar atomic gaps it surfaced (**Zabha** byte/half AMO, full **Zacas** incl. the 128-bit `amocas.q`), added **PMP** (Smpmp / SvPMP) region enforcement (load/store/fetch/AMO + PTE walks, PMA-hole faults), and fixed numerous real **FPU** bugs and several **Veryl simulator/analyzer bugs — fixed and upstreamed** to veryl-lang/veryl, so heliodor now builds on pristine upstream Veryl. See `test/act/README.md` | complete |
+| 10    | **RVA23-profile scalar ISA extensions** (V / H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, Zfhmin, Sscofpmf, Supm/Ssnpm, and the hint / Zcb / system / MMU (Svnapot/Svpbmt/Svadu) bundles. Validated by upgrading the boot from 5.15 to mainline **6.6 LTS** and **7.1**, which discover the extensions from the device tree and exercise them; enabling userspace FP on 7.1 exposed and fixed two SMP-only FP-context RTL bugs | complete |
+| 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation (VMID/VS-ASID-tagged TLB), HLV/HLVX/HSV, the guest-page-fault trio, virtual-interrupt delivery, htimedelta + Sstc-in-VS guest timers, and VS-mode CSR isolation. Validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (Veryl sim + Verilator) | complete |
+| 12    | **Vector (V) extension (RVV 1.0)** — a decoupled in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL; full arithmetic + masking + unit-stride / strided / indexed / segment / fault-only-first load-store), exercised by a V-enabled 7.1 kernel and inline **RVV arch suites** — plus **RVA23 architectural-compliance** verification against the official ACT4 (`riscv-arch-test`, Sail golden reference). The compliance pass closed scalar atomic gaps (**Zabha**, full **Zacas** incl. `amocas.q`), added **PMP** (Smpmp / SvPMP) enforcement, and fixed real FPU bugs + upstreamed several **Veryl** simulator/analyzer fixes. See `test/act/README.md` | complete |
+| 13    | **Realistic-SRAM migration + near-term deep-pipeline CP** (tapeout realism): every cache RAM (D$ / icache / L2 tags + data) migrated to real ASIC-SRAM port shapes — **1R1W** (tag read-port replication, data byte-write-enable write-collapse) with **registered-address (clocked) reads** for the three big data arrays (a `--dump-area` sweep confirms all migratable blocks 1R1W, core + SMP-SoC). The icache clocked read shipped **default-on** behind a **fetch-directed prefetcher** (FTB) at **~+8 % IPC**, cross-checked byte-identical on Verilator; near-term **~12 ns CP** met. See `doc/sram_inventory.md`, `doc/cp_icache_fetch_decouple_plan.md` | complete |
 
 ## References
 
