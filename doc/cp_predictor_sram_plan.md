@@ -218,6 +218,136 @@ carried-index proof is unaffected (older ops all committed).
 Best started in a clean, focused context (large multi-file restructure of the most
 delicate, already-tuned fetch logic — same guidance §8.1 gave for R1).
 
+## order-item-3 design analysis (2026-07-24, audited against the RTL)
+
+Auditing the SYNC_READ scaffold + the extract datapath resolved *how* step 3 (flip
+predictors clocked) actually lands. Three findings changed the step-3/step-4 framing:
+
+**Finding 1 — flipping `*_SYNC_READ=1` REQUIRES the authority inversion; there is no
+"L1 half-step".** The scaffold registers the read OUTPUT, not the address
+(`btb.veryl:104` `r0_q = r0`, `lk_idx` combinational on `i_pc`). So at =1 EVERY core
+consumer of `btb_hit`/`bht_taken`/`tage_*`/`pred_next_pc_bp` sees the read of
+`ic_pc`(T-1), a cycle stale. The Stage-A steer (`ext_taken_redir`, the `ext_pc_q`
+advance to `ext_next_pc`, `ext_pop`, RAS push/pop, spec-history, FTB-train — all at T,
+`heliodor_core.veryl:1462/1497/1556/1660`) would apply a stale prediction. Moving the
+consumers to Stage-B (T+1, where the registered read matches `a_pc`) forces Stage-A to
+advance `ext_pc_q` at T on something *available at T* — NOT the clocked predictor —
+else it re-presents the same `ext_pc_q` and the clocked read is a duplicate (1 advance
+per 2 cycles = half throughput). A Stage-A speculative advance + a Stage-B override IS
+the authority inversion. Step 3 (clock the arrays) and step 4 (override redirect) are
+therefore inseparable — one change, not two.
+
+**Finding 2 — the Stage-A fast path needs a per-PC predictor the core does not have.**
+The FTB (`ICACHE_FETCH_DIRECTED`) is per-DWORD and a fetch-prefetch hint only, and it
+EXCLUDES returns + indirects (`heliodor_core.veryl:1746` `!btb_is_ret && !btb_is_ind`).
+It cannot supply the per-instruction taken/target the extract advance needs. If Stage-A
+advances with only "sequential + computed direct-JAL target" guesses (no fast BTB/BHT),
+then every taken conditional (~10 % of insns), every return, and every indirect pays a
++1 Stage-B override bubble → likely **>+10 % cycles, over the ~+8 % budget**. The
+classic fix is a fast L0 structure (micro-BTB + fast bimodal) read combinationally at
+Stage-A that the big clocked BTB/TAGE overrides — but that is a NEW structure to build.
+
+**Finding 3 — RAS/return timing.** The RAS resolves at Stage-A today (0-bubble return
+prediction, `:1331/1084`). In the inversion it moves to Stage-B (+1 per return) unless a
+fast-RAS peek is retained at Stage-A. Returns are frequent, so this alone is a few %.
+
+### Design options for order-item-3 (the fork)
+
+- **(A) Accept the bubbles — pure clocked arrays, minimal new logic.** Stage-A advances
+  sequentially + computed direct-JAL target; Stage-B (clocked BTB/BHT/TAGE/iBTB + RAS)
+  is authoritative and overrides on any taken-cond / return / indirect (+1 each). Fully
+  clocks all four arrays (truest "structural"), smallest diff, WORST IPC — measure the
+  true cost; it also quantifies exactly how much fast-path option (B) must recover.
+- **(B) Build an L0 fast predictor.** Add a per-PC fast BTB + fast bimodal (small
+  async-read RF, realistic) at Stage-A for the 0-bubble common case; the clocked
+  BTB/TAGE override only on disagreement. Best IPC, most new logic, biggest design.
+- **(C) Clock TAGE-output only (partial).** TAGE is already the register-file array
+  (never SRAM); registering only its OUTPUT while BTB/BHT keep their combinational Stage-A
+  read is a smaller, lower-value partial step that does NOT clock the big SRAM-shaped
+  arrays — rejected as "structural completion" but available as a stopgap.
+
+**Recommendation:** (A) first, as the honest structural baseline that fully clocks the
+arrays and MEASURES the real IPC cost; then (B) only if (A) exceeds the +8 % budget. (A)
+is also the smaller first increment and its measured bubbles size the fast path.
+
+### DECISION (user, 2026-07-24): (A) bubble-tolerant baseline first.
+
+### (A) implementation recipe — SIMPLE variant (FTB-off, cleanly measurable)
+
+The clean-measurement trap: keeping the F0 FTB while Stage-A advances sequentially is
+INCONSISTENT (F0's FIFO holds FTB-taken target dwords; a sequential Stage-A reads the
+wrong ones) — reconciling that IS the hard FIFO-follow logic we are deferring. So the
+SIMPLE (A) gates the F0 FTB OFF under the override, making F0 + Stage-A both purely
+sequential. The FTB-loss does NOT muddy the measurement: isolate it with the existing
+`ICACHE_FETCH_DIRECTED` knob —
+
+    inversion-cost = cyc(override=1, FTB=0)  −  cyc(order-item-2, FTB=0)
+
+both terms FTB-off, so the delta is the pure authority-inversion (taken-branch refill)
+cost. (Then (B) recovers it with a fast path; the FTB itself is one candidate fast path.)
+
+New knob: `const PRED_OVERRIDE: bit = 0;` (requires `PRED_PIPE` — the skid is the
+Stage-A/B substrate the override rides on). At =1 it also forces the four
+`{BTB,BHT,TAGE,IBTB}_SYNC_READ=1` (clocked) and gates `ICACHE_FETCH_DIRECTED`'s F0
+redirect off. DEAD at 0 (every new branch under `if PRED_OVERRIDE` → byte-identical).
+
+Mechanics at PRED_OVERRIDE=1:
+1. **Clocked predictors.** `{BTB,BHT,TAGE,IBTB}_SYNC_READ` couple to PRED_OVERRIDE, so
+   the module outputs (`btb_hit`/`bht_taken`/`tage_*`/`ibtb_*`) are the read of
+   `ic_pc`(T-1) — i.e. they now correspond to `a_pc` when consumed at Stage-B (T+1).
+2. **Stage-A (T) — no prediction.** Pop the WORD FIFO head, assemble the bundle
+   (`a_s0`/`a_s1`, RVC/straddle), present `ext_pc_q` to the clocked predictors, and
+   advance `ext_pc_q` PURELY SEQUENTIALLY (`ic_pc + pc_advance`, and slot-1 sequential
+   `s1_pc + s1_len`) — never take a branch here. Capture the raw bundle into the a_*
+   skid (already present). `ext_pop` follows the sequential advance. NO F0 steer, NO RAS
+   push/pop, NO spec-history update at Stage-A.
+3. **Stage-B (T+1) — predict + override.** The clocked outputs now match `a_pc`. Compute
+   `predicted_taken`/`pred_next_pc_bp` (+ slot-1) HERE. Write the fetch buffer with the
+   resolved prediction (as today). Do the RAS push/pop, spec-history (`spec_ghr`/
+   `spec_ghr_l`/`spec_ind_hist`) update, and FTB-train HERE (all keyed on the Stage-B
+   delivery). If `predicted_taken` (slot-0) or slot-1-taken → OVERRIDE: redirect F0 to
+   the target ({target[63:3],0}), flush the WORD FIFO + fetch-buffer entries younger than
+   this bundle, and re-steer `ext_pc_q` to the target. F0 refills from the target (icache
+   latency = the taken-branch bubble). Commit/early redirect keep priority.
+4. **F0 FTB off.** `f0_ftb_hit`/`ext_taken_redir`/`ext_buf_mismatch`/`f0_diverged` fold
+   away (FTB gated) so F0 is a plain sequential stream; the override redirect above is the
+   only extract→F0 steer. This removes the delicate FTB reconciliation from the =1 path.
+
+Known subtleties (discover/handle at implementation):
+- **spec-history 1-cycle staleness**: back-to-back branches — bundle N+1's Stage-A read
+  index uses `spec_ghr` before bundle N's Stage-B update lands (a common real-pipe
+  approximation; bypass if it measurably hurts). The commit-train carried-index proof is
+  unaffected (older ops all committed).
+- **RAS ordering**: push/pop now at Stage-B; the 1-deep skid means at most one bundle
+  in flight between the RAS read and its update — verify a call immediately followed by
+  its return (skid-adjacent) still nests correctly (may need a Stage-A→B bypass).
+- **straddle / slot-1**: unchanged datapath, but slot-1's taken-override and the
+  straddle 2-cycle path must re-time onto the Stage-B resolve.
+- **override flush vs skid**: the a_* skid holds the CURRENT bundle (being delivered);
+  the override flushes YOUNGER state (WORD FIFO + fb), not the delivering bundle itself.
+
+### (A) increment decomposition (each a verified step; DEAD at 0 until the flip)
+
+- **3a.1 + 3a.2 [done, verified — `veryl test` 252/0 byte-identical]** Declared
+  `const PRED_OVERRIDE: bit = 0;` (with the full (A) design comment) next to `PRED_PIPE`,
+  and wired the Stage-A SEQUENTIAL advance: `ext_seq_next = fb_push1 ? s1_pc+s1_len :
+  ic_pc+pc_advance`, `ext_eff_next = if PRED_OVERRIDE ? ext_seq_next : ext_next_pc`, with
+  `ext_pop` + the `ext_pc_q` advance now following `ext_eff_next`. Every arm folds to
+  today's `ext_next_pc` at 0 (const-fold) → byte-identical. NOTE the substrate is thin —
+  order-item-2's a_* skid is reused; Stage-B recomputes the prediction from the CLOCKED
+  module outputs (which auto-align to `a_pc` once `*_SYNC_READ=1`), and reuses the already
+  -captured `a_pred_index0`/`a_ghr_fold0` for the commit-carried index. No new capture regs
+  for the prediction itself; RAS/spec-history bypass regs (if needed) are discovered in 3a.3.
+  Slot-1 caveat carried to 3a.3: `ext_seq_next` still uses `fb_push1`, whose `slot1_eligible`
+  gates on `!predicted_taken` — a Stage-A prediction that will not exist at =1; the slot-1
+  eligibility must be re-timed onto the Stage-B resolve in 3a.3 (byte-identical at 0 today).
+- **3a.3** Move the RAS / spec-history / FTB-train updates + the fb-write prediction to
+  Stage-B under the flag; gate the F0 FTB off; add the Stage-B override redirect + flush.
+  Couple the four `*_SYNC_READ` to PRED_OVERRIDE. Still DEAD at 0.
+- **3a.4** FLIP `PRED_OVERRIDE=1` (test build): full regression (`veryl test` → litmus N4
+  → SMP boot N2/N4). Debug. Measure inversion-cost (formula above) + `veryl synth` CP.
+  Ship at 0 (like the other `*_SYNC_READ` scaffolds) — the =1 flip is the milestone.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
