@@ -116,8 +116,9 @@ completeness, not CP" mandate. There is no CP number to chase here; success =
   register substrate (`a_valid/a_pc/a_s0/a_s1/a_slot1_elig/a_straddle/a_ftb_next`), latched
   in a dedicated always_ff after the W2 `ext_pc_q` register, DEAD at 0. `veryl test` 252/0,
   byte-identical (reset-only writes + zero consumers → DCE), no new analyzer warnings.
-- **[implemented, validating]** step 2 / order-item-2 — the fetch-buffer write is routed
-  through Stage-B, a **1-deep skid register** between extract-assemble/predict (Stage-A, T)
+- **[done, verified — commit `a72d909`, ships DEAD at 0]** step 2 / order-item-2 — the
+  fetch-buffer write is routed through Stage-B, a **1-deep skid register** between
+  extract-assemble/predict (Stage-A, T)
   and the fb write (Stage-B, T+1). Only the fb WRITE is delayed; ext_pc_q advance / WORD-FIFO
   pop / F0 steer / RAS / spec-history / FTB-train stay at Stage-A (so the predicted stream is
   unchanged — the fb just fills a cycle later). Back-pressure: Stage-A produces only when the
@@ -136,8 +137,8 @@ completeness, not CP" mandate. There is no CP number to chase here; success =
     isolation test (revert ONLY that gate) fixed N2 boot → the **pure +1 skid latency is fine**;
     the culprit was the slot-1-bundling trajectory change, NOT a fetch-latency SMP fragility.
     Fix = keep the =0 `fb_free>=2` gate at both settings (defer near-full slot-1 to a future
-    slot-0, as =0). Regression re-run with the fix: `veryl test` 252/0, N2 boot pass 19.27M;
-    litmus N4 + N4 boot validating.
+    slot-0, as =0). Full regression with the fix (=1): `veryl test` 252/0, litmus N4 pass
+    (cy=00559a10), SMP boot N2 pass (cy=01260970 = 19.27M), SMP boot N4 pass — all green.
   - Predictors stay COMBINATIONAL here (outputs captured into Stage-A regs, replayed at
     Stage-B) — step 3 removes those prediction regs and lets the clocked `*_SYNC_READ` flops
     be the Stage-A→B prediction latch.
