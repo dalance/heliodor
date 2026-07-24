@@ -341,12 +341,56 @@ Known subtleties (discover/handle at implementation):
   Slot-1 caveat carried to 3a.3: `ext_seq_next` still uses `fb_push1`, whose `slot1_eligible`
   gates on `!predicted_taken` — a Stage-A prediction that will not exist at =1; the slot-1
   eligibility must be re-timed onto the Stage-B resolve in 3a.3 (byte-identical at 0 today).
-- **3a.3** Move the RAS / spec-history / FTB-train updates + the fb-write prediction to
-  Stage-B under the flag; gate the F0 FTB off; add the Stage-B override redirect + flush.
-  Couple the four `*_SYNC_READ` to PRED_OVERRIDE. Still DEAD at 0.
-- **3a.4** FLIP `PRED_OVERRIDE=1` (test build): full regression (`veryl test` → litmus N4
-  → SMP boot N2/N4). Debug. Measure inversion-cost (formula above) + `veryl synth` CP.
-  Ship at 0 (like the other `*_SYNC_READ` scaffolds) — the =1 flip is the milestone.
+- **3a.3 [done, verified — 3 commits, `veryl test` 252/0 byte-identical each]** The full
+  authority inversion, DEAD at 0, in three slices:
+  - **3a.3(i)** `sb_next0/1` (Stage-B resolved next-PC = `predicted_taken?pred_target:a_pc+a_len`,
+    reusing the clocked `predicted_taken`/`pred_target` + the captured a_pc for the fall-through),
+    `sb_slot1_kill`, `slot1_eligible` drop-`!predicted_taken`, fb-write `fb_pred_next_pc`/`fb_ghr_fold`
+    routed through sb_* under PRED_OVERRIDE.
+  - **3a.3(ii)** `deliver0/deliver1` (Stage-B delivery); RAS spec push/pop, gshare + indirect
+    spec-history, keyed on deliver0/1; FTB-train gated OFF under PRED_OVERRIDE.
+  - **3a.3(iii)** `sb_override` (Stage-B taken redirect) + `sb_override_target`; `ext_taken_redir`/
+    `f0_diverged` gated off; pc_fetch_q/WORD-FIFO-flush/ext_pc_q-re-steer/skid-squash all add
+    sb_override.
+  - **Design pivot (loop + drift, documented at `sb_next0`):** the planned "re-present a_pc to the
+    clocked predictor during a skid hold" closes a SPURIOUS comb loop (pred-index → sb_hold →
+    fb_free → rename_fire2 → slot1_valid → predicted_taken → pred-index; FETCH_REG=1-dead
+    fb_bypass2/fb_fall keep it symbolically live so Veryl rejects it though the real circuit has
+    none). Variant A instead ACCEPTS hold-drift (a bundle held >1 cycle resolves with its
+    successor's prediction) — proven accuracy-only (every predictor output feeds only the
+    speculative fetch path; `c_bp_mispredict = pred_next_pc != arch_next_pc` validates EVERY
+    committed op incl. non-branches, so a drifted non-branch → sequential arch_next → caught).
+- **3a.4 [DONE — flip measured, correctness bug localized, SHIPPED AT 0]** Flipped all six consts
+  (`PRED_PIPE`, `PRED_OVERRIDE`, `{BTB,BHT,TAGE,IBTB}_SYNC_READ`) in a test build. Findings:
+  - **Builds, NO comb loop; `veryl test` 252/0** (fast + arch rv64ui/um/ua/mi/si/uf/ud all pass —
+    basic branch/jump/jalr correctness holds).
+  - **Microbench matrix (correct runs → valid IPC):** memcpy PASS (121333 cy vs 80099 base, **+51%**),
+    multiply PASS, median PASS, **coremark PASS bit-exact** (instret 374357 == base; 410812 cy vs
+    276893, **+48%**). So the inversion cost is **~+48–51 % cycles — far over the ~+8 % budget**,
+    decisively confirming Finding 2: variant (A) is the honest worst-case and needs the fast-path
+    (B) or the drift-fix to be viable. There is no CP number to chase (F1 CP = 0, §CP measurement).
+  - **CORRECTNESS BUG (dhrystone + boot): silent data corruption, localized to the slot-1 + override
+    interaction.** dhrystone commits 2.36M instret (base completes at 273K) without reaching tohost,
+    with `mispred=0 redirect=0 earlymis=13488` — control flow IS corrected (early redirects) but a
+    WRONG value commits (an instruction delivered with wrong bytes / skipped / duplicated whose
+    next-PC matches, so `c_bp_mispredict` doesn't fire). **Bisection:**
+    - `PRED_PIPE=1` alone → dhrystone PASS (instret 264834).
+    - `SYNC_READ=1 + PRED_PIPE=1 + PRED_OVERRIDE=0` (stale-prediction "measurement flip") → PASS
+      (instret 264834, slow) — the SYNC_READ scaffolds are functionally HEALTHY.
+    - `PRED_OVERRIDE=1` full → FAIL (2.36M loop).
+    - `PRED_OVERRIDE=1` + **slot-1 disabled** (`slot1_valid_gate = !PRED_OVERRIDE`) → **PASS**
+      (instret 264834, 380185 cy). ⇒ the single-slot inversion (Stage-A seq advance, Stage-B
+      predict/RAS/spec/override) is CORRECT; the bug is SPECIFIC to the dual-issue slot-1 path.
+    - Analysis of every slot-1 sub-signal (a_s1/a_s1_pc capture, sb_next1, sb_slot1_kill, deliver1,
+      sb_ovr_taken1, fb_wr1, ext_seq_next-via-fb_push1, RAS ordering) found each self-consistent;
+      the exact corner is NOT yet pinpointed. **Next debug step:** commit-PC trace of the slot-1-on
+      run vs the slot-1-off (correct) run under an identical seed, diff to the first divergence PC —
+      that instruction's bundle is the corner (candidate: a 2-slot bundle where slot-0 is taken and
+      slot-1 was optimistically produced, at a dword boundary / under back-pressure hold).
+  - **Shipped at 0** (all six consts reverted; repo == the 3a.3(iii) commit, byte-identical). The
+    slot-1 bug + the IPC recovery (drift-fix output-register-stall, and/or option (B) fast path)
+    are the next increment; a single-issue (slot-1-off) PRED_OVERRIDE=1 is a WORKING but
+    lower-IPC fallback baseline if a dual-issue fix proves hard.
 
 ## Independence
 
