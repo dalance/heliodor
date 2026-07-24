@@ -1253,6 +1253,13 @@ pub module heliodor_core #(
     // the =0 gate DEFERS near-full slot-1 to a future slot-0 exactly as at =0 (byte-identical at
     // 0). The drain still re-checks fb_free>=sb_ops, so a 1-op bundle can still form near-full.
     let fb_push1: logic = fb_push0 && slot1_valid && fb_free >= 4'd2;
+    // F1 order-item-3 (A): the DELIVERY (prediction applied → RAS / spec-history / FTB-train keyed
+    // on it). At PRED_OVERRIDE=1 delivery moves to Stage-B (the skid drain), where the clocked
+    // predictor outputs align to the drained bundle; the slot-1 delivery drops out when slot-0
+    // resolved taken (sb_slot1_kill). Folds to the Stage-A push fb_push0/fb_push1 at 0 (deliver1 ==
+    // fb_wr1's PRED_OVERRIDE arm — RAS slot-1 fires exactly when the fb slot-1 write does).
+    let deliver0: logic = if PRED_OVERRIDE ? (sb_drain && a_push0) : fb_push0;
+    let deliver1: logic = if PRED_OVERRIDE ? (sb_drain && a_push1 && !sb_slot1_kill) : fb_push1;
     // M3: an instruction is delivered (its prediction applied) this cycle when
     // the fetch engine pushes it into the FIFO. RAS speculative push/pop and the
     // gshare spec-history update are gated on this so a stalled / squashed /
@@ -1262,11 +1269,15 @@ pub module heliodor_core #(
     // predicted taken (BTB hit, is_cond=0) → slot1_valid=0, so slot-0's RAS update
     // and slot-1's are mutually exclusive. ras_push_addr is the return address of
     // whichever slot is the call (slot-0's pc+len, or slot-1's pc+len).
-    let s0_ras_push: logic = fb_push0 && btb_hit && btb_is_call;
-    let s0_ras_pop : logic = fb_push0 && btb_hit && btb_is_ret;
-    let s1_ras_push: logic = fb_push1 && btb_hit2 && btb_is_call2;
-    let s1_ras_pop : logic = fb_push1 && btb_hit2 && btb_is_ret2;
-    let ras_push_addr : logic<64> = if s1_ras_push ? s1_pc + s1_len : ic_pc + pc_advance;
+    // F1 order-item-3 (A): keyed on the Stage-B delivery (deliver0/1) so push/pop happen in program
+    // order at the drain (the 1-deep skid means at most one RAS op in flight; a call kills slot-1
+    // via sb_slot1_kill so slot-0/slot-1 stay mutually exclusive). btb_is_call/ret are the clocked
+    // outputs aligned to the drained bundle; the push addr uses the captured a_pc/a_s1_pc.
+    let s0_ras_push: logic = deliver0 && btb_hit && btb_is_call;
+    let s0_ras_pop : logic = deliver0 && btb_hit && btb_is_ret;
+    let s1_ras_push: logic = deliver1 && btb_hit2 && btb_is_call2;
+    let s1_ras_pop : logic = deliver1 && btb_hit2 && btb_is_ret2;
+    let ras_push_addr : logic<64> = if s1_ras_push ? (if PRED_OVERRIDE ? a_s1_pc + a_s1_len : s1_pc + s1_len) : (if PRED_OVERRIDE ? a_pc + a_len0 : ic_pc + pc_advance);
     let ras_spec_push : logic     = s0_ras_push || s1_ras_push;
     let ras_spec_pop  : logic     = s0_ras_pop || s1_ras_pop;
 
@@ -1799,7 +1810,10 @@ pub module heliodor_core #(
     // ICACHE_FTB_COND (B2a). Returns/indirect excluded (need RAS/iBTB); straddling excluded (F0's
     // redirect would skip the branch's high half). At ICACHE_FTB_COND=0 this folds to B1's
     // `!btb_is_cond` gate → byte-identical to B1 (is_cond/conf writes are then dead → DCE).
-    let ftb_br_deliver: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && fb_push0
+    // F1 order-item-3 (A): the SIMPLE variant gates the F0 FTB OFF (F0 is a plain sequential stream,
+    // the Stage-B override is the only steer) — so its training is inert; suppress it under
+    // PRED_OVERRIDE. Byte-identical at 0 (`!PRED_OVERRIDE`==1).
+    let ftb_br_deliver: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && !PRED_OVERRIDE && fb_push0
         && btb_hit && !btb_is_ret && !btb_is_ind
         && (!btb_is_cond || ICACHE_FTB_COND)
         && (curr_is_rvc || ic_pc[2:1] != 2'b11);
@@ -5252,8 +5266,11 @@ pub module heliodor_core #(
     // S22: the shifted bit is the FINAL predicted direction (TAGE over BHT)
     // so the spec history mirrors what committed_ghr will record when the
     // prediction is right; the 55-bit long twin shifts identically.
-    let ghr_upd0: logic = fb_push0 && btb_hit && btb_is_cond;
-    let ghr_upd1: logic = fb_push1 && btb_hit2 && btb_is_cond2;
+    // F1 order-item-3 (A): keyed on the Stage-B delivery (deliver0/1) so the spec history shifts in
+    // the RESOLVED direction (cond_taken0/1 from the clocked outputs aligned to the drained bundle).
+    // Folds to the Stage-A push at PRED_OVERRIDE=0.
+    let ghr_upd0: logic = deliver0 && btb_hit && btb_is_cond;
+    let ghr_upd1: logic = deliver1 && btb_hit2 && btb_is_cond2;
     always_ff (clk, rst) {
         if_reset {
             spec_ghr   = 13'd0;
@@ -5280,8 +5297,8 @@ pub module heliodor_core #(
     // predicted indirect's target; restore on any flush (same approximation
     // as spec_ghr above). A slot-0 indirect is predicted taken, which kills
     // slot-1 delivery, so at most one indirect folds per cycle.
-    let ind_upd0: logic = fb_push0 && btb_hit && btb_is_ind;
-    let ind_upd1: logic = fb_push1 && btb_hit2 && btb_is_ind2;
+    let ind_upd0: logic = deliver0 && btb_hit && btb_is_ind; // F1 3(A): Stage-B delivery (folds to fb_push0 at 0)
+    let ind_upd1: logic = deliver1 && btb_hit2 && btb_is_ind2;
     always_ff (clk, rst) {
         if_reset {
             spec_ind_hist = 9'd0;
