@@ -22,7 +22,7 @@ Test names shifted when the OoO SoC landed: **phase1–6 use `test_linux_boot`**
 | phase7/8     | `test_soc_linux_boot`   | `tb_soc_linux_boot.sv`               | `test_soc_smp_linux_boot_{2,4}hart` / `tb_soc_smp_linux_boot_{2,4}hart.sv` |
 | phase9       | `test_soc_linux_boot`   | `tb_soc_linux_boot.sv`               | + `_8hart`                                  |
 | phase12      | `test_soc_linux_boot`   | `tb_soc_linux_boot.sv`               | `test_soc_smp_linux_boot_{2,4,8}hart` (+ kernel variants, below) |
-| master (13)  | `test_soc_linux_boot`   | `tb_soc_linux_boot.sv`               | `test_soc_smp_linux_boot_{2,4}hart`         |
+| phase13      | `test_soc_linux_boot`   | `tb_soc_linux_boot.sv`               | `test_soc_smp_linux_boot_{2,4}hart`         |
 
 The Verilator top-module name equals the wrapper's `module` name (same as the file
 stem). Wrappers instantiate the `<test>_harness` module that `veryl build` emits.
@@ -35,7 +35,7 @@ boots (Linux 6.6 / 7.1 / 7.1-vector), naming matters:
   `linux_boot`, so `--test test_soc_linux_boot` matches **only** the base boot.
 - **phase1–9**: no N=1 kernel variants, so `--test test_soc_linux_boot` /
   `--test test_linux_boot` already isolates.
-- **master (13)**: still uses the old suffix form (`test_soc_linux_boot_66` …),
+- **phase13**: still uses the old suffix form (`test_soc_linux_boot_66` …),
   so `--test test_soc_linux_boot` matches 4 tests and they run concurrently —
   either filter by the full variant name, or apply the phase12 rename here too.
 
