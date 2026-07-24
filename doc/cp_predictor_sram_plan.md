@@ -116,16 +116,31 @@ completeness, not CP" mandate. There is no CP number to chase here; success =
   register substrate (`a_valid/a_pc/a_s0/a_s1/a_slot1_elig/a_straddle/a_ftb_next`), latched
   in a dedicated always_ff after the W2 `ext_pc_q` register, DEAD at 0. `veryl test` 252/0,
   byte-identical (reset-only writes + zero consumers → DCE), no new analyzer warnings.
-- **[next]** step 2 / order-item-2 — route the fetch-buffer push through Stage-B under
-  `PRED_PIPE=1`. **This is the first BEHAVIOUR-CHANGING flip** and needs the full regression
-  (litmus N4 + SMP boot N2/N4) + IPC/CP measurement, not just 252/0. Register set is LARGER
-  than the minimal `a_*` list above: Stage-B replays the whole fb-push0/1 metadata
-  (`fb_pc/instr/is_rvc/ifault/iacc/gstage/gpa/pred_next_pc/pred_index/ghr_fold` for both
-  slots) + the F0-steer inputs (`predicted_taken`, `ext_next_pc`, `f0_prefetched_target`) +
-  RAS spec push/pop + `spec_ghr`/`spec_ind_hist` advance point. Keep the FTB fast path proven
-  first (authority inversion note above). Predictors stay COMBINATIONAL here (their outputs
-  are captured into Stage-A regs and replayed at Stage-B) — step 3 then removes those
-  prediction regs and lets the clocked `*_SYNC_READ` flops be the Stage-A→B prediction latch.
+- **[implemented, validating]** step 2 / order-item-2 — the fetch-buffer write is routed
+  through Stage-B, a **1-deep skid register** between extract-assemble/predict (Stage-A, T)
+  and the fb write (Stage-B, T+1). Only the fb WRITE is delayed; ext_pc_q advance / WORD-FIFO
+  pop / F0 steer / RAS / spec-history / FTB-train stay at Stage-A (so the predicted stream is
+  unchanged — the fb just fills a cycle later). Back-pressure: Stage-A produces only when the
+  skid can accept (`sb_can_accept = !a_valid || sb_drain`), replacing fb_push0's `!fb_full`;
+  fb-room checking moved to the drain (`sb_drain = a_valid && fb_free>=sb_ops`). Register set:
+  `a_valid/a_push0/a_push1` + the full fb-push0/1 metadata for both slots. Everything gated
+  `if PRED_PIPE ? new : old` → **byte-identical at 0** (`veryl test` 252/0).
+  - **=1 IPC**: litmus N2 +1.14%, N1 boot +1.05%, N2 boot **+0.4%** (cy 19.27M) — the +1
+    front-end stage, far under the ~+8% budget (prediction is NOT delayed, so no taken-branch
+    bubble; only the fb write is +1).
+  - **N2-boot livelock + fix (important)**: the first =1 cut ALSO dropped the slot-1
+    produce-time `fb_free>=2` gate (`fb_push1 = fb_push0 && slot1_valid`), so near-full slot-1
+    was always bundled → ext_pc_q skipped to `pred_next_pc1` and parked a 2-op bundle in the
+    skid that only drains on `fb_free>=2`, pathologically stalling Stage-A under N2 lock
+    contention → **N2 SMP boot livelocked** (100M-cy timeout; N1 boot + litmus N4 passed). An
+    isolation test (revert ONLY that gate) fixed N2 boot → the **pure +1 skid latency is fine**;
+    the culprit was the slot-1-bundling trajectory change, NOT a fetch-latency SMP fragility.
+    Fix = keep the =0 `fb_free>=2` gate at both settings (defer near-full slot-1 to a future
+    slot-0, as =0). Regression re-run with the fix: `veryl test` 252/0, N2 boot pass 19.27M;
+    litmus N4 + N4 boot validating.
+  - Predictors stay COMBINATIONAL here (outputs captured into Stage-A regs, replayed at
+    Stage-B) — step 3 removes those prediction regs and lets the clocked `*_SYNC_READ` flops
+    be the Stage-A→B prediction latch.
 - **[measured]** F1 CP = 0 (above). The remaining F1+F2 work is a **large,
   multi-session restructuring of the fetch datapath** (pipeline extract across the
   clocked predictor read → FTQ + overriding redirect), reworking the already-complex

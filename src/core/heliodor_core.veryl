@@ -430,13 +430,37 @@ pub module heliodor_core #(
     // adds the +0 structural stage, measures its IPC); step 3 flips the predictor sync-reads
     // coupled to PRED_PIPE so the read is truly clocked; step 4 adds the override redirect.
     const PRED_PIPE: bit = 0;
-    var a_valid     : logic    ; // Stage-A produced a bundle this cycle (Stage-B applies next)
-    var a_pc        : logic<64>; // slot-0 instruction PC (= ic_pc at Stage-A)
-    var a_s0        : logic<32>; // slot-0 RVC-expanded instruction (= fetched_instr)
-    var a_s1        : logic<32>; // slot-1 RVC-expanded instruction (= s1_instr)
-    var a_slot1_elig: logic    ; // slot-1 eligibility (slot1_eligible) resolved at Stage-A
-    var a_straddle  : logic    ; // straddle_q latched into Stage-A
-    var a_ftb_next  : logic<64>; // FTB-followed / delivered next-PC (ext_next_pc); step-4 override compares against it
+    // Stage-B is a 1-deep SKID register between extract-assemble/predict (Stage-A, at T) and
+    // the fetch-buffer write (Stage-B, at T+1). a_valid holds until the bundle drains into the
+    // fetch buffer; a_push0/a_push1 are the registered slot deliveries (drive the fb write +
+    // tail/count advance at drain). All the fb-push metadata is captured for both slots so the
+    // write replays it a cycle later. Stage-A's ext_pc_q advance / WORD-FIFO pop / F0 steer /
+    // RAS / spec-history / FTB-train stay at T (order-item-2 delays ONLY the fb write).
+    var a_valid       : logic    ; // Stage-B holds a valid bundle (persists until drained)
+    var a_push0       : logic    ; // registered fb_push0 (slot-0 delivered)
+    var a_push1       : logic    ; // registered fb_push1 (slot-1 delivered)
+    // slot-0 fb-write fields
+    var a_pc          : logic<64>; // slot-0 instruction PC (= ic_pc at Stage-A)
+    var a_s0          : logic<32>; // slot-0 RVC-expanded instruction (= fetched_instr)
+    var a_is_rvc0     : logic    ; // slot-0 is_rvc (= !straddle_q && curr_is_rvc)
+    var a_ifault      : logic    ; // slot-0 imem page fault (= ic_ifault)
+    var a_iacc        : logic    ; // slot-0 imem access fault (= ic_iacc)
+    var a_gstage      : logic    ; // slot-0 G-stage fault (= ic_gstage)
+    var a_gpa         : logic<64>; // slot-0 faulting guest PA (= ic_gpa)
+    var a_pred_next_pc0: logic<64>; // slot-0 predicted next PC (= pred_next_pc_bp)
+    var a_pred_index0 : logic<13>; // slot-0 gshare BHT index (= bht_lk_index)
+    var a_ghr_fold0   : logic    ; // slot-0 spec_ghr_l fold flag (= btb_hit && btb_is_cond)
+    // slot-1 fb-write fields
+    var a_s1_pc       : logic<64>; // slot-1 instruction PC (= s1_pc)
+    var a_s1          : logic<32>; // slot-1 RVC-expanded instruction (= s1_instr)
+    var a_s1_is_rvc   : logic    ; // slot-1 is_rvc (= s1_is_rvc)
+    var a_pred_next_pc1: logic<64>; // slot-1 predicted next PC (= pred_next_pc1)
+    var a_pred_index1 : logic<13>; // slot-1 gshare BHT index (= bht_lk_index1)
+    var a_ghr_fold1   : logic    ; // slot-1 spec_ghr_l fold flag (= btb_hit2 && btb_is_cond2)
+    // order-item-4 (override redirect) fields — captured now, consumed when the override lands
+    var a_slot1_elig  : logic    ; // slot-1 eligibility (slot1_eligible) resolved at Stage-A
+    var a_straddle    : logic    ; // straddle_q latched into Stage-A
+    var a_ftb_next    : logic<64>; // FTB-followed / delivered next-PC (ext_next_pc); step-4 override compares against it
 
     // Phase 8 S4a: fetch buffer (decode queue). Depth-8 FIFO of clean fetched
     // records. Per-field plain arrays (NOT an array of structs) so the
@@ -1154,10 +1178,32 @@ pub module heliodor_core #(
     // drain freeing slots). fb_count 0..8, fb_pop/fb_pop2 0..1, so fb_free 0..8.
     let fb_free : logic<4> = (4'd8 - fb_count) + (if fb_pop ? 4'd1 : 4'd0) + (if fb_pop2 ? 4'd1 : 4'd0);
     let fb_tail1: logic<3> = fb_tail + 3'd1; // slot-1 write index (wraps mod 8)
+    // ── F1 order-item-2: Stage-B skid drain / accept (PRED_PIPE) ──
+    // Stage-B (the a_* skid register) drains its held bundle into the fetch buffer when the
+    // buffer has room for it (fb_free already counts a simultaneous rename drain). sb_ops = the
+    // held bundle's op count (1 or 2). Stage-A produces a new bundle only when Stage-B is empty
+    // OR draining this cycle (sb_can_accept) — the +1-deep back-pressure that REPLACES fb_push0's
+    // direct !fb_full at PRED_PIPE=1 (fb-full checking moves to the drain side). DEAD at 0:
+    // sb_drain = PRED_PIPE && … = const-false, sb_can_accept unused (the =0 mux arm keeps
+    // !fb_full), so fb_push0/fb_push1 fold to today's byte-identical form.
+    let sb_ops       : logic<4> = if a_push1 ? 4'd2 : 4'd1;
+    let sb_drain     : logic    = PRED_PIPE && a_valid && (fb_free >= sb_ops);
+    let sb_can_accept: logic    = !a_valid || sb_drain;
     // Phase 8 S4a.3: 2-wide push. fb_push0 = the slot-0 delivery (== the S4a.2
     // single push); fb_push1 = the slot-1 delivery (needs slot1_valid + room for
     // a 2nd record). slot-0 pushes to fb_tail, slot-1 to fb_tail+1.
-    let fb_push0: logic = !any_redirect && !fb_full && fetch_ready;
+    // At PRED_PIPE=1 fb_push0/fb_push1 are the Stage-A PRODUCE (into the skid), gated on
+    // sb_can_accept instead of !fb_full; the actual fb write (fb_wr0/fb_wr1 below) is the
+    // Stage-B drain. At =0 both fold to today's live push.
+    let fb_push0: logic = !any_redirect && fetch_ready && (if PRED_PIPE ? sb_can_accept : !fb_full);
+    // slot-1 keeps the produce-time fb_free>=2 gate at BOTH PRED_PIPE settings. An earlier
+    // PRED_PIPE=1 variant dropped it (fb_push1 = fb_push0 && slot1_valid, deferring the fb-room
+    // check to the Stage-B drain) so near-full slot-1 was always bundled; that skipped ext_pc_q
+    // to pred_next_pc1 and parked a 2-op bundle in the skid that can only drain on fb_free>=2 —
+    // pathologically stalling Stage-A under N2 lock contention → SMP-boot livelock (isolation
+    // test: reverting ONLY this gate fixed N2 boot; the pure +1 skid latency is fine). Keeping
+    // the =0 gate DEFERS near-full slot-1 to a future slot-0 exactly as at =0 (byte-identical at
+    // 0). The drain still re-checks fb_free>=sb_ops, so a 1-op bundle can still form near-full.
     let fb_push1: logic = fb_push0 && slot1_valid && fb_free >= 4'd2;
     // M3: an instruction is delivered (its prediction applied) this cycle when
     // the fetch engine pushes it into the FIFO. RAS speculative push/pop and the
@@ -1607,37 +1653,80 @@ pub module heliodor_core #(
                 ext_pc_q = redirect_pc;
             } else if early_redir_fire_q {
                 ext_pc_q = early_redir_pc_q;
-            } else if !fb_full {
+            // At PRED_PIPE=1 the Stage-A advance is gated on the skid accepting (sb_can_accept)
+            // instead of !fb_full — fb-full back-pressure moved to the Stage-B drain. This
+            // branch is only reached when !any_redirect, so sb_can_accept && fetch_ready ==
+            // fb_push0 there (Stage-A produce). Byte-identical at 0 (folds to !fb_full).
+            } else if (if PRED_PIPE ? sb_can_accept : !fb_full) {
                 if fetch_ready {
                     ext_pc_q = ext_next_pc;
                 }
             }
         }
     }
-    // F1 step 2: extract Stage-A latch (DEAD at PRED_PIPE=0). Registers Stage-A's assembled
-    // bundle + prediction operands so Stage-B can apply the (soon-to-be-clocked) prediction
-    // one cycle later. a_valid is the Stage-A→Stage-B valid: a slot-0 delivery was assembled
-    // this cycle (fb_push0), and no redirect voids it. On a redirect Stage-A produces nothing
-    // (a_valid=0) so Stage-B applies no stale prediction. Written ONLY under `else if
-    // PRED_PIPE` → reset-only at 0 → every a_* reg (and its fanin) DCEs, byte-identical.
+    // F1 order-item-2: Stage-B skid register (DEAD at PRED_PIPE=0). A 1-deep holding register
+    // between extract-assemble/predict (Stage-A, T) and the fetch-buffer write (Stage-B, T+1).
+    //  - Stage-A PRODUCES (fb_push0, gated on sb_can_accept) → capture the bundle, a_valid=1.
+    //  - the held bundle DRAINS (sb_drain) into the fetch buffer via fb_wr0/fb_wr1 below.
+    //  - produce + drain the same cycle → the OLD bundle drains (fb_wr* read the pre-edge a_*)
+    //    while the NEW one is captured; a_valid stays 1.
+    //  - drain, no produce → a_valid=0.  any_redirect → flush the wrong-path skid (a_valid=0;
+    //    fb_push0 is already 0 under a redirect, and the fb write takes its any_redirect branch
+    //    so the skid is never drained on a redirect).
+    // Written ONLY under `else if PRED_PIPE` → reset-only at 0 → every a_* reg (and its fanin)
+    // DCEs, byte-identical (the fb write folds back to the live Stage-A push at =0).
     always_ff (clk, rst) {
         if_reset {
-            a_valid      = 1'b0;
-            a_pc         = 64'd0;
-            a_s0         = 32'd0;
-            a_s1         = 32'd0;
-            a_slot1_elig = 1'b0;
-            a_straddle   = 1'b0;
-            a_ftb_next   = 64'd0;
+            a_valid         = 1'b0;
+            a_push0         = 1'b0;
+            a_push1         = 1'b0;
+            a_pc            = 64'd0;
+            a_s0            = 32'd0;
+            a_is_rvc0       = 1'b0;
+            a_ifault        = 1'b0;
+            a_iacc          = 1'b0;
+            a_gstage        = 1'b0;
+            a_gpa           = 64'd0;
+            a_pred_next_pc0 = 64'd0;
+            a_pred_index0   = 13'd0;
+            a_ghr_fold0     = 1'b0;
+            a_s1_pc         = 64'd0;
+            a_s1            = 32'd0;
+            a_s1_is_rvc     = 1'b0;
+            a_pred_next_pc1 = 64'd0;
+            a_pred_index1   = 13'd0;
+            a_ghr_fold1     = 1'b0;
+            a_slot1_elig    = 1'b0;
+            a_straddle      = 1'b0;
+            a_ftb_next      = 64'd0;
         } else if PRED_PIPE {
-            a_valid = fb_push0 && !any_redirect;
-            if fb_push0 {
-                a_pc         = ic_pc;
-                a_s0         = fetched_instr;
-                a_s1         = s1_instr;
-                a_slot1_elig = slot1_eligible;
-                a_straddle   = straddle_q;
-                a_ftb_next   = ext_next_pc;
+            if any_redirect {
+                a_valid = 1'b0;
+            } else if fb_push0 {
+                a_valid         = 1'b1;
+                a_push0         = fb_push0;
+                a_push1         = fb_push1;
+                a_pc            = ic_pc;
+                a_s0            = fetched_instr;
+                a_is_rvc0       = !straddle_q && curr_is_rvc;
+                a_ifault        = ic_ifault;
+                a_iacc          = ic_iacc;
+                a_gstage        = ic_gstage;
+                a_gpa           = ic_gpa;
+                a_pred_next_pc0 = pred_next_pc_bp;
+                a_pred_index0   = bht_lk_index;
+                a_ghr_fold0     = btb_hit && btb_is_cond;
+                a_s1_pc         = s1_pc;
+                a_s1            = s1_instr;
+                a_s1_is_rvc     = s1_is_rvc;
+                a_pred_next_pc1 = pred_next_pc1;
+                a_pred_index1   = bht_lk_index1;
+                a_ghr_fold1     = btb_hit2 && btb_is_cond2;
+                a_slot1_elig    = slot1_eligible;
+                a_straddle      = straddle_q;
+                a_ftb_next      = ext_next_pc;
+            } else if sb_drain {
+                a_valid = 1'b0;
             }
         }
     }
@@ -1700,6 +1789,12 @@ pub module heliodor_core #(
     }
 
     // ============================================================
+    // F1 order-item-2: fetch-buffer write drivers. At PRED_PIPE=1 the write is the Stage-B skid
+    // DRAIN (registered a_push0/a_push1 gated by sb_drain); at =0 it is the live Stage-A push
+    // (fb_push0/fb_push1). Byte-identical at 0 (the mux folds to the live push). The per-field
+    // data-source muxes below fold likewise, so =0 emits today's exact write.
+    let fb_wr0: logic = if PRED_PIPE ? (sb_drain && a_push0) : fb_push0;
+    let fb_wr1: logic = if PRED_PIPE ? (sb_drain && a_push1) : fb_push1;
     // Phase 8 S4a: fetch buffer (decode queue). The fetch engine pushes a clean
     // record (fb_push) and rename drains the head (fb_pop). The head is exposed
     // combinationally on the if_*_q names every downstream stage already reads.
@@ -1713,47 +1808,49 @@ pub module heliodor_core #(
             fb_count = 4'd0;
         } else if any_redirect {
             // Phase 8 S8.E: drain the fetch buffer on an early redirect too (it
-            // holds wrong-path records younger than the resolved branch).
+            // holds wrong-path records younger than the resolved branch). The
+            // Stage-B skid is flushed in its own always_ff (a_valid=0) — a
+            // wrong-path skid bundle is never written here (this branch skips fb_wr*).
             fb_head  = 3'd0;
             fb_tail  = 3'd0;
             fb_count = 4'd0;
         } else {
-            if fb_push0 {
-                fb_pc[fb_tail]           = ic_pc;
-                fb_instr[fb_tail]        = fetched_instr;
+            if fb_wr0 {
+                fb_pc[fb_tail]           = if PRED_PIPE ? a_pc : ic_pc;
+                fb_instr[fb_tail]        = if PRED_PIPE ? a_s0 : fetched_instr;
                 // M7: track RVC-origin for the link register (pc+2 vs pc+4). A
                 // straddle resolves a 32-bit instr, so is_rvc=0 in that case.
-                fb_is_rvc[fb_tail]       = !straddle_q && curr_is_rvc;
-                fb_ifault[fb_tail]       = ic_ifault;
-                fb_iacc[fb_tail]         = ic_iacc;
-                fb_ifault_gstage[fb_tail] = ic_gstage;
-                fb_ifault_gpa[fb_tail]   = ic_gpa;
-                fb_pred_next_pc[fb_tail] = pred_next_pc_bp;
-                fb_pred_index[fb_tail]   = bht_lk_index;
-                fb_ghr_fold[fb_tail]     = btb_hit && btb_is_cond;
+                fb_is_rvc[fb_tail]       = if PRED_PIPE ? a_is_rvc0 : (!straddle_q && curr_is_rvc);
+                fb_ifault[fb_tail]       = if PRED_PIPE ? a_ifault : ic_ifault;
+                fb_iacc[fb_tail]         = if PRED_PIPE ? a_iacc : ic_iacc;
+                fb_ifault_gstage[fb_tail] = if PRED_PIPE ? a_gstage : ic_gstage;
+                fb_ifault_gpa[fb_tail]   = if PRED_PIPE ? a_gpa : ic_gpa;
+                fb_pred_next_pc[fb_tail] = if PRED_PIPE ? a_pred_next_pc0 : pred_next_pc_bp;
+                fb_pred_index[fb_tail]   = if PRED_PIPE ? a_pred_index0 : bht_lk_index;
+                fb_ghr_fold[fb_tail]     = if PRED_PIPE ? a_ghr_fold0 : (btb_hit && btb_is_cond);
             }
             // Phase 8 S4a.3: slot-1 record into fb_tail+1. slot-1 is delivered
             // only on a clean, non-faulting, not-predicted-taken slot-0, so its
             // ifault is 0. Dead until S4a.3-b (fb_push1 needs slot1_valid_gate).
-            if fb_push1 {
-                fb_pc[fb_tail1]           = s1_pc;
-                fb_instr[fb_tail1]        = s1_instr;
-                fb_is_rvc[fb_tail1]       = s1_is_rvc;
+            if fb_wr1 {
+                fb_pc[fb_tail1]           = if PRED_PIPE ? a_s1_pc : s1_pc;
+                fb_instr[fb_tail1]        = if PRED_PIPE ? a_s1 : s1_instr;
+                fb_is_rvc[fb_tail1]       = if PRED_PIPE ? a_s1_is_rvc : s1_is_rvc;
                 fb_ifault[fb_tail1]       = 1'b0;
                 fb_iacc[fb_tail1]         = 1'b0; // slot-1 same page as slot-0 → no PMP fault
                 fb_ifault_gstage[fb_tail1] = 1'b0; // slot-1 never faults (same page as slot-0)
                 fb_ifault_gpa[fb_tail1]   = 64'd0;
-                fb_pred_next_pc[fb_tail1] = pred_next_pc1;
-                fb_pred_index[fb_tail1]   = bht_lk_index1;
-                fb_ghr_fold[fb_tail1]     = btb_hit2 && btb_is_cond2;
+                fb_pred_next_pc[fb_tail1] = if PRED_PIPE ? a_pred_next_pc1 : pred_next_pc1;
+                fb_pred_index[fb_tail1]   = if PRED_PIPE ? a_pred_index1 : bht_lk_index1;
+                fb_ghr_fold[fb_tail1]     = if PRED_PIPE ? a_ghr_fold1 : (btb_hit2 && btb_is_cond2);
             }
-            fb_tail = fb_tail + (if fb_push0 ? (if fb_push1 ? 3'd2 : 3'd1) : 3'd0);
+            fb_tail = fb_tail + (if fb_wr0 ? (if fb_wr1 ? 3'd2 : 3'd1) : 3'd0);
             // Phase 8 S4b: 2-wide drain. fb_pop2 (== rename_fire2) drains the
             // head+1 record too, so head advances by 2 and count drops by 2.
             if fb_pop {
                 fb_head = fb_head + (if fb_pop2 ? 3'd2 : 3'd1);
             }
-            fb_count = fb_count + (if fb_push0 ? (if fb_push1 ? 4'd2 : 4'd1) : 4'd0) - (if fb_pop ? (if fb_pop2 ? 4'd2 : 4'd1) : 4'd0);
+            fb_count = fb_count + (if fb_wr0 ? (if fb_wr1 ? 4'd2 : 4'd1) : 4'd0) - (if fb_pop ? (if fb_pop2 ? 4'd2 : 4'd1) : 4'd0);
         }
     }
 
