@@ -38,6 +38,10 @@ whose components are the DEAD scaffolds below.
 | `DCACHE_TAG_READ_1R=0` | dcache:781 | **REVERTED 2026-07-22** for tag REPLICATION — D$ tag is now **ALL 1R1W** via the `dcache_tagbank` submodule (12 instances + in-module demand copy), not the registered-demand stage. See `cp_dcache_tag_replication_plan.md` |
 | `L2_SYNC_READ=1` | l2cache:249, mem_ctrl:249 | L2 data synchronous read |
 | `L2_PORTS_1R1W=1` | l2cache:260 | L2 data write-port collapse 2R2W→2R1W |
+| `ICACHE_SYNC_READ=1` | icache:727, heliodor_core:336 | **Phase 13 close (default-on `3f5681d`)** — I$ synchronous (registered-address) demand read = a real clocked-SRAM macro (the last big-array clocked-read gap) |
+| `ICACHE_FETCH_DIRECTED=1` | heliodor_core:381 | B1/B2a F0 fetch-directed prefetch (removes the taken-refill bubble; makes the sync-read flip IPC-viable) |
+| `ICACHE_FTB_COND=1` | heliodor_core:390 | B2a conditional-branch FTB (loop back-edges) with a 2-bit taken-confidence |
+| `ICACHE_FIFO_BYPASS=1` | heliodor_core:858 | §19 FIFO read-around bypass (the dominant IPC lever; reconciled with the FTB by the §25.3 contiguity fix) |
 
 ## 2. DEAD scaffolds — byte-identical at default; components of the *future* 7.5 ns / 10-stage program
 
@@ -51,8 +55,6 @@ Each is verified byte-identical at its shown value; flipping is a full-SMP-ladde
 | `VFP_EX_PIPE=0` | vector_unit:2261 | vector datapath cut (`cp_vector_datapath_cut_plan.md`) | **built + gate-tested this session**: functionally correct (=1 252/0, vfarith PASS) but moves real CP only 0.02 ns alone (vx co-floor) — flip only PAIRED with the un-built integer-vx cut; throughput-gated |
 | `DECODE_REG=0` | heliodor_core:1806 | front-end (sub-13.120) | built-dead; masked below the current wall |
 | `IMEM_MMU_STAGE=0` | imem_mmu:199 | Phase D front-end | instruction-side MMU stage |
-| `ICACHE_SYNC_READ=0` | icache:561, heliodor_core:336 | Phase D — I$ shape-W | net-negative alone (§21); superseded by fetch-directed prefetch |
-| `ICACHE_FIFO_BYPASS=0` | heliodor_core:818 | Phase D — I$ fetch decouple | N4-clean body vs de-risked bypass |
 | `BTB_SYNC_READ=0` | btb:88 | Phase D — predictor SRAM | flip bundled with shape-W |
 | `BHT_SYNC_READ=0` | bht:54 | Phase D — predictor SRAM | (livelock caution — directory sync) |
 | `IBTB_SYNC_READ=0` | ibtb:66 | Phase D — predictor SRAM | |
