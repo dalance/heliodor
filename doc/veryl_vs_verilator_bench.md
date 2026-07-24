@@ -30,14 +30,11 @@ stem). Wrappers instantiate the `<test>_harness` module that `veryl build` emits
 ### Kernel variants and `--test` isolation
 `veryl test --test X` is a **substring** filter. Where a branch has extra kernel
 boots (Linux 6.6 / 7.1 / 7.1-vector), naming matters:
-- **phase12**: variants are named `test_soc_{66,71,71v}_linux_boot` and
-  `test_soc_{66,71}_smp_linux_boot_{2,4}hart` — the kernel tag sits *before*
+- **phase12 / phase13**: variants are named `test_soc_{66,71,71v}_linux_boot`
+  and `test_soc_{66,71}_smp_linux_boot_{2,4}hart` — the kernel tag sits *before*
   `linux_boot`, so `--test test_soc_linux_boot` matches **only** the base boot.
 - **phase1–9**: no N=1 kernel variants, so `--test test_soc_linux_boot` /
   `--test test_linux_boot` already isolates.
-- **phase13**: still uses the old suffix form (`test_soc_linux_boot_66` …),
-  so `--test test_soc_linux_boot` matches 4 tests and they run concurrently —
-  either filter by the full variant name, or apply the phase12 rename here too.
 
 When a filter matches several boots they run on parallel workers and pollute each
 other's wall time; always confirm the run reports `1 passed` before trusting a
