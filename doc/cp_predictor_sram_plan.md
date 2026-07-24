@@ -112,6 +112,20 @@ completeness, not CP" mandate. There is no CP number to chase here; success =
 
 - **[done, verified]** step 1 — `TAGE_SYNC_READ` scaffold added; `veryl test` 252/0;
   byte-identical (const-folded). All four predictors now carry a sync-read scaffold.
+- **[done, verified]** step 2 / order-item-1 — `PRED_PIPE` param + the Stage-A/B pipeline
+  register substrate (`a_valid/a_pc/a_s0/a_s1/a_slot1_elig/a_straddle/a_ftb_next`), latched
+  in a dedicated always_ff after the W2 `ext_pc_q` register, DEAD at 0. `veryl test` 252/0,
+  byte-identical (reset-only writes + zero consumers → DCE), no new analyzer warnings.
+- **[next]** step 2 / order-item-2 — route the fetch-buffer push through Stage-B under
+  `PRED_PIPE=1`. **This is the first BEHAVIOUR-CHANGING flip** and needs the full regression
+  (litmus N4 + SMP boot N2/N4) + IPC/CP measurement, not just 252/0. Register set is LARGER
+  than the minimal `a_*` list above: Stage-B replays the whole fb-push0/1 metadata
+  (`fb_pc/instr/is_rvc/ifault/iacc/gstage/gpa/pred_next_pc/pred_index/ghr_fold` for both
+  slots) + the F0-steer inputs (`predicted_taken`, `ext_next_pc`, `f0_prefetched_target`) +
+  RAS spec push/pop + `spec_ghr`/`spec_ind_hist` advance point. Keep the FTB fast path proven
+  first (authority inversion note above). Predictors stay COMBINATIONAL here (their outputs
+  are captured into Stage-A regs and replayed at Stage-B) — step 3 then removes those
+  prediction regs and lets the clocked `*_SYNC_READ` flops be the Stage-A→B prediction latch.
 - **[measured]** F1 CP = 0 (above). The remaining F1+F2 work is a **large,
   multi-session restructuring of the fetch datapath** (pipeline extract across the
   clocked predictor read → FTQ + overriding redirect), reworking the already-complex
@@ -172,10 +186,14 @@ resolves) — the redirect-restore must sample the Stage-B point; the commit-tra
 carried-index proof is unaffected (older ops all committed).
 
 **Order of implementation (each a verified increment):**
-1. `PRED_PIPE` param + the Stage-A/B pipeline register, DEAD at 0 (reset-only → DCE,
-   byte-identical; verify 252/0). Declares the substrate, no consumer rewire yet.
-2. Route the fetch-buffer push through Stage-B under `PRED_PIPE=1` (predictors still
-   combinational — a pure +0 structural stage first, measure IPC of the extra stage).
+1. **[done, verified]** `PRED_PIPE` param + the Stage-A/B pipeline register, DEAD at 0
+   (reset-only → DCE, byte-identical; verified `veryl test` 252/0). Declares the substrate,
+   no consumer rewire yet. `const PRED_PIPE: bit = 0` + the `a_valid/a_pc/a_s0/a_s1/
+   a_slot1_elig/a_straddle/a_ftb_next` regs (`heliodor_core.veryl` ~412), latched in a
+   dedicated always_ff after the W2 `ext_pc_q` register (written ONLY under `else if
+   PRED_PIPE` → reset-only at 0 → the regs + fanin DCE). No new analyzer warnings.
+2. **[next]** Route the fetch-buffer push through Stage-B under `PRED_PIPE=1` (predictors
+   still combinational — a pure +0 structural stage first, measure IPC of the extra stage).
 3. Flip predictors to clocked (`*_SYNC_READ=1`) coupled to `PRED_PIPE`; the Stage-B
    apply now consumes the registered read. Prove the FTB-followed delivery + override.
 4. Measure IPC (boot cycle counts + benchmarks) and CP (`veryl synth`, expect no CP
