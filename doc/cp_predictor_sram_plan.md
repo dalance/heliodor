@@ -441,7 +441,36 @@ Known subtleties (discover/handle at implementation):
     increment over continuing to chase this specific corner's corrupting commit.
   - **Shipped at 0** (all 7 consts reverted; the fix is DEAD, byte-identical). Next increment: the
     drift-fix (predictor output-register freeze) — resolves IPC + likely the boot corner — else option
-    (B) L0 fast predictor.
+    (B) L0 fast predictor. **[done in 3a.6 — the boot corner WAS the hold-drift.]**
+- **3a.6 [DONE — hold-drift fix, boot corner RESOLVED, shipped at 0]** The hold-drift (the clocked
+  predictor output drifting from pred(a_pc) to pred(successor) while a bundle is held in the skid,
+  fb full > 1 cyc) is confirmed the shared root of the slot-1 corner (3a.5) AND the boot corner —
+  freezing it makes BOTH go away.
+  - **Fix (`heliodor_core.veryl`, `PRED_HOLD_FREEZE`, DEAD at 0).** Capture the ALIGNED resolved
+    prediction (`predicted_taken`/`pred_target` ×2) on the drain-aligned cycle (`produce_q` = `fb_push0`
+    delayed one cycle — the cycle on which the clocked outputs equal pred(a_pc)) into `held_*`, and
+    FREEZE it while the bundle is held; Stage-B (`sb_next0/1`, `sb_slot1_kill`, `sb_override`,
+    `sb_override_target`, `sb_ovr_taken1`) consumes the frozen `*_eff = produce_q ? live : held`. This
+    is a REGISTERED capture, NOT the combinational re-present of a_pc that 3a.3's pivot found closes a
+    spurious comb loop — so no loop. `*_eff` folds to the live value at 0 → byte-identical (cycle-exact).
+    `PRED_HOLD_FREEZE` joins the flip set (now **8 consts**).
+  - **Verify @ =1 (8 consts).** **N=1 Linux boot COMPLETES — cy 15.9M, +12 % vs base 14.2M** (was a
+    HANG at =1 without the freeze; the boot corner WAS the hold-drift). dhrystone bit-exact (310655
+    cy), coremark bit-exact (411616 cy), memcpy pass (118642 cy); full `veryl test` 252/0. @ =0:
+    `veryl test` 252/0, byte-identical.
+  - **IPC picture.** The freeze's big win is the **hold-heavy real workload** (boot: hang → +12 %).
+    The compute-heavy microbenches stay high (dhrystone +24 %, coremark +49 %, memcpy +48 % vs base)
+    because they hold rarely (little drift) and the **fundamental Stage-B override bubble** — a +1 on
+    every taken-cond/return/indirect — dominates. Closing THAT is option (B) (an L0 fast predictor at
+    Stage-A) or F2's FTQ, not the drift-fix.
+  - **Remaining (accuracy-only).** RAS / spec-history (`spec_ghr`/`spec_ind_hist`) + the `btb_hit`/
+    `is_call`/`is_ret`/`is_cond` RAS-train bits still re-read live under a hold, so they can drift —
+    but that is ACCURACY-ONLY (every predictor output is validated + corrected at commit; the boot +
+    dhrystone + arch are all bit-exact). Freezing them too (capture the raw btb bundle) is a clean
+    follow-up if the residual +12 % boot / microbench accuracy is worth it.
+  - **Shipped at 0** (all 8 consts reverted; DEAD, byte-identical). The overriding clocked predictor
+    (variant A) is now **correct end-to-end at =1** (boot + dhrystone + arch); the remaining work is
+    IPC (option (B) fast path / F2 FTQ) — a performance, not correctness, item.
 
 ## Independence
 
