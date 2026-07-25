@@ -1231,12 +1231,32 @@ pub module heliodor_core #(
     // the FETCH_REG=1-dead fb_bypass2/fb_fall terms keep symbolically live).
     let a_len0  : logic<64> = if a_is_rvc0 ? 64'd2 : 64'd4;   // slot-0 length (straddle/32b = 4)
     let a_s1_len: logic<64> = if a_s1_is_rvc ? 64'd2 : 64'd4; // slot-1 length
-    let sb_next0: logic<64> = if predicted_taken  ? pred_target  : a_pc + a_len0;
-    let sb_next1: logic<64> = if predicted_taken1 ? pred_target1 : a_s1_pc + a_s1_len;
+    // ── F1 order-item-3a.6: predictor hold-drift fix (PRED_HOLD_FREEZE) ──
+    // Under a skid HOLD (fb full > 1 cyc) the clocked predictor keeps reading the FROZEN ext_pc_q, so
+    // its output drifts from pred(a_pc) to pred(successor); Stage-B then resolves the held bundle with
+    // a STRAY prediction (wrong sb_next0 / slot1_kill / override) → over-eager overrides + mispredicts
+    // (the +48% inversion IPC cost) and the slot-1/boot wrong-path-commit corners. Fix: capture the
+    // ALIGNED resolved prediction on the drain-aligned cycle (produce_q, the cycle after a produce)
+    // and FREEZE it through the hold; Stage-B consumes the frozen *_eff. This is a REGISTERED capture,
+    // NOT a combinational re-present of a_pc — so it avoids the spurious comb loop 3a.3's design pivot
+    // hit. DEAD at 0 (*_eff == the live value → byte-identical). Meaningful only with PRED_OVERRIDE
+    // (Stage-A does not predict otherwise); produce_q is fb_push0 delayed one cycle = the aligned drain.
+    const PRED_HOLD_FREEZE: bit = 0;
+    var produce_q: logic    ;
+    var held_pt0 : logic    ;
+    var held_tgt0: logic<64>;
+    var held_pt1 : logic    ;
+    var held_tgt1: logic<64>;
+    let pt0_eff : logic     = if PRED_HOLD_FREEZE ? (if produce_q ? predicted_taken  : held_pt0 ) : predicted_taken;
+    let tgt0_eff: logic<64> = if PRED_HOLD_FREEZE ? (if produce_q ? pred_target      : held_tgt0) : pred_target;
+    let pt1_eff : logic     = if PRED_HOLD_FREEZE ? (if produce_q ? predicted_taken1 : held_pt1 ) : predicted_taken1;
+    let tgt1_eff: logic<64> = if PRED_HOLD_FREEZE ? (if produce_q ? pred_target1     : held_tgt1) : pred_target1;
+    let sb_next0: logic<64> = if pt0_eff  ? tgt0_eff  : a_pc + a_len0;
+    let sb_next1: logic<64> = if pt1_eff ? tgt1_eff : a_s1_pc + a_s1_len;
     // Slot-1 is KILLED at Stage-B when slot-0 resolved taken (slot-1 is past the taken branch →
     // wrong-path); the fb slot-1 write + count/tail advance suppress it, and the override re-steers
-    // to slot-0's target. DEAD at 0.
-    let sb_slot1_kill: logic = PRED_OVERRIDE && predicted_taken;
+    // to slot-0's target. DEAD at 0. Uses pt0_eff (the frozen aligned prediction under FREEZE).
+    let sb_slot1_kill: logic = PRED_OVERRIDE && pt0_eff;
     // Phase 8 S4a.3: 2-wide push. fb_push0 = the slot-0 delivery (== the S4a.2
     // single push); fb_push1 = the slot-1 delivery (needs slot1_valid + room for
     // a 2nd record). slot-0 pushes to fb_tail, slot-1 to fb_tail+1.
@@ -1253,6 +1273,27 @@ pub module heliodor_core #(
     // the =0 gate DEFERS near-full slot-1 to a future slot-0 exactly as at =0 (byte-identical at
     // 0). The drain still re-checks fb_free>=sb_ops, so a 1-op bundle can still form near-full.
     let fb_push1: logic = fb_push0 && slot1_valid && fb_free >= 4'd2;
+    // F1 order-item-3a.6: capture the aligned resolved prediction (see PRED_HOLD_FREEZE above).
+    // produce_q marks the drain-aligned cycle (fb_push0 of the PREVIOUS cycle → the clocked outputs
+    // now equal pred(a_pc)); on that cycle latch the live prediction into held_*, then freeze it while
+    // the bundle is held (produce_q=0). DEAD at PRED_HOLD_FREEZE=0 (reset-only → every reg + fanin DCE).
+    always_ff (clk, rst) {
+        if_reset {
+            produce_q = 1'b0;
+            held_pt0  = 1'b0;
+            held_tgt0 = 64'd0;
+            held_pt1  = 1'b0;
+            held_tgt1 = 64'd0;
+        } else if PRED_HOLD_FREEZE {
+            produce_q = fb_push0;
+            if produce_q {
+                held_pt0  = predicted_taken;
+                held_tgt0 = pred_target;
+                held_pt1  = predicted_taken1;
+                held_tgt1 = pred_target1;
+            }
+        }
+    }
     // F1 order-item-3 (A): the DELIVERY (prediction applied → RAS / spec-history / FTB-train keyed
     // on it). At PRED_OVERRIDE=1 delivery moves to Stage-B (the skid drain), where the clocked
     // predictor outputs align to the drained bundle; the slot-1 delivery drops out when slot-0
@@ -1593,9 +1634,9 @@ pub module heliodor_core #(
     // capture are squashed and F0/ext_pc_q re-steer to the target. sb_ovr_taken1 already excludes a
     // taken slot-0 (deliver1 carries !sb_slot1_kill = !predicted_taken). Commit/early redirect
     // (any_redirect) outranks it. DEAD at 0 (PRED_OVERRIDE const-false).
-    let sb_ovr_taken1     : logic     = deliver1 && predicted_taken1;
-    let sb_override       : logic     = PRED_OVERRIDE && sb_drain && !any_redirect && (predicted_taken || sb_ovr_taken1);
-    let sb_override_target: logic<64> = if predicted_taken ? pred_target : pred_target1;
+    let sb_ovr_taken1     : logic     = deliver1 && pt1_eff;
+    let sb_override       : logic     = PRED_OVERRIDE && sb_drain && !any_redirect && (pt0_eff || sb_ovr_taken1);
+    let sb_override_target: logic<64> = if pt0_eff ? tgt0_eff : tgt1_eff;
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
