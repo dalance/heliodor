@@ -472,6 +472,243 @@ Known subtleties (discover/handle at implementation):
     (variant A) is now **correct end-to-end at =1** (boot + dhrystone + arch); the remaining work is
     IPC (option (B) fast path / F2 FTQ) — a performance, not correctness, item.
 
+## F1 option (B) L0 fast predictor + F2 FTQ — design (2026-07-25)
+
+Written after 3a.6 made variant (A) correct end-to-end. The remaining gap is IPC:
+the **Stage-B override bubble** — a +1 refill on every taken-cond / return / indirect
+because Stage-A advances SEQUENTIALLY and Stage-B corrects a cycle late (microbench
++24–49 %; boot +12 %). Closing it is option (B) or F2. The audit below establishes
+they are **the same structure at two scales**, so they form one continuous path.
+
+### The unifying insight — L0 fast predictor IS the FTQ producer engine
+
+The override bubble exists because *nothing at Stage-A produces a next-target in time*.
+Both fixes add a **fast, combinational, per-PC next-target predictor** at the front:
+
+- **option (B)** places it at **Stage-A** of the existing extract pipeline. Stage-A
+  advances to the L0-predicted target (0 bubble); the clocked full BTB/BHT/TAGE at
+  Stage-B **overrides only on disagreement** (the classic overriding-predictor pair).
+  The current WORD-FIFO / Stage-A/B structure is otherwise unchanged. **Effort: medium.**
+- **F2** promotes that same fast predictor into a **free-running loop** (PC → L0 →
+  next PC, 1 block/cycle) that **enqueues fetch-block descriptors into an FTQ**; F0
+  (icache read) becomes an FTQ *consumer*, decoupled, so the predictor runs many blocks
+  ahead and hides icache-miss latency. The full clocked predictor is still the override.
+  **Effort: large.**
+
+So the L0 built for (B) is **not throwaway** — it is exactly the engine F2's FTQ
+producer runs. Build order **B → F2** is one structure, incrementally decoupled.
+(This also matches the real µarch: L0/µBTB fast path + L2/TAGE clocked override, then
+the decoupled predictor→FTQ→fetch of Reinman/Calder — heliodor's shipped per-dword FTB
+`ICACHE_FETCH_DIRECTED` is the germ of the F2 block predictor, currently gated OFF under
+PRED_OVERRIDE.)
+
+### What the L0 must reproduce (audit of the extract predictor)
+
+Today's combinational extract prediction (`heliodor_core.veryl:1095/1104/1105`, slot-1
+`:1149/1152/1153`), the thing variant (A) delayed to Stage-B:
+- `predicted_taken = btb_hit && (!btb_is_cond || cond_taken0)`,
+  `cond_taken0 = tage_hit ? tage_taken : bht_taken` (TAGE over gshare BHT).
+- `pred_target = pred_use_ras ? ras_spec_top : pred_use_ibtb ? ibtb_target : btb_target`
+  (return→RAS, indirect→iBTB, else BTB last-target).
+
+The L0 is a **small, realistic (async-read flop RF, below the SRAM floor) approximation**
+of this, read combinationally on `ext_pc_q` at Stage-A:
+- **L0 µBTB** — direct-mapped, tagged, ~32 entries, `{target, is_cond, is_call, is_ret,
+  is_ind}`. (Full BTB is 4096.)
+- **L0 bimodal** — ~128–256 × 2-bit, **PC-indexed (no gshare)** for speed. (Full is 8192 gshare + TAGE.)
+- **L0 RAS peek** — reuse the existing RAS `o_spec_top`/`o_spec_valid` (already combinational
+  flops) at Stage-A for returns (Finding 3's fast-RAS peek). Indirects: **L0 skips them**
+  (no fast iBTB) → they pay the Stage-B override bubble, rare.
+- `l0_taken = l0_hit && (!l0_is_cond || l0_bimodal_taken)`;
+  `l0_target = l0_is_ret ? ras_top : l0_btb_target`.
+
+Realism note (feedback_heliodor_realistic_sram_real_port_config): keep the L0 **small on
+purpose** — a real L0 is fast *because* it is small. CP is NOT the constraint here (retire
+wall 12.8 ns, predictor cone masked ~7 ns below), but sizing the L0 to "whatever CP allows"
+would be structurally dishonest. Start small, **measure the realistic overriding-predictor
+IPC**, and accept it.
+
+### Option (B) — concrete DEAD scaffold (`PRED_L0_FAST`, the 9th const)
+
+New `const PRED_L0_FAST: bit = 0;` (requires the full variant-A flip set — PRED_PIPE +
+PRED_OVERRIDE + {BTB,BHT,TAGE,IBTB}_SYNC_READ + PRED_HOLD_FREEZE + rob::PRED_OVERRIDE).
+Mechanics at =1:
+1. **L0 structures** (µBTB + bimodal flops, async read on `ext_pc_q`), trained at commit
+   off the same taken-control train that fills the full BTB/BHT (a subset — L0 holds the
+   hottest sites). If boot hit-rate is low, add an **L1→L0 fill** (populate L0 from the
+   full BTB on a Stage-B hit) — a realistic second increment.
+2. **Stage-A advance via L0.** `ext_l0_next = l0_taken ? l0_target : ext_seq_next`;
+   `ext_eff_next = PRED_OVERRIDE ? (PRED_L0_FAST ? ext_l0_next : ext_seq_next) : ext_next_pc`.
+   Capture `a_l0_taken`/`a_l0_target` into the skid alongside the bundle.
+3. **Stage-B override on DISAGREEMENT.** The full clocked prediction resolves on `a_pc`
+   (with the 3a.6 hold-freeze). Redefine `sb_override` from "any taken" to "full disagrees
+   with what Stage-A did": `sb_override = (sb_full_taken != a_l0_taken) || (sb_full_taken &&
+   sb_full_target != a_l0_target)`, redirect to the full result. Common case L0==full → **no
+   override, 0 bubble**; residual bubble only on L0 miss / direction-mismatch.
+4. **Correctness net unchanged.** Both L0 and the Stage-B full prediction are SPECULATIVE;
+   commit-time `c_bp_mispredict` (+ the 3a.5 `rob::PRED_OVERRIDE` lane-B guard, still in
+   force) remain authoritative. Option (B) is an **accuracy/IPC change, not correctness** —
+   it rides on the 3a.5+3a.6 fixes. DEAD at 0: every new term under `if PRED_L0_FAST` →
+   byte-identical; L0 arrays reset-only → DCE.
+
+Increment decomposition (each verified, DEAD at 0): **b.1** L0 arrays + commit train
+(no consumer) → **b.2** Stage-A L0 advance (capture a_l0_*) → **b.3** Stage-B
+disagreement-override → **b.4** flip the 9 consts, measure IPC (expect the +48 % to
+collapse toward baseline as far as L0 coverage reaches), regress (test / litmus / boot).
+Optional **b.5** L1→L0 fill if hit-rate is the limiter.
+
+### F2 — FTQ decoupled fetch (sketch, builds on (B)'s L0)
+
+Promote the L0 loop to a free-running producer:
+```
+ predictor loop (L0 fast + clocked full override) ──enqueue──▶ FTQ ──dequeue──▶ F0 (icache read) ─▶ WORD FIFO ─▶ extract/decode
+```
+- **FTQ** = queue of block descriptors `{start_pc, taken, target, pred metadata}`. The
+  predictor loop (L0-driven, 1 block/cycle) fills it regardless of F0's rate; F0 dequeues
+  and reads the icache for each block. This is the second decoupling queue (the WORD FIFO
+  is the existing icache→extract one).
+- **Full predictor = override**, a stage behind L0 in the producer (or checked at decode):
+  a block the full predictor disagrees with squashes the FTQ tail + re-steers — the same
+  override, now at the FTQ granularity.
+- The shipped per-dword FTB is re-cast as the block predictor feeding the loop; the
+  delicate FTB/straddle/WORD-FIFO reconciliation (deferred throughout F1) is the bulk of
+  F2's work. **Large, its own multi-session sub-effort — start after (B) is measured.**
+
+### Recommendation
+
+**B first, then F2.** (B) recovers IPC on the already-correct variant (A), is a clean
+9th-const DEAD scaffold on the current structure, and its L0 is precisely F2's producer
+engine — so no work is wasted and the fast-predictor accuracy is proven before the large
+FTQ restructure. F2 then decouples the same L0 into the run-ahead FTQ, the true Phase-14
+decoupled front end.
+
+### (B) BUILT + MEASURED (b.1–b.4, 2026-07-25) — placement-1 L0 is MARGINAL
+
+Built as three DEAD-at-0 increments (each `veryl test` 252/0 byte-identical), then flipped
+(the 8 variant-A consts + `PRED_L0_FAST` = the 9-const set):
+- **b.1** `l0pred.veryl` (32-entry µBTB + 128-entry PC-bimodal, async-read flop RF, all
+  fields reset — a real flop RF, NOT the SRAM-inference idiom) + instance + commit train +
+  the Stage-A advance arm (`ext_eff_next` L0 target) + slot1 gate. `veryl check` == baseline
+  (zero new warnings).
+- **b.2** `l0_redir` — the Stage-A F0 re-steer (flush WORD FIFO + steer `pc_fetch_q` to the
+  L0 target), the Stage-A analogue of `sb_override`; `sb_override` (older, draining bundle)
+  outranks it. `ext_pc_q` already advanced via b.1's `ext_eff_next`.
+- **b.3** Stage-B disagreement-override: `sb_override` fires only when the clocked FULL
+  slot-0 prediction disagrees with what Stage-A (L0) did (`a_l0_taken`/`a_l0_target` captured
+  in the skid). `sb_next0` (the full prediction) stays the fb_pred_next_pc / commit
+  check-of-record — it equals the L0 target when they agree and the override makes the stream
+  follow full when they disagree, so it is the actual stream next-PC either way.
+
+**b.4 flip @ 9 consts — `veryl test` 252/0, all instret BIT-EXACT (correct), no comb loop.**
+IPC vs base / variant-A (3a.6):
+
+| bench      | base   | variant-A     | L0 cond-ON     | L0 cond-OFF   |
+|------------|--------|---------------|----------------|---------------|
+| dhrystone  | 251423 | 310655 (+24%) | 294328 (+17%)  | 307875 (+23%) |
+| memcpy     | 80099  | 118642 (+48%) | 102650 (+28%)  | 118642 (+48%) |
+| coremark   | 276893 | 411616 (+49%) | 419488 (+51%!) | 407593 (+47%) |
+| boot N=1   | 14.2M  | 15.9M (+12%)  | 15.58M (+9.7%) | 15.81M (+11%) |
+
+**Finding: placement-1 L0 caps at ~1 cycle per L0-predicted taken branch** (the Stage-A vs
+Stage-B earliness) and does NOT remove the dominant bubble (the target's icache-read latency),
+because the L0 sits at extract's Stage-A — BEHIND fetch — so it re-steers F0 one cycle sooner
+but cannot prefetch the taken path ahead of extract. Worse, the L0's weak gshare-less bimodal
+disagrees with the full TAGE on context-dependent conditionals, **double-bubbling** them
+(l0_redir to the wrong side + Stage-B correct):
+- **cond-ON** takes strong-bimodal conditionals → wins on simple loops (memcpy −13%, boot −2%,
+  dhrystone −5%) but **REGRESSES coremark +2%** (its TAGE-favourable branches).
+- **cond-OFF** (unconditional + return only, where the L0 can never disagree with full on
+  direction) never regresses but the win is tiny (< 2% everywhere) — coremark −1%, boot ~0.
+
+Neither config is a clear win. The measurement DECISIVELY confirms the plan's Finding 2/3
+framing: the override bubble is dominated by the target-fetch latency, which only **run-ahead
+fetch (F2 FTQ)** hides — a fast predictor a stage earlier (placement-1) is not enough; the
+predictor must run AHEAD of fetch (placement-2). **Recommendation: pivot to F2**, reusing the
+b.1–b.3 L0 as the FTQ producer's fast engine, with the FULL clocked TAGE (not the weak L0
+bimodal) as the block-direction predictor.
+
+**Shipped at 0** (all 9 consts + `L0_PRED_COND` reverted; `veryl test` 252/0 byte-identical).
+The L0 scaffold (`l0pred.veryl` + the b.1–b.3 datapath) is BANKED DEAD as F2 substrate, not
+enabled — placement-1's marginal, workload-dependent IPC does not justify shipping it live.
+
+## F2 — FTQ decoupled fetch: detailed design (2026-07-25, post-(B) pivot)
+
+The (B) measurement fixed the requirement: to remove the override bubble the fast predictor
+must run **AHEAD of fetch** (placement-2) so the taken path is *prefetched* before extract
+reaches the branch — a predictor read one stage earlier (placement-1) only shaves the Stage-A
+vs Stage-B cycle. Over heliodor's variable-length RVC stream the run-ahead predictor cannot
+decode ahead to find branch offsets, so it must be **per-fetch-address (dword)** — which is
+exactly the shipped **FTB** (`ICACHE_FETCH_DIRECTED`), not the per-branch-PC L0/BTB.
+
+### The key realization — the FTB already IS placement-2; variant-A disabled it
+
+Pre-variant-A (`ICACHE_FETCH_DIRECTED=1`, extract-authoritative) the FTB **re-steers F0** to
+predicted targets, so F0 prefetches the taken path into the WORD FIFO and extract consumes a
+correctly-predicted stream — placement-2 for the FTB-covered branches (unconditional +
+strong-cond). That is why the pre-variant-A baseline has decent IPC. **Variant-A's +48% is
+mostly the cost of GATING THE FTB OFF** (`!PRED_OVERRIDE` on `f0_ftb_hit`/`ext_taken_redir`/
+`f0_diverged`) to make F0 purely sequential — the SIMPLE-(A) recipe did this deliberately to
+avoid the "FIFO-follow reconciliation" it deferred. **F2 is that deferred reconciliation:**
+keep the big BTB/BHT/TAGE **clocked** (variant-A's structural win — the ~35 KB arrays are
+SRAM-registered) AND re-enable the **FTB as the run-ahead F0 driver**, with the clocked full
+predictor at extract as the **override**. FTB fast-path prefetch + clocked-full override = the
+"overriding predictor" the plan named, now correctly placement-2.
+
+### F2-lite (first target) vs F2-full
+
+- **F2-lite — FTB-authoritative F0 + clocked-full override (~1 block ahead).** Re-enable the
+  FTB under PRED_OVERRIDE so F0 follows FTB targets (prefetch); extract's clocked full pred
+  overrides on FTB miss/mispredict (the disagreement-override pattern from (B) b.3, now FTB-vs-
+  full instead of L0-vs-full). This is the deferred FTB reconciliation and recovers the bulk of
+  the +48% (the prefetched taken path removes the icache-latency bubble on FTB-covered branches).
+  Returns/indirects (FTB-excluded) still override → bubble, as today.
+- **F2-full — first-class multi-block FTQ (N blocks ahead).** Decouple the FTB predictor loop
+  from F0 entirely: `pc_pred` advances independently (clocked FTB read → next `pc_pred`), each
+  block enqueued into an **FTQ** {dword_pc, taken, target, gshare_idx/ind_hist/kind for train};
+  F0 dequeues and reads the icache, running many blocks behind the predictor so icache-miss
+  latency is fully hidden and run-ahead prefetch is driven. Generalises F2-lite's 1-ahead FTB
+  into an N-deep queue.
+
+### heliodor realization + the reconciliation challenges
+
+The hard part (why (A) deferred it): with F0 following the FTB, the WORD FIFO holds the
+FTB-predicted (jumping) stream, so extract's `ext_pc_q` is non-sequential vs the FIFO and the
+existing `ext_head_match` / `f0_diverged` / straddle / `f0_no_ftb` corners all re-engage —
+now composed with the Stage-A/B skid + clocked predictors. Specifically:
+- **FTB coverage of returns/indirects.** The FTB excludes them (`!btb_is_ret && !btb_is_ind`),
+  so F0 can't prefetch a return/indirect target — these stay Stage-B overrides. A first-class
+  FTQ could carry a run-ahead RAS for returns (a known decoupled-front-end technique).
+- **FTB direction for conditionals.** The FTB's 2-bit `ftb_conf` (strong-taken==3 follows) is
+  the run-ahead direction — weaker than TAGE, so a strong-FTB-but-TAGE-not-taken cond
+  double-bubbles (the same trap (B) hit). The full TAGE override at extract corrects it; the
+  FTB conf gate bounds how often it fires wrong.
+- **straddle / slot-1 / WORD-FIFO head tracking** must be re-reconciled with a non-sequential
+  F0 stream under the skid — the delicate, already-tuned shape-W logic, now under PRED_OVERRIDE.
+- **Train.** The FTB trains at extract/commit on the delivered prediction (as today); under F2
+  it must train from the clocked-full resolution so the FTB tracks the authoritative predictor.
+
+### Increment plan (DEAD-scaffold, each =0 byte-identical, flip last)
+
+- **f2.1** Re-enable the FTB F0 redirect under PRED_OVERRIDE behind a new `const FTB_OVERRIDE`
+  (couples the `!PRED_OVERRIDE` gates on `f0_ftb_hit`/`ext_taken_redir`/`f0_diverged` to
+  `!PRED_OVERRIDE || FTB_OVERRIDE`). DEAD at 0. This is the substrate — F0 can follow the FTB
+  while the clocked predictors are on.
+- **f2.2** Extract-side reconciliation: make the Stage-A advance / `ext_head_match` / straddle
+  track the FTB-followed (non-sequential) WORD FIFO under PRED_OVERRIDE (the (A)-deferred FIFO
+  follow). DEAD at 0.
+- **f2.3** Stage-B override becomes FTB-vs-clocked-full disagreement (reuse the (B) b.3 pattern:
+  the delivered stream followed the FTB; the clocked full pred overrides on disagreement).
+- **f2.4** Flip (FTB_OVERRIDE + the variant-A set), measure IPC (expect the +48% to collapse —
+  FTB prefetch removes the taken-path icache bubble), regress (test / litmus N4 / boot N2/N4).
+- **f2.5** (F2-full) Promote to a multi-block FTQ + independent `pc_pred` loop + run-ahead RAS.
+
+**Guidance (plan §8.1 / this doc): F2 is a large, delicate multi-session restructure of the
+most-tuned fetch logic (WORD FIFO / FTB / straddle / skid) — best begun in a clean, focused
+context.** The banked L0 (b.1–b.3) is not the F2 producer after all (it is per-PC, extract-side;
+the FTB is the per-dword run-ahead producer) — but the (B) disagreement-override + l0_redir
+flush *patterns* transfer directly to f2.3/f2.1, and the L0 stays available as an extract-side
+secondary fast path if wanted.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with

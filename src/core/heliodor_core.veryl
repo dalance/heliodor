@@ -479,6 +479,10 @@ pub module heliodor_core #(
     var a_slot1_elig  : logic    ; // slot-1 eligibility (slot1_eligible) resolved at Stage-A
     var a_straddle    : logic    ; // straddle_q latched into Stage-A
     var a_ftb_next    : logic<64>; // FTB-followed / delivered next-PC (ext_next_pc); step-4 override compares against it
+    // F1 option (B) b.3: the L0 fast prediction Stage-A applied (l0_taken / l0_pred_target),
+    // carried to Stage-B so the clocked full predictor can OVERRIDE only on DISAGREEMENT.
+    var a_l0_taken    : logic    ; // L0 called slot-0 taken at Stage-A (→ ext_pc_q/F0 steered to a_l0_target)
+    var a_l0_target   : logic<64>; // the L0 target Stage-A steered to
 
     // Phase 8 S4a: fetch buffer (decode queue). Depth-8 FIFO of clean fetched
     // records. Per-field plain arrays (NOT an array of structs) so the
@@ -1089,6 +1093,38 @@ pub module heliodor_core #(
     var ibtb_target : logic<64>;
     var ibtb_hit2   : logic    ;
     var ibtb_target2: logic<64>;
+    // ── F1 option (B): L0 fast predictor (PRED_L0_FAST) — DEAD at 0 ──
+    // The overriding-predictor fast path (l0pred.veryl, cp_predictor_sram_plan.md "F1
+    // option (B)"). Under PRED_OVERRIDE the full BTB/BHT/TAGE are CLOCKED and resolve at
+    // Stage-B, so a bare Stage-A advances sequentially and pays a +1 override bubble on
+    // every taken-cond / return / indirect (the +48% inversion IPC cost). This small
+    // async-read L0 gives Stage-A a fast first guess: it predicts the taken target
+    // combinationally, Stage-A advances there + re-steers F0 (b.2), and the clocked full
+    // predictor at Stage-B OVERRIDES only on disagreement (b.3). Requires the full
+    // variant-A flip set (PRED_OVERRIDE + *_SYNC_READ + PRED_HOLD_FREEZE + rob::PRED_OVERRIDE);
+    // joins it as the 9th const. DEAD at 0: the module trains only under PRED_L0_FAST
+    // (reset-only → DCE) and every consumer folds via `if PRED_L0_FAST` → byte-identical.
+    const PRED_L0_FAST: bit = 0;
+    var l0_hit          : logic    ;
+    var l0_target       : logic<64>;
+    var l0_is_cond      : logic    ;
+    var l0_is_ret       : logic    ;
+    var l0_is_ind       : logic    ;
+    var l0_bimodal_strong: logic   ;
+    // Combine (mirrors predicted_taken / pred_target below, minus the iBTB): a return takes the
+    // RAS peek; a non-return indirect is NOT predicted by L0 (falls through → Stage-B override);
+    // a conditional is taken ONLY when the L0 bimodal is STRONG-taken (else it falls through to
+    // the full TAGE at Stage-B — a weak L0 direction must not double-bubble a hard branch).
+    // Slot-0 only (L0 reads ic_pc).
+    // L0_PRED_COND: whether the L0 predicts CONDITIONAL branches (strong-bimodal) at all. Even a
+    // strong-bimodal L0 direction can disagree with the full TAGE on a context-dependent branch,
+    // double-bubbling it (l0_redir to the wrong side + Stage-B correct). =0 restricts the L0 to
+    // UNCONDITIONAL + RETURN (where it can never disagree with the full on direction), so it can
+    // only ever help; =1 also takes strong-bimodal conditionals (loops). Measurement knob.
+    const L0_PRED_COND: bit = 1;
+    let l0_use_ras    : logic     = l0_hit && l0_is_ret && ras_spec_valid;
+    let l0_taken      : logic     = l0_hit && !l0_is_ind && (!l0_is_cond || (L0_PRED_COND && l0_bimodal_strong));
+    let l0_pred_target: logic<64> = if l0_use_ras ? ras_spec_top : l0_target;
     // A conditional branch is predicted taken per the direction predictor
     // (TAGE over base BHT); JAL/JALR/call/ret (is_cond=0) are predicted
     // taken on any BTB hit.
@@ -1157,7 +1193,11 @@ pub module heliodor_core #(
     // here reads the STALE clocked output), so slot-1 is produced optimistically (assume slot-0
     // not-taken) and SQUASHED at Stage-B if slot-0 resolves taken. Drop the !predicted_taken gate
     // then. Byte-identical at 0 (the term folds back in via `!PRED_OVERRIDE`).
-    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && (PRED_OVERRIDE || !predicted_taken);
+    // F1 option (B): with the L0 fast path, a taken slot-0 IS known at Stage-A (l0_taken),
+    // so slot-1 (past the taken branch) is ineligible again — no need for the optimistic
+    // produce+squash. Without L0 (PRED_L0_FAST=0) keep the PRED_OVERRIDE optimistic path.
+    let slot1_pred_ok : logic = if PRED_OVERRIDE ? (if PRED_L0_FAST ? !l0_taken : 1'b1) : !predicted_taken;
+    let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && slot1_pred_ok;
     // slot-1 needs the next word (rdata_next) unless it is an RVC sitting in the
     // slot-0 word (b1==1 && rvc). Using the next word requires it be in the SAME
     // cache line (→ same page as slot-0, so slot-1's fetch can't fault separately).
@@ -1445,6 +1485,30 @@ pub module heliodor_core #(
         i_recovery_fire : any_redirect      ,
     );
 
+    // F1 option (B): L0 fast predictor instance (see PRED_L0_FAST above). Read on the
+    // Stage-A fetch PC (ic_pc); trained at commit from the same taken-control / cond
+    // stream as the full BTB/BHT, gated by PRED_L0_FAST (reset-only → module DCE at 0).
+    inst u_l0pred: l0pred (
+        clk                                               ,
+        rst                                               ,
+        i_pc               : ic_pc                        ,
+        o_hit              : l0_hit                       ,
+        o_target           : l0_target                    ,
+        o_is_cond          : l0_is_cond                   ,
+        o_is_ret           : l0_is_ret                    ,
+        o_is_ind           : l0_is_ind                    ,
+        o_bimodal_strong   : l0_bimodal_strong            ,
+        i_btb_train_en     : PRED_L0_FAST && btb_train_en ,
+        i_btb_train_pc     : bp_train_pc                  ,
+        i_btb_train_target : btb_train_target             ,
+        i_btb_train_is_cond: btb_train_is_cond            ,
+        i_btb_train_is_ret : btb_train_is_ret             ,
+        i_btb_train_is_ind : btb_train_is_ind             ,
+        i_bht_train_en     : PRED_L0_FAST && bht_train_en ,
+        i_bht_train_pc     : bp_train_pc                  ,
+        i_bht_train_taken  : bht_train_taken              ,
+    );
+
     // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
     // imem_mmu's i_vaddr is the fetch address — advances ahead of pc_q
     // by 2 during straddle so the next-word fetch lands cycle T+1.
@@ -1566,7 +1630,12 @@ pub module heliodor_core #(
     // the predicted ext_next_pc — the taken redirect becomes Stage-B's override (3a.3). DEAD at 0:
     // ext_eff_next folds to ext_next_pc → byte-identical.
     let ext_seq_next: logic<64> = if fb_push1 ? s1_pc + s1_len : ic_pc + pc_advance;
-    let ext_eff_next: logic<64> = if PRED_OVERRIDE ? ext_seq_next : ext_next_pc;
+    // F1 option (B): under PRED_L0_FAST the Stage-A advance follows the L0 fast
+    // prediction (taken slot-0 → l0_pred_target) instead of pure-sequential; the
+    // accompanying F0 re-steer is added in b.2, the Stage-B disagreement-override in
+    // b.3. Folds to ext_seq_next at PRED_L0_FAST=0 → byte-identical.
+    let ext_l0_next : logic<64> = if l0_taken ? l0_pred_target : ext_seq_next;
+    let ext_eff_next: logic<64> = if PRED_OVERRIDE ? (if PRED_L0_FAST ? ext_l0_next : ext_seq_next) : ext_next_pc;
     let ext_pop    : logic     = ICACHE_SYNC_READ && fb_push0 && !straddle_q
         && (ext_eff_next[63:3] != ext_pc_q[63:3]);
     // (b) B1: F0-side FTB lookup on the presented dword. A tag-matched hit predicts an
@@ -1635,8 +1704,29 @@ pub module heliodor_core #(
     // taken slot-0 (deliver1 carries !sb_slot1_kill = !predicted_taken). Commit/early redirect
     // (any_redirect) outranks it. DEAD at 0 (PRED_OVERRIDE const-false).
     let sb_ovr_taken1     : logic     = deliver1 && pt1_eff;
-    let sb_override       : logic     = PRED_OVERRIDE && sb_drain && !any_redirect && (pt0_eff || sb_ovr_taken1);
-    let sb_override_target: logic<64> = if pt0_eff ? tgt0_eff : tgt1_eff;
+    // F1 option (B) b.3: with the L0 fast path, Stage-A ALREADY took the L0-predicted branch
+    // (a_l0_taken → a_l0_target, via l0_redir). The clocked full slot-0 prediction (pt0_eff/tgt0_eff)
+    // now OVERRIDES only on DISAGREEMENT: full and L0 differ on taken, or both taken to different
+    // targets (an aliased/cold L0 entry). A match is the 0-bubble common case — F0 was already steered
+    // to the right target at Stage-A. sb_next0 (the FULL prediction) stays the fb_pred_next_pc / commit
+    // check-of-record: whenever L0 and full agree it equals the L0 target, and whenever they disagree
+    // the override makes the stream follow full — so it is the actual stream next-PC either way. At
+    // PRED_L0_FAST=0, a_l0_taken=0 → sb_disagree0 folds to pt0_eff (the plain "any taken"). Byte-id.
+    let sb_disagree0      : logic     = if PRED_L0_FAST ? ((pt0_eff != a_l0_taken) || (pt0_eff && a_l0_taken && (tgt0_eff != a_l0_target))) : pt0_eff;
+    let sb_override       : logic     = PRED_OVERRIDE && sb_drain && !any_redirect && (sb_disagree0 || sb_ovr_taken1);
+    // Override target: full-taken → full target; else the L0 falsely took slot-0 → the slot-0
+    // fall-through; else slot-1's target. Folds to `pt0_eff ? tgt0_eff : tgt1_eff` at PRED_L0_FAST=0.
+    let sb_override_target: logic<64> = if pt0_eff ? tgt0_eff : (if (PRED_L0_FAST && a_l0_taken) ? a_pc + a_len0 : tgt1_eff);
+    // F1 option (B) b.2: Stage-A F0 re-steer. When the L0 fast predictor calls slot-0 TAKEN at a
+    // Stage-A produce (fb_push0), F0 — streaming sequentially — must re-steer to the L0 target and
+    // the sequential WORD FIFO flush, so the target is fetched now instead of at the Stage-B
+    // override a cycle later (the +1 the L0 fast path recovers). ext_pc_q already advanced to
+    // l0_pred_target via ext_eff_next (b.1); this is the F0-side analogue of sb_override. sb_override
+    // (an OLDER, draining bundle's full-pred correction) OUTRANKS it (a wrong older bundle squashes
+    // this younger produce). The skid still CAPTURES this bundle (the taken branch is correct-path,
+    // unlike sb_override which squashes a wrong-path younger produce). DEAD at 0 (PRED_L0_FAST=0).
+    let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && l0_taken && !sb_override;
+    let l0_redir_target: logic<64> = l0_pred_target;
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -1680,6 +1770,12 @@ pub module heliodor_core #(
                 pc_fetch_q   = {sb_override_target[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
                 f0_no_ftb_q  = 1'b0; // FTB is off under PRED_OVERRIDE
+            } else if l0_redir {
+                // F1 option (B) b.2: Stage-A L0-taken → re-steer F0 to the L0 target dword (one
+                // cycle earlier than sb_override would). DEAD at 0 (l0_redir const-false).
+                pc_fetch_q   = {l0_redir_target[63:3], 3'b000};
+                f0_nc_beat_q = 1'b0;
+                f0_no_ftb_q  = 1'b0;
             } else if ext_taken_redir {
                 pc_fetch_q   = {ext_next_pc[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
@@ -1711,7 +1807,7 @@ pub module heliodor_core #(
             // 32-bit word arrives next cycle as icache_rdata; latch it for the beat-1 assembly.
             // A redirect / taken re-steer voids the in-flight low word (wrong-path).
             f0_nc_lo_inflight_q = f0_present && !ic_dram && !f0_fault && !f0_nc_beat_q
-                && !any_redirect && !ext_taken_redir && !f0_diverged && !sb_override;
+                && !any_redirect && !ext_taken_redir && !f0_diverged && !sb_override && !l0_redir;
             if f0_nc_lo_inflight_q {
                 f0_nc_lo_q = icache_rdata;
             }
@@ -1719,7 +1815,7 @@ pub module heliodor_core #(
             // cycle to land with its data. Only a beat-DONE present pushes (the low-word beat does
             // not). Cleared on a redirect / taken re-steer (fetch is wrong-path). wf_push_nc_q
             // flags a non-cacheable dword — its high word comes from f0_nc_lo_q + icache_rdata.
-            wf_push_valid_q = f0_present && f0_beat_done && !any_redirect && !ext_taken_redir && !f0_diverged && !sb_override;
+            wf_push_valid_q = f0_present && f0_beat_done && !any_redirect && !ext_taken_redir && !f0_diverged && !sb_override && !l0_redir;
             if f0_present && f0_beat_done {
                 wf_push_pc_q     = pc_fetch_q;
                 wf_push_ifault_q = imem_fault_w;
@@ -1742,8 +1838,9 @@ pub module heliodor_core #(
             // Flush on a commit/early redirect OR a predicted-taken re-steer (the buffered
             // words after the taken branch are wrong-path; F0 refetches from the target).
             // F1 order-item-3 (A): sb_override (Stage-B taken redirect) flushes the wrong-path
-            // sequential dwords too. DEAD at 0.
-            if any_redirect || ext_taken_redir || f0_diverged || sb_override {
+            // sequential dwords too. F1 option (B) b.2: l0_redir (Stage-A L0-taken re-steer) flushes
+            // the same wrong-path sequential dwords, a cycle earlier. DEAD at 0.
+            if any_redirect || ext_taken_redir || f0_diverged || sb_override || l0_redir {
                 wf_head  = 3'd0;
                 wf_tail  = 3'd0;
                 wf_count = 4'd0;
@@ -1835,6 +1932,8 @@ pub module heliodor_core #(
             a_slot1_elig    = 1'b0;
             a_straddle      = 1'b0;
             a_ftb_next      = 64'd0;
+            a_l0_taken      = 1'b0;
+            a_l0_target     = 64'd0;
         } else if PRED_PIPE {
             // F1 order-item-3 (A): sb_override (Stage-B taken redirect) flushes the wrong-path
             // Stage-A capture produced THIS cycle (the sequential bundle past the taken branch) —
@@ -1865,6 +1964,8 @@ pub module heliodor_core #(
                 a_slot1_elig    = slot1_eligible;
                 a_straddle      = straddle_q;
                 a_ftb_next      = ext_next_pc;
+                a_l0_taken      = l0_taken;
+                a_l0_target     = l0_pred_target;
             } else if sb_drain {
                 a_valid = 1'b0;
             }
