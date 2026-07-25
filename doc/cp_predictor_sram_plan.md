@@ -689,9 +689,13 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
 
 ### Increment plan (DEAD-scaffold, each =0 byte-identical, flip last)
 
-- **f2.1** Re-enable the FTB F0 redirect under PRED_OVERRIDE behind a new `const FTB_OVERRIDE`
-  (couples the `!PRED_OVERRIDE` gates on `f0_ftb_hit`/`ext_taken_redir`/`f0_diverged` to
-  `!PRED_OVERRIDE || FTB_OVERRIDE`). DEAD at 0. This is the substrate — F0 can follow the FTB
+- **f2.1** ✅ DONE (`dd0f4da`). Re-enable the FTB F0 redirect under PRED_OVERRIDE behind a new
+  `const FTB_OVERRIDE`. The three `!PRED_OVERRIDE` gates that keep the FTB inert are coupled to
+  `!PRED_OVERRIDE || FTB_OVERRIDE`: **`ftb_br_deliver`** (the FTB *train* — this is the actual
+  "f0_ftb_hit off" mechanism: with train gated, no entry is ever written so `f0_ftb_hit` never
+  fires and F0 streams sequentially; `f0_ftb_hit` itself needs no change — it starts firing once
+  the FTB retrains), **`ext_taken_redir`**, **`f0_diverged`**. DEAD at 0: folds to `!PRED_OVERRIDE`
+  → *.sv byte-identical to HEAD; veryl test 252/0. This is the substrate — F0 can follow the FTB
   while the clocked predictors are on.
 - **f2.2** Extract-side reconciliation: make the Stage-A advance / `ext_head_match` / straddle
   track the FTB-followed (non-sequential) WORD FIFO under PRED_OVERRIDE (the (A)-deferred FIFO
