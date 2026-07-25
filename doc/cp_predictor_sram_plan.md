@@ -709,8 +709,20 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
   offset 0 here. DEAD at FTB_OVERRIDE=0: `ext_ftb_follow` const-false → inner mux folds to
   `ext_seq_next`, predicate + `wf_pc[head+1]` read DCE → `ext_eff_next` byte-identical; *.sv
   byte-identical to HEAD, veryl test 252/0. See "f2.2/f2.3 reconciliation design" below.
-- **f2.3** Stage-B override becomes FTB-vs-clocked-full disagreement (reuse the (B) b.3 pattern:
-  the delivered stream followed the FTB; the clocked full pred overrides on disagreement).
+- **f2.3** ✅ DONE (`sb_ovr_soft` prefetch-reuse). Stage-B override = FTB-vs-clocked-full
+  disagreement, realized via the FLUSH condition (cleaner than suppressing the fire — the override
+  must still re-steer ext_pc_q offset-correctly): `sb_override` fires on any taken as before, but a
+  new `sb_ovr_soft` (FTB_OVERRIDE && sb_override && pt0_eff && wf_count>=2 &&
+  wf_pc[wf_head+1][63:3]==tgt0_eff[63:3] — the clocked full target is prefetched at head+1, i.e. the
+  FTB agreed) makes it SOFT: the WORD FIFO is NOT flushed (`sb_override && !sb_ovr_soft` gates the
+  flush), instead the branch dword is popped (wf_head→the prefetched target entry), F0 is NOT
+  re-steered (stays running ahead), and ext_pc_q = sb_override_target (==tgt0_eff, offset-correct) as
+  before → the taken-path icache bubble is removed (only the Stage-A/B skid +1 remains). On
+  DISAGREEMENT (target not prefetched at head+1) it stays HARD = today's flush + F0 re-steer +
+  refetch. sb_disagree0 unchanged. DEAD at FTB_OVERRIDE=0: sb_ovr_soft const-false → hard everywhere,
+  `if sb_ovr_soft{} else if ext_pop{}` folds to `if ext_pop{}`, `sb_override && !sb_ovr_soft` folds to
+  `sb_override` → *.sv byte-identical to HEAD, veryl test 252/0. Edit sites: sb_ovr_soft def, FIFO
+  flush+wf_head always_ff, F0 FSM sb_override arm (ext_pc_q re-steer needs NO change).
 - **f2.4** Flip (FTB_OVERRIDE + the variant-A set), measure IPC (expect the +48% to collapse —
   FTB prefetch removes the taken-path icache bubble), regress (test / litmus N4 / boot N2/N4).
 - **f2.5** (F2-full) Promote to a multi-block FTQ + independent `pc_pred` loop + run-ahead RAS.

@@ -1748,6 +1748,21 @@ pub module heliodor_core #(
     // Override target: full-taken → full target; else the L0 falsely took slot-0 → the slot-0
     // fall-through; else slot-1's target. Folds to `pt0_eff ? tgt0_eff : tgt1_eff` at PRED_L0_FAST=0.
     let sb_override_target: logic<64> = if pt0_eff ? tgt0_eff : (if (PRED_L0_FAST && a_l0_taken) ? a_pc + a_len0 : tgt1_eff);
+    // f2.3: prefetch-reuse soft redirect. Under FTB_OVERRIDE the FTB-followed FIFO has already
+    // prefetched the taken target — F0 jumped at the branch dword so the target dword sits at the
+    // FIFO's next entry (wf_head+1, the f0_prefetched_target position). When sb_override's
+    // offset-correct clocked target (tgt0_eff, since sb_ovr_soft ⟹ pt0_eff ⟹ sb_override_target ==
+    // tgt0_eff) matches that prefetched dword — the FTB agreed with the clocked full pred, the common
+    // case — the override is SOFT: rather than flushing the WORD FIFO and refetching the target (full
+    // icache latency), just POP the branch dword (wf_head → the prefetched target entry), keep the
+    // rest, set ext_pc_q = sb_override_target (offset-correct), and leave F0 running ahead. This
+    // removes the taken-path icache bubble (only the Stage-A/B skid +1 remains). On DISAGREEMENT
+    // (target not prefetched at head+1 — FTB miss / stale-FTB mispredict / different target) the
+    // override stays HARD: today's flush + F0 re-steer + refetch. sb_override still fires either way
+    // (ext_pc_q is re-steered offset-correctly for both); only the FLUSH + F0 re-steer are gated off
+    // on soft. DEAD at FTB_OVERRIDE=0: sb_ovr_soft const-false → hard everywhere → byte-identical.
+    let sb_ovr_soft       : logic     = FTB_OVERRIDE && sb_override && pt0_eff && (wf_count >= 4'd2)
+        && (wf_pc[wf_head + 3'd1][63:3] == tgt0_eff[63:3]);
     // F1 option (B) b.2: Stage-A F0 re-steer. When the L0 fast predictor calls slot-0 TAKEN at a
     // Stage-A produce (fb_push0), F0 — streaming sequentially — must re-steer to the L0 target and
     // the sequential WORD FIFO flush, so the target is fetched now instead of at the Stage-B
@@ -1793,11 +1808,14 @@ pub module heliodor_core #(
                 pc_fetch_q   = {early_redir_pc_q[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
                 f0_no_ftb_q  = early_redir_pc_q[2:1] != 2'b00;
-            } else if sb_override {
+            } else if sb_override && !sb_ovr_soft {
                 // F1 order-item-3 (A): Stage-B taken override — re-steer F0 to the target dword
                 // (the sequential stream past the branch was wrong-path; the WORD FIFO flushes in
                 // its own always_ff). Mutually exclusive with ext_taken_redir/f0_diverged (gated off
-                // under PRED_OVERRIDE). DEAD at 0.
+                // under PRED_OVERRIDE). DEAD at 0. f2.3: only the HARD override re-steers F0; a SOFT
+                // override (sb_ovr_soft) leaves F0 running ahead (it already prefetched the target
+                // past the branch), so `!sb_ovr_soft` skips this arm and F0 keeps streaming. Folds to
+                // `sb_override` at FTB_OVERRIDE=0 → byte-identical.
                 pc_fetch_q   = {sb_override_target[63:3], 3'b000};
                 f0_nc_beat_q = 1'b0;
                 f0_no_ftb_q  = 1'b0; // FTB is off under PRED_OVERRIDE
@@ -1871,7 +1889,10 @@ pub module heliodor_core #(
             // F1 order-item-3 (A): sb_override (Stage-B taken redirect) flushes the wrong-path
             // sequential dwords too. F1 option (B) b.2: l0_redir (Stage-A L0-taken re-steer) flushes
             // the same wrong-path sequential dwords, a cycle earlier. DEAD at 0.
-            if any_redirect || ext_taken_redir || f0_diverged || sb_override || l0_redir {
+            // f2.3: a SOFT override (sb_ovr_soft) does NOT flush — the FTB-followed FIFO already
+            // holds the correct-path target at head+1, so `sb_override && !sb_ovr_soft` (HARD only)
+            // flushes; the soft case falls through to the else arm and pops the branch dword instead.
+            if any_redirect || ext_taken_redir || f0_diverged || (sb_override && !sb_ovr_soft) || l0_redir {
                 wf_head  = 3'd0;
                 wf_tail  = 3'd0;
                 wf_count = 4'd0;
@@ -1888,11 +1909,17 @@ pub module heliodor_core #(
                     wf_gpa[wf_tail]    = wf_push_gpa_q;
                     wf_tail            = wf_tail + 3'd1;
                 }
-                // Extract-side pop: the head dword is consumed when ext_pc_q crosses it.
-                if ext_pop {
+                // f2.3 soft override: pop the branch dword so wf_head advances to the prefetched
+                // target entry (head+1), keeping the rest of the FIFO — the wrong-path Stage-A produce
+                // (its ext_pop) is squashed, so the soft pop is the authoritative single pop this
+                // cycle. Else the normal extract-side pop: the head dword is consumed when ext_pc_q
+                // crosses it. DEAD at 0: sb_ovr_soft const-false → folds to `if ext_pop`.
+                if sb_ovr_soft {
+                    wf_head = wf_head + 3'd1;
+                } else if ext_pop {
                     wf_head = wf_head + 3'd1;
                 }
-                wf_count = wf_count + (if wf_do_push ? 4'd1 : 4'd0) - (if ext_pop ? 4'd1 : 4'd0);
+                wf_count = wf_count + (if wf_do_push ? 4'd1 : 4'd0) - (if (sb_ovr_soft || ext_pop) ? 4'd1 : 4'd0);
             }
         }
     }
