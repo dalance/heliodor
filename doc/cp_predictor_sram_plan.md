@@ -697,14 +697,73 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
   the FTB retrains), **`ext_taken_redir`**, **`f0_diverged`**. DEAD at 0: folds to `!PRED_OVERRIDE`
   → *.sv byte-identical to HEAD; veryl test 252/0. This is the substrate — F0 can follow the FTB
   while the clocked predictors are on.
-- **f2.2** Extract-side reconciliation: make the Stage-A advance / `ext_head_match` / straddle
-  track the FTB-followed (non-sequential) WORD FIFO under PRED_OVERRIDE (the (A)-deferred FIFO
-  follow). DEAD at 0.
+- **f2.2** ✅ DONE (`ext_eff_next` FIFO-follow substrate). Extract-side reconciliation: the Stage-A
+  advance now tracks the FTB-followed (non-sequential) WORD FIFO under PRED_OVERRIDE. New
+  `ext_ftb_follow` predicate — on a sequential dword-cross where the next FIFO entry is a buffered
+  non-sequential FTB target (`wf_count>=2 && !head1_seq`) — makes `ext_eff_next` follow
+  `wf_pc[wf_head+1]` (the dword F0 actually fetched) instead of the sequential successor, so
+  `ext_head_match` holds next cycle (no stall on the non-sequential FIFO) and `ext_pop` consumes the
+  head as the cross is taken. `ext_head_match`/straddle "track" by construction once the advance
+  follows the FIFO (the across-dword read already self-guards on `head1_seq`/`ext_next_valid`). The
+  target's within-dword offset is resolved at Stage-B (`sb_override`, f2.3) — extract resumes at
+  offset 0 here. DEAD at FTB_OVERRIDE=0: `ext_ftb_follow` const-false → inner mux folds to
+  `ext_seq_next`, predicate + `wf_pc[head+1]` read DCE → `ext_eff_next` byte-identical; *.sv
+  byte-identical to HEAD, veryl test 252/0. See "f2.2/f2.3 reconciliation design" below.
 - **f2.3** Stage-B override becomes FTB-vs-clocked-full disagreement (reuse the (B) b.3 pattern:
   the delivered stream followed the FTB; the clocked full pred overrides on disagreement).
 - **f2.4** Flip (FTB_OVERRIDE + the variant-A set), measure IPC (expect the +48% to collapse —
   FTB prefetch removes the taken-path icache bubble), regress (test / litmus N4 / boot N2/N4).
 - **f2.5** (F2-full) Promote to a multi-block FTQ + independent `pc_pred` loop + run-ahead RAS.
+
+### f2.2/f2.3 reconciliation design (the FIFO-follow) — analysis before scaffold
+
+(Analogous to F1 order-item-3's `65fe514` design-analysis-before-scaffold. Pins the mechanism so
+the f2.2/f2.3 DEAD scaffolds and the f2.4 flip have a written target.)
+
+**The core tension (why this is the hard part).** Under PRED_OVERRIDE the authority is inverted:
+Stage-A has NO offset-correct branch target (the clocked BTB/BHT/TAGE resolve at Stage-B). So when
+F0 follows the FTB and jumps `pc_fetch_q` to `{ftb_target[63:3],3'b000}` (dword-aligned, offset
+DROPPED), the WORD FIFO holds a non-sequential stream but Stage-A cannot itself compute where in
+the target dword to resume — it only has the sequential advance (`ext_seq_next`). This is exactly
+why variant (A) gated the F0 FTB off. F2-lite keeps the FTB as a *dword-granular prefetch hint*
+and leaves the offset-correct redirect at Stage-B — "extract stays authoritative" (§24.4), now
+meaning **the clocked full pred at Stage-B is the branch-point/offset authority; the FTB only
+run-ahead-prefetches the target dword.**
+
+**f2.2 — FIFO-follow advance (the substrate).** The one thing Stage-A CAN do without the target
+offset: keep `ext_pc_q`'s DWORD consistent with the non-sequential FIFO. On a dword-crossing
+advance, instead of `ext_seq_next` (which assumes the sequential successor `D0+8`), follow the
+FIFO's next-entry PC `wf_pc[wf_head+1]` — the dword F0 actually fetched (FTB target dword, or the
+sequential successor when F0 did not jump). Effect: `ext_head_match` (`wf_pc[wf_head] ==
+ext_head_dw`) holds next cycle instead of failing → extract does not stall on the non-sequential
+FIFO. The straddle/slot-1 across-dword read already self-guards on the non-sequential head+1 via
+`head1_seq`/`ext_next_valid` (stalls the across-dword read when head+1 is a non-sequential FTB
+target) — so f2.2 is primarily the `ext_eff_next` advance change; the head-match/straddle "track"
+by construction once the advance follows the FIFO. The target's within-dword offset is NOT
+recovered here (Stage-A has no offset) — extract resumes at offset 0 of the target dword; the
+offset is corrected at Stage-B by `sb_override` (offset-correct clocked target). Folds to
+`ext_seq_next` at FTB_OVERRIDE=0 (and whenever head+1 is sequential) → byte-identical.
+
+**f2.3 — Stage-B override = FTB-vs-clocked-full disagreement + prefetch reuse.** Today `sb_override`
+ALWAYS flushes the WORD FIFO and F0 refetches the target (full icache latency) — so the FTB
+prefetch is wasted. f2.3 makes it reuse the prefetch: when the clocked full pred resolves the
+branch and its offset-correct target's DWORD is already buffered in the FIFO (F0's FTB jump was
+right — the common case), `sb_override` does a SOFT redirect (advance `wf_head` to the prefetched
+target entry + set `ext_pc_q = sb_override_target` with the correct offset, NO flush) instead of a
+hard flush+refetch → the taken-path icache-latency bubble is removed (only the Stage-A/B skid +1
+remains). On DISAGREEMENT (FTB missed / mispredicted / different target — stale FTB vs evicted BTB,
+or a strong-FTB-but-TAGE-not-taken cond) it falls back to today's hard flush+refetch. This is the
+(B) b.3 disagreement-override pattern, now FTB-vs-clocked-full instead of L0-vs-full. DEAD at 0.
+
+**Skid-composition corners (expect at f2.4 flip, debug then — cf. 3a.4→3a.6).** The FTB-followed
+FIFO now composes with the 1-deep Stage-A/B skid + clocked predictors: (a) a mid-dword FTB branch
+lets Stage-A cross D0 sequentially into the prefetched target a cycle before `sb_override` fires
+(race between the FIFO-follow cross and the override) — the override still corrects offset+path, so
+worst case is a 1-cycle wrong-dword fetch that is squashed; (b) `f0_diverged`'s straddle/head
+corners re-engage under a non-sequential head+1 and must survive the skid; (c) the FTB `conf` gate
+bounds how often a strong-FTB-but-TAGE-not-taken cond double-bubbles. All of these are correctness-
+preserving (the clocked full pred + `c_bp_mispredict` at commit remain the backstop, as in 3a.6);
+they cost IPC, not correctness, and are tuned at/after the flip.
 
 **Guidance (plan §8.1 / this doc): F2 is a large, delicate multi-session restructure of the
 most-tuned fetch logic (WORD FIFO / FTB / straddle / skid) — best begun in a clean, focused
