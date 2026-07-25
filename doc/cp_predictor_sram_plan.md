@@ -390,7 +390,44 @@ Known subtleties (discover/handle at implementation):
   - **Shipped at 0** (all six consts reverted; repo == the 3a.3(iii) commit, byte-identical). The
     slot-1 bug + the IPC recovery (drift-fix output-register-stall, and/or option (B) fast path)
     are the next increment; a single-issue (slot-1-off) PRED_OVERRIDE=1 is a WORKING but
-    lower-IPC fallback baseline if a dual-issue fix proves hard.
+    lower-IPC fallback baseline if a dual-issue fix proves hard. **[slot-1 bug root-caused + fixed
+    in 3a.5.]**
+- **3a.5 [DONE — slot-1 corner ROOT-CAUSED + FIXED, shipped at 0]** Commit-PC trace bisection
+  (3a.4's planned next step) localized the dhrystone corruption to `Proc_1`'s call of `Proc_3`.
+  - **Mechanism.** A 2-op bundle {slot-0 `c.ld`@0x13a, slot-1 `c.sd`@0x13c} held in the a_* skid
+    (fb full) ≥2 cyc lets `ext_pc_q` drift to 0x13e (`jal Proc_3`); the clocked predictor output
+    then drifts to pred(0x13e)=TAKEN / target 0xe4. At the drain the drifted `predicted_taken`=1 →
+    `sb_slot1_kill` drops the store 0x13c, `sb_override` steers F0 to 0xe4 (skipping the jal 0x13e),
+    and the non-branch slot-0 (0x13a) is delivered carrying a stray `pred_next`=0xe4.
+  - **Root cause.** 0x13a retires on **commit lane B (`commit2`)**, which does NOT run the
+    commit-time mispredict check (`c_bp_mispredict` is head/lane-0 only). Lane B relied on the
+    invariant "a simple non-control op always falls through" — true for the plain predictor, but
+    PRED_OVERRIDE's drift/override breaks it. The stray `pred_next`=0xe4 is thus never validated;
+    the ROB holds 0x13a→0xe4 (skipping store 0x13c + jal 0x13e), `ra` is never written, and Proc_3
+    returns to garbage → runaway. Exactly the "wrong-bytes / skipped, next-PC-matches" class 3a.4 named.
+  - **Fix (`rob.veryl` only, DEAD at 0).** `c2_valid` under `PRED_OVERRIDE` additionally requires the
+    head+1 op's recorded `pred_next` == its fall-through (== arch_next for a non-control op, which
+    lane-B ops always are). A stray/mispredicting simple op is thereby kept OFF lane B and deferred
+    to the head, where `c_bp_mispredict` fires and redirects to the fall-through — recovering the
+    skipped store+jal. Written as `if PRED_OVERRIDE ? guarded : original`; the rob-internal
+    `const PRED_OVERRIDE` is **FLIP-COUPLED** to the core's (flip both together — a mismatched pair
+    silently re-opens the corner). `heliodor_core.sv` stays byte-identical; `rob.sv` adds only the
+    inert mux. Flip set is now **7 consts** (the six + `rob::PRED_OVERRIDE`).
+  - **Verify @ =1 (7 consts flipped).** dhrystone PASS, **instret 264834 == base (BIT-EXACT)**,
+    316680 cy (+26% vs 251423 base — and faster than the 380185-cy single-issue slot-1-off fallback,
+    so the dual-issue overriding predictor now works AND beats that baseline). full `veryl test` 252/0
+    (fast + arch). @ =0: `veryl test` 252/0; SV byte-identical (cycle-exact DEAD scaffold).
+  - **REMAINING — 2nd corner (boot, DISTINCT from slot-1).** With the fix, N=1 Linux boot @ =1 no
+    longer corrupts early, but hits a separate infinite loop: from cyc ~6.0M the commit head pins to a
+    kernel siphash-style leaf at PA 0x800b9be2–bf2 forever (heartbeat: PC frozen, retire count still
+    creeping at IPC ~0.1). The `ret`@0x800b9bf2 resolves `ra`=0x800b9be2 — i.e. `ra` is corrupted to
+    point back into the callee → self-return loop. dhrystone + all arch are bit-exact with the fix, so
+    this is NOT the lane-B slot-1 case; it is a separate PRED_OVERRIDE data/`ra`-corruption path the
+    boot's early page-table/mem-init (~0x80010cxx, entry ~cyc 6.2M) exercises. Localized but not yet
+    root-caused. **Next debug step:** window the commit trace at the ~6.2M loop entry and find the
+    jal/store whose effect on `ra` is lost.
+  - **Shipped at 0** (all 7 consts reverted; the fix is DEAD, byte-identical). Next increment: the
+    boot 2nd corner, then IPC recovery (drift-fix output-register-stall / option (B) fast path).
 
 ## Independence
 
