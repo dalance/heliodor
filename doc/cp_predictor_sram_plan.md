@@ -745,6 +745,25 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     commit-PC trace; boot needs c_instr + register-operand trace like 3a.5's udelay corner).
 - **f2.4-fix** (next) Root-cause + fix the 2 corners, then re-flip + full regress (test / litmus N4 /
   boot N2/N4), ship at 0 with the flip validated (cf. 3a.4→3a.5→3a.6).
+
+  **Flip recipe (the 9-const F2-lite set; PRED_L0_FAST stays 0):**
+  ```
+  sed -i 's/const PRED_PIPE: bit = 0;/const PRED_PIPE: bit = 1;/'             src/core/heliodor_core.veryl
+  sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'     src/core/heliodor_core.veryl
+  sed -i 's/const FTB_OVERRIDE: bit = 0;/const FTB_OVERRIDE: bit = 1;/'       src/core/heliodor_core.veryl
+  sed -i 's/const PRED_HOLD_FREEZE: bit = 0;/const PRED_HOLD_FREEZE: bit = 1;/' src/core/heliodor_core.veryl
+  sed -i 's/const IBTB_SYNC_READ: bit = 0;/const IBTB_SYNC_READ: bit = 1;/'   src/core/ibtb.veryl
+  sed -i 's/const BHT_SYNC_READ: bit = 0;/const BHT_SYNC_READ: bit = 1;/'     src/core/bht.veryl
+  sed -i 's/const BTB_SYNC_READ: bit = 0;/const BTB_SYNC_READ: bit = 1;/'     src/core/btb.veryl
+  sed -i 's/const TAGE_SYNC_READ: bit = 0;/const TAGE_SYNC_READ: bit = 1;/'   src/core/tage.veryl
+  sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'     src/core/rob.veryl
+  ```
+  Revert with `git checkout -- src/core/{heliodor_core,ibtb,bht,btb,tage,rob}.veryl`. Bisect f2.3 by
+  editing `let sb_ovr_soft ... = FTB_OVERRIDE &&` → `= 1'b0 && FTB_OVERRIDE &&` (isolates f2.3: with
+  it forced 0, dhrystone was bit-exact but boot still hung ⇒ boot hang is f2.1/f2.2). Correctness
+  check = dhrystone **instret == 264834** (NOT tohost — tohost=1 lies under this corruption). Baseline
+  dhrystone at =0: cy 251423 / instret 264834. Known-good ref: 3a.6 variant-A (FTB_OVERRIDE=0) boots
+  N1 at ~15.9M. Boot-hang signature: cy=45M timeout, x3=0x80a85b60. Litmus-hang: 30M, harts ~0x800007b8.
 - **f2.5** (F2-full) Promote to a multi-block FTQ + independent `pc_pred` loop + run-ahead RAS.
 
 ### f2.2/f2.3 reconciliation design (the FIFO-follow) — analysis before scaffold
