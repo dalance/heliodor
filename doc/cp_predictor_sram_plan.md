@@ -417,17 +417,31 @@ Known subtleties (discover/handle at implementation):
     316680 cy (+26% vs 251423 base — and faster than the 380185-cy single-issue slot-1-off fallback,
     so the dual-issue overriding predictor now works AND beats that baseline). full `veryl test` 252/0
     (fast + arch). @ =0: `veryl test` 252/0; SV byte-identical (cycle-exact DEAD scaffold).
-  - **REMAINING — 2nd corner (boot, DISTINCT from slot-1).** With the fix, N=1 Linux boot @ =1 no
-    longer corrupts early, but hits a separate infinite loop: from cyc ~6.0M the commit head pins to a
-    kernel siphash-style leaf at PA 0x800b9be2–bf2 forever (heartbeat: PC frozen, retire count still
-    creeping at IPC ~0.1). The `ret`@0x800b9bf2 resolves `ra`=0x800b9be2 — i.e. `ra` is corrupted to
-    point back into the callee → self-return loop. dhrystone + all arch are bit-exact with the fix, so
-    this is NOT the lane-B slot-1 case; it is a separate PRED_OVERRIDE data/`ra`-corruption path the
-    boot's early page-table/mem-init (~0x80010cxx, entry ~cyc 6.2M) exercises. Localized but not yet
-    root-caused. **Next debug step:** window the commit trace at the ~6.2M loop entry and find the
-    jal/store whose effect on `ra` is lost.
+  - **REMAINING — 2nd corner (boot, DISTINCT from slot-1; further localized).** With the fix, N=1
+    Linux boot @ =1 no longer corrupts early but HANGS from cyc ~6M — the commit head pins (heartbeat)
+    to a **`rdtime`-based `udelay` spin at VA 0x800b9bde–bf2**: `bde: rdtime a4` (start), then the loop
+    `be2: rdtime a5; be6: sub a5,a5,a4 (elapsed); be8: bltu a5,a0,→bee; bec: ret (exit); bee: (dead);
+    bf2: j be2` — adjacent to a `memcpy` at 0x800b9c8c–d32. (The earlier "siphash / `ra`=0x800b9be2
+    self-return" note was a MIS-ALIGNED-disasm artifact; the trace's committed `c_instr` confirms
+    VA→PA offset 0 and the real ops.) The delay's `bltu` exit fires normally around cyc 15M (elapsed
+    reaches a0 → `ret`), but by cyc 30M it **never exits** (be8 taken 1432/1432) and the PC never
+    returns to a higher-level caller for 58M+ cycles → an **outer loop that repeatedly calls this
+    udelay is non-terminating**, and/or one udelay's `a4` baseline resets so `elapsed = rdtime−a4`
+    never reaches the target (elapsed observed sawtoothing 0→~0x27ff). The loop carries periodic drift
+    mispredicts (`be6` mp=1, pred_next skips be8) that ARE caught on lane 0 — so the escape is a
+    DIFFERENT wrong-path-commit path than slot-1 (dhrystone+arch stay bit-exact). Behaviour is
+    **time-varying** (completes ~15M, stuck ~30M). Not yet root-caused — needs register-operand
+    (a0 / a4 / outer-loop-counter) tracing to pin the corrupted value.
+  - **Strategic note (next-increment choice).** The hold-drift is the shared root of the slot-1 corner
+    (fixed here) and very likely this boot corner. The **drift-fix — a per-module read-enable that
+    FREEZES the predictor output register during a skid hold** (the option deferred at 3a.3's design
+    pivot, where the naive combinational re-present closed a spurious comb loop) — removes the stray
+    predictions at the source AND recovers the +48 % IPC. It therefore addresses both the remaining
+    correctness corner and the viability gap in ONE structural step, so it is the higher-value next
+    increment over continuing to chase this specific corner's corrupting commit.
   - **Shipped at 0** (all 7 consts reverted; the fix is DEAD, byte-identical). Next increment: the
-    boot 2nd corner, then IPC recovery (drift-fix output-register-stall / option (B) fast path).
+    drift-fix (predictor output-register freeze) — resolves IPC + likely the boot corner — else option
+    (B) L0 fast predictor.
 
 ## Independence
 
