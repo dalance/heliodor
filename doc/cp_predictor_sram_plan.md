@@ -723,8 +723,28 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
   `if sb_ovr_soft{} else if ext_pop{}` folds to `if ext_pop{}`, `sb_override && !sb_ovr_soft` folds to
   `sb_override` → *.sv byte-identical to HEAD, veryl test 252/0. Edit sites: sb_ovr_soft def, FIFO
   flush+wf_head always_ff, F0 FSM sb_override arm (ext_pc_q re-steer needs NO change).
-- **f2.4** Flip (FTB_OVERRIDE + the variant-A set), measure IPC (expect the +48% to collapse —
-  FTB prefetch removes the taken-path icache bubble), regress (test / litmus N4 / boot N2/N4).
+- **f2.4** ⏳ FLIPPED + MEASURED — 2 corners found, bisected, reverted to =0 (ship-safe). Flip = 9
+  const (variant-A 8-set + FTB_OVERRIDE; PRED_L0_FAST stays 0). Builds, **no comb loop**. Results:
+  - `veryl test` **251/1** — `test_litmus_2hart` TIMEOUT (tohost=0, cy=30M vs normal ~2.1M; both
+    harts stuck ~0x800007b8). arch suite + all else pass.
+  - **dhrystone SILENT CORRUPTION** — instret **213489 vs base 264834** (~51k insts skipped),
+    tohost=1 MISLEADING (3a.4 lesson: instret bit-exactness, not tohost, is the correctness check).
+  - **N1 boot HANG** — cy=45M timeout (x3=0x80a85b60), did not reach SBI shutdown.
+  - **Bisection — `sb_ovr_soft` forced 0 (f2.3 soft-redirect OFF, keep f2.1 train + f2.2 follow +
+    hard override)**: dhrystone **BIT-EXACT 264834**, cy 319915 (**+27%** = variant-A train+follow
+    cost, no prefetch benefit since hard-flush wastes it) → **f2.3 = the dhrystone-corruption
+    culprit**. BUT N1 boot **STILL hangs identically** (45M, same x3=0x80a85b60) → **the boot hang is
+    f2.1/f2.2 (FTB train + FIFO-follow), NOT f2.3** — a boot-path-specific forward-progress failure
+    that the tight dhrystone loop doesn't trigger.
+  - **⇒ TWO independent bugs**: (1) f2.3 soft-redirect silently skips insts (hypothesis: the
+    head+1 target assumption + wf_count/pop bookkeeping under the Stage-A/B skid — the timing corner
+    flagged in the design analysis; boundary-vs-mid-dword branch changes whether the target sits at
+    head or head+1). (2) f2.1/f2.2 boot hang (needs further bisect: f2.1's re-engaged
+    ext_taken_redir/f0_diverged vs f2.2's follow advance; and ICACHE_FTB_COND on/off = the
+    conditional-FTB double-bubble risk the design flagged). Next: trace root-cause both (cf. 3a.5
+    commit-PC trace; boot needs c_instr + register-operand trace like 3a.5's udelay corner).
+- **f2.4-fix** (next) Root-cause + fix the 2 corners, then re-flip + full regress (test / litmus N4 /
+  boot N2/N4), ship at 0 with the flip validated (cf. 3a.4→3a.5→3a.6).
 - **f2.5** (F2-full) Promote to a multi-block FTQ + independent `pc_pred` loop + run-ahead RAS.
 
 ### f2.2/f2.3 reconciliation design (the FIFO-follow) — analysis before scaffold
