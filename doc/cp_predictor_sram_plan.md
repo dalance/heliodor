@@ -743,8 +743,47 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     ext_taken_redir/f0_diverged vs f2.2's follow advance; and ICACHE_FTB_COND on/off = the
     conditional-FTB double-bubble risk the design flagged). Next: trace root-cause both (cf. 3a.5
     commit-PC trace; boot needs c_instr + register-operand trace like 3a.5's udelay corner).
-- **f2.4-fix** (next) Root-cause + fix the 2 corners, then re-flip + full regress (test / litmus N4 /
-  boot N2/N4), ship at 0 with the flip validated (cf. 3a.4→3a.5→3a.6).
+- **f2.4-fix** ⏳ IN PROGRESS — 2 leaks ROOT-CAUSED + FIXED (both DEAD-at-0, veryl test 252/0), boot
+  advances from the early idle-task panic all the way to **userspace init**; a 3rd leak remains. The
+  fixes are committed at 0 (behavior-inert scaffold, cf. the f1 skid additions); re-flip validation
+  waits on the remaining boot leak(s). Debug method = 3a.5 commit-PC trace + a "first novel PC" diff
+  vs a variant-A (FTB_OVERRIDE=0) boot PC-set, then trace the corrupted value/bytes back to the
+  produce/fb-write (add a `$display` gated on the exact PC/value/instr).
+  - **Corner 1 [FIXED — `a_eff_next`]** dhrystone silent corruption (was: 51k insts skipped, instret
+    213489 vs 264834). Root: under FTB_OVERRIDE `ext_ftb_follow` (f2.2) advances extract NON-
+    sequentially to the FTB target dword at OFFSET 0. When the clocked-full pred resolves the branch
+    NOT-taken (pt0_eff=0, FTB-vs-full disagreement) `sb_override` does not fire, so extract is
+    stranded at the offset-0 target — but the recorded pred_next (`sb_next0` not-taken arm) used the
+    SEQUENTIAL fall-through (`a_pc + a_len0`), which equalled the branch's arch_next, MASKING
+    `c_bp_mispredict` so the wrong-path offset-0 instr silently retired (the strcpy 0x9a→0x98 leak:
+    `bnez` at 0xa6 delivered 0x98 `mv a5,a0` instead of 0x9a). **Fix:** capture the ACTUAL Stage-A
+    advance `a_eff_next = ext_eff_next` at produce (the true delivered successor) and record IT on the
+    not-taken arm: `sb_next0 = pt0_eff ? tgt0_eff : (a_push1 ? a_pc+a_len0 : a_eff_next)`, `sb_next1 =
+    pt1_eff ? tgt1_eff : a_eff_next`. Now pred_next == delivered successor → the mispredict fires and
+    flushes the leak. dhrystone **bit-exact 264834** (PC stream identical to base; cy 333910). Folds to
+    ext_seq_next at FTB_OVERRIDE=0 → variant-A/HEAD unchanged.
+  - **Corner 2 [FIXED — `ext_next_valid` !ext_bypass]** boot garbage-ra panic (`epc=ra=0xf00406c88…`,
+    "Attempted to kill the idle task"). Root: an across-dword slot-1 (or straddle slot-0) reads the
+    next word from `wf_data[head+1]`, but during an `ext_bypass` the slot-0 comes from the ARRIVING
+    push, NOT `wf_data[head]` — head lags ext_pc_q (points at an OLDER FIFO entry), so `wf_data[head+1]`
+    is NOT ext_pc_q's next dword and the `head1_seq` guard (head vs head+1) is irrelevant. The old code
+    relied on `wf_count~0` during a bypass to fail `wf_count >= 2`, but under FTB_OVERRIDE the FTB-follow
+    leaves stale older entries → a bypass fired with wf_count=2 → the slot-1 read a WRONG dword (boot:
+    slot-1 at 0x80202e20 got `slli ra,ra,29` (0x01d09093) from the stale head+1 instead of `sub a5`,
+    writing x1=garbage → a later `ret` jumped to it). **Fix:** `ext_next_valid`'s across-dword arm gets
+    `&& (!FTB_OVERRIDE || !ext_bypass)` — the across-dword read only consumes head+1 when head IS
+    ext_pc_q's dword; the slot-1/straddle just waits a cycle during a bypass. DEAD at FTB_OVERRIDE=0.
+  - **Corner 3 [OPEN]** boot init SIGSEGV (exitcode 0xb, "Attempted to kill init"). After corners 1+2
+    boot reaches userspace init, then init faults. First novel PC (vs variant-A) = `c.beqz a5` at
+    0x800bbc4a branching on a5 = bit-3 of `tp[0]` (thread-local) — a DATA corruption of tp/tp[0], root
+    not yet traced (likely another wrong-path leak, possibly more after it). Next: trace the tp[0]
+    (or tp) corruption back to its producing instruction, same method as corners 1/2.
+  - **IPC note (partial):** at =1 (both fixes) dhrystone is 333910 cy = **+33% vs base, WORSE than
+    variant-A's +26%** — the FTB-vs-clocked disagreement-recovery flush (every loop-exit / TAGE
+    disagreement) costs more than the FTB prefetch saves on dhrystone's tiny strcpy/strcmp loops. Only
+    dhrystone measured (f2.4's worst case: short loops); boot/coremark/longer-loop IPC unmeasured and
+    may favour f2.4. IPC tuning (recover the disagreement flush at Stage-B instead of via early/commit
+    redirect) is a post-correctness item.
 
   **Flip recipe (the 9-const F2-lite set; PRED_L0_FAST stays 0):**
   ```

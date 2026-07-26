@@ -494,6 +494,13 @@ pub module heliodor_core #(
     var a_slot1_elig  : logic    ; // slot-1 eligibility (slot1_eligible) resolved at Stage-A
     var a_straddle    : logic    ; // straddle_q latched into Stage-A
     var a_ftb_next    : logic<64>; // FTB-followed / delivered next-PC (ext_next_pc); step-4 override compares against it
+    // f2.4-fix: the ACTUAL Stage-A advance (ext_eff_next) captured at produce = the PC of the next
+    // instruction extract delivered after this bundle. Under FTB_OVERRIDE ext_ftb_follow (f2.2)
+    // advances NON-sequentially to the FTB target dword (offset 0); the recorded pred_next of the
+    // bundle's LAST delivered slot MUST equal this actual successor (not the sequential fall-through),
+    // else the commit-time c_bp_mispredict backstop is masked and a wrong-path offset-0 instr silently
+    // retires (the strcpy 0x98 leak). Folds to ext_seq_next at FTB_OVERRIDE=0 → variant-A unchanged.
+    var a_eff_next    : logic<64>; // = ext_eff_next at produce (the delivered next-PC)
     // F1 option (B) b.3: the L0 fast prediction Stage-A applied (l0_taken / l0_pred_target),
     // carried to Stage-B so the clocked full predictor can OVERRIDE only on DISAGREEMENT.
     var a_l0_taken    : logic    ; // L0 called slot-0 taken at Stage-A (→ ext_pc_q/F0 steered to a_l0_target)
@@ -963,7 +970,19 @@ pub module heliodor_core #(
     // boundary (ext_pc_q[2]=1) the next FIFO entry must be buffered (wf_count >= 2) AND — under
     // fetch-directed prefetch — be the sequential successor (else the straddle/slot-1 stalls and
     // f0_diverged re-fetches this dword sequentially; see the recovery below).
-    let ext_next_valid: logic = if ext_pc_q[2] ? (wf_count >= 4'd2 && (!ICACHE_FETCH_DIRECTED || head1_seq)) : 1'b1;
+    // f2.4-fix: the across-dword next word (ext_word_next = wf_data[head+1]) is only the SLOT-0
+    // dword's successor when head == ext_pc_q's dword (ext_head_match). During an ext_bypass the
+    // slot-0 comes from the ARRIVING push (wf_push_dword), NOT wf_data[head] — head points at an
+    // OLDER FIFO entry, so wf_data[head+1] is NOT ext_pc_q's next dword and head1_seq (comparing
+    // head vs head+1) is irrelevant to it. The old code relied on wf_count~0 during a bypass to
+    // fail the `wf_count >= 2` gate, but under FTB_OVERRIDE the FTB-follow leaves stale older
+    // entries so a bypass can fire with wf_count>=2 — then the across-dword straddle/slot-1 read a
+    // WRONG dword (the boot `slli ra,ra,29` garbage-ra leak). Require !ext_bypass so the across-dword
+    // read only consumes head+1 when head is ext_pc_q's dword; the straddle/slot-1 just wait a cycle
+    // during a bypass (its real next dword is the push's not-yet-fetched successor). Gated on
+    // FTB_OVERRIDE (folds away at 0 → byte-identical; the lagging-head bypass only arises under the
+    // FTB-follow timing, variant-A/HEAD boot clean without it).
+    let ext_next_valid: logic = if ext_pc_q[2] ? (wf_count >= 4'd2 && (!ICACHE_FETCH_DIRECTED || head1_seq) && (!FTB_OVERRIDE || !ext_bypass)) : 1'b1;
     let ic_pc         : logic<64> = if ICACHE_SYNC_READ ? ext_pc_q      : pc_q;
     let ic_rdata      : logic<32> = if ICACHE_SYNC_READ ? ext_word      : icache_rdata;
     let ic_rdata_next : logic<32> = if ICACHE_SYNC_READ ? ext_word_next : icache_rdata_next;
@@ -1306,8 +1325,16 @@ pub module heliodor_core #(
     let tgt0_eff: logic<64> = if PRED_HOLD_FREEZE ? (if produce_q ? pred_target      : held_tgt0) : pred_target;
     let pt1_eff : logic     = if PRED_HOLD_FREEZE ? (if produce_q ? predicted_taken1 : held_pt1 ) : predicted_taken1;
     let tgt1_eff: logic<64> = if PRED_HOLD_FREEZE ? (if produce_q ? pred_target1     : held_tgt1) : pred_target1;
-    let sb_next0: logic<64> = if pt0_eff  ? tgt0_eff  : a_pc + a_len0;
-    let sb_next1: logic<64> = if pt1_eff ? tgt1_eff : a_s1_pc + a_s1_len;
+    // f2.4-fix: the not-taken pred_next MUST equal the actual delivered successor (a_eff_next), not
+    // the sequential fall-through, so the FTB-follow (f2.2) non-sequential advance stays consistent
+    // with the recorded prediction and the commit c_bp_mispredict backstop fires on a disagreement
+    // (FTB ran ahead to the target but the clocked full resolved not-taken → extract stranded at the
+    // target's offset-0; recording that here makes commit catch + flush it). For the LAST delivered
+    // slot the successor is a_eff_next; slot-0 in a dual bundle is followed by slot-1 (a_pc+a_len0 =
+    // a_s1_pc). a_eff_next folds to ext_seq_next at FTB_OVERRIDE=0 (= a_pc+a_len0 slot-0-only /
+    // a_s1_pc+a_s1_len dual) → variant-A unchanged; DEAD at PRED_OVERRIDE=0 (sb_next* unused → DCE).
+    let sb_next0: logic<64> = if pt0_eff ? tgt0_eff : (if a_push1 ? a_pc + a_len0 : a_eff_next);
+    let sb_next1: logic<64> = if pt1_eff ? tgt1_eff : a_eff_next;
     // Slot-1 is KILLED at Stage-B when slot-0 resolved taken (slot-1 is past the taken branch →
     // wrong-path); the fb slot-1 write + count/tail advance suppress it, and the override re-steers
     // to slot-0's target. DEAD at 0. Uses pt0_eff (the frozen aligned prediction under FREEZE).
@@ -1990,6 +2017,7 @@ pub module heliodor_core #(
             a_slot1_elig    = 1'b0;
             a_straddle      = 1'b0;
             a_ftb_next      = 64'd0;
+            a_eff_next      = 64'd0;
             a_l0_taken      = 1'b0;
             a_l0_target     = 64'd0;
         } else if PRED_PIPE {
@@ -2022,6 +2050,7 @@ pub module heliodor_core #(
                 a_slot1_elig    = slot1_eligible;
                 a_straddle      = straddle_q;
                 a_ftb_next      = ext_next_pc;
+                a_eff_next      = ext_eff_next;
                 a_l0_taken      = l0_taken;
                 a_l0_target     = l0_pred_target;
             } else if sb_drain {
