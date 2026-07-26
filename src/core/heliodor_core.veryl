@@ -1672,8 +1672,18 @@ pub module heliodor_core #(
     // spot at the icache inst) so the shape-W 2-beat non-cacheable F0 below can read it.
     // imem_paddr_w is a forward-declared var (assigned by the imem_mmu inst further down).
     let ic_dram: logic = imem_paddr_w[63:25] == 39'h40;
+    // f2.5b: F0's actual fetch address. Under FTQ_DECOUPLE F0 no longer advances its own pointer
+    // via its FTB read — it DEQUEUES the FTQ head (which pc_pred filled). When the FTQ is momentarily
+    // empty (the cycle after a redirect flush, before pc_pred refills — the decoupled-front-end
+    // redirect bubble) fall back to pc_pred (a valid predicted address) rather than the stale ftq
+    // slot, so the always-on MMU translate (i_req=!any_redirect) never walks a garbage address;
+    // f0_present is gated off then anyway (ftq empty), so no fetch is presented. At FTQ_DECOUPLE=0
+    // this folds to pc_fetch_q → byte-identical, and pc_fetch_q's coupled FTB loop stays authoritative.
+    let f0_fetch_pc: logic<64> = if FTQ_DECOUPLE ? (if ftq_count >= 4'd1 ? ftq_pc[ftq_head] : pc_pred) : pc_fetch_q;
+    // f2.5b: under FTQ_DECOUPLE F0 presents only when the FTQ has an entry to consume (else it waits
+    // for pc_pred to refill — the +1 redirect bubble). Folds to unchanged at 0 (`!0 || ...` == 1).
     let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall_comb && !wf_full
-        && (imem_valid_w || imem_fault_w || imem_acc_fault_w);
+        && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && (!FTQ_DECOUPLE || ftq_count >= 4'd1);
     // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
     // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
     let wf_do_push: logic = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall;
@@ -1773,7 +1783,7 @@ pub module heliodor_core #(
     let f0_diverged: logic = ICACHE_SYNC_READ && ICACHE_FETCH_DIRECTED && (!PRED_OVERRIDE || FTB_OVERRIDE) && !any_redirect
         && (
             (!ext_head_match && (wf_count >= 4'd1)
-             && (pc_fetch_q[63:3] != ext_pc_q[63:3])
+             && (f0_fetch_pc[63:3] != ext_pc_q[63:3]) // f2.5b: F0's actual fetch dword (FTQ head under FTQ_DECOUPLE); folds to pc_fetch_q at 0
              && !(wf_push_valid_q && (wf_push_pc_q[63:3] == ext_pc_q[63:3])))
             || (ext_head_match && needs_straddle && ext_pc_q[2] && (wf_count >= 4'd2) && !head1_seq)
         );
@@ -1837,6 +1847,9 @@ pub module heliodor_core #(
     let pp_ftb_target: logic<64> = ftb_target[pp_ftb_idx];
     let pp_next      : logic<64> = if pp_ftb_hit ? {pp_ftb_target[63:3], 3'b000} : pc_pred + 64'd8;
     let ftq_full     : logic     = ftq_count >= 4'd8;
+    // f2.5b: F0 dequeues the FTQ head when it presents + completes a fetch of it (beat-done, so a
+    // non-cacheable 2-beat dword pops once). Gated FTQ_DECOUPLE → DCE at 0.
+    let f0_ftq_pop   : logic     = FTQ_DECOUPLE && f0_present && f0_beat_done;
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -1930,7 +1943,7 @@ pub module heliodor_core #(
             // flags a non-cacheable dword — its high word comes from f0_nc_lo_q + icache_rdata.
             wf_push_valid_q = f0_present && f0_beat_done && !any_redirect && !ext_taken_redir && !f0_diverged && !sb_override && !l0_redir;
             if f0_present && f0_beat_done {
-                wf_push_pc_q     = pc_fetch_q;
+                wf_push_pc_q     = f0_fetch_pc; // f2.5b: the FTQ head under FTQ_DECOUPLE; folds to pc_fetch_q at 0
                 wf_push_ifault_q = imem_fault_w;
                 wf_push_iacc_q   = imem_acc_fault_w;
                 wf_push_gstage_q = imem_gstage_w;
@@ -1955,6 +1968,12 @@ pub module heliodor_core #(
             ftq_head    = 3'd0;
             ftq_tail    = 3'd0;
             ftq_count   = 4'd0;
+            // Reset the FTQ storage so f0_fetch_pc's (const-gated, dead-at-0) read is never of an
+            // unassigned array — at FTQ_DECOUPLE=0 ftq_pc is reset-only (0) and f0_fetch_pc selects
+            // pc_fetch_q anyway → DCE, behaviorally identical.
+            for i in 0..FTQ_N {
+                ftq_pc[i] = 64'd0;
+            }
         } else if FTQ_DECOUPLE {
             if redirect_fire {
                 pc_pred     = {redirect_pc[63:3], 3'b000};
@@ -1986,12 +2005,22 @@ pub module heliodor_core #(
                 ftq_head    = 3'd0;
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
-            } else if !ftq_full {
-                ftq_pc[ftq_tail] = pc_pred;
-                ftq_tail         = ftq_tail + 3'd1;
-                ftq_count        = ftq_count + 4'd1;
-                pc_pred          = pp_next;
-                pp_no_ftb_q      = 1'b0;
+            } else {
+                // f2.5b: steady state — DEQUEUE (F0 consumed the head) + ENQUEUE (pc_pred produced),
+                // independent. Dequeue on f0_ftq_pop (F0 presented + beat-done). Enqueue when there is
+                // room, accounting for a concurrent dequeue (!ftq_full || f0_ftq_pop); pc_pred advances
+                // only when it enqueues. Count = +enq -deq. (Enqueue-only in f2.5a; the dequeue is f2.5b.)
+                let ftq_enq: logic = !ftq_full || f0_ftq_pop;
+                if f0_ftq_pop {
+                    ftq_head = ftq_head + 3'd1;
+                }
+                if ftq_enq {
+                    ftq_pc[ftq_tail] = pc_pred;
+                    ftq_tail         = ftq_tail + 3'd1;
+                    pc_pred          = pp_next;
+                    pp_no_ftb_q      = 1'b0;
+                }
+                ftq_count = ftq_count + (if ftq_enq ? 4'd1 : 4'd0) - (if f0_ftq_pop ? 4'd1 : 4'd0);
             }
         }
     }
@@ -2395,7 +2424,8 @@ pub module heliodor_core #(
     // Non-cacheable 2-beat (W3): beat 1 presents the dword-high word at pc_fetch_q+4 (the
     // passthrough icache returns one word per present); f0_nc_beat_q is 0 in every cacheable
     // fetch, so the +4 is exclusive to the boot-ROM / MMIO path.
-    let fetch_vaddr: logic<64> = if ICACHE_SYNC_READ ? (pc_fetch_q + (if f0_nc_beat_q ? 64'd4 : 64'd0)) : (if straddle_q ? pc_q + 64'd2 : pc_q);
+    // f2.5b: the fetch address is f0_fetch_pc (= the FTQ head under FTQ_DECOUPLE, else pc_fetch_q).
+    let fetch_vaddr: logic<64> = if ICACHE_SYNC_READ ? (f0_fetch_pc + (if f0_nc_beat_q ? 64'd4 : 64'd0)) : (if straddle_q ? pc_q + 64'd2 : pc_q);
     // M9 (2026-05-25): gate i_req with !redirect_fire. On the redirect cycle,
     // pc_q still holds the OLD value (NBA — update at clock edge), so
     // fetch_vaddr presents the old VA to MMU. Without this gate, MMU at IDLE

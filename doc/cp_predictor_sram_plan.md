@@ -1030,19 +1030,43 @@ New `const FTQ_DECOUPLE: bit = 0;` (requires the F2-lite 9-const set; PRED_L0_FA
     cycle-count check. (Prior "byte-identical" claims for register-adding scaffolds — PRED_PIPE,
     PRED_HOLD_FREEZE — meant this behavioral sense; only EXPRESSION-level folds like f2.1's `||0` are
     literally byte-identical SV. `.sv` is gitignored, so verify via build+diff, not `git diff`.)
-- **f2.5b** Wire the `pc_pred` FTB loop + FTQ enqueue, and F0 dequeue. Under FTQ_DECOUPLE: (i)
-  `pc_pred` reads the FTB (`pc_pred_ftb_hit`/`_target` = the `f0_ftb_hit` logic on `pc_pred`),
-  enqueues `pc_pred` to the FTQ + advances `pc_pred` to `(hit ? target : +8)` when `!ftq_full`; (ii)
-  F0's `pc_fetch_q` advance arm (`:1867` `f0_present && f0_beat_done`) takes `ftq_pc[ftq_head]`
-  instead of its own `f0_ftb_hit ? target : +8`, and dequeues (`ftq_head++`) on that fetch; (iii) the
-  FTQ flush + `pc_pred` re-seed mirror every `pc_fetch_q` redirect arm per the invariant above. Keep
-  it LOCKSTEP-equivalent first (FTQ shallow, `pc_pred` leads F0 by ≤1) so the WORD-FIFO stream is
-  provably identical. Folds to today's coupled F0 at FTQ_DECOUPLE=0. DEAD at 0.
-- **f2.5c** Decouple depth — let `pc_pred` run ahead by FTQ_N blocks (fill the FTQ while F0 is
-  stalled on `wf_full`/miss); F0 drains at its rate. This is the actual multi-block run-ahead. Still
-  returns/indirects override at extract (identical to F2-lite — the FTB excludes them, so `pc_pred`
-  falls through past a return and extract's `sb_override` corrects + flushes the FTQ). Flip
-  FTQ_DECOUPLE=1 here, MEASURE IPC (expect ≈-neutral per the assessment), regress (test/litmus/boot).
+- **f2.5b** ✅ DONE (`7df1264`). Wired the F0 CONSUMER (the enqueue+pc_pred loop landed in
+  f2.5a). **Scheme b1** (audited as the cleanly-correct variant): F0 fetches EXCLUSIVELY from the FTQ
+  (no direct re-seed fetch), so the redirect target is not duplicated. Mechanics under FTQ_DECOUPLE:
+  - `f0_fetch_pc = FTQ_DECOUPLE ? (ftq_count>=1 ? ftq_pc[ftq_head] : pc_pred) : pc_fetch_q` — F0's
+    actual fetch address is the FTQ head; on a momentarily-empty FTQ (the redirect-refill cycle) it
+    falls back to `pc_pred` (a valid address) so the always-on MMU translate (`i_req=!any_redirect`)
+    never walks a garbage slot, and `f0_present` is gated off then anyway. Routed to the 3 real uses of
+    "the presented fetch address": `fetch_vaddr` (→imem_mmu), `wf_push_pc_q` (the pushed dword's PC),
+    and `f0_diverged`'s pointer compare. Folds to `pc_fetch_q` at 0.
+  - `f0_present` gains `&& (!FTQ_DECOUPLE || ftq_count>=1)` — F0 presents only when the FTQ has an
+    entry (else it waits for `pc_pred` to refill = the +1 redirect bubble, a known decoupled-front-end
+    cost, to be measured/mitigated at f2.5c/with a bypass).
+  - dequeue `f0_ftq_pop = FTQ_DECOUPLE && f0_present && f0_beat_done` (once per dword, non-cacheable
+    2-beat pops on beat-1); the producer always_ff's steady-state arm now does DEQUEUE (`ftq_head++`)
+    + ENQUEUE (`ftq_pc[ftq_tail]=pc_pred`, `pc_pred=pp_next`) independently, `count += enq - deq`.
+  - **The coupled loop DCEs at the flip:** at FTQ_DECOUPLE=1, `pc_fetch_q` + its arms + `f0_ftb_hit`
+    (F0's FTB read port) become UNREAD (all fetch-address uses route to `f0_fetch_pc`=ftq head) → the
+    whole F2-lite coupled machinery DCEs, leaving only `pc_pred`'s FTB read (1 port, the final
+    structure). At FTQ_DECOUPLE=0 the reverse: `f0_fetch_pc≡pc_fetch_q`, everything else FTQ-gated →
+    the coupled loop is authoritative, `pc_pred`/FTQ DCE.
+  - **DEAD-at-0 proof (behavioral, not pure-addition — f2.5b MODIFIES existing exprs to route through
+    `f0_fetch_pc`):** `f0_fetch_pc` folds to `pc_fetch_q` at 0 (ternary else) and every other addition
+    is FTQ_DECOUPLE-gated → provably identical by construction. Verified: `veryl test` **252/0**, litmus
+    N2 **cy=0x282170 = cycle-exact to f2.5a/HEAD**; no new analyzer warnings (ftq_pc reset in if_reset
+    silences the const-gated-read "unassigned" flag). **Note the run-ahead already works** — `pc_pred`
+    fills the FTQ up to FTQ_N while F0 drains, so f2.5b already IS the decoupled structure; f2.5c is
+    just the flip + measurement (no separate "decouple depth" step needed).
+    - **Gotcha logged:** Veryl `for` loops take NO type annotation — `for i in 0..N {` (not
+      `for i: u32 in 0..N`, a SyntaxError that a warm `.build` cache HIDES until `rm -rf .build`).
+- **f2.5c** FLIP + MEASURE (the run-ahead already works after f2.5b — `pc_pred` fills the FTQ up to
+  FTQ_N while F0 drains, so there is no separate "decouple depth" step). Flip the 10-const set
+  (F2-lite 9 + FTQ_DECOUPLE), build (check for a comb loop), and validate like f2.4: dhrystone
+  instret bit-exact, N1 boot completes (~17.6M ref), litmus. Returns/indirects still override at
+  extract (identical to F2-lite — the FTB excludes them, so `pc_pred` falls through past a return and
+  extract's `sb_override` corrects + flushes the FTQ). MEASURE IPC (expect ≈-neutral + the +1
+  redirect bubble per the assessment). Expect skid/straddle/`f0_diverged`-under-FTQ corners (debug
+  with the divergence trap, cf. f2.4-fix). Revert to =0 (ship-safe) if corners need multi-session work.
 - **f2.5d** (value-add, gated on f2.5c's measurement) Run-ahead RAS: extend the FTB (or a companion)
   to mark block-terminating returns + carry is_call, add a `pc_pred`-side run-ahead RAS pushed/popped
   as `pc_pred` predicts, so `pc_pred` predicts return targets AHEAD (removing the return override
