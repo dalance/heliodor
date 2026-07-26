@@ -463,6 +463,29 @@ pub module heliodor_core #(
     // PRED_OVERRIDE=1. f2.2 wires the extract-side FIFO-follow, f2.3 the FTB-vs-full override, f2.4
     // flips =1 and measures, f2.5 promotes to a first-class multi-block FTQ.
     const FTB_OVERRIDE: bit = 0;
+    // ── F2-full (f2.5): decoupled FTQ — independent pc_pred loop + FTQ (cp_predictor_sram_plan.md,
+    //    "F2-full (f2.5) — detailed design") ──
+    // F2-lite's pc_fetch_q serves DOUBLE duty (icache read address + FTB-steer predictor loop),
+    // coupled in lockstep (pc_fetch_q advances only on f0_present). F2-full SPLITS them: pc_pred runs
+    // the FTB loop independently (1 block/cyc, gated only on FTQ room), enqueues each predicted dword
+    // into the FTQ, and F0 (pc_fetch_q) DEQUEUES the FTQ head to fetch. The WORD-FIFO stream is
+    // PROVABLY identical (pc_pred computes the same dword sequence pc_fetch_q's FTB loop did) → the
+    // whole extract side (WORD FIFO + skid + straddle + Stage-B override) is UNCHANGED; f2.5 is purely
+    // upstream of F0. f2.5a (this increment) declares the substrate + wires the pc_pred FTB PRODUCER +
+    // FTQ enqueue (NO F0 consumer yet — F0 keeps its own coupled advance, so at =1 the producer runs
+    // in parallel but is IGNORED; f2.5b routes F0's fetch address FROM ftq_pc[ftq_head] + adds the
+    // dequeue). Consistency invariant: pc_pred re-seeds + the FTQ flushes on every redirect that
+    // re-steers pc_fetch_q / flushes the WORD FIFO (sb_ovr_soft is the sole non-flushing case). DEAD
+    // at FTQ_DECOUPLE=0: every write is `else if FTQ_DECOUPLE` → reset-only → pc_pred/pp_no_ftb_q/ftq_*
+    // + their fanin DCE → byte-identical. Requires the F2-lite 9-const set at flip (PRED_L0_FAST=0).
+    const FTQ_DECOUPLE: bit = 0;
+    const FTQ_N: u32 = 8;
+    var pc_pred    : logic<64>;         // independent predictor-loop dword pointer (leads pc_fetch_q)
+    var pp_no_ftb_q: logic;             // mid-dword re-entry guard for the pc_pred FTB read (cf. f0_no_ftb_q)
+    var ftq_pc     : logic<64> [FTQ_N]; // FTQ: the dword-PC sequence F0 will fetch (addresses only)
+    var ftq_head   : logic<3>;
+    var ftq_tail   : logic<3>;
+    var ftq_count  : logic<4>;
     // Stage-B is a 1-deep SKID register between extract-assemble/predict (Stage-A, at T) and
     // the fetch-buffer write (Stage-B, at T+1). a_valid holds until the bundle drains into the
     // fetch buffer; a_push0/a_push1 are the registered slot deliveries (drive the fb write +
@@ -1800,6 +1823,20 @@ pub module heliodor_core #(
     // unlike sb_override which squashes a wrong-path younger produce). DEAD at 0 (PRED_L0_FAST=0).
     let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && l0_taken && !sb_override;
     let l0_redir_target: logic<64> = l0_pred_target;
+    // f2.5a: the FTB read on the INDEPENDENT pc_pred pointer (the F2-full predictor loop) — the same
+    // logic as f0_ftb_hit/f0_ftb_target but indexed by pc_pred, steering the next pc_pred + the FTQ
+    // enqueue. pp_no_ftb_q suppresses the redirect on the first pc_pred step after a re-seed (the
+    // mid-dword re-entry guard, cf. f0_no_ftb_q). In the FINAL F2-full structure F0 no longer reads
+    // the FTB (it dequeues the FTQ), so this REPLACES the pc_fetch_q FTB read port rather than adding
+    // one; during scaffolding both coexist at =1 (harmless — F0's is ignored once f2.5b lands). DEAD
+    // at FTQ_DECOUPLE=0: pp_ftb_hit const-false → pp_next = pc_pred+8, pc_pred reset-only → cone DCE.
+    let pp_ftb_idx   : logic<FTB_IDX_W> = pc_pred[FTB_IDX_W + 2:3];
+    let pp_ftb_tag   : logic<FTB_TAG_W> = pc_pred[63:FTB_IDX_W + 3];
+    let pp_ftb_follow: logic     = !ICACHE_FTB_COND || !ftb_is_cond[pp_ftb_idx] || (ftb_conf[pp_ftb_idx] == 2'd3);
+    let pp_ftb_hit   : logic     = FTQ_DECOUPLE && ICACHE_FETCH_DIRECTED && ftb_valid[pp_ftb_idx] && (ftb_tag[pp_ftb_idx] == pp_ftb_tag) && pp_ftb_follow && !pp_no_ftb_q;
+    let pp_ftb_target: logic<64> = ftb_target[pp_ftb_idx];
+    let pp_next      : logic<64> = if pp_ftb_hit ? {pp_ftb_target[63:3], 3'b000} : pc_pred + 64'd8;
+    let ftq_full     : logic     = ftq_count >= 4'd8;
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -1899,6 +1936,62 @@ pub module heliodor_core #(
                 wf_push_gstage_q = imem_gstage_w;
                 wf_push_gpa_q    = imem_gpa_w;
                 wf_push_nc_q     = !ic_dram && !f0_fault;
+            }
+        }
+    }
+    // ── F2-full (f2.5a): the pc_pred FTB PRODUCER + FTQ enqueue — DEAD at FTQ_DECOUPLE=0 ──
+    // pc_pred runs the FTB loop independently and enqueues each predicted dword into the FTQ. NO F0
+    // consumer yet (F0 keeps its coupled advance; f2.5b routes pc_fetch_q FROM ftq_pc[ftq_head] + adds
+    // the ftq_head/ftq_count dequeue). Re-seed pc_pred + flush the FTQ on every redirect that re-steers
+    // pc_fetch_q / flushes the WORD FIFO (the consistency invariant) so pc_pred never leads F0 down a
+    // redirected-off path; sb_ovr_soft (FTB agreed, WORD FIFO not flushed) is the sole non-flushing
+    // case → pc_pred keeps running. Priority mirrors the pc_fetch_q FSM. Enqueue-only here (count rises
+    // to FTQ_N then ftq_full halts the loop — harmless while DEAD; f2.5b adds the dequeue). DEAD at 0:
+    // written ONLY under `else if FTQ_DECOUPLE` → reset-only → pc_pred/pp_no_ftb_q/ftq_* + fanin DCE.
+    always_ff (clk, rst) {
+        if_reset {
+            pc_pred     = RESET_PC;
+            pp_no_ftb_q = 1'b0;
+            ftq_head    = 3'd0;
+            ftq_tail    = 3'd0;
+            ftq_count   = 4'd0;
+        } else if FTQ_DECOUPLE {
+            if redirect_fire {
+                pc_pred     = {redirect_pc[63:3], 3'b000};
+                pp_no_ftb_q = redirect_pc[2:1] != 2'b00;
+                ftq_head    = 3'd0;
+                ftq_tail    = 3'd0;
+                ftq_count   = 4'd0;
+            } else if early_redir_fire_q {
+                pc_pred     = {early_redir_pc_q[63:3], 3'b000};
+                pp_no_ftb_q = early_redir_pc_q[2:1] != 2'b00;
+                ftq_head    = 3'd0;
+                ftq_tail    = 3'd0;
+                ftq_count   = 4'd0;
+            } else if sb_override && !sb_ovr_soft {
+                pc_pred     = {sb_override_target[63:3], 3'b000};
+                pp_no_ftb_q = 1'b0;
+                ftq_head    = 3'd0;
+                ftq_tail    = 3'd0;
+                ftq_count   = 4'd0;
+            } else if ext_taken_redir {
+                pc_pred     = {ext_next_pc[63:3], 3'b000};
+                pp_no_ftb_q = ext_next_pc[2:1] != 2'b00;
+                ftq_head    = 3'd0;
+                ftq_tail    = 3'd0;
+                ftq_count   = 4'd0;
+            } else if f0_diverged {
+                pc_pred     = {ext_pc_q[63:3], 3'b000};
+                pp_no_ftb_q = ext_pc_q[2:1] != 2'b00;
+                ftq_head    = 3'd0;
+                ftq_tail    = 3'd0;
+                ftq_count   = 4'd0;
+            } else if !ftq_full {
+                ftq_pc[ftq_tail] = pc_pred;
+                ftq_tail         = ftq_tail + 3'd1;
+                ftq_count        = ftq_count + 4'd1;
+                pc_pred          = pp_next;
+                pp_no_ftb_q      = 1'b0;
             }
         }
     }

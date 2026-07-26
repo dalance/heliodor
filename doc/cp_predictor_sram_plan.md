@@ -865,6 +865,7 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
   dhrystone at =0: cy 251423 / instret 264834. Known-good ref: 3a.6 variant-A (FTB_OVERRIDE=0) boots
   N1 at ~15.9M. Boot-hang signature: cy=45M timeout, x3=0x80a85b60. Litmus-hang: 30M, harts ~0x800007b8.
 - **f2.5** (F2-full) Promote to a multi-block FTQ + independent `pc_pred` loop + run-ahead RAS.
+  Detailed design + increment decomposition below ("## F2-full (f2.5) — detailed design").
 
 ### f2.2/f2.3 reconciliation design (the FIFO-follow) — analysis before scaffold
 
@@ -922,6 +923,121 @@ context.** The banked L0 (b.1–b.3) is not the F2 producer after all (it is per
 the FTB is the per-dword run-ahead producer) — but the (B) disagreement-override + l0_redir
 flush *patterns* transfer directly to f2.3/f2.1, and the L0 stays available as an extract-side
 secondary fast path if wanted.
+
+## F2-full (f2.5) — detailed design (2026-07-26, audited against the RTL)
+
+Written after auditing the F2-lite datapath (F0 FSM `heliodor_core.veryl:1803-1904`, WORD FIFO
+`:1907-1952`, extract Stage-A/B `:1668-1984`) for how F2-full lands. F2-lite (f2.4-fix, the 9-const
+set) is correct end-to-end at =1 (boots 17.6M, dhrystone bit-exact) and shipped at 0.
+
+### The clean-decoupling insight — extract is UNTOUCHED; f2.5 is entirely upstream of F0
+
+In F2-lite `pc_fetch_q` serves DOUBLE duty: (1) the icache read address (F0 demand fetch), and
+(2) the FTB read address whose hit steers the NEXT `pc_fetch_q` (the predictor loop). They advance
+in LOCKSTEP — `pc_fetch_q` moves only on `f0_present` (icache read succeeds + WORD-FIFO room), so a
+miss / full FIFO stalls the predictor loop too. There is exactly ONE queue (the WORD FIFO) between
+fetch and extract.
+
+**F2-full splits these two duties into two independent pointers with a queue (the FTQ) between:**
+```
+ pc_pred ─▶ FTB read ─▶ {enqueue FTQ: dword_pc (+ later: taken/target/kind for run-ahead RAS)}
+        └────────────────────────────────▶ next pc_pred (1 block/cyc, independent of F0)
+                                     │
+                                     ▼  FTQ  (NEW queue, addresses only)
+                                     │
+ pc_fetch_q = FTQ.head ─▶ icache read ─(T+1)─▶ dword ─▶ WORD FIFO ─▶ extract  (UNCHANGED)
+```
+
+**The crux (audited): the WORD-FIFO stream `wf_pc[*]` is IDENTICAL under F2-full.** `pc_pred`
+computes exactly the same dword sequence the F2-lite `pc_fetch_q` FTB loop did (same FTB reads,
+same `f0_ftb_hit`/`f0_no_ftb_q` steer, same redirect re-seeds), enqueues it, and F0 fetches those
+dwords IN ORDER — so the WORD FIFO fills with the same non-sequential stream. Therefore the entire
+delicate extract side — `ext_ftb_follow` (f2.2), `f0_prefetched_target`/`ext_taken_redir`,
+`sb_override`/`sb_ovr_soft` (f2.3), the straddle/`head1_seq`/`ext_next_valid` corners, and the
+f2.4-fix `a_eff_next`/`ext_next_valid !ext_bypass`/`c_bp_mispredict rob_commit_ack` fixes — all read
+the WORD FIFO (`wf_*`) or the F0 fetch pointer `pc_fetch_q`, NOT the new `pc_pred`, and stay
+STRUCTURALLY UNCHANGED. (Verified: `f0_diverged` `:1750` is the only extract-recovery term that
+references `pc_fetch_q` directly — and it references the F0 FETCH pointer, which F2-full KEEPS as
+`pc_fetch_q`; the run-ahead pointer is the NEW `pc_pred`.) f2.5 is a pure F0-front restructure.
+
+### Honest IPC assessment — structural, marginal IPC on the CURRENT memory system
+
+The plan's mandate is structural completeness, not IPC (Phase-14; §CP: F1 CP = 0). F2-full is the
+textbook decoupled front end (Reinman/Calder: predictor→FTQ→fetch) and completing it is the Phase-14
+front-end endpoint. But be honest about the IPC it buys on heliodor AS SHIPPED:
+- The WORD FIFO already gives F2-lite up to WF_N=8 dwords of predictor run-ahead (F0 follows FTB
+  targets 8 dwords ahead of extract before `wf_full` stalls it). The FTQ adds MORE run-ahead
+  (`pc_pred` leads F0 by FTQ-depth blocks), but extract still drains at its own rate — deeper
+  run-ahead does not make extract faster BY ITSELF.
+- The two mechanisms that WOULD convert run-ahead into IPC both need memory-system support heliodor
+  currently lacks: (a) **FTQ-driven prefetch** — issue icache reads for FTQ-queued blocks ahead of
+  demand — is exactly the next-line prefetch **P9.6 turned OFF** (it holds the single shared per-hart
+  mem_ctrl port, starving the D-cache; `icache.veryl:73`). (b) **hit-under-miss at F0** — F0 issuing
+  the next FTQ block's read while a prior miss fills — needs F0 to sustain multiple outstanding reads
+  (it stalls on `!icache_stall_comb` today, one at a time). Neither is in f2.5's scope.
+- So on the current single-outstanding, prefetch-off memory system, F2-full is **IPC-≈-neutral vs
+  F2-lite** (a structural-fidelity change), and it is the SUBSTRATE that makes FTQ-driven prefetch /
+  hit-under-miss a localized follow-up once the P9.6 port contention is addressed. This mirrors the
+  L0 "marginal, banked" finding — build the structure, measure, document, don't over-claim IPC.
+
+**Recommendation:** build f2.5a–f2.5c (the decoupled FTQ substrate — `pc_pred` loop + FTQ + F0
+dequeue, returns still overriding at extract as in F2-lite) as the structural completion, measure to
+confirm IPC-neutral, and treat f2.5d (run-ahead RAS) + FTQ-driven prefetch as value-add increments
+gated on whether the measured structure motivates them. Surface the IPC assessment to the user after
+the substrate lands so they choose whether to push run-ahead RAS + prefetch.
+
+### FTQ / pc_pred consistency invariant (the correctness backbone)
+
+**Whenever the WORD FIFO is flushed OR `pc_fetch_q` is re-steered, the FTQ is flushed and `pc_pred`
+is re-seeded to the SAME target** — so `pc_pred`/FTQ never lead F0 down a path F0's own pointer was
+redirected off. Concretely, mirror the F0 `pc_fetch_q` FSM arms (`:1824-1881`) and the WORD-FIFO
+flush (`:1922`) onto `pc_pred`/FTQ:
+- `redirect_fire` / `early_redir_fire_q` (arch / early redirect): flush FTQ, `pc_pred` = the redirect
+  target dword (+ carry `f0_no_ftb_q`'s mid-dword-reentry guard onto the pc_pred FTB read).
+- `sb_override && !sb_ovr_soft` (HARD extract override — FTB-vs-full disagreement): flush FTQ,
+  `pc_pred` = `sb_override_target` dword.
+- `ext_taken_redir` / `f0_diverged` (FTB reconciliation redirects, re-engaged under FTB_OVERRIDE):
+  flush FTQ, `pc_pred` = the re-steer target (`ext_next_pc` / `ext_pc_q` dword) — same as F2-lite
+  re-steers `pc_fetch_q`.
+- `sb_ovr_soft` (SOFT — FTB agreed, WORD FIFO NOT flushed, F0 keeps running): FTQ NOT flushed,
+  `pc_pred` keeps running. (Consistent — the FTB stream was right.)
+- Steady state (no redirect): `pc_pred` advances via its own FTB read (`pc_pred_ftb_hit ? target :
+  pc_pred+8`) whenever the FTQ has room; F0 dequeues the FTQ head on `f0_present`.
+
+The correctness net is UNCHANGED: `pc_pred`/FTQ are pure speculation feeding F0; the WORD-FIFO
+stream, the Stage-B clocked-full override, and commit `c_bp_mispredict` (+ the 3a.5 rob lane-B guard)
+remain authoritative. f2.5 is an accuracy/structure change, not a correctness change — it rides on
+the f2.4-fix corners.
+
+### Increment decomposition (DEAD-scaffold, each =0 byte-identical, flip last) — the 10th const
+
+New `const FTQ_DECOUPLE: bit = 0;` (requires the F2-lite 9-const set; PRED_L0_FAST stays 0).
+
+- **f2.5a** FTQ storage substrate + `pc_pred` register, declared ONLY (no consumer rewire). `pc_pred`
+  + `ftq_pc[FTQ_N]`/`ftq_head`/`ftq_tail`/`ftq_count`, written ONLY under `else if FTQ_DECOUPLE` →
+  reset-only at 0 → the regs + fanin DCE → byte-identical (the ext_pc_q / WORD-FIFO idiom). Declares
+  the substrate; `veryl check` == baseline, `veryl test` 252/0. (This increment.)
+- **f2.5b** Wire the `pc_pred` FTB loop + FTQ enqueue, and F0 dequeue. Under FTQ_DECOUPLE: (i)
+  `pc_pred` reads the FTB (`pc_pred_ftb_hit`/`_target` = the `f0_ftb_hit` logic on `pc_pred`),
+  enqueues `pc_pred` to the FTQ + advances `pc_pred` to `(hit ? target : +8)` when `!ftq_full`; (ii)
+  F0's `pc_fetch_q` advance arm (`:1867` `f0_present && f0_beat_done`) takes `ftq_pc[ftq_head]`
+  instead of its own `f0_ftb_hit ? target : +8`, and dequeues (`ftq_head++`) on that fetch; (iii) the
+  FTQ flush + `pc_pred` re-seed mirror every `pc_fetch_q` redirect arm per the invariant above. Keep
+  it LOCKSTEP-equivalent first (FTQ shallow, `pc_pred` leads F0 by ≤1) so the WORD-FIFO stream is
+  provably identical. Folds to today's coupled F0 at FTQ_DECOUPLE=0. DEAD at 0.
+- **f2.5c** Decouple depth — let `pc_pred` run ahead by FTQ_N blocks (fill the FTQ while F0 is
+  stalled on `wf_full`/miss); F0 drains at its rate. This is the actual multi-block run-ahead. Still
+  returns/indirects override at extract (identical to F2-lite — the FTB excludes them, so `pc_pred`
+  falls through past a return and extract's `sb_override` corrects + flushes the FTQ). Flip
+  FTQ_DECOUPLE=1 here, MEASURE IPC (expect ≈-neutral per the assessment), regress (test/litmus/boot).
+- **f2.5d** (value-add, gated on f2.5c's measurement) Run-ahead RAS: extend the FTB (or a companion)
+  to mark block-terminating returns + carry is_call, add a `pc_pred`-side run-ahead RAS pushed/popped
+  as `pc_pred` predicts, so `pc_pred` predicts return targets AHEAD (removing the return override
+  bubble that survives f2.5c). Enqueue the RAS action in the FTQ; repair the run-ahead RAS from the
+  committed RAS on a mispredict. The hardest, most speculative part — its own increment, deferred.
+- **f2.5e** (value-add, gated) FTQ-driven prefetch / F0 hit-under-miss — convert the run-ahead into
+  IPC once the P9.6 mem-port contention is addressed. Out of f2.5's structural scope; noted as the
+  path that makes the decoupling pay.
 
 ## Independence
 
