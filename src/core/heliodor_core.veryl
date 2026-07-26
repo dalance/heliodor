@@ -1680,10 +1680,11 @@ pub module heliodor_core #(
     // f0_present is gated off then anyway (ftq empty), so no fetch is presented. At FTQ_DECOUPLE=0
     // this folds to pc_fetch_q → byte-identical, and pc_fetch_q's coupled FTB loop stays authoritative.
     let f0_fetch_pc: logic<64> = if FTQ_DECOUPLE ? (if ftq_count >= 4'd1 ? ftq_pc[ftq_head] : pc_pred) : pc_fetch_q;
-    // f2.5b: under FTQ_DECOUPLE F0 presents only when the FTQ has an entry to consume (else it waits
-    // for pc_pred to refill — the +1 redirect bubble). Folds to unchanged at 0 (`!0 || ...` == 1).
+    // f2.5c.1: F0 presents whenever ready (no FTQ-non-empty gate) — when the FTQ is empty it fetches
+    // pc_pred DIRECTLY (f0_fetch_pc's fallback = the bypass), removing the +1 redirect bubble. The FTQ
+    // only buffers when F0 falls behind pc_pred (miss / wf_full). Unchanged at FTQ_DECOUPLE=0.
     let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall_comb && !wf_full
-        && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && (!FTQ_DECOUPLE || ftq_count >= 4'd1);
+        && (imem_valid_w || imem_fault_w || imem_acc_fault_w);
     // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
     // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
     let wf_do_push: logic = ICACHE_SYNC_READ && wf_push_valid_q && !icache_stall;
@@ -1847,9 +1848,14 @@ pub module heliodor_core #(
     let pp_ftb_target: logic<64> = ftb_target[pp_ftb_idx];
     let pp_next      : logic<64> = if pp_ftb_hit ? {pp_ftb_target[63:3], 3'b000} : pc_pred + 64'd8;
     let ftq_full     : logic     = ftq_count >= 4'd8;
-    // f2.5b: F0 dequeues the FTQ head when it presents + completes a fetch of it (beat-done, so a
-    // non-cacheable 2-beat dword pops once). Gated FTQ_DECOUPLE → DCE at 0.
-    let f0_ftq_pop   : logic     = FTQ_DECOUPLE && f0_present && f0_beat_done;
+    // f2.5b/c.1: F0 DEQUEUES a real buffered FTQ entry when it presents + completes a fetch of the
+    // head (beat-done; non-cacheable 2-beat pops once) AND the FTQ is non-empty. When the FTQ is empty
+    // F0 instead BYPASSES — fetches pc_pred directly (f0_ftq_byp) — so no dequeue. Gated FTQ_DECOUPLE → DCE at 0.
+    let f0_ftq_pop   : logic     = FTQ_DECOUPLE && f0_present && f0_beat_done && ftq_count >= 4'd1;
+    // f2.5c.1: F0 is bypassing this cycle — fetching pc_pred directly because the FTQ is empty (both
+    // beats of a non-cacheable fetch). The producer then skips enqueuing pc_pred (F0 took it) and
+    // advances pc_pred on beat-done. This is the in-sync / redirect-refill case = F2-lite behavior, 0 bubble.
+    let f0_ftq_byp   : logic     = FTQ_DECOUPLE && f0_present && ftq_count == 4'd0;
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -2006,19 +2012,24 @@ pub module heliodor_core #(
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
             } else {
-                // f2.5b: steady state — DEQUEUE (F0 consumed the head) + ENQUEUE (pc_pred produced),
-                // independent. Dequeue on f0_ftq_pop (F0 presented + beat-done). Enqueue when there is
-                // room, accounting for a concurrent dequeue (!ftq_full || f0_ftq_pop); pc_pred advances
-                // only when it enqueues. Count = +enq -deq. (Enqueue-only in f2.5a; the dequeue is f2.5b.)
-                let ftq_enq: logic = !ftq_full || f0_ftq_pop;
+                // f2.5b/c.1: steady state — DEQUEUE (F0 drained a real head entry, f0_ftq_pop) +
+                // ENQUEUE (pc_pred produced) + BYPASS (f2.5c.1). pc_pred is ENQUEUED only when F0 did
+                // NOT bypass it this cycle (else a duplicate — F0 fetched it directly); it ADVANCES to
+                // pp_next when enqueued OR when a bypass fetch completes (beat-done). enq accounts for a
+                // concurrent dequeue for room. Count = +enq -deq (a bypass touches neither). The bypass
+                // makes F0 track pc_pred with 0 bubble when in sync (FTQ empty); the FTQ buffers only
+                // when F0 falls behind (stall → !f0_ftq_byp → enqueue fills it).
+                let ftq_enq: logic = (!ftq_full || f0_ftq_pop) && !f0_ftq_byp;
                 if f0_ftq_pop {
                     ftq_head = ftq_head + 3'd1;
                 }
                 if ftq_enq {
                     ftq_pc[ftq_tail] = pc_pred;
                     ftq_tail         = ftq_tail + 3'd1;
-                    pc_pred          = pp_next;
-                    pp_no_ftb_q      = 1'b0;
+                }
+                if ftq_enq || (f0_ftq_byp && f0_beat_done) {
+                    pc_pred     = pp_next;
+                    pp_no_ftb_q = 1'b0;
                 }
                 ftq_count = ftq_count + (if ftq_enq ? 4'd1 : 4'd0) - (if f0_ftq_pop ? 4'd1 : 4'd0);
             }

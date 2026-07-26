@@ -1083,12 +1083,29 @@ New `const FTQ_DECOUPLE: bit = 0;` (requires the F2-lite 9-const set; PRED_L0_FA
     predictor→FTQ→fetch front end (Reinman/Calder) now exists and boots Linux correctly at =1. The
     IPC is negative until the redirect bubble is mitigated AND the run-ahead is converted to IPC:
     - **redirect-bubble mitigation (memory-system-INDEPENDENT, the cheapest win):** a bypass — F0
-      fetches `pc_pred` directly on the empty-FTQ refill cycle (the `f0_fetch_pc` fallback is already
-      `pc_pred`; just let `f0_present` fire on it for the first post-redirect fetch, taking care the
-      dword isn't double-fetched from the FTQ) — removes the +1 bubble and should bring f2.5 back
-      toward F2-lite parity. A clean, self-contained f2.5c.1 follow-up.
+      fetches `pc_pred` directly on the empty-FTQ refill cycle — removes the +1 bubble. → **f2.5c.1
+      below (DONE, recovers F2-lite PARITY).**
     - **IPC payoff (memory-system-DEPENDENT):** f2.5d run-ahead RAS + f2.5e FTQ-driven prefetch /
       hit-under-miss, gated on the P9.6 mem-port contention being addressed.
+- **f2.5c.1** ✅ DONE (`132d470`). Redirect-bubble BYPASS — recovers F2-lite parity while keeping the
+  decoupled FTQ. **Mechanism:** F0 fetches `pc_pred` DIRECTLY when the FTQ is empty (the `f0_fetch_pc`
+  fallback is already `pc_pred`); the empty-FTQ `f0_present` gate is removed so F0 presents then. To
+  avoid duplicating that dword, the producer treats an empty-FTQ present as a BYPASS (`f0_ftq_byp =
+  f0_present && ftq_count==0`): it does NOT enqueue `pc_pred` (F0 took it directly) and advances
+  `pc_pred` on beat-done; the FTQ only ENQUEUES when F0 did not bypass (i.e. when F0 is stalled or
+  behind). **Net effect:** in sync (FTQ empty) F0 tracks `pc_pred` with 0 bubble = F2-lite coupled
+  behavior; the FTQ buffers ONLY when F0 falls behind `pc_pred` (miss / `wf_full`) — the true
+  decoupling, retained. Dequeue (`f0_ftq_pop`) now requires `ftq_count>=1` (a real entry, not a
+  bypass). DEAD at 0 (all under `else if FTQ_DECOUPLE` / gated; the `f0_present` gate was already a
+  fold-to-1 at 0). **Verified — flip measured (=0 reverted):** correct (dhrystone instret 264834
+  BIT-EXACT, `veryl test` 252/0, **N1 boot 0x10c66f0 ≈ 17.6M = F2-lite parity, x3=0xaa**), IPC:
+  | bench     | base   | F2-lite | f2.5c (no byp) | **f2.5c.1 (byp)** |
+  |-----------|--------|---------|----------------|-------------------|
+  | dhrystone | 251423 | 333910  | 378650         | **334165 (≈parity)** |
+  | boot N1   | 14.2M  | 17.6M   | 20.6M          | **17.6M (parity)** |
+  | litmus N2 | 2.63M  | —       | 3.52M          | **3.07M**         |
+  So **F2-full = the decoupled predictor→FTQ→fetch front end AT F2-lite IPC** — a no-regression
+  structural upgrade, with the FTQ run-ahead retained as the substrate for f2.5d/e. Shipped DEAD at 0.
 - **f2.5d** (value-add, gated on f2.5c's measurement) Run-ahead RAS: extend the FTB (or a companion)
   to mark block-terminating returns + carry is_call, add a `pc_pred`-side run-ahead RAS pushed/popped
   as `pc_pred` predicts, so `pc_pred` predicts return targets AHEAD (removing the return override
