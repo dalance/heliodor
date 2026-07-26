@@ -743,12 +743,13 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     ext_taken_redir/f0_diverged vs f2.2's follow advance; and ICACHE_FTB_COND on/off = the
     conditional-FTB double-bubble risk the design flagged). Next: trace root-cause both (cf. 3a.5
     commit-PC trace; boot needs c_instr + register-operand trace like 3a.5's udelay corner).
-- **f2.4-fix** ⏳ IN PROGRESS — 2 leaks ROOT-CAUSED + FIXED (both DEAD-at-0, veryl test 252/0), boot
-  advances from the early idle-task panic all the way to **userspace init**; a 3rd leak remains. The
-  fixes are committed at 0 (behavior-inert scaffold, cf. the f1 skid additions); re-flip validation
-  waits on the remaining boot leak(s). Debug method = 3a.5 commit-PC trace + a "first novel PC" diff
-  vs a variant-A (FTB_OVERRIDE=0) boot PC-set, then trace the corrupted value/bytes back to the
-  produce/fb-write (add a `$display` gated on the exact PC/value/instr).
+- **f2.4-fix** ✅ DONE — 3 leaks ROOT-CAUSED + FIXED (all DEAD-at-0, veryl test 252/0, dhrystone
+  bit-exact cy 251423 / instret 264834). **Re-flip N1 boot now COMPLETES (17.6M, x3=0xaa pass=1)** with
+  the divergence trap silent for the whole boot — corner 3 was the last leak. The fixes are committed at
+  0 (behavior-inert, cf. the f1 skid additions); the flip (9-const set below) is validated but stays at
+  0 for ship. Debug method that closed corner 3 = the **divergence trap** (fetch-stream invariant
+  pred_next==next-committed-PC, mechanism-agnostic — catches wrong-PATH skips a wrong-bytes detector
+  misses) + a windowed produce/commit/redirect trace; keep it in the reusable-harness kit.
   - **Corner 1 [FIXED — `a_eff_next`]** dhrystone silent corruption (was: 51k insts skipped, instret
     213489 vs 264834). Root: under FTB_OVERRIDE `ext_ftb_follow` (f2.2) advances extract NON-
     sequentially to the FTB target dword at OFFSET 0. When the clocked-full pred resolves the branch
@@ -773,22 +774,29 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     writing x1=garbage → a later `ret` jumped to it). **Fix:** `ext_next_valid`'s across-dword arm gets
     `&& (!FTB_OVERRIDE || !ext_bypass)` — the across-dword read only consumes head+1 when head IS
     ext_pc_q's dword; the slot-1/straddle just waits a cycle during a bypass. DEAD at FTB_OVERRIDE=0.
-  - **Corner 3 [OPEN — localized]** boot init SIGSEGV (exitcode 0xb, "Attempted to kill init"). After
-    corners 1+2 boot reaches userspace init, then a kernel path faults: **epc=0x800a243a `ld a0,8(a5)`,
-    badaddr=0x33, cause=0xd (load fault), a5=a0=0x2b** — a kernel struct pointer corrupted to 0x2b
-    (passed in as a0 by the caller, ra=0x800a2884). First novel PC (vs variant-A) = `c.beqz a5` at
-    0x800bbc4a (a5 = bit-3 of tp[0]) — a downstream data-branch divergence. **NOT a wrong-bytes leak**:
-    a general "same PC committed with >1 distinct instr" detector (trace `A/B pc instr`, needs the
-    o_commit2_instr rob debug port for lane B, then `sort -u | awk '{c[$1]++} c[$1]>1'`) found ZERO
-    over the full 10M-commit boot. So corner 3 is a **wrong-PATH** (an instr wrongly executes / is
-    skipped, like corner 1's strcpy 0x98) or **wrong-VALUE** (a load reads wrong data) leak, harder to
-    trap than corner 2's wrong-bytes. Hypothesis: a residual pred_next inconsistency my a_eff_next fix
-    doesn't cover — a_eff_next assumes the delivered successor == ext_eff_next captured at produce, but
-    an f2.1 `ext_taken_redir`/`f0_diverged` firing the cycle AFTER a produce re-steers the NEXT
-    ext_pc_q, so the recorded a_eff_next ≠ the actual delivered successor → another masked-mispredict
-    leak. Next (fresh context): trace the 0x2b (or the tp[0]) corruption back to its producer via the
-    noisy boot PC-stream diff (align vs a variant-A trace, filter udelay/poll timing noise) or a
-    value/first-permanent-divergence trap; then check the a_eff_next-vs-f2.1-redirect race.
+  - **Corner 3 [FIXED — `c_bp_mispredict` gated on `rob_commit_ack` for non-control ops]** boot init
+    SIGSEGV / hang. Root-caused with a **divergence trap** (a temp `always_ff`: the fetch-stream
+    invariant "instr A's recorded pred_next_pc == the PC of the NEXT committed instr B"; fires on the
+    first violation, invalidated across any redirect, latched once) + a windowed produce/commit/redirect
+    trace. The FIRST divergence was a SKIPPED store at 0x800abf4e: the sequence
+    `jal ra→0x800abf4c` (cy 0x30d28) → `c.addi16sp` (0x800abf4c, lane B) → **`c.swsp x9,132(x2)`
+    (0x800abf4e) NEVER COMMITS** → `c.sdsp` (0x800abf50). The `c.swsp` (a stack register-save store, the
+    LAST RVC in dword 0x800abf48, offset 6) was fetched with `ext_ftb_follow` (f2.2) engaged: a
+    stale/aliased FTB entry for dword 0x800abf48 pointed at 0x800ac2c0, so slot-1's pred_next was
+    recorded as 0x800ac2c0 (the FTB target) not the sequential 0x800abf50. That IS a correctly-detected
+    `c_bp_mispredict` (pred 0x800ac2c0 ≠ arch_next 0x800abf50) — **but the store was still draining**
+    (`rob_commit_valid=1`, `rob_commit_ack=0`: sb_elig / store_fetched_q / dcache gating). The OLD
+    `c_bp_mispredict = rob_commit_valid && (pred != arch)` fired the redirect on `rob_commit_valid`, so
+    the redirect (to c_arch_next_pc = the store's fall-through 0x800abf50) FLUSHED the store *before it
+    retired* and re-fetched from 0x800abf50 — permanently SKIPPING the store (s1 never saved → corrupted
+    stack → the eventual init fault). **Fix:** `&& (c_is_control || rob_commit_ack)` — a NON-control
+    mispredict waits for the op to actually retire (execute) before firing the redirect; control ops keep
+    rob_commit_valid (exact baseline). Corner 1's op was a simple ALU op (retires immediately), so it
+    never hit this; only STORES (and c_serial/c_flush_op) stall at the head long enough to be flushed
+    pre-retire. **DEAD/byte-identical at =0** (a non-control op's pred_next == fall-through there, so the
+    non-control mispredict is 0 regardless). Validated: re-flip N1 boot **completes 17.6M, DIVERGE trap
+    silent for the whole boot** (corner 3 was the LAST leak); at =0 veryl test 252/0, dhrystone
+    bit-exact cy 251423 / instret 264834.
   - **IPC note (partial):** at =1 (both fixes) dhrystone is 333910 cy = **+33% vs base, WORSE than
     variant-A's +26%** — the FTB-vs-clocked disagreement-recovery flush (every loop-exit / TAGE
     disagreement) costs more than the FTB prefetch saves on dhrystone's tiny strcpy/strcmp loops. Only
@@ -796,6 +804,28 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     may favour f2.4. IPC tuning (recover the disagreement flush at Stage-B instead of via early/commit
     redirect) is a post-correctness item.
   - **Debug harness (reusable, for corner 3+):**
+    - **Divergence trap (THE tool that closed corner 3 — mechanism-agnostic, timing-noise-immune):**
+      a temp `always_ff` that verifies the fetch-stream invariant **A.pred_next_pc == the PC of the NEXT
+      committed instr B** (in correct operation the frontend steers the next fetch to exactly A's
+      recorded pred_next, so a wrong-path/skip commit breaks this). Keep `dv_prev_pred`/`dv_prev_pc`/
+      `dv_valid`/`dv_seen`/`dv_cy` regs: on `rob_commit_ack`, if `dv_valid && !dv_seen && c_pc !=
+      dv_prev_pred` → `$display("DIVERGE-A ...")` + latch `dv_seen`; then set `dv_prev_pred =
+      c_pred_next_pc` (lane A) or `c2_pc + (c2_is_rvc?2:4)` on `commit2_fire` (lane B, whose c2_valid
+      guard already forces pred==fall). **Crucial:** invalidate `dv_valid=1'b0` on
+      `redirect_fire || early_redir_fire_q || commit_redirect` OUTSIDE the `rob_commit_ack` block — an
+      async interrupt/trap redirects on a NON-commit cycle, and missing that gives a false DIVERGE at the
+      trap vector (got=trap-handler-PC). Soundness control: it must be SILENT on a variant-A (=0-ish)
+      boot. It catches wrong-PATH skips a wrong-bytes detector misses; it does NOT catch pure wrong-VALUE
+      (data) leaks. Needs the lane-B `o_commit2_is_rvc`/`o_commit2_instr` temp rob ports (below).
+    - **Windowed produce/commit/redirect trace:** once the trap gives the divergence `dv_cy`, gate a
+      second `always_ff` on `dv_cy in [lo,hi]` and dump per-cycle: fetch PRODUCE (`fb_push0`: ic_pc,
+      ext_eff_next, ext_ftb_follow, ext_next_valid, ext_bypass, fb_push1, s1_pc, sb_override, ext_pc_q,
+      wf_count), COMMIT (lanes A/B: pc, instr, pred_next, is_rvc), REDIRECT (any of redirect_fire/
+      early_redir_fire_q/sb_override/ext_taken_redir/f0_diverged/commit_redirect: their PCs +
+      c_bp_mispredict/c_arch_next_pc), and ROB ALLOC (`rename_fire` gated on `if_pc_q` in the region:
+      if_pc_q, if_pred_next_pc_q, rename_fire2). This is what showed corner 3: the store was ALLOCATED
+      (AL), reached the head with `c_bp_mispredict=1` but `rob_commit_ack=0` (draining), and the redirect
+      flushed it pre-retire. dv_cy is deterministic across runs (the trap regs don't feed RTL).
     - **Commit trace:** in the perf-counter `always_ff` (`else` arm), `const TRACE_COMMIT: bit = 1;`
       then `if TRACE_COMMIT { if rob_commit_ack { $display("A %h %h", c_pc, c_instr); } if
       commit2_fire { $display("B %h %h", c2_pc, c2_instr); } }`. Lane B's instr needs a temp rob port:
