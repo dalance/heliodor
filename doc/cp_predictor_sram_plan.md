@@ -1059,14 +1059,36 @@ New `const FTQ_DECOUPLE: bit = 0;` (requires the F2-lite 9-const set; PRED_L0_FA
     just the flip + measurement (no separate "decouple depth" step needed).
     - **Gotcha logged:** Veryl `for` loops take NO type annotation — `for i in 0..N {` (not
       `for i: u32 in 0..N`, a SyntaxError that a warm `.build` cache HIDES until `rm -rf .build`).
-- **f2.5c** FLIP + MEASURE (the run-ahead already works after f2.5b — `pc_pred` fills the FTQ up to
-  FTQ_N while F0 drains, so there is no separate "decouple depth" step). Flip the 10-const set
-  (F2-lite 9 + FTQ_DECOUPLE), build (check for a comb loop), and validate like f2.4: dhrystone
-  instret bit-exact, N1 boot completes (~17.6M ref), litmus. Returns/indirects still override at
-  extract (identical to F2-lite — the FTB excludes them, so `pc_pred` falls through past a return and
-  extract's `sb_override` corrects + flushes the FTQ). MEASURE IPC (expect ≈-neutral + the +1
-  redirect bubble per the assessment). Expect skid/straddle/`f0_diverged`-under-FTQ corners (debug
-  with the divergence trap, cf. f2.4-fix). Revert to =0 (ship-safe) if corners need multi-session work.
+- **f2.5c** ✅ FLIPPED + MEASURED (=0 reverted, ship-safe). Flipped the 10-const set (F2-lite 9 +
+  FTQ_DECOUPLE). **Builds, NO comb loop.**
+  - **CORRECTNESS — FULLY HEALTHY on the FIRST flip, ZERO corners** (contrast f2.4's 3 corners):
+    dhrystone **instret 264834 = base (BIT-EXACT)**; `veryl test` **252/0** (arch rv64ui/um/ua/mi/si/
+    uf/ud + litmus N2 all pass — better than f2.4's 251/1 litmus-timeout); **N1 Linux boot COMPLETES
+    cy 0x139df90 ≈ 20.6M, x3=0xaa, pass=1.** This validates the clean-decoupling design: because f2.5
+    is purely UPSTREAM of extract (the WORD-FIFO stream is provably identical), it inherits the
+    f2.4-fix correctness wholesale and introduces NO new corner. The predicted skid/straddle/
+    `f0_diverged`-under-FTQ corners did NOT materialize — the FTQ is transparent to extract.
+  - **IPC — NEGATIVE (the +1 redirect bubble, as the honest assessment predicted):**
+    | bench     | base (=0)       | F2-lite (f2.4-fix) | F2-full (f2.5c)        |
+    |-----------|-----------------|--------------------|------------------------|
+    | dhrystone | 251423          | 333910 (+33%)      | 378650 (+50.6%)        |
+    | boot N1   | 14.2M           | 17.6M (+24%)       | 20.6M (+45%)           |
+    | litmus N2 | 2.63M(0x282170) | —                  | 3.52M (0x35b600, +34%) |
+    Each redirect (taken branch not FTB-prefetched, every mispredict) now costs +1 (the FTQ-refill
+    bubble: after a flush, F0 waits one cycle for `pc_pred` to re-enqueue the target before it can
+    dequeue). On the current single-outstanding / prefetch-OFF (P9.6) memory system there is NO
+    offsetting run-ahead-prefetch gain, so the decoupling is a **net IPC LOSS vs F2-lite** (~+17% boot,
+    +13% dhrystone). Exactly the "structural completion, not IPC win" outcome the assessment named.
+  - **⇒ F2-full is STRUCTURALLY COMPLETE + CORRECT end-to-end, shipped DEAD at 0.** The decoupled
+    predictor→FTQ→fetch front end (Reinman/Calder) now exists and boots Linux correctly at =1. The
+    IPC is negative until the redirect bubble is mitigated AND the run-ahead is converted to IPC:
+    - **redirect-bubble mitigation (memory-system-INDEPENDENT, the cheapest win):** a bypass — F0
+      fetches `pc_pred` directly on the empty-FTQ refill cycle (the `f0_fetch_pc` fallback is already
+      `pc_pred`; just let `f0_present` fire on it for the first post-redirect fetch, taking care the
+      dword isn't double-fetched from the FTQ) — removes the +1 bubble and should bring f2.5 back
+      toward F2-lite parity. A clean, self-contained f2.5c.1 follow-up.
+    - **IPC payoff (memory-system-DEPENDENT):** f2.5d run-ahead RAS + f2.5e FTQ-driven prefetch /
+      hit-under-miss, gated on the P9.6 mem-port contention being addressed.
 - **f2.5d** (value-add, gated on f2.5c's measurement) Run-ahead RAS: extend the FTB (or a companion)
   to mark block-terminating returns + carry is_call, add a `pc_pred`-side run-ahead RAS pushed/popped
   as `pc_pred` predicts, so `pc_pred` predicts return targets AHEAD (removing the return override
