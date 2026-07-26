@@ -773,11 +773,22 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     writing x1=garbage → a later `ret` jumped to it). **Fix:** `ext_next_valid`'s across-dword arm gets
     `&& (!FTB_OVERRIDE || !ext_bypass)` — the across-dword read only consumes head+1 when head IS
     ext_pc_q's dword; the slot-1/straddle just waits a cycle during a bypass. DEAD at FTB_OVERRIDE=0.
-  - **Corner 3 [OPEN]** boot init SIGSEGV (exitcode 0xb, "Attempted to kill init"). After corners 1+2
-    boot reaches userspace init, then init faults. First novel PC (vs variant-A) = `c.beqz a5` at
-    0x800bbc4a branching on a5 = bit-3 of `tp[0]` (thread-local) — a DATA corruption of tp/tp[0], root
-    not yet traced (likely another wrong-path leak, possibly more after it). Next: trace the tp[0]
-    (or tp) corruption back to its producing instruction, same method as corners 1/2.
+  - **Corner 3 [OPEN — localized]** boot init SIGSEGV (exitcode 0xb, "Attempted to kill init"). After
+    corners 1+2 boot reaches userspace init, then a kernel path faults: **epc=0x800a243a `ld a0,8(a5)`,
+    badaddr=0x33, cause=0xd (load fault), a5=a0=0x2b** — a kernel struct pointer corrupted to 0x2b
+    (passed in as a0 by the caller, ra=0x800a2884). First novel PC (vs variant-A) = `c.beqz a5` at
+    0x800bbc4a (a5 = bit-3 of tp[0]) — a downstream data-branch divergence. **NOT a wrong-bytes leak**:
+    a general "same PC committed with >1 distinct instr" detector (trace `A/B pc instr`, needs the
+    o_commit2_instr rob debug port for lane B, then `sort -u | awk '{c[$1]++} c[$1]>1'`) found ZERO
+    over the full 10M-commit boot. So corner 3 is a **wrong-PATH** (an instr wrongly executes / is
+    skipped, like corner 1's strcpy 0x98) or **wrong-VALUE** (a load reads wrong data) leak, harder to
+    trap than corner 2's wrong-bytes. Hypothesis: a residual pred_next inconsistency my a_eff_next fix
+    doesn't cover — a_eff_next assumes the delivered successor == ext_eff_next captured at produce, but
+    an f2.1 `ext_taken_redir`/`f0_diverged` firing the cycle AFTER a produce re-steers the NEXT
+    ext_pc_q, so the recorded a_eff_next ≠ the actual delivered successor → another masked-mispredict
+    leak. Next (fresh context): trace the 0x2b (or the tp[0]) corruption back to its producer via the
+    noisy boot PC-stream diff (align vs a variant-A trace, filter udelay/poll timing noise) or a
+    value/first-permanent-divergence trap; then check the a_eff_next-vs-f2.1-redirect race.
   - **IPC note (partial):** at =1 (both fixes) dhrystone is 333910 cy = **+33% vs base, WORSE than
     variant-A's +26%** — the FTB-vs-clocked disagreement-recovery flush (every loop-exit / TAGE
     disagreement) costs more than the FTB prefetch saves on dhrystone's tiny strcpy/strcmp loops. Only
