@@ -795,6 +795,26 @@ now composed with the Stage-A/B skid + clocked predictors. Specifically:
     dhrystone measured (f2.4's worst case: short loops); boot/coremark/longer-loop IPC unmeasured and
     may favour f2.4. IPC tuning (recover the disagreement flush at Stage-B instead of via early/commit
     redirect) is a post-correctness item.
+  - **Debug harness (reusable, for corner 3+):**
+    - **Commit trace:** in the perf-counter `always_ff` (`else` arm), `const TRACE_COMMIT: bit = 1;`
+      then `if TRACE_COMMIT { if rob_commit_ack { $display("A %h %h", c_pc, c_instr); } if
+      commit2_fire { $display("B %h %h", c2_pc, c2_instr); } }`. Lane B's instr needs a temp rob port:
+      add `o_commit2_instr : output logic<32>` + `assign o_commit2_instr = sh_instr[head1_idx];` in
+      rob.veryl, and a `var c2_instr` + `o_commit2_instr: c2_instr` on the core's rob instance. (Veryl
+      $display in always_ff is fine; no `$finish`/relational `>`; the UART console double-chars but
+      $display does not — dedouble a captured console line with `sed 's/\(.\)\1/\1/g'`.)
+    - **Kernel disasm** (N1 boot loads `test/hex/linux_dram_real.hex` at PA 0x80000000; VA
+      0xffffffff80xxxxxx → PA 0x80xxxxxx): hex line M (1-based) = the 32-bit word at PA 0x80000000 +
+      4*(M-1), so M = (PA-0x80000000)/4 + 1. Extract a range, little-endian each word to bytes, and
+      `riscv64-unknown-elf-objdump -b binary -m riscv:rv64 -M no-aliases -D` (add PA to the blob
+      offsets; branch targets in the objdump text are blob-relative — add the blob base).
+    - **First-novel-PC diff:** trace a variant-A boot (FTB_OVERRIDE=0, others 1) → `vA_pcset =
+      sort -u of its A/B PCs`; trace the =1 boot; `awk 'NR==FNR{seen[$1];next} /^A |^B /{if(!($2 in
+      seen)){print FNR": "$2; exit}}' vA_pcset fix1_boot` = first PC variant-A never runs (a wrong-path
+      entry — but may be a downstream data-branch; the ROOT is upstream, trace the corrupted value back).
+    - **Wrong-bytes detector (banked, found nothing for corner 3):** `grep '^A \|^B ' | awk '{print
+      $2,$3}' | sort -u | awk '{c[$1]++} END{for(p in c)if(c[p]>1)print p}'` = PCs committed with >1
+      distinct instr. Catches corner-2-style wrong-bytes; corner 3 is wrong-PATH/VALUE so this is empty.
 
   **Flip recipe (the 9-const F2-lite set; PRED_L0_FAST stays 0):**
   ```
