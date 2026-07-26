@@ -1013,10 +1013,23 @@ the f2.4-fix corners.
 
 New `const FTQ_DECOUPLE: bit = 0;` (requires the F2-lite 9-const set; PRED_L0_FAST stays 0).
 
-- **f2.5a** FTQ storage substrate + `pc_pred` register, declared ONLY (no consumer rewire). `pc_pred`
-  + `ftq_pc[FTQ_N]`/`ftq_head`/`ftq_tail`/`ftq_count`, written ONLY under `else if FTQ_DECOUPLE` →
-  reset-only at 0 → the regs + fanin DCE → byte-identical (the ext_pc_q / WORD-FIFO idiom). Declares
-  the substrate; `veryl check` == baseline, `veryl test` 252/0. (This increment.)
+- **f2.5a** ✅ DONE (`a70afa1`). FTQ storage substrate (`pc_pred`/`pp_no_ftb_q`/`ftq_pc[FTQ_N]`/
+  `ftq_head`/`ftq_tail`/`ftq_count`, FTQ_N=8) + the `pc_pred` FTB PRODUCER (`pp_ftb_hit`/`pp_next` =
+  the `f0_ftb_hit` logic on `pc_pred`) + FTQ enqueue + the redirect re-seed/flush invariant. NO F0
+  consumer yet (f2.5b). Written ONLY under `else if FTQ_DECOUPLE`; `pp_ftb_hit` carries `FTQ_DECOUPLE
+  &&`. `veryl check` no new warnings; `veryl test` 252/0.
+  - **DEAD-proof caveat (learned here — correct the "byte-identical" shorthand):** Veryl 0.20.2 does
+    NOT const-fold `else if CONST_FALSE` / reset-only flops at the SV-TEXT level — the generated
+    heliodor_core.sv literally contains the (dead) localparam=0, the flop decls, the always_comb, and
+    the `else if (FTQ_DECOUPLE)` always_ff. The correct DEAD criterion is **the existing SV is
+    preserved VERBATIM and the additions are inert**: the SV diff vs HEAD is PURE ADDITIONS (all `a`
+    hunks, zero `c`/`d` — no existing line changed/removed), and every addition is const-gated
+    (`FTQ_DECOUPLE`=0 → the always_ff non-reset branch never runs, pc_pred/ftq hold reset, pp_ftb_hit
+    const-false, all unread) → synth-DCE + sim-inert → behavior provably identical (existing netlist
+    untouched + additions unread ⟹ cannot perturb any existing signal). This is STRONGER than a
+    cycle-count check. (Prior "byte-identical" claims for register-adding scaffolds — PRED_PIPE,
+    PRED_HOLD_FREEZE — meant this behavioral sense; only EXPRESSION-level folds like f2.1's `||0` are
+    literally byte-identical SV. `.sv` is gitignored, so verify via build+diff, not `git diff`.)
 - **f2.5b** Wire the `pc_pred` FTB loop + FTQ enqueue, and F0 dequeue. Under FTQ_DECOUPLE: (i)
   `pc_pred` reads the FTB (`pc_pred_ftb_hit`/`_target` = the `f0_ftb_hit` logic on `pc_pred`),
   enqueues `pc_pred` to the FTQ + advances `pc_pred` to `(hit ? target : +8)` when `!ftq_full`; (ii)
