@@ -98,6 +98,39 @@ ordering.
 **Effort:** medium (SEL/SPEC + bypass). **Mostly independent** of L; `LOAD_SPEC`
 touches R3's ordering machinery.
 
+### ✅ S1 status (2026-07-27) — scheduler-pipeline SHIPPED LIVE; EX_PIPE banked
+
+The scheduler pipeline is now the **FINAL structure, LIVE**: `SEL_PIPE=1` +
+`SPEC_WAKE=1` (`iq_int.veryl:266/297`). Re-validated end-to-end in the current
+tree (post-F1/F2): `veryl test` **252/0**, litmus **N4 pass** (cy 5.63M), **N2 SMP
+boot** 19.25M, **N4 SMP boot** 30.55M — all at baseline cycle counts (**IPC-neutral**;
+dhrystone +0.6 %, instret bit-exact). A1.0 pipelines the select→wakeup loop
+(registers the SCHED_WAKEUP pdst); A1.1's grandparent speculative wakeup recovers
+the +1-cy dependent-issue (litmus N2 returns to the byte-exact baseline). The CP
+benefit stays masked under the wall (only realised in a bundle flip) — this ships
+for the **structure**, per the campaign's "advance FINAL structure, not the synth
+number" mandate.
+
+**EX_PIPE (execute-staging keystone) is BANKED at 0** — two blockers in the current
+tree, user-decided to bank (2026-07-27) and ship the scheduler-pipeline alone:
+1. **Boot hang** (arch 252/0 passes, but N1 boot infinite-loops): at `EX_PIPE=1`
+   early boot corrupts the paging-enable / control flow (`csrw satp` @0x80001040 →
+   a wild jump to PC 0 → `handle_exception` re-enters forever because `ld sp,16(tp)`
+   loads sp=0 → `sd ra,8(sp)` store-page-faults → nested-trap storm). Localised to
+   the paging-enable/CSR-CDB region; a wrong-value from the EX register/bypass. The
+   old "SMP-complete" validation (`deep_pipeline_status_and_replan.md`) predates
+   F1/F2 + the grown suite. −15 % IPC alone, so IPC-negative even once fixed.
+2. **FROUND_PIPE=1 latent bug** (coupled to EX_PIPE): the 3-stage Zfa FROUND applies
+   the wrong rounding mode for STATIC-rm `fround.s` and drops the `froundnx.s` NX
+   flag — the held-at-head op's rounding-mode / fflags are read LIVE one cycle after
+   the op released (`test_arch_zfa_s2`; ACT4's single dynamic-rm fround never hit it).
+   **Decoupled** (`FROUND_PIPE=FMA_PIPE3=0`, byte-identical at `EX_PIPE=0`) so a
+   future EX_PIPE flip does not re-enable it; the fix + re-couple is FP-CP follow-up.
+
+EX_PIPE + its bypass/E3 scaffold + corner-fixes stay committed (built, `=0`); the
+boot corner and the FROUND bug are the remaining work for a future execute-staging /
+FP-CP session. `LOAD_SPEC=0` remains deferred to Block R.
+
 ---
 
 ## Block L — Canonical LSQ (store queue + translate@execute + load queue)
