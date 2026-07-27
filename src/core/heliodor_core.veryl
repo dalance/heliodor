@@ -8265,13 +8265,94 @@ pub module heliodor_core #(
     // block holds the entry's D-cone. Alloc is the cycle the in-cache write would have
     // fired; drain is R3.2's (still a placeholder: the real engine re-reads under
     // ownership). Both const-gated, so at ATOMIC_SQ=0 every field holds its reset value.
+    // ── R3.2a: drain engine — datapath + FSM (DEAD at ATOMIC_SQ=0) ────────────
+    // §6.2's compute-at-drain: the queued atomic's RMW is performed HERE, at the
+    // memory system, not at execute. IDLE -> RD (an ownership read, i.e. the same
+    // RFO the execute-side AMO read raises) -> WR (the in-cache exclusive merge of
+    // `new = old OP src`) -> IDLE. Because rd is architecturally dead for this class,
+    // losing the line at any point is not a correctness event: asq_dr_poison simply
+    // sends the engine back to RD and it re-reads. That retry is the whole answer to
+    // "a retired atomic that cannot drain" — there is no fallback machinery, and no
+    // pin has to be held across retire.
+    //
+    // Poison sources are the ones the execute-side watch already uses (remote/precise
+    // invalidate + local eviction), compared against the entry's line. A stale `old`
+    // can therefore never reach the write: any departure between RD and WR restarts
+    // the read.
+    //
+    // ⚠️ R3.2a builds the engine only — its requests are NOT yet wired into the dcache
+    // port muxes (that is R3.2b), so at ATOMIC_SQ=1 the RD state would consume
+    // whatever the port happens to return. =1 stays non-functional by construction
+    // until R3.2b lands; at =0 the whole engine is const-gated and unreachable.
+    var asq_dr_st_q : logic<2> ; // 0=IDLE 1=RD(ownership read) 2=WR(exclusive merge)
+    var asq_dr_old_q: logic<64>; // the dword read back at asq_pa (dword frame)
+    let asq_dr_start : logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty && asq_dr_st_q == 2'd0;
+    let asq_dr_ren   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd1;
+    let asq_dr_rdone : logic = asq_dr_ren && !dcache_stall;
+    let asq_dr_wen   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd2;
+    let asq_dr_wdone : logic = asq_dr_wen && !dcache_stall;
+    let asq_dr_poison: logic = ATOMIC_SQ && asq_dr_st_q != 2'd0
+        && ((i_dcache_inv_valid && i_dcache_inv_addr[63:6] == asq_pa_q[0][63:6])
+        || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == asq_pa_q[0][63:6])
+        || (dc_evict1_v && dc_evict1_addr[63:6] == asq_pa_q[0][63:6])
+        || (dc_evict2_v && dc_evict2_addr[63:6] == asq_pa_q[0][63:6]));
+    always_ff (clk, rst) {
+        if_reset {
+            asq_dr_st_q  = 2'd0;
+            asq_dr_old_q = 64'd0;
+        } else if asq_dr_poison {
+            asq_dr_st_q = 2'd1; // re-acquire + re-read; never write a stale `old`
+        } else if asq_dr_start {
+            asq_dr_st_q = 2'd1;
+        } else if asq_dr_rdone {
+            asq_dr_old_q = dcache_rdata;
+            asq_dr_st_q  = 2'd2;
+        } else if asq_dr_wdone {
+            asq_dr_st_q = 2'd0;
+        }
+    }
+    // The RMW itself, replicating alu_wrap's M5.A compute on the queued operands:
+    // the target sub-word is right-aligned out of the dword by the byte offset, both
+    // operands are extended at the access width, and the result is re-shifted into
+    // the dword lane with a funct3-derived strobe (atomics are naturally aligned, so
+    // there is never a hi-dword span). LR/SC/amocas are not in the class, so only the
+    // nine RMW ops appear here.
+    let asq_boff  : logic<3>  = asq_pa_q[0][2:0];
+    let asq_f3    : logic<3>  = asq_sz_q[0];
+    let asq_old_al: logic<64> = asq_dr_old_q >> {asq_boff, 3'b000};
+    let asq_old_ze: logic<64> = if asq_f3 == 3'b000 ? {56'd0, asq_old_al[7:0]} : if asq_f3 == 3'b001 ? {48'd0, asq_old_al[15:0]} : if asq_f3 == 3'b010 ? {32'd0, asq_old_al[31:0]} : asq_old_al;
+    let asq_old_se: logic<64> = if asq_f3 == 3'b000 ? {asq_old_al[7] repeat 56, asq_old_al[7:0]} : if asq_f3 == 3'b001 ? {asq_old_al[15] repeat 48, asq_old_al[15:0]} : if asq_f3 == 3'b010 ? {asq_old_al[31] repeat 32, asq_old_al[31:0]} : asq_old_al;
+    let asq_b_ze  : logic<64> = if asq_f3 == 3'b000 ? {56'd0, asq_src_q[0][7:0]} : if asq_f3 == 3'b001 ? {48'd0, asq_src_q[0][15:0]} : if asq_f3 == 3'b010 ? {32'd0, asq_src_q[0][31:0]} : asq_src_q[0];
+    let asq_b_se  : logic<64> = if asq_f3 == 3'b000 ? {asq_src_q[0][7] repeat 56, asq_src_q[0][7:0]} : if asq_f3 == 3'b001 ? {asq_src_q[0][15] repeat 48, asq_src_q[0][15:0]} : if asq_f3 == 3'b010 ? {asq_src_q[0][31] repeat 32, asq_src_q[0][31:0]} : asq_src_q[0];
+    let asq_lt    : logic     = $signed(asq_old_se) <: $signed(asq_b_se);
+    let asq_ltu   : logic     = asq_old_ze <: asq_b_ze;
+    var asq_new_64: logic<64>;
+    always_comb {
+        case asq_op_q[0] {
+            5'b00001: asq_new_64 = asq_b_ze;                          // SWAP
+            5'b00000: asq_new_64 = asq_old_ze + asq_b_ze;             // ADD
+            5'b00100: asq_new_64 = asq_old_ze ^ asq_b_ze;             // XOR
+            5'b01100: asq_new_64 = asq_old_ze & asq_b_ze;             // AND
+            5'b01000: asq_new_64 = asq_old_ze | asq_b_ze;             // OR
+            5'b10000: asq_new_64 = if asq_lt ? asq_old_se : asq_b_se; // MIN
+            5'b10100: asq_new_64 = if asq_lt ? asq_b_se : asq_old_se; // MAX
+            5'b11000: asq_new_64 = if asq_ltu ? asq_old_ze : asq_b_ze; // MINU
+            5'b11100: asq_new_64 = if asq_ltu ? asq_b_ze : asq_old_ze; // MAXU
+            default : asq_new_64 = asq_b_ze;
+        }
+    }
+    let asq_mask_base: logic<8>  = if asq_f3 == 3'b000 ? 8'b0000_0001 : if asq_f3 == 3'b001 ? 8'b0000_0011 : if asq_f3 == 3'b010 ? 8'b0000_1111 : 8'b1111_1111;
+    let asq_mask_ext : logic<16> = ({8'd0, asq_mask_base} as 16) << asq_boff;
+    let asq_dr_wstrb : logic<8>  = asq_mask_ext[7:0];
+    let asq_dr_wdata : logic<64> = asq_new_64 << {asq_boff, 3'b000};
+
     // rs2 read from the architectural regfile at commit: the atomic is serialized at
     // the ROB head and retires in order, so arch_regs is authoritative for its rs2
     // (exactly the amocas.q commit-operand argument). x0 reads as zero.
     let asq_src_rs2 : logic<5>  = c_instr[24:20];
     let asq_src_arch: logic<64> = if asq_src_rs2 == 5'd0 ? 64'd0 : arch_regs[asq_src_rs2];
     let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full;
-    let asq_drain: logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty;
+    let asq_drain: logic = ATOMIC_SQ && asq_dr_wdone;
     always_ff (clk, rst) {
         if_reset {
             for i in 0..ASQ_N {
@@ -8301,7 +8382,11 @@ pub module heliodor_core #(
     // (constant selector, synth folds). At 1 the in-cache write still fires for every
     // atomic OUTSIDE the class (!asq_class — LR/SC, result-returning AMOs, amocas,
     // MMIO); the class's write is instead performed by the queue drain.
-    let amo_cwr_eff: logic = if ATOMIC_SQ ? (asq_drain || (amo_cwr_en && !asq_class)) : amo_cwr_en;
+    // The drain arm is the REQUEST (asq_dr_wen, a pure function of the FSM register),
+    // never the completion (asq_dr_wdone, which reads dcache_stall): routing the
+    // completion here closes a combinational loop write-enable -> dcache_stall ->
+    // wdone -> write-enable. Whether the write landed only ever advances the FSM.
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? (asq_dr_wen || (amo_cwr_en && !asq_class)) : amo_cwr_en;
     let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? ac_pa_q : m_pa_q)) : dmu_dmem_addr;
     // CP M3b: the AMO read must be a SINGLE RFO pulse at its ACCESS cycle, not a
     // sustained access. The AMO is held at the issue port for both its fetch and

@@ -9,11 +9,11 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 substrate + R3.1 classify/retire built, DEAD at `ATOMIC_SQ=0`; R3.2's blocking
-design question RESOLVED (§6)** (2026-07-27). §6 is authoritative over §2's original scheme-A
-recommendation. Next: **R3.2**, the compute-at-drain engine — until it lands, `ATOMIC_SQ=1` is
-non-functional by construction (the drain is a placeholder that frees the entry without
-performing the RMW), so do not flip.
+Status: **R3.0 substrate + R3.1 classify/retire + R3.2a drain engine built, DEAD at
+`ATOMIC_SQ=0`; R3.2's blocking design question RESOLVED (§6)** (2026-07-27). §6 is
+authoritative over §2's original scheme-A recommendation. Next: **R3.2b**, the dcache port
+arbitration — until it lands, `ATOMIC_SQ=1` is non-functional by construction (the drain's
+read consumes whatever the unwired port returns), so do not flip.
 
 ---
 
@@ -225,9 +225,33 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
   `i_wen_excl` port, when it is the oldest memory op. **The fallback question dissolves**: no
   architectural state depends on any intermediate, so a stolen line means *retry the drain*,
   never a replay (§6.2). Once the drain owns the line the existing pin covers the single write
-  cycle exactly as today — no pin extension, no watch, no poison for this class. Then the
-  execute-time read becomes architecturally dead for the class and is removed (§6.5), which is
-  what actually lifts issue-side head serialisation.
+  cycle exactly as today — no pin extension, no watch, no poison for this class. Split three
+  ways because the port arbitration is the risky part and deserves its own verified step:
+  - **R3.2a — engine (datapath + FSM). ✅ BUILT, DEAD at 0.** `asq_dr_st_q`
+    IDLE→RD(ownership read)→WR(exclusive merge)→IDLE, started on `asq_valid_q[0] && sb_empty`;
+    `asq_dr_old_q` captures the read dword; `asq_dr_poison` (the execute-side watch's own
+    sources — `i_dcache_inv/inv2`, `dc_evict1/2` — compared against the entry's line) sends the
+    engine **back to RD**, so a stale `old` can never reach the write. That retry *is* the
+    fallback. The RMW replicates alu_wrap's M5.A compute on the queued operands (right-align by
+    byte offset → width-extend → the nine RMW ops → re-shift with a funct3 strobe); LR/SC/
+    amocas cannot appear. `asq_drain` becomes `asq_dr_wdone`, replacing R3.0's placeholder.
+    **Comb-loop corner found and fixed:** the `amo_cwr_eff` drain arm must be the REQUEST
+    (`asq_dr_wen`, a pure function of the FSM register), never the completion (`asq_dr_wdone`,
+    which reads `dcache_stall`) — routing the completion there closes
+    write-enable → `dcache_stall` → `wdone` → write-enable, and Veryl's detector is structural
+    (it does not fold the `ATOMIC_SQ=0` constant away, so the loop is a hard build error even
+    DEAD). Whether the write landed only ever advances the FSM.
+    **Verified (=0):** 252/0 · litmus N2 `cy=0x282170` · dhrystone 252939 cy / instret 264834
+    (identical to R3.1) · N=1 boot `cy=0x0d99720` cycle-identical. Two expected `unused`
+    warnings (`asq_dr_wstrb`, `asq_dr_wdata`) — the engine's outputs have no consumer until
+    R3.2b.
+  - **R3.2b — port arbitration.** Wire `asq_dr_ren`/`asq_dr_wen`/`asq_dr_wdata`/`asq_dr_wstrb`
+    into the dcache port muxes (`dmem_pa_m`/`ren`/`wen`/`wdata`/`wstrb`/`wexcl`) with the RFO
+    flag on the read, const-gated. Until this lands `ATOMIC_SQ=1` is non-functional by
+    construction — the RD state would consume whatever the port happens to return.
+  - **R3.2c — §6.5.** Drop the class's execute-time read (`issue_amo_read`, the watch, the
+    poison, the replay). This is what actually lifts issue-side head serialisation and is where
+    §0(b)'s IPC lives.
 - **R3.3 — flip + litmus closure.** Flip `ATOMIC_SQ=1`; run the FULL ladder (litmus N2/N4 +
   SMP boot N2/N4 + Verilator + ACT4) + contended-atomic IPC. Debug the minefield corners
   (expect several — this is Test-7/Test-8 territory). Ship decision (=0 validated DEAD vs =1),
