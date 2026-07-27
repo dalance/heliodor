@@ -9,7 +9,8 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **design, grounded in the atomic-machinery audit.** No R3 RTL yet.
+Status: **R3.0 substrate built, DEAD at `ATOMIC_SQ=0`** (2026-07-27). Design grounded in the
+atomic-machinery audit; no behaviour has moved yet (R3.1 is the first functional step).
 
 ---
 
@@ -154,11 +155,24 @@ Const `ATOMIC_SQ: bit = 0` gates every increment; each new register's D is const
 §10.10 rule: a DEAD reg whose D-cone doesn't mirror a live signal is NOT synth-neutral unless
 its D is const-gated). Byte-identical proof = existing SV verbatim + additions const-inert.
 
-- **R3.0 — atomic-SQ substrate (this block's first increment).** Declare the `ATOMIC_SQ` const
-  + a small atomic-SQ entry array (`asq_valid/pa/op/src/watch/pin_hold`, `ASQ_N=1..2`) with
-  reset-only + const-gated writes, and a **dual-path `amo_cwr_en` mux** whose `ATOMIC_SQ` arm
-  const-folds to the live single-cycle path at =0. No functional change. Verify: 252/0, litmus
-  N2 cycle-exact, synth FF/CP unchanged (const-gated D). *Ground the structure; do not flip.*
+- **R3.0 — atomic-SQ substrate (this block's first increment). ✅ BUILT, DEAD at 0.** Declares
+  `const ATOMIC_SQ = 0` / `ASQ_N = 1` + the entry array with reset-only, const-gated writes, and
+  the dual-path write-enable, all at `heliodor_core.veryl` immediately after `amo_cwr_en`.
+  Shipped shape (scheme A, so the entry carries the write verbatim rather than `op/src`):
+  `asq_valid_q / asq_pa_q (=ac_pa_q) / asq_data_q (the pre-computed new) / asq_strb_q /
+  asq_excl_q (=ac_wexcl_q) / asq_wpa_q (watch, for R3.2's cross-retire pin) / asq_pin_q`.
+  `asq_alloc = ATOMIC_SQ && amo_commit_live && ac_wok_q && !asq_full` mirrors R3.1's intent
+  (book the entry the cycle the in-cache write would have fired); `asq_drain = ATOMIC_SQ &&
+  asq_valid_q[0] && sb_empty` mirrors R3.2's (release-order gate preserved). The mux is
+  `amo_cwr_eff = ATOMIC_SQ ? asq_drain : amo_cwr_en` — **`amo_cwr_en` itself is untouched**, so
+  the =0 arm is the proven expression (the `alu_cdb_eff` / `c_store_eff_pa` idiom); the two
+  consumers (`dmem_wen_m`, `dmem_wexcl_m`) read `_eff`.
+  **Verified:** SV diff = the existing `amo_cwr_en` expression verbatim + const-gated additions
+  (`ATOMIC_SQ` is a `localparam bit = 0`, so both arms are constant 0 and the mux selector is
+  constant) · `veryl test` **252/0** · litmus N2 **cycle-exact** (`cy=0x282170`, = baseline) ·
+  no new `veryl check` warnings (4856 = baseline) · synth-neutral by the §10.10 const-gated-D
+  rule. *Structure grounded; not flipped — R3.0 at =1 is non-functional by construction (no
+  drain machinery yet), which is why the flip is R3.3.*
 - **R3.1 — retire-into-SQ (alloc + head-release).** At the atomic's commit, instead of the
   single-cycle write, allocate the atomic-SQ entry (carrying the execute-captured `ac_pa_q` +
   pre-computed `new` for scheme A) and **retire** (free the ROB entry, pointer bump). The write
@@ -175,11 +189,15 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
   (expect several — this is Test-7/Test-8 territory). Ship decision (=0 validated DEAD vs =1),
   per the campaign's structural-mandate framing.
 
-**Anchors to touch:** `amo_cwr_en` (:8182) + commit mux (:8183); `ac_pa_q`/`ac_wok_q` alloc
+**Anchors to touch** (line numbers post-R3.0): `amo_cwr_en` (:8182) + the R3.0 substrate and
+`amo_cwr_eff` mux right below it (:8183-8249) + the commit port muxes (`dmem_pa_m` :8250,
+`dmem_wen_m` :8265, `dmem_wdata_m`/`dmem_wexcl_m` :8279-8281) → R3.2 must route the drain's
+address/data/strobe from the asq entry, not the live commit drive; `ac_pa_q`/`ac_wok_q` alloc
 (:6561-6565) → asq alloc; `amo_watch_*_q` (:3437-3440) → asq watch fields; `commit_amo_replay`
-(:4646) / retire gate (`rob_commit_ack` :4702) → SQ-decoupled retire; `dcache.veryl` pin
-(:587, :1529) → cross-retire hold; `sb_empty` (:911) / `c_serial` drain (:168) → atomic-SQ
-ordering; presence `dc_amo_present` (:8315) → asq-driven.
+(:4646) / retire gate (`rob_commit_ack` :4702, whose `c_serial && !sb_empty` fence term is
+:4711) → SQ-decoupled retire; `dcache.veryl` pin (`pin_cnt_q` :587, reset :1534) → cross-retire
+hold; `sb_empty` (:911) → atomic-SQ ordering; presence `dc_amo_present` (chk3 port :8381, today
+addressed by `amo_watch_pa_q`) → must follow `asq_wpa_q` once the atomic retires.
 
 ## 5. Sequencing note
 Per the study's "do not start R3 autonomously" + the campaign's "clean-context start for a

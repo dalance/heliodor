@@ -8180,6 +8180,73 @@ pub module heliodor_core #(
     // → byte-identical. dc_amo_present is derived from the (registered) tag state,
     // not the bus invalidate, so it does not form a combinational loop.
     let amo_cwr_en   : logic     = store_drive && sb_empty && ac_wok_q && (dc_amo_present || !EX_PIPE);
+    // ── R3.0: atomic store-queue substrate — DEAD at ATOMIC_SQ=0 ──────────────
+    // Block R (doc/cp_r3_atomic_reorder_plan.md §4). The atomic today is a single-
+    // cycle in-cache RMW fused at the ROB head (amo_cwr_en above); R3 makes it RETIRE
+    // INTO A QUEUE whose write drains later under coherence, like a store. R3.0
+    // grounds only the STRUCTURE — the entry array, its alloc/drain D-cone, and the
+    // dual-path write-enable — with every write const-gated, so the synthesised design
+    // is unchanged (§10.10: a DEAD reg whose D-cone does not mirror a live signal is
+    // synth-neutral only when its D is const-gated). No behaviour moves here: R3.1
+    // moves the retire, R3.2 the ownership-locked drain, R3.3 flips.
+    //
+    // Scheme A (ownership-locked drain, §2's recommendation): the line never leaves
+    // E/M between the atomic's execute-time read and the queued write, so the entry
+    // carries the write VERBATIM as the commit path would have driven it — address
+    // ac_pa_q (the read-time PA), data/strobe off the atomic's commit drive, in-cache-
+    // merge mode ac_wexcl_q — plus the ownership state R3.2 must hold ACROSS retire:
+    // the watched line (today the watch dies at amo_watch_retire, and dc_amo_present's
+    // chk3 port still reads amo_watch_pa_q — retargeting that port to the queue entry
+    // is R3.2, not R3.0) and the pin flag. Scheme B (re-read-at-drain) would instead
+    // carry {amo_op, src} and defer rd's writeback to the drain: a strictly larger
+    // delta, held as R3-far.
+    const ATOMIC_SQ: bit = 0;
+    const ASQ_N    : u32 = 1; // one atomic in flight (allocation stays head-serialised)
+    var asq_valid_q: logic     [ASQ_N];
+    var asq_pa_q   : logic<64> [ASQ_N]; // write address (= ac_pa_q, the read-time PA)
+    var asq_data_q : logic<64> [ASQ_N]; // pre-computed `new` = old OP src (scheme A)
+    var asq_strb_q : logic<8>  [ASQ_N];
+    var asq_excl_q : logic     [ASQ_N]; // in-cache merge (cacheable) vs write-through
+    var asq_wpa_q  : logic<64> [ASQ_N]; // watched line, held across retire (R3.2 pin)
+    var asq_pin_q  : logic     [ASQ_N]; // ownership hold outstanding (R3.2)
+    // The alloc arm mirrors R3.1's intent: the cycle the atomic would have written
+    // in-cache it instead books the entry (and R3.1 then lets it retire). The drain
+    // arm mirrors R3.2's: the entry frees when its write leaves, after all older
+    // stores (sb_empty = today's release-order gate). Both are const-gated, so at
+    // ATOMIC_SQ=0 every field holds its reset value and the array is unreachable.
+    let asq_full : logic = asq_valid_q[0];
+    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && ac_wok_q && !asq_full;
+    let asq_drain: logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty;
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..ASQ_N {
+                asq_valid_q[i] = 1'b0;
+                asq_pa_q[i]    = 64'd0;
+                asq_data_q[i]  = 64'd0;
+                asq_strb_q[i]  = 8'd0;
+                asq_excl_q[i]  = 1'b0;
+                asq_wpa_q[i]   = 64'd0;
+                asq_pin_q[i]   = 1'b0;
+            }
+        } else if asq_alloc {
+            asq_valid_q[0] = 1'b1;
+            asq_pa_q[0]    = ac_pa_q;
+            asq_data_q[0]  = dmu_dmem_wdata;
+            asq_strb_q[0]  = dmu_dmem_wstrb;
+            asq_excl_q[0]  = ac_wexcl_q;
+            asq_wpa_q[0]   = amo_watch_pa_q;
+            asq_pin_q[0]   = 1'b1;
+        } else if asq_drain {
+            asq_valid_q[0] = 1'b0;
+            asq_pin_q[0]   = 1'b0;
+        }
+    }
+    // Dual-path commit write-enable. amo_cwr_en itself is left UNTOUCHED so the =0 arm
+    // is the proven single-cycle expression; _eff is what the dcache write port reads
+    // (the alu_cdb_eff / c_store_eff_pa idiom). At ATOMIC_SQ=0 amo_cwr_eff ≡ amo_cwr_en
+    // (constant selector, synth folds); at 1 the write is driven by the queue drain
+    // instead — inert until R3.2 wires the drain's address/data into the port muxes.
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? asq_drain : amo_cwr_en;
     let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? ac_pa_q : m_pa_q)) : dmu_dmem_addr;
     // CP M3b: the AMO read must be a SINGLE RFO pulse at its ACCESS cycle, not a
     // sustained access. The AMO is held at the issue port for both its fetch and
@@ -8195,7 +8262,7 @@ pub module heliodor_core #(
     let dmem_ren_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live)) : (dmu_dmem_ren && !lsr_capture);
     let dmem_unc_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_unc_q) : (dc_uncached && !lsr_capture);
     let dmem_lnext_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_lnext_q) : (dc_load_next && !dc_uncached && !lsr_capture);
-    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? amo_cwr_en : m_wen_q)) : dc_i_wen;
+    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? amo_cwr_eff : m_wen_q)) : dc_i_wen;
     let dmem_wstrb_m : logic<8>  = if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : (if amo_commit_live ? dmu_dmem_wstrb : m_wstrb_q)) : dmu_dmem_wstrb;
     // CP wall-cut (W2 keystone-unmask): an AMO/SC commit is ALWAYS naturally aligned
     // (a misaligned AMO faults at issue, never reaching amo_commit_live), and amocas.q's
@@ -8211,7 +8278,7 @@ pub module heliodor_core #(
     let dmem_wstrbhi_m: logic<8> = if MEM_PIPE ? (if ptw_dc_active ? 8'd0 : (if amo_commit_live ? 8'd0 : m_wstrbhi_q)) : dc_st_wstrb_hi;
     let dmem_wdata_m : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_wdata : (if amo_commit_live ? dmu_dmem_wdata : m_wdata_q)) : dmu_dmem_wdata;
     let dmem_amord_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (m_amo_read_q && amo_fetched_q)) : dc_amo_read;
-    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? (amo_cwr_en && ac_wexcl_q) : m_wen_excl_q)) : dc_wen_excl;
+    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? (amo_cwr_eff && ac_wexcl_q) : m_wen_excl_q)) : dc_wen_excl;
     let dmem_addr2_m : logic<64> = if MEM_PIPE ? m_addr2_q    : dc_addr2;
     let dmem_ren2_m  : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_ren2_q) : dc_ren2;
     let dmem_lnext2_m: logic     = if MEM_PIPE ? m_lnext2_q   : dc_load_next2;
