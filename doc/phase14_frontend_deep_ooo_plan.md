@@ -168,7 +168,13 @@ before R3.
   an owned line** (`amo_watch`/`amo_poison`, P9.3); a +1-cy commit slip desyncs
   this (the litmus-N2 amoadd "M3b wedge"). Route atomics through the LSQ +
   coherence protocol so multi-cycle atomic handling is tolerated. **Highest SMP
-  risk** — the M3b minefield.
+  risk** — the M3b minefield. **User chose R3 next (2026-07-27)** after L1/L2 were
+  found already-LIVE and the study marked the load side (L3) already-modern.
+  Detailed design + DEAD-scaffold decomposition (R3.0 substrate → R3.1 retire-
+  into-SQ → R3.2 ownership-locked drain → R3.3 flip+litmus): **`cp_r3_atomic_
+  reorder_plan.md`**. ⚠️ Note there: with EX_PIPE banked (S1), R3's M3b/CP
+  motivation is LATENT — its value is structural canonicalisation + contended-
+  atomic IPC + future-EX_PIPE-enablement, at the highest SMP-validation cost.
 - **LOAD_SPEC** replay validation lands here too (speculative load wakeup's
   miss-replay interacts with coherence/ordering in SMP).
 
