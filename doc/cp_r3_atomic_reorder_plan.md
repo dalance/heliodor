@@ -9,13 +9,14 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b built, DEAD at `ATOMIC_SQ=0` (tree ships DEAD); R3.2's design
-question RESOLVED (§6); FIRST FLIP PROBED (§7)** (2026-07-27). §6 supersedes §2's scheme A.
-The first `=1` run found (a) that **the litmus battery cannot exercise this class at all** —
-its atomics sit in the non-cacheable tohost window, so R3.3's guards do not currently guard
-anything (§7.1), and (b) a **younger-store ordering hole** whose fix belongs in the store
-commit path (§7.2). Next: resolve §7.1's test-coverage problem and §7.2's ordering design —
-both before R3.2c and R3.3.
+Status: **R3.0 + R3.1 + R3.2a/b built, DEAD at `ATOMIC_SQ=0` (tree ships DEAD); design question
+RESOLVED (§6); first flip probed and the validation gap CLOSED (§7)** (2026-07-27). §6
+supersedes §2's scheme A. The litmus battery could not exercise this class at all — its
+atomics sat in the non-cacheable tohost window — so `.barrier`/`.vars` were relocated
+(§7.1); the battery now guards the R3 path and, at `=1`, catches the open bug in ~3 M cycles as
+**test 7 slot 1 (`tohost=0x7012`)**, the AMO lost-update outcome. Remaining before R3.3: the
+**younger-store ordering hole** (§7.2), whose fix belongs in the store commit path. R3.2c is
+deferred behind it.
 
 ---
 
@@ -296,13 +297,38 @@ variables at **0x80003000** — both inside it. Every litmus and arch-test atomi
 non-cacheable, so `asq_class` (which requires `ac_wexcl_q`) can never match.
 
 **Consequence: the guards §3 names — Test 7 (`amoadd.w x0`, the exact M3b case), Test 6, Test 8
-— cannot validate the R3 path as the tests stand.** R3.3 cannot be gated on them without first
-either (a) relocating the litmus `.barrier`/`.vars` sections above 0x80004000 so the atomics
-become cacheable (changes litmus baselines; arguably makes the battery *stronger*, since today
-it never exercises the in-cache MESI atomic write path either), or (b) narrowing the
-`[31:14]` tohost window in the RTL to the actual tohost page (touches live behaviour → needs
-its own validation). **Resolve this before R3.3.** Today the only workload that exercises the
-class is the Linux boot (kernel atomics at 0x80a8xxxx — 1798 allocations in an N=1 boot).
+— could not validate the R3 path as the tests stood.**
+
+**✅ RESOLVED (option (a), user's call, 2026-07-27):** `.barrier` → **0x80006000** and `.vars` →
+**0x80007000** (`litmus.ld` + the hardcoded `li s3/s4` bases in `litmus.S` + the harness's
+barrier watch words `dram[6144]`/`dram[6160]` in `tb/test_litmus.veryl`). `.result`
+(0x80004000) and `.scratch` (0x80005000) were already outside the window and did not move.
+Option (b) — narrowing the RTL's `[31:14]` window — was declined: it touches live behaviour and
+would need its own validation, while (a) touches only the test.
+
+This is a **test-strengthening** change, not merely an R3 enabler: the litmus battery had never
+exercised the in-cache MESI atomic write path *at all*, on any prior campaign step. It passes
+at `ATOMIC_SQ=0`, so that path is sound — but the baselines move, because the atomics now pay
+real ownership/line-bounce cost:
+
+| | before (write-through atomics) | after (cacheable atomics) |
+|---|---|---|
+| litmus N2 | `cy=0x282170` (2.63 M) | **`cy=0x2e3bf0` (3.03 M), +15 %** |
+
+| litmus N4 | `cy=0x55ce90`-ish (5.63 M, S1 figure) | **`cy=0x398690` (3.77 M), −33 %** |
+
+N4 gets *faster* because a non-cacheable atomic went out over the bus on every operation,
+while an owned-line merge is cheap even when the line bounces; N2 gets slower because two harts
+now RFO-ping-pong a line that used to be write-through. Both pass. `veryl test` stays 252/0.
+**Use the new figures as the litmus baseline from here on** — the `0x282170` quoted in
+R3.0/R3.1/R3.2's evidence refers to the old, weaker image.
+
+**And it immediately paid for itself.** With the relocation in place, `ATOMIC_SQ=1` fails
+litmus N2 in ~3 M cycles with **`tohost=0x7012`** → `0x701` = **test 7, slot 1 = the AMO
+atomicity forbidden outcome**, i.e. the lost update §3 named as *the exact M3b case*. So the
+battery now guards the R3 path for real, and §7.2's ordering work has a **fast, precise
+reproducer** instead of a 45 M-cycle boot wedge. Debug §7.2 against `test_litmus_2hart`, not
+the boot.
 
 ### 7.2 Two real design gaps the boot found
 

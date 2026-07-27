@@ -87,8 +87,8 @@ _start:
     la   t0, trap_handler
     csrw mtvec, t0
     csrr s0, mhartid
-    li   s3, 0x80002000          /* barrier: count @+0, sense @+64 */
-    li   s4, 0x80003000          /* vars: x @+0, y @+64 */
+    li   s3, 0x80006000          /* barrier: count @+0, sense @+64 */
+    li   s4, 0x80007000          /* vars: x @+0, y @+64 */
     li   s5, 0x80004000          /* result histogram */
     li   s9, 0x80005000          /* scratch handoff */
     li   s7, 0                   /* barrier local sense */
