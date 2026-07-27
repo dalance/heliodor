@@ -412,7 +412,40 @@ ordering family, but on the path `asq_st_block` does not cover, so the next prob
 cheap: **print `x` at test-7 entry** (and at each test boundary), and if it is non-zero, trace
 which drain wrote it after the reset store.
 
-**Ruled out by this trace (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
+### 7.5 Write-order trace + a build sanity check — where the next session should start
+
+Traced **every write landing on `x`, on both dcache write paths** (the main port = atomic
+commit write + queue drain; the store-buffer drain port = plain stores, including the tests'
+`sw x0, 0(s4)` resets), qualified to the cycle each write actually lands.
+
+**Accounting, and it closes exactly:** the 4000 commits at `x` are `2000 amoadd (test 7) +
+1000 unlock amoswap (test 8) + 1000 sc.w (test 8)`. `alloc=3000` = the amoadds + the unlock
+swaps (both class); `cwr=1000` = the SC writes (SC is not in the class). **Every commit takes
+exactly one path — there is no double-apply per commit.** A `drw=0` write immediately followed
+by a `drw=1` write, which looked like one atomic applying twice, is two *different* atomics
+(one that could not book an entry because the queue was still full, then the next one's drain).
+
+**A diversion latch was added anyway** (`asq_divert_q`, set on alloc, cleared on the atomic's
+`rob_commit_ack`) because the live-state suppression it replaces really is unsound in
+principle: the drain can finish while the atomic is still at the head, and then nothing holds
+`amo_cwr_en` down. It is kept, but it **changed nothing** — like every other fix in this round.
+
+**🚨 Build sanity check — the toolchain is NOT the problem.** Eight substantive RTL edits in a
+row producing bit-identical output justified checking the obvious: forcing `asq_class = 1'b0`
+at `ATOMIC_SQ=1` makes litmus **pass at `cy=0x2e3bf0`, exactly the `=0` baseline**. So the
+build/sim pipeline responds correctly, the DEAD-at-0 folding is real, and the class path is
+genuinely the only thing at fault. *(Worth repeating whenever a run stops responding to edits —
+it is one cheap run and it separates "wrong fix" from "wrong binary".)*
+
+**So the remaining fact to explain is arithmetic, not mechanism:** 2000 atomic, non-duplicated
+`+1` drains land on `x`, yet `x` reaches 3999. Those two statements are only compatible if
+**`x` was already ~2000 when test 7's loop started** — i.e. the residue hypothesis of §7.4
+stands and is now the *only* survivor. Start there: dump `x` at each test boundary (the WSB
+trace already shows plain stores of 0/1 to `x` from tests 0-1, so the instrumentation exists),
+find the last test that leaves `x` non-zero at `=1` but zero at `=0`, and diff that test's
+write order between the two builds.
+
+**Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 `asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
 after alloc" theory — a guard for it was added (`!(asq_class && !asq_empty)` in `amo_cwr_eff`,
 kept, it is correct in its own right) and changed **nothing**: the counts stayed 4000/3000/1000
