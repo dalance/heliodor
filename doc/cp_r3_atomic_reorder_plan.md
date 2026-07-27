@@ -9,14 +9,15 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b built, DEAD at `ATOMIC_SQ=0` (tree ships DEAD); design question
-RESOLVED (§6); first flip probed and the validation gap CLOSED (§7)** (2026-07-27). §6
+Status: **R3.0 + R3.1 + R3.2a/b + §7.2 hardening built, DEAD at `ATOMIC_SQ=0` (tree ships
+DEAD); design question RESOLVED (§6); validation gap CLOSED (§7.1)** (2026-07-27). §6
 supersedes §2's scheme A. The litmus battery could not exercise this class at all — its
-atomics sat in the non-cacheable tohost window — so `.barrier`/`.vars` were relocated
-(§7.1); the battery now guards the R3 path and, at `=1`, catches the open bug in ~3 M cycles as
-**test 7 slot 1 (`tohost=0x7012`)**, the AMO lost-update outcome. Remaining before R3.3: the
-**younger-store ordering hole** (§7.2), whose fix belongs in the store commit path. R3.2c is
-deferred behind it.
+atomics sat in the non-cacheable tohost window — so `.barrier`/`.vars` were relocated (§7.1),
+which also strengthened the battery in its own right. **The flip still fails** at litmus N2
+`tohost=0x7012` (test 7 slot 1, AMO lost update) with the cycle count bit-identical across four
+RTL variants, so the remaining fault is off the paths edited so far: **the next step is a
+trace session on `test_litmus_2hart`, not another candidate fix** (§7.3). R3.2c and R3.3 stay
+behind it.
 
 ---
 
@@ -349,7 +350,44 @@ the boot.
   1798 → 39 and the boot wedged earlier. Reverted.
   The real fix has to gate the younger store's **write drive** (`store_drive` / `fast_store` /
   the `sb_push`), not its retire — i.e. it lands in the store commit path, which is the memory-
-  ordering heart of the machine. That is a design step, not a patch, and it is the next R3 task.
+  ordering heart of the machine.
+
+### 7.3 §7.2 hardening landed; the flip still fails — hand off to a trace session
+
+Four fixes were designed and built against the §7.1 reproducer. All are individually justified
+and all are DEAD at 0 (the tree ships `=0`, re-verified: 252/0 · dhrystone 252939 / 264834 ·
+N=1 boot `cy=0x0d99720`):
+
+1. **Younger-store ordering (§7.2's real fix).** `asq_st_block = !asq_empty` now gates
+   `store_drive` **and** `fast_store` **and** the store's retire. Gating the drive is the part
+   the first attempt missed, and it is what breaks that attempt's deadlock.
+2. **Alloc-time ordering anchor.** `asq_alloc` now also requires `sb_empty`, so an entry only
+   enters the queue once every OLDER store is visible. Together with (1) — younger stores held
+   out until it drains — the queued RMW is pinned to its program-order position without the
+   drain having to reason about the buffer.
+3. **Presence-based drain poison.** `asq_dr_poison` gains `asq_dr_st_q == WR && !dc_amo_present`,
+   and the dcache's `chk3` port is borrowed for the drain's line while `asq_dr_busy`. inv/evict
+   pulses alone are *not* a sufficient departure signal — a remote RFO recall can take the line
+   without one, which is exactly why the execute-side `amo_remote_hit` carries `!dc_amo_present`.
+   Safe to borrow: while the drain is busy no load/AMO may issue and no store may retire.
+4. **🚨 The write-mask/alloc unification — a silently lost atomic.** `amo_cwr_eff` masked the
+   in-cache write on **`asq_class`** (mere class membership), while `asq_alloc` carries extra
+   conditions (`!asq_full`, `sb_empty`). A class-eligible atomic that could **not** allocate
+   therefore had its write suppressed *and* retired through the normal path — **its write
+   went nowhere.** Diverting the write and booking the entry are one decision and must be one
+   predicate: the mask is now `!asq_alloc`, `asq_takeover` mirrors the same conditions, and
+   `asq_stall` is deleted (an atomic that cannot be booked simply takes today's proven path,
+   so there is no longer anything to stall for).
+
+**The flip still fails**, identically: litmus N2 `cy=0x2d9fb0`, `tohost=0x7012` (test 7 slot 1).
+The cycle count was **bit-identical across all four RTL variants**, which is the useful signal:
+whatever is wrong is not on the paths being edited. Hypothesis-driven patching has stopped
+paying, and the next step is the campaign's proven method instead — a **trace session** on
+`test_litmus_2hart` (per-atomic PA/old/new/state trace out of the drain FSM, plus a
+divergence trap on "x advanced by exactly 1 per amoadd"), not another candidate fix. Note also
+that a counter probe reading `ALLOC` at the 4000th AMO commit showed 0 and was **misread as
+"the class never fires"** — test 7 runs later than that sample point; do not repeat that
+inference without sampling at the end of the run.
 
 **Boot status at `=1`:** wedges at the 45 M cycle cap (`pass=0`) with drains completing
 normally (1797/1798, watchdog never trips), i.e. the queue machinery runs — the failure is the

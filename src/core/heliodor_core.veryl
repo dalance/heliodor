@@ -936,6 +936,14 @@ pub module heliodor_core #(
     // load/AMO issue is held — that is what lets the port quiesce and keeps the engine
     // from starving behind a load stream (see asq_dr_port_ok).
     let asq_dr_busy: logic = ATOMIC_SQ && asq_dr_st_q != 2'd0;
+    // R3 §7.2: while an atomic is queued, NO younger store may become visible — the
+    // queued RMW is older in program order and has not been performed yet. Blocking the
+    // store's RETIRE alone is not enough and in fact deadlocks: a store held at the head
+    // keeps driving store_drive -> dc_i_wen -> m_wen_q every cycle, so asq_dr_port_ok
+    // never opens and the entry never drains. The WRITE DRIVE has to stop too, which is
+    // why this gates store_drive / fast_store as well as the retire gate. Constant 0 at
+    // ATOMIC_SQ=0 (asq_empty is constant 1 there).
+    let asq_st_block: logic = !asq_empty;
     // S25 write-combining: entries are cache LINES (64B), not dwords. A push
     // whose PA matches a live entry's line MERGES into that entry's dword lane
     // (byte-granular strobe OR) instead of allocating — a streaming store
@@ -4739,14 +4747,12 @@ pub module heliodor_core #(
     let asq_class   : logic    = ATOMIC_SQ && c_is_amo && !c_is_cas_q && c_rd_arch == 5'd0
         && asq_amo_f5 != 5'b00010 && asq_amo_f5 != 5'b00011 && asq_amo_f5 != 5'b00101
         && ac_wexcl_q && ac_wok_q;
-    let asq_takeover: logic    = asq_class && !asq_full;
-    // ...and the matching HOLD. A class atomic never performs the in-cache write
-    // (amo_cwr_eff masks it with !asq_class), so if the queue is full it can neither
-    // allocate nor write: it must WAIT at the head until the entry drains. Without
-    // this the old gate could let it retire with its write nowhere — a silently lost
-    // atomic. Bounded: the occupying entry is draining. (At ATOMIC_SQ=0, asq_class=0
-    // → asq_stall=0 → the term folds away.)
-    let asq_stall   : logic    = asq_class && asq_full;
+    // The retire relaxation must mirror asq_alloc's conditions (it is asq_alloc minus
+    // amo_commit_live, which is defined further down and is implied here anyway): relax
+    // ONLY when the entry will actually be booked. If it cannot be, the atomic performs
+    // its in-cache write and retires exactly as today — which is why there is no longer
+    // any "class atomic stuck with nowhere to write" case to stall for.
+    let asq_takeover: logic    = asq_class && !asq_full && sb_empty;
     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !commit_amo_replay
         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
         // CP M3a: a slow store's dcache write happens the cycle AFTER it translates
@@ -4759,8 +4765,9 @@ pub module heliodor_core #(
         // conditions — the dcache stall and the sb_empty release-order wait belong to
         // the DRAIN, which is ordered behind the store buffer anyway (§6.4). Folds to
         // today's term at ATOMIC_SQ=0.
-        && !(c_is_store && !sb_elig && !asq_takeover && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
-        && !asq_stall
+        && !(c_is_store && !sb_elig && ((dcache_stall && !asq_takeover) || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+        // R3 §7.2: and no store retires while an atomic is still queued.
+        && !(c_is_store && asq_st_block)
         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
         // R3.1 §6.4: a FENCE must not complete ahead of a queued atomic's write.
         // asq_empty is constant 1 at ATOMIC_SQ=0 → the term folds to !sb_empty.
@@ -6704,7 +6711,7 @@ pub module heliodor_core #(
     // Phase 11-H: an HSV store (c_is_mem_virt) is translated (VA != PA) and must
     // never take the fast (bare-PA) path. Use c_is_mem_virt directly — NOT
     // dmem_vm_on_op — so fast_store→store_drive→dmem_op_hlv stays loop-free.
-    assign fast_store = commit_store_fire && !c_is_amo && !dmem_vm_on && !c_is_mem_virt && st_wstrb_hi == 8'd0
+    assign fast_store = commit_store_fire && !asq_st_block && !c_is_amo && !dmem_vm_on && !c_is_mem_virt && st_wstrb_hi == 8'd0
         && c_store_addr[63:25] == 39'h40 && (!st_tohost_page || c_is_cbo_zero);
 
     // PMP (Smpmp): a fast store drains via the store-buffer / i_saddr port and
@@ -6927,7 +6934,9 @@ pub module heliodor_core #(
     // so exclude it from store_drive. This also drops load_blocks_on_store for
     // the fast-store cycle (= issue_is_load && store_drive), letting the load
     // read coexist with the store write on the separate ports.
-    let store_drive    : logic     = commit_store_fire && !load_walk_busy && !fast_store;
+    // R3 §7.2: a queued atomic is older than any committing store, so no store may
+    // drive its write while the queue is occupied (see asq_st_block).
+    let store_drive    : logic     = commit_store_fire && !load_walk_busy && !fast_store && !asq_st_block;
     // M9.3: a load walk PHYSICALLY owns the dmem port only while the MMU FSM is
     // NOT idle (LEVEL/DONE/FAULT). walk_v_q is a registered owner tag that, under
     // hart1's SMP bus-contention back-to-back walks, stays set CONTINUOUSLY across
@@ -8317,11 +8326,17 @@ pub module heliodor_core #(
     let asq_dr_go_w  : logic = asq_dr_wen && asq_dr_port_ok;
     let asq_dr_rdone : logic = asq_dr_go_r && !dcache_stall;
     let asq_dr_wdone : logic = asq_dr_go_w && !dcache_stall;
-    let asq_dr_poison: logic = ATOMIC_SQ && asq_dr_st_q != 2'd0
+    let asq_dr_poison: logic = ATOMIC_SQ && (
+        // WR: the line must still be OWNED here. A remote RFO recall can take it away
+        // without an i_dcache_inv pulse, so presence (registered tag state, as
+        // amo_remote_hit uses it) is the authoritative departure signal. In RD the line
+        // may legitimately be absent — acquiring it is what that state is for.
+        (asq_dr_st_q == 2'd2 && !dc_amo_present) ||
+        asq_dr_st_q != 2'd0
         && ((i_dcache_inv_valid && i_dcache_inv_addr[63:6] == asq_pa_q[0][63:6])
         || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == asq_pa_q[0][63:6])
         || (dc_evict1_v && dc_evict1_addr[63:6] == asq_pa_q[0][63:6])
-        || (dc_evict2_v && dc_evict2_addr[63:6] == asq_pa_q[0][63:6]));
+        || (dc_evict2_v && dc_evict2_addr[63:6] == asq_pa_q[0][63:6])));
     // WR watchdog. The exclusive merge only lands while the line is owned; if it is
     // not, the dcache holds (o_stall). Departures normally announce themselves through
     // asq_dr_poison, but a bounded timeout keeps a missed announcement from wedging the
@@ -8394,7 +8409,11 @@ pub module heliodor_core #(
     // (exactly the amocas.q commit-operand argument). x0 reads as zero.
     let asq_src_rs2 : logic<5>  = c_instr[24:20];
     let asq_src_arch: logic<64> = if asq_src_rs2 == 5'd0 ? 64'd0 : arch_regs[asq_src_rs2];
-    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full;
+    // sb_empty at ALLOC (not just at drain) is the ordering anchor: the entry only
+    // enters the queue once every OLDER store is visible, and §7.2's block then keeps
+    // every YOUNGER store out until it drains. Together that pins the queued RMW to its
+    // program-order position without the drain having to reason about the buffer.
+    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full && sb_empty;
     let asq_drain: logic = ATOMIC_SQ && asq_dr_wdone;
     always_ff (clk, rst) {
         if_reset {
@@ -8433,7 +8452,14 @@ pub module heliodor_core #(
     // reads dcache_stall, closes write-enable -> dcache_stall -> wdone -> write-enable.
     // Veryl's loop detector is structural and does NOT fold the ATOMIC_SQ=0 constant,
     // so such a loop is a hard build error even while DEAD.)
-    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_class) : amo_cwr_en;
+    // 🚨 The mask MUST be asq_alloc, not asq_class. asq_alloc carries extra conditions
+    // (!asq_full, sb_empty); masking on mere class membership meant a class-eligible
+    // atomic that could NOT allocate had its in-cache write suppressed and then retired
+    // through the normal path with its write nowhere — a silently lost atomic (litmus
+    // test 7 slot 1, R3 §7.2). Diverting the write and booking the entry are one
+    // decision, so they must be one predicate. When the entry cannot be booked the
+    // atomic simply takes today's proven path.
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_alloc) : amo_cwr_en;
     // ── R3.2b: the drain engine's port arms ───────────────────────────────────
     // asq_dr_go_r/_w are already qualified by asq_dr_port_ok (nobody else owns the
     // port this cycle), so these outermost arms are mutually exclusive with every
@@ -8574,7 +8600,14 @@ pub module heliodor_core #(
         o_chk_present    : dc_rsv_present                ,
         i_chk2_addr      : sc_watch_addr_q               , // (holds the PA since P9.3)
         o_chk2_present   : dc_scw_present                ,
-        i_chk3_addr      : amo_watch_pa_q                , // P9.3: AMO watch
+        // R3 §7.2: while the atomic-SQ drain is busy it BORROWS this presence port for
+        // its own line (see asq_dr_poison — a remote recall can take the line without
+        // ever pulsing i_dcache_inv at the core, so inv/evict alone is not a sufficient
+        // departure signal; that is exactly how the execute-side watch uses it via
+        // amo_remote_hit's !dc_amo_present term). Safe to borrow: while asq_dr_busy no
+        // load/AMO may issue and no store may retire, so any other live watch cannot
+        // commit a write in that window. Folds to amo_watch_pa_q at ATOMIC_SQ=0.
+        i_chk3_addr      : if ATOMIC_SQ && asq_dr_busy ? asq_pa_q[0] : amo_watch_pa_q, // P9.3: AMO watch
         o_chk3_present   : dc_amo_present                ,
         o_evict1_v       : dc_evict1_v                   , // P9.2: line-departure events
         o_evict1_addr    : dc_evict1_addr                , //       (ROB CoRR poison scan)
