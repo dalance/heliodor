@@ -912,6 +912,25 @@ pub module heliodor_core #(
     var sb_push : logic;
     var sb_vm_ok: logic; // VM arm of the classifier (TLB-hit translate ready)
     var sb_pa   : logic<64>;
+    // ── R3.1: atomic store-queue — forward declarations (DEAD at ATOMIC_SQ=0) ──
+    // doc/cp_r3_atomic_reorder_plan.md §6. Declared here for the same reason
+    // sb_elig/sb_full/sb_empty are: the retire gate (rob_commit_ack), the FENCE gate
+    // and the load-issue gate all read the queue state, and they live above the
+    // entry's D-cone (which sits with the atomic commit path). The queue holds an
+    // atomic-without-return whose RMW the R3.2 drain performs at the memory system;
+    // it carries OPERANDS ({pa, op, src, size, aq/rl}), never a pre-computed value.
+    const ATOMIC_SQ: bit = 0;
+    const ASQ_N    : u32 = 1; // one in flight (allocation stays head-serialised)
+    var asq_valid_q: logic     [ASQ_N];
+    var asq_pa_q   : logic<64> [ASQ_N]; // write address (= ac_pa_q, the read-time PA)
+    var asq_src_q  : logic<64> [ASQ_N]; // rs2 operand (NOT a pre-computed `new`)
+    var asq_op_q   : logic<5>  [ASQ_N]; // AMO funct5
+    var asq_sz_q   : logic<3>  [ASQ_N]; // funct3 (.w/.d, and Zabha .b/.h)
+    var asq_aq_q   : logic     [ASQ_N];
+    var asq_rl_q   : logic     [ASQ_N];
+    var asq_ld_ovl : logic            ; // issuing access's dword span may hit the entry
+    let asq_full   : logic = asq_valid_q[0];
+    let asq_empty  : logic = !ATOMIC_SQ || !asq_valid_q[0];
     // S25 write-combining: entries are cache LINES (64B), not dwords. A push
     // whose PA matches a live entry's line MERGES into that entry's dword lane
     // (byte-granular strobe OR) instead of allocating — a streaming store
@@ -4699,6 +4718,30 @@ pub module heliodor_core #(
     // different-address stores become visible out of order without a fence);
     // an AMO/SC keeps the full-empty wait (release semantics: all prior
     // stores must be visible before it).
+    // ── R3.1 §6.2: the atomic-without-return class ──────────────────────────────
+    // An AMO whose rd is x0 discards the old value, so nothing architectural depends
+    // on the execute-time read: it may retire into the atomic-SQ and have its RMW
+    // performed later at the memory system (§6.2). Everything else must NOT — retire
+    // is rd's architectural commit and there is no replay after it. Excluded by
+    // funct5: LR (00010, never store_drives anyway), SC (00011, rd = success code),
+    // amocas (00101, needs the compare result); excluded by flag: amocas.q, MMIO /
+    // uncacheable (!ac_wexcl_q — a write-through cannot be an owned-line RMW) and a
+    // faulting atomic (!ac_wok_q, so a fault can never surface at drain time).
+    // asq_takeover is the retire-gate arm: the class does not wait out the in-cache
+    // write's conditions because it is not doing that write. All const-gated → at
+    // ATOMIC_SQ=0 asq_class is constant 0 and every gate below folds to today's.
+    let asq_amo_f5  : logic<5> = c_instr[31:27];
+    let asq_class   : logic    = ATOMIC_SQ && c_is_amo && !c_is_cas_q && c_rd_arch == 5'd0
+        && asq_amo_f5 != 5'b00010 && asq_amo_f5 != 5'b00011 && asq_amo_f5 != 5'b00101
+        && ac_wexcl_q && ac_wok_q;
+    let asq_takeover: logic    = asq_class && !asq_full;
+    // ...and the matching HOLD. A class atomic never performs the in-cache write
+    // (amo_cwr_eff masks it with !asq_class), so if the queue is full it can neither
+    // allocate nor write: it must WAIT at the head until the entry drains. Without
+    // this the old gate could let it retire with its write nowhere — a silently lost
+    // atomic. Bounded: the occupying entry is draining. (At ATOMIC_SQ=0, asq_class=0
+    // → asq_stall=0 → the term folds away.)
+    let asq_stall   : logic    = asq_class && asq_full;
     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !commit_amo_replay
         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
         // CP M3a: a slow store's dcache write happens the cycle AFTER it translates
@@ -4706,9 +4749,17 @@ pub module heliodor_core #(
         // M3b: AMO/SC commits write LIVE (amo_commit_live) and retire single-cycle, so
         // they are excluded (!c_is_amo) from this translate-cycle hold.
         && !(MEM_PIPE && c_is_store && !sb_elig && !c_is_amo && !store_fetched_q)
-        && !(c_is_store && !sb_elig && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+        // R3.1: a class atomic (asq_takeover) retires into the atomic-SQ instead of
+        // performing the in-cache write, so it does not wait out that write's
+        // conditions — the dcache stall and the sb_empty release-order wait belong to
+        // the DRAIN, which is ordered behind the store buffer anyway (§6.4). Folds to
+        // today's term at ATOMIC_SQ=0.
+        && !(c_is_store && !sb_elig && !asq_takeover && (dcache_stall || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+        && !asq_stall
         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
-        && !(c_serial && !sb_empty)
+        // R3.1 §6.4: a FENCE must not complete ahead of a queued atomic's write.
+        // asq_empty is constant 1 at ATOMIC_SQ=0 → the term folds to !sb_empty.
+        && !(c_serial && !(sb_empty && asq_empty))
         && !(c_flush_op && !dc_flush_done && (COHERENT_IFETCH == 0)); // P9.2 sweep (P9.6: gone when coherent)
     // Zacas amocas.q retires when the entry actually leaves the ROB (rob_commit_ack
     // already waits for the store to drain + excludes replays). At retire it writes
@@ -7001,6 +7052,8 @@ pub module heliodor_core #(
     //    empties (page-tail misaligned loads are vanishingly rare).
     let sb_ld_pg_edge: logic = agu_addr_iss[11:3] == 9'h1ff && agu_addr_iss[2:0] != 3'd0;
     assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && sb_ld_ovl)
+        // R3.1 §6.4: hold any access overlapping a queued atomic (no forward possible).
+        || ((issue_is_load || issue_amo_read) && asq_ld_ovl)
         || (issue_is_load && !issue_amo_read && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
         || (issue_is_load && sb_cnt >= 4'd3)
         || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])))
@@ -7411,6 +7464,15 @@ pub module heliodor_core #(
     let sb_ld_spans: logic    = ({1'b0, agu_addr_iss[2:0]} + sb_ld_sz) >: 4'd8;
     let sb_ld_dw0  : logic<9> = agu_addr_iss[11:3];
     let sb_ld_dw1  : logic<9> = agu_addr_iss[11:3] + 9'd1;
+    // R3.1 §6.4: the atomic-SQ entry CANNOT forward — its value does not exist until
+    // the drain computes it — so an overlapping younger access must WAIT instead
+    // (the opposite of S27's plain-load forward from the store buffer). Same
+    // page-offset compare as sb_ld_ovl above (VA[11:3] == PA[11:3], loop-free), and
+    // the same conservative dword+1 span rule. This also covers the `.aq` ordering
+    // requirement: a class atomic's read happens at drain, so younger loads must not
+    // pass it. Constant 0 at ATOMIC_SQ=0 (asq_valid_q never sets).
+    assign asq_ld_ovl = ATOMIC_SQ && asq_valid_q[0]
+        && ((asq_pa_q[0][11:3] == sb_ld_dw0) || (sb_ld_spans && asq_pa_q[0][11:3] == sb_ld_dw1));
     always_comb {
         sb_ld_ovl = 1'b0;
         for i in 0..SB_N {
@@ -8180,73 +8242,66 @@ pub module heliodor_core #(
     // → byte-identical. dc_amo_present is derived from the (registered) tag state,
     // not the bus invalidate, so it does not form a combinational loop.
     let amo_cwr_en   : logic     = store_drive && sb_empty && ac_wok_q && (dc_amo_present || !EX_PIPE);
-    // ── R3.0: atomic store-queue substrate — DEAD at ATOMIC_SQ=0 ──────────────
-    // Block R (doc/cp_r3_atomic_reorder_plan.md §4). The atomic today is a single-
-    // cycle in-cache RMW fused at the ROB head (amo_cwr_en above); R3 makes it RETIRE
-    // INTO A QUEUE whose write drains later under coherence, like a store. R3.0
-    // grounds only the STRUCTURE — the entry array, its alloc/drain D-cone, and the
-    // dual-path write-enable — with every write const-gated, so the synthesised design
-    // is unchanged (§10.10: a DEAD reg whose D-cone does not mirror a live signal is
-    // synth-neutral only when its D is const-gated). No behaviour moves here: R3.1
-    // moves the retire, R3.2 the ownership-locked drain, R3.3 flips.
+    // ── R3.1: atomic store-queue — entry + alloc/drain — DEAD at ATOMIC_SQ=0 ──
+    // Block R (doc/cp_r3_atomic_reorder_plan.md §6, which supersedes §2's scheme A).
+    // An ATOMIC-WITHOUT-RETURN (AMO with rd == x0, cacheable, fault-free) retires into
+    // this queue like a store; its RMW is then performed at the memory system by the
+    // R3.2 drain (RFO -> read -> `new = old OP src` -> write, one owned-line
+    // transaction). Because rd is architecturally dead, NOTHING committed depends on
+    // the execute-time `old`, so a line stolen mid-drain costs cycles, never
+    // correctness — the drain simply retries. That is why this class needs no
+    // cross-retire pin, no watch and no poison, and why "a retired atomic that cannot
+    // drain" (the question that blocked R3) does not arise. Every result-returning
+    // AMO, LR/SC, amocas and MMIO atomic keeps today's proven single-cycle path.
     //
-    // Scheme A (ownership-locked drain, §2's recommendation): the line never leaves
-    // E/M between the atomic's execute-time read and the queued write, so the entry
-    // carries the write VERBATIM as the commit path would have driven it — address
-    // ac_pa_q (the read-time PA), data/strobe off the atomic's commit drive, in-cache-
-    // merge mode ac_wexcl_q — plus the ownership state R3.2 must hold ACROSS retire:
-    // the watched line (today the watch dies at amo_watch_retire, and dc_amo_present's
-    // chk3 port still reads amo_watch_pa_q — retargeting that port to the queue entry
-    // is R3.2, not R3.0) and the pin flag. Scheme B (re-read-at-drain) would instead
-    // carry {amo_op, src} and defer rd's writeback to the drain: a strictly larger
-    // delta, held as R3-far.
-    const ATOMIC_SQ: bit = 0;
-    const ASQ_N    : u32 = 1; // one atomic in flight (allocation stays head-serialised)
-    var asq_valid_q: logic     [ASQ_N];
-    var asq_pa_q   : logic<64> [ASQ_N]; // write address (= ac_pa_q, the read-time PA)
-    var asq_data_q : logic<64> [ASQ_N]; // pre-computed `new` = old OP src (scheme A)
-    var asq_strb_q : logic<8>  [ASQ_N];
-    var asq_excl_q : logic     [ASQ_N]; // in-cache merge (cacheable) vs write-through
-    var asq_wpa_q  : logic<64> [ASQ_N]; // watched line, held across retire (R3.2 pin)
-    var asq_pin_q  : logic     [ASQ_N]; // ownership hold outstanding (R3.2)
-    // The alloc arm mirrors R3.1's intent: the cycle the atomic would have written
-    // in-cache it instead books the entry (and R3.1 then lets it retire). The drain
-    // arm mirrors R3.2's: the entry frees when its write leaves, after all older
-    // stores (sb_empty = today's release-order gate). Both are const-gated, so at
-    // ATOMIC_SQ=0 every field holds its reset value and the array is unreachable.
-    let asq_full : logic = asq_valid_q[0];
-    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && ac_wok_q && !asq_full;
+    // Hence the entry carries the OPERANDS, not a pre-computed value: {pa, op, src,
+    // size, aq/rl}. `src` is read from arch_regs at commit — the atomic is at the head
+    // and retires in order, so the architectural rs2 is authoritative there (the same
+    // idiom amocas.q's commit operands use). R3.0 shipped the scheme-A field set
+    // (data/strb/wpa/pin); §6 replaced it with this one.
+    //
+    // The class predicate, the queue state and the entry array are declared with the
+    // store-buffer forward declarations (they gate retire/fence/issue up there); this
+    // block holds the entry's D-cone. Alloc is the cycle the in-cache write would have
+    // fired; drain is R3.2's (still a placeholder: the real engine re-reads under
+    // ownership). Both const-gated, so at ATOMIC_SQ=0 every field holds its reset value.
+    // rs2 read from the architectural regfile at commit: the atomic is serialized at
+    // the ROB head and retires in order, so arch_regs is authoritative for its rs2
+    // (exactly the amocas.q commit-operand argument). x0 reads as zero.
+    let asq_src_rs2 : logic<5>  = c_instr[24:20];
+    let asq_src_arch: logic<64> = if asq_src_rs2 == 5'd0 ? 64'd0 : arch_regs[asq_src_rs2];
+    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full;
     let asq_drain: logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty;
     always_ff (clk, rst) {
         if_reset {
             for i in 0..ASQ_N {
                 asq_valid_q[i] = 1'b0;
                 asq_pa_q[i]    = 64'd0;
-                asq_data_q[i]  = 64'd0;
-                asq_strb_q[i]  = 8'd0;
-                asq_excl_q[i]  = 1'b0;
-                asq_wpa_q[i]   = 64'd0;
-                asq_pin_q[i]   = 1'b0;
+                asq_src_q[i]   = 64'd0;
+                asq_op_q[i]    = 5'd0;
+                asq_sz_q[i]    = 3'd0;
+                asq_aq_q[i]    = 1'b0;
+                asq_rl_q[i]    = 1'b0;
             }
         } else if asq_alloc {
             asq_valid_q[0] = 1'b1;
             asq_pa_q[0]    = ac_pa_q;
-            asq_data_q[0]  = dmu_dmem_wdata;
-            asq_strb_q[0]  = dmu_dmem_wstrb;
-            asq_excl_q[0]  = ac_wexcl_q;
-            asq_wpa_q[0]   = amo_watch_pa_q;
-            asq_pin_q[0]   = 1'b1;
+            asq_src_q[0]   = asq_src_arch;
+            asq_op_q[0]    = asq_amo_f5;
+            asq_sz_q[0]    = c_instr[14:12];
+            asq_aq_q[0]    = c_instr[26];
+            asq_rl_q[0]    = c_instr[25];
         } else if asq_drain {
             asq_valid_q[0] = 1'b0;
-            asq_pin_q[0]   = 1'b0;
         }
     }
     // Dual-path commit write-enable. amo_cwr_en itself is left UNTOUCHED so the =0 arm
     // is the proven single-cycle expression; _eff is what the dcache write port reads
     // (the alu_cdb_eff / c_store_eff_pa idiom). At ATOMIC_SQ=0 amo_cwr_eff ≡ amo_cwr_en
-    // (constant selector, synth folds); at 1 the write is driven by the queue drain
-    // instead — inert until R3.2 wires the drain's address/data into the port muxes.
-    let amo_cwr_eff: logic = if ATOMIC_SQ ? asq_drain : amo_cwr_en;
+    // (constant selector, synth folds). At 1 the in-cache write still fires for every
+    // atomic OUTSIDE the class (!asq_class — LR/SC, result-returning AMOs, amocas,
+    // MMIO); the class's write is instead performed by the queue drain.
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? (asq_drain || (amo_cwr_en && !asq_class)) : amo_cwr_en;
     let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? ac_pa_q : m_pa_q)) : dmu_dmem_addr;
     // CP M3b: the AMO read must be a SINGLE RFO pulse at its ACCESS cycle, not a
     // sustained access. The AMO is held at the issue port for both its fetch and

@@ -9,9 +9,11 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 substrate built, DEAD at `ATOMIC_SQ=0`; R3.2's blocking design question RESOLVED
-(§6)** (2026-07-27). No behaviour has moved yet — R3.1 is the first functional step, and §6 is
-authoritative over §2's original scheme-A recommendation.
+Status: **R3.0 substrate + R3.1 classify/retire built, DEAD at `ATOMIC_SQ=0`; R3.2's blocking
+design question RESOLVED (§6)** (2026-07-27). §6 is authoritative over §2's original scheme-A
+recommendation. Next: **R3.2**, the compute-at-drain engine — until it lands, `ATOMIC_SQ=1` is
+non-functional by construction (the drain is a placeholder that frees the entry without
+performing the RMW), so do not flip.
 
 ---
 
@@ -177,18 +179,47 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
   **Verified:** SV diff = the existing `amo_cwr_en` expression verbatim + const-gated additions
   (`ATOMIC_SQ` is a `localparam bit = 0`, so both arms are constant 0 and the mux selector is
   constant) · `veryl test` **252/0** · litmus N2 **cycle-exact** (`cy=0x282170`, = baseline) ·
-  no new `veryl check` warnings (4856 = baseline) · synth-neutral by the §10.10 const-gated-D
+  no `veryl check` warning names the new signals · synth-neutral by the §10.10 const-gated-D
   rule. *Structure grounded; not flipped — R3.0 at =1 is non-functional by construction (no
   drain machinery yet), which is why the flip is R3.3.*
-- **R3.1 — classify + retire-into-SQ (alloc + head-release).** *(Revised by §6.)* Restrict
-  `asq_alloc` to the **atomic-without-return** class (AMO with `rd == x0`, cacheable
-  `ac_wexcl_q`, fault-free `ac_wok_q`); everything else keeps today's path. At the atomic's
-  commit, instead of the single-cycle write, allocate the entry — carrying `{ac_pa_q, amo_op,
-  src, size, aqrl}`, **not** a pre-computed `new` — and **retire** (free the ROB entry, pointer
-  bump). `rob_commit_ack` for that atomic no longer waits the in-cache write. Also lands the
-  younger-access blocking rules (§6.4) and the fence/`.rl` extension. Gated `ATOMIC_SQ`. This
-  is where head-serialisation is lifted. **Entry-field note:** R3.0 shipped scheme-A fields
-  (`asq_data/strb/wpa/pin`); R3.1 re-shapes them to the §6 set.
+  > **Metric note (learned at R3.1):** a raw `veryl check` warning COUNT is not a valid
+  > baseline comparison — it is build-cache dependent (only re-processed files re-emit), and
+  > the same tree reported 4856 / 4666 / 735 on consecutive runs. Compare by *name* instead
+  > (grep the new signals), which is what the R3.0 and R3.1 checks actually establish.
+- **R3.1 — classify + retire-into-SQ (alloc + head-release). ✅ BUILT, DEAD at 0.** Entry
+  re-shaped to the §6 operand set (`asq_pa/src/op/sz/aq/rl_q`, replacing R3.0's scheme-A
+  `data/strb/wpa/pin`), and — like `sb_elig`/`sb_full`/`sb_empty` — the const, the array and
+  `asq_full`/`asq_empty`/`asq_ld_ovl` moved up to the store-buffer forward declarations,
+  because retire/fence/issue all read the queue state above the entry's D-cone. Shipped:
+  - **class predicate** `asq_class` (just above `rob_commit_ack`): `ATOMIC_SQ && c_is_amo &&
+    !c_is_cas_q && c_rd_arch == 0 && funct5 ∉ {LR 00010, SC 00011, amocas 00101} &&
+    ac_wexcl_q && ac_wok_q`. `asq_takeover = asq_class && !asq_full` (retire relaxation) and
+    **`asq_stall = asq_class && asq_full`** (the matching hold — see the corner below).
+  - **alloc** `ATOMIC_SQ && amo_commit_live && asq_class && !asq_full`; `src` is read from
+    `arch_regs[c_instr[24:20]]` at commit (the amocas.q commit-operand idiom — the atomic is
+    at the head and retires in order, so the architectural rs2 is authoritative), op/size/aq/rl
+    off `c_instr`.
+  - **retire** (`rob_commit_ack`): the `dcache_stall || sb_empty` in-cache-write wait is
+    bypassed for `asq_takeover`; **`&& !asq_stall`** added.
+  - **§6.4 ordering:** `asq_ld_ovl` (page-offset dword compare mirroring `sb_ld_ovl`) added to
+    `load_blocks_on_store` for loads *and* AMO reads — the entry cannot forward, so overlapping
+    younger accesses wait, which also discharges `.aq`; the FENCE gate becomes
+    `!(c_serial && !(sb_empty && asq_empty))`.
+  - **`amo_cwr_eff`** now keeps the live in-cache write for non-class atomics at =1
+    (`asq_drain || (amo_cwr_en && !asq_class)`).
+
+  **Corner found and fixed during the build (would be a silently lost atomic at =1):** a class
+  atomic never performs the in-cache write (`!asq_class` masks it), so when the queue is full
+  it can neither allocate nor write — the un-relaxed retire gate would still let it retire with
+  its write nowhere. `asq_stall` holds it at the head until the entry drains (bounded).
+
+  **Verified (=0):** `veryl test` **252/0** · litmus N2 **cycle-exact** `cy=0x282170` ·
+  dhrystone **instret 264834 bit-exact** (252939 cy = post-S1 baseline) · **N=1 boot
+  `cy=0x0d99720` cycle-identical to R3.0** · **N=2 SMP boot `cy=0x125bb50` = 19.25M**, the S1
+  ship figure · no `veryl check` warning names the new signals.
+
+  **Not yet functional at =1** — `asq_drain` is still R3.0's placeholder (it frees the entry
+  without performing the RMW), so the queue would swallow the write. R3.2 builds the engine.
 - **R3.2 — compute-at-drain engine (scheme B, `rd == x0` only).** The entry drains as one
   owned-line transaction: RFO → read → `new = old OP src` → write through the dcache
   `i_wen_excl` port, when it is the oldest memory op. **The fallback question dissolves**: no
