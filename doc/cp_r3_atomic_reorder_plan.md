@@ -9,8 +9,9 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 substrate built, DEAD at `ATOMIC_SQ=0`** (2026-07-27). Design grounded in the
-atomic-machinery audit; no behaviour has moved yet (R3.1 is the first functional step).
+Status: **R3.0 substrate built, DEAD at `ATOMIC_SQ=0`; R3.2's blocking design question RESOLVED
+(§6)** (2026-07-27). No behaviour has moved yet — R3.1 is the first functional step, and §6 is
+authoritative over §2's original scheme-A recommendation.
 
 ---
 
@@ -114,6 +115,12 @@ scheme (today's commit write already assumes continuous ownership; R3-A just let
 *retire* before that write drains, holding the pin across retire). (B) is the fully-canonical
 end state; treat it as R3-far if (A)'s ordering proves insufficient.
 
+> **⚠️ SUPERSEDED at design time (2026-07-27) — see §6.** (A) was analysed and **rejected**: its
+> "hold ownership across retire" needs an unbounded pin, which re-opens the very deadlock cycle
+> the 64-cy watchdog exists to break, and the pin does not stop *local* eviction either. The
+> resolved design splits on `rd`: **(B) for atomics whose result is architecturally dead
+> (`rd == x0`)**, today's proven head-serialised path for everything else. §6 is authoritative.
+
 **SQ vs the committed-store buffer:** the atomic drain can reuse the existing committed-store-
 buffer drain port (`sb_pop`, `dcache i_wen_excl`) — a dedicated **atomic-SQ entry** carries
 the extra atomic state (op, watch, pin-hold) and drains through the same dcache write port,
@@ -173,17 +180,23 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
   no new `veryl check` warnings (4856 = baseline) · synth-neutral by the §10.10 const-gated-D
   rule. *Structure grounded; not flipped — R3.0 at =1 is non-functional by construction (no
   drain machinery yet), which is why the flip is R3.3.*
-- **R3.1 — retire-into-SQ (alloc + head-release).** At the atomic's commit, instead of the
-  single-cycle write, allocate the atomic-SQ entry (carrying the execute-captured `ac_pa_q` +
-  pre-computed `new` for scheme A) and **retire** (free the ROB entry, pointer bump). The write
-  is now pending in the SQ. `rob_commit_ack` for the atomic no longer waits the in-cache write.
-  Gated `ATOMIC_SQ`. This is where head-serialisation is lifted.
-- **R3.2 — ownership-locked drain + coherence poison (scheme A).** Extend the pin to hold E/M
-  across the atomic's retire→drain; the SQ entry drains the write through the dcache `i_wen_
-  excl` port when it is the oldest memory op + owns the line. A remote request to the held line
-  is deferred (pin) until drain; if the pin watchdog trips (contention), fall back (bounded —
-  design TBD: re-acquire + re-drain, since replay is no longer available). Wire the fence/`.rl`
-  drain-ordering and `.aq` read-ordering.
+- **R3.1 — classify + retire-into-SQ (alloc + head-release).** *(Revised by §6.)* Restrict
+  `asq_alloc` to the **atomic-without-return** class (AMO with `rd == x0`, cacheable
+  `ac_wexcl_q`, fault-free `ac_wok_q`); everything else keeps today's path. At the atomic's
+  commit, instead of the single-cycle write, allocate the entry — carrying `{ac_pa_q, amo_op,
+  src, size, aqrl}`, **not** a pre-computed `new` — and **retire** (free the ROB entry, pointer
+  bump). `rob_commit_ack` for that atomic no longer waits the in-cache write. Also lands the
+  younger-access blocking rules (§6.4) and the fence/`.rl` extension. Gated `ATOMIC_SQ`. This
+  is where head-serialisation is lifted. **Entry-field note:** R3.0 shipped scheme-A fields
+  (`asq_data/strb/wpa/pin`); R3.1 re-shapes them to the §6 set.
+- **R3.2 — compute-at-drain engine (scheme B, `rd == x0` only).** The entry drains as one
+  owned-line transaction: RFO → read → `new = old OP src` → write through the dcache
+  `i_wen_excl` port, when it is the oldest memory op. **The fallback question dissolves**: no
+  architectural state depends on any intermediate, so a stolen line means *retry the drain*,
+  never a replay (§6.2). Once the drain owns the line the existing pin covers the single write
+  cycle exactly as today — no pin extension, no watch, no poison for this class. Then the
+  execute-time read becomes architecturally dead for the class and is removed (§6.5), which is
+  what actually lifts issue-side head serialisation.
 - **R3.3 — flip + litmus closure.** Flip `ATOMIC_SQ=1`; run the FULL ladder (litmus N2/N4 +
   SMP boot N2/N4 + Verilator + ACT4) + contended-atomic IPC. Debug the minefield corners
   (expect several — this is Test-7/Test-8 territory). Ship decision (=0 validated DEAD vs =1),
@@ -193,15 +206,115 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
 `amo_cwr_eff` mux right below it (:8183-8249) + the commit port muxes (`dmem_pa_m` :8250,
 `dmem_wen_m` :8265, `dmem_wdata_m`/`dmem_wexcl_m` :8279-8281) → R3.2 must route the drain's
 address/data/strobe from the asq entry, not the live commit drive; `ac_pa_q`/`ac_wok_q` alloc
-(:6561-6565) → asq alloc; `amo_watch_*_q` (:3437-3440) → asq watch fields; `commit_amo_replay`
-(:4646) / retire gate (`rob_commit_ack` :4702, whose `c_serial && !sb_empty` fence term is
-:4711) → SQ-decoupled retire; `dcache.veryl` pin (`pin_cnt_q` :587, reset :1534) → cross-retire
-hold; `sb_empty` (:911) → atomic-SQ ordering; presence `dc_amo_present` (chk3 port :8381, today
-addressed by `amo_watch_pa_q`) → must follow `asq_wpa_q` once the atomic retires.
+(:6561-6565) → asq alloc + the class check; `commit_amo_replay` (:4646) / retire gate
+(`rob_commit_ack` :4702, whose `c_serial && !sb_empty` fence term is :4711) → SQ-decoupled
+retire + the §6.4 fence extension; `load_blocks_on_store` (:7003, `sb_ld_ovl` :911/:7415) →
+the §6.4 younger-access block; `sb_empty` (:911) → atomic-SQ drain ordering; `issue_amo_read`
+(:5950) / `amo_exec_capture` (:6455) → §6.5 removal of the class's at-head read.
+*Not needed under §6* (they were scheme-A anchors): `amo_watch_*_q` (:3437-3440), the
+`dc_amo_present` chk3 port (:8381) and the `dcache.veryl` pin (`pin_cnt_q` :587, reset :1534)
+all stay exactly as they are — the without-return class carries no watch and needs no
+cross-retire pin hold.
 
 ## 5. Sequencing note
 Per the study's "do not start R3 autonomously" + the campaign's "clean-context start for a
 fresh block" pattern (used for S1): build **R3.0 from a clean context**, verify byte-identical,
 then R3.1→R3.3 across sessions with the full ladder at each functional step. R3.2's ownership-
 locked-drain fallback (what happens when a retired atomic cannot drain) is the single hardest
-design question — resolve it before R3.1's head-release lands.
+design question — resolve it before R3.1's head-release lands. **✅ Resolved 2026-07-27 — §6.**
+
+---
+
+## 6. R3.2 design resolution — the fallback question, answered by splitting on `rd`
+
+**Status: RESOLVED (2026-07-27), supersedes §2's scheme-A recommendation. Authoritative for
+R3.1-R3.3.** The blocking question was *"what does a retired atomic do when it cannot drain?"*
+The answer is to make the question unreachable, by only letting an atomic retire early when its
+drain depends on **nothing captured at execute**.
+
+### 6.1 Why scheme A was rejected
+
+(A) keeps `rd ← old` at execute, so the execute-time `old` must stay valid until the drain —
+i.e. the line must hold E/M continuously across retire. Three findings kill it:
+
+1. **The pin cannot be extended.** `pin_cnt_q` (`dcache.veryl:587`) defers a remote probe only
+   while `!pin_cnt_q[6]` (< 64 cy), and its own comment states why: *"The bound keeps the defer
+   from closing a deadlock cycle through the single engine."* Holding the pin until an SQ drain
+   re-opens exactly that cycle — hart A defers B's probe on line X while A's drain waits behind
+   an older store whose RFO needs a line B is pinning.
+2. **The pin does not stop LOCAL eviction.** `pin_line_q` is read only by `probe_pinned` and the
+   arm condition (`:589`, `:1531`) — nothing in victim selection consults it. A younger access's
+   conflict/capacity miss can evict the pinned line. Today that is caught by `amo_poison_q` via
+   `dc_evict1/2` → **replay**, which is precisely what a retired atomic cannot do.
+3. **What is left is worth ~1 cycle.** Bound the window instead (retire only when the write is
+   already guaranteed) and the alloc condition collapses back into today's `store_drive &&
+   sb_empty && ac_wok_q` — the atomic retires one cycle before its write lands. Not worth the
+   highest SMP risk in the campaign.
+
+### 6.2 The split: the result register decides
+
+In an **in-order-retire** machine, an atomic that writes `rd` cannot retire before its RMW is
+globally performed — retire *is* the architectural commit of `rd`, and after retire there is no
+replay. That is not a limitation of this design; it is what retirement means.
+
+But when **`rd == x0` the execute-time `old` is architecturally dead.** Then the SQ entry need
+carry no pre-computed value at all: it carries `{pa, amo_op, src, size, aqrl}` and the drain
+performs RFO → read → compute → write as one owned-line transaction (scheme B). **No
+architectural state depends on any intermediate**, so:
+
+> **"Cannot drain" is answered by "retry the drain."** A line stolen mid-drain costs cycles,
+> never correctness. No pin extension, no cross-retire watch, no poison, no replay, no fallback
+> machinery — the hard design question does not exist for this class.
+
+Forward progress is no weaker than today: once the drain owns the line, the existing pin covers
+its single write cycle exactly as the commit write does now; acquiring the line is the same RFO
+fairness problem the current AMO (and its replay loop) already has. No new livelock class.
+
+This is the same split real ISAs make — ARM64 `ST<op>` (no return, store-shaped) vs `LD<op>`
+(returns, load-shaped); "far atomics" are exactly the without-return class.
+
+### 6.3 Why this is the valuable subset, not a consolation prize
+
+The guards in §3 answer this themselves — the highest-value contended cases are all `rd == x0`:
+
+| litmus | instruction | class |
+|---|---|---|
+| **Test 7** AMO atomicity (forbidden `0x701`, *the exact M3b case*) | `amoadd.w x0, t2, (t3)` (`litmus.S:381`) | **without-return → SQ** |
+| **Test 6** release | `amoswap.w.rl x0, t0, (t1)` (`:348`) | **without-return → SQ** |
+| **Test 8** lock release | `amoswap.w.rl x0, x0, (t3)` (`:415`) | **without-return → SQ** |
+| barrier arrive | `amoadd.w.aqrl t1, t0, (s3)` (`:570`) | returns → old path |
+| Test 8 acquire | `lr.w.aq` / `sc.w` (`:407-410`) | returns → old path |
+
+Linux's `atomic_add`/`atomic_or`/unlock-store paths have the same shape. So §0(b)'s entire IPC
+motivation — contended counters and release stores — is covered, while LR/SC, `amocas`, MMIO
+atomics and every result-returning AMO stay on the proven single-cycle path **untouched**. That
+also shrinks the flip's blast radius: R3.3 changes behaviour only for without-return AMOs.
+
+### 6.4 Rules the SQ path must obey
+
+- **Younger overlapping accesses BLOCK — they cannot forward.** The entry's value does not exist
+  until the drain, so no S27-style forward layer is possible. Reuse the existing shape: today
+  `issue_amo_read && sb_ld_ovl` (`:7003`) blocks an AMO/LR read on a buffered overlapping store.
+  Extend the same predicate to the pending ASQ line, and — unlike the S27 store-buffer case —
+  **plain loads that overlap must block too.** (ASQ_N=1 keeps this a single compare.)
+- **Release / fence.** The ASQ drains in order behind the store buffer, so `.rl` is preserved by
+  construction. Extend the fence retire gate `!(c_serial && !sb_empty)` (`:4711`) to also
+  require the ASQ empty, or a FENCE could complete ahead of a pending atomic write.
+- **Acquire.** `.aq` on a without-return atomic: its read happens at drain, so block younger
+  loads until the entry drains (the same predicate as above — conservative and sufficient).
+- **Fault precision.** Translation + PMP stay at execute (`ac_pa_q` / `ac_wok_q` already do
+  exactly this), so a faulting atomic never allocates and no fault can surface at drain.
+- **Class exclusions:** `rd != x0`, all SC (rd = success code) and LR, `amocas`, and MMIO /
+  uncacheable (`ac_wexcl_q == 0`, a write-through cannot be an owned-line RMW) keep today's path.
+- **No new comb loop:** the drain's presence check reads registered tag state, as `dc_amo_present`
+  does today (§3.6). The ASQ needs no `chk3`-style watch at all — there is nothing to poison.
+
+### 6.5 The structural prize
+
+A without-return atomic **does not need its execute-time read**. Once R3.2's drain computes the
+value, the execute side reduces to translate + fault-check, and the class drops out of
+`issue_amo_read` / RFO-at-head / `amo_watch_*` / `amo_poison_q` / `commit_amo_replay` entirely:
+it becomes *a store with an ALU op*, allocated and drained like any other store. That is the
+canonical-LSQ end state for this class, and removing the at-head read is what actually lifts
+issue-side serialisation — the IPC in §0(b) comes from there, not from the retire bump alone.
+Sequence it as the tail of R3.2 (the read is still live and harmless during R3.1).
