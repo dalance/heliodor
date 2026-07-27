@@ -9,12 +9,13 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 substrate + R3.1 classify/retire + R3.2a/b drain engine & port arbitration
-built, DEAD at `ATOMIC_SQ=0`; R3.2's blocking design question RESOLVED (§6)** (2026-07-27).
-§6 is authoritative over §2's original scheme-A recommendation. The `=1` path is now
-structurally complete for the without-return class, but **it has never been exercised** — no
-flip has been run. Next: **R3.2c** (§6.5, drop the class's execute-time read), then **R3.3**,
-the flip + full SMP ladder, which is where the real debugging starts.
+Status: **R3.0 + R3.1 + R3.2a/b built, DEAD at `ATOMIC_SQ=0` (tree ships DEAD); R3.2's design
+question RESOLVED (§6); FIRST FLIP PROBED (§7)** (2026-07-27). §6 supersedes §2's scheme A.
+The first `=1` run found (a) that **the litmus battery cannot exercise this class at all** —
+its atomics sit in the non-cacheable tohost window, so R3.3's guards do not currently guard
+anything (§7.1), and (b) a **younger-store ordering hole** whose fix belongs in the store
+commit path (§7.2). Next: resolve §7.1's test-coverage problem and §7.2's ordering design —
+both before R3.2c and R3.3.
 
 ---
 
@@ -274,7 +275,59 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
     two R3.2a `unused` warnings are gone (the outputs now have consumers).
   - **R3.2c — §6.5.** Drop the class's execute-time read (`issue_amo_read`, the watch, the
     poison, the replay). This is what actually lifts issue-side head serialisation and is where
-    §0(b)'s IPC lives.
+    §0(b)'s IPC lives. **Deferred behind §7** — see the first-flip findings.
+
+---
+
+## 7. First flip probe (2026-07-27) — two findings, one of them a validation-plan problem
+
+`ATOMIC_SQ=1` was run early, *before* R3.2c, deliberately: with the execute-time read still in
+place, any failure is attributable to the queue/drain machinery alone rather than confounded
+with the read removal. Reverted to `=0` afterwards; the tree ships DEAD.
+
+### 7.1 🚨 The litmus battery cannot exercise this class at all
+
+At `=1` the whole default suite was **252/0 with litmus N2 `cy=0x282170` — cycle-identical to
+`=0`**. That is not a pass; it means the class never fired. A probe on every AMO commit showed
+`wexcl=0` universally: `ac_wexcl_q`'s cacheability test excludes
+`dmu_dmem_addr[31:14] == 18'h20000`, i.e. **PA 0x80000000-0x80003FFF** (a 16 KB window around
+the riscv-tests tohost page). And `litmus.ld` puts the barrier at **0x80002000** and the test
+variables at **0x80003000** — both inside it. Every litmus and arch-test atomic is therefore
+non-cacheable, so `asq_class` (which requires `ac_wexcl_q`) can never match.
+
+**Consequence: the guards §3 names — Test 7 (`amoadd.w x0`, the exact M3b case), Test 6, Test 8
+— cannot validate the R3 path as the tests stand.** R3.3 cannot be gated on them without first
+either (a) relocating the litmus `.barrier`/`.vars` sections above 0x80004000 so the atomics
+become cacheable (changes litmus baselines; arguably makes the battery *stronger*, since today
+it never exercises the in-cache MESI atomic write path either), or (b) narrowing the
+`[31:14]` tohost window in the RTL to the actual tohost page (touches live behaviour → needs
+its own validation). **Resolve this before R3.3.** Today the only workload that exercises the
+class is the Linux boot (kernel atomics at 0x80a8xxxx — 1798 allocations in an N=1 boot).
+
+### 7.2 Two real design gaps the boot found
+
+- **Port-ownership deadlock (understood, fixed).** `asq_dr_port_ok` treated `amo_commit_live`
+  as "someone else owns the port". But a *class* atomic's commit drives no write
+  (`amo_cwr_eff` masks it) and no read (the M-stage read arm is already gated off by
+  `amo_commit_live`) — and when the queue is full the class atomic waits at the head on
+  `asq_stall`, holding `amo_commit_live=1` the whole time, which would keep the drain from ever
+  getting the port that frees the entry. Qualified with `!asq_class`; **kept** (a `=1`-only
+  refinement, inert at 0).
+- **Younger-store ordering hole (open — needs a design decision).** §6.4 blocks younger *loads*
+  and AMO reads from passing the queued atomic, but says nothing about younger **stores**. The
+  drain waits for `sb_empty`, so a younger store that reached the store buffer drains **first**,
+  and the drain then reads a value that already includes it — program order inverted.
+  The naive fix (hold store *retire* while the queue is occupied) **deadlocks**: a store held at
+  the head keeps driving `store_drive` → `dc_i_wen` → `m_wen_q=1` every cycle, so
+  `asq_dr_port_ok` never opens and the queue never drains. Evidence: allocations collapsed
+  1798 → 39 and the boot wedged earlier. Reverted.
+  The real fix has to gate the younger store's **write drive** (`store_drive` / `fast_store` /
+  the `sb_push`), not its retire — i.e. it lands in the store commit path, which is the memory-
+  ordering heart of the machine. That is a design step, not a patch, and it is the next R3 task.
+
+**Boot status at `=1`:** wedges at the 45 M cycle cap (`pass=0`) with drains completing
+normally (1797/1798, watchdog never trips), i.e. the queue machinery runs — the failure is the
+§7.2 ordering hole, not a stuck engine.
 - **R3.3 — flip + litmus closure.** Flip `ATOMIC_SQ=1`; run the FULL ladder (litmus N2/N4 +
   SMP boot N2/N4 + Verilator + ACT4) + contended-atomic IPC. Debug the minefield corners
   (expect several — this is Test-7/Test-8 territory). Ship decision (=0 validated DEAD vs =1),
