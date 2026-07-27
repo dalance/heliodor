@@ -9,11 +9,12 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 substrate + R3.1 classify/retire + R3.2a drain engine built, DEAD at
-`ATOMIC_SQ=0`; R3.2's blocking design question RESOLVED (§6)** (2026-07-27). §6 is
-authoritative over §2's original scheme-A recommendation. Next: **R3.2b**, the dcache port
-arbitration — until it lands, `ATOMIC_SQ=1` is non-functional by construction (the drain's
-read consumes whatever the unwired port returns), so do not flip.
+Status: **R3.0 substrate + R3.1 classify/retire + R3.2a/b drain engine & port arbitration
+built, DEAD at `ATOMIC_SQ=0`; R3.2's blocking design question RESOLVED (§6)** (2026-07-27).
+§6 is authoritative over §2's original scheme-A recommendation. The `=1` path is now
+structurally complete for the without-return class, but **it has never been exercised** — no
+flip has been run. Next: **R3.2c** (§6.5, drop the class's execute-time read), then **R3.3**,
+the flip + full SMP ladder, which is where the real debugging starts.
 
 ---
 
@@ -245,10 +246,32 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
     (identical to R3.1) · N=1 boot `cy=0x0d99720` cycle-identical. Two expected `unused`
     warnings (`asq_dr_wstrb`, `asq_dr_wdata`) — the engine's outputs have no consumer until
     R3.2b.
-  - **R3.2b — port arbitration.** Wire `asq_dr_ren`/`asq_dr_wen`/`asq_dr_wdata`/`asq_dr_wstrb`
-    into the dcache port muxes (`dmem_pa_m`/`ren`/`wen`/`wdata`/`wstrb`/`wexcl`) with the RFO
-    flag on the read, const-gated. Until this lands `ATOMIC_SQ=1` is non-functional by
-    construction — the RD state would consume whatever the port happens to return.
+  - **R3.2b — port arbitration. ✅ BUILT, DEAD at 0.** The engine is an **opportunistic**
+    requester: `asq_dr_port_ok = !ptw_dc_active && !amo_commit_live && !m_ren_q && !m_wen_q &&
+    !lsr_drive && !replay_drive` qualifies both `asq_dr_go_r`/`asq_dr_go_w`, so it drives the
+    shared port only on cycles nobody else owns it. That is a correctness requirement, not
+    politeness — the M-stage request is registered, so stealing its cycle would *drop* it, and
+    stealing an LSR/replay/PTW cycle would make the engine capture someone else's data.
+    Because `go_*` already excludes every other user, the seven new mux arms (`dmem_pa_m`,
+    `ren`, `wen`, `wstrb`, `wdata`, `amord`, `wexcl`) are mutually exclusive with the existing
+    ones by construction and fold away at =0. The read asserts `dmem_amord_m` (RFO — the
+    engine needs ownership, exactly like the execute-side AMO read); the write is the
+    exclusive merge, and since `asq_class` requires `ac_wexcl_q` the merge arm is always the
+    right one (no MMIO write-through can reach the queue).
+    **Anti-starvation, from the other side:** while `asq_dr_busy`, new load/AMO *issue* is
+    held (`load_blocks_on_store`), so the port quiesces as in-flight accesses retire and the
+    engine gets its cycles — instead of the engine preempting anyone.
+    **WR watchdog:** the exclusive merge only lands while the line is owned; departures
+    normally announce themselves via `asq_dr_poison`, but a 128-cycle bound (twice the dcache
+    pin's own) re-enters **RD** if the merge is held that long. It never "writes anyway" — the
+    `old` behind the value is always freshly read.
+    **Correction it also carried:** R3.2a had put `asq_dr_wen` into `amo_cwr_eff`, which is
+    only selected under `amo_commit_live` — i.e. during a *commit*, never during a drain. That
+    term was dead; the drain's real write is the new `dmem_wen_m` arm. `amo_cwr_eff` is now
+    just `amo_cwr_en && !asq_class` (suppress the class's in-cache write at =1).
+    **Verified (=0):** 252/0 · litmus N2 `cy=0x282170` · dhrystone 252939 cy / instret 264834 ·
+    N=1 boot `cy=0x0d99720` · N=2 SMP boot `cy=0x125bb50` — all cycle-identical to R3.2a · the
+    two R3.2a `unused` warnings are gone (the outputs now have consumers).
   - **R3.2c — §6.5.** Drop the class's execute-time read (`issue_amo_read`, the watch, the
     poison, the replay). This is what actually lifts issue-side head serialisation and is where
     §0(b)'s IPC lives.

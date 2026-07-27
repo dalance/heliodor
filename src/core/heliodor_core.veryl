@@ -929,8 +929,13 @@ pub module heliodor_core #(
     var asq_aq_q   : logic     [ASQ_N];
     var asq_rl_q   : logic     [ASQ_N];
     var asq_ld_ovl : logic            ; // issuing access's dword span may hit the entry
+    var asq_dr_st_q: logic<2>         ; // drain FSM: 0=IDLE 1=RD(ownership) 2=WR(merge)
     let asq_full   : logic = asq_valid_q[0];
     let asq_empty  : logic = !ATOMIC_SQ || !asq_valid_q[0];
+    // R3.2b: the drain owns the dcache port opportunistically, so while it is busy new
+    // load/AMO issue is held — that is what lets the port quiesce and keeps the engine
+    // from starving behind a load stream (see asq_dr_port_ok).
+    let asq_dr_busy: logic = ATOMIC_SQ && asq_dr_st_q != 2'd0;
     // S25 write-combining: entries are cache LINES (64B), not dwords. A push
     // whose PA matches a live entry's line MERGES into that entry's dword lane
     // (byte-granular strobe OR) instead of allocating — a streaming store
@@ -7054,6 +7059,11 @@ pub module heliodor_core #(
     assign load_blocks_on_store = (issue_is_load && store_drive) || (issue_amo_read && sb_ld_ovl)
         // R3.1 §6.4: hold any access overlapping a queued atomic (no forward possible).
         || ((issue_is_load || issue_amo_read) && asq_ld_ovl)
+        // R3.2b: and hold ALL new load/AMO issue while the drain engine is running, so
+        // the shared dcache port quiesces for it (anti-starvation — the engine never
+        // preempts an in-flight access). Bounded by the drain, which is a few cycles
+        // once it owns the line.
+        || ((issue_is_load || issue_amo_read) && asq_dr_busy)
         || (issue_is_load && !issue_amo_read && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
         || (issue_is_load && sb_cnt >= 4'd3)
         || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])))
@@ -8284,31 +8294,58 @@ pub module heliodor_core #(
     // port muxes (that is R3.2b), so at ATOMIC_SQ=1 the RD state would consume
     // whatever the port happens to return. =1 stays non-functional by construction
     // until R3.2b lands; at =0 the whole engine is const-gated and unreachable.
-    var asq_dr_st_q : logic<2> ; // 0=IDLE 1=RD(ownership read) 2=WR(exclusive merge)
     var asq_dr_old_q: logic<64>; // the dword read back at asq_pa (dword frame)
+    // R3.2b port arbitration: the engine is an OPPORTUNISTIC requester — it drives the
+    // shared dcache port only on cycles nobody else owns it, so no in-flight
+    // transaction can be preempted (the M-stage request is registered; stealing its
+    // cycle would drop it, and stealing an LSR/replay/PTW cycle would make the engine
+    // capture someone else's data). Starvation is prevented from the other side: while
+    // the engine is busy, load/AMO issue is held (load_blocks_on_store), so the port
+    // quiesces as the in-flight accesses retire and the drain gets its cycles.
+    let asq_dr_port_ok: logic = ATOMIC_SQ && !ptw_dc_active && !amo_commit_live
+        && !m_ren_q && !m_wen_q && !lsr_drive && !replay_drive;
     let asq_dr_start : logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty && asq_dr_st_q == 2'd0;
     let asq_dr_ren   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd1;
-    let asq_dr_rdone : logic = asq_dr_ren && !dcache_stall;
     let asq_dr_wen   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd2;
-    let asq_dr_wdone : logic = asq_dr_wen && !dcache_stall;
+    let asq_dr_go_r  : logic = asq_dr_ren && asq_dr_port_ok; // drives the port this cycle
+    let asq_dr_go_w  : logic = asq_dr_wen && asq_dr_port_ok;
+    let asq_dr_rdone : logic = asq_dr_go_r && !dcache_stall;
+    let asq_dr_wdone : logic = asq_dr_go_w && !dcache_stall;
     let asq_dr_poison: logic = ATOMIC_SQ && asq_dr_st_q != 2'd0
         && ((i_dcache_inv_valid && i_dcache_inv_addr[63:6] == asq_pa_q[0][63:6])
         || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == asq_pa_q[0][63:6])
         || (dc_evict1_v && dc_evict1_addr[63:6] == asq_pa_q[0][63:6])
         || (dc_evict2_v && dc_evict2_addr[63:6] == asq_pa_q[0][63:6]));
+    // WR watchdog. The exclusive merge only lands while the line is owned; if it is
+    // not, the dcache holds (o_stall). Departures normally announce themselves through
+    // asq_dr_poison, but a bounded timeout keeps a missed announcement from wedging the
+    // engine forever. It re-enters RD — never "write anyway" — so the `old` behind the
+    // value is always freshly read. 128 cycles is twice the dcache pin's own bound.
+    var asq_dr_cnt_q  : logic<7>;
+    let asq_dr_wtimeout: logic = ATOMIC_SQ && asq_dr_wen && asq_dr_cnt_q == 7'h7f;
     always_ff (clk, rst) {
         if_reset {
             asq_dr_st_q  = 2'd0;
             asq_dr_old_q = 64'd0;
+            asq_dr_cnt_q = 7'd0;
         } else if asq_dr_poison {
-            asq_dr_st_q = 2'd1; // re-acquire + re-read; never write a stale `old`
+            asq_dr_st_q  = 2'd1; // re-acquire + re-read; never write a stale `old`
+            asq_dr_cnt_q = 7'd0;
         } else if asq_dr_start {
-            asq_dr_st_q = 2'd1;
+            asq_dr_st_q  = 2'd1;
+            asq_dr_cnt_q = 7'd0;
         } else if asq_dr_rdone {
             asq_dr_old_q = dcache_rdata;
             asq_dr_st_q  = 2'd2;
+            asq_dr_cnt_q = 7'd0;
         } else if asq_dr_wdone {
-            asq_dr_st_q = 2'd0;
+            asq_dr_st_q  = 2'd0;
+            asq_dr_cnt_q = 7'd0;
+        } else if asq_dr_wtimeout {
+            asq_dr_st_q  = 2'd1;
+            asq_dr_cnt_q = 7'd0;
+        } else if asq_dr_wen {
+            asq_dr_cnt_q = asq_dr_cnt_q + 7'd1;
         }
     }
     // The RMW itself, replicating alu_wrap's M5.A compute on the queued operands:
@@ -8382,12 +8419,25 @@ pub module heliodor_core #(
     // (constant selector, synth folds). At 1 the in-cache write still fires for every
     // atomic OUTSIDE the class (!asq_class — LR/SC, result-returning AMOs, amocas,
     // MMIO); the class's write is instead performed by the queue drain.
-    // The drain arm is the REQUEST (asq_dr_wen, a pure function of the FSM register),
-    // never the completion (asq_dr_wdone, which reads dcache_stall): routing the
-    // completion here closes a combinational loop write-enable -> dcache_stall ->
-    // wdone -> write-enable. Whether the write landed only ever advances the FSM.
-    let amo_cwr_eff: logic = if ATOMIC_SQ ? (asq_dr_wen || (amo_cwr_en && !asq_class)) : amo_cwr_en;
-    let dmem_pa_m    : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? ac_pa_q : m_pa_q)) : dmu_dmem_addr;
+    // This mux only ever selects during a COMMIT (its consumers sit under the
+    // amo_commit_live arm), so the drain does not belong here — R3.2b gives the drain
+    // its own arms in the port muxes below, on cycles no commit is happening.
+    // (Note for any future edit: a drain term here must be the REQUEST asq_dr_wen, a
+    // pure function of the FSM register — routing the completion asq_dr_wdone, which
+    // reads dcache_stall, closes write-enable -> dcache_stall -> wdone -> write-enable.
+    // Veryl's loop detector is structural and does NOT fold the ATOMIC_SQ=0 constant,
+    // so such a loop is a hard build error even while DEAD.)
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_class) : amo_cwr_en;
+    // ── R3.2b: the drain engine's port arms ───────────────────────────────────
+    // asq_dr_go_r/_w are already qualified by asq_dr_port_ok (nobody else owns the
+    // port this cycle), so these outermost arms are mutually exclusive with every
+    // existing one by construction — at ATOMIC_SQ=0 they are constant 0 and each mux
+    // folds to today's expression. The read is an RFO (dmem_amord_m) because the
+    // engine needs OWNERSHIP, exactly like the execute-side AMO read; the write is the
+    // in-cache exclusive merge (dmem_wexcl_m) of `new` with the funct3 strobe. The
+    // entry is only allocated for cacheable atomics (ac_wexcl_q in asq_class), so the
+    // merge arm is always the right one — no MMIO write-through case reaches here.
+    let dmem_pa_m    : logic<64> = if asq_dr_go_r || asq_dr_go_w ? asq_pa_q[0] : if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_addr : (if amo_commit_live ? ac_pa_q : m_pa_q)) : dmu_dmem_addr;
     // CP M3b: the AMO read must be a SINGLE RFO pulse at its ACCESS cycle, not a
     // sustained access. The AMO is held at the issue port for both its fetch and
     // access cycles, so dc_amo_read (and thus m_ren_q / m_amo_read_q) stays asserted
@@ -8399,11 +8449,11 @@ pub module heliodor_core #(
     // AMO read that is no longer in its access window (amo_fetched_q dropped). The
     // genuine access cycle (and a sustained miss-fill) keeps amo_fetched_q=1.
     let m_amo_tail   : logic     = m_amo_read_q && !amo_fetched_q;
-    let dmem_ren_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live)) : (dmu_dmem_ren && !lsr_capture);
+    let dmem_ren_m   : logic     = if asq_dr_go_r ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live)) : (dmu_dmem_ren && !lsr_capture);
     let dmem_unc_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_unc_q) : (dc_uncached && !lsr_capture);
     let dmem_lnext_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_lnext_q) : (dc_load_next && !dc_uncached && !lsr_capture);
-    let dmem_wen_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? amo_cwr_eff : m_wen_q)) : dc_i_wen;
-    let dmem_wstrb_m : logic<8>  = if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : (if amo_commit_live ? dmu_dmem_wstrb : m_wstrb_q)) : dmu_dmem_wstrb;
+    let dmem_wen_m   : logic     = if asq_dr_go_w ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? amo_cwr_eff : m_wen_q)) : dc_i_wen;
+    let dmem_wstrb_m : logic<8>  = if asq_dr_go_w ? asq_dr_wstrb : if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : (if amo_commit_live ? dmu_dmem_wstrb : m_wstrb_q)) : dmu_dmem_wstrb;
     // CP wall-cut (W2 keystone-unmask): an AMO/SC commit is ALWAYS naturally aligned
     // (a misaligned AMO faults at issue, never reaching amo_commit_live), and amocas.q's
     // hi dword sits in the SAME 64B line as the lo dword (16B-aligned), so a committing
@@ -8416,9 +8466,9 @@ pub module heliodor_core #(
     // constant 0 (byte-identical: dc_st_wstrb_hi is provably 0 for an aligned atomic) and
     // the wall drops to the rs1_rdy keystone floor (15.300 -> 14.565 ns).
     let dmem_wstrbhi_m: logic<8> = if MEM_PIPE ? (if ptw_dc_active ? 8'd0 : (if amo_commit_live ? 8'd0 : m_wstrbhi_q)) : dc_st_wstrb_hi;
-    let dmem_wdata_m : logic<64> = if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_wdata : (if amo_commit_live ? dmu_dmem_wdata : m_wdata_q)) : dmu_dmem_wdata;
-    let dmem_amord_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (m_amo_read_q && amo_fetched_q)) : dc_amo_read;
-    let dmem_wexcl_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? (amo_cwr_eff && ac_wexcl_q) : m_wen_excl_q)) : dc_wen_excl;
+    let dmem_wdata_m : logic<64> = if asq_dr_go_w ? asq_dr_wdata : if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_wdata : (if amo_commit_live ? dmu_dmem_wdata : m_wdata_q)) : dmu_dmem_wdata;
+    let dmem_amord_m : logic     = if asq_dr_go_r ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (m_amo_read_q && amo_fetched_q)) : dc_amo_read;
+    let dmem_wexcl_m : logic     = if asq_dr_go_w ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? (amo_cwr_eff && ac_wexcl_q) : m_wen_excl_q)) : dc_wen_excl;
     let dmem_addr2_m : logic<64> = if MEM_PIPE ? m_addr2_q    : dc_addr2;
     let dmem_ren2_m  : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_ren2_q) : dc_ren2;
     let dmem_lnext2_m: logic     = if MEM_PIPE ? m_lnext2_q   : dc_load_next2;
