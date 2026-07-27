@@ -10,14 +10,13 @@ says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L
 complete) as the next block; F+S+L1+L2 are done.
 
 Status: **R3.0 + R3.1 + R3.2a/b + §7.2 hardening built, DEAD at `ATOMIC_SQ=0` (tree ships
-DEAD); design question RESOLVED (§6); validation gap CLOSED (§7.1)** (2026-07-27). §6
-supersedes §2's scheme A. The litmus battery could not exercise this class at all — its
-atomics sat in the non-cacheable tohost window — so `.barrier`/`.vars` were relocated (§7.1),
-which also strengthened the battery in its own right. **The flip still fails** at litmus N2
-`tohost=0x7012` (test 7 slot 1, AMO lost update) with the cycle count bit-identical across four
-RTL variants, so the remaining fault is off the paths edited so far: **the next step is a
-trace session on `test_litmus_2hart`, not another candidate fix** (§7.3). R3.2c and R3.3 stay
-behind it.
+DEAD)** (2026-07-27). Design question RESOLVED (§6); validation gap CLOSED (§7.1). **The
+compute-at-drain RMW is proven atomic under contention** by the §7.4 trace — 2000 test-7
+increments, 1000 per hart, zero duplicate `old`, every booked entry drained. The flip still
+fails, but **not on the drain path**: `x` ends at ~4000 instead of 2000, and test 7 asserts
+equality, so this is a *too-large* result inherited from an earlier test, not a lost update.
+Next: probe `x` at each test boundary — the hypothesis is a cleanup store being overtaken by a
+queued drain (§7.4). R3.2c and R3.3 stay behind it.
 
 ---
 
@@ -380,6 +379,45 @@ N=1 boot `cy=0x0d99720`):
    so there is no longer anything to stall for).
 
 **The flip still fails**, identically: litmus N2 `cy=0x2d9fb0`, `tohost=0x7012` (test 7 slot 1).
+
+### 7.4 Trace session — what the drain actually does (and what it is NOT)
+
+Instrumented every commit and every drain write landing on test 7's `x` line (0x80007000) at
+`=1`. **The drain path is not the problem:**
+
+| measurement | value |
+|---|---|
+| AMO commits at `x` | 4000 |
+| of which booked an entry (`alloc=1`) | 3000 |
+| of which wrote in-cache (`cwr=1`) | 1000 |
+| queue full at commit (`full=1`) | **0** |
+| drain writes at `x` | 3000 — **exactly the alloc count** |
+| drain writes that are `new == old + 1` | 2000, **1000 per hart** |
+| duplicate `(old, new)` pairs among those | **0** |
+
+So every atomic took exactly one path, every booked entry drained, and **no two drains ever
+read the same `old`** — the compute-at-drain RMW is genuinely atomic under contention, which is
+the core thing R3 had to prove. The §7.2 fixes are doing their job.
+
+**The failure is elsewhere: `x` ends at ~4000, not 2000** (max `new` observed = 3999). Test 7
+does 2000 `amoadd`s and asserts `x == 2*AMO_ITER`; it fails on *inequality*, so "too large"
+lands in the same slot as "lost update" — the slot name ("lost AMO update(s)") misled the whole
+first round of analysis. **Test 7 does not zero `x` on entry** (`t7_ok` clears it on the way
+*out*), so it inherits whatever the preceding tests left.
+
+**Leading hypothesis for the next session:** at `=1`, `x` is already ~2000 when test 7 starts —
+i.e. an earlier test's cleanup store (`sw x0, 0(s4)`) is being **overtaken by a queued atomic's
+drain**, which lands after the reset and resurrects a stale value. That is still the §7.2
+ordering family, but on the path `asq_st_block` does not cover, so the next probe is narrow and
+cheap: **print `x` at test-7 entry** (and at each test boundary), and if it is non-zero, trace
+which drain wrote it after the reset store.
+
+**Ruled out by this trace (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
+`asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
+after alloc" theory — a guard for it was added (`!(asq_class && !asq_empty)` in `amo_cwr_eff`,
+kept, it is correct in its own right) and changed **nothing**: the counts stayed 4000/3000/1000
+bit-identical. Six substantive RTL edits in a row have produced bit-identical results, which is
+itself the strongest evidence that the fault is off these paths.
 The cycle count was **bit-identical across all four RTL variants**, which is the useful signal:
 whatever is wrong is not on the paths being edited. Hypothesis-driven patching has stopped
 paying, and the next step is the campaign's proven method instead — a **trace session** on
