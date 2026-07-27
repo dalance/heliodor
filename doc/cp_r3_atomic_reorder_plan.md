@@ -9,16 +9,15 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b + §7.2/7.5/7.6/7.7 hardening built, DEAD at `ATOMIC_SQ=0`
-(tree ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); the
-compute-at-drain RMW is **proven atomic under contention** (§7.4). The flip fails on one fact:
-in test 7's region there are **3999 landing writes with every value distinct, split 2000 queue
-drain / 1999 in-cache** — both paths applying once for what should be 2000 operations (§7.7).
-**Ten consecutive candidate fixes have left the result bit-identical**, so the mechanism
-inferred from aggregate counts is still wrong. **Next session: instrument the PC/ROB index
-behind each landing write** (§7.7) — that one measurement decides between "one instruction
-applying twice" and "the loop executing twice" — before writing any further fix. R3.2c and R3.3
-stay behind it.
+Status: **R3.0 + R3.1 + R3.2a/b + §7.2/7.5/7.7 hardening built, DEAD at `ATOMIC_SQ=0` (tree
+ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); the
+compute-at-drain RMW is **proven atomic under contention** (§7.4) and, by PC/ROB attribution,
+**the queue applies test 7's `amoadd` exactly once per instruction — the queue is exonerated**
+(§7.8). The earlier "clean 2×" was an artifact of my own trace segmentation and is retracted.
+The flip still fails, so the fault is in **what test 7's check observes**, not in applying the
+atomics. Next measurement: print the value loaded by test 7's `lw t0, 0(s4)` at `=0` and `=1`
+(§7.8) — it splits cleanly into "stale load / barrier-fence does not cover the ASQ" vs
+"not a memory-system problem at all". R3.2c and R3.3 stay behind it.
 
 ---
 
@@ -517,7 +516,41 @@ amoadds") is wrong and the loop is executing ~4000 times — which would point a
 redirect path, not the queue. That single measurement splits the remaining space in half; do it
 before writing any more candidate fixes.
 
+### 7.8 ✅ Attribution: every writer of `x` is correct — the queue is exonerated
+
+Carried the allocating atomic's **PC and ROB index** in the queue entry and printed them with
+every landing write on `x`, alongside the committing PC for in-cache writes. Cross-referenced
+with `objdump`:
+
+| PC | instruction | landing writes | verdict |
+|---|---|---|---|
+| `0x800005cc` | `t7_amo`: `amoadd.w zero,t2,(t3)` | **2000 drains** (1000/hart, all ROB indices distinct) | ✅ exactly one per instruction |
+| `0x80000624` | `t8_acq`: `sc.w t2,t1,(t3)` | 1000 in-cache (SC is not in the class) | ✅ |
+| `0x80000638` | test 8 unlock: `amoswap.w.rl zero,zero,(t3)` | 1000 drains | ✅ |
+
+**All three writers are accounted for with exactly the right counts, and test 7's amoadd applies
+once per instruction through the queue.** There is no double apply.
+
+**⇒ §7.6/§7.7's "clean 2×" was an artifact of my own segmentation heuristic** (slicing the
+value stream on "values > 2500" and extending backwards stitched unrelated runs together), not
+a real doubling. Retracted. **The R3 queue is exonerated for the whole of test 7.**
+
+**So the failure is not in *applying* the atomics — it is in what test 7's check observes.**
+Test 7 does `barrier; lw t0, 0(s4); beq t0, 2*AMO_ITER`. With 2000 correct increments the value
+must be 2000 at the check, so the next measurement is **the loaded value itself**: print `t0` at
+the `lw` (PC `0x800005e0`-ish, right after `t7_sync`'s barrier) at both `=0` and `=1`. Two
+outcomes, both actionable:
+- **loaded value ≠ 2000 but the line's final value is 2000** → the *load* is stale: a queued
+  atomic had not drained when the barrier released, i.e. the barrier/fence ordering does not
+  cover the ASQ from the *observer's* side. Check that `barrier_fn`'s `amoadd.w.aqrl` (rd = t1,
+  so **not** in the class → in-cache path) and its trailing `fence rw,rw` really do wait for
+  `asq_empty` on **both** harts, and that a remote hart's un-drained queue cannot be passed by
+  our acquire.
+- **loaded value = 2000** → the failure is in the compare/record path, not the memory system at
+  all, and the whole R3 line of investigation is clear.
+
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
+**double application of any atomic**; **the queue mis-applying test 7's amoadd**;
 `asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
 after alloc" theory — a guard for it was added (`!(asq_class && !asq_empty)` in `amo_cwr_eff`,
 kept, it is correct in its own right) and changed **nothing**: the counts stayed 4000/3000/1000
