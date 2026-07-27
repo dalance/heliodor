@@ -9,14 +9,16 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b + §7.2 hardening built, DEAD at `ATOMIC_SQ=0` (tree ships
-DEAD)** (2026-07-27). Design question RESOLVED (§6); validation gap CLOSED (§7.1). **The
-compute-at-drain RMW is proven atomic under contention** by the §7.4 trace — 2000 test-7
-increments, 1000 per hart, zero duplicate `old`, every booked entry drained. The flip still
-fails, but **not on the drain path**: `x` ends at ~4000 instead of 2000, and test 7 asserts
-equality, so this is a *too-large* result inherited from an earlier test, not a lost update.
-Next: probe `x` at each test boundary — the hypothesis is a cleanup store being overtaken by a
-queued drain (§7.4). R3.2c and R3.3 stay behind it.
+Status: **R3.0 + R3.1 + R3.2a/b + §7.2/§7.5/§7.6 hardening built, DEAD at `ATOMIC_SQ=0` (tree
+ships DEAD)** (2026-07-27). Design question RESOLVED (§6); validation gap CLOSED (§7.1); the
+compute-at-drain RMW is **proven atomic under contention** (§7.4). The flip fails on one
+remaining, now sharply-characterised fact: **~4000 increments land where 2000 are expected — a
+clean 2×** (§7.6; `x` maxes at exactly 2000 at `=0` and 3999 at `=1`, one continuous run, so
+nothing is inherited from an earlier test). Given §7.5's accounting (2000 commits, one path
+each, 2000 drain completions with non-duplicated `old`), the only consistent explanation is
+**one drain completion producing two landing writes**. Next probe is narrow: count main-port
+landing writes per drain completion; suspect the level-held WR write-enable and fix with a
+one-shot. R3.2c and R3.3 stay behind it.
 
 ---
 
@@ -444,6 +446,38 @@ stands and is now the *only* survivor. Start there: dump `x` at each test bounda
 trace already shows plain stores of 0/1 to `x` from tests 0-1, so the instrumentation exists),
 find the last test that leaves `x` non-zero at `=1` but zero at `=0`, and diff that test's
 write order between the two builds.
+
+### 7.6 The residue hypothesis is DEAD — it is a clean factor of two
+
+Captured the same x-write-order trace at **both** `ATOMIC_SQ=0` and `=1` and compared:
+
+| | `=0` (passes) | `=1` (fails) |
+|---|---|---|
+| writes landing on `x` | 20665 | 24170 |
+| **max value written to `x`** | **2000 — exactly right** | **3999** |
+| shape | — | one *continuous* run: …1999, 2000, 2001, 2002… |
+
+`x` climbs straight past 2000 in a single unbroken sequence, so nothing was inherited from an
+earlier test. **§7.4's residue hypothesis is dead.** The real fact is simpler and sharper:
+**~4000 increments are applied where 2000 are expected — a clean 2×.**
+
+That is hard to reconcile with §7.5's accounting (2000 amoadd commits, each taking exactly one
+path, 2000 drain completions with non-duplicated `old`). The two are only compatible if **one
+drain completion produces two increment writes on the dcache port.**
+
+**Fix tried, correct in principle, did not move it:** the FSM gave `asq_dr_poison` priority over
+`asq_dr_wdone`, so a departure signal arriving in the same cycle the exclusive merge landed sent
+the engine back to RD — while `asq_drain` (which has no such priority) freed the entry — and it
+re-read the already-updated value and applied the op again. `asq_dr_wdone` now outranks poison
+(a completed write is done; a same-cycle departure refers to the line *after* it). **Kept — it
+is a real ordering bug — but the result stayed bit-identical.**
+
+**Next probe, and it is a narrow one:** count main-port *landing* writes per drain completion.
+If it is 2, find why `asq_dr_go_w` presents the merge on two cycles that both see
+`dcache_stall == 0` (the level-held request is the obvious suspect: the write enable is a state
+decode, not a one-shot, so anything that delays the FSM's departure from WR by a cycle while the
+port stays ready applies the merge twice). A one-shot / "write already issued" latch on the WR
+state is the likely shape of the fix.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 `asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
