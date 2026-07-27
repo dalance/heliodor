@@ -9,16 +9,16 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b + §7.2/§7.5/§7.6 hardening built, DEAD at `ATOMIC_SQ=0` (tree
-ships DEAD)** (2026-07-27). Design question RESOLVED (§6); validation gap CLOSED (§7.1); the
-compute-at-drain RMW is **proven atomic under contention** (§7.4). The flip fails on one
-remaining, now sharply-characterised fact: **~4000 increments land where 2000 are expected — a
-clean 2×** (§7.6; `x` maxes at exactly 2000 at `=0` and 3999 at `=1`, one continuous run, so
-nothing is inherited from an earlier test). Given §7.5's accounting (2000 commits, one path
-each, 2000 drain completions with non-duplicated `old`), the only consistent explanation is
-**one drain completion producing two landing writes**. Next probe is narrow: count main-port
-landing writes per drain completion; suspect the level-held WR write-enable and fix with a
-one-shot. R3.2c and R3.3 stay behind it.
+Status: **R3.0 + R3.1 + R3.2a/b + §7.2/7.5/7.6/7.7 hardening built, DEAD at `ATOMIC_SQ=0`
+(tree ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); the
+compute-at-drain RMW is **proven atomic under contention** (§7.4). The flip fails on one fact:
+in test 7's region there are **3999 landing writes with every value distinct, split 2000 queue
+drain / 1999 in-cache** — both paths applying once for what should be 2000 operations (§7.7).
+**Ten consecutive candidate fixes have left the result bit-identical**, so the mechanism
+inferred from aggregate counts is still wrong. **Next session: instrument the PC/ROB index
+behind each landing write** (§7.7) — that one measurement decides between "one instruction
+applying twice" and "the loop executing twice" — before writing any further fix. R3.2c and R3.3
+stay behind it.
 
 ---
 
@@ -478,6 +478,44 @@ If it is 2, find why `asq_dr_go_w` presents the merge on two cycles that both se
 decode, not a one-shot, so anything that delays the FSM's departure from WR by a cycle while the
 port stays ready applies the merge twice). A one-shot / "write already issued" latch on the WR
 state is the likely shape of the fix.
+
+### 7.7 The 2× is two *landing writes*, split evenly between the two paths
+
+Classified every landing write in test 7's increment region (from the §7.5 log, no new run):
+
+- **3999 landing writes, values 1…3999, every value distinct, none written twice**
+- split **`drw=1` (queue drain) 2000 / `drw=0` (in-cache) 1999**
+- the head of the run is **hart 0 alone**, alternating `drw=0, drw=1, drw=0, …`
+
+So it is *not* one drain landing twice (§7.6's guess). It is **both paths each applying once**
+for what should be 2000 operations. **§7.5's "every commit takes exactly one path" was wrong** —
+that counted *commit events*; counting *landing writes* shows otherwise.
+
+Mechanism that fits: the atomic performs its in-cache write, but its **retire is held** (most
+often by `asq_st_block`, because the queue still holds the *previous* atomic), so it stays at
+the head; when the queue frees, it satisfies `asq_alloc`, books an entry, and the drain applies
+the operation a second time.
+
+**Fix built for exactly that (kept, correct in principle, still inert):** the `asq_divert_q`
+latch now closes **both** directions — set on `asq_alloc` **or** on the in-cache write
+(`amo_commit_live && amo_cwr_eff`), cleared on the atomic's `rob_commit_ack`, and it now gates
+`asq_alloc` as well as `amo_cwr_eff`. Whichever way the atomic performed its RMW, it performs
+it once.
+
+**🚨 Honest status: ten consecutive fixes have left the result bit-identical** (`cy=0x2d9fb0`,
+`tohost=0x7012`), while forcing `asq_class = 0` still flips it to a clean pass. Every guard
+added so far is evidently never true in this workload — which means the *mechanism* inferred
+from aggregate counts is still not the real one. **Stop inferring from counts.**
+
+**The one instrumentation that has been missing all along: attribute each landing write to the
+INSTRUCTION that caused it.** Print the committing atomic's PC (and ROB index) with every
+in-cache write, and carry the allocating atomic's PC in the queue entry so the drain write can
+print it too. If the two writes of a pair carry the *same* PC/ROB index, it is one instruction
+applying twice and the latch must be repaired (start by checking it is not cleared in the same
+cycle it is set); if they carry *different* PCs, the counting premise ("test 7 issues only 2000
+amoadds") is wrong and the loop is executing ~4000 times — which would point at the retire/
+redirect path, not the queue. That single measurement splits the remaining space in half; do it
+before writing any more candidate fixes.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 `asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
