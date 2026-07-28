@@ -9,15 +9,16 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b + the §7.11/§7.13 fixes built, DEAD at `ATOMIC_SQ=0` (tree
-ships DEAD)** (2026-07-28). Design RESOLVED (§6); validation gap CLOSED (§7.1); **both `=1` bugs
-found and fixed** (§7.11 M-stage double-write, §7.13 the stale `asq_divert_q` latch killing
-unrelated atomics' writes). **The full functional ladder now PASSES at `=1`**: `veryl test`
-252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1 boot · N=2 SMP boot (cycle-identical) ·
-**N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %** · **Verilator NBA 4/4** (§7.14) · **ACT4 696/0**
-(§7.15). **Validation is COMPLETE; only the user's ship decision remains** (the tree still holds
-`=0`). R3.2c (§6.5, drop the class's execute-time read — where the rest of the IPC is)
-is now unblocked.
+Status: 🏁 **SHIPPED LIVE — `ATOMIC_SQ = 1`** (2026-07-28, user's ship decision at §7.16).
+R3.0 + R3.1 + R3.2a/b + the §7.11/§7.13 fixes are on the default path: without-return atomics
+(`rd == x0`) now retire into the atomic store-queue and their RMW drains at the memory system
+under coherence, instead of being a single-cycle in-cache commit fused at the ROB head. Design
+RESOLVED (§6); validation gap CLOSED (§7.1); **both `=1` bugs found and fixed** (§7.11 M-stage
+double-write, §7.13 the stale `asq_divert_q` latch killing unrelated atomics' writes). **Every
+gate passes at `=1`**: `veryl test` 252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1
+boot · N=2 SMP boot (cycle-identical) · **N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %** ·
+**Verilator NBA 4/4** (§7.14) · **ACT4 696/0** (§7.15). R3.2c (§6.5, drop the class's
+execute-time read — where the rest of the IPC is) is now unblocked.
 
 ---
 
@@ -766,8 +767,29 @@ suite cannot do better.
 
 **Validation is now complete — every gate in the plan has been run at `=1` and passes.** What is
 left is not a test but the **ship decision**, which is the user's per the campaign convention.
-The tree still holds `ATOMIC_SQ = 0`; flipping it is a one-line change at
-`heliodor_core.veryl:922`.
+
+### 7.16 🏁 R3.3 SHIPPED — `ATOMIC_SQ = 1` is the default path
+
+User's decision, 2026-07-28, on the §7.13-§7.15 evidence. `heliodor_core.veryl:922` flips to 1
+and the queue is live; the `=0` arm stays in the source as the fold-away fallback (every gate is
+still written `if ATOMIC_SQ ? … : …`, so reverting is the same one-line change).
+
+Re-verified on the flipped tree before the commit: `veryl test` **252/0** with
+`litmus(N=2) cy=0x2e6300 tohost=1 pass=1`, and **N=1 boot `cy=0x0d9be30` `x3=0xAA` pass=1**.
+That N=1 figure is one 10 000-cycle probe interval below §7.13's `0x0d9e540` — the harness
+samples `tohost` on that granularity, so the two differ by a boundary crossing (0.07 %), and
+Verilator's exact 14,267,393 sits just under both, as it should.
+
+**What is now structurally true:** a without-return atomic is no longer a ROB-head special case.
+It allocates like a store, retires without waiting for its write, and the drain acquires
+ownership and performs the RMW at the memory system — the canonical-LSQ shape for this class.
+§0(b)'s contended-atomic win is real and measured (N=4 SMP boot −4.2 %); §0(a)'s
+canonicalisation is what unblocks R3.2c.
+
+**Next: R3.2c (§6.5)** — with the drain computing the value, the class no longer needs its
+execute-time read, so it can drop out of `issue_amo_read` / RFO-at-head / `amo_watch_*` /
+`amo_poison_q` / `commit_amo_replay` entirely and become *a store with an ALU op*. That is where
+the remaining IPC is: removing the at-head read is what lifts issue-side serialisation.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 **double application by the queue itself** (the drain fires once per instruction, §7.8's PC
