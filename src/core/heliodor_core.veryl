@@ -8352,13 +8352,24 @@ pub module heliodor_core #(
     // engine forever. It re-enters RD — never "write anyway" — so the `old` behind the
     // value is always freshly read. 128 cycles is twice the dcache pin's own bound.
     var asq_dr_cnt_q  : logic<7>;
+    // R3 §7.12: BACKOFF (state 3). A poison sends the engine back to acquire, and with
+    // every hart retrying immediately and symmetrically that is a textbook livelock —
+    // litmus N=4 ping-pongs the line forever while N=2 squeaks through on the pin's
+    // 64-cy defer. Stagger the retry: wait a hart-dependent, doubling interval before
+    // re-acquiring, which desynchronises the harts and lets one of them win the line.
+    // Purely a forward-progress device — correctness never depends on it (the re-read
+    // still happens; only its timing changes).
+    var asq_dr_bo_q   : logic<8>;
+    let asq_dr_bo_seed: logic<8> = ({6'd0, HART_ID[1:0]} + 8'd1) << 3;
     let asq_dr_wtimeout: logic = ATOMIC_SQ && asq_dr_wen && asq_dr_cnt_q == 7'h7f;
     always_ff (clk, rst) {
         if_reset {
             asq_dr_st_q  = 2'd0;
             asq_dr_old_q = 64'd0;
             asq_dr_cnt_q = 7'd0;
+            asq_dr_bo_q  = 8'd0;
         } else if asq_dr_wdone {
+            asq_dr_bo_q = 8'd0; // fresh entry starts with no accumulated backoff
             // 🚨 The completed WRITE outranks a same-cycle poison. Once the exclusive
             // merge has landed, the RMW is DONE — it happened atomically under ownership,
             // and a departure signal arriving in that same cycle refers to the line
@@ -8371,8 +8382,15 @@ pub module heliodor_core #(
             asq_dr_st_q  = 2'd0;
             asq_dr_cnt_q = 7'd0;
         } else if asq_dr_poison {
-            asq_dr_st_q  = 2'd1; // re-acquire + re-read; never write a stale `old`
+            asq_dr_st_q  = 2'd3; // back off, then re-acquire; never write a stale `old`
             asq_dr_cnt_q = 7'd0;
+            asq_dr_bo_q  = if asq_dr_bo_q == 8'd0 ? asq_dr_bo_seed : (if asq_dr_bo_q[7] ? asq_dr_bo_q : asq_dr_bo_q << 1);
+        } else if asq_dr_st_q == 2'd3 {
+            if asq_dr_bo_q == 8'd0 {
+                asq_dr_st_q = 2'd1;
+            } else {
+                asq_dr_bo_q = asq_dr_bo_q - 8'd1;
+            }
         } else if asq_dr_start {
             asq_dr_st_q  = 2'd1;
             asq_dr_cnt_q = 7'd0;
@@ -8431,7 +8449,7 @@ pub module heliodor_core #(
     // enters the queue once every OLDER store is visible, and §7.2's block then keeps
     // every YOUNGER store out until it drains. Together that pins the queued RMW to its
     // program-order position without the drain having to reason about the buffer.
-    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full && sb_empty && !asq_divert_q;
+    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full && sb_empty;
     let asq_drain: logic = ATOMIC_SQ && asq_dr_wdone;
     always_ff (clk, rst) {
         if_reset {
@@ -8487,7 +8505,14 @@ pub module heliodor_core #(
     // commits for 2000 amoadds, x climbing to 3999 instead of 2000, with the drains
     // themselves perfectly atomic (2000 increments, 1000 per hart, zero duplicate `old`).
     // While an entry is queued, a class atomic at the head must never write in-cache.
-    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_alloc && !asq_divert_q) : amo_cwr_en;
+    // asq_divert_q is deliberately NOT part of this gate. It is a single latch, not
+    // per-instruction: if it is still set when an unrelated atomic reaches the head it
+    // silently kills that atomic's write. That is what wedged litmus N=4 — all four harts
+    // spinning in barrier_fn's sense loop because a barrier `amoadd.w.aqrl t1` (rd = t1,
+    // so NOT in the class, in-cache path) lost its increment. The real double-write is
+    // fixed at its source in the M-stage capture (§7.11), so the per-commit `!asq_alloc`
+    // is sufficient and safe here.
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_alloc) : amo_cwr_en;
     // R3 §7.7: the latch must close BOTH directions. The §7.6 factor of two is one
     // atomic applied twice — once in-cache and once from the queue — and the alternating
     // drw=0/drw=1 landing writes (3999 of them, every value distinct) showed it directly.

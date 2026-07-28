@@ -9,15 +9,14 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b + the §7.11 fix built, DEAD at `ATOMIC_SQ=0` (tree ships
-DEAD)** (2026-07-28). Design RESOLVED (§6); validation gap CLOSED (§7.1); **the `=1` correctness
-bug is FOUND AND FIXED** (§7.11 — a diverted atomic still latched its write into the M-stage and
-was applied twice; one-line fix at the M-stage capture). At `=1`: `veryl test` **252/0**, litmus
-N2 **pass**, dhrystone **bit-exact**, N=1 boot **pass** (+0.03 %). **Sole remaining blocker:
-litmus N=4 livelocks** (§7.12) — a forward-progress problem, not correctness: the drain's RD→WR
-window has no pin protection and the dcache deliberately will not re-arm the pin on a line it
-already pins, so four-way contention can ping-pong forever. First candidate fix: make the drain
-single-cycle when the RD hits E/M. R3.2c and R3.3 stay behind it.
+Status: **R3.0 + R3.1 + R3.2a/b + the §7.11/§7.13 fixes built, DEAD at `ATOMIC_SQ=0` (tree
+ships DEAD)** (2026-07-28). Design RESOLVED (§6); validation gap CLOSED (§7.1); **both `=1` bugs
+found and fixed** (§7.11 M-stage double-write, §7.13 the stale `asq_divert_q` latch killing
+unrelated atomics' writes). **The full functional ladder now PASSES at `=1`**: `veryl test`
+252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1 boot · N=2 SMP boot (cycle-identical) ·
+**N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %**. Remaining before the ship decision: **Verilator
+NBA and ACT4**. R3.2c (§6.5, drop the class's execute-time read — where the rest of the IPC is)
+is now unblocked.
 
 ---
 
@@ -683,8 +682,49 @@ does not.
 
 (1) is the natural first attempt and is a small change to the FSM.
 
-**Ladder status at `=1`:** `veryl test` 252/0 ✅ · litmus N2 ✅ · dhrystone bit-exact ✅ · N=1
-boot ✅ · **litmus N4 ❌ (timeout)** · N2/N4 SMP boot, Verilator, ACT4 not yet run.
+### 7.13 ✅ N=4 fixed too — a single latch was killing unrelated atomics' writes
+
+The N=4 probe showed **all four harts spinning at `barrier_fn+0x18`** (the sense-flag wait) with
+retire counters still climbing — a livelock, not a deadlock. The barrier's
+`amoadd.w.aqrl t1, t0, (s3)` has **rd = t1, so it is NOT in the class** and takes the in-cache
+path; the fact that it was affected at all named the culprit:
+
+**🚨 `asq_divert_q` is a single latch, not per-instruction.** Left set by one class atomic, it
+gates `amo_cwr_eff` for whatever atomic reaches the head next — silently killing that atomic's
+write. A lost barrier increment means no hart ever observes `t1 == 3`, so all four wait on the
+sense flag forever. Exactly the observed state.
+
+**Fix:** drop `asq_divert_q` from both `amo_cwr_eff` and `asq_alloc`; the per-commit
+`!asq_alloc` is sufficient, because §7.11 fixes the real double-write **at its source** in the
+M-stage capture. (The latch was introduced in §7.7 against a mechanism that turned out not to
+be the real one — it was never load-bearing, only harmful.)
+
+**Also added (forward progress, not correctness): a staggered retry backoff.** On poison the
+engine now enters a BACKOFF state for a hart-dependent, doubling, capped interval before
+re-acquiring, which desynchronises harts that would otherwise ping-pong the line in lockstep.
+Correctness never depends on it — the re-read still happens, only its timing changes.
+
+**Ladder status at `=1`:**
+
+| check | `=0` | `=1` | delta |
+|---|---|---|---|
+| `veryl test` | 252/0 | **252/0** ✅ | — |
+| litmus N2 | `0x2e3bf0` | **`0x2e6300` pass** ✅ | +0.09 % |
+| litmus N4 | `0x398690` | **`0x39ada0` pass** ✅ | +0.24 % |
+| dhrystone | 252939 cy / 264834 instret | **bit-exact** ✅ | 0 |
+| N=1 boot | `0x0d99720` | **`0x0d9e540` pass** ✅ | +0.03 % |
+| N=2 SMP boot | `0x125bb50` (19.25 M) | **`0x125bb50` pass** ✅ | **identical** |
+| N=4 SMP boot | 30.55 M | **`0x1bec700` (29.28 M) pass** ✅ | **−4.2 %** |
+| Verilator NBA, ACT4 | — | not yet run | — |
+
+**The entire functional ladder passes with the queue live**, at essentially neutral cost — and
+the N=4 SMP boot is actually **4.2 % faster**, which is §0(b)'s contended-atomic win showing up
+where four harts fight over kernel locks. (The N=4 runs took ~1 h wall-clock on this shared box;
+that is host load, not a livelock — both completed and passed.)
+
+**Remaining before a ship decision:** Verilator NBA (the SV-semantics cross-check that has
+caught bugs the Veryl sim masked — including an SMP LR/SC livelock) and ACT4. Per the campaign
+convention the flip itself is the user's call; the tree ships `=0` until then.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 **double application by the queue itself** (the drain fires once per instruction, §7.8's PC
