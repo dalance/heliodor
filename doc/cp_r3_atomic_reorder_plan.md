@@ -10,15 +10,16 @@ says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L
 complete) as the next block; F+S+L1+L2 are done.
 
 Status: **R3.0 + R3.1 + R3.2a/b + §7.2/7.5/7.7 hardening built, DEAD at `ATOMIC_SQ=0` (tree
-ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); the
-compute-at-drain RMW is **proven atomic under contention** (§7.4) and the drain fires **once per
-instruction** (§7.8 PC attribution). But test 7's check load really does read **3999 instead of
-2000** (§7.9), so §7.8's exoneration was premature: its filter only counted writes attributable
-to an *atomic commit*, and the ~2000 rising-value writes that actually double `x` are **not**
-atomic-commit writes. Open question, now small and precise: **what drives those non-atomic
-writes onto `x` through the main dcache port at `=1`?** Prime suspect is a **mux-arm overlap
-from R3.2b's seven new outermost port arms**, not queue logic. Next probe prints the driving arm
-for every landing write (§7.9) — one run, decisive. R3.2c and R3.3 stay behind it.
+ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); compute-at-drain
+**proven atomic under contention** (§7.4) and the drain fires **once per instruction** (§7.8).
+The flip's failure is now **localised to a named mux arm**: of 7521 landing writes on `x` at
+`=1`, 3000 are legitimate drains and 1000 legitimate in-cache commits, while **3521 are issued
+off the registered M-stage (`m_wen_q`) with `m_wen_excl_q` set** (§7.10) — neither a drain nor
+an atomic commit. Prime cause: **R3.2b's outermost port arms perturb `dmem_pa_m`/`wdata`/`wexcl`
+on drain RD cycles**, so an in-flight M-stage store lands against the wrong address/data pairing.
+Next: attribute those 3521 to instructions (the §7.8 PC technique), then make the drain's port
+arms mutually exclusive with a pending M-stage access **in both directions**. R3.2c and R3.3
+stay behind it.
 
 ---
 
@@ -580,6 +581,41 @@ has dropped (e.g. `m_wen_q` still set, with `dmem_pa_m`/`dmem_wdata_m` still mux
 address/data) — i.e. a mux-arm overlap introduced by R3.2b's seven new outermost arms, not a
 queue-logic bug at all. Check the R3.2b arms for exactly this: they were added assuming
 `asq_dr_go_*` is the *only* way the drain's address/data reach the port.
+
+### 7.10 ✅ The culprit arm is named: `m_wen_q` + `m_wen_excl_q`
+
+Printed, for every landing write on the `x` line, which port-mux arm drove it. **7521 landing
+writes at `=1`, and they partition cleanly into three populations:**
+
+| driving arm | count | what it is |
+|---|---|---|
+| **`m_wen_q = 1`, `dmem_wexcl_m = 1`, everything else 0** | **3521** | ← **the unexplained population** |
+| `asq_dr_go_w = 1` | 3000 | the queue drains — legitimate |
+| `amo_commit_live = 1, amo_cwr_eff = 1` | 1000 | in-cache atomic commits (the SCs) — legitimate |
+
+So the doubling comes from **3521 writes issued off the registered M-stage
+(`m_wen_q`) with the exclusive-merge flag set (`m_wen_excl_q`)** — neither a drain nor an
+atomic commit. With `asq_dr_go_w = 0` the port muxes fall through to `dmem_pa_m = m_pa_q`,
+`dmem_wdata_m = m_wdata_q`, `dmem_wexcl_m = m_wen_excl_q`, so this population is the M-stage
+replaying an exclusive write onto `x`.
+
+**Why this is very likely R3.2b's fault rather than a pre-existing bug:** `asq_dr_port_ok`
+includes `!m_wen_q` exactly so the drain never steals a cycle from a pending M-stage write —
+but the drain's *outermost* mux arms (R3.2b) override `dmem_pa_m`/`wdata`/`wstrb`/`wexcl`
+whenever `asq_dr_go_r || asq_dr_go_w`, and the **read** arm (`asq_dr_go_r`) is *not* covered by
+the write-side reasoning. A drain RD cycle repoints `dmem_pa_m` at the queue's line while an
+M-stage store is mid-flight; that store then lands later against a different address/data
+pairing than it was issued with. That is exactly the "the drain's address/data reach the port
+only via `asq_dr_go_*`" assumption R3.2b was built on, and it does not hold in the other
+direction: **the M-stage's address/data must not be perturbed by the drain's arms either.**
+
+**Next step (small, and now well-aimed):** attribute those 3521 writes to instructions with the
+same PC technique that worked in §7.8 (print `c_pc`/ROB index alongside `m_wen_q` writes, or
+carry the issuing PC into the M-stage registers temporarily). Then fix by making the drain's
+port arms *mutually exclusive with a pending M-stage write in both directions* — either extend
+`asq_dr_port_ok` to gate `asq_dr_go_r` on `!m_wen_q` as well (it already does — verify it is
+actually holding), or stop overriding `dmem_pa_m` on RD cycles and give the drain a dedicated
+read address port.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 **double application by the queue itself** (the drain fires once per instruction, §7.8's PC
