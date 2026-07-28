@@ -17,8 +17,9 @@ RESOLVED (§6); validation gap CLOSED (§7.1); **both `=1` bugs found and fixed*
 double-write, §7.13 the stale `asq_divert_q` latch killing unrelated atomics' writes). **Every
 gate passes at `=1`**: `veryl test` 252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1
 boot · N=2 SMP boot (cycle-identical) · **N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %** ·
-**Verilator NBA 4/4** (§7.14) · **ACT4 696/0** (§7.15). R3.2c (§6.5, drop the class's
-execute-time read — where the rest of the IPC is) is now unblocked.
+**Verilator NBA 4/4** (§7.14) · **ACT4 696/0** (§7.15).
+**R3.2c (§6.5) is BUILT and DEAD at `ASQ_NOREAD = 0`** — three real bugs fixed, the bare-mode
+ladder passes at `=1`, but the Sv39 N=1 boot panics; the flip is parked (§7.17).
 
 ---
 
@@ -276,9 +277,11 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
     **Verified (=0):** 252/0 · litmus N2 `cy=0x282170` · dhrystone 252939 cy / instret 264834 ·
     N=1 boot `cy=0x0d99720` · N=2 SMP boot `cy=0x125bb50` — all cycle-identical to R3.2a · the
     two R3.2a `unused` warnings are gone (the outputs now have consumers).
-  - **R3.2c — §6.5.** Drop the class's execute-time read (`issue_amo_read`, the watch, the
-    poison, the replay). This is what actually lifts issue-side head serialisation and is where
-    §0(b)'s IPC lives. **Deferred behind §7** — see the first-flip findings.
+  - **R3.2c — §6.5. 🔨 BUILT, DEAD at `ASQ_NOREAD = 0` — see §7.17.** Drops the class's
+    execute-time read (`issue_amo_read`, the RFO, the fetch handshake, the watch, the poison, the
+    replay, and the ROB load record). Three real bugs found and fixed building it; at `=1` the
+    whole bare-mode ladder passes and is slightly faster (litmus N2 −0.09 %, N4 −0.24 %,
+    dhrystone bit-exact), but the **Sv39 N=1 Linux boot panics** and the flip is parked at 0.
 
 ---
 
@@ -790,6 +793,105 @@ canonicalisation is what unblocks R3.2c.
 execute-time read, so it can drop out of `issue_amo_read` / RFO-at-head / `amo_watch_*` /
 `amo_poison_q` / `commit_amo_replay` entirely and become *a store with an ALU op*. That is where
 the remaining IPC is: removing the at-head read is what lifts issue-side serialisation.
+
+### 7.17 R3.2c built + probed — three real bugs fixed, one blocker left (the RFO itself)
+
+**Status: BUILT, DEAD at `ASQ_NOREAD = 0`, NOT flipped.** New const `ASQ_NOREAD`
+(`heliodor_core.veryl`, next to `ATOMIC_SQ`) gates the whole increment; at 0 the SV diff is the
+existing expressions verbatim + const-gated additions (plus Veryl's column realignment), and the
+DEAD ladder passes: `veryl test` **252/0**, litmus N2 **`cy=0x2e6300` cycle-exact**, N=1 boot
+**`cy=0x0d9be30`**.
+
+**What R3.2c does at `=1`.** `asq_nr_iss` is the ISSUE-side class predicate — the decode half of
+`asq_class` (`rd_arch == 0`, a real RMW funct5, not amocas.q), deliberately **PA-independent**
+because the read/no-read decision must be made in the cycle the MMU produces the PA.
+`issue_amo_read` splits into `issue_amo_xlat` ("an atomic translates + fault-checks", every
+atomic, unchanged) and the narrower `issue_amo_read` ("…and needs the data read"). The class then
+drops out of `dc_amo_read`/`dmem_amord_m`, `amo_fetch_hold`, `amo_watch_*`/`amo_poison_q`/
+`commit_amo_replay`, and the M-stage dcache access (`m_ren_q`).
+
+**Three bugs found and fixed on the way (all real, all keepers):**
+
+1. **The cacheability half of `asq_class` cannot be decided at issue.** Resolved with existing
+   machinery instead of new fallback logic: a no-read atomic that translates to an uncacheable PA
+   **arms the AMO watch already poisoned**, so the existing `commit_amo_replay` re-fetches it, and
+   a sticky `amo_fread_q` makes the re-executed one take today's read path. Exactly one replay, no
+   new commit-side state, no new redirect arm. (Never fires in any current test — `freadcnt=0`
+   over the whole N=1 boot — so every atomic in DRAM stays on the fast path.)
+2. **🚨 The class atomic must not present itself to the ROB as a LOAD.** `alu_wrap` gained
+   `i_amo_noread`, which clears `o_cdb.is_load`. Without it the P9.0 remote-invalidate scan
+   (`rob.veryl:1031`) poisons the atomic's ROB **load record** the moment the other hart's RFO
+   invalidates the line → `commit_load_replay` blocks retire, but `commit_store_fire` (hence
+   `asq_alloc`) is *not* gated by it, so the same atomic **re-allocates forever**: litmus N=2
+   deadlocked with both harts at `t7_amo`, `asq_alloc` firing while `rob_commit_ack` never did.
+   Until R3.2c the AMO watch masked this — it poisons on the same events and *does* suppress
+   `commit_store_fire`. There is nothing to re-read for this class, so the record is simply wrong.
+3. **The drain's read had no fetch/access handshake.** The dcache data array is a synchronous read
+   (`DCACHE_SYNC_READ=1`: the PA must be presented one cycle before its data, and `miss` is itself
+   registered) — which is exactly why the execute-side AMO read has `amo_fetched_q`/
+   `amo_fetch_hold`. The drain captured on its first driving cycle; until R3.2c the execute read
+   had already walked the line through that pipeline, so it never showed. `asq_dr_rfetch_q` adds
+   the missing cycle. Also added: the same 2-cycle handshake for the class's translate-only access
+   (`asq_nr_acc` / `asq_nr_fetched_q`), and the positive invariant `amo_cwr_eff && !ac_noread_q`
+   so an atomic that performed no read can *never* reach the in-cache write path.
+
+**Ladder at `=1`: everything passes except the N=1 Linux boot.**
+
+| check | `ASQ_NOREAD=0` | `=1` | note |
+|---|---|---|---|
+| `veryl test` (incl. arch + litmus N2) | 252/0 | **252/0** ✅ | litmus N2 `0x2e3bf0` vs `0x2e6300` = **−0.09 %** |
+| litmus N=4 | `0x39ada0` | **`0x398690` pass** ✅ | **−0.24 %** |
+| dhrystone | 252939 cy / 264834 instret | **bit-exact** ✅ | — |
+| **N=1 Linux boot** | `0x0d9be30` pass | **wedges at the 45 M cap** ❌ | kernel panic — see below |
+
+**The failure is a kernel panic, not a hang.** Console: `Unable to handle kernel NULL pointer
+dereference at virtual address 0x100`, `cause 0xd` (load page fault), PID 1, then
+`Attempted to kill init! exitcode=0xb` → `panic()`'s blink loop (`state ^= 1`,
+`i_next = i + 200`, `mdelay(100)`), which is what the 45 M cycles of `__delay` spinning at
+`0x800b9be2..bf2` actually were. The faulting code loads `page->flags`, takes its **top two bits**
+as a zone/node index and indexes a table — and those bits read **2 instead of 0**, so the table
+entry is NULL. `page->flags` is exactly what `set_bit`/`clear_bit` (`amoor.d`/`amoand.d` with
+`rd == x0`) touch: the R3.2c class.
+
+**Bisected to the execute-time READ itself.** With the class's dcache access restored and
+everything else of R3.2c live (no watch, no ROB load record), the boot passes **cycle-identical to
+baseline** (`0x0d9be30`) — so fixes 1-3 are inert on this path and the culprit is inside the read
+removal. Bisecting further *inside* that: restoring the M-stage plain read (RFO still gone) still
+fails; restoring the 2-cycle translate handshake still fails; restoring the
+`load_blocks_on_store` terms (`sb_ld_ovl`, `commit_store_fire`, `.rl && !sb_empty`) still fails.
+**What is left is the ownership (RFO) read itself.**
+
+**🚨 Measured and RULED OUT — do not re-litigate (every one of these was a direct measurement at
+`=1`, not an argument):**
+- **Wrong captured PA.** `ac_pa_q` compared against a commit-time re-translation on every alloc:
+  **0 mismatches** out of ~1000 checked.
+- **Port ownership at capture.** Counter on "class atomic acks while the dmem port is not carrying
+  its own address" (vu/store-drive/walk/redirect/replay/LSR): **0** over the whole boot.
+- **Drain arithmetic.** All 1163 drains re-computed offline from their own logged
+  `(old, src, op, size, byte-offset)`: **1163/1163 correct**.
+- **Stale `old` / lost writes.** Per-PA drain chaining: `old_n != new_{n-1}` in **0.9 %** of
+  repeat-PA drains at `=1` — *identical* to the `=0` rate — and **zero** cases of re-reading the
+  same `old` (the lost-update signature).
+- **Ordering vs younger accesses.** Probe for an overlapping younger load/AMO issuing while a
+  class atomic is executed-but-not-drained: **1 hit in the whole boot, and it is a page-offset
+  alias** (VA offset 0x700 vs a different page's PA offset 0x700). The window is in fact closed by
+  construction: `rob.veryl:724` blocks a younger load behind *any* in-ROB AMO ("atomic — never
+  reorder"), and from alloc onward `asq_ld_ovl` + `asq_dr_busy` take over.
+- **Lost / duplicated queue entries.** `asq_alloc` count == `asq_drain` count at every sample.
+- **The uncacheable fallback.** `freadcnt = 0` — it never fires in the boot.
+- **MMU busy timing.** `mmu.veryl:1300` `o_busy` includes `tlb_miss_start` combinationally, so
+  there is no "TLB miss not yet busy" window to latch a garbage PA through.
+
+**Where the next session should start.** The one asymmetry the bisect leaves is that at `=1` the
+class's line is first touched by the **drain's** RFO instead of the execute read's — so the drain
+is now the only owner-acquiring access, and it is *long* (a cold fill) instead of a warm hit. The
+bare-mode batteries (litmus N2/N4, the arch suite, dhrystone) all pass, and only the **Sv39** boot
+fails, which points at the interaction of that cold owning fill with the PTW / A-D write-back path
+(`ptw_dc_active`, `dmu_ad_wb`) rather than at the atomic datapath — note `asq_dr_port_ok` yields to
+`ptw_dc_active`, and the drain's arms do **not** override `dmem_unc_m` / `dmem_lnext_m` /
+`dmem_wstrbhi_m`, which are stale M-stage registers (safe at `=0` only because
+`port_ok ⇒ !m_ren_q ⇒ !m_unc_q`). Instrument the drain's fill against a concurrent walk, and
+compare the physical line the drain writes against the line the walk reads.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 **double application by the queue itself** (the drain fires once per instruction, §7.8's PC

@@ -921,6 +921,28 @@ pub module heliodor_core #(
     // it carries OPERANDS ({pa, op, src, size, aq/rl}), never a pre-computed value.
     const ATOMIC_SQ: bit = 1;
     const ASQ_N    : u32 = 1; // one in flight (allocation stays head-serialised)
+    // ── R3.2c (§6.5): drop the class's EXECUTE-TIME READ — DEAD at ASQ_NOREAD=0 ──
+    // With R3.2's drain computing the value at the memory system, a without-return
+    // atomic no longer needs to read anything at execute: nothing architectural
+    // depends on the execute-time `old`. At ASQ_NOREAD=1 the class keeps only
+    // translate + fault-check at issue (like a store) and drops out of the RFO
+    // (dc_amo_read / dmem_amord_m), the 2-cycle fetch handshake (amo_fetch_hold),
+    // the RMW watch (amo_watch_*/amo_poison_q) and its commit replay
+    // (commit_amo_replay) — which is where the issue-side serialisation lives.
+    //
+    // The one thing the execute side cannot know before it translates is whether the
+    // PA is CACHEABLE, and asq_class needs that (an uncacheable atomic keeps today's
+    // write-through path and therefore still needs a real `old`). That case is
+    // resolved with the machinery already in place instead of new fallback logic:
+    // a no-read atomic that translates to an uncacheable PA arms the AMO watch
+    // ALREADY POISONED, so the existing commit_amo_replay re-fetches it, and the
+    // sticky amo_fread_q makes the re-executed atomic take today's proven read path.
+    // Exactly one replay, no new commit-side state, no new redirect arm.
+    const ASQ_NOREAD: bit = 0;
+    // Forward-declared like sb_elig/asq_ld_ovl: u_alu (i_amo_noread) is instantiated
+    // above the issue block where this is assigned.
+    var asq_nr_iss: logic;
+    var asq_nr_acc: logic; // …and it is driving its translate-only dmem request now
     var asq_valid_q: logic     [ASQ_N];
     var asq_pa_q   : logic<64> [ASQ_N]; // write address (= ac_pa_q, the read-time PA)
     var asq_src_q  : logic<64> [ASQ_N]; // rs2 operand (NOT a pre-computed `new`)
@@ -2941,6 +2963,13 @@ pub module heliodor_core #(
     var ac_pa_q    : logic<64>; // atomic commit-write PA (= dmu_dmem_addr at read)
     var ac_wok_q   : logic    ; // atomic R+W PMP + translation OK (= !acc_fault && !fault)
     var ac_wexcl_q : logic    ; // atomic line is cacheable (in-cache merge, not MMIO/tohost)
+    var ac_noread_q: logic    ; // R3.2c: this atomic performed NO execute-time read
+    // R3.2c: sticky "the atomic at the head must take today's READ path". Set when a
+    // no-read class atomic discovers at its translate cycle that its PA is
+    // uncacheable (so the queue cannot perform its RMW); it is then replayed through
+    // the existing AMO-poison redirect and the re-executed atomic reads normally.
+    // Cleared when an atomic retires. Const-gated → constant 0 at ASQ_NOREAD=0.
+    var amo_fread_q: logic    ;
     // Phase 8 S3: CDB lane 1 = pipe-1 (2nd integer ALU/branch). Independent of
     // the lane-0 FPU/ALU interlock; pipe-1 never executes FP.
     var alu_cdb2: CdbBus;
@@ -3710,6 +3739,7 @@ pub module heliodor_core #(
         i_rsv_valid       : rsv_valid_q                                         ,
         i_rsv_addr        : rsv_addr_q                                          ,
         i_is_amo          : iq_iss_is_amo                                       ,
+        i_amo_noread      : asq_nr_iss                                          , // R3.2c: no execute read ⇒ not a load
         i_amo_funct5      : iq_iss_amo_funct5                                   ,
         i_rd_cmp_data     : prf_rd_cmp_data                                     , // Zacas: amocas compare value
         i_is_csr          : iq_iss_is_csr                                       ,
@@ -3925,6 +3955,7 @@ pub module heliodor_core #(
         i_rsv_valid       : 1'b0            ,
         i_rsv_addr        : 64'd0           ,
         i_is_amo          : 1'b0            , // pipe-1: no AMO
+        i_amo_noread      : 1'b0            , // pipe-1: no AMO
         i_amo_funct5      : 5'd0            ,
         i_rd_cmp_data     : 64'd0           , // pipe-1: no AMO/CAS
         i_is_csr          : 1'b0            ,
@@ -6010,8 +6041,24 @@ pub module heliodor_core #(
             default: agu_addr_iss = agu_raw_iss;
         }
     }
-    let issue_amo_read: logic     = iq_issue_valid && iq_iss_is_amo && !amo_is_sc_iss;
-    let issue_is_load : logic     = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_read;
+    // R3.2c (§6.5): the ISSUE-side without-return class. It is the decode half of
+    // asq_class (`c_rd_arch == 0`, a real RMW funct5, not amocas.q) — deliberately
+    // PA-INDEPENDENT, because the read/no-read decision has to be made in the same
+    // cycle the MMU produces the PA. The cacheability half of asq_class is handled
+    // after the fact by the poison-replay (see amo_fread_q / the amo watch below).
+    // amo_fread_q is the replay's own escape: while it is set the atomic reads
+    // normally, so the fallback can never loop. Constant 0 at ASQ_NOREAD=0.
+    assign asq_nr_iss = ASQ_NOREAD && iq_issue_valid && iq_iss_is_amo && !iq_iss_is_cas_q
+        && iq_issue_op.base.rd_arch == 5'd0 && !amo_fread_q
+        && iq_iss_amo_funct5 != 5'b00010 && iq_iss_amo_funct5 != 5'b00011 && iq_iss_amo_funct5 != 5'b00101;
+    // An AMO/LR at issue: it TRANSLATES (drives the dmem MMU for its PA + fault check)
+    // — every atomic still does this, the class included, so fault precision and the
+    // ac_*_q capture are untouched by R3.2c. issue_amo_read is the narrower "…and
+    // needs the data READ" (the RFO, the fetch/access handshake, the RMW watch): at
+    // ASQ_NOREAD=0 the two are identical and every gate below folds to today's.
+    let issue_amo_xlat: logic     = iq_issue_valid && iq_iss_is_amo && !amo_is_sc_iss;
+    let issue_amo_read: logic     = issue_amo_xlat && !asq_nr_iss;
+    let issue_is_load : logic     = (iq_issue_valid && iq_issue_op.base.is_load) || issue_amo_xlat;
     // A misaligned atomic must ACCESS-fault (cause 5 LR / 7 AMO) regardless of
     // the page mapping — Sail checks alignment before translation, so an unmapped
     // VA never page-faults. heliodor still walks (via the AMO read), so when that
@@ -6515,7 +6562,22 @@ pub module heliodor_core #(
     // clean at commit, ownership was held continuously ⇒ the RMW is atomic.
     // ============================================================
     let issue_is_realamo: logic = issue_is_amo && !issue_is_lr && !issue_is_sc;
-    let amo_exec_capture: logic = issue_is_realamo && iq_issue_ack;
+    // "The atomic's line is cacheable, so its RMW may be an owned-line merge" —
+    // computed on the LIVE translated PA (the same expression ac_wexcl_q registers
+    // below; hoisted here so R3.2c can also read it at the capture cycle).
+    let iss_wexcl       : logic = (dmu_dmem_addr[63:25] == 39'h40) && !dmu_pbmt_unc
+        && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008));
+    // R3.2c: a no-read class atomic that translated to an UNCACHEABLE PA cannot be
+    // performed by the queue (asq_class requires ac_wexcl_q) and has no `old` of its
+    // own — the one case the PA-independent issue-side class predicate cannot decide
+    // in advance. Take the existing exit: arm the watch already poisoned so
+    // commit_amo_replay re-fetches the atomic, and set amo_fread_q so the re-executed
+    // one reads normally and lands on today's proven write-through path. Bounded at
+    // exactly one replay. Constant 0 at ASQ_NOREAD=0.
+    let asq_nr_mmio     : logic = asq_nr_iss && !iss_wexcl;
+    // R3.2c: a no-read atomic arms no watch at all (there is no read→write window to
+    // protect) — unless it is the uncacheable case above, which arms it poisoned.
+    let amo_exec_capture: logic = issue_is_realamo && iq_issue_ack && !(asq_nr_iss && iss_wexcl);
     let amo_remote_hit  : logic = amo_watch_valid_q && ((i_dcache_inv_valid && i_dcache_inv_addr[63:6] == amo_watch_pa_q[63:6])
         || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == amo_watch_pa_q[63:6]) || !dc_amo_present);
     // Poisoned watched AMO at the head -> replay (re-acquire + re-read).
@@ -6598,10 +6660,13 @@ pub module heliodor_core #(
             // (the registered presence port still checks the OLD watch
             // address this cycle): both precise-inv ports + both dcache
             // line-departure event ports, line-granular on the PA.
+            // R3.2c: … and a no-read atomic on an uncacheable PA arms POISONED, so the
+            // existing commit replay sends it back through today's read path.
             amo_poison_q = (i_dcache_inv_valid && i_dcache_inv_addr[63:6] == dmu_dmem_addr[63:6])
                 || (i_dcache_inv2_valid && i_dcache_inv2_addr[63:6] == dmu_dmem_addr[63:6])
                 || (dc_evict1_v && dc_evict1_addr[63:6] == dmu_dmem_addr[63:6])
-                || (dc_evict2_v && dc_evict2_addr[63:6] == dmu_dmem_addr[63:6]);
+                || (dc_evict2_v && dc_evict2_addr[63:6] == dmu_dmem_addr[63:6])
+                || asq_nr_mmio;
         } else if amo_watch_retire {
             amo_watch_valid_q = 1'b0;
             amo_poison_q      = 1'b0;
@@ -6618,14 +6683,30 @@ pub module heliodor_core #(
     // && not a tohost page (mirrors c_store_mmio / st_pa_tohost on the read PA).
     always_ff (clk, rst) {
         if_reset {
-            ac_pa_q    = 64'd0;
-            ac_wok_q   = 1'b0;
-            ac_wexcl_q = 1'b0;
+            ac_pa_q     = 64'd0;
+            ac_wok_q    = 1'b0;
+            ac_wexcl_q  = 1'b0;
+            ac_noread_q = 1'b0;
         } else if issue_is_amo && !issue_is_lr && iq_issue_ack {
-            ac_pa_q    = dmu_dmem_addr;
-            ac_wok_q   = !dmem_mmu_acc_fault && !dmem_mmu_fault;
-            ac_wexcl_q = (dmu_dmem_addr[63:25] == 39'h40) && !dmu_pbmt_unc
-                && !((dmu_dmem_addr[31:14] == 18'h20000) || (dmu_dmem_addr[31:12] == 20'h80008));
+            ac_pa_q     = dmu_dmem_addr;
+            ac_wok_q    = !dmem_mmu_acc_fault && !dmem_mmu_fault;
+            ac_wexcl_q  = iss_wexcl;
+            ac_noread_q = asq_nr_iss;
+        }
+    }
+    // R3.2c: the no-read fallback's sticky bit. Set at the translate cycle of a
+    // class atomic whose PA turned out uncacheable (that atomic is being poisoned +
+    // replayed by the arms above); cleared when an atomic retires, which is the
+    // replayed one landing through today's path. It only ever costs a slower path,
+    // so a stale set bit (e.g. the replayed atomic squashed by an interrupt first)
+    // is harmless. Constant 0 at ASQ_NOREAD=0.
+    always_ff (clk, rst) {
+        if_reset {
+            amo_fread_q = 1'b0;
+        } else if asq_nr_mmio && issue_is_realamo && iq_issue_ack {
+            amo_fread_q = 1'b1;
+        } else if rob_commit_ack && c_is_amo {
+            amo_fread_q = 1'b0;
         }
     }
 
@@ -7073,7 +7154,9 @@ pub module heliodor_core #(
         // preempts an in-flight access). Bounded by the drain, which is a few cycles
         // once it owns the line.
         || ((issue_is_load || issue_amo_read) && asq_dr_busy)
-        || (issue_is_load && !issue_amo_read && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
+        // R3.2c: the page-edge hold is a plain-LOAD forward-layer restriction, so it
+        // keys off "is an atomic at all" (issue_amo_xlat), not "does it read".
+        || (issue_is_load && !issue_amo_xlat && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
         || (issue_is_load && sb_cnt >= 4'd3)
         || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])))
         // P9.3: an AMO/LR read must NOT issue while a younger load's PTW walk
@@ -7084,7 +7167,11 @@ pub module heliodor_core #(
         // instantly and exposed this: the AMO armed its watch on a stale S
         // line, then its commit write wedged (needs E/M) with no poison
         // (the line is present). Hold the read until the walk drains.
-        || (issue_amo_read && mmu_walk_inflight)
+        // R3.2c: this one must hold for EVERY atomic (issue_amo_xlat), read or not.
+        // While a younger load's walk owns the port, core_dmem_vaddr is pinned to the
+        // WALK's VA — a class atomic acking then would latch the walk's address into
+        // ac_pa_q and the queue would RMW the wrong line.
+        || (issue_amo_xlat && mmu_walk_inflight)
         // Zacas amocas.q: its read returns TWO dwords (lo via i_load_data, hi via
         // i_load_data_next). The AMO read does not forward and the store-overlap
         // gate (sb_ld_ovl) only covers the primary (lo) dword, so a buffered older
@@ -7160,7 +7247,28 @@ pub module heliodor_core #(
     // (dc_amo_read) AND its translate is done (!dmem_mmu_busy)" — only then does the
     // dcache read the latched AMO PA and dcache_rdata carry the AMO value. Anything
     // else (the fetch cycle, a stolen port, an unfinished translate) is held.
-    assign amo_fetch_hold = MEM_PIPE && issue_amo_read && !(amo_fetched_q && dc_amo_read && !dmem_mmu_busy);
+    // R3.2c: the class atomic drives the dmem port for TRANSLATION ONLY — same port
+    // arbitration as dc_amo_read, minus the data read. Its dcache access is suppressed
+    // (m_ren_q), so the port carries only the MMU request.
+    assign asq_nr_acc = asq_nr_iss && !mmu_walk_inflight && !redirect_fire && !load_blocks_on_store;
+    // …and it keeps the SAME 2-cycle fetch/access handshake the read path has. Acking
+    // on the first driving cycle is not safe just because !dmem_mmu_busy holds: the
+    // whole MEM_PIPE M-stage (m_pa_q and friends) is latched from that cycle and the
+    // rest of the machine is built around an atomic occupying the port for its fetch
+    // AND access cycle. Dropping the handshake is what broke the N=1 VM boot (a
+    // corrupted page->flags → init SIGSEGV → panic) while every bare-mode test passed.
+    var asq_nr_fetched_q: logic;
+    always_ff (clk, rst) {
+        if_reset {
+            asq_nr_fetched_q = 1'b0;
+        } else if redirect_fire || (asq_nr_iss && iq_issue_ack) || !asq_nr_acc {
+            asq_nr_fetched_q = 1'b0;
+        } else {
+            asq_nr_fetched_q = !dmem_mmu_busy;
+        }
+    }
+    assign amo_fetch_hold = MEM_PIPE && ((issue_amo_read && !(amo_fetched_q && dc_amo_read && !dmem_mmu_busy))
+        || (asq_nr_iss && !(asq_nr_fetched_q && asq_nr_acc && !dmem_mmu_busy)));
 
     // ============================================================
     // M9.A.294 (F2): load-fault attribution fix.
@@ -8324,7 +8432,27 @@ pub module heliodor_core #(
     let asq_dr_wen   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd2;
     let asq_dr_go_r  : logic = asq_dr_ren && asq_dr_port_ok; // drives the port this cycle
     let asq_dr_go_w  : logic = asq_dr_wen && asq_dr_port_ok;
-    let asq_dr_rdone : logic = asq_dr_go_r && !dcache_stall;
+    // R3.2c: the drain's read needs the same FETCH/ACCESS handshake the execute-side
+    // AMO read has (amo_fetched_q / amo_fetch_hold). The dcache data array is a
+    // SYNCHRONOUS read (dcache.veryl DCACHE_SYNC_READ=1): the PA must be presented one
+    // cycle before its data is on dcache_rdata, and the hit/miss the stall is built
+    // from is itself registered (miss = miss_q). Capturing on the FIRST driving cycle
+    // therefore latches whatever the previous access left behind. Until R3.2c the
+    // execute-side AMO read had already walked this line through that pipeline and
+    // left it owned, so the drain's read was always a warm re-presentation and the
+    // missing handshake never showed; with the execute read gone the drain is the
+    // first — and only — access to the line, and a stale `old` goes straight into the
+    // RMW. asq_dr_rfetch_q is that fetch cycle. Const-gated: at ASQ_NOREAD=0 the drain
+    // keeps its proven single-cycle capture, so the =0 arm stays byte-identical.
+    var asq_dr_rfetch_q: logic;
+    let asq_dr_rdone : logic = asq_dr_go_r && !dcache_stall && (!ASQ_NOREAD || asq_dr_rfetch_q);
+    always_ff (clk, rst) {
+        if_reset {
+            asq_dr_rfetch_q = 1'b0;
+        } else {
+            asq_dr_rfetch_q = asq_dr_go_r && !dcache_stall;
+        }
+    }
     let asq_dr_wdone : logic = asq_dr_go_w && !dcache_stall;
     let asq_dr_poison: logic = ATOMIC_SQ && (
         // WR: the line must still be OWNED here. A remote RFO recall can take it away
@@ -8503,7 +8631,14 @@ pub module heliodor_core #(
     // so NOT in the class, in-cache path) lost its increment. The real double-write is
     // fixed at its source in the M-stage capture (§7.11), so the per-commit `!asq_alloc`
     // is sufficient and safe here.
-    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_alloc) : amo_cwr_en;
+    // R3.2c adds the matching POSITIVE invariant: an atomic that performed no execute
+    // read has no `old` and therefore no valid pre-computed `new` — it must NEVER take
+    // the in-cache write path, whatever the reason its allocation did not fire. With
+    // that term, "no read" and "the queue performs it" are inseparable, so no path can
+    // leak a garbage RMW into the line. (Reachability: alloc's other conditions —
+    // !asq_full / sb_empty — already block rob_commit_ack and store_drive, so today
+    // this is redundant; it is here so it stays redundant.) Constant 1 at ASQ_NOREAD=0.
+    let amo_cwr_eff: logic = if ATOMIC_SQ ? (amo_cwr_en && !asq_alloc && !(ASQ_NOREAD && ac_noread_q)) : amo_cwr_en;
     // ── R3.2b: the drain engine's port arms ───────────────────────────────────
     // asq_dr_go_r/_w are already qualified by asq_dr_port_ok (nobody else owns the
     // port this cycle), so these outermost arms are mutually exclusive with every
@@ -8949,7 +9084,12 @@ pub module heliodor_core #(
             m_cbom_pmp_r_q = cbo_m_pmp_deny_r;
             m_cbom_pmp_w_q = cbo_m_pmp_deny_w;
             m_fault_q    = dmem_mmu_fault_s || dmem_mmu_acc_fault_s;
-            m_ren_q      = dmu_dmem_ren && !lsr_capture;
+            // R3.2c: a class atomic still drives core_dmem_ren so the MMU translates and
+            // fault-checks it, but it must not turn into a dcache ACCESS — the M-stage
+            // would otherwise do a plain (shared) read/fill of the line the drain is
+            // about to RFO. Gated on the ack cycle so a PTW/other owner of dmu_dmem_ren
+            // is never suppressed. Constant 0 at ASQ_NOREAD=0.
+            m_ren_q      = dmu_dmem_ren && !lsr_capture && !asq_nr_acc;
             m_unc_q      = dc_uncached && !lsr_capture;
             m_lnext_q    = dc_load_next && !dc_uncached && !lsr_capture;
             // R3 §7.11: an atomic whose LIVE in-cache write was suppressed because it
@@ -9569,4 +9709,5 @@ pub module heliodor_core #(
     assign o_dbg_dtlb_hit   = dmem_dtlb_hit;
     assign o_dbg_dtlb_ppn   = dmem_dtlb_ppn;
     assign o_dbg_dtlb_perm  = dmem_dtlb_perm;
+
 }
