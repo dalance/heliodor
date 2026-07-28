@@ -11,13 +11,14 @@ complete) as the next block; F+S+L1+L2 are done.
 
 Status: **R3.0 + R3.1 + R3.2a/b + §7.2/7.5/7.7 hardening built, DEAD at `ATOMIC_SQ=0` (tree
 ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); the
-compute-at-drain RMW is **proven atomic under contention** (§7.4) and, by PC/ROB attribution,
-**the queue applies test 7's `amoadd` exactly once per instruction — the queue is exonerated**
-(§7.8). The earlier "clean 2×" was an artifact of my own trace segmentation and is retracted.
-The flip still fails, so the fault is in **what test 7's check observes**, not in applying the
-atomics. Next measurement: print the value loaded by test 7's `lw t0, 0(s4)` at `=0` and `=1`
-(§7.8) — it splits cleanly into "stale load / barrier-fence does not cover the ASQ" vs
-"not a memory-system problem at all". R3.2c and R3.3 stay behind it.
+compute-at-drain RMW is **proven atomic under contention** (§7.4) and the drain fires **once per
+instruction** (§7.8 PC attribution). But test 7's check load really does read **3999 instead of
+2000** (§7.9), so §7.8's exoneration was premature: its filter only counted writes attributable
+to an *atomic commit*, and the ~2000 rising-value writes that actually double `x` are **not**
+atomic-commit writes. Open question, now small and precise: **what drives those non-atomic
+writes onto `x` through the main dcache port at `=1`?** Prime suspect is a **mux-arm overlap
+from R3.2b's seven new outermost port arms**, not queue logic. Next probe prints the driving arm
+for every landing write (§7.9) — one run, decisive. R3.2c and R3.3 stay behind it.
 
 ---
 
@@ -549,8 +550,40 @@ outcomes, both actionable:
 - **loaded value = 2000** → the failure is in the compare/record path, not the memory system at
   all, and the whole R3 line of investigation is clear.
 
+### 7.9 The check really does load 3999 — and that un-does §7.8's exoneration
+
+Printed the value committed by test 7's check load (`lw t0, 0(s4)`, PC `0x800005e0`) on both
+builds:
+
+| | loaded value |
+|---|---|
+| `ATOMIC_SQ=0` | **`0x7d0` = 2000 — correct** |
+| `ATOMIC_SQ=1` | **`0xf9f` = 3999** |
+
+So `x` genuinely holds 3999 at the check; the doubling in §7.6/§7.7 was real after all, and it
+is **§7.8's exoneration that was premature** — not the other way round. The reason §7.8 looked
+clean: its in-cache filter was `amo_commit_live && amo_cwr_eff`, which only catches writes
+attributable to an *atomic commit*. §7.7's `drw=0` writes (1999 of them, carrying the rising
+values) are **not** atomic-commit writes, so §7.8 never counted them and the PC attribution
+covered only three of the four write populations.
+
+**So the open question is precise and small: what drives the ~2000 non-atomic, rising-value
+writes onto `x` via the main dcache port at `=1`?** They land, they carry `old+1`, and they
+interleave one-for-one with the drains.
+
+**Next probe (one run, decisive):** on every landing write to the `x` line
+(`dmem_wen_m && !dcache_stall`), print the **mux arm that drove it** — `asq_dr_go_w`,
+`amo_commit_live`, `amo_cwr_eff`, `m_wen_q`, `ptw_dc_active` — plus `dmem_wdata_m`. Exactly one
+of those is high for each phantom write and it names the culprit arm. The leading suspect is the
+drain's own write being presented a second time through a *different* arm after `asq_dr_go_w`
+has dropped (e.g. `m_wen_q` still set, with `dmem_pa_m`/`dmem_wdata_m` still muxed to the drain's
+address/data) — i.e. a mux-arm overlap introduced by R3.2b's seven new outermost arms, not a
+queue-logic bug at all. Check the R3.2b arms for exactly this: they were added assuming
+`asq_dr_go_*` is the *only* way the drain's address/data reach the port.
+
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
-**double application of any atomic**; **the queue mis-applying test 7's amoadd**;
+**double application by the queue itself** (the drain fires once per instruction, §7.8's PC
+attribution is still valid *for the writes it counted*);
 `asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
 after alloc" theory — a guard for it was added (`!(asq_class && !asq_empty)` in `amo_cwr_eff`,
 kept, it is correct in its own right) and changed **nothing**: the counts stayed 4000/3000/1000
