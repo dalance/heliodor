@@ -14,8 +14,9 @@ ships DEAD)** (2026-07-28). Design RESOLVED (§6); validation gap CLOSED (§7.1)
 found and fixed** (§7.11 M-stage double-write, §7.13 the stale `asq_divert_q` latch killing
 unrelated atomics' writes). **The full functional ladder now PASSES at `=1`**: `veryl test`
 252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1 boot · N=2 SMP boot (cycle-identical) ·
-**N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %**. Remaining before the ship decision: **Verilator
-NBA and ACT4**. R3.2c (§6.5, drop the class's execute-time read — where the rest of the IPC is)
+**N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %** · **Verilator NBA 4/4** (§7.14) · **ACT4 696/0**
+(§7.15). **Validation is COMPLETE; only the user's ship decision remains** (the tree still holds
+`=0`). R3.2c (§6.5, drop the class's execute-time read — where the rest of the IPC is)
 is now unblocked.
 
 ---
@@ -715,7 +716,8 @@ Correctness never depends on it — the re-read still happens, only its timing c
 | N=1 boot | `0x0d99720` | **`0x0d9e540` pass** ✅ | +0.03 % |
 | N=2 SMP boot | `0x125bb50` (19.25 M) | **`0x125bb50` pass** ✅ | **identical** |
 | N=4 SMP boot | 30.55 M | **`0x1bec700` (29.28 M) pass** ✅ | **−4.2 %** |
-| Verilator NBA, ACT4 | — | not yet run | — |
+| Verilator NBA (§7.14) | — | **4/4 pass** ✅ | — |
+| ACT4 RVA23 (§7.15) | — | **696/0** ✅ | — |
 
 **The entire functional ladder passes with the queue live**, at essentially neutral cost — and
 the N=4 SMP boot is actually **4.2 % faster**, which is §0(b)'s contended-atomic win showing up
@@ -725,6 +727,47 @@ that is host load, not a livelock — both completed and passed.)
 **Remaining before a ship decision:** Verilator NBA (the SV-semantics cross-check that has
 caught bugs the Veryl sim masked — including an SMP LR/SC livelock) and ACT4. Per the campaign
 convention the flip itself is the user's call; the tree ships `=0` until then.
+
+### 7.14 ✅ Verilator NBA cross-check — 4/4 pass at `=1`
+
+The check that mattered most: standard SV non-blocking-assignment semantics, on the very
+machinery (`m_wen_q` capture, the drain FSM's RD→WR window, the `asq_*` gates) whose bugs the
+Veryl sim's multi-instance evaluation could in principle have masked — this is the flow that
+caught the SMP LR/SC `read_lock` livelock. Built from `veryl build` output with `ATOMIC_SQ = 1`
+(`heliodor_core.sv:928` `localparam bit ATOMIC_SQ = 1`), Verilator 5.050, `-O3`:
+
+| Verilator run | result | cycles | Veryl sim `=1` | wall |
+|---|---|---|---|---|
+| `tb_litmus_4hart` (P9.0 RVWMO battery, N=4) | **PASS** `tohost=1`, `fail=0` | 3,778,796 | 3,779,488 (`0x39ada0`) | 7.4 min |
+| `tb_soc_linux_boot` (N=1) | **PASS** `x3=0xAA` | 14,267,393 | 14,279,488 (`0x0d9e540`) | 2.4 min |
+| `tb_soc_smp_linux_boot_2hart` | **PASS** `x3=0xAA` | 19,245,878 | 19,250,000 (`0x125bb50`) | 7.0 min |
+| `tb_soc_smp_linux_boot_4hart` | **PASS** `x3=0xAA` | 29,277,542 | 29,279,488 (`0x1bec700`) | 59 min |
+
+Every count agrees with the Veryl sim to **< 0.1 %** (the residual is the wrappers' reset-cycle
+offset, not behaviour), so the two simulators do not merely both pass — they execute the same
+schedule. The litmus histogram shows only allowed outcomes; no forbidden slot, no trap, no
+timeout. In particular the N=4 litmus battery — the contended-atomic case where §7.13's
+livelock lived — completes in the same ~3.78 M cycles under NBA semantics, which is the direct
+evidence that the backoff/`asq_divert_q` fix is not a Veryl-sim artefact.
+
+Build/run recipe (from the project root, per CLAUDE.md; `--Mdir sim/verilator/build_r3_*`):
+`verilator --binary -j 6 --top-module <top> -f heliodor.f sim/verilator/<wrapper>.sv --timing
+-Wno-fatal -O3`.
+
+### 7.15 ✅ ACT4 RVA23 compliance — 696/0 at `=1`
+
+`veryl test --ignored --test test_act_` over the already-generated suites (framework pinned at
+`ACT_COMMIT` `0656889`): **696 passed, 0 failed** (252 ignored are the non-ACT `#[ignore]`
+tests). That covers the atomic-relevant suites the class actually touches — `Zaamo`/`Zalrsc`
+including the `ExceptionsSvZaamo`/`ExceptionsSvZalrsc` fault-precision groups, which is the
+external check on §6.4's "translation + PMP stay at execute, so a faulting atomic never
+allocates". Zero failures means there is nothing to compare against a `=0` baseline: the
+suite cannot do better.
+
+**Validation is now complete — every gate in the plan has been run at `=1` and passes.** What is
+left is not a test but the **ship decision**, which is the user's per the campaign convention.
+The tree still holds `ATOMIC_SQ = 0`; flipping it is a one-line change at
+`heliodor_core.veryl:922`.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 **double application by the queue itself** (the drain fires once per instruction, §7.8's PC
