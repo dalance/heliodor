@@ -9,17 +9,15 @@ scopes this as "large — bigger than the whole campaign so far … multi-turn, 
 says explicitly *do not start it autonomously.* User chose it 2026-07-27 (over L3 / declare-
 complete) as the next block; F+S+L1+L2 are done.
 
-Status: **R3.0 + R3.1 + R3.2a/b + §7.2/7.5/7.7 hardening built, DEAD at `ATOMIC_SQ=0` (tree
-ships DEAD)** (2026-07-27). Design RESOLVED (§6); validation gap CLOSED (§7.1); compute-at-drain
-**proven atomic under contention** (§7.4) and the drain fires **once per instruction** (§7.8).
-The flip's failure is now **localised to a named mux arm**: of 7521 landing writes on `x` at
-`=1`, 3000 are legitimate drains and 1000 legitimate in-cache commits, while **3521 are issued
-off the registered M-stage (`m_wen_q`) with `m_wen_excl_q` set** (§7.10) — neither a drain nor
-an atomic commit. Prime cause: **R3.2b's outermost port arms perturb `dmem_pa_m`/`wdata`/`wexcl`
-on drain RD cycles**, so an in-flight M-stage store lands against the wrong address/data pairing.
-Next: attribute those 3521 to instructions (the §7.8 PC technique), then make the drain's port
-arms mutually exclusive with a pending M-stage access **in both directions**. R3.2c and R3.3
-stay behind it.
+Status: **R3.0 + R3.1 + R3.2a/b + the §7.11 fix built, DEAD at `ATOMIC_SQ=0` (tree ships
+DEAD)** (2026-07-28). Design RESOLVED (§6); validation gap CLOSED (§7.1); **the `=1` correctness
+bug is FOUND AND FIXED** (§7.11 — a diverted atomic still latched its write into the M-stage and
+was applied twice; one-line fix at the M-stage capture). At `=1`: `veryl test` **252/0**, litmus
+N2 **pass**, dhrystone **bit-exact**, N=1 boot **pass** (+0.03 %). **Sole remaining blocker:
+litmus N=4 livelocks** (§7.12) — a forward-progress problem, not correctness: the drain's RD→WR
+window has no pin protection and the dcache deliberately will not re-arm the pin on a line it
+already pins, so four-way contention can ping-pong forever. First candidate fix: make the drain
+single-cycle when the RD hits E/M. R3.2c and R3.3 stay behind it.
 
 ---
 
@@ -616,6 +614,77 @@ port arms *mutually exclusive with a pending M-stage write in both directions* �
 `asq_dr_port_ok` to gate `asq_dr_go_r` on `!m_wen_q` as well (it already does — verify it is
 actually holding), or stop overriding `dmem_pa_m` on RD cycles and give the drain a dedicated
 read address port.
+
+### 7.11 ✅ ROOT CAUSE FOUND AND FIXED — the diverted write still latched into the M-stage
+
+The measurement that cracked it was the one I had skipped all along: **run the same arm
+breakdown as a control at `ATOMIC_SQ=0`.**
+
+| driving arm | `=0` (passes) | `=1` (failed) |
+|---|---|---|
+| atomic commit (`amo_commit_live && amo_cwr_eff`) | **4000** — every atomic | 1000 |
+| queue drain (`asq_dr_go_w`) | — | 3000 |
+| **M-stage (`m_wen_q`, `m_wen_excl_q`)** | **15** — just the reset stores | **3521** |
+| total | 4015 | 7521 |
+
+15 versus 3521. The ~3500 extra M-stage writes at `=1` are exactly the 3000 atomics that went
+to the queue — **each one also left a write pending in the M-stage.**
+
+**Root cause:** suppressing `amo_cwr_eff` stops the *live* in-cache write, but `dc_i_wen` is
+derived from the same `store_drive` and is latched into `m_wen_q` regardless. The diverted
+write therefore lands one cycle later through the M-stage arm, and the atomic is applied
+**twice** — once by the queue drain and once from the M-stage. This is what every earlier
+theory was circling: it really was "both paths apply once", and §7.8's PC attribution missed it
+because the second write is not attributable to an atomic *commit*.
+
+**Fix (one line, at the M-stage capture):**
+```veryl
+m_wen_q = dc_i_wen && !(ATOMIC_SQ && amo_commit_live && !amo_cwr_eff);
+```
+An atomic whose live in-cache write was suppressed because it was diverted into the queue must
+not leave an M-stage write behind either. Folds away at `ATOMIC_SQ=0`.
+
+**Result — the flip PASSES:** `litmus(N=2) cy=0x2e6300 tohost=1 pass=1`, `veryl test` **252/0**,
+dhrystone **252939 cy / instret 264834 — bit-exact with `=0`**, **N=1 Linux boot
+`cy=0x0d9e540` `x3=0xAA` pass=1** (vs `0x0d99720` at `=0`: +0.03 %, IPC-neutral).
+
+**Method note worth keeping:** ten candidate fixes failed because I kept inferring mechanism
+from aggregate counts on the *failing* build alone. The decisive step was a **control run of the
+same instrumentation on the passing build** — 15 vs 3521 named the population instantly. Take
+the control measurement early, not after exhausting hypotheses.
+
+### 7.12 🚨 But litmus N=4 LIVELOCKS at `=1` — the next (and now sole) blocker
+
+With the §7.11 fix in, the N=2 ladder is green but **litmus N=4 times out**: `cy=0x1c9c380`
+(30 M, the cap), `tohost=0` (timeout, *not* a forbidden outcome), ~1 h wall-clock versus ~10 min
+at `=0`. So the correctness bug is fixed and what remains is a **forward-progress** problem that
+only bites at four-way contention.
+
+**Most likely cause — the drain has no ownership protection across its RD→WR window.** The
+in-cache path establishes ownership and writes *in the same cycle*; the drain takes two (RD then
+WR), and the dcache pin deliberately does **not** re-arm on an E/M hit to a line it is already
+pinning (`dcache.veryl:1531`, `{tag,index} != pin_line_q` — the anti-starvation rule that stops
+a spin loop from holding a line forever). So under N=4 every hart's drain can acquire, lose the
+line to the next hart before its WR cycle, poison, re-read, and repeat — a textbook livelock,
+and exactly why N=2 (where the 64-cy pin defer is enough for one hart to win) passes while N=4
+does not.
+
+**Candidate fixes, in increasing order of intrusiveness:**
+1. **Single-cycle drain when the line is already owned** — if the RD hits E/M, compute and write
+   the same cycle, so the drain has the same atomicity profile as today's commit write. Removes
+   the window entirely for the common case; the two-cycle path stays only for the fill case.
+2. **Arm the pin for the drain explicitly** — give the drain a "pin this line until my write
+   lands" request, bounded by the existing watchdog. Needs a dcache port and must not reintroduce
+   the starvation the `!= pin_line_q` rule prevents.
+3. **Backoff on repeated poison** — count consecutive poisons for one entry and, past a
+   threshold, fall back to performing the RMW at the ROB head the old way (the entry is still
+   architecturally un-retired at that point only if we keep the atomic at the head, so this
+   interacts with R3.1's head-release and needs care).
+
+(1) is the natural first attempt and is a small change to the FSM.
+
+**Ladder status at `=1`:** `veryl test` 252/0 ✅ · litmus N2 ✅ · dhrystone bit-exact ✅ · N=1
+boot ✅ · **litmus N4 ❌ (timeout)** · N2/N4 SMP boot, Verilator, ACT4 not yet run.
 
 **Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
 **double application by the queue itself** (the drain fires once per instruction, §7.8's PC
