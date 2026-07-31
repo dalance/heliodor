@@ -941,4 +941,40 @@ value made the pre-existing bug harmless.
 | N=2 SMP Linux boot | `0x125bb50` | **`0x125bb50` pass** ✅ | **cycle-identical** |
 
 The `sb_2cyc_ok` guard is a correctness fix for **both** arms, so it is deliberately *not*
-const-gated and is verified at `=0` in its own right.
+const-gated and is verified at `=0` in its own right (252/0 · litmus N2 `0x2e8a10` · N=1 boot
+`0x0d9e540` · litmus N4 `0x3ae620` · N=2 SMP boot `0x125bb50`). Against **that** `=0` arm —
+the honest comparison, since both carry the fix — R3.2c is essentially **cost-neutral**:
+litmus N2 −0.33 %, litmus N4 +0.26 %, N=1 boot −0.07 %, N=2 SMP boot cycle-identical,
+N=4 SMP boot `0x1c4e180` pass. **ACT4 RVA23: 696 passed / 0 failed at `=1`.**
+
+**Honest note on §0(b)'s IPC promise.** R3.2c removes the class's RFO, its 2-cycle fetch
+handshake, its watch/poison/replay and its ROB load record — the machinery §6.5 predicted would
+"lift issue-side serialisation" — and the measured result is **neutral, not a win**. The
+without-return class is simply not frequent enough in these workloads (≈1160 such atomics in a
+14 M-cycle N=1 boot) for its per-instruction saving to show up at the top level. What R3.2c does
+deliver is §0(a): the class is now structurally *a store with an ALU op*, which is the
+canonical-LSQ end state, plus the two real bugs it exposed (§7.18's store-buffer hole is an SMP
+atomicity hole that exists at `ASQ_NOREAD=0` today, and §7.17's ROB-load-record hole).
+
+### 7.19 ✅ Validation complete at `ASQ_NOREAD = 1` — Verilator NBA 4/4 + ACT4 696/0
+
+Every gate R3.3 itself had to clear (§7.14/§7.15) has now been re-run for R3.2c, on the same
+flow that once caught the SMP LR/SC `read_lock` livelock — standard SV non-blocking-assignment
+semantics, Verilator 5.050, `-O3`, built from `veryl build` output with `ASQ_NOREAD = 1`:
+
+| Verilator run | result | cycles | Veryl sim `=1` | agreement |
+|---|---|---|---|---|
+| `tb_litmus_4hart` (P9.0 RVWMO battery, N=4) | **PASS** `tohost=1`, `fail=0` | 3,861,342 | 3,870,000 (`0x3b0d30`) | −0.22 % |
+| `tb_soc_linux_boot` (N=1) | **PASS** `x3=0xAA` | 14,260,462 | 14,269,488 (`0x0d9be30`) | −0.06 % |
+| `tb_soc_smp_linux_boot_2hart` | **PASS** `x3=0xAA` | 19,244,683 | 19,250,000 (`0x125bb50`) | −0.03 % |
+| `tb_soc_smp_linux_boot_4hart` | **PASS** `x3=0xAA` | 29,670,919 | 29,679,488 (`0x1c4e180`) | −0.03 % |
+
+Plus **ACT4 RVA23 696 passed / 0 failed** — including the `Zaamo`/`Zalrsc` and
+`ExceptionsSvZaamo`/`ExceptionsSvZalrsc` groups, which is the external check on §6.4's
+"translation + PMP stay at execute, so a faulting atomic never allocates" now that the class
+does *only* translate + fault-check at execute.
+
+**Nothing is left to test.** As at §7.15, what remains is the **ship decision**, which is the
+user's per the campaign convention; the tree stays at `ASQ_NOREAD = 0` until then. Reverting or
+flipping is the same one-line change, and the `sb_2cyc_ok` fix (§7.18) is already live in both
+arms because it is a correctness fix, not part of the increment.
