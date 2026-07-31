@@ -396,6 +396,26 @@ pub module heliodor_core #(
     var ftb_target : logic<64>        [FTB_N];
     var ftb_is_cond: logic           [FTB_N]; // B2a: entry predicts a CONDITIONAL branch
     var ftb_conf   : logic<2>         [FTB_N]; // B2a: 2-bit saturating taken-confidence (3 = follow)
+    // ── F2-full f2.5d: run-ahead RAS (cp_predictor_sram_plan.md "f2.5d") — DEAD at 0 ──
+    // After f2.5c.1 the decoupled front end runs at F2-lite IPC, but RETURNS still pay the full
+    // Stage-B override bubble: the FTB excludes returns (a stored target is caller-dependent and so
+    // useless), so pc_pred cannot run ahead past a `ret` and the return target is never prefetched.
+    // The classic decoupled-front-end answer is a RUN-AHEAD RAS on the predictor loop: mark the
+    // block-terminating CALL / RETURN in the FTB, and let pc_pred push/pop its own stack as it
+    // predicts — a return then gets a target AT THE PREDICTOR, one FTQ block ahead of fetch, so F0
+    // prefetches it and f2.3's sb_ovr_soft turns the Stage-B return override from a hard flush into a
+    // soft pop. The stack lives in ras.veryl as a THIRD stack (pred), resynced from the speculative
+    // stack on every pc_pred re-seed (the f2.5a consistency invariant) and from the architectural one
+    // on a pipeline flush. Accuracy-only: the run-ahead RAS feeds only the FTQ/prefetch stream; the
+    // Stage-B clocked full pred (which uses the SPECULATIVE RAS) and commit c_bp_mispredict stay
+    // authoritative. FLIP-COUPLED to FTQ_DECOUPLE (the run-ahead RAS is on the pc_pred loop; the
+    // coupled f0_ftb_hit loop, DCE'd at FTQ_DECOUPLE=1, would follow a ret entry's unused target).
+    // DEAD at 0: is_call/is_ret are reset-only (their train is under `if PRED_RAS_AHEAD`), so a ret
+    // entry never exists and every consumer const-folds away.
+    const PRED_RAS_AHEAD: bit = 0;
+    var ftb_is_call : logic     [FTB_N]; // f2.5d: entry's branch is a CALL → push ftb_ret_addr
+    var ftb_is_ret  : logic     [FTB_N]; // f2.5d: entry's branch is a RETURN → pop the run-ahead RAS
+    var ftb_ret_addr: logic<64> [FTB_N]; // f2.5d: a call's return address (its fall-through PC)
     // (b) B1: gate f0_ftb_hit for the FIRST F0 fetch after any re-steer (redirect / early /
     // ext_taken / f0_diverged). A re-steer target can land MID-dword (a branch/jump/trap
     // target past a branch the FTB trained on that same dword); if F0 then FTB-redirected off
@@ -1398,10 +1418,30 @@ pub module heliodor_core #(
     var held_tgt0: logic<64>;
     var held_pt1 : logic    ;
     var held_tgt1: logic<64>;
+    // f2.5d.1: the RAW btb bundle (hit + kind + direction) is frozen too — 3a.6 left it live as the
+    // documented "accuracy-only remainder", but the FTB train (retimed to Stage-B below) and the
+    // speculative RAS push/pop READ these bits, so a drifted kind writes a wrong-PC FTB entry / pushes
+    // a stray return address. Same capture cycle (produce_q) and the same fold-to-live at 0.
+    var held_hit0 : logic;
+    var held_cond0: logic;
+    var held_call0: logic;
+    var held_ret0 : logic;
+    var held_ind0 : logic;
+    var held_hit1 : logic;
+    var held_call1: logic;
+    var held_ret1 : logic;
     let pt0_eff : logic     = if PRED_HOLD_FREEZE ? (if produce_q ? predicted_taken  : held_pt0 ) : predicted_taken;
     let tgt0_eff: logic<64> = if PRED_HOLD_FREEZE ? (if produce_q ? pred_target      : held_tgt0) : pred_target;
     let pt1_eff : logic     = if PRED_HOLD_FREEZE ? (if produce_q ? predicted_taken1 : held_pt1 ) : predicted_taken1;
     let tgt1_eff: logic<64> = if PRED_HOLD_FREEZE ? (if produce_q ? pred_target1     : held_tgt1) : pred_target1;
+    let hit0_eff : logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_hit      : held_hit0 ) : btb_hit;
+    let cond0_eff: logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_is_cond  : held_cond0) : btb_is_cond;
+    let call0_eff: logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_is_call  : held_call0) : btb_is_call;
+    let ret0_eff : logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_is_ret   : held_ret0 ) : btb_is_ret;
+    let ind0_eff : logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_is_ind   : held_ind0 ) : btb_is_ind;
+    let hit1_eff : logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_hit2     : held_hit1 ) : btb_hit2;
+    let call1_eff: logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_is_call2 : held_call1) : btb_is_call2;
+    let ret1_eff : logic = if PRED_HOLD_FREEZE ? (if produce_q ? btb_is_ret2  : held_ret1 ) : btb_is_ret2;
     // f2.4-fix: the not-taken pred_next MUST equal the actual delivered successor (a_eff_next), not
     // the sequential fall-through, so the FTB-follow (f2.2) non-sequential advance stays consistent
     // with the recorded prediction and the commit c_bp_mispredict backstop fires on a disagreement
@@ -1438,18 +1478,34 @@ pub module heliodor_core #(
     // the bundle is held (produce_q=0). DEAD at PRED_HOLD_FREEZE=0 (reset-only → every reg + fanin DCE).
     always_ff (clk, rst) {
         if_reset {
-            produce_q = 1'b0;
-            held_pt0  = 1'b0;
-            held_tgt0 = 64'd0;
-            held_pt1  = 1'b0;
-            held_tgt1 = 64'd0;
+            produce_q  = 1'b0;
+            held_pt0   = 1'b0;
+            held_tgt0  = 64'd0;
+            held_pt1   = 1'b0;
+            held_tgt1  = 64'd0;
+            held_hit0  = 1'b0;
+            held_cond0 = 1'b0;
+            held_call0 = 1'b0;
+            held_ret0  = 1'b0;
+            held_ind0  = 1'b0;
+            held_hit1  = 1'b0;
+            held_call1 = 1'b0;
+            held_ret1  = 1'b0;
         } else if PRED_HOLD_FREEZE {
             produce_q = fb_push0;
             if produce_q {
-                held_pt0  = predicted_taken;
-                held_tgt0 = pred_target;
-                held_pt1  = predicted_taken1;
-                held_tgt1 = pred_target1;
+                held_pt0   = predicted_taken;
+                held_tgt0  = pred_target;
+                held_pt1   = predicted_taken1;
+                held_tgt1  = pred_target1;
+                held_hit0  = btb_hit;
+                held_cond0 = btb_is_cond;
+                held_call0 = btb_is_call;
+                held_ret0  = btb_is_ret;
+                held_ind0  = btb_is_ind;
+                held_hit1  = btb_hit2;
+                held_call1 = btb_is_call2;
+                held_ret1  = btb_is_ret2;
             }
         }
     }
@@ -1473,10 +1529,14 @@ pub module heliodor_core #(
     // order at the drain (the 1-deep skid means at most one RAS op in flight; a call kills slot-1
     // via sb_slot1_kill so slot-0/slot-1 stay mutually exclusive). btb_is_call/ret are the clocked
     // outputs aligned to the drained bundle; the push addr uses the captured a_pc/a_s1_pc.
-    let s0_ras_push: logic = deliver0 && btb_hit && btb_is_call;
-    let s0_ras_pop : logic = deliver0 && btb_hit && btb_is_ret;
-    let s1_ras_push: logic = deliver1 && btb_hit2 && btb_is_call2;
-    let s1_ras_pop : logic = deliver1 && btb_hit2 && btb_is_ret2;
+    // f2.5d.1: read the FROZEN kind bits (hit0_eff/call0_eff/…). Under a skid hold the live clocked
+    // outputs drift to the successor's read, so a held bundle could push/pop the RAS for a call/return
+    // that is not the one being delivered — 3a.6's "accuracy-only remainder". Folds to the live bits at
+    // PRED_HOLD_FREEZE=0 → byte-identical.
+    let s0_ras_push: logic = deliver0 && hit0_eff && call0_eff;
+    let s0_ras_pop : logic = deliver0 && hit0_eff && ret0_eff;
+    let s1_ras_push: logic = deliver1 && hit1_eff && call1_eff;
+    let s1_ras_pop : logic = deliver1 && hit1_eff && ret1_eff;
     let ras_push_addr : logic<64> = if s1_ras_push ? (if PRED_OVERRIDE ? a_s1_pc + a_s1_len : s1_pc + s1_len) : (if PRED_OVERRIDE ? a_pc + a_len0 : ic_pc + pc_advance);
     let ras_spec_push : logic     = s0_ras_push || s1_ras_push;
     let ras_spec_pop  : logic     = s0_ras_pop || s1_ras_pop;
@@ -1504,6 +1564,14 @@ pub module heliodor_core #(
     var ras_arch_push     : logic    ;
     var ras_arch_pop      : logic    ;
     var ras_arch_push_addr: logic<64>;
+    // f2.5d run-ahead RAS (the pc_pred predictor loop; forward-referenced — the drivers live with
+    // the pc_pred FTB producer far below). DEAD at PRED_RAS_AHEAD=0 (all const-false / unread).
+    var ras_pred_push     : logic    ;
+    var ras_pred_pop      : logic    ;
+    var ras_pred_push_addr: logic<64>;
+    var ras_pred_resync   : logic    ;
+    var ras_pred_top      : logic<64>;
+    var ras_pred_valid    : logic    ;
 
     inst u_btb: btb (
         clk                               ,
@@ -1587,7 +1655,11 @@ pub module heliodor_core #(
         i_train_mispred  : tage_train_mispred,
         i_train_base_pred: bht_base_pred_c   ,
     );
-    inst u_ras: ras (
+    inst u_ras: ras #(
+        // f2.5d: the run-ahead stack is flip-COUPLED to PRED_RAS_AHEAD through this param (no
+        // duplicated const to keep in sync — cf. the rob::PRED_OVERRIDE hazard 3a.5 documented).
+        PRED_AHEAD: PRED_RAS_AHEAD,
+    ) (
         clk                                 ,
         rst                                 ,
         i_spec_push     : ras_spec_push     ,
@@ -1602,6 +1674,13 @@ pub module heliodor_core #(
         // an early redirect too (accuracy-only approximation — loses in-flight
         // call/ret nesting between the commit head and the resolved branch).
         i_recovery_fire : any_redirect      ,
+        // f2.5d run-ahead stack (pc_pred loop) — drivers assigned with the FTB producer below.
+        i_pred_push     : ras_pred_push     ,
+        i_pred_pop      : ras_pred_pop      ,
+        i_pred_push_addr: ras_pred_push_addr,
+        i_pred_resync   : ras_pred_resync   ,
+        o_pred_top      : ras_pred_top      ,
+        o_pred_valid    : ras_pred_valid    ,
     );
 
     // F1 option (B): L0 fast predictor instance (see PRED_L0_FAST above). Read on the
@@ -1898,9 +1977,19 @@ pub module heliodor_core #(
     let pp_ftb_idx   : logic<FTB_IDX_W> = pc_pred[FTB_IDX_W + 2:3];
     let pp_ftb_tag   : logic<FTB_TAG_W> = pc_pred[63:FTB_IDX_W + 3];
     let pp_ftb_follow: logic     = !ICACHE_FTB_COND || !ftb_is_cond[pp_ftb_idx] || (ftb_conf[pp_ftb_idx] == 2'd3);
-    let pp_ftb_hit   : logic     = FTQ_DECOUPLE && ICACHE_FETCH_DIRECTED && ftb_valid[pp_ftb_idx] && (ftb_tag[pp_ftb_idx] == pp_ftb_tag) && pp_ftb_follow && !pp_no_ftb_q;
+    // f2.5d: the CALL / RETURN kind of the block this FTB entry terminates. A return entry has NO
+    // usable stored target — its target is the run-ahead RAS top, so it only predicts while that
+    // stack is non-empty (else the entry is treated as a miss and pc_pred streams sequentially,
+    // exactly as before f2.5d). Both const-false at PRED_RAS_AHEAD=0 → pp_ftb_hit/pp_next fold to
+    // their f2.5a form and the ftb_is_call/ftb_is_ret reads DCE.
+    let pp_ftb_is_call: logic = PRED_RAS_AHEAD && ftb_is_call[pp_ftb_idx];
+    let pp_ftb_is_ret : logic = PRED_RAS_AHEAD && ftb_is_ret[pp_ftb_idx];
+    let pp_ftb_hit   : logic     = FTQ_DECOUPLE && ICACHE_FETCH_DIRECTED && ftb_valid[pp_ftb_idx] && (ftb_tag[pp_ftb_idx] == pp_ftb_tag) && pp_ftb_follow && !pp_no_ftb_q
+        && (!pp_ftb_is_ret || ras_pred_valid);
     let pp_ftb_target: logic<64> = ftb_target[pp_ftb_idx];
-    let pp_next      : logic<64> = if pp_ftb_hit ? {pp_ftb_target[63:3], 3'b000} : pc_pred + 64'd8;
+    // A followed RETURN block predicts the run-ahead RAS top (dword-aligned — the within-dword offset
+    // is recovered at Stage-B by sb_override, as for every other FTB target under f2.2/f2.3).
+    let pp_next      : logic<64> = if pp_ftb_hit ? (if pp_ftb_is_ret ? {ras_pred_top[63:3], 3'b000} : {pp_ftb_target[63:3], 3'b000}) : pc_pred + 64'd8;
     let ftq_full     : logic     = ftq_count >= 4'd8;
     // f2.5b/c.1: F0 DEQUEUES a real buffered FTQ entry when it presents + completes a fetch of the
     // head (beat-done; non-cacheable 2-beat pops once) AND the FTQ is non-empty. When the FTQ is empty
@@ -1910,6 +1999,24 @@ pub module heliodor_core #(
     // beats of a non-cacheable fetch). The producer then skips enqueuing pc_pred (F0 took it) and
     // advances pc_pred on beat-done. This is the in-sync / redirect-refill case = F2-lite behavior, 0 bubble.
     let f0_ftq_byp   : logic     = FTQ_DECOUPLE && f0_present && ftq_count == 4'd0;
+    // f2.5d: the pc_pred loop's control terms, hoisted to module level so the run-ahead RAS (a
+    // separate module instance) can be driven by them. pp_reseed = every redirect that re-seeds
+    // pc_pred + flushes the FTQ (the f2.5a consistency invariant, sb_ovr_soft excluded — the FTB
+    // agreed, the stream stands); ftq_enq / pp_advance are exactly the enqueue and pc_pred-advance
+    // conditions of the producer always_ff's steady-state arm, which that arm now reads instead of
+    // recomputing locally (inside it pp_reseed is false and FTQ_DECOUPLE true by construction, so the
+    // hoisted terms are identical there). DEAD at FTQ_DECOUPLE=0 (all const-false).
+    let pp_reseed : logic = FTQ_DECOUPLE && (redirect_fire || early_redir_fire_q || (sb_override && !sb_ovr_soft) || ext_taken_redir || f0_diverged);
+    let ftq_enq   : logic = FTQ_DECOUPLE && !pp_reseed && (!ftq_full || f0_ftq_pop) && !f0_ftq_byp;
+    let pp_advance: logic = ftq_enq || (FTQ_DECOUPLE && !pp_reseed && f0_ftq_byp && f0_beat_done);
+    // The run-ahead RAS follows the blocks pc_pred actually commits to: a followed CALL entry pushes
+    // its recorded return address, a followed RETURN entry pops. Resynced on every pc_pred re-seed
+    // (ras.veryl copies from the speculative stack; a pipeline flush copies from the architectural
+    // one and outranks it). DEAD at PRED_RAS_AHEAD=0 — pp_ftb_is_call/ret are const-false.
+    assign ras_pred_push      = pp_advance && pp_ftb_hit && pp_ftb_is_call;
+    assign ras_pred_pop       = pp_advance && pp_ftb_hit && pp_ftb_is_ret;
+    assign ras_pred_push_addr = ftb_ret_addr[pp_ftb_idx];
+    assign ras_pred_resync    = PRED_RAS_AHEAD && pp_reseed;
     always_ff (clk, rst) {
         if_reset {
             pc_fetch_q          = RESET_PC;
@@ -2073,7 +2180,8 @@ pub module heliodor_core #(
                 // concurrent dequeue for room. Count = +enq -deq (a bypass touches neither). The bypass
                 // makes F0 track pc_pred with 0 bubble when in sync (FTQ empty); the FTQ buffers only
                 // when F0 falls behind (stall → !f0_ftq_byp → enqueue fills it).
-                let ftq_enq: logic = (!ftq_full || f0_ftq_pop) && !f0_ftq_byp;
+                // f2.5d: ftq_enq is now the hoisted module-level term (identical here — this arm
+                // implies FTQ_DECOUPLE && !pp_reseed); the run-ahead RAS reads it too.
                 if f0_ftq_pop {
                     ftq_head = ftq_head + 3'd1;
                 }
@@ -2262,33 +2370,79 @@ pub module heliodor_core #(
     // PRED_OVERRIDE. f2.1: `(!PRED_OVERRIDE || FTB_OVERRIDE)` re-trains the FTB under PRED_OVERRIDE=1
     // when FTB_OVERRIDE=1 (F0 then follows it as a run-ahead producer). Folds to `!PRED_OVERRIDE` at
     // FTB_OVERRIDE=0 → byte-identical.
-    let ftb_br_deliver: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && (!PRED_OVERRIDE || FTB_OVERRIDE) && fb_push0
-        && btb_hit && !btb_is_ret && !btb_is_ind
-        && (!btb_is_cond || ICACHE_FTB_COND)
-        && (curr_is_rvc || ic_pc[2:1] != 2'b11);
-    let ftb_tr_idx: logic<FTB_IDX_W> = ic_pc[FTB_IDX_W + 2:3];
-    let ftb_tr_tag: logic<FTB_TAG_W> = ic_pc[63:FTB_IDX_W + 3];
+    // f2.5d.1: RE-TIME the train to Stage-B under PRED_OVERRIDE. f2.1 re-enabled this train while it
+    // still keyed on the STAGE-A produce (fb_push0) and indexed by the Stage-A PC (ic_pc) — but with
+    // the predictors clocked, btb_hit/btb_is_*/pred_target on that cycle are the read of ic_pc(T-1).
+    // So the entry for dword(ic_pc(T)) was written with the target of the branch at ic_pc(T-1): every
+    // trained entry was ALIASED by one bundle (the "stale/aliased FTB entry" the f2.4-fix corner-3
+    // trace saw). Under PRED_OVERRIDE the aligned operands are the Stage-B ones — the delivery
+    // (deliver0), the captured PC/length (a_pc/a_is_rvc0), and the frozen prediction (hit0_eff/
+    // cond0_eff/ret0_eff/ind0_eff/pt0_eff/tgt0_eff, which correspond to a_pc by construction).
+    // pt0_eff replaces cond_taken0 in the direction arm: that arm already implies hit && is_cond, and
+    // predicted_taken == cond_taken0 there. Every mux folds to today's Stage-A operand at
+    // PRED_OVERRIDE=0 → the =0 train is unchanged.
+    let ftb_tr_fire: logic     = if PRED_OVERRIDE ? deliver0  : fb_push0;
+    let ftb_tr_pc  : logic<64> = if PRED_OVERRIDE ? a_pc      : ic_pc;
+    let ftb_tr_rvc : logic     = if PRED_OVERRIDE ? a_is_rvc0 : curr_is_rvc;
+    let ftb_tr_hit : logic     = if PRED_OVERRIDE ? hit0_eff  : btb_hit;
+    let ftb_tr_cond: logic     = if PRED_OVERRIDE ? cond0_eff : btb_is_cond;
+    let ftb_tr_ret : logic     = if PRED_OVERRIDE ? ret0_eff  : btb_is_ret;
+    let ftb_tr_ind : logic     = if PRED_OVERRIDE ? ind0_eff  : btb_is_ind;
+    let ftb_tr_dir : logic     = if PRED_OVERRIDE ? pt0_eff   : cond_taken0;
+    let ftb_tr_tgt : logic<64> = if PRED_OVERRIDE ? tgt0_eff  : pred_target;
+    // f2.5d: the CALL kind + the call's return address (its fall-through PC — what the run-ahead RAS
+    // pushes). Same Stage-A/Stage-B operand split; both are read only under PRED_RAS_AHEAD.
+    let ftb_tr_call    : logic     = if PRED_OVERRIDE ? call0_eff : btb_is_call;
+    let ftb_tr_ret_addr: logic<64> = if PRED_OVERRIDE ? a_pc + a_len0 : ic_pc + pc_advance;
+    let ftb_br_deliver: logic = ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ && (!PRED_OVERRIDE || FTB_OVERRIDE) && ftb_tr_fire
+        && ftb_tr_hit && !ftb_tr_ret && !ftb_tr_ind
+        && (!ftb_tr_cond || ICACHE_FTB_COND)
+        && (ftb_tr_rvc || ftb_tr_pc[2:1] != 2'b11);
+    // f2.5d: RETURN entries — excluded from ftb_br_deliver above (no usable stored target), trainable
+    // here because the run-ahead RAS supplies the target at predict time. Same straddle exclusion.
+    // Returns are unconditional, so no confidence gate. DEAD at PRED_RAS_AHEAD=0 (const-false).
+    let ftb_ret_deliver: logic = PRED_RAS_AHEAD && ICACHE_FETCH_DIRECTED && ICACHE_SYNC_READ
+        && (!PRED_OVERRIDE || FTB_OVERRIDE) && ftb_tr_fire
+        && ftb_tr_hit && ftb_tr_ret
+        && (ftb_tr_rvc || ftb_tr_pc[2:1] != 2'b11);
+    let ftb_tr_idx: logic<FTB_IDX_W> = ftb_tr_pc[FTB_IDX_W + 2:3];
+    let ftb_tr_tag: logic<FTB_TAG_W> = ftb_tr_pc[63:FTB_IDX_W + 3];
     let ftb_tr_same: logic = ftb_valid[ftb_tr_idx] && (ftb_tag[ftb_tr_idx] == ftb_tr_tag);
     always_ff (clk, rst) {
         if_reset {
             for i in 0..FTB_N {
                 ftb_valid[i] = 1'b0;
+                // f2.5d: the two kind bits gate the run-ahead RAS, so reset them like ftb_valid
+                // (ftb_ret_addr stays unreset — masked by is_call, as tag/target are by valid).
+                ftb_is_call[i] = 1'b0;
+                ftb_is_ret[i]  = 1'b0;
             }
         } else if ICACHE_FETCH_DIRECTED {
             if ftb_br_deliver {
-                if !btb_is_cond {
+                if !ftb_tr_cond {
                     // Unconditional: always taken, always followed (conf=3, is_cond=0) — B1.
                     ftb_valid[ftb_tr_idx]   = 1'b1;
                     ftb_tag[ftb_tr_idx]     = ftb_tr_tag;
-                    ftb_target[ftb_tr_idx]  = pred_target;
+                    ftb_target[ftb_tr_idx]  = ftb_tr_tgt;
                     ftb_is_cond[ftb_tr_idx] = 1'b0;
                     ftb_conf[ftb_tr_idx]    = 2'd3;
-                } else if cond_taken0 {
+                    // f2.5d: a CALL (jal/jalr writing the link reg) is unconditional, so this is the
+                    // only arm that can install one. Record its return address for the run-ahead RAS
+                    // push; clear is_ret in case this index previously held a return entry.
+                    // ftb_ret_addr is written UNGATED (like ftb_tag/ftb_target, and unlike the two
+                    // kind bits) so the analyzer does not flag it unassigned at PRED_RAS_AHEAD=0; it
+                    // is masked by ftb_is_call, which IS gated, so the array is unread → DCE at 0.
+                    ftb_ret_addr[ftb_tr_idx] = ftb_tr_ret_addr;
+                    if PRED_RAS_AHEAD {
+                        ftb_is_call[ftb_tr_idx] = ftb_tr_call;
+                        ftb_is_ret[ftb_tr_idx]  = 1'b0;
+                    }
+                } else if ftb_tr_dir {
                     // Conditional, extract predicts TAKEN: (re)store the target, bump confidence.
                     // A same-dword conditional entry saturates up; a new/aliased slot inits weak-taken.
                     ftb_valid[ftb_tr_idx]   = 1'b1;
                     ftb_tag[ftb_tr_idx]     = ftb_tr_tag;
-                    ftb_target[ftb_tr_idx]  = pred_target;
+                    ftb_target[ftb_tr_idx]  = ftb_tr_tgt;
                     ftb_is_cond[ftb_tr_idx] = 1'b1;
                     if ftb_tr_same && ftb_is_cond[ftb_tr_idx] {
                         if ftb_conf[ftb_tr_idx] != 2'd3 {
@@ -2297,6 +2451,12 @@ pub module heliodor_core #(
                     } else {
                         ftb_conf[ftb_tr_idx] = 2'd2;
                     }
+                    // f2.5d: a conditional branch is never a call/return — clear both in case this
+                    // index previously held one (the entry is being re-tagged to this dword).
+                    if PRED_RAS_AHEAD {
+                        ftb_is_call[ftb_tr_idx] = 1'b0;
+                        ftb_is_ret[ftb_tr_idx]  = 1'b0;
+                    }
                 } else {
                     // Conditional, extract predicts NOT-taken: decay only an existing conditional
                     // entry for this dword (no target on a fall-through). At conf 0 F0 stops following.
@@ -2304,6 +2464,17 @@ pub module heliodor_core #(
                         ftb_conf[ftb_tr_idx] = ftb_conf[ftb_tr_idx] - 2'd1;
                     }
                 }
+            } else if ftb_ret_deliver {
+                // f2.5d: RETURN entry. No stored target is used (the run-ahead RAS supplies it at
+                // predict time); ftb_target is still written so the entry stays self-consistent.
+                // Unconditional shape (is_cond=0, conf=3) so pp_ftb_follow always follows it.
+                ftb_valid[ftb_tr_idx]   = 1'b1;
+                ftb_tag[ftb_tr_idx]     = ftb_tr_tag;
+                ftb_target[ftb_tr_idx]  = ftb_tr_tgt;
+                ftb_is_cond[ftb_tr_idx] = 1'b0;
+                ftb_conf[ftb_tr_idx]    = 2'd3;
+                ftb_is_call[ftb_tr_idx] = 1'b0;
+                ftb_is_ret[ftb_tr_idx]  = 1'b1;
             }
         }
     }

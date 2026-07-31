@@ -1111,6 +1111,56 @@ New `const FTQ_DECOUPLE: bit = 0;` (requires the F2-lite 9-const set; PRED_L0_FA
   as `pc_pred` predicts, so `pc_pred` predicts return targets AHEAD (removing the return override
   bubble that survives f2.5c). Enqueue the RAS action in the FTQ; repair the run-ahead RAS from the
   committed RAS on a mispredict. The hardest, most speculative part — its own increment, deferred.
+  **Built 2026-07-31 as f2.5d.1–d.3 (below); the 11th const is `PRED_RAS_AHEAD`.** No FTQ-carried RAS
+  action was needed — the run-ahead stack is resynced wholesale from the speculative stack on every
+  `pc_pred` re-seed (the f2.5a invariant already flushes the FTQ there), which is simpler and strictly
+  more accurate than replaying queued actions.
+
+### f2.5d — run-ahead RAS: audit findings + increments (2026-07-31)
+
+**Audit finding (a real bug in f2.1, fixed in d.1): the FTB train was ALIASED BY ONE BUNDLE under
+`PRED_OVERRIDE`.** f2.1 re-enabled `ftb_br_deliver` but left it keyed on the STAGE-A produce
+(`fb_push0`) and indexed by the Stage-A PC (`ic_pc`) — while `btb_hit` / `btb_is_*` / `pred_target`
+on that cycle are the CLOCKED read of `ic_pc(T-1)`. So every trained entry recorded
+`dword(ic_pc(T)) → target-of-the-branch-at-ic_pc(T-1)`. This is the "stale/aliased FTB entry"
+the f2.4-fix corner-3 trace saw (`0x800abf48 → 0x800ac2c0`) and it plausibly explains a chunk of
+F2-lite's IPC deficit (a garbage FTB steers F0 wrong → the disagreement-flush path fires constantly).
+It is accuracy-only — Stage-B + commit are authoritative — which is why the ladder still passed.
+The run-ahead RAS CANNOT be built on it (an aliased `is_call` pushes a stray return address), so
+re-timing the train is the prerequisite increment.
+
+- **f2.5d.1** ✅ DONE. (i) Extend `PRED_HOLD_FREEZE` to the RAW btb bundle — `held_{hit,cond,call,
+  ret,ind}0` + `held_{hit,call,ret}1`, with `*_eff` accessors — which is exactly 3a.6's documented
+  "accuracy-only remainder" (the kind bits still re-read live under a skid hold). (ii) Re-time the
+  FTB train to Stage-B: `ftb_tr_{fire,pc,rvc,hit,cond,ret,ind,dir,tgt}` = `PRED_OVERRIDE ? Stage-B :
+  Stage-A` (`deliver0` / `a_pc` / `a_is_rvc0` / the frozen prediction; `pt0_eff` stands in for
+  `cond_taken0`, equal in the arm that reads it). (iii) The speculative RAS push/pop
+  (`s0/s1_ras_push/pop`) now read the frozen kind bits too. **DEAD at 0** — every term is a
+  `CONST ? new : old` ternary with the const 0, plus reset-only regs. Verified `veryl test` **252/0**
+  AND **cycle-exact** (litmus N2 `cy=0x2e6300`, identical to HEAD).
+- **f2.5d.2** ✅ DONE. FTB gains `is_call` / `is_ret` / `ret_addr` (`ftb_ret_addr` = the call's
+  fall-through PC). The unconditional arm records `is_call`+`ret_addr`; the conditional arm clears
+  both (re-tagging); and a NEW arm `ftb_ret_deliver` trains RETURN entries — which the base FTB
+  excludes precisely because a stored return target is caller-dependent, but which become useful once
+  a stack supplies the target. `is_call`/`is_ret` are reset + written only under `PRED_RAS_AHEAD`
+  (reset-only at 0 → DCE); `ret_addr` is written ungated (masked by `is_call`) so the analyzer does
+  not flag it unassigned — exactly the `ftb_tag`/`ftb_target` policy.
+- **f2.5d.3** ✅ DONE. `ras.veryl` gains a THIRD stack (`pred_stack`/`pred_tos`) behind a new
+  `param PRED_AHEAD` **flip-coupled through the instantiation** (`PRED_AHEAD: PRED_RAS_AHEAD`) — no
+  duplicated const to desync, unlike `rob::PRED_OVERRIDE`. It restores from `arch_stack` on
+  `i_recovery_fire` and from `spec_stack` on `i_pred_resync` (every `pc_pred` re-seed), and otherwise
+  pushes/pops as the predictor loop follows call/return entries. Core side: `pp_ftb_is_call/is_ret`,
+  `pp_ftb_hit` additionally requires `ras_pred_valid` on a return entry (an empty stack = a miss →
+  sequential, today's behavior), and `pp_next` takes `{ras_pred_top[63:3],3'b000}` for a return. The
+  producer's control terms (`pp_reseed`/`ftq_enq`/`pp_advance`) are hoisted to module level so the
+  RAS instance can be driven by them (the steady-state arm reads the hoisted `ftq_enq`, identical
+  there by construction). **Nothing on the extract side changes**: f2.3's `sb_ovr_soft` already turns
+  a Stage-B override into a soft pop whenever the target dword sits at `wf_head+1`, so a prefetched
+  return target converts automatically.
+  - **Known accuracy limit (documented, not fixed):** an INDIRECT call (`jalr ra,rs` → `btb_is_ind`)
+    is excluded from the FTB (today's policy), so the run-ahead stack does not push for it while the
+    speculative stack does — the two drift until the next resync. Direct `jal` calls dominate; if the
+    measurement shows returns still overriding, admitting is_ind call entries is the next knob.
 - **f2.5e** (value-add, gated) FTQ-driven prefetch / F0 hit-under-miss — convert the run-ahead into
   IPC once the P9.6 mem-port contention is addressed. Out of f2.5's structural scope; noted as the
   path that makes the decoupling pay.

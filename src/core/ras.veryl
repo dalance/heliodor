@@ -17,8 +17,18 @@
 // deep call chains beyond 16 simply mispredict their returns. tos is a count
 // in [0,16]; the top entry is at index tos-1. Resizing DEPTH requires updating
 // the 5'd16 / [3:0] literals below.
+// F2-full f2.5d adds a THIRD stack, the RUN-AHEAD one. The decoupled predictor loop (pc_pred /
+// FTQ) runs many fetch blocks ahead of extract, so it cannot use the fetch-time speculative stack:
+// it needs its own, pushed/popped as it PREDICTS. It is resynced from the speculative stack on
+// every pc_pred re-seed (the FTQ consistency invariant — the predictor loop restarts from where
+// extract is) and from the architectural stack on a pipeline flush, exactly as the speculative one
+// is. Purely speculative: it only picks FTQ prefetch targets. The DELIVERED return prediction still
+// comes from the speculative stack at extract, and commit (c_bp_mispredict) validates it — so the
+// run-ahead stack is accuracy-only, never a correctness path. Gated by PRED_AHEAD (flip-coupled to
+// the core's PRED_RAS_AHEAD): at 0 every pred_* write is reset-only → the stack + its fanin DCE.
 pub module ras #(
-    param DEPTH: u32 = 16,
+    param DEPTH    : u32 = 16,
+    param PRED_AHEAD: bit = 0,
 ) (
     clk: input clock,
     rst: input reset,
@@ -37,11 +47,27 @@ pub module ras #(
 
     // Recovery: restore the speculative stack + tos from the architectural one.
     i_recovery_fire: input logic,
+
+    // f2.5d run-ahead stack (predictor loop). i_pred_resync restores it from the SPECULATIVE stack
+    // (used on a pc_pred re-seed that is not a pipeline flush); i_recovery_fire restores it from the
+    // architectural stack, outranking everything.
+    i_pred_push     : input  logic    ,
+    i_pred_pop      : input  logic    ,
+    i_pred_push_addr: input  logic<64>,
+    i_pred_resync   : input  logic    ,
+    o_pred_top      : output logic<64>,
+    o_pred_valid    : output logic    ,
 ) {
     var spec_stack: logic<64> [DEPTH];
     var spec_tos  : logic<5>          ; // 0..16
     var arch_stack: logic<64> [DEPTH];
     var arch_tos  : logic<5>          ;
+    var pred_stack: logic<64> [DEPTH]; // f2.5d: run-ahead (predictor-loop) stack
+    var pred_tos  : logic<5>          ;
+
+    assign o_pred_valid = pred_tos != 5'd0;
+    let pred_top_m1: logic<5> = pred_tos - 5'd1;
+    assign o_pred_top = pred_stack[pred_top_m1[3:0]];
 
     assign o_spec_valid = spec_tos != 5'd0;
     // Top entry = tos-1. When empty the index underflows but o_spec_valid=0 so
@@ -54,9 +80,11 @@ pub module ras #(
             for i in 0..DEPTH {
                 spec_stack[i] = 64'd0;
                 arch_stack[i] = 64'd0;
+                pred_stack[i] = 64'd0;
             }
             spec_tos = 5'd0;
             arch_tos = 5'd0;
+            pred_tos = 5'd0;
         } else {
             // Speculative stack (fetch).
             if i_recovery_fire {
@@ -83,6 +111,35 @@ pub module ras #(
             } else if i_arch_pop {
                 if arch_tos != 5'd0 {
                     arch_tos = arch_tos - 5'd1;
+                }
+            }
+            // f2.5d run-ahead stack (predictor loop) — DEAD at PRED_AHEAD=0 (reset-only).
+            // A pipeline flush restores it from the ARCHITECTURAL stack (the same source the
+            // speculative stack takes this cycle — the correct-path state, since the redirecting op
+            // commits at the ROB head). A pc_pred re-seed without a flush (extract override / FTB
+            // reconciliation) resyncs it from the SPECULATIVE stack: the predictor loop restarts from
+            // extract's point, so extract's stack is the right approximation. NBA means a same-cycle
+            // spec push/pop is not yet visible to that copy — at most one entry stale, accuracy-only.
+            if PRED_AHEAD {
+                if i_recovery_fire {
+                    for i in 0..DEPTH {
+                        pred_stack[i] = arch_stack[i];
+                    }
+                    pred_tos = arch_tos;
+                } else if i_pred_resync {
+                    for i in 0..DEPTH {
+                        pred_stack[i] = spec_stack[i];
+                    }
+                    pred_tos = spec_tos;
+                } else if i_pred_push {
+                    if pred_tos != 5'd16 {
+                        pred_stack[pred_tos[3:0]] = i_pred_push_addr;
+                        pred_tos                  = pred_tos + 5'd1;
+                    }
+                } else if i_pred_pop {
+                    if pred_tos != 5'd0 {
+                        pred_tos = pred_tos - 5'd1;
+                    }
                 }
             }
         }
