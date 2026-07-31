@@ -1161,6 +1161,71 @@ re-timing the train is the prerequisite increment.
     is excluded from the FTB (today's policy), so the run-ahead stack does not push for it while the
     speculative stack does — the two drift until the next resync. Direct `jal` calls dominate; if the
     measurement shows returns still overriding, admitting is_ind call entries is the next knob.
+- **f2.5d.1b** ✅ DONE (found while auditing d.1, same root cause, kept because it measures POSITIVE).
+  `ext_taken_redir`'s `ext_deliver_taken` term is `(fb_push0 && predicted_taken) || …` — a STAGE-A
+  produce ANDed with the CLOCKED (one-cycle-stale) prediction. Under the authority inversion Stage-A
+  never takes a branch, so that term is meaningless there, yet it fired a full WORD-FIFO flush + an F0
+  re-steer to a stale target on essentially every produce after a taken branch — destroying exactly
+  the FTB prefetch f2.1/f2.3 exist to create. Gated `!PRED_OVERRIDE`, and `ext_buf_mismatch` now
+  compares against the advance Stage-A ACTUALLY took (`ext_eff_next`) instead of the stale
+  `ext_next_pc`. Measured at the flip: `ext_taken_redir` fires **0** times (was the dominant flush),
+  dhrystone 338665→337169, **N1 boot 16.85M→16.69M (−0.95 %)**. DEAD at PRED_OVERRIDE=0.
+- **f2.5d.4** ⏳ FLIPPED + MEASURED — **CORRECT but IPC-NEGATIVE; shipped DEAD at 0 (banked)**, the
+  same outcome as option (B)'s L0. Flip = the F2-full 10-const set + `PRED_RAS_AHEAD`
+  (`ras::PRED_AHEAD` auto-couples). Builds, no comb loop.
+  - **Correctness: clean.** `veryl test` 252/0; dhrystone **instret 264834 = BIT-EXACT** at every
+    configuration measured; **N1 Linux boot COMPLETES** (`cy=0x102a2f0` ≈ 16.95M, x3=0xaa, pass=1).
+    Like f2.5c, f2.5d introduced ZERO new correctness corners — it is purely upstream of extract.
+  - **IPC (this tree; baselines re-measured because S1 + Block R shipped since f2.5c.1):**
+
+    | config | dhrystone | Δ vs =0 | N1 boot | Δ vs =0 |
+    |---|---|---|---|---|
+    | =0 (ship) | 252939 | — | 14.27M (0xd9be30) | — |
+    | 10-const F2-full (d.1 train fix, no d.1b) | 338665 | +33.9 % | 16.85M | +18.1 % |
+    | 10-const + d.1b | 337169 | +33.3 % | 16.69M | +17.0 % |
+    | **11-const (+run-ahead RAS) + d.1b** | **368644** | **+45.7 %** | **16.95M** | **+18.8 %** |
+    | 11-const, ret entries TRAINED but never FOLLOWED | 338665 | +33.9 % | — | — |
+
+    So the run-ahead RAS costs **+9.3 % on dhrystone and +1.6 % on boot** relative to the same tree
+    without it. Not a measurement artifact: instret is bit-exact and `earlymis` is IDENTICAL (1753)
+    in both configurations, so architectural prediction quality is unchanged — the loss is entirely
+    front-end. `frontidl` 87378 → 116369 (**+28991**) accounts for the whole +31475-cycle delta.
+  - **ROOT CAUSE — the FTQ never actually runs ahead, so there is nothing for the run-ahead RAS to
+    exploit.** Per-event instrumentation over dhrystone (temporary `$display` counters, removed):
+
+    | event | RAS-ahead OFF | RAS-ahead ON |
+    |---|---|---|
+    | F0 BYPASS (FTQ empty → F0 fetches `pc_pred` directly) | 331853 / 337169 cy (**98.4 %**) | 358365 |
+    | `ftq_enq` (a block actually buffered) | 4796 | 7781 |
+    | `f0_diverged` | 11744 | **35211** (arm A 27725 / arm B 7486) |
+    | `sb_override` HARD | 44796 | 42813 |
+    | `sb_ovr_soft` (prefetch reused) | 3982 | 5474 |
+    | `ext_taken_redir` | 0 (d.1b) | 0 |
+    | `pp_reseed` (FTQ flush) | 57003 | 68002 |
+    | run-ahead RAS push / pop | 0 / 0 | 10969 / 32495 |
+
+    **f2.5c.1's bypass — added to remove the +1 redirect bubble — locks `pc_pred` to F0's rate
+    whenever the FTQ is empty, and on an all-hitting icache with ~57k front-end flushes the FTQ is
+    empty 98 % of the time.** The decoupling is therefore latent: correct and structurally present,
+    but with ZERO effective run-ahead depth. The return prediction's only realised effect is to make
+    F0's stream NON-SEQUENTIAL at return sites; f2.2's FIFO-follow can only track that when
+    `wf_count >= 2`, which a zero-depth queue often fails, so extract advances sequentially into a
+    dword F0 never fetched → `f0_diverged` arm A → full flush. That triples `f0_diverged` and IS the
+    +29k front-end idle.
+  - **Two clean sub-findings.** (i) The run-ahead STACK is not at fault: substituting `ras_spec_top`
+    for `ras_pred_top` gives the byte-identical cycle count (368644 both ways). (ii) FTB pollution by
+    return entries is FREE: training them but never following them reproduces the RAS-off count
+    **exactly** (338665), so the 64-entry FTB has room for them.
+  - **Also measured, for f2.5e:** soft overrides are only **8–13 %** of all Stage-B overrides
+    (3982/44796 → 5474/42813). The FTB prefetch is RARELY reused — that, not the return bubble, is
+    F2-lite's dominant IPC deficit, and it is the correct next target.
+  - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
+    d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
+    measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
+    blocked on run-ahead depth, not on its own design:** it should be re-flipped once the FTQ can
+    actually get ahead of F0 (a conditional bypass — let `pc_pred` free-run to N blocks instead of
+    bypassing whenever the queue is momentarily empty — and/or f2.5e's hit-under-miss / FTQ-driven
+    prefetch). Re-measure it there before judging the structure.
 - **f2.5e** (value-add, gated) FTQ-driven prefetch / F0 hit-under-miss — convert the run-ahead into
   IPC once the P9.6 mem-port contention is addressed. Out of f2.5's structural scope; noted as the
   path that makes the decoupling pay.
