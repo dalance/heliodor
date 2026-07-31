@@ -1219,6 +1219,35 @@ re-timing the train is the prerequisite increment.
   - **Also measured, for f2.5e:** soft overrides are only **8–13 %** of all Stage-B overrides
     (3982/44796 → 5474/42813). The FTB prefetch is RARELY reused — that, not the return bubble, is
     F2-lite's dominant IPC deficit, and it is the correct next target.
+
+### f2.3b — widening the soft override: TRIED AND REJECTED (2026-07-31)
+
+Direct follow-up on that last measurement, recorded because the negative result pins the mechanism.
+
+**Why the soft rate is low.** `sb_ovr_soft` tests `wf_pc[wf_head+1] == tgt0_eff`. But the f2.2
+FIFO-follow advance often crosses INTO the prefetched target dword BEFORE the Stage-B override fires
+— the "mid-dword FTB branch vs override race" the f2.2/f2.3 design analysis already flagged. After
+that cross the target sits at `wf_head`, not `wf_head+1`, the test fails, and the override HARD
+-flushes the very dword the FTB prefetched for it. So the prefetch is discarded exactly in the case
+where it succeeded.
+
+**The obvious fix does not work.** Adding a second soft flavor for "target already at `wf_head`",
+with no pop (the branch dword was consumed by the earlier cross), is faster on dhrystone
+(337169 → 332665) and keeps instret bit-exact — but it **HANGS the N1 boot** (45M timeout,
+`x3=0x80a85b60`, the f2.4 boot-hang signature). Guarding it with `ext_head_match && !ext_bypass`
+(the stale-entry shape of f2.4-fix corner 2) removes the spurious firings — `mispred` drops from 124
+back to 1 — but the boot **hangs identically**, and the remaining gain collapses to −0.15 %.
+
+**Root cause of the hang: a head-case soft override CONSUMES NOTHING.** The head+1 flavor always pops
+one dword, which is what guarantees forward motion; the head flavor pops nothing and re-steers
+`ext_pc_q` inside the dword it is already on, so the same bundle can re-drain and re-override
+indefinitely (a spin loop contained in one dword is the natural trigger). Reverted; the analysis is
+left as a comment at `sb_ovr_soft`.
+
+**⇒ Raising the soft rate needs the Stage-A cross to be HELD while a drained bundle's override is
+pending** (so the target stays at head+1 and the existing, forward-progress-safe soft path applies) —
+not a wider soft test. That is the concrete next experiment for F2-lite IPC, and it is independent of
+the memory system, unlike f2.5e.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
