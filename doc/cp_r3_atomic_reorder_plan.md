@@ -18,9 +18,11 @@ double-write, §7.13 the stale `asq_divert_q` latch killing unrelated atomics' w
 gate passes at `=1`**: `veryl test` 252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1
 boot · N=2 SMP boot (cycle-identical) · **N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %** ·
 **Verilator NBA 4/4** (§7.14) · **ACT4 696/0** (§7.15).
-**R3.2c (§6.5) is BUILT** — four real bugs fixed, the last of them (§7.18) a **pre-existing**
-one: an atomic held at the ROB head could become `sb_elig` and retire through the committed-store
-buffer as a plain store. With that guard in place the whole ladder passes at `ASQ_NOREAD = 1`.
+🏁 **R3.2c (§6.5) is ALSO SHIPPED — `ASQ_NOREAD = 1`** (2026-07-31, §7.20): the class does only
+translate + fault-check at execute. Four real bugs fixed on the way, the last (§7.18) a
+**pre-existing** one — an atomic held at the ROB head could become `sb_elig` and retire through
+the committed-store buffer as a plain store. Ladder at `=1`: 252/0 · litmus N2/N4 · dhrystone
+bit-exact · boot N1/N2/N4 · **ACT4 696/0** · **Verilator NBA 4/4** (§7.19). Cost-neutral.
 
 ---
 
@@ -978,3 +980,27 @@ does *only* translate + fault-check at execute.
 user's per the campaign convention; the tree stays at `ASQ_NOREAD = 0` until then. Reverting or
 flipping is the same one-line change, and the `sb_2cyc_ok` fix (§7.18) is already live in both
 arms because it is a correctness fix, not part of the increment.
+
+### 7.20 🏁 R3.2c SHIPPED — `ASQ_NOREAD = 1` is the default path
+
+User's decision, 2026-07-31, on the §7.18/§7.19 evidence. `heliodor_core.veryl` flips to 1: a
+without-return atomic now does **only translate + fault-check** at execute. It is out of
+`issue_amo_read` / the RFO / the 2-cycle fetch handshake / `amo_watch_*` / `amo_poison_q` /
+`commit_amo_replay` / the M-stage dcache access / the ROB load record — *a store with an ALU op*,
+which is §6.5's canonical-LSQ end state for this class. The `=0` arm stays in the source as the
+fold-away fallback (every gate is written `if ASQ_NOREAD ? … : …` or `&& ASQ_NOREAD`, so
+reverting is the same one-line change).
+
+Re-verified on the flipped tree before the commit: `veryl test` **252/0** with
+`litmus(N=2) cy=0x2e6300 tohost=1 pass=1`, and **N=1 boot `cy=0x0d9be30` `x3=0xAA` pass=1** —
+both exactly the §7.18 figures.
+
+**What Block R now is, end to end.** A `rd == x0` atomic is no longer a ROB-head special case in
+*any* respect: it translates and fault-checks like a store, retires into the atomic store-queue
+without waiting for its write, and its RMW is performed at the memory system under coherence by
+the drain, which acquires ownership itself. The cost is neutral and the payoff is structural —
+plus the two genuine bugs the work exposed (§7.17's ROB-load-record hole, §7.18's store-buffer
+atomicity hole, the latter live at `ASQ_NOREAD=0` as well and fixed for both arms).
+
+**Next candidate:** R3.2c was the last item in Block R's decomposition (§4), so the next choice is
+a Phase-14 block-level one, not an R3 one.
