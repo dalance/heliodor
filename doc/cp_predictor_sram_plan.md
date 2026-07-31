@@ -1238,16 +1238,29 @@ with no pop (the branch dword was consumed by the earlier cross), is faster on d
 (the stale-entry shape of f2.4-fix corner 2) removes the spurious firings — `mispred` drops from 124
 back to 1 — but the boot **hangs identically**, and the remaining gain collapses to −0.15 %.
 
-**Root cause of the hang: a head-case soft override CONSUMES NOTHING.** The head+1 flavor always pops
-one dword, which is what guarantees forward motion; the head flavor pops nothing and re-steers
-`ext_pc_q` inside the dword it is already on, so the same bundle can re-drain and re-override
-indefinitely (a spin loop contained in one dword is the natural trigger). Reverted; the analysis is
-left as a comment at `sb_ovr_soft`.
+**Neither hardening rescues it, and both erase the speedup.** Two hypotheses were implemented and
+measured:
 
-**⇒ Raising the soft rate needs the Stage-A cross to be HELD while a drained bundle's override is
-pending** (so the target stays at head+1 and the existing, forward-progress-safe soft path applies) —
-not a wider soft test. That is the concrete next experiment for F2-lite IPC, and it is independent of
-the memory system, unlike f2.5e.
+| variant | dhrystone | N1 boot |
+|---|---|---|
+| baseline (head+1 only) | 337169 | 16.69M ✅ |
+| f2.3b head case, unguarded | 332665 (−1.34 %) | **HANG** 45M |
+| f2.3b + `ext_head_match && !ext_bypass` (stale-head guard) | 336671 (−0.15 %) | **HANG** 45M |
+| f2.3c + registered "last pop WAS an FTB-follow cross" | 336671 (−0.15 %) | **HANG** 45M |
+
+f2.3c's gate was meant to supply the forward-progress guarantee the head flavor lacks — it proves a
+dword WAS consumed on this branch's behalf the previous cycle, so the cycle *pair* consumes exactly
+one dword. It changes dhrystone not at all and the boot hangs identically, so **the boot-fatal
+interaction is neither staleness nor forward progress.** Equally important, both safe variants give
+back almost the whole speedup: the −1.34 % came from the UNSAFE firings, and the real, safely
+reachable upside is **−0.15 %**. Not worth root-causing at that price. Reverted; the analysis is left
+as a comment at `sb_ovr_soft`.
+
+**⇒ If the soft rate is revisited, attack the CAUSE, not the test:** hold the Stage-A FIFO-follow
+cross while a drained bundle's override is still pending, so the target stays at `head+1` and the
+existing pop-guaranteed soft path applies unchanged. Also note the reframing this measurement forces
+— the 8–13 % soft rate is a big number, but the fraction these variants could safely convert bought
+only 0.15 %, so "raise the soft rate" is not automatically where F2-lite's IPC is hiding.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
