@@ -18,8 +18,9 @@ double-write, §7.13 the stale `asq_divert_q` latch killing unrelated atomics' w
 gate passes at `=1`**: `veryl test` 252/0 · litmus N2 **and N4** · dhrystone bit-exact · N=1
 boot · N=2 SMP boot (cycle-identical) · **N=4 SMP boot 29.28 M vs 30.55 M = −4.2 %** ·
 **Verilator NBA 4/4** (§7.14) · **ACT4 696/0** (§7.15).
-**R3.2c (§6.5) is BUILT and DEAD at `ASQ_NOREAD = 0`** — three real bugs fixed, the bare-mode
-ladder passes at `=1`, but the Sv39 N=1 boot panics; the flip is parked (§7.17).
+**R3.2c (§6.5) is BUILT** — four real bugs fixed, the last of them (§7.18) a **pre-existing**
+one: an atomic held at the ROB head could become `sb_elig` and retire through the committed-store
+buffer as a plain store. With that guard in place the whole ladder passes at `ASQ_NOREAD = 1`.
 
 ---
 
@@ -277,11 +278,12 @@ its D is const-gated). Byte-identical proof = existing SV verbatim + additions c
     **Verified (=0):** 252/0 · litmus N2 `cy=0x282170` · dhrystone 252939 cy / instret 264834 ·
     N=1 boot `cy=0x0d99720` · N=2 SMP boot `cy=0x125bb50` — all cycle-identical to R3.2a · the
     two R3.2a `unused` warnings are gone (the outputs now have consumers).
-  - **R3.2c — §6.5. 🔨 BUILT, DEAD at `ASQ_NOREAD = 0` — see §7.17.** Drops the class's
-    execute-time read (`issue_amo_read`, the RFO, the fetch handshake, the watch, the poison, the
-    replay, and the ROB load record). Three real bugs found and fixed building it; at `=1` the
-    whole bare-mode ladder passes and is slightly faster (litmus N2 −0.09 %, N4 −0.24 %,
-    dhrystone bit-exact), but the **Sv39 N=1 Linux boot panics** and the flip is parked at 0.
+  - **R3.2c — §6.5. ✅ BUILT + root-caused — see §7.17/§7.18.** Drops the class's execute-time
+    read (`issue_amo_read`, the RFO, the fetch handshake, the watch, the poison, the replay, and
+    the ROB load record). Four real bugs found and fixed building it; the last (§7.18) is a
+    **pre-existing** hole — `sb_2cyc_ok` was missing `!c_is_amo`, so a held atomic could retire
+    through the store buffer as a plain store. Found by budget bisection to the exact
+    instruction. With the guard, the full ladder passes at `=1`.
 
 ---
 
@@ -882,155 +884,61 @@ fails; restoring the 2-cycle translate handshake still fails; restoring the
 - **MMU busy timing.** `mmu.veryl:1300` `o_busy` includes `tlb_miss_start` combinationally, so
   there is no "TLB miss not yet busy" window to latch a garbage PA through.
 
-**Where the next session should start.** The one asymmetry the bisect leaves is that at `=1` the
-class's line is first touched by the **drain's** RFO instead of the execute read's — so the drain
-is now the only owner-acquiring access, and it is *long* (a cold fill) instead of a warm hit. The
-bare-mode batteries (litmus N2/N4, the arch suite, dhrystone) all pass, and only the **Sv39** boot
-fails, which points at the interaction of that cold owning fill with the PTW / A-D write-back path
-(`ptw_dc_active`, `dmu_ad_wb`) rather than at the atomic datapath — note `asq_dr_port_ok` yields to
-`ptw_dc_active`, and the drain's arms do **not** override `dmem_unc_m` / `dmem_lnext_m` /
-`dmem_wstrbhi_m`, which are stale M-stage registers (safe at `=0` only because
-`port_ok ⇒ !m_ren_q ⇒ !m_unc_q`). Instrument the drain's fill against a concurrent walk, and
-compare the physical line the drain writes against the line the walk reads.
+### 7.18 ✅ ROOT CAUSE — an atomic could retire through the STORE BUFFER (`sb_2cyc_ok`)
 
-**Ruled out by these traces (do not re-litigate):** lost/dropped queue entries; non-atomic drains;
-**double application by the queue itself** (the drain fires once per instruction, §7.8's PC
-attribution is still valid *for the writes it counted*);
-`asq_full` starvation; and the "class atomic double-applies via in-cache write on the cycle
-after alloc" theory — a guard for it was added (`!(asq_class && !asq_empty)` in `amo_cwr_eff`,
-kept, it is correct in its own right) and changed **nothing**: the counts stayed 4000/3000/1000
-bit-identical. Six substantive RTL edits in a row have produced bit-identical results, which is
-itself the strongest evidence that the fault is off these paths.
-The cycle count was **bit-identical across all four RTL variants**, which is the useful signal:
-whatever is wrong is not on the paths being edited. Hypothesis-driven patching has stopped
-paying, and the next step is the campaign's proven method instead — a **trace session** on
-`test_litmus_2hart` (per-atomic PA/old/new/state trace out of the drain FSM, plus a
-divergence trap on "x advanced by exactly 1 per amoadd"), not another candidate fix. Note also
-that a counter probe reading `ALLOC` at the 4000th AMO commit showed 0 and was **misread as
-"the class never fires"** — test 7 runs later than that sample point; do not repeat that
-inference without sampling at the end of the run.
+**Found by budget bisection, not by hypothesis.** §7.17's eight refuted theories showed the
+atomic datapath was clean, so the next step was to localise the *first* atomic that breaks the
+boot rather than guess a mechanism. A temporary `NR_BUDGET` const capped how many class atomics
+were allowed the no-read path; with the boot testbench's cycle cap lowered to 16 M (pass and fail
+both ~2.5 min) a binary search over 0…1200 converged in 10 runs:
 
-**Boot status at `=1`:** wedges at the 45 M cycle cap (`pass=0`) with drains completing
-normally (1797/1798, watchdog never trips), i.e. the queue machinery runs — the failure is the
-§7.2 ordering hole, not a stuck engine.
-- **R3.3 — flip + litmus closure.** Flip `ATOMIC_SQ=1`; run the FULL ladder (litmus N2/N4 +
-  SMP boot N2/N4 + Verilator + ACT4) + contended-atomic IPC. Debug the minefield corners
-  (expect several — this is Test-7/Test-8 territory). Ship decision (=0 validated DEAD vs =1),
-  per the campaign's structural-mandate framing.
+> **budget 239 → boot passes, budget 240 → boot fails.** The culprit is no-read class atomic
+> **#239**: `amoadd.w x0, a4, (a5)` at PC `0xffffffff80066232`, PA `0x80a0d798`, cacheable.
 
-**Anchors to touch** (line numbers post-R3.0): `amo_cwr_en` (:8182) + the R3.0 substrate and
-`amo_cwr_eff` mux right below it (:8183-8249) + the commit port muxes (`dmem_pa_m` :8250,
-`dmem_wen_m` :8265, `dmem_wdata_m`/`dmem_wexcl_m` :8279-8281) → R3.2 must route the drain's
-address/data/strobe from the asq entry, not the live commit drive; `ac_pa_q`/`ac_wok_q` alloc
-(:6561-6565) → asq alloc + the class check; `commit_amo_replay` (:4646) / retire gate
-(`rob_commit_ack` :4702, whose `c_serial && !sb_empty` fence term is :4711) → SQ-decoupled
-retire + the §6.4 fence extension; `load_blocks_on_store` (:7003, `sb_ld_ovl` :911/:7415) →
-the §6.4 younger-access block; `sb_empty` (:911) → atomic-SQ drain ordering; `issue_amo_read`
-(:5950) / `amo_exec_capture` (:6455) → §6.5 removal of the class's at-head read.
-*Not needed under §6* (they were scheme-A anchors): `amo_watch_*_q` (:3437-3440), the
-`dc_amo_present` chk3 port (:8381) and the `dcache.veryl` pin (`pin_cnt_q` :587, reset :1534)
-all stay exactly as they are — the without-return class carries no watch and needs no
-cross-retire pin hold.
+A cycle trace of exactly that instruction showed it **retiring with its RMW nowhere**:
 
-## 5. Sequencing note
-Per the study's "do not start R3 autonomously" + the campaign's "clean-context start for a
-fresh block" pattern (used for S1): build **R3.0 from a clean context**, verify byte-identical,
-then R3.1→R3.3 across sessions with the full ladder at each functional step. R3.2's ownership-
-locked-drain fallback (what happens when a retired atomic cannot drain) is the single hardest
-design question — resolve it before R3.1's head-release lands. **✅ Resolved 2026-07-27 — §6.**
+```
+t=0  cv=1 cpc=…232 camo=1 acl=1 ack=0 | ELIG=0 sfet=0 p2c=0 sbempty=0 sbpush=0 | cls=1 alloc=0 cwr=0
+t=1  cv=1 cpc=…232 camo=1 acl=1 ack=1 | ELIG=1 sfet=1 p2c=1 sbempty=0 sbpush=1 | cls=1 alloc=0 cwr=0 sdata=0x1
+t=2  cv=1 cpc=…236   ← head has moved on
+```
 
----
+- **t=0** — the atomic is at the ROB head with `sb_empty = 0`, so it can neither retire, nor
+  allocate (`asq_alloc` requires `sb_empty`), nor perform the in-cache write. That very cycle
+  satisfies `store_fetched_q`'s set condition (`store_drive && !sb_elig && !dmem_mmu_busy`).
+- **t=1** — `store_fetched_q = 1` makes **`sb_2cyc_ok = 1` ⇒ `sb_elig = 1`**, and `sb_elig`
+  *removes the whole `c_is_store && !sb_elig && (… c_is_amo ? !sb_empty …)` term from the retire
+  gate*. So the atomic retires (`ack=1`) and is **pushed into the committed-store buffer**
+  (`sbpush=1`) as a plain store of `c_store_data`, with `alloc = 0`.
 
-## 6. R3.2 design resolution — the fallback question, answered by splitting on `rd`
+**The bug is in `sb_2cyc_ok` (`heliodor_core.veryl`), and it predates R3.2c.** Both of its
+siblings exclude atomics explicitly — `c_pretx_fast` carries `&& !c_is_amo` and so does
+`sb_vm_live_ok`, and the comment above them states the rule ("AMO/SC … are excluded"). This arm
+instead leaned on `store_fetched_q` to imply "plain store", which is false: **any** atomic held at
+the head for one cycle sets that latch. Fix = the missing guard:
 
-**Status: RESOLVED (2026-07-27), supersedes §2's scheme-A recommendation. Authoritative for
-R3.1-R3.3.** The blocking question was *"what does a retired atomic do when it cannot drain?"*
-The answer is to make the question unreachable, by only letting an atomic retire early when its
-drain depends on **nothing captured at execute**.
+```veryl
+let sb_2cyc_ok: logic = STORE_PRETRANSLATE && store_fetched_q && !c_is_amo && m_pa_cacheable && …
+```
 
-### 6.1 Why scheme A was rejected
+**Why it was invisible until R3.2c.** At `ASQ_NOREAD = 0` the buffered `c_store_data` is the
+*correct* pre-computed RMW result, so the atomic still lands the right value — only its
+*atomicity* is lost (no ownership, no in-cache merge, and at `ATOMIC_SQ=1` it silently bypasses
+the atomic-SQ). Latent on one hart; a genuine atomicity hole under SMP. With R3.2c's execute read
+gone there is no pre-computed result, so the buffer wrote garbage — the trace shows `sdata = 0x1`
+for an `amoadd.w` whose true `old` was non-zero, i.e. a **lost update**. That is also why the
+bisect in §7.17 pointed at "the RFO itself": the read was not the cause, it was the thing whose
+value made the pre-existing bug harmless.
 
-(A) keeps `rd ← old` at execute, so the execute-time `old` must stay valid until the drain —
-i.e. the line must hold E/M continuously across retire. Three findings kill it:
+**Ladder at `ASQ_NOREAD = 1` with the fix — everything passes:**
 
-1. **The pin cannot be extended.** `pin_cnt_q` (`dcache.veryl:587`) defers a remote probe only
-   while `!pin_cnt_q[6]` (< 64 cy), and its own comment states why: *"The bound keeps the defer
-   from closing a deadlock cycle through the single engine."* Holding the pin until an SQ drain
-   re-opens exactly that cycle — hart A defers B's probe on line X while A's drain waits behind
-   an older store whose RFO needs a line B is pinning.
-2. **The pin does not stop LOCAL eviction.** `pin_line_q` is read only by `probe_pinned` and the
-   arm condition (`:589`, `:1531`) — nothing in victim selection consults it. A younger access's
-   conflict/capacity miss can evict the pinned line. Today that is caught by `amo_poison_q` via
-   `dc_evict1/2` → **replay**, which is precisely what a retired atomic cannot do.
-3. **What is left is worth ~1 cycle.** Bound the window instead (retire only when the write is
-   already guaranteed) and the alloc condition collapses back into today's `store_drive &&
-   sb_empty && ac_wok_q` — the atomic retires one cycle before its write lands. Not worth the
-   highest SMP risk in the campaign.
+| check | baseline (`=0`, pre-fix) | `=1` + fix | delta |
+|---|---|---|---|
+| `veryl test` (arch + litmus N2) | 252/0, `0x2e6300` | **252/0, `0x2e6300`** ✅ | identical |
+| litmus N=4 | `0x39ada0` | **`0x3b0d30` pass** ✅ | +2.4 % (the fix makes held atomics wait) |
+| dhrystone | 252939 cy / 264834 instret | **bit-exact** ✅ | 0 |
+| N=1 Linux boot | `0x0d9be30` | **`0x0d9be30` pass** ✅ | **cycle-identical** |
+| N=2 SMP Linux boot | `0x125bb50` | **`0x125bb50` pass** ✅ | **cycle-identical** |
 
-### 6.2 The split: the result register decides
-
-In an **in-order-retire** machine, an atomic that writes `rd` cannot retire before its RMW is
-globally performed — retire *is* the architectural commit of `rd`, and after retire there is no
-replay. That is not a limitation of this design; it is what retirement means.
-
-But when **`rd == x0` the execute-time `old` is architecturally dead.** Then the SQ entry need
-carry no pre-computed value at all: it carries `{pa, amo_op, src, size, aqrl}` and the drain
-performs RFO → read → compute → write as one owned-line transaction (scheme B). **No
-architectural state depends on any intermediate**, so:
-
-> **"Cannot drain" is answered by "retry the drain."** A line stolen mid-drain costs cycles,
-> never correctness. No pin extension, no cross-retire watch, no poison, no replay, no fallback
-> machinery — the hard design question does not exist for this class.
-
-Forward progress is no weaker than today: once the drain owns the line, the existing pin covers
-its single write cycle exactly as the commit write does now; acquiring the line is the same RFO
-fairness problem the current AMO (and its replay loop) already has. No new livelock class.
-
-This is the same split real ISAs make — ARM64 `ST<op>` (no return, store-shaped) vs `LD<op>`
-(returns, load-shaped); "far atomics" are exactly the without-return class.
-
-### 6.3 Why this is the valuable subset, not a consolation prize
-
-The guards in §3 answer this themselves — the highest-value contended cases are all `rd == x0`:
-
-| litmus | instruction | class |
-|---|---|---|
-| **Test 7** AMO atomicity (forbidden `0x701`, *the exact M3b case*) | `amoadd.w x0, t2, (t3)` (`litmus.S:381`) | **without-return → SQ** |
-| **Test 6** release | `amoswap.w.rl x0, t0, (t1)` (`:348`) | **without-return → SQ** |
-| **Test 8** lock release | `amoswap.w.rl x0, x0, (t3)` (`:415`) | **without-return → SQ** |
-| barrier arrive | `amoadd.w.aqrl t1, t0, (s3)` (`:570`) | returns → old path |
-| Test 8 acquire | `lr.w.aq` / `sc.w` (`:407-410`) | returns → old path |
-
-Linux's `atomic_add`/`atomic_or`/unlock-store paths have the same shape. So §0(b)'s entire IPC
-motivation — contended counters and release stores — is covered, while LR/SC, `amocas`, MMIO
-atomics and every result-returning AMO stay on the proven single-cycle path **untouched**. That
-also shrinks the flip's blast radius: R3.3 changes behaviour only for without-return AMOs.
-
-### 6.4 Rules the SQ path must obey
-
-- **Younger overlapping accesses BLOCK — they cannot forward.** The entry's value does not exist
-  until the drain, so no S27-style forward layer is possible. Reuse the existing shape: today
-  `issue_amo_read && sb_ld_ovl` (`:7003`) blocks an AMO/LR read on a buffered overlapping store.
-  Extend the same predicate to the pending ASQ line, and — unlike the S27 store-buffer case —
-  **plain loads that overlap must block too.** (ASQ_N=1 keeps this a single compare.)
-- **Release / fence.** The ASQ drains in order behind the store buffer, so `.rl` is preserved by
-  construction. Extend the fence retire gate `!(c_serial && !sb_empty)` (`:4711`) to also
-  require the ASQ empty, or a FENCE could complete ahead of a pending atomic write.
-- **Acquire.** `.aq` on a without-return atomic: its read happens at drain, so block younger
-  loads until the entry drains (the same predicate as above — conservative and sufficient).
-- **Fault precision.** Translation + PMP stay at execute (`ac_pa_q` / `ac_wok_q` already do
-  exactly this), so a faulting atomic never allocates and no fault can surface at drain.
-- **Class exclusions:** `rd != x0`, all SC (rd = success code) and LR, `amocas`, and MMIO /
-  uncacheable (`ac_wexcl_q == 0`, a write-through cannot be an owned-line RMW) keep today's path.
-- **No new comb loop:** the drain's presence check reads registered tag state, as `dc_amo_present`
-  does today (§3.6). The ASQ needs no `chk3`-style watch at all — there is nothing to poison.
-
-### 6.5 The structural prize
-
-A without-return atomic **does not need its execute-time read**. Once R3.2's drain computes the
-value, the execute side reduces to translate + fault-check, and the class drops out of
-`issue_amo_read` / RFO-at-head / `amo_watch_*` / `amo_poison_q` / `commit_amo_replay` entirely:
-it becomes *a store with an ALU op*, allocated and drained like any other store. That is the
-canonical-LSQ end state for this class, and removing the at-head read is what actually lifts
-issue-side serialisation — the IPC in §0(b) comes from there, not from the retire bump alone.
-Sequence it as the tail of R3.2 (the read is still live and harmless during R3.1).
+The `sb_2cyc_ok` guard is a correctness fix for **both** arms, so it is deliberately *not*
+const-gated and is verified at `=0` in its own right.
