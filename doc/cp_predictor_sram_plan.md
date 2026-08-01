@@ -1261,6 +1261,53 @@ cross while a drained bundle's override is still pending, so the target stays at
 existing pop-guaranteed soft path applies unchanged. Also note the reframing this measurement forces
 — the 8–13 % soft rate is a big number, but the fraction these variants could safely convert bought
 only 0.15 %, so "raise the soft rate" is not automatically where F2-lite's IPC is hiding.
+
+## F2's IPC premise is REFUTED by measurement (2026-08-01) — variant-A beats F2-lite/F2-full
+
+The f2.3b/c dead end prompted a direct test of the plan's central IPC claim (§"The key realization":
+*"Variant-A's +48 % is mostly the cost of GATING THE FTB OFF … re-enable the FTB as the run-ahead F0
+driver … recovers the bulk of the +48 %"*). It does not. Re-measured end-to-end in the current tree:
+
+| config (current tree) | dhrystone | Δ vs =0 | N1 boot | Δ vs =0 |
+|---|---|---|---|---|
+| **=0 (shipped)** | 252939 | — | 14.27M | — |
+| **variant-A** (clocked predictors, Stage-B override, F0 purely SEQUENTIAL) | **318202** | **+25.8 %** | **16.03M** | **+12.3 %** |
+| F2-full (FTB-driven F0 + FTQ, incl. d.1 + d.1b) | 337169 | +33.3 % | 16.69M | +17.0 % |
+| F2-full + run-ahead RAS (f2.5d) | 368644 | +45.7 % | 16.95M | +18.8 % |
+
+**Variant-A — the variant that keeps the FTB OFF — is the best of the three inversion configurations
+on BOTH workloads** (dhrystone −5.6 %, boot −4.1 % vs F2-full). The FTB-driven F0 does not recover
+variant-A's cost; it ADDS to it. (f2.4's note already saw this on dhrystone — "+33 %, WORSE than
+variant-A's +26 %" — but it was attributed to dhrystone's short loops and left for boot to redeem.
+Boot does not redeem it.)
+
+**An FTB size sweep makes the mechanism unambiguous — and the sign FLIPS with authority:**
+
+| FTB entries | dhrystone @ F2-full | dhrystone @ =0 |
+|---|---|---|
+| 16 | **329192** | — |
+| 64 (shipped) | 337169 | 252939 |
+| 256 | 340655 | **251943** |
+
+Under the inversion, *fewer* FTB entries is monotonically *better*; at =0, *more* is better. So the
+FTB is a good prefetch hint **while extract is authoritative**, and a net liability **when it drives
+F0 under the inversion**: each additional FTB-followed jump costs more in reconciliation (the
+`f0_diverged` recovery flushes plus the hard override whenever the clocked full predictor disagrees)
+than its prefetch saves. That is a property of the FTB-follow mechanism itself, not of coverage,
+tuning, or the run-ahead depth — which also explains why f2.5d, f2.3b and f2.3c all failed to move it.
+
+**Consequences.**
+- **F2 (f2.1–f2.5) stands as a STRUCTURAL result, not an IPC one**: a real decoupled
+  predictor→FTQ→fetch front end exists, is correct end-to-end, and boots Linux. Its IPC is worse than
+  the simpler variant-A. Shipping any of this LIVE is a Phase-14 decision for the user; if it ever
+  ships, **variant-A (8 consts, `FTB_OVERRIDE=FTQ_DECOUPLE=0`) is the configuration to ship**, not
+  F2-lite/F2-full.
+- **Enlarging the shipped FTB is NOT worth it**: 64→256 buys −0.39 % dhrystone / −0.21 % boot at =0
+  for 4× the FTB flop RF (~7.9 Kb → ~31.5 Kb). Rejected on area.
+- The remaining honest IPC lever for the inversion is unchanged and unaddressed: the Stage-B override
+  bubble itself (+1 on every taken-cond / return / indirect), which needs a genuine fast path AT
+  Stage-A — option (B)'s L0 placed correctly, or a fundamentally different fetch structure. Not the
+  FTB.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
