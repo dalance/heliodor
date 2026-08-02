@@ -1361,12 +1361,58 @@ up-to-date history at Stage-A requires the in-flight bundle's predicted directio
 inversion is precisely what is not yet known. **The direction disagreement was not the binding
 constraint, and paying for it with staler TAGE history is net-negative.** Shipped DEAD at 0.
 
-**Still open: the L0 hangs the N1 boot.** With corner 1 fixed, variant-A + L0 is bit-exact on
-dhrystone AND coremark but the N1 boot times out at 45M (`x3=0x80a85b60`). (B) booted at 15.58M in
-2026-07-25, so this is a SECOND regression in the banked L0, not yet root-caused — the same shape as
-f2.4-fix (arch + microbenches clean, boot-only corner), and it needs the same divergence-trap
-campaign. **Until that is root-caused the L0 path — the only measured attack on the 76 % — is not
-usable**, so the deficit stands.
+## f2.7 — root-causing the L0 boot failure (2026-08-02)
+
+With corner 1 fixed, variant-A + L0 is bit-exact on dhrystone AND coremark but the N1 boot dies with
+**`Kernel panic - not syncing: Attempted to kill init! exitcode=0xb`** (init SIGSEGV). (Correction to
+an earlier note: `x3=0x80a85b60` is NOT a fingerprint — `x3`=`gp` is a kernel constant, so it only
+says "the kernel was running".) What the campaign established:
+
+- **It is NOT a wrong-path commit.** Built the f2.4-fix **divergence trap** (fetch-stream invariant
+  "A.pred_next_pc == the PC of the next committed instruction"). Two iterations were needed:
+  - Asserting the EARLY-redirect target as the next expected PC is **unsound** — it fires
+    speculatively and can be superseded before anything commits from it. It produced an identical hit
+    at cy=0xb0 on the PASSING control, and (because the original recipe latches the first hit) that
+    single false positive blinded the whole run. Fixed by asserting only the COMMIT-redirect target
+    (precise) and by reporting up to 12 hits instead of latching one. **Recommended amendment to the
+    reusable harness.**
+  - Sound version: **0 hits on the failing run**, silent on the passing control. So every committed
+    instruction's successor is exactly what the front end predicted, including across commit
+    redirects.
+- **The failing value, traced.** epc `0x800b9d3a` is `sb a4,0(t6)` inside `memcpy` with `t6`=`a0`=6;
+  a windowed commit trace of the failing call showed `kmalloc`'s inner allocator call
+  (`jal ra,0x8003434c` at `0x80048d3a`) returning **6**, so `bgeu a5,a0` (a5=16) took the
+  "allocation failed" path and returned `s0`=6 to `kstrdup`, which memcpy'd to address 6.
+- **Stream diffing hits a hard limit — the streams diverge LEGITIMATELY.** A full committed-PC diff
+  against the passing run puts the first control-flow split at commit #3,972,269 (a CRC/LFSR loop,
+  `c.beqz a5` on a data bit), with NO novel PC anywhere. Diffing committed RESULTS puts the first
+  value difference much earlier, at #3,786,987 — and it is **benign twice over**: the instruction is
+  `amoor.d zero,a5,(a1)`, whose result is architecturally discarded (and whose recorded result is
+  meaningless by design since R3.2c's `ASQ_NOREAD=1` skips the read for `rd==x0` atomics). The next
+  differences are **time-derived** (`0x7b614` vs `0x77216` ≈ cycle counts) and cascade from there.
+  Because the L0 changes cycle counts, any `rdtime` makes the two streams differ legitimately, so
+  good-vs-bad diffing cannot localize anything downstream of the first timer read.
+- **Narrowed to L0-predicted CONDITIONALS.** `L0_PRED_COND=0` (L0 restricted to unconditional +
+  return, where it can never disagree with the full predictor on direction) **BOOTS**: N1
+  **15.86M, pass=1** — and that is **−1.1 % vs variant-A's 16.03M**, a small but real working win.
+  With `L0_PRED_COND=1` the boot SIGSEGVs. dhrystone at cond-OFF is 313433 (vs variant-A 318202,
+  −1.5 %; cond-ON was 298401, −6.2 %).
+
+**Where this leaves the deficit.** The only measured attack on the 76 % is the L0, and it currently
+splits into a safe-but-small config and a valuable-but-boot-broken one:
+
+| config | dhrystone | N1 boot |
+|---|---|---|
+| variant-A | 318202 (+25.8 %) | 16.03M ✅ |
+| + L0, cond-OFF | 313433 (+23.9 %) | **15.86M ✅** |
+| + L0, cond-ON | **298401 (+18.0 %)** | SIGSEGV ❌ |
+
+**Next step for whoever resumes:** the trigger is an L0-predicted conditional, and the corruption is a
+VALUE that survives a self-consistent fetch stream. Since good-vs-bad diffing is unusable past the
+first timer read, the next tool must be **self-referential** — e.g. a checker that flags an L0
+disagreement-override whose squash overlaps an in-flight load/store, or a replay of the same config
+with `l0_redir` suppressed (keeping the Stage-A advance) to separate "the L0 steers F0" from "the L0
+advances ext_pc_q".
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
