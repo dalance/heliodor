@@ -1308,6 +1308,65 @@ tuning, or the run-ahead depth — which also explains why f2.5d, f2.3b and f2.3
   bubble itself (+1 on every taken-cond / return / indirect), which needs a genuine fast path AT
   Stage-A — option (B)'s L0 placed correctly, or a fundamentally different fetch structure. Not the
   FTB.
+
+## Deficit decomposition, and the f2.6 round (2026-08-02)
+
+**Where variant-A's deficit actually is.** Measured with the tb's own counters:
+
+| dhrystone | =0 | variant-A | Δ |
+|---|---|---|---|
+| cycles | 252939 | 318202 | **+65263** |
+| front-idle | 14066 | 63960 | **+49894** |
+
+**76 % of the deficit is front-end idle**, against ~48.8 k taken control transfers (the `sb_override`
+count) — i.e. **~1.0 cycle of front-end idle per taken transfer**, because Stage-A has no next-target.
+This CORRECTS option (B)'s conclusion that "the dominant bubble is the target's icache-read latency,
+which a Stage-A fast path cannot hide": on an icache hit the whole bubble is ~1.0 cycle, exactly what
+an L0 hit removes. (B) under-delivered on coverage/accuracy, not because of a structural ceiling.
+
+**A real bug found on the way — the banked option-(B) L0 had been silently broken since 2026-07-25.**
+Flipping variant-A + `PRED_L0_FAST` reproduced neither (B)'s numbers nor its bit-exactness: dhrystone
+instret **206663 vs 264834**, with `tohost=1` lying (the 3a.4 lesson again). Bisected to a worktree at
+the session-start commit — broken there too, so it predates this session. Root cause: **f2.4-fix
+corner 1 (`a_eff_next`) is correct for the FTB-follow and WRONG under `PRED_L0_FAST`**. The rule is
+"record the ACTUAL delivered successor"; under `FTB_OVERRIDE` the Stage-A advance IS that successor,
+but under `PRED_L0_FAST` the Stage-A advance is the L0 TARGET, and when the clocked full predictor
+then resolves NOT-taken the disagreement override re-steers to the FALL-THROUGH. Recording
+`a_eff_next` there put the L0's target in the `pred_next` of an op that actually fell through.
+Corner 1 landed after (B) was measured and nobody re-flipped (B). **Fixed** (`PRED_L0_FAST ?
+fall-through : a_eff_next`): dhrystone **bit-exact 264834** again, and the L0 is worth
+**318202 → 298401 (−6.2 %)**, coremark 409984 — the best inversion result measured so far
+(+18.0 % vs =0, down from variant-A's +25.8 %).
+
+**f2.6 — TAGE combinational at Stage-A: REFUTED.** The idea: TAGE is deliberately a register file and
+never inferred as SRAM (`sram_inventory.md:111,156`), so `TAGE_SYNC_READ` is a uniformity scaffold,
+not an SRAM-realism requirement — TAGE may stay combinational at Stage-A, letting the L0 use the REAL
+direction the full predictor will use, which removes the L0-vs-full direction disagreement that
+double-bubbled (B)'s cond-ON. Built as `TAGE_STAGEA` (Stage-B replays the value captured at produce,
+`a_tage_*`, since a combinational read is aligned to Stage-A's PC, not to the draining bundle).
+Measured:
+
+| | dhrystone | coremark |
+|---|---|---|
+| L0, TAGE clocked (bimodal direction) | 298401 | **409984** |
+| L0 + `TAGE_STAGEA`, TAGE-only direction | 299899 | — |
+| L0 + `TAGE_STAGEA`, TAGE-then-bimodal | 298400 | **414743 (+1.2 %)** |
+
+It does not help on dhrystone (1 cycle) and it **costs 1.2 % on coremark** — the very workload the
+disagreement was supposed to be hurting. Mechanism, from the counters: `earlymis` **8926 → 9412
+(+5.4 %)** while front-idle barely moves. Reading TAGE at Stage-A means the FULL predictor now indexes
+it with **one-update-staler speculative history** (`spec_ghr`/`spec_ghr_l` advance at Stage-B), and
+TAGE — unlike the bimodal — is history-dependent, so its accuracy drops. Not readily fixable: getting
+up-to-date history at Stage-A requires the in-flight bundle's predicted direction, which under the
+inversion is precisely what is not yet known. **The direction disagreement was not the binding
+constraint, and paying for it with staler TAGE history is net-negative.** Shipped DEAD at 0.
+
+**Still open: the L0 hangs the N1 boot.** With corner 1 fixed, variant-A + L0 is bit-exact on
+dhrystone AND coremark but the N1 boot times out at 45M (`x3=0x80a85b60`). (B) booted at 15.58M in
+2026-07-25, so this is a SECOND regression in the banked L0, not yet root-caused — the same shape as
+f2.4-fix (arch + microbenches clean, boot-only corner), and it needs the same divergence-trap
+campaign. **Until that is root-caused the L0 path — the only measured attack on the 76 % — is not
+usable**, so the deficit stands.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
