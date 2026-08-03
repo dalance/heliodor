@@ -1677,6 +1677,59 @@ mechanism predicted (≈1.0 cycle per taken transfer removed on an L0 hit) — b
 dominates what is left, and on coremark it is essentially the ONLY thing left. Tuning anything other
 than Stage-A next-target coverage cannot move these numbers.
 
+### f2.9 — where the remaining bubbles actually are: it is SLOT-1, not L0 capacity
+
+Every `sb_override` is one front-end bubble, and `26800 × ~0.87 cy ≈ 29608` accounts for essentially
+ALL of dhrystone's front-idle excess — so attributing the overrides IS attributing the deficit.
+Instrumented the split by CAUSE (`sb_disagree0` decomposes exactly three ways) plus, for the L0's
+own misses, the reason. Measured at variant-A + L0 cond-ON:
+
+| override cause | dhrystone | coremark |
+|---|---|---|
+| **total** | 26800 | 26677 |
+| **S1 — slot-0 agreed, SLOT-1 was taken** | **17851 (67 %)** | **18243 (68 %)** |
+| A — full taken, L0 declined (coverage miss) | 8919 (33 %) | 5952 (22 %) |
+| B — L0 took, full did not (L0 was WRONG) | 30 (0.1 %) | 2482 (9.3 %) |
+| C — both taken, targets differ | **0** | **0** |
+| A: micro-BTB miss / indirect / weak dir / no RAS | 8917 / 0 / 2 / 0 | 2682 / 4 / 3266 / 0 |
+
+**The dominant cost is not the L0 at all — it is `sb_ovr_taken1`.** The front end is 2-wide but the
+L0 only ever looked up slot 0 (`i_pc` = `ic_pc`; `slot1_pred_ok = !l0_taken`), so a taken slot-1
+branch paid an override bubble unconditionally, no matter how good the L0 was. That is two thirds of
+all bubbles on both benchmarks. **C = 0 everywhere** is worth noting separately: when the L0 hits, its
+target is always right — aliasing is simply not a problem, so nothing here argues for more tags.
+
+Added a second async read port to `l0pred` (on `s1_pc`) purely observationally, to size the prize
+before building a datapath for it:
+
+| slot-1 population | dhrystone | coremark |
+|---|---|---|
+| **covered — the L0 WOULD have predicted it** (jal / strong-cond) | **9426 (53 %)** | **14218 (78 %)** |
+| micro-BTB miss | 7425 | 683 |
+| return (would drag RAS ordering into Stage-A) | 999 | 1242 |
+| indirect / weak direction | 0 / 1 | 441 / 1659 |
+
+So the SIMPLEST possible slot-1 path — direct targets only, **returns and indirects excluded, no RAS
+at Stage-A** — addresses **35 % of all overrides on dhrystone and 53 % on coremark**. At coremark's
+~1.58 cy/override that is ~22.5 k cycles, i.e. +11.7 % → ≈ +5.5 % vs `=0`.
+
+**Micro-BTB capacity sweep — REJECTED, the lever is weak:**
+
+| micro-BTB entries | dhrystone | Δ | coremark | Δ |
+|---|---|---|---|---|
+| 32 (shipped) | 298401 | — | 409984 | — |
+| 64 | 296397 | −0.67 % | 409459 | −0.13 % |
+| 128 | 293417 | −1.67 % | 409394 | −0.14 % |
+
+4× the array for −1.67 % / −0.14 %, on an **async-read flop RF that sits on the Stage-A critical
+path** — the structure whose entire reason for existing is being fast. Same shape of trade the
+campaign already rejected for the FTB (64→256 for −0.39 %). Kept at 32. (A useful artefact of the
+sweep: slot-1 `ret` rises 999 → 3058 as entries grow, because those PCs now HIT and get identified as
+returns instead of being counted as misses — the return share is real, not a capacity artefact.)
+
+**⇒ Next lever: a slot-1 L0 path, not a bigger L0.** Chosen by measurement, against the prior
+expectation that capacity was the constraint.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
