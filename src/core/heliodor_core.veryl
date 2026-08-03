@@ -548,6 +548,8 @@ pub module heliodor_core #(
     // carried to Stage-B so the clocked full predictor can OVERRIDE only on DISAGREEMENT.
     var a_l0_taken    : logic    ; // L0 called slot-0 taken at Stage-A (→ ext_pc_q/F0 steered to a_l0_target)
     var a_l0_target   : logic<64>; // the L0 target Stage-A steered to
+    var a_l0_taken1   : logic    ; // f2.9: L0 called SLOT-1 taken at Stage-A
+    var a_l0_target1  : logic<64>; // f2.9: the slot-1 L0 target Stage-A steered to
     // f2.6: the TAGE direction READ AT STAGE-A, captured so Stage-B can replay it (see TAGE_STAGEA).
     var a_tage_hit    : logic    ;
     var a_tage_taken  : logic    ;
@@ -1272,6 +1274,12 @@ pub module heliodor_core #(
     var l0_is_ret       : logic    ;
     var l0_is_ind       : logic    ;
     var l0_bimodal_strong: logic   ;
+    var l0_hit2          : logic   ;
+    var l0_target2       : logic<64>;
+    var l0_is_cond2      : logic   ;
+    var l0_is_ret2       : logic   ;
+    var l0_is_ind2       : logic   ;
+    var l0_bimodal_strong2: logic  ;
     // Combine (mirrors predicted_taken / pred_target below, minus the iBTB): a return takes the
     // RAS peek; a non-return indirect is NOT predicted by L0 (falls through → Stage-B override);
     // a conditional is taken ONLY when the L0 bimodal is STRONG-taken (else it falls through to
@@ -1298,6 +1306,11 @@ pub module heliodor_core #(
     let l0_cond_taken : logic     = if TAGE_STAGEA ? (if tage_hit ? tage_taken : (L0_PRED_COND && l0_bimodal_strong)) : (L0_PRED_COND && l0_bimodal_strong);
     let l0_taken      : logic     = l0_hit && !l0_is_ind && (!l0_is_cond || l0_cond_taken);
     let l0_pred_target: logic<64> = if l0_use_ras ? ras_spec_top : l0_target;
+    // f2.9: slot-1 conditional direction, from the L0's own bimodal read on the
+    // slot-1 PC (port 2). Same strong-only rule as slot 0 — see o_bimodal_strong in
+    // l0pred for why an unconfident fast direction is worse than declining. TAGE is
+    // not consulted here: TAGE_STAGEA's Stage-A read is slot-0's.
+    let l0_cond_taken1: logic     = L0_PRED_COND && l0_bimodal_strong2;
     // A conditional branch is predicted taken per the direction predictor
     // (TAGE over base BHT); JAL/JALR/call/ret (is_cond=0) are predicted
     // taken on any BTB hit.
@@ -1371,6 +1384,27 @@ pub module heliodor_core #(
     // produce+squash. Without L0 (PRED_L0_FAST=0) keep the PRED_OVERRIDE optimistic path.
     let slot1_pred_ok : logic = if PRED_OVERRIDE ? (if PRED_L0_FAST ? !l0_taken : 1'b1) : !predicted_taken;
     let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && slot1_pred_ok;
+    // f2.9 SLOT-1 L0 FAST PATH. The front end is 2-wide but the L0 only ever looked
+    // up slot 0, so a taken SLOT-1 branch paid a Stage-B override bubble
+    // unconditionally — measured as 67 % (dhrystone) / 68 % (coremark) of ALL
+    // override bubbles, far more than the L0's own slot-0 coverage gap. Give Stage-A
+    // the same 0-bubble first guess for slot 1: predict it from the l0pred's second
+    // async read port (on s1_pc), advance there, and let the clocked full predictor
+    // override at Stage-B only on DISAGREEMENT — exactly the slot-0 protocol.
+    //
+    // RETURNS and INDIRECTS are deliberately EXCLUDED. A slot-1 return would have to
+    // consult the RAS at Stage-A in the same cycle slot-0 may itself push/pop it,
+    // dragging RAS ordering into the fast path for a measured 5.6 % / 6.8 % of the
+    // slot-1 population; indirects the L0 never predicts anyway. What remains — the
+    // direct targets — is 53 % / 78 % of that population, so the simple version gets
+    // nearly all of the prize with none of the ordering risk.
+    //
+    // Mutually exclusive with l0_taken by construction (slot1_pred_ok = !l0_taken
+    // already gates slot1_eligible), so Stage-A never has two fast targets at once.
+    // DEAD at 0: l0_taken1 const-false → every use below folds away byte-identically.
+    const L0_SLOT1: bit = 0;
+    // (l0_taken1 itself is defined below, next to fb_free — it has to be gated on the
+    // SAME condition that actually delivers slot 1, and that needs fb_free.)
     // slot-1 needs the next word (rdata_next) unless it is an RVC sitting in the
     // slot-0 word (b1==1 && rvc). Using the next word requires it be in the SAME
     // cache line (→ same page as slot-0, so slot-1's fetch can't fault separately).
@@ -1412,6 +1446,18 @@ pub module heliodor_core #(
     // Free slots available for a push this cycle (accounts for a simultaneous
     // drain freeing slots). fb_count 0..8, fb_pop/fb_pop2 0..1, so fb_free 0..8.
     let fb_free : logic<4> = (4'd8 - fb_count) + (if fb_pop ? 4'd1 : 4'd0) + (if fb_pop2 ? 4'd1 : 4'd0);
+    // f2.9 slot-1 L0 take (see the L0_SLOT1 comment above). Gated on the EXACT
+    // condition under which slot 1 is actually delivered — `fb_push1` minus its
+    // `fb_push0` term, i.e. slot1_valid AND fetch-buffer room for two. Gating on the
+    // weaker `slot1_eligible` is WRONG, and was measured to be: Stage-A advanced to
+    // slot-1's target on a produce that pushed only slot 0 (no room, or the
+    // cross-line s1_needs_next case), so slot 1 itself was never delivered and the
+    // instruction was SKIPPED — dhrystone retired 264336 instead of 264834. Kept
+    // produce-INDEPENDENT (like l0_taken) so ext_eff_next's every-cycle consumers
+    // (f0_diverged / ext_exp_next) see the same shape they always did.
+    let l0_slot1_deliv: logic = slot1_valid && (fb_free >= 4'd2);
+    let l0_taken1     : logic = L0_SLOT1 && PRED_L0_FAST && !l0_taken && l0_slot1_deliv
+        && l0_hit2 && !l0_is_ind2 && !l0_is_ret2 && (!l0_is_cond2 || l0_cond_taken1);
     let fb_tail1: logic<3> = fb_tail + 3'd1; // slot-1 write index (wraps mod 8)
     // ── F1 order-item-2: Stage-B skid drain / accept (PRED_PIPE) ──
     // Stage-B (the a_* skid register) drains its held bundle into the fetch buffer when the
@@ -1743,6 +1789,13 @@ pub module heliodor_core #(
     inst u_l0pred: l0pred (
         clk                                               ,
         rst                                               ,
+        i_pc2              : s1_pc                        ,
+        o_hit2             : l0_hit2                      ,
+        o_target2          : l0_target2                   ,
+        o_is_cond2         : l0_is_cond2                  ,
+        o_is_ret2          : l0_is_ret2                   ,
+        o_is_ind2          : l0_is_ind2                   ,
+        o_bimodal_strong2  : l0_bimodal_strong2           ,
         i_pc               : ic_pc                        ,
         o_hit              : l0_hit                       ,
         o_target           : l0_target                    ,
@@ -1897,7 +1950,9 @@ pub module heliodor_core #(
     // prediction (taken slot-0 → l0_pred_target) instead of pure-sequential; the
     // accompanying F0 re-steer is added in b.2, the Stage-B disagreement-override in
     // b.3. Folds to ext_seq_next at PRED_L0_FAST=0 → byte-identical.
-    let ext_l0_next : logic<64> = if l0_taken ? l0_pred_target : ext_seq_next;
+    // f2.9: a slot-1 L0 take advances Stage-A to slot-1's target (the bundle's ACTUAL
+    // delivered successor), exactly as a slot-0 take does. Folds away at L0_SLOT1=0.
+    let ext_l0_next : logic<64> = if l0_taken ? l0_pred_target : (if l0_taken1 ? l0_target2 : ext_seq_next);
     // f2.2: FIFO-follow advance. Under FTB_OVERRIDE the WORD FIFO holds F0's FTB-jumped
     // (non-sequential) stream. When the Stage-A sequential advance CROSSES the current head dword
     // AND the next FIFO entry is a non-sequential FTB target (buffered, !head1_seq), follow the
@@ -1990,7 +2045,13 @@ pub module heliodor_core #(
     // capture are squashed and F0/ext_pc_q re-steer to the target. sb_ovr_taken1 already excludes a
     // taken slot-0 (deliver1 carries !sb_slot1_kill = !predicted_taken). Commit/early redirect
     // (any_redirect) outranks it. DEAD at 0 (PRED_OVERRIDE const-false).
-    let sb_ovr_taken1     : logic     = deliver1 && pt1_eff;
+    // f2.9: with the slot-1 fast path, Stage-A has ALREADY taken slot-1's L0 target,
+    // so the clocked full slot-1 prediction overrides only on DISAGREEMENT — the same
+    // shape as sb_disagree0. Folds to plain `pt1_eff` at L0_SLOT1=0 (a_l0_taken1
+    // const-false) → byte-identical.
+    let sb_ovr_taken1     : logic     = deliver1 && (if L0_SLOT1 ?
+        ((pt1_eff != a_l0_taken1) || (pt1_eff && a_l0_taken1 && (tgt1_eff != a_l0_target1)))
+      : pt1_eff);
     // F1 option (B) b.3: with the L0 fast path, Stage-A ALREADY took the L0-predicted branch
     // (a_l0_taken → a_l0_target, via l0_redir). The clocked full slot-0 prediction (pt0_eff/tgt0_eff)
     // now OVERRIDES only on DISAGREEMENT: full and L0 differ on taken, or both taken to different
@@ -2003,7 +2064,11 @@ pub module heliodor_core #(
     let sb_override       : logic     = PRED_OVERRIDE && sb_drain && !any_redirect && (sb_disagree0 || sb_ovr_taken1);
     // Override target: full-taken → full target; else the L0 falsely took slot-0 → the slot-0
     // fall-through; else slot-1's target. Folds to `pt0_eff ? tgt0_eff : tgt1_eff` at PRED_L0_FAST=0.
-    let sb_override_target: logic<64> = if pt0_eff ? tgt0_eff : (if (PRED_L0_FAST && a_l0_taken) ? a_pc + a_len0 : tgt1_eff);
+    // f2.9 adds one arm: the L0 falsely took SLOT-1 → slot-1's fall-through.
+    let sb_override_target: logic<64> = if pt0_eff ? tgt0_eff
+        : if (PRED_L0_FAST && a_l0_taken) ? a_pc + a_len0
+        : if (L0_SLOT1 && a_l0_taken1 && !pt1_eff) ? a_s1_pc + a_s1_len
+        : tgt1_eff;
     // f2.3: prefetch-reuse soft redirect. Under FTB_OVERRIDE the FTB-followed FIFO has already
     // prefetched the taken target — F0 jumped at the branch dword so the target dword sits at the
     // FIFO's next entry (wf_head+1, the f0_prefetched_target position). When sb_override's
@@ -2043,8 +2108,8 @@ pub module heliodor_core #(
     // (an OLDER, draining bundle's full-pred correction) OUTRANKS it (a wrong older bundle squashes
     // this younger produce). The skid still CAPTURES this bundle (the taken branch is correct-path,
     // unlike sb_override which squashes a wrong-path younger produce). DEAD at 0 (PRED_L0_FAST=0).
-    let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && l0_taken && !sb_override;
-    let l0_redir_target: logic<64> = l0_pred_target;
+    let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && (l0_taken || l0_taken1) && !sb_override;
+    let l0_redir_target: logic<64> = if l0_taken ? l0_pred_target : l0_target2;
     // f2.5a: the FTB read on the INDEPENDENT pc_pred pointer (the F2-full predictor loop) — the same
     // logic as f0_ftb_hit/f0_ftb_target but indexed by pc_pred, steering the next pc_pred + the FTQ
     // enqueue. pp_no_ftb_q suppresses the redirect on the first pc_pred step after a re-seed (the
@@ -2403,6 +2468,8 @@ pub module heliodor_core #(
             a_eff_next      = 64'd0;
             a_l0_taken      = 1'b0;
             a_l0_target     = 64'd0;
+            a_l0_taken1     = 1'b0;
+            a_l0_target1    = 64'd0;
             a_tage_hit      = 1'b0;
             a_tage_taken    = 1'b0;
             a_tage_hit2     = 1'b0;
@@ -2440,6 +2507,8 @@ pub module heliodor_core #(
                 a_eff_next      = ext_eff_next;
                 a_l0_taken      = l0_taken;
                 a_l0_target     = l0_pred_target;
+                a_l0_taken1     = l0_taken1;
+                a_l0_target1    = l0_target2;
                 // f2.6: the Stage-A TAGE read, aligned to a_pc — Stage-B replays it (tage_*_sb).
                 a_tage_hit      = tage_hit;
                 a_tage_taken    = tage_taken;

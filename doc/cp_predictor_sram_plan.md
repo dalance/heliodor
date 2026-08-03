@@ -1730,6 +1730,56 @@ returns instead of being counted as misses — the return share is real, not a c
 **⇒ Next lever: a slot-1 L0 path, not a bigger L0.** Chosen by measurement, against the prior
 expectation that capacity was the constraint.
 
+### f2.10 — the slot-1 L0 fast path, BUILT and measured (`L0_SLOT1`, DEAD at 0)
+
+Built what f2.9 pointed at: a second async read port on `l0pred` (on `s1_pc`) and the same
+Stage-A-predict / Stage-B-override-on-disagreement protocol slot 0 already had. Returns and
+indirects deliberately excluded, so the RAS never enters the Stage-A fast path.
+
+Touches, all folding away at `L0_SLOT1=0`: `l0_taken1` + `l0_slot1_deliv`; `ext_l0_next` (Stage-A
+advances to slot-1's target); `l0_redir` / `l0_redir_target` (the F0 re-steer); `a_l0_taken1` /
+`a_l0_target1`; `sb_ovr_taken1` becomes a disagreement check mirroring `sb_disagree0`; one new arm in
+`sb_override_target` for "the L0 falsely took slot 1" → slot-1's fall-through.
+
+| | =0 | variant-A + L0 | **+ slot-1** | Δ |
+|---|---|---|---|---|
+| dhrystone | 252939 | 298401 (+18.0 %) | **286080 (+13.1 %)** | **−4.13 %** |
+| coremark | 367139 | 409984 (+11.7 %) | **407093 (+10.9 %)** | −0.71 % |
+| litmus N=2 | 3.039 M | 3.279 M (+7.9 %) | **3.101 M (+2.0 %)** | −5.5 % |
+| boot N=1 | 14.27 M | 15.64 M (+9.6 %) | **15.51 M (+8.7 %)** | −0.84 % |
+
+instret BIT-EXACT on both benchmarks (264834 / 374357). `veryl test` **252/0** with it on; at
+`L0_SLOT1=0` the whole ladder is byte-identical to the f2.8 numbers, and at the shipped default
+config `veryl test` 252/0 + litmus `0x2e6300` + dhrystone 252939/264834 are unchanged — the scaffold
+is genuinely inert.
+
+Overrides: dhrystone 26800 → 16640 (S1 17851 → **7825**), coremark 26677 → 14056 (S1 18243 →
+**5735**). The `s1: covered` population collapses to ~0, which is the signature of exactly those
+bubbles now being covered.
+
+**A bug in the first cut, caught by instret and worth recording.** The initial gate was
+`slot1_eligible`. That is NOT the condition under which slot 1 is delivered — `fb_push1` also needs
+`slot1_valid` (the cross-line `s1_needs_next` case) and fetch-buffer room for two. So Stage-A
+advanced to slot-1's target on produces that pushed only slot 0, and **slot 1 was skipped**:
+dhrystone retired **264336 instead of 264834**. `tohost` still said pass — the 3a.4 lesson again, and
+the reason instret is the canary of record. Fixed by gating on `slot1_valid && fb_free >= 2`, kept
+produce-INDEPENDENT so `ext_eff_next`'s every-cycle consumers (`f0_diverged` / `ext_exp_next`) see
+the shape they always did.
+
+**A projection of mine that was WRONG, also worth recording.** f2.9 estimated coremark would go
++11.7 % → ≈ +5.5 %, by dividing its front-idle excess by its override count (1.58 cy/override) and
+scaling. Actual: **+10.9 %**. Measured cost per override removed is **1.21 cy on dhrystone but only
+0.23 cy on coremark** — on coremark the front-end bubbles largely OVERLAP icache/back-end stalls, so
+removing them buys almost nothing. **A global average cycles-per-override is not a valid projector**;
+it is only near-additive where the front end is actually the binding constraint (dhrystone, litmus).
+
+**Where the deficit stands now.** dhrystone +13.1 %, remaining overrides 16640 = slot-0 coverage 8782
+(all micro-BTB miss) + slot-1 7825 (btbmiss 6836, returns 984). So after the slot-1 path the
+remaining population IS mostly micro-BTB capacity — but f2.9 already measured that lever as weak
+(−1.67 % for 4× the array, on the Stage-A critical path), and it would now have to pay for BOTH
+slots' read ports. Not obviously worth it; the honest next candidates are slot-1 returns (needs RAS
+at Stage-A) and coremark's direction confidence, neither of which is a capacity problem.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
