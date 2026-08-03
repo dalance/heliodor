@@ -1780,6 +1780,61 @@ remaining population IS mostly micro-BTB capacity — but f2.9 already measured 
 slots' read ports. Not obviously worth it; the honest next candidates are slot-1 returns (needs RAS
 at Stage-A) and coremark's direction confidence, neither of which is a capacity problem.
 
+### 🚩 f2.11 — the synth answer: the predictor is NOT on the critical path (CP-neutral flip)
+
+The one thing the campaign had never measured: what the front-end flip does to **synth CP**. Run in
+the current tree, sky130, `veryl synth --top heliodor_core --dump-timing/--dump-area`, baseline vs
+the full LIVE candidate (variant-A 8 consts + `PRED_L0_FAST` + `L0_SLOT1`):
+
+| | CP | top path | gates | FFs | area (um²) |
+|---|---|---|---|---|---|
+| `=0` shipped | **12.975 ns** | `pc_fetch_q[34] → n_inflight[5]`, 138 levels | 1178181 | 162575 | 19877985.60 |
+| variant-A + L0 + slot-1 | **12.975 ns** | **identical, cell-for-cell** | 1193696 | 167975 | 20153085.60 |
+| Δ | **0.000 ns** | — | +1.32 % | **+3.32 %** | +1.38 % |
+
+**The critical path contains ZERO predictor cells** — grepping path #1 for `btb|bht|tage|ibtb|l0pred`
+returns nothing. What the 12.975 ns megacone actually is:
+
+```
+pc_fetch_q → u_imem_mmu.u_mmu (Sv39 translate) → u_icache.i_addr → u_icache.next_hit
+           → u_dcache.i_wen → rob_commit_valid → commit_trap → u_fl.n_inflight
+```
+
+i.e. **instruction-fetch MMU + icache hit → commit/trap → rename resource**. The branch predictor
+read is a shorter PARALLEL cone that never binds, so making it clocked cuts something that was not
+the wall. The identical number is a real measurement, not a stale-cache artefact: FF count moves
+162575 → 167975 (+5400 = the sync-read output registers + the L0 flop RF + its slot-1 read port) with
+RAM bits unchanged at 1627752, so the netlist demonstrably changed while path #1 did not.
+
+Second front, for reference: `head[0] → xline_lo_q` at 12.680 ns — the commit-store PMP
+(`u_dmem_mmu.u_pmp_amo_w`) → `m_wstrb_q` → dcache `d1_msk` cone. Also not front-end. So even a
+*perfect* front-end cut could only have bought 0.295 ns (2.3 %) before hitting a non-front-end wall.
+
+**⇒ The LIVE decision is a pure structure-for-IPC trade with NO timing compensation:**
+
+| | cost of going LIVE |
+|---|---|
+| dhrystone | **+13.1 %** (was +18.0 % before the L0 + slot-1 work) |
+| coremark | +10.9 % |
+| boot N=1 / N=2 / N=4 | +8.7 % / +7.5 %* / +5.3 %* |
+| litmus N=2 | +2.0 % |
+| synth CP | **0.000 ns** |
+| area / FFs | +1.38 % / +3.32 % |
+
+<sub>* N=2/N=4 measured at f2.8 without the slot-1 path; both improve with it.</sub>
+
+This is **not** the "free structural win" the campaign's framing might suggest, and it is worth
+stating plainly. Phase 14's mandate is explicitly *structural completeness, not CP*, and
+`feedback: CP-neutral stage boundaries still count as progress` — on those terms a clocked-read
+predictor is a genuine advance toward what a real core has, and the L0 + slot-1 work is what brought
+the price down from +18.0 % to +13.1 %. But the price is real, it is paid on every workload, and
+nothing in the timing report offsets it. **The flip is the user's call; the measurement no longer
+leaves it ambiguous.**
+
+**If CP were the goal instead**, this report names the target unambiguously and it is not the
+predictor: the `imem_mmu → icache → commit_trap → n_inflight` fetch-to-rename megacone (138 levels),
+with the commit-store PMP → dcache mask cone 0.295 ns behind it.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
