@@ -1445,6 +1445,44 @@ silent trap alongside a corrupted machine. The other live suspects are the liven
 (`em*_live`, age &lt; size), the IQ partial squash, and the LSU/store-buffer view of a partial squash.
 Next step: instrument `early_redir_fix*` (which entry is rewritten, with what, and whether that entry
 is still live) rather than chasing the L0 further.
+
+### Reproduction recipe for the S8.E hunt (self-contained — start in a clean context)
+
+**The failing configuration** = variant-A (8 consts) + the L0, with the shipped early redirect on:
+
+```sh
+sed -i 's/const PRED_PIPE: bit = 0;/const PRED_PIPE: bit = 1;/'               src/core/heliodor_core.veryl
+sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'       src/core/heliodor_core.veryl
+sed -i 's/const PRED_HOLD_FREEZE: bit = 0;/const PRED_HOLD_FREEZE: bit = 1;/' src/core/heliodor_core.veryl
+sed -i 's/const PRED_L0_FAST: bit = 0;/const PRED_L0_FAST: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const IBTB_SYNC_READ: bit = 0;/const IBTB_SYNC_READ: bit = 1;/'     src/core/ibtb.veryl
+sed -i 's/const BHT_SYNC_READ: bit = 0;/const BHT_SYNC_READ: bit = 1;/'       src/core/bht.veryl
+sed -i 's/const BTB_SYNC_READ: bit = 0;/const BTB_SYNC_READ: bit = 1;/'       src/core/btb.veryl
+sed -i 's/const TAGE_SYNC_READ: bit = 0;/const TAGE_SYNC_READ: bit = 1;/'     src/core/tage.veryl
+sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'       src/core/rob.veryl
+# FTB_OVERRIDE / FTQ_DECOUPLE / PRED_RAS_AHEAD / TAGE_STAGEA stay 0 (variant-A, not F2).
+```
+Revert with `git checkout -- src/core/{heliodor_core,ibtb,bht,btb,tage,rob}.veryl`.
+
+- **FAIL signature:** `veryl test --ignored --test test_soc_linux_boot` → 45M timeout,
+  `Kernel panic - not syncing: Attempted to kill init! exitcode=0xb`, fault `epc=0x800b9d3a`
+  (memcpy `sb a4,0(t6)` with `t6=a0=6`). Console is UART-doubled — de-double with
+  `sed 's/\(.\)\1/\1/g'`. dhrystone/coremark are BIT-EXACT in this config, so the boot is the only
+  reproducer.
+- **The one-line control that proves it is S8.E, not the L0:**
+  `sed -i "s/let s8e_flip_en: logic = 1'b1;/let s8e_flip_en: logic = 1'b0;/" src/core/heliodor_core.veryl`
+  → boots, 15.58M. Toggle it back and forth to confirm before instrumenting anything.
+- **Kernel disasm** (needed to read any PC): hex line `M = (PA - 0x80000000)/4 + 1` in
+  `test/hex/linux_dram_real.hex`; extract N words, little-endian each to bytes, then
+  `toolchain/elf/bin/riscv64-unknown-elf-objdump -b binary -m riscv:rv64 -M no-aliases -D
+  --adjust-vma=0x<PA>`. **Committed PCs are VIRTUAL** (`0xffffffff80xxxxxx`); the VA→PA offset is 0,
+  so compare traces against the VA, not the PA (a full trace run was wasted on this).
+- **Trace plumbing** already proven in this campaign: `o_commit2_is_rvc` / `o_commit2_instr` are the
+  two temp `rob` ports lane-B tracing needs (`sh_is_rvc[head1_idx]` / `sh_instr[head1_idx]`).
+  Veryl relational operators are `<:` / `>:` (not `<` / `>`).
+- **Capture gotcha:** pipe a long `$display` run to a FILE and post-process it; piping the live run
+  through `grep | sort` silently truncated a 10.4M-line trace to 51 k lines and produced a bogus
+  "streams identical" conclusion.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
