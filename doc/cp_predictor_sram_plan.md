@@ -1640,6 +1640,43 @@ S8E-IRQ cy=7325862 NEW=800b3ebe OLD=800b3ec2 if_v=0 if_pc=800b3f22 ic_pc=800b3ec
 with the fetch buffer already EMPTY (`fbc=0`) — so the `if_v_q ? if_pc_q : ic_pc` selector, which
 only ever accounted for ONE fetched-but-undispatched instruction, had nothing left to fall back on.
 
+### f2.8 — the corrected ladder for variant-A + L0 cond-ON (2026-08-03)
+
+With the epc fix in, the whole ladder was re-measured end-to-end in one tree. **This is the first
+time the cond-ON configuration has passed every gate**, so it supersedes every earlier cond-ON
+number (those were taken from a machine whose boot was broken).
+
+| gate | =0 (shipped) | **variant-A + L0 cond-ON** | Δ |
+|---|---|---|---|
+| `veryl test` | 252 / 0 | **252 / 0** | — |
+| litmus N=2 | `0x2e6300` 3.04 M | `0x320c80` 3.28 M | +7.9 % |
+| litmus N=4 | `0x3b0d30` 3.87 M | `0x3fef30` 4.19 M | +8.3 % |
+| dhrystone | 252939 | **298401** | **+18.0 %** |
+| coremark | 367139 | **409984** | **+11.7 %** |
+| boot N=1 | `0x0d9be30` 14.27 M | `0x0eea5c0` **15.64 M** | +9.6 % |
+| boot N=2 SMP | `0x125bb50` 19.25 M | `0x13bdb60` **20.70 M** | +7.5 % |
+| boot N=4 SMP | `0x1c4e180` 29.68 M | `0x1dcaf40` **31.24 M** | +5.3 % |
+
+instret is BIT-EXACT vs `=0` on both benchmarks (264834 / 374357), so every delta above is pure
+front-end cycles. Against the previously best BOOTABLE inversion config (variant-A): dhrystone
+318202 → 298401 (**−6.2 %**), boot N1 16.03 M → 15.64 M (**−2.4 %**).
+
+**The cost falls as harts are added** (+9.6 % → +7.5 % → +5.3 %): SMP boot is increasingly
+memory/coherence bound, so a front-end cost matters less. The single-hart numbers are the worst case.
+
+**Deficit decomposition — the remaining cost is almost entirely front-end idle:**
+
+| | cycles Δ vs =0 | front-idle Δ vs =0 | front-idle share of the deficit |
+|---|---|---|---|
+| dhrystone, variant-A | +65263 | +49894 | 76 % |
+| dhrystone, **+L0** | **+45462** | **+29608** | **65 %** |
+| coremark, **+L0** | +42845 | +42113 | **98 %** |
+
+So the L0 removed **41 %** of variant-A's front-idle excess (49894 → 29608) — real, and exactly the
+mechanism predicted (≈1.0 cycle per taken transfer removed on an L0 hit) — but the SAME lever still
+dominates what is left, and on coremark it is essentially the ONLY thing left. Tuning anything other
+than Stage-A next-target coverage cannot move these numbers.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
