@@ -1409,6 +1409,11 @@ splits into a safe-but-small config and a valuable-but-boot-broken one:
 
 ## 🚨 f2.7 RESULT — the L0 is INNOCENT; the bug is in the EARLY-REDIRECT (S8.E) path
 
+> **Amended by the root-cause section below.** The "S8.E is where the bug lives" half of this
+> heading is WRONG. S8.E is the EXPOSER, not the location: the defect is an unsound interrupt-`epc`
+> source in the commit/CSR path that is present with the early redirect off too. Everything else
+> here (the L0 is innocent, `s8e_flip_en=0` boots) stands. Kept as written — this is a lab notebook.
+
 Continuing the bisection past the "L0-predicted conditional" trigger produced the real answer.
 **Disabling the execute-time early redirect (`s8e_flip_en = 1'b0`, the documented revert-to-S8.D
 knob) makes variant-A + L0 cond-ON BOOT — N1 `cy=0x00edbb60` ≈ 15.58M, pass=1** — and that is the
@@ -1483,6 +1488,173 @@ Revert with `git checkout -- src/core/{heliodor_core,ibtb,bht,btb,tage,rob}.very
 - **Capture gotcha:** pipe a long `$display` run to a FILE and post-process it; piping the live run
   through `grep | sort` silently truncated a 10.4M-line trace to 51 k lines and produced a bogus
   "streams identical" conclusion.
+- **`$display` gotcha (new):** the Veryl simulator's formatter supports only bare `%h/%d/%b/%o/%c/%s`
+  — a WIDTH/FLAG modifier is not parsed (`crates/simulator/src/ir/statement.rs:486`, the `_ =>` arm).
+  `%0d` therefore prints the two characters `%0` followed by `d` and **consumes no argument**, so a
+  whole instrumented run comes back as unsubstituted format strings. Use `%d`, never `%0d`. (Real SV
+  accepts `%0d`, so this is a genuine simulator gap worth an upstream fix.)
+
+### f2.7 instrumentation round 1+2 — the rename/writeback datapath is INNOCENT
+
+Instrumented the failing configuration with five always-on invariant detectors in the core / `rob` /
+`rat` (all silent unless violated, plus a 1 M-cycle summary line). Two runs, both carried **past** the
+point where the passing control has already booted (23.0 M and 16.8 M cycles vs the 15.58 M passing
+boot), **every counter zero**:
+
+| detector | what a hit would mean | result |
+|---|---|---|
+| `S8E-STALE0/1` | a CDB writeback whose `rob_idx` age ≥ `rob_size` — a squashed op's straggler landing in a dead entry (its pdst already reclaimed) | **0** |
+| `S8E-WBDUP` | an entry written back **twice** between alloc and commit — the same straggler landing in a slot that has since been REALLOCATED, the one shape the head-relative liveness test cannot see | **0** |
+| `S8E-TAGBAD` | CDB `pdst` ≠ the ROB entry's `rd_pdst` — an IQ payload/`rob_idx` desync after a partial squash (FU writes through the wrong physical tag) | **0** |
+| `S8E-RATDUP` | `rat_spec` (or `rat_arch`) not pairwise distinct — the free list handed one tag out twice, the classic mis-sized checkpoint rewind | **0** |
+| `S8E-MISROUTE` | `early_redir_fix0` applied to a different entry than the ALU resolved, because it rides the SHARED lane-0 `cdb` priority mux (fpu > mshr > int_div > alu > lsu > vu) while being derived from `alu_cdb_eff` | **0** |
+| `S8E-SURVIVOR` | both lanes mispredict and the NON-selected (also-fixed) lane is not strictly younger, so the partial squash would not remove it | **0** |
+| `S8E-MSHRABAND` | an MSHR entry squashed while it OWNS an in-flight dcache fill — the fill is bound to a load by `own_q`, NOT by a line tag, so an orphaned fill can be latched by whichever entry holds the slot when it lands | **0** |
+| `S8E-LSRABAND` | the LSR squashed mid Stage-B read | ~13/M — **benign, see below** |
+
+So the `early_redir_fix` rewrite itself is well-behaved, and the whole **stale-writeback / renaming**
+class is dead: no straggler write, no double write, no tag desync, no free-list double-allocation.
+Worth recording because two of these looked structurally damning by inspection:
+
+- **the lane-0 CDB priority mux** genuinely can deliver a different op than `alu_cdb_eff` — but only
+  at `EX_PIPE=1`; at the shipped `EX_PIPE=0` the ALU issue gate (`!fpu_cdb.valid && !mshr_cdb.valid`,
+  plus a DIV holding the `iq_int` head) makes `cdb ≡ alu_cdb_eff` whenever the ALU is valid. **A
+  latent `EX_PIPE=1` hazard, not this bug.**
+- **`fpu_wrap` is the one FU that is NOT told about the partial squash** — its `i_flush` is wired to
+  `redirect_fire` (commit redirect) only, so a stage-2 op younger than the resolved branch keeps
+  going. The div/sqrt FSMs were already hardened against exactly this (`done_for_me`, and the comment
+  there says outright that the early redirect does not assert `i_flush`), but `s2_valid` is not. The
+  detectors say this window is never actually hit in this boot, so it too is **latent, not the bug**.
+- **the LSR abandoned mid-read** DOES happen (~13 per million cycles, and the printed events are the
+  expected shape — the squashed load sits exactly one ROB slot after the resolving branch). It is
+  nonetheless **benign**: `dcache.o_rdata` is driven from the tag/data lookup of the address being
+  driven THIS cycle (`dhit_rdata_sel` / `o_rdata_live`), not from a fill buffer keyed to the original
+  miss offset, and `o_stall` holds through `FILL`/`DONE`/`miss` — so the LSR's next occupant reads
+  its own address or waits. (`o_fill_rdata`, which IS keyed to the original miss offset, goes only to
+  the MSHR, and `S8E-MSHRABAND` says that binding is never orphaned.) Worth recording because the
+  asymmetry is real: after a FULL flush the pipe is empty and the abandoned access has long finished
+  before a new load can issue, whereas after a PARTIAL squash a new load can capture the LSR two
+  cycles later — S8.E genuinely opens a window that S8.D never opens.
+
+**Next step: budget bisection** (the technique that localized the R3.2c atomic bug). `S8E_BUDGET`
+lets the early redirect fire only for its first N events and behave exactly like `s8e_flip_en=0`
+after; a binary search over N names the single early redirect that breaks the machine. The boot tb's
+chunk cap is temporarily 1800 (18 M) instead of 4500 (45 M) so a failing probe aborts in a third of
+the time. Bracket measured: **94,428 firings** over the failing run, ~11–13 min per probe, so ~17
+iterations. It is sound because the budget only truncates the event sequence — the first N firings
+of a budget-N run are bit-identical to the first N of the unlimited run, so the search converges on a
+single, dumpable event.
+
+### 🎯 f2.7 BISECTION RESULT — the culprit is early-redirect firing **#88,784**
+
+17 probes, monotone as required (every budget ≤ 88,783 boots, every budget ≥ 88,784 fails):
+
+```
+budget  47250 PASS   70875 PASS   82687 PASS   88593 PASS   88777 PASS   88782 PASS   88783 PASS
+budget  91546 FAIL   90069 FAIL   89331 FAIL   88962 FAIL   88869 FAIL   88823 FAIL   88800 FAIL
+        88788 FAIL   88785 FAIL   88784 FAIL
+⇒ last-good budget 88783, first-bad 88784
+```
+
+Sanity-checked rather than assumed: each probe's `S8E-SUM` shows `fire` saturating at exactly its
+configured budget (so the `sed` really took), and `lsrab` differs between probes (so the trajectories
+really are distinct). The identical shutdown cycle across several PASS probes is timer quantization
+at the end of boot, not a stuck knob.
+
+**The payoff is a perfectly matched control.** A budget-N and a budget-(N+1) run are bit-identical up
+to firing N, so `S8E_BUDGET=88783` (PASS) and `88784` (FAIL) form an aligned pair from the culprit
+firing onward. That defeats the wall this campaign hit earlier — good-vs-bad committed-stream diffing
+was useless because any `rdtime` read makes two differently-timed runs diverge legitimately. Here the
+two streams are architecturally identical until the bug bites, so the **first non-time-derived
+difference names the corrupted instruction outright**. `S8E_DUMP_FROM` dumps `(pc, rd, value)` for
+both commit lanes from firing #88,783 on, in both arms, for the diff.
+
+## 🎉 f2.7 ROOT CAUSE — an interrupt's `epc` was read off the SPECULATIVE FRONT END
+
+The matched-control diff put the machine's death on one line. First difference, commit #380 — the
+trap-entry save of the interrupted PC — and then the payoff 2000 commits later:
+
+```
+PASS   C0 80002714 x0 <- 0102     (sret)          FAIL   C0 80002714 x0 <- 0102     (sret)
+       C0 80048d3a x1 <- 80048d3e  jal ra,8003434c        C0 80048d3e ...   <- jal SKIPPED
+       C0 8003434c ... (callee, 25 instrs)                C0 80048d40 x8 <- 6
+       C0 8003438e x0 <- 80034390  ret
+       C1 80048d3e ...             back at caller
+```
+
+`0x80048d3e` is the FALL-THROUGH of a taken `jal` — a PC the architectural control flow never
+reaches. The interrupt's `sepc` was wrong, `sret` resumed past the call, the callee never ran, and
+`a0` kept a stale 6 — which is precisely the "`kmalloc`'s inner call returned 6" the earlier windowed
+trace had found, now explained rather than merely observed.
+
+**The defect** (`heliodor_core.veryl`, the `csr` instance):
+
+```veryl
+let commit_irq: logic = (rob_size == 8'd0) && !redirect_fire_q && !commit_excp && csr_irq_pending;
+i_trap_pc: if commit_irq ? (if if_v_q ? if_pc_q : ic_pc) : ... c_pc,   // ← unsound
+```
+
+An async interrupt's `epc` must be the architectural successor of the last COMMITTED instruction —
+a commit-side quantity. It was instead read off the front end. `if_pc_q`/`ic_pc` are **speculative
+fetch pointers**, and `rob_size == 0` drains the ROB but says nothing about the **fetch pipeline**:
+`ic_pc` runs ahead of the architectural PC by an amount that varies with front-end depth and timing.
+Both arms take this interrupt on the SAME cycle (11,325,830) with `if_v=0`, so both fall to `ic_pc`:
+
+| | `ic_pc` (= `sepc`) | `since_earl` |
+|---|---|---|
+| PASS | `80048d3a` ✅ the jal | 255 (no early redirect) |
+| FAIL | `80048d3e` ❌ its fall-through | 199 |
+
+Same last-committed instruction, same cycle, different `epc` — `epc` had become a function of
+TIMING rather than of architectural state.
+
+**The fix**: maintain the committed architectural next PC and use it.
+
+```veryl
+let c2_arch_next_pc: logic<64> = c2_pc + (if c2_is_rvc ? 64'd2 : 64'd4);
+always_ff (clk, rst) {
+    if_reset            { arch_next_pc_q = RESET_PC;        }
+    else if redirect_fire { arch_next_pc_q = redirect_pc;     }   // commit redirect target
+    else if commit2_fire  { arch_next_pc_q = c2_arch_next_pc; }   // slot 1 (non-control by c2_simple)
+    else if rob_commit_ack { arch_next_pc_q = c_arch_next_pc; }   // slot 0, full control-aware form
+}
+i_trap_pc: if commit_irq ? arch_next_pc_q : ...
+```
+
+`c_arch_next_pc` already existed (it is what the commit-time mispredict check compares against); the
+EARLY redirect is deliberately NOT tracked, since it is speculative and its branch has not committed.
+Needs one new `rob` output, `o_commit2_is_rvc` (slot-1 length) — slot-1 commit excludes control ops,
+so slot-1's successor is just `pc+len`. **44 + 6 lines total.**
+
+**Result: the failing configuration BOOTS** — variant-A + L0 cond-ON + `s8e_flip_en=1`, unlimited
+budget, `cy=0x00eea5c0` ≈ **15.64 M, pass=1** (vs variant-A's 16.03 M: **−2.4 %**).
+
+And the mechanism is proven, not just the symptom cured: instrumenting "IRQs where the fixed `epc`
+differs from the old one" over the whole 15.6 M-cycle boot reports **exactly one**:
+
+```
+S8E-IRQ cy=7325862 NEW=800b3ebe OLD=800b3ec2 if_v=0 if_pc=800b3f22 ic_pc=800b3ec2 since_earl=255 fbc=0
+```
+
+`OLD = NEW + 4`: the old source skipped one 4-byte instruction that was still inside the fetch pipe,
+with the fetch buffer already EMPTY (`fbc=0`) — so the `if_v_q ? if_pc_q : ic_pc` selector, which
+only ever accounted for ONE fetched-but-undispatched instruction, had nothing left to fall back on.
+
+### Corrections to the earlier f2.7 write-up
+
+- **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
+  redirect anywhere near it. The unsound `epc` source is in the shipped commit/CSR path and is
+  independent of the early redirect; S8.E (and variant-A's deeper front end, and the L0) only change
+  the timing that decides whether the window is hit. So this is a **latent correctness bug in the
+  shipped core**, not a defect of the DEAD scaffolds — the f2.7 heading above overstated the case.
+- **The event is rare and timing-fragile**: one occurrence per boot, and any front-end timing change
+  moves whether it happens at all. That is why variant-A alone boots and variant-A + L0 does not, and
+  why dhrystone/coremark are bit-exact in the failing configuration (no interrupts of consequence).
+- **Method note.** The three techniques that mattered, in order: (1) invariant detectors to kill whole
+  hypothesis classes cheaply — six of them, all zero, which is what stopped the hunt from chasing the
+  rename/writeback datapath; (2) **budget bisection** to name the single causal event; (3) the
+  **matched control** that bisection hands you for free, which is what finally beat the `rdtime`
+  problem that had made good-vs-bad stream diffing useless.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is

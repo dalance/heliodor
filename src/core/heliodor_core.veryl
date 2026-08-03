@@ -4854,6 +4854,12 @@ pub module heliodor_core #(
     var c2_old_rd_pdst: logic<PRF_INT_W>;
     var c2_has_rd     : logic           ;
     var c2_result_data: logic<64>       ;
+    var c2_is_rvc     : logic           ;
+    // The COMMITTED architectural next PC — the PC the hart would execute next if
+    // it stopped here. Declared up with the other commit-stage signals so the csr
+    // instance can take it as an interrupt's epc; maintained next to
+    // c_arch_next_pc below, where its rationale is documented.
+    var arch_next_pc_q: logic<64>       ;
     var c_has_rd      : logic           ;
     var c_illegal     : logic           ;
     var c_redirect_pc : logic<64>       ;
@@ -5304,6 +5310,7 @@ pub module heliodor_core #(
         o_commit2_old_rd_pdst: c2_old_rd_pdst       ,
         o_commit2_has_rd     : c2_has_rd            ,
         o_commit2_result_data: c2_result_data       ,
+        o_commit2_is_rvc     : c2_is_rvc            ,
         i_commit_ack2        : commit2_fire         ,
         i_redirect_fire      : redirect_fire        ,
         // Phase 8 S8.E: early partial squash (flip). Rewind tail to one past the
@@ -5766,13 +5773,14 @@ pub module heliodor_core #(
         // M9: inject_fake_ifault synthesizes a trap as if the post-csrw-satp
         // fetch had taken a page fault. epc/stval = c_pc + 4 (the would-be
         // faulting VA), cause = 12 via excp_cause path.
-        // M9.A.288: on commit_irq the ROB is empty (rob_size==0) so c_pc
-        // is stale. Use the PC of the next instruction the hart would
-        // have executed: if a fetched-but-not-dispatched instr exists
-        // (if_v_q=1), that PC is if_pc_q; otherwise pc_q (= next to
-        // fetch). Same approach as v1's ifid_pc selector at
-        // heliodor_core.veryl:4366.
-        i_trap_pc: if commit_irq ? (if if_v_q ? if_pc_q : ic_pc) : if inject_fake_ifault ? c_pc + 64'd4 : c_pc,
+        // M9.A.288: on commit_irq the ROB is empty (rob_size==0) so c_pc is
+        // stale — the epc must be the PC of the next instruction the hart would
+        // have executed. That was originally taken from the front end
+        // (if_v_q ? if_pc_q : ic_pc, after v1's ifid_pc selector), which is
+        // UNSOUND: those are speculative fetch pointers and rob_size==0 drains
+        // only the ROB, not the fetch pipeline. It is now the committed
+        // architectural next PC — see the arch_next_pc_q block below.
+        i_trap_pc: if commit_irq ? arch_next_pc_q : if inject_fake_ifault ? c_pc + 64'd4 : c_pc,
         i_trap_cause: trap_cause,
         // mtval/stval for page faults carry the faulting VA; other
         // exception kinds leave it at 0 for now.
@@ -5973,6 +5981,39 @@ pub module heliodor_core #(
     // c_bp_mispredict is 0 for it regardless of the added term.
     let c_bp_mispredict: logic     = rob_commit_valid && (c_pred_next_pc != c_arch_next_pc)
         && (c_is_control || rob_commit_ack);
+
+    // An async interrupt's epc must be the architectural successor of the LAST
+    // COMMITTED instruction — a commit-side quantity. It used to be read off the
+    // front end (`if_v_q ? if_pc_q : ic_pc`) under a `rob_size == 0` guard, but
+    // those are SPECULATIVE fetch pointers: draining the ROB says nothing about the
+    // FETCH pipeline, and ic_pc runs ahead of the architectural PC by an amount
+    // that varies with front-end depth and timing. Observed on a Linux boot: an
+    // interrupt was taken while a `jal` was still inside the fetch pipe with the
+    // fetch buffer already empty, so ic_pc pointed at that jal's FALL-THROUGH; epc
+    // skipped the jal and sret resumed PAST a taken jump, silently dropping a call
+    // and leaving its return register stale (init then SIGSEGV'd on the garbage
+    // pointer). Nothing downstream can catch it: sret really does branch to epc, so
+    // the committed PC stream stays self-consistent and only a register value is
+    // wrong. Rare — one occurrence per ~15 M-cycle boot — and any front-end timing
+    // change moves whether it is hit at all.
+    //
+    // Slot-1 commit is restricted to non-control ops (rob's c2_simple), so its
+    // successor is pc+len; slot 0 uses the full c_arch_next_pc. A commit redirect
+    // re-points the architectural PC at its target, so track that too (the same
+    // value pc_q takes). The EARLY (execute-time) redirect is deliberately NOT
+    // tracked: it is speculative, and its branch has not committed.
+    let c2_arch_next_pc: logic<64> = c2_pc + (if c2_is_rvc ? 64'd2 : 64'd4);
+    always_ff (clk, rst) {
+        if_reset {
+            arch_next_pc_q = RESET_PC;
+        } else if redirect_fire {
+            arch_next_pc_q = redirect_pc;
+        } else if commit2_fire {
+            arch_next_pc_q = c2_arch_next_pc;
+        } else if rob_commit_ack {
+            arch_next_pc_q = c_arch_next_pc;
+        }
+    }
     // Phase 8 M2: predictor training at retire. c_taken = a committed control
     // op went taken (its resolved target differs from the fall-through). Train
     // the BTB on every taken control op (allocate/refresh target + conditional
