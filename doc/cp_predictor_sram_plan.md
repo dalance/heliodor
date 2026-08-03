@@ -1407,12 +1407,44 @@ splits into a safe-but-small config and a valuable-but-boot-broken one:
 | + L0, cond-OFF | 313433 (+23.9 %) | **15.86M ✅** |
 | + L0, cond-ON | **298401 (+18.0 %)** | SIGSEGV ❌ |
 
-**Next step for whoever resumes:** the trigger is an L0-predicted conditional, and the corruption is a
-VALUE that survives a self-consistent fetch stream. Since good-vs-bad diffing is unusable past the
-first timer read, the next tool must be **self-referential** — e.g. a checker that flags an L0
-disagreement-override whose squash overlaps an in-flight load/store, or a replay of the same config
-with `l0_redir` suppressed (keeping the Stage-A advance) to separate "the L0 steers F0" from "the L0
-advances ext_pc_q".
+## 🚨 f2.7 RESULT — the L0 is INNOCENT; the bug is in the EARLY-REDIRECT (S8.E) path
+
+Continuing the bisection past the "L0-predicted conditional" trigger produced the real answer.
+**Disabling the execute-time early redirect (`s8e_flip_en = 1'b0`, the documented revert-to-S8.D
+knob) makes variant-A + L0 cond-ON BOOT — N1 `cy=0x00edbb60` ≈ 15.58M, pass=1** — and that is the
+best boot number of any authority-inversion configuration measured:
+
+| config | N1 boot, `s8e_flip_en=1` (shipped) | N1 boot, `s8e_flip_en=0` |
+|---|---|---|
+| =0 baseline | 14.27M | — |
+| variant-A | 16.03M ✅ | 15.94M ✅ |
+| variant-A + L0, cond-OFF | 15.86M ✅ | — |
+| variant-A + L0, cond-ON | **init SIGSEGV** ❌ | **15.58M ✅** |
+
+So the L0 works and is worth **−2.3 %** on boot (15.94M → 15.58M) and **−6.2 %** on dhrystone. What
+breaks is the **execute-time early-redirect / partial-squash machinery**, which the L0's prediction
+pattern merely EXPOSES. `s8e_flip_en=1` is the **shipped default**, so this is a latent correctness
+risk in the shipped core, not a defect of the DEAD scaffolds.
+
+**What has been excluded** (each by measurement or by inspection):
+- **wrong PATH** — the (hardened, control-verified) divergence trap reports 0 hits on the failing run.
+- **wrong BYTES** — the banked detector (a PC committed with >1 distinct encoding) reports 0 hits.
+- **the L0 disagreement-override (b.3)** — forcing `sb_disagree0 = pt0_eff` (override on ANY taken,
+  making the L0 a pure F0 prefetch hint) still fails, so the damage is done at Stage-A.
+- **lane-1 early mispredict** — forcing `early_mispredict1 = 0` still fails.
+- **the dual-rename checkpoint construction** — inspected: `free_list` snapshots `post0_head`/
+  `post1_head` and `rat` snapshots `post0_pak`/`post1_pak`, both of which correctly include slot-0's
+  allocation in slot-1's snapshot.
+
+**Top remaining suspect, and a trap blind spot worth knowing.** `early_redir_fix0/1` rewrites the
+committed `pred_next_pc` of every mispredicting lane so the surviving op does not re-redirect at
+commit. That rewrite makes the divergence trap's invariant **trivially true** for exactly those ops —
+`c_pred_next_pc` is compared against the next committed PC after having been overwritten with the
+resolved target. **The trap is therefore blind to a bad `early_redir_fix`**, which would explain a
+silent trap alongside a corrupted machine. The other live suspects are the liveness gate
+(`em*_live`, age &lt; size), the IQ partial squash, and the LSU/store-buffer view of a partial squash.
+Next step: instrument `early_redir_fix*` (which entry is rewritten, with what, and whether that entry
+is still live) rather than chasing the L0 further.
   - **⇒ Shipped DEAD at 0** (all 11 consts reverted; `veryl test` 252/0 + cycle-exact litmus N2).
     d.1 (train re-timing) and d.1b (stale Stage-A redirect) STAY — both are structurally correct and
     measure non-negative — while the run-ahead RAS itself is BANKED as f2.5e substrate. **f2.5d is
