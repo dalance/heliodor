@@ -1888,6 +1888,108 @@ policy (the queue can now fill whenever the producer is ahead) and it is the pre
 block-granularity work would need — but on its own it is worth exactly zero, and the table above is
 the record of that.
 
+## f2.13 — BLOCK-GRANULARITY PREDICTION: hand-off for a clean context
+
+User decision (2026-08-04) after f2.12: proceed to block-granularity prediction. Written to be
+self-contained — start here in a fresh session, the way f2.7's recipe was used.
+
+### The one-sentence problem
+
+`pp_next = pc_pred + 64'd8` advances the predictor **one dword per cycle**; F0 consumes one dword per
+beat (1 cycle on an icache hit). Equal rates ⇒ the FTQ can never accumulate depth ⇒ the clocked
+predictor's latency is paid per branch instead of amortised ⇒ +13.1 % dhrystone. **Make the producer
+faster than the consumer.**
+
+### What "block granularity" has to mean here
+
+Today the FTB is a per-dword map: `dword PC → next dword PC`. A block-granularity predictor maps
+**fetch block → fetch block**: given a block's start PC, produce in ONE cycle the block's *end* (where
+the taken branch is, or the line end) and the *next block's* start PC. Then one predictor cycle
+supplies many dwords of fetch, and the queue fills at (block size) : 1 against F0.
+
+Concretely, the FTQ entry stops being a dword PC (`ftq_pc[]`) and becomes a descriptor:
+`{start_pc, n_dwords / end_pc, taken, target, kind(call/ret/ind), RAS action}` — the shape the F2
+plan already sketched (§"Target structure", the `enqueue FTQ descriptor` line) but never built,
+because f2.5a wired the FTQ as an address queue.
+
+### RTL anchors (all in `heliodor_core.veryl`)
+
+| what | where |
+|---|---|
+| producer loop | `pc_pred`, `pp_next`, `pp_ftb_hit/target/is_ret`, `pp_advance` |
+| the queue | `ftq_pc[FTQ_N]` (`FTQ_N=8`), `ftq_head/tail/count` |
+| consumer | `f0_fetch_pc`, `f0_ftq_pop`, `f0_ftq_byp`, `f0_beat_done`, `f0_present` |
+| flush | `pp_reseed` (= redirect / early-redirect / hard `sb_override` / `ext_taken_redir` / `f0_diverged`) |
+| bypass fix | `FTQ_RUNAHEAD` (DEAD@0, f2.12) — keep it; a block producer still needs it |
+| FTB itself | `ftb_valid/tag/target[]`, `ICACHE_FETCH_DIRECTED`, indexed per dword today |
+
+### Two blockers that will bite, both measured
+
+1. **`pp_reseed` fires on 16 % of cycles** (52418 / 327679; `f0_diverged` is 19689 of them). A queue
+   flushed every sixth cycle cannot stay deep no matter how fast the producer is. `f0_diverged`
+   compares `f0_fetch_pc[63:3] != ext_pc_q[63:3]` — a **lockstep assumption**: it treats F0 being at a
+   different dword from extract as an error. Under a genuine run-ahead that is the NORMAL state.
+   **This check must be re-scoped (or dropped under FTQ_DECOUPLE) before depth is possible.**
+2. **Reconciliation cost scales with depth.** Every `sb_override` throws away the queued run-ahead.
+   Deeper queue ⇒ more discarded work per disagreement. f2.3/f2.4 measured FTB-follow reconciliation
+   as already net-negative *at depth 0*; it is not obvious this improves with depth, and that is the
+   real risk to the whole idea. **Measure depth first, IPC second — do not build the full descriptor
+   FTQ before confirming depth can be held.**
+
+### Config recipe (F2-full — the arm this work lives in)
+
+```sh
+sed -i 's/const PRED_PIPE: bit = 0;/const PRED_PIPE: bit = 1;/'               src/core/heliodor_core.veryl
+sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'       src/core/heliodor_core.veryl
+sed -i 's/const PRED_HOLD_FREEZE: bit = 0;/const PRED_HOLD_FREEZE: bit = 1;/' src/core/heliodor_core.veryl
+sed -i 's/const PRED_L0_FAST: bit = 0;/const PRED_L0_FAST: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const L0_SLOT1: bit = 0;/const L0_SLOT1: bit = 1;/'                 src/core/heliodor_core.veryl
+sed -i 's/const FTB_OVERRIDE: bit = 0;/const FTB_OVERRIDE: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const FTQ_DECOUPLE: bit = 0;/const FTQ_DECOUPLE: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const IBTB_SYNC_READ: bit = 0;/const IBTB_SYNC_READ: bit = 1;/'     src/core/ibtb.veryl
+sed -i 's/const BHT_SYNC_READ: bit = 0;/const BHT_SYNC_READ: bit = 1;/'       src/core/bht.veryl
+sed -i 's/const BTB_SYNC_READ: bit = 0;/const BTB_SYNC_READ: bit = 1;/'       src/core/btb.veryl
+sed -i 's/const TAGE_SYNC_READ: bit = 0;/const TAGE_SYNC_READ: bit = 1;/'     src/core/tage.veryl
+sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'       src/core/rob.veryl
+```
+Revert: `git checkout -- src/core/{heliodor_core,ibtb,bht,btb,tage,rob}.veryl`.
+
+### Baselines to beat (dhrystone, this tree)
+
+| config | cycles |
+|---|---|
+| `=0` shipped | 252939 |
+| variant-A + L0 + slot-1 (**the number to beat**) | **286080** |
+| F2-full (+FTB_OVERRIDE +FTQ_DECOUPLE) | 358627 |
+
+instret must stay **264834** (dhrystone) / **374357** (coremark) — see the traps below.
+
+### Depth instrumentation (reproduce f2.12's table in ~2 min)
+
+Counters on `ftq_count` (sum for mean, max), `f0_ftq_byp`, `pp_reseed`, `f0_diverged`, `ftq_enq`,
+`f0_ftq_pop`, printed every 2^16 cycles from an `always_ff` next to the FTQ. f2.12's numbers to
+reproduce as the control: mean depth **0.026**, byp **97.9 %**, reseed **16 %**.
+
+### Traps this campaign has actually paid for
+
+- **`instret` is the canary, not `tohost`.** A skipped instruction still reports pass (3a.4, and
+  f2.10's `slot1_eligible` gate: 264336 vs 264834).
+- **Veryl `$display` has no width specifiers** — `%0d` prints literally and consumes NO argument. Use
+  `%d`. (`crates/simulator/src/ir/statement.rs:486`.)
+- **No dynamic array READ inside `always_ff`** — the simulator rejects it and blames an unrelated,
+  legitimate read of the same array. Hoist to a module-level `let`.
+- **Sanity-check the `sed`.** Confirm a flipped const actually changed behaviour (a saturating
+  counter, a differing statistic) before believing an A/B result.
+- Veryl relational operators are `<:` / `>:`.
+
+### Judgement to keep in view
+
+The whole exercise is gated on blocker 2. If depth CAN be held and IPC still does not improve, that
+is a genuine negative result and the honest conclusion is that the +13.1 % is the permanent price of
+the clocked-read front end in this microarchitecture — which is a legitimate place to stop, given
+Phase 14's goal is structural completeness rather than CP (and f2.11 showed the flip is CP-neutral
+anyway).
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
