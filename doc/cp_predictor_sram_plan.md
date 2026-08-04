@@ -1835,6 +1835,59 @@ leaves it ambiguous.**
 predictor: the `imem_mmu → icache → commit_trap → n_inflight` fetch-to-rename megacone (138 levels),
 with the commit-store PMP → dcache mask cone 0.295 ns behind it.
 
+### 🔬 f2.12 — WHY the decoupling never paid: the FTQ is RATE-MATCHED to fetch
+
+Prompted by the right question: real cores use overriding/clocked-read predictors *and* have high
+IPC, so either the structure is unusual (it is not — it is standard) or heliodor is missing the
+mechanism that hides its latency. That mechanism is a **run-ahead FTQ**, and F2 has one. Measured
+what it actually does, at F2-full (variant-A + L0 + slot-1 + `FTB_OVERRIDE` + `FTQ_DECOUPLE`),
+dhrystone:
+
+| | enq | pop | mean depth | bypass cycles | `pp_reseed` |
+|---|---|---|---|---|---|
+| shipped policy | 3909 (1.2 %) | 1040 | **0.026** | **97.9 %** | 52418 (16 %) |
+| `FTQ_RUNAHEAD=1` | **275176 (84 %)** | **321841 (98 %)** | **0.026** | 97.9 % | 52418 (16 %) |
+
+`FTQ_N=8`, and the mean occupancy is **0.026 entries**. The FTQ is a pass-through, not a queue.
+
+**First finding — the bypass policy.** `f0_ftq_byp = FTQ_DECOUPLE && f0_present && ftq_count == 0`
+suppresses `ftq_enq`, so the instant the queue empties the producer stops producing: empty → bypass →
+no enqueue → still empty. Depth could only ever accumulate while F0 was STALLED, i.e. exactly when it
+is useless. `FTQ_RUNAHEAD` (DEAD scaffold, byte-identical at 0) removes that: keep enqueuing on a
+bypass cycle and let the same cycle's beat-done consume the bypassed entry. It works — enq goes
+1.2 % → 84 % — and **changes nothing**: depth stays 0.026, cycles stay 358627, instret bit-exact.
+
+**Root finding — producer and consumer are rate-matched by construction.** `pp_next = pc_pred + 8`:
+`pc_pred` advances **one dword per cycle**, and F0 consumes one dword per beat, which on an icache
+hit is one cycle (`pop` = 98 % of cycles confirms fetch really is running at ~1 dword/cycle). A queue
+between a producer and a consumer of equal rate **cannot accumulate depth**, whatever its capacity or
+bypass policy. That is why f2.5d was "blocked on run-ahead depth", why enlarging `FTQ_N` would do
+nothing, and why F2 measured WORSE than variant-A: it pays the reconciliation cost of a decoupled
+front end while structurally unable to collect the benefit.
+
+Compounding it: `pp_reseed` fires on **16 %** of cycles (52418; `f0_diverged` is 19689 of those),
+flushing the queue to empty roughly every sixth cycle. Even a rate-advantaged producer would struggle
+against that.
+
+**What a real core does differently.** Its predictor produces a whole **fetch BLOCK** per cycle — a
+run of instructions up to the next taken branch, often many dwords — while fetch consumes one line
+per cycle. The producer is therefore *faster* than the consumer, the queue fills, and the predictor's
+(clocked, multi-cycle) latency is amortised across the queue depth instead of paid per branch.
+heliodor's FTB predicts **per dword**, so it can never out-run fetch.
+
+**⇒ The honest answer to "can the IPC loss be recovered separately": yes in principle, by the
+mechanism real cores use, but that mechanism requires BLOCK-GRANULARITY prediction.** It is not a
+tuning problem — not the L0's capacity (measured, weak), not the FTQ's depth (measured, irrelevant at
+equal rates), not the bypass policy (built, measured, no effect). It is a restructure of the
+prediction granularity itself, and that is materially larger than anything left in Phase 14's current
+scope. Until it exists, the +13.1 % is the standing price of the clocked-read front end, and F2's
+decoupling cannot pay for itself.
+
+`FTQ_RUNAHEAD` is kept as a DEAD scaffold: it is a genuine correctness improvement to the bypass
+policy (the queue can now fill whenever the producer is ahead) and it is the prerequisite any
+block-granularity work would need — but on its own it is worth exactly zero, and the table above is
+the record of that.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
