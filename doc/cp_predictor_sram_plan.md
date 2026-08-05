@@ -2313,6 +2313,8 @@ with the array live and training, dhrystone is 252939 / instret 264834 and N1 bo
 - **f2.15d** — FTQ entry becomes the descriptor.
 - **f2.15e** — extract consumes the descriptor; Stage-B demoted to reconciliation. ✅ BUILT + MEASURED
   (see "f2.15e RESULT" below): dhrystone 280067, the first rung to beat the 286080 best-known arm.
+- **f2.15e′** — conditional block exits (the direction counter lives in the block entry). ✅ BUILT +
+  MEASURED (see "f2.15e′ RESULT"): dhrystone 264536, N1 boot +3.2 % — the standing +13.1 % is gone.
 - **f2.15f** — flip + full ladder measurement.
 
 ## f2.15e — CONSUMER REWIRE: hand-off for a clean context
@@ -2542,6 +2544,97 @@ exactly zero anyway).
   other is how the pointer silently duplicated entries.
 - **`f0_diverged` firing at a constant rate per cycle with a frozen `enq` counter is the signature of
   a producer that has stopped**, not of a divergence problem. Read `enq`/`pop` before `reseed`.
+
+## 🎉 f2.15e′ RESULT — the conditional case, and the f2.6 gate turned out not to apply
+
+Built and measured 2026-08-05, immediately after f2.15e. The f2.15 design gated this increment on a
+shadow direction measurement because the obvious construction — read BHT/TAGE at the run-ahead
+pointer — changes the index resolution *and* the history at once, which is what killed f2.6.
+**A different construction avoids both, so the gate does not apply to it.**
+
+| workload | `=0` | variant-A + L0 + slot-1 | f2.15e | **f2.15e′** |
+|---|---|---|---|---|
+| dhrystone | 252939 | 286080 (+13.1 %) | 278570 (+10.1 %) | **264536 (+4.6 %)** |
+| coremark | 367139 | 407093 (+10.9 %) | 402545 (+9.6 %) | **402520 (+9.6 %)** |
+| N1 Linux boot | 14.27 M | 15.51 M (+8.7 %) | 15.21 M (+6.6 %) | **14.72 M (+3.2 %)** |
+
+`instret` bit-exact on both benchmarks, default suite **252/0** at the flip, N1 boot passes. At
+`PRED_BLK_COND=0` the tree is unchanged (252/0, dhrystone 252939 / 264834).
+
+**The clocked-read front end now costs +3.2 % on the kernel, down from the +13.1 % this campaign
+carried for months.**
+
+### The construction — the direction lives IN the block entry
+
+Each conditional slot in `blkpred` carries its own 2-bit saturating counter, so the block's exit
+direction arrives *with* the entry. Consequences, and why the f2.6 precedent does not transfer:
+
+- **No history at all.** There is no speculative history to be stale, no run-ahead GHR to maintain,
+  and no resync on any of the 52418 re-seeds. `PRED_GHR_AHEAD` (f2.15a) is left unused — the problem
+  it was built for does not arise in this construction.
+- **No index resolution lost.** The slot records the branch's own halfword offset, so the counter is
+  per-BRANCH, not per-dword. The aliasing the f2.15b census measured (coremark 6.4 %, kernel 9.9 %)
+  is exactly what the two slots already solved.
+- **No extra producer stage, no extra BHT/TAGE port.** A serial "block read, then direction read"
+  needs a third stage and costs TWO bubbles per taken block instead of one — on 30585 takes that
+  would have eaten the entire gain before it started.
+
+The block exits at whichever of {first strong-taken conditional, tail transfer} comes first in the
+dword, decided by comparing the recorded offsets. Conditional targets come from the slot's 13-bit
+signed displacement (B-type reach is exactly ±4 KiB, so it is not an approximation).
+
+Two details that are load-bearing. Conditionals train on **every** commit, taken or not (the union
+with `bht_train_en`) — the BTB-shaped train only ever fires on taken transfers and would leave every
+counter saturated. And a not-taken commit carries no usable displacement, so the stored target is not
+updated then; a slot that has never committed taken cannot reach strong, so it can never steer with a
+meaningless target.
+
+### What it measured — coverage more than tripled, and the queue finally fills
+
+dhrystone, at 262143 cycles:
+
+| | f2.15e | **f2.15e′** |
+|---|---|---|
+| descriptor takes (`bd0`+`bd1`) | 6581 | **22715** |
+| L0-only takes (`l0tk`) | 24004 | 13504 |
+| descriptor share of Stage-A takes | 21 % | **63 %** |
+| mean FTQ depth | 0.197 | **1.00** |
+| `pp_reseed` | 41630 | 27640 |
+| `ext_taken_redir` | 1233 | **0** |
+
+The run-ahead accumulates depth for the first time in this campaign — 0.026 in f2.12, 3.127 in f2.14
+(and worth zero), and now 1.00 while actually *paying*. It is worth something here for the reason
+f2.14 identified and could not exploit: the prediction is now made at the run-ahead pointer, so depth
+is latency the queue absorbs rather than idle buffering.
+
+### The honest part — coremark is neutral, and the f2.6 effect is visible in it
+
+coremark gains nothing, and the counters say exactly why:
+
+| | `=0` | variant-A+L0+s1 | f2.15e | f2.15e′ |
+|---|---|---|---|---|
+| `frontidl` | 38198 | 73817 | 70134 | **64590** |
+| `earlymis` | 6885 | 9128 | 8830 | **9947** |
+
+f2.15e′ removes 5544 cycles of front-end idle and adds 1117 early mispredicts (+12.7 %), and the two
+cancel to −25 cycles. **That IS the f2.6 failure mode** — a strong bimodal disagreeing with the full
+TAGE steers fetch wrong, so the Stage-B correction costs a refetch instead of a bubble — showing up
+on the same workload that killed f2.6, at a scale where it breaks even rather than losing. dhrystone's
+`earlymis` is *unchanged* (1269 at both), and the kernel gains 3.4 %, so the effect is real but
+workload-specific.
+
+The obvious lever if it is ever worth pursuing is the confidence gate (currently `== 3`, i.e. a plain
+2-bit strong); a wider counter or a hysteresis requirement trades coverage for false takes. That is
+tuning, not structure, and is deliberately not done here.
+
+### Also folded in: the mid-dword re-entry guard on descriptor targets
+
+A conditional target is a loop back-edge as often as not, so it lands mid-dword far more often than a
+call/jal target does — and the producer must not follow a transfer recorded *before* the point it
+enters the dword at. Arming `pp_no_ftb_q` from the descriptor target's offset (the same rule the
+re-seed arms use) fixes that, and it turned out to help the tail-only case too: **f2.15e's own
+dhrystone went 280067 → 278570** on this tree, which is why the f2.15e column above differs from the
+f2.15e commit's number.
 
 ### Corrections to the earlier f2.7 write-up
 

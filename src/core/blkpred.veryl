@@ -51,10 +51,12 @@ pub module blkpred #(
     o_b0_valid  : output logic    ,
     o_b0_off    : output logic<2> , // halfword offset within the dword = pc[2:1]
     o_b0_toff   : output logic<13>, // signed B-type offset from the branch PC
+    o_b0_ctr    : output logic<2> , // f2.15e': 2-bit direction counter (see the DIRECTION note)
     // conditional slot 1 (second conditional branch, program order)
     o_b1_valid  : output logic    ,
     o_b1_off    : output logic<2> ,
     o_b1_toff   : output logic<13>,
+    o_b1_ctr    : output logic<2> ,
     // tail slot: the unconditional / indirect terminator
     o_tl_valid  : output logic    ,
     o_tl_off    : output logic<2> ,
@@ -71,6 +73,10 @@ pub module blkpred #(
     i_train_is_call: input logic     ,
     i_train_is_ret : input logic     ,
     i_train_is_ind : input logic     ,
+    // f2.15e': the committed DIRECTION. Conditional branches train on every commit, taken or not
+    // (unlike the BTB/tail path, which only ever sees taken transfers), so the slot counters see the
+    // full population. i_train_target is meaningless on a not-taken commit and is NOT stored then.
+    i_train_dir    : input logic     ,
 ) {
     const ENTRIES: u32 = 1 << IDX_W;
     const TAG_W  : u32 = 61 - IDX_W; // pc[63:IDX_W+3]
@@ -80,16 +86,18 @@ pub module blkpred #(
     const O_B0V : u32 = TAG_W;
     const O_B0O : u32 = TAG_W + 1;
     const O_B0T : u32 = TAG_W + 3;
-    const O_B1V : u32 = TAG_W + 16;
-    const O_B1O : u32 = TAG_W + 17;
-    const O_B1T : u32 = TAG_W + 19;
-    const O_TLV : u32 = TAG_W + 32;
-    const O_TLO : u32 = TAG_W + 33;
-    const O_TLC : u32 = TAG_W + 35;
-    const O_TLR : u32 = TAG_W + 36;
-    const O_TLI : u32 = TAG_W + 37;
-    const O_TLT : u32 = TAG_W + 38;
-    const DATA_W: u32 = TAG_W + 102;
+    const O_B0C : u32 = TAG_W + 16; // f2.15e' direction counter, slot 0
+    const O_B1V : u32 = TAG_W + 18;
+    const O_B1O : u32 = TAG_W + 19;
+    const O_B1T : u32 = TAG_W + 21;
+    const O_B1C : u32 = TAG_W + 34; // f2.15e' direction counter, slot 1
+    const O_TLV : u32 = TAG_W + 36;
+    const O_TLO : u32 = TAG_W + 37;
+    const O_TLC : u32 = TAG_W + 39;
+    const O_TLR : u32 = TAG_W + 40;
+    const O_TLI : u32 = TAG_W + 41;
+    const O_TLT : u32 = TAG_W + 42;
+    const DATA_W: u32 = TAG_W + 106;
 
     var valid: logic         [ENTRIES];
     var dp   : logic<DATA_W> [ENTRIES]; // 1R1W copy — the run-ahead predict read
@@ -123,9 +131,11 @@ pub module blkpred #(
     assign o_b0_valid   = rp_q[O_B0V];
     assign o_b0_off     = rp_q[O_B0O +: 2];
     assign o_b0_toff    = rp_q[O_B0T +: 13];
+    assign o_b0_ctr     = rp_q[O_B0C +: 2];
     assign o_b1_valid   = rp_q[O_B1V];
     assign o_b1_off     = rp_q[O_B1O +: 2];
     assign o_b1_toff    = rp_q[O_B1T +: 13];
+    assign o_b1_ctr     = rp_q[O_B1C +: 2];
     assign o_tl_valid   = rp_q[O_TLV];
     assign o_tl_off     = rp_q[O_TLO +: 2];
     assign o_tl_is_call = rp_q[O_TLC];
@@ -152,6 +162,7 @@ pub module blkpred #(
     var t_call : logic        ;
     var t_ret  : logic        ;
     var t_ind  : logic        ;
+    var t_dir  : logic        ;
     var t_old  : logic<DATA_W>;
     var t_oldv : logic        ;
     always_ff (clk, rst) {
@@ -166,6 +177,7 @@ pub module blkpred #(
             t_call = 1'b0;
             t_ret  = 1'b0;
             t_ind  = 1'b0;
+            t_dir  = 1'b0;
             t_old  = '0;
             t_oldv = 1'b0;
         } else {
@@ -179,6 +191,7 @@ pub module blkpred #(
             t_call = i_train_is_call;
             t_ret  = i_train_is_ret;
             t_ind  = i_train_is_ind;
+            t_dir  = i_train_dir;
             t_old  = tr_old;
             t_oldv = tr_oldv;
         }
@@ -210,9 +223,31 @@ pub module blkpred #(
     let e_b0v: logic     = t_keep && t_old_e[O_B0V];
     let e_b0o: logic<2>  = t_old_e[O_B0O +: 2];
     let e_b0t: logic<13> = t_old_e[O_B0T +: 13];
+    let e_b0c: logic<2>  = if t_keep ? t_old_e[O_B0C +: 2] : 2'd0;
     let e_b1v: logic     = t_keep && t_old_e[O_B1V];
     let e_b1o: logic<2>  = t_old_e[O_B1O +: 2];
     let e_b1t: logic<13> = t_old_e[O_B1T +: 13];
+    let e_b1c: logic<2>  = if t_keep ? t_old_e[O_B1C +: 2] : 2'd0;
+    // f2.15e' DIRECTION. Each conditional slot carries its own 2-bit saturating counter, so the
+    // block's exit direction arrives WITH the entry — no extra producer stage, no extra BHT/TAGE read
+    // port, and (the point) NO HISTORY. The f2.15 design note feared this increment for the f2.6
+    // reason: moving a direction read earlier onto a staler speculative history cost earlymis +5.4 %
+    // and made coremark worse. That failure mode cannot occur here, because there is no history to
+    // stale — the counter is indexed by the entry itself, i.e. by the exact branch. Nor is index
+    // resolution lost: the slot records the branch's own halfword offset.
+    //
+    // The residual risk is the one the L0 already lives with (l0pred's o_bimodal_strong): a bimodal
+    // that disagrees with the full TAGE sends FETCH down the wrong path, so the Stage-B correction
+    // costs a refetch rather than one bubble. The mitigation is the same and is applied at the
+    // consumer: take only on STRONG (==3), never on weak.
+    let sat_up  : logic<2> = if e_b0c == 2'd3 ? 2'd3 : e_b0c + 2'd1;
+    let sat_dn  : logic<2> = if e_b0c == 2'd0 ? 2'd0 : e_b0c - 2'd1;
+    let sat1_up : logic<2> = if e_b1c == 2'd3 ? 2'd3 : e_b1c + 2'd1;
+    let sat1_dn : logic<2> = if e_b1c == 2'd0 ? 2'd0 : e_b1c - 2'd1;
+    // A slot being (re)allocated starts weak on the observed direction rather than inheriting the
+    // evicted branch's confidence — the strong-only consumer gate then needs a second agreeing commit
+    // before it steers fetch, which is exactly the warm-up behaviour the FTB's conf=2 init gives.
+    let init_c  : logic<2> = if t_dir ? 2'd2 : 2'd1;
 
     // Which conditional slot this train belongs in: retrain the slot already holding this offset,
     // otherwise take a free slot, otherwise evict slot 1 (slot 0 holds the earlier branch in program
@@ -225,12 +260,27 @@ pub module blkpred #(
     let c_before0: logic = !c_hit0 && !c_hit1 && e_b0v && !e_b1v && (t_off <: e_b0o);
 
     // Merged conditional slots.
+    // f2.15e': a NOT-TAKEN commit carries no usable displacement (tr_disp is the fall-through), so the
+    // stored toff is kept unless this train went taken. The slot is still (re)allocated on a
+    // not-taken commit — knowing the branch is there, and that it fell through, is the whole point of
+    // the counter — it just leaves toff at whatever the last taken occurrence recorded, and a slot
+    // that has never been taken is held below strong by init_c so it can never steer with a
+    // meaningless target.
     let n_b0v: logic     = if !t_cond ? e_b0v : if (c_use0 || c_before0) ? 1'b1 : e_b0v;
     let n_b0o: logic<2>  = if !t_cond ? e_b0o : if (c_use0 || c_before0) ? t_off : e_b0o;
-    let n_b0t: logic<13> = if !t_cond ? e_b0t : if (c_use0 || c_before0) ? t_toff : e_b0t;
+    let n_b0t: logic<13> = if !t_cond ? e_b0t : if ((c_use0 || c_before0) && t_dir) ? t_toff : e_b0t;
+    let n_b0c: logic<2>  = if !t_cond ? e_b0c
+        : if c_hit0 ? (if t_dir ? sat_up : sat_dn)                 // retraining the resident branch
+        : if (c_use0 || c_before0) ? init_c                        // fresh slot 0
+        : e_b0c;
     let n_b1v: logic     = if !t_cond ? e_b1v : if c_use0 ? e_b1v : 1'b1;
     let n_b1o: logic<2>  = if !t_cond ? e_b1o : if c_use0 ? e_b1o : if c_before0 ? e_b0o : if c_hit1 ? e_b1o : t_off;
-    let n_b1t: logic<13> = if !t_cond ? e_b1t : if c_use0 ? e_b1t : if c_before0 ? e_b0t : t_toff;
+    let n_b1t: logic<13> = if !t_cond ? e_b1t : if c_use0 ? e_b1t : if c_before0 ? e_b0t : if t_dir ? t_toff : e_b1t;
+    let n_b1c: logic<2>  = if !t_cond ? e_b1c
+        : if c_use0 ? e_b1c
+        : if c_before0 ? e_b0c                                     // slot 0's branch pushed down
+        : if c_hit1 ? (if t_dir ? sat1_up : sat1_dn)               // retraining the resident branch
+        : init_c;                                                  // fresh slot 1
 
     // Merged tail slot (a non-conditional train replaces it outright — there is only ever one
     // reachable unconditional terminator per block).
@@ -244,8 +294,8 @@ pub module blkpred #(
 
     let t_word: logic<DATA_W> = {
         n_tlt, n_tli, n_tlr, n_tlc, n_tlo, n_tlv,
-        n_b1t, n_b1o, n_b1v,
-        n_b0t, n_b0o, n_b0v,
+        n_b1c, n_b1t, n_b1o, n_b1v,
+        n_b0c, n_b0t, n_b0o, n_b0v,
         t_tag
     };
 

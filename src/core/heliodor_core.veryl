@@ -2337,9 +2337,11 @@ pub module heliodor_core #(
     var blk_b0_valid  : logic    ;
     var blk_b0_off    : logic<2> ;
     var blk_b0_toff   : logic<13>;
+    var blk_b0_ctr    : logic<2> ;
     var blk_b1_valid  : logic    ;
     var blk_b1_off    : logic<2> ;
     var blk_b1_toff   : logic<13>;
+    var blk_b1_ctr    : logic<2> ;
     var blk_tl_valid  : logic    ;
     var blk_tl_off    : logic<2> ;
     var blk_tl_is_call: logic    ;
@@ -2378,10 +2380,57 @@ pub module heliodor_core #(
     // pp_no_desc_q is the mid-dword re-entry guard, delayed to match pc_pred_q: a re-seed landing
     // MID-dword means extract enters PAST any transfer the entry records, so its block exit does not
     // apply to this pass (the pp_no_ftb_q idiom, one stage later).
-    let pd_taken : logic     = FTQ_DESC && pp_desc_vld && !pp_no_desc_q && blk_hit && blk_tl_valid
-        && !blk_tl_is_ret && !blk_tl_is_ind;
-    let pd_target: logic<64> = blk_tl_target;
-    let pd_off   : logic<2>  = blk_tl_off;
+    // ── f2.15e': CONDITIONAL BLOCK EXITS — the direction comes WITH the entry ── DEAD at 0 ──
+    // f2.15e covers 21 % of Stage-A takes; the other 79 % are conditionals, which the tail-slot-only
+    // scope leaves on the L0 where each one still costs a flush + a run-ahead re-seed. Closing that
+    // is the rest of the prize.
+    //
+    // The f2.15 design note gated this increment on a direction-accuracy measurement, because the
+    // obvious construction — read BHT/TAGE at the run-ahead pointer — changes the index resolution
+    // (halfword -> dword) and the history (spec_ghr -> ghr_pred) at once, and f2.6 is the precedent
+    // where exactly that cost earlymis +5.4 % and made coremark worse. THIS CONSTRUCTION AVOIDS BOTH,
+    // so the measurement it was gated on does not apply:
+    //
+    //   * No history at all. The direction is a 2-bit counter carried in the block entry's own
+    //     conditional slot, so there is no speculative history to be stale, no run-ahead GHR to
+    //     maintain, and no resync on any of the 52418 re-seeds. PRED_GHR_AHEAD stays unused.
+    //   * No index resolution lost. The slot records the branch's own halfword offset, so the counter
+    //     is per-BRANCH, not per-dword — the aliasing the f2.15b census measured (coremark 6.4 %,
+    //     kernel 9.9 %) is what the two slots already solved.
+    //   * No extra producer stage and no extra BHT/TAGE read port. A serial "block read then direction
+    //     read" would need a third stage and would cost TWO bubbles per taken block instead of one,
+    //     which on 30585 takes would eat the entire gain.
+    //
+    // What remains is the risk the L0 already lives with (l0pred's o_bimodal_strong, and the FTB's
+    // conf==3 follow gate): a bimodal that disagrees with the full TAGE steers FETCH wrong, so the
+    // Stage-B correction costs a refetch rather than one bubble. Same mitigation — take only on
+    // STRONG. A slot that has never committed taken cannot reach strong (init_c), so it can never
+    // steer with the meaningless target a not-taken-only train would leave behind.
+    const PRED_BLK_COND: bit = 0;
+    let bc0_take: logic = PRED_BLK_COND && blk_b0_valid && (blk_b0_ctr == 2'd3);
+    let bc1_take: logic = PRED_BLK_COND && blk_b1_valid && (blk_b1_ctr == 2'd3);
+    let bct_take: logic = blk_tl_valid && !blk_tl_is_ret && !blk_tl_is_ind;
+    // Each conditional slot's own PC and target. B-type reach is +/-4 KiB, so the stored 13-bit
+    // signed displacement is exact and sign-extends to the full target.
+    let bc0_pc  : logic<64> = {pc_pred_q[63:3], blk_b0_off, 1'b0};
+    let bc1_pc  : logic<64> = {pc_pred_q[63:3], blk_b1_off, 1'b0};
+    let bc0_sx  : logic<51> = if blk_b0_toff[12] ? '1 : '0;
+    let bc1_sx  : logic<51> = if blk_b1_toff[12] ? '1 : '0;
+    let bc0_tgt : logic<64> = bc0_pc + {bc0_sx, blk_b0_toff};
+    let bc1_tgt : logic<64> = bc1_pc + {bc1_sx, blk_b1_toff};
+    // The first TAKEN conditional in program order — blkpred keeps slot 0 as the earlier branch, so a
+    // not-strong slot 0 simply falls through to slot 1.
+    let bcs_take: logic     = bc0_take || bc1_take;
+    let bcs_off : logic<2>  = if bc0_take ? blk_b0_off : blk_b1_off;
+    let bcs_tgt : logic<64> = if bc0_take ? bc0_tgt : bc1_tgt;
+    // The block exits at whichever of {first taken conditional, tail transfer} comes FIRST in the
+    // dword. A tail ahead of the conditional makes the conditional unreachable on this pass, and vice
+    // versa; the offsets settle it directly.
+    let bx_tail : logic = bct_take && (!bcs_take || (blk_tl_off <: bcs_off));
+    let bx_cond : logic = bcs_take && !bx_tail;
+    let pd_taken : logic     = FTQ_DESC && pp_desc_vld && !pp_no_desc_q && blk_hit && (bx_tail || bx_cond);
+    let pd_target: logic<64> = if bx_cond ? bcs_tgt : blk_tl_target;
+    let pd_off   : logic<2>  = if bx_cond ? bcs_off : blk_tl_off;
     // (f2.15d had a `pd_next = taken ? target : pc_pred_q + 8` here and fed pc_pred from it. That is
     // the phase error f2.15e found by measurement: pc_pred is one dword AHEAD of pc_pred_q, so
     // assigning it next(pc_pred_q) writes back the value it already held — the pointer stops, each
@@ -2710,7 +2759,13 @@ pub module heliodor_core #(
                     // one bubble per taken block, nothing on a sequential run.
                     if pp_step {
                         pc_pred     = if pd_taken ? {pd_target[63:3], 3'b000} : pc_pred + 64'd8;
-                        pp_no_ftb_q = 1'b0;
+                        // f2.15e': a conditional target is a loop back-edge as often as not, so it
+                        // lands MID-dword far more often than a call/jal target does. Arm the
+                        // re-entry guard from the target's offset, exactly as the re-seed arms do:
+                        // the producer must not follow a transfer recorded BEFORE the point it is
+                        // entering the dword at. pp_no_desc_q picks this up one step later, matching
+                        // the dword it guards (the register value is read before this clear lands).
+                        pp_no_ftb_q = pd_taken && (pd_target[2:1] != 2'b00);
                     }
                 } else if ftq_enq || (f0_ftq_byp && f0_beat_done) {
                     pc_pred = if pp_wide ? pp_next_b : pp_next;
@@ -2757,9 +2812,11 @@ pub module heliodor_core #(
         o_b0_valid     : blk_b0_valid              ,
         o_b0_off       : blk_b0_off                ,
         o_b0_toff      : blk_b0_toff               ,
+        o_b0_ctr       : blk_b0_ctr                ,
         o_b1_valid     : blk_b1_valid              ,
         o_b1_off       : blk_b1_off                ,
         o_b1_toff      : blk_b1_toff               ,
+        o_b1_ctr       : blk_b1_ctr                ,
         o_tl_valid     : blk_tl_valid              ,
         o_tl_off       : blk_tl_off                ,
         o_tl_is_call   : blk_tl_is_call            ,
@@ -2773,13 +2830,18 @@ pub module heliodor_core #(
         // transfer at halfword offset 3 has its own high half in the NEXT dword, so a block that
         // exits there would have fetch jump past the dword extract still needs in order to decode it.
         // Same rule, same reason, and the f2.15c coverage census predates it by one increment.
-        i_train_en     : PRED_BLK && btb_train_en && !blk_train_straddle,
+        // f2.15e' widens the train to EVERY committed conditional, taken or not (bht_train_en), so
+        // the slot counters see the full direction population — the BTB-shaped train only ever fires
+        // on taken transfers, which would leave every counter saturated at taken. Folds back to
+        // btb_train_en alone at PRED_BLK_COND=0 → the f2.15c/e table byte-for-byte.
+        i_train_en     : PRED_BLK && (btb_train_en || (PRED_BLK_COND && bht_train_en)) && !blk_train_straddle,
         i_train_pc     : bp_train_pc               ,
         i_train_target : btb_train_target          ,
         i_train_is_cond: btb_train_is_cond         ,
         i_train_is_call: btb_train_is_call         ,
         i_train_is_ret : btb_train_is_ret          ,
         i_train_is_ind : btb_train_is_ind          ,
+        i_train_dir    : bht_train_taken           ,
     );
     // ── f2.15c COVERAGE CENSUS (temporary; DEAD at BLKC_STATS=0) ──
     // At commit, does the block predictor hold THIS branch? The read is one cycle old (the array is
