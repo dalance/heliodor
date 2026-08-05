@@ -2204,6 +2204,69 @@ pub module heliodor_core #(
     // carries no RAS action, and there is room for both.
     let pp_wide         : logic            = FTQ_WIDE_ENQ && ftq_enq && !pp_ftb_hit && ftq_room2
         && !pp_ftb_is_call_b && !pp_ftb_is_ret_b;
+    // blkpred's outputs, declared here so the f2.15d descriptor terms below can read them; the
+    // instance itself lives with the f2.15c census further down.
+    var blk_hit       : logic    ;
+    var blk_b0_valid  : logic    ;
+    var blk_b0_off    : logic<2> ;
+    var blk_b0_toff   : logic<13>;
+    var blk_b1_valid  : logic    ;
+    var blk_b1_off    : logic<2> ;
+    var blk_b1_toff   : logic<13>;
+    var blk_tl_valid  : logic    ;
+    var blk_tl_off    : logic<2> ;
+    var blk_tl_is_call: logic    ;
+    var blk_tl_is_ret : logic    ;
+    var blk_tl_is_ind : logic    ;
+    var blk_tl_target : logic<64>;
+    // ── f2.15d: the FTQ entry becomes a DESCRIPTOR ── DEAD at FTQ_DESC=0 ──
+    // f2.13 sketched this and f2.14 refuted its stated motivation: the value is NOT that the producer
+    // emits more dwords per cycle (measured, worth exactly zero) — it is that the prediction is made
+    // at the RUN-AHEAD pointer with a CLOCKED read, so the queue absorbs the read latency that
+    // extract otherwise pays per branch. The entry therefore stays ONE DWORD (multi-dword blocks buy
+    // producer rate, which f2.14 proved is worthless here); what it gains is the prediction itself.
+    //
+    // SCOPE OF THIS INCREMENT — unconditional transfers only. blkpred's tail slot (jal / jalr / call /
+    // ret / indirect) is predicted taken on sight, so it needs NO direction predictor. That lets the
+    // descriptor plumbing be built and proven with ZERO accuracy risk, which matters because f2.6 is
+    // the standing warning here: moving a direction read earlier cost +5.4 % earlymis and made
+    // coremark worse. Conditional blocks keep the existing path until the run-ahead direction read
+    // (BHT/TAGE on the run-ahead dword index and ghr_pred, f2.15a's twin) is built and measured.
+    //
+    // The producer becomes two-stage: pc_pred is presented to blkpred at T and the entry arrives at
+    // T+1, so the descriptor enqueued at T+1 belongs to pc_pred_q, not pc_pred. Rate is unchanged at
+    // one dword per cycle (stage 1 for the next dword overlaps stage 2 for this one); the cost is one
+    // cycle of start-up after each reseed, which is exactly the latency the queue exists to hide.
+    const FTQ_DESC: bit = 0;
+    var pc_pred_q  : logic<64>;         // the dword whose blkpred result is arriving THIS cycle
+    var pp_desc_vld: logic    ;         // pc_pred_q is a real in-flight lookup (cleared by a reseed)
+    var ftq_d_taken : logic     [FTQ_N]; // this dword's block exits on a predicted-taken transfer
+    var ftq_d_target: logic<64> [FTQ_N];
+    var ftq_d_off   : logic<2>  [FTQ_N]; // halfword offset of that transfer within the dword
+    var ftq_d_call  : logic     [FTQ_N];
+    var ftq_d_ret   : logic     [FTQ_N];
+    var ftq_d_ind   : logic     [FTQ_N];
+    // The block predictor's answer for pc_pred_q. Only the tail slot is consumed in this increment;
+    // a conditional-only dword reads as not-taken and the stream falls through sequentially, which is
+    // precisely what the pre-f2.15 producer does, so nothing regresses while the direction read is
+    // still missing.
+    let pd_taken : logic     = FTQ_DESC && pp_desc_vld && blk_hit && blk_tl_valid;
+    let pd_target: logic<64> = blk_tl_target;
+    let pd_off   : logic<2>  = blk_tl_off;
+    // Next run-ahead dword: the tail target when the block exits taken, else the next dword.
+    let pd_next  : logic<64> = if pd_taken ? {blk_tl_target[63:3], 3'b000} : pc_pred_q + 64'd8;
+    // Stage-1/stage-2 registers for the two-stage run-ahead lookup. Kept as their own always_ff so
+    // the producer's five reseed arms need no edit: a reseed at T changes pc_pred at the end of T, so
+    // the lookup that was in flight during T was for the pre-reseed pointer and is marked invalid.
+    always_ff (clk, rst) {
+        if_reset {
+            pc_pred_q   = RESET_PC;
+            pp_desc_vld = 1'b0;
+        } else if FTQ_DESC {
+            pc_pred_q   = pc_pred;
+            pp_desc_vld = !pp_reseed;
+        }
+    }
     // ── f2.15a: RUN-AHEAD GHR — the direction-history twin for a run-ahead predictor ── DEAD at 0 ──
     // f2.14 established that a deeper FTQ cannot amortise the clocked predictor latency because every
     // clocked predictor is indexed by ext_pc_q (the EXTRACT pointer) and by spec_ghr, which is
@@ -2383,7 +2446,13 @@ pub module heliodor_core #(
             // unassigned array — at FTQ_DECOUPLE=0 ftq_pc is reset-only (0) and f0_fetch_pc selects
             // pc_fetch_q anyway → DCE, behaviorally identical.
             for i in 0..FTQ_N {
-                ftq_pc[i] = 64'd0;
+                ftq_pc[i]       = 64'd0;
+                ftq_d_taken[i]  = 1'b0;
+                ftq_d_target[i] = 64'd0;
+                ftq_d_off[i]    = 2'd0;
+                ftq_d_call[i]   = 1'b0;
+                ftq_d_ret[i]    = 1'b0;
+                ftq_d_ind[i]    = 1'b0;
             }
         } else if FTQ_DECOUPLE {
             if redirect_fire {
@@ -2437,6 +2506,17 @@ pub module heliodor_core #(
                     if pp_wide {
                         ftq_pc[ftq_tail + 3'd1] = pp_pc_b;
                     }
+                    // f2.15d: park the run-ahead block prediction beside the address. Written only
+                    // under FTQ_DESC and read by nobody yet — f2.15e rewires the producer's PC
+                    // advance and extract's consumption together, since those must change as one.
+                    if FTQ_DESC {
+                        ftq_d_taken[ftq_tail]  = pd_taken;
+                        ftq_d_target[ftq_tail] = pd_target;
+                        ftq_d_off[ftq_tail]    = pd_off;
+                        ftq_d_call[ftq_tail]   = blk_tl_is_call;
+                        ftq_d_ret[ftq_tail]    = blk_tl_is_ret;
+                        ftq_d_ind[ftq_tail]    = blk_tl_is_ind;
+                    }
                     ftq_tail = ftq_tail + (if pp_wide ? 3'd2 : 3'd1);
                 }
                 if ftq_enq || (f0_ftq_byp && f0_beat_done) {
@@ -2470,23 +2550,10 @@ pub module heliodor_core #(
     // valid in any config (including the shipped =0 arm, where FTQ_DECOUPLE is off and pc_pred does
     // not run). Coverage is a property of the table and its training, not of where it is read.
     const PRED_BLK: bit = 0;
-    var blk_hit      : logic    ;
-    var blk_b0_valid : logic    ;
-    var blk_b0_off   : logic<2> ;
-    var blk_b0_toff  : logic<13>;
-    var blk_b1_valid : logic    ;
-    var blk_b1_off   : logic<2> ;
-    var blk_b1_toff  : logic<13>;
-    var blk_tl_valid : logic    ;
-    var blk_tl_off   : logic<2> ;
-    var blk_tl_is_call: logic   ;
-    var blk_tl_is_ret : logic   ;
-    var blk_tl_is_ind : logic   ;
-    var blk_tl_target : logic<64>;
     inst u_blkpred: blkpred (
         clk                                        ,
         rst                                        ,
-        i_pc           : {ic_pc[63:3], 3'b000}     ,
+        i_pc           : if FTQ_DESC ? {pc_pred[63:3], 3'b000} : {ic_pc[63:3], 3'b000},
         o_hit          : blk_hit                   ,
         o_b0_valid     : blk_b0_valid              ,
         o_b0_off       : blk_b0_off                ,
