@@ -2314,6 +2314,113 @@ with the array live and training, dhrystone is 252939 / instret 264834 and N1 bo
 - **f2.15e** — extract consumes the descriptor; Stage-B demoted to reconciliation.
 - **f2.15f** — flip + full ladder measurement.
 
+## f2.15e — CONSUMER REWIRE: hand-off for a clean context
+
+Written to be self-contained; start here in a fresh session, the way f2.7's recipe and f2.13's were.
+f2.15e is the datapath switchover, which is where this campaign has produced every one of its
+corners (f2.4: three, f2.7: one, all boot-specific, none visible in dhrystone/coremark).
+
+### Tree state — everything below is already built and DEAD at 0
+
+| commit | what |
+|---|---|
+| `7a2db01` | f2.14 `FTQ_WIDE_ENQ` + `FTQ_STATS` — run-ahead depth works and is worth zero |
+| `a5fdc9c` | f2.15a `PRED_GHR_AHEAD` run-ahead GHR; `OVR_STATS` / `BLK_STATS` censuses |
+| `293117f` | f2.15c `blkpred.veryl` + `PRED_BLK` instance + `BLKC_STATS` coverage census |
+| `ad07ea5` | f2.15d `FTQ_DESC` descriptor arrays + two-stage run-ahead lookup (no consumer) |
+
+Consts, all 0: `PRED_PIPE PRED_OVERRIDE PRED_HOLD_FREEZE PRED_L0_FAST L0_SLOT1 FTB_OVERRIDE
+FTQ_DECOUPLE FTQ_RUNAHEAD FTQ_WIDE_ENQ PRED_GHR_AHEAD PRED_BLK FTQ_DESC` + the four censuses
+(`FTQ_STATS BLK_STATS BLKC_STATS OVR_STATS`) + `*_SYNC_READ` in btb/bht/tage/ibtb + `rob::PRED_OVERRIDE`.
+
+### The one-sentence job
+
+`ftq_d_*[]` already carries a run-ahead block prediction for every enqueued dword; make the producer
+advance `pc_pred` from it (instead of `pp_next`/the async FTB) and make extract consume it (instead of
+reading BTB/iBTB at `ext_pc_q`), demoting `sb_override` from predictor to reconciliation check.
+**Producer advance and extract consumption must change together** — a half-switched front end has the
+producer and the consumer disagreeing about the stream, which is the f2.4 failure shape.
+
+### Do NOT re-measure these — already settled
+
+- **Ceiling**: deficit = 1.037 × (Stage-B overrides) + **15450**. Killing every override gets
+  286080 → ~268400, **+13.1 % → +6.1 %**. The 15450 is fixed and NOT addressable here.
+- **The overrides are COVERAGE, not accuracy**: 33 L0 false positives (all warm-up), ZERO target
+  errors, over a whole dhrystone run. slot-1 is 47 % of them and a block predictor covers it for free.
+- **blkpred coverage vs the 4096-entry BTB**: dhrystone 100 %, coremark 99.6 %, N1 boot 96.2 % at
+  `IDX_W=12`. Two branch slots is exactly right (kernel pop3 = 1.9 %, pop4 = 0).
+- **Run-ahead FTQ depth is worth zero on its own** (f2.14). Do not chase depth.
+
+### Scope boundary that is deliberately still open
+
+f2.15d wired **unconditional transfers only** (blkpred's tail slot — jal/jalr/call/ret/ind — which is
+predicted taken on sight and needs no direction predictor). Conditional blocks currently read as
+not-taken and fall through sequentially, i.e. exactly today's behaviour, so they cannot regress.
+
+**The conditional case (f2.15e′) is the real accuracy risk and must be measured before it is built.**
+f2.6 is the precedent: moving TAGE's read to Stage-A cost `earlymis` +5.4 % and made coremark *worse*
+than the bubble it saved. f2.15e′ changes the direction read in two ways at once — index resolution
+(halfword → dword) and history (`spec_ghr` → the run-ahead `ghr_pred`, resynced on all 52418 reseeds).
+Against a 17691-cycle ceiling, a few percent of accuracy eats the whole prize. Build the shadow
+measurement first: read BHT/TAGE at `{dword-aligned pc, ghr_pred}` and score it against ground truth
+at commit, before any of it steers.
+
+### Config recipe (the arm this work lives in)
+
+```sh
+sed -i 's/const PRED_PIPE: bit = 0;/const PRED_PIPE: bit = 1;/'               src/core/heliodor_core.veryl
+sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'       src/core/heliodor_core.veryl
+sed -i 's/const PRED_HOLD_FREEZE: bit = 0;/const PRED_HOLD_FREEZE: bit = 1;/' src/core/heliodor_core.veryl
+sed -i 's/const PRED_L0_FAST: bit = 0;/const PRED_L0_FAST: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const L0_SLOT1: bit = 0;/const L0_SLOT1: bit = 1;/'                 src/core/heliodor_core.veryl
+sed -i 's/const FTB_OVERRIDE: bit = 0;/const FTB_OVERRIDE: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const FTQ_DECOUPLE: bit = 0;/const FTQ_DECOUPLE: bit = 1;/'         src/core/heliodor_core.veryl
+sed -i 's/const IBTB_SYNC_READ: bit = 0;/const IBTB_SYNC_READ: bit = 1;/'     src/core/ibtb.veryl
+sed -i 's/const BHT_SYNC_READ: bit = 0;/const BHT_SYNC_READ: bit = 1;/'       src/core/bht.veryl
+sed -i 's/const BTB_SYNC_READ: bit = 0;/const BTB_SYNC_READ: bit = 1;/'       src/core/btb.veryl
+sed -i 's/const TAGE_SYNC_READ: bit = 0;/const TAGE_SYNC_READ: bit = 1;/'     src/core/tage.veryl
+sed -i 's/const PRED_OVERRIDE: bit = 0;/const PRED_OVERRIDE: bit = 1;/'       src/core/rob.veryl
+# plus, for f2.15: PRED_BLK, FTQ_DESC, FTQ_RUNAHEAD, PRED_GHR_AHEAD
+```
+Revert: `git checkout -- src/core/{heliodor_core,ibtb,bht,btb,tage,rob}.veryl`.
+
+### Baselines (dhrystone, this tree)
+
+| config | cycles |
+|---|---|
+| `=0` shipped | 252939 |
+| variant-A | 318202 |
+| variant-A + L0 + slot-1 (**the number to beat**) | **286080** |
+| F2-full | 358627 |
+
+instret must stay **264834** (dhrystone) / **374357** (coremark). N1 boot `=0` is `cy=00d9be30`.
+
+### RTL anchors
+
+| what | where (`heliodor_core.veryl` unless noted) |
+|---|---|
+| descriptor arrays | `ftq_d_taken/target/off/call/ret/ind[FTQ_N]` |
+| two-stage lookup | `pc_pred_q`, `pp_desc_vld`, `pd_taken/target/off/next` |
+| block predictor | `blkpred.veryl`, instance `u_blkpred`, outputs `blk_*` |
+| producer to rewire | `pp_next`, `pp_advance`, the producer `always_ff` steady arm |
+| consumer to rewire | `f0_fetch_pc`, and extract's `predicted_taken` / `pred_target` / `sb_override` |
+| run-ahead GHR | `ghr_pred`, `ghr_pred_l`, `ghr_pred_upd` |
+
+### Traps this campaign has paid for
+
+- **`instret` is the canary, not `tohost`** — a skipped instruction still reports pass.
+- **When comparing against a CLOCKED array, delay the comparison operands.** Cost an hour in f2.15c
+  (read 11 % coverage instead of the truth).
+- **A 1R1W array's two-cycle train RMW needs write forwarding** — without it, two branches in one
+  dword (adjacent instructions, so adjacent commits) lose one of themselves systematically.
+- **Veryl**: module-level `let` requires definition before reference (declare `var`s early instead);
+  `$display` has no width specifiers (`%0d` prints literally and consumes no argument — use `%d`); no
+  dynamic array READ inside `always_ff` (hoist to a module-level `let`); relational ops are `<:` `>:`.
+- **Sanity-check the flip** — confirm a flipped const actually changed a statistic before believing
+  an A/B result.
+- **`veryl check` exits 1 on this tree from pre-existing cache warnings.** Diff the exit code with and
+  without your file rather than assuming your change broke it.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
