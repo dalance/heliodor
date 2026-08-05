@@ -2647,24 +2647,33 @@ Run 2026-08-05 on the f2.15e′ config (the 15-const set). Every standing regres
 | litmus N=4 (RVWMO battery) | **pass**, `cy=003bf790` = 3.93 M | no forbidden outcome |
 | N=1 Linux boot | **pass**, `cy=00e09c00` = 14.72 M | +3.2 % |
 | SMP N=2 Linux boot | **pass**, `cy=012a4f30` = 19.55 M | ≈ +1.8 % |
-| SMP N=4 Linux boot | **pass**, `cy=01baa850` = 29.01 M | within the documented ±1 M band |
+| SMP N=4 Linux boot | **pass**, `cy=01baa850` = 29.01 M | −0.67 M vs a matched `=0` 29.68 M (within the ±1 M band) |
 | dhrystone / coremark | pass, `instret` bit-exact both | +4.6 % / +9.6 % |
 
 At `=0` the tree is behaviourally unchanged throughout: 252/0, dhrystone 252939 / 264834, litmus N=2
 `cy=002e6300`.
 
-**Caveat: the N=4 comparison is not a matched pair.** The ±1 M band figure comes from the recorded
-baseline, not from an `=0` N=4 run on this tree, so treat 29.01 M as "no regression detected" rather
-than as a measured speedup.
+### The N=4 gate: a matched `=0` run, and a withdrawn claim
 
-**Correction — CLAUDE.md's "~10 min" for the N=4 gate is stale, and f2.15 is not why it is slow.**
-The f2.15f run took ~70 minutes, and the first write-up of this section attributed that to blkpred's
-array state (4096 × 155 bits × 2 replicated copies per core). **That attribution was never measured
-and is withdrawn.** The wall-time figure in CLAUDE.md dates from P9.1 (`ebc5627`, 2026-06-12); the
-line's cycle count was refreshed on 2026-07-23 (`3f5681d`) but the runtime was carried forward
-untouched, across the icache bundle going default-on, `ATOMIC_SQ`, `MEM_PIPE`, `RETIRE_DECOUPLE` and
-the vector/H work. The N=4 gate has in practice been taking close to an hour for some time,
-independently of anything in F2. Do not size a session around the "~10 min" number.
+The first write-up of this section reported the N=4 SMP boot taking ~70 minutes against CLAUDE.md's
+"~10 min" and attributed the difference to blkpred's array state (4096 × 155 bits × 2 replicated
+copies per core). **That attribution was never measured, and the measurement says it was wrong.**
+
+A matched `=0` N=4 run on this tree: **4408 s wall (73.5 min)**, `cy=01c4e180` = **29.68 M**, pass.
+
+- **The gate costs ~75 minutes at `=0`.** CLAUDE.md's figure understated it by ~7×; it dates from
+  P9.1 (`ebc5627`, 2026-06-12) and was carried forward untouched while the cycle count was refreshed
+  (`3f5681d`, 2026-07-23) across the icache bundle going default-on, `ATOMIC_SQ`, `MEM_PIPE`,
+  `RETIRE_DECOUPLE` and the vector/H work. CLAUDE.md now carries the measured number.
+- **f2.15 costs nothing in runtime.** The flip run (~70 min) was if anything *faster* than the `=0`
+  baseline, so there is no blkpred-attributable simulation cost to speak of.
+- **The cycle pair is now matched**: `=0` 29.68 M vs f2.15e′ 29.01 M, i.e. −0.67 M (−2.3 %). That is
+  inside the ±1 M band this gate is documented to carry, so the honest reading is *no regression*,
+  not a measured speedup.
+
+The lesson, and it is the expensive kind: an inherited number in a workflow doc is not a measurement,
+and a plausible cause for a discrepancy is not a cause. Both got committed here before either was
+checked.
 
 ### Not run
 

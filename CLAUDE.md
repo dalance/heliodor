@@ -128,8 +128,12 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      (~19.2M cycles, ~3 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
      (~14.2M cycles, ~1 min).
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
-     (~30.4M cycles, ~10 min). Cycle counts drift with perf work — treat large
-     unexplained jumps as regressions (N=4 has a ±1M timing band).
+     (~29.7M cycles, **~75 min** — measured 2026-08-05 at 4408 s wall on this box).
+     Cycle counts drift with perf work — treat large unexplained jumps as
+     regressions (N=4 has a ±1M timing band). The wall-time here read "~10 min"
+     from P9.1 (2026-06-12) until 2026-08-05: the cycle count was refreshed over
+     the intervening perf work but the runtime was not, so it understated the gate
+     by ~7×. Budget over an hour for it, and re-measure if you touch this line.
 - **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
   (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`, `test_coremark`)
   that print cycles + retired instructions (IPC = instret / cycles, frozen at
