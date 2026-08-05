@@ -2204,6 +2204,55 @@ pub module heliodor_core #(
     // carries no RAS action, and there is room for both.
     let pp_wide         : logic            = FTQ_WIDE_ENQ && ftq_enq && !pp_ftb_hit && ftq_room2
         && !pp_ftb_is_call_b && !pp_ftb_is_ret_b;
+    // ── f2.15a: RUN-AHEAD GHR — the direction-history twin for a run-ahead predictor ── DEAD at 0 ──
+    // f2.14 established that a deeper FTQ cannot amortise the clocked predictor latency because every
+    // clocked predictor is indexed by ext_pc_q (the EXTRACT pointer) and by spec_ghr, which is
+    // likewise updated from Stage-A/B outcomes. Moving those reads onto pc_pred therefore needs a
+    // history that is valid AT pc_pred — i.e. one that already includes every conditional branch the
+    // producer has run past but extract has not yet reached.
+    //
+    // This is exactly f2.5d's run-ahead RAS problem, and it takes the same shape: a THIRD copy of the
+    // history, advanced by the producer on the blocks pc_pred commits to, and resynced on every
+    // pc_pred re-seed (pp_reseed) from the extract-side speculative history — which is the correct
+    // source, because a reseed means the run-ahead was thrown away and must restart from where
+    // extract actually is. Both widths mirror spec_ghr / spec_ghr_l so a later dword-indexed
+    // BHT/TAGE read can use them directly.
+    //
+    // What the producer knows about a block's direction comes from the FTB's own metadata, which is
+    // all a block predictor ever has: a FOLLOWED entry (pp_ftb_hit) on a conditional branch means
+    // predicted-taken → shift in 1; a PRESENT but not-followed conditional entry means the block's
+    // branch was predicted not-taken → shift in 0. A dword with no conditional entry shifts nothing.
+    // Only meaningful under FTB_OVERRIDE (the FTB is not trained otherwise — see f2.1), which is the
+    // arm f2.15 lives in.
+    const PRED_GHR_AHEAD: bit = 0;
+    var ghr_pred  : logic<13>;
+    var ghr_pred_l: logic<55>;
+    // The producer's view of this dword's conditional branch. pp_ftb_hit already requires
+    // valid+tag+follow, so "present but not followed" needs its own (unfollowed) presence test.
+    let pp_ftb_present : logic = PRED_GHR_AHEAD && FTQ_DECOUPLE && ICACHE_FETCH_DIRECTED
+        && ftb_valid[pp_ftb_idx] && (ftb_tag[pp_ftb_idx] == pp_ftb_tag) && !pp_no_ftb_q;
+    let pp_cond        : logic = pp_ftb_present && ftb_is_cond[pp_ftb_idx];
+    let pp_cond_taken  : logic = pp_cond && pp_ftb_hit; // followed ⟹ the FTB predicted it taken
+    // Advance only when the producer actually commits to the block (pp_advance is the enqueue /
+    // bypass-beat-done condition the run-ahead RAS uses, so the two histories stay in step).
+    let ghr_pred_upd   : logic = PRED_GHR_AHEAD && pp_advance && pp_cond && !pp_reseed;
+    always_ff (clk, rst) {
+        if_reset {
+            ghr_pred   = 13'd0;
+            ghr_pred_l = '0;
+        } else if PRED_GHR_AHEAD {
+            if pp_reseed {
+                // The run-ahead was discarded — restart from where extract actually is. Same
+                // approximation the spec_ghr restore makes (it lags by the in-flight branches), and
+                // accuracy-only for gshare, exactly as documented there.
+                ghr_pred   = spec_ghr;
+                ghr_pred_l = spec_ghr_l;
+            } else if ghr_pred_upd {
+                ghr_pred   = {ghr_pred[11:0], pp_cond_taken};
+                ghr_pred_l = {ghr_pred_l[53:0], pp_cond_taken};
+            }
+        }
+    }
     // The run-ahead RAS follows the blocks pc_pred actually commits to: a followed CALL entry pushes
     // its recorded return address, a followed RETURN entry pops. Resynced on every pc_pred re-seed
     // (ras.veryl copies from the speculative stack; a pipeline flush copies from the architectural
@@ -2405,6 +2454,153 @@ pub module heliodor_core #(
                     pp_no_ftb_q = if PRED_RAS_AHEAD ? (pp_ftb_hit && pp_ftb_is_ret && (ras_pred_top[2:1] != 2'b00)) : 1'b0;
                 }
                 ftq_count = ftq_count + (if ftq_enq ? (if pp_wide ? 4'd2 : 4'd1) : 4'd0) - (if f0_ftq_pop ? 4'd1 : 4'd0);
+            }
+        }
+    }
+    // ── f2.15b DWORD-ALIASING PROBE (temporary; DEAD at BLK_STATS=0) ──
+    // Gating measurement for the block predictor. A dword-indexed block predictor holds ONE entry per
+    // dword, so two distinct conditional branches inside the same dword cannot both be represented —
+    // they alias, and one of them is mispredicted every time. This counts that case with GROUND TRUTH
+    // at commit (not agreement with the current predictor): committed conditional branches whose PC
+    // lies in the same dword as the PREVIOUSLY committed conditional branch but at a different
+    // halfword offset. With RVC, four instructions fit in a dword, so this is not a priori rare and
+    // it is the structural part of the accuracy risk — the part no amount of table capacity fixes.
+    const BLK_STATS: bit = 0;
+    var bs_cy    : logic<32>;
+    var bs_cond  : logic<32>; // committed conditional branches
+    var bs_alias : logic<32>; // ... in the same dword as the previous one, different halfword
+    var bs_same  : logic<32>; // ... the SAME branch again (a loop back-edge: no aliasing, benign)
+    var bs_prevpc: logic<64>;
+    var bs_prevok: logic     ;
+    // Exact (non-consecutive) form: remember, per dword, the halfword offset of the last committed
+    // conditional branch in it, with a tag so different dwords do not alias in the PROBE itself.
+    // The consecutive-pair counters above are only a lower bound — a dword whose two branches are
+    // never committed back-to-back would escape them.
+    const BS_N: u32 = 4096;
+    var bs_toff: logic<2>  [BS_N];
+    var bs_ttag: logic<12> [BS_N];
+    var bs_tval: logic     [BS_N];
+    var bs_alias2: logic<32>;
+    // How MANY branch slots a block entry needs. A dword holds at most four RVC instructions, so the
+    // within-dword branch offset pc[2:1] has exactly four values — a 4-bit mask per dword records the
+    // exact set of offsets at which a conditional branch has committed. Classifying each committed
+    // branch by its dword's distinct-offset count answers the design parameter directly: popcount 1
+    // needs one slot, 2 needs two, >2 would still alias with a two-slot entry.
+    var bs_tmsk: logic<4> [BS_N];
+    var bs_pc1 : logic<32>;
+    var bs_pc2 : logic<32>;
+    var bs_pc3 : logic<32>;
+    var bs_pc4 : logic<32>;
+    // Dynamic array reads are hoisted to module level (the simulator rejects them inside always_ff).
+    let bs_idx  : logic<12> = bp_train_pc[14:3];
+    let bs_tag  : logic<12> = bp_train_pc[26:15];
+    let bs_rdoff: logic<2>  = bs_toff[bs_idx];
+    let bs_rdtag: logic<12> = bs_ttag[bs_idx];
+    let bs_rdval: logic     = bs_tval[bs_idx];
+    let bs_rdmsk: logic<4>  = bs_tmsk[bs_idx];
+    // The mask this dword has AFTER counting the branch committing now (a tag miss restarts it).
+    let bs_setbit: logic<4> = (4'd1 << bp_train_pc[2:1]);
+    let bs_newmsk: logic<4> = if (bs_rdval && (bs_rdtag == bs_tag)) ? (bs_rdmsk | bs_setbit) : bs_setbit;
+    let bs_pop   : logic<3> = {2'd0, bs_newmsk[0]} + {2'd0, bs_newmsk[1]} + {2'd0, bs_newmsk[2]} + {2'd0, bs_newmsk[3]};
+    always_ff (clk, rst) {
+        if_reset {
+            bs_cy     = 32'd0;
+            bs_cond   = 32'd0;
+            bs_alias  = 32'd0;
+            bs_same   = 32'd0;
+            bs_prevpc = 64'd0;
+            bs_prevok = 1'b0;
+            bs_alias2 = 32'd0;
+            bs_pc1    = 32'd0;
+            bs_pc2    = 32'd0;
+            bs_pc3    = 32'd0;
+            bs_pc4    = 32'd0;
+            for i in 0..BS_N {
+                bs_toff[i] = 2'd0;
+                bs_ttag[i] = 12'd0;
+                bs_tval[i] = 1'b0;
+                bs_tmsk[i] = 4'd0;
+            }
+        } else if BLK_STATS {
+            bs_cy = bs_cy + 32'd1;
+            if bht_train_en {
+                bs_cond   = bs_cond + 32'd1;
+                bs_prevpc = bp_train_pc;
+                bs_prevok = 1'b1;
+                if bs_prevok && (bs_prevpc[63:3] == bp_train_pc[63:3]) {
+                    if bs_prevpc[2:1] == bp_train_pc[2:1] {
+                        bs_same = bs_same + 32'd1;
+                    } else {
+                        bs_alias = bs_alias + 32'd1;
+                    }
+                }
+                if bs_rdval && (bs_rdtag == bs_tag) && (bs_rdoff != bp_train_pc[2:1]) {
+                    bs_alias2 = bs_alias2 + 32'd1;
+                }
+                if bs_pop == 3'd1 {
+                    bs_pc1 = bs_pc1 + 32'd1;
+                } else if bs_pop == 3'd2 {
+                    bs_pc2 = bs_pc2 + 32'd1;
+                } else if bs_pop == 3'd3 {
+                    bs_pc3 = bs_pc3 + 32'd1;
+                } else {
+                    bs_pc4 = bs_pc4 + 32'd1;
+                }
+                bs_toff[bs_idx] = bp_train_pc[2:1];
+                bs_ttag[bs_idx] = bs_tag;
+                bs_tval[bs_idx] = 1'b1;
+                bs_tmsk[bs_idx] = bs_newmsk;
+            }
+            if bs_cy[15:0] == 16'hffff {
+                $display("BLK cy=%d cond=%d alias2=%d pop1=%d pop2=%d pop3=%d pop4=%d", bs_cy, bs_cond, bs_alias2, bs_pc1, bs_pc2, bs_pc3, bs_pc4);
+            }
+        }
+    }
+    // ── f2.15 STAGE-B OVERRIDE CENSUS (temporary; DEAD at OVR_STATS=0) ──
+    // Sizes the prize for "move the clocked prediction onto the run-ahead pointer": every
+    // sb_override is one bubble that a prediction available AT Stage-A would not have cost.
+    // Split by cause so we know the character of the remaining population at the best ladder
+    // rung (variant-A + L0 + slot-1), not just its size.
+    const OVR_STATS: bit = 0;
+    var ov_cy    : logic<32>;
+    var ov_drain : logic<32>; // sb_drain cycles (the delivery population overrides are drawn from)
+    var ov_tot   : logic<32>; // sb_override fires
+    var ov_s0_mis: logic<32>; // slot-0: full says TAKEN, L0 did not     → L0 coverage miss
+    var ov_s0_fp : logic<32>; // slot-0: L0 took, full says NOT taken    → L0 false positive
+    var ov_s0_tgt: logic<32>; // slot-0: both taken, targets differ      → L0 target wrong
+    var ov_s1    : logic<32>; // slot-1 override (any cause)
+    always_ff (clk, rst) {
+        if_reset {
+            ov_cy     = 32'd0;
+            ov_drain  = 32'd0;
+            ov_tot    = 32'd0;
+            ov_s0_mis = 32'd0;
+            ov_s0_fp  = 32'd0;
+            ov_s0_tgt = 32'd0;
+            ov_s1     = 32'd0;
+        } else if OVR_STATS {
+            ov_cy = ov_cy + 32'd1;
+            if sb_drain {
+                ov_drain = ov_drain + 32'd1;
+            }
+            if sb_override {
+                ov_tot = ov_tot + 32'd1;
+                if sb_disagree0 {
+                    if pt0_eff && !a_l0_taken {
+                        ov_s0_mis = ov_s0_mis + 32'd1;
+                    } else if !pt0_eff && a_l0_taken {
+                        ov_s0_fp = ov_s0_fp + 32'd1;
+                    } else {
+                        ov_s0_tgt = ov_s0_tgt + 32'd1;
+                    }
+                }
+                if sb_ovr_taken1 {
+                    ov_s1 = ov_s1 + 32'd1;
+                }
+            }
+            if ov_cy[15:0] == 16'hffff {
+                $display("OVR cy=%d drain=%d ovr=%d s0mis=%d s0fp=%d s0tgt=%d s1=%d",
+                    ov_cy, ov_drain, ov_tot, ov_s0_mis, ov_s0_fp, ov_s0_tgt, ov_s1);
             }
         }
     }

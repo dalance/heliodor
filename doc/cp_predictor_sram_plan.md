@@ -2106,6 +2106,171 @@ substrate for anyone who does move the prediction onto the run-ahead pointer. Ve
 with both at 0: dhrystone **358627 / instret 264834**, bit-identical to the f2.12 control; and with
 the whole F2 config reverted, the default suite is green.
 
+## f2.15 — MOVING THE CLOCKED PREDICTION ONTO THE RUN-AHEAD POINTER (design)
+
+User decision (2026-08-05) after f2.14: pursue the corrected direction. This section fixes the design
+before building, following the f2.2 / order-item-3 precedent.
+
+### The ceiling, measured first
+
+Two config points on this tree, dhrystone, with the `OVR_STATS` census (`sb_override` fires, split by
+cause) plus the harness counters:
+
+| config | cycles | Stage-B overrides | deficit vs `=0` | front-idle excess | front-idle per override |
+|---|---|---|---|---|---|
+| `=0` shipped | 252939 | — | — | — | — |
+| variant-A | 318202 | 48035 | 65263 | 49894 | **1.039** |
+| variant-A + L0 + slot-1 | 286080 | 17060 | 33141 | 17727 | **1.039** |
+
+Two unknowns, two equations:
+
+> **deficit = 1.037 × (Stage-B overrides) + 15450**
+
+and it reproduces variant-A to within 1 cycle. The per-override front-idle coefficient is *identical*
+in both configs (1.039), which is an independent counter confirming the model rather than a fit.
+
+**⇒ The honest ceiling for f2.15: removing EVERY Stage-B override recovers 17691 cycles — 286080 →
+~268400, i.e. +13.1 % → +6.1 % vs `=0`.** The residual **15450 cycles (+6.1 %) does not scale with
+override count** and is therefore *not* addressable by moving the prediction to the run-ahead
+pointer. What it is (extra-stage refill latency, Stage-B skid throughput under back-pressure) is a
+separate question; it is not this block's. Scope f2.15 as "recover 53 % of the current deficit."
+
+### What the remaining overrides actually are — COVERAGE, not accuracy
+
+Census at the best rung (extrapolated to the full run):
+
+| cause | count | share |
+|---|---|---|
+| slot-0: full says TAKEN, L0 did not (**coverage miss**) | ~9000 | 52.8 % |
+| slot-0: L0 took, full says not-taken (false positive) | 33 | 0.02 % |
+| slot-0: both taken, targets differ | **0** | 0 % |
+| slot-1 override (any cause) | ~8020 | 47.0 % |
+
+**When the L0 knows a branch it is essentially never wrong** — 33 false positives over the whole run
+(all in the first 65k cycles, i.e. warm-up) and *zero* target errors. The entire population is
+branches the fast path does not have. The reason is a size mismatch, not a design flaw:
+
+| array | entries |
+|---|---|
+| **BTB** (read at `ic_pc` / `s1_pc`) | **4096** |
+| BHT | 8192 |
+| iBTB | 512 |
+| TAGE | 1024 / tagged table |
+| **L0 µBTB** (Stage-A fast path) | **32** |
+| **FTB** (read at `pc_pred`, the only run-ahead-side predictor today) | **64** |
+
+The L0 is fighting a 4096-entry BTB with 32 entries. **This also means the fix is not "tune the L0"**
+— f2.9 already measured µBTB capacity as a weak lever, and now we know why the *population* is what
+it is without that telling us capacity is cheap to buy at Stage-A (a big async array is a flop RF,
+which is the non-SRAM shape this whole campaign exists to remove).
+
+### Why this forces a block predictor (the structural constraint)
+
+Extract's predictor read PCs are **instruction** PCs derived from decoding the fetched dword:
+
+```
+let ic_pc = ext_pc_q;                      // slot-0 instruction PC
+let s1_pc = ic_pc + pc_advance;            // needs slot-0's LENGTH → needs the fetched bytes
+```
+
+`pc_pred` is a *dword address of a not-yet-fetched dword*. There is no way to read a PC-indexed
+BTB/BHT/TAGE there. **A run-ahead predictor must be dword → block by construction.** That is the FTB's
+shape, which is why f2.13's descriptor FTQ was the right structure even though its stated motivation
+(producer rate) was refuted in f2.14.
+
+It also disposes of the slot-1 half of the census for free: a block predictor predicts *the first
+taken branch in the block* and does not care which slot it lands in, so the ~8020 slot-1 overrides
+(47 %) are covered by the same mechanism as slot-0 rather than needing a second fast path.
+
+### Target structure
+
+Grow the FTB into a **BTB-scale, dword-indexed, clocked-read block predictor**, and let it *replace*
+the extract-side BTB read rather than duplicate it — the same budget re-organised from PC-indexed to
+block-indexed, which is exactly the transition real cores made:
+
+```
+entry (indexed by pc[..:3], tagged): { branch_hw_offset, is_cond, is_call, is_ret, is_ind, target }
+FTQ entry:  { start_pc, branch_hw_offset, taken, target, kind, ras_action }   // descriptor, not an address
+```
+
+- Producer reads the block predictor at `pc_pred` (clocked — the FTQ absorbs the latency, which is
+  the entire point and the thing f2.14 proved the current structure cannot do).
+- Direction comes from BHT/TAGE indexed by the **dword** PC and a **run-ahead GHR**.
+- Extract consumes the descriptor; Stage-B stops being the predictor and becomes a *reconciliation*
+  check (does the decoded instruction stream match the descriptor?).
+
+### The gating risk — direction accuracy (f2.6 is the precedent and the warning)
+
+f2.6 moved TAGE's read to Stage-A and measured **`earlymis` +5.4 %**, making coremark *worse* — the
+cost of indexing on a staler speculative history exceeded the bubble it saved. f2.15 changes the
+history in a *different* way (further ahead, more speculative, resynced on all 52418 reseeds) and
+changes the index resolution (halfword → dword). Either can trade bubbles for mispredicts. Given the
+ceiling is only 17691 cycles, an accuracy regression of a few percent eats the whole prize.
+
+**⇒ Measure accuracy BEFORE building the datapath.** This is f2.13's own lesson generalised: that
+plan spent its credibility on an unmeasured premise, and f2.14 cost one experiment to refute it.
+
+### f2.15b RESULT — one branch slot per block is NOT enough (measured)
+
+The probe counts, with **ground truth at commit** (not agreement with the current predictor), committed
+conditional branches that land in a dword which also holds another *executed* conditional branch — the
+case a one-entry-per-dword block predictor structurally cannot represent. `alias` is the
+consecutive-pair lower bound; `alias2` is the exact form (a per-dword table of the last committed
+branch offset, tagged so the probe itself does not alias).
+
+| workload | committed cond branches | `alias2` | share |
+|---|---|---|---|
+| dhrystone | 35083 | **0** | 0 % |
+| coremark | 52813 | 3388 | 6.4 % |
+| **N1 Linux boot** | 1350942 | **134020** | **9.9 %** |
+
+dhrystone is entirely free of it; coremark is not, and the kernel — the workload with the code
+footprint that actually matters — is worst. 9.9 % of conditional branches losing their own entry is
+well past the +5.4 % `earlymis` that killed f2.6, and against a ceiling of only 17691 cycles that is
+enough to eat the whole prize several times over. **Had f2.15 been built on the obvious one-entry-
+per-dword FTB, it would have failed for this reason and the cause would have been hard to see from
+the cycle count alone.**
+
+**⇒ Design decision, derived from the measurement: the block entry carries TWO branch slots, not
+one** (`{offset, is_cond, kind, target} × 2` + a block-end field), which is what BOOM / XiangShan-class
+FTBs do and for exactly this reason. A single-slot entry was the obvious first cut and would have
+been wrong on coremark and on the kernel; this is what the probe was for.
+
+**And two is exactly the right number — measured, not assumed.** The within-dword branch offset
+`pc[2:1]` has only four values, so a 4-bit mask per dword records the *exact* set of offsets at which
+a conditional branch has committed. Classifying every committed branch by its dword's distinct-offset
+count settles the design parameter directly:
+
+| workload | pop=1 (needs 1 slot) | pop=2 (needs 2) | **pop=3** | pop=4 |
+|---|---|---|---|---|
+| coremark | 44974 (85.2 %) | 7839 (14.8 %) | **0** | 0 |
+| N1 Linux boot | 1182754 (87.6 %) | 142155 (10.5 %) | **26033 (1.9 %)** | **0** |
+
+Two slots covers coremark completely (it eliminates the 6.4 % rather than merely reducing it) and
+covers **98.1 %** of the kernel, taking its aliasing 9.9 % → 1.9 %. Four never occurs anywhere.
+
+**Do NOT add a third slot for the residual 1.9 %.** A block ends at the first *taken* branch, so a
+third branch in a dword is only consulted when both earlier ones fall through — and the case already
+has a correct, cheap home: extract's reconciliation (the demoted Stage-B override) catches it at the
+cost of one bubble, which is exactly the mechanism f2.15e leaves in place. A third slot would grow
+every entry by ~50 % (offset + kind + 64-bit target) to buy back a fraction of 1.9 % of branches.
+**Two slots plus graceful degradation to the existing override path** is the design.
+
+### Increments (each DEAD at 0, byte-identical at 0)
+
+- **f2.15a — run-ahead GHR** (`ghr_pred` / `ghr_pred_l`): the direction-history analogue of f2.5d's
+  run-ahead RAS third stack (that is the exact precedent, including the resync-on-reseed discipline).
+  Advanced by the producer from the block predictor's own `is_cond` / followed-ness; resynced from
+  `spec_ghr` / `spec_ghr_l` on every `pp_reseed`. Substrate for everything below.
+- **f2.15b — ACCURACY PROBE (gating).** Shadow-read BHT/TAGE at `{dword-aligned PC, ghr_pred}` and
+  compare against the real delivered direction on delivered conditional branches. Counts agreement,
+  disagreement, and disagreement-on-taken. Pure counters, no datapath. **Decides whether f2.15c-f are
+  worth building at all.**
+- **f2.15c** — block predictor array (BTB-scale, dword-indexed, tagged, clocked, branch offset + kind).
+- **f2.15d** — FTQ entry becomes the descriptor.
+- **f2.15e** — extract consumes the descriptor; Stage-B demoted to reconciliation.
+- **f2.15f** — flip + full ladder measurement.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
