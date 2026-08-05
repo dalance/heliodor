@@ -2315,7 +2315,8 @@ with the array live and training, dhrystone is 252939 / instret 264834 and N1 bo
   (see "f2.15e RESULT" below): dhrystone 280067, the first rung to beat the 286080 best-known arm.
 - **f2.15e′** — conditional block exits (the direction counter lives in the block entry). ✅ BUILT +
   MEASURED (see "f2.15e′ RESULT"): dhrystone 264536, N1 boot +3.2 % — the standing +13.1 % is gone.
-- **f2.15f** — flip + full ladder measurement.
+- **f2.15f** — flip + full ladder measurement. ✅ RUN (see "f2.15f"): all five gates green at the
+  flip; Verilator + ACT4 deferred until a ship decision is taken.
 
 ## f2.15e — CONSUMER REWIRE: hand-off for a clean context
 
@@ -2635,6 +2636,43 @@ enters the dword at. Arming `pp_no_ftb_q` from the descriptor target's offset (t
 re-seed arms use) fixes that, and it turned out to help the tail-only case too: **f2.15e's own
 dhrystone went 280067 → 278570** on this tree, which is why the f2.15e column above differs from the
 f2.15e commit's number.
+
+## f2.15f — the full ladder at the flip: ALL GREEN, awaiting the ship decision
+
+Run 2026-08-05 on the f2.15e′ config (the 15-const set). Every standing regression gate passes.
+
+| gate | result | vs shipped `=0` |
+|---|---|---|
+| default suite (`veryl test`) | **252 passed, 0 failed** | — |
+| litmus N=4 (RVWMO battery) | **pass**, `cy=003bf790` = 3.93 M | no forbidden outcome |
+| N=1 Linux boot | **pass**, `cy=00e09c00` = 14.72 M | +3.2 % |
+| SMP N=2 Linux boot | **pass**, `cy=012a4f30` = 19.55 M | ≈ +1.8 % |
+| SMP N=4 Linux boot | **pass**, `cy=01baa850` = 29.01 M | within the documented ±1 M band |
+| dhrystone / coremark | pass, `instret` bit-exact both | +4.6 % / +9.6 % |
+
+At `=0` the tree is behaviourally unchanged throughout: 252/0, dhrystone 252939 / 264834, litmus N=2
+`cy=002e6300`.
+
+Two caveats worth stating rather than burying. **The N=4 comparison is not a matched pair** — the
+±1 M band figure comes from the recorded baseline, not from an `=0` N=4 run on this tree, so treat
+29.01 M as "no regression detected" rather than as a measured speedup. And **the N=4 run took ~70
+minutes instead of the documented ~10**, which is a simulation-cost observation, not a hardware one:
+`blkpred` at `IDX_W=12` is 4096 entries × 155 bits × 2 replicated copies ≈ 1.27 Mbit *per core*, and
+four of those dominate the simulator's state. It is the same array budget the design already
+justified (~1.27× the BTB it replaces, for 4× the code span), but it does make the N=4 gate expensive
+to re-run, and an `IDX_W` sweep is the obvious lever if that becomes a problem.
+
+### Not run
+
+Verilator NBA cross-check (the R3 precedent ran 4/4) and the ACT4 696-test compliance sweep. Both are
+standing requirements for a flip that changes the default path; neither is needed while the whole
+stack stays `=0`, which is where it is committed.
+
+### The state this leaves
+
+Everything is DEAD at 0 and the shipped path is untouched, so nothing here is a regression risk. The
+flip is a 15-const set (f2.13's F2-full plus `PRED_BLK`, `FTQ_DESC`, `PRED_BLK_COND`); shipping it —
+i.e. making it the default — is a user decision, as R3.3 and R3.2c were.
 
 ### Corrections to the earlier f2.7 write-up
 
