@@ -2168,6 +2168,42 @@ pub module heliodor_core #(
     let pp_reseed : logic = FTQ_DECOUPLE && (redirect_fire || early_redir_fire_q || (sb_override && !sb_ovr_soft) || ext_taken_redir || f0_diverged);
     let ftq_enq   : logic = FTQ_DECOUPLE && !pp_reseed && (!ftq_full || f0_ftq_pop) && (FTQ_RUNAHEAD || !f0_ftq_byp);
     let pp_advance: logic = ftq_enq || (FTQ_DECOUPLE && !pp_reseed && !FTQ_RUNAHEAD && f0_ftq_byp && f0_beat_done);
+    // ── f2.14: WIDE (2-dword) FTQ ENQUEUE — the producer/consumer RATE FIX ── DEAD at 0 ──
+    // f2.12's root finding: `pp_next = pc_pred + 8` is one dword/cycle against a consumer that takes
+    // one dword/beat, so the FTQ is rate-matched and CANNOT accumulate depth. This is the cheapest
+    // possible test of "can depth be held at all" — strictly weaker than the descriptor FTQ the F2
+    // plan sketches, but it moves the same lever (producer rate) and it is the measurement f2.13
+    // gates the whole block-granularity idea on.
+    //
+    // When pc_pred's dword has NO followed FTB entry the next dword is sequential BY CONSTRUCTION
+    // (pp_next = pc_pred + 8), so we already know it without a prediction: enqueue BOTH dwords this
+    // cycle and run the FTB read for the second one on a second async port (pp_*_b). The emitted
+    // dword sequence is therefore BIT-IDENTICAL to what the 1-wide producer would emit over two
+    // cycles — only the timing changes. That invariant is what makes this safe: fetch sees the same
+    // stream, so instret must not move.
+    //
+    // The RAS is deliberately excluded from the wide step (a call/ret at the second dword falls back
+    // to 1-wide) — the run-ahead stack must see each followed block exactly once, and PRED_RAS_AHEAD
+    // is 0 in this arm anyway, so those terms are const-false.
+    // Only useful with FTQ_RUNAHEAD=1: at 0, ftq_enq is suppressed on a bypass cycle (97.9 % of them),
+    // so the wide step would almost never fire.
+    const FTQ_WIDE_ENQ: bit = 0;
+    let pp_pc_b         : logic<64>        = pc_pred + 64'd8;
+    let pp_ftb_idx_b    : logic<FTB_IDX_W> = pp_pc_b[FTB_IDX_W + 2:3];
+    let pp_ftb_tag_b    : logic<FTB_TAG_W> = pp_pc_b[63:FTB_IDX_W + 3];
+    let pp_ftb_follow_b : logic            = !ICACHE_FTB_COND || !ftb_is_cond[pp_ftb_idx_b] || (ftb_conf[pp_ftb_idx_b] == 2'd3);
+    let pp_ftb_is_call_b: logic            = PRED_RAS_AHEAD && ftb_is_call[pp_ftb_idx_b];
+    let pp_ftb_is_ret_b : logic            = PRED_RAS_AHEAD && ftb_is_ret[pp_ftb_idx_b];
+    let pp_ftb_hit_b    : logic            = FTQ_WIDE_ENQ && FTQ_DECOUPLE && ICACHE_FETCH_DIRECTED
+        && ftb_valid[pp_ftb_idx_b] && (ftb_tag[pp_ftb_idx_b] == pp_ftb_tag_b) && pp_ftb_follow_b;
+    let pp_next_b       : logic<64>        = if pp_ftb_hit_b ? {ftb_target[pp_ftb_idx_b][63:3], 3'b000} : pp_pc_b + 64'd8;
+    // Room for two entries, accounting for a concurrent dequeue (mirrors ftq_enq's `!ftq_full || pop`).
+    let ftq_room2       : logic            = (ftq_count <: 4'd7) || (f0_ftq_pop && (ftq_count <: 4'd8));
+    // The wide step: dword A is sequential (no followed entry — pp_no_ftb_q's forced-sequential case
+    // included, which is exactly right: that dword must NOT re-follow its branch), the second dword
+    // carries no RAS action, and there is room for both.
+    let pp_wide         : logic            = FTQ_WIDE_ENQ && ftq_enq && !pp_ftb_hit && ftq_room2
+        && !pp_ftb_is_call_b && !pp_ftb_is_ret_b;
     // The run-ahead RAS follows the blocks pc_pred actually commits to: a followed CALL entry pushes
     // its recorded return address, a followed RETURN entry pops. Resynced on every pc_pred re-seed
     // (ras.veryl copies from the speculative stack; a pipeline flush copies from the architectural
@@ -2346,10 +2382,16 @@ pub module heliodor_core #(
                 }
                 if ftq_enq {
                     ftq_pc[ftq_tail] = pc_pred;
-                    ftq_tail         = ftq_tail + 3'd1;
+                    // f2.14: the wide step also enqueues the (known-sequential) second dword. NBA
+                    // semantics — both index expressions read the OLD ftq_tail, so tail+1 is the
+                    // slot after the one just written.
+                    if pp_wide {
+                        ftq_pc[ftq_tail + 3'd1] = pp_pc_b;
+                    }
+                    ftq_tail = ftq_tail + (if pp_wide ? 3'd2 : 3'd1);
                 }
                 if ftq_enq || (f0_ftq_byp && f0_beat_done) {
-                    pc_pred = pp_next;
+                    pc_pred = if pp_wide ? pp_next_b : pp_next;
                     // f2.5d: a followed RETURN lands at the instruction AFTER the call — i.e. almost
                     // always MID-dword, in the very dword the call was trained on. Without the
                     // re-entry guard the next pc_pred step re-reads that dword's CALL entry and jumps
@@ -2362,7 +2404,80 @@ pub module heliodor_core #(
                     // ({target[63:3],0}) and drops it. Folds to 1'b0 at PRED_RAS_AHEAD=0.
                     pp_no_ftb_q = if PRED_RAS_AHEAD ? (pp_ftb_hit && pp_ftb_is_ret && (ras_pred_top[2:1] != 2'b00)) : 1'b0;
                 }
-                ftq_count = ftq_count + (if ftq_enq ? 4'd1 : 4'd0) - (if f0_ftq_pop ? 4'd1 : 4'd0);
+                ftq_count = ftq_count + (if ftq_enq ? (if pp_wide ? 4'd2 : 4'd1) : 4'd0) - (if f0_ftq_pop ? 4'd1 : 4'd0);
+            }
+        }
+    }
+    // ── f2.14 FTQ DEPTH INSTRUMENTATION (temporary; DEAD at FTQ_STATS=0) ──
+    // Reproduces f2.12's control table AND decomposes pp_reseed by which flush term actually
+    // fired (priority order, so the five counters sum to pp_reseed). Blocker 1 in the f2.13
+    // hand-off is "reseed is 16 % of cycles" — but not which reseed, which is what decides
+    // whether the reseed rate is even attackable.
+    const FTQ_STATS: bit = 0;
+    var st_cy      : logic<32>;
+    var st_depth   : logic<48>; // sum of ftq_count → mean depth
+    var st_dmax    : logic<4> ;
+    var st_byp     : logic<32>;
+    var st_enq     : logic<32>;
+    var st_wide    : logic<32>;
+    var st_pop     : logic<32>;
+    var st_reseed  : logic<32>;
+    var st_rs_redir: logic<32>;
+    var st_rs_earl : logic<32>;
+    var st_rs_sbov : logic<32>;
+    var st_rs_ext  : logic<32>;
+    var st_rs_div  : logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            st_cy       = 32'd0;
+            st_depth    = 48'd0;
+            st_dmax     = 4'd0;
+            st_byp      = 32'd0;
+            st_enq      = 32'd0;
+            st_wide     = 32'd0;
+            st_pop      = 32'd0;
+            st_reseed   = 32'd0;
+            st_rs_redir = 32'd0;
+            st_rs_earl  = 32'd0;
+            st_rs_sbov  = 32'd0;
+            st_rs_ext   = 32'd0;
+            st_rs_div   = 32'd0;
+        } else if FTQ_STATS {
+            st_cy    = st_cy + 32'd1;
+            st_depth = st_depth + {44'd0, ftq_count};
+            if ftq_count >: st_dmax {
+                st_dmax = ftq_count;
+            }
+            if f0_ftq_byp {
+                st_byp = st_byp + 32'd1;
+            }
+            if ftq_enq {
+                st_enq = st_enq + 32'd1;
+            }
+            if pp_wide {
+                st_wide = st_wide + 32'd1;
+            }
+            if f0_ftq_pop {
+                st_pop = st_pop + 32'd1;
+            }
+            if pp_reseed {
+                st_reseed = st_reseed + 32'd1;
+                if redirect_fire {
+                    st_rs_redir = st_rs_redir + 32'd1;
+                } else if early_redir_fire_q {
+                    st_rs_earl = st_rs_earl + 32'd1;
+                } else if sb_override && !sb_ovr_soft {
+                    st_rs_sbov = st_rs_sbov + 32'd1;
+                } else if ext_taken_redir {
+                    st_rs_ext = st_rs_ext + 32'd1;
+                } else {
+                    st_rs_div = st_rs_div + 32'd1;
+                }
+            }
+            if st_cy[15:0] == 16'hffff {
+                $display("FTQ cy=%d depthsum=%d dmax=%d byp=%d enq=%d wide=%d pop=%d reseed=%d (redir=%d earl=%d sbov=%d ext=%d div=%d)",
+                    st_cy, st_depth, st_dmax, st_byp, st_enq, st_wide, st_pop, st_reseed,
+                    st_rs_redir, st_rs_earl, st_rs_sbov, st_rs_ext, st_rs_div);
             }
         }
     }

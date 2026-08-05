@@ -1990,6 +1990,122 @@ the clocked-read front end in this microarchitecture — which is a legitimate p
 Phase 14's goal is structural completeness rather than CP (and f2.11 showed the flip is CP-neutral
 anyway).
 
+## 🚩 f2.14 — RUN-AHEAD DEPTH ACHIEVED, AND IT IS WORTH EXACTLY ZERO CYCLES
+
+f2.13 gated block-granularity work on one measurement: *can depth be held?* It can. It buys nothing.
+The experiment that shows it is much cheaper than the descriptor FTQ, and its result **refutes the
+premise the whole block-granularity idea rests on**.
+
+### What was built — `FTQ_WIDE_ENQ` (DEAD@0)
+
+The cheapest possible way to make the producer faster than the consumer, without touching the FTQ
+entry format. When `pc_pred`'s dword has no *followed* FTB entry, the next dword is sequential **by
+construction** (`pp_next = pc_pred + 8`) — so it needs no prediction: enqueue BOTH dwords this cycle,
+running the FTB read for the second one on a second async port (`pp_*_b`, mirroring how f2.10 added a
+second `l0pred` port). The RAS is excluded from the wide step (a call/ret at the second dword falls
+back to 1-wide), so the run-ahead stack still sees each followed block exactly once.
+
+**The design invariant that makes this safe and makes the result interpretable:** the emitted dword
+sequence is *bit-identical* to what the 1-wide producer emits over two cycles. Only the timing
+changes. Fetch sees the same stream — so any cycle difference would be purely the depth effect.
+
+Measured with `FTQ_RUNAHEAD=1` (f2.12's bypass fix — required, else `ftq_enq` is suppressed on the
+97.9 % of cycles that bypass), dhrystone, F2-full:
+
+| | mean depth | dmax | bypass | wide steps | enq | pop | **cycles** | instret |
+|---|---|---|---|---|---|---|---|---|
+| f2.12 control | 0.026 | 8 | 97.9 % | — | 3909 | 1040 | 358627 | 264834 |
+| **+`FTQ_WIDE_ENQ`+`FTQ_RUNAHEAD`** | **3.127** | 8 | **18.9 %** | 209665 (64 %) | 272337 | 321841 | **358627** | 264834 |
+
+**Depth went up 120×. Cycles did not move by one.** Nor did `instret`, nor any of the six secondary
+counters (`frontidl` 109858, `earlymis` 1264, `dispstl` 13550, `membusy` 75349, `commit0` 153621,
+`loadwait` 13576), nor — the sharpest tell — the `pp_reseed` breakdown, term by term. The fetch
+stream is byte-identical, exactly as the invariant predicted; the queue in front of it is now 3.1
+entries deep instead of 0.026, and nothing downstream can tell.
+
+Sanity-check on the flip (the trap this campaign has paid for): `wide` fires 209665 times, bypass
+collapses 97.9 % → 18.9 %, depth 0.026 → 3.127. The knob demonstrably took effect.
+
+### Why — the run-ahead is UPSTREAM of where the clocked latency is paid
+
+`ftq_pc` has exactly **one** consumer in the whole core:
+
+```
+let f0_fetch_pc = if FTQ_DECOUPLE ? (if ftq_count >= 1 ? ftq_pc[ftq_head] : pc_pred) : pc_fetch_q;
+```
+
+an icache **address**. Meanwhile every clocked predictor — BTB, IBTB, BHT, TAGE — is indexed by
+
+```
+let ic_pc = if ICACHE_SYNC_READ ? ext_pc_q : pc_q;     // the EXTRACT pointer
+let bht_lk_index = ic_pc[13:1] ^ spec_ghr;             // history is extract-side too
+```
+
+and `spec_ghr_l` / `spec_ind_hist` are updated from `cond_taken0/1`, i.e. the Stage-A/B decoded slot
+outcomes. So:
+
+```
+pc_pred ─► FTQ ─► F0 fetch ─► WORD FIFO ─► ext_pc_q ─► [BTB/BHT/TAGE/IBTB clocked read] ─► Stage-A/B
+           ^^^^ the run-ahead lives here                ^^^^ the clocked latency is paid here
+```
+
+The FTQ sits entirely **upstream** of the read whose latency it was supposed to hide. The predictors
+are read at the extract pointer, which advances at extract's own rate; no amount of FTQ depth moves
+that read one cycle earlier. Index *and* history are both extract-anchored. **A deeper FTQ is
+architecturally incapable of amortising the clocked predictor latency in this microarchitecture** —
+which is why 3.1 entries of run-ahead are worth zero, and would still be worth zero at 8 or 32.
+
+### What this does to the f2.13 plan
+
+f2.13's stated mechanism was "make the producer faster than the consumer." That is now **measured,
+achieved, and worth nothing** — so it is *necessary but nowhere near sufficient*, and block
+granularity pursued for that reason alone would buy exactly what `FTQ_WIDE_ENQ` bought: nothing.
+
+Note the two blockers f2.13 flagged both came out differently from expected:
+
+- **Blocker 1 is not a blocker.** `pp_reseed` at 16 % of cycles (mean 6.25 cycles between flushes)
+  still leaves room to reach depth 3.1 against a 2:1 producer, and `f0_diverged` never had to be
+  re-scoped — it did not fire once more than in the control. The "lockstep assumption" reading was
+  also wrong: `f0_diverged`'s `f0_fetch_pc != ext_pc_q` term is an *exclusion guard* (F0 is not
+  currently presenting extract's dword), not a lockstep requirement, so it does not get worse with
+  run-ahead.
+- **Blocker 2 was never reached** — reconciliation cost cannot scale with depth when depth changes
+  nothing at all.
+
+**The corrected direction, if this is pursued.** The descriptor FTQ is still the right structure, but
+its operative content is *not* "more dwords per producer cycle." It is **moving the clocked
+prediction onto the run-ahead pointer**: read BTB/BHT/TAGE/IBTB at `pc_pred` instead of `ext_pc_q`,
+carry the resulting prediction *inside* the FTQ entry, and consume it at extract. Then the queue
+depth absorbs the read latency, which is the actual thing real cores do. That also drags in the hard
+part this core has not built: the speculative GHR / indirect history must be maintained on the
+**run-ahead** path (today `spec_ghr_l` and `spec_ind_hist` are updated from Stage-A/B outcomes), and
+re-synced on every one of those 52418 reseeds.
+
+### New reseed decomposition (measured, not in f2.12)
+
+f2.13 called the 16 % reseed rate a blocker without knowing which term dominates. Now measured
+(priority order, so the five sum to `pp_reseed` = 52418 over 327679 cycles):
+
+| term | count | share |
+|---|---|---|
+| `redirect_fire` (commit redirect) | **1** | 0.0 % |
+| `early_redir_fire_q` | 1061 | 2.0 % |
+| `sb_override` (hard) | 12850 | 24.5 % |
+| `ext_taken_redir` | 18817 | 35.9 % |
+| `f0_diverged` | 19689 | 37.6 % |
+
+**Commit redirects are literally 1.** The entire 16 % is the front end's own reconciliation — the
+Stage-A FTB net (`ext_taken_redir` + `f0_diverged` = 73.5 %) plus the Stage-B hard override (24.5 %).
+That is machinery the decoupled arm *adds* relative to variant-A, and this is where its +25.4 %
+(286080 → 358627) is spent — cost with, as f2.14 now shows, no mechanism to earn it back.
+
+### Shipped state
+
+`FTQ_WIDE_ENQ` and the `FTQ_STATS` instrumentation are DEAD at 0, kept as the record and as working
+substrate for anyone who does move the prediction onto the run-ahead pointer. Verified at F2-full
+with both at 0: dhrystone **358627 / instret 264834**, bit-identical to the f2.12 control; and with
+the whole F2 config reverted, the default suite is green.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
