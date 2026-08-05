@@ -2653,14 +2653,18 @@ Run 2026-08-05 on the f2.15e′ config (the 15-const set). Every standing regres
 At `=0` the tree is behaviourally unchanged throughout: 252/0, dhrystone 252939 / 264834, litmus N=2
 `cy=002e6300`.
 
-Two caveats worth stating rather than burying. **The N=4 comparison is not a matched pair** — the
-±1 M band figure comes from the recorded baseline, not from an `=0` N=4 run on this tree, so treat
-29.01 M as "no regression detected" rather than as a measured speedup. And **the N=4 run took ~70
-minutes instead of the documented ~10**, which is a simulation-cost observation, not a hardware one:
-`blkpred` at `IDX_W=12` is 4096 entries × 155 bits × 2 replicated copies ≈ 1.27 Mbit *per core*, and
-four of those dominate the simulator's state. It is the same array budget the design already
-justified (~1.27× the BTB it replaces, for 4× the code span), but it does make the N=4 gate expensive
-to re-run, and an `IDX_W` sweep is the obvious lever if that becomes a problem.
+**Caveat: the N=4 comparison is not a matched pair.** The ±1 M band figure comes from the recorded
+baseline, not from an `=0` N=4 run on this tree, so treat 29.01 M as "no regression detected" rather
+than as a measured speedup.
+
+**Correction — CLAUDE.md's "~10 min" for the N=4 gate is stale, and f2.15 is not why it is slow.**
+The f2.15f run took ~70 minutes, and the first write-up of this section attributed that to blkpred's
+array state (4096 × 155 bits × 2 replicated copies per core). **That attribution was never measured
+and is withdrawn.** The wall-time figure in CLAUDE.md dates from P9.1 (`ebc5627`, 2026-06-12); the
+line's cycle count was refreshed on 2026-07-23 (`3f5681d`) but the runtime was carried forward
+untouched, across the icache bundle going default-on, `ATOMIC_SQ`, `MEM_PIPE`, `RETIRE_DECOUPLE` and
+the vector/H work. The N=4 gate has in practice been taking close to an hour for some time,
+independently of anything in F2. Do not size a session around the "~10 min" number.
 
 ### Not run
 
