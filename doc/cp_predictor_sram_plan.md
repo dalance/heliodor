@@ -2311,7 +2311,8 @@ with the array live and training, dhrystone is 252939 / instret 264834 and N1 bo
   worth building at all.**
 - **f2.15c** — block predictor array (BTB-scale, dword-indexed, tagged, clocked, branch offset + kind).
 - **f2.15d** — FTQ entry becomes the descriptor.
-- **f2.15e** — extract consumes the descriptor; Stage-B demoted to reconciliation.
+- **f2.15e** — extract consumes the descriptor; Stage-B demoted to reconciliation. ✅ BUILT + MEASURED
+  (see "f2.15e RESULT" below): dhrystone 280067, the first rung to beat the 286080 best-known arm.
 - **f2.15f** — flip + full ladder measurement.
 
 ## f2.15e — CONSUMER REWIRE: hand-off for a clean context
@@ -2420,6 +2421,127 @@ instret must stay **264834** (dhrystone) / **374357** (coremark). N1 boot `=0` i
   an A/B result.
 - **`veryl check` exits 1 on this tree from pre-existing cache warnings.** Diff the exit code with and
   without your file rather than assuming your change broke it.
+
+## 🎉 f2.15e RESULT — the consumer is rewired, and it BEATS the standing best rung
+
+Built and measured 2026-08-05. This is the first rung of the whole F1/F2 campaign that is *faster*
+than the best previously-shipped-at-0 arm, on every workload measured, and it is the first decoupled
+arm that boots Linux at all.
+
+| workload (instret canary) | `=0` shipped | variant-A + L0 + slot-1 | F2-full | **f2.15e** |
+|---|---|---|---|---|
+| dhrystone (264834) | 252939 | 286080 (+13.1 %) | 358627 (+41.8 %) | **280067 (+10.7 %)** |
+| coremark (374357) | 367139 | 407093 (+10.9 %) | 475690 (+29.6 %) | **402545 (+9.6 %)** |
+| N1 Linux boot | 14.27 M | 15.51 M (+8.7 %) | **HANG (45 M timeout)** | **15.21 M (+6.6 %)** |
+
+`instret` is bit-exact on both benchmarks, the default suite is **252/0** at the flip (arch tests +
+litmus N=2 included), and at `FTQ_DESC=0` the tree is behaviourally identical: 252/0, dhrystone
+252939 / 264834, litmus N=2 `cy=002e6300`.
+
+**F2-full does not boot.** That was not previously known — f2.12/f2.14 only ever ran dhrystone in that
+arm — and it means the +25.4 % dhrystone figure was understating the problem: the decoupled front end
+with the FTB as its producer is not merely slow, it is broken on the kernel. f2.15e makes it work.
+
+### What was built
+
+The mechanism is exactly the hand-off's one-sentence job, plus three things measurement forced.
+
+- **The producer advances from the block predictor**, and the FTQ entry carries the resulting
+  descriptor (`ftq_d_taken/target/off`).
+- **The descriptor rides the WORD FIFO to extract** (`wf_d_*`, registered through `wf_push_d_*_q`
+  exactly like the fault bits). The FTQ is dequeued at F0, four stages upstream of the consumer, so
+  carrying it with the fetched bytes is the only way it can arrive aligned with its own dword.
+- **Extract consumes it as Stage-A's fast prediction** — `l0e_taken/target` = the descriptor where it
+  speaks, the L0 elsewhere. Everything downstream (`ext_l0_next`, the `a_l0_*` capture,
+  `sb_disagree0`) is unchanged, so Stage-B reconciliation was inherited rather than rebuilt.
+- **A descriptor-sourced take costs ZERO.** `l0_redir` explicitly excludes it: the run-ahead already
+  steered fetch there, so the target sits at `wf_head+1` and the ordinary `ext_pop` walks into it —
+  no flush, no re-seed, no refetch. This is the entire prize, and it is why the descriptor is
+  strictly cheaper than the L0 rather than merely wider.
+- **An L0-sourced take now re-seeds the run-ahead** (`pp_reseed` gains `FTQ_DESC && l0_redir`).
+
+### Three things the measurement forced, none of them in the f2.15d design
+
+**(1) f2.15d's producer phase was wrong, and it wedges the front end.** f2.15d fed `pc_pred` from
+`pd_next = next(pc_pred_q)` — but `pc_pred` is one dword *ahead* of `pc_pred_q`, so that assignment
+writes back the value the pointer already held. The pointer stops, each dword commits twice, and the
+front end deadlocks: measured **18 enqueues in a 3 M-cycle run**, `instret` 5138, with `f0_diverged`
+firing on 20 % of cycles forever.
+
+The note in f2.15d that "stage 1 for the next dword overlaps stage 2 for this one" only holds if
+stage 1's address is knowable without stage 2 — and a clocked array whose output supplies its own
+next index is serially dependent, i.e. one dword per *two* cycles, half of fetch's rate. The fix is
+the standard shape: **the lookup pointer steps `+8` speculatively every cycle** (a dword with no
+followed transfer continues sequentially by construction — the same observation `FTQ_WIDE_ENQ` rests
+on) and only a TAKEN descriptor re-steers it, invalidating the fall-through lookup already in flight.
+Sequential runs, the overwhelming majority, cost nothing; a taken block costs one bubble.
+
+**(2) The f2.12 bypass policy starves the descriptor path.** Under `FTQ_DESC` a dword may never reach
+F0 outside the queue, or its descriptor never reaches the WORD FIFO — so the always-enqueue
+(`FTQ_RUNAHEAD`) shape stops being an option and becomes mandatory. An empty-queue fetch is an
+enqueue and a dequeue in the same cycle.
+
+**(3) The re-seed start-up bubble was the dominant remaining cost, and it is free to remove.** With
+the pipe correct but the bubble still there, dhrystone was **318298**. The counters said why:
+
+| | count @ 262143 cy | |
+|---|---|---|
+| descriptor takes (`bd0` + `bd1`) | 6581 | free |
+| **L0-only takes** | **24004** | flush + re-seed each |
+| hard `sb_override` | 9096 | |
+| `f0_diverged` | 822 | was 19689 in the f2.14 control |
+| `ext_taken_redir` | 1233 | was 18817 |
+
+Re-seeds were 33100 events and each paid one start-up cycle — which accounted for essentially the
+whole remaining gap. But **the re-seed target is known combinationally** (it comes from extract or
+commit, never from the block array, so there is no array-read-to-array-index path), so the target's
+lookup can start at T instead of T+1: `u_blkpred`'s `i_pc` takes `pp_reseed_pc` on a re-seed cycle,
+stage 2 restarts *valid* on it, and the producer's arms set `pc_pred` to target + 8 to keep stage 1
+one dword ahead. **318298 → 280067.** `pp_no_ftb_q` becomes dead under `FTQ_DESC` (the guard is
+carried directly by `pp_no_desc_q`).
+
+Note the old reconciliation storm is simply gone: `f0_diverged` 19689 → 822 and `ext_taken_redir`
+18817 → 1233. Producer and consumer now agree by construction, which is what the descriptor is for.
+
+### New measured fact: FTQ_DECOUPLE without FTB_OVERRIDE DEADLOCKS
+
+Worth recording because it looks like the obvious cheap config. variant-A + L0 + slot-1 +
+`FTQ_DECOUPLE`, with `FTB_OVERRIDE=0`, does not run: dhrystone stops at `instret` **15** and times out
+at 3 M cycles. Cause: `l0_redir` flushes the WORD FIFO but (before f2.15e) re-seeded nothing, so F0
+kept fetching the stale FTQ stream and only `f0_diverged` — which is gated off at `FTB_OVERRIDE=0` —
+could have recovered it. **The decoupled arm has always needed a divergence net; f2.15e replaces it
+with an actual re-seed, which is the architecturally right answer.**
+
+### Where the remaining deficit is — and it is exactly the deliberately-open boundary
+
+The descriptor covers **21 % of Stage-A takes** (6581 of 30585). The other 79 % are conditionals,
+which the tail-slot-only scope does not describe, so they stay on the L0 and still pay a flush +
+re-seed each. That is not a defect in the mechanism; it is f2.15d's stated scope, and it is precisely
+what f2.15e′ (the conditional case) would close.
+
+**The gating warning stands unchanged.** f2.6 is still the precedent — moving a direction read earlier
+cost `earlymis` +5.4 % and made coremark worse — and f2.15e′ changes both the index resolution
+(halfword → dword) and the history (`spec_ghr` → the run-ahead `ghr_pred`, resynced on every re-seed)
+at once. **Build the shadow measurement first**: read BHT/TAGE at `{dword-aligned pc, ghr_pred}` and
+score it against ground truth at commit, before any of it steers. Everything it needs is now in
+place — `PRED_GHR_AHEAD` (f2.15a), blkpred's two conditional slots (f2.15c), and a working
+descriptor datapath to hang it on.
+
+### Config recipe for this arm
+
+The f2.15e recipe is f2.13's F2-full set **plus `PRED_BLK` and `FTQ_DESC`** (14 consts). `FTQ_RUNAHEAD`
+is not needed — `FTQ_DESC` forces the always-enqueue behaviour itself. `FTQ_WIDE_ENQ` is now mutually
+exclusive with `FTQ_DESC` (its second dword would need its own descriptor, and f2.14 measured it at
+exactly zero anyway).
+
+### New traps banked
+
+- **A clocked array that supplies its own next index cannot run at one lookup per cycle.** Give the
+  pointer a speculative default (here `+8`) and let the array only *re-steer* it.
+- **When a pipe has two stages, advance them under ONE condition.** Freezing one and stepping the
+  other is how the pointer silently duplicated entries.
+- **`f0_diverged` firing at a constant rate per cycle with a frozen `enq` counter is the signature of
+  a producer that has stopped**, not of a divergence problem. Read `enq`/`pop` before `reseed`.
 
 ### Corrections to the earlier f2.7 write-up
 

@@ -342,6 +342,12 @@ pub module heliodor_core #(
     var wf_iacc   : logic     [WF_N];      // imem access (PMP) fault marker
     var wf_gstage : logic     [WF_N];      // H-ext guest-page fault marker
     var wf_gpa    : logic<64> [WF_N];      // faulting guest PA (for htval)
+    // f2.15e: the run-ahead block prediction rides its own dword all the way to extract. The FTQ is
+    // dequeued at F0, four stages upstream of the consumer, so the descriptor has to be carried with
+    // the fetched bytes exactly as the fault bits are. DEAD at FTQ_DESC=0 (written const-gated).
+    var wf_d_taken : logic     [WF_N];     // this dword's block exits on a predicted-taken transfer
+    var wf_d_target: logic<64> [WF_N];     // ... to here (dword+offset exact)
+    var wf_d_off   : logic<2>  [WF_N];     // ... at this halfword offset within the dword
     var wf_head   : logic<3>;
     var wf_tail   : logic<3>;
     var wf_count  : logic<4>;
@@ -353,6 +359,9 @@ pub module heliodor_core #(
     var wf_push_iacc_q  : logic;
     var wf_push_gstage_q: logic;
     var wf_push_gpa_q   : logic<64>;
+    var wf_push_d_taken_q : logic;         // f2.15e: the descriptor of the dword in flight
+    var wf_push_d_target_q: logic<64>;
+    var wf_push_d_off_q   : logic<2>;
     // W3 non-cacheable 2-beat: a non-cacheable fetch (i_dram=0: boot ROM / MMIO) has NO next
     // word — the icache passthrough returns only the single presented 32-bit word (o_rdata_next
     // is 0). The dword-granular F0 would push {0, low_word}, so the high word (odd instr slot)
@@ -506,6 +515,28 @@ pub module heliodor_core #(
     var ftq_head   : logic<3>;
     var ftq_tail   : logic<3>;
     var ftq_count  : logic<4>;
+    // ── f2.15d/e: the FTQ entry becomes a DESCRIPTOR — the const + the terms extract needs ──
+    // Declared HERE rather than with the f2.15d logic far below because Veryl requires definition
+    // before reference for module-level lets, and the consumer side (F0's fetch address, the L0
+    // combine, the Stage-A advance) all sit above it. The design rationale, the two-stage producer
+    // and every driver live at the f2.15d/e block; this is only the forward declaration.
+    const FTQ_DESC: bit = 0;
+    var pc_pred_q  : logic<64>;         // the dword whose blkpred result is arriving THIS cycle
+    var pp_desc_vld: logic    ;         // pc_pred_q is a real in-flight lookup (cleared by a reseed)
+    var pp_no_desc_q: logic   ;         // pp_no_ftb_q, delayed to match pc_pred_q
+    var ftq_d_taken : logic     [FTQ_N]; // this dword's block exits on a predicted-taken transfer
+    var ftq_d_target: logic<64> [FTQ_N];
+    var ftq_d_off   : logic<2>  [FTQ_N]; // halfword offset of that transfer within the dword
+    var ftq_d_call  : logic     [FTQ_N];
+    var ftq_d_ret   : logic     [FTQ_N];
+    var ftq_d_ind   : logic     [FTQ_N];
+    // f2.15e: under FTQ_DESC the run-ahead pointer the FTQ/F0 side CONSUMES is pc_pred_q — the dword
+    // whose descriptor is arriving this cycle — while pc_pred itself is one dword ahead, in the array
+    // lookup. Everything downstream of the producer (the enqueue address, F0's empty-FTQ bypass) must
+    // therefore read pp_cur, and must hold while pp_cur_ok is low (the one start-up cycle after a
+    // re-seed, when pc_pred_q still holds the abandoned pointer). Folds to pc_pred / 1'b1 at 0.
+    let pp_cur   : logic<64> = if FTQ_DESC ? pc_pred_q : pc_pred;
+    let pp_cur_ok: logic     = !FTQ_DESC || pp_desc_vld;
     // Stage-B is a 1-deep SKID register between extract-assemble/predict (Stage-A, at T) and
     // the fetch-buffer write (Stage-B, at T+1). a_valid holds until the bundle drains into the
     // fetch buffer; a_push0/a_push1 are the registered slot deliveries (drive the fb write +
@@ -1306,6 +1337,35 @@ pub module heliodor_core #(
     let l0_cond_taken : logic     = if TAGE_STAGEA ? (if tage_hit ? tage_taken : (L0_PRED_COND && l0_bimodal_strong)) : (L0_PRED_COND && l0_bimodal_strong);
     let l0_taken      : logic     = l0_hit && !l0_is_ind && (!l0_is_cond || l0_cond_taken);
     let l0_pred_target: logic<64> = if l0_use_ras ? ras_spec_top : l0_target;
+    // ── f2.15e: THE RUN-AHEAD BLOCK PREDICTION, CONSUMED ── DEAD at FTQ_DESC=0 ──
+    // This is the L0's job — give Stage-A a first guess so it does not advance sequentially past a
+    // taken transfer and pay a Stage-B override bubble — done from a fundamentally better source. The
+    // L0 is a 32-entry ASYNC register file fighting a 4096-entry BTB, and the f2.15 census showed the
+    // whole override population is that coverage gap (33 false positives and ZERO target errors over
+    // a run: when the L0 knows a branch it is essentially never wrong). blkpred is 4096 dword entries
+    // and CLOCKED, read at pc_pred with the FTQ absorbing the latency — the structure f2.14 proved
+    // this core was missing, since every other predictor is indexed by the extract pointer and so can
+    // never be read early no matter how deep the queue.
+    //
+    // Two properties make consuming it strictly cheaper than the L0, not merely wider. The producer
+    // ALREADY FETCHED the target (it steered pc_pred there), so a descriptor-sourced take needs no
+    // WORD-FIFO flush and no run-ahead re-seed — the target dword is sitting at head+1 and the normal
+    // ext_pop walks straight into it. And the descriptor carries the branch's exact halfword OFFSET,
+    // so extract knows WHICH slot the transfer belongs to instead of inferring it.
+    // PRED_L0_FAST is required, not incidental: the descriptor steers through ext_l0_next and is
+    // reconciled at Stage-B through a_l0_*/sb_disagree0, both of which exist only in that arm.
+    let bd_valid : logic     = FTQ_DESC && PRED_L0_FAST
+        && (if ext_bypass ? wf_push_d_taken_q : (ext_head_match && wf_d_taken[wf_head]));
+    let bd_off   : logic<2>  = if ext_bypass ? wf_push_d_off_q    : wf_d_off[wf_head];
+    let bd_target: logic<64> = if ext_bypass ? wf_push_d_target_q : wf_d_target[wf_head];
+    // Slot-0 sits at this dword's halfword offset ic_pc[2:1]; a straddling delivery is excluded here
+    // and at the train, since a transfer whose own high half lives in the next dword cannot be the
+    // block's exit (F0's jump would skip the dword extract still needs to decode it).
+    let bd_taken0: logic     = bd_valid && !straddle_q && (bd_off == ic_pc[2:1]);
+    // The effective Stage-A prediction: the descriptor where it speaks, the L0 elsewhere (it still
+    // owns conditionals, which the tail-slot-only descriptor does not describe).
+    let l0e_taken : logic     = if FTQ_DESC ? (bd_taken0 || l0_taken) : l0_taken;
+    let l0e_target: logic<64> = if (FTQ_DESC && bd_taken0) ? bd_target : l0_pred_target;
     // f2.9: slot-1 conditional direction, from the L0's own bimodal read on the
     // slot-1 PC (port 2). Same strong-only rule as slot 0 — see o_bimodal_strong in
     // l0pred for why an unconfident fast direction is worse than declining. TAGE is
@@ -1382,7 +1442,7 @@ pub module heliodor_core #(
     // F1 option (B): with the L0 fast path, a taken slot-0 IS known at Stage-A (l0_taken),
     // so slot-1 (past the taken branch) is ineligible again — no need for the optimistic
     // produce+squash. Without L0 (PRED_L0_FAST=0) keep the PRED_OVERRIDE optimistic path.
-    let slot1_pred_ok : logic = if PRED_OVERRIDE ? (if PRED_L0_FAST ? !l0_taken : 1'b1) : !predicted_taken;
+    let slot1_pred_ok : logic = if PRED_OVERRIDE ? (if PRED_L0_FAST ? !l0e_taken : 1'b1) : !predicted_taken;
     let slot1_eligible: logic = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && slot1_pred_ok;
     // f2.9 SLOT-1 L0 FAST PATH. The front end is 2-wide but the L0 only ever looked
     // up slot 0, so a taken SLOT-1 branch paid a Stage-B override bubble
@@ -1456,8 +1516,19 @@ pub module heliodor_core #(
     // produce-INDEPENDENT (like l0_taken) so ext_eff_next's every-cycle consumers
     // (f0_diverged / ext_exp_next) see the same shape they always did.
     let l0_slot1_deliv: logic = slot1_valid && (fb_free >= 4'd2);
-    let l0_taken1     : logic = L0_SLOT1 && PRED_L0_FAST && !l0_taken && l0_slot1_deliv
+    let l0_taken1     : logic = L0_SLOT1 && PRED_L0_FAST && !l0e_taken && l0_slot1_deliv
         && l0_hit2 && !l0_is_ind2 && !l0_is_ret2 && (!l0_is_cond2 || l0_cond_taken1);
+    // f2.15e: the descriptor covers slot 1 with the SAME entry — a block predictor predicts the first
+    // taken transfer in the dword and does not care which slot it lands in, which is why the f2.15
+    // census could count the ~8020 slot-1 overrides (47 % of the population) as covered for free
+    // rather than needing a second fast path the way the L0 did (f2.10's second async port).
+    // L0_SLOT1 gates it for the same reason PRED_L0_FAST gates bd_valid: sb_ovr_taken1 and
+    // sb_override_target only consult a_l0_taken1 under that const, so a slot-1 take made without it
+    // would go unreconciled at Stage-B.
+    let bd_taken1: logic     = bd_valid && L0_SLOT1 && !l0e_taken && l0_slot1_deliv && !straddle_q
+        && (s1_pc[63:3] == ic_pc[63:3]) && (bd_off == s1_pc[2:1]);
+    let l0e_taken1 : logic     = if FTQ_DESC ? (bd_taken1 || l0_taken1) : l0_taken1;
+    let l0e_target1: logic<64> = if (FTQ_DESC && bd_taken1) ? bd_target : l0_target2;
     let fb_tail1: logic<3> = fb_tail + 3'd1; // slot-1 write index (wraps mod 8)
     // ── F1 order-item-2: Stage-B skid drain / accept (PRED_PIPE) ──
     // Stage-B (the a_* skid register) drains its held bundle into the fetch buffer when the
@@ -1919,11 +1990,16 @@ pub module heliodor_core #(
     // slot, so the always-on MMU translate (i_req=!any_redirect) never walks a garbage address;
     // f0_present is gated off then anyway (ftq empty), so no fetch is presented. At FTQ_DECOUPLE=0
     // this folds to pc_fetch_q → byte-identical, and pc_fetch_q's coupled FTB loop stays authoritative.
-    let f0_fetch_pc: logic<64> = if FTQ_DECOUPLE ? (if ftq_count >= 4'd1 ? ftq_pc[ftq_head] : pc_pred) : pc_fetch_q;
+    // f2.15e: the empty-FTQ fallback is pp_cur — pc_pred under the address-queue FTQ, pc_pred_q under
+    // FTQ_DESC (the dword whose descriptor is arriving now; pc_pred is one lookup ahead of it).
+    let f0_fetch_pc: logic<64> = if FTQ_DECOUPLE ? (if ftq_count >= 4'd1 ? ftq_pc[ftq_head] : pp_cur) : pc_fetch_q;
     // f2.5c.1: F0 presents whenever ready (no FTQ-non-empty gate) — when the FTQ is empty it fetches
     // pc_pred DIRECTLY (f0_fetch_pc's fallback = the bypass), removing the +1 redirect bubble. The FTQ
     // only buffers when F0 falls behind pc_pred (miss / wf_full). Unchanged at FTQ_DECOUPLE=0.
+    // f2.15e: the empty-FTQ bypass fetches pp_cur, so it must wait out the one start-up cycle after a
+    // re-seed in which pc_pred_q still holds the abandoned pointer. Folds to 1'b1 at FTQ_DESC=0.
     let f0_present: logic = ICACHE_SYNC_READ && !any_redirect && !icache_stall_comb && !wf_full
+        && (!FTQ_DESC || ftq_count >= 4'd1 || pp_cur_ok)
         && (imem_valid_w || imem_fault_w || imem_acc_fault_w);
     // The dword presented last cycle arrives now (o_rdata is registered under sync-read);
     // push it unless the icache is still stalling a miss (W3 hardens the miss hold).
@@ -1952,7 +2028,8 @@ pub module heliodor_core #(
     // b.3. Folds to ext_seq_next at PRED_L0_FAST=0 → byte-identical.
     // f2.9: a slot-1 L0 take advances Stage-A to slot-1's target (the bundle's ACTUAL
     // delivered successor), exactly as a slot-0 take does. Folds away at L0_SLOT1=0.
-    let ext_l0_next : logic<64> = if l0_taken ? l0_pred_target : (if l0_taken1 ? l0_target2 : ext_seq_next);
+    // f2.15e: l0e_* is the L0 with the run-ahead block prediction folded in; folds to l0_* at 0.
+    let ext_l0_next : logic<64> = if l0e_taken ? l0e_target : (if l0e_taken1 ? l0e_target1 : ext_seq_next);
     // f2.2: FIFO-follow advance. Under FTB_OVERRIDE the WORD FIFO holds F0's FTB-jumped
     // (non-sequential) stream. When the Stage-A sequential advance CROSSES the current head dword
     // AND the next FIFO entry is a non-sequential FTB target (buffered, !head1_seq), follow the
@@ -2108,8 +2185,15 @@ pub module heliodor_core #(
     // (an OLDER, draining bundle's full-pred correction) OUTRANKS it (a wrong older bundle squashes
     // this younger produce). The skid still CAPTURES this bundle (the taken branch is correct-path,
     // unlike sb_override which squashes a wrong-path younger produce). DEAD at 0 (PRED_L0_FAST=0).
-    let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && (l0_taken || l0_taken1) && !sb_override;
-    let l0_redir_target: logic<64> = if l0_taken ? l0_pred_target : l0_target2;
+    // f2.15e: a DESCRIPTOR-sourced take is deliberately excluded — this is where the mechanism pays.
+    // The run-ahead already steered fetch to that target, so the WORD FIFO holds it at head+1 and the
+    // stream past the branch is CORRECT path: flushing it (and re-seeding pc_pred onto it) would throw
+    // away the very prefetch the block predictor exists to produce, and re-pay the icache latency the
+    // queue just hid. Only an L0-sourced take — a conditional the tail slot does not describe — still
+    // needs the flush + re-seed, because there the producer really did run down the fall-through.
+    let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && (l0e_taken || l0e_taken1) && !sb_override
+        && !(FTQ_DESC && (bd_taken0 || bd_taken1));
+    let l0_redir_target: logic<64> = if l0e_taken ? l0e_target : l0e_target1;
     // f2.5a: the FTB read on the INDEPENDENT pc_pred pointer (the F2-full predictor loop) — the same
     // logic as f0_ftb_hit/f0_ftb_target but indexed by pc_pred, steering the next pc_pred + the FTQ
     // enqueue. pp_no_ftb_q suppresses the redirect on the first pc_pred step after a re-seed (the
@@ -2152,8 +2236,13 @@ pub module heliodor_core #(
     const FTQ_RUNAHEAD: bit = 0;
     // (`ftq_count == 0` here IS f0_ftq_byp — FTQ_DECOUPLE && f0_present are already
     // ANDed in — written this way because f0_ftq_byp is defined just below.)
+    // f2.15e: FTQ_DESC must ALWAYS enqueue — a dword may never reach F0 outside the queue, or its
+    // descriptor never reaches the WORD FIFO. So an empty-queue fetch becomes an enqueue and a
+    // dequeue in the same cycle: the FTQ_RUNAHEAD shape, mandatory here rather than optional. Without
+    // this the f2.12 bypass suppression starves the whole mechanism — measured: the producer enqueued
+    // 18 dwords in a 3M-cycle run and then stopped, with f0_diverged firing on 20 % of cycles.
     let f0_ftq_pop   : logic     = FTQ_DECOUPLE && f0_present && f0_beat_done
-        && (ftq_count >= 4'd1 || FTQ_RUNAHEAD);
+        && (ftq_count >= 4'd1 || FTQ_RUNAHEAD || FTQ_DESC);
     // f2.5c.1: F0 is bypassing this cycle — fetching pc_pred directly because the FTQ is empty (both
     // beats of a non-cacheable fetch). The producer then skips enqueuing pc_pred (F0 took it) and
     // advances pc_pred on beat-done. This is the in-sync / redirect-refill case = F2-lite behavior, 0 bubble.
@@ -2165,9 +2254,43 @@ pub module heliodor_core #(
     // conditions of the producer always_ff's steady-state arm, which that arm now reads instead of
     // recomputing locally (inside it pp_reseed is false and FTQ_DECOUPLE true by construction, so the
     // hoisted terms are identical there). DEAD at FTQ_DECOUPLE=0 (all const-false).
-    let pp_reseed : logic = FTQ_DECOUPLE && (redirect_fire || early_redir_fire_q || (sb_override && !sb_ovr_soft) || ext_taken_redir || f0_diverged);
-    let ftq_enq   : logic = FTQ_DECOUPLE && !pp_reseed && (!ftq_full || f0_ftq_pop) && (FTQ_RUNAHEAD || !f0_ftq_byp);
-    let pp_advance: logic = ftq_enq || (FTQ_DECOUPLE && !pp_reseed && !FTQ_RUNAHEAD && f0_ftq_byp && f0_beat_done);
+    // f2.15e adds the sixth term: an L0-sourced Stage-A take re-seeds the run-ahead too (see the
+    // producer arm for why — without it the decoupled front end has no way back to Stage-A's stream).
+    // Folds away at FTQ_DESC=0 → the five-term expression byte-for-byte.
+    let pp_reseed : logic = FTQ_DECOUPLE && (redirect_fire || early_redir_fire_q || (sb_override && !sb_ovr_soft) || (FTQ_DESC && l0_redir) || ext_taken_redir || f0_diverged);
+    // ── f2.15e: the two-stage run-ahead pipe ──
+    // pp_step is one step of {lookup, commit}: it advances pc_pred and pc_pred_q together, gated only
+    // on FTQ room, so the pipe never half-advances. A commit — the actual enqueue — additionally needs
+    // the in-flight lookup to be ON-PATH (pp_desc_vld); the one cycle after a re-seed, and the one
+    // after a descriptor-taken re-steer, are lookup-only.
+    //
+    // Why the lookup pointer runs SPECULATIVELY SEQUENTIAL. A clocked array whose result supplies the
+    // NEXT address is serially dependent: address -> 1 cycle -> next address is one dword per TWO
+    // cycles, half of fetch's rate. f2.15d's note that "stage 1 for the next dword overlaps stage 2
+    // for this one" only holds if stage 1's address is known without stage 2, and it is — for the
+    // common case. A dword with no followed transfer continues at +8 BY CONSTRUCTION (f2.14's
+    // FTQ_WIDE_ENQ rests on the same observation), so pc_pred just keeps stepping +8 while the
+    // descriptor for pc_pred_q is in flight, and only a TAKEN descriptor re-steers it — invalidating
+    // the fall-through lookup already in flight, which is the one bubble per taken block. Sequential
+    // runs, i.e. the overwhelming majority of dwords, cost nothing.
+    let pp_step   : logic = FTQ_DECOUPLE && FTQ_DESC && !pp_reseed && (!ftq_full || f0_ftq_pop);
+    // f2.15e RE-SEED LOOKUP BYPASS. The re-seed target is known COMBINATIONALLY at the re-seed cycle
+    // (it comes from extract or commit, never from the block array — so this costs no array-to-array
+    // path), which means the target's lookup can start at T instead of T+1 and the pipe restarts with
+    // ZERO start-up bubble. Without it every re-seed pays one cycle, and re-seeds are the dominant
+    // event in this arm: measured 33100 per 262143 cycles, ~79 % of them an L0-sourced conditional
+    // take the tail-slot descriptor does not cover. Same priority order as the producer's arms, so
+    // pp_reseed_tgt is by construction the pc_pred those arms assign.
+    let pp_reseed_tgt: logic<64> = if redirect_fire ? redirect_pc
+        : if early_redir_fire_q            ? early_redir_pc_q
+        : if (sb_override && !sb_ovr_soft) ? sb_override_target
+        : if (FTQ_DESC && l0_redir)        ? l0_redir_target
+        : if ext_taken_redir               ? ext_next_pc
+        :                                    ext_pc_q;
+    let pp_reseed_pc : logic<64> = {pp_reseed_tgt[63:3], 3'b000};
+    let ftq_enq   : logic = FTQ_DECOUPLE && !pp_reseed && (!ftq_full || f0_ftq_pop)
+        && (if FTQ_DESC ? pp_desc_vld : (FTQ_RUNAHEAD || !f0_ftq_byp));
+    let pp_advance: logic = ftq_enq || (FTQ_DECOUPLE && !FTQ_DESC && !pp_reseed && !FTQ_RUNAHEAD && f0_ftq_byp && f0_beat_done);
     // ── f2.14: WIDE (2-dword) FTQ ENQUEUE — the producer/consumer RATE FIX ── DEAD at 0 ──
     // f2.12's root finding: `pp_next = pc_pred + 8` is one dword/cycle against a consumer that takes
     // one dword/beat, so the FTQ is rate-matched and CANNOT accumulate depth. This is the cheapest
@@ -2202,7 +2325,11 @@ pub module heliodor_core #(
     // The wide step: dword A is sequential (no followed entry — pp_no_ftb_q's forced-sequential case
     // included, which is exactly right: that dword must NOT re-follow its branch), the second dword
     // carries no RAS action, and there is room for both.
-    let pp_wide         : logic            = FTQ_WIDE_ENQ && ftq_enq && !pp_ftb_hit && ftq_room2
+    // f2.15e makes the two mutually exclusive: under FTQ_DESC the second dword would need its own
+    // descriptor (a second blkpred port) and pp_pc_b is derived from pc_pred, which is the LOOKUP
+    // pointer there, not the one being committed. f2.14 measured the wide step at exactly zero
+    // cycles anyway, so there is nothing to give up.
+    let pp_wide         : logic            = FTQ_WIDE_ENQ && !FTQ_DESC && ftq_enq && !pp_ftb_hit && ftq_room2
         && !pp_ftb_is_call_b && !pp_ftb_is_ret_b;
     // blkpred's outputs, declared here so the f2.15d descriptor terms below can read them; the
     // instance itself lives with the f2.15c census further down.
@@ -2237,36 +2364,63 @@ pub module heliodor_core #(
     // T+1, so the descriptor enqueued at T+1 belongs to pc_pred_q, not pc_pred. Rate is unchanged at
     // one dword per cycle (stage 1 for the next dword overlaps stage 2 for this one); the cost is one
     // cycle of start-up after each reseed, which is exactly the latency the queue exists to hide.
-    const FTQ_DESC: bit = 0;
-    var pc_pred_q  : logic<64>;         // the dword whose blkpred result is arriving THIS cycle
-    var pp_desc_vld: logic    ;         // pc_pred_q is a real in-flight lookup (cleared by a reseed)
-    var ftq_d_taken : logic     [FTQ_N]; // this dword's block exits on a predicted-taken transfer
-    var ftq_d_target: logic<64> [FTQ_N];
-    var ftq_d_off   : logic<2>  [FTQ_N]; // halfword offset of that transfer within the dword
-    var ftq_d_call  : logic     [FTQ_N];
-    var ftq_d_ret   : logic     [FTQ_N];
-    var ftq_d_ind   : logic     [FTQ_N];
+    // (FTQ_DESC + the descriptor arrays + pp_cur/pp_cur_ok are forward-declared with FTQ_DECOUPLE.)
     // The block predictor's answer for pc_pred_q. Only the tail slot is consumed in this increment;
     // a conditional-only dword reads as not-taken and the stream falls through sequentially, which is
     // precisely what the pre-f2.15 producer does, so nothing regresses while the direction read is
     // still missing.
-    let pd_taken : logic     = FTQ_DESC && pp_desc_vld && blk_hit && blk_tl_valid;
+    //
+    // f2.15e narrows the FOLLOWED set to exactly what the F0 FTB follows (ftb_br_deliver): direct
+    // unconditional transfers. RETURNS and INDIRECTS are excluded — blkpred stores their last-seen
+    // target, which is the value the RAS / iBTB exist to replace, so following it would steer fetch
+    // at a target extract will disagree with on most executions. They fall through sequentially and
+    // keep today's Stage-B override, exactly as they do at FTQ_DESC=0.
+    // pp_no_desc_q is the mid-dword re-entry guard, delayed to match pc_pred_q: a re-seed landing
+    // MID-dword means extract enters PAST any transfer the entry records, so its block exit does not
+    // apply to this pass (the pp_no_ftb_q idiom, one stage later).
+    let pd_taken : logic     = FTQ_DESC && pp_desc_vld && !pp_no_desc_q && blk_hit && blk_tl_valid
+        && !blk_tl_is_ret && !blk_tl_is_ind;
     let pd_target: logic<64> = blk_tl_target;
     let pd_off   : logic<2>  = blk_tl_off;
-    // Next run-ahead dword: the tail target when the block exits taken, else the next dword.
-    let pd_next  : logic<64> = if pd_taken ? {blk_tl_target[63:3], 3'b000} : pc_pred_q + 64'd8;
+    // (f2.15d had a `pd_next = taken ? target : pc_pred_q + 8` here and fed pc_pred from it. That is
+    // the phase error f2.15e found by measurement: pc_pred is one dword AHEAD of pc_pred_q, so
+    // assigning it next(pc_pred_q) writes back the value it already held — the pointer stops, each
+    // dword commits twice, and the front end wedges. The advance now lives on the LOOKUP pointer,
+    // which steps +8 on its own and is re-steered only by a taken descriptor. See pp_step.)
     // Stage-1/stage-2 registers for the two-stage run-ahead lookup. Kept as their own always_ff so
     // the producer's five reseed arms need no edit: a reseed at T changes pc_pred at the end of T, so
     // the lookup that was in flight during T was for the pre-reseed pointer and is marked invalid.
     always_ff (clk, rst) {
         if_reset {
-            pc_pred_q   = RESET_PC;
-            pp_desc_vld = 1'b0;
+            pc_pred_q    = RESET_PC;
+            pp_desc_vld  = 1'b0;
+            pp_no_desc_q = 1'b0;
         } else if FTQ_DESC {
-            pc_pred_q   = pc_pred;
-            pp_desc_vld = !pp_reseed;
+            // Stage 2 of the pipe, stepping in lockstep with pc_pred (both under pp_step) so the two
+            // can never drift. A re-seed leaves the in-flight lookup off-path; so does a
+            // descriptor-taken re-steer, since the lookup in flight was that block's fall-through.
+            if pp_reseed {
+                // The re-seed target was presented to blkpred THIS cycle (the lookup bypass on
+                // u_blkpred's i_pc), so its descriptor is ready next cycle and stage 2 restarts on it
+                // directly — valid, not a bubble. The producer's arms set pc_pred to the target + 8 to
+                // match, keeping stage 1 exactly one dword ahead of stage 2.
+                pc_pred_q    = pp_reseed_pc;
+                pp_desc_vld  = 1'b1;
+                pp_no_desc_q = pp_reseed_tgt[2:1] != 2'b00;
+            } else if pp_step {
+                pc_pred_q    = pc_pred;
+                pp_desc_vld  = !pd_taken;
+                pp_no_desc_q = pp_no_ftb_q;
+            }
         }
     }
+    // f2.15e: the descriptor that belongs to the dword F0 is presenting THIS cycle (f0_fetch_pc). It
+    // is the FTQ head's when the queue holds one, and the arriving pd_* on a bypass — where F0 fetches
+    // pp_cur directly, which is precisely the dword pd_* describes, so the two agree by construction.
+    // Registered one cycle alongside wf_push_pc_q so it lands in the WORD FIFO with its own bytes.
+    let f0_d_taken : logic     = FTQ_DESC && (if ftq_count >= 4'd1 ? ftq_d_taken[ftq_head]  : pd_taken);
+    let f0_d_target: logic<64> = if ftq_count >= 4'd1 ? ftq_d_target[ftq_head] : pd_target;
+    let f0_d_off   : logic<2>  = if ftq_count >= 4'd1 ? ftq_d_off[ftq_head]    : pd_off;
     // ── f2.15a: RUN-AHEAD GHR — the direction-history twin for a run-ahead predictor ── DEAD at 0 ──
     // f2.14 established that a deeper FTQ cannot amortise the clocked predictor latency because every
     // clocked predictor is indexed by ext_pc_q (the EXTRACT pointer) and by spec_ghr, which is
@@ -2333,6 +2487,9 @@ pub module heliodor_core #(
             wf_push_iacc_q      = 1'b0;
             wf_push_gstage_q    = 1'b0;
             wf_push_gpa_q       = 64'd0;
+            wf_push_d_taken_q   = 1'b0;
+            wf_push_d_target_q  = 64'd0;
+            wf_push_d_off_q     = 2'd0;
             f0_nc_beat_q        = 1'b0;
             f0_nc_lo_inflight_q = 1'b0;
             f0_nc_lo_q          = 32'd0;
@@ -2423,6 +2580,10 @@ pub module heliodor_core #(
                 wf_push_gstage_q = imem_gstage_w;
                 wf_push_gpa_q    = imem_gpa_w;
                 wf_push_nc_q     = !ic_dram && !f0_fault;
+                // f2.15e: the run-ahead block prediction for this very dword, delayed with it.
+                wf_push_d_taken_q  = f0_d_taken;
+                wf_push_d_target_q = f0_d_target;
+                wf_push_d_off_q    = f0_d_off;
             }
         }
     }
@@ -2456,32 +2617,52 @@ pub module heliodor_core #(
             }
         } else if FTQ_DECOUPLE {
             if redirect_fire {
-                pc_pred     = {redirect_pc[63:3], 3'b000};
-                pp_no_ftb_q = redirect_pc[2:1] != 2'b00;
+                pc_pred     = {redirect_pc[63:3], 3'b000} + (if FTQ_DESC ? 64'd8 : 64'd0);
+                pp_no_ftb_q = !FTQ_DESC && (redirect_pc[2:1] != 2'b00);
                 ftq_head    = 3'd0;
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
             } else if early_redir_fire_q {
-                pc_pred     = {early_redir_pc_q[63:3], 3'b000};
-                pp_no_ftb_q = early_redir_pc_q[2:1] != 2'b00;
+                pc_pred     = {early_redir_pc_q[63:3], 3'b000} + (if FTQ_DESC ? 64'd8 : 64'd0);
+                pp_no_ftb_q = !FTQ_DESC && (early_redir_pc_q[2:1] != 2'b00);
                 ftq_head    = 3'd0;
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
             } else if sb_override && !sb_ovr_soft {
-                pc_pred     = {sb_override_target[63:3], 3'b000};
+                pc_pred     = {sb_override_target[63:3], 3'b000} + (if FTQ_DESC ? 64'd8 : 64'd0);
+                // f2.15e: an override target lands MID-dword on essentially every conditional /
+                // return, and the run-ahead block entry for that dword records a transfer extract may
+                // now be entering PAST. Arm the re-entry guard from the offset, as every other arm
+                // does. Folds to 1'b0 at FTQ_DESC=0 → the pre-f2.15 arm byte-for-byte.
+                pp_no_ftb_q = 1'b0;
+                ftq_head    = 3'd0;
+                ftq_tail    = 3'd0;
+                ftq_count   = 4'd0;
+            } else if FTQ_DESC && l0_redir {
+                // f2.15e: Stage-A took a transfer the RUN-AHEAD did not — a conditional the L0 called
+                // taken, which the tail-slot-only descriptor does not describe. Under FTQ_DECOUPLE
+                // l0_redir re-steers pc_fetch_q (inert here — F0 reads the FTQ) and flushes the WORD
+                // FIFO, but before f2.15e nothing re-seeded the QUEUE: F0 kept fetching the
+                // sequential stream and only f0_diverged, a full extract stall later, recovered it.
+                // That is measured: FTQ_DECOUPLE with the L0 and WITHOUT the FTB_OVERRIDE divergence
+                // net DEADLOCKS outright (dhrystone, 3M cycles, instret 15). Re-seeding here makes
+                // the run-ahead follow Stage-A's actual stream, which is the point of a decoupled
+                // front end. Descriptor-sourced takes deliberately do NOT reach this arm — l0_redir
+                // excludes them, because the producer already fetched that target.
+                pc_pred     = {l0_redir_target[63:3], 3'b000} + 64'd8;
                 pp_no_ftb_q = 1'b0;
                 ftq_head    = 3'd0;
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
             } else if ext_taken_redir {
-                pc_pred     = {ext_next_pc[63:3], 3'b000};
-                pp_no_ftb_q = ext_next_pc[2:1] != 2'b00;
+                pc_pred     = {ext_next_pc[63:3], 3'b000} + (if FTQ_DESC ? 64'd8 : 64'd0);
+                pp_no_ftb_q = !FTQ_DESC && (ext_next_pc[2:1] != 2'b00);
                 ftq_head    = 3'd0;
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
             } else if f0_diverged {
-                pc_pred     = {ext_pc_q[63:3], 3'b000};
-                pp_no_ftb_q = ext_pc_q[2:1] != 2'b00;
+                pc_pred     = {ext_pc_q[63:3], 3'b000} + (if FTQ_DESC ? 64'd8 : 64'd0);
+                pp_no_ftb_q = !FTQ_DESC && (ext_pc_q[2:1] != 2'b00);
                 ftq_head    = 3'd0;
                 ftq_tail    = 3'd0;
                 ftq_count   = 4'd0;
@@ -2499,16 +2680,17 @@ pub module heliodor_core #(
                     ftq_head = ftq_head + 3'd1;
                 }
                 if ftq_enq {
-                    ftq_pc[ftq_tail] = pc_pred;
+                    // f2.15e: under FTQ_DESC the dword being COMMITTED to is pc_pred_q (the one whose
+                    // descriptor arrived this cycle), not pc_pred (which is one lookup ahead).
+                    ftq_pc[ftq_tail] = pp_cur;
                     // f2.14: the wide step also enqueues the (known-sequential) second dword. NBA
                     // semantics — both index expressions read the OLD ftq_tail, so tail+1 is the
                     // slot after the one just written.
                     if pp_wide {
                         ftq_pc[ftq_tail + 3'd1] = pp_pc_b;
                     }
-                    // f2.15d: park the run-ahead block prediction beside the address. Written only
-                    // under FTQ_DESC and read by nobody yet — f2.15e rewires the producer's PC
-                    // advance and extract's consumption together, since those must change as one.
+                    // f2.15d/e: park the run-ahead block prediction beside the address; f2.15e's
+                    // consumer picks it up out of the WORD FIFO, having ridden along with its dword.
                     if FTQ_DESC {
                         ftq_d_taken[ftq_tail]  = pd_taken;
                         ftq_d_target[ftq_tail] = pd_target;
@@ -2519,7 +2701,18 @@ pub module heliodor_core #(
                     }
                     ftq_tail = ftq_tail + (if pp_wide ? 3'd2 : 3'd1);
                 }
-                if ftq_enq || (f0_ftq_byp && f0_beat_done) {
+                if FTQ_DESC {
+                    // f2.15e: the LOOKUP pointer. It steps +8 speculatively every cycle the pipe
+                    // moves — a dword with no followed transfer continues sequentially by
+                    // construction, so its successor needs no prediction — and a TAKEN descriptor
+                    // (which describes pc_pred_q, one behind) re-steers it to the block target. The
+                    // fall-through lookup already in flight is then wrong, and pp_desc_vld drops it:
+                    // one bubble per taken block, nothing on a sequential run.
+                    if pp_step {
+                        pc_pred     = if pd_taken ? {pd_target[63:3], 3'b000} : pc_pred + 64'd8;
+                        pp_no_ftb_q = 1'b0;
+                    }
+                } else if ftq_enq || (f0_ftq_byp && f0_beat_done) {
                     pc_pred = if pp_wide ? pp_next_b : pp_next;
                     // f2.5d: a followed RETURN lands at the instruction AFTER the call — i.e. almost
                     // always MID-dword, in the very dword the call was trained on. Without the
@@ -2550,10 +2743,16 @@ pub module heliodor_core #(
     // valid in any config (including the shipped =0 arm, where FTQ_DECOUPLE is off and pc_pred does
     // not run). Coverage is a property of the table and its training, not of where it is read.
     const PRED_BLK: bit = 0;
+    // Forward-declared; driven from the commit-side c_is_rvc far below (see i_train_en).
+    var blk_train_straddle: logic;
     inst u_blkpred: blkpred (
         clk                                        ,
         rst                                        ,
-        i_pc           : if FTQ_DESC ? {pc_pred[63:3], 3'b000} : {ic_pc[63:3], 3'b000},
+        // f2.15e: the run-ahead lookup pointer, with the RE-SEED BYPASS — on a re-seed cycle present
+        // the new target instead of the pointer being abandoned, so the pipe restarts with no
+        // start-up bubble. pp_reseed_tgt comes from extract/commit, never from this array, so the
+        // bypass adds no array-read-to-array-index path.
+        i_pc           : if FTQ_DESC ? (if pp_reseed ? pp_reseed_pc : {pc_pred[63:3], 3'b000}) : {ic_pc[63:3], 3'b000},
         o_hit          : blk_hit                   ,
         o_b0_valid     : blk_b0_valid              ,
         o_b0_off       : blk_b0_off                ,
@@ -2570,7 +2769,11 @@ pub module heliodor_core #(
         // Trained from the same committed taken control transfer the BTB is trained from, so the two
         // tables see an identical event stream and a coverage comparison between them is honest.
         // Gated by PRED_BLK so the arrays are never written at 0 → the whole instance is inert.
-        i_train_en     : PRED_BLK && btb_train_en  ,
+        // f2.15e adds the STRADDLE exclusion the F0 FTB has always had (ftb_br_deliver): a 32-bit
+        // transfer at halfword offset 3 has its own high half in the NEXT dword, so a block that
+        // exits there would have fetch jump past the dword extract still needs in order to decode it.
+        // Same rule, same reason, and the f2.15c coverage census predates it by one increment.
+        i_train_en     : PRED_BLK && btb_train_en && !blk_train_straddle,
         i_train_pc     : bp_train_pc               ,
         i_train_target : btb_train_target          ,
         i_train_is_cond: btb_train_is_cond         ,
@@ -2824,6 +3027,13 @@ pub module heliodor_core #(
     var st_rs_sbov : logic<32>;
     var st_rs_ext  : logic<32>;
     var st_rs_div  : logic<32>;
+    // f2.15e: the sixth reseed term, plus the split that matters here — how many Stage-A takes came
+    // from the run-ahead DESCRIPTOR (free: fetch already went there) versus from the L0 (still costs
+    // a flush + reseed). That ratio is the mechanism's coverage, measured directly.
+    var st_rs_l0   : logic<32>;
+    var st_bd0     : logic<32>;
+    var st_bd1     : logic<32>;
+    var st_l0tk    : logic<32>;
     always_ff (clk, rst) {
         if_reset {
             st_cy       = 32'd0;
@@ -2839,6 +3049,10 @@ pub module heliodor_core #(
             st_rs_sbov  = 32'd0;
             st_rs_ext   = 32'd0;
             st_rs_div   = 32'd0;
+            st_rs_l0    = 32'd0;
+            st_bd0      = 32'd0;
+            st_bd1      = 32'd0;
+            st_l0tk     = 32'd0;
         } else if FTQ_STATS {
             st_cy    = st_cy + 32'd1;
             st_depth = st_depth + {44'd0, ftq_count};
@@ -2865,16 +3079,32 @@ pub module heliodor_core #(
                     st_rs_earl = st_rs_earl + 32'd1;
                 } else if sb_override && !sb_ovr_soft {
                     st_rs_sbov = st_rs_sbov + 32'd1;
+                } else if FTQ_DESC && l0_redir {
+                    st_rs_l0 = st_rs_l0 + 32'd1;
                 } else if ext_taken_redir {
                     st_rs_ext = st_rs_ext + 32'd1;
                 } else {
                     st_rs_div = st_rs_div + 32'd1;
                 }
             }
+            // Stage-A takes, split by SOURCE. bd_* is the free path (fetch already followed it);
+            // l0tk is the L0-only take that still pays a flush + reseed.
+            if fb_push0 {
+                if bd_taken0 {
+                    st_bd0 = st_bd0 + 32'd1;
+                }
+                if bd_taken1 {
+                    st_bd1 = st_bd1 + 32'd1;
+                }
+                if (l0e_taken || l0e_taken1) && !bd_taken0 && !bd_taken1 {
+                    st_l0tk = st_l0tk + 32'd1;
+                }
+            }
             if st_cy[15:0] == 16'hffff {
-                $display("FTQ cy=%d depthsum=%d dmax=%d byp=%d enq=%d wide=%d pop=%d reseed=%d (redir=%d earl=%d sbov=%d ext=%d div=%d)",
+                $display("FTQ cy=%d depthsum=%d dmax=%d byp=%d enq=%d wide=%d pop=%d reseed=%d (redir=%d earl=%d sbov=%d l0=%d ext=%d div=%d) bd0=%d bd1=%d l0tk=%d",
                     st_cy, st_depth, st_dmax, st_byp, st_enq, st_wide, st_pop, st_reseed,
-                    st_rs_redir, st_rs_earl, st_rs_sbov, st_rs_ext, st_rs_div);
+                    st_rs_redir, st_rs_earl, st_rs_sbov, st_rs_l0, st_rs_ext, st_rs_div,
+                    st_bd0, st_bd1, st_l0tk);
             }
         }
     }
@@ -2885,6 +3115,13 @@ pub module heliodor_core #(
             wf_head  = 3'd0;
             wf_tail  = 3'd0;
             wf_count = 4'd0;
+            // f2.15e: reset the descriptor slots so the const-gated (dead-at-0) extract-side read is
+            // never of an unassigned array — the ftq_pc idiom. At FTQ_DESC=0 they are reset-only → DCE.
+            for i in 0..WF_N {
+                wf_d_taken[i]  = 1'b0;
+                wf_d_target[i] = 64'd0;
+                wf_d_off[i]    = 2'd0;
+            }
         } else if ICACHE_SYNC_READ {
             // Write ONLY at =1 → reset-only at =0 → the FIFO pointers + data arrays DCE.
             // Flush on a commit/early redirect OR a predicted-taken re-steer (the buffered
@@ -2910,6 +3147,12 @@ pub module heliodor_core #(
                     wf_iacc[wf_tail]   = wf_push_iacc_q;
                     wf_gstage[wf_tail] = wf_push_gstage_q;
                     wf_gpa[wf_tail]    = wf_push_gpa_q;
+                    // f2.15e: the descriptor lands with its dword (const-gated → DCE at 0).
+                    if FTQ_DESC {
+                        wf_d_taken[wf_tail]  = wf_push_d_taken_q;
+                        wf_d_target[wf_tail] = wf_push_d_target_q;
+                        wf_d_off[wf_tail]    = wf_push_d_off_q;
+                    }
                     wf_tail            = wf_tail + 3'd1;
                 }
                 // f2.3 soft override: pop the branch dword so wf_head advances to the prefetched
@@ -3033,10 +3276,14 @@ pub module heliodor_core #(
                 a_straddle      = straddle_q;
                 a_ftb_next      = ext_next_pc;
                 a_eff_next      = ext_eff_next;
-                a_l0_taken      = l0_taken;
-                a_l0_target     = l0_pred_target;
-                a_l0_taken1     = l0_taken1;
-                a_l0_target1    = l0_target2;
+                // f2.15e: Stage-B reconciles against what Stage-A ACTUALLY applied, which is now the
+                // descriptor wherever it spoke. Both tables are trained from the same committed
+                // stream, so a descriptor take normally agrees with the clocked full prediction and
+                // sb_override does not fire — that agreement is the whole prize.
+                a_l0_taken      = l0e_taken;
+                a_l0_target     = l0e_target;
+                a_l0_taken1     = l0e_taken1;
+                a_l0_target1    = l0e_target1;
                 // f2.6: the Stage-A TAGE read, aligned to a_pc — Stage-B replays it (tage_*_sb).
                 a_tage_hit      = tage_hit;
                 a_tage_taken    = tage_taken;
@@ -6619,6 +6866,9 @@ pub module heliodor_core #(
     assign btb_train_en      = rob_commit_ack && c_is_control && (c_redirect_pc != c_fall_pc);
     assign bht_train_en      = rob_commit_ack && c_is_cond;
     assign bp_train_pc       = c_pc;
+    // f2.15e: a 32-bit control transfer at halfword offset 3 STRADDLES into the next dword, so it can
+    // never be a block exit (see blkpred's i_train_en). The F0 FTB excludes the same shape.
+    assign blk_train_straddle = !c_is_rvc && (c_pc[2:1] == 2'b11);
     assign btb_train_target  = c_redirect_pc;
     assign btb_train_is_cond = c_is_cond;
     assign btb_train_is_call = c_is_call;
