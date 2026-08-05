@@ -1,0 +1,273 @@
+// Phase 14 F2 f2.15c: the RUN-AHEAD BLOCK PREDICTOR.
+//
+// Why this exists (measured, doc/cp_predictor_sram_plan.md f2.14/f2.15):
+//   f2.14 proved a deeper FTQ cannot amortise the clocked predictor latency, because every clocked
+//   predictor is indexed by ext_pc_q — the EXTRACT pointer — so the run-ahead sits entirely upstream
+//   of the read it was meant to hide. The fix is to read the predictor at the RUN-AHEAD pointer
+//   (pc_pred) instead, and let the FTQ absorb the read latency. But extract's read PCs are
+//   INSTRUCTION PCs derived from decoding fetched bytes (s1_pc = ic_pc + pc_advance needs slot-0's
+//   length), and pc_pred addresses a dword that has not been fetched yet. A run-ahead predictor is
+//   therefore dword -> block BY CONSTRUCTION. That is this module.
+//
+// Geometry, every field of it decided by measurement rather than convention:
+//   * Indexed by DWORD (pc[IDX_W+2:3]), tagged. One entry describes one dword of code.
+//   * TWO conditional-branch slots, not one. The f2.15b census counted, with ground truth at commit,
+//     conditional branches sharing a dword with another EXECUTED conditional branch: dhrystone 0 %,
+//     coremark 6.4 %, N1 Linux boot 9.9 %. A single-slot entry would alias a tenth of the kernel's
+//     branches — past the +5.4 % earlymis that killed f2.6, against a ceiling of only 17691 cycles.
+//     Refining to the exact distinct-offset count per dword (the offset pc[2:1] has just four values,
+//     so a 4-bit mask counts it exactly) gave coremark pop1/pop2/pop3/pop4 = 85.2/14.8/0/0 % and the
+//     kernel 87.6/10.5/1.9/0 %: two slots eliminates coremark's aliasing outright and covers 98.1 %
+//     of the kernel. THREE slots is deliberately NOT built — a block ends at the first TAKEN branch,
+//     so a third is consulted only when both earlier ones fall through, and extract's reconciliation
+//     already handles that case at one bubble, which is cheaper than +50 % on every entry.
+//   * The two conditional slots store a 13-bit SIGNED OFFSET, not a target: RV64 B-type reach is
+//     +/-4 KiB, so 13 bits is exact and the slots cost ~16 bits each instead of ~67.
+//   * ONE tail slot with a full 64-bit target for the unconditional/indirect block terminator
+//     (JAL/JALR/call/ret). A JALR's real target still comes from the RAS / iBTB exactly as today;
+//     the stored one is the same last-target fallback the BTB keeps.
+//
+// Port shape is REAL (doc/sram_inventory.md; a compiler memory has at most 1R1W). The predict read
+// and the train read-modify-write would be 2R1W, so they are resolved by REPLICATION — copy `dp`
+// serves the run-ahead read, copy `dt` serves the train RMW read, and a train writes both
+// identically. `valid` stays a reset flop array (it gates every lookup and is one bit).
+//
+// The train is PIPELINED over two cycles on purpose: a 1R1W macro cannot read and write the same
+// address in one cycle. Cycle T reads the old entry through `dt`, cycle T+1 merges and writes. Two
+// trains to the same index back-to-back therefore drop the first merge — accuracy-only, exactly like
+// every other predictor train in this core (commit recomputes the architectural next PC and
+// redirects on any mismatch, see heliodor_core c_bp_mispredict).
+pub module blkpred #(
+    param IDX_W: u32 = 12, // log2(#dword entries). 10 -> 1024 entries = 8 KiB of code. Swept in f2.15f.
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // ── Run-ahead lookup, on the producer's dword pointer (pc_pred). CLOCKED: the result is valid
+    // the cycle AFTER i_pc is presented. That latency is the whole point — the FTQ absorbs it.
+    i_pc        : input  logic<64>,
+    o_hit       : output logic    ,
+    // conditional slot 0 (first conditional branch in the dword, program order)
+    o_b0_valid  : output logic    ,
+    o_b0_off    : output logic<2> , // halfword offset within the dword = pc[2:1]
+    o_b0_toff   : output logic<13>, // signed B-type offset from the branch PC
+    // conditional slot 1 (second conditional branch, program order)
+    o_b1_valid  : output logic    ,
+    o_b1_off    : output logic<2> ,
+    o_b1_toff   : output logic<13>,
+    // tail slot: the unconditional / indirect terminator
+    o_tl_valid  : output logic    ,
+    o_tl_off    : output logic<2> ,
+    o_tl_is_call: output logic    ,
+    o_tl_is_ret : output logic    ,
+    o_tl_is_ind : output logic    ,
+    o_tl_target : output logic<64>,
+
+    // ── Train (commit), one committed taken control transfer.
+    i_train_en     : input logic     ,
+    i_train_pc     : input logic<64> ,
+    i_train_target : input logic<64> ,
+    i_train_is_cond: input logic     , // conditional -> a branch slot; else -> the tail slot
+    i_train_is_call: input logic     ,
+    i_train_is_ret : input logic     ,
+    i_train_is_ind : input logic     ,
+) {
+    const ENTRIES: u32 = 1 << IDX_W;
+    const TAG_W  : u32 = 61 - IDX_W; // pc[63:IDX_W+3]
+
+    // Packed entry. Offsets are named rather than magic so the read/merge sides cannot drift.
+    const O_TAG : u32 = 0;
+    const O_B0V : u32 = TAG_W;
+    const O_B0O : u32 = TAG_W + 1;
+    const O_B0T : u32 = TAG_W + 3;
+    const O_B1V : u32 = TAG_W + 16;
+    const O_B1O : u32 = TAG_W + 17;
+    const O_B1T : u32 = TAG_W + 19;
+    const O_TLV : u32 = TAG_W + 32;
+    const O_TLO : u32 = TAG_W + 33;
+    const O_TLC : u32 = TAG_W + 35;
+    const O_TLR : u32 = TAG_W + 36;
+    const O_TLI : u32 = TAG_W + 37;
+    const O_TLT : u32 = TAG_W + 38;
+    const DATA_W: u32 = TAG_W + 102;
+
+    var valid: logic         [ENTRIES];
+    var dp   : logic<DATA_W> [ENTRIES]; // 1R1W copy — the run-ahead predict read
+    var dt   : logic<DATA_W> [ENTRIES]; // 1R1W copy — the train RMW read
+
+    // ── Predict side ──────────────────────────────────────────────────────────────
+    let lk_idx: logic<IDX_W> = i_pc[IDX_W + 2:3];
+    let lk_tag: logic<TAG_W> = i_pc[63:IDX_W + 3];
+    let rp    : logic<DATA_W> = dp[lk_idx];
+    let rp_v  : logic         = valid[lk_idx];
+
+    // Clocked read: a real 1R1W SRAM returns the entry one cycle after the index. Unlike the
+    // btb/bht/tage scaffolds — where the registered read is a retrofit onto a combinational
+    // consumer — this module is CREATED for the clocked shape, so there is no combinational arm to
+    // fold back to and no *_SYNC_READ const. The consumer (the FTQ producer) is built for it.
+    var rp_q  : logic<DATA_W>;
+    var rpv_q : logic        ;
+    var tag_q : logic<TAG_W> ;
+    always_ff (clk, rst) {
+        if_reset {
+            rp_q  = '0;
+            rpv_q = 1'b0;
+            tag_q = '0;
+        } else {
+            rp_q  = rp;
+            rpv_q = rp_v;
+            tag_q = lk_tag;
+        }
+    }
+    assign o_hit        = rpv_q && (rp_q[O_TAG +: TAG_W] == tag_q);
+    assign o_b0_valid   = rp_q[O_B0V];
+    assign o_b0_off     = rp_q[O_B0O +: 2];
+    assign o_b0_toff    = rp_q[O_B0T +: 13];
+    assign o_b1_valid   = rp_q[O_B1V];
+    assign o_b1_off     = rp_q[O_B1O +: 2];
+    assign o_b1_toff    = rp_q[O_B1T +: 13];
+    assign o_tl_valid   = rp_q[O_TLV];
+    assign o_tl_off     = rp_q[O_TLO +: 2];
+    assign o_tl_is_call = rp_q[O_TLC];
+    assign o_tl_is_ret  = rp_q[O_TLR];
+    assign o_tl_is_ind  = rp_q[O_TLI];
+    assign o_tl_target  = rp_q[O_TLT +: 64];
+
+    // ── Train stage 1: read the old entry (through the train copy) and capture the request ──────
+    let tr_idx : logic<IDX_W> = i_train_pc[IDX_W + 2:3];
+    let tr_tag : logic<TAG_W> = i_train_pc[63:IDX_W + 3];
+    let tr_old : logic<DATA_W> = dt[tr_idx];
+    let tr_oldv: logic         = valid[tr_idx];
+    // The branch's own displacement, recovered from the committed target. B-type reach is +/-4 KiB
+    // so the low 13 bits of (target - pc) are the whole signed offset; bit 0 is always 0.
+    let tr_disp: logic<64> = i_train_target - i_train_pc;
+
+    var t_en   : logic        ;
+    var t_idx  : logic<IDX_W> ;
+    var t_tag  : logic<TAG_W> ;
+    var t_off  : logic<2>     ;
+    var t_toff : logic<13>    ;
+    var t_tgt  : logic<64>    ;
+    var t_cond : logic        ;
+    var t_call : logic        ;
+    var t_ret  : logic        ;
+    var t_ind  : logic        ;
+    var t_old  : logic<DATA_W>;
+    var t_oldv : logic        ;
+    always_ff (clk, rst) {
+        if_reset {
+            t_en   = 1'b0;
+            t_idx  = '0;
+            t_tag  = '0;
+            t_off  = 2'd0;
+            t_toff = 13'd0;
+            t_tgt  = 64'd0;
+            t_cond = 1'b0;
+            t_call = 1'b0;
+            t_ret  = 1'b0;
+            t_ind  = 1'b0;
+            t_old  = '0;
+            t_oldv = 1'b0;
+        } else {
+            t_en   = i_train_en;
+            t_idx  = tr_idx;
+            t_tag  = tr_tag;
+            t_off  = i_train_pc[2:1];
+            t_toff = tr_disp[12:0];
+            t_tgt  = i_train_target;
+            t_cond = i_train_is_cond;
+            t_call = i_train_is_call;
+            t_ret  = i_train_is_ret;
+            t_ind  = i_train_is_ind;
+            t_old  = tr_old;
+            t_oldv = tr_oldv;
+        }
+    }
+
+    // ── Train stage 2: merge into the captured entry and write both copies ──────────────────────
+    // A tag miss starts a fresh entry (the old one described a different dword). A tag hit keeps the
+    // slots that are not being retrained, which is the entire reason for the two-cycle RMW.
+    //
+    // WRITE FORWARDING (f2.15c, found by measurement — see the coverage census in
+    // cp_predictor_sram_plan.md §f2.15c). Stage 1 reads the array a cycle before stage 2 writes it,
+    // so a train arriving one cycle after another to the SAME dword captures pre-write state and its
+    // merge then clobbers the earlier one. That is not a corner case: two branches in one dword are
+    // ADJACENT INSTRUCTIONS, so they commit within a cycle or two of each other by construction. It
+    // left entries holding only whichever branch trained last — the census measured 100 % of the
+    // slot misses as "a slot was free", dhrystone coverage 20.8 %. Fix: remember the word written
+    // last cycle and merge onto THAT when the index repeats. A mux on the merge input, not an extra
+    // port — the 1R1W shape is unchanged — and it chains through a run of trains to one dword.
+    var w_en  : logic        ;
+    var w_idx : logic<IDX_W> ;
+    var w_word: logic<DATA_W>;
+    let t_fwd  : logic          = w_en && (w_idx == t_idx);
+    let t_old_e: logic<DATA_W>  = if t_fwd ? w_word : t_old;
+    let t_oldv_e: logic         = if t_fwd ? 1'b1 : t_oldv;
+
+    let t_keep: logic = t_oldv_e && (t_old_e[O_TAG +: TAG_W] == t_tag);
+
+    // Existing conditional slots, as seen by the merge.
+    let e_b0v: logic     = t_keep && t_old_e[O_B0V];
+    let e_b0o: logic<2>  = t_old_e[O_B0O +: 2];
+    let e_b0t: logic<13> = t_old_e[O_B0T +: 13];
+    let e_b1v: logic     = t_keep && t_old_e[O_B1V];
+    let e_b1o: logic<2>  = t_old_e[O_B1O +: 2];
+    let e_b1t: logic<13> = t_old_e[O_B1T +: 13];
+
+    // Which conditional slot this train belongs in: retrain the slot already holding this offset,
+    // otherwise take a free slot, otherwise evict slot 1 (slot 0 holds the earlier branch in program
+    // order, and a block is entered at its start, so the earlier branch is the more valuable one).
+    let c_hit0: logic = e_b0v && (e_b0o == t_off);
+    let c_hit1: logic = e_b1v && (e_b1o == t_off);
+    let c_use0: logic = c_hit0 || !e_b0v;
+    // Program order is maintained so that slot 0 is always the FIRST conditional branch in the dword:
+    // a new branch that sorts before the resident slot-0 branch takes slot 0 and pushes it to slot 1.
+    let c_before0: logic = !c_hit0 && !c_hit1 && e_b0v && !e_b1v && (t_off <: e_b0o);
+
+    // Merged conditional slots.
+    let n_b0v: logic     = if !t_cond ? e_b0v : if (c_use0 || c_before0) ? 1'b1 : e_b0v;
+    let n_b0o: logic<2>  = if !t_cond ? e_b0o : if (c_use0 || c_before0) ? t_off : e_b0o;
+    let n_b0t: logic<13> = if !t_cond ? e_b0t : if (c_use0 || c_before0) ? t_toff : e_b0t;
+    let n_b1v: logic     = if !t_cond ? e_b1v : if c_use0 ? e_b1v : 1'b1;
+    let n_b1o: logic<2>  = if !t_cond ? e_b1o : if c_use0 ? e_b1o : if c_before0 ? e_b0o : if c_hit1 ? e_b1o : t_off;
+    let n_b1t: logic<13> = if !t_cond ? e_b1t : if c_use0 ? e_b1t : if c_before0 ? e_b0t : t_toff;
+
+    // Merged tail slot (a non-conditional train replaces it outright — there is only ever one
+    // reachable unconditional terminator per block).
+    let e_tlv: logic     = t_keep && t_old_e[O_TLV];
+    let n_tlv: logic     = if t_cond ? e_tlv : 1'b1;
+    let n_tlo: logic<2>  = if t_cond ? t_old_e[O_TLO +: 2] : t_off;
+    let n_tlc: logic     = if t_cond ? (t_keep && t_old_e[O_TLC]) : t_call;
+    let n_tlr: logic     = if t_cond ? (t_keep && t_old_e[O_TLR]) : t_ret;
+    let n_tli: logic     = if t_cond ? (t_keep && t_old_e[O_TLI]) : t_ind;
+    let n_tlt: logic<64> = if t_cond ? t_old_e[O_TLT +: 64] : t_tgt;
+
+    let t_word: logic<DATA_W> = {
+        n_tlt, n_tli, n_tlr, n_tlc, n_tlo, n_tlv,
+        n_b1t, n_b1o, n_b1v,
+        n_b0t, n_b0o, n_b0v,
+        t_tag
+    };
+
+    always_ff (clk, rst) {
+        if_reset {
+            // Only the valid bits need a reset — they gate every lookup. The packed copies are left
+            // un-reset so they infer as SRAM; an unwritten entry's garbage is masked by valid=0.
+            for i in 0..ENTRIES {
+                valid[i] = 1'b0;
+            }
+            w_en   = 1'b0;
+            w_idx  = '0;
+            w_word = '0;
+        } else {
+            w_en   = t_en;
+            w_idx  = t_idx;
+            w_word = t_word;
+            if t_en {
+                valid[t_idx] = 1'b1;
+                dp[t_idx]    = t_word; // both copies written identically (replication)
+                dt[t_idx]    = t_word;
+            }
+        }
+    }
+}

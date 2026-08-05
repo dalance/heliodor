@@ -2256,6 +2256,49 @@ cost of one bubble, which is exactly the mechanism f2.15e leaves in place. A thi
 every entry by ~50 % (offset + kind + 64-bit target) to buy back a fraction of 1.9 % of branches.
 **Two slots plus graceful degradation to the existing override path** is the design.
 
+### f2.15c RESULT — the array is built, and building it *as a measurement* caught a systematic bug
+
+`src/core/blkpred.veryl`: dword-indexed, tagged, clocked-read, two conditional slots (13-bit signed
+offsets — RV64 B-type reach is exactly ±4 KiB, so a slot costs ~16 bits instead of ~67) plus one tail
+slot with a full 64-bit target for the unconditional/indirect terminator. Port shape is real: the
+predict read and the train read-modify-write would be 2R1W, so they are resolved by **replication**
+(`dp` / `dt`, both written identically) — the same idiom `btb.veryl` already uses for its two lookup
+ports. The train is pipelined over two cycles because a 1R1W macro cannot read and write one address
+in a cycle.
+
+This increment deliberately builds and **trains** the array without steering anything, and measures
+the only property that matters given the deficit is coverage: **does it have the branch?** Measured
+against the 4096-entry BTB on the same committed event stream.
+
+**And the measurement immediately paid for itself.** The first census read dhrystone coverage at
+**20.8 %** — with `free`, the count of misses where the entry existed *and had a spare slot*, equal to
+**100 %** of the misses. No capacity pressure at all, so not a sizing problem. Sampling the actual
+slot contents (`BLKMISS`) showed entries holding exactly one branch at the wrong offset. Root cause:
+**the two-cycle train RMW loses the earlier of any two control transfers in the same dword, and two
+branches one dword apart are ADJACENT INSTRUCTIONS — so they commit within a cycle or two of each
+other by construction.** It is not a corner case, it is the normal case, and it left every
+multi-branch dword holding only whichever branch trained last. Fixed by forwarding the word written
+last cycle into the merge when the index repeats — a mux on the merge input, not an extra port, so
+the 1R1W shape is unchanged, and it chains through a run of trains to one dword.
+
+| workload | before fix | after fix (1024 entries) | 4096 entries |
+|---|---|---|---|
+| dhrystone | 20.8 % | **100.0 %** (`free`=0) | — |
+| coremark | 66.4 % | **99.6 %** | — |
+| N1 Linux boot | 33.3 % | 91.4 % | **96.2 %** |
+
+At 1024 entries the block predictor already matches the 4096-entry BTB **exactly** on dhrystone and to
+0.4 % on coremark. The kernel wants more capacity (its residual misses are index thrashing, which
+shows up as "entry present, slot free" once a wiped entry is refilled by one branch), and 4096 dword
+entries — the same entry count as the BTB it is meant to replace, ~1.27× its bits for 4× the code
+span — reaches 96.2 %. That is the default; the sweep is the record.
+
+Two notes worth keeping. The probe had its own phase bug first (comparing a *clocked* block
+prediction against the same cycle's `ic_pc`), which read as 11 % coverage; the operands must be
+delayed to match the array's registered read. And the instantiation is confirmed non-perturbing —
+with the array live and training, dhrystone is 252939 / instret 264834 and N1 boot `cy=00d9be30`
+`pass=1`, both baseline-exact.
+
 ### Increments (each DEAD at 0, byte-identical at 0)
 
 - **f2.15a — run-ahead GHR** (`ghr_pred` / `ghr_pred_l`): the direction-history analogue of f2.5d's

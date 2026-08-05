@@ -2457,6 +2457,140 @@ pub module heliodor_core #(
             }
         }
     }
+    // ── f2.15c: the RUN-AHEAD BLOCK PREDICTOR — instantiated + trained + MEASURED ── DEAD at 0 ──
+    // See blkpred.veryl for the geometry and why every field of it is what the f2.15b census said.
+    // This increment builds and trains the array but does NOT yet steer anything: f2.15d/e wire the
+    // descriptor into the FTQ and demote Stage-B to reconciliation. What it DOES do is answer the
+    // question that decides whether those are worth building — the f2.15 deficit is COVERAGE (the L0
+    // has 32 entries against a 4096-entry BTB; 33 false positives and ZERO target errors over a
+    // whole run), so the only thing that matters about the block predictor is whether it HAS the
+    // branch. That is measured here, against ground truth at commit, before any datapath moves.
+    //
+    // The read is placed on the dword-aligned EXTRACT pc rather than pc_pred so the measurement is
+    // valid in any config (including the shipped =0 arm, where FTQ_DECOUPLE is off and pc_pred does
+    // not run). Coverage is a property of the table and its training, not of where it is read.
+    const PRED_BLK: bit = 0;
+    var blk_hit      : logic    ;
+    var blk_b0_valid : logic    ;
+    var blk_b0_off   : logic<2> ;
+    var blk_b0_toff  : logic<13>;
+    var blk_b1_valid : logic    ;
+    var blk_b1_off   : logic<2> ;
+    var blk_b1_toff  : logic<13>;
+    var blk_tl_valid : logic    ;
+    var blk_tl_off   : logic<2> ;
+    var blk_tl_is_call: logic   ;
+    var blk_tl_is_ret : logic   ;
+    var blk_tl_is_ind : logic   ;
+    var blk_tl_target : logic<64>;
+    inst u_blkpred: blkpred (
+        clk                                        ,
+        rst                                        ,
+        i_pc           : {ic_pc[63:3], 3'b000}     ,
+        o_hit          : blk_hit                   ,
+        o_b0_valid     : blk_b0_valid              ,
+        o_b0_off       : blk_b0_off                ,
+        o_b0_toff      : blk_b0_toff               ,
+        o_b1_valid     : blk_b1_valid              ,
+        o_b1_off       : blk_b1_off                ,
+        o_b1_toff      : blk_b1_toff               ,
+        o_tl_valid     : blk_tl_valid              ,
+        o_tl_off       : blk_tl_off                ,
+        o_tl_is_call   : blk_tl_is_call            ,
+        o_tl_is_ret    : blk_tl_is_ret             ,
+        o_tl_is_ind    : blk_tl_is_ind             ,
+        o_tl_target    : blk_tl_target             ,
+        // Trained from the same committed taken control transfer the BTB is trained from, so the two
+        // tables see an identical event stream and a coverage comparison between them is honest.
+        // Gated by PRED_BLK so the arrays are never written at 0 → the whole instance is inert.
+        i_train_en     : PRED_BLK && btb_train_en  ,
+        i_train_pc     : bp_train_pc               ,
+        i_train_target : btb_train_target          ,
+        i_train_is_cond: btb_train_is_cond         ,
+        i_train_is_call: btb_train_is_call         ,
+        i_train_is_ret : btb_train_is_ret          ,
+        i_train_is_ind : btb_train_is_ind          ,
+    );
+    // ── f2.15c COVERAGE CENSUS (temporary; DEAD at BLKC_STATS=0) ──
+    // At commit, does the block predictor hold THIS branch? The read is one cycle old (the array is
+    // clocked, by design), so compare against the commit PC registered to match it.
+    const BLKC_STATS: bit = 0;
+    var bc_cy   : logic<32>;
+    var bc_tot  : logic<32>; // committed taken control transfers
+    var bc_ent  : logic<32>; // ... whose dword has an entry at all (tag hit)
+    var bc_cov  : logic<32>; // ... AND a slot matching this branch's offset  = real coverage
+    var bc_l0   : logic<32>; // ... that the 32-entry L0 micro-BTB would have had, for comparison
+    var bc_free : logic<32>; // coverage misses where the entry existed WITH a free slot
+    var bc_tr   : logic<32>; // blkpred train events (must equal the BTB's)
+    // The blkpred read is indexed by the CURRENT ic_pc; to ask about the committing branch we read
+    // the table with a commit-side index instead. Reuse the probe's own tiny shadow: a direct
+    // recompute of "would a dword-indexed table of this size, trained on this stream, have it".
+    // PHASE: blkpred's read is CLOCKED, so its outputs this cycle describe the dword of ic_pc from
+    // the PREVIOUS cycle. The comparison operands must be delayed to match, or the probe reports a
+    // stale prediction against a fresh branch and undercounts coverage badly.
+    var bc_pc_q : logic<64>;
+    var bc_btb_q: logic    ;
+    var bc_l0_q : logic    ;
+    let bc_dw_hit: logic = blk_hit && (
+        (blk_b0_valid && (blk_b0_off == bc_pc_q[2:1]))
+     || (blk_b1_valid && (blk_b1_off == bc_pc_q[2:1]))
+     || (blk_tl_valid && (blk_tl_off == bc_pc_q[2:1]))
+    );
+    always_ff (clk, rst) {
+        if_reset {
+            bc_cy    = 32'd0;
+            bc_tot   = 32'd0;
+            bc_ent   = 32'd0;
+            bc_cov   = 32'd0;
+            bc_l0    = 32'd0;
+            bc_free  = 32'd0;
+            bc_tr    = 32'd0;
+            bc_pc_q  = 64'd0;
+            bc_btb_q = 1'b0;
+            bc_l0_q  = 1'b0;
+        } else if BLKC_STATS {
+            bc_cy    = bc_cy + 32'd1;
+            bc_pc_q  = ic_pc;
+            bc_btb_q = btb_hit;
+            bc_l0_q  = l0_hit;
+            // Sampled on the FETCH side: for every dword extract is presenting that actually holds a
+            // control transfer the full BTB knows about, did the block predictor know it too?
+            if bc_btb_q {
+                bc_tot = bc_tot + 32'd1;
+                if blk_hit {
+                    bc_ent = bc_ent + 32'd1;
+                }
+                if bc_dw_hit {
+                    bc_cov = bc_cov + 32'd1;
+                }
+                if bc_l0_q {
+                    bc_l0 = bc_l0 + 32'd1;
+                }
+                // Diagnostic: the entry is present but this branch is not in it, AND a slot was
+                // free. With dhrystone measured at zero within-dword aliasing there is no capacity
+                // pressure, so a large count here means the branch never got allocated — an
+                // allocation defect, not a sizing one.
+                if blk_hit && !bc_dw_hit && (!blk_b0_valid || !blk_b1_valid || !blk_tl_valid) {
+                    bc_free = bc_free + 32'd1;
+                    // Sample the first few so the actual slot contents settle what "free slot but not
+                    // allocated" means, instead of another round of reasoning about the merge.
+                    if bc_free <: 32'd12 {
+                        $display("BLKMISS pc=%h want_off=%d b0=%d/%d b1=%d/%d tl=%d/%d",
+                            bc_pc_q, bc_pc_q[2:1],
+                            blk_b0_valid, blk_b0_off,
+                            blk_b1_valid, blk_b1_off,
+                            blk_tl_valid, blk_tl_off);
+                    }
+                }
+            }
+            if PRED_BLK && btb_train_en {
+                bc_tr = bc_tr + 32'd1;
+            }
+            if bc_cy[15:0] == 16'hffff {
+                $display("BLKC cy=%d btb=%d blk_ent=%d blk_cov=%d free=%d tr=%d l0=%d", bc_cy, bc_tot, bc_ent, bc_cov, bc_free, bc_tr, bc_l0);
+            }
+        }
+    }
     // ── f2.15b DWORD-ALIASING PROBE (temporary; DEAD at BLK_STATS=0) ──
     // Gating measurement for the block predictor. A dword-indexed block predictor holds ONE entry per
     // dword, so two distinct conditional branches inside the same dword cannot both be represented —
