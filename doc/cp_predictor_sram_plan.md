@@ -2829,6 +2829,94 @@ FTB_OVERRIDE FTQ_DECOUPLE PRED_BLK FTQ_DESC PRED_BLK_COND` + `IBTB/BHT/BTB/TAGE_
   IPC once the P9.6 mem-port contention is addressed. Out of f2.5's structural scope; noted as the
   path that makes the decoupling pay.
 
+## f2.16 RESULT — the census refutes the premise, and the guard it pointed at is load-bearing
+
+Measured 2026-08-07 on the f2.15e′ arm (the 15-const flip + `FTQ_STATS=1`). dhrystone reproduced at
+264536 / instret 264834, bit-identical to the f2.16 baseline, so the added counters are
+non-perturbing and every number below is on the same run the hand-off's `l0tk=13504` came from.
+
+### The census — returns are 1.4 %, not the gap
+
+The hand-off's job was "teach the descriptor RETURNS, then delete the L0", gated on splitting `l0tk`
+by kind first. Split (the five counters sum to `l0tk` exactly, which is the self-check):
+
+| L0-only Stage-A take, dhrystone @ cy 262143 | count | of `l0tk` |
+|---|---|---|
+| slot-0 return | 510 | 3.8 % |
+| slot-0 conditional | 1990 | 14.7 % |
+| slot-0 unconditional | 1005 | 7.4 % |
+| **slot-1 conditional** | **9461** | **70.1 %** |
+| slot-1 unconditional | 538 | 4.0 % |
+| **total** | **13504** | = `l0tk` ✓ |
+
+**Returns are 510 — 1.4 % of all 36219 Stage-A takes.** The RAS increment the hand-off specified
+would close a rounding error, so it is NOT the way to the L0. `PRED_RAS_AHEAD` stays banked and
+unbuilt. What holds the L0 in the fetch path is **conditionals in the fetch bundle's slot 1**.
+
+Splitting THAT bucket by why the descriptor declined it: **`nodesc` = 9461, `offmiss` = 0,
+`other` = 0.** Not one of them is an offset mismatch — the descriptor simply is not there. So the
+`bd_off == s1_pc[2:1]` comparison and the whole slot-1 consumer path are exonerated, and the
+question moves entirely to the producer.
+
+### The producer census — where descriptors die
+
+Six arms partitioning `pp_step` (they sum to it):
+
+| of 230269 descriptors produced | count | share |
+|---|---|---|
+| a taken exit WAS produced | 41170 | 17.9 % |
+| **killed by the mid-dword re-entry guard** | **48802** | **21.2 %** |
+| lookup in flight invalidated (one per taken re-steer) | 40182 | 17.4 % |
+| blkpred tag miss — mostly branch-free dwords, which have no exit to record | 70752 | 30.7 % |
+| hit, a conditional slot is valid, but none is strong | 14907 | 6.5 % |
+| hit, nothing applicable recorded | 14456 | 6.3 % |
+
+### ⚠️ `PRED_BLK_REENT` — built, measured, REFUTED, and kept DEAD at 0
+
+The guard drops the WHOLE descriptor when a re-seed lands mid-dword, on the argument that extract
+enters past part of the dword. Since the entry records each transfer's own halfword offset, per-slot
+reachability (`off >= pp_ent_off_q`) looks like a strictly sharper test — and it is a no-op on the
+common path, because `pp_ent_off_q` is 0 on every ordinary step. Measured opportunity: 3979 of the
+48802. Per-slot filtering and whole-descriptor filtering recovered the SAME 3979 on dhrystone, which
+is exactly what f2.15b's census predicts (dhrystone has 0 % dwords with two executed conditionals;
+the two forms can only differ on coremark 6.4 % / kernel 9.9 %).
+
+**At `=1`: dhrystone 264536 → 267052, +0.95 % WORSE**, instret bit-exact at 264834. The reseed
+census names the mechanism: **`ext_taken_redir` 0 → 1476 and `f0_diverged` 988 → 1964.** The
+run-ahead began following exits extract does not take.
+
+**The guard was doing a second job, and offset comparison cannot replace it: DECODE-ALIGNMENT
+aliasing.** A block entry's slot offsets were trained on a pass that entered the dword at some
+alignment. Entering at a different halfword re-decodes the bytes, so a recorded offset at or after
+the re-entry point need not be an instruction boundary on THIS pass; following it steers fetch at a
+target extract never reaches. `ext_taken_redir = 0` at `=0` is the fingerprint — with every
+re-entered dword blocked and aligned entries decoding canonically, the failure mode cannot occur.
+Recovering these descriptors needs a reachability test on instruction BOUNDARIES, and the entry does
+not carry the information to build one.
+
+Kept as a DEAD-at-0 const with the mechanism in the RTL comment so it is not rebuilt.
+
+### What this leaves for the next increment
+
+The extract-side gap (9461 slot-1 conditionals, all `nodesc`) has NOT been connected to its
+producer-side cause. The largest producer bucket was attacked and it was the wrong one — the
+extract-side bucket barely moved (9461 → 9366) while cycles regressed. **Do not pick the next
+increment by bucket size again;** carry a small "why not" code from the producer into the WORD FIFO
+alongside `d_taken` and read it at extract, so the 9461 are attributed directly. The two candidates
+that survive are the strong-only gate (`weak` = 14907; the doc already flags `== 3` as the lever,
+and it is tuning) and the post-take lookup invalidation (`nvld` = 40182, one per taken re-steer —
+structural, and the re-seed path already has the combinational lookup bypass that would fix it:
+`u_blkpred.i_pc` takes `pp_reseed_pc` on `pp_reseed` but not `pd_target` on `pd_taken`).
+
+### Traps banked
+
+- **A guard can be load-bearing for a reason its comment does not state.** This one documented
+  "extract enters past the transfer"; it was also the only thing preventing decode-alignment
+  aliasing. Before sharpening a guard, ask what ELSE goes to zero because of it — here
+  `ext_taken_redir = 0` was sitting in the census the whole time as the evidence.
+- **The biggest bucket is not the connected bucket.** Attribute the symptom to its cause before
+  building; an aggregate rate does not establish that the two populations overlap.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with

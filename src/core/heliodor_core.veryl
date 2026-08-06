@@ -524,6 +524,7 @@ pub module heliodor_core #(
     var pc_pred_q  : logic<64>;         // the dword whose blkpred result is arriving THIS cycle
     var pp_desc_vld: logic    ;         // pc_pred_q is a real in-flight lookup (cleared by a reseed)
     var pp_no_desc_q: logic   ;         // pp_no_ftb_q, delayed to match pc_pred_q
+    var pp_ent_off_q: logic<2>;         // f2.16: the halfword extract RE-ENTERS pc_pred_q's dword at
     var ftq_d_taken : logic     [FTQ_N]; // this dword's block exits on a predicted-taken transfer
     var ftq_d_target: logic<64> [FTQ_N];
     var ftq_d_off   : logic<2>  [FTQ_N]; // halfword offset of that transfer within the dword
@@ -2407,9 +2408,45 @@ pub module heliodor_core #(
     // STRONG. A slot that has never committed taken cannot reach strong (init_c), so it can never
     // steer with the meaningless target a not-taken-only train would leave behind.
     const PRED_BLK_COND: bit = 0;
-    let bc0_take: logic = PRED_BLK_COND && blk_b0_valid && (blk_b0_ctr == 2'd3);
-    let bc1_take: logic = PRED_BLK_COND && blk_b1_valid && (blk_b1_ctr == 2'd3);
-    let bct_take: logic = blk_tl_valid && !blk_tl_is_ret && !blk_tl_is_ind;
+    // ── f2.16: RE-ENTRY REACHABILITY, replacing the whole-descriptor guard ── DEAD at 0 ──
+    // The f2.16 census (doc §f2.16) refuted the hand-off's premise. Returns are 510 of the 13504
+    // L0-only Stage-A takes; 9461 (70 %) are conditionals in the fetch bundle's slot 1, and ALL of
+    // them have NO descriptor rather than a mismatched offset. The producer census then found the
+    // largest addressable bucket: 48802 of 230269 descriptors (21 %) are thrown away by the
+    // mid-dword re-entry guard.
+    //
+    // The guard looked blunt: a re-seed landing MID-dword means extract enters past part of the
+    // dword, so an exit recorded BEFORE that point is unreachable on this pass, and the entry
+    // records each transfer's own halfword offset — so reachability looks decidable per slot
+    // instead of by discarding the entry.
+    //
+    // ⚠️ MEASURED AND REFUTED (2026-08-07). Kept DEAD at 0 with the mechanism, so it is not rebuilt.
+    // At =1 dhrystone goes 264536 -> 267052 (+0.95 %) with instret bit-exact, and the reseed census
+    // says why: ext_taken_redir 0 -> 1476 and f0_diverged 988 -> 1964. The run-ahead starts
+    // following exits extract does not take. The guard was doing a SECOND job that offset
+    // comparison cannot replace — DECODE-ALIGNMENT aliasing. A block entry's slot offsets were
+    // trained on a pass that entered the dword at some alignment; entering at a different halfword
+    // re-decodes the bytes, so a recorded offset at or after the re-entry point need not be an
+    // instruction boundary on THIS pass. Following it steers fetch at a target extract never
+    // reaches. That failure is invisible at =0 because the guard blocks every re-entered dword and
+    // an aligned entry (offset 0) decodes canonically — which is exactly why ext_taken_redir is 0
+    // there. Recovering these descriptors needs a reachability test on instruction boundaries, not
+    // on offsets; the entry does not carry the information to build one.
+    const PRED_BLK_REENT: bit = 0;
+    // The construction itself, folded away at 0. pp_ent_off_q is 0 on every ordinary step
+    // (it is non-zero only for the one descriptor following a mid-dword re-seed, which is precisely
+    // when pp_no_desc_q is set). So `off >= pp_ent_off_q` is vacuously true on the common path and
+    // is a no-op there by construction — it only filters the re-entry case, where a slot BEFORE the
+    // re-entry point describes a transfer extract has already walked past on this pass.
+    // Filtering per SLOT rather than rejecting the entry is what makes this better than the
+    // conservative form: a dword whose slot 0 is unreachable can still exit correctly through
+    // slot 1, which the whole-descriptor guard threw away along with everything else.
+    let re_b0: logic = !PRED_BLK_REENT || (blk_b0_off >= pp_ent_off_q);
+    let re_b1: logic = !PRED_BLK_REENT || (blk_b1_off >= pp_ent_off_q);
+    let re_tl: logic = !PRED_BLK_REENT || (blk_tl_off >= pp_ent_off_q);
+    let bc0_take: logic = PRED_BLK_COND && blk_b0_valid && (blk_b0_ctr == 2'd3) && re_b0;
+    let bc1_take: logic = PRED_BLK_COND && blk_b1_valid && (blk_b1_ctr == 2'd3) && re_b1;
+    let bct_take: logic = blk_tl_valid && !blk_tl_is_ret && !blk_tl_is_ind && re_tl;
     // Each conditional slot's own PC and target. B-type reach is +/-4 KiB, so the stored 13-bit
     // signed displacement is exact and sign-extends to the full target.
     let bc0_pc  : logic<64> = {pc_pred_q[63:3], blk_b0_off, 1'b0};
@@ -2428,9 +2465,15 @@ pub module heliodor_core #(
     // versa; the offsets settle it directly.
     let bx_tail : logic = bct_take && (!bcs_take || (blk_tl_off <: bcs_off));
     let bx_cond : logic = bcs_take && !bx_tail;
-    let pd_taken : logic     = FTQ_DESC && pp_desc_vld && !pp_no_desc_q && blk_hit && (bx_tail || bx_cond);
     let pd_target: logic<64> = if bx_cond ? bcs_tgt : blk_tl_target;
     let pd_off   : logic<2>  = if bx_cond ? bcs_off : blk_tl_off;
+    // The f2.16 claim was that per-slot reachability SUBSUMES the whole-descriptor guard, so the
+    // guard term can drop out. Measurement refuted it (see the const above) — offsets decide who
+    // extract walked past, but not what decodes as an instruction on this pass. Also note the guard
+    // has a second source, pp_no_ftb_q under PRED_RAS_AHEAD (const-false in this arm); re-flipping
+    // that would need its own term rather than riding on pp_ent_off_q, which carries only the
+    // re-seed offset.
+    let pd_taken   : logic = FTQ_DESC && pp_desc_vld && (!pp_no_desc_q || PRED_BLK_REENT) && blk_hit && (bx_tail || bx_cond);
     // (f2.15d had a `pd_next = taken ? target : pc_pred_q + 8` here and fed pc_pred from it. That is
     // the phase error f2.15e found by measurement: pc_pred is one dword AHEAD of pc_pred_q, so
     // assigning it next(pc_pred_q) writes back the value it already held — the pointer stops, each
@@ -2444,6 +2487,7 @@ pub module heliodor_core #(
             pc_pred_q    = RESET_PC;
             pp_desc_vld  = 1'b0;
             pp_no_desc_q = 1'b0;
+            pp_ent_off_q = 2'd0;
         } else if FTQ_DESC {
             // Stage 2 of the pipe, stepping in lockstep with pc_pred (both under pp_step) so the two
             // can never drift. A re-seed leaves the in-flight lookup off-path; so does a
@@ -2456,10 +2500,14 @@ pub module heliodor_core #(
                 pc_pred_q    = pp_reseed_pc;
                 pp_desc_vld  = 1'b1;
                 pp_no_desc_q = pp_reseed_tgt[2:1] != 2'b00;
+                // f2.16: WHERE in the dword extract re-enters. Only meaningful while pp_no_desc_q
+                // is set, which is exactly when the guard consults it.
+                pp_ent_off_q = pp_reseed_tgt[2:1];
             } else if pp_step {
                 pc_pred_q    = pc_pred;
                 pp_desc_vld  = !pd_taken;
                 pp_no_desc_q = pp_no_ftb_q;
+                pp_ent_off_q = 2'd0;
             }
         }
     }
@@ -3096,6 +3144,31 @@ pub module heliodor_core #(
     var st_bd0     : logic<32>;
     var st_bd1     : logic<32>;
     var st_l0tk    : logic<32>;
+    // f2.16 census: the same L0-only population, split by KIND. The descriptor declines returns
+    // (a block entry holds the LAST return address — the value a RAS exists to replace) and
+    // indirects (where the L0 declines too), so the split says whether the remaining 37 % is the
+    // return gap the run-ahead RAS closes, or something else entirely. Measure before building.
+    var st_l0ret   : logic<32>; // slot-0: return
+    var st_l0cnd   : logic<32>; // slot-0: conditional
+    var st_l0unc   : logic<32>; // slot-0: unconditional, non-return (jal / call)
+    var st_l0s1c   : logic<32>; // slot-1: conditional
+    var st_l0s1u   : logic<32>; // slot-1: unconditional (slot-1 declines ret outright)
+    // The census said slot-1 conditionals are 70 % of the residual, so this splits THAT bucket by
+    // why the descriptor declined it: no taken exit recorded for the dword at all, versus an exit
+    // recorded at a different halfword than slot-1's. The two answers point at opposite fixes.
+    var st_s1_nod  : logic<32>; // !bd_valid — the block entry predicted no taken exit for this dword
+    var st_s1_off  : logic<32>; // bd_valid but the exit offset is not slot-1's
+    var st_s1_oth  : logic<32>; // offset matches — blocked by straddle / cross-dword slot-1
+    // nodesc measured at 100 % of that bucket, so the next question is at the PRODUCER: of the dwords
+    // it describes, why does it record no taken exit? These partition every pp_step in priority order.
+    var st_pp_step : logic<32>; // descriptors produced
+    var st_pp_nvld : logic<32>; //   lookup in flight was invalidated by a re-seed
+    var st_pp_nod  : logic<32>; //   suppressed by the mid-dword re-entry guard
+    var st_pp_miss : logic<32>; //   blkpred tag miss (cold or evicted)
+    var st_pp_weak : logic<32>; //   hit, a conditional slot is valid, but no slot is strong
+    var st_pp_none : logic<32>; //   hit, and the dword records no taken exit and no conditional at all
+    var st_pp_take : logic<32>; //   a taken exit WAS produced
+    var st_pp_rcv  : logic<32>; //   of nodesc: the exit is AT OR AFTER the re-entry — recoverable
     always_ff (clk, rst) {
         if_reset {
             st_cy       = 32'd0;
@@ -3115,6 +3188,22 @@ pub module heliodor_core #(
             st_bd0      = 32'd0;
             st_bd1      = 32'd0;
             st_l0tk     = 32'd0;
+            st_l0ret    = 32'd0;
+            st_l0cnd    = 32'd0;
+            st_l0unc    = 32'd0;
+            st_l0s1c    = 32'd0;
+            st_l0s1u    = 32'd0;
+            st_s1_nod   = 32'd0;
+            st_s1_off   = 32'd0;
+            st_s1_oth   = 32'd0;
+            st_pp_step  = 32'd0;
+            st_pp_nvld  = 32'd0;
+            st_pp_nod   = 32'd0;
+            st_pp_miss  = 32'd0;
+            st_pp_weak  = 32'd0;
+            st_pp_none  = 32'd0;
+            st_pp_take  = 32'd0;
+            st_pp_rcv   = 32'd0;
         } else if FTQ_STATS {
             st_cy    = st_cy + 32'd1;
             st_depth = st_depth + {44'd0, ftq_count};
@@ -3160,6 +3249,58 @@ pub module heliodor_core #(
                 }
                 if (l0e_taken || l0e_taken1) && !bd_taken0 && !bd_taken1 {
                     st_l0tk = st_l0tk + 32'd1;
+                    // f2.16 kind split. With !bd_taken0 the l0e_* muxes collapse to the raw L0
+                    // takes, and l0_taken1 already requires !l0e_taken, so the two arms partition
+                    // this population exactly — the five counters must sum to l0tk (self-check).
+                    if l0_taken {
+                        if l0_is_ret {
+                            st_l0ret = st_l0ret + 32'd1;
+                        } else if l0_is_cond {
+                            st_l0cnd = st_l0cnd + 32'd1;
+                        } else {
+                            st_l0unc = st_l0unc + 32'd1;
+                        }
+                    } else if l0_is_cond2 {
+                        st_l0s1c = st_l0s1c + 32'd1;
+                        if !bd_valid {
+                            st_s1_nod = st_s1_nod + 32'd1;
+                        } else if bd_off != s1_pc[2:1] {
+                            st_s1_off = st_s1_off + 32'd1;
+                        } else {
+                            st_s1_oth = st_s1_oth + 32'd1;
+                        }
+                    } else {
+                        st_l0s1u = st_l0s1u + 32'd1;
+                    }
+                }
+            }
+            // Producer-side census: for every descriptor the producer commits to, why is there no
+            // taken exit? The six arms partition pp_step. `take` is tested BEFORE the guard so the
+            // split reads correctly at PRED_BLK_REENT=1 too, where a guarded dword can still take.
+            if pp_step {
+                st_pp_step = st_pp_step + 32'd1;
+                if !pp_desc_vld {
+                    st_pp_nvld = st_pp_nvld + 32'd1;
+                } else if pd_taken {
+                    st_pp_take = st_pp_take + 32'd1;
+                } else if pp_no_desc_q {
+                    st_pp_nod = st_pp_nod + 32'd1;
+                    // The opportunity PRED_BLK_REENT takes, computed independently of the const so it
+                    // reads the same at both settings: the entry records SOME exit at or after the
+                    // halfword extract re-enters at, so extract reaches it.
+                    if blk_hit && (
+                        (PRED_BLK_COND && blk_b0_valid && (blk_b0_ctr == 2'd3) && (blk_b0_off >= pp_ent_off_q))
+                        || (PRED_BLK_COND && blk_b1_valid && (blk_b1_ctr == 2'd3) && (blk_b1_off >= pp_ent_off_q))
+                        || (blk_tl_valid && !blk_tl_is_ret && !blk_tl_is_ind && (blk_tl_off >= pp_ent_off_q))
+                    ) {
+                        st_pp_rcv = st_pp_rcv + 32'd1;
+                    }
+                } else if !blk_hit {
+                    st_pp_miss = st_pp_miss + 32'd1;
+                } else if blk_b0_valid || blk_b1_valid {
+                    st_pp_weak = st_pp_weak + 32'd1;
+                } else {
+                    st_pp_none = st_pp_none + 32'd1;
                 }
             }
             if st_cy[15:0] == 16'hffff {
@@ -3167,6 +3308,12 @@ pub module heliodor_core #(
                     st_cy, st_depth, st_dmax, st_byp, st_enq, st_wide, st_pop, st_reseed,
                     st_rs_redir, st_rs_earl, st_rs_sbov, st_rs_l0, st_rs_ext, st_rs_div,
                     st_bd0, st_bd1, st_l0tk);
+                $display("FTQ-L0KIND cy=%d l0tk=%d ret=%d cond=%d unc=%d s1cond=%d s1unc=%d (s1: nodesc=%d offmiss=%d other=%d)",
+                    st_cy, st_l0tk, st_l0ret, st_l0cnd, st_l0unc, st_l0s1c, st_l0s1u,
+                    st_s1_nod, st_s1_off, st_s1_oth);
+                $display("FTQ-PROD cy=%d step=%d take=%d nvld=%d nodesc=%d (recoverable=%d) miss=%d weak=%d nocond=%d",
+                    st_cy, st_pp_step, st_pp_take, st_pp_nvld, st_pp_nod, st_pp_rcv, st_pp_miss,
+                    st_pp_weak, st_pp_none);
             }
         }
     }
