@@ -2917,6 +2917,92 @@ structural, and the re-seed path already has the combinational lookup bypass tha
 - **The biggest bucket is not the connected bucket.** Attribute the symptom to its cause before
   building; an aggregate rate does not establish that the two populations overlap.
 
+## 🎉 f2.16b RESULT — the gap was a same-dword clause, and 66 % of it was already in the FIFO
+
+Measured 2026-08-07, immediately after f2.16. The f2.16 write-up ended by saying the next increment
+must ATTRIBUTE the 9461 slot-1 conditionals to their own producer-side cause rather than pick by
+bucket size. That attribution was built (a 3-bit `d_why` carried from the producer through the FTQ
+and the WORD FIFO to extract) and it answered in one run.
+
+### The attribution — three measurements, each one eliminating everything else
+
+| question | answer |
+|---|---|
+| which producer reason? | **`miss` 9461 / 9461.** Guard 0, `nvld` 0, `weak` 0, `none` 0 |
+| miss because untrained, or evicted? | **untrained 9461 / 9461.** Evicted 0 — not capacity, not aliasing |
+| where in the dword does slot 1 sit? | **halfword 0: 9461 / 9461.** Halfwords 1/2/3: zero |
+
+Halfword 0 is the whole answer. Slot 1 at halfword 0 means slot 0 ends exactly on the dword
+boundary and **slot 1 is the first instruction of the NEXT dword** — so `bd_taken1`'s
+`s1_pc[63:3] == ic_pc[63:3]` excludes every one of them by construction, and `bd_why` was
+describing the head dword (correctly untrained: it holds no branch at all).
+
+The descriptor that DOES describe slot 1 is head+1's, and it is already in the FIFO:
+
+| of the 9461 | count |
+|---|---|
+| head+1 is slot-1's dword | **9461 (100 %)** |
+| … and its descriptor records a taken exit | **8964 (94.7 %)** |
+| … at exactly slot-1's halfword | **8964 (100 % of those)** |
+
+**66 % of the entire `l0tk` residual was a correct prediction sitting one FIFO entry along,
+unread.** The f2.15e comment "the descriptor covers slot 1 with the SAME entry" is true only when
+slot 1 is in the same dword; that assumption is what the census finally priced.
+
+### `BD_SLOT1_NEXT` — and the two bookkeeping edits that decide whether it pays
+
+Reading head+1 when slot 1 crosses the boundary is three lines, and the coverage moved exactly as
+predicted on the first flip: `bd1` 3189 → 11162, `l0tk` 13504 → **4135**, `s1cond` 9461 → 452.
+**And dhrystone went 264536 → 290017, +9.6 % WORSE**, with `ext_taken_redir` 0 → 8153 and
+`f0_diverged` 988 → 9047. A correct prediction is worthless if the bookkeeping around it says the
+stream diverged. Two edits, in this order:
+
+1. **`ext_pop2` — the head advances by TWO.** Such a take consumes the head dword entirely and
+   head+1 up to a transfer that skips its remainder. A single pop leaves the target at head+1.
+2. **`ext_buf_mismatch` must then compare against head+2.** This is the one that mattered: with the
+   double pop alone the result was *bit-identical* to without it, because `ext_buf_mismatch` still
+   compared the branch target against head+1 (= D+1), called it a mismatch, and raised
+   `ext_taken_redir` — which **flushes the FIFO**, so the head-advance arm was never reached. One
+   wrong index was the entire regression.
+
+| dhrystone | f2.15e′ | +read head+1 | +double pop | **+head+2 compare** |
+|---|---|---|---|---|
+| cycles | 264536 | 290017 | 290017 (bit-identical) | **263039** |
+| `instret` | 264834 | 264834 | 264834 | **264834** |
+| `ext_taken_redir` | 0 | 8153 | 8153 | **0** |
+| `f0_diverged` | 988 | 9047 | 9047 | **992** |
+| reseed total | 27640 | 32861 | 32861 | **18312 (−34 %)** |
+| `l0tk` | 13504 | 4135 | 4135 | **4558 (−66 %)** |
+| `bd0` / `bd1` | 19526 / 3189 | — | — | **25090 / 7703** |
+
+### The ladder
+
+| workload | f2.15e′ | **f2.16b** |
+|---|---|---|
+| dhrystone | 264536 | **263039** (−0.57 %) |
+| coremark | 402520 | **405455** (+0.73 %) |
+| N=1 boot | `cy=00e09c00` 14.72 M | **`cy=00df1560` 14.62 M** (−0.68 %), pass |
+
+`instret` bit-exact on both microbenchmarks. Cycles are a modest net win (two of three), but the
+result that matters for this campaign is **`l0tk` −66 %**: the L0's remaining job is what keeps a
+32-entry async-read four-port register file in the fetch path, and two thirds of it is now gone.
+
+`BD_SLOT1_NEXT` is left at **1** in master rather than added to the flip set — `bd1n_hit` is
+`&& FTQ_DESC && PRED_L0_FAST`, so it folds away with the arm and needs no separate entry.
+
+### Traps banked
+
+- **A correct prediction can still cost cycles if the bookkeeping around it disagrees.** The
+  coverage counters said the mechanism worked (`bd1` +8000, `l0tk` −70 %) while cycles regressed
+  9.6 %. Read the reseed census, not the coverage census, to judge a front-end increment.
+- **A bit-identical result after a change means the change never fired.** The double pop looked
+  inert; it was actually being pre-empted by a flush two lines earlier. Bit-identical is a
+  measurement, and it says "not reached" — chase that before re-deriving the design.
+- **Attribution beat aggregation twice in a row.** f2.16 attacked the largest producer bucket (21 %)
+  and made things worse; f2.16b carried the reason down with the data and hit 100 %/100 %/100 % on
+  three successive questions. When a symptom and a cause live at different pipeline stages, spend
+  the plumbing to join them.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
