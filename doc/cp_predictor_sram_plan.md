@@ -2687,6 +2687,122 @@ Everything is DEAD at 0 and the shipped path is untouched, so nothing here is a 
 flip is a 15-const set (f2.13's F2-full plus `PRED_BLK`, `FTQ_DESC`, `PRED_BLK_COND`); shipping it —
 i.e. making it the default — is a user decision, as R3.3 and R3.2c were.
 
+## f2.16 — DELETING THE L0: hand-off for a clean context
+
+Written to be self-contained; start here in a fresh session, the way f2.7 / f2.13 / f2.15e were.
+User decision 2026-08-06: pursue f2.16 rather than the f2.15 ship gate.
+
+### The one-sentence job, and why it is not the obvious one
+
+`l0pred` is a **32-entry µBTB + 128-entry bimodal, async-read, four lookup ports** — the exact
+non-SRAM shape this whole campaign exists to remove, sitting in the fetch path. After f2.15e′ the
+run-ahead descriptor covers **63 %** of Stage-A takes, so deleting the L0 is finally thinkable.
+
+But "delete the L0" is not the increment. **The L0's one irreplaceable job is RETURNS**:
+
+```
+let l0_use_ras     = l0_hit && l0_is_ret && ras_spec_valid;   // the RAS peek
+let l0_pred_target = if l0_use_ras ? ras_spec_top : l0_target;
+let bct_take       = blk_tl_valid && !blk_tl_is_ret && !blk_tl_is_ind;  // descriptor DECLINES ret
+```
+
+The descriptor deliberately declines returns (a block entry stores the *last* return address, which is
+the value the RAS exists to replace) and indirects. Indirects are not a gap — the L0 declines them
+too (`!l0_is_ind`). **Returns are the whole gap**, and call/ret is a large share of unconditional
+transfers, so deleting the L0 today would put a Stage-B override bubble on every return.
+
+**⇒ f2.16 is: teach the descriptor returns, then delete the L0.** In that order.
+
+### The substrate is already built — do not build a new RAS
+
+`PRED_RAS_AHEAD` (f2.5d, DEAD at 0) is a complete run-ahead RAS: a third stack in `ras.veryl`
+(`i_pred_push/pop/push_addr/resync`, `o_pred_top`) with the resync-on-`pp_reseed` discipline already
+wired. Two things need rewiring for FTQ_DESC, and both have their substrate in place:
+
+| what | today | f2.16 |
+|---|---|---|
+| stack drive | `ras_pred_push = pp_advance && pp_ftb_hit && pp_ftb_is_call` (the **FTB**) | blkpred's tail slot: `blk_tl_is_call` / `blk_tl_is_ret`, on `pp_step` |
+| ret target | — | `ras_pred_top` feeds `pd_target` when `blk_tl_is_ret` |
+| consumer | — | `ftq_d_ret` / `ftq_d_call` are **already written** by f2.15d and read by nobody |
+
+Note `pp_ftb_is_call/is_ret` carry `PRED_RAS_AHEAD` and the FTB entry's kind bits, which are only
+trained under `ftb_ret_deliver` — all of that is the FTB path and is dead under FTQ_DESC. The
+blkpred tail slot already carries `is_call`/`is_ret`/`is_ind` and is trained from commit.
+
+**The known hazard, from f2.5d's own write-up:** a followed RETURN lands at the instruction *after*
+the call, i.e. almost always MID-dword, in the very dword the call was trained on. Without a re-entry
+guard the next run-ahead step re-reads that dword's CALL entry and jumps to the callee again — the
+predictor loop spins call→ret→call. f2.15e's `pp_no_ftb_q` / `pp_no_desc_q` guard now arms from the
+descriptor target's offset, which is exactly the right mechanism, but **verify it covers this case**
+before trusting it.
+
+### Do the census FIRST — what does the L0 still win?
+
+`FTQ_STATS` already counts Stage-A takes by source (`bd0` / `bd1` = descriptor, `l0tk` = L0-only).
+dhrystone at 262143 cycles, f2.15e′: `bd0=19526`, `bd1=3189`, `l0tk=13504` → 63 % descriptor.
+**Split `l0tk` by kind (ret / cond / uncond-missed) before building anything.** If returns dominate
+it, f2.16 is the RAS increment and the L0 falls out. If they do not, the premise needs re-examining.
+
+### Tree state — all DEAD at 0, shipped path untouched
+
+| commit | what |
+|---|---|
+| `965f396` | f2.15e — descriptor consumed at extract; producer two-stage + re-seed lookup bypass |
+| `f462ec7` | f2.15e′ — conditional block exits via per-slot 2-bit counters in the block entry |
+| `6e585c7` | f2.15f — full ladder green |
+| `3173224` | the N=4 gate measured (see traps) |
+
+The flip is a **15-const set**: `PRED_PIPE PRED_OVERRIDE PRED_HOLD_FREEZE PRED_L0_FAST L0_SLOT1
+FTB_OVERRIDE FTQ_DECOUPLE PRED_BLK FTQ_DESC PRED_BLK_COND` + `IBTB/BHT/BTB/TAGE_SYNC_READ` +
+`rob::PRED_OVERRIDE`. f2.16 adds `PRED_RAS_AHEAD` (already declared, `heliodor_core.veryl:424`).
+
+### Baselines to beat (f2.15e′, this tree)
+
+| workload | `=0` | **f2.15e′** |
+|---|---|---|
+| dhrystone | 252939 / instret 264834 | **264536** (+4.6 %) |
+| coremark | 367139 / instret 374357 | **402520** (+9.6 %) |
+| N=1 boot | `cy=00d9be30` 14.27 M | **`cy=00e09c00` 14.72 M** (+3.2 %) |
+| SMP N=2 | ~19.2 M | **`cy=012a4f30` 19.55 M** |
+| SMP N=4 | `cy=01c4e180` 29.68 M | **`cy=01baa850` 29.01 M** (inside the ±1 M band) |
+| litmus N=4 | — | **`cy=003bf790` 3.93 M**, pass |
+
+`instret` is the canary and must stay bit-exact. Default suite is 252/0 at both `=0` and the flip.
+
+### Do NOT re-measure these — already settled
+
+- **The f2.15 ladder above.** All five gates are green; see "f2.15f".
+- **F2-full does not boot Linux** (45 M timeout) — the arm f2.15e started from.
+- **`FTQ_DECOUPLE` without `FTB_OVERRIDE` DEADLOCKS** (instret 15): `l0_redir` flushed the WORD FIFO
+  but re-seeded nothing, and `f0_diverged` is gated off there.
+- **f2.6 does not apply to the block-entry direction counter** — no history, no index-resolution loss,
+  no extra stage. Do not re-litigate it.
+- **coremark is neutral on purpose**: `frontidl` −5544 vs `earlymis` +1117. The confidence gate
+  (`== 3`) is the lever; it is tuning, not structure, and was deliberately left alone.
+- **Run-ahead FTQ depth on its own is worth zero** (f2.14). It pays now only because the *prediction*
+  moved onto the run-ahead pointer.
+
+### Traps this campaign has paid for
+
+- 🚩 **The N=4 SMP boot gate takes ~75 minutes** (measured 4408 s at `=0`, 2026-08-05). CLAUDE.md said
+  "~10 min" from P9.1 until it was corrected; the cycle count had been refreshed over two months of
+  perf work while the runtime was not. **Budget over an hour.** More generally: an inherited number in
+  a workflow doc is not a measurement, and a plausible cause for a discrepancy is not a cause — both
+  got committed here before either was checked.
+- **`instret` is the canary, not `tohost`** — a skipped instruction still reports pass.
+- **A clocked array that supplies its own next index cannot run at one lookup per cycle.** Give the
+  pointer a speculative default and let the array only *re-steer* it (f2.15e's producer).
+- **A two-stage pipe must advance under ONE condition.** Freezing one stage and stepping the other is
+  how f2.15e's pointer silently duplicated entries.
+- **`f0_diverged` at a constant rate with a frozen `enq` is a stopped producer**, not a divergence
+  problem. Read `enq`/`pop` before `reseed`.
+- **When comparing against a CLOCKED array, delay the comparison operands** (cost an hour in f2.15c).
+- **Veryl**: module-level `let` requires definition before reference (forward-declare `var`s);
+  `$display` has no width specifiers (use `%d`); no dynamic array READ inside `always_ff`; relational
+  ops are `<:` `>:`; a sized literal wider than its type errors — use `'1` / `'0` fills.
+- **`veryl check` exits 1 on this tree from pre-existing `missing_reset_statement` warnings.** Diff
+  the warning *locations* against a clean tree rather than trusting the exit code.
+
 ### Corrections to the earlier f2.7 write-up
 
 - **S8.E is the EXPOSER, not the location.** At the confirmed mismatch `since_earl=255` — no early
