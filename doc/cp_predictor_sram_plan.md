@@ -3106,6 +3106,75 @@ which was the entire point. Held at 0. SMP N=4 not run: it would only price a kn
   costing an optimisation from a census, enumerate every precondition the fast path needs — not
   just the one that motivated the idea.
 
+## 🎉 f2.16c RESULT — the same descriptor, aimed at STRUCTURE, lands cycle-neutral with `l0tk` −66 %
+
+Measured 2026-08-07, straight after f2.16b's withdrawal. Same census, same descriptor, same branch
+population — and it works, because the target changed from "win cycles" to "move the L0's job onto
+a clocked table at no cost", which is what this campaign is actually for.
+
+### Why f2.16b failed and this does not — one wrong premise, twice
+
+| attempt | the premise | outcome |
+|---|---|---|
+| f2.16b (free take) | the branch target is buffered at head+2 | **untested.** False for a backward branch → SMP hang. Made a condition → only ~500 takes survive, gain gone |
+| f2.16c first try | "an ordinary redirect costs what the L0 costs" | **false.** dhrystone 290017 (+9.6 %), `ext_taken_redir` 0 → 8153, `f0_diverged` 988 → 9047 |
+| **f2.16c** | the descriptor supplies the PREDICTION; the redirect stays the L0's own cheap path | ✅ **neutral, `l0tk` −66 %** |
+
+The first try failed on a suppression whose premise had gone stale:
+
+```
+let l0_redir = … && !(FTQ_DESC && (bd_taken0 || bd_taken1));
+```
+
+That exists because a descriptor take needs no flush — the producer already fetched the target.
+True for `bd_taken0` / `bd_taken1s` (same dword), and for `bd_taken1n` only in the free-pop arm
+where head+2 is *proven* to hold the target. A **non-free** `bd_taken1n` caught by this suppression
+loses the cheap Stage-A re-steer and falls through to `ext_taken_redir` + `f0_diverged` — the
+expensive recovery net. Narrowing the suppression to the cases where its premise actually holds is
+the whole fix. The descriptor then provides only the prediction, and the redirect costs exactly what
+the L0 costs for the same branch — which is the thing being replaced.
+
+### Measured
+
+| gate | f2.15e′ | **f2.16c** |
+|---|---|---|
+| dhrystone | 264536 | **264037** (−0.19 %) |
+| coremark | 402520 | **402496** (−0.006 %) |
+| N=1 boot | `cy=00e09c00` 14.72 M | **`cy=00e04de0` 14.70 M** (−0.14 %) |
+| **SMP N=2 boot** | `cy=012a4f30` 19.55 M | **`cy=012a0110` 19.53 M** (−0.1 %), pass |
+| litmus N=4 | `cy=003bf790` | **identical**, pass |
+| default suite @ `=0` | 252/0 | **252/0** |
+
+`instret` bit-exact on both microbenchmarks. Front-end bookkeeping is consistent, which is what
+separates this from the f2.16b arm: `ext_taken_redir` **0** (was 8153), `f0_diverged` 990 vs 988,
+reseed total 27695 vs 27640.
+
+### The structural result
+
+| dhrystone @ cy 262143 | f2.15e′ | **f2.16c** |
+|---|---|---|
+| `l0tk` (L0-only Stage-A takes) | 13504 | **4549 (−66 %)** |
+| `s1cond` (the gap f2.16 found) | 9461 | **498** |
+| `bd0` / `bd1` | 19526 / 3189 | **19561 / 12673** |
+
+**Cycle-neutral, and two thirds of the L0's remaining work is now served by blkpred** — a clocked,
+tagged, 1R1W-shaped table instead of a 32-entry async-read four-port register file. That is the win
+condition for this campaign (see `feedback_heliodor_optimize_for_structure_not_cp`): structure
+forward at neutral cost, not IPC.
+
+What is left of `l0tk` = 4549: slot-0 conditional 1994, slot-0 unconditional 1007, return 511,
+slot-1 unconditional 539, slot-1 conditional 498. No single dominant bucket any more — deleting the
+L0 outright now needs the slot-0 residue, which is a different mechanism from this one.
+
+### Config
+
+`BD_SLOT1_NEXT=1` + `BDN_FREE_POP=0` is the arm above. Both fold away through
+`bd1n_hit`'s `&& FTQ_DESC && PRED_L0_FAST`, so the shipped `=0` path is untouched and neither joins
+the 15-const flip set. `BDN_FREE_POP=1` keeps the f2.16b free-take form (correct since the head+2
+fix, but worth only ~500 takes and +2.3 % on SMP N=2) as a measured, documented alternative.
+
+**Not run: SMP N=4** (~75 min). It is the remaining milestone gate for this arm.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
