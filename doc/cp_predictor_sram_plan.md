@@ -2919,9 +2919,11 @@ structural, and the re-seed path already has the combinational lookup bypass tha
 
 ## f2.16b RESULT — the gap is found and the mechanism works, but it BREAKS SMP BRINGUP (held DEAD)
 
-> **Read this box before the sections below.** The diagnosis in this section stands and is the most
-> valuable thing f2.16 produced. The *increment* does not: `BD_SLOT1_NEXT` passes every single-hart
-> gate and then hangs the N=2 SMP boot. It is held at **0**. See "⚠️ The SMP gate" at the end.
+> **Read this box before the sections below.** The DIAGNOSIS stands and is the most valuable thing
+> f2.16 produced. The INCREMENT does not, for two separate reasons that were found in this order:
+> it hung the N=2 SMP boot (root-caused below), and once fixed it no longer buys the coverage that
+> motivated it. **The "`l0tk` −66 %" headline was a product of the bug and is WITHDRAWN.**
+> `BD_SLOT1_NEXT` is held at **0**. See "⚠️ The SMP gate" and "The withdrawal" at the end.
 
 Measured 2026-08-07, immediately after f2.16. The f2.16 write-up ended by saying the next increment
 must ATTRIBUTE the 9461 slot-1 conditionals to their own producer-side cause rather than pick by
@@ -3014,10 +3016,65 @@ never arrives. A kernel `---[ end trace … ]---` also appears, absent from the 
 `BD_SLOT1_NEXT` is therefore held at **0**. It stays in the tree with the mechanism and the failure
 recorded, because the diagnosis above is worth keeping and the increment is worth finishing.
 
-**Not root-caused.** The next step is budget bisection — the technique that named R3.2c's atomic and
-f2.7's `epc` event — on the secondary hart's wake path. Two facts to start from: `trap1 == 0` says
-the wake never fires at all (not that it fires and is mishandled), and every single-hart gate
-including a cycle-identical litmus N=4 says the take itself is correct where one hart runs.
+### 🎯 ROOT CAUSE — the double pop assumed an invariant it never tested
+
+Budget bisection (a temporary `BDN_BUDGET` allowing only the first N takes per hart, since removed)
+named the event in six runs:
+
+| `BDN_BUDGET` | N=2 SMP boot |
+|---|---|
+| 0 (control) | `cy=012a4f30` 19.55 M, pass |
+| 1, 2, 3, 4 | `cy=012a4f30`, pass — **every field BIT-IDENTICAL to the control** |
+| **5** | **100 M timeout, pass=0** |
+
+Takes #1–#4 do not move a single cycle; take **#5** hangs the boot. Printing the first five and
+comparing the harmless ones against the culprit puts the difference on one field:
+
+```
+#4 (harmless): head=…d79b0  head+1=…d79b8  head+2=…d78f0 == target ✅  wf_count=4
+#5 (culprit):  head=…dd7c0  head+1=…dd7c8  head+2=…dd7d0 != target(…dd7ba) ❌  wf_count=2
+```
+
+**`ext_pop2` lands the head at head+2, so it assumes head+2 holds the branch target — and never
+tests it.** For a FORWARD branch the producer's sequential run-ahead happens to contain the target
+there, which is why four takes in a row were free and invisible. Take #5 is a **BACKWARD** branch:
+head+2 is the sequential successor instead. Worse, `wf_count == 2` means head+2 is not a live entry
+at all, and the `ext_buf_mismatch` correction added in f2.16b is gated on `wf_count >= 3` — so the
+one case that needed checking was precisely the one the check skipped. The head then points at the
+wrong dword with nothing to notice it.
+
+**Fix:** make the assumption a condition — `bd1n_hit` now also requires
+`wf_pc[head+2] == wf_d_target[head+1]` (and `wf_count >= 3`). Same shape as `f0_prefetched_target`
+for the ordinary taken path, one entry further along. With it the N=2 boot passes at
+`cy=013105f0` = 20.0 M.
+
+### The withdrawal — the fixed mechanism does not buy the coverage
+
+| dhrystone @ cy 262143 | f2.15e′ | f2.16b (buggy) | **f2.16b + fix** |
+|---|---|---|---|
+| `l0tk` | 13504 | 4135 | **13558** |
+| `bd1` | 3189 | 11162 | **3696** |
+| `s1cond` | 9461 | 452 | **9499** |
+
+**The `l0tk` −66 % was a product of the bug and is withdrawn.** The census measured that the
+DESCRIPTOR for a cross-dword slot-1 branch is present at head+1 in 8964 of 9461 cases — that part
+is true and still stands. But a FREE take needs the TARGET buffered at head+2 as well, and for a
+backward branch the producer has usually not put it there. Only ~500 extra takes survive the
+correct condition, and the −1497 cycles on dhrystone is exactly those ~500 takes × ~3 cycles.
+
+Final ladder with the fix (all `instret` bit-exact):
+
+| gate | f2.15e′ | **f2.16b + fix** |
+|---|---|---|
+| dhrystone | 264536 | **263039** (−0.57 %) |
+| coremark | 402520 | **401013** (−0.37 %) |
+| N=1 boot | 14.72 M | **14.70 M** (−0.14 %) |
+| litmus N=4 | `cy=003bf790` | **identical**, pass |
+| **SMP N=2 boot** | **19.55 M** | **20.0 M (+2.3 %)**, pass |
+| default suite @ `=0` | 252/0 | **252/0** |
+
+A ~0.5 % single-hart gain, a 2.3 % SMP cost, and **no structural progress on removing the L0** —
+which was the entire point. Held at 0. SMP N=4 not run: it would only price a knob that is off.
 
 ### Traps banked
 
@@ -3039,6 +3096,15 @@ including a cycle-identical litmus N=4 says the take itself is correct where one
   ~3 min. Run it before writing a result up, not after.
 - **State the arm a claim covers.** "Shipped path untouched, 252/0" was true and was also read as
   the increment being safe. It is safe only at `=0`; at the flip it hangs. Say which arm.
+- 🚩 **A headline measured on buggy RTL is not a result.** `l0tk` −66 % was real output from a real
+  counter, and it was an artifact of the very defect that hung SMP — the mechanism was "covering"
+  branches by mis-steering fetch. Numbers taken before the correctness gates are provisional; do
+  not promote one to a headline until the ladder that could invalidate it has run.
+- **"Already in the FIFO" needed two things, and the census only measured one.** The descriptor for
+  a cross-dword slot-1 branch is at head+1 (8964 / 9461, true). A FREE take also needs the TARGET
+  at head+2, which the census never checked and which usually fails for a backward branch. When
+  costing an optimisation from a census, enumerate every precondition the fast path needs — not
+  just the one that motivated the idea.
 
 ## Independence
 
