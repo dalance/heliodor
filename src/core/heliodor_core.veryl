@@ -2292,7 +2292,9 @@ pub module heliodor_core #(
     // dhrystone 290017 (+9.6 %) with ext 0 -> 8153 and div 988 -> 9047. Let it redirect like an L0
     // take of the same branch, which is exactly the cost it is meant to replace.
     let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && (l0e_taken || l0e_taken1) && !sb_override
-        && !(FTQ_DESC && (bd_taken0 || bd_taken1s || (BDN_FREE_POP && bd_taken1n)));
+        // f2.17: bd_why == 2 is a descriptor DELIVERED under the re-entry guard — the producer
+        // never followed it, so its target was not prefetched and the flush is required.
+        && !(FTQ_DESC && (bd_why != 3'd2) && (bd_taken0 || bd_taken1s || (BDN_FREE_POP && bd_taken1n)));
     let l0_redir_target: logic<64> = if l0e_taken ? l0e_target : l0e_target1;
     // f2.5a: the FTB read on the INDEPENDENT pc_pred pointer (the F2-full predictor loop) — the same
     // logic as f0_ftb_hit/f0_ftb_target but indexed by pc_pred, steering the next pc_pred + the FTQ
@@ -2573,7 +2575,29 @@ pub module heliodor_core #(
     // has a second source, pp_no_ftb_q under PRED_RAS_AHEAD (const-false in this arm); re-flipping
     // that would need its own term rather than riding on pp_ent_off_q, which carries only the
     // re-seed offset.
-    let pd_taken   : logic = FTQ_DESC && pp_desc_vld && (!pp_no_desc_q || PRED_BLK_REENT) && blk_hit && (bx_tail || bx_cond);
+    let pd_exit    : logic = FTQ_DESC && pp_desc_vld && blk_hit && (bx_tail || bx_cond);
+    let pd_taken   : logic = pd_exit && (!pp_no_desc_q || PRED_BLK_REENT);
+    // ── f2.17: DELIVER the guarded descriptor without FOLLOWING it ── DEAD at 0 ──
+    // The slot-0 census (doc §f2.17) put 1993 of the 3512 slot-0-only takes — 57 % — on the
+    // mid-dword re-entry guard. f2.16's PRED_BLK_REENT tried to relax that guard for the PRODUCER
+    // and was refuted: a slot offset trained under one decode alignment need not be an instruction
+    // boundary when the dword is re-entered at another, so following it steers fetch where extract
+    // never goes (ext_taken_redir 0 -> 1476).
+    //
+    // f2.16c showed the way around exactly this shape. Split the two jobs the descriptor does:
+    //   * FOLLOW (pd_taken) — the producer re-steers pc_pred. Still guarded, unchanged.
+    //   * DELIVER (pd_deliver) — extract may consult it. NOT guarded.
+    // Extract's own test is self-validating where the producer's is not: bd_taken0 requires
+    // `bd_off == ic_pc[2:1]`, and ic_pc IS an instruction boundary by construction — extract
+    // decoded its way there. Equal offsets on identical bytes means the SAME instruction, so the
+    // recorded transfer and its target apply. The decode-alignment hazard is a producer-side
+    // hazard only, and this increment never lets the producer act.
+    //
+    // Such a take is NOT free (the producer did not prefetch the target), so it must keep the
+    // ordinary cheap Stage-A re-steer instead of being caught by l0_redir's suppression — the very
+    // mistake that cost f2.16c its first attempt. bd_why == 2 marks these at extract.
+    const BD_REENT_DELIVER: bit = 1;
+    let pd_deliver : logic = if BD_REENT_DELIVER ? pd_exit : pd_taken;
     // ── f2.16b INSTRUMENTATION: the producer's own reason, travelling with the descriptor ──
     // f2.16 measured the producer's reasons as an AGGREGATE and then attacked the largest bucket,
     // which turned out not to be the bucket connected to the extract-side gap: the 9461 slot-1
@@ -2627,7 +2651,7 @@ pub module heliodor_core #(
     // is the FTQ head's when the queue holds one, and the arriving pd_* on a bypass — where F0 fetches
     // pp_cur directly, which is precisely the dword pd_* describes, so the two agree by construction.
     // Registered one cycle alongside wf_push_pc_q so it lands in the WORD FIFO with its own bytes.
-    let f0_d_taken : logic     = FTQ_DESC && (if ftq_count >= 4'd1 ? ftq_d_taken[ftq_head]  : pd_taken);
+    let f0_d_taken : logic     = FTQ_DESC && (if ftq_count >= 4'd1 ? ftq_d_taken[ftq_head]  : pd_deliver);
     let f0_d_target: logic<64> = if ftq_count >= 4'd1 ? ftq_d_target[ftq_head] : pd_target;
     let f0_d_off   : logic<2>  = if ftq_count >= 4'd1 ? ftq_d_off[ftq_head]    : pd_off;
     let f0_d_why   : logic<3>  = if ftq_count >= 4'd1 ? ftq_d_why[ftq_head]    : pd_why;
@@ -2905,7 +2929,7 @@ pub module heliodor_core #(
                     // f2.15d/e: park the run-ahead block prediction beside the address; f2.15e's
                     // consumer picks it up out of the WORD FIFO, having ridden along with its dword.
                     if FTQ_DESC {
-                        ftq_d_taken[ftq_tail]  = pd_taken;
+                        ftq_d_taken[ftq_tail]  = pd_deliver;
                         ftq_d_target[ftq_tail] = pd_target;
                         ftq_d_off[ftq_tail]    = pd_off;
                         ftq_d_why[ftq_tail]    = pd_why;
@@ -3305,6 +3329,18 @@ pub module heliodor_core #(
     var st_n1_off  : logic<32>; //   ... at exactly slot-1's halfword — fully recoverable
     var st_w_take  : logic<32>; // 0: the producer DID record a take — then bd_valid must be a
                                 //    delivery-path loss (bypass/head mismatch), not a prediction one
+    // f2.17: the SLOT-0 residue (cond 1994 + uncond 1007 of the 4549 left after f2.16c).
+    // Unlike the slot-1 case, bd_why here describes ic_pc's OWN dword, so the attribution is direct.
+    var st_s0_str  : logic<32>; // slot-0 delivery straddles the dword — descriptor cannot apply
+    var st_s0_nod  : logic<32>; // no taken descriptor for this dword at all
+    var st_s0_ofl  : logic<32>; // descriptor exit is BEFORE ic_pc — extract entered past it
+    var st_s0_ofg  : logic<32>; // descriptor exit is AFTER ic_pc — the L0 took an earlier transfer
+    var st_s0w_nv  : logic<32>; // of s0_nod, by producer reason: lookup invalidated
+    var st_s0w_gd  : logic<32>; //   mid-dword re-entry guard
+    var st_s0w_ut  : logic<32>; //   blkpred untrained (no entry for this dword)
+    var st_s0w_ev  : logic<32>; //   blkpred evicted / index-aliased
+    var st_s0w_wk  : logic<32>; //   entry hit, a conditional slot valid, none strong
+    var st_s0w_ot  : logic<32>; //   entry hit, nothing applicable / producer did record a take
     // nodesc measured at 100 % of that bucket, so the next question is at the PRODUCER: of the dwords
     // it describes, why does it record no taken exit? These partition every pp_step in priority order.
     var st_pp_step : logic<32>; // descriptors produced
@@ -3348,6 +3384,16 @@ pub module heliodor_core #(
             st_w_weak   = 32'd0;
             st_w_none   = 32'd0;
             st_w_evic   = 32'd0;
+            st_s0_str   = 32'd0;
+            st_s0_nod   = 32'd0;
+            st_s0_ofl   = 32'd0;
+            st_s0_ofg   = 32'd0;
+            st_s0w_nv   = 32'd0;
+            st_s0w_gd   = 32'd0;
+            st_s0w_ut   = 32'd0;
+            st_s0w_ev   = 32'd0;
+            st_s0w_wk   = 32'd0;
+            st_s0w_ot   = 32'd0;
             st_w_o0     = 32'd0;
             st_w_o1     = 32'd0;
             st_w_o2     = 32'd0;
@@ -3421,6 +3467,26 @@ pub module heliodor_core #(
                             st_l0cnd = st_l0cnd + 32'd1;
                         } else {
                             st_l0unc = st_l0unc + 32'd1;
+                        }
+                        // f2.17: why did the descriptor not cover this slot-0 take? bd_taken0 is
+                        // bd_valid && !straddle_q && (bd_off == ic_pc[2:1]) and we are in the
+                        // L0-only bucket, so these three arms partition the population exactly.
+                        if straddle_q {
+                            st_s0_str = st_s0_str + 32'd1;
+                        } else if !bd_valid {
+                            st_s0_nod = st_s0_nod + 32'd1;
+                            case bd_why {
+                                3'd1:    st_s0w_nv = st_s0w_nv + 32'd1;
+                                3'd2:    st_s0w_gd = st_s0w_gd + 32'd1;
+                                3'd3:    st_s0w_ut = st_s0w_ut + 32'd1;
+                                3'd6:    st_s0w_ev = st_s0w_ev + 32'd1;
+                                3'd4:    st_s0w_wk = st_s0w_wk + 32'd1;
+                                default: st_s0w_ot = st_s0w_ot + 32'd1;
+                            }
+                        } else if bd_off <: ic_pc[2:1] {
+                            st_s0_ofl = st_s0_ofl + 32'd1;
+                        } else {
+                            st_s0_ofg = st_s0_ofg + 32'd1;
                         }
                     } else if l0_is_cond2 {
                         st_l0s1c = st_l0s1c + 32'd1;
@@ -3514,6 +3580,9 @@ pub module heliodor_core #(
                     st_cy, st_w_o0, st_w_o1, st_w_o2, st_w_o3, st_tr_cond, st_tr_str);
                 $display("FTQ-S1NXT cy=%d of nodesc=%d: head+1 is s1 dword=%d taken=%d off-match=%d",
                     st_cy, st_s1_nod, st_n1_has, st_n1_take, st_n1_off);
+                $display("FTQ-S0WHY cy=%d slot0-only: straddle=%d nodesc=%d off-before=%d off-after=%d | nodesc by: nvld=%d guard=%d untrained=%d evicted=%d weak=%d other=%d",
+                    st_cy, st_s0_str, st_s0_nod, st_s0_ofl, st_s0_ofg,
+                    st_s0w_nv, st_s0w_gd, st_s0w_ut, st_s0w_ev, st_s0w_wk, st_s0w_ot);
                 $display("FTQ-PROD cy=%d step=%d take=%d nvld=%d nodesc=%d (recoverable=%d) miss=%d weak=%d nocond=%d",
                     st_cy, st_pp_step, st_pp_take, st_pp_nvld, st_pp_nod, st_pp_rcv, st_pp_miss,
                     st_pp_weak, st_pp_none);

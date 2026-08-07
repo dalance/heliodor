@@ -3175,6 +3175,83 @@ fix, but worth only ~500 takes and +2.3 % on SMP N=2) as a measured, documented 
 
 **Not run: SMP N=4** (~75 min). It is the remaining milestone gate for this arm.
 
+## 🎉 f2.17 RESULT — DELIVER the guarded descriptor without FOLLOWING it: `l0tk` −70 %, still neutral
+
+Measured 2026-08-07 after f2.16c. The census discipline was applied first this time, before any RTL.
+
+### The slot-0 census
+
+After f2.16c the residue is `l0tk` = 4549, of which slot-0 is 3512 (cond 1994 + uncond 1007 + ret
+511). Attributed through the same `d_why` plumbing — and here `bd_why` describes `ic_pc`'s OWN
+dword, so unlike the slot-1 case the reading is direct. The four arms sum to 3512:
+
+| slot-0-only take, why no descriptor | count | share |
+|---|---|---|
+| **mid-dword re-entry guard** | **1993** | **57 %** |
+| blkpred untrained | 507 | 14 % |
+| entry hit, no conditional slot strong | 501 | 14 % |
+| other | 511 | 15 % |
+| straddle / offset mismatch / lookup invalidated / evicted | **0** | — |
+
+Offsets are clean again (0 mismatches, 0 straddles); the whole residue is "no descriptor". And the
+dominant cause is **the same guard f2.16 attacked and was refuted by**.
+
+### Why it works this time — split the descriptor's two jobs
+
+`PRED_BLK_REENT` relaxed the guard for the **producer**, and the decode-alignment hazard killed it:
+a slot offset trained under one alignment need not be an instruction boundary when the dword is
+re-entered at another, so following it steers fetch where extract never goes. f2.16c then showed the
+general escape from that shape. Split what the descriptor does:
+
+* **FOLLOW** (`pd_taken`) — the producer re-steers `pc_pred`. **Still guarded, unchanged.**
+* **DELIVER** (`pd_deliver`) — extract may consult it. **Not guarded.**
+
+Extract's test is self-validating where the producer's is not. `bd_taken0` requires
+`bd_off == ic_pc[2:1]`, and `ic_pc` **is** an instruction boundary by construction — extract decoded
+its way there. Equal offsets over identical bytes is the same instruction, so the recorded transfer
+and its target apply. **The decode-alignment hazard is producer-side only, and this increment never
+lets the producer act.**
+
+Such a take is not free — the producer did not prefetch the target — so it must keep the ordinary
+cheap Stage-A re-steer rather than being caught by `l0_redir`'s suppression, which is precisely what
+cost f2.16c its first attempt. `bd_why == 2` marks a guard-delivered descriptor at extract and
+excludes it from the suppression.
+
+The measurement confirms the mechanism rather than just the outcome: the guard bucket halves
+(1993 → 998) and **498 reappear as `off-before`** — descriptors now delivered, examined, and
+correctly declined because their exit lies before `ic_pc` and is unreachable on this pass.
+
+### Measured
+
+| gate | f2.15e′ | f2.16c | **f2.17** |
+|---|---|---|---|
+| dhrystone | 264536 | 264037 | **263541** (−0.38 %) |
+| coremark | 402520 | 402496 | **402398** (−0.03 %) |
+| N=1 boot | 14.72 M | 14.70 M | **`cy=00dfd8b0` 14.67 M** (−0.34 %) |
+| **SMP N=2 boot** | `cy=012a4f30` 19.55 M | 19.53 M | **`cy=012a4f30` 19.55 M — exactly the baseline**, pass |
+| litmus N=4 | `cy=003bf790` 3.930 M | identical | **`cy=003bd080` 3.919 M** (−0.28 %), pass |
+| default suite @ `=0` | 252/0 | 252/0 | **252/0** |
+
+`instret` bit-exact on both microbenchmarks; `ext_taken_redir` **0**, `f0_diverged` 992 vs 988,
+reseed total 27754 vs 27640. litmus N=4 is no longer cycle-identical (it was under f2.16c) but
+passes with no forbidden outcome.
+
+| dhrystone @ cy 262143 | f2.15e′ | f2.16c | **f2.17** |
+|---|---|---|---|
+| `l0tk` | 13504 | 4549 | **4056 (−70 %)** |
+| slot-0 unconditional | 1005 | 1007 | **508** |
+| `bd0` / `bd1` | 19526 / 3189 | 19561 / 12673 | **20098 / 13194** |
+
+Slot-0 **unconditional** takes halve; slot-0 **conditional** does not move (1994 → 1997), because a
+conditional exit must also be the block's FIRST exit and reach `ctr == 3`. What remains of `l0tk`
+= 4056: slot-0 cond 1997, ret 512, slot-1 uncond 540, slot-1 cond 499, slot-0 uncond 508.
+
+### Config
+
+`BD_REENT_DELIVER=1`, on top of f2.16c's `BD_SLOT1_NEXT=1` + `BDN_FREE_POP=0`. All fold away with
+`FTQ_DESC`, so the shipped `=0` path is untouched and none joins the 15-const flip set.
+**Not run: SMP N=4** (~75 min) — still the outstanding milestone gate for this arm.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
