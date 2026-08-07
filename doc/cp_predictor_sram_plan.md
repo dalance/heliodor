@@ -2917,7 +2917,11 @@ structural, and the re-seed path already has the combinational lookup bypass tha
 - **The biggest bucket is not the connected bucket.** Attribute the symptom to its cause before
   building; an aggregate rate does not establish that the two populations overlap.
 
-## 🎉 f2.16b RESULT — the gap was a same-dword clause, and 66 % of it was already in the FIFO
+## f2.16b RESULT — the gap is found and the mechanism works, but it BREAKS SMP BRINGUP (held DEAD)
+
+> **Read this box before the sections below.** The diagnosis in this section stands and is the most
+> valuable thing f2.16 produced. The *increment* does not: `BD_SLOT1_NEXT` passes every single-hart
+> gate and then hangs the N=2 SMP boot. It is held at **0**. See "⚠️ The SMP gate" at the end.
 
 Measured 2026-08-07, immediately after f2.16. The f2.16 write-up ended by saying the next increment
 must ATTRIBUTE the 9461 slot-1 conditionals to their own producer-side cause rather than pick by
@@ -2987,8 +2991,33 @@ stream diverged. Two edits, in this order:
 result that matters for this campaign is **`l0tk` −66 %**: the L0's remaining job is what keeps a
 32-entry async-read four-port register file in the fetch path, and two thirds of it is now gone.
 
-`BD_SLOT1_NEXT` is left at **1** in master rather than added to the flip set — `bd1n_hit` is
-`&& FTQ_DESC && PRED_L0_FAST`, so it folds away with the arm and needs no separate entry.
+### ⚠️ The SMP gate — hart 1 never starts, and the control is exact
+
+The ladder above is the SINGLE-HART ladder, and it is uniformly green. The SMP gate is not:
+
+| gate | control (`BD_SLOT1_NEXT=0`, same arm) | **`=1`** |
+|---|---|---|
+| litmus N=4 | `cy=003bf790` 3.93 M, pass | **identical**, pass |
+| SMP N=2 boot | **`cy=012a4f30` 19.55 M, pass** | **never finishes; past 50 M and climbing** |
+| hart-1 PC @ cy 10.0 M | `ffffffff8005ed32` (kernel) | **`0000000000000514` (boot ROM)** |
+| hart-1 traps @ cy 10.0 M | 42 | **0** |
+
+The control is exact: same tree, same 15-const arm, only this const differs, and it reproduces
+`cy=012a4f30` — bit-identical to the f2.15e′ baseline. That also proves the `d_why` plumbing and
+`PRED_BLK_REENT=0` are behaviourally inert, so the difference is `BD_SLOT1_NEXT` and nothing else.
+
+**hart 1 never leaves the boot-ROM spin at 0x504-0x514, and `trap1` stays exactly 0 for the entire
+boot.** Not a slow bringup — a bringup that never starts. Both harts retire at a normal rate
+(aggregate IPC ≈ 1.06), so it is not a livelock either; hart 1 is spinning correctly on a flag that
+never arrives. A kernel `---[ end trace … ]---` also appears, absent from the control.
+
+`BD_SLOT1_NEXT` is therefore held at **0**. It stays in the tree with the mechanism and the failure
+recorded, because the diagnosis above is worth keeping and the increment is worth finishing.
+
+**Not root-caused.** The next step is budget bisection — the technique that named R3.2c's atomic and
+f2.7's `epc` event — on the secondary hart's wake path. Two facts to start from: `trap1 == 0` says
+the wake never fires at all (not that it fires and is mishandled), and every single-hart gate
+including a cycle-identical litmus N=4 says the take itself is correct where one hart runs.
 
 ### Traps banked
 
@@ -3002,6 +3031,14 @@ result that matters for this campaign is **`l0tk` −66 %**: the L0's remaining 
   and made things worse; f2.16b carried the reason down with the data and hit 100 %/100 %/100 % on
   three successive questions. When a symptom and a cause live at different pipeline stages, spend
   the plumbing to join them.
+- 🚩 **A front-end change can pass EVERY single-hart gate and still break SMP bringup.** Two
+  microbenchmarks with bit-exact `instret`, an N=1 boot, the 252-test default suite, and a
+  *cycle-identical* litmus N=4 all passed while hart 1 never started. `instret` is the canary for a
+  skipped instruction; it says nothing about a hart that never runs. **The N=2 SMP boot is not an
+  optional last rung — it is the first gate that exercises a second hart at all**, and it costs
+  ~3 min. Run it before writing a result up, not after.
+- **State the arm a claim covers.** "Shipped path untouched, 252/0" was true and was also read as
+  the increment being safe. It is safe only at `=0`; at the flip it hangs. Say which arm.
 
 ## Independence
 
