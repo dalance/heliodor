@@ -3252,6 +3252,42 @@ conditional exit must also be the block's FIRST exit and reach `ctr == 3`. What 
 `FTQ_DESC`, so the shipped `=0` path is untouched and none joins the 15-const flip set.
 **Not run: SMP N=4** (~75 min) — still the outstanding milestone gate for this arm.
 
+## f2.18 — PRICING THE DELETION: the objective, measured directly
+
+The campaign's objective is not `l0tk`. It is removing **`l0pred`** — a 32-entry µBTB + 128-entry
+bimodal with **four async lookup ports** in the fetch path, the exact non-SRAM shape this plan
+exists to eliminate. Driving `l0tk` from 13504 to 4056 across f2.16c/f2.17 buys **deletability, not
+deletion**: until `l0_taken` / `l0_taken1` are gone the module is still instantiated with every
+port, so area and CP are unchanged. Stating that plainly matters — three commits of "progress" had
+moved a counter, not a structure.
+
+`L0_STAGEA_OFF` (DEAD at 0) prices it directly: the L0 stops predicting at Stage-A entirely, the
+descriptor keeps its own, and everything else falls back to the Stage-B override. `l0pred`'s
+outputs then go unread (`l0e_target` is consulted only when `l0e_taken`, which reduces to
+`bd_taken0`) and the module DCEs.
+
+| dhrystone | L0 present | **L0 deleted** | cost of deletion |
+|---|---|---|---|
+| f2.15e′ (before f2.16c/f2.17) | 264536 | **280346** | **+6.0 %** |
+| f2.16c + f2.17 | 263541 | **270859** | **+2.8 %** |
+
+**The price of removing the L0 halved, +6.0 % → +2.8 %, and deleted-vs-deleted is 280346 → 270859
+= −3.4 %.** That is the structural result of the last two increments, stated in the currency the
+campaign actually spends. `l0tk` was a proxy; this is the thing itself.
+
+At `L0_STAGEA_OFF=1` the descriptor coverage is untouched (`bd0`/`bd1` 19584/13306 vs 20098/13194)
+and the 4056 former L0 takes reappear as Stage-B overrides: `sbov` 11058 → 14661, `earl`
+1148 → 1584, `ext` 0 → 483.
+
+**Only dhrystone has been measured in the deleted arm.** Deleting `l0pred` for real is a ship
+decision, not a measurement, and it needs the full ladder (coremark, N=1, SMP N=2, litmus N=4,
+suite) plus the removal of the instance and its ports.
+
+What still stands between here and a cheaper deletion is `l0tk` = 4056, whose largest bucket is now
+**slot-0 conditional (1997)**. That one is not plumbing: it is blkpred's conditional-slot structure
+— two slots, first-exit-only, `ctr == 3` only — so closing it needs a different mechanism from the
+f2.16c/f2.17 family.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
