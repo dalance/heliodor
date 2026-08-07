@@ -3279,9 +3279,49 @@ At `L0_STAGEA_OFF=1` the descriptor coverage is untouched (`bd0`/`bd1` 19584/133
 and the 4056 former L0 takes reappear as Stage-B overrides: `sbov` 11058 → 14661, `earl`
 1148 → 1584, `ext` 0 → 483.
 
-**Only dhrystone has been measured in the deleted arm.** Deleting `l0pred` for real is a ship
-decision, not a measurement, and it needs the full ladder (coremark, N=1, SMP N=2, litmus N=4,
-suite) plus the removal of the instance and its ports.
+### The full ladder in the deleted arm — and the microbenchmarks are the worst case
+
+All pass, `instret` bit-exact:
+
+| workload | f2.17 | **L0 deleted** | cost | vs f2.15e′ |
+|---|---|---|---|---|
+| dhrystone | 263541 | **270859** | +2.78 % | +2.39 % |
+| **coremark** | 402398 | **416738** | **+3.56 %** | +3.53 % |
+| N=1 Linux boot | `cy=00dfd8b0` 14.67 M | **`cy=00e13840` 14.76 M** | +0.61 % | **+0.27 %** |
+| SMP N=2 boot | `cy=012a4f30` 19.55 M | **`cy=012c9920` 19.70 M** | +0.77 %, pass | +0.77 % |
+| litmus N=4 | 3.919 M | **3.950 M** | +0.77 %, pass | — |
+
+**The real Linux boots pay 0.6–0.8 %; only the microbenchmarks pay 2.8–3.6 %.** The L0's value is
+concentrated in tight loops, and against the pre-campaign f2.15e′ baseline the N=1 boot costs
++0.27 % — very close to free. "+2.8 %" from the dhrystone-only measurement was the pessimistic
+reading of the price, not the representative one.
+
+### On recovering it later — partly, and with two measured cautions
+
+The cheap takes went first. Per-take, the deletion cost is already rising:
+
+| | takes | cost | **per take** |
+|---|---|---|---|
+| f2.15e′ | 13504 | 15810 cycles | 1.17 |
+| f2.16c + f2.17 | 4056 | 7318 cycles | **1.80** |
+
+The remaining takes cost **54 % more each** than those already covered, so the same family of
+increments will not recover at the same rate. Two identified paths do exist and are cheap —
+`PRED_RAS_AHEAD` is already built as substrate (returns, 512) and both the `ctr == 3` confidence
+gate (`weak`, 501) and blkpred's `IDX_W` (`untrained`, 507) are existing tuning knobs — plus a
+different lever entirely: making the Stage-B override cheaper (f2.5e's FTQ-driven prefetch /
+hit-under-miss), which does not fight the SRAM constraint.
+
+Against that: **one obvious recovery path is already known to be forbidden** — closing `nvld`
+(40182) needs `pd_target` fed back into `u_blkpred.i_pc`, an array-read → array-index path (see
+f2.15e's trap). And the descriptor is clocked and read early, so it structurally cannot see what an
+async Stage-A predictor could: a re-entry target the producer declined to follow, or a block's
+second conditional exit. There is a floor, and its height is not yet measured. **Treat recovery as
+upside, not as a premise for paying the price** — the thing being bought is the removal of a
+four-port async RF from the fetch path.
+
+Deleting `l0pred` for real is a ship decision, not a measurement: it needs the instance and its
+ports removed from the RTL, not just `L0_STAGEA_OFF=1`. Area and CP only move at that point.
 
 What still stands between here and a cheaper deletion is `l0tk` = 4056, whose largest bucket is now
 **slot-0 conditional (1997)**. That one is not plumbing: it is blkpred's conditional-slot structure
