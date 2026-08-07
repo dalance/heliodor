@@ -1294,67 +1294,20 @@ pub module heliodor_core #(
     var ibtb_target : logic<64>;
     var ibtb_hit2   : logic    ;
     var ibtb_target2: logic<64>;
-    // ── F1 option (B): L0 fast predictor (PRED_L0_FAST) — DEAD at 0 ──
-    // The overriding-predictor fast path (l0pred.veryl, cp_predictor_sram_plan.md "F1
-    // option (B)"). Under PRED_OVERRIDE the full BTB/BHT/TAGE are CLOCKED and resolve at
-    // Stage-B, so a bare Stage-A advances sequentially and pays a +1 override bubble on
-    // every taken-cond / return / indirect (the +48% inversion IPC cost). This small
-    // async-read L0 gives Stage-A a fast first guess: it predicts the taken target
-    // combinationally, Stage-A advances there + re-steers F0 (b.2), and the clocked full
-    // predictor at Stage-B OVERRIDES only on disagreement (b.3). Requires the full
-    // variant-A flip set (PRED_OVERRIDE + *_SYNC_READ + PRED_HOLD_FREEZE + rob::PRED_OVERRIDE);
-    // joins it as the 9th const. DEAD at 0: the module trains only under PRED_L0_FAST
-    // (reset-only → DCE) and every consumer folds via `if PRED_L0_FAST` → byte-identical.
+    // ── F1 option (B) → f2.19: the Stage-A FAST PREDICTION path (PRED_L0_FAST) — DEAD at 0 ──
+    // Under PRED_OVERRIDE the full BTB/BHT/TAGE are CLOCKED and resolve at Stage-B, so a bare
+    // Stage-A advances sequentially and pays a +1 override bubble on every taken transfer. This
+    // const enables a Stage-A first guess so it does not.
+    //
+    // That guess USED to come from l0pred: a 32-entry uBTB + 128-entry bimodal, async-read, FOUR
+    // lookup ports, in the fetch path — the exact non-SRAM shape this plan exists to remove.
+    // f2.19 DELETED it. The guess now comes entirely from the run-ahead block descriptor
+    // (bd_taken0 / bd_taken1, below): 4096 dword entries, tagged, CLOCKED, 1R1W-shaped, read at
+    // pc_pred with the FTQ absorbing the latency. See doc/cp_predictor_sram_plan.md f2.16c/f2.17
+    // for how the descriptor took over the L0's remaining work, and f2.18 for what the deletion
+    // costs. PRED_L0_FAST now gates the descriptor's Stage-A consumption and the l0_redir re-steer;
+    // the l0_* naming is kept where it refers to that PATH rather than to the deleted module.
     const PRED_L0_FAST: bit = 0;
-    var l0_hit          : logic    ;
-    var l0_target       : logic<64>;
-    var l0_is_cond      : logic    ;
-    var l0_is_ret       : logic    ;
-    var l0_is_ind       : logic    ;
-    var l0_bimodal_strong: logic   ;
-    var l0_hit2          : logic   ;
-    var l0_target2       : logic<64>;
-    var l0_is_cond2      : logic   ;
-    var l0_is_ret2       : logic   ;
-    var l0_is_ind2       : logic   ;
-    var l0_bimodal_strong2: logic  ;
-    // Combine (mirrors predicted_taken / pred_target below, minus the iBTB): a return takes the
-    // RAS peek; a non-return indirect is NOT predicted by L0 (falls through → Stage-B override);
-    // a conditional is taken ONLY when the L0 bimodal is STRONG-taken (else it falls through to
-    // the full TAGE at Stage-B — a weak L0 direction must not double-bubble a hard branch).
-    // Slot-0 only (L0 reads ic_pc).
-    // L0_PRED_COND: whether the L0 predicts CONDITIONAL branches (strong-bimodal) at all. Even a
-    // strong-bimodal L0 direction can disagree with the full TAGE on a context-dependent branch,
-    // double-bubbling it (l0_redir to the wrong side + Stage-B correct). =0 restricts the L0 to
-    // UNCONDITIONAL + RETURN (where it can never disagree with the full on direction), so it can
-    // only ever help; =1 also takes strong-bimodal conditionals (loops). Measurement knob.
-    const L0_PRED_COND: bit = 1;
-    let l0_use_ras    : logic     = l0_hit && l0_is_ret && ras_spec_valid;
-    // f2.6: with TAGE at Stage-A the L0's conditional direction becomes the REAL TAGE — the same
-    // value Stage-B replays (a_tage_*) — so an L0-taken conditional can no longer disagree with the
-    // full prediction on direction, which is what double-bubbled option (B)'s cond-ON. On a TAGE MISS
-    // the L0 declines to take (Stage-B falls back to the clocked BHT, which Stage-A cannot see): that
-    // costs the ordinary single override bubble, never a double one. Folds to the L0 bimodal at
-    // TAGE_STAGEA=0 → option (B) behaviour byte-for-byte.
-    // Use TAGE when it HITS (then Stage-B replays the same value → agreement by construction) and
-    // fall back to the L0 bimodal when it misses — TAGE only allocates on mispredicts, so a simple
-    // loop back-edge is often a TAGE miss that the bimodal predicts perfectly well. Sourcing the
-    // direction from TAGE ALONE measured slightly WORSE than the bimodal alone (dhrystone 299899 vs
-    // 298401) precisely because it declines to take those. This combined form dominates both.
-    let l0_cond_taken : logic     = if TAGE_STAGEA ? (if tage_hit ? tage_taken : (L0_PRED_COND && l0_bimodal_strong)) : (L0_PRED_COND && l0_bimodal_strong);
-    // ── f2.18 PROBE: what does DELETING the L0 cost, right now? ── DEAD at 0 ──
-    // The campaign's objective is not l0tk. It is removing l0pred itself — a 32-entry uBTB +
-    // 128-entry bimodal with FOUR async lookup ports sitting in the fetch path, the exact non-SRAM
-    // shape this plan exists to eliminate. Driving l0tk down (13504 -> 4056 across f2.16c/f2.17)
-    // buys DELETABILITY, not deletion: until l0_taken/l0_taken1 are gone the module is still
-    // instantiated with every port, so area and CP are unchanged.
-    // At 1 the L0 stops making Stage-A predictions entirely; the descriptor keeps its own, and
-    // everything the L0 still covered falls back to the Stage-B override. l0pred's outputs then go
-    // unread (l0e_target is only consulted when l0e_taken, which reduces to bd_taken0) and the
-    // module DCEs. This prices the deletion directly instead of arguing about it.
-    const L0_STAGEA_OFF: bit = 0;
-    let l0_taken      : logic     = !L0_STAGEA_OFF && l0_hit && !l0_is_ind && (!l0_is_cond || l0_cond_taken);
-    let l0_pred_target: logic<64> = if l0_use_ras ? ras_spec_top : l0_target;
     // ── f2.15e: THE RUN-AHEAD BLOCK PREDICTION, CONSUMED ── DEAD at FTQ_DESC=0 ──
     // This is the L0's job — give Stage-A a first guess so it does not advance sequentially past a
     // taken transfer and pay a Stage-B override bubble — done from a fundamentally better source. The
@@ -1383,13 +1336,14 @@ pub module heliodor_core #(
     let bd_taken0: logic     = bd_valid && !straddle_q && (bd_off == ic_pc[2:1]);
     // The effective Stage-A prediction: the descriptor where it speaks, the L0 elsewhere (it still
     // owns conditionals, which the tail-slot-only descriptor does not describe).
-    let l0e_taken : logic     = if FTQ_DESC ? (bd_taken0 || l0_taken) : l0_taken;
-    let l0e_target: logic<64> = if (FTQ_DESC && bd_taken0) ? bd_target : l0_pred_target;
+    // The effective Stage-A prediction. Descriptor-only since f2.19 (the L0 that used to supply
+    // the other arm is gone), so it folds to nothing at FTQ_DESC=0 exactly as the whole arm does.
+    let l0e_taken : logic     = FTQ_DESC && bd_taken0;
+    let l0e_target: logic<64> = bd_target;
     // f2.9: slot-1 conditional direction, from the L0's own bimodal read on the
     // slot-1 PC (port 2). Same strong-only rule as slot 0 — see o_bimodal_strong in
-    // l0pred for why an unconfident fast direction is worse than declining. TAGE is
+    // the deleted l0pred for why an unconfident fast direction is worse than declining. TAGE is
     // not consulted here: TAGE_STAGEA's Stage-A read is slot-0's.
-    let l0_cond_taken1: logic     = L0_PRED_COND && l0_bimodal_strong2;
     // A conditional branch is predicted taken per the direction predictor
     // (TAGE over base BHT); JAL/JALR/call/ret (is_cond=0) are predicted
     // taken on any BTB hit.
@@ -1467,7 +1421,7 @@ pub module heliodor_core #(
     // up slot 0, so a taken SLOT-1 branch paid a Stage-B override bubble
     // unconditionally — measured as 67 % (dhrystone) / 68 % (coremark) of ALL
     // override bubbles, far more than the L0's own slot-0 coverage gap. Give Stage-A
-    // the same 0-bubble first guess for slot 1: predict it from the l0pred's second
+    // the same 0-bubble first guess for slot 1: originally from the l0pred's second
     // async read port (on s1_pc), advance there, and let the clocked full predictor
     // override at Stage-B only on DISAGREEMENT — exactly the slot-0 protocol.
     //
@@ -1535,8 +1489,6 @@ pub module heliodor_core #(
     // produce-INDEPENDENT (like l0_taken) so ext_eff_next's every-cycle consumers
     // (f0_diverged / ext_exp_next) see the same shape they always did.
     let l0_slot1_deliv: logic = slot1_valid && (fb_free >= 4'd2);
-    let l0_taken1     : logic = !L0_STAGEA_OFF && L0_SLOT1 && PRED_L0_FAST && !l0e_taken && l0_slot1_deliv
-        && l0_hit2 && !l0_is_ind2 && !l0_is_ret2 && (!l0_is_cond2 || l0_cond_taken1);
     // f2.15e: the descriptor covers slot 1 with the SAME entry — a block predictor predicts the first
     // taken transfer in the dword and does not care which slot it lands in, which is why the f2.15
     // census could count the ~8020 slot-1 overrides (47 % of the population) as covered for free
@@ -1614,8 +1566,8 @@ pub module heliodor_core #(
     let bd_taken1n : logic     = bd1n_hit && L0_SLOT1 && !l0e_taken && l0_slot1_deliv && !straddle_q
         && (s1_pc[63:3] != ic_pc[63:3]) && (wf_d_off[wf_head + 3'd1] == s1_pc[2:1]);
     let bd_taken1  : logic     = bd_taken1s || bd_taken1n;
-    let l0e_taken1 : logic     = if FTQ_DESC ? (bd_taken1 || l0_taken1) : l0_taken1;
-    let l0e_target1: logic<64> = if (FTQ_DESC && bd_taken1n) ? bd1n_target : if (FTQ_DESC && bd_taken1s) ? bd_target : l0_target2;
+    let l0e_taken1 : logic     = FTQ_DESC && bd_taken1;
+    let l0e_target1: logic<64> = if bd_taken1n ? bd1n_target : bd_target;
     let fb_tail1: logic<3> = fb_tail + 3'd1; // slot-1 write index (wraps mod 8)
     // ── F1 order-item-2: Stage-B skid drain / accept (PRED_PIPE) ──
     // Stage-B (the a_* skid register) drains its held bundle into the fetch buffer when the
@@ -1944,33 +1896,6 @@ pub module heliodor_core #(
     // F1 option (B): L0 fast predictor instance (see PRED_L0_FAST above). Read on the
     // Stage-A fetch PC (ic_pc); trained at commit from the same taken-control / cond
     // stream as the full BTB/BHT, gated by PRED_L0_FAST (reset-only → module DCE at 0).
-    inst u_l0pred: l0pred (
-        clk                                               ,
-        rst                                               ,
-        i_pc2              : s1_pc                        ,
-        o_hit2             : l0_hit2                      ,
-        o_target2          : l0_target2                   ,
-        o_is_cond2         : l0_is_cond2                  ,
-        o_is_ret2          : l0_is_ret2                   ,
-        o_is_ind2          : l0_is_ind2                   ,
-        o_bimodal_strong2  : l0_bimodal_strong2           ,
-        i_pc               : ic_pc                        ,
-        o_hit              : l0_hit                       ,
-        o_target           : l0_target                    ,
-        o_is_cond          : l0_is_cond                   ,
-        o_is_ret           : l0_is_ret                    ,
-        o_is_ind           : l0_is_ind                    ,
-        o_bimodal_strong   : l0_bimodal_strong            ,
-        i_btb_train_en     : PRED_L0_FAST && btb_train_en ,
-        i_btb_train_pc     : bp_train_pc                  ,
-        i_btb_train_target : btb_train_target             ,
-        i_btb_train_is_cond: btb_train_is_cond            ,
-        i_btb_train_is_ret : btb_train_is_ret             ,
-        i_btb_train_is_ind : btb_train_is_ind             ,
-        i_bht_train_en     : PRED_L0_FAST && bht_train_en ,
-        i_bht_train_pc     : bp_train_pc                  ,
-        i_bht_train_taken  : bht_train_taken              ,
-    );
 
     // o_imem_addr / o_imem_ren driven below (after imem_mmu inst). The
     // imem_mmu's i_vaddr is the fetch address — advances ahead of pc_q
@@ -3052,7 +2977,6 @@ pub module heliodor_core #(
     var bc_tot  : logic<32>; // committed taken control transfers
     var bc_ent  : logic<32>; // ... whose dword has an entry at all (tag hit)
     var bc_cov  : logic<32>; // ... AND a slot matching this branch's offset  = real coverage
-    var bc_l0   : logic<32>; // ... that the 32-entry L0 micro-BTB would have had, for comparison
     var bc_free : logic<32>; // coverage misses where the entry existed WITH a free slot
     var bc_tr   : logic<32>; // blkpred train events (must equal the BTB's)
     // The blkpred read is indexed by the CURRENT ic_pc; to ask about the committing branch we read
@@ -3063,7 +2987,6 @@ pub module heliodor_core #(
     // stale prediction against a fresh branch and undercounts coverage badly.
     var bc_pc_q : logic<64>;
     var bc_btb_q: logic    ;
-    var bc_l0_q : logic    ;
     let bc_dw_hit: logic = blk_hit && (
         (blk_b0_valid && (blk_b0_off == bc_pc_q[2:1]))
      || (blk_b1_valid && (blk_b1_off == bc_pc_q[2:1]))
@@ -3075,17 +2998,14 @@ pub module heliodor_core #(
             bc_tot   = 32'd0;
             bc_ent   = 32'd0;
             bc_cov   = 32'd0;
-            bc_l0    = 32'd0;
             bc_free  = 32'd0;
             bc_tr    = 32'd0;
             bc_pc_q  = 64'd0;
             bc_btb_q = 1'b0;
-            bc_l0_q  = 1'b0;
         } else if BLKC_STATS {
             bc_cy    = bc_cy + 32'd1;
             bc_pc_q  = ic_pc;
             bc_btb_q = btb_hit;
-            bc_l0_q  = l0_hit;
             // Sampled on the FETCH side: for every dword extract is presenting that actually holds a
             // control transfer the full BTB knows about, did the block predictor know it too?
             if bc_btb_q {
@@ -3095,9 +3015,6 @@ pub module heliodor_core #(
                 }
                 if bc_dw_hit {
                     bc_cov = bc_cov + 32'd1;
-                }
-                if bc_l0_q {
-                    bc_l0 = bc_l0 + 32'd1;
                 }
                 // Diagnostic: the entry is present but this branch is not in it, AND a slot was
                 // free. With dhrystone measured at zero within-dword aliasing there is no capacity
@@ -3120,7 +3037,7 @@ pub module heliodor_core #(
                 bc_tr = bc_tr + 32'd1;
             }
             if bc_cy[15:0] == 16'hffff {
-                $display("BLKC cy=%d btb=%d blk_ent=%d blk_cov=%d free=%d tr=%d l0=%d", bc_cy, bc_tot, bc_ent, bc_cov, bc_free, bc_tr, bc_l0);
+                $display("BLKC cy=%d btb=%d blk_ent=%d blk_cov=%d free=%d tr=%d", bc_cy, bc_tot, bc_ent, bc_cov, bc_free, bc_tr);
             }
         }
     }
@@ -3296,62 +3213,27 @@ pub module heliodor_core #(
     var st_rs_l0   : logic<32>;
     var st_bd0     : logic<32>;
     var st_bd1     : logic<32>;
-    var st_l0tk    : logic<32>;
     // f2.16 census: the same L0-only population, split by KIND. The descriptor declines returns
     // (a block entry holds the LAST return address — the value a RAS exists to replace) and
     // indirects (where the L0 declines too), so the split says whether the remaining 37 % is the
     // return gap the run-ahead RAS closes, or something else entirely. Measure before building.
-    var st_l0ret   : logic<32>; // slot-0: return
-    var st_l0cnd   : logic<32>; // slot-0: conditional
-    var st_l0unc   : logic<32>; // slot-0: unconditional, non-return (jal / call)
-    var st_l0s1c   : logic<32>; // slot-1: conditional
-    var st_l0s1u   : logic<32>; // slot-1: unconditional (slot-1 declines ret outright)
     // The census said slot-1 conditionals are 70 % of the residual, so this splits THAT bucket by
     // why the descriptor declined it: no taken exit recorded for the dword at all, versus an exit
     // recorded at a different halfword than slot-1's. The two answers point at opposite fixes.
-    var st_s1_nod  : logic<32>; // !bd_valid — the block entry predicted no taken exit for this dword
-    var st_s1_off  : logic<32>; // bd_valid but the exit offset is not slot-1's
-    var st_s1_oth  : logic<32>; // offset matches — blocked by straddle / cross-dword slot-1
     // f2.16b: the same nodesc bucket, attributed to the PRODUCER's own reason for THIS dword
     // (bd_why, carried down with the descriptor) instead of to an aggregate producer rate.
-    var st_w_nvld  : logic<32>; // 1: the run-ahead lookup for this dword was invalidated
-    var st_w_nod   : logic<32>; // 2: the mid-dword re-entry guard dropped it
-    var st_w_miss  : logic<32>; // 3: blkpred tag miss — no entry for this dword
-    var st_w_weak  : logic<32>; // 4: entry hit, a conditional slot is valid, none strong
-    var st_w_none  : logic<32>; // 5: entry hit, nothing applicable recorded
-    var st_w_evic  : logic<32>; // 6: MISS with the valid bit SET — evicted or index-aliased
     // f2.16b: WHERE in the dword the untrained slot-1 conditional sits. blkpred's train excludes a
     // 32-bit transfer at halfword 3 (blk_train_straddle) because its bytes cross into the next
     // dword, so it can never be that dword's exit. If this histogram piles up at 3, the gap is
     // structural — a per-dword block entry cannot describe a branch that straddles the boundary.
-    var st_w_o0    : logic<32>;
-    var st_w_o1    : logic<32>;
-    var st_w_o2    : logic<32>;
-    var st_w_o3    : logic<32>;
     // The same population counted at its SOURCE: committed conditionals the train refuses.
-    var st_tr_str  : logic<32>;
-    var st_tr_cond : logic<32>;
     // f2.16b: the histogram landed 100 % at halfword 0, which means slot-1 is at the START of a
     // dword — so it is in the NEXT dword, and bd_taken1's `s1_pc[63:3] == ic_pc[63:3]` excludes it
     // by construction. The descriptor that DOES describe it is one WORD-FIFO entry along. Measure
     // how much of the gap that entry would close, before building anything.
-    var st_n1_has  : logic<32>; // head+1 is present and is s1_pc's dword
-    var st_n1_take : logic<32>; //   ... and its descriptor records a taken exit
-    var st_n1_off  : logic<32>; //   ... at exactly slot-1's halfword — fully recoverable
-    var st_w_take  : logic<32>; // 0: the producer DID record a take — then bd_valid must be a
                                 //    delivery-path loss (bypass/head mismatch), not a prediction one
     // f2.17: the SLOT-0 residue (cond 1994 + uncond 1007 of the 4549 left after f2.16c).
     // Unlike the slot-1 case, bd_why here describes ic_pc's OWN dword, so the attribution is direct.
-    var st_s0_str  : logic<32>; // slot-0 delivery straddles the dword — descriptor cannot apply
-    var st_s0_nod  : logic<32>; // no taken descriptor for this dword at all
-    var st_s0_ofl  : logic<32>; // descriptor exit is BEFORE ic_pc — extract entered past it
-    var st_s0_ofg  : logic<32>; // descriptor exit is AFTER ic_pc — the L0 took an earlier transfer
-    var st_s0w_nv  : logic<32>; // of s0_nod, by producer reason: lookup invalidated
-    var st_s0w_gd  : logic<32>; //   mid-dword re-entry guard
-    var st_s0w_ut  : logic<32>; //   blkpred untrained (no entry for this dword)
-    var st_s0w_ev  : logic<32>; //   blkpred evicted / index-aliased
-    var st_s0w_wk  : logic<32>; //   entry hit, a conditional slot valid, none strong
-    var st_s0w_ot  : logic<32>; //   entry hit, nothing applicable / producer did record a take
     // nodesc measured at 100 % of that bucket, so the next question is at the PRODUCER: of the dwords
     // it describes, why does it record no taken exit? These partition every pp_step in priority order.
     var st_pp_step : logic<32>; // descriptors produced
@@ -3380,41 +3262,6 @@ pub module heliodor_core #(
             st_rs_l0    = 32'd0;
             st_bd0      = 32'd0;
             st_bd1      = 32'd0;
-            st_l0tk     = 32'd0;
-            st_l0ret    = 32'd0;
-            st_l0cnd    = 32'd0;
-            st_l0unc    = 32'd0;
-            st_l0s1c    = 32'd0;
-            st_l0s1u    = 32'd0;
-            st_s1_nod   = 32'd0;
-            st_s1_off   = 32'd0;
-            st_s1_oth   = 32'd0;
-            st_w_nvld   = 32'd0;
-            st_w_nod    = 32'd0;
-            st_w_miss   = 32'd0;
-            st_w_weak   = 32'd0;
-            st_w_none   = 32'd0;
-            st_w_evic   = 32'd0;
-            st_s0_str   = 32'd0;
-            st_s0_nod   = 32'd0;
-            st_s0_ofl   = 32'd0;
-            st_s0_ofg   = 32'd0;
-            st_s0w_nv   = 32'd0;
-            st_s0w_gd   = 32'd0;
-            st_s0w_ut   = 32'd0;
-            st_s0w_ev   = 32'd0;
-            st_s0w_wk   = 32'd0;
-            st_s0w_ot   = 32'd0;
-            st_w_o0     = 32'd0;
-            st_w_o1     = 32'd0;
-            st_w_o2     = 32'd0;
-            st_w_o3     = 32'd0;
-            st_tr_str   = 32'd0;
-            st_tr_cond  = 32'd0;
-            st_n1_has   = 32'd0;
-            st_n1_take  = 32'd0;
-            st_n1_off   = 32'd0;
-            st_w_take   = 32'd0;
             st_pp_step  = 32'd0;
             st_pp_nvld  = 32'd0;
             st_pp_nod   = 32'd0;
@@ -3466,86 +3313,9 @@ pub module heliodor_core #(
                 if bd_taken1 {
                     st_bd1 = st_bd1 + 32'd1;
                 }
-                if (l0e_taken || l0e_taken1) && !bd_taken0 && !bd_taken1 {
-                    st_l0tk = st_l0tk + 32'd1;
-                    // f2.16 kind split. With !bd_taken0 the l0e_* muxes collapse to the raw L0
-                    // takes, and l0_taken1 already requires !l0e_taken, so the two arms partition
-                    // this population exactly — the five counters must sum to l0tk (self-check).
-                    if l0_taken {
-                        if l0_is_ret {
-                            st_l0ret = st_l0ret + 32'd1;
-                        } else if l0_is_cond {
-                            st_l0cnd = st_l0cnd + 32'd1;
-                        } else {
-                            st_l0unc = st_l0unc + 32'd1;
-                        }
-                        // f2.17: why did the descriptor not cover this slot-0 take? bd_taken0 is
-                        // bd_valid && !straddle_q && (bd_off == ic_pc[2:1]) and we are in the
-                        // L0-only bucket, so these three arms partition the population exactly.
-                        if straddle_q {
-                            st_s0_str = st_s0_str + 32'd1;
-                        } else if !bd_valid {
-                            st_s0_nod = st_s0_nod + 32'd1;
-                            case bd_why {
-                                3'd1:    st_s0w_nv = st_s0w_nv + 32'd1;
-                                3'd2:    st_s0w_gd = st_s0w_gd + 32'd1;
-                                3'd3:    st_s0w_ut = st_s0w_ut + 32'd1;
-                                3'd6:    st_s0w_ev = st_s0w_ev + 32'd1;
-                                3'd4:    st_s0w_wk = st_s0w_wk + 32'd1;
-                                default: st_s0w_ot = st_s0w_ot + 32'd1;
-                            }
-                        } else if bd_off <: ic_pc[2:1] {
-                            st_s0_ofl = st_s0_ofl + 32'd1;
-                        } else {
-                            st_s0_ofg = st_s0_ofg + 32'd1;
-                        }
-                    } else if l0_is_cond2 {
-                        st_l0s1c = st_l0s1c + 32'd1;
-                        if !bd_valid {
-                            st_s1_nod = st_s1_nod + 32'd1;
-                            // f2.16b: attribute THIS dword, not the aggregate.
-                            case bd_why {
-                                3'd0:    st_w_take = st_w_take + 32'd1;
-                                3'd1:    st_w_nvld = st_w_nvld + 32'd1;
-                                3'd2:    st_w_nod = st_w_nod + 32'd1;
-                                3'd3:    st_w_miss = st_w_miss + 32'd1;
-                                3'd4:    st_w_weak = st_w_weak + 32'd1;
-                                3'd6:    st_w_evic = st_w_evic + 32'd1;
-                                default: st_w_none = st_w_none + 32'd1;
-                            }
-                            // Would the NEXT dword's descriptor have covered this branch?
-                            if (wf_count >= 4'd2) && (wf_pc[wf_head_p1][63:3] == s1_pc[63:3]) {
-                                st_n1_has = st_n1_has + 32'd1;
-                                if wf_d_taken[wf_head_p1] {
-                                    st_n1_take = st_n1_take + 32'd1;
-                                    if wf_d_off[wf_head_p1] == s1_pc[2:1] {
-                                        st_n1_off = st_n1_off + 32'd1;
-                                    }
-                                }
-                            }
-                            if bd_why == 3'd3 {
-                                case s1_pc[2:1] {
-                                    2'd0:    st_w_o0 = st_w_o0 + 32'd1;
-                                    2'd1:    st_w_o1 = st_w_o1 + 32'd1;
-                                    2'd2:    st_w_o2 = st_w_o2 + 32'd1;
-                                    default: st_w_o3 = st_w_o3 + 32'd1;
-                                }
-                            }
-                        } else if bd_off != s1_pc[2:1] {
-                            st_s1_off = st_s1_off + 32'd1;
-                        } else {
-                            st_s1_oth = st_s1_oth + 32'd1;
-                        }
-                    } else {
-                        st_l0s1u = st_l0s1u + 32'd1;
-                    }
-                }
             }
-            // The train's own view: committed conditionals, and how many the straddle gate refuses.
             if bht_train_en {
-                st_tr_cond = st_tr_cond + 32'd1;
                 if blk_train_straddle {
-                    st_tr_str = st_tr_str + 32'd1;
                 }
             }
             // Producer-side census: for every descriptor the producer commits to, why is there no
@@ -3578,22 +3348,10 @@ pub module heliodor_core #(
                 }
             }
             if st_cy[15:0] == 16'hffff {
-                $display("FTQ cy=%d depthsum=%d dmax=%d byp=%d enq=%d wide=%d pop=%d reseed=%d (redir=%d earl=%d sbov=%d l0=%d ext=%d div=%d) bd0=%d bd1=%d l0tk=%d",
+                $display("FTQ cy=%d depthsum=%d dmax=%d byp=%d enq=%d wide=%d pop=%d reseed=%d (redir=%d earl=%d sbov=%d l0=%d ext=%d div=%d) bd0=%d bd1=%d",
                     st_cy, st_depth, st_dmax, st_byp, st_enq, st_wide, st_pop, st_reseed,
                     st_rs_redir, st_rs_earl, st_rs_sbov, st_rs_l0, st_rs_ext, st_rs_div,
-                    st_bd0, st_bd1, st_l0tk);
-                $display("FTQ-L0KIND cy=%d l0tk=%d ret=%d cond=%d unc=%d s1cond=%d s1unc=%d (s1: nodesc=%d offmiss=%d other=%d)",
-                    st_cy, st_l0tk, st_l0ret, st_l0cnd, st_l0unc, st_l0s1c, st_l0s1u,
-                    st_s1_nod, st_s1_off, st_s1_oth);
-                $display("FTQ-S1WHY cy=%d nodesc=%d -> take=%d nvld=%d guard=%d untrained=%d evicted=%d weak=%d none=%d",
-                    st_cy, st_s1_nod, st_w_take, st_w_nvld, st_w_nod, st_w_miss, st_w_evic, st_w_weak, st_w_none);
-                $display("FTQ-S1OFF cy=%d untrained-at-halfword: 0=%d 1=%d 2=%d 3=%d | train: cond=%d straddle-refused=%d",
-                    st_cy, st_w_o0, st_w_o1, st_w_o2, st_w_o3, st_tr_cond, st_tr_str);
-                $display("FTQ-S1NXT cy=%d of nodesc=%d: head+1 is s1 dword=%d taken=%d off-match=%d",
-                    st_cy, st_s1_nod, st_n1_has, st_n1_take, st_n1_off);
-                $display("FTQ-S0WHY cy=%d slot0-only: straddle=%d nodesc=%d off-before=%d off-after=%d | nodesc by: nvld=%d guard=%d untrained=%d evicted=%d weak=%d other=%d",
-                    st_cy, st_s0_str, st_s0_nod, st_s0_ofl, st_s0_ofg,
-                    st_s0w_nv, st_s0w_gd, st_s0w_ut, st_s0w_ev, st_s0w_wk, st_s0w_ot);
+                    st_bd0, st_bd1);
                 $display("FTQ-PROD cy=%d step=%d take=%d nvld=%d nodesc=%d (recoverable=%d) miss=%d weak=%d nocond=%d",
                     st_cy, st_pp_step, st_pp_take, st_pp_nvld, st_pp_nod, st_pp_rcv, st_pp_miss,
                     st_pp_weak, st_pp_none);

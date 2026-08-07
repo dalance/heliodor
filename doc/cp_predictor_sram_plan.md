@@ -3328,6 +3328,64 @@ What still stands between here and a cheaper deletion is `l0tk` = 4056, whose la
 — two slots, first-exit-only, `ctr == 3` only — so closing it needs a different mechanism from the
 f2.16c/f2.17 family.
 
+## 🏁 f2.19 — THE L0 IS GONE
+
+`src/core/l0pred.veryl` is deleted. The instance, its twelve output signals, `l0_use_ras` /
+`l0_cond_taken` / `l0_pred_target` / `l0_taken` / `l0_taken1`, the `L0_PRED_COND` knob and the
+L0-comparison census (`bc_l0`, the whole `l0tk` kind split) are removed with it: **−406 lines,
++22.** Stage-A's prediction is now entirely descriptor-sourced:
+
+```veryl
+let l0e_taken  : logic     = FTQ_DESC && bd_taken0;
+let l0e_target : logic<64> = bd_target;
+let l0e_taken1 : logic     = FTQ_DESC && bd_taken1;
+let l0e_target1: logic<64> = if bd_taken1n ? bd1n_target : bd_target;
+```
+
+**A 32-entry µBTB + 128-entry bimodal with FOUR async lookup ports is out of the fetch path.** What
+replaces it is blkpred: 4096 dword entries, tagged, CLOCKED, 1R1W-shaped by replication. That is the
+structural objective of this plan, and it is the first time in the campaign that a non-SRAM
+structure has actually left the tree rather than been made deletable.
+
+### Verification — the deletion reproduces the probe EXACTLY
+
+The correctness criterion was set before the edit: removing the module must reproduce
+`L0_STAGEA_OFF=1` bit-for-bit. Anything else means something still doing work was removed.
+
+| gate | probe (`L0_STAGEA_OFF=1`) | **l0pred deleted** |
+|---|---|---|
+| dhrystone | 270859 | **270859** ✓ |
+| coremark | 416738 / instret 374357 | **416738 / 374357** ✓ |
+| N=1 boot | `cy=00e13840` | **`cy=00e13840`** ✓ |
+| SMP N=2 boot | `cy=012c9920` | **`cy=012c9920`** ✓, pass |
+| litmus N=4 | `cy=003c45b0` | **`cy=003c45b0`** ✓, pass |
+| default suite @ `=0` | — | **252 passed / 0 failed** |
+
+Every figure identical. Deleting the module changed nothing beyond what turning its predictions off
+already changed.
+
+### Deliberately kept
+
+* **The `d_why` plumbing** (`pd_why` → `ftq_d_why` → `wf_d_why` → `bd_why`). It started as f2.16b
+  instrumentation and became FUNCTIONAL in f2.17: `bd_why != 2` is what excludes a guard-delivered
+  descriptor from `l0_redir`'s suppression. It is not a counter and must not be stripped.
+* **The `a_l0_*` Stage-B reconciliation.** It now carries the descriptor's prediction.
+* **The `l0_*` naming on `PRED_L0_FAST`, `l0e_*`, `l0_redir`, `l0_slot1_deliv`.** These name the
+  Stage-A fast-prediction PATH, not the deleted module; the comments say so where it matters.
+
+### Cost, and what is left
+
+The price is f2.18's, unchanged: dhrystone +2.8 %, coremark +3.6 %, **N=1 boot +0.6 %, SMP N=2
++0.8 %** — against the pre-campaign f2.15e′ baseline the N=1 boot is **+0.27 %**. Paid deliberately
+for the structure (user decision, 2026-08-08).
+
+Recovery levers, in the order their substrate is ready: `PRED_RAS_AHEAD` (already built, returns),
+the `ctr == 3` confidence gate, blkpred `IDX_W`, and f2.5e's cheaper Stage-B override. The measured
+caution from f2.18 stands — the cheap takes went first (1.17 → 1.80 cycles per take) and one lever
+(`nvld`) is forbidden by the SRAM constraint.
+
+**Still not run: SMP N=4** (~75 min).
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
