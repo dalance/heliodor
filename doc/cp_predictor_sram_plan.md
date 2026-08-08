@@ -3384,7 +3384,74 @@ the `ctr == 3` confidence gate, blkpred `IDX_W`, and f2.5e's cheaper Stage-B ove
 caution from f2.18 stands — the cheap takes went first (1.17 → 1.80 cycles per take) and one lever
 (`nvld`) is forbidden by the SRAM constraint.
 
-**Still not run: SMP N=4** (~75 min).
+### SMP N=4 — the arm is now fully validated
+
+`cy=01c074b0` = **29.39 M, pass**, against the f2.15e′ baseline of `cy=01baa850` = 29.01 M: **+1.3 %**,
+comfortably inside the documented ±1 M band and consistent with the +0.8 % measured at N=2. Every
+gate this arm has has now been run with the L0 gone.
+
+## 🎉 f2.20 — RETURNS, delivered but never followed: the deletion cost comes back
+
+Measured 2026-08-08. The 512 returns in the residue were the one thing the deleted L0 did that the
+descriptor still declined, and they turned out to be worth far more than their share.
+
+### The design, and why it departs from the f2.16 hand-off
+
+The hand-off specified building the run-ahead RAS (`PRED_RAS_AHEAD`) so the **producer** could
+follow returns. **This does not do that, deliberately.** Every hazard this campaign has paid for
+lives on the producer side — f2.16's decode-alignment refutation, f2.16b's SMP hang — and f2.5d's
+own recorded hazard for the run-ahead RAS is a producer spin (a followed return lands mid-dword in
+the dword the call was trained on, so the loop can go call→ret→call).
+
+f2.16c/f2.17 established the alternative and returns fit it perfectly: **deliver without
+following.** The descriptor says only "this block exits at offset X on a return"; extract resolves
+the target from `ras_spec_top`, the extract-side speculative RAS that already exists and that the
+deleted L0 used for exactly this. **No run-ahead stack, no new state at all** — one new `d_why` code
+(7), riding plumbing that f2.17 had already made functional. `PRED_RAS_AHEAD` stays unbuilt.
+
+### Measured
+
+| workload | f2.17 (L0 present) | f2.19 (L0 deleted) | **f2.20** |
+|---|---|---|---|
+| dhrystone | 263541 | 270859 | **263393** — *better than with the L0* |
+| N=1 boot | 14.67 M | 14.76 M | **`cy=00deee50` 14.61 M** — *better than with the L0* |
+| SMP N=2 boot | 19.55 M | 19.70 M | **`cy=012b60a0` 19.62 M**, pass |
+| litmus N=4 | 3.919 M | 3.950 M | **3.919 M**, pass |
+| **coremark** | 402398 | 416738 | **421616** ⚠️ |
+| suite @ `=0` | 252/0 | 252/0 | **252/0** |
+
+`instret` bit-exact throughout. **Four of five gates improve, and on dhrystone and the N=1 boot the
+entire L0-deletion cost is recovered** — both now beat the arm that still had the L0. 512 returns
+were worth ~7466 cycles on dhrystone, ≈14.6 cycles each against a 1.80-cycle average for the rest
+of the residue: **the average was hiding the distribution**, which is the third time in this
+campaign that an aggregate concealed the answer.
+
+### coremark — attributed, and it is NOT the returns
+
+coremark's +1.17 % is `mispred` 90 → 183 (+93 committed mispredicts × ~45 cycles ≈ the whole 4878).
+Two hypotheses were tested rather than argued:
+
+1. **Missing RAS pop** — the speculative pop is keyed on the BTB (`s0_ras_pop = deliver0 &&
+   hit0_eff && ret0_eff`), so a descriptor-only return would consume `ras_spec_top` without popping
+   it. Driving the pop from the descriptor take as well was **bit-identical**. *Refuted, and the
+   inert code was removed rather than left implying a mechanism that is not there.*
+2. **Are the extra mispredicts even returns?** A commit-side probe split them by kind and printed
+   the offenders. **Zero committed return mispredicts** — the first 24 return slots printed nothing
+   at all, while the non-return slots filled immediately with **conditional branches** (loop
+   back-edges predicted not-taken, e.g. `pc=8000064e pred=80000652 arch=80000626 cond=1`).
+
+**The return mechanism is clean: it never mispredicts a target.** coremark's loss is
+conditional-branch DIRECTION accuracy, degraded because delivering returns perturbs the fetch
+stream and hence the speculative history the BHT/TAGE index with — the same class of second-order
+effect f2.6 documented (+5.4 % earlymis from moving a direction read). `earlymis` moves with it,
+10965 → 11777.
+
+`MISP_PROBE` is kept DEAD at 0: it is the instrument that turned "the returns must be wrong" into
+"the returns are perfect and the conditionals regressed", in one run.
+
+### Config
+
+`BD_RET_DELIVER=1`, on top of f2.17's set. Folds away with `FTQ_DESC`.
 
 ## Independence
 

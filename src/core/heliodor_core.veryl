@@ -1333,13 +1333,18 @@ pub module heliodor_core #(
     // Slot-0 sits at this dword's halfword offset ic_pc[2:1]; a straddling delivery is excluded here
     // and at the train, since a transfer whose own high half lives in the next dword cannot be the
     // block's exit (F0's jump would skip the dword extract still needs to decode it).
-    let bd_taken0: logic     = bd_valid && !straddle_q && (bd_off == ic_pc[2:1]);
+    // f2.20: a descriptor whose exit is a RETURN (bd_why == 7) carries no usable target — extract
+    // resolves it against its own speculative RAS, exactly as the deleted L0 did (l0_use_ras). It
+    // declines when the RAS is empty, which is the same fallback the L0 had.
+    let bd_ret   : logic     = FTQ_DESC && (bd_why == 3'd7);
+    let bd_taken0: logic     = bd_valid && !straddle_q && (bd_off == ic_pc[2:1])
+        && (!bd_ret || ras_spec_valid);
     // The effective Stage-A prediction: the descriptor where it speaks, the L0 elsewhere (it still
     // owns conditionals, which the tail-slot-only descriptor does not describe).
     // The effective Stage-A prediction. Descriptor-only since f2.19 (the L0 that used to supply
     // the other arm is gone), so it folds to nothing at FTQ_DESC=0 exactly as the whole arm does.
     let l0e_taken : logic     = FTQ_DESC && bd_taken0;
-    let l0e_target: logic<64> = bd_target;
+    let l0e_target: logic<64> = if bd_ret ? ras_spec_top : bd_target;
     // f2.9: slot-1 conditional direction, from the L0's own bimodal read on the
     // slot-1 PC (port 2). Same strong-only rule as slot 0 — see o_bimodal_strong in
     // the deleted l0pred for why an unconfident fast direction is worse than declining. TAGE is
@@ -2230,7 +2235,11 @@ pub module heliodor_core #(
     let l0_redir       : logic     = PRED_L0_FAST && fb_push0 && (l0e_taken || l0e_taken1) && !sb_override
         // f2.17: bd_why == 2 is a descriptor DELIVERED under the re-entry guard — the producer
         // never followed it, so its target was not prefetched and the flush is required.
-        && !(FTQ_DESC && (bd_why != 3'd2) && (bd_taken0 || bd_taken1s || (BDN_FREE_POP && bd_taken1n)));
+        // f2.17: bd_why == 2 is a descriptor DELIVERED under the re-entry guard; f2.20: bd_why == 7
+        // is one delivered as a RETURN. Neither was followed by the producer, so neither prefetched
+        // its target and both need the flush.
+        && !(FTQ_DESC && (bd_why != 3'd2) && (bd_why != 3'd7)
+             && (bd_taken0 || bd_taken1s || (BDN_FREE_POP && bd_taken1n)));
     let l0_redir_target: logic<64> = if l0e_taken ? l0e_target : l0e_target1;
     // f2.5a: the FTB read on the INDEPENDENT pc_pred pointer (the F2-full predictor loop) — the same
     // logic as f0_ftb_hit/f0_ftb_target but indexed by pc_pred, steering the next pc_pred + the FTQ
@@ -2485,6 +2494,24 @@ pub module heliodor_core #(
     let bc0_take: logic = PRED_BLK_COND && blk_b0_valid && (blk_b0_ctr == 2'd3) && re_b0;
     let bc1_take: logic = PRED_BLK_COND && blk_b1_valid && (blk_b1_ctr == 2'd3) && re_b1;
     let bct_take: logic = blk_tl_valid && !blk_tl_is_ret && !blk_tl_is_ind && re_tl;
+    // ── f2.20: RETURNS, delivered but never followed ── DEAD at 0 ──
+    // 512 of the l0tk residue are returns, and they are the one thing the deleted L0 did that the
+    // descriptor still declines: a block entry stores the LAST return address, which is the value a
+    // RAS exists to replace, so following it would steer fetch at a target extract disagrees with.
+    //
+    // The f2.16 hand-off proposed building the run-ahead RAS (PRED_RAS_AHEAD) so the PRODUCER could
+    // follow returns. This does NOT do that, and deliberately. Every hazard this campaign has paid
+    // for lives on the producer side — f2.16's decode-alignment refutation, f2.16b's SMP hang — and
+    // f2.5d's own recorded hazard for the run-ahead RAS is a producer spin (a followed return lands
+    // mid-dword in the dword the call was trained on, so the loop can go call->ret->call).
+    //
+    // f2.16c/f2.17 established the alternative: DELIVER without FOLLOWING. The descriptor says only
+    // "this block exits at offset X on a return"; extract supplies the target from ras_spec_top —
+    // the extract-side speculative RAS that already exists and that the deleted L0 used for exactly
+    // this (l0_use_ras). No run-ahead stack, no new structure, and the take costs what an L0 return
+    // take cost: the ordinary l0_redir re-steer. PRED_RAS_AHEAD stays unbuilt.
+    const BD_RET_DELIVER: bit = 1;
+    let bct_ret : logic = BD_RET_DELIVER && blk_tl_valid && blk_tl_is_ret && !blk_tl_is_ind && re_tl;
     // Each conditional slot's own PC and target. B-type reach is +/-4 KiB, so the stored 13-bit
     // signed displacement is exact and sign-extends to the full target.
     let bc0_pc  : logic<64> = {pc_pred_q[63:3], blk_b0_off, 1'b0};
@@ -2502,7 +2529,9 @@ pub module heliodor_core #(
     // dword. A tail ahead of the conditional makes the conditional unreachable on this pass, and vice
     // versa; the offsets settle it directly.
     let bx_tail : logic = bct_take && (!bcs_take || (blk_tl_off <: bcs_off));
-    let bx_cond : logic = bcs_take && !bx_tail;
+    // A return exit competes for "first in the dword" on the same offset rule as any other tail.
+    let bx_ret  : logic = bct_ret && (!bcs_take || (blk_tl_off <: bcs_off));
+    let bx_cond : logic = bcs_take && !bx_tail && !bx_ret;
     let pd_target: logic<64> = if bx_cond ? bcs_tgt : blk_tl_target;
     let pd_off   : logic<2>  = if bx_cond ? bcs_off : blk_tl_off;
     // The f2.16 claim was that per-slot reachability SUBSUMES the whole-descriptor guard, so the
@@ -2511,8 +2540,11 @@ pub module heliodor_core #(
     // has a second source, pp_no_ftb_q under PRED_RAS_AHEAD (const-false in this arm); re-flipping
     // that would need its own term rather than riding on pp_ent_off_q, which carries only the
     // re-seed offset.
+    // FOLLOW covers only what the producer may act on — never a return, whose target it cannot know.
     let pd_exit    : logic = FTQ_DESC && pp_desc_vld && blk_hit && (bx_tail || bx_cond);
     let pd_taken   : logic = pd_exit && (!pp_no_desc_q || PRED_BLK_REENT);
+    // DELIVER additionally covers the return, which extract resolves against its own RAS.
+    let pd_exit_r  : logic = FTQ_DESC && pp_desc_vld && blk_hit && bx_ret;
     // ── f2.17: DELIVER the guarded descriptor without FOLLOWING it ── DEAD at 0 ──
     // The slot-0 census (doc §f2.17) put 1993 of the 3512 slot-0-only takes — 57 % — on the
     // mid-dword re-entry guard. f2.16's PRED_BLK_REENT tried to relax that guard for the PRODUCER
@@ -2533,7 +2565,7 @@ pub module heliodor_core #(
     // ordinary cheap Stage-A re-steer instead of being caught by l0_redir's suppression — the very
     // mistake that cost f2.16c its first attempt. bd_why == 2 marks these at extract.
     const BD_REENT_DELIVER: bit = 1;
-    let pd_deliver : logic = if BD_REENT_DELIVER ? pd_exit : pd_taken;
+    let pd_deliver : logic = (if BD_REENT_DELIVER ? pd_exit : pd_taken) || pd_exit_r;
     // ── f2.16b INSTRUMENTATION: the producer's own reason, travelling with the descriptor ──
     // f2.16 measured the producer's reasons as an AGGREGATE and then attacked the largest bucket,
     // which turned out not to be the bucket connected to the extract-side gap: the 9461 slot-1
@@ -2542,6 +2574,7 @@ pub module heliodor_core #(
     // Same priority order as the FTQ_STATS producer census, so the two are directly comparable.
     let pd_why: logic<3> = if !pp_desc_vld ? 3'd1                        // lookup invalidated
      : if pd_taken ? 3'd0                                                // a taken exit was produced
+     : if pd_exit_r ? 3'd7                                               // f2.20: a RETURN, delivered only
      : if pp_no_desc_q ? 3'd2                                            // mid-dword re-entry guard
      : if !blk_hit ? (if blk_novalid ? 3'd3 : 3'd6)                       // never trained / evicted
      : if blk_b0_valid || blk_b1_valid ? 3'd4                            // hit, but no slot is strong
@@ -7079,6 +7112,38 @@ pub module heliodor_core #(
     // c_bp_mispredict is 0 for it regardless of the added term.
     let c_bp_mispredict: logic     = rob_commit_valid && (c_pred_next_pc != c_arch_next_pc)
         && (c_is_control || rob_commit_ack);
+    // ── f2.20 PROBE: is the coremark mispredict doubling actually the RETURNS? ── DEAD at 0 ──
+    // f2.20 delivers descriptor returns and coremark's committed mispredicts went 90 -> 183 while
+    // dhrystone and the N=1 boot improved. The missing-RAS-pop hypothesis was tested and REFUTED
+    // (the added pop was bit-identical). Before guessing again: split the count by kind, and print
+    // the offending returns with predicted vs architectural target so the failure names itself.
+    const MISP_PROBE: bit = 0;
+    var mp_ret : logic<32>;
+    var mp_oth : logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            mp_ret = 32'd0;
+            mp_oth = 32'd0;
+        } else if MISP_PROBE {
+            if c_bp_mispredict {
+                if c_is_ret {
+                    mp_ret = mp_ret + 32'd1;
+                    if mp_ret <: 32'd24 {
+                        $display("MISP-RET n=%d pc=%h pred=%h arch=%h", mp_ret, c_pc, c_pred_next_pc, c_arch_next_pc);
+                    }
+                } else {
+                    mp_oth = mp_oth + 32'd1;
+                    if mp_oth <: 32'd8 {
+                        $display("MISP-OTH n=%d pc=%h pred=%h arch=%h call=%b cond=%b", mp_oth, c_pc, c_pred_next_pc, c_arch_next_pc, c_is_call, c_is_cond);
+                    }
+                }
+            }
+            if c_is_ret && rob_commit_ack {
+                // total committed returns, for the rate
+                mp_oth = mp_oth;
+            }
+        }
+    }
 
     // An async interrupt's epc must be the architectural successor of the LAST
     // COMMITTED instruction — a commit-side quantity. It used to be read off the
