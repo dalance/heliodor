@@ -3453,6 +3453,56 @@ effect f2.6 documented (+5.4 % earlymis from moving a direction read). `earlymis
 
 `BD_RET_DELIVER=1`, on top of f2.17's set. Folds away with `FTQ_DESC`.
 
+## f2.21 — THE SHIP QUESTION: arm vs the shipped path, and coremark attributed
+
+Everything above compares against `f2.15e′`, a baseline **inside** the arm. The decision needs the
+other comparison: **the arm against the path that actually ships today** (all 16 consts at 0).
+
+| workload | shipped `=0` | **arm (f2.20)** | cost |
+|---|---|---|---|
+| dhrystone | 252939 | 263393 | **+4.1 %** |
+| **coremark** | 367139 | 421616 | **+14.8 %** |
+| N=1 Linux boot | `cy=00d9be30` 14.27 M | `cy=00deee50` 14.61 M | **+2.4 %** |
+| SMP N=2 boot | `cy=0125bb50` 19.25 M | `cy=012b60a0` 19.62 M | **+1.9 %** |
+
+**What the arm buys:** every fetch-path predictor in an implementable shape. BTB / BHT / TAGE /
+iBTB clocked (`*_SYNC_READ`), and `l0pred` — 32-entry µBTB + 128-entry bimodal, async, **four
+lookup ports** — deleted outright, its work carried by blkpred (4096 dword entries, tagged,
+clocked, 1R1W by replication). That is not recoverable by tuning; it is the campaign's product.
+
+**What it costs:** ~2 % on the real Linux boots and **+14.8 % on coremark**, which is the one
+number a reader should weigh.
+
+### coremark, attributed — and three levers tried and refuted
+
+`frontidl` is 72 % of it: 38198 → **77443** (+39245 of the +54477). `earlymis` 6885 → 11777,
+`mispred` 114 → 183, `dispstl` −3739. The front end is idle, and its FTQ never fills — mean depth
+**0.11** against dhrystone's 1.0, with **82 % bypass**.
+
+| lever | result |
+|---|---|
+| **Confidence gate** `ctr == 3` → `>= 2` (`BLK_COND_WEAK`) — the lever this doc has named since f2.15e′ | **REFUTED.** coremark 421616 → **434434** (+3.0 %), `mispred` 183 → 273, and `frontidl` went **UP** 77443 → 83997. The extra takes are wrong and cause refetches. dhrystone improves 1.3 %, so it is a workload trade, not a fix. Kept DEAD at 0. |
+| **blkpred capacity** `IDX_W` 12 → 14 (4× entries) | **REFUTED, bit-identical** — not one cycle, not one miss (177240 exactly). coremark's misses are dwords that were never TRAINED, not entries evicted; there is no conflict pressure and a bigger table buys only area. Left at 12. |
+| **Missing RAS pop** (f2.20) | **REFUTED, bit-identical.** |
+
+A correction to the reading that motivated the capacity test: **a high blkpred miss rate is not by
+itself a defect.** A dword with no branch legitimately misses and streams sequentially, which is
+correct and free; coremark's larger, straighter code simply has more of them. The real difference is
+accuracy — `earlymis` **doubles** in the arm (6885 → 11777) and early redirects are 9× dhrystone's
+(10228 vs 1143). That is the f2.6 effect: clocked predictors are read a cycle earlier at a different
+PC, and on a workload with hard control flow that costs accuracy.
+
+**So coremark's +14.8 % is, on the evidence so far, the structural price of the clocked front end on
+a hard-control-flow workload — not a defect anyone has found.** Three candidate fixes were measured
+and all three were refuted, two of them bit-identically.
+
+### The decision, stated plainly
+
+Shipping means flipping the arm's consts to 1 in master. It is a user decision. The trade is:
+**an implementable fetch path (no async multi-ported RF anywhere in it) for ~2 % on real Linux
+boots and ~15 % on coremark.** SMP N=4 passes in the arm (`cy=01c074b0` 29.39 M, +1.3 %, inside
+the ±1 M band), so every gate has been run.
+
 ## Independence
 
 Fully independent of Blocks L (LSQ) and the commit side. Shares the front-end with
