@@ -423,10 +423,23 @@ Stage-B handoff must not ack an unrelated IQ op; it *does* drive the ROB LQ-reco
 | arm | result |
 |---|---|
 | **`=0` (DEAD, shipped)** | **252/0, N=1 boot `cy=00deee50`, `instret` 10434358, every census counter bit-identical.** Verified, committed. |
-| **`=1` (flip)** | **249 passed / 3 failed. `test_litmus_2hart` FAILS: `tohost=0x7012` → test 7, slot 1 = LOST AMO UPDATE.** |
+| **`=1` (flip)** | **249 passed / 3 failed** — `test_litmus_2hart`: `tohost=0x7012` → test 7, slot 1 = LOST AMO UPDATE. **AND the N=1 Linux boot does not complete**: `cy=02aea540` (the 45 M budget cap), `x3=ffffffff80a85b60`, `pass=0`, `instret` 34,427,162 vs 10,434,358. |
 
 Test 7 is AMO atomicity: two harts each run `AMO_ITER` × `amoadd.w` on one word and the total must
 be `2*AMO_ITER`. Losing an update is a real memory-model bug, not a timing shift.
+
+**The mechanism itself works — that is not what is broken.** In the failing `=1` boot the census
+shows the handoff doing exactly its job: the `lsr` sole-blocker bucket falls 1,757,323 → 242,587 and
+its `dcache` sub-bucket 1,043,579 → 44,730, while `mshr` (2,074) and `replay` (4,938) appear as sole
+blockers for the first time (both were 0). The LSR is being freed on a miss as designed. What is
+wrong is the *correctness* of the woken path.
+
+**⚠️ The N=1 boot failure is the cheaper reproduction, and it reshapes the hypothesis.** A
+single-hart boot has no cross-hart coherence traffic, so "two harts race on an atomic" cannot be the
+whole story — but the ASQ drain engine exists at N=1 too, so the port-contention hypothesis
+survives. More usefully: 34.4 M instructions retire without reaching shutdown, so this is a
+livelock / wrong-data-then-error-loop, **not** a deadlock, and it reproduces in ~1 minute against
+litmus's longer loop. **Diagnose on the N=1 boot first.**
 
 **Leading hypothesis — the replay engine and R3's atomic drain have never coexisted.** Waking the
 handoff also wakes `replay_q` / `replay_drive`, which have been inert since `88b7735`
@@ -438,8 +451,8 @@ root cause was a diverted atomic's write latching into `m_wen_q` and landing twi
 per-event attribution.
 
 **Where to start** (do not re-derive the design — the scaffold is correct as far as the flip goes):
-1. Reproduce standalone: `veryl test --ignored --test test_litmus_2hart` at `=1`. It is in the
-   default suite, so the loop is short.
+1. Reproduce on the **N=1 boot** at `=1` (~1 min, single-hart, no coherence traffic). Only fall back
+   to `veryl test --ignored --test test_litmus_2hart` once the single-hart bug is out of the way.
 2. Instrument the *port*, not the outcome: count cycles where `replay_drive` and `asq_dr_busy` (or
    `asq_dr_go_r`, or `commit_store_fire`) are simultaneously live. If that count is 0 the hypothesis
    is dead and the bug is elsewhere — cheap and decisive either way.
