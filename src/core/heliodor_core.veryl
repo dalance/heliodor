@@ -4183,6 +4183,15 @@ pub module heliodor_core #(
     // block) — the issuing load misses, the fill starts, and the load is acked
     // OUT of the IQ with its writeback deferred to fill completion.
     var mshr_capture: logic;
+    // step-2 (L4): capture-source-agnostic entry-write feeds. Forward-declared so
+    // the rob instance's LQ-record port can read them; assigned by the MSHR block.
+    var mshr_alloc_fire: logic            ;
+    var mshr_alloc_rob : logic<ROB_IDX_W> ;
+    var mshr_alloc_f3  : logic<3>         ;
+    // The Stage-B handoff pulses. Assigned down with the LSR block (they need
+    // lsr_squashed), read up here by the entry-write feeds.
+    var mshr_cap_b     : logic            ;
+    var mshr_cap_b_own : logic            ;
     // S10.3/S10.4b MSHR state + rob-port feeds (declared here so the rob
     // instance and the issue gates can consume them; assigned in the MSHR
     // block after the dcache instance). S10.4b: TWO entries (a/b) = one fill
@@ -6349,10 +6358,12 @@ pub module heliodor_core #(
         i_cdb2_store_addr    : alu_cdb2.store_addr  ,
         i_cdb2_store_funct3  : alu_cdb2.store_funct3,
         // Phase 8 S10.3: MSHR capture-time LQ record + aborted-fill poison.
-        i_lq_rec_valid       : mshr_capture         ,
-        i_lq_rec_idx         : iq_iss_rob_idx       ,
+        // step-2: a Stage-B handoff records too — the load leaves the pipe with no
+        // normal CDB writeback, so the disambiguation scan needs its address.
+        i_lq_rec_valid       : mshr_alloc_fire      ,
+        i_lq_rec_idx         : mshr_alloc_rob       ,
         i_lq_rec_addr        : mshr_rec_addr        ,
-        i_lq_rec_funct3      : iq_issue_op.base.mem_funct3,
+        i_lq_rec_funct3      : mshr_alloc_f3        ,
         // P9.0 CoRR: remote-invalidate poison (same pulses the dcache gets).
         i_inv_valid          : i_dcache_inv_valid   ,
         i_inv_addr           : i_dcache_inv_addr    ,
@@ -10430,8 +10441,52 @@ pub module heliodor_core #(
     let mshr_capture_own: logic = s10_flip_en && !replay_q && dc_miss_valid && mshr_plain_load && mshr_free_ok;
     let mshr_capture_que: logic = s10_flip_en && !replay_q && !dc_miss_valid && dcache_stall && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid && mshr_plain_load && mshr_free_ok;
     assign mshr_capture = mshr_capture_own || mshr_capture_que;
+
+    // ------------------------------------------------------------------
+    // Phase 1 LSU 2-stage STEP-2 (L4): non-blocking MSHR-from-Stage-B.
+    //
+    // step-1 (88b7735) routed every plain load through the LSR, which BLOCKS on a
+    // Stage-B miss, and disabled the issue-side MSHR capture (mshr_plain_load=0)
+    // with "non-blocking MSHR-from-Stage-B is step-2". It was never built. The L4
+    // census prices it: the incumbent load sits in the single LSR slot driving a
+    // stalling dcache for 1,043,579 cy = 7.14 % of the N=1 boot, and every younger
+    // load is behind it.
+    //
+    // This hands the missing load off to the (fully built, currently inert) 2-entry
+    // MSHR and frees the LSR the same cycle, so the next load can capture. The
+    // receiving machinery is unchanged: owner/queued capture, the replay engine,
+    // the deferred mshr_cdb writeback, age-based squash and the SMP aborted-fill
+    // poison all already exist and were live before step-1.
+    //
+    // Eligibility mirrors the original issue-side qualifier, re-expressed against
+    // the LSR's LATCHED state (every field the entry write needs has an lsr_*_q
+    // equivalent): not faulting (a fault completes from the LSR, never reads),
+    // not an FP load (mshr_cdb is lane-0 int), not uncached (side effects must not
+    // be replayed), not a cross-dword misaligned span (the entry holds one dword),
+    // and no forwarded store bytes (stld_fwd_mask is the Stage-B mask — the fill
+    // data would predate the store).
+    //
+    // Kept SEPARATE from mshr_capture on purpose: mshr_capture also drives
+    // iq_issue_ack, and a Stage-B handoff must not ack whatever unrelated op is
+    // sitting at the IQ head. It DOES drive the ROB LQ-record port — the load
+    // leaves the pipe without a normal CDB writeback, so its address has to be
+    // recorded for the disambiguation scan exactly like an issue-side capture.
+    //
+    // DEAD at 0: mshr_cap_b folds away, every _eff selector collapses to today's
+    // term, and the LSR clear arm disappears → bit-identical.
+    // ------------------------------------------------------------------
+    const LSR_MSHR_B: bit = 0;
+    // Entry-write feeds: issue-side capture keeps its live sources, a Stage-B
+    // handoff supplies the latched LSR ones.
+    assign mshr_alloc_fire = mshr_capture || mshr_cap_b;
+    assign mshr_alloc_rob  = if mshr_cap_b ? lsr_rob_idx_q : iq_iss_rob_idx;
+    assign mshr_alloc_f3   = if mshr_cap_b ? lsr_funct3_q : iq_issue_op.base.mem_funct3;
+    let mshr_alloc_own  : logic            = mshr_capture_own || mshr_cap_b_own;
+    let mshr_alloc_pdst : logic<PRF_INT_W> = if mshr_cap_b ? lsr_pdst_q : iq_iss_rd_pdst;
+    let mshr_alloc_hasrd: logic            = if mshr_cap_b ? lsr_has_rd_q : iq_issue_op.base.has_rd;
+    let mshr_alloc_addr : logic<64>        = if mshr_cap_b ? lsr_paddr_q : dmu_dmem_addr;
     // rob LQ-record / abort-poison port feeds (vars declared near mshr_cdb).
-    assign mshr_rec_addr     = dmu_dmem_addr;
+    assign mshr_rec_addr     = if mshr_cap_b ? lsr_paddr_q : dmu_dmem_addr;
     // S20R: a committed store buffered DURING the fill (or before a queued
     // replay's hit) overlaps the captured load — the fill/dcache data
     // predates the store and the issue-time sb scan can no longer help, so
@@ -10516,6 +10571,16 @@ pub module heliodor_core #(
     // resolved branch (age > the branch's age) — so a correct-path older load that a
     // younger pipe-1 branch mispredicts is NOT squashed.
     let lsr_squashed : logic = lsr_v_q && (redirect_fire || (early_redir_fire_q && (lsr_age >: s10_early_age)));
+    // step-2 (L4) Stage-B MSHR handoff — see the LSR_MSHR_B block by the MSHR.
+    // Placed here because it needs lsr_squashed: a wrong-path load must never be
+    // captured, or its deferred writeback lands on a re-allocated rob_idx (the
+    // S8.E BUG5 class the MSHR's own squash arms guard against).
+    let lsr_mshr_ok : logic = LSR_MSHR_B && lsr_v_q && !lsr_squashed && !lsr_fault
+        && !lsr_fp_ld_q && !lsr_unc_q && !lsr_dc_load_next && stld_fwd_mask == 8'd0 && mshr_free_ok;
+    let mshr_cap_b_que: logic = lsr_mshr_ok && lsr_drive && !dc_miss_valid && dcache_stall
+        && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid;
+    assign mshr_cap_b_own = lsr_mshr_ok && lsr_drive && dc_miss_valid;
+    assign mshr_cap_b     = mshr_cap_b_own || mshr_cap_b_que;
     // step-1.5 lane select. A non-fault, non-FP load goes to LANE 1 (pipe-1 yields,
     // so it is always available → no yield term). A faulting / FP load stays on
     // LANE 0 (only lane 0 carries fault side-bands + the FP-regfile route) and must
@@ -10565,6 +10630,13 @@ pub module heliodor_core #(
                 lsr_unc_q       = dc_uncached;
                 lsr_gstage_q    = dmem_mmu_gstage; // Phase 11-H: two-stage fault attribution (htval)
                 lsr_gpa_q       = dmem_mmu_gpa;
+            } else if mshr_cap_b {
+                // step-2: the missing load has been handed to an MSHR entry — free
+                // the slot NOW so the next load can capture instead of waiting out
+                // the fill. Mutually exclusive with lsr_complete (the handoff only
+                // fires while dcache_stall holds, so lsr_read_done is 0) and with
+                // lsr_capture (which needs !lsr_v_q).
+                lsr_v_q = 1'b0;
             } else if lsr_complete {
                 lsr_v_q = 1'b0;
             }
@@ -10742,15 +10814,15 @@ pub module heliodor_core #(
                 mshra_v_q    = 1'b0;
                 mshra_done_q = 1'b0;
                 mshra_own_q  = 1'b0;
-            } else if mshr_capture && mshr_alloc_a {
+            } else if mshr_alloc_fire && mshr_alloc_a {
                 mshra_v_q       = 1'b1;
                 mshra_done_q    = 1'b0;
-                mshra_own_q     = mshr_capture_own;
-                mshra_rob_idx_q = iq_iss_rob_idx;
-                mshra_pdst_q    = iq_iss_rd_pdst;
-                mshra_has_rd_q  = iq_issue_op.base.has_rd;
-                mshra_addr_q    = dmu_dmem_addr;
-                mshra_funct3_q  = iq_issue_op.base.mem_funct3;
+                mshra_own_q     = mshr_alloc_own;
+                mshra_rob_idx_q = mshr_alloc_rob;
+                mshra_pdst_q    = mshr_alloc_pdst;
+                mshra_has_rd_q  = mshr_alloc_hasrd;
+                mshra_addr_q    = mshr_alloc_addr;
+                mshra_funct3_q  = mshr_alloc_f3;
             } else if replay_claim && replay_is_a {
                 mshra_own_q = 1'b1;
             } else if replay_hit_fire && replay_is_a {
@@ -10769,15 +10841,15 @@ pub module heliodor_core #(
                 mshrb_v_q    = 1'b0;
                 mshrb_done_q = 1'b0;
                 mshrb_own_q  = 1'b0;
-            } else if mshr_capture && !mshr_alloc_a {
+            } else if mshr_alloc_fire && !mshr_alloc_a {
                 mshrb_v_q       = 1'b1;
                 mshrb_done_q    = 1'b0;
-                mshrb_own_q     = mshr_capture_own;
-                mshrb_rob_idx_q = iq_iss_rob_idx;
-                mshrb_pdst_q    = iq_iss_rd_pdst;
-                mshrb_has_rd_q  = iq_issue_op.base.has_rd;
-                mshrb_addr_q    = dmu_dmem_addr;
-                mshrb_funct3_q  = iq_issue_op.base.mem_funct3;
+                mshrb_own_q     = mshr_alloc_own;
+                mshrb_rob_idx_q = mshr_alloc_rob;
+                mshrb_pdst_q    = mshr_alloc_pdst;
+                mshrb_has_rd_q  = mshr_alloc_hasrd;
+                mshrb_addr_q    = mshr_alloc_addr;
+                mshrb_funct3_q  = mshr_alloc_f3;
             } else if replay_claim && !replay_is_a {
                 mshrb_own_q = 1'b1;
             } else if replay_hit_fire && !replay_is_a {
