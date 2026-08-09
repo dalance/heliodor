@@ -162,6 +162,98 @@ before R3.
 
 ---
 
+## L3 — FIRST-CLASS LOAD QUEUE: hand-off for a clean context (2026-08-09)
+
+Written to be self-contained; start here in a fresh session, the way f2.7 / f2.13 / f2.15e / f2.16
+were. User chose L3 after F2 shipped.
+
+### ⚠️ FIRST: the premise is CONTESTED by this repo's own study — census before building
+
+Block L3 above says "today disambiguation is load-violation detect + commit-time replay with **no
+explicit LQ**" and prescribes an age-ordered LQ-CAM. But
+`retire_memory_ordering_redesign_study.md` §3.5/§3.7 examined the same code and concluded the
+opposite:
+
+> load speculation + forwarding + poison-replay — **already decoupled ✅ keep (modern)**
+> "✅ This is already a modern speculative-memory scheme."
+
+One says build it, the other says keep it. **f2.16 is the precedent for what to do here:** its
+hand-off prescribed a run-ahead RAS, the census showed returns were 1.4 % of the target population,
+and the increment was correctly abandoned before a line was written. Do the same.
+
+**Measured already, at the shipped default (2026-08-09):**
+
+| workload | `loadviol` |
+|---|---|
+| dhrystone | **0** |
+| coremark | **0** |
+
+**Zero load-order violations.** The replay mechanism the plan wants to replace never fires on either
+microbenchmark, so its IPC cost there is exactly nothing. **The boot harnesses do not expose the
+counter at all** (`tb/test_soc_*_linux_boot*.veryl` have no `loadviol` port) — wiring
+`o_dbg_load_viol_cnt` through them is the first task, because the kernel and SMP are the only places
+a violation is plausible.
+
+**Decide the justification before building.** If `loadviol` is ~0 on the boots too, L3 cannot be
+sold on IPC and must stand or fall on (a) canonical LSQ structure and (b) CP — and (b) needs a
+`veryl synth` number, not an argument. Bring that to the user rather than assuming.
+
+### What is already built — do NOT rebuild
+
+| piece | state |
+|---|---|
+| `RETIRE_DECOUPLE` (L1) | **LIVE**, `heliodor_core.veryl:6722` |
+| `STORE_PRETRANSLATE` (L2) | **LIVE**, `heliodor_core.veryl:4288` |
+| `ATOMIC_SQ` / `ASQ_NOREAD` (R3) | **LIVE**, `:987` / `:1006` — atomics already route through the SQ |
+| store buffer + drain | decoupled since P9; `sb_pop` |
+| store→load forwarding | `stld_fwd_*`, ROB scan + committed buffer |
+| load poison / replay | `sh_load_poison` → `commit_load_replay`; counter `o_dbg_load_viol_cnt` (`:201`) |
+
+So the "S" half the plan says L3 depends on is **done and shipped**. What L3 adds is the age-ordered
+LQ-CAM and folding forwarding into one SQ CAM.
+
+### Baselines — ⚠️ ALL CHANGED TODAY, F2 SHIPPED (`78529fe`)
+
+Every pre-2026-08-08 number in this repo's docs is against the OLD front end. The current default:
+
+| gate | value |
+|---|---|
+| default suite | **252 passed / 0 failed** |
+| dhrystone | **263393** (instret 264834) |
+| coremark | **421616** (instret 374357) |
+| N=1 boot | **`cy=00deee50`** |
+| SMP N=2 boot | **`cy=012b60a0`** |
+| SMP N=4 boot | **`cy=01c074b0`** 29.39 M |
+| litmus N=4 | **`cy=003bd080`** |
+
+`instret` is the canary and must stay bit-exact. **The N=4 SMP boot gate takes ~75 minutes.**
+
+### Traps this campaign has paid for — the ones that generalise
+
+- **Attribute before building.** Every increment built from an aggregate rate failed (f2.16 attacked
+  the largest producer bucket and regressed); every one built from a per-event attribution landed
+  (f2.16c, f2.17, f2.20).
+- **A bit-identical result means the change never fired.** This happened FOUR times in one session
+  (a PC-region gate, a double pop, a RAS pop, a 4× table). Chase "why was it not reached" before
+  re-deriving the design.
+- **The N=2 SMP boot is the first gate that exercises a second hart at all.** An increment passed
+  252/0 + bit-exact `instret` + N=1 boot + a cycle-identical litmus N=4 and still hung SMP bringup.
+  Run it before writing a result up, not after.
+- **Say which arm a claim covers.** "252/0 at `=0`" is not "the increment is safe".
+- **A guard can be load-bearing for a reason its comment does not state** — ask what goes to zero
+  because of it.
+- **Consuming a resource whose bookkeeping you do not maintain** is the shape of three separate
+  bugs here (`ext_pop2` assuming head+2, `l0_redir`'s suppression, the Stage-A RAS read).
+
+### Do NOT re-measure
+
+- The F2 ladder and the coremark attribution — see `cp_predictor_sram_plan.md` §f2.21. Three
+  candidate fixes for coremark are refuted there, two bit-identically.
+- `d_why` (`pd_why` → `ftq_d_why` → `wf_d_why` → `bd_why`) is **functional, not instrumentation** —
+  `bd_why != 2 && != 7` gates `l0_redir`'s suppression. Do not strip it as a counter.
+
+---
+
 ## Block R — SMP-critical finale (gated)
 
 - **R3 — atomic reorder.** Atomics today are a **single-cycle commit-time RMW into
