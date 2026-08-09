@@ -450,6 +450,45 @@ it. R3's own history says this exact symptom is what a port/latch race there loo
 root cause was a diverted atomic's write latching into `m_wen_q` and landing twice, found only by
 per-event attribution.
 
+#### L4 step-2 diagnosis — bisected to the QUEUED arm; the ASQ hypothesis is refuted
+
+`LSR_MSHR_B_QUE` (`:10601`) splits the two capture arms. `_own` only needs the entry to latch
+`dc_fill_rdata` at DONE; `_que` is the one that revives the **replay engine** (a queued entry has
+`own_q=0`, which is what drives `mshra_queued` → `replay_q` → `replay_drive`).
+
+| arm | default suite | N=1 boot |
+|---|---|---|
+| `LSR_MSHR_B=0` | 252/0 | `cy=00deee50` pass |
+| `=1`, `QUE=1` | 249/3 (litmus test 7 lost AMO) | **pass=0**, hangs at the 45 M cap |
+| **`=1`, `QUE=0` (own only)** | **252/0** | **`cy=00de5210` pass, −0.27 %** |
+
+**Every failure — the three suite failures, the lost AMO update and the boot hang — is in the
+queued/replay arm. The Stage-B handoff itself is correct.** Own-only is green on the fast gates.
+
+**But own-only recovers almost nothing: −40,000 cy (−0.27 %),** and the `dcache` sub-bucket only
+falls 1,043,579 → 912,463 (−12.6 %). `_own` fires only on the exact `dc_miss_valid` cycle, and most
+stalled cycles are loads arriving at an *already busy* dcache — which is precisely the `_que` case.
+**The 7.14 % prize requires the replay engine to work.**
+
+**Refuted: the ASQ port hypothesis.** `replay_drive` genuinely lacks both checks R3 added to
+`load_blocks_on_store` (`asq_dr_busy`, `asq_ld_ovl`) — it has been dead since before R3 existed, so
+it was never in scope. Added both (`asq_replay_ovl` compares `asq_pa_q[0]` against `replay_addr`,
+single-dword since cross-dword spans cannot be captured). Result: **bit-identical** — same
+`cy=02aea540`, same `instret` 34,427,162, same counters down to `replay=4938`. Per this campaign's
+rule, bit-identical means the change never fired: `asq_valid_q[0]` (a queued atomic) essentially
+never coincides with a replay on an N=1 boot. The terms are kept — they close a real gap and are
+inert at `ATOMIC_SQ`-idle — but they are **not** the boot bug. They may still matter for litmus.
+
+**Next suspect, unproven: `replay_q` freezes the whole plain-load path.** It arms whenever a queued
+entry exists and the fill FSM is idle, and *holds* while armed (`:10803`). Both `lsr_capture` and
+`lsr_drive` carry `!replay_q`, so **while any replay is pending, no load may capture and no Stage-B
+load may drive.** `replay_drive` in turn needs `!store_drive && dmem_mmu_idle && !m_store_wr_busy`;
+under Sv39, `dmem_mmu_idle` is false for long PTW stretches. A replay starved for the port while
+holding every load hostage matches the observed shape — 34.4 M instructions retired, forward
+progress but 3.3× the work, no shutdown. **Instrument that before anything else:** histogram
+`replay_q` residency and count cycles where `replay_q && !replay_drive`, split by which term is
+false. `=0` is the matched control (all zero).
+
 **Where to start** (do not re-derive the design — the scaffold is correct as far as the flip goes):
 1. Reproduce on the **N=1 boot** at `=1` (~1 min, single-hart, no coherence traffic). Only fall back
    to `veryl test --ignored --test test_litmus_2hart` once the single-hart bug is out of the way.
