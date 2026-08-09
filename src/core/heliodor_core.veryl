@@ -206,6 +206,7 @@ pub module heliodor_core #(
     o_dbg_viol_exact_cnt : output logic<32>, // violations a full-width compare also finds
     o_dbg_viol_pgx_cnt   : output logic<32>, // violations from the VM page-cross blanket
     o_dbg_st_resolve_cnt : output logic<32>, // store resolves (violation denominator)
+    o_dbg_lw_cause       : output logic<32> [20], // L4 census: load-issue stall by sole blocker (+ lsr drill-down)
     o_dbg_viol_store_cnt : output logic<32>, // store-resolve scan events
     o_dbg_viol_self_cnt  : output logic<32>, // S15 record-time self-scan events
     // M9 diag: ALU operand observation (verify base.pc passthrough)
@@ -11107,6 +11108,47 @@ pub module heliodor_core #(
     // the poisoned load and everything younger. rob's load_viol_cnt counts only
     // one of the three poison sources, so this is the event to price L3 against.
     var load_replay_cnt   : logic<32>;
+
+    // ------------------------------------------------------------------
+    // L4 census: WHY does a selected load fail to issue? (2026-08-09)
+    //
+    // load_wait_cnt is 20.5 % of N=1 boot cycles but is an aggregate rate, and
+    // every increment this campaign built from an aggregate rate failed. Decompose
+    // it per cause. For a PLAIN load iq_issue_ack is exactly
+    // `lsr_capture || mshr_capture`, so the blockers are the negated terms of
+    // lsr_capture — an enumerable, mutually-known set.
+    //
+    // The actionable question is not "was cause X present" (they overlap heavily)
+    // but "would removing X alone have let the load through". So each cause is
+    // counted ONLY when it is the SOLE blocker; cycles with two or more live
+    // causes go to a separate multi bucket. A big multi bucket is itself a
+    // finding: it means no single lever moves those cycles.
+    // ------------------------------------------------------------------
+    let lw_stall  : logic = issue_is_load && !iq_issue_ack;
+    let lw_plain  : logic = lw_stall && iss_is_plain_load && !mshr_capture;
+    // The eight lsr_capture terms, as blockers.
+    let lwc_lsr   : logic = lsr_v_q;                                  // LSR occupied — the previous load is still in Stage B
+    let lwc_mmu   : logic = dmem_mmu_busy;                            // translate / PTW busy
+    let lwc_walk  : logic = load_walk_block;                          // a load walk owns the port, this load is not the owner
+    let lwc_store : logic = load_blocks_on_store;                     // store-ordering / drain hold
+    let lwc_fpu   : logic = fpu_cdb.valid;                            // FPU owns lane 0
+    let lwc_mshr  : logic = mshr_cdb.valid;                           // MSHR owns lane 0 (deferred fill writeback)
+    let lwc_replay: logic = replay_q;
+    let lwc_redir : logic = redirect_fire || early_redir_fire_q;      // squash cycle, not a real stall
+    let lw_n_causes: logic<4> =
+        ({3'b0, lwc_lsr} as 4) + ({3'b0, lwc_mmu} as 4) + ({3'b0, lwc_walk} as 4) + ({3'b0, lwc_store} as 4)
+      + ({3'b0, lwc_fpu} as 4) + ({3'b0, lwc_mshr} as 4) + ({3'b0, lwc_replay} as 4) + ({3'b0, lwc_redir} as 4);
+    let lw_sole   : logic = lw_plain && lw_n_causes == 4'd1;
+    // Drill-down on the lsr bucket: the LSR is a SINGLE entry, so while the
+    // incumbent load sits in Stage B no other plain load can even latch. Ask why
+    // the incumbent is not completing. lsr_complete needs (fault || read_done)
+    // and, on the lane-0 path, a free lane-0; read_done needs lsr_drive (which
+    // yields the dcache port to a committing store / an MMU walk / a replay /
+    // an in-flight store write) and !dcache_stall. Priority-encoded so the
+    // sub-buckets partition the lsr bucket exactly.
+    let lwl       : logic = lw_sole && lwc_lsr;
+    let lwl_drive : logic = lwl && lsr_drive;
+    var lw_cause_cnt: logic<32> [20];
     always_ff (clk, rst) {
         if_reset {
             mispredict_cnt    = 32'd0;
@@ -11118,9 +11160,67 @@ pub module heliodor_core #(
             commit0_cnt       = 32'd0;
             load_wait_cnt     = 32'd0;
             load_replay_cnt   = 32'd0;
+            for c in 0..20 {
+                lw_cause_cnt[c] = 32'd0;
+            }
         } else {
             if commit_load_replay {
                 load_replay_cnt = load_replay_cnt + 32'd1;
+            }
+            // L4 census: sole-blocker attribution (see the declarations above).
+            if lw_sole && lwc_lsr {
+                lw_cause_cnt[0] = lw_cause_cnt[0] + 32'd1;
+            }
+            if lw_sole && lwc_mmu {
+                lw_cause_cnt[1] = lw_cause_cnt[1] + 32'd1;
+            }
+            if lw_sole && lwc_walk {
+                lw_cause_cnt[2] = lw_cause_cnt[2] + 32'd1;
+            }
+            if lw_sole && lwc_store {
+                lw_cause_cnt[3] = lw_cause_cnt[3] + 32'd1;
+            }
+            if lw_sole && lwc_fpu {
+                lw_cause_cnt[4] = lw_cause_cnt[4] + 32'd1;
+            }
+            if lw_sole && lwc_mshr {
+                lw_cause_cnt[5] = lw_cause_cnt[5] + 32'd1;
+            }
+            if lw_sole && lwc_replay {
+                lw_cause_cnt[6] = lw_cause_cnt[6] + 32'd1;
+            }
+            if lw_sole && lwc_redir {
+                lw_cause_cnt[7] = lw_cause_cnt[7] + 32'd1;
+            }
+            if lw_plain && lw_n_causes >: 4'd1 {
+                lw_cause_cnt[8] = lw_cause_cnt[8] + 32'd1; // two or more causes live
+            }
+            if lw_plain && lw_n_causes == 4'd0 {
+                lw_cause_cnt[9] = lw_cause_cnt[9] + 32'd1; // sanity: should stay 0
+            }
+            if lw_stall && !iss_is_plain_load {
+                lw_cause_cnt[10] = lw_cause_cnt[10] + 32'd1; // the AMO/LR/SC issue path
+            }
+            if lw_stall && iss_is_plain_load && mshr_capture {
+                lw_cause_cnt[11] = lw_cause_cnt[11] + 32'd1; // acked via MSHR capture, not a stall
+            }
+            // Sub-partition of bucket 0 (lsr): why is the incumbent not completing?
+            if lwl_drive && dcache_stall {
+                lw_cause_cnt[12] = lw_cause_cnt[12] + 32'd1; // driving, waiting on the dcache (miss / fill)
+            } else if lwl_drive {
+                lw_cause_cnt[13] = lw_cause_cnt[13] + 32'd1; // read done, waiting for writeback lane 0
+            } else if lwl && lsr_fault {
+                lw_cause_cnt[14] = lw_cause_cnt[14] + 32'd1; // faulted, waiting for lane 0
+            } else if lwl && store_drive {
+                lw_cause_cnt[15] = lw_cause_cnt[15] + 32'd1; // port yielded to a committing store
+            } else if lwl && !dmem_mmu_idle {
+                lw_cause_cnt[16] = lw_cause_cnt[16] + 32'd1; // port yielded to an MMU walk
+            } else if lwl && m_store_wr_busy {
+                lw_cause_cnt[17] = lw_cause_cnt[17] + 32'd1; // port yielded to an in-flight store write
+            } else if lwl && replay_q {
+                lw_cause_cnt[18] = lw_cause_cnt[18] + 32'd1;
+            } else if lwl {
+                lw_cause_cnt[19] = lw_cause_cnt[19] + 32'd1; // sanity: should stay 0
             }
             if c_bp_mispredict {
                 mispredict_cnt = mispredict_cnt + 32'd1;
@@ -11182,6 +11282,7 @@ pub module heliodor_core #(
     assign o_dbg_viol_exact_cnt       = rob_viol_exact_cnt_w;
     assign o_dbg_viol_pgx_cnt         = rob_viol_pgx_cnt_w;
     assign o_dbg_st_resolve_cnt       = rob_st_resolve_cnt_w;
+    assign o_dbg_lw_cause             = lw_cause_cnt;
     assign o_dbg_viol_store_cnt       = rob_viol_store_cnt_w;
     assign o_dbg_viol_self_cnt        = rob_viol_self_cnt_w;
     assign o_dbg_rob_size       = rob_size;

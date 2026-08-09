@@ -311,10 +311,81 @@ cycles (2,987,980) and 4.0 M/0.9 M per hart at N=2. That is issue-side serializa
 an aggregate rate, so per the campaign's own rule it needs a per-event attribution before anything
 is built on it.
 
+### L4 — `loadwait` CENSUS: the 20.5 % is one structure, and it is not the CAM (2026-08-09)
+
+L3.1 pointed at `loadwait` as the real pool but warned it is an aggregate rate. Decomposed per
+cause. For a PLAIN load `iq_issue_ack` is exactly `lsr_capture || mshr_capture`, so the blockers are
+the negated terms of `lsr_capture` — an enumerable set. Each cause is counted **only when it is the
+SOLE blocker** (the causes overlap heavily; "was X present" is not actionable, "would removing X
+alone have let the load through" is). Cycles with ≥2 live causes go to a `multi` bucket.
+
+**N=1 boot, `cy=00deee50` (bit-exact — the counters do not perturb).** The buckets sum to
+**2,987,980 = `loadwait` exactly**, so the partition is complete and there are no unexplained cycles
+(`none` = 0 confirms it):
+
+| sole blocker | cycles | of `loadwait` | of boot |
+|---|---|---|---|
+| **`lsr_v_q`** — LSR occupied | **1,757,323** | **58.8 %** | **12.03 %** |
+| `load_blocks_on_store` | 729,009 | 24.4 % | 4.99 % |
+| `dmem_mmu_busy` | 272,825 | 9.1 % | 1.87 % |
+| AMO/LR/SC issue path | 106,663 | 3.6 % | 0.73 % |
+| multi (≥2 causes) | 89,270 | 3.0 % | 0.61 % |
+| redirect (squash cycle, not a stall) | 32,890 | 1.1 % | 0.23 % |
+| `load_walk_block` / `fpu_cdb` / `mshr_cdb` / `replay_q` | **0** | 0 % | 0 % |
+
+Four of the eight enumerated blockers **never block alone**. The lane-0 contenders (FPU, MSHR,
+divider) are not the problem; neither is the PTW.
+
+**Drill-down on the dominant bucket — why is the incumbent load not completing?** Priority-encoded,
+and again an exact partition (sums to 1,757,323):
+
+| incumbent state | cycles | of boot | |
+|---|---|---|---|
+| driving, `dcache_stall` | **1,043,579** | **7.14 %** | a missing load holds the only LSR slot for the whole miss |
+| read done, `lsr_v_q` still set | **713,742** | **4.89 %** | the hand-off bubble |
+| `m_store_wr_busy` | 2 | — | |
+| fault / `store_drive` / MMU walk / replay | **0** | 0 % | Stage B essentially never loses the port |
+
+**Both halves are the same fact: the Load Stage Register is ONE entry deep.**
+
+- The 4.89 % is structural, not contention. `lsr_capture` requires `!lsr_v_q`, and `lsr_v_q` only
+  drops the cycle *after* `lsr_complete`. For a plain integer load `lsr_to_lane1` is 1, so
+  `lsr_complete` is just `read_done` — the incumbent finishes *this* cycle and the newcomer still
+  waits one. **Every back-to-back load pays a dead cycle even on a dcache hit**, capping load
+  throughput at 1 per 2 cycles.
+- The 7.14 % is the absence of memory-level parallelism for loads. A load that captured into the LSR
+  and then misses sits there for the entire miss; `mshr_capture` releases the *IQ*, not the LSR, so
+  every younger load is behind it. The load path is **blocking**.
+
+**The obvious one-line bypass is not available.** Relaxing the gate to `!lsr_v_q || lsr_complete`
+closes a real combinational loop: `dcache_stall` → `lsr_read_done` → `lsr_complete` → `lsr_capture`
+→ dcache `i_ren` (`heliodor_core.veryl:10234` connects `i_ren : dmem_ren_m || replay_drive ||
+lsr_drive`, and its comment records that `dmem_ren_m` already folds `!lsr_capture`). This is the
+same loop the `lsr_capture` comment cites for excluding `iss_dc_ok`. **A second LSR entry — a real
+2-deep load stage — avoids the question entirely, and is what both halves need anyway.**
+
+**So Block L3's value is real, but it is on the other side of the block from where the plan put it.**
+The plan framed L3 as an age-ordered LQ-CAM for disambiguation; that half is measured dead (L3.1,
+0.41 % ceiling). The half that is worth 12 % of boot stall cycles is **load-queue DEPTH** — more
+than one load in flight — which the plan does not mention at all.
+
+⚠️ **Do not read 12.03 % as 12.03 % of cycles recoverable.** `loadwait` counts cycles where a load
+is *selected but does not ack*; some overlap with work the back end is doing anyway. L3.1 is the
+standing warning here — an event/stall count over-predicted the real prize by 3–5× last time, and
+the only thing that settled it was deleting the mechanism and reading the clock. There is no const
+gate that "deletes" LSR depth, so **the ceiling for this one has to come from building the 2-deep
+scaffold DEAD and flipping it**, not from another counter.
+
+**Next drill, if wanted:** the `load_blocks_on_store` bucket (729,009 cy, 4.99 % of boot) is still
+undecomposed — `load_blocks_on_store` (`heliodor_core.veryl:8672`) ORs `store_drive`, `sb_cnt >= 3`,
+`asq_ld_ovl`, `asq_dr_busy`, the page-edge hold and the AMO terms. Same sole-blocker treatment
+applies and is cheap.
+
 **Instrumentation left in the tree** (all diagnostic; N=1 boot stays bit-exact at `00deee50`):
 `o_dbg_load_replay_cnt` / `o_dbg_inv_viol_cnt` / `o_dbg_mshr_pois_cnt` / `o_dbg_viol_store_cnt` /
-`o_dbg_viol_self_cnt` / `o_dbg_viol_exact_cnt` / `o_dbg_viol_pgx_cnt` / `o_dbg_st_resolve_cnt` on
-`heliodor_core` + `rob`, wired through `heliodor_soc` into `test_soc_linux_boot`. The per-hart
+`o_dbg_viol_self_cnt` / `o_dbg_viol_exact_cnt` / `o_dbg_viol_pgx_cnt` / `o_dbg_st_resolve_cnt` and
+the L4 array `o_dbg_lw_cause[20]` on `heliodor_core` + `rob`, wired through `heliodor_soc` into
+`test_soc_linux_boot`. The per-hart
 subset (`load_viol`/`load_replay`/`inv_viol`/`mshr_pois`/`load_wait`/`rob_commit`) is wired through
 `heliodor_soc_smp` into the N=2/N=4 harnesses; the decomposition counters are N=1-only.
 
