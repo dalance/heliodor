@@ -194,9 +194,129 @@ counter at all** (`tb/test_soc_*_linux_boot*.veryl` have no `loadviol` port) —
 `o_dbg_load_viol_cnt` through them is the first task, because the kernel and SMP are the only places
 a violation is plausible.
 
+> ⚠️ **Superseded by L3.0/L3.1 below (2026-08-09).** The wiring was done and the boot answer is
+> **not** zero — 19,539 poisons / 16,496 replays on the N=1 boot. The microbenchmarks read 0 because
+> they run **bare**, where the overlap test is exact; the degradation is Sv39-only. But the
+> *conclusion* here still holds for a different reason: deleting the dominant poison source outright
+> buys only **0.41 %** (L3.1). Right verdict, wrong evidence. Read L3.0/L3.1, not this.
+
 **Decide the justification before building.** If `loadviol` is ~0 on the boots too, L3 cannot be
 sold on IPC and must stand or fall on (a) canonical LSQ structure and (b) CP — and (b) needs a
 `veryl synth` number, not an argument. Bring that to the user rather than assuming.
+
+### L3.0 — THE CENSUS, MEASURED (2026-08-09). The microbenchmark zero does not carry.
+
+The counters are now wired through the SoCs into the boot harnesses (`o_dbg_load_viol_cnt` and, new
+here, `o_dbg_load_replay_cnt` / `o_dbg_inv_viol_cnt` / `o_dbg_mshr_pois_cnt` /
+`o_dbg_viol_store_cnt` / `o_dbg_viol_self_cnt` / `o_dbg_viol_exact_cnt` / `o_dbg_viol_pgx_cnt` /
+`o_dbg_st_resolve_cnt`). All are diagnostic — the N=1 boot is **`cy=00deee50`, bit-exact with the
+shipped baseline**, so nothing here perturbs the design.
+
+**N=1 Linux boot, shipped default (`78529fe`): 14,609,488 cy / 10,434,358 instret**
+
+| counter | value | what it is |
+|---|---|---|
+| `stresolve` | 1,877,893 | stores resolving on CDB lane 0 — the denominator |
+| `loadviol` | **19,539** | poison events (both scans fused, as the old counter always was) |
+| ├ `violstore` | 6,459 | the store-resolve scan (a store poisons younger executed loads) |
+| │ └ of which `exact` | **6,419** | …a full-width compare of the two recorded addresses also fires |
+| │ └ of which `pgx` | **0** | …the VM page-cross blanket. **Never fires. Hypothesis dead.** |
+| └ `violself` | **13,083** | the S15 record-time self-scan (a load poisons ITSELF) |
+| `loadreplay` | **16,496** | commit-time replays — full redirect + refetch of the load and younger |
+| `invviol` | 0 | P9.0 CoRR remote-invalidate poison (expected 0 at N=1) |
+| `mshrpois` | 0 | S10.3 aborted-MSHR-fill poison |
+| `loadwait` | 2,987,980 | 20.5 % of all cycles: a selected load cannot issue |
+
+**The hand-off premise above is refuted, but not in the direction it assumed.** It is not that
+disambiguation never fires — it fires 19,539 times and costs 16,496 full redirects. It is that
+**the microbenchmarks run bare (no MMU) where the overlap test is an exact 64-bit compare, so they
+cannot see the problem at all.** Under Sv39 the test degrades, and that degradation is the entire
+signal. dhrystone/coremark reading 0 was never evidence about the kernel.
+
+**Where the 19,539 actually come from — attributed, not inferred:**
+
+- The **store-resolve scan is already precise**: 6,419 of its 6,459 events (99.4 %) are confirmed by
+  a full-width compare. There is nothing to win here.
+- The **S15 record-time self-scan is 13,083 events — 67 % of all poisons — and has no exact arm at
+  all.** Its firing condition (`rob.veryl`, `rec0/rec1/recq_self_viol_w`) is literally *page offsets
+  overlap AND the full VAs do not*: `a0_ovl && !a0_va_ovl`. That is the "different VA, might still
+  be the same PA" alias suspicion, and it is resolved by poisoning unconditionally.
+
+**Why it is approximate, and why the fix is already half-built.** Under VM the load record and the
+resolving store are not in the same address space — `sh_load_addr` is fed from the lane-0/lane-1 CDB
+(`lsr_vaddr_q`, a **VA**) while MSHR captures record a **PA**, and the store shadow `sh_store_addr`
+is a VA. Only bits [11:0] are translation-invariant, hence the 13-bit range compare. But **both
+exact PAs already exist in the RTL and neither is used by disambiguation**:
+
+- the load's PA is `lsr_paddr_q` (`heliodor_core.veryl:4228`), the Stage-A translated PA, live at
+  the load's execute cycle — the ROB records the VA next to it and drops the PA;
+- the store's PA is `store_pretx_pa` (`:8572` — the TLB probe L2/`STORE_PRETRANSLATE` already
+  captures for the commit drain), and it is **already a ROB input and shadow field**
+  (`i_cdb_store_pa` → `sh_store_pa` / `sh_store_pa_valid`, `rob.veryl:448`). `store_pretx_valid`
+  asserts on `cdb.valid && cdb.is_store` — *the same cycle the scan runs*.
+
+So the age-ordered load queue Block L3 asks for is, structurally, already present: the ROB shadow
+arrays (`sh_load_addr` / `sh_load_done` / `sh_load_funct3` / `sh_load_poison`) ARE an age-ordered LQ
+checked at store-execute. What is missing is not the queue — it is that **the queue is tagged with
+the wrong address**. The canonical increment is therefore *PA-exact LQ records*, not a new structure:
+record `lsr_paddr_q` alongside the VA, and let both scans use an exact PA overlap test whenever both
+PAs are valid, falling back to today's conservative test otherwise. Strictly fewer poisons, same
+true positives (PA overlap ⟺ byte overlap), and the stale-translation case is already gated by
+`rob_has_pending_xlate` on the store side.
+
+### L3.1 — THE CEILING, MEASURED. **0.41 %. Do not build L3 for IPC.**
+
+Rather than estimate the prize from the event count, delete the dominant source outright and read
+the cycles. `S15_SELF_SCAN` (`rob.veryl:768`) gates the three record-time self-scan flags. It is a
+**measurement arm only** — removing the scan is UNSOUND for a genuine VA alias — and it must stay
+at 1. At 0 the N=1 boot still reaches SBI shutdown with correct output:
+
+| N=1 boot | `S15_SELF_SCAN=1` (ship) | `=0` (probe) | Δ |
+|---|---|---|---|
+| cycles | **14,609,488** (`00deee50`) | **14,549,488** (`00de03f0`) | **−60,000 = −0.41 %** |
+| `loadreplay` | 16,496 | 10,524 | −5,972 |
+| `violself` | 13,083 | 0 | −13,083 |
+| `violstore` | 6,459 (exact 6,419) | **11,743** (exact 11,709) | **+5,284** |
+| `instret` | 10,434,358 | 10,434,440 | +82 |
+
+**Deleting 13,083 poisons buys 5,972 fewer replays, not 13,083.** The machine that stops replaying
+runs further ahead, and 5,284 of the avoided conservative poisons come straight back as *genuine*
+store-resolve violations (99.7 % exact-confirmed). The two scans partly cover the same conflicts
+from opposite sides; suppressing one just moves the detection.
+
+**So the ceiling on the whole PA-exact idea is 0.41 % of the N=1 boot — and that is the UNSOUND
+bound.** A sound PA-exact test only fires where both PAs are available (`sh_store_pa_valid` needs a
+clean TLB-probe hit, no pending xlate), so the real number is strictly less. **L3 has no IPC case.**
+The earlier estimate in this document of "roughly 1–2 %" was derived from the event count and a
+redirect-cost band; the direct measurement refutes it. Attribute, then measure the ceiling, then
+build — the estimate was wrong by 3–5×.
+
+**SMP adds nothing to the case.** N=2 boot, `cy=012b60a0` (baseline, bit-exact):
+
+| | `loadreplay` | `loadviol` | `invviol` | `mshrpois` | `loadwait` | `instret` |
+|---|---|---|---|---|---|---|
+| hart0 | 19,971 | 22,442 | **0** | 0 | 4,014,596 | 13,301,401 |
+| hart1 | 879 | 961 | **1** | 0 | 875,021 | 14,600,654 |
+
+The P9.0 CoRR remote-invalidate poison fires **once** in an entire 2-hart Linux boot. There is no
+SMP-specific memory-ordering cost to recover either.
+
+**What survives as a reason to do L3:** only (a) canonical LSQ structure and (b) CP — and (b) still
+needs a `veryl synth` number, not an argument. The IPC leg is now measured and gone.
+
+**Where the cycles actually are, for whoever picks the next block.** `loadwait` is 20.5 % of N=1
+cycles (2,987,980) and 4.0 M/0.9 M per hart at N=2. That is issue-side serialization —
+`load_blocks_on_store` in `heliodor_core.veryl` (`sb_cnt >= 3`, `store_drive`, `asq_dr_busy`,
+`asq_ld_ovl`, the page-edge hold) — **not** disambiguation, and an LQ-CAM does not address it. It is
+an aggregate rate, so per the campaign's own rule it needs a per-event attribution before anything
+is built on it.
+
+**Instrumentation left in the tree** (all diagnostic; N=1 boot stays bit-exact at `00deee50`):
+`o_dbg_load_replay_cnt` / `o_dbg_inv_viol_cnt` / `o_dbg_mshr_pois_cnt` / `o_dbg_viol_store_cnt` /
+`o_dbg_viol_self_cnt` / `o_dbg_viol_exact_cnt` / `o_dbg_viol_pgx_cnt` / `o_dbg_st_resolve_cnt` on
+`heliodor_core` + `rob`, wired through `heliodor_soc` into `test_soc_linux_boot`. The per-hart
+subset (`load_viol`/`load_replay`/`inv_viol`/`mshr_pois`/`load_wait`/`rob_commit`) is wired through
+`heliodor_soc_smp` into the N=2/N=4 harnesses; the decomposition counters are N=1-only.
 
 ### What is already built — do NOT rebuild
 

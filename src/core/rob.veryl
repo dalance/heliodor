@@ -397,6 +397,13 @@ pub module rob #(
     // is OFF (conservative block prevents any younger load from executing before
     // an older unknown store resolves); after the S9.4 flip it counts replays.
     o_dbg_load_viol_cnt: output logic<32>,
+    o_dbg_inv_viol_cnt : output logic<32>, // L3 census: P9.0 CoRR remote-invalidate poison events
+    o_dbg_mshr_pois_cnt: output logic<32>, // L3 census: S10.3 aborted-MSHR-fill poison events
+    o_dbg_viol_exact_cnt: output logic<32>, // L3 census: violations a full-width compare also finds
+    o_dbg_viol_pgx_cnt  : output logic<32>, // L3 census: violations from the page-cross blanket
+    o_dbg_st_resolve_cnt: output logic<32>, // L3 census: store resolves (the denominator)
+    o_dbg_viol_store_cnt: output logic<32>, // L3 census: store-resolve scan events
+    o_dbg_viol_self_cnt : output logic<32>, // L3 census: S15 record-time self-scan events
 ) {
     var entries: pipeline_pkg::RobEntry    [ROB_DEPTH];
     var head   : logic                    <6>            ; // ROB_IDX_W + 1 for full/empty distinction
@@ -751,6 +758,14 @@ pub module rob #(
     // alias of the same page cannot forward and is caught by the record-time
     // scan below (offset overlap without VA overlap → replay).
     let s15_vm_spec_en: logic = 1'b1;
+    // L3 census probe (2026-08-09). The record-time self-scan below is 13,083 of
+    // the N=1 boot's 19,539 poisons and has no exact arm — it fires on "page
+    // offsets overlap AND full VAs do not", i.e. pure VA-alias suspicion. Setting
+    // this to 0 removes the scan entirely. That is UNSOUND for a genuine VA alias
+    // (two VAs onto one PA would go unreplayed), so it is a MEASUREMENT ARM ONLY,
+    // never a ship candidate: it prices the poisons and tests the hypothesis that
+    // essentially all of them are false. Keep at 1.
+    const S15_SELF_SCAN: bit = 1;
     // Fmax tree-ize: pairwise-argmin of two packed candidates {valid(1),
     // age(ROB_IDX_W=5)} = 6 bits. age_i = i - head_idx is a bijection over
     // 0..ROB_DEPTH, so blocker ages are unique and argmin is associative — a
@@ -905,8 +920,20 @@ pub module rob #(
     // block keeps every younger load from executing before the store resolves).
     var load_viol_w    : logic [ROB_DEPTH];
     var any_load_viol_w: logic            ;
+    // L3 census (diagnostic only — never gates anything). Under VM the overlap
+    // test degrades to a 13-bit page-offset range compare plus a blanket poison
+    // for any access whose [11:0]+size crosses the page end, because the load
+    // record and the resolving store are not in the same address space. These
+    // two flags decompose a firing event into "a full-width compare of the two
+    // recorded addresses would ALSO have fired" (exact) and "only the page-cross
+    // blanket fired" (pgx), so the approximation's false-positive share can be
+    // priced before an exact-PA load queue is designed.
+    var any_viol_exact_w: logic;
+    var any_viol_pgx_w  : logic;
     always_comb {
-        any_load_viol_w = 1'b0;
+        any_load_viol_w  = 1'b0;
+        any_viol_exact_w = 1'b0;
+        any_viol_pgx_w   = 1'b0;
         for i in 0..ROB_DEPTH {
             let st_age : logic<ROB_IDX_W> = i_cdb_rob_idx - head_idx;
             let ld_age : logic<ROB_IDX_W> = (i as ROB_IDX_W) - head_idx;
@@ -940,6 +967,12 @@ pub module rob #(
                 && (ld_age >: st_age) && ovl;
             if load_viol_w[i] {
                 any_load_viol_w = 1'b1;
+                if overlap {
+                    any_viol_exact_w = 1'b1;
+                }
+                if pgx {
+                    any_viol_pgx_w = 1'b1;
+                }
             }
         }
     }
@@ -985,7 +1018,7 @@ pub module rob #(
             let a0_ovl   : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
             let a0_ssz   : logic<64>        = (5'd1 << sh_store_funct3[i][1:0]) as 64;
             let a0_va_ovl: logic            = (i_cdb_store_addr <: sh_store_addr[i] + a0_ssz) && (sh_store_addr[i] <: i_cdb_store_addr + a0_lsz);
-            if i_conservative && s15_vm_spec_en && i_cdb_valid && i_cdb_is_load && !i_cdb_is_lfault
+            if S15_SELF_SCAN && i_conservative && s15_vm_spec_en && i_cdb_valid && i_cdb_is_load && !i_cdb_is_lfault
                 && st_known && (st_age <: a0_age) && a0_ovl && !a0_va_ovl {
                 rec0_self_viol_w = 1'b1;
             }
@@ -994,7 +1027,7 @@ pub module rob #(
             let a1_la13: logic<13>        = {1'b0, i_cdb2_store_addr[11:0]};
             let a1_le13: logic<13>        = a1_la13 + ((5'd1 << i_cdb2_store_funct3[1:0]) as 13);
             let a1_ovl : logic            = s_pgx || (a1_le13 >: 13'h1000) || ((a1_la13 <: se13) && (sa13 <: a1_le13));
-            if i_conservative && s15_vm_spec_en && i_cdb2_valid && i_cdb2_is_load
+            if S15_SELF_SCAN && i_conservative && s15_vm_spec_en && i_cdb2_valid && i_cdb2_is_load
                 && st_known && (st_age <: a1_age) && a1_ovl {
                 rec1_self_viol_w = 1'b1;
             }
@@ -1003,7 +1036,7 @@ pub module rob #(
             let aq_la13: logic<13>        = {1'b0, i_lq_rec_addr[11:0]};
             let aq_le13: logic<13>        = aq_la13 + ((5'd1 << i_lq_rec_funct3[1:0]) as 13);
             let aq_ovl : logic            = s_pgx || (aq_le13 >: 13'h1000) || ((aq_la13 <: se13) && (sa13 <: aq_le13));
-            if i_conservative && s15_vm_spec_en && i_lq_rec_valid
+            if S15_SELF_SCAN && i_conservative && s15_vm_spec_en && i_lq_rec_valid
                 && st_known && (st_age <: aq_age) && aq_ovl {
                 recq_self_viol_w = 1'b1;
             }
@@ -1037,11 +1070,41 @@ pub module rob #(
             inv_viol_w[i] = line_hit && ld_seen && !sh_load_poison[i];
         }
     }
+    // L3 census: any-of reduction over the CoRR scan (one event per cycle, so the
+    // counter matches the "how many replays did this source cause" question).
+    var any_inv_viol_w: logic;
+    always_comb {
+        any_inv_viol_w = 1'b0;
+        for i in 0..ROB_DEPTH {
+            if inv_viol_w[i] {
+                any_inv_viol_w = 1'b1;
+            }
+        }
+    }
 
     var alloc_cnt    : logic<32>;
     var cdb_cnt2     : logic<32>;
     var commit_cnt   : logic<32>;
     var load_viol_cnt: logic<32>;
+    // L3 census: load_viol_cnt counts only the store-resolve / record-time scans.
+    // Two further sources poison a load into the same commit-time replay and were
+    // never counted — the P9.0 remote-invalidate (CoRR) scan and the S10.3
+    // aborted-MSHR-fill pulse. Count them separately so the replay total can be
+    // attributed instead of inferred.
+    var inv_viol_cnt : logic<32>;
+    var mshr_pois_cnt: logic<32>;
+    // L3 census: decomposition of the store-resolve violation events, plus the
+    // store-resolve total as the denominator.
+    var viol_exact_cnt: logic<32>; // a full-width compare would have fired too
+    var viol_pgx_cnt  : logic<32>; // the page-cross blanket fired
+    var st_resolve_cnt: logic<32>; // stores resolving on CDB lane 0
+    // load_viol_cnt fuses two independent scans. Split them: the store-resolve
+    // scan (a store poisons younger executed loads) and the S15 record-time
+    // self-scan (a load poisons ITSELF against older resolved stores). The
+    // self-scan is VM-only and has no exact arm at all, so its share is entirely
+    // page-offset suspicion.
+    var viol_store_cnt: logic<32>;
+    var viol_self_cnt : logic<32>;
 
     always_ff (clk, rst) {
         if_reset {
@@ -1139,6 +1202,13 @@ pub module rob #(
             cdb_cnt2      = 32'd0;
             commit_cnt    = 32'd0;
             load_viol_cnt = 32'd0;
+            inv_viol_cnt   = 32'd0;
+            mshr_pois_cnt  = 32'd0;
+            viol_exact_cnt = 32'd0;
+            viol_pgx_cnt   = 32'd0;
+            st_resolve_cnt = 32'd0;
+            viol_store_cnt = 32'd0;
+            viol_self_cnt  = 32'd0;
         } else if i_redirect_fire {
             // Full flush — return ROB to empty. n_inflight in free_list
             // gets the same recovery_fire pulse so popped pdsts come back.
@@ -1497,6 +1567,29 @@ pub module rob #(
             if any_load_viol_w || rec0_self_viol_w || rec1_self_viol_w || recq_self_viol_w {
                 load_viol_cnt = load_viol_cnt + 32'd1;
             }
+            // L3 census: decompose the violation and count the denominator.
+            if any_load_viol_w && any_viol_exact_w {
+                viol_exact_cnt = viol_exact_cnt + 32'd1;
+            }
+            if any_load_viol_w && any_viol_pgx_w {
+                viol_pgx_cnt = viol_pgx_cnt + 32'd1;
+            }
+            if i_cdb_valid && i_cdb_is_store {
+                st_resolve_cnt = st_resolve_cnt + 32'd1;
+            }
+            if any_load_viol_w {
+                viol_store_cnt = viol_store_cnt + 32'd1;
+            }
+            if rec0_self_viol_w || rec1_self_viol_w || recq_self_viol_w {
+                viol_self_cnt = viol_self_cnt + 32'd1;
+            }
+            // L3 census: the two poison sources load_viol_cnt does not cover.
+            if any_inv_viol_w {
+                inv_viol_cnt = inv_viol_cnt + 32'd1;
+            }
+            if i_load_poison_v || i_load_poison_v2 {
+                mshr_pois_cnt = mshr_pois_cnt + 32'd1;
+            }
             // Phase 8 S10.3: aborted-MSHR-fill poison (replay at commit, S9.3).
             // The partial-squash below runs LATER, so a squashed entry's poison
             // is correctly re-cleared; a full flush invalidates the entry and
@@ -1595,4 +1688,11 @@ pub module rob #(
     assign o_dbg_cdb_cnt    = cdb_cnt2;
     assign o_dbg_commit_cnt = commit_cnt;
     assign o_dbg_load_viol_cnt = load_viol_cnt;
+    assign o_dbg_inv_viol_cnt  = inv_viol_cnt;
+    assign o_dbg_mshr_pois_cnt = mshr_pois_cnt;
+    assign o_dbg_viol_exact_cnt = viol_exact_cnt;
+    assign o_dbg_viol_pgx_cnt   = viol_pgx_cnt;
+    assign o_dbg_st_resolve_cnt = st_resolve_cnt;
+    assign o_dbg_viol_store_cnt = viol_store_cnt;
+    assign o_dbg_viol_self_cnt  = viol_self_cnt;
 }
