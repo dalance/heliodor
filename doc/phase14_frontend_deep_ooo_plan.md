@@ -411,6 +411,48 @@ undecomposed — `load_blocks_on_store` (`heliodor_core.veryl:8672`) ORs `store_
 `asq_ld_ovl`, `asq_dr_busy`, the page-edge hold and the AMO terms. Same sole-blocker treatment
 applies and is cheap.
 
+### L4 step-2 — BUILT AND FLIPPED. Flip FAILS on a lost AMO update; scaffold banked at 0.
+
+`LSR_MSHR_B` (`heliodor_core.veryl:10478`) hands a Stage-B load that misses to the 2-entry MSHR and
+frees the LSR the same cycle. Eligibility mirrors the original issue-side qualifier against the
+LSR's latched state (not faulting / FP / uncached / cross-dword span / forwarded-bytes /
+wrong-path). Kept separate from `mshr_capture` because that signal also drives `iq_issue_ack` and a
+Stage-B handoff must not ack an unrelated IQ op; it *does* drive the ROB LQ-record port, from
+`lsr_paddr_q`.
+
+| arm | result |
+|---|---|
+| **`=0` (DEAD, shipped)** | **252/0, N=1 boot `cy=00deee50`, `instret` 10434358, every census counter bit-identical.** Verified, committed. |
+| **`=1` (flip)** | **249 passed / 3 failed. `test_litmus_2hart` FAILS: `tohost=0x7012` → test 7, slot 1 = LOST AMO UPDATE.** |
+
+Test 7 is AMO atomicity: two harts each run `AMO_ITER` × `amoadd.w` on one word and the total must
+be `2*AMO_ITER`. Losing an update is a real memory-model bug, not a timing shift.
+
+**Leading hypothesis — the replay engine and R3's atomic drain have never coexisted.** Waking the
+handoff also wakes `replay_q` / `replay_drive`, which have been inert since `88b7735`
+(2026-06-26). Everything R3 built *after* that — `ATOMIC_SQ`, `ASQ_NOREAD`, the drain engine and its
+port arbitration (`asq_dr_busy`, and `asq_dr_go_r` forcing `dmem_ren_m` at `:10187`) — was designed
+and validated against a tree where **no replay could ever drive the dcache port**. Both now claim
+it. R3's own history says this exact symptom is what a port/latch race there looks like: the §7.11
+root cause was a diverted atomic's write latching into `m_wen_q` and landing twice, found only by
+per-event attribution.
+
+**Where to start** (do not re-derive the design — the scaffold is correct as far as the flip goes):
+1. Reproduce standalone: `veryl test --ignored --test test_litmus_2hart` at `=1`. It is in the
+   default suite, so the loop is short.
+2. Instrument the *port*, not the outcome: count cycles where `replay_drive` and `asq_dr_busy` (or
+   `asq_dr_go_r`, or `commit_store_fire`) are simultaneously live. If that count is 0 the hypothesis
+   is dead and the bug is elsewhere — cheap and decisive either way.
+3. The matched-control trick applies: `=0` with the same instrumentation is the control.
+4. If the ports do collide, the fix is arbitration (the ASQ drain should block a replay start, or
+   `replay_drive` must yield like `lsr_drive` already does via `!store_drive && dmem_mmu_idle &&
+   !m_store_wr_busy` — note `replay_drive` may simply be missing the ASQ terms that were added to
+   `lsr_drive`'s peers after it went dead).
+
+⚠️ Do not flip `LSR_MSHR_B` to 1 on master until litmus N=2 **and** N=4 pass. The other two failures
+in the 249/3 run were not captured (the suite output was tail-truncated) — re-run and collect them
+before diagnosing, since they may share the root cause or be a second, independent one.
+
 **Instrumentation left in the tree** (all diagnostic; N=1 boot stays bit-exact at `00deee50`):
 `o_dbg_load_replay_cnt` / `o_dbg_inv_viol_cnt` / `o_dbg_mshr_pois_cnt` / `o_dbg_viol_store_cnt` /
 `o_dbg_viol_self_cnt` / `o_dbg_viol_exact_cnt` / `o_dbg_viol_pgx_cnt` / `o_dbg_st_resolve_cnt` and
