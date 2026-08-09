@@ -357,12 +357,42 @@ and again an exact partition (sums to 1,757,323):
   and then misses sits there for the entire miss; `mshr_capture` releases the *IQ*, not the LSR, so
   every younger load is behind it. The load path is **blocking**.
 
-**The obvious one-line bypass is not available.** Relaxing the gate to `!lsr_v_q || lsr_complete`
-closes a real combinational loop: `dcache_stall` → `lsr_read_done` → `lsr_complete` → `lsr_capture`
-→ dcache `i_ren` (`heliodor_core.veryl:10234` connects `i_ren : dmem_ren_m || replay_drive ||
-lsr_drive`, and its comment records that `dmem_ren_m` already folds `!lsr_capture`). This is the
-same loop the `lsr_capture` comment cites for excluding `iss_dc_ok`. **A second LSR entry — a real
-2-deep load stage — avoids the question entirely, and is what both halves need anyway.**
+**The obvious one-line bypass is not available — tried it, the loop is real.** `doc/lsu_pipeline_
+plan.md` §11 claims the bubble is "recoverable with back-to-back capture (`lsr_accept = !lsr_v_q ||
+lsr_complete`)". It is not, as stated. Relaxing the gate that way and running the suite gives
+**230/252 failed with the simulator's `involved in loop`**, closing through `heliodor_soc.veryl:78`
+(`in_dram = c_dmem_addr[31]`) and `heliodor_core.veryl` `lsr_drive`.
+
+Two things worth carrying forward from that experiment:
+
+- **`veryl build` does NOT catch it, and neither does a narrow test.** The build is clean and
+  `test_dcache` passes; only the full-core simulation reports the loop. The step-1 commit's "veryl
+  build (clean, no comb loop)" is not the check it reads like. **Run the default suite.**
+- **The loop is not the one the step-1 comment names.** That comment cites `i_ren ← lsr_capture`,
+  and that path is genuinely broken now — at `MEM_PIPE=1` (`:4283`) `dmem_ren_m` takes the
+  registered `m_ren_q` arm, so the `!lsr_capture` fold is only on the dead `MEM_PIPE=0` arm. The
+  loop that actually fires closes through the dcache **address/decode** path instead:
+  `lsr_capture` → the dmem address mux → SoC decode → hit/miss → `dcache_stall` → `lsr_read_done` →
+  `lsr_complete` → `lsr_capture`. A comment can outlive its reason while the conclusion stays true.
+
+**A second LSR entry avoids the question entirely**: accept is then a function of a flop
+(`!lsr_v_q[tail]`), never of the incumbent completing this cycle, so no accept→complete edge exists.
+
+**But depth-2 is not the best first increment — step-2 is.** A 2-deep LSR recovers the 4.89 %
+bubble and little of the 7.14 %: if entry 0 is stalled on a fill, entry 1 can capture but still
+cannot drive, because the dcache is busy. The 7.14 % needs the load to *leave* on a miss — which is
+exactly **step-2, "non-blocking MSHR-from-Stage-B"**, named and deferred by the step-1 commit
+(`88b7735`) and never built. Its receiving machinery is **already in the tree and merely
+disconnected**: `let mshr_plain_load: logic = 1'b0;` (`:10423`) kills a fully-built 2-entry
+miss-under-miss MSHR — owner/queued capture, replay engine, deferred `mshr_cdb` writeback, age-based
+squash safety, SMP aborted-fill poison. The census confirms it is inert (`mshr_cdb` never blocks,
+`mshrack` = 0).
+
+So the ranking within this bucket is: **step-2 (7.14 %, machinery exists, must be re-qualified from
+the LSR's latched state instead of the issue-side signals) before depth-2 (4.89 %, all-new state).**
+⚠️ The MSHR path has been dead since 2026-06-26 and the tree has since gained R3's atomic SQ,
+`ASQ_NOREAD`, the F2 front end and `MEM_PIPE`. Waking dead RTL across that much churn is the risk to
+budget for — build it DEAD-gated and flip it against the full ladder, N=2 SMP included.
 
 **So Block L3's value is real, but it is on the other side of the block from where the plan put it.**
 The plan framed L3 as an age-ordered LQ-CAM for disambiguation; that half is measured dead (L3.1,
