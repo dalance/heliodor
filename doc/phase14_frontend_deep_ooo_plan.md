@@ -479,15 +479,39 @@ rule, bit-identical means the change never fired: `asq_valid_q[0]` (a queued ato
 never coincides with a replay on an N=1 boot. The terms are kept — they close a real gap and are
 inert at `ATOMIC_SQ`-idle — but they are **not** the boot bug. They may still matter for litmus.
 
-**Next suspect, unproven: `replay_q` freezes the whole plain-load path.** It arms whenever a queued
-entry exists and the fill FSM is idle, and *holds* while armed (`:10803`). Both `lsr_capture` and
-`lsr_drive` carry `!replay_q`, so **while any replay is pending, no load may capture and no Stage-B
-load may drive.** `replay_drive` in turn needs `!store_drive && dmem_mmu_idle && !m_store_wr_busy`;
-under Sv39, `dmem_mmu_idle` is false for long PTW stretches. A replay starved for the port while
-holding every load hostage matches the observed shape — 34.4 M instructions retired, forward
-progress but 3.3× the work, no shutdown. **Instrument that before anything else:** histogram
-`replay_q` residency and count cycles where `replay_q && !replay_drive`, split by which term is
-false. `=0` is the matched control (all zero).
+**Refuted #2: replay starvation.** Both `lsr_capture` and `lsr_drive` carry `!replay_q`, so a
+pending replay does freeze the whole plain-load path — but it barely happens. Instrumented
+(`o_dbg_lw_cause[20..27]`, exact partition, `=0` control all-zero):
+
+`replay_q` resident **78,986 cy of 45 M = 0.18 %**, of which **driving 66,982 (85 %)**; blocked
+`store_drive` 11,699, `dmem_mmu_idle` 305, everything else 0. The replay gets the port almost
+immediately. **Not a starvation stall — the boot failure is wrong data or wrong control.**
+
+**Refuted #3 (as sole cause): the S27 sb-forward gap.** This one is a genuine hole and is now fixed,
+but it is not the whole bug. S27 — added *after* the MSHR path went dead — stopped blocking a plain
+load on a committed-store overlap and instead has the **sb forward layer** (`sbf*`/`sbg*`) patch the
+pending bytes onto the Stage-B data path. A captured load never takes that path: it completes from
+raw `dcache_rdata`/`dc_fill_rdata` via `mshr_cdb`, so those bytes are silently dropped.
+`stld_fwd_mask` does not cover it — that is the ROB-scan (uncommitted-store) forward, a different
+layer — and `sb_ld_ovl` is built from the ISSUE address, so Stage B needs its own compare against
+`lsr_vaddr_q` (`lsr_sb_ovl`). Added to the qualifier. It **fires** (`replay_q` resident 78,986 →
+68,026, `instret` 34,427,162 → 34,429,930, so it is not a no-op) but the boot still fails at the
+same `cy=02aea540` with the same `x3`. **A real gap closed; the failure survives it.**
+
+**Remaining suspects for whoever resumes** — the theme is the same in each: machinery added after
+2026-06-26 that assumed no captured load could exist.
+1. **Data formatting.** `mshr_cdb` writes back `mshra_data_q`, a raw dword. Sign/zero-extension and
+   byte selection by `funct3`/offset happen in the in-pipe path; confirm the MSHR writeback still
+   applies them the same way after the LSU split moved that logic.
+2. **`dc_hit_safe` semantics.** `replay_hit_fire` completes from `dcache_rdata` on the drive cycle.
+   Verify that verdict is still the *replay's* and not the LSR's, now that `lsr_drive` also muxes
+   `i_addr` (`:10245`) — the two are made exclusive only by `lsr_drive`'s `!replay_q`.
+3. **The ROB LQ-record.** The scaffold routes a Stage-B handoff into `i_lq_rec_*`. Check the index
+   is right and that a captured load's ROB entry cannot also be completed by the normal CDB.
+4. Note the `i_addr` mux comment at `:10244` still asserts "lsr_drive and replay_drive are mutually
+   exclusive (the MSHR is disabled for plain loads in step-1)" — the premise is exactly what step-2
+   removes. It happens to remain true via `!replay_q`, but it is the kind of stale invariant this
+   whole diagnosis keeps tripping over.
 
 **Where to start** (do not re-derive the design — the scaffold is correct as far as the flip goes):
 1. Reproduce on the **N=1 boot** at `=1` (~1 min, single-hart, no coherence traffic). Only fall back
