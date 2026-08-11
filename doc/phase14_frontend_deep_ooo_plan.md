@@ -677,10 +677,76 @@ M h=0 [2559195] wb rob=4 a=80007000 f3=2 raw=0 out=0
 ```
 
 The load's **fill returned 0**. So the AMOs are not lost — the captured load's fill read a stale
-line. Next suspect: the stale-fill hazard `fill_blocked_wb` guards (dcache.veryl:1066-1072 records
-the identical symptom, "ra/s0 restored as ZEROS from a stack line evicted dirty and immediately
-reloaded"), reached because a replay-driven miss does not hold `i_ren` the way a blocking LSR drive
-does. Trace `wb_v`/`wb_line`/`fill_blocked_wb` against the claim cycle before theorising.
+line. (The ASQ drain trace then proved it outright: the RMW chain runs unbroken 0x7c8, 0x7c9, …
+**0x7d0 = 2000**, so x really is 2000 and only hart 0's fill disagrees.)
+
+#### L4 step-2 — SOLVED. Five bugs, one root cause: `DCACHE_SYNC_READ` broke "driver == owner"
+
+The remaining four all fell out of the same sentence:
+
+> **`DCACHE_SYNC_READ=1` made every fill decision a function of the PREVIOUS cycle's port state,
+> and the MSHR/replay path was already dead when that landed, so nothing caught it.**
+
+A *blocking* LSR drive holds `i_addr`/`i_ren` on every cycle of its wait, so "whoever is driving
+the port now" and "whoever the in-flight thing belongs to" stay the same signal by accident. A
+*replay* drive is intermittent, and every place that relied on that accident breaks:
+
+| # | invariant that quietly died | fix |
+|---|---|---|
+| 1 | `o_miss_valid` is the IDLE→FILL edge | `&& state == State::IDLE` (dcache) |
+| 2 | "a captured load's bus request survives the capture" | queued handoff only while `fill_busy_q` (`LSR_MSHR_B_QUE_FILLONLY`) |
+| 3 | "the driver at the pulse owns the fill" — LINE | compare `dc_mem_addr[63:6]` |
+| 4 | "the port is free" | `replay_drive` yields to `m_ren_q` like the ASQ drain does |
+| 5 | "…owns the fill" — **DWORD** | new `o_miss_offset`; compare `[63:3]` |
+
+**#2** — `dcache_stall && !dc_miss_valid && !dc_hit_safe` conflates "the dcache is filling someone
+else's line" (safe: `lo_miss` carries `state == IDLE`, so we have no request outstanding) with "our
+OWN miss is waiting for the bus grant" (fatal: `o_memr_req` is asserted and, as the `o_miss_valid`
+comment already spelled out, "needs `i_ren` held to keep requesting the bus"). Freeing the LSR
+withdraws the request mid-arbitration. Restricting the handoff to `fill_busy_q` fixed litmus N=2.
+
+**#5** — `o_fill_rdata` is the ONE critical word the fill was demanded for, and `f_offset_q` is a
+previous-cycle register just like `f_index_q`. Two accesses to the same line but different dwords
+across those two cycles give a line-match with an offset-mismatch, and the owner latches its
+neighbour's dword. `o_memr_addr` zeroes the offset at a fill start, hence the new port.
+
+**How #5 was found — the technique to reach for first.** Retire is in-order and both arms run the
+same program, so the commit streams are identical up to the first wrong VALUE. Dump both
+(`CMT_TRACE`, pc + rd/data, rd only when `has_rd` so branch/store result slots cannot add false
+divergences) and `cmp`:
+
+```
+cmp cmt_dead.log cmt_live.log   ->  differ: line 3216288       (of 10.4M)
+
+  =0   C pc=ffffffff8021786c rd=15 d=0000000080000000
+  =1   C pc=ffffffff8021786c rd=15 d=0000000001fff000   <- the value the NEXT instruction loads
+```
+
+One command, one culprit instruction, zero hypotheses. Cost: two traced boots (375 MB + 1.2 GB).
+Contrast the five preceding hypotheses, every one of which died **bit-identical** (never fired).
+
+**Ladder at `LSR_MSHR_B=1`** (all green):
+
+| gate | result | =0 baseline |
+|---|---|---|
+| default suite | **252 / 0** | 252 / 0 |
+| litmus N=4 | PASS `cy=003c1ea0` (3.94 M) | 3.78 M — **+4.3 %** |
+| N=1 Linux boot | PASS `cy=00dec740` (14.60 M) | 14.61 M — −0.07 % |
+| N=2 SMP boot | PASS `cy=012a0110` (19.53 M) | 19.62 M — −0.46 % |
+| `LSR_MSHR_B=0` re-check | **252 / 0, `cy=00deee50`, instret 10434358** | bit-exact |
+
+⚠️ **The IPC prize did NOT arrive.** L4 priced the LSR-occupancy bucket at 7.14 % of the boot; this
+delivers 0.07-0.46 %, and litmus N=4 gets 4.3 % SLOWER (contended atomics pay for the replays).
+The reason is #2: `QUE_FILLONLY` excludes the "own miss waiting for the grant" case, which is most
+of the bucket. Unlocking it needs the handoff to keep the bus request alive across the LSR release
+— i.e. the dcache must latch the pending miss instead of re-deriving it from `i_ren` each cycle.
+That is real work, not a qualifier. **Measure `QUE_FILLONLY=0` before designing it**: the five
+attribution bugs are fixed now, so the case may simply work, and if it does the census says that is
+where the 7 % lives.
+
+⚠️ Bugs #1, #3, #4, #5 are **latent defects in shipped RTL**, not step-2 defects — every consumer
+that could observe them is dead at `mshr_plain_load = 0`. They become live the moment anything
+takes fill ownership again.
 
 **Instrumentation left in the tree** (all diagnostic; N=1 boot stays bit-exact at `00deee50`):
 `o_dbg_load_replay_cnt` / `o_dbg_inv_viol_cnt` / `o_dbg_mshr_pois_cnt` / `o_dbg_viol_store_cnt` /

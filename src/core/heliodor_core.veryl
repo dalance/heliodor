@@ -4225,6 +4225,7 @@ pub module heliodor_core #(
     // readers yield the port (iss_dc_ok), so dc_hit_safe is the REPLAY
     // address's verdict, not an issuing load's.
     var replay_q: logic;
+    var fill_busy_q: logic; // dcache fill FSM busy (start → DONE); read by the step-2 QUE gate
     // Phase 8 S10.4a: pipe-0 hit-under-miss. dc_hit_safe = the dcache's
     // fill-safe hit on i_addr; ld0_hum_ok (forward-ref, assigned in the MSHR
     // block) lets a plain bare-mode slot-0 load that HITS complete in-pipe
@@ -8135,13 +8136,34 @@ pub module heliodor_core #(
     // stream can, and it is timing-independent. Only usable on a short directed test
     // (rv64mi-ma_addr = seconds) — never on a boot.
     const CMT_TRACE: bit = 0;
+    // Separate const from CMT_TRACE: the commit stream is only affordable on a directed
+    // test, while the MSHR/ASQ traces are sparse enough for a litmus run. h= is HART_ID
+    // (N>1 harts interleave on stdout).
+    const MSHR_TRACE: bit = 0;
+    var trc_cy_q: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            trc_cy_q = '0;
+        } else {
+            trc_cy_q = trc_cy_q + 32'd1;
+        }
+    }
+    // rd/data are only printed when the entry HAS an rd: for a branch/store the ROB's
+    // result_data slot holds whatever its producer left there, which can differ between
+    // arms for benign reasons and would swamp a diff with false divergences.
     always_ff (clk, rst) {
         if_reset {} else if CMT_TRACE {
-            if rob_commit_ack {
-                $display("C0 pc=%h rd=%d d=%h", c_pc, c_rd_arch, c_result_data);
+            if rob_commit_ack && c_has_rd {
+                $display("C pc=%h rd=%d d=%h", c_pc, c_rd_arch, c_result_data);
             }
-            if commit2_fire {
-                $display("C1 pc=%h rd=%d d=%h", c2_pc, c2_rd_arch, c2_result_data);
+            if rob_commit_ack && !c_has_rd {
+                $display("C pc=%h", c_pc);
+            }
+            if commit2_fire && c2_has_rd {
+                $display("C pc=%h rd=%d d=%h", c2_pc, c2_rd_arch, c2_result_data);
+            }
+            if commit2_fire && !c2_has_rd {
+                $display("C pc=%h", c2_pc);
             }
         }
     }
@@ -9807,8 +9829,19 @@ pub module heliodor_core #(
     // compare against replay_addr; single-dword only, since cross-dword spans are
     // excluded from capture (!lsr_dc_load_next). Bounded: the ASQ entry drains.
     let asq_replay_ovl: logic = ATOMIC_SQ && asq_valid_q[0] && asq_pa_q[0][11:3] == replay_addr[11:3];
+    // L4 step-2: the READ counterpart of m_store_wr_busy. At MEM_PIPE=1 a NON-capturing
+    // memory read (AMO/LR fetch, an uncached load whose lsr_capture was blocked, …) is
+    // REGISTERED into the M-stage and reaches the dcache the cycle after translate. A
+    // replay firing on that cycle hijacks i_addr and hands the M-stage access the
+    // REPLAY's data. The ASQ drain engine already yields to exactly this
+    // (asq_dr_port_ok: `!m_ren_q && !m_wen_q && !ptw_dc_active`); replay_drive yields to
+    // the write half only. lsr_drive needs no such term — a plain load and a
+    // non-capturing read cannot both be in flight (the issue gates keep an AMO out while
+    // lsr_v_q), and a probe over a whole N=1 boot confirms lsr_drive NEVER collides
+    // while replay_drive does. Bounded: the M-stage access completes or retries.
+    let m_load_rd_busy: logic = MEM_PIPE && m_ren_q;
     let replay_drive: logic = replay_q && !store_drive && dmem_mmu_idle && !m_store_wr_busy
-        && !asq_dr_busy && !asq_replay_ovl;
+        && !m_load_rd_busy && !asq_dr_busy && !asq_replay_ovl;
 
     // ============================================================
     // Phase 1 LSU 2-stage: Load Stage Register control (assigned here so
@@ -9851,6 +9884,7 @@ pub module heliodor_core #(
     // block after the instance. dc_miss_valid = fill-start pulse, dc_fill_complete
     // = non-aborted DONE, dc_fill_rdata = filled dword at the original miss offset.
     var dc_miss_valid   : logic    ;
+    var dc_miss_offset  : logic<3> ; // L4 step-2: demanded dword of the starting fill
     var dc_fill_complete: logic    ;
     var dc_fill_rdata   : logic<64>;
     var dc_fill_aborted : logic    ;
@@ -10136,6 +10170,26 @@ pub module heliodor_core #(
     // program-order position without the drain having to reason about the buffer.
     let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full && sb_empty;
     let asq_drain: logic = ATOMIC_SQ && asq_dr_wdone;
+    // L4 step-2 litmus diagnosis: ASQ drain trace, filtered to ONE line so the volume
+    // stays readable in a 3.1M-cycle 2-hart run. TRC_LINE is the line of litmus test 7's
+    // shared counter x (PA 0x80007000; 0x80007000 >> 6 = 0x20001C0). MSHR_TRACE-gated.
+    let asq_trc_hit: logic = asq_pa_q[0][31:6] == 26'h20001C0;
+    always_ff (clk, rst) {
+        if_reset {} else if MSHR_TRACE {
+            if asq_alloc && ac_pa_q[31:6] == 26'h20001C0 {
+                $display("A h=%d [%d] alloc pa=%h", HART_ID, trc_cy_q, ac_pa_q);
+            }
+            if asq_dr_rdone && asq_trc_hit {
+                $display("A h=%d [%d] rd  pa=%h old=%h", HART_ID, trc_cy_q, asq_pa_q[0], dcache_rdata);
+            }
+            if asq_dr_wdone && asq_trc_hit {
+                $display("A h=%d [%d] wr  pa=%h new=%h", HART_ID, trc_cy_q, asq_pa_q[0], asq_dr_wdata);
+            }
+            if asq_dr_poison && asq_trc_hit {
+                $display("A h=%d [%d] POIS pa=%h", HART_ID, trc_cy_q, asq_pa_q[0]);
+            }
+        }
+    }
     always_ff (clk, rst) {
         if_reset {
             for i in 0..ASQ_N {
@@ -10248,6 +10302,33 @@ pub module heliodor_core #(
     let dmem_wexcl_m : logic     = if asq_dr_go_w ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : (if amo_commit_live ? (amo_cwr_eff && ac_wexcl_q) : m_wen_excl_q)) : dc_wen_excl;
     let dmem_addr2_m : logic<64> = if MEM_PIPE ? m_addr2_q    : dc_addr2;
     let dmem_ren2_m  : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_ren2_q) : dc_ren2;
+    // L4 step-2 diagnosis probes: does a replay/Stage-B drive HIJACK the port from an
+    // access that is already in flight? asq_dr_port_ok yields to `!m_ren_q && !m_wen_q`
+    // and `!ptw_dc_active`; replay_drive/lsr_drive yield to neither. One-shot so the
+    // cost is a line each. MSHR_TRACE-gated.
+    var pr1_q: logic; var pr2_q: logic; var pr3_q: logic; var pr4_q: logic;
+    always_ff (clk, rst) {
+        if_reset {
+            pr1_q = 1'b0; pr2_q = 1'b0; pr3_q = 1'b0; pr4_q = 1'b0;
+        } else if MSHR_TRACE {
+            if replay_drive && m_ren_q && !pr1_q {
+                pr1_q = 1'b1;
+                $display("P1 [%d] replay_drive over registered M-stage READ (m_pa=%h replay_a=%h)", trc_cy_q, m_pa_q, replay_addr);
+            }
+            if replay_drive && ptw_dc_active && !pr2_q {
+                pr2_q = 1'b1;
+                $display("P2 [%d] replay_drive during ptw_dc_active", trc_cy_q);
+            }
+            if lsr_drive && m_ren_q && !pr3_q {
+                pr3_q = 1'b1;
+                $display("P3 [%d] lsr_drive over registered M-stage READ (m_pa=%h lsr_pa=%h)", trc_cy_q, m_pa_q, lsr_paddr_q);
+            }
+            if replay_drive && dmem_wen_m && !pr4_q {
+                pr4_q = 1'b1;
+                $display("P4 [%d] replay_drive during a dcache WRITE", trc_cy_q);
+            }
+        }
+    }
     let dmem_lnext2_m: logic     = if MEM_PIPE ? m_lnext2_q   : dc_load_next2;
     inst u_dcache: dcache (
         clk                                              ,
@@ -10323,6 +10404,7 @@ pub module heliodor_core #(
         o_stall          : dcache_stall                  ,
         o_data_valid     : _                             , // single-hart
         o_miss_valid     : dc_miss_valid                 , // S10.1: MSHR capture trigger
+        o_miss_offset    : dc_miss_offset                , // L4 step-2: that fill's demanded dword
         o_fill_complete  : dc_fill_complete              ,
         o_fill_rdata     : dc_fill_rdata                 ,
         o_fill_aborted   : dc_fill_aborted               , // S10.3: stale fill → poison+replay
@@ -10647,8 +10729,27 @@ pub module heliodor_core #(
     // replay_drive). Turning _que off leaves the replay path dead, so a pass at
     // QUE=0 pins the bug on the replay engine and a fail pins it on the handoff.
     const LSR_MSHR_B_QUE: bit = 1;
+    // `dcache_stall && !dc_miss_valid && !dc_hit_safe` covers TWO different situations
+    // and only one of them is safe to hand off:
+    //   (a) the dcache is filling SOMEONE ELSE's line (fill_busy_q). Our load has no
+    //       bus request outstanding — lo_miss carries `state == IDLE`, so load_sel_raw
+    //       is 0 throughout — and nothing is lost by freeing the LSR.
+    //   (b) our OWN miss is waiting for the bus grant. Here load_sel_raw IS 1 and
+    //       o_memr_req is asserted; the FSM stays IDLE and, as the o_miss_valid comment
+    //       in dcache.veryl spells out, "needs i_ren held to keep requesting the bus, so
+    //       a core that captured the load into an MSHR on the raw miss and dropped i_ren
+    //       would strand the fill". The Stage-B handoff frees the LSR, i_ren drops, and
+    //       load_sel_q follows it down one cycle later — withdrawing a request mid
+    //       arbitration.
+    // QUE_FILLONLY restricts the handoff to (a). Observed at =0: litmus N=2 test 7
+    // (2000 amoadds across 2 harts, then `lw t0,0(s4)`) retires 0 from a fill, while the
+    // ASQ drain trace proves the RMW chain is intact all the way to 0x7d0 = 2000 — i.e.
+    // the atomics are fine and the captured load's FILL read a line that predates all of
+    // them. Case (b) is the only structural difference from the =0 arm at that load.
+    const LSR_MSHR_B_QUE_FILLONLY: bit = 1;
     let mshr_cap_b_que_raw: logic = LSR_MSHR_B_QUE && lsr_mshr_ok && lsr_drive && !dc_miss_valid && dcache_stall
-        && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid;
+        && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid
+        && (!LSR_MSHR_B_QUE_FILLONLY || fill_busy_q);
     // ── L4 step-2 budget bisection (DIAGNOSIS SCAFFOLD, not a ship candidate) ──
     // Allow only the first CAPB_BUDGET queued handoffs, then hold the arm off. Runs
     // with budget >= N take events 0..N-1 identically (the trajectory only diverges at
@@ -10675,7 +10776,11 @@ pub module heliodor_core #(
         }
     }
     let mshr_cap_b_que: logic = mshr_cap_b_que_raw && capb_ok;
-    assign mshr_cap_b_own = lsr_mshr_ok && lsr_drive && dc_miss_valid;
+    // Same fill-attribution check as replay_claim (see dc_fill_line there): a Stage-B
+    // drive is continuous, so the deciding cycle is normally its own — but the LSR can
+    // be handed the port back mid-sequence, so verify rather than infer. A mismatch
+    // declines the handoff and the load simply stays in the LSR (= the =0 behaviour).
+    assign mshr_cap_b_own = lsr_mshr_ok && lsr_drive && dc_miss_valid && lsr_paddr_q[63:3] == {dc_mem_addr[63:6], dc_miss_offset};
     assign mshr_cap_b     = mshr_cap_b_own || mshr_cap_b_que;
     // step-1.5 lane select. A non-fault, non-FP load goes to LANE 1 (pipe-1 yields,
     // so it is always available → no yield term). A faulting / FP load stays on
@@ -10835,9 +10940,26 @@ pub module heliodor_core #(
         }
     }
     // Replay outcomes (replay_drive/replay_is_a defined at the dcache inst).
+    // L4 step-2: WHOSE fill is this? `dc_miss_valid` says "a load fill starts now", and
+    // the pre-step-1 design read that as "…for whoever is driving the port this cycle".
+    // That equivalence is false under DCACHE_SYNC_READ=1: the fill TARGET is
+    // {f_tag_q, f_index_q}, registered from the PREVIOUS cycle's live address, exactly
+    // like load_sel_q. A blocking LSR drive holds i_addr every cycle so previous ==
+    // current and the shortcut happens to hold; a REPLAY drive is intermittent, so the
+    // deciding cycle can belong to a different requester and the replay then claims a
+    // fill for someone else's line — latching that line's critical word as its own data.
+    // Observed at LSR_MSHR_B=1 on test_arch_hvtmr: `ld t6,80(sp)` (the guest's SBI a0 =
+    // the DBCN length, must be 1) retired 0x140111735450a001, the dword of an unrelated
+    // line that was filling around it, and the hypervisor's byte-copy loop then ran
+    // ~forever. Check the fill's own line instead of inferring it from the drive:
+    // o_memr_addr at a fill start is {f_tag, f_index, 6'd0}, so the comparison is exact.
+    // A mismatch simply declines ownership — the entry stays queued and replays again
+    // (dc_miss_valid still clears replay_q and sets fill_busy_q), so it is bounded.
+    let dc_fill_dw     : logic<61> = {dc_mem_addr[63:6], dc_miss_offset};
+    let dc_fill_line_ok_r: logic = replay_addr[63:3] == dc_fill_dw;
     let replay_sb_ovl  : logic = if replay_is_a ? sb_mshra_ovl : sb_mshrb_ovl;
     let replay_hit_fire: logic = replay_drive && dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid && !replay_sb_ovl;
-    let replay_claim   : logic = replay_drive && dc_miss_valid;
+    let replay_claim   : logic = replay_drive && dc_miss_valid && dc_fill_line_ok_r;
     // Fill completion routes to the OWNING entry.
     // S14.2: dc_fill_ready fires the owner's completion EARLY — critical-word-
     // first lands the demanded dword on the first transfer, so the writeback no
@@ -10856,7 +10978,7 @@ pub module heliodor_core #(
     let mshr_wb_fire : logic = (mshra_wb_rdy || mshrb_wb_rdy) && !fpu_cdb.valid;
 
     // Core-tracked dcache fill-FSM busy (fill start → DONE) — arms the replay.
-    var fill_busy_q: logic;
+    // (declared next to replay_q: the L4 step-2 QUE_FILLONLY qualifier reads it above.)
     always_ff (clk, rst) {
         if_reset {
             fill_busy_q = 1'b0;
@@ -11015,19 +11137,8 @@ pub module heliodor_core #(
         mshr_cdb.fault_acc    = 1'b0;
         mshr_cdb.fault_vaddr  = '0;
     }
-    // L4 step-2 diagnosis: MSHR life-cycle trace, correlated with CMT_TRACE by rob_idx.
-    // Separate const from CMT_TRACE: the commit stream is only affordable on a directed
-    // test, while this one is sparse enough for a litmus run. h= is HART_ID (N>1 harts
-    // interleave on stdout).
-    const MSHR_TRACE: bit = 0;
-    var trc_cy_q: logic<32>;
-    always_ff (clk, rst) {
-        if_reset {
-            trc_cy_q = '0;
-        } else {
-            trc_cy_q = trc_cy_q + 32'd1;
-        }
-    }
+    // L4 step-2 diagnosis: MSHR life-cycle trace, correlated with CMT_TRACE by rob_idx
+    // (MSHR_TRACE / trc_cy_q are declared next to CMT_TRACE, above the ASQ engine).
     always_ff (clk, rst) {
         if_reset {} else if MSHR_TRACE {
             if dc_miss_valid {
