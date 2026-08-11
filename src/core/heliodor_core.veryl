@@ -8129,6 +8129,22 @@ pub module heliodor_core #(
     // commits; the extra slot-1 commit just waits one cycle.
     assign commit2_fire = rob_commit_ack && !commit_redirect && c2_valid && !s8_restore_en;
 
+    // ── L4 step-2 differential trace (DIAGNOSIS SCAFFOLD — keep at 0 on master) ──
+    // A PC-keyed COMMIT stream. Cycle counts and per-cause census buckets legitimately
+    // differ between the =0 and =1 arms, so neither can name a wrong VALUE; the retire
+    // stream can, and it is timing-independent. Only usable on a short directed test
+    // (rv64mi-ma_addr = seconds) — never on a boot.
+    const CMT_TRACE: bit = 0;
+    always_ff (clk, rst) {
+        if_reset {} else if CMT_TRACE {
+            if rob_commit_ack {
+                $display("C0 pc=%h rd=%d d=%h", c_pc, c_rd_arch, c_result_data);
+            }
+            if commit2_fire {
+                $display("C1 pc=%h rd=%d d=%h", c2_pc, c2_rd_arch, c2_result_data);
+            }
+        }
+    }
 
     always_ff (clk, rst) {
         if_reset {
@@ -10258,7 +10274,18 @@ pub module heliodor_core #(
         // still translates (core_dmem_ren), and PTW PTE reads (dmem_mmu_busy, so
         // lsr_capture=0) pass through unaffected.
         i_ren            : dmem_ren_m || replay_drive || lsr_drive, // execute term (incl. !lsr_capture) folded into dmem_ren_m
-        i_uncached       : if lsr_drive ? lsr_unc_q : dmem_unc_m, // P9.5: MMIO single-beat read (Stage B uses the latched flag)
+        // L4 step-2: the replay drive must present its OWN uncached flag, and a
+        // captured load is never uncached (!lsr_unc_q at capture) → tie 0. dc_uncached
+        // carries an explicit !replay_drive term (the pre-step-1 design knew the replay
+        // must not look uncached), but MEM_PIPE=1 sources this from the REGISTERED
+        // m_unc_q, which latched that decision a cycle earlier — when replay_drive was
+        // still 0. So the guard misses, and a replay landing one cycle after a
+        // non-capturing uncached read (an MMIO load whose lsr_capture was blocked)
+        // presents i_uncached=1: the dcache runs uncached_active on the replay address
+        // (a spurious bus read) AND rd1_req_nf drops → nf_reroute=0 → the replay leaves
+        // the +1 registered read path and delivers off live_hit_rdata, which DCEs to 0
+        // at DCACHE_R1_DCE=1. Dead at MEM_PIPE=0 (the live !replay_drive already covers).
+        i_uncached       : if lsr_drive ? lsr_unc_q : (dmem_unc_m && !replay_drive), // P9.5: MMIO single-beat read (Stage B uses the latched flag)
         i_wstrb          : dmem_wstrb_m                  ,
         i_wstrb_hi       : dmem_wstrbhi_m                , // B.3: misaligned store → invalidate
         i_load_next      : if lsr_drive ? lsr_dc_load_next : (dmem_lnext_m && !replay_drive), // B.3: misaligned cross-line load fill (Stage B uses the latched span)
@@ -10620,8 +10647,34 @@ pub module heliodor_core #(
     // replay_drive). Turning _que off leaves the replay path dead, so a pass at
     // QUE=0 pins the bug on the replay engine and a fail pins it on the handoff.
     const LSR_MSHR_B_QUE: bit = 1;
-    let mshr_cap_b_que: logic = LSR_MSHR_B_QUE && lsr_mshr_ok && lsr_drive && !dc_miss_valid && dcache_stall
+    let mshr_cap_b_que_raw: logic = LSR_MSHR_B_QUE && lsr_mshr_ok && lsr_drive && !dc_miss_valid && dcache_stall
         && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid;
+    // ── L4 step-2 budget bisection (DIAGNOSIS SCAFFOLD, not a ship candidate) ──
+    // Allow only the first CAPB_BUDGET queued handoffs, then hold the arm off. Runs
+    // with budget >= N take events 0..N-1 identically (the trajectory only diverges at
+    // the first suppressed event), so a PASS at N and a FAIL at N+1 names event #N as
+    // the culprit AND gives a perfectly matched control pair. Set to all-ones for the
+    // unrestricted arm.
+    const CAPB_BUDGET: logic<32> = 32'hffffffff;
+    var capb_cnt_q  : logic<32>;
+    var capb_shown_q: logic    ;
+    let capb_ok    : logic = capb_cnt_q <: CAPB_BUDGET;
+    let capb_reject: logic = mshr_cap_b_que_raw && !capb_ok && !capb_shown_q;
+    always_ff (clk, rst) {
+        if_reset {
+            capb_cnt_q   = '0;
+            capb_shown_q = 1'b0;
+        } else {
+            if mshr_cap_b_que_raw && capb_ok {
+                capb_cnt_q = capb_cnt_q + 32'd1;
+            }
+            if capb_reject {
+                capb_shown_q = 1'b1;
+                $display("capb REJECT #%d pc=%h va=%h pa=%h f3=%d rob=%d replayq=%d", capb_cnt_q, lsr_pc_q, lsr_vaddr_q, lsr_paddr_q, lsr_funct3_q, lsr_rob_idx_q, replay_q);
+            }
+        }
+    }
+    let mshr_cap_b_que: logic = mshr_cap_b_que_raw && capb_ok;
     assign mshr_cap_b_own = lsr_mshr_ok && lsr_drive && dc_miss_valid;
     assign mshr_cap_b     = mshr_cap_b_own || mshr_cap_b_que;
     // step-1.5 lane select. A non-fault, non-FP load goes to LANE 1 (pipe-1 yields,
@@ -10961,6 +11014,50 @@ pub module heliodor_core #(
         mshr_cdb.is_sfault    = 1'b0;
         mshr_cdb.fault_acc    = 1'b0;
         mshr_cdb.fault_vaddr  = '0;
+    }
+    // L4 step-2 diagnosis: MSHR life-cycle trace, correlated with CMT_TRACE by rob_idx.
+    // Separate const from CMT_TRACE: the commit stream is only affordable on a directed
+    // test, while this one is sparse enough for a litmus run. h= is HART_ID (N>1 harts
+    // interleave on stdout).
+    const MSHR_TRACE: bit = 0;
+    var trc_cy_q: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            trc_cy_q = '0;
+        } else {
+            trc_cy_q = trc_cy_q + 32'd1;
+        }
+    }
+    always_ff (clk, rst) {
+        if_reset {} else if MSHR_TRACE {
+            if dc_miss_valid {
+                $display("M h=%d [%d] MISS rq=%d ld=%d av=%d ao=%d bv=%d bo=%d", HART_ID, trc_cy_q, replay_q, lsr_drive, mshra_v_q, mshra_own_q, mshrb_v_q, mshrb_own_q);
+            }
+            if replay_claim {
+                $display("M h=%d [%d] claim isa=%d a=%h", HART_ID, trc_cy_q, replay_is_a, replay_addr);
+            }
+            if mshr_cap_b {
+                $display("M h=%d [%d] cap own=%d pc=%h pa=%h f3=%d rob=%d", HART_ID, trc_cy_q, mshr_cap_b_own, lsr_pc_q, mshr_alloc_addr, mshr_alloc_f3, mshr_alloc_rob);
+            }
+            if replay_hit_fire {
+                $display("M h=%d [%d] rhit a=%h isa=%d d=%h", HART_ID, trc_cy_q, replay_addr, replay_is_a, dcache_rdata);
+            }
+            if mshra_fill_done {
+                $display("M h=%d [%d] fillA a=%h d=%h rdy=%d cmp=%d", HART_ID, trc_cy_q, mshra_addr_q, dc_fill_rdata, dc_fill_ready, dc_fill_complete);
+            }
+            if mshrb_fill_done {
+                $display("M h=%d [%d] fillB a=%h d=%h rdy=%d cmp=%d", HART_ID, trc_cy_q, mshrb_addr_q, dc_fill_rdata, dc_fill_ready, dc_fill_complete);
+            }
+            if mshr_abort_poison {
+                $display("M h=%d [%d] poisA rob=%d a=%h", HART_ID, trc_cy_q, mshra_rob_idx_q, mshra_addr_q);
+            }
+            if mshr_abort_poison2 {
+                $display("M h=%d [%d] poisB rob=%d a=%h", HART_ID, trc_cy_q, mshrb_rob_idx_q, mshrb_addr_q);
+            }
+            if mshr_wb_fire {
+                $display("M h=%d [%d] wb rob=%d a=%h f3=%d raw=%h out=%h", HART_ID, trc_cy_q, mshr_wb_rob, mshr_wb_addr, mshr_wb_funct3, mshr_wb_data64, mshr_ld_data);
+            }
+        }
     }
 
     // ============================================================

@@ -529,6 +529,159 @@ same `cy=02aea540` with the same `x3`. **A real gap closed; the failure survives
 in the 249/3 run were not captured (the suite output was tail-truncated) — re-run and collect them
 before diagnosing, since they may share the root cause or be a second, independent one.
 
+#### L4 step-2 diagnosis, round 2 — the failure signature, and the replay's side-band inputs
+
+**The N=1 failure is a kernel Oops, not a hang.** The boot testbench mirrors UART TX to stdout, and
+the earlier runs only ever looked at the tail, so this was sitting there unread the whole time:
+
+```
+epc: ffffffff800b9e58  ra: ffffffff802007fc0  sp: ffffffff80a03f00
+status: 0000000200000100  badaddr: ffffffdf83ffde80  cause: 000000000000000f
+Kernel panic - not syncing: Attempted to kill the idle task!
+```
+
+`cause=0xf` is a **store/AMO page fault**, `badaddr` is a vmalloc-region address, and `a0 == badaddr`
+with `a2 = 0x1180` — a `memset`-shaped call faulting on its very first store. That is the shape of a
+**load having returned a wrong value that was then used as a pointer**, not a lost store or a
+livelock. (Lesson, again: read the whole console log before theorising. It was free.)
+
+**Budget bisection is armed and works.** `CAPB_BUDGET` (`heliodor_core.veryl`, by
+`mshr_cap_b_que`) allows only the first N queued handoffs and then holds the arm off, printing the
+first REJECTED event's `pc`/`va`/`pa`/`funct3`/`rob`. Runs with budget ≥ N take events `0..N-1`
+identically — the trajectory only diverges at the first suppressed event — so a PASS at N and a FAIL
+at N+1 names event #N *and* hands over a perfectly matched control pair. First probe:
+
+| budget | result |
+|---|---|
+| 0 (= `LSR_MSHR_B_QUE=0`, own-only) | PASS, `cy=00de5210` |
+| 1 | **PASS**, `cy=00dec740`, `instret` 10,434,456; REJECT #1 at `pc=8020319a va=pa=80a87fb8 f3=3` |
+| all-ones | FAIL (the Oops above) |
+
+**Suspects 1-3 above are all REFUTED by reading the code** (each took minutes; none needed a run):
+1. **Data formatting is correct.** `mshr_shift = {mshr_wb_addr[2:0], 3'b000}` + the `funct3` case at
+   `:10921` is exactly `alu_wrap`'s `ld_*` select on a within-dword dword. Cross-dword and
+   forwarded-byte loads are excluded at capture, so the single-dword slice is the whole job.
+2. **`lsr_drive` and `replay_drive` really are exclusive** — not for the stale reason the `:10244`
+   comment gives, but because `lsr_drive` carries `!replay_q` (`:9816`). The invariant holds; only
+   its stated justification is dead. Fix the comment, not the logic.
+3. **The ROB LQ-record is right.** `sh_load_addr` is documented as a VA and the scaffold records
+   `lsr_paddr_q`, but every consumer under VM compares `[11:0]` only (`ovl_vm`), and in bare mode
+   VA==PA — so the unit mismatch is benign, exactly as `:10438` claims. `sh_load_done` is set from
+   `i_lq_rec_valid` and `mshr_cdb.is_load=0` prevents a second record.
+
+**What the code review DID find — the replay's side-band inputs.** The dcache's data path has a
+2-cycle registered-read (`DCACHE_DATA_READ_1R`) with a bypass for "non-folded" accessors
+(`nf_reroute`), and `DCACHE_R1_DCE=1` **deleted the live read**, so anything that falls off *both*
+the folded-demand path and the nf path reads **zero**. For a replay cycle:
+
+| dcache input | during `replay_drive` | guarded? |
+|---|---|---|
+| `i_load_next` | `dmem_lnext_m && !replay_drive` | ✅ explicit |
+| `i_amo_read` | `dmem_amord_m && !replay_drive` | ✅ explicit |
+| `i_ren_folded` | `lsr_drive` (= 0, needs `!replay_q`) | ✅ structural |
+| `i_uncached` | `dmem_unc_m` | ❌ **unguarded** |
+
+`dc_uncached` (`:9850`) carries its own `!replay_drive` term — the pre-step-1 design knew a replay
+must never look uncached. But `MEM_PIPE=1` sources `i_uncached` from the **registered** `m_unc_q`,
+latched a cycle earlier, when `replay_drive` was still 0. The guard is one cycle too early and
+misses. A replay landing one cycle after a non-capturing uncached read (an MMIO load whose
+`lsr_capture` was blocked by `lsr_v_q`) therefore presents `i_uncached=1`, and then:
+`uncached_active` fires a **spurious uncached bus read at the replay's address**, and
+`rd1_req_nf = i_ren && !dhit_use && !i_uncached` drops → `nf_reroute=0` → `nf_replay_ready=1` → the
+live `o_hit_safe` completes the replay off `live_hit_rdata`, **which DCEs to 0**. A load returning 0
+into a pointer is precisely the Oops signature above. Fix (dead at `MEM_PIPE=0`, where the live
+`!replay_drive` already covers it):
+
+```veryl
+i_uncached : if lsr_drive ? lsr_unc_q : (dmem_unc_m && !replay_drive),
+```
+
+This is the same failure mode as R3.2c (`sb_2cyc_ok` missing `!c_is_amo`) and as the S27 gap: a
+guard written for a live path, then invalidated by a later change while the path it protected was
+dead, so nothing caught it.
+
+⚠️ **The `i_uncached` fix is BIT-IDENTICAL at N=1** — `cy=02aea540`, `x3=ffffffff80a85b60`,
+`instret=34,429,930`, the same three numbers as before it. The hole is real and the guard is kept
+as hardening, but it never fires at N=1 and it is **not** this bug. That is the fifth consecutive
+hypothesis to die bit-identical. Stop hypothesising here; the next section is what worked.
+
+#### L4 step-2 diagnosis, round 3 — ROOT CAUSE: `o_miss_valid` is not the edge it claims to be
+
+**Step 1: get a cheap repro.** The 249/3 failures had never been collected in six sessions of
+diagnosis (the suite output was always tail-truncated). Collecting them took one run:
+
+| failing test | cost |
+|---|---|
+| **`test_arch_rv64mi_ma_addr`** | **seconds**, directed, deterministic — `tohost=0x2f` → subtest **23** |
+| `test_arch_hvtmr` | seconds |
+| `test_litmus_2hart` | ~3.1 M cy |
+
+That single run replaced a 45 M-cycle boot with a seconds-long directed test. **Do this first next
+time** — the whole round-1/round-2 flailing was paid for by not having it.
+
+**Step 2: trace the retire stream, not the cycle counts.** Cycle counts and census buckets
+legitimately differ between the arms, so neither can name a wrong VALUE. A PC-keyed COMMIT trace
+(`CMT_TRACE`) plus an MSHR life-cycle trace (`MSHR_TRACE`) can, and on ma_addr the whole run has
+only **12** MSHR events. Subtest 23 is `sw x0, 5(s0)` — a cross-dword misaligned store — followed by
+four `lb`s whose expected values are fixed by the test source. The trace:
+
+```
+M[317] cap own=0 pc=80000498 pa=80002009 f3=0 rob=30   <- lb 9(s0), QUEUED
+M[321] MISS rq=1 ld=0 av=1 ao=0 bv=0 bo=0              <- fill starts, replay drives
+M[321] claim isa=1 a=80002009                          <- entry A becomes the owner
+M[322] MISS rq=0 ld=1 av=1 ao=1 bv=0 bo=0              <- SECOND pulse, SAME fill, A already owns
+M[322] cap own=1 pc=800004a0 pa=80002005 rob=0         <- entry B becomes a SECOND owner
+M[323] fillA a=80002009 d=eeffee1122334400 rdy=1
+M[323] fillB a=80002005 d=eeffee1122334400 rdy=1       <- both latch the same dword
+M[324] wb rob=30 a=80002009 raw=eeffee1122334400 out=0000000000000044   <- correct
+M[325] wb rob=0  a=80002005 raw=eeffee1122334400 out=ffffffffffffffee   <- WRONG (must be 0)
+```
+
+**`dc_miss_valid` pulses on two consecutive cycles for one fill.** 0x80002005 is the line's dword 0
+and 0x80002009 is dword 1; `o_fill_rdata` is the ONE critical word the fill was demanded for
+(`fill_crit_q`, §13.8), so the second owner necessarily gets a dword it never asked for. `lb 5(s0)`
+returned `0xee` where the test requires 0 → `bnez t1, fail`.
+
+**Root cause.** `o_miss_valid = load_sel && !fill_blocked_wb && i_memr_grant`, documented as "pulses
+on the cycle a LOAD fill actually STARTS (the IDLE→FILL edge)". Under `DCACHE_SYNC_READ=1`,
+`load_sel` is `load_sel_q` — the PREVIOUS cycle's `load_sel_raw`. `load_sel_raw` is itself IDLE-gated
+(`lo_miss`/`hi_miss` carry `state == State::IDLE`), but the FSM's IDLE→FILL transition registers at
+the END of the start cycle, so on the next cycle `load_sel_q` still carries the pre-transition raw,
+and with `i_memr_grant` held across the burst the output pulses again. The FSM is safe
+(`fill_start_fire` is consumed inside the `State::IDLE` arm); **only this output escaped the gate**.
+Fix (`src/cache/dcache.veryl`):
+
+```veryl
+assign o_miss_valid = load_sel && !fill_blocked_wb && i_memr_grant && state == State::IDLE;
+```
+
+This is a **latent defect in shipped RTL**, not a step-2 defect. It is invisible today only because
+`mshr_plain_load = 0` leaves every ownership consumer (`mshr_capture_own`, `replay_claim`) dead; the
+one live consumer is the core's `fill_busy_q` SET, which the first pulse already performed. Measured:
+
+| arm | result |
+|---|---|
+| `LSR_MSHR_B=0` (shipped) | **252/0**, `cy=00deee50`, `instret 10434358` — **bit-exact baseline** |
+| `LSR_MSHR_B=1` | **249/3 → 251/1**; `ma_addr` and `hvtmr` both fixed |
+
+**Still failing at `=1`: `test_litmus_2hart`, `tohost=0x7012` = test 7 slot 1** (`amoadd.w x0` ×1000
+per hart, then `lw t0,0(s4)` must read 2000). This is a SECOND, independent bug. The MSHR trace
+names it precisely — `pc=0x800005e0` is that check load, it executes exactly **once** in the whole
+run, and:
+
+```
+M h=0 [2559146] cap own=0 pc=800005e0 pa=80007000 f3=2 rob=4
+M h=0 [2559162] claim isa=1 a=80007000
+M h=0 [2559194] fillA a=80007000 d=0000000000000000 rdy=1 cmp=0
+M h=0 [2559195] wb rob=4 a=80007000 f3=2 raw=0 out=0
+```
+
+The load's **fill returned 0**. So the AMOs are not lost — the captured load's fill read a stale
+line. Next suspect: the stale-fill hazard `fill_blocked_wb` guards (dcache.veryl:1066-1072 records
+the identical symptom, "ra/s0 restored as ZEROS from a stack line evicted dirty and immediately
+reloaded"), reached because a replay-driven miss does not hold `i_ren` the way a blocking LSR drive
+does. Trace `wb_v`/`wb_line`/`fill_blocked_wb` against the claim cycle before theorising.
+
 **Instrumentation left in the tree** (all diagnostic; N=1 boot stays bit-exact at `00deee50`):
 `o_dbg_load_replay_cnt` / `o_dbg_inv_viol_cnt` / `o_dbg_mshr_pois_cnt` / `o_dbg_viol_store_cnt` /
 `o_dbg_viol_self_cnt` / `o_dbg_viol_exact_cnt` / `o_dbg_viol_pgx_cnt` / `o_dbg_st_resolve_cnt` and
