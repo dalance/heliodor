@@ -735,14 +735,36 @@ Contrast the five preceding hypotheses, every one of which died **bit-identical*
 | N=2 SMP boot | PASS `cy=012a0110` (19.53 M) | 19.62 M — −0.46 % |
 | `LSR_MSHR_B=0` re-check | **252 / 0, `cy=00deee50`, instret 10434358** | bit-exact |
 
-⚠️ **The IPC prize did NOT arrive.** L4 priced the LSR-occupancy bucket at 7.14 % of the boot; this
-delivers 0.07-0.46 %, and litmus N=4 gets 4.3 % SLOWER (contended atomics pay for the replays).
-The reason is #2: `QUE_FILLONLY` excludes the "own miss waiting for the grant" case, which is most
-of the bucket. Unlocking it needs the handoff to keep the bus request alive across the LSR release
-— i.e. the dcache must latch the pending miss instead of re-deriving it from `i_ren` each cycle.
-That is real work, not a qualifier. **Measure `QUE_FILLONLY=0` before designing it**: the five
-attribution bugs are fixed now, so the case may simply work, and if it does the census says that is
-where the 7 % lives.
+#### THE VERDICT: step-2 is CORRECT, COMPLETE and IPC-NEUTRAL. Do not ship it for IPC.
+
+L4 priced the LSR-occupancy bucket at 7.14 % of the boot. Measured, with every arm green:
+
+| config | suite | N=1 boot | dhrystone | coremark |
+|---|---|---|---|---|
+| `LSR_MSHR_B=0` (shipped) | 252/0 | `00deee50` 14.610 M | 263,393 | 421,616 |
+| `=1`, `QUE_FILLONLY=1` | 252/0 | `00dec740` 14.600 M (−0.07 %) | 263,395 (+2 cy) | 421,803 (+0.04 %) |
+| `=1`, `QUE_FILLONLY=0` (full queued) | 252/0 | `00dec740` **14.600 M — identical** | — | — |
+
+Plus litmus N=4 **+4.3 %** (3.78 → 3.94 M; contended atomics pay for the replays) and N=2 SMP boot
+−0.46 %.
+
+**The `QUE_FILLONLY=0` row is the important one.** The suspicion was that restricting the handoff
+to "another fill in flight" left the prize on the table, since the census said the
+waiting-for-grant case dominates. With the five attribution bugs fixed, the full queued arm runs
+clean — **and buys exactly zero cycles.** Same cycle count to the digit.
+
+So the census bucket was never recoverable. `lsr_v_q` occupancy measures cycles the LSR is BLOCKED,
+not cycles that would be SAVED by unblocking it: the loads behind the missing load are either
+dependent on it, or on the same line (so they hit off the same fill either way), or the machine
+runs out of other work regardless. **A sole-blocker census is an upper bound on the OPPORTUNITY,
+not on the PRIZE** — the same lesson as [[feedback_measure_ceiling_dont_estimate]], one level up:
+there the estimate was wrong and measurement fixed it; here the measurement itself was of the wrong
+quantity. The only sound way to price a structural change remains: build it DEAD, flip it, read the
+cycle counter.
+
+What step-2 *is* worth: it is the canonical non-blocking-MSHR structure, it is now correct and
+fully gated, and building it flushed out **five latent defects in shipped RTL**. That may justify
+shipping on structural grounds — but that is the user's call, and the IPC case is dead.
 
 ⚠️ Bugs #1, #3, #4, #5 are **latent defects in shipped RTL**, not step-2 defects — every consumer
 that could observe them is dead at `mshr_plain_load = 0`. They become live the moment anything
