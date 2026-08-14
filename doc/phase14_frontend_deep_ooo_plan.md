@@ -781,8 +781,38 @@ cycle counter.
 What step-2 *is* worth: it is the canonical non-blocking-MSHR structure, it is now correct and
 fully gated, the boot gain grows with hart count, and building it flushed out **five latent defects
 in shipped RTL** — defects whose fixes go back to being dead code the moment the scaffold sits at 0,
-so shipping is also what keeps them exercised. That may justify shipping on structural grounds —
-but that is the user's call, and the IPC case (7 %) is dead.
+so shipping is also what keeps them exercised. The IPC case (7 %) is dead; the structural case
+stands.
+
+#### 🏁 L4 step-2 SHIPPED — `LSR_MSHR_B=1` is the default path
+
+**Verilator NBA cross-check 4/4**, every cycle count matching the Veryl sim (this campaign requires
+Verilator for anything touching coherence timing, and these five fixes are exactly that):
+
+| | Verilator | Veryl sim |
+|---|---|---|
+| N=1 boot | `$finish` 146 ms = 14.60 M | 14,600,000 |
+| N=2 SMP boot | 195 ms = 19.5 M | 19,530,000 |
+| litmus N=4 | `cy=3,931,194` pass=1 | 3,940,000 |
+| N=4 SMP boot | 283 ms = 28.3 M | 28,320,000 |
+
+**Full gate list, all green at `=1`:** default suite 252/0 (incl. litmus N=2) · litmus N=4 ·
+N=1/N=2/N=4 Linux boots · dhrystone 263,395 · coremark 421,803 · Verilator NBA 4/4.
+
+**The `=0` arm stays as a fold-away fallback**, same pattern as `ATOMIC_SQ=0` — re-verified
+bit-exact (252/0, `cy=00deee50`, instret 10434358) after every fix landed.
+
+⚠️ **Before shipping, the diagnosis scaffolds were made to actually fold away.** `CAPB_BUDGET`'s
+`capb_cnt_q <: 32'hffff_ffff` is always true in practice but is **not constant-foldable**, so it
+would have put a live 32-bit counter + comparator in the ship path; `trc_cy_q` was an unconditional
+free-running counter. Both now sit behind `CAPB_BISECT` / `CMT_TRACE || MSHR_TRACE` so their
+registers are reset-only → DCE. Re-validated after the change: 252/0, `cy=00dec740`, instret
+10434447 — identical. **A DEAD scaffold is only dead if the const can fold it; check the comparison,
+not just the intent.**
+
+**New default baselines** (supersede the F2-ship figures): N=1 `cy=00dec740` 14.60 M · N=2
+`cy=012a0110` 19.53 M · N=4 `cy=01b02100` 28.32 M · litmus N=4 3.94 M · dhrystone 263,395 ·
+coremark 421,803 · 252/0. README not updated (phase-end task).
 
 ⚠️ Bugs #1, #3, #4, #5 are **latent defects in shipped RTL**, not step-2 defects — every consumer
 that could observe them is dead at `mshr_plain_load = 0`. They become live the moment anything
