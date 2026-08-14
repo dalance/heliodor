@@ -745,8 +745,24 @@ L4 priced the LSR-occupancy bucket at 7.14 % of the boot. Measured, with every a
 | `=1`, `QUE_FILLONLY=1` | 252/0 | `00dec740` 14.600 M (−0.07 %) | 263,395 (+2 cy) | 421,803 (+0.04 %) |
 | `=1`, `QUE_FILLONLY=0` (full queued) | 252/0 | `00dec740` **14.600 M — identical** | — | — |
 
-Plus litmus N=4 **+4.3 %** (3.78 → 3.94 M; contended atomics pay for the replays) and N=2 SMP boot
-−0.46 %.
+Boot cycles, every `=0` figure a MATCHED control on this same tree:
+
+| gate | `=0` | `=1` | Δ |
+|---|---|---|---|
+| N=1 boot | 14,610,000 | 14,600,000 | −0.07 % |
+| N=2 SMP boot | 19,620,000 | 19,530,000 | −0.46 % |
+| N=4 SMP boot | 28,530,000 | 28,320,000 | **−0.74 %** |
+| litmus N=4 | 3,780,000 | 3,940,000 | **+4.3 %** |
+
+The boot gain is **monotone in hart count** (0.07 → 0.46 → 0.74 %), which is the shape the structure
+predicts: more harts ⇒ longer misses (coherence traffic) ⇒ more value in freeing the LSR. litmus
+N=4 is the opposite regime (contended atomics paying for the replays).
+
+⚠️ **Take the matched control, not a remembered baseline.** The recorded F2-ship N=4 figure is
+29.39 M; measuring `=0` on this tree gives **28.53 M**. Comparing against the remembered number
+would have reported −3.6 % — a **5× overstatement**. Every intervening commit is DEAD-gated and was
+verified bit-exact, but only at N=1, so the 2.9 % gap between the recorded and measured `=0` N=4 is
+**unexplained and open**. Re-measure `=0` N=4 before trusting it again.
 
 **The `QUE_FILLONLY=0` row is the important one.** The suspicion was that restricting the handoff
 to "another fill in flight" left the prize on the table, since the census said the
@@ -763,8 +779,10 @@ quantity. The only sound way to price a structural change remains: build it DEAD
 cycle counter.
 
 What step-2 *is* worth: it is the canonical non-blocking-MSHR structure, it is now correct and
-fully gated, and building it flushed out **five latent defects in shipped RTL**. That may justify
-shipping on structural grounds — but that is the user's call, and the IPC case is dead.
+fully gated, the boot gain grows with hart count, and building it flushed out **five latent defects
+in shipped RTL** — defects whose fixes go back to being dead code the moment the scaffold sits at 0,
+so shipping is also what keeps them exercised. That may justify shipping on structural grounds —
+but that is the user's call, and the IPC case (7 %) is dead.
 
 ⚠️ Bugs #1, #3, #4, #5 are **latent defects in shipped RTL**, not step-2 defects — every consumer
 that could observe them is dead at `mshr_plain_load = 0`. They become live the moment anything
