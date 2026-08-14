@@ -882,6 +882,92 @@ Every pre-2026-08-08 number in this repo's docs is against the OLD front end. Th
 
 ---
 
+## Block W — WIDTH. The machine is ~1-wide, and that caps everything above (2026-08-15)
+
+**Why this block exists.** With F/S/L/R all shipped, an architecture-level review asked what is
+missing versus a modern OoO. The answer is not in the memory system — L3 measured a 0.41 % ceiling
+and L4 step-2 measured **zero** recoverable cycles from a 7.14 % stall bucket. Both came back empty
+for the same reason: **the machine is rename-limited, not memory-limited.**
+
+Rename is 2-wide on paper, but slot-1 takes only a simple integer ALU op:
+
+```veryl
+dec_op2_eligible = dec_op2.has_rd && !fp && !is_load && !is_store && !is_amo
+                   && !is_csr && !is_branch && !is_jal && !is_jalr && !is_vec && ...
+```
+
+Measured IPC: dhrystone **1.005**, coremark 0.89, N=1 boot 0.71 — exactly what a 1-wide rename caps
+at. Structure sizes match that scale: ROB **32**, PRF int **64**, IQ **8/8/8** (modern: ROB 200-600,
+PRF 200-400, IQ 60-100+).
+
+### W0 — the rename-width census (routing probe, `DBG_CENSUS` buckets 28-39)
+
+N=1 boot, 14,600,000 cy. The four top-level states **partition exactly** (sum 14,598,965):
+
+| state | cycles | of boot |
+|---|---|---|
+| rename fired **1-wide** | 6,883,844 | 47.1 % |
+| rename fired **2-wide** | 2,200,786 | 15.1 % |
+| instruction available, rename did not fire | 2,473,601 | 16.9 % |
+| **front end empty** | 3,040,734 | 20.8 % |
+
+Sole-blocker split of the 1-wide cycles (sums exactly to 6,883,844):
+
+| blocker | cycles | of 1-wide |
+|---|---|---|
+| **slot-1 op INELIGIBLE** | 2,757,384 | **40.1 %** |
+| multi | 2,387,633 | 34.7 % |
+| no 2nd instruction in the FIFO | 1,261,868 | 18.3 % |
+| **resource (ROB / free-list / IQ full)** | 476,959 | **6.9 %** |
+
+Ineligible by class: **store/AMO 1,527,051 · branch 1,205,693 · load 1,100,640** · other 59,693.
+
+### What the census changes about the plan
+
+1. ⚠️ **Deepening ROB/PRF/IQ is NOT the first move.** Resource-full is the sole blocker on 6.9 % of
+   1-wide cycles = **3.3 % of all cycles**. ROB 32 *is* shallow, but it only starts to bind once
+   width actually exists — at ~1 IPC a 32-entry window is not the constraint. This also avoided a
+   large edit: **sizing has no single source of truth** — `pipeline_pkg` and `decode_pkg` carry the
+   consts, and `rob` / `rat` / `free_list` / `iq_int` / `iq_fp` / `prf_int` / `prf_fp` / `alu_wrap` /
+   `lsu` / `fpu_wrap` each carry their OWN defaults, and **not one core instantiation overrides
+   them**. They merely happen to agree at 32/64/8. Fix that before any resize.
+2. **No single opcode class unlocks width** — the ineligible cycles split ~39/31/28 across
+   store-AMO / branch / load.
+3. **The front end is a second, independent axis** that was not in the original review:
+   `front end empty` 20.8 % + `no 2nd in FIFO` 18.3 %.
+
+### The three stages disagree about eligibility — and that is the map
+
+| class | rename slot-1 | execute pipe-1 | commit slot-1 (`c2_simple`) |
+|---|---|---|---|
+| int ALU | ✅ | ✅ | ✅ |
+| **control** (branch/JAL/JALR) | ❌ predicate only | ✅ **already built** (S3: "ALU/branch/JAL/JALR/LUI/AUIPC") | ❌ `!sh_is_control` |
+| **load** | ❌ (no mem-IQ slot-1 alloc port) | partial (`lsr_to_lane1` writeback; the 2nd dcache read port is best-effort DENIED by `S3_SLOT1` at `DCACHE_DATA_READ_1R=1`) | ✅ **already allowed** |
+| store/AMO | ❌ | ❌ | ❌ (commit is the memory ordering point) |
+
+**⇒ Control transfers on slot-1 are the cheapest real width increment.** The execute pipe already
+does them and `dec_op2_eligible`'s own comment says so ("Control transfers are excluded for now
+(conservative first flip); a later milestone can admit them"). The ROB already carries
+`i_cdb2_mispredict` / `i_cdb2_redirect_pc`. What is actually missing is two predicates plus the
+commit-slot-1 next-PC handling — `c2_simple` excludes control because "the architectural next PC
+after a slot-1 commit is just pc + (rvc ? 2 : 4)", which a taken branch breaks.
+
+Loads are the opposite shape: commit already allows them, but the second dcache read port was
+**traded away for the 1R1W SRAM**, so re-admitting them means banking the L1D — a big build.
+
+### Order (revised by measurement)
+
+1. **W1 — control transfers on rename slot-1** (+ commit slot-1 next-PC). Execute side exists.
+2. **W2 — front-end delivery** (20.8 % empty + 18.3 % no-2nd).
+3. **W3 — loads on slot-1** — needs mem-IQ slot-1 alloc + a banked/dual-ported L1D.
+4. **W4 — resize ROB/PRF/IQ**, after width exists. First give sizing a single source of truth.
+
+⚠️ Census discipline, per L4 step-2: a sole-blocker census bounds the **OPPORTUNITY**, not the
+**PRIZE**. Use these numbers to choose WHERE to build, never to predict what a build is worth.
+Price every one of W1-W4 the same way: build it DEAD, flip it, read the cycle counter.
+
+---
+
 ## Block R — SMP-critical finale (gated)
 
 - **R3 — atomic reorder.** Atomics today are a **single-cycle commit-time RMW into
