@@ -1067,6 +1067,76 @@ front of the earlier step.** W1a alone was worth 0.21 %; with W2a's wall removed
 1.44 %. Measuring the two together was the right call — a lever pressed against a wall reads as
 worthless even when it is not.
 
+### W2b — the wall is the L1I, and it is CAPACITY, not run-ahead
+
+The W2b census partitions the 1,660,371 "extract wants a dword, FIFO cannot supply" cycles exactly:
+
+| | cycles | share |
+|---|---|---|
+| FIFO **genuinely empty** (`wf_count == 0`) | **1,655,976** | 99.7 % |
+| FIFO non-empty, head is the WRONG dword (run-ahead diverged) | 4,395 | 0.3 % |
+
+…and on those cycles, the producer's state:
+
+| | cycles | share |
+|---|---|---|
+| **icache miss** (`icache_stall_comb`) | **1,224,545** | 73.8 % |
+| presenting, data not back yet | 434,724 | 26.2 % |
+| I-PTW | 902 | 0.05 % |
+| `wf_full` (back-pressure) | **0** | 0 % |
+
+⚠️ **Three hypotheses die at once: run-ahead divergence (4,395), I-PTW (902) and FIFO depth
+(`wf_full` = 0).** The run-ahead MACHINERY was never the problem. This also closes
+[[f2.14]] from the other side — deepening run-ahead was unamortisable because *the miss, not the
+pointer,* is what starves fetch.
+
+**L1I 16 KB → 32 KB** (`INDEX_W` 6 → 7; 128 sets × 4 ways × 64 B). Measured: icache-miss cycles
+1,224,545 → **426,402 (−65 %)**, FIFO-empty 1,655,976 → **843,393 (−49 %)**.
+
+### 🏁 Block W result — full Veryl ladder green
+
+| gate | old default | W1a + W2a + 32 KB L1I | Δ |
+|---|---|---|---|
+| default suite | 252/0 | **252/0** | — |
+| **dhrystone** | 263,393 | **237,827** | **−9.71 %** (IPC 1.005 → **1.114**) |
+| **N=2 SMP boot** | 19,620,000 | **18,170,000** | **−7.39 %** |
+| **N=4 SMP boot** | 28,530,000 | **26,440,000** | **−7.33 %** |
+| **N=1 boot** | 14,600,000 | **13,580,000** | **−6.99 %** |
+| coremark | 421,616 | 404,355 | −4.09 % |
+| litmus N=4 | 3,940,000 | 3,960,000 | +0.51 % |
+
+**IPC crosses 1.0 for the first time in this campaign** (dhrystone 1.005 → 1.114) — the "effectively
+1-wide" diagnosis, solved. Boot improves ~7 % at N=1/2/4 alike, i.e. it is per-core, not an SMP
+effect. **Cost: the L1I SRAM doubles, per hart.**
+
+Verilator NBA cross-check — **3/4**, all clean rebuilds, all matching the Veryl sim:
+
+| | Verilator | Veryl sim |
+|---|---|---|
+| N=1 boot | `$finish` 136 ms = 13.6 M ✓ | 13,580,000 |
+| N=2 SMP boot | 182 ms = 18.2 M ✓ | 18,170,000 |
+| litmus N=4 | `cy=3,952,044` pass=1 ✓ | 3,960,000 (−0.20 %, the same systematic offset as the previous session's 3,931,194 vs 3,940,000) |
+| **N=4 SMP boot** | **NOT RUN** | 26,440,000 |
+
+⚠️ R3 shipped on Verilator **4/4**; this is **3/4**. The N=4 boot is outstanding.
+
+⚠️ **Two Verilator-side traps this cost real time on, both worth remembering:**
+1. **A stale build directory lies convincingly.** The first N=2 attempt reported `$finish at 195ms`
+   — *exactly the pre-improvement number* — because an interrupted incremental build left old
+   objects in `build_n2`. A clean rebuild gave 182 ms. **`rm -rf` the `build_*` dir whenever the
+   configuration changes.**
+2. **`-O3` cannot build the 4-hart models here any more**: `g++: internal compiler error: Bus error
+   signal terminated program cc1plus`, reproducibly, on `Vtb_litmus_4hart___024root__12.o`. Disk is
+   fine (7.6 T free), so it is compiler memory pressure. **`-O1 -j 2` builds cleanly** (slower sim,
+   ~490 s for litmus N=4 vs ~490 s at `-O3` previously — no real loss). The CLAUDE.md recipe still
+   says `-O3`; that no longer works for N=4 tops on this box.
+
+⚠️ **A stale Verilator build directory lies convincingly.** The first N=2 attempt reported
+`$finish at 195ms` — *exactly the pre-improvement number* — because an interrupted incremental build
+left old objects in `build_n2`. A clean rebuild gave 182 ms. **`rm -rf` the `build_*` dir whenever
+the configuration changes**; an incremental Verilator build can otherwise produce a plausible,
+wrong, and very believable result.
+
 ### Order (revised AGAIN, by the W2a flip)
 
 1. **W2b — the fetch-ahead FIFO not delivering** (1,660,371 cy at `W1a+W2a`). This is the wall that

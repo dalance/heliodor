@@ -206,7 +206,7 @@ pub module heliodor_core #(
     o_dbg_viol_exact_cnt : output logic<32>, // violations a full-width compare also finds
     o_dbg_viol_pgx_cnt   : output logic<32>, // violations from the VM page-cross blanket
     o_dbg_st_resolve_cnt : output logic<32>, // store resolves (violation denominator)
-    o_dbg_lw_cause       : output logic<32> [52], // L4 census + W1 rename-width + W2 front-end census: load-issue stall by sole blocker (+ lsr drill-down)
+    o_dbg_lw_cause       : output logic<32> [60], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
     o_dbg_viol_store_cnt : output logic<32>, // store-resolve scan events
     o_dbg_viol_self_cnt  : output logic<32>, // S15 record-time self-scan events
     // M9 diag: ALU operand observation (verify base.pc passthrough)
@@ -1402,7 +1402,7 @@ pub module heliodor_core #(
     // there still waits, which is exactly today's behaviour.
     // DEAD at 0: every W2A term folds away and b1==3 cannot reach slot-1 anyway
     // (slot1_eligible still excludes straddle_oneshot) → bit-identical.
-    const W2A_STRADDLE_SLOT1: bit = 0;
+    const W2A_STRADDLE_SLOT1: bit = 1;
     // b1 = halfword index where slot-1 starts (clean case: curr_is_rvc == slot-0
     // is RVC). pc[1]=0,rvc→1 / pc[1]=0,32b→2 / pc[1]=1,rvc→2 (pc[1]=1,32b is a
     // straddle, excluded by slot1_eligible).
@@ -4058,7 +4058,21 @@ pub module heliodor_core #(
     // bypasses the cache and is served from the legacy o_imem passthrough.
     // (ic_dram is defined up near the shape-W F0 stream — the 2-beat non-cacheable
     // fetch reads it before this icache instantiation, so it must precede it.)
-    inst u_icache: icache (
+    // ── Block W2b: L1I 16 KB -> 32 KB (INDEX_W 6 -> 7; 128 sets x 4 ways x 64 B) ──
+    // The W2b census partitioned the front-end wall exactly: of the 1,660,371 cycles
+    // where the extract side wanted a dword and the fetch-ahead FIFO could not supply
+    // it, 1,655,976 (99.7 %) were the FIFO GENUINELY EMPTY and only 4,395 were a
+    // run-ahead address mismatch; of those empty cycles 1,224,545 (74 %) were an
+    // ICACHE MISS, against I-PTW 902 and wf_full 0. So the run-ahead MACHINERY (FTQ
+    // depth, predictor accuracy, FIFO depth) was never the problem — capacity was.
+    // That also closes the f2.14 finding from the other side: deepening run-ahead is
+    // unamortisable here because the miss, not the pointer, is what starves fetch.
+    // Measured: icache-miss cycles 1,224,545 -> 426,402 (-65 %), FIFO-empty
+    // 1,655,976 -> 843,393 (-49 %), boot -5.63 % on top of W1a+W2a.
+    // COSTS DOUBLE THE L1I SRAM — adopted on the user's call (2026-08-15).
+    inst u_icache: icache #(
+        INDEX_W: 7,
+    ) (
         clk                              ,
         rst                              ,
         i_addr      : imem_paddr_w       ,
@@ -4710,7 +4724,7 @@ pub module heliodor_core #(
     // the flip to say (W1b).
     // DEAD at 0: `(has_rd || 0)` folds to has_rd and `(0 || !br && !jal && !jalr)`
     // folds to the original three terms → bit-identical.
-    const W1_CTRL_SLOT1: bit = 0;
+    const W1_CTRL_SLOT1: bit = 1;
     let dec_op2_ctrl: logic = dec_op2.is_branch || dec_op2.is_jal || dec_op2.is_jalr;
     let dec_op2_eligible: logic = (dec_op2.has_rd || (W1_CTRL_SLOT1 && dec_op2_ctrl)) && !dec_op2.fp_writes_fp
         && !dec_op2.is_fpu_op && !dec_op2.fp_ld && !dec_op2.fp_st
@@ -11549,7 +11563,7 @@ pub module heliodor_core #(
     let rw_n       : logic<2> = ({1'b0, rw_blk_no2} as 2) + ({1'b0, rw_blk_elig} as 2) + ({1'b0, rw_blk_res} as 2);
     let rw_1wide   : logic    = rename_fire && !rename_fire2;
     let rw_sole    : logic    = rw_1wide && rw_n == 2'd1;
-    var lw_cause_cnt: logic<32> [52];
+    var lw_cause_cnt: logic<32> [60];
     // DBG_CENSUS: master gate for this whole diagnostic-counter block (the Phase-8 M0
     // perf counters + the L3 replay counter + the 28-bucket L4 census). Every one of
     // them drives an o_dbg_* port that reaches the heliodor_soc / heliodor_soc_smp TOP
@@ -11572,7 +11586,7 @@ pub module heliodor_core #(
             commit0_cnt       = 32'd0;
             load_wait_cnt     = 32'd0;
             load_replay_cnt   = 32'd0;
-            for c in 0..52 {
+            for c in 0..60 {
                 lw_cause_cnt[c] = 32'd0;
             }
         } else if DBG_CENSUS {
@@ -11771,6 +11785,42 @@ pub module heliodor_core #(
             }
             if fb_push1 {
                 lw_cause_cnt[51] = lw_cause_cnt[51] + 32'd1;
+            }
+            // ── W2b producer census (buckets 52-59) ──
+            // Population = the W2 bucket-43 cycles: the extract side wants a dword and
+            // ext_head_avail is false. That has TWO causes needing OPPOSITE fixes, and
+            // ext_head_match = (wf_count >= 1) && (wf_pc[wf_head] == ext_head_dw)
+            // separates them. (wf_pc[wf_head] is a dynamic array index and must not be
+            // read in an always_ff — the Veryl sim hangs — so split on wf_count alone,
+            // which is exact: count>=1 with !avail IS the address mismatch.)
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && wf_count == 4'd0 {
+                lw_cause_cnt[52] = lw_cause_cnt[52] + 32'd1;
+            }
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && wf_count != 4'd0 {
+                lw_cause_cnt[53] = lw_cause_cnt[53] + 32'd1;
+            }
+            // …and on those cycles, why is the PRODUCER not presenting a fetch?
+            // f0_present's own terms, priority-ordered so they partition.
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && !f0_present && icache_stall_comb {
+                lw_cause_cnt[54] = lw_cause_cnt[54] + 32'd1;
+            }
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && !f0_present && !icache_stall_comb
+                && !(imem_valid_w || imem_fault_w || imem_acc_fault_w) {
+                lw_cause_cnt[55] = lw_cause_cnt[55] + 32'd1;
+            }
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && !f0_present && !icache_stall_comb
+                && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && wf_full {
+                lw_cause_cnt[56] = lw_cause_cnt[56] + 32'd1;
+            }
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && !f0_present && !icache_stall_comb
+                && (imem_valid_w || imem_fault_w || imem_acc_fault_w) && !wf_full {
+                lw_cause_cnt[57] = lw_cause_cnt[57] + 32'd1;
+            }
+            if !if_v_q && !any_redirect && !fetch_ready && !ext_head_avail && f0_present {
+                lw_cause_cnt[58] = lw_cause_cnt[58] + 32'd1;
+            }
+            if wf_do_push {
+                lw_cause_cnt[59] = lw_cause_cnt[59] + 32'd1;
             }
             if !rob_commit_ack {
                 commit0_cnt = commit0_cnt + 32'd1;
