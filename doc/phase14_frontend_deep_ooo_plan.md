@@ -968,6 +968,38 @@ instead of a guess.
 dispatch never coexists with a squash (0 over a boot). Both are load-bearing for the queue's
 pointers, and both were previously only implied by other modules' gating.
 
+### L3.2c — FLIPPED. Bit-identical, exactly as predicted, and the shadow keeps agreeing.
+
+`LQ_REAL = 1` (one `const` in `heliodor_core`, passed as a **param** to both `rob` and the queue —
+the `ras::PRED_AHEAD` form, not the duplicated-const form that made `rob::PRED_OVERRIDE` a hazard in
+3a.5). At 1 the ROB's `o_commit_load_poison` and its commit-slot-1 gate read the queue instead of
+`sh_load_poison`. Build clean, **no comb loop** (the queue's outputs are FF-derived, so the
+core→queue→rob→core path has no cycle).
+
+| gate | `=0` (shipped) | `=1` (flip) |
+|---|---|---|
+| `veryl test` | 252/0 | **252/0** |
+| dhrystone | 237,827 cy / instret 264,834 | **237,827 / 264,834 — bit-identical** |
+| N=1 Linux boot | `cy=00cf36e0` (13,580,000) | **`cy=00cf36e0` — bit-identical** |
+| N=2 SMP Linux boot | 18,170,000 | **`cy=01154090` = 18,170,000 — bit-identical** |
+| litmus N=2 | `cy=002e6300` | **`cy=002e6300`** |
+| litmus N=4 | 3,960,000 | **`cy=003c6cc0` = 3,960,000** |
+| equivalence violations | 0 | **0 — the shadow still agrees every cycle** |
+
+Every gate, including both SMP gates the campaign requires for anything touching memory ordering,
+is bit-identical to the shipped baseline. Reverted to `=0` for ship-safety; **whether `LQ_REAL=1`
+becomes the default path is the user's call**, as it was for `ATOMIC_SQ` and `LSR_MSHR_B`.
+
+**The prediction written before the measurement was "< 0.5 % in either direction, expected exactly
+bit-identical". It is exactly bit-identical**, on both workloads, which is the only honest outcome:
+the queue recomputes the same decisions from the same inputs. A cycle difference here would have
+been a bug, not a result.
+
+The interesting property of this flip is that it is **self-validating**: the ROB shadow is left
+running as a live reference, so at `=1` the machine is simultaneously using the new structure and
+proving it agrees with the old one, cycle for cycle. That check is what makes the eventual deletion
+of the shadow arrays a mechanical step rather than a leap.
+
 ### What is already built — do NOT rebuild
 
 | piece | state |
