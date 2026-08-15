@@ -955,12 +955,55 @@ after a slot-1 commit is just pc + (rvc ? 2 : 4)", which a taken branch breaks.
 Loads are the opposite shape: commit already allows them, but the second dcache read port was
 **traded away for the 1R1W SRAM**, so re-admitting them means banking the L1D — a big build.
 
-### Order (revised by measurement)
+### W1a — control transfers on rename slot-1: BUILT, FLIPPED, MEASURED
 
-1. **W1 — control transfers on rename slot-1** (+ commit slot-1 next-PC). Execute side exists.
-2. **W2 — front-end delivery** (20.8 % empty + 18.3 % no-2nd).
-3. **W3 — loads on slot-1** — needs mem-IQ slot-1 alloc + a banked/dual-ported L1D.
-4. **W4 — resize ROB/PRF/IQ**, after width exists. First give sizing a single source of truth.
+`W1_CTRL_SLOT1` (`heliodor_core.veryl`, at `dec_op2_eligible`). It turned out to be a **one-predicate
+change**: everything downstream is not merely wired but **already exercised in the shipped design**,
+because `iq_int`'s `pipe1_ok` excludes only load/store/amo/csr/fp/div — so control ops renamed on
+SLOT-0 already issue on pipe-1 today. `u_alu2` is a full `alu_wrap`; `early_mispredict1` is exactly
+symmetric with lane 0 (age-picked between lanes); `rob_alloc_entry2` already fills `is_control` /
+`is_call` / `is_ret` / `pred_index` / `ghr_fold`, so predictor training is right; `i_rename_en2` and
+`fl_pop_en2` are both `&& has_rd`, so a rd-less branch touches neither RAT nor free list; and
+`sb_slot1_kill` kills slot-1 at the FRONT END when slot-0 is predicted taken, so the FIFO never
+holds a wrong-path slot-1. DEAD at 0 verified bit-exact (252/0, `cy=00dec740`, instret 10434447).
+
+| | `W1=0` | `W1=1` | Δ |
+|---|---|---|---|
+| **cycles** | 14,600,000 | **14,570,000** | **−0.21 %** |
+| 1-wide rename | 6,883,844 | 5,754,483 | −1,129,361 |
+| 2-wide rename | 2,200,786 | 2,776,763 | **+575,977 (+26 %)** |
+| front end empty | 3,040,734 | 3,453,341 | **+412,607** |
+| no 2nd in FIFO | 1,261,868 | 1,807,139 | **+545,271** |
+| resource | 476,959 | 758,781 | +281,822 |
+| **branch ineligible** | 1,205,693 | **0** | eliminated |
+
+Suite 252/0 (incl. litmus N=2). Two independent runs agree on the cycle count.
+
+**The flip fired perfectly and bought almost nothing, and the census says exactly why.** Renaming
+26 % wider only **drained the fetch FIFO faster**: front-end-supply-limited cycles (`empty` +
+`no2nd`) went **4,302,602 → 5,260,480, +958k**, absorbing essentially all of the 1,129,361-cycle
+reduction in 1-wide rename. ⚠️ **The prediction in this plan — that commit (`c2_simple` excluding
+control) or the 32-entry ROB would become the new limiter — was WRONG.** `resource` grew but stays
+small. The limiter moved **upstream**, not downstream.
+
+⚠️ **Third confirmation that a stall census does not convert.** L3 over-promised 3-5×, L4 step-2
+over-promised ∞ (7.14 % → 0), W1a over-promised **~40×** (8.3 % → 0.21 %). Treat every future
+bucket the same way: it says WHERE, never HOW MUCH.
+
+W1a is banked at 0 — it is correct and it removes an arbitrary restriction outright, but 0.21 % does
+not justify its own multi-hour ladder (litmus N=4 + N=2/N=4 SMP boots + Verilator NBA). Gate it
+together with W2, which touches the same paths.
+
+### Order (revised AGAIN, by the W1a flip)
+
+1. **W2 — front-end delivery. THE binding constraint: 5,260,480 cy = 36 % of the boot** is "the
+   front end did not deliver enough" (`empty` 3,453,341 + `no2nd` 1,807,139 at `W1=1`). Nothing
+   downstream can pay until this moves.
+2. **W1b — control on commit slot-1** (`c2_simple`'s `!sh_is_control`; needs the slot-1 next-PC to
+   stop assuming `pc + (rvc?2:4)`). Only after W2, and only if commit shows up as the limiter then.
+3. **W3 — loads on slot-1** — mem-IQ slot-1 alloc + a banked/dual-ported L1D.
+4. **W4 — resize ROB/PRF/IQ** — still last; `resource` is 758,781 cy even at `W1=1`. First give
+   sizing a single source of truth.
 
 ⚠️ Census discipline, per L4 step-2: a sole-blocker census bounds the **OPPORTUNITY**, not the
 **PRIZE**. Use these numbers to choose WHERE to build, never to predict what a build is worth.
