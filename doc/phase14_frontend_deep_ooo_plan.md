@@ -1137,6 +1137,55 @@ left old objects in `build_n2`. A clean rebuild gave 182 ms. **`rm -rf` the `bui
 the configuration changes**; an incremental Verilator build can otherwise produce a plausible,
 wrong, and very believable result.
 
+
+### 🗺️ Post-Block-W re-census (2026-08-15) — the map changed, so it was re-measured
+
+Every bucket in this document above was taken on a machine that no longer exists (~1-wide,
+16 KB L1I). Re-measured at the new default (`cy=00cf36e0` = 13,580,000):
+
+| pool | cycles | of boot |
+|---|---|---|
+| **`loadwait`** (back end) | **2,758,130** | **20.3 %** |
+| **front end empty** | **2,648,008** | **19.5 %** |
+
+The two are now level — and note `loadwait` did **not** shrink in absolute terms; the front-end
+work simply removed cycles around it. `loadwait` splits:
+
+| sole blocker | cycles |
+|---|---|
+| **`lsr` occupancy** | **1,440,381** |
+| ├ `dcache` | 734,816 |
+| └ **`lane0`** | **705,559** |
+| `load_blocks_on_store` | 723,149 |
+| `dmem_mmu_busy` | 261,794 |
+| AMO path | 106,413 |
+| replay (live now that the MSHR ships) | 50,147 |
+| mshr | 17,466 |
+
+⚠️ **`lane0` was ~0 before Block W.** It is the Stage-B load waiting for a free lane-0 writeback
+slot (`lsr_lane0_free`) — a PORT CONTENTION created by the extra traffic 2-wide rename delivers.
+A bottleneck Block W *made*, not one it found.
+
+### W3 probe — L1D 16 KB → 32 KB: **−1.40 %. Do not adopt.**
+
+Same one-parameter probe that returned −5.63 % on the L1I. The data side does not behave like the
+instruction side at all:
+
+| | 16 KB | 32 KB | Δ |
+|---|---|---|---|
+| cycles | 13,580,000 | 13,390,000 | **−1.40 %** |
+| `lsr`→`dcache` | 734,816 | 692,398 | **−5.8 %** |
+| `lsr`→`lane0` | 705,559 | 708,405 | +0.4 % (unmoved) |
+| `loadwait` | 2,758,130 | 2,647,076 | −4.0 % |
+
+Doubling the L1I cut its miss cycles **−65 %**; doubling the L1D cuts its stall bucket **−5.8 %**.
+D-side misses here are compulsory/coherence traffic, not capacity — **the same SRAM area buys 4×
+more on the instruction side.** Probe reverted; not shipped.
+
+**⇒ Next lever is `lane0` (705,559 cy), and it is structural, not capacity** — port contention on
+the lane-0 writeback, untouched by any cache size. See `lsr_lane0_free` / `lsr_to_lane1`
+(step-1.5's "fault/FP loads stay on lane 0, everything else goes to lane 1").
+
 ### Order (revised AGAIN, by the W2a flip)
 
 1. **W2b — the fetch-ahead FIFO not delivering** (1,660,371 cy at `W1a+W2a`). This is the wall that
