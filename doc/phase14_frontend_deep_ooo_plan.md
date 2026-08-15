@@ -826,6 +826,107 @@ the L4 array `o_dbg_lw_cause[20]` on `heliodor_core` + `rob`, wired through `hel
 subset (`load_viol`/`load_replay`/`inv_viol`/`mshr_pois`/`load_wait`/`rob_commit`) is wired through
 `heliodor_soc_smp` into the N=2/N=4 harnesses; the decomposition counters are N=1-only.
 
+## L3.2 — THE BUILD: a first-class load queue (2026-08-15). Structure, not IPC.
+
+**User decision, 2026-08-15:** "performance is of almost no interest right now; I want structural
+progress — performance falling out of it is a bonus." L3 is therefore promoted to *the next block*
+on the structural leg alone. Phase 14 defines itself as *front-end + LSQ structural completion*, and
+after F2 / S1 / L1 / L2 / L4 shipped, **the load queue is the only named structure never built**:
+`pipeline_pkg::LQ_DEPTH = 8` / `LQ_IDX_W = 3` (and `SQ_DEPTH = 8`) have sat in the package **unread
+by any module** since they were written — the plan's own evidence that this one was skipped.
+
+⚠️ **This will not move IPC and that is not a failure.** L3.1 measured the disambiguation ceiling by
+deleting the dominant poison source outright: **0.41 % of the N=1 boot, and that is the UNSOUND
+bound**. Anyone reading a flat cycle count on the flip as "L3 failed" is reading it wrong; the
+same reading of L4 step-2 would have thrown away five latent-bug fixes. Record the number, ship the
+structure. Do not go looking for an IPC story afterwards.
+
+### L3.2.0 — audit of what is actually there today (re-verified against HEAD, not from memory)
+
+| piece | where | what it really is |
+|---|---|---|
+| the "queue" | `rob.veryl:468-471` | `sh_load_done/addr/funct3/poison`, four **ROB_DEPTH=32** arrays indexed by `rob_idx` |
+| age order | `rob.veryl:938-939` | derived per-scan by subtracting `head_idx`, not held by the structure |
+| record ports | `rob.veryl:1500` / `:1530` / `:1543` | lane-0 CDB, lane-1 CDB, MSHR capture |
+| store-resolve CAM | `rob.veryl:933-978` | 32-wide, over the same arrays |
+| self-scan (S15) | `rob.veryl:994-1044` | 32-wide, over the ROB store shadow |
+| CoRR invalidate scan | `rob.veryl:1059-1072` | 32-wide line compare |
+| replay | `rob.veryl:693` → `heliodor_core.veryl:6210` | `o_commit_load_poison` → full redirect + refetch |
+
+It works, and L3.0 already concluded the *shape* is an age-ordered LQ checked at store-execute. What
+is missing is everything that makes it a **structure** rather than four more shadow arrays:
+
+1. **No queue.** No head/tail, no occupancy, no depth of its own — it is ROB-indexed, so "load queue
+   depth" is not a design parameter of this machine at all. `LQ_DEPTH` is unread.
+2. **The tag is the wrong address.** Both CDB record ports write a **VA** (`i_cdb_store_addr` = the
+   AGU output), while the MSHR port writes a **PA** (`mshr_rec_addr = lsr_paddr_q`,
+   `heliodor_core.veryl:10690`). One array, two address spaces, distinguished nowhere.
+3. **🚩 …and that makes the CoRR scan unsound under VM — a correctness gap, not a performance one.**
+   `inv_viol_w` (`rob.veryl:1066`) compares the record against `i_inv_addr[63:6]`, and `i_inv_addr`
+   is a **PA** (port comment, `rob.veryl:126`). For a CDB-recorded load under Sv39 the record is a
+   VA, so the compare is against the wrong address space: a remote write that should poison an
+   executed-uncommitted load **silently does not**. It has never been caught because the litmus
+   battery runs **bare** (VA == PA there, so the compare is exact) and the SMP boots hit the case
+   once in an entire 2-hart boot (L3.1). This is the first argument for L3 that is not structural
+   taste: **PA-exact records close a real hole in RVWMO CoRR under paging.**
+4. **Allocation is implicit.** A load "enters the queue" the cycle it *executes* (its record port
+   fires). There is no dispatch-time entry, so nothing in the machine knows how many loads are in
+   flight, and no back-pressure exists to know about.
+5. **Disambiguation state is spread across three modules.** The queue is in `rob`, the exact PA is in
+   `heliodor_core` (`lsr_paddr_q`), the forward network is in `alu_wrap`.
+
+### L3.2.1 — the design
+
+A new peer module **`load_queue.veryl`**, instantiated in `heliodor_core` alongside `rob` (not inside
+it): the point of the block is to make the interface of load disambiguation explicit, and a module
+nested inside the ROB would hide exactly that. Every input it needs already exists at core level —
+they are the signals the core drives into `rob` today.
+
+```
+                 dispatch (dec_op.is_load)          ┌──────────────┐
+   rename ──────────────────────────────────────────▶│              │
+   CDB lane0 / lane1 / MSHR record (VA + PA + size) ─▶│  load_queue  │── o_poison_head  ─┐
+   store resolve (rob_idx, VA, PA, size) ───────────▶│  LQ_N entries │── o_poison_head1 ─┤
+   remote invalidate / evict (PA line) ×4 ──────────▶│  head / tail  │                   │
+   MSHR abort poison ×2 ────────────────────────────▶│  age-ordered  │                   ▼
+   commit / flush / partial squash ─────────────────▶│              │            rob commit gate
+                                                     └──────────────┘
+```
+
+- **Entry**: `{ valid, rob_idx, done, va, pa, pa_valid, size, poison }`. Allocated **in program
+  order at dispatch** for every op with `dec_op.is_load` (= `mem_ren`, `decode.veryl:223` — a
+  superset of every op that can later record: `alu_wrap.veryl:441` gates the CDB record with the
+  same `base.is_load`, and the MSHR record is a load miss). Freed **in order at commit**, up to 2
+  per cycle (`c2_simple` permits a load in commit slot-1).
+- **Age** is the queue's own order. Comparisons against a *store* still need the ROB's `head_idx`,
+  because stores live in the ROB shadow (that is L1, the SQ half, which was never built either —
+  the ROB's exported `o_store_*` arrays stand in for it, and the interface says so).
+- **Depth** `LQ_N` is a real parameter. It starts at **32** = ROB_DEPTH so the queue can never fill
+  and the flip measures the *structure* alone; the depth sweep (8 / 16) is a separate, honest
+  measurement of what this machine actually needs, run afterwards.
+- **Squash** rewinds `tail` to the first entry younger than the branch — a prefix count over the
+  survivors, the queue analogue of the ROB's `squash_new_tail`.
+
+### L3.2.2 — increments (each DEAD at `LQ_REAL = 0`, flip last)
+
+| step | content | gate |
+|---|---|---|
+| **a** | the queue substrate: alloc / free / flush / squash, records, no scans, outputs unread | `veryl test` 252/0 + **membership equivalence vs the ROB shadow proven over a full boot** |
+| **b** | the three scans re-derived in the LQ + a per-cycle divergence trap vs the ROB's decisions | boot with **0 divergences** |
+| **c** | flip: `o_commit_load_poison` / `c2_simple` sourced from the LQ | full ladder: 252/0, dhrystone, N=1, litmus N=2/N=4, N=2 SMP |
+| **d** | PA-exact records + exact overlap when both PAs are valid (closes gap 3 above) | same ladder + the CoRR-under-VM argument re-checked |
+
+**DEAD criterion is the f2.5a one, not "byte-identical":** Veryl 0.20.2 does not fold
+`else if CONST_FALSE` at SV-text level, so the standard is *existing SV preserved verbatim (the diff
+is pure addition) + every addition const-gated and unread*. A new module that nothing reads meets it.
+
+**Predictions, written before the measurement** (so they can be scored, per the campaign rule):
+`c` moves cycles by **< 0.5 %** in either direction and is expected to be **exactly bit-identical**,
+because at `LQ_REAL=1` the LQ recomputes the same poison decisions from the same inputs — anything
+else is a bug, not a result. `d` is bounded by L3.1's 0.41 % and will land **below** it, since a
+sound PA-exact test only fires where both PAs are valid. The one thing `d` genuinely buys that no
+counter shows is CoRR correctness under Sv39.
+
 ### What is already built — do NOT rebuild
 
 | piece | state |
