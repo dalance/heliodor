@@ -927,6 +927,47 @@ else is a bug, not a result. `d` is bounded by L3.1's 0.41 % and will land **bel
 sound PA-exact test only fires where both PAs are valid. The one thing `d` genuinely buys that no
 counter shows is CoRR correctness under Sv39.
 
+### L3.2a/b — BUILT, DEAD, AND PROVEN EQUIVALENT ON A FULL LINUX BOOT
+
+`src/core/load_queue.veryl` (new module, instantiated in `heliodor_core` next to `rob`). It allocates
+at dispatch on `dec_op.is_load`, frees up to two entries at commit, rewinds on partial squash by a
+survivor count, empties on flush, records at the ROB's three record sites verbatim, and re-derives
+all three scans (store-resolve / S15 self / CoRR invalidate) with **bit-identical arithmetic**. The
+ROB gained four pure-addition outputs — `o_lq_rec_set`, `o_lq_pois_set`, `o_store_known` — and the
+`LQ_REAL` flip mux; nothing existing changed.
+
+**The check is the deliverable, not the code.** Every cycle the queue compares its own state against
+the shadow arrays it is meant to replace, in both directions:
+
+| check | what a hit would mean | N=1 boot |
+|---|---|---|
+| record with no LQ entry (`orphan`) | the dispatch alloc predicate is not a superset of the recorders | **0** |
+| executed-load set != the ROB's | alloc / free / squash diverges | **0** |
+| poison set != the ROB's | one of the three scans differs | **0** |
+| push into a full queue | LQ_N too small | **0** |
+| alloc in a squash/flush cycle | the "alloc never coexists with squash" assumption is false | **0** |
+
+Set equality is proven as *containment + equal cardinality* (3 × 32 compares), not a 32 × 32 matrix:
+the matrix is exact too but costs 1024 compares per simulated cycle, and this runs for 13.58 M of
+them. Containment is a dynamic read of the reference vector by the entry's own `rob_idx`.
+
+**Gates:** `veryl test` **252/0** · N=1 Linux boot **`cy=00cf36e0` = 13,580,000, `x3=0xaa`,
+bit-exact with the shipped Block-W baseline** — the queue is genuinely dead, and the boot is the
+run that matters because all three scans are Sv39-only (L3.0: 19,539 poisons / 16,496 replays there,
+**0** on the bare microbenchmarks).
+
+🎯 **Measured, and it is the answer to "what depth?": the high-water occupancy of a full Linux boot
+is 16 of 32** (8 across the whole arch + litmus suite). So `LQ_DEPTH = 8` — the number that has sat
+unread in `pipeline_pkg` since it was written — **would have been too small**, and 16 is the honest
+size for this machine. The queue ships at 32 (= ROB_DEPTH, cannot fill) so that the flip measures the
+structure and nothing else; depth is a separate experiment, and it now has a measured starting point
+instead of a guess.
+
+**Two assumptions were converted into measurements rather than left as comments:** that
+`dec_op.is_load` is a superset of every op that can record (orphan = 0 over a boot), and that
+dispatch never coexists with a squash (0 over a boot). Both are load-bearing for the queue's
+pointers, and both were previously only implied by other modules' gating.
+
 ### What is already built — do NOT rebuild
 
 | piece | state |

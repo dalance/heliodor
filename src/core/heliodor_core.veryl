@@ -996,6 +996,15 @@ pub module heliodor_core #(
     // it carries OPERANDS ({pa, op, src, size, aq/rl}), never a pre-computed value.
     const ATOMIC_SQ: bit = 1;
     const ASQ_N    : u32 = 1; // one in flight (allocation stays head-serialised)
+    // ── L3.2c: the first-class load queue is the AUTHORITY for load poison ──
+    // At 0 the queue is built, records, scans and checks itself against the ROB
+    // shadow every cycle, but the ROB's commit gate still reads sh_load_poison —
+    // so the whole structure is inert. At 1 the ROB reads the queue instead.
+    // Passed as a param to BOTH u_rob and (below) the queue, so there is one
+    // source of truth. Expect ZERO cycle change at the flip: the queue
+    // recomputes the same decisions from the same inputs, and L3.1 measured the
+    // whole disambiguation prize at 0.41 % anyway. This block is structural.
+    const LQ_REAL  : bit = 0;
     // ── R3.2c (§6.5): drop the class's EXECUTE-TIME READ — DEAD at ASQ_NOREAD=0 ──
     // With R3.2's drain computing the value at the memory system, a without-return
     // atomic no longer needs to read anything at execute: nothing architectural
@@ -6359,8 +6368,28 @@ pub module heliodor_core #(
     var rob_st_resolve_cnt_w: logic<32>; // L3 census: store resolves
     var rob_viol_store_cnt_w: logic<32>; // L3 census: store-resolve scan events
     var rob_viol_self_cnt_w : logic<32>; // L3 census: S15 self-scan events
+    // Phase 14 L3.2a: the ROB's executed-load record set + the load queue's
+    // equivalence counters (declared here: a var driven by an inst output port
+    // must be defined before the instantiation).
+    var rob_lq_rec_set   : logic [32];
+    var rob_lq_pois_set  : logic [32];
+    var rob_store_known  : logic [32];
+    var lq_dbg_alloc_cnt : logic<32>;
+    var lq_dbg_orphan_cnt: logic<32>;
+    var lq_dbg_mism_cnt  : logic<32>;
+    var lq_dbg_full_cnt  : logic<32>;
+    var lq_dbg_asq_cnt   : logic<32>;
+    var lq_dbg_occ_max   : logic<32>;
+    var lq_dbg_pmism_cnt : logic<32>;
+    var lq_poison_head   : logic    ;
+    var lq_poison_head1  : logic    ;
 
-    inst u_rob: rob (
+    inst u_rob: rob #(
+        // Phase 14 L3.2c: one source of truth for the flip — the same value goes
+        // to the load_queue below, so the ROB's commit gate and the queue that
+        // answers it can never be built against different settings.
+        LQ_REAL: LQ_REAL,
+    ) (
         clk                                         ,
         rst                                         ,
         i_alloc_en           : rename_fire          ,
@@ -6587,6 +6616,108 @@ pub module heliodor_core #(
         o_dbg_st_resolve_cnt : rob_st_resolve_cnt_w , // L3 census
         o_dbg_viol_store_cnt : rob_viol_store_cnt_w , // L3 census
         o_dbg_viol_self_cnt  : rob_viol_self_cnt_w  , // L3 census
+        o_lq_rec_set         : rob_lq_rec_set       , // Phase 14 L3.2a
+        o_lq_pois_set        : rob_lq_pois_set      , // Phase 14 L3.2b
+        o_store_known        : rob_store_known      , // Phase 14 L3.2b
+        i_lq_poison_head     : lq_poison_head       , // Phase 14 L3.2c
+        i_lq_poison_head1    : lq_poison_head1      ,
+    );
+
+    // ============================================================
+    // Phase 14 L3.2 — first-class LOAD QUEUE (peer of the ROB)
+    // ============================================================
+    // The age-ordered load queue this design never had; see load_queue.veryl and
+    // doc/phase14_frontend_deep_ooo_plan.md §L3.2. Every input below is a signal
+    // the core already drives into the ROB — the queue is a restructuring of
+    // state, not new information. DEAD at L3.2a: nothing reads its poison, so
+    // the only thing it does is prove (LQ_CHECK) that it tracks exactly the
+    // ROB's executed-load set through alloc / commit / squash / flush.
+    // Record ports, matched to the ROB's three record sites verbatim
+    // (rob.veryl:1500 / :1530 / :1543) so the queue's contents are bit-identical
+    // to the shadow arrays it replaces. Note the address spaces: the two CDB
+    // ports carry the AGU VA, the MSHR port carries the Stage-A PA. The shadow
+    // array cannot tell them apart; this queue can, and L3.2d uses it.
+    let lq_rec0_valid: logic = cdb.valid && cdb.is_load && !cdb.is_lfault;
+    let lq_rec1_valid: logic = alu_cdb2.valid && alu_cdb2.is_load;
+    inst u_load_queue: load_queue #(
+        LQ_N     : 32,
+        LQ_IDX_W : 5 ,
+        LQ_PTR_W : 6 ,
+        ROB_DEPTH: 32,
+        ROB_IDX_W: 5 ,
+    ) (
+        clk                                     ,
+        rst                                     ,
+        i_alloc_en       : rename_fire          ,
+        i_alloc_is_load  : dec_op.is_load       ,
+        i_alloc_idx      : rob_alloc_idx        ,
+        i_alloc_en2      : rename_fire2         ,
+        i_alloc_is_load2 : dec_op2.is_load      ,
+        i_alloc_idx2     : rob_alloc_idx2       ,
+        i_rob_full       : rob_full             ,
+        i_rob_head_idx   : rob_head_idx         ,
+        i_commit_fire    : rob_commit_valid && rob_commit_ack,
+        i_commit_idx     : rob_commit_idx       ,
+        i_commit_fire2   : commit2_fire         ,
+        i_commit_idx2    : rob_commit_idx + 5'd1,
+        i_redirect_fire  : redirect_fire        ,
+        i_squash_en      : s8_restore_en        ,
+        i_squash_idx     : s8_restore_idx       ,
+        i_rec0_valid     : lq_rec0_valid        ,
+        i_rec0_idx       : cdb.rob_idx          ,
+        i_rec0_va        : cdb.store_addr       ,
+        i_rec0_pa        : 64'd0                , // L3.2d wires the exact PA here
+        i_rec0_pa_valid  : 1'b0                 ,
+        i_rec0_funct3    : cdb.store_funct3     ,
+        i_rec1_valid     : lq_rec1_valid        ,
+        i_rec1_idx       : alu_cdb2.rob_idx     ,
+        i_rec1_va        : alu_cdb2.store_addr  ,
+        i_rec1_pa        : 64'd0                ,
+        i_rec1_pa_valid  : 1'b0                 ,
+        i_rec1_funct3    : alu_cdb2.store_funct3,
+        // The MSHR port's address IS the PA (mshr_rec_addr = lsr_paddr_q /
+        // dmu_dmem_addr), so it fills both fields: `va` keeps the queue's scans
+        // bit-identical to the shadow's (which stores this PA in sh_load_addr),
+        // `pa` records what it actually is.
+        i_rec2_valid     : mshr_alloc_fire      ,
+        i_rec2_idx       : mshr_alloc_rob       ,
+        i_rec2_va        : mshr_rec_addr        ,
+        i_rec2_pa        : mshr_rec_addr        ,
+        i_rec2_pa_valid  : 1'b1                 ,
+        i_rec2_funct3    : mshr_alloc_f3        ,
+        // L3.2b: the disambiguation event + the store side (still the ROB
+        // shadow — L1 was never built) + every line-departure the dcache sees.
+        i_st_valid       : cdb.valid && cdb.is_store,
+        i_st_idx         : cdb.rob_idx          ,
+        i_st_addr        : cdb.store_addr       ,
+        i_st_funct3      : cdb.store_funct3     ,
+        i_store_addr     : rob_store_addr       ,
+        i_store_funct3   : rob_store_funct3     ,
+        i_store_known    : rob_store_known      ,
+        i_conservative   : dmem_vm_on           ,
+        i_inv_valid      : i_dcache_inv_valid   ,
+        i_inv_addr       : i_dcache_inv_addr    ,
+        i_inv2_valid     : i_dcache_inv2_valid  ,
+        i_inv2_addr      : i_dcache_inv2_addr   ,
+        i_evict1_valid   : dc_evict1_v && (SMP_COHERENT != 0),
+        i_evict1_addr    : dc_evict1_addr       ,
+        i_evict2_valid   : dc_evict2_v && (SMP_COHERENT != 0),
+        i_evict2_addr    : dc_evict2_addr       ,
+        i_pois_v         : mshr_abort_poison    ,
+        i_pois_idx       : mshr_poison_idx      ,
+        i_pois_v2        : mshr_abort_poison2   ,
+        i_pois_idx2      : mshr_poison_idx2     ,
+        i_rob_rec_set    : rob_lq_rec_set       ,
+        i_rob_pois_set   : rob_lq_pois_set      ,
+        o_poison_head    : lq_poison_head       ,
+        o_poison_head1   : lq_poison_head1      ,
+        o_dbg_lq_alloc_cnt : lq_dbg_alloc_cnt   ,
+        o_dbg_lq_orphan_cnt: lq_dbg_orphan_cnt  ,
+        o_dbg_lq_mism_cnt  : lq_dbg_mism_cnt    ,
+        o_dbg_lq_full_cnt  : lq_dbg_full_cnt    ,
+        o_dbg_lq_asq_cnt   : lq_dbg_asq_cnt     ,
+        o_dbg_lq_occ_max   : lq_dbg_occ_max     ,
+        o_dbg_lq_pmism_cnt : lq_dbg_pmism_cnt   ,
     );
 
     // ============================================================

@@ -1,0 +1,623 @@
+// Phase 14 Block L3.2 — first-class LOAD QUEUE.
+//
+// Until now heliodor had no load queue. Load disambiguation state lived in four
+// ROB-indexed shadow arrays (`sh_load_done/addr/funct3/poison`, `rob.veryl`),
+// which are an age-ordered LQ in behaviour but not in structure: no head/tail,
+// no occupancy, no depth of their own — `pipeline_pkg::LQ_DEPTH` sat unread in
+// the package. This module is that structure, built as a PEER of the ROB (not
+// nested inside it) so the interface of load disambiguation is explicit: what
+// the queue must be told, and by whom.
+//
+// Entries are allocated IN PROGRAM ORDER AT DISPATCH for every op the decoder
+// marks `is_load` (= mem_ren), which is a superset of every op that can later
+// record (alu_wrap gates its CDB record with the same `base.is_load`; the MSHR
+// record is a load miss). They are freed IN ORDER AT COMMIT, up to two per
+// cycle (a load is permitted in commit slot-1). Over-allocation is harmless —
+// an op that never records simply holds a slot that never matches a scan — but
+// under-allocation is not, so the DEAD-phase check below counts orphan records.
+//
+// The address a load is TAGGED with is the point of the block. The shadow
+// arrays hold a VA from the two CDB record ports and a PA from the MSHR port,
+// in one array, distinguished nowhere — which is why the CoRR remote-invalidate
+// scan (a PA line compare) is unsound under Sv39 for CDB-recorded loads. Every
+// entry here carries both, with an explicit `pa_valid`.
+//
+// AGE: comparisons against a STORE are still relative to the ROB head, because
+// the store side is still the ROB shadow — L1 (the store queue) was never built
+// either, and the ROB's exported `o_store_*` arrays stand in for it. That is a
+// stated dependency of this module, not an oversight.
+//
+// DEAD at LQ_REAL=0: the poison outputs are not read by the ROB, so the whole
+// module is inert (the flip is L3.2c). LQ_CHECK gates the equivalence counters,
+// which are verification-phase hardware only.
+pub module load_queue #(
+    param LQ_N     : u32 = 32, // entries — 32 = ROB_DEPTH, so the queue never fills
+    param LQ_IDX_W : u32 = 5 , // log2(LQ_N)
+    param LQ_PTR_W : u32 = 6 , // LQ_IDX_W + 1 (full/empty distinction, like the ROB's)
+    param ROB_DEPTH: u32 = 32,
+    param ROB_IDX_W: u32 = 5 ,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // ---- dispatch allocation (mirrors the ROB's own alloc gating exactly) ----
+    i_alloc_en      : input logic           , // rename_fire
+    i_alloc_is_load : input logic           , // dec_op.is_load
+    i_alloc_idx     : input logic<ROB_IDX_W>, // rob_alloc_idx  (ROB tail)
+    i_alloc_en2     : input logic           , // rename_fire2
+    i_alloc_is_load2: input logic           , // dec_op2.is_load
+    i_alloc_idx2    : input logic<ROB_IDX_W>, // rob_alloc_idx2 (ROB tail+1)
+    i_rob_full      : input logic           , // the ROB's alloc gate — allocation must not diverge
+
+    // ---- ROB geometry: the oldest in-flight op (ages are relative to it) ----
+    i_rob_head_idx: input logic<ROB_IDX_W>,
+
+    // ---- in-order release ----
+    i_commit_fire : input logic           , // rob_commit_valid && rob_commit_ack
+    i_commit_idx  : input logic<ROB_IDX_W>,
+    i_commit_fire2: input logic           , // commit2_fire (slot-1)
+    i_commit_idx2 : input logic<ROB_IDX_W>,
+
+    // ---- recovery ----
+    i_redirect_fire: input logic           , // full flush
+    i_squash_en    : input logic           , // partial age-based squash
+    i_squash_idx   : input logic<ROB_IDX_W>, // ROB idx of the youngest KEPT op
+
+    // ---- execute-time records (the ROB's three ports, verbatim) ----
+    // 0 = lane-0 CDB (VA), 1 = lane-1 CDB (VA), 2 = MSHR capture (PA).
+    i_rec0_valid   : input logic           ,
+    i_rec0_idx     : input logic<ROB_IDX_W>,
+    i_rec0_va      : input logic<64>       ,
+    i_rec0_pa      : input logic<64>       ,
+    i_rec0_pa_valid: input logic           ,
+    i_rec0_funct3  : input logic<3>        ,
+    i_rec1_valid   : input logic           ,
+    i_rec1_idx     : input logic<ROB_IDX_W>,
+    i_rec1_va      : input logic<64>       ,
+    i_rec1_pa      : input logic<64>       ,
+    i_rec1_pa_valid: input logic           ,
+    i_rec1_funct3  : input logic<3>        ,
+    i_rec2_valid   : input logic           ,
+    i_rec2_idx     : input logic<ROB_IDX_W>,
+    i_rec2_va      : input logic<64>       ,
+    i_rec2_pa      : input logic<64>       ,
+    i_rec2_pa_valid: input logic           ,
+    i_rec2_funct3  : input logic<3>        ,
+
+    // ---- L3.2b: the disambiguation event — a store resolving its address ----
+    i_st_valid : input logic           , // cdb.valid && cdb.is_store
+    i_st_idx   : input logic<ROB_IDX_W>,
+    i_st_addr  : input logic<64>       ,
+    i_st_funct3: input logic<3>        ,
+    // ---- the STORE side, which is still the ROB shadow ----
+    // L1 (the store queue) was never built, so the queue's self-scan reads the
+    // ROB's exported store shadow. This is the honest shape of the dependency:
+    // when L1 lands these three become the SQ's ports, not the ROB's.
+    i_store_addr  : input logic<64>[ROB_DEPTH],
+    i_store_funct3: input logic<3> [ROB_DEPTH],
+    i_store_known : input logic    [ROB_DEPTH], // valid && is_store && rw && !is_amo
+    i_conservative: input logic                , // Sv39 active → VA compares degrade
+
+    // ---- coherence: every way a line can leave this L1 (P9.0 / P9.2 CoRR) ----
+    i_inv_valid   : input logic    ,
+    i_inv_addr    : input logic<64>,
+    i_inv2_valid  : input logic    ,
+    i_inv2_addr   : input logic<64>,
+    i_evict1_valid: input logic    ,
+    i_evict1_addr : input logic<64>,
+    i_evict2_valid: input logic    ,
+    i_evict2_addr : input logic<64>,
+
+    // ---- external poison: an MSHR fill aborted by a remote write (S10.3) ----
+    i_pois_v   : input logic           ,
+    i_pois_idx : input logic<ROB_IDX_W>,
+    i_pois_v2  : input logic           ,
+    i_pois_idx2: input logic<ROB_IDX_W>,
+
+    // ---- DEAD-phase equivalence reference: the ROB's own sets ----
+    // i_rob_rec_set[i] = sh_valid[i] && sh_load_done[i]. The queue must track
+    // exactly this set, cycle for cycle, or its alloc/free/squash is wrong.
+    // i_rob_pois_set[i] = sh_valid[i] && sh_load_poison[i] — the same test for
+    // the three scans (L3.2b).
+    i_rob_rec_set : input logic [ROB_DEPTH],
+    i_rob_pois_set: input logic [ROB_DEPTH],
+
+    // ---- poison outputs (read by the ROB only at LQ_REAL=1, L3.2c) ----
+    o_poison_head : output logic, // the committing head load is poisoned → replay
+    o_poison_head1: output logic, // head+1 is poisoned → keep it out of commit slot-1
+
+    // ---- diagnostics (LQ_CHECK-gated; reset-only → DCE at 0) ----
+    o_dbg_lq_alloc_cnt : output logic<32>, // entries allocated
+    o_dbg_lq_orphan_cnt: output logic<32>, // record with no LQ entry = alloc predicate hole
+    o_dbg_lq_mism_cnt  : output logic<32>, // cycles where the tracked set != the ROB's
+    o_dbg_lq_full_cnt  : output logic<32>, // push into a full queue (never, at LQ_N = ROB_DEPTH)
+    o_dbg_lq_asq_cnt   : output logic<32>, // alloc in a squash/flush cycle (assumed impossible)
+    o_dbg_lq_occ_max   : output logic<32>, // high-water occupancy — the answer to "what depth?"
+    o_dbg_lq_pmism_cnt : output logic<32>, // cycles where the poison set != the ROB's (L3.2b)
+) {
+    // Verification-phase instrumentation. Set to 0 before shipping: at 0 every
+    // counter here is reset-only, so the whole check (including the 32x32
+    // set compare) folds away.
+    const LQ_CHECK: bit = 1;
+    // FLIP-COUPLED with rob.veryl's S15_SELF_SCAN. The record-time self-scan is
+    // the dominant poison source (13,083 of 19,539 on an N=1 boot, L3.0); it is
+    // reproduced here bit-for-bit, so if one side is turned off for a probe the
+    // other must be too or the equivalence check fires.
+    const S15_SELF_SCAN: bit = 1;
+
+    var lq_valid : logic           [LQ_N];
+    var lq_rob   : logic<ROB_IDX_W>[LQ_N];
+    var lq_done  : logic           [LQ_N]; // has executed — address recorded
+    var lq_va    : logic<64>       [LQ_N];
+    var lq_pa    : logic<64>       [LQ_N];
+    var lq_pa_v  : logic           [LQ_N];
+    var lq_f3    : logic<3>        [LQ_N];
+    var lq_poison: logic           [LQ_N]; // violated → replay at commit (L3.2b/c)
+
+    var head: logic<LQ_PTR_W>;
+    var tail: logic<LQ_PTR_W>;
+
+    let head_idx: logic<LQ_IDX_W>  = head[LQ_IDX_W - 1:0];
+    let tail_idx: logic<LQ_IDX_W>  = tail[LQ_IDX_W - 1:0];
+    let count   : logic<LQ_PTR_W>  = tail - head;
+    let is_full : logic            = count == (LQ_N as LQ_PTR_W);
+
+    // Allocation. The ROB allocs slot-0 on (i_alloc_en && !is_full) and slot-1
+    // nested inside it, so slot-1 without slot-0 is impossible; mirror that
+    // exactly or the two structures drift. Alloc never coexists with a squash
+    // or flush (rename_fire is gated on !any_redirect) — asserted, not assumed:
+    // o_dbg_lq_asq_cnt counts any violation.
+    let rob_alloc0: logic = i_alloc_en && !i_rob_full;
+    let rob_alloc1: logic = rob_alloc0 && i_alloc_en2;
+    let push0     : logic = rob_alloc0 && i_alloc_is_load && !i_squash_en && !i_redirect_fire;
+    let push1     : logic = rob_alloc1 && i_alloc_is_load2 && !i_squash_en && !i_redirect_fire;
+
+    let tail_a1    : logic<LQ_PTR_W> = tail + (if push0 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W));
+    let tail_a1_idx: logic<LQ_IDX_W> = tail_a1[LQ_IDX_W - 1:0];
+    let push_cnt   : logic<LQ_PTR_W> = (if push0 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W))
+        + (if push1 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W));
+
+    // Release. The committing ROB entry is a load iff it is the LQ head (the
+    // queue holds the loads of exactly the in-flight window, in order), so the
+    // pop condition is a single tag compare, not a search.
+    let pop0        : logic           = i_commit_fire && (count != (32'd0 as LQ_PTR_W))
+        && lq_valid[head_idx] && (lq_rob[head_idx] == i_commit_idx);
+    let head_p1     : logic<LQ_PTR_W> = head + (if pop0 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W));
+    let head_p1_idx : logic<LQ_IDX_W> = head_p1[LQ_IDX_W - 1:0];
+    let pop1        : logic           = i_commit_fire2 && (count >: (if pop0 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W)))
+        && lq_valid[head_p1_idx] && (lq_rob[head_p1_idx] == i_commit_idx2);
+    let pop_cnt     : logic<LQ_PTR_W> = (if pop0 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W))
+        + (if pop1 ? (32'd1 as LQ_PTR_W) : (32'd0 as LQ_PTR_W));
+
+    // Partial squash. The ROB keeps every entry with age <= squash_age and
+    // rewinds its tail to just past the branch; the queue's analogue is a
+    // survivor count, because its slots are not ROB-indexed. Entries are
+    // age-ordered from the head, so the survivors are a prefix and the new tail
+    // is head + keep_cnt. Ages are taken against the PRE-commit head, exactly
+    // as the ROB's `squash_age` is.
+    let squash_age: logic<ROB_IDX_W> = i_squash_idx - i_rob_head_idx;
+    var keep_cnt  : logic<LQ_PTR_W>;
+    var sq_drop   : logic [LQ_N];
+    always_comb {
+        keep_cnt = 32'd0 as LQ_PTR_W;
+        for i in 0..LQ_N {
+            let age: logic<ROB_IDX_W> = lq_rob[i] - i_rob_head_idx;
+            sq_drop[i] = lq_valid[i] && (age >: squash_age);
+            if lq_valid[i] && !(age >: squash_age) {
+                keep_cnt = keep_cnt + (32'd1 as LQ_PTR_W);
+            }
+        }
+    }
+
+    // Record CAM. A record is tagged by rob_idx, so writeback finds its entry by
+    // an associative compare over the queue. (The canonical alternative is to
+    // carry an lq_idx with the op from dispatch through issue to writeback; that
+    // needs a new field in the issue/CDB structs and is deliberately left for
+    // later — it changes no behaviour, only the port count.)
+    var rec_hit0: logic [LQ_N];
+    var rec_hit1: logic [LQ_N];
+    var rec_hit2: logic [LQ_N];
+    var orphan0 : logic;
+    var orphan1 : logic;
+    var orphan2 : logic;
+    always_comb {
+        orphan0 = i_rec0_valid;
+        orphan1 = i_rec1_valid;
+        orphan2 = i_rec2_valid;
+        for i in 0..LQ_N {
+            rec_hit0[i] = i_rec0_valid && lq_valid[i] && (lq_rob[i] == i_rec0_idx);
+            rec_hit1[i] = i_rec1_valid && lq_valid[i] && (lq_rob[i] == i_rec1_idx);
+            rec_hit2[i] = i_rec2_valid && lq_valid[i] && (lq_rob[i] == i_rec2_idx);
+            if rec_hit0[i] {
+                orphan0 = 1'b0;
+            }
+            if rec_hit1[i] {
+                orphan1 = 1'b0;
+            }
+            if rec_hit2[i] {
+                orphan2 = 1'b0;
+            }
+        }
+    }
+
+    // ============================================================
+    // L3.2b — the three scans, re-derived from the queue
+    // ============================================================
+    // Reproduced from rob.veryl (store-resolve scan `:933`, S15 record-time
+    // self-scan `:994`, P9.0 CoRR invalidate scan `:1059`) with the SAME
+    // arithmetic, deliberately: the DEAD-phase check demands bit-identical
+    // decisions, so the only thing allowed to change is where the state lives.
+    // The approximations (13-bit page-offset compare, page-cross blanket) are
+    // carried over unchanged here — L3.2d is where the PA fixes them.
+    //
+    // Same-cycle folds: a load recording THIS cycle has already read past a
+    // store resolving in the same cycle, so it must be visible to that store's
+    // scan even though its `done` bit lands on the next edge. The shadow arrays
+    // fold the live record ports in for exactly this reason; `eff_*` is that.
+    var eff_done: logic    [LQ_N];
+    var eff_va  : logic<64>[LQ_N];
+    var eff_f3  : logic<3> [LQ_N];
+    always_comb {
+        for i in 0..LQ_N {
+            eff_done[i] = lq_done[i] || rec_hit0[i] || rec_hit1[i] || rec_hit2[i];
+            eff_va[i]   = if rec_hit0[i] ? i_rec0_va : (if rec_hit1[i] ? i_rec1_va : (if rec_hit2[i] ? i_rec2_va : lq_va[i]));
+            eff_f3[i]   = if rec_hit0[i] ? i_rec0_funct3 : (if rec_hit1[i] ? i_rec1_funct3 : (if rec_hit2[i] ? i_rec2_funct3 : lq_f3[i]));
+        }
+    }
+
+    // Store-resolve scan: an executed load YOUNGER than the resolving store that
+    // overlaps its bytes read stale data — poison it for the commit replay.
+    var st_viol_w: logic [LQ_N];
+    always_comb {
+        for i in 0..LQ_N {
+            let st_age : logic<ROB_IDX_W> = i_st_idx - i_rob_head_idx;
+            let ld_age : logic<ROB_IDX_W> = lq_rob[i] - i_rob_head_idx;
+            let ld_seen: logic            = lq_valid[i] && eff_done[i];
+            let la     : logic<64>        = eff_va[i];
+            let lsz    : logic<64>        = (5'd1 << eff_f3[i][1:0]) as 64;
+            let sa     : logic<64>        = i_st_addr;
+            let ssz    : logic<64>        = (5'd1 << i_st_funct3[1:0]) as 64;
+            let overlap: logic            = (la <: sa + ssz) && (sa <: la + lsz);
+            let la13   : logic<13>        = {1'b0, la[11:0]};
+            let sa13   : logic<13>        = {1'b0, sa[11:0]};
+            let le13   : logic<13>        = la13 + lsz[12:0];
+            let se13   : logic<13>        = sa13 + ssz[12:0];
+            let pgx    : logic            = (le13 >: 13'h1000) || (se13 >: 13'h1000);
+            let ovl_vm : logic            = pgx || ((la13 <: se13) && (sa13 <: le13));
+            let ovl    : logic            = if i_conservative ? ovl_vm : overlap;
+            st_viol_w[i] = i_st_valid && ld_seen && !lq_poison[i] && (ld_age >: st_age) && ovl;
+        }
+    }
+
+    // S15 record-time self-scan (VM only): a load issuing past an already-
+    // RESOLVED older store may have read stale bytes, and the store-resolve scan
+    // above can never see that ordering. One flag per record port.
+    var rec0_self_w: logic;
+    var rec1_self_w: logic;
+    var rec2_self_w: logic;
+    always_comb {
+        rec0_self_w = 1'b0;
+        rec1_self_w = 1'b0;
+        rec2_self_w = 1'b0;
+        for i in 0..ROB_DEPTH {
+            let st_age  : logic<ROB_IDX_W> = (i as ROB_IDX_W) - i_rob_head_idx;
+            let st_known: logic            = i_store_known[i];
+            let sa13    : logic<13>        = {1'b0, i_store_addr[i][11:0]};
+            let ssz13   : logic<13>        = (5'd1 << i_store_funct3[i][1:0]) as 13;
+            let se13    : logic<13>        = sa13 + ssz13;
+            let s_pgx   : logic            = se13 >: 13'h1000;
+            let sszb    : logic<64>        = (5'd1 << i_store_funct3[i][1:0]) as 64;
+            // port 0 — S16 exemption: a full-VA overlap was byte-forwarded this
+            // same cycle, so only the offset-overlap-without-VA-overlap alias
+            // case (which the forward network cannot serve) still poisons.
+            let a0_la13 : logic<13>        = {1'b0, i_rec0_va[11:0]};
+            let a0_lsz  : logic<64>        = (5'd1 << i_rec0_funct3[1:0]) as 64;
+            let a0_le13 : logic<13>        = a0_la13 + a0_lsz[12:0];
+            let a0_age  : logic<ROB_IDX_W> = i_rec0_idx - i_rob_head_idx;
+            let a0_ovl  : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
+            let a0_vaovl: logic            = (i_rec0_va <: i_store_addr[i] + sszb) && (i_store_addr[i] <: i_rec0_va + a0_lsz);
+            if S15_SELF_SCAN && i_conservative && i_rec0_valid
+                && st_known && (st_age <: a0_age) && a0_ovl && !a0_vaovl {
+                rec0_self_w = 1'b1;
+            }
+            // port 1 (lane-1 CDB, bare-only today, kept for symmetry)
+            let a1_la13: logic<13>        = {1'b0, i_rec1_va[11:0]};
+            let a1_le13: logic<13>        = a1_la13 + ((5'd1 << i_rec1_funct3[1:0]) as 13);
+            let a1_age : logic<ROB_IDX_W> = i_rec1_idx - i_rob_head_idx;
+            let a1_ovl : logic            = s_pgx || (a1_le13 >: 13'h1000) || ((a1_la13 <: se13) && (sa13 <: a1_le13));
+            if S15_SELF_SCAN && i_conservative && i_rec1_valid
+                && st_known && (st_age <: a1_age) && a1_ovl {
+                rec1_self_w = 1'b1;
+            }
+            // port 2 (MSHR capture)
+            let a2_la13: logic<13>        = {1'b0, i_rec2_va[11:0]};
+            let a2_le13: logic<13>        = a2_la13 + ((5'd1 << i_rec2_funct3[1:0]) as 13);
+            let a2_age : logic<ROB_IDX_W> = i_rec2_idx - i_rob_head_idx;
+            let a2_ovl : logic            = s_pgx || (a2_le13 >: 13'h1000) || ((a2_la13 <: se13) && (sa13 <: a2_le13));
+            if S15_SELF_SCAN && i_conservative && i_rec2_valid
+                && st_known && (st_age <: a2_age) && a2_ovl {
+                rec2_self_w = 1'b1;
+            }
+        }
+    }
+
+    // P9.0 CoRR: every departure of a line from this L1 poisons the executed
+    // load records on it. ⚠️ The compare is against a PA line address while a
+    // CDB-recorded load holds a VA — the soundness hole L3.2d closes. Kept
+    // verbatim here so the equivalence check is exact.
+    var inv_viol_w: logic [LQ_N];
+    always_comb {
+        for i in 0..LQ_N {
+            let la      : logic<64> = eff_va[i];
+            let ld_seen : logic     = lq_valid[i] && eff_done[i];
+            let line_hit: logic     = (i_inv_valid && la[63:6] == i_inv_addr[63:6])
+                || (i_inv2_valid && la[63:6] == i_inv2_addr[63:6])
+                || (i_evict1_valid && la[63:6] == i_evict1_addr[63:6])
+                || (i_evict2_valid && la[63:6] == i_evict2_addr[63:6]);
+            inv_viol_w[i] = line_hit && ld_seen && !lq_poison[i];
+        }
+    }
+
+    // S10.3 aborted-MSHR-fill poison, delivered by rob_idx.
+    var pois_hit_w: logic [LQ_N];
+    always_comb {
+        for i in 0..LQ_N {
+            pois_hit_w[i] = lq_valid[i]
+                && ((i_pois_v && (lq_rob[i] == i_pois_idx)) || (i_pois_v2 && (lq_rob[i] == i_pois_idx2)));
+        }
+    }
+
+    // Commit-side answers (read only at LQ_REAL=1).
+    let rob_head_p1: logic<ROB_IDX_W> = i_rob_head_idx + 5'd1;
+    var pois_head_w : logic;
+    var pois_head1_w: logic;
+    always_comb {
+        pois_head_w  = 1'b0;
+        pois_head1_w = 1'b0;
+        for i in 0..LQ_N {
+            if lq_valid[i] && lq_poison[i] && (lq_rob[i] == i_rob_head_idx) {
+                pois_head_w = 1'b1;
+            }
+            if lq_valid[i] && lq_poison[i] && (lq_rob[i] == rob_head_p1) {
+                pois_head1_w = 1'b1;
+            }
+        }
+    }
+    assign o_poison_head  = pois_head_w;
+    assign o_poison_head1 = pois_head1_w;
+
+    // ---- DEAD-phase equivalence: does the queue track the ROB's sets exactly? ----
+    // Containment + equal cardinality, not a 32x32 matrix: the matrix is exact
+    // but costs 1024 compares per cycle in the simulator, and this runs for a
+    // 13.6 M-cycle boot. Every LQ entry must be in the ROB's set (a dynamic read
+    // of the reference vector by the entry's own tag) and the two counts must be
+    // equal — together that is set equality, at 3 x 32 compares.
+    var lq_done_cnt : logic<6>;
+    var rob_rec_cnt : logic<6>;
+    var lq_pois_cnt : logic<6>;
+    var rob_pois_cnt: logic<6>;
+    var set_mism    : logic   ;
+    var pset_mism   : logic   ;
+    always_comb {
+        set_mism     = 1'b0;
+        pset_mism    = 1'b0;
+        lq_done_cnt  = 6'd0;
+        rob_rec_cnt  = 6'd0;
+        lq_pois_cnt  = 6'd0;
+        rob_pois_cnt = 6'd0;
+        for i in 0..LQ_N {
+            if lq_valid[i] && lq_done[i] {
+                lq_done_cnt = lq_done_cnt + 6'd1;
+                if !i_rob_rec_set[lq_rob[i]] {
+                    set_mism = 1'b1;
+                }
+            }
+            if lq_valid[i] && lq_poison[i] {
+                lq_pois_cnt = lq_pois_cnt + 6'd1;
+                if !i_rob_pois_set[lq_rob[i]] {
+                    pset_mism = 1'b1;
+                }
+            }
+        }
+        for r in 0..ROB_DEPTH {
+            if i_rob_rec_set[r] {
+                rob_rec_cnt = rob_rec_cnt + 6'd1;
+            }
+            if i_rob_pois_set[r] {
+                rob_pois_cnt = rob_pois_cnt + 6'd1;
+            }
+        }
+        if lq_done_cnt != rob_rec_cnt {
+            set_mism = 1'b1;
+        }
+        if lq_pois_cnt != rob_pois_cnt {
+            pset_mism = 1'b1;
+        }
+    }
+
+    var alloc_cnt : logic<32>;
+    var orphan_cnt: logic<32>;
+    var mism_cnt  : logic<32>;
+    var pmism_cnt : logic<32>;
+    var full_cnt  : logic<32>;
+    var asq_cnt   : logic<32>;
+    var occ_max   : logic<32>;
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..LQ_N {
+                lq_valid[i]  = 1'b0;
+                lq_rob[i]    = 5'd0;
+                lq_done[i]   = 1'b0;
+                lq_va[i]     = 64'd0;
+                lq_pa[i]     = 64'd0;
+                lq_pa_v[i]   = 1'b0;
+                lq_f3[i]     = 3'd0;
+                lq_poison[i] = 1'b0;
+            }
+            head       = 6'd0;
+            tail       = 6'd0;
+            alloc_cnt  = 32'd0;
+            orphan_cnt = 32'd0;
+            mism_cnt   = 32'd0;
+            pmism_cnt  = 32'd0;
+            full_cnt   = 32'd0;
+            asq_cnt    = 32'd0;
+            occ_max    = 32'd0;
+        } else if i_redirect_fire {
+            // Full flush — the queue returns to empty, like the ROB.
+            for i in 0..LQ_N {
+                lq_valid[i]  = 1'b0;
+                lq_done[i]   = 1'b0;
+                lq_poison[i] = 1'b0;
+            }
+            head = 6'd0;
+            tail = 6'd0;
+        } else {
+            // --- allocate (dispatch) ---
+            if push0 {
+                lq_valid[tail_idx]  = 1'b1;
+                lq_rob[tail_idx]    = i_alloc_idx;
+                lq_done[tail_idx]   = 1'b0;
+                lq_va[tail_idx]     = 64'd0;
+                lq_pa[tail_idx]     = 64'd0;
+                lq_pa_v[tail_idx]   = 1'b0;
+                lq_f3[tail_idx]     = 3'd0;
+                lq_poison[tail_idx] = 1'b0;
+            }
+            if push1 {
+                lq_valid[tail_a1_idx]  = 1'b1;
+                lq_rob[tail_a1_idx]    = i_alloc_idx2;
+                lq_done[tail_a1_idx]   = 1'b0;
+                lq_va[tail_a1_idx]     = 64'd0;
+                lq_pa[tail_a1_idx]     = 64'd0;
+                lq_pa_v[tail_a1_idx]   = 1'b0;
+                lq_f3[tail_a1_idx]     = 3'd0;
+                lq_poison[tail_a1_idx] = 1'b0;
+            }
+
+            // --- record (execute) ---
+            for i in 0..LQ_N {
+                if rec_hit0[i] {
+                    lq_done[i]  = 1'b1;
+                    lq_va[i]    = i_rec0_va;
+                    lq_pa[i]    = i_rec0_pa;
+                    lq_pa_v[i]  = i_rec0_pa_valid;
+                    lq_f3[i]    = i_rec0_funct3;
+                }
+                if rec_hit1[i] {
+                    lq_done[i]  = 1'b1;
+                    lq_va[i]    = i_rec1_va;
+                    lq_pa[i]    = i_rec1_pa;
+                    lq_pa_v[i]  = i_rec1_pa_valid;
+                    lq_f3[i]    = i_rec1_funct3;
+                }
+                if rec_hit2[i] {
+                    lq_done[i]  = 1'b1;
+                    lq_va[i]    = i_rec2_va;
+                    lq_pa[i]    = i_rec2_pa;
+                    lq_pa_v[i]  = i_rec2_pa_valid;
+                    lq_f3[i]    = i_rec2_funct3;
+                }
+            }
+
+            // --- poison (L3.2b: the three scans + the external MSHR abort) ---
+            // Placed after the records (a load recording this cycle can be
+            // self-poisoned by the same cycle's scan) and before the squash
+            // below, which must win for a wrong-path entry — the same ordering
+            // the ROB relies on.
+            for i in 0..LQ_N {
+                if st_viol_w[i] || inv_viol_w[i] || pois_hit_w[i] {
+                    lq_poison[i] = 1'b1;
+                }
+                if (rec_hit0[i] && rec0_self_w) || (rec_hit1[i] && rec1_self_w) || (rec_hit2[i] && rec2_self_w) {
+                    lq_poison[i] = 1'b1;
+                }
+            }
+
+            // --- release (commit) ---
+            if pop0 {
+                lq_valid[head_idx]  = 1'b0;
+                lq_done[head_idx]   = 1'b0;
+                lq_poison[head_idx] = 1'b0;
+            }
+            if pop1 {
+                lq_valid[head_p1_idx]  = 1'b0;
+                lq_done[head_p1_idx]   = 1'b0;
+                lq_poison[head_p1_idx] = 1'b0;
+            }
+
+            // --- pointers: ONE assignment each per cycle (the free_list lesson:
+            // two `+=` in the same always_ff race under NBA last-write-wins) ---
+            head = head + pop_cnt;
+            if i_squash_en {
+                // Squash wins the tail (alloc is suppressed in this cycle).
+                for i in 0..LQ_N {
+                    if sq_drop[i] {
+                        lq_valid[i]  = 1'b0;
+                        lq_done[i]   = 1'b0;
+                        lq_poison[i] = 1'b0;
+                    }
+                }
+                tail = head + keep_cnt;
+            } else {
+                tail = tail + push_cnt;
+            }
+
+            if LQ_CHECK {
+                if push_cnt != (32'd0 as LQ_PTR_W) {
+                    alloc_cnt = alloc_cnt + 32'd1;
+                }
+                // Each check prints its first few occurrences and then only
+                // counts: a divergence trap is only useful if it names the
+                // FIRST event (the campaign's f2.4-fix lesson), and a mismatch
+                // that repeats every cycle would otherwise drown the console.
+                if (i_rec0_valid && orphan0) || (i_rec1_valid && orphan1) || (i_rec2_valid && orphan2) {
+                    orphan_cnt = orphan_cnt + 32'd1;
+                    if orphan_cnt <: 32'd8 {
+                        $display("LQ ORPHAN r0=%d/%d r1=%d/%d r2=%d/%d", i_rec0_valid, i_rec0_idx, i_rec1_valid, i_rec1_idx, i_rec2_valid, i_rec2_idx);
+                    }
+                }
+                if set_mism {
+                    mism_cnt = mism_cnt + 32'd1;
+                    if mism_cnt <: 32'd8 {
+                        $display("LQ MISM head=%d tail=%d cnt=%d robhead=%d", head, tail, count, i_rob_head_idx);
+                    }
+                }
+                if pset_mism {
+                    pmism_cnt = pmism_cnt + 32'd1;
+                    if pmism_cnt <: 32'd8 {
+                        $display("LQ PMISM lqp=%d robp=%d robhead=%d", lq_pois_cnt, rob_pois_cnt, i_rob_head_idx);
+                    }
+                }
+                if is_full && (push_cnt != (32'd0 as LQ_PTR_W)) {
+                    full_cnt = full_cnt + 32'd1;
+                    if full_cnt <: 32'd8 {
+                        $display("LQ FULL push=%d", push_cnt);
+                    }
+                }
+                if (i_squash_en || i_redirect_fire) && (rob_alloc0 || rob_alloc1) {
+                    asq_cnt = asq_cnt + 32'd1;
+                    if asq_cnt <: 32'd8 {
+                        $display("LQ ALLOC-IN-SQUASH sq=%d rd=%d", i_squash_en, i_redirect_fire);
+                    }
+                }
+                // The high-water mark is the honest answer to "what depth does
+                // this machine actually need" — printed as it rises, so no
+                // SoC/harness plumbing is needed for the DEAD phase.
+                if ({26'd0, count} >: occ_max) {
+                    occ_max = {26'd0, count};
+                    $display("LQ occ %d", count);
+                }
+            }
+        }
+    }
+
+    assign o_dbg_lq_alloc_cnt  = alloc_cnt;
+    assign o_dbg_lq_orphan_cnt = orphan_cnt;
+    assign o_dbg_lq_mism_cnt   = mism_cnt;
+    assign o_dbg_lq_full_cnt   = full_cnt;
+    assign o_dbg_lq_asq_cnt    = asq_cnt;
+    assign o_dbg_lq_occ_max    = occ_max;
+    assign o_dbg_lq_pmism_cnt  = pmism_cnt;
+}
