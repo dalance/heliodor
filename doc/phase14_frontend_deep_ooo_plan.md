@@ -994,11 +994,61 @@ W1a is banked at 0 — it is correct and it removes an arbitrary restriction out
 not justify its own multi-hour ladder (litmus N=4 + N=2/N=4 SMP boots + Verilator NBA). Gate it
 together with W2, which touches the same paths.
 
-### Order (revised AGAIN, by the W1a flip)
+### W2.0 — the front-end census (buckets 40-51, measured at `W1=1`)
 
-1. **W2 — front-end delivery. THE binding constraint: 5,260,480 cy = 36 % of the boot** is "the
-   front end did not deliver enough" (`empty` 3,453,341 + `no2nd` 1,807,139 at `W1=1`). Nothing
-   downstream can pay until this moves.
+Both halves split, N=1 boot, `cy=00de5210`:
+
+**Why the fetch FIFO is EMPTY at rename** (3,453,341, partitions exactly):
+
+| cause | cycles |
+|---|---|
+| fetch not ready | 1,978,518 |
+| ├ fetch-ahead FIFO empty (icache miss / I-PTW / run-ahead starved) | 1,593,317 |
+| └ straddle (slow path) | 385,201 |
+| fetch ready but FIFO still empty (produce→visible latency / skid) | 1,436,237 |
+| redirect flush | 38,586 |
+
+**Why slot-1 was NOT produced** on a cycle slot-0 was:
+
+| cause | cycles |
+|---|---|
+| **straddle** | **2,035,379** |
+| **cross-line (`s1_needs_next`)** | **895,789** |
+| predicted-taken (structural: the block ends at a taken branch) | 946,952 |
+| fb room held | 680,863 |
+| *(slot-1 actually produced)* | *4,109,713* |
+
+⚠️ **The dominant slot-1 loss is ALIGNMENT, not branches and not cache misses.** straddle +
+cross-line = **2.93 M**, three times the predicted-taken term.
+
+**And the straddle term looks recoverable by a predicate, exactly like W1a.** The fetch granule is
+already a 64-bit dword with a next-dword peek (`wf_data: logic<64> [WF_N]`,
+`wf_data[wf_head + 1]`), and:
+
+```veryl
+needs_straddle   = !straddle_q && ic_pc[1] && !curr_is_rvc   // 32-bit insn at a 2-byte offset
+straddle_oneshot = needs_straddle && ic_rdata_nv && straddle_same_page
+slot1_eligible   = fetch_ready && !straddle_q && !straddle_oneshot && !ic_ifault && slot1_pred_ok
+```
+
+`straddle_oneshot` is the case where **the next dword is ALREADY valid and same-page** — slot-0
+costs no extra cycle, and slot-1 would start at `ic_pc + 4`, which is inside
+`wf_head_next_data`, i.e. **data we already hold**. `slot1_eligible` kills slot-1 there anyway.
+So straddle here is a *control* conservatism, not a fetch-width problem.
+
+### Order (revised AGAIN, by the W2.0 census)
+
+1. **W2a — allow slot-1 on a ONE-SHOT straddle.** 2,035,379 cy of slot-1 loss; the data is already
+   in `wf_head_next_data`. Same shape as W1a: a conservative predicate over an already-built
+   datapath. Cheapest and biggest single item.
+2. **W2b — the fetch-ahead FIFO running dry** (1,593,317 cy): icache miss / I-PTW / run-ahead
+   depth. A different axis, and the wall waiting behind W2a.
+3. **W2c — cross-line slot-1** (895,789 cy): needs deeper `wf` lookahead across a line boundary.
+4. *(predicted-taken 946,952 is fetch-BLOCK SHAPE — only a wider block attacks it. Last.)*
+
+⚠️ Expect W2a to fire and buy little: W1a fired perfectly (+26 % 2-wide) for 0.21 % because the
+wall behind it was the front end. The wall behind W2a is W2b (1.59 M cy of dry FIFO). Price it the
+same way — build DEAD, flip, read cycles — and do not let the 2.0 M bucket set an expectation.
 2. **W1b — control on commit slot-1** (`c2_simple`'s `!sh_is_control`; needs the slot-1 next-PC to
    stop assuming `pc + (rvc?2:4)`). Only after W2, and only if commit shows up as the limiter then.
 3. **W3 — loads on slot-1** — mem-IQ slot-1 alloc + a banked/dual-ported L1D.
