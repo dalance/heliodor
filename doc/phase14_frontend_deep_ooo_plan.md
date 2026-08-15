@@ -1052,16 +1052,25 @@ agrees with the conservative answer.
 receives no invalidates at all (`invnopa = 0` for that reason, not a good one). That measurement
 needs N ≥ 2.
 
-**N=2 SMP boot, same zero-risk configuration** (`LQ_PA_EXACT=1`, `LQ_REAL=0`), first 4.19 M cycles:
+**N=2 SMP boot, same zero-risk configuration** (`LQ_PA_EXACT=1`, `LQ_REAL=0`), full boot,
+`cy=01154090` = 18,170,000 unchanged, per hart (each has its own queue):
 
-| | value |
-|---|---|
-| load records carrying a PA | 518,151 / 518,519 = **99.93 %** |
-| store-resolve cycles with a pre-translated store PA | 148,524 / 400,512 = **37 %** |
-| cycles with a known older store, ≥1 of them carrying a PA | 555,990 / 995,814 = **56 %** |
-| store-resolve cycles decided PA-to-PA | 12,584 |
-| **poisons the exact test would avoid** | **14** |
-| executed record with NO PA when a line leaves the L1 (`invnopa`) | **0** |
+| | hart 0 | hart 1 |
+|---|---|---|
+| load records carrying a PA | 1,678,464 / 1,781,996 = **94.2 %** | 2,090,360 / 2,106,145 = **99.3 %** |
+| store-resolve cycles with a pre-translated store PA | 339,346 / 1,088,552 = **31 %** | 840,346 / 2,157,839 = **39 %** |
+| cycles with a PA-carrying known older store | 1,695,544 / 5,937,276 = **29 %** | 3,543,513 / 5,071,828 = **70 %** |
+| store-resolve cycles decided PA-to-PA | 109,496 | 105,576 |
+| **poisons the exact test would avoid** | **5** | **99** |
+| executed record with NO PA when a line leaves the L1 (`invnopa`) | **38** | **78** |
+| executed-load set vs the ROB's | **0 divergences** | **0 divergences** |
+
+⚠️ **Correction to the 4.19 M-cycle sample read earlier in this session: `invnopa` is NOT 0 over a
+full boot — it is 38 + 78 = 116.** A partial sample said zero and the honest number is small but
+nonzero, so the claim "sound for essentially every record" has to be stated as: the exact arm closes
+the CoRR hole for the ~94-99 % of executed records that carry a PA, and **a residual 116 cycles per
+2-hart boot remain where a line leaves the L1 while an executed record has none**. Closing that
+last part needs the record to carry a PA unconditionally, which is a separate change.
 
 Two things fall out. **The store side is the coverage bottleneck** (37 %, because L2's pre-translate
 probe declines on `!dmem_sprobe_ok` / pending-xlate / `store_drive`), not the load side (99.9 %) —
@@ -1069,10 +1078,11 @@ so anyone tempted to revisit precision should go after `store_pretx_valid`, not 
 **even where the exact test does run, it almost always agrees**: 12,584 exact decisions bought 14
 avoided poisons. The conservative test is not sloppy; it is nearly right.
 
-**But the CoRR fix is fully covered.** With 99.9 % of executed records carrying a PA, `invnopa = 0`:
-turning `LQ_PA_EXACT` on makes the remote-invalidate line compare sound for essentially every record
-under Sv39, which is the hole the audit opened this section with. That is the one thing in L3.2d
-worth shipping, and it ships for correctness, not for cycles.
+**The CoRR fix is the part worth shipping, and it is nearly — not entirely — complete.** Turning
+`LQ_PA_EXACT` on makes the remote-invalidate line compare sound for the 94-99 % of executed records
+that carry a PA, against a compare that today matches nothing at all under Sv39. The residual is the
+116 cycles above. That ships for correctness, not for cycles, and the remaining hole is a known,
+quantified follow-up rather than an unknown.
 
 ### What is already built — do NOT rebuild
 
