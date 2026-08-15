@@ -1036,19 +1036,51 @@ costs no extra cycle, and slot-1 would start at `ic_pc + 4`, which is inside
 `wf_head_next_data`, i.e. **data we already hold**. `slot1_eligible` kills slot-1 there anyway.
 So straddle here is a *control* conservatism, not a fetch-width problem.
 
-### Order (revised AGAIN, by the W2.0 census)
+### W2a — slot-1 on a one-shot straddle: BUILT, FLIPPED, MEASURED. **The first real win.**
 
-1. **W2a — allow slot-1 on a ONE-SHOT straddle.** 2,035,379 cy of slot-1 loss; the data is already
-   in `wf_head_next_data`. Same shape as W1a: a conservative predicate over an already-built
-   datapath. Cheapest and biggest single item.
-2. **W2b — the fetch-ahead FIFO running dry** (1,593,317 cy): icache miss / I-PTW / run-ahead
-   depth. A different axis, and the wall waiting behind W2a.
-3. **W2c — cross-line slot-1** (895,789 cy): needs deeper `wf` lookahead across a line boundary.
-4. *(predicted-taken 946,952 is fetch-BLOCK SHAPE — only a wider block attacks it. Last.)*
+⚠️ **The census pointed at a predicate; the RTL said one layer deeper.** Unlike W1a this was *not*
+just a predicate — `slot1_eligible` excluded straddle because the extraction could not handle it:
 
-⚠️ Expect W2a to fire and buy little: W1a fired perfectly (+26 % 2-wide) for 0.21 % because the
-wall behind it was the front end. The wall behind W2a is W2b (1.59 M cy of dry FIFO). Price it the
-same way — build DEAD, flip, read cycles — and do not let the 2.0 M bucket set an expectation.
+```veryl
+let s1_hw : logic<16> = if s1_b1 == 2'd1 ? fw_hw1 : fw_hw2;   // b1∈{1,2}
+```
+
+A straddling slot-0 (`ic_pc[1] && !curr_is_rvc`) puts slot-1 at window halfword **3**, which that
+mux never handled. The window is `{ic_rdata_next, ic_rdata}` = 4 halfwords, so slot-1's OWN halfword
+(hw3) is present but its SECOND would be hw4, one past the end. Hence the rule: **a one-shot
+straddle may deliver slot-1 only when slot-1 is RVC** — most of the population in RVC-dense kernel
+code. The SLOW straddle (`straddle_q`) is left untouched (it re-fetches, so the extraction window is
+not the one it will run in). `W2A_STRADDLE_SLOT1`; DEAD at 0 verified bit-exact.
+
+| config | cycles | vs base |
+|---|---|---|
+| base | 14,600,000 | — |
+| W1a | 14,570,000 | −0.21 % |
+| **W1a + W2a** | **14,390,000** | **−1.44 %** (W2a's own share **−1.24 %**, 6× W1a) |
+
+Suite 252/0. Census at `W1a+W2a`: slot-1 produced 4,109,713 → **4,712,401** (+602,688), straddle
+loss 2,035,379 → **1,068,857** (−966,522 — about half, exactly the RVC share), 2-wide rename
+2,776,763 → **3,087,802**.
+
+🎯 **This is where the "fires but buys nothing" chain broke, and it broke by removing the wall in
+front of the earlier step.** W1a alone was worth 0.21 %; with W2a's wall removed the pair is worth
+1.44 %. Measuring the two together was the right call — a lever pressed against a wall reads as
+worthless even when it is not.
+
+### Order (revised AGAIN, by the W2a flip)
+
+1. **W2b — the fetch-ahead FIFO not delivering** (1,660,371 cy at `W1a+W2a`). This is the wall that
+   has now capped BOTH W1a and W2a. ⚠️ It has **two causes needing opposite fixes**, and
+   `ext_head_avail = ext_head_match || ext_bypass` with
+   `ext_head_match = (wf_count >= 1) && (wf_pc[wf_head] == ext_head_dw)` splits them:
+   **(a) FIFO genuinely empty** (`wf_count == 0`) → producer can't keep up: icache miss / I-PTW /
+   bandwidth; **(b) FIFO non-empty but the head is the WRONG dword** → stale after a redirect, or
+   the run-ahead followed a different path (FTB follow). `WF_N = 8`, so plain depth is unlikely to
+   be it. **Census the split before building.**
+2. **W2c — cross-line slot-1** (869,632 cy): deeper `wf` lookahead across a line boundary.
+3. **straddle remainder** (1,068,857 cy): the 32-bit-slot-1 half, which needs hw4 — a 3-word /
+   128-bit window.
+4. *(predicted-taken 790,845 is fetch-BLOCK SHAPE — only a wider block attacks it. Last.)*
 2. **W1b — control on commit slot-1** (`c2_simple`'s `!sh_is_control`; needs the slot-1 next-PC to
    stop assuming `pc + (rvc?2:4)`). Only after W2, and only if commit shows up as the limiter then.
 3. **W3 — loads on slot-1** — mem-IQ slot-1 alloc + a banked/dual-ported L1D.
