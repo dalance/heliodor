@@ -1109,16 +1109,16 @@ pointer,* is what starves fetch.
 1-wide" diagnosis, solved. Boot improves ~7 % at N=1/2/4 alike, i.e. it is per-core, not an SMP
 effect. **Cost: the L1I SRAM doubles, per hart.**
 
-Verilator NBA cross-check — **3/4**, all clean rebuilds, all matching the Veryl sim:
+Verilator NBA cross-check — **4/4**, all clean rebuilds, all matching the Veryl sim:
 
 | | Verilator | Veryl sim |
 |---|---|---|
 | N=1 boot | `$finish` 136 ms = 13.6 M ✓ | 13,580,000 |
 | N=2 SMP boot | 182 ms = 18.2 M ✓ | 18,170,000 |
 | litmus N=4 | `cy=3,952,044` pass=1 ✓ | 3,960,000 (−0.20 %, the same systematic offset as the previous session's 3,931,194 vs 3,940,000) |
-| **N=4 SMP boot** | **NOT RUN** | 26,440,000 |
+| N=4 SMP boot | 264 ms = 26.4 M ✓ | 26,440,000 |
 
-⚠️ R3 shipped on Verilator **4/4**; this is **3/4**. The N=4 boot is outstanding.
+Same verification standard R3 shipped on.
 
 ⚠️ **Two Verilator-side traps this cost real time on, both worth remembering:**
 1. **A stale build directory lies convincingly.** The first N=2 attempt reported `$finish at 195ms`
