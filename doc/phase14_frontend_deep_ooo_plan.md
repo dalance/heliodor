@@ -1052,6 +1052,28 @@ agrees with the conservative answer.
 receives no invalidates at all (`invnopa = 0` for that reason, not a good one). That measurement
 needs N ≥ 2.
 
+**N=2 SMP boot, same zero-risk configuration** (`LQ_PA_EXACT=1`, `LQ_REAL=0`), first 4.19 M cycles:
+
+| | value |
+|---|---|
+| load records carrying a PA | 518,151 / 518,519 = **99.93 %** |
+| store-resolve cycles with a pre-translated store PA | 148,524 / 400,512 = **37 %** |
+| cycles with a known older store, ≥1 of them carrying a PA | 555,990 / 995,814 = **56 %** |
+| store-resolve cycles decided PA-to-PA | 12,584 |
+| **poisons the exact test would avoid** | **14** |
+| executed record with NO PA when a line leaves the L1 (`invnopa`) | **0** |
+
+Two things fall out. **The store side is the coverage bottleneck** (37 %, because L2's pre-translate
+probe declines on `!dmem_sprobe_ok` / pending-xlate / `store_drive`), not the load side (99.9 %) —
+so anyone tempted to revisit precision should go after `store_pretx_valid`, not the load record. And
+**even where the exact test does run, it almost always agrees**: 12,584 exact decisions bought 14
+avoided poisons. The conservative test is not sloppy; it is nearly right.
+
+**But the CoRR fix is fully covered.** With 99.9 % of executed records carrying a PA, `invnopa = 0`:
+turning `LQ_PA_EXACT` on makes the remote-invalidate line compare sound for essentially every record
+under Sv39, which is the hole the audit opened this section with. That is the one thing in L3.2d
+worth shipping, and it ships for correctness, not for cycles.
+
 ### What is already built — do NOT rebuild
 
 | piece | state |
