@@ -97,6 +97,12 @@ pub module load_queue #(
     i_store_funct3: input logic<3> [ROB_DEPTH],
     i_store_known : input logic    [ROB_DEPTH], // valid && is_store && rw && !is_amo
     i_conservative: input logic                , // Sv39 active → VA compares degrade
+    // L3.2d: the exact PAs. Per-entry for the self-scan's older stores, live for
+    // the store resolving this cycle (L2's STORE_PRETRANSLATE probe).
+    i_store_pa    : input logic<64>[ROB_DEPTH],
+    i_store_pa_v  : input logic    [ROB_DEPTH],
+    i_st_pa       : input logic<64>           ,
+    i_st_pa_valid : input logic               ,
 
     // ---- coherence: every way a line can leave this L1 (P9.0 / P9.2 CoRR) ----
     i_inv_valid   : input logic    ,
@@ -134,6 +140,13 @@ pub module load_queue #(
     o_dbg_lq_asq_cnt   : output logic<32>, // alloc in a squash/flush cycle (assumed impossible)
     o_dbg_lq_occ_max   : output logic<32>, // high-water occupancy — the answer to "what depth?"
     o_dbg_lq_pmism_cnt : output logic<32>, // cycles where the poison set != the ROB's (L3.2b)
+    // L3.2d coverage + effect. rec/pa_rec answer "can the exact test even run?"
+    // BEFORE it is switched on; exact/saved answer "what does it change?".
+    o_dbg_lq_rec_cnt    : output logic<32>, // load records taken
+    o_dbg_lq_pa_rec_cnt : output logic<32>, // ...of which carried an exact PA
+    o_dbg_lq_exact_cnt  : output logic<32>, // store-resolve cycles decided PA-to-PA
+    o_dbg_lq_saved_cnt  : output logic<32>, // poisons the conservative test raises and the exact one does not
+    o_dbg_lq_invnopa_cnt: output logic<32>, // CoRR line compare against a record with NO PA (the Sv39 hole)
 ) {
     // Verification-phase instrumentation. Set to 0 before shipping: at 0 every
     // counter here is reset-only, so the whole check (including the 32x32
@@ -144,6 +157,15 @@ pub module load_queue #(
     // reproduced here bit-for-bit, so if one side is turned off for a probe the
     // other must be too or the equivalence check fires.
     const S15_SELF_SCAN: bit = 1;
+    // ── L3.2d: decide with the exact PA wherever both sides have one ──
+    // The 13-bit page-offset compare and the page-cross blanket exist only
+    // because the load record and the store are in different address spaces
+    // (L3.0). Both PAs are in the RTL already — the load's from the Stage-A
+    // translation, the store's from L2's pre-translate probe — so where both
+    // are valid the queue can compare PA to PA: strictly fewer poisons, same
+    // true positives, and it is also what makes the CoRR line compare sound
+    // under Sv39. DEAD at 0 (every `if LQ_PA_EXACT ?` folds to today's arm).
+    const LQ_PA_EXACT: bit = 0;
 
     var lq_valid : logic           [LQ_N];
     var lq_rob   : logic<ROB_IDX_W>[LQ_N];
@@ -257,17 +279,23 @@ pub module load_queue #(
     var eff_done: logic    [LQ_N];
     var eff_va  : logic<64>[LQ_N];
     var eff_f3  : logic<3> [LQ_N];
+    var eff_pa  : logic<64>[LQ_N];
+    var eff_pa_v: logic    [LQ_N];
     always_comb {
         for i in 0..LQ_N {
             eff_done[i] = lq_done[i] || rec_hit0[i] || rec_hit1[i] || rec_hit2[i];
             eff_va[i]   = if rec_hit0[i] ? i_rec0_va : (if rec_hit1[i] ? i_rec1_va : (if rec_hit2[i] ? i_rec2_va : lq_va[i]));
             eff_f3[i]   = if rec_hit0[i] ? i_rec0_funct3 : (if rec_hit1[i] ? i_rec1_funct3 : (if rec_hit2[i] ? i_rec2_funct3 : lq_f3[i]));
+            eff_pa[i]   = if rec_hit0[i] ? i_rec0_pa : (if rec_hit1[i] ? i_rec1_pa : (if rec_hit2[i] ? i_rec2_pa : lq_pa[i]));
+            eff_pa_v[i] = if rec_hit0[i] ? i_rec0_pa_valid : (if rec_hit1[i] ? i_rec1_pa_valid : (if rec_hit2[i] ? i_rec2_pa_valid : lq_pa_v[i]));
         }
     }
 
     // Store-resolve scan: an executed load YOUNGER than the resolving store that
     // overlaps its bytes read stale data — poison it for the commit replay.
-    var st_viol_w: logic [LQ_N];
+    var st_viol_w : logic [LQ_N];
+    var st_saved_w: logic [LQ_N];
+    var st_exact_w: logic [LQ_N];
     always_comb {
         for i in 0..LQ_N {
             let st_age : logic<ROB_IDX_W> = i_st_idx - i_rob_head_idx;
@@ -284,21 +312,33 @@ pub module load_queue #(
             let se13   : logic<13>        = sa13 + ssz[12:0];
             let pgx    : logic            = (le13 >: 13'h1000) || (se13 >: 13'h1000);
             let ovl_vm : logic            = pgx || ((la13 <: se13) && (sa13 <: le13));
-            let ovl    : logic            = if i_conservative ? ovl_vm : overlap;
+            let ovl_cons: logic           = if i_conservative ? ovl_vm : overlap;
+            // L3.2d: both PAs known → compare them and skip the approximation.
+            let pa_ok  : logic            = LQ_PA_EXACT && eff_pa_v[i] && i_st_pa_valid;
+            let lpa    : logic<64>        = eff_pa[i];
+            let spa    : logic<64>        = i_st_pa;
+            let ovl_pa : logic            = (lpa <: spa + ssz) && (spa <: lpa + lsz);
+            let ovl    : logic            = if pa_ok ? ovl_pa : ovl_cons;
             st_viol_w[i] = i_st_valid && ld_seen && !lq_poison[i] && (ld_age >: st_age) && ovl;
+            // A poison the approximation would have raised and the exact test does not.
+            st_saved_w[i] = i_st_valid && ld_seen && !lq_poison[i] && (ld_age >: st_age)
+                && pa_ok && ovl_cons && !ovl_pa;
+            st_exact_w[i] = i_st_valid && ld_seen && (ld_age >: st_age) && pa_ok;
         }
     }
 
     // S15 record-time self-scan (VM only): a load issuing past an already-
     // RESOLVED older store may have read stale bytes, and the store-resolve scan
     // above can never see that ordering. One flag per record port.
-    var rec0_self_w: logic;
-    var rec1_self_w: logic;
-    var rec2_self_w: logic;
+    var rec0_self_w : logic;
+    var rec1_self_w : logic;
+    var rec2_self_w : logic;
+    var self_saved_w: logic;
     always_comb {
-        rec0_self_w = 1'b0;
-        rec1_self_w = 1'b0;
-        rec2_self_w = 1'b0;
+        rec0_self_w  = 1'b0;
+        rec1_self_w  = 1'b0;
+        rec2_self_w  = 1'b0;
+        self_saved_w = 1'b0;
         for i in 0..ROB_DEPTH {
             let st_age  : logic<ROB_IDX_W> = (i as ROB_IDX_W) - i_rob_head_idx;
             let st_known: logic            = i_store_known[i];
@@ -314,17 +354,31 @@ pub module load_queue #(
             let a0_lsz  : logic<64>        = (5'd1 << i_rec0_funct3[1:0]) as 64;
             let a0_le13 : logic<13>        = a0_la13 + a0_lsz[12:0];
             let a0_age  : logic<ROB_IDX_W> = i_rec0_idx - i_rob_head_idx;
-            let a0_ovl  : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
+            let a0_ovlc : logic            = s_pgx || (a0_le13 >: 13'h1000) || ((a0_la13 <: se13) && (sa13 <: a0_le13));
             let a0_vaovl: logic            = (i_rec0_va <: i_store_addr[i] + sszb) && (i_store_addr[i] <: i_rec0_va + a0_lsz);
+            // L3.2d: PA-to-PA where both sides have one. The S16 VA exemption
+            // still applies on top — it is about whether the bytes were
+            // FORWARDED (a VA-keyed network), not about whether they overlap.
+            let a0_paok : logic            = LQ_PA_EXACT && i_rec0_pa_valid && i_store_pa_v[i];
+            let a0_ovlp : logic            = (i_rec0_pa <: i_store_pa[i] + sszb) && (i_store_pa[i] <: i_rec0_pa + a0_lsz);
+            let a0_ovl  : logic            = if a0_paok ? a0_ovlp : a0_ovlc;
             if S15_SELF_SCAN && i_conservative && i_rec0_valid
                 && st_known && (st_age <: a0_age) && a0_ovl && !a0_vaovl {
                 rec0_self_w = 1'b1;
+            }
+            if S15_SELF_SCAN && i_conservative && i_rec0_valid
+                && st_known && (st_age <: a0_age) && a0_paok && a0_ovlc && !a0_ovlp && !a0_vaovl {
+                self_saved_w = 1'b1;
             }
             // port 1 (lane-1 CDB, bare-only today, kept for symmetry)
             let a1_la13: logic<13>        = {1'b0, i_rec1_va[11:0]};
             let a1_le13: logic<13>        = a1_la13 + ((5'd1 << i_rec1_funct3[1:0]) as 13);
             let a1_age : logic<ROB_IDX_W> = i_rec1_idx - i_rob_head_idx;
-            let a1_ovl : logic            = s_pgx || (a1_le13 >: 13'h1000) || ((a1_la13 <: se13) && (sa13 <: a1_le13));
+            let a1_ovlc: logic            = s_pgx || (a1_le13 >: 13'h1000) || ((a1_la13 <: se13) && (sa13 <: a1_le13));
+            let a1_paok: logic            = LQ_PA_EXACT && i_rec1_pa_valid && i_store_pa_v[i];
+            let a1_lsz : logic<64>        = (5'd1 << i_rec1_funct3[1:0]) as 64;
+            let a1_ovlp: logic            = (i_rec1_pa <: i_store_pa[i] + sszb) && (i_store_pa[i] <: i_rec1_pa + a1_lsz);
+            let a1_ovl : logic            = if a1_paok ? a1_ovlp : a1_ovlc;
             if S15_SELF_SCAN && i_conservative && i_rec1_valid
                 && st_known && (st_age <: a1_age) && a1_ovl {
                 rec1_self_w = 1'b1;
@@ -333,7 +387,11 @@ pub module load_queue #(
             let a2_la13: logic<13>        = {1'b0, i_rec2_va[11:0]};
             let a2_le13: logic<13>        = a2_la13 + ((5'd1 << i_rec2_funct3[1:0]) as 13);
             let a2_age : logic<ROB_IDX_W> = i_rec2_idx - i_rob_head_idx;
-            let a2_ovl : logic            = s_pgx || (a2_le13 >: 13'h1000) || ((a2_la13 <: se13) && (sa13 <: a2_le13));
+            let a2_ovlc: logic            = s_pgx || (a2_le13 >: 13'h1000) || ((a2_la13 <: se13) && (sa13 <: a2_le13));
+            let a2_paok: logic            = LQ_PA_EXACT && i_rec2_pa_valid && i_store_pa_v[i];
+            let a2_lsz : logic<64>        = (5'd1 << i_rec2_funct3[1:0]) as 64;
+            let a2_ovlp: logic            = (i_rec2_pa <: i_store_pa[i] + sszb) && (i_store_pa[i] <: i_rec2_pa + a2_lsz);
+            let a2_ovl : logic            = if a2_paok ? a2_ovlp : a2_ovlc;
             if S15_SELF_SCAN && i_conservative && i_rec2_valid
                 && st_known && (st_age <: a2_age) && a2_ovl {
                 rec2_self_w = 1'b1;
@@ -345,16 +403,24 @@ pub module load_queue #(
     // load records on it. ⚠️ The compare is against a PA line address while a
     // CDB-recorded load holds a VA — the soundness hole L3.2d closes. Kept
     // verbatim here so the equivalence check is exact.
-    var inv_viol_w: logic [LQ_N];
+    var inv_viol_w : logic [LQ_N];
+    var inv_nopa_w : logic [LQ_N];
     always_comb {
         for i in 0..LQ_N {
-            let la      : logic<64> = eff_va[i];
+            // L3.2d: an exact PA makes this compare SOUND under Sv39; without
+            // one it is a VA-vs-PA compare that silently never matches.
+            let use_pa  : logic     = LQ_PA_EXACT && eff_pa_v[i];
+            let la      : logic<64> = if use_pa ? eff_pa[i] : eff_va[i];
             let ld_seen : logic     = lq_valid[i] && eff_done[i];
+            let any_inv : logic     = i_inv_valid || i_inv2_valid || i_evict1_valid || i_evict2_valid;
             let line_hit: logic     = (i_inv_valid && la[63:6] == i_inv_addr[63:6])
                 || (i_inv2_valid && la[63:6] == i_inv2_addr[63:6])
                 || (i_evict1_valid && la[63:6] == i_evict1_addr[63:6])
                 || (i_evict2_valid && la[63:6] == i_evict2_addr[63:6]);
             inv_viol_w[i] = line_hit && ld_seen && !lq_poison[i];
+            // The residual hole: a line leaves the L1 while an executed record
+            // has no PA to compare it against, under translation.
+            inv_nopa_w[i] = any_inv && ld_seen && i_conservative && !eff_pa_v[i];
         }
     }
 
@@ -364,6 +430,45 @@ pub module load_queue #(
         for i in 0..LQ_N {
             pois_hit_w[i] = lq_valid[i]
                 && ((i_pois_v && (lq_rob[i] == i_pois_idx)) || (i_pois_v2 && (lq_rob[i] == i_pois_idx2)));
+        }
+    }
+
+    // L3.2d store-side coverage. `saved` being ~0 has two very different
+    // explanations — the store PA is rarely available, or the conservative
+    // poisons are GENUINE aliases — and only a coverage number separates them.
+    var sq_known_any: logic;
+    var sq_pa_any   : logic;
+    always_comb {
+        sq_known_any = 1'b0;
+        sq_pa_any    = 1'b0;
+        for i in 0..ROB_DEPTH {
+            if i_store_known[i] {
+                sq_known_any = 1'b1;
+                if i_store_pa_v[i] {
+                    sq_pa_any = 1'b1;
+                }
+            }
+        }
+    }
+
+    // Any-of reductions for the L3.2d counters (one event per cycle).
+    var st_exact_any : logic;
+    var st_saved_any : logic;
+    var inv_nopa_any : logic;
+    always_comb {
+        st_exact_any = 1'b0;
+        st_saved_any = 1'b0;
+        inv_nopa_any = 1'b0;
+        for i in 0..LQ_N {
+            if st_exact_w[i] {
+                st_exact_any = 1'b1;
+            }
+            if st_saved_w[i] {
+                st_saved_any = 1'b1;
+            }
+            if inv_nopa_w[i] {
+                inv_nopa_any = 1'b1;
+            }
         }
     }
 
@@ -435,7 +540,17 @@ pub module load_queue #(
         }
     }
 
-    var alloc_cnt : logic<32>;
+    var alloc_cnt   : logic<32>;
+    var rec_cnt     : logic<32>;
+    var pa_rec_cnt  : logic<32>;
+    var exact_cnt   : logic<32>;
+    var saved_cnt   : logic<32>;
+    var invnopa_cnt : logic<32>;
+    var chk_cy      : logic<32>;
+    var stres_cnt   : logic<32>;
+    var stres_pa_cnt: logic<32>;
+    var sqk_cnt     : logic<32>;
+    var sqk_pa_cnt  : logic<32>;
     var orphan_cnt: logic<32>;
     var mism_cnt  : logic<32>;
     var pmism_cnt : logic<32>;
@@ -457,7 +572,17 @@ pub module load_queue #(
             }
             head       = 6'd0;
             tail       = 6'd0;
-            alloc_cnt  = 32'd0;
+            alloc_cnt   = 32'd0;
+            rec_cnt     = 32'd0;
+            pa_rec_cnt  = 32'd0;
+            exact_cnt   = 32'd0;
+            saved_cnt   = 32'd0;
+            invnopa_cnt = 32'd0;
+            chk_cy      = 32'd0;
+            stres_cnt    = 32'd0;
+            stres_pa_cnt = 32'd0;
+            sqk_cnt      = 32'd0;
+            sqk_pa_cnt   = 32'd0;
             orphan_cnt = 32'd0;
             mism_cnt   = 32'd0;
             pmism_cnt  = 32'd0;
@@ -568,6 +693,44 @@ pub module load_queue #(
                 if push_cnt != (32'd0 as LQ_PTR_W) {
                     alloc_cnt = alloc_cnt + 32'd1;
                 }
+                // L3.2d coverage: how many records carry an exact PA at all.
+                // Measured BEFORE the exact test is switched on, because if the
+                // answer were small the increment would buy nothing and should
+                // not be built (the f2.16 rule).
+                if i_rec0_valid || i_rec1_valid || i_rec2_valid {
+                    rec_cnt = rec_cnt + 32'd1;
+                }
+                if (i_rec0_valid && i_rec0_pa_valid) || (i_rec1_valid && i_rec1_pa_valid) || (i_rec2_valid && i_rec2_pa_valid) {
+                    pa_rec_cnt = pa_rec_cnt + 32'd1;
+                }
+                if st_exact_any {
+                    exact_cnt = exact_cnt + 32'd1;
+                }
+                if st_saved_any || self_saved_w {
+                    saved_cnt = saved_cnt + 32'd1;
+                }
+                if inv_nopa_any {
+                    invnopa_cnt = invnopa_cnt + 32'd1;
+                }
+                if i_st_valid {
+                    stres_cnt = stres_cnt + 32'd1;
+                    if i_st_pa_valid {
+                        stres_pa_cnt = stres_pa_cnt + 32'd1;
+                    }
+                }
+                if sq_known_any {
+                    sqk_cnt = sqk_cnt + 32'd1;
+                    if sq_pa_any {
+                        sqk_pa_cnt = sqk_pa_cnt + 32'd1;
+                    }
+                }
+                // Periodic dump: the counters live inside the module and the
+                // SoC/harness plumbing for them is not worth building for a
+                // verification-phase measurement, so print every 4 M cycles.
+                chk_cy = chk_cy + 32'd1;
+                if chk_cy[21:0] == 22'd0 {
+                    $display("LQ[%d] rec=%d pa_rec=%d exact=%d saved=%d invnopa=%d occ=%d mism=%d/%d stres=%d/%d sqk=%d/%d", chk_cy, rec_cnt, pa_rec_cnt, exact_cnt, saved_cnt, invnopa_cnt, occ_max, mism_cnt, pmism_cnt, stres_pa_cnt, stres_cnt, sqk_pa_cnt, sqk_cnt);
+                }
                 // Each check prints its first few occurrences and then only
                 // counts: a divergence trap is only useful if it names the
                 // FIRST event (the campaign's f2.4-fix lesson), and a mismatch
@@ -620,4 +783,9 @@ pub module load_queue #(
     assign o_dbg_lq_asq_cnt    = asq_cnt;
     assign o_dbg_lq_occ_max    = occ_max;
     assign o_dbg_lq_pmism_cnt  = pmism_cnt;
+    assign o_dbg_lq_rec_cnt     = rec_cnt;
+    assign o_dbg_lq_pa_rec_cnt  = pa_rec_cnt;
+    assign o_dbg_lq_exact_cnt   = exact_cnt;
+    assign o_dbg_lq_saved_cnt   = saved_cnt;
+    assign o_dbg_lq_invnopa_cnt = invnopa_cnt;
 }

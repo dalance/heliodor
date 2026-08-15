@@ -1000,6 +1000,58 @@ running as a live reference, so at `=1` the machine is simultaneously using the 
 proving it agrees with the old one, cycle for cycle. That check is what makes the eventual deletion
 of the shadow arrays a mechanical step rather than a leap.
 
+### L3.2d — PA-exact records: built DEAD, and the COVERAGE is measured first
+
+The queue carries both addresses per entry (`va`, `pa`, `pa_valid`), and every scan has an exact arm
+that fires only where both sides have a PA: the store-resolve scan against `store_pretx_pa` (L2's
+pre-translate probe, live on the resolving store's own cycle), the record-time self-scan against the
+ROB's per-entry `sh_store_pa`, and — the one that is a correctness fix rather than a precision one —
+the CoRR line compare, which is a **VA-vs-PA compare today** and therefore silently never matches
+under Sv39. `LQ_PA_EXACT = 0` keeps every one of those folded to today's arm.
+
+**The coverage is measured before the arm is switched on** (the f2.16 rule: an increment whose
+target population is small should die before a line of it is enabled). Counters: `rec` (cycles with
+a record), `pa_rec` (…carrying an exact PA), `exact` (store-resolve cycles decided PA-to-PA), `saved`
+(poisons the approximation raises that the exact test does not), `invnopa` (a line leaves the L1
+while an executed record has no PA — the residual hole).
+
+🚩 **First measurement: 45,349 / 1,613,658 = 2.8 %.** Almost no record carried a PA — and the reason
+was a wiring mistake this measurement is exactly designed to catch: **a plain integer load writes
+back on LANE 1**, not lane 0 (`lsr_to_lane1 = 1` for it, and `alu_cdb2 = lsr_lane1_fire ? lsu_cdb :
+alu2_pipe_cdb`), and only the lane-0 record port had been given the PA. Guessing from the code would
+have "confirmed" the lane-0 wiring; the counter refused it in one boot.
+
+**After wiring lane 1: 1,606,011 / 1,613,658 = 99.5 % of load records carry an exact PA**, with the
+N=1 boot still at `cy=00cf36e0` (recorded but unread at `LQ_PA_EXACT = 0`). The load side of the
+exact test is therefore fully covered; what is left to measure is the store side and the prize.
+
+**And the prize can be measured at zero risk** — worth stating as a method. Set `LQ_PA_EXACT = 1`
+while leaving `LQ_REAL = 0`: the ROB shadow is still the authority, so the machine executes the OLD
+policy and the cycle count cannot move, while the queue running alongside reports what the NEW
+policy would have decided (`saved` = poisons the approximation raises that the exact test does not;
+the poison-set divergence counter is the same number seen from the other side). A policy change that
+is normally flip-and-pray becomes an observation.
+
+**Result of that observation, N=1 boot (`cy=00cf36e0`, unchanged as designed):**
+
+| | at 4.19 M cy | at 8.39 M cy | at 12.58 M cy |
+|---|---|---|---|
+| store-resolve cycles decided PA-to-PA | 13,051 | 39,684 | 71,494 |
+| **poisons the exact test would AVOID** | **14** | **41** | **63** |
+| load records carrying a PA | 501,526 / 501,749 | 1,032,571 / 1,035,974 | 1,606,011 / 1,613,658 |
+| executed-load set vs the ROB's | 0 divergences | 0 | 0 |
+
+🎯 **~63 avoided poisons against the boot's 19,539 — 0.35 % of them.** The precision half of the
+PA-exact idea is therefore **measured dead**, and it died *below* the bound L3.1 set (0.41 % of
+cycles), exactly as this document predicted before the run. Note what that also says about the
+census's own framing: the S15 self-scan's 13,083 "VA alias suspicion" poisons are **not**
+false positives waiting to be cleaned up — where an exact PA compare can be made, it almost always
+agrees with the conservative answer.
+
+**What survives is the CoRR correctness fix, and it is not measurable at N=1** — a single hart
+receives no invalidates at all (`invnopa = 0` for that reason, not a good one). That measurement
+needs N ≥ 2.
+
 ### What is already built — do NOT rebuild
 
 | piece | state |
