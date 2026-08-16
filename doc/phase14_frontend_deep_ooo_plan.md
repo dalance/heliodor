@@ -1121,14 +1121,55 @@ that the VA-vs-PA compare silently missed, and each catch is a replay. N=1 has n
 and is unchanged, which is consistent with that reading. (Not separately instrumented — `LQ_CHECK`
 is off in the shipped build — so this is the coherent explanation, not a measured attribution.)
 
-**That is the trade this block ships: 0.39 % of a 2-hart boot for a memory-model hole that has been
-open since VM support landed.** The precision half that L3.2d measured dead buys nothing back, as
-predicted.
+**The cost scales with hart count, and that is the strongest evidence for the mechanism.** The N=4
+SMP boot came in at `cy=01985340` = **26,760,000 vs 26,440,000 = +1.21 %**, pass=1. So:
 
-**New default baselines**: N=1 `cy=00cf36e0` · N=2 `cy=01165200` · litmus N=2 `cy=002e6300` ·
-litmus N=4 `cy=003c6cc0` · dhrystone 237,827 / 264,834 · 252/0. N=4 SMP boot and the Verilator NBA
-cross-check are NOT re-run yet — both are milestone-level gates and this change touches coherence,
-so they are the next thing to run before this is called finished.
+| | N=1 | N=2 | N=4 |
+|---|---|---|---|
+| cost of the shipped config | **0 %** | **+0.39 %** | **+1.21 %** |
+
+Monotone in the number of harts, which is exactly the shape a coherence-correctness fix has: more
+harts, more remote invalidates, more of the previously-missed cases now caught, more replays. A
+constant overhead (extra logic in a hot path) would not look like this, and a single-hart machine
+pays nothing at all.
+
+**That is the trade this block ships: 0 / 0.39 / 1.21 % by hart count, for a memory-model hole that
+has been open since VM support landed.** The precision half that L3.2d measured dead buys nothing
+back, as predicted.
+
+**New default baselines**: N=1 `cy=00cf36e0` / N=2 `cy=01165200` / N=4 `cy=01985340` /
+litmus N=2 `cy=002e6300` / litmus N=4 `cy=003c6cc0` / dhrystone 237,827 / instret 264,834 / 252/0.
+
+**Verilator NBA cross-check - 3/4 landed, all PASS.** Its exact counts also confirm the
+10,000-cycle quantisation of every Veryl harness number:
+
+| | Verilator (exact) | Veryl sim (quantised) |
+|---|---|---|
+| N=1 Linux boot | **PASSED, cy=13,575,874** | 13,580,000 ok |
+| N=2 SMP Linux boot | **PASSED, cy=18,233,239** | 18,240,000 ok |
+| litmus N=4 | **PASSED, cy=3,952,044** | 3,960,000 ok |
+| N=4 SMP Linux boot | still running (-O1 build, hours) | 26,760,000 |
+
+The litmus N=4 figure 3,952,044 is **the same number to the cycle as the pre-L3 Block-W run** - the
+RVWMO battery is bit-identical under the new structure, on the NBA semantics that matter.
+
+### Do NOT delete the ROB shadow — at the shipped setting it is already gone
+
+The obvious follow-up after L3.3 is "now remove the shadow arrays, so the structure is a replacement
+rather than a duplicate". Checked, and the answer is **no**. At `LQ_REAL=1` / `LQ_CHECK=0` /
+`DBG_CENSUS=0` the complete reader set of `sh_load_done/addr/funct3/poison` is:
+
+| reader | state when shipped |
+|---|---|
+| `o_commit_load_poison`, `c2_simple` | the **unselected** arm of `if LQ_REAL ? queue : shadow` |
+| `o_lq_rec_set` / `o_lq_pois_set` | consumed only by the queue's `LQ_CHECK` block — folded at 0 |
+| the three scans themselves | their only sinks are the two rows above and the DBG_CENSUS counters |
+
+So the 4 × 32 arrays and the three 32-wide scans have **no live consumer in the shipped netlist**;
+synthesis removes them. Deleting them from the source would buy zero gates and would destroy the
+`LQ_REAL=0` fold-away fallback this campaign deliberately keeps (the `ATOMIC_SQ=0` / `LSR_MSHR_B=0`
+precedent). The duplication is source-level only, and source-level duplication that a const can fold
+is exactly what the campaign's DEAD-scaffold discipline asks for.
 
 ### What is already built — do NOT rebuild
 
