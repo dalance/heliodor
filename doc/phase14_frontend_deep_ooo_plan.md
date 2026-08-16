@@ -1400,6 +1400,98 @@ AGU time, where only the VA exists, so the work is to move (or mirror) it to the
 has `lsr`→**`lane0` at 705,559 cy = 5.2 %** unbuilt, and `storeamo` ineligible-on-slot-1 at
 1,600,337 cy. Pick this block for structural completeness (the reason L3 shipped), not for cycles.
 
+### M2 — building lever (d), and what building it actually found
+
+The plan was to key the uncommitted store→load byte network on physical addresses, the way the
+committed (`sbf*`) half already is. That is a small, local change — the network is evaluated at
+Stage B, which holds `lsr_paddr_q` for the load and `ls_pa[i]` (L2's `STORE_PRETRANSLATE`) for every
+store — plus the mirror-image change to the self-scan's S16 exemption, which is a statement about
+that same key. Both were built const-gated (`FWD_PA`, flip-coupled across the two files) and DEAD at
+0 was verified bit-identical (252/0, `cy=00cf36e0`, instret 10,431,242).
+
+**The flip was bit-identical too** — the fifth time in this campaign. Chasing "why was it not
+reached" rather than re-deriving the design is what found the actual defect:
+
+| self-scan poisons, N=1 boot, by record port | |
+|---|---|
+| port 0 (lane-0 CDB record) — the port the S16 exemption is written for | **0** |
+| port 2 (MSHR fill capture) | 2 |
+| **port 1 (lane-1 CDB record)** | **~7,627, i.e. all of them** |
+
+Port 1's own comment reads *"lane-1 CDB, bare-only today, kept for symmetry"*, and it has **no
+exemption at all** — it poisons on ANY overlap. That comment went stale when L4 step-1.5 routed the
+LSR's completion to lane 1 (`lsr_to_lane1`: fault/FP loads stay on lane 0, **everything else goes to
+lane 1**). So since L4, the port carrying ordinary VM loads has been poisoning loads the byte network
+had **already served** — a full commit-time replay each, for bytes that were correct in the register
+file.
+
+### M2a — give port 1 the exemption. **−1.03 %.**
+
+| | default | `P1_SERVED=1` |
+|---|---|---|
+| default suite | 252/0 | **252/0** |
+| **N=1 boot** | 13,580,000 (`00cf36e0`) | **13,440,000 (`00cd1400`) = −1.03 %** |
+| replay events | 19,757 | **11,145** |
+| replay recovery cycles | 180,895 | **102,733** |
+| poisons suppressed | — | 16,556 |
+
+Bigger than the −0.88 % the *unsound* `S15_SELF_SCAN=0` arm bought, because removing the poison at
+the source also removes the store-resolve violations the replays themselves caused.
+
+Two things make the exemption sound rather than plausible, and both were added after measuring:
+
+1. **The identity guard `i_rec1_pa_valid`** (= `lsr_v_q && lsr_rob_idx_q == alu_cdb2.rob_idx`). With
+   it the exemption is not an argument but a term-for-term identity with the network's coverage
+   predicate: same forwardable set (`i_store_fwd` = the net's `ls_fwd`), same age test (the ages are
+   equal exactly when the rob indices are), same address, same cycle.
+2. **An interlock against the network's own mask.** The scan computes the byte mask this store
+   covers and suppresses only if it is a subset of `sf_rob_mask` (the ROB half of the live forward
+   mask — the committed store buffer is a different question). The exemption therefore cannot claim
+   more than the datapath delivered, whatever anyone believes about the identity above.
+
+⚠️ **One open item, deliberately left visible.** A counter placed in the CORE reports 3 suppressions
+(of 16,556) on cycles where `sf_rob_mask` reads 0; the SAME question asked INSIDE the load queue,
+where the mask is a port read, reports **0**. Two readers of one combinational signal, same cycle,
+different answers — so it is a sampling artefact rather than 3 unserved loads, and the interlock the
+LQ actually decides with is the one reading 0. Verilator (SV NBA) is the arbiter and must be run
+before this ships.
+
+### M2b — the PA key itself is worth **exactly zero**
+
+With the port-1 exemption in place, `FWD_PA=1` gives a **bit-identical** boot: same cycles, same
+11,145 replays, same 16,556 suppressions.
+
+🎯 **So M1c's reading was wrong, and the flip is what corrected it.** "96.7 % decided PA-to-PA with 0
+attribution failures" was true, but the inference — *therefore they are VA aliases the network cannot
+serve* — silently imported port 0's structure (`&& !a0_vaovl`) into port 1, which has no VA test at
+all. Those poisons had overlapping VAs the whole time. The PA key stays in-tree at 0 as a fold-away
+arm, with the measurement recorded next to it.
+
+**Lever (d) was therefore worth ~1 % — but not for the reason it was chosen.** What the block
+actually found is a latent over-poisoning bug that L4 step-1.5 introduced and no gate caught, because
+a spurious replay is invisible to every correctness test and only shows up in cycles.
+
+### M2a gates (default = the post-L3.3 baselines)
+
+| gate | default | M2a | Δ |
+|---|---|---|---|
+| default suite (incl. litmus N=2) | 252/0 | **252/0** | — |
+| **N=1 boot** | `00cf36e0` 13,580,000 | **`00cd1400` 13,440,000** | **−1.03 %** |
+| **N=2 SMP boot** | `01165200` 18,240,000 | **`011567a0` 18,180,000** | **−0.33 %** |
+| dhrystone | 237,827 / instret 264,834 | **237,827 / 264,834** | bit-exact |
+| coremark | 404,355 / instret 374,357 | **404,355 / 374,357** | bit-exact |
+| litmus N=4 | `003c6cc0` | *(running)* | |
+| N=4 SMP boot | `01985340` 26,760,000 | *(running)* | |
+
+The two microbenchmarks being **bit-exact** is the load-bearing check, not a null result: they run
+bare, and the whole change is gated on `i_conservative` (Sv39 active). A change that moved them would
+have been firing somewhere it must not.
+
+⚠️ `instret` on the N=1 boot moves 10,431,242 → 10,428,249 (−0.03 %). That is expected here and is
+NOT the canary failing: the boot's instruction count is timing-dependent through `rdtime` spin loops,
+and the unsound `S15_SELF_SCAN=0` arm lands at 10,428,245 — the same ballpark — for the same reason.
+`instret` is only a bit-exact canary for changes that do not move cycles.
+
 
 
 ## Block W — WIDTH. The machine is ~1-wide, and that caps everything above (2026-08-15)

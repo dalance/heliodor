@@ -96,6 +96,16 @@ pub module load_queue #(
     i_store_addr  : input logic<64>[ROB_DEPTH],
     i_store_funct3: input logic<3> [ROB_DEPTH],
     i_store_known : input logic    [ROB_DEPTH], // valid && is_store && rw && !is_amo
+    // M2: the FORWARDABLE set (o_store_fwdable) — st_known minus the cbo ops the
+    // byte network refuses to serve. The exemption below must be keyed on what the
+    // network can actually forward, not on a neighbouring module's invariant.
+    i_store_fwd   : input logic    [ROB_DEPTH],
+    // M2a: the forward network's OWN per-byte mask for the load in Stage B (the ROB
+    // half only — the committed store buffer is a different question). The port-1
+    // exemption is interlocked against this: a poison is suppressed only for bytes
+    // the network demonstrably delivered, so the exemption can never claim more than
+    // the datapath did. Byte p = the load's frame byte at lsr_vaddr_q + p.
+    i_fwd_mask    : input logic<8>            ,
     i_conservative: input logic                , // Sv39 active → VA compares degrade
     // L3.2d: the exact PAs. Per-entry for the self-scan's older stores, live for
     // the store resolving this cycle (L2's STORE_PRETRANSLATE probe).
@@ -161,6 +171,16 @@ pub module load_queue #(
     // are decided with someone else's address.
     o_dbg_self_pamis    : output logic    , // load side: rec PA does not match its own VA offset
     o_dbg_self_spamis   : output logic    , // store side: the ROB's store PA does not match its VA offset
+    // M2 flip debug: the exemption did not fire even at FWD_PA=1, and only two
+    // terms can explain that. Count both instead of reasoning about them.
+    // M2a soundness probe: the exemption claims the byte network already served
+    // these bytes. Report each suppression so the core can check that claim against
+    // the network's OWN mask on the same cycle — the "is this guard load-bearing"
+    // question, asked with data instead of an argument.
+    o_dbg_p1_exempt     : output logic    , // port 1: a poison was suppressed this cycle
+    o_dbg_p1_nomask     : output logic    , // ...asked INSIDE the module, where i_fwd_mask is a local port read
+    o_dbg_self_p0       : output logic    , // fired on port 0 (Stage-B CDB record — what M2 fixes)
+    o_dbg_self_p2       : output logic    , // fired on port 2 (MSHR fill capture — a MISSING load)
 ) {
     // Verification-phase instrumentation. Set to 0 before shipping: at 0 every
     // counter here is reset-only, so the whole check (including the 32x32
@@ -171,6 +191,29 @@ pub module load_queue #(
     // reproduced here bit-for-bit, so if one side is turned off for a probe the
     // other must be too or the equivalence check fires.
     const S15_SELF_SCAN: bit = 1;
+    // ── M2 / Block M lever (d) ── FLIP-COUPLED with heliodor_core.veryl's FWD_PA.
+    // The S16 exemption below encodes "the byte network already served these bytes,
+    // so only the case it cannot serve still poisons". That is a statement about
+    // the network's KEY, so when the network moves to physical addresses this must
+    // move with it — otherwise the served loads are still poisoned (no gain) or the
+    // unserved ones are exempted (unsound). At 0 the exemption is today's VA test,
+    // bit for bit.
+    const FWD_PA: bit = 0; // MEASURED WORTH EXACTLY ZERO — see M2b in the plan doc:
+    // with the port-1 exemption in place, flipping this to 1 gives a bit-identical
+    // boot (same cycles, same 11,145 replays, same 16,556 suppressions). The
+    // "genuine VA alias" reading of M1c was wrong: those poisons had overlapping VAs
+    // too, they simply had no exemption on that port. Kept as a fold-away arm.
+    // ── M2a ── The S16 "already forwarded" exemption exists ONLY on port 0, and the
+    // M2 flip proved port 0 fires ZERO times on an N=1 boot: every one of the 7,627
+    // record-time self-scan poisons comes from PORT 1. Port 1's comment calls it
+    // "lane-1 CDB, bare-only today, kept for symmetry" — that went stale when L4
+    // step-1.5 routed the LSR's completion to lane 1 (`lsr_to_lane1`: fault/FP loads
+    // stay on lane 0, everything else goes to lane 1). So the port that carries
+    // ordinary VM loads poisons on ANY overlap, including the full-VA overlaps the
+    // Stage-B byte network HAS already served (i_rec1_pa = lsr_paddr_q, valid on the
+    // LSR idx match — the same load the net was evaluated against).
+    // At 0 this is today's behaviour, bit for bit.
+    const P1_SERVED: bit = 1;
     // ── L3.2d: decide with the exact PA wherever both sides have one ──
     // The 13-bit page-offset compare and the page-cross blanket exist only
     // because the load record and the store are in different address spaces
@@ -349,16 +392,20 @@ pub module load_queue #(
     var rec2_self_w : logic;
     var self_saved_w: logic;
     var self_nopa_w : logic; // M1: fired on the approximation, with no PA pair
+    var p1_exempt_w : logic; // M2a: port 1 suppressed a poison this cycle
     var self_pamis_w: logic; // M1: fired PA-decided, load PA offset != load VA offset
     var self_spamis_w: logic; // M1: fired PA-decided, store PA offset != store VA offset
+
     always_comb {
         rec0_self_w  = 1'b0;
         rec1_self_w  = 1'b0;
         rec2_self_w  = 1'b0;
         self_saved_w = 1'b0;
         self_nopa_w  = 1'b0;
+        p1_exempt_w  = 1'b0;
         self_pamis_w = 1'b0;
         self_spamis_w = 1'b0;
+
         for i in 0..ROB_DEPTH {
             let st_age  : logic<ROB_IDX_W> = (i as ROB_IDX_W) - i_rob_head_idx;
             let st_known: logic            = i_store_known[i];
@@ -382,8 +429,18 @@ pub module load_queue #(
             let a0_paok : logic            = LQ_PA_EXACT && i_rec0_pa_valid && i_store_pa_v[i];
             let a0_ovlp : logic            = (i_rec0_pa <: i_store_pa[i] + sszb) && (i_store_pa[i] <: i_rec0_pa + a0_lsz);
             let a0_ovl  : logic            = if a0_paok ? a0_ovlp : a0_ovlc;
+            // M2: what the forward network ACTUALLY served for these bytes. Its key
+            // is the store's PA when the store has one (and the load's PA is this
+            // load's — i_rec0_pa_valid is the same lsr_v_q && idx-match predicate
+            // the net's own gate implies), else the VA. Mirroring it exactly is the
+            // whole correctness argument: a0_served must never claim more than the
+            // net delivers.
+            let a0_fwd_pa: logic = FWD_PA && i_rec0_pa_valid && i_store_pa_v[i];
+            let a0_served: logic = if FWD_PA
+                ? i_store_fwd[i] && (if a0_fwd_pa ? a0_ovlp : a0_vaovl)
+                : a0_vaovl;
             if S15_SELF_SCAN && i_conservative && i_rec0_valid
-                && st_known && (st_age <: a0_age) && a0_ovl && !a0_vaovl {
+                && st_known && (st_age <: a0_age) && a0_ovl && !a0_served {
                 rec0_self_w = 1'b1;
                 if !a0_paok {
                     self_nopa_w = 1'b1;
@@ -394,6 +451,7 @@ pub module load_queue #(
                 if a0_paok && i_store_pa[i][11:0] != i_store_addr[i][11:0] {
                     self_spamis_w = 1'b1;
                 }
+
             }
             if S15_SELF_SCAN && i_conservative && i_rec0_valid
                 && st_known && (st_age <: a0_age) && a0_paok && a0_ovlc && !a0_ovlp && !a0_vaovl {
@@ -408,8 +466,47 @@ pub module load_queue #(
             let a1_lsz : logic<64>        = (5'd1 << i_rec1_funct3[1:0]) as 64;
             let a1_ovlp: logic            = (i_rec1_pa <: i_store_pa[i] + sszb) && (i_store_pa[i] <: i_rec1_pa + a1_lsz);
             let a1_ovl : logic            = if a1_paok ? a1_ovlp : a1_ovlc;
+            // M2a: the same "was it served" test port 0 has had since S16 — the VA
+            // overlap the byte network keys on, or the PA overlap once FWD_PA moves
+            // that key. i_store_fwd is the net's own forwardable set.
+            let a1_vaovl : logic = (i_rec1_va <: i_store_addr[i] + sszb) && (i_store_addr[i] <: i_rec1_va + a1_lsz);
+            let a1_fwd_pa: logic = FWD_PA && i_rec1_pa_valid && i_store_pa_v[i];
+            // ⚠️ i_rec1_pa_valid is not decoration — it is `lsr_v_q && lsr_rob_idx_q ==
+            // alu_cdb2.rob_idx`, i.e. "the record IS the load the Stage-B net was
+            // evaluated against". With it the exemption is not an argument but an
+            // IDENTITY: the net's coverage predicate for byte p is
+            //   ls_fwd[i] && (age_i < lsr_rob_idx_q-head) && la+p in [sa, sa+ssz)
+            // and each conjunct is then term-for-term the same signal as this scan's
+            // (i_store_fwd[i], st_age < a1_age, the overlap) on the SAME cycle with the
+            // SAME address. Without it, a port-1 record could be some other load (a
+            // pipe-1 completion served by the twin net one cycle earlier) and the
+            // mirror would be an assumption instead of an equality.
+            // The bytes of the load frame THIS store covers, computed exactly as the
+            // network computes its own coverage (same address pair, same size), then
+            // required to be a subset of what the network actually delivered. A byte
+            // the network took from a YOUNGER older store is still covered — that is
+            // the correct value — so subset, not equality.
+            let a1_sa   : logic<64> = if a1_fwd_pa ? i_store_pa[i] : i_store_addr[i];
+            let a1_la   : logic<64> = if a1_fwd_pa ? i_rec1_pa : i_rec1_va;
+            let a1_cov  : logic<8>  = {
+                (a1_la + 64'd7 >= a1_sa) && (a1_la + 64'd7 <: a1_sa + sszb),
+                (a1_la + 64'd6 >= a1_sa) && (a1_la + 64'd6 <: a1_sa + sszb),
+                (a1_la + 64'd5 >= a1_sa) && (a1_la + 64'd5 <: a1_sa + sszb),
+                (a1_la + 64'd4 >= a1_sa) && (a1_la + 64'd4 <: a1_sa + sszb),
+                (a1_la + 64'd3 >= a1_sa) && (a1_la + 64'd3 <: a1_sa + sszb),
+                (a1_la + 64'd2 >= a1_sa) && (a1_la + 64'd2 <: a1_sa + sszb),
+                (a1_la + 64'd1 >= a1_sa) && (a1_la + 64'd1 <: a1_sa + sszb),
+                (a1_la >= a1_sa) && (a1_la <: a1_sa + sszb)
+            };
+            let a1_served: logic = P1_SERVED && i_rec1_pa_valid && i_store_fwd[i]
+                && (a1_cov != 8'd0) && ((a1_cov & ~i_fwd_mask) == 8'd0)
+                && (if a1_fwd_pa ? a1_ovlp : a1_vaovl);
             if S15_SELF_SCAN && i_conservative && i_rec1_valid
-                && st_known && (st_age <: a1_age) && a1_ovl {
+                && st_known && (st_age <: a1_age) && a1_ovl && a1_served {
+                p1_exempt_w = 1'b1;
+            }
+            if S15_SELF_SCAN && i_conservative && i_rec1_valid
+                && st_known && (st_age <: a1_age) && a1_ovl && !a1_served {
                 rec1_self_w = 1'b1;
                 if !a1_paok {
                     self_nopa_w = 1'b1;
@@ -828,4 +925,12 @@ pub module load_queue #(
     assign o_dbg_self_nopa      = self_nopa_w;
     assign o_dbg_self_pamis     = self_pamis_w;
     assign o_dbg_self_spamis    = self_spamis_w;
+    assign o_dbg_p1_exempt      = p1_exempt_w;
+    // The interlock makes this a contradiction (a suppression needs a1_cov != 0 AND
+    // a1_cov subset of i_fwd_mask), so a non-zero count here would be a real hole —
+    // whereas the same question asked from the core can also catch a comb-ordering
+    // artefact in how a counter samples a cross-module signal.
+    assign o_dbg_p1_nomask      = p1_exempt_w && i_fwd_mask == 8'd0;
+    assign o_dbg_self_p0        = rec0_self_w;
+    assign o_dbg_self_p2        = rec2_self_w;
 }

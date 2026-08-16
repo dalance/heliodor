@@ -4930,6 +4930,9 @@ pub module heliodor_core #(
     var rob_is_control        : logic         [ROB_DEPTH];
     var stld_fwd_data         : logic<64>                ;
     var stld_fwd_mask         : logic<8>                 ;
+    // M2a: the ROB half of that mask on its own (stld_fwd_mask ORs in the committed
+    // store buffer). The load queue's port-1 exemption is interlocked against this.
+    var sf_rob_mask           : logic<8>                 ;
     // Phase 8 S5.2: 2nd store-to-load forward network (slot-1 / pipe-1 LOAD at
     // agu_addr_iss2). Mirror of the slot-0 network below; feeds u_alu2.i_fwd_*.
     var stld_fwd_data2        : logic<64>                ;
@@ -4941,6 +4944,10 @@ pub module heliodor_core #(
     var ls_data               : logic<64>     [ROB_DEPTH];
     var ls_f3                 : logic<3>      [ROB_DEPTH];
     var ls_fwd                : logic         [ROB_DEPTH];
+    // M2 (Block M lever d): the same shadow's PHYSICAL addresses (L2's
+    // STORE_PRETRANSLATE), local for the same Veryl-sim reason as the four above.
+    var ls_pa                 : logic<64>     [ROB_DEPTH];
+    var ls_pa_v               : logic         [ROB_DEPTH];
 
     var prf_rs1_data: logic<64>;
     var prf_rs2_data: logic<64>;
@@ -6392,6 +6399,10 @@ pub module heliodor_core #(
     var lq_self_nopa       : logic    ; // M1: ...decided by the approximation, not a PA pair
     var lq_self_pamis      : logic    ; // M1: ...decided PA-to-PA with a load PA that is not the load's
     var lq_self_spamis     : logic    ; // M1: ...decided PA-to-PA with a store PA that is not the store's
+    var lq_p1_exempt       : logic    ; // M2a: port 1 suppressed a poison this cycle
+    var lq_p1_nomask       : logic    ; // M2a: ...with an empty mask, asked inside the LQ
+    var lq_self_p0         : logic    ; // M2: self-scan fired on port 0 (Stage-B record)
+    var lq_self_p2         : logic    ; // M2: self-scan fired on port 2 (MSHR fill)
     var lq_poison_head   : logic    ;
     var lq_poison_head1  : logic    ;
 
@@ -6721,6 +6732,8 @@ pub module heliodor_core #(
         i_store_addr     : rob_store_addr       ,
         i_store_funct3   : rob_store_funct3     ,
         i_store_known    : rob_store_known      ,
+        i_store_fwd      : rob_store_fwdable    , // M2
+        i_fwd_mask       : sf_rob_mask          , // M2a interlock
         i_store_pa       : rob_store_pa         , // L3.2d
         i_store_pa_v     : rob_store_pa_v       ,
         i_st_pa          : store_pretx_pa       ,
@@ -6758,6 +6771,10 @@ pub module heliodor_core #(
         o_dbg_self_nopa     : lq_self_nopa      ,
         o_dbg_self_pamis    : lq_self_pamis     ,
         o_dbg_self_spamis   : lq_self_spamis    ,
+        o_dbg_p1_exempt     : lq_p1_exempt      ,
+        o_dbg_p1_nomask     : lq_p1_nomask      ,
+        o_dbg_self_p0       : lq_self_p0        ,
+        o_dbg_self_p2       : lq_self_p2        ,
     );
 
     // ============================================================
@@ -7904,6 +7921,35 @@ pub module heliodor_core #(
     assign ls_data = rob_store_data;
     assign ls_f3   = rob_store_funct3;
     assign ls_fwd  = rob_store_fwdable;
+    assign ls_pa   = rob_store_pa;
+    assign ls_pa_v = rob_store_pa_v;
+    // ── M2 / Block M lever (d): key this network on PHYSICAL addresses ──────────
+    // This net is the UNCOMMITTED half of store->load forwarding and it compares
+    // full VAs. The COMMITTED half (sbf*, below) already compares PAs
+    // (`sbf_pa = lsr_paddr_q`), so the two halves of one mechanism disagree about
+    // what an address is — and the disagreement is measurable: Block M's M1c found
+    // 7,378 of the 7,627 record-time self-scan poisons on an N=1 boot are genuine
+    // PHYSICAL overlaps whose VAs differ (0 attribution failures on either side).
+    // Those are exactly the loads this net cannot serve today, so each one costs a
+    // full commit-time replay (10.8 cy measured end to end).
+    //
+    // The swap is local because Stage B holds BOTH addresses of BOTH sides: the
+    // load's `lsr_paddr_q` (this net is already evaluated against the LSR, and
+    // lsr_v_q — the gate on the whole loop — is what makes that PA this load's,
+    // the same predicate L3.2d's `lq_rec0_pa_v` uses) and the store's `ls_pa[i]`.
+    // The choice is PER ENTRY so the two sides are never mixed: an entry with no
+    // pre-translated PA keeps comparing VA to VA exactly as today.
+    //
+    // ⚠️ FLIP-COUPLED with load_queue.veryl's FWD_PA: the self-scan's S16 exemption
+    // ("a full-VA overlap was forwarded, so only the alias case still poisons") is
+    // the mirror image of this net's key. Flipping one without the other either
+    // poisons loads that were served (no gain) or exempts loads that were not
+    // (unsound).
+    const FWD_PA: bit = 0; // MEASURED WORTH EXACTLY ZERO — see M2b in the plan doc:
+    // with the port-1 exemption in place, flipping this to 1 gives a bit-identical
+    // boot (same cycles, same 11,145 replays, same 16,556 suppressions). The
+    // "genuine VA alias" reading of M1c was wrong: those poisons had overlapping VAs
+    // too, they simply had no exemption on that port. Kept as a fold-away arm.
     var sf0_v: logic; var sf0_age: logic<ROB_IDX_W>; var sf0_b: logic<8>;
     var sf1_v: logic; var sf1_age: logic<ROB_IDX_W>; var sf1_b: logic<8>;
     var sf2_v: logic; var sf2_age: logic<ROB_IDX_W>; var sf2_b: logic<8>;
@@ -7919,7 +7965,9 @@ pub module heliodor_core #(
         sf0_v = 1'b0; sf0_age = '0; sf0_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd0;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd0;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7930,7 +7978,9 @@ pub module heliodor_core #(
         sf1_v = 1'b0; sf1_age = '0; sf1_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd1;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd1;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7941,7 +7991,9 @@ pub module heliodor_core #(
         sf2_v = 1'b0; sf2_age = '0; sf2_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd2;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd2;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7952,7 +8004,9 @@ pub module heliodor_core #(
         sf3_v = 1'b0; sf3_age = '0; sf3_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd3;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd3;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7963,7 +8017,9 @@ pub module heliodor_core #(
         sf4_v = 1'b0; sf4_age = '0; sf4_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd4;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd4;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7974,7 +8030,9 @@ pub module heliodor_core #(
         sf5_v = 1'b0; sf5_age = '0; sf5_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd5;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd5;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7985,7 +8043,9 @@ pub module heliodor_core #(
         sf6_v = 1'b0; sf6_age = '0; sf6_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd6;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd6;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -7996,7 +8056,9 @@ pub module heliodor_core #(
         sf7_v = 1'b0; sf7_age = '0; sf7_b = 8'd0;
         if stld_fwd_en { for i in 0..ROB_DEPTH {
             let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = lsr_vaddr_q + 64'd7;
+            let upa: logic = FWD_PA && ls_pa_v[i];
+            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
+            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd7;
             let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
             let off: logic<64> = la - sa;
             let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
@@ -9699,6 +9761,7 @@ pub module heliodor_core #(
         if sf4_v ? sf4_b : sbf4_b, if sf3_v ? sf3_b : sbf3_b, if sf2_v ? sf2_b : sbf2_b,
         if sf1_v ? sf1_b : sbf1_b, if sf0_v ? sf0_b : sbf0_b
     };
+    assign sf_rob_mask = {sf7_v, sf6_v, sf5_v, sf4_v, sf3_v, sf2_v, sf1_v, sf0_v};
     assign stld_fwd_mask = {
         sf7_v || sbf7_v, sf6_v || sbf6_v, sf5_v || sbf5_v, sf4_v || sbf4_v,
         sf3_v || sbf3_v, sf2_v || sbf2_v, sf1_v || sbf1_v, sf0_v || sbf0_v
@@ -12095,11 +12158,27 @@ pub module heliodor_core #(
             if lq_self_nopa {
                 lw_cause_cnt[75] = lw_cause_cnt[75] + 32'd1;                        // ...raised WITHOUT a PA pair (approximation only)
             }
-            if lq_self_pamis {
-                lw_cause_cnt[76] = lw_cause_cnt[76] + 32'd1;                        // ...decided with a load PA that is not the load's
+            if lq_p1_nomask {
+                lw_cause_cnt[76] = lw_cause_cnt[76] + 32'd1;                        // M2a: the same question, asked inside the LQ
             }
             if lq_self_spamis {
                 lw_cause_cnt[77] = lw_cause_cnt[77] + 32'd1;                        // ...decided with a store PA that is not the store's
+            }
+            // M2a soundness: every suppression must coincide with the byte network
+            // actually delivering bytes. A suppression on a cycle where the net's own
+            // mask is EMPTY would mean the guard was load-bearing and the exemption
+            // is unsound — bucket 75 must stay 0.
+            if lq_p1_exempt {
+                lw_cause_cnt[74] = lw_cause_cnt[74] + 32'd1;                        // M2a: poisons suppressed
+            }
+            if lq_p1_exempt && sf_rob_mask == 8'd0 {
+                lw_cause_cnt[75] = lw_cause_cnt[75] + 32'd1;                        // M2a: ...with NOTHING forwarded (must be 0)
+            }
+            if lq_self_p0 {
+                lw_cause_cnt[78] = lw_cause_cnt[78] + 32'd1;                        // M2: port 0 = the Stage-B record the byte net covers
+            }
+            if lq_self_p2 {
+                lw_cause_cnt[79] = lw_cause_cnt[79] + 32'd1;                        // M2: port 2 = an MSHR fill, which the byte net never sees
             }
             if !rob_commit_ack {
                 commit0_cnt = commit0_cnt + 32'd1;
