@@ -951,8 +951,9 @@ Set equality is proven as *containment + equal cardinality* (3 × 32 compares), 
 the matrix is exact too but costs 1024 compares per simulated cycle, and this runs for 13.58 M of
 them. Containment is a dynamic read of the reference vector by the entry's own `rob_idx`.
 
-**Gates:** `veryl test` **252/0** · N=1 Linux boot **`cy=00cf36e0` = 13,580,000, `x3=0xaa`,
-bit-exact with the shipped Block-W baseline** — the queue is genuinely dead, and the boot is the
+**Gates:** `veryl test` **252/0** · N=1 Linux boot **`cy=00cf36e0`, `x3=0xaa`, matching the shipped
+Block-W baseline** (at the harness's 10,000-cycle print granularity — see the resolution note under
+L3.2c; the queue being *unread* is the real proof it is dead) — and the boot is the
 run that matters because all three scans are Sv39-only (L3.0: 19,539 poisons / 16,496 replays there,
 **0** on the bare microbenchmarks).
 
@@ -979,16 +980,27 @@ core→queue→rob→core path has no cycle).
 | gate | `=0` (shipped) | `=1` (flip) |
 |---|---|---|
 | `veryl test` | 252/0 | **252/0** |
-| dhrystone | 237,827 cy / instret 264,834 | **237,827 / 264,834 — bit-identical** |
-| N=1 Linux boot | `cy=00cf36e0` (13,580,000) | **`cy=00cf36e0` — bit-identical** |
-| N=2 SMP Linux boot | 18,170,000 | **`cy=01154090` = 18,170,000 — bit-identical** |
-| litmus N=2 | `cy=002e6300` | **`cy=002e6300`** |
-| litmus N=4 | 3,960,000 | **`cy=003c6cc0` = 3,960,000** |
-| equivalence violations | 0 | **0 — the shadow still agrees every cycle** |
+| dhrystone (exact counters) | 237,827 cy / instret 264,834 | **237,827 / 264,834 — bit-identical** |
+| N=1 Linux boot | `cy=00cf36e0` | **`cy=00cf36e0`** |
+| N=2 SMP Linux boot | `cy=01154090` | **`cy=01154090`** |
+| litmus N=2 / N=4 | `cy=002e6300` / `cy=003c6cc0` | **`cy=002e6300` / `cy=003c6cc0`** |
+| **per-cycle equivalence vs the shadow** | 0 divergences | **0 divergences** |
 
-Every gate, including both SMP gates the campaign requires for anything touching memory ordering,
-is bit-identical to the shipped baseline. Reverted to `=0` for ship-safety; **whether `LQ_REAL=1`
-becomes the default path is the user's call**, as it was for `ATOMIC_SQ` and `LSR_MSHR_B`.
+⚠️ **Read those `cy` figures at the right resolution.** The boot and litmus harnesses advance the
+clock in **10,000-cycle chunks** (`clk.next(10000)` in `tb/test_litmus.veryl`, "poll in 10000-cycle
+chunks" in `tb/test_soc_linux_boot.veryl`), so their reported `cy` is quantised to 10,000 — a match
+there means |Δ| < 10,000 (< 0.07 % at N=1), **not** bit-exactness. This applies to every boot/litmus
+number this campaign has ever quoted, including the Block-W table above. Only dhrystone/coremark
+report an exact cycle count, and those are bit-identical here.
+
+**The strong evidence for this flip is not the cycle print — it is the checker**: the ROB shadow was
+left running as a live reference, and its executed-load set and poison set agreed with the queue's
+**every cycle, with zero divergences**, across the whole suite, the N=1 boot, the N=2 SMP boot and
+litmus N=4, while the queue was the authority. That is a per-cycle equality proof over ~50 M
+simulated cycles, which the 10,000-cycle `cy` print could never give.
+
+Reverted to `=0` for ship-safety at the time of measurement; **whether `LQ_REAL=1` becomes the
+default path is the user's call**, as it was for `ATOMIC_SQ` and `LSR_MSHR_B`.
 
 **The prediction written before the measurement was "< 0.5 % in either direction, expected exactly
 bit-identical". It is exactly bit-identical**, on both workloads, which is the only honest outcome:
