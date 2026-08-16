@@ -1276,6 +1276,132 @@ Every pre-2026-08-08 number in this repo's docs is against the OLD front end. Th
 
 ---
 
+## Block M — the replay is PRICED, and one of the two levers is measured dead (2026-08-16)
+
+The hand-off above named two live levers — (a) do not speculate, (b) make recovery cheap — and
+required the volumes to be re-censused before anything was sized. This block did that, and then did
+the thing the campaign keeps having to learn: it measured **cycles**, not events.
+
+### M0 — what one commit-time load replay actually costs
+
+Census buckets 60-73 (`heliodor_core.veryl`, `DBG_CENSUS`). Method: open a window at the replay
+redirect, latch the load's PC, close it when that PC commits again; charge a trap-interrupted window
+to its own bucket. N=1 boot, `cy=00cf36e0` = 13,580,000 — **bit-identical to the default**, so the
+instrumentation does not perturb the machine it measures.
+
+| | |
+|---|---|
+| replay events | **19,757** (dedup exactly matches `load_replay_cnt`, so the redirect is a 1-cycle pulse) |
+| **total recovery cycles** | **180,895 = 1.33 % of the boot** |
+| per event | **9.15 cy** (worst clean window 76) |
+| ROB entries squashed per event | **9.94** (`squashsum` 196,419) |
+| windows: clean / trap / runaway | 19,756 / 1 / 0 — the accounting closes |
+| poison sources | store-resolve 14,797 · **self-scan 7,686** · MSHR-abort 128 · CoRR 0 |
+
+**M0b — the window splits into the half a selective replay deletes and the half it still pays**:
+redirect → the same PC back at rename = **79,208 cy (4.01 cy/event)**; the remaining
+**101,687 cy (5.15 cy/event)** is re-issue → re-execute → re-commit, which a selective replay still
+owes.
+
+### M1 — lever (a), "don't speculate", is DEAD. The RTL already had the arm.
+
+`rob.veryl:781 s9_speculate_en` has been a global "loads never pass an unknown-address store" switch
+since Phase 8 S9.4. Flipping it to 0 is the strongest possible dependence predictor — one that is
+right about every load, for free — so it **upper-bounds every predictor of this shape**:
+
+| | default | `s9_speculate_en = 0` |
+|---|---|---|
+| cycles | 13,580,000 | **13,670,000 (+0.66 %)** |
+| store-resolve violations | 14,797 | **0** |
+| **self-scan violations** | 7,686 | **18,273 (+10,587)** |
+| replay events | 19,757 | 18,024 |
+| **recovery cycles** | 180,895 | **163,368 (−17,527 only)** |
+
+🎯 **Blocking the load does not prevent the violation — it changes which detector raises it.** Holding
+the load until older stores resolve makes those stores *known*, and the record-time self-scan then
+fires on the same dynamic loads: **72 % of the eliminated store-resolve violations came back as
+self-scan violations.** So the whole lever is worth at most **17,527 cy = 0.13 %**, and its global
+form is a measured **+0.66 % regression**. A per-PC predictor cannot beat the global arm at avoiding
+violations (the global arm blocks a superset), so the ceiling holds for the selective version too.
+
+⚠️ Note what this kills: the hand-off's "the two live levers are (a) and (b)" is now **one** lever.
+Precision was measured dead twice (L3.1, L3.2d); not-speculating is measured dead here.
+
+### M1b — the end-to-end price of a replay, and the calibration that validates M0
+
+`S15_SELF_SCAN` (the record-time self-scan) is an existing measurement-only arm — unsound to ship,
+since a genuine VA alias would go unreplayed. Removing it deletes a whole poison population, so the
+cycle delta prices a replay end-to-end, including the squashed younger instructions that M0's window
+cannot see:
+
+| | default | self-scan off |
+|---|---|---|
+| cycles | 13,580,000 | **13,460,000 (−0.88 %)** |
+| replay events | 19,757 | 8,650 |
+
+**120,000 cy / 11,107 events = 10.8 cycles per replay, end to end** — against M0's window figure of
+9.15. The two methods agree within 15 %, which is the first time in this campaign that a census
+number converted to cycles at face value (L3 3-5×, L4 step-2 ∞, W1a ~40× over). **It converted
+because this census counted cycles, not events.** Total cost of the phenomenon:
+19,757 × 10.8 ≈ **213,000 cy = 1.57 % of the boot** — that is the ceiling for Block M *entire*.
+
+⚠️ **Trap paid for again, in one flip:** `S15_SELF_SCAN` exists in BOTH `rob.veryl` and
+`load_queue.veryl` and the comment says they are flip-coupled. Flipping only `rob.veryl`'s gave a
+**bit-identical** boot — because L3.3 shipped `LQ_REAL=1` and the ROB's copy is dead code. Useful
+confirmation of L3.3's claim; a wasted run all the same.
+
+### M1c — what the self-scan poisons ARE (buckets 74-77, `load_queue.veryl` outputs)
+
+The 0.88 % looked like a precision problem, so it was asked the L3.2d question — when the self-scan
+fires, did it decide PA-to-PA or fall back to the 13-bit page-offset approximation?
+
+| self-scan poisons, N=1 boot | |
+|---|---|
+| fired | **7,627** |
+| ...decided **PA-to-PA** | **7,378 (96.7 %)** |
+| ...decided by the approximation (no PA pair) | **249 (3.3 %)** |
+| ...PA attribution failures (`pa[11:0] != va[11:0]`), load side / store side | **0 / 0** |
+
+Two conclusions, and they point opposite ways:
+
+1. **Precision is dead here too.** Only 249 poisons ride the approximation; a better address supply
+   is worth 249 × 10.8 ≈ 2.7 k cycles = **0.02 %**. That is the third precision measurement in this
+   campaign and the third zero.
+2. 🎯 **The other 7,378 are REAL physical overlaps between an executed load and an older in-flight
+   store whose VAs differ — genuine VA aliases.** The attribution check confirms both PAs belong to
+   their own access (L3.2d's `lsr_v_q && lsr_rob_idx_q == cdb.rob_idx` gate holds, 0 failures), so
+   this is not a stale-address artefact. These loads really did read bytes an older uncommitted store
+   owns, and **the store-to-load forward network could not serve them because it is keyed on VA**
+   (`o_store_fwdable` + the alu_wrap byte merge compare full VAs; the self-scan's own S16 exemption
+   is exactly "a full-VA overlap was forwarded, so only the alias case still poisons").
+
+⚠️ So `S15_SELF_SCAN=0` is genuinely unsound, as its comment says — its −0.88 % is **not bankable**,
+and a boot passing without the scan proves nothing (those 7,378 stale reads simply did not happen to
+kill this kernel).
+
+### Where that leaves the block
+
+| lever | measured ceiling | verdict |
+|---|---|---|
+| (a) dependence prediction | **0.13 %** (global arm: **−0.66 %**) | **DEAD — do not build** |
+| (b) selective replay | **0.58 %** (refetch half) … ~0.8 % with the squash waste | alive; large build (re-issue from the LQ, dependent re-wakeup, a ROB that does not squash) |
+| (c) disambiguation precision | **0.02 %** (249 events) | **DEAD** (third zero) |
+| (d) **PA-keyed store→load forwarding** | **~0.6 %** (7,627 events × 10.8 cy), sound | alive; it is also the endpoint L3 named — "fold forwarding into one SQ CAM" |
+
+Block M's ceiling *entire* is **1.57 %**, and (b) and (d) are complementary rather than additive:
+(d) deletes 39 % of the replay events at the source, (b) makes whatever remains cheaper.
+
+**(d) is the recommended next build.** It is sound, its population is measured, and it is the one
+item on the modern-LSQ list this machine still does not have: the byte merge lives in `alu_wrap` at
+AGU time, where only the VA exists, so the work is to move (or mirror) it to the stage that holds
+`lsr_paddr_q` and `sh_store_pa` — the same PA pair the disambiguation scans already use.
+
+⚠️ Both remaining levers are worth under 1 %. For comparison, the post-Block-W re-census above still
+has `lsr`→**`lane0` at 705,559 cy = 5.2 %** unbuilt, and `storeamo` ineligible-on-slot-1 at
+1,600,337 cy. Pick this block for structural completeness (the reason L3 shipped), not for cycles.
+
+
+
 ## Block W — WIDTH. The machine is ~1-wide, and that caps everything above (2026-08-15)
 
 **Why this block exists.** With F/S/L/R all shipped, an architecture-level review asked what is

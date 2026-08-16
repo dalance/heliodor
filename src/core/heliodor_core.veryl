@@ -206,7 +206,7 @@ pub module heliodor_core #(
     o_dbg_viol_exact_cnt : output logic<32>, // violations a full-width compare also finds
     o_dbg_viol_pgx_cnt   : output logic<32>, // violations from the VM page-cross blanket
     o_dbg_st_resolve_cnt : output logic<32>, // store resolves (violation denominator)
-    o_dbg_lw_cause       : output logic<32> [60], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
+    o_dbg_lw_cause       : output logic<32> [80], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
     o_dbg_viol_store_cnt : output logic<32>, // store-resolve scan events
     o_dbg_viol_self_cnt  : output logic<32>, // S15 record-time self-scan events
     // M9 diag: ALU operand observation (verify base.pc passthrough)
@@ -6388,6 +6388,10 @@ pub module heliodor_core #(
     var lq_dbg_exact_cnt   : logic<32>;
     var lq_dbg_saved_cnt   : logic<32>;
     var lq_dbg_invnopa_cnt : logic<32>;
+    var lq_self_fire       : logic    ; // M1: a self-scan poison fired this cycle
+    var lq_self_nopa       : logic    ; // M1: ...decided by the approximation, not a PA pair
+    var lq_self_pamis      : logic    ; // M1: ...decided PA-to-PA with a load PA that is not the load's
+    var lq_self_spamis     : logic    ; // M1: ...decided PA-to-PA with a store PA that is not the store's
     var lq_poison_head   : logic    ;
     var lq_poison_head1  : logic    ;
 
@@ -6750,6 +6754,10 @@ pub module heliodor_core #(
         o_dbg_lq_exact_cnt : lq_dbg_exact_cnt   ,
         o_dbg_lq_saved_cnt : lq_dbg_saved_cnt   ,
         o_dbg_lq_invnopa_cnt: lq_dbg_invnopa_cnt,
+        o_dbg_self_fire     : lq_self_fire      , // M1
+        o_dbg_self_nopa     : lq_self_nopa      ,
+        o_dbg_self_pamis    : lq_self_pamis     ,
+        o_dbg_self_spamis   : lq_self_spamis    ,
     );
 
     // ============================================================
@@ -11726,7 +11734,49 @@ pub module heliodor_core #(
     let rw_n       : logic<2> = ({1'b0, rw_blk_no2} as 2) + ({1'b0, rw_blk_elig} as 2) + ({1'b0, rw_blk_res} as 2);
     let rw_1wide   : logic    = rename_fire && !rename_fire2;
     let rw_sole    : logic    = rw_1wide && rw_n == 2'd1;
-    var lw_cause_cnt: logic<32> [60];
+    var lw_cause_cnt: logic<32> [80];
+    // ------------------------------------------------------------------
+    // M0 census: what does a commit-time load replay actually COST? (2026-08-16)
+    //
+    // The recovery model is pre-OoO — a poisoned load redirects and refetches
+    // itself and everything younger. Block M's two levers (a dependence
+    // predictor that avoids the speculation, a selective replay that cheapens
+    // the recovery) are both worth exactly the cycles this event burns, and
+    // that number has never been measured: the published figures are EVENT
+    // COUNTS, and this campaign has been wrong 3x about converting a count
+    // into cycles. So measure the cycles directly.
+    //
+    // Method: open a window at the replay redirect, latch the load's PC, and
+    // close it when that PC commits again. The elapsed cycles ARE the recovery
+    // cost of one event (refetch + re-rename + re-issue + re-execute + the
+    // re-do of everything younger that was squashed with it). A trap inside
+    // the window would charge the handler to the load, so a trap closes the
+    // window into its own bucket; a runaway window is capped.
+    //
+    // The 256-entry 1-bit table is a LOAD WAIT TABLE (Alpha 21264) built as an
+    // observer: index by load PC, set on replay, and report on the next replay
+    // whether the PC was already known. That hit rate is the coverage ceiling
+    // of the cheapest possible dependence predictor — measured before building
+    // it, per the L3.2d "run the new policy without authority" rule.
+    // ------------------------------------------------------------------
+    const MRP_CAP: logic<32> = 32'd2048; // runaway-window bound (cycles)
+    var mrp_open_q: logic     ; // a replay window is open
+    var mrp_pc_q  : logic<64> ; // the replayed load's PC
+    var mrp_len_q : logic<32> ; // cycles this window has been open
+    var mrp_prev_q: logic<64> ; // PC of the PREVIOUS replay (consecutive-repeat test)
+    // M0b: split the window into the half a SELECTIVE replay would delete (the
+    // refetch: redirect → the same PC arrives at rename again) and the half it
+    // would still pay (re-issue → re-execute → commit). Only the first half is
+    // the lever's prize, so measure it instead of assuming it.
+    var mrp_seen_q: logic     ; // the replayed load has been re-renamed
+    var mrp_tab_q : logic     [256]; // the observer load-wait table
+    let mrp_idx   : logic<8>  = c_pc[9:2];
+    let mrp_hit   : logic     = mrp_tab_q[mrp_idx]; // dynamic index: comb read only, never in always_ff
+    let mrp_refetch: logic    = (rename_fire && dec_op.pc == mrp_pc_q) || (rename_fire2 && dec_op2.pc == mrp_pc_q);
+    let mrp_open  : logic     = commit_load_replay && !mrp_open_q;
+    let mrp_close : logic     = mrp_open_q && rob_commit_ack && c_pc == mrp_pc_q;
+    let mrp_trap  : logic     = mrp_open_q && !mrp_close && commit_trap;
+    let mrp_cap   : logic     = mrp_open_q && !mrp_close && !mrp_trap && mrp_len_q >= MRP_CAP;
     // DBG_CENSUS: master gate for this whole diagnostic-counter block (the Phase-8 M0
     // perf counters + the L3 replay counter + the 28-bucket L4 census). Every one of
     // them drives an o_dbg_* port that reaches the heliodor_soc / heliodor_soc_smp TOP
@@ -11749,8 +11799,16 @@ pub module heliodor_core #(
             commit0_cnt       = 32'd0;
             load_wait_cnt     = 32'd0;
             load_replay_cnt   = 32'd0;
-            for c in 0..60 {
+            for c in 0..80 {
                 lw_cause_cnt[c] = 32'd0;
+            }
+            mrp_open_q        = 1'b0;
+            mrp_pc_q          = 64'd0;
+            mrp_len_q         = 32'd0;
+            mrp_prev_q        = 64'd0;
+            mrp_seen_q        = 1'b0;
+            for t in 0..256 {
+                mrp_tab_q[t] = 1'b0;
             }
         } else if DBG_CENSUS {
             if commit_load_replay {
@@ -11984,6 +12042,64 @@ pub module heliodor_core #(
             }
             if wf_do_push {
                 lw_cause_cnt[59] = lw_cause_cnt[59] + 32'd1;
+            }
+            // ── M0 replay-cost census (buckets 60-71) ──
+            if mrp_open {
+                mrp_open_q      = 1'b1;
+                mrp_pc_q        = c_pc;
+                mrp_len_q       = 32'd0;
+                mrp_prev_q      = c_pc;
+                mrp_seen_q      = 1'b0;
+                lw_cause_cnt[61] = lw_cause_cnt[61] + 32'd1;                        // events (deduped)
+                lw_cause_cnt[62] = lw_cause_cnt[62] + ({24'd0, rob_size} as 32);    // squash volume proxy
+                mrp_tab_q[mrp_idx] = 1'b1;
+                if mrp_hit {
+                    lw_cause_cnt[63] = lw_cause_cnt[63] + 32'd1;                    // load-wait-table hit = predictable
+                }
+                if c_pc == mrp_prev_q {
+                    lw_cause_cnt[69] = lw_cause_cnt[69] + 32'd1;                    // same PC as the previous replay
+                }
+            } else if mrp_open_q {
+                mrp_len_q        = mrp_len_q + 32'd1;
+                lw_cause_cnt[60] = lw_cause_cnt[60] + 32'd1;                        // total recovery cycles
+                if commit_load_replay {
+                    lw_cause_cnt[70] = lw_cause_cnt[70] + 32'd1;                    // re-poisoned inside the window
+                }
+                if !mrp_seen_q && mrp_refetch {
+                    mrp_seen_q       = 1'b1;
+                    lw_cause_cnt[72] = lw_cause_cnt[72] + mrp_len_q;                // REFETCH half (selective replay deletes this)
+                    lw_cause_cnt[73] = lw_cause_cnt[73] + 32'd1;                    // windows where the refetch was observed
+                }
+                if mrp_close {
+                    mrp_open_q       = 1'b0;
+                    lw_cause_cnt[64] = lw_cause_cnt[64] + 32'd1;                    // closed by the load re-committing
+                    lw_cause_cnt[71] = lw_cause_cnt[71] + mrp_len_q;                // cycles from CLEAN windows only
+                    if mrp_len_q >: lw_cause_cnt[67] {
+                        lw_cause_cnt[67] = mrp_len_q;                               // worst clean window
+                    }
+                } else if mrp_trap {
+                    mrp_open_q       = 1'b0;
+                    lw_cause_cnt[65] = lw_cause_cnt[65] + 32'd1;                    // a trap intervened
+                } else if mrp_cap {
+                    mrp_open_q       = 1'b0;
+                    lw_cause_cnt[66] = lw_cause_cnt[66] + 32'd1;                    // runaway, abandoned
+                }
+            }
+            if commit_amo_replay {
+                lw_cause_cnt[68] = lw_cause_cnt[68] + 32'd1;                        // the AMO sibling, for context
+            }
+            // M1: is there a SOUND version of the 0.88 % the self-scan costs?
+            if lq_self_fire {
+                lw_cause_cnt[74] = lw_cause_cnt[74] + 32'd1;                        // self-scan poisons
+            }
+            if lq_self_nopa {
+                lw_cause_cnt[75] = lw_cause_cnt[75] + 32'd1;                        // ...raised WITHOUT a PA pair (approximation only)
+            }
+            if lq_self_pamis {
+                lw_cause_cnt[76] = lw_cause_cnt[76] + 32'd1;                        // ...decided with a load PA that is not the load's
+            }
+            if lq_self_spamis {
+                lw_cause_cnt[77] = lw_cause_cnt[77] + 32'd1;                        // ...decided with a store PA that is not the store's
             }
             if !rob_commit_ack {
                 commit0_cnt = commit0_cnt + 32'd1;
