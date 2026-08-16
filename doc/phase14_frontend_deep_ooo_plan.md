@@ -1453,8 +1453,10 @@ Two things make the exemption sound rather than plausible, and both were added a
 (of 16,556) on cycles where `sf_rob_mask` reads 0; the SAME question asked INSIDE the load queue,
 where the mask is a port read, reports **0**. Two readers of one combinational signal, same cycle,
 different answers — so it is a sampling artefact rather than 3 unserved loads, and the interlock the
-LQ actually decides with is the one reading 0. Verilator (SV NBA) is the arbiter and must be run
-before this ships.
+LQ actually decides with is the one reading 0. **Verilator arbitrated: the N=1 boot PASSES under SV
+NBA at `$finish` 134 ms** (default 135.75 ms), i.e. the improvement is real under proper NBA
+semantics and the suppression does not break the boot on the reference simulator. The disagreement
+itself is a Veryl-sim scheduling detail worth a separate look, not an RTL hole.
 
 ### M2b — the PA key itself is worth **exactly zero**
 
@@ -1480,8 +1482,9 @@ a spurious replay is invisible to every correctness test and only shows up in cy
 | **N=2 SMP boot** | `01165200` 18,240,000 | **`011567a0` 18,180,000** | **−0.33 %** |
 | dhrystone | 237,827 / instret 264,834 | **237,827 / 264,834** | bit-exact |
 | coremark | 404,355 / instret 374,357 | **404,355 / 374,357** | bit-exact |
-| litmus N=4 | `003c6cc0` | *(running)* | |
+| **litmus N=4** | `003c6cc0` | **`003c6cc0` pass=1** | **cycle-identical** |
 | N=4 SMP boot | `01985340` 26,760,000 | *(running)* | |
+| **Verilator NBA, N=1 boot** | 135.75 ms = 13,575,874 | **134 ms, PASSED** | reproduces under SV NBA |
 
 The two microbenchmarks being **bit-exact** is the load-bearing check, not a null result: they run
 bare, and the whole change is gated on `i_conservative` (Sv39 active). A change that moved them would
