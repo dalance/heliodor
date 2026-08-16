@@ -1140,15 +1140,16 @@ back, as predicted.
 **New default baselines**: N=1 `cy=00cf36e0` / N=2 `cy=01165200` / N=4 `cy=01985340` /
 litmus N=2 `cy=002e6300` / litmus N=4 `cy=003c6cc0` / dhrystone 237,827 / instret 264,834 / 252/0.
 
-**Verilator NBA cross-check - 3/4 landed, all PASS.** Its exact counts also confirm the
-10,000-cycle quantisation of every Veryl harness number:
+**Verilator NBA cross-check: 4/4 PASS**, every one built from scratch. Its exact counts also
+confirm the 10,000-cycle quantisation of every Veryl harness number — each lands inside the bucket
+the Veryl sim reported:
 
 | | Verilator (exact) | Veryl sim (quantised) |
 |---|---|---|
 | N=1 Linux boot | **PASSED, cy=13,575,874** | 13,580,000 ok |
 | N=2 SMP Linux boot | **PASSED, cy=18,233,239** | 18,240,000 ok |
 | litmus N=4 | **PASSED, cy=3,952,044** | 3,960,000 ok |
-| N=4 SMP Linux boot | still running (-O1 build, hours) | 26,760,000 |
+| N=4 SMP Linux boot | **PASSED, cy=26,750,722** | 26,760,000 ok |
 
 The litmus N=4 figure 3,952,044 is **the same number to the cycle as the pre-L3 Block-W run** - the
 RVWMO battery is bit-identical under the new structure, on the NBA semantics that matter.
