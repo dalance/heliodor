@@ -1483,8 +1483,28 @@ a spurious replay is invisible to every correctness test and only shows up in cy
 | dhrystone | 237,827 / instret 264,834 | **237,827 / 264,834** | bit-exact |
 | coremark | 404,355 / instret 374,357 | **404,355 / 374,357** | bit-exact |
 | **litmus N=4** | `003c6cc0` | **`003c6cc0` pass=1** | **cycle-identical** |
-| N=4 SMP boot | `01985340` 26,760,000 | *(running)* | |
+| **N=4 SMP boot** | `01985340` 26,760,000 | **`019d3540` 27,080,000 pass=1** | ⚠️ **+1.20 %** |
 | **Verilator NBA, N=1 boot** | 135.75 ms = 13,575,874 | **134 ms, PASSED** | reproduces under SV NBA |
+| **Verilator NBA, N=2 boot** | 182.3 ms = 18,233,239 | **182 ms, PASSED** | (ms resolution cannot see 0.33 %) |
+| **Verilator NBA, litmus N=4** | cy = 3,952,044 | **cy = 3,952,044, PASSED** | **exact same cycle** |
+
+⚠️ **This is not a free win, and the shape says so: −1.03 % / −0.33 % / +1.20 % is monotone in hart
+count.** The Veryl simulator is deterministic (same RTL + same image ⇒ same cycle count), so the N=4
+figure is exact, not run-to-run noise; the "±1M band" in this document is about drift ACROSS changes,
+not repeats. The natural hypothesis — untested, and labelled as such — is that a commit-time replay
+was acting as an accidental **backoff**: the poisoned load and everything younger were thrown away
+and re-run later, which under 4-hart contention reduces pressure on a contended line. Removing it
+lets those loads proceed and bounce lines instead. That is the same shape L3.3 measured (+1.21 % at
+N=4, 0 % at N=1) for a different coherence-correctness fix, and the mirror image of P9.3.B's
+contended-atomic result.
+
+Deciding what to do with that is a ship decision, not a measurement:
+
+- **at 1** the machine is right (it stops replaying loads that were correct), 1 % faster per core,
+  1.2 % slower at 4 harts;
+- **at 0** it keeps a latent over-poisoning bug that costs ~8,600 spurious full replays per N=1 boot.
+
+Both arms are gated and fold cleanly, so this can be parked either way.
 
 The two microbenchmarks being **bit-exact** is the load-bearing check, not a null result: they run
 bare, and the whole change is gated on `i_conservative` (Sv39 active). A change that moved them would
