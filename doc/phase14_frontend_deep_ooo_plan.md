@@ -1172,6 +1172,54 @@ synthesis removes them. Deleting them from the source would buy zero gates and w
 precedent). The duplication is source-level only, and source-level duplication that a const can fold
 is exactly what the campaign's DEAD-scaffold discipline asks for.
 
+## NEXT BLOCK — memory dependence prediction + selective replay: hand-off for a clean context
+
+Written to be self-contained, the way the L3 hand-off was. Start here.
+
+### Where the machine is now
+
+Block L3 shipped (`633a74f`): loads have a **first-class age-ordered queue**
+(`src/core/load_queue.veryl`, a peer of the ROB), allocated at dispatch, freed at commit, holding
+`{rob_idx, done, va, pa, pa_valid, size, poison}` per entry, and it is the authority for the
+commit-side load poison. High-water occupancy on a Linux boot is **16 of 32**. The ROB shadow arrays
+still exist in source as the `LQ_REAL=0` fallback but are absent from the shipped netlist.
+
+**Recovery is still the pre-OoO model.** A poisoned load sets `o_commit_load_poison`; the core turns
+that into `commit_load_replay` — a **full redirect + refetch of that load and everything younger**
+(`heliodor_core.veryl`, search `commit_load_replay`). Nothing replays selectively, and nothing
+predicts. That is the gap this block is about, and it is the last item on the modern-OoO list that
+the memory system actually owns.
+
+### What the L3 measurements already settled — do NOT re-derive
+
+1. **The conservative poisons are mostly REAL.** L3.2d put an exact PA compare next to the
+   approximate one and let it run a full boot: of ~19.5 k poisons, the exact test would avoid **63**
+   (0.35 %). So the population is not full of false positives waiting to be filtered — *making
+   disambiguation more precise is a dead lever, and it has been measured twice now* (L3.1: 0.41 %
+   ceiling; L3.2d: 0.35 % of poisons).
+2. Therefore the two live levers are **(a) don't speculate into the conflict** (a dependence
+   predictor) and **(b) make the recovery cheaper** (selective replay). They attack different halves
+   of the same event and can be built independently.
+3. **Volumes need re-censusing.** The 19,539 poisons / 16,496 replays figures are from the
+   *pre-Block-W* N=1 boot (14.6 M cycles). The default is now 13.58 M cycles with a 32 KB L1I, 2-wide
+   rename for control ops and the PA-exact scans. Re-measure before sizing anything.
+4. **The queue is the place to hang both.** A dependence predictor needs "which store did this load
+   conflict with, last time" keyed by load PC; selective replay needs "re-execute exactly this entry"
+   — and the LQ entry is the only structure that now knows both the load's identity and its address.
+
+### The campaign rule that applies hardest here
+
+⚠️ **A stall/event census tells you WHERE, never HOW MUCH.** The tally so far: L3 over-predicted by
+3-5x, L4 step-2 by infinity (7.14 % bucket → 0 cycles), W1a by ~40x (8.3 % → 0.21 %). Price every
+increment by **building it DEAD and flipping it**, never by multiplying an event count by a cost
+band. And for a policy change, remember the trick L3.2d used: run the new policy's decision logic
+alongside the old one with the old one still in authority — the machine cannot move, and the queue
+reports what the new policy *would* have decided. That turns a flip-and-pray into an observation.
+
+⚠️ **Boot/litmus `cy` is quantised to 10,000** by the harness poll loop. Only dhrystone/coremark
+report exact cycles. For per-cycle equality claims, put a checker in the RTL (that is how L3 proved
+~50 M cycles of set equality).
+
 ### What is already built — do NOT rebuild
 
 | piece | state |
