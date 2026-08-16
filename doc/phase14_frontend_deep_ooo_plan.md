@@ -1096,6 +1096,40 @@ that carry a PA, against a compare that today matches nothing at all under Sv39.
 116 cycles above. That ships for correctness, not for cycles, and the remaining hole is a known,
 quantified follow-up rather than an unknown.
 
+### 🏁 L3.3 SHIPPED — `LQ_REAL = 1` + `LQ_PA_EXACT = 1` are the default path
+
+User decision, 2026-08-16: ship both. `LQ_CHECK` goes to **0** at the same time — the equivalence
+counters and their 3 x 32 compares are verification hardware, and a scaffold is only dead if the
+const can fold it (the `CAPB_BUDGET` lesson). The equivalence itself is already proven, at `=0` and
+at `=1`, over ~50 M simulated cycles; and with the exact arm on, the shadow is *supposed* to
+disagree, so the check has done its job.
+
+| gate | baseline | shipped (both = 1) |
+|---|---|---|
+| `veryl test` | 252/0 | **252/0** |
+| dhrystone (exact) | 237,827 cy / instret 264,834 | **237,827 / 264,834 — bit-identical** |
+| N=1 Linux boot | `cy=00cf36e0` | **`cy=00cf36e0`** |
+| litmus N=2 | `cy=002e6300` | **`cy=002e6300`** |
+| litmus N=4 | `cy=003c6cc0` | **`cy=003c6cc0`** |
+| **N=2 SMP Linux boot** | `cy=01154090` = 18,170,000 | **`cy=01165200` = 18,240,000 — +0.39 %** |
+
+**The one number that moved is N=2, and it moved the direction the correctness fix predicts.**
+Everything single-hart and every bare-mode test is unchanged; the SMP boot — the only gate with
+remote invalidates AND translation on — costs 0.39 %. The only mechanism in this change that can
+*add* poisons is the CoRR arm: it now compares PA to PA, so it starts catching remote-write cases
+that the VA-vs-PA compare silently missed, and each catch is a replay. N=1 has no invalidates at all
+and is unchanged, which is consistent with that reading. (Not separately instrumented — `LQ_CHECK`
+is off in the shipped build — so this is the coherent explanation, not a measured attribution.)
+
+**That is the trade this block ships: 0.39 % of a 2-hart boot for a memory-model hole that has been
+open since VM support landed.** The precision half that L3.2d measured dead buys nothing back, as
+predicted.
+
+**New default baselines**: N=1 `cy=00cf36e0` · N=2 `cy=01165200` · litmus N=2 `cy=002e6300` ·
+litmus N=4 `cy=003c6cc0` · dhrystone 237,827 / 264,834 · 252/0. N=4 SMP boot and the Verilator NBA
+cross-check are NOT re-run yet — both are milestone-level gates and this change touches coherence,
+so they are the next thing to run before this is called finished.
+
 ### What is already built — do NOT rebuild
 
 | piece | state |
