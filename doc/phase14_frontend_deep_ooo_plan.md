@@ -1504,7 +1504,21 @@ Deciding what to do with that is a ship decision, not a measurement:
   1.2 % slower at 4 harts;
 - **at 0** it keeps a latent over-poisoning bug that costs ~8,600 spurious full replays per N=1 boot.
 
-Both arms are gated and fold cleanly, so this can be parked either way.
+### 🏁🚢 M2a SHIPPED — `P1_SERVED = 1` is the default path (user decision, 2026-08-17)
+
+Correctness of the mechanism wins over the 4-hart cycle count: the machine no longer replays loads
+whose bytes the forward network had already delivered. The `=0` arm stays in-tree as a fold-away
+fallback with its numbers recorded above, exactly like `ATOMIC_SQ=0` and `LQ_REAL=0`.
+
+**New default baselines** (supersede the post-L3.3 set): N=1 `cy=00cd1400` · N=2 `cy=011567a0` ·
+**N=4 `cy=019d3540`** · litmus N=4 `cy=003c6cc0` (unchanged) · dhrystone 237,827 / instret 264,834 ·
+coremark 404,355 / instret 374,357 · suite 252/0.
+
+⚠️ **The +1.20 % at N=4 is now a standing item, not a closed one.** It is the first measured case in
+this campaign of a *correctness* fix paying a contention tax, and the backoff hypothesis above is
+untested. If a later block wants those cycles back, the question to ask is not "undo M2a" but "what
+is the replay doing for contention that nothing else does" — the same question P9.3.B answered from
+the other side.
 
 The two microbenchmarks being **bit-exact** is the load-bearing check, not a null result: they run
 bare, and the whole change is gated on `i_conservative` (Sv39 active). A change that moved them would
