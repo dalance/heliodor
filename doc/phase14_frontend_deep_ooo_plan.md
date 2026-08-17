@@ -1527,12 +1527,12 @@ the other side.
 
 ### ▶️ SUPERSEDED — this was the Block-M hand-off; **read the `Block T` section below instead**
 
-⚠️ Candidate 1 below (`lsr`→`lane0` port contention) is **wrong and has been retired**. Block T
-measured it: the bucket's label was stale and `truelane0` is **0** — it is LSR turnaround, not lane
-contention. Block T built the fix (`LSR_B2B`), measured it at −2.16 % on the N=1 boot, and parked it
-at 0 on a wrong-value kernel oops. Everything actionable is in **"Block T — LSR TURNAROUND"**.
-Candidate 2 (the N=4 contention tax) is still open. The rest of this section is still accurate as a
-description of Block M's end state.
+⚠️ **Both candidates below are closed.** Candidate 1 (`lsr`→`lane0` port contention) was a **stale
+label**: `truelane0` measures **0**, and the whole 705,559-cycle bucket is LSR turnaround. Block T
+built the fix (`LSR_B2B` + `LSR_B2B_SBQ`) and **shipped it** — N=1 −1.93 %, N=4 −5.28 %.
+Candidate 2 (the N=4 contention tax) is **retired by that same flip**: N=4 now lands at 25,650,000,
+below even the pre-M2a 26,760,000. The baselines quoted below are superseded; see the Block T
+results table. The rest of this section is still accurate as a description of Block M's end state.
 
 **Block M is finished and shipped.** Everything above is measured, not planned. Read this section
 and the `Block M` heading above it; nothing else in this document is required to resume.
@@ -1636,7 +1636,13 @@ earlier, straight into that window. **The turnaround bubble was the accidental p
 ⚠️ Restricting it to the *colliding line* is NOT enough — measured: the same oops returns 8,590
 cycles later, so the window is wider than the head entry's line.
 
-### Results — `LSR_B2B=1` + `LSR_B2B_SBQ=1`
+### 🚢 Results — `LSR_B2B=1` + `LSR_B2B_SBQ=1`, **SHIPPED as the default path**
+
+**User decision, 2026-08-18: ship.** `LSR_B2B=1` is now the default; `LSR_B2B=0` stays as the
+fold-away arm with its numbers in the middle column. **New default baselines** (supersede the
+post-M2a set): N=1 `cy=00c91c60` · N=2 `cy=01142f20` · **N=4 `cy=01876350`** ·
+litmus N=2 `cy=002e3bf0` / N=4 `cy=003b3440` · dhrystone 235,828 / instret 264,834 ·
+coremark 394,551 / instret 374,357 · suite 252/0.
 
 | gate | `LSR_B2B=0` (baseline) | `=1`, no SBQ | **`=1` + SBQ** |
 |---|---|---|---|
@@ -1787,6 +1793,54 @@ flip), and a **dcache mis-delivery** (the baseline shows the same `dc=0` on a he
   512-cycle nf blockage never fired in the failing N=2 run. The atomics are not being starved.
 - **`DBG_CENSUS` is cycle-neutral, now verified**: the failing N=2 run is bit-identical with the
   census on and off (`cy=05f5e100 ret0=0352d2d8 ret1=0327c272 trap0=000011fc`).
+
+### ▶️ START HERE NEXT — hand-off for a clean context (2026-08-18)
+
+**Block T is finished and SHIPPED.** Read this section and the `Block T` heading above it; nothing
+else in this document is required to resume.
+
+**State of the machine.** `LSR_B2B=1` + `LSR_B2B_SBQ=1` (`heliodor_core.veryl`) is the default path,
+on top of M2a's `P1_SERVED=1`. Baselines: N=1 `cy=00c91c60` · N=2 `cy=01142f20` · N=4 `cy=01876350` ·
+litmus N=2 `cy=002e3bf0` / N=4 `cy=003b3440` · dhrystone 235,828 / instret 264,834 ·
+coremark 394,551 / instret 374,357 · suite 252/0. Fold-away arms kept at 0 with their numbers
+recorded: `LSR_B2B=0` (the turnaround bubble), `LSR_B2B_MSHR=0` (the same bypass on the MSHR
+Stage-B handoff — **never measured**, 24,383 cycles of population), `B2B_TRACE=0` and
+`NF_STARVE_PROBE=0` (this block's diagnosis probes), `DBG_CENSUS=0` (now an 88-bucket census;
+buckets 80-87 are Block T's).
+
+**What is closed, so nobody re-derives it.** The `lane0` bucket (a stale label; `truelane0` = 0).
+The N=4 contention tax (retired by this flip — N=4 is below even the pre-M2a figure). Four dead
+ends from the N=2 chase: nf-read starvation, PTW-walk steal, dcache mis-delivery, and the
+disambiguation (census-on shows it firing normally at 5,351).
+
+**The candidates, in the order the measurements support:**
+
+1. **Sharpen `LSR_B2B_SBQ`.** It currently blocks the bypass for the WHOLE non-empty-store-buffer
+   window, which is conservative — worth 0.23 pp on the N=1 boot (−2.16 % unguarded vs −1.93 %
+   shipped). The precise hazard is the drain ACK cycle plus however long the array write takes;
+   ⚠️ a same-LINE test is already measured INSUFFICIENT. The honest fix is probably in the dcache:
+   keep a drained entry visible (or stall the demand read) until its write is architecturally
+   readable, rather than papering over it at the capture gate.
+2. **`LSR_B2B_MSHR`** — 24,383 cycles of population, one const away, never flipped.
+3. **The `load_blocks_on_store` bucket** (711,676 cy at the flip) is still undecomposed — the
+   sole-blocker treatment is cheap and this block did not touch it.
+
+**Traps this block paid for, that generalise:**
+
+- 🎯 **A DEAD scaffold written `CONST && sig` does NOT const-fold.** It kept a syntactic edge that
+  closed a comb loop AT DEAD (230/252 `involved in loop`). Only the const-guarded STATEMENT form
+  (`if CONST { … }`) folds — in the SIMULATOR, not just the analyzer. Reusable, and it is why the
+  MEM_PIPE=0 arms of `dmem_ren_m`/`dmem_unc_m`/`dmem_lnext_m` are statement blocks now.
+- 🎯 **A gate on a SHARED port must be qualified by the REQUESTER.** `i_no_walk` driven by
+  "the LSR is occupied" also held off a committing store's walk and wedged the machine completely
+  (LSR residency 42 M of a 45 M run). `lsr_b2b_spec` is that lesson.
+- 🎯 **A bubble can be load-bearing.** The turnaround this block deleted was the only thing keeping
+  loads out of the store-drain window. When a timing change breaks something far away, ask what the
+  removed cycle was protecting before hunting for a logic bug.
+- **Name the instruction before diffing streams.** A 4-deep shift of one register's architectural
+  writes, dumped on the faulting trap, replaced a 5 M-line retire-stream diff and took one run.
+- **Census counters read 0 when `DBG_CENSUS=0`** — that is the gate, not the measurement. Two
+  hypotheses were nearly built on such a zero.
 
 ---
 
