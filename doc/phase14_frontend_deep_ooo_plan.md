@@ -1623,22 +1623,45 @@ existed. Three signals, all const-folded to 0 at `LSR_B2B=0`:
 
 Plus `mmu.veryl`/`dmem_mmu.veryl` gain **`i_no_walk`**: translate off the TLB, never start a walk.
 
-### Results
+### The correctness term the first flip was missing — `LSR_B2B_SBQ`
 
-| gate | `LSR_B2B=0` (shipped) | `LSR_B2B=1` |
-|---|---|---|
-| default suite | 252/0 | **252/0** |
-| **N=1 boot** | 13,440,000 (`00cd1400`) | **13,150,000 (`00c8a730`) = −2.16 %** |
-| bucket 13 (`lane0`) | 694,599 | **0** |
-| **dhrystone** | 237,827 | **235,804 = −0.85 %** (instret 264,834, bit-exact) |
-| **coremark** | 404,355 | **394,546 = −2.43 %** (instret 374,357, bit-exact) |
-| litmus N=2 | 3,038,976 (`002e6300`) | 3,029,232 (`002e3bf0`) |
-| **N=2 SMP boot** | 18,180,000 (`011567a0`) PASS | ❌ **HANGS** at the 100 M cap |
+The first flip passed every single-hart gate and **oopsed the N=2 boot on a NULL store**. The chase
+is recorded below; the answer is one term. A committed store drains out of the store buffer through
+the dcache's SECOND write port, and the drain ack POPS the entry — from that cycle the store is in
+**no forward net at all** (`sb_cnt` has dropped) while the array write is only just landing. The
+load's Stage-A read is where `DCACHE_SYNC_READ` actually reads the data, and b2b moves it one cycle
+earlier, straight into that window. **The turnaround bubble was the accidental protection.**
 
-**The flip is PARKED at 0** pending the N=2 failure. Both microbenchmarks moving while `instret`
-stays bit-exact is the load-bearing check that the mechanism fires on the real instruction stream.
+`LSR_B2B_SBQ` holds the back-to-back capture off while the store buffer is non-empty.
+⚠️ Restricting it to the *colliding line* is NOT enough — measured: the same oops returns 8,590
+cycles later, so the window is wider than the head entry's line.
 
-### The N=2 failure, as far as it is characterised
+### Results — `LSR_B2B=1` + `LSR_B2B_SBQ=1`
+
+| gate | `LSR_B2B=0` (baseline) | `=1`, no SBQ | **`=1` + SBQ** |
+|---|---|---|---|
+| default suite | 252/0 | 252/0 | **252/0** |
+| **N=1 boot** | 13,440,000 (`00cd1400`) | 13,150,000 (−2.16 %) | **13,180,000 (`00c91c60`) = −1.93 %** |
+| bucket 13 (`lane0`) | 694,599 | 0 | — |
+| **dhrystone** | 237,827 | 235,804 | **235,828 = −0.84 %** (instret 264,834, bit-exact) |
+| **coremark** | 404,355 | 394,546 | **394,551 = −2.42 %** (instret 374,357, bit-exact) |
+| litmus N=2 | 3,038,976 (`002e6300`) | 3,029,232 | **3,029,232 (`002e3bf0`)** |
+| **litmus N=4** | 3,960,000 (`003c6cc0`) | — | **3,880,000 (`003b3440`) PASS = −2.02 %** |
+| **N=2 SMP boot** | 18,180,000 (`011567a0`) | ❌ kernel oops | **18,100,000 (`01142f20`) PASS = −0.44 %** |
+| **N=4 SMP boot** | 27,080,000 (`019d3540`) | — | **25,650,000 (`01876350`) PASS = −5.28 %** |
+
+**The correctness term costs 0.23 pp of the 2.16 %** on the N=1 boot and nothing measurable on
+either microbenchmark. Both microbenchmarks moving while `instret` stays bit-exact is the
+load-bearing check that the mechanism fires on the real instruction stream.
+
+🎯 **The gain GROWS with hart count, and N=4 is where it is largest** — the opposite of the L3.3 and
+M2a pattern, where the SMP arms paid a tax (L3.3 +1.21 %, M2a +1.20 %). Block T at N=4 (25,650,000)
+is below even the **pre-M2a** N=4 figure (26,760,000, −4.15 %), so **it more than retires the
+standing +1.20 % N=4 item** the Block-M hand-off left open. That reads as the turnaround bubble
+costing most where the memory system is busiest: with four harts contending, a load path that
+accepts one load per two cycles wastes the cycles the bus contention already made scarce.
+
+### How the N=2 failure was chased — SOLVED, kept because the method is the point
 
 `pass=0` at the 100 M cap, `h0_pc=ffffffff800df804`, `h1_pc=0000000000000558`, `ret0/ret1` both
 climbing, `trap0=0x11fc`, **`trap1=0`**. The firmware is linked at **PA 0** (`linux_boot_fw.ld`,
@@ -1714,12 +1737,25 @@ compare) and the committed-store-buffer net (`sbf*`, PA compare), so 00 means *n
 earlier, not a dcache delivery bug.** The load slips past a store whose bytes neither net yet
 supplies, and nothing replays it.
 
-**Next step:** re-run the flip with `DBG_CENSUS=1` and read `load_viol` / `load_replay` on hart0 —
-if the disambiguation never fires for this load, the hole is in the LQ record vs store-resolve
-window; if it fires and the replay does not fix it, the hole is in the recovery. Then split
-`stld_fwd_mask` into its `sf*` and `sbf*` halves at `B2B_WATCH_PC` to say which net should have had
-it. ⚠️ Do NOT read the `hart0: loadreplay=… loadviol=…` line from a `DBG_CENSUS=0` run — those
-counters are census-gated and print 0 regardless.
+**What closed it** was a cycle window (`B2B_WIN_LO`/`HI`) printing the SB drain against the LSR
+control, and it took one run:
+
+```
+cy 6913584-93  sbcnt=1 swen=1 saddr=80cac1c0 sack=0     <- drain requesting for 10 cycles
+cy 6913589     the store to ...1e8 commits: fast=0 sbpush=1
+cy 6913594     sack=1  AND  cap=1                       <- drain ack and the load's Stage-A read
+cy 6913595     drv=1 lsrpa=80cac1e8 -> dc=0             <- the load delivers the pre-drain line
+```
+
+The drain ack pops the SB entry, so `sb_cnt` is 0 by the time the load completes and the `sbf*` net
+has nothing; the ROB net has nothing either because that store already committed. Hence
+`LSR_B2B_SBQ` above. Two things that did NOT work, so nobody re-tries them: gating on
+`!m_store_wr_busy` (bit-identical failure — that signal is not set here) and gating on the colliding
+LINE only (the oops returns 8,590 cycles later).
+
+⚠️ Do NOT read the `hart0: loadreplay=… loadviol=…` line from a `DBG_CENSUS=0` run — those counters
+are census-gated and print 0 regardless. With the census on they read 2,289 / 5,351 at the flip, i.e.
+the disambiguation was working normally; it was never the problem.
 
 Three things are already excluded and must not be re-derived: dcache **nf-read starvation** (a
 512-cycle-blockage probe never fired in the failing run), a **PTW-walk steal** (`mmuwalk` = 0 at the

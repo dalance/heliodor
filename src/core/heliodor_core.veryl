@@ -8456,6 +8456,11 @@ pub module heliodor_core #(
     const B2B_TRACE   : bit      = 0;
     const B2B_TRACE_RD: logic<5> = 5'd15; // a5 — the base register in the oops frame
     const B2B_WATCH_PC: logic<64> = 64'hffffffff8001592a; // c.ld a5,104(s0) — the load that returns 0
+    const B2B_WATCH_VA: logic<64> = 64'hffffffe000cac1e8; // that load's VA on the failing iteration
+    const B2B_WATCH_ROB: logic<5> = 5'd25; // ROB entry of the store that resolved 10 cy earlier
+    const B2B_WATCH_PA: logic<64> = 64'h0000000080cac1e8; // the same location, physical
+    const B2B_WIN_LO  : logic<32> = 32'd6913584; // cycle window around the failure
+    const B2B_WIN_HI  : logic<32> = 32'd6913600;
     // Free-running cycle stamp for the traces. Gated so that with both traces off it is
     // reset-only → DCE, rather than a live 32-bit counter with no readers.
     var trc_cy_q: logic<32>;
@@ -8498,11 +8503,6 @@ pub module heliodor_core #(
                 bt_pc2_q = bt_pc1_q; bt_d2_q = bt_d1_q; bt_cy2_q = bt_cy1_q;
                 bt_pc1_q = bt_pc0_q; bt_d1_q = bt_d0_q; bt_cy1_q = bt_cy0_q;
                 bt_pc0_q = c2_pc    ; bt_d0_q = c2_result_data; bt_cy0_q = trc_cy_q;
-            }
-            // …and watch the producing load itself, at its Stage-B completion, so the
-            // 0 can be attributed: dcache data vs the store->load byte network.
-            if lsr_complete && lsr_pc_q == B2B_WATCH_PC {
-                $display("B2BLOAD cy=%d pc=%h va=%h pa=%h f3=%d fwdmask=%h fwddata=%h dc=%h dcnext=%h", trc_cy_q, lsr_pc_q, lsr_vaddr_q, lsr_paddr_q, lsr_funct3_q, stld_fwd_mask, stld_fwd_data, dcache_rdata, dcache_rdata_next);
             }
             if commit_trap && trap_cause == 64'd15 && !bt_shown_q {
                 bt_shown_q = 1'b1;
@@ -9831,6 +9831,9 @@ pub module heliodor_core #(
         if sf1_v ? sf1_b : sbf1_b, if sf0_v ? sf0_b : sbf0_b
     };
     assign sf_rob_mask = {sf7_v, sf6_v, sf5_v, sf4_v, sf3_v, sf2_v, sf1_v, sf0_v};
+    // Block T diagnosis: the committed-store-buffer half, so a probe can say WHICH
+    // net should have covered a load (stld_fwd_mask is the OR of the two).
+    let sbf_fwd_mask: logic<8> = {sbf7_v, sbf6_v, sbf5_v, sbf4_v, sbf3_v, sbf2_v, sbf1_v, sbf0_v};
     assign stld_fwd_mask = {
         sf7_v || sbf7_v, sf6_v || sbf6_v, sf5_v || sbf5_v, sf4_v || sbf4_v,
         sf3_v || sbf3_v, sf2_v || sbf2_v, sf1_v || sbf1_v, sf0_v || sbf0_v
@@ -11206,6 +11209,52 @@ pub module heliodor_core #(
     // an uncached read does not re-trigger its side effect on the re-drive.
     assign lsr_complete = lsr_v_q && (lsr_fault || lsr_read_done) && !lsr_squashed && (if lsr_to_lane1 ? 1'b1 : lsr_lane0_free);
     assign lsr_lane1_fire = lsr_complete && lsr_to_lane1;
+    // Block T diagnosis: the forwardable-store bitmap as a packed word, so one
+    // $display shows whether the resolving store's ROB entry is even a candidate.
+    var ls_fwd_pack: logic<32>;
+    always_comb {
+        for i in 0..32 {
+            ls_fwd_pack[i] = ls_fwd[i];
+        }
+    }
+    // ── Block T diagnosis: attribute the value a watched load completes with ──────
+    // Placed here (not with B2B_TRACE up at the commit traces) so the committed-SB
+    // state is in scope: sbf_fwd_mask / sb_cnt / lsr_sb_ovl are all defined above
+    // this point. The matched pair for pc=8001592a showed the =0 arm completing off
+    // fwdmask=ff while the dcache dword is 0 — so the question is which of the two
+    // nets goes silent at =1. Print-only, DEAD at B2B_TRACE=0.
+    always_ff (clk, rst) {
+        if_reset {} else if B2B_TRACE {
+            if lsr_complete && lsr_pc_q == B2B_WATCH_PC {
+                $display("B2BLOAD cy=%d pa=%h fwd=%h rob=%h sb=%h dc=%h sbcnt=%d rob_idx=%d head=%d ldage=%d fwdpack=%h", trc_cy_q, lsr_paddr_q, stld_fwd_mask, sf_rob_mask, sbf_fwd_mask, dcache_rdata, sb_cnt, lsr_rob_idx_q, rob_head_idx, stld_fwd_age, ls_fwd_pack);
+                $display("B2BLOAD  ent[%d] fwd=%b addr=%h f3=%d data=%h", B2B_WATCH_ROB, ls_fwd[B2B_WATCH_ROB], ls_addr[B2B_WATCH_ROB], ls_f3[B2B_WATCH_ROB], ls_data[B2B_WATCH_ROB]);
+            }
+            // The other half of the timeline: every STORE that resolves its address
+            // into the watched dword. Ordering the two prints answers the question
+            // outright — a store resolving AFTER the load executed must poison it
+            // (so a silent scan is the bug), while one resolving BEFORE must have
+            // been in the sf* forward net (so a silent net is the bug).
+            if cdb.valid && cdb.is_store && cdb.store_addr[63:3] == B2B_WATCH_VA[63:3] {
+                $display("B2BSTORE cy=%d va=%h rob=%d f3=%d data=%h", trc_cy_q, cdb.store_addr, cdb.rob_idx, cdb.store_funct3, cdb.store_data);
+            }
+            // …and the COMMIT side: when does a store to the watched dword actually
+            // leave the machine, and by which path? Under VM `fast_store` is 0, so a
+            // kernel store never enters the committed store buffer — it drains
+            // through the M-stage write instead, and the window between commit and
+            // that write is invisible to every forward net.
+            // Cycle-by-cycle window across the failure, so the SB drain and the
+            // load's Stage-A read can be lined up against each other.
+            if trc_cy_q >= B2B_WIN_LO && trc_cy_q <= B2B_WIN_HI {
+                $display("B2BWIN cy=%d sbcnt=%d swen=%b saddr=%h sack=%b wen=%b wpa=%h cap=%b drv=%b v=%b lsrpa=%h stall=%b", trc_cy_q, sb_cnt, sdrain_swen, sdrain_saddr, dc_sdrain_ack, dmem_wen_m, dmem_pa_m, lsr_capture, lsr_drive, lsr_v_q, lsr_paddr_q, dcache_stall);
+            }
+            if commit_store_fire && c_store_eff_pa[63:3] == B2B_WATCH_PA[63:3] {
+                $display("B2BCMT cy=%d pa=%h fast=%b sbpush=%b stdrive=%b dcstall=%b ack=%b mwr=%b", trc_cy_q, c_store_eff_pa, fast_store, sb_push, store_drive, dcache_stall, rob_commit_ack, m_store_wr_busy);
+            }
+            if lq_rec1_valid && alu_cdb2.store_addr[63:3] == B2B_WATCH_VA[63:3] {
+                $display("B2BREC cy=%d va=%h rob=%d pav=%b", trc_cy_q, alu_cdb2.store_addr, alu_cdb2.rob_idx, lq_rec1_pa_v);
+            }
+        }
+    }
     // ── Block T: back-to-back LSR capture (2026-08-17) ──────────────────────────
     // The LSR is a SINGLE entry and lsr_capture required !lsr_v_q, so the next load
     // could only latch the cycle AFTER the incumbent left — one load every TWO
@@ -11269,9 +11318,25 @@ pub module heliodor_core #(
                 lsr_b2b_spec = 1'b1;
             }
         }
+        // ⚠️ LSR_B2B_SBQ is CORRECTNESS, not tuning. A committed store drains out of
+        // the store buffer through the dcache's SECOND write port, and the drain ack
+        // pops the entry — from that cycle the store is in NO forward net (sb_cnt has
+        // dropped) while the array write is only just landing. The load's Stage-A read
+        // is where DCACHE_SYNC_READ actually reads the data, and b2b moves it one
+        // cycle earlier, straight into that collision. Measured: the drain of line
+        // 80cac1c0 is acked on the exact cycle the load to 80cac1e8 captures, and the
+        // load completes with the pre-drain 0 -> a NULL-pointer kernel oops.
+        // The old turnaround bubble was the accidental protection.
+        // Holding b2b off for the whole non-empty-SB window restores the healthy
+        // trajectory exactly (hart1 reaches the kernel; trap0/trap1 match the baseline
+        // at the same cycle). ⚠️ Restricting it to the COLLIDING LINE is NOT enough —
+        // measured: the same oops returns 8,590 cycles later. The window is wider than
+        // the head entry's line, so the conservative form is what this arm ships.
+        // Loop-free: sdrain_swen is register-derived (imem_aw_grant || !sb_empty).
+        const LSR_B2B_SBQ: bit = 1;
         lsr_b2b_free = 1'b0;
         if LSR_B2B {
-            if lsr_b2b_spec && lsr_complete {
+            if lsr_b2b_spec && lsr_complete && (!LSR_B2B_SBQ || !sdrain_swen) {
                 lsr_b2b_free = 1'b1;
             }
         }
