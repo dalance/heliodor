@@ -1487,6 +1487,11 @@ a spurious replay is invisible to every correctness test and only shows up in cy
 | **Verilator NBA, N=1 boot** | 135.75 ms = 13,575,874 | **134 ms, PASSED** | reproduces under SV NBA |
 | **Verilator NBA, N=2 boot** | 182.3 ms = 18,233,239 | **182 ms, PASSED** | (ms resolution cannot see 0.33 %) |
 | **Verilator NBA, litmus N=4** | cy = 3,952,044 | **cy = 3,952,044, PASSED** | **exact same cycle** |
+| **Verilator NBA, N=4 boot** | — | **cy = 27,073,544, PASSED** | inside the Veryl sim's 27,080,000 bucket |
+
+**Verilator NBA cross-check: 4/4, all PASS** — the same standard R3, L3.3 and Block W shipped on. The
+N=4 regression is confirmed by the reference simulator, not an artefact of the Veryl sim: 27,073,544
+lands exactly inside the 10,000-cycle bucket the Veryl harness reports as `019d3540`.
 
 ⚠️ **This is not a free win, and the shape says so: −1.03 % / −0.33 % / +1.20 % is monotone in hart
 count.** The Veryl simulator is deterministic (same RTL + same image ⇒ same cycle count), so the N=4
