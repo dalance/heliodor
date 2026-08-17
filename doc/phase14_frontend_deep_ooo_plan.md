@@ -1673,11 +1673,57 @@ passing is coverage luck, not evidence of correctness.** hart0's own first four 
 unremarkable (`#0 cause=0xc` instruction page fault at `epc=80001040`, `to_s=1`; `#1-#3 cause=9`
 ECALL-from-S = SBI, all at `epc=ffffffff80004008`).
 
-**Next step:** this is the shape `feedback_diff_retire_streams` is for — dump the full retire stream
-(PC + written value) at `LSR_B2B=0` and `=1` and `cmp` for the first divergence, rather than
-hypothesising about which dcache case mis-delivers. Two things are already excluded and must not be
-re-derived: dcache **nf-read starvation** (a 512-cycle-blockage probe never fired in the failing run)
-and a **PTW-walk steal** (`mmuwalk` = 0 at the flip).
+### The failing instruction, and what actually goes wrong
+
+A full retire-stream diff was not needed. `B2B_TRACE` (`heliodor_core.veryl`, DEAD at 0) keeps a
+4-deep shift of the architectural writes to one register and dumps it on the first cause-15 commit;
+one run named the producer:
+
+```
+B2BFAULT cy=6913607 pc=ffffffff8001592e cause=0f stval=0
+  rd-w0 pc=ffffffff8001592a d=0000000000000000     <- wrote a5 = 0
+  rd-w1 pc=ffffffff80015922 d=0000000000000001
+```
+
+Disassembling the 2-hart kernel image at those PAs:
+
+```
+80015922: c.li  a5, 1
+80015924: c.sw  a5, 0(s0)
+80015926: sw    x0, 112(s0)
+8001592a: c.ld  a5, 104(s0)      <- returns 0; should return a pointer
+8001592c: c.li  a4, 1
+8001592e: amoadd.w x0, a4, (a5)  <- faults on a5 = 0
+```
+
+A second probe (`B2B_WATCH_PC`) prints that load's Stage-B completion — its PA, the merged
+store->load mask/data, and the dcache dword. The **matched pair is decisive**:
+
+| arm | pa | `fwdmask` | `fwddata` | `dc` |
+|---|---|---|---|---|
+| `=0` (passing) | `80cac0e8` | **ff** | **ffffffff80a85028** | `0` |
+| `=1` (failing) | `80cac1e8` | **00** | `0` | `0` |
+
+**The dcache returning 0 is NORMAL here** — the store that writes the pointer has not reached the
+cache yet, and in the baseline the forward network covers the load completely (`ff`). At the flip the
+same load gets `fwdmask=00`: **the store->load forward network did not fire for a store it must
+cover**, so the load committed the stale line. `stld_fwd_mask` is the OR of the ROB net (`sf*`, VA
+compare) and the committed-store-buffer net (`sbf*`, PA compare), so 00 means *neither* half had it.
+
+⇒ **Block T's failure is a forwarding / memory-ordering hole opened by moving Stage B one cycle
+earlier, not a dcache delivery bug.** The load slips past a store whose bytes neither net yet
+supplies, and nothing replays it.
+
+**Next step:** re-run the flip with `DBG_CENSUS=1` and read `load_viol` / `load_replay` on hart0 —
+if the disambiguation never fires for this load, the hole is in the LQ record vs store-resolve
+window; if it fires and the replay does not fix it, the hole is in the recovery. Then split
+`stld_fwd_mask` into its `sf*` and `sbf*` halves at `B2B_WATCH_PC` to say which net should have had
+it. ⚠️ Do NOT read the `hart0: loadreplay=… loadviol=…` line from a `DBG_CENSUS=0` run — those
+counters are census-gated and print 0 regardless.
+
+Three things are already excluded and must not be re-derived: dcache **nf-read starvation** (a
+512-cycle-blockage probe never fired in the failing run), a **PTW-walk steal** (`mmuwalk` = 0 at the
+flip), and a **dcache mis-delivery** (the baseline shows the same `dc=0` on a healthy load).
 
 ### Traps this block paid for
 
