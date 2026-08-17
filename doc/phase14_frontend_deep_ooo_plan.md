@@ -1525,7 +1525,14 @@ untested. If a later block wants those cycles back, the question to ask is not "
 is the replay doing for contention that nothing else does" — the same question P9.3.B answered from
 the other side.
 
-### ▶️ START HERE NEXT — hand-off for a clean context (2026-08-17)
+### ▶️ SUPERSEDED — this was the Block-M hand-off; **read the `Block T` section below instead**
+
+⚠️ Candidate 1 below (`lsr`→`lane0` port contention) is **wrong and has been retired**. Block T
+measured it: the bucket's label was stale and `truelane0` is **0** — it is LSR turnaround, not lane
+contention. Block T built the fix (`LSR_B2B`), measured it at −2.16 % on the N=1 boot, and parked it
+at 0 on a wrong-value kernel oops. Everything actionable is in **"Block T — LSR TURNAROUND"**.
+Candidate 2 (the N=4 contention tax) is still open. The rest of this section is still accurate as a
+description of Block M's end state.
 
 **Block M is finished and shipped.** Everything above is measured, not planned. Read this section
 and the `Block M` heading above it; nothing else in this document is required to resume.
@@ -1575,7 +1582,131 @@ NOT the canary failing: the boot's instruction count is timing-dependent through
 and the unsound `S15_SELF_SCAN=0` arm lands at 10,428,245 — the same ballpark — for the same reason.
 `instret` is only a bit-exact canary for changes that do not move cycles.
 
+---
 
+## Block T — LSR TURNAROUND. The `lane0` bucket was never lane contention (2026-08-17)
+
+**The hand-off named `lsr`→`lane0` (705,559 cy = 5.2 % of the N=1 boot) as the largest unbuilt item.
+The name is wrong, and measuring it first is what made the block cheap.** `lsr_complete`'s lane term
+is `if lsr_to_lane1 ? 1'b1 : lsr_lane0_free`, and since L4 step-1.5 `lsr_to_lane1` is 1 for every
+non-fault non-FP load — so an ordinary load never waits for a lane at all. Bucket 13's label ("read
+done, waiting for writeback lane 0") predates that routing change by a whole block.
+
+Split it (buckets 80-87, `DBG_CENSUS`), N=1 boot at the shipped default `cy=00cd1400`:
+
+| bucket | cycles | |
+|---|---|---|
+| **`b2b`** — slot frees AND a load is ready to take it | **694,599** | the whole of bucket 13 |
+| **`truelane0`** — genuinely waiting for lane 0 (an FP load) | **0** | the label, priced |
+| `mshrb2b` — the same bubble on the MSHR Stage-B handoff | 24,383 | |
+| `freeidle` — slot frees, nothing ready | 934,749 | |
+| `busy` — a load ready, incumbent genuinely busy (not this block's) | 712,255 | |
+| captures / completes / LSR residency | 1,657,365 / 1,605,390 / 2,723,972 | |
+
+So the 705,559 is **pure turnaround**: `lsr_capture` required `!lsr_v_q`, a REGISTER, so the next
+load could only latch the cycle after the incumbent left — one load per two cycles even when every
+load hits. §L4 step-1 had already found this ("the hand-off bubble", 4.89 %) and recorded that the
+one-line bypass "is not available — the loop is real". It is available; the loop is mostly phantom.
+
+### The build — `LSR_B2B` (`heliodor_core.veryl`)
+
+The datapath was already pipelined for it: at `DCACHE_SYNC_READ` the SRAM read happens at **Stage A**
+(`i_ren_r` → `rd1_index` → `rd1_data_*`/`rt1_*`) and Stage B only DELIVERS off the registered
+`dhit_*_q`, so the incumbent needs no dcache resource on its completing cycle. Nothing had ever
+exercised a same-cycle Stage-A read + Stage-B delivery, because `lsr_capture` (`!lsr_v_q`) and
+`lsr_drive` (`lsr_v_q`) were mutually exclusive by construction — which is exactly why the bubble
+existed. Three signals, all const-folded to 0 at `LSR_B2B=0`:
+
+- `lsr_b2b_ok` — the incumbent is b2b-eligible (**registers only**: not faulting, not uncached).
+- `lsr_b2b_spec` — …and THIS cycle's dmem request is the speculative Stage-A load.
+- `lsr_b2b_free` — …and it actually completes (`lsr_complete`) → `lsr_capture` fires.
+
+Plus `mmu.veryl`/`dmem_mmu.veryl` gain **`i_no_walk`**: translate off the TLB, never start a walk.
+
+### Results
+
+| gate | `LSR_B2B=0` (shipped) | `LSR_B2B=1` |
+|---|---|---|
+| default suite | 252/0 | **252/0** |
+| **N=1 boot** | 13,440,000 (`00cd1400`) | **13,150,000 (`00c8a730`) = −2.16 %** |
+| bucket 13 (`lane0`) | 694,599 | **0** |
+| **dhrystone** | 237,827 | **235,804 = −0.85 %** (instret 264,834, bit-exact) |
+| **coremark** | 404,355 | **394,546 = −2.43 %** (instret 374,357, bit-exact) |
+| litmus N=2 | 3,038,976 (`002e6300`) | 3,029,232 (`002e3bf0`) |
+| **N=2 SMP boot** | 18,180,000 (`011567a0`) PASS | ❌ **HANGS** at the 100 M cap |
+
+**The flip is PARKED at 0** pending the N=2 failure. Both microbenchmarks moving while `instret`
+stays bit-exact is the load-bearing check that the mechanism fires on the real instruction stream.
+
+### The N=2 failure, as far as it is characterised
+
+`pass=0` at the 100 M cap, `h0_pc=ffffffff800df804`, `h1_pc=0000000000000558`, `ret0/ret1` both
+climbing, `trap0=0x11fc`, **`trap1=0`**. The firmware is linked at **PA 0** (`linux_boot_fw.ld`,
+16 K ROM) and `0x558` is `_secondary_park`: this firmware deliberately parks hart 1+ in M-mode and
+wakes them only on the SBI HSM `HART_START` MSIP (see its own comment — the kernel `hart_lottery`
+path was already known-unreliable here). **`trap1=0` therefore says hart1 never received an MSIP at
+all**, i.e. the kernel on hart0 never completed `HART_START(1)`. hart0 meanwhile sits in
+`0x800df7f4`-`0x800df844`, which the healthy baseline shows is the *secondary/idle* loop.
+
+**The UART console names it outright — and it is NOT an SMP bug.** Running the failing N=2
+unfiltered (the harness echoes UART; only the probe grep was hiding it) shows the kernel booting
+normally through PLIC / timer / SLUB / mount-cache and then:
+
+```
+Unable to handle kernel NULL pointer dereference at virtual address 0000000000000000
+Oops [#1]
+CPU: 0 PID: 2 Comm: kthreadd   Not tainted 5.15.0+ #51
+epc : ffffffff8001592e   ra : ffffffff80015922
+a5  : 0000000000000000
+status: 0000000200000120  badaddr: 0000000000000000  cause: 000000000000000f
+```
+
+Cause 15 = store/AMO page fault, `badaddr=0`: a **base register that should hold a pointer is 0**.
+This is a **wrong-value bug, not a hang and not a coherence failure** — the "hang" is just the
+post-oops idle loop, and `HART_START` is never reached because the kernel died first.
+
+⚠️ **Do not chase SMP.** `trap1=0` for the whole 100 M cycles and `h1_pc` never leaves `0x504`-`0x558`:
+hart1 stays in the firmware's own M-mode park loop and **executes no kernel code at all**. The
+failing execution is effectively single-hart on hart0 — the N=2 test differs from the passing N=1
+test by its *kernel image* (SMP=y, different code paths), not by hart interaction. **The N=1 boot
+passing is coverage luck, not evidence of correctness.** hart0's own first four traps are
+unremarkable (`#0 cause=0xc` instruction page fault at `epc=80001040`, `to_s=1`; `#1-#3 cause=9`
+ECALL-from-S = SBI, all at `epc=ffffffff80004008`).
+
+**Next step:** this is the shape `feedback_diff_retire_streams` is for — dump the full retire stream
+(PC + written value) at `LSR_B2B=0` and `=1` and `cmp` for the first divergence, rather than
+hypothesising about which dcache case mis-delivers. Two things are already excluded and must not be
+re-derived: dcache **nf-read starvation** (a 512-cycle-blockage probe never fired in the failing run)
+and a **PTW-walk steal** (`mmuwalk` = 0 at the flip).
+
+### Traps this block paid for
+
+- 🎯 **A DEAD scaffold must const-fold, and `CONST && sig` does NOT.** `assign lsr_b2b_free =
+  LSR_B2B && lsr_complete;` keeps the syntactic edge at 0 and closed a comb loop the simulator
+  reported **at DEAD** — 230/252 failed. The **const-guarded STATEMENT block** (`if LSR_B2B { … }`)
+  does fold, in the simulator as well as the analyzer. That is the same trick `dcache.veryl` §13.7
+  uses to DCE a read port, and it is now proven for loop-breaking too. The three MEM_PIPE=0 arms of
+  `dmem_ren_m`/`dmem_unc_m`/`dmem_lnext_m` (which MENTION `lsr_capture`) needed the same treatment.
+- **§L4 step-1's "the loop is real" was half right.** The loop it saw closed through the dead
+  `SB_PA_REG=0` arm of `c_store_eff_pa` and the dead MEM_PIPE=0 arms — foldable. But there IS a real
+  one, and it is why `core_dmem_ren` is opened with `lsr_b2b_ok` (registers) rather than
+  `lsr_complete`: `core_dmem_ren` → `mem_req` → mmu `o_valid` → `o_dmem_addr` → PMP `acc_deny` →
+  `dmu_dmem_wstrb` → the dcache write path → `o_stall` → `lsr_read_done` → `lsr_complete`.
+- **Opening the translate early started walks for loads that could not capture.** The walk then owns
+  the dmem port and `lsr_drive` needs `dmem_mmu_idle`, so it holds the very incumbent whose slot was
+  about to free: `mmuwalk` went 2 → **7,969,797** and the boot died. Hence `i_no_walk`.
+- 🎯 **A shared-port gate must be qualified by the REQUESTER.** The first `i_no_walk` was
+  `lsr_b2b_ok` alone, so it also held off a *committing store's* walk — the store could not retire,
+  the LSR could not drain, and the machine wedged completely (LSR residency **42,115,934** of a 45 M
+  run, `instret` 3.5 M). `lsr_b2b_spec` adds `!core_dmem_wen && !mmu_walk_inflight && !sc_walk_drive
+  && !vu_mem_active && iss_is_plain_load`.
+- **Refuted, so nobody re-derives it:** dcache **nf-read starvation**. Demand (`i_ren_r`) outranks
+  the non-folded read absolutely, and b2b makes demand assertable every cycle — but a probe for a
+  512-cycle nf blockage never fired in the failing N=2 run. The atomics are not being starved.
+- **`DBG_CENSUS` is cycle-neutral, now verified**: the failing N=2 run is bit-identical with the
+  census on and off (`cy=05f5e100 ret0=0352d2d8 ret1=0327c272 trap0=000011fc`).
+
+---
 
 ## Block W — WIDTH. The machine is ~1-wide, and that caps everything above (2026-08-15)
 
