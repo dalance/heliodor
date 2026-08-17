@@ -206,7 +206,7 @@ pub module heliodor_core #(
     o_dbg_viol_exact_cnt : output logic<32>, // violations a full-width compare also finds
     o_dbg_viol_pgx_cnt   : output logic<32>, // violations from the VM page-cross blanket
     o_dbg_st_resolve_cnt : output logic<32>, // store resolves (violation denominator)
-    o_dbg_lw_cause       : output logic<32> [80], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
+    o_dbg_lw_cause       : output logic<32> [88], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
     o_dbg_viol_store_cnt : output logic<32>, // store-resolve scan events
     o_dbg_viol_self_cnt  : output logic<32>, // S15 record-time self-scan events
     // M9 diag: ALU operand observation (verify base.pc passthrough)
@@ -4316,6 +4316,11 @@ pub module heliodor_core #(
     var lsr_drive      : logic           ; // Stage-B owns the dcache read port
     var lsr_complete   : logic           ; // Stage-B writeback fires (→ u_lsu.i_valid)
     var lsr_dc_load_next: logic          ; // Stage-B misaligned cross-line fill
+    // Block T: the LSR frees its slot THIS cycle, so a new load may latch into it
+    // now instead of a cycle later (see LSR_B2B below). Assigned with lsr_complete.
+    var lsr_b2b_free   : logic           ; // slot frees this cycle (back-to-back capture)
+    var lsr_b2b_ok     : logic           ; // ...and the incumbent is a b2b-eligible load (REGISTERS ONLY)
+    var lsr_b2b_spec   : logic           ; // ...and THIS cycle's dmem request is the speculative Stage-A load
     // Phase 1 step-1.5 (flexible writeback lane — recover the block-on-issue IPC):
     // a non-fault, non-FP plain load writes back on LANE 1 (the pipe-1 alu_cdb2
     // port, which carries result + is_load LQ-record), so its Stage-B writeback no
@@ -9113,7 +9118,20 @@ pub module heliodor_core #(
     // NOT start a fresh PTW walk that would steal the port from the LSR's Stage-B
     // read (mmu_walk_inflight would drop dmem_mmu_idle → lsr_drive). The actual
     // Stage-B dcache read is driven by lsr_drive at the dcache i_ren mux.
-    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q && !lsr_v_q) || sc_walk_drive || (mmu_walk_inflight && !sb_walk_ovl));
+    // Block T: the new load must have its PA on the cycle it latches, so the
+    // translate has to be open while the LSR is still occupied. It is opened with
+    // lsr_b2b_ok — REGISTERS ONLY, deliberately NOT lsr_b2b_free/lsr_complete: this
+    // signal reaches the dmem MMU, and the MMU's live outputs (dmu_dmem_wstrb via
+    // acc_deny, dmu_dmem_addr) reach the dcache write path and so o_stall. Making it
+    // depend on lsr_complete would close a REAL comb loop, not a foldable one.
+    // lsr_b2b_ok is therefore a SUPERSET of the capture condition: the translate may
+    // run on cycles the incumbent does not finish. That is side-effect-free for a TLB
+    // hit; a TLB MISS starts its walk a little earlier than before (the walk then
+    // holds the incumbent through dmem_mmu_idle — the hazard the old !lsr_v_q term
+    // was written for, now traded for the turnaround). Faulting and UNCACHED
+    // incumbents opt out: an MMIO read must not have its i_ren withdrawn mid-bus
+    // transaction, and lsr_unc_q/lsr_fault are registers, so the opt-out is free.
+    let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q && (!lsr_v_q || lsr_b2b_spec)) || sc_walk_drive || (mmu_walk_inflight && !sb_walk_ovl));
     let core_dmem_wstrb: logic<8> = if vu_mem_active ? vu_mem_wstrb : if store_drive ? st_wstrb : 8'd0;
     // P9.3: mark the AMO/LR data read so the dcache serves it only from an
     // OWNED (E/M) line — an S hit or a miss raises an RFO fill first (the
@@ -9923,6 +9941,11 @@ pub module heliodor_core #(
         i_wdata     : core_dmem_wdata,
         i_wen       : core_dmem_wen  ,
         i_ren       : core_dmem_ren  ,
+        // Block T: the extra Stage-A translate opened over an occupied LSR is
+        // SPECULATIVE — translate off the TLB, never start a walk (see mmu.veryl's
+        // i_no_walk; a walk started here owns the dmem port and holds the very
+        // incumbent whose slot was about to free). Registers only → loop-free.
+        i_no_walk   : lsr_b2b_spec   ,
         i_wstrb     : core_dmem_wstrb,
         o_rdata     : dmem_mmu_rdata ,
         o_dmem_addr : dmu_dmem_addr  ,
@@ -10167,9 +10190,12 @@ pub module heliodor_core #(
     // read is suppressed, so there is no miss to wait on, and including dcache_stall
     // here would close a comb loop: i_ren depends on lsr_capture). Requires the LSR
     // free (!lsr_v_q) — block-on-issue.
-    assign lsr_capture = iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block
+    // Split out the LSR-free test so the census below can count the cycles on which
+    // EVERYTHING BUT the free slot was ready — that population is the Block T prize.
+    let lsr_cap_terms: logic = iq_issue_valid && !iss_is_div && !dmem_mmu_busy && !load_walk_block
         && !fpu_cdb.valid && !mshr_cdb.valid && !load_blocks_on_store && iss_is_plain_load
-        && !lsr_v_q && !replay_q && !redirect_fire && !early_redir_fire_q;
+        && !replay_q && !redirect_fire && !early_redir_fire_q;
+    assign lsr_capture = lsr_cap_terms && (!lsr_v_q || lsr_b2b_free);
     // Stage B: own the dcache read port. Mirror replay_drive's port arbitration
     // (yield to a committing store's write and to any in-flight MMU walk); a faulting
     // load needs no read (it completes from the latched fault).
@@ -10591,9 +10617,27 @@ pub module heliodor_core #(
     // AMO read that is no longer in its access window (amo_fetched_q dropped). The
     // genuine access cycle (and a sustained miss-fill) keeps amo_fetched_q=1.
     let m_amo_tail   : logic     = m_amo_read_q && !amo_fetched_q;
-    let dmem_ren_m   : logic     = if asq_dr_go_r ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live)) : (dmu_dmem_ren && !lsr_capture);
-    let dmem_unc_m   : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_unc_q) : (dc_uncached && !lsr_capture);
-    let dmem_lnext_m : logic     = if MEM_PIPE ? (if ptw_dc_active ? 1'b0 : m_lnext_q) : (dc_load_next && !dc_uncached && !lsr_capture);
+    // ⚠️ Const-guarded STATEMENT blocks, not `if MEM_PIPE ? … : …` lets. The three
+    // MEM_PIPE=0 arms below MENTION lsr_capture, and a ternary keeps that syntactic
+    // edge even though MEM_PIPE is 1 — which is enough to close a comb loop once
+    // Block T makes lsr_capture depend on lsr_complete: lsr_capture → (dead arm) →
+    // i_ren → dcache → o_stall → lsr_read_done → lsr_complete. Only the statement
+    // form drops the dead arm (dcache.veryl §13.7 uses the same trick to DCE a read
+    // port). At MEM_PIPE=1 these are the identical expressions.
+    var dmem_ren_m   : logic;
+    var dmem_unc_m   : logic;
+    var dmem_lnext_m : logic;
+    always_comb {
+        if MEM_PIPE {
+            dmem_ren_m   = if asq_dr_go_r ? 1'b1 : (if ptw_dc_active ? ptw_dc_ren : (m_ren_q && !m_amo_tail && !amo_commit_live));
+            dmem_unc_m   = if ptw_dc_active ? 1'b0 : m_unc_q;
+            dmem_lnext_m = if ptw_dc_active ? 1'b0 : m_lnext_q;
+        } else {
+            dmem_ren_m   = if asq_dr_go_r ? 1'b1 : (dmu_dmem_ren && !lsr_capture);
+            dmem_unc_m   = dc_uncached && !lsr_capture;
+            dmem_lnext_m = dc_load_next && !dc_uncached && !lsr_capture;
+        }
+    }
     let dmem_wen_m   : logic     = if asq_dr_go_w ? 1'b1 : if MEM_PIPE ? (if ptw_dc_active ? dmu_ad_wb : (if amo_commit_live ? amo_cwr_eff : m_wen_q)) : dc_i_wen;
     let dmem_wstrb_m : logic<8>  = if asq_dr_go_w ? asq_dr_wstrb : if MEM_PIPE ? (if ptw_dc_active ? (if dmu_ad_wb ? 8'hFF : 8'd0) : (if amo_commit_live ? dmu_dmem_wstrb : m_wstrb_q)) : dmu_dmem_wstrb;
     // CP wall-cut (W2 keystone-unmask): an AMO/SC commit is ALWAYS naturally aligned
@@ -11111,6 +11155,81 @@ pub module heliodor_core #(
     // an uncached read does not re-trigger its side effect on the re-drive.
     assign lsr_complete = lsr_v_q && (lsr_fault || lsr_read_done) && !lsr_squashed && (if lsr_to_lane1 ? 1'b1 : lsr_lane0_free);
     assign lsr_lane1_fire = lsr_complete && lsr_to_lane1;
+    // ── Block T: back-to-back LSR capture (2026-08-17) ──────────────────────────
+    // The LSR is a SINGLE entry and lsr_capture required !lsr_v_q, so the next load
+    // could only latch the cycle AFTER the incumbent left — one load every TWO
+    // cycles even when every load hits in the L1D. The post-Block-W re-census reads
+    // that bubble as 705,559 cy = 5.2 % of the N=1 boot, under a bucket labelled
+    // "waiting for writeback lane 0". That label went stale at L4 step-1.5: with
+    // lsr_to_lane1 a non-fault non-FP load takes lane 1 UNCONDITIONALLY (the lane
+    // term is a literal 1), so those cycles are not port contention at all — they
+    // are the turnaround of a block-on-issue slot.
+    //
+    // The datapath is already pipelined for the fix. At DCACHE_SYNC_READ the SRAM
+    // read happens at STAGE A (i_ren_r → rd1_index → rd1_data_*/rt1_*) and Stage B
+    // only DELIVERS off the registered dhit_*_q, so the incumbent needs no dcache
+    // resource on its completing cycle: a same-cycle Stage-A read for the NEW load
+    // and the incumbent's Stage-B delivery are disjoint. Nothing tested that
+    // combination before, because lsr_capture (!lsr_v_q) and lsr_drive (lsr_v_q)
+    // were mutually exclusive by construction.
+    //
+    // The completion condition is self-guarding: lsr_b2b_free is lsr_complete, i.e.
+    // "the incumbent is done THIS cycle". Any reason it would still need the port
+    // (an nf read that has not won, a fill, a cross-line phase) holds dcache_stall,
+    // which clears lsr_read_done → lsr_complete → the bypass simply does not fire.
+    //
+    // No comb loop: lsr_b2b_free reaches the dcache only through i_ren_r/i_addr_r
+    // (Stage-A tag+data read), and every consumer of those lands in a flop
+    // (dhit_*_q, rt1_*, rd1_data_*, nf_won_q) — o_stall has no path back.
+    // The always_ff above already ranks lsr_capture ABOVE mshr_cap_b/lsr_complete,
+    // so the entry is simply overwritten and no free-then-refill sequencing is
+    // needed. DEAD at 0: lsr_b2b_free const-folds to 0 → lsr_capture and
+    // core_dmem_ren revert to their !lsr_v_q form, byte-identical.
+    const LSR_B2B     : bit = 0; // capture in the cycle the incumbent completes
+    // The MSHR Stage-B handoff (L4 step-2) frees the slot the same way and pays the
+    // same turnaround. Separate arm: it hands the load to an MSHR entry mid-miss, a
+    // narrower and rarer path than the completion above.
+    const LSR_B2B_MSHR: bit = 0;
+    // ⚠️ Written as a const-guarded STATEMENT block, not `LSR_B2B && lsr_complete`.
+    // A ternary/`&&` form keeps the syntactic edge to lsr_complete even at 0, and
+    // that edge alone closes a comb loop the simulator reports at DEAD: this signal
+    // reaches core_dmem_ren -> dmem_mmu's ptw_req -> dmu_dmem_addr, which the
+    // MEM_PIPE=0 / SB_PA_REG=0 arms of dmem_pa_m and c_store_eff_pa still MENTION,
+    // and those reach store_drive -> lsr_drive -> lsr_complete. Only the statement
+    // form drops the dead arm (the same trick dcache.veryl §13.7 uses to DCE a read
+    // port). 230/252 failed with `involved in loop` before this was written this way.
+    always_comb {
+        lsr_b2b_ok = 1'b0;
+        if LSR_B2B {
+            if lsr_v_q && !lsr_fault && !lsr_unc_q {
+                lsr_b2b_ok = 1'b1;
+            }
+        }
+        // The dmem port is SHARED. lsr_b2b_ok says the incumbent is eligible; it does
+        // NOT say the request on the port this cycle is the speculative load. Both the
+        // extra translate and (critically) i_no_walk must be qualified by the requester,
+        // or i_no_walk holds off a COMMITTING STORE's walk — and the store cannot
+        // retire, the LSR cannot drain, and the machine wedges (measured: LSR residency
+        // 42,115,934 of a 45 M-cycle run, instret 3.5 M, boot never finishes).
+        lsr_b2b_spec = 1'b0;
+        if LSR_B2B {
+            if lsr_b2b_ok && iq_issue_valid && iss_is_plain_load && !core_dmem_wen
+                && !mmu_walk_inflight && !sc_walk_drive && !vu_mem_active {
+                lsr_b2b_spec = 1'b1;
+            }
+        }
+        lsr_b2b_free = 1'b0;
+        if LSR_B2B {
+            if lsr_b2b_spec && lsr_complete {
+                lsr_b2b_free = 1'b1;
+            }
+        }
+        if LSR_B2B_MSHR {
+            if lsr_b2b_spec && mshr_cap_b {
+                lsr_b2b_free = 1'b1;
+            }
+        }
+    }
     always_ff (clk, rst) {
         if_reset {
             lsr_v_q         = 1'b0;
@@ -11151,8 +11270,12 @@ pub module heliodor_core #(
                 // step-2: the missing load has been handed to an MSHR entry — free
                 // the slot NOW so the next load can capture instead of waiting out
                 // the fill. Mutually exclusive with lsr_complete (the handoff only
-                // fires while dcache_stall holds, so lsr_read_done is 0) and with
-                // lsr_capture (which needs !lsr_v_q).
+                // fires while dcache_stall holds, so lsr_read_done is 0). It was also
+                // mutually exclusive with lsr_capture (which needed !lsr_v_q) until
+                // Block T: at LSR_B2B_MSHR=1 a capture may land on the SAME cycle, and
+                // the branch order above is what makes that correct — the handoff has
+                // already read the LSR's registered fields into the MSHR entry, so
+                // overwriting them with the new load loses nothing.
                 lsr_v_q = 1'b0;
             } else if lsr_complete {
                 lsr_v_q = 1'b0;
@@ -11202,9 +11325,12 @@ pub module heliodor_core #(
             // would otherwise do a plain (shared) read/fill of the line the drain is
             // about to RFO. Gated on the ack cycle so a PTW/other owner of dmu_dmem_ren
             // is never suppressed. Constant 0 at ASQ_NOREAD=0.
-            m_ren_q      = dmu_dmem_ren && !lsr_capture && !asq_nr_acc;
-            m_unc_q      = dc_uncached && !lsr_capture;
-            m_lnext_q    = dc_load_next && !dc_uncached && !lsr_capture;
+            // Block T: lsr_b2b_spec is the extra suppression for a Stage-A plain load
+            // that does not capture (see its always_comb). Const-folds to 0 at
+            // LSR_B2B=0 → bit-identical there.
+            m_ren_q      = dmu_dmem_ren && !lsr_capture && !lsr_b2b_spec && !asq_nr_acc;
+            m_unc_q      = dc_uncached && !lsr_capture && !lsr_b2b_spec;
+            m_lnext_q    = dc_load_next && !dc_uncached && !lsr_capture && !lsr_b2b_spec;
             // R3 §7.11: an atomic whose LIVE in-cache write was suppressed because it
             // was diverted into the atomic-SQ must not leave an M-stage write behind
             // either. dc_i_wen still latches here from the same store_drive, so without
@@ -11787,6 +11913,18 @@ pub module heliodor_core #(
     // sub-buckets partition the lsr bucket exactly.
     let lwl       : logic = lw_sole && lwc_lsr;
     let lwl_drive : logic = lwl && lsr_drive;
+    // Block T terms. Bucket 13 above ("waiting for writeback lane 0") is measured at
+    // 705,559 cy, but its label predates L4 step-1.5 — for a non-FP load the lane
+    // term in lsr_complete is a literal 1, so the incumbent is COMPLETING on those
+    // cycles and the waiter is held by nothing but the single-entry slot. Split it:
+    // lwt_b2b is the population LSR_B2B converts into a capture, lwt_lane0 is what
+    // is genuinely waiting for lane 0 (an FP load, the only lane-0 completer left).
+    let lwt_free  : logic = lsr_v_q && lsr_complete;
+    let lwt_b2b   : logic = lwt_free && lsr_cap_terms;
+    let lwt_mshr  : logic = lsr_v_q && !lsr_complete && mshr_cap_b && lsr_cap_terms;
+    let lwt_idle  : logic = lsr_v_q && (lsr_complete || mshr_cap_b) && !lsr_cap_terms;
+    let lwt_busy  : logic = lsr_v_q && !lsr_complete && !mshr_cap_b && lsr_cap_terms;
+    let lwt_lane0 : logic = lwl_drive && !dcache_stall && !lsr_complete;
     // W1 rename-width census terms. rw_have2 / rw_res2 mirror rename_fire2's own
     // conditions exactly, so the three blockers partition the 1-wide cycles.
     let rw_have2   : logic    = fb_count >= 4'd2 || fb_bypass2 || fb_fall;
@@ -11797,7 +11935,7 @@ pub module heliodor_core #(
     let rw_n       : logic<2> = ({1'b0, rw_blk_no2} as 2) + ({1'b0, rw_blk_elig} as 2) + ({1'b0, rw_blk_res} as 2);
     let rw_1wide   : logic    = rename_fire && !rename_fire2;
     let rw_sole    : logic    = rw_1wide && rw_n == 2'd1;
-    var lw_cause_cnt: logic<32> [80];
+    var lw_cause_cnt: logic<32> [88];
     // ------------------------------------------------------------------
     // M0 census: what does a commit-time load replay actually COST? (2026-08-16)
     //
@@ -11862,7 +12000,7 @@ pub module heliodor_core #(
             commit0_cnt       = 32'd0;
             load_wait_cnt     = 32'd0;
             load_replay_cnt   = 32'd0;
-            for c in 0..80 {
+            for c in 0..88 {
                 lw_cause_cnt[c] = 32'd0;
             }
             mrp_open_q        = 1'b0;
@@ -12179,6 +12317,31 @@ pub module heliodor_core #(
             }
             if lq_self_p2 {
                 lw_cause_cnt[79] = lw_cause_cnt[79] + 32'd1;                        // M2: port 2 = an MSHR fill, which the byte net never sees
+            }
+            // ── Block T LSR-turnaround census (buckets 80-87) ──
+            if lwt_b2b {
+                lw_cause_cnt[80] = lw_cause_cnt[80] + 32'd1;                        // LSR_B2B prize: slot frees + a load is ready
+            }
+            if lwt_mshr {
+                lw_cause_cnt[81] = lw_cause_cnt[81] + 32'd1;                        // ...the same, on the MSHR Stage-B handoff
+            }
+            if lwt_idle {
+                lw_cause_cnt[82] = lw_cause_cnt[82] + 32'd1;                        // slot frees, nothing ready to take it
+            }
+            if lwt_busy {
+                lw_cause_cnt[83] = lw_cause_cnt[83] + 32'd1;                        // a load is ready, incumbent genuinely busy (not Block T's)
+            }
+            if lwt_lane0 {
+                lw_cause_cnt[84] = lw_cause_cnt[84] + 32'd1;                        // bucket 13 minus the turnaround = the REAL lane-0 wait (FP)
+            }
+            if lsr_capture {
+                lw_cause_cnt[85] = lw_cause_cnt[85] + 32'd1;                        // loads captured (denominator)
+            }
+            if lwt_free {
+                lw_cause_cnt[86] = lw_cause_cnt[86] + 32'd1;                        // loads completed (denominator)
+            }
+            if lsr_v_q {
+                lw_cause_cnt[87] = lw_cause_cnt[87] + 32'd1;                        // LSR residency
             }
             if !rob_commit_ack {
                 commit0_cnt = commit0_cnt + 32'd1;
