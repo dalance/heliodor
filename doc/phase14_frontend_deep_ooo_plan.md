@@ -1525,6 +1525,47 @@ untested. If a later block wants those cycles back, the question to ask is not "
 is the replay doing for contention that nothing else does" — the same question P9.3.B answered from
 the other side.
 
+### ▶️ START HERE NEXT — hand-off for a clean context (2026-08-17)
+
+**Block M is finished and shipped.** Everything above is measured, not planned. Read this section
+and the `Block M` heading above it; nothing else in this document is required to resume.
+
+**State of the machine.** `P1_SERVED=1` (`load_queue.veryl`) is the default path. Baselines:
+N=1 `cy=00cd1400` · N=2 `cy=011567a0` · N=4 `cy=019d3540` · litmus N=4 `cy=003c6cc0` ·
+dhrystone 237,827 / instret 264,834 · coremark 404,355 / instret 374,357 · suite 252/0 ·
+Verilator NBA 4/4. Fold-away arms kept at 0 with their numbers recorded: `P1_SERVED=0` (the old
+behaviour), `FWD_PA=0` (PA-keyed forwarding — measured worth *exactly zero*), `DBG_CENSUS=0` (the
+80-bucket census, buckets 60-79 are Block M's).
+
+**What is dead, so nobody re-derives it.** Dependence prediction (0.13 % ceiling, global arm
+−0.66 %). Disambiguation precision (three separate zeros: L3.1, L3.2d, M1c). PA-keyed forwarding
+(bit-identical). What survives in this area is **selective replay only**, and M2a cut its own ceiling
+to ~0.3-0.5 % (11,145 replays × ~9.2 cy) for a large build.
+
+**The two candidates, in the order the measurements support:**
+
+1. **`lsr`→`lane0` port contention — 705,559 cy = 5.2 % of the N=1 boot, untouched.** The largest
+   unbuilt item on the post-Block-W map, and structural rather than capacity (W3 proved doubling the
+   L1D does not move it: 705,559 → 708,405). See `lsr_lane0_free` / `lsr_to_lane1`. ⚠️ This is the
+   same lane routing M2a just found a stale assumption in — expect more of them.
+2. **The N=4 contention tax** (+1.20 %, standing item above). Cheaper to *diagnose* than to fix, and
+   a census there costs 90 minutes per run.
+
+**Traps this session paid for, that generalise:**
+
+- 🎯 **Split a multi-port mechanism by port before believing anything about its population.** M2's
+  whole first day went into a design premised on port 0's condition structure while port 0 fires
+  **zero** times; the exemption was missing on port 1. One counter per port would have found it
+  immediately.
+- **"Flip is bit-identical" is a measurement, not a dead end** — it happened three times today and
+  each time the answer was one counter away.
+- **A stale comment is load-bearing.** "bare-only today, kept for symmetry" survived L4 step-1.5 and
+  hid the bug for a whole block.
+- **`instret` is only a canary for changes that do not move cycles.** The boot's stream is
+  timing-dependent through `rdtime`; M2a legitimately moves it by 0.03 %.
+- **Flip-coupled constants exist** (`S15_SELF_SCAN` in both `rob.veryl` and `load_queue.veryl`,
+  `FWD_PA` likewise). Flipping one gives a bit-identical run and wastes a boot.
+
 The two microbenchmarks being **bit-exact** is the load-bearing check, not a null result: they run
 bare, and the whole change is gated on `i_conservative` (Sv39 active). A change that moved them would
 have been firing somewhere it must not.
