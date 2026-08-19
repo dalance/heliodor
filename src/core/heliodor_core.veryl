@@ -8962,7 +8962,76 @@ pub module heliodor_core #(
     // read coexist with the store write on the separate ports.
     // R3 §7.2: a queued atomic is older than any committing store, so no store may
     // drive its write while the queue is occupied (see asq_st_block).
-    let store_drive    : logic     = commit_store_fire && !load_walk_busy && !fast_store && !asq_st_block;
+    // ── Block L1.a (STORE_NOPORT): a PRE-TRANSLATED store needs NOTHING from the
+    // shared dmem port, so it must not take it. ──────────────────────────────────
+    // S6 already established the pattern for BARE mode: a `fast_store` drains via
+    // i_saddr, so it is excluded from store_drive and a load may issue in the same
+    // cycle. Under VM `fast_store` is 0 by construction (it requires !dmem_vm_on), so
+    // EVERY kernel store re-drives the shared MMU at commit — even the ones whose PA
+    // was already produced at execute by the STORE_PRETRANSLATE probe. Enumerate what
+    // such a store still reads off the live port:
+    //   - its PA          → c_store_eff_pa takes the c_pretx_fast arm (registered).
+    //   - its SB push     → sb_vm_ok = c_pretx_fast (registered classifier).
+    //   - its MMIO class  → c_store_mmio from the registered c_store_eff_pa.
+    //   - its faults      → RETIRE_DECOUPLE makes sfault_*_eff = store_fetched_q ?
+    //                       m_*_q : 0, and a pretx store retires in ONE cycle without
+    //                       ever setting store_fetched_q, so they are already 0. The
+    //                       probe (dmem_sprobe_ok) checked W&D + U + PMP-W + backing
+    //                       at execute; D is already set, so no A/D write-back either.
+    //   - its dcache write→ none: sb_elig ⇒ the write-through path is suppressed
+    //                       (dc_i_wen's !sb_vm_live_ok term) and it drains through the
+    //                       SECOND write port (i_saddr) like a fast store.
+    // NOTHING. The port hold is pure fusion, and it is the largest remaining stall
+    // bucket: `store_drive` = 641,637 cy = 4.87 % of the N=1 boot, 91.5 % of the
+    // `store` sole-blocker bucket (plan doc, Block L1). Dropping it frees the SAME
+    // three consumers S6 freed for bare mode — load_blocks_on_store (Stage-A capture),
+    // lsr_drive (Stage-B read), replay_drive — plus store_pretx_valid itself, which
+    // carries !store_drive, so a freed port also raises the probe's own hit rate.
+    // ⚠️ LOOP-FREE PREDICATE, not `c_pretx_fast`. c_pretx_fast reads dmem_vm_on_op =
+    // dmem_vm_on || dmem_op_hlv, and dmem_op_hlv reads store_drive (:9360) — the exact
+    // edge fast_store's `use c_is_mem_virt, NOT dmem_vm_on_op` comment was written to
+    // avoid. This uses the CSR-derived dmem_vm_on (registers) and excludes HSV
+    // outright, so it IMPLIES c_pretx_fast (dmem_vm_on ⇒ dmem_vm_on_op) without
+    // closing the loop; every other term is c_pretx_fast's own, verbatim.
+    // Const-guarded STATEMENT form so DEAD really const-folds (the CONST && sig trap).
+    // ✅ MEASURED (2026-08-19): N=1 boot 13,180,000 -> 12,370,000 (-6.15 %), N=2 SMP
+    // 18,100,000 -> 17,340,000 (-4.20 %), N=4 SMP 25,650,000 -> 24,780,000 (-3.39 %),
+    // together with SB_DRAIN_SHADOW and LSR_B2B_SBQ=0. Bare-mode gates stay
+    // instret-identical (this cannot fire without dmem_vm_on). It paid MORE than its
+    // 641,637-cy census bucket (790,000 unrestricted) — the store_pretx_valid
+    // self-reinforcement noted above.
+    // 🚨 SB_DRAIN_SHADOW IS A PREREQUISITE, NOT A FOLLOW-ON. This flip ALONE wedges the
+    // N=2 SMP boot (hart1 never leaves firmware, h1_pc=0x51a / trap1=0 — the S20R
+    // doorbell signature, :5.1). Freeing the port lets a load capture on cycles the
+    // committing store used to idle it, and some of those land in the store-drain window
+    // the shadow closes. LSR_B2B_SBQ only ever guarded the b2b door into that SAME
+    // window; this opened the ordinary one. See cp_store_queue_plan.md §13.3.
+    const STORE_NOPORT: bit = 1;
+    // L1.a BISECTION arm (2026-08-19): the unrestricted flip WEDGED the N=2 SMP boot —
+    // hart1 never leaves firmware (PC 0x51a, trap1=0), the S20R doorbell signature. Two
+    // live hypotheses, and this term separates them from everything else:
+    //   (i)  the §9 drain-window visibility skew, now reachable through the ORDINARY
+    //        capture path (LSR_B2B_SBQ only guards the b2b one), and
+    //   (ii) DRAIN STARVATION: store_drive was an implicit drain priority — every
+    //        committing store idled the load stream for a cycle, handing the IDLE-only
+    //        drain its slots. S20.2 knew about this coupling and kept only the
+    //        `sb_cnt >= 3` watermark when the buffer took over; L1.a removes the rest.
+    // Both live in the non-empty-SB window, so restricting the flip to sb_empty tests
+    // "is the hazard SB-related at all" in ONE run. sb_empty is a register → loop-free.
+    const STORE_NOPORT_SBE: bit = 0;
+    var store_noport: logic;
+    always_comb {
+        store_noport = 1'b0;
+        if STORE_NOPORT && STORE_PRETRANSLATE {
+            if commit_store_fire && c_store_pa_valid && !c_is_amo && dmem_vm_on && !c_is_mem_virt
+                && st_wstrb_hi == 8'd0 && c_store_pa[63:25] == 39'h40
+                && !((c_store_pa[31:14] == 18'h20000) || (c_store_pa[31:12] == 20'h80008))
+                && (!STORE_NOPORT_SBE || sb_empty) {
+                store_noport = 1'b1;
+            }
+        }
+    }
+    let store_drive    : logic     = commit_store_fire && !load_walk_busy && !fast_store && !asq_st_block && !store_noport;
     // M9.3: a load walk PHYSICALLY owns the dmem port only while the MMU FSM is
     // NOT idle (LEVEL/DONE/FAULT). walk_v_q is a registered owner tag that, under
     // hart1's SMP bus-contention back-to-back walks, stays set CONTINUOUSLY across
@@ -9674,6 +9743,71 @@ pub module heliodor_core #(
     }
 
     // ============================================================
+    // Block L1.c — THE DRAIN SHADOW (the visibility contract, plan Part II §9).
+    // ============================================================
+    // The hole Block T papered over with LSR_B2B_SBQ is a SNAPSHOT SKEW, not an early
+    // pop. A 2-stage load samples the two halves of its result on DIFFERENT cycles:
+    //
+    //   cycle N                                  cycle N+1
+    //   Stage A: i_ren_r/i_addr_r presented;     Stage B: the sbf* forward net is
+    //            DCACHE_SYNC_READ reads the               evaluated (stld_fwd_en =
+    //            array COMBINATIONALLY and                lsr_v_q) — against a buffer
+    //            REGISTERS the result                     that no longer holds the entry
+    //   drain:   store_can_drain → o_sdrain_ack
+    //            ...the merge is applied AT THE N→N+1 EDGE, and sb_pop drops sb_cnt
+    //            on that SAME edge.
+    //
+    // So the DATA READ snapshots the array pre-merge and the FORWARD NET snapshots the
+    // buffer post-pop: a store drained on that edge is in NEITHER. The entry's lifetime
+    // does not cover both halves of any load that straddles the edge.
+    //
+    // The contract (Part II §10 Q2): an entry stays in the forward net until every read
+    // that could have snapshotted the array BEFORE its write has completed. For a
+    // 2-stage load that is exactly ONE cycle past the drain ack. This register is that
+    // cycle — the departing head entry's {line PA, 8 lanes, strobes}, held for one
+    // cycle and ORed into sbf* as the OLDEST writer (checked BEFORE the sb_cnt loop, so
+    // any live SB entry and the same-cycle sb_push both override it per byte).
+    //
+    // Address-exact by construction, which is why it is preferred over sharpening
+    // LSR_B2B_SBQ: Block T measured a same-LINE restriction INSUFFICIENT and concluded
+    // the window is wider than the head line — a conclusion Part II §9 flags for
+    // re-checking, since a correct compare should have sufficed. The shadow sidesteps
+    // the question entirely.
+    // Registers only → no comb loop into the sbf nets. Const-guarded STATEMENT form at
+    // the read sites so DEAD really const-folds.
+    // ✅ MEASURED (2026-08-19): with STORE_NOPORT=1 this is what carries the N=2 SMP boot
+    // at FULL width. The bisection arm (STORE_NOPORT_SBE, restrict the flip to sb_empty)
+    // also passes but leaves 3/4 of the win on the table (N=1 -1.52 % vs -5.99 %), and it
+    // REFUTED the competing hypothesis — drain starvation, i.e. store_drive acting as an
+    // implicit drain priority (S20.2's coupling, of which only the sb_cnt>=3 watermark
+    // survived). It is the WINDOW, not the door. Full Veryl ladder + Verilator NBA 4/4
+    // green; see cp_store_queue_plan.md §13.
+    const SB_DRAIN_SHADOW: bit = 1;
+    var sbs_v_q   : logic         ;
+    var sbs_line_q: logic<58>     ;
+    var sbs_data_q: logic<64> [8] ;
+    var sbs_strb_q: logic<8>  [8] ;
+    always_ff {
+        if_reset {
+            sbs_v_q    = 1'b0;
+            sbs_line_q = 58'd0;
+            for l in 0..8 {
+                sbs_data_q[l] = 64'd0;
+                sbs_strb_q[l] = 8'd0;
+            }
+        } else if SB_DRAIN_SHADOW {
+            sbs_v_q = sb_pop;
+            if sb_pop {
+                sbs_line_q = sb_line[0];
+                for l in 0..8 {
+                    sbs_data_q[l] = sb_head_data[l];
+                    sbs_strb_q[l] = sb_head_strb[l];
+                }
+            }
+        }
+    }
+
+    // ============================================================
     // S27: committed-store-buffer FORWARD layer. sb bytes are committed —
     // older than every ROB-resident store — so a ROB-forward byte (sf*/sg*)
     // wins per byte, an sb byte fills the rest, and the dcache supplies the
@@ -9707,6 +9841,12 @@ pub module heliodor_core #(
         sbf0_v = 1'b0; sbf0_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd0;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf0_v = 1'b1; sbf0_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9723,6 +9863,12 @@ pub module heliodor_core #(
         sbf1_v = 1'b0; sbf1_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd1;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf1_v = 1'b1; sbf1_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9739,6 +9885,12 @@ pub module heliodor_core #(
         sbf2_v = 1'b0; sbf2_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd2;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf2_v = 1'b1; sbf2_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9755,6 +9907,12 @@ pub module heliodor_core #(
         sbf3_v = 1'b0; sbf3_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd3;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf3_v = 1'b1; sbf3_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9771,6 +9929,12 @@ pub module heliodor_core #(
         sbf4_v = 1'b0; sbf4_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd4;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf4_v = 1'b1; sbf4_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9787,6 +9951,12 @@ pub module heliodor_core #(
         sbf5_v = 1'b0; sbf5_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd5;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf5_v = 1'b1; sbf5_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9803,6 +9973,12 @@ pub module heliodor_core #(
         sbf6_v = 1'b0; sbf6_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd6;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf6_v = 1'b1; sbf6_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -9819,6 +9995,12 @@ pub module heliodor_core #(
         sbf7_v = 1'b0; sbf7_b = 8'd0;
         if stld_fwd_en {
             let ba: logic<64> = sbf_pa + 64'd7;
+            if SB_DRAIN_SHADOW {
+                if sbs_v_q && sbs_line_q == ba[63:6] && sbs_strb_q[ba[5:3]][ba[2:0]] {
+                    let d: logic<64> = sbs_data_q[ba[5:3]] >> {ba[2:0], 3'b000};
+                    sbf7_v = 1'b1; sbf7_b = d[7:0];
+                }
+            }
             for i in 0..SB_N {
                 if (i as 4) <: sb_cnt && sb_line[i] == ba[63:6] && sb_strb[{(i as 2), ba[5:3]}][ba[2:0]] {
                     let d: logic<64> = sb_data[{(i as 2), ba[5:3]}] >> {ba[2:0], 3'b000};
@@ -11339,7 +11521,21 @@ pub module heliodor_core #(
         // measured: the same oops returns 8,590 cycles later. The window is wider than
         // the head entry's line, so the conservative form is what this arm ships.
         // Loop-free: sdrain_swen is register-derived (imem_aw_grant || !sb_empty).
-        const LSR_B2B_SBQ: bit = 1;
+        // 🏁 SUBSUMED, AND NOW 0 (Block L1.c, 2026-08-19). Everything above describes the
+        // WINDOW correctly and the DOOR wrongly: this guard closed the b2b capture path
+        // into the store-drain window, but the window is reachable from the ordinary
+        // capture path too (L1.a's STORE_NOPORT walked straight through it and wedged the
+        // N=2 boot). SB_DRAIN_SHADOW closes the window itself — the drained entry stays in
+        // the sbf* forward net for the one cycle a 2-stage load needs, address-exact — so
+        // this gate has nothing left to protect. Dropping it is worth +0.16 pp at N=1
+        // (12,390,000 -> 12,370,000) and +0.28 pp at N=2, consistent with the 0.23 pp
+        // yardstick Block T measured for it. Kept as a fold-away arm, not deleted, so the
+        // revert path survives if the shadow ever needs to be turned off.
+        // ⚠️ This also retires Block T's "the window is wider than the head entry's line"
+        // conclusion: the shadow needs no width estimate at all. Do not propagate the wide
+        // -window reading — the likely explanation is that the same-LINE test compared the
+        // incumbent's lsr_paddr_q, not the capturing load's address (plan Part II §9).
+        const LSR_B2B_SBQ: bit = 0;
         lsr_b2b_free = 1'b0;
         if LSR_B2B {
             if lsr_b2b_spec && lsr_complete && (!LSR_B2B_SBQ || !sdrain_swen) {

@@ -275,3 +275,337 @@ sub-12.49; the fetch prefix alone inflates it to 12.9.
 - **(D) Accept ~12.5 as the reached scalar floor and revise the §6.1/§8.1 target** — the near-term
   ~12 ns goal is essentially met on the *real* floor (12.51 ≈ 12); the 7.5 ns aspiration was always
   contingent on FPU/vector + memory-floor + R3 SMP work (a different program).
+
+---
+
+# ▶️ Part II — the STRUCTURAL half (Block L1, design phase, 2026-08-19)
+
+Part I above is the **CP** half of L1 and it shipped (`SB_PA_REG=1`, −6 % CP). The user chose L1 as
+the next block on **structural** grounds (`phase14_frontend_deep_ooo_plan.md`, "▶️ Block L1"): the
+canonical LSQ's fourth piece — the store queue itself — was never built. This part is the design the
+plan doc says still needs writing. It resolves the five hard questions **before** RTL, per the
+campaign's proven order.
+
+## 7. The audit — what the store path actually is today
+
+A store passes through **three** structures, and only the middle one is age-ordered per store:
+
+| stage | structure | key | age | lifetime |
+|---|---|---|---|---|
+| dispatch → commit | **ROB shadow** `sh_store_{addr,data,funct3,pa,pa_valid}` (`rob.veryl:479`) | **VA** (`FWD_PA=0`) | ROB index | allocated at dispatch, written at execute (CDB), **dies at commit** (`sh_valid` clears) |
+| commit → drain-ack | **committed SB** `sb_{line,data,strb,lmap}`, 4 × 64 B write-combining | **PA** | FIFO (in-order, index 0 = head) | pushed at `sb_push`, **popped on `dc_sdrain_ack`** |
+| drain-ack → ∞ | the dcache array | PA | — | the merge lands at the ack's clock edge |
+
+Forwarding is the OR of the first two: `sf*` (ROB scan, VA-keyed, aged by `stld_fwd_age`) and `sbf*`
+(SB scan, PA-keyed, youngest-index-wins), both evaluated at **Stage B** against `lsr_vaddr_q` /
+`lsr_paddr_q`, plus a same-cycle `sb_push` fold.
+
+⚠️ **The age split is sound; only the KEY is not.** Commit is in-order, so every committed store is
+older than every in-flight load — the SB needs no age compare, and youngest-index-wins is exact. What
+the two halves genuinely disagree about is *what an address is* (M1c). So "one age-ordered CAM" is a
+**key** unification, not an age unification. (`FWD_PA=1` measured worth exactly zero *given the
+current split*; it is a structural cleanup, not an IPC lever. Do not re-price it as one.)
+
+## 8. 🎯 The reframing that changes the plan: `store_drive` is a TRANSLATE hold, not a drain-port hold
+
+The plan doc prices `store_drive` at **641,637 cy = 4.87 %** of the N=1 boot and describes it as "a
+committing store holding the shared dcache port". The audit sharpens that, and the sharpening moves
+the fix:
+
+- **The SQ already has a private drain port.** The SB drains through the dcache's SECOND write port
+  (`i_saddr`/`i_swen`/`o_sdrain_ack`, `dcache.veryl:126`), which is disjoint from the load read port.
+  Question 5's "can the SQ drain without ever taking the load port?" is **already answered YES**, and
+  has been since Phase 8 S6. The drain is not what costs 641,637 cycles.
+- **What costs them is the commit-time TRANSLATE.** `store_drive` pins `core_dmem_vaddr` /
+  `core_dmem_wen` to the committing store, i.e. it takes the **shared dmem MMU request port** — and
+  three separate consumers yield to it: `load_blocks_on_store` (Stage-A capture), `lsr_drive`
+  (Stage-B read), `replay_drive`. A load cannot even *translate* while a store commits.
+- **And under VM it fires for EVERY store, including ones that need nothing.** `fast_store` — the
+  bare-mode store that S6 already excludes from `store_drive` — requires `!dmem_vm_on`. Once Linux
+  turns paging on, `fast_store ≡ 0`, so every kernel store re-drives the MMU at commit **even when
+  its PA was already produced at execute** by the `STORE_PRETRANSLATE` probe.
+
+**Enumerate what a pre-translated store (`c_pretx_fast`) still reads off that live port:**
+
+| commit-time need | where it comes from at `STORE_PRETRANSLATE=1` |
+|---|---|
+| its PA | `c_store_eff_pa` takes the `c_pretx_fast` arm = `c_store_pa`, a ROB **flop** |
+| SB-push eligibility | `sb_vm_ok = c_pretx_fast` — a **registered** classifier |
+| MMIO classification | `c_store_mmio` from the registered `c_store_eff_pa` |
+| page / access fault | `RETIRE_DECOUPLE` ⇒ `sfault_*_eff = store_fetched_q ? m_*_q : 0`, and a pretx store retires in ONE cycle **without ever setting `store_fetched_q`** ⇒ already 0 |
+| A/D write-back | none — `dmem_sprobe_ok` required W **and D** already set |
+| the dcache write | none — `sb_elig` suppresses the write-through (`dc_i_wen`'s `!sb_vm_live_ok`), it drains via `i_saddr` |
+
+**NOTHING.** The port hold is pure fusion. This is the same structure S6 already dissolved for bare
+mode, left un-generalised to VM only because `c_pretx_fast` postdates it.
+
+⇒ **L1.a is the first build**, and it attacks the whole 641,637-cy bucket rather than the 0.23 %
+guard: exclude a pre-translated store from `store_drive`.
+
+⚠️ **The predicate must be loop-free, and `c_pretx_fast` is not.** `c_pretx_fast` reads
+`dmem_vm_on_op = dmem_vm_on || dmem_op_hlv`, and `dmem_op_hlv` reads `store_drive` (`:9360`) — the
+exact edge `fast_store`'s "use `c_is_mem_virt`, NOT `dmem_vm_on_op`" comment exists to avoid. The
+scaffold therefore rebuilds the predicate from the CSR-derived `dmem_vm_on` (registers) and excludes
+HSV outright, which **implies** `c_pretx_fast` (`dmem_vm_on ⇒ dmem_vm_on_op`) without closing the
+loop. Every other term is `c_pretx_fast`'s own, verbatim.
+
+**Second-order gain:** `store_pretx_valid` itself carries `&& !store_drive` (`:9012`) — the probe
+cannot fire while a store owns the port. So freeing the port also raises the probe's hit rate, which
+raises the `c_pretx_fast` population, which frees more ports. L1.a is self-reinforcing; expect the
+flip to move more than a static census of today's `c_pretx_fast` rate would predict.
+
+**What L1.a does NOT cover:** the `sb_2cyc_ok` population — stores that MISSED the execute-time probe
+and translate live at commit cycle N, pushing the registered `m_pa_q` at N+1. Those genuinely need
+the port. Closing them is L1.b.
+
+## 9. 🎯 The visibility hole, located exactly: a snapshot SKEW, not just an early pop
+
+Block T proved the hole exists and papered it with `LSR_B2B_SBQ`. The audit names the mechanism, and
+it is narrower and more fixable than "pop-on-ack is too early":
+
+```
+cycle N            cycle N+1
+─────────────────  ─────────────────
+Stage A: i_ren_r / i_addr_r presented (lsr_capture)
+         DCACHE_SYNC_READ reads the array COMBINATIONALLY and REGISTERS it
+drain:   store_can_drain=1 → o_sdrain_ack=1     ← the merge is applied AT THIS EDGE
+sb:      entry still counted in sb_cnt          sb_pop → sb_cnt drops
+                                    Stage B: the sbf* forward net is evaluated (lsr_v_q)
+                                             …against a buffer that no longer holds the entry
+```
+
+The **data read** snapshots the array at the end of cycle N (pre-merge). The **forward net**
+snapshots the buffer at cycle N+1 (post-pop). A store drained at that edge is in **neither**. It is
+not that the entry is freed before its write lands — the write lands at the same edge. It is that the
+load's two halves sample **different cycles**, and the entry's lifetime covers neither of them fully.
+
+⇒ **The visibility contract (question 2) is: an SQ entry must stay in the forward net until every
+read that could have SNAPSHOTTED the array before its write has completed.** With a 2-stage load that
+is exactly **one cycle past the drain ack** — a one-entry *drain shadow* holding the popped entry's
+{line PA, 8 lanes, strobes}, ORed into `sbf*`, cleared the following cycle. `LSR_B2B_SBQ` then has
+nothing left to protect and can be deleted rather than sharpened.
+
+⚠️ **Re-open the "wider than the head line" finding before trusting it.** Block T recorded that
+restricting the b2b suppression to the COLLIDING LINE was insufficient (the oops returned 8,590
+cycles later) and concluded the window is wider than the head entry's line. If the hole is exactly
+the merge-cycle skew above, a *correct* line compare should have sufficed — so the more likely
+reading is that the compare was made against the wrong address (the incumbent's `lsr_paddr_q` rather
+than the capturing load's `dmu_dmem_addr`, which is what Stage A actually presents). **Check which
+address that test compared before designing around a wide window.** A shadow entry sidesteps the
+question entirely — it is address-exact by construction — which is another reason to prefer it over
+sharpening the guard.
+
+**Open, and NOT covered by the shadow:** the `wt_fires` drain (`dcache.veryl:1350`). A full-line
+drain that misses locally acks on its **bus write-channel grant** and never enters the local array;
+"architecturally readable" for it means the bus write has been ordered ahead of any later fill of the
+same line. That is a memory_bus/L2 ordering property, not an L1 lifetime property. Confirm it holds
+before declaring the contract closed; if it does not, the shadow must persist until write completion,
+not for a fixed cycle.
+
+## 10. The five hard questions — resolved
+
+**Q1. Allocation point → dispatch, ROB-indexed. Do not build a second free list.**
+The ROB shadow already allocates at dispatch and is written at execute; age *is* the ROB index, free.
+A separate SQ with its own pointers buys nothing but a second full-condition to stall dispatch on, and
+W0 measured `resource` (ROB/free-list/IQ full) at only 6.9 % of 1-wide cycles even after Block W. The
+"queue" L1 must build is not new storage before commit — it is a **lifetime extension after** it.
+
+**Q2. Visibility contract → an entry is freed only when every possible reader's snapshot is after its
+write.** Concretely: one cycle past `dc_sdrain_ack` for the local-merge path (§9), and past bus write
+completion for `wt_fires` if §9's open item says so. Today's pop-on-ack is the bug; `LSR_B2B_SBQ` is
+its workaround and is deleted, not sharpened, by the fix.
+
+**Q3. Forwarding key and CAM shape → PA-unified, one net, ROB half retires into the same net.**
+The age structure is already correct (§7), so this is a key change (`FWD_PA` + `load_queue.veryl`'s
+S16 exemption, **flip-coupled** — flipping one alone is either gainless or unsound). Sequence it
+LAST: it is measured worth zero IPC and it touches the disambiguation, the highest-risk net in the
+tree. Ship it as structure, on the structure gate, after the two IPC pieces are banked.
+
+**Q4. Relationship to the ASQ → keep two queues; do not fold atomics in.**
+R3 shipped the ASQ with an explicit ordering contract already enforced at three points:
+`asq_st_block = !asq_empty` (no store may drive while an atomic is queued), `asq_ld_ovl` (no younger
+overlapping access may pass a queued atomic — it *cannot* forward, since its value does not exist
+until the drain computes it), and `asq_dr_busy` (all load/AMO issue held while the drain engine runs).
+An atomic's entry is fundamentally different from a store's — no forwardable data — so folding it into
+a forwarding CAM would need a per-entry "cannot forward, must wait" bit, i.e. exactly the ASQ, inlined.
+The `asq_dr_busy` (9,997 cy) and `asq_ld_ovl` (0 cy) buckets say the split costs nothing measurable.
+**Fold nothing. Document the ordering contract as the answer.**
+
+**Q5. The drain port → already private (§8). The question was mis-stated; the real one is the
+TRANSLATE port,** and the answer is "every store's PA is registered before commit" (L1.a for the
+probe-hit population, L1.b for the rest).
+
+## 11. Build order — three DEAD scaffolds, each priced by its own flip
+
+Each step is const-gated, verified byte-identical at 0, flipped, and priced by reading the cycle
+counter — never by its census bucket (L4 step-2 recovered **zero** from a 7.14 % bucket; W1a
+over-promised 40×).
+
+- **L1.a — `STORE_NOPORT`** (`heliodor_core.veryl`, at `store_drive`). A pre-translated store does not
+  take the shared dmem port. Small, self-contained, aimed at the 641,637-cy bucket, and it rides a
+  shipped precedent (S6 for bare mode). ⚠️ It lets a load issue in the same cycle an older store
+  commits — sound because the load's Stage-B forward net covers the SB entry, including the
+  same-cycle `sb_push` fold — but it is a memory-ordering change and gates on the **full SMP ladder**.
+- **L1.b — universal execute-time translate.** Give the `sb_2cyc_ok` population a registered PA too,
+  so no store ever needs the commit port. The probe misses today for three reasons (execute-time TLB
+  miss, port taken by another requester, `rob_has_pending_xlate`); the canonical fix is an **SQ
+  translate retry** that re-probes a missed store from its ROB entry in idle port cycles, instead of
+  at commit where it blocks. This is the piece that makes the store queue a real queue rather than a
+  shadow. Depends on L1.a having freed the port for the retries to use.
+- **L1.c — the visibility contract** (§9): the drain shadow, then **delete** `LSR_B2B_SBQ`. Its
+  yardstick is already measured (0.23 pp at N=1, ~0.2 % at every width — the "cost grows with harts"
+  prediction was made and REFUTED). Ship for correctness; the 0.2 % is a bonus.
+- **L1.d — the unified PA-keyed forward net** (Q3), last, on the structure gate.
+
+**Gate for every step:** default suite (252/0, incl. litmus N=2) → litmus N=4 → N=1 boot → N=2 SMP
+boot → N=4 SMP boot → Verilator NBA cross-check. Retire and memory ordering is the highest-risk area
+in the tree; Block T's own N=2 kernel oops surfaced only at 2 harts.
+
+## 12. Facts recorded before the first flip
+
+Baselines (shipped default, `LSR_B2B=1` + `LSR_B2B_SBQ=1` + `P1_SERVED=1`):
+N=1 `cy=00c91c60` · N=2 `cy=01142f20` · N=4 `cy=01876350` · litmus N=2 `cy=002e3bf0` /
+N=4 `cy=003b3440` · dhrystone 235,828 / instret 264,834 · coremark 394,551 / instret 374,357 ·
+suite 252/0.
+
+Census at that default, `DBG_CENSUS=1` (N=1 boot, 13,180,000 cy): `store` sole-blocker 701,128
+(5.32 %), of which **`store_drive` 641,637 (4.87 %)**, `sb_cnt >= 3` 49,485, `asq_dr_busy` 9,997,
+page-edge 9, `asq_ld_ovl` 0. `lsr` sole-blocker 758,020 (5.75 %), now 100 % dcache miss.
+`LSR_B2B_SBQ` suppressed/fired 19,023 / 682,106.
+
+---
+
+## 13. ✅ MEASURED (2026-08-19) — L1.a + L1.c built, flipped, and priced. **N=1 −6.15 % / N=2 −4.20 %**, and `LSR_B2B_SBQ` is DELETED
+
+Both scaffolds were built DEAD, verified, flipped, and priced by the cycle counter. Two of §11's
+predictions held and **one ordering decision in §11 was WRONG and is corrected below.**
+
+### 13.1 The ladder
+
+| gate | baseline | L1.a + L1.c + `LSR_B2B_SBQ=0` | Δ |
+|---|---|---|---|
+| default suite | 252/0 | **252/0** | — |
+| litmus N=2 | `cy=002e3bf0` | `cy=002e3bf0` | **identical** |
+| litmus N=4 | `cy=003b3440` | `cy=003b3440` | **identical** |
+| dhrystone | 235,828 / instret 264,834 | 235,804 / **instret 264,834** | −24 cy |
+| coremark | 394,551 / instret 374,357 | 394,546 / **instret 374,357** | −5 cy |
+| **N=1 boot** | 13,180,000 | **12,370,000** | **−6.15 %** |
+| **N=2 SMP boot** | 18,100,000 | **17,340,000** | **−4.20 %** |
+
+The bare-mode gates move by tens of cycles with **instret bit-identical** — `STORE_NOPORT` cannot
+fire in bare mode (it requires `dmem_vm_on`; S6's `fast_store` already covers bare), so the residue
+is `LSR_B2B_SBQ`'s deletion alone. That is a strong functional-equivalence signal, not a null result.
+
+### 13.2 L1.a paid MORE than its census bucket — the self-reinforcement is real
+
+`store_drive`'s sole-blocker bucket was 641,637 cy. The unrestricted flip removed **790,000**. §8
+predicted exactly this: `store_pretx_valid` carries `&& !store_drive`, so freeing the port raises the
+execute-time probe's own hit rate, which grows the `c_pretx_fast` population, which frees more ports.
+
+⚠️ Worth recording as the campaign's **first over-delivery**. L3 over-promised 3-5×, L4 step-2
+over-promised ∞ (7.14 % → 0), W1a over-promised 40×. A sole-blocker census still says WHERE and not
+HOW MUCH — but the error is not signed. Do not start treating buckets as floors either.
+
+### 13.3 🚨 ORDER CORRECTION: L1.c is a PREREQUISITE for L1.a, not a follow-on
+
+§11 sequenced L1.a first and L1.c third. **That was wrong, and the machine said so.** L1.a alone:
+
+| config | N=1 boot | N=2 SMP boot |
+|---|---|---|
+| `STORE_NOPORT=1` alone | 12,390,000 (−5.99 %) | ❌ **WEDGE** — hart1 never leaves firmware (`h1_pc=0x51a`, `trap1=0`), the S20R doorbell signature (§5.1) |
+| `+ STORE_NOPORT_SBE=1` (restrict to `sb_empty`) | 12,980,000 (−1.52 %) | 17,550,000 (−3.04 %) ✅ |
+| **`+ SB_DRAIN_SHADOW=1`** (the real fix, unrestricted) | 12,390,000 (−5.99 %) | **17,390,000 (−3.92 %)** ✅ |
+| **`+ LSR_B2B_SBQ=0`** | **12,370,000 (−6.15 %)** | **17,340,000 (−4.20 %)** ✅ |
+
+**Two hypotheses were live and the bisection killed one.** (i) the §9 snapshot skew, now reachable
+through the ORDINARY capture path — `LSR_B2B_SBQ` only ever guarded the b2b one; (ii) **drain
+starvation** — `store_drive` was an implicit drain priority (every committing store idled the load
+stream for a cycle, handing the IDLE-only drain its slots), and S20.2 explicitly documents that
+coupling, keeping only the `sb_cnt >= 3` watermark when the buffer took over. Both live in the
+non-empty-SB window, so a one-run `&& sb_empty` restriction proved the hazard is SB-related; the
+drain shadow then fixed it outright at full width, **refuting (ii)**.
+
+🎯 **`feedback_removed_bubble_was_protection` fired for the second time in two blocks.** Block T
+deleted the LSR turnaround bubble and found it was the only thing keeping loads out of the store-drain
+window. L1.a deletes the commit-store port hold and finds it was the only thing keeping loads out of
+the *same* window through a *different* door. **The general form: when a bubble protects a window,
+removing ANY of the mechanisms that create it re-opens the window — so fix the window, not the door.**
+That is what the shadow does, and it is why it was worth building the contract rather than another
+capture gate.
+
+### 13.4 `LSR_B2B_SBQ` is deleted, exactly as §10 Q2 predicted
+
+With the shadow in place the guard is dead weight: dropping it gains **+0.16 pp at N=1** (12,390,000 →
+12,370,000) and **+0.28 pp at N=2**, and every gate stays green. Block T's own yardstick for it was
+0.23 pp at N=1 — consistent. The visibility contract is now a **contract**, not a workaround:
+*an entry is not freed until every reader that could have snapshotted the array before its write has
+completed.*
+
+This also retires Block T's open question about the window's width. Block T measured a same-LINE
+restriction insufficient and concluded the window is wider than the head entry's line; §9 flagged that
+for re-checking. The shadow is address-exact by construction and needs no width estimate, so the
+question is moot — but the §9 reading (that the earlier test compared the wrong address) remains the
+likely explanation and should not be propagated as "the window is wide".
+
+### 13.5 Revised build order
+
+1. ✅ **L1.c `SB_DRAIN_SHADOW`** — the visibility contract. **First**, because L1.a is unsafe without it.
+2. ✅ **L1.a `STORE_NOPORT`** — the pre-translated store does not take the shared dmem port.
+3. ✅ **`LSR_B2B_SBQ` deleted** — subsumed by 1.
+4. ▶️ **L1.b** — universal execute-time translate (the `sb_2cyc_ok` population; an SQ translate retry
+   in idle port cycles). Now unblocked: L1.a freed the port those retries need.
+5. **L1.d** — the unified PA-keyed forward net, last, on the structure gate.
+
+### 13.6 ⚠️ Open before ship
+
+- **N=4 SMP boot** and the **Verilator NBA cross-check** (4 configs) are the remaining gates. Running.
+- **The AMO hole is NOT closed by the shadow.** AMO/LR reads do not forward — they wait on
+  `sb_ld_ovl` / `!sb_empty` — so the same one-cycle skew exists for them: `sb_empty` goes true on the
+  drain ack, one cycle before the merge is readable. litmus N=2/N=4 are identical to baseline and the
+  boots pass, which is evidence but not proof (the atomic population that straddles a drain ack may
+  simply be rare). If any N=4 gate fails, the fix is `sb_empty_eff = sb_empty && !sbs_v_q` at the
+  ordering gates — the same contract, applied to the readers that cannot forward.
+- **`wt_fires`** (§9): a full-line write-through drain acks on its bus grant and never enters the local
+  array. The shadow covers it for one cycle, which is not obviously the right lifetime there. Still open.
+- **Scaffold hygiene:** `STORE_NOPORT_SBE` is the bisection arm and is now 0; keep it as a fold-away
+  arm with its numbers (§13.3) or delete it at ship. `SB_DRAIN_SHADOW=0` must stay byte-identical.
+
+### 13.7 ✅ Verilator NBA cross-check — 4/4, all matching the Veryl sim
+
+Same standard R3 and Block W shipped on. Built with `-O1 -j 2` (the 4-hart tops still ICE cc1plus at
+`-O3` on this box) into freshly `rm -rf`'d `build_*` dirs.
+
+| config | Verilator (NBA) | Veryl sim |
+|---|---|---|
+| N=1 boot | **PASSED** (SBI shutdown, x3==0xAA), `$finish` 124 ms = 12.4 M | 12,370,000 ✓ |
+| N=2 SMP boot | **PASSED**, `$finish` 173 ms = 17.3 M | 17,340,000 ✓ |
+| N=4 SMP boot | **PASSED**, `$finish` 248 ms = 24.8 M | 24,780,000 ✓ |
+| litmus N=4 | **PASSED**, `pass=1 fail=0 tohost=1`, `cy=3,878,771` | 3,880,000 ✓ |
+
+⚠️ **A `$finish` line is NOT a pass.** Both wrappers `$finish` unconditionally after printing their
+verdict, so an early `$finish` only proves the loop broke — on `pass` for the boots (`MAX_CY` =
+100,000,000, so finishing at 24.8 M IS conclusive there) but on `pass || fail` for litmus, which is
+not. The litmus verdict line had to be re-read from a second run. **Grep the verdict, not `$finish`.**
+
+### 13.8 Revert path proven
+
+All three consts back to DEAD (`STORE_NOPORT=0`, `SB_DRAIN_SHADOW=0`, `LSR_B2B_SBQ=1`) reproduces the
+baseline exactly: default suite 252/0, litmus N=2 `cy=002e3bf0`, **N=1 boot `cy=00c91c60` =
+13,180,000** — the recorded baseline to the cycle. `STORE_NOPORT_SBE` is kept at 0 as a fold-away arm
+with its numbers in §13.3.
+
+### 13.9 The generalisable lesson
+
+🎯 **When a bubble protects a window, removing ANY of the mechanisms that create the bubble re-opens
+the window — so fix the window, not the door.**
+
+Block T deleted the LSR turnaround bubble, found it had been the only thing keeping loads out of the
+store-drain window, and patched the *door* it had come through (`LSR_B2B_SBQ`, a capture gate). L1.a
+deleted the commit-store port hold and walked into the **same window through a different door** —
+which is why the N=2 wedge looked like a brand-new bug and was not. Building the *contract* instead
+(the entry stays visible until every reader that could have snapshotted the array before its write
+has completed) closed both doors at once and let Block T's patch be deleted.
+
+This is the second consecutive block where `feedback_removed_bubble_was_protection` was the operative
+rule. The refinement worth carrying forward: **enumerate the mechanisms that create a protective
+bubble, not just the one you are removing.**

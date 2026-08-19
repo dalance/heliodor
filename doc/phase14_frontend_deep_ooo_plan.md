@@ -1961,6 +1961,59 @@ build; price the build by flipping it.
 - **(b) The full L1 queue.** Effort: large, and it touches retire + memory ordering — the highest-risk
   area in the tree (R3's M3b minefield). Gate with the full ladder, SMP included.
 
+### 🏁 Block L1 first result (2026-08-19) — the contract, and the port. **N=1 −6.15 % / N=2 −4.20 % / N=4 −3.39 %**
+
+Neither (a) nor (b) as framed: the RTL audit found the plan's own framing of `store_drive` was wrong,
+and the two pieces that fell out are **coupled** — the cheap one is unsafe without the contract.
+Full design + numbers: **`doc/cp_store_queue_plan.md` Part II (§7-§13)**.
+
+🎯 **`store_drive` is a TRANSLATE hold, not a drain-port hold.** The SB has drained through the
+dcache's private SECOND write port since Phase 8 S6, so question 5 was already answered YES. What the
+641,637 cy buy is the shared dmem **MMU request port**, which `load_blocks_on_store` / `lsr_drive` /
+`replay_drive` all yield to — and under VM it is taken by EVERY store, including ones whose PA the
+execute-time probe already registered. Enumerating what such a store still needs from that port gives
+**nothing**. `STORE_NOPORT` deletes the hold.
+
+🎯 **The visibility hole is a SNAPSHOT SKEW.** The data read snapshots the array at Stage A (cycle N,
+pre-merge); the `sbf*` forward net snapshots the buffer at Stage B (N+1, post-pop); the drain merge
+lands on the edge between them. A store drained there is in neither. `SB_DRAIN_SHADOW` holds the
+departing entry in the forward net for exactly that one cycle.
+
+| gate | baseline | shipped arms | Δ |
+|---|---|---|---|
+| default suite | 252/0 | **252/0** | — |
+| litmus N=2 / N=4 | `002e3bf0` / `003b3440` | **identical** | 0 |
+| dhrystone / coremark | 235,828 / 394,551 | 235,804 / 394,546, **instret identical** | −24 / −5 cy |
+| **N=1 boot** | 13,180,000 | **12,370,000** | **−6.15 %** |
+| **N=2 SMP boot** | 18,100,000 | **17,340,000** | **−4.20 %** |
+| **N=4 SMP boot** | 25,650,000 | **24,780,000** | **−3.39 %** |
+
+Verilator NBA **4/4**, every config matching the Veryl sim. Revert path proven (all arms DEAD
+reproduces `cy=00c91c60` exactly). **No SRAM added** — compare Block W's −6.99 % at N=1, which
+included doubling the L1I.
+
+🚨 **Two plan corrections this produced.**
+1. **L1.c is a PREREQUISITE for L1.a, not a follow-on.** `STORE_NOPORT` alone WEDGES the N=2 SMP boot
+   (hart1 never leaves firmware — the S20R doorbell signature). A one-run `&& sb_empty` bisection
+   proved the hazard is SB-window-local and **refuted** the competing drain-starvation hypothesis.
+2. **`LSR_B2B_SBQ` is DELETED, not sharpened** — worth +0.16 pp at N=1, matching Block T's own
+   0.23 pp yardstick. Block T's "the window is wider than the head line" conclusion is retired: the
+   shadow is address-exact and needs no width estimate.
+
+🎯 **The generalisable rule, and the second consecutive block it decided:** *when a bubble protects a
+window, removing ANY of the mechanisms that create it re-opens the window — so fix the window, not
+the door.* Block T patched the door it came through; L1.a walked into the same window through
+another one.
+
+⚠️ **Open, deliberately not closed:** (i) AMO/LR do not forward — they wait on `sb_empty`, which goes
+true on the drain ack, so the SAME one-cycle skew may exist for them; every gate is green, which is
+evidence, not proof. Fix if it ever bites: `sb_empty_eff = sb_empty && !sbs_v_q`. (ii) `wt_fires`
+(full-line write-through, line not locally owned) acks on its bus grant and never enters the array,
+so one cycle may not be the right shadow lifetime there.
+
+**Next: L1.b** — universal execute-time translate for the `sb_2cyc_ok` population (an SQ translate
+retry in idle port cycles), now unblocked because L1.a freed the port those retries need.
+
 ---
 
 ## Block W — WIDTH. The machine is ~1-wide, and that caps everything above (2026-08-15)
