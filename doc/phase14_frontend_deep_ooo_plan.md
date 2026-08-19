@@ -1813,7 +1813,13 @@ The N=4 contention tax (retired by this flip — N=4 is below even the pre-M2a f
 ends from the N=2 chase: nf-read starvation, PTW-walk steal, dcache mis-delivery, and the
 disambiguation (census-on shows it firing normally at 5,351).
 
-**The candidates, in the order the measurements support:**
+⚠️ **The candidate list below is SUPERSEDED — the user chose L1 (the real store queue) on
+2026-08-19 after these were priced. Read "▶️ Block L1" below.** The pricing itself still stands and
+is why L1 won: candidate 3's 5.4 % turned out to be **91.5 % `store_drive`** (a committing store
+holding the shared dcache port — a store-path structure problem, not a threshold), and candidate 1
+is a workaround for a store-buffer visibility hole that L1 removes outright.
+
+**The candidates, as priced (kept for the numbers):**
 
 1. **Sharpen `LSR_B2B_SBQ`.** It currently blocks the bypass for the WHOLE non-empty-store-buffer
    window, which is conservative — worth 0.23 pp on the N=1 boot (−2.16 % unguarded vs −1.93 %
@@ -1841,6 +1847,119 @@ disambiguation (census-on shows it firing normally at 5,351).
   writes, dumped on the faulting trap, replaced a 5 M-line retire-stream diff and took one run.
 - **Census counters read 0 when `DBG_CENSUS=0`** — that is the gate, not the measurement. Two
   hypotheses were nearly built on such a zero.
+
+---
+
+## ▶️ Block L1 — THE REAL STORE QUEUE. Design phase; **start here** (2026-08-19)
+
+**User decision (2026-08-19): next block is L1, chosen on STRUCTURAL grounds, not IPC.**
+
+### Why this one
+
+Phase 14's own definition of the target is "a **canonical LSQ** (store queue + translate-at-execute
++ a first-class load queue + queue-ordered atomics)". Three of the four are done and one is not:
+
+| piece | status |
+|---|---|
+| translate-at-execute (L2 / `STORE_PRETRANSLATE`) | ✅ live |
+| first-class load queue (L3.3 `633a74f`) | ✅ shipped |
+| queue-ordered atomics (R3.3 `e577328`) | ✅ shipped |
+| **store queue (L1)** | ❌ **never built** |
+
+L1's *CP-side* pieces shipped (`SB_PA_REG=1`, `RETIRE_DECOUPLE=1`, `STORE_PRETRANSLATE`), but the
+queue itself does not exist: heliodor still has a **committed**-store buffer, and a store enters it
+only at commit.
+
+### Block T turned this from tidiness into a demonstrated defect
+
+1. **The visibility contract is broken, and it is measured.** The committed SB pops its entry on the
+   drain ACK (`o_sdrain_ack`), and between that pop and the array write landing the store is in
+   **no forward net at all** — gone from the ROB (`sh_valid` cleared), absent from the SB (`sb_cnt`
+   dropped), not yet in the cache. Block T's N=2 kernel oops is the proof, traced to a single cycle.
+   It is currently papered over by `LSR_B2B_SBQ`, a **capture-gate workaround**. A real SQ holds an
+   entry until it is architecturally readable.
+2. **It owns the largest remaining stall bucket.** `store_drive` = **641,637 cy = 4.87 %** of the
+   N=1 boot and **91.5 %** of the `store` sole-blocker bucket: a committing store holding the shared
+   dcache port. That IS the `commit_store_fire →` shared-port fusion L1 exists to break.
+3. **It subsumes the two smaller candidates.** Sharpening `LSR_B2B_SBQ` (0.23 % at N=1) becomes moot
+   if the SQ's visibility is airtight; the only other actionable store-bucket terms are SB policy
+   artefacts an SQ redesigns away (`sb_cnt >= 3` 49,485 cy, `asq_dr_busy` 9,997 cy).
+4. **It removes a split this campaign has already measured as harmful.** Forwarding is two nets
+   today — `sf*` (ROB scan, **VA**-keyed, aged by `stld_fwd_age`) and `sbf*` (committed SB, **PA**
+   -keyed) — OR'd into `stld_fwd_mask`. Block M's M1c measured that the two halves genuinely
+   disagree about what an address is. One age-ordered SQ CAM makes the disagreement impossible by
+   construction; L3's own text already prescribes exactly that fold.
+
+### What exists today, for the design to build on
+
+- `sb_*`: 4 × 64 B line write-combining committed-store buffer. Push at `sb_push` (under
+  `commit_store_fire`); drain through the dcache's SECOND write port (`i_saddr`/`i_swen`,
+  `sdrain_*`); pop on `dc_sdrain_ack`. Under VM every kernel store is a SLOW store
+  (`fast_store` requires `!dmem_vm_on`), so it does NOT take the fast path.
+- Forwarding: `sf*` + `sbf*` as above, plus the `sb_push` same-cycle fold.
+- `RETIRE_DECOUPLE=1`, `STORE_PRETRANSLATE`, `SB_PA_REG=1` all live.
+- Atomics have their own queue (ASQ, R3) — `asq_*`.
+- `FWD_PA=0` is a fold-away arm measured worth **exactly zero** *given the current split*. ⚠️ That
+  measurement does not carry over to a unified CAM: it was zero because the port-1 exemption already
+  covered those loads, not because PA-keying is worthless.
+
+### The hard questions to resolve BEFORE any RTL
+
+This is the campaign's proven order (`cp_dcache_sync_read_plan.md` §10/§11): design first.
+`doc/cp_store_queue_plan.md` exists but is **CP-oriented** (the retire megacone); the structural half
+below is what still needs writing.
+
+1. **Allocation point** — dispatch/rename (age index free, but occupancy pressure) vs execute.
+2. **Visibility contract** — when may an entry be freed? Block T supplies the answer for the drain
+   edge: *not before its write is architecturally readable*. Today's pop-on-ack is the bug.
+3. **Forwarding key and CAM shape** — PA-unified, age-ordered; how the ROB half retires.
+4. **Relationship to the ASQ** — fold atomics in, or keep two queues and define the ordering between
+   them.
+5. **The drain port** — can the SQ drain without ever taking the load port? That is what would
+   actually attack the 641,637 cy, and it is a dcache-port question, not only a queue question.
+
+### Measured facts to design against (do NOT re-measure)
+
+N=1 boot at the shipped default (`cy=00c91c60`, 13,180,000), `DBG_CENSUS=1`:
+
+| bucket | cycles | of boot |
+|---|---|---|
+| `store` sole-blocker | 701,128 | 5.32 % |
+| ├ **`store_drive`** | **641,637** | **4.87 %** |
+| ├ `sb_cnt >= 3` | 49,485 | 0.38 % |
+| ├ `asq_dr_busy` | 9,997 | 0.08 % |
+| └ page-edge / `asq_ld_ovl` / other | 9 / 0 / 0 | — |
+| `lsr` sole-blocker | 758,020 | 5.75 % — now **100 % dcache miss** (MLP, not turnaround) |
+| `LSR_B2B_SBQ` suppressed / fired | 19,023 / 682,106 | 2.7 % of b2b opportunities |
+
+**`LSR_B2B_SBQ`'s cost does NOT grow with hart count — that prediction was made and REFUTED.**
+Block T's *gain* scales with harts (−1.93 % at N=1 → −5.28 % at N=4), so the guard's cost was
+expected to scale too; it does not. Suppressed/fired, read off the periodic `B2BSUP` print near the
+end of each boot:
+
+| config | busiest hart | system-wide |
+|---|---|---|
+| N=1 (13.18 M cy, full boot) | 19,023 / 682,106 = **2.79 %** | same |
+| N=2 (at 15 M cy) | h0 31,191 / 793,678 = **3.93 %** | 32,890 / 990,777 = 3.32 % |
+| N=4 (at 25 M cy) | h0 35,270 / 934,721 = **3.63 %** | 39,013 / 2,076,761 = **1.88 %** |
+
+h0's absolute rate is flat (~1.4 k suppressions per M-cycle at both N=1 and N=4) and the secondary
+harts barely suppress at all, so the system-wide ratio *dilutes* as harts are added. **Candidate 1
+stays a ~0.2 % item at every width** — which is one more reason L1 (which removes the need for the
+guard entirely) is the right block rather than sharpening the guard.
+
+⚠️ Census discipline, unchanged: a sole-blocker bucket bounds the **OPPORTUNITY**, not the
+**PRIZE** — L4 step-2 recovered **zero** cycles from a 7.14 % bucket. Use these to choose WHERE to
+build; price the build by flipping it.
+
+### Two ways in — the cheap one first is available
+
+- **(a) A narrow DEAD scaffold on the visibility contract alone**: hold a draining SB entry until its
+  write is readable, then try removing `LSR_B2B_SBQ`. This tests the contract change against a
+  **known yardstick** (0.23 % at N=1, and whatever N=4 turns out to be) before committing to the
+  full queue.
+- **(b) The full L1 queue.** Effort: large, and it touches retire + memory ordering — the highest-risk
+  area in the tree (R3's M3b minefield). Gate with the full ladder, SMP included.
 
 ---
 
