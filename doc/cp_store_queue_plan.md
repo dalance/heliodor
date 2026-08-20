@@ -669,3 +669,71 @@ arrays (today only the CDB writes them) and one more arm on the `core_dmem_vaddr
 ⚠️ **Staleness is already safe by ORDER, not by luck:** an SFENCE/satp write younger than the store
 commits *after* it, so a PA captured early is still that store's PA at its own commit. The retry must
 still honour `rob_has_pending_xlate` exactly as the execute-time probe does.
+
+---
+
+## 15. ❌ L1.b REFUTED (2026-08-19) — an opportunistic re-probe on the shared MMU port is structurally impossible
+
+The build §14.3 routed — a probe retry for a ROB-resident store in an idle port cycle — was built
+DEAD (byte-identical, 252/0, litmus N=2 `cy=002e3bf0`), flipped, and **fails catastrophically**:
+43-50/252, a litmus forbidden outcome, N=1 boot dead at instret 121,850.
+
+### 15.1 Three facts that pin it
+
+1. **The ROB write port is innocent.** Forcing `sqrt_cap` to 0 (port arm live, second write port
+   dead) still fails — **208/252**.
+2. **Tightening the free-cycle predicate makes it WORSE.** Adding
+   `dmem_mmu_idle && !lsr_capture && !lsr_drive && !replay_q && !iq_issue_valid` moved it from 202
+   to **209** failures. A predicate that reads more of the users' state is not a safer predicate.
+3. **It breaks in BARE mode** (`rv64ui-add`), where the probe cannot capture at all —
+   `o_sprobe_ok` carries `vm_enabled`. So the damage is not the captured PA.
+
+### 15.2 🎯 Root cause — the shared address bus has an UNCONDITIONAL consumer
+
+```veryl
+} else {
+    m_pa_q = dmu_dmem_addr;    // heliodor_core.veryl:11709 — every cycle, NO enable
+```
+
+The M-stage PA register mirrors whatever sits on the shared MMU output, and its consumers read it
+under their **own** latched control (`m_wen_q` / `m_ren_q`). **There is therefore no such thing as a
+free cycle on this port**: every cycle's address is captured by the M stage, so an opportunistic
+re-probe simply becomes the next cycle's memory address.
+
+🎯 **This is the mirror image of `feedback_driver_is_not_owner_sync_read`.** There, after
+`DCACHE_SYNC_READ`, the *driver* was no longer the *owner*. Here **every driver is unconditionally
+the owner** — the bus has a free-running latch on it. Both say the same thing from opposite sides:
+**on a shared bus, establish who captures each cycle before assuming a cycle is spare.**
+
+⚠️ The design error was mine and it is worth naming precisely: "the probe is side-effect-free" is
+true of the **MMU** and false of the **shared bus**. Side-effect-freedom of a *consumer* says nothing
+about the *medium*.
+
+### 15.3 Two ways to revive it, neither justified by L1.b alone
+
+- **(a) Give `m_pa_q` a real enable.** Improvement in its own right — it free-runs today, so it also
+  toggles for nothing — but it is the heart of the shipped MEM_PIPE, and it would change the M-stage
+  timing that RETIRE_DECOUPLE / SB_PA_REG all rest on.
+- **(b) Give the probe its OWN address port** — a second TLB read port. Kills the whole hazard class
+  (fix the window, not the door), and costs real area under the realistic-SRAM discipline.
+
+Against L1.b's **~2.8 % ceiling** (§14.2 — a bound, not a prize; L4 step-2 recovered zero from
+7.14 %), neither is worth doing *for L1.b*. If (a) is ever done for its own reasons, L1.b becomes
+nearly free and should be re-tried then.
+
+**`SQ_RETRY` is kept DEAD and marked DO-NOT-FLIP** rather than deleted, so this dead end is not
+re-derived. The `i_sqrt_*` ROB write port stays with it (it is correct and inert at 0).
+
+### 15.4 Block L1 status
+
+| piece | status |
+|---|---|
+| L1.c `SB_DRAIN_SHADOW` — the visibility contract | 🚢 **SHIPPED** |
+| L1.a `STORE_NOPORT` — the store stops taking the load port | 🚢 **SHIPPED** |
+| `LSR_B2B_SBQ` deleted (subsumed) | 🚢 **SHIPPED** |
+| L1.b — universal execute-time translate | ❌ **REFUTED** on the shared port (§15.2); needs (a) or (b) first |
+| L1.d — unified PA-keyed forward net | not started; IPC measured zero, ship-for-structure only |
+
+**Next front is no longer in the store path.** After L1.a the `store` sole-blocker bucket is 102,057
+(0.82 %), of which `sb_cnt >= 3` is 85,937. The largest single sole-blocker is now **`lsr` 745,356
+(6.03 %), which Block T established is 100 % dcache miss — an MLP question, not a queue question.**

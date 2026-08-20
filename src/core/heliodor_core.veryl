@@ -4312,6 +4312,23 @@ pub module heliodor_core #(
     // in scope). lsr_capture deliberately EXCLUDES iss_dc_ok (the dcache_stall
     // term): the Stage-A read is suppressed (no miss to wait on), so a dcache_stall
     // dependency here would close a comb loop (i_ren depends on lsr_capture).
+    // ── Block L1.b (SQ_RETRY): the store-queue TRANSLATE RETRY ──────────────────
+    // The execute-time probe fires on 81.4 % of store executes; 86 % of the misses are
+    // the shared dmem port being busy at that one cycle, not a TLB miss
+    // (cp_store_queue_plan.md §14.3). A missed store falls to sb_2cyc_ok and burns a
+    // COMMIT cycle (rob_commit_ack's !store_fetched_q term) — ~345,000 of them on the
+    // N=1 boot, ~2.8 % of it in retire bandwidth. So: re-probe the OLDEST ROB-resident
+    // store that still has no PA, on a cycle nobody else drives the dmem port. The probe
+    // is side-effect-free and needs only the ADDRESS mux (o_sprobe_* is a pure TLB read
+    // off i_vaddr, gated on the MMU being IDLE) — no request, so a retry can never start
+    // a walk. Assigned late (cdb / store_pretx_valid must be in scope); declared here so
+    // core_dmem_vaddr can read them, the same forward-decl pattern as fast_store/sb_elig.
+    var sqrt_sel_v : logic              ; // an entry needs a PA
+    var sqrt_idx   : logic<ROB_IDX_W>   ; // ...its ROB index
+    var sqrt_vaddr : logic<64>          ; // ...its VA
+    var sqrt_age   : logic<ROB_IDX_W>   ; // ...its age, for the oldest-first select
+    var sqrt_drive : logic              ; // the retry owns the dmem address this cycle
+    var sqrt_cap   : logic              ; // ...and the probe hit: write the PA into the ROB
     var lsr_capture    : logic           ; // Stage-A latch enable + IQ ack (this cycle)
     var lsr_drive      : logic           ; // Stage-B owns the dcache read port
     var lsr_complete   : logic           ; // Stage-B writeback fires (→ u_lsu.i_valid)
@@ -6441,6 +6458,10 @@ pub module heliodor_core #(
         i_cdb_store_pa       : store_pretx_pa       ,
         i_cdb_store_xfault   : store_pretx_xfault   ,
         i_cdb_store_pa_valid : store_pretx_valid    ,
+        // Block L1.b: the translate-retry write port (DEAD at SQ_RETRY=0).
+        i_sqrt_valid         : sqrt_cap             ,
+        i_sqrt_idx           : sqrt_idx             ,
+        i_sqrt_pa            : dmem_sprobe_pa       ,
         i_cdb_cas_q_mem_lo   : cdb.cas_q_mem_lo     , // Zacas amocas.q loaded 128b value
         i_cdb_cas_q_mem_hi   : cdb.cas_q_mem_hi     ,
         i_cdb_is_load        : cdb.is_load          , // Phase 8 S9 LQ record (lane 0)
@@ -9054,7 +9075,7 @@ pub module heliodor_core #(
     // and only asserts when the scalar mem path is quiescent (vu_mem_idle gated
     // the start), so it never races store_drive (the vector op is the ROB head =
     // no scalar store committing) or an in-flight walk.
-    let core_dmem_vaddr: logic<64> = if vu_mem_active ? vu_mem_vaddr : if store_drive ? c_store_addr : if mmu_walk_inflight ? walk_vaddr_q : agu_addr_iss;
+    let core_dmem_vaddr: logic<64> = if vu_mem_active ? vu_mem_vaddr : if store_drive ? c_store_addr : if mmu_walk_inflight ? walk_vaddr_q : if sqrt_drive ? sqrt_vaddr : agu_addr_iss;
     let core_dmem_wdata: logic<64> = if vu_mem_active ? vu_mem_wdata : st_wdata;
     let core_dmem_wen  : logic     = if vu_mem_active ? vu_mem_is_store : store_drive;
     // PMP (Smpmp): the dmem port carries a real AMO's RMW read (agu_addr_iss) only
@@ -9080,6 +9101,53 @@ pub module heliodor_core #(
     assign store_pretx_valid  = cdb.valid && cdb.is_store && !iq_iss_is_amo
         && !store_drive && !mmu_walk_inflight && !vu_mem_active
         && dmem_sprobe_ok && !rob_has_pending_xlate;
+
+    // ── Block L1.b: SQ translate retry (DEAD at SQ_RETRY=0) ─────────────────────
+    // Oldest-first select over the ROB store shadow. ls_fwd[i] already implies
+    // EXECUTED (o_store_fwdable carries sh_rw), so a candidate's VA is real and the CDB
+    // cannot be writing that entry this cycle. Self-referencing accumulator, the same
+    // shape as iq_int's oldest-ready select; const-guarded STATEMENT form so DEAD folds.
+    // 🚨 REFUTED — DO NOT FLIP. Measured 2026-08-19: =1 gives 43-50/252 (litmus violation,
+    // N=1 boot dead at instret 121,850), and it breaks BARE-mode rv64ui-add, where the
+    // probe cannot even capture (o_sprobe_ok carries vm_enabled). Isolating the two halves
+    // proved the ROB write is innocent: the PORT ARM alone breaks it, and tightening
+    // sqrt_port_free all the way to `!iq_issue_valid` made it WORSE (202 -> 209 failures).
+    //
+    // 🎯 ROOT CAUSE, and it is STRUCTURAL, not a missing term: `m_pa_q = dmu_dmem_addr`
+    // is latched EVERY CYCLE with NO ENABLE (:11709). The M-stage PA register mirrors
+    // whatever sits on the shared MMU output, and its consumers read it under their OWN
+    // latched control (m_wen_q / m_ren_q). **There is therefore no such thing as a free
+    // cycle on this port** — every cycle's address is captured by the M stage, so any
+    // opportunistic re-probe becomes the next cycle's memory address. No predicate can
+    // fix that; a tighter one only reads more of the users' state.
+    //
+    // This is the mirror image of feedback_driver_is_not_owner_sync_read: there the
+    // DRIVER was not the OWNER; here EVERY driver is unconditionally the owner.
+    //
+    // Two ways this could be revived, both touching load-bearing structure and neither
+    // justified by L1.b's ~2.8 % ceiling on its own: (a) give `m_pa_q` a real enable —
+    // a genuine improvement (it free-runs today, so it also toggles for nothing) but it
+    // is the heart of the shipped MEM_PIPE; (b) give the probe its OWN address port, i.e.
+    // a second TLB read port — clean, kills the whole hazard class, costs real area.
+    // Kept DEAD as the record of the dead end; see cp_store_queue_plan.md §15.
+    const SQ_RETRY: bit = 0;
+    always_comb {
+        sqrt_sel_v = 1'b0;
+        sqrt_idx   = '0;
+        sqrt_vaddr = 64'd0;
+        sqrt_age   = '0;
+        if SQ_RETRY {
+            for i in 0..ROB_DEPTH {
+                let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+                if ls_fwd[i] && !ls_pa_v[i] && (!sqrt_sel_v || age_i <: sqrt_age) {
+                    sqrt_sel_v = 1'b1;
+                    sqrt_age   = age_i;
+                    sqrt_idx   = i as ROB_IDX_W;
+                    sqrt_vaddr = ls_addr[i];
+                }
+            }
+        }
+    }
     // Zicbom: the dmem port is driving a cbo.clean/flush/inval's commit-time walk
     // (store-routed, so core_dmem_wen is high while it holds the ROB head). Tells
     // the MMU to use the relaxed R-OR-W cbo page permission instead of W.
@@ -9259,6 +9327,38 @@ pub module heliodor_core #(
     // transaction, and lsr_unc_q/lsr_fault are registers, so the opt-out is free.
     let core_dmem_ren  : logic    = if vu_mem_active ? vu_mem_is_load : ((issue_is_load && !redirect_fire && !store_drive && !load_blocks_on_store && !replay_q && (!lsr_v_q || lsr_b2b_spec)) || sc_walk_drive || (mmu_walk_inflight && !sb_walk_ovl));
     let core_dmem_wstrb: logic<8> = if vu_mem_active ? vu_mem_wstrb : if store_drive ? st_wstrb : 8'd0;
+
+    // The retry takes the ADDRESS only, and only when no real requester wants it.
+    // ⚠️ `!(cdb.valid && cdb.is_store)` is CORRECTNESS, not politeness: store_pretx_valid
+    // above assumes the port is showing agu_addr_iss whenever no store-commit / walk / VU
+    // overrides it. A retry is a NEW override it does not know about, so without this term
+    // an executing store would latch the RETRY's PA as its own. Yielding also gets the
+    // priority right — the fresh store is the one whose probe we most want to land.
+    // Loop-free: core_dmem_ren / core_dmem_wen / core_dmem_is_amo are all computed from
+    // issue + register state, never from the core_dmem_vaddr mux this arm feeds.
+    // ⚠️ "no requester" is NOT the same as "nobody samples the MMU output". A request-free
+    // cycle still feeds dmu_dmem_addr to consumers that latch it on their OWN enable —
+    // above all the Stage-A dcache tag read (i_addr_r: dmu_dmem_addr, i_ren_r:
+    // lsr_capture), whose predicate is NOT a subset of core_dmem_ren. Retrying on such a
+    // cycle hands the dcache the RETRY's address. Hence the extra terms; dmem_mmu_idle
+    // also covers a STORE walk, which mmu_walk_inflight (load walks only) does not.
+    let sqrt_port_free: logic = !vu_mem_active && !store_drive && !mmu_walk_inflight
+        && !core_dmem_ren && !core_dmem_wen && !core_dmem_is_amo
+        && !(cdb.valid && cdb.is_store)
+        && dmem_mmu_idle && !lsr_capture && !lsr_drive && !replay_q && !iq_issue_valid;
+    always_comb {
+        sqrt_drive = 1'b0;
+        if SQ_RETRY {
+            if sqrt_sel_v && sqrt_port_free {
+                sqrt_drive = 1'b1;
+            }
+        }
+    }
+    // Capture on a clean probe hit, under the SAME translation-barrier rule the
+    // execute-time probe obeys. Staleness is safe by ORDER, not by luck: an SFENCE/satp
+    // write younger than this store commits AFTER it, so a PA captured early is still
+    // this store's PA at its own commit.
+    assign sqrt_cap = sqrt_drive && dmem_sprobe_ok && !rob_has_pending_xlate;
     // P9.3: mark the AMO/LR data read so the dcache serves it only from an
     // OWNED (E/M) line — an S hit or a miss raises an RFO fill first (the
     // in-cache RMW: the commit write then merges locally; a departure in
