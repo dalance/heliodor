@@ -611,3 +611,61 @@ has completed) closed both doors at once and let Block T's patch be deleted.
 This is the second consecutive block where `feedback_removed_bubble_was_protection` was the operative
 rule. The refinement worth carrying forward: **enumerate the mechanisms that create a protective
 bubble, not just the one you are removing.**
+
+---
+
+## 14. L1.b routing census (2026-08-19) — ⚠️ the first read was made with the WRONG census
+
+N=1 boot at the shipped default (`cy=00bcc050` = 12,370,000), `DBG_CENSUS=1`.
+
+### 14.1 What L1.a did to the store bucket
+
+| bucket | before L1.a | after |
+|---|---|---|
+| `store` sole-blocker | 701,128 (5.32 %) | **102,057 (0.82 %)** — −85 % |
+| ├ `store_drive` | 641,637 | **6,348** — **−99 %** |
+| └ `sb_cnt >= 3` | 49,485 | **85,937** — GREW |
+
+The port is still held **650,789 cy** by plain stores (15,975 by atomics), but it is almost never the
+thing a waiting load is stuck behind any more. L1.a did not remove the hold; it removed the hold's
+*consequence*. `sb_cnt >= 3` grew because stores now reach the buffer without waiting for the port, so
+it runs fuller — an expected second-order effect, and the largest store-side term left.
+
+### 14.2 🚨 The trap: a load-wait census cannot price a COMMIT-path change
+
+Read off §14.1 alone, L1.b's ceiling is **6,348 cy = 0.05 %** and the block is dead. That reading is
+**wrong**, and the error is worth recording because it is not the usual one:
+
+**A probe-missed store falls to the `sb_2cyc_ok` path, which costs a COMMIT CYCLE, not a load stall.**
+`rob_commit_ack`'s term `!(MEM_PIPE && c_is_store && !sb_elig && !c_is_amo && !store_fetched_q)` holds
+the store at cycle N (translate) and retires it at N+1. ~345,000 stores miss the probe on this boot,
+so ~345,000 cycles of **retire bandwidth** — **2.8 % of the boot** — are lost to the two-cycle path.
+`lw_cause_cnt`'s sole-blocker buckets count *loads waiting*; they are structurally blind to this.
+
+🎯 **Lesson: match the census to the PATH the change moves, not to the biggest pool you already have
+instrumented.** L4/W1a/L3 taught that a bucket bounds opportunity and not prize; this adds the prior
+question — *is the mechanism even in this census's population?*
+
+### 14.3 The build is a RETRY, not a speculative store walk
+
+Store execute events 1,855,598, priority-encoded:
+
+| outcome | events | share |
+|---|---|---|
+| probe **FIRED** (PA registered at execute) | 1,510,968 | **81.4 %** |
+| missed — **the shared port was busy** | 267,781 | **14.4 %** |
+| missed — TLB / perm / cacheability | 42,645 | 2.3 % |
+| missed — `rob_has_pending_xlate` | 34,204 | 1.8 % |
+
+**86 % of the misses are port contention, not TLB misses.** So L1.b does not need a speculative store
+PTW (an order more machine, and squarely in the retire/memory-ordering risk area); it needs a **probe
+retry for a ROB-resident store in an idle port cycle** — which is precisely the resource L1.a freed.
+
+**Sketch.** A retry pointer over the ROB store shadow selects an entry with `sh_store_pa_valid == 0`;
+on a cycle no one else drives the dmem port it presents that entry's `sh_store_addr` and captures
+`dmem_sprobe_pa/ok` into `sh_store_pa`/`sh_store_pa_valid`. Needs a SECOND write port into those two
+arrays (today only the CDB writes them) and one more arm on the `core_dmem_vaddr` mux.
+
+⚠️ **Staleness is already safe by ORDER, not by luck:** an SFENCE/satp write younger than the store
+commits *after* it, so a PA captured early is still that store's PA at its own commit. The retry must
+still honour `rob_has_pending_xlate` exactly as the execute-time probe does.
