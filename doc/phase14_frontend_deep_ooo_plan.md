@@ -1961,7 +1961,10 @@ build; price the build by flipping it.
 - **(b) The full L1 queue.** Effort: large, and it touches retire + memory ordering — the highest-risk
   area in the tree (R3's M3b minefield). Gate with the full ladder, SMP included.
 
-### 🏁 Block L1 first result (2026-08-19) — the contract, and the port. **N=1 −6.15 % / N=2 −4.20 % / N=4 −3.39 %**
+### 🏁🚢 Block L1 first result — SHIPPED (2026-08-19). The contract, and the port. **N=1 −6.15 % / N=2 −4.20 % / N=4 −3.39 %**
+
+`STORE_NOPORT=1` + `SB_DRAIN_SHADOW=1` + `LSR_B2B_SBQ=0` are the default path (`0f2fe0d`).
+New baselines: **N=1 `cy=00bcc050`** · **N=2 `cy=01089660`** · **N=4 `cy=017a1ce0`** · dhrystone 235,804 · coremark 394,546.
 
 Neither (a) nor (b) as framed: the RTL audit found the plan's own framing of `store_drive` was wrong,
 and the two pieces that fell out are **coupled** — the cheap one is unsafe without the contract.

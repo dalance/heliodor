@@ -475,7 +475,9 @@ page-edge 9, `asq_ld_ovl` 0. `lsr` sole-blocker 758,020 (5.75 %), now 100 % dcac
 
 ---
 
-## 13. ✅ MEASURED (2026-08-19) — L1.a + L1.c built, flipped, and priced. **N=1 −6.15 % / N=2 −4.20 %**, and `LSR_B2B_SBQ` is DELETED
+## 13. 🏁🚢 SHIPPED (2026-08-19) — L1.a + L1.c are the DEFAULT PATH. **N=1 −6.15 % / N=2 −4.20 % / N=4 −3.39 %**, and `LSR_B2B_SBQ` is DELETED
+
+`STORE_NOPORT=1` + `SB_DRAIN_SHADOW=1` + `LSR_B2B_SBQ=0` ship as the default path (`0f2fe0d`). Full Veryl ladder + Verilator NBA 4/4 green; revert path proven (§13.8). New baselines: **N=1 `cy=00bcc050`** · **N=2 `cy=01089660`** · **N=4 `cy=017a1ce0`** · dhrystone 235,804 · coremark 394,546 · litmus N=2 `cy=002e3bf0` / N=4 `cy=003b3440`.
 
 Both scaffolds were built DEAD, verified, flipped, and priced by the cycle counter. Two of §11's
 predictions held and **one ordering decision in §11 was WRONG and is corrected below.**
