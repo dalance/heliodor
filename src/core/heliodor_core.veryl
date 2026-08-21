@@ -32,6 +32,12 @@ pub module heliodor_core #(
     // configurations leave it 0: no remote writers exist, and the poison
     // replays would only cost cycles.
     param SMP_COHERENT: u8 = 0,
+    // ── Block N step 3 (cp_mshr_mlp_plan.md §10.2): the instruction side uses its
+    // OWN mem_ctrl transaction slot (o_imemr_*) instead of sharing the D-side read
+    // port through ic_route. A PARAMETER, not a const: the bare testbenches that
+    // instantiate this core directly have no mem_ctrl to give it a second slot, so
+    // they keep the default 0 and the shared path. The SoCs pass 1.
+    param ID_SPLIT: bit = 0,
     // P9.6: SET TO 1 IN SoCs WITH THE mem_ctrl/L2 MEMORY SYSTEM (both N=1 and
     // SMP). The instruction side (I-cache fill + I-PTW PTE read) is then
     // COHERENT — it reads through L2 with recall-on-owned, so a modified D-cache
@@ -95,6 +101,16 @@ pub module heliodor_core #(
     // (the request is asserted ungated, so the gate only affects completion).
     o_dmem_req   : output logic,
     i_dmem_grant : input  logic,
+    // ── Block N step 3 (cp_mshr_mlp_plan.md §10.2): the instruction side's OWN
+    // mem_ctrl transaction slot. Until now the I-cache fill and the I-side page-table
+    // walker shared the D-side read port through `ic_route`, so an I-fill and a
+    // D-fill were mutually exclusive (census bucket 101 = 146,647 cy at N=1). These
+    // ports carry the I side when ID_SPLIT=1; at 0 they are tied off and the old
+    // ic_route mux is unchanged.
+    o_imemr_addr : output logic<64>,
+    o_imemr_req  : output logic    ,
+    i_imemr_grant: input  logic    ,
+    i_imemr_rdata: input  logic<64>,
 
     // S23: the dcache mem side is split into a READ channel (o_dmem_addr/
     // o_dmem_ren/i_dmem_rdata + o_dmem_req/i_dmem_grant above, fills and miss
@@ -4067,6 +4083,8 @@ pub module heliodor_core #(
     var ic_mem_req  : logic    ;
     var ic_grant    : logic    ;
     var ic_fill_done: logic    ;
+    // The I side's read data: its own channel when split, else the shared D port.
+    let is_rdata: logic<64> = if ID_SPLIT ? i_imemr_rdata : i_dmem_rdata;
     var ic_owns     : logic    ; // arbiter: instruction side owns the read port (txn in flight)
     var ic_route    : logic    ; // arbiter: route the shared read port to the instruction side
     // P9.6 phase 2: the instruction side has TWO consumers of the shared read
@@ -4110,7 +4128,7 @@ pub module heliodor_core #(
         o_stall     : icache_stall       ,
         o_stall_comb: icache_stall_comb  ,
         o_mem_addr  : ic_mem_addr        ,
-        i_mem_rdata : i_dmem_rdata        , // P9.6: 64-bit dword stream (shared D port)
+        i_mem_rdata : is_rdata            , // P9.6/Block N: 64-bit dword stream (own channel when split)
         o_mem_req   : ic_mem_req         ,
         i_mem_grant : ic_grant           ,
         o_fill_done : ic_fill_done       ,
@@ -12086,8 +12104,19 @@ pub module heliodor_core #(
     // imem_ptw_addr_w → iptw_off, which would re-point mem_ctrl's beat to the
     // wrong dword of the latched line and corrupt the captured PTE).
     let is_mem_addr : logic<64> = if is_ptw ? (if iptw_busy ? iptw_addr_q : iptw_rd_addr) : ic_mem_addr;
-    assign ic_route = ic_owns || (is_req && !dc_mem_req);
-    let is_grant    : logic     = i_dmem_grant && ic_route;
+    // Block N step 3: with its own slot the I side never routes onto the D port, so
+    // ic_route folds to 0 and the D side owns o_dmem_* unconditionally. ic_owns and
+    // is_ptw_q stay — they still pick I-PTW vs I-fill and track the 8-beat STREAM;
+    // what disappears is only the arbitration AGAINST the D side.
+    assign ic_route = if ID_SPLIT ? 1'b0 : (ic_owns || (is_req && !dc_mem_req));
+    assign o_imemr_req  = ID_SPLIT && is_req;
+    assign o_imemr_addr = is_mem_addr;
+    // NOTE: no `is_req` term on the split arm. mem_ctrl's STREAM beats do not depend on
+    // i_hreq (stream_ok is purely `slot in STREAM && i_haddr line == line_q`), and is_req
+    // CAN drop mid-transaction (an I-fill that aborts on a redirect). The old shared path
+    // kept receiving beats through ic_route's `ic_owns` term for exactly this reason;
+    // gating on is_req here loses beats and strands the fill.
+    let is_grant    : logic     = if ID_SPLIT ? i_imemr_grant : (i_dmem_grant && ic_route);
     let iptw_grant  : logic     = is_grant && is_ptw;  // STREAM beat for the I-PTW
     assign ic_grant = is_grant && !is_ptw;             // STREAM beat for the I-fill
     assign dc_grant = i_dmem_grant && !ic_route;
@@ -12102,7 +12131,7 @@ pub module heliodor_core #(
                 if is_done {
                     ic_owns = 1'b0;
                 }
-            } else if is_req && !dc_mem_req && i_dmem_grant {
+            } else if is_req && is_grant {
                 ic_owns  = 1'b1;
                 is_ptw_q = is_ptw;
             }
@@ -12124,7 +12153,7 @@ pub module heliodor_core #(
         } else {
             if iptw_busy {
                 if iptw_grant {
-                    iptw_data = i_dmem_rdata;
+                    iptw_data = is_rdata;
                     if iptw_cnt == 3'd7 {
                         iptw_busy   = 1'b0;
                         iptw_done_q = 1'b1;
@@ -12135,7 +12164,7 @@ pub module heliodor_core #(
                 }
             } else {
                 // Accept for the I-PTW (the IS port granted while I-PTW is the pick).
-                if !ic_owns && is_ptw && is_req && !dc_mem_req && i_dmem_grant {
+                if !ic_owns && is_ptw && is_req && is_grant {
                     iptw_busy   = 1'b1;
                     iptw_cnt    = 3'd0;
                     iptw_addr_q = iptw_rd_addr; // latch the read addr for the txn

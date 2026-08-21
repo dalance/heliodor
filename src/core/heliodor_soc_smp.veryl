@@ -161,8 +161,8 @@ pub module heliodor_soc_smp #(
     var bus_wgrant  : logic     [N_HARTS]    ; // arbiter -> per-hart WRITE grant
     // P9.1: mem_ctrl <-> SoC wires (split-transaction DRAM reads).
     var ctrl_bus_rreq: logic     [N_HARTS];
-    var ctrl_hgrant  : logic     [N_HARTS];
-    var ctrl_hrdata  : logic<64> [N_HARTS];
+    var ctrl_hgrant  : logic     [N_HARTS * 2];
+    var ctrl_hrdata  : logic<64> [N_HARTS * 2];
     var ctrl_mem_addr: logic<64>          ;
     var ctrl_mem_ren : logic              ;
     var l2_caddr     : logic<64>          ;
@@ -189,8 +189,8 @@ pub module heliodor_soc_smp #(
     var l2_inst_port_busy: logic          ; // P3.a L2 1R1W: install-yields-to-write hold
     var l2_w_hit         : logic          ; // P3.b L2 1R1W: write hits L2 (needs merge-read), gated
     var l2_w_spec_ready  : logic          ; // P3.b L2 1R1W: pending write-hit's old line spec-read
-    var ctrl_busy_line: logic<58> [N_HARTS];
-    var ctrl_busy_v   : logic     [N_HARTS];
+    var ctrl_busy_line: logic<58> [N_HARTS * 2];
+    var ctrl_busy_v   : logic     [N_HARTS * 2];
     var l2_w_sharers   : logic<N_HARTS>   ;
     var l2_w_sharers_hi: logic<N_HARTS>   ;
     var l2_w_owned     : logic            ;
@@ -201,9 +201,9 @@ pub module heliodor_soc_smp #(
     var ctrl_inv2_addr: logic<64>          ;
     // P9.2 Phase B: write-back / MESI wires.
     var c_dmemw_wb    : logic     [N_HARTS]; // core → bus: writeback flag
-    var c_dmem_rfo    : logic     [N_HARTS]; // core → mem_ctrl: store fill = RFO
-    var c_dmem_iread  : logic     [N_HARTS]; // P9.6: core → mem_ctrl: I-cache fill (uncounted)
-    var ctrl_hexcl    : logic     [N_HARTS]; // mem_ctrl → core: grant state
+    var c_dmem_rfo    : logic     [N_HARTS * 2]; // core → mem_ctrl: store fill = RFO (per SLOT)
+    var c_dmem_iread  : logic     [N_HARTS * 2]; // P9.6: core → mem_ctrl: I-cache fill (uncounted, per SLOT)
+    var ctrl_hexcl    : logic     [N_HARTS * 2]; // mem_ctrl → core: grant state (per SLOT)
     var ctrl_probe_v  : logic     [N_HARTS]; // recall engine probes
     var ctrl_probe_addr: logic<64>         ;
     var ctrl_probe_self: logic             ;
@@ -425,14 +425,39 @@ pub module heliodor_soc_smp #(
     // mem_ctrl headers). Per-hart slots: one outstanding line read per hart;
     // gather beats are arbitrated through the bus's read-channel rotation
     // (which keeps the AMO-lock pinning + the S20R anti-starvation shape).
+    // ── Block N step 3: TWO transaction slots per hart (cp_mshr_mlp_plan.md §10.2). ──
+    // Slot 2h is the D side (loads, store-RFO fills, uncached MMIO), slot 2h+1 the
+    // I side (I-cache fill + I-side page-table walk). An I-side read is always DRAM
+    // (a non-DRAM fetch uses the o_imem passthrough) and always an uncounted I-read.
+    var mc_req  : logic     [N_HARTS * 2];
+    var mc_addr : logic<64> [N_HARTS * 2];
+    var mc_dram : logic     [N_HARTS * 2];
+    var c_imemr_addr: logic<64> [N_HARTS];
+    var c_imemr_req : logic     [N_HARTS];
+    // SLOT-MAJOR (see mem_ctrl's header): slots [0, N_HARTS) are the D side, one per
+    // hart in hart order, and [N_HARTS, 2*N_HARTS) the I side. Hart-major numbering
+    // would hand hart 0 two consecutive slots and let it win both lowest-id-wins
+    // encoders in mem_ctrl, starving the higher harts.
+    for h in 0..N_HARTS :gen_mcslot {
+        assign mc_req[h]      = c_dmem_req[h];
+        assign mc_addr[h]     = c_dmem_addr[h];
+        assign mc_dram[h]     = in_dram[h];
+        assign mc_req[N_HARTS + h]  = c_imemr_req[h];
+        assign mc_addr[N_HARTS + h] = c_imemr_addr[h];
+        assign mc_dram[N_HARTS + h] = 1'b1;
+        assign c_dmem_rfo[N_HARTS + h]   = 1'b0;
+        assign c_dmem_iread[N_HARTS + h] = 1'b1;
+    }
+
     inst u_mctrl: mem_ctrl #(
         N_HARTS: N_HARTS,
+        SPH    : 2      ,
     ) (
         clk                                 ,
         rst                                 ,
-        i_hreq        : c_dmem_req          ,
-        i_haddr       : c_dmem_addr         ,
-        i_hdram       : in_dram             ,
+        i_hreq        : mc_req              ,
+        i_haddr       : mc_addr             ,
+        i_hdram       : mc_dram             ,
         o_hgrant      : ctrl_hgrant         ,
         o_hrdata      : ctrl_hrdata         ,
         i_hrfo        : c_dmem_rfo          , // P9.2: store fill = RFO
@@ -498,6 +523,7 @@ pub module heliodor_soc_smp #(
     // write-passthrough only.
     inst u_l2: l2cache #(
         N_HARTS: N_HARTS,
+        SPH    : 2      ,
     ) (
         clk                        ,
         rst                        ,
@@ -689,6 +715,7 @@ pub module heliodor_soc_smp #(
             assign c_dmem_wstrb[h * 8 + l] = core_wstrb[l];
         }
         inst u_core: heliodor_core #(
+            ID_SPLIT: 1, // Block N: the I side has its own mem_ctrl slot
             RESET_PC    : RESET_PC,
             HART_ID     : h as 8  ,
             SMP_COHERENT: 1       , // P9.2: eviction → ROB CoRR poison
@@ -712,7 +739,11 @@ pub module heliodor_soc_smp #(
             o_dmem_wdata_hi   : c_dmem_wdata_hi[h],
             o_dmem_wstrb_hi   : c_dmem_wstrb_hi[h],
             o_dmem_req        : c_dmem_req[h]     ,
-            i_dmem_grant      : ctrl_hgrant[h]    , // P9.1: mem_ctrl grant
+            i_dmem_grant      : ctrl_hgrant[h]    , // P9.1: mem_ctrl grant (D slot)
+            o_imemr_addr      : c_imemr_addr[h]  , // Block N: I-side read channel (slot 2h+1)
+            o_imemr_req       : c_imemr_req[h]   ,
+            i_imemr_grant     : ctrl_hgrant[N_HARTS + h],
+            i_imemr_rdata     : ctrl_hrdata[N_HARTS + h],
 
             o_dmemw_addr      : c_dmemw_addr[h]   ,
             o_dmemw_req       : c_dmemw_req[h]    ,

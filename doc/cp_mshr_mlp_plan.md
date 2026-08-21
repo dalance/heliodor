@@ -633,3 +633,172 @@ and in all three of its use sites `slot_bus_req` is 1 by construction (GATHER or
 Next: SPH=2 with the second slot left unused (must stay cycle-identical — slot 1 never accepts,
 so the lookup/accept priority encoders and the bus aggregation see no change), then wire the
 core's I-side to it.
+
+### 10.1 Step 2 — a second slot, tied off
+
+`heliodor_soc` widens the mem_ctrl-facing wires to 2 and instantiates `mem_ctrl` / `l2cache` with
+`SPH: 2`. Slot 1 is tied off (`ctrl_hreq[1] = 0`). An IDLE slot never accepts, never selects the
+lookup port, never requests the bus and reports `o_busy_v = 0`, so this stage must be
+**cycle-identical** — it exercises the widened priority encoders and the bus aggregation with the
+second slot present but silent.
+
+### 10.2 Step 3 — the core's instruction-side read channel (design)
+
+Today `heliodor_core` muxes four requesters onto one port:
+
+```
+assign ic_route   = ic_owns || (is_req && !dc_mem_req);   // I-side wins only when D is idle
+assign o_dmem_req = if ic_route ? is_req : dc_mem_req;
+assign dc_grant   = i_dmem_grant && !ic_route;
+```
+
+Step 3 adds `o_imemr_{req,addr}` / `i_imemr_{grant,rdata}` and a const gate `ID_SPLIT`:
+
+| | `ID_SPLIT=0` (dead) | `ID_SPLIT=1` |
+|---|---|---|
+| `ic_route` | unchanged | `1'b0` — the D port is the D side's, always |
+| `o_imemr_req` | `1'b0` | `is_req` |
+| I-side grant | `i_dmem_grant && ic_route` | `i_imemr_grant` |
+| I-side data | `i_dmem_rdata` | `i_imemr_rdata` |
+| `dc_grant` | `i_dmem_grant && !ic_route` | `i_dmem_grant` |
+
+`ic_owns` / `is_ptw_q` stay: they still pick between the I-fill and the I-PTW and track the
+transaction across its 8 STREAM beats — what disappears is only the *arbitration against the D
+side*. On the SoC side slot 1 gets `i_hdram = 1` (an I-side mem_ctrl read is always DRAM; a
+non-DRAM fetch uses the separate `o_imem` passthrough) and `i_iread = 1` (uncounted — no
+directory sharer is added for an instruction fill).
+
+#### 10.2.1 A trap in this refactor, and why N=1 caught it
+
+Splitting one identifier into two is not a textual edit: **each occurrence's meaning is fixed by
+the array it indexes, not by where it appears.** Two adjacent loops in `mem_ctrl` look identical
+and mean opposite things:
+
+```
+for h in 0..? { if i_l2_c_shr[h] { lk_owner = h; } }        // directory mask -> HART
+for h in 0..? { if lk_go_all[h]  { o_cadd_hart = ...; } }   // slot array    -> SLOT
+```
+
+Both were flipped the wrong way in the first pass. The one that mattered was caught by
+`veryl check`'s `invalid_select` — *because this stage runs at N_HARTS=1 with SPH=2*, so a hart
+mask indexed by a slot number is provably out of range. Had the first flip been made at
+N_HARTS=2/SPH=2, both indices would have been in range and the bug would have been silent: the
+recall engine would occasionally probe the wrong hart.
+
+Also caught in the same sweep: `o_w_cadd_hart` (the c2c directory add) was still writing the
+slot index into a hart field.
+
+Rule for the rest of this block: **when a loop bound changes, read the loop body and classify by
+the arrays it subscripts** — and do the first flip at the width where a mistake is out of range.
+
+### 10.3 Step 3 built — the I side has its own slot
+
+`heliodor_core` gains `o_imemr_{req,addr}` / `i_imemr_{grant,rdata}` and `const ID_SPLIT`. At 1:
+
+- `ic_route` folds to 0 — the D side owns `o_dmem_*` unconditionally, and `o_dmem_iread` with it;
+- `o_imemr_req = is_req`, `o_imemr_addr = is_mem_addr` (the existing I-PTW / I-fill sub-mux);
+- `is_grant = i_imemr_grant && is_req`, and the I-side read data comes off `is_rdata`
+  (`i_imemr_rdata` when split), feeding both the I-cache fill and the I-PTW dword capture.
+
+`ic_owns` / `is_ptw_q` survive unchanged: they still choose I-PTW over I-fill and hold the
+transaction across its 8 STREAM beats. Both accept sites were rewritten through `is_grant`
+(`is_req && !dc_mem_req && i_dmem_grant` → `is_req && is_grant`), which is an identity at
+ID_SPLIT=0 inside the `!ic_owns` arm and the correct condition at 1.
+
+`heliodor_soc` maps slot 0 → D, slot 1 → I. `heliodor_soc_smp` builds a per-slot request bundle
+(`mc_req`/`mc_addr`/`mc_dram`, slot `2h` = D and `2h+1` = I) and moves every per-hart core wire
+to the even slot; `i_hdram = 1` and `i_iread = 1` are constants on the odd slots.
+
+### 10.4 N1 MEASURED — the I side gets its own slot
+
+| arm | N=1 boot | vs default |
+|---|---|---|
+| default (shared read channel) | 12,370,000 (`00bcc050`) | — |
+| **ID_SPLIT=1, SPH=2** | **12,230,000 (`00ba9d70`)** | **−140,000 = −1.13 %** |
+
+Census bucket 101 (`ic_owns && dc_mem_req` — the I side holding the channel while the D side
+wants it) predicted 146,647 cy. The build recovers **140,000 of them, 95 % of the bucket.** That
+is an unusually clean agreement between a census and a build for this campaign, and it is worth
+noting *why* it held here when it did not for `dcache_stall` in §8.1: bucket 101 counts a
+**structural conflict between two named requesters**, not a stall whose cost the out-of-order
+core might already be hiding. When the census predicate IS the mechanism, the bucket is the
+amount; when it is a symptom, it is not.
+
+**One bug on the way, worth recording.** The first build booted 77 k instructions and died. The
+cause was a single extra term: `is_grant = i_imemr_grant && is_req`. `mem_ctrl`'s STREAM beats do
+**not** depend on `i_hreq` — `stream_ok` is `slot in STREAM && i_haddr line == line_q` — and
+`is_req` can drop mid-transaction (an I-fill abandoned by a redirect). The shared path never
+noticed because `ic_route` carries an `ic_owns` term that keeps routing the port for the whole
+transaction. Removing the `is_req` term fixed it. The general shape: **when you split a shared
+resource, the state that used to keep the shared path open is not automatically reproduced by
+the new dedicated path.**
+
+#### 10.4.1 `ID_SPLIT` must be a PARAMETER, not a const
+
+The first full-suite run after N1 booted came back **23 passed / 229 failed** — including
+single-hart tests that have nothing to do with SMP. The cause is structural, not a logic bug:
+six testbenches instantiate `heliodor_core` **directly** against a simple memory model
+(`test_arch_common`, `test_bench`, `test_smoke`, `test_hello`, `test_smode_plic`,
+`test_linux_boot`). They have no `mem_ctrl`, so there is no second slot to give the instruction
+side — with `ID_SPLIT` a module-internal `const`, they routed their I-fills to an unconnected
+port and starved instruction fetch.
+
+Rule: **a flag that creates a new EXTERNAL dependency (a port that must be wired) belongs in the
+parameter list, not in a const.** A const is forced on every instantiation; the wiring it
+requires is not. `ID_SPLIT` now defaults to 0 (shared path, exactly as before) and the two SoCs —
+the only instantiators that own a `mem_ctrl` — pass 1.
+
+This is the mirror of `feedback_dead_scaffold_must_constant_fold`: a const is the right home for
+a scaffold that must fold away *inside* the module, and the wrong home for one whose "off" state
+is what an outside instantiator needs.
+
+#### 10.4.2 Slot numbering is not free: hart-major starves the higher harts
+
+With `ID_SPLIT=1` the single-hart boot was fine (−1.13 %) and the arch suite passed 251/1, but
+**litmus N=2 timed out and the N=2 SMP boot never reached SBI shutdown** — in both cases with
+every hart still retiring instructions (hart 1 spinning in firmware, 52 M retired). Not a
+deadlock: a starvation.
+
+The first numbering was **hart-major** — slot `2h` = hart h's D side, slot `2h+1` = its I side.
+`mem_ctrl` picks with two lowest-id-wins encoders: the accept arbiter, and the **single L2 lookup
+port**. The second one matters more than it looks, because a slot that hits an OWNED line stays
+in `ST_LOOKUP` and *re-enters the selection every cycle* while the recall engine works. Under
+hart-major, hart 0 owns slots 0 and 1, so both of its transactions outrank every slot of hart 1 —
+and while either of them is retrying, hart 1 cannot look anything up at all.
+
+Renumbered **slot-major**: slots `[0, N_HARTS)` are the D side (one per hart, in hart order) and
+`[N_HARTS, 2*N_HARTS)` the I side, so `hart_of(s) = s % N_HARTS`. The inter-hart order of the D
+side is then exactly what the pre-Block-N module had, and the I side sits below all of it. At
+SPH=1 this is the identity, same as `s / SPH` was.
+
+Worth generalizing: **when you widen a resource that is arbitrated by a priority encoder, the
+INDEX ORDER is part of the design, not bookkeeping.** Adding a second slot per hart doubled
+hart 0's share of the priority space without anyone choosing that.
+
+With slot-major numbering the suite is **252/0** and litmus N=2 comes back `cy=002ed830` —
+**bit-identical to the shipped default**, which is itself informative: the litmus battery is a
+handful of tight loops with essentially no I-cache misses, so splitting the I and D channels
+changes nothing there. The win is a boot-shaped one, exactly as census bucket 101 said.
+
+### 10.5 N1 result — and it SCALES with hart count
+
+| gate | default | N1 (`ID_SPLIT=1`, `SPH=2`) |
+|---|---|---|
+| suite | 252/0 | **252/0** |
+| **N=1 boot** | 12,370,000 (`00bcc050`) | **12,230,000 (`00ba9d70`) = −1.13 %** |
+| **N=2 SMP boot** | 16,950,000 (`0102a2f0`) | **16,420,000 (`00fa8ca0`) = −3.13 %** |
+| litmus N=2 | `002ed830` | `002ed830` (bit-identical) |
+
+The N=1 number matched census bucket 101 to 95 %. **The N=2 number is nearly 3× the N=1 one**,
+which the census could not have predicted — bucket 101 is a per-hart count from a single-hart
+boot. Two effects compound at N=2 and neither is visible at N=1:
+
+- there are twice as many I-side transactions competing for the same shared L2 lookup port and
+  DRAM gather rotation, so every I/D conflict a split removes also removes a knock-on delay to
+  the *other* hart's transactions;
+- the higher hart is the one that was losing the shared channel most often (the arbiter gives
+  the D side strict priority, and hart 1's D side is busiest exactly when hart 0's I side is).
+
+This is the same shape as Block T (−1.93 % at N=1 → −5.28 % at N=4) and the opposite of the O4
+ownership-latency oracle (§8.4), which diluted with width. Worth measuring N=4 before drawing the
+curve, but the direction is already the useful one.
