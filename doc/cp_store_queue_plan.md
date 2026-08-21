@@ -816,3 +816,40 @@ and never enters the local array, so "architecturally readable" for it is a bus-
 an L1 lifetime one. The shadow covers it for one cycle, which is not obviously the right lifetime.
 ⚠️ **Do not lengthen the shadow on suspicion** — measure whether a `wt_fires` drain ack is ever
 straddled first. Absent evidence, it stays a recorded standing item, not a speculative fix.
+
+### 16.5 ✅ `wt_fires` CLOSED by inspection — no measurement needed, and no shadow lengthening
+
+§16.4 left the full-line write-through drain open on the suspicion that "one cycle may not be the
+right shadow lifetime" there, because such a drain acks on its **bus write grant** and never enters
+the local array. Reading `dcache.veryl` answers it without a probe, and the answer is that the path
+is already sound:
+
+```veryl
+// P9.2: full-line WRITE-THROUGH drain — drop our own (clean S) copy; the home
+// merges the line and invalidates the other sharers.
+if wt_fires {
+    if shit_0 { valid_0[sindex] = 1'b0; }   // …and shit_1..3
+}
+```
+
+The local S copy is **invalidated on the same edge as the ack** (`:2032`). So:
+
+1. **Local reader, after the ack** — the line is gone, so it MISSES and refills from the home, which
+   has the merged bytes. No stale local hit is possible.
+2. **Local reader straddling the ack** — Stage A (cycle N) may snapshot the still-valid stale S copy
+   and complete at N+1. That is the *same one-cycle skew* as the `store_can_drain` path, and the
+   drain shadow covers it *identically*: `sb_cnt` still counts the entry at N, and `sbs_v_q` covers
+   it at N+1. Nothing special is needed.
+3. **AMO/LR** — now wait on `sb_empty_eff`, i.e. one cycle past the ack, by which point the
+   invalidate has landed and the line must be refetched from the home. ✅
+4. **Remote reader** — the home's merge plus its invalidation of the other sharers is the COHERENCE
+   mechanism. That is not an L1 entry-lifetime question at all, and the shadow has no role in it.
+
+⇒ The open item was based on the right instinct ("ack ≠ readable") applied to a path that had already
+solved it a different way. **Closed. No shadow lengthening — which is exactly why the standing item
+said to measure before lengthening rather than lengthen on suspicion.**
+
+**Block L1 is complete.** L1.a, L1.c, `LSR_B2B_SBQ` deletion and `SB_EMPTY_EFF` shipped; L1.b refuted
+and parked with its root cause (§15); L1.d deliberately NOT taken — its structural claim is weaker
+than the checklist suggests (§7: the age structure is already exact, only the key differs) and
+`FWD_PA=1` measured exactly zero, against the highest-risk net in the tree.
