@@ -594,3 +594,42 @@ Two consequences for the plan:
   were cycles, a prize that shrinks with width is the wrong prize. The reason to build it is that
   the machine has one miss context and every modern core has 8-16 — and that argument does not
   depend on the boot number at all.
+
+---
+
+## 10. Build log — N1 step 1: separate "slot" from "hart" in `mem_ctrl` / `l2cache`
+
+`mem_ctrl` used `N_HARTS` for **two different quantities** and got away with it only because the
+D-cache has one fill FSM: how many L1 caches the directory addresses (a hart count) and how many
+line reads can be in flight (a slot count). Untangling them is the whole of step 1.
+
+Introduced `param SPH` (slots per hart) and `param N_SLOTS = N_HARTS * SPH`, then split every use:
+
+| stays per-HART | becomes per-SLOT |
+|---|---|
+| `i_l2_c_shr`, `i_iv_sharers`, `i_inst_oldshr`, `i_w_shr(_hi)` (directory masks) | `i_hreq/i_haddr/i_hdram/o_hgrant/o_hrdata/i_hrfo/i_iread/o_hexcl` |
+| `o_probe_v`, `i_probe_ack`, `o_inv1_v`, `o_inv2_v` (they address L1s) | `st_all`/`line_all`/`gcnt_all`/`iok_all`/`conf_all`/`rfo_all`/`iread_all`/`buf_all`/… |
+| `o_bus_rreq`, `i_bus_rgrant` (memory_bus is unchanged) | `lk_sel_all`, `acc_line_busy`, `accept`, `inst_go_all`, `inst_excl_w`, `o_busy_line/v` |
+| `N_HARTS == 1` grant-policy tests | `l2cache`'s `i_busy_line/v` + `bm_0..3` (victim exclusion is per transaction) |
+
+Four places needed a real **slot → hart map** (`h / SPH`, the identity at SPH=1):
+- the c2c capture's "not my own writeback" test (`i_w_hart != hart_of(slot)`),
+- `lk_oh`, which is ANDed with the directory's sharer mask — it must be a HART one-hot,
+- `o_cadd_hart`, the directory sharer add,
+- the install one-hot, which is consumed **both** as a slot mask (go/hold) and as a hart mask
+  (the abort-invalidate target and the in-place-overwrite sharer test) — the hart view is now
+  derived explicitly as `inst_sel_hart_oh`.
+
+`inst_sel_h` widened 3 → 4 bits (up to 8 harts × SPH slots). The DRAM read channel stays **one
+request per hart**: each slot drives `slot_bus_req`, a per-hart OR produces `o_bus_rreq[h]`, and
+the hart's single grant goes to its lowest-indexed requesting slot (`slot_bus_gnt`). At SPH=1 the
+`lower` term folds to 0 and this is exactly the old direct wiring.
+
+**Verified logically identical** by diffing the generated SystemVerilog against a build of the
+pre-change source: every hunk is either a rename (`N_HARTS` → `N_SLOTS`, same value at SPH=1),
+`h / SPH` → `h`, or the new aggregation collapsing to `i_bus_rgrant[h] && slot_bus_req[h]` —
+and in all three of its use sites `slot_bus_req` is 1 by construction (GATHER or legacy).
+
+Next: SPH=2 with the second slot left unused (must stay cycle-identical — slot 1 never accepts,
+so the lookup/accept priority encoders and the bus aggregation see no change), then wire the
+core's I-side to it.

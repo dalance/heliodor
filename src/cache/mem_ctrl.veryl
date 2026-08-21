@@ -68,6 +68,15 @@
 //    write targeting a line owned by another hart).
 pub module mem_ctrl #(
     param N_HARTS  : u32 = 1 ,
+    // ── Block N (cp_mshr_mlp_plan.md §5): transaction SLOTS per hart. ──
+    // This module used N_HARTS for two different things: how many L1 caches the
+    // directory addresses (a hart count) and how many line reads can be in flight
+    // (a slot count). They were the same number only because the D-cache has one
+    // fill FSM. SPH separates them; at SPH=1, N_SLOTS == N_HARTS and every
+    // slot->hart map (slot / SPH) is the identity, so the module is byte-identical
+    // to the pre-Block-N version.
+    param SPH      : u32 = 1 ,
+    param N_SLOTS  : u32 = N_HARTS * SPH,
     param DRAM_WAIT: u32 = 20, // accept -> gather start (DRAM latency model), >= 1
     param HIT_WAIT : u32 = 2 , // L2 copy -> stream start (L2 latency model), >= 1
 ) (
@@ -75,21 +84,21 @@ pub module mem_ctrl #(
     rst: input reset,
     // Hart side (read channel, per hart): request/addr from the dcache,
     // i_hdram = SoC's DRAM decode of the addr. o_hgrant feeds i_memr_grant.
-    i_hreq  : input  logic     [N_HARTS],
-    i_haddr : input  logic<64> [N_HARTS],
-    i_hdram : input  logic     [N_HARTS],
-    o_hgrant: output logic     [N_HARTS],
-    o_hrdata: output logic<64> [N_HARTS],
+    i_hreq  : input  logic     [N_SLOTS],
+    i_haddr : input  logic<64> [N_SLOTS],
+    i_hdram : input  logic     [N_SLOTS],
+    o_hgrant: output logic     [N_SLOTS],
+    o_hrdata: output logic<64> [N_SLOTS],
     // P9.2: read-for-ownership flag (store fill) + grant state to the L1
     // (sampled at fill completion: 1 = E/M-capable, 0 = S).
-    i_hrfo : input  logic [N_HARTS],
+    i_hrfo : input  logic [N_SLOTS],
     // P9.6: the request is an I-cache fill — an UNCOUNTED coherent read. It
     // looks up / recalls / gathers exactly like a normal read but adds NO
     // directory sharer (no cadd) and does NOT install the gathered line into
     // the L2; on GATHER completion it streams straight to the L1. The I-cache
     // is kept coherent by FENCE.I + recall-on-owned, not by directory tracking.
-    i_iread: input  logic [N_HARTS],
-    o_hexcl: output logic [N_HARTS],
+    i_iread: input  logic [N_SLOTS],
+    o_hexcl: output logic [N_SLOTS],
     // Bus side: read-channel cycle requests (gather beats + legacy reads).
     // The memory_bus arbitrates these with its existing rotation + AMO lock.
     o_bus_rreq  : output logic [N_HARTS],
@@ -123,8 +132,8 @@ pub module mem_ctrl #(
     // cycle → HOLD the install (retry next cycle). 0 unless L2_PORTS_1R1W (l2cache).
     i_inst_port_busy: input logic           ,
     i_inst_oldshr: input logic<N_HARTS>     , // Phase B: in-place install sharers
-    o_busy_line : output logic<58> [N_HARTS],
-    o_busy_v    : output logic     [N_HARTS],
+    o_busy_line : output logic<58> [N_SLOTS],
+    o_busy_v    : output logic     [N_SLOTS],
     // P9.2: writer hart + sharer masks of the granted write's line(s), for
     // precise invalidate emission (replaces the all-hart broadcast).
     // i_w_wb: the write is an L1 WRITEBACK — no invalidates (the home just
@@ -193,18 +202,24 @@ pub module mem_ctrl #(
     let w_line_hi: logic<58> = w_addr_hi[63:6];
 
     // Cross-hart visible slot state (each element driven by its own slot).
-    var st_all     : logic<3>  [N_HARTS]    ;
-    var line_all   : logic<58> [N_HARTS]    ;
-    var gcnt_all   : logic<3>  [N_HARTS]    ;
-    var iok_all    : logic     [N_HARTS]    ;
-    var conf_all   : logic     [N_HARTS]    ;
-    var rfo_all    : logic     [N_HARTS]    ; // P9.2: slot transaction is an RFO
-    var iread_all  : logic     [N_HARTS]    ; // P9.6: slot transaction is an I-read (uncounted)
-    var inst_go_all: logic     [N_HARTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
-    var lk_go_all  : logic     [N_HARTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
+    var st_all     : logic<3>  [N_SLOTS]    ;
+    var line_all   : logic<58> [N_SLOTS]    ;
+    var gcnt_all   : logic<3>  [N_SLOTS]    ;
+    var iok_all    : logic     [N_SLOTS]    ;
+    var conf_all   : logic     [N_SLOTS]    ;
+    var rfo_all    : logic     [N_SLOTS]    ; // P9.2: slot transaction is an RFO
+    var iread_all  : logic     [N_SLOTS]    ; // P9.6: slot transaction is an I-read (uncounted)
+    var inst_go_all: logic     [N_SLOTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
+    var lk_go_all  : logic     [N_SLOTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
     var lk_excl_w  : logic                  ; // P9.2: grant state for the lookup go
-    var inst_excl_w: logic     [N_HARTS]    ; // P9.2: grant state at install go
-    var buf_all    : logic<64> [N_HARTS * 8];
+    var inst_excl_w: logic     [N_SLOTS]    ; // P9.2: grant state at install go
+    var buf_all    : logic<64> [N_SLOTS * 8];
+    // Block N: the DRAM read channel stays ONE request per hart — memory_bus is
+    // unchanged. A hart's slots share it: any slot may ask, and the lowest-indexed
+    // asking slot of that hart takes the grant (aggregation below the slot loop).
+    // Identity at SPH=1, where each hart has exactly one slot.
+    var slot_bus_req: logic [N_SLOTS];
+    var slot_bus_gnt: logic [N_SLOTS];
 
     // P9.2 Phase B: recall engine state (registered; probes are asserted
     // while busy, completion = clean probe-ack OR the owner's WB arriving on
@@ -215,7 +230,7 @@ pub module mem_ctrl #(
     var eng_self: logic    ; // requester == probed owner (lk self-recall)
 
     // P9.2: active-transaction lines for the L2's victim exclusion.
-    for h in 0..N_HARTS :gen_busy {
+    for h in 0..N_SLOTS :gen_busy {
         assign o_busy_v[h]    = st_all[h] != ST_IDLE;
         assign o_busy_line[h] = line_all[h];
     }
@@ -226,9 +241,9 @@ pub module mem_ctrl #(
     // registered slot state — gating ACCEPTS on a retry would create a comb
     // cycle (retry ← granted write ← wgrant_ok ← read-channel state ← accept
     // grant).
-    var lk_sel_all: logic [N_HARTS];
-    var lk_found  : logic [N_HARTS];
-    for h in 0..N_HARTS :gen_lksel {
+    var lk_sel_all: logic [N_SLOTS];
+    var lk_found  : logic [N_SLOTS];
+    for h in 0..N_SLOTS :gen_lksel {
         if h == 0 :gen_first {
             assign lk_sel_all[h] = st_all[h] == ST_LOOKUP;
             assign lk_found[h]   = lk_sel_all[h];
@@ -261,16 +276,16 @@ pub module mem_ctrl #(
     // race exists: a WB for L implies the directory still shows L owned
     // this cycle, so lk_hit_ok is false.
     // ------------------------------------------------------------------
-    var c2c_go_all: logic [N_HARTS];
-    for h in 0..N_HARTS :gen_c2c {
+    var c2c_go_all: logic [N_SLOTS];
+    for h in 0..N_SLOTS :gen_c2c {
         assign c2c_go_all[h] = (st_all[h] == ST_LOOKUP) && i_w_valid && i_w_wb
-            && (w_line == line_all[h]) && (i_w_hart != (h as 3));
+            && (w_line == line_all[h]) && (i_w_hart != ((h / SPH) as 3));
     }
     always_comb {
         o_w_cadd_v    = 1'b0;
         o_w_cadd_hart = 3'd0;
         o_w_cadd_own  = 1'b0;
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             // P9.6: an I-read captures the c2c WB data (current copy) but adds
             // NO directory sharer — suppress the requester add for it.
             if c2c_go_all[h] && !iread_all[h] {
@@ -285,11 +300,11 @@ pub module mem_ctrl #(
     // engine active on the requested line). P9.3: the RFO AMO-lock gating
     // is gone with the bus lock — per-line serialization alone keeps the
     // directory race-free; RMW atomicity lives in the L1 (ownership).
-    var acc_line_busy: logic [N_HARTS];
+    var acc_line_busy: logic [N_SLOTS];
     always_comb {
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             acc_line_busy[h] = eng_busy && (eng_line == i_haddr[h][63:6]);
-            for g in 0..N_HARTS {
+            for g in 0..N_SLOTS {
                 if g != h {
                     if (st_all[g] != ST_IDLE) && (line_all[g] == i_haddr[h][63:6]) {
                         acc_line_busy[h] = 1'b1;
@@ -302,14 +317,14 @@ pub module mem_ctrl #(
     // Accept arbitration: at most one accept per cycle (the L2 lookup port is
     // single), lowest-id wins. Accept conflicts are 1-cycle and rare; the real
     // serialization (gather beats) goes through the bus's fair rotation.
-    var acc_found: logic [N_HARTS];
-    var accept   : logic [N_HARTS];
-    var acc_ok   : logic [N_HARTS];
-    for h in 0..N_HARTS :gen_accok {
+    var acc_found: logic [N_SLOTS];
+    var accept   : logic [N_SLOTS];
+    var acc_ok   : logic [N_SLOTS];
+    for h in 0..N_SLOTS :gen_accok {
         assign acc_ok[h] = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h]
             && !acc_line_busy[h];
     }
-    for h in 0..N_HARTS :gen_acc {
+    for h in 0..N_SLOTS :gen_acc {
         if h == 0 :gen_first {
             assign accept[h]    = acc_ok[h];
             assign acc_found[h] = accept[h];
@@ -320,7 +335,7 @@ pub module mem_ctrl #(
     }
 
     // Per-hart slot.
-    for h in 0..N_HARTS :gen_slot {
+    for h in 0..N_SLOTS :gen_slot {
         var st_q  : logic<3>     ;
         var line_q: logic<58>    ;
         var wcnt_q: logic<8>     ;
@@ -441,7 +456,7 @@ pub module mem_ctrl #(
                         }
                     }
                     ST_GATHER: {
-                        if i_bus_rgrant[h] {
+                        if slot_bus_gnt[h] {
                             buf_q[gcnt_q] = i_mem_rdata;
                             if gcnt_q == 3'd7 {
                                 // P9.6: an I-read does NOT install into the L2 (no
@@ -507,15 +522,44 @@ pub module mem_ctrl #(
         // current request; mismatched beats stream out unconsumed (scnt still
         // advances) and the consumer re-requests a fresh, correctly-targeted txn.
         let stream_ok: logic = (st_q == ST_STREAM) && (i_haddr[h][63:6] == line_q);
-        assign o_hgrant[h] = accept[h] || stream_ok || (legacy && i_bus_rgrant[h]);
+        assign o_hgrant[h] = accept[h] || stream_ok || (legacy && slot_bus_gnt[h]);
         // Beat data: the addressed dword of the slot buffer (the dcache walks
         // its critical-word-first order through i_haddr during STREAM).
         assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
         // P9.2: grant state to the L1 (sampled at fill completion).
         assign o_hexcl[h] = excl_q;
 
-        // Bus cycle requests: gather beats + legacy reads.
-        assign o_bus_rreq[h] = legacy || (st_q == ST_GATHER);
+        // Bus cycle requests: gather beats + legacy reads (per SLOT; the per-hart
+        // aggregation and grant distribution are below).
+        assign slot_bus_req[h] = legacy || (st_q == ST_GATHER);
+    }
+
+    // Per-hart aggregation of the slot bus requests, and the reverse distribution
+    // of the hart's single grant. At SPH=1 `lower` folds to 0 and this is exactly
+    // the old `o_bus_rreq[h] = req` / `i_bus_rgrant[h]` pair.
+    for hh in 0..N_HARTS :gen_bus_agg {
+        var hreq: logic;
+        always_comb {
+            hreq = 1'b0;
+            for k in 0..SPH {
+                if slot_bus_req[hh * SPH + k] {
+                    hreq = 1'b1;
+                }
+            }
+        }
+        assign o_bus_rreq[hh] = hreq;
+    }
+    for h in 0..N_SLOTS :gen_bus_gnt {
+        var lower: logic;
+        always_comb {
+            lower = 1'b0;
+            for k in 0..SPH {
+                if (k <: (h % SPH)) && slot_bus_req[(h / SPH) * SPH + k] {
+                    lower = 1'b1;
+                }
+            }
+        }
+        assign slot_bus_gnt[h] = i_bus_rgrant[h / SPH] && slot_bus_req[h] && !lower;
     }
 
     // L2 lookup mux: the SELECTED lookup slot (lowest-id; a retrying slot
@@ -527,7 +571,7 @@ pub module mem_ctrl #(
     always_comb {
         o_l2_caddr = 64'd0;
         o_l2_cren  = 1'b0;
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             if lk_sel_all[h] {
                 o_l2_caddr = {line_all[h], 6'd0};
                 o_l2_cren  = 1'b1;
@@ -550,11 +594,11 @@ pub module mem_ctrl #(
         lk_v  = 1'b0;
         lk_oh = '0;
         lk_h  = 3'd0;
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             if lk_sel_all[h] {
-                lk_v     = 1'b1;
-                lk_oh[h] = 1'b1;
-                lk_h     = h as 3;
+                lk_v            = 1'b1;
+                lk_oh[h / SPH]  = 1'b1;   // HART one-hot: lk_others ANDs it with the directory
+                lk_h            = (h / SPH) as 3;
             }
         }
     }
@@ -563,7 +607,7 @@ pub module mem_ctrl #(
     always_comb {
         lk_rfo = 1'b0;
         lk_cf  = 1'b0;
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             if lk_sel_all[h] {
                 lk_rfo = rfo_all[h];
                 lk_cf  = conf_all[h];
@@ -584,7 +628,7 @@ pub module mem_ctrl #(
     // so the sole-sharer E grant stays (the self-recall it can regenerate
     // is answered without aborting the requester's own fill — probe-self).
     assign lk_excl_w = lk_rfo || (N_HARTS == 1);
-    for h in 0..N_HARTS :gen_lkgo {
+    for h in 0..N_SLOTS :gen_lkgo {
         assign lk_go_all[h] = lk_sel_all[h] && lk_go;
     }
     // Recall request: lookup hit on an OWNED line (owner = the one-hot mask).
@@ -592,7 +636,7 @@ pub module mem_ctrl #(
     var lk_owner: logic<3>;
     always_comb {
         lk_owner = 3'd0;
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             if i_l2_c_shr[h] {
                 lk_owner = h as 3;
             }
@@ -606,7 +650,7 @@ pub module mem_ctrl #(
             // P9.6: an I-read (uncounted) grants S but adds NO directory sharer.
             if lk_go_all[h] && !iread_all[h] {
                 o_cadd_v    = 1'b1;
-                o_cadd_hart = h as 3;
+                o_cadd_hart = (h / SPH) as 3;
             }
         }
     }
@@ -616,8 +660,8 @@ pub module mem_ctrl #(
     always_comb {
         o_mem_addr = 64'd0;
         o_mem_ren  = 1'b0;
-        for h in 0..N_HARTS {
-            if (st_all[h] == ST_GATHER) && i_bus_rgrant[h] {
+        for h in 0..N_SLOTS {
+            if (st_all[h] == ST_GATHER) && slot_bus_gnt[h] {
                 o_mem_addr = {line_all[h], gcnt_all[h], 3'b000};
                 o_mem_ren  = 1'b1;
             }
@@ -640,14 +684,14 @@ pub module mem_ctrl #(
     //     entered into the directory).
     // ------------------------------------------------------------------
     var inst_sel_v: logic    ;
-    var inst_sel_h: logic<3> ;
+    var inst_sel_h: logic<4> ;
     always_comb {
         inst_sel_v = 1'b0;
-        inst_sel_h = 3'd0;
-        for h in 0..N_HARTS {
+        inst_sel_h = 4'd0;
+        for h in 0..N_SLOTS {
             if (st_all[h] == ST_INSTALL) && !inst_sel_v {
                 inst_sel_v = 1'b1;
-                inst_sel_h = h as 3;
+                inst_sel_h = h as 4;
             }
         }
     }
@@ -656,16 +700,29 @@ pub module mem_ctrl #(
     always_comb {
         inst_line = '0;
         inst_do   = 1'b0;
-        for h in 0..N_HARTS {
-            if inst_sel_v && (inst_sel_h == (h as 3)) {
+        for h in 0..N_SLOTS {
+            if inst_sel_v && (inst_sel_h == (h as 4)) {
                 inst_line = line_all[h];
                 inst_do   = iok_all[h] && !conf_all[h];
             }
         }
     }
-    var inst_sel_oh: logic<N_HARTS>;
-    for h in 0..N_HARTS :gen_inst_oh {
-        assign inst_sel_oh[h] = inst_sel_v && (inst_sel_h == (h as 3));
+    var inst_sel_oh: logic<N_SLOTS>;
+    for h in 0..N_SLOTS :gen_inst_oh {
+        assign inst_sel_oh[h] = inst_sel_v && (inst_sel_h == (h as 4));
+    }
+
+    // The install one-hot above is a SLOT mask; the directory consumers below
+    // (the abort invalidate's target, and the in-place-overwrite sharer test) need
+    // the HART view of it. Identity at SPH=1.
+    var inst_sel_hart_oh: logic<N_HARTS>;
+    always_comb {
+        inst_sel_hart_oh = '0;
+        for h in 0..N_SLOTS {
+            if inst_sel_oh[h] {
+                inst_sel_hart_oh[h / SPH] = 1'b1;
+            }
+        }
     }
 
     // Precise-invalidate events and the two-port arbitration.
@@ -695,7 +752,7 @@ pub module mem_ctrl #(
     let inst_need_backinv: logic = inst_do && i_iv_valid && !i_iv_owned && (i_iv_sharers != '0);
     let inst_need_inv    : logic          = inst_sel_v && (inst_need_backinv || !inst_do);
     let ev_i_addr        : logic<64>      = if inst_do ? i_iv_addr : {inst_line, 6'd0};
-    let ev_i_mask        : logic<N_HARTS> = if inst_do ? i_iv_sharers : inst_sel_oh;
+    let ev_i_mask        : logic<N_HARTS> = if inst_do ? i_iv_sharers : inst_sel_hart_oh;
     let inst_inv_granted : logic          = inst_need_inv && !(ev_w1_v && ev_w2_v);
 
     // Port 1: write lo > install > lookup-RFO.
@@ -710,7 +767,7 @@ pub module mem_ctrl #(
     var lk_line: logic<58>;
     always_comb {
         lk_line = '0;
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             if lk_sel_all[h] {
                 lk_line = line_all[h];
             }
@@ -727,14 +784,14 @@ pub module mem_ctrl #(
     // be recalled before the eviction (engine request below). P3.a L2 1R1W: a
     // same-bank merge write owns the data port this cycle → hold (0 at =0).
     let inst_blocked: logic = (inst_do && (i_iv_blocked || i_iv_owned)) || (inst_need_inv && !inst_inv_granted) || i_inst_port_busy;
-    for h in 0..N_HARTS :gen_inst_go {
+    for h in 0..N_SLOTS :gen_inst_go {
         assign inst_go_all[h] = inst_sel_oh[h] && !inst_blocked;
     }
     // Phase B: grant state at install — the installer becomes owner (E for a
     // read miss, M-capable for an RFO) unless an in-place overwrite finds
     // other harts still listed.
-    for h in 0..N_HARTS :gen_inst_excl {
-        assign inst_excl_w[h] = rfo_all[h] || ((i_inst_oldshr & ~inst_sel_oh) == '0);
+    for h in 0..N_SLOTS :gen_inst_excl {
+        assign inst_excl_w[h] = rfo_all[h] || ((i_inst_oldshr & ~inst_sel_hart_oh) == '0);
     }
     // Victim-recall owner (one-hot victim sharer mask).
     var iv_owner: logic<3>;
@@ -807,7 +864,7 @@ pub module mem_ctrl #(
         for l in 0..8 {
             o_l2_inst_data[l] = 64'd0;
         }
-        for h in 0..N_HARTS {
+        for h in 0..N_SLOTS {
             if inst_sel_oh[h] {
                 o_l2_inst_addr = {line_all[h], 6'd0};
                 o_inst_hart    = h as 3;
