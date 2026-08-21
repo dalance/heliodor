@@ -206,7 +206,7 @@ pub module heliodor_core #(
     o_dbg_viol_exact_cnt : output logic<32>, // violations a full-width compare also finds
     o_dbg_viol_pgx_cnt   : output logic<32>, // violations from the VM page-cross blanket
     o_dbg_st_resolve_cnt : output logic<32>, // store resolves (violation denominator)
-    o_dbg_lw_cause       : output logic<32> [96], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
+    o_dbg_lw_cause       : output logic<32> [128], // L4 + W1 rename-width + W2 front-end + W2b producer census: load-issue stall by sole blocker (+ lsr drill-down)
     o_dbg_viol_store_cnt : output logic<32>, // store-resolve scan events
     o_dbg_viol_self_cnt  : output logic<32>, // S15 record-time self-scan events
     // M9 diag: ALU operand observation (verify base.pc passthrough)
@@ -11442,9 +11442,12 @@ pub module heliodor_core #(
             }
         }
     }
-    let lsr_mshr_ok : logic = LSR_MSHR_B && lsr_v_q && !lsr_squashed && !lsr_fault
+    // Split in two (logic-identical) so the Block N census can see a handoff declined
+    // ONLY because the 2-entry queue was full — the population an N-deep queue serves.
+    let lsr_mshr_elig: logic = LSR_MSHR_B && lsr_v_q && !lsr_squashed && !lsr_fault
         && !lsr_fp_ld_q && !lsr_unc_q && !lsr_dc_load_next && stld_fwd_mask == 8'd0
-        && !lsr_sb_ovl && mshr_free_ok;
+        && !lsr_sb_ovl;
+    let lsr_mshr_ok : logic = lsr_mshr_elig && mshr_free_ok;
     // Bisect arm (L4 step-2 diagnosis). The two capture arms wake different amounts
     // of machinery: _own only needs the entry to latch dc_fill_rdata at DONE, while
     // _que is the one that brings the REPLAY ENGINE back to life (a queued entry
@@ -12379,7 +12382,7 @@ pub module heliodor_core #(
     let rw_n       : logic<2> = ({1'b0, rw_blk_no2} as 2) + ({1'b0, rw_blk_elig} as 2) + ({1'b0, rw_blk_res} as 2);
     let rw_1wide   : logic    = rename_fire && !rename_fire2;
     let rw_sole    : logic    = rw_1wide && rw_n == 2'd1;
-    var lw_cause_cnt: logic<32> [96];
+    var lw_cause_cnt: logic<32> [128];
     // ------------------------------------------------------------------
     // M0 census: what does a commit-time load replay actually COST? (2026-08-16)
     //
@@ -12444,7 +12447,7 @@ pub module heliodor_core #(
             commit0_cnt       = 32'd0;
             load_wait_cnt     = 32'd0;
             load_replay_cnt   = 32'd0;
-            for c in 0..96 {
+            for c in 0..128 {
                 lw_cause_cnt[c] = 32'd0;
             }
             mrp_open_q        = 1'b0;
@@ -12839,6 +12842,118 @@ pub module heliodor_core #(
             }
             if lsr_b2b_free {
                 lw_cause_cnt[95] = lw_cause_cnt[95] + 32'd1;                        // b2b captures that fired
+            }
+            // ── Block N census (buckets 96-107): memory-level parallelism ──
+            // The read path is ONE deep at four consecutive levels (cp_mshr_mlp_plan.md §2):
+            // the 2-entry core queue, the dcache's single fill FSM, the core's single DRAM
+            // read channel (shared with the instruction side), and mem_ctrl's one slot per
+            // hart. These buckets say WHERE the cycles are; the O1 latency oracle already
+            // says HOW MANY there are to win (DRAM_WAIT/HIT_WAIT=1 -> 11,480,000 vs
+            // 12,370,000 = 890,000 cy = 7.20 % of the N=1 boot), so they must add to less.
+            // 96-98 size the D-side serialization: a fill in flight, and whether a SECOND
+            // miss is already known while it runs (97 = the MLP>=2 ceiling — those are the
+            // cycles a second fill context could overlap).
+            // 99/100 are the two reasons a Stage-B handoff is DECLINED: a full queue (what
+            // sizing alone would fix) vs QUE_FILLONLY (case (b) — our own miss waiting for
+            // the bus grant, which needs the dcache to hold the request itself).
+            // 101-105 size the I/D channel split; 101 is its direct ceiling.
+            let nx_miss_wait: logic = lsr_v_q && lsr_drive && dcache_stall && !dc_hit_safe && !dc_miss_valid;
+            let nx_full_rej : logic = lsr_mshr_elig && !mshr_free_ok && nx_miss_wait;
+            let nx_fo_rej   : logic = lsr_mshr_ok && lsr_drive && !dc_miss_valid && dcache_stall
+                && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid && !fill_busy_q;
+            if fill_busy_q {
+                lw_cause_cnt[96] = lw_cause_cnt[96] + 32'd1;                        // a dcache fill is in flight
+            }
+            if fill_busy_q && (mshra_queued || mshrb_queued) {
+                lw_cause_cnt[97] = lw_cause_cnt[97] + 32'd1;                        // ... and a SECOND miss is queued (MLP>=2 ceiling)
+            }
+            if fill_busy_q && nx_miss_wait {
+                lw_cause_cnt[98] = lw_cause_cnt[98] + 32'd1;                        // ... and the LSR also holds a missing load
+            }
+            if nx_full_rej {
+                lw_cause_cnt[99] = lw_cause_cnt[99] + 32'd1;                        // handoff declined: the queue was FULL
+            }
+            if nx_fo_rej {
+                lw_cause_cnt[100] = lw_cause_cnt[100] + 32'd1;                      // handoff declined: QUE_FILLONLY
+            }
+            if ic_owns && dc_mem_req {
+                lw_cause_cnt[101] = lw_cause_cnt[101] + 32'd1;                      // I-side owns the channel, D-side waiting
+            }
+            if is_req && dc_mem_req && !ic_owns {
+                lw_cause_cnt[102] = lw_cause_cnt[102] + 32'd1;                      // I-side yields to the D-side
+            }
+            if dc_mem_req && !i_dmem_grant {
+                lw_cause_cnt[103] = lw_cause_cnt[103] + 32'd1;                      // D request not granted
+            }
+            if ic_route {
+                lw_cause_cnt[104] = lw_cause_cnt[104] + 32'd1;                      // I-side using the channel
+            }
+            if dc_mem_req {
+                lw_cause_cnt[105] = lw_cause_cnt[105] + 32'd1;                      // D request cycles (denominator)
+            }
+            if dc_miss_valid {
+                lw_cause_cnt[106] = lw_cause_cnt[106] + 32'd1;                      // fill starts (events)
+            }
+            if !fill_busy_q && !ic_route && !dc_mem_req {
+                lw_cause_cnt[107] = lw_cause_cnt[107] + 32'd1;                      // the memory system is idle
+            }
+            // ── Block N census PASS 2 (buckets 108-115) ──
+            // Pass 1's surprise: bucket 103 (a D-side read request the bus does not grant) is
+            // 1,612,034 cy = 13.03 % of the N=1 boot, while the fill FSM is only busy for
+            // 740,402 (bucket 96) and the I-side conflict explains just 146,647 (bucket 101).
+            // So most of the ungranted time is spent BEFORE the fill starts. Split it: 108 is
+            // the part inside a running fill (its DWAIT/HWAIT/gather latency, which is what O1
+            // deleted), 109 the part before one starts, and 110-112 partition 109 into the
+            // I-side conflict, an uncached/MMIO single-beat read (never a fill at all), and
+            // the remainder = mem_ctrl declining to ACCEPT.
+            // 113/114 re-ask pass 1's MLP question without the fill_busy_q qualifier: a queued
+            // entry waits through the accept delay too, so bucket 97 UNDERSTATES the population
+            // by exactly the amount 109 turns out to be.
+            let nx_unc_eff: logic = if lsr_drive ? lsr_unc_q : (dmem_unc_m && !replay_drive);
+            let nx_ngrant : logic = dc_mem_req && !i_dmem_grant;
+            let nx_pre    : logic = nx_ngrant && !fill_busy_q;
+            if nx_ngrant && fill_busy_q {
+                lw_cause_cnt[108] = lw_cause_cnt[108] + 32'd1;                      // ungranted INSIDE a running fill
+            }
+            if nx_pre {
+                lw_cause_cnt[109] = lw_cause_cnt[109] + 32'd1;                      // ungranted BEFORE a fill starts
+            }
+            if nx_pre && ic_owns {
+                lw_cause_cnt[110] = lw_cause_cnt[110] + 32'd1;                      // ... the I-side holds the channel
+            } else if nx_pre && nx_unc_eff {
+                lw_cause_cnt[111] = lw_cause_cnt[111] + 32'd1;                      // ... an uncached/MMIO read (no fill)
+            } else if nx_pre {
+                lw_cause_cnt[112] = lw_cause_cnt[112] + 32'd1;                      // ... mem_ctrl declines to ACCEPT
+            }
+            if mshra_queued || mshrb_queued {
+                lw_cause_cnt[113] = lw_cause_cnt[113] + 32'd1;                      // a queued entry is waiting (any reason)
+            }
+            if (mshra_queued || mshrb_queued) && !fill_busy_q {
+                lw_cause_cnt[114] = lw_cause_cnt[114] + 32'd1;                      // ... with no fill in flight at all
+            }
+            if dcache_stall {
+                lw_cause_cnt[115] = lw_cause_cnt[115] + 32'd1;                      // dcache holding the core (denominator)
+            }
+            // ── Block N census PASS 3 (buckets 116-119) ──
+            // Pass 2 put 1,056,043 cy (8.54 %) in "mem_ctrl declines to ACCEPT", which is
+            // larger than the whole fill-busy bucket and cannot be the I-side (that is 110)
+            // or MMIO (111 = 0). The suspect is a definitional hole rather than a new
+            // stall: `fill_busy_q` is SET from `dc_miss_valid`, and dcache.veryl's
+            // o_miss_valid comment says "store-RFO fills never pulse it (no load to
+            // capture)". So a store's read-for-ownership fill occupies the mem_ctrl slot
+            // and holds `o_memr_req` for its whole 12-40 cycle transaction while
+            // fill_busy_q reads 0 — landing in 112 by construction. Split 112 by
+            // `dc_mem_rfo` to confirm, and count the RFO traffic itself (118/119).
+            if nx_pre && !ic_owns && dc_mem_rfo {
+                lw_cause_cnt[116] = lw_cause_cnt[116] + 32'd1;                      // ... an RFO (store ownership) fill is running
+            } else if nx_pre && !ic_owns && !nx_unc_eff {
+                lw_cause_cnt[117] = lw_cause_cnt[117] + 32'd1;                      // ... genuinely waiting for an ACCEPT
+            }
+            if dc_mem_rfo {
+                lw_cause_cnt[118] = lw_cause_cnt[118] + 32'd1;                      // RFO request cycles
+            }
+            if dc_mem_rfo && !i_dmem_grant {
+                lw_cause_cnt[119] = lw_cause_cnt[119] + 32'd1;                      // RFO cycles not granted
             }
             if !rob_commit_ack {
                 commit0_cnt = commit0_cnt + 32'd1;
