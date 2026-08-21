@@ -737,3 +737,82 @@ re-derived. The `i_sqrt_*` ROB write port stays with it (it is correct and inert
 **Next front is no longer in the store path.** After L1.a the `store` sole-blocker bucket is 102,057
 (0.82 %), of which `sb_cnt >= 3` is 85,937. The largest single sole-blocker is now **`lsr` 745,356
 (6.03 %), which Block T established is 100 % dcache miss — an MLP question, not a queue question.**
+
+---
+
+## 16. 🏁🚢 SHIPPED (2026-08-19) — `SB_EMPTY_EFF`: the visibility contract now holds for the readers that CANNOT forward
+
+§15.4 left the contract with a footnote, recorded honestly as a standing item: L1.c closed the
+drain-ack window for loads by keeping the drained entry in the `sbf*` net for one cycle, but **AMO/LR
+have no forward net at all** — they keep order by WAITING on `sb_empty`, and `sb_empty` goes true on
+the drain ack, the very edge the merge lands on. So the shipped contract was **stated more strongly
+than it held**. This closes it.
+
+### 16.1 The change: one signal, two different questions
+
+`sb_empty` is read at 15 sites, and they are not asking the same thing:
+
+- **ORDERING** — "are all my older stores architecturally readable?" — 12 sites, now `sb_empty_eff`:
+  `dc_flush_req`, `asq_takeover`, the retire gate's `c_is_amo || c_store_mmio ? !sb_empty`,
+  `c_serial`'s drain wait, the page-edge load hold, the release-AMO and `cas_q` issue gates,
+  `dc_i_wen`'s write-order term, **`amo_cwr_en`** (the atomic's commit write), `asq_dr_start`,
+  `asq_alloc`, `vu_mem_idle`.
+- **RESOURCE** — a different question, deliberately left on the raw `sb_empty`:
+  `imem_aw_grant` ("is the drain port free?" — it feeds `sb_pop`'s underflow guard) and
+  `sdrain_swen` ("is there anything left to drain?" — a shadow entry has ALREADY drained, so
+  asserting swen for it would re-drain the line).
+
+`sb_empty_eff = sb_empty && !sbs_v_q`. It cannot deadlock (`sbs_v_q = sb_pop`, a single-cycle pulse,
+so it is at most ONE cycle later) and every use delays in the conservative direction.
+
+### 16.2 🎯 The gap was REAL and REACHABLE — litmus N=2 moved
+
+| gate | before | after | Δ |
+|---|---|---|---|
+| default suite | 252/0 | **252/0** | — |
+| **litmus N=2** | 3,030,000 | **3,070,000** | **+1.32 %** ← the contract's price |
+| litmus N=4 | 3,880,000 | 3,870,000 | −0.26 % |
+| dhrystone / coremark | 235,804 / 394,546 | **bit-identical** | 0 |
+| N=1 boot | 12,370,000 | 12,370,000 | 0.00 % |
+| **N=2 SMP boot** | 17,340,000 | **16,950,000** | **−2.25 %** |
+| N=4 SMP boot | 24,780,000 | 24,720,000 | −0.24 % |
+
+**litmus N=2 changing is the headline, and it is not a performance result.** It is direct evidence
+that AMO/LR *do* straddle the drain-ack window — the footnote was reachable, not theoretical. Every
+gate had been green with the footnote in place, which is exactly what "green is evidence, not proof"
+was written to guard against. **The right move was to make the implementation match the claim, not to
+weaken the claim to match the implementation.**
+
+The bare-mode benchmarks being **bit-identical** confirms the change is as local as intended: a
+single-hart bare program with no atomics never has an ordering waiter coincide with a shadow cycle.
+
+⚠️ **The N=2 SMP boot −2.25 % is UNEXPLAINED and is not claimed as a mechanism.** A conservative
+delay making the machine faster is plausible (delaying the atomic drain start changes the contention
+waveform — the same shape as M2a's "replay was an accidental backoff"), but that is a hypothesis. It
+*is* real rather than noise: Verilator reproduces it independently (169 ms vs the previous 173 ms).
+
+### 16.3 Verilator NBA cross-check — 4/4, verdict lines read (not `$finish`)
+
+| config | Verilator | Veryl sim |
+|---|---|---|
+| N=1 boot | **PASSED**, 124 ms = 12.4 M | 12,370,000 ✓ |
+| N=2 SMP boot | **PASSED**, 169 ms = 16.9 M | 16,950,000 ✓ |
+| litmus N=4 | **PASSED**, `pass=1 fail=0 tohost=1`, `cy=3,864,789` | 3,870,000 ✓ |
+| N=4 SMP boot | **PASSED**, 247 ms = 24.7 M | 24,720,000 ✓ |
+
+### 16.4 Block L1 cumulative, and what is still open
+
+| gate | pre-L1 baseline | shipped now | Δ |
+|---|---|---|---|
+| **N=1 boot** | 13,180,000 | **12,370,000** | **−6.15 %** |
+| **N=2 SMP boot** | 18,100,000 | **16,950,000** | **−6.35 %** |
+| **N=4 SMP boot** | 25,650,000 | **24,720,000** | **−3.62 %** |
+
+No SRAM added. New baselines: N=1 `cy=00bcc050` · N=2 `cy=0102a2f0` · N=4 `cy=01793280` ·
+litmus N=2 `cy=002ed830` / N=4 `cy=003b0d30` · dhrystone 235,804 · coremark 394,546.
+
+**Still open — `wt_fires`.** A full-line write-through drain acks on its **bus write-channel grant**
+and never enters the local array, so "architecturally readable" for it is a bus-ordering property, not
+an L1 lifetime one. The shadow covers it for one cycle, which is not obviously the right lifetime.
+⚠️ **Do not lengthen the shadow on suspicion** — measure whether a `wt_fires` drain ack is ever
+straddled first. Absent evidence, it stays a recorded standing item, not a speculative fix.

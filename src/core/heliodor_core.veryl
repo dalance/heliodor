@@ -984,6 +984,22 @@ pub module heliodor_core #(
     var sb_elig : logic; // head store can be absorbed (classifier)
     var sb_full : logic;
     var sb_empty: logic;
+    // Block L1.c COMPLETION (SB_EMPTY_EFF): the visibility contract for the readers that
+    // CANNOT forward. SB_DRAIN_SHADOW closed the window for loads by keeping the drained
+    // entry in the sbf* net for one cycle. AMO/LR have no forward net at all — they keep
+    // order by WAITING on sb_empty — and sb_empty goes true on the drain ack, the very
+    // edge the merge lands on. So the shipped contract ("an entry stays visible until
+    // every reader that could have snapshotted the array before its write has completed")
+    // is currently stated more strongly than it holds. sb_empty_eff is that contract for
+    // the waiters: the buffer is not "empty" while its last entry is still in the shadow.
+    // At most ONE cycle later than sb_empty (sbs_v_q = sb_pop, a single-cycle pulse), so
+    // it cannot deadlock, and every use of it delays in the CONSERVATIVE direction.
+    // ⚠️ Deliberately NOT applied to the two RESOURCE questions, which are a different
+    // question from ordering: imem_aw_grant ("is the drain port free?" — it feeds
+    // sb_pop's underflow guard) and sdrain_swen ("is there anything left to drain?" — a
+    // shadow entry has ALREADY drained; asserting swen for it would re-drain the line).
+    // Assigned after the shadow regs exist; forward-declared here for the early consumers.
+    var sb_empty_eff: logic;
     var sb_push : logic;
     var sb_vm_ok: logic; // VM arm of the classifier (TLB-hit translate ready)
     var sb_pa   : logic<64>;
@@ -6301,7 +6317,7 @@ pub module heliodor_core #(
     // to fetch on demand. The serializing op still waits for the store buffer to
     // drain (c_serial && sb_empty below), so the stores are merged into the
     // D-cache before the I-cache refill recalls them.
-    assign dc_flush_req = c_flush_op && sb_empty && (COHERENT_IFETCH == 0);
+    assign dc_flush_req = c_flush_op && sb_empty_eff && (COHERENT_IFETCH == 0);
     // S20R: an MMIO (non-DRAM) store is a DOORBELL — firmware writes a DRAM
     // mailbox then rings CLINT msip with no fence between (legal on the old
     // never-reordering pipeline). If the doorbell passes the buffered
@@ -6334,7 +6350,7 @@ pub module heliodor_core #(
     // ONLY when the entry will actually be booked. If it cannot be, the atomic performs
     // its in-cache write and retires exactly as today — which is why there is no longer
     // any "class atomic stuck with nowhere to write" case to stall for.
-    let asq_takeover: logic    = asq_class && !asq_full && sb_empty;
+    let asq_takeover: logic    = asq_class && !asq_full && sb_empty_eff;
     let rob_commit_ack: logic = rob_commit_valid && !commit_load_replay && !commit_amo_replay
         && !(c_is_store && !sb_elig && (dmem_mmu_busy || (walk_v_q && !walk_is_store_q)))
         // CP M3a: a slow store's dcache write happens the cycle AFTER it translates
@@ -6347,13 +6363,13 @@ pub module heliodor_core #(
         // conditions — the dcache stall and the sb_empty release-order wait belong to
         // the DRAIN, which is ordered behind the store buffer anyway (§6.4). Folds to
         // today's term at ATOMIC_SQ=0.
-        && !(c_is_store && !sb_elig && ((dcache_stall && !asq_takeover) || (if c_is_amo || c_store_mmio ? !sb_empty : sb_st_ovl)))
+        && !(c_is_store && !sb_elig && ((dcache_stall && !asq_takeover) || (if c_is_amo || c_store_mmio ? !sb_empty_eff : sb_st_ovl)))
         // R3 §7.2: and no store retires while an atomic is still queued.
         && !(c_is_store && asq_st_block)
         && !(c_is_store && sb_elig && sb_full && !sb_merge_ok)
         // R3.1 §6.4: a FENCE must not complete ahead of a queued atomic's write.
         // asq_empty is constant 1 at ATOMIC_SQ=0 → the term folds to !sb_empty.
-        && !(c_serial && !(sb_empty && asq_empty))
+        && !(c_serial && !(sb_empty_eff && asq_empty))
         && !(c_flush_op && !dc_flush_done && (COHERENT_IFETCH == 0)); // P9.2 sweep (P9.6: gone when coherent)
     // Zacas amocas.q retires when the entry actually leaves the ROB (rob_commit_ack
     // already waits for the store to drain + excludes replays). At retire it writes
@@ -9238,9 +9254,9 @@ pub module heliodor_core #(
         || ((issue_is_load || issue_amo_read) && asq_dr_busy)
         // R3.2c: the page-edge hold is a plain-LOAD forward-layer restriction, so it
         // keys off "is an atomic at all" (issue_amo_xlat), not "does it read".
-        || (issue_is_load && !issue_amo_xlat && dmem_vm_on && sb_ld_pg_edge && !sb_empty)
+        || (issue_is_load && !issue_amo_xlat && dmem_vm_on && sb_ld_pg_edge && !sb_empty_eff)
         || (issue_is_load && sb_cnt >= 4'd3)
-        || (issue_amo_read && (commit_store_fire || (!sb_empty && iq_issue_op.base.instr[25])))
+        || (issue_amo_read && (commit_store_fire || (!sb_empty_eff && iq_issue_op.base.instr[25])))
         // P9.3: an AMO/LR read must NOT issue while a younger load's PTW walk
         // owns the dmem port (mmu_walk_inflight) — the dcache i_addr is the
         // walk's VA then, so dc_amo_read is 0 (no ownership enforcement) and
@@ -9259,7 +9275,7 @@ pub module heliodor_core #(
         // gate (sb_ld_ovl) only covers the primary (lo) dword, so a buffered older
         // store to the HIGH dword would be missed (stale hi read). Hold the read
         // until the store buffer is fully drained.
-        || (issue_amo_read && iq_iss_is_cas_q && !sb_empty)
+        || (issue_amo_read && iq_iss_is_cas_q && !sb_empty_eff)
         // Phase 12 V1: hold scalar load/AMO issue while the VU owns the dmem port
         // (vu_mem_port_req). Registered, so no combinational loop into issue.
         || ((issue_is_load || issue_amo_read) && vu_mem_port_req);
@@ -9906,6 +9922,16 @@ pub module heliodor_core #(
             }
         }
     }
+    // Const-guarded STATEMENT form so DEAD const-folds to plain sb_empty (byte-identical).
+    const SB_EMPTY_EFF: bit = 1;
+    always_comb {
+        sb_empty_eff = sb_empty;
+        if SB_EMPTY_EFF {
+            if sbs_v_q {
+                sb_empty_eff = 1'b0;
+            }
+        }
+    }
 
     // ============================================================
     // S27: committed-store-buffer FORWARD layer. sb bytes are committed —
@@ -10401,7 +10427,7 @@ pub module heliodor_core #(
     // cacheable VM store still suppresses the M-stage dcache write at its live-translate
     // cycle and is instead SB-pushed (from the registered m_pa_q) on its retire cycle.
     // At STORE_PRETRANSLATE=0 sb_vm_live_ok ≡ sb_vm_ok = byte-identical.
-    let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_live_ok && !(if c_is_amo || c_store_mmio_x ? !sb_empty : sb_st_ovl)) || dmu_ad_wb;
+    let dc_i_wen      : logic    = (dmu_dmem_wen && !sb_vm_live_ok && !(if c_is_amo || c_store_mmio_x ? !sb_empty_eff : sb_st_ovl)) || dmu_ad_wb;
     // Phase 12 V1: a VU unit-stride store element is single-dword (no hi-strobe).
     let dc_st_wstrb_hi: logic<8> = if vu_mem_active ? 8'd0 : if dmu_ad_wb ? 8'd0 : if dc_i_wen ? st_wstrb_hi : 8'd0;
     // P9.3: in-cache AMO/SC commit write — eligible when the committing
@@ -10647,7 +10673,7 @@ pub module heliodor_core #(
     // EX_PIPE=0 the write never coincides with the recall, so the term folds to 1
     // → byte-identical. dc_amo_present is derived from the (registered) tag state,
     // not the bus invalidate, so it does not form a combinational loop.
-    let amo_cwr_en   : logic     = store_drive && sb_empty && ac_wok_q && (dc_amo_present || !EX_PIPE);
+    let amo_cwr_en   : logic     = store_drive && sb_empty_eff && ac_wok_q && (dc_amo_present || !EX_PIPE);
     // ── R3.1: atomic store-queue — entry + alloc/drain — DEAD at ATOMIC_SQ=0 ──
     // Block R (doc/cp_r3_atomic_reorder_plan.md §6, which supersedes §2's scheme A).
     // An ATOMIC-WITHOUT-RETURN (AMO with rd == x0, cacheable, fault-free) retires into
@@ -10706,7 +10732,7 @@ pub module heliodor_core #(
     // would keep the drain from ever getting the port that would free the entry.
     let asq_dr_port_ok: logic = ATOMIC_SQ && !ptw_dc_active && !(amo_commit_live && !asq_class)
         && !m_ren_q && !m_wen_q && !lsr_drive && !replay_drive;
-    let asq_dr_start : logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty && asq_dr_st_q == 2'd0;
+    let asq_dr_start : logic = ATOMIC_SQ && asq_valid_q[0] && sb_empty_eff && asq_dr_st_q == 2'd0;
     let asq_dr_ren   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd1;
     let asq_dr_wen   : logic = ATOMIC_SQ && asq_dr_st_q == 2'd2;
     let asq_dr_go_r  : logic = asq_dr_ren && asq_dr_port_ok; // drives the port this cycle
@@ -10847,7 +10873,7 @@ pub module heliodor_core #(
     // enters the queue once every OLDER store is visible, and §7.2's block then keeps
     // every YOUNGER store out until it drains. Together that pins the queued RMW to its
     // program-order position without the drain having to reason about the buffer.
-    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full && sb_empty;
+    let asq_alloc: logic = ATOMIC_SQ && amo_commit_live && asq_class && !asq_full && sb_empty_eff;
     let asq_drain: logic = ATOMIC_SQ && asq_dr_wdone;
     // L4 step-2 litmus diagnosis: ASQ drain trace, filtered to ONE line so the volume
     // stays readable in a 3.1M-cycle 2-hart run. TRC_LINE is the line of litmus test 7's
@@ -11167,7 +11193,7 @@ pub module heliodor_core #(
     // the port exclusively and streams elements with blocking accesses (it never
     // uses the MSHR for its own misses). All but dcache_stall are registered;
     // dcache_stall only gates the VU's registered FSM transition → no comb loop.
-    assign vu_mem_idle     = sb_empty && !walk_v_q && dmem_mmu_idle && !replay_q && !mshra_v_q && !mshrb_v_q && !dcache_stall;
+    assign vu_mem_idle     = sb_empty_eff && !walk_v_q && dmem_mmu_idle && !replay_q && !mshra_v_q && !mshrb_v_q && !dcache_stall;
     assign vu_mem_ready    = !dcache_stall && !dmem_mmu_busy;
     assign vu_mem_fault    = dmem_mmu_fault;
     assign vu_mem_fault_st = dmem_mmu_fault_s;
