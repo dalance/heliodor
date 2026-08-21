@@ -802,3 +802,118 @@ boot. Two effects compound at N=2 and neither is visible at N=1:
 This is the same shape as Block T (−1.93 % at N=1 → −5.28 % at N=4) and the opposite of the O4
 ownership-latency oracle (§8.4), which diluted with width. Worth measuring N=4 before drawing the
 curve, but the direction is already the useful one.
+
+---
+
+## 11. N1′ design — two fill contexts in the D-cache (load vs store-RFO)
+
+With N1 shipped the downstream is built: `mem_ctrl` takes any number of slots per hart, the SoCs
+route them, and the priority-order trap is understood (§10.4.2). N1′ reuses all of it and adds a
+**third** requester class: the D-cache's ownership fills, separated from its demand-load fills.
+
+Measured bound: **2.91 %** at N=1 (O4, §8.2), **2.12 %** at N=2 (§8.4) — note this one *dilutes*
+with width, unlike N1.
+
+### 11.1 What has to double inside the D-cache
+
+The fill FSM's state is one set today (`dcache.veryl:415-439`):
+
+| state | why a second copy is needed | difficulty |
+|---|---|---|
+| `state` (IDLE/FILL/DONE) | the two contexts advance independently | mechanical |
+| `fill_count` / `fill_offset` | per-burst beat position and critical word | mechanical |
+| `fill_index` / `fill_tag` / `fill_way` | which line each is filling | mechanical |
+| `fill_rfo` | becomes a constant per context (that is the point) | folds away |
+| `fill_aborted` + the `inv_fill_hit` comparators | each in-flight line needs its own remote-invalidate watch | **needs care** |
+| `victim_way` / `victim_way_q` reservation | two fills must not pick the same way in the same set | **needs an interlock** |
+| the writeback buffer (`wb_v`/`wb_line`/`wb_data`) | two fills can each evict a dirty victim | **needs a second buffer or a block** |
+
+### 11.2 The two interlocks
+
+**Same-set way collision.** `victim_way_raw` is PLRU + invalid-way preference, computed from the
+tag array. Two fills that start in the same set on different cycles can pick the same victim way,
+and the second would evict the line the first is still filling. Cheapest correct rule: the second
+context may not START a fill whose index equals a live context's `fill_index` (a one-comparator
+block, same shape as `fill_blocked_wb`). It costs nothing on the common case — an RFO and a load
+miss in the same set at the same time is rare — and it is strictly conservative.
+
+**Writeback buffer.** Today the buffer is "guaranteed free" at fill start because `fill_blocked_wb`
+holds the start otherwise. With two contexts, either give the buffer a second entry or extend
+`fill_blocked_wb` to mean "the buffer is occupied at all" for whichever context wants to start
+second. The block is the cheaper first cut and preserves the existing invariant exactly.
+
+### 11.3 Where the ordering argument lives
+
+The load and the RFO contexts serve **different consumers** (the MSHR/LSR completion path vs the
+store-drain merge), so there is no new forwarding or age question inside the core. The memory
+ordering that matters is at the L2, and it is already handled: `mem_ctrl`'s per-line accept
+blocking (`acc_line_busy`) serializes any two transactions on the same line **across all slots**,
+which now includes the same hart's own load and RFO. That is the rule that made two harts safe;
+it makes two contexts safe for free.
+
+### 11.4 Suggested build order
+
+1. `SPH: 3` and a third SoC-side slot, tied off — must be cycle-identical (as §10.1 was).
+2. The D-cache's second context behind a param (`RFO_CTX`), reachable only by store-RFO fills,
+   with both interlocks conservative.
+3. Flip, read the boot, and check the interlocks are not the whole cost (census the two blocks).
+
+---
+
+## 12. The prefetch that N1 unblocks
+
+`icache.veryl:78` still carries the whole S11.2 next-line prefetcher — `pf_pending` / `pf_line`,
+the present-check against the fill and the pending line, the request path — behind
+`let s11_pf_en: logic = 1'b0`. The comment above it says exactly why it is off:
+
+> P9.6: prefetch is now OFF. With fills routed through mem_ctrl (shared with the D-cache read
+> port), a speculative prefetch HOLDS the single per-hart slot for a whole transaction and blocks
+> a subsequent demand D-cache fill — measured net-negative on boot (N=1 13.84M→13.30M, N=2
+> 18.77M→17.25M).
+
+**That reason is now gone**: the I side has its own slot, and a prefetch occupying it no longer
+delays any D-side fill. It can still delay a *demand I-fill* (the same slot), which is the real
+question the flip now asks — and it is a much smaller one than blocking the D side.
+
+Flip `s11_pf_en` to 1 and read the boot at N=1 and N=2. This is free to try (one constant, the
+machinery is intact) and it is the second prize N1 was predicted to unlock in §2.3.
+
+### 10.6 N=4 — the gain does NOT continue; it reverses
+
+| gate | default | N1 | delta |
+|---|---|---|---|
+| N=1 boot | 12,370,000 | 12,230,000 | **−1.13 %** |
+| N=2 SMP | 16,950,000 | 16,420,000 | **−3.13 %** |
+| **N=4 SMP** | 24,720,000 (`01793280`) | **25,180,000 (`01803760`)** | **+1.86 %** |
+
+`pass=1`. The N=4 boot carries a ±1M timing band (CLAUDE.md), so +460,000 is inside the noise and
+this is not a demonstrated regression — but it is definitely **not** the continuation of the N=2
+trend, and the plan must not assume one.
+
+The likely mechanism is the one shared resource N1 does not widen: **the L2 lookup port is one
+per cycle**, and N1 doubles the number of slots contending for it (N=4 goes from 4 slots to 8).
+While the I side shared the D-side port, an I-side lookup consumed a D-side slot's turn rather
+than adding a new contender. The same effect is invisible at N=1 (2 slots, no contention) and
+still favourable at N=2 (4 slots), which is exactly the shape observed.
+
+If N1 is to scale, the lookup port is the next thing to look at — either a second lookup port
+(the L2 directory is flops; the DATA array is the sync-read one) or a fairer selection than
+lowest-id-wins among the slots in `ST_LOOKUP`. Recorded as a standing item; the ship decision for
+N1 at its current shape is the user's.
+
+### 12.1 Re-tested, and it stays OFF
+
+| arm (all with N1 live) | N=1 boot | vs N1 |
+|---|---|---|
+| `s11_pf_en = 0` (shipped) | 12,230,000 (`00ba9d70`) | — |
+| **`s11_pf_en = 1`** | **12,390,000 (`00bd0e70`)** | **+160,000 = +1.31 %** |
+
+`pass=1`, `instret=10424070`. Still net-negative — and slightly *slower than the pre-N1 default*.
+
+So P9.6's decision was right for more than the reason it recorded. Removing the D-side blocking
+was necessary but not sufficient: a speculative next-line fetch still occupies **the I side's own
+slot** for a whole 12-40 cycle transaction, and the demand I-fill queued behind it costs more
+than the prefetch saves. The prefetcher would need to be *cancellable* (drop the speculative
+transaction when a demand miss arrives) or to have a slot of its own before it pays.
+
+Left at 0 with this measurement in the comment, so the next person does not re-derive it.
