@@ -1201,3 +1201,29 @@ step, paired with the core-side change that gives "not stalled, no data" a meani
 Method note: the bisect cost one boot and converted "N2.2a is broken" into "one term of `o_stall`
 is broken", with the rest proven bit-identical. Isolating a suspect term is cheaper than reading
 a 35 M-instruction trace.
+
+### 14.9 `QUE_FILLONLY=0` — the predicted failure IS fixed, a different one appears
+
+With ALLOC in place, flipping `LSR_MSHR_B_QUE_FILLONLY` to 0:
+
+| test | before N2.2a | with ALLOC |
+|---|---|---|
+| litmus N=2 (the failure the const's comment records) | retires 0 from a fill | **pass**, `cy=003037c0` |
+| `rv64ui-ma_data` | pass | **fail** |
+| everything else | pass | pass (251/252) |
+
+The first line is the point: the const exists because case (b) — our own miss waiting for the bus
+grant — stranded the fill when the Stage-B handoff dropped `i_ren`. **ALLOC closes exactly that
+hole, and the test that documented it now passes.** The theory predicted a specific failure and
+the predicted fix removes it.
+
+The second line is a *different* composition problem, not a return of the first. A misaligned
+load spans two lines and fills them **sequentially**: `hi_miss` requires `cache_hit` (the lo line
+already present) *and* `state == IDLE`. So the hi-side fill can only be detected after the lo-side
+fill has fully retired to IDLE — and a Stage-B handoff that happens across the lo-side ALLOC
+leaves nothing in the pipe to re-present the hi half. `lsr_mshr_ok` excludes `lsr_dc_load_next`
+(cross-dword spans never hand off), so the interaction is indirect and needs its own diagnosis.
+
+Left at 1 with this evidence in the comment. The fix belongs with the step that makes the D-cache
+non-blocking (§14.8), because both need the same thing: a miss that is *recorded* rather than
+*re-detected*, including the hi half of a span.
