@@ -1142,3 +1142,62 @@ O1 bound minus what N1 took is what is left to win here.
 
 Doing 2.2a first also keeps the risky part isolated: 2.2a changes *when* a fill is recorded, 2.2b
 changes *how many* can run. If the boot moves the wrong way, the two causes are separable.
+
+### 14.7 N2.2a built — and `state == IDLE` meant THREE things, not two
+
+The ALLOC state is in: a miss without a grant this cycle captures the line into the entry and
+waits there, so the request survives its requester. `o_memr_req`/`addr`/`rfo`/`ren` come from the
+entry while it is in ALLOC, the invalidate watch covers ALLOC as well as FILL, and `o_miss_valid`
+fires on the ALLOC → FILL launch too (with a new per-entry `m_ld_q`, since `load_sel` is a live
+signal that means nothing by then).
+
+Restricted to a **clean victim**. Capturing a dirty victim's writeback at ALLOC would clear
+`dirty` and leave the still-valid, now-stale-in-DRAM line exposed to a store for the whole grant
+wait — a far wider window than the 8-cycle FILL the current design tolerates. Dirty victims keep
+the pre-N2.2a behaviour until the entry gets its own dirty/tag read port.
+
+**The bug worth recording.** The first build ran 35.6 M instructions without finishing. I had
+split the twelve `state == State::IDLE` sites into two classes — "the arrays are free" (stores,
+which ran during the old grant wait and must keep running) and "no entry yet" (miss detection) —
+and that split was right as far as it went. It missed a third:
+
+> **`uncached_active` and `amo_upg` are not array tests; they COMPETE FOR THE READ CHANNEL.**
+
+An MMIO read allowed to fire during ALLOC asserts `o_memr_req` with its own address, wins the
+single `i_memr_grant`, and the allocated entry — watching only `i_memr_grant` — takes that grant
+as its own launch and enters FILL against a transaction that was never its. Both are back on
+`state == IDLE`; an MMIO read arriving during ALLOC simply does not assert `o_data_valid`, so the
+core waits, which is correct and costs nothing.
+
+Generalizing: **when you split an overloaded predicate, the granularity is set by who READS it,
+not by what it looks like it means.** Three readers, three classes — array occupancy, entry
+occupancy, and channel arbitration — and the third only becomes visible once something else can
+hold the channel.
+
+### 14.8 The bisect answers it: ALLOC is right, dropping `o_stall` is not
+
+Including `m_alloc` in `o_stall` makes the N=1 boot come back `cy=00ba9d70`,
+`instret=10421567` — **bit-identical to N2.1**. So:
+
+- **the ALLOC state itself is correct** — capturing the line into the entry and waiting there is
+  exactly equivalent to the old "hold in IDLE", cycle for cycle;
+- **the failure was entirely in letting `o_stall` drop.** `miss` is built from `miss_raw`, which
+  is IDLE-gated, so an allocated entry silently stops asserting it. The core then sees "not
+  stalled" together with "no data", and 35.6 M instructions later the boot has not finished.
+
+That is a better outcome than a fix would have been, because it separates the two things N2.2a
+was bundling:
+
+| | what it is | status |
+|---|---|---|
+| the entry **holds the line** independently of `i_ren` | the MSHR property; what `QUE_FILLONLY` exists to work around | **works, bit-identical** |
+| the D-cache stops stalling while an entry waits | non-blocking behaviour; needs the CORE to handle "no stall, no data" | **needs core-side work, deferred** |
+
+Revised order: ship ALLOC **with** the stall (a pure structural change, no behaviour delta), then
+take the first real prize by deleting `QUE_FILLONLY` — the restriction that exists only because
+the fill used to be stranded when `i_ren` dropped. Non-blocking D-cache behaviour becomes its own
+step, paired with the core-side change that gives "not stalled, no data" a meaning.
+
+Method note: the bisect cost one boot and converted "N2.2a is broken" into "one term of `o_stall`
+is broken", with the rest proven bit-identical. Isolating a suspect term is cheaper than reading
+a 35 M-instruction trace.

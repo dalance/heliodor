@@ -412,10 +412,17 @@ pub module dcache #(
     // statement block (after DCACHE_R1_DCE) so the reads DCE at =1; see rdata_* there.
 
     // State machine for line fill
+    // Block N step N2.2a (cp_mshr_mlp_plan.md §14.6): ALLOC is the state that makes this
+    // an MSHR rather than a fill FSM — the entry holds the missing line's address while
+    // it waits for the bus, INDEPENDENTLY of whether the requester is still presenting
+    // it. That is what dissolves the i_ren-holding contract documented at o_miss_valid
+    // (and hence the core's LSR_MSHR_B_QUE_FILLONLY restriction). A grant arriving the
+    // same cycle as the miss still goes straight to FILL, so the common path is unchanged.
     enum State: logic<2> {
-        IDLE = 2'd0,
-        FILL = 2'd1,
-        DONE = 2'd2,
+        IDLE  = 2'd0,
+        ALLOC = 2'd1,
+        FILL  = 2'd2,
+        DONE  = 2'd3,
     }
 
     // ── Block N step N2.1 (cp_mshr_mlp_plan.md §14): the fill state becomes an MSHR
@@ -433,6 +440,7 @@ pub module dcache #(
     var m_off_q  : logic<3>       [MSHR_N]; // original miss dword offset (for MSHR re-read)
     var m_abort_q: logic          [MSHR_N]; // remote invalidate hit the line being filled
     var m_rfo_q  : logic          [MSHR_N]; // P9.2: this fill is a read-for-ownership (store)
+    var m_ld_q   : logic          [MSHR_N]; // N2.2a: demanded by a LOAD (o_miss_valid's qualifier)
     // Read aliases for entry 0 — every existing reader keeps its name and its meaning.
     let state     : State          = m_st_q[0];
     let fill_count: logic<3>       = m_cnt_q[0];
@@ -453,6 +461,12 @@ pub module dcache #(
     let fill_offset : logic<3> = m_off_q[0];
     let fill_aborted: logic    = m_abort_q[0];
     let fill_rfo    : logic    = m_rfo_q[0];
+    let fill_ld     : logic    = m_ld_q[0];
+    // "the entry is holding a line" (ALLOC or FILL) vs "the arrays are free". Every
+    // pre-N2.2a `state == IDLE` test meant one of these two things; they were the same
+    // test only because there was no ALLOC.
+    let m_alloc  : logic = state == State::ALLOC;
+    let m_arr_free: logic = (state == State::IDLE) || m_alloc;
     // Phase 8 S14.2: critical-word-first. The fill bursts the 8 dwords
     // starting at the MISSING dword (fill_offset) and wraps, so the demand
     // word is transfer #0 — the owner's early writeback (o_fill_data_ready)
@@ -532,8 +546,8 @@ pub module dcache #(
         o_tag_3  : c6f_tag_3  ,
     );
     // Any-port invalidate pulse on the line being filled (mid-fill abort).
-    let inv_fill_hit: logic = (i_inv_valid && state == State::FILL && fill_index == inv_index && fill_tag == inv_tag)
-        || (i_inv2_valid && state == State::FILL && fill_index == inv2_index && fill_tag == inv2_tag);
+    let inv_fill_hit: logic = (i_inv_valid && (state == State::FILL || m_alloc) && fill_index == inv_index && fill_tag == inv_tag)
+        || (i_inv2_valid && (state == State::FILL || m_alloc) && fill_index == inv2_index && fill_tag == inv2_tag);
 
     // CPU request present
     let cpu_req: logic = i_wen || i_ren;
@@ -664,7 +678,7 @@ pub module dcache #(
     // outstanding. It stays in IDLE (never enters FILL — excluded from lo_miss
     // above), so nothing is fetched line-wise or installed. o_memr_req holds the
     // request; o_memr_ren pulses only on the grant (below).
-    let uncached_active: logic = i_uncached && i_ren && state == State::IDLE;
+    let uncached_active: logic = i_uncached && i_ren && (state == State::IDLE);
 
     // P9.2: a FULL-LINE drain entry (all 64 bytes strobed — memset/memcpy
     // write-combining) keeps the posted WRITE-THROUGH path: an RFO would
@@ -1099,6 +1113,10 @@ pub module dcache #(
     let fill_blocked_wb: logic = wb_v && (vic_dirty || (wb_line == {f_tag, f_index}));
     // The IDLE→FILL transition fires this cycle.
     let fill_start_fire: logic = (load_sel || srfo_sel) && !fill_blocked_wb && i_memr_grant;
+    // Block N N2.2a: the same miss WITHOUT a grant this cycle allocates an entry instead
+    // of dissolving, so the request survives i_ren dropping. Restricted to a CLEAN victim
+    // (see above); a dirty one still holds in IDLE exactly as before.
+    let fill_alloc_fire: logic = (load_sel || srfo_sel) && !fill_blocked_wb && !i_memr_grant && !vic_dirty;
 
     // ── Phase C delta-5: Stage-A demand-load tag read (§11.2 the load-use fold) ──
     // The core presents the load's PA one cycle early on i_addr_r (= dmu_dmem_addr
@@ -1364,13 +1382,13 @@ pub module dcache #(
     // (P9.3: the AMO force-miss is gone — an AMO read no longer invalidates
     // a hit line, so the old drain_amo_clash same-cycle hazard no longer
     // exists; an AMO read's S-upgrade fill is covered by the fill-set clash.)
-    let store_can_drain: logic = i_swen && state == State::IDLE && !i_wen && s_hit_excl
+    let store_can_drain: logic = i_swen && m_arr_free && !i_wen && s_hit_excl
         && !drain_probe_clash && !drain_fill_set_clash;
     // P9.2: full-line WRITE-THROUGH drain (see s_full_line). Fires on its
     // write-channel grant; the writeback buffer outranks it there, and a
     // same-cycle fill start in the set must win (shared departure-event
     // port + its victim could be our S copy's way).
-    let want_store_wt: logic = i_swen && state == State::IDLE && !i_wen && !s_hit_excl && s_full_line
+    let want_store_wt: logic = i_swen && m_arr_free && !i_wen && !s_hit_excl && s_full_line
         && !drain_probe_clash;
     let wt_fires: logic = want_store_wt && i_memw_grant && !wb_v && !fill_start_fire;
     assign o_sdrain_ack = store_can_drain || wt_fires;
@@ -1394,7 +1412,7 @@ pub module dcache #(
     // A misaligned store whose touched line(s) are DIRTY detours them
     // through the writeback buffer first (the self-invalidate would lose
     // the dirty bytes); the write itself is held meanwhile.
-    let mis_active       : logic = i_wen && (state == State::IDLE) && (i_wstrb_hi != 8'd0);
+    let mis_active       : logic = i_wen && m_arr_free && (i_wstrb_hi != 8'd0);
     let mis_lo_dirty     : logic = mis_active && cache_hit && hit_dirty;
     let mis_hi_dirty     : logic = mis_active && next_line_hit && next_hit_dirty;
     let mis_dirty_pending: logic = mis_lo_dirty || mis_hi_dirty;
@@ -1530,7 +1548,7 @@ pub module dcache #(
     // store waits out its dirty detours. P9.3: an in-cache AMO/SC commit
     // write (i_wen_excl) never touches the channel — see wenl_fires below.
     let amo_miss : logic = i_ren && i_wen && !cache_hit;
-    let wen_fires: logic = i_wen && !i_wen_excl && state == State::IDLE && i_memw_grant && !amo_miss
+    let wen_fires: logic = i_wen && !i_wen_excl && m_arr_free && i_memw_grant && !amo_miss
         && !wb_v && !mis_dirty_pending;
     // 14.13: a FOLDED cap writeback (wb_folded_q) drains only once its +1-latched data
     // has landed (wb_data_rdy_q); a live writeback (=0 / a disabled cap source, wb_folded_q
@@ -1547,13 +1565,13 @@ pub module dcache #(
     // longer owned here the write HOLDS (o_stall); the core's watch poisons
     // and the commit replay drops the request.
     let wenl_probe_clash: logic = i_probe_v && !probe_pinned && (i_probe_addr[63:6] == i_addr[63:6]);
-    let wenl_fires: logic = i_wen && i_wen_excl && (state == State::IDLE) && hit_excl
+    let wenl_fires: logic = i_wen && i_wen_excl && m_arr_free && hit_excl
         && !(fill_start_fire && (f_index == index)) && !wenl_probe_clash
         && !inv_hits_active && !inv2_hits_active;
 
     // P9.3 pin arming (see the pin block above) + counter.
     let pin_arm_fill: logic = (state == State::DONE) && fill_rfo && i_amo_read && !fill_aborted;
-    let pin_arm_hit : logic = i_amo_read && i_ren && (state == State::IDLE) && cache_hit && hit_excl
+    let pin_arm_hit : logic = i_amo_read && i_ren && m_arr_free && cache_hit && hit_excl
         && ({tag, index} != pin_line_q);
     always_ff (clk, rst) {
         if_reset {
@@ -1701,6 +1719,7 @@ pub module dcache #(
             m_off_q[0]   = 3'd0;
             m_abort_q[0] = 1'b0;
             m_rfo_q[0]   = 1'b0;
+            m_ld_q[0]    = 1'b0;
             wb_v         = 1'b0;
             wb_line      = '0;
             fl_active    = 1'b0;
@@ -1770,7 +1789,21 @@ pub module dcache #(
                         m_rfo_q[0]   = f_rfo;
                         m_abort_q[0] = (i_inv_valid && inv_index == f_index && inv_tag == f_tag)
                             || (i_inv2_valid && inv2_index == f_index && inv2_tag == f_tag);
+                        m_ld_q[0] = load_sel && !srfo_sel;
                         m_st_q[0] = State::FILL;
+                    } else if fill_alloc_fire {
+                        // N2.2a: same capture, no grant yet, no writeback (clean victim).
+                        // The entry now OWNS the request; o_memr_req/addr come from it.
+                        m_index_q[0] = f_index;
+                        m_tag_q[0]   = f_tag;
+                        m_way_q[0]   = victim_way;
+                        m_off_q[0]   = f_offset;
+                        m_cnt_q[0]   = 3'd0;
+                        m_rfo_q[0]   = f_rfo;
+                        m_ld_q[0]    = load_sel && !srfo_sel;
+                        m_abort_q[0] = (i_inv_valid && inv_index == f_index && inv_tag == f_tag)
+                            || (i_inv2_valid && inv2_index == f_index && inv2_tag == f_tag);
+                        m_st_q[0] = State::ALLOC;
                     }
                     // Write-through (i_wen: AMO/LR-SC, misaligned, MMIO, slow
                     // stores): update cache on write hit. Only commit the
@@ -1960,6 +1993,19 @@ pub module dcache #(
                         } else {
                             m_cnt_q[0] = fill_count + 3'd1;
                         }
+                    }
+                }
+                State::ALLOC: {
+                    // Waiting for the bus. The line is held in the entry, so nothing here
+                    // depends on the requester still presenting it. A remote invalidate to
+                    // our line while we wait poisons the fill exactly as it does in FILL.
+                    if i_memr_grant {
+                        m_cnt_q[0] = 3'd0;
+                        m_st_q[0]  = State::FILL;
+                    }
+                    if (i_inv_valid && inv_index == fill_index && inv_tag == fill_tag)
+                        || (i_inv2_valid && inv2_index == fill_index && inv2_tag == fill_tag) {
+                        m_abort_q[0] = 1'b1;
                     }
                 }
                 State::DONE: {
@@ -2744,11 +2790,13 @@ pub module dcache #(
         i_addr
     : if filling ?
         {fill_tag, fill_index, fill_woff, 3'b000}
+    : if m_alloc ?
+        {fill_tag, fill_index, 3'd0, 3'b000}
     :
         {f_tag, f_index, 3'd0, 3'b000}
     ;
-    assign o_memr_ren = if uncached_active ? i_memr_grant : if filling ? 1'b1 : if fill_start_fire ? 1'b1 : 1'b0;
-    assign o_memr_rfo = if uncached_active ? 1'b0 : if filling ? fill_rfo : f_rfo;
+    assign o_memr_ren = if uncached_active ? i_memr_grant : if filling ? 1'b1 : if m_alloc ? 1'b1 : if fill_start_fire ? 1'b1 : 1'b0;
+    assign o_memr_rfo = if uncached_active ? 1'b0 : if filling ? fill_rfo : if m_alloc ? fill_rfo : f_rfo;
 
     assign o_memw_addr = if wb_v ? {wb_line, 6'd0} : if i_wen ? i_addr : i_saddr;
     assign o_memw_wb   = wb_v;
@@ -2782,8 +2830,8 @@ pub module dcache #(
     // granted request as a committed transaction, so a grant must ALWAYS
     // coincide with the IDLE→FILL transition.
     let want_fill_start: logic = (load_sel || srfo_sel) && !fill_blocked_wb;
-    let want_write     : logic = i_wen && !i_wen_excl && !amo_miss && state == State::IDLE && !mis_dirty_pending;
-    assign o_memr_req = filling || want_fill_start || uncached_active;
+    let want_write     : logic = i_wen && !i_wen_excl && !amo_miss && m_arr_free && !mis_dirty_pending;
+    assign o_memr_req = filling || m_alloc || want_fill_start || uncached_active;
     // 14.13: a folded cap writeback withholds its channel request until its +1-latched
     // data is ready (wb_drain_ok) so a grant never lands on an empty wb_data_lat (no
     // phantom write). Byte-identical at CAP_1R=0 (wb_drain_ok = wb_v).
@@ -2817,7 +2865,8 @@ pub module dcache #(
     // Byte-identical at DCACHE_SYNC_READ=0 (there load_sel = load_sel_raw, already
     // IDLE-gated) and at LSR_MSHR_B=0 (the only live consumer is the core's
     // fill_busy_q SET, which the first pulse already did).
-    assign o_miss_valid = load_sel && !fill_blocked_wb && i_memr_grant && state == State::IDLE;
+    assign o_miss_valid = (load_sel && !fill_blocked_wb && i_memr_grant && state == State::IDLE)
+        || (m_alloc && i_memr_grant && fill_ld); // N2.2a: the ALLOC -> FILL launch is a fill start too
     // L4 step-2: the DEMANDED dword of the fill that starts on this pulse. o_memr_addr
     // zeroes the offset (it is the line base), but o_fill_rdata delivers only the
     // CRITICAL word — the beat at fill_woff == fill_offset — so a consumer taking
@@ -3195,9 +3244,14 @@ pub module dcache #(
     // P9.3: an in-cache AMO/SC commit write holds until its local merge
     // fires; if the line departed it holds until the core's commit replay
     // drops the request.
-    let write_wait_grant: logic = state == State::IDLE && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
-    let write_wait_local: logic = state == State::IDLE && i_wen && i_wen_excl && !wenl_fires;
-    assign o_stall = (state == State::FILL) || miss || (state == State::DONE) || write_during_fill || write_wait_grant
+    let write_wait_grant: logic = m_arr_free && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
+    let write_wait_local: logic = m_arr_free && i_wen && i_wen_excl && !wenl_fires;
+    // N2.2a bisect: does the failure come from o_stall DROPPING during ALLOC? `miss` is
+    // built from miss_raw, which is IDLE-gated, so an allocated entry stops asserting it.
+    // Including m_alloc here restores the pre-N2.2a stall behaviour while keeping the
+    // entry's i_ren-independence; if the boot passes with this term, the defect is in what
+    // the core does when the D-cache says "not stalled" but also "no data".
+    assign o_stall = (state == State::FILL) || m_alloc || miss || (state == State::DONE) || write_during_fill || write_wait_grant
         || write_wait_local || inv_hits_active || inv2_hits_active || dhit_c3_squash || dhit_cap_pre_q || dhit_miss || nf_gap_stall || nf_reg_stall || (uncached_active && !i_memr_grant);
 
 }
