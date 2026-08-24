@@ -82,7 +82,7 @@ pub module mem_ctrl #(
     // fill FSM. SPH separates them; at SPH=1, N_SLOTS == N_HARTS and every
     // slot->hart map (slot / SPH) is the identity, so the module is byte-identical
     // to the pre-Block-N version.
-    param SPH      : u32 = 1 ,
+    param SPH      : u32 = 2 ,
     param N_SLOTS  : u32 = N_HARTS * SPH,
     param DRAM_WAIT: u32 = 20, // accept -> gather start (DRAM latency model), >= 1
     param HIT_WAIT : u32 = 2 , // L2 copy -> stream start (L2 latency model), >= 1
@@ -638,6 +638,141 @@ pub module mem_ctrl #(
     for h in 0..N_SLOTS :gen_lkgo {
         assign lk_go_all[h] = lk_sel_all[h] && lk_go;
     }
+    // ══════════════════════════════════════════════════════════════════
+    // Block N lookup-port census (cp_mshr_mlp_plan.md §13). DEAD at LK_CENSUS=0.
+    //
+    // N1 (the I/D channel split) gained -1.13 % at N=1 and -3.13 % at N=2 but REVERSED
+    // to +1.86 % at N=4, and the suspect is the one shared resource N1 does not widen:
+    // this module's L2 lookup port serves ONE slot per cycle, and N1 doubles the number
+    // of slots contending for it. Two very different failures look the same from the
+    // boot number, and they need different fixes:
+    //
+    //   STARVATION — the port has spare cycles but lowest-id-wins keeps handing them to
+    //     the same slots. Fix: a fairer selection. Signature: `wait` high while `busy`
+    //     is well under 100 %.
+    //   BANDWIDTH  — the port is simply saturated at 1 lookup/cycle. Fix: replicate the
+    //     directory (it is flops; the sync-read DATA array can stay single-ported since
+    //     only a HITTING slot reads it). Signature: `busy` near 100 % whenever `cont`.
+    //
+    // Slot numbering is slot-major, so [0, N_HARTS) is the D side and [N_HARTS, 2N) the
+    // I side; `hi` is the HIGHEST-numbered D slot = the hart the priority encoder ranks
+    // last, i.e. the first one starvation would show up on. Printed periodically so the
+    // SMP arms need no census port plumbing (same trick as Block T's B2B_SUP_TRACE).
+    // ══════════════════════════════════════════════════════════════════
+    const LK_CENSUS: bit       = 0;
+    const LK_EVERY : logic<32> = 32'd5000000;
+    var lkc_nin   : logic<4>;
+    var lkc_d_in  : logic   ;
+    var lkc_d_wait: logic   ;
+    var lkc_i_in  : logic   ;
+    var lkc_i_wait: logic   ;
+    always_comb {
+        lkc_nin    = 4'd0;
+        lkc_d_in   = 1'b0;
+        lkc_d_wait = 1'b0;
+        lkc_i_in   = 1'b0;
+        lkc_i_wait = 1'b0;
+        for s in 0..N_SLOTS {
+            if st_all[s] == ST_LOOKUP {
+                lkc_nin = lkc_nin + 4'd1;
+                if s <: N_HARTS {
+                    lkc_d_in = 1'b1;
+                    if !lk_sel_all[s] {
+                        lkc_d_wait = 1'b1;
+                    }
+                } else {
+                    lkc_i_in = 1'b1;
+                    if !lk_sel_all[s] {
+                        lkc_i_wait = 1'b1;
+                    }
+                }
+            }
+        }
+    }
+    // The last-ranked D slot: starvation shows here first.
+    let lkc_hi_wait: logic = (st_all[N_HARTS - 1] == ST_LOOKUP) && !lk_sel_all[N_HARTS - 1];
+    var lkc_cy   : logic<32>;
+    var lkc_busy : logic<32>; // the port served someone
+    var lkc_cont : logic<32>; // 2+ slots wanted it
+    var lkc_dwait: logic<32>;
+    var lkc_iwait: logic<32>;
+    var lkc_hiw  : logic<32>;
+    var lkc_own  : logic<32>; // the SELECTED slot is re-looking-up an OWNED line
+    // Pass 2 (the lookup port turned out to be idle at N=2, §13.3): the OTHER shared
+    // resources a second slot per hart adds contenders to.
+    var lkc_accl : logic<32>; // an accept was refused by per-line serialization
+    var lkc_accw : logic<32>; // an accept was refused because another slot won the cycle
+    var lkc_busq : logic<32>; // both of a hart's slots wanted the DRAM read channel
+    var lkc_accl_w: logic   ;
+    var lkc_accw_w: logic   ;
+    var lkc_busq_w: logic   ;
+    always_comb {
+        lkc_accl_w = 1'b0;
+        lkc_accw_w = 1'b0;
+        for s in 0..N_SLOTS {
+            if (st_all[s] == ST_IDLE) && i_hreq[s] && i_hdram[s] {
+                if acc_line_busy[s] {
+                    lkc_accl_w = 1'b1;
+                } else if !accept[s] {
+                    lkc_accw_w = 1'b1;
+                }
+            }
+        }
+        lkc_busq_w = 1'b0;
+        for h2 in 0..N_HARTS {
+            if slot_bus_req[h2] && slot_bus_req[N_HARTS + h2] {
+                lkc_busq_w = 1'b1;
+            }
+        }
+    }
+    always_ff (clk, rst) {
+        if_reset {
+            lkc_cy    = 32'd0;
+            lkc_busy  = 32'd0;
+            lkc_cont  = 32'd0;
+            lkc_dwait = 32'd0;
+            lkc_iwait = 32'd0;
+            lkc_hiw   = 32'd0;
+            lkc_own   = 32'd0;
+            lkc_accl  = 32'd0;
+            lkc_accw  = 32'd0;
+            lkc_busq  = 32'd0;
+        } else if LK_CENSUS {
+            lkc_cy = lkc_cy + 32'd1;
+            if lkc_nin != 4'd0 {
+                lkc_busy = lkc_busy + 32'd1;
+            }
+            if lkc_nin >: 4'd1 {
+                lkc_cont = lkc_cont + 32'd1;
+            }
+            if lkc_d_wait {
+                lkc_dwait = lkc_dwait + 32'd1;
+            }
+            if lkc_i_wait {
+                lkc_iwait = lkc_iwait + 32'd1;
+            }
+            if lkc_hi_wait {
+                lkc_hiw = lkc_hiw + 32'd1;
+            }
+            if lk_v && !lk_cf && i_l2_chit && i_l2_c_owned { // = lk_recall_req, declared below
+                lkc_own = lkc_own + 32'd1;
+            }
+            if lkc_accl_w {
+                lkc_accl = lkc_accl + 32'd1;
+            }
+            if lkc_accw_w {
+                lkc_accw = lkc_accw + 32'd1;
+            }
+            if lkc_busq_w {
+                lkc_busq = lkc_busq + 32'd1;
+            }
+            if lkc_cy % LK_EVERY == 32'd0 {
+                $display("LK [%d] busy=%d cont=%d dwait=%d iwait=%d hiwait=%d ownretry=%d", lkc_cy, lkc_busy, lkc_cont, lkc_dwait, lkc_iwait, lkc_hiw, lkc_own);
+                $display("LK2[%d] accline=%d acclost=%d busboth=%d", lkc_cy, lkc_accl, lkc_accw, lkc_busq);
+            }
+        }
+    }
+
     // Recall request: lookup hit on an OWNED line (owner = the one-hot mask).
     let lk_recall_req: logic = lk_v && !lk_cf && i_l2_chit && i_l2_c_owned;
     var lk_owner: logic<3>;
@@ -811,6 +946,36 @@ pub module mem_ctrl #(
         }
     }
     let iv_recall_req: logic = inst_sel_v && inst_do && i_iv_valid && i_iv_owned;
+
+    // Block N lookup census, part 2 (declared here because inst_blocked / iv_recall_req
+    // are `let`s at this point in the file). DEAD at LK_CENSUS=0.
+    var lkc_cy2  : logic<32>;
+    var lkc_instb: logic<32>; // the selected INSTALL slot was held
+    var lkc_engb : logic<32>; // the recall engine was busy
+    var lkc_engw : logic<32>; // a recall was wanted while the engine was busy
+    always_ff (clk, rst) {
+        if_reset {
+            lkc_cy2   = 32'd0;
+            lkc_instb = 32'd0;
+            lkc_engb  = 32'd0;
+            lkc_engw  = 32'd0;
+        } else if LK_CENSUS {
+            lkc_cy2 = lkc_cy2 + 32'd1;
+            if inst_sel_v && inst_blocked {
+                lkc_instb = lkc_instb + 32'd1;
+            }
+            if eng_busy {
+                lkc_engb = lkc_engb + 32'd1;
+            }
+            if eng_busy && (i_wv_req || iv_recall_req || lk_recall_req) {
+                lkc_engw = lkc_engw + 32'd1;
+            }
+            if lkc_cy2 % LK_EVERY == 32'd0 {
+                $display("LK3[%d] instblk=%d engbusy=%d engwait=%d", lkc_cy2, lkc_instb, lkc_engb, lkc_engw);
+            }
+        }
+    }
+
 
     // ------------------------------------------------------------------
     // P9.2 Phase B: recall engine. One outstanding recall; requesters by

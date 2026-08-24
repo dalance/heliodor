@@ -917,3 +917,190 @@ than the prefetch saves. The prefetcher would need to be *cancellable* (drop the
 transaction when a demand miss arrives) or to have a slot of its own before it pays.
 
 Left at 0 with this measurement in the comment, so the next person does not re-derive it.
+
+---
+
+## 13. The fifth level: the L2 lookup port
+
+The §2 audit counted four levels of the read path and missed one. `mem_ctrl`'s **L2 lookup port
+serves one slot per cycle**, and a slot that hits an OWNED line stays in `ST_LOOKUP` re-entering
+the selection every cycle until the recall engine clears the ownership. N1 doubled the number of
+slots contending for that port without widening it, which is the most likely explanation for
+§10.6's reversal at N=4 (4 slots → 8).
+
+This matters far beyond N1: **N miss contexts cannot start N misses if lookups are 1/cycle.**
+Every remaining step in the ledger (N1′, N2, N3) adds contenders to this same port, so it is a
+prerequisite for all of them rather than a repair to one of them. It is also the campaign's own
+first-layer rule — *make what already shipped actually hold* — and the same shape as Block L1's
+`SB_EMPTY_EFF`: the claim ("the I and D sides proceed independently") is stronger than the
+implementation, so fix the implementation rather than weaken the claim.
+
+### 13.1 Two failures that look identical from the boot number
+
+| | mechanism | signature in the census | fix |
+|---|---|---|---|
+| **starvation** | the port has spare cycles, but lowest-id-wins keeps giving them to the same slots | `wait` high while `busy` is well under 100 % | a fairer selection (round-robin / last-served) — cheap |
+| **bandwidth** | 1 lookup/cycle is simply not enough | `busy` at ~100 % whenever `cont` | replicate the **directory** (it is flops); the sync-read DATA array can stay single-ported, since only a HITTING slot reads it |
+
+### 13.2 The census (`LK_CENSUS`, DEAD at 0)
+
+Per cycle, counted in `mem_ctrl` and printed periodically so the SMP arms need no census port
+plumbing (the Block T `B2B_SUP_TRACE` trick):
+
+| counter | meaning |
+|---|---|
+| `busy` | at least one slot was in `ST_LOOKUP` (the port had work) |
+| `cont` | **two or more** slots were in `ST_LOOKUP` (they contended) |
+| `dwait` | a D-side slot was in `ST_LOOKUP` and NOT selected |
+| `iwait` | an I-side slot was in `ST_LOOKUP` and NOT selected |
+| `hiwait` | the **highest-numbered D slot** was waiting — the hart the encoder ranks last, where starvation appears first |
+| `ownretry` | the selected slot was re-looking-up an OWNED line (the retry that holds the port) |
+
+Read at N=2 (where N1 wins) and N=4 (where it reverses); the *difference* between the two is the
+answer, not either one alone.
+
+### 13.3 REFUTED at N=2 — the lookup port is idle
+
+| `LK` at cy=15,000,000 (N=2 boot, N1 live) | value | of 15 M |
+|---|---|---|
+| `busy` (any slot in `ST_LOOKUP`) | 158,276 | **1.06 %** |
+| `cont` (**two or more** slots wanting it) | 338 | **0.002 %** |
+| `dwait` / `iwait` | 42 / 299 | ~0 |
+| `hiwait` (last-ranked D slot waiting) | 42 | ~0 |
+| `ownretry` | 6,795 | 0.05 % |
+
+**The port is idle.** It does work on 1 % of cycles and two slots want it on 0.002 % of them, so
+neither failure mode in §13.1 is present — there is no starvation to fix and no bandwidth to add.
+Scaling the contention 4× for N=4 still leaves it under 0.01 %, which cannot produce the +1.86 %
+of §10.6. **The hypothesis is refuted, and it is refuted cheaply, before any RTL was written for
+it.**
+
+That is worth stating plainly because the reasoning that produced it was sound and still wrong:
+"N1 doubles the contenders for a 1/cycle port" is true, and irrelevant, because the port was
+never near its limit. `feedback_shared_bus_has_no_free_cycles` says to check who captures every
+cycle before riding a shared bus — the mirror rule applies here: **before blaming a shared
+resource for a regression, measure whether it is actually busy.**
+
+So the +1.86 % at N=4 is still unexplained. Pass 2 widens the net to the other resources a second
+slot per hart adds contenders to — per-line accept blocking, accept arbitration, the shared DRAM
+read channel within a hart, the L2 install port, and the single recall engine — with N=4 as the
+arm that has to show the difference.
+
+### 13.4 Pass 2 at N=2 — every other shared resource is idle too
+
+| `LK2`/`LK3` at cy=15,000,000 (N=2) | value | of 15 M |
+|---|---|---|
+| `accline` (accept refused by per-line serialization) | 891 | 0.006 % |
+| `acclost` (accept refused — another slot won the cycle) | 680 | 0.005 % |
+| `busboth` (a hart's D **and** I slot both wanted the DRAM channel) | 11,047 | 0.07 % |
+| `instblk` (the selected INSTALL slot held) | 15,511 | 0.10 % |
+| `engbusy` / `engwait` (recall engine busy / wanted while busy) | 15,520 / 14,581 | 0.10 % |
+
+Nothing above 0.1 %. Four times that for N=4 is still under half a percent, so **no shared
+resource inside `mem_ctrl` can account for +1.86 %** unless N=4 changes their behaviour in kind
+rather than in degree. N=4 is running with the same counters to settle that.
+
+If N=4 also comes back idle, the honest conclusion is that the +1.86 % is **not a structural cost
+of N1 at all** but the N=4 boot's known ±1M timing sensitivity re-rolling: the same "small change,
+large re-arrangement" property CLAUDE.md warns about, and half the band. That would make it a
+standing item to re-measure when something else moves the N=4 number, not a defect to fix — and
+the block would continue to N2 rather than stopping to widen a resource that is 99 % idle.
+
+---
+
+## 14. N2 design — a real MSHR file inside the D-cache
+
+This is the capability the block is named for and the machine does not have. N1′ (§11) is a
+special case of it — two fixed-purpose contexts — so N2 subsumes it and N1′ should not be built
+separately (`feedback_commit_to_structural_cp_change`: commit to the structural change rather
+than iterating small ones).
+
+### 14.1 The layering, which the current code does not have
+
+| layer | owns | today |
+|---|---|---|
+| **line fill** (D-cache MSHR) | the missing LINE: address, way reservation, abort bit, beat counter, who is waiting | fused into the single fill FSM, driven from the LIVE `i_addr` |
+| **load completion** (core MSHR) | the missing LOAD: rob idx, pdst, funct3, poison, the deferred CDB writeback | exists (2 entries, Stage-B handoff) |
+
+The relationship is **1:N** — one line fill can have several loads waiting on it — and that is
+exactly what a secondary-miss merge is. Today it cannot exist because there is no object
+representing "the line being fetched" that a second load could attach to. Note the core layer is
+already right and should not be rebuilt; N2 is entirely below it.
+
+### 14.2 The change that carries all the others
+
+Miss *detection* is currently a function of the request presented this cycle:
+
+```
+let lo_miss: logic = i_ren && !cache_hit && !i_uncached && state == State::IDLE;
+let f_index_raw = if srfo_sel_raw ? sindex : if fill_is_hi ? next_index : index;   // live i_addr
+let want_fill_start = (load_sel || srfo_sel) && !fill_blocked_wb;                  // live again
+```
+
+Every `state == IDLE` term and every "which line" mux reads the live port. N2 splits this in two:
+
+1. **allocate** (demand side): on a miss, look the line up in the MSHR file. Hit → attach (a
+   secondary miss, no new fill). Miss → allocate an entry, capturing address / way / rfo.
+2. **launch** (MSHR side): any allocated entry that has not started its fill requests the bus,
+   *independently of whether its requester is still presenting the address*.
+
+Step 2 is what dissolves the `i_ren`-holding contract that `dcache.veryl:2769` documents and that
+forced `LSR_MSHR_B_QUE_FILLONLY = 1` in the core (§2.1): once the entry holds the address, the
+core is free to drop `i_ren` and the fill is not stranded. **`QUE_FILLONLY` should be deleted as
+part of N2, not before it** — it is the symptom, and removing it early re-opens the bug it was
+introduced for.
+
+### 14.3 Per-entry state, and the two interlocks (unchanged from §11.2)
+
+Each entry needs its own `line`/`way`/`offset`/`beat`/`rfo`/`aborted` plus its own invalidate
+comparator (the `inv_fill_hit` check is currently against the single `fill_index`/`fill_tag`).
+The two structural interlocks are the same ones N1′ would have needed:
+
+- **same-set way collision**: an entry may not allocate a victim way in a set where another live
+  entry is filling. Cheapest correct rule is to refuse allocation on an index match — one
+  comparator per entry, strictly conservative, and rare in practice.
+- **writeback buffer**: today "guaranteed free at fill start" via `fill_blocked_wb`. With N
+  entries either the buffer gains entries or allocation blocks while it is occupied. Block first,
+  measure, then size.
+
+Ordering needs no new argument inside the core (the load and store consumers are distinct, the LQ
+already does disambiguation), and at the L2 `mem_ctrl`'s per-line accept blocking already
+serializes any two transactions on the same line across all slots — the rule that made N harts
+safe makes N entries safe.
+
+### 14.4 Build order
+
+1. **MSHR file with N=1 entry**, allocate/launch split, everything else unchanged → must be
+   cycle-identical. This is the step that proves the re-derivation of miss detection is faithful,
+   and it is where the real risk lives.
+2. N=2 entries + both interlocks conservative → read the boot. Expect ≤ the O1 bound of 7.20 %
+   minus what N1 already took.
+3. Delete `QUE_FILLONLY` (and re-check the litmus case its comment cites), then size N.
+4. Secondary-miss merge last — it is the largest win per entry but needs the waiter list, and
+   steps 1-3 are useful without it.
+
+### 13.5 N=4 settles it — nothing in `mem_ctrl` is busy
+
+| counter, cy=25,000,000 (N=4 boot, N1 live) | value | of 25 M | N=2 equivalent |
+|---|---|---|---|
+| `busy` (lookup port had work) | 210,006 | **0.84 %** | 1.06 % |
+| `cont` (2+ slots wanted it) | 812 | 0.003 % | 0.002 % |
+| `hiwait` (last-ranked D slot waiting) | 106 | ~0 | ~0 |
+| `accline` / `acclost` | 5,496 / 1,375 | 0.02 % / 0.005 % | 0.006 % / 0.005 % |
+| `busboth` (a hart's D and I both wanting the channel) | 20,453 | 0.08 % | 0.07 % |
+| `instblk` | 27,968 | 0.11 % | 0.10 % |
+| `engbusy` / `engwait` | 28,852 / 26,999 | 0.12 % / 0.11 % | 0.10 % |
+
+**Every counter is the same order of magnitude at N=4 as at N=2, and none exceeds 0.12 %.** The
+465,000 cycles of §10.6 are not in any of them. Widening a resource that is 99 % idle would buy
+nothing, so the L2 lookup port — and the rest of `mem_ctrl`'s shared machinery — is dismissed.
+
+**Conclusion: the +1.86 % at N=4 is not a structural cost of N1.** It is the N=4 boot's known
+±1M timing sensitivity re-rolling (CLAUDE.md), and +465,000 is under half that band. Recorded as
+a standing item to re-measure whenever something else moves the N=4 number, not a defect to
+repair. The block continues to N2.
+
+Method note worth keeping: the whole investigation — hypothesis, instrumentation, refutation at
+N=2, confirmation at N=4 — cost two boots and no RTL. The alternative (building a second lookup
+port and reading the boot) would have cost days and produced a change that could not have helped.
+**Measure whether the suspect is busy before widening it.**
