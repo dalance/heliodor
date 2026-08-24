@@ -1343,3 +1343,89 @@ the next build and split it by something the counter itself cannot see. The firs
 state entered 14 times; the second found 8.7 % of the boot filed under the wrong heading. Neither
 needed RTL. `feedback_census_must_match_the_path`, twice, on the census that was written to answer
 it the first time.
+
+### 14.12 The MLP ceiling is 1.26 %, and O1/O4 were never measuring it
+
+N2.2b — a second D-side `mem_ctrl` slot and a two-entry MSHR, so two fills run at once — is the
+step §14.10 pointed at, and the one the block is named for. It was priced before it was built.
+
+The first two passes located the population but not its shape:
+
+| N=1 boot, 12,230,000 cy | cycles | of boot |
+|---|---|---|
+| D-cache `State::FILL`, any requester | 2,119,006 | 17.3 % |
+| … of which RFO (store ownership) | 1,440,973 | 11.8 % |
+| a waiting load, behind a fill | 188,384 | 1.54 % |
+| **a drain needing ownership while the entry is busy** | **931,746** | **7.62 %** |
+| … with an RFO fill in the way | 779,592 | 6.37 % |
+
+Read naively that says: store ownership serializes against store ownership for 6.37 % of the boot,
+which a second fill context would collapse. It says no such thing. **`i_swen` stays asserted for
+the whole of a drain's own RFO burst** — the drain is not acked until the line installs — so a
+drain waiting for its own fill is indistinguishable, in those counters, from one blocked behind
+someone else's. The same is true of a load demanding the very line being filled.
+
+The discriminator is the line address. Adding `fill_line != drain_line` and
+`fill_line != load_line`:
+
+| wants a **different** line while a fill runs | cycles | of boot |
+|---|---|---|
+| a store drain | **58,234** | 0.48 % |
+| … with an RFO fill in the way | **26** | ~0 |
+| a load | **96,159** | 0.79 % |
+
+**Twenty-six cycles.** The RFO-behind-RFO serialization does not exist. Of the 931,746 cycles a
+drain spends "blocked", 873,512 — 94 % — are the drain waiting for its **own** ownership fetch,
+which no MSHR depth shortens.
+
+The reason is a fifth level of single-depth the §5 audit missed, one layer above the four it
+found: **the store buffer's drain port presents only `sb_line[0]`** (`heliodor_core.veryl`'s
+`sdrain_saddr = {sb_line[0], 6'd0}`, popped by `o_sdrain_ack`). While the head line waits for its
+RFO, the next drain line is not presented to the D-cache at all — so a second MSHR entry has
+nothing to allocate. Store-side MLP is bounded by the drain port, not by the fill contexts.
+
+**So N2.2b's ceiling is 58,234 + 96,159 = 154,393 cycles = 1.26 % of the boot** — and that is the
+count of *blocked* cycles, an upper bound before the transfer floor (the data array takes one
+dword per cycle; only the latency half is overlappable, §8.3). A three-module build — dcache
+MSHR file, `mem_ctrl` `SPH` 2→3, a second core read channel — for at most 1.26 %.
+
+#### The correction this forces on the block's own ceilings
+
+O1 (all fill latency → 1) measured **7.20 %** and was recorded as "the block's upper bound"; O4
+(RFO latency only) measured **2.91 %** and was recorded as N1′'s. Both are real numbers and
+neither is an MLP ceiling:
+
+> **O1 and O4 make the fill the requester is *already waiting for* faster. MLP cannot do that.
+> MLP only helps when there is a SECOND, DIFFERENT line to overlap with — and that is a
+> concurrency measurement, not a latency measurement.**
+
+Measuring the latency tells you what a faster memory would buy. Measuring the concurrency tells
+you what a wider one would. The block spent its scoping on the first and inherited it as the
+budget for the second; 7.20 % and 1.26 % differ by 5.7×. This is
+`feedback_latency_vs_transfer` taken one step further: latency is overlappable **only against an
+independent request**, so the ceiling for overlapping is `min(latency, concurrency)`, and the
+block only ever measured the first term.
+
+#### Where that leaves Block N
+
+| step | status |
+|---|---|
+| N1 — I/D read channel split | 🏁 shipped-arm; N=1 −1.13 %, N=2 −3.13 % |
+| N2.1 — the fill state becomes an MSHR file | 🏁 built, bit-identical |
+| N2.2a — the ALLOC state | 🏁 built, bit-identical; §14.10: entered **14 cycles** per boot |
+| N2.2b — two fill contexts | ❌ **ceiling 1.26 %, refuted before build** |
+| N1′ — load vs store-RFO contexts | ❌ subsumed by the above; same 1.26 % |
+| N3 — deeper queues | ❌ zero on its own (§9), and now zero downstream too |
+
+N1 is the block's result. Everything below it is bounded by 1.26 % because the machine does not
+generate two independent line requests often enough to overlap — the four single-depth layers of
+§5 were the visible constraint, and the drain port is the fifth, sitting above all of them.
+
+If store-side MLP is ever wanted, the change is in the **store buffer**, not the D-cache: present
+the next drain line while the head waits. That is a different block, with its own census.
+
+**Method.** Three passes, four boots, no RTL. Pass 1 split the bucket that justified the build and
+found the mechanism's own slice was 0 (§14.10). Pass 2 checked the qualifier from outside and
+found 8.7 % of the boot filed under the wrong heading (§14.11). Pass 3 compared the addresses and
+found 94 % of the remaining population waiting on itself. Each pass cost one boot; the build they
+were pricing would have cost days and bought 1.26 % at best.
