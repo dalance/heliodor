@@ -1104,3 +1104,41 @@ Method note worth keeping: the whole investigation — hypothesis, instrumentati
 N=2, confirmation at N=4 — cost two boots and no RTL. The alternative (building a second lookup
 port and reading the boot) would have cost days and produced a change that could not have helped.
 **Measure whether the suspect is busy before widening it.**
+
+### 14.5 N2.1 built — the fill state is an MSHR file (one entry)
+
+`dcache.veryl`'s single fill context becomes `MSHR_N`-deep arrays (`m_st_q`, `m_cnt_q`,
+`m_index_q`, `m_tag_q`, `m_way_q`, `m_off_q`, `m_abort_q`, `m_rfo_q`) with **read aliases** for
+entry 0 named exactly as before (`state`, `fill_count`, `fill_index`, …). All 68 readers are
+untouched; only the 20 writes — every one of them inside the fill `always_ff` — address the entry.
+
+At `MSHR_N=1` this is the same registers under a different name, and the N=1 boot confirms it:
+`cy=00ba9d70`, `instret=10421567`, **bit-identical to N1**.
+
+Doing the mechanical reshape as its own step is deliberate. The risk in N2 is concentrated in one
+place — re-deriving miss detection from a **latched entry** instead of the live `i_addr` (§14.2) —
+and separating the reshape means that when the next step breaks something, the cause is
+structural rather than a slip in renaming 88 sites.
+
+### 14.6 N2.2 splits in two, because of a constraint N1 exposed
+
+Writing the next step out revealed something the §14 plan glossed over: **a second MSHR entry does
+not by itself give a second concurrent fill.** `mem_ctrl` holds one slot per requester class, and
+the D side has exactly one. Two allocated entries would still take turns on it.
+
+So N2.2 is two steps with different values:
+
+**N2.2a — the MSHR file becomes real (one launch port).** Two entries, allocate decoupled from
+launch, miss detection re-derived from the latched entry. Even with a single slot this buys:
+- **secondary-miss merge** — a second load to a line already being fetched attaches instead of
+  waiting for the fill to retire and then missing again;
+- the end of the `i_ren`-holding contract, hence `QUE_FILLONLY` and the core-side restriction it
+  forces (§2.1);
+- `o_stall` stops meaning "a fill is in flight" and starts meaning "no entry is free".
+
+**N2.2b — a second D-side slot (`SPH: 3`).** This is what makes two fills actually concurrent, and
+it is the same wiring exercise N1 already did (core port, SoC bundle, slot-major numbering). The
+O1 bound minus what N1 took is what is left to win here.
+
+Doing 2.2a first also keeps the risky part isolated: 2.2a changes *when* a fill is recorded, 2.2b
+changes *how many* can run. If the boot moves the wrong way, the two causes are separable.
