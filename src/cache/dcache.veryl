@@ -163,6 +163,22 @@ pub module dcache #(
     // valid whenever this is high.
     o_fill_data_ready: output logic,
     o_hit_safe     : output logic    , // S10.4: fill-safe pipe-0 hit on i_addr (see assign)
+    // Block N N2.2b: an MSHR entry is ALLOCATED and holding a line that has not yet
+    // won its bus grant (State::ALLOC). The line is o_memr_addr[63:6] — while ALLOC
+    // the read-channel outputs are driven from the entry, and ALLOC is mutually
+    // exclusive with both `filling` and `uncached_active`, so that address is the
+    // allocated line and nothing else. The core uses it to tell "the D-cache has
+    // RECORDED this load's miss" apart from the other reasons o_stall is high: a
+    // recorded miss is safe to hand off to the core MSHR (the entry keeps requesting
+    // the bus with i_ren dropped), an unrecorded one is not.
+    o_mshr_alloc   : output logic    ,
+    // Block N census: WHY o_stall is high this cycle, one bit per reason class (they
+    // overlap; this is a decomposition of the OR, not a priority encode). The core's
+    // DBG_CENSUS block splits its "handoff declined" bucket by these, which is how §14.10
+    // found that the ALLOC slice of that bucket is zero and §14.11 that most of it is a
+    // fill the core's fill_busy_q cannot see. Pure combinational terms already computed
+    // for o_stall, so the whole port DCEs when the consumer is const-gated off.
+    o_stall_why    : output logic<8> ,
     // Memory side — S23: split READ channel (fills / miss reads) and WRITE
     // channel (i_wen write-through + store drain), each with its own
     // request/grant pair, so a store drain proceeds DURING a fill burst
@@ -416,8 +432,10 @@ pub module dcache #(
     // an MSHR rather than a fill FSM — the entry holds the missing line's address while
     // it waits for the bus, INDEPENDENTLY of whether the requester is still presenting
     // it. That is what dissolves the i_ren-holding contract documented at o_miss_valid
-    // (and hence the core's LSR_MSHR_B_QUE_FILLONLY restriction). A grant arriving the
-    // same cycle as the miss still goes straight to FILL, so the common path is unchanged.
+    // (and hence the core's Stage-B handoff restriction — now LSR_MSHR_B_QUE_SCOPE, which
+    // reads o_mshr_alloc to allow exactly the handoffs this state makes safe). A grant
+    // arriving the same cycle as the miss still goes straight to FILL, so the common path
+    // is unchanged.
     enum State: logic<2> {
         IDLE  = 2'd0,
         ALLOC = 2'd1,
@@ -2795,6 +2813,7 @@ pub module dcache #(
     :
         {f_tag, f_index, 3'd0, 3'b000}
     ;
+    assign o_mshr_alloc = m_alloc;
     assign o_memr_ren = if uncached_active ? i_memr_grant : if filling ? 1'b1 : if m_alloc ? 1'b1 : if fill_start_fire ? 1'b1 : 1'b0;
     assign o_memr_rfo = if uncached_active ? 1'b0 : if filling ? fill_rfo : if m_alloc ? fill_rfo : f_rfo;
 
@@ -3246,11 +3265,21 @@ pub module dcache #(
     // drops the request.
     let write_wait_grant: logic = m_arr_free && i_wen && !i_wen_excl && !amo_miss && !wen_fires;
     let write_wait_local: logic = m_arr_free && i_wen && i_wen_excl && !wenl_fires;
-    // N2.2a bisect: does the failure come from o_stall DROPPING during ALLOC? `miss` is
-    // built from miss_raw, which is IDLE-gated, so an allocated entry stops asserting it.
-    // Including m_alloc here restores the pre-N2.2a stall behaviour while keeping the
-    // entry's i_ren-independence; if the boot passes with this term, the defect is in what
-    // the core does when the D-cache says "not stalled" but also "no data".
+    // N2.2a: `miss` is built from miss_raw, which is IDLE-gated, so an allocated entry
+    // stops asserting it — m_alloc here keeps the stall while ALLOC holds the line, which
+    // made the ALLOC state bit-identical to the old hold-in-IDLE (§14.8). Dropping it is
+    // the non-blocking step, and needs the core to give "not stalled, no data" a meaning.
+    // §14.10 prices that step at nothing while ALLOC lasts 14 cycles of a whole boot.
+    assign o_stall_why = {
+        nf_gap_stall || nf_reg_stall || (uncached_active && !i_memr_grant), // 7: sync-read gap / MMIO
+        dhit_c3_squash || dhit_cap_pre_q || dhit_miss,                      // 6: registered Stage-A hit path
+        inv_hits_active || inv2_hits_active,                                // 5: remote invalidate race
+        write_during_fill || write_wait_grant || write_wait_local,          // 4: a WRITE is holding
+        state == State::DONE,                                               // 3: fill retiring
+        miss,                                                               // 2: a miss (pre-allocate)
+        m_alloc,                                                            // 1: an entry HOLDS a line, no grant yet
+        state == State::FILL                                                // 0: a fill is running
+    };
     assign o_stall = (state == State::FILL) || m_alloc || miss || (state == State::DONE) || write_during_fill || write_wait_grant
         || write_wait_local || inv_hits_active || inv2_hits_active || dhit_c3_squash || dhit_cap_pre_q || dhit_miss || nf_gap_stall || nf_reg_stall || (uncached_active && !i_memr_grant);
 

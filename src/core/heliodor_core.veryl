@@ -10607,6 +10607,8 @@ pub module heliodor_core #(
     // block after the instance. dc_miss_valid = fill-start pulse, dc_fill_complete
     // = non-aborted DONE, dc_fill_rdata = filled dword at the original miss offset.
     var dc_miss_valid   : logic    ;
+    var dc_mshr_alloc   : logic    ; // N2.2b: a D-cache MSHR entry HOLDS a line, waiting for its grant
+    var dc_stall_why    : logic<8> ; // N2.2b census: which class of reason o_stall is high (see dcache.veryl)
     var dc_miss_offset  : logic<3> ; // L4 step-2: demanded dword of the starting fill
     var dc_fill_complete: logic    ;
     var dc_fill_rdata   : logic<64>;
@@ -11145,6 +11147,8 @@ pub module heliodor_core #(
         o_stall          : dcache_stall                  ,
         o_data_valid     : _                             , // single-hart
         o_miss_valid     : dc_miss_valid                 , // S10.1: MSHR capture trigger
+        o_mshr_alloc     : dc_mshr_alloc                 , // N2.2b: an MSHR entry holds a line (State::ALLOC)
+        o_stall_why      : dc_stall_why                  , // N2.2b census: the stall's reason classes
         o_miss_offset    : dc_miss_offset                , // L4 step-2: that fill's demanded dword
         o_fill_complete  : dc_fill_complete              ,
         o_fill_rdata     : dc_fill_rdata                 ,
@@ -11485,23 +11489,39 @@ pub module heliodor_core #(
     //       would strand the fill". The Stage-B handoff frees the LSR, i_ren drops, and
     //       load_sel_q follows it down one cycle later — withdrawing a request mid
     //       arbitration.
-    // QUE_FILLONLY restricts the handoff to (a). Observed at =0: litmus N=2 test 7
-    // (2000 amoadds across 2 harts, then `lw t0,0(s4)`) retires 0 from a fill, while the
-    // ASQ drain trace proves the RMW chain is intact all the way to 0x7d0 = 2000 — i.e.
-    // the atomics are fine and the captured load's FILL read a line that predates all of
-    // them. Case (b) is the only structural difference from the =0 arm at that load.
-    // Block N N2.2a: the D-cache now ALLOCATES an MSHR entry on a miss without a grant, so
-    // case (b) no longer strands the fill when i_ren drops. Flipping this to 0 gets PAST the
-    // failure this comment records — litmus N=2 passes (cy=003037c0) where it used to retire
-    // 0 from a fill — which is direct evidence the ALLOC state closes that hole. But
-    // rv64ui-ma_data then fails: a MISALIGNED load spans two lines, and its hi-side fill
-    // (hi_miss) is detected only in IDLE and only when the lo side already HIT, so the
-    // two-stage fill and a handoff across ALLOC do not yet compose. Left at 1 with the
-    // evidence; see cp_mshr_mlp_plan.md §14.9.
-    const LSR_MSHR_B_QUE_FILLONLY: bit = 1;
+    // QUE_SCOPE names WHICH of those `dcache_stall` cycles may hand off:
+    //   0 = FILL only — case (a). The original L4 step-2 arm.
+    //   1 = FILL, or an MSHR entry holding OUR line (State::ALLOC) — case (a) + the
+    //       precise case (b). This is what N2.2a's ALLOC state was built to enable:
+    //       the entry keeps requesting the bus after i_ren drops, so nothing is lost.
+    //   2 = any stall. The blanket arm; it also hands off on stall cycles where the
+    //       load's miss has NOT been recorded ANYWHERE (dhit_miss / nf_gap_stall — the
+    //       load's first Stage-B cycle, before the D-cache has even evaluated its live
+    //       miss — plus write_wait_grant, DONE, inv_*, uncached_active).
+    // Observed at 2 (Block N, cp_mshr_mlp_plan.md §14.9): litmus N=2 test 7 — the failure
+    // this const was introduced for — PASSES (cy=003037c0) where it used to retire 0 from a
+    // fill, which is direct evidence that ALLOC closes case (b). rv64ui-ma_data then fails
+    // at subtest 126 (`sw 62(s0)` then `lbu 64(s0)`, both crossing a line), a DIFFERENT bug
+    // that lives in the rest of scope 2 — the dhit/inv/gap cycles, where the load's miss has
+    // not been recorded anywhere yet.
+    // Observed at 1 (§14.10): the suite passes 252/0, so the precise case-(b) handoff IS safe
+    // — and the N=1 boot is BIT-IDENTICAL (cy=00ba9d70, instret=10421567), because the
+    // D-cache enters State::ALLOC for **14 cycles** in the whole boot. A load's fill request
+    // is granted the cycle it is made, so case (b) is an empty population and this whole
+    // restriction was guarding nothing. Left at 0 = the shipped arm; 1 and 2 are kept as
+    // measured arms, not candidates.
+    const LSR_MSHR_B_QUE_SCOPE: u32 = 0;
+    // The D-cache has RECORDED this load's miss in an MSHR entry. `dc_mem_addr` is the
+    // entry's line whenever dc_mshr_alloc is high (ALLOC drives the read channel from the
+    // entry and excludes `filling` / `uncached_active`), so this is an attribution check of
+    // the same shape as mshr_cap_b_own's, one level coarser (line, not dword: any load on
+    // that line is served by that entry's fill).
+    let dc_alloc_ours: logic = dc_mshr_alloc && lsr_paddr_q[63:6] == dc_mem_addr[63:6];
+    let que_scope_ok : logic = fill_busy_q || (LSR_MSHR_B_QUE_SCOPE >= 1 && dc_alloc_ours)
+        || (LSR_MSHR_B_QUE_SCOPE >= 2);
     let mshr_cap_b_que_raw: logic = LSR_MSHR_B_QUE && lsr_mshr_ok && lsr_drive && !dc_miss_valid && dcache_stall
         && !dc_hit_safe && !i_dcache_inv_valid && !i_dcache_inv2_valid
-        && (!LSR_MSHR_B_QUE_FILLONLY || fill_busy_q);
+        && que_scope_ok;
     // ── L4 step-2 budget bisection (DIAGNOSIS SCAFFOLD, not a ship candidate) ──
     // Allow only the first CAPB_BUDGET queued handoffs, then hold the arm off. Runs
     // with budget >= N take events 0..N-1 identically (the trajectory only diverges at
@@ -12911,7 +12931,34 @@ pub module heliodor_core #(
                 lw_cause_cnt[99] = lw_cause_cnt[99] + 32'd1;                        // handoff declined: the queue was FULL
             }
             if nx_fo_rej {
-                lw_cause_cnt[100] = lw_cause_cnt[100] + 32'd1;                      // handoff declined: QUE_FILLONLY
+                lw_cause_cnt[100] = lw_cause_cnt[100] + 32'd1;                      // handoff declined: not FILL
+            }
+            // N2.2b: SPLIT bucket 100 by the D-cache's reason for stalling. Bucket 100 is
+            // the whole population QUE_SCOPE=2 hands off and QUE_SCOPE=0 declines; only
+            // the ALLOC slice (121) is the case (b) the ALLOC state was built to serve,
+            // and only that slice is safe (QUE_SCOPE=1). The rest are cycles where the
+            // load's miss has not been recorded anywhere yet. 127 is the denominator that
+            // says whether ALLOC is ever entered at all.
+            if nx_fo_rej && dc_stall_why[0] {
+                lw_cause_cnt[120] = lw_cause_cnt[120] + 32'd1;                      // ... a fill is RUNNING (skew vs fill_busy_q)
+            }
+            if nx_fo_rej && dc_stall_why[1] {
+                lw_cause_cnt[121] = lw_cause_cnt[121] + 32'd1;                      // ... an entry HOLDS a line = case (b)
+            }
+            if nx_fo_rej && dc_stall_why[2] {
+                lw_cause_cnt[122] = lw_cause_cnt[122] + 32'd1;                      // ... a miss, not yet allocated
+            }
+            if dc_stall_why[0] {
+                lw_cause_cnt[123] = lw_cause_cnt[123] + 32'd1;                      // D-cache FILL cycles, ANY requester
+            }
+            if nx_fo_rej && (dc_stall_why[5] || dc_stall_why[7]) {
+                lw_cause_cnt[125] = lw_cause_cnt[125] + 32'd1;                      // ... an inv race / sync-read gap / MMIO
+            }
+            if nx_fo_rej && dc_stall_why[6] {
+                lw_cause_cnt[126] = lw_cause_cnt[126] + 32'd1;                      // ... the registered Stage-A hit path
+            }
+            if dc_mshr_alloc {
+                lw_cause_cnt[127] = lw_cause_cnt[127] + 32'd1;                      // ALLOC cycles, ANY requester (denominator)
             }
             if ic_owns && dc_mem_req {
                 lw_cause_cnt[101] = lw_cause_cnt[101] + 32'd1;                      // I-side owns the channel, D-side waiting
@@ -12954,6 +13001,14 @@ pub module heliodor_core #(
             }
             if nx_pre {
                 lw_cause_cnt[109] = lw_cause_cnt[109] + 32'd1;                      // ungranted BEFORE a fill starts
+            }
+            // N2.2b: fill_busy_q is set by dc_miss_valid, which o_miss_valid qualifies with
+            // m_ld_q (a LOAD demanded the fill) — so a store-RFO fill is INVISIBLE to it, and
+            // every bucket here that reads !fill_busy_q calls an RFO fill's own burst beats
+            // "before a fill starts". 124 measures that blind spot directly: how much of
+            // nx_pre is really INSIDE a D-cache fill. (123 is the matching denominator.)
+            if nx_pre && dc_stall_why[0] {
+                lw_cause_cnt[124] = lw_cause_cnt[124] + 32'd1;                      // "pre-fill" ungranted while the D-cache IS filling
             }
             if nx_pre && ic_owns {
                 lw_cause_cnt[110] = lw_cause_cnt[110] + 32'd1;                      // ... the I-side holds the channel

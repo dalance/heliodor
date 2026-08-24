@@ -1227,3 +1227,119 @@ leaves nothing in the pipe to re-present the hi half. `lsr_mshr_ok` excludes `ls
 Left at 1 with this evidence in the comment. The fix belongs with the step that makes the D-cache
 non-blocking (§14.8), because both need the same thing: a miss that is *recorded* rather than
 *re-detected*, including the hi half of a span.
+
+### 14.10 The ALLOC state is entered 14 times in a 12 M-cycle boot
+
+§14.9 left two things to fix together — let `o_stall` drop during ALLOC (a), and record the hi
+half of a misaligned span (b) — with the prize named as census bucket 100, "handoff declined by
+`QUE_FILLONLY`". Before building either, the bucket was **split by the D-cache's reason for
+stalling**, because a bucket names a *place* and not an *amount* and because a population has to
+be checked against the mechanism that would serve it (`feedback_census_must_match_the_path`).
+
+`dcache.veryl` gained `o_mshr_alloc` (an entry is in `State::ALLOC`; its line is `o_memr_addr`,
+since ALLOC drives the read channel from the entry and excludes `filling`/`uncached_active`) and
+`o_stall_why[7:0]`, a decomposition of the `o_stall` OR into reason classes. The core's
+`LSR_MSHR_B_QUE_FILLONLY` bit became `LSR_MSHR_B_QUE_SCOPE`:
+
+| scope | which stall cycles may hand off | |
+|---|---|---|
+| **0** | `fill_busy_q` only | the shipped arm — case (a) |
+| **1** | + an MSHR entry holds **our** line (`dc_alloc_ours`) | case (b), the one ALLOC was built for |
+| **2** | any stall | the blanket arm |
+
+**Scope 1 is correct and useless.** The full suite passes 252/0 — so the precise case-(b) handoff
+is safe, and the whole `rv64ui-ma_data` failure of §14.9 lives in the *rest* of scope 2. But the
+N=1 boot comes back `cy=00ba9d70`, `instret=10421567` — **bit-identical**. Not "small": identical.
+The handoff never fires.
+
+The census says why:
+
+| N=1 boot, 12,230,000 cy | value |
+|---|---|
+| **`State::ALLOC` cycles, any requester** | **14** |
+| bucket 100 slice where an entry holds a line (case (b)) | **0** |
+| bucket 100 total (`fillonly`) | 72,615 |
+| … a fill IS running (`state == FILL`, `fill_busy_q` low) | 39,986 |
+| … the registered Stage-A hit path (`dhit_*`) | 24,701 |
+| … an inv race / sync-read gap / MMIO | 23,854 |
+| … a miss not yet allocated / DONE / a write | 125 / 771 / 0 |
+
+**Fourteen cycles.** The state that N2.2a was built to add — hold the missing line while waiting
+for a bus grant — is entered fourteen times in a twelve-million-cycle boot. A load's fill request
+is granted the cycle it is made; `fill_alloc_fire` needs `!i_memr_grant`, and after N1 gave the D
+side its own `mem_ctrl` slot that condition is essentially never true. The `prefill_accept=0` line
+of the earlier census said the same thing and was not believed hard enough: **there is no
+pre-launch wait for a load fill to overlap.**
+
+So `QUE_FILLONLY` was guarding an empty population, and the "prize" of deleting it is not case (b)
+at all. What bucket 100 actually contains is 55 % **"a fill is running that `fill_busy_q` cannot
+see"** — `o_miss_valid` is qualified by `m_ld_q`, so a store-RFO fill never sets the core's
+tracker — plus 34 % `dhit_miss` / 33 % inv-and-gap cycles, which are the load's *first* Stage-B
+cycle, before the D-cache has evaluated its own miss. Those last two are where `ma_data` breaks:
+handing off there hands off a load whose miss has not been recorded anywhere.
+
+Consequences for the block:
+
+1. **(a) and (b) are not the next step, and they were not one step.** Making `o_stall` droppable
+   during ALLOC buys nothing while ALLOC lasts 14 cycles. The span fix (b) is a real bug but it is
+   only reachable through scope 2, which is not a shape worth shipping.
+2. **`fill_busy_q` means the wrong thing** — "a fill I asked for" rather than "the D-cache is
+   filling". It gates the Stage-B handoff *and* arms `replay_q`, so during an RFO fill the core
+   both declines the handoff and lets a queued entry spin the replay engine over the port. One
+   definition fixes both. Whether it is worth doing is a 0.33 %-of-boot question (39,986 cy), so
+   it is a cleanup, not a lever.
+3. **N2's remaining value is entirely in the second entry**, not in the allocate/launch split.
+   Overlapping the 32,565 fill starts × ~23 cy needs two fills in flight = N2.2b's second
+   `mem_ctrl` slot. ALLOC was never on that path.
+
+Method note, and the reason this cost two boots instead of a week: the step that would have been
+built here (non-blocking `o_stall` + span recording, both non-trivial) was priced first by
+splitting the bucket that justified it. The bucket's largest slice turned out to be a measurement
+artefact and its named slice turned out to be zero. **Split the bucket before building for it.**
+
+### 14.11 …and the same blind spot was mislabelling 8.7 % of the boot
+
+`fill_busy_q` mattering more than it looked led to one more counter, because §6.2/§8 had built the
+block's picture on buckets that all read `!fill_busy_q`. Bucket 109 ("ungranted BEFORE a fill
+starts", 1,061,519 cy = **8.68 %** of the N=1 boot) and its remainder 112 ("`mem_ctrl` declines to
+ACCEPT", 1,035,087 = 8.46 %) are the two largest single numbers this block has produced. Adding
+`nx_pre && (D-cache state == FILL)`:
+
+| N=1 boot, 12,230,000 cy | value |
+|---|---|
+| D-cache `State::FILL` cycles, **any** requester | **2,119,006** |
+| `fill_busy_q` cycles (bucket 96) | 741,563 |
+| bucket 109 "ungranted BEFORE a fill starts" | 1,061,519 |
+| … of which the D-cache **IS** filling | **1,061,504 = 99.9986 %** |
+
+**There is no pre-fill accept wait. There never was.** `o_miss_valid` is qualified by `m_ld_q`, so
+a store-RFO fill never sets `fill_busy_q`; every one of that fill's ungranted burst beats was
+therefore counted as "waiting to start". The core sees 741,563 of the D-cache's 2,119,006 fill
+cycles — **35 %** — and the missing 1.38 M are ownership fetches.
+
+So the block's "the read channel's biggest consumer is store RFO" (§6.3) stands and is if anything
+understated, but the **shape** recorded next to it does not: bucket 112 was read as arbitration
+pressure at `mem_ctrl` (which is what motivated §13's lookup-port hypothesis, itself refuted by
+measurement). It is not arbitration. It is the RFO fill's own DRAM latency and transfer —
+precisely the thing O4 priced at **−2.91 %** and precisely the thing only a second fill context
+can overlap. Two counters that disagreed about the same 1.06 M cycles, and the disagreement was
+the whole finding.
+
+Corrections to carry forward:
+
+- **`prefill_accept=0` was already saying this** and was recorded as "true accept wait = 0" without
+  following it to "then what are the other 1.03 M cycles?". A zero in one bucket is a claim about
+  its neighbours.
+- **Any bucket qualified by `fill_busy_q` describes load fills only.** 96/97/98 (the MLP≥2 ceiling),
+  107 (memory idle), 108/109 and their children, and the Stage-B handoff gate all inherit it.
+- The fix is one line — `fill_busy` should be the D-cache's `filling`, exported, not the core's
+  load-fill tracker — and it changes behaviour in two places at once (the handoff gate, and
+  `replay_q`'s arming, which currently lets a queued entry spin the replay engine over the port
+  for the whole of an RFO fill). Worth doing as a correctness-of-meaning cleanup; not a lever
+  (§14.10 item 2).
+
+**Method.** Both §14.10 and this section came from the same move — take the counter that justifies
+the next build and split it by something the counter itself cannot see. The first split found a
+state entered 14 times; the second found 8.7 % of the boot filed under the wrong heading. Neither
+needed RTL. `feedback_census_must_match_the_path`, twice, on the census that was written to answer
+it the first time.
