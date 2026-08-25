@@ -1429,3 +1429,75 @@ found the mechanism's own slice was 0 (§14.10). Pass 2 checked the qualifier fr
 found 8.7 % of the boot filed under the wrong heading (§14.11). Pass 3 compared the addresses and
 found 94 % of the remaining population waiting on itself. Each pass cost one boot; the build they
 were pricing would have cost days and bought 1.26 % at best.
+
+## 15. Block N SHIP — the instruction side's own slot is the default path
+
+**Shipped: `ID_SPLIT = 1` in both SoCs, `SPH = 2` in `mem_ctrl`.** N1 is what Block N produced;
+everything below it (N1′, N2.2b, N3) is closed by §14.12's 1.26 % ceiling, and N2.1 / N2.2a stay
+in-tree as bit-identical structure.
+
+### 15.1 What ships
+
+The instruction side — the I-cache fill and the I-side page-table walker — had shared the D-side
+read port through `ic_route`, so an I-fill and a D-fill were mutually exclusive. It now has its
+own `mem_ctrl` transaction slot (`o_imemr_*`), which is what `SPH` (slots per hart) was
+introduced for: the module had been using `N_HARTS` for two different things, "how many L1s the
+directory addresses" and "how many line reads can be in flight", and they were the same number
+only because the D-cache has one fill FSM.
+
+| gate | before | shipped (re-measured at ship) |
+|---|---|---|
+| default suite (incl. litmus N=2) | 252 / 0 | **252 / 0** |
+| **N=1 Linux boot** | 12,370,000 | **12,230,000 `00ba9d70` = −1.13 %** |
+| **N=2 SMP Linux boot** | 16,950,000 | **16,400,000 `00fa3e80` = −3.25 %** |
+| N=4 SMP Linux boot | 24,720,000 | 25,180,000 `01803760` = +1.86 % (§10.6, §13.5) |
+| litmus N=2 | `002ed830` | `002ed830` bit-identical |
+| litmus N=4 (RVWMO battery) | pass | **pass**, `cy=003b0d30` |
+
+The N=2 ship figure is 20,000 cy (two quantization steps — the boot `cy` is reported in units of
+10,000) below the −3.13 % measured at the N1 build itself, because N2.1 and N2.2a have landed
+since; both were bit-identical at N=1 and this is their first N=2 run. Within noise, same result.
+
+**The gain grows with hart count** where it exists at all: N=2 is ~3× N=1, because the resource
+it un-shares is contended by more requesters as harts are added. That is the opposite of O4's
+shape (§8.4, where the RFO-overlap gain *shrank* from N=1 to N=2) and the same shape as Block T.
+The litmus batteries are bit-identical because their loops fit in the I-cache and take no
+I-fills — **the win is in the boot's footprint, not in the microbenchmarks**.
+
+The **N=4 +1.86 %** is a standing item, not a defect: §13 instrumented every shared resource in
+`mem_ctrl` (`LK_CENSUS`, still in-tree DEAD) and found the lookup port 99 % idle at both N=2 and
+N=4, with no counter exceeding 0.12 % and none of them scaling. 465,000 cycles is under half the
+N=4 boot's known ±1M band. Re-measure it whenever something else moves the N=4 number.
+
+### 15.2 Why `ID_SPLIT` stays a `param`
+
+Making it a `const` was tried and broke **229 tests**. Six testbenches instantiate `heliodor_core`
+directly and have no `mem_ctrl` to give it a second slot. The general rule, and the mirror image
+of "dead scaffolding must constant-fold":
+
+> **A flag that creates a new EXTERNAL dependency — a port that needs wiring — belongs in a
+> `param`, not a `const`. A const is forced on every instantiation; the wiring it needs is not.**
+
+### 15.3 The three bugs the build produced, and what each generalizes to
+
+1. **`is_grant` gained an `is_req` term and the boot died at 77 k instructions.** `mem_ctrl`'s
+   STREAM beats do not depend on `i_hreq`, and `is_req` drops mid-transaction on a redirect. The
+   old shared path had held the channel open through `ic_route`'s `ic_owns` term. ⇒ **When you
+   split a shared resource, the state that kept the shared path open is not reproduced in the
+   dedicated one automatically.**
+2. **`ID_SPLIT` as a const** — §15.2.
+3. **Hart-major slot numbering starved the higher harts** (litmus timeout, N=2 boot never
+   finishing, both harts still retiring). `mem_ctrl` has two lowest-id-wins encoders, and the
+   single L2 lookup port is re-entered every cycle by a slot retrying an owned line, so hart 0's
+   two slots outranked all of hart 1's indefinitely. Fixed by **slot-major** numbering
+   (`[0, N_HARTS)` = D, `[N_HARTS, 2N)` = I, `hart_of(s) = s % N_HARTS`), which keeps the
+   inter-hart order identical to the pre-Block-N module. ⇒ **When you widen a resource arbitrated
+   by a priority encoder, the index ordering is part of the design.**
+
+### 15.4 What Block N leaves in the tree, DEAD
+
+All const-folded at their shipped values, kept with their measurements in the comments:
+`RFO_OFF` / `RFO_FAST` (the O3/O4 oracles), `LK_CENSUS` (the `mem_ctrl` shared-resource census),
+`DBG_CENSUS` buckets 96-127 with `dcache`'s `o_stall_why` / `o_mshr_alloc`, and
+`LSR_MSHR_B_QUE_SCOPE` (0 = shipped, 1 = the measured no-op, 2 = the measured break).
+Re-measuring any of them is a one-const flip.
