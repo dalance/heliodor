@@ -1501,3 +1501,106 @@ All const-folded at their shipped values, kept with their measurements in the co
 `DBG_CENSUS` buckets 96-127 with `dcache`'s `o_stall_why` / `o_mshr_alloc`, and
 `LSR_MSHR_B_QUE_SCOPE` (0 = shipped, 1 = the measured no-op, 2 = the measured break).
 Re-measuring any of them is a one-const flip.
+
+## 16. Block O — the store buffer's drain port (opened by §14.12)
+
+§14.12 closed store-side MLP on a layer above the four the §5 audit found: **the drain port
+presents only `sb_line[0]`** (`heliodor_core.veryl`'s `sdrain_saddr`, popped by `o_sdrain_ack`),
+so while the head waits for its ownership fetch the next drain line is not visible to the D-cache
+and a second MSHR entry has nothing to allocate. That closed N2.2b — and opened this.
+
+### 16.1 The population, measured first
+
+SB entries are per-LINE (`sb_merge_ok` folds same-line stores into the existing entry), so
+`sb_cnt >= 2` *is* "a second, different line is waiting".
+
+| N=1 boot, 12,230,000 cy | cycles | of boot |
+|---|---|---|
+| **a 2nd store line waits while an RFO fill runs** | **1,009,862** | **8.26 %** |
+| … while any fill runs | 1,097,615 | 8.97 % |
+| a 2nd store line exists at all | 1,218,004 | 9.96 % |
+| a 3rd one | 414,487 | 3.39 % |
+| RFO fill cycles | 1,440,973 | 11.8 % |
+| D-cache fill cycles, any requester | 2,119,006 | 17.3 % |
+
+**During 70 % of all RFO fill cycles a second store line is sitting in the buffer, invisible.**
+That is 6.5× N2.2b's whole population (154,393) and it sits exactly where §14.12 said it would.
+
+It also *closes the arithmetic* with §14.12 rather than contradicting it: there, "the drain wants
+a DIFFERENT line than the one filling" was only 58,234, because the drain **head** is normally
+waiting on its own fill. The second entry is the one with the different line, and the port never
+shows it. Two measurements of the same machine from opposite sides, agreeing.
+
+### 16.2 The ceiling is still O4
+
+Overlapping RFO fills cannot beat deleting RFO latency outright, so **O4 = −2.91 % (§8.2) remains
+the hard cap**, with O3 = −3.15 % the policy-change comparison. Unlike §14.12 — where O1/O4 were
+the *wrong* ceilings because MLP cannot speed up the fill you are already waiting for — here the
+block IS about overlapping one RFO's latency behind another's, which is a strict subset of what
+O4 removed. Population 8.26 %, ceiling 2.91 %, and a realistic 2-deep overlap recovers part of
+the serialized half.
+
+### 16.3 What the build costs, and the question that sizes it
+
+The change is three layers, because the drain port is only the top one:
+
+1. the drain port presents the **next** line while the head is blocked;
+2. the D-cache holds **two** fill contexts (the N2.1/N2.2a MSHR file, widened to `MSHR_N = 2`,
+   with the same-set and writeback-buffer interlocks of §14.3);
+3. `mem_ctrl` gains a **third slot class** (`SPH` 2→3), wired like N1.
+
+Before committing to all three, one more discriminator: **does the second line even need the
+bus?** A drain that hits an owned (E/M) way merges locally with no transaction at all
+(`store_can_drain` → `wenl_fires`), and is blocked only by the `m_arr_free` gate — which would be
+relaxed by a much smaller change than layers 2 and 3. RFO fill STARTS versus drain ACKS gives the
+fraction of drains that actually need ownership.
+
+### 16.4 The buffer is already absorbing it — the cost gate is 1.7 %, not 8.26 %
+
+Two discriminators, one boot each.
+
+**Does the second line need the bus?** RFO fill STARTS versus drain ACKS:
+
+| N=1 boot | events |
+|---|---|
+| drain acks | **1,316,597** |
+| RFO fill starts | **44,705** = **3.4 %** |
+| ⇒ drains that merge LOCALLY, no transaction at all | **96.6 %** |
+
+(1,440,973 RFO fill cycles / 44,705 starts = 32.2 cy per ownership fetch.) So most of the 8.26 %
+is not waiting for a bus transaction. It is waiting for the **data arrays**, which the fill is
+using — and `d1_idx`/`d1_new`/`d1_msk` are a single write port (per-way enables only), so a fill
+beat and a drain genuinely cannot both fire in one cycle.
+
+**What does the waiting actually cost?** A drain blocked in the buffer costs nothing until the
+buffer backs up. There are exactly two paths by which it does:
+
+| N=1 boot, 12,230,000 cy | cycles | of boot |
+|---|---|---|
+| population: a 2nd store line waits behind an RFO fill | 1,009,862 | 8.26 % |
+| population: the head would MERGE LOCALLY, arrays busy | 123,060 | 1.01 % |
+| **cost: a load's SOLE blocker is a deep store buffer** (bucket 89) | **76,672** | **0.63 %** |
+| **cost: the store buffer is FULL** (blocks retire) | **125,694** | **1.03 %** |
+
+**8.26 % of waiting converts to at most ~1.7 % of cost, and the two paths overlap.** The store
+buffer is a latency-hiding structure and it is doing its job: four entries of write-combining
+absorb almost all of the drain serialization. That is the third time this campaign that a large
+*place* has been a small *amount*, and the cleanest instance — here the absorber is visible and
+named.
+
+#### Consequences
+
+- **The three-layer build (§16.3) is not proportionate.** Its population is 8.26 % but its cost
+  gate is 1.7 %, below even O4's 2.91 %, and the two layers that make it expensive (a second fill
+  context, a third `mem_ctrl` slot) serve only the 3.4 % of drains that need the bus.
+- **The proportionate change is one predicate.** `store_can_drain` requires `m_arr_free`
+  (`IDLE || ALLOC`), but the array is only busy on a **granted beat** — 8 cycles of a 32-cycle
+  fill. Letting a local-merge drain fire on a fill's idle cycles is the same per-way / per-cycle
+  exclusion this module already uses twice (S10.2's `fill_busy2` for `o_hit2`, S10.4a's
+  `fill_busy0` for `o_hit_safe`), applied to the third accessor. `s_hit_excl` already excludes the
+  way being filled, so the line being fetched cannot be the line merged.
+- **A deeper store buffer attacks the same two cost paths directly** and needs no D-cache change
+  at all — `sb_full` and the `sb_cnt >= 3` load-issue watermark are both buffer-depth policy. It
+  costs flops, not structure. Worth measuring alongside.
+
+Ceiling for anything in Block O: **~1.7 %**.
