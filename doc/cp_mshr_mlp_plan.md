@@ -1604,3 +1604,58 @@ named.
   costs flops, not structure. Worth measuring alongside.
 
 Ceiling for anything in Block O: **~1.7 %**.
+
+### 16.5 Block O closes without a build — and what that says about the phase
+
+Judged on structure rather than cycles, the drain relaxation does not earn a build:
+
+- **The machine lacks no capability.** Stores complete, retire proceeds, ordering is intact. The
+  `m_arr_free` gate is a *coarse arbiter for a fine-grained resource* — over-conservative, not
+  wrong. Making it per-beat is a refinement of a correct guard.
+- **The absorber is present and doing its job.** Four store-buffer entries with line
+  write-combining convert 8.26 % of drain waiting into ≤1.7 % of cost. That is what a store
+  buffer is *for*; finding it working is a sign of structural completeness, not a gap.
+- The one structural argument available — "loads have had hit-under-miss since Phase 8 and stores
+  never did" — is real but thin: the read path is the one that stalls the pipeline, and it is
+  already non-blocking. The write path is buffered by design.
+
+So Block O is **closed as measured**, alongside N2.2b, N1′ and N3. `RFO_OFF`/`RFO_FAST`,
+`LK_CENSUS` and the `o_stall_why` buckets stay in-tree DEAD; re-opening any of it is a const flip.
+
+**The pattern across the last three candidate blocks is itself the finding.** N2.2b: ceiling
+1.26 %, absorber = the drain port. N=4's +1.86 %: absorber = hart-count timing sensitivity, every
+shared resource 99 % idle. Block O: ceiling 1.7 %, absorber = the store buffer. Three blocks, three
+identified absorbers, no missing capability. **The memory system is not where Phase 14's remaining
+structure is.**
+
+## 17. Where the open structure actually is: EX_PIPE
+
+Phase 14's Block S1 shipped the **scheduler pipeline** live (`SEL_PIPE=1` + `SPEC_WAKE=1`,
+`iq_int.veryl:266/297`) — IPC-neutral, shipped explicitly *for the structure*, per the campaign's
+"advance the FINAL structure, not the synth number" mandate
+(`phase14_frontend_deep_ooo_plan.md` §S1).
+
+**Its matching half is banked at 0.** `EX_PIPE` (`heliodor_core.veryl:4237`) — the registered
+RR│EX│WB execute stage, plus the bypass/forwarding network that keeps pipelined-execute results
+reaching waiting consumers — was user-decided to bank on 2026-07-27. It is **−15 % IPC alone**,
+so it can only ever be justified structurally, which makes it exactly the kind of work this
+criterion selects for. It is also the keystone of the deep-pipeline campaign that Phase 13 left
+half-finished: realistic SRAM landed, the CP wall did not move.
+
+**One blocker remains, and it is localized.** At `EX_PIPE=1` the arch suite passes 252/0 but the
+N=1 boot infinite-loops: early boot corrupts the paging-enable path (`csrw satp` @0x80001040 → a
+wild jump to PC 0 → `handle_exception` re-enters forever because `ld sp,16(tp)` loads sp=0 → the
+`sd ra,8(sp)` store page-faults → nested-trap storm). Named as "a wrong value from the EX
+register/bypass" in the paging-enable / CSR-CDB region.
+
+**The second blocker is already off the critical path.** The `FROUND_PIPE=1` bug (3-stage Zfa
+FROUND applies the rne result for every static rm, and `froundnx.s` drops NX, because the
+held-at-head op's rounding-mode / fflags are read LIVE one cycle after release) was **decoupled**:
+`FROUND_PIPE = FMA_PIPE3 = 0` at the `u_fpu` instantiation, and **EX_PIPE=1 with the committed
+2-stage FROUND/FMA is zfa 4/4**. It stays a real, known-wrong piece of RTL and a standalone FP-CP
+follow-up — a latching bug of exactly the class this campaign has found three times (L1's snapshot
+skew, N2's live-vs-latched miss detection) — but it does not gate EX_PIPE.
+
+So the open structural item is **one bug, in a named region, on the keystone of the deep-pipeline
+campaign**, and `feedback_commit_to_structural_cp_change` is explicit about what to do with it:
+commit to the large change rather than iterating small ones.
