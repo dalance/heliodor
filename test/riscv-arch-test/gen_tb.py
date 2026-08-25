@@ -99,6 +99,7 @@ module test_arch_{suite}_{name}_harness (
         i_ext_irq      : 32'd0     ,
     );
 
+    #[allow(initial_assign)]
     var dram: logic<32> [262144];
     initial {{
         $readmemh("test/riscv-arch-test/build/{suite}/{file}.hex", dram);
