@@ -181,6 +181,54 @@ against pristine master: dhrystone 235,808 / 264,834 and coremark 394,555 / 374,
 bit-identical, N=1 boot `00ba9d70` / instret 10,421,567 identical). The flip itself is a
 ship decision, not a bug fix.
 
+### S3 (2026-08-26) — E3 becomes the §1.0b BUFFER, and E3 is NOT the coremark cost
+
+The 13 % coremark spread pointed at E3, whose own comment called itself a stand-in
+("Conservative predictor … tightened for IPC at the EX_PIPE=1 flip"): it stopped lane-0
+issue outright whenever an MSHR entry merely EXISTED, or any FP op was in flight. It is
+now the mechanism §1.0b actually specifies and that `mshr_cdb` / `int_div_cdb` already use
+— **a holding buffer**. `alu_cdb_q` keeps a staged result that LOSES the unified-CDB
+arbitration and retries next cycle; `ex3_defer` is exactly "the buffer is occupied".
+Nothing is predicted and nothing is dropped.
+
+**Two things the flip taught, both worth more than the cycles:**
+
+1. **E3 was priced by REPLACEMENT, not by removal.** Forcing `ex3_defer = 0` wedges
+   dhrystone at instret 5,354 and coremark at 2,037 — the drop it prevents is not a corner,
+   so the usual "delete the dominant source and read the cycle count" oracle has no reading
+   to give here. The A/B of two correct implementations was the only available price.
+2. **The hold OPENS a window the pre-hold design did not have.** A staged result can now
+   sit for many cycles, so an early (execute-time) redirect can fire WHILE it waits, and
+   `ec_wrongpath` only ever covered the single registration cycle. `eh_wrongpath` applies
+   the same age test to the entry already IN the buffer. Likewise `alu_sprobe_pa_q` /
+   `alu_sprobe_ok_q` — S2's fix — are part of `alu_cdb_q`'s payload and must HOLD with it:
+   a held STORE keeps `cdb.valid && cdb.is_store` asserted every cycle it waits, and
+   re-latching the live probe under it hands the ROB a later cycle's PA, i.e. S2's bug
+   reintroduced. 🚩**Without `eh_wrongpath` the buffer passes the 252-test suite AND both
+   microbenchmarks and livelocks the N=1 boot** (instret 35.8 M in a 45 M-cycle budget) —
+   the sharpest argument yet for keeping the boot in the ladder when the suite is green.
+
+**Result — E3 is not the lever.** Against the predictor, at `EX_PIPE=1`:
+
+| gate | predictor | §1.0b buffer | Δ |
+|---|---|---|---|
+| default suite | 252 / 0 | 252 / 0 | — |
+| coremark | 446,664 | 442,112 | **−1.02 %** |
+| litmus N=4 | `003e1a70` | `003d5720` | **−1.23 %** |
+| litmus N=2 | `00305ed0` | `003037c0` | −0.32 % |
+| dhrystone | 230,966 | 230,980 | ±0 |
+| N=1 boot | `00c1c960` | `00c265a0` | +0.31 % |
+| N=2 SMP boot | `010736d0` | `010dc680` | **+2.49 %** |
+
+So the buffer wins where the CDB is genuinely contended (coremark, the atomic-heavy litmus)
+and loses on the boots — the predictor keeps a blocked op IN the IQ, where the oldest-ready
+select can pick something else, while the buffer has already ACKed it and pins lane 0.
+**Of coremark's 13.21 pp gap the whole E3 question is worth 1.02 pp.** The remaining ~12 pp
+is not writeback arbitration; it is the +1-cycle EX latency itself, and naming where it
+lands (a `DBG_CENSUS` diff of the two arms is the started-but-unfinished measurement) is the
+next step, not another guess. The buffer ships anyway because it is the FINAL structure and
+the predictor was explicitly a stand-in; ⚠️the **N=2 SMP +2.49 %** is a standing item.
+
 **Standing item (same class, not yet hit).** `i_cdb_fault_gstage` / `i_cdb_fault_gpa` take
 the LIVE `dmem_mmu_gstage`/`gpa` for the non-`lsu_cdb` winner; the comment's "an AMO/store
 fault (alu_cdb) is single-cycle, so its live MMU gstage/gpa is correct" stops holding at
