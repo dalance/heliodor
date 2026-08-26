@@ -111,25 +111,80 @@ benefit stays masked under the wall (only realised in a bundle flip) — this sh
 for the **structure**, per the campaign's "advance FINAL structure, not the synth
 number" mandate.
 
-**EX_PIPE (execute-staging keystone) is BANKED at 0** — two blockers in the current
-tree, user-decided to bank (2026-07-27) and ship the scheduler-pipeline alone:
-1. **Boot hang** (arch 252/0 passes, but N1 boot infinite-loops): at `EX_PIPE=1`
-   early boot corrupts the paging-enable / control flow (`csrw satp` @0x80001040 →
-   a wild jump to PC 0 → `handle_exception` re-enters forever because `ld sp,16(tp)`
-   loads sp=0 → `sd ra,8(sp)` store-page-faults → nested-trap storm). Localised to
-   the paging-enable/CSR-CDB region; a wrong-value from the EX register/bypass. The
-   old "SMP-complete" validation (`deep_pipeline_status_and_replan.md`) predates
-   F1/F2 + the grown suite. −15 % IPC alone, so IPC-negative even once fixed.
-2. **FROUND_PIPE=1 latent bug** (coupled to EX_PIPE): the 3-stage Zfa FROUND applies
+**EX_PIPE (execute-staging keystone) was BANKED at 0** (2026-07-27) on two blockers.
+The first is now **FIXED**; see S2 below. The second never blocked it:
+
+2. **FROUND_PIPE=1 latent bug** (once coupled to EX_PIPE): the 3-stage Zfa FROUND applies
    the wrong rounding mode for STATIC-rm `fround.s` and drops the `froundnx.s` NX
    flag — the held-at-head op's rounding-mode / fflags are read LIVE one cycle after
    the op released (`test_arch_zfa_s2`; ACT4's single dynamic-rm fround never hit it).
-   **Decoupled** (`FROUND_PIPE=FMA_PIPE3=0`, byte-identical at `EX_PIPE=0`) so a
-   future EX_PIPE flip does not re-enable it; the fix + re-couple is FP-CP follow-up.
+   **Decoupled** (`FROUND_PIPE=FMA_PIPE3=0`, byte-identical at `EX_PIPE=0`) so an
+   EX_PIPE flip does not re-enable it; the fix + re-couple is FP-CP follow-up. It does
+   NOT block EX_PIPE — at the committed 2-stage FROUND/FMA, EX_PIPE=1 is zfa 4/4.
 
-EX_PIPE + its bypass/E3 scaffold + corner-fixes stay committed (built, `=0`); the
-boot corner and the FROUND bug are the remaining work for a future execute-staging /
-FP-CP session. `LOAD_SPEC=0` remains deferred to Block R.
+`LOAD_SPEC=0` remains deferred to Block R.
+
+### ✅ S2 (2026-08-26) — the boot hang is FIXED; EX_PIPE=1 boots Linux
+
+The recorded blocker ("`csrw satp` @0x80001040 → a wild jump to PC 0 →
+`handle_exception` re-enters forever") was **two independent wrong-value bugs**, both of
+the same class the E1 `alu_iss_fp_ld_q` fix already named: **a side-band that must travel
+WITH the result across the EX register was being read LIVE.** Neither was in the
+paging-enable / CSR-CDB region the old note pointed at.
+
+1. **`store_pretx_pa` — the execute-time store TLB probe** (`heliodor_core.veryl`, the
+   `store_pretx_*` assigns). `dmem_sprobe_pa/ok` describe the op whose VA is on the dmem
+   port THIS cycle (the op ISSUING), and the ROB writes them at `sh_store_pa[cdb.rob_idx]`.
+   At `EX_PIPE=1` `cdb` is the op that issued LAST cycle, so **every store recorded the
+   NEXT store's PA and then committed to it.** A register-save prologue wrote its slots one
+   apart, its epilogue reloaded a neighbour's value, and the kernel's
+   `excp_vect_table[scause]` load returned 0 → `jr t0` → PC 0 → the nested-trap storm. Fix:
+   register the probe + its probe-cycle qualifiers alongside `alu_cdb_q`
+   (`alu_sprobe_pa_q` / `alu_sprobe_ok_q`); `rob_has_pending_xlate` is additionally
+   required LIVE at the record cycle. Byte-identical at `EX_PIPE=0`.
+2. **`amo_cwr_en`'s presence gate** — the `0ee0e5f` A-EXE fix gated the atomic commit write
+   on `dc_amo_present`, but **an SC never arms the AMO watch** (`amo_exec_capture` is
+   `issue_is_realamo`, which excludes LR/SC — an SC arms `sc_watch_*`/`dc_scw_present`). So
+   at `EX_PIPE=1` `dc_amo_present` tested an unrelated line (`amo_watch_pa_q` = the last
+   real AMO's PA, or 0 when the program has run no AMO), and **every SC's commit write was
+   suppressed while the SC still returned SUCCESS**. Caught by `test_arch_supm` check 43
+   (`sc.d` retires with `t5=0`, the following `ld` reads the pre-SC value); `rv64ua-lrsc`
+   only passed by accident — its opening `amoadd.w (coreid)` leaves a resident line in
+   `amo_watch_pa_q`. Fix: select the presence gate by **watch identity** (own AMO watch →
+   `dc_amo_present`, own SC watch → `dc_scw_present`, no watch → no gate).
+
+**Gate ladder at `EX_PIPE=1`** (2026-08-26): `veryl test` **252/0** (litmus N=2 included),
+**N=1 Linux boot to SBI shutdown** `cy=00c1c960` / instret 10,423,977, **N=2 SMP boot**
+`cy=010736d0` pass, **litmus N=4** `cy=003e1a70` pass — the full fast ladder, all green.
+
+**Cost — and it is NOT −15 %.** With the E2 bypass + E3 arbitration in place the flip costs
+
+| gate | EX_PIPE=0 | EX_PIPE=1 | Δ |
+|---|---|---|---|
+| default suite | 252 / 0 | 252 / 0 | — |
+| N=1 Linux boot | `00ba9d70` (12,230,000) | `00c1c960` (12,700,000) | **+3.84 %** |
+| N=2 SMP boot | `00fa3e80` (16,400,000) | `010736d0` (17,250,000) | **+5.18 %** |
+| litmus N=2 | `002ed830` | `00305ed0` | +3.26 % |
+| litmus N=4 | `003b0d30` | `003e1a70` | +5.17 % |
+| dhrystone | 235,808 | 230,966 | **−2.05 % (faster)** |
+| coremark | 394,555 | 446,664 | **+13.21 %** |
+
+instret is bit-exact in both arms on dhrystone (264,834) and coremark (374,357), so those
+two deltas are pure cycle cost. The recorded "−15 % IPC alone" figure predates the bypass
+network and should not be quoted again. The spread is the interesting part: dhrystone GAINS
+while coremark pays 13 % — the +1-cycle EX latency is priced by load-use / dependent-ALU
+chain density, not by a single global number, so the next EX_PIPE work has a measurable
+target (coremark's chains) rather than a slogan.
+
+**`EX_PIPE` is left at 0 in this commit** — the two fixes are byte-identical there (proved
+against pristine master: dhrystone 235,808 / 264,834 and coremark 394,555 / 374,357 both
+bit-identical, N=1 boot `00ba9d70` / instret 10,421,567 identical). The flip itself is a
+ship decision, not a bug fix.
+
+**Standing item (same class, not yet hit).** `i_cdb_fault_gstage` / `i_cdb_fault_gpa` take
+the LIVE `dmem_mmu_gstage`/`gpa` for the non-`lsu_cdb` winner; the comment's "an AMO/store
+fault (alu_cdb) is single-cycle, so its live MMU gstage/gpa is correct" stops holding at
+`EX_PIPE=1`. The hypervisor tests are 252/0 today, so it is latent, not live.
 
 ---
 

@@ -8510,6 +8510,10 @@ pub module heliodor_core #(
     // stream can, and it is timing-independent. Only usable on a short directed test
     // (rv64mi-ma_addr = seconds) — never on a boot.
     const CMT_TRACE: bit = 0;
+    // A-EXE boot diff: bound the commit stream by RETIRE INDEX, not by cycle — the two
+    // arms reach the same instruction at different cycles, so only a retire-indexed
+    // bound makes the two dumps line up for `cmp`. prog_ret_q (below) is the counter.
+    const CMT_TRACE_N: logic<32> = 32'd78000;
     // Separate const from CMT_TRACE: the commit stream is only affordable on a directed
     // test, while the MSHR/ASQ traces are sparse enough for a litmus run. h= is HART_ID
     // (N>1 harts interleave on stdout).
@@ -8521,6 +8525,13 @@ pub module heliodor_core #(
     // HART_ID; the harts interleave on stdout.
     const B2B_SUP_TRACE: bit      = 0;
     const B2B_SUP_EVERY: logic<32> = 32'd5000000;
+    // Progress probe (DIAGNOSIS SCAFFOLD — keep at 0 on master). A boot that WEDGES
+    // cannot be diagnosed by a commit dump (10 M retires per arm) nor by the final
+    // cycle/instret pair, which says only "it stopped". This prints, once every 2^20
+    // cycles, the retire count and the ROB HEAD's PC — so a stalled head names the
+    // instruction it is stuck on, and a livelock shows the PC cycling. Cheap (43 lines
+    // over a 45 M-cycle budget) and off by default.
+    const PROG_TRACE   : bit       = 0;
     const B2B_TRACE_RD: logic<5> = 5'd15; // a5 — the base register in the oops frame
     const B2B_WATCH_PC: logic<64> = 64'hffffffff8001592a; // c.ld a5,104(s0) — the load that returns 0
     const B2B_WATCH_VA: logic<64> = 64'hffffffe000cac1e8; // that load's VA on the failing iteration
@@ -8534,8 +8545,91 @@ pub module heliodor_core #(
     always_ff (clk, rst) {
         if_reset {
             trc_cy_q = '0;
-        } else if CMT_TRACE || MSHR_TRACE || B2B_TRACE || B2B_SUP_TRACE {
+        } else if CMT_TRACE || MSHR_TRACE || B2B_TRACE || B2B_SUP_TRACE || PROG_TRACE {
             trc_cy_q = trc_cy_q + 32'd1;
+        }
+    }
+    // Progress probe body (see PROG_TRACE above). prog_ret_q is a private retire
+    // counter so the probe does not depend on the census plumbing being enabled.
+    var prog_ret_q: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            prog_ret_q = '0;
+        } else if (PROG_TRACE || CMT_TRACE) && rob_commit_ack {
+            prog_ret_q = prog_ret_q + 32'd1;
+        }
+    }
+    // ... and the LAST commit trap, so a trap storm names its cause/PC/tval instead of
+    // just its PC band.
+    var prog_trap_q  : logic<32>;
+    var prog_tcause_q: logic<64>;
+    var prog_tpc_q   : logic<64>;
+    var prog_ttval_q : logic<64>;
+    always_ff (clk, rst) {
+        if_reset {
+            prog_trap_q   = '0;
+            prog_tcause_q = '0;
+            prog_tpc_q    = '0;
+            prog_ttval_q  = '0;
+        } else if PROG_TRACE && commit_trap {
+            prog_trap_q   = prog_trap_q + 32'd1;
+            prog_tcause_q = trap_cause;
+            prog_tpc_q    = c_pc;
+            prog_ttval_q  = dbg_csr_stval;
+        }
+    }
+    // A trap STORM's own traps all look the same; the interesting ones are the few
+    // that precede it. Print every trap whose index falls in [PROG_TRAP_LO, PROG_TRAP_HI]
+    // so the window straddles the storm's first fault.
+    const PROG_TRAP_LO: logic<32> = 32'd13400;
+    const PROG_TRAP_HI: logic<32> = 32'd13700;
+    always_ff (clk, rst) {
+        if_reset {} else if PROG_TRACE && commit_trap && prog_trap_q >= PROG_TRAP_LO && prog_trap_q <= PROG_TRAP_HI {
+            $display("TRAP #%d cy=%h cause=%h pc=%h tval=%h", prog_trap_q, trc_cy_q, trap_cause, c_pc, dbg_csr_stval);
+        }
+    }
+    // Retire-indexed EXECUTE window: once the commit diff has named the first wrong
+    // value, this shows how it got there — the load completion (its Stage-B PA and the
+    // data it captured), the MSHR fill writeback, and every CDB write with its rob_idx.
+    const PROG_WIN_LO: logic<32> = 32'd76900;
+    const PROG_WIN_HI: logic<32> = 32'd77100;
+    // Keyed on the COMMIT-LINE index (both retire slots), so the window number is the
+    // same one `cmp` reports on the C-stream — prog_ret_q counts slot 0 only.
+    var prog_cmt_q: logic<32>;
+    always_ff (clk, rst) {
+        if_reset {
+            prog_cmt_q = '0;
+        } else if PROG_TRACE || CMT_TRACE {
+            prog_cmt_q = prog_cmt_q + (if rob_commit_ack ? 32'd1 : 32'd0) + (if commit2_fire ? 32'd1 : 32'd0);
+        }
+    }
+    let prog_win: logic = PROG_TRACE && prog_cmt_q >= PROG_WIN_LO && prog_cmt_q <= PROG_WIN_HI;
+    always_ff (clk, rst) {
+        if_reset {} else if prog_win {
+            if lsr_complete {
+                $display("LSR cy=%h n=%d pc=%h pa=%h rob=%d pdst=%d dc=%h dcn=%h fwdm=%h out=%h l1=%b", trc_cy_q, prog_cmt_q, lsr_pc_q, lsr_paddr_q, lsr_rob_idx_q, lsr_pdst_q, dcache_rdata, dcache_rdata_next, stld_fwd_mask, lsu_cdb.data, lsr_to_lane1);
+            }
+            if mshr_cdb.valid {
+                $display("MSHRCDB cy=%h n=%d rob=%d pdst=%d d=%h", trc_cy_q, prog_cmt_q, mshr_cdb.rob_idx, mshr_cdb.pdst, mshr_cdb.data);
+            }
+            if cdb.valid {
+                $display("CDB cy=%h n=%d rob=%d pdst=%d d=%h st=%b sa=%h sd=%h", trc_cy_q, prog_cmt_q, cdb.rob_idx, cdb.pdst, cdb.data, cdb.is_store, cdb.store_addr, cdb.store_data);
+            }
+            if alu_cdb2.valid {
+                $display("CDB2 cy=%h n=%d rob=%d pdst=%d d=%h st=%b sa=%h sd=%h", trc_cy_q, prog_cmt_q, alu_cdb2.rob_idx, alu_cdb2.pdst, alu_cdb2.data, alu_cdb2.is_store, alu_cdb2.store_addr, alu_cdb2.store_data);
+            }
+            if rob_commit_ack {
+                $display("RET cy=%h n=%d rob=%d pc=%h", trc_cy_q, prog_cmt_q, rob_commit_idx, c_pc);
+            }
+            if commit2_fire {
+                $display("RET2 cy=%h n=%d pc=%h", trc_cy_q, prog_cmt_q, c2_pc);
+            }
+        }
+    }
+    always_ff (clk, rst) {
+        if_reset {} else if PROG_TRACE && trc_cy_q[19:0] == 20'd0 {
+            $display("PROG cy=%h ret=%d head_pc=%h size=%d cv=%b ack=%b stall=%b", trc_cy_q, prog_ret_q, c_pc, rob_size, rob_commit_valid, rob_commit_ack, dcache_stall);
+            $display("PROG   traps=%d cause=%h tpc=%h tval=%h", prog_trap_q, prog_tcause_q, prog_tpc_q, prog_ttval_q);
         }
     }
     // ── Block T diagnosis: NAME the instruction that produced the faulting value ──
@@ -8585,7 +8679,7 @@ pub module heliodor_core #(
     // result_data slot holds whatever its producer left there, which can differ between
     // arms for benign reasons and would swamp a diff with false divergences.
     always_ff (clk, rst) {
-        if_reset {} else if CMT_TRACE {
+        if_reset {} else if CMT_TRACE && prog_ret_q <: CMT_TRACE_N {
             if rob_commit_ack && c_has_rd {
                 $display("C pc=%h rd=%d d=%h", c_pc, c_rd_arch, c_result_data);
             }
@@ -9136,11 +9230,39 @@ pub module heliodor_core #(
     // probe PA equals what the commit-time store_drive translation would produce for this
     // VA. Faults always fall back (sprobe_ok=0 on any deny), so xfault is constant 0.
     // Unread at STORE_PRETRANSLATE=0; the commit drain that uses sh_store_pa is in P3.
-    assign store_pretx_pa     = dmem_sprobe_pa;
+    // A-EXE (EX_PIPE=1): this probe is a SIDE-BAND that must travel WITH the result
+    // across the EX register. dmem_sprobe_pa/ok describe the op whose VA is on the dmem
+    // port THIS cycle — the op ISSUING — while the ROB writes them at
+    // sh_store_pa[cdb.rob_idx]. At EX_PIPE=1 cdb is the op that issued LAST cycle, so
+    // every store recorded the NEXT store's PA and then COMMITTED to it: a register-save
+    // sequence wrote its slots one apart, its epilogue reloaded a neighbour's value, and
+    // the kernel's excp_vect_table[scause] load returned 0 -> `jr t0` to PC 0 -> the
+    // nested-trap storm recorded as the "wild jump to 0" boot hang. Register the probe
+    // and its probe-cycle qualifiers alongside alu_cdb_q and consume the registered pair
+    // at EX_PIPE=1 — the same shape as the E1 alu_iss_fp_ld_q fix. rob_has_pending_xlate
+    // is additionally required LIVE at the record cycle (a satp/SFENCE that appears in
+    // the probe->record window must still fall back to the commit-time translate), which
+    // only makes =1 stricter. Byte-identical at EX_PIPE=0: both muxes fold to the live
+    // arm and store_pretx_live_ok is the original term list.
+    let store_pretx_live_ok: logic = !iq_iss_is_amo && !store_drive && !mmu_walk_inflight
+        && !vu_mem_active && dmem_sprobe_ok && !rob_has_pending_xlate;
+    var alu_sprobe_pa_q: logic<64>;
+    var alu_sprobe_ok_q: logic    ;
+    always_ff (clk, rst) {
+        if_reset {
+            alu_sprobe_pa_q = 64'd0;
+            alu_sprobe_ok_q = 1'b0;
+        } else if EX_PIPE {
+            // Write-folded on the const so the pair is reset-only at EX_PIPE=0 and DCEs,
+            // rather than living as two flops with no reader (the trc_cy_q idiom above).
+            alu_sprobe_pa_q = dmem_sprobe_pa;
+            alu_sprobe_ok_q = store_pretx_live_ok;
+        }
+    }
+    assign store_pretx_pa     = if EX_PIPE ? alu_sprobe_pa_q : dmem_sprobe_pa;
     assign store_pretx_xfault = 1'b0;
-    assign store_pretx_valid  = cdb.valid && cdb.is_store && !iq_iss_is_amo
-        && !store_drive && !mmu_walk_inflight && !vu_mem_active
-        && dmem_sprobe_ok && !rob_has_pending_xlate;
+    assign store_pretx_valid  = cdb.valid && cdb.is_store
+        && (if EX_PIPE ? (alu_sprobe_ok_q && !rob_has_pending_xlate) : store_pretx_live_ok);
 
     // ── Block L1.b: SQ translate retry (DEAD at SQ_RETRY=0) ─────────────────────
     // Oldest-first select over the ROB store shadow. ls_fwd[i] already implies
@@ -10699,7 +10821,25 @@ pub module heliodor_core #(
     // EX_PIPE=0 the write never coincides with the recall, so the term folds to 1
     // → byte-identical. dc_amo_present is derived from the (registered) tag state,
     // not the bus invalidate, so it does not form a combinational loop.
-    let amo_cwr_en   : logic     = store_drive && sb_empty_eff && ac_wok_q && (dc_amo_present || !EX_PIPE);
+    // A-EXE (EX_PIPE=1) follow-on: the presence gate must consult the watch THIS
+    // committing atomic actually armed. An SC arms the SC watch (sc_exec_match ->
+    // sc_watch_*/dc_scw_present) and NEVER the AMO watch — amo_exec_capture is
+    // issue_is_realamo, which excludes LR/SC — so reading dc_amo_present for an SC
+    // tests an UNRELATED line: amo_watch_pa_q still holds the last real AMO's PA, or
+    // 0 when the program has executed no AMO at all. PA 0 is never in the D-cache, so
+    // every SC's commit write was suppressed while the SC still returned SUCCESS
+    // (observed: test_arch_supm check 43 — `sc.d` retired with t5=0 but the following
+    // `ld` read the pre-SC value; rv64ua-lrsc only passed by accident, its opening
+    // `amoadd.w (coreid)` leaves a resident line in amo_watch_pa_q). Select the gate
+    // by watch identity (the atomic is at the ROB head, so rob_commit_idx names it):
+    // its own AMO watch, else its own SC watch, else no gate — the no-watch classes
+    // (R3.2c's no-read atomic, a failing SC) have no read->write window to protect and
+    // keep the EX_PIPE=0 behavior. Byte-identical at EX_PIPE=0 (the whole term folds
+    // to 1 -> DCE).
+    let amo_cwr_own_amo: logic = amo_watch_valid_q && rob_commit_idx == amo_watch_rob_q;
+    let amo_cwr_own_sc : logic = sc_watch_valid_q && rob_commit_idx == sc_watch_rob_q;
+    let amo_cwr_present: logic = if amo_cwr_own_amo ? dc_amo_present : if amo_cwr_own_sc ? dc_scw_present : 1'b1;
+    let amo_cwr_en     : logic = store_drive && sb_empty_eff && ac_wok_q && (amo_cwr_present || !EX_PIPE);
     // ── R3.1: atomic store-queue — entry + alloc/drain — DEAD at ATOMIC_SQ=0 ──
     // Block R (doc/cp_r3_atomic_reorder_plan.md §6, which supersedes §2's scheme A).
     // An ATOMIC-WITHOUT-RETURN (AMO with rd == x0, cacheable, fault-free) retires into
@@ -13195,5 +13335,21 @@ pub module heliodor_core #(
     assign o_dbg_dtlb_hit   = dmem_dtlb_hit;
     assign o_dbg_dtlb_ppn   = dmem_dtlb_ppn;
     assign o_dbg_dtlb_perm  = dmem_dtlb_perm;
+
+    // Store-side half of the retire-indexed EXECUTE window (prog_win, declared with the
+    // PROG_TRACE probes). Placed at the END of the module because the commit-store
+    // signals (c_store_eff_pa / the store-buffer drain) are defined far below the probe
+    // block. A wrong value that reaches memory is invisible in the commit stream — only
+    // the store address/data and the drain that carries them name it.
+    always_ff (clk, rst) {
+        if_reset {} else if prog_win {
+            if commit_store_fire {
+                $display("CSTORE cy=%h n=%d rob=%d pa=%h d=%h f3=%d", trc_cy_q, prog_cmt_q, rob_commit_idx, c_store_eff_pa, c_store_data, c_store_funct3);
+            }
+            if sdrain_swen {
+                $display("DRAIN cy=%h n=%d sa=%h d4=%h s4=%h d5=%h s5=%h ack=%b", trc_cy_q, prog_cmt_q, sdrain_saddr, sdrain_swdata[4], sdrain_swstrb[4], sdrain_swdata[5], sdrain_swstrb[5], dc_sdrain_ack);
+            }
+        }
+    }
 
 }
