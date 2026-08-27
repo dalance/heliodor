@@ -229,6 +229,49 @@ lands (a `DBG_CENSUS` diff of the two arms is the started-but-unfinished measure
 next step, not another guess. The buffer ships anyway because it is the FINAL structure and
 the predictor was explicitly a stand-in; ⚠️the **N=2 SMP +2.49 %** is a standing item.
 
+### 🛑 S4 (2026-08-27) — the keystone MEASURED: EX_PIPE=1 is CP-NEGATIVE
+
+Two days were spent measuring what `EX_PIPE=1` COSTS and none measuring what it BUYS —
+because until S2 it did not boot, so nobody could take the number. Taken now
+(`veryl synth --top heliodor_core --dump-timing`, the same tool the campaign's 12.920 ns
+`rs1_rdy` figure came from):
+
+| | EX_PIPE=0 | EX_PIPE=1 |
+|---|---|---|
+| critical path | **15.142 ns**, 160 levels | **17.490 ns**, 197 levels |
+| binding endpoint | `ftq_head[0] → sh_load_poison[*]` | `occupied[0] → s2_cheap_fflags[0]`, then `→ fr_d_sum_q[*]` |
+| area | 26.82 Mum² (comb 10.38 M) | 29.27 Mum² (comb 12.69 M) |
+
+**The keystone that exists to CUT the critical path lengthens it by 2.35 ns (+15.5 %) and
+grows the design 9.1 %** — on top of the +12.06 % coremark / +7.80 % N=2-SMP IPC cost. In
+this tree it buys nothing.
+
+**Attribution (three probes, all negative).** The A/B is not confounded by S3: the
+`bb93235` predictor build measures **17.490 ns / 197 levels / 29.270 M**, i.e. bit-for-bit
+the same front as the S3 buffer — so the 2.35 ns is EX_PIPE itself. Forcing `ex3_defer` to
+a literal `1'b0` (a functionally unsound but synth-valid netlist): **17.490 ns, unchanged**.
+Forcing `exb_live` (the whole E2 bypass) to `1'b0`: **17.490 ns, unchanged**. So the cost is
+neither the writeback arbitration nor the bypass network — the two pieces that were assumed
+to carry it. ⚠️ Both probes must be written as a LITERAL, never `x && 1'b0`: a `&&` guard
+keeps the syntactic edge (see the loop note below), so the first attempt measured nothing.
+
+**What this retires.** The keystone section's "A-EXE is NOT CP-neutral — it is the front
+right behind the loop" was written against a 2026-06 tree and a 12.920 ns `rs1_rdy` floor.
+Neither survives: today's binding front at `EX_PIPE=0` is **`ftq_head → sh_load_poison`**,
+the front-end FTQ into the ROB's load-poison scan — not the A-SCHED select→wakeup loop and
+not the execute staging. **The campaign's CP map is stale, and the next structural target
+should be picked from this measurement, not from that map.** Whether EX_PIPE can be made
+CP-positive at all is now an open question rather than an assumption; it stays at 0.
+
+**A real defect S3 introduced, caught only by synth.** `alu_cdb_won` reached `alu_cdb`
+through `alu_cdb_eff`'s `EX_PIPE=0` arm, and `ex3_defer` feeds `u_alu.i_issue_valid` which
+produces `alu_cdb` — a **combinational loop in the =0 netlist**. `veryl build` and the whole
+252-test suite passed with it (both arms, bit-identical numbers); only `veryl synth`
+reported it. It folds away algebraically — with `alu_cdb_eff == alu_cdb_q` at `EX_PIPE=1`,
+`hold = q.valid && !(q.valid && !hipri) = q.valid && hipri` — so the fixed form never names
+`alu_cdb` at all. Re-validated identical: `=0` dhrystone 235,808 / coremark 394,555
+(bit-identical to master), `=1` suite 252/0, coremark 442,112, N=1 boot `00c265a0`.
+
 **Standing item (same class, not yet hit).** `i_cdb_fault_gstage` / `i_cdb_fault_gpa` take
 the LIVE `dmem_mmu_gstage`/`gpa` for the non-`lsu_cdb` winner; the comment's "an AMO/store
 fault (alu_cdb) is single-cycle, so its live MMU gstage/gpa is correct" stops holding at
