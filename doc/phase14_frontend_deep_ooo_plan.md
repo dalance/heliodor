@@ -232,9 +232,15 @@ the predictor was explicitly a stand-in; ⚠️the **N=2 SMP +2.49 %** is a stan
 ### 🛑 S4 (2026-08-27) — the keystone MEASURED: EX_PIPE=1 is CP-NEGATIVE
 
 > ⚠️ **VOIDED 2026-08-28.** Every CP and area number in this section was taken with
-> `veryl` `ba03f6b8`, which synthesized only 52.5 % of the gates. Both arms are
-> unmeasured — see *Wall localization (2026-08-28)* at the end of this document. The
-> IPC costs (coremark +12.06 %, N=2 SMP +7.80 %) came from the simulator and stand.
+> `veryl` `ba03f6b8`, which synthesized only 52.5 % of the gates. Re-taken on
+> `b40d8cdf` after the vcpop fix, **both arms are identical**: 31.710 ns / 339 levels /
+> `sh_store_funct3[0] → sh_load_poison[0]`, area 36.334 M (=0) vs 36.352 M (=1) —
+> **+0.05 %, not +9.1 %, and +0.00 ns, not +2.35 ns.** EX_PIPE is CP-NEUTRAL here, and
+> the reason is that the binding wall is now the store→load forwarding walk, which
+> EX_PIPE does not touch. It stays at 0 because it still costs +12.06 % coremark for
+> no CP gain — but that is a *different* verdict from "it lengthens the path", and it
+> can change once the forwarding wall is cut. The IPC costs came from the simulator
+> and stand. See *Wall localization (2026-08-28)* at the end of this document.
 
 Two days were spent measuring what `EX_PIPE=1` COSTS and none measuring what it BUYS —
 because until S2 it did not boot, so nobody could take the number. Taken now
@@ -2610,7 +2616,24 @@ which is where the 2026-08-27 note guessed the path would land.
 The prediction in that note was right about the *neighbourhood* and wrong about the
 *endpoint*, for the same reason the endpoint was wrong: it was reading the old number.
 
-**Carried-forward items**: L1 ship declaration · **re-measure both EX_PIPE arms on the
-current binary** (the +2.35 ns is void) · N=2 SMP +2.49 % from the S3 buffer ·
+### EX_PIPE re-measured on the working tool — it is CP-NEUTRAL, not CP-negative
+
+Both arms on `b40d8cdf`, post-vcpop tree, same run conditions:
+
+| | EX_PIPE=0 | EX_PIPE=1 | Δ |
+|---|---|---|---|
+| critical path | 31.710 ns / 339 lv | **31.710 ns / 339 lv** | **0.000 ns** |
+| binding endpoint | `sh_store_funct3[0] → sh_load_poison[0]` | *the same* | — |
+| area | 36.334 M um² | 36.352 M um² | **+0.05 %** |
+| gates / FFs | 2,407,145 / 195,790 | 2,408,643 / 195,855 | +1,498 / +65 |
+
+S4 reported **+2.35 ns and +9.1 % area**; the truth is **0.000 ns and +0.05 %** — the area
+error alone is 136×. The keystone does not lengthen the critical path. It is *neutral*
+because the binding wall is the store→load forwarding walk, which EX_PIPE has nothing to do
+with. It stays at `0` on the IPC cost alone (+12.06 % coremark), which is a materially
+different position from "the mechanism that exists to cut CP lengthens it": once the
+forwarding wall is cut, EX_PIPE is back on the table as the next stage split.
+
+**Carried-forward items**: L1 ship declaration · N=2 SMP +2.49 % from the S3 buffer ·
 `i_cdb_fault_gstage`/`gpa` latent side-band · `FROUND_PIPE=1`'s real Zfa bug
 (`test_arch_zfa_s2`).
