@@ -2791,3 +2791,30 @@ itself → **~9 ns**. That is 17.940 → ~9, a further −50 %, on top of today'
 **Dependency order**: the Zfa `FROUND_PIPE` bug is on the campaign's critical path — it
 gates P1 and it is the machinery P3 reuses — so it is the first step, and it is the only
 step that is a *correctness* fix rather than a structural one.
+
+### Step 1 done: the Zfa `FROUND_PIPE` bug was a LIVE head read (`a5e29de`)
+
+Not a rounding bug. On the broadcast cycle the queue already presents the NEXT fround, and
+`o_cdb.rob_idx`/`pdst`/`has_rd`, `fround_data`'s S/D select and `o_fflags` all read the
+live head — so every fround wrote the PREVIOUS fround's result into its own ROB slot,
+which reads back as "every static rounding mode returns the rne answer". Same side-band
+class as `bb93235` / `8a3345b`. Fixed by latching the op's identity and operand class at
+issue and driving every writeback field from that copy.
+
+Two iq_fp protocol facts had to be measured rather than assumed, and are now comments in
+the code: the queue selects the **lowest-index ready** entry (the tracked op can be
+displaced at any cycle, including by a newly allocated one), and it frees the **selected**
+entry on `i_issue_ack = valid && !fpu_busy`. Firing to the right `rob_idx` while a
+different entry is selected retires *that* entry and livelocks; holding busy until the
+owner returns deadlocks. So the FSM is owner-exact with restart-on-mismatch, and busy is
+high for the two pre-broadcast cycles and low on the broadcast cycle — the same shape as
+div/sqrt's `done_for_me`.
+
+`FROUND_PIPE=1`: `test_arch_zfa` 4/4 (was 3/4), suite 252/0. `FROUND_PIPE=0` (unchanged
+default): suite 252/0, dhrystone 235,808 / 264,834, coremark 394,555 / 374,357 —
+byte-identical, and `heliodor_core.veryl` untouched. The default stays 0 because the knob
+is worth 0.21 ns alone; what changed is that it is no longer blocked.
+
+**Remaining in the bundle**: P3 (give `u_fround_?_sub` a `PIPE` argument — the machinery
+now works), P2 (the commit→AGU→TLB→PMP→issue→CDB→poison stage boundary, the only piece
+with no existing knob), then `fp_adder`'s own split.
