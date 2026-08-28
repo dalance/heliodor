@@ -2683,3 +2683,47 @@ exists and is already a carried item: `FROUND_PIPE` (`fpu_wrap.veryl:27`, defaul
 Note also what the endpoint became: `occupied[0] → …fflags`, one hop away from S4's
 reported `EX_PIPE=1` front (`occupied[0] → s2_cheap_fflags[0]`). Two walls down, the FP
 issue→execute→flags path is what binds — for both EX_PIPE arms alike.
+
+### The prize for the third wall, measured BEFORE building it: 1.5 %
+
+The third wall's 46 % segment has a ready-made cut (`FROUND_PIPE`), so the cost looked like
+"fix the Zfa bug and flip it". The benefit was taken first — synth does not care that
+`FROUND_PIPE=1` is functionally wrong, so the number is free:
+
+| arm | critical path | binding endpoint |
+|---|---|---|
+| as shipped | 17.940 ns / 200 lv | `occupied[0] → sh_fflags[0]` |
+| `FROUND_PIPE=1` | **17.730 ns** / 178 lv | `head[0] → sh_load_poison[0]` |
+| `FROUND_PIPE=1` **+** `S15_SELF_SCAN=0` | **17.670 ns** / 189 lv | `fr_d_sum_q[10] → vrf[64]` |
+
+**Cutting the entire `fround.d` select buys 0.21 ns. Cutting it AND deleting the ROB's
+record-time self-scan outright buys 0.27 ns — 1.5 %.** Every top-20 endpoint is one path
+(all twenty are `occupied → sh_fflags[*]`), but the moment it is removed a *different* path
+appears 0.21 ns below it, and then a third 0.06 ns below that. The critical path is no
+longer a spike; it is a **dense plateau at 17.7–17.9 ns**, three unrelated FP/memory paths
+deep.
+
+The second path, decomposed (`head[0] → sh_load_poison[0]`, 17.730 ns / 178 lv), shows why:
+it is one cycle that walks commit → AGU → TLB → PMP → issue → CDB → the ROB poison scan.
+
+| segment | ns | share |
+|---|---|---|
+| ROB commit `sh_rd_arch` → `arch_regs` → CAS → `commit_store_fire` | 2.93 | 17 % |
+| AGU address → **`dmem_mmu` TLB lookup** | 4.31 | 24 % |
+| **PMP check** (`u_pmp_amo_w`) | 2.45 | 14 % |
+| issue-valid → CDB muxing | 1.19 | 7 % |
+| load-queue self-scan compare | 1.63 | 9 % |
+| **ROB record-time self-scan, 32-deep serial OR** (`rec*_self_viol_w`) | 3.10 | 17 % |
+| poison write | 1.35 | 8 % |
+
+That 3.10 ns run is the serial-reduce defect class for the **third** time —
+`for i in 0..ROB_DEPTH { if … { rec0_self_viol_w = 1'b1; } }` is a 32-input OR written as a
+chain. But tree-ising it today buys **0.00 ns**, because the fflags path binds 0.21 ns
+above it.
+
+**So local CP work stops here.** Two commits took the wall 40.250 → 17.940 ns (−55.4 %)
+with +211 gates and *less* area. A third would cost a correctness-bug hunt in the Zfa
+`fround` 3-stage path plus an RTL change, for 1.5 %. The next real gain has to be
+structural — a stage split that moves a whole layer (FP issue→execute→flags, or
+commit→AGU→TLB→PMP) across a register boundary — not another local reduction. Which is the
+kind of change `EX_PIPE` is, and it is now measured CP-NEUTRAL rather than CP-negative.
