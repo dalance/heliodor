@@ -898,6 +898,57 @@ pub module fpu_wrap #(
     // adders combinational in stage 1 (byte-identical, used by the fround unit
     // tests). FROUND fflags depend only on the stage-1 add, so they stay on the
     // cheap-fflags path; only the result is finalized in stage 2.
+    // ============================================================
+    // A-EXE FROUND 3-stage completion (FROUND_PIPE=1) — OWNER-EXACT.
+    // The rint trick needs 3 cycles here (the registered add is 2, the magic-sub a
+    // 3rd), and the op is NOT still the iq_fp head on the broadcast cycle: measured,
+    // at the broadcast the queue already presents the NEXT fround. So the FSM runs
+    // off a REGISTERED in-flight flag and every writeback field comes from the
+    // LATCHED copy, never the live head. Reading them live is what made every STATIC
+    // rounding mode return the rne result (this fround's rob_idx/pdst received the
+    // PREVIOUS fround's data) and dropped froundnx's NX (o_fflags took the live
+    // fpu_fflags_comb). Same defect, and the same remedy, as div/sqrt's done_for_me.
+    // Dead at FROUND_PIPE=0: start/busy/done fold to 0 and every arm below folds back
+    // to the live signal (byte-identical).
+    let is_fround: logic = i_fpu_op == FpuOp::FROUND_S || i_fpu_op == FpuOp::FROUNDNX_S
+        || i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D;
+    let fr_is_d  : logic = i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D;
+    let fr_is_nx : logic = i_fpu_op == FpuOp::FROUNDNX_S || i_fpu_op == FpuOp::FROUNDNX_D;
+    // sNaN / NX-eligibility of the ISSUE-cycle operand. Mirrors s1_is_snan_comb /
+    // d1_is_snan_comb and the FROUNDNX arms of fpu_fflags_comb, which are declared
+    // further down the file — declaration order, not a second policy.
+    let fr_snan_in: logic = if fr_is_d
+        ? (d1[62:52] == 11'h7FF && d1[51] == 1'b0 && d1[50:0] != 51'd0)
+        : (s1_val[30:23] == 8'hFF && s1_val[22] == 1'b0 && s1_val[21:0] != 22'd0);
+    let fr_nx_elig: logic = if fr_is_d ? (d1[62:52] <: 11'd1075) : (s1_val[30:23] <: 8'd150);
+
+    var fr_inflight_q : logic           ;
+    var fr_cnt_q      : logic           ; // 0 = the add's stage 2, 1 = magic-sub + broadcast
+    var fr_own_rob_q  : logic<ROB_IDX_W>;
+    var fr_own_pdst_q : logic<PRF_W>    ;
+    var fr_own_hasrd_q: logic           ;
+    var fr_own_wint_q : logic           ;
+    var fr_own_isd_q  : logic           ;
+    var fr_own_nv_q   : logic           ;
+    var fr_own_nxe_q  : logic           ;
+    var fr_own_isnx_q : logic           ;
+    var fr_own_ffl_q  : logic<5>        ;
+    // A fround is presented this cycle (the queue selects the lowest-index READY
+    // entry, so which one that is can change under us at any cycle).
+    let fr_presented: logic = FROUND_PIPE && i_issue_valid && is_fround;
+    let fr_own_match: logic = fr_inflight_q && (i_issue_rob_idx == fr_own_rob_q);
+    // iq_fp frees the SELECTED entry when `i_issue_ack = valid && !fpu_busy`, so busy
+    // must be high for the two pre-broadcast cycles and LOW on the broadcast cycle —
+    // the entry is retired by the same ack that lets the result fire.
+    let fround_busy : logic = fr_presented && !(fr_own_match && fr_cnt_q);
+    // OWNER-EXACT broadcast, exactly like div/sqrt's done_for_me: iq_fp frees the
+    // SELECTED entry, so the result must fire while its own op is the selected one —
+    // firing to the right rob_idx at the wrong moment retires a DIFFERENT entry and
+    // livelocks the queue (measured both ways). If the selection moves to another
+    // fround mid-flight the FSM restarts for that one and this attempt is simply
+    // re-run when it is selected again; frounds are re-executable, which is why
+    // div/sqrt take the same "restart for the real head" route.
+
     var fr_s_sum_q: logic<32>;
     var fr_d_sum_q: logic<64>;
     var fr_d1_q   : logic<64>;
@@ -910,12 +961,25 @@ pub module fpu_wrap #(
             fr_d1_q    = 64'd0;
             fr_s1v_q   = 32'd0;
             fr_rm_q    = 3'd0;
-        } else {
+        } else if !FROUND_PIPE {
+            // 2-stage FROUND: one cycle deep, so capture every cycle (as shipped).
             fr_s_sum_q = fr_s_sum;
             fr_d_sum_q = fr_d_sum;
             fr_d1_q    = d1;
             fr_s1v_q   = s1_val;
             fr_rm_q    = fp_rm_resolved;
+        } else {
+            // 3-stage: the head moves on mid-flight, so capture the operand at ISSUE
+            // and the rint add's sum on the cycle it is valid, then HOLD both.
+            if fr_presented && !fr_own_match {
+                fr_d1_q  = d1;
+                fr_s1v_q = s1_val;
+                fr_rm_q  = fp_rm_resolved;
+            }
+            if fr_inflight_q && !fr_cnt_q {
+                fr_s_sum_q = fr_s_sum;
+                fr_d_sum_q = fr_d_sum;
+            }
         }
     }
     // Subtract operands: live (PIPE=0, stage 1) or registered (PIPE=1, stage 2).
@@ -2693,37 +2757,8 @@ pub module fpu_wrap #(
         }
     }
 
-    // A-EXE FROUND 3-stage completion (FROUND_PIPE=1): the registered rounding-add
-    // spans 2 cycles + the magic-subtract a 3rd, so hold the op at the iq_fp head
-    // for 2 extra cycles (via o_fpu_busy, like div/sqrt) and broadcast on the 3rd.
-    // Held ⇒ operands + metadata (i_issue_rd_pdst/rob/has_rd) are stable, so the
-    // existing fr_*_sum_q / fr_*1*_q registers converge to the correct value by the
-    // 3rd cycle with no s2/s3 latch, and no common op is in flight to collide on the
-    // single CDB port (busy blocks issue, the same guarantee div/sqrt rely on).
-    // fround_active carries FROUND_PIPE, so at FROUND_PIPE=0 the whole FSM is inert
-    // (fround_busy/done = 0 → byte-identical). NOTE: fround_cnt_q is NOT DCE'd by
-    // veryl's simple synth at FROUND_PIPE=0 — unlike a same-module `const` (EX_PIPE,
-    // SPEC_WAKE), a submodule INSTANCE parameter is not const-propagated into the body,
-    // so the 2-bit counter survives in both fpu_wrap instances (+4 dead FFs, held at
-    // 0, off the critical path — a real synth tool folds them). This is CP-neutral
-    // (EX_PIPE=0 synth CP 14.745 unchanged), which is the invariant that matters.
-    let is_fround: logic = i_fpu_op == FpuOp::FROUND_S || i_fpu_op == FpuOp::FROUNDNX_S
-        || i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D;
-    let fround_active: logic = FROUND_PIPE && i_issue_valid && is_fround;
-    var fround_cnt_q: logic<2>;
-    always_ff (clk, rst) {
-        if_reset {
-            fround_cnt_q = 2'd0;
-        } else if i_flush {
-            fround_cnt_q = 2'd0;
-        } else if fround_active {
-            fround_cnt_q = if fround_cnt_q == 2'd2 ? 2'd0 : fround_cnt_q + 2'd1;
-        } else {
-            fround_cnt_q = 2'd0;
-        }
-    }
-    let fround_busy: logic = fround_active && fround_cnt_q != 2'd2; // hold on cycles 0,1
-    let fround_done: logic = fround_active && fround_cnt_q == 2'd2; // broadcast on cycle 2
+    // (The FROUND 3-stage FSM moved up next to the rint adders — it now latches the
+    // op's identity at issue instead of reading the head live. See it there.)
 
     // A-EXE FMA 3-stage completion (FMA_PIPE3=1): the double-precision FMA gains a
     // third stage (fp_fma STAGE3 registers the mantissa multiply before align+add), so
@@ -2824,6 +2859,62 @@ pub module fpu_wrap #(
         }
     }
 
+    // OWNER-EXACT, exactly like div/sqrt's done_for_me: the tracked op must still be
+    // the presented one. If the selection moves to a DIFFERENT fround mid-flight the
+    // FSM restarts for that one — never inherits the old op's registers, which is how
+    // op A's result used to land on op B's rob_idx and made every static rounding
+    // mode read back the rne answer.
+    let fround_done : logic = fr_presented && fr_own_match && fr_cnt_q;
+    always_ff (clk, rst) {
+        if_reset {
+            fr_inflight_q  = 1'b0;
+            fr_cnt_q       = 1'b0;
+            fr_own_rob_q   = '0;
+            fr_own_pdst_q  = '0;
+            fr_own_hasrd_q = 1'b0;
+            fr_own_wint_q  = 1'b0;
+            fr_own_isd_q   = 1'b0;
+            fr_own_nv_q    = 1'b0;
+            fr_own_nxe_q   = 1'b0;
+            fr_own_isnx_q  = 1'b0;
+            fr_own_ffl_q   = 5'd0;
+        } else if i_flush {
+            fr_inflight_q = 1'b0;
+            fr_cnt_q      = 1'b0;
+        } else if fr_presented && !fr_own_match {
+            // (re)start for the fround now presented
+            fr_inflight_q  = 1'b1;
+            fr_cnt_q       = 1'b0;
+            fr_own_rob_q   = i_issue_rob_idx;
+            fr_own_pdst_q  = i_issue_rd_pdst;
+            fr_own_hasrd_q = i_issue_has_rd;
+            fr_own_wint_q  = i_issue_writes_int;
+            fr_own_isd_q   = fr_is_d;
+            fr_own_nv_q    = fr_snan_in;
+            fr_own_nxe_q   = fr_nx_elig;
+            fr_own_isnx_q  = fr_is_nx;
+        } else if !fr_presented {
+            fr_inflight_q = 1'b0;
+            fr_cnt_q      = 1'b0;
+        } else {
+            if fr_cnt_q {
+                fr_inflight_q = 1'b0;
+                fr_cnt_q      = 1'b0;
+            } else {
+                fr_cnt_q = 1'b1;
+                // The rint add's o_fflags is valid THIS cycle (its own stage 2), so
+                // latch the fround's flags here, keyed off the latched operand class.
+                if fr_own_nv_q {
+                    fr_own_ffl_q = 5'b10000;
+                } else if fr_own_isnx_q && fr_own_nxe_q && (if fr_own_isd_q ? fr_d_sum_fflags[0] : fr_s_sum_fflags[0]) {
+                    fr_own_ffl_q = 5'b00001;
+                } else {
+                    fr_own_ffl_q = 5'd0;
+                }
+            }
+        }
+    }
+
     // Stage-2 data/fflags: for arith ops take the unit's now-valid registered
     // output (live this cycle for the op issued last cycle); for every other
     // op take the cheap result registered in stage 1.
@@ -2883,13 +2974,13 @@ pub module fpu_wrap #(
     // 3-stage FROUND result (held-at-head): broadcast via this dedicated arm so the
     // magic-sub cone lands on o_cdb.data (like the 2-stage s2_data path) and NOT on
     // the s2_cheap_result register. Dead at FROUND_PIPE=0 (fround_done const 0 → DCE).
-    let fround_data: logic<64> = if i_fpu_op == FpuOp::FROUND_D || i_fpu_op == FpuOp::FROUNDNX_D ? fround_d_final : fround_s_final;
+    let fround_data: logic<64> = if fr_own_isd_q ? fround_d_final : fround_s_final;
 
     assign o_cdb.valid        = cdb_fire;
-    assign o_cdb.has_rd       = if PIPE == 1 ? ((s2_valid && s2_has_rd) || ((cdb_fire_ds || fround_done || fma_done) && i_issue_has_rd)) : (cdb_fire_legacy && i_issue_has_rd);
-    assign o_cdb.pdst         = if PIPE == 1 ? (if s2_valid ? s2_pdst : i_issue_rd_pdst) : i_issue_rd_pdst;
+    assign o_cdb.has_rd       = if PIPE == 1 ? ((s2_valid && s2_has_rd) || (fround_done && fr_own_hasrd_q) || ((cdb_fire_ds || fma_done) && i_issue_has_rd)) : (cdb_fire_legacy && i_issue_has_rd);
+    assign o_cdb.pdst         = if PIPE == 1 ? (if s2_valid ? s2_pdst : (if fround_done ? fr_own_pdst_q : i_issue_rd_pdst)) : i_issue_rd_pdst;
     assign o_cdb.data         = if PIPE == 1 ? (if s2_valid ? s2_data : (if fround_done ? fround_data : fpu_result)) : fpu_result;
-    assign o_cdb.rob_idx      = if PIPE == 1 ? (if s2_valid ? s2_rob : i_issue_rob_idx) : i_issue_rob_idx;
+    assign o_cdb.rob_idx      = if PIPE == 1 ? (if s2_valid ? s2_rob : (if fround_done ? fr_own_rob_q : i_issue_rob_idx)) : i_issue_rob_idx;
     assign o_cdb.mispredict   = 1'b0;
     assign o_cdb.redirect_pc  = 64'd0;
     assign o_cdb.is_store     = 1'b0;
@@ -2908,9 +2999,9 @@ pub module fpu_wrap #(
     assign o_cdb.fault_acc    = 1'b0;
     assign o_cdb.fault_vaddr  = 64'd0;
 
-    assign o_fflags     = if PIPE == 1 ? (if s2_valid ? s2_fflags : fpu_fflags_comb) : fpu_fflags_comb;
+    assign o_fflags     = if PIPE == 1 ? (if s2_valid ? s2_fflags : (if fround_done ? fr_own_ffl_q : fpu_fflags_comb)) : fpu_fflags_comb;
     assign o_fflags_wen = cdb_fire;
 
     // Dest-is-FP of the op writing back this cycle (see port comment).
-    assign o_dest_is_fp = if PIPE == 1 ? (if s2_valid ? !s2_wr_int : !i_issue_writes_int) : !i_issue_writes_int;
+    assign o_dest_is_fp = if PIPE == 1 ? (if s2_valid ? !s2_wr_int : (if fround_done ? !fr_own_wint_q : !i_issue_writes_int)) : !i_issue_writes_int;
 }
