@@ -2533,9 +2533,54 @@ Recommended order (front-end-first, risk last):
 4. **L1→L2→L3** LSQ — commit side, parallelisable throughout.
 5. **R3 + LOAD_SPEC** — gated SMP finale.
 
-## First step
+## First step — SUPERSEDED (F1 shipped 2026-07; see below for the current one)
 
-Begin **F1**: audit the current predictor RTL (exact array sizes, ports, F0
-combinational read paths for BTB/BHT/TAGE/iBTB), then design the `PRED_SYNC_READ`
-DEAD scaffold and the F0→F1 override datapath. Sub-plan doc:
-`cp_predictor_sram_plan.md` (to be written).
+The original first step was **F1** (predictor SRAM + F0→F1 override). Done: F1 and F2
+shipped (`78529fe`), and every other block above is shipped, measured-and-declined, or
+carries only a user ship-decision. Kept for provenance only.
+
+---
+
+## ▶️ NEXT STEP (2026-08-27) — localize the MEASURED wall before choosing a block
+
+**State.** Phase 14's named work is down to two items: `LOAD_SPEC` (still `0`, deferred
+into Block R) and **L1's ship declaration** (its arm is ON and green; the call is the
+user's). Block R shipped only the *without-return* atomic class (`ATOMIC_SQ=1`,
+`ASQ_NOREAD=1`); result-returning AMO / LR-SC / amocas / MMIO atomics still take the
+single-cycle commit-time RMW, so R3's stated射程 is half-done. EX_PIPE is measured
+CP-NEGATIVE (S4) and stays at 0.
+
+**Why this step and not a block.** S4 retired the CP map this plan was steering by
+(`rs1_rdy` 12.920 ns; "A-EXE is the front right behind the loop"). The only evidence we
+have about today's critical path is the S4 measurement itself:
+
+```
+EX_PIPE=0:  15.142 ns, 160 levels, ftq_head[0] → sh_load_poison[*]     area 26.82 M
+```
+
+160 levels is the whole machine in one endpoint name, which tells us WHERE it ends and
+nothing about WHICH SEGMENT pays. **There is currently no evidence-backed reason to pick
+any particular next block** — so decompose this path first. It is cheap (a few synth
+runs), and the likely landing zone is the load-violation / poison scan, i.e. the memory
+-ordering machinery that Block R's remaining half and L1 already live in — so the
+measurement plausibly connects to the existing plan rather than replacing it.
+
+**Method.**
+```
+./veryl/target/release-verylup/veryl synth --top heliodor_core --dump-timing --timing-paths N
+```
+Then attribute segments the way S4 did — by REPLACING or literal-zeroing one suspect at a
+time and re-reading the CP. ⚠️ Two traps S4 paid for, both recorded:
+- A probe must be a **literal** (`let x: logic = 1'b0;`). `x && 1'b0` keeps the syntactic
+  edge and the number does not move — the first S4 probe measured nothing.
+- If removal wedges the machine, price by **replacement** with a second correct
+  implementation, not by removal (that is how E3 was finally priced at 1.02 pp).
+
+**Toolchain note.** `veryl` is at `b40d8cdf` (2026-08-28) since `04b1b61`. The incremental
+comb-loop blind spot is closed, so `veryl check` catches loops again — `veryl synth` is no
+longer the only gate. Baselines are unchanged across that update (all bit-identical).
+
+**Carried-forward items** (none blocking this step): L1 ship declaration · the unexplained
++2.35 ns / +2.31 M comb of EX_PIPE=1 (`ex3_defer` and the E2 bypass are both excluded) ·
+N=2 SMP +2.49 % from the S3 buffer · `i_cdb_fault_gstage`/`gpa` latent side-band ·
+`FROUND_PIPE=1`'s real Zfa bug (`test_arch_zfa_s2`).
