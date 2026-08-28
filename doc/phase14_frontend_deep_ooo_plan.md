@@ -231,6 +231,11 @@ the predictor was explicitly a stand-in; ⚠️the **N=2 SMP +2.49 %** is a stan
 
 ### 🛑 S4 (2026-08-27) — the keystone MEASURED: EX_PIPE=1 is CP-NEGATIVE
 
+> ⚠️ **VOIDED 2026-08-28.** Every CP and area number in this section was taken with
+> `veryl` `ba03f6b8`, which synthesized only 52.5 % of the gates. Both arms are
+> unmeasured — see *Wall localization (2026-08-28)* at the end of this document. The
+> IPC costs (coremark +12.06 %, N=2 SMP +7.80 %) came from the simulator and stand.
+
 Two days were spent measuring what `EX_PIPE=1` COSTS and none measuring what it BUYS —
 because until S2 it did not boot, so nobody could take the number. Taken now
 (`veryl synth --top heliodor_core --dump-timing`, the same tool the campaign's 12.920 ns
@@ -2541,46 +2546,71 @@ carries only a user ship-decision. Kept for provenance only.
 
 ---
 
-## ▶️ NEXT STEP (2026-08-27) — localize the MEASURED wall before choosing a block
+## Wall localization (2026-08-28) — DONE, and it retired the measuring instrument too
 
-**State.** Phase 14's named work is down to two items: `LOAD_SPEC` (still `0`, deferred
-into Block R) and **L1's ship declaration** (its arm is ON and green; the call is the
-user's). Block R shipped only the *without-return* atomic class (`ATOMIC_SQ=1`,
-`ASQ_NOREAD=1`); result-returning AMO / LR-SC / amocas / MMIO atomics still take the
-single-cycle commit-time RMW, so R3's stated射程 is half-done. EX_PIPE is measured
-CP-NEGATIVE (S4) and stays at 0.
+**The 2026-08-27 step above was "decompose `ftq_head → sh_load_poison`, 15.142 ns / 160
+levels". That endpoint does not exist. The tool that reported it was reading half the
+netlist.** Both synth binaries, run back-to-back on the *identical* tree (`b92769a` with
+the 19 tb `#[allow(initial_assign)]` lines stripped so the old one would parse it):
 
-**Why this step and not a block.** S4 retired the CP map this plan was steering by
-(`rs1_rdy` 12.920 ns; "A-EXE is the front right behind the loop"). The only evidence we
-have about today's critical path is the S4 measurement itself:
+| `veryl` | gates | FFs | area | critical path |
+|---|---|---|---|---|
+| `ba03f6b8` (pre-`04b1b61`, the binary S4 used) | 1,265,967 | 176,091 | 26.82 M | 15.142 ns / 160 lv `ftq_head[0] → sh_load_poison[0]` |
+| `b40d8cdf` (current) | **2,410,872** | 195,790 | **36.36 M** | **40.250 ns / 421 lv** `head[0] → prf[7]` |
+
+Same RTL, **52.5 % of the gates missing** from the old netlist — the same instance-boundary
+lookup miss that hid comb loops (`04b1b61`) also dropped whole subtrees from area and
+timing. So `15.142 ns / ftq_head → sh_load_poison` is retired, **and so is S4's `EX_PIPE=1
+→ 17.490 ns` / `+2.35 ns` / `+9.1 % area`**: both arms were measured on the blind netlist,
+so the *keystone's CP verdict is unmeasured*, not negative. (The IPC costs S2/S3 measured —
+coremark +12.06 %, N=2 SMP +7.80 % — stand; those came from the simulator.) Re-take both
+arms before touching that decision again.
+
+### What the true wall was: a 128-deep serial `+1` in `vcpop.m`
+
+All twelve worst endpoints were one path fanning into twelve physical registers:
+`u_vu.head[0] → vcpop_cnt[7] → vu_cdb → prf[*]`, 421 levels. `vector_unit`'s V4d mask
+reduction counted eligible mask bits with `for i in 0..VLEN { vcpop_cnt = vcpop_cnt + 1 }`
+— a 128-iteration ripple of 8-bit increments, ~0.77 ns each. The same file had already
+converted its two neighbours away from exactly this shape (vmsbf/vmsif to a Hillis-Steele
+prefix-OR, viota's seed to `popcount64`); V4d was simply missed, and it was the deepest
+combinational path **in the whole core**.
+
+Fixed by sharing one structure: vcpop is a tree popcount of the eligible mask, and vfirst
+falls out of the prefix vmsbf already builds (`vmsp_nf` holds exactly *first index + 1*
+ones, so `popcount(nf) − 1` **is** the index). `tb/test_vmspre.veryl` now proves both
+reductions bit-identical to their serial references over 4000 random + directed vectors.
 
 ```
-EX_PIPE=0:  15.142 ns, 160 levels, ftq_head[0] → sh_load_poison[*]     area 26.82 M
+40.250 ns / 421 lv  head[0] → prf[7]                      (before)
+31.710 ns / 339 lv  sh_store_funct3[0] → sh_load_poison[0] (after)   −21.2 %, area −26 k um²
 ```
 
-160 levels is the whole machine in one endpoint name, which tells us WHERE it ends and
-nothing about WHICH SEGMENT pays. **There is currently no evidence-backed reason to pick
-any particular next block** — so decompose this path first. It is cheap (a few synth
-runs), and the likely landing zone is the load-violation / poison scan, i.e. the memory
--ordering machinery that Block R's remaining half and L1 already live in — so the
-measurement plausibly connects to the existing plan rather than replacing it.
+### ▶️ The wall that is now binding, decomposed
 
-**Method.**
-```
-./veryl/target/release-verylup/veryl synth --top heliodor_core --dump-timing --timing-paths N
-```
-Then attribute segments the way S4 did — by REPLACING or literal-zeroing one suspect at a
-time and re-reading the CP. ⚠️ Two traps S4 paid for, both recorded:
-- A probe must be a **literal** (`let x: logic = 1'b0;`). `x && 1'b0` keeps the syntactic
-  edge and the number does not move — the first S4 probe measured nothing.
-- If removal wedges the machine, price by **replacement** with a second correct
-  implementation, not by removal (that is how E3 was finally priced at 1.02 pp).
+`sh_store_funct3[0] → sh_load_poison[0]`, 31.710 ns / 339 levels:
 
-**Toolchain note.** `veryl` is at `b40d8cdf` (2026-08-28) since `04b1b61`. The incremental
-comb-loop blind spot is closed, so `veryl check` catches loops again — `veryl synth` is no
-longer the only gate. Baselines are unchanged across that update (all bit-identical).
+| segment | ns | share | what it is |
+|---|---|---|---|
+| `ls_f3` → `ls_addr` → `lsr_vaddr_q` | 1.68 | 5 % | store size/address decode + the load's VA compare |
+| **`ls_fwd[0..31]` × 32** | **23.90** | **75 %** | **store→load forwarding: a serial "youngest older store" walk, one iteration per ROB entry** |
+| `sf2_v` → `stld_fwd_mask` → `lsr_mshr_*` → `iq_issue_op` | 1.10 | 3 % | forward-mask assembly and LSR/MSHR issue gating |
+| `u_load_queue.i_rec2_*` vs `i_store_addr` | 1.58 | 5 % | load-queue self-scan address compare |
+| `u_rob.i_conservative` 31-deep `ao21` | 2.48 | 8 % | linear reduce across the 32 ROB entries |
+| `u_rob.sh_load_poison` | 0.87 | 3 % | the poison write itself |
 
-**Carried-forward items** (none blocking this step): L1 ship declaration · the unexplained
-+2.35 ns / +2.31 M comb of EX_PIPE=1 (`ex3_defer` and the E2 bypass are both excluded) ·
-N=2 SMP +2.49 % from the S3 buffer · `i_cdb_fault_gstage`/`gpa` latent side-band ·
-`FROUND_PIPE=1`'s real Zfa bug (`test_arch_zfa_s2`).
+**Three quarters of the critical path is one construct** (`heliodor_core.veryl` ~8067):
+eight per-byte accumulators, each `for i in 0..ROB_DEPTH { if cov && (!sfN_v || age_i >:
+sfN_age) { … } }`. The self-referential age compare serializes all 32 iterations; the
+2.48 ns ROB tail is the same linear-reduce shape at 32 entries. Both are **structurally
+identical to the vcpop defect just fixed** — an age-max select and an OR reduce, each
+computable in log depth — and both sit squarely in Block L1's (store queue) territory,
+which is where the 2026-08-27 note guessed the path would land.
+
+The prediction in that note was right about the *neighbourhood* and wrong about the
+*endpoint*, for the same reason the endpoint was wrong: it was reading the old number.
+
+**Carried-forward items**: L1 ship declaration · **re-measure both EX_PIPE arms on the
+current binary** (the +2.35 ns is void) · N=2 SMP +2.49 % from the S3 buffer ·
+`i_cdb_fault_gstage`/`gpa` latent side-band · `FROUND_PIPE=1`'s real Zfa bug
+(`test_arch_zfa_s2`).
