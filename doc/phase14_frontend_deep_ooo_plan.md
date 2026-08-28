@@ -2727,3 +2727,67 @@ with +211 gates and *less* area. A third would cost a correctness-bug hunt in th
 structural — a stage split that moves a whole layer (FP issue→execute→flags, or
 commit→AGU→TLB→PMP) across a register boundary — not another local reduction. Which is the
 kind of change `EX_PIPE` is, and it is now measured CP-NEUTRAL rather than CP-negative.
+
+## ▶️ The stage-split map (2026-08-28) — the plateau is ONE unpipelined FP adder
+
+Per-module standalone synth (`--top <module>`, default params — so treat any module the core
+instantiates with overrides, or whose worst endpoint is a `o_dbg_*` port, as confounded):
+
+| module | CP | levels | note |
+|---|---|---|---|
+| `fpu_wrap` | 27.240 | 312 | **confounded** — default `PIPE=0`; the core passes `PIPE:1` |
+| `load_queue` | 25.020 | 218 | **confounded** — endpoint is `o_dbg_self_nopa`, DCE'd in the core |
+| `fp_fma` | 19.010 | 206 | staged in the core |
+| **`vector_unit`** | **17.520** | 188 | **real** — same path the core reports at 17.670 |
+| **`fp_adder`** | **13.450** | 154 | **real — the floor** |
+| `alu_wrap` 9.060 · `l2cache` 8.730 · `iq_int` 7.732 · `dmem_mmu` 6.840 · `rob` 6.360 · `dcache` 6.055 · `mmu` 5.320 · `iq_fp` 3.780 · `csr` 2.900 · `pmp_check` 2.820 · `rat` 0.940 · `prf_fp` 0.900 · `vrf` 0.750 | | | all far below |
+
+**The three plateau paths, and what each needs**
+
+| | path | ns | dominant segment | the cut |
+|---|---|---|---|---|
+| P1 | `occupied → sh_fflags` | 17.940 | `fround_d_add` select **8.33** | `FROUND_PIPE=1` — blocked by the Zfa bug (`test_arch_zfa_s2`) |
+| P2 | `head → sh_load_poison` | 17.730 | TLB 4.31 + PMP 2.45 + ROB serial-OR self-scan **3.10** | no knob exists; needs a real stage boundary |
+| P3 | `fr_d_sum_q → vrf` | 17.670 | `u_fround_d_sub` (a whole unpipelined `fp_adder`) **13.27** | `u_fround_d_sub` takes **no** `PIPE` param today |
+
+Measured, not assumed — each arm is a synth run, and synth does not care that
+`FROUND_PIPE=1` is functionally wrong:
+
+```
+as shipped                                      17.940   occupied → sh_fflags
+FROUND_PIPE=1                                   17.730   head → sh_load_poison
+FROUND_PIPE=1 + VFP_EX_PIPE=1                   17.730   head → sh_load_poison
+FROUND_PIPE=1 + VFP_EX_PIPE=1 + S15_SELF_SCAN=0 17.670   fr_d_sum_q → vrf
+```
+
+**No single cut moves the CP** — each one only uncovers the next, 0.06–0.21 ns below. This is
+the case [[feedback_commit_to_structural_cp_change]] describes: commit to the bundle or do
+not start.
+
+### Why `VFP_EX_PIPE=1` changed nothing, and where the floor really is
+
+`FROUND_PIPE` splits the Zfa rint trick `(x + magic) − magic` by registering the sum
+*between* the two adders (`fr_d_sum_q`). The first adder gets `PIPE: FROUND_PIPE`; the
+second — `u_fround_s_sub` / `u_fround_d_sub`, `fpu_wrap.veryl:929` — is instantiated with
+**no PIPE argument at all**, so it is `PIPE=0` forever. The third FROUND stage *is* one
+whole combinational `fp_adder`:
+
+| `fp_adder` internal (13.450 ns) | ns |
+|---|---|
+| operand align / compare (`i_a`/`i_b`) | 4.71 |
+| `s1_sum_sel` normalize | 3.31 |
+| `s1_exp_sel` | 2.54 |
+| round / result select | 2.48 |
+
+`fp_adder` already carries its own `param PIPE` and midpoint register (`s1_sum_q`,
+`fp_adder.veryl:11`), which would split it **4.71 / 8.74**. Passing it to the sub instance
+is the P3 cut and costs one more held cycle, the same machinery `FROUND_PIPE` already has.
+
+### Target
+
+Cut P1 + P2 + P3 together → **~13.5 ns** (the `fp_adder` floor). Then split `fp_adder`
+itself → **~9 ns**. That is 17.940 → ~9, a further −50 %, on top of today's −55.4 %.
+
+**Dependency order**: the Zfa `FROUND_PIPE` bug is on the campaign's critical path — it
+gates P1 and it is the machinery P3 reuses — so it is the first step, and it is the only
+step that is a *correctness* fix rather than a structural one.
