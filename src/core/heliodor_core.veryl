@@ -8007,10 +8007,11 @@ pub module heliodor_core #(
     // reading a backward-referenced cross-module array hangs the Veryl sim). For
     // each of the 8 bytes [agu_addr_iss, +7] the issuing LOAD consumes, override
     // the dcache byte with the YOUNGEST older forwardable store writing it. Each
-    // store's data is aligned into the load frame ONCE (`asd`); the 8 scalar
-    // accumulators (manually unrolled — a loop-var WRITE index hangs the sim) read
-    // constant slices. stld_fwd_data is in the natural load frame (byte p = addr
-    // agu_addr_iss+p, matching alu_wrap's ld_shifted); stld_fwd_mask gates it.
+    // store's data is aligned into the load frame; the winner per byte lane is picked
+    // by a balanced argmax tree over {cov, age, byte} (pick_youngest_fwd below — it
+    // replaced eight 32-deep SERIAL accumulators that were 75 % of the critical path).
+    // stld_fwd_data is in the natural load frame (byte p = addr agu_addr_iss+p,
+    // matching alu_wrap's ld_shifted); stld_fwd_mask gates it.
     // ============================================================
     // Phase 1 LSU 2-stage: the store→load forward network (ROB sf* + SB sbf* below)
     // is computed at STAGE B against the LSR's registered VA/PA and age — it is
@@ -8053,121 +8054,87 @@ pub module heliodor_core #(
     // boot (same cycles, same 11,145 replays, same 16,556 suppressions). The
     // "genuine VA alias" reading of M1c was wrong: those poisons had overlapping VAs
     // too, they simply had no exemption on that port. Kept as a fold-away arm.
-    var sf0_v: logic; var sf0_age: logic<ROB_IDX_W>; var sf0_b: logic<8>;
-    var sf1_v: logic; var sf1_age: logic<ROB_IDX_W>; var sf1_b: logic<8>;
-    var sf2_v: logic; var sf2_age: logic<ROB_IDX_W>; var sf2_b: logic<8>;
-    var sf3_v: logic; var sf3_age: logic<ROB_IDX_W>; var sf3_b: logic<8>;
-    var sf4_v: logic; var sf4_age: logic<ROB_IDX_W>; var sf4_b: logic<8>;
-    var sf5_v: logic; var sf5_age: logic<ROB_IDX_W>; var sf5_b: logic<8>;
-    var sf6_v: logic; var sf6_age: logic<ROB_IDX_W>; var sf6_b: logic<8>;
-    var sf7_v: logic; var sf7_age: logic<ROB_IDX_W>; var sf7_b: logic<8>;
-    // One always_comb per byte (each a single self-ref accumulator like iq_int's
-    // oldest-ready select): 8 accumulators in ONE block made the combinational_loop
-    // diagnostic falsely fuse them into a loop. p = byte position; la = agu+p.
+    // Fmax (2026-08-28): pairwise-argmax of two packed forward candidates
+    // {cov(1), age(ROB_IDX_W=5), byte(8)} = 14 bits. `age_i = i - rob_head_idx` is a
+    // BIJECTION over 0..ROB_DEPTH, so the ages of covering stores are unique, argmax is
+    // associative, and a balanced reduction is BIT-IDENTICAL to the linear running-max
+    // the eight accumulators used to walk. That walk was the wall: 23.90 ns of a
+    // 31.710 ns critical path (32 iterations × ~0.77 ns, `sh_store_funct3 →
+    // sh_load_poison`) — the same shape, and the same fix, as the ROB's
+    // pick_oldest_blk. Only `sfN_v` / `sfN_b` are consumed downstream (stld_fwd_data
+    // takes byte p from the sb half when sfN_v=0), so the winner's age is internal.
+    function pick_youngest_fwd (
+        a: input logic<14>,
+        b: input logic<14>,
+    ) -> logic<14> {
+        return if !a[13] ? b : if !b[13] ? a : if a[12:8] >: b[12:8] ? a : b;
+    }
+    // Candidates for the slot-0 load, 8 byte lanes × ROB_DEPTH entries, flat as
+    // [p * ROB_DEPTH + i]. Coverage and the aligned byte are computed exactly as the
+    // accumulators did — only the SELECT changed.
+    var sf_cand: logic<14> [8 * ROB_DEPTH];
     always_comb {
-        sf0_v = 1'b0; sf0_age = '0; sf0_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd0;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf0_v || age_i >: sf0_age) { sf0_v = 1'b1; sf0_age = age_i; sf0_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for i in 0..ROB_DEPTH {
+                let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+                let upa  : logic            = FWD_PA && ls_pa_v[i];
+                let sa   : logic<64>        = if upa ? ls_pa[i] : ls_addr[i];
+                let la   : logic<64>        = (if upa ? lsr_paddr_q : lsr_vaddr_q) + (p as 64);
+                let cov  : logic            = stld_fwd_en && ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+                let off  : logic<64>        = la - sa;
+                let byt  : logic<64>        = ls_data[i] >> {off[2:0], 3'b000};
+                sf_cand[p * ROB_DEPTH + i] = {cov, age_i, byt[7:0]};
+            }
+        }
+    }
+    // Balanced argmax tree, one level per always_comb so no block ever reads an array
+    // it writes (the eight accumulators had to be split for the same reason).
+    var sf_r16: logic<14> [8 * 16];
+    var sf_r8 : logic<14> [8 * 8] ;
+    var sf_r4 : logic<14> [8 * 4] ;
+    var sf_r2 : logic<14> [8 * 2] ;
+    var sf_win: logic<14> [8]     ;
+    always_comb {
+        for p in 0..8 {
+            for j in 0..16 {
+                sf_r16[p * 16 + j] = pick_youngest_fwd(sf_cand[p * ROB_DEPTH + 2 * j], sf_cand[p * ROB_DEPTH + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sf1_v = 1'b0; sf1_age = '0; sf1_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd1;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf1_v || age_i >: sf1_age) { sf1_v = 1'b1; sf1_age = age_i; sf1_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for j in 0..8 {
+                sf_r8[p * 8 + j] = pick_youngest_fwd(sf_r16[p * 16 + 2 * j], sf_r16[p * 16 + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sf2_v = 1'b0; sf2_age = '0; sf2_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd2;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf2_v || age_i >: sf2_age) { sf2_v = 1'b1; sf2_age = age_i; sf2_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for j in 0..4 {
+                sf_r4[p * 4 + j] = pick_youngest_fwd(sf_r8[p * 8 + 2 * j], sf_r8[p * 8 + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sf3_v = 1'b0; sf3_age = '0; sf3_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd3;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf3_v || age_i >: sf3_age) { sf3_v = 1'b1; sf3_age = age_i; sf3_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for j in 0..2 {
+                sf_r2[p * 2 + j] = pick_youngest_fwd(sf_r4[p * 4 + 2 * j], sf_r4[p * 4 + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sf4_v = 1'b0; sf4_age = '0; sf4_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd4;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf4_v || age_i >: sf4_age) { sf4_v = 1'b1; sf4_age = age_i; sf4_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            sf_win[p] = pick_youngest_fwd(sf_r2[p * 2], sf_r2[p * 2 + 1]);
+        }
     }
-    always_comb {
-        sf5_v = 1'b0; sf5_age = '0; sf5_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd5;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf5_v || age_i >: sf5_age) { sf5_v = 1'b1; sf5_age = age_i; sf5_b = byt[7:0]; }
-        } }
-    }
-    always_comb {
-        sf6_v = 1'b0; sf6_age = '0; sf6_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd6;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf6_v || age_i >: sf6_age) { sf6_v = 1'b1; sf6_age = age_i; sf6_b = byt[7:0]; }
-        } }
-    }
-    always_comb {
-        sf7_v = 1'b0; sf7_age = '0; sf7_b = 8'd0;
-        if stld_fwd_en { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let upa: logic = FWD_PA && ls_pa_v[i];
-            let sa: logic<64> = if upa ? ls_pa[i] : ls_addr[i];
-            let la: logic<64> = (if upa ? lsr_paddr_q : lsr_vaddr_q) + 64'd7;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sf7_v || age_i >: sf7_age) { sf7_v = 1'b1; sf7_age = age_i; sf7_b = byt[7:0]; }
-        } }
-    }
+    let sf0_v: logic = sf_win[0][13]; let sf0_b: logic<8> = sf_win[0][7:0];
+    let sf1_v: logic = sf_win[1][13]; let sf1_b: logic<8> = sf_win[1][7:0];
+    let sf2_v: logic = sf_win[2][13]; let sf2_b: logic<8> = sf_win[2][7:0];
+    let sf3_v: logic = sf_win[3][13]; let sf3_b: logic<8> = sf_win[3][7:0];
+    let sf4_v: logic = sf_win[4][13]; let sf4_b: logic<8> = sf_win[4][7:0];
+    let sf5_v: logic = sf_win[5][13]; let sf5_b: logic<8> = sf_win[5][7:0];
+    let sf6_v: logic = sf_win[6][13]; let sf6_b: logic<8> = sf_win[6][7:0];
+    let sf7_v: logic = sf_win[7][13]; let sf7_b: logic<8> = sf_win[7][7:0];
     // S27: stld_fwd_data/mask are now composed AFTER the committed-store-
     // buffer forward layer (near the sb FIFO below): ROB bytes win, sb bytes
     // fill the rest.
@@ -8181,102 +8148,66 @@ pub module heliodor_core #(
     // ============================================================
     let stld_fwd_age2: logic<ROB_IDX_W> = iq_iss_rob_idx2 - rob_head_idx;
     let stld_fwd_en2 : logic              = issue2_is_load;
-    var sg0_v: logic; var sg0_age: logic<ROB_IDX_W>; var sg0_b: logic<8>;
-    var sg1_v: logic; var sg1_age: logic<ROB_IDX_W>; var sg1_b: logic<8>;
-    var sg2_v: logic; var sg2_age: logic<ROB_IDX_W>; var sg2_b: logic<8>;
-    var sg3_v: logic; var sg3_age: logic<ROB_IDX_W>; var sg3_b: logic<8>;
-    var sg4_v: logic; var sg4_age: logic<ROB_IDX_W>; var sg4_b: logic<8>;
-    var sg5_v: logic; var sg5_age: logic<ROB_IDX_W>; var sg5_b: logic<8>;
-    var sg6_v: logic; var sg6_age: logic<ROB_IDX_W>; var sg6_b: logic<8>;
-    var sg7_v: logic; var sg7_age: logic<ROB_IDX_W>; var sg7_b: logic<8>;
+    var sg_cand: logic<14> [8 * ROB_DEPTH];
     always_comb {
-        sg0_v = 1'b0; sg0_age = '0; sg0_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd0;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg0_v || age_i >: sg0_age) { sg0_v = 1'b1; sg0_age = age_i; sg0_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for i in 0..ROB_DEPTH {
+                let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
+                let sa   : logic<64>        = ls_addr[i];
+                let la   : logic<64>        = agu_addr_iss2 + (p as 64);
+                let cov  : logic            = stld_fwd_en2 && ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
+                let off  : logic<64>        = la - sa;
+                let byt  : logic<64>        = ls_data[i] >> {off[2:0], 3'b000};
+                sg_cand[p * ROB_DEPTH + i] = {cov, age_i, byt[7:0]};
+            }
+        }
+    }
+    var sg_r16: logic<14> [8 * 16];
+    var sg_r8 : logic<14> [8 * 8] ;
+    var sg_r4 : logic<14> [8 * 4] ;
+    var sg_r2 : logic<14> [8 * 2] ;
+    var sg_win: logic<14> [8]     ;
+    always_comb {
+        for p in 0..8 {
+            for j in 0..16 {
+                sg_r16[p * 16 + j] = pick_youngest_fwd(sg_cand[p * ROB_DEPTH + 2 * j], sg_cand[p * ROB_DEPTH + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sg1_v = 1'b0; sg1_age = '0; sg1_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd1;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg1_v || age_i >: sg1_age) { sg1_v = 1'b1; sg1_age = age_i; sg1_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for j in 0..8 {
+                sg_r8[p * 8 + j] = pick_youngest_fwd(sg_r16[p * 16 + 2 * j], sg_r16[p * 16 + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sg2_v = 1'b0; sg2_age = '0; sg2_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd2;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg2_v || age_i >: sg2_age) { sg2_v = 1'b1; sg2_age = age_i; sg2_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for j in 0..4 {
+                sg_r4[p * 4 + j] = pick_youngest_fwd(sg_r8[p * 8 + 2 * j], sg_r8[p * 8 + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sg3_v = 1'b0; sg3_age = '0; sg3_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd3;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg3_v || age_i >: sg3_age) { sg3_v = 1'b1; sg3_age = age_i; sg3_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            for j in 0..2 {
+                sg_r2[p * 2 + j] = pick_youngest_fwd(sg_r4[p * 4 + 2 * j], sg_r4[p * 4 + 2 * j + 1]);
+            }
+        }
     }
     always_comb {
-        sg4_v = 1'b0; sg4_age = '0; sg4_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd4;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg4_v || age_i >: sg4_age) { sg4_v = 1'b1; sg4_age = age_i; sg4_b = byt[7:0]; }
-        } }
+        for p in 0..8 {
+            sg_win[p] = pick_youngest_fwd(sg_r2[p * 2], sg_r2[p * 2 + 1]);
+        }
     }
-    always_comb {
-        sg5_v = 1'b0; sg5_age = '0; sg5_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd5;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg5_v || age_i >: sg5_age) { sg5_v = 1'b1; sg5_age = age_i; sg5_b = byt[7:0]; }
-        } }
-    }
-    always_comb {
-        sg6_v = 1'b0; sg6_age = '0; sg6_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd6;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg6_v || age_i >: sg6_age) { sg6_v = 1'b1; sg6_age = age_i; sg6_b = byt[7:0]; }
-        } }
-    }
-    always_comb {
-        sg7_v = 1'b0; sg7_age = '0; sg7_b = 8'd0;
-        if stld_fwd_en2 { for i in 0..ROB_DEPTH {
-            let age_i: logic<ROB_IDX_W> = (i as ROB_IDX_W) - rob_head_idx;
-            let sa: logic<64> = ls_addr[i]; let la: logic<64> = agu_addr_iss2 + 64'd7;
-            let cov: logic = ls_fwd[i] && (age_i <: stld_fwd_age2) && (la >= sa) && (la <: sa + ((5'd1 << ls_f3[i][1:0]) as 64));
-            let off: logic<64> = la - sa;
-            let byt: logic<64> = ls_data[i] >> {off[2:0], 3'b000};
-            if cov && (!sg7_v || age_i >: sg7_age) { sg7_v = 1'b1; sg7_age = age_i; sg7_b = byt[7:0]; }
-        } }
-    }
+    let sg0_v: logic = sg_win[0][13]; let sg0_b: logic<8> = sg_win[0][7:0];
+    let sg1_v: logic = sg_win[1][13]; let sg1_b: logic<8> = sg_win[1][7:0];
+    let sg2_v: logic = sg_win[2][13]; let sg2_b: logic<8> = sg_win[2][7:0];
+    let sg3_v: logic = sg_win[3][13]; let sg3_b: logic<8> = sg_win[3][7:0];
+    let sg4_v: logic = sg_win[4][13]; let sg4_b: logic<8> = sg_win[4][7:0];
+    let sg5_v: logic = sg_win[5][13]; let sg5_b: logic<8> = sg_win[5][7:0];
+    let sg6_v: logic = sg_win[6][13]; let sg6_b: logic<8> = sg_win[6][7:0];
+    let sg7_v: logic = sg_win[7][13]; let sg7_b: logic<8> = sg_win[7][7:0];
     // S27: stld_fwd_data2/mask2 composed after the sb forward layer (below).
 
     // ============================================================

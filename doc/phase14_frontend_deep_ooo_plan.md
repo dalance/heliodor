@@ -2637,3 +2637,49 @@ forwarding wall is cut, EX_PIPE is back on the table as the next stage split.
 **Carried-forward items**: L1 ship declaration · N=2 SMP +2.49 % from the S3 buffer ·
 `i_cdb_fault_gstage`/`gpa` latent side-band · `FROUND_PIPE=1`'s real Zfa bug
 (`test_arch_zfa_s2`).
+
+## The forwarding walk, cut (2026-08-28) — 31.710 → 17.940 ns
+
+The 75 % segment above is gone. `pick_youngest_fwd` is a pairwise argmax of two packed
+candidates `{cov(1), age(ROB_IDX_W=5), byte(8)}`, reduced by a balanced depth-5 tree — the
+same construction, for the same reason, as the ROB's `pick_oldest_blk`. `age_i = i −
+rob_head_idx` is a bijection over `0..ROB_DEPTH`, so covering ages are unique, argmax is
+associative, and the tree is **bit-identical** to the sixteen 32-deep serial accumulators
+it replaces (8 byte lanes × 2 issue slots). Only `sfN_v` / `sfN_b` are consumed — when
+`sfN_v=0`, `stld_fwd_data` takes byte *p* from the committed-store-buffer half — so the
+winner's age never leaves the network.
+
+```
+31.710 ns / 339 lv  sh_store_funct3[0] → sh_load_poison[0]   (before)
+17.940 ns / 200 lv  occupied[0] → sh_fflags[0]               (after)   −43.4 %
+```
+
+Gates 2,407,145 → 2,407,356 (**+211**), area 36.3339 M → 36.3289 M um² (**−4,954**): the
+tree costs nothing, because 32 comparators is 32 comparators either way — only their
+*arrangement* changed. Cumulatively the wall is down **40.250 → 17.940 ns, −55.4 %**, from
+two commits that between them add zero hardware.
+
+Gates, all bit-identical to master: suite 252/0 · dhrystone 235,808 / 264,834 · coremark
+394,555 / 374,357 · N=1 boot `00ba9d70` + instret 10,421,567 · N=2 SMP `00fa3e80`
+(hart instret 13,295,358 / 12,792,670) · litmus N=2 in the default suite.
+
+### ▶️ The third wall: `fround.d`'s normalize/round select
+
+`occupied[0] → sh_fflags[0]`, 17.940 ns / 200 levels — the FP side, end to end:
+
+| segment | ns | share | what it is |
+|---|---|---|---|
+| `u_iq_fp.occupied` | 2.82 | 16 % | FP issue-queue select |
+| `s1_pdst` → `u_prf_fp.prf` | 1.20 | 7 % | FP physical-register read |
+| `fr_d1_q` → `u_fpu.d1` → `fround_d_add` operand mux | 3.93 | 22 % | FPU operand staging |
+| **`fround_d_add.s1_sum_sel` / `s1_exp_sel`** | **8.33** | **46 %** | **the Zfa `fround.d` normalize + exponent select** |
+| `i_fpu_op` → `fpu_fflags_comb` → `vu_cdb_fflags` → `sh_fflags` | 1.22 | 7 % | flags to the ROB |
+
+Nearly half of it is one FP adder's select network, and the machinery to split it already
+exists and is already a carried item: `FROUND_PIPE` (`fpu_wrap.veryl:27`, default 0) with
+`doc/cp_fround_3stage_plan.md`, parked because `FROUND_PIPE=1` has a real Zfa bug
+(`test_arch_zfa_s2`). That bug is now on the critical path, not beside it.
+
+Note also what the endpoint became: `occupied[0] → …fflags`, one hop away from S4's
+reported `EX_PIPE=1` front (`occupied[0] → s2_cheap_fflags[0]`). Two walls down, the FP
+issue→execute→flags path is what binds — for both EX_PIPE arms alike.
