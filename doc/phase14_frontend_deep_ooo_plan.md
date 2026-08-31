@@ -2818,3 +2818,39 @@ is worth 0.21 ns alone; what changed is that it is no longer blocked.
 **Remaining in the bundle**: P3 (give `u_fround_?_sub` a `PIPE` argument — the machinery
 now works), P2 (the commit→AGU→TLB→PMP→issue→CDB→poison stage boundary, the only piece
 with no existing knob), then `fp_adder`'s own split.
+
+## Bundle progress (2026-08-31): 17.940 → 15.160 ns, gate count flat
+
+| step | commit | CP after | note |
+|---|---|---|---|
+| P1 unblocked — Zfa `FROUND_PIPE` fix | `a5e29de` | — | correctness only; the knob works now |
+| ROB record-time self-scan → tree OR | `d08ce5e` | 17.730 → **15.700** | unconditional, −352 gates |
+| P3 — the fround magic-sub gets `PIPE` | `d816dca` | 17.940 → **17.730** | with `VFP_EX_PIPE=1`; FROUND is 4 cycles |
+| load-queue self-scan → tree OR | `c6dad47` | 15.700 → **15.160** | unconditional, −38 gates |
+
+With `FROUND_PIPE=1 + VFP_EX_PIPE=1` the wall is **15.160 ns / 152 levels**, −15.5 % from
+the shipped 17.940, and gates are 2,407,950 vs 2,407,356 — flat. The default arm
+(`FROUND_PIPE=0`, `VFP_EX_PIPE=0`) is byte-identical throughout: suite 252/0, dhrystone
+235,808 / 264,834, coremark 394,555 / 374,357, N=1 instret 10,421,567, N=2 SMP `00fa3e80`.
+
+**Four instances of the serial-reduce defect class are now fixed** — vcpop, the
+store-forward walk, the ROB self-scan, the load-queue self-scan. The chains are gone from
+the critical path entirely; what is left is real work.
+
+### What P2 still is, with the chains gone (`head → sh_load_poison`, 15.160 ns)
+
+| segment | ns | share |
+|---|---|---|
+| ROB commit `sh_rd_arch` → `arch_regs` → CAS → `commit_store_fire` | 2.93 | 19 % |
+| AGU → **Sv39 TLB lookup** (`tlb_valid` alone is 2.36) | 4.31 | 28 % |
+| **PMP check** (`u_pmp_amo_w`) | 2.45 | 16 % |
+| issue-valid → CDB mux | 1.19 | 8 % |
+| load-queue address compare | 1.54 | 10 % |
+| ROB `rec0_vec` reduce + poison write | 2.07 | 14 % |
+
+**9.69 ns of it — commit + TLB + PMP — is address generation and translation happening in
+the same cycle as the memory-order check.** No local rewrite touches that; it needs a
+register boundary between translation and the poison scan, which is what
+`doc/cp_commit_store_pretranslate_plan.md` and `doc/cp_mmu_dcache_pipeline_plan.md` were
+written for. That is the next step, and it is the first one in this bundle that is a real
+pipeline change rather than a rearrangement.
