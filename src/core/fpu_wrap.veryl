@@ -923,7 +923,7 @@ pub module fpu_wrap #(
     let fr_nx_elig: logic = if fr_is_d ? (d1[62:52] <: 11'd1075) : (s1_val[30:23] <: 8'd150);
 
     var fr_inflight_q : logic           ;
-    var fr_cnt_q      : logic           ; // 0 = the add's stage 2, 1 = magic-sub + broadcast
+    var fr_cnt_q      : logic<2>        ; // 0 = add stage 2, 1 = sub stage 1, 2 = sub stage 2 + broadcast
     var fr_own_rob_q  : logic<ROB_IDX_W>;
     var fr_own_pdst_q : logic<PRF_W>    ;
     var fr_own_hasrd_q: logic           ;
@@ -940,7 +940,7 @@ pub module fpu_wrap #(
     // iq_fp frees the SELECTED entry when `i_issue_ack = valid && !fpu_busy`, so busy
     // must be high for the two pre-broadcast cycles and LOW on the broadcast cycle —
     // the entry is retired by the same ack that lets the result fire.
-    let fround_busy : logic = fr_presented && !(fr_own_match && fr_cnt_q);
+    let fround_busy : logic = fr_presented && !(fr_own_match && fr_cnt_q == 2'd2);
     // OWNER-EXACT broadcast, exactly like div/sqrt's done_for_me: iq_fp frees the
     // SELECTED entry, so the result must fire while its own op is the selected one —
     // firing to the right rob_idx at the wrong moment retires a DIFFERENT entry and
@@ -976,7 +976,7 @@ pub module fpu_wrap #(
                 fr_s1v_q = s1_val;
                 fr_rm_q  = fp_rm_resolved;
             }
-            if fr_inflight_q && !fr_cnt_q {
+            if fr_inflight_q && (fr_cnt_q == 2'd0) {
                 fr_s_sum_q = fr_s_sum;
                 fr_d_sum_q = fr_d_sum;
             }
@@ -990,7 +990,14 @@ pub module fpu_wrap #(
     let fr_d_sub_a: logic<64> = if PIPE == 1 ? fr_d_sum_q : fr_d_sum;
     let fr_d_sub_b: logic<64> = if PIPE == 1 ? {fr_d1_q[63], 11'd1075, 52'd0} : fr_d_magic;
     let fr_sub_rm : logic<3>  = if PIPE == 1 ? fr_rm_q : fp_rm_resolved;
-    inst u_fround_s_sub: fp_adder_s (
+    // P3 (stage-split bundle): the magic-subtract is the DEEPEST stage in the design
+    // — one whole combinational fp_adder, 13.450 ns / 154 levels, the floor the whole
+    // core sits on. It had no PIPE argument at all, so FROUND_PIPE split only the
+    // rint ADD and left this one flat. Giving it fp_adder's own midpoint register
+    // splits it 4.71 / 8.74 and makes FROUND a 4-cycle op.
+    inst u_fround_s_sub: fp_adder_s #(
+        PIPE: FROUND_PIPE,
+    ) (
         clk           ,
         rst           ,
         i_a     : fr_s_sub_a,
@@ -1000,7 +1007,9 @@ pub module fpu_wrap #(
         o_result: fr_s_int  ,
         o_fflags: _         ,
     );
-    inst u_fround_d_sub: fp_adder (
+    inst u_fround_d_sub: fp_adder #(
+        PIPE: FROUND_PIPE,
+    ) (
         clk           ,
         rst           ,
         i_a     : fr_d_sub_a,
@@ -2864,11 +2873,11 @@ pub module fpu_wrap #(
     // FSM restarts for that one — never inherits the old op's registers, which is how
     // op A's result used to land on op B's rob_idx and made every static rounding
     // mode read back the rne answer.
-    let fround_done : logic = fr_presented && fr_own_match && fr_cnt_q;
+    let fround_done : logic = fr_presented && fr_own_match && (fr_cnt_q == 2'd2);
     always_ff (clk, rst) {
         if_reset {
             fr_inflight_q  = 1'b0;
-            fr_cnt_q       = 1'b0;
+            fr_cnt_q       = 2'd0;
             fr_own_rob_q   = '0;
             fr_own_pdst_q  = '0;
             fr_own_hasrd_q = 1'b0;
@@ -2880,11 +2889,11 @@ pub module fpu_wrap #(
             fr_own_ffl_q   = 5'd0;
         } else if i_flush {
             fr_inflight_q = 1'b0;
-            fr_cnt_q      = 1'b0;
+            fr_cnt_q      = 2'd0;
         } else if fr_presented && !fr_own_match {
             // (re)start for the fround now presented
             fr_inflight_q  = 1'b1;
-            fr_cnt_q       = 1'b0;
+            fr_cnt_q       = 2'd0;
             fr_own_rob_q   = i_issue_rob_idx;
             fr_own_pdst_q  = i_issue_rd_pdst;
             fr_own_hasrd_q = i_issue_has_rd;
@@ -2895,21 +2904,24 @@ pub module fpu_wrap #(
             fr_own_isnx_q  = fr_is_nx;
         } else if !fr_presented {
             fr_inflight_q = 1'b0;
-            fr_cnt_q      = 1'b0;
+            fr_cnt_q      = 2'd0;
         } else {
-            if fr_cnt_q {
+            if fr_cnt_q == 2'd2 {
                 fr_inflight_q = 1'b0;
-                fr_cnt_q      = 1'b0;
+                fr_cnt_q      = 2'd0;
             } else {
-                fr_cnt_q = 1'b1;
-                // The rint add's o_fflags is valid THIS cycle (its own stage 2), so
-                // latch the fround's flags here, keyed off the latched operand class.
-                if fr_own_nv_q {
-                    fr_own_ffl_q = 5'b10000;
-                } else if fr_own_isnx_q && fr_own_nxe_q && (if fr_own_isd_q ? fr_d_sum_fflags[0] : fr_s_sum_fflags[0]) {
-                    fr_own_ffl_q = 5'b00001;
-                } else {
-                    fr_own_ffl_q = 5'd0;
+                fr_cnt_q = fr_cnt_q + 2'd1;
+                if fr_cnt_q == 2'd0 {
+                    // The rint add's o_fflags is valid THIS cycle (its own stage 2),
+                    // so latch the fround's flags here, keyed off the latched operand
+                    // class — the head may already be someone else's.
+                    if fr_own_nv_q {
+                        fr_own_ffl_q = 5'b10000;
+                    } else if fr_own_isnx_q && fr_own_nxe_q && (if fr_own_isd_q ? fr_d_sum_fflags[0] : fr_s_sum_fflags[0]) {
+                        fr_own_ffl_q = 5'b00001;
+                    } else {
+                        fr_own_ffl_q = 5'd0;
+                    }
                 }
             }
         }
