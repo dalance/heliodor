@@ -2634,9 +2634,11 @@ with. It stays at `0` on the IPC cost alone (+12.06 % coremark), which is a mate
 different position from "the mechanism that exists to cut CP lengthens it": once the
 forwarding wall is cut, EX_PIPE is back on the table as the next stage split.
 
-**Carried-forward items**: L1 ship declaration · N=2 SMP +2.49 % from the S3 buffer ·
-`i_cdb_fault_gstage`/`gpa` latent side-band · `FROUND_PIPE=1`'s real Zfa bug
-(`test_arch_zfa_s2`).
+**Carried-forward items** (refreshed 2026-09-10): `LOAD_SPEC=0` · Block R's
+result-returning atomic class · N=2 SMP +2.49 % from the S3 buffer ·
+`i_cdb_fault_gstage`/`gpa` latent side-band · where EX_PIPE=1's +12.06 % coremark actually
+goes. Block L1 shipped in `e5e3041` and the Zfa `FROUND_PIPE` bug was fixed in `a5e29de`;
+both were still listed here long after the fact.
 
 ## The forwarding walk, cut (2026-08-28) — 31.710 → 17.940 ns
 
