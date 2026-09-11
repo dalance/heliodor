@@ -1659,3 +1659,75 @@ skew, N2's live-vs-latched miss detection) — but it does not gate EX_PIPE.
 So the open structural item is **one bug, in a named region, on the keystone of the deep-pipeline
 campaign**, and `feedback_commit_to_structural_cp_change` is explicit about what to do with it:
 commit to the large change rather than iterating small ones.
+
+## 🛑 N2.2a は畳んだ(2026-09-11)— N=4 SMP Linux boot をライブロックさせていた
+
+`67d5b9a`(N2.2a: D-cache MSHR に `State::ALLOC` を追加)が **既定パスの N=4 SMP Linux
+boot を壊していた**。`MSHR_ALLOC = 0` で `fill_alloc_fire` を定数畳みし、ALLOC を到達不能に
+した。遷移経路はそこ 1 箇所だけなので、`m_alloc` → 0、`m_arr_free` → `state == IDLE`、
+`o_miss_valid` と `inv_fill_hit` の ALLOC アームも畳まれ、**step 全体が構造的に revert
+される**。`effc11c` が追加した census ポート `o_mshr_alloc` は残り、定数 0 を読む。
+
+### 見つかり方
+
+`FROUND_PIPE`/`VFP_EX_PIPE` の SHIP ゲートで N=4 boot を回したら、100M サイクル上限まで
+走って SBI shutdown に到達しなかった。**ノブは無罪**だった: ノブ ON/OFF で 4 ハートの
+PC・retire・trap・instret が**完全に一致**した。
+
+### ビセクト
+
+`src/` だけを候補コミットへ差し替える方式(この窓の `tb/` 変更は
+`#[allow(initial_assign)]` 注釈と `test_vmspre` 拡張だけでポート変更が無いので成立)。
+
+| コミット | N=4 boot |
+|---|---|
+| `47077d8` | 25,180,000 完走 ✅ |
+| `df5f82e`(N2.1) | 25,180,000 完走 ✅ |
+| **`67d5b9a`(N2.2a)** | **破損** 🛑 |
+| `f08a1bd` / HEAD | 破損 🛑 |
+
+健全側と破損側は **cy=15M まで hart0 の retire がビット一致**し、**cy=16M で分岐**する。
+そのおかげで 1 候補あたり 18M サイクル(約 25 分)で二値判定できた。破損の形は
+**1 ハートが cy≈17M で 1 箇所に入ったまま 82M サイクル出てこない**(割り込みは生きている)。
+
+### 機構
+
+原因は**緩めたガードではなく ALLOC の FSM 経路そのもの**だった。検証:
+
+- `pin_arm_hit` だけを `state == IDLE` に戻す → **変化なし**(AMO 予約が退避で消える説は否定)
+- `state == IDLE` → `m_arr_free` に緩めた **9 箇所を全部戻す** → **変化なし**
+
+残るのは `fill_alloc_fire`(バス grant 前にエントリを確保し、`i_ren` が落ちても要求を
+生き残らせる = N2.2a の中核動作)と、それに伴う `o_miss_valid` の拡張。
+
+### 対価
+
+`effc11c` の実測で **`State::ALLOC` はブート全体で 14 サイクルしか入らない**。畳んだ結果の
+実測差分も同じ桁だった:
+
+| ゲート | N2.2a あり | 畳んだ後 |
+|---|---|---|
+| **N=4 SMP boot** | **未到達(100M 上限)** | **25,180,000 pass** |
+| N=1 boot | `00ba9d70` / instret 10,421,567 | 同一 |
+| N=2 SMP boot | `00fa3e80` | `00fa8ca0`(+20,000 = +0.12 %) |
+| litmus N=4 | `003b0d30` | 同一 |
+| dhrystone / coremark | 235,808 / 394,555 | 235,804 / 394,546(−4 / −9) |
+| suite | 252/0 | 252/0 |
+
+⚠️ `67d5b9a` は「N=1 でビット一致」を根拠に通したが、**現在のツリーではベンチが −4 / −9
+サイクル動く**ので、その主張は少なくとも今は成り立っていない。**N=2 で +0.12 % を買い、
+N=4 boot を失っていた**のが正味の収支。
+
+### 再挑戦するなら
+
+N2.2b(2 エントリ目)で ALLOC が本当に必要になったときに、**N=4 boot をゲートに入れて**
+設計し直すこと。`MSHR_ALLOC` を 1 に戻すだけでは同じライブロックに戻る。
+
+### この件が露わにした運用の穴
+
+- **`67d5b9a` は「N=1 でビット一致」だけで通り、`f08a1bd`(Block N SHIP)の出荷ゲートにも
+  N=4 boot が入っていなかった。** 結果、退行は **18 コミット・約 3 週間**気づかれなかった。
+  ⇒ **メモリ系ブロックの SHIP ゲートには N=4 boot を必須にする。**
+- **DEAD arm は腐る。** 切り分けに使おうとした `ID_SPLIT=0` は、もはや単独では起動しない
+  (secondary ハートが上がらない)。「畳めること」だけでなく**畳んだ状態がまだ動くこと**まで
+  確かめないと、退行時に戻れない。
