@@ -2856,3 +2856,59 @@ register boundary between translation and the poison scan, which is what
 `doc/cp_commit_store_pretranslate_plan.md` and `doc/cp_mmu_dcache_pipeline_plan.md` were
 written for. That is the next step, and it is the first one in this bundle that is a real
 pipeline change rather than a rearrangement.
+
+## 🏁 Phase 14 完了(2026-10-10)
+
+### 当初の 3 本柱に対する到達点
+
+| 柱 | 状態 | 出荷物 |
+|---|---|---|
+| F: フロントエンド | ✅ 完成 | 予測器配列の 1R1W SRAM 化 + override(F1)、FTQ による decoupled fetch と descriptor 化(F2 `78529fe`、L0 は削除) |
+| L: LSQ | ✅ ほぼ完成 | store-drain の可視性契約と store の load ポート解放(L1 `e5e3041`/`c593d6d`)、一級 load queue(L3.3 `633a74f`)、Stage-B からの non-blocking MSHR(L4 `2319734`)、戻り値なし atomics の SQ 退避(R3 `e577328`/`92c9fe5`) |
+| S: スケジューラ | ◐ 半分 | select パイプライン + 投機的ウェイクアップ(S1 `686b27d`)は既定。`EX_PIPE=1` は CP 中立と測定済みだが coremark +12.06 % のため既定 0 |
+
+計画外の出荷: Block W(rename slot-1 の拡張 + L1I 32 KB、`85071a8`、IPC が初めて 1.0 超)、
+Block M(`P1_SERVED=1`、`aaea763`)、Block T(`LSR_B2B`、`6977008`)、Block N(I 側専用の
+mem_ctrl スロット、`f08a1bd`)。Block O は census で建てずに閉じ、N2.2a(MSHR ALLOC)は
+N=4 SMP boot のライブロックにより `95753c8` で畳んだ。
+
+### CP
+
+40.250 → **15.160 ns**。大半は改善ではなく測定器の修正(旧 synth はゲートの 52.5 % しか
+見ていなかった)。その上で直列リデュース欠陥を 4 例(vcpop / store フォワード走査 / ROB
+self-scan / LQ self-scan)潰し、`FROUND_PIPE=1` + `VFP_EX_PIPE=1` を既定化した(`7336e0d`、
+前提の FMA owner-exact 修正 `be117a7`)。残る壁は上の P2(commit + TLB + PMP が順序チェックと
+同一サイクル)で、局所の書き換えでは届かない。
+
+### 最終ベースライン(`7336e0d`)
+
+suite 253/0 · dhrystone 235,804 · coremark 394,546 · N=1 boot `00ba9d70` · N=2 SMP
+`00fa8ca0` · litmus N=4 `003b0d30` · N=4 SMP `01803760` · ゲスト Linux `01546c70` · synth 15.160 ns(`c358684` 時点)。
+
+### 教訓(フェーズ全体で効いたもの)
+
+- **N=1 のビット一致は N=4 について何も言わない。** `67d5b9a` は N=4 boot をライブロック
+  させたまま 18 コミット・約 3 週間通った。メモリ系の SHIP ゲートには N=4 SMP boot を必須とする。
+- **完了を後ろにずらす機構は、op の識別情報を全部発行時にラッチする。** ライブの head を
+  読む欠陥が 5 例(S2 の側帯 2 例、未踏のまま潜在する G-stage fault 側帯、Zfa FROUND、FMA)出た。
+- **DEAD arm は腐る。** 畳めることと、畳んだ状態がまだ動くことは別。
+- **ゲートに無いテストは守られていない。** Block T の SHIP(`6977008`、`LSR_B2B=1`)はゲスト Linux
+  ブートを deadlock させたまま約 2 か月通った。two-stage MMU は TLB を埋めず `TS_DONE` で結果を保持するが、
+  b2b の投機要求が同じ VA を出し続けると `TS_DONE` から抜けず、LSR の先行 load は MMU の IDLE を待って
+  完了できない。`c358684` で投機要求は `TS_DONE` を保持しないよう修正。H 拡張に触れない変更でも、
+  共有資源(dmem MMU)に投機要求を足すなら V=1 経路を通すこと。
+
+### Phase 15 への持ち越し
+
+Phase 15 はインクリメンタル改善をやめ、コアパイプライン(フロントエンド・rename・
+スケジューラ・ROB・LSQ・実行配線)を**パラメータ化・モジュラーに新規設計**する。周辺
+(キャッシュ・コヒーレンス・MMU・CSR・FPU・VU・デコーダ)と検証資産は再利用し、現コアは
+凍結して retire ストリームの黄金モデルとする。以下は Phase 15 では個別タスクではなく
+**設計の入力**になる:
+
+- P2 の段分割(翻訳と順序チェックの間のレジスタ境界)と `EX_PIPE` の IPC コストの出所
+  → 最初から段の深さを前提にした設計で扱う
+- `fp_adder` の床 13.450 ns、スカラ `FMA_PIPE3`(修正済み・既定 0)
+- `LOAD_SPEC=0`、Block R の戻り値ありの atomics クラス
+- S3 バッファ由来の N=2 SMP +2.49 %
+- `EX_PIPE=1` 時の `i_cdb_fault_gstage`/`gpa` 潜在側帯(既定 `EX_PIPE=0` では無害)

@@ -134,6 +134,12 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      from P9.1 (2026-06-12) until 2026-08-05: the cycle count was refreshed over
      the intervening perf work but the runtime was not, so it understated the gate
      by ~7×. Budget over an hour for it, and re-measure if you touch this line.
+  5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
+     hypervisor (~22.3M cycles, ~5 min). The only gate that runs the two-stage (V=1)
+     MMU under load; the native boots never leave single-stage translation, so a
+     change to the shared dmem MMU or the load path can pass steps 1-4 and still
+     deadlock here. Needs `test/hv/hv_dram.hex` (gitignored; see the Verilator
+     table for its `make -C test/hv` line).
 - **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
   (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`, `test_coremark`)
   that print cycles + retired instructions (IPC = instret / cycles, frozen at

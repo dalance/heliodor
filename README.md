@@ -31,6 +31,8 @@ own type-1 hypervisor. See **Verification**.
   - Pipeline: fetch → decode + rename → issue → execute → commit, 2-wide at
     every stage (fetch bundle, dual rename, dual issue, dual retire of simple
     ops)
+  - Decoupled front end: the predictor runs ahead of fetch through an 8-entry
+    fetch target queue whose entries are fetch-block descriptors
   - Register renaming: RAT (speculative + architectural) + free list
   - Physical register files: 64-entry integer (`prf_int`) + 64-entry FP (`prf_fp`)
   - 32-entry Reorder Buffer driving in-order retire; precise exceptions;
@@ -38,13 +40,17 @@ own type-1 hypervisor. See **Verification**.
     ROB/IQ squash for branch mispredicts (commit-time redirect as backstop)
   - Branch prediction: 4096-entry BTB, 8192-entry gshare BHT (13-bit GHR),
     TAGE-lite direction predictor, 512-entry indirect-target BTB
-    (path-history-indexed), return-address stack
+    (path-history-indexed), return-address stack; the predictor arrays are
+    clocked 1R1W SRAM with a later-stage override
   - Issue queues: 8-entry integer (oldest-ready, 2-issue: pipe-0 full / pipe-1
-    ALU-class + bare-mode hit-only loads) + FP queue
+    ALU-class + bare-mode hit-only loads) + FP queue, with a pipelined select and
+    speculative wakeup
   - Memory pipeline: single AGU/LSU on pipe-0 with memory-dependence
-    speculation (load-violation detection + commit-time replay), speculative
-    loads under Sv39, store-to-load forwarding from BOTH in-flight (ROB) and
-    committed (store-buffer) stores
+    speculation, speculative loads under Sv39, store-to-load forwarding from BOTH
+    in-flight (ROB) and committed (store-buffer) stores
+  - Load/store queues: an 8-entry load queue with physical-address-exact records
+    detects ordering violations (replayed at commit); an 8-entry store queue, which
+    atomics without a return value also retire into
   - Committed-store buffer: stores retire without waiting for the bus; 4 x 64B
     line entries with byte-granular write-combining, drained as one line-wide
     bus transaction each
@@ -97,7 +103,7 @@ own type-1 hypervisor. See **Verification**.
   and **Sstc-in-VS** (`vstimecmp`) guest timers; `hstatus.VTVM`/`VTSR` guest-op
   interception and VS-mode CSR isolation; `HFENCE.VVMA`/`GVMA`
 - **Caches** (`src/cache/`)
-  - L1 I-cache: 16 KB, 4-way, 64 B line, tree-PLRU, non-blocking
+  - L1 I-cache: 32 KB, 4-way, 64 B line, tree-PLRU, non-blocking
     (hit-under-fill, streaming), single-cycle assembly of instructions
     straddling a line boundary; fills coherently through the L2 (recall-on-owned)
     so self-modified code is seen after a FENCE.I with no flush sweep. The demand
@@ -117,7 +123,8 @@ own type-1 hypervisor. See **Verification**.
   - Split-transaction DRAM reads (`mem_ctrl`): a line fill is a tagged
     per-hart transaction with modeled latency — L2 hit ≈ 4 cycles to first
     beat, L2 miss ≈ 30 (DRAM wait + 8-beat gather), one outstanding line read
-    per hart progressing independently; writes stay 1-cycle posted
+    per hart per side (instruction and data have separate slots) progressing
+    independently; writes stay 1-cycle posted
     write-through and contend with gathers for the DRAM port
   - **Realistic SRAM (Phase 13):** every cache array — D$ / icache / L2 tags and
     data — is a real ASIC-SRAM port shape (**1R1W** via read-port replication for
@@ -143,13 +150,13 @@ own type-1 hypervisor. See **Verification**.
 
 | Suite                                                                       | Result |
 |-----------------------------------------------------------------------------|--------|
-| Default `veryl test` (unit + inline arch suites + Phase-10/11/12 directed tests + N=2 litmus, on the OoO core) | 250 passed, 0 failed |
+| Default `veryl test` (unit + inline arch suites + Phase-10/11/12 directed tests + N=2 litmus, on the OoO core) | 253 passed, 0 failed |
 | **RVA23 scalar compliance** — ACT4 (`riscv-arch-test`, Sail-signed golden reference), run via `make -C test/act` | pass: integer / atomic (+Zacas/Zabha) / FP / Zb*/Zc* / Zfa / Zfhmin / Zicbo* / PMP (Smpmp/SvPMP) / Sv* / Exceptions — see `test/act/README.md` |
-| Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~10.2 / 13.9 / 20.0 / 26.9M cycles) |
-| Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~18.6 / 25.5 / 33.6M cycles) |
-| Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~16.8 / 19.2 / 23.6M cycles) |
-| Linux **7.1 + Vector** boot (`test_soc_71v_linux_boot`, V-aware kernel)      | pass (~17.8M cycles, 1-hart) |
-| **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (~21.4M cycles) |
+| Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~12.2 / 16.4 / 25.2M cycles; 8-hart not re-run since Phase 12) |
+| Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~20.4 / 26.9M cycles; 4-hart not re-run since Phase 12) |
+| Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~17.1 / 20.0M cycles; 4-hart not re-run since Phase 12) |
+| Linux **7.1 + Vector** boot (`test_soc_71v_linux_boot`, V-aware kernel)      | pass (~18.6M cycles, 1-hart) |
+| **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (~22.3M cycles) |
 
 The inline arch suites are the official `riscv-tests` rv64ui / um / ua / mi / si
 (integer + privileged), rv64uf / ud (FP), and the **vector (RVV)** suites,
@@ -175,14 +182,14 @@ interrupts). CoreMark is the upstream EEMBC source (vendored under
 
 | Benchmark  | Cycles  | Instret | IPC   |
 |------------|---------|---------|-------|
-| CoreMark   | 276,893 | 374,357 | 1.352 |
-| Dhrystone  | 210,037 | 273,241 | 1.301 |
-| memcpy     |  80,099 | 102,051 | 1.274 |
-| multiply   |  20,612 |  27,397 | 1.329 |
-| median     |   6,790 |   6,875 | 1.013 |
+| CoreMark   | 394,546 | 374,357 | 0.949 |
+| Dhrystone  | 235,804 | 264,834 | 1.123 |
+| memcpy     | 116,672 | 102,051 | 0.875 |
+| multiply   |  19,230 |  27,397 | 1.425 |
+| median     |  10,569 |   6,875 | 0.650 |
 
 CoreMark score: at ITERATIONS=1 the frequency-independent figure
-CoreMark/MHz = iterations × 10⁶ / cycles ≈ **3.61**. Because the harness times the
+CoreMark/MHz = iterations × 10⁶ / cycles ≈ **2.53**. Because the harness times the
 whole program and runs a single iteration, the one-time setup is not amortized, so
 this is a conservative lower bound on the steady-state (multi-iteration)
 CoreMark/MHz rather than an official score.
@@ -239,7 +246,7 @@ steps, Verilator cross-check).
 ## Development Phases
 
 Development history — the **Architecture** section above describes the design
-as of Phase 13:
+as of Phase 14:
 
 | Phase | Scope                                    | Status       |
 |-------|------------------------------------------|--------------|
@@ -256,6 +263,7 @@ as of Phase 13:
 | 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation (VMID/VS-ASID-tagged TLB), HLV/HLVX/HSV, the guest-page-fault trio, virtual-interrupt delivery, htimedelta + Sstc-in-VS guest timers, and VS-mode CSR isolation. Validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (Veryl sim + Verilator) | complete |
 | 12    | **Vector (V) extension (RVV 1.0)** — a decoupled in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL; full arithmetic + masking + unit-stride / strided / indexed / segment / fault-only-first load-store), exercised by a V-enabled 7.1 kernel and inline **RVV arch suites** — plus **RVA23 architectural-compliance** verification against the official ACT4 (`riscv-arch-test`, Sail golden reference). The compliance pass closed scalar atomic gaps (**Zabha**, full **Zacas** incl. `amocas.q`), added **PMP** (Smpmp / SvPMP) enforcement, and fixed real FPU bugs + upstreamed several **Veryl** simulator/analyzer fixes. See `test/act/README.md` | complete |
 | 13    | **Realistic-SRAM migration + near-term deep-pipeline CP** (tapeout realism): every cache RAM (D$ / icache / L2 tags + data) migrated to real ASIC-SRAM port shapes — **1R1W** (tag read-port replication, data byte-write-enable write-collapse) with **registered-address (clocked) reads** for the three big data arrays (a `--dump-area` sweep confirms all migratable blocks 1R1W, core + SMP-SoC). The icache clocked read shipped **default-on** behind a **fetch-directed prefetcher** (FTB) at **~+8 % IPC**, cross-checked byte-identical on Verilator; near-term **~12 ns CP** met. See `doc/sram_inventory.md`, `doc/cp_icache_fetch_decouple_plan.md` | complete |
+| 14    | **Front-end + LSQ structural completion** (deep-OoO structures instead of single-cycle fusions): predictor arrays to clocked 1R1W SRAM with a later-stage override, a decoupled front end through a descriptor fetch target queue, a pipelined scheduler (select + speculative wakeup), a store-drain visibility contract that frees the load port, a first-class physical-address-exact load queue, non-blocking misses from the second load stage, atomics without a return value retired into the store queue, wider rename slot-1 use + a 32 KB L1I (IPC above 1.0), and separate instruction / data read slots in the DRAM controller. Correcting the synthesis flow (it had been timing half the netlist) and cutting four serial-reduce chains brought the measured critical path to **15.16 ns**. Execute-stage deepening (`EX_PIPE`) is built and CP-neutral but stays off for its IPC cost. See `doc/phase14_frontend_deep_ooo_plan.md` | complete |
 
 ## References
 
