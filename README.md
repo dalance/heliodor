@@ -152,9 +152,9 @@ own type-1 hypervisor. See **Verification**.
 |-----------------------------------------------------------------------------|--------|
 | Default `veryl test` (unit + inline arch suites + Phase-10/11/12 directed tests + N=2 litmus, on the OoO core) | 253 passed, 0 failed |
 | **RVA23 scalar compliance** — ACT4 (`riscv-arch-test`, Sail-signed golden reference), run via `make -C test/act` | pass: integer / atomic (+Zacas/Zabha) / FP / Zb*/Zc* / Zfa / Zfhmin / Zicbo* / PMP (Smpmp/SvPMP) / Sv* / Exceptions — see `test/act/README.md` |
-| Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~12.2 / 16.4 / 25.2M cycles; 8-hart not re-run since Phase 12) |
-| Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~20.4 / 26.9M cycles; 4-hart not re-run since Phase 12) |
-| Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~17.1 / 20.0M cycles; 4-hart not re-run since Phase 12) |
+| Linux **5.15** SMP boot, 1 / 2 / 4 / 8-hart                                 | pass (~12.2 / 16.4 / 25.2 / 36.6M cycles) |
+| Linux **6.6 LTS** SMP boot (RVA23 device tree), 1 / 2 / 4-hart              | pass (~20.4 / 26.9 / 37.0M cycles) |
+| Linux **7.1** SMP boot (RVA23 + userspace FP), 1 / 2 / 4-hart               | pass (~17.1 / 20.0 / 25.8M cycles) |
 | Linux **7.1 + Vector** boot (`test_soc_71v_linux_boot`, V-aware kernel)      | pass (~18.6M cycles, 1-hart) |
 | **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (~22.3M cycles) |
 
