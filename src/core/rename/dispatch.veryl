@@ -1,0 +1,378 @@
+// dispatch: per-cycle acceptance (take) from registered credits, and the
+// allocation writes of the rename/dispatch stage rn_ into rob, iq, lq, sq,
+// the free lists and busy_table.
+//
+// Ports (timing contract):
+//   i_valid/i_op   : rq output lanes (registered), contiguous from lane 0
+//   i_ren          : rename mapping of the same lanes (combinational)
+//   i_*_free, i_rob_tag, i_lq_tag, i_sq_tag, i_lq_bar, i_fl_*_head :
+//                    owner credits and allocation tables, registered state
+//                    only; *_tag[k] / *_head[k] is the ring position after k
+//                    allocations
+//   i_bt_rdy[3l+s] : busy_table prf_ready of source s of lane l (read with
+//                    i_ren.ps*); i_wake_v/i_wake_p : this cycle's wake lanes
+//   i_kill, i_walk_busy : take is 0 in a kill cycle and while rob walks
+//   o_take         : lanes accepted this cycle, to rq.i_take and rename
+//   o_pop_n_int/fp : free_list pops; o_bar_n : ld_barrier ops to lq
+//   o_rob_valid/o_rob : rob allocation, lanes 0..o_take-1
+//   o_iq_valid/o_iq   : per IQ q, slots q*RENAME_W + i, the i-th taken op
+//                       bound for q (compacted, program order)
+//   o_lq_*/o_sq_*     : compacted in program order; the queue gives slot i
+//                       its o_alloc_tag[i]
+//   o_bt_clr_*     : destinations whose prf_ready clears on this edge
+//   o_perf         : registered event wires; o_chk : sticky flags
+//   All outputs are combinational from the inputs; every write happens on
+//   the edge of this cycle.
+// Owns:
+//   - accepted lanes are contiguous from lane 0; the rest stay in rq
+//   - no owner is asked for more allocations than its registered credit
+//   - nothing is allocated in a kill cycle or during a walk
+//   - an op with fu NONE goes to rob only, allocated done
+// Rationale:
+//   - take is a prefix of lanes whose cumulative demand fits every credit;
+//     the IQ of an op follows from its FU kind alone (one IQ per kind), so
+//     take does not wait for port selection inside the IQ
+//   - tags come from the owners' tables indexed by group prefix counts;
+//     dispatch never computes a next tag and never sees a ring size
+//   - a source written by an older lane of the group starts not ready: its
+//     busy bit still describes the register's previous owner
+module dispatch::<CFG: core_cfg> (
+    clk          : input  clock                                                                                ,
+    rst          : input  reset                                                                                ,
+    i_valid      : input  logic                                                     [CFG::RENAME_W]            ,
+    i_op         : input  core_types::<CFG>::DecOp                                  [CFG::RENAME_W]            ,
+    i_ren        : input  core_types::<CFG>::RenOut                                 [CFG::RENAME_W]            ,
+    i_kill       : input  core_types::<CFG>::Kill                                                              ,
+    i_walk_busy  : input  logic                                                                                ,
+    i_rob_free   : input  logic                      <core_types::<CFG>::ROB_CNT_W>                            ,
+    i_rob_tag    : input  core_types::<CFG>::RobTag                                 [CFG::RENAME_W]            ,
+    i_iq_free    : input  logic                      <core_types::<CFG>::IQ_CNT_W>  [CFG::N_IQ]                ,
+    i_lq_free    : input  logic                      <core_types::<CFG>::LQ_CNT_W>                             ,
+    i_lq_tag     : input  core_types::<CFG>::LqTag                                  [CFG::RENAME_W + 1]        ,
+    i_lq_bar     : input  core_types::<CFG>::BarSeq                                 [CFG::RENAME_W + 1]        ,
+    i_sq_free    : input  logic                      <core_types::<CFG>::SQ_CNT_W>                             ,
+    i_sq_tag     : input  core_types::<CFG>::SqTag                                  [CFG::RENAME_W + 1]        ,
+    i_fl_int_free: input  logic                      <core_types::<CFG>::FL_CNT_W>                             ,
+    i_fl_int_head: input  core_types::<CFG>::FlPtr                                  [CFG::RENAME_W + 1]        ,
+    i_fl_fp_free : input  logic                      <core_types::<CFG>::FL_CNT_W>                             ,
+    i_fl_fp_head : input  core_types::<CFG>::FlPtr                                  [CFG::RENAME_W + 1]        ,
+    i_bt_rdy     : input  logic                                                     [3 * CFG::RENAME_W]        ,
+    i_wake_v     : input  logic                                                     [core_types::<CFG>::WB_N]  ,
+    i_wake_p     : input  core_types::<CFG>::PReg                                   [core_types::<CFG>::WB_N]  ,
+    o_take       : output logic                      <core_types::<CFG>::TAKE_W>                               ,
+    o_pop_n_int  : output logic                      <core_types::<CFG>::TAKE_W>                               ,
+    o_pop_n_fp   : output logic                      <core_types::<CFG>::TAKE_W>                               ,
+    o_bar_n      : output logic                      <core_types::<CFG>::TAKE_W>                               ,
+    o_rob_valid  : output logic                                                     [CFG::RENAME_W]            ,
+    o_rob        : output core_types::<CFG>::RobAlloc                               [CFG::RENAME_W]            ,
+    o_iq_valid   : output logic                                                     [CFG::N_IQ * CFG::RENAME_W],
+    o_iq         : output core_types::<CFG>::IqAlloc                                [CFG::N_IQ * CFG::RENAME_W],
+    o_lq_valid   : output logic                                                     [CFG::RENAME_W]            ,
+    o_lq         : output core_types::<CFG>::LqAlloc                                [CFG::RENAME_W]            ,
+    o_sq_valid   : output logic                                                     [CFG::RENAME_W]            ,
+    o_sq         : output core_types::<CFG>::SqAlloc                                [CFG::RENAME_W]            ,
+    o_bt_clr_v   : output logic                                                     [CFG::RENAME_W]            ,
+    o_bt_clr_p   : output core_types::<CFG>::PReg                                   [CFG::RENAME_W]            ,
+    o_perf       : output core_types::<CFG>::DispPerf                                                          ,
+    o_chk        : output logic                      <3>                                                       ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const W   : u32 = CFG::RENAME_W;
+    const NQ  : u32 = CFG::N_IQ;
+    const CW  : u32 = TAKE_W;
+    const LW  : u32 = tag_pkg::idx_w(W);
+    const NIQW: u32 = tag_pkg::idx_w(NQ + 1);
+
+    // ---- Demand and group prefix counts (inclusive) ----
+
+    var vm   : logic<W>       ;
+    var d_lq : logic<W>       ;
+    var d_sq : logic<W>       ;
+    var d_int: logic<W>       ;
+    var d_fp : logic<W>       ;
+    var d_bar: logic<W>       ;
+    var iq_of: logic<NIQW> [W];
+    always_comb {
+        for l in 0..W {
+            vm[l]    = i_valid[l];
+            d_lq[l]  = i_valid[l] && i_op[l].cls.budget.lq;
+            d_sq[l]  = i_valid[l] && i_op[l].cls.budget.sq;
+            d_int[l] = i_valid[l] && i_op[l].cls.budget.int_rd;
+            d_fp[l]  = i_valid[l] && i_op[l].cls.budget.fp_rd;
+            d_bar[l] = i_valid[l] && i_op[l].cls.ld_barrier;
+            iq_of[l] = fu_iq(i_op[l].cls.fu) as NIQW;
+        }
+    }
+
+    var p_rob: logic<CW> [W];
+    var p_lq : logic<CW> [W];
+    var p_sq : logic<CW> [W];
+    var p_int: logic<CW> [W];
+    var p_fp : logic<CW> [W];
+    var p_bar: logic<CW> [W];
+    always_comb {
+        tree_prefix_count::<W, CW>(vm, p_rob);
+        tree_prefix_count::<W, CW>(d_lq, p_lq);
+        tree_prefix_count::<W, CW>(d_sq, p_sq);
+        tree_prefix_count::<W, CW>(d_int, p_int);
+        tree_prefix_count::<W, CW>(d_fp, p_fp);
+        tree_prefix_count::<W, CW>(d_bar, p_bar);
+    }
+
+    var d_iq: logic<W>  [NQ]    ;
+    var p_iq: logic<CW> [NQ * W];
+    always_comb {
+        for q in 0..NQ {
+            for l in 0..W {
+                d_iq[q][l] = i_valid[l] && iq_of[l] == q;
+            }
+        }
+    }
+    for q in 0..NQ :g_piq {
+        var pc: logic<CW> [W];
+        always_comb {
+            tree_prefix_count::<W, CW>(d_iq[q], pc);
+        }
+        for l in 0..W :g_l {
+            assign p_iq[q * W + l] = pc[l];
+        }
+    }
+
+    // ---- take ----
+
+    var fit_iq: logic<NQ> [W];
+    var c_rob : logic<W>     ;
+    var c_lq  : logic<W>     ;
+    var c_sq  : logic<W>     ;
+    var c_int : logic<W>     ;
+    var c_fp  : logic<W>     ;
+    var c_iq  : logic<W>     ;
+    var ok    : logic<W>     ;
+    always_comb {
+        for l in 0..W {
+            for q in 0..NQ {
+                fit_iq[l][q] = (p_iq[q * W + l] as IQ_CNT_W) <= i_iq_free[q];
+            }
+            c_rob[l] = (p_rob[l] as ROB_CNT_W) >: i_rob_free;
+            c_lq[l]  = (p_lq[l] as LQ_CNT_W) >: i_lq_free;
+            c_sq[l]  = (p_sq[l] as SQ_CNT_W) >: i_sq_free;
+            c_int[l] = (p_int[l] as FL_CNT_W) >: i_fl_int_free;
+            c_fp[l]  = (p_fp[l] as FL_CNT_W) >: i_fl_fp_free;
+            c_iq[l]  = !(&fit_iq[l]);
+            ok[l]    = i_valid[l] && !(c_rob[l] || c_lq[l] || c_sq[l] || c_int[l] || c_fp[l] || c_iq[l]);
+        }
+    }
+
+    let stall: logic     = i_kill.valid || i_walk_busy;
+    let okp  : logic<W>  = tree_prefix_and::<W>(ok);
+    let take : logic<CW> = if stall ? 0 : tree_popcount::<W, CW>(okp);
+    let tk   : logic<W>  = if stall ? 0 : okp;
+
+    assign o_take = take;
+
+    // Counts taken: the prefix counts at the last taken lane.
+    function at_take (
+        p: input logic<CW> [W],
+        t: input logic<CW>    ,
+    ) -> logic<CW> {
+        return if t == 0 ? 0 : p[t - 1];
+    }
+    assign o_pop_n_int = at_take(p_int, take);
+    assign o_pop_n_fp  = at_take(p_fp, take);
+    assign o_bar_n     = at_take(p_bar, take);
+
+    // ---- Per-lane allocation records ----
+
+    var rob_l: RobAlloc [W];
+    var iq_l : IqAlloc  [W];
+    var lq_l : LqAlloc  [W];
+    var sq_l : SqAlloc  [W];
+    always_comb {
+        for l in 0..W {
+            let op : DecOp  = i_op[l];
+            let rn : RenOut = i_ren[l];
+            let lqt: LqTag  = if d_lq[l] ? i_lq_tag[p_lq[l] - 1] : 0 as LqTag;
+            let sqt: SqTag  = if d_sq[l] ? i_sq_tag[p_sq[l] - 1] : 0 as SqTag;
+
+            var ex       : ExTag;
+            ex.rob    = i_rob_tag[l];
+            ex.pdst   = rn.pdst;
+            ex.has_rd = op.dst.has_rd;
+
+            var sn        : DispSnap;
+            sn.lq_tail = i_lq_tag[p_lq[l]];
+            sn.sq_tail = i_sq_tag[p_sq[l]];
+            sn.fl_int  = i_fl_int_head[p_int[l]];
+            sn.fl_fp   = i_fl_fp_head[p_fp[l]];
+            sn.bar_seq = i_lq_bar[p_bar[l]];
+
+            rob_l[l].done     = op.cls.fu == FuKind::NONE;
+            rob_l[l].fu       = op.cls.fu;
+            rob_l[l].drain    = op.cls.drain;
+            rob_l[l].flush    = op.cls.flush;
+            rob_l[l].alone    = op.cls.alone;
+            rob_l[l].csr_wr   = op.cls.csr_wr;
+            rob_l[l].effect   = op.cls.effect;
+            rob_l[l].is_rvc   = op.is_rvc;
+            rob_l[l].has_rd   = op.dst.has_rd;
+            rob_l[l].cls      = op.dst.rcls;
+            rob_l[l].rd_arch  = op.dst.arch;
+            rob_l[l].pdst     = rn.pdst.idx;
+            rob_l[l].old_pdst = rn.old_pdst;
+            rob_l[l].lq       = lqt;
+            rob_l[l].lq_v     = d_lq[l];
+            rob_l[l].sq       = sqt;
+            rob_l[l].sq_v     = d_sq[l];
+            rob_l[l].ftq      = op.ftq;
+            rob_l[l].foff     = op.foff;
+            rob_l[l].insn     = op.insn;
+            rob_l[l].exc      = op.exc;
+            rob_l[l].snap     = sn;
+
+            // Ready at allocation: absent, or not produced in this group and
+            // either ready in busy_table or woken this cycle.
+            var wk   : logic<3>    ;
+            var pr   : PReg     [3];
+            pr[0] = rn.ps1;
+            pr[1] = rn.ps2;
+            pr[2] = rn.ps3;
+            for s in 0..3 {
+                var m: logic<WB_N>;
+                for w in 0..WB_N {
+                    m[w] = i_wake_v[w] && i_wake_p[w] == pr[s];
+                }
+                wk[s] = i_bt_rdy[3 * l + s] || |m;
+            }
+
+            iq_l[l].tag        = ex;
+            iq_l[l].fu         = op.cls.fu;
+            iq_l[l].uop        = op.uop;
+            iq_l[l].s1.used    = op.rs1.used;
+            iq_l[l].s1.pr      = rn.ps1;
+            iq_l[l].s1.rdy     = !op.rs1.used || (!rn.grp[0] && wk[0]);
+            iq_l[l].s2.used    = op.rs2.used;
+            iq_l[l].s2.pr      = rn.ps2;
+            iq_l[l].s2.rdy     = !op.rs2.used || (!rn.grp[1] && wk[1]);
+            iq_l[l].s3.used    = op.rs3.used;
+            iq_l[l].s3.pr      = rn.ps3;
+            iq_l[l].s3.rdy     = !op.rs3.used || (!rn.grp[2] && wk[2]);
+            iq_l[l].nonspec    = op.cls.nonspec;
+            iq_l[l].imm        = op.imm;
+            iq_l[l].rm         = op.rm;
+            iq_l[l].ftq        = op.ftq;
+            iq_l[l].foff       = op.foff;
+            iq_l[l].pred_taken = op.pred_taken;
+            iq_l[l].lq         = lqt;
+            iq_l[l].lq_v       = d_lq[l];
+            iq_l[l].sq         = sqt;
+            iq_l[l].sq_v       = d_sq[l];
+            iq_l[l].bar_w      = i_lq_bar[p_bar[l] - (d_bar[l] as CW)];
+
+            lq_l[l].ex     = ex;
+            lq_l[l].fu     = op.cls.fu;
+            lq_l[l].uop    = op.uop;
+            lq_l[l].sq_lim = i_sq_tag[p_sq[l]];
+
+            sq_l[l].rob    = i_rob_tag[l];
+            sq_l[l].fu     = op.cls.fu;
+            sq_l[l].uop    = op.uop;
+            sq_l[l].lq_lim = i_lq_tag[p_lq[l]];
+
+            o_rob_valid[l] = tk[l];
+            o_rob[l]       = rob_l[l];
+            o_bt_clr_v[l]  = tk[l] && op.dst.has_rd;
+            o_bt_clr_p[l]  = rn.pdst;
+        }
+    }
+
+    // ---- Compaction: slot i of a queue takes its i-th taken lane ----
+
+    function slot_sel (
+        d: input logic<W>     ,
+        p: input logic<CW> [W],
+        t: input logic<W>     ,
+        i: input logic<CW>    ,
+    ) -> logic<W> {
+        var s: logic<W>;
+        for l in 0..W {
+            s[l] = d[l] && t[l] && p[l] == i + 1;
+        }
+        return s;
+    }
+
+    for i in 0..W :g_slot {
+        let s_lq: logic<W>  = slot_sel(d_lq, p_lq, tk, i as CW);
+        let s_sq: logic<W>  = slot_sel(d_sq, p_sq, tk, i as CW);
+        let x_lq: logic<LW> = tree_onehot_enc::<W, LW>(s_lq);
+        let x_sq: logic<LW> = tree_onehot_enc::<W, LW>(s_sq);
+        assign o_lq_valid[i] = |s_lq;
+        assign o_lq[i]       = lq_l[x_lq];
+        assign o_sq_valid[i] = |s_sq;
+        assign o_sq[i]       = sq_l[x_sq];
+    }
+
+    for q in 0..NQ :g_iqs {
+        var pc: logic<CW> [W];
+        always_comb {
+            for l in 0..W {
+                pc[l] = p_iq[q * W + l];
+            }
+        }
+        for i in 0..W :g_slot {
+            let s: logic<W>  = slot_sel(d_iq[q], pc, tk, i as CW);
+            let x: logic<LW> = tree_onehot_enc::<W, LW>(s);
+            assign o_iq_valid[q * W + i] = |s;
+            assign o_iq[q * W + i]       = iq_l[x];
+        }
+    }
+
+    // ---- Events ----
+
+    let first : logic   <W> = tree_first::<W>(vm & ~ok);
+    var perf_q: DispPerf   ;
+    always_ff {
+        if_reset {
+            perf_q = 0 as DispPerf;
+        } else {
+            perf_q.cut_rob    = !stall && |(first & c_rob);
+            perf_q.cut_iq     = !stall && |(first & c_iq);
+            perf_q.cut_lq     = !stall && |(first & c_lq);
+            perf_q.cut_sq     = !stall && |(first & c_sq);
+            perf_q.cut_int    = !stall && |(first & c_int);
+            perf_q.cut_fp     = !stall && |(first & c_fp);
+            perf_q.kill_stall = i_kill.valid && i_valid[0];
+            perf_q.walk_stall = !i_kill.valid && i_walk_busy && i_valid[0];
+        }
+    }
+    assign o_perf = perf_q;
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_dispatch::<CFG> (
+            clk                       ,
+            rst                       ,
+            i_stall      : stall      ,
+            i_rob_valid  : o_rob_valid,
+            i_rob        : o_rob      ,
+            i_iq_valid   : o_iq_valid ,
+            i_iq         : o_iq       ,
+            i_lq_valid   : o_lq_valid ,
+            i_sq_valid   : o_sq_valid ,
+            i_rob_free                ,
+            i_iq_free                 ,
+            i_lq_free                 ,
+            i_sq_free                 ,
+            i_pop_n_int  : o_pop_n_int,
+            i_pop_n_fp   : o_pop_n_fp ,
+            i_fl_int_free             ,
+            i_fl_fp_free              ,
+            o_chk                     ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    {
+        assign o_chk = 3'b0;
+    }
+}
