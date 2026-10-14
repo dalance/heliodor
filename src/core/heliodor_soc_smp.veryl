@@ -1,10 +1,12 @@
-// Phase 7 v4 M9.2.b: N-hart SMP SoC wrapping heliodor_core.
+// The heliodor SoC, for N_HARTS >= 1.
 //
-// Mirrors the single-hart heliodor_soc (which stays untouched) but scales to
-// N_HARTS cores sharing one memory_bus DRAM arbiter, one L2, one CLINT (N_HARTS
-// contexts) and one UART. The v4 core has NO MMIO select ports (it emits DRAM
-// and MMIO mixed on its flat o_dmem); the SoC address-decodes each core's o_dmem
-// into DRAM (paddr[31]) / CLINT (paddr[31:24]==0x02) / UART (paddr[31:28]==0x1).
+// N_HARTS cores share one memory_bus DRAM arbiter, one L2, one CLINT (N_HARTS
+// contexts), one PLIC and one UART. N_HARTS=1 is the single-hart platform; the
+// coherence wiring (precise invalidates, SMP_COHERENT) stays live there too. The
+// v4 core has NO MMIO select ports (it emits DRAM and MMIO mixed on its flat
+// o_dmem); the SoC address-decodes each core's o_dmem into DRAM (paddr[31]) /
+// CLINT (paddr[31:24]==0x02) / UART (paddr[31:28]==0x1) / PLIC
+// (paddr[31:24]==0x0c).
 //
 // MMIO needs NO separate arbiter: the dcache grant-gates o_dmem_wen/ren, so only
 // the core that won the memory_bus DRAM arbiter this cycle asserts c_dmem_wen[h]
@@ -16,8 +18,8 @@
 // is TX-only — so the dcache never caches a stale MMIO read.)
 //
 // Per-hart instruction fetch (o_imem_*) and instruction PTW (o_iptw_*) stay
-// per-hart and are served by the tb. Coherence: the bus broadcasts every granted
-// DRAM write to all cores' i_dcache_inv (filtered to skip the writer); AMO
+// per-hart and are served by the tb. Coherence: mem_ctrl drives precise per-hart
+// invalidates from the L2 directory (see core_inv_valid below).
 pub module heliodor_soc_smp #(
     param N_HARTS : u32 = 2            ,
     param RESET_PC: u64 = 64'h8000_0000,
@@ -49,11 +51,18 @@ pub module heliodor_soc_smp #(
     o_uart_tx_data : output logic<8>,
     // Per-hart architectural x3 (boot pass = hart0 x3 == 0xAA) + retire PC + a
     // retire-valid pulse (for forward-progress / spin-vs-deadlock diagnosis).
-    // L3 census: per-hart memory-order counters (see heliodor_soc).
+    // L3 census: per-hart memory-order counters. o_dbg_lw_cause is hart-major:
+    // hart h bucket c = [h*128+c].
     o_dbg_load_viol_cnt : output logic<32> [N_HARTS],
     o_dbg_load_replay_cnt: output logic<32> [N_HARTS],
     o_dbg_inv_viol_cnt  : output logic<32> [N_HARTS],
     o_dbg_mshr_pois_cnt : output logic<32> [N_HARTS],
+    o_dbg_viol_exact_cnt: output logic<32> [N_HARTS],
+    o_dbg_viol_pgx_cnt  : output logic<32> [N_HARTS],
+    o_dbg_st_resolve_cnt: output logic<32> [N_HARTS],
+    o_dbg_viol_store_cnt: output logic<32> [N_HARTS],
+    o_dbg_viol_self_cnt : output logic<32> [N_HARTS],
+    o_dbg_lw_cause      : output logic<32> [N_HARTS * 128],
     o_dbg_load_wait_cnt : output logic<32> [N_HARTS],
     o_dbg_rob_commit_cnt: output logic<32> [N_HARTS],
     o_dbg_r3        : output logic<64> [N_HARTS],
@@ -125,7 +134,7 @@ pub module heliodor_soc_smp #(
     var c_dmemw_addr   : logic<64> [N_HARTS];
     var c_dmemw_req    : logic     [N_HARTS];
 
-    // Per-hart MMIO address decode (mirrors the standalone tb / N=1 SoC).
+    // Per-hart MMIO address decode.
     var in_dram : logic [N_HARTS];
     var in_clint: logic [N_HARTS];
     var in_uart : logic [N_HARTS];
@@ -421,10 +430,12 @@ pub module heliodor_soc_smp #(
         }
     }
 
-    // P9.1: split-transaction DRAM read controller (see the N=1 SoC /
-    // mem_ctrl headers). Per-hart slots: one outstanding line read per hart;
-    // gather beats are arbitrated through the bus's read-channel rotation
-    // (which keeps the AMO-lock pinning + the S20R anti-starvation shape).
+    // P9.1: split-transaction DRAM read controller (see the mem_ctrl header).
+    // It accepts a hart's DRAM read, looks the line up in the L2 and streams
+    // the 8 beats after the modeled latency (HIT_WAIT on an L2 hit, DRAM_WAIT
+    // plus an 8-cycle gather on a miss, installing the line). Gather beats are
+    // arbitrated through the bus's read-channel rotation; legacy (MMIO /
+    // firmware-ROM) reads pass through combinationally on the read grant.
     // ── Block N SHIPPED: TWO transaction slots per hart (cp_mshr_mlp_plan.md §10.2). ──
     // Slot 2h is the D side (loads, store-RFO fills, uncached MMIO), slot 2h+1 the
     // I side (I-cache fill + I-side page-table walk). An I-side read is always DRAM
@@ -714,6 +725,10 @@ pub module heliodor_soc_smp #(
             assign c_dmem_wdata[h * 8 + l] = core_wdata[l];
             assign c_dmem_wstrb[h * 8 + l] = core_wstrb[l];
         }
+        var core_lw_cause: logic<32> [128];
+        for c in 0..128 :gen_core_lw {
+            assign o_dbg_lw_cause[h * 128 + c] = core_lw_cause[c];
+        }
         inst u_core: v14_heliodor_core #(
             ID_SPLIT: 1, // Block N SHIPPED: the I side has its own mem_ctrl slot
             RESET_PC    : RESET_PC,
@@ -781,6 +796,12 @@ pub module heliodor_soc_smp #(
             o_dbg_load_replay_cnt: o_dbg_load_replay_cnt[h],
             o_dbg_inv_viol_cnt  : o_dbg_inv_viol_cnt[h]  ,
             o_dbg_mshr_pois_cnt : o_dbg_mshr_pois_cnt[h] ,
+            o_dbg_viol_exact_cnt: o_dbg_viol_exact_cnt[h],
+            o_dbg_viol_pgx_cnt  : o_dbg_viol_pgx_cnt[h]  ,
+            o_dbg_st_resolve_cnt: o_dbg_st_resolve_cnt[h],
+            o_dbg_viol_store_cnt: o_dbg_viol_store_cnt[h],
+            o_dbg_viol_self_cnt : o_dbg_viol_self_cnt[h] ,
+            o_dbg_lw_cause      : core_lw_cause          ,
             o_dbg_load_wait_cnt : o_dbg_load_wait_cnt[h] ,
             o_dbg_rob_commit_cnt: o_dbg_rob_commit_cnt[h],
             o_dbg_dmem_fault  : o_dbg_dmem_fault[h],
