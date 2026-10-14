@@ -1,0 +1,185 @@
+// ifu: fetch of FTQ blocks through translation and the icache into the fetch
+// buffer (FBQ).
+//
+// Ports (timing contract):
+//   i_fetch_valid/i_fetch : the ftq entry at fetch_q, registered state;
+//                           o_fetch_take advances it
+//   o_rewind_valid/o_rewind : set the ftq fetch pointer back to a block whose
+//                           icache request missed (wins over a take)
+//   o_ic_req_valid/o_ic_req : icache request, from the f1 register
+//   i_ic_resp             : icache response, fu_pkg::IC_RESP_LAT after accept
+//   i_ic_ev               : any icache event releases a MISS wait
+//   o_ic_flush            : front-end flush to the icache
+//   o_fb_valid/o_fb       : head of the FBQ, registered; i_fb_take pops it
+//   i_kill, i_pdr         : flush the whole ifu (f1, in-flight requests, FBQ,
+//                           the MISS wait and the fault stop) at the edge
+//   o_ev_*                : event wires: no FBQ credit, ftq empty with the ifu
+//                           idle, stopped after a faulted block
+// Stages: f0 takes an FTQ entry and translates its aligned block (Bare: PA =
+// VA, then pma_check), f1 = f0 + fu_pkg::ITLB_LAT requests the icache, f2 =
+// f1 + IC_RESP_LAT receives the response and pushes a HIT into the FBQ.
+// Owns:
+//   - FBQ credit: an entry is taken from the ftq only if FBQ entries plus
+//     blocks in f1 and f2 stay within FBQ_N, so a response always has room
+//   - blocks reach the FBQ in ftq order with no gap: a MISS drops every
+//     younger in-flight request and rewinds the ftq to the missed block
+//   - after a faulted block is taken, no further entry is taken until a flush
+// Rationale:
+//   - translation sits in its own stage before the icache index, since the
+//     icache way is larger than a page and cannot be virtually indexed
+//   - a block is translated once (a FETCH_BYTES block never crosses a page)
+//     and its PMA evaluated once (regions are at least 4 KiB)
+pub module ifu::<CFG: core_cfg> #(
+    param PMA_N      : u32                        = 1,
+    param PMA_REGIONS: pma_pkg::PmaRegion [PMA_N] = '{
+        default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
+    },
+) (
+    clk                : input  clock                        ,
+    rst                : input  reset                        ,
+    i_fetch_valid      : input  logic                        ,
+    i_fetch            : input  core_types::<CFG>::FtqFetch  ,
+    o_fetch_take       : output logic                        ,
+    o_rewind_valid     : output logic                        ,
+    o_rewind           : output core_types::<CFG>::FtqTag    ,
+    o_ic_req_valid     : output logic                        ,
+    o_ic_req           : output core_types::<CFG>::IcReq     ,
+    i_ic_ready         : input  logic                        ,
+    i_ic_resp          : input  core_types::<CFG>::IcResp    ,
+    i_ic_ev            : input  core_types::<CFG>::IcEvent   ,
+    o_ic_flush         : output logic                        ,
+    o_fb_valid         : output logic                        ,
+    o_fb               : output core_types::<CFG>::FetchBlk  ,
+    i_fb_take          : input  logic                        ,
+    i_kill             : input  core_types::<CFG>::Kill      ,
+    i_pdr              : input  core_types::<CFG>::PdRedirect,
+    o_ev_fbq_full      : output logic                        ,
+    o_ev_ftq_empty_idle: output logic                        ,
+    o_ev_fault_stall   : output logic                        ,
+) {
+    import core_types::<CFG>::*;
+
+    const FBQ_N: u32 = CFG::FBQ_N;
+    const CNT_W: u32 = tag_pkg::idx_w(FBQ_N + 1);
+
+    let flush: logic = i_kill.valid || i_pdr.valid;
+
+    var f1_v_q : logic       ;
+    var f1_q   : IcReq       ;
+    var f2_v_q : logic       ; // a request was accepted last cycle; its response is due now
+    var wait_q : logic       ; // waiting for an icache event after a MISS
+    var stop_q : logic       ; // a faulted block was taken
+    var fbq_n_q: logic<CNT_W>; // FBQ occupancy
+
+    // f2: the response of the request accepted last cycle.
+    let resp  : logic = f2_v_q && i_ic_resp.valid;
+    let r_hit : logic = resp && i_ic_resp.kind == IcKind::HIT;
+    let r_miss: logic = resp && i_ic_resp.kind == IcKind::MISS;
+
+    // f1: request the icache unless this cycle drops it.
+    let f1_out: logic = f1_v_q && !r_miss && !flush;
+    let f1_go : logic = f1_out && i_ic_ready;
+
+    // f0: Bare translation of the aligned block and its PMA.
+    let base  : logic           <64> = i_fetch.start_pc & ~((CFG::FETCH_BYTES - 1) as 64);
+    let pa    : pma_pkg::Pa          = base[55:0];
+    let attr  : pma_pkg::PmaAttr     = pma_check::<PMA_N>(pa, PMA_REGIONS);
+    let fault : logic                = i_fetch.start_pc[63:56] != 0 || !attr.executable;
+    var f0_req: IcReq               ;
+    always_comb {
+        f0_req              = 0 as IcReq;
+        f0_req.id.ftq       = i_fetch.ftq;
+        f0_req.id.start_pc  = i_fetch.start_pc;
+        f0_req.id.pred      = i_fetch.pred;
+        f0_req.id.probe     = !fault;
+        f0_req.id.exc.valid = fault;
+        f0_req.id.exc.cause = 6'd1; // instruction access fault
+        f0_req.id.exc.tval  = i_fetch.start_pc;
+        f0_req.pa           = pa;
+        f0_req.cacheable    = attr.cacheable;
+    }
+
+    let used  : logic<CNT_W> = fbq_n_q + f1_v_q + f2_v_q;
+    let credit: logic        = used <: FBQ_N;
+    let f0_go : logic        = i_fetch_valid && !wait_q && !stop_q && !flush && !r_miss && credit && (!f1_v_q || f1_go);
+    let push  : logic        = r_hit && !flush;
+
+    var fb_v  : logic    [1];
+    var fb_d  : FetchBlk [1];
+    var fbin_v: logic    [1];
+    var fbin_d: FetchBlk [1];
+    always_comb {
+        fbin_v[0]      = push;
+        fbin_d[0].id   = i_ic_resp.id;
+        fbin_d[0].data = i_ic_resp.data;
+    }
+
+    inst u_fbq: lane_queue #(
+        T    : FetchBlk,
+        W_IN : 1       ,
+        W_OUT: 1       ,
+        DEPTH: FBQ_N   ,
+    ) (
+        clk               ,
+        rst               ,
+        i_valid: fbin_v   ,
+        i_data : fbin_d   ,
+        o_ready: _        ,
+        o_valid: fb_v     ,
+        o_data : fb_d     ,
+        i_take : i_fb_take,
+        i_flush: flush    ,
+    );
+
+    always_ff {
+        if_reset {
+            f1_v_q  = 1'b0;
+            f1_q    = 0 as IcReq;
+            f2_v_q  = 1'b0;
+            wait_q  = 1'b0;
+            stop_q  = 1'b0;
+            fbq_n_q = 0;
+        } else {
+            if flush || r_miss {
+                f1_v_q = 1'b0;
+            } else if f0_go {
+                f1_v_q = 1'b1;
+                f1_q   = f0_req;
+            } else if f1_go {
+                f1_v_q = 1'b0;
+            }
+            f2_v_q = f1_go;
+            if flush {
+                wait_q = 1'b0;
+            } else if r_miss && !i_ic_ev.valid {
+                wait_q = 1'b1;
+            } else if i_ic_ev.valid {
+                wait_q = 1'b0;
+            }
+            // A MISS rewinds past the faulted block, which is always younger.
+            if flush || r_miss {
+                stop_q = 1'b0;
+            } else if f0_go && fault {
+                stop_q = 1'b1;
+            }
+            if flush {
+                fbq_n_q = 0;
+            } else {
+                fbq_n_q = fbq_n_q + push - i_fb_take;
+            }
+        }
+    }
+
+    assign o_fetch_take   = f0_go;
+    assign o_rewind_valid = r_miss && !flush;
+    assign o_rewind       = i_ic_resp.id.ftq;
+    assign o_ic_req_valid = f1_out;
+    assign o_ic_req       = f1_q;
+    assign o_ic_flush     = flush;
+    assign o_fb_valid     = fb_v[0];
+    assign o_fb           = fb_d[0];
+
+    assign o_ev_fbq_full       = i_fetch_valid && !credit;
+    assign o_ev_ftq_empty_idle = !i_fetch_valid && !f1_v_q && !f2_v_q && !wait_q && !stop_q;
+    assign o_ev_fault_stall    = i_fetch_valid && stop_q;
+}
