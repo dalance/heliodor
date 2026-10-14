@@ -3,14 +3,14 @@
 
     test/golden/canon.py [-o OUT] [LOG ...]      (stdin if no LOG)
 
-Keeps only R/T/I/H lines (K checkpoint lines, console output and every other
+Keeps only R/T/I/N/H lines (K checkpoint lines, console output and every other
 line are dropped), removes a trailing `#TAG` annotation, collapses whitespace,
 and rewrites every number in a fixed form: decimal fields (order, count,
 register numbers, priv/virt) without leading zeros, hex fields in lowercase
 without leading zeros, insn as 8 hex digits plus the `c` RVC suffix. A
 masked value `*` is kept. Line formats are those printed by tb/rvfi_tracer.veryl.
 
-A line that starts with R/T/I/H but does not parse is an error (exit code 2),
+A line that starts with R/T/I/N/H but does not parse is an error (exit code 2),
 so a format drift between the tracer and this script cannot pass silently.
 Use --lenient to drop such lines instead (console text interleaved into a
 trace line).
@@ -20,7 +20,7 @@ import argparse
 import re
 import sys
 
-KINDS = ("R", "T", "I", "H")
+KINDS = ("R", "T", "I", "N", "H")
 _DEC = re.compile(r"^\d+$")
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _REG = re.compile(r"^([xf])(\d+)=(\S+)$")
@@ -108,6 +108,10 @@ def canon_line(line):
             if len(s) != 7:
                 raise Bad(line)
             out = ["T", dec(s[1]), privvirt(s[2]), hx(s[3]), insn(s[4]), hx(s[5]), hx(s[6])]
+        elif k == "N":
+            if len(s) != 4:
+                raise Bad(line)
+            out = ["N", dec(s[1]), hx(s[2]), hx(s[3])]
         elif k == "I":
             if len(s) != 4:
                 raise Bad(line)
