@@ -17,6 +17,11 @@
 //                       the same cycle moves it to INFLIGHT
 //   o_win[COMMIT_W]   : from registered state, the COMMIT_W oldest entries;
 //                       commit selects by tag equality
+//   o_split_lo        : registered lo dword of the crossing load whose lo
+//                       pass completed (one at a time: crossing loads run
+//                       only as the oldest op), read by the memory pipes
+//   o_perf            : combinational event wires
+//   o_chk             : sticky checker flags (HELIODOR_CHK only, else 0)
 //   i_retire_cnt      : loads retired this cycle; head advances on the edge
 //   i_bar_alloc, i_bar_ret : ld_barrier ops dispatched / retired this cycle
 //   o_bar_after[k], o_bar_ret : registered barrier counts (o_bar_after[k] =
@@ -35,9 +40,11 @@
 //   - no entry leaves PARK except on its own key (fill_id, SqTag, token) or a
 //     broadcast
 // Rationale:
-//   - commit-time replay only, with no dependence predictor and no precision
-//     filters: both levers were measured to be negligible against the cost of
-//     the structure
+//   - ordering violations are repaired only by commit-time replay of the
+//     poisoned load, with no dependence predictor and no filter on the scans:
+//     the simplest scheme that is correct
+//   - the per-entry scans OR over MEM_W pipes and COH_N events, written as
+//     reductions of a vector
 pub module lq::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
@@ -74,9 +81,7 @@ pub module lq::<CFG: core_cfg> (
     o_win     : output core_types::<CFG>::LqCmWin [CFG::COMMIT_W],
     o_split_lo: output logic<64>                               ,
 
-    #[ifdef(HELIODOR_CHK)]
-    o_chk: output logic<4>,
-
+    o_chk : output logic<4>                ,
     o_perf: output core_types::<CFG>::LqPerf,
 ) {
     import core_types::<CFG>::*;
@@ -125,8 +130,6 @@ pub module lq::<CFG: core_cfg> (
     var e_seen1 : logic          [QN];
     var e_dw    : logic    <3>   [QN]; // dword of the latest pass (FILL_CRIT match)
     var e_half  : logic          [QN]; // the next pass is the hi line
-    var e_io    : logic          [QN]; // not cacheable: io_unit executes it
-    var e_ioord : logic          [QN];
     var e_state : LqState        [QN];
     var e_why   : ParkWhy        [QN];
     var e_fid   : FillId         [QN];
@@ -173,21 +176,19 @@ pub module lq::<CFG: core_cfg> (
     var coh_hit: logic<QN>;
     always_comb {
         for e in 0..QN {
-            var s: logic;
-            var c: logic;
-            s = 1'b0;
-            c = 1'b0;
+            var s: logic<CFG::MEM_W>;
+            var c: logic<COH_N>     ;
             for p in 0..CFG::MEM_W {
                 let sm: logic<64> = line_mask(sta_q[p].dw, sta_q[p].mask);
                 let ov: logic     = (e_seen0[e] && e_line0[e] == sta_q[p].line && (e_lm0[e] & sm) != 64'd0)
                     || (e_seen1[e] && e_line1[e] == sta_q[p].line && (e_lm1[e] & sm) != 64'd0);
-                s |= sta_q[p].valid && ov && !tag_older::<LQ_TAG_W>(tags[e], {sta_q[p].lq_lim.wrap, sta_q[p].lq_lim.idx});
+                s[p] = sta_q[p].valid && ov && !tag_older::<LQ_TAG_W>(tags[e], {sta_q[p].lq_lim.wrap, sta_q[p].lq_lim.idx});
             }
             for k in 0..COH_N {
-                c |= i_coh_v[k] && ((e_seen0[e] && e_line0[e] == i_coh_line[k]) || (e_seen1[e] && e_line1[e] == i_coh_line[k]));
+                c[k] = i_coh_v[k] && ((e_seen0[e] && e_line0[e] == i_coh_line[k]) || (e_seen1[e] && e_line1[e] == i_coh_line[k]));
             }
-            sta_hit[e] = live[e] && !e_io[e] && s;
-            coh_hit[e] = live[e] && !e_io[e] && c;
+            sta_hit[e] = live[e] && |s;
+            coh_hit[e] = live[e] && |c;
         }
     }
 
@@ -200,24 +201,23 @@ pub module lq::<CFG: core_cfg> (
         line: input logic<50>,
         dw  : input logic<3> ,
         rob : input RobTag   ,
-        io  : input logic    ,
         ev  : input MemEvent ,
         std : input StdWrite [CFG::MEM_W],
         sqh : input SqTag    ,
         tokv: input logic    ,
         tok : input RobTag   ,
     ) -> logic {
-        var sq_w: logic;
+        var sq_d: logic<CFG::MEM_W>;
         let ev_end: logic = ev.valid && (ev.kind == EvKind::FILL_DONE || ev.kind == EvKind::FILL_ABORT);
-        sq_w = tag_older::<SQ_TAG_W>({key.wrap, key.idx}, {sqh.wrap, sqh.idx});
         for p in 0..CFG::MEM_W {
-            sq_w |= std[p].valid && std[p].sq == key;
+            sq_d[p] = std[p].valid && std[p].sq == key;
         }
+        let sq_w: logic = tag_older::<SQ_TAG_W>({key.wrap, key.idx}, {sqh.wrap, sqh.idx}) || |sq_d;
         return case why {
             ParkWhy::FILL: (ev_end || (ev.valid && ev.kind == EvKind::FILL_CRIT && ev.line == line && ev.crit == dw)) && ev.fill_id == fid,
             ParkWhy::BUSY: ev_end,
             ParkWhy::SQ  : sq_w,
-            ParkWhy::HEAD: !io && tokv && tok == rob,
+            ParkWhy::HEAD: tokv && tok == rob,
             default      : 1'b0,
         };
     }
@@ -225,7 +225,7 @@ pub module lq::<CFG: core_cfg> (
     var wake: logic<QN>;
     always_comb {
         for e in 0..QN {
-            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, e_io[e], i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag);
+            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag);
         }
     }
 
@@ -258,18 +258,15 @@ pub module lq::<CFG: core_cfg> (
     for k in 0..CFG::COMMIT_W :g_win {
         let wt: LqTag = lq_adv(head_q, k);
         always_comb {
-            o_win[k].valid          = k <: cnt;
-            o_win[k].tag            = wt;
-            o_win[k].poison         = e_poison[wt.idx];
-            o_win[k].io_ordered     = e_ioord[wt.idx];
-            o_win[k].obs.size       = {1'b0, e_op[wt.idx].size};
-            o_win[k].obs.vaddr      = e_va[wt.idx];
-            o_win[k].obs.paddr      = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
-            o_win[k].obs.io         = e_io[wt.idx];
-            o_win[k].obs.rmask      = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
-            o_win[k].obs.wmask      = '0;
-            o_win[k].obs.wdata      = '0;
-            o_win[k].obs.wdata_hi   = '0;
+            o_win[k].valid     = k <: cnt;
+            o_win[k].tag       = wt;
+            o_win[k].poison    = e_poison[wt.idx];
+            o_win[k].obs.size  = {1'b0, e_op[wt.idx].size};
+            o_win[k].obs.vaddr = e_va[wt.idx];
+            o_win[k].obs.paddr = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
+            o_win[k].obs.rmask = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
+            o_win[k].obs.wmask = '0;
+            o_win[k].obs.wdata = '0;
         }
     }
     assign o_split_lo = lo_q;
@@ -306,8 +303,6 @@ pub module lq::<CFG: core_cfg> (
                 e_seen1[e]  = 1'b0;
                 e_poison[e] = 1'b0;
                 e_half[e]   = 1'b0;
-                e_io[e]     = 1'b0;
-                e_ioord[e]  = 1'b0;
             }
         } else {
             head_q = head_nx;
@@ -354,8 +349,6 @@ pub module lq::<CFG: core_cfg> (
                         e_seen1[e]  = 1'b0;
                         e_poison[e] = 1'b0;
                         e_half[e]   = 1'b0;
-                        e_io[e]     = 1'b0;
-                        e_ioord[e]  = 1'b0;
                     }
                 }
                 for p in 0..CFG::MEM_W {
@@ -377,11 +370,9 @@ pub module lq::<CFG: core_cfg> (
                         e_why[e] = i_verdict[p].why;
                         e_fid[e] = i_verdict[p].fill_id;
                         e_key[e] = i_verdict[p].sq_key;
-                        e_va[e]    = i_verdict[p].va;
-                        e_io[e]    = i_verdict[p].io;
-                        e_ioord[e] = i_verdict[p].io_ord;
+                        e_va[e]  = i_verdict[p].va;
                         // An event of this cycle counts as after the verdict.
-                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_verdict[p].io, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag) {
+                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag) {
                             e_state[e] = LqState::READY;
                         } else {
                             e_state[e] = i_verdict[p].state;
@@ -401,27 +392,23 @@ pub module lq::<CFG: core_cfg> (
     }
 
     always_comb {
-        var pk_fill: logic;
-        var pk_busy: logic;
-        var pk_sq  : logic;
-        var pk_head: logic;
-        pk_fill = 1'b0;
-        pk_busy = 1'b0;
-        pk_sq   = 1'b0;
-        pk_head = 1'b0;
+        var pk_fill: logic<CFG::MEM_W>;
+        var pk_busy: logic<CFG::MEM_W>;
+        var pk_sq  : logic<CFG::MEM_W>;
+        var pk_head: logic<CFG::MEM_W>;
         for p in 0..CFG::MEM_W {
             let pk: logic = i_verdict[p].valid && i_verdict[p].state == LqState::PARK;
-            pk_fill |= pk && i_verdict[p].why == ParkWhy::FILL;
-            pk_busy |= pk && i_verdict[p].why == ParkWhy::BUSY;
-            pk_sq   |= pk && i_verdict[p].why == ParkWhy::SQ;
-            pk_head |= pk && i_verdict[p].why == ParkWhy::HEAD;
+            pk_fill[p] = pk && i_verdict[p].why == ParkWhy::FILL;
+            pk_busy[p] = pk && i_verdict[p].why == ParkWhy::BUSY;
+            pk_sq[p]   = pk && i_verdict[p].why == ParkWhy::SQ;
+            pk_head[p] = pk && i_verdict[p].why == ParkWhy::HEAD;
         }
         o_perf.poison_sta = sta_hit != '0;
         o_perf.poison_coh = coh_hit != '0;
-        o_perf.park_fill  = pk_fill;
-        o_perf.park_busy  = pk_busy;
-        o_perf.park_sq    = pk_sq;
-        o_perf.park_head  = pk_head;
+        o_perf.park_fill  = |pk_fill;
+        o_perf.park_busy  = |pk_busy;
+        o_perf.park_sq    = |pk_sq;
+        o_perf.park_head  = |pk_head;
         o_perf.reissue    = i_reissue_gnt && rsel_v_q;
         o_perf.fence_ret  = i_bar_ret;
     }
@@ -449,4 +436,6 @@ pub module lq::<CFG: core_cfg> (
             o_chk                       ,
         );
     }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
 }

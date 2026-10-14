@@ -6,8 +6,12 @@
 //                           o_fetch_take advances it
 //   o_rewind_valid/o_rewind : set the ftq fetch pointer back to a block whose
 //                           icache request missed (wins over a take)
+//   i_priv, i_pmp*        : live csr state, read in f0; they change only at a
+//                           flushing retire
 //   o_ic_req_valid/o_ic_req : icache request, from the f1 register
-//   i_ic_resp             : icache response, fu_pkg::IC_RESP_LAT after accept
+//   i_ic_ready            : the icache accepts the f1 request this cycle
+//   i_ic_resp             : icache response, IC_RESP_LAT = 1 cycle after
+//                           accept
 //   i_ic_ev               : any icache event releases a MISS wait
 //   o_ic_flush            : front-end flush to the icache
 //   o_fb_valid/o_fb       : head of the FBQ, registered; i_fb_take pops it
@@ -15,20 +19,27 @@
 //                           the MISS wait and the fault stop) at the edge
 //   o_ev_*                : event wires: no FBQ credit, ftq empty with the ifu
 //                           idle, stopped after a faulted block
-// Stages: f0 takes an FTQ entry and translates its aligned block (Bare: PA =
-// VA, then pma_check), f1 = f0 + fu_pkg::ITLB_LAT requests the icache, f2 =
-// f1 + IC_RESP_LAT receives the response and pushes a HIT into the FBQ.
+// Stages: f0 takes an FTQ entry, translates its aligned block (Bare: PA =
+// VA), and evaluates PMA and per-granule PMP execute permission, all
+// combinationally; f1 (registered) requests the icache; f2 is the cycle after
+// the accept and receives the response, pushing a HIT into the FBQ. The
+// module has one register per stage, so it requires IC_RESP_LAT = 1
+// (CFG_ERR bit 17).
 // Owns:
 //   - FBQ credit: an entry is taken from the ftq only if FBQ entries plus
 //     blocks in f1 and f2 stay within FBQ_N, so a response always has room
 //   - blocks reach the FBQ in ftq order with no gap: a MISS drops every
 //     younger in-flight request and rewinds the ftq to the missed block
-//   - after a faulted block is taken, no further entry is taken until a flush
+//   - after a faulted block is taken, no further entry is taken until a
+//     flush or a MISS (the rewind refetches from an older block, which comes
+//     before the faulted one again)
 // Rationale:
 //   - translation sits in its own stage before the icache index, since the
 //     icache way is larger than a page and cannot be virtually indexed
 //   - a block is translated once (a FETCH_BYTES block never crosses a page)
-//     and its PMA evaluated once (regions are at least 4 KiB)
+//     and its PMA evaluated once (regions are at least 4 KiB); PMP is checked
+//     per 4-byte granule (pmp_deny), since PMP regions can be that small, and
+//     extract faults only the instructions that touch a denied granule
 pub module ifu::<CFG: core_cfg> #(
     param PMA_N      : u32                        = 1,
     param PMA_REGIONS: pma_pkg::PmaRegion [PMA_N] = '{
@@ -38,6 +49,9 @@ pub module ifu::<CFG: core_cfg> #(
     clk                : input  clock                        ,
     rst                : input  reset                        ,
     i_fetch_valid      : input  logic                        ,
+    i_priv             : input  csr_pkg::PrivLevel           ,
+    i_pmpcfg           : input  logic<64>                [2] ,
+    i_pmpaddr          : input  logic<64>                [16],
     i_fetch            : input  core_types::<CFG>::FtqFetch  ,
     o_fetch_take       : output logic                        ,
     o_rewind_valid     : output logic                        ,
@@ -85,6 +99,18 @@ pub module ifu::<CFG: core_cfg> #(
     let pa    : pma_pkg::Pa          = base[55:0];
     let attr  : pma_pkg::PmaAttr     = pma_check::<PMA_N>(pa, PMA_REGIONS);
     let fault : logic                = i_fetch.start_pc[63:56] != 0 || !attr.executable;
+    var deny  : logic           <GRAN_N>;
+    for g in 0..GRAN_N :g_pmp {
+        inst u_pmp: pmp_check (
+            i_addr   : {8'd0, pa} + (g * 4) as 64,
+            i_acc    : 2'd2                      ,
+            i_priv                               ,
+            i_pmpcfg                             ,
+            i_pmpaddr                            ,
+            o_fault  : deny[g]                   ,
+        );
+    }
+
     var f0_req: IcReq               ;
     always_comb {
         f0_req              = 0 as IcReq;
@@ -95,6 +121,7 @@ pub module ifu::<CFG: core_cfg> #(
         f0_req.id.exc.valid = fault;
         f0_req.id.exc.cause = 6'd1; // instruction access fault
         f0_req.id.exc.tval  = i_fetch.start_pc;
+        f0_req.id.pmp_deny  = if fault ? 0 : deny;
         f0_req.pa           = pa;
         f0_req.cacheable    = attr.cacheable;
     }

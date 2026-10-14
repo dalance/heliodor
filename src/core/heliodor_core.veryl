@@ -1,5 +1,7 @@
 // heliodor_core: the core top. Instances and their connections only; no
-// state, no reset value, no logic beyond selecting array elements.
+// state and no logic beyond selecting array elements, struct fields and bit
+// slices, and tying an input that a port's kind never drives to its constant
+// (exec ports never hold, memory pipes have no blocking FU).
 //
 // Ports (timing contract):
 //   i_hart_id, i_reset_pc : static inputs, the same component for every hart
@@ -15,13 +17,22 @@
 //   o_retire[COMMIT_W], o_irq_evt : registered retire records and interrupt
 //                    event, the core's only observation contract
 //   i_dbg_*        : lockstep controls, 0 in normal use
-//   o_perf, o_chk  : registered event wires and sticky checker flags
+//   o_perf, o_chk  : event wires and sticky checker flags of every unit
+// Owns: none (no state).
+// What this build serves: RV64I, M, C and Zicsr, with Bare translation and
+// cacheable memory only. decode rejects F, D, A, V, CBO and H as illegal
+// instructions, mem_pipe faults any non-cacheable access, and the reused csr
+// is connected only through the ports listed above (no frm, no translation
+// state). The FP register file, free list and IQ structure exist as the
+// final topology but receive no op.
 // Rationale:
 //   - every lane and port array is a generate-for over the config; the FU
 //     topology functions of core_types map issue ports to IQs, WB ports, BRU
 //     and SYS indices, so no port number appears here
 //   - the dcache is a sibling of the LSU behind dcache_port_adapter; its
 //     memory side is the D read slot and the write channel
+//   - the file is over the 600-line guideline because it is the connection
+//     list of every unit; splitting it would only add pass-through ports
 pub module heliodor_core::<CFG: core_cfg> #(
     param PMA_N      : u32                            = 1,
     param PMA_REGIONS: pma_pkg::PmaRegion     [PMA_N] = '{
@@ -93,8 +104,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
     const MW   : u32 = CFG::MEM_W;
     const NQ   : u32 = CFG::N_IQ;
     const SYS_P: u32 = sys_port();
-    // WB slot a memory-pipe pass claims when it enters m0 the next cycle.
-    const MEM_CLAIM: fu_pkg::WbSlot = fu_pkg::WbSlot'{valid: 1'b1, off: fu_pkg::claim_off(FuKind::LOAD) as fu_pkg::WbOff};
+    // WB slot offset a memory-pipe pass claims when it enters m0 the next cycle.
+    const MEM_CLAIM_OFF: u32 = fu_pkg::claim_off(FuKind::LOAD);
 
     // ---- Kill, redirect and the oldest token ----
 
@@ -110,6 +121,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var priv    : csr_pkg::PrivLevel     ;
     var virt    : logic                  ;
     var tsr     : logic                  ;
+    var tvm     : logic                  ;
     var pmpcfg  : logic             <64> [2] ;
     var pmpaddr : logic             <64> [16];
 
@@ -181,6 +193,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         clk                                             ,
         rst                                             ,
         i_fetch_valid      : f_v                        ,
+        i_priv             : priv                       ,
+        i_pmpcfg           : pmpcfg                     ,
+        i_pmpaddr          : pmpaddr                    ,
         i_fetch            : fetch                      ,
         o_fetch_take       : f_take                     ,
         o_rewind_valid     : rw_v                       ,
@@ -205,8 +220,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var fill_addr: logic<56>    ;
     var unc_req  : logic        ;
     var unc_addr : logic<56>    ;
-    var cl_acc   : logic     [3];
-    var cl_beat  : logic     [3];
+    var cl_acc   : logic     [2];
+    var cl_beat  : logic     [2];
     var sl_rdata : logic<64>    ;
     inst u_ic: icache::<CFG> (
         clk                                     ,
@@ -220,25 +235,24 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_inval_all   : ic_inv                  ,
         o_fill_req    : fill_req                ,
         o_fill_addr   : fill_addr               ,
-        i_fill_acc    : cl_acc[1]               ,
-        i_fill_beat   : cl_beat[1]              ,
+        i_fill_acc    : cl_acc[0]               ,
+        i_fill_beat   : cl_beat[0]              ,
         o_unc_req     : unc_req                 ,
         o_unc_addr    : unc_addr                ,
-        i_unc_beat    : cl_beat[2]              ,
+        i_unc_beat    : cl_beat[1]              ,
         i_rdata       : sl_rdata                ,
         o_ev_miss     : o_perf.front.ic_miss    ,
         o_ev_fill_busy: o_perf.front.ic_fill_busy,
     );
 
-    // Client 0 is the I-side page-table walker (M2).
     inst u_islot: islot_arb #(
-        N_CL: 3,
+        N_CL: 2,
     ) (
         clk                                    ,
         rst                                    ,
-        i_req       : '{1'b0, fill_req, unc_req}  ,
-        i_addr      : '{56'd0, fill_addr, unc_addr},
-        i_line      : '{1'b1, 1'b1, 1'b0}        ,
+        i_req       : '{fill_req, unc_req}       ,
+        i_addr      : '{fill_addr, unc_addr}     ,
+        i_line      : '{1'b1, 1'b0}              ,
         o_acc       : cl_acc                     ,
         o_beat      : cl_beat                    ,
         o_rdata     : sl_rdata                   ,
@@ -289,6 +303,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_priv       : priv       ,
         i_virt       : virt       ,
         i_mstatus_tsr: tsr        ,
+        i_mstatus_tvm: tvm        ,
         o_perf       : o_perf.dec ,
         o_chk        : o_chk.dec  ,
     );
@@ -511,7 +526,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var rd_i : logic   <64> [PRF_RD_N];
     var rd_f : logic   <64> [PRF_RD_N];
     inst u_prf_i: prf::<CFG> #(
-        FP     : 0             ,
+        CLS    : RegClass::INT ,
         N_ENTRY: CFG::PRF_INT_N,
     ) (
         clk                    ,
@@ -522,7 +537,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_chk  : o_chk.prf_int ,
     );
     inst u_prf_f: prf::<CFG> #(
-        FP     : 1            ,
+        CLS    : RegClass::FP ,
         N_ENTRY: CFG::PRF_FP_N,
     ) (
         clk                   ,
@@ -533,12 +548,11 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_chk  : o_chk.prf_fp ,
     );
 
-    // WB slot reservation per WB port; a memory pipe also takes the slot of
-    // a re-issue granted by mem_port_arb.
+    // WB slot reservation per WB port; mem_port_arb drives the memory pipes'
+    // reservations (a granted re-issue claims its slot there).
     var hf_req  : logic          [WB_N];
     var hf_gnt  : fu_pkg::WbSlot [WB_N];
     var rs_in   : fu_pkg::WbSlot [WB_N];
-    var mem_claim: logic         [MW]  ;
     var rs_chk  : logic<2>       [WB_N];
     var rs_perf : logic<2>       [WB_N];
     for w in 0..WB_N :g_rs {
@@ -638,7 +652,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var sq_re   : MemReissue      ;
     var lq_gnt  : logic           ;
     var sq_gnt  : logic           ;
-    var new_req : logic       [MW];
+    var mp_resv : fu_pkg::WbSlot [MW];
     var arb_ok  : logic       [MW];
     var arb_hold: logic       [MW];
 
@@ -655,10 +669,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         }
         assign busy_w[W]  = 0 as FuSet;
         assign hf_req[W]  = 1'b0;
-        assign new_req[m] = 1'b1;
-        assign arb_ok[m]  = ok_w[W][MEM_CLAIM.off];
+        assign arb_ok[m]  = ok_w[W][MEM_CLAIM_OFF];
         assign hold_w[W]  = arb_hold[m];
-        assign rs_in[W]   = if mem_claim[m] ? MEM_CLAIM : resv_w[W];
+        assign rs_in[W]   = mp_resv[m];
 
         inst u_mp: mem_pipe::<CFG> #(
             PMA_N  : PMA_N      ,
@@ -696,16 +709,21 @@ pub module heliodor_core::<CFG: core_cfg> #(
         );
     }
 
+    var mp_iq_resv: fu_pkg::WbSlot [MW];
+    for m in 0..MW :g_mp_resv {
+        assign mp_iq_resv[m] = resv_w[IW + m];
+    }
+
     inst u_arb: mem_port_arb::<CFG> (
         clk                        ,
         rst                        ,
-        i_new_req  : new_req       ,
         i_wb_ok    : arb_ok        ,
         i_lq_re    : lq_re         ,
         i_sq_re    : sq_re         ,
+        i_iq_resv  : mp_iq_resv    ,
         o_port_hold: arb_hold      ,
         o_re       : mre           ,
-        o_wb_claim : mem_claim     ,
+        o_resv     : mp_resv       ,
         o_lq_gnt   : lq_gnt        ,
         o_sq_gnt   : sq_gnt        ,
         o_perf     : o_perf.arb    ,
@@ -807,9 +825,6 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_drain_strb    : dr_strb       ,
         o_drain_urgent  : dr_urg        ,
         i_drain_ack     : dr_ack        ,
-        i_aq_empty      : 1'b1          ,
-        o_resource_empty: _             ,
-        o_drained       : _             ,
         o_ordering_empty: ord_empty     ,
         o_chk           : o_chk.sb      ,
         o_perf          : o_perf.sb     ,
@@ -848,7 +863,6 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_req_ready         : _            ,
         o_resp              : mresp        ,
         o_evt               : mevt         ,
-        i_p0_resv_next      : 1'b0         ,
         o_dc_addr           : dc_addr      ,
         o_dc_ren            : dc_ren       ,
         o_dc_ren_folded     : dc_renf      ,
@@ -1145,7 +1159,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_mstatus_mxr  : _                  ,
         o_mstatus_mprv : _                  ,
         o_mstatus_mpp  : _                  ,
-        o_mstatus_tvm  : _                  ,
+        o_mstatus_tvm  : tvm                ,
         o_mstatus_tsr  : tsr                ,
         o_mstatus_fs   : _                  ,
         o_mstatus_vs   : _                  ,

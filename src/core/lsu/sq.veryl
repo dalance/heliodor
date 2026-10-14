@@ -16,6 +16,11 @@
 //                       o_win); o_push carries their lines in the same cycle
 //   o_head            : registered; entries older than it have left the SQ
 //   i_kill            : tail := kill.sq_tail (partial) or empty (full)
+//   o_perf            : combinational event wires
+//   o_chk             : sticky checker flags (HELIODOR_CHK only, else 0)
+// Every entry is an integer store to a cacheable PA (decode rejects FP
+// stores, atomics and CBO; mem_pipe faults any other PA), so every retiring
+// entry pushes its one or two lines into sb.
 // Owns:
 //   - only uncommitted stores are here: a store leaves on the edge of its
 //     retire, the same edge that pushes its lines into sb, so it is visible
@@ -25,7 +30,12 @@
 //     together
 // Rationale:
 //   - forwarding picks per byte the youngest covering store older than the
-//     load's sq_lim with a log-depth tree, so any SQ_N works
+//     load's sq_lim with a log-depth tree, so any SQ_N works. tree_oldest
+//     finds the youngest when fed rtags = {wrap, ~idx}: the candidates are
+//     live, so they lie in one ring window. Within one wrap value ~idx
+//     reverses the order; across the two, tag_older compares the indices
+//     the other way round, so with ~idx the newer-wrap entry (the lower idx)
+//     again ranks first
 pub module sq::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
@@ -51,9 +61,7 @@ pub module sq::<CFG: core_cfg> (
     o_push      : output core_types::<CFG>::SbPush [core_types::<CFG>::PUSH_W],
     o_head      : output core_types::<CFG>::SqTag                             ,
 
-    #[ifdef(HELIODOR_CHK)]
-    o_chk: output logic<4>,
-
+    o_chk : output logic<4>                ,
     o_perf: output core_types::<CFG>::SqPerf,
 ) {
     import core_types::<CFG>::*;
@@ -94,8 +102,6 @@ pub module sq::<CFG: core_cfg> (
     var e_av0  : logic       [QN];
     var e_av1  : logic       [QN];
     var e_exc  : logic       [QN];
-    var e_io   : logic       [QN];
-    var e_ioord: logic       [QN];
     var e_data : logic<128>  [QN];
     var e_dv   : logic       [QN];
     var e_hrdy : logic       [QN]; // hi-line pass pending
@@ -162,7 +168,7 @@ pub module sq::<CFG: core_cfg> (
                 let h1 : logic      = e_cross[e] && e_av1[e] && e_line1[e] == i_fwd_q[p].line;
                 let m64: logic<64>  = if h0 ? lo_m64[e] : if h1 ? hi_m64[e] : 64'd0;
                 let d  : logic<512> = if h0 ? lo_d[e] : hi_d[e];
-                cand[e] = live[e] && !e_io[e] && !e_exc[e] && tag_older::<SQ_TAG_W>(tags[e], {i_fwd_q[p].sq_lim.wrap, i_fwd_q[p].sq_lim.idx});
+                cand[e] = live[e] && !e_exc[e] && tag_older::<SQ_TAG_W>(tags[e], {i_fwd_q[p].sq_lim.wrap, i_fwd_q[p].sq_lim.idx});
                 let sm : logic<64>  = m64 >> {i_fwd_q[p].dw, 3'd0};
                 let sd : logic<512> = d >> {i_fwd_q[p].dw, 6'd0};
                 cov[e]  = sm[15:0] & i_fwd_q[p].mask;
@@ -233,22 +239,19 @@ pub module sq::<CFG: core_cfg> (
         let wt : SqTag      = sq_adv(head_q, k);
         let wsh: logic<128> = e_data[wt.idx] >> {e_va[wt.idx][2:0], 3'd0};
         assign w_ix[k]  = wt.idx;
-        assign w_ret[k] = k <: i_retire_cnt && !e_io[wt.idx];
+        assign w_ret[k] = k <: i_retire_cnt;
         assign w_x[k]   = w_ret[k] && e_cross[wt.idx];
         always_comb {
-            o_win[k].valid        = k <: cnt;
-            o_win[k].tag          = wt;
-            o_win[k].retire_ok    = e_av0[wt.idx] && e_av1[wt.idx] && e_dv[wt.idx];
-            o_win[k].io_ordered   = e_ioord[wt.idx];
-            o_win[k].lines        = if e_io[wt.idx] ? 2'd0 : if e_cross[wt.idx] ? 2'd2 : 2'd1;
-            o_win[k].obs.size     = {1'b0, e_op[wt.idx].size};
-            o_win[k].obs.vaddr    = e_va[wt.idx];
-            o_win[k].obs.paddr    = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
-            o_win[k].obs.io       = e_io[wt.idx];
-            o_win[k].obs.rmask    = '0;
-            o_win[k].obs.wmask    = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
-            o_win[k].obs.wdata    = wsh[63:0];
-            o_win[k].obs.wdata_hi = '0;
+            o_win[k].valid     = k <: cnt;
+            o_win[k].tag       = wt;
+            o_win[k].retire_ok = e_av0[wt.idx] && e_av1[wt.idx] && e_dv[wt.idx];
+            o_win[k].lines     = if e_cross[wt.idx] ? 2'd2 : 2'd1;
+            o_win[k].obs.size  = {1'b0, e_op[wt.idx].size};
+            o_win[k].obs.vaddr = e_va[wt.idx];
+            o_win[k].obs.paddr = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
+            o_win[k].obs.rmask = '0;
+            o_win[k].obs.wmask = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
+            o_win[k].obs.wdata = wsh[63:0];
         }
     }
 
@@ -295,8 +298,6 @@ pub module sq::<CFG: core_cfg> (
                 e_av1[e]  = 1'b0;
                 e_dv[e]   = 1'b0;
                 e_exc[e]  = 1'b0;
-                e_io[e]   = 1'b0;
-                e_ioord[e] = 1'b0;
                 e_hrdy[e] = 1'b0;
                 e_cross[e] = 1'b0;
             }
@@ -324,8 +325,6 @@ pub module sq::<CFG: core_cfg> (
                         e_av1[e]   = 1'b0;
                         e_dv[e]    = 1'b0;
                         e_exc[e]   = 1'b0;
-                        e_io[e]    = 1'b0;
-                        e_ioord[e] = 1'b0;
                         e_hrdy[e]  = 1'b0;
                         e_cross[e] = 1'b0;
                     }
@@ -347,8 +346,6 @@ pub module sq::<CFG: core_cfg> (
                             e_av0[e]   = 1'b1;
                             e_av1[e]   = !x || i_sta[p].exc.valid;
                             e_exc[e]   = i_sta[p].exc.valid;
-                            e_io[e]    = !i_sta[p].attr.cacheable;
-                            e_ioord[e] = i_sta[p].attr.io_ordered;
                             e_hrdy[e]  = x && !i_sta[p].exc.valid;
                         }
                     }
@@ -362,18 +359,16 @@ pub module sq::<CFG: core_cfg> (
     }
 
     always_comb {
-        var w: logic;
-        var s: logic;
-        w = 1'b0;
-        s = 1'b0;
+        var w: logic<CFG::MEM_W>;
+        var s: logic<CFG::MEM_W>;
         for p in 0..CFG::MEM_W {
-            w |= i_fwd_q[p].valid && o_fwd[p].wt;
-            s |= i_sta[p].valid;
+            w[p] = i_fwd_q[p].valid && o_fwd[p].wt;
+            s[p] = i_sta[p].valid;
         }
-        o_perf.sta      = s;
+        o_perf.sta      = |s;
         o_perf.reissue  = i_reissue_gnt && rsel_v_q;
         o_perf.retire   = i_retire_cnt != '0;
-        o_perf.fwd_wait = w;
+        o_perf.fwd_wait = |w;
     }
 
     #[ifdef(HELIODOR_CHK)]
@@ -398,4 +393,6 @@ pub module sq::<CFG: core_cfg> (
             o_chk                  ,
         );
     }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
 }

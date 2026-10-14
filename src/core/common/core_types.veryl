@@ -11,10 +11,8 @@ pub package core_types::<CFG: core_cfg> {
     const LQ_IDX_W : u32 = tag_pkg::idx_w(CFG::LQ_N);
     const SQ_IDX_W : u32 = tag_pkg::idx_w(CFG::SQ_N);
     const FTQ_IDX_W: u32 = tag_pkg::idx_w(CFG::FTQ_N);
-    // int and fp share one PReg width: the reused vector unit and the CDB
-    // bus assume PRF_INT_W == PRF_FP_W.
+    // int and fp share one PReg width, so one PReg type names either file.
     const PREG_W: u32 = tag_pkg::idx_w(if CFG::PRF_INT_N >: CFG::PRF_FP_N ? CFG::PRF_INT_N : CFG::PRF_FP_N);
-    const CKPT_W: u32 = tag_pkg::idx_w(CFG::NUM_CKPT);
     const FOFF_W: u32 = tag_pkg::idx_w(CFG::FETCH_BYTES / 2); // halfword offset in a fetch block
 
     // Full tag widths (wrap + index), the W argument of tag_older/tag_next.
@@ -129,22 +127,6 @@ pub package core_types::<CFG: core_cfg> {
 
     type BarSeq = logic<BAR_SEQ_W>;
 
-    // Identity of an op, carried with it through every stage. Live state
-    // (ROB head, the driver of a port) is never re-read to identify an op.
-    struct OpTag {
-        rob   : RobTag        , // every op
-        lq    : LqTag         , // loads, valid when lq_v
-        lq_v  : logic         ,
-        sq    : SqTag         , // stores and store-class atomics, valid when sq_v
-        sq_v  : logic         ,
-        ftq   : FtqTag        , // fetch block
-        foff  : logic <FOFF_W>, // halfword offset in the block
-        pdst  : PReg          ,
-        has_rd: logic         , // 0 for x0 and no-destination ops
-        ckpt  : logic <CKPT_W>, // checkpoint held by this op, valid when ckpt_v
-        ckpt_v: logic         ,
-    }
-
     // ---- Kill and redirect ----
 
     // Registered one-cycle pulse, at most one per cycle. A partial kill keeps
@@ -160,8 +142,6 @@ pub package core_types::<CFG: core_cfg> {
         fl_fp   : FlPtr         ,
         bar_seq : BarSeq        ,
         ftq_tail: FtqTag        , // next of the branch's FtqTag
-        ckpt_v  : logic         ,
-        ckpt    : logic <CKPT_W>,
     }
 
     // Only BR and BR_CM carry the branch outcome (Redirect.foff/taken) used to
@@ -209,31 +189,20 @@ pub package core_types::<CFG: core_cfg> {
         valid : logic              ,
         tag   : ExTag              ,
         data  : logic          <64>,
-        exc   : exc_pkg::ExcRec    ,
+        exc   : exc_pkg::ExcRec    , // memory pipe ports only
         fflags: logic          <5> ,
         br    : BrResolve          , // BRU ports only
     }
 
-    // Scheduling wakeup: the value of pdst is on a WB bus WAKE_LEAD cycles
-    // later (or later still for memory-pipe wake lanes).
+    // Scheduling wakeup: a consumer of pdst is selectable from the cycle
+    // after the wake. An exec port wakes WAKE_LEAD cycles before its WB, so
+    // that consumer is accepted in the WB cycle and reads the bypass. A
+    // memory pipe wakes at R and writes back at R + 1, one cycle less than
+    // WAKE_LEAD: the consumer is accepted at R + 2 and reads the PRF
+    // (PRF_WR = 1).
     struct Wake {
         valid: logic,
         pdst : PReg ,
-    }
-
-    enum XfKind: logic<2> {
-        SFENCE,
-        HFENCE_VVMA,
-        HFENCE_GVMA,
-    }
-
-    struct XlateFlush {
-        valid   : logic     ,
-        kind    : XfKind    ,
-        va      : logic <64>,
-        asid    : logic <16>,
-        all_va  : logic     , // rs1 was x0
-        all_asid: logic     , // rs2 was x0
     }
 
     // fu_sys -> commit: what a SYS op does at retire.
@@ -242,7 +211,6 @@ pub package core_types::<CFG: core_cfg> {
         tag      : RobTag        ,
         csr_addr : logic     <12>,
         csr_wdata: logic     <64>,
-        xf       : XlateFlush    ,
     }
 
     // lq -> memory iq: a ld_barrier op retired; bar_ret is now seq.
@@ -276,7 +244,6 @@ pub package core_types::<CFG: core_cfg> {
     struct IqCold {
         uop       : logic <UOP_W> , // FU-specific op code
         imm       : logic <32>    ,
-        rm        : logic <3>     ,
         ftq       : FtqTag        ,
         foff      : logic <FOFF_W>,
         pred_taken: logic         , // this op is its block's predicted taken exit
@@ -314,12 +281,12 @@ pub package core_types::<CFG: core_cfg> {
 
     // ---- Topology derived from the FU table ----
 
-    // FU kinds a memory pipe accepts: every pipe takes loads and stores,
-    // atomics run only on pipe 0.
+    // FU kinds a memory pipe accepts: every pipe takes loads and stores.
+    // Atomics are not served by this core build (decode rejects them).
     function mem_port_fu (
         m: input u32,
     ) -> FuSet {
-        return fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE) | (if m == 0 ? fu_bit(FuKind::ATOMIC) : 0);
+        return fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE);
     }
 
     // The exec port that is issue port i of IQ q.
@@ -461,16 +428,15 @@ pub package core_types::<CFG: core_cfg> {
         rf: input logic   <64>       ,
         wb: input WbPacket     [WB_N],
     ) -> logic<64> {
-        var hit: logic<WB_N>;
-        var r  : logic<64>  ;
+        var hit: logic<WB_N>       ;
+        var d  : logic<64>   [WB_N];
         for w in 0..WB_N {
             hit[w] = wb_writes(w, pr.cls == RegClass::FP) && wb[w].valid && wb[w].tag.has_rd && wb[w].tag.pdst == pr;
         }
-        r = if hit == 0 ? rf : 0;
         for w in 0..WB_N {
-            r = r | ({hit[w] repeat 64} & wb[w].data);
+            d[w] = wb[w].data;
         }
-        return r;
+        return if hit == 0 ? rf : tree_onehot_mux::<WB_N, 64>(hit, d);
     }
 
     // Whether kill k removes the op tagged t.
@@ -489,7 +455,6 @@ pub package core_types::<CFG: core_cfg> {
     }
 
     // WB port p is exec port p for p < ISSUE_W, else memory pipe p - ISSUE_W.
-    // Exceptions arrive only on the memory pipe ports.
     function wb_has_bru (
         p: input u32,
     ) -> logic {
@@ -639,33 +604,29 @@ pub package core_types::<CFG: core_cfg> {
 
     // Retire-record fields of a memory access, kept by its LQ/SQ entry.
     struct MemObs {
-        size    : logic<3> ,
-        vaddr   : logic<64>,
-        paddr   : logic<64>,
-        io      : logic    ,
-        rmask   : logic<16>,
-        wmask   : logic<16>,
-        wdata   : logic<64>,
-        wdata_hi: logic<64>,
+        size : logic<3> ,
+        vaddr: logic<64>,
+        paddr: logic<64>,
+        rmask: logic<16>,
+        wmask: logic<16>,
+        wdata: logic<64>,
     }
 
     // Commit window entries, registered by lq (COMMIT_W oldest) and sq
     // (MEM_W oldest); commit selects by tag equality.
     struct LqCmWin {
-        valid     : logic ,
-        tag       : LqTag ,
-        poison    : logic ,
-        io_ordered: logic ,
-        obs       : MemObs,
+        valid : logic ,
+        tag   : LqTag ,
+        poison: logic ,
+        obs   : MemObs,
     }
 
     struct SqCmWin {
-        valid     : logic    ,
-        tag       : SqTag    ,
-        retire_ok : logic    , // addr_v && data_v && (kind != IO || wt_done)
-        io_ordered: logic    ,
-        lines     : logic <2>, // sb lines pushed at retire: 0 (CMO, IO), 1, or 2 (line-crossing)
-        obs       : MemObs   ,
+        valid    : logic    ,
+        tag      : SqTag    ,
+        retire_ok: logic    , // every half has its address and the data is written
+        lines    : logic <2>, // sb lines pushed at retire: 1, or 2 (line-crossing)
+        obs      : MemObs   ,
     }
 
     // sb credit offered to commit, saturated at PUSH_W lines.
@@ -968,7 +929,6 @@ pub package core_types::<CFG: core_cfg> {
         rs3       : ArchSrc                ,
         dst       : ArchDst                ,
         imm       : logic          <32>    ,
-        rm        : logic          <3>     ,
         exc       : exc_pkg::ExcRec        ,
     }
 
@@ -1023,7 +983,7 @@ pub package core_types::<CFG: core_cfg> {
         rq_full: logic, // decode held a group because rq was full
     }
     struct RenPerf {
-        walk_start  : logic, // partial kill without a checkpoint
+        walk_start  : logic, // partial kill: a walk starts
         walk_cyc    : logic, // a walk lane was applied
         full_restore: logic, // spec RAT := arch RAT
     }
@@ -1040,83 +1000,58 @@ pub package core_types::<CFG: core_cfg> {
 
     // ---- LSU and the memory port (sections 5.9, L) ----
 
-    // ---- Counts of the LSU queues ----
+    const SB_CNT_W: u32 = tag_pkg::idx_w(CFG::SB_N + 1);
 
-    const SB_CNT_W : u32 = tag_pkg::idx_w(CFG::SB_N + 1);
-
-
-
-
-    // ---- Memory port (section 5.9) ----
-
-    // M1-M2: the adapter's fill generation; every holder compares by equality.
+    // Fill generation of dcache_port_adapter; every holder compares by
+    // equality. Fills are serial (MSHR_N = 1, CFG_ERR bit 6): generation g
+    // ends with FILL_DONE(g) or FILL_ABORT(g) before g + 1 starts, so at most
+    // one generation is live and 4 bits cannot alias.
     const FILL_ID_W: u32 = 4;
     type FillId = logic<FILL_ID_W>;
 
     const MEMID_W: u32 = if LQ_TAG_W >: SQ_TAG_W ? (if LQ_TAG_W >: FTQ_TAG_W ? LQ_TAG_W : FTQ_TAG_W) : (if SQ_TAG_W >: FTQ_TAG_W ? SQ_TAG_W : FTQ_TAG_W);
 
-    enum MemClient: logic<4> {
+    // The only client and request class of this core build: the memory
+    // pipes' loads (stores reach the dcache through the sb drain).
+    enum MemClient: logic {
         LQ,
-        SQ,
-        PTW_D,
-        PTW_I,
-        AD,
-        ATOMIC,
-        IO,
-        IFU,
-        VU,
     }
 
-    enum MemCls: logic<3> {
+    enum MemCls: logic {
         LOAD, // one line, up to two adjacent dwords
-        LOAD_EXCL, // AMO/LR read with ownership
-        UNC_READ,
-        PTW_READ,
-        STORE_WT,
-        STORE_EXCL,
-        CMO,
     }
 
-    enum RespKind: logic<3> {
+    enum RespKind: logic<2> {
         HIT,
         MISS,
         RETRY,
-        EXCL_PASS,
-        EXCL_FAIL,
-        PENDING,
     }
 
-    enum RetryReason: logic<3> {
+    enum RetryReason: logic<2> {
         FILL_BUSY,
         INV_RACE,
         PREEMPTED,
-        WB_BLOCKED,
         BANK_CONFLICT,
     }
 
-    enum EvKind: logic<3> {
+    enum EvKind: logic<2> {
         FILL_START,
         FILL_CRIT,
         FILL_DONE,
         FILL_ABORT,
-        UNC_DONE,
-        WT_DONE,
     }
 
     struct MemTag {
-        client: MemClient        ,
-        id    : logic  <MEMID_W> , // the requester's queue tag, zero-extended
-        rob_v : logic            , // rob names the owner op (back-end clients)
-        rob   : RobTag           ,
+        client: MemClient       ,
+        id    : logic    <MEMID_W>, // the requester's queue tag, zero-extended
+        rob   : RobTag          , // the owner op
     }
 
     struct MemReq {
-        tag  : MemTag          ,
-        cls  : MemCls          ,
-        pa   : pma_pkg::Pa     ,
-        mask : logic   <16>    , // bytes of dwords pa[5:3] and pa[5:3]+1, inside one line
-        wdata: logic   <128>   ,
-        attr : pma_pkg::PmaAttr,
+        tag : MemTag     ,
+        cls : MemCls     ,
+        pa  : pma_pkg::Pa,
+        mask: logic <16> , // bytes of dwords pa[5:3] and pa[5:3]+1, inside one line
     }
 
     // Exactly RESP_LAT cycles after accept, one per accepted request.
@@ -1149,14 +1084,11 @@ pub package core_types::<CFG: core_cfg> {
         DONE,
     }
 
-    enum ParkWhy: logic<3> {
+    enum ParkWhy: logic<2> {
         FILL,
         BUSY,
-        XLATE,
         SQ,
-        AQ,
         HEAD,
-        DBIT, // SQ only
     }
 
     // A memory op as the LSU modules use it, decoded from {fu, uop} by mem_op.
@@ -1164,23 +1096,16 @@ pub package core_types::<CFG: core_cfg> {
         st  : logic   , // store (STA + STD); load otherwise
         size: logic<2>, // log2 bytes
         sgn : logic   , // load: sign-extend
-        fp  : logic   , // load: NaN-box below 64 bits
     }
 
-
     function mem_op (
-        fu : input FuKind        ,
-        uop: input logic <UOP_W> ,
+        fu : input FuKind       ,
+        uop: input logic <UOP_W>,
     ) -> MemOp {
-        var r : MemOp;
-        var ld: LdUop;
-        var st: StUop;
-        ld     = uop[5:0] as LdUop;
-        st     = uop[5:0] as StUop;
+        var r: MemOp;
         r.st   = fu == FuKind::STORE;
-        r.size = if r.st ? st.f3[1:0] : ld.f3[1:0];
-        r.sgn  = !ld.f3[2];
-        r.fp   = !r.st && ld.fp;
+        r.size = uop[1:0];
+        r.sgn  = !uop[2];
         return r;
     }
 
@@ -1195,8 +1120,6 @@ pub package core_types::<CFG: core_cfg> {
         lq   : LqTag       ,
         sq   : SqTag       ,
     }
-
-
 
     // m2 query of the PA-keyed forwarding network (one line, dwords dw..dw+1).
     struct FwdQuery {
@@ -1226,7 +1149,6 @@ pub package core_types::<CFG: core_cfg> {
         line  : logic       <50>,
         dw    : logic       <3> ,
         mask  : logic       <16>,
-        attr  : pma_pkg::PmaAttr,
         exc   : exc_pkg::ExcRec ,
     }
 
@@ -1259,11 +1181,7 @@ pub package core_types::<CFG: core_cfg> {
         split_lo: logic    , // lo pass of a line-crossing load: keep lo_data, next pass is hi
         lo_data : logic<64>,
         va      : logic<64>, // VA of the access, for re-issue and the commit window
-        io      : logic    , // not cacheable: io_unit executes it, the scans skip it
-        io_ord  : logic    , // attr.io_ordered
     }
-
-
 
     // One committed line pushed into the store buffer.
     struct SbPush {
@@ -1272,7 +1190,6 @@ pub package core_types::<CFG: core_cfg> {
         data : logic<512> ,
         strb : logic<64>  ,
     }
-
 
     // Coherence events seen by the CoRR scan: inv, inv2, evict1, evict2.
     const COH_N: u32 = 4;
@@ -1406,7 +1323,7 @@ pub package core_types::<CFG: core_cfg> {
         var e: u32;
         e = 0;
         if CFG::FETCH_W != 1 && CFG::FETCH_W != 2 && CFG::FETCH_W != 4 {
-            e |= 1 << 0; // icache block and one ITLB lookup per block cap fetch at 32 bytes
+            e |= 1 << 0; // icache block and one translation per block cap fetch at 32 bytes
         }
         if CFG::FETCH_BYTES != 8 * CFG::FETCH_W {
             e |= 1 << 1;
@@ -1414,8 +1331,8 @@ pub package core_types::<CFG: core_cfg> {
         if CFG::RENAME_W == 0 || CFG::ISSUE_W == 0 || CFG::MEM_W == 0 || CFG::COMMIT_W == 0 {
             e |= 1 << 2;
         }
-        if CFG::ROB_N >: 256 || (CFG::ROB_N & (CFG::ROB_N - 1)) != 0 || CFG::ROB_N <: CFG::RENAME_W {
-            e |= 1 << 3; // vector unit: 8-bit owner and idx - head age
+        if CFG::ROB_N <: CFG::RENAME_W {
+            e |= 1 << 3;
         }
         if CFG::PRF_INT_N <= 32 || CFG::PRF_FP_N <= 32 {
             e |= 1 << 4;
@@ -1424,7 +1341,7 @@ pub package core_types::<CFG: core_cfg> {
             e |= 1 << 5;
         }
         if CFG::MSHR_N != 1 || CFG::DC_NB != 1 {
-            e |= 1 << 6; // one fill per hart until the new core boots N=4
+            e |= 1 << 6; // dcache_port_adapter serves one fill at a time on one bank
         }
         if CFG::DQ_N <: CFG::FETCH_W || CFG::RQ_N <: CFG::FETCH_W || CFG::RQ_N <: CFG::RENAME_W {
             e |= 1 << 7; // a lane_queue holds at least one full group
@@ -1441,39 +1358,39 @@ pub package core_types::<CFG: core_cfg> {
             if CFG::PORT_IQ[p] >= CFG::N_IQ || CFG::PORT_IQ[p] == CFG::MEM_IQ {
                 e |= 1 << 10;
             }
-            // Memory and dispatch-completed kinds never sit on an exec port.
-            if (CFG::PORT_FU[p]
-                    & (fu_bit(FuKind::NONE) | fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE) | fu_bit(FuKind::ATOMIC)
-                        | fu_bit(FuKind::VEC))) != 0 {
+            // An exec port carries only the kinds exec_port builds (ALU, BRU,
+            // SYS, MUL, DIV); DIV is then the port's only blocking FU.
+            if (CFG::PORT_FU[p] & ~(fu_bit(FuKind::ALU) | fu_bit(FuKind::BRU) | fu_bit(FuKind::SYS) | fu_bit(FuKind::MUL)
+                | fu_bit(FuKind::DIV))) != 0 {
                 e |= 1 << 11;
-            }
-            // At most one HOLE_FILL (blocking) FU per port: one wb_resv requester.
-            if CFG::PORT_FU[p][FuKind::DIV] && CFG::PORT_FU[p][FuKind::FDIV] {
-                e |= 1 << 12;
             }
             // The ports of one FU kind share an IQ, so the destination IQ of an
             // op depends on its kind alone.
             for p2 in 0..CFG::ISSUE_W {
                 if (CFG::PORT_FU[p] & CFG::PORT_FU[p2]) != 0 && CFG::PORT_IQ[p] != CFG::PORT_IQ[p2] {
-                    e |= 1 << 13;
+                    e |= 1 << 12;
                 }
             }
         }
         if port_count(FuKind::SYS) != 1 {
-            e |= 1 << 14;
+            e |= 1 << 13;
         }
         if port_count(FuKind::ALU) == 0 || port_count(FuKind::BRU) == 0 || port_count(FuKind::MUL) == 0
-            || port_count(FuKind::DIV) == 0 || port_count(FuKind::FMA) == 0 || port_count(FuKind::FMISC) == 0
-            || port_count(FuKind::FDIV) == 0 {
-            e |= 1 << 15; // every exec kind decode can emit has a port
+            || port_count(FuKind::DIV) == 0 {
+            e |= 1 << 14; // every exec kind decode lets through has a port
         }
         if CFG::NUM_CKPT != 0 {
-            e |= 1 << 16; // rename recovers by walk only until the checkpoint pool exists
+            e |= 1 << 15; // rename recovers by walk only; there is no checkpoint pool
         }
         for q in 0..CFG::N_IQ {
             if CFG::IQ_N[q] >= 512 {
-                e |= 1 << 17; // IQ credits are IQ_CNT_W bits
+                e |= 1 << 16; // IQ credits are IQ_CNT_W bits
             }
+        }
+        // Fixed latencies the RTL is built for: ifu has one register per
+        // fetch stage, and sb hands a drained line over on the ack edge.
+        if fu_pkg::IC_RESP_LAT != 1 || fu_pkg::SHADOW_LEN != 0 {
+            e |= 1 << 17;
         }
         return e;
     }

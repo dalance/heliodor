@@ -2,6 +2,7 @@
 // acceptance, the oldest token and the retire record.
 //
 // Ports (timing contract):
+//   i_reset_pc           : static; the PC of the first op after reset
 //   i_cm, i_exc, i_head  : rob's registered window, exc_q and head
 //   i_lq_win, i_sq_win   : registered commit windows of lq and sq; a lane
 //                          selects its entry by tag equality
@@ -13,16 +14,22 @@
 //                          acceptance edge
 //   i_irq                : csr's pending interrupt, registered here (irq_q)
 //                          before any use
+//   i_priv, i_virt       : csr's current mode, for the retire record only
 //   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs
 //   i_dbg_*              : lockstep controls, all 0 in normal use
 //   decision outputs     : o_retire_cnt, o_flush, o_trap_fire, o_irq_take,
 //                          the side-effect ports and o_csr are combinational
 //                          functions of registered state, i_kill and i_dbg_*
+//   o_irq_q, o_epc       : irq_q and the committed next PC, registered state,
+//                          to trap_unit
 //   o_ren_cm             : per lane, to rename (arch RAT) and both free lists
+//   o_lq_ret_cnt, o_sq_ret_cnt : loads and stores retired this cycle, to lq
+//                          and sq (their heads advance on the edge)
 //   o_ftq_cm             : position of the youngest op retired this cycle
 //   o_bar_ret            : an ld_barrier op retired this cycle (at most one,
 //                          barrier ops are alone)
-//   o_oldest             : from registered state and i_kill only
+//   o_icache_inv         : a FENCE.I retired this cycle
+//   o_oldest             : from registered state, i_kill and i_dbg_*
 //   o_retire, o_irq_evt  : registered, one cycle after retire
 // Owns:
 //   - retire is a prefix of the lanes; at most one flush per cycle (irq >
@@ -30,9 +37,12 @@
 //     trap, replay or interrupt cycle retires nothing
 //   - every side effect is conditioned on retire[l] alone (plus trap_fire
 //     or irq_take on lane 0), never on "the head is valid"
-//   - arch_next_pc_q is the PC of the head op whenever the head is valid,
-//     so lane PCs are derived and never stored
+//   - arch_pc_q is the PC of the head op whenever the head is valid, so lane
+//     PCs are derived and never stored
 //   - a lane never retires an op that the kill of the cycle selects
+//   - sys_q belongs to the SYS op that retires: SYS ops are nonspec and
+//     alone, so at most one is past select at any time, it is the head when
+//     it retires, and sys_q is written only by it (chk_commit bit 4)
 // Rationale:
 //   - trap, replay and interrupts act only at the group head (lane 0); an
 //     exception, poison or alone op on a younger lane cuts the group so it
@@ -40,6 +50,9 @@
 //     not a per-lane special case
 //   - the token is computed from the registered head, so it passes to the
 //     next op one cycle after the previous op retires
+//   - lane l's PC is the target of the youngest redirecting lane before it
+//     (or the head PC) plus the halfwords in between, a prefix count, so no
+//     adder chain runs across the lanes
 pub module commit::<CFG: core_cfg> (
     clk                  : input  clock                                                                         ,
     rst                  : input  reset                                                                         ,
@@ -111,7 +124,6 @@ pub module commit::<CFG: core_cfg> (
     var evt_q    : IrqEvent           ;
     var perf_q   : CmPerf             ;
 
-    // i_reset_pc is an input, not a reset constant.
     let apc: logic<64> = if boot_q ? i_reset_pc : arch_pc_q;
 
     // ---- Interrupt acceptance and the oldest token ----
@@ -130,26 +142,71 @@ pub module commit::<CFG: core_cfg> (
 
     var lq_bits: logic<OBS_W> [CW];
     var lq_pz  : logic<CW>        ;
-    var lq_io  : logic<CW>        ;
     var sq_bits: logic<OBS_W> [MW];
     var sq_ok  : logic<MW>        ;
-    var sq_io  : logic<MW>        ;
     var sq_ln  : logic<2>     [MW];
     always_comb {
         for w in 0..CW {
             lq_bits[w] = i_lq_win[w].obs;
             lq_pz[w]   = i_lq_win[w].poison;
-            lq_io[w]   = i_lq_win[w].io_ordered;
         }
         for w in 0..MW {
             sq_bits[w] = i_sq_win[w].obs;
             sq_ok[w]   = i_sq_win[w].retire_ok;
-            sq_io[w]   = i_sq_win[w].io_ordered;
             sq_ln[w]   = i_sq_win[w].lines;
         }
     }
 
-    var pc     : logic  <64> [CW + 1];
+    // ---- Lane PCs ----
+
+    // Anchor 0 is the head PC; anchor l + 1 is the target of lane l when lane
+    // l redirects its successor (BRU or xRET).
+    const NA  : u32 = CW + 1;
+    const HW_W: u32 = tag_pkg::idx_w(2 * CW + 1);
+
+    // One-hot of the highest set bit of x; 0 when x is 0.
+    function last_oh (
+        x: input logic<NA>,
+    ) -> logic<NA> {
+        var r: logic<NA>;
+        var f: logic<NA>;
+        for i in 0..NA {
+            r[i] = x[NA - 1 - i];
+        }
+        f = tree_first::<NA>(r);
+        for i in 0..NA {
+            r[i] = f[NA - 1 - i];
+        }
+        return r;
+    }
+
+    var nrvc : logic<CW>          ;
+    var n32  : logic<HW_W>   [CW] ; // 32-bit ops among lanes 0..l-1
+    var hw   : logic<HW_W>   [NA] ; // halfwords of lanes 0..k-1
+    var a_v  : logic<NA>          ;
+    var a_adj: logic<64>     [NA] ; // anchor PC minus 2 * hw[k]
+    var pc   : logic<64>     [CW] ;
+    always_comb {
+        for l in 0..CW {
+            nrvc[l] = !i_cm[l].ent.is_rvc;
+        }
+        tree_prefix_count::<CW, HW_W>(nrvc << 1, n32);
+        for k in 0..NA {
+            hw[k] = if k == CW ? 0 : n32[k % CW] + k;
+        }
+        a_v[0]   = 1'b1;
+        a_adj[0] = apc;
+        for l in 0..CW {
+            let e: RobEnt = i_cm[l].ent;
+            a_v[l + 1]   = e.fu == FuKind::BRU || e.flush == FlushKind::XRET;
+            a_adj[l + 1] = (if e.fu == FuKind::BRU ? i_cm[l].res.next_pc : if e.sret ? i_sret_pc : i_mret_pc) - {hw[l + 1], 1'b0};
+        }
+        for l in 0..CW {
+            pc[l] = tree_onehot_mux::<NA, 64>(last_oh(a_v & ((1 << (l + 1)) - 1)), a_adj) + {hw[l], 1'b0};
+        }
+    }
+
+
     var nxt_pc : logic  <64> [CW]    ;
     var outc   : Outcome     [CW]    ;
     var is_ld  : logic  <CW>         ;
@@ -168,7 +225,6 @@ pub module commit::<CFG: core_cfg> (
     var dr_wait: logic  <CW>         ;
 
     always_comb {
-        pc[0] = apc;
         for l in 0..CW {
             let e   : RobEnt     = i_cm[l].ent;
             let ctrl: logic      = e.fu == FuKind::BRU;
@@ -186,7 +242,7 @@ pub module commit::<CFG: core_cfg> (
             is_bar[l]  = e.ld_barr;
             exc[l]     = i_exc.valid && i_exc.tag == i_cm[l].tag;
             poison[l]  = |(lq_hit[l] & lq_pz);
-            alone_e[l] = e.alone || |(lq_hit[l] & lq_io) || |(sq_hit[l] & sq_io);
+            alone_e[l] = e.alone;
             ln1[l]     = e.sq_v && tree_onehot_mux::<MW, 2>(sq_hit[l], sq_ln) != 2'd0;
             ln2[l]     = e.sq_v && tree_onehot_mux::<MW, 2>(sq_hit[l], sq_ln) == 2'd2;
             kil[l]     = killed(i_kill, i_cm[l].tag);
@@ -196,7 +252,6 @@ pub module commit::<CFG: core_cfg> (
                 | tree_onehot_mux::<MW, OBS_W>(sq_hit[l], sq_bits)) as MemObs;
 
             nxt_pc[l] = if ctrl ? i_cm[l].res.next_pc : if e.flush == FlushKind::XRET ? xpc : pc[l] + len;
-            pc[l + 1] = nxt_pc[l];
 
             if !i_cm[l].valid || !i_cm[l].done {
                 outc[l] = Outcome::WAIT;
@@ -442,11 +497,9 @@ pub module commit::<CFG: core_cfg> (
                         ret_q[l].mem_size     = mo.size;
                         ret_q[l].mem_vaddr    = mo.vaddr;
                         ret_q[l].mem_paddr    = mo.paddr;
-                        ret_q[l].mem_io       = mo.io;
                         ret_q[l].mem_rmask    = mo.rmask;
                         ret_q[l].mem_wmask    = mo.wmask;
                         ret_q[l].mem_wdata    = mo.wdata;
-                        ret_q[l].mem_wdata_hi = mo.wdata_hi;
                     }
                     if c.ent.lq_v {
                         ret_q[l].mem_rdata = c.obs & rmask64[l];

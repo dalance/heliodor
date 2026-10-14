@@ -77,16 +77,34 @@ module rename::<CFG: core_cfg> (
         tree_prefix_count::<W, CW>(wr_fp << 1, rank_fp);
     }
 
+    // One-hot of the highest set bit of x (the youngest lane); 0 when none.
+    function last_lane (
+        x: input logic<W>,
+    ) -> logic<W> {
+        var r: logic<W>;
+        var f: logic<W>;
+        for i in 0..W {
+            r[i] = x[W - 1 - i];
+        }
+        f = tree_first::<W>(r);
+        for i in 0..W {
+            r[i] = f[W - 1 - i];
+        }
+        return r;
+    }
+
     var pdst: PReg [W];
+    var pidx: logic<PREG_W> [W];
     always_comb {
         for l in 0..W {
             pdst[l].cls = i_op[l].dst.rcls;
             pdst[l].idx = if wr_fp[l] ? i_pop_fp[rank_fp[l]] : i_pop_int[rank_int[l]];
+            pidx[l]     = pdst[l].idx;
         }
     }
 
-    // Source and old-destination lookup, overridden by older lanes of the
-    // group in lane order so the youngest older writer wins.
+    // Source and old-destination lookup, overridden by the youngest older
+    // writer of the group (an AND-OR select over the lanes).
     always_comb {
         for l in 0..W {
             var k     : logic   <KEY>    [3];
@@ -100,24 +118,19 @@ module rename::<CFG: core_cfg> (
             cls[0] = i_op[l].rs1.rcls;
             cls[1] = i_op[l].rs2.rcls;
             cls[2] = i_op[l].rs3.rcls;
-            g      = 0;
             for s in 0..3 {
-                p[s] = spec_q[k[s]];
-            }
-            oldp = spec_q[dkey[l]];
-            for j in 0..W {
-                if j <: l && wr[j] {
-                    for s in 0..3 {
-                        if dkey[j] == k[s] {
-                            p[s] = pdst[j].idx;
-                            g[s] = 1'b1;
-                        }
-                    }
-                    if dkey[j] == dkey[l] {
-                        oldp = pdst[j].idx;
-                    }
+                var m: logic<W>;
+                for j in 0..W {
+                    m[j] = j <: l && wr[j] && dkey[j] == k[s];
                 }
+                g[s] = m != '0;
+                p[s] = if g[s] ? tree_onehot_mux::<W, PREG_W>(last_lane(m), pidx) : spec_q[k[s]];
             }
+            var md: logic<W>;
+            for j in 0..W {
+                md[j] = j <: l && wr[j] && dkey[j] == dkey[l];
+            }
+            oldp = if md != '0 ? tree_onehot_mux::<W, PREG_W>(last_lane(md), pidx) : spec_q[dkey[l]];
             o_ren[l].ps1.cls  = cls[0];
             o_ren[l].ps1.idx  = p[0];
             o_ren[l].ps2.cls  = cls[1];
@@ -134,6 +147,26 @@ module rename::<CFG: core_cfg> (
     // the oldest lane of the batch (highest lane index) wins.
     let full: logic = i_kill.valid && i_kill.full;
 
+    const CMW: u32 = CFG::COMMIT_W;
+
+    // One-hot of the highest set bit over the commit lanes (the youngest).
+    function last_cm (
+        x: input logic<CMW>,
+    ) -> logic<CMW> {
+        var r: logic<CMW>;
+        var f: logic<CMW>;
+        for i in 0..CMW {
+            r[i] = x[CMW - 1 - i];
+        }
+        f = tree_first::<CMW>(r);
+        for i in 0..CMW {
+            r[i] = f[CMW - 1 - i];
+        }
+        return r;
+    }
+
+    var wk_d  : logic<PREG_W> [W]    ;
+    var cm_d  : logic<PREG_W> [CMW]  ;
     var ren_we: logic         [RAT_N];
     var ren_wd: logic<PREG_W> [RAT_N];
     var wlk_we: logic         [RAT_N];
@@ -141,29 +174,29 @@ module rename::<CFG: core_cfg> (
     var cm_we : logic         [RAT_N];
     var cm_wd : logic<PREG_W> [RAT_N];
     always_comb {
+        for l in 0..W {
+            wk_d[l] = i_walk[l].old_pdst;
+        }
+        for l in 0..CMW {
+            cm_d[l] = i_cm[l].pdst;
+        }
         for e in 0..RAT_N {
-            ren_we[e] = 1'b0;
-            ren_wd[e] = 0;
-            wlk_we[e] = 1'b0;
-            wlk_wd[e] = 0;
-            cm_we[e]  = 1'b0;
-            cm_wd[e]  = 0;
+            var rh: logic<W>  ;
+            var wh: logic<W>  ;
+            var ch: logic<CMW>;
             for l in 0..W {
-                if wr[l] && l <: i_take && dkey[l] == e {
-                    ren_we[e] = 1'b1;
-                    ren_wd[e] = pdst[l].idx;
-                }
-                if i_walk[l].valid && key(i_walk[l].cls, i_walk[l].rd_arch) == e {
-                    wlk_we[e] = 1'b1;
-                    wlk_wd[e] = i_walk[l].old_pdst;
-                }
+                rh[l] = wr[l] && l <: i_take && dkey[l] == e;
+                wh[l] = i_walk[l].valid && key(i_walk[l].cls, i_walk[l].rd_arch) == e;
             }
-            for l in 0..CFG::COMMIT_W {
-                if i_cm[l].retire && i_cm[l].has_rd && key(i_cm[l].cls, i_cm[l].arch) == e {
-                    cm_we[e] = 1'b1;
-                    cm_wd[e] = i_cm[l].pdst;
-                }
+            for l in 0..CMW {
+                ch[l] = i_cm[l].retire && i_cm[l].has_rd && key(i_cm[l].cls, i_cm[l].arch) == e;
             }
+            ren_we[e] = rh != '0;
+            ren_wd[e] = tree_onehot_mux::<W, PREG_W>(last_lane(rh), pidx);
+            wlk_we[e] = wh != '0;
+            wlk_wd[e] = tree_onehot_mux::<W, PREG_W>(last_lane(wh), wk_d);
+            cm_we[e]  = ch != '0;
+            cm_wd[e]  = tree_onehot_mux::<CMW, PREG_W>(last_cm(ch), cm_d);
         }
     }
 
@@ -203,7 +236,7 @@ module rename::<CFG: core_cfg> (
         if_reset {
             perf_q = 0 as RenPerf;
         } else {
-            perf_q.walk_start   = i_kill.valid && !i_kill.full && !i_kill.ckpt_v;
+            perf_q.walk_start   = i_kill.valid && !i_kill.full;
             perf_q.walk_cyc     = walk_any && !full;
             perf_q.full_restore = full;
         }

@@ -1,5 +1,5 @@
 // sb: committed store buffer; line write-combining, the drain port, the SB
-// part of the forwarding network and the ordering predicates
+// part of the forwarding network and the ordering predicate
 //
 // Ports (timing contract):
 //   i_push[PUSH_W]    : lines of the stores retired this cycle, in program
@@ -9,23 +9,28 @@
 //   i_fwd_q -> o_fwd  : combinational, against registered entries
 //   o_drain_*         : the head entry, registered state only, held until
 //                       i_drain_ack (combinational from the dcache)
-//   o_resource_empty  : no entry to drain
-//   o_drained         : no entry and no drain shadow: every committed store
-//                       is visible
-//   o_ordering_empty  : o_drained && i_aq_empty; what FENCE, IO, atomics and
-//                       the VU wait for
+//   o_drain_urgent    : registered state only: at most one entry is free;
+//                       asks the dcache to favour the drain
+//   o_ordering_empty  : no entry: every committed store is visible; what
+//                       FENCE and the other draining ops wait for
+//   o_perf            : combinational event wires
+//   o_chk             : sticky checker flags (HELIODOR_CHK only, else 0)
 // Owns:
 //   - a push merges into the youngest entry with its line, among the
 //     registered entries (except the head acked this cycle) and the entries
-//     made by earlier pushes of the samel cycle; otherwise it allocates
+//     made by earlier pushes of the same cycle; otherwise it allocates
 //   - a drained store stays visible to forwarding through its ack cycle and
-//     SHADOW_LEN cycles after (SHADOW_LEN = 0: a load forwards and reads the
-//     data array in the samel cycle, so the ack edge itself hands over)
+//     SHADOW_LEN cycles after. This module is built for SHADOW_LEN = 0 (a
+//     load forwards and reads the data array in the same cycle, so the ack
+//     edge itself hands over); CFG_ERR bit 17 rejects any other value
 //   - only the head drives the drain port, so the driver is the owner
 // Rationale:
 //   - merging into an older entry past entries of other lines reorders
 //     stores to different lines; RVWMO allows it and ordering_empty restores
 //     order for the operations that need it
+//   - a push that shares its line with an earlier push of the cycle takes
+//     the target of the first such push; new entries are numbered by a
+//     prefix count, so no chain runs across the push ports
 pub module sb::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
@@ -43,12 +48,8 @@ pub module sb::<CFG: core_cfg> (
     o_drain_urgent: output logic        ,
     i_drain_ack   : input  logic        ,
 
-    i_aq_empty      : input  logic,
-    o_resource_empty: output logic,
-    o_drained       : output logic,
     o_ordering_empty: output logic,
 
-    #[ifdef(HELIODOR_CHK)]
     o_chk: output logic<2>,
 
     o_perf: output core_types::<CFG>::SbPerf,
@@ -101,32 +102,33 @@ pub module sb::<CFG: core_cfg> (
 
     // ---- push targets ----
 
-    var p_new: logic<PUSH_W>         ;
-    var p_tgt: logic<QIW>     [PUSH_W];
-    var p_nw : logic<PUSH_W>         ; // wrap bit of a new entry's position
-    var n_new: logic<32>             ;
+    var p_m    : logic<QN>         [PUSH_W]; // registered entries holding the line
+    var p_same : logic<PUSH_W>     [PUSH_W]; // earlier pushes of the same line
+    var p_new  : logic<PUSH_W>             ;
+    var p_rank : logic<QTW>        [PUSH_W]; // new entries before push k
+    var p_base : logic<QIW>        [PUSH_W]; // target ignoring earlier pushes
+    var p_tgt  : logic<QIW>        [PUSH_W];
+    var p_nw   : logic<PUSH_W>             ; // wrap bit of a new entry's position
+    var n_new  : logic<32>                 ;
     always_comb {
-        n_new = 0;
         for k in 0..PUSH_W {
-            var m    : logic<QN>;
-            var samel : logic   ;
-            var s_tgt: logic<QIW>;
             for e in 0..QN {
-                m[e] = live[e] && e_line[e] == i_push[k].line && !(e == hix && i_drain_ack);
+                p_m[k][e] = live[e] && e_line[e] == i_push[k].line && !(e == hix && i_drain_ack);
             }
-            samel  = 1'b0;
-            s_tgt = '0;
-            for j in 0..k {
-                if i_push[j].valid && i_push[j].line == i_push[k].line {
-                    samel  = 1'b1;
-                    s_tgt = p_tgt[j];
-                }
+            for j in 0..PUSH_W {
+                p_same[k][j] = j <: k && i_push[j].valid && i_push[j].line == i_push[k].line;
             }
-            let at: logic<QTW> = sb_adv(tail_q, n_new);
-            p_new[k] = i_push[k].valid && !samel && m == '0;
-            p_tgt[k] = if samel ? s_tgt : if m != '0 ? tree_onehot_enc::<QN, QIW>(tree_oldest::<QN, QTW>(m, rtags)) : at[QIW - 1:0];
-            p_nw[k]  = at[QTW - 1];
-            n_new    = n_new + (p_new[k] as 32);
+            p_new[k] = i_push[k].valid && p_same[k] == '0 && p_m[k] == '0;
+        }
+        tree_prefix_count::<PUSH_W, QTW>(p_new << 1, p_rank);
+        n_new = tree_popcount::<PUSH_W, 32>(p_new);
+        for k in 0..PUSH_W {
+            let at: logic<QTW> = sb_adv(tail_q, p_rank[k] as 32);
+            p_base[k] = if p_m[k] != '0 ? tree_onehot_enc::<QN, QIW>(tree_oldest::<QN, QTW>(p_m[k], rtags)) : at[QIW - 1:0];
+            p_nw[k]   = at[QTW - 1];
+        }
+        for k in 0..PUSH_W {
+            p_tgt[k] = if p_same[k] != '0 ? tree_onehot_mux::<PUSH_W, QIW>(tree_first::<PUSH_W>(p_same[k]), p_base) : p_base[k];
         }
     }
 
@@ -169,9 +171,7 @@ pub module sb::<CFG: core_cfg> (
         assign o_drain_data[l] = e_data[hix][l * 64+:64];
         assign o_drain_strb[l] = e_strb[hix][l * 8+:8];
     }
-    assign o_resource_empty = cnt == 0;
-    assign o_drained        = cnt == 0;
-    assign o_ordering_empty = cnt == 0 && i_aq_empty;
+    assign o_ordering_empty = cnt == 0;
 
     // ---- state ----
 
@@ -225,12 +225,11 @@ pub module sb::<CFG: core_cfg> (
     }
 
     always_comb {
-        var mg: logic;
-        mg = 1'b0;
+        var mg: logic<PUSH_W>;
         for k in 0..PUSH_W {
-            mg |= i_push[k].valid && !p_new[k];
+            mg[k] = i_push[k].valid && !p_new[k];
         }
-        o_perf.merge  = mg;
+        o_perf.merge  = |mg;
         o_perf.alloc  = p_new != '0;
         o_perf.full   = cnt == QN;
         o_perf.urgent = o_drain_urgent;
@@ -249,4 +248,6 @@ pub module sb::<CFG: core_cfg> (
             o_chk                      ,
         );
     }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
 }
