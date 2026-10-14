@@ -184,6 +184,292 @@ pub package core_types::<CFG: core_cfg> {
         return k.valid && (k.full || tag_older::<ROB_TAG_W>(k.keep, t));
     }
 
+    // The FTQ tag allocated after t (Kill.ftq_tail of a partial kill).
+    function ftq_next (
+        t: input FtqTag,
+    ) -> FtqTag {
+        return tag_next::<FTQ_TAG_W, CFG::FTQ_N>(t) as FtqTag;
+    }
+
+    // ---- Writeback ----
+
+    struct ExTag {
+        rob   : RobTag,
+        pdst  : PReg  ,
+        has_rd: logic ,
+    }
+
+    struct WbPacket {
+        valid : logic              ,
+        tag   : ExTag              ,
+        data  : logic          <64>,
+        exc   : exc_pkg::ExcRec    ,
+        fflags: logic          <5> ,
+        br    : BrResolve          , // BRU ports only
+    }
+
+    // WB port p is exec port p for p < ISSUE_W, else memory pipe p - ISSUE_W.
+    // Exceptions arrive only on the memory pipe ports.
+    function wb_has_bru (
+        p: input u32,
+    ) -> logic {
+        var r: logic;
+        r = 1'b0;
+        for q in 0..CFG::ISSUE_W {
+            if q == p {
+                r = CFG::PORT_FU[q][FuKind::BRU];
+            }
+        }
+        return r;
+    }
+
+    // ---- ROB ----
+
+    // Entry fields written by dispatch.
+    struct RobEnt {
+        fu      : FuKind           ,
+        drain   : logic            ,
+        flush   : FlushKind        ,
+        alone   : logic            ,
+        csr_wr  : logic            ,
+        effect  : Effect           ,
+        is_rvc  : logic            ,
+        sret    : logic            , // XRET flavour: 1 SRET, 0 MRET
+        fence_i : logic            , // retire invalidates the icache
+        has_rd  : logic            ,
+        rd_arch : logic    <5>     ,
+        pdst    : PReg             ,
+        old_pdst: PReg             , // its cls is the class of rd_arch
+        lq      : LqTag            ,
+        lq_v    : logic            ,
+        sq      : SqTag            ,
+        sq_v    : logic            ,
+        ftq     : FtqTag           ,
+        foff    : logic    <FOFF_W>,
+        insn    : logic    <32>    , // expanded instruction, retire record only
+    }
+
+    // Ring positions just after an op was allocated (rewind targets).
+    struct RobSnap {
+        lq_tail: LqTag ,
+        sq_tail: SqTag ,
+        fl_int : FlPtr ,
+        fl_fp  : FlPtr ,
+        bar_seq: BarSeq,
+    }
+
+    // One dispatch lane. exc is a dispatch-time exception (fu == NONE).
+    struct RobAlloc {
+        ent : RobEnt         ,
+        snap: RobSnap        ,
+        exc : exc_pkg::ExcRec,
+    }
+
+    struct ResRec {
+        mispred: logic    ,
+        taken  : logic    ,
+        next_pc: logic<64>,
+    }
+
+    // A commit-window lane: the entry at head + l.
+    struct RobCm {
+        valid    : logic     ,
+        tag      : RobTag    ,
+        ent      : RobEnt    ,
+        done     : logic     ,
+        fflags   : logic <5> ,
+        res      : ResRec    ,
+        recovered: logic     ,
+        obs      : logic <64>, // value written to rd, retire record only
+    }
+
+    // ROB head and the oldest token.
+    struct TagTok {
+        valid: logic ,
+        tag  : RobTag,
+    }
+
+    // The oldest reported exception (rob.exc_q).
+    struct ExcHold {
+        valid: logic          ,
+        tag  : RobTag         ,
+        rec  : exc_pkg::ExcRec,
+    }
+
+    // One walk lane: RAT[{old_pdst.cls, rd_arch}] := old_pdst.idx.
+    struct WalkLane {
+        valid   : logic   ,
+        rd_arch : logic<5>,
+        old_pdst: PReg    ,
+    }
+
+    // ---- Commit ----
+
+    // Retire-record fields of a memory access, kept by its LQ/SQ entry.
+    struct MemObs {
+        size    : logic<3> ,
+        vaddr   : logic<64>,
+        paddr   : logic<64>,
+        io      : logic    ,
+        rmask   : logic<16>,
+        wmask   : logic<16>,
+        wdata   : logic<64>,
+        wdata_hi: logic<64>,
+    }
+
+    // Commit window entries, registered by lq (COMMIT_W oldest) and sq
+    // (MEM_W oldest); commit selects by tag equality.
+    struct LqCmWin {
+        valid     : logic ,
+        tag       : LqTag ,
+        poison    : logic ,
+        io_ordered: logic ,
+        obs       : MemObs,
+    }
+
+    struct SqCmWin {
+        valid     : logic    ,
+        tag       : SqTag    ,
+        retire_ok : logic    , // addr_v && data_v && (kind != IO || wt_done)
+        io_ordered: logic    ,
+        lines     : logic <2>, // sb lines pushed at retire: 0 (CMO, IO), 1, or 2 (line-crossing)
+        obs       : MemObs   ,
+    }
+
+    // sb credit offered to commit, saturated at PUSH_W lines.
+    const SB_CREDIT_W: u32 = tag_pkg::idx_w(PUSH_W + 1);
+
+    // Units whose started pulse sets commit.head_started_q: fu_sys.
+    const STARTED_N: u32 = 1;
+
+    struct RatCm {
+        valid  : logic   ,
+        rd_arch: logic<5>,
+        pdst   : PReg    ,
+    }
+
+    struct FlRel {
+        valid: logic,
+        pdst : PReg ,
+    }
+
+    // Per retired lane, to ftq and bpu.
+    struct FtqCm {
+        valid  : logic         ,
+        ftq    : FtqTag        ,
+        foff   : logic <FOFF_W>,
+        is_ctrl: logic         ,
+        res    : ResRec        ,
+    }
+
+    // Commit's flush request to flush_ctrl. ftq/foff/taken only for BR_CM.
+    struct CmFlush {
+        valid: logic            ,
+        kind : RedirKind        ,
+        pc   : logic    <64>    ,
+        ftq  : FtqTag           ,
+        foff : logic    <FOFF_W>,
+        taken: logic            ,
+    }
+
+    enum XfKind: logic<2> {
+        SFENCE,
+        HFENCE_VVMA,
+        HFENCE_GVMA,
+    }
+
+    struct XlateFlush {
+        valid   : logic     ,
+        kind    : XfKind    ,
+        va      : logic <64>,
+        asid    : logic <16>,
+        all_va  : logic     ,
+        all_asid: logic     ,
+    }
+
+    // Written by fu_sys for the op holding the oldest token.
+    struct SysPending {
+        valid    : logic         ,
+        tag      : RobTag        ,
+        csr_addr : logic     <12>,
+        csr_wdata: logic     <64>,
+        xf       : XlateFlush    ,
+    }
+
+    // csr's pending interrupt, registered by commit before use.
+    struct IrqReq {
+        pending: logic   ,
+        code   : logic<6>,
+        to_s   : logic   ,
+        to_vs  : logic   ,
+    }
+
+    // commit -> csr
+    struct CsrCm {
+        wr_en      : logic              ,
+        wr_addr    : logic<12>          ,
+        wr_data    : logic<64>          ,
+        mret       : logic              ,
+        sret       : logic              ,
+        instret_cnt: logic<RETIRE_CNT_W>,
+        fflags_set : logic              ,
+        fflags     : logic<5>           ,
+    }
+
+    // trap_unit -> csr
+    struct CsrTrap {
+        fire : logic    ,
+        pc   : logic<64>,
+        cause: logic<64>,
+        tval : logic<64>,
+        to_s : logic    ,
+        to_vs: logic    ,
+        htval: logic<64>,
+        gva  : logic    ,
+    }
+
+    // ---- Firing events (registered) ----
+
+    struct RobPerf {
+        walk    : logic, // a walk batch is presented
+        exc_repl: logic, // exc_q replaced by an older report
+    }
+
+    // Group cuts name the reason at the first lane that did not retire.
+    struct CmPerf {
+        retire_n   : logic<RETIRE_CNT_W>,
+        cut_alone  : logic              ,
+        cut_exc    : logic              ,
+        cut_poison : logic              ,
+        cut_store  : logic              , // store or sb-line budget
+        wait_st    : logic              , // store not retire_ok
+        wait_drain : logic              ,
+        cut_limit  : logic              ,
+        cut_kill   : logic              ,
+        trap       : logic              ,
+        replay     : logic              ,
+        rf_xret    : logic              ,
+        rf_serial  : logic              ,
+        rf_br_cm   : logic              , // T8 backstop
+        irq_take   : logic              ,
+        irq_started: logic              , // interrupt waits for head_started_q
+    }
+
+    struct FlushPerf {
+        partial    : logic    ,
+        drop_walk  : logic    ,
+        drop_consec: logic    , // right after another kill
+        drop_full  : logic    , // commit flush in the same cycle
+        drop_older : logic    , // an older resolve won the tree
+        full       : logic    ,
+        full_kind  : RedirKind,
+    }
+
+    // Checker flag widths (bit meanings in each chk_* header).
+    const CHK_ROB_W  : u32 = 7;
+    const CHK_CM_W   : u32 = 7;
+    const CHK_FLUSH_W: u32 = 2;
+
     // ---- Structural constraints ----
 
     // One bit per violated constraint; a legal config has CFG_ERR == 0.

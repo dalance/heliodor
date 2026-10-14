@@ -1,0 +1,539 @@
+// commit: the commit-group function, retire side effects, interrupt
+// acceptance, the oldest token and the retire record.
+//
+// Ports (timing contract):
+//   i_cm, i_exc, i_head  : rob's registered window, exc_q and head
+//   i_lq_win, i_sq_win   : registered commit windows of lq and sq; a lane
+//                          selects its entry by tag equality
+//   i_ordering_empty, i_sb_credit : registered sb outputs (credit saturated
+//                          at PUSH_W lines)
+//   i_kill               : the registered Kill of this cycle
+//   i_sys_wr             : fu_sys write of sys_pending, applied on the edge
+//   i_started            : started-latch pulses of the units, on their
+//                          acceptance edge
+//   i_irq                : csr's pending interrupt, registered here (irq_q)
+//                          before any use
+//   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs
+//   i_dbg_*              : lockstep controls, all 0 in normal use
+//   decision outputs     : o_retire_cnt, o_flush, o_trap_fire, o_irq_take,
+//                          the side-effect ports and o_csr are combinational
+//                          functions of registered state, i_kill and i_dbg_*
+//   o_oldest             : from registered state and i_kill only
+//   o_retire, o_irq_evt  : registered, one cycle after retire
+// Owns:
+//   - retire is a prefix of the lanes; at most one flush per cycle (irq >
+//     trap > replay > the RETIRE_FLUSH of the youngest retired lane); a
+//     trap, replay or interrupt cycle retires nothing
+//   - every side effect is conditioned on retire[l] alone (plus trap_fire
+//     or irq_take on lane 0), never on "the head is valid"
+//   - arch_next_pc_q is the PC of the head op whenever the head is valid,
+//     so lane PCs are derived and never stored
+//   - a lane never retires an op that the kill of the cycle selects
+// Rationale:
+//   - trap, replay and interrupts act only at the group head (lane 0); an
+//     exception, poison or alone op on a younger lane cuts the group so it
+//     becomes the head next cycle. This is an order property of the group,
+//     not a per-lane special case
+//   - the token is computed from the registered head, so it passes to the
+//     next op one cycle after the previous op retires
+pub module commit::<CFG: core_cfg> (
+    clk                  : input  clock                                                                         ,
+    rst                  : input  reset                                                                         ,
+    i_reset_pc           : input  logic                        <64>                                             ,
+    i_cm                 : input  core_types::<CFG>::RobCm                                       [CFG::COMMIT_W],
+    i_exc                : input  core_types::<CFG>::ExcHold                                                    ,
+    i_head               : input  core_types::<CFG>::TagTok                                                     ,
+    i_lq_win             : input  core_types::<CFG>::LqCmWin                                     [CFG::COMMIT_W],
+    i_sq_win             : input  core_types::<CFG>::SqCmWin                                     [CFG::MEM_W]   ,
+    i_ordering_empty     : input  logic                                                                         ,
+    i_sb_credit          : input  logic                        <core_types::<CFG>::SB_CREDIT_W>                 ,
+    i_kill               : input  core_types::<CFG>::Kill                                                       ,
+    i_sys_wr             : input  core_types::<CFG>::SysPending                                                 ,
+    i_started            : input  logic                        <core_types::<CFG>::STARTED_N>                   ,
+    i_irq                : input  core_types::<CFG>::IrqReq                                                     ,
+    i_priv               : input  logic                        <2>                                              ,
+    i_virt               : input  logic                                                                         ,
+    i_trap_target        : input  logic                        <64>                                             ,
+    i_trap_tval          : input  logic                        <64>                                             ,
+    i_mret_pc            : input  logic                        <64>                                             ,
+    i_sret_pc            : input  logic                        <64>                                             ,
+    i_dbg_retire_limit_en: input  logic                                                                         ,
+    i_dbg_retire_limit   : input  logic                        <64>                                             ,
+    i_dbg_irq_mask       : input  logic                                                                         ,
+    i_dbg_irq_allow      : input  logic                                                                         ,
+    o_retire_cnt         : output logic                        <core_types::<CFG>::RETIRE_CNT_W>                ,
+    o_oldest             : output core_types::<CFG>::TagTok                                                     ,
+    o_flush              : output core_types::<CFG>::CmFlush                                                    ,
+    o_trap_fire          : output logic                                                                         ,
+    o_irq_take           : output logic                                                                         ,
+    o_irq_q              : output core_types::<CFG>::IrqReq                                                     ,
+    o_epc                : output logic                        <64>                                             ,
+    o_rat_cm             : output core_types::<CFG>::RatCm                                       [CFG::COMMIT_W],
+    o_fl_rel             : output core_types::<CFG>::FlRel                                       [CFG::COMMIT_W],
+    o_lq_ret_cnt         : output logic                        <core_types::<CFG>::RETIRE_CNT_W>                ,
+    o_sq_ret_cnt         : output logic                        <core_types::<CFG>::RETIRE_CNT_W>                ,
+    o_ftq_cm             : output core_types::<CFG>::FtqCm                                       [CFG::COMMIT_W],
+    o_icache_inv         : output logic                                                                         ,
+    o_csr                : output core_types::<CFG>::CsrCm                                                      ,
+    o_retire             : output retire_pkg::RetireRec                                          [CFG::COMMIT_W],
+    o_irq_evt            : output retire_pkg::IrqEvent                                                          ,
+    o_perf               : output core_types::<CFG>::CmPerf                                                     ,
+    o_chk                : output logic                        <core_types::<CFG>::CHK_CM_W>                    ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+    import retire_pkg::*;
+
+    const CW   : u32 = CFG::COMMIT_W;
+    const MW   : u32 = CFG::MEM_W;
+    const RC_W : u32 = RETIRE_CNT_W;
+    const OBS_W: u32 = $bits(MemObs);
+
+    enum Outcome: logic<3> {
+        WAIT,
+        RETIRE,
+        RETIRE_FLUSH,
+        TRAP,
+        REPLAY,
+    }
+
+    var arch_pc_q: logic     <64>     ;
+    var boot_q   : logic              ; // first cycle out of reset: the PC is i_reset_pc
+    var order_q  : logic     <64>     ;
+    var irq_q    : IrqReq             ;
+    var sys_q    : SysPending         ;
+    var started_q: logic              ;
+    var ret_q    : RetireRec      [CW];
+    var evt_q    : IrqEvent           ;
+    var perf_q   : CmPerf             ;
+
+    // i_reset_pc is an input, not a reset constant.
+    let apc: logic<64> = if boot_q ? i_reset_pc : arch_pc_q;
+
+    // ---- Interrupt acceptance and the oldest token ----
+
+    let limit_hit: logic = i_dbg_retire_limit_en && order_q >= i_dbg_retire_limit;
+    let irq_ok   : logic = !i_dbg_irq_mask
+        || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit);
+    let irq_take : logic = irq_q.pending && irq_ok && !started_q && !i_kill.valid;
+
+    always_comb {
+        o_oldest.valid = i_head.valid && !(irq_q.pending && irq_ok) && !limit_hit && !i_kill.valid;
+        o_oldest.tag   = i_head.tag;
+    }
+
+    // ---- Lane classification ----
+
+    var lq_bits: logic<OBS_W> [CW];
+    var lq_pz  : logic<CW>        ;
+    var lq_io  : logic<CW>        ;
+    var sq_bits: logic<OBS_W> [MW];
+    var sq_ok  : logic<MW>        ;
+    var sq_io  : logic<MW>        ;
+    var sq_ln  : logic<2>     [MW];
+    always_comb {
+        for w in 0..CW {
+            lq_bits[w] = i_lq_win[w].obs;
+            lq_pz[w]   = i_lq_win[w].poison;
+            lq_io[w]   = i_lq_win[w].io_ordered;
+        }
+        for w in 0..MW {
+            sq_bits[w] = i_sq_win[w].obs;
+            sq_ok[w]   = i_sq_win[w].retire_ok;
+            sq_io[w]   = i_sq_win[w].io_ordered;
+            sq_ln[w]   = i_sq_win[w].lines;
+        }
+    }
+
+    var pc     : logic  <64> [CW + 1];
+    var nxt_pc : logic  <64> [CW]    ;
+    var outc   : Outcome     [CW]    ;
+    var is_ld  : logic  <CW>         ;
+    var is_st  : logic  <CW>         ;
+    var exc    : logic  <CW>         ;
+    var poison : logic  <CW>         ;
+    var alone_e: logic  <CW>         ;
+    var ln1    : logic  <CW>         ; // store pushes at least one line
+    var ln2    : logic  <CW>         ; // store pushes two lines
+    var lq_hit : logic  <CW> [CW]    ;
+    var sq_hit : logic  <MW> [CW]    ;
+    var mem_obs: MemObs      [CW]    ;
+    var kil    : logic  <CW>         ;
+    var st_wait: logic  <CW>         ;
+    var dr_wait: logic  <CW>         ;
+
+    always_comb {
+        pc[0] = apc;
+        for l in 0..CW {
+            let e   : RobEnt     = i_cm[l].ent;
+            let ctrl: logic      = e.fu == FuKind::BRU;
+            let len : logic <64> = if e.is_rvc ? 64'd2 : 64'd4;
+            let xpc : logic <64> = if e.sret ? i_sret_pc : i_mret_pc;
+
+            for w in 0..CW {
+                lq_hit[l][w] = e.lq_v && i_lq_win[w].valid && i_lq_win[w].tag == e.lq;
+            }
+            for w in 0..MW {
+                sq_hit[l][w] = e.sq_v && i_sq_win[w].valid && i_sq_win[w].tag == e.sq;
+            }
+            is_ld[l]   = e.lq_v;
+            is_st[l]   = e.sq_v;
+            exc[l]     = i_exc.valid && i_exc.tag == i_cm[l].tag;
+            poison[l]  = |(lq_hit[l] & lq_pz);
+            alone_e[l] = e.alone || |(lq_hit[l] & lq_io) || |(sq_hit[l] & sq_io);
+            ln1[l]     = e.sq_v && tree_onehot_mux::<MW, 2>(sq_hit[l], sq_ln) != 2'd0;
+            ln2[l]     = e.sq_v && tree_onehot_mux::<MW, 2>(sq_hit[l], sq_ln) == 2'd2;
+            kil[l]     = killed(i_kill, i_cm[l].tag);
+            st_wait[l] = e.sq_v && !(|(sq_hit[l] & sq_ok));
+            dr_wait[l] = e.drain && !i_ordering_empty;
+            mem_obs[l] = (tree_onehot_mux::<CW, OBS_W>(lq_hit[l], lq_bits)
+                | tree_onehot_mux::<MW, OBS_W>(sq_hit[l], sq_bits)) as MemObs;
+
+            nxt_pc[l] = if ctrl ? i_cm[l].res.next_pc : if e.flush == FlushKind::XRET ? xpc : pc[l] + len;
+            pc[l + 1] = nxt_pc[l];
+
+            if !i_cm[l].valid || !i_cm[l].done {
+                outc[l] = Outcome::WAIT;
+            } else if exc[l] {
+                outc[l] = Outcome::TRAP;
+            } else if poison[l] {
+                outc[l] = Outcome::REPLAY;
+            } else if st_wait[l] || dr_wait[l] {
+                outc[l] = Outcome::WAIT;
+            } else if e.flush != FlushKind::NONE || (ctrl && i_cm[l].res.mispred && !i_cm[l].recovered) {
+                outc[l] = Outcome::RETIRE_FLUSH;
+            } else {
+                outc[l] = Outcome::RETIRE;
+            }
+        }
+    }
+
+    // ---- The group ----
+
+    var n_st: logic<RC_W> [CW];
+    var n_l1: logic<RC_W> [CW];
+    var n_l2: logic<RC_W> [CW];
+    always_comb {
+        tree_prefix_count::<CW, RC_W>(is_st, n_st);
+        tree_prefix_count::<CW, RC_W>(ln1, n_l1);
+        tree_prefix_count::<CW, RC_W>(ln2, n_l2);
+    }
+
+    // The group head is lane 0: cuts act only on younger lanes.
+    const HEAD: logic<CW> = 1;
+
+    var ok    : logic<CW>;
+    var cut   : logic<CW>;
+    var fin   : logic<CW>; // nothing younger joins the group
+    var lim_ok: logic<CW>;
+    var bud_ok: logic<CW>;
+    var retire: logic<CW>;
+    always_comb {
+        for l in 0..CW {
+            let rf       : logic = outc[l] == Outcome::RETIRE_FLUSH;
+            lim_ok[l] = !i_dbg_retire_limit_en || order_q + l <: i_dbg_retire_limit;
+            bud_ok[l] = n_st[l] <= MW && ((n_l1[l] as u32) + (n_l2[l] as u32)) <= (i_sb_credit as u32);
+            ok[l]     = (outc[l] == Outcome::RETIRE || rf) && !kil[l] && bud_ok[l] && lim_ok[l];
+            fin[l]    = rf || alone_e[l];
+        }
+        cut    = (alone_e | exc | poison) & ~HEAD;
+        retire = if irq_take ? 0 : tree_prefix_and::<CW>(ok & ~cut & ~(fin << 1));
+    }
+
+    let head_go    : logic = !irq_take && !kil[0] && lim_ok[0];
+    let trap_fire  : logic = head_go && outc[0] == Outcome::TRAP;
+    let replay_fire: logic = head_go && outc[0] == Outcome::REPLAY;
+
+    var rf_lane: logic<CW>;
+    always_comb {
+        for l in 0..CW {
+            rf_lane[l] = retire[l] && outc[l] == Outcome::RETIRE_FLUSH;
+        }
+    }
+    let rf_any: logic = |rf_lane;
+
+    // Youngest retired lane; retire is a prefix.
+    let last: logic<CW> = retire & ~(retire >> 1);
+
+    // One-hot selects over the lanes: the RETIRE_FLUSH lane, and the
+    // backstop lane among them.
+    var l_xret: logic<CW>            ;
+    var l_ser : logic<CW>            ;
+    var l_br  : logic<CW>            ;
+    var l_ftq : logic<FTQ_TAG_W> [CW];
+    var l_foff: logic<FOFF_W>    [CW];
+    var l_tkn : logic<CW>            ;
+    always_comb {
+        for l in 0..CW {
+            l_xret[l] = rf_lane[l] && i_cm[l].ent.flush == FlushKind::XRET;
+            l_ser[l]  = rf_lane[l] && i_cm[l].ent.flush == FlushKind::NEXT_PC;
+            l_br[l]   = rf_lane[l] && i_cm[l].ent.flush == FlushKind::NONE;
+            l_ftq[l]  = i_cm[l].ent.ftq;
+            l_foff[l] = i_cm[l].ent.foff;
+            l_tkn[l]  = i_cm[l].res.taken;
+        }
+    }
+
+    let rf_kind: RedirKind         = if |l_xret ? RedirKind::XRET : if |l_ser ? RedirKind::SERIAL : RedirKind::BR_CM;
+    let rf_pc  : logic    <64>     = tree_onehot_mux::<CW, 64>(rf_lane, nxt_pc);
+    let rf_ftq : FtqTag            = tree_onehot_mux::<CW, FTQ_TAG_W>(l_br, l_ftq) as FtqTag;
+    let rf_foff: logic    <FOFF_W> = tree_onehot_mux::<CW, FOFF_W>(l_br, l_foff);
+    let rf_tkn : logic             = |(l_br & l_tkn);
+    let new_pc : logic    <64>     = tree_onehot_mux::<CW, 64>(last, nxt_pc);
+
+    always_comb {
+        o_flush.valid = irq_take || trap_fire || replay_fire || rf_any;
+        o_flush.kind  = if irq_take ?
+            RedirKind::IRQ
+        : if trap_fire ?
+            RedirKind::TRAP
+        : if replay_fire ?
+            RedirKind::REPLAY
+        :
+            rf_kind
+        ;
+        o_flush.pc    = if irq_take || trap_fire ? i_trap_target : if replay_fire ? apc : rf_pc;
+        o_flush.ftq   = if irq_take ? 0 : rf_ftq;
+        o_flush.foff  = if irq_take ? 0 : rf_foff;
+        o_flush.taken = !irq_take && rf_tkn;
+    }
+
+    var c_ret: logic<RC_W> [CW];
+    var c_ld : logic<RC_W> [CW];
+    var c_st : logic<RC_W> [CW];
+    always_comb {
+        tree_prefix_count::<CW, RC_W>(retire, c_ret);
+        tree_prefix_count::<CW, RC_W>(retire & is_ld, c_ld);
+        tree_prefix_count::<CW, RC_W>(retire & is_st, c_st);
+    }
+    let n_ret: logic<RC_W> = c_ret[CW - 1];
+
+    assign o_retire_cnt = n_ret;
+    assign o_trap_fire  = trap_fire;
+    assign o_irq_take   = irq_take;
+    assign o_irq_q      = irq_q;
+    assign o_epc        = apc;
+    assign o_lq_ret_cnt = c_ld[CW - 1];
+    assign o_sq_ret_cnt = c_st[CW - 1];
+
+    // ---- Side effects ----
+
+    var sys_ret: logic<CW>    ;
+    var csr_ret: logic<CW>    ;
+    var mret   : logic<CW>    ;
+    var sret   : logic<CW>    ;
+    var fen_i  : logic<CW>    ;
+    var ffl_v  : logic<CW>    ;
+    var ffl_col: logic<CW> [5];
+    always_comb {
+        for l in 0..CW {
+            let e         : RobEnt = i_cm[l].ent;
+            sys_ret[l] = retire[l] && e.fu == FuKind::SYS;
+            csr_ret[l] = sys_ret[l] && e.csr_wr;
+            mret[l]    = retire[l] && e.flush == FlushKind::XRET && !e.sret;
+            sret[l]    = retire[l] && e.flush == FlushKind::XRET && e.sret;
+            fen_i[l]   = retire[l] && e.fence_i;
+            ffl_v[l]   = retire[l] && e.effect.fflags;
+            for b in 0..5 {
+                ffl_col[b][l] = ffl_v[l] && i_cm[l].fflags[b];
+            }
+
+            o_rat_cm[l].valid   = retire[l] && e.has_rd;
+            o_rat_cm[l].rd_arch = e.rd_arch;
+            o_rat_cm[l].pdst    = e.pdst;
+            o_fl_rel[l].valid   = retire[l] && e.has_rd;
+            o_fl_rel[l].pdst    = e.old_pdst;
+
+            o_ftq_cm[l].valid   = retire[l];
+            o_ftq_cm[l].ftq     = e.ftq;
+            o_ftq_cm[l].foff    = e.foff;
+            o_ftq_cm[l].is_ctrl = e.fu == FuKind::BRU;
+            o_ftq_cm[l].res     = i_cm[l].res;
+        }
+        o_icache_inv      = |fen_i;
+        o_csr.wr_en       = |csr_ret;
+        o_csr.wr_addr     = sys_q.csr_addr;
+        o_csr.wr_data     = sys_q.csr_wdata;
+        o_csr.mret        = |mret;
+        o_csr.sret        = |sret;
+        o_csr.instret_cnt = n_ret;
+        o_csr.fflags_set  = |ffl_v;
+        for b in 0..5 {
+            o_csr.fflags[b] = |ffl_col[b];
+        }
+    }
+
+    // ---- State ----
+
+    always_ff {
+        if_reset {
+            arch_pc_q = 0;
+            boot_q    = 1'b1;
+            order_q   = 0;
+            irq_q     = 0;
+            sys_q     = 0;
+            started_q = 1'b0;
+        } else {
+            irq_q  = i_irq;
+            boot_q = 1'b0;
+            if irq_take || trap_fire {
+                arch_pc_q = i_trap_target;
+            } else if |retire {
+                arch_pc_q = new_pc;
+            } else {
+                arch_pc_q = apc;
+            }
+            order_q = order_q + (n_ret as 64) + (trap_fire as 64);
+
+            if (sys_q.valid && killed(i_kill, sys_q.tag)) || |sys_ret {
+                sys_q.valid = 1'b0;
+            }
+            if i_sys_wr.valid {
+                sys_q = i_sys_wr;
+            }
+
+            if retire[0] || trap_fire || (i_kill.valid && i_kill.full) {
+                started_q = 1'b0;
+            }
+            if |i_started {
+                started_q = 1'b1;
+            }
+        }
+    }
+
+    // ---- Retire record ----
+
+    var rmask64: logic<64> [CW];
+    always_comb {
+        for l in 0..CW {
+            for b in 0..64 {
+                rmask64[l][b] = mem_obs[l].rmask[b / 8];
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            for l in 0..CW {
+                ret_q[l] = 0;
+            }
+        } else {
+            for l in 0..CW {
+                let c               : RobCm  = i_cm[l];
+                let mo              : MemObs = mem_obs[l];
+                let tr              : logic  = trap_fire && l == 0;
+                ret_q[l]         = 0;
+                ret_q[l].valid   = retire[l] || tr;
+                ret_q[l].order   = order_q + l;
+                ret_q[l].pc      = pc[l];
+                ret_q[l].next_pc = if tr ? 64'd0 : nxt_pc[l];
+                ret_q[l].insn    = c.ent.insn;
+                ret_q[l].is_rvc  = c.ent.is_rvc;
+                ret_q[l].priv    = i_priv;
+                ret_q[l].virt    = i_virt;
+                if tr {
+                    ret_q[l].trap  = 1'b1;
+                    ret_q[l].cause = i_exc.rec.cause;
+                    ret_q[l].tval  = i_trap_tval;
+                } else {
+                    if c.ent.has_rd {
+                        ret_q[l].rd_kind  = if c.ent.pdst.cls == RegClass::FP ? RdKind::FP : RdKind::INT;
+                        ret_q[l].rd_addr  = c.ent.rd_arch;
+                        ret_q[l].rd_wdata = c.obs;
+                    }
+                    if c.ent.lq_v || c.ent.sq_v {
+                        ret_q[l].mem_size     = mo.size;
+                        ret_q[l].mem_vaddr    = mo.vaddr;
+                        ret_q[l].mem_paddr    = mo.paddr;
+                        ret_q[l].mem_io       = mo.io;
+                        ret_q[l].mem_rmask    = mo.rmask;
+                        ret_q[l].mem_wmask    = mo.wmask;
+                        ret_q[l].mem_wdata    = mo.wdata;
+                        ret_q[l].mem_wdata_hi = mo.wdata_hi;
+                    }
+                    if c.ent.lq_v {
+                        ret_q[l].mem_rdata = c.obs & rmask64[l];
+                    }
+                    if c.ent.fu == FuKind::SYS && c.ent.csr_wr {
+                        ret_q[l].csr_valid = 1'b1;
+                        ret_q[l].csr_addr  = sys_q.csr_addr;
+                        ret_q[l].csr_wdata = sys_q.csr_wdata;
+                    }
+                    ret_q[l].fflags = c.fflags;
+                }
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            evt_q = 0;
+        } else {
+            evt_q.valid = irq_take;
+            evt_q.cause = irq_q.code;
+            evt_q.epc   = apc;
+            evt_q.order = order_q;
+        }
+    }
+
+    assign o_retire  = ret_q;
+    assign o_irq_evt = evt_q;
+
+    // ---- Firing events ----
+
+    // The first lane that did not retire while the group was still open.
+    var ready: logic<CW>;
+    var stop : logic<CW>;
+    always_comb {
+        for l in 0..CW {
+            ready[l] = i_cm[l].valid && i_cm[l].done;
+        }
+        stop = ~retire & ready & (((retire & ~fin) << 1) | HEAD);
+    }
+
+    always_ff {
+        if_reset {
+            perf_q = 0;
+        } else {
+            perf_q.retire_n    = n_ret;
+            perf_q.cut_alone   = |(stop & cut & alone_e);
+            perf_q.cut_exc     = |(stop & exc);
+            perf_q.cut_poison  = |(stop & poison);
+            perf_q.cut_store   = |(stop & ~bud_ok);
+            perf_q.wait_st     = |(stop & st_wait);
+            perf_q.wait_drain  = |(stop & dr_wait);
+            perf_q.cut_limit   = |(stop & ~lim_ok);
+            perf_q.cut_kill    = |(stop & kil);
+            perf_q.trap        = trap_fire;
+            perf_q.replay      = replay_fire;
+            perf_q.rf_xret     = rf_any && rf_kind == RedirKind::XRET;
+            perf_q.rf_serial   = rf_any && rf_kind == RedirKind::SERIAL;
+            perf_q.rf_br_cm    = rf_any && rf_kind == RedirKind::BR_CM;
+            perf_q.irq_take    = irq_take;
+            perf_q.irq_started = irq_q.pending && irq_ok && started_q && !i_kill.valid;
+        }
+    }
+
+    assign o_perf = perf_q;
+
+    #[ifdef(HELIODOR_CHK)]
+    inst u_chk: chk_commit::<CFG> (
+        clk                       ,
+        rst                       ,
+        i_retire     : retire     ,
+        i_cm                      ,
+        i_kill                    ,
+        i_trap_fire  : trap_fire  ,
+        i_replay_fire: replay_fire,
+        i_irq_take   : irq_take   ,
+        i_rf_lane    : rf_lane    ,
+        i_sys_q      : sys_q      ,
+        i_lq_hit     : lq_hit     ,
+        i_sq_hit     : sq_hit     ,
+        i_started                 ,
+        i_oldest     : o_oldest   ,
+        o_chk                     ,
+    );
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}
