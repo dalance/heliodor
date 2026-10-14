@@ -355,6 +355,36 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 5. 同じ関数を入れ子で呼ぶと recursion と誤判定される問題 (`veryl/crates/simulator/src/ir/statement.rs:4535`) を、clone 側で修正する。【決定】プロジェクト規則に従い、heliodor 側では回避しない。修正が入るまでの間も、tree は段ごとに配列を持つ generate で書く (§5.15)。この書き方は修正後もそのまま正しい。
 6. §3.5 の拒否の仕組みを確認する。
 
+#### 3.7.1 spike の結果 (2026-10-14、ブランチ `phase15/spike`)
+
+【決定】§3.6 の (A) を採る。fallback は使わない。spike (`src/spike/`、`tb/test_spk_*.veryl`) は、proto パッケージ `spk_cfg` と 2 つの構成パッケージ、generic な型パッケージ `spk_types::<CFG>`、generic モジュール `spk_rob::<CFG>`、非 generic wrapper `spk_core_w2/w4`、`type` パラメータと struct 配列ポートを持つ `spk_lane_queue`、const struct 配列パラメータ (PMA 表) を受ける `spk_pma_user`、ポート集合の異なる 2 本の generate-if 枝を持つ `spk_soc` から成る。
+
+| 項目 | 結果 |
+|---|---|
+| 1. cc backend | `check/build/test` 通過。`VERYL_AOT_C_DIAG=1` で whole-comb fallback は 0 (旧コアを含む既定スイート全体でも 0)。 |
+| 2. Verilator | `spk_soc` の 2 構成が cc と同じ値を出す。 |
+| 3. synth | `veryl synth --top` が `spk_core_w2`、`spk_core_w4`、`spk_soc` で通る。 |
+| 4. clone の単体テスト | spike が見つけた veryl のバグ 3 件を clone で直し、それぞれに回帰テストを足した (下記)。構文ごとの網羅的な単体テストは、M1b で各構文を最初に使うモジュールと一緒に足す。 |
+| 5. 入れ子呼び出し | パッケージの generic 関数では再現しない。モジュール内の関数では再現したので clone で直した (下記 D)。 |
+| 6. 拒否 (U6) | 未定義モジュールの instantiate は条件に関係なく常にエラーになり、幅 0 の型は確実に落ちない。【決定】`#[test] test_cfg_constraints` で全構成の制約定数を検査する。 |
+| cranelift (U10) | spike は `--backend cranelift` でも通る。skeleton 規模での到達範囲は M1b で測る。 |
+
+見つけて直した veryl のバグ (clone の修正ブランチ。統合ブランチ `local/heliodor-fixes` からビルドしたバイナリで heliodor を回す。upstream への PR はユーザが行う):
+
+| ID | 症状 | 原因 | ブランチ |
+|---|---|---|---|
+| A | 前のパラメータで大きさを決めたパッケージ struct の配列パラメータのメンバを参照すると「定義前の参照」になる | 配列で初期化した const のメンバパスが登録されず、外部参照として型を評価し直していた | `fix/param-array-member-ref` |
+| C | パッケージ内の `#[ifdef]` に `--define` が効かない (simulator だけ。SV 出力は正しい) | 名前解決が define を知らず、排他な変種のうち最後の宣言を選んでいた | `fix/sim-ifdef-package-items` |
+| D | 同じモジュール内関数の入れ子呼び出しが recursion と判定される | 引数を変換する前に展開中の印を付けていた | `fix/sim-nested-same-function-call` |
+
+仕様上の制約 (バグではない): パッケージの generic 関数に、モジュールのパラメータを generic 引数として渡せない (`p::f::<N>()` は循環依存として拒否される。インスタンスがパッケージ内に生成され、モジュールの `N` が見えないため)。【決定】そのような helper (`pma_check` など) はパッケージ外のグローバル generic 関数にする。グローバル関数は呼び出し元のモジュール内に生成される。
+
+その他の決定:
+
+- U7: 【決定】checker (`chk_*`) は `#[ifdef(HELIODOR_CHK)]` で囲み、`[test].defines` にだけ `HELIODOR_CHK` を入れる。`veryl synth` は define を渡さないので、synth からは自動的に外れる。Verilator でも `+define+HELIODOR_CHK` で有効にする。
+- `CORE` の既定値の切替 (検証計画 §2.5): バグ C の修正により、パッケージ const の `#[ifdef]` で切り替えられる。
+- U4: 【決定】新コアは `local/heliodor-fixes` の veryl を使う。旧コアはこのバイナリでも dhrystone/coremark がビット一致し、既定スイートも全通過した。
+
 【決定】fallback: spike で (A) が成立しなかった場合は、`#[ifdef]` で選ぶ素のパッケージ `core_cfg` (1 回の veryl 起動で 1 構成、もう 1 構成は別の worktree/.build で回す) に切り替える。§3.6 の import 規則により、モジュール本体は変わらない。`#(param)` を全モジュールに通す方式 (旧コア流) は採らない。理由: struct のフィールド幅をパラメータに追従させられず、モジュール間でタグ幅の食い違いを許してしまうため。
 
 ---
