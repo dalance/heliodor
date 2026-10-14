@@ -1,0 +1,145 @@
+// bpu: block predictor behind the predict/update/recover contract.
+//
+// Ports (timing contract):
+//   o_enq_valid/o_enq : at most one predicted block per cycle; held with its
+//                       data while i_enq_ready = 0
+//   i_enq_ready       : registered free space of the ftq
+//   i_rcv             : one-cycle pulse in a kill or predecode-redirect cycle
+//                       k: every in-flight lookup and the enqueue of cycle k
+//                       are dropped, the speculative state is restored from
+//                       the record, and prediction restarts at i_rcv.pc (its
+//                       block is offered at k+1)
+//   i_upd             : training of one committed block per cycle; always
+//                       accepted
+//   i_reset_pc        : static, the first block after reset starts here
+//   o_ev_taken_bubble : a predicted-taken block cost one lookup slot
+// Owns:
+//   - the ckpt enqueued with block n is the speculative state used to
+//     predict block n, before n's own push or pop
+//   - the lookup index never depends on a table result of the same cycle
+// Rationale:
+//   - bp_btb has BTB_LAT = 1: the sequential successor is looked up
+//     speculatively and dropped when the block turns out taken, one bubble
+//     per taken block; the ftq depth hides it
+//   - a return target comes from the stack at the prediction stage, so the
+//     table stores none for it
+pub module bpu::<CFG: core_cfg> (
+    clk              : input  clock                           ,
+    rst              : input  reset                           ,
+    i_reset_pc       : input  logic                       <64>,
+    o_enq_valid      : output logic                           ,
+    o_enq            : output core_types::<CFG>::FtqEnq       ,
+    i_enq_ready      : input  logic                           ,
+    i_rcv            : input  core_types::<CFG>::BpRecover    ,
+    i_upd            : input  core_types::<CFG>::BpUpdate     ,
+    o_ev_taken_bubble: output logic                           ,
+) {
+    import core_types::<CFG>::*;
+    import bpu_pkg::<CFG>::*;
+
+    function seq_pc (
+        pc: input logic<64>,
+    ) -> logic<64> {
+        return (pc & ~((CFG::FETCH_BYTES - 1) as 64)) + CFG::FETCH_BYTES;
+    }
+
+    var run_q  : logic    ; // 0 only in the first cycle after reset
+    var p1_v_q : logic    ; // a lookup was issued last cycle for p1_pc_q
+    var p1_pc_q: logic<64>;
+    var nxt_q  : logic<64>; // next block when p1 is empty
+
+    var b_pred: BlockPred    ;
+    var b_rvc : logic        ;
+    var b_meta: BtbMeta      ;
+    var r_top : logic    <64>;
+    var r_ckpt: RasCkpt      ;
+
+    // Prediction of the block in p1: a return takes the stack top.
+    let ret : logic     = is_pop(b_pred.exit_kind);
+    var pred: BlockPred;
+    always_comb {
+        pred = b_pred;
+        if b_pred.exit_v && ret {
+            pred.target = r_top;
+        }
+    }
+    let base  : logic<64> = p1_pc_q & ~((CFG::FETCH_BYTES - 1) as 64);
+    let ret_pc: logic<64> = base + {pred.exit_foff, 1'b0} + (if b_rvc ? 64'd2 : 64'd4);
+
+    let enq_v: logic = p1_v_q && !i_rcv.valid;
+    let fire : logic = enq_v && i_enq_ready;
+    let taken: logic = fire && pred.exit_v;
+
+    // The lookup index uses registered state and the recover record only.
+    let lk_pc: logic<64> = if i_rcv.valid ?
+        i_rcv.pc
+    : if !run_q ?
+        i_reset_pc
+    : if p1_v_q && fire ?
+        seq_pc(p1_pc_q)
+    : if p1_v_q ?
+        p1_pc_q
+    :
+        nxt_q
+    ;
+
+    inst u_btb: bp_btb::<CFG> (
+        clk               ,
+        rst               ,
+        i_lk_valid: 1'b1  ,
+        i_lk_pc   : lk_pc ,
+        o_pred    : b_pred,
+        o_exit_rvc: b_rvc ,
+        o_meta    : b_meta,
+        i_upd             ,
+    );
+
+    // Recover: the keep point's own call or return, when it was taken.
+    let rk   : CfiKind     = i_rcv.pd.cfi[i_rcv.foff] as CfiKind;
+    let rapp : logic       = i_rcv.apply && i_rcv.taken;
+    let rrvc : logic       = i_rcv.foff == NH - 1 || i_rcv.pd.start[i_rcv.foff + 1];
+    let rbase: logic  <64> = i_rcv.start_pc & ~((CFG::FETCH_BYTES - 1) as 64);
+    let rret : logic  <64> = rbase + {i_rcv.foff, 1'b0} + (if rrvc ? 64'd2 : 64'd4);
+
+    inst u_ras: bp_ras::<CFG> (
+        clk                                          ,
+        rst                                          ,
+        o_top      : r_top                           ,
+        o_ckpt     : r_ckpt                          ,
+        i_op_push  : taken && is_push(pred.exit_kind),
+        i_op_pop   : taken && ret,
+        i_op_val   : ret_pc                          ,
+        i_rst_valid: i_rcv.valid                     ,
+        i_rst_ckpt : i_rcv.ckpt as RasCkpt           ,
+        i_rst_push : rapp && is_push(rk),
+        i_rst_pop  : rapp && is_pop(rk),
+        i_rst_val  : rret                            ,
+    );
+
+    always_ff {
+        if_reset {
+            run_q   = 1'b0;
+            p1_v_q  = 1'b0;
+            p1_pc_q = 64'd0;
+            nxt_q   = 64'd0;
+        } else {
+            run_q = 1'b1;
+            if i_rcv.valid || !run_q || (p1_v_q && !fire) || !p1_v_q {
+                p1_v_q  = 1'b1;
+                p1_pc_q = lk_pc;
+            } else if taken {
+                p1_v_q = 1'b0;
+                nxt_q  = pred.target;
+            } else {
+                p1_pc_q = lk_pc;
+            }
+        }
+    }
+
+    assign o_enq_valid       = enq_v;
+    assign o_enq.start_pc    = p1_pc_q;
+    assign o_enq.pred        = pred;
+    assign o_enq.meta        = b_meta as PredMeta;
+    assign o_enq.ckpt        = r_ckpt as PredCkpt;
+    assign o_ev_taken_bubble = taken;
+}
