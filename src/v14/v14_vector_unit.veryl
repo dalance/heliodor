@@ -1,0 +1,3044 @@
+// Phase 12 V0: decoupled, in-order Vector Unit (VU).
+//
+// The VU owns the vector config state (vtype/vl, working copies) and drives the
+// VRF (vrf.veryl). It receives vector instructions from rename in PROGRAM ORDER
+// into a small in-order FIFO and executes them one at a time, head first — the
+// VRF is not renamed, so vector source operands are always the values the VU
+// itself wrote earlier in program order (no vector-operand wakeup needed). Only
+// the scalar (integer) operand of vadd.vx / vset*vl needs wakeup, which it gets
+// from the integer CDB exactly like iq_fp's int→fp source.
+//
+// Completion rides the lane-0 CDB at LOWEST priority (the VU drives the bus only
+// when the scalar pipe is idle, i_cdb_free). A vector-dest op (vadd) drives the
+// CDB with has_rd=0 to set the ROB's result_written; a vector→scalar op
+// (vmv.x.s, vset*vl) drives it with has_rd=1 to write the integer PRF + wake int
+// consumers + set result_written, exactly like an fcvt.w.s (FP→INT) writeback.
+//
+// V0 subset: vsetvli / vsetivli, vadd.{vv,vx,vi}, vmv.x.s. VLEN=128, ELEN=64.
+// Tail / masked-off elements are written as 0 (refined to vta/vma in V2).
+pub module v14_vector_unit #(
+    param VRF_W    : u32 = 5  ,
+    param VLEN     : u32 = 128 ,
+    param PRF_W    : u32 = 6  , // integer PRF index width
+    param ROB_IDX_W: u32 = 5  ,
+    param FIFO_N   : u32 = 8  ,
+    param FIFO_W   : u32 = 3  ,
+    // CP: FP operand pipeline. The COMPUTE present-phase drives the VRF operand
+    // fetch (FIFO read -> decode -> element select -> forward, ~10.5 ns) AND
+    // u_vfpu stage-1 (~13 ns) in one combinational cycle (the synth top cone when
+    // the scalar front register is on). VFP_PIPE=1 inserts a FETCH phase that
+    // registers the u_vfpu operands, splitting the fetch from stage-1 (~23.6 ->
+    // ~13 ns). Cost: +1 cycle per FP element (3 phases vs 2). Built DEAD (=0):
+    // fp_fetched_q is never set, so the FSM stays the 2-phase present/capture and
+    // o_/u_vfpu inputs take the live combinational operands = today (cycle-exact).
+    param VFP_PIPE : bit = 1  ,
+    // CP: MMU->dcache memory pipeline (cp_mmu_dcache_pipeline_plan.md, M2). When
+    // the core's MEM_PIPE is on, the dcache reads the REGISTERED translated PA one
+    // cycle after the MMU translates, so each VU mem element needs 2 cycles: a
+    // FETCH (drive vaddr -> MMU translate -> the core's M-stage latches the PA) and
+    // an ACCESS (the dcache reads the latched PA; the result lands here). mem_fetched_q
+    // splits the ACCESS-state element loop the same way fp_fetched_q splits COMPUTE.
+    // Passed from the core's `const MEM_PIPE` so the two stay in sync. Built DEAD
+    // (=0): mem_fetched_q is never set -> single-cycle element = today (cycle-exact).
+    param MEM_PIPE : bit = 0  ,
+    // CP: VU integer/permute datapath pipeline (cp_vu_datapath_pipeline_plan.md,
+    // cut #1). vrgather's per-element source addressing is a data-dependent chained
+    // VRF read: vs1 -> idx -> source-register select -> the dynamic vs2 read (the
+    // ~7.8 ns VU-compute floor). VINT_PIPE=1 inserts a FETCH phase in the permute
+    // COMPUTE FSM that registers the gather addressing (pm_g_sreg/sbitoff/oob) off
+    // the live vs1 read, so the deep vs2 read drives off the REGISTERED index the
+    // next cycle (the o_vs2_addr output now starts at a register, not at vs1). Cost:
+    // +1 cycle per vrgather element. Built DEAD (=0): pm_fetched_q is never set, so
+    // the permute FSM stays single-cycle and the addressing is live = cycle-exact.
+    param VINT_PIPE: bit = 1  ,
+    // CP: VU same-width integer ALU/mul datapath pipeline (cp_vrf_cut_plan.md §2).
+    // The register-serial VALU compute reads the full VRF group (vs2/vs1/vdold) and
+    // runs the multiply/ALU (valu_res) or compare (cmp_res) in one cycle -> the vrf
+    // 13.88 ns front. VALU_PIPE=1 inserts a FETCH cycle per plain-valu/compare group
+    // that latches the operands into va_vs*_q; compute then runs next cycle off the
+    // registers, splitting VRF-read (~3 ns) | multiply+ALU+write (~10 ns). Cost:
+    // +1 cycle per plain-valu/compare group. Widen/narrow/viota/divide keep live
+    // operands (below the front; divide is int_divider-bound). Built DEAD (=0):
+    // va_fetched_q is never set, all operands fold to the live inputs = cycle-exact.
+    param VALU_PIPE: bit = 1  ,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // ---- Dispatch (in-order push from rename) -------------------------------
+    i_alloc_en          : input  logic                ,
+    i_alloc_vec_op      : input  vector_pkg::VecOp    ,
+    i_alloc_instr       : input  logic         <32>   , // for immediate fields
+    i_alloc_vd          : input  logic         <VRF_W>, // rd field (vector dest / int rd)
+    i_alloc_vs1         : input  logic         <VRF_W>, // rs1 field (vector src1)
+    i_alloc_vs2         : input  logic         <VRF_W>, // rs2 field (vector src2)
+    i_alloc_uses_scalar : input  logic                , // reads int rs1
+    i_alloc_scalar_pdst : input  logic         <PRF_W>,
+    i_alloc_scalar_ready: input  logic                , // initial int-rs1 readiness
+    // V3b: FP scalar operand for .vf ops (vfadd.vf etc.). The renamed f[rs1]
+    // physical reg, captured at alloc; the VU reads it from prf_fp at execute.
+    // No readiness tracking is needed — the VU runs at the ROB head, so f[rs1]'s
+    // producer has committed and the value is in prf_fp.
+    i_alloc_fscalar_pdst: input  logic         <PRF_W>,
+    // V5h: SECOND int scalar operand for strided ops (vlse/vsse stride = x[rs2]).
+    // The renamed rs2 physical reg, captured at alloc; read from prf_int at the
+    // ROB head. Like the FP .vf scalar, no readiness tracking — at the head the
+    // stride producer has committed and the value is in prf_int.
+    i_alloc_scalar2_pdst: input  logic         <PRF_W>,
+    i_alloc_has_rd      : input  logic                , // writes a scalar rd (int or FP)
+    i_alloc_rd_is_fp    : input  logic                , // the scalar rd is an FP reg (vfmv.f.s)
+    i_alloc_rd_pdst     : input  logic         <PRF_W>,
+    i_alloc_rob_idx     : input  logic         <ROB_IDX_W>,
+    o_alloc_rdy         : output logic                , // FIFO has a free slot
+
+    // ---- Integer CDB snoop (wake the scalar operand) ------------------------
+    // Lane 0 = the merged CDB (includes the VU's own int writeback, so a
+    // vset*vl/vmv.x.s result wakes a younger vector op's scalar source).
+    i_cdb_int_valid: input logic       , // cdb.valid && !cdb_dest_is_fp && cdb.has_rd
+    i_cdb_int_pdst : input logic<PRF_W>,
+    i_cdb2_valid   : input logic       , // pipe-1 (always int)
+    i_cdb2_has_rd  : input logic       ,
+    i_cdb2_pdst    : input logic<PRF_W>,
+
+    // ---- Integer PRF scalar read (combinational, at execute) ----------------
+    o_scalar_pdst: output logic<PRF_W>,
+    i_scalar_data: input  logic<64>   ,
+
+    // ---- FP PRF scalar read (combinational, at execute; V3b .vf ops) --------
+    o_fscalar_pdst: output logic<PRF_W>,
+    i_fscalar_data: input  logic<64>   ,
+
+    // ---- 2nd int PRF scalar read (combinational, at head; V5h strided stride)
+    o_scalar2_pdst: output logic<PRF_W>,
+    i_scalar2_data: input  logic<64>   ,
+
+    // ---- VRF interface (combinational read, registered write) ---------------
+    // Four read ports: vs1, vs2, mask (always v0), old-vd (for vta/vma merge).
+    o_vs1_addr  : output logic<VRF_W>,
+    i_vs1_data  : input  logic<VLEN> ,
+    o_vs2_addr  : output logic<VRF_W>,
+    i_vs2_data  : input  logic<VLEN> ,
+    o_mask_addr : output logic<VRF_W>,
+    i_mask_data : input  logic<VLEN> ,
+    o_vdold_addr: output logic<VRF_W>,
+    i_vdold_data: input  logic<VLEN> ,
+    o_vd_addr   : output logic<VRF_W>,
+    o_vd_wen    : output logic       ,
+    o_vd_data   : output logic<VLEN> ,
+
+    // ---- Non-speculative execution gate -------------------------------------
+    // The VRF is NOT renamed, so a wrong-path vector op's VRF write could not be
+    // rolled back. The VU therefore executes its head op only once that op is the
+    // ROB head (all older ops committed → it is non-speculative and cannot be
+    // squashed by an older mispredict; a younger mispredict flushes the FIFO
+    // before this op ever reaches the head). Correctness-first; throughput is a
+    // later-sub-phase concern (execute-driven per ReOVE).
+    i_rob_head_idx: input logic<ROB_IDX_W>,
+
+    // ---- CDB writeback grant + output (lowest priority on lane 0) -----------
+    i_cdb_free   : input  logic            , // scalar pipe idle this cycle
+    o_cdb_valid  : output logic            ,
+    o_cdb_has_rd : output logic            ,
+    o_cdb_pdst   : output logic<PRF_W>     ,
+    o_cdb_data   : output logic<64>        ,
+    o_cdb_rob_idx: output logic<ROB_IDX_W> ,
+    // vset*vl carries the new vtype/vl to the ROB shadow → CSR at commit.
+    o_cdb_vset_wen: output logic       ,
+    o_cdb_vtype   : output logic<64>   ,
+    o_cdb_vl      : output logic<64>   ,
+
+    // ---- Architectural vtype/vl restore on flush (committed values) ---------
+    i_csr_vtype: input logic<64>,
+    i_csr_vl   : input logic<64>,
+
+    // ---- V1: unit-stride vector memory port ---------------------------------
+    // The VU drives the shared dmem port (highest priority) when a vector
+    // load/store is at the ROB head and the scalar memory path is quiescent
+    // (i_mem_idle). It streams one element per access; the element address is
+    // base + i*EEW/8. Loads accumulate into the VRF dest; stores read vs3.
+    // A faulting element rides vu_cdb's is_lfault/is_sfault and sets vstart.
+    o_mem_port_req: output logic       , // VU holds the port (block scalar load issue)
+    o_mem_active  : output logic       , // drive the dmem port THIS cycle
+    o_mem_vaddr   : output logic<64>   ,
+    o_mem_is_load : output logic       ,
+    o_mem_is_store: output logic       ,
+    o_mem_funct3  : output logic<3>    , // dcache size: 000/001/010/011 = 1/2/4/8 B
+    o_mem_wdata   : output logic<64>   , // store data, positioned at vaddr[2:0]
+    o_mem_wstrb   : output logic<8>    , // store byte strobe, positioned
+    i_mem_idle    : input  logic       , // scalar mem path quiescent (sb empty, no walk/busy)
+    i_mem_ready   : input  logic       , // current element's access completes this cycle
+    i_mem_rdata   : input  logic<64>   , // load dword (dcache_rdata)
+    i_mem_fault   : input  logic       , // load page/access fault
+    i_mem_fault_st: input  logic       , // store page/access fault
+    // vstart resume element. V1 always restarts a faulting unit-stride op from
+    // element 0 (idempotent), so this is currently informational only.
+    i_csr_vstart  : input  logic<64>   ,
+    // ---- Memory fault + vstart, carried on the vu_cdb writeback -------------
+    // A faulting element rides the (lowest-priority lane-0) vu_cdb just like a
+    // scalar load/store fault: the ROB records is_lfault/is_sfault + fault_vaddr
+    // and the commit stage raises cause 13/15. o_cdb_vstart_wen pulses on every
+    // retiring vector mem op to set vstart (= faulting element, else 0).
+    o_cdb_is_lfault : output logic     ,
+    o_cdb_is_sfault : output logic     ,
+    o_cdb_fault_vaddr: output logic<64>,
+    o_cdb_vstart_wen: output logic     ,
+    o_cdb_vstart    : output logic<64> ,
+    // o_cdb_vstore marks a retiring (non-faulting) vector STORE so the ROB can
+    // force a commit-time redirect: it overwrote cache lines that younger
+    // speculative loads may have already read, so they must be squashed and
+    // re-fetched (Rule B vector-store / younger-load memory ordering).
+    o_cdb_vstore    : output logic     ,
+
+    // ---- V3 vector FP: rounding mode in, accrued fflags out -----------------
+    // Vector FP ops always round with fcsr.frm (the encoding carries no rm
+    // field), so the VU passes DYN to its fpu_wrap and supplies i_frm. The
+    // per-element IEEE exception flags OR-accumulate across the op and ride the
+    // vu_cdb writeback into the ROB; the core routes them to fcsr at commit,
+    // exactly like a scalar FP op's fflags.
+    i_frm           : input  logic<3>,
+    // V5b: fixed-point rounding mode (vxrm) for the averaging / scaling-shift /
+    // clip ops. Read combinationally at the ROB head (committed value), like i_frm.
+    i_vxrm          : input  logic<2>,
+    o_cdb_fflags    : output logic<5>,
+    o_cdb_fflags_wen: output logic   ,
+    // V5a: fixed-point saturating ops OR a sticky bit into vxsat. The accrued
+    // "this op saturated" bit rides the vu_cdb writeback into the ROB; the core
+    // ORs it into the vxsat CSR at commit, exactly like an FP op's fflags.
+    o_cdb_vxsat     : output logic   ,
+    o_cdb_vxsat_wen : output logic   ,
+    // V3f: vfmv.f.s writes the scalar FP register file. When the VU drives this
+    // writeback, the core must route cdb.pdst/data to prf_fp (cdb_dest_is_fp).
+    o_cdb_fp_dest   : output logic   ,
+
+    // ---- Flush (commit-time redirect) ---------------------------------------
+    i_flush: input logic,
+    // Early (execute-time) PARTIAL squash, mirroring the ROB's i_squash_en /
+    // i_squash_idx: keep FIFO entries older-or-equal to i_squash_idx (ROB age) and
+    // drop the younger suffix. Mutually exclusive with i_flush.
+    i_squash_en : input logic              ,
+    i_squash_idx: input logic<ROB_IDX_W>   ,
+) {
+    import vector_pkg::*;
+    import fpu_pkg::*;
+
+    // ---- Per-element integer ALU (V2a), parameterized by element width W ----
+    // a = vs2[i]; b = the second operand (vs1[i] / x[rs1] / sign-extended imm5),
+    // already truncated to W; op = funct6 (inst[31:26]). Shift amount masks b to
+    // log2(W) bits (W is a power of two, so W-1 is the mask).
+    function valu::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        let sh   : logic<W> = b & (W - 1);
+        let sra_r: logic<W> = $signed(a) >>> sh; // arithmetic right shift (signed)
+        return case op {
+            6'b000000: a + b,                                // vadd
+            6'b000010: a - b,                                // vsub
+            6'b000011: b - a,                                // vrsub
+            6'b000100: if a <: b ? a : b,                    // vminu
+            6'b000101: if $signed(a) <: $signed(b) ? a : b,  // vmin
+            6'b000110: if a <: b ? b : a,                    // vmaxu
+            6'b000111: if $signed(a) <: $signed(b) ? b : a,  // vmax
+            6'b001001: a & b,                                // vand
+            6'b001010: a | b,                                // vor
+            6'b001011: a ^ b,                                // vxor
+            6'b100101: a << sh,                              // vsll
+            6'b101000: a >> sh,                              // vsrl
+            6'b101001: sra_r,                                // vsra
+            default  : a,
+        };
+    }
+
+    // ---- Per-element fixed-point saturating add/sub (V5a) -------------------
+    // vsaddu/vsadd/vssubu/vssub. Returns {sat, result[W-1:0]}: sat=1 if the op
+    // saturated (OR-accumulated into vxsat). sub = funct6[1] (0=add, 1=sub);
+    // sgn = funct6[0] (0=unsigned, 1=signed).
+    function vsatas::<W: u32> (
+        a  : input logic<W>,
+        b  : input logic<W>,
+        sub: input logic   ,
+        sgn: input logic   ,
+    ) -> logic<W + 1> {
+        // Unsigned: (W+1)-bit add/sub; bit W = carry (add) / borrow (sub). Add
+        // saturates high (all ones); sub saturates low (zero).
+        let uadd : logic<W + 1> = {1'b0, a} + {1'b0, b};
+        let usub : logic<W + 1> = {1'b0, a} - {1'b0, b};
+        let u_ovf: logic        = if sub ? usub[W] : uadd[W];
+        let u_res: logic<W>     = if sub ? (if usub[W] ? {1'b0 repeat W} : usub[W - 1:0]) : (if uadd[W] ? {1'b1 repeat W} : uadd[W - 1:0]);
+        // Signed: (W+1)-bit sign-extended add/sub; overflow when the top two bits
+        // differ. Saturate to MIN ({1,0..}) when the true sign is negative, else
+        // MAX ({0,1..}).
+        let sadd : logic<W + 1> = {a[W - 1], a} + {b[W - 1], b};
+        let ssub : logic<W + 1> = {a[W - 1], a} - {b[W - 1], b};
+        let sext : logic<W + 1> = if sub ? ssub : sadd;
+        let s_ovf: logic        = sext[W] != sext[W - 1];
+        let s_sat: logic<W>     = if sext[W] ? {1'b1, 1'b0 repeat (W - 1)} : {1'b0, 1'b1 repeat (W - 1)};
+        let s_res: logic<W>     = if s_ovf ? s_sat : sext[W - 1:0];
+        let res  : logic<W>     = if sgn ? s_res : u_res;
+        let sat  : logic        = if sgn ? s_ovf : u_ovf;
+        return {sat, res};
+    }
+
+    // ---- Per-element averaging add/sub (V5b): (a +/- b + round) >> 1 ---------
+    // vaaddu/vaadd/vasubu/vasub. The add/sub is computed with one extra bit of
+    // precision (zero-/sign-extend per signedness) so the carry/borrow shifts into
+    // the result; the discarded bit v[0] (and v[1] for rne/rod) sets the rounding
+    // increment r per vxrm. sub = funct6[1], sgn = funct6[0]. No saturation.
+    function vaverage::<W: u32> (
+        a   : input logic<W>   ,
+        b   : input logic<W>   ,
+        sub : input logic      ,
+        sgn : input logic      ,
+        vxrm: input logic<2>   ,
+    ) -> logic<W> {
+        let v_u: logic<W + 1> = if sub ? ({1'b0, a} - {1'b0, b}) : ({1'b0, a} + {1'b0, b});
+        let v_s: logic<W + 1> = if sub ? ({a[W - 1], a} - {b[W - 1], b}) : ({a[W - 1], a} + {b[W - 1], b});
+        let v  : logic<W + 1> = if sgn ? v_s : v_u;
+        // Rounding increment for a 1-bit right shift (d=1): rnu=v[0], rne=v[0]&v[1],
+        // rdn=0, rod=!v[1]&v[0].
+        let r  : logic = case vxrm {
+            2'b00  : v[0],
+            2'b01  : v[0] & v[1],
+            2'b10  : 1'b0,
+            default: !v[1] & v[0],
+        };
+        // Right shift by 1 (arithmetic for signed, logical for unsigned); a
+        // separate let keeps Veryl from demoting >>> to a logical shift.
+        let sh_s: logic<W + 1> = $signed(v) >>> 1;
+        let sh_u: logic<W + 1> = v >> 1;
+        let sh  : logic<W>     = if sgn ? sh_s[W - 1:0] : sh_u[W - 1:0];
+        return sh + {1'b0 repeat (W - 1), r};
+    }
+
+    // ---- Per-element scaling (rounding) right shift (V5c) --------------------
+    // vssrl/vssra = roundoff(v, shamt) = (v >> shamt) + r. The shift amount is
+    // masked to log2(W) bits. The rounding increment r comes from the discarded
+    // bits per vxrm: round = v[shamt-1], sticky = (v[shamt-2:0] != 0), lsb =
+    // v[shamt] (the result LSB). The dropped low `shamt` bits are brought to the
+    // top by a left shift so round = dropped[W-1] and sticky = |dropped[W-2:0];
+    // shamt == 0 (nz=0) gates the rounding off entirely. arith = funct6[0].
+    function vssh::<W: u32> (
+        v    : input logic<W>,
+        shamt: input logic<W>,
+        arith: input logic   ,
+        vxrm : input logic<2>,
+    ) -> logic<W> {
+        let shm  : logic<W> = shamt & (W - 1);
+        let vsh_u: logic<W> = v >> shm;
+        let vsh_s: logic<W> = $signed(v) >>> shm;
+        let vsh  : logic<W> = if arith ? vsh_s : vsh_u;
+        let r_lsb: logic    = vsh[0];
+        let nz   : logic    = shm != 0;
+        let dropped: logic<W> = v << (W - shm);
+        let r_rnd : logic = nz & dropped[W - 1];
+        let r_stk : logic = nz & |dropped[W - 2:0];
+        let r: logic = case vxrm {
+            2'b00  : r_rnd,
+            2'b01  : r_rnd & (r_stk | r_lsb),
+            2'b10  : 1'b0,
+            default: (!r_lsb) & (r_rnd | r_stk),
+        };
+        return vsh + {1'b0 repeat (W - 1), r};
+    }
+
+    // ---- Per-element fractional saturating multiply (V5e) -------------------
+    // vsmul: signed fixed-point multiply of two Q(W-1) fractions. The full signed
+    // 2*W product is rounded off by W-1 bits (per vxrm) and saturated to W signed
+    // bits. Only MIN*MIN overflows (-1.0 * -1.0 = +1.0 → MAX). Returns {sat, result}.
+    function vsmul::<W: u32> (
+        a   : input logic<W>,
+        b   : input logic<W>,
+        vxrm: input logic<2>,
+    ) -> logic<W + 1> {
+        // Sign-extend to 2*W and multiply; the low 2*W bits are the full product.
+        let a_s : logic<W * 2> = {a[W - 1] repeat W, a};
+        let b_s : logic<W * 2> = {b[W - 1] repeat W, b};
+        let prod: logic<W * 2> = a_s * b_s;
+        // roundoff_signed(prod, W-1): shift amount d = W-1, so the result LSB is
+        // prod[W-1], the round bit prod[W-2], sticky = |prod[W-3:0].
+        let r_lsb: logic = prod[W - 1];
+        let r_rnd: logic = prod[W - 2];
+        let r_stk: logic = |prod[W - 3:0];
+        let r: logic = case vxrm {
+            2'b00  : r_rnd,
+            2'b01  : r_rnd & (r_stk | r_lsb),
+            2'b10  : 1'b0,
+            default: (!r_lsb) & (r_rnd | r_stk),
+        };
+        let shv    : logic<W * 2> = $signed(prod) >>> (W - 1);
+        let rounded: logic<W * 2> = shv + {1'b0 repeat (W * 2 - 1), r};
+        // Saturate signed to W bits (overflow unless the high W+1 bits sign-extend).
+        let s_hi : logic<W + 1> = rounded[W * 2 - 1:W - 1];
+        let s_ovf: logic = !((s_hi == {1'b0 repeat (W + 1)}) || (s_hi == {1'b1 repeat (W + 1)}));
+        let s_sat: logic<W> = if rounded[W * 2 - 1] ? {1'b1, 1'b0 repeat (W - 1)} : {1'b0, 1'b1 repeat (W - 1)};
+        let res  : logic<W> = if s_ovf ? s_sat : rounded[W - 1:0];
+        return {s_ovf, res};
+    }
+
+    // ---- Per-element integer compare (V2b), parameterized by element width ---
+    // Returns the 1-bit mask result for funct6 011xxx (vmseq/vmsne/vmsltu/vmslt/
+    // vmsleu/vmsle/vmsgtu/vmsgt). <=/>/>= are expressed via the < operator.
+    function vcmp::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic {
+        return case op {
+            6'b011000: a == b,                               // vmseq
+            6'b011001: a != b,                               // vmsne
+            6'b011010: a <: b,                               // vmsltu
+            6'b011011: $signed(a) <: $signed(b),             // vmslt
+            6'b011100: !(b <: a),                            // vmsleu (a<=b)
+            6'b011101: !($signed(b) <: $signed(a)),          // vmsle
+            6'b011110: b <: a,                               // vmsgtu (a>b)
+            6'b011111: $signed(b) <: $signed(a),             // vmsgt
+            default  : 1'b0,
+        };
+    }
+
+    // ---- Per-element integer reduction fold (V4b), parameterized by width -----
+    // Folds the running accumulator a with the next source element b for the
+    // OPMVV .vs reductions (funct6 0000xx): sum / and / or / xor / minu / min /
+    // maxu / max. (and/or/xor use funct6 0000001/010/011, distinct from the
+    // element-wise vand/vor/vxor 001001/010/011 — hence a dedicated map.)
+    function vredop::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        return case op {
+            6'b000000: a + b,                                // vredsum
+            6'b000001: a & b,                                // vredand
+            6'b000010: a | b,                                // vredor
+            6'b000011: a ^ b,                                // vredxor
+            6'b000100: if a <: b ? a : b,                    // vredminu
+            6'b000101: if $signed(a) <: $signed(b) ? a : b,  // vredmin
+            6'b000110: if a <: b ? b : a,                    // vredmaxu
+            6'b000111: if $signed(a) <: $signed(b) ? b : a,  // vredmax
+            default  : a + b,
+        };
+    }
+
+    // ---- Per-element integer multiply / divide (V2c, OPMVV/OPMVX) -----------
+    // a = vs2[i]; b = vs1[i] (VV) / x[rs1] (VX); op = funct6 (100xxx). The
+    // high-half multiplies need the full 2*W-bit product, so the operands are
+    // sign- / zero-extended to 2*W before the (unsigned) multiply: the low 2*W
+    // bits of an extended-operand product hold the correctly-signed result.
+    // div/rem follow the scalar ALU (alu.veryl): divide-by-zero gives an
+    // all-ones quotient and a dividend remainder; signed overflow (most-negative
+    // / -1) wraps to the dividend with remainder 0 (matches the RISC-V spec).
+    function vmuldiv::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        // The vdivu/vdiv/vremu/vrem cases (funct6 1000xx) are handled by the
+        // multi-cycle int_divider FU (element-serial), not here. This function
+        // serves the multiply cases (1001xx).
+        //
+        // Fmax: build ONE unsigned W×W→2W product from half-width partials and
+        // derive the signed high halves by correction, instead of three
+        // sign-/zero-extended (2W)×(2W) array multiplies (the old p_ss/p_su were
+        // the deepest combinational path in the core — a 128×128 signed array for
+        // SEW=64). Mirrors the scalar RV64M MULH path in alu.veryl exactly, so it
+        // is bit-identical; no IPC cost (still combinational). Partials:
+        //   a = aH·2^(W/2) + aL,  b = bH·2^(W/2) + bL  (halves zero-extended to W)
+        //   prod = pp_hh·2^W + (pp_lh+pp_hl)·2^(W/2) + pp_ll
+        let aL: logic<W> = {1'b0 repeat (W / 2), a[W / 2 - 1:0]};
+        let aH: logic<W> = {1'b0 repeat (W / 2), a[W - 1:W / 2]};
+        let bL: logic<W> = {1'b0 repeat (W / 2), b[W / 2 - 1:0]};
+        let bH: logic<W> = {1'b0 repeat (W / 2), b[W - 1:W / 2]};
+        let pp_ll: logic<W> = aL * bL;
+        let pp_lh: logic<W> = aL * bH;
+        let pp_hl: logic<W> = aH * bL;
+        let pp_hh: logic<W> = aH * bH;
+        let mid_v : logic<W> = pp_lh + pp_hl;
+        let mid_of: logic<W> = if mid_v <: pp_lh ? (1 as W) << (W / 2) : '0; // carry out of mid sum
+        let mid_hi: logic<W> = mid_v >> (W / 2);
+        let lo_v  : logic<W> = pp_ll + (mid_v << (W / 2)); // = low W bits of the product (vmul)
+        let lo_of : logic<W> = if lo_v <: pp_ll ? (1 as W) : '0;
+        let hi_u  : logic<W> = pp_hh + mid_hi + mid_of + lo_of; // high W of UNSIGNED product (vmulhu)
+        // Signed-from-unsigned high-half corrections (standard identity):
+        // (signed)high = (unsigned)high − [a<0]·b − [b<0]·a.
+        let adj_a: logic<W> = {a[W - 1] repeat W} & b;
+        let adj_b: logic<W> = {b[W - 1] repeat W} & a;
+        let hi_ss: logic<W> = hi_u - adj_a - adj_b; // vmulh   (signed   × signed)
+        let hi_su: logic<W> = hi_u - adj_a;         // vmulhsu (signed   × unsigned)
+        return case op {
+            6'b100101: lo_v,  // vmul    (low W bits; sign-agnostic)
+            6'b100111: hi_ss, // vmulh   (signed   × signed,   high)
+            6'b100100: hi_u,  // vmulhu  (unsigned × unsigned, high)
+            6'b100110: hi_su, // vmulhsu (signed   × unsigned, high)
+            default  : lo_v,
+        };
+    }
+
+    // ---- Per-element widening add/sub/mul (V2d-4, OPMVV/OPMVX funct6 11xxxx) -
+    // a, b are SEW-wide source elements; the result is 2*W (= 2*SEW). Operands
+    // are sign-/zero-extended to 2*W per signedness before the op (the low 2*W
+    // bits of the extended product hold the correctly-signed widening product).
+    function vwiden::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W * 2> {
+        let a_s: logic<W * 2> = {a[W - 1] repeat W, a};
+        let b_s: logic<W * 2> = {b[W - 1] repeat W, b};
+        let a_u: logic<W * 2> = {1'b0 repeat W, a};
+        let b_u: logic<W * 2> = {1'b0 repeat W, b};
+        return case op {
+            6'b110000: a_u + b_u, // vwaddu
+            6'b110001: a_s + b_s, // vwadd
+            6'b110010: a_u - b_u, // vwsubu
+            6'b110011: a_s - b_s, // vwsub
+            6'b111000: a_u * b_u, // vwmulu
+            6'b111010: a_s * b_u, // vwmulsu
+            6'b111011: a_s * b_s, // vwmul
+            default  : a_u + b_u,
+        };
+    }
+
+    // ---- Per-element widening .w add/sub (V2d-6, OPMVV/OPMVX funct6 1101xx) --
+    // a is already 2*W (= 2*SEW) from vs2; b is the SEW second operand, sign-/
+    // zero-extended to 2*W before the add/sub.
+    function vwidenw::<W: u32> (
+        a : input logic<W * 2>,
+        b : input logic<W>    ,
+        op: input logic<6>    ,
+    ) -> logic<W * 2> {
+        let b_s: logic<W * 2> = {b[W - 1] repeat W, b};
+        let b_u: logic<W * 2> = {1'b0 repeat W, b};
+        return case op {
+            6'b110100: a + b_u, // vwaddu.w
+            6'b110101: a + b_s, // vwadd.w
+            6'b110110: a - b_u, // vwsubu.w
+            6'b110111: a - b_s, // vwsub.w
+            default  : a + b_u,
+        };
+    }
+
+    // ---- Per-element narrowing shift (V2d-5, OPIVV/VX/VI funct6 10110x) ------
+    // a is a 2*W-wide source element; the shift amount is masked to log2(2*W)
+    // bits (2*W is a power of two, so 2*W-1 is the mask). vnsrl = logical, vnsra
+    // = arithmetic; the result is the low W bits after the shift.
+    function vnshift::<W: u32> (
+        a    : input logic<W * 2>,
+        sh   : input logic<W>    ,
+        arith: input logic       ,
+    ) -> logic<W> {
+        let amt: logic<W>     = sh & ((W * 2) - 1);
+        // The signed shift must land in its own let; inlining $signed(a)>>>amt as
+        // a ternary branch (alongside the unsigned a>>amt) degrades it to logical.
+        let sra: logic<W * 2> = $signed(a) >>> amt;
+        let srl: logic<W * 2> = a >> amt;
+        let res: logic<W * 2> = if arith ? sra : srl;
+        return res[W - 1:0];
+    }
+
+    // ---- Per-element narrowing clip (V5d, OPIVV/VX/VI funct6 10111x) ---------
+    // vnclipu/vnclip: roundoff the 2*W source right by the shift amount (per vxrm,
+    // like vssh but on 2*W bits) then saturate the result to W bits. Returns
+    // {sat, result[W-1:0]}: sat=1 if clipped (OR-accumulated into vxsat).
+    // sgn = funct6[0] (0 = unsigned vnclipu, 1 = signed vnclip).
+    function vnclip::<W: u32> (
+        a   : input logic<W * 2>,
+        sh  : input logic<W>    ,
+        sgn : input logic       ,
+        vxrm: input logic<2>    ,
+    ) -> logic<W + 1> {
+        let amt: logic<W>     = sh & ((W * 2) - 1);
+        let sra: logic<W * 2> = $signed(a) >>> amt;
+        let srl: logic<W * 2> = a >> amt;
+        let shv: logic<W * 2> = if sgn ? sra : srl;
+        let r_lsb: logic = shv[0];
+        let nz   : logic = amt != 0;
+        let dropped: logic<W * 2> = a << ((W * 2) - amt);
+        let r_rnd: logic = nz & dropped[W * 2 - 1];
+        let r_stk: logic = nz & |dropped[W * 2 - 2:0];
+        let r: logic = case vxrm {
+            2'b00  : r_rnd,
+            2'b01  : r_rnd & (r_stk | r_lsb),
+            2'b10  : 1'b0,
+            default: (!r_lsb) & (r_rnd | r_stk),
+        };
+        let rounded: logic<W * 2> = shv + {1'b0 repeat (W * 2 - 1), r};
+        // Unsigned clip to [0, 2^W-1]: overflow if any bit at or above W is set.
+        let u_ovf: logic    = |rounded[W * 2 - 1:W];
+        let u_res: logic<W> = if u_ovf ? {1'b1 repeat W} : rounded[W - 1:0];
+        // Signed clip to [-2^(W-1), 2^(W-1)-1]: overflow unless the high W+1 bits
+        // are a clean sign-extension of bit W-1. Saturate to MIN/MAX by true sign.
+        let s_hi : logic<W + 1> = rounded[W * 2 - 1:W - 1];
+        let s_ovf: logic = !((s_hi == {1'b0 repeat (W + 1)}) || (s_hi == {1'b1 repeat (W + 1)}));
+        let s_sat: logic<W> = if rounded[W * 2 - 1] ? {1'b1, 1'b0 repeat (W - 1)} : {1'b0, 1'b1 repeat (W - 1)};
+        let s_res: logic<W> = if s_ovf ? s_sat : rounded[W - 1:0];
+        let res: logic<W> = if sgn ? s_res : u_res;
+        let sat: logic     = if sgn ? s_ovf : u_ovf;
+        return {sat, res};
+    }
+
+    // ---- V3i widening FP: single -> double (exact) --------------------------
+    // Widening FP arithmetic computes in double, so each single operand is
+    // reformatted to double first. The widening is exact: normals just rebias the
+    // exponent (e + 896 = e - 127 + 1023) and left-pad the mantissa; subnormals
+    // normalize via a leading-one search; zero/inf/NaN pass through.
+    function s2d (x: input logic<32>) -> logic<64> {
+        let xs: logic     = x[31];
+        let xe: logic<8>  = x[30:23];
+        let xm: logic<23> = x[22:0];
+        var r : logic<64>;
+        if xe == 8'd0 {
+            if xm == 23'd0 {
+                r = {xs, 63'd0}; // signed zero
+            } else {
+                // Subnormal single -> normal double. Find the leading one.
+                let lz_w: logic<9> = clz::<23>(xm);
+                let lz  : logic<5> = lz_w[4:0];
+                // Double exp = (22-lz) + 874 = 896 - lz; drop the leading one.
+                let dexp: logic<11> = 11'd896 - {6'd0, lz};
+                let frac: logic<23> = xm << (lz + 5'd1);
+                r = {xs, dexp, frac, 29'd0};
+            }
+        } else if xe == 8'hFF {
+            if xm == 23'd0 {
+                r = {xs, 11'h7FF, 52'd0}; // infinity
+            } else {
+                r = {xs, 11'h7FF, xm, 29'd0}; // NaN (payload preserved)
+            }
+        } else {
+            r = {xs, ({3'd0, xe} + 11'd896), xm, 29'd0}; // normal
+        }
+        return r;
+    }
+
+    // ---- V3j-4 vfrsqrt7 / vfrec7 7-bit estimate ROMs ------------------------
+    // 128-entry lookup tables from the RVV spec (spike softfloat fall_reciprocal.c).
+    // vfrsqrt7 is indexed by {exp[0], sig[MSB-1:MSB-6]}; vfrec7 by sig[MSB-1:MSB-7].
+    function rsqrt7_tab (idx: input logic<7>) -> logic<7> {
+        return case idx {
+            7'd0: 7'd52, 7'd1: 7'd51, 7'd2: 7'd50, 7'd3: 7'd48, 7'd4: 7'd47, 7'd5: 7'd46, 7'd6: 7'd44, 7'd7: 7'd43,
+            7'd8: 7'd42, 7'd9: 7'd41, 7'd10: 7'd40, 7'd11: 7'd39, 7'd12: 7'd38, 7'd13: 7'd36, 7'd14: 7'd35, 7'd15: 7'd34,
+            7'd16: 7'd33, 7'd17: 7'd32, 7'd18: 7'd31, 7'd19: 7'd30, 7'd20: 7'd30, 7'd21: 7'd29, 7'd22: 7'd28, 7'd23: 7'd27,
+            7'd24: 7'd26, 7'd25: 7'd25, 7'd26: 7'd24, 7'd27: 7'd23, 7'd28: 7'd23, 7'd29: 7'd22, 7'd30: 7'd21, 7'd31: 7'd20,
+            7'd32: 7'd19, 7'd33: 7'd19, 7'd34: 7'd18, 7'd35: 7'd17, 7'd36: 7'd16, 7'd37: 7'd16, 7'd38: 7'd15, 7'd39: 7'd14,
+            7'd40: 7'd14, 7'd41: 7'd13, 7'd42: 7'd12, 7'd43: 7'd12, 7'd44: 7'd11, 7'd45: 7'd10, 7'd46: 7'd10, 7'd47: 7'd9,
+            7'd48: 7'd9, 7'd49: 7'd8, 7'd50: 7'd7, 7'd51: 7'd7, 7'd52: 7'd6, 7'd53: 7'd6, 7'd54: 7'd5, 7'd55: 7'd4,
+            7'd56: 7'd4, 7'd57: 7'd3, 7'd58: 7'd3, 7'd59: 7'd2, 7'd60: 7'd2, 7'd61: 7'd1, 7'd62: 7'd1, 7'd63: 7'd0,
+            7'd64: 7'd127, 7'd65: 7'd125, 7'd66: 7'd123, 7'd67: 7'd121, 7'd68: 7'd119, 7'd69: 7'd118, 7'd70: 7'd116, 7'd71: 7'd114,
+            7'd72: 7'd113, 7'd73: 7'd111, 7'd74: 7'd109, 7'd75: 7'd108, 7'd76: 7'd106, 7'd77: 7'd105, 7'd78: 7'd103, 7'd79: 7'd102,
+            7'd80: 7'd100, 7'd81: 7'd99, 7'd82: 7'd97, 7'd83: 7'd96, 7'd84: 7'd95, 7'd85: 7'd93, 7'd86: 7'd92, 7'd87: 7'd91,
+            7'd88: 7'd90, 7'd89: 7'd88, 7'd90: 7'd87, 7'd91: 7'd86, 7'd92: 7'd85, 7'd93: 7'd84, 7'd94: 7'd83, 7'd95: 7'd82,
+            7'd96: 7'd80, 7'd97: 7'd79, 7'd98: 7'd78, 7'd99: 7'd77, 7'd100: 7'd76, 7'd101: 7'd75, 7'd102: 7'd74, 7'd103: 7'd73,
+            7'd104: 7'd72, 7'd105: 7'd71, 7'd106: 7'd70, 7'd107: 7'd70, 7'd108: 7'd69, 7'd109: 7'd68, 7'd110: 7'd67, 7'd111: 7'd66,
+            7'd112: 7'd65, 7'd113: 7'd64, 7'd114: 7'd63, 7'd115: 7'd63, 7'd116: 7'd62, 7'd117: 7'd61, 7'd118: 7'd60, 7'd119: 7'd59,
+            7'd120: 7'd59, 7'd121: 7'd58, 7'd122: 7'd57, 7'd123: 7'd56, 7'd124: 7'd56, 7'd125: 7'd55, 7'd126: 7'd54, 7'd127: 7'd53,
+            default: 7'd0,
+        };
+    }
+
+    function recip7_tab (idx: input logic<7>) -> logic<7> {
+        return case idx {
+            7'd0: 7'd127, 7'd1: 7'd125, 7'd2: 7'd123, 7'd3: 7'd121, 7'd4: 7'd119, 7'd5: 7'd117, 7'd6: 7'd116, 7'd7: 7'd114,
+            7'd8: 7'd112, 7'd9: 7'd110, 7'd10: 7'd109, 7'd11: 7'd107, 7'd12: 7'd105, 7'd13: 7'd104, 7'd14: 7'd102, 7'd15: 7'd100,
+            7'd16: 7'd99, 7'd17: 7'd97, 7'd18: 7'd96, 7'd19: 7'd94, 7'd20: 7'd93, 7'd21: 7'd91, 7'd22: 7'd90, 7'd23: 7'd88,
+            7'd24: 7'd87, 7'd25: 7'd85, 7'd26: 7'd84, 7'd27: 7'd83, 7'd28: 7'd81, 7'd29: 7'd80, 7'd30: 7'd79, 7'd31: 7'd77,
+            7'd32: 7'd76, 7'd33: 7'd75, 7'd34: 7'd74, 7'd35: 7'd72, 7'd36: 7'd71, 7'd37: 7'd70, 7'd38: 7'd69, 7'd39: 7'd68,
+            7'd40: 7'd66, 7'd41: 7'd65, 7'd42: 7'd64, 7'd43: 7'd63, 7'd44: 7'd62, 7'd45: 7'd61, 7'd46: 7'd60, 7'd47: 7'd59,
+            7'd48: 7'd58, 7'd49: 7'd57, 7'd50: 7'd56, 7'd51: 7'd55, 7'd52: 7'd54, 7'd53: 7'd53, 7'd54: 7'd52, 7'd55: 7'd51,
+            7'd56: 7'd50, 7'd57: 7'd49, 7'd58: 7'd48, 7'd59: 7'd47, 7'd60: 7'd46, 7'd61: 7'd45, 7'd62: 7'd44, 7'd63: 7'd43,
+            7'd64: 7'd42, 7'd65: 7'd41, 7'd66: 7'd40, 7'd67: 7'd40, 7'd68: 7'd39, 7'd69: 7'd38, 7'd70: 7'd37, 7'd71: 7'd36,
+            7'd72: 7'd35, 7'd73: 7'd35, 7'd74: 7'd34, 7'd75: 7'd33, 7'd76: 7'd32, 7'd77: 7'd31, 7'd78: 7'd31, 7'd79: 7'd30,
+            7'd80: 7'd29, 7'd81: 7'd28, 7'd82: 7'd28, 7'd83: 7'd27, 7'd84: 7'd26, 7'd85: 7'd25, 7'd86: 7'd25, 7'd87: 7'd24,
+            7'd88: 7'd23, 7'd89: 7'd23, 7'd90: 7'd22, 7'd91: 7'd21, 7'd92: 7'd21, 7'd93: 7'd20, 7'd94: 7'd19, 7'd95: 7'd19,
+            7'd96: 7'd18, 7'd97: 7'd17, 7'd98: 7'd17, 7'd99: 7'd16, 7'd100: 7'd15, 7'd101: 7'd15, 7'd102: 7'd14, 7'd103: 7'd14,
+            7'd104: 7'd13, 7'd105: 7'd12, 7'd106: 7'd12, 7'd107: 7'd11, 7'd108: 7'd11, 7'd109: 7'd10, 7'd110: 7'd9, 7'd111: 7'd9,
+            7'd112: 7'd8, 7'd113: 7'd8, 7'd114: 7'd7, 7'd115: 7'd7, 7'd116: 7'd6, 7'd117: 7'd5, 7'd118: 7'd5, 7'd119: 7'd4,
+            7'd120: 7'd4, 7'd121: 7'd3, 7'd122: 7'd3, 7'd123: 7'd2, 7'd124: 7'd2, 7'd125: 7'd1, 7'd126: 7'd1, 7'd127: 7'd0,
+            default: 7'd0,
+        };
+    }
+
+    // ---- V3j-4 vfrsqrt7 / vfrec7 element kernels ----------------------------
+    // Single/double reciprocal square-root and reciprocal 7-bit estimates.
+    // Each returns {fflags[4:0], result}. Algorithms mirror spike softfloat
+    // rsqrte7()/recip7() and the per-precision wrappers (fall_reciprocal.c):
+    // rsqrt: neg(non-zero)/sNaN -> NV+NaN; +/-0 -> DZ + +/-inf; +inf -> +0.
+    // recip: sNaN -> NV+NaN; -inf->-0; +inf->+0; +/-0 -> DZ + +/-inf; tiny
+    //   subnormal overflow -> NX|OF + (inf or greatest-magnitude, per frm).
+    function rsqrt7_s (x: input logic<32>) -> logic<37> {
+        let sign    : logic     = x[31];
+        let exp     : logic<8>  = x[30:23];
+        let sig     : logic<23> = x[22:0];
+        let exp_all1: logic     = exp == 8'hff;
+        let exp_zero: logic     = exp == 8'd0;
+        let sig_zero: logic     = sig == 23'd0;
+        let is_inf  : logic     = exp_all1 && sig_zero;
+        let is_nan  : logic     = exp_all1 && !sig_zero;
+        let is_snan : logic     = is_nan && !sig[22];
+        let is_zero : logic     = exp_zero && sig_zero;
+        let is_sub  : logic     = exp_zero && !sig_zero;
+        let lzc_w: logic<9> = clz::<23>(sig);
+        let lzc  : logic<5> = lzc_w[4:0];
+        let sig_norm: logic<23> = sig << (lzc + 5'd1);
+        let top6    : logic<6>  = if is_sub ? sig_norm[22:17] : sig[22:17];
+        let exp_par : logic     = if is_sub ? lzc[0] : exp[0];
+        let idx     : logic<7>  = {exp_par, top6};
+        let tsig    : logic<7>  = rsqrt7_tab(idx);
+        let out_sig : logic<23> = {tsig, 16'd0};
+        let num     : logic<10> = if is_sub ? (10'd380 + {5'd0, lzc}) : (10'd380 - {2'd0, exp});
+        let num_h   : logic<10> = num >> 1;
+        let out_exp : logic<8>  = num_h[7:0];
+        let r_normal: logic<32> = {sign, out_exp, out_sig};
+        let neg_snan: logic     = (sign && !is_zero && !is_nan) || is_snan;
+        let res     : logic<32> =
+            if neg_snan ? 32'h7fc00000 :
+            if is_nan   ? 32'h7fc00000 :
+            if is_zero  ? (if sign ? 32'hff800000 : 32'h7f800000) :
+            if is_inf   ? 32'h0 :
+            r_normal;
+        let ffl     : logic<5> = if neg_snan ? 5'b10000 : if is_zero ? 5'b01000 : 5'd0;
+        return {ffl, res};
+    }
+
+    function rsqrt7_d (x: input logic<64>) -> logic<69> {
+        let sign    : logic     = x[63];
+        let exp     : logic<11>  = x[62:52];
+        let sig     : logic<52> = x[51:0];
+        let exp_all1: logic     = exp == 11'h7ff;
+        let exp_zero: logic     = exp == 11'd0;
+        let sig_zero: logic     = sig == 52'd0;
+        let is_inf  : logic     = exp_all1 && sig_zero;
+        let is_nan  : logic     = exp_all1 && !sig_zero;
+        let is_snan : logic     = is_nan && !sig[51];
+        let is_zero : logic     = exp_zero && sig_zero;
+        let is_sub  : logic     = exp_zero && !sig_zero;
+        let lzc_w: logic<9> = clz::<52>(sig);
+        let lzc  : logic<6> = lzc_w[5:0];
+        let sig_norm: logic<52> = sig << (lzc + 6'd1);
+        let top6    : logic<6>  = if is_sub ? sig_norm[51:46] : sig[51:46];
+        let exp_par : logic     = if is_sub ? lzc[0] : exp[0];
+        let idx     : logic<7>  = {exp_par, top6};
+        let tsig    : logic<7>  = rsqrt7_tab(idx);
+        let out_sig : logic<52> = {tsig, 45'd0};
+        let num     : logic<13> = if is_sub ? (13'd3068 + {7'd0, lzc}) : (13'd3068 - {2'd0, exp});
+        let num_h   : logic<13> = num >> 1;
+        let out_exp : logic<11>  = num_h[10:0];
+        let r_normal: logic<64> = {sign, out_exp, out_sig};
+        let neg_snan: logic     = (sign && !is_zero && !is_nan) || is_snan;
+        let res     : logic<64> =
+            if neg_snan ? 64'h7ff8000000000000 :
+            if is_nan   ? 64'h7ff8000000000000 :
+            if is_zero  ? (if sign ? 64'hfff0000000000000 : 64'h7ff0000000000000) :
+            if is_inf   ? 64'h0 :
+            r_normal;
+        let ffl     : logic<5> = if neg_snan ? 5'b10000 : if is_zero ? 5'b01000 : 5'd0;
+        return {ffl, res};
+    }
+
+    function recip7_s (x: input logic<32>, frm: input logic<3>) -> logic<37> {
+        let sign    : logic     = x[31];
+        let exp     : logic<8>  = x[30:23];
+        let sig     : logic<23> = x[22:0];
+        let exp_all1: logic     = exp == 8'hff;
+        let exp_zero: logic     = exp == 8'd0;
+        let sig_zero: logic     = sig == 23'd0;
+        let is_inf  : logic     = exp_all1 && sig_zero;
+        let is_nan  : logic     = exp_all1 && !sig_zero;
+        let is_snan : logic     = is_nan && !sig[22];
+        let is_zero : logic     = exp_zero && sig_zero;
+        let is_sub  : logic     = exp_zero && !sig_zero;
+        let lzc_w: logic<9> = clz::<23>(sig);
+        let lzc  : logic<5> = lzc_w[4:0];
+        let sig_norm: logic<23> = sig << (lzc + 5'd1);
+        let idx_sig : logic<23> = if is_sub ? sig_norm : sig;
+        let idx     : logic<7>  = idx_sig[22:16];
+        let tsig    : logic<7>  = recip7_tab(idx);
+        let base_sig: logic<23> = {tsig, 16'd0};
+        let out_sub : logic     = !is_sub && (exp == 8'd253 || exp == 8'd254);
+        let out_m1  : logic     = !is_sub && (exp == 8'd254);
+        let ssig1   : logic<23> = (base_sig >> 1) | 23'h400000;
+        let ssig2   : logic<23> = ssig1 >> 1;
+        let fin_sig : logic<23> = if out_sub ? (if out_m1 ? ssig2 : ssig1) : base_sig;
+        let oe_norm : logic<8>  = 8'd253 - exp;
+        let oe_sub  : logic<8>  = 8'd253 + {3'd0, lzc};
+        let fin_exp : logic<8>  = if out_sub ? 8'd0 : (if is_sub ? oe_sub : oe_norm);
+        let r_normal: logic<32> = {sign, fin_exp, fin_sig};
+        let ovf     : logic     = is_sub && (lzc >= 5'd2);
+        let to_great: logic     = (frm == 3'b001) || (frm == 3'b010 && !sign) || (frm == 3'b011 && sign);
+        let ovf_res : logic<32> = if to_great ? {sign, 8'hfe, 23'h7fffff} : {sign, 8'hff, 23'd0};
+        let res     : logic<32> =
+            if is_snan ? 32'h7fc00000 :
+            if is_nan  ? 32'h7fc00000 :
+            if is_inf  ? (if sign ? 32'h80000000 : 32'h0) :
+            if is_zero ? (if sign ? 32'hff800000 : 32'h7f800000) :
+            if ovf     ? ovf_res :
+            r_normal;
+        let ffl     : logic<5> =
+            if is_snan ? 5'b10000 :
+            if is_zero ? 5'b01000 :
+            if ovf     ? 5'b00101 :
+            5'd0;
+        return {ffl, res};
+    }
+
+    function recip7_d (x: input logic<64>, frm: input logic<3>) -> logic<69> {
+        let sign    : logic     = x[63];
+        let exp     : logic<11>  = x[62:52];
+        let sig     : logic<52> = x[51:0];
+        let exp_all1: logic     = exp == 11'h7ff;
+        let exp_zero: logic     = exp == 11'd0;
+        let sig_zero: logic     = sig == 52'd0;
+        let is_inf  : logic     = exp_all1 && sig_zero;
+        let is_nan  : logic     = exp_all1 && !sig_zero;
+        let is_snan : logic     = is_nan && !sig[51];
+        let is_zero : logic     = exp_zero && sig_zero;
+        let is_sub  : logic     = exp_zero && !sig_zero;
+        let lzc_w: logic<9> = clz::<52>(sig);
+        let lzc  : logic<6> = lzc_w[5:0];
+        let sig_norm: logic<52> = sig << (lzc + 6'd1);
+        let idx_sig : logic<52> = if is_sub ? sig_norm : sig;
+        let idx     : logic<7>  = idx_sig[51:45];
+        let tsig    : logic<7>  = recip7_tab(idx);
+        let base_sig: logic<52> = {tsig, 45'd0};
+        let out_sub : logic     = !is_sub && (exp == 11'd2045 || exp == 11'd2046);
+        let out_m1  : logic     = !is_sub && (exp == 11'd2046);
+        let ssig1   : logic<52> = (base_sig >> 1) | 52'h8000000000000;
+        let ssig2   : logic<52> = ssig1 >> 1;
+        let fin_sig : logic<52> = if out_sub ? (if out_m1 ? ssig2 : ssig1) : base_sig;
+        let oe_norm : logic<11>  = 11'd2045 - exp;
+        let oe_sub  : logic<11>  = 11'd2045 + {5'd0, lzc};
+        let fin_exp : logic<11>  = if out_sub ? 11'd0 : (if is_sub ? oe_sub : oe_norm);
+        let r_normal: logic<64> = {sign, fin_exp, fin_sig};
+        let ovf     : logic     = is_sub && (lzc >= 6'd2);
+        let to_great: logic     = (frm == 3'b001) || (frm == 3'b010 && !sign) || (frm == 3'b011 && sign);
+        let ovf_res : logic<64> = if to_great ? {sign, 11'h7fe, 52'hfffffffffffff} : {sign, 11'h7ff, 52'd0};
+        let res     : logic<64> =
+            if is_snan ? 64'h7ff8000000000000 :
+            if is_nan  ? 64'h7ff8000000000000 :
+            if is_inf  ? (if sign ? 64'h8000000000000000 : 64'h0) :
+            if is_zero ? (if sign ? 64'hfff0000000000000 : 64'h7ff0000000000000) :
+            if ovf     ? ovf_res :
+            r_normal;
+        let ffl     : logic<5> =
+            if is_snan ? 5'b10000 :
+            if is_zero ? 5'b01000 :
+            if ovf     ? 5'b00101 :
+            5'd0;
+        return {ffl, res};
+    }
+
+    // ---- In-order FIFO state ------------------------------------------------
+    var occupied   : logic                [FIFO_N];
+    var fifo_op    : vector_pkg::VecOp     [FIFO_N];
+    var fifo_instr : logic            <32> [FIFO_N];
+    var fifo_vd    : logic         <VRF_W> [FIFO_N];
+    var fifo_vs1   : logic         <VRF_W> [FIFO_N];
+    var fifo_vs2   : logic         <VRF_W> [FIFO_N];
+    var fifo_uses_s: logic                 [FIFO_N];
+    var fifo_s_pdst: logic         <PRF_W> [FIFO_N];
+    var fifo_s_rdy : logic                 [FIFO_N];
+    var fifo_fs_pd : logic         <PRF_W> [FIFO_N]; // V3b: FP scalar pdst (.vf)
+    var fifo_s2_pd : logic         <PRF_W> [FIFO_N]; // V5h: 2nd int scalar pdst (strided stride)
+    var fifo_has_rd: logic                 [FIFO_N];
+    var fifo_rd_fp : logic                 [FIFO_N]; // V3f: scalar rd is FP (vfmv.f.s)
+    var fifo_rd_pd : logic         <PRF_W> [FIFO_N];
+    var fifo_rob   : logic     <ROB_IDX_W> [FIFO_N];
+    var head       : logic         <FIFO_W>;
+    var count      : logic       <FIFO_W+1>; // 0..FIFO_N
+
+    // ---- Working vector config (architectural-as-executed; in-order) --------
+    var vtype_q: logic<64>;
+    var vl_q   : logic<64>;
+
+    // ---- V1 unit-stride memory FSM ------------------------------------------
+    // States: 0=IDLE, 1=ARM (own the dmem port, drain the scalar mem path),
+    // 2=ACCESS (stream one element per access), 3=DONE (drive vu_cdb + retire).
+    // The head FIFO fields stay stable for the whole op (it is not popped until
+    // DONE), so EEW/vm/base/mask/vs3 are read combinationally — only the
+    // streaming state (element index, load accumulator, fault) is registered.
+    var mem_state : logic<2> ;
+    var mem_fetched_q: logic ; // CP (MEM_PIPE): element is in its ACCESS phase (FETCH done)
+    // CP (VINT_PIPE cut #2): the registered element VA + a VADDR-done flag. When
+    // MEM_PIPE && VINT_PIPE, each active mem element first spends a VADDR cycle
+    // (mem_va_ready_q 0->1) that latches m_vaddr (the strided-address multiply /
+    // indexed offset add) into mem_va_q WITHOUT driving the port (o_mem_active=0);
+    // the FETCH cycle then drives the REGISTERED VA into the shared MMU, so the MMU
+    // input starts at a register, not at the velem*stride multiply. Dead when
+    // VINT_PIPE=0 (mem_va_ready_q never set -> the FETCH drives live m_vaddr = today).
+    var mem_va_q     : logic<64>;
+    var mem_va_ready_q: logic   ;
+    var velem     : logic<8> ; // current element index (0 .. vl)
+    var vacc      : logic<VLEN>; // load accumulator (tail / masked-off stay 0)
+    var fault_q   : logic    ; // the op faulted at vstart_q
+    var fault_va_q: logic<64>;
+    var vstart_q  : logic<8> ;
+    var seg_field : logic<3> ; // V5j segment: current field (0 .. nf), outer loop
+    // V6 vleff (fault-only-first): when an element > 0 of a vle<eew>ff.v would
+    // fault, the op does NOT trap — vl is trimmed to that element index (only the
+    // fault-free prefix is loaded) and execution continues. ff_trim_q marks such
+    // a retiring vleff; ff_vl_q carries the trimmed vl (= the faulting element).
+    var ff_trim_q : logic    ;
+    var ff_vl_q   : logic<8> ;
+
+    // ---- V2d arithmetic register-group iteration (LMUL>1) -------------------
+    // Same-width ALU/merge/mul-div span EMUL = LMUL destination registers; the
+    // VU processes one register group per cycle (register-serial), reading the
+    // source group base+va_reg and writing the dest group base+va_reg. va_reg
+    // walks 0 .. va_nregs-1; the final group rides the vu_cdb (result_written).
+    var va_reg: logic<3>; // current register-group index
+    // Compare LMUL>1: mask-bit accumulator across the EMUL source groups. Seeded
+    // from the old mask dest on group 0 (inactive / tail bits undisturbed); each
+    // group splices its element bits in, and the final group writes the mask reg.
+    var va_acc: logic<VLEN>;
+    // V5a saturating add/sub: OR-accumulate the per-group saturation across the
+    // EMUL groups (seeded 0 at group 0); the final group drives o_cdb_vxsat.
+    var vxsat_acc: logic;
+    // Narrowing: the low half of the dest register (computed on the even source
+    // step from source register va_reg) is held until the odd step writes the
+    // full dest register as {high-half, vn_lo}.
+    var vn_lo: logic<64>;
+    // CP (VALU_PIPE): the FETCH-phase registered VRF operands for the register-serial
+    // plain-valu / compare compute. Each such group first spends a FETCH cycle that
+    // latches vs2/vs1/vdold here; valu_res/cmp_res then run next cycle off these
+    // registers. va_fetched_q flags the fetch done. Dead when VALU_PIPE=0 (never set).
+    var va_vs1_q    : logic<VLEN>;
+    var va_vs2_q    : logic<VLEN>;
+    var va_fetched_q: logic      ;
+
+    // ---- V3 vector FP element-serial state ----------------------------------
+    // FP arithmetic shares ONE fpu_wrap instance (an FPU per element would be
+    // far too large), so elements stream one per cycle. fp_state: 0=IDLE,
+    // 1=COMPUTE, 2=DONE. fp_elem is the global element index; fp_acc accumulates
+    // the current destination register (active results spliced over the old vd,
+    // so tail / masked-off stay undisturbed); fp_fflags_q OR-accumulates the
+    // per-element IEEE flags across the whole op. vfpu_* receive the shared
+    // fpu_wrap outputs (combinational result for the single-cycle V3a ops).
+    var fp_state   : logic<2>            ;
+    // fp-pipeline: the shared fpu_wrap (u_vfpu) is PIPE=1 (2-stage), so a fast
+    // (arith/cmp) element's result lands one cycle after its operands are
+    // presented. fp_ph sequences each COMPUTE element: 0 = present (drive
+    // operands; fp_elem stable), 1 = capture (accumulate the now-ready result,
+    // advance). Holding fp_elem across both phases keeps all dest geometry /
+    // vdold addressing correct with no extra pipelining (throughput halves for
+    // now; a later streaming step recovers it). div/sqrt still wait on vfpu_busy.
+    var fp_ph      : logic               ;
+    var fp_elem    : logic<8>            ;
+    // CP (VFP_PIPE): registered u_vfpu operands + the FETCH-done flag. When
+    // VFP_PIPE, each COMPUTE element first spends a FETCH cycle (fp_fetched_q 0->1)
+    // that latches the operands here; present/capture then run on the registered
+    // copies. Dead when VFP_PIPE=0 (fp_fetched_q never set).
+    var fp_s1_q     : logic<64>          ;
+    var fp_s2_q     : logic<64>          ;
+    var fp_s3_q     : logic<64>          ;
+    var fp_int_rs1_q: logic<64>          ;
+    var fp_fetched_q: logic              ;
+    var fp_acc     : logic<VLEN>         ;
+    var fp_fflags_q: logic<5>            ;
+    var red_acc    : logic<64>           ; // V4a reduction scalar accumulator (NaN-boxed for SEW=32)
+    var vfpu_cdb   : pipeline_pkg::CdbBus;
+    var vfpu_fflags: logic<5>            ;
+    var vfpu_busy  : logic               ;
+
+    // ---- Integer DIV/REM element-serial state (V2c vdiv/vrem) ----------------
+    // The shared int_divider FU processes one lane of the current VALU group per
+    // ~34 cycles. dv_lane walks the group's lanes (0..16>>vsew); dv_acc holds the
+    // group's completed quotients/remainders (inactive/tail lanes pull old vd at
+    // the valu_res mux, so dv_acc need only carry active lanes). The group's
+    // va_run / va_fire is held until dv_lane reaches the lane count.
+    var dv_lane: logic<5>   ;
+    var dv_acc : logic<VLEN>;
+
+    // ---- V4i permute (slide/vrgather/vcompress) element-serial state --------
+    // These ops can move an element across register groups, so for LMUL>1 a
+    // single-cycle whole-register datapath is impossible — a destination element
+    // may source an arbitrary register. The VU therefore walks one element per
+    // cycle (pelem), accumulating each destination register and writing it at its
+    // boundary, exactly like the FP / memory FSMs (this also covers LMUL=1, just
+    // multi-cycle). pm_acc is the current dest-register accumulator; pm_j is
+    // vcompress's running output element position. pm_state: 0=IDLE,1=COMPUTE,2=DONE.
+    var pm_state: logic<2>   ;
+    var pelem   : logic<8>   ; // global element walk index
+    var pm_acc  : logic<VLEN>; // current destination register accumulator
+    var pm_j    : logic<8>   ; // vcompress running output element index
+    // CP (VINT_PIPE cut #1): registered permute source addressing + the FETCH-done
+    // flag. When VINT_PIPE, each permute COMPUTE element first spends a FETCH cycle
+    // (pm_fetched_q 0->1) that latches the vs2 source register (pm_src_reg) and the
+    // in-register element offset (pm_src_bitoff) + OOB; the present cycle then drives
+    // o_vs2_addr (-> the VRF read) and the element extract off these REGISTERS, so
+    // the deep source-addressing chain (vrgather's vs1->idx, slide's scalar->sidx)
+    // ends at a register and the VRF read is the next segment. This cuts the worst
+    // VU-compute path (the data-dependent source read feeding the integer ALU /
+    // permute splice). Dead when VINT_PIPE=0 (pm_fetched_q never set).
+    var pm_src_reg_q   : logic<8>;
+    var pm_src_bitoff_q: logic<8>;
+    var pm_idx_oob_q   : logic   ;
+    var pm_fetched_q   : logic   ;
+
+    // FIFO_N == 2**FIFO_W, so count uses FIFO_W+1 bits and is full exactly when
+    // its top bit is set (count == FIFO_N); otherwise a slot is free.
+    let has_free: logic = !count[FIFO_W];
+    assign o_alloc_rdy = has_free;
+
+    // ---- Head fields --------------------------------------------------------
+    let h_op    : vector_pkg::VecOp = fifo_op[head];
+    let h_instr : logic        <32> = fifo_instr[head];
+    let h_vd    : logic     <VRF_W> = fifo_vd[head];
+    let h_vs1   : logic     <VRF_W> = fifo_vs1[head];
+    let h_vs2   : logic     <VRF_W> = fifo_vs2[head];
+    let h_uses_s: logic             = fifo_uses_s[head];
+    let h_s_pdst: logic     <PRF_W> = fifo_s_pdst[head];
+    let h_s_rdy : logic             = fifo_s_rdy[head];
+    let h_fs_pd : logic     <PRF_W> = fifo_fs_pd[head]; // V3b FP scalar pdst
+    let h_s2_pd : logic     <PRF_W> = fifo_s2_pd[head]; // V5h 2nd int scalar pdst (stride)
+    let h_has_rd: logic             = fifo_has_rd[head];
+    let h_rd_fp : logic             = fifo_rd_fp[head]; // V3f scalar rd is FP
+    let h_rd_pd : logic     <PRF_W> = fifo_rd_pd[head];
+    let h_rob   : logic <ROB_IDX_W> = fifo_rob[head];
+
+    let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
+    let h_is_valu: logic = h_op == VecOp::VALU;
+    let h_is_vmv : logic = h_op == VecOp::VMV_X_S;
+    // V3f FP scalar <-> element-0 moves (single-cycle, like vmv.x.s / vset).
+    let h_is_vfmv_sf: logic = h_op == VecOp::VFMV_S_F; // vd[0] <- f[rs1] (VRF write)
+    let h_is_vfmv_fs: logic = h_op == VecOp::VFMV_F_S; // f[rd] <- vs2[0] (FP CDB)
+    // V4c: mask-register logical (OPMVV .mm, funct6 011xxx). Single-cycle whole-
+    // register bitwise op vd = vs2 OP vs1 over the first vl bits (tail undisturbed).
+    let h_is_vmask  : logic = h_op == VecOp::VMLOGIC;
+    // V4d: mask-register reductions to int rd (vcpop.m / vfirst.m). Single-cycle;
+    // vs1 field bit 0 (h_instr[15]) selects vfirst (1) vs vcpop (0).
+    let h_is_vcpop  : logic = h_op == VecOp::VCPOP;
+    // V4e-1: mask set-prefix ops (vmsbf/vmsof/vmsif). Single-cycle mask→mask;
+    // vs1[1:0] (h_instr[16:15]) selects 01=vmsbf / 10=vmsof / 11=vmsif.
+    let h_is_vmspre : logic = h_op == VecOp::VMSPRE;
+    // V4e-2: viota.m / vid.v. Register-serial (SEW elements, EMUL dest groups);
+    // vs1 field bit 0 (h_instr[15]) selects vid.v (1) vs viota.m (0).
+    let h_is_viota  : logic = h_op == VecOp::VIOTA;
+    let h_is_vid    : logic = h_is_viota && h_instr[15];
+    // V4f-1: vector slide (single-cycle, LMUL=1). funct6[0] = h_instr[26] = down
+    // (001111) vs up (001110). The offset is x[rs1] (.vx) or uimm5 (vs1, .vi).
+    let h_is_slide  : logic = h_op == VecOp::VSLIDE;
+    let h_slide_dn  : logic = h_instr[26];
+    // V4f-3 / V4i-2: vrgather (element-serial, all LMUL). idx = vs1[i] (.vv) or
+    // x[rs1]/uimm5 (.vx/.vi). V4i-4: vrgatherei16.vv (funct6 001110) reads the
+    // index as a 16-bit element regardless of SEW (h_instr[31:26] used directly
+    // since h_funct6 is defined below).
+    let h_is_vrg    : logic = h_op == VecOp::VRGATHER;
+    let h_is_rg16   : logic = h_is_vrg && (h_instr[31:26] == 6'b001110);
+    // V4f-4 / V4i-3: vcompress.vm (element-serial, all LMUL). vs1 = compress mask.
+    let h_is_comp   : logic = h_op == VecOp::VCOMPRESS;
+    // OPIVx/OPMVx operand mode + op: funct6 (inst[31:26]) selects the op; funct3
+    // (inst[14:12]) the operand mode. VV reads vs1[i] (OPIVV=000 / OPMVV=010 →
+    // bit2=0,bit0=0); VX reads x[rs1] (OPIVX=100 / OPMVX=110 → bit2=1,bit0=0);
+    // VI uses imm5 (OPIVI=011). OPMVV/OPMVX (funct3[1:0]==10) carry the V2c
+    // integer mul/div ops. vm (inst[25]) = unmasked.
+    let h_funct3 : logic<3> = h_instr[14:12];
+    let h_funct6 : logic<6> = h_instr[31:26];
+    let h_is_vv  : logic    = !h_funct3[2] && !h_funct3[0];
+    let h_is_vx  : logic    = h_funct3[2] && !h_funct3[0];
+    let h_is_opm : logic    = h_funct3[1:0] == 2'b10;
+    let h_alu_vm : logic    = h_instr[25];
+    // V2b op categories (within VALU): integer compare (funct6 011xxx → mask
+    // register result) and merge/vmv.v (funct6 010111 → element select).
+    let h_is_cmp  : logic = h_funct6[5:3] == 3'b011;
+    let h_is_merge: logic = h_funct6 == 6'b010111;
+    // V5a fixed-point saturating add/sub (OPIV* funct6 1000xx): vsaddu/vsadd/
+    // vssubu/vssub. Gated to !h_is_opm so it does not collide with the OPMV*
+    // mul/div ops (funct6 100xxx). funct6[1] = sub, funct6[0] = signed.
+    let h_is_satadd: logic = h_is_valu && !h_is_opm && (h_funct6[5:2] == 4'b1000);
+    // Integer divide/remainder (OPMV* funct6 1000xx = vdivu/vdiv/vremu/vrem).
+    // These run on the shared multi-cycle int_divider FU (element-serial across
+    // the group's lanes), NOT the per-lane combinational divider — that
+    // synthesized to the deepest path in the vector unit. funct6[1]=rem,
+    // funct6[0]=signed.
+    let h_is_vdiv  : logic = h_is_valu && h_is_opm && (h_funct6[5:2] == 4'b1000);
+    // V5b averaging add/sub (OPMV* funct6 0010xx): vaaddu/vaadd/vasubu/vasub.
+    // funct6[1] = sub, funct6[0] = signed. Rounds the 1-bit shift per vxrm.
+    let h_is_vaavg : logic = h_is_valu && h_is_opm && (h_funct6[5:2] == 4'b0010);
+    // V5c scaling (rounding) right shift (OPIV* funct6 10101x): vssrl/vssra.
+    // funct6[0] = arithmetic (vssra) vs logical (vssrl). Rounds per vxrm.
+    let h_is_vssh  : logic = h_is_valu && !h_is_opm && (h_funct6[5:1] == 5'b10101);
+    // V5e fractional saturating multiply (OPIV* funct6 100111): vsmul.vv/.vx. The
+    // OPMV* funct6 100111 is vmulh, so gate on !h_is_opm (OPIVI 100111 is vmvr.v,
+    // handled by the decoder — it never reaches the VU as a VALU op).
+    let h_is_vsmul : logic = h_is_valu && !h_is_opm && (h_funct6 == 6'b100111);
+    // V2d-4 widening (OPMVV/OPMVX funct6 11xxxx): result EEW = 2*SEW, so the
+    // destination spans 2*EMUL registers (one source group → two dest groups).
+    let h_is_widen: logic = h_is_opm && (h_funct6[5:4] == 2'b11);
+    // .w forms (vwadd.w/vwsub.w, funct6 1101xx): vs2 is already 2*SEW, so it is
+    // read full-width (h_vs2+va_reg) while vs1/scalar is the SEW operand.
+    let h_is_widen_w: logic = h_is_widen && (h_funct6[5:2] == 4'b1101);
+    // V2d-5 narrowing (OPIVV/VX/VI funct6 10110x = vnsrl/vnsra): source vs2 is
+    // 2*SEW, so two source registers feed one SEW dest register (the inverse of
+    // widening). funct6[0] = arithmetic (vnsra) vs logical (vnsrl).
+    let h_is_narrow: logic = !h_is_opm && (h_funct6[5:1] == 5'b10110);
+    // V5d narrowing fixed-point clip (OPIV* funct6 10111x = vnclipu/vnclip): same
+    // 2*SEW→SEW narrowing geometry as vnsrl/vnsra, but rounded (vxrm) and saturated
+    // (vxsat). funct6[0] = signed (vnclip) vs unsigned (vnclipu). h_is_narr drives
+    // the shared narrowing geometry for both.
+    let h_is_vnclip: logic = !h_is_opm && (h_funct6[5:1] == 5'b10111);
+    let h_is_narr  : logic = h_is_narrow || h_is_vnclip;
+    // V1 unit-stride memory ops.
+    let h_is_vle: logic = h_op == VecOp::VLE;
+    let h_is_vse: logic = h_op == VecOp::VSE;
+    let h_is_mem: logic = h_is_vle || h_is_vse;
+    // V5f memory: the unit-stride family's lumop/sumop (inst[24:20]) selects the
+    // variant; nf (inst[31:29]) the whole-register count. 01000 = whole-register
+    // (vl<nreg>re / vs<nreg>r, NREG = nf+1 ∈ {1,2,4,8}), 01011 = mask (vlm/vsm,
+    // EEW=8). Both are unmasked and move a fixed byte count (independent of vl):
+    // whole-register transfers NREG*VLEN/EEW elements, mask transfers ceil(vl/8)
+    // bytes. The address generation, element packing and register-boundary writes
+    // are identical to unit-stride — only the element count (evl) and the
+    // all-active mask differ.
+    let h_lumop      : logic<5> = h_instr[24:20];
+    let h_nf         : logic<3> = h_instr[31:29];
+    let h_is_wholereg: logic    = h_is_mem && (h_lumop == 5'b01000);
+    let h_is_maskmem : logic    = h_is_mem && (h_lumop == 5'b01011);
+    // V5g indexed gather/scatter: mop (inst[27:26]) 01 (unordered) / 11 (ordered)
+    // — both serialize identically in the in-order VU. inst[24:20] is the index
+    // vector vs2 (read on the otherwise-free vs1 port). The instruction width
+    // field is the INDEX EEW; the data EEW is SEW (vtype). Each element's address
+    // is base + vs2[i] (a per-element gather/scatter).
+    let h_is_indexed : logic    = h_is_mem && h_instr[26];
+    // V5h strided: mop = 10 (inst[27]=1, inst[26]=0). The per-element byte stride
+    // is x[rs2] (the 2nd int scalar, i_scalar2_data); data EEW is the width field
+    // (like unit-stride). Disjoint from indexed (inst[26]=1) and unit-stride
+    // family (inst[27]=0).
+    let h_is_strided : logic    = h_is_mem && h_instr[27] && !h_instr[26];
+    // V5j segment: unit-stride family (mop=00, lumop=00000) with nf>0. Each
+    // element is a struct of NF = nf+1 fields; field f of element i lives at
+    // base + (i*NF + f)*EEW and lands in register vd+f, element i. Walked
+    // field-outer / element-inner so each field register fills as a stride-NF*EEW
+    // strided load (reusing the unit-stride per-register accumulate). LMUL=1.
+    let h_is_segment : logic    = h_is_mem && (h_instr[27:26] == 2'b00) && (h_lumop == 5'b00000) && (h_nf != 3'd0);
+    let seg_nf1      : logic<8> = {5'd0, h_nf} + 8'd1; // NF = nf+1 ∈ {2..8}
+    // V6 fault-only-first (vle<eew>ff.v): unit-stride family, lumop = 10000, load
+    // only. Addressing / element packing / evl (= vl) are identical to unit-stride;
+    // the only difference is the fault response (trim vl instead of trapping).
+    let h_is_ff      : logic    = h_is_vle && (h_lumop == 5'b10000);
+    // V3a/V3b/V3c vector FP arithmetic (OPFVV .vv / OPFVF .vf). .vf (funct3=101)
+    // takes its second operand from the FP scalar f[rs1]. The reverse .vf forms
+    // vfrsub.vf (100111 = f[rs1]-vs2) and vfrdiv.vf (100001 = f[rs1]/vs2) swap
+    // the FPU operands (s1=scalar, s2=vs2).
+    let h_is_fp  : logic = h_op == VecOp::VFALU;
+    let h_is_vf  : logic = h_is_fp && (h_funct3 == 3'b101);
+    // V4a: FP reductions (OPFVV .vs, funct6 0001x1 odd: vfredusum 000001 /
+    // vfredosum 000011 / vfredmin 000101 / vfredmax 000111). A horizontal fold:
+    // vd[0] = vs1[0] OP vs2[0] OP ... OP vs2[vl-1] over all active elements (vd[0]
+    // is the only element written; the rest stay tail-undisturbed). The element-
+    // serial FSM folds one vs2 element per cycle into the scalar red_acc, seeded
+    // from vs1[0]. usum/osum both fold sequentially (a valid unordered order).
+    let h_is_fred: logic = h_is_fp && (h_funct3 == 3'b001) && (h_funct6[5:3] == 3'b000) && h_funct6[0];
+    // V4b: integer reductions (OPMVV .vs, funct6 0000xx: vredsum/vredand/vredor/
+    // vredxor/vredminu/vredmin/vredmaxu/vredmax). Same horizontal fold as the FP
+    // reductions, routed to VFALU so it reuses the element-serial walk + red_acc,
+    // but the per-element fold is combinational (no FPU, no fflags, no NaN-box).
+    let h_is_ired: logic = h_is_fp && (h_funct3 == 3'b010) && (h_funct6[5:3] == 3'b000);
+    // V4g-1: integer widening reduction (OPIVV .vs funct6 110000 vwredsumu /
+    // 110001 vwredsum). Reuses the reduction FSM but accumulates / writes at
+    // 2*SEW; funct6[0] selects signed (vwredsum) vs unsigned element extension.
+    let h_is_iwred: logic = h_is_fp && (h_funct3 == 3'b000) && (h_funct6[5:1] == 5'b11000);
+    let h_is_anyired: logic = h_is_ired || h_is_iwred;
+    // V4g-2: FP widening reduction (OPFVV .vs funct6 110001 vfwredusum / 110011
+    // vfwredosum). The 2*SEW (double) accumulator folds s2d-widened single vs2
+    // elements via FADD_D; the seed vs1[0] is already 2*SEW. Both fold serially.
+    let h_is_fwred: logic = h_is_fp && (h_funct3 == 3'b001) && (h_funct6 == 6'b110001 || h_funct6 == 6'b110011);
+    let h_is_red : logic = h_is_fred || h_is_fwred || h_is_anyired;
+    // V3d: FP compare (funct6 011xxx) → 1-bit-per-element mask register result.
+    let h_is_fcmp: logic = h_is_fp && (h_funct6[5:3] == 3'b011);
+    // V3e: vfmerge.vfm / vfmv.v.f (funct6 010111) — a data select (no FPU), so it
+    // neither issues the shared FPU nor accrues fflags. Every body element is
+    // written (active → f[rs1], inactive → vs2); only the tail stays undisturbed.
+    let h_is_fmerge: logic = h_is_fp && (h_funct6 == 6'b010111);
+    // V3g: vfcvt.* (funct6 010010) — same-width int<->FP conversion. The rtz
+    // variants (vs1 00110/00111, i.e. vs1[2]=1) round toward zero; the rest use
+    // fcsr.frm. int->FP variants feed the vreg element to the FPU's INT input.
+    let h_is_fcvt: logic = h_is_fp && (h_funct6 == 6'b010010);
+    // V3j: widening conversion vfwcvt.* (VFUNARY0 010010, vs1[4:3]==01, SEW->2*SEW).
+    // Unary; result is 64-bit (double or 2*SEW int), so it uses the 2*SEW dest
+    // geometry. vs1[2:0] selects the FCVT op (see the FpuOp map below).
+    let h_is_fwcvt: logic = h_is_fp && (h_funct6 == 6'b010010) && (h_instr[19:18] == 2'b01);
+    // V4h: vfncvt.* (VFUNARY0 010010, vs1[4:3]==10): narrowing convert, 2*SEW
+    // source (double / int64) -> SEW dest (single / int32). Mirror of vfwcvt:
+    // the source is read at the 2*SEW (double) geometry while the dest is the
+    // normal same-width SEW geometry. vs1[2:0] selects the FCVT op.
+    let h_is_fncvt: logic = h_is_fp && (h_funct6 == 6'b010010) && (h_instr[19:18] == 2'b10);
+    // V3j-4: vfrsqrt7.v (VFUNARY1 010011, vs1=00100) / vfrec7.v (vs1=00101) — the
+    // 7-bit reciprocal-square-root / reciprocal estimates. Same-width, OPFVV-only,
+    // unary; computed by a table ROM in the VU (the shared FPU has no such op), so
+    // they neither issue the FPU nor read its result/fflags.
+    let h_is_vfrsqrt7: logic = h_is_fp && (h_funct6 == 6'b010011) && (h_instr[19:15] == 5'b00100);
+    let h_is_vfrec7  : logic = h_is_fp && (h_funct6 == 6'b010011) && (h_instr[19:15] == 5'b00101);
+    let h_is_vfest   : logic = h_is_vfrsqrt7 || h_is_vfrec7;
+    // V3h: FP fused multiply-add (funct6 101xxx) — 3-operand, reads the old vd
+    // element as an accumuland. funct6[2] picks the multiplicand pairing
+    // (1 = macc: vs1*vs2 + vd ; 0 = madd: vs1*vd + vs2).
+    let h_is_fma: logic = h_is_fp && (h_funct6[5:3] == 3'b101);
+    // V3i: widening FP add/sub/mul (.vv/.vf): vfwadd(110000)/vfwsub(110010)/
+    // vfwmul(111000). Result EEW = 2*SEW (single -> double), so the destination
+    // uses 2*SEW geometry (one source register pair -> two dest registers).
+    // V3j: the .w forms vfwadd.w(110100)/vfwsub.w(110110) — vs2 is ALREADY double
+    // (read at dest geometry); only vs1 / f[rs1] is widened from single.
+    let h_is_fwiden_w: logic = h_is_fp && (h_funct6 == 6'b110100 || h_funct6 == 6'b110110);
+    // V3j: widening FMA (funct6 1111xx) vfwmacc/vfwnmacc/vfwmsac/vfwnmsac — both
+    // multiplicands are single (s2d-widened); the accumulator is the old vd, which
+    // is already double (read at dest geometry). funct6[1:0] picks the sign form.
+    let h_is_fwfma: logic = h_is_fp && (h_funct6[5:2] == 4'b1111);
+    // Widening FP ops are OPFVV/OPFVF (funct3 001/101); excluding funct3==000
+    // keeps the integer widening reduction (vwredsumu, funct6 110000) off this
+    // path (it shares funct6 110000 with vfwadd but is routed via VFALU too).
+    let h_is_fwiden: logic = h_is_fp && (h_funct3 != 3'b000) && (h_funct6 == 6'b110000 || h_funct6 == 6'b110010 || h_funct6 == 6'b111000 || h_is_fwiden_w || h_is_fwfma);
+    // Reverse / swapped-operand forms: vfrsub.vf (100111), vfrdiv.vf (100001),
+    // and the .vf-only compares vmfgt (011101) / vmfge (011111), which are
+    // computed as f[rs1] < / <= vs2 with the FPU operands swapped.
+    let fp_swap  : logic = h_is_fp && (h_funct6 == 6'b100111 || h_funct6 == 6'b100001
+        || h_funct6 == 6'b011101 || h_funct6 == 6'b011111);
+    // V2d LMUL>1: EMUL register groups walked per VALU op (integer LMUL 1/2/4/8
+    // → 1/2/4/8 groups; fractional LMUL → 1). For a same-width ALU/merge/mul-div
+    // op this is the destination register count (one written per group). A
+    // compare reads EMUL source groups but writes a SINGLE mask register, so it
+    // walks the same group count while accumulating mask bits into va_acc and
+    // writing the mask only on the final group.
+    let h_vlmul: logic<3> = vtype_q[2:0];
+    var emul    : logic<4>;
+    always_comb {
+        if h_vlmul[2] {
+            emul = 4'd1; // fractional LMUL
+        } else {
+            emul = 4'd1 << h_vlmul[1:0]; // 1/2/4/8
+        }
+    }
+    // Widening walks 2*EMUL dest groups; narrowing 2*EMUL source steps; else EMUL.
+    let va_nregs: logic<4> = if (h_is_widen || h_is_narr) ? {emul[2:0], 1'b0} : emul;
+    // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
+    // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
+    let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
+    let h_vm     : logic    = h_instr[25];
+
+    // Current SEW / vl (8-bit element count; vl <= VLMAX <= 128).
+    let vsew: logic<3> = vtype_q[5:3];
+    let vl8 : logic<8> = vl_q[7:0];
+
+    // ---- vset*vl: requested vtype, VLMAX, AVL, granted vl -------------------
+    // vsetvli (inst[31]=0): vtype = zimm[10:0] (inst[30:20]). vsetivli
+    // (inst[31:30]=11): vtype = zimm[9:0] (inst[29:20]). vsetvl register form
+    // (inst[31:30]=10, same VSETVLI VecOp): vtype = x[rs2] = the 2nd int scalar
+    // (read at the ROB head, like the strided stride).
+    let h_is_vsetvl_r: logic = (h_op == VecOp::VSETVLI) && h_instr[31];
+    var vtype_req: logic<64>;
+    always_comb {
+        if h_op == VecOp::VSETIVLI {
+            vtype_req = {54'd0, h_instr[29:20]};
+        } else if h_is_vsetvl_r {
+            vtype_req = i_scalar2_data;
+        } else {
+            vtype_req = {53'd0, h_instr[30:20]};
+        }
+    }
+    let req_vsew : logic<3> = vtype_req[5:3];
+    let req_vlmul: logic<3> = vtype_req[2:0];
+    // Reserved configs → vill (SEW > 64 = ELEN, or LMUL encoding 100).
+    let vill: logic = (req_vsew >= 3'd4) || (req_vlmul == 3'd4);
+    // Elements per vector register at this SEW (16/8/4/2 for SEW 8/16/32/64).
+    let vlen_div_sew: logic<8> = 8'd16 >> req_vsew;
+    var vlmax: logic<8>;
+    always_comb {
+        if req_vlmul[2] == 1'b0 {
+            // integer LMUL: *1/*2/*4/*8
+            vlmax = vlen_div_sew << req_vlmul[1:0];
+        } else {
+            // fractional LMUL: /8, /4, /2 for vlmul 101/110/111
+            let fshift: logic<4> = 4'd8 - {1'b0, req_vlmul};
+            vlmax = vlen_div_sew >> fshift;
+        }
+    }
+    let vlmax64: logic<64> = {56'd0, vlmax};
+    // AVL: vsetivli uimm[19:15]; vsetvli x[rs1] (rs1==x0 → VLMAX, except keep-vl).
+    var avl: logic<64>;
+    always_comb {
+        if h_op == VecOp::VSETIVLI {
+            avl = {59'd0, h_instr[19:15]};
+        } else if h_vs1 == 5'd0 {
+            avl = vlmax64; // rs1==x0: request VLMAX (keep-vl handled in vl_new)
+        } else {
+            avl = i_scalar_data; // x[rs1]
+        }
+    }
+    let keep_vl: logic = (h_op == VecOp::VSETVLI) && (h_vs1 == 5'd0) && (h_vd == 5'd0);
+    var vl_new: logic<64>;
+    always_comb {
+        if vill {
+            vl_new = 64'd0;
+        } else if keep_vl {
+            vl_new = vl_q;
+        } else if avl >: vlmax64 {
+            vl_new = vlmax64;
+        } else {
+            vl_new = avl;
+        }
+    }
+    let vtype_new: logic<64> = if vill ? {1'b1, 63'd0} : {56'd0, vtype_req[7:0]};
+
+    // ---- Integer ALU / merge (OPIVV/VX/VI): per-SEW element compute over VLEN
+    // a = vs2[i]; second operand b = vs1[i] (VV) / x[rs1] (VX) / sign-extended
+    // imm5 (VI). Active = (i < vl) && (vm || v0[i]). ALU ops write only active
+    // elements (inactive + tail keep the old vd = undisturbed; a spec-compliant
+    // choice for the agnostic policies too). vmerge/vmv.v (h_is_merge) instead
+    // write EVERY body element, selecting b when active and vs2[i] otherwise
+    // (vmv.v.* has vm=1 → all active → broadcast b); tail stays undisturbed.
+    let bbcast: logic<64> = if h_is_vx ? i_scalar_data : {h_instr[19] repeat 59, h_instr[19:15]};
+    // CP (VALU_PIPE): the multiply/compare operands read these aliases. They are
+    // PARAM-gated (folds to va_vs*_q at VALU_PIPE=1, i_vs*_data at =0) so no runtime
+    // mux is left on the datapath — a runtime `va_use_reg ? reg : live` mux leaves a
+    // FALSE PATH (STA times the live input feeding the multiply, defeating the cut).
+    // Only plain-valu/compare groups fetch (va_use_reg, control-only below); those are
+    // the only ops whose SELECTED result reads a/b (widen->vw_res, narrow->vn_step,
+    // viota->viota_res, divide->dv_acc read live; valu_res's a*b is dead for them).
+    // vdold stays LIVE (the valu_res default / cmp_seed) so divide's inactive/tail
+    // lanes are correct without fetching. va_reg is stable across a group's
+    // fetch->compute, so the registered value equals the live read (latency-only cut).
+    let va_use_reg: logic       = VALU_PIPE && h_is_valu && !h_is_vdiv && !h_is_widen && !h_is_narr;
+    let va_vs2    : logic<VLEN> = if VALU_PIPE ? va_vs2_q : i_vs2_data;
+    let va_vs1    : logic<VLEN> = if VALU_PIPE ? va_vs1_q : i_vs1_data;
+    var valu_res: logic<VLEN>;
+    var vsat_grp: logic; // V5a: any active satadd element saturated in this group
+    always_comb {
+        valu_res = i_vdold_data; // default: inactive/tail = undisturbed (live: divide reads this)
+        vsat_grp = 1'b0;
+        case vsew {
+            3'd0: {
+                let base: logic<8>    = {1'b0, va_reg, 4'd0}; // va_reg * 16 elements
+                let msk : logic<VLEN> = i_mask_data >> base;  // v0 bits for this group
+                for i in 0..16 {
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic    = h_alu_vm || msk[i];
+                        let a  : logic<8> = va_vs2[i*8+:8];
+                        let b  : logic<8> = if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0];
+                        if h_is_merge {
+                            valu_res[i*8+:8] = if act ? b : a;
+                        } else if act {
+                            if h_is_satadd {
+                                let sr: logic<9> = vsatas::<8>(a, b, h_funct6[1], h_funct6[0]);
+                                valu_res[i*8+:8] = sr[7:0];
+                                if sr[8] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else if h_is_vaavg {
+                                valu_res[i*8+:8] = vaverage::<8>(a, b, h_funct6[1], h_funct6[0], i_vxrm);
+                            } else if h_is_vssh {
+                                valu_res[i*8+:8] = vssh::<8>(a, b, h_funct6[0], i_vxrm);
+                            } else if h_is_vsmul {
+                                let sr: logic<9> = vsmul::<8>(a, b, i_vxrm);
+                                valu_res[i*8+:8] = sr[7:0];
+                                if sr[8] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else {
+                                valu_res[i*8+:8] = if h_is_vdiv ? dv_acc[i*8+:8] : (if h_is_opm ? vmuldiv::<8>(a, b, h_funct6) : valu::<8>(a, b, h_funct6));
+                            }
+                        }
+                    }
+                }
+            }
+            3'd1: {
+                let base: logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk : logic<VLEN> = i_mask_data >> base;
+                for i in 0..8 {
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic     = h_alu_vm || msk[i];
+                        let a  : logic<16> = va_vs2[i*16+:16];
+                        let b  : logic<16> = if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0];
+                        if h_is_merge {
+                            valu_res[i*16+:16] = if act ? b : a;
+                        } else if act {
+                            if h_is_satadd {
+                                let sr: logic<17> = vsatas::<16>(a, b, h_funct6[1], h_funct6[0]);
+                                valu_res[i*16+:16] = sr[15:0];
+                                if sr[16] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else if h_is_vaavg {
+                                valu_res[i*16+:16] = vaverage::<16>(a, b, h_funct6[1], h_funct6[0], i_vxrm);
+                            } else if h_is_vssh {
+                                valu_res[i*16+:16] = vssh::<16>(a, b, h_funct6[0], i_vxrm);
+                            } else if h_is_vsmul {
+                                let sr: logic<17> = vsmul::<16>(a, b, i_vxrm);
+                                valu_res[i*16+:16] = sr[15:0];
+                                if sr[16] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else {
+                                valu_res[i*16+:16] = if h_is_vdiv ? dv_acc[i*16+:16] : (if h_is_opm ? vmuldiv::<16>(a, b, h_funct6) : valu::<16>(a, b, h_funct6));
+                            }
+                        }
+                    }
+                }
+            }
+            3'd2: {
+                let base: logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk : logic<VLEN> = i_mask_data >> base;
+                for i in 0..4 {
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic     = h_alu_vm || msk[i];
+                        let a  : logic<32> = va_vs2[i*32+:32];
+                        let b  : logic<32> = if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0];
+                        if h_is_merge {
+                            valu_res[i*32+:32] = if act ? b : a;
+                        } else if act {
+                            if h_is_satadd {
+                                let sr: logic<33> = vsatas::<32>(a, b, h_funct6[1], h_funct6[0]);
+                                valu_res[i*32+:32] = sr[31:0];
+                                if sr[32] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else if h_is_vaavg {
+                                valu_res[i*32+:32] = vaverage::<32>(a, b, h_funct6[1], h_funct6[0], i_vxrm);
+                            } else if h_is_vssh {
+                                valu_res[i*32+:32] = vssh::<32>(a, b, h_funct6[0], i_vxrm);
+                            } else if h_is_vsmul {
+                                let sr: logic<33> = vsmul::<32>(a, b, i_vxrm);
+                                valu_res[i*32+:32] = sr[31:0];
+                                if sr[32] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else {
+                                valu_res[i*32+:32] = if h_is_vdiv ? dv_acc[i*32+:32] : (if h_is_opm ? vmuldiv::<32>(a, b, h_funct6) : valu::<32>(a, b, h_funct6));
+                            }
+                        }
+                    }
+                }
+            }
+            default: {
+                let base: logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk : logic<VLEN> = i_mask_data >> base;
+                for i in 0..2 {
+                    if (base + (i as 8)) <: vl8 {
+                        let act: logic     = h_alu_vm || msk[i];
+                        let a  : logic<64> = va_vs2[i*64+:64];
+                        let b  : logic<64> = if h_is_vv ? va_vs1[i*64+:64] : bbcast;
+                        if h_is_merge {
+                            valu_res[i*64+:64] = if act ? b : a;
+                        } else if act {
+                            if h_is_satadd {
+                                let sr: logic<65> = vsatas::<64>(a, b, h_funct6[1], h_funct6[0]);
+                                valu_res[i*64+:64] = sr[63:0];
+                                if sr[64] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else if h_is_vaavg {
+                                valu_res[i*64+:64] = vaverage::<64>(a, b, h_funct6[1], h_funct6[0], i_vxrm);
+                            } else if h_is_vssh {
+                                valu_res[i*64+:64] = vssh::<64>(a, b, h_funct6[0], i_vxrm);
+                            } else if h_is_vsmul {
+                                let sr: logic<65> = vsmul::<64>(a, b, i_vxrm);
+                                valu_res[i*64+:64] = sr[63:0];
+                                if sr[64] {
+                                    vsat_grp = 1'b1;
+                                }
+                            } else {
+                                valu_res[i*64+:64] = if h_is_vdiv ? dv_acc[i*64+:64] : (if h_is_opm ? vmuldiv::<64>(a, b, h_funct6) : valu::<64>(a, b, h_funct6));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Integer compare (OPIVV/VX/VI, funct6 011xxx): mask register result.
+    // Bit g = compare(vs2[g], b) for active elements; inactive body + tail mask
+    // bits stay undisturbed (a spec-compliant agnostic choice). The result packs
+    // one bit per element into the low bits of the single mask dest, independent
+    // of SEW. LMUL>1: each group va_reg contributes elems_per_reg bits at global
+    // offset base; the running mask seeds from the old dest on group 0 and from
+    // va_acc afterwards. A group's bits are computed into vcmp_grp (active →
+    // compare, inactive/tail → the prior bit) then spliced into [base, base+epr).
+    let cmp_seed: logic<VLEN> = if va_reg == 3'd0 ? i_vdold_data : va_acc;
+    var vcmp_grp: logic<16>;
+    var cmp_res : logic<VLEN>;
+    always_comb {
+        vcmp_grp = 16'd0;
+        cmp_res  = cmp_seed;
+        case vsew {
+            3'd0: {
+                let base   : logic<8>    = {1'b0, va_reg, 4'd0}; // va_reg * 16
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base; // prior bits for this group
+                for i in 0..16 {
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<8>(va_vs2[i*8+:8], if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0], h_funct6) : seed_sh[i];
+                }
+                cmp_res = (cmp_seed & ~({112'd0, 16'hffff} << base)) | ({112'd0, vcmp_grp} << base);
+            }
+            3'd1: {
+                let base   : logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base;
+                for i in 0..8 {
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<16>(va_vs2[i*16+:16], if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0], h_funct6) : seed_sh[i];
+                }
+                cmp_res = (cmp_seed & ~({120'd0, 8'hff} << base)) | ({112'd0, vcmp_grp} << base);
+            }
+            3'd2: {
+                let base   : logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base;
+                for i in 0..4 {
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<32>(va_vs2[i*32+:32], if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0], h_funct6) : seed_sh[i];
+                }
+                cmp_res = (cmp_seed & ~({124'd0, 4'hf} << base)) | ({112'd0, vcmp_grp} << base);
+            }
+            default: {
+                let base   : logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk    : logic<VLEN> = i_mask_data >> base;
+                let seed_sh: logic<VLEN> = cmp_seed >> base;
+                for i in 0..2 {
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
+                    vcmp_grp[i] = if do_c ? vcmp::<64>(va_vs2[i*64+:64], if h_is_vv ? va_vs1[i*64+:64] : bbcast, h_funct6) : seed_sh[i];
+                }
+                cmp_res = (cmp_seed & ~({126'd0, 2'h3} << base)) | ({112'd0, vcmp_grp} << base);
+            }
+        }
+    }
+
+    // ---- Widening (V2d-4): dest group va_reg holds VLEN/(2*SEW) results of 2*SEW
+    // from one half of source register h_vs2+(va_reg>>1). The half offset in bits
+    // is always VLEN/2 = 64 (= elems_per_dreg * SEW), so the half is selected by a
+    // constant shift (no dynamic part-select). Even dest groups take the low half,
+    // odd the high half. Global element index = va_reg * elems_per_dreg + j.
+    let vw_vs2_half: logic<64> = if va_reg[0] ? i_vs2_data[127:64] : i_vs2_data[63:0];
+    let vw_vs1_half: logic<64> = if va_reg[0] ? i_vs1_data[127:64] : i_vs1_data[63:0];
+    var vw_res: logic<VLEN>;
+    always_comb {
+        vw_res = i_vdold_data; // inactive / tail = undisturbed
+        case vsew {
+            3'd0: { // SEW=8 → 16-bit results, 8 per dest register
+                let gbase: logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..8 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a : logic<8>  = vw_vs2_half[j*8+:8];     // SEW src (.vv/.vx)
+                        let aw: logic<16> = i_vs2_data[j*16+:16];    // 2*SEW src (.w)
+                        let b : logic<8>  = if h_is_vv ? vw_vs1_half[j*8+:8] : i_scalar_data[7:0];
+                        vw_res[j*16+:16] = if h_is_widen_w ? vwidenw::<8>(aw, b, h_funct6) : vwiden::<8>(a, b, h_funct6);
+                    }
+                }
+            }
+            3'd1: { // SEW=16 → 32-bit results, 4 per dest register
+                let gbase: logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..4 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a : logic<16> = vw_vs2_half[j*16+:16];
+                        let aw: logic<32> = i_vs2_data[j*32+:32];
+                        let b : logic<16> = if h_is_vv ? vw_vs1_half[j*16+:16] : i_scalar_data[15:0];
+                        vw_res[j*32+:32] = if h_is_widen_w ? vwidenw::<16>(aw, b, h_funct6) : vwiden::<16>(a, b, h_funct6);
+                    }
+                }
+            }
+            default: { // SEW=32 → 64-bit results, 2 per dest register
+                let gbase: logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..2 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a : logic<32> = vw_vs2_half[j*32+:32];
+                        let aw: logic<64> = i_vs2_data[j*64+:64];
+                        let b : logic<32> = if h_is_vv ? vw_vs1_half[j*32+:32] : i_scalar_data[31:0];
+                        vw_res[j*64+:64] = if h_is_widen_w ? vwidenw::<32>(aw, b, h_funct6) : vwiden::<32>(a, b, h_funct6);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Narrowing (V2d-5): source step va_reg reads one 2*SEW register
+    // (h_vs2+va_reg) and produces 64 bits = half a SEW dest register. The shift
+    // amount comes from vs1 (.wv, the matching half), x[rs1] (.wx) or uimm5
+    // (.wi). Even steps fill the low half (held in vn_lo), odd steps the high
+    // half; the dest register h_vd+(va_reg>>1) is written on the odd step.
+    let vn_vs1_half: logic<64> = if va_reg[0] ? i_vs1_data[127:64] : i_vs1_data[63:0];
+    let vn_old_half: logic<64> = if va_reg[0] ? i_vdold_data[127:64] : i_vdold_data[63:0];
+    var vn_step: logic<64>;
+    var vnc_grp: logic; // V5d: any active vnclip element saturated in this step
+    always_comb {
+        vn_step = vn_old_half; // inactive / tail = undisturbed
+        vnc_grp = 1'b0;
+        case vsew {
+            3'd0: { // SEW=8 ← 16-bit source, 8 results per step
+                let gbase: logic<8>    = {2'd0, va_reg, 3'd0}; // va_reg * 8
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..8 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a : logic<16> = i_vs2_data[j*16+:16];
+                        let sh: logic<8>  = if h_is_vv ? vn_vs1_half[j*8+:8] : (if h_is_vx ? i_scalar_data[7:0] : {3'd0, h_instr[19:15]});
+                        if h_is_vnclip {
+                            let cr: logic<9> = vnclip::<8>(a, sh, h_funct6[0], i_vxrm);
+                            vn_step[j*8+:8] = cr[7:0];
+                            if cr[8] {
+                                vnc_grp = 1'b1;
+                            }
+                        } else {
+                            vn_step[j*8+:8] = vnshift::<8>(a, sh, h_funct6[0]);
+                        }
+                    }
+                }
+            }
+            3'd1: { // SEW=16 ← 32-bit source, 4 results per step
+                let gbase: logic<8>    = {3'd0, va_reg, 2'd0}; // va_reg * 4
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..4 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a : logic<32> = i_vs2_data[j*32+:32];
+                        let sh: logic<16> = if h_is_vv ? vn_vs1_half[j*16+:16] : (if h_is_vx ? i_scalar_data[15:0] : {11'd0, h_instr[19:15]});
+                        if h_is_vnclip {
+                            let cr: logic<17> = vnclip::<16>(a, sh, h_funct6[0], i_vxrm);
+                            vn_step[j*16+:16] = cr[15:0];
+                            if cr[16] {
+                                vnc_grp = 1'b1;
+                            }
+                        } else {
+                            vn_step[j*16+:16] = vnshift::<16>(a, sh, h_funct6[0]);
+                        }
+                    }
+                }
+            }
+            default: { // SEW=32 ← 64-bit source, 2 results per step
+                let gbase: logic<8>    = {4'd0, va_reg, 1'b0}; // va_reg * 2
+                let msk  : logic<VLEN> = i_mask_data >> gbase;
+                for j in 0..2 {
+                    if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
+                        let a : logic<64> = i_vs2_data[j*64+:64];
+                        let sh: logic<32> = if h_is_vv ? vn_vs1_half[j*32+:32] : (if h_is_vx ? i_scalar_data[31:0] : {27'd0, h_instr[19:15]});
+                        if h_is_vnclip {
+                            let cr: logic<33> = vnclip::<32>(a, sh, h_funct6[0], i_vxrm);
+                            vn_step[j*32+:32] = cr[31:0];
+                            if cr[32] {
+                                vnc_grp = 1'b1;
+                            }
+                        } else {
+                            vn_step[j*32+:32] = vnshift::<32>(a, sh, h_funct6[0]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- vmv.x.s: x[rd] = sign-extend(vs2[element 0], SEW) ------------------
+    var vmv_res: logic<64>;
+    always_comb {
+        case vsew {
+            3'd0   : vmv_res = {i_vs2_data[7] repeat 56, i_vs2_data[7:0]};
+            3'd1   : vmv_res = {i_vs2_data[15] repeat 48, i_vs2_data[15:0]};
+            3'd2   : vmv_res = {i_vs2_data[31] repeat 32, i_vs2_data[31:0]};
+            default: vmv_res = i_vs2_data[63:0];
+        }
+    }
+    // ---- V3f FP scalar moves ------------------------------------------------
+    // vfmv.f.s: f[rd] = vs2[element 0] (NaN-boxed for SEW=32, raw for SEW=64).
+    let fp_mv_res: logic<64> = if vsew == 3'd3 ? i_vs2_data[63:0] : {32'hffffffff, i_vs2_data[31:0]};
+    // vfmv.s.f: vd[0] = f[rs1], the rest of vd undisturbed. Splice the SEW-wide
+    // scalar (vector elements are not NaN-boxed) into element 0 of the old vd.
+    let sf_mask: logic<VLEN> = if vsew == 3'd3 ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
+    let sf_val : logic<VLEN> = if vsew == 3'd3 ? {64'd0, i_fscalar_data} : {96'd0, i_fscalar_data[31:0]};
+    let sf_res : logic<VLEN> = (i_vdold_data & ~sf_mask) | sf_val;
+
+    // ---- V4c mask-register logical (single-cycle, whole register) -----------
+    // vd = vs2 OP vs1 (a=vs1, b=vs2) over the first vl bits; the tail (bits >= vl)
+    // stays undisturbed. vl_mask has the low vl bits set (all-ones when vl==VLEN).
+    let vmask_op  : logic<VLEN> = case h_funct6 {
+        6'b011000: i_vs2_data & ~i_vs1_data,   // vmandn  (vs2 & ~vs1)
+        6'b011001: i_vs2_data & i_vs1_data,    // vmand
+        6'b011010: i_vs2_data | i_vs1_data,    // vmor
+        6'b011011: i_vs2_data ^ i_vs1_data,    // vmxor
+        6'b011100: i_vs2_data | ~i_vs1_data,   // vmorn   (vs2 | ~vs1)
+        6'b011101: ~(i_vs2_data & i_vs1_data), // vmnand
+        6'b011110: ~(i_vs2_data | i_vs1_data), // vmnor
+        6'b011111: ~(i_vs2_data ^ i_vs1_data), // vmxnor
+        default  : i_vs2_data & i_vs1_data,
+    };
+    let vl_sh     : logic<VLEN> = {127'd0, 1'b1} << vl8[6:0];
+    let vl_mask   : logic<VLEN> = if vl8 >= 8'd128 ? {1'b1 repeat VLEN} : (vl_sh - {127'd0, 1'b1});
+    let vmask_res : logic<VLEN> = (vmask_op & vl_mask) | (i_vdold_data & ~vl_mask);
+
+    // ---- Shared mask-reduction prefix (V4d vcpop/vfirst, V4e-1 vmsbf/of/if) --
+    // "Eligible" = an active body element whose source bit is set:
+    // (i < vl) && (vm || v0[i]) && vs2[i]. Both mask reductions below are
+    // functions only of this vector and of where its lowest set bit sits, so the
+    // eligible mask and its EXCLUSIVE prefix-OR are built once here, in log depth
+    // (Hillis-Steele), instead of the VLEN(=128)-deep serial scan each used to
+    // walk. vmsp_nf[i] = "no eligible bit strictly before i" — 1 up to and
+    // including the first eligible element, 0 after it.
+    let vmsp_active: logic<VLEN> = vl_mask & (if h_alu_vm ? {1'b1 repeat VLEN} : i_mask_data);
+    let vmsp_elig  : logic<VLEN> = vmsp_active & i_vs2_data; // active set source bits
+    let vmsp_p0    : logic<VLEN> = vmsp_elig;
+    let vmsp_p1    : logic<VLEN> = vmsp_p0 | (vmsp_p0 << 1);
+    let vmsp_p2    : logic<VLEN> = vmsp_p1 | (vmsp_p1 << 2);
+    let vmsp_p3    : logic<VLEN> = vmsp_p2 | (vmsp_p2 << 4);
+    let vmsp_p4    : logic<VLEN> = vmsp_p3 | (vmsp_p3 << 8);
+    let vmsp_p5    : logic<VLEN> = vmsp_p4 | (vmsp_p4 << 16);
+    let vmsp_p6    : logic<VLEN> = vmsp_p5 | (vmsp_p5 << 32);
+    let vmsp_pin   : logic<VLEN> = vmsp_p6 | (vmsp_p6 << 64); // inclusive prefix-OR
+    let vmsp_before: logic<VLEN> = vmsp_pin << 1;             // exclusive: OR(elig[0..i-1])
+    let vmsp_nf    : logic<VLEN> = ~vmsp_before;              // !vmsp_found per element
+
+    // ---- V4d vcpop.m / vfirst.m (single-cycle mask reductions to int rd) ----
+    // vcpop counts the eligible bits; vfirst returns the lowest eligible index
+    // (or -1 = all-ones if none). Both write x[rd] over the int CDB (fire path).
+    // Fmax: the count was a VLEN(=128)-deep serial "+1" accumulator, and with it
+    // the deepest combinational path in the WHOLE core (head -> vcpop_res ->
+    // vu_cdb -> prf, 421 levels / 40.250 ns). It is a tree popcount of the
+    // eligible mask instead. vfirst falls out of the same shape: vmsp_nf holds
+    // exactly (first index + 1) ones, so its popcount minus one IS the index, and
+    // when nothing is eligible vmsp_nf is all-ones and vf_any returns -1.
+    // Bit-identical to the serial loop.
+    let vcpop_cnt: logic<8>  = {1'b0, popcount64(vmsp_elig[63:0])} + {1'b0, popcount64(vmsp_elig[127:64])};
+    let vf_any   : logic     = |vmsp_elig;
+    let vf_nfcnt : logic<8>  = {1'b0, popcount64(vmsp_nf[63:0])} + {1'b0, popcount64(vmsp_nf[127:64])};
+    let vfirst_ix: logic<64> = if vf_any ? {56'd0, vf_nfcnt - 8'd1} : {1'b1 repeat 64};
+    // h_instr[15] = vs1 field bit 0: 0 → vcpop, 1 → vfirst.
+    let vcpop_res: logic<64> = if h_instr[15] ? vfirst_ix : {56'd0, vcpop_cnt};
+
+    // ---- V4e-1 vmsbf.m / vmsof.m / vmsif.m (single-cycle mask set-prefix) ----
+    // Derive a prefix mask from the first active source bit set. For each active
+    // body element (i < vl, vm || v0[i]): vmsbf = 1 before the first set element;
+    // vmsif = 1 up to and including it; vmsof = 1 only at it. If no source bit is
+    // set, vmsbf/vmsif fill all active body with 1, vmsof with 0. Inactive / tail
+    // elements stay undisturbed (old vd). vs1[1:0]: 01=msbf, 10=msof, 11=msif.
+    // Everything here is per-element parallel over the shared prefix above.
+    let vmsp_bf : logic<VLEN> = vmsp_nf & ~i_vs2_data; // before first set
+    let vmsp_of : logic<VLEN> = vmsp_nf & i_vs2_data;  // only the first set
+    let vmsp_sel: logic<VLEN> = case h_instr[16:15] {
+        2'b01  : vmsp_bf,
+        2'b10  : vmsp_of,
+        default: vmsp_nf, // 2'b11 = vmsif (up to & incl. first), 2'b00 unused
+    };
+    let vmspre_res: logic<VLEN> = (vmsp_active & vmsp_sel) | (~vmsp_active & i_vdold_data);
+
+    // ---- V4e-2 viota.m / vid.v (register-serial, SEW elements) --------------
+    // viota.m writes the exclusive prefix-sum of active source-mask (vs2) bits to
+    // each active element; vid.v writes each element's own index (vs2 unused).
+    // The source mask vs2 is a single register (not LMUL-scaled); the dest spans
+    // EMUL registers, one per group va_reg. The running sum is recomputed from
+    // element 0 each group (seed = popcount of eligible source bits before this
+    // group's base), then a local prefix within the group. The prefix value is at
+    // most vl <= 128, so an 8-bit accumulator (zero-extended to SEW) suffices.
+    // Inactive / tail elements stay undisturbed. base = va_reg * (VLEN/SEW).
+    let iota_base: logic<8> = case vsew {
+        3'd0   : {1'b0, va_reg, 4'd0}, // *16
+        3'd1   : {2'd0, va_reg, 3'd0}, // *8
+        3'd2   : {3'd0, va_reg, 2'd0}, // *4
+        default: {4'd0, va_reg, 1'b0}, // *2 (SEW=64)
+    };
+    let iota_msk: logic<VLEN> = i_mask_data >> iota_base; // v0 bits for this group
+    let iota_vs2: logic<VLEN> = i_vs2_data >> iota_base;  // source bits for this group
+    // Fmax: the seed (count of eligible source bits with global index < base)
+    // was a VLEN(=128)-deep serial increment loop — the deepest combinational
+    // path in the vector unit (head -> viota_res -> vrf MSB). Build the eligible
+    // predicate in parallel and reduce it with a tree popcount (fpu_pkg's
+    // popcount64 on each 64-bit half), bit-identical to the serial count.
+    let iota_active   : logic<VLEN> = if h_alu_vm ? {1'b1 repeat VLEN} : i_mask_data;
+    let iota_base_mask: logic<VLEN> = if iota_base >= 8'd128 ? {1'b1 repeat VLEN} : (({127'd0, 1'b1} << iota_base[6:0]) - {127'd0, 1'b1});
+    let iota_seed_pred: logic<VLEN> = i_vs2_data & iota_base_mask & vl_mask & iota_active;
+    let iota_seed     : logic<8>    = {1'b0, popcount64(iota_seed_pred[63:0])} + {1'b0, popcount64(iota_seed_pred[127:64])};
+    var viota_res: logic<VLEN>;
+    var iota_run : logic<8>;
+    always_comb {
+        viota_res = i_vdold_data; // inactive / tail = undisturbed
+        // seed = count of active source bits with global index < base (parallel
+        // tree popcount; replaces the old VLEN-deep serial increment loop).
+        iota_run = iota_seed;
+        case vsew {
+            3'd0: { // SEW=8 → 16 elements per register
+                for k in 0..16 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*8+:8] = if h_is_vid ? (iota_base + (k as 8)) : iota_run;
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+            3'd1: { // SEW=16 → 8 elements per register
+                for k in 0..8 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*16+:16] = if h_is_vid ? {8'd0, iota_base + (k as 8)} : {8'd0, iota_run};
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+            3'd2: { // SEW=32 → 4 elements per register
+                for k in 0..4 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*32+:32] = if h_is_vid ? {24'd0, iota_base + (k as 8)} : {24'd0, iota_run};
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+            default: { // SEW=64 → 2 elements per register
+                for k in 0..2 {
+                    if ((iota_base + (k as 8)) <: vl8) && (h_alu_vm || iota_msk[k]) {
+                        viota_res[k*64+:64] = if h_is_vid ? {56'd0, iota_base + (k as 8)} : {56'd0, iota_run};
+                        if !h_is_vid && iota_vs2[k] {
+                            iota_run = iota_run + 8'd1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- V4i permute (slide / vrgather / vcompress): element-serial datapath -
+    // Shared geometry for the dest-walk permute ops. SEW elements, EMUL register
+    // groups: VLMAX = (elements per register) * EMUL. The walk index pelem maps to
+    // a destination register (pm_dreg) and an in-register element (pm_dlocal); the
+    // element value is spliced into the accumulator pm_acc at pm_dbitoff and the
+    // register is written at its boundary (pm_dreg_lst), seeding from the old vd at
+    // the first element so inactive / tail / undisturbed elements stay intact.
+    let pm_epr8   : logic<8>     = 8'd16 >> vsew;            // elements per 128b register
+    let pm_eshift : logic<3>     = 3'd4 - {1'b0, vsew[1:0]}; // log2(elems per register)
+    let pm_eshamt : logic<3>     = 3'd3 + {1'b0, vsew[1:0]}; // log2(SEW in bits)
+    let pm_emul_lg: logic<2>     = if h_vlmul[2] ? 2'd0 : h_vlmul[1:0]; // log2(EMUL), 0 if fractional
+    let pm_vlmax8 : logic<8>     = pm_epr8 << pm_emul_lg;    // VLMAX (<= 128)
+    let pm_sew_msk: logic<64>    = case vsew {
+        3'd0   : 64'h0000_0000_0000_00ff,
+        3'd1   : 64'h0000_0000_0000_ffff,
+        3'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    // Destination element geometry (dest-walk: write vd[pelem]).
+    let pm_dreg    : logic<8>     = pelem >> pm_eshift;
+    let pm_dlocal  : logic<8>     = pelem & (pm_epr8 - 8'd1);
+    let pm_dbitoff : logic<8>     = pm_dlocal << pm_eshamt;
+    let pm_dreg_vrf: logic<VRF_W> = h_vd + pm_dreg[VRF_W - 1:0];
+    let pm_dreg_1st: logic        = pm_dlocal == 8'd0;       // first element of a dest register
+    let pm_dreg_lst: logic        = ((pm_dlocal + 8'd1) >= pm_epr8) || ((pelem + 8'd1) >= vl8);
+    // Mask (v0): vm=1 unmasked, else v0[pelem]. (Shift then bit 0 — no dynamic select.)
+    let pm_mask_sh : logic<VLEN>  = i_mask_data >> pelem;
+    let pm_active  : logic        = h_vm || pm_mask_sh[0];
+
+    // ---- slide (vslide{,1}up / vslide{,1}down) source addressing ------------
+    // off = x[rs1] (.vx) / uimm5 (.vi) / 1 (slide1), capped at VLMAX (off >= VLMAX
+    // makes slideup write nothing, slidedown all 0). slideup picks vs2[pelem-off]
+    // (written only for pelem >= off; the [0,off) prefix is undisturbed); slidedown
+    // picks vs2[pelem+off] (0-fill when pelem+off >= VLMAX). slide1 is slide-by-one
+    // that injects a scalar at the vacated end (up: elem 0; down: elem vl-1) and
+    // writes every active element. The fill is the int scalar (.vx) or FP (.vf).
+    let h_is_slide1: logic = h_is_slide && (h_funct3 == 3'b110 || h_funct3 == 3'b101);
+    let h_slide1_fp: logic = h_is_slide && (h_funct3 == 3'b101); // vfslide1.vf
+    let pm_off_raw : logic<64> = if h_is_slide1 ? 64'd1 : (if h_is_vx ? i_scalar_data : {59'd0, h_instr[19:15]});
+    let pm_off     : logic<8>  = if pm_off_raw >= {56'd0, pm_vlmax8} ? pm_vlmax8 : pm_off_raw[7:0];
+    let pm_up_ok   : logic     = pelem >= pm_off;                 // slideup element written?
+    let pm_dn_sum  : logic<9>  = {1'b0, pelem} + {1'b0, pm_off};
+    let pm_dn_ok   : logic     = pm_dn_sum <: {1'b0, pm_vlmax8};  // slidedown element in range?
+    let pm_sidx    : logic<8>  = if h_slide_dn ? pm_dn_sum[7:0] : (pelem - pm_off);
+    let pm_sreg    : logic<8>  = pm_sidx >> pm_eshift;
+    let pm_slocal  : logic<8>  = pm_sidx & (pm_epr8 - 8'd1);
+    let pm_sbitoff : logic<8>  = pm_slocal << pm_eshamt;
+    let pm_vl_last : logic<8>  = vl8 - 8'd1;
+    let pm_fill_at : logic     = h_is_slide1 && (if h_slide_dn ? (pelem == pm_vl_last) : (pelem == 8'd0));
+    let pm_fill_val: logic<64> = if h_slide1_fp ? i_fscalar_data : i_scalar_data;
+    let pm_slide_raw: logic<VLEN> = i_vs2_data >> (if VINT_PIPE ? pm_src_bitoff_q : pm_sbitoff); // vs2[src] at bit 0 (registered offset under VINT_PIPE)
+    let pm_slide_el : logic<64>   = if pm_fill_at ? pm_fill_val : (if h_slide_dn ? (if pm_dn_ok ? pm_slide_raw[63:0] : 64'd0) : pm_slide_raw[63:0]);
+    let pm_slide_wr : logic       = pm_active && (h_is_slide1 || h_slide_dn || pm_up_ok);
+
+    // ---- vrgather (vd[pelem] = vs2[idx]) source addressing -----------------
+    // idx = vs1[pelem] (.vv, read at the dest element's SEW from the index register
+    // h_vs1+pm_dreg) or x[rs1] / uimm5 (.vx/.vi, broadcast). vrgatherei16 (h_is_rg16)
+    // instead reads a 16-bit index regardless of SEW: 8 indices per register, so the
+    // index register is h_vs1 + pelem/8 and the in-register bit offset is (pelem%8)*16.
+    // An index >= VLMAX gives 0. The index selects the SOURCE register dynamically
+    // (h_vs2 + idx/epr); the chained vs1->idx->vs2 reads are all combinational (the
+    // VRF is async-read). The index is range-checked in 8 bits — VLMAX <= 128 < 256,
+    // so any bit above bit 7 already means out of range. All active elements written.
+    let pm_vrg_idx_vv: logic<VLEN> = i_vs1_data >> pm_dbitoff;   // vs1[pelem] at bit 0 (SEW idx)
+    let pm_ei16_reg  : logic<8>    = pelem >> 3;                 // 8 ei16 indices per register
+    let pm_ei16_off  : logic<8>    = (pelem & 8'd7) << 4;        // (pelem%8)*16 bit offset
+    let pm_ei16_raw  : logic<VLEN> = i_vs1_data >> pm_ei16_off;  // ei16 index at bit 0
+    let pm_vrg_idx   : logic<64>   = if h_is_rg16 ? {48'd0, pm_ei16_raw[15:0]} : (if h_is_vv ? (pm_vrg_idx_vv[63:0] & pm_sew_msk) : (if (h_funct3 == 3'b011) ? {59'd0, h_instr[19:15]} : i_scalar_data));
+    let pm_idx_oob   : logic       = (|pm_vrg_idx[63:8]) || (pm_vrg_idx[7:0] >= pm_vlmax8);
+    let pm_g_sreg    : logic<8>    = pm_vrg_idx[7:0] >> pm_eshift;
+    let pm_g_slocal  : logic<8>    = pm_vrg_idx[7:0] & (pm_epr8 - 8'd1);
+    let pm_g_sbitoff : logic<8>    = pm_g_slocal << pm_eshamt;
+    // CP (VINT_PIPE): the deep vs2 read + element extract use the REGISTERED gather
+    // addressing (latched in the FETCH cycle off the live vs1->idx read), so the
+    // dynamic read starts at a register. Live (VINT_PIPE=0) = single-cycle today.
+    let pm_vrg_raw   : logic<VLEN> = i_vs2_data >> (if VINT_PIPE ? pm_src_bitoff_q : pm_g_sbitoff); // vs2[idx] at bit 0
+    let pm_vrg_el    : logic<64>   = if (if VINT_PIPE ? pm_idx_oob_q : pm_idx_oob) ? 64'd0 : pm_vrg_raw[63:0];
+
+    // ---- per-op source register + element value + write enable --------------
+    // slide / vrgather are dest-walk (write vd[pelem]); vcompress is source-walk
+    // (read vs2[pelem], its source register is the pelem-based pm_dreg).
+    let pm_src_reg: logic<8>   = if h_is_comp ? pm_dreg : (if h_is_vrg ? pm_g_sreg : pm_sreg); // vs2 register to read (live)
+    // CP (VINT_PIPE): the vs2 source register feeding o_vs2_addr (-> the VRF read)
+    // comes from the REGISTERED copy, so the read starts at a register, not at the
+    // deep source-addressing chain. Live (VINT_PIPE=0) = today.
+    let pm_src_reg_e: logic<8> = if VINT_PIPE ? pm_src_reg_q : pm_src_reg;
+    let pm_el_val : logic<64>  = if h_is_vrg ? pm_vrg_el : pm_slide_el; // source element value (low SEW bits)
+    let pm_wr_el  : logic      = if h_is_vrg ? pm_active : pm_slide_wr; // write this destination element?
+    // Splice the element into the dest-register accumulator (seed from old vd at
+    // the first element of each register; undisturbed elements keep the seed).
+    let pm_res_vlen: logic<VLEN> = ({64'd0, pm_el_val & pm_sew_msk} as VLEN) << pm_dbitoff;
+    let pm_dmask_v : logic<VLEN> = ({64'd0, pm_sew_msk} as VLEN) << pm_dbitoff;
+    let pm_acc_base: logic<VLEN> = if pm_dreg_1st ? i_vdold_data : pm_acc;
+    let pm_acc_next: logic<VLEN> = if pm_wr_el ? ((pm_acc_base & ~pm_dmask_v) | pm_res_vlen) : pm_acc_base;
+
+    // ---- vcompress.vm (vs1 = bit-per-element compress mask) -----------------
+    // Source-walk: for each source element pelem with vs1[pelem]=1, write vs2[pelem]
+    // to the running output position pm_j via a read-modify-write of the dest
+    // register h_vd + pm_j/epr. Elements past the packed count stay undisturbed
+    // (the RMW reads back the dest register's previous-cycle value, so only the
+    // packed positions are overwritten). Unmasked — vs1 IS the control (no v0).
+    let pm_cmask_sh  : logic<VLEN>  = i_vs1_data >> pelem;
+    let pm_cm        : logic        = pm_cmask_sh[0];
+    let pm_c_dreg    : logic<8>     = pm_j >> pm_eshift;
+    let pm_c_dlocal  : logic<8>     = pm_j & (pm_epr8 - 8'd1);
+    let pm_c_dbitoff : logic<8>     = pm_c_dlocal << pm_eshamt;
+    let pm_c_dreg_vrf: logic<VRF_W> = h_vd + pm_c_dreg[VRF_W - 1:0];
+    let pm_c_src     : logic<VLEN>  = i_vs2_data >> (if VINT_PIPE ? pm_src_bitoff_q : pm_dbitoff); // vs2[pelem] at bit 0 (registered offset under VINT_PIPE)
+    let pm_c_res     : logic<VLEN>  = (i_vdold_data & ~(({64'd0, pm_sew_msk} as VLEN) << pm_c_dbitoff)) | (({64'd0, pm_c_src[63:0] & pm_sew_msk} as VLEN) << pm_c_dbitoff);
+    // Permute destination register + write data: compress is pm_j-based RMW;
+    // slide / vrgather are the pelem-based accumulator written at register boundaries.
+    let pm_dst_vrf   : logic<VRF_W> = if h_is_comp ? pm_c_dreg_vrf : pm_dreg_vrf;
+    let pm_vd_data   : logic<VLEN>  = if h_is_comp ? pm_c_res : pm_acc_next;
+
+    // ---- V1 unit-stride memory: addressing + element packing ----------------
+    // Operands are stable for the whole op (the head is not popped until DONE):
+    // base = x[rs1] (scalar), mask = v0 (read on the vs1 port with addr 0),
+    // store data = vs3 = vd field (read on the vs2 port).
+    let m_base : logic<64>   = i_scalar_data;
+    let m_mask : logic<VLEN> = i_mask_data;
+    let m_vs3  : logic<VLEN> = i_vs2_data;
+    // Data element width. For indexed gather/scatter the element width is SEW
+    // (vtype) while the instruction width field gives the INDEX width; every
+    // other mode's data EEW is the width field (h_eew_log), so this is identical
+    // to h_eew_log unless indexed (keeps unit-stride/whole-reg/mask byte-exact).
+    let data_eew_log: logic<2> = if h_is_indexed ? vsew[1:0] : h_eew_log;
+    let eew_mask: logic<64> = case data_eew_log {
+        2'd0   : 64'h0000_0000_0000_00ff,
+        2'd1   : 64'h0000_0000_0000_ffff,
+        2'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let eew_strb: logic<8> = case data_eew_log {
+        2'd0   : 8'b0000_0001,
+        2'd1   : 8'b0000_0011,
+        2'd2   : 8'b0000_1111,
+        default: 8'b1111_1111,
+    };
+    // V2d-3 LMUL>1: the unit-stride op spans EMUL = ceil(vl*EEW/VLEN) registers.
+    // velem is the GLOBAL element index; the byte address uses it directly, while
+    // the register index (mem_reg) and in-register offset (mem_local) partition
+    // it by elems-per-register (mem_epr = VLEN/EEW). Loads accumulate a register's
+    // elements into vacc and write h_vd+mem_reg when it completes; stores read
+    // source register h_vd+mem_reg element by element.
+    let mem_epr8   : logic<8>     = 8'd16 >> data_eew_log;        // data elements per 128b register
+    let epr_shift  : logic<3>     = 3'd4 - {1'b0, data_eew_log};  // log2(mem_epr)
+    // Segment: register = field (vd + seg_field), in-register offset = velem
+    // (each field register holds vl elements). Other modes: LMUL>1 register span.
+    let mem_reg    : logic<8>     = if h_is_segment ? {5'd0, seg_field} : (velem >> epr_shift); // data register index
+    let mem_local  : logic<8>     = if h_is_segment ? velem : (velem & (mem_epr8 - 8'd1));      // element within the data register
+    let mem_reg_vrf: logic<VRF_W> = h_vd + mem_reg[VRF_W - 1:0];
+    // Indexed addressing: the per-element byte offset is vs2[velem] read at the
+    // INDEX EEW (instruction width field, h_eew_log). The index vector spans its
+    // own register group (idx_reg / idx_local at the index EEW) and is read on the
+    // free vs1 port. Zero-extended (indices are unsigned byte offsets).
+    let idx_epr8   : logic<8>     = 8'd16 >> h_eew_log;
+    let idx_eprsh  : logic<3>     = 3'd4 - {1'b0, h_eew_log};
+    let idx_reg    : logic<8>     = velem >> idx_eprsh;
+    let idx_local  : logic<8>     = velem & (idx_epr8 - 8'd1);
+    let idx_shamt  : logic<3>     = 3'd3 + {1'b0, h_eew_log};
+    let idx_bitoff : logic<8>     = idx_local << idx_shamt;
+    let idx_reg_vrf: logic<VRF_W> = h_vs2 + idx_reg[VRF_W - 1:0];
+    let idx_eew_msk: logic<64>    = case h_eew_log {
+        2'd0   : 64'h0000_0000_0000_00ff,
+        2'd1   : 64'h0000_0000_0000_ffff,
+        2'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let idx_raw    : logic<VLEN>  = i_vs1_data >> idx_bitoff;
+    let idx_val    : logic<64>    = idx_raw[63:0] & idx_eew_msk;
+    // Effective element count (evl). Unit-stride uses vl; whole-register transfers
+    // NREG full registers (NREG * elems-per-register, independent of vl); mask
+    // transfers ceil(vl/8) bytes (EEW=8 → elems-per-register handled as bytes).
+    let wr_nreg8 : logic<8> = {5'd0, h_nf} + 8'd1;        // NREG = nf+1 ∈ {1,2,4,8}
+    let m_vl8    : logic<8> = if h_is_wholereg ? (wr_nreg8 * mem_epr8) : (if h_is_maskmem ? ((vl_q[7:0] + 8'd7) >> 3) : vl_q[7:0]);
+    // This element completes its register (last in-register element, or last vl).
+    let reg_last : logic = ((mem_local + 8'd1) >= mem_epr8) || ((velem + 8'd1) >= m_vl8);
+    // Element byte address: indexed = base + vs2[velem]; strided = base +
+    // velem*stride (x[rs2], signed byte stride — the low 64 bits of the product
+    // are correct for wrap-around); unit-stride/whole-reg/mask = base + velem*EEW.
+    // Plus dword / in-register bit offsets (data geometry).
+    let velem64     : logic<64> = {56'd0, velem};
+    let stride_off  : logic<64> = i_scalar2_data * velem64; // low 64 bits (wrap-around correct)
+    // Segment linear element index: velem*NF + seg_field (field-outer walk).
+    let seg_lin     : logic<64> = (velem64 * {56'd0, seg_nf1}) + {61'd0, seg_field};
+    let m_vaddr     : logic<64> = if h_is_indexed ? (m_base + idx_val) : (if h_is_strided ? (m_base + stride_off) : (if h_is_segment ? (m_base + (seg_lin << data_eew_log)) : (m_base + ({56'd0, velem} << data_eew_log))));
+    let m_byteoff   : logic<3>  = m_vaddr[2:0];
+    let m_byteshift : logic<6>  = {m_byteoff, 3'b000};         // *8 → bit offset in dword
+    let elem_shamt  : logic<3>  = 3'd3 + {1'b0, data_eew_log}; // log2(data EEW in bits)
+    let elem_bitoff : logic<8>  = mem_local << elem_shamt;     // in-register element bit offset
+    // Mask: vm=1 unmasked; else v0[velem]. (Shift then bit0 — no dynamic select.)
+    // Whole-register and mask transfers are always unmasked (every element active).
+    let m_mask_sh: logic<VLEN> = m_mask >> velem;
+    let m_active : logic       = h_vm || m_mask_sh[0] || h_is_wholereg || h_is_maskmem;
+    // Load: extract the element from the dcache dword; ld_write is the current
+    // register's accumulator including this element (masked-off → contributes 0).
+    let ld_raw    : logic<64>   = i_mem_rdata >> m_byteshift;
+    let ld_el     : logic<64>   = ld_raw & eew_mask;
+    let ld_shifted: logic<VLEN> = ({64'd0, ld_el} as VLEN) << elem_bitoff;
+    let ld_contrib: logic<VLEN> = if m_active ? ld_shifted : {1'b0 repeat VLEN};
+    let ld_write  : logic<VLEN> = vacc | ld_contrib;
+    // Store: extract the element from the current source register (vs3 = h_vd+mem_reg).
+    let m_vs3_sh: logic<VLEN> = m_vs3 >> elem_bitoff;
+    let st_el   : logic<64>   = m_vs3_sh[63:0] & eew_mask;
+    let st_wd   : logic<64>   = st_el << m_byteshift;
+    let st_sb   : logic<8>    = eew_strb << m_byteoff;
+
+    // ---- V3a vector FP arithmetic (OPFVV .vv): element-serial datapath ------
+    // The op streams one element per cycle through the shared fpu_wrap below.
+    // SEW = 32 (single, NaN-boxed into the FPU's 64-bit operand) / 64 (double).
+    // vsew is log2(SEW in bytes), so the element geometry reuses the unit-stride
+    // memory formulas (elements-per-register, in-register bit offset) with vsew
+    // in place of EEW. Element values are extracted with a dynamic shift (no
+    // dynamic part-select). For .vv the second operand is vs1[i].
+    let fp_double  : logic        = vsew == 3'd3;             // SEW=64 → double
+    let fp_epr8    : logic<8>     = 8'd16 >> vsew;            // elements per register
+    let fp_eshift  : logic<3>     = 3'd4 - {1'b0, vsew[1:0]}; // log2(fp_epr)
+    let fp_eshamt  : logic<3>     = 3'd3 + {1'b0, vsew[1:0]}; // log2(SEW in bits)
+    let fp_reg     : logic<8>     = fp_elem >> fp_eshift;     // register index (0..EMUL-1)
+    let fp_local   : logic<8>     = fp_elem & (fp_epr8 - 8'd1);
+    let fp_reg_vrf : logic<VRF_W> = h_vd  + fp_reg[VRF_W - 1:0];
+    let fp_vs2_vrf : logic<VRF_W> = h_vs2 + fp_reg[VRF_W - 1:0];
+    let fp_vs1_vrf : logic<VRF_W> = h_vs1 + fp_reg[VRF_W - 1:0];
+    let fp_bitoff  : logic<8>     = fp_local << fp_eshamt;    // element bit offset in register
+    let fp_reg_last: logic        = ((fp_local + 8'd1) >= fp_epr8) || ((fp_elem + 8'd1) >= vl8);
+    // Mask: vm=1 unmasked; else v0[fp_elem]. (Shift then bit 0 — no dynamic select.)
+    let fp_mask_sh : logic<VLEN>  = i_mask_data >> fp_elem;
+    let fp_active  : logic        = h_vm || fp_mask_sh[0];
+    // Element operands. For SEW=32 each is NaN-boxed into the FPU's 64-bit input.
+    // vs2[i] is always a vector source; the second operand is vs1[i] (.vv) or the
+    // FP scalar f[rs1] (.vf). vfrsub.vf swaps the operands (f[rs1] - vs2).
+    let fp_a_sh   : logic<VLEN> = i_vs2_data >> fp_bitoff;
+    let fp_b_sh   : logic<VLEN> = i_vs1_data >> fp_bitoff;
+    let fp_velem_a: logic<64>   = if fp_double ? fp_a_sh[63:0] : {32'hffffffff, fp_a_sh[31:0]};
+    let fp_velem_b: logic<64>   = if fp_double ? fp_b_sh[63:0] : {32'hffffffff, fp_b_sh[31:0]};
+    let fp_scalar : logic<64>   = if fp_double ? i_fscalar_data : {32'hffffffff, i_fscalar_data[31:0]};
+    let fp_s2_op  : logic<64>   = if h_is_vf ? fp_scalar : fp_velem_b;
+    // V4a reduction operands: fold red_acc with vs2[elem]. The accumulator is
+    // seeded from vs1[0] (element 0 of the vs1 register, NaN-boxed for SEW=32),
+    // used as the FPU s1 on the first element and red_acc thereafter; s2 is the
+    // current vs2 element. (At element 0 fp_reg=0, so i_vs1_data is the vs1 reg.)
+    let red_seed  : logic<64>   = if fp_double ? i_vs1_data[63:0] : {32'hffffffff, i_vs1_data[31:0]};
+    let fp_red_s1 : logic<64>   = if fp_elem == 8'd0 ? red_seed : red_acc;
+    // V4b integer reduction fold: combinational, no FPU. The accumulator (low SEW
+    // bits) is seeded from vs1[0] on element 0, then folded with the raw vs2
+    // element via vredop, per SEW. Inactive elements keep the accumulator.
+    let red_iacc  : logic<64>   = if fp_elem == 8'd0 ? i_vs1_data[63:0] : red_acc;
+    let red_ielem : logic<64>   = fp_a_sh[63:0];
+    let red_ifold : logic<64>   = case vsew {
+        3'd0   : {56'd0, vredop::<8>(red_iacc[7:0], red_ielem[7:0], h_funct6)},
+        3'd1   : {48'd0, vredop::<16>(red_iacc[15:0], red_ielem[15:0], h_funct6)},
+        3'd2   : {32'd0, vredop::<32>(red_iacc[31:0], red_ielem[31:0], h_funct6)},
+        default: vredop::<64>(red_iacc[63:0], red_ielem[63:0], h_funct6),
+    };
+    // V4g-1 widening reduction: extend the SEW vs2 element to 64 bits (sign for
+    // vwredsum = funct6[0], zero for vwredsumu) and add to the accumulator. The
+    // running sum stays in the low 2*SEW bits (high bits are masked off on write).
+    let red_welem : logic<64>   = if h_funct6[0] ? (case vsew {
+        3'd0   : {red_ielem[7] repeat 56, red_ielem[7:0]},
+        3'd1   : {red_ielem[15] repeat 48, red_ielem[15:0]},
+        3'd2   : {red_ielem[31] repeat 32, red_ielem[31:0]},
+        default: red_ielem[63:0],
+    }) : (case vsew {
+        3'd0   : {56'd0, red_ielem[7:0]},
+        3'd1   : {48'd0, red_ielem[15:0]},
+        3'd2   : {32'd0, red_ielem[31:0]},
+        default: red_ielem[63:0],
+    });
+    let red_wfold : logic<64>   = red_iacc + red_welem;
+    let red_fold_sel : logic<64> = if h_is_iwred ? red_wfold : red_ifold;
+    let red_int_final: logic<64> = if fp_active ? red_fold_sel : red_iacc;
+    // V3h FMA operands: multiplicand a = vs1 (.vv) / f[rs1] (.vf); macc multiplies
+    // by vs2 and accumulates the old vd, madd multiplies by vd and accumulates vs2.
+    let fp_vd_sh  : logic<VLEN> = i_vdold_data >> fp_bitoff;
+    let fp_vd_elem: logic<64>   = if fp_double ? fp_vd_sh[63:0] : {32'hffffffff, fp_vd_sh[31:0]};
+    let fma_mul_a : logic<64>   = if h_is_vf ? fp_scalar : fp_velem_b;
+    let fma_mul_b : logic<64>   = if h_funct6[2] ? fp_velem_a : fp_vd_elem; // macc: vs2 / madd: vd
+    let fma_add   : logic<64>   = if h_funct6[2] ? fp_vd_elem : fp_velem_a; // macc: vd / madd: vs2
+    // V3i widening: convert the single source operands to double (exact) and run
+    // the double FPU op. vfwadd/vfwsub = vs2 +/- vs1, vfwmul = vs2*vs1 (s1=vs2).
+    // V3j .w forms: vs2 is ALREADY double, read at the dest (2*SEW) geometry
+    // (bit offset 0/64 within the double-element register); only vs1 / f[rs1] is
+    // widened from single. fw_s1d picks the raw double vs2 instead of s2d(single).
+    let fw_vs2_s  : logic<32>   = fp_a_sh[31:0];
+    let fw_vs1_s  : logic<32>   = if h_is_vf ? i_fscalar_data[31:0] : fp_b_sh[31:0];
+    // .w vs2 / widening-FMA accumuland (old vd) are both already double, read at
+    // dest geometry (bit offset 0/64 in the double-element register).
+    let fw_dbitoff: logic<8>    = if fp_elem[0] ? 8'd64 : 8'd0;
+    let fw_vs2_dsh: logic<VLEN> = i_vs2_data >> fw_dbitoff;
+    let fw_vs2_d  : logic<64>   = fw_vs2_dsh[63:0];
+    let fw_vd_dsh : logic<VLEN> = i_vdold_data >> fw_dbitoff;
+    let fw_vd_d   : logic<64>   = fw_vd_dsh[63:0]; // V3j widening-FMA addend (old vd, double)
+    let fw_s1d    : logic<64>   = if h_is_fwiden_w ? fw_vs2_d : s2d(fw_vs2_s);
+    let fw_s2d    : logic<64>   = s2d(fw_vs1_s);
+    // V4h vfncvt: the 2*SEW source element (double / int64) is read at the wide
+    // geometry — source register h_vs2 + (fp_elem>>1), bit offset (fp_elem&1)*64.
+    let fn_sbitoff: logic<8>    = if fp_elem[0] ? 8'd64 : 8'd0;
+    let fn_src_sh : logic<VLEN> = i_vs2_data >> fn_sbitoff;
+    let fncvt_src : logic<64>   = fn_src_sh[63:0];
+    // V4g-2 FP widening reduction: s1 is the double accumulator (seeded from the
+    // 2*SEW vs1[0]), s2 is the s2d-widened single vs2 element. FpuOp = FADD_D.
+    let fp_wred_s1: logic<64>   = if fp_elem == 8'd0 ? i_vs1_data[63:0] : red_acc;
+    let red_w_s2d : logic<64>   = s2d(fw_vs2_s);
+    let fp_s1     : logic<64>   = if h_is_fncvt ? fncvt_src : (if h_is_fwred ? fp_wred_s1 : (if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a)))));
+    let fp_s2     : logic<64>   = if h_is_fwred ? red_w_s2d : (if h_is_fred ? fp_velem_a : (if h_is_fwiden ? fw_s2d : (if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op))));
+    let fp_s3     : logic<64>   = if h_is_fwfma ? fw_vd_d : (if h_is_fma ? fma_add : 64'd0);
+    // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
+    // and vfsgnj take magnitude/sign from vs2/vs1, matching s1=vs2, s2=vs1.
+    var fp_fpu_op: fpu_pkg::FpuOp;
+    always_comb {
+        if h_is_fwcvt {
+            // V3j widening conversion vfwcvt.* (SEW=32 source -> 64-bit dest). vs1[2:0]
+            // = h_instr[17:15]: 100 f.f (single->double) / 011 f.x (int32->double) /
+            // 010 f.xu (uint32->double) / 001 x.f (single->int64) / 000 xu.f
+            // (single->uint64) / 111 rtz.x.f / 110 rtz.xu.f. (FP->int truncates per the
+            // shared fpu_wrap RTZ limitation; rtz.* are exact.)
+            case h_instr[17:15] {
+                3'b100  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_S;  // f.f
+                3'b011  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_W;  // f.x
+                3'b010  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_WU; // f.xu
+                3'b001  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_L_S;  // x.f
+                3'b000  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_LU_S; // xu.f
+                3'b111  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_L_S;  // rtz.x.f
+                3'b110  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_LU_S; // rtz.xu.f
+                default : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_S;
+            }
+        } else if h_is_fwiden {
+            // Widening always computes in double (operands are s2d-converted; for
+            // the .w forms vs2 is taken as a raw double, vs1/scalar via s2d). The
+            // 1111xx FMAs multiply the two s2d operands and accumulate the old vd.
+            case h_funct6 {
+                6'b110010, 6'b110110: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D; // vfwsub / vfwsub.w
+                6'b111000           : fp_fpu_op = fpu_pkg::FpuOp::FMUL_D; // vfwmul
+                6'b111100           : fp_fpu_op = fpu_pkg::FpuOp::FMADD_D;  // vfwmacc
+                6'b111101           : fp_fpu_op = fpu_pkg::FpuOp::FNMADD_D; // vfwnmacc
+                6'b111110           : fp_fpu_op = fpu_pkg::FpuOp::FMSUB_D;  // vfwmsac
+                6'b111111           : fp_fpu_op = fpu_pkg::FpuOp::FNMSUB_D; // vfwnmsac
+                default             : fp_fpu_op = fpu_pkg::FpuOp::FADD_D; // vfwadd / vfwadd.w (110000/110100)
+            }
+        } else if h_is_fncvt {
+            // V4h narrowing conversion vfncvt.* (2*SEW source -> SEW dest). vs1[2:0]
+            // = h_instr[17:15]: 000 xu.f (double->uint32) / 001 x.f (double->int32) /
+            // 010 f.xu (uint64->single) / 011 f.x (int64->single) / 100 f.f
+            // (double->single) / 101 rod.f.f (round-odd, approximated) / 110 rtz.xu.f
+            // / 111 rtz.x.f. (FP->int truncates per the shared fpu_wrap RTZ limit.)
+            case h_instr[17:15] {
+                3'b000  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_WU_D; // xu.f
+                3'b001  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_W_D;  // x.f
+                3'b010  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_LU; // f.xu
+                3'b011  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_L;  // f.x
+                3'b110  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_WU_D; // rtz.xu.f
+                3'b111  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_W_D;  // rtz.x.f
+                default : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_D;  // f.f / rod.f.f
+            }
+        } else if h_is_fwred {
+            // V4g-2 FP widening reduction: always a double add of the widened
+            // element into the double accumulator (usum and osum both fold here).
+            fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
+        } else if fp_double {
+            case h_funct6 {
+                6'b000000: fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
+                6'b000010: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D;
+                6'b000100: fp_fpu_op = fpu_pkg::FpuOp::FMIN_D;
+                6'b000110: fp_fpu_op = fpu_pkg::FpuOp::FMAX_D;
+                // V4a reductions (.vs): vfredusum 000001 / vfredosum 000011 fold
+                // with FADD; vfredmin 000101 / vfredmax 000111 with FMIN / FMAX.
+                6'b000001, 6'b000011: fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
+                6'b000101            : fp_fpu_op = fpu_pkg::FpuOp::FMIN_D;
+                6'b000111            : fp_fpu_op = fpu_pkg::FpuOp::FMAX_D;
+                6'b001000: fp_fpu_op = fpu_pkg::FpuOp::FSGNJ_D;
+                6'b001001: fp_fpu_op = fpu_pkg::FpuOp::FSGNJN_D;
+                6'b001010: fp_fpu_op = fpu_pkg::FpuOp::FSGNJX_D;
+                6'b100100: fp_fpu_op = fpu_pkg::FpuOp::FMUL_D;
+                6'b100111: fp_fpu_op = fpu_pkg::FpuOp::FSUB_D; // vfrsub.vf (operands swapped)
+                6'b100000: fp_fpu_op = fpu_pkg::FpuOp::FDIV_D; // vfdiv
+                6'b100001: fp_fpu_op = fpu_pkg::FpuOp::FDIV_D; // vfrdiv.vf (operands swapped)
+                // vfsqrt.v (vs1=0) / vfclass.v (vs1=10000) share funct6 010011.
+                6'b010011: fp_fpu_op = if h_instr[19:15] == 5'b10000 ? fpu_pkg::FpuOp::FCLASS_D : fpu_pkg::FpuOp::FSQRT_D;
+                // vfcvt.*: int->FP when vs1[2:1]==01 (f.xu/f.x); else FP->int
+                // (xu.f/x.f, incl. the rtz forms 00110/00111). Signed = vs1[0].
+                6'b010010: fp_fpu_op = if h_instr[17:16] == 2'b01 ? (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_D_L : fpu_pkg::FpuOp::FCVT_D_LU) : (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_L_D : fpu_pkg::FpuOp::FCVT_LU_D);
+                6'b011000: fp_fpu_op = fpu_pkg::FpuOp::FEQ_D; // vmfeq
+                6'b011100: fp_fpu_op = fpu_pkg::FpuOp::FEQ_D; // vmfne (result inverted)
+                6'b011001: fp_fpu_op = fpu_pkg::FpuOp::FLE_D; // vmfle
+                6'b011011: fp_fpu_op = fpu_pkg::FpuOp::FLT_D; // vmflt
+                6'b011101: fp_fpu_op = fpu_pkg::FpuOp::FLT_D; // vmfgt.vf (operands swapped)
+                6'b011111: fp_fpu_op = fpu_pkg::FpuOp::FLE_D; // vmfge.vf (operands swapped)
+                // FMA (101xxx): funct6[1:0] -> FMADD / FNMADD / FMSUB / FNMSUB.
+                6'b101000, 6'b101100: fp_fpu_op = fpu_pkg::FpuOp::FMADD_D;
+                6'b101001, 6'b101101: fp_fpu_op = fpu_pkg::FpuOp::FNMADD_D;
+                6'b101010, 6'b101110: fp_fpu_op = fpu_pkg::FpuOp::FMSUB_D;
+                6'b101011, 6'b101111: fp_fpu_op = fpu_pkg::FpuOp::FNMSUB_D;
+                default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_D;
+            }
+        } else {
+            case h_funct6 {
+                6'b000000: fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
+                6'b000010: fp_fpu_op = fpu_pkg::FpuOp::FSUB_S;
+                6'b000100: fp_fpu_op = fpu_pkg::FpuOp::FMIN_S;
+                6'b000110: fp_fpu_op = fpu_pkg::FpuOp::FMAX_S;
+                // V4a reductions (.vs): vfredusum 000001 / vfredosum 000011 fold
+                // with FADD; vfredmin 000101 / vfredmax 000111 with FMIN / FMAX.
+                6'b000001, 6'b000011: fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
+                6'b000101            : fp_fpu_op = fpu_pkg::FpuOp::FMIN_S;
+                6'b000111            : fp_fpu_op = fpu_pkg::FpuOp::FMAX_S;
+                6'b001000: fp_fpu_op = fpu_pkg::FpuOp::FSGNJ_S;
+                6'b001001: fp_fpu_op = fpu_pkg::FpuOp::FSGNJN_S;
+                6'b001010: fp_fpu_op = fpu_pkg::FpuOp::FSGNJX_S;
+                6'b100100: fp_fpu_op = fpu_pkg::FpuOp::FMUL_S;
+                6'b100111: fp_fpu_op = fpu_pkg::FpuOp::FSUB_S; // vfrsub.vf (operands swapped)
+                6'b100000: fp_fpu_op = fpu_pkg::FpuOp::FDIV_S; // vfdiv
+                6'b100001: fp_fpu_op = fpu_pkg::FpuOp::FDIV_S; // vfrdiv.vf (operands swapped)
+                // vfsqrt.v (vs1=0) / vfclass.v (vs1=10000) share funct6 010011.
+                6'b010011: fp_fpu_op = if h_instr[19:15] == 5'b10000 ? fpu_pkg::FpuOp::FCLASS_S : fpu_pkg::FpuOp::FSQRT_S;
+                // vfcvt.*: int->FP when vs1[2:1]==01 (f.xu/f.x); else FP->int
+                // (xu.f/x.f, incl. the rtz forms 00110/00111). Signed = vs1[0].
+                6'b010010: fp_fpu_op = if h_instr[17:16] == 2'b01 ? (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_S_W : fpu_pkg::FpuOp::FCVT_S_WU) : (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_W_S : fpu_pkg::FpuOp::FCVT_WU_S);
+                6'b011000: fp_fpu_op = fpu_pkg::FpuOp::FEQ_S; // vmfeq
+                6'b011100: fp_fpu_op = fpu_pkg::FpuOp::FEQ_S; // vmfne (result inverted)
+                6'b011001: fp_fpu_op = fpu_pkg::FpuOp::FLE_S; // vmfle
+                6'b011011: fp_fpu_op = fpu_pkg::FpuOp::FLT_S; // vmflt
+                6'b011101: fp_fpu_op = fpu_pkg::FpuOp::FLT_S; // vmfgt.vf (operands swapped)
+                6'b011111: fp_fpu_op = fpu_pkg::FpuOp::FLE_S; // vmfge.vf (operands swapped)
+                // FMA (101xxx): funct6[1:0] -> FMADD / FNMADD / FMSUB / FNMSUB.
+                6'b101000, 6'b101100: fp_fpu_op = fpu_pkg::FpuOp::FMADD_S;
+                6'b101001, 6'b101101: fp_fpu_op = fpu_pkg::FpuOp::FNMADD_S;
+                6'b101010, 6'b101110: fp_fpu_op = fpu_pkg::FpuOp::FMSUB_S;
+                6'b101011, 6'b101111: fp_fpu_op = fpu_pkg::FpuOp::FNMSUB_S;
+                default  : fp_fpu_op = fpu_pkg::FpuOp::FADD_S;
+            }
+        }
+    }
+    // Shared FP compute unit: one element per cycle. The result + fflags are
+    // combinational this cycle for the single-cycle V3a ops (div/sqrt, which
+    // would gate on o_fpu_busy, arrive in a later sub-phase). Vector FP always
+    // rounds with fcsr.frm → pass DYN so fpu_wrap resolves it from i_frm.
+    // Merge is a pure data select, so it must not issue the shared FPU (no
+    // spurious fflags / busy). Arithmetic and compare issue it for active elements.
+    // CP (VFP_PIPE): the resolved u_vfpu int operand (registered in the FETCH
+    // phase alongside fp_s1/2/3). Live when VFP_PIPE=0.
+    let fp_int_rs1: logic<64> = if h_is_fncvt ? fncvt_src : fp_a_sh[63:0];
+    // u_vfpu operands: registered (FETCH-phase copy) when VFP_PIPE, else live.
+    let fpu_s1     : logic<64> = if VFP_PIPE ? fp_s1_q : fp_s1;
+    let fpu_s2     : logic<64> = if VFP_PIPE ? fp_s2_q : fp_s2;
+    let fpu_s3     : logic<64> = if VFP_PIPE ? fp_s3_q : fp_s3;
+    let fpu_int_rs1: logic<64> = if VFP_PIPE ? fp_int_rs1_q : fp_int_rs1;
+    // CP (VFP_PIPE): only issue to u_vfpu AFTER the FETCH phase has registered the
+    // operands (fp_fetched_q). VFP_PIPE=0 -> the gate is always true (today).
+    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest && !h_is_anyired && (!VFP_PIPE || fp_fetched_q);
+    // VFP_EX_PIPE registers u_vfpu's fround add and FMA mantissa product. The extra
+    // cycles surface as vfpu_busy, which the COMPUTE FSM already waits on before capture.
+    const VFP_EX_PIPE: bit = 1;
+    inst u_vfpu: fpu_wrap #(
+        PRF_W    : PRF_W    ,
+        ROB_IDX_W: ROB_IDX_W,
+        PIPE       : 1          , // 2-stage FP arith; VU streams via fp_ph (present/capture)
+        FROUND_PIPE: VFP_EX_PIPE, // register the double fround-add off the vector FP CP (held via o_fpu_busy)
+        FMA_PIPE3  : VFP_EX_PIPE, // register the FMA 53x53 mantissa-mul (held via o_fpu_busy)
+    ) (
+        clk                                  ,
+        rst                                  ,
+        i_issue_valid     : fp_issue_v       ,
+        i_fpu_op          : fp_fpu_op        ,
+        // Vector FP rounds with fcsr.frm (DYN), except vfcvt.rtz.* (vs1[2]=1)
+        // which forces round-toward-zero.
+        i_fp_rm           : if h_is_fcvt && h_instr[17] ? 3'b001 : 3'b111,
+        i_fli_idx         : 5'd0             ,
+        i_frm             : i_frm            ,
+        i_issue_rd_pdst   : '0               ,
+        // V3c: fpu_wrap's multi-cycle FDIV.D/FSQRT.D completion latch is owned by
+        // i_issue_rob_idx; the VU drives one element at a time with i_issue_valid
+        // held high, so a CONSTANT id would leave the previous element's done flag
+        // "for me" and the divider would never re-trigger. Feeding the element
+        // index (consecutive elements always differ mod 32) makes each element a
+        // fresh owner → the divider restarts per element. Harmless for the
+        // single-cycle ops (they don't use the owner latch).
+        i_issue_rob_idx   : fp_elem[ROB_IDX_W - 1:0],
+        i_issue_has_rd    : 1'b0             ,
+        i_issue_writes_int: 1'b0             ,
+        i_s1_data         : fpu_s1           ,
+        i_s2_data         : fpu_s2           ,
+        i_s3_data         : fpu_s3           , // V3h FMA addend (old vd / vs2)
+        // V3g int->FP vfcvt reads the vreg element as the FPU's INT operand
+        // (the SEW-wide integer at the current element). V4h vfncvt int->FP reads
+        // the 2*SEW (int64) element at the wide source geometry. FP-input ops
+        // ignore this.
+        i_int_rs1_data    : fpu_int_rs1      ,
+        i_flush           : i_flush          ,
+        o_fpu_busy        : vfpu_busy        ,
+        o_cdb             : vfpu_cdb         ,
+        o_fflags          : vfpu_fflags      ,
+        o_fflags_wen      : _                ,
+        // PIPE=0 here (combinational, same-cycle result); the VU routes its own
+        // dest via vu_cdb_fp_dest, so this pipelined dest-is-fp is unused.
+        o_dest_is_fp      : _                ,
+    );
+    // V3j-4 vfrsqrt7/vfrec7: the element estimate + its fflags come from the table
+    // ROMs (no FPU). vfrec7 rounds overflow per fcsr.frm (i_frm). Single results
+    // occupy the low 32 bits; double the full 64. {fflags[4:0], result} is packed.
+    let est_s_in : logic<32> = fp_a_sh[31:0];
+    let est_d_in : logic<64> = fp_a_sh[63:0];
+    let rsq_s    : logic<37> = rsqrt7_s(est_s_in);
+    let rsq_d    : logic<69> = rsqrt7_d(est_d_in);
+    let rec_s    : logic<37> = recip7_s(est_s_in, i_frm);
+    let rec_d    : logic<69> = recip7_d(est_d_in, i_frm);
+    let est_res_s: logic<32> = if h_is_vfrec7 ? rec_s[31:0] : rsq_s[31:0];
+    let est_ffl_s: logic<5>  = if h_is_vfrec7 ? rec_s[36:32] : rsq_s[36:32];
+    let est_res_d: logic<64> = if h_is_vfrec7 ? rec_d[63:0] : rsq_d[63:0];
+    let est_ffl_d: logic<5>  = if h_is_vfrec7 ? rec_d[68:64] : rsq_d[68:64];
+    let vfest_res: logic<64> = if fp_double ? est_res_d : {32'd0, est_res_s};
+    let vfest_ffl: logic<5>  = if fp_double ? est_ffl_d : est_ffl_s;
+    // Per-element write value (SEW-wide). Arithmetic/div/sqrt use the FPU result;
+    // a merge selects f[rs1] (active) or vs2[i] (inactive) — no FPU; an estimate
+    // (vfrsqrt7/vfrec7) uses the ROM result. A merge writes EVERY body element
+    // (fp_wr_elem=1), while arithmetic / estimates leave inactive / tail elements
+    // undisturbed (fp_wr_elem = active). The value is spliced in at fp_bitoff.
+    let fp_wval    : logic<64>   = if h_is_fmerge ? (if fp_active ? fp_scalar : fp_velem_a) : (if h_is_vfest ? vfest_res : vfpu_cdb.data);
+    let fp_wr_elem : logic       = h_is_fmerge || fp_active;
+    // Destination element geometry. Widening (arith/FMA/cvt) writes 2*SEW elements,
+    // two per register (one source register -> two dest registers); everything else
+    // writes SEW elements at the source geometry (fp_reg / fp_bitoff). For a
+    // wide-dest op the result is the full 64-bit value from the FPU.
+    let h_is_wdst  : logic        = h_is_fwiden || h_is_fwcvt; // 2*SEW dest geometry
+    let fp_res_vlen: logic<VLEN>  = if (fp_double || h_is_wdst) ? {64'd0, fp_wval} : {96'd0, fp_wval[31:0]};
+    let fp_dmask   : logic<VLEN>  = if (fp_double || h_is_wdst) ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
+    let fp_dbitoff : logic<8>     = if h_is_wdst ? (if fp_elem[0] ? 8'd64 : 8'd0) : fp_bitoff;
+    let fp_dlocal0 : logic        = if h_is_wdst ? !fp_elem[0] : (fp_local == 8'd0);
+    let fp_dreg    : logic<8>     = if h_is_wdst ? (fp_elem >> 1) : fp_reg;
+    let fp_dreg_last: logic       = if h_is_wdst ? (fp_elem[0] || ((fp_elem + 8'd1) >= vl8)) : fp_reg_last;
+    let fp_dreg_vrf: logic<VRF_W> = h_vd + fp_dreg[VRF_W - 1:0];
+    let fp_dreg_vs2: logic<VRF_W> = h_vs2 + fp_dreg[VRF_W - 1:0]; // .w: vs2 at dest (double) geometry
+    let fp_acc_base: logic<VLEN>  = if fp_dlocal0 ? i_vdold_data : fp_acc;
+    let fp_acc_next: logic<VLEN>  = if fp_wr_elem ? ((fp_acc_base & ~(fp_dmask << fp_dbitoff)) | (fp_res_vlen << fp_dbitoff)) : fp_acc_base;
+    // FP compare (funct6 011xxx): the FPU returns the boolean in bit 0 (FEQ/FLT/
+    // FLE); vmfne (011100) inverts it. The result packs 1 bit per element at bit
+    // position fp_elem (global) into a SINGLE mask register (vd) — inactive / tail
+    // bits stay undisturbed from the old mask. The mask accumulator reuses fp_acc,
+    // seeded from the old mask on element 0, and is written once at the last
+    // element (no per-register write, unlike the SEW-wide arithmetic accumulator).
+    let fp_cmp_raw  : logic       = vfpu_cdb.data[0];
+    let fp_cmp_res  : logic       = if h_funct6 == 6'b011100 ? !fp_cmp_raw : fp_cmp_raw; // vmfne inverts
+    let fp_mask_base: logic<VLEN> = if fp_elem == 8'd0 ? i_vdold_data : fp_acc;
+    let fp_mask_bit : logic<VLEN> = {127'd0, fp_cmp_res} << fp_elem;
+    let fp_mask_clr : logic<VLEN> = {127'd0, 1'b1} << fp_elem;
+    let fp_mask_next: logic<VLEN> = if fp_active ? ((fp_mask_base & ~fp_mask_clr) | fp_mask_bit) : fp_mask_base;
+    let fp_last_elem: logic       = (fp_elem + 8'd1) >= vl8;
+    // V4a/V4b reduction: the running fold this cycle. FP folds the (NaN-boxed)
+    // FPU result; integer folds combinationally via red_int_final. Inactive ->
+    // keep the accumulator (seeded from vs1[0] on element 0). At the last element
+    // this is the vd[0] result; only element 0 of vd is written (SEW-wide splice),
+    // the rest staying tail-undisturbed.
+    // FP widening reduction produces a double result (no NaN-box); its seed is
+    // the 2*SEW vs1[0] (not the SEW-NaN-boxed red_seed).
+    let red_fold   : logic<64>    = if (fp_double || h_is_fwred) ? vfpu_cdb.data : {32'hffffffff, vfpu_cdb.data[31:0]};
+    let red_seed_e : logic<64>    = if h_is_fwred ? i_vs1_data[63:0] : red_seed;
+    let red_final  : logic<64>    = if h_is_anyired ? red_int_final : (if fp_active ? red_fold : (if fp_elem == 8'd0 ? red_seed_e : red_acc));
+    let red_sew_mask: logic<64>   = case vsew {
+        3'd0   : 64'h0000_0000_0000_00ff,
+        3'd1   : 64'h0000_0000_0000_ffff,
+        3'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    // Widening reduction writes vd[0] at 2*SEW; the same-width reductions at SEW.
+    let red_wsew_mask: logic<64>  = case vsew {
+        3'd0   : 64'h0000_0000_0000_ffff,
+        3'd1   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let red_res_mask: logic<64>   = if (h_is_iwred || h_is_fwred) ? red_wsew_mask : red_sew_mask;
+    let fp_red_vd  : logic<VLEN>  = {i_vdold_data[127:64], (i_vdold_data[63:0] & ~red_res_mask) | (red_final & red_res_mask)};
+    // VRF writes during COMPUTE: arithmetic writes a completed register at its
+    // boundary; a compare / reduction writes its single dest element at the last.
+    // fp-pipeline: writes fire on the CAPTURE phase (fp_ph=1), when the streamed
+    // element's result is valid — not when its operands are presented (fp_ph=0).
+    let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && !h_is_fcmp && !h_is_red && fp_dreg_last;
+    let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && h_is_fcmp && fp_last_elem;
+    let fp_red_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && h_is_red && fp_last_elem;
+    let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
+
+    // ---- Execute the head (combinational) -----------------------------------
+    let scalar_ok: logic = !h_uses_s || h_s_rdy;
+    let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
+    // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
+    let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre;
+    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
+    // V4i permute (slide / vrgather / vcompress): element-serial via the pm_state
+    // FSM below, retiring from DONE (pm_cdb_fire). Handles all LMUL. The VRF write
+    // is the dest-register boundary (slide / vrgather) or every compressed element
+    // (vcompress RMW at the running output position).
+    let h_is_perm  : logic = h_is_slide || h_is_vrg || h_is_comp;
+    // CP (VINT_PIPE): every permute element spends a FETCH cycle. vrgather's source
+    // read is the data-dependent vs1->idx->vs2 chain and slide's is the scalar->sidx
+    // chain — both feed o_vs2_addr deeply; registering the source register/offset for
+    // the whole family cuts the worst VU-compute path (source addr -> VRF read -> ALU
+    // false combine). vcompress's source is pelem-based (shallow) but takes the same
+    // FETCH for a uniform element loop.
+    let pm_need_fetch: logic = VINT_PIPE && h_is_perm;
+    // The dest-register VRF write only fires in the present cycle (not the FETCH
+    // cycle, where pm_fetched_q is still 0 and the registered index is stale).
+    let pm_reg_wr  : logic = (pm_state == 2'd1) && (!pm_need_fetch || pm_fetched_q) && (if h_is_comp ? pm_cm : pm_dreg_lst);
+    let pm_cdb_fire: logic = h_is_perm && (pm_state == 2'd2) && i_cdb_free && !i_flush;
+    // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
+    // cycle. Intermediate groups write the VRF with no CDB; the last group
+    // (va_last) rides the vu_cdb (result_written) and needs i_cdb_free.
+    // Integer DIV/REM (element-serial via the shared int_divider). dv_op is the
+    // running divide; dv_nlanes = VLEN/SEW lanes in a group; dv_group_done is high
+    // once all lanes of the current group have been driven through the FU. va_run
+    // (below) holds while a divide group is still iterating.
+    let dv_op        : logic    = h_is_valu && h_is_vdiv;
+    let dv_nlanes    : logic<5> = 5'd16 >> vsew;
+    let dv_group_done: logic    = dv_lane >= dv_nlanes;
+    // Per-lane operand at dv_lane (SEW-wide, extracted from the current group's
+    // vs2/vs1; .vx broadcasts the scalar). Sign-/zero-extend to the int_divider's
+    // 32-bit W path (SEW<=32) or feed the full 64 bits (SEW=64).
+    let dv_bitoff : logic<8>   = (dv_lane as 8) << (vsew + 3'd3);
+    let dv_a_shv  : logic<VLEN> = i_vs2_data >> dv_bitoff;
+    let dv_b_shv  : logic<VLEN> = i_vs1_data >> dv_bitoff;
+    let dv_a_e    : logic<64>  = dv_a_shv[63:0];
+    let dv_b_e    : logic<64>  = if h_is_vv ? dv_b_shv[63:0] : bbcast;
+    let dv_sgn    : logic      = h_funct6[0]; // vdiv/vrem signed
+    let dv_a_ext  : logic<64>  = case vsew {
+        3'd0   : if dv_sgn ? {dv_a_e[7] repeat 56, dv_a_e[7:0]} : {56'd0, dv_a_e[7:0]},
+        3'd1   : if dv_sgn ? {dv_a_e[15] repeat 48, dv_a_e[15:0]} : {48'd0, dv_a_e[15:0]},
+        3'd2   : if dv_sgn ? {dv_a_e[31] repeat 32, dv_a_e[31:0]} : {32'd0, dv_a_e[31:0]},
+        default: dv_a_e,
+    };
+    let dv_b_ext  : logic<64>  = case vsew {
+        3'd0   : if dv_sgn ? {dv_b_e[7] repeat 56, dv_b_e[7:0]} : {56'd0, dv_b_e[7:0]},
+        3'd1   : if dv_sgn ? {dv_b_e[15] repeat 48, dv_b_e[15:0]} : {48'd0, dv_b_e[15:0]},
+        3'd2   : if dv_sgn ? {dv_b_e[31] repeat 32, dv_b_e[31:0]} : {32'd0, dv_b_e[31:0]},
+        default: dv_b_e,
+    };
+    let dv_d      : logic      = vsew == 3'd3; // SEW=64 → 64-bit (D) ops, else W
+    let dv_rem    : logic      = h_funct6[1];
+    let dv_alu_op : alu_pkg::AluOp = if dv_rem ?
+        (if dv_sgn ? (if dv_d ? alu_pkg::AluOp::REM : alu_pkg::AluOp::REMW) : (if dv_d ? alu_pkg::AluOp::REMU : alu_pkg::AluOp::REMUW))
+    : (if dv_sgn ? (if dv_d ? alu_pkg::AluOp::DIV : alu_pkg::AluOp::DIVW) : (if dv_d ? alu_pkg::AluOp::DIVU : alu_pkg::AluOp::DIVUW));
+    // Start a lane's divide whenever the FU is idle (one pulse per lane; the FU's
+    // o_busy suppresses re-trigger until o_valid).
+    var dv_result_w: logic<64>;
+    var dv_valid_w : logic    ;
+    var dv_busy_w  : logic    ;
+    // !dv_valid_w guards the completion cycle: the int_divider's o_valid is
+    // registered and pulses on the IDLE cycle (busy already 0), so without this a
+    // new lane would (re)start with the just-finished lane's still-current dv_lane
+    // operands — shifting every result one lane.
+    let dv_start  : logic = dv_op && at_head && (count != 0) && scalar_ok && !i_flush && !dv_group_done && !dv_busy_w && !dv_valid_w;
+    inst u_int_div: int_divider (
+        clk                    ,
+        rst                    ,
+        i_valid : dv_start     ,
+        i_alu_op: dv_alu_op    ,
+        i_a     : dv_a_ext     ,
+        i_b     : dv_b_ext     ,
+        i_flush : i_flush      ,
+        o_result: dv_result_w  ,
+        o_valid : dv_valid_w   ,
+        o_busy  : dv_busy_w    ,
+    );
+
+    // Completed lane result spliced into dv_acc at dv_bitoff (SEW-truncated).
+    let dv_sew_mask : logic<64>  = case vsew {
+        3'd0   : 64'h0000_0000_0000_00ff,
+        3'd1   : 64'h0000_0000_0000_ffff,
+        3'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let dv_mask_vlen: logic<VLEN> = {64'd0, dv_sew_mask} << dv_bitoff;
+    let dv_res_vlen : logic<VLEN> = {64'd0, dv_result_w & dv_sew_mask} << dv_bitoff;
+
+    let va_run  : logic = (count != 0) && at_head && scalar_ok && !i_flush && (h_is_valu || h_is_viota) && (!dv_op || dv_group_done);
+    let va_last : logic = ({1'b0, va_reg} + 4'd1) >= va_nregs;
+    // CP (VALU_PIPE): a plain-valu/compare group first spends a FETCH cycle (latch the
+    // VRF operands into va_vs*_q); compute/retire waits on va_ops_rdy. Widen/narrow/
+    // viota/divide don't fetch (va_use_reg=0 for them) -> va_ops_rdy is immediately
+    // true (as today). Dead when VALU_PIPE=0 (va_use_reg=0 -> va_ops_rdy=1).
+    let va_ops_rdy   : logic = !va_use_reg || va_fetched_q;
+    let va_fetch_need: logic = va_use_reg && va_run && !va_fetched_q; // the FETCH cycle
+    let va_fire : logic = va_run && va_last && i_cdb_free && va_ops_rdy; // final group + writeback
+    let va_step : logic = va_run && !va_last && va_ops_rdy;             // intermediate group (no CDB)
+    // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
+    let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
+    // A retiring vleff that trimmed vl writes the new vl at commit. It reuses the
+    // vset writeback path (sh_vset / o_commit_vtype/vl in the ROB → CSR), carrying
+    // the unchanged vtype (vtype_q) and the trimmed vl (ff_vl_q).
+    let ff_trim_retire: logic = mem_cdb_fire && ff_trim_q;
+    // FP arithmetic (vfadd/...) streams through its own element-serial FSM,
+    // also retiring from DONE (fp_cdb_fire, defined with the FP datapath above).
+    let vu_pop      : logic = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
+    // Load VRF write (V2d-3): a register's accumulated value is written when its
+    // last element is processed during ACCESS — no fault, element completed.
+    let mem_fault_now: logic = (h_is_vle && i_mem_fault) || (h_is_vse && i_mem_fault_st);
+    let mem_elem_done: logic = (mem_state == 2'd2) && ((m_active && i_mem_ready && !mem_fault_now) || !m_active);
+    let mem_ld_wr    : logic = mem_elem_done && h_is_vle && reg_last;
+    // vleff trim write: the faulting element ends the load mid-register, so the
+    // current register's fault-free prefix (in vacc, elements [reg_base, velem))
+    // must be committed now. Only when mem_local != 0 (the partial register holds
+    // at least one loaded element); a fault exactly at a register boundary leaves
+    // the (entirely-tail) register untouched, matching the unit-stride convention.
+    let mem_trim_wr  : logic = (mem_state == 2'd2) && m_active && mem_fault_now && h_is_ff && (velem != 8'd0) && (mem_local != 8'd0);
+    let mem_wr_data  : logic<VLEN> = if mem_trim_wr ? vacc : ld_write;
+
+    let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : if h_is_vfmv_fs ? fp_mv_res : if h_is_vcpop ? vcpop_res : 64'd0;
+    // vfmv.s.f writes vd[0] in the (single-cycle) fire path; suppress the write
+    // when vl == 0 (the move is a no-op then).
+    let sf_wr: logic = fire && h_is_vfmv_sf && (vl8 != 8'd0);
+    // V4c mask logical / V4e-1 mask set-prefix write their single dest mask
+    // register in the fire path.
+    let vmask_wr : logic = fire && h_is_vmask;
+    let vmspre_wr: logic = fire && h_is_vmspre;
+    // Register group for source / dest addressing. A compare reads source group
+    // base+va_reg but writes its SINGLE mask register (h_vd), only on the final
+    // group; ALU/merge/mul-div write dest group h_vd+va_reg each group.
+    let va_grp : logic<VRF_W> = h_vd + {2'd0, va_reg};
+    let cmp_wen: logic        = va_fire && h_is_cmp; // compare: write mask on last group only
+    // V5a: running saturation including this group (seed 0 at group 0). The final
+    // group's value rides the vu_cdb to OR into vxsat at commit.
+    // V5a/V5d: per-group saturation comes from satadd (vsat_grp) or vnclip (vnc_grp).
+    let vsat_step: logic = if h_is_vnclip ? vnc_grp : vsat_grp;
+    let vxsat_now: logic = (if va_reg == 3'd0 ? 1'b0 : vxsat_acc) | vsat_step;
+
+    // Widening/narrowing pair a source register with two of the other side
+    // (vw_src = va_reg>>1). Narrowing writes dest reg h_vd+vw_src on odd steps,
+    // building it as {high-half (this step), vn_lo (prev step)}.
+    let vw_src    : logic<VRF_W> = {3'd0, va_reg[2:1]};
+    let vn_dst    : logic<VRF_W> = h_vd + vw_src;
+    let narrow_wen: logic        = (va_step || va_fire) && va_reg[0]; // dest write on odd step
+    assign o_scalar_pdst  = h_s_pdst;
+    assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
+    assign o_scalar2_pdst = h_s2_pd; // V5h strided stride: prf_int 2nd read address
+    assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
+    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
+    assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
+    assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
+    assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
+    assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narr ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || mem_trim_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
+    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? mem_wr_data : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : valu_res)))))))));
+
+    assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
+    assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
+    assign o_cdb_fp_dest  = fire && h_rd_fp;  // vfmv.f.s → write prf_fp (cdb_dest_is_fp)
+    assign o_cdb_pdst     = h_rd_pd;
+    assign o_cdb_data     = h_cdb_data;
+    assign o_cdb_rob_idx  = h_rob;
+    assign o_cdb_vset_wen = (fire && h_is_vset) || ff_trim_retire;
+    assign o_cdb_vtype    = if ff_trim_retire ? vtype_q : vtype_new;
+    assign o_cdb_vl       = if ff_trim_retire ? {56'd0, ff_vl_q} : vl_new;
+
+    // ---- Memory port outputs (V1 unit-stride) -------------------------------
+    assign o_mem_port_req  = (mem_state == 2'd1) || (mem_state == 2'd2);
+    // CP (VINT_PIPE cut #2): the VADDR cycle (mem_va_ready_q=0) registers the VA
+    // but does NOT drive the port — o_mem_active is gated off so the dcache stays
+    // idle (no translate/read/write). The port is still HELD (o_mem_port_req=1, so
+    // scalar load issue is blocked) and the VU op is the ROB head (so a scalar
+    // store can't commit) — the VADDR gap is safe. FETCH/ACCESS drive normally.
+    assign o_mem_active    = (mem_state == 2'd2) && m_active && (!(MEM_PIPE && VINT_PIPE) || mem_va_ready_q);
+    // The MMU input VA is the registered copy when cut #2 is on (the element VA is
+    // stable across VADDR/FETCH/ACCESS — velem doesn't advance — so this only cuts
+    // the timing path, not the value).
+    assign o_mem_vaddr     = if (MEM_PIPE && VINT_PIPE) ? mem_va_q : m_vaddr;
+    assign o_mem_is_load   = o_mem_active && h_is_vle;
+    assign o_mem_is_store  = o_mem_active && h_is_vse;
+    assign o_mem_funct3    = {1'b0, data_eew_log};
+    assign o_mem_wdata     = st_wd;
+    assign o_mem_wstrb     = st_sb;
+
+    // ---- Fault / vstart / vstore (ride the vu_cdb writeback) ----------------
+    assign o_cdb_is_lfault   = mem_cdb_fire && fault_q && h_is_vle;
+    assign o_cdb_is_sfault   = mem_cdb_fire && fault_q && h_is_vse;
+    assign o_cdb_fault_vaddr = fault_va_q;
+    assign o_cdb_vstart_wen  = mem_cdb_fire;
+    assign o_cdb_vstart      = if fault_q ? {56'd0, vstart_q} : 64'd0;
+    assign o_cdb_vstore      = mem_cdb_fire && h_is_vse && !fault_q;
+
+    // ---- V3 vector FP fflags (ride the vu_cdb writeback) --------------------
+    // The accrued per-op flags pulse to the ROB on the FP op's retirement; the
+    // core routes them into fcsr at commit (muxed against the scalar FPU's).
+    assign o_cdb_fflags     = fp_fflags_q;
+    assign o_cdb_fflags_wen = fp_cdb_fire;
+    // V5a: a retiring saturating op (final group) ORs its accrued saturation into
+    // the vxsat CSR at commit.
+    assign o_cdb_vxsat      = vxsat_now;
+    assign o_cdb_vxsat_wen  = va_fire && (h_is_satadd || h_is_vnclip || h_is_vsmul);
+
+    // ---- FIFO maintenance + config update -----------------------------------
+    let do_alloc: logic = i_alloc_en && has_free;
+    let tail    : logic<FIFO_W> = head + count[FIFO_W-1:0];
+
+    // Partial-squash keep mask. A slot is kept if occupied and its op is older-or-
+    // equal to i_squash_idx (ROB age <= squash_age) — exactly the ROB's rule.
+    var sq_keep : logic         [FIFO_N];
+    var sq_nkeep: logic<FIFO_W + 1>     ;
+    always_comb {
+        let squash_age: logic<ROB_IDX_W> = i_squash_idx - i_rob_head_idx;
+        sq_nkeep = 4'd0;
+        for i in 0..FIFO_N {
+            let eage: logic<ROB_IDX_W> = fifo_rob[i] - i_rob_head_idx;
+            sq_keep[i] = occupied[i] && (eage <= squash_age);
+            if sq_keep[i] {
+                sq_nkeep = sq_nkeep + 4'd1;
+            }
+        }
+    }
+
+    always_ff (clk, rst) {
+        if_reset {
+            for i in 0..FIFO_N {
+                occupied[i]    = 1'b0;
+                fifo_op[i]     = vector_pkg::VecOp::NONE;
+                fifo_instr[i]  = 32'd0;
+                fifo_vd[i]     = 5'd0;
+                fifo_vs1[i]    = 5'd0;
+                fifo_vs2[i]    = 5'd0;
+                fifo_uses_s[i] = 1'b0;
+                fifo_s_pdst[i] = 6'd0;
+                fifo_fs_pd[i]  = 6'd0;
+                fifo_s2_pd[i]  = 6'd0;
+                fifo_s_rdy[i]  = 1'b0;
+                fifo_has_rd[i] = 1'b0;
+                fifo_rd_fp[i]  = 1'b0;
+                fifo_rd_pd[i]  = 6'd0;
+                fifo_rob[i]    = 5'd0;
+            }
+            head    = 0;
+            count   = 0;
+            vtype_q = 64'd0;
+            vl_q    = 64'd0;
+            mem_state  = 2'd0;
+            mem_fetched_q = 1'b0;
+            mem_va_ready_q = 1'b0;
+            velem      = 8'd0;
+            seg_field  = 3'd0;
+            vacc       = {1'b0 repeat VLEN};
+            fault_q    = 1'b0;
+            fault_va_q = 64'd0;
+            vstart_q   = 8'd0;
+            ff_trim_q  = 1'b0;
+            ff_vl_q    = 8'd0;
+            va_reg     = 3'd0;
+            va_acc     = {1'b0 repeat VLEN};
+            vxsat_acc  = 1'b0;
+            vn_lo      = 64'd0;
+            va_fetched_q = 1'b0;
+            va_vs1_q    = {1'b0 repeat VLEN};
+            va_vs2_q    = {1'b0 repeat VLEN};
+            dv_lane     = 5'd0;
+            dv_acc      = {1'b0 repeat VLEN};
+            fp_state    = 2'd0;
+            fp_ph       = 1'b0;
+            fp_elem     = 8'd0;
+            fp_fetched_q = 1'b0;
+            fp_s1_q     = 64'd0;
+            fp_s2_q     = 64'd0;
+            fp_s3_q     = 64'd0;
+            fp_int_rs1_q = 64'd0;
+            fp_acc      = {1'b0 repeat VLEN};
+            fp_fflags_q = 5'd0;
+            red_acc     = 64'd0;
+            pm_state    = 2'd0;
+            pelem       = 8'd0;
+            pm_acc      = {1'b0 repeat VLEN};
+            pm_j        = 8'd0;
+            pm_fetched_q = 1'b0;
+        } else if i_flush {
+            // Drop all speculative vector ops; restore config from the committed
+            // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
+            // memory op (its element writes are idempotent unit-stride accesses;
+            // it re-fetches and re-executes from element 0).
+            for i in 0..FIFO_N {
+                occupied[i] = 1'b0;
+            }
+            head       = 0;
+            count      = 0;
+            vtype_q    = i_csr_vtype;
+            vl_q       = i_csr_vl;
+            mem_state  = 2'd0;
+            mem_fetched_q = 1'b0;
+            mem_va_ready_q = 1'b0;
+            fault_q    = 1'b0;
+            ff_trim_q  = 1'b0;
+            va_reg     = 3'd0;
+            va_acc     = {1'b0 repeat VLEN};
+            vn_lo      = 64'd0;
+            // Abandon any in-flight plain-valu/compare fetch (idempotent: re-reads
+            // the same unrenamed VRF sources and re-fetches from group 0).
+            va_fetched_q = 1'b0;
+            // Abandon any in-flight integer divide; idempotent, re-reads the
+            // unrenamed VRF sources and re-iterates from lane 0.
+            dv_lane     = 5'd0;
+            // Abandon any in-flight FP op; idempotent, re-executes from element 0.
+            fp_state    = 2'd0;
+            // Abandon any in-flight permute op (idempotent: re-reads the same
+            // unrenamed VRF sources and re-writes the dest from element 0).
+            pm_state    = 2'd0;
+            pm_fetched_q = 1'b0;
+        } else {
+            // Scalar-operand wakeup (int CDB snoop, both lanes).
+            for i in 0..FIFO_N {
+                if occupied[i] && fifo_uses_s[i] && !fifo_s_rdy[i] {
+                    if (i_cdb_int_valid && fifo_s_pdst[i] == i_cdb_int_pdst)
+                        || (i_cdb2_valid && i_cdb2_has_rd && fifo_s_pdst[i] == i_cdb2_pdst) {
+                        fifo_s_rdy[i] = 1'b1;
+                    }
+                }
+            }
+            // Memory FSM (vle/vse): stream one element per access, head first.
+            case mem_state {
+                2'd0: {
+                    // IDLE: launch when a mem op is the ROB head with its base ready.
+                    if (count != 0) && at_head && h_is_mem && scalar_ok {
+                        velem     = 8'd0;
+                        seg_field = 3'd0;
+                        vacc      = {1'b0 repeat VLEN};
+                        fault_q   = 1'b0;
+                        ff_trim_q = 1'b0;
+                        mem_fetched_q = 1'b0; // CP (MEM_PIPE): first element starts with a FETCH
+                        mem_va_ready_q = 1'b0; // CP (VINT_PIPE cut #2): first element starts with a VADDR
+                        if m_vl8 == 8'd0 {
+                            mem_state = 2'd3; // empty op: nothing to access
+                        } else {
+                            mem_state = 2'd1; // ARM: drain the scalar mem path
+                        }
+                    }
+                }
+                2'd1: {
+                    // ARM: own the port; wait for the scalar mem path to quiesce.
+                    if i_mem_idle {
+                        mem_state = 2'd2;
+                    }
+                }
+                2'd2: {
+                    // ACCESS: process element velem (active → drive the port).
+                    if MEM_PIPE && VINT_PIPE && m_active && !mem_va_ready_q {
+                        // CP (VINT_PIPE cut #2) VADDR phase: latch the element VA so
+                        // the MMU input is a register next cycle. o_mem_active is
+                        // gated off this cycle (no translate/fault/access yet), so the
+                        // fault check below runs only once the FETCH cycle drives the
+                        // registered VA into the MMU. No port drive, no element advance.
+                        mem_va_q       = m_vaddr;
+                        mem_va_ready_q = 1'b1;
+                    } else if m_active && mem_fault_now {
+                        if h_is_ff && (velem != 8'd0) {
+                            // Fault-only-first: an element > 0 faulted. Trim vl to
+                            // this element (the fault-free prefix [0, velem) stays
+                            // loaded — its partial register is written this cycle via
+                            // mem_trim_wr) and retire WITHOUT a trap.
+                            ff_trim_q = 1'b1;
+                            ff_vl_q   = velem;
+                            mem_state = 2'd3;
+                        } else {
+                            // vle/vse fault, or vleff faulting on element 0: trap.
+                            fault_q    = 1'b1;
+                            fault_va_q = m_vaddr;
+                            vstart_q   = velem;
+                            mem_state  = 2'd3;
+                        }
+                    } else if MEM_PIPE && m_active && !mem_fetched_q {
+                        // CP (MEM_PIPE) FETCH phase: drive the element address this
+                        // cycle so the MMU translates and the core's M-stage latches
+                        // the PA; the dcache accesses that latched PA NEXT cycle.
+                        // Advance to ACCESS when the translation is ready — i_mem_ready
+                        // here means !dmem_mmu_busy, because the FETCH-cycle dcache
+                        // re-read of the prior (already-cached) element hits, so
+                        // dcache_stall=0. The element is NOT completed this cycle.
+                        if i_mem_ready {
+                            mem_fetched_q = 1'b1;
+                        }
+                    } else if (m_active && i_mem_ready) || !m_active {
+                        // Element processed (active completed, or masked-off skip).
+                        // Loads accumulate into vacc; at a register boundary the
+                        // completed register is written via the VRF port this cycle
+                        // (mem_ld_wr / ld_write) and the accumulator resets.
+                        if h_is_vle {
+                            vacc = if reg_last ? {1'b0 repeat VLEN} : ld_write;
+                        }
+                        if velem + 8'd1 >= m_vl8 {
+                            // Field complete. For a segment op, advance to the next
+                            // field's element 0 (field-outer walk); otherwise done.
+                            if h_is_segment && (seg_field != h_nf) {
+                                seg_field = seg_field + 3'd1;
+                                velem     = 8'd0;
+                            } else {
+                                mem_state = 2'd3;
+                            }
+                        } else {
+                            velem = velem + 8'd1;
+                        }
+                        mem_fetched_q = 1'b0; // CP (MEM_PIPE): next element re-fetches
+                        mem_va_ready_q = 1'b0; // CP (VINT_PIPE cut #2): next element re-VADDRs
+                    }
+                }
+                2'd3: {
+                    // DONE: retire on the vu_cdb writeback (vu_pop below).
+                    if i_cdb_free {
+                        mem_state = 2'd0;
+                    }
+                }
+            }
+            // FP arithmetic FSM (vfadd/.../vfmul): stream one element per cycle
+            // through the shared fpu_wrap, head first. fp_acc accumulates the
+            // current destination register (written at its boundary via
+            // fp_reg_wr / fp_acc_next) and fp_fflags_q OR-accumulates the flags.
+            case fp_state {
+                2'd0: {
+                    // IDLE: launch when an FP op is the ROB head (no scalar source
+                    // for .vv, so scalar_ok is always met).
+                    if (count != 0) && at_head && h_is_fp && scalar_ok {
+                        fp_elem     = 8'd0;
+                        fp_ph       = 1'b0;
+                        fp_fetched_q = 1'b0; // CP (VFP_PIPE): first element starts with a FETCH
+                        fp_acc      = {1'b0 repeat VLEN};
+                        fp_fflags_q = 5'd0;
+                        if vl8 == 8'd0 {
+                            fp_state = 2'd2; // empty op: nothing to compute
+                        } else {
+                            fp_state = 2'd1;
+                        }
+                    }
+                }
+                2'd1: {
+                    // COMPUTE: element fp_elem streams through u_vfpu (PIPE=1). A
+                    // fast (arith/cmp/est/merge) op presents in fp_ph=0 and its
+                    // result is captured in fp_ph=1; fp_elem is stable across both,
+                    // so all the per-element geometry stays valid. FDIV.D/FSQRT.D
+                    // hold here on vfpu_busy (they then fall through fp_ph=0→1 once
+                    // their latched result is ready, captured the next cycle).
+                    if !vfpu_busy {
+                        if VFP_PIPE && !fp_fetched_q {
+                            // CP (VFP_PIPE) FETCH phase: latch the u_vfpu operands so
+                            // the long VRF-fetch -> stage-1 chain is split across two
+                            // cycles. u_vfpu is not issued yet (fp_issue_v gated on
+                            // fp_fetched_q); present runs next cycle on the registered
+                            // copies. Dead when VFP_PIPE=0.
+                            fp_s1_q      = fp_s1;
+                            fp_s2_q      = fp_s2;
+                            fp_s3_q      = fp_s3;
+                            fp_int_rs1_q = fp_int_rs1;
+                            fp_fetched_q = 1'b1;
+                        } else if fp_ph == 1'b0 {
+                            // present phase: operands driven this cycle; capture next.
+                            fp_ph = 1'b1;
+                        } else {
+                            // capture phase: the result for fp_elem is now valid.
+                            if fp_active && !h_is_fmerge && !h_is_anyired {
+                                // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU);
+                                // integer reductions (h_is_anyired) accrue no FP flags.
+                                fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : vfpu_fflags);
+                            }
+                            // A compare accumulates the running mask in fp_acc (no
+                            // reset — one mask register spans the whole op); a reduction
+                            // folds into the scalar red_acc; arithmetic accumulates the
+                            // SEW-wide register value, resetting at each register
+                            // boundary (the next register re-seeds from old vd).
+                            if h_is_fcmp {
+                                fp_acc = fp_mask_next;
+                            } else if h_is_red {
+                                red_acc = red_final;
+                            } else {
+                                fp_acc = if fp_dreg_last ? {1'b0 repeat VLEN} : fp_acc_next;
+                            }
+                            fp_ph = 1'b0;
+                            fp_fetched_q = 1'b0; // CP (VFP_PIPE): next element re-fetches
+                            if fp_elem + 8'd1 >= vl8 {
+                                fp_state = 2'd2;
+                            } else {
+                                fp_elem = fp_elem + 8'd1;
+                            }
+                        }
+                    }
+                }
+                2'd2: {
+                    // DONE: retire on the vu_cdb writeback (vu_pop below).
+                    if i_cdb_free {
+                        fp_state = 2'd0;
+                    }
+                }
+            }
+            // Permute FSM (slide / vrgather / vcompress): walk one element per
+            // cycle, accumulating each destination register and writing it at its
+            // boundary (pm_reg_wr / pm_acc_next via the VRF port this cycle). The
+            // accumulator resets at the boundary; the next register re-seeds from
+            // the old vd (so inactive / tail / undisturbed elements stay intact).
+            case pm_state {
+                2'd0: {
+                    // IDLE: launch when a permute op is the ROB head with its
+                    // scalar operand ready (slide.vx / slide1; .vv / .vf need none).
+                    if (count != 0) && at_head && h_is_perm && scalar_ok {
+                        pelem  = 8'd0;
+                        pm_acc = {1'b0 repeat VLEN};
+                        pm_j   = 8'd0;
+                        pm_fetched_q = 1'b0; // CP (VINT_PIPE): first element starts with a FETCH
+                        if vl8 == 8'd0 {
+                            pm_state = 2'd2; // empty op: nothing to do
+                        } else {
+                            pm_state = 2'd1;
+                        }
+                    }
+                }
+                2'd1: {
+                    // COMPUTE: process element pelem. slide / vrgather accumulate
+                    // the dest register and write it at the boundary; vcompress RMWs
+                    // the dest register on each selected element and advances the
+                    // running output position pm_j (the VRF write is pm_reg_wr above).
+                    if pm_need_fetch && !pm_fetched_q {
+                        // CP (VINT_PIPE) FETCH phase: latch the permute source
+                        // addressing (the unified source register + its in-register
+                        // element offset + the vrgather OOB flag) computed from the
+                        // live source-addressing chain, so the deep vs2 read + extract
+                        // run next cycle off the registers. No write, no advance.
+                        pm_src_reg_q    = pm_src_reg;
+                        pm_src_bitoff_q = if h_is_comp ? pm_dbitoff : (if h_is_vrg ? pm_g_sbitoff : pm_sbitoff);
+                        pm_idx_oob_q    = pm_idx_oob;
+                        pm_fetched_q    = 1'b1;
+                    } else {
+                        if h_is_comp {
+                            if pm_cm {
+                                pm_j = pm_j + 8'd1;
+                            }
+                        } else {
+                            pm_acc = if pm_dreg_lst ? {1'b0 repeat VLEN} : pm_acc_next;
+                        }
+                        pm_fetched_q = 1'b0; // CP (VINT_PIPE): next element re-fetches
+                        if pelem + 8'd1 >= vl8 {
+                            pm_state = 2'd2;
+                        } else {
+                            pelem = pelem + 8'd1;
+                        }
+                    }
+                }
+                2'd2: {
+                    // DONE: retire on the vu_cdb writeback (vu_pop below).
+                    if i_cdb_free {
+                        pm_state = 2'd0;
+                    }
+                }
+            }
+            // CP (VALU_PIPE): FETCH phase for the register-serial plain-valu/compare
+            // datapath. va_fetch_need holds on a group's first cycle: latch the VRF
+            // operands into va_vs*_q and set va_fetched_q, so the compute (va_step/
+            // va_fire, gated on va_ops_rdy) runs next cycle off the registers. The
+            // compute cycle clears va_fetched_q so the next group re-fetches. The
+            // whole block folds away when VALU_PIPE=0 (registers reset-only -> DCE).
+            if VALU_PIPE {
+                if va_fetch_need {
+                    va_vs1_q     = i_vs1_data;
+                    va_vs2_q     = i_vs2_data;
+                    va_fetched_q = 1'b1;
+                } else if va_step || va_fire {
+                    va_fetched_q = 1'b0;
+                }
+            }
+            // Arith register-group advance (V2d LMUL>1): step intermediate
+            // groups; the op stays at the FIFO head until va_fire pops it.
+            // Compare accumulates the running mask into va_acc each group.
+            if h_is_cmp && (va_step || va_fire) {
+                va_acc = cmp_res;
+            }
+            // V5a/V5d: accumulate the saturation across the EMUL groups / narrowing
+            // steps (intermediate ones latch vxsat_acc; the final drives o_cdb_vxsat).
+            if (h_is_satadd || h_is_vnclip || h_is_vsmul) && va_step {
+                vxsat_acc = vxsat_now;
+            }
+            // Narrowing: latch the low-half result on each even source step.
+            if h_is_narr && va_step && !va_reg[0] {
+                vn_lo = vn_step;
+            }
+            if va_step {
+                va_reg = va_reg + 3'd1;
+            } else if va_fire {
+                va_reg = 3'd0;
+            }
+            // Integer DIV/REM element-serial: splice each completed lane into dv_acc
+            // and step to the next lane. dv_lane resets at every group boundary
+            // (va_step) and op retire (vu_pop), so each group starts fresh at lane 0.
+            if dv_valid_w {
+                dv_acc  = (dv_acc & ~dv_mask_vlen) | dv_res_vlen;
+                dv_lane = dv_lane + 5'd1;
+            }
+            if va_step || vu_pop {
+                dv_lane = 5'd0;
+            }
+            // Issue/complete the head (arith fire OR mem-op retire).
+            if vu_pop {
+                occupied[head] = 1'b0;
+                if fire && h_is_vset {
+                    vtype_q = vtype_new;
+                    vl_q    = vl_new;
+                } else if ff_trim_retire {
+                    // vleff trimmed vl: update the VU's working copy so younger
+                    // vector ops (popped after this) see the new vl immediately.
+                    vl_q = {56'd0, ff_vl_q};
+                }
+            }
+            // Allocate at the tail.
+            if do_alloc {
+                occupied[tail]    = 1'b1;
+                fifo_op[tail]     = i_alloc_vec_op;
+                fifo_instr[tail]  = i_alloc_instr;
+                fifo_vd[tail]     = i_alloc_vd;
+                fifo_vs1[tail]    = i_alloc_vs1;
+                fifo_vs2[tail]    = i_alloc_vs2;
+                fifo_uses_s[tail] = i_alloc_uses_scalar;
+                fifo_s_pdst[tail] = i_alloc_scalar_pdst;
+                fifo_fs_pd[tail]  = i_alloc_fscalar_pdst; // V3b FP scalar (.vf)
+                fifo_s2_pd[tail]  = i_alloc_scalar2_pdst; // V5h strided stride (x[rs2])
+                fifo_has_rd[tail] = i_alloc_has_rd;
+                fifo_rd_fp[tail]  = i_alloc_rd_is_fp;
+                fifo_rd_pd[tail]  = i_alloc_rd_pdst;
+                fifo_rob[tail]    = i_alloc_rob_idx;
+                // Initial scalar readiness: core-supplied, or same-cycle int CDB.
+                fifo_s_rdy[tail] = (!i_alloc_uses_scalar) || i_alloc_scalar_ready
+                    || (i_cdb_int_valid && i_cdb_int_pdst == i_alloc_scalar_pdst)
+                    || (i_cdb2_valid && i_cdb2_has_rd && i_cdb2_pdst == i_alloc_scalar_pdst);
+            }
+            // Early (execute-time) PARTIAL squash, mirroring the ROB. Drop FIFO
+            // entries YOUNGER than i_squash_idx (ROB age > squash_age); the kept set
+            // is sq_keep / sq_nkeep (computed combinationally). This runs alongside
+            // the normal FSM/pop above (it only touches the younger suffix — the
+            // tail side — while pop touches the head, so they are independent). Only
+            // CLEAR occupied for dropped slots so a same-cycle vu_pop's head clear
+            // above is preserved. The core suppresses alloc on a squash cycle.
+            if i_squash_en {
+                for i in 0..FIFO_N {
+                    if !sq_keep[i] {
+                        occupied[i] = 1'b0;
+                    }
+                }
+            }
+            // Head/count update (pop + push are independent slots). On a squash the
+            // surviving count is sq_nkeep (minus the head if it also popped); the
+            // head advances only on a pop.
+            if i_squash_en {
+                if vu_pop {
+                    head  = head + 1;
+                    count = sq_nkeep - 4'd1;
+                } else {
+                    count = sq_nkeep;
+                }
+            } else if vu_pop && !do_alloc {
+                head  = head + 1;
+                count = count - 1;
+            } else if !vu_pop && do_alloc {
+                count = count + 1;
+            } else if vu_pop && do_alloc {
+                head = head + 1; // count unchanged
+            }
+        }
+    }
+}
