@@ -3794,6 +3794,10 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 
 M1a で決める事項: U4 (新コアの veryl の版、M1a 開始時)、U5、U6 (§3.5 の拒否の仕組み)、U7 (checker の synth からの除外)、U9 (CP の基準値の取り直し)、U10 (cranelift の到達範囲)、U11、U12、U14 (golden 成果物の置き場所)、U31 (編集上の積み残し。ヘッダ雛形だけは M1b)。加えて、検証計画 §2.5 の `CORE` の切替方法と §2.6 の載せ先。U3 は M1a から適用する。
 
+#### M1a の完了 (2026-10-14)
+
+出口条件はすべて満たした。V14 は統合 SoC と新しい veryl (origin/master `6a671a6b` + 修正) の上で梯子 1-5 が緑: 既定 254 passed、litmus N=4 pass (3.87M)、N=2 boot 16.42M、N=4 boot 25.18M、hvlinux 22.32M、5.15 N=1 12.23M。dhrystone/coremark はビット一致。基盤側は spike (§3.7.1)、retire_pkg と tracer (`0675176`)、golden の受入と最初の成果物 (`0bc2467`)、rv64ui 54 本の golden checkpoint (`3cd76ae`)、20 テストの判定 (検証計画 §2.6.1、統合 SoC に載せる) が揃った。手順 4 で予定していた SoC への追加 (CORE、PMA_REGIONS、MTIME_SRC、デバッグ入力、I slot の ROM 経路、dcache の export) は、使う側と同時に入れる (DEAD scaffolding を作らないため)。
+
 ### M1b: 歩く骨格 (最終構造 + 最も単純な policy)
 
 目標: rv64ui に要るモジュールだけを最終形の構造で立ち上げ、最も単純な policy で rv64ui を golden と trace 一致させる。cfg_w4 は elaborate でき、rv64ui のサブセットが通る状態を M1b から保つ。FP の FU、`tlb`/`ptw`、`atomic_unit`、`io_unit`、rv64ui が要らない CSR と割込みの経路は M2 で入れる。
