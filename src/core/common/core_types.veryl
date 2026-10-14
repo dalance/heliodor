@@ -195,6 +195,284 @@ pub package core_types::<CFG: core_cfg> {
         foff   : logic <FOFF_W>,
     }
 
+    // ---- Execution (sections 5.6, 5.7, X) ----
+
+    // Identity an FU echoes unchanged from its input to its WB packet.
+    struct ExTag {
+        rob   : RobTag,
+        pdst  : PReg  ,
+        has_rd: logic ,
+    }
+
+    // The only output of an execution unit; nothing travels beside it.
+    struct WbPacket {
+        valid : logic              ,
+        tag   : ExTag              ,
+        data  : logic          <64>,
+        exc   : exc_pkg::ExcRec    ,
+        fflags: logic          <5> ,
+        br    : BrResolve          , // BRU ports only
+    }
+
+    // Scheduling wakeup: the value of pdst is on a WB bus WAKE_LEAD cycles
+    // later (or later still for memory-pipe wake lanes).
+    struct Wake {
+        valid: logic,
+        pdst : PReg ,
+    }
+
+    enum XfKind: logic<2> {
+        SFENCE,
+        HFENCE_VVMA,
+        HFENCE_GVMA,
+    }
+
+    struct XlateFlush {
+        valid   : logic     ,
+        kind    : XfKind    ,
+        va      : logic <64>,
+        asid    : logic <16>,
+        all_va  : logic     , // rs1 was x0
+        all_asid: logic     , // rs2 was x0
+    }
+
+    // fu_sys -> commit: what a SYS op does at retire.
+    struct SysPending {
+        valid    : logic         ,
+        tag      : RobTag        ,
+        csr_addr : logic     <12>,
+        csr_wdata: logic     <64>,
+        xf       : XlateFlush    ,
+    }
+
+    // lq -> memory iq: a ld_barrier op retired; bar_ret is now seq.
+    struct LoadFence {
+        valid: logic ,
+        seq  : BarSeq,
+    }
+
+    // ---- Issue queue records ----
+
+    function iq_n_max () -> u32 {
+        var m: u32;
+        m = 0;
+        for q in 0..CFG::N_IQ {
+            if CFG::IQ_N[q] >: m {
+                m = CFG::IQ_N[q];
+            }
+        }
+        return m;
+    }
+
+    const IQ_ENT_W: u32 = tag_pkg::idx_w(iq_n_max());
+    const SRC_N   : u32 = 3; // source slots of the widest op (FMA)
+
+    struct IqSrc {
+        en: logic, // the op reads this source
+        pr: PReg ,
+    }
+
+    // Read only for the selected entry.
+    struct IqCold {
+        uop       : logic <fu_pkg::UOP_W>, // FU-specific op code
+        imm       : logic <32>           ,
+        rm        : logic <3>            ,
+        ftq       : FtqTag               ,
+        foff      : logic <FOFF_W>       ,
+        pred_taken: logic                , // this op is its block's predicted taken exit
+        rvc       : logic                ,
+        lq        : LqTag                ,
+        sq        : SqTag                ,
+    }
+
+    // dispatch -> iq, one per rename lane.
+    struct IqAlloc {
+        tag       : ExTag    ,
+        fu        : FuKind   ,
+        nonspec   : logic    , // select only with the oldest token
+        src       : IqSrc <3>,
+        rdy       : logic <3>, // initial ready per source (1 when unused)
+        obey_fence: logic    , // a load behind an unretired ld_barrier op
+        bar_w     : BarSeq   , // ld_barrier ops allocated before this load
+        cold      : IqCold   ,
+    }
+
+    // iq -> exec_port / mem_pipe, one per issue port, combinational in S.
+    struct IqGrant {
+        valid: logic           ,
+        entry: logic <IQ_ENT_W>, // returned with iq_release
+        tag  : ExTag           ,
+        fu   : FuKind          ,
+        src  : IqSrc <3>       ,
+        cold : IqCold          ,
+    }
+
+    struct IqRelease {
+        valid: logic          ,
+        entry: logic<IQ_ENT_W>,
+    }
+
+    // ---- Topology derived from the FU table ----
+
+    // FU kinds a memory pipe accepts: every pipe takes loads and stores,
+    // atomics run only on pipe 0.
+    function mem_port_fu (
+        m: input u32,
+    ) -> FuSet {
+        return fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE) | (if m == 0 ? fu_bit(FuKind::ATOMIC) : 0);
+    }
+
+    // The exec port that is issue port i of IQ q.
+    function iq_exec_port (
+        q: input u32,
+        i: input u32,
+    ) -> u32 {
+        var r: u32;
+        var c: u32;
+        r = 0;
+        c = 0;
+        for p in 0..CFG::ISSUE_W {
+            if CFG::PORT_IQ[p] == q {
+                if c == i {
+                    r = p;
+                }
+                c += 1;
+            }
+        }
+        return r;
+    }
+
+    // Position of exec port p among the issue ports of its IQ.
+    function exec_port_local (
+        p: input u32,
+    ) -> u32 {
+        var c: u32;
+        c = 0;
+        for j in 0..CFG::ISSUE_W {
+            if j <: p && CFG::PORT_IQ[j] == CFG::PORT_IQ[p] {
+                c += 1;
+            }
+        }
+        return c;
+    }
+
+    // FU set of issue port i of IQ q (memory pipe i for MEM_IQ).
+    function iq_port_fu (
+        q: input u32,
+        i: input u32,
+    ) -> FuSet {
+        return if q == CFG::MEM_IQ ? mem_port_fu(i) : CFG::PORT_FU[iq_exec_port(q, i)];
+    }
+
+    // Whether FU kind k may read register class fp (0 INT, 1 FP) in source
+    // slot s.
+    function fu_reads (
+        k : input FuKind,
+        s : input u32   ,
+        fp: input logic ,
+    ) -> logic {
+        var r: logic;
+        r = 1'b0;
+        case k {
+            FuKind::ALU, FuKind::BRU, FuKind::MUL, FuKind::DIV, FuKind::SYS, FuKind::LOAD: {
+                r = !fp && (s == 0 || (s == 1 && k != FuKind::LOAD));
+            }
+            FuKind::STORE, FuKind::ATOMIC: {
+                r = (s == 0 && !fp) || s == 1;
+            }
+            FuKind::FMA: {
+                r = fp && s <: 3;
+            }
+            FuKind::FMISC: {
+                r = s == 0 || (s == 1 && fp);
+            }
+            FuKind::FDIV: {
+                r = fp && s <: 2;
+            }
+            default: {}
+        }
+        return r;
+    }
+
+    // FU kinds a WB port carries: exec port w, or memory pipe w - ISSUE_W.
+    function wb_fu (
+        w: input u32,
+    ) -> FuSet {
+        return if w <: CFG::ISSUE_W ? CFG::PORT_FU[w] : mem_port_fu(w - CFG::ISSUE_W);
+    }
+
+    // Whether WB port w can write register class fp: the union of the
+    // destination classes of its FUs.
+    function wb_writes (
+        w : input u32  ,
+        fp: input logic,
+    ) -> logic {
+        var s   : FuSet;
+        var iset: FuSet;
+        var fset: FuSet;
+        s    = wb_fu(w);
+        iset = fu_bit(FuKind::ALU) | fu_bit(FuKind::BRU) | fu_bit(FuKind::MUL) | fu_bit(FuKind::DIV)
+            | fu_bit(FuKind::SYS) | fu_bit(FuKind::FMISC) | fu_bit(FuKind::LOAD) | fu_bit(FuKind::ATOMIC);
+        fset = fu_bit(FuKind::FMA) | fu_bit(FuKind::FMISC) | fu_bit(FuKind::FDIV) | fu_bit(FuKind::LOAD);
+        return (s & (if fp ? fset : iset)) != 0;
+    }
+
+    // Furthest WB slot a RESERVED op on WB port w claims (D_p).
+    function wb_depth (
+        w: input u32,
+    ) -> u32 {
+        var d: u32  ;
+        var s: FuSet;
+        d = fu_pkg::WAKE_LEAD;
+        s = wb_fu(w);
+        for k in 0..FU_KIND_N {
+            if s[k] && !fu_pkg::is_blocking(k as FuKind) && fu_pkg::claim_off(k as FuKind) >: d {
+                d = fu_pkg::claim_off(k as FuKind);
+            }
+        }
+        return d;
+    }
+
+    // PRF read ports: SRC_N per issue port, exec ports first, then memory
+    // pipes; port r * SRC_N + s serves source slot s. Only the ports some FU
+    // of that issue port reads in the class of the file exist.
+    const PRF_RD_N: u32 = (CFG::ISSUE_W + CFG::MEM_W) * SRC_N;
+
+    function rd_live (
+        r : input u32  ,
+        fp: input logic,
+    ) -> logic {
+        var l: logic;
+        var s: FuSet;
+        l = 1'b0;
+        s = wb_fu(r / SRC_N);
+        for k in 0..FU_KIND_N {
+            if s[k] && fu_reads(k as FuKind, r % SRC_N, fp) {
+                l = 1'b1;
+            }
+        }
+        return l;
+    }
+
+    // Register read with bypass from the WB buses: the value of WB port w if
+    // it writes pr this cycle (at most one does), else the PRF value.
+    function bypass (
+        pr: input PReg               ,
+        rf: input logic   <64>       ,
+        wb: input WbPacket     [WB_N],
+    ) -> logic<64> {
+        var hit: logic<WB_N>;
+        var r  : logic<64>  ;
+        for w in 0..WB_N {
+            hit[w] = wb_writes(w, pr.cls == RegClass::FP) && wb[w].valid && wb[w].tag.has_rd && wb[w].tag.pdst == pr;
+        }
+        r = if hit == 0 ? rf : 0;
+        for w in 0..WB_N {
+            r = r | ({hit[w] repeat 64} & wb[w].data);
+        }
+        return r;
+    }
+
     // Whether kill k removes the op tagged t.
     function killed (
         k: input Kill  ,
