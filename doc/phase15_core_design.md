@@ -3689,13 +3689,13 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 | U1 | N=4 boot のゲートを両構成で回すか | D7 | M3 | matched な N=1/2/4 の測定で崖の原因を特定した後、cfg_w4 の cy/s から梯子全体の時間を見積もって決める。 |
 | U2 | 【M3 で決定】N=4 の判定を Verilator で行うか (D7 と合わせて決める) | 調査 (シミュレーション速度)、D7 | M3 | U1 の matched 測定と同じ機会に、N=4 boot の壁時間を native と Verilator (`-O1`) の両方で測り、梯子全体の時間で比べる。候補: native だけ、N=4 だけ Verilator、併用。初期の見込みは「N=4 boot は Verilator を正とし、native は N=1/2 と節目の N=4」。Verilator は約 1.6 倍速く、NBA の基準でもある。ただし `-O1` が要り、veryl の cache は効かない。決めた方針は M4 から適用する。 |
 | U3 | 2 構成を並行 worktree で回すか: 採用済み (第 0 部 §1.4 の運用) | 調査 (シミュレーション速度) | M1a から適用 | マシンは 16 CPU で、各シミュレーションは単一スレッドで動く。veryl は同時に 1 起動しか許さないので、`.build` を分けるには worktree を分ける必要がある。 |
-| U4 | 新コアで使う veryl の版 | 調査 (Veryl) | M1a 開始時 | `fbd14729` より先に進めて generics の修正を取り込むかどうか。推奨: 進める。golden は D1 のとおり `fbd14729` の別 worktree に残す。master 上の旧コアは、新しい veryl で dhrystone/coremark のビット一致を確認してから使う。 |
+| U4 | 新コアで使う veryl の版 | 調査 (Veryl) | M1a 開始時 | 【決定済み (§3.7.1)】新コアは `local/heliodor-fixes` の veryl を使う。旧コアはこの版でも dhrystone/coremark がビット一致する。 |
 | U5 | 旧コアの simulator 回避コードは今も必要か | 調査 (Veryl) | M1a | 部分 squash の動的書込、代入後の field 上書き、後方参照する配列の settle の 3 つを、spike の単体テストとして現行の veryl で再現させてみる。 |
-| U6 | 拒否の仕組み | §3.5 | M1a | spike の中で、generate-if と未定義モジュールで落とす方法が使えるかを確かめる。使えなければ `test_cfg_constraints` で代替する。 |
-| U7 | checker を synth から外す方法 | §5.15 | M1a | spike の中で、`#[ifdef]` で外すか、面積から差し引くかを決める。 |
+| U6 | 拒否の仕組み | §3.5 | M1a | 【決定済み (§3.7.1)】`#[test] test_cfg_constraints` で全構成の制約定数を検査する。 |
+| U7 | checker を synth から外す方法 | §5.15 | M1a | 【決定済み (§3.7.1)】`#[ifdef(HELIODOR_CHK)]` で囲み、`[test].defines` にだけ定義する。 |
 | U8 | `RESP_LAT` の値 | §5.9 MP1 | M1b | adapter を実装し、Stage-A の提示から Stage-B の判定までの距離で決める (2 を見込む)。 |
 | U9 | CP の基準値 | 調査 (過去の教訓) | M1a | 現行の synth で `b0f4668` を合成し直して基準を取る。2026-06-15 から 08-28 の CP の数値は無効である (synth がゲートの 52.5 % しか見ていなかった)。 |
-| U10 | cranelift backend の到達範囲と `--backend-validate` の可否 | 調査 (Veryl) | M1a | skeleton が cranelift でどれだけ interpreter に落ちるかを測る。落ちる割合が大きければ、第二の backend によるクロスチェックは Verilator で行う。 |
+| U10 | cranelift backend の到達範囲と `--backend-validate` の可否 | 調査 (Veryl) | M1a | spike は cranelift で通る (§3.7.1)。skeleton 規模での到達範囲は M1b で測る。 |
 | U11 | パッチを当てた旧コアが tick モードで 5.15 N=1 を完走するか | 調査 (検証) | M1a | D1 の受入の後に 1 回走らせる。timeout や drain の問題がないかを確認する。 |
 | U12 | 5.15 boot が cycle/instret/hpm の CSR や MMIO の mtime を読むか | 調査 (検証) | M1a | tracer で数える。読むなら、MASK にするか、csr に mcycle-by-instret を足すかを決める。 |
 | U13 | 割込み replay で allow と force のどちらが要るか | 調査 (検証) | M2 | 5.15 lockstep で、「golden の割込みが自コアで pending でない」が起きる頻度を測る (D2)。 |
