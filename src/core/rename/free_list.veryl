@@ -1,0 +1,160 @@
+// free_list: circular FIFO of the free physical registers of one RegClass.
+//
+// Ports (timing contract):
+//   o_pop[k]        : the k-th register from the head, read from registered
+//                     state (valid only for k < o_free)
+//   o_head_after[k] : head advanced by k pops (k = 0..RENAME_W), for the
+//                     dispatch snapshot
+//   o_free          : tail - head, registered state only
+//   i_pop_n         : registers popped on this edge (from dispatch)
+//   i_rel           : commit lanes; the old_pdst of each retiring lane of
+//                     this class is pushed at the tail in lane order
+//   i_kill          : partial: head := kill.fl_int / fl_fp (this class);
+//                     full: head := tail - N; applied on the edge
+//   o_chk           : sticky invariant flags (HELIODOR_CHK builds only)
+// Owns:
+//   - 0 <= tail - head <= N, and no register is pushed while it is free
+//   - head and tail are each assigned once per cycle
+// Rationale:
+//   - no in-flight counter: pops happen in op order and pushes in retire
+//     order, so [tail - N, head) holds exactly the destinations of renamed,
+//     unretired ops in order; rewinding head to the snapshot of keep frees
+//     every younger one, and a full kill frees them all
+//   - the ring size N is the class's FREE_*_N, never the PRF size
+module free_list::<CFG: core_cfg> #(
+    param CLS: core_types::<CFG>::RegClass = core_types::<CFG>::RegClass::INT,
+) (
+    clk         : input  clock                                                                    ,
+    rst         : input  reset                                                                    ,
+    i_pop_n     : input  logic                   <core_types::<CFG>::TAKE_W>                      ,
+    i_rel       : input  core_types::<CFG>::RenCm                              [CFG::COMMIT_W]    ,
+    i_kill      : input  core_types::<CFG>::Kill                                                  ,
+    o_pop       : output logic                   <core_types::<CFG>::PREG_W>   [CFG::RENAME_W]    ,
+    o_head_after: output core_types::<CFG>::FlPtr                              [CFG::RENAME_W + 1],
+    o_free      : output logic                   <core_types::<CFG>::FL_CNT_W>                    ,
+    o_chk       : output logic                   <2>                                              ,
+) {
+    import core_types::<CFG>::*;
+
+    const N   : u32 = if CLS == RegClass::INT ? FREE_INT_N : FREE_FP_N;
+    const CMN : u32 = CFG::COMMIT_W;
+    const CMW : u32 = tag_pkg::idx_w(CMN + 1);
+    const SUMW: u32 = FL_IDX_W + 2;
+
+    var ent_q : logic<PREG_W> [N];
+    var head_q: FlPtr            ;
+    var tail_q: FlPtr            ;
+
+    // p advanced by k <= N positions in the ring of N entries.
+    function fl_add (
+        p: input FlPtr      ,
+        k: input logic<SUMW>,
+    ) -> FlPtr {
+        var s: logic<SUMW>;
+        var r: FlPtr      ;
+        s = (p.idx as SUMW) + k;
+        if s >= N {
+            r.wrap = ~p.wrap;
+            r.idx  = (s - N) as FL_IDX_W;
+        } else {
+            r.wrap = p.wrap;
+            r.idx  = s as FL_IDX_W;
+        }
+        return r;
+    }
+
+    for k in 0..CFG::RENAME_W + 1 :g_ha {
+        assign o_head_after[k] = fl_add(head_q, k as SUMW);
+    }
+    for k in 0..CFG::RENAME_W :g_pop {
+        assign o_pop[k] = ent_q[o_head_after[k].idx];
+    }
+
+    assign o_free = if head_q.wrap == tail_q.wrap ?
+        (tail_q.idx - head_q.idx) as FL_CNT_W
+    :
+        (N - head_q.idx + tail_q.idx) as FL_CNT_W
+    ;
+
+    // Pushes: lane l of this class goes to tail + (its rank among pushes).
+    var push: logic<CFG::COMMIT_W>;
+    always_comb {
+        for l in 0..CFG::COMMIT_W {
+            push[l] = i_rel[l].retire && i_rel[l].has_rd && i_rel[l].cls == CLS;
+        }
+    }
+    var rank: logic<CMW> [CFG::COMMIT_W];
+    always_comb {
+        tree_prefix_count::<CMN, CMW>(push << 1, rank);
+    }
+    let n_push: logic<CMW> = tree_popcount::<CMN, CMW>(push);
+
+    var ppos: FlPtr [CFG::COMMIT_W];
+    for l in 0..CFG::COMMIT_W :g_pp {
+        assign ppos[l] = fl_add(tail_q, rank[l] as SUMW);
+    }
+
+    var we: logic         [N];
+    var wd: logic<PREG_W> [N];
+    always_comb {
+        for e in 0..N {
+            we[e] = 1'b0;
+            wd[e] = 0;
+            for l in 0..CFG::COMMIT_W {
+                if push[l] && ppos[l].idx == e {
+                    we[e] = 1'b1;
+                    wd[e] = wd[e] | i_rel[l].old_pdst;
+                }
+            }
+        }
+    }
+
+    let tail_nx: FlPtr = fl_add(tail_q, n_push as SUMW);
+    let kill_fl: FlPtr = if CLS == RegClass::INT ? i_kill.fl_int : i_kill.fl_fp;
+
+    always_ff {
+        if_reset {
+            for e in 0..N {
+                ent_q[e] = (32 + e) as PREG_W;
+            }
+            head_q      = 0 as FlPtr;
+            tail_q.wrap = 1'b1;
+            tail_q.idx  = 0;
+        } else {
+            for e in 0..N {
+                if we[e] {
+                    ent_q[e] = wd[e];
+                }
+            }
+            tail_q = tail_nx;
+            if i_kill.valid && i_kill.full {
+                head_q.wrap = ~tail_nx.wrap;
+                head_q.idx  = tail_nx.idx;
+            } else if i_kill.valid {
+                head_q = kill_fl;
+            } else {
+                head_q = fl_add(head_q, i_pop_n as SUMW);
+            }
+        }
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_free_list::<CFG> #(
+            N: N,
+        ) (
+            clk           ,
+            rst           ,
+            i_ent : ent_q ,
+            i_head: head_q,
+            i_tail: tail_q,
+            i_push: push  ,
+            i_rel         ,
+            o_chk         ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    {
+        assign o_chk = 2'b0;
+    }
+}

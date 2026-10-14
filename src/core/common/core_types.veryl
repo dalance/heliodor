@@ -70,6 +70,25 @@ pub package core_types::<CFG: core_cfg> {
         return c;
     }
 
+    // The IQ that receives ops of FU kind k: the memory IQ for memory kinds,
+    // else the IQ of the exec ports carrying k (one IQ per kind, CFG_ERR bit
+    // 13). N_IQ when no IQ takes k (NONE completes at dispatch).
+    function fu_iq (
+        k: input FuKind,
+    ) -> u32 {
+        var q: u32;
+        q = CFG::N_IQ;
+        if k == FuKind::LOAD || k == FuKind::STORE || k == FuKind::ATOMIC {
+            q = CFG::MEM_IQ;
+        }
+        for p in 0..CFG::ISSUE_W {
+            if CFG::PORT_FU[p][k] {
+                q = CFG::PORT_IQ[p];
+            }
+        }
+        return q;
+    }
+
     // Resolves per cycle, = FTQ PC read ports.
     const BRU_N: u32 = port_count(FuKind::BRU);
 
@@ -184,6 +203,197 @@ pub package core_types::<CFG: core_cfg> {
         return k.valid && (k.full || tag_older::<ROB_TAG_W>(k.keep, t));
     }
 
+    // ---- Front end to decode ----
+
+    // extract -> decode, one per lane.
+    struct XOp {
+        ftq       : FtqTag                 ,
+        foff      : logic          <FOFF_W>,
+        pc        : logic          <64>    ,
+        insn      : logic          <32>    , // expanded form
+        cinsn     : logic          <16>    , // raw RVC parcel
+        is_rvc    : logic                  ,
+        pred_taken: logic                  , // this op is its block's predicted taken exit
+        exc       : exc_pkg::ExcRec        , // fetch fault only
+    }
+
+    // ---- Decode, rename and dispatch ----
+
+    // Credit widths: a count from 0 to the ring size.
+    const ROB_CNT_W: u32 = tag_pkg::idx_w(CFG::ROB_N + 1);
+    const LQ_CNT_W : u32 = tag_pkg::idx_w(CFG::LQ_N + 1);
+    const SQ_CNT_W : u32 = tag_pkg::idx_w(CFG::SQ_N + 1);
+    const FL_CNT_W : u32 = tag_pkg::idx_w((if FREE_INT_N >: FREE_FP_N ? FREE_INT_N : FREE_FP_N) + 1);
+    const IQ_CNT_W : u32 = 9; // IQ_N[q] < 512, checked by CFG_ERR bit 17
+    const TAKE_W   : u32 = tag_pkg::idx_w(CFG::RENAME_W + 1); // lanes taken per cycle
+    const RAT_N    : u32 = 64; // {RegClass, arch} keys
+
+    // Architectural register operand; `used` is 0 for absent operands.
+    struct ArchSrc {
+        used: logic      ,
+        rcls: RegClass   ,
+        arch: logic   <5>,
+    }
+    struct ArchDst {
+        has_rd: logic      , // 0 for x0 and ops without a destination
+        rcls  : RegClass   ,
+        arch  : logic   <5>,
+    }
+
+    // decode -> rq -> rename/dispatch. imm holds the sign-extended low 32 bits
+    // of the immediate; CSR ops pack {uimm, csr} as imm[16:12], imm[11:0].
+    // FU operand convention: an unused rs1 reads as 0, an unused rs2 as imm.
+    struct DecOp {
+        insn      : logic          <32>    ,
+        is_rvc    : logic                  ,
+        ftq       : FtqTag                 ,
+        foff      : logic          <FOFF_W>,
+        pred_taken: logic                  ,
+        cls       : OpClass                ,
+        uop       : logic          <UOP_W> ,
+        rs1       : ArchSrc                ,
+        rs2       : ArchSrc                ,
+        rs3       : ArchSrc                ,
+        dst       : ArchDst                ,
+        imm       : logic          <32>    ,
+        rm        : logic          <3>     ,
+        exc       : exc_pkg::ExcRec        ,
+    }
+
+    // rename -> dispatch, per lane. grp[s] marks a source produced by an
+    // older lane of the same group (its busy bit belongs to the previous
+    // owner, so it starts not ready).
+    struct RenOut {
+        ps1     : PReg         ,
+        ps2     : PReg         ,
+        ps3     : PReg         ,
+        grp     : logic<3>     ,
+        pdst    : PReg         ,
+        old_pdst: logic<PREG_W>,
+    }
+
+    // rob -> rename, youngest lane first within a batch.
+    struct WalkLane {
+        valid   : logic           ,
+        cls     : RegClass        ,
+        rd_arch : logic   <5>     ,
+        old_pdst: logic   <PREG_W>,
+    }
+
+    // commit -> rename (arch RAT) and free_list (old_pdst release), per lane.
+    struct RenCm {
+        retire  : logic           ,
+        has_rd  : logic           ,
+        cls     : RegClass        ,
+        arch    : logic   <5>     ,
+        pdst    : logic   <PREG_W>,
+        old_pdst: logic   <PREG_W>,
+    }
+
+    // Ring positions just after an op's allocation; rob keeps one per entry.
+    struct DispSnap {
+        lq_tail: LqTag ,
+        sq_tail: SqTag ,
+        fl_int : FlPtr ,
+        fl_fp  : FlPtr ,
+        bar_seq: BarSeq,
+    }
+
+    struct ExTag {
+        rob   : RobTag,
+        pdst  : PReg  ,
+        has_rd: logic ,
+    }
+
+    // dispatch -> rob, one per allocated lane.
+    struct RobAlloc {
+        done    : logic                  , // fu == NONE completes at dispatch
+        fu      : FuKind                 ,
+        drain   : logic                  ,
+        flush   : FlushKind              ,
+        alone   : logic                  ,
+        csr_wr  : logic                  ,
+        effect  : Effect                 ,
+        is_rvc  : logic                  ,
+        has_rd  : logic                  ,
+        cls     : RegClass               ,
+        rd_arch : logic          <5>     ,
+        pdst    : logic          <PREG_W>,
+        old_pdst: logic          <PREG_W>,
+        lq      : LqTag                  ,
+        lq_v    : logic                  ,
+        sq      : SqTag                  ,
+        sq_v    : logic                  ,
+        ftq     : FtqTag                 ,
+        foff    : logic          <FOFF_W>,
+        insn    : logic          <32>    ,
+        exc     : exc_pkg::ExcRec        ,
+        snap    : DispSnap               ,
+    }
+
+    struct IqSrc {
+        used: logic,
+        pr  : PReg ,
+        rdy : logic,
+    }
+
+    // dispatch -> iq, compacted: slot i of IQ q holds the i-th op bound for q.
+    struct IqAlloc {
+        tag       : ExTag         ,
+        fu        : FuKind        ,
+        uop       : logic <UOP_W> ,
+        s1        : IqSrc         ,
+        s2        : IqSrc         ,
+        s3        : IqSrc         ,
+        nonspec   : logic         ,
+        imm       : logic <32>    ,
+        rm        : logic <3>     ,
+        ftq       : FtqTag        ,
+        foff      : logic <FOFF_W>,
+        pred_taken: logic         ,
+        lq        : LqTag         ,
+        lq_v      : logic         ,
+        sq        : SqTag         ,
+        sq_v      : logic         ,
+        bar_w     : BarSeq        , // ld_barrier ops dispatched before this op
+    }
+
+    // dispatch -> lq / sq, compacted in program order; the queue assigns
+    // o_alloc_tag[i] to slot i.
+    struct LqAlloc {
+        ex    : ExTag        ,
+        fu    : FuKind       ,
+        uop   : logic <UOP_W>,
+        sq_lim: SqTag        , // first SQ position younger than the load
+    }
+    struct SqAlloc {
+        rob   : RobTag       ,
+        fu    : FuKind       ,
+        uop   : logic <UOP_W>,
+        lq_lim: LqTag        , // first LQ position younger than the store
+    }
+
+    // Registered event wires (o_perf).
+    struct DecPerf {
+        illegal: logic, // a lane carries a decode-raised exception
+        rq_full: logic, // decode held a group because rq was full
+    }
+    struct RenPerf {
+        walk_start  : logic, // partial kill without a checkpoint
+        walk_cyc    : logic, // a walk lane was applied
+        full_restore: logic, // spec RAT := arch RAT
+    }
+    struct DispPerf {
+        cut_rob   : logic, // first refused lane, per missing credit
+        cut_iq    : logic,
+        cut_lq    : logic,
+        cut_sq    : logic,
+        cut_int   : logic,
+        cut_fp    : logic,
+        kill_stall: logic,
+        walk_stall: logic,
+    }
+
     // ---- Structural constraints ----
 
     // One bit per violated constraint; a legal config has CFG_ERR == 0.
@@ -255,6 +465,11 @@ pub package core_types::<CFG: core_cfg> {
         }
         if CFG::NUM_CKPT != 0 {
             e |= 1 << 16; // rename recovers by walk only until the checkpoint pool exists
+        }
+        for q in 0..CFG::N_IQ {
+            if CFG::IQ_N[q] >= 512 {
+                e |= 1 << 17; // IQ credits are IQ_CNT_W bits
+            }
         }
         return e;
     }
