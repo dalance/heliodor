@@ -303,6 +303,17 @@ H <order> <hash>
 
 ---
 
+### 4.8 実装で確定した規則 (M1a、`src/pkg/retire_pkg.veryl`、`tb/rvfi_tracer.veryl`、`tb/retire_mon.veryl`)
+
+- mask と data: `mem_rmask`/`mem_wmask` は右詰めの 16 bit (16 B アクセスまで)、data は `_lo`/`_hi` の 64+64 bit。tracer は wdata を wmask のバイトで切り出してから印字・hash する。
+- 混合関数: `mix64` (splitmix64 の finalizer) は `retire_pkg` に、rolling の 1 段 `h' = mix64((h ^ w) + 0x9e3779b97f4a7c15)` は tracer に置く。版は `retire_pkg::TRACER_VER` (現在 1)。`retire_pkg` を変えたら golden 成果物を再生成する。
+- vector: §4.4 の形式に `V <vtype> <vl> <vstart> <wcnt> <vrf_hash>` を足す (vector op の record にだけ付く)。後から足すと TRACER_VER を上げることになるので最初から入れた。
+- ビット単位の MASK (付録 B の mhpmevent の bit 63、mip/sip の bit 13 など) は、そのビットを 0 にしてから印字・hash する。フィールド全体を `*` にするのはフィールド単位の MASK だけ。
+- rd=x0 の書き込みは record に出さない (rd_kind=INT かつ rd_addr=0 は「書き込みなし」)。`F` は fflags が 0 でないときだけ付ける。rd=x0 の load の `mem_rdata` の MASK は、trace に load の値を出さないので実装しない。
+- 終端: `retire_mon` が終端 record (tohost store、boot 系では x3:=0xAA) を lane ごとに示し、tracer はそこまでだけを hash する。cycles/instret もその record を含めて凍結する。終端が来ないテストは flush で H 行を出す。H 行の order は吸収した record 数。
+- `o_chk` は `{tb の sticky checker, retire 契約 checker}` の連結とする (OR ではない)。retire 契約 checker は lane の連続性、order の +1、trap が lane 0 だけであること、trap の後に record がないこと、IrqEvent の条件と order、trap record に副作用がないことを見る。
+- checkpoint ファイル: `[0]` TRACER_VER、`[1]` 間隔の log2、`[2]` 個数 n、`[3..3+n)` 各 checkpoint の hash、`[3+n]` 最終 count、`[4+n]` 最終 hash。版か間隔が合わなければ stale として fail にする。`CK_PRINT=1` で `K <count> <hash>` 行を出し、golden の checkpoint ファイルを作る。`canon.py` は R/T/I/H 以外の行を無視する。
+
 ## 5. invariant checker と発火カウンタ (設計書 §5.15)
 
 ### 5.1 invariant checker
