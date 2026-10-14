@@ -1,0 +1,347 @@
+// dcache_port_adapter: puts MEM_W logical memory ports on the single
+// physical path of the reused dcache, with the final request/response/event
+// types of the memory port contract
+//
+// Ports (timing contract):
+//   i_req_valid[p], i_req[p] : cycle A; o_req_ready is the constant 1. A
+//                     request that does not get the physical path this cycle
+//                     is answered RETRY(BANK_CONFLICT)
+//   o_resp[p]       : registered, exactly RESP_LAT = 2 cycles after A, one per
+//                     request
+//   o_evt           : registered, one cycle after the dcache state it reports,
+//                     at most one per cycle; an event in the cycle of a
+//                     response counts as after it
+//   i_p0_resv_next  : registered in mem_port_arb, high in the cycle before a
+//                     non-pipe client's request on port 0: the fold group is
+//                     turned away so the B position is free for it
+//   o_dc_*          : the dcache main port and its Stage-A fold read
+//   i_dc_*          : dcache outputs of this cycle (decision inputs)
+//   i_inv*, i_ev*   : remote invalidates and local departures of this cycle
+//   i_kill          : applied to the held request by its MemTag.rob
+// Owns:
+//   - the response of a request accepted at A is decided at V = A + 1 from the
+//     dcache outputs of V, by the first matching row:
+//       1 killed -> RETRY(PREEMPTED); 2 invalidate race (at A or V) ->
+//       RETRY(INV_RACE); 3 hit -> HIT; 4 the critical word of the fill of its
+//       line -> HIT; 5 a fill of its line -> MISS(that fill); 6 another fill ->
+//       RETRY(FILL_BUSY); 7/8 a transient stall or a miss -> MISS(gen) and the
+//       request is held (HOLD)
+//   - a held request presents itself non-folded every cycle until a fill
+//     starts (its own or not: MISS(gen) names the next fill), it is killed, or
+//     it hits without a fill; the last case advances gen and broadcasts
+//     FILL_ABORT(gen), so every MISS(g) is followed by FILL_DONE(g) or
+//     FILL_ABORT(g)
+//   - fill attribution is by line and fill_id only, never by who drives the port
+// Rationale:
+//   - one held request doubles as the single MSHR of the reused dcache; a
+//     fill's line and demanded dword come from the dcache's fill entry
+//   - a 2-dword load folds like a 1-dword one: both dwords come from the same
+//     registered line
+//   - of two simultaneous requests the older op wins (unless port 0 is
+//     reserved), so the machine's oldest load never loses a conflict
+pub module dcache_port_adapter::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill,
+
+    i_req_valid   : input  logic                        [CFG::MEM_W],
+    i_req         : input  core_types::<CFG>::MemReq    [CFG::MEM_W],
+    o_req_ready   : output logic                        [CFG::MEM_W],
+    o_resp        : output core_types::<CFG>::MemResp   [CFG::MEM_W],
+    o_evt         : output core_types::<CFG>::MemEvent              ,
+    i_p0_resv_next: input  logic                                    ,
+
+    o_dc_addr      : output logic<64>,
+    o_dc_ren       : output logic    ,
+    o_dc_ren_folded: output logic    ,
+    o_dc_addr_r    : output logic<64>,
+    o_dc_ren_r     : output logic    ,
+
+    i_dc_rdata          : input logic<64>              ,
+    i_dc_stall          : input logic                  ,
+    i_dc_data_valid     : input logic                  ,
+    i_dc_fill_rdata     : input logic<64>              ,
+    i_dc_fill_data_ready: input logic                  ,
+    i_dc_fill_complete  : input logic                  ,
+    i_dc_fill_aborted   : input logic                  ,
+    i_dc_fill_start     : input logic                  ,
+    i_dc_fill_start_line: input logic<58>              ,
+    i_dc_fill_start_off : input logic<3>               ,
+    i_dc_fill_busy      : input logic                  ,
+    i_dc_fill_line      : input logic<58>              ,
+    i_dc_fill_off       : input logic<3>               ,
+    i_dc_stall_terms    : input dcache_pkg::StallTerms ,
+    i_dc_dhit_used      : input logic                  ,
+    i_dc_dhit_rdata_next: input logic<64>              ,
+
+    i_inv_v    : input logic    ,
+    i_inv_addr : input logic<64>,
+    i_inv2_v   : input logic    ,
+    i_inv2_addr: input logic<64>,
+    i_ev1_v    : input logic    ,
+    i_ev1_addr : input logic<64>,
+    i_ev2_v    : input logic    ,
+    i_ev2_addr : input logic<64>,
+
+    #[ifdef(HELIODOR_CHK)]
+    o_chk: output logic<3>,
+
+    o_perf: output core_types::<CFG>::AdapterPerf,
+) {
+    import core_types::<CFG>::*;
+
+    const PW: u32 = tag_pkg::idx_w(CFG::MEM_W);
+
+    var slot_v_q    : logic    ;
+    var slot_first_q: logic    ; // this cycle is the decision cycle V
+    var slot_race_q : logic    ; // an invalidate or departure hit the line at A
+    var slot_miss_q : logic    ; // the held request saw its own miss
+    var slot_q      : MemReq   ;
+    var slot_port_q : logic<PW>;
+
+    var gen_q : FillId;
+    var fid_q : FillId;
+    var crit_q: logic ;
+    var resv_q: logic ;
+
+    var rej_q    : logic  [CFG::MEM_W];
+    var rej_tag_q: MemTag [CFG::MEM_W];
+    var resp_q   : MemResp [CFG::MEM_W];
+    var evt_q    : MemEvent;
+
+    // ---- the held request ----
+
+    let s_line: logic<50> = slot_q.pa[55:6];
+    let s_dw  : logic<3>  = slot_q.pa[5:3];
+    let s_1dw : logic     = slot_q.mask[15:8] == 8'd0;
+    let s_kill: logic     = slot_v_q && slot_q.tag.rob_v && killed(i_kill, slot_q.tag.rob);
+    let st    : dcache_pkg::StallTerms = i_dc_stall_terms;
+    let f_mine: logic     = i_dc_fill_line[49:0] == s_line;
+    let hit   : logic     = !i_dc_stall && i_dc_data_valid;
+
+    let r1 : logic = s_kill;
+    let r2 : logic = !r1 && (st.inv_race || st.dhit_c3_squash || st.dhit_cap_pre_q || slot_race_q);
+    let r3 : logic = !r1 && !r2 && hit && (s_1dw || i_dc_dhit_used);
+    let r4 : logic = !r1 && !r2 && !r3 && i_dc_fill_busy && f_mine && s_1dw && i_dc_fill_off == s_dw && i_dc_fill_data_ready;
+    let r5 : logic = !r1 && !r2 && !r3 && !r4 && i_dc_fill_busy && f_mine;
+    let r6 : logic = !r1 && !r2 && !r3 && !r4 && !r5 && i_dc_fill_busy;
+    let r78: logic = !r1 && !r2 && !r3 && !r4 && !r5 && !r6;
+
+    let at_v     : logic = slot_v_q && slot_first_q;
+    let at_hold  : logic = slot_v_q && !slot_first_q;
+    let v_hold   : logic = at_v && r78 && !i_dc_fill_start;
+    let empty_gen: logic = at_hold && hit && !i_dc_fill_start && !s_kill;
+    let h_release: logic = at_hold && (i_dc_fill_start || s_kill || hit);
+    let s_free   : logic = !slot_v_q || (at_v && !v_hold) || h_release;
+
+    // ---- acceptance at A ----
+
+    var cand  : logic<CFG::MEM_W>                    ;
+    var norob : logic<CFG::MEM_W>                    ;
+    var rtags : logic<ROB_TAG_W>       [CFG::MEM_W]  ;
+    var r_line: logic<50>              [CFG::MEM_W]  ;
+    var r_pa  : pma_pkg::Pa            [CFG::MEM_W]  ;
+    var r_mask: logic<16>              [CFG::MEM_W]  ;
+    var r_cl  : logic<4>               [CFG::MEM_W]  ;
+    var r_id  : logic<MEMID_W>         [CFG::MEM_W]  ;
+    var r_robv: logic<1>               [CFG::MEM_W]  ;
+    always_comb {
+        for p in 0..CFG::MEM_W {
+            cand[p]   = i_req_valid[p];
+            norob[p]  = i_req_valid[p] && !i_req[p].tag.rob_v;
+            rtags[p]  = {i_req[p].tag.rob.wrap, i_req[p].tag.rob.idx};
+            r_line[p] = i_req[p].pa[55:6];
+            r_pa[p]   = i_req[p].pa;
+            r_mask[p] = i_req[p].mask;
+            r_cl[p]   = i_req[p].tag.client;
+            r_id[p]   = i_req[p].tag.id;
+            r_robv[p] = i_req[p].tag.rob_v;
+        }
+    }
+    let open  : logic              = s_free && !i_p0_resv_next;
+    let win_oh: logic<CFG::MEM_W>  = if resv_q && cand[0] ? 1 : if norob != '0 ? tree_first::<CFG::MEM_W>(norob) : tree_oldest::<CFG::MEM_W, ROB_TAG_W>(cand, rtags);
+    let acc   : logic              = open && cand != '0;
+    let w_port: logic<PW>          = tree_onehot_enc::<CFG::MEM_W, PW>(win_oh);
+    let w_line: logic<50>          = tree_onehot_mux::<CFG::MEM_W, 50>(win_oh, r_line);
+    let w_pa  : pma_pkg::Pa        = tree_onehot_mux::<CFG::MEM_W, 56>(win_oh, r_pa);
+    let w_mask: logic<16>          = tree_onehot_mux::<CFG::MEM_W, 16>(win_oh, r_mask);
+    let w_rob : logic<ROB_TAG_W>   = tree_onehot_mux::<CFG::MEM_W, ROB_TAG_W>(win_oh, rtags);
+    var w_tag : MemTag             ;
+    always_comb {
+        w_tag.client   = tree_onehot_mux::<CFG::MEM_W, 4>(win_oh, r_cl) as MemClient;
+        w_tag.id       = tree_onehot_mux::<CFG::MEM_W, MEMID_W>(win_oh, r_id);
+        w_tag.rob_v    = tree_onehot_mux::<CFG::MEM_W, 1>(win_oh, r_robv);
+        w_tag.rob.wrap = w_rob[ROB_TAG_W - 1];
+        w_tag.rob.idx  = w_rob[ROB_TAG_W - 2:0];
+    }
+    let race_a: logic              = (i_inv_v && i_inv_addr[55:6] == w_line) || (i_inv2_v && i_inv2_addr[55:6] == w_line)
+        || (i_ev1_v && i_ev1_addr[55:6] == w_line) || (i_ev2_v && i_ev2_addr[55:6] == w_line);
+
+    for p in 0..CFG::MEM_W :g_rdy {
+        assign o_req_ready[p] = 1'b1;
+    }
+
+    assign o_dc_addr       = {8'd0, slot_q.pa};
+    assign o_dc_ren        = slot_v_q;
+    assign o_dc_ren_folded = at_v;
+    assign o_dc_addr_r     = {8'd0, w_pa};
+    assign o_dc_ren_r      = acc;
+
+    // ---- decision of V ----
+
+    var v_resp: MemResp;
+    always_comb {
+        v_resp.valid   = at_v;
+        v_resp.tag     = slot_q.tag;
+        v_resp.kind    = RespKind::MISS;
+        v_resp.reason  = RetryReason::BANK_CONFLICT;
+        v_resp.fill_id = gen_q;
+        v_resp.data    = {i_dc_dhit_rdata_next, i_dc_rdata};
+        if r1 {
+            v_resp.kind   = RespKind::RETRY;
+            v_resp.reason = RetryReason::PREEMPTED;
+        } else if r2 {
+            v_resp.kind   = RespKind::RETRY;
+            v_resp.reason = RetryReason::INV_RACE;
+        } else if r3 {
+            v_resp.kind = RespKind::HIT;
+        } else if r4 {
+            v_resp.kind = RespKind::HIT;
+            v_resp.data = {64'd0, i_dc_fill_rdata};
+        } else if r5 {
+            v_resp.fill_id = fid_q;
+        } else if r6 {
+            v_resp.kind   = RespKind::RETRY;
+            v_resp.reason = RetryReason::FILL_BUSY;
+        }
+    }
+
+    // ---- events ----
+
+    let crit_rise: logic = i_dc_fill_data_ready && !crit_q;
+    var evt_in: MemEvent;
+    always_comb {
+        evt_in.valid   = i_dc_fill_start || crit_rise || i_dc_fill_complete || i_dc_fill_aborted || empty_gen;
+        evt_in.fill_id = if i_dc_fill_start || empty_gen ? gen_q : fid_q;
+        evt_in.line    = if i_dc_fill_start ? i_dc_fill_start_line[49:0] : if empty_gen ? s_line : i_dc_fill_line[49:0];
+        evt_in.crit    = if i_dc_fill_start ? i_dc_fill_start_off : i_dc_fill_off;
+        evt_in.data    = i_dc_fill_rdata;
+        evt_in.kind    = if i_dc_fill_start ?
+            EvKind::FILL_START
+        : if crit_rise ?
+            EvKind::FILL_CRIT
+        : if i_dc_fill_complete ?
+            EvKind::FILL_DONE
+        :
+            EvKind::FILL_ABORT
+        ;
+    }
+
+    // ---- state ----
+
+    always_ff {
+        if_reset {
+            slot_v_q     = 1'b0;
+            slot_first_q = 1'b0;
+            slot_race_q  = 1'b0;
+            slot_miss_q  = 1'b0;
+            slot_port_q  = '0;
+            gen_q        = '0;
+            fid_q        = '0;
+            crit_q       = 1'b0;
+            resv_q       = 1'b0;
+            evt_q.valid  = 1'b0;
+            for p in 0..CFG::MEM_W {
+                rej_q[p]        = 1'b0;
+                resp_q[p].valid = 1'b0;
+            }
+        } else {
+            resv_q = i_p0_resv_next;
+            crit_q = i_dc_fill_data_ready;
+            evt_q  = evt_in;
+
+            if i_dc_fill_start {
+                fid_q = gen_q;
+                gen_q = gen_q + 1;
+            } else if empty_gen {
+                gen_q = gen_q + 1;
+            }
+
+            for p in 0..CFG::MEM_W {
+                resp_q[p]         = v_resp;
+                resp_q[p].valid   = 1'b0;
+                if rej_q[p] {
+                    resp_q[p].valid  = 1'b1;
+                    resp_q[p].tag    = rej_tag_q[p];
+                    resp_q[p].kind   = RespKind::RETRY;
+                    resp_q[p].reason = RetryReason::BANK_CONFLICT;
+                }
+                if at_v && slot_port_q == p {
+                    resp_q[p] = v_resp;
+                }
+                rej_q[p]     = i_req_valid[p] && !(acc && win_oh[p]);
+                rej_tag_q[p] = i_req[p].tag;
+            }
+
+            if acc {
+                slot_v_q     = 1'b1;
+                slot_first_q = 1'b1;
+                slot_race_q  = race_a;
+                slot_miss_q  = 1'b0;
+                slot_q.tag   = w_tag;
+                slot_q.cls   = MemCls::LOAD;
+                slot_q.pa    = w_pa;
+                slot_q.mask  = w_mask;
+                slot_q.wdata = '0;
+                slot_q.attr  = '0;
+                slot_port_q  = w_port;
+            } else if slot_v_q && !s_free {
+                slot_first_q = 1'b0;
+                if at_hold && st.nf_gap_stall {
+                    slot_miss_q = 1'b1;
+                }
+            } else {
+                slot_v_q = 1'b0;
+            }
+        }
+    }
+
+    assign o_resp = resp_q;
+    assign o_evt  = evt_q;
+
+    always_comb {
+        var bank: logic;
+        bank = 1'b0;
+        for p in 0..CFG::MEM_W {
+            bank |= i_req_valid[p] && !(acc && win_oh[p]);
+        }
+        o_perf.accept      = acc;
+        o_perf.b2b         = acc && at_v;
+        o_perf.hit         = at_v && r3;
+        o_perf.crit_hit    = at_v && r4;
+        o_perf.attach      = at_v && r5;
+        o_perf.hold        = v_hold;
+        o_perf.empty_gen   = empty_gen;
+        o_perf.r_fill_busy = at_v && r6;
+        o_perf.r_inv_race  = at_v && r2;
+        o_perf.r_preempted = at_v && r1;
+        o_perf.r_bank      = bank;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var c_src: logic<5>;
+        assign c_src = {empty_gen, i_dc_fill_aborted, i_dc_fill_complete, crit_rise, i_dc_fill_start};
+        inst u_chk: chk_mem_port::<CFG> (
+            clk                                         ,
+            rst                                         ,
+            i_req_valid                                 ,
+            i_req                                       ,
+            i_resp      : resp_q                        ,
+            i_ev_src    : c_src                         ,
+            i_miss_hit  : empty_gen && slot_miss_q      ,
+            o_chk                                       ,
+        );
+    }
+}

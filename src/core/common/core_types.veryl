@@ -184,6 +184,359 @@ pub package core_types::<CFG: core_cfg> {
         return k.valid && (k.full || tag_older::<ROB_TAG_W>(k.keep, t));
     }
 
+    // ---- Counts of the LSU queues ----
+
+    const LQ_CNT_W : u32 = tag_pkg::idx_w(CFG::LQ_N + 1);
+    const SQ_CNT_W : u32 = tag_pkg::idx_w(CFG::SQ_N + 1);
+    const SB_CNT_W : u32 = tag_pkg::idx_w(CFG::SB_N + 1);
+    const RN_CNT_W : u32 = tag_pkg::idx_w(CFG::RENAME_W + 1);
+    const ST_CNT_W : u32 = tag_pkg::idx_w(ST_RET_N + 1);
+    const MIQ_IDX_W: u32 = tag_pkg::idx_w(CFG::IQ_N[CFG::MEM_IQ]);
+
+    // ---- Execution completion (section 5.6) ----
+
+    struct ExTag {
+        rob   : RobTag,
+        pdst  : PReg  ,
+        has_rd: logic ,
+    }
+
+    struct WbPacket {
+        valid : logic           ,
+        tag   : ExTag           ,
+        data  : logic    <64>   ,
+        exc   : exc_pkg::ExcRec ,
+        fflags: logic    <5>    ,
+        br    : BrResolve       ,
+    }
+
+    // ---- Memory port (section 5.9) ----
+
+    // M1-M2: the adapter's fill generation; every holder compares by equality.
+    const FILL_ID_W: u32 = 4;
+    type FillId = logic<FILL_ID_W>;
+
+    const MEMID_W: u32 = if LQ_TAG_W >: SQ_TAG_W ? (if LQ_TAG_W >: FTQ_TAG_W ? LQ_TAG_W : FTQ_TAG_W) : (if SQ_TAG_W >: FTQ_TAG_W ? SQ_TAG_W : FTQ_TAG_W);
+
+    enum MemClient: logic<4> {
+        LQ,
+        SQ,
+        PTW_D,
+        PTW_I,
+        AD,
+        ATOMIC,
+        IO,
+        IFU,
+        VU,
+    }
+
+    enum MemCls: logic<3> {
+        LOAD, // one line, up to two adjacent dwords
+        LOAD_EXCL, // AMO/LR read with ownership
+        UNC_READ,
+        PTW_READ,
+        STORE_WT,
+        STORE_EXCL,
+        CMO,
+    }
+
+    enum RespKind: logic<3> {
+        HIT,
+        MISS,
+        RETRY,
+        EXCL_PASS,
+        EXCL_FAIL,
+        PENDING,
+    }
+
+    enum RetryReason: logic<3> {
+        FILL_BUSY,
+        INV_RACE,
+        PREEMPTED,
+        WB_BLOCKED,
+        BANK_CONFLICT,
+    }
+
+    enum EvKind: logic<3> {
+        FILL_START,
+        FILL_CRIT,
+        FILL_DONE,
+        FILL_ABORT,
+        UNC_DONE,
+        WT_DONE,
+    }
+
+    struct MemTag {
+        client: MemClient        ,
+        id    : logic  <MEMID_W> , // the requester's queue tag, zero-extended
+        rob_v : logic            , // rob names the owner op (back-end clients)
+        rob   : RobTag           ,
+    }
+
+    struct MemReq {
+        tag  : MemTag          ,
+        cls  : MemCls          ,
+        pa   : pma_pkg::Pa     ,
+        mask : logic   <16>    , // bytes of dwords pa[5:3] and pa[5:3]+1, inside one line
+        wdata: logic   <128>   ,
+        attr : pma_pkg::PmaAttr,
+    }
+
+    // Exactly RESP_LAT cycles after accept, one per accepted request.
+    struct MemResp {
+        valid  : logic           ,
+        tag    : MemTag          ,
+        kind   : RespKind        ,
+        data   : logic      <128>, // dwords pa[5:3] and pa[5:3]+1
+        fill_id: FillId          ,
+        reason : RetryReason     ,
+    }
+
+    // Broadcast; an event in the same cycle as a response counts as after it.
+    struct MemEvent {
+        valid  : logic      ,
+        fill_id: FillId     ,
+        line   : logic <50> , // PA[55:6]
+        crit   : logic <3>  ,
+        kind   : EvKind     ,
+        data   : logic <64> ,
+    }
+
+    // ---- LSU (section L) ----
+
+    enum LqState: logic<3> {
+        ISSUE,
+        INFLIGHT,
+        PARK,
+        READY,
+        DONE,
+    }
+
+    enum ParkWhy: logic<3> {
+        FILL,
+        BUSY,
+        XLATE,
+        SQ,
+        AQ,
+        HEAD,
+        DBIT, // SQ only
+    }
+
+    // Decoded memory micro-op, carried by the memory IQ, LQ and SQ.
+    struct MemOp {
+        st  : logic   , // store (STA + STD); load otherwise
+        size: logic<2>, // log2 bytes
+        sgn : logic   , // load: sign-extend
+        fp  : logic   , // load: NaN-box below 64 bits
+    }
+
+    // Memory IQ grant for one pipe (select cycle S). For a load, sq is its
+    // sq_lim; for a store, lq is its lq_lim.
+    struct MemIssue {
+        valid: logic           ,
+        entry: logic<MIQ_IDX_W>, // IQ entry, returned by the release at m0
+        tag  : ExTag           ,
+        op   : MemOp           ,
+        imm  : logic<12>       ,
+        lq   : LqTag           ,
+        sq   : SqTag           ,
+        src1 : PReg            , // address base
+        src2 : PReg            , // store data (INT or FP)
+    }
+
+    // A pass re-entered at m0 from the LQ or SQ: the op is identified the
+    // same way as MemIssue, its address is the stored VA.
+    struct MemReissue {
+        valid: logic       ,
+        tag  : ExTag       ,
+        op   : MemOp       ,
+        va   : logic<64>   ,
+        half : logic       , // the hi-line pass of a line-crossing access
+        lq   : LqTag       ,
+        sq   : SqTag       ,
+    }
+
+    struct LqAlloc {
+        valid : logic,
+        tag   : LqTag,
+        ex    : ExTag,
+        op    : MemOp,
+        sq_lim: SqTag,
+    }
+
+    struct SqAlloc {
+        valid : logic ,
+        tag   : SqTag ,
+        rob   : RobTag,
+        op    : MemOp ,
+        lq_lim: LqTag ,
+    }
+
+    // m2 query of the PA-keyed forwarding network (one line, dwords dw..dw+1).
+    struct FwdQuery {
+        valid : logic     ,
+        line  : logic <50>,
+        dw    : logic <3> ,
+        mask  : logic <16>,
+        sq_lim: SqTag     , // only SQ entries older than this are candidates
+    }
+
+    // Answer of one forwarding source in the query's 16-byte window.
+    struct FwdPart {
+        cov    : logic<16> ,
+        data   : logic<128>,
+        wt     : logic     , // a covering entry cannot supply its data yet (`wait` is an SV keyword)
+        wait_sq: SqTag     ,
+    }
+
+    // Store address write (and store-resolve scan request). For the lo half
+    // mask is the full 16-byte window, so bits past the line mark a crossing.
+    struct StaWrite {
+        valid : logic           ,
+        sq    : SqTag           ,
+        lq_lim: LqTag           ,
+        half  : logic           ,
+        va    : logic       <64>, // VA of the access (both halves)
+        line  : logic       <50>,
+        dw    : logic       <3> ,
+        mask  : logic       <16>,
+        attr  : pma_pkg::PmaAttr,
+        exc   : exc_pkg::ExcRec ,
+    }
+
+    // Store data write: the store's bytes placed in the 16-byte window of its
+    // lo half (rs2 shifted by the byte offset).
+    struct StdWrite {
+        valid: logic      ,
+        sq   : SqTag      ,
+        data : logic<128> ,
+    }
+
+    // m2 forward snapshot of a load pass: the bytes it read, for the scans.
+    struct LqSnap {
+        valid: logic     ,
+        lq   : LqTag     ,
+        half : logic     ,
+        line : logic <50>,
+        dw   : logic <3> ,
+        mask : logic <16>,
+    }
+
+    // Outcome of a load pass at m2 + RESP_LAT.
+    struct LqVerdict {
+        valid   : logic    ,
+        lq      : LqTag    ,
+        state   : LqState  , // PARK, READY or DONE
+        why     : ParkWhy  ,
+        fill_id : FillId   ,
+        sq_key  : SqTag    ,
+        split_lo: logic    , // lo pass of a line-crossing load: keep lo_data, next pass is hi
+        lo_data : logic<64>,
+        va      : logic<64>, // VA of the access, for re-issue and the commit window
+        io      : logic    , // not cacheable: io_unit executes it, the scans skip it
+        io_ord  : logic    , // attr.io_ordered
+    }
+
+    // Commit windows: registered state of the oldest entries.
+    struct LqWin {
+        valid : logic          ,
+        tag   : LqTag          ,
+        poison: logic          ,
+        io    : logic          , // attr.io_ordered (commit's alone_eff)
+        va    : logic      <64>,
+        pa    : pma_pkg::Pa    ,
+        size  : logic      <2> ,
+    }
+
+    struct SqWin {
+        valid    : logic          ,
+        tag      : SqTag          ,
+        retire_ok: logic          , // addr_v && data_v of every half
+        io       : logic          ,
+        split    : logic          , // pushes two lines
+        va       : logic      <64>,
+        pa       : pma_pkg::Pa    ,
+        size     : logic      <2> ,
+        wdata    : logic      <64>, // right-aligned store data
+    }
+
+    // One committed line pushed into the store buffer.
+    struct SbPush {
+        valid: logic      ,
+        line : logic<50>  ,
+        data : logic<512> ,
+        strb : logic<64>  ,
+    }
+
+    struct LoadFence {
+        valid: logic ,
+        seq  : BarSeq,
+    }
+
+    // Coherence events seen by the CoRR scan: inv, inv2, evict1, evict2.
+    const COH_N: u32 = 4;
+
+    // ---- Firing events (o_perf) ----
+
+    struct MemPipePerf {
+        issue    : logic, // a pass entered m0
+        reissue  : logic,
+        fwd_full : logic, // every byte of a load pass forwarded
+        fwd_part : logic,
+        fwd_wait : logic,
+        split    : logic, // a line-crossing pass
+        fault    : logic,
+        hit      : logic,
+        miss     : logic,
+        retry    : logic,
+    }
+
+    struct LqPerf {
+        poison_sta: logic,
+        poison_coh: logic,
+        park_fill : logic,
+        park_busy : logic,
+        park_sq   : logic,
+        park_head : logic,
+        reissue   : logic,
+        fence_ret : logic,
+    }
+
+    struct SqPerf {
+        sta     : logic,
+        reissue : logic,
+        retire  : logic,
+        fwd_wait: logic,
+    }
+
+    struct SbPerf {
+        merge : logic,
+        alloc : logic,
+        full  : logic,
+        urgent: logic,
+        drain : logic,
+    }
+
+    struct ArbPerf {
+        lq_win: logic,
+        sq_win: logic,
+        lq_blk: logic, // an LQ request lost or waited for its WB slot
+    }
+
+    struct AdapterPerf {
+        accept     : logic,
+        b2b        : logic, // accept in the decision cycle of the previous request
+        hit        : logic,
+        crit_hit   : logic, // row 4, early completion from the critical word
+        attach     : logic,
+        hold       : logic, // entered HOLD
+        empty_gen  : logic,
+        r_fill_busy: logic,
+        r_inv_race : logic,
+        r_preempted: logic,
+        r_bank     : logic,
+    }
+
     // ---- Structural constraints ----
 
     // One bit per violated constraint; a legal config has CFG_ERR == 0.

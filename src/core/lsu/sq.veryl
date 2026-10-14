@@ -1,0 +1,392 @@
+// sq: store queue; uncommitted stores with their address (STA) and data (STD),
+// the SQ part of the forwarding network, and the push of retired stores
+//
+// Ports (timing contract):
+//   i_alloc[RENAME_W] : per dispatch lane, valid for the stores of the group,
+//                       each with its tag from o_alloc_tag; never valid in a
+//                       kill cycle
+//   o_free, o_alloc_tag[RENAME_W+1] : registered state only
+//   i_sta[MEM_W], i_std[MEM_W] : m2 of each pipe, written on the edge
+//   i_fwd_q[MEM_W] -> o_fwd[MEM_W] : combinational, against registered entries
+//   o_reissue         : registered; the oldest store whose hi-line pass is
+//                       pending; i_reissue_gnt in the same cycle takes it
+//   o_win[MEM_W]      : from registered state, the MEM_W oldest entries;
+//                       commit selects by tag equality
+//   i_retire_cnt      : stores retired this cycle (the first entries of
+//                       o_win); o_push carries their lines in the same cycle
+//   o_head            : registered; entries older than it have left the SQ
+//   i_kill            : tail := kill.sq_tail (partial) or empty (full)
+// Owns:
+//   - only uncommitted stores are here: a store leaves on the edge of its
+//     retire, the same edge that pushes its lines into sb, so it is visible
+//     to forwarding in exactly one of the two in every cycle
+//   - a store is retirable (retire_ok) only once every half has its address
+//     and its data; the two halves of a crossing store are written to sb
+//     together
+// Rationale:
+//   - forwarding picks per byte the youngest covering store older than the
+//     load's sq_lim with a log-depth tree, so any SQ_N works
+pub module sq::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill,
+
+    i_alloc    : input  core_types::<CFG>::SqAlloc [CFG::RENAME_W]    ,
+    o_free     : output logic<core_types::<CFG>::SQ_CNT_W>             ,
+    o_alloc_tag: output core_types::<CFG>::SqTag   [CFG::RENAME_W + 1],
+
+    i_sta: input core_types::<CFG>::StaWrite [CFG::MEM_W],
+    i_std: input core_types::<CFG>::StdWrite [CFG::MEM_W],
+
+    i_fwd_q: input  core_types::<CFG>::FwdQuery [CFG::MEM_W],
+    o_fwd  : output core_types::<CFG>::FwdPart  [CFG::MEM_W],
+
+    o_reissue    : output core_types::<CFG>::MemReissue,
+    i_reissue_gnt: input  logic                        ,
+
+    o_win       : output core_types::<CFG>::SqWin  [CFG::MEM_W]               ,
+    i_retire_cnt: input  logic<core_types::<CFG>::ST_CNT_W>                    ,
+    o_push      : output core_types::<CFG>::SbPush [core_types::<CFG>::PUSH_W],
+    o_head      : output core_types::<CFG>::SqTag                             ,
+
+    #[ifdef(HELIODOR_CHK)]
+    o_chk: output logic<4>,
+
+    o_perf: output core_types::<CFG>::SqPerf,
+) {
+    import core_types::<CFG>::*;
+
+    const QN : u32 = CFG::SQ_N;
+    const QIW: u32 = SQ_IDX_W;
+
+    function sq_adv (
+        t: input SqTag    ,
+        k: input logic<32>,
+    ) -> SqTag {
+        var r: SqTag    ;
+        var s: logic<32>;
+        s = (t.idx as 32) + k;
+        if s >= QN {
+            r.idx  = (s - QN) as QIW;
+            r.wrap = ~t.wrap;
+        } else {
+            r.idx  = s as QIW;
+            r.wrap = t.wrap;
+        }
+        return r;
+    }
+
+    var head_q: SqTag;
+    var tail_q: SqTag;
+
+    var e_wrap : logic       [QN];
+    var e_rob  : RobTag      [QN];
+    var e_lqlim: LqTag       [QN];
+    var e_op   : MemOp       [QN];
+    var e_va   : logic<64>   [QN];
+    var e_line0: logic<50>   [QN];
+    var e_dw0  : logic<3>    [QN];
+    var e_m16  : logic<16>   [QN]; // bytes in the 16-byte window of the lo half
+    var e_line1: logic<50>   [QN];
+    var e_cross: logic       [QN];
+    var e_av0  : logic       [QN];
+    var e_av1  : logic       [QN];
+    var e_exc  : logic       [QN];
+    var e_io   : logic       [QN];
+    var e_data : logic<128>  [QN];
+    var e_dv   : logic       [QN];
+    var e_hrdy : logic       [QN]; // hi-line pass pending
+
+    var rsel_v_q: logic    ;
+    var rsel_q  : logic<QIW>;
+
+    // Line images of each half: bytes and data placed at their line offsets.
+    var lo_m64: logic<64>  [QN];
+    var hi_m64: logic<64>  [QN];
+    var lo_d  : logic<512> [QN];
+    var hi_d  : logic<512> [QN];
+    always_comb {
+        for e in 0..QN {
+            lo_m64[e] = {48'd0, e_m16[e]} << {e_dw0[e], 3'd0};
+            hi_m64[e] = {56'd0, e_m16[e][15:8]};
+            lo_d[e]   = {384'd0, e_data[e]} << {e_dw0[e], 6'd0};
+            hi_d[e]   = {448'd0, e_data[e][127:64]};
+        }
+    }
+
+    // ---- occupancy ----
+
+    let cnt: logic<32> = if head_q.wrap == tail_q.wrap ? (tail_q.idx as 32) - (head_q.idx as 32) : QN - (head_q.idx as 32) + (tail_q.idx as 32);
+    assign o_free = (QN - cnt) as SQ_CNT_W;
+    for k in 0..CFG::RENAME_W + 1 :g_atag {
+        assign o_alloc_tag[k] = sq_adv(tail_q, k);
+    }
+    assign o_head = head_q;
+
+    var dv   : logic<QN>;
+    var wrapv: logic<QN>;
+    var live : logic<QN>;
+    var tags : logic<SQ_TAG_W> [QN];
+    var rtags: logic<SQ_TAG_W> [QN]; // youngest-first order for tree_oldest
+    always_comb {
+        for e in 0..QN {
+            live[e]  = if head_q.wrap == tail_q.wrap ? (e >= head_q.idx && e <: tail_q.idx) : (e >= head_q.idx || e <: tail_q.idx);
+            tags[e]  = {e_wrap[e], e as QIW};
+            rtags[e] = {e_wrap[e], ~(e as QIW)};
+            dv[e]    = e_dv[e];
+            wrapv[e] = e_wrap[e];
+        }
+    }
+
+    var n_alloc: logic<32>;
+    always_comb {
+        var v: logic<CFG::RENAME_W>;
+        for l in 0..CFG::RENAME_W {
+            v[l] = i_alloc[l].valid;
+        }
+        n_alloc = tree_popcount::<CFG::RENAME_W, 32>(v);
+    }
+
+    // ---- forwarding ----
+
+    for p in 0..CFG::MEM_W :g_fwd {
+        var cov  : logic<16> [QN];
+        var dat  : logic<128>[QN];
+        var cand : logic<QN>      ;
+        always_comb {
+            for e in 0..QN {
+                let h0 : logic      = e_av0[e] && e_line0[e] == i_fwd_q[p].line;
+                let h1 : logic      = e_cross[e] && e_av1[e] && e_line1[e] == i_fwd_q[p].line;
+                let m64: logic<64>  = if h0 ? lo_m64[e] : if h1 ? hi_m64[e] : 64'd0;
+                let d  : logic<512> = if h0 ? lo_d[e] : hi_d[e];
+                cand[e] = live[e] && !e_io[e] && !e_exc[e] && tag_older::<SQ_TAG_W>(tags[e], {i_fwd_q[p].sq_lim.wrap, i_fwd_q[p].sq_lim.idx});
+                let sm : logic<64>  = m64 >> {i_fwd_q[p].dw, 3'd0};
+                let sd : logic<512> = d >> {i_fwd_q[p].dw, 6'd0};
+                cov[e]  = sm[15:0] & i_fwd_q[p].mask;
+                dat[e]  = sd[127:0];
+            }
+        }
+        var wait_b: logic<16>      ;
+        var wsel  : logic<QN> [16] ;
+        var f_cov : logic<16>      ;
+        var f_dat : logic<128>     ;
+        always_comb {
+            for b in 0..16 {
+                var c : logic<QN>     ;
+                var bd: logic<8> [QN];
+                for e in 0..QN {
+                    c[e]  = cand[e] && cov[e][b];
+                    bd[e] = dat[e][b * 8+:8];
+                }
+                wsel[b]          = tree_oldest::<QN, SQ_TAG_W>(c, rtags);
+                f_cov[b]         = c != '0;
+                f_dat[b * 8+:8]  = tree_onehot_mux::<QN, 8>(wsel[b], bd);
+                wait_b[b]        = (wsel[b] & ~dv) != '0;
+            }
+        }
+        let wfirst: logic<16>  = tree_first::<16>(wait_b);
+        let wsel_e: logic<QN>  = tree_onehot_mux::<16, QN>(wfirst, wsel);
+        always_comb {
+            o_fwd[p].cov          = f_cov;
+            o_fwd[p].data         = f_dat;
+            o_fwd[p].wt           = wait_b != 16'd0;
+            o_fwd[p].wait_sq.wrap = (wsel_e & wrapv) != '0;
+            o_fwd[p].wait_sq.idx  = tree_onehot_enc::<QN, QIW>(wsel_e);
+        }
+    }
+
+    // ---- hi-pass re-issue ----
+
+    var gnt_oh: logic<QN>;
+    var ready : logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            gnt_oh[e] = i_reissue_gnt && rsel_v_q && rsel_q == e;
+            ready[e]  = live[e] && e_hrdy[e] && !gnt_oh[e];
+        }
+    }
+    let sel_oh: logic<QN>  = tree_oldest::<QN, SQ_TAG_W>(ready, tags);
+    let sel_ix: logic<QIW> = tree_onehot_enc::<QN, QIW>(sel_oh);
+
+    always_comb {
+        o_reissue.valid       = rsel_v_q;
+        o_reissue.tag.rob     = e_rob[rsel_q];
+        o_reissue.tag.pdst    = '0;
+        o_reissue.tag.has_rd  = 1'b0;
+        o_reissue.op          = e_op[rsel_q];
+        o_reissue.va          = e_va[rsel_q];
+        o_reissue.half        = 1'b1;
+        o_reissue.lq          = e_lqlim[rsel_q];
+        o_reissue.sq.wrap     = e_wrap[rsel_q];
+        o_reissue.sq.idx      = rsel_q;
+    }
+
+    // ---- commit window and push ----
+
+    var w_ix : logic<QIW> [CFG::MEM_W];
+    var w_ret: logic<CFG::MEM_W>      ;
+    var w_x  : logic<CFG::MEM_W>      ; // retiring and crossing
+    for k in 0..CFG::MEM_W :g_win {
+        let wt : SqTag      = sq_adv(head_q, k);
+        let wsh: logic<128> = e_data[wt.idx] >> {e_va[wt.idx][2:0], 3'd0};
+        assign w_ix[k]  = wt.idx;
+        assign w_ret[k] = k <: i_retire_cnt;
+        assign w_x[k]   = w_ret[k] && e_cross[wt.idx];
+        always_comb {
+            o_win[k].valid     = k <: cnt;
+            o_win[k].tag       = wt;
+            o_win[k].retire_ok = e_av0[wt.idx] && e_av1[wt.idx] && e_dv[wt.idx];
+            o_win[k].io        = e_io[wt.idx];
+            o_win[k].split     = e_cross[wt.idx];
+            o_win[k].va        = e_va[wt.idx];
+            o_win[k].pa        = {e_line0[wt.idx], e_va[wt.idx][5:0]};
+            o_win[k].size      = e_op[wt.idx].size;
+            o_win[k].wdata     = wsh[63:0];
+        }
+    }
+
+    // Push port of entry k's lo line: k plus the crossing entries before it.
+    var w_off: logic<8> [CFG::MEM_W];
+    for k in 0..CFG::MEM_W :g_off {
+        let below: logic<CFG::MEM_W> = w_x & ((1 << k) - 1);
+        assign w_off[k] = (k as 8) + tree_popcount::<CFG::MEM_W, 8>(below);
+    }
+    for i in 0..PUSH_W :g_push {
+        var lo_sel: logic<CFG::MEM_W>;
+        var hi_sel: logic<CFG::MEM_W>;
+        var ld    : logic<512> [CFG::MEM_W];
+        var lm    : logic<64>  [CFG::MEM_W];
+        var ll    : logic<50>  [CFG::MEM_W];
+        always_comb {
+            for k in 0..CFG::MEM_W {
+                lo_sel[k] = w_ret[k] && w_off[k] == i;
+                hi_sel[k] = w_x[k] && w_off[k] + 8'd1 == i;
+                ld[k]     = if hi_sel[k] ? hi_d[w_ix[k]] : lo_d[w_ix[k]];
+                lm[k]     = if hi_sel[k] ? hi_m64[w_ix[k]] : lo_m64[w_ix[k]];
+                ll[k]     = if hi_sel[k] ? e_line1[w_ix[k]] : e_line0[w_ix[k]];
+            }
+        }
+        let sel: logic<CFG::MEM_W> = lo_sel | hi_sel;
+        assign o_push[i].valid = sel != '0;
+        assign o_push[i].line  = tree_onehot_mux::<CFG::MEM_W, 50>(sel, ll);
+        assign o_push[i].data  = tree_onehot_mux::<CFG::MEM_W, 512>(sel, ld);
+        assign o_push[i].strb  = tree_onehot_mux::<CFG::MEM_W, 64>(sel, lm);
+    }
+
+    // ---- state ----
+
+    let head_nx: SqTag = sq_adv(head_q, i_retire_cnt as 32);
+
+    always_ff {
+        if_reset {
+            head_q   = '0;
+            tail_q   = '0;
+            rsel_v_q = 1'b0;
+            rsel_q   = '0;
+            for e in 0..QN {
+                e_av0[e]  = 1'b0;
+                e_av1[e]  = 1'b0;
+                e_dv[e]   = 1'b0;
+                e_exc[e]  = 1'b0;
+                e_io[e]   = 1'b0;
+                e_hrdy[e] = 1'b0;
+                e_cross[e] = 1'b0;
+            }
+        } else {
+            head_q = head_nx;
+            if i_kill.valid {
+                tail_q = if i_kill.full ? head_nx : i_kill.sq_tail;
+            } else {
+                tail_q = sq_adv(tail_q, n_alloc);
+            }
+            rsel_v_q = (ready != '0) && !i_kill.valid;
+            rsel_q   = sel_ix;
+
+            for e in 0..QN {
+                if gnt_oh[e] {
+                    e_hrdy[e] = 1'b0;
+                }
+                for l in 0..CFG::RENAME_W {
+                    if i_alloc[l].valid && i_alloc[l].tag.idx == e {
+                        e_wrap[e]  = i_alloc[l].tag.wrap;
+                        e_rob[e]   = i_alloc[l].rob;
+                        e_lqlim[e] = i_alloc[l].lq_lim;
+                        e_op[e]    = i_alloc[l].op;
+                        e_av0[e]   = 1'b0;
+                        e_av1[e]   = 1'b0;
+                        e_dv[e]    = 1'b0;
+                        e_exc[e]   = 1'b0;
+                        e_io[e]    = 1'b0;
+                        e_hrdy[e]  = 1'b0;
+                        e_cross[e] = 1'b0;
+                    }
+                }
+                for p in 0..CFG::MEM_W {
+                    if i_sta[p].valid && i_sta[p].sq.idx == e {
+                        if i_sta[p].half {
+                            e_line1[e] = i_sta[p].line;
+                            e_av1[e]   = 1'b1;
+                            e_exc[e]   = e_exc[e] || i_sta[p].exc.valid;
+                            e_hrdy[e]  = 1'b0;
+                        } else {
+                            let x: logic = i_sta[p].dw == 3'd7 && i_sta[p].mask[15:8] != 8'd0;
+                            e_line0[e] = i_sta[p].line;
+                            e_dw0[e]   = i_sta[p].dw;
+                            e_m16[e]   = i_sta[p].mask;
+                            e_va[e]    = i_sta[p].va;
+                            e_cross[e] = x;
+                            e_av0[e]   = 1'b1;
+                            e_av1[e]   = !x || i_sta[p].exc.valid;
+                            e_exc[e]   = i_sta[p].exc.valid;
+                            e_io[e]    = !i_sta[p].attr.cacheable;
+                            e_hrdy[e]  = x && !i_sta[p].exc.valid;
+                        }
+                    }
+                    if i_std[p].valid && i_std[p].sq.idx == e {
+                        e_data[e] = i_std[p].data;
+                        e_dv[e]   = 1'b1;
+                    }
+                }
+            }
+        }
+    }
+
+    always_comb {
+        var w: logic;
+        var s: logic;
+        w = 1'b0;
+        s = 1'b0;
+        for p in 0..CFG::MEM_W {
+            w |= i_fwd_q[p].valid && o_fwd[p].wt;
+            s |= i_sta[p].valid;
+        }
+        o_perf.sta      = s;
+        o_perf.reissue  = i_reissue_gnt && rsel_v_q;
+        o_perf.retire   = i_retire_cnt != '0;
+        o_perf.fwd_wait = w;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var c_ok: logic<CFG::MEM_W>;
+        for k in 0..CFG::MEM_W :g_cok {
+            assign c_ok[k] = o_win[k].valid && o_win[k].retire_ok;
+        }
+        inst u_chk: chk_sq::<CFG> #(
+            N: QN,
+        ) (
+            clk                    ,
+            rst                    ,
+            i_kill                 ,
+            i_live  : live         ,
+            i_rob   : e_rob        ,
+            i_hrdy  : e_hrdy       ,
+            i_alloc                ,
+            i_win_ok: c_ok         ,
+            i_ret   : w_ret        ,
+            i_gnt   : gnt_oh       ,
+            o_chk                  ,
+        );
+    }
+}
