@@ -242,7 +242,7 @@ sweep の判定: 1 軸だけを増やし、他の軸を固定する。coremark/d
 | `FETCH_BYTES` (fetch block) | 8×FETCH_W | 16 | 32 | 【決定】非圧縮命令 FETCH_W 個分 (4×FETCH_W B) の 2 倍。block 内で開始位置がずれていても FETCH_W 命令を供給できる。icache の CPU ポートもこの幅に広げる (§F)。 |
 | WB ポート総数 | ISSUE_W+MEM_W | 3 | 8 | 【決定】§5.7 |
 | retire 数の幅 `RETIRE_CNT_W` | idx_w(COMMIT_W+1) | 2 | 3 | 【決定】 |
-| 1 サイクルに retire できる store 数 | MEM_W | 1 | 2 | 【決定】store は execute で 1 サイクルに最大 MEM_W 個しか生成されないため、それ以上 retire させても定常状態では得にならない。 |
+| 1 サイクルに retire できる store 数 `ST_RET_N` | MEM_W | 1 | 2 | 【決定】`core_types` の導出定数 `ST_RET_N` として出す (M1b)。store は execute で 1 サイクルに最大 MEM_W 個しか生成されないため、それ以上 retire させても定常状態では得にならない。 |
 | SB の push ポート数 `PUSH_W` (line 単位) | max(MEM_W, 2) | 2 | 2 | 【決定】line をまたぐ store は、retire のサイクルに 2 つの line を push する (§L)。 |
 | FTQ の PC 読出ポート数 | BRU ポート数 | 1 | 2 | 【決定】PC を FTQ から読むのは BRU ポートだけ (§F.3)。commit は PC を導出する (§C.2.3)。 |
 | commit-alone op | 1/cycle | 1 | 1 | 【決定】§5.12 |
@@ -311,9 +311,29 @@ VU に由来する行 (ROB ≤ 256 と 2 の冪、CDB の 2 lane snoop、alloc 1
 |---|---|---|
 | 支援構成 | `cfg_w2` と `cfg_w4` だけ | ゲートの梯子をすべて通す。 |
 | sweep 点 | 構造制約を満たす他の値 | elaborate でき、bench が走る。ゲートでの保証は無い。config パッケージは `tb/` に置く。 |
-| 拒否 | 構造制約に反する値 | elaborate 時に失敗させる。 |
+| 拒否 | 構造制約に反する値 | `test_cfg_constraints` を落とす (下記)。 |
 
-構造制約は、それを課すモジュールが `const` で宣言する (例: `MEM_W >= 1`, `ROB_N <= 256`, `ROB_N` は 2 の冪, `COMMIT_W >= 1`)。【M1a で決定】拒否の仕組みは spike (§3.7) で確定する。第一候補は、制約が偽のときに generate-if で未定義モジュールを instantiate し、`veryl check` を落とす方法。だめなら、全構成について制約定数を検査する `#[test] test_cfg_constraints` で代替する。
+【決定】(U6、§3.7.1) 構造制約は `core_types` の 1 つの bitmask 定数 `CFG_ERR` (制約 1 つに 1 bit、合法な構成では 0) にまとめ、`#[test] test_cfg_constraints` が全構成について `CFG_ERR == 0` を検査する。理由: 未定義モジュールの instantiate は generate 条件に関係なく常にエラーになり、elaborate 時の拒否が書けないため。各 bit が実際に立ちうることは、わざと違反させた構成 `cfg_bad_a`/`cfg_bad_b` (`tb/cfg_bad.veryl`) が期待どおりの bit を立てることで示す (2 つの和で全 bit を覆う)。制約を所有モジュールの側へ移すのは、その方がきれいになった場合に限る。M1b 時点の bit:
+
+| bit | 制約 | 理由 |
+|---|---|---|
+| 0 | `FETCH_W` ∈ {1, 2, 4} | icache の block と block あたり 1 回の ITLB lookup で fetch は 32 B が上限 (§3.4) |
+| 1 | `FETCH_BYTES == 8×FETCH_W` | §3.2 |
+| 2 | `RENAME_W`、`ISSUE_W`、`MEM_W`、`COMMIT_W` ≥ 1 | |
+| 3 | `ROB_N` ≤ 256、2 の冪、`ROB_N ≥ RENAME_W` | VU の 8 bit owner と `idx - head` (§3.4) |
+| 4 | `PRF_INT_N`、`PRF_FP_N` > 32 | free list が空にならない |
+| 5 | 1 ≤ `REISSUE_W` ≤ `MEM_W` | §3.3 |
+| 6 | `MSHR_N == 1` かつ `DC_NB == 1` | 新コアの N=4 boot まで fill は 1 本 (§2.5)。M3/M4 で緩める |
+| 7 | `DQ_N ≥ FETCH_W`、`RQ_N ≥ FETCH_W`、`RQ_N ≥ RENAME_W` | `lane_queue` は少なくとも 1 group を保持する |
+| 8 | `MEM_IQ < N_IQ` | §X.2 |
+| 9 | 各 IQ に issue ポートが 1 本以上 (`MEM_IQ` は memory pipe を数える)、`IQ_N[q] ≥ RENAME_W`、1 ≤ `IQ_NSRC[q]` ≤ 3 | |
+| 10 | `PORT_IQ[p] < N_IQ` かつ `PORT_IQ[p] != MEM_IQ` | `PORT_IQ` は exec ポートだけを表す (§X.2) |
+| 11 | `PORT_FU` に NONE、LOAD、STORE、ATOMIC、VEC を載せない | memory と dispatch で完了する種別は exec ポートに来ない |
+| 12 | 1 つのポートに DIV と FDIV を同時に載せない | HOLE_FILL の FU はポートに高々 1 つ (§X.2) |
+| 13 | 同じ FuKind を持つポートは同じ IQ に属する | op の行き先 IQ が種別だけで決まる (§R.5.1) |
+| 14 | SYS を持つポートはちょうど 1 本 | §X.8.3 |
+| 15 | ALU、BRU、MUL、DIV、FMA、FMISC、FDIV がそれぞれ 1 本以上のポートに載る | decode が出す exec 種別はどれも行き先を持つ |
+| 16 | `NUM_CKPT == 0` | checkpoint pool ができるまで walk だけで回復する (§R.7)。M3 で緩める |
 
 ### 3.6 構成の運び手 (Veryl)
 
@@ -350,7 +370,8 @@ pub proto package core_cfg {
     // FU topology (see sections 5.7 and X)
     const PORT_FU    : FuSet [ISSUE_W]; // FU set per exec issue port
     const PORT_IQ    : u32 [ISSUE_W];   // IQ feeding each exec issue port
-    const N_IQ       : u32;
+    const N_IQ       : u32;             // includes the memory IQ
+    const MEM_IQ     : u32;             // IQ feeding every memory pipe
     const IQ_N       : u32 [N_IQ];      // entries per IQ
     const IQ_NSRC    : u32 [N_IQ];      // source operands per IQ entry
 }
@@ -370,7 +391,7 @@ pub module heliodor_core_w2 ( /* same ports, concrete widths */ ) {
 ```
 
 - `core_cfg` に置く予測器の定数は、不透明な予測器型 (`PredMeta`, `PredCkpt`) の幅だけである。BTB のエントリ数、block あたりの slot 数、RAS の深さ、各部品のレイテンシなど予測器内部のサイズは `bpu_pkg::<CFG>` に置き、`bpu` だけが読む (§F)。
-- FU トポロジ表 (`PORT_FU`, `PORT_IQ`, `N_IQ`, `IQ_N[]`, `IQ_NSRC[]`) の意味と cfg_w2/cfg_w4 の値は §X が定める。構成によって変わるのはこの表だけである (§5.7)。
+- FU トポロジ表 (`PORT_FU`, `PORT_IQ`, `N_IQ`, `MEM_IQ`, `IQ_N[]`, `IQ_NSRC[]`) の意味と cfg_w2/cfg_w4 の値は §X が定める。構成によって変わるのはこの表だけである (§5.7)。
 - モジュール本体は、構成を先頭の `import core_types::<CFG>::*;` だけで受け取る。本体の中で `CFG::` を修飾して書くのは、子モジュールの instantiate (`inst u: rob::<CFG>`) とサイズの所有箇所だけ。この規則にしておけば、§3.7 の fallback への移行が機械的な書き換えで済む。
 - 構成に依存しない helper (`tag_pkg`, `tree_pkg`, `exc_pkg`, `pma_pkg`, `retire_pkg`, `fu_pkg`) は、通常の非 generic パッケージに置く。幅が必要なものは generic 関数 (`older::<W>`) にする。前例として `fpu_pkg::clz::<W>` が production で動いている。
 - 構成ごとの wrapper top (`heliodor_core_w2`, `heliodor_core_w4`) は、`veryl synth --top`、Verilator の SV wrapper、tb ハーネスに安定した名前を与える。generic モジュールは mangle された名前で emit されるので、外から直接名指ししない。
@@ -416,6 +437,7 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 - U7: 【決定】checker (`chk_*`) は `#[ifdef(HELIODOR_CHK)]` で囲み、`[test].defines` にだけ `HELIODOR_CHK` を入れる。`veryl synth` は define を渡さないので、synth からは自動的に外れる。Verilator でも `+define+HELIODOR_CHK` で有効にする。
 - `CORE` の既定値の切替 (検証計画 §2.5): バグ C の修正により、パッケージ const の `#[ifdef]` で切り替えられる。
 - U4: 【決定】新コアは `local/heliodor-fixes` の veryl を使う。旧コアはこのバイナリでも dhrystone/coremark がビット一致し、既定スイートも全通過した。
+- 【M1b で決定】次の 4 点は、M1b の最初の RTL が見つけて clone で修正中の veryl のバグの結果に従って決める: age helper の置き場所 (`tag_pkg` の中か、グローバル関数の `tag_age.veryl` か)、`core_types::killed()` が age 比較を helper の呼び出しにせず展開して書くかどうか、`tree_pkg` をパッケージにするかグローバル関数にするか、`tree_prefix_count` の戻り値を packed にするかどうか。修正が入った時点の挙動で決め、§5.2 と §5.15 をそれに合わせる。
 
 【決定】fallback: spike で (A) が成立しなかった場合は、`#[ifdef]` で選ぶ素のパッケージ `core_cfg` (1 回の veryl 起動で 1 構成、もう 1 構成は別の worktree/.build で回す) に切り替える。§3.6 の import 規則により、モジュール本体は変わらない。`#(param)` を全モジュールに通す方式 (旧コア流) は採らない。理由: struct のフィールド幅をパラメータに追従させられず、モジュール間でタグ幅の食い違いを許してしまうため。
 
@@ -570,6 +592,12 @@ const FTQ_IDX_W: u32 = tag_pkg::idx_w(CFG::FTQ_N);
 const PREG_W   : u32 = tag_pkg::idx_w(max(CFG::PRF_INT_N, CFG::PRF_FP_N));
 const CKPT_W   : u32 = tag_pkg::idx_w(CFG::NUM_CKPT);   // >= 1 even when NUM_CKPT = 0
 const FOFF_W   : u32 = tag_pkg::idx_w(CFG::FETCH_BYTES / 2);
+const ROB_TAG_W: u32 = ROB_IDX_W + 1;                  // full tag widths (wrap + index), the W of the
+const LQ_TAG_W : u32 = LQ_IDX_W + 1;                   // age helpers (section 5.2); likewise SQ_TAG_W, FTQ_TAG_W
+const FREE_INT_N: u32 = CFG::PRF_INT_N - 32;           // free-list sizes (section R.4)
+const FREE_FP_N : u32 = CFG::PRF_FP_N - 32;
+const FL_IDX_W : u32 = tag_pkg::idx_w(max(FREE_INT_N, FREE_FP_N)); // one FlPtr type for both classes
+const ST_RET_N : u32 = CFG::MEM_W;                      // stores retired per cycle (section 3.2)
 
 struct RobTag { wrap: logic, idx: logic<ROB_IDX_W> }
 struct LqTag  { wrap: logic, idx: logic<LQ_IDX_W>  }
@@ -577,7 +605,8 @@ struct SqTag  { wrap: logic, idx: logic<SQ_IDX_W>  }
 struct FtqTag { wrap: logic, idx: logic<FTQ_IDX_W> }
 enum   RegClass: logic { INT, FP }
 struct PReg   { cls: RegClass, idx: logic<PREG_W> }
-// also defined here: FlPtr (free-list pointer per RegClass), FillId (section 5.9),
+struct FlPtr  { wrap: logic, idx: logic<FL_IDX_W> }
+// also defined here: FillId (section 5.9),
 // MemTag (section 5.9), OpTag and Kill (sections 5.2, 5.4), ExTag and WbPacket (section 5.6)
 ```
 
@@ -591,7 +620,7 @@ struct PReg   { cls: RegClass, idx: logic<PREG_W> }
 
 | 型 | 中身 | 置き場所 |
 |---|---|---|
-| `FuKind`、`FuSet` | FU の種別 (§5.5) と、その bitset (`logic<FuKind の数>`)。`PORT_FU` の要素型。 | `opclass_pkg` |
+| `FuKind`、`FuSet`、`fu_bit` | FU の種別 (§5.5) と、その bitset (`logic<FuKind の数>`、bit k が FuKind k)。`PORT_FU` の要素型。`fu_bit(k)` は k だけを立てた FuSet。 | `opclass_pkg` |
 | `N_PORT` | 1 つの `iq` が受け持つ issue ポートの数。FU トポロジ表 (`PORT_IQ`) から導く。 | `core_types` |
 | `BrResolve` | `{valid, mispred, taken, next_pc: logic<64>, ftq: FtqTag, foff: logic<FOFF_W>}`。BRU の WB packet が運び、`rob.res` と `flush_ctrl` が読む。 | `core_types` |
 | `Effect` | retire 時の副作用の bitset `{FFLAGS, FS_DIRTY, VS_DIRTY, VXSAT, VCFG, VSTART}`。 | `opclass_pkg` |
@@ -603,8 +632,10 @@ struct PReg   { cls: RegClass, idx: logic<PREG_W> }
 | `TlbFill`、`TlbInv` | `ptw` から `tlb` への install と、retire 時の無効化 `{kind, va, asid, all_va, all_asid}` (§M.7、§C.2.5 の `XlateFlush` と同形)。 | `xlate_pkg` |
 | `BarSeq` | `ld_barrier` op の通し番号 (`logic<ROB_IDX_W+2>`、巡回)。Kill と dispatch snapshot が運ぶ (§L.10)。 | `core_types` |
 | `Target`、`AmoClass` | PMA 領域の種類 `{DRAM, ROM, IO}` と、許す atomic の範囲 `{NONE, LRSC, FULL}` (§5.11、§S.2)。 | `pma_pkg` |
-| `FlPtr` | free list のポインタ `{wrap, idx}` (§R.4)。Kill と dispatch snapshot がクラスごとに運ぶ。 | `core_types` |
 | `FillId` | fill の帰属 ID。M1-M2 は adapter の世代 `gen_q` (§M.2.5)、M3 からは `{idx, gen}` (§M.6.4)。LQ 側から見た型は変わらない (§5.9)。 | `core_types` |
+
+- 【決定】`FlPtr` は int と fp で 1 つの型とし、幅は `FL_IDX_W = idx_w(max(FREE_INT_N, FREE_FP_N))` とする。Kill と dispatch snapshot はクラスごとに別のフィールドで運ぶ (§5.4)。理由: リングの深さは 2 の冪でなくてよい (§5.2) ので、小さい側のリングは idx の上位が余るだけで済み、型を 1 つにできる。
+- 【決定】`opclass_pkg` は M1b の時点では `FuKind`、`FuSet`、`fu_bit` だけを持ち、`src/core/common/` に置く。`Effect`、`Budget`、`FlushKind`、`op_class()` は decode と一緒に足す。理由: `core_cfg` の `PORT_FU` が `FuSet` を使うので、構成の運び手より先に存在しなければならないため。
 
 型の定義は、上の 2 つの表のほか、契約を定める節か所有モジュールの節にある。所在の索引:
 
@@ -612,7 +643,7 @@ struct PReg   { cls: RegClass, idx: logic<PREG_W> }
 |---|---|
 | `OpTag` | §5.2 |
 | `Kill`、`Redirect` | §5.4 |
-| `RedirKind` | §C.4 (所有者 `flush_ctrl`) |
+| `RedirKind` | §5.4 (定義は `core_types`、生成者 `flush_ctrl`、値の意味は §C.4) |
 | `OpClass` | §5.5 |
 | `ExTag`、`WbPacket` | §5.6 |
 | `ExcRec` | §5.8 (`exc_pkg`) |
@@ -659,6 +690,7 @@ function next    ::<W: u32, N: u32>(t: input logic<W>) -> logic<W>;            /
   - ROB が出す oldest token `{valid, tag: RobTag}` (§5.12)。消費者は自分が運んでいるタグとの等値比較にだけ使う。
   - 取り消せない操作の started latch と、それを立てるタグ無しの `o_started` パルス (`fu_sys`、`io_unit`、`atomic_unit`、`sq` の D ビット経路、M5 の `vu_adapter`、§5.13.1)。パルスはタグを運ばず「いま token を持つ op」に帰属する。これが正しいのは、パルスを出せるのが token と等しいタグを持つ op の受理 edge だけだからである。checker `chk_oldest` が、パルスのサイクルに token が有効でそのタグが発生源の op のタグと等しいことと、`commit.head_started_q` が各 unit の latch の OR に等しいことを検査する。
 - 木の中の比較は段ごとに配列を持つ generate で書き、`older(older(..), ..)` のような同一関数の入れ子呼び出しはしない (§3.7)。
+- 【決定】`core_types` はタグ全体の幅 (wrap + index) を定数 `ROB_TAG_W`、`LQ_TAG_W`、`SQ_TAG_W`、`FTQ_TAG_W`、`FL_TAG_W` (= `*_IDX_W + 1`) として出し、age helper の `W` にはこれを渡す。理由: Veryl の generic 引数には単純な識別子かリテラルしか書けず、`ROB_IDX_W + 1` のような式を渡せないため。
 
 ### 5.3 段間ハンドシェイク規約
 
@@ -676,12 +708,19 @@ module lane_queue #(param T: type, param W_IN: u32, param W_OUT: u32, param DEPT
     o_ready: output logic        ,              // registered: free >= W_IN
     o_valid: output logic [W_OUT], o_data: output T [W_OUT],
     i_take : input  logic<idx_w(W_OUT + 1)>,    // consumer takes lanes 0..i_take-1
-    i_flush: input  logic        ,              // front-end stages: any kill flushes
+    i_flush: input  logic        ,              // empties the queue; drops this cycle's input group and take
 );
-module stage_reg #(param T: type) (            // back-end pipeline register with built-in kill
-    i_valid: input logic, i_data: input T, i_kill: input Kill, o_valid: output logic, o_data: output T,
-);  // o_valid_next = i_valid && !killed(i_kill, tag_of(i_data))
+module stage_reg::<CFG: core_cfg> #(param T: type) ( // back-end pipeline register with built-in kill
+    i_valid: input logic, i_data: input T, i_tag: input RobTag, i_kill: input Kill,
+    o_valid: output logic, o_data: output T,
+);  // o_valid_next = i_valid && !killed(i_kill, i_tag); data captured only when i_valid
 ```
+
+- 【決定】`lane_queue` では flush がすべてに優先する。flush の edge では、そのサイクルの入力 group と take をどちらも捨てて空にする。理由: flush するのは kill を受けた段だけで、その入力と出力はどちらも kill 済みの op なので、受理や取り出しを数える必要が無い。
+- 【決定】`lane_queue` の `DEPTH` は 2 の冪でなくてよい。リングの index は 1 回の減算で巻き戻す (1 サイクルに進む量は `DEPTH` を超えない)。理由: `RQ_N = 2×FETCH_W` のような深さを 2 の冪に丸めずに使えるようにするため。
+- 【決定】`stage_reg` は op の `RobTag` を別ポート `i_tag` で受ける。理由: `T` は不透明な型パラメータで、`stage_reg` からはタグの位置が分からないため。
+- 【決定】`stage_reg` は stall を持たず、毎サイクル進む。データは `i_valid` のサイクルにだけ捕捉する。理由: back-end の段は背圧を持たない (待たせる必要がある経路は `lane_queue` か WB 予約で表す)。無効なサイクルのデータは誰も読まないので、書き込みは有効な op に限ってよい。
+- `stage_reg` が kill を確かめるのは捕捉の edge だけである。kill のサイクルに `o_data` に居る op は次段の入力であり、次段が同じ kill を捕捉時に適用する。
 
 - R6. 段の挿入とは、`lane_queue` か `stage_reg` を 1 つ挟み、その経路のレイテンシ定数 (FU なら `fu_pkg`、memory pipe なら §5.9 の `RESP_LAT`) を 1 増やすことである。それ以外の変更が必要になったら、その設計は契約違反である。
 
@@ -695,7 +734,8 @@ struct Kill {                       // registered one-cycle pulse, at most one p
     full    : logic,                // 1: every in-flight op dies (keep ignored)
     keep    : RobTag,               // partial: youngest SURVIVING op
     lq_tail : LqTag, sq_tail: SqTag,// partial: rewind targets, from rob's dispatch snapshot of keep
-    fl_head : FlPtr [2],            // partial: free-list head per RegClass, same snapshot
+    fl_int  : FlPtr,                // partial: free-list head of the INT class, same snapshot
+    fl_fp   : FlPtr,                // partial: free-list head of the FP class, same snapshot
     bar_seq : BarSeq,               // partial: ld_barrier allocation count, same snapshot (section L.10)
     ftq_tail: FtqTag,               // partial: next of the branch's FtqTag (carried by BrResolve)
     ckpt_v  : logic, ckpt: logic<CKPT_W>,
@@ -704,20 +744,22 @@ struct Redirect {                   // to the front end
     valid: logic, pc: logic<64>, ftq_keep: FtqTag,
     foff : logic<FOFF_W>,           // halfword offset of the redirecting op in its block
     taken: logic,                   // resolved direction of that op (history/RAS repair, FTQ outcome)
-    kind : RedirKind,               // defined in section C, owner flush_ctrl
+    kind : RedirKind,               // produced by flush_ctrl, values in section C.4
 }
+enum RedirKind: logic<3> { BR, BR_CM, TRAP, IRQ, XRET, SERIAL, REPLAY }
 function killed (k: input Kill, t: input RobTag) -> logic { return k.valid && (k.full || older(k.keep, t)); }
 ```
 
 タイミング規則:
 
 - T1. kill は 1 サイクルに最大 1 つ。full が partial に優先する。同じサイクルに resolve した BRU の中では、最古のものが勝つ (木で選ぶ)。採用されなかった resolve は捨ててよい。commit の backstop (T8) が拾うので安全である。別の kill の直後のサイクルには部分 kill を採用しない (`!kill_q.valid`)。そのサイクルの resolve は直前の kill で既に死んでいる可能性があり、捨てても T8 が拾う。
-- `RedirKind` は §C が定義する (所有者 `flush_ctrl`)。少なくとも `BR` (BRU の resolve による部分 kill)、`BR_CM` (commit 時の検査 T8 による full kill) と、その他の原因 (例外、割込み、xRET、replay、flush を伴う retire) を区別する。front end は `BR`/`BR_CM` と `foff`/`taken` を使って history、RAS、FTQ の outcome を正確に修復する (§F)。
+- 【決定】`Kill` は free list の head を、クラスごとの配列 `fl_head[2]` ではなく 2 つのフィールド `fl_int`/`fl_fp` で運ぶ。理由: Veryl は struct の中に unpacked 配列を置けないため。
+- 【決定】`RedirKind` は `core_types` に `Redirect` と並べて定義し、生成するのは `flush_ctrl` である (値の意味は §C.4)。理由: `Redirect` のフィールドの型であり、モジュール間で共有する型は型パッケージに置くため。`RedirKind` は少なくとも `BR` (BRU の resolve による部分 kill)、`BR_CM` (commit 時の検査 T8 による full kill) と、その他の原因 (例外、割込み、xRET、replay、flush を伴う retire) を区別する。front end は `BR`/`BR_CM` と `foff`/`taken` を使って history、RAS、FTQ の outcome を正確に修復する (§F)。
 - T2. kill のサイクルには、タグを持つどの構造にも割り当てを行わない (`dispatch` を抑止する)。
 - T3. kill のサイクルにも issue、execute、完了は続いてよい。ただし、すべての段レジスタは、その edge で捕捉する op に `killed()` を適用する。kill のサイクルに完了した op は kill に負ける。
 - T4. 部分 kill は commit と同じサイクルに共存できる (keep より古い op は影響を受けない)。full kill のサイクルには commit を抑止する。
 - T5. リングはエントリごとの比較ではなく snapshot で巻き戻す。ROB の tail は `next(keep)`、LQ/SQ/FTQ の tail、free list の head、`lq` の barrier 割り当て数 `bar_seq` (§L.10) は Kill が運ぶ値にする。full kill では ROB/LQ/SQ を空にし、free list の head を全非アーキ pdst の解放位置に戻し、`RAT := arch RAT` とする。SQ には commit 前の store しか入らない (commit 済みの store は `sb` にある) ので、full kill で SQ は空になる。
-- T6. dispatch snapshot `{lq_tail, sq_tail, fl_head[2], bar_seq}` は、`rob` が ROB index ごとの副配列として持つ。`dispatch` が割り当て時に書き込み、`flush_ctrl` が resolve のサイクルに keep の index で読む。【決定】理由: branch の payload を太らせずに済み、サイズ (`ROB_N`) を参照するのが `rob` だけで済む (P2)。
+- T6. dispatch snapshot `{lq_tail, sq_tail, fl_int, fl_fp, bar_seq}` は、`rob` が ROB index ごとの副配列として持つ。`dispatch` が割り当て時に書き込み、`flush_ctrl` が resolve のサイクルに keep の index で読む。【決定】理由: branch の payload を太らせずに済み、サイズ (`ROB_N`) を参照するのが `rob` だけで済む (P2)。
 - T7. kill の完全性 (最重要の不変条件): kill の edge までに、すべての構造は `killed(k, tag)` が選ぶ op をすべて捨てている。その edge で捕捉中の op も含む。ROB の完了ポートはフィルタではない (エントリの valid は確認するが、世代は確認しない)。
 - T8. commit の backstop: すべての control op の resolve 結果 (mispredict, resolved next PC) を ROB に記録する。commit 時に `mispredict && !recovered` であれば、その op を retire したうえで full kill をかける (§5.12 の RETIRE_FLUSH)。早期 kill は最適化にすぎず、正しさはそれに依存しない。部分 kill を発行したときは、keep に該当する ROB エントリの `recovered` を立てる。予測値の上書きはしない。
 - T9. walk 中に届いた部分 kill と、別の kill の直後のサイクルの部分 kill は捨てる (T8 が拾う)。【M3 で決定】walk の途中で、より古い kill を受け入れて終点を動かすかどうか: M3 で「walk 中に捨てた resolve の数 × 回復コスト」を測って決める。
@@ -728,7 +770,7 @@ function killed (k: input Kill, t: input RobTag) -> logic { return k.valid && (k
 |---|---|
 | `ftq`, `ifu`, `extract`, `decode`, rename 前の `lane_queue` | `kill.valid` で全 flush する (rename 前の op はすべて keep より若い)。`ftq` は、partial なら `ftq_tail` まで、full なら commit 済みの位置まで巻き戻す (詳細は §F)。`bpu` の history/RAS は生き残った FTQ エントリから復元する。 |
 | `rename` | full なら arch RAT をコピー。partial なら、`ckpt_v` の場合は restore、そうでなければ ROB の `{rd_arch, cls, old_pdst}` を tail 側から keep の手前まで WALK_W 個ずつ戻す。walk 中は rename を止める。 |
-| `free_list` | head を `fl_head` に戻す。占有数は `tail - head` から求め、別のカウンタは持たない。 |
+| `free_list` | head を自分のクラスの `fl_int`/`fl_fp` に戻す。占有数は `tail - head` から求め、別のカウンタは持たない。 |
 | `dispatch` | kill のサイクルには割り当てない。入口の `lane_queue` は flush する。 |
 | `iq` と issue 段のレジスタ | `killed()` でエントリを落とす。ready/busy ビットは kill では触らない (rename 時の割り当てでクリアする)。 |
 | すべての FU の段レジスタ、反復 FU の shell、WB 保持バッファ | `stage_reg` の規則に従う。反復 FU は、FSM を abort したうえで、同じサイクルの `o_valid` をマスクする (§5.6)。 |
@@ -868,7 +910,7 @@ WB ポート表:
 | wbm1 (memory pipe 1) | (無し) | | | load |
 | 合計 | 3 本 (int 3W, fp 2W) | | | 8 本 (int 7W, fp 4W) |
 
-FU とポートの対応は config パッケージの FU トポロジ表 (`PORT_FU: FuSet [ISSUE_W]`、`PORT_IQ`、`N_IQ`、`IQ_N[]`、`IQ_NSRC[]`、§3.6) で表す。構成によって変わるのはこの表だけである。cfg_w4 の最終形は、M3 の sweep で FU ごとの使用率を測って決める。
+FU とポートの対応は config パッケージの FU トポロジ表 (`PORT_FU: FuSet [ISSUE_W]`、`PORT_IQ`、`N_IQ`、`MEM_IQ`、`IQ_N[]`、`IQ_NSRC[]`、§3.6) で表す。構成によって変わるのはこの表だけである。cfg_w4 の最終形は、M3 の sweep で FU ごとの使用率を測って決める。
 
 ### 5.8 例外の報告経路
 
@@ -1221,6 +1263,7 @@ struct PdRedirect { valid: logic, ftq: FtqTag, foff: logic<FOFF_W>, taken: logic
 | `DQ_N` | `extract` | 8 | 16 | 旧 fetch buffer は 8 records。4×FETCH_W とする。 |
 | `BP_BTB_N` / `BP_SLOTS` (`bpu_pkg`) | `bpu` | 4096 / 2 | 4096 / 3 | blkpred は 4096 entry。8 B の dword で cond slot 2 個が kernel の 98.1 % を覆った (`blkpred.veryl:14-21`)。32 B の block では 1 個足す。 |
 | `BP_RAS_N` (`bpu_pkg`) | `bpu` | 16 | 32 | 旧 ras は 16。 |
+| `PRED_META_W` / `PRED_CKPT_W` | `bpu` (幅の検査) | 16 / 72 | 16 / 72 | 【M1b で決定】両構成とも暫定値。`bpu` が `PredMeta`/`PredCkpt` の内部 layout を決めた時点で、その幅に合わせて確定する。それまでは `ftq` と `core_types` が型を組めるだけの仮の幅である。 |
 
 最終値は【M3 で決定】: §2.5 の sweep で、`ftq_full`/`fbq_full`/`dq_full` の発火数と IPC の膝の位置を見て決める。`BP_SLOTS` は、commit された block 範囲あたりの条件分岐数を census で数えて決める。
 
@@ -1411,7 +1454,7 @@ straddle (block の末尾をまたぐ 32-bit 命令):
 | `extract` (x0、x1、carry) | すべて捨てる | x0 だけ捨てる |
 | DQ | flush する | 触らない |
 
-- `RedirKind` の定義は §C (所有者 `flush_ctrl`) にある。front end が区別するのは、「branch の結末 (`Redirect.foff`, `Redirect.taken`、§5.4) を運ぶかどうか」だけである: BR (partial、BRU の resolve)、BR_CM (commit backstop による full kill)、それ以外 (trap、xRET、割込み、NEXT_PC flush、REPLAY による full kill。§C はこれらを細分してよいが、front end から見れば同じ扱い)。
+- `RedirKind` の定義は `core_types` にあり、生成者は `flush_ctrl` である (§5.4、§C.4)。front end が区別するのは、「branch の結末 (`Redirect.foff`, `Redirect.taken`、§5.4) を運ぶかどうか」だけである: BR (partial、BRU の resolve)、BR_CM (commit backstop による full kill)、それ以外 (trap、xRET、割込み、NEXT_PC flush、REPLAY による full kill。§C はこれらを細分してよいが、front end から見れば同じ扱い)。
 - mispredict の定義 (BRU、§X): `taken != op.pred_taken || (taken && target != ftq[op.ftq].pred.target)`。pc (= block base + 2·foff) と `pred` は ftq から読む。
 - early redirect は最適化にすぎず、正しさは T8 の commit backstop が持つ。front end の側の規則は次の 2 つ。
   - 予測値は書き換えない。`ftq.pred` は不変で、partial kill が書くのは `res` だけである。二重の redirect は ROB の `recovered` で防ぐ (T8)。旧コアは ROB の `pred_next_pc` を resolve した target で上書きしたので、TAGE がその誤りを `c_early_fix` で拾い直す必要があった。
@@ -1475,7 +1518,7 @@ trace diff に現れうる差異 (D4。推定のものは、M2 の前に golden 
 
 - 【決定】rename と dispatch は同じ段 `rn_` に置く。lane 0..take-1 について、RAT への書き込み、free list の pop、ROB の割り当て (walk 記録となる `{has_rd, cls, rd_arch, old_pdst}` と dispatch snapshot を含む)、IQ/LQ/SQ への書き込み、busy_table のクリアを同じ edge で行う。理由: RAT を書き換えた op は必ず同じ edge で ROB に載るので、walk (§R.3.4) は ROB の範囲だけで完結する。「rename 済みだが ROB に未登録」の op が存在すると、それを巻き戻す経路が別に必要になる。
 - 段を足すとき (§2.1 P3) は、IQ/LQ/SQ への payload 書き込みの側に `stage_reg` を挟む。タグと credit は `rn_` で確定しているので、変わるのは IQ の ready 初期値に 1 サイクル分の wake を畳み込むことだけである。【M3 で決定】段を足すかどうか: CP 分解で `rn_` が名指しされた場合だけ検討する (周波数は目標でない、§2.6)。
-- 【決定】`rq` の深さの初期値は 2×FETCH_W とする。理由: ready は登録済みの占有数から作る (§5.3 R2) ので、1 group/サイクルを維持できる最小の深さがこれである。dispatch の部分受理 (§5.3 R4) で残った lane もここに残る。
+- 【決定】`rq` の深さ `RQ_N` (`core_cfg`) の初期値は 2×FETCH_W とする (cfg_w2 で 4、cfg_w4 で 8)。理由: ready は登録済みの占有数から作る (§5.3 R2) ので、1 group/サイクルを維持できる最小の深さがこれである。dispatch の部分受理 (§5.3 R4) で残った lane もここに残る。
 
 ### §R.2 decode
 
@@ -1558,7 +1601,7 @@ for e:     RAT_next[e] = pdst[最も若い l : wr[l] && dst[l] == e]   (該当�
 | 2 | `add x5, x5, x5` | x5 → p40 (`src_grp`) ×2 | x5 → p41 (old = p40) | ROB, iq_int, INT_RD | 1 |
 | 3 | `sd x5, 0(x2)` | x5 → p41 (`src_grp`) | なし | ROB, iq_m, SQ | 0 (SQ の credit) |
 
-take=3 となり、lane 3 は rq に残る。RAT は x5 → p41 (lane 2 が勝つ)、f1 → p33 に更新される。int の head は 2、fp の head は 1 だけ進む。snapshot の `fl_head[INT]` は lane 0 が head+1、lane 1 が head+1、lane 2 が head+2 である。
+take=3 となり、lane 3 は rq に残る。RAT は x5 → p41 (lane 2 が勝つ)、f1 → p33 に更新される。int の head は 2、fp の head は 1 だけ進む。snapshot の `fl_int` は lane 0 が head+1、lane 1 が head+1、lane 2 が head+2 である。
 
 #### §R.3.3 投機 RAT の書き込み優先順位
 
@@ -1616,7 +1659,7 @@ commit が retire させた lane l (§5.12 C3) ごとに、`{retire, has_rd, rcl
 
 巻き戻しの代数。旧 `free_list.veryl:148-174` を一般化し、n_inflight は持たない:
 
-- 部分 kill (checkpoint の有無によらない): `head := kill.fl_head[cls]`。
+- 部分 kill (checkpoint の有無によらない): int の instance は `head := kill.fl_int`、fp の instance は `head := kill.fl_fp`。
 - full kill: `head := tail - FREE_N`。同じサイクルに commit は無い (§5.4 T4)。
 - それ以外: `head := head + i_pop_n`。tail は push 数だけ進み、kill とは独立。
 
@@ -1666,7 +1709,7 @@ group を切る理由。lane l で ok[l]=0 になった最初の理由を、理�
 lane l < take について、すべて同じ edge で次を行う。タグは所有者が出した値をそのまま使い、dispatch が `next()` を計算することはない (リングのサイズを知るのは所有者だけ、§2.1 P2)。
 
 - ROB: タグは `rob.o_alloc_tag[l]`。書く内容は §C.1.1 の表のうち dispatch が書く列で、commit 用の class (`fu`, `drain`, `flush`, `alone`, `csr_wr`, `effect`, `is_rvc`)、rename 情報 (`has_rd`, `cls`, `rd_arch`, `pdst`, `old_pdst`。walk 記録を兼ねる)、OpTag の `lq`/`sq`/`ftq`/`foff`、`insn`、`recovered := 0` である。例外はエントリに書かず、`rob` の `exc_q` の木に入れる (§C.1.2)。PC は書かない (§F.3)。
-- dispatch snapshot (§5.4 T6): `{lq_tail, sq_tail, fl_head[INT], fl_head[FP], bar_seq}` は、lane l までの割り当てを済ませた後の値で、`lq.o_alloc_tag[P[l][LQ]]`、`sq.o_alloc_tag[P[l][SQ]]`、`free_list[c].o_head_after[P[l][c]]`、`lq.o_bar_after[P[l][BAR]]` (lane l までの `ld_barrier` op の数、§L.10) から取る。ROB の割り当てと同じ edge で書くので、ROB にいる op は必ず snapshot を持つ。
+- dispatch snapshot (§5.4 T6): `{lq_tail, sq_tail, fl_int, fl_fp, bar_seq}` は、lane l までの割り当てを済ませた後の値で、`lq.o_alloc_tag[P[l][LQ]]`、`sq.o_alloc_tag[P[l][SQ]]`、`free_list[c].o_head_after[P[l][c]]`、`lq.o_bar_after[P[l][BAR]]` (lane l までの `ld_barrier` op の数、§L.10) から取る。ROB の割り当てと同じ edge で書くので、ROB にいる op は必ず snapshot を持つ。
 - dispatch 時完了: `fu == NONE` の op は、ROB エントリを done=1 で割り当て、例外があれば同じ edge で `exc_q` の木に入れる (§C.1.3)。IQ にも FU にも行かない (§5.5)。
 - LQ/SQ: `budget.LQ`/`budget.SQ` を持つ op にタグを割り当てる。lane l の LQ タグは `lq.o_alloc_tag[P[l][LQ] - 1]`、SQ タグも同形である。load の `sq_lim` は `sq.o_alloc_tag[P[l][SQ]]`、store の `lq_lim` は `lq.o_alloc_tag[P[l][LQ]]` で、どちらも同じ表から読む (§L.3)。エントリの中身は §L が定める。
 - IQ k: `fu` から決まる IQ に `{ExTag, fu, uop, src[3], nonspec, payload}` を渡す。IQ 内のエントリ選択とポート割り当ては IQ が行う (§X.3)。
@@ -1699,7 +1742,7 @@ lane l < take について、すべて同じ edge で次を行う。タグは所
 | amocas.q の形 | §5.5 の【M2 で決定】(M2) | |
 | VEC | dispatch しない (VQ の credit 0、DC6) | M5 で VU の alloc を接続する |
 | cfg_w4 | elaborate でき、rv64ui のサブセットが通る | ゲートの梯子をすべて通す |
-| rq の深さ、IQ ポート割り当て方針 | 2×FETCH_W、最小占有 (§X.3) | sweep で決める |
+| rq の深さ `RQ_N`、IQ ポート割り当て方針 | 2×FETCH_W、最小占有 (§X.3) | sweep で決める |
 
 ---
 
@@ -1787,27 +1830,34 @@ cfg_w2 の値は §3.2 と一致する。この本数には、retire record の 
 
 #### IQ の構成
 
-| 構成 | IQ | 担当ポート | エントリ数 (初期値) | source 数 | wake lane | wake 比較器 |
+| 構成 | IQ (番号 q) | 担当ポート | エントリ数 (初期値) | source 数 | wake lane | wake 比較器 |
 |---|---|---|---|---|---|---|
-| cfg_w2 | iq_x | p0, p1 | 24 | 3 | 3 | 216 |
-| cfg_w2 | iq_m | m0 | 16 | 2 | 3 | 96 |
-| cfg_w4 | iq_int | p0-p3 | 32 | 2 | 8 | 512 |
-| cfg_w4 | iq_fp | p4, p5 | 24 | 3 | 8 | 576 |
-| cfg_w4 | iq_m | m0, m1 | 24 | 2 | 8 | 384 |
+| cfg_w2 | iq_x (0) | p0, p1 | 24 | 3 | 3 | 216 |
+| cfg_w2 | iq_m (1 = `MEM_IQ`) | m0 | 16 | 2 | 3 | 96 |
+| cfg_w4 | iq_int (0) | p0-p3 | 32 | 2 | 8 | 512 |
+| cfg_w4 | iq_fp (1) | p4, p5 | 24 | 3 | 8 | 576 |
+| cfg_w4 | iq_m (2 = `MEM_IQ`) | m0, m1 | 24 | 2 | 8 | 384 |
+
+- 【決定】memory 側の IQ も FU トポロジ表に含める。`N_IQ`、`IQ_N[]`、`IQ_NSRC[]` は memory IQ を含めた全 IQ を数え、新しい定数 `MEM_IQ` がその番号を表す。すべての memory pipe は `MEM_IQ` から発行する。`PORT_IQ[]` は exec ポートだけを表し、`MEM_IQ` を指さない。理由: memory 側の IQ も同じ generic `iq` の instance なので、エントリ数と source 数を同じ表で持てば構成の差が表だけに閉じるため。
 
 - 【決定】cfg_w2 では、p1 が ALU と FP を兼ねるので、整数と FP を 1 つの IQ (iq_x) に入れる。cfg_w4 では、FuKind を担当するポートが int 側と fp 側にきれいに分かれるので、IQ を分けて source 数と比較器を減らす。どちらも同じ generic `iq` の instance で、違いは構成表だけである。
 - 【M3 で決定】エントリ数。初期値は IQ 合計を ROB_N の約 0.6 倍とした (旧コアは 16/32)。IQ ごとに 1 軸ずつ sweep し、IPC 曲線の膝で決める。
 - wake 比較器は「エントリ × source × wake lane」で増える。cfg_w4 は cfg_w2 の約 5 倍で、シミュレーション速度 (§5.15 の cy/s) の主要な項になる。
 
-#### 構成制約 (elaborate 時に拒否、§3.5)
+#### 構成制約 (`CFG_ERR` で検査、§3.5)
+
+下の各項目は §3.5 の `CFG_ERR` の bit として検査する (最後の項目を除く)。
 
 - ある FuKind を担当するポートは、すべて同じ IQ に属する (§R.5.1)。
 - 1 つの exec ポートに載せる HOLE_FILL の FU は高々 1 つ (wb_resv の HOLE_FILL 要求者が 1 つで済む)。
 - SYS を持つポートはちょうど 1 つ。BRU を持つポートは 1 つ以上。
-- `op_class` が出す FuKind (NONE, LOAD, STORE, ATOMIC, VEC を除く) は、どれも 1 つ以上のポートに載っている。
-- WB ポートが書けるクラスは、そのポートの FU の宛先クラスの和である。
+- `op_class` が出す FuKind (NONE, LOAD, STORE, ATOMIC, VEC を除く) は、どれも 1 つ以上のポートに載っている。NONE, LOAD, STORE, ATOMIC, VEC は exec ポートに載せない。
+- 各 IQ は 1 本以上の issue ポート (`MEM_IQ` なら memory pipe) を持つ。`PORT_IQ[p]` は `MEM_IQ` 以外の有効な番号である。
+- WB ポートが書けるクラスは、そのポートの FU の宛先クラスの和である (これは FU 集合からの導出であり、構成の検査ではない)。
 
-これらの表は `core_cfg` (§3.6) の FU トポロジ表 `PORT_FU: FuSet [ISSUE_W]`、`PORT_IQ: u32 [ISSUE_W]`、`N_IQ: u32`、`IQ_N: u32 [N_IQ]`、`IQ_NSRC: u32 [N_IQ]` で表し、構成によって変わるのはこれらの値だけである。
+これらの表は `core_cfg` (§3.6) の FU トポロジ表 `PORT_FU: FuSet [ISSUE_W]`、`PORT_IQ: u32 [ISSUE_W]`、`N_IQ: u32`、`MEM_IQ: u32`、`IQ_N: u32 [N_IQ]`、`IQ_NSRC: u32 [N_IQ]` で表し、構成によって変わるのはこれらの値だけである。
+
+- 【決定】トポロジ表は M1b から最終形の FU 集合を持つ。M1b が instantiate するのは必要な FU だけで、残りは表の上で予約された枠とする (§X.12)。理由: 上の制約 (どの種別にも行き先がある、SYS は 1 本、HOLE_FILL は 1 つ) の検査が、最終形の FU 集合に対して働く必要があるため。
 
 ### §X.3 iq
 
@@ -2041,7 +2091,7 @@ issue ポート 1 本分。for-generate で ISSUE_W 個並べ、中身は `PORT_
 | トポロジ | cfg_w2 の表 (§5.7 で決定済み)。cfg_w4 は表の案で elaborate し、rv64ui のサブセット | cfg_w4 の FU 集合、BRU ポート数、IQ 分割、PRF 読出本数 (【M3 で決定】) |
 | IQ | 表の初期値、最小占有のポート割り当て、ROB タグの木 | エントリ数と割り当て方針を sweep で決める |
 | FU | 表の LATENCY。FMA は STAGE3=0。fround は FDIV の shell | `LAT_MUL`、STAGE3 (§5.6) を sweep と CP 分解で決める |
-| FU の範囲 | `fu_alu`、`fu_bru`、`fu_sys` (rv64ui のゲートが確かめるもの)。`fu_mul`、`fu_div` (`fu_blocking_shell`) は入れてもよい。FP の FU (`fu_fma`、`fu_fmisc`、`fu_fdiv`) は M2 で入れ、正しさを arch suite と ACT4 で確定させる。トポロジ表は最初から最終形で、M1b で instantiate しない FU の枠は FU 集合から外して elaborate する | |
+| FU の範囲 | `fu_alu`、`fu_bru`、`fu_sys` (rv64ui のゲートが確かめるもの)。`fu_mul`、`fu_div` (`fu_blocking_shell`) は入れてもよい。FP の FU (`fu_fma`、`fu_fmisc`、`fu_fdiv`) は M2 で入れ、正しさを arch suite と ACT4 で確定させる。トポロジ表は最初から最終形の FU 集合を持つ (構成制約の検査に要るため、§X.2)。M1b で instantiate しない FU は表の上で予約された枠として残し、FU 集合からは外さない | |
 | PC | BRU ポートが ftq の読出ポートで読む (§F.3)。IQ と ROB は持たない | |
 
 ---
@@ -2082,7 +2132,7 @@ REPLAY outcome は M1b から group 関数に入るが、発火するのは §L 
 | 最古の例外 (`ExcRec`) | 単一レジスタ `exc_q` | dispatch、例外を運ぶ完了ポート | commit, `trap_unit` |
 | resolve record `{mispred, taken, next_pc}` | 副配列 `res[ROB_N]` | BRU を持つ WB ポート | commit |
 | `recovered` | 副配列 | `flush_ctrl` (set)、dispatch (clear) | commit |
-| dispatch snapshot `{lq_tail, sq_tail, fl_head[2], bar_seq}` | 副配列 `snap[ROB_N]` | dispatch | `flush_ctrl` (読出し 1 本) |
+| dispatch snapshot `{lq_tail, sq_tail, fl_int, fl_fp, bar_seq}` | 副配列 `snap[ROB_N]` | dispatch | `flush_ctrl` (読出し 1 本) |
 | `rd_wdata` | 観測用副配列 `obs[ROB_N]` | 完了ポート | retire record のみ |
 | load の VA/PA/size/data、poison、`PmaAttr` | `lq` | `mem_pipe`, `lq` | commit (LQ 窓) |
 | store の VA/PA/mask/data、`PmaAttr` | `sq` | `mem_pipe`, `sq` | commit (SQ 窓)、`sq` から `sb` への push |
@@ -2127,7 +2177,7 @@ REPLAY outcome は M1b から group 関数に入るが、発火するのは §L 
 
 #### C.1.6 dispatch snapshot と割り当て
 
-- `snap[e]` は、エントリ e の op を割り当てた直後の `{lq_tail, sq_tail, fl_head[INT], fl_head[FP], bar_seq}` である。dispatch が lane ごとに「その lane までを割り当てた値」を書く。読出しは 1 本で、`flush_ctrl` が resolve のサイクルに、分岐自身が運ぶ `RobTag` で読む (T6)。full kill は snapshot を使わない。
+- `snap[e]` は、エントリ e の op を割り当てた直後の `{lq_tail, sq_tail, fl_int, fl_fp, bar_seq}` である。dispatch が lane ごとに「その lane までを割り当てた値」を書く。読出しは 1 本で、`flush_ctrl` が resolve のサイクルに、分岐自身が運ぶ `RobTag` で読む (T6)。full kill は snapshot を使わない。
 - `rob` は次に割り当てる `RENAME_W` 個のタグ `o_alloc_tag[RENAME_W]` と空き数 `o_free` を登録済みで出す。dispatch はそのうち `take` 個を使う (§5.3 R4)。
 - head は commit の `i_retire_cnt` だけ進む。`o_head {valid, tag}` は登録済みで、commit が gate して oldest token にする (C.2.6)。
 
@@ -2308,11 +2358,11 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 登録 (t+1 に有効):
 
 - full: `Kill {valid, full=1}`。`Redirect.pc` は commit の要求 pc。
-- partial: `keep` = 分岐のタグ、`lq_tail/sq_tail/fl_head/bar_seq` = `snap[keep]`、`ftq_tail = next(br.ftq)` (`BrResolve` が運ぶ分岐の FTQ タグ。keep は RobTag なので FTQ タグを持たない)、`ckpt` (M3)。`Redirect = {pc: res.next_pc, ftq_keep: br.ftq, foff: br.foff, taken: res.taken, kind: BR}`。
+- partial: `keep` = 分岐のタグ、`lq_tail/sq_tail/fl_int/fl_fp/bar_seq` = `snap[keep]`、`ftq_tail = next(br.ftq)` (`BrResolve` が運ぶ分岐の FTQ タグ。keep は RobTag なので FTQ タグを持たない)、`ckpt` (M3)。`Redirect = {pc: res.next_pc, ftq_keep: br.ftq, foff: br.foff, taken: res.taken, kind: BR}`。
 - full で commit の要求が T8 の backstop (BR_CM) のとき: `Redirect = {pc: res.next_pc, ftq_keep: 分岐の ftq, foff, taken, kind: BR_CM}`。それ以外の full では `foff`/`taken` は無効で、`kind` は要求の kind。
 - partial を採用したサイクルの edge で `rob` の `recovered[keep]` を立てる (C.1.4)。
 
-`RedirKind` (定義と所有者は `flush_ctrl`、§5.4 から参照される): `BR` (BRU の resolve による部分 kill)、`BR_CM` (commit 時の検査 T8 による full kill)、`TRAP`, `IRQ`, `XRET`, `SERIAL`, `REPLAY`。`BR` と `BR_CM` のときだけ `Redirect.foff`/`taken` が有効である。§F はこれを予測器の回復方針と発火カウンタにだけ使い、飛び先の計算には使わない。
+`RedirKind` (定義は `core_types`、§5.4。生成するのは `flush_ctrl` だけ): `BR` (BRU の resolve による部分 kill)、`BR_CM` (commit 時の検査 T8 による full kill)、`TRAP`, `IRQ`, `XRET`, `SERIAL`, `REPLAY`。`BR` と `BR_CM` のときだけ `Redirect.foff`/`taken` が有効である。§F はこれを予測器の回復方針と発火カウンタにだけ使い、飛び先の計算には使わない。
 
 不変条件 (所有者 `flush_ctrl`):
 
@@ -3643,7 +3693,7 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
   - `o_perf` の RETRY の理由別の比率 (BANK_CONFLICT、FILL_BUSY)。
 - 緩和策:
   - (1) 平らな軸は原因を特定して §3.4 に登録する。
-  - (2) 支援外の値は elaborate 時に拒否する (§3.5)。
+  - (2) 支援外の値は `CFG_ERR` と `test_cfg_constraints` で拒否する (§3.5)。
   - (3) 天井を上げる変更 (N_FILL>1 など) は N=4 boot を入口のゲートにする。`95753c8` では、N=1 でビット一致のまま N=4 がライブロックした。
 
 #### R7. cfg_w4 の腐敗
@@ -3675,7 +3725,7 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 | U3 | 2 構成を並行 worktree で回すか: 採用済み (第 0 部 §1.4 の運用) | 調査 (シミュレーション速度) | M1a から適用 | マシンは 16 CPU で、各シミュレーションは単一スレッドで動く。veryl は同時に 1 起動しか許さないので、`.build` を分けるには worktree を分ける必要がある。 |
 | U4 | 新コアで使う veryl の版 | 調査 (Veryl) | M1a 開始時 | 【決定済み (§3.7.1)】新コアは `local/heliodor-fixes` の veryl を使う。旧コアはこの版でも dhrystone/coremark がビット一致する。 |
 | U5 | 旧コアの simulator 回避コードは今も必要か | 調査 (Veryl) | M1a | 部分 squash の動的書込、代入後の field 上書き、後方参照する配列の settle の 3 つを、spike の単体テストとして現行の veryl で再現させてみる。 |
-| U6 | 拒否の仕組み | §3.5 | M1a | 【決定済み (§3.7.1)】`#[test] test_cfg_constraints` で全構成の制約定数を検査する。 |
+| U6 | 拒否の仕組み | §3.5 | M1a | 【決定済み (§3.7.1)】`#[test] test_cfg_constraints` で全構成の `core_types::CFG_ERR` を検査する (§3.5)。 |
 | U7 | checker を synth から外す方法 | §5.15 | M1a | 【決定済み (§3.7.1)】`#[ifdef(HELIODOR_CHK)]` で囲み、`[test].defines` にだけ定義する。 |
 | U8 | `RESP_LAT` の値 | §5.9 MP1 | M1b | adapter を実装し、Stage-A の提示から Stage-B の判定までの距離で決める (2 を見込む)。 |
 | U9 | CP の基準値 | 調査 (過去の教訓) | M1a | 現行の synth で `b0f4668` を合成し直して基準を取る。2026-06-15 から 08-28 の CP の数値は無効である (synth がゲートの 52.5 % しか見ていなかった)。 |
