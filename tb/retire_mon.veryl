@@ -1,0 +1,199 @@
+// retire_mon: per-hart pass/fail detection, counters and the retire-contract
+// checker, all derived from the retire records alone.
+//
+// Ports (timing contract):
+//   i_retire[LANES] : registered retire records, sampled every posedge
+//   i_irq_evt       : registered interrupt event
+//   i_chk           : the core's sticky checker flags, ORed in sticky here
+//   i_hash_mismatch : rvfi_tracer's sticky mismatch flag
+//   o_stop[LANES]   : combinational from i_retire and registered state: the
+//                     terminal record (first tohost store, or first
+//                     x3 := 0xAA when PASS_BY_X3), set at most once per run
+//   o_x3, o_tohost  : registered shadows (x3: youngest lane wins; tohost:
+//                     wdata[31:0] of the first store to TOHOST_PA)
+//   o_cycles        : registered, cycles from reset through the cycle of the
+//                     terminal record, then frozen
+//   o_instret       : registered, non-trap records up to and including the
+//                     terminal record, then frozen
+//   o_last_pc, o_ret_cnt, o_trap_cnt : registered liveness probes, not frozen
+//   o_chk           : {sticky i_chk, sticky retire-contract bits}
+//                     (retire_pkg::CHK_RET_*)
+//   o_pass/o_fail/o_done : combinational from the registered state
+// Owns:
+//   - Pass:  tohost == 1 (x3 == 0xAA when PASS_BY_X3), with chk == 0 and no
+//     hash mismatch.
+//   - Fail:  tohost not in {0, 1}, or chk != 0, or a hash mismatch.
+//   - Done:  tohost != 0 (x3 == 0xAA when PASS_BY_X3), or chk != 0, or a hash
+//     mismatch.
+//   - The counters stop at the terminal record itself, so they do not
+//     depend on how records are distributed over lanes.
+//   - chk_retire: lanes contiguous from lane 0; order +1 per record; trap
+//     records on lane 0 only (any lane when TRAP_ANY_LANE); no record after a
+//     trap in the same cycle; IrqEvent only in cycles without records and
+//     carrying the next order; trap records without rd, rd2, memory write,
+//     CSR write or next_pc.
+module retire_mon #(
+    param LANES        : u32     = 2            ,
+    param TOHOST_PA    : bit<64> = 64'h8000_1000,
+    param PASS_BY_X3   : bit     = 0            ,
+    param TRAP_ANY_LANE: bit     = 0            ,
+    param CHK_W        : u32     = 1            ,
+) (
+    clk            : input  clock                                                       ,
+    rst            : input  reset                                                       ,
+    i_retire       : input  retire_pkg::RetireRec                                [LANES],
+    i_irq_evt      : input  retire_pkg::IrqEvent                                        ,
+    i_chk          : input  logic                <CHK_W>                                ,
+    i_hash_mismatch: input  logic                                                       ,
+    o_stop         : output logic                                                [LANES],
+    o_x3           : output logic                <64>                                   ,
+    o_tohost       : output logic                <32>                                   ,
+    o_pass         : output logic                                                       ,
+    o_fail         : output logic                                                       ,
+    o_done         : output logic                                                       ,
+    o_cycles       : output logic                <64>                                   ,
+    o_instret      : output logic                <64>                                   ,
+    o_last_pc      : output logic                <64>                                   ,
+    o_ret_cnt      : output logic                <64>                                   ,
+    o_trap_cnt     : output logic                <64>                                   ,
+    o_chk          : output logic                <CHK_W + retire_pkg::CHK_RET_W>        ,
+) {
+    import retire_pkg::*;
+
+    var x3_q      : logic<64>       ;
+    var tohost_q  : logic<32>       ;
+    var th_seen_q : logic           ;
+    var frozen_q  : logic           ;
+    var cycles_q  : logic<64>       ;
+    var instret_q : logic<64>       ;
+    var last_pc_q : logic<64>       ;
+    var ret_q     : logic<64>       ;
+    var trap_q    : logic<64>       ;
+    var order_q   : logic<64>       ;
+    var core_chk_q: logic<CHK_W>    ;
+    var ret_chk_q : logic<CHK_RET_W>;
+
+    // Lane chains: entry l is the state before lane l.
+    var x3_c  : logic<64>        [LANES + 1];
+    var th_c  : logic            [LANES + 1];
+    var thv_c : logic<32>        [LANES + 1];
+    var frz_c : logic            [LANES + 1];
+    var ins_c : logic<64>        [LANES + 1];
+    var ret_c : logic<64>        [LANES + 1];
+    var trp_c : logic<64>        [LANES + 1];
+    var pc_c  : logic<64>        [LANES + 1];
+    var ord_c : logic<64>        [LANES + 1];
+    var hole_c: logic            [LANES + 1];
+    var tseen : logic            [LANES + 1];
+    var vany_c: logic            [LANES + 1];
+    var bits_c: logic<CHK_RET_W> [LANES + 1];
+
+    assign x3_c[0]   = x3_q;
+    assign th_c[0]   = th_seen_q;
+    assign thv_c[0]  = tohost_q;
+    assign frz_c[0]  = frozen_q;
+    assign ins_c[0]  = instret_q;
+    assign ret_c[0]  = ret_q;
+    assign trp_c[0]  = trap_q;
+    assign pc_c[0]   = last_pc_q;
+    assign ord_c[0]  = order_q;
+    assign hole_c[0] = 1'b0;
+    assign tseen[0]  = 1'b0;
+    assign vany_c[0] = 1'b0;
+    assign bits_c[0] = '0;
+
+    for l in 0..LANES :g_lane {
+        let r    : RetireRec            = i_retire[l];
+        let ok   : logic                = r.valid && !r.trap;
+        let th_st: logic                = ok && r.mem_paddr == TOHOST_PA && r.mem_wmask != 16'd0;
+        let x3_wr: logic                = ok && r.rd_kind == RdKind::INT && r.rd_addr == 5'd3;
+        let term : logic                = !frz_c[l] && (if PASS_BY_X3 ? x3_wr && r.rd_wdata == 64'hAA : th_st);
+        let e_gap: logic                = r.valid && hole_c[l];
+        let e_ord: logic                = r.valid && r.order != ord_c[l];
+        let e_tln: logic                = r.valid && r.trap && l != 0 && !TRAP_ANY_LANE;
+        let e_fls: logic                = r.valid && tseen[l];
+        let e_tfx: logic                = r.valid && r.trap
+            && (r.rd_kind != RdKind::NONE || r.rd2_valid || r.mem_wmask != 16'd0 || r.csr_valid || r.next_pc != 64'd0);
+        var e    : logic    <CHK_RET_W>;
+
+        always_comb {
+            e                   = '0;
+            e[CHK_RET_LANE_GAP] = e_gap;
+            e[CHK_RET_ORDER]    = e_ord;
+            e[CHK_RET_TRAP_LN]  = e_tln;
+            e[CHK_RET_FLUSH]    = e_fls;
+            e[CHK_RET_TRAP_FX]  = e_tfx;
+        }
+
+        assign o_stop[l]     = term;
+        assign x3_c[l + 1]   = if x3_wr ? r.rd_wdata : x3_c[l];
+        assign th_c[l + 1]   = th_c[l] || th_st;
+        assign thv_c[l + 1]  = if th_st && !th_c[l] ? r.mem_wdata[31:0] : thv_c[l];
+        assign frz_c[l + 1]  = frz_c[l] || term;
+        assign ins_c[l + 1]  = ins_c[l] + {63'd0, ok && !frz_c[l]};
+        assign ret_c[l + 1]  = ret_c[l] + {63'd0, ok};
+        assign trp_c[l + 1]  = trp_c[l] + {63'd0, r.valid && r.trap};
+        assign pc_c[l + 1]   = if r.valid ? r.pc : pc_c[l];
+        assign ord_c[l + 1]  = if r.valid ? r.order + 64'd1 : ord_c[l];
+        assign hole_c[l + 1] = hole_c[l] || !r.valid;
+        assign tseen[l + 1]  = tseen[l] || (r.valid && r.trap);
+        assign vany_c[l + 1] = vany_c[l] || r.valid;
+        assign bits_c[l + 1] = bits_c[l] | e;
+    }
+
+    let e_irq  : logic            = i_irq_evt.valid && (vany_c[LANES] || i_irq_evt.order != order_q);
+    var irq_bit: logic<CHK_RET_W>;
+    always_comb {
+        irq_bit              = '0;
+        irq_bit[CHK_RET_IRQ] = e_irq;
+    }
+
+    always_ff {
+        if_reset {
+            x3_q       = 64'd0;
+            tohost_q   = 32'd0;
+            th_seen_q  = 1'b0;
+            frozen_q   = 1'b0;
+            cycles_q   = 64'd0;
+            instret_q  = 64'd0;
+            last_pc_q  = 64'd0;
+            ret_q      = 64'd0;
+            trap_q     = 64'd0;
+            order_q    = 64'd0;
+            core_chk_q = '0;
+            ret_chk_q  = '0;
+        } else {
+            x3_q       = x3_c[LANES];
+            tohost_q   = thv_c[LANES];
+            th_seen_q  = th_c[LANES];
+            frozen_q   = frz_c[LANES];
+            instret_q  = ins_c[LANES];
+            last_pc_q  = pc_c[LANES];
+            ret_q      = ret_c[LANES];
+            trap_q     = trp_c[LANES];
+            order_q    = ord_c[LANES];
+            core_chk_q = core_chk_q | i_chk;
+            ret_chk_q  = ret_chk_q | bits_c[LANES] | irq_bit;
+            if !frozen_q {
+                cycles_q = cycles_q + 64'd1;
+            }
+        }
+    }
+
+    let chk_all: logic<CHK_W + CHK_RET_W> = {core_chk_q, ret_chk_q};
+    let chk_any: logic                    = chk_all != '0;
+    let goal   : logic                    = if PASS_BY_X3 ? x3_q == 64'hAA : tohost_q == 32'd1;
+    let reached: logic                    = if PASS_BY_X3 ? x3_q == 64'hAA : tohost_q != 32'd0;
+
+    assign o_x3       = x3_q;
+    assign o_tohost   = tohost_q;
+    assign o_pass     = goal && !chk_any && !i_hash_mismatch;
+    assign o_fail     = (tohost_q != 32'd0 && tohost_q != 32'd1) || chk_any || i_hash_mismatch;
+    assign o_done     = reached || chk_any || i_hash_mismatch;
+    assign o_cycles   = cycles_q;
+    assign o_instret  = instret_q;
+    assign o_last_pc  = last_pc_q;
+    assign o_ret_cnt  = ret_q;
+    assign o_trap_cnt = trap_q;
+    assign o_chk      = chk_all;
+}

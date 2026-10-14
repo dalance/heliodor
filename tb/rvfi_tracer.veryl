@@ -1,0 +1,389 @@
+// rvfi_tracer: serializes the retire record stream into trace lines and a
+// rolling hash, and checks the hash against golden checkpoints.
+//
+// Ports (timing contract):
+//   i_retire[LANES] : registered retire records, sampled every posedge; lanes
+//                     are scanned 0..LANES-1 so the stream is lane-split free
+//   i_irq_evt       : registered, only in cycles with no valid lane record
+//   i_stop[LANES]   : combinational, marks the terminal record (tohost store
+//                     or x3 := 0xAA); it and older records are hashed, nothing
+//                     after it is, and the final H line is printed
+//   i_flush         : end of test without a terminal record; prints the final
+//                     H line over everything absorbed so far
+//   o_count/o_hash  : registered, records absorbed and the hash after them
+//   o_final_valid   : registered, the final H line has been printed
+//   o_hash_mismatch : registered, sticky: checkpoint or final mismatch, or a
+//                     stale checkpoint file
+//   o_ck_stale      : the checkpoint file's TRACER_VER or interval differs
+// Owns:
+//   - The trace text, the MASK rules and the hash: they are defined here
+//     only, and the text and the hash cover exactly the same normalized
+//     fields, so equal hashes mean equal canonical traces.
+//   - Hash and text depend only on the record sequence, not on how records
+//     are distributed over lanes or cycles.
+// Rationale:
+//   - Trace lines (values in hex, order and register numbers in decimal,
+//     masked values printed as `*`):
+//       R <order> <priv><virt> <pc> <insn>[c] [x<n>=<v>|f<n>=<v>] [y=<v>]
+//         [S <pa> <wmask> <wdata> [IO]] [C <csr>=<v>] [F <fflags>]
+//         [V <vtype> <vl> <vstart> <vrf_wcnt> <vrf_hash>]
+//       T <order> <priv><virt> <pc> <insn>[c] <cause> <tval>
+//       I <order> <cause> <epc>
+//       H <count> <hash>      final, once
+//       K <count> <hash>      every 2^CK_LOG2 records when CK_PRINT
+//     R/T/I lines are printed when TRACE_EN and TRACE_LO <= order <
+//     TRACE_HI; the window does not affect the hash.
+//     <count> is the number of records absorbed. A 16-byte store prints
+//     {wdata_hi, wdata}. Store data is cut to the bytes in wmask.
+//   - Normalization: a write to x0 is not a register write; F is printed
+//     only for non-zero flags; a vector op's mem_* are dropped.
+//   - MASK rules (applied before hashing):
+//       CNT: rd of a Zicsr op on mcycle/cycle, minstret/instret, the HPM
+//            counters and scountovf; bit 63 of mhpmevent3..31; bit 13 of
+//            mip/sip.
+//       fetch fault (cause 1/12/20): insn and its RVC flag.
+//       RVC_ILL (cause 2 with is_rvc): insn and tval.
+//       EBREAK_TVAL (cause 3): tval.
+//       SATP_ENABLE_WIN: store PA from the first S-mode satp write with
+//            MODE=8 up to the next satp write.
+//     Load values are not traced, so the rd=x0 load rdata rule has nothing
+//     to act on yet.
+//   - Hash: h' = mix64((h ^ w) + ABSORB_K) over 64-bit words, starting
+//     from H_INIT. A record absorbs 14 words: a header with every flag,
+//     kind and small field, then order, pc, insn/cause, rd value or tval,
+//     rd2, store PA, store data lo/hi, CSR data, vtype, vl, vstart and
+//     vrf_hash; absent or masked fields absorb 0. An IrqEvent absorbs a
+//     header, order, cause and epc.
+//   - Checkpoint file ($readmemh, 64-bit words): [0] TRACER_VER,
+//     [1] CK_LOG2, [2] n, [3..3+n) hash after k*2^CK_LOG2 records for
+//     k = 1..n, [3+n] final count, [4+n] final hash. 2^CK_LOG2 >= LANES, so
+//     at most one checkpoint falls in a cycle.
+module rvfi_tracer #(
+    param LANES   : u32        = 2                      ,
+    param CK_EN   : bit        = 0                      ,
+    param CK_FILE : string     = ""                     ,
+    param CK_LOG2 : u32        = 10                     ,
+    param CK_DEPTH: u32        = 256                    ,
+    param CK_PRINT: bit        = 0                      ,
+    param TRACE_EN: bit        = 0                      ,
+    param TRACE_LO: bit   <64> = 64'd0                  ,
+    param TRACE_HI: bit   <64> = 64'hffff_ffff_ffff_ffff,
+) (
+    clk            : input  clock                            ,
+    rst            : input  reset                            ,
+    i_retire       : input  retire_pkg::RetireRec     [LANES],
+    i_irq_evt      : input  retire_pkg::IrqEvent             ,
+    i_stop         : input  logic                     [LANES],
+    i_flush        : input  logic                            ,
+    o_count        : output logic                <64>        ,
+    o_hash         : output logic                <64>        ,
+    o_final_valid  : output logic                            ,
+    o_hash_mismatch: output logic                            ,
+    o_ck_stale     : output logic                            ,
+) {
+    import retire_pkg::*;
+
+    const NW      : u32       = 14;
+    const ABSORB_K: logic<64> = 64'h9e37_79b9_7f4a_7c15;
+    const H_INIT  : logic<64> = 64'h6865_6c69_6f64_6f72;
+    const CK_MASK : logic<64> = (64'd1 << CK_LOG2) - 64'd1;
+    const KIND_R  : logic<2>  = 2'd1;
+    const KIND_T  : logic<2>  = 2'd2;
+    const KIND_I  : logic<2>  = 2'd3;
+
+    function absorb (
+        h: input logic<64>,
+        w: input logic<64>,
+    ) -> logic<64> {
+        return mix64((h ^ w) + ABSORB_K);
+    }
+
+    function byte_bits (
+        m: input logic<8>,
+    ) -> logic<64> {
+        return {
+            m[7] repeat 8, m[6] repeat 8, m[5] repeat 8, m[4] repeat 8, m[3] repeat 8, m[2] repeat 8, m[1] repeat 8,
+            m[0] repeat 8
+        };
+    }
+
+    var hash_q    : logic<64>;
+    var count_q   : logic<64>;
+    var stopped_q : logic    ;
+    var win_q     : logic    ;
+    var win_done_q: logic    ;
+    var mismatch_q: logic    ;
+    var stale_q   : logic    ;
+    var ck_ptr_q  : logic<32>;
+    var ck_k_q    : logic<64>;
+
+    // Lane chains: entry l is the state before lane l, entry LANES after all.
+    var h_c   : logic<64> [LANES + 1];
+    var cnt_c : logic<64> [LANES + 1];
+    var stop_c: logic     [LANES + 1];
+    var win_c : logic     [LANES + 1];
+    var wdn_c : logic     [LANES + 1];
+
+    var take  : logic        [LANES];
+    var pr_on : logic        [LANES];
+    var ck_hit: logic<LANES>        ;
+    var ck_bad: logic<LANES>        ;
+    var m_insn: logic        [LANES];
+    var m_tval: logic        [LANES];
+    var m_rd  : logic        [LANES];
+    var m_pa  : logic        [LANES];
+    var p_rvc : logic        [LANES];
+    var p_rd  : logic<2>     [LANES];
+    var p_rdv : logic<64>    [LANES];
+    var p_y   : logic        [LANES];
+    var p_st  : logic        [LANES];
+    var p_wide: logic        [LANES];
+    var p_wd  : logic<64>    [LANES];
+    var p_wdhi: logic<64>    [LANES];
+    var p_csr : logic        [LANES];
+    var p_ff  : logic        [LANES];
+    var p_vec : logic        [LANES];
+
+    #[allow(initial_assign)]
+    var ck_mem: logic<64> [CK_DEPTH];
+    initial {
+        if CK_EN {
+            $readmemh(CK_FILE, ck_mem);
+        }
+    }
+    let ck_n       : logic<64> = ck_mem[2];
+    let ck_n_idx   : logic<32> = ck_n[31:0];
+    let ck_fin_ci  : logic<32> = ck_n_idx + 32'd3;
+    let ck_fin_hi  : logic<32> = ck_n_idx + 32'd4;
+    let ck_exp     : logic<64> = ck_mem[ck_ptr_q];
+    let ck_fin_cnt : logic<64> = ck_mem[ck_fin_ci];
+    let ck_fin_hash: logic<64> = ck_mem[ck_fin_hi];
+    let ck_stale   : logic     = CK_EN && (ck_mem[0] != TRACER_VER || ck_mem[1] != CK_LOG2 as 64);
+
+    assign h_c[0]    = hash_q;
+    assign cnt_c[0]  = count_q;
+    assign stop_c[0] = stopped_q;
+    assign win_c[0]  = win_q;
+    assign wdn_c[0]  = win_done_q;
+
+    for l in 0..LANES :g_lane {
+        let r: RetireRec = i_retire[l];
+
+        let csr_op : logic     = r.insn[6:0] == 7'h73 && r.insn[14:12] != 3'd0 && r.insn[14:12] != 3'd4;
+        let csr_num: logic<12> = r.insn[31:20];
+        let cnt_all: logic     = csr_op
+            && (csr_num == 12'hB00 || csr_num == 12'hC00 || csr_num == 12'hB02 || csr_num == 12'hC02
+                || (csr_num >= 12'hB03 && csr_num <= 12'hB1F) || (csr_num >= 12'hC03 && csr_num <= 12'hC1F) || csr_num
+                == 12'hDA0);
+        let cnt_b63: logic     = csr_op && csr_num >= 12'h323 && csr_num <= 12'h33F;
+        let cnt_b13: logic     = csr_op && (csr_num == 12'h344 || csr_num == 12'h144);
+
+        let ffault : logic = r.trap && (r.cause == 6'd1 || r.cause == 6'd12 || r.cause == 6'd20);
+        let rvc_ill: logic = r.trap && r.cause == 6'd2 && r.is_rvc;
+        let ebreak : logic = r.trap && r.cause == 6'd3;
+
+        let rd_int: logic     = r.rd_kind == RdKind::INT && r.rd_addr != 5'd0;
+        let rd_on : logic     = !r.trap && (rd_int || r.rd_kind == RdKind::FP);
+        let rd_bm : logic<64> = {cnt_b63 && rd_int, 49'd0, cnt_b13 && rd_int, 13'd0};
+        let st_on : logic     = !r.trap && !r.vec_v && r.mem_wmask != 16'd0;
+        let satp_w: logic     = take[l] && !r.trap && r.csr_valid && r.csr_addr == 12'h180 && !r.virt;
+        let w_open: logic     = satp_w && r.priv == 2'd1 && r.csr_wdata[63:60] == 4'h8 && !wdn_c[l] && !win_c[l];
+        let w_shut: logic     = satp_w && win_c[l];
+
+        assign take[l]   = r.valid && !stop_c[l];
+        assign pr_on[l]  = TRACE_EN && take[l] && r.order >= TRACE_LO && r.order <: TRACE_HI;
+        assign m_insn[l] = ffault || rvc_ill;
+        assign m_tval[l] = rvc_ill || ebreak;
+        assign m_rd[l]   = cnt_all && rd_int;
+        assign m_pa[l]   = st_on && win_c[l];
+        assign p_rvc[l]  = r.is_rvc && !ffault;
+        assign p_rd[l]   = if rd_on ? r.rd_kind : RdKind::NONE;
+        assign p_rdv[l]  = if rd_on && !m_rd[l] ? r.rd_wdata & ~rd_bm : 64'd0;
+        assign p_y[l]    = !r.trap && r.rd2_valid;
+        assign p_st[l]   = st_on;
+        assign p_wide[l] = st_on && r.mem_wmask[15:8] != 8'd0;
+        assign p_wd[l]   = if st_on ? r.mem_wdata & byte_bits(r.mem_wmask[7:0]) : 64'd0;
+        assign p_wdhi[l] = if st_on ? r.mem_wdata_hi & byte_bits(r.mem_wmask[15:8]) : 64'd0;
+        assign p_csr[l]  = !r.trap && r.csr_valid;
+        assign p_ff[l]   = !r.trap && r.fflags != 5'd0;
+        assign p_vec[l]  = !r.trap && r.vec_v;
+
+        let hdr: logic<64> = {
+            1'b0, (if r.trap ? KIND_T : KIND_R), r.priv, r.virt, p_rvc[l], m_insn[l], p_rd[l],
+            (if rd_on ? r.rd_addr : 5'd0), m_rd[l], p_y[l], p_st[l], st_on && r.mem_io, m_pa[l],
+            (if st_on ? r.mem_wmask : 16'd0), p_csr[l], (if p_csr[l] ? r.csr_addr : 12'd0),
+            (if p_ff[l] ? r.fflags : 5'd0), p_vec[l], (if p_vec[l] ? r.vrf_wcnt : 8'd0), m_tval[l]
+        };
+
+        var w: logic<64> [NW];
+        assign w[0]  = hdr;
+        assign w[1]  = r.order;
+        assign w[2]  = r.pc;
+        assign w[3]  = {(if m_insn[l] ? 32'd0 : r.insn), 26'd0, (if r.trap ? r.cause : 6'd0)};
+        assign w[4]  = if r.trap ? (if m_tval[l] ? 64'd0 : r.tval) : p_rdv[l];
+        assign w[5]  = if p_y[l] ? r.rd2_wdata : 64'd0;
+        assign w[6]  = if st_on && !m_pa[l] ? r.mem_paddr : 64'd0;
+        assign w[7]  = p_wd[l];
+        assign w[8]  = p_wdhi[l];
+        assign w[9]  = if p_csr[l] ? r.csr_wdata : 64'd0;
+        assign w[10] = if p_vec[l] ? r.vtype : 64'd0;
+        assign w[11] = if p_vec[l] ? r.vl : 64'd0;
+        assign w[12] = if p_vec[l] ? r.vstart : 64'd0;
+        assign w[13] = if p_vec[l] ? r.vrf_hash : 64'd0;
+
+        var a: logic<64> [NW + 1];
+        assign a[0] = h_c[l];
+        for k in 0..NW :g_abs {
+            assign a[k + 1] = absorb(a[k], w[k]);
+        }
+
+        assign h_c[l + 1]    = if take[l] ? a[NW] : h_c[l];
+        assign cnt_c[l + 1]  = cnt_c[l] + {63'd0, take[l]};
+        assign stop_c[l + 1] = stop_c[l] || (take[l] && i_stop[l]);
+        assign win_c[l + 1]  = if w_open ? 1'b1 : if w_shut ? 1'b0 : win_c[l];
+        assign wdn_c[l + 1]  = wdn_c[l] || w_open;
+        assign ck_hit[l]     = take[l] && (cnt_c[l + 1] & CK_MASK) == 64'd0;
+        assign ck_bad[l]     = CK_EN && ck_hit[l] && ck_k_q <: ck_n && h_c[l + 1] != ck_exp;
+    }
+
+    let irq_take: logic         = i_irq_evt.valid && !stop_c[LANES];
+    let irq_pr  : logic         = TRACE_EN && irq_take && i_irq_evt.order >= TRACE_LO && i_irq_evt.order <: TRACE_HI;
+    let irq_hdr : logic<64>     = {KIND_I, 62'd0};
+    var ai      : logic<64> [5];
+    assign ai[0] = h_c[LANES];
+    assign ai[1] = absorb(ai[0], irq_hdr);
+    assign ai[2] = absorb(ai[1], i_irq_evt.order);
+    assign ai[3] = absorb(ai[2], {58'd0, i_irq_evt.cause});
+    assign ai[4] = absorb(ai[3], i_irq_evt.epc);
+
+    let h_post : logic<64> = if irq_take ? ai[4] : h_c[LANES];
+    let fin_now: logic     = !stopped_q && (stop_c[LANES] || i_flush);
+    let fin_bad: logic     = CK_EN && fin_now && (cnt_c[LANES] != ck_fin_cnt || h_post != ck_fin_hash);
+    let any_hit: logic     = |ck_hit;
+    let any_bad: logic     = |ck_bad;
+    let bad_now: logic     = any_bad || fin_bad || ck_stale;
+
+    always_ff {
+        if_reset {
+            hash_q     = H_INIT;
+            count_q    = 64'd0;
+            stopped_q  = 1'b0;
+            win_q      = 1'b0;
+            win_done_q = 1'b0;
+            mismatch_q = 1'b0;
+            stale_q    = 1'b0;
+            ck_ptr_q   = 32'd3;
+            ck_k_q     = 64'd0;
+        } else {
+            for l in 0..LANES {
+                if pr_on[l] {
+                    if i_retire[l].trap {
+                        $write("T %d %d%d %h", i_retire[l].order, i_retire[l].priv, i_retire[l].virt, i_retire[l].pc);
+                    } else {
+                        $write("R %d %d%d %h", i_retire[l].order, i_retire[l].priv, i_retire[l].virt, i_retire[l].pc);
+                    }
+                    if m_insn[l] {
+                        $write(" *");
+                    } else {
+                        $write(" %h", i_retire[l].insn);
+                    }
+                    if p_rvc[l] {
+                        $write("c");
+                    }
+                    if i_retire[l].trap {
+                        $write(" %h", i_retire[l].cause);
+                        if m_tval[l] {
+                            $write(" *");
+                        } else {
+                            $write(" %h", i_retire[l].tval);
+                        }
+                    } else {
+                        if p_rd[l] == RdKind::INT {
+                            $write(" x%d=", i_retire[l].rd_addr);
+                        }
+                        if p_rd[l] == RdKind::FP {
+                            $write(" f%d=", i_retire[l].rd_addr);
+                        }
+                        if p_rd[l] != RdKind::NONE {
+                            if m_rd[l] {
+                                $write("*");
+                            } else {
+                                $write("%h", p_rdv[l]);
+                            }
+                        }
+                        if p_y[l] {
+                            $write(" y=%h", i_retire[l].rd2_wdata);
+                        }
+                        if p_st[l] {
+                            if m_pa[l] {
+                                $write(" S *");
+                            } else {
+                                $write(" S %h", i_retire[l].mem_paddr);
+                            }
+                            if p_wide[l] {
+                                $write(" %h %h", i_retire[l].mem_wmask, {p_wdhi[l], p_wd[l]});
+                            } else {
+                                $write(" %h %h", i_retire[l].mem_wmask, p_wd[l]);
+                            }
+                            if i_retire[l].mem_io {
+                                $write(" IO");
+                            }
+                        }
+                        if p_csr[l] {
+                            $write(" C %h=%h", i_retire[l].csr_addr, i_retire[l].csr_wdata);
+                        }
+                        if p_ff[l] {
+                            $write(" F %h", i_retire[l].fflags);
+                        }
+                        if p_vec[l] {
+                            $write(
+                                " V %h %h %h %h %h",
+                                i_retire[l].vtype,
+                                i_retire[l].vl,
+                                i_retire[l].vstart,
+                                i_retire[l].vrf_wcnt,
+                                i_retire[l].vrf_hash,
+                            );
+                        }
+                    }
+                    $display("");
+                }
+                if CK_PRINT && ck_hit[l] {
+                    $display("K %d %h", cnt_c[l + 1], h_c[l + 1]);
+                }
+            }
+            if irq_pr {
+                $display("I %d %h %h", i_irq_evt.order, i_irq_evt.cause, i_irq_evt.epc);
+            }
+            if fin_now {
+                $display("H %d %h", cnt_c[LANES], h_post);
+            }
+            if bad_now && !mismatch_q {
+                $display(
+                    "rvfi_tracer: hash mismatch count=%d hash=%h ck_exp=%h stale=%b",
+                    cnt_c[LANES],
+                    h_post,
+                    ck_exp,
+                    ck_stale,
+                );
+            }
+            hash_q     = h_post;
+            count_q    = cnt_c[LANES];
+            stopped_q  = stopped_q || fin_now;
+            win_q      = win_c[LANES];
+            win_done_q = wdn_c[LANES];
+            mismatch_q = mismatch_q || bad_now;
+            stale_q    = ck_stale;
+            if any_hit {
+                ck_ptr_q = ck_ptr_q + 32'd1;
+                ck_k_q   = ck_k_q + 64'd1;
+            }
+        }
+    }
+
+    assign o_count         = count_q;
+    assign o_hash          = hash_q;
+    assign o_final_valid   = stopped_q;
+    assign o_hash_mismatch = mismatch_q;
+    assign o_ck_stale      = stale_q;
+}
