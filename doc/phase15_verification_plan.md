@@ -154,6 +154,16 @@ litmus の histogram (0x8000_4000) と barrier 語 (0x8000_6000) の DRAM ダン
 
 adapter (`tb/tb_flat_slot_mem.veryl`) の仕様: コアの外部ポート (設計書 §4.5 の D read slot、I read slot、write channel、coherence 入力) にそのまま接続する。mem_ctrl と同じ accept + 8-beat STREAM (DRAM 領域) と legacy single-beat (非 DRAM) を、平坦配列から即時の accept で返す。write channel は即 grant し、coherence 入力は 0 に固定する。CLINT と UART の印字は `pma_check` でデコードして harness に置き、PLIC は持たない (smode_plic は常に統合 SoC で走らせる)。コア側には knob を足さない (D3)。
 
+
+#### 2.6.1 結果 (2026-10-14、M1a 手順 7)
+
+【決定】f = 1.21 / 1.25 (2 回の測定) で 1.5 以下。新コアの arch テストは統合 SoC に載せる。flat-memory slot adapter は作らない。
+
+- 20 本すべてが統合 SoC 上の V14 で tohost=1 になった。除外したテストは無い。
+- サイクルあたりのシミュレーション時間の比は約 1.22 (SoC 10.9 us 対 平坦 8.9 us)。
+- V14 が pass までに要するサイクル数は SoC 上で約 1.49 倍 (mem_ctrl/L2 の遅延。平坦メモリは遅延 0)。
+- 現行の平坦ハーネスは早期終了しない。早期終了を入れると arch 系の時間は約 1/18 になり、1 本あたり約 0.13 s の固定費 (simulator の生成と hex 読み込み) が支配的になる。新コアの生成ラッパに早期終了を入れる (§2.3) 効果はこちらの方がはるかに大きい。
+
 ---
 
 ## 3. golden モデル (D1)
