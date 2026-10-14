@@ -1,0 +1,265 @@
+// core_types: config-dependent types, widths and derived constants.
+//
+// The only place where tag, index and port widths are computed; everything
+// else uses the types below. Modules import it as `import core_types::<CFG>::*`.
+pub package core_types::<CFG: core_cfg> {
+    import opclass_pkg::*;
+
+    // ---- Widths ----
+
+    const ROB_IDX_W: u32 = tag_pkg::idx_w(CFG::ROB_N);
+    const LQ_IDX_W : u32 = tag_pkg::idx_w(CFG::LQ_N);
+    const SQ_IDX_W : u32 = tag_pkg::idx_w(CFG::SQ_N);
+    const FTQ_IDX_W: u32 = tag_pkg::idx_w(CFG::FTQ_N);
+    // int and fp share one PReg width: the reused vector unit and the CDB
+    // bus assume PRF_INT_W == PRF_FP_W.
+    const PREG_W: u32 = tag_pkg::idx_w(if CFG::PRF_INT_N >: CFG::PRF_FP_N ? CFG::PRF_INT_N : CFG::PRF_FP_N);
+    const CKPT_W: u32 = tag_pkg::idx_w(CFG::NUM_CKPT);
+    const FOFF_W: u32 = tag_pkg::idx_w(CFG::FETCH_BYTES / 2); // halfword offset in a fetch block
+
+    // Full tag widths (wrap + index), the W argument of tag_older/tag_next.
+    const ROB_TAG_W: u32 = ROB_IDX_W + 1;
+    const LQ_TAG_W : u32 = LQ_IDX_W + 1;
+    const SQ_TAG_W : u32 = SQ_IDX_W + 1;
+    const FTQ_TAG_W: u32 = FTQ_IDX_W + 1;
+
+    // Free-list sizes: every physical register beyond the 32 architectural
+    // mappings. free_list and busy_table use these instead of the PRF sizes.
+    const FREE_INT_N: u32 = CFG::PRF_INT_N - 32;
+    const FREE_FP_N : u32 = CFG::PRF_FP_N - 32;
+    // One FlPtr type serves both classes, so it is sized for the larger ring.
+    const FL_IDX_W: u32 = tag_pkg::idx_w(if FREE_INT_N >: FREE_FP_N ? FREE_INT_N : FREE_FP_N);
+    const FL_TAG_W: u32 = FL_IDX_W + 1;
+
+    // ld_barrier sequence: at most ROB_N barriers are unretired, so two
+    // extra bits keep the cyclic comparison unambiguous.
+    const BAR_SEQ_W: u32 = ROB_IDX_W + 2;
+
+    // ---- Derived counts ----
+
+    const WB_N        : u32 = CFG::ISSUE_W + CFG::MEM_W; // one WB port per issue port and memory pipe
+    const RETIRE_CNT_W: u32 = tag_pkg::idx_w(CFG::COMMIT_W + 1);
+    // Stores retired per cycle: execute produces at most MEM_W per cycle.
+    const ST_RET_N: u32 = CFG::MEM_W;
+    // sb push ports, in lines: a line-crossing store pushes two lines.
+    const PUSH_W: u32 = if CFG::MEM_W >: 2 ? CFG::MEM_W : 2;
+    // walk reuses the rename RAT write ports.
+    const WALK_W: u32 = CFG::RENAME_W;
+
+    // Exec ports carrying FU kind k.
+    function port_count (
+        k: input FuKind,
+    ) -> u32 {
+        var c: u32;
+        c = 0;
+        for p in 0..CFG::ISSUE_W {
+            c += CFG::PORT_FU[p][k] as u32;
+        }
+        return c;
+    }
+
+    // Issue ports fed by IQ q (exec ports, or the memory pipes for MEM_IQ).
+    function iq_port_count (
+        q: input u32,
+    ) -> u32 {
+        var c: u32;
+        c = if q == CFG::MEM_IQ ? CFG::MEM_W : 0;
+        for p in 0..CFG::ISSUE_W {
+            c += (CFG::PORT_IQ[p] == q) as u32;
+        }
+        return c;
+    }
+
+    // Resolves per cycle, = FTQ PC read ports.
+    const BRU_N: u32 = port_count(FuKind::BRU);
+
+    // ---- Tags ----
+
+    struct RobTag {
+        wrap: logic           ,
+        idx : logic<ROB_IDX_W>,
+    }
+    struct LqTag {
+        wrap: logic          ,
+        idx : logic<LQ_IDX_W>,
+    }
+    struct SqTag {
+        wrap: logic          ,
+        idx : logic<SQ_IDX_W>,
+    }
+    struct FtqTag {
+        wrap: logic           ,
+        idx : logic<FTQ_IDX_W>,
+    }
+
+    enum RegClass: logic {
+        INT,
+        FP,
+    }
+
+    struct PReg {
+        cls: RegClass        ,
+        idx: logic   <PREG_W>,
+    }
+
+    // Free-list ring pointer of one RegClass.
+    struct FlPtr {
+        wrap: logic          ,
+        idx : logic<FL_IDX_W>,
+    }
+
+    type BarSeq = logic<BAR_SEQ_W>;
+
+    // Identity of an op, carried with it through every stage. Live state
+    // (ROB head, the driver of a port) is never re-read to identify an op.
+    struct OpTag {
+        rob   : RobTag        , // every op
+        lq    : LqTag         , // loads, valid when lq_v
+        lq_v  : logic         ,
+        sq    : SqTag         , // stores and store-class atomics, valid when sq_v
+        sq_v  : logic         ,
+        ftq   : FtqTag        , // fetch block
+        foff  : logic <FOFF_W>, // halfword offset in the block
+        pdst  : PReg          ,
+        has_rd: logic         , // 0 for x0 and no-destination ops
+        ckpt  : logic <CKPT_W>, // checkpoint held by this op, valid when ckpt_v
+        ckpt_v: logic         ,
+    }
+
+    // ---- Kill and redirect ----
+
+    // Registered one-cycle pulse, at most one per cycle. A partial kill keeps
+    // every op older than or equal to keep; the rewind targets come from the
+    // rob dispatch snapshot of keep.
+    struct Kill {
+        valid   : logic         ,
+        full    : logic         , // every in-flight op dies, the fields below are ignored
+        keep    : RobTag        , // youngest surviving op
+        lq_tail : LqTag         ,
+        sq_tail : SqTag         ,
+        fl_int  : FlPtr         , // free-list heads per RegClass
+        fl_fp   : FlPtr         ,
+        bar_seq : BarSeq        ,
+        ftq_tail: FtqTag        , // next of the branch's FtqTag
+        ckpt_v  : logic         ,
+        ckpt    : logic <CKPT_W>,
+    }
+
+    // Only BR and BR_CM carry the branch outcome (Redirect.foff/taken) used to
+    // repair predictor history and RAS.
+    enum RedirKind: logic<3> {
+        BR, // partial kill from a BRU resolve
+        BR_CM, // full kill from the commit-time mispredict backstop
+        TRAP,
+        IRQ,
+        XRET,
+        SERIAL,
+        REPLAY,
+    }
+
+    struct Redirect {
+        valid   : logic            ,
+        pc      : logic    <64>    ,
+        ftq_keep: FtqTag           ,
+        foff    : logic    <FOFF_W>, // halfword offset of the redirecting op in its block
+        taken   : logic            , // resolved direction of that op
+        kind    : RedirKind        ,
+    }
+
+    // Branch outcome carried by a BRU WB packet.
+    struct BrResolve {
+        valid  : logic         ,
+        mispred: logic         ,
+        taken  : logic         ,
+        next_pc: logic <64>    ,
+        ftq    : FtqTag        ,
+        foff   : logic <FOFF_W>,
+    }
+
+    // Whether kill k removes the op tagged t. The comparison is tag_older
+    // spelled out: core_types cannot instantiate a generic function with its
+    // own constants. tb/test_tag.veryl checks the two agree.
+    function killed (
+        k: input Kill  ,
+        t: input RobTag,
+    ) -> logic {
+        return k.valid && (k.full || (if k.keep.wrap == t.wrap ? k.keep.idx <: t.idx : k.keep.idx >: t.idx));
+    }
+
+    // ---- Structural constraints ----
+
+    // One bit per violated constraint; a legal config has CFG_ERR == 0.
+    // Constraints of a single module are added here by that module's owner.
+    function cfg_err () -> u32 {
+        var e: u32;
+        e = 0;
+        if CFG::FETCH_W != 1 && CFG::FETCH_W != 2 && CFG::FETCH_W != 4 {
+            e |= 1 << 0; // icache block and one ITLB lookup per block cap fetch at 32 bytes
+        }
+        if CFG::FETCH_BYTES != 8 * CFG::FETCH_W {
+            e |= 1 << 1;
+        }
+        if CFG::RENAME_W == 0 || CFG::ISSUE_W == 0 || CFG::MEM_W == 0 || CFG::COMMIT_W == 0 {
+            e |= 1 << 2;
+        }
+        if CFG::ROB_N >: 256 || (CFG::ROB_N & (CFG::ROB_N - 1)) != 0 || CFG::ROB_N <: CFG::RENAME_W {
+            e |= 1 << 3; // vector unit: 8-bit owner and idx - head age
+        }
+        if CFG::PRF_INT_N <= 32 || CFG::PRF_FP_N <= 32 {
+            e |= 1 << 4;
+        }
+        if CFG::REISSUE_W == 0 || CFG::REISSUE_W >: CFG::MEM_W {
+            e |= 1 << 5;
+        }
+        if CFG::MSHR_N != 1 || CFG::DC_NB != 1 {
+            e |= 1 << 6; // one fill per hart until the new core boots N=4
+        }
+        if CFG::DQ_N <: CFG::FETCH_W || CFG::RQ_N <: CFG::FETCH_W || CFG::RQ_N <: CFG::RENAME_W {
+            e |= 1 << 7; // a lane_queue holds at least one full group
+        }
+        if CFG::MEM_IQ >= CFG::N_IQ {
+            e |= 1 << 8;
+        }
+        for q in 0..CFG::N_IQ {
+            if iq_port_count(q) == 0 || CFG::IQ_N[q] <: CFG::RENAME_W || CFG::IQ_NSRC[q] == 0 || CFG::IQ_NSRC[q] >: 3 {
+                e |= 1 << 9;
+            }
+        }
+        for p in 0..CFG::ISSUE_W {
+            if CFG::PORT_IQ[p] >= CFG::N_IQ || CFG::PORT_IQ[p] == CFG::MEM_IQ {
+                e |= 1 << 10;
+            }
+            // Memory and dispatch-completed kinds never sit on an exec port.
+            if (CFG::PORT_FU[p]
+                    & (fu_bit(FuKind::NONE) | fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE) | fu_bit(FuKind::ATOMIC)
+                        | fu_bit(FuKind::VEC))) != 0 {
+                e |= 1 << 11;
+            }
+            // At most one HOLE_FILL (blocking) FU per port: one wb_resv requester.
+            if CFG::PORT_FU[p][FuKind::DIV] && CFG::PORT_FU[p][FuKind::FDIV] {
+                e |= 1 << 12;
+            }
+            // The ports of one FU kind share an IQ, so the destination IQ of an
+            // op depends on its kind alone.
+            for p2 in 0..CFG::ISSUE_W {
+                if (CFG::PORT_FU[p] & CFG::PORT_FU[p2]) != 0 && CFG::PORT_IQ[p] != CFG::PORT_IQ[p2] {
+                    e |= 1 << 13;
+                }
+            }
+        }
+        if port_count(FuKind::SYS) != 1 {
+            e |= 1 << 14;
+        }
+        if port_count(FuKind::ALU) == 0 || port_count(FuKind::BRU) == 0 || port_count(FuKind::MUL) == 0
+            || port_count(FuKind::DIV) == 0 || port_count(FuKind::FMA) == 0 || port_count(FuKind::FMISC) == 0
+            || port_count(FuKind::FDIV) == 0 {
+            e |= 1 << 15; // every exec kind decode can emit has a port
+        }
+        if CFG::NUM_CKPT != 0 {
+            e |= 1 << 16; // rename recovers by walk only until the checkpoint pool exists
+        }
+        return e;
+    }
+
+    const CFG_ERR: u32 = cfg_err();
+}
