@@ -313,28 +313,30 @@ VU に由来する行 (ROB ≤ 256 と 2 の冪、CDB の 2 lane snoop、alloc 1
 | sweep 点 | 構造制約を満たす他の値 | elaborate でき、bench が走る。ゲートでの保証は無い。config パッケージは `tb/` に置く。 |
 | 拒否 | 構造制約に反する値 | `test_cfg_constraints` を落とす (下記)。 |
 
-【決定】(U6、§3.7.1) 構造制約は `core_types` の 1 つの bitmask 定数 `CFG_ERR` (制約 1 つに 1 bit、合法な構成では 0) にまとめ、`#[test] test_cfg_constraints` が全構成について `CFG_ERR == 0` を検査する。理由: 未定義モジュールの instantiate は generate 条件に関係なく常にエラーになり、elaborate 時の拒否が書けないため。各 bit が実際に立ちうることは、わざと違反させた構成 `cfg_bad_a`/`cfg_bad_b` (`tb/cfg_bad.veryl`) が期待どおりの bit を立てることで示す (2 つの和で全 bit を覆う)。制約を所有モジュールの側へ移すのは、その方がきれいになった場合に限る。M1b 時点の bit:
+【決定】(U6、§3.7.1) 構造制約は `core_types` の 1 つの bitmask 定数 `CFG_ERR` (制約 1 つに 1 bit、合法な構成では 0) にまとめ、`#[test] test_cfg_constraints` が全構成について `CFG_ERR == 0` を検査する。理由: 未定義モジュールの instantiate は generate 条件に関係なく常にエラーになり、elaborate 時の拒否が書けないため。各 bit が実際に立ちうることは、わざと違反させた構成 `cfg_bad_a`/`cfg_bad_b` (`tb/cfg_bad.veryl`) が期待どおりの bit を立てることで示す (2 つの和で全 bit を覆う)。制約を所有モジュールの側へ移すのは、その方がきれいになった場合に限る。M1b 時点の bit (cold-reader gate の後の番号。M1b の build が持たない FU と VU に由来する制約を外して詰め直した):
 
 | bit | 制約 | 理由 |
 |---|---|---|
 | 0 | `FETCH_W` ∈ {1, 2, 4} | icache の block と block あたり 1 回の ITLB lookup で fetch は 32 B が上限 (§3.4) |
 | 1 | `FETCH_BYTES == 8×FETCH_W` | §3.2 |
 | 2 | `RENAME_W`、`ISSUE_W`、`MEM_W`、`COMMIT_W` ≥ 1 | |
-| 3 | `ROB_N` ≤ 256、2 の冪、`ROB_N ≥ RENAME_W` | VU の 8 bit owner と `idx - head` (§3.4) |
+| 3 | `ROB_N ≥ RENAME_W` | dispatch は 1 group を丸ごと割り当てる |
 | 4 | `PRF_INT_N`、`PRF_FP_N` > 32 | free list が空にならない |
 | 5 | 1 ≤ `REISSUE_W` ≤ `MEM_W` | §3.3 |
-| 6 | `MSHR_N == 1` かつ `DC_NB == 1` | 新コアの N=4 boot まで fill は 1 本 (§2.5)。M3/M4 で緩める |
+| 6 | `MSHR_N == 1` かつ `DC_NB == 1` | `dcache_port_adapter` は 1 bank で fill を 1 本ずつ扱う。新コアの N=4 boot まで fill は 1 本 (§2.5)。M3/M4 で緩める |
 | 7 | `DQ_N ≥ FETCH_W`、`RQ_N ≥ FETCH_W`、`RQ_N ≥ RENAME_W` | `lane_queue` は少なくとも 1 group を保持する |
 | 8 | `MEM_IQ < N_IQ` | §X.2 |
 | 9 | 各 IQ に issue ポートが 1 本以上 (`MEM_IQ` は memory pipe を数える)、`IQ_N[q] ≥ RENAME_W`、1 ≤ `IQ_NSRC[q]` ≤ 3 | |
 | 10 | `PORT_IQ[p] < N_IQ` かつ `PORT_IQ[p] != MEM_IQ` | `PORT_IQ` は exec ポートだけを表す (§X.2) |
-| 11 | `PORT_FU` に NONE、LOAD、STORE、ATOMIC、VEC を載せない | memory と dispatch で完了する種別は exec ポートに来ない |
-| 12 | 1 つのポートに DIV と FDIV を同時に載せない | HOLE_FILL の FU はポートに高々 1 つ (§X.2) |
-| 13 | 同じ FuKind を持つポートは同じ IQ に属する | op の行き先 IQ が種別だけで決まる (§R.5.1) |
-| 14 | SYS を持つポートはちょうど 1 本 | §X.8.3 |
-| 15 | ALU、BRU、MUL、DIV、FMA、FMISC、FDIV がそれぞれ 1 本以上のポートに載る | decode が出す exec 種別はどれも行き先を持つ |
-| 16 | `NUM_CKPT == 0` | checkpoint pool ができるまで walk だけで回復する (§R.7)。M3 で緩める |
-| 17 | `IQ_N[q]` < 512 | IQ の credit は固定幅 `IQ_CNT_W = 9` で dispatch に渡す (§R.5.1) |
+| 11 | `PORT_FU[p]` ⊆ {ALU, BRU, SYS, MUL, DIV} | `exec_port` が作る FU はこの 5 種だけで、DIV がポート上の唯一の blocking FU になる。M2 で FP の FU を入れるときに FMA、FMISC、FDIV を足し、「1 つのポートに DIV と FDIV を同時に載せない」(HOLE_FILL の FU はポートに高々 1 つ、§X.2) を戻す |
+| 12 | 同じ FuKind を持つポートは同じ IQ に属する | op の行き先 IQ が種別だけで決まる (§R.5.1) |
+| 13 | SYS を持つポートはちょうど 1 本 | §X.8.3 |
+| 14 | ALU、BRU、MUL、DIV がそれぞれ 1 本以上のポートに載る | decode が通す exec 種別はどれも行き先を持つ。M2 で FMA、FMISC、FDIV を足す |
+| 15 | `NUM_CKPT == 0` | checkpoint pool ができるまで walk だけで回復する (§R.7)。M3 で緩める |
+| 16 | `IQ_N[q]` < 512 | IQ の credit は固定幅 `IQ_CNT_W = 9` で dispatch に渡す (§R.5.1) |
+| 17 | `IC_RESP_LAT == 1` かつ `SHADOW_LEN == 0` | `ifu` は fetch の段ごとにレジスタを 1 つしか持たず、`sb` は drain の ack の edge で line を手放す (§5.9 MP7)。RTL がこの値で作られている |
+
+- 【決定】(M1b) `ROB_N` ≤ 256 と 2 の冪 (VU の 8 bit owner と `idx - head`、§3.4) は M1b の build では検査しない。M5 で VU を入れるときに bit 3 へ戻す。理由: M1b の build には VU が無く、この制約が守る対象が無い。§3.4 の宣言された上限としては残す。
 
 ### 3.6 構成の運び手 (Veryl)
 
@@ -506,7 +508,7 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 | `exec_port` | issue ポート 1 本分: RR、bypass の選択、FU 集合、WB packet | §X | 新規 |
 | `fu_alu`, `fu_bru`, `fu_mul`, `fu_div`, `fu_fma`, `fu_fmisc`, `fu_fdiv`, `fu_sys` | FU 契約 (§5.6) に従う各 FU | §X | 新規 (`int_divider`、fp_* の各 leaf は再利用) |
 | `fu_blocking_shell` | blocking FU の共通 shell (占有状態、タグの latch、kill による abort、`i_wb_grant` までの保持)。`fu_div` と `fu_fdiv` が共有する。 | §X | 新規 |
-| `fp_misc` | スカラ FP の雑多な演算の leaf (`fpu_wrap` から切り出す。`fpu_wrap` 自体は変更しない) | §X | 新規 (leaf のロジックを移植) |
+| `fp_misc`, `fp_cvt`, `fp_round_pack` | スカラ FP の 1 サイクル演算の leaf (`fp_misc`)、その中の全 FCVT (`fp_cvt`)、形式ごとの丸めと詰め直し (`fp_round_pack`)。`fpu_wrap` から切り出し、`fpu_wrap` 自体は変更しない (§X.8) | §X | 新規 (leaf のロジックを移植し、変換の誤りは直す) |
 | `mem_pipe` | memory pipe 1 本分: AGU、DTLB、PMP/PMA、dcache 要求、forwarding、load 整形 | §L | 新規 |
 | `lq`, `sq`, `sb` | load queue、store queue (commit 前)、committed store buffer | §L | 新規 (D5) |
 | `atomic_unit` | AMO/LR/SC、reservation、watch | §L | 新規 (旧方式を移植、D5) |
@@ -630,7 +632,7 @@ struct FlPtr  { wrap: logic, idx: logic<FL_IDX_W> }
 | `Effect` | retire 時の副作用の bitset `{FFLAGS, FS_DIRTY, VS_DIRTY, VXSAT, VCFG, VSTART}`。 | `opclass_pkg` |
 | `Budget` | rename/dispatch の資源需要の bitset `{INT_RD, FP_RD, LQ, SQ, VQ, CKPT, PAIR_RD}` (§R.5.1)。 | `opclass_pkg` |
 | `FlushKind` | `{NONE, NEXT_PC, XRET}` (§5.5)。 | `opclass_pkg` |
-| `AccKind` | `{LOAD, STORE, AMO, FETCH}` (§5.10)。 | `xlate_pkg` |
+| `AccKind` | `{LOAD, STORE, AMO, FETCH, CBO}` (§5.10)。 | `xlate_pkg` |
 | `MemCls`、`RespKind`、`RetryReason`、`EvKind`、`MemClient` | §5.9 のコメントに列挙した値をそのまま enum にしたもの。 | `core_types` |
 | `PtwKey` | `{vpn: logic<27>, regime: {V0, V1, HLV}}` (§5.10、§M.8.1)。 | `xlate_pkg` |
 | `TlbFill`、`TlbInv` | `ptw` から `tlb` への install と、retire 時の無効化 `{kind, va, asid, all_va, all_asid}` (§M.7、§C.2.5 の `XlateFlush` と同形)。 | `xlate_pkg` |
@@ -1010,18 +1012,20 @@ struct MemEvent {                  // broadcast, all ports
 所有者: `tlb` (lookup)、`ptw` (walk と epoch)、`mem_pipe`/`ifu` (要求者)。
 
 ```veryl
-struct XlateReq  { valid: logic, tag: MemTag, va: logic<64>, acc: AccKind, hlv: logic, hlvx: logic, // acc: LOAD, STORE, AMO, FETCH
+struct XlateReq  { valid: logic, tag: MemTag, va: logic<64>, acc: AccKind, hlv: logic, hlvx: logic, // acc: LOAD, STORE, AMO, FETCH, CBO
                    nonspec: logic }   // D-bit update allowed: set only on an accept edge where the op holds the token (section 5.13.1)
-struct XlateResp { valid: logic, tag: MemTag, hit: logic, pa: Pa, pma: pma_pkg::PmaAttr, exc: exc_pkg::ExcRec,
+struct XlateResp { valid: logic, tag: MemTag, hit: logic, pa: Pa, pma: pma_pkg::PmaAttr, exc: exc_pkg::ExcRec, // hit: resolved (always 1 from ptw)
                    need_d: logic }    // store/AMO hit a W=1, D=0 entry with ADUE=1: PA not final, retry with nonspec
 struct PtwEvent  { valid: logic, key: PtwKey, fault: logic }  // key = {vpn, regime}; broadcast on every walk completion
 ```
 
 - X1. 権限の文脈 (実効特権、SUM、MXR、MPRV、V、satp/vsatp/hgatp) は、lookup 時に CSR ファイルから読む。これが正しいのは、翻訳の文脈を変える操作がすべて flush を伴う retire であり (§5.5)、実行中の op はどれもその変更より若いからである。HLV/HLVX は op ごとの属性として運ぶ。
-- X2. epoch: `ptw` は walk の開始時に文脈と epoch を latch する。epoch は full kill のたびに増える。walk の完了時に epoch が一致していれば TLB に install する (fill は常に許す: kill された op のための翻訳であっても、正しい翻訳を cache することはアーキ上問題ない)。walk 要求は owner の RobTag を運ぶ (`MemTag.rob`)。walk の owner は、成功でも fault でも完全な XlateResp を受け取り、kill 済みのタグ宛てなら捨てる。fault を含むすべての walk の完了は `PtwEvent {valid, key (vpn, regime), fault}` を broadcast し、park している待ち手 (合流した要求者) は lookup をやり直す (§M)。同じサイクルの規則 (MP2 と同じ形): walk 要求が受理されたサイクル r から、その要求者が park を記録する edge までの間に届いた同じキーの `PtwEvent` は、park の後に来たものとして扱う。要求者 (`mem_pipe` の段レジスタ) は r 以降の event を自分のキーと比較して印を運び、印があれば park せずに READY として記録する。理由: m1 で合流した walk が m1 か m2 で完了すると、park の前に event が過ぎ去り、他に walk が無ければその load は永久に待つ。
+- X2. epoch: `ptw` は walk の開始時に文脈と epoch を latch する。epoch は full kill (と retire 時の TLB 無効化) のたびに増える。walk の完了時に epoch が一致していれば TLB に install する (実装は walk ごとの stale bit、§M.8.1) (fill は常に許す: kill された op のための翻訳であっても、正しい翻訳を cache することはアーキ上問題ない)。walk 要求は owner の RobTag を運ぶ (`MemTag.rob`)。walk の owner は、成功でも fault でも完全な XlateResp を受け取り、kill 済みのタグ宛てなら捨てる。fault を含むすべての walk の完了は `PtwEvent {valid, key (vpn, regime), fault}` を broadcast し、park している待ち手 (合流した要求者) は lookup をやり直す (§M)。同じサイクルの規則 (MP2 と同じ形): walk 要求が受理されたサイクル r から、その要求者が park を記録する edge までの間に届いた同じキーの `PtwEvent` は、park の後に来たものとして扱う。要求者 (`mem_pipe` の段レジスタ) は r 以降の event を自分のキーと比較して印を運び、印があれば park せずに READY として記録する。理由: m1 で合流した walk が m1 か m2 で完了すると、park の前に event が過ぎ去り、他に walk が無ければその load は永久に待つ。
 - X3. TLB miss は非ブロッキングで扱う。miss した load は LQ で待つ。要求者が VA を再提示することに依存しない。
 - X4. TLB の lookup は副作用を持たず、どのサイクルでも捨ててよい。walk を始める方法は、`ptw` の要求キューへの valid/ready 要求だけである。walk 要求を出せるのは、LQ/SQ に割り当て済みで (タグを持つ) まだ kill されていない op (LR も LQ に割り当てる、§L.3)、`ifu`、M5 からは VU の要素アクセス (`vu_mem_adapter`、VEC op の RobTag を owner とする、§V.4) だけである。要求者は、walk の間もポートや MMU の FSM 状態を保持しない。I 側では、walk を始めてよいのは最古の未 fetch block (f1 にあるもの) だけである。walk の重複排除 (同じ VPN と文脈への要求をまとめる) と要求キューの深さは §M で決める。
 - X5. satp の shadow (旧コアの `satp_shadow` や偽の ifault 注入) は持たない。MMU は retire した瞬間の CSR 値を使う。
+- 【決定】(M2 準備) `AccKind` に `CBO` を足す。cbo.clean/flush/inval は R または W の権限で翻訳し、D ビットを要求せず、fault は store 側 (cause 15/7) にする。理由: cbo.* の権限規則は load とも store とも違い (Zicbom)、`STORE` で翻訳すると R だけのページで誤って fault し、D=0 のページで不要な D の更新を起こす。
+- 【決定】(M2 準備) `XlateResp.hit` は「翻訳が確定した」を意味し、`ptw` が返す応答では常に 1 である。fault も確定した翻訳であり、`exc` が運ぶ。理由: owner は walk の結果を必ず受け取るので (M.8.2)、miss を表す値を `ptw` の応答に持たせる必要が無く、要求者は TLB の lookup と同じ型で「確定したか」だけを見ればよい。
 
 翻訳の文脈を変える CSR と命令の完全なリスト (どれも §5.5 の flush 規則で覆われる。白リスト化するときは、このリストが必要条件になる): `satp`, `vsatp`, `hgatp`, `mstatus` (MPRV, MPP, MPV, MXR, SUM, GVA), `sstatus` (SUM, MXR), `vsstatus` (SUM, MXR), `hstatus` (SPV, SPVP, HU, VTVM), `menvcfg`/`henvcfg`/`senvcfg` (PBMTE, ADUE, PMM), `mseccfg` (PMM), `pmpcfg0-15`, `pmpaddr0-63`。命令: SFENCE.VMA, SINVAL.VMA, SFENCE.W.INVAL, SFENCE.INVAL.IR, HFENCE.VVMA, HFENCE.GVMA, HINVAL.*, MRET, SRET、および trap の受付。
 
@@ -1118,8 +1122,8 @@ replay の手順 (tb が行う): golden の (K, cause) ごとに、`limit=K, lim
 | unit | 操作 | 開始点 (最初の要求が受理される edge) | 開始後に同じ op が繰り返す手順 |
 |---|---|---|---|
 | `fu_sys` | SYS の実行 (CSR の読み、`sys_pending` への書き込み) | FU の受理 | なし |
-| `io_unit` | IO load の `UNC_READ`、IO store の `STORE_WT` | adapter が要求を受理した edge | RETRY を受けた後の再要求 |
-| `atomic_unit` | LR、AMO、SC、amocas の `LOAD_EXCL` と `STORE_EXCL` | 最初の `LOAD_EXCL` (SC は `STORE_EXCL`) を adapter が受理した edge | MISS と FILL_DONE の後の再要求、RETRY の後の再要求、D8 の FAIL と watch による読み直し、`STORE_EXCL` |
+| `io_unit` | IO load の `UNC_READ`、IO store の `STORE_WT` | 要求を最初に adapter へ提示した edge (応答が RETRY(BANK_CONFLICT) でも、§L.13) | RETRY を受けた後の再要求 |
+| `atomic_unit` | LR、AMO、SC、amocas の `LOAD_EXCL` と `STORE_EXCL` | 最初の `LOAD_EXCL` (SC は `STORE_EXCL`) を adapter へ提示した edge (応答が RETRY(BANK_CONFLICT) でも、§L.11) | MISS と FILL_DONE の後の再要求、RETRY の後の再要求、D8 の FAIL と watch による読み直し、`STORE_EXCL` |
 | `sq` | D ビットを立てる `nonspec` walk (§L.16、§M.8.4)。atomic の分も SQ エントリが出す | `ptw` の要求キューが `nonspec=1` の要求を受理した edge | walk の完了後に STA を完了させる再 issue |
 | `vu_adapter` (M5) | VU の実行 (要素アクセス、VRF 書き込み) | 最初の exec 許可 (`exec_q`、§V.3 VA2) | 要素ごとの要求 |
 
@@ -1150,6 +1154,7 @@ IDLE --(受理 edge で token.valid && token.tag == 自分の tag)--> STARTED --
 | IO load の発行 | 発行できるのは、自分のタグが oldest token と等しく、`sb.ordering_empty`、`atomic_unit` が空、未完了の IO store が無い、のすべてが成り立つときだけ。割込みが pending なら token は出ないので、割込みは発行の前に受け付けられる。 |
 | IO load の一回性 | 1 op につき要求は 1 つ (port 0 の UNC_READ、タグは LqTag)。応答は `io_unit` の 1 本の結果レジスタで捕捉し (IO アクセスは hart あたり同時に 1 つだけ)、WB は HOLE_FILL で行う。LQ のエントリは完了だけを記録する。受理された後は、flush も、forward の受け手になることも、poison も、replay もされない (I3)。 |
 | IO store | non-posted。より古いすべての store が見えた (`ordering_empty`) 後に、`io_unit` が STORE_WT として 1 回だけ発行する。retire は WT_DONE を受けた後。受理された後に再提示しない。SB には入らない。 |
+| 開始点と一回性の実装 (M2 準備) | `io_unit` は要求を最初に提示した edge で `started_q` を立て (§5.13.1)、op が retire するまで保持する。LQ/SQ が head の非 cacheable op を提示し続けても、保持中の op は 2 度実行しない。PENDING の後は再提示せず、再提示するのは RETRY だけである。adapter は UNC_READ と STORE_WT を PENDING で返し、書き込みが発火したか読みが grant されるまで保持し、その後に WT_DONE か UNC_DONE を出す (device から見たアクセスは 1 回)。 |
 | forwarding | IO の store は forward の送り手にならず、IO の load は forward の受け手にならない。 |
 | misaligned、AMO、LR/SC | NC/IO 領域に対しては、翻訳時にアクセス fault (load は cause 5、store/AMO は cause 7) とする。分割はしない。 |
 | fetch | `executable=0` の領域からの fetch は、命令アクセス fault とする。 |
@@ -1399,7 +1404,7 @@ history と RAS の修復 (所有者 `bp_hist`, `bp_ras`):
 - 再送の規則は 1 つだけである: 「その block 以降の in-flight 要求を捨て、ftq を `rewind(tag)` して待つ」。ITLB miss にも icache MISS にも使う。要求には、lookup と PLRU 以外の副作用が無いので、捨ててよい。
 - 【決定】ifu は、icache への要求を出す前に FBQ の credit を確保する: `in_flight + FBQ の占有数 ≤ FBQ_N` (所有者 `ifu`)。理由: 旧 WORD FIFO は in-flight の push を数えておらず、背圧が続くと 9 段目に溢れた (78355eb)。
 - fault の block を出したら、ifu は次の flush まで要求を止める。無駄な walk を始めないためである。fault の op は commit で trap するか、より古い redirect で消えるので、front end が止まったままになることは無い。ただし、より古い block の icache MISS による rewind もこの停止を解く。fault の block は MISS した block より必ず若く、rewind で捨てられて、MISS の block の後でもう一度取り直されるからである。
-- M1b の Bare 翻訳 (所有者 `ifu`): 整列 block の VA の `[63:56]` が 0 でない (PA の 56 bit に収まらない) か、PMA が `executable=0` (hole を含む) なら、その block は instruction access fault (cause 1) の block になる。`pmp_deny` は M1b では 0 に固定する。理由: PMP の判定には csr の pmpcfg/pmpaddr と実効特権が要り、その接続は M2 で入る。
+- M1b の Bare 翻訳 (所有者 `ifu`): 整列 block の VA の `[63:56]` が 0 でない (PA の 56 bit に収まらない) か、PMA が `executable=0` (hole を含む) なら、その block は instruction access fault (cause 1) の block になる。【決定】(M1b、cold-reader gate) fetch の PMP は M1b から `ifu` で実装する: f0 で csr の実効特権と pmpcfg/pmpaddr を live に読み (変わるのは flush を伴う retire だけ、§5.5)、`pmp_check` を `GRAN_N` 個並べて X 権限の拒否 mask `pmp_deny` を作る。block 全体の fault (VA の上位か PMA) があれば mask は 0 にする。理由: mask を 0 に固定すると PMP の拒否を黙って通す。必要な入力は csr の既存出力だけなので、M2 を待つ理由が無い。
 - ifu は割込み入力も CSR の shadow も持たない (§5.10 X5)。SFENCE.VMA/HFENCE は NEXT_PC flush を伴う (§5.5)。したがって、fence より前に取った命令が古い翻訳のまま retire することは無い (旧コアの SFENCE は redirect しなかった)。
 - 不変条件 (所有者 `commit` と `tlb`): SFENCE 系による tlb(I) の無効化は、その op の retire flush の後の最初の lookup より前に効く。
 
@@ -1503,7 +1508,7 @@ straddle (block の末尾をまたぐ 32-bit 命令):
 | bpu の部品 | `bp_btb` (blkpred 由来、slot の 2-bit ctr)、`bp_ras` (ckpt あり)。global history は持たない (読まれない状態は DEAD scaffold になるため) | `bp_hist`、`bp_dir` (tage/bht 由来)、`bp_ind` (ibtb 由来)。L0 段と override の要否 |
 | 予測のレイテンシ | `LAT=1`。taken block ごとに 1 bubble | 最終段の `LAT` と L0 段を `ftq_empty && ifu_idle` で決める |
 | recover の経路 | partial kill、PdRedirect、commit backstop、full kill をすべて動かす (RAS の ckpt で FTQ の ckpt 経路が M1 から働く) | history の定義を決める |
-| ifu / icache | f0-f2、block ごとに 1 回の翻訳 (M1b は Bare。tlb(I)/ptw(I) と ITLB miss の再送は M2)、miss でブロックする、tag からの再送、fill 1 本、任意の event で再提示 | early restart、prefetch、2 本目の fill、redirect の fast path |
+| ifu / icache | f0-f2、block ごとに 1 回の翻訳 (M1b は Bare。tlb(I)/ptw(I) と ITLB miss の再送は M2)、granule ごとの fetch の PMP (F.5)、miss でブロックする、tag からの再送、fill 1 本、任意の event で再提示 | early restart、prefetch、2 本目の fill、redirect の fast path |
 | extract | x0/x1、1 サイクルに 1 block、V1-V6 | 2 block からの取り出し、未予測 RET の訂正 |
 | 構成 | cfg_w2 で `FETCH_BYTES=16`。cfg_w4 (`32`、4 lane) は elaborate でき、rv64ui のサブセットが通る | sweep でサイズを決める |
 
@@ -1577,7 +1582,8 @@ lane ごとに `decoder` と `imm_gen` (どちらも再利用) を 1 つずつ�
 規則:
 
 - DC1. 特権・状態に依存する合法性 (§5.5 の【決定】) の規則表は §C.8 が所有し、decode はそれを実装する。入力は csr の登録済み出力 (priv、V、mstatus/hstatus の TVM/TSR/TW/VTVM/VTSR/VTW/FS/VS、frm、*counteren、menvcfg/senvcfg の CBIE/CBCFE/CBZE (CBO の有効化) と STCE) と、`csr_pkg` に追加する CSR 属性表 (§C.8) だけで、どちらも組合せで読む。csr と csr_pkg への変更は追加だけで済む (§4.4)。lane ごとに同じ関数を for-generate で並べ、lane 0 だけの検査は無い。旧コアは同じ検査の一部を commit 時に head だけで行っていたので、slot 1 を通った op は検査を逃れた。
-- M1b の decode が実装する合法性 (§C.8 の M1b 行): CSR の存在 (`csr_pkg::csr_exists`)・最低特権 (`addr[9:8]`)・読み出し専用への書き込み、MRET の特権と SRET の特権 + TSR、SYSTEM funct3=000 の未定義符号化 (ECALL、EBREAK、MRET/SRET、WFI、SFENCE/SINVAL 系、WRS 以外)、vector 命令すべて (DC6)、AMO の予約 funct5。読む csr 出力は `i_priv`、`i_virt`、`i_mstatus_tsr` の 3 本だけで、残りの入力は M2 で足す。
+- M1b の decode が実装する合法性 (§C.8 の M1b 行): CSR の存在 (`csr_pkg::csr_exists`)・最低特権 (`addr[9:8]`)・読み出し専用への書き込み、HS-mode で TVM のときの satp アクセス、MRET の特権と SRET の特権 + TSR、HS-mode で TVM のときの SFENCE.VMA/SINVAL.VMA、SYSTEM funct3=000 の未定義符号化 (ECALL、EBREAK、MRET/SRET、WFI、SFENCE/SINVAL 系、WRS 以外)、vector 命令すべて (DC6)、M1b の build が持たない op クラス (下の【決定】)。読む csr 出力は `i_priv`、`i_virt`、`i_mstatus_tsr`、`i_mstatus_tvm` の 4 本だけで、残りの入力は M2 で足す。counteren は検査しない (再利用する csr は値を持つだけで強制しない。§C.8 の M2 行)。
+- 【決定】(M1b、cold-reader gate) M1b の decode は、その build に実行する unit が無い op クラスをすべて不正命令 (cause 2) にする: F と D (演算、FP の load/store、fflags/frm/fcsr の CSR)、A 拡張 (LR/SC、AMO、amocas)、CBO、H 拡張 (HLV/HLVX/HSV、HFENCE/HINVAL、hypervisor と VS の CSR)、V の CSR。決めるのは decode の `illegal` 関数 1 か所だけで、他のモジュールに「この build はこの op を持たない」という条件を書かない。理由: unit の無い op を通すと、行き先の無い FU 種別 (§3.5 の bit 14) か、受け手の無い memory op になり、黙って wedge するか誤った値で retire する。不正命令にすれば trace の上で golden との差としてすぐ見える。M2 で各 unit を入れるときに、その分の拒否を外す。
 - decode のポート (§R.6): DQ の出力 lane (`i_valid`/`i_xop`) を組合せで `DecOp` にし、`i_rq_ready` (rq の登録済み ready) が立っていれば全 valid lane を `o_dq_take` で取る (group は全部動くか動かないか)。`rq` (`lane_queue`) は core top が instantiate する。
 - 【決定】decode は live な csr 出力をそのまま読み、shadow を持たない。理由: csr の出力が変わるのは、flush を伴う retire、trap、xRET、割込みのいずれかだけである。どれも次のサイクルに `kill.valid` を立て、そのとき DQ、decode、rq にいる op をすべて捨てる (§5.4 の消費者表)。したがって生き残った op が decode で見た状態は、その op の commit 時の状態に等しい。
 - DC2. rm=DYN で frm が予約値 (101-111) の FP 命令は不正命令にする (非特権仕様の規定)。frm も commit 済み状態なので、上の【決定】と同じ理由で decode で判定してよい。静的な予約 rm は §C.8 の表にある。
@@ -1774,6 +1780,7 @@ lane l < take について、すべて同じ edge で次を行う。タグは所
 | walk 中の部分 kill | flush_ctrl が出さない (T8 に任せる) | §5.4 T9 の【M3 で決定】 |
 | amocas.q の形 | §5.5 の【M2 で決定】(M2) | |
 | VEC | dispatch しない (VQ の credit 0、DC6) | M5 で VU の alloc を接続する |
+| unit の無い op クラス | F/D、A、CBO、H、V の CSR を decode で不正命令にする (§R.2 の M1b の【決定】) | F/D、A、CBO は M2 で各 unit と同時に外す。H と V の CSR は M5 |
 | cfg_w4 | elaborate でき、rv64ui のサブセットが通る | ゲートの梯子をすべて通す |
 | rq の深さ `RQ_N`、IQ ポート割り当て方針 | 2×FETCH_W、最小占有 (§X.3) | sweep で決める |
 | group の切断 (§R.5.2) | credit 不足だけ。VEC (2 つ目と VU の ready)、`PAIR_RD`、checkpoint の切断は持たない (M1b では発生しない) | VEC は M5、`PAIR_RD` は amocas.q の形 (M2)、checkpoint は M3 で足す |
@@ -1895,6 +1902,7 @@ cfg_w2 の値は §3.2 と一致する。この本数には、retire record の 
 これらの表は `core_cfg` (§3.6) の FU トポロジ表 `PORT_FU: FuSet [ISSUE_W]`、`PORT_IQ: u32 [ISSUE_W]`、`N_IQ: u32`、`MEM_IQ: u32`、`IQ_N: u32 [N_IQ]`、`IQ_NSRC: u32 [N_IQ]` で表し、構成によって変わるのはこれらの値だけである。
 
 - 【決定】トポロジ表は M1b から最終形の FU 集合を持つ。M1b が instantiate するのは必要な FU だけで、残りは表の上で予約された枠とする (§X.12)。理由: 上の制約 (どの種別にも行き先がある、SYS は 1 本、HOLE_FILL は 1 つ) の検査が、最終形の FU 集合に対して働く必要があるため。
+- 【決定】(M1b、cold-reader gate) 上の決定を、ポートの本数と IQ の割り当ては最終形のまま、FU 集合は「その build が作る FU だけ」に改める。M1b の `PORT_FU` は cfg_w2 が p0 = {ALU, BRU, SYS, MUL, DIV}、p1 = {ALU}、cfg_w4 が p0-p3 は上の表のとおりで p4/p5 は空集合 (FU を持たず、iq_fp (1) には op が来ない) とする。`ISSUE_W=6` と `PORT_IQ` は変えない。FP の FU を入れる M2 で p1 (cfg_w2) と p4/p5 (cfg_w4) に FMA、FMISC、FDIV を戻し、§3.5 の bit 11 と bit 14 を広げる。理由: build が作らない FU 種別を表に載せると、その種別の op の行き先があるように見えるのに受け手が無く、decode の拒否 (§R.7) と表が食い違う。ポートの本数と IQ を残すのは、W4 の 6 ポートの WB、bypass、PRF の配線を M1b から elaborate し続けるためである。
 
 ### §X.3 iq
 
@@ -2009,14 +2017,15 @@ issue ポート 1 本分。for-generate で ISSUE_W 個並べ、中身は `PORT_
 
 - is→ex の `stage_reg` (kill を内蔵)。中身は grant の出力。
 - RR と bypass (サイクル A): source slot ごとに、そのクラスを書く WB ポートの packet のうち `valid && has_rd && pdst == src.pr` のものがあればそのデータ、無ければ PRF の読み出し値を使う。一致は高々 1 つなので AND-OR で選ぶ。比較と選択は `core_types` の関数にし、memory pipe の第 1 段 (§L) も同じ関数を使う。
-- FU への分配: `i_valid[k] = stage.valid && stage.fu == k`。FU 固有の入力 (`imm`、`rm`、PC と予測、CSR の読み出し値) はここで配る。動的丸めモードは、rm=DYN なら csr の frm (live。§5.5 により正しい) を使う。
+- FU への分配: `i_valid[k] = stage.valid && stage.fu == k`。FU 固有の入力 (`imm`、`rm`、PC と予測、CSR の読み出し値) はここで配る。FP の FU には命令の `rm` と csr の frm (live。§5.5 により正しい) の両方を配り、rm=DYN の解決は FU が行う (§X.8.2)。
 - PC と予測: BRU を持つポートは、PRF と同じサイクル A に、`stage` の ftq タグで ftq の読出ポート (§F.3) を 1 本引き (`o_ftq_rd: FtqTag` → `i_ftq: FtqRead {base, pred}`)、`pc = base + 2·foff` と `pred.target` を得る。b 番目の BRU ポート (`bru_port(b)`) が ftq の読出ポート b を使う。読み出しは、op が生きている間はいつでも正しい (§F の FQ1, FQ3)。
 - WB packet: そのポートの FU の `o_wb` の OR。予約により、有効なのは高々 1 つである (checker)。packet は PRF の書込ポート、ROB の完了ポート、busy_table の done、全 bypass 点に配り、BRU を持つポートでは `flush_ctrl` の resolve 入力 (§C) にも配る。packet の外に sideband は無い (§5.6 F5)。
 - wake 遅延線: `stage_reg` (kill を内蔵) の深さ D_p - WAKE_LEAD の列。select (遅延 L-1) と HOLE_FILL の grant (遅延 off - WAKE_LEAD) から押し込み、遅延が 0 になったものを `o_wake {valid, pdst}` に出す。予約の一意性により、1 サイクルに高々 1 つ。遅延線は kill を消費するので、kill された op の wake は edge の後には出ない。
 - blocking FU の可用性: `fu_avail = fu.o_ready && !(issue 段がその FU 向けの op を保持している)`。`o_ready` は登録済みで、受理の次のサイクルにならないと落ちない。そのため、select から受理までの ISS_TO_ACC サイクルの間に 2 つ目を select しないように、このマスクを掛ける。
 - `iq_release[p]`: サイクル A に、`stage.valid` とエントリ番号を IQ へ返す。
 - SYS を持つポートは `fu_sys` の信号をそのまま外に出す: `o_csr_raddr`/`i_csr_rdata` (A の組合せ読み)、`i_tok`、`o_started` (A のパルス)、`o_sys: SysPending` (`o_wb` と同じサイクルに登録済み)。core top は `o_started` を `commit.i_started[STARTED_N]` に、`o_sys` を `commit.i_sys_wr` に配線する。
-- op 符号の配り方: ALU/MUL/DIV には `uop[5:0]` を `alu_pkg::AluOp` として、BRU には `uop[3:0]` を `BruOp` として、SYS には `SysUop` として渡す。BRU の命令長 (`rvc`) と `pred_taken` は IQ の cold payload から取る。
+- op 符号の配り方: ALU/MUL/DIV には `uop[5:0]` を `alu_pkg::AluOp` として、BRU には `uop[3:0]` を `BruOp` として、SYS には `SysUop` として、FP の FU には `fpu_pkg::FpuOp` (`UOP_W` = 7 bit に収まる) として渡す。BRU の命令長 (`rvc`) と `pred_taken` は IQ の cold payload から取る。
+- FDIV を持つポート (M2): `fu_fdiv` の `o_ready` から作る `fu_avail` のマスクを DIV と同じく FDIV にも掛け (blocking FU が 2 つになる)、`o_chk` を `fu_fdiv` の 2 bit の分だけ広げる。
 
 ### §X.8 FU
 
@@ -2026,15 +2035,17 @@ issue ポート 1 本分。for-generate で ISSUE_W 個並べ、中身は `PORT_
 | `fu_bru` | 旧 `alu_wrap.veryl:143-187` の比較と target を移植 | 1 / 1 | 条件分岐、JAL、JALR、AUIPC。data はリンク (pc+2/pc+4) か、AUIPC の pc+imm。実行したすべての op (AUIPC を含む) で `br = {valid, mispredict, taken, next_pc, ftq, foff}` を出す。AUIPC は `valid=1`、not-taken、`next_pc = pc + len`、mispredict しない。`mispredict = taken != op.pred_taken \|\| (taken && target != pred.target)` (§F.9。「予測した次 PC と解決した次 PC の不一致」と同値)。not-taken でも `next_pc = pc + len` を出す (§C.1.4)。C 拡張があるので target の misaligned 例外は生じない。 |
 | `fu_mul` | 旧 `alu.veryl:40-62, 139` の乗算を移植 | 2 / 1 | 段 1: 部分積と積、段 2: hi/lo/W の選択と符号補正、出力レジスタ。 |
 | `fu_div` | `int_divider` (共有、そのまま) + `fu_blocking_shell` | 36 / 0 | leaf は 34 サイクル固定 (`int_divider.veryl:10`)。 |
-| `fu_fma` | `fp_adder`/`_s`、`fp_multiplier`/`_s`、`fp_fma`/`_s` (PIPE=1、STAGE3=0) | 2 / 1 | leaf の中点レジスタは毎サイクル捕捉するので、valid/ExTag/op/rm は並走する `stage_reg` で運ぶ (§5.6 F1)。 |
-| `fu_fmisc` | 新 leaf `fp_misc` (`fpu_wrap.veryl` の結果 case `:1480-2767` と fflags case `:1069-1476` から cheap-op の arm を抽出) | 1 / 1 | sgnj、min/max(m)、比較 (quiet 含む)、class、cvt (Zfhmin、fcvtmod を含む)、mv、FLI。 |
-| `fu_fdiv` | `fp_divider`/`_s`、`fp_sqrt`/`_s` (共有) + fround 経路 + `fu_blocking_shell` | 6 / 0 (最小) | 一度に 1 op。fround は `fp_adder`/`_s` を 2 段直列にした経路 (PIPE=1) で、shell が入力を保持し、4 サイクルで完了する。 |
+| `fu_fma` | `fp_adder`/`_s`、`fp_multiplier`/`_s`、`fp_fma`/`_s` (PIPE=1、STAGE3=0) | 2 / 1 | leaf の中点レジスタは毎サイクル捕捉するので、valid/ExTag/op/rm は並走する `stage_reg` で運ぶ (§5.6 F1)。source は 3 本。 |
+| `fu_fmisc` | 新 leaf `fp_misc` (`fpu_wrap.veryl` の結果 case `:1480-2767` と fflags case `:1069-1476` から cheap-op の arm を抽出)。FCVT は `fp_misc` の中の `fp_cvt`、丸めは `fp_round_pack` | 1 / 1 | sgnj、min/max(m)、比較 (quiet 含む)、class、cvt (Zfhmin、fcvtmod を含む)、mv、FLI。source は 2 本。 |
+| `fu_fdiv` | `fp_divider`/`_s`、`fp_sqrt`/`_s` (共有) + fround 経路 + `fu_blocking_shell` | 6 / 0 (最小) | 一度に 1 op。source は 2 本。fround は `fp_adder`/`_s` を 2 回続けて使う経路 (間に和のレジスタ) で、shell が入力を保持し、A+4 に結果が揃う。ポートは `fu_div` と同じで、`o_perf` (kill による abort、1 bit) と `o_chk` (2 bit) を持つ。 |
 | `fu_sys` | 旧 `alu_wrap.veryl:376-393` の CSR 新値計算を移植 | 1 / 1 | §X.8.3 |
 
 - 【決定】(M1b 統合) BRU のすべての op が resolve record を書く。AUIPC も not-taken の record を書く。理由: commit は `fu == BRU` の op の次 PC を resolve record から取る (§C.2.3) ので、AUIPC を例外扱いする条件を commit に書かずに済む。
 - 【決定】AUIPC と JAL も `fu_bru` で実行する。理由: PC を読めるのは ftq の読出ポートを持つ BRU ポートだけで (§F.3)、IQ に 64 bit の PC や decode で畳んだ 64 bit の定数を持たせずに済む。JAL は通常 front end で target が確定しており mispredict しない (straddle する JAL だけは BRU が直す、§F.8) が、リンクの計算に PC が要る。
 - 【決定】`fu_mul` の LATENCY は 2 とする。理由: MUL を ALU から外して乗算器の数をトポロジ表で決められるようにし、さらに整数側でも、1 つの WB ポートに異なる LATENCY が混在する予約と、wake 遅延線を rv64um で動かす。【M3 で決定】最終値: coremark/dhrystone の LATENCY sweep で決める。
 - 【決定】fround と froundnx は `fu_fdiv` の shell で実行し、FuKind は FDIV とする。理由: 1 FU = 1 LATENCY (§5.6) を崩さず、RESERVED ポートに 4 サイクルの経路を足さずに済む。Zfa の fround は稀で、旧コアも 4 サイクル占有の blocking 扱いだった。
+- 【決定】(M2 準備) fround のタイミングは、結果が揃って HOLE_FILL を要求するのが A+4、最も早い WB が A+6 で、これが `LAT_FDIV` (FDIV の最小 LATENCY) になる。fround は `copysign(2^p, x)` を足してから引き、加算器自身の丸めで小数部を落とす。2 回の加算は間に和のレジスタを置いて続けて行い、1 サイクルに加算器の半分より多くを置かない。理由: fround が FDIV の中で最短の経路なので、公表する最小値はこの経路で決まる。
+- 【決定】(M2 準備) `fp_misc` を 3 つのモジュールに分ける: 1 サイクル演算と FLI の `fp_misc`、全 FCVT の `fp_cvt` (`fp_misc` が instantiate する)、形式ごとの丸めと詰め直しの `fp_round_pack` (`#(EW, MW)`)。`fp_cvt` は入力をすべて `(-1)^sign × sig × 2^(exp-63)` (`sig[63]=1`) の 1 つの形に展開し、出力の形式ごとに `fp_round_pack` を 1 つ使う。理由: 1 モジュール 600 行の目安 (§2.2 M4) に収めるためと、変換の組ごとに丸めのコードを持たないためである。移植の途中で、旧 `fpu_wrap` の変換経路に検証計画付録 B の B49-B54 の誤りが見つかった。`fp_round_pack` は tininess を丸めの後で判定する (B54 を直す)。
 - 【決定】`fu_fmisc` の中身は新しい leaf `fp_misc` (純組合せ) に抽出し、`fpu_wrap` には手を入れない (§5.6 の凍結)。M5 までは cheap-op の論理が `fpu_wrap` と `fp_misc` に 2 重にある。【M5 で決定】VU の `u_vfpu` も新しい FP FU に移して 2 重を解消するか、`fpu_wrap` を VU 専用のまま残すか: VU の vector テスト群がビット一致で通るかと、移したときの VU の LATENCY 変化で決める。
 - 旧コアの `alu`、`alu_wrap`、`lsu` は `v14_` に改名される private モジュールである (§4.4) ので、instantiate せずに論理を移植する。`int_divider` と fp_* の leaf は共有モジュールで、そのまま instantiate する。
 
@@ -2066,7 +2077,12 @@ issue ポート 1 本分。for-generate で ISSUE_W 個並べ、中身は `PORT_
 | `fu_fmisc` | FSGNJ*/FMIN/FMAX/FMINM/FMAXM、FEQ/FLT/FLE/FLEQ/FLTQ、FCLASS、FCVT の全種 (整数との変換、S/D 間、Zfhmin の H、FCVTMOD.W.D)、FMV.X.*/FMV.*.X、FLI |
 | `fu_fdiv` | FDIV/FSQRT (S, D)、FROUND/FROUNDNX (S, D) |
 
-- 入力の NaN-unboxing (S/H)、rm=DYN の解決、結果の NaN-boxing は、`fpu_wrap` の該当部を移植し、`fpu_pkg` に関数として追加する (追加だけの変更、§4.4)。
+- 入力の NaN-unboxing (S/H)、rm=DYN の解決、結果の NaN-boxing は、`fpu_wrap` の該当部を移植し、`fpu_pkg` に関数として追加する (`resolve_rm`、`unbox_s/h`、`box_s/h`、`round_up`。追加だけの変更、§4.4)。
+- 【決定】(M2 準備) rm=DYN の解決は各 FP の FU が行う。FU は `i_rm` (命令の rm、IQ の cold payload) と `i_frm` (csr の frm、live) を受け、サイクル A に `fpu_pkg::resolve_rm` で 1 つにする。理由: rm を使うのは FP の FU だけで、`exec_port` に FP 固有の選択を置かずに済む。frm を live に読んでよい理由は §5.5 (frm の書き込みは flush を伴う retire) である。
+- 【決定】(M2 準備) FLI の定数の番号 (命令の rs1 欄) は `imm[4:0]` で運ぶ。decode は FLI の rs1 欄を即値として詰め、rs1 を source として使わない。理由: FLI は source を読まないので、番号を IQ の source slot や別の欄に置く必要が無い。
+- source slot の規約: slot 0 = rs1、slot 1 = rs2、slot 2 = rs3 (`fu_fma` だけ)。slot 0 は、FMV.*.X と整数から FP への FCVT では整数の rs1 で、クラスは PReg が運ぶ。`fu_fmisc` と `fu_fdiv` は 2 本、`fu_fma` は 3 本を読む。
+- 出力: FP の結果は S/H を NaN-boxing し、整数の結果は 64 bit に符号拡張する。`fu_fma` と `fu_fmisc` は `o_ready=1` (定数) で、結果は A+LAT に出し、`o_perf` を持たない。
+- `fpu_wrap` の変換の誤り (検証計画付録 B の B49-B54、golden 上の probe で確定) は移植しない。新コアが正しく golden が誤りなので、lockstep では許容差異として扱う。VU は `fpu_wrap` を使い続けるので、M5 まで同じ誤りを持つ (上の §X.8 の【M5 で決定】で扱う)。
 - 宛先クラスは decode が決め、`ExTag.pdst.cls` が運ぶ。FMV.X.*、FCVT.{W,L}*、FEQ/FLT/FLE (quiet 版を含む)、FCLASS は INT、それ以外の FP op は FP である。rd=x0 の INT 宛先は has_rd=0 になるので、PRF[0] を書く経路は無い。
 - fflags は packet の 5 bit で運び、ROB エントリに記録し、commit が retire した lane の分を OR する (§5.12 C3)。
 - 例外: exec ポートの FU は例外を作らない。合法性はすべて decode で決まる (§5.5、§R.2)。packet の `exc` は形をそろえるために残し (§5.6 F5)、exec ポートでは定数 0 になる。0 でない `exc` を出すのは memory pipe だけである。
@@ -2134,7 +2150,7 @@ M1b では、1 つのモジュールで閉じる項目を各モジュールの `
 | トポロジ | cfg_w2 の表 (§5.7 で決定済み)。cfg_w4 は表の案で elaborate し、rv64ui のサブセット | cfg_w4 の FU 集合、BRU ポート数、IQ 分割、PRF 読出本数 (【M3 で決定】) |
 | IQ | 表の初期値、最小占有のポート割り当て、ROB タグの木 | エントリ数と割り当て方針を sweep で決める |
 | FU | 表の LATENCY。FMA は STAGE3=0。fround は FDIV の shell | `LAT_MUL`、STAGE3 (§5.6) を sweep と CP 分解で決める |
-| FU の範囲 | `fu_alu`、`fu_bru`、`fu_sys` (rv64ui のゲートが確かめるもの) と、`fu_mul`、`fu_div` (`fu_blocking_shell`)。FP の FU (`fu_fma`、`fu_fmisc`、`fu_fdiv`) は M1b では instantiate せず、M2 で入れ、正しさを arch suite と ACT4 で確定させる。トポロジ表は最初から最終形の FU 集合を持つ (構成制約の検査に要るため、§X.2)。M1b で instantiate しない FU は表の上で予約された枠として残し、FU 集合からは外さない | |
+| FU の範囲 | `fu_alu`、`fu_bru`、`fu_sys` (rv64ui のゲートが確かめるもの) と、`fu_mul`、`fu_div` (`fu_blocking_shell`)。FP の FU (`fu_fma`、`fu_fmisc`、`fu_fdiv`) は M1b では instantiate せず、M2 で入れ、正しさを arch suite と ACT4 で確定させる。トポロジ表はポートの本数と IQ を最終形のまま持ち、FU 集合はその build が作る FU だけにする (§X.2 の M1b の【決定】)。cfg_w4 の p4/p5 は M1b では FU を持たない | |
 | PC | BRU ポートが ftq の読出ポートで読む (§F.3)。IQ と ROB は持たない | |
 
 ---
@@ -2152,11 +2168,11 @@ M1b では、1 つのモジュールで閉じる項目を各モジュールの `
 | `trap_unit` | rv64ui の環境が使う同期例外 (ECALL、不正命令、アクセス fault)、`medeleg`、tvec、xRET | S-mode の残りの同期例外、割込みの cause と委譲、Sstc、LCOFI | trap 段の要否 | VS への委譲、htval/mtval2、GVA、tinst、cause 22 |
 | `flush_ctrl` | partial kill (`BRU_N` 本の resolve から最古を選ぶ木。cfg_w2 で 1、cfg_w4 で 2) と full kill | | checkpoint、T9、kill の段数、cfg_w4 の BRU ポート数の確定 | |
 | `csr` の接続 | `i_instret_cnt`、rv64ui の環境が使う CSR の読み書きと trap/xRET の入力 | 割込み関係の出力、`i_fs_dirty`、追加出力、`v14_csr` 凍結後の仕様修正 | | `i_vs_dirty`、H 関連の修正 |
-| decode 時の特権検査 (規則は C.8、評価は §R) | CSR の存在・特権・RO、xRET の特権 (SRET は TSR も)、未定義 SYSTEM、AMO の予約 funct5、vector 命令 | counteren、FS=Off、TVM/TSR、WFI、CBO、Sstc | | VS=Off、HLV/HSV、HFENCE、VTVM/VTSR/VTW、VS 階層の CSR |
+| decode 時の特権検査 (規則は C.8、評価は §R) | CSR の存在・特権・RO、xRET の特権 (SRET は TSR も)、TVM の satp と SFENCE/SINVAL、未定義 SYSTEM、vector 命令。F/D、A、CBO、H、V の CSR は unit が無いので全部不正命令 (§R.2)。AMO の予約 funct5 は A を入れる M2 | counteren、FS=Off、TVM/TSR、WFI、CBO、Sstc | | VS=Off、HLV/HSV、HFENCE、VTVM/VTSR/VTW、VS 階層の CSR |
 
 REPLAY outcome は M1b から group 関数に入るが、発火するのは §L が順序違反の検出を入れてからである。割込み経路は M2 で実装する (rv64ui のゲートは割込みを使わない)。
 
-M1b の `commit` が持たない副作用ポート (C.2.4 の表のうち M2 以降のもの): `o_xlate_flush` (翻訳の無効化、tlb/ptw と同時に M2)、`o_rsv_clr` と atomic の retire (`atomic_unit` と同時に M2)、FS/VS の dirty 化 (`i_fs_dirty` を足す M2、VS は M5)、vector のフィールド (M5)。`head_started_q` の発生源は `fu_sys` だけである (`STARTED_N = 1`)。
+M1b の `commit` が持たない副作用ポート (C.2.4 の表のうち M2 以降のもの): `o_xlate_flush` (翻訳の無効化、tlb/ptw と同時に M2)、`o_rsv_clr` と atomic の retire (`atomic_unit` と同時に M2)、FS/VS の dirty 化 (`i_fs_dirty` を足す M2、VS は M5)、vector のフィールド (M5)。`head_started_q` の発生源は `fu_sys` だけである (`STARTED_N = 1`)。M2 で `atomic_unit` と `io_unit` の `o_started` を足して `STARTED_N = 3` にする。
 
 ---
 
@@ -2169,7 +2185,7 @@ M1b の `commit` が持たない副作用ポート (C.2.4 の表のうち M2 以
 | データ | 置き場所 | 書き手 (時点) | 読み手 |
 |---|---|---|---|
 | `done` | エントリ | dispatch (`fu==NONE` なら 1)、完了ポート | commit |
-| commit 用 class: `fu`, `drain`, `flush`, `alone`, `csr_wr`, `effect`, `is_rvc`, `sret`, `fence_i` | エントリ | dispatch | commit |
+| commit 用 class: `fu`, `drain`, `flush`, `alone`, `csr_wr`, `effect`, `is_rvc`, `sret`, `fence_i`, `ld_barr` | エントリ | dispatch | commit |
 | rename 情報: `has_rd`, `cls`, `rd_arch`, `pdst`, `old_pdst` | エントリ | dispatch | commit (arch RAT, free list)、walk |
 | `OpTag` の `lq`, `sq`, `ftq`, `foff` | エントリ | dispatch | commit (窓の選択、FTQ への報告) |
 | `fflags` | エントリ | 完了ポート | commit (lane 間 OR) |
@@ -2184,6 +2200,7 @@ M1b の `commit` が持たない副作用ポート (C.2.4 の表のうち M2 以
 | CSR の新値と番地、SFENCE のオペランド | commit の `sys_pending` | `fu_sys` | commit |
 | PC | どこにも置かない (C.2.3) | | |
 
+- 【決定】(M1b 統合) `RobEnt` は `ld_barr` (OpClass の `ld_barrier`) を持ち、commit はそれが retire したサイクルに `o_bar_ret` (retire した lane の `ld_barr` の OR) を出して `lq.i_bar_ret` に配る。ld_barrier の op は alone なので 1 サイクルに高々 1 つである。理由: `lq` の barrier の retire 数 (§L.10) を数える源が他に無い。
 - 【決定】(M1b) ROB エントリ `RobEnt` は `sret` (xRET の種類、1 = SRET) と `fence_i` (retire で icache を invalidate する) を持ち、dispatch が `DecOp` の同名フィールドから写す。理由: commit は xRET の retire で MRET と SRET のどちらの飛び先 (`mepc` か `sepc`) と csr 入力 (`mret`/`sret`) を使うかを、FENCE.I の retire で `o_icache_inv` を出すかを、エントリだけから決める必要があり、`flush` (XRET/NEXT_PC) と `fu` (NONE) からは区別できない。
 - 窓の規則 (所有者は各キュー。§L はこの規則に従う): `lq` は最古から `COMMIT_W` 個、`sq` は最古から `MEM_W` 個 (SB push 予算, §3.2) のエントリを登録済みの窓として出す。commit の lane は自分が運ぶタグと窓エントリのタグの等値比較で 1 つを選ぶ (one-hot の AND-OR)。`idx - head` は計算しない (§5.2)。一致がちょうど 1 つであることは checker が検査する。
 - `insn` と `obs` は retire record 専用で、設計論理には戻さない。decode 不正の tval は `ExcRec.tval` が運ぶので `insn` を使わない。synth からの除外は checker と同じ方法 (§5.15 の【M1a で決定】) による。
@@ -2314,7 +2331,7 @@ limit_ok[l] = !i_dbg_retire_limit_en || order_q + l < i_dbg_retire_limit
 | FS/VS の dirty 化 | `effect.FS_DIRTY` / `VS_DIRTY` の OR | `csr.i_fs_dirty` / `i_vs_dirty` (新設) | 1 |
 | 翻訳の無効化 | SFENCE.VMA, SINVAL.VMA, HFENCE.*, HINVAL.* | I/D の `tlb` と `ptw` (`o_xlate_flush`) | 1 |
 | icache の無効化 | `fence_i` (ROB エントリ) | `icache` (`o_icache_inv`) | 1 |
-| atomic の retire | `fu == ATOMIC` | `atomic_unit` (reservation と watch) | 1 |
+| head の retire | lane 0 の retire | `atomic_unit` と `io_unit` の `i_head_retired` (started latch を下ろし、保持中の op を手放す。M2) | 1 |
 | reservation の解除事象 | trap の受付、xRET、satp への書込み | `atomic_unit` (`o_rsv_clr`) | 1 |
 | FTQ と予測器 | retire した最年少 lane の `{ftq, foff}` | `ftq` の `i_cm` へ 1 本の `o_ftq_cm: FtqCommit {valid, ftq, foff}` (§F.3)。valid は retire した lane が 1 つ以上あることなので、full kill のサイクルには立たない。予測器の更新は ftq が commit 済みの範囲から作る (§F.4) | 1 |
 | instret | `popcount(retire)` | `csr.i_instret_cnt` | `RETIRE_CNT_W` |
@@ -2529,7 +2546,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 
 ### C.9 旧コアの仕様逸脱と allow-list (D4)
 
-新コアはアーキテクチャ的に正しく作り、golden との差は検証計画 (`doc/phase15_verification_plan.md`) 付録 B の許容差異表で吸収する。【決定】allow-list の語彙と行番号は検証計画付録 B のものを唯一の正本とし、本節は付録 B の行番号 (B01-B48) で参照する。本節が決めるのは新コア側の挙動だけである。扱いの語彙 (REPLAY、NORM、MASK:<tag>、EXCL:<tag>、STOP:<tag>、OUT、SAME) の意味も付録 B に従う。理由: 2 か所でタグ名を持つと、書式だけでなく扱いの意味まで分かれる。「推定」の行は M2 の前に golden 上の directed test で確かめる (D4)。本表は commit・trap・CSR の範囲に限る。misaligned や fetch の straddle などは §L, §M, §F の表にある。
+新コアはアーキテクチャ的に正しく作り、golden との差は検証計画 (`doc/phase15_verification_plan.md`) 付録 B の許容差異表で吸収する。【決定】allow-list の語彙と行番号は検証計画付録 B のものを唯一の正本とし、本節は付録 B の行番号 (B01-B54) で参照する。本節が決めるのは新コア側の挙動だけである。扱いの語彙 (REPLAY、NORM、MASK:<tag>、EXCL:<tag>、STOP:<tag>、OUT、SAME) の意味も付録 B に従う。理由: 2 か所でタグ名を持つと、書式だけでなく扱いの意味まで分かれる。「推定」の行は M2 の前に golden 上の directed test で確かめる (D4)。本表は commit・trap・CSR の範囲に限る。misaligned や fetch の straddle などは §L, §M, §F の表にある。
 
 | # | 旧コアの逸脱 (根拠) | 新コア | 付録 B の行と扱い |
 |---|---|---|---|
@@ -2674,7 +2691,7 @@ LQ エントリ: `{ex: ExTag (rob, pdst, has_rd), ldk (size, signed, fp), sq_lim
 | `sb` | `i_push[PUSH_W]`、`i_vu_push` (M5)、`i_fwd_q[MEM_W]`、`i_drain_ack`、`i_aq_empty` | `o_fwd[MEM_W]`、`o_credit`、drain ポート (`o_drain_v`/`addr`、8 lane の `data`/`strb`、`o_drain_urgent`)、`o_resource_empty`、`o_drained`、`o_ordering_empty` |
 
 - 【決定】(M1b) LQ と SQ の commit 窓は、エントリごとに retire record 用の `MemObs {size, vaddr, paddr, io, rmask, wmask, wdata, wdata_hi}` を持ち (`LqCmWin {valid, tag, poison, io_ordered, obs}`、`SqCmWin {valid, tag, retire_ok, io_ordered, lines, obs}`)、head 1 つ分の `o_head_rec` は持たない。理由: commit は窓のどの lane でも load/store を retire させうる (§5.12 C5) ので、retire record の値も lane ごとに要る。`SqCmWin.lines` は retire で `sb` に push する line 数 (CMO と IO は 0、通常 1、line 跨ぎ 2) で、commit の `n_line` (§C.2.2) の源である。`io_ordered` は commit が `alone_eff` を作るための遅延属性である。
-- 未接続 (統合の stage g で決める): `lq.i_bar_ret` (このサイクルに `ld_barrier` op が retire したか) を作る `commit` の出力が無い。`RobEnt` は `ld_barrier` を持たないので、ROB エントリに足すか、stage g で別の源から作る必要がある。
+- 統合の stage g で閉じた接続: `lq.i_bar_ret` は `commit.o_bar_ret` (RobEnt の `ld_barr`、§C.1.1) から来る。`IqCold` の `lq`/`sq` は「load は自分の LqTag と `sq_lim`、store は自分の SqTag と `lq_lim`」を運ぶ (L.2)。
 
 kill への応答は §5.4 の消費者表 (`lq`、`sq` の行) と T5 のとおりで、生存数の popcount は使わない。
 
@@ -2863,9 +2880,11 @@ drain (§5.9 MP7、所有者 `sb`): drain ポートを駆動するのは head �
 
 ### L.11 atomic_unit
 
-入力: m2 で `mem_pipe` から受け取る翻訳済みの atomic `{OpTag, op (funct5, size, aq, rl), pa, attr, rs2 の値}` (rs1 と rs2 は通常の issue と同じく memory IQ の 2 source で読む)。例外を持つ atomic は `mem_pipe` が自分で完了させ、`atomic_unit` には渡さない。oldest token を持つ atomic の要求は port 0 の HEAD クラス、queued atomic (M4) の要求は ASQ クラスの slot で出す (L.14)。開始と開始後の再要求は §5.13.1 の規則に従う: 最初の `LOAD_EXCL` (SC は `STORE_EXCL`) の受理 edge で `started_q` を立て、それ以降の再要求 (MISS と FILL_DONE の後、RETRY の後、FAIL と watch による読み直し、`STORE_EXCL`) はすべて `started_q` で出す。LR も同じ扱いである (LOAD_EXCL の slot は fill の DONE まで保持され、§M.2.6 はそれが kill されないことを前提にしている)。
+入力: m2 で `mem_pipe` から受け取る翻訳済みの atomic `AtomicOp {tag: ExTag, amo: AmoUop {op, f3}, pa, rs2 の値, rd_arch, rs2_arch}` (rs1 と rs2 は通常の issue と同じく memory IQ の 2 source で読む。AGU は imm = 0 で使う。`rd_arch` と `rs2_arch` は amocas の追加オペランドを引くための番号。【M2 で決定】運び方は統合で決める。案は decode が IQ の cold payload の `imm` に入れること)。例外を持つ atomic は `mem_pipe` が自分で完了させ、`atomic_unit` には渡さない。oldest token を持つ atomic の要求は port 0 の HEAD クラス、queued atomic (M4) の要求は ASQ クラスの slot で出す (L.14)。開始と開始後の再要求は §5.13.1 の規則に従う: 最初の `LOAD_EXCL` (SC は `STORE_EXCL`) を提示した edge で `started_q` を立て、それ以降の再要求 (MISS と FILL_DONE の後、RETRY の後、FAIL と watch による読み直し、`STORE_EXCL`) はすべて `started_q` で出す。LR も同じ扱いである (LOAD_EXCL の slot は fill の DONE まで保持され、§M.2.6 はそれが kill されないことを前提にしている)。
+- 【決定】(M2 準備) `started_q` は、最初の要求を adapter に提示した edge で立て、その応答が RETRY(BANK_CONFLICT) であっても下ろさない (`io_unit` も同じ、L.13)。理由: adapter の `o_req_ready` は定数 1 で、提示と受理は同じ edge であり、IR3 の token の照合もこの edge で行う。応答は `RESP_LAT` 後に来るので、開始を応答で決めると、token を照合した edge と開始の edge が分かれ、IR3 の「窓が無い」が崩れる。
+- 【決定】(M2 準備) `AmoUop` は aq と rl を持たない (`{op, f3}` だけ)。aq は OpClass の `ld_barrier` (§5.5) が若い load を止め、rl も含めて、どの atomic も開始前に `ordering_empty` を待つ。理由: D8 の方式では atomic は最古で、より古い store が全部見えてから始まるので、aq/rl を unit の中で区別しても振る舞いが変わらない。
 
-【決定】amocas の追加オペランド (比較値の rd、amocas.q の rd+1 と rs2+1) は、`atomic_unit` が開始時に自分で読む。arch RAT の読出ポートで写像を引き、PRF の読出ポートで値を読む。理由: op は最古なので、より古い op はすべて retire しており、arch RAT の写像がそのままこの op の source の写像であり、値は PRF にある (§V.3 VA3 と同じ論法)。これで `DecOp.src[3]`、memory IQ の `IQ_NSRC=2`、§X.2 の slot 表を amocas のために広げずに済む。この読出ポート (arch RAT の int 読み 4 本と PRF の int 読み 4 本、amocas の開始時だけ使う) は §X.2 の本数に含まれず、M2 で amocas を入れるときに足す。結果は wbm0 に HOLE_FILL で書く (§5.7)。
+【決定】amocas の追加オペランド (比較値の rd、amocas.q の rd+1 と rs2+1) は、`atomic_unit` が開始時に自分で読む。arch RAT の読出ポートで写像を引き、PRF の読出ポートで値を読む。理由: op は最古なので、より古い op はすべて retire しており、arch RAT の写像がそのままこの op の source の写像であり、値は PRF にある (§V.3 VA3 と同じ論法)。これで `DecOp.src[3]`、memory IQ の `IQ_NSRC=2`、§X.2 の slot 表を amocas のために広げずに済む。この読出ポート (arch RAT の int 読みと PRF の int 読みを各 `CAS_RD_N = 3` 本: rd、rd+1、rs2+1。amocas の開始時だけ使い、1 本につき 1 サイクルの組合せ読み) は §X.2 の本数に含まれず、M2 で amocas を入れるときに足す。rs2 自身は通常の source で読むので 4 本目は要らない。結果は wbm0 に HOLE_FILL で書く (§5.7)。amocas.q の rd+1 は `o_wb_hi` に別に出す。rd の対を ROB と PRF にどう書くか (2 つ目の宛先) は §5.5 の【M2 で決定】のままで、`o_wb_hi` はどちらの案でも値の出所になる。
 
 dcache との契約 (§5.9 MP6、§M):
 
@@ -2877,10 +2896,11 @@ dcache との契約 (§5.9 MP6、§M):
 
 dcache との契約 (ownership read、pin、MP6、watch) と queued atomic (ASQ) という旧方式の中身は変わらず、変わるのは書き込みの時点だけであり、D5 の「既存方式のまま」はこの範囲で読み替える (D8。旧方式を採らなかった経緯は付録 §L)。
 
-- LR: `LOAD_EXCL` が HIT したら reservation を張り (L.12)、rd を WB する。書き込みは無い。
+- LR: `LOAD_EXCL` が HIT したら reservation を張り (L.12)、rd を WB する。書き込みは無い。【決定】(M2 準備) 読みの間に watch が発火した LR は、AMO と同じく backoff の後に読み直す。理由: line が離れた後の値で reservation を張ると、その間の remote の書き込みを見落としたまま SC が成功しうる。
+- SC: 【決定】(M2 準備) reservation が無い (か PA が一致しない) SC は、要求も token も使わずに rd = 1 で完了する。理由: 失敗が確定しているので、メモリに何も出さないのが最短であり、取り消せない操作も始まらない。
 - amocas.w/d/q: 比較値は上の【決定】のとおり `atomic_unit` が arch RAT と PRF から読む (旧コアの `arch_regs` の shadow は持たない)。amocas.q は 16 B 境界に整列している必要があり (整列していなければ misaligned AMO として access fault)、`LOAD_EXCL` と `STORE_EXCL` に 2 dword の mask と 128 bit の data を使う。line は跨がない。rd の対をどう書くかは §5.5 の【M2 で決定】に従う。
 - AMO の演算 (swap/add/xor/and/or/min/max/minu/maxu、Zabha の幅) は `atomic_unit` の中の関数 1 つで行う。旧コアは execute 側と ASQ の drain 側に同じ演算を 2 つ持っていた (`heliodor_core.veryl:10958-10991`)。
-- 不変条件 (所有者 `atomic_unit`): FAIL した AMO、watch が発火した AMO、例外を持つ atomic は、rd もメモリも書かない。atomic の分類は decode の op 種別と翻訳時の `PmaAttr` だけから決め、横の latch からは決めない。
+- 不変条件 (所有者 `atomic_unit`): FAIL した AMO、watch が発火した AMO、例外を持つ atomic は、rd もメモリも書かない。比較が一致しなかった amocas はメモリに書かない (`STORE_EXCL` を出さず、読んだ値を rd に書く)。atomic の分類は decode の op 種別と翻訳時の `PmaAttr` だけから決め、横の latch からは決めない。
 
 queued atomic (ASQ、M4):
 
@@ -2910,14 +2930,15 @@ reservation (所有者 `atomic_unit`、1 hart に 1 つ): `{valid, pa (LR の正
 ### L.13 io_unit
 
 - 対象: `!attr.cacheable` の load と store。IO (`attr.io_ordered=1`) のほか、M1-M2 では NC (`io_ordered=0`) もここで実行する。
-- IO load: LQ に PARK(HEAD) で置かれ、`io_unit` は次の条件がすべて成り立つと HEAD クラスの slot を要求する: oldest token == エントリのタグ、`ordering_empty`、`atomic_unit` が空 (§5.14)。`UNC_READ` (タグは `MemTag{IO, LqTag}`) が受理された edge で `started_q` を立て、`o_started` を出す (§5.13.1。RETRY が返っても retire まで下ろさず、RETRY の後の再要求は token ではなく `started_q` で出す。mem_ctrl は非 DRAM の読み出しを grant のサイクルに行うので、要求を出した時点で副作用が起こりうる)。`PENDING(fill_id)` の後、同じ `fill_id` の `UNC_DONE` の event で data を受け取る。
-- IO store: oldest token と `ordering_empty` が成り立ったら、`STORE_WT` を出し、受理 edge で同じく `started_q` を立てる。`WT_DONE` を受けたら `sq.i_wt_done` で SQ エントリの `wt_done` を立てる。retire はその後である (non-posted、§C.2.2 の 4 行目)。旧コアの doorbell 規則 (mailbox への store の後、fence 無しで CLINT の msip を書く。`heliodor_core.veryl:6369-6374`) を `ordering_empty` で満たす。
+- IO load: LQ に PARK(HEAD) で置かれ、`io_unit` は次の条件がすべて成り立つと HEAD クラスの slot を要求する: oldest token == エントリのタグ、`ordering_empty`、`atomic_unit` が空 (§5.14)。`UNC_READ` (タグは `MemTag{IO, LqTag}`) を最初に提示した edge で `started_q` を立て、`o_started` を出す (§5.13.1。RETRY(BANK_CONFLICT) を含め RETRY が返っても retire まで下ろさず、RETRY の後の再要求は token ではなく `started_q` で出す。mem_ctrl は非 DRAM の読み出しを grant のサイクルに行うので、要求を出した時点で副作用が起こりうる)。`PENDING(fill_id)` の後、同じ `fill_id` の `UNC_DONE` の event で data を受け取る。
+- IO store: oldest token と `ordering_empty` が成り立ったら、`STORE_WT` を出し、最初に提示した edge で同じく `started_q` を立てる。`WT_DONE` を受けたら `sq.i_wt_done` で SQ エントリの `wt_done` を立てる。retire はその後である (non-posted、§C.2.2 の 4 行目)。旧コアの doorbell 規則 (mailbox への store の後、fence 無しで CLINT の msip を書く。`heliodor_core.veryl:6369-6374`) を `ordering_empty` で満たす。
 - 不変条件 (所有者 `io_unit`): 同時に未完了の要求は 1 本だけ。要求を再提示してよいのは RETRY を受けたときだけで、PENDING の後は決して再提示しない。結果は `io_unit` の結果レジスタ 1 本で捕まえ、wbm0 に HOLE_FILL で書く。LQ エントリは完了だけを記録する。
 - misaligned アクセス、AMO、LR/SC が IO/NC 領域を指したら、m1 で access fault にする (§5.14)。
 - DRAM の PA を指す NC/IO アクセス (Svpbmt): §5.11 の【M2 で決定】の基本線に従う。`io_unit` は uncached アクセスの前に、自 hart の dirty line を `CMO` (clean) 要求で書き戻す。`CMO` クラスの要求者は現時点でこれだけである。
 - 【M3 で決定】NC load の投機的な発行 (§5.14) は boot と bench で NC load の発生数を数えて決める。発生数が 0 なら head での発行のまま確定する。
-
-### L.14 mem_port_arb
+- 接続 (M2 準備): `io_unit` は `lq` (head の非 cacheable load) と `sq` (head の非 cacheable store) から登録済みの `IoOp` の申し出を受け、op が retire するまで保持する (`i_head_retired` = commit の lane 0 の retire)。`i_atomic_empty` は `atomic_unit.o_empty` である。要求は `mem_port_arb` の HEAD クラスで出し、応答は `MemTag.client = IO` で HEAD ポートの応答から選ぶ。完了は `o_ld_done`/`o_st_done` で LQ/SQ に返す。
+- 【決定】(M2 準備) adapter (§M.2) は、uncached の読みが grant された瞬間を、新しい dcache の export を足さずに `!fill_busy && !unc_wait` (既存の出力と stall の項 E3) で検出する。理由: fill の状態機械が idle のときだけ uncached の読みが進み、idle の読みは grant まで `unc_wait` で止まるので、2 つの既存の項で足りる。export を足すと §4.4 の追加変更が 1 つ増える。
+- 【決定】(M2 準備) adapter は `CMO` を受理サイクル A で判定して HIT を返し (nf 群の他の要求と同じく B 位置が空いているときだけ受理する)、再利用 dcache には操作を出さない。`io_unit` は HIT を受けてから uncached のアクセスを出す。理由: 応答の形 (A で確定する HIT) を最終形の契約どおりに固定しておけば、clean の実体を足しても `io_unit` は変わらない。【M2 で決定】再利用 dcache に自 hart の dirty line が残りうるなら、HIT の前に clean の実体 (dcache の追加 export) が要る。DRAM 上の Svpbmt NC/IO の基本線 (U28) と同時に確かめる。
 
 - 要求者クラスと port の能力 (定数配列 `PORT_CLASSES[p]`。サイズではなく能力の表で、`core_types` が `MEM_W` から導く: port 0 は全クラス、port ≥1 は NEW/LQ/SQ。lane 番号による特例は書かない):
 
@@ -2969,7 +2990,7 @@ reservation (所有者 `atomic_unit`、1 hart に 1 つ): `{valid, pa (LR の正
 
 | M | §L が出荷するもの |
 |---|---|
-| M1b | `mem_pipe` (m0-m2+RESP_LAT、Bare の翻訳経路、PMP/PMA)、`lq` (credit、store-resolve scan、PARK(FILL/BUSY/SQ/HEAD)、再 issue、commit 窓の poison、`ld_barrier` の通し番号、kill)、`sq` (STA/STD ポート、一括 issue)、`sb` (PUSH_W ポート、write-combining、drain、3 つの empty)、`mem_port_arb` (NEW/LQ/SQ)、PA キーの forward、FENCE/FENCE.I の順序、line 内と line 跨ぎの misaligned (rv64ui の ma_data)。cfg_w4 は MEM_W=2 で elaborate でき、論理ポートの衝突は負けた側の `RETRY(BANK_CONFLICT)` になる。実装の結果 (stage f): `lq` は CoRR の line scan の入力 (`i_coh_*`、adapter と同じ inv/inv2/evict) も持つ。adapter は fold 群 (LOAD) だけを扱い、nf 群、`io_unit`、cbo、atomic、TLB は M2。統合の stage g に残る接続: `lq.i_bar_ret` の源 (L.10)、dispatch の cold payload を `mem_pipe` の規約 (load の `cold.sq = sq_lim`、store の `cold.lq = lq_lim`、L.2) に合わせること。 |
+| M1b | `mem_pipe` (m0-m2+RESP_LAT、Bare の翻訳経路、PMP/PMA)、`lq` (credit、store-resolve scan、PARK(FILL/BUSY/SQ/HEAD)、再 issue、commit 窓の poison、`ld_barrier` の通し番号、kill)、`sq` (STA/STD ポート、一括 issue)、`sb` (PUSH_W ポート、write-combining、drain、3 つの empty)、`mem_port_arb` (NEW/LQ/SQ)、PA キーの forward、FENCE/FENCE.I の順序、line 内と line 跨ぎの misaligned (rv64ui の ma_data)。cfg_w4 は MEM_W=2 で elaborate でき、論理ポートの衝突は負けた側の `RETRY(BANK_CONFLICT)` になる。実装の結果 (stage f): `lq` は CoRR の line scan の入力 (`i_coh_*`、adapter と同じ inv/inv2/evict) も持つ。adapter は fold 群 (LOAD) だけを扱い、nf 群、`io_unit`、cbo、atomic、TLB は M2。`lq.i_bar_ret` の源 (`commit.o_bar_ret`、§C.1.1) と dispatch の cold payload の規約 (L.2) は統合の stage g で接続した。【決定】(M1b、cold-reader gate) M1b の `mem_pipe` が実行するのは cacheable な PA への 1/2/4/8 byte の整数 load/store だけで、それ以外は m1 でアクセス fault (load は 5、store は 7) にする: hole、PMP の拒否、非 cacheable な PA、`misaligned_ok` を持たない領域への misaligned。理由: M1b には uncached の経路 (`io_unit`) が無い。非 cacheable な PA を cacheable として扱うと IO の副作用を壊すので、fault にして trace で見えるようにする (特権仕様はアクセスできない属性へのアクセスを access fault にしてよい)。M2 で `io_unit` を入れるときに非 cacheable の fault を外す。 |
 | M2 | `atomic_unit` (AMO/LR/SC/amocas/Zabha、watch、reservation、started latch)、`io_unit` (IO/NC、DRAM 上の Svpbmt と CMO clean)、`tlb`/`ptw` と Sv39 の TLB miss の park (PARK(XLATE)) と D-PTW (PTW クラス)、Svadu (AD クラスは `STORE_WT`)、cbo.*、PMA/PMP の fault、IO/AMO の misaligned fault、CoRR scan (N=1 でも追い出しで発火する)。gate は arch suite、ACT4、5.15 N=1 の lockstep。 |
 | M3 | 2 ポートの dcache で MEM_W=2 を実働させる。port ごとの forward と scan、複数 lane からの store retire、STA/STD 分離の判定、REISSUE_W、サイズの sweep、NC の投機の判定、line 跨ぎ load の投機の判定、`LD_LAT` の圧縮の判定、replay コストの測定。 |
 | M4 | コヒーレンスの下での CoRR、reservation、watch の検証 (litmus N=2/4、N=2/4 boot。メモリ系の変更には N=4 boot を必須とする)。ASQ の判定、AD クラスを所有権付き RMW に変える、victim 除外の判定、drain の飢餓の確認、`wt_fires` の directed test。 |
@@ -3210,6 +3231,7 @@ fold 群と LOAD_EXCL は、判定サイクル V に次の行を上から評価�
   - 非 cacheable fetch は、要求者の属性 (`pma.cacheable=0`) で single-beat 要求として出す。SoC が要求者の属性で legacy grant に回すこと (PM7) が前提で、これは M1a で入れる §S.4 の変更である (SoC は今 I slot を DRAM 固定にしている、`heliodor_soc_smp.veryl:447`)。
   - I-PTW と icache の読みは `i_iread=1` (計数しない coherent 読み、owned なら recall) を使う。自 hart の L1 にある dirty line も recall で見える。SB の中の store は見えないが、sfence は drain を待つ (§5.5) ので問題ない。
 - I-PTW の A ビット書き込みは、旧コアの drain ポート借用をやめ、`mem_port_arb` の port 0 に client=AD、STORE_WT として出す (M.8.4)。
+- 【M2 で決定】I-PTW の PTE 読みの経路。M2 準備で作った `ptw` は D と I で同じ 1 本のメモリ client (port 0 形の `MemReq`/`MemResp`/`MemEvent`、PTE 読みは PTW_READ、client は PTW_D か PTW_I) を持つ。上の規則どおり I-PTW の PTE 読みを `islot_arb` に出すなら、その client を I read slot の要求に変換する小さな adapter が要る。I-PTW の PTE 読みも port 0 に出すなら、この節と §5.9 の能力表、`islot_arb` の client 0 を改める。core top を組む時点で、port 0 の占有と adapter の大きさを比べて決める。
 
 ### M.6 M3: dcache CPU 側の再構築
 
@@ -3329,15 +3351,17 @@ module ptw::<CFG: core_cfg> #(param QN: u32) (   // QN bound from CFG::PTW_D_QN 
     o_evt  : output PtwEvent,                         // waiter wakeup, registered
     // D: MemReq/MemResp/MemEvent client on port 0: PTW_READ; as client AD, STORE_WT (M1-M3) or LOAD_EXCL/STORE_EXCL (M4)
     // I: islot_arb client for PTE reads; port-0 STORE_WT client AD for A-bit writes
-    // CSR context (satp/vsatp/hgatp, privilege, SUM/MXR, menvcfg/henvcfg, pmpcfg/pmpaddr), latched at walk start
+    // CSR context XlateCtx {prv, sum, mxr, adue, pbmte, asid, root} latched at walk start; pmpcfg/pmpaddr read live
 );
 ```
 
 - 要求は valid/ready で受ける (ready は登録済みのキュー空き)。要求を出せるのは、LQ/SQ に割り当て済みで kill されていない op (D。LR を含む)、M5 からは VU の要素アクセス (D)、`ifu` (I) だけである (X4)。キューのエントリは `{tag: MemTag, va, acc, hlv, hlvx, nonspec}`。
 - 【決定】合流: キー `{VPN, regime}` (regime は V=0、V=1、HLV のいずれか) がキュー内のエントリか実行中の walk と一致する要求は、キューに入れずに受理し、要求者を PtwEvent の waiter にする。理由: N 本のポートが同じ page で miss しても、walk は 1 回で済む。
+- 【決定】(M2 準備) `nonspec` の要求は合流させず、必ず自分のエントリとしてキューに入る。理由: `nonspec` の要求は D ビットを書く walk の owner にならなければならず (M.8.4)、waiter になると PtwEvent しか受け取らないので、D を立てる walk がどこにも無くなる。
 - 【M3 で決定】キュー深さ `QN` (初期値 D=4、I=1): cfg_w4 の bench と boot で、キューが満杯で受理を待ったサイクル数を測って決める。
-- kill: D のキューは、エントリの owner の RobTag (`MemTag.rob`) に `killed()` を適用して owner を落とす (§5.4、§5.9)。I のキューは、どの kill でも空にする (front end の規則, §5.4)。実行中の walk の owner が kill されたら owner の valid だけを落とし、walk は続ける。ただし `nonspec` の walk は、owner の valid が落ちていたら D ビットの PTE 書き込みを出さず、TLB への install だけで終える (§5.13.1 IR5。IR4 により起こらないはずなので、checker が flag を立てる)。
-- epoch (X2): walk の開始時に、epoch と文脈 (satp/vsatp/hgatp のルートと mode、実効特権、SUM/MXR、ADUE、PBMTE) を latch する。install は、COMPLETE のサイクルの増分を反映した後の epoch と一致するときだけ行う。したがって kill と同じサイクルに完了した walk は install されない。合流は、同じ epoch の walk にだけ行う。
+- kill: D のキューは、エントリの owner の RobTag (`MemTag.rob`) に `killed()` を適用して owner を落とす (§5.4、§5.9)。【決定】(M2 準備) キューのエントリは、owner と合流した waiter のうち最も古い RobTag (最古の参加者) を持ち、エントリ自体を捨てるのはその参加者が kill されたときだけとする。owner だけが kill されたエントリは owner の valid を落として残し、walk は waiter のために行う。理由: kill は keep より若い op をすべて消すので、最古の参加者が残っていれば、その walk を待つ生きた waiter が少なくとも 1 つある。owner の kill で捨てると、生きた waiter が PtwEvent を受け取れず永久に park する。I のキュー (`MemTag.rob_v = 0`) は、どの kill でも、また `i_owner_drop` (F.5) でも空にする (front end の規則, §5.4)。実行中の walk の owner が kill されたら owner の valid だけを落とし、walk は続ける。ただし `nonspec` の walk は、owner の valid が落ちていたら D ビットの PTE 書き込みを出さず、TLB への install だけで終える (§5.13.1 IR5。IR4 により起こらないはずなので、checker が flag を立てる)。
+- epoch (X2): walk の開始時に、文脈 `XlateCtx {prv, sum, mxr, adue, pbmte, asid, root}` (satp/vsatp/hgatp のルートと mode、実効特権、SUM/MXR、ADUE、PBMTE) を latch する。【決定】(M2 準備) epoch はカウンタで持たず、walk ごとの stale bit で表す: walk の開始で 0 にし、その後の full kill か retire 時の TLB 無効化 (`i_inv`) で 1 にする。COMPLETE のサイクルに起きたものも数える。install、owner への `o_resp`、合流は stale でない walk にだけ行う。したがって kill と同じサイクルに完了した walk は install されない。理由: 比べる相手は「開始以後に epoch が動いたか」だけなので 1 bit で足り、カウンタの巡回を考えずに済む。
+- 【決定】(M2 準備) PMP (pmpcfg/pmpaddr) は latch せず、毎サイクル csr から live に読む。理由: PMP の CSR への書き込みは flush を伴う retire であり (§5.5、§5.10 の文脈 CSR のリスト)、full kill は walk を stale にするので、walk の途中で値が変わっても、その walk の結果は使われない。latch すると 16 本の pmpaddr を walker ごとに複製することになる。
 
 #### M.8.2 完了と応答
 
@@ -3347,7 +3371,7 @@ o_evt : PtwEvent  // {valid, key: PtwKey = {vpn, regime}, fault} (section 5.10);
 ```
 
 - 【決定】walk の owner には、完全な XlateResp (pa、pma、exc。owner の acc で権限、PMP、PMA を検査済み) を返す。合流した waiter には PtwEvent を送り、waiter は TLB をもう一度 lookup する。fault のときも PtwEvent を送る。waiter は再 lookup で miss し、自分の walk の owner になって自分の fault を受け取る。理由: owner が install 直後の置換で再 lookup に負け続ける余地を消すため (owner は必ず前進する)。walker は結果を保持する状態を持たないので、TS_DONE が投機要求に握られて guest Linux を 2 か月 deadlock させた事故 (c358684) の類は構造的に起きない。
-- そのため `ptw` は、最終 PA 用に `pmp_check` (D は R と W、I は X) と `pma_check` を持つ。
+- そのため `ptw` は、最終 PA 用に `pmp_check` と `pma_check` を持つ。【決定】(M2 準備) 最終 PA の検査は owner の `AccKind` ごとに行う: PMP は LOAD が R、STORE が W、AMO が R かつ W、CBO が R または W、FETCH が X。PMA は backed であること (hole はアクセス fault)、FETCH ではさらに `executable`。PBMT は PMA と合成して `XlateResp.pma` に入れる (M.8.5)。理由: owner に返す応答は「そのまま使える最終の翻訳」であり (上の【決定】)、要求者が受け取った後に検査をやり直す経路を作らないため。M.10 の `mem_pipe` 側の規則と同じ表である。
 - 冗長な walk (lookup の miss の直後に、同じキーの walk が完了していた場合) は許す。正しさには影響しない。
 - 不変条件 (所有者 `ptw`): walker は、要求者が VA を再提示することにも、ポートの live な状態にも依存しない。応答の帰属は tag だけで決める。
 
@@ -3363,7 +3387,8 @@ o_evt : PtwEvent  // {valid, key: PtwKey = {vpn, regime}, fault} (section 5.10);
 - A ビットは投機的に立ててよい。ADUE=1 で A=0 の leaf に当たったら、PTE|A を書いてから install する。
 - D ビットは正確でなければならない (非投機、プログラム順)。【決定】store/AMO の lookup が W=1・D=0 のエントリに当たったら、ADUE=0 なら page fault、ADUE=1 なら XlateResp に `need_d=1` を返し、PA は確定させない。`sq` (atomic も SQ エントリを持つので、atomic の分も `sq` が出す) は、§5.13.1 の開始点の規則に従って `nonspec=1` の `ptw` 要求を出す (受理 edge で token を照合し、`started_q` を立てる。§L.16)。walker は PTE を読み直し、valid で store を許すことを確かめてから PTE|A|D を書き、D=1 のエントリを install して owner に XlateResp を返す。理由: D を更新した時点の walk を、その store の翻訳とする (Sv39 の更新手順と同じ)。execute 時の PA を使わないので、途中で PTE が書き換わった場合の照合も replay も要らない。代わりに、D=0 の page への最初の store だけが head まで PA 不明になり、その間 LSQ はこれを「アドレス未知の store」として扱う (§L)。
 - `nonspec` の要求が受理されてから store が retire するまで、head の op は取り消せない操作を開始した状態 (`head_started_q`、§5.13.1) とする。割込みで store が捨てられると、D だけが立って store が行われないことになるからである。
-- 書き込みの経路は、M1-M3 では port 0 の client=AD、STORE_WT (PENDING の後、WT_DONE で完了)。【決定】A/D の書き込みは `sb.ordering_empty` の下でだけ出す。理由: PTE を読んでから書くまでの間に、自 hart の SB にある同じ PTE への store が drain されると、古い PTE|A で上書きしてしまう。M4 では、LOAD_EXCL で PTE を読み、walk で読んだ値と比較して、一致すれば STORE_EXCL で書く owned RMW にする。不一致か FAIL なら walk をやり直す (§5.9 の A/D の決定。SMP での原子性)。
+- 書き込みの経路は、M1-M3 では port 0 の client=AD、STORE_WT (PENDING の後、WT_DONE で完了)。【決定】A/D の書き込みは `sb.ordering_empty` の下でだけ出す。理由: PTE を読んでから書くまでの間に、自 hart の SB にある同じ PTE への store が drain されると、古い PTE|A で上書きしてしまう。
+- 【決定】(M2 準備) 上の規則は「書き込みの時点で `ordering_empty`」だけでは足りないので、次の手順にする: A/D を書く walk は、`ordering_empty` が成り立ってから leaf の PTE を読み直し、その読みから書き込みの提示まで `ordering_empty` が途切れずに成り立っていたときだけ、読み直した値から作った PTE|A|D を書く。途中で `ordering_empty` が落ちたら leaf をもう一度読み直す。理由: 最初の walk の読みと `ordering_empty` の成立の間に SB の store が PTE を書き換えうる。書き込みの時点だけを見ると、その書き換えを古い値で上書きする。読み直しの後に SB が空のままなら、読んだ値と書く値の間に自 hart の store は入らない (M4 では owned RMW がこの役を負う)。M4 では、LOAD_EXCL で PTE を読み、walk で読んだ値と比較して、一致すれば STORE_EXCL で書く owned RMW にする。不一致か FAIL なら walk をやり直す (§5.9 の A/D の決定。SMP での原子性)。
 - A/D の書き込みは PTE アドレスへの W であり、PMP で拒否されればアクセス fault とする (`mmu.veryl:453` の検査を移植)。
 
 #### M.8.5 Svnapot と Svpbmt
@@ -3921,6 +3946,18 @@ M1a で決める事項: U4 (新コアの veryl の版、M1a 開始時)、U5、U6
 | e | `iq`、`busy_table` (`prf_ready` のみ)、`wb_resv`、`prf`、`exec_port`、`fu_alu`、`fu_bru`、`fu_sys` (`fu_mul`、`fu_div` は入れてもよい) | 最初の端から端までの rv64ui (ALU、分岐、CSR)。ここで golden との trace diff を回し始める |
 | f | `mem_pipe` (Bare の翻訳)、`lq`、`sq`、`sb`、`mem_port_arb`、`dcache_port_adapter`、`pmp_check` の各 instance | load/store、PA キーの forward、FENCE/FENCE.I と `ld_barrier`、line 内と line 跨ぎの misaligned (§L.18、§M.1 の M1b 列) |
 | g | `heliodor_core::<CFG>`、`heliodor_core_w2`/`_w4`、SoC の `CORE=W2/W4` 枝、`gen_core_tests.py` と `test/gates/m1.list` | W2 の rv64ui 54 本の lockstep、W4 の elaborate と rv64ui のサブセット |
+
+【決定】(M1b、cold-reader gate) M1b の build が実行する範囲 (served ISA) を次のとおりとし、それ以外は黙って通さず、決まった例外にする:
+
+| 区分 | M1b で実行する | M1b での扱い (M2 以降で外す) |
+|---|---|---|
+| 命令 | RV64I、M、C (extract が展開)、`fu_alu` が持つ Zba/Zbb/Zbs/Zicond/Zimop、Zicsr (存在表にある CSR)、FENCE/FENCE.I、ECALL/EBREAK、MRET/SRET、WFI (NOP) | F/D、A (LR/SC、AMO、amocas)、CBO、H (HLV/HSV、HFENCE/HINVAL、H と VS の CSR)、V の CSR と vector 命令は decode で不正命令 (§R.2) |
+| データアクセス | cacheable な PA への 1/2/4/8 byte の整数 load/store。line 内と line 跨ぎの misaligned を含む (領域が `misaligned_ok` のとき) | hole、PMP の拒否、非 cacheable な PA、`misaligned_ok` の無い領域への misaligned は m1 でアクセス fault (§L.18) |
+| fetch | PMA が `executable` で PMP の X が許す block | instruction access fault (§F.5。PMP は granule ごと) |
+| 翻訳 | Bare (PA = VA) | `tlb`/`ptw` は M2 |
+| 割込み | 受け付けない | M2 (§C.0) |
+
+理由: M1b のゲートは rv64ui だけなので、unit の無い機能を通しても検査されず、黙って誤った値で retire するか wedge する。決まった例外にしておけば、trace の上で golden との差としてすぐ見え、unit を入れるときに外す場所も decode と `mem_pipe` の 1 か所ずつに限られる。cfg_w4 は p4/p5 の FU を持たずに 6 本の issue ポートを保つ (§X.2 の M1b の【決定】)。
 
 段 b を front end より先に置くのは、retire record と kill の消費経路 (再利用 index のバグ類の主戦場) を、他のモジュールが揃う前から checker 付きで動かすためである。各段は前の段の上に積み、段 e 以降は毎コミット G0 を回す。
 
