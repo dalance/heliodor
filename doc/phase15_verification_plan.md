@@ -322,7 +322,7 @@ H <order> <hash>
 
 | 対象 | 方式 | 構成 | 条件 |
 |---|---|---|---|
-| arch (rv64ui/um/ua/uc/uf/ud/mi/si、uzba/uzbb/uzbs、mzicbo、test_arch_zicond/cmo/zcb/sysb/svnapot/zfhmin/supm/hint、zfa_s1..s4、fp_smoke) | golden lockstep | M1b W2 (rv64ui)、M2 W2 (全部)、M3 から W4 も | `MTIME_SRC=OFF`。rv64uf/ud は B04 の N6 正規化を通したうえで比較する。冪等でない op が二重実行された場合は STOP として個別に除外する。 |
+| arch (rv64ui/um/ua/uc/uf/ud/mi/si、uzba/uzbb/uzbs、mzicbo、test_arch_zicond/cmo/zcb/sysb/svnapot/zfhmin/supm/hint、zfa_s1..s4、fp_smoke) | golden lockstep | M1b W2 (rv64ui)、M2 W2 (全部)、M3 から W4 も | `MTIME_SRC=OFF`。rv64uf/ud は B04 の N6 正規化を通したうえで比較する。冪等でない op が二重実行された場合は STOP として個別に除外する。riscv-tests の env が先頭で書く mnstatus は付録 B の B48 で扱う (M1b の rv64ui ゲートより前に扱いを決める)。 |
 | ACT4 (全スカラ suite、Zabha/Zacas を含む) | golden lockstep (最終 hash) | M2 W2、M3 から W4 も | Zicntr は両者 `MTIME_SRC=INSTRET`、他は `OFF`。 |
 | 5.15 N=1 boot (ADUE off) | golden lockstep (checkpoint + schedule replay) | M2 W2、M3 から W4 も | `MTIME_SRC=INSTRET`、K=10。 |
 | 割込みを受けるテスト (sstc_stimecmp、sscofpmf、smode_plic、hsstc、hvtmr、hvirq、hvsirq)、hpm_counter、test_arch_svadu、test_arch_svpbmt、test_lrsc_reorder | pass/fail | | 割込みの位置は arch harness では replay しない。svadu は ADUE (B33)、svpbmt は DRAM 内の NC/IO (設計書 §5.11)、lrsc_reorder は投機に依存する SC の成否 (B06) を含む。hpm の値はマイクロアーキテクチャ依存。 |
@@ -363,7 +363,7 @@ H <order> <hash>
 | `chk_rat` | core | 投機 RAT と arch RAT の重複写像 | 設計書 §5.4 |
 | `chk_free_list` | core | 漏れと重複 (free + 写像中 + 解放待ちの総数 = `PRF_*_N`) | |
 | `chk_mem_resp` | core | 受理した要求ごとにちょうど `RESP_LAT` 後に応答が 1 つ。未知のタグ宛ての応答が無い | 設計書 §5.9 MP1, MP2 |
-| `chk_oldest` | core | 各 unit (`fu_sys`、`io_unit`、`atomic_unit`、`sq` の D ビット経路、M5 の `vu_adapter`) の `o_started` パルスのサイクルに token が有効で、そのタグが発生源の op のタグに等しい。`head_started_q` が各 unit の started latch の OR に等しい。started latch を立てた op が自分の retire と trap 以外の kill に選ばれない。owner を落とした `nonspec` walk が PTE を書かない | 設計書 §5.2, §5.13.1 |
+| `chk_oldest` | core | 各 unit (`fu_sys`、`io_unit`、`atomic_unit`、`sq` の D ビット経路、M5 の `vu_adapter`) の `o_started` パルスのサイクルに token が有効で、そのタグが発生源の op のタグに等しい。`head_started_q` が各 unit の started latch の OR に等しい。started latch を立てた op が自分の retire と trap 以外の kill に選ばれない。owner を落とした `nonspec` walk が PTE を書かない。M1b では unit の started latch がまだ無いので、`chk_commit` が「パルスのサイクルに token が有効」だけを検査し、`chk_oldest` は M2 で入れる | 設計書 §5.2, §5.13.1, §C.10 |
 | `chk_retire` | tb (`retire_mon`) | lane が lane 0 から連続している、order が 1 ずつ増える、trap は lane 0 だけ (golden では N4 を許す)、1 サイクルの flush は最大 1、IrqEvent は record の無いサイクルだけ、trap record に rd/store/CSR が無い | 設計書 §5.12 |
 | `chk_irq` | tb (`irq_replay`) | §4.2 の (a)(b)(c) | D2 |
 | `chk_io` | SoC | §8 | 設計書 §5.14 |
@@ -479,7 +479,7 @@ RVWMO (litmus N=2/4/8)、remote invalidate による reservation の消去、ato
 
 【決定】付録 B で golden の誤りと分かっている振る舞いと、golden lockstep で守れない規則には、`test/directed/` に自己検査型のテストを置く。tohost は、仕様どおりの振る舞いなら 1、golden の誤りと同じ振る舞いなら付録 B の番号を符号化した専用の値 (`0xB000 + 番号`) を書く。golden 上で走らせて誤りを確認する (D4) のと、新コアのゲートに入れるのを同じプログラムで済ませるためである。対象: B03、B04、B05、B07、B10、B12、B19、B21、B22、B24、B26、B28、B30、B35、B36、B46 (付録 B の各行の probe 列。B46 は UART THR への書き込み回数を数える)。順序違反の commit 時 REPLAY、walk 中の full kill による epoch 破棄、SC 失敗時の書き込み権限での翻訳、Supm の Sv39/U-mode 版、§8 の IO 系 directed もここに置く。
 
-golden 上の probe は作成済みで、branch `golden/probes` にある (ソースは `test/directed/`、Veryl の test は `tb/test_golden_probe.veryl`)。tohost の符号化は、1 が仕様どおり、`0xB000 + n` が Bn の誤りを観測 (n は付録 B の行番号の 10 進値、bit [23:16] は sub-case か観測した変種のマスク)、`0xE000 + x` が判定不能である。走らせた probe は上の対象に B13、B14、B17、B20、B27、B39 を加えた 22 本で、結果は付録 B の各行の状態と probe 列に書いた。B10 の probe からは新しい行 B47 (fault する store がデータを書く) が見つかった。
+golden 上の probe は作成済みで、branch `golden/probes` にある (ソースは `test/directed/`、Veryl の test は `tb/test_golden_probe.veryl`)。tohost の符号化は、1 が仕様どおり、`0xB000 + n` が Bn の誤りを観測 (n は付録 B の行番号の 10 進値、bit [23:16] は sub-case か観測した変種のマスク)、`0xE000 + x` が判定不能である。走らせた probe は上の対象に B13、B14、B17、B20、B27、B39 を加えた 22 本で、結果は付録 B の各行の状態と probe 列に書いた。B10 の probe からは新しい行 B47 (fault する store がデータを書く) が見つかった。B48 (riscv-tests の env が書く mnstatus) は probe ではなく M1b の decode の実装で見つかった。
 
 - 再現せず: B20、B21 (pmpcfg)、B36 の Svinval 部分、B39 の ASQ の順序。どれも扱いは STOP か OUT のまま残す。
 - 判定不能: B05。N=1 では自分の eviction でしか poison が起きず、掃引 2 通りで `SC_REPLAY` は 0 だった。M4 で remote の inv で poison する SMP の probe を足す。
@@ -577,3 +577,4 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 | B45 | mhpmevent の OF (bit 63) が既に立っていても、counter の再度の wrap で LCOFI を再び pend する | 確定 | csr.veryl:1226-1239 | n (5.15 は Sscofpmf の overflow を使わない) | STOP:LCOFI (新コアは OF の 0→1 でだけ pend する csr 修正、設計書 §C.9 #21) | OF を立てたまま hpmcounter を再び overflow させ、mip.LCOFIP を読む |
 | B46 | console の文字が 2 回ずつ出る (`pprriinnttkk`)。パッチ前の `b0f4668` でも同じで、B41 の IO store の重複書き込み (M 段の無条件の latch) による | 確定 (probe、現象と原因) | 11940 (fill_1 の M 段 latch) | y (console の全文字) | 許容差異。新コアは IO store をちょうど 1 回だけ書く (設計書 §5.14) ので、console に出るバイト列は golden と違う。trace には現れない (store の record は両コアとも 1 つ) ので、IO デバイス側の書き込み (console の出力を含む) を trace の比較に入れない。新コアの回数は §8 の IO モニタと、UART THR への書き込み回数を数える自己検査型の directed test (§7.4) で守る | `b46_uart`、tohost 0xB02E。commit した THR への byte store 12 個に対し device 書き込みは 21 回。trace の IO store record は store ごとにちょうど 1 つ。連続する store と fence で隔てた store は 2 回書かれ、直後に DRAM への sd が続く store は 1 回 (別の store が M 段の latch を上書きすると重複が消える) |
 | B47 | W=1/D=0 のページ (ADUE=0) で page fault する store が、trap しながらデータをメモリに書く | 確定 (probe) | `b10_amo_vm` の trace と実行後のメモリ。コード位置は未特定 | 不明 (D=0 のページへ ADUE=0 で store したときだけ起こる。測った範囲では 5.15 lockstep boot はそうしないが、数えるタグは無い) | 許容差異。新コアは trap する op では何も書かない (設計書 §5.8)。trap record は両コアで同じなので、差は後でその番地を読む load の rd に現れ、lockstep はそこで止まる | `b10_amo_vm` (B10 と同じ probe)。trace `T ... 0062b023 0f 0000000080201000` で store が cause 15 で trap した後、メモリにはその store のデータ (0x10) が入っていた |
+| B48 | riscv-tests の env (`upstream/env/p/riscv_test.h` の `INIT_RNMI`) が全テストの先頭で `csrwi mnstatus, MNSTATUS_NMIE` (CSR 0x744、Smrnmi) を実行する。golden は未実装 CSR として書き込みを捨てて retire する (B31 と同じ機構)。新コアは CSR の存在検査 (設計書 §C.8) で不正命令 (cause 2) の trap にする。env は直前に mtvec をこの命令の直後に向けているので、どちらも同じ次 PC から続く | 確定 (コード。M1b の decode で判明) | `upstream/env/p/riscv_test.h:120-125`、csr.veryl:585-591 | n (boot は推定)。arch では riscv-tests の env を使う全テストで y (1 回ずつ) | 【M1b で決定】B31 の STOP:CSR_EXIST のままでは rv64ui の lockstep がすべて先頭で止まるので、M1b の rv64ui trace ゲートより前に扱いを決める。この 1 命令の record (golden は R、新コアは cause 2 の T) をどう吸収するか (正規化、MASK、mnstatus を存在表に入れるか) は未決 | 不要 (env のコードと両コアの trace で確認できる) |
