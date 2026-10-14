@@ -51,7 +51,8 @@ heliodor/
 ├── CLAUDE.md
 ├── Veryl.toml              # Project configuration
 ├── src/
-│   ├── core/               # Pipeline stages, decode, ALU, FPU, CSR, RS/ROB/RAT, SoC
+│   ├── core/               # Shared core blocks (decoder, FPU, CSR, VU), SoC, and the Phase 15 core
+│   ├── v14/                # Old core (v14_ prefix), frozen; default until Phase 15 M6
 │   ├── cache/              # I-Cache / D-Cache / shared L2 / memory_bus
 │   ├── mmu/                # Sv39 MMU
 │   ├── peripheral/         # UART, CLINT, PLIC
