@@ -1,0 +1,118 @@
+// fu_sys: CSR read-modify computation and the operands of the address
+// translation fences, handed to commit for retire.
+//
+// Ports (timing contract):
+//   i_valid/i_op/i_tag/i_src : the op accepted in cycle A (rs1, rs2); select
+//                              granted it only with the oldest token
+//   i_imm                    : CSR number and uimm (fu_pkg::sys_csr/sys_uimm)
+//   o_csr_raddr/i_csr_rdata  : combinational read of the live CSR file in A
+//   i_tok_valid/i_tok        : oldest token in A
+//   o_started                : combinational pulse in A when the op is
+//                              accepted while it holds the token; carries no
+//                              tag (it belongs to the token holder)
+//   i_kill                   : applied when the result is captured
+//   o_ready                  : constant 1 (pipelined)
+//   o_wb                     : registered, valid in A + LAT_SYS; data is the
+//                              old CSR value
+//   o_sys                    : registered with o_wb: the CSR write and the
+//                              translation flush commit applies at retire
+// Owns:
+//   - o_started fires only in a cycle where the token is valid and carries
+//     the accepted op's tag
+// Rationale:
+//   - reading the live CSR file is correct because the op is the oldest and
+//     every CSR write happens at retire followed by a flush
+//   - no exception: CSR legality is decided at decode
+//   - the op still completes if it lost the token between select and accept
+//     (a kill or an interrupt became visible in A); it then does not mark
+//     itself started, and its effects wait for retire like any other op
+pub module fu_sys::<CFG: core_cfg> (
+    clk        : input  clock                                ,
+    rst        : input  reset                                ,
+    i_valid    : input  logic                                ,
+    i_op       : input  fu_pkg::SysUop                       ,
+    i_tag      : input  core_types::<CFG>::ExTag             ,
+    i_src      : input  logic                        <64> [2],
+    i_imm      : input  logic                        <32>    ,
+    o_csr_raddr: output logic                        <12>    ,
+    i_csr_rdata: input  logic                        <64>    ,
+    i_tok_valid: input  logic                                ,
+    i_tok      : input  core_types::<CFG>::RobTag            ,
+    o_started  : output logic                                ,
+    i_kill     : input  core_types::<CFG>::Kill              ,
+    o_ready    : output logic                                ,
+    o_wb       : output core_types::<CFG>::WbPacket          ,
+    o_sys      : output core_types::<CFG>::SysPending        ,
+) {
+    import core_types::<CFG>::*;
+    import fu_pkg::*;
+
+    struct Out {
+        pkt: WbPacket  ,
+        sys: SysPending,
+    }
+
+    let csr : logic<12> = sys_csr(i_imm);
+    let opnd: logic<64> = case i_op.op {
+        SysOp::CSRRWI, SysOp::CSRRSI, SysOp::CSRRCI: {59'b0, sys_uimm(i_imm)},
+        default                                    : i_src[0],
+    };
+    let wdata: logic<64> = case i_op.op {
+        SysOp::CSRRS, SysOp::CSRRSI: i_csr_rdata | opnd,
+        SysOp::CSRRC, SysOp::CSRRCI: i_csr_rdata & ~opnd,
+        default                    : opnd,
+    };
+    let is_fence: logic = i_op.op == SysOp::SFENCE_VMA || i_op.op == SysOp::HFENCE_VVMA || i_op.op
+        == SysOp::HFENCE_GVMA;
+
+    var o_in: Out;
+    always_comb {
+        o_in               = 0 as Out;
+        o_in.pkt.valid     = 1'b1;
+        o_in.pkt.tag       = i_tag;
+        o_in.pkt.data      = i_csr_rdata;
+        o_in.sys.valid     = 1'b1;
+        o_in.sys.tag       = i_tag.rob;
+        o_in.sys.csr_addr  = csr;
+        o_in.sys.csr_wdata = wdata;
+        o_in.sys.xf.valid  = is_fence;
+        o_in.sys.xf.kind   = case i_op.op {
+            SysOp::HFENCE_VVMA: XfKind::HFENCE_VVMA,
+            SysOp::HFENCE_GVMA: XfKind::HFENCE_GVMA,
+            default           : XfKind::SFENCE,
+        };
+        if is_fence {
+            o_in.sys.xf.va       = i_src[0];
+            o_in.sys.xf.asid     = i_src[1][15:0];
+            o_in.sys.xf.all_va   = i_op.all_va;
+            o_in.sys.xf.all_asid = i_op.all_asid;
+        }
+    }
+
+    var out_v: logic;
+    var out_d: Out  ;
+    inst u_out: stage_reg::<CFG> #(
+        T: Out,
+    ) (
+        clk               ,
+        rst               ,
+        i_valid: i_valid  ,
+        i_data : o_in     ,
+        i_tag  : i_tag.rob,
+        i_kill            ,
+        o_valid: out_v    ,
+        o_data : out_d    ,
+    );
+
+    always_comb {
+        o_wb           = out_d.pkt;
+        o_wb.valid     = out_v;
+        o_sys          = out_d.sys;
+        o_sys.valid    = out_v;
+        o_sys.xf.valid = out_v && out_d.sys.xf.valid;
+    }
+
+    assign o_csr_raddr = csr;
+    assign o_started   = i_valid && i_tok_valid && i_tok == i_tag.rob;
+    assign o_ready     = 1'b1;
+}
