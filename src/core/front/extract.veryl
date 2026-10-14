@@ -1,0 +1,545 @@
+// extract: instruction boundaries, RVC expansion and prediction checking of
+// fetch blocks, into the decode queue (DQ).
+//
+// Ports (timing contract):
+//   i_fb_valid/i_fb : FBQ head; o_fb_take pops it when the block enters x1
+//   o_dq_valid/o_dq : DQ head (lane_queue, registered); i_dq_take pops a
+//                     prefix of the lanes
+//   o_pdw           : predecode (and corrected prediction) of the block that
+//                     enters x1 this cycle, before any of its ops is in the DQ
+//   o_pdr           : registered predecode redirect, the cycle after its
+//                     block entered x1; flushes the ifu and x0
+//   i_kill          : flushes x1, the carry and the DQ at the edge
+//   i_redirect      : the redirect of a kill (observed by the checker only)
+//   o_chk           : sticky checker flags (chk_fetch_stream), 0 without
+//                     HELIODOR_CHK
+// Stages: x0 is combinational on the FBQ head and computes the start mask,
+// the predecode and the corrected prediction of the whole block once; x1
+// holds the block and emits up to FETCH_W ops per cycle into the DQ.
+// Owns:
+//   - an op with pred_taken is the instruction predecode found at the
+//     block's corrected exit; every other op has pred_taken = 0
+//   - consecutive ops a, b with no kill between satisfy
+//     b.pc == (a.pred_taken ? exit target : a.pc + len(a))
+//   - no op of a block younger than a predecode redirect enters the DQ
+//   - after an op with a fault, nothing enters the DQ until a kill
+// Rationale:
+//   - the start mask is a log-depth composition of per-halfword maps and
+//     lane l takes the l-th remaining start, so no lane depends on the
+//     length of the previous lane and the depth does not grow with FETCH_W
+//   - one block per cycle: a block of 8 * FETCH_W bytes holds FETCH_W
+//     uncompressed instructions from its first half
+//   - a 32-bit instruction starting at the last halfword is carried to the
+//     next block, and joined only if that block starts right after it; the
+//     op takes the fault of its lower part first, then of its upper part
+//     (tval pc + 2)
+pub module extract::<CFG: core_cfg> (
+    clk               : input  clock                                                                         ,
+    rst               : input  reset                                                                         ,
+    i_fb_valid        : input  logic                                                                         ,
+    i_fb              : input  core_types::<CFG>::FetchBlk                                                   ,
+    o_fb_take         : output logic                                                                         ,
+    o_dq_valid        : output logic                                                           [CFG::FETCH_W],
+    o_dq              : output core_types::<CFG>::XOp                                          [CFG::FETCH_W],
+    i_dq_take         : input  logic                        <tag_pkg::idx_w(CFG::FETCH_W + 1)>               ,
+    o_pdw             : output core_types::<CFG>::PdWrite                                                    ,
+    o_pdr             : output core_types::<CFG>::PdRedirect                                                 ,
+    i_kill            : input  core_types::<CFG>::Kill                                                       ,
+    i_redirect        : input  core_types::<CFG>::Redirect                                                   ,
+    o_ev_cut_block_end: output logic                                                                         ,
+    o_ev_dq_full      : output logic                                                                         ,
+    o_ev_pdr          : output logic                        <5>                                              , // V1..V5 corrections, registered with o_pdr
+    o_chk             : output logic                        <4>                                              ,
+) {
+    import core_types::<CFG>::*;
+
+    const FW: u32 = CFG::FETCH_W;
+    const FB: u32 = CFG::FETCH_BYTES;
+    const CW: u32 = tag_pkg::idx_w(NH + 1);
+    const LW: u32 = tag_pkg::idx_w(FW + 1);
+
+    // ---- Predecode helpers ----
+
+    function link (
+        r: input logic<5>,
+    ) -> logic {
+        return r == 5'd1 || r == 5'd5;
+    }
+
+    // CfiKind of the instruction whose parcels are lo (first) and hi.
+    function cfi_of (
+        lo: input logic<16>,
+        hi: input logic<16>,
+    ) -> logic<3> {
+        let rd : logic  <5> = lo[11:7];
+        let rs1: logic  <5> = {hi[3:0], lo[15]};
+        var k  : CfiKind   ;
+        k   = CfiKind::NONE;
+        if lo[1:0] == 2'b11 {
+            if lo[6:0] == 7'b1100011 {
+                k = CfiKind::BR;
+            } else if lo[6:0] == 7'b1101111 {
+                k = if link(rd) ? CfiKind::JAL_CALL : CfiKind::JAL;
+            } else if lo[6:0] == 7'b1100111 && lo[14:12] == 3'b000 {
+                k = if link(rd) && link(rs1) && rd != rs1 ?
+                    CfiKind::JALR_RETCALL
+                : if link(rd) ?
+                    CfiKind::JALR_CALL
+                : if link(rs1) ?
+                    CfiKind::JALR_RET
+                :
+                    CfiKind::JALR
+                ;
+            }
+        } else if lo[1:0] == 2'b01 {
+            if lo[15:13] == 3'b101 {
+                k = CfiKind::JAL; // c.j
+            } else if lo[15:14] == 2'b11 {
+                k = CfiKind::BR; // c.beqz, c.bnez
+            }
+        } else if lo[1:0] == 2'b10 && lo[15:13] == 3'b100 && lo[6:2] == 5'd0 && lo[11:7] != 5'd0 {
+            // c.jr (rd = x0) and c.jalr (rd = x1)
+            k = if !lo[12] ?
+                (if link(lo[11:7]) ? CfiKind::JALR_RET : CfiKind::JALR)
+            : if lo[11:7] == 5'd5 ?
+                CfiKind::JALR_RETCALL
+            :
+                CfiKind::JALR_CALL
+            ;
+        }
+        return k;
+    }
+
+    // Offset of a direct branch or jump (B, J, CB or CJ format); 0 otherwise.
+    function dir_imm (
+        w: input logic<32>,
+    ) -> logic<64> {
+        var r: logic<64>;
+        r = 64'd0;
+        if w[1:0] == 2'b11 {
+            if w[6:0] == 7'b1100011 {
+                r = {w[31] repeat 52, w[7], w[30:25], w[11:8], 1'b0};
+            } else if w[6:0] == 7'b1101111 {
+                r = {w[31] repeat 44, w[19:12], w[20], w[30:21], 1'b0};
+            }
+        } else if w[1:0] == 2'b01 {
+            if w[15:13] == 3'b101 {
+                r = {w[12] repeat 53, w[8], w[10:9], w[6], w[7], w[2], w[11], w[5:3], 1'b0};
+            } else if w[15:14] == 2'b11 {
+                r = {w[12] repeat 56, w[6:5], w[2], w[11:10], w[4:3], 1'b0};
+            }
+        }
+        return r;
+    }
+
+    function is_direct (
+        k: input logic<3>,
+    ) -> logic {
+        return k == CfiKind::BR || k == CfiKind::JAL || k == CfiKind::JAL_CALL;
+    }
+
+    // Instruction starts from entry position s (initial state init at s):
+    // S[h+1] = !(S[h] && is32[h]). Each halfword is a map on the 2-state
+    // {start, continuation}; the prefix compositions are built in log2(NH)
+    // levels, map m encoded as {m(1), m(0)}.
+    function start_mask (
+        s   : input logic<FOFF_W>,
+        init: input logic        ,
+        is32: input logic<NH>    ,
+    ) -> logic<NH> {
+        var m: logic<2>  [NH];
+        var p: logic<2>  [NH];
+        var r: logic<NH>     ;
+        for h in 0..NH {
+            // m[h] maps S[h] to S[h+1].
+            m[h] = if h + 1 <: s ? 2'b00 : if h + 1 == s ? {init, init} : {!is32[h], 1'b1};
+        }
+        for lv in 0..tag_pkg::idx_w(NH) {
+            p = m;
+            for h in 0..NH {
+                if h >= (1 << lv) {
+                    // later after earlier: m[h] o p[h - 2^lv]
+                    m[h] = {p[h][p[h - (1 << lv)][1]], p[h][p[h - (1 << lv)][0]]};
+                }
+            }
+        }
+        let s0  : logic = if s == 0 ? init : 1'b0;
+        r[0] = s0;
+        for h in 1..NH {
+            r[h] = m[h - 1][s0];
+        }
+        return r;
+    }
+
+    // ---- State ----
+
+    let kill: logic = i_kill.valid;
+
+    var x1_v_q   : logic                  ;
+    var x1_id_q  : FetchId                ;
+    var x1_hw_q  : logic          <FB * 8>;
+    var x1_rem_q : logic          <NH>    ; // starts still to emit
+    var x1_ex_v_q: logic                  ; // corrected exit
+    var x1_ex_f_q: logic          <FOFF_W>;
+    var x1_tgt_q : logic          <64>    ;
+    var x1_cv_q  : logic                  ; // a carried op is emitted first
+    var x1_cop_q : XOp                    ;
+    var x1_str_q : logic                  ; // the block ends in a straddling instruction
+    var x1_scx_q : exc_pkg::ExcRec        ; // its lower-part fault
+    var car_v_q  : logic                  ;
+    var car_lo_q : logic          <16>    ;
+    var car_pc_q : logic          <64>    ;
+    var car_ftq_q: FtqTag                 ;
+    var car_ex_q : exc_pkg::ExcRec        ;
+    var stop_q   : logic                  ;
+    var pdr_q    : PdRedirect             ;
+    var pdr_ev_q : logic          <5>     ;
+
+    // ---- x0: the FBQ head ----
+
+    let b     : FetchBlk         = i_fb;
+    let b_base: logic   <64>     = b.id.start_pc & ~((FB - 1) as 64);
+    let b_s   : logic   <FOFF_W> = b.id.start_pc[FOFF_W:1];
+    let b_exc : logic            = b.id.exc.valid;
+
+    // Parcels of the block, with a zero parcel past its end.
+    var hw  : logic<16> [NH + 1];
+    var w32 : logic<32> [NH]    ;
+    var is32: logic<NH>         ;
+    var cfi : logic<3>  [NH]    ;
+    always_comb {
+        for h in 0..NH {
+            hw[h] = b.data[16 * h+:16];
+        }
+        hw[NH] = 16'd0;
+        for h in 0..NH {
+            w32[h]  = {hw[h + 1], hw[h]};
+            is32[h] = hw[h][1:0] == 2'b11;
+            cfi[h]  = if h + 1 == NH && is32[h] ? CfiKind::NONE : cfi_of(hw[h], w32[h][31:16]);
+        }
+    }
+
+    // The carry of x1 if it finishes now, else the registered one.
+    let e_car_v : logic               = if x1_v_q ? x1_str_q : car_v_q;
+    let e_car_lo: logic          <16> = if x1_v_q ? x1_hw_q[FB * 8 - 16+:16] : car_lo_q;
+    let e_car_pc: logic          <64> = if x1_v_q ? (x1_id_q.start_pc & ~((FB - 1) as 64)) + FB - 2 : car_pc_q;
+    let e_car_ft: FtqTag              = if x1_v_q ? x1_id_q.ftq : car_ftq_q;
+    let e_car_ex: exc_pkg::ExcRec     = if x1_v_q ? x1_scx_q : car_ex_q;
+    let car_hit : logic               = e_car_v && b.id.start_pc == e_car_pc + 2;
+
+    let st    : logic<NH> = start_mask(b_s, !car_hit, is32);
+    let str_at: logic     = st[NH - 1] && is32[NH - 1];
+
+    // Prediction check (V1-V6); the first violated position is corrected.
+    let p      : BlockPred         = b.id.pred;
+    let e      : logic    <FOFF_W> = p.exit_foff;
+    let exit_ok: logic             = p.exit_v && st[e] && cfi[e] != CfiKind::NONE && !(e == NH - 1 && is32[e]);
+    var jal_m  : logic    <NH>    ;
+    always_comb {
+        for h in 0..NH {
+            jal_m[h] = st[h] && (cfi[h] == CfiKind::JAL || cfi[h] == CfiKind::JAL_CALL) && (!exit_ok || h <: e);
+        }
+    }
+    let j_oh : logic<NH>     = tree_first::<NH>(jal_m);
+    let j_v  : logic         = jal_m != 0;
+    let j    : logic<FOFF_W> = tree_onehot_enc::<NH, FOFF_W>(j_oh);
+    let e_oh : logic<NH>     = (1 as NH) << e;
+    let w_j  : logic<32>     = tree_onehot_mux::<NH, 32>(j_oh, w32);
+    let w_e  : logic<32>     = tree_onehot_mux::<NH, 32>(e_oh, w32);
+    let tgt_j: logic<64>     = b_base + {j, 1'b0} + dir_imm(w_j);
+    let tgt_e: logic<64>     = b_base + {e, 1'b0} + dir_imm(w_e);
+    let k_e  : logic<3>      = cfi[e];
+    let v3   : logic         = !j_v && exit_ok && is_direct(k_e) && tgt_e != p.target;
+    let v6   : logic         = !j_v && exit_ok && k_e != p.exit_kind;
+    let rm   : logic         = !j_v && p.exit_v && !exit_ok; // exit removed (V1, V2, V4)
+    let v1   : logic         = rm && !st[e];
+    let v4   : logic         = rm && st[e] && e == NH - 1 && is32[e];
+    let v2   : logic         = rm && !v1 && !v4;
+
+    var cp: BlockPred;
+    always_comb {
+        cp = p;
+        if j_v {
+            cp.exit_v    = 1'b1;
+            cp.exit_foff = j;
+            cp.exit_kind = cfi[j] as CfiKind;
+            cp.target    = tgt_j;
+        } else if exit_ok {
+            cp.exit_kind = k_e as CfiKind;
+            if is_direct(k_e) {
+                cp.target = tgt_e;
+            }
+        } else {
+            cp = 0 as BlockPred;
+        }
+    }
+    let fix   : logic             = !b_exc && (j_v || v3 || v6 || rm);
+    let redir : logic             = !b_exc && (j_v || v3 || rm);
+    let c_pred: BlockPred         = if b_exc ? p : cp;
+    let c_last: logic    <FOFF_W> = if c_pred.exit_v ? c_pred.exit_foff : (NH - 1) as FOFF_W;
+
+    // The carried op, joined with this block's first halfword.
+    var cop: XOp;
+    always_comb {
+        cop      = 0 as XOp;
+        cop.ftq  = e_car_ft;
+        cop.foff = (NH - 1) as FOFF_W;
+        cop.pc   = e_car_pc;
+        cop.insn = {hw[0], e_car_lo};
+        cop.exc  = e_car_ex;
+        if !e_car_ex.valid {
+            if b_exc {
+                cop.exc      = b.id.exc;
+                cop.exc.tval = e_car_pc + 2;
+            } else if b.id.pmp_deny[0] {
+                cop.exc       = 0 as exc_pkg::ExcRec;
+                cop.exc.valid = 1'b1;
+                cop.exc.cause = 6'd1;
+                cop.exc.tval  = e_car_pc + 2;
+            }
+        }
+        if cop.exc.valid {
+            cop.insn = 32'd0;
+        }
+    }
+
+    // ---- x1: lane selection ----
+
+    var x1_hw: logic<16> [NH + 1];
+    var x1_w : logic<32> [NH]    ;
+    always_comb {
+        for h in 0..NH {
+            x1_hw[h] = x1_hw_q[16 * h+:16];
+        }
+        x1_hw[NH] = 16'd0;
+        for h in 0..NH {
+            x1_w[h] = {x1_hw[h + 1], x1_hw[h]};
+        }
+    }
+    let x1_base: logic<64> = x1_id_q.start_pc & ~((FB - 1) as 64);
+
+    var rank: logic<CW> [NH];
+    always_comb {
+        tree_prefix_count::<NH, CW>(x1_rem_q << 1, rank);
+    }
+    let n_m: logic<CW> = tree_popcount::<NH, CW>(x1_rem_q);
+    let cv : logic     = x1_cv_q;
+
+    var sel   : logic<NH> [FW];
+    var lv    : logic<FW>     ;
+    var lop   : XOp       [FW];
+    var lexp  : logic<32> [FW];
+    var lill  : logic     [FW];
+    var lfault: logic<FW>     ;
+    for l in 0..FW :g_lane {
+        inst u_cexp: c_expander (
+            i_cinstr : lop[l].cinsn,
+            o_instr  : lexp[l]     ,
+            o_illegal: lill[l]     ,
+        );
+    }
+    always_comb {
+        for l in 0..FW {
+            var w   : logic<32>    ;
+            var foff: logic<FOFF_W>;
+            var rvc : logic        ;
+            var pc  : logic<64>    ;
+            for h in 0..NH {
+                sel[l][h] = x1_rem_q[h] && (rank[h] + cv) == l;
+            }
+            w     = tree_onehot_mux::<NH, 32>(sel[l], x1_w);
+            foff  = tree_onehot_enc::<NH, FOFF_W>(sel[l]);
+            rvc   = w[1:0] != 2'b11;
+            pc    = x1_base + {foff, 1'b0};
+            lv[l] = l <: (cv + n_m);
+            if cv && l == 0 {
+                lop[l] = x1_cop_q;
+            } else {
+                lop[l]            = 0 as XOp;
+                lop[l].ftq        = x1_id_q.ftq;
+                lop[l].foff       = foff;
+                lop[l].pc         = pc;
+                lop[l].is_rvc     = rvc;
+                lop[l].cinsn      = if rvc ? w[15:0] : 16'd0;
+                lop[l].insn       = w;
+                lop[l].pred_taken = x1_ex_v_q && foff == x1_ex_f_q;
+                if x1_id_q.exc.valid {
+                    lop[l].exc      = x1_id_q.exc;
+                    lop[l].exc.tval = pc;
+                } else if x1_id_q.pmp_deny[foff >> 1] || (!rvc && foff != NH - 1 && x1_id_q.pmp_deny[(foff + 1) >> 1]) {
+                    lop[l].exc       = 0 as exc_pkg::ExcRec;
+                    lop[l].exc.valid = 1'b1;
+                    lop[l].exc.cause = 6'd1;
+                    lop[l].exc.tval  = if x1_id_q.pmp_deny[foff >> 1] ? pc : pc + 2;
+                }
+            }
+            lfault[l] = lop[l].exc.valid;
+        }
+    }
+
+    // Lanes after the first faulting lane are not emitted.
+    let before_f: logic<FW> = tree_prefix_or::<FW>(lv & lfault) << 1;
+    let allowed : logic<FW> = lv & ~before_f;
+
+    var dq_rdy: logic;
+    let push  : logic = x1_v_q && lv[0] && dq_rdy && !kill;
+
+    var dq_in_v: logic [FW];
+    var dq_in  : XOp   [FW];
+    always_comb {
+        for l in 0..FW {
+            dq_in_v[l] = push && allowed[l];
+            dq_in[l]   = lop[l];
+            if lop[l].is_rvc && !(cv && l == 0) {
+                dq_in[l].insn = if lill[l] || lop[l].exc.valid ? 32'd0 : lexp[l];
+            } else if lop[l].exc.valid {
+                dq_in[l].insn = 32'd0;
+            }
+        }
+    }
+
+    inst u_dq: lane_queue #(
+        T    : XOp      ,
+        W_IN : FW       ,
+        W_OUT: FW       ,
+        DEPTH: CFG::DQ_N,
+    ) (
+        clk                ,
+        rst                ,
+        i_valid: dq_in_v   ,
+        i_data : dq_in     ,
+        o_ready: dq_rdy    ,
+        o_valid: o_dq_valid,
+        o_data : o_dq      ,
+        i_take : i_dq_take ,
+        i_flush: kill      ,
+    );
+
+    var emitted: logic<NH>;
+    always_comb {
+        for h in 0..NH {
+            var by: logic<FW>;
+            for l in 0..FW {
+                by[l] = sel[l][h] && allowed[l];
+            }
+            emitted[h] = |by;
+        }
+    }
+    let rem_nx: logic<NH> = if push ? x1_rem_q & ~emitted : x1_rem_q;
+    let cv_nx : logic     = cv && !push;
+    let f_push: logic     = push && (allowed & lfault) != 0;
+    let done  : logic     = x1_v_q && (f_push || (rem_nx == 0 && !cv_nx));
+
+    // A new block enters x1 when x1 is empty or finishing, unless x0 is
+    // flushed by a predecode redirect this cycle.
+    let enter: logic = i_fb_valid && !kill && !pdr_q.valid && !stop_q && (!x1_v_q || (done && !f_push));
+
+    always_ff {
+        if_reset {
+            x1_v_q   = 1'b0;
+            x1_cv_q  = 1'b0;
+            car_v_q  = 1'b0;
+            stop_q   = 1'b0;
+            pdr_q    = 0 as PdRedirect;
+            pdr_ev_q = 0;
+        } else if kill {
+            x1_v_q   = 1'b0;
+            x1_cv_q  = 1'b0;
+            car_v_q  = 1'b0;
+            stop_q   = 1'b0;
+            pdr_q    = 0 as PdRedirect;
+            pdr_ev_q = 0;
+        } else {
+            pdr_q.valid = enter && redir;
+            pdr_q.ftq   = b.id.ftq;
+            pdr_q.foff  = if rm ? (NH - 1) as FOFF_W : c_pred.exit_foff;
+            pdr_q.taken = !rm;
+            pdr_q.pc    = if rm ? b_base + FB : c_pred.target;
+            pdr_ev_q    = if enter && redir ? {j_v, v4, v3, v2, v1} : 5'd0;
+            if f_push {
+                stop_q = 1'b1;
+            }
+            if enter {
+                x1_v_q  = 1'b1;
+                x1_cv_q = car_hit;
+                car_v_q = 1'b0;
+            } else if done {
+                x1_v_q  = 1'b0;
+                x1_cv_q = 1'b0;
+                car_v_q = x1_str_q && !f_push;
+            } else if push {
+                x1_cv_q = 1'b0;
+            }
+        }
+    }
+
+    always_ff {
+        if enter {
+            x1_id_q   = b.id;
+            x1_hw_q   = b.data;
+            x1_rem_q  = if b_exc ?
+                (st & ((1 as NH) << b_s))
+            :
+                st & ~(if str_at ? (1 as NH) << (NH - 1) : 0) & ((({1'b0 repeat NH - 1, 1'b1} << c_last) << 1) - 1)
+            ;
+            x1_ex_v_q = c_pred.exit_v;
+            x1_ex_f_q = c_pred.exit_foff;
+            x1_tgt_q  = c_pred.target;
+            x1_cop_q  = cop;
+            x1_str_q  = str_at && !b_exc && c_last == (NH - 1) as FOFF_W;
+            x1_scx_q  = 0 as exc_pkg::ExcRec;
+            if b.id.pmp_deny[GRAN_N - 1] {
+                x1_scx_q.valid = 1'b1;
+                x1_scx_q.cause = 6'd1;
+                x1_scx_q.tval  = b_base + FB - 2;
+            }
+        } else if push {
+            x1_rem_q = rem_nx;
+        }
+        if done && !enter {
+            car_lo_q  = e_car_lo;
+            car_pc_q  = e_car_pc;
+            car_ftq_q = e_car_ft;
+            car_ex_q  = e_car_ex;
+        }
+    }
+
+    // ---- Outputs ----
+
+    always_comb {
+        o_pdw          = 0 as PdWrite;
+        o_pdw.valid    = enter;
+        o_pdw.ftq      = b.id.ftq;
+        o_pdw.fix      = fix;
+        o_pdw.pred     = c_pred;
+        o_pdw.last     = c_last;
+        o_pdw.pd.start = st;
+        for h in 0..NH {
+            o_pdw.pd.cfi[h] = if st[h] ? cfi[h] : CfiKind::NONE;
+        }
+    }
+
+    assign o_fb_take          = enter;
+    assign o_pdr              = pdr_q;
+    assign o_ev_pdr           = pdr_ev_q;
+    assign o_ev_cut_block_end = push && done && !f_push && allowed != {1'b1 repeat FW};
+    assign o_ev_dq_full       = x1_v_q && lv[0] && !dq_rdy;
+
+    #[ifdef(HELIODOR_CHK)]
+    inst u_chk: chk_fetch_stream::<CFG> (
+        clk                                                       ,
+        rst                                                       ,
+        i_push_v  : dq_in_v                                       ,
+        i_push    : dq_in                                         ,
+        i_tgt     : x1_tgt_q                                      ,
+        i_enter   : enter                                         ,
+        i_blk_ftq : b.id.ftq                                      ,
+        i_blk_pc  : b.id.start_pc                                 ,
+        i_blk_next: if c_pred.exit_v ? c_pred.target : b_base + FB,
+        i_kill                                                    ,
+        i_redirect                                                ,
+        o_chk                                                     ,
+    );
+    #[else]
+    assign o_chk = 4'd0;
+}

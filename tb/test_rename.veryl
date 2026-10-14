@@ -1,0 +1,936 @@
+// rename + free_list + dispatch (with the rq lane_queue) against reference
+// models, for both supported configs.
+//
+// A random producer feeds groups of DecOps with dense intra-group register
+// dependencies into rq. Behavioural stand-ins play rob (ring, retire, partial
+// and full kill, youngest-first walk), lq/sq (tag counters) and busy_table
+// (random ready bits and wake lanes); credits are randomly throttled to
+// force partial acceptance. References:
+//   - mapping: every taken lane's sources and old destination equal the map
+//     derived from the architectural reference plus the in-flight stand-in
+//     entries in order, updated lane by lane within the group
+//   - free list: a per-register used/free bitmap per class; every pop must be
+//     free, every release used, and o_free must equal the free count
+//   - take, compaction, snapshot positions, bar_w and ready initialization
+//     recomputed serially
+module rename_harness::<CFG: core_cfg> (
+    clk   : input  clock    ,
+    rst   : input  reset    ,
+    o_pass: output logic    ,
+    o_done: output logic    ,
+    o_bad : output logic<16>,
+    o_cov : output logic<12>,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const FW : u32 = CFG::FETCH_W;
+    const W  : u32 = CFG::RENAME_W;
+    const CMW: u32 = CFG::COMMIT_W;
+    const NQ : u32 = CFG::N_IQ;
+    const RN : u32 = CFG::ROB_N;
+    const PN : u32 = 1 << PREG_W;
+    const CW : u32 = TAKE_W;
+    const FTW: u32 = tag_pkg::idx_w(FW + 1);
+
+    var lfsr : logic<64>;
+    var lfsr2: logic<64>;
+    var cnt  : logic<16>;
+    var bad_q: logic<16>;
+    var cov_q: logic<12>;
+
+    // ---- Producer ----
+
+    // fpb biases the mix towards FP destinations.
+    function mk_op (
+        h  : input logic<16>,
+        fpb: input logic    ,
+    ) -> DecOp {
+        var d         : DecOp;
+        d          = 0 as DecOp;
+        let k         : logic<3> = if fpb && h[14] ? 3'd3 : h[2:0];
+        let a         : logic<5> = {2'b0, h[5:3]};
+        let b         : logic<5> = {2'b0, h[8:6]};
+        let r         : logic<5> = {2'b0, h[11:9]};
+        d.rs1.arch = a;
+        d.rs2.arch = b;
+        d.rs3.arch = r;
+        d.dst.arch = r;
+        d.insn     = {16'd0, h};
+        case k {
+            3'd3: {
+                d.cls.fu           = FuKind::FMA;
+                d.rs1.used         = 1'b1;
+                d.rs1.rcls         = RegClass::FP;
+                d.rs2.used         = 1'b1;
+                d.rs2.rcls         = RegClass::FP;
+                d.rs3.used         = h[12];
+                d.rs3.rcls         = RegClass::FP;
+                d.rs3.arch         = {2'b0, h[15:13]};
+                d.dst.rcls         = RegClass::FP;
+                d.dst.has_rd       = 1'b1;
+                d.cls.budget.fp_rd = 1'b1;
+            }
+            3'd4: {
+                d.cls.fu            = FuKind::LOAD;
+                d.rs1.used          = 1'b1;
+                d.dst.has_rd        = r != 0;
+                d.cls.budget.int_rd = r != 0;
+                d.cls.budget.lq     = 1'b1;
+            }
+            3'd5: {
+                d.cls.fu        = FuKind::STORE;
+                d.rs1.used      = 1'b1;
+                d.rs2.used      = 1'b1;
+                d.rs2.rcls      = if h[12] ? RegClass::FP : RegClass::INT;
+                d.cls.budget.sq = 1'b1;
+            }
+            3'd6: {
+                d.cls.fu   = FuKind::BRU;
+                d.rs1.used = 1'b1;
+                d.rs2.used = h[12];
+            }
+            3'd7: {
+                d.cls.fu         = FuKind::NONE;
+                d.cls.ld_barrier = h[12];
+                d.cls.drain      = h[12];
+                d.exc.valid      = h[13];
+            }
+            default: {
+                d.cls.fu            = FuKind::ALU;
+                d.rs1.used          = 1'b1;
+                d.rs2.used          = h[12];
+                d.dst.has_rd        = r != 0;
+                d.cls.budget.int_rd = r != 0;
+            }
+        }
+        return d;
+    }
+
+    var pg_q: DecOp      [FW];
+    var pn_q: logic<FTW>     ;
+
+    var rq_iv   : logic     [FW];
+    var rq_ready: logic         ;
+    var rq_ov   : logic     [W] ;
+    var rq_od   : DecOp     [W] ;
+    var take    : logic<CW>     ;
+    var kill    : Kill          ;
+
+    always_comb {
+        for l in 0..FW {
+            rq_iv[l] = l <: pn_q;
+        }
+    }
+
+    inst rq: lane_queue #(
+        T    : DecOp    ,
+        W_IN : FW       ,
+        W_OUT: W        ,
+        DEPTH: CFG::RQ_N,
+    ) (
+        clk                ,
+        rst                ,
+        i_valid: rq_iv     ,
+        i_data : pg_q      ,
+        o_ready: rq_ready  ,
+        o_valid: rq_ov     ,
+        o_data : rq_od     ,
+        i_take : take      ,
+        i_flush: kill.valid,
+    );
+
+    let push: logic = rq_ready && rq_iv[0];
+
+    // ---- rob stand-in ----
+
+    var head_q : logic   <ROB_TAG_W>     ;
+    var tail_q : logic   <ROB_TAG_W>     ;
+    var e_hrd  : logic               [RN];
+    var e_cls  : RegClass            [RN];
+    var e_arch : logic   <5>         [RN];
+    var e_pdst : logic   <PREG_W>    [RN];
+    var e_old  : logic   <PREG_W>    [RN];
+    var e_snap : DispSnap            [RN];
+    var e_lq   : logic               [RN];
+    var e_bar  : logic               [RN];
+    var wk_busy: logic                   ;
+    var wk_ptr : logic   <ROB_TAG_W>     ; // one past the youngest unwalked entry
+    var wk_end : logic   <ROB_TAG_W>     ; // one past keep
+    var kprev_q: logic                   ;
+
+    let count: logic<ROB_TAG_W> = tail_q - head_q;
+    let rob_n: logic<ROB_CNT_W> = (RN - count) as ROB_CNT_W;
+
+    function rtag (
+        c: input logic<ROB_TAG_W>,
+    ) -> RobTag {
+        return c as RobTag;
+    }
+    function ridx (
+        c: input logic<ROB_TAG_W>,
+    ) -> logic<ROB_IDX_W> {
+        return c[ROB_IDX_W - 1:0];
+    }
+
+    // A periodic phase without retire and with FP-heavy ops drains the FP
+    // free list, which is smaller than the ROB.
+    let drain_ph: logic = cnt[9:8] == 2'b11;
+
+    // Kill: registered-state decision; at most one per cycle, no partial
+    // kill during a walk or right after a kill.
+    var keep_c: logic<ROB_TAG_W>;
+    always_comb {
+        keep_c       = head_q + (lfsr2[15:0] % (if count == 0 ? 1 : count)) as ROB_TAG_W;
+        kill         = 0 as Kill;
+        kill.full    = lfsr2[23:18] == 0 && !drain_ph;
+        kill.valid   = kill.full || (lfsr2[28:25] == 0 && count != 0 && !wk_busy && !kprev_q && !drain_ph);
+        kill.keep    = rtag(keep_c);
+        kill.lq_tail = e_snap[ridx(keep_c)].lq_tail;
+        kill.sq_tail = e_snap[ridx(keep_c)].sq_tail;
+        kill.fl_int  = e_snap[ridx(keep_c)].fl_int;
+        kill.fl_fp   = e_snap[ridx(keep_c)].fl_fp;
+        kill.bar_seq = e_snap[ridx(keep_c)].bar_seq;
+    }
+    let pkill: logic = kill.valid && !kill.full;
+    let fkill: logic = kill.valid && kill.full;
+
+    // Retire: never in a full kill; never past keep in a partial kill.
+    let kept    : logic<ROB_TAG_W> = keep_c - head_q + 1;
+    let ret_lim : logic<ROB_TAG_W> = if pkill ? kept : count;
+    let ret_want: logic<ROB_TAG_W> = (lfsr[50:48] % (CMW + 1)) as ROB_TAG_W;
+    let n_ret   : logic<ROB_TAG_W> = if fkill || drain_ph || lfsr[55:53] == 0 ?
+        0
+    : if ret_want >: ret_lim ?
+        ret_lim
+    :
+        ret_want
+    ;
+
+    var cm: RenCm [CMW];
+    always_comb {
+        for l in 0..CMW {
+            let e             : logic<ROB_IDX_W> = ridx(head_q + l);
+            cm[l].retire   = l <: n_ret;
+            cm[l].has_rd   = e_hrd[e];
+            cm[l].cls      = e_cls[e];
+            cm[l].arch     = e_arch[e];
+            cm[l].pdst     = e_pdst[e];
+            cm[l].old_pdst = e_old[e];
+        }
+    }
+
+    // Walk lanes, youngest first.
+    let wk_left: logic   <ROB_TAG_W>          = wk_ptr - wk_end;
+    var walk   : WalkLane            [WALK_W];
+    always_comb {
+        for l in 0..WALK_W {
+            let e               : logic<ROB_IDX_W> = ridx(wk_ptr - 1 - l);
+            walk[l].valid    = wk_busy && l <: wk_left && e_hrd[e];
+            walk[l].cls      = e_cls[e];
+            walk[l].rd_arch  = e_arch[e];
+            walk[l].old_pdst = e_old[e];
+        }
+    }
+
+    // ---- lq / sq / barrier tag stand-ins ----
+
+    var lq_c  : logic <LQ_TAG_W>        ;
+    var sq_c  : logic <SQ_TAG_W>        ;
+    var bar_c : BarSeq                  ;
+    var lq_ret: logic <LQ_TAG_W>        ;
+    var bar_rt: BarSeq                  ;
+    var lq_tag: LqTag            [W + 1];
+    var sq_tag: SqTag            [W + 1];
+    var lq_bar: BarSeq           [W + 1];
+    var rob_tg: RobTag           [W]    ;
+    always_comb {
+        for k in 0..W + 1 {
+            lq_tag[k] = (lq_c + k) as LqTag;
+            sq_tag[k] = (sq_c + k) as SqTag;
+            lq_bar[k] = bar_c + k;
+        }
+        for l in 0..W {
+            rob_tg[l] = rtag(tail_q + l);
+        }
+    }
+
+    // ---- DUT ----
+
+    var pop_int : logic   <PREG_W>   [W]     ;
+    var pop_fp  : logic   <PREG_W>   [W]     ;
+    var ha_int  : FlPtr              [W + 1] ;
+    var ha_fp   : FlPtr              [W + 1] ;
+    var free_int: logic   <FL_CNT_W>         ;
+    var free_fp : logic   <FL_CNT_W>         ;
+    var ren     : RenOut             [W]     ;
+    var popn_i  : logic   <CW>               ;
+    var popn_f  : logic   <CW>               ;
+    var bar_n   : logic   <CW>               ;
+    var rob_v   : logic              [W]     ;
+    var rob_a   : RobAlloc           [W]     ;
+    var iq_v    : logic              [NQ * W];
+    var iq_a    : IqAlloc            [NQ * W];
+    var lq_v    : logic              [W]     ;
+    var lq_a    : LqAlloc            [W]     ;
+    var sq_v    : logic              [W]     ;
+    var sq_a    : SqAlloc            [W]     ;
+    var clr_v   : logic              [W]     ;
+    var clr_p   : PReg               [W]     ;
+    var rperf   : RenPerf                    ;
+    var dperf   : DispPerf                   ;
+    var chk_r   : logic   <2>                ;
+    var chk_fi  : logic   <2>                ;
+    var chk_ff  : logic   <2>                ;
+    var chk_d   : logic   <3>                ;
+
+    inst u_ren: rename::<CFG> (
+        clk               ,
+        rst               ,
+        i_valid  : rq_ov  ,
+        i_op     : rq_od  ,
+        i_take   : take   ,
+        i_pop_int: pop_int,
+        i_pop_fp : pop_fp ,
+        o_ren    : ren    ,
+        i_walk   : walk   ,
+        i_cm     : cm     ,
+        i_kill   : kill   ,
+        o_perf   : rperf  ,
+        o_chk    : chk_r  ,
+    );
+
+    inst u_fl_int: free_list::<CFG> #(
+        CLS: RegClass::INT,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_pop_n     : popn_i  ,
+        i_rel       : cm      ,
+        i_kill      : kill    ,
+        o_pop       : pop_int ,
+        o_head_after: ha_int  ,
+        o_free      : free_int,
+        o_chk       : chk_fi  ,
+    );
+
+    inst u_fl_fp: free_list::<CFG> #(
+        CLS: RegClass::FP,
+    ) (
+        clk                  ,
+        rst                  ,
+        i_pop_n     : popn_f ,
+        i_rel       : cm     ,
+        i_kill      : kill   ,
+        o_pop       : pop_fp ,
+        o_head_after: ha_fp  ,
+        o_free      : free_fp,
+        o_chk       : chk_ff ,
+    );
+
+    // Throttled credits (never above the true free space).
+    function thr::<CWD: u32> (
+        avail: input logic<CWD>,
+        r    : input logic<8>  ,
+    ) -> logic<CWD> {
+        let s: logic<CWD> = (r[2:0] % (W + 1)) as CWD;
+        return if r[6:4] == 0 && s <: avail ? s : avail;
+    }
+
+    var iq_free: logic<IQ_CNT_W> [NQ];
+    always_comb {
+        for q in 0..NQ {
+            let r         : logic<64> = lfsr >> (q * 5 + 30);
+            iq_free[q] = if r[2:0] == 0 ? (r[4:3] % (W + 1)) as IQ_CNT_W : CFG::IQ_N[q] as IQ_CNT_W;
+        }
+    }
+    let rob_cr: logic<ROB_CNT_W> = thr::<ROB_CNT_W>(rob_n, lfsr[7:0]);
+    let lq_cr : logic<LQ_CNT_W>  = thr::<LQ_CNT_W>(CFG::LQ_N as LQ_CNT_W, lfsr[15:8]);
+    let sq_cr : logic<SQ_CNT_W>  = thr::<SQ_CNT_W>(CFG::SQ_N as SQ_CNT_W, lfsr[23:16]);
+    let fli_cr: logic<FL_CNT_W>  = thr::<FL_CNT_W>(free_int, lfsr2[39:32]);
+    let flf_cr: logic<FL_CNT_W>  = thr::<FL_CNT_W>(free_fp, lfsr2[47:40]);
+
+    var bt_rdy: logic [3 * W];
+    var wake_v: logic [WB_N] ;
+    var wake_p: PReg  [WB_N] ;
+    var wake  : Wake  [WB_N] ;
+    always_comb {
+        for i in 0..3 * W {
+            bt_rdy[i] = lfsr2[i % 64];
+        }
+        for w in 0..WB_N {
+            wake_v[w]     = lfsr2[48 + w % 16];
+            wake_p[w]     = if lfsr2[60] ? ren[w % W].ps1 : ren[w % W].ps2;
+            wake[w].valid = wake_v[w];
+            wake[w].pdst  = wake_p[w];
+        }
+    }
+
+    inst u_dis: dispatch::<CFG> (
+        clk                     ,
+        rst                     ,
+        i_valid      : rq_ov    ,
+        i_op         : rq_od    ,
+        i_ren        : ren      ,
+        i_kill       : kill     ,
+        i_walk_busy  : wk_busy  ,
+        i_rob_free   : rob_cr   ,
+        i_rob_tag    : rob_tg   ,
+        i_iq_free    : iq_free  ,
+        i_lq_free    : lq_cr    ,
+        i_lq_tag     : lq_tag   ,
+        i_lq_bar     : lq_bar   ,
+        i_bar_ret    : lq_bar[0],
+        i_sq_free    : sq_cr    ,
+        i_sq_tag     : sq_tag   ,
+        i_fl_int_free: fli_cr   ,
+        i_fl_int_head: ha_int   ,
+        i_fl_fp_free : flf_cr   ,
+        i_fl_fp_head : ha_fp    ,
+        i_bt_rdy     : bt_rdy   ,
+        i_wake       : wake     ,
+        o_take       : take     ,
+        o_pop_n_int  : popn_i   ,
+        o_pop_n_fp   : popn_f   ,
+        o_bar_n      : bar_n    ,
+        o_rob_valid  : rob_v    ,
+        o_rob        : rob_a    ,
+        o_iq_valid   : iq_v     ,
+        o_iq         : iq_a     ,
+        o_lq_valid   : lq_v     ,
+        o_lq         : lq_a     ,
+        o_sq_valid   : sq_v     ,
+        o_sq         : sq_a     ,
+        o_bt_clr_v   : clr_v    ,
+        o_bt_clr_p   : clr_p    ,
+        o_perf       : dperf    ,
+        o_chk        : chk_d    ,
+    );
+
+    // ---- Reference: derived mapping ----
+
+    var arch_ref: logic<PREG_W> [RAT_N];
+    var dmap    : logic<PREG_W> [RAT_N];
+    always_comb {
+        dmap = arch_ref;
+        for i in 0..RN {
+            let e: logic<ROB_IDX_W> = ridx(head_q + i);
+            if i <: count && e_hrd[e] {
+                dmap[{e_cls[e], e_arch[e]}] = e_pdst[e];
+            }
+        }
+    }
+
+    // ---- Reference: free/used bitmaps ----
+
+    var used_q: logic<PN> [2];
+    var freed : logic<PN> [2];
+    always_comb {
+        freed[0] = 0;
+        freed[1] = 0;
+        for i in 0..RN {
+            let c   : logic<ROB_TAG_W> = head_q + i;
+            let e   : logic<ROB_IDX_W> = ridx(c);
+            let dead: logic            = i <: count && (fkill || (pkill && c - head_q >: keep_c - head_q));
+            if dead && e_hrd[e] {
+                if e_cls[e] == RegClass::FP {
+                    freed[1][e_pdst[e]] = 1'b1;
+                } else {
+                    freed[0][e_pdst[e]] = 1'b1;
+                }
+            }
+        }
+        for l in 0..CMW {
+            if cm[l].retire && cm[l].has_rd {
+                if cm[l].cls == RegClass::FP {
+                    freed[1][cm[l].old_pdst] = 1'b1;
+                } else {
+                    freed[0][cm[l].old_pdst] = 1'b1;
+                }
+            }
+        }
+    }
+
+    // Per-cycle counts used by the stand-ins.
+    var popped : logic <PN>       [2];
+    var rl     : logic <LQ_TAG_W>    ;
+    var rb     : BarSeq              ;
+    var n_lq   : logic <LQ_TAG_W>    ;
+    var n_sq   : logic <SQ_TAG_W>    ;
+    var n_valid: logic <CW>          ;
+    always_comb {
+        popped[0] = 0;
+        popped[1] = 0;
+        n_lq      = 0;
+        n_sq      = 0;
+        n_valid   = 0;
+        for l in 0..W {
+            n_valid += rq_ov[l] as CW;
+            if l <: take {
+                n_lq += rq_od[l].cls.budget.lq as LQ_TAG_W;
+                n_sq += rq_od[l].cls.budget.sq as SQ_TAG_W;
+                if rq_od[l].dst.has_rd {
+                    if ren[l].pdst.cls == RegClass::FP {
+                        popped[1][ren[l].pdst.idx] = 1'b1;
+                    } else {
+                        popped[0][ren[l].pdst.idx] = 1'b1;
+                    }
+                }
+            }
+        }
+        rl = 0;
+        rb = 0;
+        for l in 0..CMW {
+            if l <: n_ret {
+                rl += e_lq[ridx(head_q + l)] as LQ_TAG_W;
+                rb += e_bar[ridx(head_q + l)] as BAR_SEQ_W;
+            }
+        }
+    }
+
+    // ---- Checks ----
+
+    var e_take : logic<CW>;
+    var b_map  : logic    ;
+    var b_cmp  : logic    ;
+    var b_free : logic    ;
+    var b_rdy  : logic    ;
+    var b_snap : logic    ;
+    var grp_any: logic    ;
+    always_comb {
+        // Expected take, serially.
+        var nr: u32       ;
+        var nl: u32       ;
+        var ns: u32       ;
+        var ni: u32       ;
+        var nf: u32       ;
+        var nq: u32   [NQ];
+        var go: logic     ;
+        nr = 0;
+        nl = 0;
+        ns = 0;
+        ni = 0;
+        nf = 0;
+        for q in 0..NQ {
+            nq[q] = 0;
+        }
+        go     = !kill.valid && !wk_busy;
+        e_take = 0;
+        for l in 0..W {
+            if go && rq_ov[l] {
+                let q : u32 = fu_iq(rq_od[l].cls.fu);
+                nr += 1;
+                nl += rq_od[l].cls.budget.lq as u32;
+                ns += rq_od[l].cls.budget.sq as u32;
+                ni += rq_od[l].cls.budget.int_rd as u32;
+                nf += rq_od[l].cls.budget.fp_rd as u32;
+                var qf: logic;
+                qf = 1'b1;
+                for qq in 0..NQ {
+                    if q == qq {
+                        nq[qq] += 1;
+                        qf     =  nq[qq] <= iq_free[qq];
+                    }
+                }
+                if nr <= rob_cr && nl <= lq_cr && ns <= sq_cr && ni <= fli_cr && nf <= flf_cr && qf {
+                    e_take += 1;
+                } else {
+                    go = 1'b0;
+                }
+            } else {
+                go = 1'b0;
+            }
+        }
+
+        // Mapping, snapshot, bar_w and ready of every taken lane.
+        var m  : logic<PREG_W> [RAT_N];
+        var wrk: logic         [RAT_N];
+        var li : u32                  ;
+        var si : u32                  ;
+        var bi : u32                  ;
+        var ii : u32                  ;
+        var fi : u32                  ;
+        m   = dmap;
+        for k in 0..RAT_N {
+            wrk[k] = 1'b0;
+        }
+        b_map   = 1'b0;
+        b_snap  = 1'b0;
+        b_rdy   = 1'b0;
+        grp_any = 1'b0;
+        li      = 0;
+        si      = 0;
+        bi      = 0;
+        ii      = 0;
+        fi      = 0;
+        for l in 0..W {
+            if l <: take {
+                let d    : DecOp         = rq_od[l];
+                let r    : RenOut        = ren[l];
+                var ks   : logic <6> [3];
+                var us   : logic     [3];
+                var ps   : PReg      [3];
+                ks[0] = {d.rs1.rcls, d.rs1.arch};
+                ks[1] = {d.rs2.rcls, d.rs2.arch};
+                ks[2] = {d.rs3.rcls, d.rs3.arch};
+                us[0] = d.rs1.used;
+                us[1] = d.rs2.used;
+                us[2] = d.rs3.used;
+                ps[0] = r.ps1;
+                ps[1] = r.ps2;
+                ps[2] = r.ps3;
+                for s in 0..3 {
+                    var ex_rdy: logic;
+                    var wk    : logic;
+                    wk     = bt_rdy[3 * l + s];
+                    for w in 0..WB_N {
+                        if wake_v[w] && wake_p[w] == ps[s] {
+                            wk = 1'b1;
+                        }
+                    }
+                    ex_rdy = !us[s] || (!wrk[ks[s]] && wk);
+                    if us[s] && (ps[s].idx != m[ks[s]] || ps[s].cls != ks[s][5] || r.grp[s] != wrk[ks[s]]) {
+                        b_map = 1'b1;
+                    }
+                    if us[s] && wrk[ks[s]] {
+                        grp_any = 1'b1;
+                    }
+                    var got: logic;
+                    got = 1'b0;
+                    for q in 0..NQ {
+                        for i in 0..W {
+                            if iq_v[q * W + i] && iq_a[q * W + i].tag.rob == rob_tg[l] {
+                                got = if s == 0 ?
+                                    iq_a[q * W + i].rdy[0]
+                                : if s == 1 ?
+                                    iq_a[q * W + i].rdy[1]
+                                :
+                                    iq_a[q * W + i].rdy[2]
+                                ;
+                                if iq_a[q * W + i].bar_w != bar_c + bi {
+                                    b_snap = 1'b1;
+                                }
+                            }
+                        }
+                    }
+                    if d.cls.fu != FuKind::NONE && got != ex_rdy {
+                        b_rdy = 1'b1;
+                    }
+                }
+                let dk: logic<6> = {d.dst.rcls, d.dst.arch};
+                if d.dst.has_rd {
+                    if r.old_pdst != m[dk] || r.pdst.cls != d.dst.rcls || used_q[d.dst.rcls][r.pdst.idx] {
+                        b_map = 1'b1;
+                    }
+                    m[dk]   = r.pdst.idx;
+                    wrk[dk] = 1'b1;
+                }
+                li += d.cls.budget.lq as u32;
+                si += d.cls.budget.sq as u32;
+                bi += d.cls.ld_barrier as u32;
+                let sn: DispSnap = rob_a[l].snap;
+                if sn.lq_tail != (lq_c + li) as LqTag || sn.sq_tail != (sq_c + si) as SqTag || sn.bar_seq != bar_c + bi
+                    || rob_a[l].done != (d.cls.fu == FuKind::NONE) || rob_a[l].ent.pdst != r.pdst.idx
+                    || (d.cls.budget.lq && rob_a[l].ent.lq != (lq_c + li - 1) as LqTag)
+                    || (d.cls.budget.sq && rob_a[l].ent.sq != (sq_c + si - 1) as SqTag) {
+                    b_snap = 1'b1;
+                }
+            }
+        }
+
+        // Compaction: slot i of each queue holds its i-th taken lane.
+        var cq   : u32 [NQ];
+        var cl   : u32     ;
+        var cs   : u32     ;
+        b_cmp = take != e_take;
+        for q in 0..NQ {
+            cq[q] = 0;
+        }
+        cl = 0;
+        cs = 0;
+        for l in 0..W {
+            if l <: take {
+                let q: u32 = fu_iq(rq_od[l].cls.fu);
+                for qq in 0..NQ {
+                    if q == qq {
+                        for i in 0..W {
+                            if i == cq[qq] && (!iq_v[qq * W + i] || iq_a[qq * W + i].tag.rob != rob_tg[l]) {
+                                b_cmp = 1'b1;
+                            }
+                        }
+                        cq[qq] += 1;
+                    }
+                }
+                if rq_od[l].cls.budget.lq {
+                    for i in 0..W {
+                        if i == cl && (!lq_v[i] || lq_a[i].ex.rob != rob_tg[l]) {
+                            b_cmp = 1'b1;
+                        }
+                    }
+                    cl += 1;
+                }
+                if rq_od[l].cls.budget.sq {
+                    for i in 0..W {
+                        if i == cs && (!sq_v[i] || sq_a[i].rob != rob_tg[l]) {
+                            b_cmp = 1'b1;
+                        }
+                    }
+                    cs += 1;
+                }
+            }
+            if rob_v[l] != (l <: take) {
+                b_cmp = 1'b1;
+            }
+        }
+        for q in 0..NQ {
+            for i in 0..W {
+                if iq_v[q * W + i] != (i <: cq[q]) {
+                    b_cmp = 1'b1;
+                }
+            }
+        }
+        for i in 0..W {
+            if lq_v[i] != (i <: cl) || sq_v[i] != (i <: cs) {
+                b_cmp = 1'b1;
+            }
+        }
+
+        // Free list: counts match the bitmap, pops are free.
+        var fc   : u32 [2];
+        fc[0] = 0;
+        fc[1] = 0;
+        for p in 0..PN {
+            if p <: CFG::PRF_INT_N && !used_q[0][p] {
+                fc[0] += 1;
+            }
+            if p <: CFG::PRF_FP_N && !used_q[1][p] {
+                fc[1] += 1;
+            }
+        }
+        b_free = fc[0] != free_int || fc[1] != free_fp;
+        for k in 0..W {
+            if (k <: free_int && used_q[0][pop_int[k]]) || (k <: free_fp && used_q[1][pop_fp[k]]) {
+                b_free = 1'b1;
+            }
+        }
+        for l in 0..CMW {
+            if cm[l].retire && cm[l].has_rd && !used_q[cm[l].cls][cm[l].old_pdst] {
+                b_free = 1'b1;
+            }
+        }
+    }
+
+    let chk_any: logic = chk_r != 0 || chk_fi != 0 || chk_ff != 0 || chk_d != 0;
+
+    always_ff {
+        if_reset {
+            lfsr  = 64'h0123_4567_89ab_cdef;
+            lfsr2 = 64'h5a5a_1234_dead_beef;
+            cnt   = 0;
+            bad_q = 0;
+            cov_q = 0;
+            pn_q  = 0;
+            for l in 0..FW {
+                pg_q[l] = 0 as DecOp;
+            }
+            head_q  = 0;
+            tail_q  = 0;
+            wk_busy = 1'b0;
+            wk_ptr  = 0;
+            wk_end  = 0;
+            kprev_q = 1'b0;
+            lq_c    = 0;
+            sq_c    = 0;
+            bar_c   = 0;
+            lq_ret  = 0;
+            bar_rt  = 0;
+            for e in 0..RN {
+                e_hrd[e]  = 1'b0;
+                e_cls[e]  = RegClass::INT;
+                e_arch[e] = 0;
+                e_pdst[e] = 0;
+                e_old[e]  = 0;
+                e_snap[e] = 0 as DispSnap;
+                e_lq[e]   = 1'b0;
+                e_bar[e]  = 1'b0;
+            }
+            for k in 0..RAT_N {
+                arch_ref[k] = k[4:0] as PREG_W;
+            }
+            for p in 0..PN {
+                used_q[0][p] = p <: 32;
+                used_q[1][p] = p <: 32;
+            }
+        } else {
+            bad_q = bad_q | {9'd0, chk_any, b_rdy, b_snap, b_free, b_cmp, b_map, 1'b0};
+
+            // Producer.
+            if kill.valid || push || pn_q == 0 {
+                pn_q = (lfsr[63:60] % (FW + 1)) as FTW;
+                for l in 0..FW {
+                    pg_q[l] = mk_op(((lfsr2 >> (l * 16)) ^ (lfsr >> (l * 13))) as 16, drain_ph);
+                }
+            }
+
+            // Bitmaps: frees and the pops of this cycle never overlap.
+            for c in 0..2 {
+                used_q[c] = (used_q[c] & ~freed[c]) | popped[c];
+            }
+
+            // Arch reference.
+            for k in 0..RAT_N {
+                for l in 0..CMW {
+                    if cm[l].retire && cm[l].has_rd && {cm[l].cls, cm[l].arch} == k {
+                        arch_ref[k] = cm[l].pdst;
+                    }
+                }
+            }
+
+            // rob stand-in allocation.
+            for e in 0..RN {
+                for l in 0..W {
+                    if rob_v[l] && ridx(tail_q + l) == e {
+                        e_hrd[e]  = rob_a[l].ent.has_rd;
+                        e_cls[e]  = rob_a[l].ent.cls;
+                        e_arch[e] = rob_a[l].ent.rd_arch;
+                        e_pdst[e] = rob_a[l].ent.pdst;
+                        e_old[e]  = rob_a[l].ent.old_pdst;
+                        e_snap[e] = rob_a[l].snap;
+                        e_lq[e]   = rob_a[l].ent.lq_v;
+                        e_bar[e]  = rq_od[l].cls.ld_barrier;
+                    }
+                }
+            }
+
+            // Retire.
+            head_q = head_q + n_ret;
+            lq_ret = lq_ret + rl;
+            bar_rt = bar_rt + rb;
+
+            // Walk progress.
+            if wk_busy {
+                wk_ptr = wk_ptr - WALK_W;
+                if wk_left <= WALK_W {
+                    wk_busy = 1'b0;
+                }
+            }
+
+            // Kill and tail.
+            if fkill {
+                tail_q   = head_q;
+                wk_busy  = 1'b0;
+                lq_c     = lq_ret + rl;
+                bar_c    = bar_rt + rb;
+                cov_q[0] = 1'b1;
+            } else if pkill {
+                if tail_q != keep_c + 1 {
+                    wk_busy = 1'b1;
+                    wk_ptr  = tail_q;
+                    wk_end  = keep_c + 1;
+                    if tail_q - keep_c - 1 >: WALK_W {
+                        cov_q[1] = 1'b1;
+                    }
+                }
+                tail_q = keep_c + 1;
+                lq_c   = kill.lq_tail as LQ_TAG_W;
+                sq_c   = kill.sq_tail as SQ_TAG_W;
+                bar_c  = kill.bar_seq;
+                if n_ret != 0 {
+                    cov_q[2] = 1'b1;
+                }
+            } else {
+                tail_q = tail_q + take;
+                lq_c   = lq_c + n_lq;
+                sq_c   = sq_c + n_sq;
+                bar_c  = bar_c + bar_n;
+            }
+            kprev_q = kill.valid;
+
+            if take != 0 && take <: n_valid {
+                cov_q[3] = 1'b1;
+            }
+            if dperf.cut_rob {
+                cov_q[4] = 1'b1;
+            }
+            if dperf.cut_iq {
+                cov_q[5] = 1'b1;
+            }
+            if dperf.cut_lq || dperf.cut_sq {
+                cov_q[6] = 1'b1;
+            }
+            if dperf.cut_int || dperf.cut_fp {
+                cov_q[7] = 1'b1;
+            }
+            if grp_any {
+                cov_q[8] = 1'b1;
+            }
+            if rperf.walk_cyc {
+                cov_q[9] = 1'b1;
+            }
+            if take == W {
+                cov_q[10] = 1'b1;
+            }
+            if free_fp <: W {
+                cov_q[11] = 1'b1;
+            }
+
+            var t    : logic<64>;
+            var t2   : logic<64>;
+            t     = lfsr ^ (lfsr << 13);
+            t     = t ^ (t >> 7);
+            t     = t ^ (t << 17);
+            lfsr  = t;
+            t2    = lfsr2 ^ (lfsr2 >> 11);
+            t2    = t2 ^ (t2 << 9);
+            t2    = t2 ^ (t2 >> 13);
+            lfsr2 = t2;
+            cnt   = cnt + 1;
+        }
+    }
+
+    assign o_pass = bad_q == 0;
+    assign o_done = cnt >= 16'd4000;
+    assign o_bad  = bad_q;
+    assign o_cov  = cov_q;
+}
+
+#[test(test_rename)]
+module test_rename {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic    ;
+    var done2: logic    ;
+    var bad2 : logic<16>;
+    var cov2 : logic<12>;
+    var pass4: logic    ;
+    var done4: logic    ;
+    var bad4 : logic<16>;
+    var cov4 : logic<12>;
+    inst h2: rename_harness::<cfg_w2> (
+        clk          ,
+        rst          ,
+        o_pass: pass2,
+        o_done: done2,
+        o_bad : bad2 ,
+        o_cov : cov2 ,
+    );
+    inst h4: rename_harness::<cfg_w4> (
+        clk          ,
+        rst          ,
+        o_pass: pass4,
+        o_done: done4,
+        o_bad : bad4 ,
+        o_cov : cov4 ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(4020);
+        $display("rename: w2 pass=%b bad=%b cov=%b  w4 pass=%b bad=%b cov=%b", pass2, bad2, cov2, pass4, bad4, cov4);
+        $assert(done2 && done4, "rename test did not run enough cycles");
+        $assert(pass2 && pass4, "rename/dispatch diverged from the reference");
+        $assert(cov2 == 12'hfff && cov4 == 12'hfff, "rename scenario not covered");
+        $finish();
+    }
+}

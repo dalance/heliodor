@@ -5,7 +5,7 @@
 //   i_iss, i_re    : cycle S, combinational; at most one is valid (mem_port_arb
 //                    holds the IQ for this pipe when it grants a re-issue);
 //                    captured into m0
-//   o_iq_rel_*     : m0; a new issue releases its IQ entry on acceptance
+//   o_iq_rel       : m0; a new issue releases its IQ entry on acceptance
 //   o_rf_addr*, i_rf_*, i_wb : m0 register read, bypassed from the WB bus
 //   i_priv, i_pmp* : read at m1; they change only at a flushing retire
 //   o_req_*        : m2 = A, the adapter's accept cycle; i_resp is its answer
@@ -38,11 +38,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     i_kill: input core_types::<CFG>::Kill,
 
-    i_iss: input core_types::<CFG>::MemIssue  ,
+    i_iss: input core_types::<CFG>::IqGrant   ,
     i_re : input core_types::<CFG>::MemReissue,
 
-    o_iq_rel_v    : output logic                                ,
-    o_iq_rel_entry: output logic<core_types::<CFG>::MIQ_IDX_W>,
+    o_iq_rel: output core_types::<CFG>::IqRelease,
 
     o_rf_addr1: output core_types::<CFG>::PReg                             ,
     o_rf_addr2: output core_types::<CFG>::PReg                             ,
@@ -67,11 +66,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
     o_sta : output core_types::<CFG>::StaWrite,
     o_std : output core_types::<CFG>::StdWrite,
 
-    i_split_lo : input  logic<64>                    ,
-    o_verdict  : output core_types::<CFG>::LqVerdict ,
-    o_wake_v   : output logic                        ,
-    o_wake_pdst: output core_types::<CFG>::PReg      ,
-    o_wb       : output core_types::<CFG>::WbPacket  ,
+    i_split_lo: input  logic<64>                   ,
+    o_verdict : output core_types::<CFG>::LqVerdict,
+    o_wake    : output core_types::<CFG>::Wake     ,
+    o_wb      : output core_types::<CFG>::WbPacket ,
 
     o_perf: output core_types::<CFG>::MemPipePerf,
 ) {
@@ -89,21 +87,6 @@ pub module mem_pipe::<CFG: core_cfg> #(
             2'd2   : 16'h000f,
             default: 16'h00ff,
         };
-    }
-
-    // Register read with bypass from the WB packets of the current cycle.
-    function rf_bypass (
-        pr : input PReg             ,
-        prf: input logic   <64>     ,
-        wb : input WbPacket [WB_N],
-    ) -> logic<64> {
-        var hit: logic<WB_N>    ;
-        var d  : logic<64> [WB_N];
-        for w in 0..WB_N {
-            hit[w] = wb[w].valid && wb[w].tag.has_rd && wb[w].tag.pdst == pr;
-            d[w]   = wb[w].data;
-        }
-        return if hit != '0 ? tree_onehot_mux::<WB_N, 64>(hit, d) : prf;
     }
 
     // Load result from the 16-byte window holding the access at byte bo.
@@ -128,10 +111,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
         op   : MemOp           ,
         lq   : LqTag           ,
         sq   : SqTag           ,
-        imm  : logic<12>       ,
+        imm  : logic<32>       ,
         src1 : PReg            ,
         src2 : PReg            ,
-        entry: logic<MIQ_IDX_W>,
+        entry: logic<IQ_ENT_W> ,
         new_ : logic           , // from the IQ (operands from the PRF)
         va   : logic<64>       , // re-issue: the stored VA
         half : logic           ,
@@ -195,12 +178,12 @@ pub module mem_pipe::<CFG: core_cfg> #(
     always_comb {
         s_v        = i_iss.valid || i_re.valid;
         s_d.tag    = if i_re.valid ? i_re.tag : i_iss.tag;
-        s_d.op     = if i_re.valid ? i_re.op : i_iss.op;
-        s_d.lq     = if i_re.valid ? i_re.lq : i_iss.lq;
-        s_d.sq     = if i_re.valid ? i_re.sq : i_iss.sq;
-        s_d.imm    = i_iss.imm;
-        s_d.src1   = i_iss.src1;
-        s_d.src2   = i_iss.src2;
+        s_d.op     = if i_re.valid ? i_re.op : mem_op(i_iss.fu, i_iss.cold.uop);
+        s_d.lq     = if i_re.valid ? i_re.lq : i_iss.cold.lq;
+        s_d.sq     = if i_re.valid ? i_re.sq : i_iss.cold.sq;
+        s_d.imm    = i_iss.cold.imm;
+        s_d.src1   = i_iss.src[0].pr;
+        s_d.src2   = i_iss.src[1].pr;
         s_d.entry  = i_iss.entry;
         s_d.new_   = !i_re.valid;
         s_d.va     = i_re.va;
@@ -224,15 +207,15 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     // ---- m0: operands, address, pass shape ----
 
-    assign o_iq_rel_v     = m0_v && m0.new_;
-    assign o_iq_rel_entry = m0.entry;
+    assign o_iq_rel.valid = m0_v && m0.new_;
+    assign o_iq_rel.entry = m0.entry;
     assign o_rf_addr1     = m0.src1;
     assign o_rf_addr2     = m0.src2;
 
-    let rs1: logic<64> = rf_bypass(m0.src1, i_rf_int1, i_wb);
-    let rs2: logic<64> = rf_bypass(m0.src2, if m0.src2.cls == RegClass::FP ? i_rf_fp2 : i_rf_int2, i_wb);
+    let rs1: logic<64> = bypass(m0.src1, i_rf_int1, i_wb);
+    let rs2: logic<64> = bypass(m0.src2, if m0.src2.cls == RegClass::FP ? i_rf_fp2 : i_rf_int2, i_wb);
 
-    let m0_va  : logic<64> = if m0.new_ ? rs1 + {m0.imm[11] repeat 52, m0.imm} : m0.va;
+    let m0_va  : logic<64> = if m0.new_ ? rs1 + {m0.imm[31] repeat 32, m0.imm} : m0.va;
     let m0_bo  : logic<3>  = m0_va[2:0];
     let m0_m16 : logic<16> = size_mask(m0.op.size) << m0_bo;
     let m0_dw  : logic<3>  = m0_va[5:3];
@@ -476,8 +459,8 @@ pub module mem_pipe::<CFG: core_cfg> #(
         }
     }
 
-    assign o_wake_v    = r_v && !r_st && r_done && !r_exc && r.tag.has_rd;
-    assign o_wake_pdst = r.tag.pdst;
+    assign o_wake.valid = r_v && !r_st && r_done && !r_exc && r.tag.has_rd;
+    assign o_wake.pdst  = r.tag.pdst;
 
     // A store completes on its last pass; the lo pass of a crossing store
     // leaves the hi pass to the sq.

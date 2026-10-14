@@ -1,0 +1,245 @@
+// bp_btb: block target buffer, the table part of the M1 predictor.
+//
+// Ports (timing contract):
+//   i_lk_valid/i_lk_pc : lookup of the block entered at i_lk_pc, every cycle
+//   o_pred/o_meta/...  : result of the lookup of the previous cycle
+//                        (bpu_pkg::BTB_LAT = 1); combinational from the
+//                        registered lookup address, so a cycle with no lookup
+//                        leaves them stale
+//   i_upd              : training of one committed block per cycle, written
+//                        at the edge; a lookup of the same entry in that cycle
+//                        reads the old contents
+// Owns:
+//   - the prediction is a function of the table and the looked-up start_pc
+//     only; the table holds no speculative state (no recover port)
+//   - update writes only the fields its metadata and outcome determine and
+//     never reads the table
+// Rationale:
+//   - indexed and tagged by start_pc in halfwords, and slot offsets are
+//     relative to the aligned block, so a prediction is used only from the
+//     entry point it was learned at
+//   - an entry has BP_SLOTS conditional slots (2-bit counter and target) and
+//     one tail slot for the unconditional jump that ends the block; the exit
+//     is the earliest predicted-taken slot
+pub module bp_btb::<CFG: core_cfg> (
+    clk       : input  clock                           ,
+    rst       : input  reset                           ,
+    i_lk_valid: input  logic                           ,
+    i_lk_pc   : input  logic                       <64>,
+    o_pred    : output core_types::<CFG>::BlockPred    ,
+    o_exit_rvc: output logic                           , // the predicted exit is a 16-bit instruction
+    o_meta    : output bpu_pkg::<CFG>::BtbMeta         ,
+    i_upd     : input  core_types::<CFG>::BpUpdate     ,
+) {
+    import core_types::<CFG>::*;
+    import bpu_pkg::<CFG>::*;
+
+    const N_CAND: u32 = BP_SLOTS + 1; // conditional slots, then the tail slot
+
+    var vld  : logic              [BP_BTB_N]          ;
+    var tagv : logic  <BTB_TAG_W> [BP_BTB_N]          ;
+    var s_v  : logic              [BP_SLOTS, BP_BTB_N];
+    var s_off: logic  <FOFF_W>    [BP_SLOTS, BP_BTB_N];
+    var s_ctr: logic  <2>         [BP_SLOTS, BP_BTB_N];
+    var s_tgt: logic  <64>        [BP_SLOTS, BP_BTB_N];
+    var t_v  : logic              [BP_BTB_N]          ;
+    var t_off: logic  <FOFF_W>    [BP_BTB_N]          ;
+    var t_knd: CfiKind            [BP_BTB_N]          ;
+    var t_tgt: logic  <64>        [BP_BTB_N]          ;
+    var t_rvc: logic              [BP_BTB_N]          ;
+
+    function idx_of (
+        pc: input logic<64>,
+    ) -> logic<BTB_IDX_W> {
+        return pc[BTB_IDX_W:1] ^ pc[2 * BTB_IDX_W:BTB_IDX_W + 1];
+    }
+    function tag_of (
+        pc: input logic<64>,
+    ) -> logic<BTB_TAG_W> {
+        return pc[BTB_IDX_W + BTB_TAG_W:BTB_IDX_W + 1];
+    }
+    function foff_of (
+        pc: input logic<64>,
+    ) -> logic<FOFF_W> {
+        return pc[FOFF_W:1];
+    }
+
+    // ---- Lookup ----
+
+    var lk_v_q : logic    ;
+    var lk_pc_q: logic<64>;
+    always_ff {
+        if_reset {
+            lk_v_q  = 1'b0;
+            lk_pc_q = 64'd0;
+        } else if i_lk_valid {
+            lk_v_q  = 1'b1;
+            lk_pc_q = i_lk_pc;
+        } else {
+            lk_v_q = 1'b0;
+        }
+    }
+
+    let r_idx: logic<BTB_IDX_W> = idx_of(lk_pc_q);
+    let r_hit: logic            = lk_v_q && vld[r_idx] && tagv[r_idx] == tag_of(lk_pc_q);
+    let r_s0 : logic<FOFF_W>    = foff_of(lk_pc_q);
+
+    var c_v  : logic  <N_CAND>         ;
+    var c_off: logic  <FOFF_W> [N_CAND];
+    var c_knd: logic  <3>      [N_CAND];
+    var c_tgt: logic  <64>     [N_CAND];
+    var c_rvc: logic  <1>      [N_CAND];
+    var meta : BtbMeta                 ;
+    always_comb {
+        meta           = 0 as BtbMeta;
+        meta.hit       = r_hit;
+        meta.tail_v    = r_hit && t_v[r_idx];
+        meta.tail_foff = t_off[r_idx];
+        for k in 0..BP_SLOTS {
+            var sm           : SlotMeta;
+            sm.v          = r_hit && s_v[k][r_idx];
+            sm.foff       = s_off[k][r_idx];
+            sm.ctr        = s_ctr[k][r_idx];
+            meta.slots[k] = sm;
+            c_v[k]        = sm.v && sm.ctr[1] && sm.foff >= r_s0;
+            c_off[k]      = sm.foff;
+            c_knd[k]      = CfiKind::BR;
+            c_tgt[k]      = s_tgt[k][r_idx];
+            c_rvc[k]      = 1'b0;
+        }
+        c_v[BP_SLOTS]   = meta.tail_v && t_off[r_idx] >= r_s0;
+        c_off[BP_SLOTS] = t_off[r_idx];
+        c_knd[BP_SLOTS] = t_knd[r_idx];
+        c_tgt[BP_SLOTS] = t_tgt[r_idx];
+        c_rvc[BP_SLOTS] = t_rvc[r_idx];
+    }
+
+    // The earliest taken candidate wins (lower index on equal offsets);
+    // pairwise compares, no chain.
+    var win: logic<N_CAND>;
+    always_comb {
+        for c in 0..N_CAND {
+            win[c] = c_v[c];
+            for d in 0..N_CAND {
+                if d != c && c_v[d] && (c_off[d] <: c_off[c] || (c_off[d] == c_off[c] && d <: c)) {
+                    win[c] = 1'b0;
+                }
+            }
+        }
+    }
+
+    assign o_meta           = meta;
+    assign o_pred.exit_v    = |win;
+    assign o_pred.exit_foff = tree_onehot_mux::<N_CAND, FOFF_W>(win, c_off);
+    assign o_pred.exit_kind = tree_onehot_mux::<N_CAND, 3>(win, c_knd) as CfiKind;
+    assign o_pred.target    = tree_onehot_mux::<N_CAND, 64>(win, c_tgt);
+    assign o_exit_rvc       = tree_onehot_mux::<N_CAND, 1>(win, c_rvc);
+
+    // ---- Update ----
+
+    let u    : BpUpdate            = i_upd;
+    let um   : BtbMeta             = u.meta as BtbMeta;
+    let u_idx: logic   <BTB_IDX_W> = idx_of(u.start_pc);
+    let x_br : logic               = u.res.exit_kind == CfiKind::BR;
+    let x_jmp: logic               = u.valid && u.res.exit_v && !x_br;
+    let alloc: logic               = u.valid && !um.hit && u.res.exit_v;
+    let x_rvc: logic               = u.res.exit_foff == NH - 1 || u.pd.start[u.res.exit_foff + 1];
+
+    var ctr_we: logic<BP_SLOTS>           ;
+    var tgt_we: logic<BP_SLOTS>           ;
+    var inv   : logic<BP_SLOTS>           ;
+    var new_c : logic<2>        [BP_SLOTS];
+    var match : logic<BP_SLOTS>           ;
+    var freev : logic<BP_SLOTS>           ;
+    var ntk   : logic<BP_SLOTS>           ;
+    always_comb {
+        for k in 0..BP_SLOTS {
+            var sm       : SlotMeta;
+            var reached  : logic   ;
+            var isbr     : logic   ;
+            var tk       : logic   ;
+            sm        = um.slots[k] as SlotMeta;
+            reached   = sm.v && sm.foff <= u.last;
+            isbr      = u.pd.start[sm.foff] && u.pd.cfi[sm.foff] == CfiKind::BR;
+            tk        = u.res.exit_v && u.res.exit_foff == sm.foff;
+            ctr_we[k] = u.valid && um.hit && reached && isbr;
+            tgt_we[k] = ctr_we[k] && tk;
+            inv[k]    = u.valid && um.hit && reached && !isbr;
+            new_c[k]  = if tk ? (if sm.ctr == 2'd3 ? 2'd3 : sm.ctr + 2'd1) : (if sm.ctr == 2'd0 ? 2'd0 : sm.ctr - 2'd1);
+            match[k]  = sm.v && sm.foff == u.res.exit_foff;
+            freev[k]  = !sm.v;
+            ntk[k]    = !sm.ctr[1];
+        }
+    }
+
+    // A taken branch with no slot takes a free slot, else a not-taken one,
+    // else the last slot.
+    let need_slot: logic           = u.valid && um.hit && u.res.exit_v && x_br && match == 0;
+    let victim   : logic<BP_SLOTS> = if freev != 0 ?
+        tree_first::<BP_SLOTS>(freev)
+    : if ntk != 0 ?
+        tree_first::<BP_SLOTS>(ntk)
+    :
+        (1 as BP_SLOTS) << (BP_SLOTS - 1)
+    ;
+    let t_inv    : logic           = u.valid && um.hit && um.tail_v && um.tail_foff <= u.last
+        && !(u.res.exit_v && u.res.exit_foff == um.tail_foff);
+
+    // Valid bits.
+    always_ff {
+        if_reset {
+            for e in 0..BP_BTB_N {
+                vld[e] = 1'b0;
+                t_v[e] = 1'b0;
+                for k in 0..BP_SLOTS {
+                    s_v[k][e] = 1'b0;
+                }
+            }
+        } else {
+            if alloc {
+                vld[u_idx] = 1'b1;
+            }
+            for k in 0..BP_SLOTS {
+                if (alloc && k == 0 && x_br) || (need_slot && victim[k]) {
+                    s_v[k][u_idx] = 1'b1;
+                } else if alloc || inv[k] {
+                    s_v[k][u_idx] = 1'b0;
+                }
+            }
+            if alloc && x_br {
+                t_v[u_idx] = 1'b0;
+            } else if x_jmp {
+                t_v[u_idx] = 1'b1;
+            } else if t_inv {
+                t_v[u_idx] = 1'b0;
+            }
+        }
+    }
+
+    // Payload.
+    always_ff {
+        if alloc {
+            tagv[u_idx] = tag_of(u.start_pc);
+        }
+        for k in 0..BP_SLOTS {
+            if (alloc && k == 0 && x_br) || (need_slot && victim[k]) {
+                s_off[k][u_idx] = u.res.exit_foff;
+                s_ctr[k][u_idx] = 2'd2;
+                s_tgt[k][u_idx] = u.res.target;
+            } else if !alloc {
+                if ctr_we[k] {
+                    s_ctr[k][u_idx] = new_c[k];
+                }
+                if tgt_we[k] {
+                    s_tgt[k][u_idx] = u.res.target;
+                }
+            }
+        }
+        if x_jmp {
+            t_off[u_idx] = u.res.exit_foff;
+            t_knd[u_idx] = u.res.exit_kind;
+            t_tgt[u_idx] = u.res.target;
+            t_rvc[u_idx] = x_rvc;
+        }
+    }
+}

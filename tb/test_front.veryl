@@ -1,0 +1,1191 @@
+// Front end from bpu to the decode queue (bpu, ftq, ifu, icache, islot_arb,
+// extract) against a reference walker, for both supported configs.
+//
+// Instruction memory is a random RVC/32-bit mix (test/front/gen_prog.py),
+// mirrored every 4 KiB over the ROM (uncached, single-beat reads) and DRAM
+// (line fills, critical dword first) regions; everything else is a hole. A
+// behavioural mem_ctrl I slot serves the arbiter with random accept and
+// stream latencies, and a synthetic PTW client competes for the slot.
+//
+// The back-end model takes random prefixes of the DQ and walks the
+// architectural path: branch outcomes are random, JAL targets come from the
+// code, returns pop a call stack, other indirect jumps go to a hash of the pc.
+// Each delivered op is checked against memory (pc, parcels, RVC expansion,
+// fetch faults with their tval). A mispredict is resolved by a partial kill
+// after a random delay or by a commit-time full kill (BR_CM); retires drive
+// the ftq commit pointer; random full kills refetch from a retire boundary
+// (SERIAL) and fetch faults trap to rotating vectors (TRAP). FENCE.I pulses
+// invalidate the icache. The checkers of extract and ftq must stay 0.
+package front_tb_pkg {
+    function link (
+        r: input logic<5>,
+    ) -> logic {
+        return r == 5'd1 || r == 5'd5;
+    }
+
+    // Control-flow kind with the CfiKind encoding (NONE 0, BR 1, JAL 2,
+    // JAL_CALL 3, JALR 4, JALR_CALL 5, JALR_RET 6, JALR_RETCALL 7).
+    function cfi_kind (
+        lo: input logic<16>,
+        hi: input logic<16>,
+    ) -> logic<3> {
+        let rd : logic<5> = lo[11:7];
+        let rs1: logic<5> = {hi[3:0], lo[15]};
+        var k  : logic<3>;
+        k   = 3'd0;
+        if lo[1:0] == 2'b11 {
+            if lo[6:0] == 7'h63 {
+                k = 3'd1;
+            } else if lo[6:0] == 7'h6f {
+                k = if link(rd) ? 3'd3 : 3'd2;
+            } else if lo[6:0] == 7'h67 && lo[14:12] == 3'd0 {
+                if link(rd) && link(rs1) && rd != rs1 {
+                    k = 3'd7;
+                } else if link(rd) {
+                    k = 3'd5;
+                } else if link(rs1) {
+                    k = 3'd6;
+                } else {
+                    k = 3'd4;
+                }
+            }
+        } else if lo[1:0] == 2'b01 {
+            if lo[15:13] == 3'b101 {
+                k = 3'd2;
+            } else if lo[15:13] == 3'b110 || lo[15:13] == 3'b111 {
+                k = 3'd1;
+            }
+        } else if lo[1:0] == 2'b10 && lo[15:13] == 3'b100 && lo[6:2] == 0 && lo[11:7] != 0 {
+            if lo[12] == 1'b0 {
+                k = if link(lo[11:7]) ? 3'd6 : 3'd4;
+            } else {
+                k = if lo[11:7] == 5'd5 ? 3'd7 : 3'd5;
+            }
+        }
+        return k;
+    }
+
+    function sext (
+        v: input logic<64>,
+        b: input u32      ,
+    ) -> logic<64> {
+        return if v[b] ? v | ~((64'd1 << b) - 1) : v;
+    }
+
+    // Offset of a direct branch or jump.
+    function dir_imm (
+        w: input logic<32>,
+    ) -> logic<64> {
+        var r: logic<64>;
+        r = 0;
+        if w[1:0] == 2'b11 {
+            if w[6:0] == 7'h63 {
+                r = sext({51'd0, w[31], w[7], w[30:25], w[11:8], 1'b0}, 12);
+            } else if w[6:0] == 7'h6f {
+                r = sext({43'd0, w[31], w[19:12], w[20], w[30:21], 1'b0}, 20);
+            }
+        } else if w[1:0] == 2'b01 {
+            if w[15:13] == 3'b101 {
+                r = sext({52'd0, w[12], w[8], w[10:9], w[6], w[7], w[2], w[11], w[5:3], 1'b0}, 11);
+            } else if w[15:14] == 2'b11 {
+                r = sext({55'd0, w[12], w[6:5], w[2], w[11:10], w[4:3], 1'b0}, 8);
+            }
+        }
+        return r;
+    }
+
+    // Target of a non-return indirect jump: a halfword of the same 4 KiB page.
+    function hash_tgt (
+        pc: input logic<64>,
+    ) -> logic<64> {
+        let h: logic<11> = (pc[11:1] * 11'd37 + 11'd11) ^ pc[22:12];
+        return {pc[63:12], h, 1'b0};
+    }
+
+    function xs (
+        x: input logic<64>,
+    ) -> logic<64> {
+        var t: logic<64>;
+        t = x ^ (x << 13);
+        t = t ^ (t >> 7);
+        t = t ^ (t << 17);
+        return t;
+    }
+
+    const A_ROM        : pma_pkg::PmaAttr       = pma_pkg::PmaAttr'{
+        target       : pma_pkg::Target::ROM   ,
+        backed       : 1                      ,
+        cacheable    : 0                      ,
+        coherent     : 0                      ,
+        executable   : 1                      ,
+        amo          : pma_pkg::AmoClass::NONE,
+        idempotent   : 1                      ,
+        io_ordered   : 0                      ,
+        misaligned_ok: 0                      ,
+        pte_ok       : 0                      ,
+        cbo_ok       : 0
+    };
+    const A_DRAM       : pma_pkg::PmaAttr       = pma_pkg::PmaAttr'{
+        target       : pma_pkg::Target::DRAM  ,
+        backed       : 1                      ,
+        cacheable    : 1                      ,
+        coherent     : 1                      ,
+        executable   : 1                      ,
+        amo          : pma_pkg::AmoClass::FULL,
+        idempotent   : 1                      ,
+        io_ordered   : 0                      ,
+        misaligned_ok: 1                      ,
+        pte_ok       : 1                      ,
+        cbo_ok       : 1
+    };
+    const A_IO         : pma_pkg::PmaAttr       = pma_pkg::PmaAttr'{
+        target       : pma_pkg::Target::IO    ,
+        backed       : 1                      ,
+        cacheable    : 0                      ,
+        coherent     : 0                      ,
+        executable   : 0                      ,
+        amo          : pma_pkg::AmoClass::NONE,
+        idempotent   : 0                      ,
+        io_ordered   : 1                      ,
+        misaligned_ok: 0                      ,
+        pte_ok       : 0                      ,
+        cbo_ok       : 0
+    };
+    const PMA          : pma_pkg::PmaRegion [3] = '{
+        pma_pkg::PmaRegion'{base: 56'h0, mask: 56'hff_ffff_ffff_c000, attr: A_ROM},
+        pma_pkg::PmaRegion'{base: 56'h8000_0000, mask: 56'hff_ffff_fe00_0000, attr: A_DRAM},
+        pma_pkg::PmaRegion'{base: 56'h1000_0000, mask: 56'hff_ffff_ffff_f000, attr: A_IO}
+    };
+
+    const NCNT: u32 = 27;
+}
+
+module front_harness::<CFG: core_cfg> #(
+    param CYCLES: u32 = 20000,
+) (
+    clk   : input  clock                         ,
+    rst   : input  reset                         ,
+    o_pass: output logic                         ,
+    o_done: output logic                         ,
+    o_chk : output logic<13>                     ,
+    o_cnt : output logic<32> [front_tb_pkg::NCNT],
+) {
+    import core_types::<CFG>::*;
+    import front_tb_pkg::*;
+
+    const FW  : u32 = CFG::FETCH_W;
+    const CMW : u32 = CFG::COMMIT_W;
+    const QN  : u32 = 64;
+    const QW  : u32 = 6;
+    const TK_W: u32 = tag_pkg::idx_w(FW + 1);
+
+    #[allow(initial_assign)]
+    var dimg: logic<16> [2048];
+    #[allow(initial_assign)]
+    var rimg: logic<16> [2048];
+    initial {
+        $readmemh("test/front/dram.hex", dimg);
+        $readmemh("test/front/rom.hex", rimg);
+    }
+
+    var lfsr_q: logic<64>;
+    var cyc_q : logic<32>;
+    var ok_q  : logic<8> ; // sticky failure bits, 0 = pass
+
+    // ---- DUT ----
+
+    var kill : Kill     ;
+    var redir: Redirect ;
+    var cm   : FtqCommit;
+    var inval: logic    ;
+
+    var enq_v  : logic    ;
+    var enq    : FtqEnq   ;
+    var enq_rdy: logic    ;
+    var rcv    : BpRecover;
+    var upd    : BpUpdate ;
+    var ev_bub : logic    ;
+    inst u_bpu: bpu::<CFG> (
+        clk                             ,
+        rst                             ,
+        i_reset_pc       : 64'h8000_0000,
+        o_enq_valid      : enq_v        ,
+        o_enq            : enq          ,
+        i_enq_ready      : enq_rdy      ,
+        i_rcv            : rcv          ,
+        i_upd            : upd          ,
+        o_ev_taken_bubble: ev_bub       ,
+    );
+
+    var f_v     : logic     ;
+    var fetch   : FtqFetch  ;
+    var take    : logic     ;
+    var rw_v    : logic     ;
+    var rw      : FtqTag    ;
+    var pdw     : PdWrite   ;
+    var pdr     : PdRedirect;
+    var ev_ffull: logic     ;
+    var chk_ftq : logic     ;
+    inst u_ftq: ftq::<CFG> (
+        clk                     ,
+        rst                     ,
+        i_enq_valid   : enq_v   ,
+        i_enq         : enq     ,
+        o_enq_ready   : enq_rdy ,
+        o_fetch_valid : f_v     ,
+        o_fetch       : fetch   ,
+        i_fetch_take  : take    ,
+        i_rewind_valid: rw_v    ,
+        i_rewind      : rw      ,
+        i_pdw         : pdw     ,
+        i_pdr         : pdr     ,
+        i_kill        : kill    ,
+        i_redirect    : redir   ,
+        i_cm          : cm      ,
+        o_rcv         : rcv     ,
+        o_upd         : upd     ,
+        o_ev_full     : ev_ffull,
+        o_chk         : chk_ftq ,
+    );
+
+    var icq_v  : logic   ;
+    var icq    : IcReq   ;
+    var ic_rdy : logic   ;
+    var icr    : IcResp  ;
+    var icev   : IcEvent ;
+    var ic_fl  : logic   ;
+    var fb_v   : logic   ;
+    var fb     : FetchBlk;
+    var fb_take: logic   ;
+    var ev_fbq : logic   ;
+    var ev_idle: logic   ;
+    var ev_fst : logic   ;
+    inst u_ifu: ifu::<CFG> #(
+        PMA_N      : 3  ,
+        PMA_REGIONS: PMA,
+    ) (
+        clk                         ,
+        rst                         ,
+        i_fetch_valid      : f_v    ,
+        i_fetch            : fetch  ,
+        o_fetch_take       : take   ,
+        o_rewind_valid     : rw_v   ,
+        o_rewind           : rw     ,
+        o_ic_req_valid     : icq_v  ,
+        o_ic_req           : icq    ,
+        i_ic_ready         : ic_rdy ,
+        i_ic_resp          : icr    ,
+        i_ic_ev            : icev   ,
+        o_ic_flush         : ic_fl  ,
+        o_fb_valid         : fb_v   ,
+        o_fb               : fb     ,
+        i_fb_take          : fb_take,
+        i_kill             : kill   ,
+        i_pdr              : pdr    ,
+        o_ev_fbq_full      : ev_fbq ,
+        o_ev_ftq_empty_idle: ev_idle,
+        o_ev_fault_stall   : ev_fst ,
+    );
+
+    var fill_req : logic        ;
+    var fill_addr: logic<56>    ;
+    var unc_req  : logic        ;
+    var unc_addr : logic<56>    ;
+    var cl_acc   : logic     [3];
+    var cl_beat  : logic     [3];
+    var sl_rdata : logic<64>    ;
+    var ev_miss  : logic        ;
+    var ev_fbusy : logic        ;
+    inst u_ic: icache::<CFG> #(
+        INDEX_W: 4,
+    ) (
+        clk                       ,
+        rst                       ,
+        i_req_valid   : icq_v     ,
+        i_req         : icq       ,
+        o_req_ready   : ic_rdy    ,
+        o_resp        : icr       ,
+        o_ev          : icev      ,
+        i_flush       : ic_fl     ,
+        i_inval_all   : inval     ,
+        o_fill_req    : fill_req  ,
+        o_fill_addr   : fill_addr ,
+        i_fill_acc    : cl_acc[1] ,
+        i_fill_beat   : cl_beat[1],
+        o_unc_req     : unc_req   ,
+        o_unc_addr    : unc_addr  ,
+        i_unc_beat    : cl_beat[2],
+        i_rdata       : sl_rdata  ,
+        o_ev_miss     : ev_miss   ,
+        o_ev_fill_busy: ev_fbusy  ,
+    );
+
+    var ptw_req_q : logic    ;
+    var ptw_addr_q: logic<56>;
+    var s_req     : logic    ;
+    var s_addr    : logic<64>;
+    var s_dram    : logic    ;
+    var s_grant   : logic    ;
+    var s_rdata   : logic<64>;
+    inst u_arb: islot_arb #(
+        N_CL: 3,
+    ) (
+        clk                                             ,
+        rst                                             ,
+        i_req       : '{ptw_req_q, fill_req, unc_req},
+        i_addr      : '{ptw_addr_q, fill_addr, unc_addr},
+        i_line      : '{1'b1, 1'b1, 1'b0},
+        o_acc       : cl_acc                            ,
+        o_beat      : cl_beat                           ,
+        o_rdata     : sl_rdata                          ,
+        o_slot_req  : s_req                             ,
+        o_slot_addr : s_addr                            ,
+        o_slot_dram : s_dram                            ,
+        o_slot_iread: _                                 ,
+        i_slot_grant: s_grant                           ,
+        i_slot_rdata: s_rdata                           ,
+    );
+
+    var dq_v  : logic       [FW];
+    var dq    : XOp         [FW];
+    var dq_tk : logic<TK_W>     ;
+    var ev_cut: logic           ;
+    var ev_dqf: logic           ;
+    var ev_pdr: logic<5>        ;
+    var chk_x : logic<4>        ;
+    inst u_x: extract::<CFG> (
+        clk                        ,
+        rst                        ,
+        i_fb_valid        : fb_v   ,
+        i_fb              : fb     ,
+        o_fb_take         : fb_take,
+        o_dq_valid        : dq_v   ,
+        o_dq              : dq     ,
+        i_dq_take         : dq_tk  ,
+        o_pdw             : pdw    ,
+        o_pdr             : pdr    ,
+        i_kill            : kill   ,
+        i_redirect        : redir  ,
+        o_ev_cut_block_end: ev_cut ,
+        o_ev_dq_full      : ev_dqf ,
+        o_ev_pdr          : ev_pdr ,
+        o_chk             : chk_x  ,
+    );
+
+    // ---- Instruction memory and the I slot ----
+
+    let s_idx: logic<9> = s_addr[11:3];
+    assign s_rdata = if s_addr[31] ?
+        {dimg[{s_idx, 2'd3}], dimg[{s_idx, 2'd2}], dimg[{s_idx, 2'd1}], dimg[{s_idx, 2'd0}]}
+    :
+        {rimg[{s_idx, 2'd3}], rimg[{s_idx, 2'd2}], rimg[{s_idx, 2'd1}], rimg[{s_idx, 2'd0}]}
+    ;
+
+    var sm_st_q  : logic<2> ; // 0 idle, 1 latency, 2 stream
+    var sm_lat_q : logic<4> ;
+    var sm_line_q: logic<50>;
+    var sm_cnt_q : logic<3> ;
+    let acc_ok   : logic     = lfsr_q[3:2] != 0;
+    assign s_grant = (sm_st_q == 0 && s_req && acc_ok) || sm_st_q == 2;
+    let sm_bad: logic = sm_st_q == 2 && s_addr[55:6] != sm_line_q;
+
+    always_ff {
+        if_reset {
+            sm_st_q   = 0;
+            sm_lat_q  = 0;
+            sm_line_q = 0;
+            sm_cnt_q  = 0;
+        } else if sm_st_q == 0 {
+            if s_req && acc_ok && s_dram {
+                sm_st_q   = 1;
+                sm_lat_q  = lfsr_q[7:4];
+                sm_line_q = s_addr[55:6];
+            }
+        } else if sm_st_q == 1 {
+            if sm_lat_q == 0 {
+                sm_st_q  = 2;
+                sm_cnt_q = 0;
+            } else {
+                sm_lat_q = sm_lat_q - 1;
+            }
+        } else {
+            sm_cnt_q = sm_cnt_q + 1;
+            if sm_cnt_q == 7 {
+                sm_st_q = 0;
+            }
+        }
+    }
+
+    // Synthetic PTW client: line reads at random DRAM dwords; beat 0 is the
+    // addressed dword (critical dword first).
+    var ptw_busy_q: logic    ;
+    var ptw_cnt_q : logic<3> ;
+    let p_idx     : logic<9>  = ptw_addr_q[11:3];
+    let p_dw      : logic<64> = {dimg[{p_idx, 2'd3}], dimg[{p_idx, 2'd2}], dimg[{p_idx, 2'd1}], dimg[{p_idx, 2'd0}]};
+    let ptw_bad   : logic     = ptw_busy_q && cl_beat[0] && ptw_cnt_q == 0 && sl_rdata != p_dw;
+    let ptw_done  : logic     = ptw_busy_q && cl_beat[0] && ptw_cnt_q == 7;
+    always_ff {
+        if_reset {
+            ptw_req_q  = 1'b0;
+            ptw_addr_q = 0;
+            ptw_busy_q = 1'b0;
+            ptw_cnt_q  = 0;
+        } else {
+            if cl_acc[0] {
+                ptw_req_q  = 1'b0;
+                ptw_busy_q = 1'b1;
+                ptw_cnt_q  = 0;
+            } else if !ptw_req_q && !ptw_busy_q && lfsr_q[30:23] == 0 {
+                ptw_req_q  = 1'b1;
+                ptw_addr_q = {24'd0, 1'b1, 6'd0, lfsr_q[24:3], 3'd0};
+            }
+            if ptw_busy_q && cl_beat[0] {
+                ptw_cnt_q = ptw_cnt_q + 1;
+                if ptw_cnt_q == 7 {
+                    ptw_busy_q = 1'b0;
+                }
+            }
+        }
+    }
+
+    // ---- Back-end model ----
+
+    // Memory view of each DQ lane, and its reference RVC expansion.
+    var m_lo : logic<16> [FW];
+    var m_hi : logic<16> [FW];
+    var m_exp: logic<32> [FW];
+    var m_ill: logic     [FW];
+    var ex_lo: logic     [FW];
+    var ex_hi: logic     [FW];
+    always_comb {
+        for l in 0..FW {
+            var pc      : logic           <64>;
+            var pc2     : logic           <64>;
+            var a       : pma_pkg::PmaAttr    ;
+            var a2      : pma_pkg::PmaAttr    ;
+            pc       = dq[l].pc;
+            pc2      = dq[l].pc + 2;
+            a        = pma_check::<3>(pc[55:0], PMA);
+            a2       = pma_check::<3>(pc2[55:0], PMA);
+            m_lo[l]  = if pc[31] ? dimg[pc[11:1]] : rimg[pc[11:1]];
+            m_hi[l]  = if pc2[31] ? dimg[pc2[11:1]] : rimg[pc2[11:1]];
+            ex_lo[l] = pc[63:56] == 0 && a.executable;
+            ex_hi[l] = pc2[63:56] == 0 && a2.executable;
+        }
+    }
+    for l in 0..FW :g_exp {
+        inst u_exp: c_expander (
+            i_cinstr : m_lo[l] ,
+            o_instr  : m_exp[l],
+            o_illegal: m_ill[l],
+        );
+    }
+
+    var ref_q  : logic <64>         ;
+    var wrong_q: logic              ; // ops are on a wrong path until the next kill
+    var pend_q : logic              ; // the last op was predicted taken; its target is checked by the next op
+    var pnx_q  : logic <64>         ;
+    var pqi_q  : logic <QW>         ;
+    var pret_q : logic              ;
+    var pftq_q : FtqTag             ;
+    var pfoff_q: logic <FOFF_W>     ;
+    var st_q   : logic <64>     [16];
+    var sp_q   : logic <4>          ;
+    var ast_q  : logic <64>     [16];
+    var asp_q  : logic <4>          ;
+
+    var q_ftq  : FtqTag         [QN];
+    var q_foff : logic <FOFF_W> [QN];
+    var q_next : logic <64>     [QN];
+    var q_push : logic          [QN];
+    var q_pop  : logic          [QN];
+    var q_pval : logic <64>     [QN];
+    var q_res  : logic          [QN];
+    var q_trap : logic          [QN];
+    var q_mis  : logic          [QN];
+    var q_taken: logic          [QN];
+    var head_q : logic <QW>         ;
+    var tail_q : logic <QW>         ;
+    var qcnt_q : logic <QW + 1>     ;
+
+    // Scheduled full kill, pending partial kill.
+    var fk_v_q   : logic            ;
+    var fk_kind_q: RedirKind        ;
+    var fk_pc_q  : logic    <64>    ;
+    var fk_ftq_q : FtqTag           ;
+    var fk_foff_q: logic    <FOFF_W>;
+    var fk_tk_q  : logic            ;
+    var pk_v_q   : logic            ;
+    var pk_cnt_q : logic    <2>     ;
+    var pk_qi_q  : logic    <QW>    ;
+    var pk_ftq_q : FtqTag           ;
+    var pk_foff_q: logic    <FOFF_W>;
+    var pk_pc_q  : logic    <64>    ;
+    var pk_tk_q  : logic            ;
+    var idle_q   : logic    <16>    ;
+
+    let pk_fire: logic = pk_v_q && pk_cnt_q == 0 && !fk_v_q;
+    always_comb {
+        kill           = 0 as Kill;
+        kill.valid     = fk_v_q || pk_fire;
+        kill.full      = fk_v_q;
+        kill.ftq_tail  = tag_next::<FTQ_TAG_W, CFG::FTQ_N>(pk_ftq_q) as FtqTag;
+        redir          = 0 as Redirect;
+        redir.valid    = kill.valid;
+        redir.pc       = if fk_v_q ? fk_pc_q : pk_pc_q;
+        redir.ftq_keep = if fk_v_q ? fk_ftq_q : pk_ftq_q;
+        redir.foff     = if fk_v_q ? fk_foff_q : pk_foff_q;
+        redir.taken    = if fk_v_q ? fk_tk_q : pk_tk_q;
+        redir.kind     = if fk_v_q ? fk_kind_q : RedirKind::BR;
+    }
+    assign inval = lfsr_q[62:52] == 0;
+
+    var nvalid: logic<TK_W>;
+    always_comb {
+        nvalid = 0;
+        for l in 0..FW {
+            nvalid += dq_v[l];
+        }
+    }
+    assign dq_tk = if kill.valid || qcnt_q + FW >: QN ? 0 : (lfsr_q[47:40] % (nvalid + 1)) as TK_W;
+
+    // Walk of the taken lanes along the architectural path.
+    var w_wrong: logic              ;
+    var w_ref  : logic <64>         ;
+    var w_pend : logic              ;
+    var w_pnx  : logic <64>         ;
+    var w_pqi  : logic <QW>         ;
+    var w_pret : logic              ;
+    var w_pftq : FtqTag             ;
+    var w_pfoff: logic <FOFF_W>     ;
+    var w_sp   : logic <4>          ;
+    var w_st   : logic <64>     [16];
+    var n_new  : logic <QW>         ;
+    var ne_v   : logic          [FW];
+    var ne_qi  : logic <QW>     [FW];
+    var ne_next: logic <64>     [FW];
+    var ne_push: logic          [FW];
+    var ne_pop : logic          [FW];
+    var ne_pval: logic <64>     [FW];
+    var ne_res : logic          [FW];
+    var ne_trap: logic          [FW];
+    var ne_mis : logic          [FW];
+    var ne_tk  : logic          [FW];
+    var det_v  : logic              ;
+    var det_qi : logic <QW>         ;
+    var det_pc : logic <64>         ;
+    var det_tk : logic              ;
+    var det_ftq: FtqTag             ;
+    var det_fo : logic <FOFF_W>     ;
+    var det_cm : logic              ; // resolve at commit (BR_CM) instead of a partial kill
+    var res_v  : logic          [FW];
+    var res_qi : logic <QW>     [FW];
+    var w_bad  : logic              ;
+    var c_on   : logic <4>          ;
+    var c_rvc  : logic <4>          ;
+    var c_str  : logic <4>          ;
+    var c_flo  : logic <4>          ;
+    var c_fhi  : logic <4>          ;
+    var c_rom  : logic <4>          ;
+    var c_wr   : logic <4>          ;
+    var c_ras  : logic              ;
+    always_comb {
+        w_wrong = wrong_q;
+        w_ref   = ref_q;
+        w_pend  = pend_q;
+        w_pnx   = pnx_q;
+        w_pqi   = pqi_q;
+        w_pret  = pret_q;
+        w_pftq  = pftq_q;
+        w_pfoff = pfoff_q;
+        w_sp    = sp_q;
+        w_st    = st_q;
+        n_new   = 0;
+        det_v   = 1'b0;
+        det_qi  = 0;
+        det_pc  = 0;
+        det_tk  = 1'b0;
+        det_ftq = 0 as FtqTag;
+        det_fo  = 0;
+        det_cm  = lfsr_q[33:32] == 0;
+        w_bad   = 1'b0;
+        c_on    = 0;
+        c_rvc   = 0;
+        c_str   = 0;
+        c_flo   = 0;
+        c_fhi   = 0;
+        c_rom   = 0;
+        c_wr    = 0;
+        c_ras   = 1'b0;
+        for l in 0..FW {
+            var o         : XOp      ;
+            var on        : logic    ;
+            var is32      : logic    ;
+            var k         : logic<3> ;
+            var imm       : logic<64>;
+            var len       : logic<64>;
+            var tk        : logic    ;
+            var nx        : logic<64>;
+            var qi        : logic<QW>;
+            o          = dq[l];
+            is32       = m_lo[l][1:0] == 2'b11;
+            len        = if is32 ? 64'd4 : 64'd2;
+            qi         = tail_q + n_new;
+            ne_v[l]    = 1'b0;
+            ne_qi[l]   = qi;
+            ne_next[l] = 0;
+            ne_push[l] = 1'b0;
+            ne_pop[l]  = 1'b0;
+            ne_pval[l] = o.pc + len;
+            ne_res[l]  = 1'b1;
+            ne_trap[l] = 1'b0;
+            ne_mis[l]  = 1'b0;
+            ne_tk[l]   = 1'b0;
+            res_v[l]   = 1'b0;
+            res_qi[l]  = 0;
+            if l <: dq_tk {
+                if w_wrong {
+                    c_wr += 1;
+                } else {
+                    on = 1'b1;
+                    if w_pend {
+                        w_pend = 1'b0;
+                        if o.pc == w_pnx {
+                            res_v[l]  = 1'b1;
+                            res_qi[l] = w_pqi;
+                            c_ras     = w_pret;
+                        } else {
+                            det_v   =  1'b1;
+                            det_qi  =  w_pqi;
+                            det_pc  =  w_pnx;
+                            det_tk  =  1'b1;
+                            det_ftq =  w_pftq;
+                            det_fo  =  w_pfoff;
+                            w_wrong =  1'b1;
+                            on      =  1'b0;
+                            c_wr    += 1;
+                        }
+                    }
+                    if on {
+                        c_on    += 1;
+                        n_new   += 1;
+                        ne_v[l] =  1'b1;
+                        if o.pc != w_ref {
+                            w_bad = 1'b1;
+                        }
+                        if !o.pc[31] {
+                            c_rom += 1;
+                        }
+                        if !ex_lo[l] || (is32 && !ex_hi[l]) {
+                            if !o.exc.valid || o.exc.cause != 6'd1 || o.exc.tval != (if ex_lo[l] ? o.pc + 2 : o.pc) {
+                                w_bad = 1'b1;
+                            }
+                            if ex_lo[l] {
+                                c_fhi += 1;
+                            } else {
+                                c_flo += 1;
+                            }
+                            ne_trap[l] = 1'b1;
+                            w_wrong    = 1'b1;
+                        } else {
+                            if o.exc.valid || o.is_rvc == is32 {
+                                w_bad = 1'b1;
+                            }
+                            if is32 && o.insn != {m_hi[l], m_lo[l]} {
+                                w_bad = 1'b1;
+                            }
+                            if !is32 && (o.cinsn != m_lo[l] || o.insn != (if m_ill[l] ? 32'd0 : m_exp[l])) {
+                                w_bad = 1'b1;
+                            }
+                            if !is32 {
+                                c_rvc += 1;
+                            }
+                            if is32 && o.foff == NH - 1 {
+                                c_str += 1;
+                            }
+                            k   = cfi_kind(m_lo[l], m_hi[l]);
+                            imm = dir_imm({m_hi[l], m_lo[l]});
+                            tk  = k != 0;
+                            nx  = o.pc + imm;
+                            if k == 3'd1 {
+                                tk = lfsr_q[l * 5 + 9];
+                                nx = if tk ? o.pc + imm : o.pc + len;
+                            } else if k == 3'd4 || k == 3'd5 {
+                                nx = hash_tgt(o.pc);
+                            } else if k == 3'd6 || k == 3'd7 {
+                                nx = w_st[w_sp - 1];
+                            } else if k == 3'd0 {
+                                nx = o.pc + len;
+                            }
+                            ne_pop[l]  = k == 3'd6 || k == 3'd7;
+                            ne_push[l] = k == 3'd3 || k == 3'd5 || k == 3'd7;
+                            if ne_pop[l] {
+                                w_sp = w_sp - 1;
+                            }
+                            if ne_push[l] {
+                                w_st[w_sp] = o.pc + len;
+                                w_sp       = w_sp + 1;
+                            }
+                            if o.pred_taken && k == 0 {
+                                w_bad = 1'b1;
+                            }
+                            ne_next[l] = nx;
+                            ne_tk[l]   = tk;
+                            w_ref      = nx;
+                            if o.pred_taken != tk {
+                                det_v     = 1'b1;
+                                det_qi    = qi;
+                                det_pc    = nx;
+                                det_tk    = tk;
+                                det_ftq   = o.ftq;
+                                det_fo    = o.foff;
+                                ne_res[l] = det_cm;
+                                ne_mis[l] = det_cm;
+                                w_wrong   = 1'b1;
+                            } else if tk {
+                                ne_res[l] = 1'b0;
+                                w_pend    = 1'b1;
+                                w_pnx     = nx;
+                                w_pqi     = qi;
+                                w_pret    = k == 3'd6 || k == 3'd7;
+                                w_pftq    = o.ftq;
+                                w_pfoff   = o.foff;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Commit: retire resolved entries in order; a BR_CM entry, a random
+    // SERIAL point or a trap at the head schedules a full kill for the next
+    // cycle.
+    var c_n    : logic    <QW>         ;
+    var c_stop : logic                 ;
+    var a_sp   : logic    <4>          ;
+    var a_st   : logic    <64>     [16];
+    var sch_v  : logic                 ;
+    var sch_k  : RedirKind             ;
+    var sch_pc : logic    <64>         ;
+    var sch_ftq: FtqTag                ;
+    var sch_fo : logic    <FOFF_W>     ;
+    var sch_tk : logic                 ;
+    var vecs   : logic    <64>     [8] ;
+    var vec_q  : logic    <3>          ;
+    always_comb {
+        vecs[0] = {32'h0000_0000, 18'h20000, lfsr_q[13:1], 1'b0};
+        vecs[1] = {50'd0, lfsr_q[13:1], 1'b0};
+        vecs[2] = 64'h3ff8;
+        vecs[3] = 64'h81ff_fff8;
+        vecs[4] = {32'h0000_0000, 7'h40, lfsr_q[24:1], 1'b0};
+        vecs[5] = {50'd0, 2'b01, lfsr_q[11:1], 1'b0} + 64'h1000;
+        vecs[6] = 64'h3ffa;
+        vecs[7] = 64'h8000_0000;
+    }
+    always_comb {
+        c_n     = 0;
+        c_stop  = kill.valid || fk_v_q;
+        a_sp    = asp_q;
+        a_st    = ast_q;
+        sch_v   = 1'b0;
+        sch_k   = RedirKind::SERIAL;
+        sch_pc  = 0;
+        sch_ftq = 0 as FtqTag;
+        sch_fo  = 0;
+        sch_tk  = 1'b0;
+        cm      = 0 as FtqCommit;
+        for k in 0..CMW {
+            var idx: logic<QW>;
+            idx = head_q + k;
+            if !c_stop && k <: qcnt_q && k <: lfsr_q[51:49] {
+                if q_trap[idx] {
+                    if k == 0 {
+                        sch_v  = 1'b1;
+                        sch_k  = RedirKind::TRAP;
+                        sch_pc = vecs[vec_q];
+                    }
+                    c_stop = 1'b1;
+                } else if !q_res[idx] {
+                    c_stop = 1'b1;
+                } else {
+                    c_n      += 1;
+                    cm.valid =  1'b1;
+                    cm.ftq   =  q_ftq[idx];
+                    cm.foff  =  q_foff[idx];
+                    if q_pop[idx] {
+                        a_sp = a_sp - 1;
+                    }
+                    if q_push[idx] {
+                        a_st[a_sp] = q_pval[idx];
+                        a_sp       = a_sp + 1;
+                    }
+                    if q_mis[idx] || lfsr_q[63:58] == 0 || lfsr_q[57:51] == 0 {
+                        // BR_CM backstop, a refetch (SERIAL), or an
+                        // interrupt-like full kill to a vector (IRQ).
+                        sch_v   = 1'b1;
+                        sch_k   = if q_mis[idx] ?
+                            RedirKind::BR_CM
+                        : if lfsr_q[63:58] == 0 ?
+                            RedirKind::SERIAL
+                        :
+                            RedirKind::IRQ
+                        ;
+                        sch_pc  = if q_mis[idx] || lfsr_q[63:58] == 0 ? q_next[idx] : vecs[vec_q];
+                        sch_ftq = q_ftq[idx];
+                        sch_fo  = q_foff[idx];
+                        sch_tk  = q_taken[idx];
+                        c_stop  = 1'b1;
+                    }
+                }
+            } else {
+                c_stop = 1'b1;
+            }
+        }
+    }
+
+    var icacc_q: logic           ;
+    var cnt_q  : logic<32> [NCNT];
+    var inc    : logic     [NCNT];
+    always_comb {
+        for i in 0..NCNT {
+            inc[i] = 1'b0;
+        }
+        inc[0]  = c_on != 0;
+        inc[1]  = c_rvc != 0;
+        inc[2]  = c_str != 0;
+        inc[3]  = pk_fire;
+        inc[4]  = fk_v_q && fk_kind_q == RedirKind::BR_CM;
+        inc[5]  = fk_v_q && fk_kind_q == RedirKind::SERIAL;
+        inc[6]  = fk_v_q && fk_kind_q == RedirKind::TRAP;
+        inc[26] = fk_v_q && fk_kind_q == RedirKind::IRQ;
+        inc[7]  = c_fhi != 0;
+        inc[8]  = c_flo != 0;
+        inc[9]  = pdr.valid;
+        inc[10] = ev_miss;
+        inc[11] = c_rom != 0;
+        inc[12] = ptw_done;
+        inc[13] = c_ras;
+        inc[14] = ev_pdr[4];
+        inc[15] = ev_pdr[0] || ev_pdr[1] || ev_pdr[3];
+        inc[16] = ev_pdr[2];
+        inc[17] = inval;
+        inc[18] = ev_fbq;
+        inc[19] = ev_bub;
+        inc[20] = det_v;
+        inc[21] = c_wr != 0;
+        inc[22] = ev_ffull;
+        inc[23] = ev_dqf;
+        inc[24] = ev_cut;
+        inc[25] = ev_fbusy;
+    }
+
+    let progress: logic = n_new != 0 || c_n != 0;
+
+    always_ff {
+        if_reset {
+            lfsr_q    = 64'h1234_5678_9abc_def1;
+            cyc_q     = 0;
+            ok_q      = 0;
+            icacc_q   = 1'b0;
+            ref_q     = 64'h8000_0000;
+            wrong_q   = 1'b0;
+            pend_q    = 1'b0;
+            pnx_q     = 0;
+            pqi_q     = 0;
+            pret_q    = 1'b0;
+            pftq_q    = 0 as FtqTag;
+            pfoff_q   = 0;
+            sp_q      = 0;
+            asp_q     = 0;
+            head_q    = 0;
+            tail_q    = 0;
+            qcnt_q    = 0;
+            fk_v_q    = 1'b0;
+            fk_kind_q = RedirKind::SERIAL;
+            fk_pc_q   = 0;
+            fk_ftq_q  = 0 as FtqTag;
+            fk_foff_q = 0;
+            fk_tk_q   = 1'b0;
+            pk_v_q    = 1'b0;
+            pk_cnt_q  = 0;
+            pk_qi_q   = 0;
+            pk_ftq_q  = 0 as FtqTag;
+            pk_foff_q = 0;
+            pk_pc_q   = 0;
+            pk_tk_q   = 1'b0;
+            vec_q     = 0;
+            idle_q    = 0;
+            // Returns with an empty call stack land in DRAM.
+            for i in 0..16 {
+                st_q[i]  = 64'h8000_0000 + i * 64'h1c6;
+                ast_q[i] = 64'h8000_0000 + i * 64'h1c6;
+            }
+            for i in 0..NCNT {
+                cnt_q[i] = 0;
+            }
+        } else {
+            lfsr_q  = xs(lfsr_q);
+            cyc_q   = cyc_q + 1;
+            icacc_q = icq_v && ic_rdy;
+            for i in 0..NCNT {
+                if inc[i] {
+                    cnt_q[i] = cnt_q[i] + 1;
+                }
+            }
+            if w_bad {
+                ok_q[0] = 1'b1;
+            }
+            if sm_bad {
+                ok_q[1] = 1'b1;
+            }
+            if ptw_bad {
+                ok_q[2] = 1'b1;
+            }
+            if icr.valid != icacc_q {
+                ok_q[3] = 1'b1; // icache response is not IC_RESP_LAT after accept
+            }
+            if idle_q >: 16'd6000 {
+                ok_q[4] = 1'b1;
+            }
+            idle_q = if progress || kill.valid ? 0 : idle_q + 1;
+
+            if fk_v_q {
+                tail_q  = head_q;
+                qcnt_q  = 0;
+                ref_q   = fk_pc_q;
+                wrong_q = 1'b0;
+                pend_q  = 1'b0;
+                pk_v_q  = 1'b0;
+                fk_v_q  = 1'b0;
+                st_q    = ast_q;
+                sp_q    = asp_q;
+                if fk_kind_q == RedirKind::TRAP || fk_kind_q == RedirKind::IRQ {
+                    vec_q = vec_q + 1;
+                }
+            } else {
+                if pk_fire {
+                    wrong_q        = 1'b0;
+                    q_res[pk_qi_q] = 1'b1;
+                    pk_v_q         = 1'b0;
+                } else {
+                    if pk_v_q {
+                        pk_cnt_q = pk_cnt_q - 1;
+                    }
+                    wrong_q = w_wrong;
+                }
+                for l in 0..FW {
+                    if ne_v[l] {
+                        q_ftq[ne_qi[l]]   = dq[l].ftq;
+                        q_foff[ne_qi[l]]  = dq[l].foff;
+                        q_next[ne_qi[l]]  = ne_next[l];
+                        q_push[ne_qi[l]]  = ne_push[l];
+                        q_pop[ne_qi[l]]   = ne_pop[l];
+                        q_pval[ne_qi[l]]  = ne_pval[l];
+                        q_res[ne_qi[l]]   = ne_res[l];
+                        q_trap[ne_qi[l]]  = ne_trap[l];
+                        q_mis[ne_qi[l]]   = ne_mis[l];
+                        q_taken[ne_qi[l]] = ne_tk[l];
+                    }
+                }
+                for l in 0..FW {
+                    if res_v[l] {
+                        q_res[res_qi[l]] = 1'b1;
+                    }
+                }
+                if det_v {
+                    q_res[det_qi]   = det_cm;
+                    q_mis[det_qi]   = det_cm;
+                    q_taken[det_qi] = det_tk;
+                    if !det_cm {
+                        pk_v_q    = 1'b1;
+                        pk_cnt_q  = lfsr_q[35:34];
+                        pk_qi_q   = det_qi;
+                        pk_ftq_q  = det_ftq;
+                        pk_foff_q = det_fo;
+                        pk_pc_q   = det_pc;
+                        pk_tk_q   = det_tk;
+                    }
+                }
+                ref_q   = w_ref;
+                pend_q  = w_pend;
+                pnx_q   = w_pnx;
+                pqi_q   = w_pqi;
+                pret_q  = w_pret;
+                pftq_q  = w_pftq;
+                pfoff_q = w_pfoff;
+                st_q    = w_st;
+                sp_q    = w_sp;
+                tail_q  = tail_q + n_new;
+                head_q  = head_q + c_n;
+                qcnt_q  = qcnt_q + n_new - c_n;
+                ast_q   = a_st;
+                asp_q   = a_sp;
+                if sch_v {
+                    fk_v_q    = 1'b1;
+                    fk_kind_q = sch_k;
+                    fk_pc_q   = sch_pc;
+                    fk_ftq_q  = sch_ftq;
+                    fk_foff_q = sch_fo;
+                    fk_tk_q   = sch_tk;
+                }
+            }
+        }
+    }
+
+    assign o_pass = ok_q == 0 && chk_ftq == 1'b0 && chk_x == 0;
+    assign o_done = cyc_q >= CYCLES;
+    assign o_chk  = {ok_q, chk_ftq, chk_x};
+    always_comb {
+        for i in 0..NCNT {
+            o_cnt[i] = cnt_q[i];
+        }
+    }
+    let _unused_ev: logic = ev_idle ^ ev_fst;
+}
+
+#[test(test_front)]
+module test_front {
+    import front_tb_pkg::*;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic           ;
+    var done2: logic           ;
+    var chk2 : logic<13>       ;
+    var cnt2 : logic<32> [NCNT];
+    var pass4: logic           ;
+    var done4: logic           ;
+    var chk4 : logic<13>       ;
+    var cnt4 : logic<32> [NCNT];
+    inst h2: front_harness::<cfg_w2> #(
+        CYCLES: 30000,
+    ) (
+        clk          ,
+        rst          ,
+        o_pass: pass2,
+        o_done: done2,
+        o_chk : chk2 ,
+        o_cnt : cnt2 ,
+    );
+    inst h4: front_harness::<cfg_w4> #(
+        CYCLES: 30000,
+    ) (
+        clk          ,
+        rst          ,
+        o_pass: pass4,
+        o_done: done4,
+        o_chk : chk4 ,
+        o_cnt : cnt4 ,
+    );
+
+    // Mechanisms that must fire in both configs.
+    function covered (
+        c: input logic<32> [NCNT],
+    ) -> logic {
+        var r: logic;
+        r = 1'b1;
+        for i in 0..NCNT {
+            if c[i] == 0 && i != 18 && i != 22 && i != 23 {
+                r = 1'b0;
+            }
+        }
+        return r;
+    }
+
+    initial {
+        rst.assert(clk);
+        clk.next(30010);
+        $display("front w2: pass=%b chk=%b", pass2, chk2);
+        $display(
+            "  on-path ops=%d rvc=%d straddle=%d wrong-path=%d rom=%d",
+            cnt2[0],
+            cnt2[1],
+            cnt2[2],
+            cnt2[21],
+            cnt2[11],
+        );
+        $display(
+            "  kills: partial=%d br_cm=%d serial=%d trap=%d mispred=%d",
+            cnt2[3],
+            cnt2[4],
+            cnt2[5],
+            cnt2[6],
+            cnt2[20],
+        );
+        $display(
+            "  faults: lower=%d upper=%d  pdr=%d (v5=%d v124=%d v3=%d)",
+            cnt2[8],
+            cnt2[7],
+            cnt2[9],
+            cnt2[14],
+            cnt2[15],
+            cnt2[16],
+        );
+        $display(
+            "  ic miss=%d fill_busy=%d ptw=%d inval=%d ras_hit=%d bubble=%d",
+            cnt2[10],
+            cnt2[25],
+            cnt2[12],
+            cnt2[17],
+            cnt2[13],
+            cnt2[19],
+        );
+        $display(
+            "  fbq_full=%d ftq_full=%d dq_full=%d cut_block_end=%d irq=%d",
+            cnt2[18],
+            cnt2[22],
+            cnt2[23],
+            cnt2[24],
+            cnt2[26],
+        );
+        $display("front w4: pass=%b chk=%b", pass4, chk4);
+        $display(
+            "  on-path ops=%d rvc=%d straddle=%d wrong-path=%d rom=%d",
+            cnt4[0],
+            cnt4[1],
+            cnt4[2],
+            cnt4[21],
+            cnt4[11],
+        );
+        $display(
+            "  kills: partial=%d br_cm=%d serial=%d trap=%d mispred=%d",
+            cnt4[3],
+            cnt4[4],
+            cnt4[5],
+            cnt4[6],
+            cnt4[20],
+        );
+        $display(
+            "  faults: lower=%d upper=%d  pdr=%d (v5=%d v124=%d v3=%d)",
+            cnt4[8],
+            cnt4[7],
+            cnt4[9],
+            cnt4[14],
+            cnt4[15],
+            cnt4[16],
+        );
+        $display(
+            "  ic miss=%d fill_busy=%d ptw=%d inval=%d ras_hit=%d bubble=%d",
+            cnt4[10],
+            cnt4[25],
+            cnt4[12],
+            cnt4[17],
+            cnt4[13],
+            cnt4[19],
+        );
+        $display(
+            "  fbq_full=%d ftq_full=%d dq_full=%d cut_block_end=%d irq=%d",
+            cnt4[18],
+            cnt4[22],
+            cnt4[23],
+            cnt4[24],
+            cnt4[26],
+        );
+        $assert(done2 && done4, "front test did not run enough cycles");
+        $assert(pass2 && pass4, "front end diverged from the reference walker or a checker fired");
+        $assert(covered(cnt2) && covered(cnt4), "front-end mechanism not covered");
+        $finish();
+    }
+}

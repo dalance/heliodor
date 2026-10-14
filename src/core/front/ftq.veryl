@@ -1,0 +1,245 @@
+// ftq: fetch target queue, the ring of fetch-block descriptors.
+//
+// Ports (timing contract):
+//   i_enq_valid/i_enq : one predicted block per cycle from bpu, written at
+//                       tail; ignored in a kill or predecode-redirect cycle
+//   o_enq_ready       : registered, the ring is not full
+//   o_fetch_valid/... : the entry at fetch_q, from registered state;
+//                       i_fetch_take advances fetch_q, i_rewind_valid sets it
+//                       back to i_rewind (rewind wins over take)
+//   i_pdw             : extract writes the predecode, and on a correction the
+//                       prediction, of one block before its first op reaches
+//                       the decode queue
+//   i_pdr             : registered predecode redirect from extract
+//   i_kill/i_redirect : registered back-end kill and its redirect, same
+//                       cycle; drop every entry younger than the keep entry
+//                       (partial) or the commit entry (full)
+//   i_cm              : youngest op retired this cycle
+//   o_rcv             : recover record for bpu, combinational in the cycle
+//                       of a kill or i_pdr
+//   o_upd             : one committed block per cycle to bpu, which always
+//                       accepts
+//   o_ev_full         : bpu offers a block while the ring is full
+//   o_chk             : sticky flag of chk_ftq, 0 without HELIODOR_CHK
+// Owns:
+//   - entry e is released only when e is older than cm_q and its update has
+//     been sent, so every live op can read its own entry
+//   - pred of an entry does not change after extract's write; a partial kill
+//     writes only res and last
+//   - upd_q <= cm_q <= fetch_q <= tail_q in ring order, at most FTQ_N
+//     entries in use
+// Rationale:
+//   - the ftq is the only holder of the PC; ops carry (ftq, foff)
+//   - update learns from the committed range [start, last] and res only,
+//     never from a speculative path
+pub module ftq::<CFG: core_cfg> (
+    clk           : input  clock                        ,
+    rst           : input  reset                        ,
+    i_enq_valid   : input  logic                        ,
+    i_enq         : input  core_types::<CFG>::FtqEnq    ,
+    o_enq_ready   : output logic                        ,
+    o_fetch_valid : output logic                        ,
+    o_fetch       : output core_types::<CFG>::FtqFetch  ,
+    i_fetch_take  : input  logic                        ,
+    i_rewind_valid: input  logic                        ,
+    i_rewind      : input  core_types::<CFG>::FtqTag    ,
+    i_pdw         : input  core_types::<CFG>::PdWrite   ,
+    i_pdr         : input  core_types::<CFG>::PdRedirect,
+    i_kill        : input  core_types::<CFG>::Kill      ,
+    i_redirect    : input  core_types::<CFG>::Redirect  ,
+    i_cm          : input  core_types::<CFG>::FtqCommit ,
+    o_rcv         : output core_types::<CFG>::BpRecover ,
+    o_upd         : output core_types::<CFG>::BpUpdate  ,
+    o_ev_full     : output logic                        ,
+    o_chk         : output logic                        ,
+) {
+    import core_types::<CFG>::*;
+
+    const N: u32 = CFG::FTQ_N;
+
+    var e_start: logic    <64>     [N];
+    var e_pred : BlockPred         [N];
+    var e_meta : PredMeta          [N];
+    var e_ckpt : PredCkpt          [N];
+    var e_pd   : PdInfo            [N];
+    var e_res  : BlockPred         [N];
+    var e_last : logic    <FOFF_W> [N];
+
+    var upd_q    : FtqTag        ;
+    var cm_q     : FtqTag        ;
+    var cm_foff_q: logic <FOFF_W>;
+    var cm_v_q   : logic         ;
+    var fetch_q  : FtqTag        ;
+    var tail_q   : FtqTag        ;
+
+    function nxt (
+        t: input FtqTag,
+    ) -> FtqTag {
+        return tag_next::<FTQ_TAG_W, N>(t) as FtqTag;
+    }
+    function older (
+        a: input FtqTag,
+        b: input FtqTag,
+    ) -> logic {
+        return tag_older::<FTQ_TAG_W>(a, b);
+    }
+    let full : logic = tail_q.idx == upd_q.idx && tail_q.wrap != upd_q.wrap;
+    let kill : logic = i_kill.valid;
+    let kfull: logic = kill && i_kill.full;
+    let kpart: logic = kill && !i_kill.full;
+    let flush: logic = kill || i_pdr.valid;
+    let enq  : logic = i_enq_valid && !full && !flush;
+    let br_cm: logic = i_redirect.kind == RedirKind::BR_CM;
+
+    // Outcome written by a kill that carries a branch result.
+    function outcome (
+        pd   : input PdInfo        ,
+        foff : input logic <FOFF_W>,
+        taken: input logic         ,
+        pc   : input logic <64>    ,
+    ) -> BlockPred {
+        var r          : BlockPred;
+        r           = 0 as BlockPred;
+        r.exit_v    = taken;
+        r.exit_foff = foff;
+        r.exit_kind = if taken ? pd.cfi[foff] as CfiKind : CfiKind::NONE;
+        r.target    = if taken ? pc : 64'd0;
+        return r;
+    }
+
+    // Entry written by the kill: the keep entry, or the commit entry.
+    let k_idx  : logic    <FTQ_IDX_W> = if kfull ? cm_q.idx : i_redirect.ftq_keep.idx;
+    let k_we   : logic                = kpart || (kfull && cm_v_q);
+    let k_carry: logic                = kpart || br_cm; // the redirect carries a branch outcome
+    let k_last : logic    <FOFF_W>    = if k_carry ? i_redirect.foff : cm_foff_q;
+    var k_res  : BlockPred           ;
+    always_comb {
+        if k_carry {
+            k_res = outcome(e_pd[k_idx], i_redirect.foff, i_redirect.taken, i_redirect.pc);
+        } else {
+            // Close the commit entry at the last retired op.
+            k_res        = e_res[k_idx];
+            k_res.exit_v = e_res[k_idx].exit_v && e_res[k_idx].exit_foff == cm_foff_q;
+        }
+    }
+
+    always_ff {
+        for e in 0..N {
+            if enq && tail_q.idx == e {
+                e_start[e] = i_enq.start_pc;
+                e_pred[e]  = i_enq.pred;
+                e_meta[e]  = i_enq.meta;
+                e_ckpt[e]  = i_enq.ckpt;
+                e_pd[e]    = 0 as PdInfo;
+                e_res[e]   = i_enq.pred;
+                e_last[e]  = if i_enq.pred.exit_v ? i_enq.pred.exit_foff : (NH - 1) as FOFF_W;
+            } else if k_we && k_idx == e {
+                e_res[e]  = k_res;
+                e_last[e] = k_last;
+            } else if i_pdw.valid && !flush && i_pdw.ftq.idx == e {
+                e_pd[e] = i_pdw.pd;
+                if i_pdw.fix {
+                    e_pred[e] = i_pdw.pred;
+                    e_res[e]  = i_pdw.pred;
+                    e_last[e] = i_pdw.last;
+                }
+            }
+        }
+    }
+
+    let new_tail: FtqTag = if kfull ? (if cm_v_q ? nxt(cm_q) : cm_q) : if kpart ? i_kill.ftq_tail : nxt(i_pdr.ftq);
+    let upd_go  : logic  = older(upd_q, cm_q);
+
+    always_ff {
+        if_reset {
+            upd_q     = 0 as FtqTag;
+            cm_q      = 0 as FtqTag;
+            cm_foff_q = 0;
+            cm_v_q    = 1'b0;
+            fetch_q   = 0 as FtqTag;
+            tail_q    = 0 as FtqTag;
+        } else {
+            if flush {
+                tail_q  = new_tail;
+                fetch_q = new_tail;
+            } else {
+                if enq {
+                    tail_q = nxt(tail_q);
+                }
+                if i_rewind_valid {
+                    fetch_q = i_rewind;
+                } else if i_fetch_take {
+                    fetch_q = nxt(fetch_q);
+                }
+            }
+            if i_cm.valid {
+                cm_q      = i_cm.ftq;
+                cm_foff_q = i_cm.foff;
+                cm_v_q    = 1'b1;
+            }
+            if upd_go {
+                upd_q = nxt(upd_q);
+            }
+        }
+    }
+
+    assign o_enq_ready      = !full;
+    assign o_fetch_valid    = fetch_q != tail_q;
+    assign o_fetch.ftq      = fetch_q;
+    assign o_fetch.start_pc = e_start[fetch_q.idx];
+    assign o_fetch.pred     = e_pred[fetch_q.idx];
+
+    // Recover record: the keep entry, the commit entry or the predecode one.
+    let r_idx: logic    <FTQ_IDX_W> = if kfull ? cm_q.idx : if kpart ? i_redirect.ftq_keep.idx : i_pdr.ftq.idx;
+    let r_res: BlockPred            = e_res[r_idx];
+    always_comb {
+        o_rcv.valid    = flush;
+        o_rcv.pc       = if kill ? i_redirect.pc : i_pdr.pc;
+        o_rcv.start_pc = e_start[r_idx];
+        o_rcv.ckpt     = e_ckpt[r_idx];
+        o_rcv.meta     = e_meta[r_idx];
+        o_rcv.pd       = e_pd[r_idx];
+        if kfull && !br_cm {
+            o_rcv.foff  = cm_foff_q;
+            o_rcv.taken = r_res.exit_v && r_res.exit_foff == cm_foff_q;
+            o_rcv.apply = cm_v_q;
+        } else if kill {
+            o_rcv.foff  = i_redirect.foff;
+            o_rcv.taken = i_redirect.taken;
+            o_rcv.apply = kpart || cm_v_q;
+        } else {
+            o_rcv.foff  = i_pdr.foff;
+            o_rcv.taken = i_pdr.taken;
+            o_rcv.apply = 1'b1;
+        }
+    }
+
+    always_comb {
+        o_upd.valid    = upd_go;
+        o_upd.start_pc = e_start[upd_q.idx];
+        o_upd.meta     = e_meta[upd_q.idx];
+        o_upd.ckpt     = e_ckpt[upd_q.idx];
+        o_upd.pd       = e_pd[upd_q.idx];
+        o_upd.res      = e_res[upd_q.idx];
+        o_upd.last     = e_last[upd_q.idx];
+        o_upd.mispred  = e_pred[upd_q.idx] != e_res[upd_q.idx];
+    }
+
+    assign o_ev_full = i_enq_valid && full;
+
+    #[ifdef(HELIODOR_CHK)]
+    inst u_chk: chk_ftq::<CFG> (
+        clk                ,
+        rst                ,
+        i_upd     : upd_q  ,
+        i_cm      : cm_q   ,
+        i_cm_v    : cm_v_q ,
+        i_fetch   : fetch_q,
+        i_tail    : tail_q ,
+        i_kill             ,
+        i_redirect         ,
+        o_chk              ,
+    );
+    #[else]
+    assign o_chk = 1'b0;
+}

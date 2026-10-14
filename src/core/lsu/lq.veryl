@@ -2,15 +2,15 @@
 // poison, the ld_barrier sequence and the commit window
 //
 // Ports (timing contract):
-//   i_alloc[RENAME_W] : per dispatch lane, valid for the loads of the group,
-//                       each with its tag from o_alloc_tag; never valid in a
-//                       kill cycle
+//   i_alloc_valid/i_alloc[RENAME_W] : the loads of the dispatch group,
+//                       compacted in program order; slot i takes the tag
+//                       o_alloc_tag[i]; never valid in a kill cycle
 //   o_free, o_alloc_tag[RENAME_W+1] : registered state only (free = LQ_N -
 //                       (tail - head); o_alloc_tag[k] = tail advanced by k)
 //   i_snap[MEM_W]     : m2 of each pipe; sets seen on the capture edge
 //   i_sta[MEM_W]      : store-resolve request at m2; scanned the next cycle
 //   i_verdict[MEM_W]  : m2 + RESP_LAT; only for ops still live in the pipe
-//   i_mem_ev, i_coh_*, i_std, i_sq_head, i_oldest_* : wake and scan events of
+//   i_mem_ev, i_coh_*, i_std, i_sq_head, i_oldest : wake and scan events of
 //                       this cycle; an event in the verdict's cycle counts as
 //                       after the verdict
 //   o_reissue         : registered; the oldest READY entry; i_reissue_gnt in
@@ -44,11 +44,12 @@ pub module lq::<CFG: core_cfg> (
 
     i_kill: input core_types::<CFG>::Kill,
 
-    i_alloc    : input  core_types::<CFG>::LqAlloc [CFG::RENAME_W]    ,
+    i_alloc_valid: input  logic                      [CFG::RENAME_W]    ,
+    i_alloc      : input  core_types::<CFG>::LqAlloc [CFG::RENAME_W]    ,
     o_free     : output logic<core_types::<CFG>::LQ_CNT_W>             ,
     o_alloc_tag: output core_types::<CFG>::LqTag   [CFG::RENAME_W + 1],
 
-    i_bar_alloc : input  logic<core_types::<CFG>::RN_CNT_W>              ,
+    i_bar_alloc : input  logic<core_types::<CFG>::TAKE_W>                ,
     i_bar_ret   : input  logic                                           ,
     o_bar_after : output core_types::<CFG>::BarSeq   [CFG::RENAME_W + 1],
     o_bar_ret   : output core_types::<CFG>::BarSeq                       ,
@@ -63,15 +64,14 @@ pub module lq::<CFG: core_cfg> (
     i_coh_line  : input logic<50>                  [core_types::<CFG>::COH_N],
     i_std       : input core_types::<CFG>::StdWrite [CFG::MEM_W]             ,
     i_sq_head   : input core_types::<CFG>::SqTag                            ,
-    i_oldest_v  : input logic                                               ,
-    i_oldest_tag: input core_types::<CFG>::RobTag                           ,
+    i_oldest    : input core_types::<CFG>::TagTok                           ,
 
     i_retire_cnt: input logic<core_types::<CFG>::RETIRE_CNT_W>,
 
     o_reissue    : output core_types::<CFG>::MemReissue,
     i_reissue_gnt: input  logic                        ,
 
-    o_win     : output core_types::<CFG>::LqWin [CFG::COMMIT_W],
+    o_win     : output core_types::<CFG>::LqCmWin [CFG::COMMIT_W],
     o_split_lo: output logic<64>                               ,
 
     #[ifdef(HELIODOR_CHK)]
@@ -162,7 +162,7 @@ pub module lq::<CFG: core_cfg> (
     always_comb {
         var v: logic<CFG::RENAME_W>;
         for l in 0..CFG::RENAME_W {
-            v[l] = i_alloc[l].valid;
+            v[l] = i_alloc_valid[l];
         }
         n_alloc = tree_popcount::<CFG::RENAME_W, 32>(v);
     }
@@ -225,7 +225,7 @@ pub module lq::<CFG: core_cfg> (
     var wake: logic<QN>;
     always_comb {
         for e in 0..QN {
-            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, e_io[e], i_mem_ev, i_std, i_sq_head, i_oldest_v, i_oldest_tag);
+            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, e_io[e], i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag);
         }
     }
 
@@ -258,13 +258,18 @@ pub module lq::<CFG: core_cfg> (
     for k in 0..CFG::COMMIT_W :g_win {
         let wt: LqTag = lq_adv(head_q, k);
         always_comb {
-            o_win[k].valid  = k <: cnt;
-            o_win[k].tag    = wt;
-            o_win[k].poison = e_poison[wt.idx];
-            o_win[k].io     = e_ioord[wt.idx];
-            o_win[k].va     = e_va[wt.idx];
-            o_win[k].pa     = {e_line0[wt.idx], e_va[wt.idx][5:0]};
-            o_win[k].size   = e_op[wt.idx].size;
+            o_win[k].valid          = k <: cnt;
+            o_win[k].tag            = wt;
+            o_win[k].poison         = e_poison[wt.idx];
+            o_win[k].io_ordered     = e_ioord[wt.idx];
+            o_win[k].obs.size       = {1'b0, e_op[wt.idx].size};
+            o_win[k].obs.vaddr      = e_va[wt.idx];
+            o_win[k].obs.paddr      = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
+            o_win[k].obs.io         = e_io[wt.idx];
+            o_win[k].obs.rmask      = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
+            o_win[k].obs.wmask      = '0;
+            o_win[k].obs.wdata      = '0;
+            o_win[k].obs.wdata_hi   = '0;
         }
     }
     assign o_split_lo = lo_q;
@@ -339,10 +344,10 @@ pub module lq::<CFG: core_cfg> (
                     e_state[e] = LqState::INFLIGHT;
                 }
                 for l in 0..CFG::RENAME_W {
-                    if i_alloc[l].valid && i_alloc[l].tag.idx == e {
-                        e_wrap[e]   = i_alloc[l].tag.wrap;
+                    if i_alloc_valid[l] && o_alloc_tag[l].idx == e {
+                        e_wrap[e]   = o_alloc_tag[l].wrap;
                         e_ex[e]     = i_alloc[l].ex;
-                        e_op[e]     = i_alloc[l].op;
+                        e_op[e]     = mem_op(i_alloc[l].fu, i_alloc[l].uop);
                         e_sqlim[e]  = i_alloc[l].sq_lim;
                         e_state[e]  = LqState::ISSUE;
                         e_seen0[e]  = 1'b0;
@@ -376,7 +381,7 @@ pub module lq::<CFG: core_cfg> (
                         e_io[e]    = i_verdict[p].io;
                         e_ioord[e] = i_verdict[p].io_ord;
                         // An event of this cycle counts as after the verdict.
-                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_verdict[p].io, i_mem_ev, i_std, i_sq_head, i_oldest_v, i_oldest_tag) {
+                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_verdict[p].io, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag) {
                             e_state[e] = LqState::READY;
                         } else {
                             e_state[e] = i_verdict[p].state;
@@ -438,7 +443,7 @@ pub module lq::<CFG: core_cfg> (
             i_live      : live          ,
             i_rob       : c_rob         ,
             i_state     : e_state       ,
-            i_alloc                     ,
+            i_alloc_valid               ,
             i_verdict                   ,
             i_gnt       : gnt_oh        ,
             o_chk                       ,

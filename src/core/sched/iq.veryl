@@ -1,0 +1,376 @@
+// iq: generic issue queue Q of the FU topology table: wakeup, oldest-first
+// select per issue port, static port assignment at allocation.
+//
+// Ports (timing contract):
+//   i_alloc_valid/i_alloc : rn_ edge; the lanes need not be contiguous. The
+//                           k-th valid lane enters the k-th free entry. The
+//                           initial ready bits are ORed with this cycle's wake
+//   o_free                : number of FREE entries, from registered state
+//   i_wake                : wake lanes, one per WB port; a matching source is
+//                           ready from the next cycle
+//   i_tok                 : oldest token (registered in commit)
+//   i_wb_ok               : per issue port, the WB slots a select may claim
+//                           this cycle (wb_resv, combinational from registered
+//                           state)
+//   i_fu_busy             : per issue port, FU kinds that may not be selected
+//                           (a blocking FU that is occupied or about to be)
+//   i_port_hold           : per issue port, no select this cycle (memory port
+//                           slot given to another requester)
+//   i_load_fence          : a ld_barrier op retired; loads waiting on it clear
+//                           their fence at this edge
+//   o_grant               : combinational in the select cycle S, from
+//                           registered state and the inputs above
+//   o_resv                : the WB slot the grant claims (RESERVED kinds only)
+//   i_release             : the accept stage returns a granted entry; it is
+//                           FREE from the next cycle
+//   i_kill                : every entry whose op it selects is FREE after the
+//                           edge
+// Owns:
+//   - an entry is granted at most once between allocation and release
+//   - a nonspec op is granted only in a cycle where the oldest token is
+//     valid and carries its tag
+//   - o_free equals the number of FREE entries
+// Rationale:
+//   - hot fields (state, port, tags, sources) are scanned every cycle; the
+//     cold payload is read once per port for the winner only
+//   - an entry keeps its payload until release, and grant and release are
+//     separate ports, so a later speculative wakeup only adds a cancel that
+//     returns an ISSUED entry to WAIT
+//   - select is a tree over ROB tags per port: one age compare per node for
+//     any entry count
+//   - the issue port is fixed at allocation: the candidate port of least
+//     occupancy, counting the earlier lanes of the same group; ties go to
+//     the lower port
+pub module iq::<CFG: core_cfg> #(
+    param Q: u32 = 0,
+) (
+    clk          : input  clock                ,
+    rst          : input  reset                ,
+    i_alloc_valid: input  logic [CFG::RENAME_W],
+    i_alloc      : input  core_types::<CFG>::IqAlloc                              [CFG::RENAME_W],
+    o_free       : output logic                     <core_types::<CFG>::IQ_CNT_W>                ,
+    i_wake       : input  core_types::<CFG>::Wake                                 [core_types::<CFG>::WB_N],
+    i_tok        : input  core_types::<CFG>::TagTok                                                        ,
+    i_wb_ok      : input  logic                     <fu_pkg::WB_OFS_N>            [core_types::<CFG>::iq_port_count(Q)],
+    i_fu_busy    : input  opclass_pkg::FuSet                                      [core_types::<CFG>::iq_port_count(Q)],
+    i_port_hold  : input  logic                                                   [core_types::<CFG>::iq_port_count(Q)],
+    i_load_fence : input  core_types::<CFG>::LoadFence,
+    o_grant      : output core_types::<CFG>::IqGrant   [core_types::<CFG>::iq_port_count(Q)],
+    o_resv       : output fu_pkg::WbSlot               [core_types::<CFG>::iq_port_count(Q)],
+    i_release    : input  core_types::<CFG>::IqRelease [core_types::<CFG>::iq_port_count(Q)],
+    i_kill       : input  core_types::<CFG>::Kill   ,
+    o_perf       : output logic                  <2>, // {nonspec waits for the token, ready op blocked by WB slot}
+    o_chk        : output logic                  <3>, // {release of a non-ISSUED entry, allocation in a kill cycle, op with no port}
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const N   : u32 = CFG::IQ_N[Q];
+    const NSRC: u32 = CFG::IQ_NSRC[Q];
+    const NP  : u32 = iq_port_count(Q);
+    const RW  : u32 = CFG::RENAME_W;
+    const PW  : u32 = tag_pkg::idx_w(NP);
+    const CW  : u32 = tag_pkg::idx_w(N + 1);
+    const KW  : u32 = tag_pkg::idx_w(RW + 1);
+    const AW  : u32 = $bits(IqAlloc);
+
+    const ST_FREE  : logic<2> = 2'd0;
+    const ST_WAIT  : logic<2> = 2'd1;
+    const ST_ISSUED: logic<2> = 2'd2;
+
+    // ---- Hot array ----
+    var st_q     : logic <2>    [N]      ;
+    var port_q   : logic <PW>   [N]      ;
+    var tag_q    : ExTag        [N]      ;
+    var fu_q     : FuKind       [N]      ;
+    var nonspec_q: logic <N>             ;
+    var sen_q    : logic <NSRC> [N]      ;
+    var spr_q    : PReg         [N, NSRC];
+    var srdy_q   : logic <NSRC> [N]      ;
+    var fence_q  : logic <N>             ;
+    var barw_q   : BarSeq       [N]      ;
+    // ---- Cold array ----
+    var cold_q: IqCold [N];
+
+    var free: logic<N>;
+    always_comb {
+        for e in 0..N {
+            free[e] = st_q[e] == ST_FREE;
+        }
+    }
+    assign o_free = tree_popcount::<N, CW>(free) as IQ_CNT_W;
+
+    // ---- Allocation ----
+
+    var lv: logic<RW>;
+    always_comb {
+        for l in 0..RW {
+            lv[l] = i_alloc_valid[l];
+        }
+    }
+
+    // Occupancy per port, for the port choice.
+    var cnt: logic<CW> [NP];
+    always_comb {
+        for i in 0..NP {
+            var m: logic<N>;
+            for e in 0..N {
+                m[e] = st_q[e] != ST_FREE && port_q[e] == i;
+            }
+            cnt[i] = tree_popcount::<N, CW>(m);
+        }
+    }
+
+    // Port choice per lane: least occupied candidate counting the earlier
+    // lanes of this group, lower port on a tie. The lane chain is
+    // O(RENAME_W), the port choice an all-pairs compare.
+    var lane_port: logic<PW> [RW];
+    var no_port  : logic<RW>     ;
+    always_comb {
+        var prior: logic<CW + KW> [NP];
+        for i in 0..NP {
+            prior[i] = 0;
+        }
+        for l in 0..RW {
+            var cand: logic<NP>          ;
+            var load: logic<CW + KW> [NP];
+            var pick: logic<NP>          ;
+            for i in 0..NP {
+                let fs     : FuSet = iq_port_fu(Q, i);
+                cand[i] = fs[i_alloc[l].fu];
+                load[i] = cnt[i] + prior[i];
+            }
+            for i in 0..NP {
+                var win: logic<NP>;
+                for j in 0..NP {
+                    win[j] = j == i || !cand[j] || load[i] <: load[j] || (load[i] == load[j] && i <: j);
+                }
+                pick[i] = cand[i] && &win;
+            }
+            lane_port[l] = tree_onehot_enc::<NP, PW>(pick);
+            no_port[l]   = i_alloc_valid[l] && cand == 0;
+            for i in 0..NP {
+                if lv[l] && pick[i] {
+                    prior[i] = prior[i] + 1;
+                }
+            }
+        }
+    }
+
+    // The k-th valid lane goes to the k-th free entry.
+    var lane_k: logic<KW> [RW];
+    var free_k: logic<CW> [N] ;
+    always_comb {
+        tree_prefix_count::<RW, KW>(lv << 1, lane_k);
+        tree_prefix_count::<N, CW>(free << 1, free_k);
+    }
+    let n_in: logic<KW> = tree_popcount::<RW, KW>(lv);
+
+    var by_k     : IqAlloc     [RW];
+    var by_k_port: logic  <PW> [RW];
+    always_comb {
+        var bits : logic<AW> [RW];
+        var ports: logic<PW> [RW];
+        for l in 0..RW {
+            bits[l]  = i_alloc[l] as AW;
+            ports[l] = lane_port[l];
+        }
+        for k in 0..RW {
+            var oh: logic<RW>;
+            for l in 0..RW {
+                oh[l] = lv[l] && lane_k[l] == k;
+            }
+            by_k[k]      = tree_onehot_mux::<RW, AW>(oh, bits) as IqAlloc;
+            by_k_port[k] = tree_onehot_mux::<RW, PW>(oh, ports);
+        }
+    }
+
+    // Source readiness folds this cycle's wake into the stored bits.
+    function woken (
+        pr: input PReg       ,
+        wk: input Wake [WB_N],
+    ) -> logic {
+        var h: logic<WB_N>;
+        for w in 0..WB_N {
+            h[w] = wk[w].valid && wk[w].pdst == pr;
+        }
+        return |h;
+    }
+
+    // ---- Select ----
+
+    var src_ok: logic<N>            ;
+    var age   : logic<ROB_TAG_W> [N];
+    var tok_ok: logic<N>            ;
+    always_comb {
+        for e in 0..N {
+            var r: logic<NSRC>;
+            for s in 0..NSRC {
+                r[s] = srdy_q[e][s] || !sen_q[e][s];
+            }
+            src_ok[e] = &r;
+            age[e]    = tag_q[e].rob;
+            tok_ok[e] = !nonspec_q[e] || (i_tok.valid && i_tok.tag == tag_q[e].rob);
+        }
+    }
+
+    var gnt_oh : logic<N> [NP];
+    var blk_wb : logic<N> [NP];
+    var blk_tok: logic<N> [NP];
+    always_comb {
+        for i in 0..NP {
+            var req: logic<N>;
+            for e in 0..N {
+                let base         : logic = st_q[e] == ST_WAIT && port_q[e] == i && src_ok[e] && !i_fu_busy[i][fu_q[e]]
+                    && !i_port_hold[i] && !fence_q[e];
+                let wb_ok        : logic = fu_pkg::is_blocking(fu_q[e]) || i_wb_ok[i][fu_pkg::claim_off(fu_q[e])];
+                req[e]        = base && wb_ok && tok_ok[e];
+                blk_wb[i][e]  = base && !wb_ok && tok_ok[e];
+                blk_tok[i][e] = base && !tok_ok[e];
+            }
+            gnt_oh[i] = tree_oldest::<N, ROB_TAG_W>(req, age);
+        }
+    }
+
+    var gnt_ent: logic<IQ_ENT_W> [NP];
+    always_comb {
+        for i in 0..NP {
+            gnt_ent[i] = tree_onehot_enc::<N, IQ_ENT_W>(gnt_oh[i]);
+        }
+    }
+
+    always_comb {
+        for i in 0..NP {
+            let ent             : logic<IQ_ENT_W> = gnt_ent[i];
+            o_grant[i].valid = gnt_oh[i] != 0;
+            o_grant[i].entry = ent;
+            o_grant[i].tag   = tag_q[ent];
+            o_grant[i].fu    = fu_q[ent];
+            o_grant[i].src   = 0;
+            for s in 0..NSRC {
+                o_grant[i].src[s].en = sen_q[ent][s];
+                o_grant[i].src[s].pr = spr_q[ent][s];
+            }
+            o_grant[i].cold = cold_q[ent];
+            o_resv[i].valid = o_grant[i].valid && !fu_pkg::is_blocking(fu_q[ent]);
+            o_resv[i].off   = fu_pkg::claim_off(fu_q[ent]) as fu_pkg::WbOff;
+        }
+    }
+
+    // ---- State update, one write per entry ----
+
+    var granted : logic<N>;
+    var released: logic<N>;
+    always_comb {
+        for e in 0..N {
+            var g: logic<NP>;
+            var r: logic<NP>;
+            for i in 0..NP {
+                g[i] = gnt_oh[i][e];
+                r[i] = i_release[i].valid && i_release[i].entry == e;
+            }
+            granted[e]  = |g;
+            released[e] = |r;
+        }
+    }
+
+    // Entry e takes the free_k[e]-th valid lane.
+    var alloc_e: logic  <N>     ;
+    var new_e  : IqAlloc     [N];
+    var newp_e : logic  <PW> [N];
+    always_comb {
+        for e in 0..N {
+            alloc_e[e] = free[e] && free_k[e] <: n_in;
+            new_e[e]   = by_k[free_k[e]];
+            newp_e[e]  = by_k_port[free_k[e]];
+        }
+    }
+
+    always_ff {
+        if_reset {
+            st_q      = '{default: ST_FREE};
+            nonspec_q = 0;
+            fence_q   = 0;
+        } else {
+            for e in 0..N {
+                if alloc_e[e] {
+                    st_q[e]      = if killed(i_kill, new_e[e].tag.rob) ? ST_FREE : ST_WAIT;
+                    nonspec_q[e] = new_e[e].nonspec;
+                    fence_q[e]   = new_e[e].obey_fence && !(i_load_fence.valid && i_load_fence.seq == new_e[e].bar_w);
+                } else if st_q[e] != ST_FREE && killed(i_kill, tag_q[e].rob) {
+                    st_q[e] = ST_FREE;
+                } else if released[e] {
+                    st_q[e] = ST_FREE;
+                } else if granted[e] {
+                    st_q[e] = ST_ISSUED;
+                }
+                if fence_q[e] && i_load_fence.valid && i_load_fence.seq == barw_q[e] {
+                    fence_q[e] = 1'b0;
+                }
+            }
+        }
+    }
+
+    always_ff {
+        for e in 0..N {
+            if alloc_e[e] {
+                port_q[e] = newp_e[e];
+                tag_q[e]  = new_e[e].tag;
+                fu_q[e]   = new_e[e].fu;
+                barw_q[e] = new_e[e].bar_w;
+                cold_q[e] = new_e[e].cold;
+                for s in 0..NSRC {
+                    sen_q[e][s]  = new_e[e].src[s].en;
+                    spr_q[e][s]  = new_e[e].src[s].pr;
+                    srdy_q[e][s] = new_e[e].rdy[s] || woken(new_e[e].src[s].pr, i_wake);
+                }
+            } else {
+                for s in 0..NSRC {
+                    if woken(spr_q[e][s], i_wake) {
+                        srdy_q[e][s] = 1'b1;
+                    }
+                }
+            }
+        }
+    }
+
+    var bw: logic<NP>;
+    var bt: logic<NP>;
+    always_comb {
+        for i in 0..NP {
+            bw[i] = blk_wb[i] != 0;
+            bt[i] = blk_tok[i] != 0;
+        }
+    }
+    assign o_perf = {|bt, |bw};
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var bad_rel: logic<NP>;
+        always_comb {
+            for i in 0..NP {
+                bad_rel[i] = i_release[i].valid
+                    && (st_q[i_release[i].entry] != ST_ISSUED || port_q[i_release[i].entry] != i);
+            }
+        }
+        var chk_q: logic<3>;
+        always_ff {
+            if_reset {
+                chk_q = 0;
+            } else {
+                if no_port != 0 {
+                    chk_q[0] = 1'b1;
+                }
+                if i_kill.valid && lv != 0 {
+                    chk_q[1] = 1'b1;
+                }
+                if bad_rel != 0 {
+                    chk_q[2] = 1'b1;
+                }
+            }
+        }
+        assign o_chk = chk_q;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

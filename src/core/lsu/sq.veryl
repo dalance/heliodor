@@ -2,9 +2,9 @@
 // the SQ part of the forwarding network, and the push of retired stores
 //
 // Ports (timing contract):
-//   i_alloc[RENAME_W] : per dispatch lane, valid for the stores of the group,
-//                       each with its tag from o_alloc_tag; never valid in a
-//                       kill cycle
+//   i_alloc_valid/i_alloc[RENAME_W] : the stores of the dispatch group,
+//                       compacted in program order; slot i takes the tag
+//                       o_alloc_tag[i]; never valid in a kill cycle
 //   o_free, o_alloc_tag[RENAME_W+1] : registered state only
 //   i_sta[MEM_W], i_std[MEM_W] : m2 of each pipe, written on the edge
 //   i_fwd_q[MEM_W] -> o_fwd[MEM_W] : combinational, against registered entries
@@ -32,7 +32,8 @@ pub module sq::<CFG: core_cfg> (
 
     i_kill: input core_types::<CFG>::Kill,
 
-    i_alloc    : input  core_types::<CFG>::SqAlloc [CFG::RENAME_W]    ,
+    i_alloc_valid: input  logic                      [CFG::RENAME_W]    ,
+    i_alloc      : input  core_types::<CFG>::SqAlloc [CFG::RENAME_W]    ,
     o_free     : output logic<core_types::<CFG>::SQ_CNT_W>             ,
     o_alloc_tag: output core_types::<CFG>::SqTag   [CFG::RENAME_W + 1],
 
@@ -45,8 +46,8 @@ pub module sq::<CFG: core_cfg> (
     o_reissue    : output core_types::<CFG>::MemReissue,
     i_reissue_gnt: input  logic                        ,
 
-    o_win       : output core_types::<CFG>::SqWin  [CFG::MEM_W]               ,
-    i_retire_cnt: input  logic<core_types::<CFG>::ST_CNT_W>                    ,
+    o_win       : output core_types::<CFG>::SqCmWin [CFG::MEM_W]              ,
+    i_retire_cnt: input  logic<core_types::<CFG>::RETIRE_CNT_W>                ,
     o_push      : output core_types::<CFG>::SbPush [core_types::<CFG>::PUSH_W],
     o_head      : output core_types::<CFG>::SqTag                             ,
 
@@ -94,6 +95,7 @@ pub module sq::<CFG: core_cfg> (
     var e_av1  : logic       [QN];
     var e_exc  : logic       [QN];
     var e_io   : logic       [QN];
+    var e_ioord: logic       [QN];
     var e_data : logic<128>  [QN];
     var e_dv   : logic       [QN];
     var e_hrdy : logic       [QN]; // hi-line pass pending
@@ -143,7 +145,7 @@ pub module sq::<CFG: core_cfg> (
     always_comb {
         var v: logic<CFG::RENAME_W>;
         for l in 0..CFG::RENAME_W {
-            v[l] = i_alloc[l].valid;
+            v[l] = i_alloc_valid[l];
         }
         n_alloc = tree_popcount::<CFG::RENAME_W, 32>(v);
     }
@@ -231,18 +233,22 @@ pub module sq::<CFG: core_cfg> (
         let wt : SqTag      = sq_adv(head_q, k);
         let wsh: logic<128> = e_data[wt.idx] >> {e_va[wt.idx][2:0], 3'd0};
         assign w_ix[k]  = wt.idx;
-        assign w_ret[k] = k <: i_retire_cnt;
+        assign w_ret[k] = k <: i_retire_cnt && !e_io[wt.idx];
         assign w_x[k]   = w_ret[k] && e_cross[wt.idx];
         always_comb {
-            o_win[k].valid     = k <: cnt;
-            o_win[k].tag       = wt;
-            o_win[k].retire_ok = e_av0[wt.idx] && e_av1[wt.idx] && e_dv[wt.idx];
-            o_win[k].io        = e_io[wt.idx];
-            o_win[k].split     = e_cross[wt.idx];
-            o_win[k].va        = e_va[wt.idx];
-            o_win[k].pa        = {e_line0[wt.idx], e_va[wt.idx][5:0]};
-            o_win[k].size      = e_op[wt.idx].size;
-            o_win[k].wdata     = wsh[63:0];
+            o_win[k].valid        = k <: cnt;
+            o_win[k].tag          = wt;
+            o_win[k].retire_ok    = e_av0[wt.idx] && e_av1[wt.idx] && e_dv[wt.idx];
+            o_win[k].io_ordered   = e_ioord[wt.idx];
+            o_win[k].lines        = if e_io[wt.idx] ? 2'd0 : if e_cross[wt.idx] ? 2'd2 : 2'd1;
+            o_win[k].obs.size     = {1'b0, e_op[wt.idx].size};
+            o_win[k].obs.vaddr    = e_va[wt.idx];
+            o_win[k].obs.paddr    = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
+            o_win[k].obs.io       = e_io[wt.idx];
+            o_win[k].obs.rmask    = '0;
+            o_win[k].obs.wmask    = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
+            o_win[k].obs.wdata    = wsh[63:0];
+            o_win[k].obs.wdata_hi = '0;
         }
     }
 
@@ -290,6 +296,7 @@ pub module sq::<CFG: core_cfg> (
                 e_dv[e]   = 1'b0;
                 e_exc[e]  = 1'b0;
                 e_io[e]   = 1'b0;
+                e_ioord[e] = 1'b0;
                 e_hrdy[e] = 1'b0;
                 e_cross[e] = 1'b0;
             }
@@ -308,16 +315,17 @@ pub module sq::<CFG: core_cfg> (
                     e_hrdy[e] = 1'b0;
                 }
                 for l in 0..CFG::RENAME_W {
-                    if i_alloc[l].valid && i_alloc[l].tag.idx == e {
-                        e_wrap[e]  = i_alloc[l].tag.wrap;
+                    if i_alloc_valid[l] && o_alloc_tag[l].idx == e {
+                        e_wrap[e]  = o_alloc_tag[l].wrap;
                         e_rob[e]   = i_alloc[l].rob;
                         e_lqlim[e] = i_alloc[l].lq_lim;
-                        e_op[e]    = i_alloc[l].op;
+                        e_op[e]    = mem_op(i_alloc[l].fu, i_alloc[l].uop);
                         e_av0[e]   = 1'b0;
                         e_av1[e]   = 1'b0;
                         e_dv[e]    = 1'b0;
                         e_exc[e]   = 1'b0;
                         e_io[e]    = 1'b0;
+                        e_ioord[e] = 1'b0;
                         e_hrdy[e]  = 1'b0;
                         e_cross[e] = 1'b0;
                     }
@@ -340,6 +348,7 @@ pub module sq::<CFG: core_cfg> (
                             e_av1[e]   = !x || i_sta[p].exc.valid;
                             e_exc[e]   = i_sta[p].exc.valid;
                             e_io[e]    = !i_sta[p].attr.cacheable;
+                            e_ioord[e] = i_sta[p].attr.io_ordered;
                             e_hrdy[e]  = x && !i_sta[p].exc.valid;
                         }
                     }
@@ -382,7 +391,7 @@ pub module sq::<CFG: core_cfg> (
             i_live  : live         ,
             i_rob   : e_rob        ,
             i_hrdy  : e_hrdy       ,
-            i_alloc                ,
+            i_alloc_valid          ,
             i_win_ok: c_ok         ,
             i_ret   : w_ret        ,
             i_gnt   : gnt_oh       ,

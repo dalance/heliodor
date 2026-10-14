@@ -1,0 +1,130 @@
+// flush_ctrl: kill generation and the front-end redirect.
+//
+// Ports (timing contract):
+//   i_wb[WB_N]       : the WB packets; the ports whose exec port has a BRU
+//                      carry the resolves
+//   i_cm_flush       : commit's flush request (full kill), same cycle
+//   i_walk_busy      : rob is presenting a walk batch
+//   o_snap_tag/i_snap: combinational snapshot read of the selected branch
+//   o_rec_set        : the adopted branch; rob sets recovered on this edge
+//   o_kill/o_redirect: registered, valid together, one cycle after the
+//                      decision; at most one kill per cycle
+// Owns:
+//   - a commit request always wins and drops every resolve of the cycle
+//   - among the mispredicted resolves not killed by the current kill, the
+//     oldest (one tag_older tree) becomes the partial kill, unless a kill is
+//     visible or rob is walking; dropped resolves are caught at commit (T8)
+//   - recovered is written on the edge that registers the partial Kill, so
+//     commit never sees recovered without the kill
+// Rationale:
+//   - no partial kill right after a kill: the resolve may belong to an op
+//     that kill already removed, and its rewind targets would be stale
+pub module flush_ctrl::<CFG: core_cfg> (
+    clk        : input  clock                                                                                 ,
+    rst        : input  reset                                                                                 ,
+    i_wb       : input  core_types::<CFG>::WbPacket                                  [core_types::<CFG>::WB_N],
+    i_cm_flush : input  core_types::<CFG>::CmFlush                                                            ,
+    i_walk_busy: input  logic                                                                                 ,
+    o_snap_tag : output core_types::<CFG>::RobTag                                                             ,
+    i_snap     : input  core_types::<CFG>::DispSnap                                                           ,
+    o_rec_set  : output core_types::<CFG>::TagTok                                                             ,
+    o_kill     : output core_types::<CFG>::Kill                                                               ,
+    o_redirect : output core_types::<CFG>::Redirect                                                           ,
+    o_perf     : output core_types::<CFG>::FlushPerf                                                          ,
+    o_chk      : output logic                       <core_types::<CFG>::CHK_FLUSH_W>                          ,
+) {
+    import core_types::<CFG>::*;
+
+    const BR_W: u32 = $bits(BrResolve);
+
+    var kill_q : Kill     ;
+    var redir_q: Redirect ;
+    var perf_q : FlushPerf;
+
+    // Candidates are indexed by WB port; ports without a BRU are constant 0.
+    var cv: logic<WB_N>            ;
+    var ct: logic<ROB_TAG_W> [WB_N];
+    var cb: logic<BR_W>      [WB_N];
+    always_comb {
+        for p in 0..WB_N {
+            cv[p] = wb_has_bru(p) && i_wb[p].valid && i_wb[p].br.valid && i_wb[p].br.mispred
+                && !killed(kill_q, i_wb[p].tag.rob);
+            ct[p] = i_wb[p].tag.rob;
+            cb[p] = i_wb[p].br;
+        }
+    }
+
+    let sel  : logic    <WB_N> = tree_oldest::<WB_N, ROB_TAG_W>(cv, ct);
+    let any  : logic           = |cv;
+    let s_tag: RobTag          = tree_onehot_mux::<WB_N, ROB_TAG_W>(sel, ct) as RobTag;
+    let s_br : BrResolve       = tree_onehot_mux::<WB_N, BR_W>(sel, cb) as BrResolve;
+    let adopt: logic           = any && !i_cm_flush.valid && !kill_q.valid && !i_walk_busy;
+
+    assign o_snap_tag = s_tag;
+    always_comb {
+        o_rec_set.valid = adopt;
+        o_rec_set.tag   = s_tag;
+    }
+
+    always_ff {
+        if_reset {
+            kill_q  = 0;
+            redir_q = 0;
+            perf_q  = 0;
+        } else {
+            kill_q  = 0;
+            redir_q = 0;
+            if i_cm_flush.valid {
+                kill_q.valid     = 1'b1;
+                kill_q.full      = 1'b1;
+                redir_q.valid    = 1'b1;
+                redir_q.pc       = i_cm_flush.pc;
+                redir_q.kind     = i_cm_flush.kind;
+                redir_q.ftq_keep = i_cm_flush.ftq;
+                redir_q.foff     = i_cm_flush.foff;
+                redir_q.taken    = i_cm_flush.taken;
+            } else if adopt {
+                kill_q.valid     = 1'b1;
+                kill_q.keep      = s_tag;
+                kill_q.lq_tail   = i_snap.lq_tail;
+                kill_q.sq_tail   = i_snap.sq_tail;
+                kill_q.fl_int    = i_snap.fl_int;
+                kill_q.fl_fp     = i_snap.fl_fp;
+                kill_q.bar_seq   = i_snap.bar_seq;
+                kill_q.ftq_tail  = ftq_next(s_br.ftq);
+                redir_q.valid    = 1'b1;
+                redir_q.pc       = s_br.next_pc;
+                redir_q.ftq_keep = s_br.ftq;
+                redir_q.foff     = s_br.foff;
+                redir_q.taken    = s_br.taken;
+                redir_q.kind     = RedirKind::BR;
+            }
+
+            perf_q.partial     = adopt;
+            perf_q.drop_walk   = any && !i_cm_flush.valid && !kill_q.valid && i_walk_busy;
+            perf_q.drop_consec = any && !i_cm_flush.valid && kill_q.valid;
+            perf_q.drop_full   = any && i_cm_flush.valid;
+            perf_q.drop_older  = (cv & ~sel) != 0;
+            perf_q.full        = i_cm_flush.valid;
+            perf_q.full_kind   = i_cm_flush.kind;
+        }
+    }
+
+    assign o_kill     = kill_q;
+    assign o_redirect = redir_q;
+    assign o_perf     = perf_q;
+
+    #[ifdef(HELIODOR_CHK)]
+    inst u_chk: chk_flush::<CFG> (
+        clk                ,
+        rst                ,
+        i_wb               ,
+        i_adopt   : adopt  ,
+        i_cm_flush         ,
+        i_kill    : kill_q ,
+        i_redirect: redir_q,
+        o_chk              ,
+    );
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}
