@@ -2478,7 +2478,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 
 ### C.9 旧コアの仕様逸脱と allow-list (D4)
 
-新コアはアーキテクチャ的に正しく作り、golden との差は検証計画 (`doc/phase15_verification_plan.md`) 付録 B の許容差異表で吸収する。【決定】allow-list の語彙と行番号は検証計画付録 B のものを唯一の正本とし、本節は付録 B の行番号 (B01-B45) で参照する。本節が決めるのは新コア側の挙動だけである。扱いの語彙 (REPLAY、NORM、MASK:<tag>、EXCL:<tag>、STOP:<tag>、OUT、SAME) の意味も付録 B に従う。理由: 2 か所でタグ名を持つと、書式だけでなく扱いの意味まで分かれる。「推定」の行は M2 の前に golden 上の directed test で確かめる (D4)。本表は commit・trap・CSR の範囲に限る。misaligned や fetch の straddle などは §L, §M, §F の表にある。
+新コアはアーキテクチャ的に正しく作り、golden との差は検証計画 (`doc/phase15_verification_plan.md`) 付録 B の許容差異表で吸収する。【決定】allow-list の語彙と行番号は検証計画付録 B のものを唯一の正本とし、本節は付録 B の行番号 (B01-B47) で参照する。本節が決めるのは新コア側の挙動だけである。扱いの語彙 (REPLAY、NORM、MASK:<tag>、EXCL:<tag>、STOP:<tag>、OUT、SAME) の意味も付録 B に従う。理由: 2 か所でタグ名を持つと、書式だけでなく扱いの意味まで分かれる。「推定」の行は M2 の前に golden 上の directed test で確かめる (D4)。本表は commit・trap・CSR の範囲に限る。misaligned や fetch の straddle などは §L, §M, §F の表にある。
 
 | # | 旧コアの逸脱 (根拠) | 新コア | 付録 B の行と扱い |
 |---|---|---|---|
