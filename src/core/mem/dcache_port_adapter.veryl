@@ -1,12 +1,17 @@
 // dcache_port_adapter: puts MEM_W logical memory ports on the single
 // physical path of the reused dcache, with the final request/response/event
-// types of the memory port contract. It serves the LOAD class of the LQ
-// client only (the only class the memory pipes send in this build).
+// types of the memory port contract. It serves the fold group: LOAD from
+// the memory pipes and PTW_READ from the walkers. STORE_WT (the walkers' A/D
+// writes) is not served: this build runs the walkers with ADUE = 0.
 //
 // Ports (timing contract):
 //   i_req_valid[p], i_req[p] : cycle A; o_req_ready is the constant 1. A
 //                     request that does not get the physical path this cycle
 //                     is answered RETRY(BANK_CONFLICT)
+//   i_np_valid[k], i_np_req[k] : cycle A, the non-pipe client k on port 0
+//                     (pipe 0's slot is empty that cycle, mem_port_arb
+//                     reserved it); it takes port 0's place and is answered
+//                     on o_resp[0], which clients filter by MemTag.client
 //   o_resp[p]       : registered, exactly RESP_LAT = 2 cycles after A, one per
 //                     request
 //   o_evt           : registered, one cycle after the dcache state it reports,
@@ -15,7 +20,8 @@
 //   o_dc_*          : the dcache main port and its Stage-A fold read
 //   i_dc_*          : dcache outputs of this cycle (decision inputs)
 //   i_inv*, i_ev*   : remote invalidates and local departures of this cycle
-//   i_kill          : applied to the held request by its MemTag.rob
+//   i_kill          : applied to the held request by its MemTag.rob when
+//                     rob_v (a walker's request is never killed)
 //   o_perf          : combinational event wires
 //   o_chk           : sticky checker flags (HELIODOR_CHK only, else 0)
 // Owns:
@@ -49,18 +55,21 @@
 //   - a 2-dword load folds like a 1-dword one: both dwords come from the same
 //     registered line
 //   - of two simultaneous requests the older op wins, so the machine's
-//     oldest load never loses a conflict
+//     oldest load never loses a conflict; a non-pipe request on port 0 wins
+//     over the other ports, since its slot was reserved a cycle ahead
 pub module dcache_port_adapter::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
 
     i_kill: input core_types::<CFG>::Kill,
 
-    i_req_valid   : input  logic                        [CFG::MEM_W],
-    i_req         : input  core_types::<CFG>::MemReq    [CFG::MEM_W],
-    o_req_ready   : output logic                        [CFG::MEM_W],
-    o_resp        : output core_types::<CFG>::MemResp   [CFG::MEM_W],
-    o_evt         : output core_types::<CFG>::MemEvent              ,
+    i_req_valid: input  logic                        [CFG::MEM_W]             ,
+    i_req      : input  core_types::<CFG>::MemReq    [CFG::MEM_W]             ,
+    i_np_valid : input  logic                        [core_types::<CFG>::NP_N],
+    i_np_req   : input  core_types::<CFG>::MemReq    [core_types::<CFG>::NP_N],
+    o_req_ready: output logic                        [CFG::MEM_W]             ,
+    o_resp     : output core_types::<CFG>::MemResp   [CFG::MEM_W]             ,
+    o_evt      : output core_types::<CFG>::MemEvent                           ,
 
     o_dc_addr      : output logic<64>,
     o_dc_ren       : output logic    ,
@@ -123,7 +132,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     let s_line: logic<50> = slot_q.pa[55:6];
     let s_dw  : logic<3>  = slot_q.pa[5:3];
     let s_1dw : logic     = slot_q.mask[15:8] == 8'd0;
-    let s_kill: logic     = slot_v_q && killed(i_kill, slot_q.tag.rob);
+    let s_kill: logic     = slot_v_q && slot_q.tag.rob_v && killed(i_kill, slot_q.tag.rob);
     let st    : dcache_pkg::StallTerms = i_dc_stall_terms;
     let f_mine: logic     = i_dc_fill_line[49:0] == s_line;
     let hit   : logic     = !i_dc_stall && i_dc_data_valid;
@@ -145,36 +154,47 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
 
     // ---- acceptance at A ----
 
+    const REQ_W: u32 = $bits(MemReq);
+
+    var np_oh: logic<NP_N>          ;
+    var np_r : logic<REQ_W> [NP_N]  ;
+    always_comb {
+        for k in 0..NP_N {
+            np_oh[k] = i_np_valid[k];
+            np_r[k]  = i_np_req[k];
+        }
+    }
+    let np_v  : logic  = np_oh != '0;
+    let np_req: MemReq = tree_onehot_mux::<NP_N, REQ_W>(np_oh, np_r) as MemReq;
+
+    // The logical ports after the non-pipe request took port 0's place.
+    var e_valid: logic  [CFG::MEM_W];
+    var e_req  : MemReq [CFG::MEM_W];
+    always_comb {
+        for p in 0..CFG::MEM_W {
+            e_valid[p] = i_req_valid[p] || (p == 0 && np_v);
+            e_req[p]   = if p == 0 && np_v ? np_req : i_req[p];
+        }
+    }
+
     var cand  : logic<CFG::MEM_W>                    ;
     var rtags : logic<ROB_TAG_W>       [CFG::MEM_W]  ;
     var r_line: logic<50>              [CFG::MEM_W]  ;
-    var r_pa  : pma_pkg::Pa            [CFG::MEM_W]  ;
-    var r_mask: logic<16>              [CFG::MEM_W]  ;
-    var r_id  : logic<MEMID_W>         [CFG::MEM_W]  ;
+    var r_req : logic<REQ_W>           [CFG::MEM_W]  ;
     always_comb {
         for p in 0..CFG::MEM_W {
-            cand[p]   = i_req_valid[p];
-            rtags[p]  = {i_req[p].tag.rob.wrap, i_req[p].tag.rob.idx};
-            r_line[p] = i_req[p].pa[55:6];
-            r_pa[p]   = i_req[p].pa;
-            r_mask[p] = i_req[p].mask;
-            r_id[p]   = i_req[p].tag.id;
+            cand[p]   = e_valid[p];
+            rtags[p]  = {e_req[p].tag.rob.wrap, e_req[p].tag.rob.idx};
+            r_line[p] = e_req[p].pa[55:6];
+            r_req[p]  = e_req[p];
         }
     }
-    let win_oh: logic<CFG::MEM_W>  = tree_oldest::<CFG::MEM_W, ROB_TAG_W>(cand, rtags);
+    let win_oh: logic<CFG::MEM_W>  = if np_v ? 1 as CFG::MEM_W : tree_oldest::<CFG::MEM_W, ROB_TAG_W>(cand, rtags);
     let acc   : logic              = s_free && cand != '0;
     let w_port: logic<PW>          = tree_onehot_enc::<CFG::MEM_W, PW>(win_oh);
     let w_line: logic<50>          = tree_onehot_mux::<CFG::MEM_W, 50>(win_oh, r_line);
-    let w_pa  : pma_pkg::Pa        = tree_onehot_mux::<CFG::MEM_W, 56>(win_oh, r_pa);
-    let w_mask: logic<16>          = tree_onehot_mux::<CFG::MEM_W, 16>(win_oh, r_mask);
-    let w_rob : logic<ROB_TAG_W>   = tree_onehot_mux::<CFG::MEM_W, ROB_TAG_W>(win_oh, rtags);
-    var w_tag : MemTag             ;
-    always_comb {
-        w_tag.client   = MemClient::LQ;
-        w_tag.id       = tree_onehot_mux::<CFG::MEM_W, MEMID_W>(win_oh, r_id);
-        w_tag.rob.wrap = w_rob[ROB_TAG_W - 1];
-        w_tag.rob.idx  = w_rob[ROB_TAG_W - 2:0];
-    }
+    let w_req : MemReq             = tree_onehot_mux::<CFG::MEM_W, REQ_W>(win_oh, r_req) as MemReq;
+    let w_pa  : pma_pkg::Pa        = w_req.pa;
     let race_a: logic              = (i_inv_v && i_inv_addr[55:6] == w_line) || (i_inv2_v && i_inv2_addr[55:6] == w_line)
         || (i_ev1_v && i_ev1_addr[55:6] == w_line) || (i_ev2_v && i_ev2_addr[55:6] == w_line);
 
@@ -278,8 +298,8 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
                 if at_v && slot_port_q == p {
                     resp_q[p] = v_resp;
                 }
-                rej_q[p]     = i_req_valid[p] && !(acc && win_oh[p]);
-                rej_tag_q[p] = i_req[p].tag;
+                rej_q[p]     = e_valid[p] && !(acc && win_oh[p]);
+                rej_tag_q[p] = e_req[p].tag;
             }
 
             if acc {
@@ -287,10 +307,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
                 slot_first_q = 1'b1;
                 slot_race_q  = race_a;
                 slot_miss_q  = 1'b0;
-                slot_q.tag   = w_tag;
-                slot_q.cls   = MemCls::LOAD;
-                slot_q.pa    = w_pa;
-                slot_q.mask  = w_mask;
+                slot_q       = w_req;
                 slot_port_q  = w_port;
             } else if slot_v_q && !s_free {
                 slot_first_q = 1'b0;
@@ -309,7 +326,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     always_comb {
         var bank: logic<CFG::MEM_W>;
         for p in 0..CFG::MEM_W {
-            bank[p] = i_req_valid[p] && !(acc && win_oh[p]);
+            bank[p] = e_valid[p] && !(acc && win_oh[p]);
         }
         o_perf.accept      = acc;
         o_perf.b2b         = acc && at_v;
@@ -331,8 +348,8 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
         inst u_chk: chk_mem_port::<CFG> (
             clk                                         ,
             rst                                         ,
-            i_req_valid                                 ,
-            i_req                                       ,
+            i_req_valid : e_valid                       ,
+            i_req       : e_req                         ,
             i_resp      : resp_q                        ,
             i_ev_src    : c_src                         ,
             i_miss_hit  : empty_gen && slot_miss_q      ,

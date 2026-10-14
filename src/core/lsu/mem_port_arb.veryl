@@ -1,29 +1,39 @@
 // mem_port_arb: assigns the next m0 slot of each memory pipe to a requester
-// class (NEW = memory IQ select, LQ and SQ = re-issue), and drives the
-// pipe's WB slot reservation.
+// class (NEW = memory IQ select, LQ and SQ = re-issue, NP = a non-pipe
+// client of port 0), and drives the pipe's WB slot reservation.
 //
 // Ports (timing contract):
 //   i_wb_ok[p]    : wb_resv of pipe p: the WB slot a pass entering m0 next
 //                   cycle would use is free
 //   i_lq_re, i_sq_re : registered re-issue requests (one each)
 //   i_iq_resv[p]  : the memory IQ's reservation for pipe p this cycle
-//   o_port_hold[p], o_re[p], o_lq_gnt, o_sq_gnt : this cycle, combinational
-//                   from the registered inputs only; a held pipe gets o_re[p]
-//                   instead of an IQ select, captured into m0 on the edge
+//   i_np_req[k]   : non-pipe client k requests port 0, from its registered
+//                   state
+//   o_port_hold[p], o_re[p], o_lq_gnt, o_sq_gnt, o_np_gnt[k] : this cycle t,
+//                   combinational from the registered inputs only; a held
+//                   pipe gets o_re[p] or an NP token instead of an IQ select,
+//                   captured into m0 on the edge
+//   o_np_slot[k]  : registered, client k's token is in m2 = A (t + 3): the
+//                   pipe 0 slot is empty and the client's request is
+//                   presented on port 0 this cycle
 //   o_resv[p]     : to wb_resv of pipe p: the re-issue's claim of the slot a
-//                   pass entering m0 next cycle uses, else i_iq_resv[p]
+//                   pass entering m0 next cycle uses, none for an NP token,
+//                   else i_iq_resv[p]
 //   o_perf        : combinational event wires
 // Owns:
 //   - a request is granted on at most one pipe, and a pipe gets at most one
 //     requester per cycle
 //   - no starvation: classes are served round-robin per pipe, so a waiting
-//     class is served within B = 2 slots of its pipe (classes - 1)
+//     class is served within B = 3 slots of its pipe (classes - 1); the NP
+//     clients take turns among themselves the same way
 // Rationale:
 //   - no class has absolute priority; the IQ's NEW requests are not starved
 //     by a stream of re-issues and vice versa
 //   - NEW always requests: whether the IQ will select for the pipe is known
 //     only in the select cycle itself. A turn of NEW with nothing to select
 //     costs a waiting re-issue one slot
+//   - the NP token travels m0 -> m2 here rather than in the pipe, so the pipe
+//     only sees an empty slot, and its response on port 0 belongs to no pass
 //   - the pipes are visited in order (pipe p sees which re-issues lower pipes
 //     took), a serial dependency of the greedy assignment over MEM_W <= 2
 //     pipes, exempt from the tree rule
@@ -31,16 +41,19 @@ pub module mem_port_arb::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
 
-    i_wb_ok  : input logic                          [CFG::MEM_W],
-    i_lq_re  : input core_types::<CFG>::MemReissue              ,
-    i_sq_re  : input core_types::<CFG>::MemReissue              ,
-    i_iq_resv: input fu_pkg::WbSlot                 [CFG::MEM_W],
+    i_wb_ok  : input logic                          [CFG::MEM_W]             ,
+    i_lq_re  : input core_types::<CFG>::MemReissue                           ,
+    i_sq_re  : input core_types::<CFG>::MemReissue                           ,
+    i_iq_resv: input fu_pkg::WbSlot                 [CFG::MEM_W]             ,
+    i_np_req : input logic                          [core_types::<CFG>::NP_N],
 
-    o_port_hold: output logic                           [CFG::MEM_W],
-    o_re       : output core_types::<CFG>::MemReissue   [CFG::MEM_W],
-    o_resv     : output fu_pkg::WbSlot                  [CFG::MEM_W],
-    o_lq_gnt   : output logic                                       ,
-    o_sq_gnt   : output logic                                       ,
+    o_port_hold: output logic                           [CFG::MEM_W]             ,
+    o_re       : output core_types::<CFG>::MemReissue   [CFG::MEM_W]             ,
+    o_resv     : output fu_pkg::WbSlot                  [CFG::MEM_W]             ,
+    o_lq_gnt   : output logic                                                    ,
+    o_sq_gnt   : output logic                                                    ,
+    o_np_gnt   : output logic                           [core_types::<CFG>::NP_N],
+    o_np_slot  : output logic                           [core_types::<CFG>::NP_N],
 
     o_perf: output core_types::<CFG>::ArbPerf,
 ) {
@@ -50,37 +63,47 @@ pub module mem_port_arb::<CFG: core_cfg> (
     // WB slot a memory-pipe pass claims when it enters m0 the next cycle.
     const CLAIM: fu_pkg::WbSlot = fu_pkg::WbSlot'{valid: 1'b1, off: fu_pkg::claim_off(FuKind::LOAD) as fu_pkg::WbOff};
 
-    // Class order of the round-robin: 0 = NEW, 1 = LQ, 2 = SQ.
-    var rr_q : logic<2> [CFG::MEM_W];
-    var win  : logic<3> [CFG::MEM_W]; // one-hot over the classes
-    var lq_by: logic<CFG::MEM_W + 1>; // granted on a lower pipe
-    var sq_by: logic<CFG::MEM_W + 1>;
+    // Classes, in round-robin order: 0 NEW, 1 LQ, 2 SQ, 3 NP.
+    const NC: u32 = 4;
+
+    var rr_q  : logic<NC>   [CFG::MEM_W]; // one-hot: the class served first
+    var win   : logic<NC>   [CFG::MEM_W]; // one-hot over the classes
+    var lq_by : logic<CFG::MEM_W + 1>   ; // granted on a lower pipe
+    var sq_by : logic<CFG::MEM_W + 1>   ;
+    var np_rr : logic<NP_N>             ; // one-hot: the NP client served first
+    var tok_q : logic<NP_N> [3]         ; // the NP token in m0, m1, m2
+
+    var np_r: logic<NP_N>;
+    always_comb {
+        for k in 0..NP_N {
+            np_r[k] = i_np_req[k];
+        }
+    }
+    let np_hi : logic<NP_N> = np_r & ~(np_rr - 1);
+    let np_sel: logic<NP_N> = if np_hi != '0 ? tree_first::<NP_N>(np_hi) : tree_first::<NP_N>(np_r);
 
     always_comb {
         lq_by[0] = 1'b0;
         sq_by[0] = 1'b0;
         for p in 0..CFG::MEM_W {
-            let r : logic<3> = {i_sq_re.valid && i_wb_ok[p] && !sq_by[p], i_lq_re.valid && i_wb_ok[p] && !lq_by[p], 1'b1};
-            // rotate so that the class at rr_q comes first
-            let rot: logic<3> = case rr_q[p] {
-                2'd1   : {r[0], r[2], r[1]},
-                2'd2   : {r[1], r[0], r[2]},
-                default: r,
-            };
-            let f  : logic<3> = tree_first::<3>(rot);
-            win[p] = case rr_q[p] {
-                2'd1   : {f[1], f[0], f[2]},
-                2'd2   : {f[0], f[2], f[1]},
-                default: f,
-            };
+            var r : logic<NC>;
+            var hi: logic<NC>;
+            r[0] = 1'b1;
+            r[1] = i_lq_re.valid && i_wb_ok[p] && !lq_by[p];
+            r[2] = i_sq_re.valid && i_wb_ok[p] && !sq_by[p];
+            r[3] = p == 0 && np_r != '0;
+            // the requests at or after the round-robin pointer come first
+            hi           = r & ~(rr_q[p] - 1);
+            win[p]       = if hi != '0 ? tree_first::<NC>(hi) : tree_first::<NC>(r);
             lq_by[p + 1] = lq_by[p] || win[p][1];
             sq_by[p + 1] = sq_by[p] || win[p][2];
         }
     }
+    let np_win: logic<NP_N> = if win[0][3] ? np_sel : '0;
 
     for p in 0..CFG::MEM_W :g_port {
-        assign o_port_hold[p] = win[p][1] || win[p][2];
-        assign o_resv[p]      = if win[p][1] || win[p][2] ? CLAIM : i_iq_resv[p];
+        assign o_port_hold[p] = win[p][1] || win[p][2] || win[p][3];
+        assign o_resv[p]      = if win[p][1] || win[p][2] ? CLAIM : if win[p][3] ? 0 as fu_pkg::WbSlot : i_iq_resv[p];
         always_comb {
             o_re[p]       = if win[p][2] ? i_sq_re : i_lq_re;
             o_re[p].valid = win[p][1] || win[p][2];
@@ -88,15 +111,30 @@ pub module mem_port_arb::<CFG: core_cfg> (
     }
     assign o_lq_gnt = lq_by[CFG::MEM_W];
     assign o_sq_gnt = sq_by[CFG::MEM_W];
+    for k in 0..NP_N :g_np {
+        assign o_np_gnt[k]  = np_win[k];
+        assign o_np_slot[k] = tok_q[2][k];
+    }
 
     always_ff {
         if_reset {
+            np_rr = 1 as NP_N;
+            for i in 0..3 {
+                tok_q[i] = '0;
+            }
             for p in 0..CFG::MEM_W {
-                rr_q[p] = 2'd0;
+                rr_q[p] = 1 as NC;
             }
         } else {
+            tok_q[0] = np_win;
+            tok_q[1] = tok_q[0];
+            tok_q[2] = tok_q[1];
+            if np_win != '0 {
+                np_rr = {np_win[NP_N - 2:0], np_win[NP_N - 1]};
+            }
             for p in 0..CFG::MEM_W {
-                rr_q[p] = if win[p][0] ? 2'd1 : if win[p][1] ? 2'd2 : 2'd0;
+                // the class after the winner comes first next time
+                rr_q[p] = {win[p][NC - 2:0], win[p][NC - 1]};
             }
         }
     }
@@ -104,4 +142,5 @@ pub module mem_port_arb::<CFG: core_cfg> (
     assign o_perf.lq_win = o_lq_gnt;
     assign o_perf.sq_win = o_sq_gnt;
     assign o_perf.lq_blk = i_lq_re.valid && !o_lq_gnt;
+    assign o_perf.np_win = np_win != '0;
 }

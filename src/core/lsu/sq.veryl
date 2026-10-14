@@ -8,8 +8,14 @@
 //   o_free, o_alloc_tag[RENAME_W+1] : registered state only
 //   i_sta[MEM_W], i_std[MEM_W] : m2 of each pipe, written on the edge
 //   i_fwd_q[MEM_W] -> o_fwd[MEM_W] : combinational, against registered entries
-//   o_reissue         : registered; the oldest store whose hi-line pass is
-//                       pending; i_reissue_gnt in the same cycle takes it
+//   o_reissue         : registered; the oldest store with a pass to re-run
+//                       (the hi-line pass of a crossing store, or a pass whose
+//                       walk ended); i_reissue_gnt in the same cycle takes it
+//   i_ptw_evt         : the walker's broadcast; wakes an entry parked on the
+//                       page of its pending pass, also in the cycle of the
+//                       STA write that parks it
+//   i_ptw_resp        : the D walker's owner answer; a fault for a live
+//                       store is kept with the entry and rides its re-issue
 //   o_win[MEM_W]      : from registered state, the MEM_W oldest entries;
 //                       commit selects by tag equality
 //   i_retire_cnt      : stores retired this cycle (the first entries of
@@ -49,6 +55,9 @@ pub module sq::<CFG: core_cfg> (
 
     i_sta: input core_types::<CFG>::StaWrite [CFG::MEM_W],
     i_std: input core_types::<CFG>::StdWrite [CFG::MEM_W],
+
+    i_ptw_evt : input core_types::<CFG>::PtwEvent ,
+    i_ptw_resp: input core_types::<CFG>::XlateResp,
 
     i_fwd_q: input  core_types::<CFG>::FwdQuery [CFG::MEM_W],
     o_fwd  : output core_types::<CFG>::FwdPart  [CFG::MEM_W],
@@ -104,7 +113,10 @@ pub module sq::<CFG: core_cfg> (
     var e_exc  : logic       [QN];
     var e_data : logic<128>  [QN];
     var e_dv   : logic       [QN];
-    var e_hrdy : logic       [QN]; // hi-line pass pending
+    var e_rdy  : logic       [QN]; // a pass waits for re-issue
+    var e_rhalf: logic       [QN]; // that pass is the hi line
+    var e_xw   : logic       [QN]; // parked on the walk of that pass's page
+    var e_xexc : exc_pkg::ExcRec [QN]; // fault of that pass's walk
 
     var rsel_v_q: logic    ;
     var rsel_q  : logic<QIW>;
@@ -204,14 +216,23 @@ pub module sq::<CFG: core_cfg> (
         }
     }
 
-    // ---- hi-pass re-issue ----
+    // ---- re-issue ----
+
+    var xwake: logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            let pva: logic<64> = if e_rhalf[e] ? {e_va[e][63:6] + 58'd1, 6'd0} : e_va[e];
+            xwake[e] = e_xw[e] && i_ptw_evt.valid && i_ptw_evt.key.vpn == pva[38:12]
+                && i_ptw_evt.key.regime == xlate_pkg::Regime::V0;
+        }
+    }
 
     var gnt_oh: logic<QN>;
     var ready : logic<QN>;
     always_comb {
         for e in 0..QN {
             gnt_oh[e] = i_reissue_gnt && rsel_v_q && rsel_q == e;
-            ready[e]  = live[e] && e_hrdy[e] && !gnt_oh[e];
+            ready[e]  = live[e] && e_rdy[e] && !gnt_oh[e];
         }
     }
     let sel_oh: logic<QN>  = tree_oldest::<QN, SQ_TAG_W>(ready, tags);
@@ -224,7 +245,8 @@ pub module sq::<CFG: core_cfg> (
         o_reissue.tag.has_rd  = 1'b0;
         o_reissue.op          = e_op[rsel_q];
         o_reissue.va          = e_va[rsel_q];
-        o_reissue.half        = 1'b1;
+        o_reissue.half        = e_rhalf[rsel_q];
+        o_reissue.xexc        = e_xexc[rsel_q];
         o_reissue.lq          = e_lqlim[rsel_q];
         o_reissue.sq.wrap     = e_wrap[rsel_q];
         o_reissue.sq.idx      = rsel_q;
@@ -298,8 +320,10 @@ pub module sq::<CFG: core_cfg> (
                 e_av1[e]  = 1'b0;
                 e_dv[e]   = 1'b0;
                 e_exc[e]  = 1'b0;
-                e_hrdy[e] = 1'b0;
+                e_rdy[e]  = 1'b0;
+                e_xw[e]   = 1'b0;
                 e_cross[e] = 1'b0;
+                e_xexc[e] = 0 as exc_pkg::ExcRec;
             }
         } else {
             head_q = head_nx;
@@ -313,7 +337,11 @@ pub module sq::<CFG: core_cfg> (
 
             for e in 0..QN {
                 if gnt_oh[e] {
-                    e_hrdy[e] = 1'b0;
+                    e_rdy[e] = 1'b0;
+                }
+                if xwake[e] {
+                    e_xw[e]  = 1'b0;
+                    e_rdy[e] = 1'b1;
                 }
                 for l in 0..CFG::RENAME_W {
                     if i_alloc_valid[l] && o_alloc_tag[l].idx == e {
@@ -325,17 +353,30 @@ pub module sq::<CFG: core_cfg> (
                         e_av1[e]   = 1'b0;
                         e_dv[e]    = 1'b0;
                         e_exc[e]   = 1'b0;
-                        e_hrdy[e]  = 1'b0;
+                        e_rdy[e]   = 1'b0;
+                        e_xw[e]    = 1'b0;
                         e_cross[e] = 1'b0;
+                        e_xexc[e]  = 0 as exc_pkg::ExcRec;
                     }
                 }
                 for p in 0..CFG::MEM_W {
-                    if i_sta[p].valid && i_sta[p].sq.idx == e {
+                    if i_sta[p].valid && i_sta[p].sq.idx == e && i_sta[p].xmiss {
+                        // An event of this cycle counts as after the write.
+                        let pva: logic<64> = if i_sta[p].half ? {i_sta[p].va[63:6] + 58'd1, 6'd0} : i_sta[p].va;
+                        let now: logic     = i_ptw_evt.valid && i_ptw_evt.key.vpn == pva[38:12]
+                            && i_ptw_evt.key.regime == xlate_pkg::Regime::V0;
+                        e_va[e]    = i_sta[p].va;
+                        e_rhalf[e] = i_sta[p].half;
+                        e_xw[e]    = i_sta[p].xpark && !now;
+                        e_rdy[e]   = !i_sta[p].xpark || now;
+                        e_xexc[e]  = 0 as exc_pkg::ExcRec;
+                    } else if i_sta[p].valid && i_sta[p].sq.idx == e {
+                        e_xexc[e] = 0 as exc_pkg::ExcRec;
                         if i_sta[p].half {
                             e_line1[e] = i_sta[p].line;
                             e_av1[e]   = 1'b1;
                             e_exc[e]   = e_exc[e] || i_sta[p].exc.valid;
-                            e_hrdy[e]  = 1'b0;
+                            e_rdy[e]   = 1'b0;
                         } else {
                             let x: logic = i_sta[p].dw == 3'd7 && i_sta[p].mask[15:8] != 8'd0;
                             e_line0[e] = i_sta[p].line;
@@ -346,13 +387,19 @@ pub module sq::<CFG: core_cfg> (
                             e_av0[e]   = 1'b1;
                             e_av1[e]   = !x || i_sta[p].exc.valid;
                             e_exc[e]   = i_sta[p].exc.valid;
-                            e_hrdy[e]  = x && !i_sta[p].exc.valid;
+                            e_rdy[e]   = x && !i_sta[p].exc.valid;
+                            e_rhalf[e] = 1'b1;
                         }
                     }
                     if i_std[p].valid && i_std[p].sq.idx == e {
                         e_data[e] = i_std[p].data;
                         e_dv[e]   = 1'b1;
                     }
+                }
+                if i_ptw_resp.valid && i_ptw_resp.exc.valid && i_ptw_resp.tag.client == MemClient::SQ
+                    && i_ptw_resp.tag.id == {e_wrap[e], e as QIW} as MEMID_W && i_ptw_resp.tag.rob == e_rob[e]
+                    && live[e] {
+                    e_xexc[e] = i_ptw_resp.exc;
                 }
             }
         }
@@ -361,11 +408,14 @@ pub module sq::<CFG: core_cfg> (
     always_comb {
         var w: logic<CFG::MEM_W>;
         var s: logic<CFG::MEM_W>;
+        var x: logic<CFG::MEM_W>;
         for p in 0..CFG::MEM_W {
             w[p] = i_fwd_q[p].valid && o_fwd[p].wt;
-            s[p] = i_sta[p].valid;
+            s[p] = i_sta[p].valid && !i_sta[p].xmiss;
+            x[p] = i_sta[p].valid && i_sta[p].xpark;
         }
         o_perf.sta      = |s;
+        o_perf.xpark    = |x;
         o_perf.reissue  = i_reissue_gnt && rsel_v_q;
         o_perf.retire   = i_retire_cnt != '0;
         o_perf.fwd_wait = |w;
@@ -385,7 +435,7 @@ pub module sq::<CFG: core_cfg> (
             i_kill                 ,
             i_live  : live         ,
             i_rob   : e_rob        ,
-            i_hrdy  : e_hrdy       ,
+            i_hrdy  : e_rdy        ,
             i_alloc_valid          ,
             i_win_ok: c_ok         ,
             i_ret   : w_ret        ,

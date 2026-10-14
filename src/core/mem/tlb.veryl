@@ -1,0 +1,144 @@
+// tlb: fully associative cache of V = 0 Sv39 leaves, ENTRIES entries and
+// LOOKUP_PORTS combinational lookup ports
+//
+// Ports (timing contract):
+//   i_lk[l]/o_lk[l] : combinational, no side effect; a lookup may be dropped
+//                     in any cycle. An entry hits when its level-masked VPN
+//                     matches and it is global or carries the lookup's ASID
+//   i_fill          : from ptw only, written on this edge into the
+//                     round-robin victim
+//   i_inv           : applied on this edge (SFENCE.VMA operands at retire);
+//                     an invalidation drops a fill of the same cycle
+// Owns:
+//   - every valid entry is a well-formed leaf: a level-2 ppn is 1 GiB aligned,
+//     a level-1 ppn 2 MiB aligned, and a napot entry is level 0
+//   - a fill is never written in a cycle with an invalidation
+// Rationale:
+//   - replacement advances on fills only, so ptw is the only writer and the
+//     structure does not depend on LOOKUP_PORTS
+//   - among several matching entries (duplicates from redundant walks) the
+//     lowest index wins; all of them were correct translations when installed
+//   - W and D are kept apart: a store that hits W = 1, D = 0 under ADUE asks
+//     for a D update instead of faulting
+pub module tlb #(
+    param ENTRIES     : u32 = 16,
+    param LOOKUP_PORTS: u32 = 1 ,
+) (
+    clk   : input  clock                              ,
+    rst   : input  reset                              ,
+    i_lk  : input  xlate_pkg::TlbLookup [LOOKUP_PORTS],
+    o_lk  : output xlate_pkg::TlbEntry  [LOOKUP_PORTS],
+    i_fill: input  xlate_pkg::TlbFill                 ,
+    i_inv : input  xlate_pkg::TlbInv                  ,
+
+    o_chk: output logic<2>,
+
+    o_perf: output xlate_pkg::TlbPerf,
+) {
+    import xlate_pkg::*;
+
+    const IW: u32 = tag_pkg::idx_w(ENTRIES);
+
+    var v_q  : logic       [ENTRIES]; // ent_q[e].valid is unused
+    var ent_q: TlbFill     [ENTRIES];
+    var rr_q : logic  <IW>          ;
+
+    // ---- lookup ----
+
+    var bits: logic<TLB_ENTRY_W> [ENTRIES];
+    always_comb {
+        for e in 0..ENTRIES {
+            var t      : TlbEntry;
+            t.hit   = 1'b1;
+            t.ppn   = ent_q[e].ppn;
+            t.level = ent_q[e].level;
+            t.r     = ent_q[e].r;
+            t.w     = ent_q[e].w;
+            t.x     = ent_q[e].x;
+            t.u     = ent_q[e].u;
+            t.d     = ent_q[e].d;
+            t.g     = ent_q[e].g;
+            t.pbmt  = ent_q[e].pbmt;
+            t.napot = ent_q[e].napot;
+            bits[e] = t;
+        }
+    }
+
+    var miss: logic<LOOKUP_PORTS>;
+    for l in 0..LOOKUP_PORTS :g_lk {
+        var m: logic<ENTRIES>;
+        always_comb {
+            for e in 0..ENTRIES {
+                let v   : logic<27> = ent_q[e].vpn;
+                let k   : logic<27> = i_lk[l].vpn;
+                let lv_m: logic     = case ent_q[e].level {
+                    2'd2   : v[26:18] == k[26:18],
+                    2'd1   : v[26:9] == k[26:9],
+                    default: v == k,
+                };
+                m[e] = v_q[e] && lv_m && (ent_q[e].g || ent_q[e].asid == i_lk[l].asid);
+            }
+        }
+        assign o_lk[l] = tree_onehot_mux::<ENTRIES, TLB_ENTRY_W>(tree_first::<ENTRIES>(m), bits) as TlbEntry;
+        assign miss[l] = i_lk[l].valid && m == '0;
+    }
+
+    // ---- fill and invalidation ----
+
+    let fill_we: logic = i_fill.valid && !i_inv.valid;
+
+    var inv_e: logic<ENTRIES>;
+    always_comb {
+        for e in 0..ENTRIES {
+            inv_e[e] = v_q[e]
+                && inv_hit(i_inv, ent_q[e].vpn, ent_q[e].level, ent_q[e].napot, ent_q[e].asid, ent_q[e].g);
+        }
+    }
+
+    always_ff {
+        for e in 0..ENTRIES {
+            if fill_we && rr_q == e {
+                ent_q[e] = i_fill;
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            rr_q = 0;
+            for e in 0..ENTRIES {
+                v_q[e] = 1'b0;
+            }
+        } else {
+            for e in 0..ENTRIES {
+                if fill_we && rr_q == e {
+                    v_q[e] = 1'b1;
+                } else if inv_e[e] {
+                    v_q[e] = 1'b0;
+                }
+            }
+            if fill_we {
+                rr_q = if rr_q == ENTRIES - 1 ? 0 : rr_q + 1;
+            }
+        }
+    }
+
+    assign o_perf.miss     = miss != '0;
+    assign o_perf.fill     = fill_we;
+    assign o_perf.fill_inv = i_fill.valid && i_inv.valid;
+    assign o_perf.inv      = inv_e != '0;
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_tlb (
+            clk               ,
+            rst               ,
+            i_fill            ,
+            i_fill_we: fill_we,
+            i_inv             ,
+            o_chk             ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}
