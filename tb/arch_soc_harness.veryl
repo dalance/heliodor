@@ -1,0 +1,158 @@
+// arch_soc_harness: one new-core hart on heliodor_soc_smp with the MAP_ARCH
+// table, a 4 MiB DRAM behind the SoC's DRAM port, retire_mon and
+// rvfi_tracer. The new-core arm of test_arch_common_harness.
+module arch_soc_harness #(
+    param HEX_FILE  : string           = ""                   ,
+    param TOHOST_IDX: u32              = 1024                 ,
+    param CORE      : soc_pkg::CoreSel = soc_pkg::CoreSel::W2 ,
+    param CK_EN     : bit              = 1'b0                 ,
+    param CK_FILE   : string           = ""                   ,
+    param TRACE_EN  : bit              = 1'b0                 ,
+) (
+    clk     : input  clock    ,
+    rst     : input  reset    ,
+    o_pass  : output logic    ,
+    o_fail  : output logic    ,
+    o_tohost: output logic<32>,
+) {
+    const RL       : u32       = soc_pkg::RET_LANES;
+    const TOHOST_PA: bit  <64> = 64'h8000_0000 + (TOHOST_IDX as 64) * 4;
+
+    var dmem_addr    : logic<64>                         ;
+    var dmem_wdata   : logic<64>                     [8] ;
+    var dmem_rdata   : logic<64>                         ;
+    var dmem_wen     : logic                             ;
+    var dmem_wstrb   : logic<8>                      [8] ;
+    var retire       : retire_pkg::RetireRec         [RL];
+    var irq_evt      : retire_pkg::IrqEvent          [1] ;
+    var core_chk     : logic<soc_pkg::CHK_W>         [1] ;
+    var uart_tx_v    : logic                             ;
+    var uart_tx_d    : logic<8>                          ;
+
+    inst dut: heliodor_soc_smp #(
+        N_HARTS    : 1                          ,
+        RESET_PC   : 64'h8000_0000              ,
+        CORE       : CORE                       ,
+        PMA_N      : tb_platform_pkg::MAP_ARCH_N,
+        PMA_REGIONS: tb_platform_pkg::MAP_ARCH  ,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr    : _             ,
+        i_imem_rdata   : '{32'd0}      ,
+        o_imem_ren     : _             ,
+        o_iptw_addr    : _             ,
+        o_iptw_req     : _             ,
+        i_iptw_rdata   : '{64'd0}      ,
+        o_dmem_addr    : dmem_addr     ,
+        o_dmem_wdata   : dmem_wdata    ,
+        i_dmem_rdata   : dmem_rdata    ,
+        o_dmem_wen     : dmem_wen      ,
+        o_dmem_ren     : _             ,
+        o_dmem_wstrb   : dmem_wstrb    ,
+        o_dmem_wdata_hi: _             ,
+        o_dmem_wstrb_hi: _             ,
+        o_uart_tx_valid: uart_tx_v     ,
+        o_uart_tx_data : uart_tx_d     ,
+        o_retire       : retire        ,
+        o_irq_evt      : irq_evt       ,
+        o_core_chk     : core_chk      ,
+    );
+
+    #[allow(initial_assign)]
+    var dram: logic<32> [1048576];
+    initial {
+        $readmemh(HEX_FILE, dram);
+    }
+
+    let in_dram: logic     = dmem_addr[31];
+    let dw_lo  : logic<20> = {dmem_addr[21:3], 1'b0};
+    let dw_hi  : logic<20> = {dmem_addr[21:3], 1'b1};
+    assign dmem_rdata = if in_dram ? {dram[dw_hi], dram[dw_lo]} : 64'd0;
+
+    always_ff {
+        if_reset {} else if dmem_wen && in_dram {
+            for l in 0..8 {
+                if dmem_wstrb[l] != 8'd0 {
+                    let w_lo : logic<20> = {dmem_addr[21:6], l as 3, 1'b0};
+                    let w_hi : logic<20> = {dmem_addr[21:6], l as 3, 1'b1};
+                    let w_old: logic<64> = {dram[w_hi], dram[w_lo]};
+                    var w_new: logic<64>;
+                    for b in 0..8 {
+                        w_new[b step 8] = if dmem_wstrb[l][b] ? dmem_wdata[l][b step 8] : w_old[b step 8];
+                    }
+                    dram[w_lo] = w_new[31:0];
+                    dram[w_hi] = w_new[63:32];
+                }
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {} else if uart_tx_v {
+            $write("%c", uart_tx_d);
+        }
+    }
+
+    var stop    : logic     [RL];
+    var mismatch: logic         ;
+    var done    : logic         ;
+    var cycles  : logic<64>     ;
+    var instret : logic<64>     ;
+    var count   : logic<64>     ;
+    var hash    : logic<64>     ;
+    inst u_trc: rvfi_tracer #(
+        LANES   : RL      ,
+        CK_EN   : CK_EN   ,
+        CK_FILE : CK_FILE ,
+        TRACE_EN: TRACE_EN,
+    ) (
+        clk                         ,
+        rst                         ,
+        i_retire       : retire     ,
+        i_irq_evt      : irq_evt[0] ,
+        i_stop         : stop       ,
+        i_flush        : 1'b0       ,
+        o_count        : count      ,
+        o_hash         : hash       ,
+        o_final_valid  : _          ,
+        o_hash_mismatch: mismatch   ,
+        o_ck_stale     : _          ,
+    );
+
+    inst u_mon: retire_mon #(
+        LANES    : RL           ,
+        TOHOST_PA: TOHOST_PA    ,
+        CHK_W    : soc_pkg::CHK_W,
+    ) (
+        clk                          ,
+        rst                          ,
+        i_retire       : retire      ,
+        i_irq_evt      : irq_evt[0]  ,
+        i_chk          : core_chk[0] ,
+        i_hash_mismatch: mismatch    ,
+        o_stop         : stop        ,
+        o_x3           : _           ,
+        o_tohost       : o_tohost    ,
+        o_pass         : o_pass      ,
+        o_fail         : o_fail      ,
+        o_done         : done        ,
+        o_cycles       : cycles      ,
+        o_instret      : instret     ,
+        o_last_pc      : _           ,
+        o_ret_cnt      : _           ,
+        o_trap_cnt     : _           ,
+        o_chk          : _           ,
+    );
+
+    var reported: logic;
+    always_ff {
+        if_reset {
+            reported = 1'b0;
+        } else if done && !reported {
+            reported = 1'b1;
+            $display("arch: tohost=%h cycles=%d instret=%d chk=%h mismatch=%b records=%d hash=%h", o_tohost, cycles,
+                instret, core_chk[0], mismatch, count, hash);
+        }
+    }
+}
