@@ -1,0 +1,1240 @@
+// heliodor_core: the core top. Instances and their connections only; no
+// state and no logic beyond selecting array elements, struct fields and bit
+// slices, and tying an input that a port's kind never drives to its constant
+// (exec ports never hold, memory pipes have no blocking FU).
+//
+// Ports (timing contract):
+//   i_reset_pc     : static, the first fetch address after reset
+//   i_hart_id      : static; reserved and unconnected. The reused csr takes
+//                    the hart id as its HART_ID parameter, not as an input,
+//                    and this build serves one hart, so mhartid reads 0
+//   D read slot    : o_dmem_* / i_dmem_*, mem_ctrl slot protocol (accept +
+//                    8-beat stream for DRAM lines); driven by the dcache only
+//   I read slot    : o_imemr_* / i_imemr_*, the same protocol; islot_arb
+//                    drives it for the icache fill and its uncached reads
+//   write channel  : o_dmemw_* / o_dmem_wdata, o_dmem_wstrb, o_dmem_wen,
+//                    i_dmemw_grant: line writes of the dcache
+//   coherence      : i_probe_*, o_probe_ack, i_inv*: the probe and
+//                    invalidate ports of the reused dcache; the invalidates
+//                    also reach the adapter and the lq line-watch
+//   i_irq_*        : interrupt pins, registered in csr and again in commit
+//   i_mtime        : time CSR source
+//   o_retire[COMMIT_W], o_irq_evt : registered retire records and interrupt
+//                    event, the core's only observation contract
+//   i_dbg_*        : lockstep controls, 0 in normal use
+//   o_perf, o_chk  : event wires and sticky checker flags of every unit
+// Owns: none (no state).
+// What this build serves: RV64I, M, C, Zicsr, Zifencei and Zawrs, with Bare
+// translation and cacheable memory only. decode rejects F, D, A, V, CBO and H
+// as illegal instructions, mem_pipe faults any non-cacheable access, and the
+// reused csr is connected only through the ports listed above (no frm, no
+// translation state). The FP register file, free list and IQ structure exist
+// as the final topology but receive no op.
+// Rationale:
+//   - every lane and port array is a generate-for over the config; the FU
+//     topology functions of core_types map issue ports to IQs, WB ports, BRU
+//     and SYS indices, so no port number appears here
+//   - the dcache is a sibling of the LSU behind dcache_port_adapter; its
+//     memory side is the D read slot and the write channel
+//   - the file is over the 600-line guideline because it is the connection
+//     list of every unit; splitting it would only add pass-through ports
+pub module heliodor_core::<CFG: core_cfg> #(
+    param PMA_N      : u32                            = 1,
+    param PMA_REGIONS: pma_pkg::PmaRegion     [PMA_N] = '{
+        default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
+    },
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_hart_id : input logic<8> ,
+    i_reset_pc: input logic<64>,
+
+    o_dmem_addr     : output logic<64>,
+    o_dmem_ren      : output logic    ,
+    o_dmem_req      : output logic    ,
+    o_dmem_rfo      : output logic    ,
+    i_dmem_grant    : input  logic    ,
+    i_dmem_rdata    : input  logic<64>,
+    i_dmem_fill_excl: input  logic    ,
+
+    o_imemr_addr : output logic<64>,
+    o_imemr_req  : output logic    ,
+    o_imemr_dram : output logic    ,
+    o_imemr_iread: output logic    ,
+    i_imemr_grant: input  logic    ,
+    i_imemr_rdata: input  logic<64>,
+
+    o_dmemw_addr : output logic<64>    ,
+    o_dmem_wdata : output logic<64> [8],
+    o_dmem_wstrb : output logic<8>  [8],
+    o_dmem_wen   : output logic        ,
+    o_dmemw_wb   : output logic        ,
+    o_dmemw_req  : output logic        ,
+    i_dmemw_grant: input  logic        ,
+
+    i_probe_v   : input  logic    ,
+    i_probe_addr: input  logic<64>,
+    i_probe_self: input  logic    ,
+    o_probe_ack : output logic    ,
+    i_inv_v     : input  logic    ,
+    i_inv_addr  : input  logic<64>,
+    i_inv2_v    : input  logic    ,
+    i_inv2_addr : input  logic<64>,
+
+    i_irq_timer_m: input logic    ,
+    i_irq_sw_m   : input logic    ,
+    i_irq_ext_m  : input logic    ,
+    i_irq_ext_s  : input logic    ,
+    i_mtime      : input logic<64>,
+
+    o_retire : output retire_pkg::RetireRec [CFG::COMMIT_W],
+    o_irq_evt: output retire_pkg::IrqEvent                 ,
+
+    i_dbg_retire_limit_en: input logic    ,
+    i_dbg_retire_limit   : input logic<64>,
+    i_dbg_irq_mask       : input logic    ,
+    i_dbg_irq_allow      : input logic    ,
+
+    o_perf: output core_types::<CFG>::CorePerf,
+    o_chk : output core_types::<CFG>::CoreChk ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const FW   : u32 = CFG::FETCH_W;
+    const RW   : u32 = CFG::RENAME_W;
+    const CW   : u32 = CFG::COMMIT_W;
+    const IW   : u32 = CFG::ISSUE_W;
+    const MW   : u32 = CFG::MEM_W;
+    const NQ   : u32 = CFG::N_IQ;
+    const SYS_P: u32 = sys_port();
+    // WB slot offset a memory-pipe pass claims when it enters m0 the next cycle.
+    const MEM_CLAIM_OFF: u32 = fu_pkg::claim_off(FuKind::LOAD);
+
+    // ---- Kill, redirect and the oldest token ----
+
+    var kill    : Kill     ;
+    var redirect: Redirect ;
+    var cm_flush: CmFlush  ;
+    var oldest  : TagTok   ;
+    var ftq_cm  : FtqCommit;
+    var ic_inv  : logic    ;
+
+    // ---- csr state seen by the pipeline ----
+
+    var priv    : csr_pkg::PrivLevel     ;
+    var virt    : logic                  ;
+    var tsr     : logic                  ;
+    var tvm     : logic                  ;
+    var pmpcfg  : logic             <64> [2] ;
+    var pmpaddr : logic             <64> [16];
+
+    // ==== Front end ====
+
+    var enq_v  : logic    ;
+    var enq    : FtqEnq   ;
+    var enq_rdy: logic    ;
+    var rcv    : BpRecover;
+    var upd    : BpUpdate ;
+    inst u_bpu: bpu::<CFG> (
+        clk                                          ,
+        rst                                          ,
+        i_reset_pc                                   ,
+        o_enq_valid      : enq_v                     ,
+        o_enq            : enq                       ,
+        i_enq_ready      : enq_rdy                   ,
+        i_rcv            : rcv                       ,
+        i_upd            : upd                       ,
+        o_ev_taken_bubble: o_perf.front.taken_bubble ,
+    );
+
+    var f_v    : logic             ;
+    var fetch  : FtqFetch          ;
+    var f_take : logic             ;
+    var rw_v   : logic             ;
+    var rw     : FtqTag            ;
+    var pdw    : PdWrite           ;
+    var pdr    : PdRedirect        ;
+    var ftq_rt : FtqTag     [BRU_N];
+    var ftq_rd : FtqRead    [BRU_N];
+    inst u_ftq: ftq::<CFG> (
+        clk                                  ,
+        rst                                  ,
+        i_enq_valid   : enq_v                ,
+        i_enq         : enq                  ,
+        o_enq_ready   : enq_rdy              ,
+        o_fetch_valid : f_v                  ,
+        o_fetch       : fetch                ,
+        i_fetch_take  : f_take               ,
+        i_rewind_valid: rw_v                 ,
+        i_rewind      : rw                   ,
+        i_pdw         : pdw                  ,
+        i_pdr         : pdr                  ,
+        i_kill        : kill                 ,
+        i_redirect    : redirect             ,
+        i_cm          : ftq_cm               ,
+        i_rd_tag      : ftq_rt               ,
+        o_rd          : ftq_rd               ,
+        o_rcv         : rcv                  ,
+        o_upd         : upd                  ,
+        o_ev_full     : o_perf.front.ftq_full,
+        o_chk         : o_chk.ftq            ,
+    );
+
+    var icq_v  : logic   ;
+    var icq    : IcReq   ;
+    var ic_rdy : logic   ;
+    var icr    : IcResp  ;
+    var icev   : IcEvent ;
+    var ic_fl  : logic   ;
+    var fb_v   : logic   ;
+    var fb     : FetchBlk;
+    var fb_take: logic   ;
+    inst u_ifu: ifu::<CFG> #(
+        PMA_N      : PMA_N      ,
+        PMA_REGIONS: PMA_REGIONS,
+    ) (
+        clk                                             ,
+        rst                                             ,
+        i_fetch_valid      : f_v                        ,
+        i_priv             : priv                       ,
+        i_pmpcfg           : pmpcfg                     ,
+        i_pmpaddr          : pmpaddr                    ,
+        i_fetch            : fetch                      ,
+        o_fetch_take       : f_take                     ,
+        o_rewind_valid     : rw_v                       ,
+        o_rewind           : rw                         ,
+        o_ic_req_valid     : icq_v                      ,
+        o_ic_req           : icq                        ,
+        i_ic_ready         : ic_rdy                     ,
+        i_ic_resp          : icr                        ,
+        i_ic_ev            : icev                       ,
+        o_ic_flush         : ic_fl                      ,
+        o_fb_valid         : fb_v                       ,
+        o_fb               : fb                         ,
+        i_fb_take          : fb_take                    ,
+        i_kill             : kill                       ,
+        i_pdr              : pdr                        ,
+        o_ev_fbq_full      : o_perf.front.fbq_full      ,
+        o_ev_ftq_empty_idle: o_perf.front.ftq_empty_idle,
+        o_ev_fault_stall   : o_perf.front.fault_stall   ,
+    );
+
+    var fill_req : logic        ;
+    var fill_addr: logic<56>    ;
+    var unc_req  : logic        ;
+    var unc_addr : logic<56>    ;
+    var cl_acc   : logic     [2];
+    var cl_beat  : logic     [2];
+    var sl_rdata : logic<64>    ;
+    inst u_ic: icache::<CFG> (
+        clk                                     ,
+        rst                                     ,
+        i_req_valid   : icq_v                   ,
+        i_req         : icq                     ,
+        o_req_ready   : ic_rdy                  ,
+        o_resp        : icr                     ,
+        o_ev          : icev                    ,
+        i_flush       : ic_fl                   ,
+        i_inval_all   : ic_inv                  ,
+        o_fill_req    : fill_req                ,
+        o_fill_addr   : fill_addr               ,
+        i_fill_acc    : cl_acc[0]               ,
+        i_fill_beat   : cl_beat[0]              ,
+        o_unc_req     : unc_req                 ,
+        o_unc_addr    : unc_addr                ,
+        i_unc_beat    : cl_beat[1]              ,
+        i_rdata       : sl_rdata                ,
+        o_ev_miss     : o_perf.front.ic_miss    ,
+        o_ev_fill_busy: o_perf.front.ic_fill_busy,
+    );
+
+    inst u_islot: islot_arb #(
+        N_CL: 2,
+    ) (
+        clk                                    ,
+        rst                                    ,
+        i_req       : '{fill_req, unc_req}       ,
+        i_addr      : '{fill_addr, unc_addr}     ,
+        i_line      : '{1'b1, 1'b0}              ,
+        i_iread     : '{1'b1, 1'b1}              ,
+        o_acc       : cl_acc                     ,
+        o_beat      : cl_beat                    ,
+        o_rdata     : sl_rdata                   ,
+        o_slot_req  : o_imemr_req                ,
+        o_slot_addr : o_imemr_addr               ,
+        o_slot_dram : o_imemr_dram               ,
+        o_slot_iread: o_imemr_iread              ,
+        i_slot_grant: i_imemr_grant              ,
+        i_slot_rdata: i_imemr_rdata              ,
+    );
+
+    var dq_v : logic                          [FW];
+    var dq   : XOp                            [FW];
+    var dq_tk: logic<tag_pkg::idx_w(FW + 1)>     ;
+    inst u_ext: extract::<CFG> (
+        clk                                          ,
+        rst                                          ,
+        i_fb_valid        : fb_v                     ,
+        i_fb              : fb                       ,
+        o_fb_take         : fb_take                  ,
+        o_dq_valid        : dq_v                     ,
+        o_dq              : dq                       ,
+        i_dq_take         : dq_tk                    ,
+        o_pdw             : pdw                      ,
+        o_pdr             : pdr                      ,
+        i_kill            : kill                     ,
+        i_redirect        : redirect                 ,
+        o_ev_cut_block_end: o_perf.front.cut_block_end,
+        o_ev_dq_full      : o_perf.front.dq_full     ,
+        o_ev_pdr          : o_perf.front.pdr         ,
+        o_chk             : o_chk.ext                ,
+    );
+
+    // ==== Decode, rename, dispatch ====
+
+    var dec_v : logic  [FW];
+    var dec   : DecOp  [FW];
+    var rq_rdy: logic      ;
+    inst u_dec: decode::<CFG> (
+        clk                       ,
+        rst                       ,
+        i_valid      : dq_v       ,
+        i_xop        : dq         ,
+        i_rq_ready   : rq_rdy     ,
+        o_valid      : dec_v      ,
+        o_dec        : dec        ,
+        o_dq_take    : dq_tk      ,
+        i_priv       : priv       ,
+        i_virt       : virt       ,
+        i_mstatus_tsr: tsr        ,
+        i_mstatus_tvm: tvm        ,
+        o_perf       : o_perf.dec ,
+        o_chk        : o_chk.dec  ,
+    );
+
+    var rq_v: logic         [RW];
+    var rq  : DecOp         [RW];
+    var take: logic<TAKE_W>     ;
+    inst u_rq: lane_queue #(
+        T    : DecOp   ,
+        W_IN : FW      ,
+        W_OUT: RW      ,
+        DEPTH: CFG::RQ_N,
+    ) (
+        clk                ,
+        rst                ,
+        i_valid: dec_v     ,
+        i_data : dec       ,
+        o_ready: rq_rdy    ,
+        o_valid: rq_v      ,
+        o_data : rq        ,
+        i_take : take      ,
+        i_flush: kill.valid,
+    );
+
+    var pop_int: logic <PREG_W> [RW]    ;
+    var pop_fp : logic <PREG_W> [RW]    ;
+    var ren    : RenOut         [RW]    ;
+    var walk   : WalkLane       [WALK_W];
+    var ren_cm : RenCm          [CW]    ;
+    inst u_ren: rename::<CFG> (
+        clk                     ,
+        rst                     ,
+        i_valid  : rq_v         ,
+        i_op     : rq           ,
+        i_take   : take         ,
+        i_pop_int: pop_int      ,
+        i_pop_fp : pop_fp       ,
+        o_ren    : ren          ,
+        i_walk   : walk         ,
+        i_cm     : ren_cm       ,
+        i_kill   : kill         ,
+        o_perf   : o_perf.ren   ,
+        o_chk    : o_chk.ren    ,
+    );
+
+    var popn_int: logic<TAKE_W>          ;
+    var popn_fp : logic<TAKE_W>          ;
+    var ha_int  : FlPtr           [RW + 1];
+    var ha_fp   : FlPtr           [RW + 1];
+    var fl_int  : logic<FL_CNT_W>        ;
+    var fl_fp   : logic<FL_CNT_W>        ;
+    inst u_fl_int: free_list::<CFG> #(
+        CLS: RegClass::INT,
+    ) (
+        clk                        ,
+        rst                        ,
+        i_pop_n     : popn_int     ,
+        i_rel       : ren_cm       ,
+        i_kill      : kill         ,
+        o_pop       : pop_int      ,
+        o_head_after: ha_int       ,
+        o_free      : fl_int       ,
+        o_chk       : o_chk.fl_int ,
+    );
+    inst u_fl_fp: free_list::<CFG> #(
+        CLS: RegClass::FP,
+    ) (
+        clk                       ,
+        rst                       ,
+        i_pop_n     : popn_fp     ,
+        i_rel       : ren_cm      ,
+        i_kill      : kill        ,
+        o_pop       : pop_fp      ,
+        o_head_after: ha_fp       ,
+        o_free      : fl_fp       ,
+        o_chk       : o_chk.fl_fp ,
+    );
+
+    var wb    : WbPacket [WB_N];
+    var wake  : Wake     [WB_N];
+    var bt_v  : logic    [RW]    ;
+    var bt_p  : PReg     [RW]    ;
+    var bt_rd : PReg     [3 * RW];
+    var bt_rdy: logic    [3 * RW];
+    for l in 0..RW :g_bt_rd {
+        assign bt_rd[3 * l]     = ren[l].ps1;
+        assign bt_rd[3 * l + 1] = ren[l].ps2;
+        assign bt_rd[3 * l + 2] = ren[l].ps3;
+    }
+    inst u_bt: busy_table::<CFG> (
+        clk                  ,
+        rst                  ,
+        i_clr_valid: bt_v    ,
+        i_clr      : bt_p    ,
+        i_wake     : wake    ,
+        i_rd       : bt_rd   ,
+        o_rdy      : bt_rdy  ,
+        o_chk      : o_chk.bt,
+    );
+
+    var walk_busy: logic                    ;
+    var rob_free : logic    <ROB_CNT_W>     ;
+    var rob_tag  : RobTag              [RW] ;
+    var iq_free  : logic    <IQ_CNT_W> [NQ] ;
+    var lq_free  : logic    <LQ_CNT_W>      ;
+    var lq_atag  : LqTag               [RW + 1];
+    var lq_bar   : BarSeq              [RW + 1];
+    var bar_ret  : BarSeq                   ;
+    var sq_free  : logic    <SQ_CNT_W>      ;
+    var sq_atag  : SqTag               [RW + 1];
+    var bar_n    : logic    <TAKE_W>        ;
+    var rob_v    : logic               [RW] ;
+    var rob_a    : RobAlloc            [RW] ;
+    var iq_v     : logic               [NQ * RW];
+    var iq_a     : IqAlloc             [NQ * RW];
+    var lq_av    : logic               [RW] ;
+    var lq_al    : LqAlloc             [RW] ;
+    var sq_av    : logic               [RW] ;
+    var sq_al    : SqAlloc             [RW] ;
+    inst u_dp: dispatch::<CFG> (
+        clk                        ,
+        rst                        ,
+        i_valid      : rq_v        ,
+        i_op         : rq          ,
+        i_ren        : ren         ,
+        i_kill       : kill        ,
+        i_walk_busy  : walk_busy   ,
+        i_rob_free   : rob_free    ,
+        i_rob_tag    : rob_tag     ,
+        i_iq_free    : iq_free     ,
+        i_lq_free    : lq_free     ,
+        i_lq_tag     : lq_atag     ,
+        i_lq_bar     : lq_bar      ,
+        i_bar_ret    : bar_ret     ,
+        i_sq_free    : sq_free     ,
+        i_sq_tag     : sq_atag     ,
+        i_fl_int_free: fl_int      ,
+        i_fl_int_head: ha_int      ,
+        i_fl_fp_free : fl_fp       ,
+        i_fl_fp_head : ha_fp       ,
+        i_bt_rdy     : bt_rdy      ,
+        i_wake       : wake        ,
+        o_take       : take        ,
+        o_pop_n_int  : popn_int    ,
+        o_pop_n_fp   : popn_fp     ,
+        o_bar_n      : bar_n       ,
+        o_rob_valid  : rob_v       ,
+        o_rob        : rob_a       ,
+        o_iq_valid   : iq_v        ,
+        o_iq         : iq_a        ,
+        o_lq_valid   : lq_av       ,
+        o_lq         : lq_al       ,
+        o_sq_valid   : sq_av       ,
+        o_sq         : sq_al       ,
+        o_bt_clr_v   : bt_v        ,
+        o_bt_clr_p   : bt_p        ,
+        o_perf       : o_perf.disp ,
+        o_chk        : o_chk.disp  ,
+    );
+
+    // ==== Scheduling: issue ports are indexed by their WB port ====
+
+    var grant_w: IqGrant                   [WB_N];
+    var resv_w : fu_pkg::WbSlot            [WB_N];
+    var ok_w   : logic  <fu_pkg::WB_OFS_N> [WB_N];
+    var busy_w : FuSet                     [WB_N];
+    var hold_w : logic                     [WB_N];
+    var rel_w  : IqRelease                 [WB_N];
+    var lfence : LoadFence                       ;
+
+    var iq_chk : logic<3> [NQ];
+    var iq_perf: logic<2> [NQ];
+    for q in 0..NQ :g_iq {
+        const NP: u32 = iq_port_count(q);
+        var av  : logic                       [RW];
+        var aa  : IqAlloc                     [RW];
+        var ok  : logic    <fu_pkg::WB_OFS_N> [NP];
+        var busy: FuSet                       [NP];
+        var hold: logic                       [NP];
+        var rel : IqRelease                   [NP];
+        var gr  : IqGrant                     [NP];
+        var rs  : fu_pkg::WbSlot              [NP];
+        for i in 0..RW :g_al {
+            assign av[i] = iq_v[q * RW + i];
+            assign aa[i] = iq_a[q * RW + i];
+        }
+        for i in 0..NP :g_port {
+            assign ok[i]                      = ok_w[iq_wb_port(q, i)];
+            assign busy[i]                    = busy_w[iq_wb_port(q, i)];
+            assign hold[i]                    = hold_w[iq_wb_port(q, i)];
+            assign rel[i]                     = rel_w[iq_wb_port(q, i)];
+            assign grant_w[iq_wb_port(q, i)] = gr[i];
+            assign resv_w[iq_wb_port(q, i)]  = rs[i];
+        }
+        inst u_iq: iq::<CFG> #(
+            Q: q,
+        ) (
+            clk                       ,
+            rst                       ,
+            i_alloc_valid: av         ,
+            i_alloc      : aa         ,
+            o_free       : iq_free[q] ,
+            i_wake       : wake       ,
+            i_tok        : oldest     ,
+            i_wb_ok      : ok         ,
+            i_fu_busy    : busy       ,
+            i_port_hold  : hold       ,
+            i_load_fence : lfence     ,
+            o_grant      : gr         ,
+            o_resv       : rs         ,
+            i_release    : rel        ,
+            i_kill       : kill       ,
+            o_perf       : iq_perf[q] ,
+            o_chk        : iq_chk[q]  ,
+        );
+    }
+
+    // PRF read port r * SRC_N + s serves source slot s of issue port r.
+    var raddr: PReg         [PRF_RD_N];
+    var rd_i : logic   <64> [PRF_RD_N];
+    var rd_f : logic   <64> [PRF_RD_N];
+    inst u_prf_i: prf::<CFG> #(
+        CLS    : RegClass::INT ,
+        N_ENTRY: CFG::PRF_INT_N,
+    ) (
+        clk                    ,
+        rst                    ,
+        i_raddr: raddr         ,
+        o_rdata: rd_i          ,
+        i_wb   : wb            ,
+        o_chk  : o_chk.prf_int ,
+    );
+    inst u_prf_f: prf::<CFG> #(
+        CLS    : RegClass::FP ,
+        N_ENTRY: CFG::PRF_FP_N,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_raddr: raddr        ,
+        o_rdata: rd_f         ,
+        i_wb   : wb           ,
+        o_chk  : o_chk.prf_fp ,
+    );
+
+    // WB slot reservation per WB port; mem_port_arb drives the memory pipes'
+    // reservations (a granted re-issue claims its slot there).
+    var hf_req  : logic          [WB_N];
+    var hf_gnt  : fu_pkg::WbSlot [WB_N];
+    var rs_in   : fu_pkg::WbSlot [WB_N];
+    var rs_chk  : logic<2>       [WB_N];
+    var rs_perf : logic<2>       [WB_N];
+    for w in 0..WB_N :g_rs {
+        inst u_rs: wb_resv #(
+            D: wb_depth(w),
+        ) (
+            clk                                                                ,
+            rst                                                                ,
+            o_ok      : ok_w[w]                                                ,
+            i_resv    : rs_in[w]                                               ,
+            i_hf_req  : hf_req[w]                                              ,
+            o_hf_grant: hf_gnt[w]                                              ,
+            o_perf    : rs_perf[w]                                             ,
+            o_chk     : rs_chk[w]                                              ,
+        );
+    }
+
+    // ==== Exec ports ====
+
+    var ep_rd   : PReg              [IW, SRC_N];
+    var ep_ftq  : FtqTag            [IW]       ;
+    var ep_ftqin: FtqRead           [IW]       ;
+    var ep_csr_a: logic     <12>    [IW]       ;
+    var ep_start: logic             [IW]       ;
+    var ep_sys  : SysPending        [IW]       ;
+    var ep_chk  : logic     <4>     [IW]       ;
+    var ep_perf : logic             [IW]       ;
+    var csr_rd  : logic     <64>               ;
+
+    for b in 0..BRU_N :g_ftq_rd {
+        assign ftq_rt[b] = ep_ftq[bru_port(b)];
+    }
+
+    for p in 0..IW :g_ep {
+        var rdi: logic<64> [SRC_N];
+        var rdf: logic<64> [SRC_N];
+        for s in 0..SRC_N :g_src {
+            assign raddr[p * SRC_N + s] = ep_rd[p][s];
+            assign rdi[s]               = rd_i[p * SRC_N + s];
+            assign rdf[s]               = rd_f[p * SRC_N + s];
+        }
+        if CFG::PORT_FU[p][FuKind::BRU] :g_bru {
+            assign ep_ftqin[p] = ftq_rd[port_bru(p)];
+        } else {
+            assign ep_ftqin[p] = 0 as FtqRead;
+        }
+        assign hold_w[p] = 1'b0;
+        assign rs_in[p]  = resv_w[p];
+
+        inst u_ep: exec_port::<CFG> #(
+            P: p,
+        ) (
+            clk                       ,
+            rst                       ,
+            i_grant    : grant_w[p]   ,
+            i_kill     : kill         ,
+            o_release  : rel_w[p]     ,
+            o_fu_busy  : busy_w[p]    ,
+            o_rd       : ep_rd[p]     ,
+            i_rd_int   : rdi          ,
+            i_rd_fp    : rdf          ,
+            i_wb       : wb           ,
+            o_wb       : wb[p]        ,
+            o_wake     : wake[p]      ,
+            o_hf_req   : hf_req[p]    ,
+            i_hf_grant : hf_gnt[p]    ,
+            o_ftq_rd   : ep_ftq[p]    ,
+            i_ftq      : ep_ftqin[p]  ,
+            o_csr_raddr: ep_csr_a[p]  ,
+            i_csr_rdata: csr_rd       ,
+            i_tok      : oldest       ,
+            o_started  : ep_start[p]  ,
+            o_sys      : ep_sys[p]    ,
+            o_perf     : ep_perf[p]   ,
+            o_chk      : ep_chk[p]    ,
+        );
+    }
+
+    // ==== Memory pipes, LQ, SQ, SB, port arbiter ====
+
+    var mp_a1   : PReg        [MW];
+    var mp_a2   : PReg        [MW];
+    var mreq_v  : logic       [MW];
+    var mreq    : MemReq      [MW];
+    var mresp   : MemResp     [MW];
+    var mevt    : MemEvent        ;
+    var fwd_q   : FwdQuery    [MW];
+    var fwd_sq  : FwdPart     [MW];
+    var fwd_sb  : FwdPart     [MW];
+    var snap    : LqSnap      [MW];
+    var sta     : StaWrite    [MW];
+    var std     : StdWrite    [MW];
+    var verd    : LqVerdict   [MW];
+    var mre     : MemReissue  [MW];
+    var split_lo: logic<64>       ;
+    var lq_re   : MemReissue      ;
+    var sq_re   : MemReissue      ;
+    var lq_gnt  : logic           ;
+    var sq_gnt  : logic           ;
+    var mp_resv : fu_pkg::WbSlot [MW];
+    var arb_ok  : logic       [MW];
+    var arb_hold: logic       [MW];
+
+    for m in 0..MW :g_mp {
+        const W: u32 = IW + m;
+        for s in 0..SRC_N :g_src {
+            if s == 0 :g_a1 {
+                assign raddr[W * SRC_N + s] = mp_a1[m];
+            } else if s == 1 :g_a2 {
+                assign raddr[W * SRC_N + s] = mp_a2[m];
+            } else {
+                assign raddr[W * SRC_N + s] = 0 as PReg;
+            }
+        }
+        assign busy_w[W]  = 0 as FuSet;
+        assign hf_req[W]  = 1'b0;
+        assign arb_ok[m]  = ok_w[W][MEM_CLAIM_OFF];
+        assign hold_w[W]  = arb_hold[m];
+        assign rs_in[W]   = mp_resv[m];
+
+        inst u_mp: mem_pipe::<CFG> #(
+            PMA_N  : PMA_N      ,
+            PMA_TBL: PMA_REGIONS,
+        ) (
+            clk                                    ,
+            rst                                    ,
+            i_kill     : kill                      ,
+            i_iss      : grant_w[W]                ,
+            i_re       : mre[m]                    ,
+            o_iq_rel   : rel_w[W]                  ,
+            o_rf_addr1 : mp_a1[m]                  ,
+            o_rf_addr2 : mp_a2[m]                  ,
+            i_rf_int1  : rd_i[W * SRC_N]           ,
+            i_rf_int2  : rd_i[W * SRC_N + 1]       ,
+            i_rf_fp2   : rd_f[W * SRC_N + 1]       ,
+            i_wb       : wb                        ,
+            i_priv     : priv                      ,
+            i_pmpcfg   : pmpcfg                    ,
+            i_pmpaddr  : pmpaddr                   ,
+            o_req_valid: mreq_v[m]                 ,
+            o_req      : mreq[m]                   ,
+            i_resp     : mresp[m]                  ,
+            o_fwd_q    : fwd_q[m]                  ,
+            i_fwd_sq   : fwd_sq[m]                 ,
+            i_fwd_sb   : fwd_sb[m]                 ,
+            o_snap     : snap[m]                   ,
+            o_sta      : sta[m]                    ,
+            o_std      : std[m]                    ,
+            i_split_lo : split_lo                  ,
+            o_verdict  : verd[m]                   ,
+            o_wake     : wake[W]                   ,
+            o_wb       : wb[W]                     ,
+            o_perf     : o_perf.mp[m]              ,
+        );
+    }
+
+    var mp_iq_resv: fu_pkg::WbSlot [MW];
+    for m in 0..MW :g_mp_resv {
+        assign mp_iq_resv[m] = resv_w[IW + m];
+    }
+
+    inst u_arb: mem_port_arb::<CFG> (
+        clk                        ,
+        rst                        ,
+        i_wb_ok    : arb_ok        ,
+        i_lq_re    : lq_re         ,
+        i_sq_re    : sq_re         ,
+        i_iq_resv  : mp_iq_resv    ,
+        o_port_hold: arb_hold      ,
+        o_re       : mre           ,
+        o_resv     : mp_resv       ,
+        o_lq_gnt   : lq_gnt        ,
+        o_sq_gnt   : sq_gnt        ,
+        o_perf     : o_perf.arb    ,
+    );
+
+    var ld_ret  : logic    <RETIRE_CNT_W>         ;
+    var st_ret  : logic    <RETIRE_CNT_W>         ;
+    var cm_bar  : logic                           ;
+    var lq_win  : LqCmWin                   [CW]  ;
+    var sq_win  : SqCmWin                   [MW]  ;
+    var sq_head : SqTag                           ;
+    var push    : SbPush                    [PUSH_W];
+    var coh_v   : logic                     [COH_N];
+    var coh_line: logic    <50>             [COH_N];
+    var ev1_v   : logic                           ;
+    var ev1_a   : logic    <64>                   ;
+    var ev2_v   : logic                           ;
+    var ev2_a   : logic    <64>                   ;
+    assign coh_v[0]    = i_inv_v;
+    assign coh_line[0] = i_inv_addr[55:6];
+    assign coh_v[1]    = i_inv2_v;
+    assign coh_line[1] = i_inv2_addr[55:6];
+    assign coh_v[2]    = ev1_v;
+    assign coh_line[2] = ev1_a[55:6];
+    assign coh_v[3]    = ev2_v;
+    assign coh_line[3] = ev2_a[55:6];
+
+    inst u_lq: lq::<CFG> (
+        clk                          ,
+        rst                          ,
+        i_kill       : kill          ,
+        i_alloc_valid: lq_av         ,
+        i_alloc      : lq_al         ,
+        o_free       : lq_free       ,
+        o_alloc_tag  : lq_atag       ,
+        i_bar_alloc  : bar_n         ,
+        i_bar_ret    : cm_bar        ,
+        o_bar_after  : lq_bar        ,
+        o_bar_ret    : bar_ret       ,
+        o_load_fence : lfence        ,
+        i_snap       : snap          ,
+        i_sta        : sta           ,
+        i_verdict    : verd          ,
+        i_mem_ev     : mevt          ,
+        i_coh_v      : coh_v         ,
+        i_coh_line   : coh_line      ,
+        i_std        : std           ,
+        i_sq_head    : sq_head       ,
+        i_oldest     : oldest        ,
+        i_retire_cnt : ld_ret        ,
+        o_reissue    : lq_re         ,
+        i_reissue_gnt: lq_gnt        ,
+        o_win        : lq_win        ,
+        o_split_lo   : split_lo      ,
+        o_chk        : o_chk.lq      ,
+        o_perf       : o_perf.lq     ,
+    );
+
+    inst u_sq: sq::<CFG> (
+        clk                          ,
+        rst                          ,
+        i_kill       : kill          ,
+        i_alloc_valid: sq_av         ,
+        i_alloc      : sq_al         ,
+        o_free       : sq_free       ,
+        o_alloc_tag  : sq_atag       ,
+        i_sta        : sta           ,
+        i_std        : std           ,
+        i_fwd_q      : fwd_q         ,
+        o_fwd        : fwd_sq        ,
+        o_reissue    : sq_re         ,
+        i_reissue_gnt: sq_gnt        ,
+        o_win        : sq_win        ,
+        i_retire_cnt : st_ret        ,
+        o_push       : push          ,
+        o_head       : sq_head       ,
+        o_chk        : o_chk.sq      ,
+        o_perf       : o_perf.sq     ,
+    );
+
+    var sb_credit: logic<SB_CREDIT_W>    ;
+    var ord_empty: logic                 ;
+    var dr_v     : logic                 ;
+    var dr_addr  : logic<64>             ;
+    var dr_data  : logic<64>         [8] ;
+    var dr_strb  : logic<8>          [8] ;
+    var dr_urg   : logic                 ;
+    var dr_ack   : logic                 ;
+    inst u_sb: sb::<CFG> (
+        clk                             ,
+        rst                             ,
+        i_push          : push          ,
+        o_credit        : sb_credit     ,
+        i_fwd_q         : fwd_q         ,
+        o_fwd           : fwd_sb        ,
+        o_drain_v       : dr_v          ,
+        o_drain_addr    : dr_addr       ,
+        o_drain_data    : dr_data       ,
+        o_drain_strb    : dr_strb       ,
+        o_drain_urgent  : dr_urg        ,
+        i_drain_ack     : dr_ack        ,
+        o_ordering_empty: ord_empty     ,
+        o_chk           : o_chk.sb      ,
+        o_perf          : o_perf.sb     ,
+    );
+
+    // ==== dcache and its adapter ====
+
+    var dc_addr  : logic<64>             ;
+    var dc_ren   : logic                 ;
+    var dc_renf  : logic                 ;
+    var dc_addr_r: logic<64>             ;
+    var dc_ren_r : logic                 ;
+    var dc_rdata : logic<64>             ;
+    var dc_stall : logic                 ;
+    var dc_dv    : logic                 ;
+    var dc_frd   : logic<64>             ;
+    var dc_fdr   : logic                 ;
+    var dc_fcmp  : logic                 ;
+    var dc_fab   : logic                 ;
+    var dc_fst   : logic                 ;
+    var dc_fstl  : logic<58>             ;
+    var dc_fsto  : logic<3>              ;
+    var dc_fbusy : logic                 ;
+    var dc_fline : logic<58>             ;
+    var dc_foff  : logic<3>              ;
+    var dc_terms : dcache_pkg::StallTerms;
+    var dc_dhu   : logic                 ;
+    var dc_dhn   : logic<64>             ;
+
+    inst u_ad: dcache_port_adapter::<CFG> (
+        clk                                ,
+        rst                                ,
+        i_kill              : kill         ,
+        i_req_valid         : mreq_v       ,
+        i_req               : mreq         ,
+        o_req_ready         : _            ,
+        o_resp              : mresp        ,
+        o_evt               : mevt         ,
+        o_dc_addr           : dc_addr      ,
+        o_dc_ren            : dc_ren       ,
+        o_dc_ren_folded     : dc_renf      ,
+        o_dc_addr_r         : dc_addr_r    ,
+        o_dc_ren_r          : dc_ren_r     ,
+        i_dc_rdata          : dc_rdata     ,
+        i_dc_stall          : dc_stall     ,
+        i_dc_data_valid     : dc_dv        ,
+        i_dc_fill_rdata     : dc_frd       ,
+        i_dc_fill_data_ready: dc_fdr       ,
+        i_dc_fill_complete  : dc_fcmp      ,
+        i_dc_fill_aborted   : dc_fab       ,
+        i_dc_fill_start     : dc_fst       ,
+        i_dc_fill_start_line: dc_fstl      ,
+        i_dc_fill_start_off : dc_fsto      ,
+        i_dc_fill_busy      : dc_fbusy     ,
+        i_dc_fill_line      : dc_fline     ,
+        i_dc_fill_off       : dc_foff      ,
+        i_dc_stall_terms    : dc_terms     ,
+        i_dc_dhit_used      : dc_dhu       ,
+        i_dc_dhit_rdata_next: dc_dhn       ,
+        i_inv_v             : i_inv_v      ,
+        i_inv_addr          : i_inv_addr   ,
+        i_inv2_v            : i_inv2_v     ,
+        i_inv2_addr         : i_inv2_addr  ,
+        i_ev1_v             : ev1_v        ,
+        i_ev1_addr          : ev1_a        ,
+        i_ev2_v             : ev2_v        ,
+        i_ev2_addr          : ev2_a        ,
+        o_chk               : o_chk.ad     ,
+        o_perf              : o_perf.ad    ,
+    );
+
+    // The main port only reads; stores reach the dcache through the sb drain.
+    inst u_dc: dcache (
+        clk                                ,
+        rst                                ,
+        i_addr           : dc_addr         ,
+        i_wdata          : 64'd0           ,
+        i_wen            : 1'b0            ,
+        i_wen_excl       : 1'b0            ,
+        i_wen_excl_q     : 1'b0            ,
+        i_wdata_hi       : 64'd0           ,
+        i_ren            : dc_ren          ,
+        i_uncached       : 1'b0            ,
+        i_wstrb          : 8'd0            ,
+        i_wstrb_hi       : 8'd0            ,
+        i_load_next      : 1'b0            ,
+        i_amo_read       : 1'b0            ,
+        i_addr2          : 64'd0           ,
+        i_ren2           : 1'b0            ,
+        i_load_next2     : 1'b0            ,
+        i_addr_r         : dc_addr_r       ,
+        i_ren_r          : dc_ren_r        ,
+        i_ren_folded     : dc_renf         ,
+        o_rdata2         : _               ,
+        o_rdata2_next    : _               ,
+        o_hit2           : _               ,
+        i_saddr          : dr_addr         ,
+        i_swen           : dr_v            ,
+        i_sdrain_urgent  : dr_urg          ,
+        i_swdata         : dr_data         ,
+        i_swstrb         : dr_strb         ,
+        o_sdrain_ack     : dr_ack          ,
+        o_rdata          : dc_rdata        ,
+        o_rdata_next     : _               ,
+        o_rdata_next_miss: _               ,
+        o_stall          : dc_stall        ,
+        o_data_valid     : dc_dv           ,
+        o_miss_valid     : _               ,
+        o_miss_offset    : _               ,
+        o_fill_complete  : dc_fcmp         ,
+        o_fill_rdata     : dc_frd          ,
+        o_fill_aborted   : dc_fab          ,
+        o_fill_data_ready: dc_fdr          ,
+        o_hit_safe       : _               ,
+        o_mshr_alloc     : _               ,
+        o_stall_why      : _               ,
+        o_fill_start     : dc_fst          ,
+        o_fill_start_line: dc_fstl         ,
+        o_fill_start_off : dc_fsto         ,
+        o_fill_start_rfo : _               ,
+        o_fill_busy      : dc_fbusy        ,
+        o_fill_line      : dc_fline        ,
+        o_fill_off       : dc_foff         ,
+        o_stall_terms    : dc_terms        ,
+        o_dhit_used      : dc_dhu          ,
+        o_dhit_rdata_next: dc_dhn          ,
+        o_memr_addr      : o_dmem_addr     ,
+        o_memr_ren       : o_dmem_ren      ,
+        o_memr_rfo       : o_dmem_rfo      ,
+        i_fill_excl      : i_dmem_fill_excl,
+        i_mem_rdata      : i_dmem_rdata    ,
+        o_memw_addr      : o_dmemw_addr    ,
+        o_memw_wdata     : o_dmem_wdata    ,
+        o_memw_wstrb     : o_dmem_wstrb    ,
+        o_memw_wen       : o_dmem_wen      ,
+        o_memw_wb        : o_dmemw_wb      ,
+        i_probe_v        : i_probe_v       ,
+        i_probe_addr     : i_probe_addr    ,
+        i_probe_self     : i_probe_self    ,
+        o_probe_ack      : o_probe_ack     ,
+        i_flush_req      : 1'b0            ,
+        o_flush_done     : _               ,
+        i_inv_valid      : i_inv_v         ,
+        i_inv_addr       : i_inv_addr      ,
+        i_inv2_valid     : i_inv2_v        ,
+        i_inv2_addr      : i_inv2_addr     ,
+        i_chk_addr       : 64'd0           ,
+        o_chk_present    : _               ,
+        i_chk2_addr      : 64'd0           ,
+        o_chk2_present   : _               ,
+        i_chk3_addr      : 64'd0           ,
+        o_chk3_present   : _               ,
+        o_evict1_v       : ev1_v           ,
+        o_evict1_addr    : ev1_a           ,
+        o_evict2_v       : ev2_v           ,
+        o_evict2_addr    : ev2_a           ,
+        o_memr_req       : o_dmem_req      ,
+        i_memr_grant     : i_dmem_grant    ,
+        o_memw_req       : o_dmemw_req     ,
+        i_memw_grant     : i_dmemw_grant   ,
+    );
+
+    // ==== ROB, flush, commit, trap, csr ====
+
+    var rob_cm    : RobCm       [CW];
+    var rob_exc   : ExcHold         ;
+    var rob_head  : TagTok          ;
+    var retire_cnt: logic<RETIRE_CNT_W>;
+    var rec_set   : TagTok          ;
+    var snap_tag  : RobTag          ;
+    var dsnap     : DispSnap        ;
+    inst u_rob: rob::<CFG> (
+        clk                      ,
+        rst                      ,
+        i_alloc_valid: rob_v     ,
+        i_alloc      : rob_a     ,
+        o_alloc_tag  : rob_tag   ,
+        o_free       : rob_free  ,
+        i_wb         : wb        ,
+        o_cm         : rob_cm    ,
+        o_exc        : rob_exc   ,
+        o_head       : rob_head  ,
+        i_retire_cnt : retire_cnt,
+        i_kill       : kill      ,
+        i_rec_set    : rec_set   ,
+        i_snap_tag   : snap_tag  ,
+        o_snap       : dsnap     ,
+        o_walk       : walk      ,
+        o_walk_busy  : walk_busy ,
+        o_perf       : o_perf.rob,
+        o_chk        : o_chk.rob ,
+    );
+
+    inst u_flush: flush_ctrl::<CFG> (
+        clk                       ,
+        rst                       ,
+        i_wb       : wb           ,
+        i_cm_flush : cm_flush     ,
+        i_walk_busy: walk_busy    ,
+        o_snap_tag : snap_tag     ,
+        i_snap     : dsnap        ,
+        o_rec_set  : rec_set      ,
+        o_kill     : kill         ,
+        o_redirect : redirect     ,
+        o_perf     : o_perf.flush ,
+        o_chk      : o_chk.flush  ,
+    );
+
+    var trap_fire: logic     ;
+    var irq_take : logic     ;
+    var irq      : IrqReq    ;
+    var irq_q    : IrqReq    ;
+    var epc      : logic<64> ;
+    var target   : logic<64> ;
+    var tval     : logic<64> ;
+    var mret_pc  : logic<64> ;
+    var sret_pc  : logic<64> ;
+    var csr_cm   : CsrCm     ;
+    var csr_trap : CsrTrap   ;
+    inst u_commit: commit::<CFG> (
+        clk                                          ,
+        rst                                          ,
+        i_reset_pc                                   ,
+        i_cm                 : rob_cm                ,
+        i_exc                : rob_exc               ,
+        i_head               : rob_head              ,
+        i_lq_win             : lq_win                ,
+        i_sq_win             : sq_win                ,
+        i_ordering_empty     : ord_empty             ,
+        i_sb_credit          : sb_credit             ,
+        i_kill               : kill                  ,
+        i_sys_wr             : ep_sys[SYS_P]         ,
+        i_started            : ep_start[SYS_P]       ,
+        i_irq                : irq                   ,
+        i_priv               : priv                  ,
+        i_virt               : virt                  ,
+        i_trap_target        : target                ,
+        i_trap_tval          : tval                  ,
+        i_mret_pc            : mret_pc               ,
+        i_sret_pc            : sret_pc               ,
+        i_dbg_retire_limit_en                        ,
+        i_dbg_retire_limit                           ,
+        i_dbg_irq_mask                               ,
+        i_dbg_irq_allow                              ,
+        o_retire_cnt         : retire_cnt            ,
+        o_oldest             : oldest                ,
+        o_flush              : cm_flush              ,
+        o_trap_fire          : trap_fire             ,
+        o_irq_take           : irq_take              ,
+        o_irq_q              : irq_q                 ,
+        o_epc                : epc                   ,
+        o_ren_cm             : ren_cm                ,
+        o_lq_ret_cnt         : ld_ret                ,
+        o_sq_ret_cnt         : st_ret                ,
+        o_bar_ret            : cm_bar                ,
+        o_ftq_cm             : ftq_cm                ,
+        o_icache_inv         : ic_inv                ,
+        o_csr                : csr_cm                ,
+        o_retire                                     ,
+        o_irq_evt                                    ,
+        o_perf               : o_perf.cm             ,
+        o_chk                : o_chk.cm              ,
+    );
+
+    var medeleg: logic<64>;
+    var mtvec  : logic<64>;
+    var stvec  : logic<64>;
+    var mepc   : logic<64>;
+    var sepc   : logic<64>;
+    var vsepc  : logic<64>;
+    inst u_trap: trap_unit::<CFG> (
+        i_trap_fire: trap_fire  ,
+        i_irq_take : irq_take   ,
+        i_exc      : rob_exc.rec,
+        i_irq      : irq_q      ,
+        i_epc      : epc        ,
+        i_priv     : priv       ,
+        i_virt     : virt       ,
+        i_medeleg  : medeleg    ,
+        i_mtvec    : mtvec      ,
+        i_stvec    : stvec      ,
+        i_mepc     : mepc       ,
+        i_sepc     : sepc       ,
+        i_vsepc    : vsepc      ,
+        o_trap     : csr_trap   ,
+        o_target   : target     ,
+        o_tval     : tval       ,
+        o_mret_pc  : mret_pc    ,
+        o_sret_pc  : sret_pc    ,
+    );
+
+    var irq_pend : logic    ;
+    var irq_cause: logic<64>;
+    var irq_to_s : logic    ;
+    var irq_to_vs: logic    ;
+    always_comb {
+        irq.pending = irq_pend;
+        irq.code    = irq_cause[5:0];
+        irq.to_s    = irq_to_s;
+        irq.to_vs   = irq_to_vs;
+    }
+
+    inst u_csr: csr #(
+        INSTRET_CNT_W: RETIRE_CNT_W,
+    ) (
+        clk                                 ,
+        rst                                 ,
+        i_rd_addr      : ep_csr_a[SYS_P]    ,
+        o_rd_data      : csr_rd             ,
+        i_wr_en        : csr_cm.wr_en       ,
+        i_wr_addr      : csr_cm.wr_addr     ,
+        i_wr_data      : csr_cm.wr_data     ,
+        i_mtime        : i_mtime            ,
+        i_trap_fire    : csr_trap.fire      ,
+        i_trap_pc      : csr_trap.pc        ,
+        i_trap_cause   : csr_trap.cause     ,
+        i_trap_tval    : csr_trap.tval      ,
+        i_mret_fire    : csr_cm.mret        ,
+        i_sret_fire    : csr_cm.sret        ,
+        o_mtvec        : mtvec              ,
+        o_mepc         : mepc               ,
+        o_stvec        : stvec              ,
+        o_dbg_stval    : _                  ,
+        o_dbg_mtval    : _                  ,
+        o_sepc         : sepc               ,
+        o_medeleg      : medeleg            ,
+        o_mideleg      : _                  ,
+        o_satp         : _                  ,
+        o_priv         : priv               ,
+        o_priv_prev    : _                  ,
+        o_mstatus_sum  : _                  ,
+        o_mstatus_mxr  : _                  ,
+        o_mstatus_mprv : _                  ,
+        o_mstatus_mpp  : _                  ,
+        o_mstatus_tvm  : tvm                ,
+        o_mstatus_tsr  : tsr                ,
+        o_mstatus_fs   : _                  ,
+        o_mstatus_vs   : _                  ,
+        o_menvcfg_pbmte: _                  ,
+        o_menvcfg_adue : _                  ,
+        o_pmpcfg       : pmpcfg             ,
+        o_pmpaddr      : pmpaddr            ,
+        o_virt         : virt               ,
+        o_mstatus_mpv  : _                  ,
+        o_hgatp        : _                  ,
+        o_vsatp        : _                  ,
+        o_vsstatus_sum : _                  ,
+        o_vsstatus_mxr : _                  ,
+        o_vsstatus_fs  : _                  ,
+        o_hstatus_spvp : _                  ,
+        o_hstatus_hu   : _                  ,
+        o_hstatus_vtvm : _                  ,
+        o_hstatus_vtsr : _                  ,
+        o_virt_prev    : _                  ,
+        o_hedeleg      : _                  ,
+        o_hideleg      : _                  ,
+        o_vstvec       : _                  ,
+        o_vsepc        : vsepc              ,
+        o_pmm_m        : _                  ,
+        o_pmm_s        : _                  ,
+        o_pmm_u        : _                  ,
+        i_trap_to_s    : csr_trap.to_s      ,
+        i_trap_to_vs   : csr_trap.to_vs     ,
+        i_htval        : csr_trap.htval     ,
+        i_trap_gva     : csr_trap.gva       ,
+        i_irq_timer_m  : i_irq_timer_m      ,
+        i_irq_sw_m     : i_irq_sw_m         ,
+        i_irq_ext_m    : i_irq_ext_m        ,
+        i_irq_ext_s    : i_irq_ext_s        ,
+        o_irq_pending  : irq_pend           ,
+        o_irq_cause    : irq_cause          ,
+        o_irq_to_s     : irq_to_s           ,
+        o_irq_to_vs    : irq_to_vs          ,
+        i_instret_cnt  : csr_cm.instret_cnt ,
+        o_frm          : _                  ,
+        i_fflags_set   : csr_cm.fflags_set  ,
+        i_fflags       : csr_cm.fflags      ,
+        i_vxsat_set    : 1'b0               ,
+        o_vxrm         : _                  ,
+        i_vset_wr      : 1'b0               ,
+        i_set_vtype    : 64'd0              ,
+        i_set_vl       : 64'd0              ,
+        o_vtype        : _                  ,
+        o_vl           : _                  ,
+        i_vstart_wr    : 1'b0               ,
+        i_vstart_val   : 64'd0              ,
+        o_vstart       : _                  ,
+        i_hpm_events   : 8'd0               ,
+    );
+
+    // ==== Observation ====
+
+    always_comb {
+        for q in 0..NQ {
+            o_chk.iq[q]  = iq_chk[q];
+            o_perf.iq[q] = iq_perf[q];
+        }
+        for p in 0..IW {
+            o_chk.ep[p]  = ep_chk[p];
+            o_perf.ep[p] = ep_perf[p];
+        }
+        for w in 0..WB_N {
+            o_chk.rs[w]  = rs_chk[w];
+            o_perf.rs[w] = rs_perf[w];
+        }
+    }
+}

@@ -1,0 +1,1229 @@
+// LSU walking test: mem_pipe x MEM_W, lq, sq, sb, mem_port_arb and
+// dcache_port_adapter over the reused dcache and a behavioural memory with
+// the mem_ctrl slot protocol (1-cycle accept, latency, 8-beat stream; a
+// write channel with random grants; random line recalls).
+//
+// A synthetic driver plays dispatch, the memory IQ and commit. The program is
+// a pure function of the op index (loads, stores, fences over a few lines,
+// with misaligned and line-crossing accesses), so a kill simply re-dispatches
+// from the op after keep. Every load is checked at retire against a byte
+// image updated by stores in program order: a load that was not poisoned must
+// hold the value of every older store. Random partial kills, delayed store
+// data and recalls stress the park, re-issue and replay paths.
+module lsu_harness::<CFG: core_cfg> #(
+    param SEED: logic<64> = 1  ,
+    param NOPS: u32       = 600,
+) (
+    clk      : input  clock    ,
+    rst      : input  reset    ,
+    o_done   : output logic    ,
+    o_pass   : output logic    ,
+    o_retired: output logic<32>,
+    o_cov    : output logic<32>,
+    o_chk    : output logic<16>,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const MW: u32 = CFG::MEM_W;
+    const RN: u32 = CFG::ROB_N;
+    const RW: u32 = ROB_IDX_W;
+    const CMW: u32 = CFG::COMMIT_W;
+    const DW: u32 = CFG::RENAME_W;
+
+    // ---- program ----
+
+    function mix (
+        x: input logic<64>,
+    ) -> logic<64> {
+        var z: logic<64>;
+        z = x + 64'h9e37_79b9_7f4a_7c15;
+        z = (z ^ (z >> 30)) * 64'hbf58_476d_1ce4_e5b9;
+        z = (z ^ (z >> 27)) * 64'h94d0_49bb_1331_11eb;
+        return z ^ (z >> 31);
+    }
+
+    // kind: 0 load, 1 store, 2 fence
+    struct POp {
+        kind: logic<2> ,
+        op  : MemOp    ,
+        va  : logic<64>,
+        imm : logic<12>,
+        data: logic<64>,
+    }
+
+    function pop (
+        pi: input logic<32>,
+    ) -> POp {
+        var r  : POp      ;
+        var h  : logic<64>;
+        var off: logic<6> ;
+        var am : logic<3> ;
+        h         = mix(SEED ^ {32'd0, pi});
+        r.kind    = if h[3:0] <: 4'd7 || h[3:0] == 4'd15 ? 2'd0 : if h[3:0] <: 4'd14 ? 2'd1 : 2'd2;
+        r.op.st   = r.kind == 2'd1;
+        r.op.size = h[5:4];
+        r.op.sgn  = h[19];
+        am        = case h[5:4] {
+            2'd0   : 3'b111,
+            2'd1   : 3'b110,
+            2'd2   : 3'b100,
+            default: 3'b000,
+        };
+        off       = if h[18:16] == 3'd0 ? h[15:10] : {h[12:10], h[15:13] & am};
+        r.va      = 64'h8000_0000 | {49'd0, h[8:6], 12'd0} | {57'd0, h[9], 6'd0};
+        // a quarter of the accesses hit two hot dwords, for store-load overlap
+        if h[24:23] == 2'd0 {
+            off  = {2'd0, h[10], h[15:13] & am};
+            r.va = 64'h8000_0000;
+        }
+        r.va      = r.va + {58'd0, off};
+        r.imm     = {h[31], h[31:21]};
+        r.data    = mix(h);
+        return r;
+    }
+
+    // ---- DUT wiring ----
+
+    var kill_q: Kill;
+
+    var iss    : IqGrant    [MW];
+    var re     : MemReissue [MW];
+    var hold   : logic      [MW];
+    var arsv   : fu_pkg::WbSlot [MW];
+    var lq_gnt : logic          ;
+    var sq_gnt : logic          ;
+    var wb_ok  : logic      [MW];
+
+    var rf_a1 : PReg      [MW];
+    var rf_a2 : PReg      [MW];
+    var rf_d1 : logic<64> [MW];
+    var rf_d2 : logic<64> [MW];
+    var wb_bus: WbPacket  [WB_N];
+
+    var req_v : logic    [MW];
+    var req   : MemReq   [MW];
+    var resp  : MemResp  [MW];
+    var evt   : MemEvent     ;
+    var fwd_q : FwdQuery [MW];
+    var fwd_sq: FwdPart  [MW];
+    var fwd_sb: FwdPart  [MW];
+    var snap  : LqSnap   [MW];
+    var sta   : StaWrite [MW];
+    var std_p : StdWrite [MW]; // from the pipes
+    var std   : StdWrite [MW]; // to sq/lq, possibly delayed
+    var verd  : LqVerdict[MW];
+    var wb    : WbPacket [MW];
+    var wake  : Wake     [MW];
+    var pperf : MemPipePerf [MW];
+    var iq_rel: IqRelease [MW];
+
+    var lq_av    : logic     [DW]    ;
+    var lq_alloc : LqAlloc   [DW]    ;
+    var sq_av    : logic     [DW]    ;
+    var sq_alloc : SqAlloc   [DW]    ;
+    var lq_free  : logic<LQ_CNT_W>   ;
+    var sq_free  : logic<SQ_CNT_W>   ;
+    var lq_atag  : LqTag     [DW + 1];
+    var sq_atag  : SqTag     [DW + 1];
+    var bar_alloc: logic<TAKE_W>     ;
+    var bar_ret  : logic             ;
+    var bar_after: BarSeq    [DW + 1];
+    var bar_rt   : BarSeq            ;
+    var lfence   : LoadFence         ;
+    var lq_re    : MemReissue        ;
+    var sq_re    : MemReissue        ;
+    var lq_win   : LqCmWin   [CMW]   ;
+    var sq_win   : SqCmWin   [MW]    ;
+    var split_lo : logic<64>         ;
+    var lq_ret   : logic<RETIRE_CNT_W>;
+    var sq_ret   : logic<RETIRE_CNT_W>;
+    var push     : SbPush    [PUSH_W];
+    var sq_head  : SqTag             ;
+    var sb_free  : logic<SB_CREDIT_W>;
+    var ord_empty: logic             ;
+    var lqperf   : LqPerf            ;
+    var sqperf   : SqPerf            ;
+    var sbperf   : SbPerf            ;
+    var arbperf  : ArbPerf           ;
+    var adperf   : AdapterPerf       ;
+    var coh_v    : logic     [COH_N] ;
+    var coh_line : logic<50> [COH_N] ;
+    var tok_v    : logic             ;
+    var tokt     : TagTok            ;
+    var tok      : RobTag            ;
+
+    var dr_v   : logic        ;
+    var dr_addr: logic<64>    ;
+    var dr_data: logic<64> [8];
+    var dr_strb: logic<8>  [8];
+    var dr_urg : logic        ;
+    var dr_ack : logic        ;
+
+    var c_lq : logic<4>;
+    var c_sq : logic<4>;
+    var c_sb : logic<2>;
+    var c_ad : logic<3>;
+
+    const PMA: pma_pkg::PmaRegion [1] = '{pma_pkg::PmaRegion'{base: 56'h80_0000_0000 >> 8, mask: 56'hff_ffff_fe00_0000, attr: pma_pkg::PmaAttr'{target: pma_pkg::Target::DRAM, backed: 1, cacheable: 1, coherent: 1, executable: 1, amo: pma_pkg::AmoClass::FULL, idempotent: 1, io_ordered: 0, misaligned_ok: 1, pte_ok: 1, cbo_ok: 1}}};
+
+    always_comb {
+        for w in 0..WB_N {
+            wb_bus[w] = '0;
+        }
+    }
+
+    for p in 0..MW :g_pipe {
+        inst u_pipe: mem_pipe::<CFG> #(
+            PMA_N  : 1  ,
+            PMA_TBL: PMA,
+        ) (
+            clk                             ,
+            rst                             ,
+            i_kill        : kill_q          ,
+            i_iss         : iss[p]          ,
+            i_re          : re[p]           ,
+            o_iq_rel      : iq_rel[p]       ,
+            o_rf_addr1    : rf_a1[p]        ,
+            o_rf_addr2    : rf_a2[p]        ,
+            i_rf_int1     : rf_d1[p]        ,
+            i_rf_int2     : rf_d2[p]        ,
+            i_rf_fp2      : 64'd0           ,
+            i_wb          : wb_bus          ,
+            i_priv        : csr_pkg::PrivLevel::MACHINE,
+            i_pmpcfg      : '{64'd0, 64'd0} ,
+            i_pmpaddr     : '{default: 64'd0},
+            o_req_valid   : req_v[p]        ,
+            o_req         : req[p]          ,
+            i_resp        : resp[p]         ,
+            o_fwd_q       : fwd_q[p]        ,
+            i_fwd_sq      : fwd_sq[p]       ,
+            i_fwd_sb      : fwd_sb[p]       ,
+            o_snap        : snap[p]         ,
+            o_sta         : sta[p]          ,
+            o_std         : std_p[p]        ,
+            i_split_lo    : split_lo        ,
+            o_verdict     : verd[p]         ,
+            o_wake        : wake[p]         ,
+            o_wb          : wb[p]           ,
+            o_perf        : pperf[p]        ,
+        );
+    }
+
+    inst u_arb: mem_port_arb::<CFG> (
+        clk                      ,
+        rst                      ,
+        i_wb_ok    : wb_ok       ,
+        i_lq_re    : lq_re       ,
+        i_sq_re    : sq_re       ,
+        i_iq_resv  : '{default: 0 as fu_pkg::WbSlot},
+        o_port_hold: hold        ,
+        o_re       : re          ,
+        o_resv     : arsv        ,
+        o_lq_gnt   : lq_gnt      ,
+        o_sq_gnt   : sq_gnt      ,
+        o_perf     : arbperf     ,
+    );
+
+    inst u_lq: lq::<CFG> (
+        clk                          ,
+        rst                          ,
+        i_kill       : kill_q        ,
+        i_alloc_valid: lq_av         ,
+        i_alloc      : lq_alloc      ,
+        o_free       : lq_free       ,
+        o_alloc_tag  : lq_atag       ,
+        i_bar_alloc  : bar_alloc     ,
+        i_bar_ret    : bar_ret       ,
+        o_bar_after  : bar_after     ,
+        o_bar_ret    : bar_rt        ,
+        o_load_fence : lfence        ,
+        i_snap       : snap          ,
+        i_sta        : sta           ,
+        i_verdict    : verd          ,
+        i_mem_ev     : evt           ,
+        i_coh_v      : coh_v         ,
+        i_coh_line   : coh_line      ,
+        i_std        : std           ,
+        i_sq_head    : sq_head       ,
+        i_oldest     : tokt          ,
+        i_retire_cnt : lq_ret        ,
+        o_reissue    : lq_re         ,
+        i_reissue_gnt: lq_gnt        ,
+        o_win        : lq_win        ,
+        o_split_lo   : split_lo      ,
+        o_chk        : c_lq          ,
+        o_perf       : lqperf        ,
+    );
+
+    inst u_sq: sq::<CFG> (
+        clk                          ,
+        rst                          ,
+        i_kill       : kill_q        ,
+        i_alloc_valid: sq_av         ,
+        i_alloc      : sq_alloc      ,
+        o_free       : sq_free       ,
+        o_alloc_tag  : sq_atag       ,
+        i_sta        : sta           ,
+        i_std        : std           ,
+        i_fwd_q      : fwd_q         ,
+        o_fwd        : fwd_sq        ,
+        o_reissue    : sq_re         ,
+        i_reissue_gnt: sq_gnt        ,
+        o_win        : sq_win        ,
+        i_retire_cnt : sq_ret        ,
+        o_push       : push          ,
+        o_head       : sq_head       ,
+        o_chk        : c_sq          ,
+        o_perf       : sqperf        ,
+    );
+
+    inst u_sb: sb::<CFG> (
+        clk                             ,
+        rst                             ,
+        i_push          : push          ,
+        o_credit        : sb_free       ,
+        i_fwd_q         : fwd_q         ,
+        o_fwd           : fwd_sb        ,
+        o_drain_v       : dr_v          ,
+        o_drain_addr    : dr_addr       ,
+        o_drain_data    : dr_data       ,
+        o_drain_strb    : dr_strb       ,
+        o_drain_urgent  : dr_urg        ,
+        i_drain_ack     : dr_ack        ,
+        o_ordering_empty: ord_empty     ,
+        o_chk           : c_sb          ,
+        o_perf          : sbperf        ,
+    );
+
+    // ---- dcache and adapter ----
+
+    var dc_addr  : logic<64>;
+    var dc_ren   : logic    ;
+    var dc_renf  : logic    ;
+    var dc_addr_r: logic<64>;
+    var dc_ren_r : logic    ;
+    var dc_rdata : logic<64>;
+    var dc_stall : logic    ;
+    var dc_dv    : logic    ;
+    var dc_frd   : logic<64>;
+    var dc_fdr   : logic    ;
+    var dc_fcmp  : logic    ;
+    var dc_fab   : logic    ;
+    var dc_fst   : logic    ;
+    var dc_fstl  : logic<58>;
+    var dc_fsto  : logic<3> ;
+    var dc_fbusy : logic    ;
+    var dc_fline : logic<58>;
+    var dc_foff  : logic<3> ;
+    var dc_terms : dcache_pkg::StallTerms;
+    var dc_dhu   : logic    ;
+    var dc_dhn   : logic<64>;
+    var ev1_v    : logic    ;
+    var ev1_a    : logic<64>;
+    var ev2_v    : logic    ;
+    var ev2_a    : logic<64>;
+
+    var mr_addr : logic<64>    ;
+    var mr_req  : logic        ;
+    var mr_gnt  : logic        ;
+    var mr_data : logic<64>    ;
+    var mw_addr : logic<64>    ;
+    var mw_data : logic<64> [8];
+    var mw_strb : logic<8>  [8];
+    var mw_wen  : logic        ;
+    var mw_wb   : logic        ;
+    var mw_req  : logic        ;
+    var mw_gnt  : logic        ;
+    var pr_v_q  : logic        ;
+    var pr_a_q  : logic<64>    ;
+    var pr_ack  : logic        ;
+
+    inst u_ad: dcache_port_adapter::<CFG> (
+        clk                                ,
+        rst                                ,
+        i_kill              : kill_q       ,
+        i_req_valid         : req_v        ,
+        i_req               : req          ,
+        o_req_ready         : _            ,
+        o_resp              : resp         ,
+        o_evt               : evt          ,
+        o_dc_addr           : dc_addr      ,
+        o_dc_ren            : dc_ren       ,
+        o_dc_ren_folded     : dc_renf      ,
+        o_dc_addr_r         : dc_addr_r    ,
+        o_dc_ren_r          : dc_ren_r     ,
+        i_dc_rdata          : dc_rdata     ,
+        i_dc_stall          : dc_stall     ,
+        i_dc_data_valid     : dc_dv        ,
+        i_dc_fill_rdata     : dc_frd       ,
+        i_dc_fill_data_ready: dc_fdr       ,
+        i_dc_fill_complete  : dc_fcmp      ,
+        i_dc_fill_aborted   : dc_fab       ,
+        i_dc_fill_start     : dc_fst       ,
+        i_dc_fill_start_line: dc_fstl      ,
+        i_dc_fill_start_off : dc_fsto      ,
+        i_dc_fill_busy      : dc_fbusy     ,
+        i_dc_fill_line      : dc_fline     ,
+        i_dc_fill_off       : dc_foff      ,
+        i_dc_stall_terms    : dc_terms     ,
+        i_dc_dhit_used      : dc_dhu       ,
+        i_dc_dhit_rdata_next: dc_dhn       ,
+        i_inv_v             : 1'b0         ,
+        i_inv_addr          : 64'd0        ,
+        i_inv2_v            : 1'b0         ,
+        i_inv2_addr         : 64'd0        ,
+        i_ev1_v             : ev1_v        ,
+        i_ev1_addr          : ev1_a        ,
+        i_ev2_v             : ev2_v        ,
+        i_ev2_addr          : ev2_a        ,
+        o_chk               : c_ad         ,
+        o_perf              : adperf       ,
+    );
+
+    inst u_dc: dcache (
+        clk                                ,
+        rst                                ,
+        i_addr           : dc_addr         ,
+        i_wdata          : 64'd0           ,
+        i_wen            : 1'b0            ,
+        i_wen_excl       : 1'b0            ,
+        i_wen_excl_q     : 1'b0            ,
+        i_wdata_hi       : 64'd0           ,
+        i_ren            : dc_ren          ,
+        i_uncached       : 1'b0            ,
+        i_wstrb          : 8'd0            ,
+        i_wstrb_hi       : 8'd0            ,
+        i_load_next      : 1'b0            ,
+        i_amo_read       : 1'b0            ,
+        i_addr2          : 64'd0           ,
+        i_ren2           : 1'b0            ,
+        i_load_next2     : 1'b0            ,
+        i_addr_r         : dc_addr_r       ,
+        i_ren_r          : dc_ren_r        ,
+        i_ren_folded     : dc_renf         ,
+        o_rdata2         : _               ,
+        o_rdata2_next    : _               ,
+        o_hit2           : _               ,
+        i_saddr          : dr_addr         ,
+        i_swen           : dr_v            ,
+        i_sdrain_urgent  : dr_urg          ,
+        i_swdata         : dr_data         ,
+        i_swstrb         : dr_strb         ,
+        o_sdrain_ack     : dr_ack          ,
+        o_rdata          : dc_rdata        ,
+        o_rdata_next     : _               ,
+        o_rdata_next_miss: _               ,
+        o_stall          : dc_stall        ,
+        o_data_valid     : dc_dv           ,
+        o_miss_valid     : _               ,
+        o_miss_offset    : _               ,
+        o_fill_complete  : dc_fcmp         ,
+        o_fill_rdata     : dc_frd          ,
+        o_fill_aborted   : dc_fab          ,
+        o_fill_data_ready: dc_fdr          ,
+        o_hit_safe       : _               ,
+        o_mshr_alloc     : _               ,
+        o_stall_why      : _               ,
+        o_fill_start     : dc_fst          ,
+        o_fill_start_line: dc_fstl         ,
+        o_fill_start_off : dc_fsto         ,
+        o_fill_start_rfo : _               ,
+        o_fill_busy      : dc_fbusy        ,
+        o_fill_line      : dc_fline        ,
+        o_fill_off       : dc_foff         ,
+        o_stall_terms    : dc_terms        ,
+        o_dhit_used      : dc_dhu          ,
+        o_dhit_rdata_next: dc_dhn          ,
+        o_memr_addr      : mr_addr         ,
+        o_memr_ren       : _               ,
+        o_memr_rfo       : _               ,
+        i_fill_excl      : 1'b1            ,
+        i_mem_rdata      : mr_data         ,
+        o_memw_addr      : mw_addr         ,
+        o_memw_wdata     : mw_data         ,
+        o_memw_wstrb     : mw_strb         ,
+        o_memw_wen       : mw_wen          ,
+        o_memw_wb        : mw_wb           ,
+        i_probe_v        : pr_v_q          ,
+        i_probe_addr     : pr_a_q          ,
+        i_probe_self     : 1'b0            ,
+        o_probe_ack      : pr_ack          ,
+        i_flush_req      : 1'b0            ,
+        o_flush_done     : _               ,
+        i_inv_valid      : 1'b0            ,
+        i_inv_addr       : 64'd0           ,
+        i_inv2_valid     : 1'b0            ,
+        i_inv2_addr      : 64'd0           ,
+        i_chk_addr       : 64'd0           ,
+        o_chk_present    : _               ,
+        i_chk2_addr      : 64'd0           ,
+        o_chk2_present   : _               ,
+        i_chk3_addr      : 64'd0           ,
+        o_chk3_present   : _               ,
+        o_evict1_v       : ev1_v           ,
+        o_evict1_addr    : ev1_a           ,
+        o_evict2_v       : ev2_v           ,
+        o_evict2_addr    : ev2_a           ,
+        o_memr_req       : mr_req          ,
+        i_memr_grant     : mr_gnt          ,
+        o_memw_req       : mw_req          ,
+        i_memw_grant     : mw_gnt          ,
+    );
+
+    assign coh_v[0]    = 1'b0;
+    assign coh_line[0] = '0;
+    assign coh_v[1]    = 1'b0;
+    assign coh_line[1] = '0;
+    assign coh_v[2]    = ev1_v;
+    assign coh_line[2] = ev1_a[55:6];
+    assign coh_v[3]    = ev2_v;
+    assign coh_line[3] = ev2_a[55:6];
+
+    // ---- memory model ----
+
+    var lfsr: logic<64>;
+    var mem  : logic<64> [4096]; // 32 KiB at 0x8000_0000; mix(dword index) until written
+    var mem_w: logic     [4096];
+
+    function mem_init (
+        d: input logic<12>,
+    ) -> logic<64> {
+        return mix({52'd0, d} ^ 64'h5555);
+    }
+
+    var rs_q: logic<2>; // 0 idle, 1 latency, 2 stream
+    var rw_q: logic<4>;
+    var rb_q: logic<3>;
+    assign mr_gnt  = (rs_q == 2'd0 && mr_req && lfsr[40]) || rs_q == 2'd2;
+    assign mr_data = if mem_w[mr_addr[14:3]] ? mem[mr_addr[14:3]] : mem_init(mr_addr[14:3]);
+    assign mw_gnt  = mw_req && lfsr[41:40] != 2'd0;
+
+    var mw_old: logic<64> [8];
+    always_comb {
+        for l in 0..8 {
+            let d: logic<12> = {mw_addr[14:6], l as 3};
+            mw_old[l] = if mem_w[d] ? mem[d] : mem_init(d);
+        }
+    }
+
+    // ---- driver state ----
+
+    var r_pi   : logic<32>       [RN];
+    var r_done : logic           [RN];
+    var r_exc  : logic           [RN];
+    var r_val  : logic<64>       [RN];
+    var r_lq   : LqTag           [RN];
+    var r_sq   : SqTag           [RN];
+    var r_lqlim: LqTag           [RN];
+    var r_sqlim: SqTag           [RN];
+    var r_slq  : LqTag           [RN]; // dispatch snapshot after this op
+    var r_ssq  : SqTag           [RN];
+    var r_sbar : BarSeq          [RN];
+    var r_iniq : logic           [RN];
+    var r_barw : BarSeq          [RN];
+    var r_obey : logic           [RN];
+    var sq_rob : RobTag          [CFG::SQ_N];
+
+    var head_q : RobTag   ;
+    var tail_q : RobTag   ;
+    var disp_q : logic<32>;
+    var gold   : logic<8> [32768]; // program-order byte image; mem_init until written
+    var gold_w : logic    [32768];
+    var ok_q   : logic    ;
+    var nret_q : logic<32>;
+    var idle_q : logic<16>;
+    var cyc_q  : logic<32>;
+
+    var cnt_q  : logic<16> [32]; // coverage counters
+
+    var hv_q   : logic   [MW];
+    var hd_q   : StdWrite[MW];
+    var hc_q   : logic<4>[MW];
+
+    let rob_cnt: logic<32> = if head_q.wrap == tail_q.wrap ? (tail_q.idx as 32) - (head_q.idx as 32) : RN - (head_q.idx as 32) + (tail_q.idx as 32);
+
+    function mk_uop (
+        po: input POp,
+    ) -> logic<UOP_W> {
+        return (if po.kind == 2'd1 ? {1'b0, po.op.size} : {!po.op.sgn, po.op.size}) as UOP_W;
+    }
+
+    function radv (
+        t: input RobTag   ,
+        k: input logic<32>,
+    ) -> RobTag {
+        var r: RobTag   ;
+        var s: logic<32>;
+        s = (t.idx as 32) + k;
+        r.idx  = s[RW - 1:0];
+        r.wrap = if s >= RN ? ~t.wrap : t.wrap;
+        return r;
+    }
+
+    function ridx (
+        t: input RobTag   ,
+        k: input logic<32>,
+    ) -> logic<RW> {
+        let r: RobTag = radv(t, k);
+        return r.idx;
+    }
+
+    function live_at (
+        e: input logic<32>,
+        h: input RobTag   ,
+        t: input RobTag   ,
+    ) -> logic {
+        return if h.wrap == t.wrap ? (e >= (h.idx as 32) && e <: (t.idx as 32)) : (e >= (h.idx as 32) || e <: (t.idx as 32));
+    }
+
+    assign tok_v      = rob_cnt != 0 && !kill_q.valid;
+    assign tokt.valid = tok_v;
+    assign tokt.tag   = tok;
+    assign tok   = head_q;
+
+    // ---- dispatch ----
+
+    var d_take : logic<32>  ;
+    var d_op   : POp    [DW];
+    var d_nld  : logic<32> [DW + 1];
+    var d_nst  : logic<32> [DW + 1];
+    var d_nbar : logic<32> [DW + 1];
+    always_comb {
+        d_nld[0]  = 0;
+        d_nst[0]  = 0;
+        d_nbar[0] = 0;
+        d_take    = 0;
+        for l in 0..DW {
+            d_op[l]       = pop(disp_q + l);
+            d_nld[l + 1]  = d_nld[l] + ((d_op[l].kind == 2'd0) as 32);
+            d_nst[l + 1]  = d_nst[l] + ((d_op[l].kind == 2'd1) as 32);
+            d_nbar[l + 1] = d_nbar[l] + ((d_op[l].kind == 2'd2) as 32);
+            if d_take == l && rob_cnt + l + 1 <= RN && d_nld[l + 1] <= (lq_free as 32) && d_nst[l + 1] <= (sq_free as 32) && !kill_q.valid && lfsr[3 + l] {
+                d_take = l + 1;
+            }
+        }
+        for l in 0..DW {
+            let rt: RobTag = radv(tail_q, l);
+            lq_av[l]    = 1'b0;
+            lq_alloc[l] = '0;
+            sq_av[l]    = 1'b0;
+            sq_alloc[l] = '0;
+        }
+        // compact the loads and stores of the taken lanes into slots
+        for l in 0..DW {
+            let rt: RobTag = radv(tail_q, l);
+            if l <: d_take && d_op[l].kind == 2'd0 {
+                lq_av[d_nld[l]]             = 1'b1;
+                lq_alloc[d_nld[l]].ex.rob   = rt;
+                lq_alloc[d_nld[l]].ex.pdst.cls = RegClass::FP;
+                lq_alloc[d_nld[l]].ex.pdst.idx = rt.idx as PREG_W;
+                lq_alloc[d_nld[l]].ex.has_rd = 1'b1;
+                lq_alloc[d_nld[l]].fu       = FuKind::LOAD;
+                lq_alloc[d_nld[l]].uop      = mk_uop(d_op[l]);
+                lq_alloc[d_nld[l]].sq_lim   = sq_atag[d_nst[l]];
+            }
+            if l <: d_take && d_op[l].kind == 2'd1 {
+                sq_av[d_nst[l]]             = 1'b1;
+                sq_alloc[d_nst[l]].rob      = rt;
+                sq_alloc[d_nst[l]].fu       = FuKind::STORE;
+                sq_alloc[d_nst[l]].uop      = mk_uop(d_op[l]);
+                sq_alloc[d_nst[l]].lq_lim   = lq_atag[d_nld[l]];
+            }
+        }
+        var nb: logic<32>;
+        nb = 0;
+        for l in 0..DW {
+            if l <: d_take && d_op[l].kind == 2'd2 {
+                nb = nb + 1;
+            }
+        }
+        bar_alloc = nb as TAKE_W;
+    }
+
+    // ---- memory IQ (oldest eligible, with random skips) ----
+
+    var sel_v: logic     [MW];
+    var sel_e: logic<RW> [MW];
+    always_comb {
+        var taken: logic<RN>;
+        taken = '0;
+        for p in 0..MW {
+            sel_v[p]   = 1'b0;
+            sel_e[p]   = '0;
+            for k in 0..RN {
+                let e : logic<RW> = ridx(head_q, k);
+                let el: logic     = (k as 32) <: rob_cnt && r_iniq[e] && !taken[e] && !(r_obey[e] && !(lfence.valid && lfence.seq == r_barw[e]));
+                if el && !sel_v[p] && !hold[p] && !kill_q.valid && lfsr[(k + p * 7) % 64] {
+                    sel_v[p] = 1'b1;
+                    sel_e[p] = e;
+                }
+            }
+            if sel_v[p] {
+                taken[sel_e[p]] = 1'b1;
+            }
+        }
+    }
+
+    for p in 0..MW :g_iss {
+        let e : logic<RW> = sel_e[p];
+        let po: POp       = pop(r_pi[e]);
+        always_comb {
+            iss[p]              = '0;
+            iss[p].valid        = sel_v[p];
+            iss[p].tag.rob.wrap = if e >= head_q.idx ? head_q.wrap : ~head_q.wrap;
+            iss[p].tag.rob.idx  = e;
+            iss[p].tag.pdst.cls = RegClass::FP;
+            iss[p].tag.pdst.idx = e as PREG_W;
+            iss[p].tag.has_rd   = po.kind == 2'd0;
+            iss[p].fu           = if po.kind == 2'd0 ? FuKind::LOAD : FuKind::STORE;
+            iss[p].cold.uop     = mk_uop(po);
+            iss[p].cold.imm     = {po.imm[11] repeat 20, po.imm};
+            iss[p].cold.lq      = if po.kind == 2'd0 ? r_lq[e] : r_lqlim[e];
+            iss[p].cold.sq      = if po.kind == 2'd0 ? r_sqlim[e] : r_sq[e];
+            iss[p].src[0].en    = 1'b1;
+            iss[p].src[0].pr.cls = RegClass::INT;
+            iss[p].src[0].pr.idx = e as PREG_W;
+            iss[p].src[1].en    = po.kind == 2'd1;
+            iss[p].src[1].pr.cls = RegClass::INT;
+            iss[p].src[1].pr.idx = (e as PREG_W) + (RN as PREG_W);
+            wb_ok[p]           = 1'b1;
+        }
+        // the register file: rs1 = va - imm, rs2 = store data
+        let p1: POp = pop(r_pi[rf_a1[p].idx[RW - 1:0]]);
+        let p2: POp = pop(r_pi[rf_a2[p].idx[RW - 1:0]]);
+        assign rf_d1[p] = p1.va - {p1.imm[11] repeat 52, p1.imm};
+        assign rf_d2[p] = p2.data;
+    }
+
+    // ---- store data delay (separate STD arrival) ----
+
+    for p in 0..MW :g_std {
+        let rel: logic = hv_q[p] && hc_q[p] == 4'd0;
+        let dly: logic = std_p[p].valid && !hv_q[p] && lfsr[45 + p];
+        always_comb {
+            std[p] = if rel ? hd_q[p] : if dly ? '0 : std_p[p];
+        }
+    }
+
+    // ---- commit ----
+
+    var c_ret  : logic<32>;
+    var c_ld   : logic<32>;
+    var c_st   : logic<32>;
+    var c_fence: logic    ;
+    var c_rply : logic    ;
+    var c_bad  : logic    ;
+    always_comb {
+        var stop : logic    ;
+        var lines: logic<32>;
+        c_ret   = 0;
+        c_ld    = 0;
+        c_st    = 0;
+        c_fence = 1'b0;
+        c_rply  = 1'b0;
+        c_bad   = 1'b0;
+        stop    = kill_q.valid;
+        lines   = 0;
+        for l in 0..CMW {
+            let e : logic<RW> = ridx(head_q, l);
+            let po: POp       = pop(r_pi[e]);
+            if !stop {
+                if (l as 32) >= rob_cnt {
+                    stop = 1'b1;
+                } else if po.kind == 2'd2 {
+                    if l == 0 && ord_empty {
+                        c_ret   = 1;
+                        c_fence = 1'b1;
+                    }
+                    stop = 1'b1;
+                } else if !r_done[e] {
+                    stop = 1'b1;
+                } else if po.kind == 2'd0 {
+                    var pz: logic;
+                    var fd: logic;
+                    pz = 1'b0;
+                    fd = 1'b0;
+                    for k in 0..CMW {
+                        if lq_win[k].valid && lq_win[k].tag == r_lq[e] {
+                            pz = lq_win[k].poison;
+                            fd = 1'b1;
+                        }
+                    }
+                    if !fd || r_exc[e] {
+                        c_bad = 1'b1;
+                        stop  = 1'b1;
+                    } else if pz {
+                        if l == 0 {
+                            c_rply = 1'b1;
+                        }
+                        stop = 1'b1;
+                    } else {
+                        c_ret = c_ret + 1;
+                        c_ld  = c_ld + 1;
+                    }
+                } else {
+                    var rk: logic;
+                    var sp: logic;
+                    rk = 1'b0;
+                    sp = 1'b0;
+                    for k in 0..MW {
+                        if sq_win[k].valid && sq_win[k].tag == r_sq[e] {
+                            rk = sq_win[k].retire_ok;
+                            sp = sq_win[k].lines == 2'd2;
+                        }
+                    }
+                    if r_exc[e] {
+                        c_bad = 1'b1;
+                        stop  = 1'b1;
+                    } else if !rk || c_st + 1 >: MW || lines + 1 + (sp as 32) >: (sb_free as 32) || lines + 1 + (sp as 32) >: PUSH_W {
+                        stop = 1'b1;
+                    } else {
+                        c_ret = c_ret + 1;
+                        c_st  = c_st + 1;
+                        lines = lines + 1 + (sp as 32);
+                    }
+                }
+            }
+        }
+        lq_ret  = c_ld as RETIRE_CNT_W;
+        sq_ret  = c_st as RETIRE_CNT_W;
+        bar_ret = c_fence;
+    }
+
+    // expected value of each retiring load from the byte image
+    var c_mis: logic;
+    var c_mpi: logic<32>;
+    var c_mex: logic<64>;
+    var c_mgt: logic<64>;
+    always_comb {
+        c_mis = 1'b0;
+        c_mpi = 0;
+        c_mex = 0;
+        c_mgt = 0;
+        for l in 0..CMW {
+            let e : logic<RW> = ridx(head_q, l);
+            let po: POp       = pop(r_pi[e]);
+            var raw: logic<64>;
+            var ex : logic<64>;
+            for b in 0..8 {
+                let gi: logic<15> = po.va[14:0] + b;
+                let iv: logic<64> = mem_init(gi[14:3]);
+                raw[b * 8+:8] = if gold_w[gi] ? gold[gi] : iv[gi[2:0] * 8+:8];
+                // older stores retiring in this cycle (earlier lanes)
+                for j in 0..l {
+                    let ej: logic<RW> = ridx(head_q, j);
+                    let pj: POp       = pop(r_pi[ej]);
+                    let dj: logic<15> = gi - pj.va[14:0];
+                    if (j as 32) <: c_ret && pj.kind == 2'd1 && dj <: ({11'd0, 4'd1} << pj.op.size) {
+                        raw[b * 8+:8] = pj.data[dj[2:0] * 8+:8];
+                    }
+                }
+            }
+            ex = case po.op.size {
+                2'd0   : if po.op.sgn ? {raw[7] repeat 56, raw[7:0]} : {56'd0, raw[7:0]},
+                2'd1   : if po.op.sgn ? {raw[15] repeat 48, raw[15:0]} : {48'd0, raw[15:0]},
+                2'd2   : if po.op.sgn ? {raw[31] repeat 32, raw[31:0]} : {32'd0, raw[31:0]},
+                default: raw,
+            };
+            if (l as 32) <: c_ret && po.kind == 2'd0 && r_val[e] != ex {
+                c_mis = 1'b1;
+                c_mpi = r_pi[e];
+                c_mex = ex;
+                c_mgt = r_val[e];
+            }
+        }
+    }
+
+    // ---- kills ----
+
+    var k_next: Kill     ;
+    var k_pi  : logic<32>;
+    always_comb {
+        let kn: logic<32> = if rob_cnt == 0 ? 1 : rob_cnt;
+        let kr: RobTag    = radv(head_q, lfsr[63:56] % kn);
+        let kk: logic<RW> = kr.idx;
+        k_next          = '0;
+        k_pi            = disp_q;
+        if c_rply {
+            k_next.valid = 1'b1;
+            k_next.full  = 1'b1;
+            k_pi         = r_pi[head_q.idx];
+        } else if !kill_q.valid && c_ret == 0 && rob_cnt >= 2 && lfsr[22:16] == 7'd0 {
+            k_next.valid   = 1'b1;
+            k_next.keep    = kr;
+            k_next.lq_tail = r_slq[kk];
+            k_next.sq_tail = r_ssq[kk];
+            k_next.bar_seq = r_sbar[kk];
+            k_pi           = r_pi[kk] + 1;
+        }
+    }
+    var kpi_q: logic<32>;
+
+    // ---- sequential ----
+
+    always_ff {
+        if_reset {
+            lfsr   = SEED ^ 64'h0123_4567_89ab_cdef;
+            kill_q = '0;
+            head_q = '0;
+            tail_q = '0;
+            disp_q = 0;
+            kpi_q  = 0;
+            ok_q   = 1'b1;
+            nret_q = 0;
+            idle_q = 0;
+            cyc_q  = 0;
+            rs_q   = 2'd0;
+            rw_q   = 4'd0;
+            rb_q   = 3'd0;
+            pr_v_q = 1'b0;
+            pr_a_q = '0;
+            for i in 0..32 {
+                cnt_q[i] = 0;
+            }
+            for p in 0..MW {
+                hv_q[p] = 1'b0;
+                hc_q[p] = 4'd0;
+            }
+            for e in 0..RN {
+                r_iniq[e] = 1'b0;
+                r_done[e] = 1'b0;
+            }
+            for d in 0..4096 {
+                mem_w[d] = 1'b0;
+            }
+            for b in 0..32768 {
+                gold_w[b] = 1'b0;
+            }
+        } else {
+            var t: logic<64>;
+            t     = lfsr ^ (lfsr << 13);
+            t     = t ^ (t >> 7);
+            t     = t ^ (t << 17);
+            lfsr  = t;
+            cyc_q = cyc_q + 1;
+
+            // memory read slot
+            case rs_q {
+                2'd0: if mr_gnt {
+                    rs_q = 2'd1;
+                    rw_q = {2'd0, lfsr[47:46]} + 4'd1;
+                }
+                2'd1: {
+                    rw_q = rw_q - 4'd1;
+                    if rw_q == 4'd1 {
+                        rs_q = 2'd2;
+                        rb_q = 3'd0;
+                    }
+                }
+                default: {
+                    rb_q = rb_q + 3'd1;
+                    if rb_q == 3'd7 {
+                        rs_q = 2'd0;
+                    }
+                }
+            }
+            // memory write channel
+            if mw_wen {
+                for l in 0..8 {
+                    var m: logic<64>;
+                    for b in 0..8 {
+                        m[b * 8+:8] = {mw_strb[l][b] repeat 8};
+                    }
+                    if mw_strb[l] != 8'd0 {
+                        mem[{mw_addr[14:6], l as 3}]   = (mw_old[l] & ~m) | (mw_data[l] & m);
+                        mem_w[{mw_addr[14:6], l as 3}] = 1'b1;
+                    }
+                }
+            }
+            // recalls of random lines
+            if pr_v_q && (pr_ack || (mw_wen && mw_wb && mw_addr[55:6] == pr_a_q[55:6])) {
+                pr_v_q = 1'b0;
+            } else if !pr_v_q && lfsr[55:49] == 7'd0 {
+                pr_v_q = 1'b1;
+                pr_a_q = 64'h8000_0000 | {49'd0, lfsr[12:10], 12'd0} | {56'd0, lfsr[14:13], 6'd0};
+            }
+
+            // store data delay
+            for p in 0..MW {
+                let rel: logic = hv_q[p] && hc_q[p] == 4'd0;
+                if hv_q[p] && !rel {
+                    hc_q[p] = hc_q[p] - 4'd1;
+                }
+                if rel {
+                    hv_q[p] = 1'b0;
+                }
+                if std_p[p].valid && (rel || (!hv_q[p] && lfsr[45 + p])) {
+                    // a store data that is not passed through waits here
+                    hv_q[p] = 1'b1;
+                    hd_q[p] = std_p[p];
+                    hc_q[p] = lfsr[53:50];
+                }
+                if kill_q.valid && hv_q[p] && killed(kill_q, sq_rob[hd_q[p].sq.idx]) {
+                    hv_q[p] = 1'b0;
+                }
+            }
+
+            // completion packets
+            for p in 0..MW {
+                if wb[p].valid {
+                    r_done[wb[p].tag.rob.idx] = 1'b1;
+                    r_exc[wb[p].tag.rob.idx]  = wb[p].exc.valid;
+                    r_val[wb[p].tag.rob.idx]  = wb[p].data;
+                }
+            }
+
+            // issue
+            for p in 0..MW {
+                if sel_v[p] {
+                    r_iniq[sel_e[p]] = 1'b0;
+                }
+            }
+            for e in 0..RN {
+                if lfence.valid && lfence.seq == r_barw[e] {
+                    r_obey[e] = 1'b0;
+                }
+            }
+
+            // commit
+            if c_mis || c_bad {
+                ok_q = 1'b0;
+                if ok_q {
+                    $display("lsu mismatch seed=%d cyc=%d mis=%b bad=%b pi=%d exp=%h got=%h", SEED, cyc_q, c_mis, c_bad, c_mpi, c_mex, c_mgt);
+                }
+            }
+            for l in 0..CMW {
+                let e : logic<RW> = ridx(head_q, l);
+                let po: POp       = pop(r_pi[e]);
+                if (l as 32) <: c_ret && po.kind == 2'd1 {
+                    for b in 0..8 {
+                        let bi: logic<3>  = b;
+                        let sz: logic<4>  = 4'd1 << po.op.size;
+                        if (bi as 4) <: sz {
+                            gold[(po.va[14:0] + b) as 15]   = po.data[b * 8+:8];
+                            gold_w[(po.va[14:0] + b) as 15] = 1'b1;
+                        }
+                    }
+                }
+            }
+            head_q = radv(head_q, c_ret);
+            nret_q = nret_q + c_ret;
+            idle_q = if c_ret != 0 ? 0 : idle_q + 1;
+
+            // kill (registered: takes effect on the next edge)
+            kill_q = k_next;
+            kpi_q  = k_pi;
+            if kill_q.valid {
+                tail_q = if kill_q.full ? head_q : radv(kill_q.keep, 1);
+                disp_q = kpi_q;
+            } else {
+                // dispatch
+                for l in 0..DW {
+                    if l <: d_take {
+                        let e: logic<RW> = ridx(tail_q, l);
+                        r_pi[e]    = disp_q + l;
+                        r_done[e]  = d_op[l].kind == 2'd2;
+                        r_exc[e]   = 1'b0;
+                        r_iniq[e]  = d_op[l].kind != 2'd2;
+                        r_lq[e]    = lq_atag[d_nld[l]];
+                        r_sq[e]    = sq_atag[d_nst[l]];
+                        r_lqlim[e] = lq_atag[d_nld[l]];
+                        r_sqlim[e] = sq_atag[d_nst[l]];
+                        r_slq[e]   = lq_atag[d_nld[l + 1]];
+                        r_ssq[e]   = sq_atag[d_nst[l + 1]];
+                        r_sbar[e]  = bar_after[d_nbar[l + 1]];
+                        r_barw[e]  = bar_after[d_nbar[l]];
+                        r_obey[e]  = d_op[l].kind == 2'd0 && bar_after[d_nbar[l]] != bar_rt;
+                        if d_op[l].kind == 2'd1 {
+                            sq_rob[sq_atag[d_nst[l]].idx] = radv(tail_q, l);
+                        }
+                    }
+                }
+                tail_q = radv(tail_q, d_take);
+                disp_q = disp_q + d_take;
+            }
+
+            // coverage
+            for p in 0..MW {
+                if pperf[p].fwd_full {
+                    cnt_q[0] = cnt_q[0] + 1;
+                }
+                if pperf[p].fwd_part {
+                    cnt_q[1] = cnt_q[1] + 1;
+                }
+                if pperf[p].split {
+                    cnt_q[2] = cnt_q[2] + 1;
+                }
+                if pperf[p].miss {
+                    cnt_q[3] = cnt_q[3] + 1;
+                }
+                if pperf[p].retry {
+                    cnt_q[4] = cnt_q[4] + 1;
+                }
+                if pperf[p].fwd_wait {
+                    cnt_q[5] = cnt_q[5] + 1;
+                }
+            }
+            if lqperf.poison_sta {
+                cnt_q[6] = cnt_q[6] + 1;
+            }
+            if lqperf.poison_coh {
+                cnt_q[7] = cnt_q[7] + 1;
+            }
+            if lqperf.park_fill {
+                cnt_q[8] = cnt_q[8] + 1;
+            }
+            if lqperf.park_busy {
+                cnt_q[9] = cnt_q[9] + 1;
+            }
+            if lqperf.park_head {
+                cnt_q[10] = cnt_q[10] + 1;
+            }
+            if lqperf.reissue {
+                cnt_q[11] = cnt_q[11] + 1;
+            }
+            if sqperf.reissue {
+                cnt_q[12] = cnt_q[12] + 1;
+            }
+            if sbperf.merge {
+                cnt_q[13] = cnt_q[13] + 1;
+            }
+            if sbperf.urgent {
+                cnt_q[14] = cnt_q[14] + 1;
+            }
+            if adperf.attach {
+                cnt_q[15] = cnt_q[15] + 1;
+            }
+            if adperf.crit_hit {
+                cnt_q[16] = cnt_q[16] + 1;
+            }
+            if adperf.hold {
+                cnt_q[17] = cnt_q[17] + 1;
+            }
+            if adperf.empty_gen {
+                cnt_q[18] = cnt_q[18] + 1;
+            }
+            if adperf.b2b {
+                cnt_q[19] = cnt_q[19] + 1;
+            }
+            if adperf.r_bank {
+                cnt_q[20] = cnt_q[20] + 1;
+            }
+            if adperf.r_inv_race {
+                cnt_q[21] = cnt_q[21] + 1;
+            }
+            if adperf.r_fill_busy {
+                cnt_q[22] = cnt_q[22] + 1;
+            }
+            if c_rply {
+                cnt_q[23] = cnt_q[23] + 1;
+            }
+            if k_next.valid && !k_next.full {
+                cnt_q[24] = cnt_q[24] + 1;
+            }
+            if c_fence {
+                cnt_q[25] = cnt_q[25] + 1;
+            }
+            if lqperf.park_sq {
+                cnt_q[26] = cnt_q[26] + 1;
+            }
+            if adperf.hit {
+                cnt_q[27] = cnt_q[27] + 1;
+            }
+            if sbperf.drain {
+                cnt_q[28] = cnt_q[28] + 1;
+            }
+            if pr_v_q && pr_ack {
+                cnt_q[29] = cnt_q[29] + 1;
+            }
+            if adperf.r_preempted {
+                cnt_q[30] = cnt_q[30] + 1;
+            }
+            if lfence.valid {
+                cnt_q[31] = cnt_q[31] + 1;
+            }
+        }
+    }
+
+
+    always_comb {
+        for i in 0..32 {
+            o_cov[i] = cnt_q[i] != 0;
+        }
+    }
+    assign o_chk     = {2'd0, c_ad, c_sb, c_sq, c_lq, ok_q == 1'b0};
+    assign o_pass    = ok_q && idle_q <: 16'd3000;
+    assign o_done    = nret_q >= NOPS || idle_q >= 16'd3000;
+    assign o_retired = nret_q;
+}
+
+#[test(test_lsu)]
+module test_lsu {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var d: logic     [4];
+    var p: logic     [4];
+    var n: logic<32> [4];
+    var v: logic<32> [4];
+    var c: logic<16> [4];
+
+    inst h0: lsu_harness::<cfg_w2> #(
+        SEED: 64'h1,
+    ) (
+        clk               ,
+        rst               ,
+        o_done   : d[0]   ,
+        o_pass   : p[0]   ,
+        o_retired: n[0]   ,
+        o_cov    : v[0]   ,
+        o_chk    : c[0]   ,
+    );
+    inst h1: lsu_harness::<cfg_w2> #(
+        SEED: 64'h3,
+    ) (
+        clk               ,
+        rst               ,
+        o_done   : d[1]   ,
+        o_pass   : p[1]   ,
+        o_retired: n[1]   ,
+        o_cov    : v[1]   ,
+        o_chk    : c[1]   ,
+    );
+    inst h2: lsu_harness::<cfg_w4> #(
+        SEED: 64'h2,
+    ) (
+        clk               ,
+        rst               ,
+        o_done   : d[2]   ,
+        o_pass   : p[2]   ,
+        o_retired: n[2]   ,
+        o_cov    : v[2]   ,
+        o_chk    : c[2]   ,
+    );
+    inst h3: lsu_harness::<cfg_w4> #(
+        SEED: 64'h4,
+    ) (
+        clk               ,
+        rst               ,
+        o_done   : d[3]   ,
+        o_pass   : p[3]   ,
+        o_retired: n[3]   ,
+        o_cov    : v[3]   ,
+        o_chk    : c[3]   ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(10000);
+        for i in 0..4 {
+            $display("lsu %d: done=%b pass=%b retired=%d cov=%b chk=%b", i, d[i], p[i], n[i], v[i], c[i]);
+        }
+        $assert(d[0] && p[0] && c[0] == 16'd0 && d[1] && p[1] && c[1] == 16'd0, "lsu w2 failed");
+        $assert(d[2] && p[2] && c[2] == 16'd0 && d[3] && p[3] && c[3] == 16'd0, "lsu w4 failed");
+        $assert((v[0] | v[1]) == 32'hffff_ffff, "lsu w2: a mechanism did not fire");
+        $assert((v[2] | v[3]) == 32'hffff_ffff, "lsu w4: a mechanism did not fire");
+        $finish();
+    }
+}

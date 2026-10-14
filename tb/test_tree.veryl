@@ -1,0 +1,244 @@
+// tree_pkg helpers against serial references, on LFSR-random inputs every
+// cycle. tree_oldest sees tags of allocation counts base + off[i] in a ring
+// of R entries (off[i] < R, so all lie in one ring window) and is checked
+// against a serial scan over the counts themselves.
+module tree_ref_harness #(
+    param N: u32 = 8,
+) (
+    clk   : input  clock,
+    rst   : input  reset,
+    o_pass: output logic,
+    o_done: output logic,
+) {
+    const CW: u32 = tag_pkg::idx_w(N + 1);
+    const IW: u32 = tag_pkg::idx_w(N);
+    const R : u32 = N + 3;
+    const TW: u32 = tag_pkg::idx_w(R) + 1;
+
+    var lfsr0: logic<64>;
+    var lfsr1: logic<64>;
+    var cnt  : logic<16>;
+    var ok   : logic    ;
+
+    // Directed all-zero and all-one vectors every 8 cycles, random otherwise.
+    let rx: logic<N> = lfsr0[N - 1:0] ^ lfsr1[N + 3:4];
+    let x : logic<N> = case cnt[2:0] {
+        3'd0   : 0,
+        3'd1   : {1'b1 repeat N},
+        default: rx,
+    };
+
+    // Directed for tree_oldest: no valid entry, every entry valid with one
+    // shared tag (lowest index wins), a single valid entry.
+    let ov: logic<N> = case cnt[2:0] {
+        3'd2   : 0,
+        3'd3   : {1'b1 repeat N},
+        3'd4   : tree_first::<N>(rx),
+        default: rx,
+    };
+
+    var dat : logic<8>  [N];
+    var ocnt: logic<32> [N];
+    var otag: logic<TW> [N];
+    always_comb {
+        let base: logic<32> = lfsr1[47:40] % (2 * R);
+        for i in 0..N {
+            let h                : logic<64> = (lfsr0 >> (i % 50)) ^ (lfsr1 >> ((i * 7) % 50));
+            dat[i]            = h[17:10] ^ i;
+            ocnt[i]           = base + (if cnt[2:0] == 3'd3 ? 0 : h[27:20] % R);
+            otag[i][TW - 1]   = (ocnt[i] / R) % 2;
+            otag[i][TW - 2:0] = ocnt[i] % R;
+        }
+    }
+
+    // ---- serial references ----
+    var r_por  : logic<N>     ;
+    var r_pand : logic<N>     ;
+    var r_cnt  : logic<CW> [N];
+    var r_first: logic<N>     ;
+    var r_fidx : logic<IW>    ;
+    var r_old  : logic<N>     ;
+    always_comb {
+        var best : u32  ;
+        var bestv: logic;
+        best  = 0;
+        bestv = 1'b0;
+        for i in 0..N {
+            if ov[i] && (!bestv || ocnt[i] <: ocnt[best]) {
+                best  = i;
+                bestv = 1'b1;
+            }
+        }
+        r_old = 0;
+        if bestv {
+            r_old[best] = 1'b1;
+        }
+    }
+    always_comb {
+        var acc_o  : logic    ;
+        var acc_a  : logic    ;
+        var acc_c  : logic<CW>;
+        var found  : logic    ;
+        acc_o   = 1'b0;
+        acc_a   = 1'b1;
+        acc_c   = 0;
+        found   = 1'b0;
+        r_first = 0;
+        r_fidx  = 0;
+        for i in 0..N {
+            acc_o     = acc_o | x[i];
+            acc_a     = acc_a & x[i];
+            acc_c     = acc_c + x[i];
+            r_por[i]  = acc_o;
+            r_pand[i] = acc_a;
+            r_cnt[i]  = acc_c;
+            if x[i] && !found {
+                r_first[i] = 1'b1;
+                r_fidx     = i;
+                found      = 1'b1;
+            }
+        }
+    }
+
+    // ---- helpers under test ----
+    let t_por  : logic<N>  = tree_prefix_or::<N>(x);
+    let t_pand : logic<N>  = tree_prefix_and::<N>(x);
+    let t_first: logic<N>  = tree_first::<N>(x);
+    let t_pop  : logic<CW> = tree_popcount::<N, CW>(x);
+    let t_fidx : logic<IW> = tree_onehot_enc::<N, IW>(t_first);
+    let t_mux  : logic<8>  = tree_onehot_mux::<N, 8>(t_first, dat);
+    let t_old  : logic<N>  = tree_oldest::<N, TW>(ov, otag);
+
+    var t_pcnt: logic<CW> [N];
+    always_comb {
+        tree_prefix_count::<N, CW>(x, t_pcnt);
+    }
+
+    var cnt_bad: logic;
+    always_comb {
+        cnt_bad = 1'b0;
+        for i in 0..N {
+            if t_pcnt[i] != r_cnt[i] {
+                cnt_bad = 1'b1;
+            }
+        }
+    }
+
+    let r_mux   : logic<8> = if |x ? dat[r_fidx] : 0;
+    let mismatch: logic    = t_por != r_por || t_pand != r_pand || t_first != r_first || cnt_bad || t_pop
+        != r_cnt[N - 1] || t_fidx != r_fidx || t_mux != r_mux || t_old != r_old;
+
+    always_ff {
+        if_reset {
+            lfsr0 = 64'h1234_5678_9abc_def0;
+            lfsr1 = 64'hfedc_ba98_7654_3210;
+            cnt   = 0;
+            ok    = 1'b1;
+        } else {
+            if mismatch {
+                ok = 1'b0;
+            }
+            var t0   : logic<64>;
+            var t1   : logic<64>;
+            t0    = lfsr0 ^ (lfsr0 << 13);
+            t0    = t0 ^ (t0 >> 7);
+            t0    = t0 ^ (t0 << 17);
+            lfsr0 = t0;
+            t1    = lfsr1 ^ (lfsr1 >> 11);
+            t1    = t1 ^ (t1 << 9);
+            t1    = t1 ^ (t1 >> 13);
+            lfsr1 = t1;
+            cnt   = cnt + 1;
+        }
+    }
+
+    assign o_pass = ok;
+    assign o_done = cnt >= 16'd2000;
+}
+
+#[test(test_tree)]
+module test_tree {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass: logic [7];
+    var done: logic [7];
+    inst h0: tree_ref_harness #(
+        N: 1,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[0],
+        o_done: done[0],
+    );
+    inst h1: tree_ref_harness #(
+        N: 2,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[1],
+        o_done: done[1],
+    );
+    inst h2: tree_ref_harness #(
+        N: 3,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[2],
+        o_done: done[2],
+    );
+    inst h3: tree_ref_harness #(
+        N: 5,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[3],
+        o_done: done[3],
+    );
+    inst h4: tree_ref_harness #(
+        N: 8,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[4],
+        o_done: done[4],
+    );
+    inst h5: tree_ref_harness #(
+        N: 24,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[5],
+        o_done: done[5],
+    );
+    inst h6: tree_ref_harness #(
+        N: 13,
+    ) (
+        clk            ,
+        rst            ,
+        o_pass: pass[6],
+        o_done: done[6],
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(2100);
+        $display(
+            "tree: pass %b%b%b%b%b%b%b done %b",
+            pass[0],
+            pass[1],
+            pass[2],
+            pass[3],
+            pass[4],
+            pass[5],
+            pass[6],
+            done[6],
+        );
+        $assert(done[0] && done[6], "tree test did not run enough cycles");
+        $assert(
+            pass[0] && pass[1] && pass[2] && pass[3] && pass[4] && pass[5] && pass[6],
+            "tree helper != serial reference",
+        );
+        $finish();
+    }
+}

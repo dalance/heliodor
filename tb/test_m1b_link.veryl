@@ -1,0 +1,506 @@
+// Cross-stage connections of the M1b back end: every port pair below is
+// wired output to input with no adaptation, so the harness elaborates only
+// when producer and consumer agree on the type. Inputs owned by stages not
+// built yet (lq, sq, sb, csr, the decode queue) are tied off. After reset
+// with no op flowing, every checker stays clear and every credit is full.
+module m1b_link_harness::<CFG: core_cfg> (
+    clk   : input  clock,
+    rst   : input  reset,
+    o_pass: output logic,
+    o_done: output logic,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const W : u32 = CFG::RENAME_W;
+    const CW: u32 = CFG::COMMIT_W;
+    const NQ: u32 = CFG::N_IQ;
+
+    function sys_port () -> u32 {
+        var r: u32;
+        r = 0;
+        for p in 0..CFG::ISSUE_W {
+            if CFG::PORT_FU[p][FuKind::SYS] {
+                r = p;
+            }
+        }
+        return r;
+    }
+    const SYS_P: u32 = sys_port();
+
+    // ---- Kill, flush and the oldest token ----
+
+    var kill    : Kill    ;
+    var redirect: Redirect;
+    var cm_flush: CmFlush ;
+    var oldest  : TagTok  ;
+
+    // ---- WB and wake: only the SYS exec port is built here ----
+
+    var sys_wb  : WbPacket       ;
+    var sys_wake: Wake           ;
+    var wb      : WbPacket [WB_N];
+    var wake    : Wake     [WB_N];
+    always_comb {
+        for p in 0..WB_N {
+            wb[p]   = 0 as WbPacket;
+            wake[p] = 0 as Wake;
+        }
+        wb[SYS_P]   = sys_wb;
+        wake[SYS_P] = sys_wake;
+    }
+
+    // ---- rob <-> dispatch, rename, commit, flush_ctrl ----
+
+    var rob_v     : logic                  [W]     ;
+    var rob_a     : RobAlloc               [W]     ;
+    var rob_tag   : RobTag                 [W]     ;
+    var rob_free  : logic   <ROB_CNT_W>            ;
+    var rob_cm    : RobCm                  [CW]    ;
+    var rob_exc   : ExcHold                        ;
+    var rob_head  : TagTok                         ;
+    var retire_cnt: logic   <RETIRE_CNT_W>         ;
+    var rec_set   : TagTok                         ;
+    var snap_tag  : RobTag                         ;
+    var snap      : DispSnap                       ;
+    var walk      : WalkLane               [WALK_W];
+    var walk_busy : logic                          ;
+    var rob_chk   : logic   <CHK_ROB_W>            ;
+    inst u_rob: rob::<CFG> (
+        clk                      ,
+        rst                      ,
+        i_alloc_valid: rob_v     ,
+        i_alloc      : rob_a     ,
+        o_alloc_tag  : rob_tag   ,
+        o_free       : rob_free  ,
+        i_wb         : wb        ,
+        o_cm         : rob_cm    ,
+        o_exc        : rob_exc   ,
+        o_head       : rob_head  ,
+        i_retire_cnt : retire_cnt,
+        i_kill       : kill      ,
+        i_rec_set    : rec_set   ,
+        i_snap_tag   : snap_tag  ,
+        o_snap       : snap      ,
+        o_walk       : walk      ,
+        o_walk_busy  : walk_busy ,
+        o_perf       : _         ,
+        o_chk        : rob_chk   ,
+    );
+
+    var fc_chk: logic<CHK_FLUSH_W>;
+    inst u_flush: flush_ctrl::<CFG> (
+        clk                   ,
+        rst                   ,
+        i_wb       : wb       ,
+        i_cm_flush : cm_flush ,
+        i_walk_busy: walk_busy,
+        o_snap_tag : snap_tag ,
+        i_snap     : snap     ,
+        o_rec_set  : rec_set  ,
+        o_kill     : kill     ,
+        o_redirect : redirect ,
+        o_perf     : _        ,
+        o_chk      : fc_chk   ,
+    );
+
+    // ---- commit <-> rob, trap_unit, rename, free lists, ftq, fu_sys ----
+
+    var trap_fire: logic                            ;
+    var irq_take : logic                            ;
+    var irq_q    : IrqReq                           ;
+    var epc      : logic     <64>                   ;
+    var target   : logic     <64>                   ;
+    var tval     : logic     <64>                   ;
+    var mret_pc  : logic     <64>                   ;
+    var sret_pc  : logic     <64>                   ;
+    var ren_cm   : RenCm                [CW]        ;
+    var ftq_cm   : FtqCommit                        ;
+    var sys_pend : SysPending                       ;
+    var started  : logic                            ;
+    var lq_win   : LqCmWin              [CW]        ;
+    var sq_win   : SqCmWin              [CFG::MEM_W];
+    var cm_chk   : logic     <CHK_CM_W>             ;
+    always_comb {
+        lq_win = '{default: 0 as LqCmWin};
+        sq_win = '{default: 0 as SqCmWin};
+    }
+    inst u_commit: commit::<CFG> (
+        clk                                         ,
+        rst                                         ,
+        i_reset_pc           : 64'h8000_0000        ,
+        i_cm                 : rob_cm               ,
+        i_exc                : rob_exc              ,
+        i_head               : rob_head             ,
+        i_lq_win             : lq_win               ,
+        i_sq_win             : sq_win               ,
+        i_ordering_empty     : 1'b1                 ,
+        i_sb_credit          : PUSH_W as SB_CREDIT_W,
+        i_kill               : kill                 ,
+        i_sys_wr             : sys_pend             ,
+        i_started            : started              ,
+        i_irq                : 0 as IrqReq          ,
+        i_priv               : csr_pkg::PrivLevel::MACHINE,
+        i_virt               : 1'b0                 ,
+        i_trap_target        : target               ,
+        i_trap_tval          : tval                 ,
+        i_mret_pc            : mret_pc              ,
+        i_sret_pc            : sret_pc              ,
+        i_dbg_retire_limit_en: 1'b0                 ,
+        i_dbg_retire_limit   : 64'd0                ,
+        i_dbg_irq_mask       : 1'b0                 ,
+        i_dbg_irq_allow      : 1'b0                 ,
+        o_retire_cnt         : retire_cnt           ,
+        o_oldest             : oldest               ,
+        o_flush              : cm_flush             ,
+        o_trap_fire          : trap_fire            ,
+        o_irq_take           : irq_take             ,
+        o_irq_q              : irq_q                ,
+        o_epc                : epc                  ,
+        o_ren_cm             : ren_cm               ,
+        o_lq_ret_cnt         : _                    ,
+        o_sq_ret_cnt         : _                    ,
+        o_ftq_cm             : ftq_cm               ,
+        o_bar_ret            : _                    ,
+        o_icache_inv         : _                    ,
+        o_csr                : _                    ,
+        o_retire             : _                    ,
+        o_irq_evt            : _                    ,
+        o_perf               : _                    ,
+        o_chk                : cm_chk               ,
+    );
+
+    inst u_trap: trap_unit::<CFG> (
+        i_trap_fire: trap_fire                  ,
+        i_irq_take : irq_take                   ,
+        i_exc      : rob_exc.rec                ,
+        i_irq      : irq_q                      ,
+        i_epc      : epc                        ,
+        i_priv     : csr_pkg::PrivLevel::MACHINE,
+        i_virt     : 1'b0                       ,
+        i_medeleg  : 64'd0                      ,
+        i_mtvec    : 64'h8000_0100              ,
+        i_stvec    : 64'd0                      ,
+        i_mepc     : 64'd0                      ,
+        i_sepc     : 64'd0                      ,
+        i_vsepc    : 64'd0                      ,
+        o_trap     : _                          ,
+        o_target   : target                     ,
+        o_tval     : tval                       ,
+        o_mret_pc  : mret_pc                    ,
+        o_sret_pc  : sret_pc                    ,
+    );
+
+    // The BRU exec ports are not built here; read port 0 feeds the SYS port's
+    // unused i_ftq so the pair is type-checked.
+    var ftq_chk: logic          ;
+    var ftq_rt : FtqTag  [BRU_N];
+    var ftq_rd : FtqRead [BRU_N];
+    always_comb {
+        ftq_rt = '{default: 0 as FtqTag};
+    }
+    inst u_ftq: ftq::<CFG> (
+        clk                            ,
+        rst                            ,
+        i_enq_valid   : 1'b0           ,
+        i_enq         : 0 as FtqEnq    ,
+        o_enq_ready   : _              ,
+        o_fetch_valid : _              ,
+        o_fetch       : _              ,
+        i_fetch_take  : 1'b0           ,
+        i_rewind_valid: 1'b0           ,
+        i_rewind      : 0 as FtqTag    ,
+        i_pdw         : 0 as PdWrite   ,
+        i_pdr         : 0 as PdRedirect,
+        i_kill        : kill           ,
+        i_redirect    : redirect       ,
+        i_cm          : ftq_cm         ,
+        i_rd_tag      : ftq_rt         ,
+        o_rd          : ftq_rd         ,
+        o_rcv         : _              ,
+        o_upd         : _              ,
+        o_ev_full     : _              ,
+        o_chk         : ftq_chk        ,
+    );
+
+    // ---- rename, free lists, busy_table, dispatch ----
+
+    var rq_v   : logic          [W];
+    var rq_op  : DecOp          [W];
+    var take   : logic <TAKE_W>    ;
+    var pop_int: logic <PREG_W> [W];
+    var pop_fp : logic <PREG_W> [W];
+    var ren    : RenOut         [W];
+    var ren_chk: logic <2>         ;
+    always_comb {
+        rq_v  = '{default: 0};
+        rq_op = '{default: 0 as DecOp};
+    }
+    inst u_ren: rename::<CFG> (
+        clk               ,
+        rst               ,
+        i_valid  : rq_v   ,
+        i_op     : rq_op  ,
+        i_take   : take   ,
+        i_pop_int: pop_int,
+        i_pop_fp : pop_fp ,
+        o_ren    : ren    ,
+        i_walk   : walk   ,
+        i_cm     : ren_cm ,
+        i_kill   : kill   ,
+        o_perf   : _      ,
+        o_chk    : ren_chk,
+    );
+
+    var popn_int: logic<TAKE_W>          ;
+    var popn_fp : logic<TAKE_W>          ;
+    var ha_int  : FlPtr           [W + 1];
+    var ha_fp   : FlPtr           [W + 1];
+    var fl_int  : logic<FL_CNT_W>        ;
+    var fl_fp   : logic<FL_CNT_W>        ;
+    var fli_chk : logic<2>               ;
+    var flf_chk : logic<2>               ;
+    inst u_fl_int: free_list::<CFG> #(
+        CLS: RegClass::INT,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_pop_n     : popn_int,
+        i_rel       : ren_cm  ,
+        i_kill      : kill    ,
+        o_pop       : pop_int ,
+        o_head_after: ha_int  ,
+        o_free      : fl_int  ,
+        o_chk       : fli_chk ,
+    );
+    inst u_fl_fp: free_list::<CFG> #(
+        CLS: RegClass::FP,
+    ) (
+        clk                  ,
+        rst                  ,
+        i_pop_n     : popn_fp,
+        i_rel       : ren_cm ,
+        i_kill      : kill   ,
+        o_pop       : pop_fp ,
+        o_head_after: ha_fp  ,
+        o_free      : fl_fp  ,
+        o_chk       : flf_chk,
+    );
+
+    var bt_v  : logic [W]    ;
+    var bt_p  : PReg  [W]    ;
+    var bt_rd : PReg  [3 * W];
+    var bt_rdy: logic [3 * W];
+    var bt_chk: logic        ;
+    always_comb {
+        for l in 0..W {
+            bt_rd[3 * l]     = ren[l].ps1;
+            bt_rd[3 * l + 1] = ren[l].ps2;
+            bt_rd[3 * l + 2] = ren[l].ps3;
+        }
+    }
+    inst u_bt: busy_table::<CFG> (
+        clk                ,
+        rst                ,
+        i_clr_valid: bt_v  ,
+        i_clr      : bt_p  ,
+        i_wake     : wake  ,
+        i_rd       : bt_rd ,
+        o_rdy      : bt_rdy,
+        o_chk      : bt_chk,
+    );
+
+    var iq_free: logic  <IQ_CNT_W> [NQ]    ;
+    var iq_v   : logic             [NQ * W];
+    var iq_a   : IqAlloc           [NQ * W];
+    var lq_tag : LqTag             [W + 1] ;
+    var sq_tag : SqTag             [W + 1] ;
+    var lq_bar : BarSeq            [W + 1] ;
+    var dp_chk : logic  <3>                ;
+    always_comb {
+        lq_tag = '{default: 0 as LqTag};
+        sq_tag = '{default: 0 as SqTag};
+        lq_bar = '{default: 0 as BarSeq};
+    }
+    inst u_dp: dispatch::<CFG> (
+        clk                       ,
+        rst                       ,
+        i_valid      : rq_v       ,
+        i_op         : rq_op      ,
+        i_ren        : ren        ,
+        i_kill       : kill       ,
+        i_walk_busy  : walk_busy  ,
+        i_rob_free   : rob_free   ,
+        i_rob_tag    : rob_tag    ,
+        i_iq_free    : iq_free    ,
+        i_lq_free    : 0          ,
+        i_lq_tag     : lq_tag     ,
+        i_lq_bar     : lq_bar     ,
+        i_bar_ret    : 0 as BarSeq,
+        i_sq_free    : 0          ,
+        i_sq_tag     : sq_tag     ,
+        i_fl_int_free: fl_int     ,
+        i_fl_int_head: ha_int     ,
+        i_fl_fp_free : fl_fp      ,
+        i_fl_fp_head : ha_fp      ,
+        i_bt_rdy     : bt_rdy     ,
+        i_wake       : wake       ,
+        o_take       : take       ,
+        o_pop_n_int  : popn_int   ,
+        o_pop_n_fp   : popn_fp    ,
+        o_bar_n      : _          ,
+        o_rob_valid  : rob_v      ,
+        o_rob        : rob_a      ,
+        o_iq_valid   : iq_v       ,
+        o_iq         : iq_a       ,
+        o_lq_valid   : _          ,
+        o_lq         : _          ,
+        o_sq_valid   : _          ,
+        o_sq         : _          ,
+        o_bt_clr_v   : bt_v       ,
+        o_bt_clr_p   : bt_p       ,
+        o_perf       : _          ,
+        o_chk        : dp_chk     ,
+    );
+
+    // ---- One iq per IQ, fed by its dispatch slots ----
+
+    var iq_chk: logic<3> [NQ];
+    for q in 0..NQ :g_iq {
+        const NP  : u32                              = iq_port_count(q);
+        var   av  : logic                       [W] ;
+        var   aa  : IqAlloc                     [W] ;
+        var   ok  : logic    <fu_pkg::WB_OFS_N> [NP];
+        var   busy: FuSet                       [NP];
+        var   hold: logic                       [NP];
+        var   rel : IqRelease                   [NP];
+        always_comb {
+            for i in 0..W {
+                av[i] = iq_v[q * W + i];
+                aa[i] = iq_a[q * W + i];
+            }
+            ok   = '{default: '1};
+            busy = '{default: 0};
+            hold = '{default: 0};
+            rel  = '{default: 0 as IqRelease};
+        }
+        inst u_iq: iq::<CFG> #(
+            Q: q,
+        ) (
+            clk                          ,
+            rst                          ,
+            i_alloc_valid: av            ,
+            i_alloc      : aa            ,
+            o_free       : iq_free[q]    ,
+            i_wake       : wake          ,
+            i_tok        : oldest        ,
+            i_wb_ok      : ok            ,
+            i_fu_busy    : busy          ,
+            i_port_hold  : hold          ,
+            i_load_fence : 0 as LoadFence,
+            o_grant      : _             ,
+            o_resv       : _             ,
+            i_release    : rel           ,
+            i_kill       : kill          ,
+            o_perf       : _             ,
+            o_chk        : iq_chk[q]     ,
+        );
+    }
+
+    // ---- The SYS exec port: oldest token in, sys_pending and started out ----
+
+    var rd_z: logic<64> [SRC_N];
+    always_comb {
+        rd_z = '{default: 0};
+    }
+    var ep_chk: logic<4>;
+    inst u_sys: exec_port::<CFG> #(
+        P: SYS_P,
+    ) (
+        clk                             ,
+        rst                             ,
+        i_grant    : 0 as IqGrant       ,
+        i_kill     : kill               ,
+        o_release  : _                  ,
+        o_fu_busy  : _                  ,
+        o_rd       : _                  ,
+        i_rd_int   : rd_z               ,
+        i_rd_fp    : rd_z               ,
+        i_wb       : wb                 ,
+        o_wb       : sys_wb             ,
+        o_wake     : sys_wake           ,
+        o_hf_req   : _                  ,
+        i_hf_grant : 0 as fu_pkg::WbSlot,
+        o_ftq_rd   : _                  ,
+        i_ftq      : ftq_rd[0]          ,
+        o_csr_raddr: _                  ,
+        i_csr_rdata: 64'd0              ,
+        i_tok      : oldest             ,
+        o_started  : started            ,
+        o_sys      : sys_pend           ,
+        o_perf     : _                  ,
+        o_chk      : ep_chk             ,
+    );
+
+    // ---- Idle checks ----
+
+    var cnt: logic<6>;
+    var ok : logic   ;
+    var bad: logic   ;
+    always_comb {
+        bad = rob_chk != 0 || fc_chk != 0 || cm_chk != 0 || ftq_chk || ren_chk != 0 || fli_chk != 0 || flf_chk != 0
+            || bt_chk || dp_chk != 0 || ep_chk != 0 || kill.valid || take != 0 || walk_busy || rob_free
+            != CFG::ROB_N as ROB_CNT_W || fl_int != FREE_INT_N as FL_CNT_W || fl_fp != FREE_FP_N as FL_CNT_W;
+        for q in 0..NQ {
+            bad = bad || iq_chk[q] != 0 || iq_free[q] != CFG::IQ_N[q] as IQ_CNT_W;
+        }
+    }
+    always_ff {
+        if_reset {
+            cnt = 0;
+            ok  = 1'b1;
+        } else {
+            if bad {
+                ok = 1'b0;
+            }
+            if cnt != 6'h3f {
+                cnt = cnt + 1;
+            }
+        }
+    }
+
+    assign o_pass = ok;
+    assign o_done = cnt >= 16;
+}
+
+#[test(test_m1b_link)]
+module test_m1b_link {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic;
+    var done2: logic;
+    var pass4: logic;
+    var done4: logic;
+    inst h2: m1b_link_harness::<cfg_w2> (
+        clk          ,
+        rst          ,
+        o_pass: pass2,
+        o_done: done2,
+    );
+    inst h4: m1b_link_harness::<cfg_w4> (
+        clk          ,
+        rst          ,
+        o_pass: pass4,
+        o_done: done4,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(24);
+        $display("m1b_link: w2 pass=%b  w4 pass=%b", pass2, pass4);
+        $assert(done2 && done4, "m1b_link test did not run enough cycles");
+        $assert(pass2 && pass4, "an idle connected back end raised a checker flag or lost a credit");
+        $finish();
+    }
+}

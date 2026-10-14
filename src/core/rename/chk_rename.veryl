@@ -1,0 +1,214 @@
+// chk_decode: checker of decode.
+//
+// Ports (timing contract):
+//   i_taken_ok : per lane, this cycle: the lane is invalid, carries no
+//                pred_taken, is a branch or jump, or carries an exception
+//   o_chk      : registered sticky flag: an op carried pred_taken but was not
+//                a branch or jump
+// Owns:
+//   - no output feeds design logic; instantiated only under HELIODOR_CHK
+module chk_decode #(
+    param W: u32 = 1,
+) (
+    clk       : input  clock   ,
+    rst       : input  reset   ,
+    i_taken_ok: input  logic<W>,
+    o_chk     : output logic   ,
+) {
+    var flag_q: logic;
+    always_ff {
+        if_reset {
+            flag_q = 1'b0;
+        } else if !(&i_taken_ok) {
+            flag_q = 1'b1;
+        }
+    }
+    assign o_chk = flag_q;
+}
+
+// chk_rename: checker of rename.
+//
+// Ports (timing contract):
+//   i_spec, i_arch : rename's registered speculative and architectural RAT
+//   i_blocked      : a rename write is requested in a kill or walk cycle
+//   o_chk          : registered sticky flags:
+//                    0 a RAT maps one physical register twice within a class
+//                    1 i_blocked
+// Owns:
+//   - no output feeds design logic; instantiated only under HELIODOR_CHK
+module chk_rename::<CFG: core_cfg> (
+    clk      : input  clock                                                      ,
+    rst      : input  reset                                                      ,
+    i_spec   : input  logic<core_types::<CFG>::PREG_W> [core_types::<CFG>::RAT_N],
+    i_arch   : input  logic<core_types::<CFG>::PREG_W> [core_types::<CFG>::RAT_N],
+    i_blocked: input  logic                                                      ,
+    o_chk    : output logic<2>                                                   ,
+) {
+    import core_types::<CFG>::*;
+
+    var dup: logic;
+    always_comb {
+        var m: logic<2 * 32 * 32>;
+        m = 0;
+        for c in 0..2 {
+            for a in 0..32 {
+                for b in 0..32 {
+                    if a <: b {
+                        m[(c * 32 + a) * 32 + b] = i_spec[c * 32 + a] == i_spec[c * 32 + b] || i_arch[c * 32 + a]
+                            == i_arch[c * 32 + b];
+                    }
+                }
+            }
+        }
+        dup = |m;
+    }
+
+    var flag_q: logic<2>;
+    always_ff {
+        if_reset {
+            flag_q = 0;
+        } else {
+            flag_q = flag_q | {i_blocked, dup};
+        }
+    }
+    assign o_chk = flag_q;
+}
+
+// chk_free_list: checker of one free_list.
+//
+// Ports (timing contract):
+//   i_ent, i_head, i_tail : the list's registered ring and pointers
+//   i_push, i_rel         : this cycle's released registers (commit lanes)
+//   o_chk                 : registered sticky flags:
+//                           0 occupancy outside [0, N]
+//                           1 a pushed register is already in the free region
+// Owns:
+//   - no output feeds design logic; instantiated only under HELIODOR_CHK
+module chk_free_list::<CFG: core_cfg> #(
+    param N: u32 = 1,
+) (
+    clk   : input  clock                                                              ,
+    rst   : input  reset                                                              ,
+    i_ent : input  logic                   <core_types::<CFG>::PREG_W> [N]            ,
+    i_head: input  core_types::<CFG>::FlPtr                                           ,
+    i_tail: input  core_types::<CFG>::FlPtr                                           ,
+    i_push: input  logic                   <CFG::COMMIT_W>                            ,
+    i_rel : input  core_types::<CFG>::RenCm                            [CFG::COMMIT_W],
+    o_chk : output logic                   <2>                                        ,
+) {
+    import core_types::<CFG>::*;
+
+    const OW: u32 = FL_IDX_W + 2;
+
+    let range_bad: logic     = if i_head.wrap == i_tail.wrap ? i_tail.idx <: i_head.idx : i_tail.idx >: i_head.idx;
+    let cnt      : logic<OW> = if i_head.wrap == i_tail.wrap ?
+        (i_tail.idx - i_head.idx) as OW
+    :
+        (N - i_head.idx + i_tail.idx) as OW
+    ;
+
+    var dbl: logic;
+    always_comb {
+        var m: logic<N * CFG::COMMIT_W>;
+        for e in 0..N {
+            let off   : logic<OW> = if e >= i_head.idx ? (e - i_head.idx) as OW : (e + N - i_head.idx) as OW;
+            let in_rgn: logic     = off <: cnt;
+            for l in 0..CFG::COMMIT_W {
+                m[e * CFG::COMMIT_W + l] = in_rgn && i_push[l] && i_ent[e] == i_rel[l].old_pdst;
+            }
+        }
+        dbl = |m;
+    }
+
+    var flag_q: logic<2>;
+    always_ff {
+        if_reset {
+            flag_q = 0;
+        } else {
+            flag_q = flag_q | {dbl, range_bad};
+        }
+    }
+    assign o_chk = flag_q;
+}
+
+// chk_dispatch: checker of dispatch.
+//
+// Ports (timing contract):
+//   i_stall            : this cycle is a kill or walk cycle
+//   i_*_valid, i_rob, i_iq : dispatch's allocation outputs of this cycle
+//   i_*_free, i_pop_n_* : the owners' credits and the free-list pops
+//   o_chk              : registered sticky flags:
+//                        0 an allocation in a kill or walk cycle
+//                        1 more allocations than an owner's credit
+//                        2 an op with fu NONE sent to an IQ, or rob done
+//                          not equal to (fu == NONE)
+// Owns:
+//   - no output feeds design logic; instantiated only under HELIODOR_CHK
+module chk_dispatch::<CFG: core_cfg> (
+    clk          : input  clock                                                                                ,
+    rst          : input  reset                                                                                ,
+    i_stall      : input  logic                                                                                ,
+    i_rob_valid  : input  logic                                                     [CFG::RENAME_W]            ,
+    i_rob        : input  core_types::<CFG>::RobAlloc                               [CFG::RENAME_W]            ,
+    i_iq_valid   : input  logic                                                     [CFG::N_IQ * CFG::RENAME_W],
+    i_iq         : input  core_types::<CFG>::IqAlloc                                [CFG::N_IQ * CFG::RENAME_W],
+    i_lq_valid   : input  logic                                                     [CFG::RENAME_W]            ,
+    i_sq_valid   : input  logic                                                     [CFG::RENAME_W]            ,
+    i_rob_free   : input  logic                      <core_types::<CFG>::ROB_CNT_W>                            ,
+    i_iq_free    : input  logic                      <core_types::<CFG>::IQ_CNT_W>  [CFG::N_IQ]                ,
+    i_lq_free    : input  logic                      <core_types::<CFG>::LQ_CNT_W>                             ,
+    i_sq_free    : input  logic                      <core_types::<CFG>::SQ_CNT_W>                             ,
+    i_pop_n_int  : input  logic                      <core_types::<CFG>::TAKE_W>                               ,
+    i_pop_n_fp   : input  logic                      <core_types::<CFG>::TAKE_W>                               ,
+    i_fl_int_free: input  logic                      <core_types::<CFG>::FL_CNT_W>                             ,
+    i_fl_fp_free : input  logic                      <core_types::<CFG>::FL_CNT_W>                             ,
+    o_chk        : output logic                      <3>                                                       ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const W : u32 = CFG::RENAME_W;
+    const CW: u32 = TAKE_W;
+
+    var any : logic;
+    var over: logic;
+    var cls : logic;
+    always_comb {
+        var rv: logic<W>            ;
+        var lv: logic<W>            ;
+        var sv: logic<W>            ;
+        var qo: logic<CFG::N_IQ>    ;
+        var bd: logic<W>            ;
+        var bq: logic<CFG::N_IQ * W>;
+        for l in 0..W {
+            rv[l] = i_rob_valid[l];
+            lv[l] = i_lq_valid[l];
+            sv[l] = i_sq_valid[l];
+            bd[l] = i_rob_valid[l] && i_rob[l].done != (i_rob[l].ent.fu == FuKind::NONE);
+        }
+        for q in 0..CFG::N_IQ {
+            var iv: logic<W>;
+            for i in 0..W {
+                iv[i]         = i_iq_valid[q * W + i];
+                bq[q * W + i] = i_iq_valid[q * W + i] && i_iq[q * W + i].fu == FuKind::NONE;
+            }
+            qo[q] = (tree_popcount::<W, CW>(iv) as IQ_CNT_W) >: i_iq_free[q];
+        }
+        let nr  : logic<CW> = tree_popcount::<W, CW>(rv);
+        any  = nr != 0;
+        over = (nr as ROB_CNT_W) >: i_rob_free || (tree_popcount::<W, CW>(lv) as LQ_CNT_W) >: i_lq_free
+            || (tree_popcount::<W, CW>(sv) as SQ_CNT_W) >: i_sq_free || |qo || (i_pop_n_int as FL_CNT_W)
+            >: i_fl_int_free || (i_pop_n_fp as FL_CNT_W) >: i_fl_fp_free;
+        cls  = |bd || |bq;
+    }
+
+    var flag_q: logic<3>;
+    always_ff {
+        if_reset {
+            flag_q = 0;
+        } else {
+            flag_q = flag_q | {cls, over, i_stall && any};
+        }
+    }
+    assign o_chk = flag_q;
+}

@@ -28,7 +28,8 @@ RE_VER = re.compile(r"TRACER_VER\s*:\s*logic<64>\s*=\s*64'h([0-9a-fA-F_]+)")
 
 
 def final_h(text):
-    hs = [m for m in map(RE_H.match, text.splitlines()) if m]
+    # The UART console prints NUL padding that can share a line with the H line.
+    hs = [m for m in map(RE_H.match, text.replace("\x00", "").splitlines()) if m]
     if not hs:
         return None
     return int(hs[-1].group(1)), int(hs[-1].group(2), 16)

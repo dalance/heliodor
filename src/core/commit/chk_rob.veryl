@@ -1,0 +1,185 @@
+// chk_rob: observation-only invariant checker for rob, built on a shadow of
+// the allocation state reconstructed from rob's ports.
+//
+// Ports (timing contract):
+//   inputs : the same-cycle values of rob's ports (o_alloc_tag as i_alloc_tag,
+//            o_head as i_head, o_walk_busy as i_walk_busy)
+//   o_chk  : registered sticky flags, one bit per violated invariant:
+//            0 completion to an entry that is not live, or to a stale tag
+//            1 completion to an entry already done, or by two ports at once
+//            2 allocation in a kill cycle or while a walk is presented
+//            3 allocation lanes not contiguous from lane 0
+//            4 rob's head or allocation tags differ from the shadow
+//            5 retire of more entries than are live, or of an entry not done
+//            6 partial kill while a walk is presented
+// Owns:
+//   - no output feeds design logic; instantiated only under HELIODOR_CHK
+// Rationale:
+//   - observation only and built only under HELIODOR_CHK, so its serial
+//     loops over the lanes are exempt from the tree rule
+pub module chk_rob::<CFG: core_cfg> (
+    clk          : input  clock                                                                                 ,
+    rst          : input  reset                                                                                 ,
+    i_alloc_valid: input  logic                                                        [CFG::RENAME_W]          ,
+    i_alloc      : input  core_types::<CFG>::RobAlloc                                  [CFG::RENAME_W]          ,
+    i_alloc_tag  : input  core_types::<CFG>::RobTag                                    [CFG::RENAME_W]          ,
+    i_wb         : input  core_types::<CFG>::WbPacket                                  [core_types::<CFG>::WB_N],
+    i_retire_cnt : input  logic                      <core_types::<CFG>::RETIRE_CNT_W>                          ,
+    i_kill       : input  core_types::<CFG>::Kill                                                               ,
+    i_head       : input  core_types::<CFG>::TagTok                                                             ,
+    i_walk_busy  : input  logic                                                                                 ,
+    o_chk        : output logic                      <core_types::<CFG>::CHK_ROB_W>                             ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const ROB_N: u32 = CFG::ROB_N;
+    const RW   : u32 = CFG::RENAME_W;
+    const CNT_W: u32 = ROB_IDX_W + 1;
+    const SUM_W: u32 = ROB_IDX_W + 2;
+
+    function tag_add (
+        t: input RobTag       ,
+        k: input logic <CNT_W>,
+    ) -> RobTag {
+        var r: RobTag       ;
+        var s: logic <SUM_W>;
+        s = (t.idx as SUM_W) + (k as SUM_W);
+        if s >= ROB_N {
+            r.wrap = ~t.wrap;
+            r.idx  = (s - ROB_N) as ROB_IDX_W;
+        } else {
+            r.wrap = t.wrap;
+            r.idx  = s as ROB_IDX_W;
+        }
+        return r;
+    }
+
+    var head_q: RobTag                   ;
+    var tail_q: RobTag                   ;
+    var live_q: logic             [ROB_N];
+    var done_q: logic             [ROB_N];
+    var tag_q : RobTag            [ROB_N];
+    var chk_q : logic <CHK_ROB_W>        ;
+
+    let count: logic<CNT_W> = if head_q.wrap == tail_q.wrap ?
+        (tail_q.idx as CNT_W) - (head_q.idx as CNT_W)
+    :
+        (ROB_N - (head_q.idx as CNT_W) + (tail_q.idx as CNT_W)) as CNT_W
+    ;
+
+    var rt: RobTag [CFG::COMMIT_W]; // entries a retire of k + 1 would remove
+    for k in 0..CFG::COMMIT_W :g_rt {
+        assign rt[k] = tag_add(head_q, k as CNT_W);
+    }
+
+    var n_alloc: logic<CNT_W>    ;
+    var bad    : logic<CHK_ROB_W>;
+    always_comb {
+        bad     = 0;
+        n_alloc = 0;
+        for l in 0..RW {
+            n_alloc += i_alloc_valid[l] as CNT_W;
+            if i_alloc_valid[l] && (i_kill.valid || i_walk_busy) {
+                bad[2] = 1'b1;
+            }
+            if l >: 0 && i_alloc_valid[l] && !i_alloc_valid[l - 1] {
+                bad[3] = 1'b1;
+            }
+            if i_alloc_tag[l] != tag_add(tail_q, l as CNT_W) {
+                bad[4] = 1'b1;
+            }
+        }
+        if i_head.valid != (count != 0) || i_head.tag != head_q {
+            bad[4] = 1'b1;
+        }
+        for p in 0..WB_N {
+            let t: RobTag = i_wb[p].tag.rob;
+            if i_wb[p].valid {
+                if !live_q[t.idx] || tag_q[t.idx] != t {
+                    bad[0] = 1'b1;
+                }
+                if done_q[t.idx] {
+                    bad[1] = 1'b1;
+                }
+                for q in 0..WB_N {
+                    if q >: p && i_wb[q].valid && i_wb[q].tag.rob.idx == t.idx {
+                        bad[1] = 1'b1;
+                    }
+                }
+            }
+        }
+        if (i_retire_cnt as CNT_W) >: count {
+            bad[5] = 1'b1;
+        }
+        for k in 0..CFG::COMMIT_W {
+            if (k as CNT_W) <: (i_retire_cnt as CNT_W) && !done_q[rt[k].idx] {
+                bad[5] = 1'b1;
+            }
+        }
+        if i_kill.valid && !i_kill.full && i_walk_busy {
+            bad[6] = 1'b1;
+        }
+    }
+
+    let head_n: RobTag = tag_add(head_q, i_retire_cnt as CNT_W);
+
+    always_ff {
+        if_reset {
+            head_q = 0;
+            tail_q = 0;
+            chk_q  = 0;
+            for e in 0..ROB_N {
+                live_q[e] = 1'b0;
+                done_q[e] = 1'b0;
+                tag_q[e]  = 0;
+            }
+        } else {
+            chk_q = chk_q | bad;
+            for e in 0..ROB_N {
+                var ret: logic;
+                var al : logic;
+                var wb : logic;
+                ret = 1'b0;
+                al  = 1'b0;
+                wb  = 1'b0;
+                for k in 0..CFG::COMMIT_W {
+                    if (k as CNT_W) <: (i_retire_cnt as CNT_W) && rt[k].idx == e {
+                        ret = 1'b1;
+                    }
+                }
+                for p in 0..WB_N {
+                    if i_wb[p].valid && i_wb[p].tag.rob.idx == e {
+                        wb = 1'b1;
+                    }
+                }
+                if wb {
+                    done_q[e] = 1'b1;
+                }
+                if ret || (i_kill.valid && (i_kill.full || tag_older::<ROB_TAG_W>(i_kill.keep, tag_q[e]))) {
+                    live_q[e] = 1'b0;
+                }
+                for l in 0..RW {
+                    if i_alloc_valid[l] && i_alloc_tag[l].idx == e {
+                        al        = 1'b1;
+                        tag_q[e]  = i_alloc_tag[l];
+                        done_q[e] = i_alloc[l].done;
+                    }
+                }
+                if al {
+                    live_q[e] = 1'b1;
+                }
+            }
+            head_q = head_n;
+            if i_kill.valid && i_kill.full {
+                tail_q = head_n;
+            } else if i_kill.valid {
+                tail_q = tag_add(i_kill.keep, 1);
+            } else {
+                tail_q = tag_add(tail_q, n_alloc);
+            }
+        }
+    }
+
+    assign o_chk = chk_q;
+}

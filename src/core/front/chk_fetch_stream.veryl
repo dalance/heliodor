@@ -1,0 +1,141 @@
+// chk_fetch_stream: observation-only checker of the fetch stream that
+// extract delivers into the decode queue.
+//
+// Ports (timing contract):
+//   i_push_v/i_push : the ops entering the DQ this cycle, in lane order
+//   i_tgt           : corrected exit target of the block those ops belong to
+//   i_enter/i_blk_* : a block entering x1, its ftq tag, start pc and the pc
+//                     following it under its corrected prediction
+//   i_kill/i_redirect : a back-end kill restarts both chains at the redirect
+//   o_chk           : sticky flags, set the cycle after a violation; never
+//                     feeds the design
+// Owns (checked):
+//   - bit 0: consecutive ops a, b satisfy
+//     b.pc == (a.pred_taken ? target : a.pc + len(a)); the first op after a
+//     kill is at the redirect pc
+//   - bit 1: consecutive blocks e, f satisfy f.ftq == next(e.ftq) and
+//     f.start_pc == next_pc(e); the first block after a kill starts at the
+//     redirect pc
+//   - bit 2: an op with pred_taken and no fetch fault is a jump or branch
+//     (a faulted op carries the block's uncorrected prediction and no insn)
+//   - bit 3: no op follows a faulting op until a kill
+// Rationale:
+//   - observation only and built only under HELIODOR_CHK, so its serial
+//     loops over the lanes are exempt from the tree rule
+pub module chk_fetch_stream::<CFG: core_cfg> (
+    clk       : input  clock                                         ,
+    rst       : input  reset                                         ,
+    i_push_v  : input  logic                           [CFG::FETCH_W],
+    i_push    : input  core_types::<CFG>::XOp          [CFG::FETCH_W],
+    i_tgt     : input  logic                      <64>               ,
+    i_enter   : input  logic                                         ,
+    i_blk_ftq : input  core_types::<CFG>::FtqTag                     ,
+    i_blk_pc  : input  logic                      <64>               ,
+    i_blk_next: input  logic                      <64>               ,
+    i_kill    : input  core_types::<CFG>::Kill                       ,
+    i_redirect: input  core_types::<CFG>::Redirect                   ,
+    o_chk     : output logic                      <4>                ,
+) {
+    import core_types::<CFG>::*;
+
+    const FW: u32 = CFG::FETCH_W;
+
+    var op_v_q  : logic     ; // op_pc_q holds the expected pc of the next op
+    var op_pc_q : logic <64>;
+    var blk_v_q : logic     ;
+    var blk_pc_q: logic <64>;
+    var blk_rd_q: logic     ; // the next block follows a kill: no ftq check
+    var blk_ft_q: FtqTag    ;
+    var fault_q : logic     ;
+    var chk_q   : logic <4> ;
+
+    function next_of (
+        o  : input XOp      ,
+        tgt: input logic<64>,
+    ) -> logic<64> {
+        return if o.pred_taken ? tgt : o.pc + (if o.is_rvc ? 64'd2 : 64'd4);
+    }
+    function is_cfi (
+        insn: input logic<32>,
+    ) -> logic {
+        return insn[6:0] == 7'b1100011 || insn[6:0] == 7'b1101111 || insn[6:0] == 7'b1100111;
+    }
+
+    var bad   : logic<4> ;
+    var any_v : logic    ;
+    var last_n: logic<64>;
+    var any_f : logic    ;
+    always_comb {
+        bad    = 0;
+        any_v  = 1'b0;
+        any_f  = 1'b0;
+        last_n = op_pc_q;
+        for l in 0..FW {
+            var exp_v : logic    ;
+            var exp_pc: logic<64>;
+            exp_v  = if l == 0 ? op_v_q : 1'b1;
+            exp_pc = if l == 0 ? op_pc_q : next_of(i_push[l - 1], i_tgt);
+            if i_push_v[l] {
+                any_v  = 1'b1;
+                last_n = next_of(i_push[l], i_tgt);
+                if exp_v && i_push[l].pc != exp_pc {
+                    bad[0] = 1'b1;
+                }
+                if i_push[l].pred_taken && !i_push[l].exc.valid && !is_cfi(i_push[l].insn) {
+                    bad[2] = 1'b1;
+                }
+                if fault_q || any_f {
+                    bad[3] = 1'b1;
+                }
+                if i_push[l].exc.valid {
+                    any_f = 1'b1;
+                }
+            }
+        }
+        if i_enter && blk_v_q {
+            if i_blk_pc != blk_pc_q
+                || (!blk_rd_q && i_blk_ftq != (tag_next::<FTQ_TAG_W, CFG::FTQ_N>(blk_ft_q) as FtqTag)) {
+                bad[1] = 1'b1;
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            op_v_q   = 1'b0;
+            op_pc_q  = 0;
+            blk_v_q  = 1'b0;
+            blk_pc_q = 0;
+            blk_rd_q = 1'b0;
+            blk_ft_q = 0 as FtqTag;
+            fault_q  = 1'b0;
+            chk_q    = 0;
+        } else {
+            chk_q = chk_q | bad;
+            if i_kill.valid {
+                op_v_q   = 1'b1;
+                op_pc_q  = i_redirect.pc;
+                blk_v_q  = 1'b1;
+                blk_pc_q = i_redirect.pc;
+                blk_rd_q = 1'b1;
+                fault_q  = 1'b0;
+            } else {
+                if any_v {
+                    op_v_q  = 1'b1;
+                    op_pc_q = last_n;
+                }
+                if any_f {
+                    fault_q = 1'b1;
+                }
+                if i_enter {
+                    blk_v_q  = 1'b1;
+                    blk_pc_q = i_blk_next;
+                    blk_rd_q = 1'b0;
+                    blk_ft_q = i_blk_ftq;
+                }
+            }
+        }
+    }
+
+    assign o_chk = chk_q;
+}

@@ -1,0 +1,261 @@
+// rename: speculative and architectural RAT, in-group dependency resolution,
+// and recovery by walk (partial kill) or arch-RAT copy (full kill).
+//
+// Ports (timing contract):
+//   i_valid/i_op : rq output lanes (registered), contiguous from lane 0
+//   i_pop_int/i_pop_fp : free_list pop windows (registered)
+//   o_ren        : per-lane mapping, combinational from the inputs and the
+//                  registered RAT; independent of i_take
+//   i_take       : lanes 0..i_take-1 are renamed on this edge (from dispatch,
+//                  0 in kill and walk cycles)
+//   i_walk       : rob walk lanes (registered), youngest first in a batch
+//   i_cm         : commit lanes; arch RAT updated on the edge
+//   i_kill       : full kill copies the arch RAT on the edge
+//   o_perf       : registered event wires
+//   o_chk        : sticky invariant flags (HELIODOR_CHK builds only, else 0)
+// Owns:
+//   - each speculative RAT entry is written once per cycle, by priority full
+//     kill > walk > rename
+//   - neither RAT maps one physical register to two architectural registers
+//   - after a walk ends, the speculative RAT equals the RAT just after keep
+//     was renamed
+// Rationale:
+//   - one 64-entry table keyed by {RegClass, arch} for both classes, so
+//     dependency checks, walk and restore are one loop and int/fp mappings
+//     cannot be confused
+//   - x0 is never renamed (has_rd = 0 from decode); its entry stays p0
+//   - the mapping does not depend on take, so dispatch computes take from
+//     credits alone and no path runs from take back into the mapping
+module rename::<CFG: core_cfg> (
+    clk      : input  clock                                                                             ,
+    rst      : input  reset                                                                             ,
+    i_valid  : input  logic                                                  [CFG::RENAME_W]            ,
+    i_op     : input  core_types::<CFG>::DecOp                               [CFG::RENAME_W]            ,
+    i_take   : input  logic                      <core_types::<CFG>::TAKE_W>                            ,
+    i_pop_int: input  logic                      <core_types::<CFG>::PREG_W> [CFG::RENAME_W]            ,
+    i_pop_fp : input  logic                      <core_types::<CFG>::PREG_W> [CFG::RENAME_W]            ,
+    o_ren    : output core_types::<CFG>::RenOut                              [CFG::RENAME_W]            ,
+    i_walk   : input  core_types::<CFG>::WalkLane                            [core_types::<CFG>::WALK_W],
+    i_cm     : input  core_types::<CFG>::RenCm                               [CFG::COMMIT_W]            ,
+    i_kill   : input  core_types::<CFG>::Kill                                                           ,
+    o_perf   : output core_types::<CFG>::RenPerf                                                        ,
+    o_chk    : output logic                      <2>                                                    ,
+) {
+    import core_types::<CFG>::*;
+
+    const W  : u32 = CFG::RENAME_W;
+    const CW : u32 = TAKE_W;
+    const KEY: u32 = 6;
+
+    var spec_q: logic<PREG_W> [RAT_N];
+    var arch_q: logic<PREG_W> [RAT_N];
+
+    function key (
+        c: input RegClass   ,
+        a: input logic   <5>,
+    ) -> logic<KEY> {
+        return {c, a};
+    }
+
+    // Destination writers of this group and their pop-window ranks.
+    var wr    : logic<W>      ;
+    var wr_int: logic<W>      ;
+    var wr_fp : logic<W>      ;
+    var dkey  : logic<KEY> [W];
+    always_comb {
+        for l in 0..W {
+            wr[l]     = i_valid[l] && i_op[l].dst.has_rd;
+            wr_int[l] = wr[l] && i_op[l].dst.rcls == RegClass::INT;
+            wr_fp[l]  = wr[l] && i_op[l].dst.rcls == RegClass::FP;
+            dkey[l]   = key(i_op[l].dst.rcls, i_op[l].dst.arch);
+        }
+    }
+    var rank_int: logic<CW> [W];
+    var rank_fp : logic<CW> [W];
+    always_comb {
+        tree_prefix_count::<W, CW>(wr_int << 1, rank_int);
+        tree_prefix_count::<W, CW>(wr_fp << 1, rank_fp);
+    }
+
+    // One-hot of the highest set bit of x (the youngest lane); 0 when none.
+    function last_lane (
+        x: input logic<W>,
+    ) -> logic<W> {
+        var r: logic<W>;
+        var f: logic<W>;
+        for i in 0..W {
+            r[i] = x[W - 1 - i];
+        }
+        f = tree_first::<W>(r);
+        for i in 0..W {
+            r[i] = f[W - 1 - i];
+        }
+        return r;
+    }
+
+    var pdst: PReg [W];
+    var pidx: logic<PREG_W> [W];
+    always_comb {
+        for l in 0..W {
+            pdst[l].cls = i_op[l].dst.rcls;
+            pdst[l].idx = if wr_fp[l] ? i_pop_fp[rank_fp[l]] : i_pop_int[rank_int[l]];
+            pidx[l]     = pdst[l].idx;
+        }
+    }
+
+    // Source and old-destination lookup, overridden by the youngest older
+    // writer of the group (an AND-OR select over the lanes).
+    always_comb {
+        for l in 0..W {
+            var k     : logic   <KEY>    [3];
+            var p     : logic   <PREG_W> [3];
+            var g     : logic   <3>         ;
+            var cls   : RegClass         [3];
+            var oldp  : logic   <PREG_W>    ;
+            k[0]   = key(i_op[l].rs1.rcls, i_op[l].rs1.arch);
+            k[1]   = key(i_op[l].rs2.rcls, i_op[l].rs2.arch);
+            k[2]   = key(i_op[l].rs3.rcls, i_op[l].rs3.arch);
+            cls[0] = i_op[l].rs1.rcls;
+            cls[1] = i_op[l].rs2.rcls;
+            cls[2] = i_op[l].rs3.rcls;
+            for s in 0..3 {
+                var m: logic<W>;
+                for j in 0..W {
+                    m[j] = j <: l && wr[j] && dkey[j] == k[s];
+                }
+                g[s] = m != '0;
+                p[s] = if g[s] ? tree_onehot_mux::<W, PREG_W>(last_lane(m), pidx) : spec_q[k[s]];
+            }
+            var md: logic<W>;
+            for j in 0..W {
+                md[j] = j <: l && wr[j] && dkey[j] == dkey[l];
+            }
+            oldp = if md != '0 ? tree_onehot_mux::<W, PREG_W>(last_lane(md), pidx) : spec_q[dkey[l]];
+            o_ren[l].ps1.cls  = cls[0];
+            o_ren[l].ps1.idx  = p[0];
+            o_ren[l].ps2.cls  = cls[1];
+            o_ren[l].ps2.idx  = p[1];
+            o_ren[l].ps3.cls  = cls[2];
+            o_ren[l].ps3.idx  = p[2];
+            o_ren[l].grp      = g;
+            o_ren[l].pdst     = pdst[l];
+            o_ren[l].old_pdst = oldp;
+        }
+    }
+
+    // Per-entry write selection. Rename: the youngest taken lane wins. Walk:
+    // the oldest lane of the batch (highest lane index) wins.
+    let full: logic = i_kill.valid && i_kill.full;
+
+    const CMW: u32 = CFG::COMMIT_W;
+
+    // One-hot of the highest set bit over the commit lanes (the youngest).
+    function last_cm (
+        x: input logic<CMW>,
+    ) -> logic<CMW> {
+        var r: logic<CMW>;
+        var f: logic<CMW>;
+        for i in 0..CMW {
+            r[i] = x[CMW - 1 - i];
+        }
+        f = tree_first::<CMW>(r);
+        for i in 0..CMW {
+            r[i] = f[CMW - 1 - i];
+        }
+        return r;
+    }
+
+    var wk_d  : logic<PREG_W> [W]    ;
+    var cm_d  : logic<PREG_W> [CMW]  ;
+    var ren_we: logic         [RAT_N];
+    var ren_wd: logic<PREG_W> [RAT_N];
+    var wlk_we: logic         [RAT_N];
+    var wlk_wd: logic<PREG_W> [RAT_N];
+    var cm_we : logic         [RAT_N];
+    var cm_wd : logic<PREG_W> [RAT_N];
+    always_comb {
+        for l in 0..W {
+            wk_d[l] = i_walk[l].old_pdst;
+        }
+        for l in 0..CMW {
+            cm_d[l] = i_cm[l].pdst;
+        }
+        for e in 0..RAT_N {
+            var rh: logic<W>  ;
+            var wh: logic<W>  ;
+            var ch: logic<CMW>;
+            for l in 0..W {
+                rh[l] = wr[l] && l <: i_take && dkey[l] == e;
+                wh[l] = i_walk[l].valid && key(i_walk[l].cls, i_walk[l].rd_arch) == e;
+            }
+            for l in 0..CMW {
+                ch[l] = i_cm[l].retire && i_cm[l].has_rd && key(i_cm[l].cls, i_cm[l].arch) == e;
+            }
+            ren_we[e] = rh != '0;
+            ren_wd[e] = tree_onehot_mux::<W, PREG_W>(last_lane(rh), pidx);
+            wlk_we[e] = wh != '0;
+            wlk_wd[e] = tree_onehot_mux::<W, PREG_W>(last_lane(wh), wk_d);
+            cm_we[e]  = ch != '0;
+            cm_wd[e]  = tree_onehot_mux::<CMW, PREG_W>(last_cm(ch), cm_d);
+        }
+    }
+
+    always_ff {
+        if_reset {
+            for e in 0..RAT_N {
+                spec_q[e] = e[4:0] as PREG_W;
+                arch_q[e] = e[4:0] as PREG_W;
+            }
+        } else {
+            for e in 0..RAT_N {
+                if full {
+                    spec_q[e] = arch_q[e];
+                } else if wlk_we[e] {
+                    spec_q[e] = wlk_wd[e];
+                } else if ren_we[e] {
+                    spec_q[e] = ren_wd[e];
+                }
+                if cm_we[e] {
+                    arch_q[e] = cm_wd[e];
+                }
+            }
+        }
+    }
+
+    var walk_any: logic;
+    always_comb {
+        var m: logic<W>;
+        for l in 0..W {
+            m[l] = i_walk[l].valid;
+        }
+        walk_any = |m;
+    }
+
+    var perf_q: RenPerf;
+    always_ff {
+        if_reset {
+            perf_q = 0 as RenPerf;
+        } else {
+            perf_q.walk_start   = i_kill.valid && !i_kill.full;
+            perf_q.walk_cyc     = walk_any && !full;
+            perf_q.full_restore = full;
+        }
+    }
+    assign o_perf = perf_q;
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_rename::<CFG> (
+            clk                                                 ,
+            rst                                                 ,
+            i_spec   : spec_q                                   ,
+            i_arch   : arch_q                                   ,
+            i_blocked: (i_kill.valid || walk_any) && i_take != 0,
+            o_chk                                               ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    {
+        assign o_chk = 2'b0;
+    }
+}

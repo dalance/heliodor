@@ -1,0 +1,370 @@
+// rob: reorder buffer storage, completion, oldest-exception record, walk
+// sequencing.
+//
+// Ports (timing contract):
+//   i_alloc_valid/i_alloc : dispatch group, lanes contiguous from lane 0;
+//                           lane l becomes the entry o_alloc_tag[l]. No
+//                           allocation in a kill cycle or while o_walk_busy
+//   o_alloc_tag, o_free   : registered state only
+//   i_wb[WB_N]            : one WbPacket per WB port; done, fflags and obs of
+//                           an op completed in cycle t are visible on o_cm
+//                           from t+1. BRU ports also write the resolve record
+//   o_cm[COMMIT_W]        : the COMMIT_W oldest entries (lane l = head + l),
+//                           registered state only
+//   o_exc, o_head         : registered state only
+//   i_retire_cnt          : from commit; head advances on the edge
+//   i_kill                : full: empties the ROB and aborts a walk. Partial:
+//                           tail := next(keep) and a walk of the killed
+//                           entries starts. Precondition: no partial kill
+//                           while o_walk_busy or in the cycle after a kill
+//                           (flush_ctrl adopts no resolve then; chk_rob bit
+//                           6 checks the walk half). A partial kill during a
+//                           walk would restart from the tail and skip the
+//                           unwalked rest
+//   i_rec_set             : from flush_ctrl; sets recovered on the edge that
+//                           registers the partial Kill
+//   i_snap_tag -> o_snap  : combinational snapshot read for flush_ctrl
+//   o_walk, o_walk_busy   : registered. In the cycles after a partial kill,
+//                           WALK_W entries per cycle, youngest first (lane 0
+//                           is the youngest of the batch); an entry without
+//                           rd is an invalid lane. o_walk_busy is set exactly
+//                           in the cycles that present a batch
+// Owns:
+//   - exc_q is the oldest exception reported by a live op: the reports of
+//     the cycle and the held one go through one oldest-tag tree after the
+//     kill of the cycle removes its victims
+//   - a walk presents every entry younger than keep exactly once, youngest
+//     first, and lasts ceil(n / WALK_W) cycles for n killed entries
+// Rationale:
+//   - an entry holds only what commit and recovery need; large results stay
+//     in their owning queues and the retire record reads them there
+//   - completion is not a filter: a packet for a free entry only marks it
+//     done, and allocation rewrites done. Not sending packets of killed ops
+//     is the senders' duty (kill completeness)
+//   - one register holds the oldest exception: only the group head traps,
+//     and every younger exception dies with that trap's full kill
+pub module rob::<CFG: core_cfg> (
+    clk          : input  clock                                                                                   ,
+    rst          : input  reset                                                                                   ,
+    i_alloc_valid: input  logic                                                        [CFG::RENAME_W]            ,
+    i_alloc      : input  core_types::<CFG>::RobAlloc                                  [CFG::RENAME_W]            ,
+    o_alloc_tag  : output core_types::<CFG>::RobTag                                    [CFG::RENAME_W]            ,
+    o_free       : output logic                      <core_types::<CFG>::ROB_CNT_W>                               ,
+    i_wb         : input  core_types::<CFG>::WbPacket                                  [core_types::<CFG>::WB_N]  ,
+    o_cm         : output core_types::<CFG>::RobCm                                     [CFG::COMMIT_W]            ,
+    o_exc        : output core_types::<CFG>::ExcHold                                                              ,
+    o_head       : output core_types::<CFG>::TagTok                                                               ,
+    i_retire_cnt : input  logic                      <core_types::<CFG>::RETIRE_CNT_W>                            ,
+    i_kill       : input  core_types::<CFG>::Kill                                                                 ,
+    i_rec_set    : input  core_types::<CFG>::TagTok                                                               ,
+    i_snap_tag   : input  core_types::<CFG>::RobTag                                                               ,
+    o_snap       : output core_types::<CFG>::DispSnap                                                             ,
+    o_walk       : output core_types::<CFG>::WalkLane                                  [core_types::<CFG>::WALK_W],
+    o_walk_busy  : output logic                                                                                   ,
+    o_perf       : output core_types::<CFG>::RobPerf                                                              ,
+    o_chk        : output logic                      <core_types::<CFG>::CHK_ROB_W>                               ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const ROB_N: u32 = CFG::ROB_N;
+    const RW   : u32 = CFG::RENAME_W;
+    const CW   : u32 = CFG::COMMIT_W;
+    const CNT_W: u32 = ROB_IDX_W + 1; // 0..ROB_N
+    const SUM_W: u32 = ROB_IDX_W + 2;
+    const N_EXC: u32 = 1 + RW + CFG::MEM_W; // held, dispatch lanes, memory pipes
+    const EXC_W: u32 = $bits(exc_pkg::ExcRec);
+    const AL_W : u32 = $bits(RobAlloc);
+    const RES_W: u32 = $bits(ResRec);
+
+    // ---- Ring arithmetic (any ROB_N) ----
+
+    function tag_add (
+        t: input RobTag       ,
+        k: input logic <CNT_W>,
+    ) -> RobTag {
+        var r: RobTag       ;
+        var s: logic <SUM_W>;
+        s = (t.idx as SUM_W) + (k as SUM_W);
+        if s >= ROB_N {
+            r.wrap = ~t.wrap;
+            r.idx  = (s - ROB_N) as ROB_IDX_W;
+        } else {
+            r.wrap = t.wrap;
+            r.idx  = s as ROB_IDX_W;
+        }
+        return r;
+    }
+
+    function tag_sub (
+        t: input RobTag       ,
+        k: input logic <CNT_W>,
+    ) -> RobTag {
+        var r: RobTag;
+        if (t.idx as CNT_W) >= k {
+            r.wrap = t.wrap;
+            r.idx  = ((t.idx as CNT_W) - k) as ROB_IDX_W;
+        } else {
+            r.wrap = ~t.wrap;
+            r.idx  = ((t.idx as SUM_W) + ROB_N - (k as SUM_W)) as ROB_IDX_W;
+        }
+        return r;
+    }
+
+    // Entries from a up to (not including) b; b is a or younger.
+    function span (
+        a: input RobTag,
+        b: input RobTag,
+    ) -> logic<CNT_W> {
+        return if a.wrap == b.wrap ?
+            (b.idx as CNT_W) - (a.idx as CNT_W)
+        :
+            (ROB_N - (a.idx as CNT_W) + (b.idx as CNT_W)) as CNT_W
+        ;
+    }
+
+    // ---- State ----
+
+    var head_q: RobTag;
+    var tail_q: RobTag;
+
+    var ent_q : RobEnt       [ROB_N];
+    var snap_q: DispSnap     [ROB_N];
+    var done_q: logic        [ROB_N];
+    var ffl_q : logic   <5>  [ROB_N];
+    var obs_q : logic   <64> [ROB_N];
+    var res_q : ResRec       [ROB_N];
+    var rec_q : logic        [ROB_N];
+
+    var exc_q: ExcHold;
+
+    var wbusy_q: logic                   ;
+    var wtop_q : RobTag                  ; // exclusive top of the next batch
+    var wrem_q : logic   <CNT_W>         ; // entries left after the presented batch
+    var walk_q : WalkLane        [WALK_W];
+    var perf_q : RobPerf                 ;
+
+    let count: logic<CNT_W> = span(head_q, tail_q);
+
+    // ---- Allocation tags ----
+
+    for l in 0..RW :g_atag {
+        assign o_alloc_tag[l] = tag_add(tail_q, l as CNT_W);
+    }
+    assign o_free = ((ROB_N as CNT_W) - count) as ROB_CNT_W;
+
+    // ---- Per-entry decoded writes ----
+
+    var al_v   : logic<RW>          ;
+    var al_bits: logic<AL_W>  [RW]  ;
+    var wb_ffl : logic<5>     [WB_N];
+    var wb_data: logic<64>    [WB_N];
+    var wb_res : logic<RES_W> [WB_N];
+    always_comb {
+        for l in 0..RW {
+            al_v[l]    = i_alloc_valid[l];
+            al_bits[l] = i_alloc[l];
+        }
+        for p in 0..WB_N {
+            var r         : ResRec;
+            r.mispred  = i_wb[p].br.mispred;
+            r.taken    = i_wb[p].br.taken;
+            r.next_pc  = i_wb[p].br.next_pc;
+            wb_ffl[p]  = i_wb[p].fflags;
+            wb_data[p] = i_wb[p].data;
+            wb_res[p]  = r;
+        }
+    }
+
+    let n_alloc: logic<CNT_W> = tree_popcount::<RW, CNT_W>(al_v);
+
+    for e in 0..ROB_N :g_ent {
+        var alh: logic<RW>  ;
+        var wbh: logic<WB_N>;
+        var brh: logic<WB_N>;
+        always_comb {
+            for l in 0..RW {
+                alh[l] = i_alloc_valid[l] && o_alloc_tag[l].idx == e;
+            }
+            for p in 0..WB_N {
+                wbh[p] = i_wb[p].valid && i_wb[p].tag.rob.idx == e;
+                brh[p] = wbh[p] && wb_has_bru(p) && i_wb[p].br.valid;
+            }
+        }
+        let al : RobAlloc = tree_onehot_mux::<RW, AL_W>(alh, al_bits) as RobAlloc;
+        let rs : ResRec   = tree_onehot_mux::<WB_N, RES_W>(brh, wb_res) as ResRec;
+        let set: logic    = i_rec_set.valid && i_rec_set.tag.idx == e;
+
+        always_ff {
+            if_reset {
+                done_q[e] = 1'b0;
+                rec_q[e]  = 1'b0;
+            } else {
+                if |alh {
+                    ent_q[e]  = al.ent;
+                    snap_q[e] = al.snap;
+                    done_q[e] = al.done;
+                    rec_q[e]  = 1'b0;
+                } else {
+                    if |wbh {
+                        done_q[e] = 1'b1;
+                        ffl_q[e]  = tree_onehot_mux::<WB_N, 5>(wbh, wb_ffl);
+                        obs_q[e]  = tree_onehot_mux::<WB_N, 64>(wbh, wb_data);
+                    }
+                    if |brh {
+                        res_q[e] = rs;
+                    }
+                    if set {
+                        rec_q[e] = 1'b1;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Commit window ----
+
+    for l in 0..CW :g_cm {
+        let t: RobTag = tag_add(head_q, l as CNT_W);
+        always_comb {
+            o_cm[l].valid     = (l as CNT_W) <: count;
+            o_cm[l].tag       = t;
+            o_cm[l].ent       = ent_q[t.idx];
+            o_cm[l].done      = done_q[t.idx];
+            o_cm[l].fflags    = ffl_q[t.idx];
+            o_cm[l].res       = res_q[t.idx];
+            o_cm[l].recovered = rec_q[t.idx];
+            o_cm[l].obs       = obs_q[t.idx];
+        }
+    }
+
+    always_comb {
+        o_head.valid = count != 0;
+        o_head.tag   = head_q;
+    }
+    assign o_exc  = exc_q;
+    assign o_snap = snap_q[i_snap_tag.idx];
+
+    // ---- Oldest exception ----
+
+    var ex_v  : logic<N_EXC>            ;
+    var ex_t  : logic<ROB_TAG_W> [N_EXC];
+    var ex_rec: logic<EXC_W>     [N_EXC];
+    always_comb {
+        ex_v[0]   = exc_q.valid && !killed(i_kill, exc_q.tag);
+        ex_t[0]   = exc_q.tag;
+        ex_rec[0] = exc_q.rec;
+        for l in 0..RW {
+            ex_v[1 + l]   = i_alloc_valid[l] && i_alloc[l].exc.valid;
+            ex_t[1 + l]   = o_alloc_tag[l];
+            ex_rec[1 + l] = i_alloc[l].exc;
+        }
+        for m in 0..CFG::MEM_W {
+            let w                 : WbPacket = i_wb[CFG::ISSUE_W + m];
+            ex_v[1 + RW + m]   = w.valid && w.exc.valid && !killed(i_kill, w.tag.rob);
+            ex_t[1 + RW + m]   = w.tag.rob;
+            ex_rec[1 + RW + m] = w.exc;
+        }
+    }
+    let ex_sel: logic<N_EXC> = tree_oldest::<N_EXC, ROB_TAG_W>(ex_v, ex_t);
+
+    // ---- Walk ----
+
+    let k_top : RobTag        = tail_q;
+    let k_n   : logic <CNT_W> = span(tag_add(i_kill.keep, 1), tail_q);
+    let k_take: logic <CNT_W> = if k_n >: WALK_W ? WALK_W as CNT_W : k_n;
+    let c_take: logic <CNT_W> = if wrem_q >: WALK_W ? WALK_W as CNT_W : wrem_q;
+    let start : logic         = i_kill.valid && !i_kill.full;
+
+    // Batch lane k: the entry k + 1 below the exclusive top; the first batch
+    // starts at the tail, later ones at wtop_q.
+    var k_batch: WalkLane [WALK_W];
+    var c_batch: WalkLane [WALK_W];
+    for k in 0..WALK_W :g_walk {
+        let kt: RobTag = tag_sub(k_top, (k + 1) as CNT_W);
+        let ct: RobTag = tag_sub(wtop_q, (k + 1) as CNT_W);
+        always_comb {
+            k_batch[k].valid    = (k as CNT_W) <: k_n && ent_q[kt.idx].has_rd;
+            k_batch[k].cls      = ent_q[kt.idx].cls;
+            k_batch[k].rd_arch  = ent_q[kt.idx].rd_arch;
+            k_batch[k].old_pdst = ent_q[kt.idx].old_pdst;
+            c_batch[k].valid    = (k as CNT_W) <: wrem_q && ent_q[ct.idx].has_rd;
+            c_batch[k].cls      = ent_q[ct.idx].cls;
+            c_batch[k].rd_arch  = ent_q[ct.idx].rd_arch;
+            c_batch[k].old_pdst = ent_q[ct.idx].old_pdst;
+        }
+    }
+
+    // ---- Pointers, exc_q, walk and events ----
+
+    let head_n: RobTag = tag_add(head_q, i_retire_cnt as CNT_W);
+
+    always_ff {
+        if_reset {
+            head_q  = 0;
+            tail_q  = 0;
+            exc_q   = 0;
+            wbusy_q = 1'b0;
+            wtop_q  = 0;
+            wrem_q  = 0;
+            for k in 0..WALK_W {
+                walk_q[k] = 0;
+            }
+            perf_q = 0;
+        } else {
+            head_q = head_n;
+            if i_kill.valid && i_kill.full {
+                tail_q = head_n;
+            } else if i_kill.valid {
+                tail_q = tag_add(i_kill.keep, 1);
+            } else {
+                tail_q = tag_add(tail_q, n_alloc);
+            }
+
+            exc_q.valid = |ex_v;
+            exc_q.tag   = tree_onehot_mux::<N_EXC, ROB_TAG_W>(ex_sel, ex_t) as RobTag;
+            exc_q.rec   = tree_onehot_mux::<N_EXC, EXC_W>(ex_sel, ex_rec) as exc_pkg::ExcRec;
+
+            if i_kill.valid && i_kill.full {
+                wbusy_q = 1'b0;
+                for k in 0..WALK_W {
+                    walk_q[k] = 0;
+                }
+            } else if start {
+                wbusy_q = k_n != 0;
+                walk_q  = k_batch;
+                wtop_q  = tag_sub(k_top, k_take);
+                wrem_q  = k_n - k_take;
+            } else if wbusy_q {
+                wbusy_q = wrem_q != 0;
+                walk_q  = c_batch;
+                wtop_q  = tag_sub(wtop_q, c_take);
+                wrem_q  = wrem_q - c_take;
+            }
+
+            perf_q.walk     = wbusy_q;
+            perf_q.exc_repl = ex_v[0] && !ex_sel[0];
+        }
+    }
+
+    assign o_walk      = walk_q;
+    assign o_walk_busy = wbusy_q;
+    assign o_perf      = perf_q;
+
+    #[ifdef(HELIODOR_CHK)]
+    inst u_chk: chk_rob::<CFG> (
+        clk                       ,
+        rst                       ,
+        i_alloc_valid             ,
+        i_alloc                   ,
+        i_alloc_tag  : o_alloc_tag,
+        i_wb                      ,
+        i_retire_cnt              ,
+        i_kill                    ,
+        i_head       : o_head     ,
+        i_walk_busy  : wbusy_q    ,
+        o_chk                     ,
+    );
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

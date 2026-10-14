@@ -1,0 +1,517 @@
+// mem_pipe: one memory pipe; address generation, translation with PMP and
+// PMA, the dcache request, forwarding, load formatting and the WB packet.
+//
+// Served: integer loads and stores of 1, 2, 4 and 8 bytes to cacheable PAs,
+// misaligned and line-crossing ones included where the region allows
+// misaligned access. Every other memory access faults (see Rationale);
+// atomics, FP and CBO never reach a pipe (decode rejects them).
+//
+// Ports (timing contract):
+//   i_iss, i_re    : cycle S, combinational; at most one is valid (mem_port_arb
+//                    holds the IQ for this pipe when it grants a re-issue);
+//                    captured into m0
+//   o_iq_rel       : m0; a new issue releases its IQ entry on acceptance
+//   o_rf_addr*, i_rf_*, i_wb : m0 register read, bypassed from the WB bus
+//   i_priv, i_pmp* : read at m1; they change only at a flushing retire
+//   o_req_*        : m2 = A, the adapter's accept cycle. Every request is
+//                    accepted and answered exactly RESP_LAT cycles later
+//                    (dcache_port_adapter), so i_resp at R belongs to the
+//                    pass at R whenever that pass sent one
+//   o_fwd_q, i_fwd_sq, i_fwd_sb : m2, combinational round trip
+//   o_snap, o_sta, o_std : m2, written on the m2 edge
+//   i_split_lo     : lq's registered lo dword of the crossing load in flight
+//                    (at most one: crossing loads run only as the oldest)
+//   o_verdict, o_wake    : R = m2 + RESP_LAT, combinational from the response;
+//                    the wake leads o_wb by one cycle (see core_types Wake)
+//   o_wb           : registered, R + 1 = m0 + LD_LAT
+//   o_perf         : combinational event wires
+//   i_kill         : applied on the capture edge of every stage, and to the
+//                    verdict and wake of the op at R
+// Owns:
+//   - every pass leaves at R: at most one verdict and one packet per pass, so
+//     a pass uses no WB slot but the one reserved when it entered m0
+//   - a store's completion packet (R + 1) follows its store-resolve scan
+//     (m2 + 1), so no younger load retires past an unseen violation
+//   - a load's value is the dcache line merged with forwarded bytes; a load
+//     that cannot get every byte this pass parks and re-issues
+// Rationale:
+//   - a line-crossing access runs as two passes, each translated and checked
+//     on its own line; a crossing load runs only once it holds the oldest
+//     token and keeps its lo dword in the lq split buffer
+//   - translation is Bare: PA = VA, and a VA above the PA width is a hole
+//   - access fault (cause 5 load, 7 store) for a hole, a PMP denial, a
+//     non-cacheable PA, and a misaligned access to a region without
+//     misaligned_ok. This build has no uncached access path, and the
+//     privileged spec allows an access fault for a misaligned access the
+//     region cannot perform
+pub module mem_pipe::<CFG: core_cfg> #(
+    param PMA_N  : u32                         = 1,
+    param PMA_TBL: pma_pkg::PmaRegion [PMA_N] = '{
+        default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
+    },
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill,
+
+    i_iss: input core_types::<CFG>::IqGrant   ,
+    i_re : input core_types::<CFG>::MemReissue,
+
+    o_iq_rel: output core_types::<CFG>::IqRelease,
+
+    o_rf_addr1: output core_types::<CFG>::PReg                             ,
+    o_rf_addr2: output core_types::<CFG>::PReg                             ,
+    i_rf_int1 : input  logic<64>                                           ,
+    i_rf_int2 : input  logic<64>                                           ,
+    i_rf_fp2  : input  logic<64>                                           ,
+    i_wb      : input  core_types::<CFG>::WbPacket [core_types::<CFG>::WB_N],
+
+    i_priv   : input csr_pkg::PrivLevel,
+    i_pmpcfg : input logic<64>      [2] ,
+    i_pmpaddr: input logic<64>      [16],
+
+    o_req_valid: output logic                     ,
+    o_req      : output core_types::<CFG>::MemReq ,
+    i_resp     : input  core_types::<CFG>::MemResp,
+
+    o_fwd_q : output core_types::<CFG>::FwdQuery,
+    i_fwd_sq: input  core_types::<CFG>::FwdPart ,
+    i_fwd_sb: input  core_types::<CFG>::FwdPart ,
+
+    o_snap: output core_types::<CFG>::LqSnap  ,
+    o_sta : output core_types::<CFG>::StaWrite,
+    o_std : output core_types::<CFG>::StdWrite,
+
+    i_split_lo: input  logic<64>                   ,
+    o_verdict : output core_types::<CFG>::LqVerdict,
+    o_wake    : output core_types::<CFG>::Wake     ,
+    o_wb      : output core_types::<CFG>::WbPacket ,
+
+    o_perf: output core_types::<CFG>::MemPipePerf,
+) {
+    import core_types::<CFG>::*;
+
+    // ---- helpers ----
+
+    // Bytes of an access of 2^size bytes at byte 0.
+    function size_mask (
+        size: input logic<2>,
+    ) -> logic<16> {
+        return case size {
+            2'd0   : 16'h0001,
+            2'd1   : 16'h0003,
+            2'd2   : 16'h000f,
+            default: 16'h00ff,
+        };
+    }
+
+    // Load result from the 16-byte window holding the access at byte bo.
+    function fmt_load (
+        win: input logic<128>,
+        bo : input logic<3>  ,
+        op : input MemOp     ,
+    ) -> logic<64> {
+        let v: logic<128> = win >> {bo, 3'd0};
+        return case op.size {
+            2'd0   : if op.sgn ? {v[7] repeat 56, v[7:0]} : {56'd0, v[7:0]},
+            2'd1   : if op.sgn ? {v[15] repeat 48, v[15:0]} : {48'd0, v[15:0]},
+            2'd2   : if op.sgn ? {v[31] repeat 32, v[31:0]} : {32'd0, v[31:0]},
+            default: v[63:0],
+        };
+    }
+
+    // ---- Stage contents ----
+
+    struct M0Op {
+        tag  : ExTag           ,
+        op   : MemOp           ,
+        lq   : LqTag           ,
+        sq   : SqTag           ,
+        imm  : logic<32>       ,
+        src1 : PReg            ,
+        src2 : PReg            ,
+        entry: logic<IQ_ENT_W> ,
+        new_ : logic           , // from the IQ (operands from the PRF)
+        va   : logic<64>       , // re-issue: the stored VA
+        half : logic           ,
+    }
+
+    struct M1Op {
+        tag  : ExTag     ,
+        op   : MemOp     ,
+        lq   : LqTag     ,
+        sq   : SqTag     ,
+        new_ : logic     ,
+        half : logic     ,
+        va   : logic<64> , // VA of the access
+        pva  : logic<64> , // VA of this pass (the next line base for the hi pass)
+        m16  : logic<16> , // access bytes in the 16-byte window at va[5:3]
+        xline: logic     ,
+        data : logic<128>, // store bytes in the same window
+    }
+
+    struct M2Op {
+        tag  : ExTag           ,
+        op   : MemOp           ,
+        lq   : LqTag           ,
+        sq   : SqTag           ,
+        new_ : logic           ,
+        half : logic           ,
+        va   : logic       <64>,
+        m16  : logic       <16>,
+        xline: logic           ,
+        data : logic       <128>,
+        pa   : pma_pkg::Pa     , // PA of this pass
+        exc  : exc_pkg::ExcRec ,
+    }
+
+    // m2 to R: what the verdict needs besides the response.
+    struct PostOp {
+        tag    : ExTag          ,
+        op     : MemOp          ,
+        lq     : LqTag          ,
+        new_   : logic          ,
+        half   : logic          ,
+        xline  : logic          ,
+        va     : logic     <64> ,
+        bo     : logic     <3>  ,
+        pmask  : logic     <16> , // bytes of this pass in its window
+        exc    : exc_pkg::ExcRec,
+        req    : logic          , // a MemReq was sent
+        fwd_cov: logic     <16> ,
+        fwd_dat: logic     <128>,
+        fwd_w  : logic          ,
+        wait_sq: SqTag          ,
+    }
+
+    // ---- S -> m0 ----
+
+    var s_v   : logic;
+    var s_d   : M0Op ;
+    always_comb {
+        s_v        = i_iss.valid || i_re.valid;
+        s_d.tag    = if i_re.valid ? i_re.tag : i_iss.tag;
+        s_d.op     = if i_re.valid ? i_re.op : mem_op(i_iss.fu, i_iss.cold.uop);
+        s_d.lq     = if i_re.valid ? i_re.lq : i_iss.cold.lq;
+        s_d.sq     = if i_re.valid ? i_re.sq : i_iss.cold.sq;
+        s_d.imm    = i_iss.cold.imm;
+        s_d.src1   = i_iss.src[0].pr;
+        s_d.src2   = i_iss.src[1].pr;
+        s_d.entry  = i_iss.entry;
+        s_d.new_   = !i_re.valid;
+        s_d.va     = i_re.va;
+        s_d.half   = i_re.valid && i_re.half;
+    }
+
+    var m0_v: logic;
+    var m0  : M0Op ;
+    inst u_m0: stage_reg::<CFG> #(
+        T: M0Op,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_valid: s_v          ,
+        i_data : s_d          ,
+        i_tag  : s_d.tag.rob  ,
+        i_kill                ,
+        o_valid: m0_v         ,
+        o_data : m0           ,
+    );
+
+    // ---- m0: operands, address, pass shape ----
+
+    assign o_iq_rel.valid = m0_v && m0.new_;
+    assign o_iq_rel.entry = m0.entry;
+    assign o_rf_addr1     = m0.src1;
+    assign o_rf_addr2     = m0.src2;
+
+    let rs1: logic<64> = bypass(m0.src1, i_rf_int1, i_wb);
+    let rs2: logic<64> = bypass(m0.src2, if m0.src2.cls == RegClass::FP ? i_rf_fp2 : i_rf_int2, i_wb);
+
+    let m0_va  : logic<64> = if m0.new_ ? rs1 + {m0.imm[31] repeat 32, m0.imm} : m0.va;
+    let m0_bo  : logic<3>  = m0_va[2:0];
+    let m0_m16 : logic<16> = size_mask(m0.op.size) << m0_bo;
+    let m0_dw  : logic<3>  = m0_va[5:3];
+
+    var m1_in: M1Op;
+    always_comb {
+        m1_in.tag   = m0.tag;
+        m1_in.op    = m0.op;
+        m1_in.lq    = m0.lq;
+        m1_in.sq    = m0.sq;
+        m1_in.new_  = m0.new_;
+        m1_in.half  = m0.half;
+        m1_in.va    = m0_va;
+        m1_in.pva   = if m0.half ? {m0_va[63:6] + 58'd1, 6'd0} : m0_va;
+        m1_in.m16   = m0_m16;
+        m1_in.xline = m0_dw == 3'd7 && m0_m16[15:8] != 8'd0;
+        m1_in.data  = {64'd0, rs2} << {m0_bo, 3'd0};
+    }
+
+    var m1_v: logic;
+    var m1  : M1Op ;
+    inst u_m1: stage_reg::<CFG> #(
+        T: M1Op,
+    ) (
+        clk                    ,
+        rst                    ,
+        i_valid: m0_v          ,
+        i_data : m1_in         ,
+        i_tag  : m0.tag.rob    ,
+        i_kill                 ,
+        o_valid: m1_v          ,
+        o_data : m1            ,
+    );
+
+    // ---- m1: Bare translation, PMP, PMA ----
+
+    let m1_pa   : pma_pkg::Pa      = m1.pva[55:0];
+    let m1_hole : logic            = m1.pva[63:56] != 8'd0;
+    let m1_attr : pma_pkg::PmaAttr = pma_check::<PMA_N>(m1_pa, PMA_TBL);
+    let m1_misal: logic            = ({1'b0, m1.va[2:0]} & ((4'd1 << m1.op.size) - 4'd1)) != 4'd0;
+
+    var m1_pmp_fault: logic;
+    inst u_pmp: pmp_check (
+        i_addr   : {8'd0, m1_pa}               ,
+        i_acc    : if m1.op.st ? 2'd1 : 2'd0   ,
+        i_priv                                 ,
+        i_pmpcfg                               ,
+        i_pmpaddr                              ,
+        o_fault  : m1_pmp_fault                ,
+    );
+
+    var m2_in: M2Op;
+    always_comb {
+        m2_in.tag       = m1.tag;
+        m2_in.op        = m1.op;
+        m2_in.lq        = m1.lq;
+        m2_in.sq        = m1.sq;
+        m2_in.new_      = m1.new_;
+        m2_in.half      = m1.half;
+        m2_in.va        = m1.va;
+        m2_in.m16       = m1.m16;
+        m2_in.xline     = m1.xline;
+        m2_in.data      = m1.data;
+        m2_in.pa        = m1_pa;
+        m2_in.exc.valid = m1_hole || !m1_attr.backed || !m1_attr.cacheable || m1_pmp_fault
+            || (m1_misal && !m1_attr.misaligned_ok);
+        m2_in.exc.cause = if m1.op.st ? 6'd7 : 6'd5;
+        m2_in.exc.tval  = m1.pva;
+        m2_in.exc.gpa   = 54'd0;
+        m2_in.exc.gva   = 1'b0;
+    }
+
+    var m2_v: logic;
+    var m2  : M2Op ;
+    inst u_m2: stage_reg::<CFG> #(
+        T: M2Op,
+    ) (
+        clk                    ,
+        rst                    ,
+        i_valid: m1_v          ,
+        i_data : m2_in         ,
+        i_tag  : m1.tag.rob    ,
+        i_kill                 ,
+        o_valid: m2_v          ,
+        o_data : m2            ,
+    );
+
+    // ---- m2: request, forward query, snapshot, STA/STD ----
+
+    let m2_live : logic     = m2_v && !killed(i_kill, m2.tag.rob);
+    let m2_dw   : logic<3>  = if m2.half ? 3'd0 : m2.va[5:3];
+    let m2_pmask: logic<16> = if m2.half ? {8'd0, m2.m16[15:8]} : if m2.xline ? {8'd0, m2.m16[7:0]} : m2.m16;
+    let m2_load : logic     = m2_v && !m2.op.st;
+    // A crossing load runs its passes only as re-issues, which lq grants once it is oldest.
+    let m2_go: logic = m2_load && !m2.exc.valid && !(m2.xline && m2.new_);
+
+    always_comb {
+        o_req_valid           = m2_go;
+        o_req.tag.client = MemClient::LQ;
+        o_req.tag.id     = {m2.lq.wrap, m2.lq.idx} as MEMID_W;
+        o_req.tag.rob    = m2.tag.rob;
+        o_req.cls        = MemCls::LOAD;
+        o_req.pa         = {m2.pa[55:6], m2_dw, 3'd0};
+        o_req.mask       = m2_pmask;
+
+        o_fwd_q.valid  = m2_go;
+        o_fwd_q.line   = m2.pa[55:6];
+        o_fwd_q.dw     = m2_dw;
+        o_fwd_q.mask   = m2_pmask;
+        o_fwd_q.sq_lim = m2.sq;
+
+        o_snap.valid = m2_go && m2_live;
+        o_snap.lq    = m2.lq;
+        o_snap.half  = m2.half;
+        o_snap.line  = m2.pa[55:6];
+        o_snap.dw    = m2_dw;
+        o_snap.mask  = m2_pmask;
+
+        o_sta.valid  = m2_live && m2.op.st;
+        o_sta.sq     = m2.sq;
+        o_sta.lq_lim = m2.lq;
+        o_sta.half   = m2.half;
+        o_sta.va     = m2.va;
+        o_sta.line   = m2.pa[55:6];
+        o_sta.dw     = m2_dw;
+        o_sta.mask   = if m2.half ? {8'd0, m2.m16[15:8]} : m2.m16;
+        o_sta.exc    = m2.exc;
+
+        o_std.valid = m2_live && m2.op.st && !m2.half;
+        o_std.sq    = m2.sq;
+        o_std.data  = m2.data;
+    }
+
+    // The two forward sources combined by age: SQ entries are younger than
+    // every store-buffer line.
+    let fw_cov: logic<16>  = i_fwd_sq.cov | i_fwd_sb.cov;
+    var fw_dat: logic<128>;
+    always_comb {
+        for b in 0..16 {
+            fw_dat[b * 8+:8] = if i_fwd_sq.cov[b] ? i_fwd_sq.data[b * 8+:8] : i_fwd_sb.data[b * 8+:8];
+        }
+    }
+
+    var post_in: PostOp;
+    always_comb {
+        post_in.tag     = m2.tag;
+        post_in.op      = m2.op;
+        post_in.lq      = m2.lq;
+        post_in.new_    = m2.new_;
+        post_in.half    = m2.half;
+        post_in.xline   = m2.xline;
+        post_in.va      = m2.va;
+        post_in.bo      = m2.va[2:0];
+        post_in.pmask   = m2_pmask;
+        post_in.exc     = m2.exc;
+        post_in.req     = m2_go;
+        post_in.fwd_cov = if m2_go ? fw_cov & m2_pmask : 16'd0;
+        post_in.fwd_dat = fw_dat;
+        post_in.fwd_w   = m2_go && i_fwd_sq.wt;
+        post_in.wait_sq = i_fwd_sq.wait_sq;
+    }
+
+    // ---- m2 -> R: RESP_LAT stages ----
+
+    var dl_v: logic  [fu_pkg::RESP_LAT + 1];
+    var dl_d: PostOp [fu_pkg::RESP_LAT + 1];
+    assign dl_v[0] = m2_v;
+    assign dl_d[0] = post_in;
+    for k in 0..fu_pkg::RESP_LAT :g_dl {
+        inst u_dl: stage_reg::<CFG> #(
+            T: PostOp,
+        ) (
+            clk                           ,
+            rst                           ,
+            i_valid: dl_v[k]              ,
+            i_data : dl_d[k]              ,
+            i_tag  : dl_d[k].tag.rob      ,
+            i_kill                        ,
+            o_valid: dl_v[k + 1]          ,
+            o_data : dl_d[k + 1]          ,
+        );
+    }
+
+    // ---- R: verdict, wake, packet ----
+
+    let r_v  : logic  = dl_v[fu_pkg::RESP_LAT] && !killed(i_kill, dl_d[fu_pkg::RESP_LAT].tag.rob);
+    let r    : PostOp = dl_d[fu_pkg::RESP_LAT];
+    let r_st : logic  = r.op.st;
+
+    var r_win: logic<128>;
+    always_comb {
+        for b in 0..16 {
+            r_win[b * 8+:8] = if r.fwd_cov[b] ? r.fwd_dat[b * 8+:8] : i_resp.data[b * 8+:8];
+        }
+    }
+    let r_full : logic = r.req && r.fwd_cov == r.pmask;
+    let r_rsp  : logic = r.req && i_resp.valid;
+    let r_hit  : logic = r_rsp && i_resp.kind == RespKind::HIT;
+    let r_exc  : logic = r.exc.valid;
+    let r_head : logic = !r_exc && r.xline && r.new_;
+    let r_wait : logic = !r_exc && !r_head && r.fwd_w;
+    let r_value: logic = !r_exc && !r_head && !r_wait && (r_full || r_hit);
+    let r_lo   : logic = r_value && r.xline && !r.half;
+    let r_done : logic = r_exc || (r_value && !r_lo);
+
+    let r_ldval: logic<64> = fmt_load(if r.xline ? {r_win[63:0], i_split_lo} : r_win, r.bo, r.op);
+
+    always_comb {
+        o_verdict.valid    = r_v && !r_st;
+        o_verdict.lq       = r.lq;
+        o_verdict.split_lo = r_lo;
+        o_verdict.lo_data  = r_win[63:0];
+        o_verdict.why      = ParkWhy::FILL;
+        o_verdict.fill_id  = i_resp.fill_id;
+        o_verdict.sq_key   = r.wait_sq;
+        o_verdict.va       = r.va;
+        if r_done {
+            o_verdict.state = LqState::DONE;
+        } else if r_head {
+            o_verdict.state = LqState::PARK;
+            o_verdict.why   = ParkWhy::HEAD;
+        } else if r_wait {
+            o_verdict.state = LqState::PARK;
+            o_verdict.why   = ParkWhy::SQ;
+        } else if r_lo {
+            o_verdict.state = LqState::READY;
+        } else if r_rsp && i_resp.kind == RespKind::MISS {
+            o_verdict.state = LqState::PARK;
+        } else if r_rsp && i_resp.kind == RespKind::RETRY && i_resp.reason == RetryReason::FILL_BUSY {
+            o_verdict.state = LqState::PARK;
+            o_verdict.why   = ParkWhy::BUSY;
+        } else {
+            o_verdict.state = LqState::READY;
+        }
+    }
+
+    assign o_wake.valid = r_v && !r_st && r_done && !r_exc && r.tag.has_rd;
+    assign o_wake.pdst  = r.tag.pdst;
+
+    // A store completes on its last pass; the lo pass of a crossing store
+    // leaves the hi pass to the sq.
+    let r_pkt: logic = if r_st ? (r_exc || !(r.xline && !r.half)) : r_done;
+
+    var pkt_in: WbPacket;
+    always_comb {
+        pkt_in.valid  = 1'b1;
+        pkt_in.tag    = r.tag;
+        pkt_in.data   = if r_exc ? 64'd0 : r_ldval;
+        pkt_in.exc    = r.exc;
+        pkt_in.fflags = 5'd0;
+        pkt_in.br     = '0;
+    }
+
+    var pkt_v: logic   ;
+    var pkt  : WbPacket;
+    inst u_wb: stage_reg::<CFG> #(
+        T: WbPacket,
+    ) (
+        clk                          ,
+        rst                          ,
+        i_valid: dl_v[fu_pkg::RESP_LAT] && r_pkt,
+        i_data : pkt_in              ,
+        i_tag  : r.tag.rob           ,
+        i_kill                       ,
+        o_valid: pkt_v               ,
+        o_data : pkt                 ,
+    );
+    always_comb {
+        o_wb       = pkt;
+        o_wb.valid = pkt_v;
+    }
+
+    always_comb {
+        o_perf.issue    = m0_v && m0.new_;
+        o_perf.reissue  = m0_v && !m0.new_;
+        o_perf.fwd_full = r_v && !r_st && r.req && r_full;
+        o_perf.fwd_part = r_v && !r_st && r.req && !r_full && r.fwd_cov != 16'd0;
+        o_perf.fwd_wait = r_v && r_wait;
+        o_perf.split    = m2_v && m2.xline;
+        o_perf.fault    = r_v && r_exc;
+        o_perf.hit      = r_v && r_hit;
+        o_perf.miss     = r_v && r_rsp && i_resp.kind == RespKind::MISS;
+        o_perf.retry    = r_v && r_rsp && i_resp.kind == RespKind::RETRY;
+    }
+}

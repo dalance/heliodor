@@ -1,0 +1,1155 @@
+// rob + commit + trap_unit + flush_ctrl + csr against a synthetic program.
+//
+// The driver generates a program lazily (op k at pc P(k)) and dispatches it in
+// order; after a mispredicted branch it dispatches wrong-path junk until a
+// kill removes it. Completions arrive on the WB ports in random order. The
+// reference is the program itself: record k must be op k, with order k. On a
+// partial kill the walk lanes, the snapshot fields of the Kill and the
+// redirect are checked against the dispatch tables; on a full kill the next
+// record must start at the redirect pc. At the end a retire limit plus a
+// masked interrupt checks the lockstep boundary and the interrupt take path.
+package commit_tb_pkg {
+    enum OpKind: logic<3> {
+        ALU,
+        BRU,
+        LOAD,
+        STORE,
+        EXC, // dispatch-time exception
+        SYS,
+        FENCE,
+        MRET,
+    }
+
+    struct ProgOp {
+        kind    : OpKind    ,
+        pc      : logic <64>,
+        npc     : logic <64>,
+        rvc     : logic     ,
+        has_rd  : logic     ,
+        rd      : logic <5> ,
+        data    : logic <64>,
+        mispred : logic     ,
+        taken   : logic     ,
+        exc     : logic     , // EXC, or a faulting LOAD (reported at WB)
+        cause   : logic <6> ,
+        tval    : logic <64>,
+        csr_wr  : logic     ,
+        csr_addr: logic <12>,
+        csr_data: logic <64>,
+        lines   : logic <2> ,
+        msize   : logic <2> ,
+        maddr   : logic <64>,
+        wdata   : logic <64>,
+    }
+
+    const TVEC  : logic<64> = 64'h0000_0000_8000_4000;
+    const PROG_N: u32       = 1024;
+
+    function mix (
+        x: input logic<64>,
+    ) -> logic<64> {
+        var y: logic<64>;
+        y = x ^ (x >> 31);
+        y = y * 64'h7fb5_d329_728e_a185;
+        y = y ^ (y >> 27);
+        return y;
+    }
+
+    function size_mask (
+        s: input logic<2>,
+    ) -> logic<16> {
+        return (16'h0001 << (16'd1 << s)) - 16'd1;
+    }
+
+    function byte_mask (
+        m: input logic<16>,
+    ) -> logic<64> {
+        var r: logic<64>;
+        for b in 0..64 {
+            r[b] = m[b / 8];
+        }
+        return r;
+    }
+
+    // Program op k at pc; r supplies the random choices. State: the current
+    // mepc and whether a trap happened since the last mret.
+    function gen_op (
+        k    : input logic<32>,
+        pc   : input logic<64>,
+        mepc : input logic<64>,
+        trapd: input logic    ,
+        r    : input logic<64>,
+    ) -> ProgOp {
+        var o      : ProgOp;
+        o       = 0 as ProgOp;
+        o.pc    = pc;
+        o.data  = mix({32'd0, k} ^ 64'h5555);
+        o.rd    = r[12:8] | 5'd1;
+        o.msize = r[14:13];
+        o.maddr = {32'd0, r[47:18], 2'b00};
+        o.wdata = mix({32'd0, k} ^ 64'haaaa);
+        o.lines = if r[15] ? 2'd2 : 2'd1;
+        if k == 0 {
+            o.kind     = OpKind::SYS;
+            o.csr_wr   = 1'b1;
+            o.csr_addr = 12'h305;
+            o.csr_data = TVEC;
+        } else {
+            if r[3:0] <= 4'd4 {
+                o.kind = OpKind::ALU;
+            } else if r[3:0] <= 4'd7 {
+                o.kind = OpKind::BRU;
+            } else if r[3:0] <= 4'd9 {
+                o.kind = OpKind::LOAD;
+            } else if r[3:0] <= 4'd11 {
+                o.kind = OpKind::STORE;
+            } else if r[3:0] == 4'd12 {
+                o.kind = OpKind::EXC;
+            } else if r[3:0] == 4'd13 {
+                o.kind = OpKind::SYS;
+            } else if r[3:0] == 4'd14 {
+                o.kind = OpKind::FENCE;
+            } else {
+                o.kind = if trapd ? OpKind::MRET : OpKind::ALU;
+            }
+        }
+        o.rvc    = r[16]
+            && (o.kind == OpKind::ALU || o.kind == OpKind::LOAD || o.kind == OpKind::STORE || o.kind == OpKind::BRU);
+        o.has_rd = (o.kind == OpKind::ALU || o.kind == OpKind::LOAD || o.kind == OpKind::SYS || o.kind == OpKind::BRU)
+            && r[17];
+        o.npc    = pc + (if o.rvc ? 64'd2 : 64'd4);
+        if o.kind == OpKind::BRU {
+            o.taken   = r[48];
+            o.mispred = r[50:49] == 2'd0;
+            if o.taken {
+                o.npc = pc + {50'd0, r[61:51], 3'b000} - 64'd4096;
+            }
+        } else if o.kind == OpKind::LOAD {
+            o.exc   = r[54:51] == 4'd0;
+            o.cause = 6'd5;
+            o.tval  = o.maddr;
+        } else if o.kind == OpKind::EXC {
+            o.exc   = 1'b1;
+            o.cause = if r[53:52] == 2'd0 ? 6'd3 : if r[53:52] == 2'd1 ? 6'd11 : 6'd2;
+            o.tval  = {32'd0, r[63:32]};
+        } else if o.kind == OpKind::SYS && k != 0 {
+            o.csr_wr   = r[51];
+            o.csr_addr = if r[52] ? 12'h341 : 12'h340;
+            o.csr_data = {32'd0, r[63:34], 2'b00};
+        } else if o.kind == OpKind::MRET {
+            o.npc = mepc;
+        }
+        if o.exc {
+            o.npc = TVEC;
+        }
+        return o;
+    }
+}
+
+module commit_harness::<CFG: core_cfg> (
+    clk   : input  clock     ,
+    rst   : input  reset     ,
+    o_pass: output logic     ,
+    o_done: output logic     ,
+    o_cov : output logic<16> ,
+    o_dbg : output logic<112>,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+    import retire_pkg::*;
+    import commit_tb_pkg::*;
+
+    const N  : u32 = CFG::ROB_N;
+    const RW : u32 = CFG::RENAME_W;
+    const CW : u32 = CFG::COMMIT_W;
+    const MW : u32 = CFG::MEM_W;
+    const IW : u32 = CFG::ISSUE_W;
+    const LQN: u32 = CFG::LQ_N;
+    const SQN: u32 = CFG::SQ_N;
+    const PH1: u32 = 4000; // cycle the retire-limit and interrupt phase starts
+    const END: u32 = 6000;
+
+    // ---- Random source ----
+
+    var lfsr: logic<64> [4];
+    var cyc : logic<32>    ;
+
+    // ---- DUT wiring ----
+
+    var al_v     : logic                  [RW]    ;
+    var al       : RobAlloc               [RW]    ;
+    var al_tag   : RobTag                 [RW]    ;
+    var rob_free : logic   <ROB_CNT_W>            ;
+    var wb       : WbPacket               [WB_N]  ;
+    var cm       : RobCm                  [CW]    ;
+    var rob_exc  : ExcHold                        ;
+    var rob_head : TagTok                         ;
+    var ret_cnt  : logic   <RETIRE_CNT_W>         ;
+    var kill     : Kill                           ;
+    var rec_set  : TagTok                         ;
+    var snap_tag : RobTag                         ;
+    var snap     : DispSnap                       ;
+    var walk     : WalkLane               [WALK_W];
+    var walk_busy: logic                          ;
+    var rob_perf : RobPerf                        ;
+    var rob_chk  : logic   <CHK_ROB_W>            ;
+
+    var lq_win     : LqCmWin                  [CW];
+    var sq_win     : SqCmWin                  [MW];
+    var ord_empty  : logic                        ;
+    var sb_credit  : logic     <SB_CREDIT_W>      ;
+    var sys_wr     : SysPending                   ;
+    var started    : logic     <STARTED_N>        ;
+    var irq_in     : IrqReq                       ;
+    var dbg_en     : logic                        ;
+    var dbg_lim    : logic     <64>               ;
+    var oldest     : TagTok                       ;
+    var cm_flush   : CmFlush                      ;
+    var trap_fire  : logic                        ;
+    var irq_take   : logic                        ;
+    var irq_q      : IrqReq                       ;
+    var epc        : logic     <64>               ;
+    var csr_cm     : CsrCm                        ;
+    var retire     : RetireRec                [CW];
+    var irq_evt    : IrqEvent                     ;
+    var cm_perf    : CmPerf                       ;
+    var cm_chk     : logic     <CHK_CM_W>         ;
+    var lq_ret     : logic     <RETIRE_CNT_W>     ;
+    var sq_ret     : logic     <RETIRE_CNT_W>     ;
+    var _ren_cm    : RenCm                    [CW];
+    var _ftq_cm    : FtqCommit                    ;
+    var _icache_inv: logic                        ;
+
+    var trap_t  : CsrTrap               ;
+    var tgt     : logic    <64>         ;
+    var tval    : logic    <64>         ;
+    var mret_pc : logic    <64>         ;
+    var sret_pc : logic    <64>         ;
+    var redirect: Redirect              ;
+    var fl_perf : FlushPerf             ;
+    var fl_chk  : logic    <CHK_FLUSH_W>;
+
+    var c_mtvec  : logic             <64>;
+    var c_mepc   : logic             <64>;
+    var c_stvec  : logic             <64>;
+    var c_sepc   : logic             <64>;
+    var c_vsepc  : logic             <64>;
+    var c_medeleg: logic             <64>;
+    var c_priv   : csr_pkg::PrivLevel    ;
+    var c_virt   : logic                 ;
+    var c_rd     : logic             <64>;
+
+
+    inst u_rob: rob::<CFG> (
+        clk                     ,
+        rst                     ,
+        i_alloc_valid: al_v     ,
+        i_alloc      : al       ,
+        o_alloc_tag  : al_tag   ,
+        o_free       : rob_free ,
+        i_wb         : wb       ,
+        o_cm         : cm       ,
+        o_exc        : rob_exc  ,
+        o_head       : rob_head ,
+        i_retire_cnt : ret_cnt  ,
+        i_kill       : kill     ,
+        i_rec_set    : rec_set  ,
+        i_snap_tag   : snap_tag ,
+        o_snap       : snap     ,
+        o_walk       : walk     ,
+        o_walk_busy  : walk_busy,
+        o_perf       : rob_perf ,
+        o_chk        : rob_chk  ,
+    );
+
+    inst u_commit: commit::<CFG> (
+        clk                                 ,
+        rst                                 ,
+        i_reset_pc           : 64'h8000_0000,
+        i_cm                 : cm           ,
+        i_exc                : rob_exc      ,
+        i_head               : rob_head     ,
+        i_lq_win             : lq_win       ,
+        i_sq_win             : sq_win       ,
+        i_ordering_empty     : ord_empty    ,
+        i_sb_credit          : sb_credit    ,
+        i_kill               : kill         ,
+        i_sys_wr             : sys_wr       ,
+        i_started            : started      ,
+        i_irq                : irq_in       ,
+        i_priv               : c_priv       ,
+        i_virt               : c_virt       ,
+        i_trap_target        : tgt          ,
+        i_trap_tval          : tval         ,
+        i_mret_pc            : mret_pc      ,
+        i_sret_pc            : sret_pc      ,
+        i_dbg_retire_limit_en: dbg_en       ,
+        i_dbg_retire_limit   : dbg_lim      ,
+        i_dbg_irq_mask       : dbg_en       ,
+        i_dbg_irq_allow      : dbg_en       ,
+        o_retire_cnt         : ret_cnt      ,
+        o_oldest             : oldest       ,
+        o_flush              : cm_flush     ,
+        o_trap_fire          : trap_fire    ,
+        o_irq_take           : irq_take     ,
+        o_irq_q              : irq_q        ,
+        o_epc                : epc          ,
+        o_ren_cm             : _ren_cm      ,
+        o_lq_ret_cnt         : lq_ret       ,
+        o_sq_ret_cnt         : sq_ret       ,
+        o_ftq_cm             : _ftq_cm      ,
+        o_bar_ret            : _            ,
+        o_icache_inv         : _icache_inv  ,
+        o_csr                : csr_cm       ,
+        o_retire             : retire       ,
+        o_irq_evt            : irq_evt      ,
+        o_perf               : cm_perf      ,
+        o_chk                : cm_chk       ,
+    );
+
+    inst u_trap: trap_unit::<CFG> (
+        i_trap_fire: trap_fire  ,
+        i_irq_take : irq_take   ,
+        i_exc      : rob_exc.rec,
+        i_irq      : irq_q      ,
+        i_epc      : epc        ,
+        i_priv     : c_priv     ,
+        i_virt     : c_virt     ,
+        i_medeleg  : c_medeleg  ,
+        i_mtvec    : c_mtvec    ,
+        i_stvec    : c_stvec    ,
+        i_mepc     : c_mepc     ,
+        i_sepc     : c_sepc     ,
+        i_vsepc    : c_vsepc    ,
+        o_trap     : trap_t     ,
+        o_target   : tgt        ,
+        o_tval     : tval       ,
+        o_mret_pc  : mret_pc    ,
+        o_sret_pc  : sret_pc    ,
+    );
+
+    inst u_flush: flush_ctrl::<CFG> (
+        clk                   ,
+        rst                   ,
+        i_wb       : wb       ,
+        i_cm_flush : cm_flush ,
+        i_walk_busy: walk_busy,
+        o_snap_tag : snap_tag ,
+        i_snap     : snap     ,
+        o_rec_set  : rec_set  ,
+        o_kill     : kill     ,
+        o_redirect : redirect ,
+        o_perf     : fl_perf  ,
+        o_chk      : fl_chk   ,
+    );
+
+    inst u_csr: csr #(
+        INSTRET_CNT_W: RETIRE_CNT_W,
+    ) (
+        clk                              ,
+        rst                              ,
+        i_rd_addr    : 12'hB02           ,
+        o_rd_data    : c_rd              ,
+        i_wr_en      : csr_cm.wr_en      ,
+        i_wr_addr    : csr_cm.wr_addr    ,
+        i_wr_data    : csr_cm.wr_data    ,
+        i_mtime      : 64'd0             ,
+        i_trap_fire  : trap_t.fire       ,
+        i_trap_pc    : trap_t.pc         ,
+        i_trap_cause : trap_t.cause      ,
+        i_trap_tval  : trap_t.tval       ,
+        i_mret_fire  : csr_cm.mret       ,
+        i_sret_fire  : csr_cm.sret       ,
+        o_mtvec      : c_mtvec           ,
+        o_mepc       : c_mepc            ,
+        o_stvec      : c_stvec           ,
+        o_sepc       : c_sepc            ,
+        o_medeleg    : c_medeleg         ,
+        o_priv       : c_priv            ,
+        o_virt       : c_virt            ,
+        o_vsepc      : c_vsepc           ,
+        i_trap_to_s  : trap_t.to_s       ,
+        i_trap_to_vs : trap_t.to_vs      ,
+        i_htval      : trap_t.htval      ,
+        i_trap_gva   : trap_t.gva        ,
+        i_irq_timer_m: 1'b0              ,
+        i_irq_sw_m   : 1'b0              ,
+        i_irq_ext_m  : 1'b0              ,
+        i_irq_ext_s  : 1'b0              ,
+        i_instret_cnt: csr_cm.instret_cnt,
+        i_fflags_set : csr_cm.fflags_set ,
+        i_fflags     : csr_cm.fflags     ,
+        i_vxsat_set  : 1'b0              ,
+        i_vset_wr    : 1'b0              ,
+        i_set_vtype  : 64'd0             ,
+        i_set_vl     : 64'd0             ,
+        i_vstart_wr  : 1'b0              ,
+        i_vstart_val : 64'd0             ,
+        i_hpm_events : 8'd0              ,
+    );
+
+    const CORE_CHK_W: u32 = CHK_ROB_W + CHK_CM_W + CHK_FLUSH_W;
+
+    var mon_chk : logic<CORE_CHK_W + CHK_RET_W>;
+    let core_chk: logic<CORE_CHK_W>             = {rob_chk, cm_chk, fl_chk};
+    inst u_mon: retire_mon #(
+        LANES: CW        ,
+        CHK_W: CORE_CHK_W,
+    ) (
+        clk                      ,
+        rst                      ,
+        i_retire       : retire  ,
+        i_irq_evt      : irq_evt ,
+        i_chk          : core_chk,
+        i_hash_mismatch: 1'b0    ,
+        o_chk          : mon_chk ,
+    );
+
+    // ---- Driver state ----
+
+    var prog_q: ProgOp     [PROG_N];
+    var gen_hi: logic <32>         ; // next op to generate
+    var gpc   : logic <64>         ; // its pc
+    var gmepc : logic <64>         ;
+    var gtrap : logic              ;
+    var dk    : logic <32>         ; // next correct-path op to dispatch
+    var wp    : logic              ; // dispatching the wrong path
+    var exp_k : logic <32>         ; // next expected record
+    var nret  : logic <64>         ; // non-trap records so far
+
+    var t_al  : RobAlloc     [N];
+    var t_k   : logic   <32> [N];
+    var t_wp  : logic        [N];
+    var t_kind: OpKind       [N];
+    var t_tag : RobTag       [N];
+    var t_pend: logic        [N];
+    var t_data: logic   <64> [N];
+    var t_exc : logic        [N];
+    var t_mis : logic        [N];
+    var t_tkn : logic        [N];
+    var t_npc : logic   <64> [N];
+    var t_rdy : logic   <32> [N]; // earliest completion cycle
+
+    var lq_hd: logic <LQ_TAG_W>      ;
+    var lq_tl: logic <LQ_TAG_W>      ;
+    var lq_pz: logic            [LQN];
+    var lq_ob: MemObs           [LQN];
+    var sq_hd: logic <SQ_TAG_W>      ;
+    var sq_tl: logic <SQ_TAG_W>      ;
+    var sq_ok: logic            [SQN];
+    var sq_ln: logic <2>        [SQN];
+    var sq_ob: MemObs           [SQN];
+
+    var wk_on : logic           ;
+    var wk_top: logic<ROB_TAG_W>;
+    var wk_n  : logic<ROB_TAG_W>;
+    var wk_i  : logic<ROB_TAG_W>;
+    var nx_chk: logic           ;
+    var nx_pc : logic<64>       ;
+    var lim   : logic<64>       ;
+    var fin   : logic           ;
+    var fin2  : logic           ;
+    var ok    : logic           ;
+    var cov   : logic<16>       ;
+    var f_cyc : logic<32>       ;
+    var f_why : logic<16>       ;
+    var f_info: logic<64>       ;
+
+    assign dbg_en  = cyc >= PH1;
+    assign dbg_lim = lim;
+    always_comb {
+        irq_in         = 0;
+        irq_in.pending = dbg_en && !fin;
+        irq_in.code    = 6'd7;
+    }
+
+    // ---- Commit-side environment ----
+
+    always_comb {
+        for w in 0..CW {
+            let t               : logic<LQ_TAG_W> = lq_hd + w;
+            let i               : logic<LQ_IDX_W> = t[LQ_IDX_W - 1:0];
+            lq_win[w]        = 0;
+            lq_win[w].valid  = (lq_tl - lq_hd) >: w;
+            lq_win[w].tag    = t as LqTag;
+            lq_win[w].poison = lq_pz[i];
+            lq_win[w].obs    = lq_ob[i];
+        }
+        for w in 0..MW {
+            let t                  : logic<SQ_TAG_W> = sq_hd + w;
+            let i                  : logic<SQ_IDX_W> = t[SQ_IDX_W - 1:0];
+            sq_win[w]           = 0;
+            sq_win[w].valid     = (sq_tl - sq_hd) >: w;
+            sq_win[w].tag       = t as SqTag;
+            sq_win[w].retire_ok = sq_ok[i] && lfsr[2][w] | lfsr[2][8];
+            sq_win[w].lines     = sq_ln[i];
+            sq_win[w].obs       = sq_ob[i];
+        }
+        ord_empty = lfsr[2][17:16] != 2'd0;
+        sb_credit = (lfsr[2][23:20] % (PUSH_W + 1)) as SB_CREDIT_W;
+    }
+
+    // ---- Dispatch ----
+
+    var d_ops : ProgOp           [RW];
+    var d_k   : logic <32>       [RW];
+    var d_wp  : logic            [RW];
+    var d_gen : logic            [RW]; // op generated this cycle
+    var d_n   : u32                  ;
+    var g_hi_n: logic <32>           ;
+    var g_pc_n: logic <64>           ;
+    var g_me_n: logic <64>           ;
+    var g_tr_n: logic                ;
+    var dk_n  : logic <32>           ;
+    var wp_n  : logic                ;
+    var lq_tn : logic <LQ_TAG_W>     ;
+    var sq_tn : logic <SQ_TAG_W>     ;
+    always_comb {
+        var n_try: u32            ;
+        var wpc  : logic          ;
+        var kc   : logic<32>      ;
+        var lq_c : logic<LQ_TAG_W>;
+        var sq_c : logic<SQ_TAG_W>;
+        var stop : logic          ;
+        n_try = (lfsr[0][2:0] % (RW + 1)) as u32;
+        if lfsr[0][5:3] == 3'd0 {
+            n_try = 0;
+        }
+        if kill.valid || walk_busy || fin {
+            n_try = 0;
+        }
+        g_hi_n = gen_hi;
+        g_pc_n = gpc;
+        g_me_n = gmepc;
+        g_tr_n = gtrap;
+        wpc    = wp;
+        kc     = dk;
+        lq_c   = lq_tl;
+        sq_c   = sq_tl;
+        stop   = 1'b0;
+        d_n    = 0;
+        for l in 0..RW {
+            let rr      : logic <64> = mix(lfsr[1] ^ {32'd0, l * 32'h1234_567});
+            var o       : ProgOp    ;
+            o        = 0 as ProgOp;
+            d_gen[l] = 1'b0;
+            d_wp[l]  = wpc;
+            d_k[l]   = kc;
+            if wpc {
+                o = gen_op(32'hffff_ffff, {32'd0, rr[31:0]}, 64'd0, 1'b0, rr);
+                if o.kind == OpKind::SYS || o.kind == OpKind::MRET {
+                    o.kind = OpKind::ALU;
+                }
+                o.exc     = o.exc && (o.kind == OpKind::EXC || o.kind == OpKind::LOAD);
+                o.mispred = rr[60];
+                o.npc     = {32'd0, rr[63:32]};
+            } else if kc == g_hi_n {
+                o        = gen_op(kc, g_pc_n, g_me_n, g_tr_n, rr);
+                d_gen[l] = 1'b1;
+            } else {
+                o = prog_q[kc[9:0]];
+            }
+            d_ops[l] = o;
+            if !stop && (l as u32) <: n_try && (l as u32) <: (rob_free as u32) && (lq_c - lq_hd) <: LQN
+                && (sq_c - sq_hd) <: SQN {
+                d_n = l + 1;
+                if o.kind == OpKind::LOAD {
+                    lq_c = lq_c + 1;
+                }
+                if o.kind == OpKind::STORE {
+                    sq_c = sq_c + 1;
+                }
+                if !wpc {
+                    if d_gen[l] {
+                        g_hi_n = kc + 1;
+                        g_pc_n = o.npc;
+                        if o.exc {
+                            g_me_n = o.pc;
+                            g_tr_n = 1'b1;
+                        }
+                        if o.kind == OpKind::MRET {
+                            g_tr_n = 1'b0;
+                        }
+                        if o.kind == OpKind::SYS && o.csr_wr && o.csr_addr == 12'h341 {
+                            g_me_n = o.csr_data;
+                        }
+                    }
+                    kc = kc + 1;
+                    if o.kind == OpKind::BRU && o.mispred {
+                        wpc = 1'b1;
+                    }
+                }
+            } else {
+                stop = 1'b1;
+            }
+        }
+        dk_n  = kc;
+        wp_n  = wpc;
+        lq_tn = lq_c;
+        sq_tn = sq_c;
+    }
+
+    always_comb {
+        var lq_c: logic<LQ_TAG_W>;
+        var sq_c: logic<SQ_TAG_W>;
+        lq_c = lq_tl;
+        sq_c = sq_tl;
+        for l in 0..RW {
+            let o             : ProgOp       = d_ops[l];
+            let rr            : logic   <64> = mix(lfsr[3] ^ {32'd0, l});
+            var a             : RobAlloc    ;
+            a              = 0 as RobAlloc;
+            a.ent.fu       = if o.kind == OpKind::ALU ?
+                FuKind::ALU
+            : if o.kind == OpKind::BRU ?
+                FuKind::BRU
+            : if o.kind == OpKind::LOAD ?
+                FuKind::LOAD
+            : if o.kind == OpKind::STORE ?
+                FuKind::STORE
+            : if o.kind == OpKind::SYS ?
+                FuKind::SYS
+            :
+                FuKind::NONE
+            ;
+            a.ent.drain    = o.kind == OpKind::FENCE;
+            a.ent.flush    = if o.kind == OpKind::MRET ?
+                FlushKind::XRET
+            : if o.kind == OpKind::SYS && o.csr_wr ?
+                FlushKind::NEXT_PC
+            :
+                FlushKind::NONE
+            ;
+            a.ent.alone    = o.kind == OpKind::SYS || o.kind == OpKind::FENCE || o.kind == OpKind::MRET;
+            a.ent.csr_wr   = o.kind == OpKind::SYS && o.csr_wr;
+            a.ent.is_rvc   = o.rvc;
+            a.ent.has_rd   = o.has_rd;
+            a.ent.rd_arch  = o.rd;
+            a.ent.cls      = RegClass::INT;
+            a.ent.pdst     = rr[PREG_W - 1:0];
+            a.ent.old_pdst = rr[PREG_W + 15:16];
+            a.ent.ftq      = rr[FTQ_TAG_W + 23:24] as FtqTag;
+            a.ent.foff     = rr[FOFF_W + 31:32];
+            a.ent.insn     = if d_wp[l] ? {4'hf, rr[63:36]} : d_k[l];
+            if o.kind == OpKind::LOAD {
+                a.ent.lq_v = 1'b1;
+                a.ent.lq   = lq_c as LqTag;
+                lq_c       = lq_c + 1;
+            }
+            if o.kind == OpKind::STORE {
+                a.ent.sq_v = 1'b1;
+                a.ent.sq   = sq_c as SqTag;
+                sq_c       = sq_c + 1;
+            }
+            a.done         = a.ent.fu == FuKind::NONE;
+            a.snap.lq_tail = lq_c as LqTag;
+            a.snap.sq_tail = sq_c as SqTag;
+            a.snap.fl_int  = rr[FL_TAG_W + 41:42] as FlPtr;
+            a.snap.fl_fp   = rr[FL_TAG_W + 49:50] as FlPtr;
+            a.snap.bar_seq = rr[BAR_SEQ_W + 3:4] ^ rr[BAR_SEQ_W + 51:52];
+            if o.kind == OpKind::EXC {
+                a.exc.valid = 1'b1;
+                a.exc.cause = o.cause;
+                a.exc.tval  = o.tval;
+            }
+            al[l]   = a;
+            al_v[l] = (l as u32) <: d_n;
+        }
+    }
+
+    // ---- Completion ----
+
+    var w_sel: logic            [WB_N];
+    var w_e  : logic<ROB_IDX_W> [WB_N];
+    var w_pz : logic            [WB_N];
+    always_comb {
+        var used: logic [N];
+        for e in 0..N {
+            used[e] = 1'b0;
+        }
+        sys_wr  = 0;
+        started = 0;
+        for p in 0..WB_N {
+            let rr   : logic<64>        = mix(lfsr[2] ^ {32'd0, p * 32'h0101_0101});
+            let start: logic<ROB_IDX_W> = rr[ROB_IDX_W + 7:8];
+            var found: logic           ;
+            var sel  : logic<ROB_IDX_W>;
+            found = 1'b0;
+            sel   = 0;
+            for i in 0..N {
+                let e   : logic <ROB_IDX_W> = start + i;
+                let kd  : OpKind            = t_kind[e];
+                var elig: logic            ;
+                elig = 1'b0;
+                if p <: IW {
+                    if kd == OpKind::ALU {
+                        elig = CFG::PORT_FU[p][FuKind::ALU];
+                    }
+                    if kd == OpKind::BRU {
+                        elig = CFG::PORT_FU[p][FuKind::BRU];
+                    }
+                    if kd == OpKind::SYS {
+                        elig = CFG::PORT_FU[p][FuKind::SYS] && oldest.valid && oldest.tag == t_tag[e];
+                    }
+                } else {
+                    elig = kd == OpKind::LOAD || kd == OpKind::STORE;
+                }
+                if !found && t_pend[e] && !used[e] && elig && cyc >= t_rdy[e] {
+                    found = 1'b1;
+                    sel   = e;
+                }
+            }
+            w_sel[p] = found && rr[1:0] != 2'd0 && !fin;
+            w_e[p]   = sel;
+            w_pz[p]  = rr[6:4] == 3'd0;
+            wb[p]    = 0;
+            if w_sel[p] {
+                used[sel]        = 1'b1;
+                wb[p].valid      = 1'b1;
+                wb[p].tag.rob    = t_tag[sel];
+                wb[p].tag.pdst   = {t_al[sel].ent.cls, t_al[sel].ent.pdst} as PReg;
+                wb[p].tag.has_rd = t_al[sel].ent.has_rd;
+                wb[p].data       = t_data[sel];
+                if t_kind[sel] == OpKind::LOAD && t_exc[sel] {
+                    wb[p].exc.valid = 1'b1;
+                    wb[p].exc.cause = 6'd5;
+                    wb[p].exc.tval  = prog_q[t_k[sel][9:0]].tval;
+                }
+                if t_kind[sel] == OpKind::BRU {
+                    wb[p].br.valid   = 1'b1;
+                    wb[p].br.mispred = t_mis[sel];
+                    wb[p].br.taken   = t_tkn[sel];
+                    wb[p].br.next_pc = t_npc[sel];
+                    wb[p].br.ftq     = t_al[sel].ent.ftq;
+                    wb[p].br.foff    = t_al[sel].ent.foff;
+                }
+                if t_kind[sel] == OpKind::SYS {
+                    sys_wr.valid     = 1'b1;
+                    sys_wr.tag       = t_tag[sel];
+                    sys_wr.csr_addr  = prog_q[t_k[sel][9:0]].csr_addr;
+                    sys_wr.csr_wdata = prog_q[t_k[sel][9:0]].csr_data;
+                    started          = 1;
+                }
+            }
+        }
+    }
+
+    // ---- Checks ----
+
+    var n_rec: u32      ;
+    var n_ok : logic<64>;
+    var why  : logic<16>;
+    var bad  : logic    ;
+    assign bad = why != 0;
+    always_comb {
+        why   = 0;
+        n_rec = 0;
+        n_ok  = 0;
+        for l in 0..CW {
+            let r       : RetireRec     = retire[l];
+            let k       : logic    <32> = exp_k + l;
+            let o       : ProgOp        = prog_q[k[9:0]];
+            let tr      : logic         = o.kind == OpKind::EXC || (o.kind == OpKind::LOAD && o.exc);
+            var x       : RetireRec    ;
+            x        = 0 as RetireRec;
+            x.valid  = 1'b1;
+            x.order  = {32'd0, k};
+            x.pc     = o.pc;
+            x.insn   = k;
+            x.is_rvc = o.rvc;
+            x.priv   = 2'd3;
+            if tr {
+                x.trap  = 1'b1;
+                x.cause = o.cause;
+                x.tval  = if o.cause == 6'd3 ? o.pc : o.tval;
+            } else {
+                x.next_pc = o.npc;
+                if o.has_rd {
+                    x.rd_kind  = RdKind::INT;
+                    x.rd_addr  = o.rd;
+                    x.rd_wdata = o.data;
+                }
+                if o.kind == OpKind::LOAD || o.kind == OpKind::STORE {
+                    x.mem_size  = {1'b0, o.msize};
+                    x.mem_vaddr = o.maddr;
+                    x.mem_paddr = o.maddr ^ 64'h0000_0001_0000_0000;
+                }
+                if o.kind == OpKind::LOAD {
+                    x.mem_rmask = size_mask(o.msize);
+                    x.mem_rdata = o.data & byte_mask(size_mask(o.msize));
+                }
+                if o.kind == OpKind::STORE {
+                    x.mem_wmask = size_mask(o.msize);
+                    x.mem_wdata = o.wdata;
+                }
+                if o.kind == OpKind::SYS && o.csr_wr {
+                    x.csr_valid = 1'b1;
+                    x.csr_addr  = o.csr_addr;
+                    x.csr_wdata = o.csr_data;
+                }
+            }
+            if r.valid {
+                n_rec += 1;
+                n_ok  += {63'd0, !r.trap};
+                if r != x {
+                    why[0] = 1'b1;
+                }
+                if l == 0 && nx_chk && r.pc != nx_pc {
+                    why[1] = 1'b1;
+                }
+                if dbg_en && r.order >= lim {
+                    why[2] = 1'b1;
+                }
+            }
+        }
+        // Partial kill: snapshot, redirect and ftq tail of the kept branch.
+        if kill.valid && !kill.full {
+            let e: logic<ROB_IDX_W> = kill.keep.idx;
+            if kill.lq_tail != t_al[e].snap.lq_tail || kill.sq_tail != t_al[e].snap.sq_tail || kill.fl_int
+                != t_al[e].snap.fl_int || kill.fl_fp != t_al[e].snap.fl_fp || kill.bar_seq != t_al[e].snap.bar_seq
+                || kill.ftq_tail != ftq_next(t_al[e].ent.ftq) {
+                why[3] = 1'b1;
+            }
+            if !redirect.valid || redirect.kind != RedirKind::BR || redirect.pc != t_npc[e] || redirect.ftq_keep
+                != t_al[e].ent.ftq || redirect.foff != t_al[e].ent.foff || redirect.taken != t_tkn[e] || !t_mis[e] {
+                why[4] = 1'b1;
+            }
+            if !t_wp[e] && t_npc[e] != prog_q[t_k[e][9:0]].npc {
+                why[5] = 1'b1;
+            }
+        }
+        // Walk: lane k is the entry wk_i + k below the old tail.
+        if walk_busy != wk_on {
+            why[6] = 1'b1;
+        }
+        if wk_on {
+            for k in 0..WALK_W {
+                let i : logic<ROB_TAG_W> = wk_i + k;
+                let t : logic<ROB_TAG_W> = wk_top - 1 - i;
+                let e : logic<ROB_IDX_W> = t[ROB_IDX_W - 1:0];
+                let ev: logic            = i <: wk_n && t_al[e].ent.has_rd;
+                if walk[k].valid != ev
+                    || (ev
+                        && (walk[k].cls != t_al[e].ent.cls || walk[k].rd_arch != t_al[e].ent.rd_arch || walk[k].old_pdst
+                            != t_al[e].ent.old_pdst)) {
+                    why[7] = 1'b1;
+                }
+            }
+        }
+        if mon_chk != 0 {
+            why[8] = 1'b1;
+        }
+        // Interrupt at the retire-limit boundary.
+        if irq_evt.valid && !fin {
+            if irq_evt.order != lim || irq_evt.cause != 6'd7 || {32'd0, exp_k} != lim {
+                why[9] = 1'b1;
+            }
+            if irq_evt.epc != (if exp_k == gen_hi ? gpc : prog_q[exp_k[9:0]].pc) {
+                why[11] = 1'b1;
+            }
+            if !kill.valid || !kill.full || redirect.kind != RedirKind::IRQ || redirect.pc != TVEC {
+                why[10] = 1'b1;
+            }
+            if c_rd != nret {
+                why[12] = 1'b1;
+            }
+        }
+    }
+
+    // ---- State update ----
+
+    always_ff {
+        if_reset {
+            for i in 0..4 {
+                lfsr[i] = 64'h9e37_79b9_7f4a_7c15 * (i + 1);
+            }
+            cyc    = 0;
+            gen_hi = 0;
+            gpc    = 64'h8000_0000;
+            gmepc  = 0;
+            gtrap  = 1'b0;
+            dk     = 0;
+            wp     = 1'b0;
+            exp_k  = 0;
+            nret   = 0;
+            lq_hd  = 0;
+            lq_tl  = 0;
+            sq_hd  = 0;
+            sq_tl  = 0;
+            wk_on  = 1'b0;
+            wk_top = 0;
+            wk_n   = 0;
+            wk_i   = 0;
+            nx_chk = 1'b0;
+            nx_pc  = 0;
+            lim    = 0;
+            fin    = 1'b0;
+            fin2   = 1'b0;
+            ok     = 1'b1;
+            cov    = 0;
+            f_cyc  = 0;
+            f_why  = 0;
+            f_info = 0;
+            for e in 0..N {
+                t_pend[e] = 1'b0;
+            }
+            for i in 0..LQN {
+                lq_pz[i] = 1'b0;
+            }
+            for i in 0..SQN {
+                sq_ok[i] = 1'b0;
+            }
+        } else {
+            for i in 0..4 {
+                var t      : logic<64>;
+                t       = lfsr[i] ^ (lfsr[i] << 13);
+                t       = t ^ (t >> 7);
+                t       = t ^ (t << 17);
+                lfsr[i] = t;
+            }
+            cyc = cyc + 1;
+            if bad {
+                ok = 1'b0;
+                if ok {
+                    f_cyc  = cyc;
+                    f_why  = why;
+                    f_info = if why[12] ?
+                        {c_rd[31:0], nret[31:0]}
+                    : if why[11] ?
+                        irq_evt.epc
+                    :
+                        {exp_k, retire[0].pc[31:0]}
+                    ;
+                }
+            }
+            if cyc == PH1 - 1 {
+                lim = {32'd0, exp_k} + 64'd40;
+            }
+
+            // Records.
+            exp_k = exp_k + n_rec;
+            nret  = nret + n_ok;
+            if n_rec != 0 {
+                nx_chk = 1'b0;
+            }
+            if irq_evt.valid {
+                fin = 1'b1;
+            }
+            fin2 = fin;
+
+            // Program generation and dispatch.
+            for l in 0..RW {
+                if (l as u32) <: d_n && d_gen[l] {
+                    prog_q[d_k[l][9:0]] = d_ops[l];
+                }
+            }
+            gen_hi = g_hi_n;
+            gpc    = g_pc_n;
+            gmepc  = g_me_n;
+            gtrap  = g_tr_n;
+            dk     = dk_n;
+            wp     = wp_n;
+            lq_tl  = lq_tn;
+            sq_tl  = sq_tn;
+            for l in 0..RW {
+                if (l as u32) <: d_n {
+                    let e        : logic <ROB_IDX_W> = al_tag[l].idx;
+                    let o        : ProgOp            = d_ops[l];
+                    let rd       : logic <64>        = mix(lfsr[3] + l + 17);
+                    t_al[e]   = al[l];
+                    t_k[e]    = d_k[l];
+                    t_wp[e]   = d_wp[l];
+                    t_kind[e] = o.kind;
+                    t_tag[e]  = al_tag[l];
+                    t_pend[e] = o.kind == OpKind::ALU || o.kind == OpKind::BRU || o.kind == OpKind::LOAD || o.kind
+                        == OpKind::STORE || o.kind == OpKind::SYS;
+                    t_data[e] = if d_wp[l] ? mix(lfsr[3] + l) : o.data;
+                    t_exc[e]  = o.exc && o.kind == OpKind::LOAD;
+                    t_mis[e]  = o.mispred;
+                    t_tkn[e]  = o.taken;
+                    t_npc[e]  = o.npc;
+                    t_rdy[e]  = cyc
+                        + (if (o.kind == OpKind::BRU && o.mispred) || (o.kind == OpKind::LOAD && o.exc) ?
+                            {27'd0, rd[4:0]}
+                        :
+                            {29'd0, rd[10:8]}
+                        );
+                    if o.kind == OpKind::LOAD {
+                        let i       : logic <LQ_IDX_W> = al[l].ent.lq.idx;
+                        var m       : MemObs          ;
+                        m        = 0 as MemObs;
+                        m.size   = {1'b0, o.msize};
+                        m.vaddr  = o.maddr;
+                        m.paddr  = o.maddr ^ 64'h0000_0001_0000_0000;
+                        m.rmask  = size_mask(o.msize);
+                        lq_ob[i] = m;
+                        lq_pz[i] = 1'b0;
+                    }
+                    if o.kind == OpKind::STORE {
+                        let i       : logic <SQ_IDX_W> = al[l].ent.sq.idx;
+                        var m       : MemObs          ;
+                        m        = 0 as MemObs;
+                        m.size   = {1'b0, o.msize};
+                        m.vaddr  = o.maddr;
+                        m.paddr  = o.maddr ^ 64'h0000_0001_0000_0000;
+                        m.wmask  = size_mask(o.msize);
+                        m.wdata  = o.wdata;
+                        sq_ob[i] = m;
+                        sq_ln[i] = o.lines;
+                        sq_ok[i] = 1'b0;
+                    }
+                }
+            }
+
+            // Completions.
+            for p in 0..WB_N {
+                if w_sel[p] {
+                    let e        : logic<ROB_IDX_W> = w_e[p];
+                    t_pend[e] = 1'b0;
+                    if t_kind[e] == OpKind::LOAD {
+                        lq_pz[t_al[e].ent.lq.idx] = w_pz[p];
+                    }
+                    if t_kind[e] == OpKind::STORE {
+                        sq_ok[t_al[e].ent.sq.idx] = 1'b1;
+                    }
+                }
+            }
+
+            // Retire and kill.
+            lq_hd = lq_hd + lq_ret;
+            sq_hd = sq_hd + sq_ret;
+            if kill.valid {
+                for e in 0..N {
+                    if killed(kill, t_tag[e]) {
+                        t_pend[e] = 1'b0;
+                    }
+                }
+                if kill.full {
+                    lq_tl  = lq_hd + lq_ret;
+                    sq_tl  = sq_hd + sq_ret;
+                    wp     = 1'b0;
+                    dk     = exp_k + n_rec;
+                    wk_on  = 1'b0;
+                    nx_chk = redirect.kind != RedirKind::IRQ;
+                    nx_pc  = redirect.pc;
+                } else {
+                    let e    : logic<ROB_IDX_W> = kill.keep.idx;
+                    var top  : logic<ROB_TAG_W>;
+                    var keep : logic<ROB_TAG_W>;
+                    top   = al_tag[0];
+                    keep  = kill.keep;
+                    lq_tl = kill.lq_tail;
+                    sq_tl = kill.sq_tail;
+                    if !t_wp[e] {
+                        wp = 1'b0;
+                        dk = t_k[e] + 1;
+                    }
+                    wk_n   = top - keep - 1;
+                    wk_top = top;
+                    wk_i   = 0;
+                    wk_on  = top - keep - 1 != 0;
+                    if top - keep - 1 >: WALK_W {
+                        cov[1] = 1'b1;
+                    }
+                }
+            } else if wk_on {
+                wk_i  = wk_i + WALK_W;
+                wk_on = wk_i + WALK_W <: wk_n;
+            }
+
+            // Coverage.
+            if fl_perf.partial {
+                cov[0] = 1'b1;
+            }
+            if cm_perf.rf_br_cm {
+                cov[2] = 1'b1;
+            }
+            if cm_perf.trap {
+                cov[3] = 1'b1;
+            }
+            if cm_perf.replay {
+                cov[4] = 1'b1;
+            }
+            if cm_perf.rf_serial {
+                cov[5] = 1'b1;
+            }
+            if cm_perf.rf_xret {
+                cov[6] = 1'b1;
+            }
+            if rob_perf.exc_repl {
+                cov[7] = 1'b1;
+            }
+            if fl_perf.drop_walk || fl_perf.drop_consec || fl_perf.drop_full {
+                cov[8] = 1'b1;
+            }
+            if cm_perf.cut_exc {
+                cov[9] = 1'b1;
+            }
+            if cm_perf.cut_store {
+                cov[10] = 1'b1;
+            }
+            if cm_perf.retire_n == CW {
+                cov[11] = 1'b1;
+            }
+            if irq_evt.valid {
+                cov[12] = 1'b1;
+            }
+            if cm_perf.cut_alone {
+                cov[13] = 1'b1;
+            }
+            if cm_perf.wait_drain {
+                cov[14] = 1'b1;
+            }
+            if cm_perf.cut_limit {
+                cov[15] = 1'b1;
+            }
+        }
+    }
+
+    assign o_pass = ok && fin2;
+    assign o_done = fin2 || cyc >= END;
+    assign o_cov  = cov;
+    assign o_dbg  = {f_cyc, f_why, f_info};
+}
+
+#[test(test_commit)]
+module test_commit {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic     ;
+    var done2: logic     ;
+    var cov2 : logic<16> ;
+    var dbg2 : logic<112>;
+    var dbg4 : logic<112>;
+    var pass4: logic     ;
+    var done4: logic     ;
+    var cov4 : logic<16> ;
+    inst h2: commit_harness::<cfg_w2> (
+        clk          ,
+        rst          ,
+        o_pass: pass2,
+        o_done: done2,
+        o_cov : cov2 ,
+        o_dbg : dbg2 ,
+    );
+    inst h4: commit_harness::<cfg_w4> (
+        clk          ,
+        rst          ,
+        o_pass: pass4,
+        o_done: done4,
+        o_cov : cov4 ,
+        o_dbg : dbg4 ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(6100);
+        $display("commit: w2 pass=%b cov=%b  w4 pass=%b cov=%b", pass2, cov2, pass4, cov4);
+        $display("commit: w2 dbg=%h  w4 dbg=%h", dbg2, dbg4);
+        $assert(done2 && done4, "commit test did not finish");
+        $assert(pass2 && pass4, "commit retire stream, kill or walk mismatch");
+        $assert(cov2 == 16'hffff && cov4 == 16'hffff, "commit scenario not covered");
+        $finish();
+    }
+}

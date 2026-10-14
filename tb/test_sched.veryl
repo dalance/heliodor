@@ -1,0 +1,1161 @@
+// test_sched: the exec-side scheduler and execution modules (iq, wb_resv,
+// busy_table, prf, exec_port and the integer FUs) under a synthetic dispatch
+// stream, against a cycle-level reference model.
+//
+// The harness renames a random op stream (ALU, MUL, DIV, BRU, SYS over a few
+// architectural registers) with its own RAT and free list, dispatches it into
+// IQ 0, retires in order and injects partial and full kills. The reference
+// model independently computes, every cycle and per issue port, which op the
+// select must grant (oldest op whose sources are scheduled, whose WB slot is
+// free, whose FU is available and, for SYS, which holds the oldest token), the
+// cycle each result must reach the WB bus and its value (from the old core's
+// ALU and a reference divider), and the IQ occupancy. Any difference fails.
+package sched_tb_pkg {
+    function mix (
+        x: input logic<64>,
+    ) -> logic<64> {
+        var z: logic<64>;
+        z = x + 64'h9e37_79b9_7f4a_7c15;
+        z = (z ^ (z >> 30)) * 64'hbf58_476d_1ce4_e5b9;
+        z = (z ^ (z >> 27)) * 64'h94d0_49bb_1331_11eb;
+        return z ^ (z >> 31);
+    }
+
+    function csr_val (
+        a: input logic<12>,
+    ) -> logic<64> {
+        return mix({52'b0, a});
+    }
+
+    // RISC-V M divide and remainder.
+    function div_ref (
+        op: input alu_pkg::AluOp    ,
+        a : input logic         <64>,
+        b : input logic         <64>,
+    ) -> logic<64> {
+        var w  : logic    ;
+        var sgn: logic    ;
+        var rem: logic    ;
+        var x  : logic<64>;
+        var y  : logic<64>;
+        var ax : logic<64>;
+        var ay : logic<64>;
+        var q  : logic<64>;
+        var r  : logic<64>;
+        var res: logic<64>;
+        w   = op == alu_pkg::AluOp::DIVW || op == alu_pkg::AluOp::DIVUW || op == alu_pkg::AluOp::REMW || op
+            == alu_pkg::AluOp::REMUW;
+        sgn = op == alu_pkg::AluOp::DIV || op == alu_pkg::AluOp::REM || op == alu_pkg::AluOp::DIVW || op
+            == alu_pkg::AluOp::REMW;
+        rem = op == alu_pkg::AluOp::REM || op == alu_pkg::AluOp::REMU || op == alu_pkg::AluOp::REMW || op
+            == alu_pkg::AluOp::REMUW;
+        if w {
+            x = if sgn ? {a[31] repeat 32, a[31:0]} : {32'b0, a[31:0]};
+            y = if sgn ? {b[31] repeat 32, b[31:0]} : {32'b0, b[31:0]};
+        } else {
+            x = a;
+            y = b;
+        }
+        if y == 0 {
+            q = '1;
+            r = x;
+        } else if sgn && y == '1 && x == (if w ? 64'hffff_ffff_8000_0000 : 64'h8000_0000_0000_0000) {
+            q = x;
+            r = 0;
+        } else {
+            ax = if sgn && x[63] ? 0 - x : x;
+            ay = if sgn && y[63] ? 0 - y : y;
+            q  = ax / ay;
+            r  = ax % ay;
+            if sgn && x[63] != y[63] {
+                q = 0 - q;
+            }
+            if sgn && x[63] {
+                r = 0 - r;
+            }
+        }
+        res = if rem ? r : q;
+        if w {
+            res = {res[31] repeat 32, res[31:0]};
+        }
+        return res;
+    }
+}
+
+module sched_harness::<CFG: core_cfg> #(
+    param CYCLES: u32 = 6000,
+) (
+    clk     : input  clock    ,
+    rst     : input  reset    ,
+    o_pass  : output logic    ,
+    o_done  : output logic    ,
+    o_cov   : output logic<12>,
+    o_err   : output logic<16>,
+    o_retire: output logic<32>,
+    o_ecyc  : output logic<32>, // first failing cycle
+    o_efirst: output logic<16>, // checks failing in that cycle
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+    import fu_pkg::*;
+    import sched_tb_pkg::*;
+
+    const NP : u32       = iq_port_count(0);
+    const RW : u32       = CFG::RENAME_W;
+    const CMW: u32       = CFG::COMMIT_W;
+    const RN : u32       = CFG::ROB_N;
+    const FN : u32       = FREE_INT_N;
+    const PN : u32       = FREE_INT_N + 32;
+    const NA : u32       = 7; // x0..x6
+    const QN : u32       = CFG::IQ_N[0];
+    const QW : u32       = tag_pkg::idx_w(QN + 1);
+    const FW : u32       = tag_pkg::idx_w(FN) + 1;
+    const INF: logic<32> = 32'hffff_ffff;
+
+    // ================= DUT =================
+
+    var kill_q   : Kill             ;
+    var tok_valid: logic            ;
+    var tok      : TagTok           ;
+    var hc       : logic <ROB_TAG_W>;
+    var tc       : logic <ROB_TAG_W>;
+    let head_q   : RobTag            = hc as RobTag;
+
+    var al_valid: logic                [RW]       ;
+    var al      : IqAlloc              [RW]       ;
+    var q_free  : logic     <IQ_CNT_W>            ;
+    var grant   : IqGrant              [NP]       ;
+    var resv    : WbSlot               [NP]       ;
+    var rel     : IqRelease            [NP]       ;
+    var fu_busy : FuSet                [NP]       ;
+    var wb_ok   : logic     <WB_OFS_N> [NP]       ;
+    var hf_req  : logic                [NP]       ;
+    var hf_gnt  : WbSlot               [NP]       ;
+    var ep_wb   : WbPacket             [NP]       ;
+    var ep_wake : Wake                 [NP]       ;
+    var ep_rd   : PReg                 [NP, SRC_N];
+    var no_hold : logic                [NP]       ;
+    var ep_ftq  : FtqTag               [NP]       ;
+    var ep_csr_a: logic     <12>       [NP]       ;
+    var ep_start: logic                [NP]       ;
+    var ep_sys  : SysPending           [NP]       ;
+    var ep_perf : logic                [NP]       ;
+    var ep_chk  : logic     <4>        [NP]       ;
+    var rs_perf : logic     <2>        [NP]       ;
+    var rs_chk  : logic     <2>        [NP]       ;
+    var iq_perf : logic     <2>                   ;
+    var iq_chk  : logic     <3>                   ;
+    var bt_chk  : logic                           ;
+    var pi_chk  : logic                           ;
+    var pf_chk  : logic                           ;
+
+    var wb   : WbPacket     [WB_N]    ;
+    var wake : Wake         [WB_N]    ;
+    var raddr: PReg         [PRF_RD_N];
+    var rd_i : logic   <64> [PRF_RD_N];
+    var rd_f : logic   <64> [PRF_RD_N];
+    for w in 0..WB_N :g_wb {
+        if w <: NP :g_ep {
+            assign wb[w]   = ep_wb[w];
+            assign wake[w] = ep_wake[w];
+        } else {
+            assign wb[w]   = 0 as WbPacket;
+            assign wake[w] = 0 as Wake;
+        }
+    }
+    for r in 0..PRF_RD_N :g_ra {
+        if r <: NP * SRC_N :g_ep {
+            assign raddr[r] = ep_rd[r / SRC_N][r % SRC_N];
+        } else {
+            assign raddr[r] = 0 as PReg;
+        }
+    }
+
+    inst u_iq: iq::<CFG> #(
+        Q: 0,
+    ) (
+        clk                          ,
+        rst                          ,
+        i_alloc_valid: al_valid      ,
+        i_alloc      : al            ,
+        o_free       : q_free        ,
+        i_wake       : wake          ,
+        i_tok        : tok           ,
+        i_wb_ok      : wb_ok         ,
+        i_fu_busy    : fu_busy       ,
+        i_port_hold  : no_hold       ,
+        i_load_fence : 0 as LoadFence,
+        o_grant      : grant         ,
+        o_resv       : resv          ,
+        i_release    : rel           ,
+        i_kill       : kill_q        ,
+        o_perf       : iq_perf       ,
+        o_chk        : iq_chk        ,
+    );
+
+    var bt_clr_v: logic [RW]    ;
+    var bt_clr  : PReg  [RW]    ;
+    var bt_rd   : PReg  [RW * 3];
+    var bt_rdy  : logic [RW * 3];
+    inst u_bt: busy_table::<CFG> (
+        clk                  ,
+        rst                  ,
+        i_clr_valid: bt_clr_v,
+        i_clr      : bt_clr  ,
+        i_wake     : wake    ,
+        i_rd       : bt_rd   ,
+        o_rdy      : bt_rdy  ,
+        o_chk      : bt_chk  ,
+    );
+
+    inst u_prf_i: prf::<CFG> #(
+        CLS    : RegClass::INT ,
+        N_ENTRY: CFG::PRF_INT_N,
+    ) (
+        clk            ,
+        rst            ,
+        i_raddr: raddr ,
+        o_rdata: rd_i  ,
+        i_wb   : wb    ,
+        o_chk  : pi_chk,
+    );
+
+    inst u_prf_f: prf::<CFG> #(
+        CLS    : RegClass::FP ,
+        N_ENTRY: CFG::PRF_FP_N,
+    ) (
+        clk            ,
+        rst            ,
+        i_raddr: raddr ,
+        o_rdata: rd_f  ,
+        i_wb   : wb    ,
+        o_chk  : pf_chk,
+    );
+
+    // FTQ and CSR models seen by the BRU and SYS ports.
+    function ftq_base (
+        f: input FtqTag,
+    ) -> logic<64> {
+        return 64'h8000_0000 + ({32'b0, f.idx} << 6) + ({32'b0, f.wrap} << 16);
+    }
+
+    function ftq_tgt (
+        f: input FtqTag,
+    ) -> logic<64> {
+        return ftq_base(f) + 64'h40;
+    }
+
+    function ftq_rd (
+        f: input FtqTag,
+    ) -> FtqRead {
+        var r            : FtqRead;
+        r             = 0 as FtqRead;
+        r.base        = ftq_base(f);
+        r.pred.target = ftq_tgt(f);
+        return r;
+    }
+
+    for i in 0..NP :g_ep {
+        var rdi: logic<64> [SRC_N];
+        var rdf: logic<64> [SRC_N];
+        always_comb {
+            for s in 0..SRC_N {
+                rdi[s] = rd_i[i * SRC_N + s];
+                rdf[s] = rd_f[i * SRC_N + s];
+            }
+        }
+        assign no_hold[i] = 1'b0;
+
+        inst u_rs: wb_resv #(
+            D: wb_depth(i),
+        ) (
+            clk                   ,
+            rst                   ,
+            o_ok      : wb_ok[i]  ,
+            i_resv    : resv[i]   ,
+            i_hf_req  : hf_req[i] ,
+            o_hf_grant: hf_gnt[i] ,
+            o_perf    : rs_perf[i],
+            o_chk     : rs_chk[i] ,
+        );
+
+        inst u_ep: exec_port::<CFG> #(
+            P: i,
+        ) (
+            clk                              ,
+            rst                              ,
+            i_grant    : grant[i]            ,
+            i_kill     : kill_q              ,
+            o_release  : rel[i]              ,
+            o_fu_busy  : fu_busy[i]          ,
+            o_rd       : ep_rd[i]            ,
+            i_rd_int   : rdi                 ,
+            i_rd_fp    : rdf                 ,
+            i_wb       : wb                  ,
+            o_wb       : ep_wb[i]            ,
+            o_wake     : ep_wake[i]          ,
+            o_hf_req   : hf_req[i]           ,
+            i_hf_grant : hf_gnt[i]           ,
+            o_ftq_rd   : ep_ftq[i]           ,
+            i_ftq      : ftq_rd(ep_ftq[i]),
+            o_csr_raddr: ep_csr_a[i]         ,
+            i_csr_rdata: csr_val(ep_csr_a[i]),
+            i_tok      : tok                 ,
+            o_started  : ep_start[i]         ,
+            o_sys      : ep_sys[i]           ,
+            o_perf     : ep_perf[i]          ,
+            o_chk      : ep_chk[i]           ,
+        );
+    }
+
+    // ================= Stimulus and reference model =================
+
+    var cyc: logic<32>;
+
+    var drain: logic    ;
+    let seed : logic<64> = {cyc, 32'h5eed_0000 + CFG::ISSUE_W};
+    let rnd0 : logic<64> = mix(seed);
+
+    // Per-entry records, indexed by ROB index.
+    var r_v     : logic     <RN>         ;
+    var r_st    : logic     <2>  [RN]    ; // 0 WAIT, 1 selected, 2 done
+    var r_tag   : RobTag         [RN]    ;
+    var r_fu    : FuKind         [RN]    ;
+    var r_port  : logic     <4>  [RN]    ;
+    var r_en    : logic     <2>  [RN]    ;
+    var r_pr    : PReg           [RN, 2] ;
+    var r_has_rd: logic     <RN>         ;
+    var r_pdst  : PReg           [RN]    ;
+    var r_old   : PReg           [RN]    ;
+    var r_rd    : logic     <3>  [RN]    ;
+    var r_exp   : logic     <64> [RN]    ;
+    var r_br    : BrResolve      [RN]    ;
+    var r_sys   : SysPending     [RN]    ;
+    var r_ns    : logic     <RN>         ;
+    var r_sel_at: logic     <32> [RN]    ;
+    var r_wb_at : logic     <32> [RN]    ;
+    var r_rat   : PReg           [RN, NA];
+    var r_fl    : logic     <FW> [RN]    ;
+
+    var rat     : PReg      [NA];
+    var arch_rat: PReg      [NA];
+    var pval    : logic<64> [PN];
+    var rdy_at  : logic<32> [PN];
+    var fl_q    : logic<8>  [FN];
+    var fl_head : logic<FW>     ;
+    var fl_tail : logic<FW>     ;
+    var fl_cm   : logic<FW>     ;
+
+    var resv_ref: logic <16> [NP];
+    var div_live: logic <NP>     ;
+    var div_rob : RobTag     [NP];
+    var div_v_at: logic <32> [NP];
+    var div_free: logic <32> [NP];
+
+    // FN and ROB_N are powers of two, so ring pointers are plain counters.
+    let inflight: logic<ROB_TAG_W> = tc - hc;
+    let fl_cnt  : logic<FW>        = fl_tail - fl_head;
+
+    assign tok_valid = r_v[head_q.idx] && inflight != 0 && !kill_q.valid;
+    always_comb {
+        tok.valid = tok_valid;
+        tok.tag   = head_q;
+    }
+
+    // ---- Op generation (one candidate per lane) ----
+
+    var g_fu  : FuKind             [RW]   ;
+    var g_uop : logic     <7>      [RW]   ;
+    var g_en  : logic     <2>      [RW]   ;
+    var g_sa  : logic     <3>      [RW, 2];
+    var g_rd  : logic     <3>      [RW]   ;
+    var g_hrd : logic     <RW>            ;
+    var g_imm : logic     <32>     [RW]   ;
+    var g_ftq : FtqTag             [RW]   ;
+    var g_foff: logic     <FOFF_W> [RW]   ;
+    var g_pt  : logic     <RW>            ;
+    var g_rvc : logic     <RW>            ;
+    var g_a   : logic     <64>     [RW]   ;
+    var g_b   : logic     <64>     [RW]   ;
+    var g_exp : logic     <64>     [RW]   ;
+    var g_br  : BrResolve          [RW]   ;
+    var g_sys : SysPending         [RW]   ;
+    var alu_y : logic     <64>     [RW]   ;
+    var alu_a : logic     <64>     [RW]   ;
+    var alu_b : logic     <64>     [RW]   ;
+
+    let n_lanes: u32   = (rnd0[63:56] % (RW + 1)) as u32;
+    let d_go   : logic = !kill_q.valid && !drain && rnd0[55:54] != 0 && q_free >= RW && inflight + RW <= RN && fl_cnt
+        >= RW;
+
+    always_comb {
+        var wr: logic<NA>;
+        wr = 0;
+        for l in 0..RW {
+            let r        : logic<64> = mix(seed ^ (64'h1234_5678 * (l + 1)));
+            let kind     : logic<5>  = r[4:0];
+            var a0       : logic<3> ;
+            var a1       : logic<3> ;
+            g_imm[l]  = {r[39] repeat 20, r[39:28]};
+            g_ftq[l]  = r[47:40] as FtqTag;
+            g_foff[l] = r[51:48] as FOFF_W;
+            g_pt[l]   = r[52];
+            g_rvc[l]  = r[53];
+            a0        = (r[10:8] % NA) as 3;
+            a1        = (r[13:11] % NA) as 3;
+            g_rd[l]   = (r[16:14] % NA) as 3;
+            g_en[l]   = 2'b11;
+            if kind <: 14 || kind >= 28 {
+                let k       : logic<6> = (r[25:20] % 51) as 6;
+                g_fu[l]  = FuKind::ALU;
+                g_uop[l] = {1'b0, if k <: 15 ? k : k + 13};
+                g_en[l]  = {r[17], r[18:17] != 0};
+            } else if kind <: 20 {
+                let k       : logic<3> = (r[22:20] % 5) as 3;
+                g_fu[l]  = FuKind::MUL;
+                g_uop[l] = case k {
+                    0      : 7'd15,
+                    1      : 7'd16,
+                    2      : 7'd17,
+                    3      : 7'd18,
+                    default: 7'd23,
+                };
+            } else if kind == 20 {
+                g_fu[l]  = FuKind::DIV;
+                g_uop[l] = case r[22:20] {
+                    0      : 7'd19,
+                    1      : 7'd20,
+                    2      : 7'd21,
+                    3      : 7'd22,
+                    4      : 7'd24,
+                    5      : 7'd25,
+                    6      : 7'd26,
+                    default: 7'd27,
+                };
+            } else if kind <: 27 {
+                let k       : logic<4> = (r[23:20] % 9) as 4;
+                g_fu[l]  = FuKind::BRU;
+                g_uop[l] = {3'b0, k};
+                g_en[l]  = case k {
+                    6      : 2'b00, // JAL
+                    7      : 2'b01, // JALR
+                    8      : 2'b00, // AUIPC
+                    default: 2'b11,
+                };
+                if r[54] {
+                    // land on the predicted target
+                    g_imm[l] = 32'h40 - {28'b0, g_foff[l], 1'b0};
+                }
+            } else {
+                let k       : logic<3> = (r[22:20] % 7) as 3;
+                g_fu[l]  = FuKind::SYS;
+                g_uop[l] = {4'b0, k};
+                g_en[l]  = if k == 6 ? 2'b11 : (if k >= 3 ? 2'b00 : 2'b01);
+                g_imm[l] = {15'b0, r[59:55], r[35:24]};
+            }
+            // No dependency inside the group: a source written by an earlier
+            // lane reads x0 instead.
+            if wr[a0] {
+                a0 = 0;
+            }
+            if wr[a1] {
+                a1 = 0;
+            }
+            g_sa[l][0] = a0;
+            g_sa[l][1] = a1;
+            g_hrd[l]   = g_rd[l] != 0 && !(g_fu[l] == FuKind::BRU && g_uop[l] <: 6)
+                && !(g_fu[l] == FuKind::SYS && g_uop[l][3:0] == 6);
+            if g_hrd[l] && l <: n_lanes {
+                wr[g_rd[l]] = 1'b1;
+            }
+            g_a[l] = pval[rat[a0].idx];
+            g_b[l] = pval[rat[a1].idx];
+        }
+    }
+
+    for l in 0..RW :g_ref_alu {
+        always_comb {
+            alu_a[l] = if g_en[l][0] ? g_a[l] : 0;
+            alu_b[l] = if g_en[l][1] ? g_b[l] : {g_imm[l][31] repeat 32, g_imm[l]};
+        }
+        inst u_ref: v14_alu (
+            i_op : g_uop[l][5:0] as alu_pkg::AluOp              ,
+            i_a  : alu_a[l]                                     ,
+            i_b  : if g_fu[l] == FuKind::MUL ? g_b[l] : alu_b[l],
+            o_out: alu_y[l]                                     ,
+        );
+    }
+
+    always_comb {
+        for l in 0..RW {
+            let a   : logic<64> = g_a[l];
+            let b   : logic<64> = g_b[l];
+            let imm : logic<64> = {g_imm[l][31] repeat 32, g_imm[l]};
+            let pc  : logic<64> = ftq_base(g_ftq[l]) + {g_foff[l], 1'b0};
+            let op  : BruOp     = g_uop[l][3:0] as BruOp;
+            let cond: logic     = case op {
+                BruOp::BEQ : a == b,
+                BruOp::BNE : a != b,
+                BruOp::BLT : $signed(a) <: $signed(b),
+                BruOp::BGE : !($signed(a) <: $signed(b)),
+                BruOp::BLTU: a <: b,
+                BruOp::BGEU: !(a <: b),
+                default    : 1'b1,
+            };
+            let ctrl    : logic     = op != BruOp::AUIPC;
+            let tk      : logic     = ctrl && cond;
+            let tgt     : logic<64> = if op == BruOp::JALR ? ((a + imm) & ~64'd1) : pc + imm;
+            let nsq     : logic<64> = pc + (if g_rvc[l] ? 64'd2 : 64'd4);
+            let sop     : SysOp     = g_uop[l][3:0] as SysOp;
+            let rdat    : logic<64> = csr_val(g_imm[l][11:0]);
+            let opnd    : logic<64> = if sop == SysOp::CSRRWI || sop == SysOp::CSRRSI || sop == SysOp::CSRRCI ?
+                {59'b0, g_imm[l][16:12]}
+            :
+                a
+            ;
+            g_br[l]  = 0 as BrResolve;
+            g_sys[l] = 0 as SysPending;
+            case g_fu[l] {
+                FuKind::ALU, FuKind::MUL: g_exp[l] = alu_y[l];
+                FuKind::DIV             : g_exp[l] = div_ref(g_uop[l][5:0] as alu_pkg::AluOp, a, b);
+                FuKind::BRU             : {
+                    g_exp[l]        = if ctrl ? nsq : pc + imm;
+                    g_br[l].valid   = 1'b1;
+                    g_br[l].taken   = tk;
+                    g_br[l].next_pc = if tk ? tgt : nsq;
+                    g_br[l].mispred = tk != g_pt[l] || (tk && tgt != ftq_tgt(g_ftq[l]));
+                    g_br[l].ftq     = g_ftq[l];
+                    g_br[l].foff    = g_foff[l];
+                }
+                default: {
+                    g_exp[l]           = rdat;
+                    g_sys[l].valid     = 1'b1;
+                    g_sys[l].csr_addr  = g_imm[l][11:0];
+                    g_sys[l].csr_wdata = case sop {
+                        SysOp::CSRRS, SysOp::CSRRSI: rdat | opnd,
+                        SysOp::CSRRC, SysOp::CSRRCI: rdat & ~opnd,
+                        default                    : opnd,
+                    };
+                }
+            }
+        }
+    }
+
+    // ---- Dispatch ----
+
+    var g_pdst: PReg   [RW];
+    var g_tag : RobTag [RW];
+    always_comb {
+        var k: u32;
+        k = 0;
+        for l in 0..RW {
+            var fp           : logic<FW>;
+            fp            = fl_head + k;
+            g_tag[l]      = (tc + l) as RobTag;
+            g_pdst[l]     = 0 as PReg;
+            g_pdst[l].idx = fl_q[fp[FW - 2:0]] as PREG_W;
+            if g_hrd[l] && l <: n_lanes {
+                k += 1;
+            }
+            al_valid[l]      = d_go && l <: n_lanes;
+            bt_clr_v[l]      = al_valid[l] && g_hrd[l];
+            bt_clr[l]        = g_pdst[l];
+            al[l]            = 0 as IqAlloc;
+            al[l].tag.rob    = g_tag[l];
+            al[l].tag.pdst   = g_pdst[l];
+            al[l].tag.has_rd = g_hrd[l];
+            al[l].fu         = g_fu[l];
+            al[l].nonspec    = g_fu[l] == FuKind::SYS;
+            for s in 0..2 {
+                bt_rd[l * 3 + s] = rat[g_sa[l][s]];
+                al[l].src[s].en  = g_en[l][s];
+                al[l].src[s].pr  = rat[g_sa[l][s]];
+                al[l].rdy[s]     = !g_en[l][s] || bt_rdy[l * 3 + s];
+            }
+            bt_rd[l * 3 + 2]      = 0 as PReg;
+            al[l].rdy[2]          = 1'b1;
+            al[l].cold.uop        = g_uop[l];
+            al[l].cold.imm        = g_imm[l];
+            al[l].cold.ftq        = g_ftq[l];
+            al[l].cold.foff       = g_foff[l];
+            al[l].cold.pred_taken = g_pt[l];
+            al[l].cold.rvc        = g_rvc[l];
+        }
+    }
+
+    // Reference IQ occupancy and port choice.
+    var occ  : logic<QW + 1> [NP];
+    var occ_n: logic<QW + 1>     ;
+    always_comb {
+        occ_n = 0;
+        for i in 0..NP {
+            occ[i] = 0;
+        }
+        for e in 0..RN {
+            if r_v[e] && (r_st[e] == 0 || (r_st[e] == 1 && r_sel_at[e] + ISS_TO_ACC >= cyc)) {
+                occ[r_port[e]] += 1;
+                occ_n          += 1;
+            }
+        }
+    }
+
+    var g_port: logic<4> [RW];
+    always_comb {
+        var prior: logic<QW + 4> [NP];
+        for i in 0..NP {
+            prior[i] = 0;
+        }
+        for l in 0..RW {
+            var best : u32  ;
+            var bestv: logic;
+            best  = 0;
+            bestv = 1'b0;
+            for i in 0..NP {
+                let fs: FuSet = iq_port_fu(0, i);
+                if fs[g_fu[l]] && (!bestv || occ[i] + prior[i] <: occ[best] + prior[best]) {
+                    best  = i;
+                    bestv = 1'b1;
+                }
+            }
+            g_port[l] = best as 4;
+            if al_valid[l] {
+                prior[best] += 1;
+            }
+        }
+    }
+
+    // ---- Reference select ----
+
+    function claim (
+        k: input FuKind,
+    ) -> u32 {
+        return claim_off(k);
+    }
+
+    var hf_v  : logic<NP>     ;
+    var hf_off: logic<4>  [NP];
+    always_comb {
+        for i in 0..NP {
+            var found    : logic;
+            hf_v[i]   = div_live[i] && div_v_at[i] == cyc && !killed(kill_q, div_rob[i]);
+            hf_off[i] = 0;
+            found     = 1'b0;
+            for o in WAKE_LEAD..8 {
+                if !found && o <= wb_depth(i) && !resv_ref[i][o] {
+                    hf_off[i] = o;
+                    found     = 1'b1;
+                }
+            }
+        }
+    }
+
+    var ref_gv: logic<NP>            ;
+    var ref_gi: logic<ROB_IDX_W> [NP];
+    always_comb {
+        for i in 0..NP {
+            ref_gv[i] = 1'b0;
+            ref_gi[i] = 0;
+            for k in 0..RN {
+                let e : logic<ROB_IDX_W> = (head_q.idx + k) as ROB_IDX_W;
+                var ok: logic           ;
+                ok = k <: inflight && r_v[e] && r_st[e] == 0 && r_port[e] == i;
+                for s in 0..2 {
+                    if r_en[e][s] && rdy_at[r_pr[e][s].idx] >: cyc {
+                        ok = 1'b0;
+                    }
+                }
+                if r_fu[e] == FuKind::DIV {
+                    if div_free[i] >: cyc {
+                        ok = 1'b0;
+                    }
+                } else {
+                    let c: u32 = claim(r_fu[e]);
+                    if resv_ref[i][c] || (hf_v[i] && hf_off[i] == c) {
+                        ok = 1'b0;
+                    }
+                }
+                if r_ns[e] && !(tok_valid && head_q == r_tag[e]) {
+                    ok = 1'b0;
+                }
+                if ok && !ref_gv[i] {
+                    ref_gv[i] = 1'b1;
+                    ref_gi[i] = e;
+                }
+            }
+        }
+    }
+
+    // ---- Checks ----
+
+    var err_q: logic<16>;
+    var cov_q: logic<12>;
+    var ret_q: logic<32>;
+    var e_cyc: logic<32>;
+    var e_fst: logic<16>;
+
+    var err_now: logic<16>;
+    always_comb {
+        err_now = 0;
+        for i in 0..NP {
+            if grant[i].valid != ref_gv[i] || (ref_gv[i] && grant[i].tag.rob != r_tag[ref_gi[i]]) {
+                err_now[0] = 1'b1;
+            }
+            if ep_wb[i].valid {
+                let e: logic<ROB_IDX_W> = ep_wb[i].tag.rob.idx;
+                if !r_v[e] || r_st[e] != 1 || r_port[e] != i || r_wb_at[e] != cyc || r_tag[e] != ep_wb[i].tag.rob {
+                    err_now[1] = 1'b1;
+                }
+                if ep_wb[i].tag.has_rd != r_has_rd[e] || (r_has_rd[e] && ep_wb[i].tag.pdst != r_pdst[e]) {
+                    err_now[2] = 1'b1;
+                }
+                if ep_wb[i].data != r_exp[e] {
+                    err_now[3] = 1'b1;
+                }
+                if ep_wb[i].br != (if r_fu[e] == FuKind::BRU ? r_br[e] : 0 as BrResolve) {
+                    err_now[4] = 1'b1;
+                }
+                if r_fu[e] == FuKind::SYS {
+                    var x    : SysPending;
+                    x     = r_sys[e];
+                    x.tag = r_tag[e];
+                    if ep_sys[i] != x {
+                        err_now[5] = 1'b1;
+                    }
+                }
+            } else if ep_sys[i].valid {
+                err_now[5] = 1'b1;
+            }
+            if ep_chk[i] != 0 || rs_chk[i] != 0 {
+                err_now[6] = 1'b1;
+            }
+            if ep_start[i] && !tok_valid {
+                err_now[7] = 1'b1;
+            }
+        }
+        for e in 0..RN {
+            if r_v[e] && r_st[e] == 1 && r_wb_at[e] == cyc {
+                var seen: logic;
+                seen = 1'b0;
+                for i in 0..NP {
+                    if ep_wb[i].valid && ep_wb[i].tag.rob == r_tag[e] {
+                        seen = 1'b1;
+                    }
+                }
+                if !seen {
+                    err_now[8] = 1'b1;
+                }
+            }
+        }
+        if q_free != QN - occ_n {
+            err_now[9] = 1'b1;
+        }
+        if iq_chk != 0 || bt_chk || pi_chk || pf_chk {
+            err_now[10] = 1'b1;
+        }
+    }
+
+    // ---- Kill injection ----
+
+    var kill_d: Kill;
+    always_comb {
+        let r     : logic<64> = mix(seed ^ 64'h0bad_cafe);
+        kill_d = 0 as Kill;
+        if !drain && !kill_q.valid && inflight != 0 {
+            if r[8:0] == 0 {
+                kill_d.valid = 1'b1;
+                kill_d.full  = 1'b1;
+            } else if r[5:0] == 0 && inflight >: CMW {
+                kill_d.valid = 1'b1;
+                kill_d.keep  = (hc + CMW + (r[31:16] % (inflight - CMW))) as RobTag;
+            }
+        }
+    }
+
+    // ---- State update ----
+
+    var any_sel_killed: logic;
+    var any_div_killed: logic;
+    always_comb {
+        any_sel_killed = 1'b0;
+        any_div_killed = 1'b0;
+        for e in 0..RN {
+            if kill_q.valid && r_v[e] && r_st[e] == 1 && killed(kill_q, r_tag[e]) {
+                any_sel_killed = 1'b1;
+                if r_fu[e] == FuKind::DIV {
+                    any_div_killed = 1'b1;
+                }
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            cyc    = 0;
+            drain  = 1'b0;
+            kill_q = 0 as Kill;
+            hc     = 0;
+            tc     = 0;
+            r_v    = 0;
+            for a in 0..NA {
+                rat[a]          = 0 as PReg;
+                rat[a].idx      = a;
+                arch_rat[a]     = 0 as PReg;
+                arch_rat[a].idx = a;
+            }
+            for p in 0..PN {
+                pval[p]   = 0;
+                rdy_at[p] = 0;
+            }
+            for f in 0..FN {
+                fl_q[f] = (32 + f) as 8;
+            }
+            fl_head  = 0;
+            fl_tail  = FN as FW;
+            fl_cm    = 0;
+            resv_ref = '{default: 0};
+            div_live = 0;
+            div_free = '{default: 0};
+            err_q    = 0;
+            cov_q    = 0;
+            ret_q    = 0;
+            e_cyc    = 0;
+            e_fst    = 0;
+        } else {
+            cyc    = cyc + 1;
+            kill_q = kill_d;
+            if cyc == CYCLES - 1500 {
+                drain = 1'b1;
+            }
+            err_q = err_q | err_now;
+            if err_now != 0 && err_q == 0 {
+                e_cyc = cyc;
+                e_fst = err_now;
+                for i in 0..NP {
+                    $display(
+                        "ERR2 W%d port%d refop: en=%b pr=%d/%d rdy_at=%d/%d resv_ref=%b wb_ok=%b fu_busy=%b hf=%b/%d divfree=%d",
+                        CFG::ISSUE_W,
+                        i,
+                        r_en[ref_gi[i]],
+                        r_pr[ref_gi[i]][0].idx,
+                        r_pr[ref_gi[i]][1].idx,
+                        rdy_at[r_pr[ref_gi[i]][0].idx],
+                        rdy_at[r_pr[ref_gi[i]][1].idx],
+                        resv_ref[i],
+                        wb_ok[i],
+                        fu_busy[i],
+                        hf_v[i],
+                        hf_off[i],
+                        div_free[i],
+                    );
+                    $display(
+                        "ERR3 W%d port%d dutop: rv=%b st=%d fu=%d ns=%b en=%b rdy_at=%d/%d  divlive=%b divrob=%d divv=%d kill=%b/%b/%d tok=%b/%d",
+                        CFG::ISSUE_W,
+                        i,
+                        r_v[grant[i].tag.rob.idx],
+                        r_st[grant[i].tag.rob.idx],
+                        r_fu[grant[i].tag.rob.idx],
+                        r_ns[grant[i].tag.rob.idx],
+                        r_en[grant[i].tag.rob.idx],
+                        rdy_at[r_pr[grant[i].tag.rob.idx][0].idx],
+                        rdy_at[r_pr[grant[i].tag.rob.idx][1].idx],
+                        div_live[i],
+                        div_rob[i].idx,
+                        div_v_at[i],
+                        kill_q.valid,
+                        kill_q.full,
+                        kill_q.keep.idx,
+                        tok_valid,
+                        hc,
+                    );
+                    $display(
+                        "ERR W%d cyc=%d port%d grant=%b/%d ref=%b/%d wb=%b tag=%d data=%h exp=%h rv=%b st=%d wbat=%d port=%d fu=%d sysv=%b sys=%h/%h exps=%h/%h",
+                        CFG::ISSUE_W,
+                        cyc,
+                        i,
+                        grant[i].valid,
+                        grant[i].tag.rob.idx,
+                        ref_gv[i],
+                        ref_gi[i],
+                        ep_wb[i].valid,
+                        ep_wb[i].tag.rob.idx,
+                        ep_wb[i].data,
+                        r_exp[ep_wb[i].tag.rob.idx],
+                        r_v[ep_wb[i].tag.rob.idx],
+                        r_st[ep_wb[i].tag.rob.idx],
+                        r_wb_at[ep_wb[i].tag.rob.idx],
+                        r_port[ep_wb[i].tag.rob.idx],
+                        r_fu[ep_wb[i].tag.rob.idx],
+                        ep_sys[i].valid,
+                        ep_sys[i].csr_addr,
+                        ep_sys[i].csr_wdata,
+                        r_sys[ep_wb[i].tag.rob.idx].csr_addr,
+                        r_sys[ep_wb[i].tag.rob.idx].csr_wdata,
+                    );
+                }
+            }
+
+            // Selects (reference), WB slot reservations and hole fills.
+            for i in 0..NP {
+                var m: logic<16>;
+                m = resv_ref[i];
+                if ref_gv[i] {
+                    let e          : logic<ROB_IDX_W> = ref_gi[i];
+                    r_st[e]     = 1;
+                    r_sel_at[e] = cyc;
+                    if r_fu[e] == FuKind::DIV {
+                        div_live[i] = 1'b1;
+                        div_rob[i]  = r_tag[e];
+                        div_v_at[i] = cyc + ISS_TO_ACC + 34;
+                        div_free[i] = INF;
+                        r_wb_at[e]  = INF;
+                        if kill_q.valid && killed(kill_q, r_tag[e]) {
+                            div_live[i] = 1'b0;
+                            div_free[i] = cyc + 1;
+                        }
+                    } else {
+                        m[claim(r_fu[e])] = 1'b1;
+                        r_wb_at[e]        = cyc + claim(r_fu[e]);
+                        if r_has_rd[e] {
+                            rdy_at[r_pdst[e].idx] = cyc + lat(r_fu[e]);
+                        }
+                    }
+                }
+                if hf_v[i] {
+                    let e           : logic<ROB_IDX_W> = div_rob[i].idx;
+                    m[hf_off[i]] = 1'b1;
+                    div_live[i]  = 1'b0;
+                    div_free[i]  = cyc + hf_off[i];
+                    r_wb_at[e]   = cyc + hf_off[i];
+                    if r_has_rd[e] {
+                        rdy_at[r_pdst[e].idx] = cyc + hf_off[i] - ISS_TO_ACC;
+                    }
+                }
+                if kill_q.valid && killed(kill_q, div_rob[i]) && div_free[i] >: cyc + 1 {
+                    div_live[i] = 1'b0;
+                    div_free[i] = cyc + 1;
+                }
+                resv_ref[i] = m >> 1;
+            }
+
+            // WB.
+            for i in 0..NP {
+                if ep_wb[i].valid && r_v[ep_wb[i].tag.rob.idx] {
+                    r_st[ep_wb[i].tag.rob.idx] = 2;
+                    if r_fu[ep_wb[i].tag.rob.idx] == FuKind::DIV {
+                        cov_q[4] = 1'b1;
+                    }
+                    if r_fu[ep_wb[i].tag.rob.idx] == FuKind::MUL {
+                        cov_q[8] = 1'b1;
+                    }
+                    if ep_wb[i].br.mispred {
+                        cov_q[10] = 1'b1;
+                    }
+                }
+                if ep_sys[i].valid {
+                    cov_q[9] = 1'b1;
+                }
+                if ep_perf[i] {
+                    cov_q[0] = 1'b1;
+                }
+                if rs_perf[i][1] {
+                    cov_q[3] = 1'b1;
+                }
+            }
+            if iq_perf[0] {
+                cov_q[1] = 1'b1;
+            }
+            if iq_perf[1] {
+                cov_q[2] = 1'b1;
+            }
+
+            if kill_q.valid {
+                // Kill: drop every selected op and roll the stream back.
+                if any_sel_killed {
+                    cov_q[5] = 1'b1;
+                }
+                if kill_q.full {
+                    cov_q[6] = 1'b1;
+                }
+                if any_div_killed {
+                    cov_q[7] = 1'b1;
+                }
+                for e in 0..RN {
+                    if r_v[e] && killed(kill_q, r_tag[e]) {
+                        r_v[e] = 1'b0;
+                    }
+                }
+                if kill_q.full {
+                    tc      = hc;
+                    rat     = arch_rat;
+                    fl_head = fl_cm;
+                } else {
+                    tc = {kill_q.keep.wrap, kill_q.keep.idx} + 1;
+                    for a in 0..NA {
+                        rat[a] = r_rat[kill_q.keep.idx][a];
+                    }
+                    fl_head = r_fl[kill_q.keep.idx];
+                }
+            } else {
+                // Retire up to COMMIT_W done ops from the head.
+                var h   : logic<ROB_TAG_W>     ;
+                var stop: logic                ;
+                var ft  : logic<FW>            ;
+                var ar  : PReg             [NA];
+                h    = hc;
+                stop = 1'b0;
+                ft   = fl_tail;
+                ar   = arch_rat;
+                for _c in 0..CMW {
+                    let hi: logic<ROB_IDX_W> = h[ROB_IDX_W - 1:0];
+                    if !stop && h != tc && r_v[hi] && r_st[hi] == 2 {
+                        r_v[hi] = 1'b0;
+                        if r_has_rd[hi] {
+                            fl_q[ft[FW - 2:0]] = r_old[hi].idx as 8;
+                            ft                 = ft + 1;
+                            ar[r_rd[hi]]       = r_pdst[hi];
+                        }
+                        fl_cm = r_fl[hi];
+                        ret_q = ret_q + 1;
+                        h     = h + 1;
+                    } else {
+                        stop = 1'b1;
+                    }
+                }
+                hc       = h;
+                fl_tail  = ft;
+                arch_rat = ar;
+
+                // Dispatch.
+                if d_go {
+                    var rt: PReg      [NA];
+                    var fh: logic<FW>     ;
+                    rt = rat;
+                    fh = fl_head;
+                    for l in 0..RW {
+                        if l <: n_lanes {
+                            let e          : logic<ROB_IDX_W> = g_tag[l].idx;
+                            r_v[e]      = 1'b1;
+                            r_st[e]     = 0;
+                            r_tag[e]    = g_tag[l];
+                            r_fu[e]     = g_fu[l];
+                            r_port[e]   = g_port[l];
+                            r_en[e]     = g_en[l];
+                            r_pr[e][0]  = rat[g_sa[l][0]];
+                            r_pr[e][1]  = rat[g_sa[l][1]];
+                            r_has_rd[e] = g_hrd[l];
+                            r_rd[e]     = g_rd[l];
+                            r_exp[e]    = g_exp[l];
+                            r_br[e]     = g_br[l];
+                            r_sys[e]    = g_sys[l];
+                            r_ns[e]     = g_fu[l] == FuKind::SYS;
+                            r_wb_at[e]  = INF;
+                            if g_hrd[l] {
+                                r_pdst[e]             = g_pdst[l];
+                                r_old[e]              = rt[g_rd[l]];
+                                rt[g_rd[l]]           = g_pdst[l];
+                                fh                    = fh + 1;
+                                pval[g_pdst[l].idx]   = g_exp[l];
+                                rdy_at[g_pdst[l].idx] = INF;
+                            }
+                            for a in 0..NA {
+                                r_rat[e][a] = rt[a];
+                            }
+                            r_fl[e] = fh;
+                        }
+                    }
+                    rat     = rt;
+                    fl_head = fh;
+                    tc      = tc + n_lanes;
+                }
+            }
+            if ret_q >: 800 {
+                cov_q[11] = 1'b1;
+            }
+        }
+    }
+
+    assign o_pass = err_q == 0;
+    assign o_done = cyc >= CYCLES && inflight == 0;
+    // A hole fill can only wait past WAKE_LEAD on a port whose RESERVED FUs
+    // reach beyond it.
+    function hf_can_wait () -> logic {
+        var r: logic;
+        r = 1'b0;
+        for i in 0..NP {
+            let fs: FuSet = iq_port_fu(0, i);
+            if fs[FuKind::DIV] && wb_depth(i) >: WAKE_LEAD {
+                r = 1'b1;
+            }
+        }
+        return r;
+    }
+    assign o_cov    = cov_q | (if hf_can_wait() ? 0 : 12'b1000);
+    assign o_err    = err_q;
+    assign o_retire = ret_q;
+    assign o_ecyc   = e_cyc;
+    assign o_efirst = e_fst;
+}
+
+#[test(test_sched)]
+module test_sched {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic    ;
+    var done2: logic    ;
+    var cov2 : logic<12>;
+    var err2 : logic<16>;
+    var ret2 : logic<32>;
+    var ec2  : logic<32>;
+    var ef2  : logic<16>;
+    var ec4  : logic<32>;
+    var ef4  : logic<16>;
+    var pass4: logic    ;
+    var done4: logic    ;
+    var cov4 : logic<12>;
+    var err4 : logic<16>;
+    var ret4 : logic<32>;
+    inst h2: sched_harness::<cfg_w2> (
+        clk            ,
+        rst            ,
+        o_pass  : pass2,
+        o_done  : done2,
+        o_cov   : cov2 ,
+        o_err   : err2 ,
+        o_retire: ret2 ,
+        o_ecyc  : ec2  ,
+        o_efirst: ef2  ,
+    );
+    inst h4: sched_harness::<cfg_w4> (
+        clk            ,
+        rst            ,
+        o_pass  : pass4,
+        o_done  : done4,
+        o_cov   : cov4 ,
+        o_err   : err4 ,
+        o_retire: ret4 ,
+        o_ecyc  : ec4  ,
+        o_efirst: ef4  ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(6100);
+        $display(
+            "sched: w2 pass=%b err=%b cov=%b retired=%d  w4 pass=%b err=%b cov=%b retired=%d",
+            pass2,
+            err2,
+            cov2,
+            ret2,
+            pass4,
+            err4,
+            cov4,
+            ret4,
+        );
+        $display("sched: first error w2 cycle=%d checks=%b  w4 cycle=%d checks=%b", ec2, ef2, ec4, ef4);
+        $assert(done2 && done4, "sched test did not drain");
+        $assert(pass2 && pass4, "sched reference mismatch");
+        $assert(cov2 == '1 && cov4 == '1, "sched scenario not covered");
+        $finish();
+    }
+}

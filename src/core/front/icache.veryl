@@ -1,0 +1,225 @@
+// icache: CPU side of the instruction cache (request/response with an echoed
+// ID), around the reused storage and fill engine icache_array.
+//
+// Ports (timing contract):
+//   i_req_valid/i_req : one block request per cycle; o_req_ready is constant 1
+//                       (registered-state contract trivially met: the lookup
+//                       never conflicts with a fill write)
+//   o_resp            : registered, exactly fu_pkg::IC_RESP_LAT = 1 cycle
+//                       after the accept, one per request, id echoed unchanged;
+//                       data is the FETCH_BYTES block at req.pa
+//   o_ev              : registered; FILL_DONE / FILL_ABORT the cycle after the
+//                       last beat of a fill, UNC_DONE the cycle after the
+//                       last uncached beat
+//   i_flush           : front-end flush; drops a fill request not yet
+//                       accepted, the uncached read in progress and the
+//                       uncached buffer
+//   i_inval_all       : FENCE.I; requests accepted after it see no earlier
+//                       contents (an in-flight fill or uncached read still
+//                       completes, with its event, but is not kept)
+//   fill / unc client : islot_arb clients; the fill is a line transaction,
+//                       uncached reads are single beats
+//   o_ev_miss         : event wire, a cacheable lookup missed;
+//   o_ev_fill_busy    : and could not start a fill
+// Owns:
+//   - a miss is reported by a MISS response, never by stale data; the MISS
+//     cycle has latched the line to fill (unless a fill or fill request is
+//     already outstanding)
+//   - a fill request uses only the latched line; once accepted it runs to its
+//     8th beat
+//   - probe = 0 requests do no lookup and no replacement update; they return
+//     HIT with zero data
+//   - an uncached request returns MISS and reads its block in FETCH_BYTES / 8
+//     single beats; the re-presented request then hits the uncached buffer
+//     once
+// Rationale:
+//   - one fill context; a requester that got MISS retries after any event,
+//     which is either its own line or the fill that blocked it
+//   - no Kill port although o_resp echoes an FtqTag: the response register
+//     lives one cycle, and the ifu drops a response that arrives in its
+//     flush cycle (i_flush is that flush), so no tag outlives a kill here
+//   - INDEX_W = 7 is 128 sets of 4 ways of 64-byte lines, a 32 KiB L1I
+pub module icache::<CFG: core_cfg> #(
+    param INDEX_W: u32 = 7,
+) (
+    clk           : input  clock                         ,
+    rst           : input  reset                         ,
+    i_req_valid   : input  logic                         ,
+    i_req         : input  core_types::<CFG>::IcReq      ,
+    o_req_ready   : output logic                         ,
+    o_resp        : output core_types::<CFG>::IcResp     ,
+    o_ev          : output core_types::<CFG>::IcEvent    ,
+    i_flush       : input  logic                         ,
+    i_inval_all   : input  logic                         ,
+    o_fill_req    : output logic                         ,
+    o_fill_addr   : output logic                     <56>,
+    i_fill_acc    : input  logic                         ,
+    i_fill_beat   : input  logic                         ,
+    o_unc_req     : output logic                         ,
+    o_unc_addr    : output logic                     <56>,
+    i_unc_beat    : input  logic                         ,
+    i_rdata       : input  logic                     <64>,
+    o_ev_miss     : output logic                         ,
+    o_ev_fill_busy: output logic                         ,
+) {
+    import core_types::<CFG>::*;
+
+    const FB  : u32 = CFG::FETCH_BYTES;
+    const NCH : u32 = 32 / FB; // FETCH_BYTES chunks per 256-bit array block
+    const NDW : u32 = FB / 8; // dwords per fetch block
+    const FBW : u32 = FB * 8;
+    const DW_W: u32 = tag_pkg::idx_w(NDW);
+
+    let acc   : logic = i_req_valid;
+    let probe : logic = acc && i_req.id.probe;
+    let cach  : logic = probe && i_req.cacheable;
+    let uncach: logic = probe && !i_req.cacheable;
+
+    var a_hit    : logic     ;
+    var a_blk    : logic<256>;
+    var a_filling: logic     ;
+    var a_line   : logic<50> ;
+    var a_last   : logic     ;
+    var a_abort  : logic     ;
+
+    var freq_v_q: logic    ; // fill request waiting for accept
+    var freq_l_q: logic<50>;
+
+    let last_dw: logic<3> = i_req.pa[5:3] + (NDW - 1);
+
+    inst u_array: icache_array #(
+        INDEX_W  ,
+    ) (
+        clk                       ,
+        rst                       ,
+        i_rd_valid    : cach      ,
+        i_rd_pa       : i_req.pa  ,
+        i_rd_last_dw  : last_dw   ,
+        o_hit         : a_hit     ,
+        o_blk         : a_blk     ,
+        i_inval_all               ,
+        i_fill_start  : i_fill_acc,
+        i_fill_line   : freq_l_q  ,
+        i_fill_beat               ,
+        i_fill_data   : i_rdata   ,
+        o_filling     : a_filling ,
+        o_fill_line   : a_line    ,
+        o_fill_last   : a_last    ,
+        o_fill_aborted: a_abort   ,
+    );
+
+    // The FETCH_BYTES chunk of the 256-bit block selected by pa[4:0].
+    var chunks: logic<FBW> [NCH];
+    always_comb {
+        for c in 0..NCH {
+            chunks[c] = a_blk[c * FBW+:FBW];
+        }
+    }
+    var csel: logic<NCH>;
+    always_comb {
+        for c in 0..NCH {
+            csel[c] = (i_req.pa[4:0] >> $clog2(FB)) == c;
+        }
+    }
+    let c_data: logic<FBW> = tree_onehot_mux::<NCH, FBW>(csel, chunks);
+
+    // Uncached reads into a one-block buffer.
+    var unc_v_q  : logic            ; // single beats in progress
+    var unc_inv_q: logic            ; // a FENCE.I hit them: the result is not kept
+    var unc_pa_q : logic<56>        ;
+    var unc_cnt_q: logic<DW_W>      ;
+    var ubuf_v_q : logic            ;
+    var ubuf_q   : logic<64>   [NDW];
+    let ubuf_hit : logic             = uncach && ubuf_v_q && unc_pa_q == i_req.pa;
+
+    let miss      : logic = (cach && !a_hit) || (uncach && !ubuf_hit);
+    let fill_free : logic = !freq_v_q && !a_filling;
+    let start_fill: logic = cach && !a_hit && fill_free;
+    let start_unc : logic = uncach && !ubuf_hit && !unc_v_q;
+    let unc_last  : logic = unc_v_q && i_unc_beat && unc_cnt_q == (NDW - 1) as DW_W;
+
+    var ubuf_flat: logic<FBW>;
+    always_comb {
+        for d in 0..NDW {
+            ubuf_flat[d * 64+:64] = ubuf_q[d];
+        }
+    }
+
+    var resp_q: IcResp ;
+    var ev_q  : IcEvent;
+    always_ff {
+        if_reset {
+            resp_q    = 0 as IcResp;
+            ev_q      = 0 as IcEvent;
+            freq_v_q  = 1'b0;
+            freq_l_q  = 0;
+            unc_v_q   = 1'b0;
+            unc_inv_q = 1'b0;
+            unc_pa_q  = 0;
+            unc_cnt_q = 0;
+            ubuf_v_q  = 1'b0;
+        } else {
+            resp_q.valid = acc;
+            resp_q.id    = i_req.id;
+            resp_q.kind  = if miss ? IcKind::MISS : IcKind::HIT;
+            resp_q.data  = if !probe ? 0 : if uncach ? ubuf_flat : c_data;
+
+            ev_q.valid = a_last || unc_last;
+            ev_q.line  = if a_last ? a_line : unc_pa_q[55:6];
+            ev_q.kind  = if a_last ? (if a_abort ? IcEvKind::FILL_ABORT : IcEvKind::FILL_DONE) : IcEvKind::UNC_DONE;
+
+            if i_fill_acc {
+                freq_v_q = 1'b0;
+            } else if i_flush {
+                freq_v_q = 1'b0;
+            } else if start_fill {
+                freq_v_q = 1'b1;
+                freq_l_q = i_req.pa[55:6];
+            }
+
+            // An uncached read hit by FENCE.I still finishes: its requester
+            // waits for UNC_DONE.
+            if i_flush {
+                unc_v_q  = 1'b0;
+                ubuf_v_q = 1'b0;
+            } else {
+                if ubuf_hit || i_inval_all {
+                    ubuf_v_q = 1'b0;
+                }
+                if i_inval_all && unc_v_q {
+                    unc_inv_q = 1'b1;
+                }
+                if unc_last {
+                    unc_v_q  = 1'b0;
+                    ubuf_v_q = !unc_inv_q && !i_inval_all;
+                } else if unc_v_q && i_unc_beat {
+                    unc_cnt_q = unc_cnt_q + 1;
+                } else if start_unc {
+                    unc_v_q   = 1'b1;
+                    unc_inv_q = 1'b0;
+                    unc_pa_q  = i_req.pa;
+                    unc_cnt_q = 0;
+                    ubuf_v_q  = 1'b0;
+                }
+            }
+        }
+    }
+
+    always_ff {
+        for d in 0..NDW {
+            if unc_v_q && i_unc_beat && unc_cnt_q == d {
+                ubuf_q[d] = i_rdata;
+            }
+        }
+    }
+
+    assign o_req_ready    = 1'b1;
+    assign o_resp         = resp_q;
+    assign o_ev           = ev_q;
+    assign o_fill_req     = freq_v_q;
+    assign o_fill_addr    = {freq_l_q, 6'd0};
+    assign o_unc_req      = unc_v_q;
+    assign o_unc_addr     = unc_pa_q + {unc_cnt_q, 3'd0};
+    assign o_ev_miss      = cach && !a_hit;
+    assign o_ev_fill_busy = cach && !a_hit && !fill_free;
+}

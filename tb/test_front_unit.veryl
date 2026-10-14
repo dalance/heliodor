@@ -1,0 +1,244 @@
+// Front-end helpers and checkers in isolation: pma_check and pma_table_err
+// over the test region table and broken tables, the predictor layout widths
+// of both configs, and the front-end checkers firing on injected violations
+// (and staying quiet on a legal stream).
+module pma_unit_harness (
+    o_ok: output logic<16>,
+) {
+    import front_tb_pkg::*;
+    import pma_pkg::*;
+
+    let a_dram: PmaAttr = pma_check::<3>(56'h8000_0000, PMA);
+    let a_dend: PmaAttr = pma_check::<3>(56'h81ff_fff8, PMA);
+    let a_dout: PmaAttr = pma_check::<3>(56'h8200_0000, PMA);
+    let a_rom : PmaAttr = pma_check::<3>(56'h3ffe, PMA);
+    let a_rout: PmaAttr = pma_check::<3>(56'h4000, PMA);
+    let a_io  : PmaAttr = pma_check::<3>(56'h1000_0800, PMA);
+    let a_high: PmaAttr = pma_check::<3>(56'h01_0000_8000_0000, PMA); // no aliasing through upper bits
+
+    // Broken tables: a 2 KiB region, a misaligned base, overlapping regions,
+    // an executable IO region, PTEs in uncached memory, atomics on uncached memory.
+    const BAD_SHAPE    : PmaRegion [2] = '{
+        PmaRegion'{base: 56'h0, mask: 56'hff_ffff_ffff_f800, attr: A_ROM},
+        PmaRegion'{base: 56'h8000_1000, mask: 56'hff_ffff_ffff_e000, attr: A_ROM}
+    };
+    const BAD_OVL      : PmaRegion [2] = '{
+        PmaRegion'{base: 56'h8000_0000, mask: 56'hff_ffff_fe00_0000, attr: A_DRAM},
+        PmaRegion'{base: 56'h8100_0000, mask: 56'hff_ffff_ffff_f000, attr: A_DRAM}
+    };
+    const A_IOX        : PmaAttr       = PmaAttr'{
+        target       : Target::IO           ,
+        backed       : 1                    ,
+        cacheable    : 0                    ,
+        coherent     : 0                    ,
+        executable   : 1                    ,
+        amo          : AmoClass::FULL       ,
+        idempotent   : 0                    ,
+        io_ordered   : 1                    ,
+        misaligned_ok: 0                    ,
+        pte_ok       : 1                    ,
+        cbo_ok       : 0
+    };
+    const BAD_ATTR     : PmaRegion [1] = '{PmaRegion'{base: 56'h1000_0000, mask: 56'hff_ffff_ffff_f000, attr: A_IOX}};
+
+    assign o_ok[0]  = a_dram.cacheable && a_dram.executable && a_dram.target == Target::DRAM;
+    assign o_ok[1]  = a_dend.cacheable && a_dend.backed;
+    assign o_ok[2]  = a_dout == (0 as PmaAttr);
+    assign o_ok[3]  = a_rom.executable && !a_rom.cacheable && a_rom.target == Target::ROM;
+    assign o_ok[4]  = a_rout == (0 as PmaAttr);
+    assign o_ok[5]  = a_io.io_ordered && !a_io.executable && !a_io.idempotent;
+    assign o_ok[6]  = a_high == (0 as PmaAttr);
+    assign o_ok[7]  = pma_table_err::<3>(PMA) == 0;
+    assign o_ok[8]  = pma_table_err::<2>(BAD_SHAPE) == PMA_ERR_SHAPE;
+    assign o_ok[9]  = pma_table_err::<2>(BAD_OVL) == PMA_ERR_OVERLAP;
+    assign o_ok[10] = pma_table_err::<1>(BAD_ATTR) == (PMA_ERR_EXEC | PMA_ERR_PTE | PMA_ERR_AMO);
+    assign o_ok[11] = bpu_pkg::<cfg_w2>::LAYOUT_ERR == 0 && bpu_pkg::<cfg_w4>::LAYOUT_ERR == 0;
+    assign o_ok[12] = bpu_pkg::<cfg_w2>::BP_SLOTS == 2 && bpu_pkg::<cfg_w4>::BP_SLOTS == 3;
+    assign o_ok[13] = bpu_pkg::<cfg_w2>::BP_RAS_N == 16 && bpu_pkg::<cfg_w4>::BP_RAS_N == 32;
+    assign o_ok[14] = core_types::<cfg_w2>::NH == 8 && core_types::<cfg_w4>::NH == 16;
+    assign o_ok[15] = core_types::<cfg_w2>::GRAN_N == 4 && core_types::<cfg_w4>::GRAN_N == 8;
+}
+
+// Five chk_fetch_stream instances: a legal stream, then one violation each.
+// Two chk_ftq instances: legal pointers, then a commit-backstop kill whose
+// keep entry is not the commit entry.
+module chk_unit_harness::<CFG: core_cfg> (
+    clk   : input  clock   ,
+    rst   : input  reset   ,
+    o_good: output logic   ,
+    o_bad : output logic<5>,
+) {
+    import core_types::<CFG>::*;
+
+    const FW: u32 = CFG::FETCH_W;
+
+    var cyc: logic<4>;
+    always_ff {
+        if_reset {
+            cyc = 0;
+        } else if cyc != 15 {
+            cyc = cyc + 1;
+        }
+    }
+
+    // Cycle 2: two ops at 0x100 (RVC) and 0x102 (32-bit). Cycle 3: the next op
+    // at 0x106. Block 0 enters at cycle 2 and block 1 at 0x110 at cycle 3.
+    function op (
+        pc : input logic<64>,
+        rvc: input logic    ,
+    ) -> XOp {
+        var o       : XOp;
+        o        = 0 as XOp;
+        o.pc     = pc;
+        o.is_rvc = rvc;
+        o.insn   = 32'h13;
+        return o;
+    }
+
+    var pv : logic      [5, FW];
+    var pd : XOp        [5, FW];
+    var ent: logic      [5]    ;
+    var bpc: logic <64> [5]    ;
+    var bft: FtqTag     [5]    ;
+    always_comb {
+        for i in 0..5 {
+            for l in 0..FW {
+                pv[i][l] = 1'b0;
+                pd[i][l] = 0 as XOp;
+            }
+            ent[i] = cyc == 2 || cyc == 3;
+            bpc[i] = if cyc == 2 ? 64'h100 : 64'h110;
+            bft[i] = (if cyc == 2 ? 0 : 1) as FtqTag;
+            if cyc == 2 {
+                pv[i][0] = 1'b1;
+                pd[i][0] = op(64'h100, 1'b1);
+                if FW >: 1 {
+                    pv[i][1] = 1'b1;
+                    pd[i][1] = op(64'h102, 1'b0);
+                }
+            }
+            if cyc == 3 {
+                pv[i][0] = 1'b1;
+                pd[i][0] = op(if FW >: 1 ? 64'h106 : 64'h102, 1'b0);
+            }
+        }
+        // 1: an op skipped. 2: the second block starts at the wrong pc.
+        // 3: a predicted-taken op that is not a jump. 4: an op after a fault.
+        if cyc == 3 {
+            pd[1][0].pc         = pd[1][0].pc + 2;
+            bpc[2]              = 64'h120;
+            pd[3][0].pred_taken = 1'b1;
+        }
+        if cyc == 2 {
+            pd[4][0].exc.valid = 1'b1;
+        }
+    }
+
+    var kill: Kill    ;
+    var red : Redirect;
+    always_comb {
+        kill = 0 as Kill;
+        red  = 0 as Redirect;
+        // A kill at cycle 1 starts both chains at 0x100.
+        kill.valid = cyc == 1;
+        red.valid  = cyc == 1;
+        red.pc     = 64'h100;
+    }
+
+    var cs: logic<4> [5];
+    for i in 0..5 :g_cs {
+        inst u: chk_fetch_stream::<CFG> (
+            clk                ,
+            rst                ,
+            i_push_v  : pv[i]  ,
+            i_push    : pd[i]  ,
+            i_tgt     : 64'h0  ,
+            i_enter   : ent[i] ,
+            i_blk_ftq : bft[i] ,
+            i_blk_pc  : bpc[i] ,
+            i_blk_next: 64'h110,
+            i_kill    : kill   ,
+            i_redirect: red    ,
+            o_chk     : cs[i]  ,
+        );
+    }
+
+    var kf : Kill    ;
+    var rf : Redirect;
+    var cf0: logic   ;
+    var cf1: logic   ;
+    always_comb {
+        kf          = 0 as Kill;
+        rf          = 0 as Redirect;
+        kf.valid    = cyc == 4;
+        kf.full     = 1'b1;
+        rf.valid    = cyc == 4;
+        rf.kind     = RedirKind::BR_CM;
+        rf.ftq_keep = 3 as FtqTag;
+    }
+    inst u_f0: chk_ftq::<CFG> (
+        clk                    ,
+        rst                    ,
+        i_upd     : 1 as FtqTag,
+        i_cm      : 3 as FtqTag,
+        i_cm_v    : 1'b1       ,
+        i_fetch   : 5 as FtqTag,
+        i_tail    : 6 as FtqTag,
+        i_kill    : kf         ,
+        i_redirect: rf         ,
+        o_chk     : cf0        ,
+    );
+    inst u_f1: chk_ftq::<CFG> (
+        clk                    ,
+        rst                    ,
+        i_upd     : 1 as FtqTag,
+        i_cm      : 2 as FtqTag,
+        i_cm_v    : 1'b1       ,
+        i_fetch   : 5 as FtqTag,
+        i_tail    : 6 as FtqTag,
+        i_kill    : kf         ,
+        i_redirect: rf         ,
+        o_chk     : cf1        ,
+    );
+
+    assign o_good = cs[0] == 0 && !cf0;
+    assign o_bad  = {cf1, cs[4][3], cs[3][2], cs[2][1], cs[1][0]};
+}
+
+#[test(test_front_unit)]
+module test_front_unit {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pma: logic<16>;
+    inst h_pma: pma_unit_harness (
+        o_ok: pma,
+    );
+
+    var good2: logic   ;
+    var bad2 : logic<5>;
+    var good4: logic   ;
+    var bad4 : logic<5>;
+    inst h2: chk_unit_harness::<cfg_w2> (
+        clk          ,
+        rst          ,
+        o_good: good2,
+        o_bad : bad2 ,
+    );
+    inst h4: chk_unit_harness::<cfg_w4> (
+        clk          ,
+        rst          ,
+        o_good: good4,
+        o_bad : bad4 ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(10);
+        $display("front_unit: pma=%b chk w2 good=%b bad=%b w4 good=%b bad=%b", pma, good2, bad2, good4, bad4);
+        $assert(pma == 16'hffff, "pma_check, pma_table_err or a predictor layout is wrong");
+        $assert(good2 && good4, "a front-end checker fired on a legal stream");
+        $assert(bad2 == 5'b11111 && bad4 == 5'b11111, "a front-end checker missed an injected violation");
+        $finish();
+    }
+}

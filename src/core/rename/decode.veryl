@@ -1,0 +1,398 @@
+// decode: per-lane instruction decode, op classification and decode-time
+// legality, between the decode queue (DQ) and the rename queue (rq).
+//
+// Ports (timing contract):
+//   i_valid/i_xop : DQ output lanes, contiguous from lane 0, registered
+//   i_rq_ready    : rq.o_ready (registered); the whole group moves or none
+//   o_valid/o_dec : to rq.i_valid/i_data, combinational from the inputs
+//   o_dq_take     : to DQ.i_take: every valid lane when rq is ready, else 0
+//   i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm : live csr outputs, read
+//                   combinationally
+//   o_perf        : registered event wires
+//   o_chk         : sticky invariant flags (HELIODOR_CHK builds only, else 0)
+//   Kill is applied by the two queues (both flush on kill.valid); decode
+//   holds no op state.
+// Owns:
+//   - an op that carries any exception (fetch fault, illegal, ECALL, EBREAK)
+//     has class fu NONE and no destination
+//   - an illegal op reports cause 2 with tval = the RVC parcel for an RVC op,
+//     else the 32-bit instruction
+//   - no op of a class this build does not serve leaves decode except as an
+//     illegal-instruction fault (legality below is the only place deciding it)
+//   - pred_taken is set only on branches and jumps (checked, not used)
+// Legality (function `illegal`): an instruction is illegal when
+//   - the reused decoder flags it, or it is a vector instruction
+//   - it is not served by this core build, because no unit for it exists:
+//     F and D (compute, loads, stores and the fflags/frm/fcsr CSRs), the A
+//     extension (LR/SC, AMOs), CBO, the H extension (HLV/HLVX/HSV,
+//     HFENCE/HINVAL and the hypervisor and VS CSRs) and the V CSRs
+//   - a CSR access names a CSR that does not exist, needs more privilege, or
+//     writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM
+//   - MRET below M, SRET in U or in HS-mode with mstatus.TSR, SFENCE.VMA or
+//     SINVAL.VMA in HS-mode with mstatus.TVM, or an undefined SYSTEM
+//     function
+//   Not checked: the counteren registers (the reused csr stores them without
+//   enforcing access); mstatus.FS (no F or D op or CSR is legal here anyway).
+// Rationale:
+//   - legality reads the committed CSR state live with no shadow: every CSR
+//     change retires with a flush, which empties DQ, decode and rq, so the
+//     state a surviving op saw equals its state at commit
+//   - a fetch fault outranks every decode-time exception, so the fetch
+//     record is taken as is and the decoder output is discarded
+//   - WFI is a no-op (fu NONE): it completes at once, which the privileged
+//     spec allows in every mode, so mstatus.TW never makes it trap
+//   - WRS.NTO and WRS.STO are no-ops (fu NONE) for the same reason: Zawrs
+//     allows them to complete at once
+module decode::<CFG: core_cfg> (
+    clk          : input  clock                                                                      ,
+    rst          : input  reset                                                                      ,
+    i_valid      : input  logic                                                        [CFG::FETCH_W],
+    i_xop        : input  core_types::<CFG>::XOp                                       [CFG::FETCH_W],
+    i_rq_ready   : input  logic                                                                      ,
+    o_valid      : output logic                                                        [CFG::FETCH_W],
+    o_dec        : output core_types::<CFG>::DecOp                                     [CFG::FETCH_W],
+    o_dq_take    : output logic                     <tag_pkg::idx_w(CFG::FETCH_W + 1)>               ,
+    i_priv       : input  csr_pkg::PrivLevel                                                         ,
+    i_virt       : input  logic                                                                      ,
+    i_mstatus_tsr: input  logic                                                                      ,
+    i_mstatus_tvm: input  logic                                                                      ,
+    o_perf       : output core_types::<CFG>::DecPerf                                                 ,
+    o_chk        : output logic                                                                      ,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    const W   : u32 = CFG::FETCH_W;
+    const DT_W: u32 = tag_pkg::idx_w(W + 1);
+
+    var alu_op    : alu_pkg::AluOp          [W];
+    var alu_src_a : decode_pkg::AluSrcA     [W];
+    var alu_src_b : decode_pkg::AluSrcB     [W];
+    var imm_type  : riscv_pkg::ImmType      [W];
+    var reg_wen   : logic                   [W];
+    var mem_ren   : logic                   [W];
+    var mem_wen   : logic                   [W];
+    var is_branch : logic                   [W];
+    var is_jal    : logic                   [W];
+    var is_jalr   : logic                   [W];
+    var is_ecall  : logic                   [W];
+    var is_ebreak : logic                   [W];
+    var is_mret   : logic                   [W];
+    var is_wfi    : logic                   [W];
+    var csr_op    : csr_pkg::CsrOp          [W];
+    var is_csr    : logic                   [W];
+    var csr_imm   : logic                   [W];
+    var dec_ill   : logic                   [W];
+    var is_amo    : logic                   [W];
+    var amo_f5    : logic              <5>  [W];
+    var is_fp     : logic                   [W];
+    var fp_reg_wen: logic                   [W];
+    var fpu_op    : fpu_pkg::FpuOp          [W];
+    var is_sfence : logic                   [W];
+    var is_sinval : logic                   [W];
+    var is_fence_i: logic                   [W];
+    var is_fence  : logic                   [W];
+    var is_cbo_z  : logic                   [W];
+    var is_cbo_m  : logic                   [W];
+    var hlv       : logic                   [W];
+    var hlvx      : logic                   [W];
+    var is_vec    : logic                   [W];
+    var imm64     : logic              <64> [W];
+
+    for l in 0..W :g_dec {
+        inst u_dec: decoder (
+            i_instr           : i_xop[l].insn,
+            o_alu_op          : alu_op[l]    ,
+            o_alu_src_a       : alu_src_a[l] ,
+            o_alu_src_b       : alu_src_b[l] ,
+            o_imm_type        : imm_type[l]  ,
+            o_wb_sel          : _            ,
+            o_reg_wen         : reg_wen[l]   ,
+            o_mem_ren         : mem_ren[l]   ,
+            o_mem_wen         : mem_wen[l]   ,
+            o_is_branch       : is_branch[l] ,
+            o_is_jal          : is_jal[l]    ,
+            o_is_jalr         : is_jalr[l]   ,
+            o_is_ecall        : is_ecall[l]  ,
+            o_is_ebreak       : is_ebreak[l] ,
+            o_is_mret         : is_mret[l]   ,
+            o_is_wfi          : is_wfi[l]    ,
+            o_csr_op          : csr_op[l]    ,
+            o_is_csr          : is_csr[l]    ,
+            o_csr_imm         : csr_imm[l]   ,
+            o_illegal         : dec_ill[l]   ,
+            o_is_amo          : is_amo[l]    ,
+            o_amo_funct5      : amo_f5[l]    ,
+            o_is_fp           : is_fp[l]     ,
+            o_fp_reg_wen      : fp_reg_wen[l],
+            o_fp_int_wen      : _            ,
+            o_fpu_op          : fpu_op[l]    ,
+            o_fp_rm           : _            ,
+            o_fp_rs3_addr     : _            ,
+            o_is_sfence       : is_sfence[l] ,
+            o_is_svinval_fence: is_sinval[l] ,
+            o_is_fence_i      : is_fence_i[l],
+            o_is_fence        : is_fence[l]  ,
+            o_is_cbo_zero     : is_cbo_z[l]  ,
+            o_is_cbo_m        : is_cbo_m[l]  ,
+            o_hlv             : hlv[l]       ,
+            o_hlvx            : hlvx[l]      ,
+            o_is_vec          : is_vec[l]    ,
+            o_vec_op          : _            ,
+            o_vec_uses_scalar : _            ,
+            o_vec_writes_int  : _            ,
+        );
+        inst u_imm: imm_gen (
+            i_instr   : i_xop[l].insn,
+            i_imm_type: imm_type[l]  ,
+            o_imm     : imm64[l]     ,
+        );
+    }
+
+    function bru_op (
+        jal  : input logic   ,
+        jalr : input logic   ,
+        auipc: input logic   ,
+        f3   : input logic<3>,
+    ) -> BruOp {
+        if jal {
+            return BruOp::JAL;
+        } else if jalr {
+            return BruOp::JALR;
+        } else if auipc {
+            return BruOp::AUIPC;
+        }
+        case f3 {
+            3'b001 : return BruOp::BNE;
+            3'b100 : return BruOp::BLT;
+            3'b101 : return BruOp::BGE;
+            3'b110 : return BruOp::BLTU;
+            3'b111 : return BruOp::BGEU;
+            default: return BruOp::BEQ;
+        }
+    }
+
+    function sys_op (
+        csr : input logic         ,
+        cop : input csr_pkg::CsrOp,
+        cimm: input logic         ,
+    ) -> SysOp {
+        if !csr {
+            return SysOp::SFENCE_VMA;
+        }
+        case cop {
+            csr_pkg::CsrOp::RS: return if cimm ? SysOp::CSRRSI : SysOp::CSRRS;
+            csr_pkg::CsrOp::RC: return if cimm ? SysOp::CSRRCI : SysOp::CSRRC;
+            default           : return if cimm ? SysOp::CSRRWI : SysOp::CSRRW;
+        }
+    }
+
+    // CSRs of extensions this build does not serve: fflags/frm/fcsr, the V
+    // CSRs, and the hypervisor and VS CSRs (address bits [9:8] = 2'b10).
+    function csr_unserved (
+        a: input logic<12>,
+    ) -> logic {
+        return (a >= 12'h001 && a <= 12'h003) || (a >= 12'h008 && a <= 12'h00a) || a == 12'h00f || (a >= 12'hc20
+            && a <= 12'hc22) || a[9:8] == 2'b10;
+    }
+
+    // Decode-time legality of one instruction (see the header).
+    function illegal (
+        insn  : input logic             <32>,
+        dill  : input logic                 ,
+        vec   : input logic                 ,
+        fp    : input logic                 , // any F or D instruction
+        amo   : input logic                 ,
+        cbo   : input logic                 ,
+        hlv   : input logic                 , // HLV, HLVX or HSV
+        csr   : input logic                 ,
+        csr_wr: input logic                 ,
+        sfence: input logic                 , // SFENCE.VMA, SINVAL.VMA, HFENCE, HINVAL
+        sinval: input logic                 ,
+        ecall : input logic                 ,
+        ebreak: input logic                 ,
+        xret  : input logic                 ,
+        wfi   : input logic                 ,
+        priv  : input csr_pkg::PrivLevel    ,
+        virt  : input logic                 ,
+        tsr   : input logic                 ,
+        tvm   : input logic                 ,
+    ) -> logic {
+        let f3    : logic<3>  = insn[14:12];
+        let f7    : logic<7>  = insn[31:25];
+        let f12   : logic<12> = insn[31:20];
+        let rp    : logic<2>  = if f12[9:8] == 2'b10 ? 2'b01 : f12[9:8];
+        let hfen  : logic     = sfence && (f7 == 7'b0010001 || f7 == 7'b0110001 || f7 == 7'b0010011 || f7 == 7'b0110011);
+        let hs    : logic     = priv == csr_pkg::PrivLevel::SUPERVISOR && !virt;
+        let wrs   : logic     = f12 == 12'h00d || f12 == 12'h01d;
+        let mret  : logic     = xret && f12 == 12'h302;
+        let sret  : logic     = xret && f12 == 12'h102;
+        let is_sys: logic     = insn[6:0] == riscv_pkg::Opcode::SYSTEM;
+        let unsrv : logic     = fp || amo || cbo || hlv || hfen || (csr && csr_unserved(f12));
+        let csr_ill: logic    = csr && (!csr_pkg::csr_exists(f12) || rp >: priv || (f12[11:10] == 2'b11 && csr_wr) || (hs
+            && tvm && f12 == 12'h180));
+        let sys_ill: logic = (mret && priv != csr_pkg::PrivLevel::MACHINE) || (sret && (priv == csr_pkg::PrivLevel::USER
+            || (hs && tsr))) || (sfence && !hfen && hs && tvm) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret
+            || wfi || sfence || sinval || wrs));
+        return dill || vec || unsrv || csr_ill || sys_ill;
+    }
+
+    var lane_ill: logic [W];
+    var lane_exc: logic [W];
+
+    always_comb {
+        for l in 0..W {
+            let insn  : logic<32> = i_xop[l].insn;
+            let f3    : logic<3>  = insn[14:12];
+            let f12   : logic<12> = insn[31:20];
+            let csr_wr: logic     = csr_op[l] == csr_pkg::CsrOp::RW || insn[19:15] != 0;
+            let sret  : logic     = is_mret[l] && f12 == 12'h102;
+            let fpc   : logic     = is_fp[l] && !mem_ren[l] && !mem_wen[l];
+
+            let ill: logic = illegal(insn, dec_ill[l], is_vec[l], is_fp[l], is_amo[l], is_cbo_z[l] || is_cbo_m[l], hlv[l]
+                || hlvx[l], is_csr[l], csr_wr, is_sfence[l], is_sinval[l], is_ecall[l], is_ebreak[l], is_mret[l],
+                is_wfi[l], i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm);
+
+            var exc: exc_pkg::ExcRec;
+            exc = 0 as exc_pkg::ExcRec;
+            if i_xop[l].exc.valid {
+                exc = i_xop[l].exc;
+            } else if ill {
+                exc.valid = 1'b1;
+                exc.cause = 6'd2;
+                exc.tval  = if i_xop[l].is_rvc ? {48'd0, i_xop[l].cinsn} : {32'd0, insn};
+            } else if is_ecall[l] {
+                exc.valid = 1'b1;
+                case i_priv {
+                    csr_pkg::PrivLevel::USER      : exc.cause = 6'd8;
+                    csr_pkg::PrivLevel::SUPERVISOR: exc.cause = if i_virt ? 6'd10 : 6'd9;
+                    default                       : exc.cause = 6'd11;
+                }
+            } else if is_ebreak[l] {
+                exc.valid = 1'b1;
+                exc.cause = 6'd3;
+            }
+            lane_ill[l] = !i_xop[l].exc.valid && ill;
+            lane_exc[l] = exc.valid;
+
+            var di           : DecInfo;
+            di.rd_nz      = insn[11:7] != 0;
+            di.writes_int = reg_wen[l] && !fp_reg_wen[l];
+            di.writes_fp  = fp_reg_wen[l];
+            di.is_branch  = is_branch[l];
+            di.is_jal     = is_jal[l];
+            di.is_jalr    = is_jalr[l];
+            di.is_auipc   = insn[6:0] == riscv_pkg::Opcode::AUIPC;
+            di.mem_ren    = mem_ren[l];
+            di.mem_wen    = mem_wen[l];
+            di.is_amo     = is_amo[l];
+            di.amo_lr     = amo_f5[l] == 5'b00010;
+            di.amo_aq     = insn[26];
+            di.is_csr     = is_csr[l];
+            di.csr_wr     = csr_wr;
+            di.is_xret    = is_mret[l];
+            di.is_sfence  = is_sfence[l];
+            di.is_sinval  = is_sinval[l];
+            di.is_fence   = is_fence[l];
+            di.is_fence_i = is_fence_i[l];
+            di.is_fp      = fpc;
+            di.alu_op     = alu_op[l];
+            di.fpu_op     = fpu_op[l];
+
+            var c: OpClass;
+            c = op_class(di, exc.valid);
+
+            var d           : DecOp;
+            d            = 0 as DecOp;
+            d.insn       = insn;
+            d.is_rvc     = i_xop[l].is_rvc;
+            d.ftq        = i_xop[l].ftq;
+            d.foff       = i_xop[l].foff;
+            d.pred_taken = i_xop[l].pred_taken;
+            d.sret       = sret;
+            d.fence_i    = is_fence_i[l] && !exc.valid;
+            d.cls        = c;
+            d.exc        = exc;
+            d.imm        = imm64[l][31:0];
+            d.rs1.arch   = insn[19:15];
+            d.rs2.arch   = insn[24:20];
+            d.rs3.arch   = insn[31:27];
+            d.dst.arch   = insn[11:7];
+            d.dst.has_rd = c.budget.int_rd || c.budget.fp_rd;
+            d.dst.rcls   = if c.budget.fp_rd ? RegClass::FP : RegClass::INT;
+
+            case c.fu {
+                FuKind::ALU, FuKind::MUL, FuKind::DIV: {
+                    d.uop      = alu_op[l] as UOP_W;
+                    d.rs1.used = alu_src_a[l] == decode_pkg::AluSrcA::REG;
+                    d.rs2.used = alu_src_b[l] == decode_pkg::AluSrcB::REG;
+                }
+                FuKind::BRU: {
+                    d.uop      = bru_op(is_jal[l], is_jalr[l], di.is_auipc, f3) as UOP_W;
+                    d.rs1.used = is_branch[l] || is_jalr[l];
+                    d.rs2.used = is_branch[l];
+                }
+                FuKind::SYS: {
+                    d.uop      = sys_op(is_csr[l], csr_op[l], csr_imm[l]) as UOP_W;
+                    d.rs1.used = is_csr[l] && !csr_imm[l];
+                    d.imm      = if is_csr[l] ? {15'd0, insn[19:15], f12} : 32'd0;
+                }
+                FuKind::LOAD, FuKind::STORE: {
+                    d.uop      = f3 as UOP_W;
+                    d.rs1.used = 1'b1;
+                    d.rs2.used = c.fu == FuKind::STORE;
+                }
+                default: {}
+            }
+            o_dec[l]   = d;
+            o_valid[l] = i_valid[l];
+        }
+    }
+
+    var vmask: logic<W>;
+    always_comb {
+        for l in 0..W {
+            vmask[l] = i_valid[l];
+        }
+    }
+    assign o_dq_take = if i_rq_ready ? tree_popcount::<W, DT_W>(vmask) : 0;
+
+    var ill_any : logic   ;
+    var taken_ok: logic<W>;
+    always_comb {
+        var m: logic<W>;
+        for l in 0..W {
+            m[l]        = i_valid[l] && lane_ill[l];
+            taken_ok[l] = !i_valid[l] || !i_xop[l].pred_taken || is_branch[l] || is_jal[l] || is_jalr[l] || lane_exc[l];
+        }
+        ill_any = |m;
+    }
+
+    var perf_q: DecPerf;
+    always_ff {
+        if_reset {
+            perf_q = 0 as DecPerf;
+        } else {
+            perf_q.illegal = ill_any;
+            perf_q.rq_full = i_valid[0] && !i_rq_ready;
+        }
+    }
+    assign o_perf = perf_q;
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_decode #(
+            W: W,
+        ) (
+            clk                 ,
+            rst                 ,
+            i_taken_ok: taken_ok,
+            o_chk               ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    {
+        assign o_chk = 1'b0;
+        let _unused_taken_ok: logic<W> = taken_ok;
+    }
+}

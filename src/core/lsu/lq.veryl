@@ -1,0 +1,441 @@
+// lq: load queue; owns each load's execution state, ordering-violation
+// poison, the ld_barrier sequence and the commit window.
+//
+// Ports (timing contract):
+//   i_alloc_valid/i_alloc[RENAME_W] : the loads of the dispatch group,
+//                       compacted in program order; slot i takes the tag
+//                       o_alloc_tag[i]; never valid in a kill cycle
+//   o_free, o_alloc_tag[RENAME_W+1] : registered state only (free = LQ_N -
+//                       (tail - head); o_alloc_tag[k] = tail advanced by k)
+//   i_snap[MEM_W]     : m2 of each pipe; sets seen on the capture edge
+//   i_sta[MEM_W]      : store-resolve request at m2; scanned the next cycle
+//   i_verdict[MEM_W]  : m2 + RESP_LAT; only for ops still live in the pipe
+//   i_mem_ev, i_coh_*, i_std, i_sq_head, i_oldest : wake and scan events of
+//                       this cycle; an event in the verdict's cycle counts as
+//                       after the verdict
+//   o_reissue         : registered; the oldest READY entry; i_reissue_gnt in
+//                       the same cycle moves it to INFLIGHT
+//   o_win[COMMIT_W]   : from registered state, the COMMIT_W oldest entries;
+//                       commit selects by tag equality
+//   o_split_lo        : registered lo dword of the crossing load whose lo
+//                       pass completed (one at a time: crossing loads run
+//                       only as the oldest op), read by the memory pipes
+//   o_perf            : combinational event wires
+//   o_chk             : sticky checker flags (HELIODOR_CHK only, else 0)
+//   i_retire_cnt      : loads retired this cycle; head advances on the edge
+//   i_bar_alloc, i_bar_ret : ld_barrier ops dispatched / retired this cycle
+//   o_bar_after[k], o_bar_ret : registered barrier counts (o_bar_after[k] =
+//                       allocated + k)
+//   o_load_fence      : registered, the cycle after a barrier retired: seq is
+//                       the retired count, IQ loads with bar_w == seq obey no
+//                       fence any more
+//   i_kill            : tail := kill.lq_tail (partial) or empty (full); the
+//                       barrier count rewinds to kill.bar_seq or the retired
+//                       count; applied on the edge
+// Owns:
+//   - poison is set only on entries with seen = 1 and is cleared by the lo
+//     snapshot of a re-issue
+//   - a store's scan covers every load whose snapshot did not include that
+//     store: a snapshot at or before the store's m2 is registered by the scan
+//   - no entry leaves PARK except on its own key (fill_id, SqTag, token) or a
+//     broadcast
+// Rationale:
+//   - ordering violations are repaired only by commit-time replay of the
+//     poisoned load, with no dependence predictor and no filter on the scans:
+//     the simplest scheme that is correct
+//   - the per-entry scans OR over MEM_W pipes and COH_N events, written as
+//     reductions of a vector
+pub module lq::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill,
+
+    i_alloc_valid: input  logic                      [CFG::RENAME_W]    ,
+    i_alloc      : input  core_types::<CFG>::LqAlloc [CFG::RENAME_W]    ,
+    o_free     : output logic<core_types::<CFG>::LQ_CNT_W>             ,
+    o_alloc_tag: output core_types::<CFG>::LqTag   [CFG::RENAME_W + 1],
+
+    i_bar_alloc : input  logic<core_types::<CFG>::TAKE_W>                ,
+    i_bar_ret   : input  logic                                           ,
+    o_bar_after : output core_types::<CFG>::BarSeq   [CFG::RENAME_W + 1],
+    o_bar_ret   : output core_types::<CFG>::BarSeq                       ,
+    o_load_fence: output core_types::<CFG>::LoadFence                    ,
+
+    i_snap   : input core_types::<CFG>::LqSnap    [CFG::MEM_W],
+    i_sta    : input core_types::<CFG>::StaWrite  [CFG::MEM_W],
+    i_verdict: input core_types::<CFG>::LqVerdict [CFG::MEM_W],
+
+    i_mem_ev    : input core_types::<CFG>::MemEvent                         ,
+    i_coh_v     : input logic                      [core_types::<CFG>::COH_N],
+    i_coh_line  : input logic<50>                  [core_types::<CFG>::COH_N],
+    i_std       : input core_types::<CFG>::StdWrite [CFG::MEM_W]             ,
+    i_sq_head   : input core_types::<CFG>::SqTag                            ,
+    i_oldest    : input core_types::<CFG>::TagTok                           ,
+
+    i_retire_cnt: input logic<core_types::<CFG>::RETIRE_CNT_W>,
+
+    o_reissue    : output core_types::<CFG>::MemReissue,
+    i_reissue_gnt: input  logic                        ,
+
+    o_win     : output core_types::<CFG>::LqCmWin [CFG::COMMIT_W],
+    o_split_lo: output logic<64>                               ,
+
+    o_chk : output logic<4>                ,
+    o_perf: output core_types::<CFG>::LqPerf,
+) {
+    import core_types::<CFG>::*;
+
+    const QN : u32 = CFG::LQ_N;
+    const QIW: u32 = LQ_IDX_W;
+
+    function lq_adv (
+        t: input LqTag    ,
+        k: input logic<32>,
+    ) -> LqTag {
+        var r: LqTag    ;
+        var s: logic<32>;
+        s = (t.idx as 32) + k;
+        if s >= QN {
+            r.idx  = (s - QN) as QIW;
+            r.wrap = ~t.wrap;
+        } else {
+            r.idx  = s as QIW;
+            r.wrap = t.wrap;
+        }
+        return r;
+    }
+
+    // Byte mask of a 16-byte window at dword dw, as bytes of its line.
+    function line_mask (
+        dw  : input logic<3> ,
+        mask: input logic<16>,
+    ) -> logic<64> {
+        return ({48'd0, mask} << {dw, 3'd0});
+    }
+
+    var head_q: LqTag;
+    var tail_q: LqTag;
+
+    var e_wrap  : logic          [QN];
+    var e_ex    : ExTag          [QN];
+    var e_op    : MemOp          [QN];
+    var e_sqlim : SqTag          [QN];
+    var e_va    : logic    <64>  [QN];
+    var e_line0 : logic    <50>  [QN];
+    var e_lm0   : logic    <64>  [QN];
+    var e_seen0 : logic          [QN];
+    var e_line1 : logic    <50>  [QN];
+    var e_lm1   : logic    <64>  [QN];
+    var e_seen1 : logic          [QN];
+    var e_dw    : logic    <3>   [QN]; // dword of the latest pass (FILL_CRIT match)
+    var e_half  : logic          [QN]; // the next pass is the hi line
+    var e_state : LqState        [QN];
+    var e_why   : ParkWhy        [QN];
+    var e_fid   : FillId         [QN];
+    var e_key   : SqTag          [QN];
+    var e_poison: logic          [QN];
+
+    var lo_q     : logic<64>      ;
+    var bar_al_q : BarSeq         ;
+    var bar_rt_q : BarSeq         ;
+    var fence_q  : logic          ;
+    var rsel_v_q : logic          ;
+    var rsel_q   : logic<QIW>      ;
+    var sta_q    : StaWrite [CFG::MEM_W];
+
+    // ---- occupancy ----
+
+    let cnt: logic<32> = if head_q.wrap == tail_q.wrap ? (tail_q.idx as 32) - (head_q.idx as 32) : QN - (head_q.idx as 32) + (tail_q.idx as 32);
+    assign o_free = (QN - cnt) as LQ_CNT_W;
+    for k in 0..CFG::RENAME_W + 1 :g_atag {
+        assign o_alloc_tag[k] = lq_adv(tail_q, k);
+    }
+
+    var live: logic<QN>;
+    var tags: logic<LQ_TAG_W> [QN];
+    always_comb {
+        for e in 0..QN {
+            live[e] = if head_q.wrap == tail_q.wrap ? (e >= head_q.idx && e <: tail_q.idx) : (e >= head_q.idx || e <: tail_q.idx);
+            tags[e] = {e_wrap[e], e as QIW};
+        }
+    }
+
+    var n_alloc: logic<32>;
+    always_comb {
+        var v: logic<CFG::RENAME_W>;
+        for l in 0..CFG::RENAME_W {
+            v[l] = i_alloc_valid[l];
+        }
+        n_alloc = tree_popcount::<CFG::RENAME_W, 32>(v);
+    }
+
+    // ---- scans (registered seen against this cycle's events) ----
+
+    var sta_hit: logic<QN>;
+    var coh_hit: logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            var s: logic<CFG::MEM_W>;
+            var c: logic<COH_N>     ;
+            for p in 0..CFG::MEM_W {
+                let sm: logic<64> = line_mask(sta_q[p].dw, sta_q[p].mask);
+                let ov: logic     = (e_seen0[e] && e_line0[e] == sta_q[p].line && (e_lm0[e] & sm) != 64'd0)
+                    || (e_seen1[e] && e_line1[e] == sta_q[p].line && (e_lm1[e] & sm) != 64'd0);
+                s[p] = sta_q[p].valid && ov && !tag_older::<LQ_TAG_W>(tags[e], {sta_q[p].lq_lim.wrap, sta_q[p].lq_lim.idx});
+            }
+            for k in 0..COH_N {
+                c[k] = i_coh_v[k] && ((e_seen0[e] && e_line0[e] == i_coh_line[k]) || (e_seen1[e] && e_line1[e] == i_coh_line[k]));
+            }
+            sta_hit[e] = live[e] && |s;
+            coh_hit[e] = live[e] && |c;
+        }
+    }
+
+    // ---- wake conditions ----
+
+    function wake_on (
+        why : input ParkWhy  ,
+        fid : input FillId   ,
+        key : input SqTag    ,
+        line: input logic<50>,
+        dw  : input logic<3> ,
+        rob : input RobTag   ,
+        ev  : input MemEvent ,
+        std : input StdWrite [CFG::MEM_W],
+        sqh : input SqTag    ,
+        tokv: input logic    ,
+        tok : input RobTag   ,
+    ) -> logic {
+        var sq_d: logic<CFG::MEM_W>;
+        let ev_end: logic = ev.valid && (ev.kind == EvKind::FILL_DONE || ev.kind == EvKind::FILL_ABORT);
+        for p in 0..CFG::MEM_W {
+            sq_d[p] = std[p].valid && std[p].sq == key;
+        }
+        let sq_w: logic = tag_older::<SQ_TAG_W>({key.wrap, key.idx}, {sqh.wrap, sqh.idx}) || |sq_d;
+        return case why {
+            ParkWhy::FILL: (ev_end || (ev.valid && ev.kind == EvKind::FILL_CRIT && ev.line == line && ev.crit == dw)) && ev.fill_id == fid,
+            ParkWhy::BUSY: ev_end,
+            ParkWhy::SQ  : sq_w,
+            ParkWhy::HEAD: tokv && tok == rob,
+            default      : 1'b0,
+        };
+    }
+
+    var wake: logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag);
+        }
+    }
+
+    // ---- re-issue selection ----
+
+    var gnt_oh: logic<QN>;
+    var ready : logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            gnt_oh[e] = i_reissue_gnt && rsel_v_q && rsel_q == e;
+            ready[e]  = live[e] && e_state[e] == LqState::READY && !gnt_oh[e];
+        }
+    }
+    let sel_oh: logic<QN>  = tree_oldest::<QN, LQ_TAG_W>(ready, tags);
+    let sel_ix: logic<QIW> = tree_onehot_enc::<QN, QIW>(sel_oh);
+
+    always_comb {
+        o_reissue.valid = rsel_v_q;
+        o_reissue.tag   = e_ex[rsel_q];
+        o_reissue.op    = e_op[rsel_q];
+        o_reissue.va    = e_va[rsel_q];
+        o_reissue.half  = e_half[rsel_q];
+        o_reissue.lq.wrap = e_wrap[rsel_q];
+        o_reissue.lq.idx  = rsel_q;
+        o_reissue.sq    = e_sqlim[rsel_q];
+    }
+
+    // ---- commit window ----
+
+    for k in 0..CFG::COMMIT_W :g_win {
+        let wt: LqTag = lq_adv(head_q, k);
+        always_comb {
+            o_win[k].valid     = k <: cnt;
+            o_win[k].tag       = wt;
+            o_win[k].poison    = e_poison[wt.idx];
+            o_win[k].obs.size  = {1'b0, e_op[wt.idx].size};
+            o_win[k].obs.vaddr = e_va[wt.idx];
+            o_win[k].obs.paddr = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
+            o_win[k].obs.rmask = (16'd1 << (4'd1 << e_op[wt.idx].size)) - 16'd1;
+            o_win[k].obs.wmask = '0;
+            o_win[k].obs.wdata = '0;
+        }
+    }
+    assign o_split_lo = lo_q;
+
+    // ---- barrier sequence ----
+
+    for k in 0..CFG::RENAME_W + 1 :g_bar {
+        assign o_bar_after[k] = bar_al_q + k;
+    }
+    assign o_bar_ret          = bar_rt_q;
+    assign o_load_fence.valid = fence_q;
+    assign o_load_fence.seq   = bar_rt_q;
+
+    // ---- state ----
+
+    let head_nx: LqTag = lq_adv(head_q, i_retire_cnt as 32);
+
+    always_ff {
+        if_reset {
+            head_q   = '0;
+            tail_q   = '0;
+            lo_q     = '0;
+            bar_al_q = '0;
+            bar_rt_q = '0;
+            fence_q  = 1'b0;
+            rsel_v_q = 1'b0;
+            rsel_q   = '0;
+            for p in 0..CFG::MEM_W {
+                sta_q[p].valid = 1'b0;
+            }
+            for e in 0..QN {
+                e_state[e]  = LqState::ISSUE;
+                e_seen0[e]  = 1'b0;
+                e_seen1[e]  = 1'b0;
+                e_poison[e] = 1'b0;
+                e_half[e]   = 1'b0;
+            }
+        } else {
+            head_q = head_nx;
+            if i_kill.valid {
+                tail_q = if i_kill.full ? head_nx : i_kill.lq_tail;
+            } else {
+                tail_q = lq_adv(tail_q, n_alloc);
+            }
+
+            bar_rt_q = bar_rt_q + (i_bar_ret as BAR_SEQ_W);
+            fence_q  = i_bar_ret;
+            if i_kill.valid {
+                bar_al_q = if i_kill.full ? bar_rt_q + (i_bar_ret as BAR_SEQ_W) : i_kill.bar_seq;
+            } else {
+                bar_al_q = bar_al_q + (i_bar_alloc as BAR_SEQ_W);
+            }
+
+            rsel_v_q = (ready != '0) && !i_kill.valid;
+            rsel_q   = sel_ix;
+            for p in 0..CFG::MEM_W {
+                sta_q[p] = i_sta[p];
+            }
+
+            for e in 0..QN {
+                // Scans and wakes act on the registered entry; the writes
+                // below (one source per entry and cycle) take precedence.
+                if sta_hit[e] || coh_hit[e] {
+                    e_poison[e] = 1'b1;
+                }
+                if wake[e] {
+                    e_state[e] = LqState::READY;
+                }
+                if gnt_oh[e] {
+                    e_state[e] = LqState::INFLIGHT;
+                }
+                for l in 0..CFG::RENAME_W {
+                    if i_alloc_valid[l] && o_alloc_tag[l].idx == e {
+                        e_wrap[e]   = o_alloc_tag[l].wrap;
+                        e_ex[e]     = i_alloc[l].ex;
+                        e_op[e]     = mem_op(i_alloc[l].fu, i_alloc[l].uop);
+                        e_sqlim[e]  = i_alloc[l].sq_lim;
+                        e_state[e]  = LqState::ISSUE;
+                        e_seen0[e]  = 1'b0;
+                        e_seen1[e]  = 1'b0;
+                        e_poison[e] = 1'b0;
+                        e_half[e]   = 1'b0;
+                    }
+                }
+                for p in 0..CFG::MEM_W {
+                    if i_snap[p].valid && i_snap[p].lq.idx == e {
+                        e_dw[e] = i_snap[p].dw;
+                        if i_snap[p].half {
+                            e_line1[e] = i_snap[p].line;
+                            e_lm1[e]   = line_mask(i_snap[p].dw, i_snap[p].mask);
+                            e_seen1[e] = 1'b1;
+                        } else {
+                            e_line0[e]  = i_snap[p].line;
+                            e_lm0[e]    = line_mask(i_snap[p].dw, i_snap[p].mask);
+                            e_seen0[e]  = 1'b1;
+                            e_seen1[e]  = 1'b0;
+                            e_poison[e] = 1'b0;
+                        }
+                    }
+                    if i_verdict[p].valid && i_verdict[p].lq.idx == e {
+                        e_why[e] = i_verdict[p].why;
+                        e_fid[e] = i_verdict[p].fill_id;
+                        e_key[e] = i_verdict[p].sq_key;
+                        e_va[e]  = i_verdict[p].va;
+                        // An event of this cycle counts as after the verdict.
+                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag) {
+                            e_state[e] = LqState::READY;
+                        } else {
+                            e_state[e] = i_verdict[p].state;
+                        }
+                        if i_verdict[p].split_lo {
+                            e_half[e] = 1'b1;
+                        }
+                    }
+                }
+            }
+            for p in 0..CFG::MEM_W {
+                if i_verdict[p].valid && i_verdict[p].split_lo {
+                    lo_q = i_verdict[p].lo_data;
+                }
+            }
+        }
+    }
+
+    always_comb {
+        var pk_fill: logic<CFG::MEM_W>;
+        var pk_busy: logic<CFG::MEM_W>;
+        var pk_sq  : logic<CFG::MEM_W>;
+        var pk_head: logic<CFG::MEM_W>;
+        for p in 0..CFG::MEM_W {
+            let pk: logic = i_verdict[p].valid && i_verdict[p].state == LqState::PARK;
+            pk_fill[p] = pk && i_verdict[p].why == ParkWhy::FILL;
+            pk_busy[p] = pk && i_verdict[p].why == ParkWhy::BUSY;
+            pk_sq[p]   = pk && i_verdict[p].why == ParkWhy::SQ;
+            pk_head[p] = pk && i_verdict[p].why == ParkWhy::HEAD;
+        }
+        o_perf.poison_sta = sta_hit != '0;
+        o_perf.poison_coh = coh_hit != '0;
+        o_perf.park_fill  = |pk_fill;
+        o_perf.park_busy  = |pk_busy;
+        o_perf.park_sq    = |pk_sq;
+        o_perf.park_head  = |pk_head;
+        o_perf.reissue    = i_reissue_gnt && rsel_v_q;
+        o_perf.fence_ret  = i_bar_ret;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var c_rob  : RobTag  [QN];
+        always_comb {
+            for e in 0..QN {
+                c_rob[e] = e_ex[e].rob;
+            }
+        }
+        inst u_chk: chk_lq::<CFG> #(
+            N: QN,
+        ) (
+            clk                         ,
+            rst                         ,
+            i_kill                      ,
+            i_live      : live          ,
+            i_rob       : c_rob         ,
+            i_state     : e_state       ,
+            i_alloc_valid               ,
+            i_verdict                   ,
+            i_gnt       : gnt_oh        ,
+            o_chk                       ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

@@ -1,0 +1,393 @@
+// exec_port: one exec issue port P: issue register, register read with
+// bypass, the FU set PORT_FU[P], the port's WB packet and wake lane. The FU
+// kinds built here are ALU, BRU, SYS, MUL and DIV; a config that puts any
+// other kind on an exec port is rejected by CFG_ERR bit 11, so every op a
+// grant can carry has its FU. DIV is the only blocking kind.
+//
+// Ports (timing contract):
+//   i_grant          : the iq grant of select cycle S (combinational)
+//   o_release        : cycle A = S + ISS_TO_ACC: the accepted op's IQ entry
+//   o_fu_busy        : registered state only: blocking FU kinds that may not
+//                      be selected this cycle
+//   o_rd             : A, PRF read addresses per source slot (registered)
+//   i_rd_int/i_rd_fp : A, PRF read data of those addresses
+//   i_wb             : every WB bus, the bypass sources
+//   o_wb             : the port's WB packet, registered, A + LAT of the FU
+//   o_wake           : the port's wake lane, WAKE_LEAD cycles before o_wb
+//                      carries the pdst; at most one per cycle
+//   o_hf_req/i_hf_grant : hole-fill request of the port's blocking FU, and
+//                      its same-cycle grant from the port's wb_resv
+//   o_ftq_rd/i_ftq      : BRU ports: combinational FTQ read in A by the op's
+//                      tag (aligned block base and the block's prediction)
+//   o_csr_raddr/i_csr_rdata/i_tok/o_started/o_sys : SYS port,
+//                      see fu_sys
+//   i_kill           : applied at every capture edge (issue register, FU
+//                      stages, wake line, blocking FU)
+//   o_perf           : combinational event in A: a read source took a bypass
+//                      value that differs from the PRF value (a bypass hit
+//                      equal to the stale PRF value is not counted)
+//   o_chk            : sticky checker flags (HELIODOR_CHK only, else 0)
+// Owns:
+//   - at most one FU result per cycle on o_wb, guaranteed by the WB slot
+//     reservation of the select
+//   - each wake event is followed WAKE_LEAD cycles later by the WB of the
+//     same pdst, unless a kill removed the op
+// Rationale:
+//   - the FU set is the only per-port difference; it comes from the topology
+//     table through generate-if
+//   - bypass comes only from the WB buses, so its depth does not depend on
+//     any FU latency
+//   - a source's value class comes from its PReg, so one slot reads either
+//     file
+pub module exec_port::<CFG: core_cfg> #(
+    param P: u32 = 0,
+) (
+    clk        : input  clock                                                       ,
+    rst        : input  reset                                                       ,
+    i_grant    : input  core_types::<CFG>::IqGrant                                  ,
+    i_kill     : input  core_types::<CFG>::Kill                                     ,
+    o_release  : output core_types::<CFG>::IqRelease                                ,
+    o_fu_busy  : output opclass_pkg::FuSet                                          ,
+    o_rd       : output core_types::<CFG>::PReg           [core_types::<CFG>::SRC_N],
+    i_rd_int   : input  logic                        <64> [core_types::<CFG>::SRC_N],
+    i_rd_fp    : input  logic                        <64> [core_types::<CFG>::SRC_N],
+    i_wb       : input  core_types::<CFG>::WbPacket       [core_types::<CFG>::WB_N] ,
+    o_wb       : output core_types::<CFG>::WbPacket                                 ,
+    o_wake     : output core_types::<CFG>::Wake                                     ,
+    o_hf_req   : output logic                                                       ,
+    i_hf_grant : input  fu_pkg::WbSlot                                              ,
+    o_ftq_rd   : output core_types::<CFG>::FtqTag                                   ,
+    i_ftq      : input  core_types::<CFG>::FtqRead                                  ,
+    o_csr_raddr: output logic                        <12>                           ,
+    i_csr_rdata: input  logic                        <64>                           ,
+    i_tok      : input  core_types::<CFG>::TagTok                                   ,
+    o_started  : output logic                                                       ,
+    o_sys      : output core_types::<CFG>::SysPending                               ,
+    o_perf     : output logic                                                       ,
+    o_chk      : output logic                        <4>                            , // {wake without its WB, WB to int pdst 0, blocking FU issued while busy, two FU results}
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+    import fu_pkg::*;
+
+    const FS   : FuSet = CFG::PORT_FU[P];
+    const DEPTH: u32   = wb_depth(P) - WAKE_LEAD;
+
+    // ---- Issue register (select -> accept) ----
+
+    var st_v: logic  ;
+    var st  : IqGrant;
+    inst u_is: stage_reg::<CFG> #(
+        T: IqGrant,
+    ) (
+        clk                     ,
+        rst                     ,
+        i_valid: i_grant.valid  ,
+        i_data : i_grant        ,
+        i_tag  : i_grant.tag.rob,
+        i_kill                  ,
+        o_valid: st_v           ,
+        o_data : st             ,
+    );
+
+    always_comb {
+        o_release.valid = st_v;
+        o_release.entry = st.entry;
+    }
+
+    // ---- Register read and bypass (cycle A) ----
+
+    always_comb {
+        for s in 0..SRC_N {
+            o_rd[s] = st.src[s].pr;
+        }
+    }
+
+    var val   : logic<64>    [SRC_N];
+    var by_hit: logic<SRC_N>        ;
+    always_comb {
+        for s in 0..SRC_N {
+            let rf       : logic<64> = if st.src[s].pr.cls == RegClass::FP ? i_rd_fp[s] : i_rd_int[s];
+            val[s]    = bypass(st.src[s].pr, rf, i_wb);
+            by_hit[s] = st_v && st.src[s].en && val[s] != rf;
+        }
+    }
+    assign o_perf = |by_hit;
+
+    let imm64: logic<64> = {st.cold.imm[31] repeat 32, st.cold.imm};
+
+    // ALU operands: rs1 or 0 (LUI), rs2 or the immediate.
+    var opnd: logic<64> [2];
+    var rs  : logic<64> [2];
+    always_comb {
+        opnd[0] = if st.src[0].en ? val[0] : 0;
+        opnd[1] = if st.src[1].en ? val[1] : imm64;
+        rs[0]   = val[0];
+        rs[1]   = val[1];
+    }
+
+    function fu_v (
+        v : input logic ,
+        fu: input FuKind,
+        k : input FuKind,
+    ) -> logic {
+        return v && fu == k;
+    }
+
+    // ---- FU set ----
+
+    var wb_alu : WbPacket;
+    var wb_bru : WbPacket;
+    var wb_sys : WbPacket;
+    var wb_mul : WbPacket;
+    var wb_div : WbPacket;
+    var div_rdy: logic   ;
+    var div_hf : logic   ;
+    var div_tag: ExTag   ;
+
+    if FS[FuKind::ALU] :g_alu {
+        inst u_alu: fu_alu::<CFG> (
+            clk                                        ,
+            rst                                        ,
+            i_valid: fu_v(st_v, st.fu, FuKind::ALU),
+            i_op   : st.cold.uop[5:0] as alu_pkg::AluOp,
+            i_tag  : st.tag                            ,
+            i_src  : opnd                              ,
+            i_kill                                     ,
+            o_ready: _                                 ,
+            o_wb   : wb_alu                            ,
+        );
+    } else {
+        assign wb_alu = 0 as WbPacket;
+    }
+
+    if FS[FuKind::BRU] :g_bru {
+        inst u_bru: fu_bru::<CFG> (
+            clk                                             ,
+            rst                                             ,
+            i_valid      : fu_v(st_v, st.fu, FuKind::BRU),
+            i_op         : st.cold.uop[3:0] as BruOp        ,
+            i_tag        : st.tag                           ,
+            i_src        : rs                               ,
+            i_imm        : imm64                            ,
+            i_pc         : i_ftq.base + {st.cold.foff, 1'b0},
+            i_pred_target: i_ftq.pred.target                ,
+            i_pred_taken : st.cold.pred_taken               ,
+            i_rvc        : st.cold.rvc                      ,
+            i_ftq        : st.cold.ftq                      ,
+            i_foff       : st.cold.foff                     ,
+            i_kill                                          ,
+            o_ready      : _                                ,
+            o_wb         : wb_bru                           ,
+        );
+        assign o_ftq_rd = st.cold.ftq;
+    } else {
+        assign wb_bru   = 0 as WbPacket;
+        assign o_ftq_rd = 0 as FtqTag;
+    }
+
+    if FS[FuKind::SYS] :g_sys {
+        inst u_sys: fu_sys::<CFG> (
+            clk                                        ,
+            rst                                        ,
+            i_valid    : fu_v(st_v, st.fu, FuKind::SYS),
+            i_op       : st.cold.uop[3:0] as SysOp     ,
+            i_tag      : st.tag                        ,
+            i_src      : rs[0]                         ,
+            i_imm      : st.cold.imm                   ,
+            o_csr_raddr                                ,
+            i_csr_rdata                                ,
+            i_tok                                      ,
+            o_started                                  ,
+            i_kill                                     ,
+            o_ready    : _                             ,
+            o_wb       : wb_sys                        ,
+            o_sys                                      ,
+        );
+    } else {
+        assign wb_sys      = 0 as WbPacket;
+        assign o_csr_raddr = 0;
+        assign o_started   = 1'b0;
+        assign o_sys       = 0 as SysPending;
+    }
+
+    if FS[FuKind::MUL] :g_mul {
+        inst u_mul: fu_mul::<CFG> (
+            clk                                        ,
+            rst                                        ,
+            i_valid: fu_v(st_v, st.fu, FuKind::MUL),
+            i_op   : st.cold.uop[5:0] as alu_pkg::AluOp,
+            i_tag  : st.tag                            ,
+            i_src  : rs                                ,
+            i_kill                                     ,
+            o_ready: _                                 ,
+            o_wb   : wb_mul                            ,
+        );
+    } else {
+        assign wb_mul = 0 as WbPacket;
+    }
+
+    if FS[FuKind::DIV] :g_div {
+        inst u_div: fu_div::<CFG> (
+            clk                                           ,
+            rst                                           ,
+            i_valid   : fu_v(st_v, st.fu, FuKind::DIV),
+            i_op      : st.cold.uop[5:0] as alu_pkg::AluOp,
+            i_tag     : st.tag                            ,
+            i_src     : rs                                ,
+            i_kill                                        ,
+            o_ready   : div_rdy                           ,
+            o_hf_req  : div_hf                            ,
+            o_hf_tag  : div_tag                           ,
+            i_wb_grant: i_hf_grant                        ,
+            o_wb      : wb_div                            ,
+        );
+    } else {
+        assign wb_div  = 0 as WbPacket;
+        assign div_rdy = 1'b1;
+        assign div_hf  = 1'b0;
+        assign div_tag = 0 as ExTag;
+    }
+
+    assign o_hf_req = div_hf;
+
+    // A blocking FU is busy until its registered ready returns, and also
+    // while the issue register holds an op for it (ready drops only after
+    // accept).
+    always_comb {
+        o_fu_busy              = 0;
+        o_fu_busy[FuKind::DIV] = !div_rdy || fu_v(st_v, st.fu, FuKind::DIV);
+    }
+
+    // ---- WB packet ----
+
+    function keep_v (
+        p: input WbPacket,
+    ) -> WbPacket {
+        return if p.valid ? p : 0 as WbPacket;
+    }
+
+    let wb_any: logic<5> = {wb_div.valid, wb_mul.valid, wb_sys.valid, wb_bru.valid, wb_alu.valid};
+    always_comb {
+        o_wb = (keep_v(wb_alu) | keep_v(wb_bru) | keep_v(wb_sys) | keep_v(wb_mul) | keep_v(wb_div)) as WbPacket;
+    }
+
+    // ---- Wake lane ----
+
+    // Select pushes the wake of a RESERVED op with delay LAT - 1; a hole-fill
+    // grant at offset off pushes with delay off - WAKE_LEAD. Delay 0 leaves
+    // in the same cycle; delay d sits d cycles in the line.
+    struct WakeEnt {
+        valid: logic ,
+        pdst : PReg  ,
+        rob  : RobTag,
+    }
+
+    var push_s: WakeEnt;
+    var push_h: WakeEnt;
+    var dly_s : WbOff  ;
+    var dly_h : WbOff  ;
+    always_comb {
+        push_s.valid = i_grant.valid && !is_blocking(i_grant.fu) && i_grant.tag.has_rd;
+        push_s.pdst  = i_grant.tag.pdst;
+        push_s.rob   = i_grant.tag.rob;
+        dly_s        = (lat(i_grant.fu) - 1) as WbOff;
+        push_h.valid = i_hf_grant.valid && div_tag.has_rd;
+        push_h.pdst  = div_tag.pdst;
+        push_h.rob   = div_tag.rob;
+        dly_h        = i_hf_grant.off - WAKE_LEAD;
+    }
+
+    // At most one push or line entry targets a cycle (the WB slot of each
+    // cycle is reserved once), so the merges are plain ORs.
+    function gate (
+        v: input logic  ,
+        e: input WakeEnt,
+    ) -> WakeEnt {
+        return if v ? e : 0 as WakeEnt;
+    }
+
+    var wl_head: WakeEnt;
+    if DEPTH == 0 :g_nowl {
+        assign wl_head = 0 as WakeEnt;
+    } else :g_wl {
+        var wl_q : WakeEnt [DEPTH];
+        var wl_up: WakeEnt [DEPTH]; // wl_q one step closer to leaving
+        always_comb {
+            for i in 0..DEPTH - 1 {
+                wl_up[i] = wl_q[i + 1];
+            }
+            wl_up[DEPTH - 1] = 0 as WakeEnt;
+        }
+        always_ff {
+            if_reset {
+                wl_q = '{default: 0 as WakeEnt};
+            } else {
+                for i in 0..DEPTH {
+                    var n      : WakeEnt;
+                    n       = (wl_up[i] | gate(push_s.valid && dly_s == i + 1, push_s)
+                        | gate(push_h.valid && dly_h == i + 1, push_h)) as WakeEnt;
+                    n.valid = n.valid && !killed(i_kill, n.rob);
+                    wl_q[i] = n;
+                }
+            }
+        }
+        assign wl_head = wl_q[0];
+    }
+
+    var wake_now: WakeEnt;
+    always_comb {
+        wake_now = (wl_head | gate(push_s.valid && dly_s == 0, push_s)
+            | gate(push_h.valid && dly_h == 0, push_h)) as WakeEnt;
+    }
+
+    always_comb {
+        o_wake.valid = wake_now.valid;
+        o_wake.pdst  = wake_now.pdst;
+    }
+
+    // ---- Invariant checker ----
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        // Wake events in flight towards their WB; entry i reaches the WB
+        // bus in i cycles.
+        var hist_q: WakeEnt [WAKE_LEAD];
+        always_ff {
+            if_reset {
+                hist_q = '{default: 0 as WakeEnt};
+            } else {
+                for i in 0..WAKE_LEAD - 1 {
+                    hist_q[i]       = hist_q[i + 1];
+                    hist_q[i].valid = hist_q[i + 1].valid && !killed(i_kill, hist_q[i + 1].rob);
+                }
+                hist_q[WAKE_LEAD - 1]       = wake_now;
+                hist_q[WAKE_LEAD - 1].valid = wake_now.valid && !killed(i_kill, wake_now.rob);
+            }
+        }
+        let miss: logic = hist_q[0].valid && !(o_wb.valid && o_wb.tag.has_rd && o_wb.tag.pdst == hist_q[0].pdst);
+
+        var chk_q: logic<4>;
+        always_ff {
+            if_reset {
+                chk_q = 0;
+            } else {
+                if (wb_any & (wb_any - 1)) != 0 {
+                    chk_q[0] = 1'b1;
+                }
+                if fu_v(st_v, st.fu, FuKind::DIV) && !div_rdy {
+                    chk_q[1] = 1'b1;
+                }
+                if o_wb.valid && o_wb.tag.has_rd && o_wb.tag.pdst.cls == RegClass::INT && o_wb.tag.pdst.idx == 0 {
+                    chk_q[2] = 1'b1;
+                }
+                if miss {
+                    chk_q[3] = 1'b1;
+                }
+            }
+        }
+        assign o_chk = chk_q;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}
