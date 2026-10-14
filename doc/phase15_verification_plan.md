@@ -167,21 +167,21 @@ adapter (`tb/tb_flat_slot_mem.veryl`) の仕様: コアの外部ポート (設�
 | ブランチ | `golden/b0f4668-obs` (親は `b0f4668`)。push しない。 |
 | worktree | `.golden/` (master の直下、gitignore)。`Veryl.toml` の sources は `src`/`tb` を明示しているので、master の veryl からは見えない。`.build/lock` も別なので、master の veryl と同時に走らせてよい。 |
 | veryl | `.golden/veryl` に `fbd14729` を detached で置き、`cargo build --profile release-verylup` でビルドする。golden の実行は `VERYL=.golden/veryl/target/release-verylup/veryl` で行う。 |
-| 駆動 | master 側の `test/golden/run_golden.py <list>` が golden worktree でテストを走らせ、成果物を master の `test/golden/` に書き戻す。 |
+| 駆動 | master 側の `test/golden/run_golden.py <list>` が golden worktree でテストを走らせ、成果物を master の `test/golden/` に書き戻す。未作成 (残作業、M1b の rv64ui trace ゲートより前に要る)。最初の成果物 (§3.5) は手で走らせて書き戻した。 |
 
 ### 3.2 パッチの中身 (観測専用)
 
 | ファイル (golden ブランチ) | 変更 |
 |---|---|
 | `src/core/rob.veryl` | 出力 `o_commit2_instr = sh_instr[head1_idx]` を追加 (lane 1 の insn。`sh_instr` は rob.veryl:467 に既存)。 |
-| `src/core/golden_rvfi_adapter.veryl` (新規) | §3.3 の正規化をすべてここに書く。入力は旧コアの内部信号、出力は `RetireRec [2]`、`IrqEvent`、tick 計数、`gtag` (§3.3 N14)。 |
+| `src/core/golden_rvfi_adapter.veryl` (新規) | §3.3 の正規化をすべてここに書く。入力は旧コアの内部信号、出力は `RetireRec [2]`、`IrqEvent`、tick 計数、`gtag` (§3.3 N14)。実装ではこれに `o_irq_lat` (pending の立ち上がりから受付までの order の差、§3.5 の分布の源) を足した。観測専用で比較対象外。 |
 | `src/core/heliodor_core.veryl` | adapter を instantiate し、出力ポート `o_rvfi`、`o_rvfi_irq`、`o_rvfi_gtag` を追加する。既存の論理には触れない。 |
 | `src/pkg/retire_pkg.veryl` | master の版を逐語コピーする。vector フィールド `{vec_v, vrf_wcnt, vrf_hash, vtype, vl, vstart}` (設計書 §5.12) は最初の版から含める。adapter は `u_vrf` の書込ポートから `vrf_wcnt`/`vrf_hash` を作り、vector 以外の record ではすべて 0 にする (設計書 §V.7)。 |
 | `src/peripheral/clint.veryl` | `i_tick_sel` と `i_tick` を追加する (§4.1。master と同じ変更)。 |
 | `src/core/heliodor_soc.veryl` | `MTIME_SRC/MTIME_DIV`、tick 生成、`o_rvfi*` の通過、`i_tick_sel=1` の配線。 |
 | `tb/test_arch_common.veryl`, `tb/test_soc_linux_boot.veryl` | harness に `MTIME_SRC` (arch harness では内部の `mtime_ctr` を INSTRET でも進められるようにする)、`rvfi_tracer`、schedule と checkpoint の印字を足す。 |
 | `tb/rvfi_tracer.veryl`, `tb/retire_mon.veryl` | master の版を逐語コピーする (trace 形式、MASK、hash の唯一の定義)。 |
-| `tb/golden_runs_*.veryl` (生成) | ゲートリストから生成する golden 実行用テスト。 |
+| `tb/golden_runs_*.veryl` (生成) | ゲートリストから生成する golden 実行用テスト。未作成 (残作業、M1b の rv64ui trace ゲートより前に要る)。現在あるのは手書きの `test_golden_boot_linux515_n1` だけ。 |
 
 D1 が挙げる 3 点 (adapter、CLINT の tick 入力、schedule printer) に加えて、rolling hash、`gtag`、arch harness の INSTRET モード、retire record の vector フィールドもこのパッチに入れる。どれも観測専用で、旧コアの状態を変えない。
 
@@ -194,23 +194,30 @@ D1 が挙げる 3 点 (adapter、CLINT の tick 入力、schedule printer) に�
 | N1 lane 0 | `valid = (rob_commit_ack \|\| commit_excp) && !(commit_sc_replay && !commit_excp)`。`rob_commit_valid` と arch_regs は使わない。 | 6402 (ack は sc_replay を除外しない)、7125-7127、8402、7808 |
 | N2 trap | `trap = commit_excp`。trap record は `rd_kind=NONE`、`wmask=0`、`csr_valid=0`、`next_pc=0`。cause は `trap_cause`、tval は `i_trap_tval` の式から取る。`o_dbg_trap_pc` (=c_pc) と `o_dbg_stval_out` (登録済みの stval) は使わない。ack=0 で trap する経路 (store を保持中の TVM sfence など) もこれで拾う。 | 7249 (`trap_cause`)、7316、7328-7346、7442-7445、7469 |
 | N3 xRET | mret/sret は trap=0 の通常 record にする (旧 `o_dbg_retire_v_a` は除外していた)。 | 7146-7147, 7887 |
-| N4 偽 ifault | `inject_fake_ifault` のサイクルは 2 record にする: lane 0 = csrw satp (trap=0、`csr_valid=1`、`csr_wdata=c_csr_wdata`)、lane 1 = 合成 trap {pc=c_pc+4、cause 12、tval=c_pc+4、insn=MASK}。tick 計数では csrw を 1 と数える。設計書 §5.12 により lane の位置は比較対象外なので、trap が lane 1 にあってよい。 | 7050-7058, 7316, 7328-7329、csr.veryl:905 対 1047 |
+| N4 偽 ifault | `inject_fake_ifault` のサイクルは 2 record にする: lane 0 = csrw satp (trap=0、`csr_valid=1`、`csr_wdata=c_csr_wdata`)、lane 1 = 合成 trap {pc=c_pc+4、cause 12、tval=c_pc+4、insn=MASK}。tick 計数では csrw を 1 と数える。設計書 §5.12 により lane の位置は比較対象外なので、trap が lane 1 にあってよい。golden の harness は `retire_mon` を `TRAP_ANY_LANE=1` で instantiate して lane 1 の trap を契約違反にせず、代わりに harness の `i_chk` が「`FAKE_IFAULT` タグの無い lane 1 の trap」を数えて違反とする (§3.4 の 3)。 | 7050-7058, 7316, 7328-7329、csr.veryl:905 対 1047 |
 | N5 lane 1 | `valid = commit2_fire`。`o_commit2_valid` は使わない。pc/rd は c2_*、insn は新設の `o_commit2_instr`、next_pc は `c2_arch_next_pc`。lane 1 には trap も store も CSR も来ない。 | 8460, 7570、rob.veryl:592-625 |
 | N6 frm 同時 retire | `commit_csrw_frm && commit2_fire` のサイクルは lane 1 の record を出さず、tick にも数えない (直後の再実行が record を出す)。冪等でない op なら値が狂うが、それは golden の誤りとして B04 で扱う。 | 7014, 8451, 7758-7762 |
 | N7 rd | lane 0: `c_has_rd && !trap` なら INT (`c_rd_arch`, `c_result_data`)、`c_is_fp_dest` なら FP。amocas.q は `cas_q_retire` で rd と rd2 に `c_cas_q_mem_lo/hi`。priv-illegal (TVM/TSR/FS-off など) は N2 で rd なしになる。 | 6427, 6967, 7826-7837 |
-| N8 store | `c_store_pa`、`c_store_data`、`c_store_funct3` から wmask/wdata を作り、16 B アクセスでは hi 側も載せる。`mem_io = c_store_mmio`。 | 6226-6229, 8792-8806, 6375 |
+| N8 store | `c_store_eff_pa` (commit が実際に書いた PA)、`c_store_data`、`c_store_funct3` から wmask/wdata を作り、16 B アクセスでは hi 側も載せる。`mem_io = c_store_mmio`。`c_store_pa` は翻訳前の probe の PA なので使わない。 | 6226-6229, 8792-8806, 6375 |
 | N9 CSR | `csr_valid = commit_csrwr && would_wr(insn)` (RW、または rs1/uimm != 0)。旧コアは読み出しだけの CSR 命令でも書き込みポートを動かしていたので、その分を落とす。 | 7000、alu_wrap.veryl:461 |
 | N10 load | load のアドレスと読み値は出さない (`mem_rmask=0`)。旧コアには commit 時に読めるポートが無い。 | rob.veryl:237-239 |
 | N11 割込み | `commit_irq` で `IrqEvent {cause=csr_irq_cause, epc=arch_next_pc_q, order}`。 | 7144, 7316 |
-| N12 order と tick | order は正規化後の record 数 (64 bit)。tick 計数は正規化後の `popcount(valid && !trap)`。`minstret` (7420) と ROB の `commit_cnt` は使わない。 | 7420、rob.veryl:1719-1730 |
+| N12 order と tick | order は正規化後の record 数 (64 bit)。tick 計数 `o_rvfi_tick_cnt` は正規化後の `popcount(valid && !trap)` で、登録済みの record からではなく commit のサイクルの信号から組合せで作る。理由: 旧コアは、古い op が retire した次のサイクルに CSR の読み出しを issue するので、record (1 サイクル後に登録) から tick を作ると、その読み出しは直前の retire の分の tick をまだ見ない。新コアは record から作ってよい (§4.1)。`minstret` (7420) と ROB の `commit_cnt` は使わない。 | 7420、rob.veryl:1719-1730 |
 | N13 priv/virt | commit サイクルの `csr_priv`/`csr_virt` (trap による更新の前の値)。 | |
-| N14 gtag | 観測フラグ (比較対象外)。trace の行末に `#TAG` として付ける: `FAKE_IFAULT`、`SC_REPLAY`、`FRM_CORETIRE`、`MA_PAGEX` (misaligned アクセスが 4 KiB をまたいだ)、`AMO_VM` (VM 下の AMO の commit)、`PRIV_ILL_RD` (rd を持つ priv-illegal trap)、`SATP_WIN` (csrw satp から次の sfence までの窓)。付録 B の「発火」はこのタグを数えて埋める。 | |
+| N14 gtag | 観測フラグ (比較対象外)。trace の行末に `#TAG` として付ける: `FAKE_IFAULT`、`SC_REPLAY`、`FRM_CORETIRE`、`MA_PAGEX` (misaligned アクセスが 4 KiB をまたいだ)、`AMO_VM` (VM 下の AMO の commit)、`PRIV_ILL_RD` (rd を持つ priv-illegal trap)、`SATP_WIN` (csrw satp から次の sfence までの窓)。付録 B の「発火」はこのタグを数えて埋める。`AMO_VM` は現在 VM 下のすべての AMO で立つ (5.15 boot で 18,925 回) ので、W か D を欠くページへの AMO だけに絞るまでは STOP のタグに使えない (付録 B の B10)。 | |
+
+golden の実装 (`golden/b0f4668-obs` の `8ee7a1d`) で分かった、観測の穴と設計からのずれ:
+
+- `MA_PAGEX` は store にだけ付く。load は record にアドレスを出さない (N10) ので、page をまたぐ misaligned load は数えていない。
+- cbo.* の record は store を持たない (`mem_wmask=0`)。cbo.zero の書き込みは trace に現れない。
+- `vrf_hash` は M5 まで best effort である。vector を使うテストを lockstep に載せる M5 で、`u_vrf` の書込ポートからの作り方を確かめ直す。
+- golden の SoC は、§4.1 の elaborate 時の検査 (`MTIME_SRC==INSTRET` のとき `MTIME_DIV ≥` lane 数) を持たない。また単一 hart の構成でしか作っていない。K=10 と lane 数 2 なので現状は問題にならない。
 
 ### 3.4 受入条件
 
 1. (D1) 既定パラメータでの dhrystone と coremark の cycles と instret が、パッチ前の `b0f4668` とビット一致すること。
 2. 5.15 N=1 boot を `MTIME_SRC=CYCLE` で走らせ、cy (10,000 刻み) と `o_dbg_rob_commit_cnt` がパッチ前と一致すること。CLINT と SoC の変更が時刻の挙動を変えていないことを確かめる。
-3. `retire_mon` の retire-contract checker (§5.1 の `chk_retire`) を adapter の出力に当て、arch 全テストと 5.15 boot で違反 0 であること。例外として N4 の lane 1 trap だけを許す。
+3. `retire_mon` の retire-contract checker (§5.1 の `chk_retire`) を adapter の出力に当て、arch 全テストと 5.15 boot で違反 0 であること。例外として N4 の lane 1 trap だけを許す (`TRAP_ANY_LANE=1` と harness の `i_chk` による数え上げ、N4)。
 4. `test_rvfi_tracer_selftest` (合成した record 列を tracer に流し、既知の hash と canonical テキストを得る) が、golden の veryl `fbd14729` と master の veryl の両方で同じ出力を出すこと。`$display` の書式が compiler の版で変わっても、比較が壊れないことを保証するため。
 5. FP の rd 値の自己整合: rv64ud の全テストで、record の FP rd 値が、直後にその値を読む fsd/fmv.x.d の record と一致すること (`c_result_data` に FP の結果が載るという推定を確認する)。
 
@@ -218,18 +225,36 @@ D1 が挙げる 3 点 (adapter、CLINT の tick 入力、schedule printer) に�
 
 【決定】パッチの後、他の何よりも先に、golden が `MTIME_SRC=INSTRET`、K=10 で 5.15 N=1 boot を x3==0xAA まで走りきることを確かめ、それを最初の成果物とする。理由: lockstep 全体がこれを前提にしており、retire 数で進む時刻のもとでは割込みの位置が変わるため、旧コアに潜んだタイムアウトや drain 方針の問題があるならここで最初に表に出る。成果物は checkpoint 列、schedule、`gtag` の出現位置、割込みの総数、pending の立ち上がりから受付までの order の差の分布である。付録 B の「発火」列のうち「不明」の欄は、この run の `gtag` 計数で埋める。
 
+結果 (2026-10-14、golden ブランチ `golden/b0f4668-obs` の `8ee7a1d`、veryl `fbd14729`、成果物は master の `0bc2467`):
+
+| 項目 | 値 |
+|---|---|
+| 終了 | x3==0xAA、cy=0xba4f50 |
+| record | 10,417,776 (非 trap 10,415,351、trap 2,425)。最終 hash `14df514488a28718` |
+| 割込み | 30 回 (cause 7 が 15 回、cause 5 が 15 回) |
+| pending から受付までの order の差 | 最小 0、中央値 2、p90 20、最大 30 |
+| `gtag` 計数 | FAKE_IFAULT=1、SC_REPLAY=0、FRM_CORETIRE=0、MA_PAGEX=0、AMO_VM=18,925、PRIV_ILL_RD=0、SATP_WIN=4,241 |
+| `SATP_WIN` の窓 (record の範囲) | 76987-76993 (B02 の窓)、2438786、4286867-4286885、10336234-10341956 (約 5.7K record、sfence の無い satp 書き込みの窓で B03 に当たる) |
+
+ファイル: `test/golden/MANIFEST` (上の計数と image の sha256)、`test/golden/boot/linux515_n1.ck.hex` (2^16 record ごとの checkpoint)、`linux515_n1.irq.hex` (schedule)、`linux515_n1.tag.hex` (`gtag` の位置、§3.6)。
+
+- 割込みの受付はすべて最大 30 order 以内に収まった。旧コアに潜むタイムアウトや drain 方針の問題は INSTRET モードでは表に出なかった。
+- console の文字が 2 回ずつ出る (`pprriinnttkk`)。パッチ前の `b0f4668` でも同じなので golden の変更によるものではない (付録 B の B46)。
+- 窓の中のカーネル page fault の数はまだ測っていない (B03 の判定に要る)。
+
 ### 3.6 成果物の扱い
 
 | 成果物 | 置き場所 | コミット |
 |---|---|---|
 | MANIFEST (golden ブランチの commit、veryl の commit、`TRACER_VER`、`retire_pkg` の sha256、K、各テスト image の sha256) | `test/golden/MANIFEST` | する |
-| arch 系の checkpoint (2^10 record ごと + 最終) | `test/golden/arch/<suite>/<test>.ck.hex` | する |
-| ACT4 の最終 `(order, hash)` (image の sha256 つき) | `test/golden/act/<ext>.final` | する (ACT4 の hex は gitignore だが、ツールチェーンは pin されているので再生成で一致する) |
-| boot の checkpoint (2^16 record ごと)、schedule、`gtag` 位置 | `test/golden/boot/linux515_n1.{ck,irq,tag}.hex` | する |
-| golden 上の directed probe の結果 | `test/golden/probe/RESULTS` | する |
+| arch 系の checkpoint (2^10 record ごと + 最終) | `test/golden/arch/<suite>/<test>.ck.hex` | する。未作成 (残作業、M1b の rv64ui trace ゲートより前に要る) |
+| ACT4 の最終 `(order, hash)` (image の sha256 つき) | `test/golden/act/<ext>.final` | する (ACT4 の hex は gitignore だが、ツールチェーンは pin されているので再生成で一致する)。未作成 (残作業、GL-C を始める M2 より前に要る) |
+| boot の checkpoint (2^16 record ごと)、schedule、`gtag` 位置 | `test/golden/boot/linux515_n1.{ck,irq,tag}.hex` | する (`0bc2467` で済み)。`tag.hex` は `AMO_VM` の位置を持たない (VM 下の AMO ごとに 1 つ立つので数が多すぎる)。その計数だけを `MANIFEST` に残す |
+| golden 上の directed probe の結果 | `test/golden/probe/RESULTS` | する。未作成 (残作業、M2 より前に要る、付録 B の probe 列) |
 | 全文 trace (boot で約 1,000 万行) と差分 dump | `.golden/cache/` (zstd) | しない。必要時に再生成する |
 
 - 再生成の契機: パッチの変更、tracer か `retire_pkg` の変更、test image の変更、K の変更 (D1)。`*.ck.hex` の先頭語に `TRACER_VER` を入れ、tracer は読み込み時に照合する。不一致は lockstep の不一致ではなく「golden が古い」として失敗させる。
+- 残作業のまとめ: `run_golden.py`、生成する `golden_runs_*` テスト、arch 系の checkpoint は M1b の rv64ui trace ゲートより前に、ACT4 の最終値と probe は M2 より前に要る。
 - 成果物は `$readmemh` で読む。上限 (`evaluate_size_limit` 8M) に対して、boot の checkpoint は約 200 語、arch は数十語なので十分小さい。
 
 ---
@@ -442,7 +467,7 @@ RVWMO (litmus N=2/4/8)、remote invalidate による reservation の消去、ato
 
 ### 7.4 新規 directed test (自己検査型)
 
-【決定】付録 B で golden の誤りと分かっている振る舞いと、golden lockstep で守れない規則には、`test/directed/` に自己検査型のテストを置く。tohost は、仕様どおりの振る舞いなら 1、golden の誤りと同じ振る舞いなら付録 B の番号を符号化した専用の値 (`0xB000 + 番号`) を書く。golden 上で走らせて誤りを確認する (D4) のと、新コアのゲートに入れるのを同じプログラムで済ませるためである。対象: B03、B04、B05、B07、B10、B12、B19、B21、B22、B24、B26、B28、B30、B35、B36 (付録 B の各行の probe 列)。順序違反の commit 時 REPLAY、walk 中の full kill による epoch 破棄、SC 失敗時の書き込み権限での翻訳、Supm の Sv39/U-mode 版、§8 の IO 系 directed もここに置く。
+【決定】付録 B で golden の誤りと分かっている振る舞いと、golden lockstep で守れない規則には、`test/directed/` に自己検査型のテストを置く。tohost は、仕様どおりの振る舞いなら 1、golden の誤りと同じ振る舞いなら付録 B の番号を符号化した専用の値 (`0xB000 + 番号`) を書く。golden 上で走らせて誤りを確認する (D4) のと、新コアのゲートに入れるのを同じプログラムで済ませるためである。対象: B03、B04、B05、B07、B10、B12、B19、B21、B22、B24、B26、B28、B30、B35、B36、B46 (付録 B の各行の probe 列。B46 は UART THR への書き込み回数を数える)。順序違反の commit 時 REPLAY、walk 中の full kill による epoch 破棄、SC 失敗時の書き込み権限での翻訳、Supm の Sv39/U-mode 版、§8 の IO 系 directed もここに置く。
 
 ---
 
@@ -491,14 +516,14 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 |---|---|---|---|---|---|---|
 | B01 | 割込みは ROB が空になってから受け付ける。受付の order は pending の立ち上がり + 実行中の op 数で、タイミングに依存する | 確定 | 4648-4650 (rename 停止)、7144 (commit_irq)、7316 | y (タイマ割込みのたび) | REPLAY | 不要。§3.5 の run で割込み数と立ち上がりから受付までの差を記録する |
 | B02 | 最初の S-mode Sv39 satp 書き込みで偽の命令 page fault を合成する。csrw は retire 扱いにならず、satp の書き込みは trap に負けて消える。その後は Bare のまま上位 VA を PA の alias で fetch する | 確定 | 7050-7058、7316、7328-7329、7170-7182、csr.veryl:905 対 1047 | y (1 回、PA 0x8000_1040) | NORM (N4)。窓の中の store の `mem_paddr` は MASK:SATP_ENABLE_WIN。窓は、最初の S-mode の satp 書き込み record (`csr_wdata[63:60]==8`) から次の satp 書き込み record までで、両コアの record から同じ規則で判定できる (約 6 record、store は 0 個と推定) | 5.15 trace で `FAKE_IFAULT` がちょうど 1 回であること。S-mode で MODE=8 を書く directed で csrw と合成 trap の 2 record を確認 |
-| B03 | satp_shadow が古い satp を保持する。csrw satp (と satp の読み出し) は旧値を latch し、次の sfence まで MMU は古い root で翻訳する | 確定 (機構)、boot への影響は未決 | 7170-7185、csr.veryl:1088 | 不明 (0x8000_46C2 と 0x8000_475A の csrw satp の後に、(a) 余分なカーネル page fault が出るか、(b) sfence で隠れるか) | (b) なら SAME。(a) なら EXCL:SATP_LAG (§4.7) | 同じ VA を別の PA に写す 2 つのページ表を用意し、sfence なしで satp を切り替えて load。golden の期待値は古い写像の値 |
+| B03 | satp_shadow が古い satp を保持する。csrw satp (と satp の読み出し) は旧値を latch し、次の sfence まで MMU は古い root で翻訳する | 確定 (機構)、boot への影響は未決 | 7170-7185、csr.veryl:1088 | 不明。§3.5 の run で sfence の無い satp 書き込みの窓 (`SATP_WIN`) を 4 つ確認した: 76987-76993 (B02)、2438786、4286867-4286885、10336234-10341956 (約 5.7K record)。窓の中で (a) 余分なカーネル page fault が出るか、(b) 窓が実害なく閉じるかは、窓の中の page fault をまだ数えていないので未決 | (b) なら SAME。(a) なら EXCL:SATP_LAG (§4.7) | 同じ VA を別の PA に写す 2 つのページ表を用意し、sfence なしで satp を切り替えて load。golden の期待値は古い写像の値 |
 | B04 | frm/fcsr への CSR 命令 (読み出しを含む) と同じサイクルに lane 1 の単純 op が retire し、その後の redirect で再実行される | 確定 (コード) | 8451 (commit_redirect に commit_csrw_frm が無い)、7014、7758-7762、8460 | n (5.15 に FP CSR 命令なし)。arch では rv64uf/ud 全テストで y (`csrwi fcsr,0` の直後の auipc) | NORM (N6) で重複 record を落とす。冪等でない op の値の誤りは STOP:FRM_CORETIRE | `csrw frm,t0; addi a0,a0,1` と `frrm t1; addi a0,a0,1`。golden の期待値は a0+2 |
 | B05 | poison された SC が rd=0 で retire した後に再実行され、2 回 retire する。rd==rs1 なら base が壊れる | 確定 | 6402、8402、8451、7729-7737 | 不明 (稀と推定。N=1 では自分の eviction でしか poison されない) | NORM (N1 で 1 回目を落とす)。rd==rs1 は STOP:SC_REPLAY。新コアの SC は REPLAY されない (D8: 結果は PASS/FAIL で 1 回だけ retire する) | LR と SC の間に、予約 line と同じ set を埋める load 列を置いて eviction を誘い、`SC_REPLAY` を数える |
 | B06 | SC の成否がキャッシュのタイミングと投機に依存する (予約 line の eviction、アドレスが一致する wrong-path の store/AMO の issue、satp の読み出し) | 確定 | 8291-8296、8349-8360 | 不明 | STOP:SC_BENIGN (仕様上は合法な失敗なので別分類で表示し、自動では許さない)。新コア (D8) の SC が失敗するのは reservation の喪失 (自 hart の追い出し、remote の inv) か watch の発火だけで、wrong path の store/AMO や satp の読み出しでは失敗しない。N=1 で食い違いうるのは、golden 側の wrong path と satp による失敗と、両コアの追い出しのタイミングの違いである | B05 と同じ prog で rd=1 の SC を数える。【M2 で決定】発火した場合に、SC の結果を tb から与える入力を設計書 §5.13 に足すか、その boot を lockstep から外すか (設計書 §L L.12 の【M2 で決定】と同じ判断) |
 | B07 | page をまたぐ misaligned アクセスを 1 回の翻訳で済ませ、上位側は PA+8 を使う | 確定 | 10677-10682、9352、dcache.veryl:576 | n (推定) | STOP:MA_PAGEX | 次ページを非連続の PA に写し、page をまたぐ ld/sd。golden の期待値は fault なしで隣の PA を読み書き |
 | B08 | 不正な vector 符号化が完了元を持たず ROB head で wedge する | 確定 | 5971、6075、decoder.veryl:1136、rob.veryl:1303 | n | OUT (golden は hang する) | `vmacc.vv v1,v2,v3` (0xB63120D7) を VS on で。golden の期待値はタイムアウト |
 | B09 | arch_regs が rob_commit_valid で書かれ、priv-illegal の rd も入る (sfence と amocas.q のオペランド、x3 の源) | 確定 | 7808、6958-6966 | n (推定) | NORM (adapter は arch_regs を読まない)。sfence のオペランドに影響したら STOP:PRIV_ILL_RD | TVM=1 の S-mode で `csrr a0,satp` を trap させ、handler から戻った直後に `sfence.vma a0` |
-| B10 | VM 下の AMO の書き込みが W/D の page 権限を検査しない | 確定 | 8733-8736、7110-7113、dmem_mmu.veryl:262、mmu.veryl:584-594 | n (推定) | STOP:AMO_VM | Sv39 S-mode で R のみのページと D=0 のページ (ADUE=0) に amoadd。golden の期待値は fault なしで書き込み |
+| B10 | VM 下の AMO の書き込みが W/D の page 権限を検査しない | 確定 | 8733-8736、7110-7113、dmem_mmu.veryl:262、mmu.veryl:584-594 | 不明。現在の `AMO_VM` タグは VM 下のすべての AMO で立ち、§3.5 の run で 18,925 回 (権限を欠くページへの AMO かどうかは区別していない) | STOP:AMO_VM。ただしタグを「W か D を欠くページへの AMO」に絞るまでは STOP に使えない (今のままでは boot が必ず止まる)。絞るのは golden のパッチの変更なので成果物を再生成する | Sv39 S-mode で R のみのページと D=0 のページ (ADUE=0) に amoadd。golden の期待値は fault なしで書き込み |
 | B11 | store/AMO の guest page fault が cause 23 でなく 15 になる | 確定 | 7226-7229 | n (V=1) | OUT (M5、hvlinux は pass/fail) | M5 で: HS からゲストの G-stage 未写像ページへの AMO |
 | B12 | S/U からの MRET、U からの SRET を trap しない | 確定 | 7146-7147 | n | STOP | U-mode で mret。golden の期待値は実行される |
 | B13 | 読み出しだけの CSR 命令も commit で書き戻す (カウンタの巻き戻し、mip の LCOFIP 消去、mstatus の SD の固着、satp/frm の読み出しで flush) | 確定 | 7000、alu_wrap.veryl:384-392、461 | カウンタは n、satp の読み出しは y (asids_init、record には現れない)、SD は n (5.15 は FS off) | NORM (N9 で csr_valid を書き込み意図で絞る)。値の差は MASK:CNT (B15) と STOP:SD | M-mode で `csrr t0,mcycle` を 2 回。FS を Dirty にして `csrr mstatus` の後、FS を Clean にして SD を読む |
@@ -529,8 +554,9 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 | B38 | HPM の event の意味がコアごとに違う | 確定 | 13196-13207 | n | MASK:CNT。hpm_counter と sscofpmf は pass/fail | 不要 |
 | B39 | vector: マスク外と tail へ 0 を書く load、vill を強制しない、vstart を無視して要素 0 から再開、vector の PMP fault を無視、VS=Off の副作用、misaligned 要素の切り捨て、G-stage を live で取る | 推定 | 5249、6540-6547、vector_unit.veryl:1239-1279、1993-1995、2562-2567 | n (5.15 に V なし) | OUT (M5)。VU 内部の挙動は再利用で両コア同じ。glue 由来の差は 7.1v と V directed の pass/fail と GX で見る | M5 で: `amoadd x0` の直後に同じ line への vle (ASQ の順序) |
 | B40 | V=1 の MXR を G-stage にも適用する、二段 walk が cbo を store として扱う | 推定 | mmu.veryl:583-594、716 | n (V=1) | OUT (M5) | M5 で |
-| B41 | IO load が head を待たずに投機発行されうる、遅い store の retire の次サイクルに IO 書き込みを再提示しうる | 推定 | 10705-10714、11940 | 不明 (UART の THR 書き込みはある。重複すれば console の文字が倍になる) | trace には現れない。新コアは §8 の IO モニタで守る。golden ではモニタを走らせない | UART 送信回数の directed を golden で走らせ、THR への store 数と device 書き込み数を比べる |
+| B41 | IO load が head を待たずに投機発行されうる、遅い store の retire の次サイクルに IO 書き込みを再提示しうる | 推定 | 10705-10714、11940 | y (console の文字が倍になることを §3.5 の run で確認、B46) | trace には現れない。新コアは §8 の IO モニタで守る。golden ではモニタを走らせない | UART 送信回数の directed を golden で走らせ、THR への store 数と device 書き込み数を比べる |
 | B42 | boot の SoC は hole で fault しない (`PMA_FAULT=0`)。新コアの `MAP_BOOT` は hole を fault にする | 確定 | 64 (`PMA_FAULT` の既定 0、両 SoC とも上書きしない)、7988、8861 | 不明 (n を期待) | STOP:PMA_HOLE | 不要 (§3.5 の trace で DRAM/ROM/IO 以外への PA を列挙する) |
 | B43 | 再利用する csr.veryl の癖 (satp の MODE が WARL でない、mstatus[63] を格納する、mip の読み値が pin 由来の bit を含まない、misa に F/D/C が無い) | 確定 | csr.veryl:1088、421、570、517 | y (satp の書き込み、misa の読み出しはありうる) | satp の MODE は新コアが csr 修正で WARL にする (設計書 §C.9 #20) ので STOP:SATP_WARL (5.15 は MODE を probe しないので 0 回の見込み)。残りは SAME で、M6 まで misa と firmware から見える CSR の振る舞いは変えない。変える場合はこの行を見直して golden 成果物を再生成する | S-mode で satp に MODE=9 を書いて読み戻す。golden の期待値は 9 が残る |
 | B44 | 時刻の CSR を読む時点 (旧コアは head で issue、新コアは oldest token の `fu_sys`) | 確定 | iq_int.veryl:425-428、csr.veryl:576 | y (rdtime 23 か所) | SAME (§4.1 の議論により両者とも retire 順位だけで決まる) | 不要 |
 | B45 | mhpmevent の OF (bit 63) が既に立っていても、counter の再度の wrap で LCOFI を再び pend する | 確定 | csr.veryl:1226-1239 | n (5.15 は Sscofpmf の overflow を使わない) | STOP:LCOFI (新コアは OF の 0→1 でだけ pend する csr 修正、設計書 §C.9 #21) | OF を立てたまま hpmcounter を再び overflow させ、mip.LCOFIP を読む |
+| B46 | console の文字が 2 回ずつ出る (`pprriinnttkk`)。パッチ前の `b0f4668` でも同じで、B41 の IO store の重複書き込み (M 段の無条件の latch) と見られる | 確定 (現象)、原因は推定 | 11940 (fill_1 の M 段 latch) | y (console の全文字) | 許容差異。新コアは IO store をちょうど 1 回だけ書く (設計書 §5.14) ので、console に出るバイト列は golden と違う。trace には現れない (store の record は両コアとも 1 つ) ので、IO デバイス側の書き込み (console の出力を含む) を trace の比較に入れない。新コアの回数は §8 の IO モニタと、UART THR への書き込み回数を数える自己検査型の directed test (§7.4) で守る | B41 と同じ (THR への store 数とデバイス書き込み数を golden で比べる) |
