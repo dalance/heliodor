@@ -6,8 +6,8 @@
 //   i_rq_ready    : rq.o_ready (registered); the whole group moves or none
 //   o_valid/o_dec : to rq.i_valid/i_data, combinational from the inputs
 //   o_dq_take     : to DQ.i_take: every valid lane when rq is ready, else 0
-//   i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr : live csr outputs,
-//                   read combinationally
+//   i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr, i_frm : live csr
+//                   outputs, read combinationally
 //   o_perf        : registered event wires
 //   o_chk         : sticky invariant flags (HELIODOR_CHK builds only, else 0)
 //   Kill is applied by the two queues (both flush on kill.valid); decode
@@ -23,15 +23,19 @@
 // Legality (function `illegal`): an instruction is illegal when
 //   - the reused decoder flags it, or it is a vector instruction
 //   - it is not served by this core build, because no unit for it exists:
-//     F and D (compute, loads, stores and the fflags/frm/fcsr CSRs), the A
-//     extension (LR/SC, AMOs), CBO, the H extension (HLV/HLVX/HSV,
+//     the A extension (LR/SC, AMOs), CBO, the H extension (HLV/HLVX/HSV,
 //     HFENCE/HINVAL and the hypervisor and VS CSRs) and the V CSRs
+//   - it is a load or store of a reserved width (LOAD funct3 111, STORE
+//     funct3 1xx, a 16-byte FP access: no Q), or an FP op that rounds with a
+//     reserved rm (101, 110) or with rm DYN while frm holds a reserved value
+//     (101-111)
 //   - a CSR access names a CSR that does not exist, needs more privilege, or
 //     writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM
 //   - a counter (cycle, time, instret, hpmcounterN) below M whose mcounteren
 //     bit is clear, or in U whose scounteren bit is clear; stimecmp in
 //     HS-mode without mcounteren.TM and menvcfg.STCE
-//   - an F or D instruction or fflags/frm/fcsr with mstatus.FS = Off
+//   - an F, D, Zfa or Zfhmin instruction (compute, load, store) or
+//     fflags/frm/fcsr with mstatus.FS = Off
 //   - a CBO below M that menvcfg disables (CBIE = 0 for inval, CBCFE for
 //     clean and flush, CBZE for zero), or in U that senvcfg disables
 //   - MRET below M, SRET in U or in HS-mode with mstatus.TSR, SFENCE.VMA or
@@ -44,6 +48,8 @@
 //     state a surviving op saw equals its state at commit
 //   - a fetch fault outranks every decode-time exception, so the fetch
 //     record is taken as is and the decoder output is discarded
+//   - frm is committed state like the rest (a write to it retires with a
+//     flush), so the DYN rounding check reads it live as well
 //   - a legal WFI is a no-op (fu NONE): it completes at once, which the
 //     privileged spec allows; the WFI that traps follows the reference model
 //   - WRS.NTO and WRS.STO are no-ops (fu NONE) and never trap: Zawrs allows
@@ -62,6 +68,7 @@ module decode::<CFG: core_cfg> (
     i_mstatus_tsr: input  logic                                                                      ,
     i_mstatus_tvm: input  logic                                                                      ,
     i_csr        : input  csr_pkg::DecCsr                                                            ,
+    i_frm        : input  logic                     <3>                                              ,
     o_perf       : output core_types::<CFG>::DecPerf                                                 ,
     o_chk        : output logic                                                                      ,
 ) {
@@ -155,6 +162,48 @@ module decode::<CFG: core_cfg> (
         );
     }
 
+    // FP ops reading an integer rs1 (moves and conversions from int).
+    function fp_int_src (
+        op: input fpu_pkg::FpuOp,
+    ) -> logic {
+        case op {
+            fpu_pkg::FpuOp::FMV_W_X, fpu_pkg::FpuOp::FMV_D_X, fpu_pkg::FpuOp::FMV_H_X, fpu_pkg::FpuOp::FCVT_S_W,
+            fpu_pkg::FpuOp::FCVT_S_WU, fpu_pkg::FpuOp::FCVT_S_L, fpu_pkg::FpuOp::FCVT_S_LU, fpu_pkg::FpuOp::FCVT_D_W,
+            fpu_pkg::FpuOp::FCVT_D_WU, fpu_pkg::FpuOp::FCVT_D_L, fpu_pkg::FpuOp::FCVT_D_LU: return 1'b1;
+            default: return 1'b0;
+        }
+    }
+
+    // FP ops with an FP rs2 (the rs2 field of the others is a sub-opcode).
+    function fp_rs2 (
+        op: input fpu_pkg::FpuOp,
+    ) -> logic {
+        case op {
+            fpu_pkg::FpuOp::FADD_S, fpu_pkg::FpuOp::FADD_D, fpu_pkg::FpuOp::FSUB_S, fpu_pkg::FpuOp::FSUB_D,
+            fpu_pkg::FpuOp::FMUL_S, fpu_pkg::FpuOp::FMUL_D, fpu_pkg::FpuOp::FDIV_S, fpu_pkg::FpuOp::FDIV_D,
+            fpu_pkg::FpuOp::FSGNJ_S, fpu_pkg::FpuOp::FSGNJN_S, fpu_pkg::FpuOp::FSGNJX_S, fpu_pkg::FpuOp::FSGNJ_D,
+            fpu_pkg::FpuOp::FSGNJN_D, fpu_pkg::FpuOp::FSGNJX_D, fpu_pkg::FpuOp::FMIN_S, fpu_pkg::FpuOp::FMAX_S,
+            fpu_pkg::FpuOp::FMIN_D, fpu_pkg::FpuOp::FMAX_D, fpu_pkg::FpuOp::FEQ_S, fpu_pkg::FpuOp::FLT_S,
+            fpu_pkg::FpuOp::FLE_S, fpu_pkg::FpuOp::FEQ_D, fpu_pkg::FpuOp::FLT_D, fpu_pkg::FpuOp::FLE_D,
+            fpu_pkg::FpuOp::FMADD_S, fpu_pkg::FpuOp::FMSUB_S, fpu_pkg::FpuOp::FNMADD_S, fpu_pkg::FpuOp::FNMSUB_S,
+            fpu_pkg::FpuOp::FMADD_D, fpu_pkg::FpuOp::FMSUB_D, fpu_pkg::FpuOp::FNMADD_D, fpu_pkg::FpuOp::FNMSUB_D,
+            fpu_pkg::FpuOp::FMINM_S, fpu_pkg::FpuOp::FMAXM_S, fpu_pkg::FpuOp::FMINM_D, fpu_pkg::FpuOp::FMAXM_D,
+            fpu_pkg::FpuOp::FLEQ_S, fpu_pkg::FpuOp::FLTQ_S, fpu_pkg::FpuOp::FLEQ_D, fpu_pkg::FpuOp::FLTQ_D: return 1'b1;
+            default: return 1'b0;
+        }
+    }
+
+    function fp_rs3 (
+        op: input fpu_pkg::FpuOp,
+    ) -> logic {
+        case op {
+            fpu_pkg::FpuOp::FMADD_S, fpu_pkg::FpuOp::FMSUB_S, fpu_pkg::FpuOp::FNMADD_S, fpu_pkg::FpuOp::FNMSUB_S,
+            fpu_pkg::FpuOp::FMADD_D, fpu_pkg::FpuOp::FMSUB_D, fpu_pkg::FpuOp::FNMADD_D,
+            fpu_pkg::FpuOp::FNMSUB_D: return 1'b1;
+            default: return 1'b0;
+        }
+    }
+
     function bru_op (
         jal  : input logic   ,
         jalr : input logic   ,
@@ -193,13 +242,12 @@ module decode::<CFG: core_cfg> (
         }
     }
 
-    // CSRs of extensions this build does not serve: fflags/frm/fcsr, the V
-    // CSRs, and the hypervisor and VS CSRs (address bits [9:8] = 2'b10).
+    // CSRs of extensions this build does not serve: the V CSRs, and the
+    // hypervisor and VS CSRs (address bits [9:8] = 2'b10).
     function csr_unserved (
         a: input logic<12>,
     ) -> logic {
-        return (a >= 12'h001 && a <= 12'h003) || (a >= 12'h008 && a <= 12'h00a) || a == 12'h00f || (a >= 12'hc20
-            && a <= 12'hc22) || a[9:8] == 2'b10;
+        return (a >= 12'h008 && a <= 12'h00a) || a == 12'h00f || (a >= 12'hc20 && a <= 12'hc22) || a[9:8] == 2'b10;
     }
 
     // The envcfg field that enables a CBO kind.
@@ -220,6 +268,7 @@ module decode::<CFG: core_cfg> (
         dill  : input logic                 ,
         vec   : input logic                 ,
         fp    : input logic                 , // any F or D instruction
+        enc   : input logic                 , // reserved width or rm (see the header)
         amo   : input logic                 ,
         cbo   : input logic                 ,
         hlv   : input logic                 , // HLV, HLVX or HSV
@@ -255,13 +304,13 @@ module decode::<CFG: core_cfg> (
         let fs_ill: logic = cs.fs == 2'b00 && (fp || (csr && f12 >= 12'h001 && f12 <= 12'h003));
         let cbo_k : logic<5> = insn[24:20]; // 0 inval, 1 clean, 2 flush, 4 zero
         let cbo_ill: logic   = cbo && ((below && !cbo_on(cs.menvcfg, cbo_k)) || (umode && !cbo_on(cs.senvcfg, cbo_k)));
-        let unsrv : logic     = fp || amo || cbo || hlv || hfen || (csr && csr_unserved(f12));
+        let unsrv : logic     = amo || cbo || hlv || hfen || (csr && csr_unserved(f12));
         let csr_ill: logic    = csr && (!csr_pkg::csr_exists(f12) || rp >: priv || (f12[11:10] == 2'b11 && csr_wr) || (hs
             && tvm && f12 == 12'h180));
         let sys_ill: logic = (mret && priv != csr_pkg::PrivLevel::MACHINE) || (sret && (priv == csr_pkg::PrivLevel::USER
             || (hs && tsr))) || (sfence && !hfen && hs && tvm) || ((sfence || sinval) && umode) || (wfi && (umode || (hs
             && cs.tw))) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret || wfi || sfence || sinval || wrs));
-        return dill || vec || unsrv || csr_ill || ctr_ill || fs_ill || cbo_ill || sys_ill;
+        return dill || vec || enc || unsrv || csr_ill || ctr_ill || fs_ill || cbo_ill || sys_ill;
     }
 
     var lane_ill: logic [W];
@@ -275,10 +324,16 @@ module decode::<CFG: core_cfg> (
             let csr_wr: logic     = csr_op[l] == csr_pkg::CsrOp::RW || insn[19:15] != 0;
             let sret  : logic     = is_mret[l] && f12 == 12'h102;
             let fpc   : logic     = is_fp[l] && !mem_ren[l] && !mem_wen[l];
+            let fpcsr : logic     = is_csr[l] && f12 >= 12'h001 && f12 <= 12'h003;
+            let rm_ill: logic     = fpc && fp_rounds(fpu_op[l])
+                && (f3 == 3'b101 || f3 == 3'b110 || (f3 == 3'b111 && i_frm >= 3'b101));
+            let opc   : logic<7>  = insn[6:0];
+            let w_rsv : logic     = (opc == riscv_pkg::Opcode::LOAD && f3 == 3'b111) || (opc == riscv_pkg::Opcode::STORE
+                && f3[2]) || (is_fp[l] && !fpc && f3 == 3'b100);
 
-            let ill: logic = illegal(insn, dec_ill[l], is_vec[l], is_fp[l], is_amo[l], is_cbo_z[l] || is_cbo_m[l], hlv[l]
-                || hlvx[l], is_csr[l], csr_wr, is_sfence[l], is_sinval[l], is_ecall[l], is_ebreak[l], is_mret[l],
-                is_wfi[l], i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr);
+            let ill: logic = illegal(insn, dec_ill[l], is_vec[l], is_fp[l], w_rsv || rm_ill, is_amo[l], is_cbo_z[l]
+                || is_cbo_m[l], hlv[l] || hlvx[l], is_csr[l], csr_wr, is_sfence[l], is_sinval[l], is_ecall[l], is_ebreak[l],
+                is_mret[l], is_wfi[l], i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr);
 
             var exc: exc_pkg::ExcRec;
             exc = 0 as exc_pkg::ExcRec;
@@ -317,6 +372,7 @@ module decode::<CFG: core_cfg> (
             di.amo_aq     = insn[26];
             di.is_csr     = is_csr[l];
             di.csr_wr     = csr_wr;
+            di.csr_fp     = fpcsr;
             di.is_xret    = is_mret[l];
             di.is_sfence  = is_sfence[l];
             di.is_sinval  = is_sinval[l];
@@ -366,9 +422,22 @@ module decode::<CFG: core_cfg> (
                     d.imm      = if is_csr[l] ? {15'd0, insn[19:15], f12} : {30'd0, insn[24:20] == 0, insn[19:15] == 0};
                 }
                 FuKind::LOAD, FuKind::STORE: {
-                    d.uop      = f3 as UOP_W;
+                    d.uop      = {is_fp[l], f3} as UOP_W;
                     d.rs1.used = 1'b1;
                     d.rs2.used = c.fu == FuKind::STORE;
+                    d.rs2.rcls = if is_fp[l] ? RegClass::FP : RegClass::INT;
+                }
+                FuKind::FMA, FuKind::FMISC, FuKind::FDIV: {
+                    let fli: logic = fpu_op[l] == fpu_pkg::FpuOp::FLI_S || fpu_op[l] == fpu_pkg::FpuOp::FLI_D;
+                    d.uop      = fpu_op[l] as UOP_W;
+                    d.rm       = f3;
+                    d.imm      = {27'd0, insn[19:15]}; // FLI: the constant index
+                    d.rs1.used = !fli;
+                    d.rs1.rcls = if fp_int_src(fpu_op[l]) ? RegClass::INT : RegClass::FP;
+                    d.rs2.used = fp_rs2(fpu_op[l]);
+                    d.rs2.rcls = RegClass::FP;
+                    d.rs3.used = fp_rs3(fpu_op[l]);
+                    d.rs3.rcls = RegClass::FP;
                 }
                 default: {}
             }
