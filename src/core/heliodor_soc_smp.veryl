@@ -29,6 +29,9 @@ pub module heliodor_soc_smp #(
     // MTIME_DIV >= its retire lanes, so a cycle makes at most one tick.
     param MTIME_SRC  : u32                            = soc_pkg::MTIME_CYCLE ,
     param MTIME_DIV  : u32                            = 10                   ,
+    // Test aid: a read of UART + 0x100 (bits [11:8] == 1) returns the number
+    // of device-side UART writes so far instead of a UART register.
+    param UART_WRCNT : bit                            = 1'b0                 ,
     param PMA_N      : u32                            = 1                    ,
     param PMA_REGIONS: pma_pkg::PmaRegion     [PMA_N] = '{
         default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
@@ -143,6 +146,11 @@ pub module heliodor_soc_smp #(
     i_dbg_retire_limit   : input logic<N_HARTS, 64> = 0,
     i_dbg_irq_mask       : input logic<N_HARTS>     = 0,
     i_dbg_irq_allow      : input logic<N_HARTS>     = 0,
+    // External interrupt sources, ORed into the PLIC sources (bit 10 is the
+    // UART's).
+    i_ext_irq_src: input logic<32> = 0,
+    // Device-side CLINT/PLIC/UART accesses of this cycle: [0] read, [1] write.
+    o_io_obs: output soc_pkg::IoObs [2],
 ) {
     // Per-hart core <-> SoC dmem wires (pre-decode, flat DRAM+MMIO).
     var c_dmem_addr    : logic<64> [N_HARTS]    ;
@@ -718,13 +726,18 @@ pub module heliodor_soc_smp #(
         i_tick     : mt_tick             ,
     );
 
+    // A new core places a UART byte in its byte lane of the dword; the old
+    // core uses byte 0 whatever the offset.
+    const UART_LANE : bit       = CORE != soc_pkg::CoreSel::V14;
+    let uart_wlane: logic<64> = bus_dram_wdata[bus_dramw_addr[5:3]];
+    let uart_wbyte: logic<64> = if UART_LANE ? uart_wlane >> {bus_dramw_addr[2:0], 3'd0} : uart_wlane;
     var uart_rdata: logic<8>;
     var uart_irq  : logic   ;
     inst u_uart: uart (
         clk                             ,
         rst                             ,
         i_addr    : if uart_wen_w ? bus_dramw_addr[2:0] : bus_dramr_addr[2:0],
-        i_wdata   : bus_dram_wdata[bus_dramw_addr[5:3]][7:0] ,
+        i_wdata   : uart_wbyte[7:0]     ,
         i_wen     : uart_wen_w          ,
         i_ren     : uart_ren_w          ,
         o_rdata   : uart_rdata          ,
@@ -743,7 +756,7 @@ pub module heliodor_soc_smp #(
     var plic_rdata: logic<64>          ;
     var plic_irq_m: logic     [N_HARTS];
     var plic_irq_s: logic     [N_HARTS];
-    let plic_src  : logic<32> = {21'd0, uart_irq, 10'd0}; // bit 10 = UART
+    let plic_src  : logic<32> = {21'd0, uart_irq, 10'd0} | i_ext_irq_src; // bit 10 = UART
     inst u_plic: plic #(
         N_HARTS: N_HARTS,
     ) (
@@ -759,6 +772,49 @@ pub module heliodor_soc_smp #(
         o_irq_s: plic_irq_s       ,
     );
 
+    var uart_wr_n: logic<32>;
+    always_ff {
+        if_reset {
+            uart_wr_n = 32'd0;
+        } else if UART_WRCNT && uart_wen_w {
+            uart_wr_n = uart_wr_n + 32'd1;
+        }
+    }
+
+    // Device-side access observation. The enables are hart-exclusive (only
+    // the granted hart's are set), so the AND-OR over harts selects it; the
+    // strobes come from the hart because the bus zeroes them outside DRAM.
+    let io_ren  : logic     = clint_ren_w || uart_ren_w || plic_ren_w;
+    let io_wen  : logic     = clint_wen_w || uart_wen_w || plic_wen_w;
+    let io_rdat : logic<64> = if clint_ren_w ?
+        clint_rdata
+    : if plic_ren_w ?
+        plic_rdata
+    :
+        {56'd0, uart_rdata} << {bus_dramr_addr[2:0], 3'd0}
+    ;
+    var io_rhart: logic<3> ;
+    var io_whart: logic<3> ;
+    var io_wstrb: logic<8> ;
+    always_comb {
+        io_rhart = 3'd0;
+        io_whart = 3'd0;
+        io_wstrb = 8'd0;
+        for h in 0..N_HARTS {
+            if c_dmem_ren[h] && (in_clint[h] || in_uart[h] || in_plic[h]) {
+                io_rhart = io_rhart | (h as 3);
+            }
+            if c_dmem_wen[h] && (in_clint_w[h] || in_uart_w[h] || in_plic_w[h]) {
+                io_whart = io_whart | (h as 3);
+                io_wstrb = io_wstrb | c_dmem_wstrb[h * 8 + c_dmemw_addr[h][5:3]];
+            }
+        }
+    }
+    assign o_io_obs[0] = soc_pkg::IoObs'{valid: io_ren, write: 1'b0, hart: io_rhart, addr: bus_dramr_addr, data: io_rdat,
+        strb: 8'd0};
+    assign o_io_obs[1] = soc_pkg::IoObs'{valid: io_wen, write: 1'b1, hart: io_whart, addr: bus_dramw_addr,
+        data: bus_dram_wdata[bus_dramw_addr[5:3]], strb: io_wstrb};
+
     // Per-hart load data: CLINT / UART / PLIC / DRAM (mem_ctrl per-hart stream
     // beat) / firmware-ROM (external comb port, legacy path — only the
     // granted hart's dcache advances on it).
@@ -766,6 +822,10 @@ pub module heliodor_soc_smp #(
     for h in 0..N_HARTS :gen_rdata {
         assign core_dmem_rdata[h] = if in_clint[h] ?
             clint_rdata
+        : if in_uart[h] && UART_WRCNT && c_dmem_addr[h][11:8] == 4'h1 ?
+            {32'd0, uart_wr_n}
+        : if in_uart[h] && UART_LANE ?
+            {56'd0, uart_rdata} << {c_dmem_addr[h][2:0], 3'd0}
         : if in_uart[h] ?
             {56'd0, uart_rdata}
         : if in_plic[h] ?
