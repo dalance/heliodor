@@ -1,29 +1,41 @@
-// Phase 7 v4: minimal CSR file (M-mode only, M4).
+// csr: the CSR file of the new core, reused from the old core and frozen
+// there as v14_csr; the behaviour fixes below apply to this copy only.
 //
-// Implements the subset of M-mode CSRs sufficient for rv64ui-* startup:
-//   mhartid (RO, 0)
-//   mtvec, mstatus, mscratch, mepc, mcause, mtval, mie, mip
-//   mcycle, minstret (counters, free-running)
-//   misa (RO, return 0)
-//   medeleg, mideleg (RW, accept writes — Phase 5+ wires them to
-//                     trap_delegate logic; M4 keeps them as plain RW)
-//   pmpcfg0, pmpaddr0 (RW, accept writes — no enforcement)
-//   satp (RW, no MMU enforcement until M5)
-//
-// All other addresses return 0 on read and silently drop writes (so
-// rv64ui startup does not trap on unknown CSR ops). M5+ MMU wires
-// satp into the page-walker; for M4 it is just a register.
-//
-// Read port is combinational; write port is registered (commit-time).
-// Trap entry / MRET updates also go through the registered write
-// path; the caller (heliodor_core commit stage) drives i_trap_fire
-// + i_mret_fire pulses.
+// Ports (timing contract):
+//   i_rd_addr/o_rd_data : combinational read of the live state
+//   i_wr_*, i_trap_*, i_mret_fire, i_sret_fire, i_fflags*, i_fs_dirty,
+//   i_instret_cnt       : retire-time inputs, applied on the edge; at most one
+//                         of {trap, xRET, CSR write} per cycle (commit's alone
+//                         and trap rules)
+//   i_hart_id           : static, read as mhartid
+//   i_hpm_events        : registered here before counting
+//   all other outputs   : registered state or combinational views of it
+// Fixes over v14_csr (each is spec behaviour the old core lacked):
+//   - mhartid from i_hart_id; misa is the MISA parameter (what the build
+//     serves)
+//   - an xRET to a mode below M clears mstatus.MPRV
+//   - mstatus.SD is computed on read and never stored; MPP = 2'b10 writes U;
+//     MPV and GVA are read-only zero without the H extension (H_EN = 0).
+//     mideleg keeps its read-only-one VS bits, as the old core reads them
+//   - mepc/sepc bit 0 reads zero; mtvec/stvec writes with a reserved mode
+//     are ignored; satp writes with a MODE other than Bare or Sv39 are ignored
+//   - mideleg, mip and sip write only their writable interrupt bits; sie and
+//     sip show only the interrupts delegated to S
+//   - mcounteren/scounteren are 32 bits; menvcfg/senvcfg keep only the
+//     implemented fields (a reserved CBIE or PMM value leaves the field
+//     unchanged)
+//   - a counter overflow pends LCOFI only when it sets OF (0 to 1)
+//   - i_fs_dirty marks mstatus.FS dirty (FP ops that do not accrue fflags)
+//   - o_data_priv is the privilege of loads and stores (MPP under MPRV)
 pub module csr #(
-    param HART_ID      : u8  = 0,
-    param INSTRET_CNT_W: u32 = 1, // ops retired per cycle, up to 2^W - 1
+    param INSTRET_CNT_W: u32       = 1                       , // ops retired per cycle, up to 2^W - 1
+    param MISA         : bit  <64> = 64'h8000_0000_0034_1181 ,
+    param H_EN         : bit       = 1'b0                    ,
 ) (
     clk: input clock,
     rst: input reset,
+
+    i_hart_id: input logic<8>,
 
     // Combinational read (issue-time CSR value sample)
     i_rd_addr: input  logic<12>,
@@ -199,6 +211,17 @@ pub module csr #(
     i_vstart_wr : input logic    ,
     i_vstart_val: input logic<64>,
     o_vstart    : output logic<64>,
+
+    // FP op that writes FP state without accruing fflags: mstatus.FS = Dirty.
+    i_fs_dirty: input logic,
+
+    // Legality state read by decode, and the privilege of loads and stores.
+    o_mstatus_tw : output logic             ,
+    o_mcounteren : output logic             <32>,
+    o_scounteren : output logic             <32>,
+    o_menvcfg    : output logic             <64>,
+    o_senvcfg    : output logic             <64>,
+    o_data_priv  : output csr_pkg::PrivLevel    ,
 
     // P10 Zihpm: per-cycle event bus. Each mhpmcounter selects one of these via
     // its mhpmevent[3:0] (1..8 → bit 0..7; 0 = counter frozen). Event meaning:
@@ -432,6 +455,53 @@ pub module csr #(
     // VS XLEN is 64). Same field position as SSTATUS_XL_RO.
     const HSTATUS_VSXL_RO: logic<64> = 64'h0000_0002_0000_0000;
 
+    // Writable bits. mstatus.SD is never stored; MPV (39) and GVA (38) exist
+    // only with H. mideleg/mip: SSIP, STIP, SEIP and LCOFIP; sip: SSIP and
+    // LCOFIP. menvcfg: FIOM, CBIE, CBCFE, CBZE, ADUE, PBMTE, STCE; senvcfg:
+    // FIOM, CBIE, CBCFE, CBZE.
+    const MSTATUS_WMASK: logic<64> = if H_EN ? 64'h7fff_ffff_ffff_ffff : 64'h7fff_ff3f_ffff_ffff;
+    const MIP_WMASK    : logic<64> = 64'h0000_0000_0000_2222;
+    const SIP_WMASK    : logic<64> = 64'h0000_0000_0000_2002;
+    const MENVCFG_WMASK: logic<64> = 64'he000_0003_0000_00f1;
+    const SENVCFG_WMASK: logic<64> = 64'h0000_0003_0000_00f1;
+
+    // WARL legalization of a mstatus (or sstatus-merged) write value.
+    function legal_mstatus (
+        v: input logic<64>,
+    ) -> logic<64> {
+        var r: logic<64>;
+        r = v & MSTATUS_WMASK;
+        if r[12:11] == 2'b10 {
+            r[12:11] = 2'b00;
+        }
+        return r;
+    }
+
+    // envcfg write: the writable fields, keeping CBIE on its reserved value.
+    function legal_envcfg (
+        old : input logic<64>,
+        v   : input logic<64>,
+        mask: input logic<64>,
+    ) -> logic<64> {
+        var r: logic<64>;
+        r = v & mask;
+        if v[5:4] == 2'b10 {
+            r[5:4] = old[5:4];
+        }
+        if v[33:32] == 2'b01 {
+            r[33:32] = old[33:32];
+        }
+        return r;
+    }
+
+    // Trap-vector write: a reserved mode (2, 3) leaves the register unchanged.
+    function legal_tvec (
+        old: input logic<64>,
+        v  : input logic<64>,
+    ) -> logic<64> {
+        return if v[1] ? old : v;
+    }
+
     // mstatus/sstatus.SD (bit 63): a read-only summary bit, set iff any of
     // FS(14:13) / VS(10:9) / XS(16:15) is Dirty (== 2'b11). heliodor has no
     // user-mode extension state (XS is always 0), so SD tracks FS and VS. It is
@@ -507,25 +577,19 @@ pub module csr #(
             ADDR_VL        : rd_data_w = vl;
             ADDR_VTYPE     : rd_data_w = vtype;
             ADDR_VLENB     : rd_data_w = VLENB_CONST;
-            ADDR_MHARTID   : rd_data_w = {56'd0, HART_ID};
+            ADDR_MHARTID   : rd_data_w = {56'd0, i_hart_id};
             ADDR_MSTATUS   : rd_data_w = mstatus | MSTATUS_XL_RO | {mstatus_sd, 63'd0};
-            // RV64 MXL=2 in [63:62]; extensions: A=bit 0, H=bit 7, I=bit 8,
-            // M=bit 12, S=bit 18, U=bit 20, V=bit 21. Phase 11-H B advertised the
-            // hypervisor extension (H, bit 7); Phase 12 V6 advertises the vector
-            // extension (V, bit 21) now that the RVV stack is complete. (F/D/C are
-            // detected from the device tree, as the original IMA value reflects;
-            // Linux likewise detects V from riscv,isa, not misa.)
-            ADDR_MISA      : rd_data_w = 64'h8000_0000_0034_1181;
+            ADDR_MISA      : rd_data_w = MISA;
             // S-mode CSRs: sstatus/sie/sip are masked views; others standalone.
             ADDR_SSTATUS   : rd_data_w = (mstatus & SSTATUS_MASK) | SSTATUS_XL_RO | {mstatus_sd, 63'd0};
-            ADDR_SIE       : rd_data_w = mie & SI_MASK;
+            ADDR_SIE       : rd_data_w = mie & SI_MASK & mideleg;
             ADDR_STVEC     : rd_data_w = stvec;
             ADDR_SCOUNTEREN: rd_data_w = scounteren;
             ADDR_SSCRATCH  : rd_data_w = sscratch;
             ADDR_SEPC      : rd_data_w = sepc;
             ADDR_SCAUSE    : rd_data_w = scause;
             ADDR_STVAL     : rd_data_w = stval;
-            ADDR_SIP       : rd_data_w = mip_read & SI_MASK;
+            ADDR_SIP       : rd_data_w = mip_read & SI_MASK & mideleg;
             ADDR_SCOUNTOVF : rd_data_w = scountovf_val; // P10 Sscofpmf (read-only)
             ADDR_STIMECMP  : rd_data_w = stimecmp;
             ADDR_MENVCFG   : rd_data_w = menvcfg;
@@ -754,6 +818,24 @@ pub module csr #(
             }
         }
     }
+    // The event bus is registered before counting: it carries no timing
+    // contract, and the counters stay off the paths of the event sources.
+    var hpm_ev_q: logic<8>;
+    always_ff (clk, rst) {
+        if_reset {
+            hpm_ev_q = 8'd0;
+        } else {
+            hpm_ev_q = i_hpm_events;
+        }
+    }
+
+    assign o_mstatus_tw = mstatus[21];
+    assign o_mcounteren = mcounteren[31:0];
+    assign o_scounteren = scounteren[31:0];
+    assign o_menvcfg    = menvcfg;
+    assign o_senvcfg    = senvcfg;
+    assign o_data_priv  = if mstatus[17] ? mstatus[12:11] as csr_pkg::PrivLevel : priv;
+
     assign o_pmpcfg       = pmpcfg;
     assign o_pmpaddr      = pmpaddr;
 
@@ -996,6 +1078,9 @@ pub module csr #(
                 // into a guest (MPP=S/U, MPV=1) this correctly sets V=1.
                 virt        = if (mstatus[12] == 1'b1 && mstatus[11] == 1'b1) ? 1'b0 : mstatus[39];
                 mstatus[39] = 1'b0;
+                if !(mstatus[12] == 1'b1 && mstatus[11] == 1'b1) {
+                    mstatus[17] = 1'b0; // MPRV
+                }
                 // MPP ← U (00)
                 mstatus[12] = 1'b0;
                 mstatus[11] = 1'b0;
@@ -1010,10 +1095,11 @@ pub module csr #(
                 vsstatus[8] = 1'b0;
             } else if i_sret_fire {
                 // sstatus: SIE ← SPIE, SPIE ← 1; priv ← SPP (1=S, 0=U); SPP ← U
-                mstatus[1] = mstatus[5];
-                mstatus[5] = 1'b1;
-                priv       = if mstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
-                mstatus[8] = 1'b0;
+                mstatus[1]  = mstatus[5];
+                mstatus[5]  = 1'b1;
+                priv        = if mstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
+                mstatus[8]  = 1'b0;
+                mstatus[17] = 1'b0; // MPRV
                 // Phase 11-H: an HS-mode SRET restores V ← hstatus.SPV, then
                 // clears SPV. When SPV=1 this enters a guest (priv = SPP gives
                 // VS/VU under the SUPERVISOR/USER encoding). Inert at V=0 (SPV=0
@@ -1058,22 +1144,22 @@ pub module csr #(
                         vxsat = {63'd0, i_wr_data[0]};
                         vxrm  = {62'd0, i_wr_data[2:1]};
                     }
-                    ADDR_MSTATUS   : mstatus  = i_wr_data;
+                    ADDR_MSTATUS   : mstatus  = legal_mstatus(i_wr_data);
                     // medeleg is fully writable (all standard exceptions, incl. the
                     // access-fault causes 1/5/7, are delegatable to S-mode — matches
                     // the Sail reference and the ACT4 PMP suites, which delegate
                     // access faults to the S-mode trap handler).
                     ADDR_MEDELEG   : medeleg  = i_wr_data;
-                    ADDR_MIDELEG   : mideleg  = i_wr_data | MIDELEG_RO1; // bits 2/6/10 RO-1
+                    ADDR_MIDELEG   : mideleg  = (i_wr_data & MIP_WMASK) | MIDELEG_RO1; // bits 2/6/10 RO-1
                     ADDR_MIE       : mie      = i_wr_data;
-                    ADDR_MTVEC     : mtvec    = i_wr_data;
+                    ADDR_MTVEC     : mtvec    = legal_tvec(mtvec, i_wr_data);
                     ADDR_MSCRATCH  : mscratch = i_wr_data;
-                    ADDR_MEPC      : mepc     = i_wr_data;
+                    ADDR_MEPC      : mepc     = {i_wr_data[63:1], 1'b0};
                     ADDR_MCAUSE    : mcause   = i_wr_data;
                     ADDR_MTVAL     : mtval    = i_wr_data;
                     ADDR_MTINST    : mtinst   = i_wr_data;
                     ADDR_MTVAL2    : mtval2   = i_wr_data;
-                    ADDR_MIP       : mip      = i_wr_data;
+                    ADDR_MIP       : mip      = i_wr_data & MIP_WMASK;
                     // PMP cfg: per-byte WARL — a locked byte (L=1) is read-only;
                     // reserved bits [6:5] are cleared on write.
                     ADDR_PMPCFG0   : for b in 0..8 {
@@ -1086,25 +1172,29 @@ pub module csr #(
                             pmpcfg[1][b * 8+:8] = i_wr_data[b * 8+:8] & PMPCFG_BYTE_MASK;
                         }
                     }
-                    ADDR_SATP      : satp     = i_wr_data;
+                    ADDR_SATP      : {
+                        if i_wr_data[63:60] == csr_pkg::SATP_MODE_BARE || i_wr_data[63:60] == csr_pkg::SATP_MODE_SV39 {
+                            satp = i_wr_data;
+                        }
+                    }
                     ADDR_MCYCLE    : mcycle   = i_wr_data;
                     ADDR_MINSTRET  : minstret = i_wr_data;
                     // S-mode CSRs (M5.D). sstatus/sie/sip write through to
                     // mstatus/mie/mip masked by visible bits.
-                    ADDR_SSTATUS   : mstatus    = (mstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK);
-                    ADDR_SIE       : mie        = (mie & ~SI_MASK) | (i_wr_data & SI_MASK);
-                    ADDR_SIP       : mip        = (mip & ~SI_MASK) | (i_wr_data & SI_MASK);
-                    ADDR_STVEC     : stvec      = i_wr_data;
-                    ADDR_SCOUNTEREN: scounteren = i_wr_data;
+                    ADDR_SSTATUS   : mstatus    = legal_mstatus((mstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK));
+                    ADDR_SIE       : mie        = (mie & ~(SI_MASK & mideleg)) | (i_wr_data & SI_MASK & mideleg);
+                    ADDR_SIP       : mip        = (mip & ~(SIP_WMASK & mideleg)) | (i_wr_data & SIP_WMASK & mideleg);
+                    ADDR_STVEC     : stvec      = legal_tvec(stvec, i_wr_data);
+                    ADDR_SCOUNTEREN: scounteren = {32'd0, i_wr_data[31:0]};
                     ADDR_SSCRATCH  : sscratch   = i_wr_data;
-                    ADDR_SEPC      : sepc       = i_wr_data;
+                    ADDR_SEPC      : sepc       = {i_wr_data[63:1], 1'b0};
                     ADDR_SCAUSE    : scause     = i_wr_data;
                     ADDR_STVAL     : stval      = i_wr_data;
                     // P10 Sstc. stimecmp is RW from M-mode and (when STCE=1)
                     // from S-mode; menvcfg.STCE enables the hardware STIP path.
                     ADDR_STIMECMP  : stimecmp   = i_wr_data;
-                    ADDR_MENVCFG   : menvcfg    = i_wr_data;
-                    ADDR_SENVCFG   : senvcfg    = i_wr_data; // P10 Supm/Ssnpm
+                    ADDR_MENVCFG   : menvcfg    = legal_envcfg(menvcfg, i_wr_data, MENVCFG_WMASK);
+                    ADDR_SENVCFG   : senvcfg    = legal_envcfg(senvcfg, i_wr_data, SENVCFG_WMASK);
                     ADDR_MSECCFG   : mseccfg    = i_wr_data; // P10 Smmpm
                     // Phase 11-H HS-level CSR writes (own addresses).
                     ADDR_HSTATUS   : hstatus    = i_wr_data;
@@ -1142,7 +1232,7 @@ pub module csr #(
                     ADDR_VSTVAL    : vstval     = i_wr_data;
                     ADDR_VSATP     : vsatp      = i_wr_data;
                     ADDR_VSTIMECMP : vstimecmp  = i_wr_data; // Phase 11-H Sstc-in-VS
-                    ADDR_MCOUNTEREN: mcounteren = i_wr_data;
+                    ADDR_MCOUNTEREN: mcounteren = {32'd0, i_wr_data[31:0]};
                     default        : {
                         // P10 Zihpm: mhpmcounter / mhpmevent writes (index =
                         // addr[4:0]). The mhpmcounter write is reconciled with
@@ -1167,6 +1257,9 @@ pub module csr #(
             if i_fflags_set {
                 fcsr[4:0]      = fcsr[4:0] | i_fflags;
                 mstatus[14:13] = 2'b11; // FS = Dirty
+            }
+            if i_fs_dirty {
+                mstatus[14:13] = 2'b11;
             }
             // Phase 12 V5a: OR the sticky vxsat bit from a committing saturating
             // op (mutually exclusive with the CSR-write case above; 1-wide commit).
@@ -1220,7 +1313,7 @@ pub module csr #(
                 let inhibit: logic = (priv == csr_pkg::PrivLevel::MACHINE && ev_sel[62])
                     || (priv == csr_pkg::PrivLevel::SUPERVISOR && ev_sel[61])
                     || (priv == csr_pkg::PrivLevel::USER && ev_sel[60]);
-                let ev_hit : logic     = sel != 4'd0 && sel <= 4'd8 && i_hpm_events[ev_idx] && !inhibit;
+                let ev_hit : logic     = sel != 4'd0 && sel <= 4'd8 && hpm_ev_q[ev_idx] && !inhibit;
                 let c_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPMC_LO + (n as 12) - 12'd3);
                 let e_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPME_LO + (n as 12) - 12'd3);
                 if ev_hit && !c_wr {
@@ -1229,7 +1322,7 @@ pub module csr #(
                     // A same-cycle event-CSR write owns OF, so suppress the set.
                     let will_wrap: logic = mhpmcounter[n] == 64'hFFFFFFFFFFFFFFFF;
                     mhpmcounter[n] = mhpmcounter[n] + 64'd1;
-                    if will_wrap && !e_wr {
+                    if will_wrap && !e_wr && !mhpmevent[n][63] {
                         mhpmevent[n][63] = 1'b1; // OF
                         hpm_ovf_pend[n]  = 1'b1; // pend LCOFI (OR-reduced below)
                     }

@@ -1,0 +1,617 @@
+// ptw: Sv39 page table walker (V = 0) with a request queue, walk
+// coalescing, the epoch rule for installs, Svadu A/D updates and PTE reads as
+// a tagged client of memory port 0
+//
+// Ports (timing contract):
+//   i_req_valid/i_req : a walk request, accepted when o_req_ready; i_req.valid
+//                       is the lookup qualifier and is not read here. A
+//                       request whose key {vpn, regime} matches a queued
+//                       request or the running walk of the same epoch is
+//                       accepted as a waiter (it gets o_evt only); nonspec
+//                       requests always queue
+//   o_req_ready       : registered state only (a free queue entry)
+//   i_kill            : on its edge drops the queued requests whose oldest
+//                       participant it kills and the owners it kills; a
+//                       request without a RobTag (tag.rob_v = 0, the IFU) is
+//                       dropped by every kill and by i_owner_drop
+//   i_ctx, i_pmp*     : live CSR context; i_ctx is latched at walk start, the
+//                       PMP registers change only under a flush
+//   i_inv             : invalidation at retire; like a full kill it advances
+//                       the epoch
+//   o_fill            : combinational in the completion cycle, to this
+//                       side's tlb: a faultless walk that saw no full kill and
+//                       no invalidation since its start, this cycle included
+//   o_resp            : registered, the cycle after completion: the full
+//                       translation for the owner's access (pa, pma with PBMT,
+//                       exc, need_d), only while the owner lives and the walk
+//                       is of the current epoch
+//   o_evt             : registered, the cycle after every completion
+//   o_mem_*, i_mem_*  : one request at a time on port 0 (valid/ready; valid
+//                       never depends on ready). PTE reads are PTW_READ of
+//                       client PTW_D (PTW_I for an IFU walk), A/D writes
+//                       STORE_WT of client AD, tag.id = {sequence, IFU walk},
+//                       rob_v = 0. A response is taken by tag only, MEM_LAT
+//                       cycles after accept; o_mem_req holds from accept
+//                       until that response, so a port that presents the
+//                       request later than the accept may read it there
+//   i_ordering_empty  : sb ordering_empty; A/D re-reads and writes wait for it
+// Owns:
+//   - an install never carries a translation read before a full kill or an
+//     invalidation
+//   - the D bit is written only for a nonspec request whose owner lives
+//   - every completion broadcasts o_evt; at most one o_resp per walk
+//   - no result-holding state: the completion cycle installs, answers and
+//     broadcasts, then the walker is idle
+// Rationale:
+//   - the owner always gets its own answer, so it progresses even if a
+//     younger fill evicts the entry before it looks up again
+//   - an A/D write re-reads the leaf once sb ordering_empty holds and writes
+//     only if it held since that read: a store to the PTE draining between the
+//     read and the write would otherwise be overwritten with the old value
+//   - PTE reads use supervisor PMP (implicit accesses) and the PMA pte_ok bit,
+//     both checked before the read is presented
+pub module ptw::<CFG: core_cfg> #(
+    param QN     : u32                        = 4               ,
+    param MEM_LAT: u32                        = fu_pkg::RESP_LAT, // accept to response
+    param PMA_N  : u32                        = 1               ,
+    param PMA_TBL: pma_pkg::PmaRegion [PMA_N] = '{
+        default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
+    },
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill      : input core_types::<CFG>::Kill,
+    i_owner_drop: input logic                  ,
+
+    i_req_valid: input  logic                      ,
+    i_req      : input  core_types::<CFG>::XlateReq,
+    o_req_ready: output logic                      ,
+
+    i_ctx    : input xlate_pkg::XlateCtx         ,
+    i_pmpcfg : input logic              <64> [2] ,
+    i_pmpaddr: input logic              <64> [16],
+    i_inv    : input xlate_pkg::TlbInv           ,
+
+    i_ordering_empty: input logic,
+
+    o_fill: output xlate_pkg::TlbFill          ,
+    o_resp: output core_types::<CFG>::XlateResp,
+    o_evt : output core_types::<CFG>::PtwEvent ,
+
+    o_mem_valid: output logic                      ,
+    o_mem_req  : output core_types::<CFG>::MemReq  ,
+    i_mem_ready: input  logic                      ,
+    i_mem_resp : input  core_types::<CFG>::MemResp ,
+    i_mem_evt  : input  core_types::<CFG>::MemEvent,
+
+    o_chk: output logic<4>,
+
+    o_perf: output xlate_pkg::PtwPerf,
+) {
+    import core_types::<CFG>::*;
+    import xlate_pkg::*;
+
+    const QW : u32 = tag_pkg::idx_w(QN);
+    const IDW: u32 = MEMID_W - 1;
+
+    enum Flt: logic<2> {
+        NONE,
+        PAGE,
+        ACCESS,
+    }
+
+    enum WSt: logic<3> {
+        IDLE,
+        REQ, // present the PTE read or the A/D write
+        WAIT, // the response of an accepted request
+        PARK, // a fill event before the read is presented again
+        WT, // WT_DONE of an accepted A/D write
+        DONE, // completion: install, answer, broadcast
+    }
+
+    function key_of (
+        r: input XlateReq,
+    ) -> PtwKey {
+        var k       : PtwKey;
+        k.vpn    = r.va[38:12];
+        k.regime = if r.hlv ? Regime::HLV : Regime::V0;
+        return k;
+    }
+
+    function gone (
+        k    : input Kill  ,
+        drop : input logic ,
+        rob_v: input logic ,
+        t    : input RobTag,
+    ) -> logic {
+        return if rob_v ? killed(k, t) : k.valid || drop;
+    }
+
+    let kfull   : logic = i_kill.valid && i_kill.full;
+    let epoch_mv: logic = kfull || i_inv.valid;
+
+    // ---- request queue ----
+
+    var q_v_q   : logic   <QN>     ;
+    var q_own_q : logic   <QN>     ; // the owner lives
+    var q_req_q : XlateReq     [QN];
+    var q_live_q: RobTag       [QN]; // oldest participant
+    var q_age_q : logic   <QN> [QN]; // q_age_q[e][f]: entry f was queued before entry e
+
+    var w_st_q   : WSt             ;
+    var w_req_q  : XlateReq        ;
+    var w_own_q  : logic           ;
+    var w_stale_q: logic           ;
+    var w_ctx_q  : XlateCtx        ;
+    var w_lvl_q  : logic      <2>  ;
+    var w_pa_q   : pma_pkg::Pa     ;
+    var w_pte_q  : logic      <64> ; // the leaf PTE, or the value an A/D write stores
+    var w_flt_q  : Flt             ;
+    var w_wr_q   : logic           ; // REQ presents the A/D write
+    var w_seta_q : logic           ;
+    var w_setd_q : logic           ;
+    var w_adr_q  : logic           ; // A/D phase: reads wait for ordering_empty
+    var w_clean_q: logic           ; // ordering_empty held since the A/D-phase read
+    var w_fid_q  : FillId          ;
+    var w_any_q  : logic           ; // PARK waits for the end of any fill
+    var w_id_q   : logic      <IDW>;
+    var w_side_q : logic           ; // an IFU walk
+
+    let in_key : PtwKey = key_of(i_req);
+    let in_gone: logic  = gone(i_kill, i_owner_drop, i_req.tag.rob_v, i_req.tag.rob);
+    assign o_req_ready = q_v_q != '1;
+    let acc_in: logic = i_req_valid && o_req_ready && !in_gone;
+
+    let w_busy: logic     = w_st_q != WSt::IDLE;
+    let hit_w : logic     = w_busy && !w_stale_q && !epoch_mv && key_of(w_req_q) == in_key;
+    var hit_q : logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            hit_q[e] = q_v_q[e] && key_of(q_req_q[e]) == in_key;
+        }
+    }
+    let coal  : logic     = acc_in && !i_req.nonspec && (hit_w || hit_q != '0);
+    let coal_q: logic<QN> = if coal && !hit_w ? tree_first::<QN>(hit_q) : '0;
+    let enq   : logic     = acc_in && !coal;
+    let fsel  : logic<QN> = tree_first::<QN>(~q_v_q);
+
+    var drop : logic<QN>;
+    var surv : logic<QN>;
+    var own_n: logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            drop[e]  = q_v_q[e] && !coal_q[e] && gone(i_kill, i_owner_drop, q_req_q[e].tag.rob_v, q_live_q[e]);
+            surv[e]  = q_v_q[e] && !drop[e];
+            own_n[e] = q_own_q[e] && !gone(i_kill, i_owner_drop, q_req_q[e].tag.rob_v, q_req_q[e].tag.rob);
+        }
+    }
+
+    // Kills leave holes in the queue, so the order is an age matrix rather
+    // than a ring of sequence numbers: an old entry may outlive any number of
+    // younger ones.
+    var oldest: logic<QN>;
+    always_comb {
+        for e in 0..QN {
+            oldest[e] = surv[e] && (q_age_q[e] & surv) == '0;
+        }
+    }
+    let start : logic        = !w_busy && surv != '0;
+    let pick  : logic   <QN> = if start ? oldest : '0;
+    let pick_i: logic   <QW> = tree_onehot_enc::<QN, QW>(pick);
+    let s_req : XlateReq     = q_req_q[pick_i];
+    let s_own : logic        = own_n[pick_i];
+
+    always_ff {
+        if_reset {
+            q_v_q   = '0;
+            q_own_q = '0;
+        } else {
+            q_v_q   = (surv & ~pick) | (if enq ? fsel : '0);
+            q_own_q = own_n | (if enq ? fsel : '0);
+        }
+    }
+
+    always_ff {
+        for e in 0..QN {
+            if enq && fsel[e] {
+                q_req_q[e]  = i_req;
+                q_live_q[e] = i_req.tag.rob;
+                q_age_q[e]  = q_v_q;
+            } else if coal_q[e] && tag_older::<ROB_TAG_W>(i_req.tag.rob, q_live_q[e]) {
+                q_live_q[e] = i_req.tag.rob;
+            }
+            if enq && !fsel[e] {
+                q_age_q[e] = q_age_q[e] & ~fsel;
+            }
+        }
+    }
+
+    // ---- the walk: memory request ----
+
+    let own_live: logic = w_own_q && !gone(i_kill, i_owner_drop, w_req_q.tag.rob_v, w_req_q.tag.rob);
+
+    let pte_attr  : pma_pkg::PmaAttr = pma_check::<PMA_N>(w_pa_q, PMA_TBL);
+    var pte_r_deny: logic           ;
+    var pte_w_deny: logic           ;
+    inst u_pmp_pr: pmp_check (
+        i_addr   : {8'd0, w_pa_q},
+        i_acc    : 2'd0                          ,
+        i_priv   : csr_pkg::PrivLevel::SUPERVISOR,
+        i_pmpcfg                                 ,
+        i_pmpaddr                                ,
+        o_fault  : pte_r_deny                    ,
+    );
+    inst u_pmp_pw: pmp_check (
+        i_addr   : {8'd0, w_pa_q},
+        i_acc    : 2'd1                          ,
+        i_priv   : csr_pkg::PrivLevel::SUPERVISOR,
+        i_pmpcfg                                 ,
+        i_pmpaddr                                ,
+        o_fault  : pte_w_deny                    ,
+    );
+    let pte_deny: logic = !pte_attr.pte_ok || pte_r_deny;
+
+    var mtag: MemTag;
+    always_comb {
+        mtag        = '0;
+        mtag.client = if w_wr_q ? MemClient::AD : if w_side_q ? MemClient::PTW_I : MemClient::PTW_D;
+        mtag.id     = {w_id_q, w_side_q};
+    }
+
+    let in_req: logic = w_st_q == WSt::REQ;
+    assign o_mem_valid = in_req
+        && (if w_wr_q ? i_ordering_empty && w_clean_q : !pte_deny && (!w_adr_q || i_ordering_empty));
+    always_comb {
+        o_mem_req.tag   = mtag;
+        o_mem_req.cls   = if w_wr_q ? MemCls::STORE_WT : MemCls::PTW_READ;
+        o_mem_req.pa    = w_pa_q;
+        o_mem_req.mask  = 16'h00ff;
+        o_mem_req.wdata = {64'd0, w_pte_q};
+        o_mem_req.attr  = pte_attr;
+    }
+    let mem_acc: logic = o_mem_valid && i_mem_ready;
+
+    let rs    : MemResp     = i_mem_resp;
+    let ev    : MemEvent    = i_mem_evt;
+    let r_my  : logic       = w_st_q == WSt::WAIT && rs.valid && rs.tag == mtag;
+    let ev_end: logic       = ev.valid && (ev.kind == EvKind::FILL_DONE || ev.kind == EvKind::FILL_ABORT);
+    let r_dw  : logic   <3> = w_pa_q[5:3];
+
+    function fill_wake (
+        e   : input MemEvent    ,
+        fin : input logic       ,
+        fid : input FillId      ,
+        any : input logic       ,
+        line: input logic   <50>,
+        dw  : input logic   <3> ,
+    ) -> logic {
+        return if any ?
+            fin
+        :
+            (fin || (e.valid && e.kind == EvKind::FILL_CRIT && e.line == line && e.crit == dw)) && e.fill_id == fid
+        ;
+    }
+
+    // ---- the walk: PTE decode ----
+
+    let va    : logic<64> = w_req_q.va;
+    let d     : logic<64> = rs.data[63:0];
+    let p_r   : logic     = d[1];
+    let p_w   : logic     = d[2];
+    let p_x   : logic     = d[3];
+    let p_a   : logic     = d[6];
+    let p_d   : logic     = d[7];
+    let p_n   : logic     = d[63];
+    let p_pbmt: logic<2>  = d[62:61];
+    let p_ppn : logic<44> = d[53:10];
+    let p_leaf: logic     = p_r || p_x;
+
+    let nl_bad  : logic = w_lvl_q == 2'd0 || p_n || p_pbmt != 2'd0 || p_d || p_a || d[4];
+    let pbmt_bad: logic = if w_ctx_q.pbmte ? p_pbmt == 2'd3 : p_pbmt != 2'd0;
+    let mis     : logic = case w_lvl_q {
+        2'd2   : p_ppn[17:0] != 18'd0,
+        2'd1   : p_ppn[8:0] != 9'd0,
+        default: 1'b0,
+    };
+    let napot_bad: logic    = p_n && (w_lvl_q != 2'd0 || p_ppn[3:0] != 4'b1000);
+    let leaf_bad : logic    = pbmt_bad || mis || napot_bad || (!p_a && !w_ctx_q.adue);
+    let p_fault  : logic    = !d[0] || d[60:54] != 7'd0 || (p_w && !p_r) || (if p_leaf ? leaf_bad : nl_bad);
+    let next_idx : logic<9> = if w_lvl_q == 2'd2 ? va[29:21] : va[20:12];
+
+    function leaf_entry (
+        pte  : input logic<64>,
+        lvl  : input logic<2> ,
+        a_va : input logic<64>,
+        pbmte: input logic    ,
+    ) -> TlbEntry {
+        var t      : TlbEntry;
+        t.hit   = 1'b1;
+        t.ppn   = if pte[63] ? {pte[53:14], a_va[15:12]} : pte[53:10];
+        t.level = lvl;
+        t.r     = pte[1];
+        t.w     = pte[2];
+        t.x     = pte[3];
+        t.u     = pte[4];
+        t.g     = pte[5];
+        t.d     = pte[7];
+        t.pbmt  = if pbmte ? pte[62:61] : 2'd0;
+        t.napot = pte[63];
+        return t;
+    }
+
+    let lp     : Perm  = perm(leaf_entry(d, w_lvl_q, va, w_ctx_q.pbmte), w_req_q.acc, w_ctx_q);
+    let want_d : logic = w_req_q.nonspec && lp.need_d;
+    let set_a  : logic = !p_a;
+    let set_d  : logic = want_d && own_live;
+    let need_wr: logic = set_a || set_d;
+    let clean  : logic = w_clean_q && i_ordering_empty;
+
+    let r_hit : logic = r_my && !w_wr_q && rs.kind == RespKind::HIT;
+    let r_leaf: logic = r_hit && !p_fault && p_leaf;
+    let r_lost: logic = r_leaf && want_d && !own_live;
+
+    // ---- the walk: completion ----
+
+    let e_ent: TlbEntry         = leaf_entry(w_pte_q, w_lvl_q, va, w_ctx_q.pbmte);
+    let f_pa : pma_pkg::Pa      = entry_pa(e_ent, va);
+    let f_att: pma_pkg::PmaAttr = pbmt_attr(pma_check::<PMA_N>(f_pa, PMA_TBL), e_ent.pbmt);
+    let f_p  : Perm             = perm(e_ent, w_req_q.acc, w_ctx_q);
+    var f_rd : logic           ;
+    var f_wd : logic           ;
+    var f_xd : logic           ;
+    inst u_pmp_fr: pmp_check (
+        i_addr   : {8'd0, f_pa},
+        i_acc    : 2'd0        ,
+        i_priv   : w_ctx_q.prv ,
+        i_pmpcfg               ,
+        i_pmpaddr              ,
+        o_fault  : f_rd        ,
+    );
+    inst u_pmp_fw: pmp_check (
+        i_addr   : {8'd0, f_pa},
+        i_acc    : 2'd1        ,
+        i_priv   : w_ctx_q.prv ,
+        i_pmpcfg               ,
+        i_pmpaddr              ,
+        o_fault  : f_wd        ,
+    );
+    inst u_pmp_fx: pmp_check (
+        i_addr   : {8'd0, f_pa},
+        i_acc    : 2'd2        ,
+        i_priv   : w_ctx_q.prv ,
+        i_pmpcfg               ,
+        i_pmpaddr              ,
+        o_fault  : f_xd        ,
+    );
+    let f_pmp: logic = case w_req_q.acc {
+        AccKind::LOAD : f_rd,
+        AccKind::STORE: f_wd,
+        AccKind::AMO  : f_rd || f_wd,
+        AccKind::FETCH: f_xd,
+        default       : f_rd && f_wd,
+    };
+    let f_pma: logic = !f_att.backed || (w_req_q.acc == AccKind::FETCH && !f_att.executable);
+
+    let done   : logic = w_st_q == WSt::DONE;
+    let pf_end : logic = w_flt_q == Flt::PAGE || (w_flt_q == Flt::NONE && !f_p.ok);
+    let af_end : logic = !pf_end && (w_flt_q == Flt::ACCESS || f_pmp || f_pma);
+    let install: logic = done && w_flt_q == Flt::NONE && !w_stale_q && !epoch_mv;
+
+    always_comb {
+        o_fill.valid = install;
+        o_fill.vpn   = va[38:12];
+        o_fill.asid  = w_ctx_q.asid;
+        o_fill.ppn   = e_ent.ppn;
+        o_fill.level = e_ent.level;
+        o_fill.r     = e_ent.r;
+        o_fill.w     = e_ent.w;
+        o_fill.x     = e_ent.x;
+        o_fill.u     = e_ent.u;
+        o_fill.d     = e_ent.d;
+        o_fill.g     = e_ent.g;
+        o_fill.pbmt  = e_ent.pbmt;
+        o_fill.napot = e_ent.napot;
+    }
+
+    var resp_n: XlateResp;
+    always_comb {
+        resp_n.valid     = done && own_live && !w_stale_q && !epoch_mv;
+        resp_n.tag       = w_req_q.tag;
+        resp_n.hit       = 1'b1;
+        resp_n.pa        = f_pa;
+        resp_n.pma       = f_att;
+        resp_n.exc.valid = pf_end || af_end;
+        resp_n.exc.cause = if pf_end ? pf_cause(w_req_q.acc) : af_cause(w_req_q.acc);
+        resp_n.exc.tval  = va;
+        resp_n.exc.gpa   = '0;
+        resp_n.exc.gva   = 1'b0;
+        resp_n.need_d    = !pf_end && !af_end && f_p.need_d;
+    }
+
+    var resp_q: XlateResp;
+    var evt_q : PtwEvent ;
+    always_ff {
+        if_reset {
+            resp_q.valid = 1'b0;
+            evt_q.valid  = 1'b0;
+        } else {
+            resp_q.valid = resp_n.valid;
+            evt_q.valid  = done;
+        }
+    }
+    always_ff {
+        resp_q.tag    = resp_n.tag;
+        resp_q.hit    = resp_n.hit;
+        resp_q.pa     = resp_n.pa;
+        resp_q.pma    = resp_n.pma;
+        resp_q.exc    = resp_n.exc;
+        resp_q.need_d = resp_n.need_d;
+        evt_q.key     = key_of(w_req_q);
+        evt_q.fault   = w_flt_q != Flt::NONE;
+    }
+    assign o_resp = resp_q;
+    assign o_evt  = evt_q;
+
+    // ---- the walk: state ----
+
+    always_ff {
+        if_reset {
+            w_st_q    = WSt::IDLE;
+            w_own_q   = 1'b0;
+            w_stale_q = 1'b0;
+            w_wr_q    = 1'b0;
+            w_adr_q   = 1'b0;
+            w_clean_q = 1'b0;
+            w_id_q    = '0;
+        } else {
+            w_own_q   = own_live;
+            w_stale_q = w_stale_q || epoch_mv;
+            w_clean_q = if mem_acc && !w_wr_q ? 1'b1 : clean;
+            if r_my {
+                w_id_q = w_id_q + 1;
+            }
+            case w_st_q {
+                WSt::IDLE: {
+                    if start {
+                        w_st_q    = WSt::REQ;
+                        w_own_q   = s_own;
+                        w_stale_q = epoch_mv;
+                        w_wr_q    = 1'b0;
+                        w_adr_q   = 1'b0;
+                    }
+                }
+                WSt::REQ: {
+                    if w_wr_q && !clean {
+                        w_wr_q = 1'b0; // ordering_empty dropped: read the leaf again
+                    } else if !w_wr_q && pte_deny {
+                        w_st_q = WSt::DONE;
+                    } else if mem_acc {
+                        w_st_q = WSt::WAIT;
+                    }
+                }
+                WSt::WAIT: {
+                    if r_my {
+                        if w_wr_q {
+                            w_st_q = if rs.kind == RespKind::PENDING ?
+                                (if ev.valid && ev.kind == EvKind::WT_DONE && ev.fill_id == rs.fill_id ?
+                                    WSt::DONE
+                                :
+                                    WSt::WT
+                                )
+                            :
+                                WSt::REQ
+                            ;
+                        } else if rs.kind == RespKind::HIT {
+                            if p_fault || !p_leaf || !need_wr {
+                                w_st_q = if p_fault || p_leaf ? WSt::DONE : WSt::REQ;
+                            } else if pte_w_deny {
+                                w_st_q = WSt::DONE;
+                            } else {
+                                w_st_q  = WSt::REQ;
+                                w_adr_q = 1'b1;
+                                w_wr_q  = w_adr_q && clean;
+                            }
+                        } else if rs.kind == RespKind::MISS {
+                            w_st_q = if fill_wake(ev, ev_end, rs.fill_id, 1'b0, w_pa_q[55:6], r_dw) ?
+                                WSt::REQ
+                            :
+                                WSt::PARK
+                            ;
+                        } else if rs.kind == RespKind::RETRY && rs.reason == RetryReason::FILL_BUSY {
+                            w_st_q = if ev_end ? WSt::REQ : WSt::PARK;
+                        } else {
+                            w_st_q = WSt::REQ;
+                        }
+                    }
+                }
+                WSt::PARK: {
+                    if fill_wake(ev, ev_end, w_fid_q, w_any_q, w_pa_q[55:6], r_dw) {
+                        w_st_q = WSt::REQ;
+                    }
+                }
+                WSt::WT: {
+                    if ev.valid && ev.kind == EvKind::WT_DONE && ev.fill_id == w_fid_q {
+                        w_st_q = WSt::DONE;
+                    }
+                }
+                default: w_st_q = WSt::IDLE;
+            }
+        }
+    }
+
+    always_ff {
+        if w_st_q == WSt::IDLE && start {
+            w_req_q  = s_req;
+            w_ctx_q  = i_ctx;
+            w_lvl_q  = 2'd2;
+            w_pa_q   = {i_ctx.root, s_req.va[38:30], 3'd0};
+            w_flt_q  = Flt::NONE;
+            w_side_q = s_req.tag.client == MemClient::IFU;
+            w_seta_q = 1'b0;
+            w_setd_q = 1'b0;
+        } else if in_req && !w_wr_q && pte_deny {
+            w_flt_q = Flt::ACCESS;
+        } else if r_hit {
+            if p_fault {
+                w_flt_q = Flt::PAGE;
+            } else if !p_leaf {
+                w_pa_q  = {p_ppn, next_idx, 3'd0};
+                w_lvl_q = w_lvl_q - 2'd1;
+            } else if need_wr && pte_w_deny {
+                w_flt_q = Flt::ACCESS;
+            } else {
+                w_pte_q  = d | (if need_wr ? 64'h40 : 64'h0) | (if set_d ? 64'h80 : 64'h0);
+                w_seta_q = set_a;
+                w_setd_q = set_d;
+            }
+        } else if r_my {
+            w_fid_q = rs.fill_id;
+            w_any_q = rs.kind != RespKind::MISS;
+        }
+    }
+
+    // ---- observation ----
+
+    always_comb {
+        o_perf.req      = enq;
+        o_perf.coalesce = coal;
+        o_perf.full     = i_req_valid && !o_req_ready;
+        o_perf.q_drop   = drop != '0;
+        o_perf.walk     = start;
+        o_perf.pte_rd   = mem_acc && !w_wr_q;
+        o_perf.park     = r_my && !w_wr_q && rs.kind == RespKind::MISS;
+        o_perf.busy     = r_my && rs.kind == RespKind::RETRY && rs.reason == RetryReason::FILL_BUSY;
+        o_perf.retry    = r_my && rs.kind == RespKind::RETRY && rs.reason != RetryReason::FILL_BUSY;
+        o_perf.pfault   = done && w_flt_q == Flt::PAGE;
+        o_perf.afault   = done && w_flt_q == Flt::ACCESS;
+        o_perf.install  = install;
+        o_perf.stale    = done && w_flt_q == Flt::NONE && !install;
+        o_perf.own_drop = done && !own_live;
+        o_perf.a_wr     = mem_acc && w_wr_q && w_seta_q;
+        o_perf.d_wr     = mem_acc && w_wr_q && w_setd_q;
+        o_perf.ad_rd    = mem_acc && !w_wr_q && w_adr_q;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_ptw::<CFG> #(
+            LAT: MEM_LAT,
+        ) (
+            clk                     ,
+            rst                     ,
+            i_kill                  ,
+            i_inv_valid: i_inv.valid,
+            i_start    : start      ,
+            i_install  : install    ,
+            i_resp     : resp_q     ,
+            i_lost     : r_lost     ,
+            i_mem_acc  : mem_acc    ,
+            i_mem_tag  : mtag       ,
+            i_mem_resp : rs         ,
+            o_chk                   ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

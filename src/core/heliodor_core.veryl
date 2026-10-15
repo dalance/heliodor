@@ -5,11 +5,12 @@
 //
 // Ports (timing contract):
 //   i_reset_pc     : static, the first fetch address after reset
-//   i_hart_id      : static; reserved and unconnected. The reused csr takes
-//                    the hart id as its HART_ID parameter, not as an input,
-//                    and this build serves one hart, so mhartid reads 0
+//   i_hart_id      : static; read as mhartid by csr and mixed into the
+//                    atomic unit's LR/SC retry backoff draw
 //   D read slot    : o_dmem_* / i_dmem_*, mem_ctrl slot protocol (accept +
-//                    8-beat stream for DRAM lines); driven by the dcache only
+//                    8-beat stream for a line, o_dmem_dram = 1; one beat with
+//                    its grant for an uncached read, whatever the address);
+//                    driven by the dcache only
 //   I read slot    : o_imemr_* / i_imemr_*, the same protocol; islot_arb
 //                    drives it for the icache fill and its uncached reads
 //   write channel  : o_dmemw_* / o_dmem_wdata, o_dmem_wstrb, o_dmem_wen,
@@ -24,18 +25,23 @@
 //   i_dbg_*        : lockstep controls, 0 in normal use
 //   o_perf, o_chk  : event wires and sticky checker flags of every unit
 // Owns: none (no state).
-// What this build serves: RV64I, M, C, Zicsr, Zifencei and Zawrs, with Bare
-// translation and cacheable memory only. decode rejects F, D, A, V, CBO and H
-// as illegal instructions, mem_pipe faults any non-cacheable access, and the
-// reused csr is connected only through the ports listed above (no frm, no
-// translation state). The FP register file, free list and IQ structure exist
-// as the final topology but receive no op.
+// What this build serves: RV64I, M, A (Zalrsc, Zaamo, Zabha, Zacas), C, F,
+// D, Zfa, Zfhmin, Zicsr, Zifencei, Zawrs, Zicbom, Zicboz and the M/S/U
+// privileged architecture (delegation, interrupts, Sstc, Zicntr/Zihpm,
+// Sscofpmf), with Bare and Sv39 translation (Svnapot, Svpbmt, Svade and
+// Svadu under menvcfg.ADUE); misa says so. Non-cacheable (IO and NC)
+// loads and stores, Svpbmt NC and IO pages included, run once each at the
+// head through io_unit. decode rejects V and H as illegal instructions, and
+// the reused csr is connected only through the ports listed above.
 // Rationale:
 //   - every lane and port array is a generate-for over the config; the FU
 //     topology functions of core_types map issue ports to IQs, WB ports, BRU
 //     and SYS indices, so no port number appears here
 //   - the dcache is a sibling of the LSU behind dcache_port_adapter; its
 //     memory side is the D read slot and the write channel
+//   - both walkers read PTEs as non-pipe clients of memory port 0, so PTE
+//     reads are coherent with this hart's dcache and the I read slot serves
+//     the icache only
 //   - the file is over the 600-line guideline because it is the connection
 //     list of every unit; splitting it would only add pass-through ports
 pub module heliodor_core::<CFG: core_cfg> #(
@@ -54,6 +60,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
     o_dmem_ren      : output logic    ,
     o_dmem_req      : output logic    ,
     o_dmem_rfo      : output logic    ,
+    o_dmem_dram     : output logic    ,
     i_dmem_grant    : input  logic    ,
     i_dmem_rdata    : input  logic<64>,
     i_dmem_fill_excl: input  logic    ,
@@ -112,6 +119,19 @@ pub module heliodor_core::<CFG: core_cfg> #(
     // WB slot offset a memory-pipe pass claims when it enters m0 the next cycle.
     const MEM_CLAIM_OFF: u32 = fu_pkg::claim_off(FuKind::LOAD);
 
+    // misa: RV64 with the extensions this build serves (I, M, A, C, F, D, S,
+    // U).
+    const MISA: bit<64> = 64'h8000_0000_0014_112d;
+
+    // HPM event bus (csr selector n counts bit n - 1), one event wire of each
+    // owner, registered in csr: 1 retired mispredicted control op, 2 Redirect,
+    // 3 dispatch idle, 4 dispatch stalled for a resource, 5 a memory-port
+    // request accepted, 6 a cycle that retires nothing, 7 a load parked on a
+    // fill.
+    var hpm_ev: logic<8>;
+    assign hpm_ev = {1'b0, o_perf.lq.park_fill, o_perf.cm.retire_none, o_perf.ad.accept, o_perf.disp.stall,
+        o_perf.disp.idle, o_perf.flush.redirect, o_perf.cm.mispred};
+
     // ---- Kill, redirect and the oldest token ----
 
     var kill    : Kill     ;
@@ -127,8 +147,43 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var virt    : logic                  ;
     var tsr     : logic                  ;
     var tvm     : logic                  ;
+    var frm     : logic             <3>      ;
     var pmpcfg  : logic             <64> [2] ;
     var pmpaddr : logic             <64> [16];
+    var dec_csr : csr_pkg::DecCsr            ;
+    var dpriv   : csr_pkg::PrivLevel         ; // privilege of loads and stores
+    var satp    : logic             <64>     ;
+    var m_sum   : logic                      ;
+    var m_mxr   : logic                      ;
+    var pbmte   : logic                      ;
+    var adue    : logic                      ;
+    var pmm     : logic             <2>  [3] ; // PMM of M, S, U
+
+    // ---- Translation context and invalidation ----
+
+    var d_on   : logic              ;
+    var d_ctx  : xlate_pkg::XlateCtx;
+    var d_pmm  : logic              <2>;
+    var i_on   : logic              ;
+    var i_ctx  : xlate_pkg::XlateCtx;
+    var tlb_inv: xlate_pkg::TlbInv  ;
+    inst u_xctx: xlate_ctx (
+        i_priv : priv  ,
+        i_dpriv: dpriv ,
+        i_satp : satp  ,
+        i_sum  : m_sum ,
+        i_mxr  : m_mxr ,
+        i_pbmte: pbmte ,
+        i_adue : adue  ,
+        i_pmm_m: pmm[0],
+        i_pmm_s: pmm[1],
+        i_pmm_u: pmm[2],
+        o_d_on : d_on  ,
+        o_d_ctx: d_ctx ,
+        o_i_on : i_on  ,
+        o_i_ctx: i_ctx ,
+        o_d_pmm: d_pmm ,
+    );
 
     // ==== Front end ====
 
@@ -191,6 +246,13 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var fb_v   : logic   ;
     var fb     : FetchBlk;
     var fb_take: logic   ;
+    var itlb_lk: xlate_pkg::TlbLookup [1];
+    var itlb_e : xlate_pkg::TlbEntry  [1];
+    var ixr_v  : logic                   ;
+    var ixr    : XlateReq                ;
+    var ixr_rdy: logic                   ;
+    var iptw_rs: XlateResp               ;
+    var iptw_ev: PtwEvent                ;
     inst u_ifu: ifu::<CFG> #(
         PMA_N      : PMA_N      ,
         PMA_REGIONS: PMA_REGIONS,
@@ -198,13 +260,21 @@ pub module heliodor_core::<CFG: core_cfg> #(
         clk                                             ,
         rst                                             ,
         i_fetch_valid      : f_v                        ,
-        i_priv             : priv                       ,
+        i_xl_on            : i_on                       ,
+        i_ctx              : i_ctx                      ,
         i_pmpcfg           : pmpcfg                     ,
         i_pmpaddr          : pmpaddr                    ,
         i_fetch            : fetch                      ,
         o_fetch_take       : f_take                     ,
         o_rewind_valid     : rw_v                       ,
         o_rewind           : rw                         ,
+        o_tlb_lk           : itlb_lk[0]                 ,
+        i_tlb              : itlb_e[0]                  ,
+        o_xreq_valid       : ixr_v                      ,
+        o_xreq             : ixr                        ,
+        i_xreq_ready       : ixr_rdy                    ,
+        i_ptw_evt          : iptw_ev                    ,
+        i_ptw_resp         : iptw_rs                    ,
         o_ic_req_valid     : icq_v                      ,
         o_ic_req           : icq                        ,
         i_ic_ready         : ic_rdy                     ,
@@ -219,6 +289,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_ev_fbq_full      : o_perf.front.fbq_full      ,
         o_ev_ftq_empty_idle: o_perf.front.ftq_empty_idle,
         o_ev_fault_stall   : o_perf.front.fault_stall   ,
+        o_ev_xlate_wait    : o_perf.front.xlate_wait    ,
     );
 
     var fill_req : logic        ;
@@ -310,6 +381,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_virt       : virt       ,
         i_mstatus_tsr: tsr        ,
         i_mstatus_tvm: tvm        ,
+        i_csr        : dec_csr    ,
+        i_frm        : frm        ,
         o_perf       : o_perf.dec ,
         o_chk        : o_chk.dec  ,
     );
@@ -339,6 +412,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var ren    : RenOut         [RW]    ;
     var walk   : WalkLane       [WALK_W];
     var ren_cm : RenCm          [CW]    ;
+    var at_rat : logic <5>              ; // atomic_unit's arch RAT read
+    var at_preg: logic <PREG_W>         ;
     inst u_ren: rename::<CFG> (
         clk                     ,
         rst                     ,
@@ -351,6 +426,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_walk   : walk         ,
         i_cm     : ren_cm       ,
         i_kill   : kill         ,
+        i_arch_rd  : at_rat     ,
+        o_arch_preg: at_preg    ,
         o_perf   : o_perf.ren   ,
         o_chk    : o_chk.ren    ,
     );
@@ -632,6 +709,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
             i_tok      : oldest       ,
             o_started  : ep_start[p]  ,
             o_sys      : ep_sys[p]    ,
+            i_frm      : frm          ,
             o_perf     : ep_perf[p]   ,
             o_chk      : ep_chk[p]    ,
         );
@@ -661,6 +739,37 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var mp_resv : fu_pkg::WbSlot [MW];
     var arb_ok  : logic       [MW];
     var arb_hold: logic       [MW];
+    var dtlb_lk : xlate_pkg::TlbLookup [MW];
+    var dtlb_e  : xlate_pkg::TlbEntry  [MW];
+    var dxr_v   : logic                [MW];
+    var dxr     : XlateReq             [MW];
+    var dxr_gnt : logic                [MW];
+    var dptw_rs : XlateResp                ;
+    var dptw_ev : PtwEvent                 ;
+    var mp_amo  : AtomicOp             [MW];
+
+    // Hole fills of the HEAD clients atomic_unit and io_unit on the HEAD
+    // pipe's WB port.
+    var hf_rq   : logic                [HF_N];
+    var hf_g    : fu_pkg::WbSlot             ;
+    var hf_wb   : WbPacket             [HF_N];
+    var hf_wake : Wake                 [HF_N];
+    var st_at   : logic                      ;
+    var st_io   : logic                      ;
+    var at_prf  : PReg                       ;
+    var at_emp  : logic                      ;
+    var at_done : logic                      ;
+    var at_wr   : logic                      ;
+    var at_wd   : logic<128>                 ;
+    var at_rd2_v: logic                      ;
+    var at_rd2  : logic<64>                  ;
+    var io_ld   : IoOp                       ;
+    var io_st   : IoOp                       ;
+    var io_ldd  : logic                      ;
+    var io_std  : logic                      ;
+    var hret    : logic                      ;
+    var rsv_clr : logic                      ;
+    var mp_st   : logic                [MW]  ;
 
     for m in 0..MW :g_mp {
         const W: u32 = IW + m;
@@ -669,15 +778,31 @@ pub module heliodor_core::<CFG: core_cfg> #(
                 assign raddr[W * SRC_N + s] = mp_a1[m];
             } else if s == 1 :g_a2 {
                 assign raddr[W * SRC_N + s] = mp_a2[m];
+            } else if mem_port_head(m) && s == 2 :g_cas {
+                assign raddr[W * SRC_N + s] = at_prf;
             } else {
                 assign raddr[W * SRC_N + s] = 0 as PReg;
             }
         }
         assign busy_w[W]  = 0 as FuSet;
-        assign hf_req[W]  = 1'b0;
         assign arb_ok[m]  = ok_w[W][MEM_CLAIM_OFF];
         assign hold_w[W]  = arb_hold[m];
         assign rs_in[W]   = mp_resv[m];
+
+        var mwb  : WbPacket [HF_N];
+        var mwake: Wake     [HF_N];
+        var mhf  : logic    [HF_N];
+        for k in 0..HF_N :g_hf {
+            if mem_port_head(m) :g_head {
+                assign mwb[k]   = hf_wb[k];
+                assign mwake[k] = hf_wake[k];
+                assign mhf[k]   = hf_rq[k];
+            } else {
+                assign mwb[k]   = 0 as WbPacket;
+                assign mwake[k] = 0 as Wake;
+                assign mhf[k]   = 1'b0;
+            }
+        }
 
         inst u_mp: mem_pipe::<CFG> #(
             PMA_N  : PMA_N      ,
@@ -689,15 +814,25 @@ pub module heliodor_core::<CFG: core_cfg> #(
             i_iss      : grant_w[W]                ,
             i_re       : mre[m]                    ,
             o_iq_rel   : rel_w[W]                  ,
+            i_tok      : oldest                    ,
+            o_started  : mp_st[m]                  ,
             o_rf_addr1 : mp_a1[m]                  ,
             o_rf_addr2 : mp_a2[m]                  ,
             i_rf_int1  : rd_i[W * SRC_N]           ,
             i_rf_int2  : rd_i[W * SRC_N + 1]       ,
             i_rf_fp2   : rd_f[W * SRC_N + 1]       ,
             i_wb       : wb                        ,
-            i_priv     : priv                      ,
-            i_pmpcfg   : pmpcfg                    ,
-            i_pmpaddr  : pmpaddr                   ,
+            i_xl_on     : d_on                     ,
+            i_ctx       : d_ctx                    ,
+            i_pmm       : d_pmm                    ,
+            i_pmpcfg    : pmpcfg                   ,
+            i_pmpaddr   : pmpaddr                  ,
+            o_tlb_lk    : dtlb_lk[m]               ,
+            i_tlb       : dtlb_e[m]                ,
+            o_xreq_valid: dxr_v[m]                 ,
+            o_xreq      : dxr[m]                   ,
+            i_xreq_gnt  : dxr_gnt[m]               ,
+            i_ptw_evt   : dptw_ev                  ,
             o_req_valid: mreq_v[m]                 ,
             o_req      : mreq[m]                   ,
             i_resp     : mresp[m]                  ,
@@ -711,15 +846,37 @@ pub module heliodor_core::<CFG: core_cfg> #(
             o_verdict  : verd[m]                   ,
             o_wake     : wake[W]                   ,
             o_wb       : wb[W]                     ,
+            o_amo      : mp_amo[m]                 ,
+            i_np_wb    : mwb                       ,
+            i_np_wake  : mwake                     ,
+            i_np_hf    : mhf                       ,
+            o_hf_req   : hf_req[W]                 ,
             o_perf     : o_perf.mp[m]              ,
         );
     }
+
+    // At most one pipe holds the oldest token's op.
+    var mp_stv: logic<MW>;
+    for m in 0..MW :g_mp_st {
+        assign mp_stv[m] = mp_st[m];
+    }
+    let mp_start: logic = mp_stv != '0;
 
     var mp_iq_resv: fu_pkg::WbSlot [MW];
     for m in 0..MW :g_mp_resv {
         assign mp_iq_resv[m] = resv_w[IW + m];
     }
 
+    // Non-pipe clients of the HEAD port: the walkers present their request
+    // in their slot, atomic_unit and io_unit drive their own valid then.
+    var np_req : logic  [NP_N];
+    var np_gnt : logic  [NP_N];
+    var np_slot: logic  [NP_N];
+    var np_av  : logic  [NP_N];
+    var np_mreq: MemReq [NP_N];
+    var resv_nx: logic        ;
+    assign np_av[NP_PTW_D] = np_slot[NP_PTW_D];
+    assign np_av[NP_PTW_I] = np_slot[NP_PTW_I];
     inst u_arb: mem_port_arb::<CFG> (
         clk                        ,
         rst                        ,
@@ -727,13 +884,18 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_lq_re    : lq_re         ,
         i_sq_re    : sq_re         ,
         i_iq_resv  : mp_iq_resv    ,
+        i_np_req   : np_req        ,
         o_port_hold: arb_hold      ,
         o_re       : mre           ,
         o_resv     : mp_resv       ,
         o_lq_gnt   : lq_gnt        ,
         o_sq_gnt   : sq_gnt        ,
+        o_np_gnt   : np_gnt        ,
+        o_np_slot  : np_slot       ,
+        o_np_resv_next: resv_nx    ,
         o_perf     : o_perf.arb    ,
     );
+
 
     var ld_ret  : logic    <RETIRE_CNT_W>         ;
     var st_ret  : logic    <RETIRE_CNT_W>         ;
@@ -779,11 +941,15 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_std        : std           ,
         i_sq_head    : sq_head       ,
         i_oldest     : oldest        ,
+        i_ptw_evt    : dptw_ev       ,
+        i_ptw_resp   : dptw_rs       ,
         i_retire_cnt : ld_ret        ,
         o_reissue    : lq_re         ,
         i_reissue_gnt: lq_gnt        ,
         o_win        : lq_win        ,
         o_split_lo   : split_lo      ,
+        o_io         : io_ld         ,
+        i_io_done    : io_ldd        ,
         o_chk        : o_chk.lq      ,
         o_perf       : o_perf.lq     ,
     );
@@ -798,6 +964,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_alloc_tag  : sq_atag       ,
         i_sta        : sta           ,
         i_std        : std           ,
+        i_ptw_evt    : dptw_ev       ,
+        i_ptw_resp   : dptw_rs       ,
+        i_tok        : oldest        ,
         i_fwd_q      : fwd_q         ,
         o_fwd        : fwd_sq        ,
         o_reissue    : sq_re         ,
@@ -806,6 +975,11 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_retire_cnt : st_ret        ,
         o_push       : push          ,
         o_head       : sq_head       ,
+        o_io         : io_st         ,
+        i_wt_done    : io_std        ,
+        i_amo_done   : at_done       ,
+        i_amo_wrote  : at_wr         ,
+        i_amo_wdata  : at_wd         ,
         o_chk        : o_chk.sq      ,
         o_perf       : o_perf.sq     ,
     );
@@ -836,6 +1010,186 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_perf          : o_perf.sb     ,
     );
 
+    // ==== Translation: TLBs and walkers ====
+
+    var dptw_v  : logic    ;
+    var dptw_rq : XlateReq ;
+    var dptw_rdy: logic    ;
+    inst u_dxarb: ptw_req_arb::<CFG> (
+        i_valid: dxr_v   ,
+        i_req  : dxr     ,
+        i_ready: dptw_rdy,
+        o_valid: dptw_v  ,
+        o_req  : dptw_rq ,
+        o_gnt  : dxr_gnt ,
+    );
+
+    var dfill: xlate_pkg::TlbFill;
+    inst u_dtlb: tlb #(
+        ENTRIES     : CFG::DTLB_N,
+        LOOKUP_PORTS: MW         ,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_lk  : dtlb_lk       ,
+        o_lk  : dtlb_e        ,
+        i_fill: dfill         ,
+        i_inv : tlb_inv       ,
+        o_chk : o_chk.dtlb    ,
+        o_perf: o_perf.dtlb   ,
+    );
+
+    inst u_dptw: ptw::<CFG> #(
+        QN     : CFG::PTW_D_QN,
+        MEM_LAT: NP_RESP_LAT  ,
+        PMA_N  : PMA_N        ,
+        PMA_TBL: PMA_REGIONS  ,
+    ) (
+        clk                               ,
+        rst                               ,
+        i_kill          : kill            ,
+        i_owner_drop    : 1'b0            ,
+        i_req_valid     : dptw_v          ,
+        i_req           : dptw_rq         ,
+        o_req_ready     : dptw_rdy        ,
+        i_ctx           : d_ctx           ,
+        i_pmpcfg        : pmpcfg          ,
+        i_pmpaddr       : pmpaddr         ,
+        i_inv           : tlb_inv         ,
+        i_ordering_empty: ord_empty       ,
+        o_fill          : dfill           ,
+        o_resp          : dptw_rs         ,
+        o_evt           : dptw_ev         ,
+        o_mem_valid     : np_req[NP_PTW_D] ,
+        o_mem_req       : np_mreq[NP_PTW_D],
+        i_mem_ready     : np_gnt[NP_PTW_D] ,
+        i_mem_resp      : mresp[0]        ,
+        i_mem_evt       : mevt            ,
+        o_chk           : o_chk.ptw_d     ,
+        o_perf          : o_perf.ptw_d    ,
+    );
+
+    var ifill: xlate_pkg::TlbFill;
+    inst u_itlb: tlb #(
+        ENTRIES     : CFG::ITLB_N,
+        LOOKUP_PORTS: 1          ,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_lk  : itlb_lk       ,
+        o_lk  : itlb_e        ,
+        i_fill: ifill         ,
+        i_inv : tlb_inv       ,
+        o_chk : o_chk.itlb    ,
+        o_perf: o_perf.itlb   ,
+    );
+
+    // A fetch walk belongs to the front end's current path: a predecode
+    // redirect drops it like a kill.
+    inst u_iptw: ptw::<CFG> #(
+        QN     : CFG::PTW_I_QN,
+        MEM_LAT: NP_RESP_LAT  ,
+        PMA_N  : PMA_N        ,
+        PMA_TBL: PMA_REGIONS  ,
+    ) (
+        clk                               ,
+        rst                               ,
+        i_kill          : kill            ,
+        i_owner_drop    : pdr.valid       ,
+        i_req_valid     : ixr_v           ,
+        i_req           : ixr             ,
+        o_req_ready     : ixr_rdy         ,
+        i_ctx           : i_ctx           ,
+        i_pmpcfg        : pmpcfg          ,
+        i_pmpaddr       : pmpaddr         ,
+        i_inv           : tlb_inv         ,
+        i_ordering_empty: ord_empty       ,
+        o_fill          : ifill           ,
+        o_resp          : iptw_rs         ,
+        o_evt           : iptw_ev         ,
+        o_mem_valid     : np_req[NP_PTW_I] ,
+        o_mem_req       : np_mreq[NP_PTW_I],
+        i_mem_ready     : np_gnt[NP_PTW_I] ,
+        i_mem_resp      : mresp[0]        ,
+        i_mem_evt       : mevt            ,
+        o_chk           : o_chk.ptw_i     ,
+        o_perf          : o_perf.ptw_i    ,
+    );
+
+    // ==== HEAD clients: atomic_unit and io_unit ====
+
+    // The HEAD pipe's WB port grants the clients' hole fills.
+    assign hf_g = hf_gnt[IW + HEAD_PORT];
+
+    inst u_at: atomic_unit::<CFG> (
+        clk                                                 ,
+        rst                                                 ,
+        i_kill          : kill                              ,
+        i_hart_id       : {56'd0, i_hart_id}                ,
+        i_op            : mp_amo[HEAD_PORT]                 ,
+        o_ready         : _                                 ,
+        i_tok           : oldest                            ,
+        i_head_retired  : hret                              ,
+        i_rsv_clr       : rsv_clr                           ,
+        i_ordering_empty: ord_empty                         ,
+        o_head_req      : np_req[NP_ATOMIC]                 ,
+        i_head_gnt      : np_gnt[NP_ATOMIC]                 ,
+        i_head_slot     : np_slot[NP_ATOMIC]                ,
+        o_req_valid     : np_av[NP_ATOMIC]                  ,
+        o_req           : np_mreq[NP_ATOMIC]                ,
+        i_resp          : mresp[HEAD_PORT]                  ,
+        i_evt           : mevt                              ,
+        i_coh_v         : coh_v                             ,
+        i_coh_line      : coh_line                          ,
+        o_rat_rd        : at_rat                            ,
+        i_rat_preg      : at_preg                           ,
+        o_prf_rd        : at_prf                            ,
+        i_prf_data      : rd_i[(IW + HEAD_PORT) * SRC_N + 2],
+        o_started       : st_at                             ,
+        o_empty         : at_emp                            ,
+        o_hf_req        : hf_rq[HF_ATOMIC]                  ,
+        i_wb_grant      : hf_g                              ,
+        o_wb            : hf_wb[HF_ATOMIC]                  ,
+        o_wake          : hf_wake[HF_ATOMIC]                ,
+        o_done          : at_done                           ,
+        o_wrote         : at_wr                             ,
+        o_wdata         : at_wd                             ,
+        o_rd2_valid     : at_rd2_v                          ,
+        o_rd2           : at_rd2                            ,
+        o_chk           : o_chk.at                          ,
+        o_perf          : o_perf.at                         ,
+    );
+
+    inst u_io: io_unit::<CFG> (
+        clk                                 ,
+        rst                                 ,
+        i_kill          : kill              ,
+        i_tok           : oldest            ,
+        i_ld            : io_ld             ,
+        i_st            : io_st             ,
+        i_ordering_empty: ord_empty         ,
+        i_atomic_empty  : at_emp            ,
+        i_head_retired  : hret              ,
+        o_head_req      : np_req[NP_IO]     ,
+        i_head_gnt      : np_gnt[NP_IO]     ,
+        i_head_slot     : np_slot[NP_IO]    ,
+        o_req_valid     : np_av[NP_IO]      ,
+        o_req           : np_mreq[NP_IO]    ,
+        i_resp          : mresp[HEAD_PORT]  ,
+        i_evt           : mevt              ,
+        o_started       : st_io             ,
+        o_busy          : _                 ,
+        o_ld_done       : io_ldd            ,
+        o_st_done       : io_std            ,
+        o_done_id       : _                 ,
+        o_hf_req        : hf_rq[HF_IO]      ,
+        i_wb_grant      : hf_g              ,
+        o_wb            : hf_wb[HF_IO]      ,
+        o_wake          : hf_wake[HF_IO]    ,
+        o_chk           : o_chk.io          ,
+        o_perf          : o_perf.io         ,
+    );
+
     // ==== dcache and its adapter ====
 
     var dc_addr  : logic<64>             ;
@@ -859,6 +1213,19 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var dc_terms : dcache_pkg::StallTerms;
     var dc_dhu   : logic                 ;
     var dc_dhn   : logic<64>             ;
+    var dc_rnext : logic<64>             ;
+    var dc_amo   : logic                 ;
+    var dc_lnext : logic                 ;
+    var dc_unc   : logic                 ;
+    var dc_wen   : logic                 ;
+    var dc_wexl  : logic                 ;
+    var dc_wexq  : logic                 ;
+    var dc_wd    : logic<64>             ;
+    var dc_wdh   : logic<64>             ;
+    var dc_wstrb : logic<8>              ;
+    var dc_cln_v : logic                 ;
+    var dc_cln_a : logic<64>             ;
+    var dc_cln_d : logic                 ;
 
     inst u_ad: dcache_port_adapter::<CFG> (
         clk                                ,
@@ -866,15 +1233,30 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_kill              : kill         ,
         i_req_valid         : mreq_v       ,
         i_req               : mreq         ,
+        i_np_valid          : np_av        ,
+        i_np_req            : np_mreq      ,
         o_req_ready         : _            ,
         o_resp              : mresp        ,
         o_evt               : mevt         ,
+        i_np_resv_next      : resv_nx      ,
         o_dc_addr           : dc_addr      ,
         o_dc_ren            : dc_ren       ,
         o_dc_ren_folded     : dc_renf      ,
         o_dc_addr_r         : dc_addr_r    ,
         o_dc_ren_r          : dc_ren_r     ,
+        o_dc_amo_read       : dc_amo       ,
+        o_dc_load_next      : dc_lnext     ,
+        o_dc_uncached       : dc_unc       ,
+        o_dc_wen            : dc_wen       ,
+        o_dc_wen_excl       : dc_wexl      ,
+        o_dc_wen_excl_q     : dc_wexq      ,
+        o_dc_wdata          : dc_wd        ,
+        o_dc_wdata_hi       : dc_wdh       ,
+        o_dc_wstrb          : dc_wstrb     ,
+        o_dc_clean_v        : dc_cln_v     ,
+        o_dc_clean_addr     : dc_cln_a     ,
         i_dc_rdata          : dc_rdata     ,
+        i_dc_rdata_next     : dc_rnext     ,
         i_dc_stall          : dc_stall     ,
         i_dc_data_valid     : dc_dv        ,
         i_dc_fill_rdata     : dc_frd       ,
@@ -890,6 +1272,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_dc_stall_terms    : dc_terms     ,
         i_dc_dhit_used      : dc_dhu       ,
         i_dc_dhit_rdata_next: dc_dhn       ,
+        i_dc_clean_done     : dc_cln_d     ,
         i_inv_v             : i_inv_v      ,
         i_inv_addr          : i_inv_addr   ,
         i_inv2_v            : i_inv2_v     ,
@@ -902,22 +1285,23 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_perf              : o_perf.ad    ,
     );
 
-    // The main port only reads; stores reach the dcache through the sb drain.
+    // The main port writes only for the non-pipe clients (exclusive and
+    // write-through writes); stores reach the dcache through the sb drain.
     inst u_dc: dcache (
         clk                                ,
         rst                                ,
         i_addr           : dc_addr         ,
-        i_wdata          : 64'd0           ,
-        i_wen            : 1'b0            ,
-        i_wen_excl       : 1'b0            ,
-        i_wen_excl_q     : 1'b0            ,
-        i_wdata_hi       : 64'd0           ,
+        i_wdata          : dc_wd           ,
+        i_wen            : dc_wen          ,
+        i_wen_excl       : dc_wexl         ,
+        i_wen_excl_q     : dc_wexq         ,
+        i_wdata_hi       : dc_wdh          ,
         i_ren            : dc_ren          ,
-        i_uncached       : 1'b0            ,
-        i_wstrb          : 8'd0            ,
+        i_uncached       : dc_unc          ,
+        i_wstrb          : dc_wstrb        ,
         i_wstrb_hi       : 8'd0            ,
-        i_load_next      : 1'b0            ,
-        i_amo_read       : 1'b0            ,
+        i_load_next      : dc_lnext        ,
+        i_amo_read       : dc_amo          ,
         i_addr2          : 64'd0           ,
         i_ren2           : 1'b0            ,
         i_load_next2     : 1'b0            ,
@@ -934,7 +1318,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_swstrb         : dr_strb         ,
         o_sdrain_ack     : dr_ack          ,
         o_rdata          : dc_rdata        ,
-        o_rdata_next     : _               ,
+        o_rdata_next     : dc_rnext        ,
         o_rdata_next_miss: _               ,
         o_stall          : dc_stall        ,
         o_data_valid     : dc_dv           ,
@@ -960,6 +1344,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_memr_addr      : o_dmem_addr     ,
         o_memr_ren       : o_dmem_ren      ,
         o_memr_rfo       : o_dmem_rfo      ,
+        o_memr_line      : o_dmem_dram     ,
         i_fill_excl      : i_dmem_fill_excl,
         i_mem_rdata      : i_dmem_rdata    ,
         o_memw_addr      : o_dmemw_addr    ,
@@ -971,6 +1356,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_probe_addr     : i_probe_addr    ,
         i_probe_self     : i_probe_self    ,
         o_probe_ack      : o_probe_ack     ,
+        i_clean_v        : dc_cln_v        ,
+        i_clean_addr     : dc_cln_a        ,
+        o_clean_done     : dc_cln_d        ,
         i_flush_req      : 1'b0            ,
         o_flush_done     : _               ,
         i_inv_valid      : i_inv_v         ,
@@ -1063,10 +1451,12 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_sb_credit          : sb_credit             ,
         i_kill               : kill                  ,
         i_sys_wr             : ep_sys[SYS_P]         ,
-        i_started            : ep_start[SYS_P]       ,
+        i_started            : {mp_start, st_io, st_at, ep_start[SYS_P]},
         i_irq                : irq                   ,
         i_priv               : priv                  ,
         i_virt               : virt                  ,
+        i_rd2_valid          : at_rd2_v              ,
+        i_rd2                : at_rd2                ,
         i_trap_target        : target                ,
         i_trap_tval          : tval                  ,
         i_mret_pc            : mret_pc               ,
@@ -1088,6 +1478,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_bar_ret            : cm_bar                ,
         o_ftq_cm             : ftq_cm                ,
         o_icache_inv         : ic_inv                ,
+        o_tlb_inv            : tlb_inv               ,
+        o_head_retired       : hret                  ,
+        o_rsv_clr            : rsv_clr               ,
         o_csr                : csr_cm                ,
         o_retire                                     ,
         o_irq_evt                                    ,
@@ -1135,9 +1528,11 @@ pub module heliodor_core::<CFG: core_cfg> #(
 
     inst u_csr: csr #(
         INSTRET_CNT_W: RETIRE_CNT_W,
+        MISA         : MISA        ,
     ) (
         clk                                 ,
         rst                                 ,
+        i_hart_id      : i_hart_id          ,
         i_rd_addr      : ep_csr_a[SYS_P]    ,
         o_rd_data      : csr_rd             ,
         i_wr_en        : csr_cm.wr_en       ,
@@ -1158,19 +1553,19 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_sepc         : sepc               ,
         o_medeleg      : medeleg            ,
         o_mideleg      : _                  ,
-        o_satp         : _                  ,
+        o_satp         : satp               ,
         o_priv         : priv               ,
         o_priv_prev    : _                  ,
-        o_mstatus_sum  : _                  ,
-        o_mstatus_mxr  : _                  ,
+        o_mstatus_sum  : m_sum              ,
+        o_mstatus_mxr  : m_mxr              ,
         o_mstatus_mprv : _                  ,
         o_mstatus_mpp  : _                  ,
         o_mstatus_tvm  : tvm                ,
         o_mstatus_tsr  : tsr                ,
-        o_mstatus_fs   : _                  ,
+        o_mstatus_fs   : dec_csr.fs         ,
         o_mstatus_vs   : _                  ,
-        o_menvcfg_pbmte: _                  ,
-        o_menvcfg_adue : _                  ,
+        o_menvcfg_pbmte: pbmte              ,
+        o_menvcfg_adue : adue               ,
         o_pmpcfg       : pmpcfg             ,
         o_pmpaddr      : pmpaddr            ,
         o_virt         : virt               ,
@@ -1189,9 +1584,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_hideleg      : _                  ,
         o_vstvec       : _                  ,
         o_vsepc        : vsepc              ,
-        o_pmm_m        : _                  ,
-        o_pmm_s        : _                  ,
-        o_pmm_u        : _                  ,
+        o_pmm_m        : pmm[0]             ,
+        o_pmm_s        : pmm[1]             ,
+        o_pmm_u        : pmm[2]             ,
         i_trap_to_s    : csr_trap.to_s      ,
         i_trap_to_vs   : csr_trap.to_vs     ,
         i_htval        : csr_trap.htval     ,
@@ -1205,9 +1600,10 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_irq_to_s     : irq_to_s           ,
         o_irq_to_vs    : irq_to_vs          ,
         i_instret_cnt  : csr_cm.instret_cnt ,
-        o_frm          : _                  ,
+        o_frm          : frm                ,
         i_fflags_set   : csr_cm.fflags_set  ,
         i_fflags       : csr_cm.fflags      ,
+        i_fs_dirty     : csr_cm.fs_dirty    ,
         i_vxsat_set    : 1'b0               ,
         o_vxrm         : _                  ,
         i_vset_wr      : 1'b0               ,
@@ -1218,7 +1614,13 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_vstart_wr    : 1'b0               ,
         i_vstart_val   : 64'd0              ,
         o_vstart       : _                  ,
-        i_hpm_events   : 8'd0               ,
+        o_mstatus_tw   : dec_csr.tw         ,
+        o_mcounteren   : dec_csr.mcounteren ,
+        o_scounteren   : dec_csr.scounteren ,
+        o_menvcfg      : dec_csr.menvcfg    ,
+        o_senvcfg      : dec_csr.senvcfg    ,
+        o_data_priv    : dpriv              ,
+        i_hpm_events   : hpm_ev             ,
     );
 
     // ==== Observation ====

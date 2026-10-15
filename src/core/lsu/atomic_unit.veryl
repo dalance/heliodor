@@ -1,0 +1,581 @@
+// atomic_unit: executes AMO, LR, SC and amocas at the head of the machine,
+// owns the LR/SC reservation and the watch of the line between the read and
+// the write
+//
+// Ports (timing contract):
+//   i_op/o_ready    : the atomic leaves m2 of the HEAD pipe in the cycle it is
+//                     accepted; o_ready is registered (idle). After a DTLB
+//                     miss the op waits for its re-issued pass, which brings
+//                     the PA
+//   i_tok           : the oldest token; a request may start the operation only
+//                     in a cycle where it names the op (compared in A itself)
+//   o_head_req      : registered HEAD slot request to mem_port_arb;
+//                     i_head_gnt (t) answers it, i_head_slot (t + 3) is A
+//   o_req_valid/o_req : A, combinational from registered state and i_tok
+//   i_resp          : the HEAD port's response, RESP_LAT after A (client
+//                     ATOMIC); an i_evt in its cycle counts as after it
+//   i_coh_v/i_coh_line : inv, inv2, evict1, evict2 of this cycle
+//   o_started       : pulse on the A edge that starts the operation
+//   i_head_retired  : lane 0 of commit retired: the op of a set started latch
+//   i_rsv_clr       : a trap was taken, or an xRET or a satp write retired
+//   o_rat_rd/i_rat_preg, o_prf_rd/i_prf_data : amocas operand reads through
+//                     one integer arch RAT port and one PRF port,
+//                     combinational, one operand per cycle (rd, rd+1, rs2+1)
+//   o_hf_req, i_wb_grant, o_wb, o_wake : the result's hole-fill on the HEAD
+//                     pipe's WB port (o_wb registered, o_wake one cycle
+//                     before it); amocas.q first writes rd+1 in place with a
+//                     pair packet, which completes nothing
+//   o_rd2_valid/o_rd2 : amocas.q's rd+1 value (rd != x0), held from its
+//                     packet until the op retires, for the retire record
+//   o_done          : pulse with the last packet of an op other than LR on
+//                     o_wb; the op's SQ entry may retire from the next cycle.
+//                     o_wrote/o_wdata in the same cycle: the op wrote memory,
+//                     and its bytes in the 16-byte window at pa[5:3] (the
+//                     retire record's store data)
+//   i_kill          : drops an op that has not started
+// Owns:
+//   - every write is a STORE_EXCL of an op that holds the token or its started
+//     latch; it is not presented once the watch saw the line leave since the
+//     read, and an EXCL_PASS is final
+//   - rd is written only after EXCL_PASS (AMO, amocas with a matching
+//     compare), after the read (LR, amocas without a match) or with the SC
+//     outcome: 0 after EXCL_PASS, 1 otherwise
+//   - an AMO whose write fails or whose line left re-reads after a backoff
+//     window that doubles per retry, offset by a hash of the whole hart id
+//   - the reservation is the exact PA of the last LR; it is cleared by any SC,
+//     i_rsv_clr, and inv/inv2/evict of its line, never by a kill
+//   - amocas.q writes rd+1 in place into its committed physical register
+//     (the op is the oldest and cannot be killed once started) before rd;
+//     its retire flushes, so no younger op keeps the old rd+1
+//   - every op sends exactly one completing packet, its rd packet;
+//     amocas.q's rd+1 packet before it is a pair packet
+// Rationale:
+//   - the read-modify-write runs back to back while the op is the oldest, so
+//     no atomic ever needs a pipeline replay and the window stays inside the
+//     dcache's ownership pin
+//   - started_q makes the requests after the first independent of the token,
+//     so a pending interrupt (which withholds the token) waits for the op
+//     instead of deadlocking with it
+//   - writing rd+1 in place keeps amocas.q one op with one ROB entry and one
+//     retire record (rd and rd2), like a two-destination op, yet rename,
+//     walk and commit see a single destination: no extra RAT write port, no
+//     second free-list pop, no fused pair of uops at commit
+pub module atomic_unit::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill   : input core_types::<CFG>::Kill      ,
+    i_hart_id: input logic<64>                    ,
+    i_op     : input core_types::<CFG>::AtomicOp  ,
+    o_ready  : output logic                       ,
+    i_tok    : input core_types::<CFG>::TagTok    ,
+
+    i_head_retired  : input logic,
+    i_rsv_clr       : input logic,
+    i_ordering_empty: input logic,
+
+    o_head_req : output logic                      ,
+    i_head_gnt : input  logic                      ,
+    i_head_slot: input  logic                      ,
+    o_req_valid: output logic                      ,
+    o_req      : output core_types::<CFG>::MemReq  ,
+    i_resp     : input  core_types::<CFG>::MemResp ,
+    i_evt      : input  core_types::<CFG>::MemEvent,
+
+    i_coh_v   : input logic     [core_types::<CFG>::COH_N],
+    i_coh_line: input logic<50> [core_types::<CFG>::COH_N],
+
+    o_rat_rd  : output logic<5>                          ,
+    i_rat_preg: input  logic<core_types::<CFG>::PREG_W>  ,
+    o_prf_rd  : output core_types::<CFG>::PReg           ,
+    i_prf_data: input  logic<64>                         ,
+
+    o_started : output logic                         ,
+    o_empty   : output logic                         ,
+    o_hf_req  : output logic                         ,
+    i_wb_grant: input  fu_pkg::WbSlot                ,
+    o_wb      : output core_types::<CFG>::WbPacket   ,
+    o_wake    : output core_types::<CFG>::Wake       ,
+    o_done    : output logic                         ,
+    o_wrote   : output logic                         ,
+    o_wdata   : output logic<128>                    ,
+    o_rd2_valid: output logic                        ,
+    o_rd2      : output logic<64>                    ,
+
+    o_chk: output logic<4>,
+
+    o_perf: output core_types::<CFG>::AtomicPerf,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+
+    // ---- the operation ----
+
+    struct AmoRes {
+        wr  : logic     , // a write is due
+        mask: logic<16> , // bytes written in the 16-byte window at pa[5:3]
+        wdat: logic<128>, // their new values
+        rd  : logic<64> , // old value at the access width, sign-extended
+        rd2 : logic<64> , // amocas.q: old upper dword
+    }
+
+    // The arithmetic of every atomic. f3: 0 B, 1 H, 2 W, 3 D, 4 Q (amocas.q).
+    // old and the result live in the 16-byte window at pa[5:3]; bo is pa[2:0].
+    function amo_calc (
+        op : input AmoOp     ,
+        f3 : input logic<3>  ,
+        bo : input logic<3>  ,
+        old: input logic<128>,
+        src: input logic<128>, // rs2, and rs2+1 above it for amocas.q
+        cmp: input logic<128>, // amocas: rd, and rd+1 above it for amocas.q
+    ) -> AmoRes {
+        var r : AmoRes   ;
+        var a : logic<64>;
+        var ax: logic<64>;
+        var az: logic<64>;
+        var sx: logic<64>;
+        var sz: logic<64>;
+        var cz: logic<64>;
+        var n : logic<64>;
+        var lt: logic    ;
+        var lu: logic    ;
+        let sv: logic<128> = old >> {bo, 3'd0};
+        let s : logic<64>  = src[63:0];
+        let c : logic<64>  = cmp[63:0];
+        a  = sv[63:0];
+        ax = case f3[1:0] {
+            2'd0   : {a[7] repeat 56, a[7:0]},
+            2'd1   : {a[15] repeat 48, a[15:0]},
+            2'd2   : {a[31] repeat 32, a[31:0]},
+            default: a,
+        };
+        az = case f3[1:0] {
+            2'd0   : {56'd0, a[7:0]},
+            2'd1   : {48'd0, a[15:0]},
+            2'd2   : {32'd0, a[31:0]},
+            default: a,
+        };
+        sx = case f3[1:0] {
+            2'd0   : {s[7] repeat 56, s[7:0]},
+            2'd1   : {s[15] repeat 48, s[15:0]},
+            2'd2   : {s[31] repeat 32, s[31:0]},
+            default: s,
+        };
+        sz = case f3[1:0] {
+            2'd0   : {56'd0, s[7:0]},
+            2'd1   : {48'd0, s[15:0]},
+            2'd2   : {32'd0, s[31:0]},
+            default: s,
+        };
+        cz = case f3[1:0] {
+            2'd0   : {56'd0, c[7:0]},
+            2'd1   : {48'd0, c[15:0]},
+            2'd2   : {32'd0, c[31:0]},
+            default: c,
+        };
+        lt = (ax ^ {1'b1, 63'd0}) <: (sx ^ {1'b1, 63'd0});
+        lu = az <: sz;
+        n  = case op {
+            AmoOp::ADD : a + s,
+            AmoOp::XOR : a ^ s,
+            AmoOp::AND : a & s,
+            AmoOp::OR  : a | s,
+            AmoOp::MIN : if lt ? a : s,
+            AmoOp::MAX : if lt ? s : a,
+            AmoOp::MINU: if lu ? a : s,
+            AmoOp::MAXU: if lu ? s : a,
+            default    : s, // SWAP, SC, CAS
+        };
+        r.wr   = op != AmoOp::LR && (op != AmoOp::CAS || (if f3 == 3'd4 ? old == cmp : az == cz));
+        r.mask = if f3 == 3'd4 ? 16'hffff : mem_size_mask(f3[1:0]) << bo;
+        r.wdat = if f3 == 3'd4 ? src : {64'd0, n} << {bo, 3'd0};
+        r.rd   = if f3 == 3'd4 ? old[63:0] : ax;
+        r.rd2  = old[127:64];
+        return r;
+    }
+
+    // Phases of the op. RD: the read (LOAD_EXCL); WR: the write (STORE_EXCL).
+    enum Ph: logic<4> {
+        IDLE,
+        XLATE, // the PA comes with the re-issued pass
+        CAS, // amocas: operand reads, one per cycle
+        WAIT, // for the token (or started latch) and ordering_empty
+        REQ, // HEAD slot requested
+        SLOT, // slot granted, waiting for A
+        RESP, // request presented, response due
+        PARK, // waiting for a fill to end
+        BACK, // backoff before re-reading
+        HI, // amocas.q: rd+1 to the WB shell
+        HI_WB, // amocas.q: waiting for the rd+1 packet
+        DONE, // rd to the WB shell
+        DONE_WB, // waiting for the rd packet
+        RET, // waiting for the retire of the op
+    }
+
+    var ph_q     : Ph           ;
+    var op_q     : AtomicOp     ;
+    var wr_q     : logic        ; // the request in flight is the write
+    var started_q: logic        ;
+    var watch_q  : logic        ; // the line left since the read was presented
+    var fid_q    : FillId       ;
+    var pany_q   : logic        ; // parked for any fill end (FILL_BUSY)
+    var res_q    : AmoRes       ;
+    var out_q    : logic<64>    ;
+    var out2_q   : logic<64>    ;
+    var cmp_q    : logic<128>   ;
+    var src_hi_q : logic<64>    ;
+    var preg_q   : logic<PREG_W> [CAS_RD_N];
+    var cval_q   : logic<64> [CAS_RD_N];
+    var cas_k_q  : logic<2>       ; // operand read step
+    var lf_q     : logic          ; // the WB shell's leaf result is due
+    var pass_q   : logic          ; // a write passed
+    var rsv_v_q  : logic        ;
+    var rsv_pa_q : pma_pkg::Pa  ;
+    var lfsr_q   : logic<16>    ;
+    var bo_exp_q : logic<4>     ;
+    var bo_cnt_q : logic<9>     ;
+
+    var sh_rdy : logic;
+    let busy   : logic     = ph_q != Ph::IDLE;
+    let is_sc  : logic     = op_q.amo.op == AmoOp::SC;
+    let is_lr  : logic     = op_q.amo.op == AmoOp::LR;
+    let is_q   : logic     = op_q.amo.f3 == 3'd4;
+    let o_line : logic<50> = op_q.pa[55:6];
+    let tok_ok : logic     = i_tok.valid && i_tok.tag == op_q.tag.rob;
+    let dead   : logic     = busy && killed(i_kill, op_q.tag.rob);
+    let accept : logic     = i_op.valid && i_op.first && !busy && !killed(i_kill, i_op.tag.rob);
+    let pa_in  : logic     = ph_q == Ph::XLATE && i_op.valid && !i_op.xmiss && i_op.tag.rob == op_q.tag.rob;
+    let go_ph  : Ph        = if op_q.amo.op == AmoOp::CAS ? Ph::CAS : Ph::WAIT;
+    let rsv_hit: logic     = rsv_v_q && rsv_pa_q == op_q.pa;
+
+    var coh_op : logic;
+    var coh_rsv: logic;
+    always_comb {
+        coh_op  = 1'b0;
+        coh_rsv = 1'b0;
+        for c in 0..COH_N {
+            coh_op  |= i_coh_v[c] && i_coh_line[c] == o_line;
+            coh_rsv |= i_coh_v[c] && i_coh_line[c] == rsv_pa_q[55:6];
+        }
+    }
+
+    // ---- the request in A ----
+
+    let slot_a : logic = ph_q == Ph::SLOT && i_head_slot;
+    // An SC presents its write only while the reservation still holds; an
+    // AMO's write only while the watch is quiet.
+    let wr_ok  : logic = if is_sc ? rsv_hit : !watch_q;
+    let present: logic = slot_a && (started_q || tok_ok) && (!wr_q || wr_ok);
+
+    let a_mask: logic<16> = if is_q ? 16'hffff : mem_size_mask(op_q.amo.f3[1:0]) << op_q.pa[2:0];
+    always_comb {
+        o_req_valid        = present;
+        o_req.tag.client   = MemClient::ATOMIC;
+        o_req.tag.id       = '0;
+        o_req.tag.rob      = op_q.tag.rob;
+        o_req.tag.rob_v    = 1'b1;
+        o_req.attr         = '0;
+        o_req.cls          = if wr_q ? MemCls::STORE_EXCL : MemCls::LOAD_EXCL;
+        o_req.pa           = op_q.pa;
+        o_req.mask         = if wr_q ? res_q.mask : a_mask;
+        o_req.wdata        = res_q.wdat;
+    }
+    assign o_head_req = ph_q == Ph::REQ;
+    assign o_started  = present && !started_q;
+
+    // ---- the response ----
+
+    let rsp     : logic   = ph_q == Ph::RESP && i_resp.valid && i_resp.tag.client == MemClient::ATOMIC;
+    let r_kind  : RespKind = i_resp.kind;
+    let r_retry : logic   = rsp && r_kind == RespKind::RETRY && i_resp.reason != RetryReason::FILL_BUSY;
+    let r_busy  : logic   = rsp && r_kind == RespKind::RETRY && i_resp.reason == RetryReason::FILL_BUSY;
+    let r_miss  : logic   = rsp && r_kind == RespKind::MISS;
+    let r_hit   : logic   = rsp && !wr_q && r_kind == RespKind::HIT;
+    let r_pass  : logic   = rsp && wr_q && r_kind == RespKind::EXCL_PASS;
+    let r_fail  : logic   = rsp && wr_q && r_kind == RespKind::EXCL_FAIL;
+    let watch_n : logic   = watch_q || coh_op;
+    let calc    : AmoRes  = amo_calc(op_q.amo.op, op_q.amo.f3, op_q.pa[2:0], i_resp.data, {src_hi_q, op_q.rs2}, cmp_q);
+    // A read whose line left before its result was used is read again.
+    let h_again : logic   = r_hit && watch_n;
+    let h_done  : logic   = r_hit && !watch_n && !calc.wr;
+    let h_write : logic   = r_hit && !watch_n && calc.wr;
+    let restart : logic   = h_again || (r_fail && !is_sc) || (slot_a && wr_q && !is_sc && watch_q);
+    let sc_none : logic   = (ph_q == Ph::WAIT && is_sc && !rsv_hit) || (slot_a && wr_q && is_sc && !rsv_hit);
+
+    let ev_end : logic = i_evt.valid && (i_evt.kind == EvKind::FILL_DONE || i_evt.kind == EvKind::FILL_ABORT);
+    let wake   : logic = ev_end && (pany_q || i_evt.fill_id == fid_q);
+    let wake_rs: logic = ev_end && (r_busy || i_evt.fill_id == i_resp.fill_id);
+
+    let hid    : logic<16> = i_hart_id[15:0] ^ i_hart_id[31:16] ^ i_hart_id[47:32] ^ i_hart_id[63:48];
+    let bo_rnd : logic<16> = lfsr_q ^ hid;
+    let bo_draw: logic<9>  = {1'b0, bo_rnd[7:0]} & ((9'd1 << bo_exp_q) - 9'd1);
+
+    // ---- amocas operands ----
+
+    // A pair based at x0 reads as zero and is not written.
+    let rd_hi : logic<5> = if op_q.rd_arch == 5'd0 ? 5'd0 : op_q.rd_arch + 5'd1;
+    let rs2_hi: logic<5> = if op_q.rs2_arch == 5'd0 ? 5'd0 : op_q.rs2_arch + 5'd1;
+    assign o_rat_rd = case cas_k_q {
+        2'd0   : op_q.rd_arch,
+        2'd1   : rd_hi,
+        default: rs2_hi,
+    };
+    assign o_prf_rd.cls = RegClass::INT;
+    assign o_prf_rd.idx = preg_q[cas_k_q - 2'd1];
+    let cas_end: logic = cas_k_q == CAS_RD_N as 2;
+    // amocas.q writes rd+1 before rd.
+    let fin_ph : Ph    = if is_q && rd_hi != 5'd0 ? Ph::HI : Ph::DONE;
+
+    // ---- state ----
+
+    always_ff {
+        if_reset {
+            ph_q      = Ph::IDLE;
+            wr_q      = 1'b0;
+            started_q = 1'b0;
+            watch_q   = 1'b0;
+            fid_q     = '0;
+            pany_q    = 1'b0;
+            rsv_v_q   = 1'b0;
+            rsv_pa_q  = '0;
+            lfsr_q    = 16'hace1;
+            bo_exp_q  = 4'd0;
+            bo_cnt_q  = '0;
+            cas_k_q   = '0;
+            lf_q      = 1'b0;
+            pass_q    = 1'b0;
+        } else {
+            if r_pass {
+                pass_q = 1'b1;
+            }
+            lfsr_q = {lfsr_q[14:0], lfsr_q[15] ^ lfsr_q[13] ^ lfsr_q[12] ^ lfsr_q[10]};
+            if busy {
+                watch_q = watch_n;
+            }
+
+            // reservation
+            if i_rsv_clr || (rsv_v_q && coh_rsv) {
+                rsv_v_q = 1'b0;
+            }
+            if h_done && is_lr {
+                rsv_v_q  = 1'b1;
+                rsv_pa_q = op_q.pa;
+            }
+            if busy && is_sc && (r_pass || r_fail || sc_none) {
+                rsv_v_q = 1'b0;
+            }
+
+            if dead {
+                ph_q      = Ph::IDLE;
+                started_q = 1'b0;
+                lf_q      = 1'b0;
+            } else {
+                case ph_q {
+                    Ph::IDLE: if accept {
+                        op_q     = i_op;
+                        res_q    = amo_calc(i_op.amo.op, i_op.amo.f3, i_op.pa[2:0], '0, {64'd0, i_op.rs2}, '0);
+                        wr_q     = i_op.amo.op == AmoOp::SC;
+                        bo_exp_q = 4'd0;
+                        cmp_q    = '0;
+                        src_hi_q = '0;
+                        cas_k_q  = 2'd0;
+                        pass_q   = 1'b0;
+                        ph_q     = if i_op.xmiss ? Ph::XLATE : if i_op.amo.op == AmoOp::CAS ? Ph::CAS : Ph::WAIT;
+                    }
+                    Ph::XLATE: if pa_in {
+                        op_q.pa = i_op.pa;
+                        res_q   = amo_calc(op_q.amo.op, op_q.amo.f3, i_op.pa[2:0], '0, {64'd0, op_q.rs2}, '0);
+                        ph_q    = go_ph;
+                    }
+                    Ph::CAS: {
+                        for k in 0..CAS_RD_N {
+                            if cas_k_q == k {
+                                preg_q[k] = i_rat_preg;
+                            }
+                            if cas_k_q == k + 1 {
+                                cval_q[k] = i_prf_data;
+                            }
+                        }
+                        cas_k_q = cas_k_q + 2'd1;
+                        if cas_end {
+                            cmp_q    = {cval_q[1], cval_q[0]};
+                            src_hi_q = i_prf_data;
+                            ph_q     = Ph::WAIT;
+                        }
+                    }
+                    Ph::WAIT: if sc_none {
+                        out_q = 64'd1;
+                        ph_q  = fin_ph;
+                    } else if (started_q || tok_ok) && (started_q || i_ordering_empty) {
+                        ph_q = Ph::REQ;
+                    }
+                    Ph::REQ: if i_head_gnt {
+                        ph_q = Ph::SLOT;
+                    }
+                    Ph::SLOT: if i_head_slot {
+                        if present {
+                            started_q = 1'b1;
+                            if !wr_q {
+                                watch_q = coh_op;
+                            }
+                            ph_q = Ph::RESP;
+                        } else if sc_none {
+                            out_q = 64'd1;
+                            ph_q  = fin_ph;
+                        } else if restart {
+                            ph_q = Ph::BACK;
+                        } else {
+                            ph_q = Ph::WAIT;
+                        }
+                    }
+                    Ph::RESP: if rsp {
+                        if r_pass {
+                            out_q = if is_sc ? 64'd0 : res_q.rd;
+                            ph_q  = fin_ph;
+                        } else if r_fail && is_sc {
+                            out_q = 64'd1;
+                            ph_q  = fin_ph;
+                        } else if h_done {
+                            out_q  = calc.rd;
+                            out2_q = calc.rd2;
+                            ph_q   = fin_ph;
+                        } else if h_write {
+                            res_q  = calc;
+                            out2_q = calc.rd2;
+                            wr_q   = 1'b1;
+                            ph_q   = Ph::REQ;
+                        } else if restart {
+                            wr_q = 1'b0;
+                            ph_q = Ph::BACK;
+                        } else if r_retry || ((r_miss || r_busy) && wake_rs) {
+                            ph_q = Ph::REQ;
+                        } else if r_miss || r_busy {
+                            fid_q  = i_resp.fill_id;
+                            pany_q = r_busy;
+                            ph_q   = Ph::PARK;
+                        }
+                    }
+                    Ph::PARK: if wake {
+                        ph_q = Ph::REQ;
+                    }
+                    Ph::HI: {
+                        lf_q = 1'b1;
+                        ph_q = Ph::HI_WB;
+                    }
+                    Ph::HI_WB: {
+                        lf_q = 1'b0;
+                        if sh_rdy && !lf_q {
+                            ph_q = Ph::DONE;
+                        }
+                    }
+                    Ph::DONE: {
+                        lf_q = 1'b1;
+                        ph_q = Ph::DONE_WB;
+                    }
+                    Ph::DONE_WB: {
+                        lf_q = 1'b0;
+                        if sh_rdy && !lf_q {
+                            ph_q = Ph::RET;
+                        }
+                    }
+                    Ph::RET: if i_head_retired {
+                        ph_q      = Ph::IDLE;
+                        started_q = 1'b0;
+                    }
+                    default: {}
+                }
+                if restart {
+                    wr_q     = 1'b0;
+                    bo_cnt_q = bo_draw + 9'd1;
+                    if bo_exp_q != 4'd8 {
+                        bo_exp_q = bo_exp_q + 4'd1;
+                    }
+                } else if ph_q == Ph::BACK {
+                    if bo_cnt_q == 9'd0 {
+                        ph_q = Ph::REQ;
+                    } else {
+                        bo_cnt_q = bo_cnt_q - 9'd1;
+                    }
+                }
+            }
+        }
+    }
+
+    assign o_ready = !busy;
+    assign o_empty = !busy;
+
+    // The WB shell takes rd+1 (amocas.q) and then rd, one at a time.
+    var sh_tag: ExTag   ;
+    var sh_wb : WbPacket;
+    always_comb {
+        sh_tag = op_q.tag;
+        if ph_q == Ph::HI {
+            sh_tag.pdst.cls = RegClass::INT;
+            sh_tag.pdst.idx = preg_q[1];
+            sh_tag.has_rd   = 1'b1;
+        }
+    }
+    inst u_wb: fu_blocking_shell::<CFG> (
+        clk                                                ,
+        rst                                                ,
+        i_valid      : ph_q == Ph::HI || ph_q == Ph::DONE  ,
+        i_tag        : sh_tag                              ,
+        i_kill                                             ,
+        o_ready      : sh_rdy                              ,
+        o_start      : _                                   ,
+        o_flush      : _                                   ,
+        i_leaf_valid : lf_q                                ,
+        i_leaf_data  : if ph_q == Ph::HI_WB ? out2_q : out_q,
+        i_leaf_fflags: 5'd0                                ,
+        o_hf_req                                           ,
+        o_hf_tag     : _                                   ,
+        i_wb_grant                                         ,
+        o_wb         : sh_wb                               ,
+        o_wake                                             ,
+    );
+    always_comb {
+        o_wb      = sh_wb;
+        o_wb.pair = ph_q == Ph::HI_WB;
+    }
+    assign o_done  = o_wb.valid && ph_q == Ph::DONE_WB && !is_lr;
+    assign o_wrote = pass_q;
+    assign o_wdata = res_q.wdat;
+    assign o_rd2_valid = ph_q == Ph::RET && is_q && rd_hi != 5'd0;
+    assign o_rd2       = out2_q;
+
+    always_comb {
+        o_perf.start     = o_started;
+        o_perf.ld_excl   = present && !wr_q;
+        o_perf.st_excl   = present && wr_q;
+        o_perf.pass      = r_pass;
+        o_perf.fail      = r_fail;
+        o_perf.watch     = h_again || (slot_a && wr_q && !is_sc && watch_q);
+        o_perf.backoff   = restart;
+        o_perf.park_fill = r_miss && !wake_rs;
+        o_perf.park_busy = r_busy && !wake_rs;
+        o_perf.retry     = r_retry;
+        o_perf.rsv_set   = h_done && is_lr;
+        o_perf.rsv_coh   = rsv_v_q && coh_rsv;
+        o_perf.rsv_clr   = rsv_v_q && i_rsv_clr;
+        o_perf.sc_nores  = sc_none;
+        o_perf.cas_miss  = h_done && op_q.amo.op == AmoOp::CAS;
+        o_perf.tok_lost  = slot_a && !started_q && !tok_ok;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_head (
+            clk                                                   ,
+            rst                                                   ,
+            i_req      : present                                  ,
+            i_tok_ok   : tok_ok                                   ,
+            i_started  : started_q                                ,
+            i_wait_resp: ph_q == Ph::RESP                         ,
+            i_kill_st  : dead && started_q                        ,
+            i_forbid   : present && wr_q && !is_sc && watch_q     ,
+            o_chk                                                 ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

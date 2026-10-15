@@ -1,0 +1,243 @@
+// boot_soc_harness: one new-core hart on heliodor_soc_smp with the MAP_BOOT
+// table, the firmware ROM and a 32 MiB DRAM behind the SoC's DRAM port,
+// retire_mon (pass = x3 := 0xAA) and rvfi_tracer. The new-core arm of
+// test_soc_linux_boot_harness. REPLAY_EN replays the golden interrupt
+// schedule IRQ_FILE through irq_replay (with MTIME_SRC = INSTRET for a golden
+// lockstep run); a replay failure is the top bit of the monitor's chk.
+module boot_soc_harness #(
+    param FW_HEX  : string           = "test/hex/linux_boot_fw.hex"  ,
+    param DRAM_HEX: string           = "test/hex/linux_dram_real.hex",
+    param CORE    : soc_pkg::CoreSel = soc_pkg::CoreSel::W2          ,
+    param MTIME_SRC: u32             = soc_pkg::MTIME_CYCLE          ,
+    param MTIME_DIV: u32             = 10                            ,
+    param REPLAY_EN: bit             = 1'b0                          ,
+    param IRQ_FILE : string          = ""                            ,
+    param CK_EN   : bit              = 1'b0                          ,
+    param CK_FILE : string           = ""                            ,
+    param CK_PRINT: bit              = 1'b0                          ,
+    param TRACE_EN: bit              = 1'b0                          ,
+    param TRACE_LO: bit <64>         = 64'd0                         ,
+    param TRACE_HI: bit <64>         = 64'hffff_ffff_ffff_ffff       ,
+) (
+    clk      : input  clock    ,
+    rst      : input  reset    ,
+    o_pass   : output logic    ,
+    o_fail   : output logic    ,
+    o_x3     : output logic<64>,
+    o_cycles : output logic<64>,
+    o_instret: output logic<64>,
+    o_last_pc: output logic<64>,
+    o_ret_cnt: output logic<64>,
+    o_traps  : output logic<64>,
+) {
+    const RL: u32 = soc_pkg::RET_LANES;
+
+    var dmem_addr    : logic<64>                         ;
+    var dmem_wdata   : logic<64>                     [8] ;
+    var dmem_rdata   : logic<64>                         ;
+    var dmem_wen     : logic                             ;
+    var dmem_wstrb   : logic<8>                      [8] ;
+    var retire       : retire_pkg::RetireRec         [RL];
+    var irq_evt      : retire_pkg::IrqEvent          [1] ;
+    var core_chk     : logic<soc_pkg::CHK_W>         [1] ;
+    var core_perf    : logic<soc_pkg::PERF_W>        [1] ;
+    var uart_tx_v    : logic                             ;
+    var uart_tx_d    : logic<8>                          ;
+    var rp_limit_en  : logic                             ;
+    var rp_limit     : logic<64>                         ;
+    var rp_mask      : logic                             ;
+    var rp_allow     : logic                             ;
+    var rp_fail      : logic                             ;
+
+    inst dut: heliodor_soc_smp #(
+        N_HARTS    : 1                          ,
+        RESET_PC   : 64'h0000_0000              ,
+        CORE       : CORE                       ,
+        MTIME_SRC  : MTIME_SRC                  ,
+        MTIME_DIV  : MTIME_DIV                  ,
+        PMA_N      : tb_platform_pkg::MAP_BOOT_N,
+        PMA_REGIONS: tb_platform_pkg::MAP_BOOT  ,
+    ) (
+        clk                            ,
+        rst                            ,
+        o_imem_addr    : _             ,
+        i_imem_rdata   : '{32'd0}      ,
+        o_imem_ren     : _             ,
+        o_iptw_addr    : _             ,
+        o_iptw_req     : _             ,
+        i_iptw_rdata   : '{64'd0}      ,
+        o_dmem_addr    : dmem_addr     ,
+        o_dmem_wdata   : dmem_wdata    ,
+        i_dmem_rdata   : dmem_rdata    ,
+        o_dmem_wen     : dmem_wen      ,
+        o_dmem_ren     : _             ,
+        o_dmem_wstrb   : dmem_wstrb    ,
+        o_dmem_wdata_hi: _             ,
+        o_dmem_wstrb_hi: _             ,
+        o_uart_tx_valid: uart_tx_v     ,
+        o_uart_tx_data : uart_tx_d     ,
+        o_retire       : retire        ,
+        o_irq_evt      : irq_evt       ,
+        o_core_chk     : core_chk      ,
+        o_core_perf    : core_perf     ,
+        i_mtime_tick   : 1'b0          ,
+        i_dbg_retire_limit_en: rp_limit_en,
+        i_dbg_retire_limit   : rp_limit   ,
+        i_dbg_irq_mask       : rp_mask    ,
+        i_dbg_irq_allow      : rp_allow   ,
+    );
+
+    #[allow(initial_assign)]
+    var fw_rom: logic<32> [4096];
+    #[allow(initial_assign)]
+    var dram: logic<32> [8388608];
+    initial {
+        $readmemh(FW_HEX, fw_rom);
+        $readmemh(DRAM_HEX, dram);
+    }
+
+    let in_fw  : logic     = dmem_addr[31:14] == 18'd0;
+    let in_dram: logic     = dmem_addr[31];
+    let dw_lo  : logic<23> = {dmem_addr[24:3], 1'b0};
+    let dw_hi  : logic<23> = {dmem_addr[24:3], 1'b1};
+    let fw_lo  : logic<12> = {dmem_addr[13:3], 1'b0};
+    let fw_hi  : logic<12> = {dmem_addr[13:3], 1'b1};
+    assign dmem_rdata = if in_dram ? {dram[dw_hi], dram[dw_lo]} : if in_fw ? {fw_rom[fw_hi], fw_rom[fw_lo]} : 64'd0;
+
+    always_ff {
+        if_reset {} else if dmem_wen && in_dram {
+            for l in 0..8 {
+                if dmem_wstrb[l] != 8'd0 {
+                    let w_lo : logic<23> = {dmem_addr[24:6], l as 3, 1'b0};
+                    let w_hi : logic<23> = {dmem_addr[24:6], l as 3, 1'b1};
+                    let w_old: logic<64> = {dram[w_hi], dram[w_lo]};
+                    var w_new: logic<64>;
+                    for b in 0..8 {
+                        w_new[b step 8] = if dmem_wstrb[l][b] ? dmem_wdata[l][b step 8] : w_old[b step 8];
+                    }
+                    dram[w_lo] = w_new[31:0];
+                    dram[w_hi] = w_new[63:32];
+                }
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {} else if uart_tx_v {
+            $write("%c", uart_tx_d);
+        }
+    }
+
+    var stop    : logic     [RL];
+    var mismatch: logic         ;
+    var done    : logic         ;
+    var count   : logic<64>     ;
+    var hash    : logic<64>     ;
+    inst u_trc: rvfi_tracer #(
+        LANES   : RL      ,
+        CK_EN   : CK_EN   ,
+        CK_FILE : CK_FILE ,
+        CK_LOG2 : 16      ,
+        CK_PRINT: CK_PRINT,
+        TRACE_EN: TRACE_EN,
+        TRACE_LO: TRACE_LO,
+        TRACE_HI: TRACE_HI,
+    ) (
+        clk                         ,
+        rst                         ,
+        i_retire       : retire     ,
+        i_irq_evt      : irq_evt[0] ,
+        i_stop         : stop       ,
+        i_flush        : 1'b0       ,
+        o_count        : count      ,
+        o_hash         : hash       ,
+        o_final_valid  : _          ,
+        o_hash_mismatch: mismatch   ,
+        o_ck_stale     : _          ,
+    );
+
+    if REPLAY_EN :g_rep {
+        inst u_rep: irq_replay #(
+            IRQ_FILE: IRQ_FILE,
+            END_EN  : CK_EN   ,
+            END_FILE: CK_FILE ,
+        ) (
+            clk                     ,
+            rst                     ,
+            i_count   : count       ,
+            i_irq_evt : irq_evt[0]  ,
+            o_limit_en: rp_limit_en ,
+            o_limit   : rp_limit    ,
+            o_mask    : rp_mask     ,
+            o_allow   : rp_allow    ,
+            o_fail    : rp_fail     ,
+            o_done    : _           ,
+        );
+    } else {
+        assign rp_limit_en = 1'b0;
+        assign rp_limit    = 64'd0;
+        assign rp_mask     = 1'b0;
+        assign rp_allow    = 1'b0;
+        assign rp_fail     = 1'b0;
+    }
+
+    if CORE == soc_pkg::CoreSel::W4 :g_pa4 {
+        inst u_pa: perf_acc::<cfg_w4> #(
+            CORE_ID: 4,
+        ) (
+            clk                  ,
+            rst                  ,
+            i_perf: core_perf[0] ,
+            i_en  : !done        ,
+            i_dump: done         ,
+        );
+    } else {
+        inst u_pa: perf_acc::<cfg_w2> #(
+            CORE_ID: 2,
+        ) (
+            clk                  ,
+            rst                  ,
+            i_perf: core_perf[0] ,
+            i_en  : !done        ,
+            i_dump: done         ,
+        );
+    }
+
+    var chk: logic<1 + soc_pkg::CHK_W + retire_pkg::CHK_RET_W>;
+    inst u_mon: retire_mon #(
+        LANES     : RL                ,
+        TOHOST_PA : 64'd0             ,
+        PASS_BY_X3: 1                 ,
+        CHK_W     : 1 + soc_pkg::CHK_W,
+    ) (
+        clk                          ,
+        rst                          ,
+        i_retire       : retire      ,
+        i_irq_evt      : irq_evt[0]  ,
+        i_chk          : {rp_fail, core_chk[0]},
+        i_hash_mismatch: mismatch    ,
+        o_stop         : stop        ,
+        o_x3           : o_x3        ,
+        o_tohost       : _           ,
+        o_pass         : o_pass      ,
+        o_fail         : o_fail      ,
+        o_done         : done        ,
+        o_cycles       : o_cycles    ,
+        o_instret      : o_instret   ,
+        o_last_pc      : o_last_pc   ,
+        o_ret_cnt      : o_ret_cnt   ,
+        o_trap_cnt     : o_traps     ,
+        o_chk          : chk         ,
+    );
+
+    var reported: logic;
+    always_ff {
+        if_reset {
+            reported = 1'b0;
+        } else if done && !reported {
+            reported = 1'b1;
+            $display("boot: x3=%h cycles=%d instret=%d chk=%h mismatch=%b records=%d hash=%h", o_x3, o_cycles, o_instret,
+                chk, mismatch, count, hash);
+        }
+    }
+}

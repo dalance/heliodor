@@ -1,0 +1,311 @@
+// fp_cvt: every FCVT of the scalar FP units: FP to integer, integer to FP,
+// and FP to FP across the S, D and H formats, combinational.
+//
+// Ports (timing contract):
+//   i_op     : an FCVT FpuOp; any other op yields an unspecified result
+//   i_a      : the source register: FP (S and H NaN-boxed) or integer
+//   i_rm     : resolved rounding mode (FCVTMOD.W.D always truncates)
+//   o_result : FP results NaN-boxed, integer results sign-extended to 64
+//   o_fflags : {NV, DZ, OF, UF, NX}
+// Owns:
+//   - every source is first unpacked to one form, (-1)^sign * sig * 2^(exp-63)
+//     with sig[63] set, and every FP result is packed by one rounder per
+//     destination format, so no conversion pair has its own rounding code
+pub module fp_cvt (
+    i_op    : input  fpu_pkg::FpuOp    ,
+    i_a     : input  logic         <64>,
+    i_rm    : input  logic         <3> ,
+    o_result: output logic         <64>,
+    o_fflags: output logic         <5> ,
+) {
+    import fpu_pkg::*;
+
+    const FMT_S: logic<2> = 2'd0;
+    const FMT_D: logic<2> = 2'd1;
+    const FMT_H: logic<2> = 2'd2;
+
+    // ---- Op decode ----
+
+    var from_int: logic   ;
+    var to_int  : logic   ;
+    var src_fmt : logic<2>;
+    var dst_fmt : logic<2>;
+    var i_signed: logic   ; // the integer side is signed
+    var i_word  : logic   ; // the integer side is 32 bits
+    var modw    : logic   ; // FCVTMOD.W.D: truncate, keep the low 32 bits
+    always_comb {
+        from_int = 1'b0;
+        to_int   = 1'b0;
+        src_fmt  = FMT_S;
+        dst_fmt  = FMT_S;
+        i_signed = 1'b0;
+        i_word   = 1'b0;
+        modw     = 1'b0;
+        case i_op {
+            FpuOp::FCVT_W_S, FpuOp::FCVT_WU_S, FpuOp::FCVT_L_S, FpuOp::FCVT_LU_S: {
+                to_int   = 1'b1;
+                i_signed = i_op == FpuOp::FCVT_W_S || i_op == FpuOp::FCVT_L_S;
+                i_word   = i_op == FpuOp::FCVT_W_S || i_op == FpuOp::FCVT_WU_S;
+            }
+            FpuOp::FCVT_W_D, FpuOp::FCVT_WU_D, FpuOp::FCVT_L_D, FpuOp::FCVT_LU_D, FpuOp::FCVTMOD_W_D: {
+                to_int   = 1'b1;
+                src_fmt  = FMT_D;
+                i_signed = i_op == FpuOp::FCVT_W_D || i_op == FpuOp::FCVT_L_D || i_op == FpuOp::FCVTMOD_W_D;
+                i_word   = i_op == FpuOp::FCVT_W_D || i_op == FpuOp::FCVT_WU_D || i_op == FpuOp::FCVTMOD_W_D;
+                modw     = i_op == FpuOp::FCVTMOD_W_D;
+            }
+            FpuOp::FCVT_S_W, FpuOp::FCVT_S_WU, FpuOp::FCVT_S_L, FpuOp::FCVT_S_LU: {
+                from_int = 1'b1;
+                i_signed = i_op == FpuOp::FCVT_S_W || i_op == FpuOp::FCVT_S_L;
+                i_word   = i_op == FpuOp::FCVT_S_W || i_op == FpuOp::FCVT_S_WU;
+            }
+            FpuOp::FCVT_D_W, FpuOp::FCVT_D_WU, FpuOp::FCVT_D_L, FpuOp::FCVT_D_LU: {
+                from_int = 1'b1;
+                dst_fmt  = FMT_D;
+                i_signed = i_op == FpuOp::FCVT_D_W || i_op == FpuOp::FCVT_D_L;
+                i_word   = i_op == FpuOp::FCVT_D_W || i_op == FpuOp::FCVT_D_WU;
+            }
+            FpuOp::FCVT_S_D: src_fmt = FMT_D;
+            FpuOp::FCVT_D_S: dst_fmt = FMT_D;
+            FpuOp::FCVT_S_H: src_fmt = FMT_H;
+            FpuOp::FCVT_H_S: dst_fmt = FMT_H;
+            FpuOp::FCVT_D_H: {
+                src_fmt = FMT_H;
+                dst_fmt = FMT_D;
+            }
+            FpuOp::FCVT_H_D: {
+                src_fmt = FMT_D;
+                dst_fmt = FMT_H;
+            }
+            default: {}
+        }
+    }
+
+    // ---- FP source ----
+
+    let sv: logic<32> = unbox_s(i_a);
+    let hv: logic<16> = unbox_h(i_a);
+
+    // Exponent field (zero-extended) and fraction (left-aligned to 52 bits).
+    var f_sign: logic    ;
+    var f_eb  : logic<11>;
+    var f_m   : logic<52>;
+    var f_bias: logic<14>;
+    var f_eall: logic<11>;
+    always_comb {
+        case src_fmt {
+            FMT_D: {
+                f_sign = i_a[63];
+                f_eb   = i_a[62:52];
+                f_m    = i_a[51:0];
+                f_bias = 14'd1023;
+                f_eall = 11'h7FF;
+            }
+            FMT_H: {
+                f_sign = hv[15];
+                f_eb   = {6'd0, hv[14:10]};
+                f_m    = {hv[9:0], 42'd0};
+                f_bias = 14'd15;
+                f_eall = 11'h01F;
+            }
+            default: {
+                f_sign = sv[31];
+                f_eb   = {3'd0, sv[30:23]};
+                f_m    = {sv[22:0], 29'd0};
+                f_bias = 14'd127;
+                f_eall = 11'h0FF;
+            }
+        }
+    }
+
+    let f_nan : logic     = f_eb == f_eall && f_m != 52'd0;
+    let f_snan: logic     = f_nan && !f_m[51];
+    let f_inf : logic     = f_eb == f_eall && f_m == 52'd0;
+    let f_zero: logic     = f_eb == 11'd0 && f_m == 52'd0;
+    let f_sub : logic     = f_eb == 11'd0 && f_m != 52'd0;
+    let f_lz  : logic<9>  = clz::<52>(f_m);
+    let f_sig : logic<64> = if f_zero ? 64'd0 : if f_sub ? {f_m, 12'd0} << f_lz[5:0] : {1'b1, f_m, 11'd0};
+    let f_exp : logic<14> = if f_sub ? 14'd0 - f_bias - {5'd0, f_lz} : {3'd0, f_eb} - f_bias;
+
+    // ---- Integer source ----
+
+    let x64  : logic<64> = if !i_word ? i_a : if i_signed ? {i_a[31] repeat 32, i_a[31:0]} : {32'd0, i_a[31:0]};
+    let x_neg: logic     = i_signed && x64[63];
+    let x_mag: logic<64> = if x_neg ? ~x64 + 64'd1 : x64;
+    let x_lz : logic<9>  = clz::<64>(x_mag);
+    let x_sig: logic<64> = x_mag << x_lz[5:0];
+    let x_exp: logic<14> = 14'd63 - {5'd0, x_lz};
+
+    // ---- The unpacked value ----
+
+    let v_sign: logic     = if from_int ? x_neg : f_sign;
+    let v_exp : logic<14> = if from_int ? x_exp : f_exp;
+    let v_sig : logic<64> = if from_int ? x_sig : f_sig;
+    let v_nan : logic     = !from_int && f_nan;
+    let v_snan: logic     = !from_int && f_snan;
+    let v_inf : logic     = !from_int && f_inf;
+    let v_zero: logic     = if from_int ? x_mag == 64'd0 : f_zero;
+
+    // ---- FP destination ----
+
+    var rs_bits: logic<32>;
+    var rs_of  : logic    ;
+    var rs_uf  : logic    ;
+    var rs_nx  : logic    ;
+    inst u_rp_s: fp_round_pack #(
+        EW: 8 ,
+        MW: 23,
+    ) (
+        i_sign: v_sign ,
+        i_exp : v_exp  ,
+        i_sig : v_sig  ,
+        i_rm           ,
+        o_bits: rs_bits,
+        o_of  : rs_of  ,
+        o_uf  : rs_uf  ,
+        o_nx  : rs_nx  ,
+    );
+
+    var rd_bits: logic<64>;
+    var rd_of  : logic    ;
+    var rd_uf  : logic    ;
+    var rd_nx  : logic    ;
+    inst u_rp_d: fp_round_pack #(
+        EW: 11,
+        MW: 52,
+    ) (
+        i_sign: v_sign ,
+        i_exp : v_exp  ,
+        i_sig : v_sig  ,
+        i_rm           ,
+        o_bits: rd_bits,
+        o_of  : rd_of  ,
+        o_uf  : rd_uf  ,
+        o_nx  : rd_nx  ,
+    );
+
+    var rh_bits: logic<16>;
+    var rh_of  : logic    ;
+    var rh_uf  : logic    ;
+    var rh_nx  : logic    ;
+    inst u_rp_h: fp_round_pack #(
+        EW: 5 ,
+        MW: 10,
+    ) (
+        i_sign: v_sign ,
+        i_exp : v_exp  ,
+        i_sig : v_sig  ,
+        i_rm           ,
+        o_bits: rh_bits,
+        o_of  : rh_of  ,
+        o_uf  : rh_uf  ,
+        o_nx  : rh_nx  ,
+    );
+
+    var fp_res: logic<64>;
+    var fp_fl : logic<5> ;
+    always_comb {
+        case dst_fmt {
+            FMT_D: {
+                fp_res = rd_bits;
+                fp_fl  = {2'b00, rd_of, rd_uf, rd_nx};
+                if v_nan {
+                    fp_res = CANONICAL_NAN_D;
+                } else if v_inf {
+                    fp_res = {v_sign, 11'h7FF, 52'd0};
+                } else if v_zero {
+                    fp_res = {v_sign, 63'd0};
+                }
+            }
+            FMT_H: {
+                fp_res = box_h(rh_bits);
+                fp_fl  = {2'b00, rh_of, rh_uf, rh_nx};
+                if v_nan {
+                    fp_res = box_h(CANONICAL_NAN_H);
+                } else if v_inf {
+                    fp_res = box_h({v_sign, 5'h1F, 10'd0});
+                } else if v_zero {
+                    fp_res = box_h({v_sign, 15'd0});
+                }
+            }
+            default: {
+                fp_res = box_s(rs_bits);
+                fp_fl  = {2'b00, rs_of, rs_uf, rs_nx};
+                if v_nan {
+                    fp_res = box_s(CANONICAL_NAN_S);
+                } else if v_inf {
+                    fp_res = box_s({v_sign, 8'hFF, 23'd0});
+                } else if v_zero {
+                    fp_res = box_s({v_sign, 31'd0});
+                }
+            }
+        }
+        if v_nan || v_inf || v_zero {
+            fp_fl = {v_snan, 4'b0000};
+        }
+    }
+
+    // ---- Integer destination ----
+
+    let rm_i: logic<3> = if modw ? 3'b001 : i_rm;
+
+    // Integer part and dropped fraction of |v|; magnitudes of 2^64 and more
+    // are out of range for every destination.
+    let t_sh: logic<14>  = 14'd63 - v_exp;
+    let big : logic      = !v_exp[13] && v_exp >: 14'd63;
+    let sh_i: logic<7>   = if t_sh[13] ? 7'd0 : if t_sh >: 14'd127 ? 7'd127 : t_sh[6:0];
+    let w_i : logic<128> = {v_sig, 64'd0} >> sh_i;
+    let ip  : logic<64>  = w_i[127:64];
+    let g_i : logic      = w_i[63];
+    let st_i: logic      = w_i[62:0] != 63'd0;
+    let ru_i: logic      = round_up(rm_i, v_sign, g_i, st_i, ip[0]);
+    let mag : logic<65>  = {1'b0, ip} + {64'd0, ru_i};
+
+    // Largest representable magnitude for the sign of v.
+    var lim: logic<65>;
+    always_comb {
+        case {i_signed, i_word} {
+            2'b11  : lim = if v_sign ? 65'h0_8000_0000 : 65'h0_7FFF_FFFF;
+            2'b01  : lim = if v_sign ? 65'd0 : 65'h0_FFFF_FFFF;
+            2'b10  : lim = if v_sign ? 65'h0_8000_0000_0000_0000 : 65'h0_7FFF_FFFF_FFFF_FFFF;
+            default: lim = if v_sign ? 65'd0 : 65'h0_FFFF_FFFF_FFFF_FFFF;
+        }
+    }
+    let inv: logic = v_nan || v_inf || big || mag >: lim;
+
+    var sat: logic<64>;
+    always_comb {
+        let pos: logic = v_nan || !v_sign;
+        case {i_signed, i_word} {
+            2'b11  : sat = if pos ? 64'h0000_0000_7FFF_FFFF : 64'hFFFF_FFFF_8000_0000;
+            2'b01  : sat = if pos ? 64'hFFFF_FFFF_FFFF_FFFF : 64'd0;
+            2'b10  : sat = if pos ? 64'h7FFF_FFFF_FFFF_FFFF : 64'h8000_0000_0000_0000;
+            default: sat = if pos ? 64'hFFFF_FFFF_FFFF_FFFF : 64'd0;
+        }
+    }
+
+    let sval: logic<64> = if v_sign ? ~mag[63:0] + 64'd1 : mag[63:0];
+
+    // FCVTMOD.W.D: the low 32 bits of the truncated magnitude, also beyond
+    // 2^64 (bits above sig[31] never reach them).
+    let m_sh : logic<14> = v_exp - 14'd63;
+    let m_lo : logic<32> = if !big ? ip[31:0] : if m_sh >: 14'd31 ? 32'd0 : v_sig[31:0] << m_sh[4:0];
+    let m_val: logic<32> = if v_nan || v_inf ? 32'd0 : if v_sign ? ~m_lo + 32'd1 : m_lo;
+
+    var int_res: logic<64>;
+    always_comb {
+        if modw {
+            int_res = {m_val[31] repeat 32, m_val};
+        } else if inv {
+            int_res = sat;
+        } else if i_word {
+            int_res = {sval[31] repeat 32, sval[31:0]};
+        } else {
+            int_res = sval;
+        }
+    }
+    let int_fl: logic<5> = if inv ? 5'b10000 : {4'b0000, g_i || st_i};
+
+    assign o_result = if to_int ? int_res : fp_res;
+    assign o_fflags = if to_int ? int_fl : fp_fl;
+}

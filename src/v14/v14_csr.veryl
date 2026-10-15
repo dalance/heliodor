@@ -1,0 +1,1243 @@
+// Phase 7 v4: minimal CSR file (M-mode only, M4).
+//
+// Implements the subset of M-mode CSRs sufficient for rv64ui-* startup:
+//   mhartid (RO, 0)
+//   mtvec, mstatus, mscratch, mepc, mcause, mtval, mie, mip
+//   mcycle, minstret (counters, free-running)
+//   misa (RO, return 0)
+//   medeleg, mideleg (RW, accept writes — Phase 5+ wires them to
+//                     trap_delegate logic; M4 keeps them as plain RW)
+//   pmpcfg0, pmpaddr0 (RW, accept writes — no enforcement)
+//   satp (RW, no MMU enforcement until M5)
+//
+// All other addresses return 0 on read and silently drop writes (so
+// rv64ui startup does not trap on unknown CSR ops). M5+ MMU wires
+// satp into the page-walker; for M4 it is just a register.
+//
+// Read port is combinational; write port is registered (commit-time).
+// Trap entry / MRET updates also go through the registered write
+// path; the caller (heliodor_core commit stage) drives i_trap_fire
+// + i_mret_fire pulses.
+pub module v14_csr #(
+    param HART_ID      : u8  = 0,
+    param INSTRET_CNT_W: u32 = 1, // ops retired per cycle, up to 2^W - 1
+) (
+    clk: input clock,
+    rst: input reset,
+
+    // Combinational read (issue-time CSR value sample)
+    i_rd_addr: input  logic<12>,
+    o_rd_data: output logic<64>,
+
+    // Registered CSR write (commit-time)
+    i_wr_en  : input logic    ,
+    i_wr_addr: input logic<12>,
+    i_wr_data: input logic<64>,
+
+    // External mtime (from CLINT) — read via CSR_TIME (0xC01). Without
+    // this Linux delay loops never break because rdtime returns mcycle
+    // (= per-instr counter, never matches mtime-based target).
+    i_mtime: input logic<64>,
+
+    // Trap entry (commit-time)
+    i_trap_fire : input logic    ,
+    i_trap_pc   : input logic<64>, // → mepc
+    i_trap_cause: input logic<64>, // → mcause
+    i_trap_tval : input logic<64>, // → mtval
+
+    // MRET (commit-time): restore PC from mepc, restore mstatus[MIE]
+    // from mstatus[MPIE], priv ← MPP
+    i_mret_fire: input logic,
+    // SRET (commit-time): restore priv ← SPP, SIE ← SPIE
+    i_sret_fire: input logic,
+
+    // mtvec for trap redirect target
+    o_mtvec    : output logic<64>,
+    o_mepc     : output logic<64>,
+    o_stvec    : output logic<64>,
+    o_dbg_stval: output logic<64>,
+    o_dbg_mtval: output logic<64>,
+    o_sepc     : output logic<64>,
+    // Trap delegation decision (commit logic reads to pick mtvec vs stvec)
+    o_medeleg: output logic<64>,
+    o_mideleg: output logic<64>,
+
+    // M5.C: MMU integration — satp + priv + mstatus permission bits.
+    // M5.D: priv is now tracked here via i_trap_fire / i_mret_fire /
+    // i_sret_fire and exposed through o_priv. trap_delegate_s indicates
+    // the current trap fires into S-mode (caller picks stvec / scause /
+    // sepc / stval write paths).
+    o_satp: output logic             <64>,
+    o_priv: output csr_pkg::PrivLevel    ,
+    // M9.A.304: previous-cycle privilege snapshot (registered). Used by the
+    // core's commit-time trap-delegation logic for SYNC exceptions (ECALL
+    // cause + medeleg gate) to avoid the simulator cross-module comb eval-order
+    // hazard of reading the LIVE `priv` that the trap-entry always_ff updates
+    // in the same settling window — mirrors v1's csr.veryl priv_lvl_q.
+    o_priv_prev  : output csr_pkg::PrivLevel,
+    o_mstatus_sum: output logic             ,
+    o_mstatus_mxr: output logic             ,
+    // MPRV (bit 17) and MPP (bits 12:11) for effective-priv computation:
+    // loads/stores in M-mode with MPRV=1 use MPP's priv level for
+    // address translation / permission. Required for rv64si-dirty etc.
+    o_mstatus_mprv: output logic   ,
+    o_mstatus_mpp : output logic<2>,
+    o_mstatus_tvm : output logic   , // Trap Virtual Memory (satp/sfence.vma in S-mode)
+    o_mstatus_tsr : output logic   , // Trap SRET (sret in S-mode)
+    o_mstatus_fs  : output logic<2>, // FP unit state (00=Off → FP traps illegal)
+    // Phase 12 V0: mstatus.VS (bits 10:9) — vector unit state (00=Off → vector
+    // instructions trap illegal). Same encoding/role as FS for the V extension.
+    o_mstatus_vs  : output logic<2>,
+    o_menvcfg_pbmte: output logic  , // P10 Svpbmt: menvcfg.PBMTE (bit 62)
+    o_menvcfg_adue : output logic  , // P10 Svadu: menvcfg.ADUE (bit 61, HW A/D update)
+    // PMP (Smpmp): config (pmpcfg0/pmpcfg2) + 16 addresses, for the PMP checker.
+    o_pmpcfg       : output logic<64> [2] ,
+    o_pmpaddr      : output logic<64> [16],
+    // Phase 11-H: virtualization state for two-stage MMU translation. o_virt is
+    // the current V bit; o_mstatus_mpv (mstatus[39]) lets the core form the
+    // MPRV-effective V for data accesses. hgatp/vsatp drive the G/VS stages, and
+    // o_vsstatus_sum/mxr are the VS-stage permission bits (guest sstatus).
+    o_virt        : output logic    ,
+    o_mstatus_mpv : output logic    ,
+    o_hgatp       : output logic<64>,
+    o_vsatp       : output logic<64>,
+    o_vsstatus_sum: output logic    ,
+    o_vsstatus_mxr: output logic    ,
+    // Phase 11-H A1: vsstatus.FS (guest FP unit state). At V=1, FP is illegal if
+    // mstatus.FS==Off OR vsstatus.FS==Off — the host can disable FP for the guest.
+    o_vsstatus_fs : output logic<2> ,
+    // Phase 11-H HLV/HSV: hstatus.SPVP (bit 8) selects the effective privilege of
+    // a hypervisor virtual-memory access — 1 = VS (supervisor), 0 = VU (user).
+    o_hstatus_spvp: output logic    ,
+    // Phase 11-H B: hstatus.HU (bit 9) permits HLV/HLVX/HSV in (HS) U-mode. When
+    // 0, executing one of these in V=0 U-mode raises an illegal-instruction trap.
+    o_hstatus_hu  : output logic    ,
+    // Phase 11-H B: hstatus.VTVM (bit 20) traps a VS-mode satp access / SFENCE.VMA;
+    // hstatus.VTSR (bit 22) traps a VS-mode SRET — both as virtual instructions.
+    o_hstatus_vtvm: output logic    ,
+    o_hstatus_vtsr: output logic    ,
+    // Phase 11-H3: VS trap delegation. o_virt_prev mirrors o_priv_prev (the
+    // registered V snapshot, for eval-order-safe trap routing); o_hedeleg /
+    // o_hideleg gate delegation of a VS-mode trap into VS; o_vstvec is the VS
+    // trap vector. i_trap_to_vs (below) commits a trap into VS-mode.
+    o_virt_prev   : output logic    ,
+    o_hedeleg     : output logic<64>,
+    o_hideleg     : output logic<64>,
+    o_vstvec      : output logic<64>,
+    // Phase 11-H3b: vsepc is the VS-mode trap return address (used by a VS-mode
+    // SRET, which the core selects over sepc when V=1).
+    o_vsepc       : output logic<64>,
+    // P10 Supm/Ssnpm pointer masking: the PMM field (bits 33:32) per priv level —
+    // mseccfg.PMM for M, menvcfg.PMM for S, senvcfg.PMM for U. 00=off, 10=PMLEN7,
+    // 11=PMLEN16, 01=reserved. The core picks one by the effective access priv.
+    o_pmm_m: output logic<2>,
+    o_pmm_s: output logic<2>,
+    o_pmm_u: output logic<2>,
+    // M5.D delegation decision: 1 if the current trap should go to S-mode
+    // (medeleg bit for this cause set AND current priv ∈ {S, U}).
+    i_trap_to_s: input logic,
+    // Phase 11-H3: the current trap is delivered into VS-mode (a VS/VU trap
+    // delegated by both medeleg and hedeleg/hideleg). Updates the VS-level trap
+    // CSRs and vsstatus; priv stays S (VS) and V stays 1. Takes priority over
+    // i_trap_to_s. 0 (with i_trap_to_s=0/1) keeps the existing HS/M behaviour.
+    i_trap_to_vs: input logic,
+    // Phase 11-H3c: guest-page-fault info. On a trap into HS/M whose cause is a
+    // guest-page-fault (20/21/23), htval ← i_htval (the faulting guest PA >> 2)
+    // and htinst ← 0. i_trap_gva sets hstatus.GVA / mstatus.GVA (stval holds a
+    // guest virtual address — true for any memory fault taken out of a guest).
+    // Both inert at V=0 (i_trap_gva is gated on the core's virt_prev).
+    i_htval     : input logic<64>,
+    i_trap_gva  : input logic    ,
+
+    // M8.C IRQ source pins (from CLINT / PLIC). They set the
+    // corresponding mip bits when asserted; mip CSR writes still
+    // override (handler can clear via csrw mip, 0).
+    i_irq_timer_m: input logic,
+    i_irq_sw_m   : input logic,
+    i_irq_ext_m  : input logic,
+    i_irq_ext_s  : input logic, // P9.5: S-mode external (SEIP) from PLIC
+
+    // M8.C IRQ pending → trap decision (computed here, used by commit
+    // stage to fire an interrupt trap when no synchronous trap fires).
+    o_irq_pending: output logic    ,
+    o_irq_cause  : output logic<64>, // MSB set + cause num
+    o_irq_to_s   : output logic    , // delegated to S-mode (HS)
+    // Phase 11-H3b: the pending interrupt is a virtual VS-level interrupt to be
+    // delivered into VS-mode (V=1). Mutually exclusive with o_irq_to_s; takes
+    // lowest priority (an M- or HS-targeted interrupt forces a guest exit first).
+    o_irq_to_vs  : output logic    ,
+
+    // ops retired this cycle (minstret increment)
+    i_instret_cnt: input logic<INSTRET_CNT_W>,
+
+    // M6: F/D fcsr. o_frm feeds the FPU's dynamic rounding mode. fflags are
+    // OR-accrued from committing FP ops (i_fflags_set pulse + i_fflags), and
+    // an FP commit marks mstatus.FS dirty.
+    o_frm       : output logic<3>,
+    i_fflags_set: input  logic   ,
+    i_fflags    : input  logic<5>,
+    // Phase 12 V5a: a committing fixed-point op that saturated ORs the sticky
+    // vxsat bit (set-only; software clears it via a CSR write to vxsat/vcsr).
+    i_vxsat_set : input  logic   ,
+    // Phase 12 V5b: fixed-point rounding mode to the VU (averaging / scaling-shift
+    // / clip ops round their right shift per vxrm).
+    o_vxrm      : output logic<2>,
+
+    // Phase 12 V0: Vector CSR config. The VU computes the granted vl + the new
+    // vtype for a vset*vl op; at that op's commit the core pulses i_vset_wr and
+    // the architectural vl/vtype update here (and vstart clears). o_vtype/o_vl
+    // feed back to the VU so it can restore its working config on a flush.
+    i_vset_wr  : input  logic    ,
+    i_set_vtype: input  logic<64>,
+    i_set_vl   : input  logic<64>,
+    o_vtype    : output logic<64>,
+    o_vl       : output logic<64>,
+    // Phase 12 V1: a retiring vector mem op writes vstart at its commit — the
+    // faulting element on a precise mem fault, else 0 (RVV clears vstart after a
+    // vector instruction completes). Pulsed by the core; takes priority over a
+    // CSR write to vstart in the same cycle (they are mutually exclusive ops).
+    i_vstart_wr : input logic    ,
+    i_vstart_val: input logic<64>,
+    o_vstart    : output logic<64>,
+
+    // P10 Zihpm: per-cycle event bus. Each mhpmcounter selects one of these via
+    // its mhpmevent[3:0] (1..8 → bit 0..7; 0 = counter frozen). Event meaning:
+    //   1 branch-mispredict  2 redirect       3 front-end-idle  4 dispatch-stall
+    //   5 mem-port-busy      6 retire-stall   7 load-issue-wait  8 (reserved)
+    i_hpm_events: input logic<8>,
+) {
+    // === CSR address constants (subset) ===
+    const ADDR_FFLAGS  : logic<12> = 12'h001;
+    const ADDR_FRM     : logic<12> = 12'h002;
+    const ADDR_FCSR    : logic<12> = 12'h003;
+    // Phase 12 V0: Vector CSRs. vstart/vxsat/vxrm/vcsr are RW; vl/vtype/vlenb are
+    // read-only (vl/vtype written by vset*vl; vlenb is a constant = VLEN/8).
+    const ADDR_VSTART  : logic<12> = 12'h008;
+    const ADDR_VXSAT   : logic<12> = 12'h009;
+    const ADDR_VXRM    : logic<12> = 12'h00A;
+    const ADDR_VCSR    : logic<12> = 12'h00F;
+    const ADDR_VL      : logic<12> = 12'hC20;
+    const ADDR_VTYPE   : logic<12> = 12'hC21;
+    const ADDR_VLENB   : logic<12> = 12'hC22;
+    const ADDR_MHARTID : logic<12> = 12'hF14;
+    const ADDR_MSTATUS : logic<12> = 12'h300;
+    const ADDR_MISA    : logic<12> = 12'h301;
+    const ADDR_MEDELEG : logic<12> = 12'h302;
+    const ADDR_MIDELEG : logic<12> = 12'h303;
+    // Phase 11-H B: VS-interrupt bits (VSSIP=2, VSTIP=6, VSEIP=10) are read-only
+    // one in mideleg when the H extension is implemented.
+    const MIDELEG_RO1  : logic<64> = (64'd1 << 2) | (64'd1 << 6) | (64'd1 << 10);
+    const ADDR_MIE     : logic<12> = 12'h304;
+    const ADDR_MTVEC   : logic<12> = 12'h305;
+    const ADDR_MSCRATCH: logic<12> = 12'h340;
+    const ADDR_MEPC    : logic<12> = 12'h341;
+    const ADDR_MCAUSE  : logic<12> = 12'h342;
+    const ADDR_MTVAL   : logic<12> = 12'h343;
+    // Phase 11-H B: M-mode hypervisor trap CSRs. mtinst = trapped instruction
+    // (transformed encoding deferred → 0); mtval2 = faulting guest physical
+    // address (>> 2) for a guest-page-fault taken in M-mode.
+    const ADDR_MTINST  : logic<12> = 12'h34A;
+    const ADDR_MTVAL2  : logic<12> = 12'h34B;
+    const ADDR_MIP     : logic<12> = 12'h344;
+    const ADDR_PMPCFG0 : logic<12> = 12'h3A0;
+    const ADDR_PMPCFG2 : logic<12> = 12'h3A2;
+    const ADDR_PMPADDR0 : logic<12> = 12'h3B0;
+    const ADDR_PMPADDR15: logic<12> = 12'h3BF;
+    // PMP address field is PHYS_ADDR_WIDTH-2 = 54 bits (addr[55:2]); granularity
+    // G=0 (4-byte, NA4 supported). Reserved pmpcfg bits [6:5] read 0.
+    const PMPADDR_MASK : logic<64> = 64'h003F_FFFF_FFFF_FFFF; // [53:0]
+    const PMPCFG_BYTE_MASK: logic<8> = 8'h9F;                 // clear bits 6:5
+    const ADDR_SATP    : logic<12> = 12'h180;
+    // M5.D S-mode CSRs
+    const ADDR_SSTATUS   : logic<12> = 12'h100;
+    const ADDR_SIE       : logic<12> = 12'h104;
+    const ADDR_STVEC     : logic<12> = 12'h105;
+    const ADDR_SCOUNTEREN: logic<12> = 12'h106;
+    const ADDR_SSCRATCH  : logic<12> = 12'h140;
+    const ADDR_SEPC      : logic<12> = 12'h141;
+    const ADDR_SCAUSE    : logic<12> = 12'h142;
+    const ADDR_STVAL     : logic<12> = 12'h143;
+    const ADDR_SIP       : logic<12> = 12'h144;
+    // P10 Sscofpmf: supervisor count-overflow register (read-only view of the
+    // mhpmevent OF bits, masked by mcounteren).
+    const ADDR_SCOUNTOVF : logic<12> = 12'hDA0;
+    // P10 Sstc: supervisor timer compare + machine env config (STCE = bit 63).
+    const ADDR_STIMECMP  : logic<12> = 12'h14D;
+    const ADDR_MENVCFG   : logic<12> = 12'h30A;
+    // P10 Supm/Ssnpm: senvcfg (U-mode env) + mseccfg (M-mode security) — only
+    // their PMM field (bits 33:32) is used here.
+    const ADDR_SENVCFG   : logic<12> = 12'h10A;
+    const ADDR_MSECCFG   : logic<12> = 12'h747;
+    // === Phase 11-H Hypervisor extension CSRs ===
+    // HS-level (accessible from HS-mode and M-mode; trap if accessed from VS).
+    const ADDR_HSTATUS   : logic<12> = 12'h600;
+    const ADDR_HEDELEG   : logic<12> = 12'h602;
+    // Phase 11-H B: writable-bit mask for hedeleg — bits 10/20/21/22/23 are
+    // read-only zero (exceptions always handled by HS/M, never delegated to VS).
+    const HEDELEG_WMASK  : logic<64> = ~((64'd1 << 10) | (64'd1 << 20) | (64'd1 << 21) | (64'd1 << 22) | (64'd1 << 23));
+    const ADDR_HIDELEG   : logic<12> = 12'h603;
+    const ADDR_HIE       : logic<12> = 12'h604;
+    const ADDR_HTIMEDELTA: logic<12> = 12'h605;
+    const ADDR_HCOUNTEREN: logic<12> = 12'h606;
+    const ADDR_HGEIE     : logic<12> = 12'h607;
+    const ADDR_HTVAL     : logic<12> = 12'h643;
+    const ADDR_HIP       : logic<12> = 12'h644;
+    const ADDR_HVIP      : logic<12> = 12'h645;
+    const ADDR_HTINST    : logic<12> = 12'h64A;
+    const ADDR_HENVCFG   : logic<12> = 12'h60A;
+    const ADDR_HGATP     : logic<12> = 12'h680;
+    const ADDR_HGEIP     : logic<12> = 12'hE12; // read-only
+    // VS-level (the guest's S-CSRs): reachable by their own addresses from
+    // HS/M, and aliased onto the S-CSR addresses when V=1.
+    const ADDR_VSSTATUS  : logic<12> = 12'h200;
+    const ADDR_VSIE      : logic<12> = 12'h204;
+    const ADDR_VSTVEC    : logic<12> = 12'h205;
+    const ADDR_VSSCRATCH : logic<12> = 12'h240;
+    const ADDR_VSEPC     : logic<12> = 12'h241;
+    const ADDR_VSCAUSE   : logic<12> = 12'h242;
+    const ADDR_VSTVAL    : logic<12> = 12'h243;
+    const ADDR_VSIP      : logic<12> = 12'h244;
+    const ADDR_VSATP     : logic<12> = 12'h280;
+    // Phase 11-H Sstc-in-VS: the guest's supervisor timer compare.
+    const ADDR_VSTIMECMP : logic<12> = 12'h24D;
+    // P10 Zicntr/Zihpm: counter-enable + HPM counter/event ranges. The HPM
+    // counter index is the low 5 bits of the address (e.g. mhpmcounter3 0xB03
+    // → 3, mhpmevent3 0x323 → 3, hpmcounter3 0xC03 → 3).
+    const ADDR_MCOUNTEREN: logic<12> = 12'h306;
+    const ADDR_MHPMC_LO  : logic<12> = 12'hB03; // mhpmcounter3
+    const ADDR_MHPMC_HI  : logic<12> = 12'hB1F; // mhpmcounter31
+    const ADDR_HPMC_LO   : logic<12> = 12'hC03; // hpmcounter3   (URO alias)
+    const ADDR_HPMC_HI   : logic<12> = 12'hC1F; // hpmcounter31
+    const ADDR_MHPME_LO  : logic<12> = 12'h323; // mhpmevent3
+    const ADDR_MHPME_HI  : logic<12> = 12'h33F; // mhpmevent31
+    const ADDR_MCYCLE    : logic<12> = 12'hB00;
+    const ADDR_MINSTRET  : logic<12> = 12'hB02;
+    const ADDR_TIME      : logic<12> = 12'hC01; // user time (== mtime)
+    const ADDR_CYCLE     : logic<12> = 12'hC00;
+    const ADDR_INSTRET   : logic<12> = 12'hC02;
+
+    // M5.D current privilege level
+    var priv: csr_pkg::PrivLevel;
+    // M9.A.304: 1-cycle-delayed snapshot of priv, captured at the TOP of the
+    // registered always_ff (before any trap/mret/sret update). The core reads
+    // this (not the live priv) for sync-exception delegation, so the eval order
+    // of this block vs the core's commit comb cannot corrupt the decision.
+    var priv_prev: csr_pkg::PrivLevel;
+
+    // === Registered CSRs ===
+    var mstatus : logic<64>;
+    var mie     : logic<64>;
+    var mtvec   : logic<64>;
+    var mscratch: logic<64>;
+    var mepc    : logic<64>;
+    var mcause  : logic<64>;
+    var mtval   : logic<64>;
+    var mtval2  : logic<64>; // Phase 11-H B: M-mode guest-page-fault GPA (>> 2)
+    var mtinst  : logic<64>; // Phase 11-H B: M-mode trapped instruction (0)
+    var mip     : logic<64>;
+    var medeleg : logic<64>;
+    var mideleg : logic<64>;
+    // PMP (Smpmp): 16 entries. pmpcfg[0]=pmpcfg0 (entries 0-7), pmpcfg[1]=pmpcfg2
+    // (entries 8-15); RV64 has no pmpcfg1/3. pmpaddr[0..15] hold addr[55:2].
+    var pmpcfg  : logic<64> [2] ;
+    var pmpaddr : logic<64> [16];
+    var satp    : logic<64>;
+    var mcycle  : logic<64>;
+    var minstret: logic<64>;
+    // M6: fcsr — bits [7:5] = frm (rounding mode), [4:0] = fflags (NV DZ OF UF NX)
+    var fcsr: logic<64>;
+    // Phase 12 V0: Vector CSR storage. vlenb is a constant (VLEN/8 = 16 B).
+    var vstart: logic<64>;
+    var vxsat : logic<64>; // bit 0
+    var vxrm  : logic<64>; // bits 1:0
+    var vl    : logic<64>;
+    var vtype : logic<64>;
+    const VLENB_CONST: logic<64> = vector_pkg::VLENB as 64;
+    // M5.D S-mode independent CSRs (sstatus/sie/sip are views of mstatus/mie/mip)
+    var stvec     : logic<64>;
+    var sscratch  : logic<64>;
+    var sepc      : logic<64>;
+    var scause    : logic<64>;
+    var stval     : logic<64>;
+    var scounteren: logic<64>;
+    // P10 Sstc registers. stimecmp resets to all-1s so the timer never fires
+    // until S-/M-mode programs it; menvcfg.STCE (bit 63) gates the feature.
+    var stimecmp  : logic<64>;
+    var menvcfg   : logic<64>;
+    // P10 Supm/Ssnpm pointer-masking config (only the PMM field 33:32 is used).
+    var senvcfg   : logic<64>;
+    var mseccfg   : logic<64>;
+    // === Phase 11-H Hypervisor state ===
+    // Virtualization mode (V bit): 0 = HS/M (non-virtualized), 1 = VS/VU
+    // (guest). Resets to 0 and is only ever set to 1 by a trap-return into a
+    // virtual mode (MRET restoring MPV=1, or HS-mode SRET restoring
+    // hstatus.SPV=1). A kernel that never enters a guest leaves it 0, so all
+    // of the H state below — and the V-aliasing of the S-CSRs — stays inert.
+    var virt: logic;
+    // Phase 11-H3: 1-cycle-delayed V snapshot (mirrors priv_prev), captured at
+    // the top of the registered block before any trap/mret/sret update. The core
+    // reads this for eval-order-safe VS trap delegation / ECALL-from-VS cause.
+    var virt_prev: logic;
+    // HS-level hypervisor CSRs.
+    var hstatus   : logic<64>;
+    var hedeleg   : logic<64>;
+    var hideleg   : logic<64>;
+    var hie       : logic<64>;
+    var hvip      : logic<64>;
+    var hgeie     : logic<64>;
+    var htval     : logic<64>;
+    var htinst    : logic<64>;
+    var hcounteren: logic<64>;
+    var htimedelta: logic<64>;
+    var henvcfg   : logic<64>;
+    var hgatp     : logic<64>;
+    // VS-level CSRs (guest supervisor state). vsstatus mirrors the sstatus
+    // layout; vsie holds the guest's interrupt enables; the rest are standalone
+    // like their S-mode peers. vsip has no storage — it is a view of hvip
+    // (see vsip_view below).
+    var vsstatus  : logic<64>;
+    var vsie      : logic<64>;
+    var vstvec    : logic<64>;
+    var vsscratch : logic<64>;
+    var vsepc     : logic<64>;
+    var vscause   : logic<64>;
+    var vstval    : logic<64>;
+    var vsatp     : logic<64>;
+    // Phase 11-H Sstc-in-VS: the guest's stimecmp. Resets to all-1s (never fires
+    // until the guest programs it); enabled by menvcfg.STCE & henvcfg.STCE.
+    var vstimecmp : logic<64>;
+    // P10 Zicntr/Zihpm. mcounteren is stored (no access-control trap is enforced
+    // yet). mhpmcounter[3..31] count the event selected by mhpmevent[3..31];
+    // indices 0..2 are unused (cycle/time/instret have dedicated registers).
+    var mcounteren: logic<64>;
+    var mhpmcounter: logic<64> [32];
+    var mhpmevent  : logic<64> [32];
+    // sstatus visible bits: SIE(1), SPIE(5), SPP(8), VS(10:9), FS(14:13),
+    // XS(16:15), SUM(18), MXR(19), UXL(33:32), SD(63). UXL is read-only for RV64.
+    // Phase 12 V6: VS (bits 10:9, +0x600) is the vector-unit state, written by
+    // S-mode software (Linux riscv_v_enable() does csr_set(sstatus, SR_VS)).
+    // Omitting it dropped sstatus.VS writes, so vector could never be enabled in
+    // S-mode (the M-mode directed tests set mstatus.VS and so missed this). Inert
+    // at V=0: VS stays 0 with no vector op, so sstatus read/write is unchanged.
+    const SSTATUS_MASK: logic<64> = 64'h8000_0003_000d_e762;
+    // sie/sip visible bits: SSIE/SSIP(1), STIE/STIP(5), SEIE/SEIP(9),
+    // and P10 Sscofpmf LCOFIE/LCOFIP(13) so a delegated counter-overflow
+    // interrupt is visible/clearable through sie/sip.
+    const SI_MASK: logic<64> = 64'h0000_0000_0000_2222;
+    // RV64 SXL/UXL = 2 (XLEN=64), required by spec for RV64 cores.
+    const MSTATUS_XL_RO: logic<64> = 64'h0000_000a_0000_0000;
+    // SSTATUS UXL bits only ([33:32])
+    const SSTATUS_XL_RO: logic<64> = 64'h0000_0002_0000_0000;
+    // Phase 11-H: hstatus.VSXL (bits 33:32) is read-only 2 on RV64 (the guest
+    // VS XLEN is 64). Same field position as SSTATUS_XL_RO.
+    const HSTATUS_VSXL_RO: logic<64> = 64'h0000_0002_0000_0000;
+
+    // mstatus/sstatus.SD (bit 63): a read-only summary bit, set iff any of
+    // FS(14:13) / VS(10:9) / XS(16:15) is Dirty (== 2'b11). heliodor has no
+    // user-mode extension state (XS is always 0), so SD tracks FS and VS. It is
+    // never stored (writes to mstatus[63] are dropped); compute it on read and
+    // OR it into the mstatus / sstatus read values below.
+    let mstatus_sd: logic = (mstatus[14:13] == 2'b11) || (mstatus[10:9] == 2'b11) || (mstatus[16:15] == 2'b11);
+
+    // P10 Sstc effective STIP. When menvcfg.STCE=1 the supervisor timer
+    // interrupt-pending bit (mip[5]) is hardware-driven by time>=stimecmp and
+    // the software-written mip.STIP is ignored; when STCE=0 it is the plain
+    // software-written bit (legacy SBI-timer path, unchanged). mip_read feeds
+    // the mip/sip CSR read so software observes the effective pending state.
+    let sstc_en  : logic     = menvcfg[63];
+    let stip_hw  : logic     = sstc_en && (i_mtime >= stimecmp);
+    let stip_eff : logic     = if sstc_en ? stip_hw : mip[5];
+    let mip_read : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
+
+    // Phase 11-H Sstc-in-VS: the guest's supervisor-timer-pending (VSTIP) is
+    // hardware-driven when Sstc is enabled for the guest — menvcfg.STCE AND
+    // henvcfg.STCE — and fires when guest time (mtime + htimedelta) reaches the
+    // guest compare vstimecmp. When disabled, VSTIP falls back to the
+    // software-injected hvip.VSTIP (the legacy SBI-timer-into-guest path). Inert
+    // at V=0 / pre-virtualization: a non-virtualizing kernel leaves henvcfg.STCE=0
+    // so vstip_eff == hvip[6] == 0 (byte-identical to before).
+    let vsstc_en : logic     = menvcfg[63] && henvcfg[63];
+    let vstip_hw : logic     = vsstc_en && ((i_mtime + htimedelta) >= vstimecmp);
+    let vstip_eff: logic     = if vsstc_en ? vstip_hw : hvip[6];
+
+    // Phase 11-H3b: vsip is the guest's S-view of the pending VS interrupts; it
+    // has no storage of its own. Each guest sip bit aliases the corresponding
+    // VS interrupt in hvip — vsip.SSIP(1)=hvip.VSSIP(2), vsip.STIP(5)=hvip.VSTIP
+    // (6), vsip.SEIP(9)=hvip.VSEIP(10) — but only while that interrupt is
+    // delegated to VS by hideleg (else the guest reads 0). vsip.SSIP is writable
+    // and clears/sets hvip.VSSIP (see the SIP/VSIP write path); STIP/SEIP are
+    // read-only here. STIP reflects the effective VSTIP (the vstimecmp hardware
+    // source when Sstc-in-VS is on, else hvip.VSTIP); the SEIP/hgeip
+    // guest-external hardware source is still deferred.
+    let vsip_view: logic<64> = (if hideleg[2] && hvip[2] ? 64'h0002 : 64'd0)
+        | (if hideleg[6] && vstip_eff ? 64'h0020 : 64'd0)
+        | (if hideleg[10] && hvip[10] ? 64'h0200 : 64'd0);
+    // hip is the HS-mode view of the pending VS interrupts: VSSIP(2)/VSEIP(10)
+    // reflect hvip and VSTIP(6) reflects the effective VSTIP (vstimecmp hardware
+    // source when Sstc-in-VS is on, else hvip.VSTIP); SGEIP(12) is the OR of
+    // hgeip&hgeie (no guest-external irqs yet, so 0). It has no storage — VSSIP is
+    // writable through the hvip alias.
+    let hip_view: logic<64> = (if hvip[2] ? 64'h0004 : 64'd0)
+        | (if vstip_eff ? 64'h0040 : 64'd0)
+        | (if hvip[10] ? 64'h0400 : 64'd0);
+
+    // P10 Sscofpmf: scountovf aggregates the mhpmevent[n].OF (bit 63) of
+    // counters 3..31 into bit n, masked by mcounteren[n] (a counter the
+    // supervisor may not read shows 0). Read-only.
+    var scountovf_val: logic<64>;
+    always_comb {
+        scountovf_val = 64'd0;
+        for n in 3..32 {
+            scountovf_val[n] = mhpmevent[n][63] && mcounteren[n];
+        }
+    }
+
+    // === Combinational read ===
+    var rd_data_w: logic<64>;
+    always_comb {
+        case i_rd_addr {
+            ADDR_FFLAGS    : rd_data_w = {59'd0, fcsr[4:0]};
+            ADDR_FRM       : rd_data_w = {61'd0, fcsr[7:5]};
+            ADDR_FCSR      : rd_data_w = {56'd0, fcsr[7:0]};
+            // Phase 12 V0: Vector CSRs.
+            ADDR_VSTART    : rd_data_w = vstart;
+            ADDR_VXSAT     : rd_data_w = {63'd0, vxsat[0]};
+            ADDR_VXRM      : rd_data_w = {62'd0, vxrm[1:0]};
+            ADDR_VCSR      : rd_data_w = {61'd0, vxrm[1:0], vxsat[0]};
+            ADDR_VL        : rd_data_w = vl;
+            ADDR_VTYPE     : rd_data_w = vtype;
+            ADDR_VLENB     : rd_data_w = VLENB_CONST;
+            ADDR_MHARTID   : rd_data_w = {56'd0, HART_ID};
+            ADDR_MSTATUS   : rd_data_w = mstatus | MSTATUS_XL_RO | {mstatus_sd, 63'd0};
+            // RV64 MXL=2 in [63:62]; extensions: A=bit 0, H=bit 7, I=bit 8,
+            // M=bit 12, S=bit 18, U=bit 20, V=bit 21. Phase 11-H B advertised the
+            // hypervisor extension (H, bit 7); Phase 12 V6 advertises the vector
+            // extension (V, bit 21) now that the RVV stack is complete. (F/D/C are
+            // detected from the device tree, as the original IMA value reflects;
+            // Linux likewise detects V from riscv,isa, not misa.)
+            ADDR_MISA      : rd_data_w = 64'h8000_0000_0034_1181;
+            // S-mode CSRs: sstatus/sie/sip are masked views; others standalone.
+            ADDR_SSTATUS   : rd_data_w = (mstatus & SSTATUS_MASK) | SSTATUS_XL_RO | {mstatus_sd, 63'd0};
+            ADDR_SIE       : rd_data_w = mie & SI_MASK;
+            ADDR_STVEC     : rd_data_w = stvec;
+            ADDR_SCOUNTEREN: rd_data_w = scounteren;
+            ADDR_SSCRATCH  : rd_data_w = sscratch;
+            ADDR_SEPC      : rd_data_w = sepc;
+            ADDR_SCAUSE    : rd_data_w = scause;
+            ADDR_STVAL     : rd_data_w = stval;
+            ADDR_SIP       : rd_data_w = mip_read & SI_MASK;
+            ADDR_SCOUNTOVF : rd_data_w = scountovf_val; // P10 Sscofpmf (read-only)
+            ADDR_STIMECMP  : rd_data_w = stimecmp;
+            ADDR_MENVCFG   : rd_data_w = menvcfg;
+            ADDR_SENVCFG   : rd_data_w = senvcfg; // P10 Supm/Ssnpm
+            ADDR_MSECCFG   : rd_data_w = mseccfg; // P10 Smmpm
+            // Phase 11-H HS-level CSRs (own addresses; HS/M view).
+            ADDR_HSTATUS   : rd_data_w = hstatus | HSTATUS_VSXL_RO;
+            ADDR_HEDELEG   : rd_data_w = hedeleg;
+            ADDR_HIDELEG   : rd_data_w = hideleg;
+            ADDR_HIE       : rd_data_w = hie;
+            ADDR_HIP       : rd_data_w = hip_view;
+            ADDR_HVIP      : rd_data_w = hvip;
+            ADDR_HGEIE     : rd_data_w = hgeie;
+            ADDR_HGEIP     : rd_data_w = 64'd0; // no guest external irqs yet (RO)
+            ADDR_HTVAL     : rd_data_w = htval;
+            ADDR_HTINST    : rd_data_w = htinst;
+            ADDR_HCOUNTEREN: rd_data_w = hcounteren;
+            ADDR_HTIMEDELTA: rd_data_w = htimedelta;
+            ADDR_HENVCFG   : rd_data_w = henvcfg;
+            ADDR_HGATP     : rd_data_w = hgatp;
+            // Phase 11-H VS-level CSRs (own addresses; HS/M view).
+            ADDR_VSSTATUS  : rd_data_w = (vsstatus & SSTATUS_MASK) | SSTATUS_XL_RO;
+            ADDR_VSIE      : rd_data_w = vsie & SI_MASK;
+            ADDR_VSTVEC    : rd_data_w = vstvec;
+            ADDR_VSSCRATCH : rd_data_w = vsscratch;
+            ADDR_VSEPC     : rd_data_w = vsepc;
+            ADDR_VSCAUSE   : rd_data_w = vscause;
+            ADDR_VSTVAL    : rd_data_w = vstval;
+            ADDR_VSIP      : rd_data_w = vsip_view;
+            ADDR_VSATP     : rd_data_w = vsatp;
+            ADDR_VSTIMECMP : rd_data_w = vstimecmp; // Phase 11-H Sstc-in-VS
+            ADDR_MCOUNTEREN: rd_data_w = mcounteren;
+            ADDR_MEDELEG   : rd_data_w = medeleg;
+            ADDR_MIDELEG   : rd_data_w = mideleg;
+            ADDR_MIE       : rd_data_w = mie;
+            ADDR_MTVEC     : rd_data_w = mtvec;
+            ADDR_MSCRATCH  : rd_data_w = mscratch;
+            ADDR_MEPC      : rd_data_w = mepc;
+            ADDR_MCAUSE    : rd_data_w = mcause;
+            ADDR_MTVAL     : rd_data_w = mtval;
+            ADDR_MTINST    : rd_data_w = mtinst;
+            ADDR_MTVAL2    : rd_data_w = mtval2;
+            ADDR_MIP       : rd_data_w = mip_read;
+            ADDR_PMPCFG0   : rd_data_w = pmpcfg[0];
+            ADDR_PMPCFG2   : rd_data_w = pmpcfg[1];
+            ADDR_SATP      : rd_data_w = satp;
+            ADDR_MCYCLE    : rd_data_w = mcycle;
+            ADDR_MINSTRET  : rd_data_w = minstret;
+            ADDR_TIME      : rd_data_w = i_mtime; // external clint mtime
+            ADDR_CYCLE     : rd_data_w = mcycle; // alias
+            ADDR_INSTRET   : rd_data_w = minstret;
+            default        : {
+                // P10 Zihpm counter/event ranges (index = addr[4:0]).
+                if i_rd_addr >= ADDR_MHPMC_LO && i_rd_addr <= ADDR_MHPMC_HI {
+                    rd_data_w = mhpmcounter[i_rd_addr[4:0]];
+                } else if i_rd_addr >= ADDR_HPMC_LO && i_rd_addr <= ADDR_HPMC_HI {
+                    rd_data_w = mhpmcounter[i_rd_addr[4:0]]; // hpmcounterN URO alias
+                } else if i_rd_addr >= ADDR_MHPME_LO && i_rd_addr <= ADDR_MHPME_HI {
+                    rd_data_w = mhpmevent[i_rd_addr[4:0]];
+                } else if i_rd_addr >= ADDR_PMPADDR0 && i_rd_addr <= ADDR_PMPADDR15 {
+                    rd_data_w = pmpaddr[i_rd_addr[3:0]];
+                } else {
+                    rd_data_w = 64'd0;
+                }
+            }
+        }
+        // Phase 11-H: in VS-mode (V=1) the S-CSR addresses access the VS
+        // shadow registers instead of the real S-CSRs (which then belong to
+        // HS-mode). Inert while V=0 (boot never enters a guest).
+        if virt {
+            case i_rd_addr {
+                ADDR_SSTATUS : rd_data_w = (vsstatus & SSTATUS_MASK) | SSTATUS_XL_RO;
+                ADDR_SIE     : rd_data_w = vsie & SI_MASK;
+                ADDR_STVEC   : rd_data_w = vstvec;
+                ADDR_SSCRATCH: rd_data_w = vsscratch;
+                ADDR_SEPC    : rd_data_w = vsepc;
+                ADDR_SCAUSE  : rd_data_w = vscause;
+                ADDR_STVAL   : rd_data_w = vstval;
+                ADDR_SIP     : rd_data_w = vsip_view;
+                ADDR_SATP    : rd_data_w = vsatp;
+                // Phase 11-H Sstc-in-VS: the guest's stimecmp (0x14D) aliases
+                // vstimecmp when V=1.
+                ADDR_STIMECMP: rd_data_w = vstimecmp;
+                // Phase 11-H3b: a guest read of `time` observes guest time =
+                // mtime + htimedelta (the hypervisor's per-guest time offset).
+                ADDR_TIME    : rd_data_w = i_mtime + htimedelta;
+                default      : {}
+            }
+        }
+    }
+    // M8.C IRQ pending logic. mip[h/w-driven bits] OR with i_irq_*; the
+    // CSR-written value still flows because mip is RW (handler clears).
+    // mip layout: bit 1=SSIP, 3=MSIP, 5=STIP, 7=MTIP, 9=SEIP, 11=MEIP.
+    // mip_raw ORs the pin-driven hardware sources (MSIP/MTIP/MEIP/SEIP) into
+    // the software-written mip; the STIP bit (5) is then overridden by the
+    // Sstc effective value (software-written when STCE=0, time>=stimecmp when 1).
+    let mip_raw : logic<64> = mip | (if i_irq_sw_m ? 64'h0008 : 64'd0) | (if i_irq_timer_m ? 64'h0080 : 64'd0)
+        | (if i_irq_ext_m ? 64'h0800 : 64'd0) | (if i_irq_ext_s ? 64'h0200 : 64'd0);
+    let mip_eff : logic<64> = (mip_raw & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
+    let mie_pend: logic<64> = mip_eff & mie;
+    // M-mode global enable: MIE for M-priv; always enabled if priv < M.
+    // S-mode global enable: SIE for S-priv (only when not delegated to M).
+    let m_irqs_visible: logic<64> = mie_pend & ~mideleg;
+    let s_irqs_visible: logic<64> = mie_pend & mideleg;
+    let m_irq_gate    : logic     = (priv != csr_pkg::PrivLevel::MACHINE) || (mstatus[3] == 1'b1);
+    // HS (supervisor) interrupts target HS-mode (priv=S, V=0). They are taken
+    // whenever the hart runs strictly below HS — U-mode (V=0), or any V=1 mode
+    // (VS/VU, which the guest exit would escalate out of) — or at HS itself with
+    // mstatus.SIE. The `|| virt` term is the Phase 11-H3b addition; it is inert
+    // while V=0 (boot never virtualizes), so the M/S routing stays byte-identical.
+    let s_irq_gate    : logic     = (priv == csr_pkg::PrivLevel::USER) || virt
+        || (priv == csr_pkg::PrivLevel::SUPERVISOR && mstatus[1] == 1'b1);
+    // Phase 11-H B: a VS interrupt (hvip VSSIP/VSTIP/VSEIP, plus the effective
+    // VSTIP timer source) that is NOT delegated to VS by hideleg is taken by HS,
+    // enabled by hie. It is delivered as the VS interrupt number (VSEIP=10,
+    // VSTIP=6, VSSIP=2) at the HS level, sharing the s_irq_gate. (When hideleg[n]
+    // IS set, the interrupt is delivered into VS instead — see vs_pend_* below.)
+    // Inert at V=0: hvip=0 and vstip_eff=0, so all three are 0 → byte-identical.
+    let hs_vs_pend_sei: logic = hvip[10] && !hideleg[10] && hie[10];
+    let hs_vs_pend_sti: logic = vstip_eff && !hideleg[6] && hie[6];
+    let hs_vs_pend_ssi: logic = hvip[2] && !hideleg[2] && hie[2];
+    let hs_vs_any     : logic = hs_vs_pend_sei || hs_vs_pend_ssi || hs_vs_pend_sti;
+    let m_irq_active  : logic     = m_irq_gate && (m_irqs_visible != 64'd0);
+    let s_irq_active  : logic     = s_irq_gate && ((s_irqs_visible != 64'd0) || hs_vs_any);
+    // Priority order (high → low): MEI MSI MTI SEI SSI STI
+    var m_cause_w: logic<6>;
+    always_comb {
+        if m_irqs_visible[11] {
+            m_cause_w = 6'd11;
+        } else if m_irqs_visible[3] {
+            m_cause_w = 6'd3;
+        } else if m_irqs_visible[7] {
+            m_cause_w = 6'd7;
+        } else if m_irqs_visible[9] {
+            m_cause_w = 6'd9;
+        } else if m_irqs_visible[1] {
+            m_cause_w = 6'd1;
+        } else if m_irqs_visible[5] {
+            m_cause_w = 6'd5;
+        } else if m_irqs_visible[13] {
+            m_cause_w = 6'd13; // P10 Sscofpmf LCOFI (below the standard interrupts)
+        } else {
+            m_cause_w = 6'd0;
+        }
+    }
+    // Priority (high → low): SEI SSI STI, then the non-delegated VS interrupts
+    // taken by HS (VSEI=10, VSSI=2, VSTI=6), then LCOFI (13). Per the RISC-V
+    // major-interrupt order. The hs_vs_* terms are 0 at V=0 (byte-identical).
+    var s_cause_w: logic<6>;
+    always_comb {
+        if s_irqs_visible[9] {
+            s_cause_w = 6'd9;
+        } else if s_irqs_visible[1] {
+            s_cause_w = 6'd1;
+        } else if s_irqs_visible[5] {
+            s_cause_w = 6'd5;
+        } else if hs_vs_pend_sei {
+            s_cause_w = 6'd10; // VSEIP taken by HS (hideleg[10]=0)
+        } else if hs_vs_pend_ssi {
+            s_cause_w = 6'd2;  // VSSIP taken by HS (hideleg[2]=0)
+        } else if hs_vs_pend_sti {
+            s_cause_w = 6'd6;  // VSTIP taken by HS (hideleg[6]=0)
+        } else if s_irqs_visible[13] {
+            s_cause_w = 6'd13; // P10 Sscofpmf LCOFI
+        } else {
+            s_cause_w = 6'd0;
+        }
+    }
+    // Phase 11-H3b: VS-level interrupt delivery into VS-mode. Pending bits come
+    // from hvip (software injection via the hypervisor) plus, for VSTIP, the
+    // hardware vstimecmp source (Sstc-in-VS); the VSEIP hgeip guest-external
+    // source is a deferred follow-up. They are
+    // enabled by the guest in vsie at the S-positions 1/5/9 (which is what the
+    // guest writes through sie), delegated to VS by hideleg at the VS-positions
+    // 2/6/10, and globally gated by V=1 with (VU, or VS and vsstatus.SIE). The
+    // delivered cause is converted to the standard supervisor number the guest
+    // expects (VSEIP→9, VSTIP→5, VSSIP→1), priority SEI>SSI>STI as for HS.
+    let vs_pend_sei: logic = hvip[10] && hideleg[10] && vsie[9];
+    // Phase 11-H Sstc-in-VS: the guest timer pending uses the effective VSTIP
+    // (hardware vstimecmp when Sstc-for-guest is on, else software hvip.VSTIP).
+    let vs_pend_sti: logic = vstip_eff && hideleg[6] && vsie[5];
+    let vs_pend_ssi: logic = hvip[2] && hideleg[2] && vsie[1];
+    let vs_irq_gate: logic = virt && ((priv == csr_pkg::PrivLevel::USER)
+        || (priv == csr_pkg::PrivLevel::SUPERVISOR && vsstatus[1] == 1'b1));
+    let vs_irq_active: logic = vs_irq_gate && (vs_pend_sei || vs_pend_sti || vs_pend_ssi);
+    var vs_cause_w: logic<6>;
+    always_comb {
+        if vs_pend_sei {
+            vs_cause_w = 6'd9;
+        } else if vs_pend_ssi {
+            vs_cause_w = 6'd1;
+        } else if vs_pend_sti {
+            vs_cause_w = 6'd5;
+        } else {
+            vs_cause_w = 6'd0;
+        }
+    }
+    // Priority across levels: M > HS > VS. A pending M- or HS-targeted interrupt
+    // takes precedence (and, while V=1, forces a guest exit) over a VS interrupt.
+    assign o_irq_pending = m_irq_active || s_irq_active || vs_irq_active;
+    assign o_irq_to_s    = !m_irq_active && s_irq_active;
+    assign o_irq_to_vs   = !m_irq_active && !s_irq_active && vs_irq_active;
+    assign o_irq_cause   = if m_irq_active ?
+        {1'b1, 57'd0, m_cause_w}
+    : if s_irq_active ?
+        {1'b1, 57'd0, s_cause_w}
+    :
+        {1'b1, 57'd0, vs_cause_w}
+    ;
+
+    // PMP per-entry config bytes (entry e -> pmpcfg[e/8] byte e%8) and the
+    // pmpaddr write-lock. pmpaddr[e] is read-only if its own entry is locked, OR
+    // if the next entry is a locked TOR (entry e+1 reads pmpaddr[e] as its lower
+    // bound, so locking it must freeze this address too).
+    var pmp_cfgb       : logic<8> [16];
+    var pmp_addr_locked: logic    [16];
+    always_comb {
+        for e in 0..16 {
+            pmp_cfgb[e] = pmpcfg[e / 8][(e % 8) * 8+:8];
+        }
+        for e in 0..16 {
+            if e == 15 {
+                pmp_addr_locked[e] = pmp_cfgb[15][7];
+            } else {
+                pmp_addr_locked[e] = pmp_cfgb[e][7] || (pmp_cfgb[e + 1][7] && pmp_cfgb[e + 1][4:3] == 2'd1);
+            }
+        }
+    }
+    assign o_pmpcfg       = pmpcfg;
+    assign o_pmpaddr      = pmpaddr;
+
+    assign o_rd_data      = rd_data_w;
+    assign o_mtvec        = mtvec;
+    assign o_mepc         = mepc;
+    assign o_stvec        = stvec;
+    assign o_dbg_stval    = stval;
+    assign o_dbg_mtval    = mtval;
+    assign o_sepc         = sepc;
+    assign o_satp         = satp;
+    assign o_medeleg      = medeleg;
+    assign o_mideleg      = mideleg;
+    assign o_priv         = priv;
+    assign o_priv_prev    = priv_prev;
+    // Phase 11-H3 VS trap delegation outputs.
+    assign o_virt_prev    = virt_prev;
+    assign o_hedeleg      = hedeleg;
+    assign o_hideleg      = hideleg;
+    assign o_vstvec       = vstvec;
+    assign o_vsepc        = vsepc;
+    assign o_mstatus_sum  = mstatus[18];
+    assign o_mstatus_mxr  = mstatus[19];
+    assign o_mstatus_mprv = mstatus[17];
+    assign o_menvcfg_pbmte = menvcfg[62]; // P10 Svpbmt
+    assign o_menvcfg_adue  = menvcfg[61]; // P10 Svadu
+    // Phase 11-H two-stage MMU state.
+    assign o_virt          = virt;
+    assign o_mstatus_mpv   = mstatus[39];
+    assign o_hgatp         = hgatp;
+    assign o_vsatp         = vsatp;
+    assign o_vsstatus_sum  = vsstatus[18];
+    assign o_vsstatus_mxr  = vsstatus[19];
+    assign o_vsstatus_fs   = vsstatus[14:13];
+    assign o_hstatus_spvp  = hstatus[8];
+    assign o_hstatus_hu    = hstatus[9];
+    assign o_hstatus_vtvm  = hstatus[20];
+    assign o_hstatus_vtsr  = hstatus[22];
+    // P10 Supm/Ssnpm: PMM (pointer-masking mode) per priv level.
+    assign o_pmm_m         = mseccfg[33:32];
+    assign o_pmm_s         = menvcfg[33:32];
+    assign o_pmm_u         = senvcfg[33:32];
+    assign o_mstatus_mpp  = mstatus[12:11];
+    assign o_mstatus_tvm  = mstatus[20];
+    assign o_mstatus_tsr  = mstatus[22];
+    assign o_mstatus_fs   = mstatus[14:13];
+    assign o_frm          = fcsr[7:5];
+    assign o_vxrm         = vxrm[1:0];
+    // Phase 12 V0: vector state + config feedback.
+    assign o_mstatus_vs   = mstatus[10:9];
+    assign o_vtype        = vtype;
+    assign o_vl           = vl;
+    assign o_vstart       = vstart;
+
+    // === Registered writes + trap entry + counters ===
+    always_ff (clk, rst) {
+        if_reset {
+            priv      = csr_pkg::PrivLevel::MACHINE;
+            priv_prev = csr_pkg::PrivLevel::MACHINE;
+            virt_prev = 1'b0;
+            // M9.A.270: match v1 mstatus reset value.
+            //   bits 35:34 SXL = 2 (= 64-bit S-mode XLEN)
+            //   bits 33:32 UXL = 2 (= 64-bit U-mode XLEN)
+            //   bit 13     FS bit 0 = 1 (FS = Initial)
+            // RV64 requires SXL/UXL = 2 (Sv*). v4 previously reset to 0
+            // (= invalid for RV64) which caused boot divergence vs v1 at
+            // the very first csrw mstatus (cy 0x29) — discovered via
+            // M9.A.269 cosim early retire ring comparison.
+            mstatus    = 64'h0000000A00002000;
+            mie        = 64'd0;
+            mtvec      = 64'd0;
+            mscratch   = 64'd0;
+            mepc       = 64'd0;
+            mcause     = 64'd0;
+            mtval      = 64'd0;
+            mtval2     = 64'd0;
+            mtinst     = 64'd0;
+            mip        = 64'd0;
+            medeleg    = 64'd0;
+            // Phase 11-H B: with H implemented, mideleg bits 2/6/10 (VSSIP/VSTIP/
+            // VSEIP) are read-only one — VS interrupts are always delegated to HS.
+            mideleg    = MIDELEG_RO1;
+            pmpcfg[0]  = 64'd0;
+            pmpcfg[1]  = 64'd0;
+            for pi in 0..16 {
+                pmpaddr[pi] = 64'd0;
+            }
+            satp       = 64'd0;
+            mcycle     = 64'd0;
+            minstret   = 64'd0;
+            fcsr       = 64'd0;
+            // Phase 12 V0: vector CSRs reset to 0 (vl=0, vtype=0 → SEW8/LMUL1).
+            vstart     = 64'd0;
+            vxsat      = 64'd0;
+            vxrm       = 64'd0;
+            vl         = 64'd0;
+            vtype      = 64'd0;
+            stvec      = 64'd0;
+            sscratch   = 64'd0;
+            sepc       = 64'd0;
+            scause     = 64'd0;
+            stval      = 64'd0;
+            scounteren = 64'd0;
+            stimecmp   = 64'hFFFF_FFFF_FFFF_FFFF;
+            menvcfg    = 64'd0;
+            senvcfg    = 64'd0;
+            mseccfg    = 64'd0;
+            // Phase 11-H: virtualization mode + all H/VS CSRs reset to 0, so the
+            // core powers up in HS/M (V=0) with the whole H state inert.
+            virt       = 1'b0;
+            hstatus    = 64'd0;
+            hedeleg    = 64'd0;
+            hideleg    = 64'd0;
+            hie        = 64'd0;
+            hvip       = 64'd0;
+            hgeie      = 64'd0;
+            htval      = 64'd0;
+            htinst     = 64'd0;
+            hcounteren = 64'd0;
+            htimedelta = 64'd0;
+            henvcfg    = 64'd0;
+            hgatp      = 64'd0;
+            vsstatus   = 64'd0;
+            vsie       = 64'd0;
+            vstvec     = 64'd0;
+            vsscratch  = 64'd0;
+            vsepc      = 64'd0;
+            vscause    = 64'd0;
+            vstval     = 64'd0;
+            vsatp      = 64'd0;
+            vstimecmp  = 64'hFFFF_FFFF_FFFF_FFFF; // Phase 11-H Sstc-in-VS: never fires until set
+            mcounteren = 64'd0;
+            for i in 0..32 {
+                mhpmcounter[i] = 64'd0;
+                mhpmevent[i]   = 64'd0;
+            }
+        } else {
+            // M9.A.304: snapshot priv BEFORE any trap/mret/sret update below.
+            priv_prev = priv;
+            // Phase 11-H3: snapshot V the same way.
+            virt_prev = virt;
+            // Trap entry (priority over CSR write since trap fires
+            // commit-time and writes mepc/mcause/mtval atomically).
+            // M5.D: if i_trap_to_s, the trap is delegated to S-mode —
+            // update sepc/scause/stval + sstatus (SPP/SPIE/SIE) and
+            // priv ← S. Else fall to M-mode handler.
+            // Phase 11-H3: i_trap_to_vs takes priority — a VS/VU trap delegated
+            // by both medeleg and hedeleg/hideleg is taken in VS-mode, updating
+            // the VS-level trap CSRs + vsstatus, with priv ← S(=VS) and V kept 1.
+            if i_trap_fire {
+                if i_trap_to_vs {
+                    vsepc   = i_trap_pc;
+                    vscause = i_trap_cause;
+                    vstval  = i_trap_tval;
+                    // vsstatus: SPIE ← SIE, SIE ← 0, SPP ← prev VS/VU priv. V and
+                    // (effective) priv stay in the guest's supervisor mode.
+                    vsstatus[5] = vsstatus[1];
+                    vsstatus[1] = 1'b0;
+                    vsstatus[8] = if priv == csr_pkg::PrivLevel::SUPERVISOR ? 1'b1 : 1'b0;
+                    priv        = csr_pkg::PrivLevel::SUPERVISOR;
+                    // virt unchanged (stays 1).
+                } else if i_trap_to_s {
+                    sepc   = i_trap_pc;
+                    scause = i_trap_cause;
+                    stval  = i_trap_tval;
+                    // Phase 11-H: a trap delivered to HS-mode leaves the
+                    // virtualized world. hstatus.SPV (bit 7) ← previous V,
+                    // hstatus.SPVP (bit 8) ← previous VS/VU priv, V ← 0. Read
+                    // priv here while it still holds the trapped mode. Inert at
+                    // V=0 (SPV/SPVP ← 0, V stays 0). GVA/htval/two-stage cause
+                    // for VS→HS traps come in H3.
+                    hstatus[7] = virt;
+                    hstatus[8] = if priv == csr_pkg::PrivLevel::SUPERVISOR ? 1'b1 : 1'b0;
+                    virt       = 1'b0;
+                    // sstatus: SPIE ← SIE (bit 5 ← bit 1), SIE ← 0
+                    mstatus[5] = mstatus[1];
+                    mstatus[1] = 1'b0;
+                    // SPP (bit 8) ← current priv: 0=U, 1=S
+                    mstatus[8] = if priv == csr_pkg::PrivLevel::SUPERVISOR ? 1'b1 : 1'b0;
+                    priv       = csr_pkg::PrivLevel::SUPERVISOR;
+                    // Phase 11-H3c: hstatus.GVA (bit 6) flags that stval holds a
+                    // guest virtual address (any memory fault taken out of a
+                    // guest). A guest-page-fault (cause 20/21/23) also records the
+                    // faulting guest PA in htval (>> 2) and clears htinst (the
+                    // transformed-instruction encoding is deferred). Inert at V=0
+                    // (i_trap_gva is gated on virt_prev; gpf causes never arise).
+                    hstatus[6] = i_trap_gva;
+                    if i_trap_cause == 64'd20 || i_trap_cause == 64'd21 || i_trap_cause == 64'd23 {
+                        htval  = i_htval;
+                        htinst = 64'd0;
+                    }
+                } else {
+                    mepc   = i_trap_pc;
+                    mcause = i_trap_cause;
+                    mtval  = i_trap_tval;
+                    // Phase 11-H: mstatus.MPV (bit 39) ← previous V (a trap into
+                    // M-mode leaves the virtualized world); V ← 0. Inert at V=0.
+                    mstatus[39] = virt;
+                    virt        = 1'b0;
+                    // Phase 11-H3c/B: mstatus.GVA (bit 38) flags that mtval holds a
+                    // guest VA; a guest-page-fault (20/21/23) taken in M-mode also
+                    // records the faulting guest PA in mtval2 (>> 2) and clears
+                    // mtinst (transformed-instruction encoding deferred). Inert at
+                    // V=0 (i_trap_gva is gated on virt_prev; gpf causes never arise).
+                    mstatus[38] = i_trap_gva;
+                    if i_trap_cause == 64'd20 || i_trap_cause == 64'd21 || i_trap_cause == 64'd23 {
+                        mtval2 = i_htval;
+                        mtinst = 64'd0;
+                    }
+                    // mstatus: MPIE ← MIE (bit 7 ← bit 3), MIE ← 0
+                    mstatus[7] = mstatus[3];
+                    mstatus[3] = 1'b0;
+                    // MPP (bits 12:11) ← current priv encoding (M=11, S=01, U=00)
+                    if priv == csr_pkg::PrivLevel::MACHINE {
+                        mstatus[12] = 1'b1;
+                        mstatus[11] = 1'b1;
+                    } else if priv == csr_pkg::PrivLevel::SUPERVISOR {
+                        mstatus[12] = 1'b0;
+                        mstatus[11] = 1'b1;
+                    } else {
+                        mstatus[12] = 1'b0;
+                        mstatus[11] = 1'b0;
+                    }
+                    priv = csr_pkg::PrivLevel::MACHINE;
+                }
+            } else if i_mret_fire {
+                // mstatus: MIE ← MPIE, MPIE ← 1; priv ← MPP; MPP ← U
+                mstatus[3] = mstatus[7];
+                mstatus[7] = 1'b1;
+                if mstatus[12] == 1'b1 && mstatus[11] == 1'b1 {
+                    priv = csr_pkg::PrivLevel::MACHINE;
+                } else if mstatus[12] == 1'b0 && mstatus[11] == 1'b1 {
+                    priv = csr_pkg::PrivLevel::SUPERVISOR;
+                } else {
+                    priv = csr_pkg::PrivLevel::USER;
+                }
+                // Phase 11-H: V ← MPV unless returning to M-mode; then MPV ← 0.
+                // Reads MPP (mstatus[12:11]) here, before it is cleared below.
+                // Inert at V=0 (MPV=0 → V stays 0). When the hypervisor returns
+                // into a guest (MPP=S/U, MPV=1) this correctly sets V=1.
+                virt        = if (mstatus[12] == 1'b1 && mstatus[11] == 1'b1) ? 1'b0 : mstatus[39];
+                mstatus[39] = 1'b0;
+                // MPP ← U (00)
+                mstatus[12] = 1'b0;
+                mstatus[11] = 1'b0;
+            } else if i_sret_fire && virt {
+                // Phase 11-H3b: a VS-mode SRET (V=1) operates on vsstatus, not
+                // mstatus, and V stays 1 (the guest returns to VS/VU). vsstatus:
+                // SIE ← SPIE, SPIE ← 1; priv ← SPP (1=VS, 0=VU); SPP ← U. The
+                // return PC is vsepc (selected by the core). hstatus is untouched.
+                vsstatus[1] = vsstatus[5];
+                vsstatus[5] = 1'b1;
+                priv        = if vsstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
+                vsstatus[8] = 1'b0;
+            } else if i_sret_fire {
+                // sstatus: SIE ← SPIE, SPIE ← 1; priv ← SPP (1=S, 0=U); SPP ← U
+                mstatus[1] = mstatus[5];
+                mstatus[5] = 1'b1;
+                priv       = if mstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
+                mstatus[8] = 1'b0;
+                // Phase 11-H: an HS-mode SRET restores V ← hstatus.SPV, then
+                // clears SPV. When SPV=1 this enters a guest (priv = SPP gives
+                // VS/VU under the SUPERVISOR/USER encoding). Inert at V=0 (SPV=0
+                // → V stays 0). A VS-mode SRET (V=1) takes the branch above.
+                virt       = hstatus[7];
+                hstatus[7] = 1'b0;
+            } else if i_wr_en && virt && (i_wr_addr == ADDR_SSTATUS || i_wr_addr == ADDR_SIE
+                || i_wr_addr == ADDR_SIP || i_wr_addr == ADDR_STVEC || i_wr_addr == ADDR_SSCRATCH
+                || i_wr_addr == ADDR_SEPC || i_wr_addr == ADDR_SCAUSE || i_wr_addr == ADDR_STVAL
+                || i_wr_addr == ADDR_SATP || i_wr_addr == ADDR_STIMECMP) {
+                // Phase 11-H: VS-mode S-CSR write aliasing — the guest's writes
+                // to the S-CSR addresses update the VS shadow registers. This
+                // whole branch is dead while V=0 (boot never enters a guest), so
+                // the existing S-CSR write path below is byte-identical.
+                case i_wr_addr {
+                    ADDR_SSTATUS : vsstatus  = (vsstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK);
+                    ADDR_SIE     : vsie      = (vsie & ~SI_MASK) | (i_wr_data & SI_MASK);
+                    // Phase 11-H3b: the guest's sip.SSIP write aliases hvip.VSSIP
+                    // (the one writable VS-interrupt-pending bit); STIP/SEIP are
+                    // read-only in sip, so the rest of the write is dropped.
+                    ADDR_SIP     : hvip[2]   = i_wr_data[1];
+                    ADDR_STVEC   : vstvec    = i_wr_data;
+                    ADDR_SSCRATCH: vsscratch = i_wr_data;
+                    ADDR_SEPC    : vsepc     = i_wr_data;
+                    ADDR_SCAUSE  : vscause   = i_wr_data;
+                    ADDR_STVAL   : vstval    = i_wr_data;
+                    ADDR_SATP    : vsatp     = i_wr_data;
+                    // Phase 11-H Sstc-in-VS: the guest's stimecmp aliases vstimecmp.
+                    ADDR_STIMECMP: vstimecmp = i_wr_data;
+                    default      : {}
+                }
+            } else if i_wr_en {
+                case i_wr_addr {
+                    ADDR_FFLAGS    : fcsr[4:0] = i_wr_data[4:0];
+                    ADDR_FRM       : fcsr[7:5] = i_wr_data[2:0];
+                    ADDR_FCSR      : fcsr[7:0] = i_wr_data[7:0];
+                    // Phase 12 V0: vector RW CSRs (vl/vtype/vlenb are read-only).
+                    ADDR_VSTART    : vstart = i_wr_data;
+                    ADDR_VXSAT     : vxsat  = {63'd0, i_wr_data[0]};
+                    ADDR_VXRM      : vxrm   = {62'd0, i_wr_data[1:0]};
+                    ADDR_VCSR      : {
+                        vxsat = {63'd0, i_wr_data[0]};
+                        vxrm  = {62'd0, i_wr_data[2:1]};
+                    }
+                    ADDR_MSTATUS   : mstatus  = i_wr_data;
+                    // medeleg is fully writable (all standard exceptions, incl. the
+                    // access-fault causes 1/5/7, are delegatable to S-mode — matches
+                    // the Sail reference and the ACT4 PMP suites, which delegate
+                    // access faults to the S-mode trap handler).
+                    ADDR_MEDELEG   : medeleg  = i_wr_data;
+                    ADDR_MIDELEG   : mideleg  = i_wr_data | MIDELEG_RO1; // bits 2/6/10 RO-1
+                    ADDR_MIE       : mie      = i_wr_data;
+                    ADDR_MTVEC     : mtvec    = i_wr_data;
+                    ADDR_MSCRATCH  : mscratch = i_wr_data;
+                    ADDR_MEPC      : mepc     = i_wr_data;
+                    ADDR_MCAUSE    : mcause   = i_wr_data;
+                    ADDR_MTVAL     : mtval    = i_wr_data;
+                    ADDR_MTINST    : mtinst   = i_wr_data;
+                    ADDR_MTVAL2    : mtval2   = i_wr_data;
+                    ADDR_MIP       : mip      = i_wr_data;
+                    // PMP cfg: per-byte WARL — a locked byte (L=1) is read-only;
+                    // reserved bits [6:5] are cleared on write.
+                    ADDR_PMPCFG0   : for b in 0..8 {
+                        if !pmpcfg[0][b * 8 + 7] {
+                            pmpcfg[0][b * 8+:8] = i_wr_data[b * 8+:8] & PMPCFG_BYTE_MASK;
+                        }
+                    }
+                    ADDR_PMPCFG2   : for b in 0..8 {
+                        if !pmpcfg[1][b * 8 + 7] {
+                            pmpcfg[1][b * 8+:8] = i_wr_data[b * 8+:8] & PMPCFG_BYTE_MASK;
+                        }
+                    }
+                    ADDR_SATP      : satp     = i_wr_data;
+                    ADDR_MCYCLE    : mcycle   = i_wr_data;
+                    ADDR_MINSTRET  : minstret = i_wr_data;
+                    // S-mode CSRs (M5.D). sstatus/sie/sip write through to
+                    // mstatus/mie/mip masked by visible bits.
+                    ADDR_SSTATUS   : mstatus    = (mstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK);
+                    ADDR_SIE       : mie        = (mie & ~SI_MASK) | (i_wr_data & SI_MASK);
+                    ADDR_SIP       : mip        = (mip & ~SI_MASK) | (i_wr_data & SI_MASK);
+                    ADDR_STVEC     : stvec      = i_wr_data;
+                    ADDR_SCOUNTEREN: scounteren = i_wr_data;
+                    ADDR_SSCRATCH  : sscratch   = i_wr_data;
+                    ADDR_SEPC      : sepc       = i_wr_data;
+                    ADDR_SCAUSE    : scause     = i_wr_data;
+                    ADDR_STVAL     : stval      = i_wr_data;
+                    // P10 Sstc. stimecmp is RW from M-mode and (when STCE=1)
+                    // from S-mode; menvcfg.STCE enables the hardware STIP path.
+                    ADDR_STIMECMP  : stimecmp   = i_wr_data;
+                    ADDR_MENVCFG   : menvcfg    = i_wr_data;
+                    ADDR_SENVCFG   : senvcfg    = i_wr_data; // P10 Supm/Ssnpm
+                    ADDR_MSECCFG   : mseccfg    = i_wr_data; // P10 Smmpm
+                    // Phase 11-H HS-level CSR writes (own addresses).
+                    ADDR_HSTATUS   : hstatus    = i_wr_data;
+                    // Phase 11-H B: hedeleg bits for exceptions always taken in HS
+                    // or M are read-only zero — ecall-from-VS (10), instruction /
+                    // load / store guest-page-fault (20/21/23), and virtual
+                    // instruction (22). These can never be delegated to VS-mode, so
+                    // mask them off on write (keeps cause-22 / guest-page-faults
+                    // routed to HS regardless of a buggy hedeleg write).
+                    ADDR_HEDELEG   : hedeleg    = i_wr_data & HEDELEG_WMASK;
+                    ADDR_HIDELEG   : hideleg    = i_wr_data;
+                    ADDR_HIE       : hie        = i_wr_data;
+                    // Phase 11-H3b: hip.VSSIP (bit 2) is a writable alias of
+                    // hvip.VSSIP; the rest of hip is read-only (a view of the
+                    // pending VS interrupts, see hip_view).
+                    ADDR_HIP       : hvip[2]    = i_wr_data[2];
+                    // hvip writable bits are VSSIP(2)/VSTIP(6)/VSEIP(10) only.
+                    ADDR_HVIP      : hvip       = i_wr_data & 64'h0000_0000_0000_0444;
+                    ADDR_HGEIE     : hgeie      = i_wr_data;
+                    ADDR_HTVAL     : htval      = i_wr_data;
+                    ADDR_HTINST    : htinst     = i_wr_data;
+                    ADDR_HCOUNTEREN: hcounteren = i_wr_data;
+                    ADDR_HTIMEDELTA: htimedelta = i_wr_data;
+                    ADDR_HENVCFG   : henvcfg    = i_wr_data;
+                    ADDR_HGATP     : hgatp      = i_wr_data;
+                    // Phase 11-H VS-level CSR writes (own addresses).
+                    ADDR_VSSTATUS  : vsstatus   = (vsstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK);
+                    ADDR_VSIE      : vsie       = (vsie & ~SI_MASK) | (i_wr_data & SI_MASK);
+                    // vsip.SSIP aliases hvip.VSSIP (see the SIP-alias write above).
+                    ADDR_VSIP      : hvip[2]    = i_wr_data[1];
+                    ADDR_VSTVEC    : vstvec     = i_wr_data;
+                    ADDR_VSSCRATCH : vsscratch  = i_wr_data;
+                    ADDR_VSEPC     : vsepc      = i_wr_data;
+                    ADDR_VSCAUSE   : vscause    = i_wr_data;
+                    ADDR_VSTVAL    : vstval     = i_wr_data;
+                    ADDR_VSATP     : vsatp      = i_wr_data;
+                    ADDR_VSTIMECMP : vstimecmp  = i_wr_data; // Phase 11-H Sstc-in-VS
+                    ADDR_MCOUNTEREN: mcounteren = i_wr_data;
+                    default        : {
+                        // P10 Zihpm: mhpmcounter / mhpmevent writes (index =
+                        // addr[4:0]). The mhpmcounter write is reconciled with
+                        // the same-cycle event increment at the bottom of this
+                        // block (the increment is suppressed when written here).
+                        if i_wr_addr >= ADDR_MHPMC_LO && i_wr_addr <= ADDR_MHPMC_HI {
+                            mhpmcounter[i_wr_addr[4:0]] = i_wr_data;
+                        } else if i_wr_addr >= ADDR_MHPME_LO && i_wr_addr <= ADDR_MHPME_HI {
+                            mhpmevent[i_wr_addr[4:0]] = i_wr_data;
+                        } else if i_wr_addr >= ADDR_PMPADDR0 && i_wr_addr <= ADDR_PMPADDR15 {
+                            // pmpaddr WARL: 54-bit field; locked entry is read-only.
+                            if !pmp_addr_locked[i_wr_addr[3:0]] {
+                                pmpaddr[i_wr_addr[3:0]] = i_wr_data & PMPADDR_MASK;
+                            }
+                        }
+                    }
+                }
+            }
+            // M6: accrue FP exception flags from a committing FP op and mark
+            // mstatus.FS dirty. 1-wide commit makes this mutually exclusive
+            // with the CSR-write / trap / mret / sret cases above.
+            if i_fflags_set {
+                fcsr[4:0]      = fcsr[4:0] | i_fflags;
+                mstatus[14:13] = 2'b11; // FS = Dirty
+            }
+            // Phase 12 V5a: OR the sticky vxsat bit from a committing saturating
+            // op (mutually exclusive with the CSR-write case above; 1-wide commit).
+            if i_vxsat_set {
+                vxsat[0] = 1'b1;
+            }
+            // Phase 12 V0: commit of a vset*vl op updates the architectural vl /
+            // vtype and clears vstart (1-wide commit makes this mutually exclusive
+            // with the CSR-write / trap / mret / sret cases above).
+            if i_vset_wr {
+                vtype  = i_set_vtype;
+                vl     = i_set_vl;
+                vstart = 64'd0;
+            }
+            // Phase 12 V1: commit of a vector mem op writes vstart (faulting
+            // element on a precise fault, else 0). Mutually exclusive with the
+            // vset case (1-wide commit), and overrides a same-cycle vstart CSR
+            // write (the committing op's effect is the architectural one).
+            if i_vstart_wr {
+                vstart = i_vstart_val;
+            }
+            // Free-running counters. Per RISC-V priv spec, a CSR write
+            // to minstret/mcycle suppresses the increment that the
+            // very next instruction would observe — implement by gating
+            // the increment when the same cycle CSR-writes the counter.
+            let mcycle_being_written  : logic = i_wr_en && i_wr_addr == ADDR_MCYCLE;
+            let minstret_being_written: logic = i_wr_en && i_wr_addr == ADDR_MINSTRET;
+            if !mcycle_being_written {
+                mcycle = mcycle + 64'd1;
+            }
+            if !minstret_being_written {
+                minstret = minstret + (i_instret_cnt as 64);
+            }
+            // P10 Zihpm: each mhpmcounter[3..31] counts the event its mhpmevent
+            // selects (sel 1..8 → event bus bit 0..7; sel 0 freezes it). A CSR
+            // write to the counter this cycle takes priority over the increment.
+            // Per-counter overflow-pend bits are gathered into an independent
+            // vector (distinct indices, no loop-carried dependency); a single
+            // balanced OR-reduction below pends mip[13] without the old
+            // ~29-deep running-OR chain.
+            var hpm_ovf_pend: logic<32>;
+            hpm_ovf_pend = 32'd0;
+            for n in 3..32 {
+                let ev_sel : logic<64> = mhpmevent[n];
+                let sel    : logic<4>  = ev_sel[3:0];
+                let sel_m1 : logic<4>  = sel - 4'd1;
+                let ev_idx : logic<3>  = sel_m1[2:0];
+                // P10 Sscofpmf: per-mode counting filter. MINH(62)/SINH(61)/
+                // UINH(60) inhibit counting in M/S/U mode (VS/VU 59/58 unused —
+                // no hypervisor). All reset to 0, so legacy code counts as before.
+                let inhibit: logic = (priv == csr_pkg::PrivLevel::MACHINE && ev_sel[62])
+                    || (priv == csr_pkg::PrivLevel::SUPERVISOR && ev_sel[61])
+                    || (priv == csr_pkg::PrivLevel::USER && ev_sel[60]);
+                let ev_hit : logic     = sel != 4'd0 && sel <= 4'd8 && i_hpm_events[ev_idx] && !inhibit;
+                let c_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPMC_LO + (n as 12) - 12'd3);
+                let e_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPME_LO + (n as 12) - 12'd3);
+                if ev_hit && !c_wr {
+                    // P10 Sscofpmf: detect wrap (all-1s → 0) on this increment;
+                    // set the event's OF (bit 63) sticky and pend LCOFI (mip[13]).
+                    // A same-cycle event-CSR write owns OF, so suppress the set.
+                    let will_wrap: logic = mhpmcounter[n] == 64'hFFFFFFFFFFFFFFFF;
+                    mhpmcounter[n] = mhpmcounter[n] + 64'd1;
+                    if will_wrap && !e_wr {
+                        mhpmevent[n][63] = 1'b1; // OF
+                        hpm_ovf_pend[n]  = 1'b1; // pend LCOFI (OR-reduced below)
+                    }
+                }
+            }
+            if hpm_ovf_pend != 32'd0 {
+                mip[13] = 1'b1; // LCOFIP (sticky until SW clears)
+            }
+        }
+    }
+}

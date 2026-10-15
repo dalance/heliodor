@@ -6,8 +6,15 @@
 //                           o_fetch_take advances it
 //   o_rewind_valid/o_rewind : set the ftq fetch pointer back to a block whose
 //                           icache request missed (wins over a take)
-//   i_priv, i_pmp*        : live csr state, read in f0; they change only at a
-//                           flushing retire
+//   i_xl_on, i_ctx, i_pmp* : live csr state, read in f0; they change only at
+//                           a flushing retire. i_xl_on: Sv39 is on for fetch
+//   o_tlb_lk/i_tlb        : f0, the ITLB lookup port, combinational round trip
+//   o_xreq_valid/o_xreq, i_xreq_ready : f0, the walk request of the oldest
+//                           unfetched block (nothing in f1 or f2) on an ITLB
+//                           miss; one at a time
+//   i_ptw_evt, i_ptw_resp : the I walker's broadcast and owner answer; the
+//                           event of the walked page ends the wait, a faulting
+//                           answer is kept and faults the block of that page
 //   o_ic_req_valid/o_ic_req : icache request, from the f1 register
 //   i_ic_ready            : the icache accepts the f1 request this cycle
 //   i_ic_resp             : icache response, IC_RESP_LAT = 1 cycle after
@@ -20,8 +27,8 @@
 //   o_ev_*                : event wires: no FBQ credit, ftq empty with the ifu
 //                           idle, stopped after a faulted block
 // Stages: f0 takes an FTQ entry, translates its aligned block (Bare: PA =
-// VA), and evaluates PMA and per-granule PMP execute permission, all
-// combinationally; f1 (registered) requests the icache; f2 is the cycle after
+// VA; Sv39: an ITLB hit, or a walk first), and evaluates PMA and per-granule
+// PMP execute permission, all combinationally; f1 (registered) requests the icache; f2 is the cycle after
 // the accept and receives the response, pushing a HIT into the FBQ. The
 // module has one register per stage, so it requires IC_RESP_LAT = 1
 // (CFG_ERR bit 17).
@@ -49,9 +56,17 @@ pub module ifu::<CFG: core_cfg> #(
     clk                : input  clock                        ,
     rst                : input  reset                        ,
     i_fetch_valid      : input  logic                        ,
-    i_priv             : input  csr_pkg::PrivLevel           ,
+    i_xl_on            : input  logic                        ,
+    i_ctx              : input  xlate_pkg::XlateCtx          ,
     i_pmpcfg           : input  logic<64>                [2] ,
     i_pmpaddr          : input  logic<64>                [16],
+    o_tlb_lk           : output xlate_pkg::TlbLookup         ,
+    i_tlb              : input  xlate_pkg::TlbEntry          ,
+    o_xreq_valid       : output logic                        ,
+    o_xreq             : output core_types::<CFG>::XlateReq  ,
+    i_xreq_ready       : input  logic                        ,
+    i_ptw_evt          : input  core_types::<CFG>::PtwEvent  ,
+    i_ptw_resp         : input  core_types::<CFG>::XlateResp ,
     i_fetch            : input  core_types::<CFG>::FtqFetch  ,
     o_fetch_take       : output logic                        ,
     o_rewind_valid     : output logic                        ,
@@ -70,6 +85,7 @@ pub module ifu::<CFG: core_cfg> #(
     o_ev_fbq_full      : output logic                        ,
     o_ev_ftq_empty_idle: output logic                        ,
     o_ev_fault_stall   : output logic                        ,
+    o_ev_xlate_wait    : output logic                        ,
 ) {
     import core_types::<CFG>::*;
 
@@ -84,6 +100,10 @@ pub module ifu::<CFG: core_cfg> #(
     var wait_q : logic       ; // waiting for an icache event after a MISS
     var stop_q : logic       ; // a faulted block was taken
     var fbq_n_q: logic<CNT_W>; // FBQ occupancy
+    var xw_q   : logic       ; // a walk of page xvpn_q is pending
+    var xvpn_q : logic<27>   ;
+    var xf_q   : logic       ; // the walk of page xvpn_q faulted with xexc_q
+    var xexc_q : exc_pkg::ExcRec;
 
     // f2: the response of the request accepted last cycle.
     let resp  : logic = f2_v_q && i_ic_resp.valid;
@@ -94,17 +114,32 @@ pub module ifu::<CFG: core_cfg> #(
     let f1_out: logic = f1_v_q && !r_miss && !flush;
     let f1_go : logic = f1_out && i_ic_ready;
 
-    // f0: Bare translation of the aligned block and its PMA.
-    let base  : logic           <64> = i_fetch.start_pc & ~((CFG::FETCH_BYTES - 1) as 64);
-    let pa    : pma_pkg::Pa          = base[55:0];
-    let attr  : pma_pkg::PmaAttr     = pma_check::<PMA_N>(pa, PMA_REGIONS);
-    let fault : logic                = i_fetch.start_pc[63:56] != 0 || !attr.executable;
+    // f0: translation of the aligned block and its PMA.
+    let va    : logic           <64> = i_fetch.start_pc;
+    let vpn   : logic           <27> = va[38:12];
+    let base  : logic           <64> = va & ~((CFG::FETCH_BYTES - 1) as 64);
+    let noncan: logic                = i_xl_on && va[63:39] != {va[38] repeat 25};
+    let xf_hit: logic                = xf_q && xvpn_q == vpn;
+    let lk    : logic                = i_xl_on && !noncan && !xf_hit;
+    let miss  : logic                = lk && !i_tlb.hit;
+    let prm   : xlate_pkg::Perm      = xlate_pkg::perm(i_tlb, xlate_pkg::AccKind::FETCH, i_ctx);
+    let pf    : logic                = noncan || (lk && i_tlb.hit && !prm.ok);
+    let pa    : pma_pkg::Pa          = if i_xl_on ? xlate_pkg::entry_pa(i_tlb, base) : base[55:0];
+    let attr  : pma_pkg::PmaAttr     = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(pa, PMA_REGIONS), if i_xl_on ? i_tlb.pbmt : 2'd0);
+    let af    : logic                = (!i_xl_on && va[63:56] != 0) || !attr.executable;
+    let fault : logic                = xf_hit || pf || af;
+
+    always_comb {
+        o_tlb_lk.valid = i_fetch_valid && lk;
+        o_tlb_lk.vpn   = vpn;
+        o_tlb_lk.asid  = i_ctx.asid;
+    }
     var deny  : logic           <GRAN_N>;
     for g in 0..GRAN_N :g_pmp {
         inst u_pmp: pmp_check (
             i_addr   : {8'd0, pa} + (g * 4) as 64,
             i_acc    : 2'd2                      ,
-            i_priv                               ,
+            i_priv   : i_ctx.prv                 ,
             i_pmpcfg                             ,
             i_pmpaddr                            ,
             o_fault  : deny[g]                   ,
@@ -119,8 +154,11 @@ pub module ifu::<CFG: core_cfg> #(
         f0_req.id.pred      = i_fetch.pred;
         f0_req.id.probe     = !fault;
         f0_req.id.exc.valid = fault;
-        f0_req.id.exc.cause = 6'd1; // instruction access fault
+        f0_req.id.exc.cause = if pf ? 6'd12 : 6'd1;
         f0_req.id.exc.tval  = i_fetch.start_pc;
+        if xf_hit {
+            f0_req.id.exc = xexc_q;
+        }
         f0_req.id.pmp_deny  = if fault ? 0 : deny;
         f0_req.pa           = pa;
         f0_req.cacheable    = attr.cacheable;
@@ -128,7 +166,21 @@ pub module ifu::<CFG: core_cfg> #(
 
     let used  : logic<CNT_W> = fbq_n_q + f1_v_q + f2_v_q;
     let credit: logic        = used <: FBQ_N;
-    let f0_go : logic        = i_fetch_valid && !wait_q && !stop_q && !flush && !r_miss && credit && (!f1_v_q || f1_go);
+    let f0_go : logic        = i_fetch_valid && !miss && !wait_q && !stop_q && !flush && !r_miss && credit && (!f1_v_q || f1_go);
+
+    // The block in f0 is the oldest unfetched one once f1 and f2 are empty.
+    assign o_xreq_valid = i_fetch_valid && miss && !xw_q && !wait_q && !stop_q && !flush && !f1_v_q && !f2_v_q;
+    always_comb {
+        o_xreq            = 0 as XlateReq;
+        o_xreq.valid      = 1'b1;
+        o_xreq.tag.client = MemClient::IFU;
+        o_xreq.tag.id     = {i_fetch.ftq.wrap, i_fetch.ftq.idx} as MEMID_W;
+        o_xreq.va         = va;
+        o_xreq.acc        = xlate_pkg::AccKind::FETCH;
+    }
+    let x_acc : logic = o_xreq_valid && i_xreq_ready;
+    let x_end : logic = i_ptw_evt.valid && i_ptw_evt.key.vpn == xvpn_q && i_ptw_evt.key.regime == xlate_pkg::Regime::V0;
+    let x_flt : logic = i_ptw_resp.valid && i_ptw_resp.exc.valid && i_ptw_resp.tag.client == MemClient::IFU;
     let push  : logic        = r_hit && !flush;
 
     var fb_v  : logic    [1];
@@ -166,7 +218,29 @@ pub module ifu::<CFG: core_cfg> #(
             wait_q  = 1'b0;
             stop_q  = 1'b0;
             fbq_n_q = 0;
+            xw_q    = 1'b0;
+            xvpn_q  = '0;
+            xf_q    = 1'b0;
+            xexc_q  = 0 as exc_pkg::ExcRec;
         } else {
+            // A flush drops the request in the walker; a running walk still
+            // ends with its event, which matches no pending page.
+            if flush {
+                xw_q = 1'b0;
+                xf_q = 1'b0;
+            } else {
+                if x_acc {
+                    xw_q   = 1'b1;
+                    xvpn_q = vpn;
+                    xf_q   = 1'b0;
+                } else if x_end {
+                    xw_q = 1'b0;
+                }
+                if x_flt {
+                    xf_q   = 1'b1;
+                    xexc_q = i_ptw_resp.exc;
+                }
+            }
             if flush || r_miss {
                 f1_v_q = 1'b0;
             } else if f0_go {
@@ -209,4 +283,5 @@ pub module ifu::<CFG: core_cfg> #(
     assign o_ev_fbq_full       = i_fetch_valid && !credit;
     assign o_ev_ftq_empty_idle = !i_fetch_valid && !f1_v_q && !f2_v_q && !wait_q && !stop_q;
     assign o_ev_fault_stall    = i_fetch_valid && stop_q;
+    assign o_ev_xlate_wait     = i_fetch_valid && xw_q;
 }

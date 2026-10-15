@@ -1,18 +1,27 @@
-// LSU walking test: mem_pipe x MEM_W, lq, sq, sb, mem_port_arb and
-// dcache_port_adapter over the reused dcache and a behavioural memory with
-// the mem_ctrl slot protocol (1-cycle accept, latency, 8-beat stream; a
-// write channel with random grants; random line recalls).
+// LSU walking test: mem_pipe x MEM_W, lq, sq, sb, mem_port_arb,
+// atomic_unit, io_unit and dcache_port_adapter over the reused dcache and a
+// behavioural memory with the mem_ctrl slot protocol (1-cycle accept,
+// latency, 8-beat stream, single-beat uncached reads; a write channel with
+// random grants; random line recalls; invalidates of lines this hart cannot
+// own; a device with a read side effect).
 //
-// A synthetic driver plays dispatch, the memory IQ and commit. The program is
-// a pure function of the op index (loads, stores, fences over a few lines,
-// with misaligned and line-crossing accesses), so a kill simply re-dispatches
-// from the op after keep. Every load is checked at retire against a byte
-// image updated by stores in program order: a load that was not poisoned must
-// hold the value of every older store. Random partial kills, delayed store
-// data and recalls stress the park, re-issue and replay paths.
+// A synthetic driver plays dispatch, the memory IQ (atomics issue on the
+// HEAD pipe once they hold the oldest token), the arch RAT and PRF reads of
+// atomic_unit, and commit; mem_pipe hands atomics to atomic_unit, and lq/sq
+// offer non-cacheable ops to io_unit. The program is a
+// pure function of the op index (loads, stores, fences, atomics and
+// non-cacheable accesses over a few lines, with misaligned and line-crossing
+// accesses), so a kill simply re-dispatches from the op after keep. Every
+// load and atomic is checked at retire against a byte image updated in
+// program order; a contended counter, incremented by a remote agent through
+// recalls, checks atomicity; device access counts check that every
+// non-cacheable access happens exactly once. Random partial kills, withheld
+// tokens with interrupt-like full kills, delayed store data, recalls and
+// invalidates stress the park, re-issue, replay, watch and reservation paths.
 module lsu_harness::<CFG: core_cfg> #(
     param SEED: logic<64> = 1  ,
     param NOPS: u32       = 600,
+    param XOPS: bit       = 1  , // atomics and non-cacheable ops in the program
 ) (
     clk      : input  clock    ,
     rst      : input  reset    ,
@@ -20,12 +29,16 @@ module lsu_harness::<CFG: core_cfg> #(
     o_pass   : output logic    ,
     o_retired: output logic<32>,
     o_cov    : output logic<32>,
-    o_chk    : output logic<16>,
+    o_cov2   : output logic<32>,
+    o_chk    : output logic<32>,
 ) {
     import core_types::<CFG>::*;
     import opclass_pkg::*;
 
     const MW: u32 = CFG::MEM_W;
+    const CTR_VA: logic<64> = 64'h8000_0f00;
+    const IO_VA : logic<64> = 64'h1000_0000;
+    const NC_VA : logic<64> = 64'h9000_0000;
     const RN: u32 = CFG::ROB_N;
     const RW: u32 = ROB_IDX_W;
     const CMW: u32 = CFG::COMMIT_W;
@@ -43,25 +56,38 @@ module lsu_harness::<CFG: core_cfg> #(
         return z ^ (z >> 31);
     }
 
-    // kind: 0 load, 1 store, 2 fence
+    // kind: 0 load, 1 store, 2 fence, 3 atomic, 4 non-cacheable
     struct POp {
-        kind: logic<2> ,
+        kind: logic<3> ,
         op  : MemOp    ,
         va  : logic<64>,
         imm : logic<12>,
         data: logic<64>,
+        amo : AmoUop   ,
+        ctr : logic    , // amoadd.d of 1 on the contended counter
+        cmat: logic    , // amocas: the compare value is memory's
+        cmp : logic<64>, // amocas: otherwise this (and its inverse above it)
+        hi  : logic<64>, // amocas.q: rs2+1
+        st  : logic    , // non-cacheable: store
+        nc  : logic    , // non-cacheable: DRAM rather than the device
     }
 
-    function pop (
+    function pop0 (
         pi: input logic<32>,
     ) -> POp {
         var r  : POp      ;
         var h  : logic<64>;
+        var g  : logic<64>;
         var off: logic<6> ;
         var am : logic<3> ;
+        var sel: logic<5> ;
+        var f3 : logic<3> ;
+        var aa : logic<6> ;
         h         = mix(SEED ^ {32'd0, pi});
-        r.kind    = if h[3:0] <: 4'd7 || h[3:0] == 4'd15 ? 2'd0 : if h[3:0] <: 4'd14 ? 2'd1 : 2'd2;
-        r.op.st   = r.kind == 2'd1;
+        g         = mix(h ^ 64'h3c3c_5a5a);
+        r.op      = 0 as MemOp;
+        r.kind    = if h[3:0] <: 4'd7 || h[3:0] == 4'd15 ? 3'd0 : if h[3:0] <: 4'd14 ? 3'd1 : 3'd2;
+        r.op.st   = r.kind == 3'd1;
         r.op.size = h[5:4];
         r.op.sgn  = h[19];
         am        = case h[5:4] {
@@ -80,6 +106,169 @@ module lsu_harness::<CFG: core_cfg> #(
         r.va      = r.va + {58'd0, off};
         r.imm     = {h[31], h[31:21]};
         r.data    = mix(h);
+        r.amo     = '0;
+        r.ctr     = 1'b0;
+        r.cmat    = g[20];
+        r.cmp     = mix(g);
+        r.hi      = mix(g ^ 64'h1);
+        r.st      = 1'b0;
+        r.nc      = 1'b0;
+        if XOPS && g[2:0] == 3'd0 {
+            r.kind = 3'd3;
+        } else if XOPS && g[5:3] == 3'd0 {
+            r.kind = 3'd4;
+        }
+        if r.kind == 3'd3 {
+            // LR 6/32, SC 6/32, each AMO op 2/32, amocas 2/32
+            sel      = {g[30], g[9:6]};
+            r.amo.op = if sel <: 5'd6 ? AmoOp::LR : if sel <: 5'd12 ? AmoOp::SC : if sel >: 5'd29 ? AmoOp::CAS : (((sel - 5'd12) >> 1) + 5'd2) as AmoOp;
+            f3       = if r.amo.op == AmoOp::LR || r.amo.op == AmoOp::SC ? {2'b01, g[10]} : if r.amo.op == AmoOp::CAS ? (if g[12:10] >: 3'd4 ? 3'd3 : g[12:10]) : {1'b0, g[11:10]};
+            aa       = case f3 {
+                3'd0   : 6'b111111,
+                3'd1   : 6'b111110,
+                3'd2   : 6'b111100,
+                3'd3   : 6'b111000,
+                default: 6'b110000,
+            };
+            r.va     = 64'h8000_0000 | {49'd0, g[15:13], 12'd0} | {57'd0, g[16], 6'd0};
+            if g[18:17] == 2'd0 {
+                r.va = 64'h8000_0000 | {57'd0, g[16], 6'd0};
+            }
+            r.va     = r.va + {58'd0, g[24:19] & aa};
+            if g[27:25] <: 3'd2 && r.amo.op != AmoOp::LR && r.amo.op != AmoOp::SC && r.amo.op != AmoOp::CAS {
+                r.ctr    = 1'b1;
+                r.amo.op = AmoOp::ADD;
+                f3       = 3'd3;
+                r.va     = CTR_VA;
+                r.data   = 64'd1;
+            }
+            r.amo.f3  = f3;
+            r.op      = mem_op(FuKind::ATOMIC, r.amo as UOP_W);
+        }
+        if r.kind == 3'd4 {
+            r.st      = g[6];
+            r.nc      = g[7];
+            r.op.st   = g[6];
+            r.op.size = g[9:8];
+            r.op.sgn  = g[15];
+            am        = case g[9:8] {
+                2'd0   : 3'b111,
+                2'd1   : 3'b110,
+                2'd2   : 3'b100,
+                default: 3'b000,
+            };
+            r.va      = if g[7] ? NC_VA | {56'd0, g[14:10], 3'd0} : IO_VA | {60'd0, g[6] || g[10], 3'd0};
+            r.va      = r.va | {61'd0, g[13:11] & am};
+        }
+        return r;
+    }
+
+    // An SC usually names the address of an LR one, two or eight ops before
+    // it (the last one often after the ownership pin expired).
+    function pop (
+        pi: input logic<32>,
+    ) -> POp {
+        var r : POp;
+        var p1: POp;
+        var p2: POp;
+        var pe: POp;
+        r  = pop0(pi);
+        p1 = pop0(pi - 1);
+        p2 = pop0(pi - 2);
+        pe = pop0(pi - 8);
+        // most LRs are followed by an SC a few ops later
+        if XOPS && r.kind <: 3'd3 && ((p2.kind == 3'd3 && p2.amo.op == AmoOp::LR && r.cmp[4:3] != 2'd0) || (pe.kind == 3'd3 && pe.amo.op == AmoOp::LR && r.cmp[5])) {
+            r.kind   = 3'd3;
+            r.amo.op = AmoOp::SC;
+            r.amo.f3 = 3'd3;
+            r.va     = r.va & ~64'd7;
+            r.ctr    = 1'b0;
+        }
+        if r.kind == 3'd3 && r.amo.op == AmoOp::SC && r.cmp[1:0] != 2'd0 {
+            if p1.kind == 3'd3 && p1.amo.op == AmoOp::LR {
+                r.va      = p1.va;
+                r.amo.f3  = p1.amo.f3;
+            } else if p2.kind == 3'd3 && p2.amo.op == AmoOp::LR {
+                r.va      = p2.va;
+                r.amo.f3  = p2.amo.f3;
+            } else if pe.kind == 3'd3 && pe.amo.op == AmoOp::LR {
+                r.va      = pe.va;
+                r.amo.f3  = pe.amo.f3;
+            }
+        }
+        if r.kind == 3'd3 {
+            r.op = mem_op(FuKind::ATOMIC, r.amo as UOP_W);
+        }
+        return r;
+    }
+
+    // Reference arithmetic of an atomic on the bytes at its address.
+    struct ARef {
+        wr : logic     ,
+        nv : logic<128>, // new bytes from the address
+        rd : logic<64> ,
+        rd2: logic<64> ,
+    }
+
+    function sext (
+        v : input logic<64>,
+        sz: input logic<2> ,
+    ) -> logic<64> {
+        return case sz {
+            2'd0   : {v[7] repeat 56, v[7:0]},
+            2'd1   : {v[15] repeat 48, v[15:0]},
+            2'd2   : {v[31] repeat 32, v[31:0]},
+            default: v,
+        };
+    }
+
+    function zext (
+        v : input logic<64>,
+        sz: input logic<2> ,
+    ) -> logic<64> {
+        return case sz {
+            2'd0   : {56'd0, v[7:0]},
+            2'd1   : {48'd0, v[15:0]},
+            2'd2   : {32'd0, v[31:0]},
+            default: v,
+        };
+    }
+
+    function ref_amo (
+        po : input POp       ,
+        old: input logic<128>,
+        cmp: input logic<128>,
+    ) -> ARef {
+        var r : ARef     ;
+        var sz: logic<2> ;
+        var a : logic<64>;
+        var s : logic<64>;
+        var n : logic<64>;
+        sz = po.op.size;
+        a  = sext(old[63:0], sz);
+        s  = sext(po.data, sz);
+        n  = case po.amo.op {
+            AmoOp::ADD : a + s,
+            AmoOp::XOR : a ^ s,
+            AmoOp::AND : a & s,
+            AmoOp::OR  : a | s,
+            AmoOp::MIN : if (a ^ {1'b1, 63'd0}) <: (s ^ {1'b1, 63'd0}) ? a : s,
+            AmoOp::MAX : if (a ^ {1'b1, 63'd0}) <: (s ^ {1'b1, 63'd0}) ? s : a,
+            AmoOp::MINU: if zext(a, sz) <: zext(s, sz) ? a : s,
+            AmoOp::MAXU: if zext(a, sz) <: zext(s, sz) ? s : a,
+            default    : s,
+        };
+        r.rd  = a;
+        r.rd2 = old[127:64];
+        r.nv  = {64'd0, n};
+        r.wr  = po.amo.op != AmoOp::LR && po.amo.op != AmoOp::SC;
+        if po.amo.op == AmoOp::CAS {
+            r.wr = if po.amo.f3 == 3'd4 ? old == cmp : zext(old[63:0], sz) == zext(cmp[63:0], sz);
+            if po.amo.f3 == 3'd4 {
+                r.nv = {po.hi, po.data};
+                r.rd = old[63:0];
+            }
+        }
         return r;
     }
 
@@ -91,9 +280,17 @@ module lsu_harness::<CFG: core_cfg> #(
     var re     : MemReissue [MW];
     var hold   : logic      [MW];
     var arsv   : fu_pkg::WbSlot [MW];
+    var iqrsv  : fu_pkg::WbSlot [MW];
+    var rs_ok  : logic<fu_pkg::WB_OFS_N> [MW];
     var lq_gnt : logic          ;
     var sq_gnt : logic          ;
     var wb_ok  : logic      [MW];
+    var mp_amo : AtomicOp   [MW];
+    var mp_hf  : logic      [MW];
+    var np_gnt : fu_pkg::WbSlot ;
+    var np_wb  : WbPacket   [HF_N];
+    var np_wake: Wake       [HF_N];
+    var np_hf  : logic      [HF_N];
 
     var rf_a1 : PReg      [MW];
     var rf_a2 : PReg      [MW];
@@ -152,6 +349,10 @@ module lsu_harness::<CFG: core_cfg> #(
     var tok_v    : logic             ;
     var tokt     : TagTok            ;
     var tok      : RobTag            ;
+    var inv_q    : logic             ;
+    var inv_a_q  : logic<64>         ;
+    var spur_q   : logic             ;
+    var spur_l_q : logic<50>         ;
 
     var dr_v   : logic        ;
     var dr_addr: logic<64>    ;
@@ -163,9 +364,51 @@ module lsu_harness::<CFG: core_cfg> #(
     var c_lq : logic<4>;
     var c_sq : logic<4>;
     var c_sb : logic<2>;
-    var c_ad : logic<3>;
+    var c_ad : logic<6>;
+    var c_at : logic<4>;
+    var c_io : logic<4>;
 
-    const PMA: pma_pkg::PmaRegion [1] = '{pma_pkg::PmaRegion'{base: 56'h80_0000_0000 >> 8, mask: 56'hff_ffff_fe00_0000, attr: pma_pkg::PmaAttr'{target: pma_pkg::Target::DRAM, backed: 1, cacheable: 1, coherent: 1, executable: 1, amo: pma_pkg::AmoClass::FULL, idempotent: 1, io_ordered: 0, misaligned_ok: 1, pte_ok: 1, cbo_ok: 1}}};
+    // HEAD-port clients
+    var hd_req  : logic    [NP_N];
+    var hd_gnt  : logic    [NP_N];
+    var hd_slot : logic    [NP_N];
+    var resv_nx : logic          ;
+    var np_v    : logic    [NP_N];
+    var np_req  : MemReq   [NP_N];
+    // No walkers: the pipes run Bare.
+    for k in 0..NP_N :g_nowalk {
+        if k == NP_PTW_D || k == NP_PTW_I :g_tie {
+            assign hd_req[k] = 1'b0;
+            assign np_v[k]   = 1'b0;
+            assign np_req[k] = 0 as MemReq;
+        }
+    }
+    var at_st   : logic          ;
+    var at_emp  : logic          ;
+    var at_done : logic          ;
+    var at_wr   : logic          ;
+    var at_wd   : logic<128>     ;
+    var at_coh_v: logic     [COH_N];
+    var at_coh_l: logic<50> [COH_N];
+    var at_rat  : logic<5>       ;
+    var at_preg : logic<PREG_W>  ;
+    var at_prf  : PReg           ;
+    var at_prfd : logic<64>      ;
+    var atperf  : AtomicPerf     ;
+    var io_ld   : IoOp           ;
+    var io_st   : IoOp           ;
+    var io_st_s : logic          ;
+    var io_ldd  : logic          ;
+    var io_sdone: logic          ;
+    var ioperf  : IoPerf         ;
+    var hret    : logic          ;
+    var rsv_clr : logic          ;
+
+    const PMA: pma_pkg::PmaRegion [3] = '{
+        pma_pkg::PmaRegion'{base: 56'h80_0000_0000 >> 8, mask: 56'hff_ffff_fe00_0000, attr: pma_pkg::PmaAttr'{target: pma_pkg::Target::DRAM, backed: 1, cacheable: 1, coherent: 1, executable: 1, amo: pma_pkg::AmoClass::FULL, idempotent: 1, io_ordered: 0, misaligned_ok: 1, pte_ok: 1, cbo_ok: 1}},
+        pma_pkg::PmaRegion'{base: IO_VA[55:0], mask: 56'hff_ffff_ffff_f000, attr: pma_pkg::PmaAttr'{target: pma_pkg::Target::IO, backed: 1, cacheable: 0, coherent: 0, executable: 0, amo: pma_pkg::AmoClass::NONE, idempotent: 0, io_ordered: 1, misaligned_ok: 0, pte_ok: 0, cbo_ok: 0}},
+        pma_pkg::PmaRegion'{base: NC_VA[55:0], mask: 56'hff_ffff_ffff_f000, attr: pma_pkg::PmaAttr'{target: pma_pkg::Target::DRAM, backed: 1, cacheable: 0, coherent: 0, executable: 0, amo: pma_pkg::AmoClass::NONE, idempotent: 1, io_ordered: 0, misaligned_ok: 0, pte_ok: 0, cbo_ok: 0}}
+    };
 
     always_comb {
         for w in 0..WB_N {
@@ -173,9 +416,31 @@ module lsu_harness::<CFG: core_cfg> #(
         }
     }
 
+    // Bare translation in M-mode: the pipes never look up or walk.
+    var mctx: xlate_pkg::XlateCtx;
+    always_comb {
+        mctx     = 0 as xlate_pkg::XlateCtx;
+        mctx.prv = csr_pkg::PrivLevel::MACHINE;
+    }
+
+    var hf_gnt_p: fu_pkg::WbSlot [MW];
     for p in 0..MW :g_pipe {
+        var mwb  : WbPacket [HF_N];
+        var mwake: Wake     [HF_N];
+        var mhf  : logic    [HF_N];
+        for k in 0..HF_N :g_np {
+            if mem_port_head(p) :g_head {
+                assign mwb[k]   = np_wb[k];
+                assign mwake[k] = np_wake[k];
+                assign mhf[k]   = np_hf[k];
+            } else {
+                assign mwb[k]   = 0 as WbPacket;
+                assign mwake[k] = 0 as Wake;
+                assign mhf[k]   = 1'b0;
+            }
+        }
         inst u_pipe: mem_pipe::<CFG> #(
-            PMA_N  : 1  ,
+            PMA_N  : 3  ,
             PMA_TBL: PMA,
         ) (
             clk                             ,
@@ -184,15 +449,25 @@ module lsu_harness::<CFG: core_cfg> #(
             i_iss         : iss[p]          ,
             i_re          : re[p]           ,
             o_iq_rel      : iq_rel[p]       ,
+            i_tok         : tokt            ,
+            o_started     : _               ,
             o_rf_addr1    : rf_a1[p]        ,
             o_rf_addr2    : rf_a2[p]        ,
             i_rf_int1     : rf_d1[p]        ,
             i_rf_int2     : rf_d2[p]        ,
             i_rf_fp2      : 64'd0           ,
             i_wb          : wb_bus          ,
-            i_priv        : csr_pkg::PrivLevel::MACHINE,
+            i_xl_on       : 1'b0            ,
+            i_ctx         : mctx            ,
+            i_pmm         : 2'd0            ,
             i_pmpcfg      : '{64'd0, 64'd0} ,
             i_pmpaddr     : '{default: 64'd0},
+            o_tlb_lk      : _               ,
+            i_tlb         : 0 as xlate_pkg::TlbEntry,
+            o_xreq_valid  : _               ,
+            o_xreq        : _               ,
+            i_xreq_gnt    : 1'b0            ,
+            i_ptw_evt     : 0 as PtwEvent   ,
             o_req_valid   : req_v[p]        ,
             o_req         : req[p]          ,
             i_resp        : resp[p]         ,
@@ -206,23 +481,116 @@ module lsu_harness::<CFG: core_cfg> #(
             o_verdict     : verd[p]         ,
             o_wake        : wake[p]         ,
             o_wb          : wb[p]           ,
+            o_amo         : mp_amo[p]       ,
+            i_np_wb       : mwb             ,
+            i_np_wake     : mwake           ,
+            i_np_hf       : mhf             ,
+            o_hf_req      : mp_hf[p]        ,
             o_perf        : pperf[p]        ,
         );
+        inst u_rs: wb_resv #(
+            D: wb_depth(CFG::ISSUE_W + p),
+        ) (
+            clk                    ,
+            rst                    ,
+            o_ok      : rs_ok[p]   ,
+            i_resv    : arsv[p]    ,
+            i_hf_req  : mp_hf[p]   ,
+            o_hf_grant: hf_gnt_p[p],
+            o_perf    : _          ,
+            o_chk     : _          ,
+        );
     }
+    assign np_gnt = hf_gnt_p[HEAD_PORT];
 
     inst u_arb: mem_port_arb::<CFG> (
-        clk                      ,
-        rst                      ,
-        i_wb_ok    : wb_ok       ,
-        i_lq_re    : lq_re       ,
-        i_sq_re    : sq_re       ,
-        i_iq_resv  : '{default: 0 as fu_pkg::WbSlot},
-        o_port_hold: hold        ,
-        o_re       : re          ,
-        o_resv     : arsv        ,
-        o_lq_gnt   : lq_gnt      ,
-        o_sq_gnt   : sq_gnt      ,
-        o_perf     : arbperf     ,
+        clk                         ,
+        rst                         ,
+        i_wb_ok       : wb_ok       ,
+        i_lq_re       : lq_re       ,
+        i_sq_re       : sq_re       ,
+        i_iq_resv     : iqrsv       ,
+        i_np_req      : hd_req      ,
+        o_port_hold   : hold        ,
+        o_re          : re          ,
+        o_resv        : arsv        ,
+        o_lq_gnt      : lq_gnt      ,
+        o_sq_gnt      : sq_gnt      ,
+        o_np_gnt      : hd_gnt      ,
+        o_np_slot     : hd_slot     ,
+        o_np_resv_next: resv_nx     ,
+        o_perf        : arbperf     ,
+    );
+
+    // ---- atomic_unit and io_unit ----
+
+    inst u_at: atomic_unit::<CFG> (
+        clk                                ,
+        rst                                ,
+        i_kill          : kill_q           ,
+        i_hart_id       : SEED             ,
+        i_op            : mp_amo[HEAD_PORT],
+        o_ready         : _                ,
+        i_tok           : tokt             ,
+        i_head_retired  : hret             ,
+        i_rsv_clr       : rsv_clr          ,
+        i_ordering_empty: ord_empty        ,
+        o_head_req      : hd_req[NP_ATOMIC],
+        i_head_gnt      : hd_gnt[NP_ATOMIC] ,
+        i_head_slot     : hd_slot[NP_ATOMIC],
+        o_req_valid     : np_v[NP_ATOMIC]  ,
+        o_req           : np_req[NP_ATOMIC],
+        i_resp          : resp[0]          ,
+        i_evt           : evt              ,
+        i_coh_v         : at_coh_v         ,
+        i_coh_line      : at_coh_l         ,
+        o_rat_rd        : at_rat           ,
+        i_rat_preg      : at_preg          ,
+        o_prf_rd        : at_prf           ,
+        i_prf_data      : at_prfd          ,
+        o_started       : at_st            ,
+        o_empty         : at_emp           ,
+        o_hf_req        : np_hf[HF_ATOMIC] ,
+        i_wb_grant      : np_gnt           ,
+        o_wb            : np_wb[HF_ATOMIC] ,
+        o_wake          : np_wake[HF_ATOMIC],
+        o_done          : at_done          ,
+        o_wrote         : at_wr            ,
+        o_wdata         : at_wd            ,
+        o_rd2_valid     : _                ,
+        o_rd2           : _                ,
+        o_chk           : c_at             ,
+        o_perf          : atperf           ,
+    );
+
+    inst u_io: io_unit::<CFG> (
+        clk                                ,
+        rst                                ,
+        i_kill          : kill_q           ,
+        i_tok           : tokt             ,
+        i_ld            : io_ld            ,
+        i_st            : io_st            ,
+        i_ordering_empty: ord_empty        ,
+        i_atomic_empty  : at_emp           ,
+        i_head_retired  : hret             ,
+        o_head_req      : hd_req[NP_IO]    ,
+        i_head_gnt      : hd_gnt[NP_IO]     ,
+        i_head_slot     : hd_slot[NP_IO]    ,
+        o_req_valid     : np_v[NP_IO]      ,
+        o_req           : np_req[NP_IO]    ,
+        i_resp          : resp[0]          ,
+        i_evt           : evt              ,
+        o_started       : io_st_s          ,
+        o_busy          : _                ,
+        o_ld_done       : io_ldd           ,
+        o_st_done       : io_sdone         ,
+        o_done_id       : _                ,
+        o_hf_req        : np_hf[HF_IO]     ,
+        i_wb_grant      : np_gnt           ,
+        o_wb            : np_wb[HF_IO]     ,
+        o_wake          : np_wake[HF_IO]   ,
+        o_chk           : c_io             ,
+        o_perf          : ioperf           ,
     );
 
     inst u_lq: lq::<CFG> (
@@ -247,11 +615,15 @@ module lsu_harness::<CFG: core_cfg> #(
         i_std        : std           ,
         i_sq_head    : sq_head       ,
         i_oldest     : tokt          ,
+        i_ptw_evt    : 0 as PtwEvent ,
+        i_ptw_resp   : 0 as XlateResp,
         i_retire_cnt : lq_ret        ,
         o_reissue    : lq_re         ,
         i_reissue_gnt: lq_gnt        ,
         o_win        : lq_win        ,
         o_split_lo   : split_lo      ,
+        o_io         : io_ld         ,
+        i_io_done    : io_ldd        ,
         o_chk        : c_lq          ,
         o_perf       : lqperf        ,
     );
@@ -266,6 +638,9 @@ module lsu_harness::<CFG: core_cfg> #(
         o_alloc_tag  : sq_atag       ,
         i_sta        : sta           ,
         i_std        : std           ,
+        i_ptw_evt    : 0 as PtwEvent ,
+        i_ptw_resp   : 0 as XlateResp,
+        i_tok        : tokt          ,
         i_fwd_q      : fwd_q         ,
         o_fwd        : fwd_sq        ,
         o_reissue    : sq_re         ,
@@ -274,6 +649,11 @@ module lsu_harness::<CFG: core_cfg> #(
         i_retire_cnt : sq_ret        ,
         o_push       : push          ,
         o_head       : sq_head       ,
+        o_io         : io_st         ,
+        i_wt_done    : io_sdone      ,
+        i_amo_done   : at_done       ,
+        i_amo_wrote  : at_wr         ,
+        i_amo_wdata  : at_wd         ,
         o_chk        : c_sq          ,
         o_perf       : sqperf        ,
     );
@@ -319,6 +699,19 @@ module lsu_harness::<CFG: core_cfg> #(
     var dc_terms : dcache_pkg::StallTerms;
     var dc_dhu   : logic    ;
     var dc_dhn   : logic<64>;
+    var dc_rnext : logic<64>;
+    var dc_amo   : logic    ;
+    var dc_lnext : logic    ;
+    var dc_unc   : logic    ;
+    var dc_wen   : logic    ;
+    var dc_wexl  : logic    ;
+    var dc_wexq  : logic    ;
+    var dc_cln_v : logic    ;
+    var dc_cln_a : logic<64>;
+    var dc_cln_d : logic    ;
+    var dc_wd    : logic<64>;
+    var dc_wdh   : logic<64>;
+    var dc_wstrb : logic<8> ;
     var ev1_v    : logic    ;
     var ev1_a    : logic<64>;
     var ev2_v    : logic    ;
@@ -328,6 +721,8 @@ module lsu_harness::<CFG: core_cfg> #(
     var mr_req  : logic        ;
     var mr_gnt  : logic        ;
     var mr_data : logic<64>    ;
+    var mr_rfo  : logic        ;
+    var fexcl_q : logic        ;
     var mw_addr : logic<64>    ;
     var mw_data : logic<64> [8];
     var mw_strb : logic<8>  [8];
@@ -345,15 +740,30 @@ module lsu_harness::<CFG: core_cfg> #(
         i_kill              : kill_q       ,
         i_req_valid         : req_v        ,
         i_req               : req          ,
+        i_np_valid          : np_v         ,
+        i_np_req            : np_req       ,
         o_req_ready         : _            ,
         o_resp              : resp         ,
         o_evt               : evt          ,
+        i_np_resv_next      : resv_nx      ,
         o_dc_addr           : dc_addr      ,
         o_dc_ren            : dc_ren       ,
         o_dc_ren_folded     : dc_renf      ,
         o_dc_addr_r         : dc_addr_r    ,
         o_dc_ren_r          : dc_ren_r     ,
+        o_dc_amo_read       : dc_amo       ,
+        o_dc_load_next      : dc_lnext     ,
+        o_dc_uncached       : dc_unc       ,
+        o_dc_wen            : dc_wen       ,
+        o_dc_wen_excl       : dc_wexl      ,
+        o_dc_wen_excl_q     : dc_wexq      ,
+        o_dc_wdata          : dc_wd        ,
+        o_dc_wdata_hi       : dc_wdh       ,
+        o_dc_wstrb          : dc_wstrb     ,
+        o_dc_clean_v        : dc_cln_v     ,
+        o_dc_clean_addr     : dc_cln_a     ,
         i_dc_rdata          : dc_rdata     ,
+        i_dc_rdata_next     : dc_rnext     ,
         i_dc_stall          : dc_stall     ,
         i_dc_data_valid     : dc_dv        ,
         i_dc_fill_rdata     : dc_frd       ,
@@ -369,8 +779,9 @@ module lsu_harness::<CFG: core_cfg> #(
         i_dc_stall_terms    : dc_terms     ,
         i_dc_dhit_used      : dc_dhu       ,
         i_dc_dhit_rdata_next: dc_dhn       ,
-        i_inv_v             : 1'b0         ,
-        i_inv_addr          : 64'd0        ,
+        i_dc_clean_done     : dc_cln_d     ,
+        i_inv_v             : inv_q        ,
+        i_inv_addr          : inv_a_q      ,
         i_inv2_v            : 1'b0         ,
         i_inv2_addr         : 64'd0        ,
         i_ev1_v             : ev1_v        ,
@@ -385,17 +796,17 @@ module lsu_harness::<CFG: core_cfg> #(
         clk                                ,
         rst                                ,
         i_addr           : dc_addr         ,
-        i_wdata          : 64'd0           ,
-        i_wen            : 1'b0            ,
-        i_wen_excl       : 1'b0            ,
-        i_wen_excl_q     : 1'b0            ,
-        i_wdata_hi       : 64'd0           ,
+        i_wdata          : dc_wd           ,
+        i_wen            : dc_wen          ,
+        i_wen_excl       : dc_wexl         ,
+        i_wen_excl_q     : dc_wexq         ,
+        i_wdata_hi       : dc_wdh          ,
         i_ren            : dc_ren          ,
-        i_uncached       : 1'b0            ,
-        i_wstrb          : 8'd0            ,
+        i_uncached       : dc_unc          ,
+        i_wstrb          : dc_wstrb        ,
         i_wstrb_hi       : 8'd0            ,
-        i_load_next      : 1'b0            ,
-        i_amo_read       : 1'b0            ,
+        i_load_next      : dc_lnext        ,
+        i_amo_read       : dc_amo          ,
         i_addr2          : 64'd0           ,
         i_ren2           : 1'b0            ,
         i_load_next2     : 1'b0            ,
@@ -412,7 +823,7 @@ module lsu_harness::<CFG: core_cfg> #(
         i_swstrb         : dr_strb         ,
         o_sdrain_ack     : dr_ack          ,
         o_rdata          : dc_rdata        ,
-        o_rdata_next     : _               ,
+        o_rdata_next     : dc_rnext        ,
         o_rdata_next_miss: _               ,
         o_stall          : dc_stall        ,
         o_data_valid     : dc_dv           ,
@@ -437,8 +848,9 @@ module lsu_harness::<CFG: core_cfg> #(
         o_dhit_rdata_next: dc_dhn          ,
         o_memr_addr      : mr_addr         ,
         o_memr_ren       : _               ,
-        o_memr_rfo       : _               ,
-        i_fill_excl      : 1'b1            ,
+        o_memr_rfo       : mr_rfo          ,
+        o_memr_line      : _               ,
+        i_fill_excl      : fexcl_q         ,
         i_mem_rdata      : mr_data         ,
         o_memw_addr      : mw_addr         ,
         o_memw_wdata     : mw_data         ,
@@ -449,10 +861,13 @@ module lsu_harness::<CFG: core_cfg> #(
         i_probe_addr     : pr_a_q          ,
         i_probe_self     : 1'b0            ,
         o_probe_ack      : pr_ack          ,
+        i_clean_v        : dc_cln_v        ,
+        i_clean_addr     : dc_cln_a        ,
+        o_clean_done     : dc_cln_d        ,
         i_flush_req      : 1'b0            ,
         o_flush_done     : _               ,
-        i_inv_valid      : 1'b0            ,
-        i_inv_addr       : 64'd0           ,
+        i_inv_valid      : inv_q           ,
+        i_inv_addr       : inv_a_q         ,
         i_inv2_valid     : 1'b0            ,
         i_inv2_addr      : 64'd0           ,
         i_chk_addr       : 64'd0           ,
@@ -471,14 +886,22 @@ module lsu_harness::<CFG: core_cfg> #(
         i_memw_grant     : mw_gnt          ,
     );
 
-    assign coh_v[0]    = 1'b0;
-    assign coh_line[0] = '0;
+    assign coh_v[0]    = inv_q;
+    assign coh_line[0] = inv_a_q[55:6];
     assign coh_v[1]    = 1'b0;
     assign coh_line[1] = '0;
     assign coh_v[2]    = ev1_v;
     assign coh_line[2] = ev1_a[55:6];
     assign coh_v[3]    = ev2_v;
     assign coh_line[3] = ev2_a[55:6];
+    // atomic_unit also sees spurious events: a false watch or reservation
+    // loss only costs a retry or a failed SC
+    always_comb {
+        at_coh_v    = coh_v;
+        at_coh_l    = coh_line;
+        at_coh_v[1] = spur_q;
+        at_coh_l[1] = spur_l_q;
+    }
 
     // ---- memory model ----
 
@@ -492,21 +915,71 @@ module lsu_harness::<CFG: core_cfg> #(
         return mix({52'd0, d} ^ 64'h5555);
     }
 
+    function is_io (
+        a: input logic<64>,
+    ) -> logic {
+        return a[55:12] == IO_VA[55:12];
+    }
+
+    function is_nc (
+        a: input logic<64>,
+    ) -> logic {
+        return a[55:8] == NC_VA[55:8];
+    }
+
+    // The device at IO_VA: dword 0 counts its reads (a read side effect),
+    // dword 1 is a plain register. NC_VA is 256 bytes of DRAM only ever
+    // accessed without caching.
+    var dev_c_q : logic<64>     ;
+    var dev_d_q : logic<64>     ;
+    var nc_mem  : logic<64> [32];
+    var dev_rd_q: logic<32>     ; // device and NC reads
+    var dev_wr_q: logic<32>     ; // device and NC writes
+
     var rs_q: logic<2>; // 0 idle, 1 latency, 2 stream
     var rw_q: logic<4>;
     var rb_q: logic<3>;
+    let mr_unc : logic     = is_io(mr_addr) || is_nc(mr_addr);
+    let unc_dat: logic<64> = if is_nc(mr_addr) ? nc_mem[mr_addr[7:3]] : if mr_addr[3] ? dev_d_q : dev_c_q;
     assign mr_gnt  = (rs_q == 2'd0 && mr_req && lfsr[40]) || rs_q == 2'd2;
-    assign mr_data = if mem_w[mr_addr[14:3]] ? mem[mr_addr[14:3]] : mem_init(mr_addr[14:3]);
+    assign mr_data = if mr_unc ? unc_dat : if mem_w[mr_addr[14:3]] ? mem[mr_addr[14:3]] : mem_init(mr_addr[14:3]);
     assign mw_gnt  = mw_req && lfsr[41:40] != 2'd0;
 
     var mw_old: logic<64> [8];
+    var mw_new: logic<64> [8];
     always_comb {
         for l in 0..8 {
             let d: logic<12> = {mw_addr[14:6], l as 3};
+            var m: logic<64>;
+            for b in 0..8 {
+                m[b * 8+:8] = {mw_strb[l][b] repeat 8};
+            }
             mw_old[l] = if mem_w[d] ? mem[d] : mem_init(d);
+            mw_new[l] = (mw_old[l] & ~m) | (mw_data[l] & m);
+        }
+    }
+    let mw_unc: logic = is_io(mw_addr) || is_nc(mw_addr);
+    let mw_ln : logic<3> = mw_addr[5:3];
+    var mw_um : logic<64>;
+    always_comb {
+        for b in 0..8 {
+            mw_um[b * 8+:8] = {mw_strb[mw_ln][b] repeat 8};
         }
     }
 
+    // The contended counter: a remote agent increments it, through a recall
+    // of the line, at the edge the recall completes.
+    const CTR_D: logic<12> = CTR_VA[14:3];
+    let ctr_cur: logic<64> = if mw_wen && !mw_unc && mw_addr[14:6] == CTR_D[11:3] && mw_strb[CTR_D[2:0]] != 8'd0 ?
+        mw_new[CTR_D[2:0]]
+    : if mem_w[CTR_D] ?
+        mem[CTR_D]
+    :
+        mem_init(CTR_D)
+    ;
+    var pr_inc_q: logic    ;
+    var rcnt_q  : logic<32>; // remote increments done
+    var own_q   : logic [512]; // a line this hart may hold E or M
     // ---- driver state ----
 
     var r_pi   : logic<32>       [RN];
@@ -523,7 +996,28 @@ module lsu_harness::<CFG: core_cfg> #(
     var r_iniq : logic           [RN];
     var r_barw : BarSeq          [RN];
     var r_obey : logic           [RN];
+    var r_kind : logic<3>        [RN];
+    var r_ln   : logic<50>       [RN]; // lines of the access
+    var r_ln2  : logic<50>       [RN];
+    var r_val2 : logic<64>       [RN];
     var sq_rob : RobTag          [CFG::SQ_N];
+
+    var ctr_n_q  : logic<64>; // counter atomics retired
+    var rc_snap_q: logic<32>; // remote increments when the counter write landed
+    var trsv_v_q : logic    ; // the reservation as the program sees it
+    var trsv_pa_q: logic<64>;
+    var tlost_q  : logic    ; // an event on its line since the LR retired
+    var sc_sent_q: logic    ; // the head atomic presented a write
+    var lr_age_q : logic<16>; // cycles since the last LR retired
+    var io_ld_n_q: logic<32>; // non-cacheable loads retired
+    var io_st_n_q: logic<32>;
+    var io_r0_q  : logic<64>; // device counter reads retired
+    var tdev_q   : logic<64>; // the device register as the program sees it
+    var nc_gold  : logic<8>  [256];
+    var irq_q    : logic    ;
+    var irq_n_q  : logic<4> ;
+    var hs_q     : logic    ; // head_started
+    var cnt2_q   : logic<16> [32];
 
     var head_q : RobTag   ;
     var tail_q : RobTag   ;
@@ -546,7 +1040,36 @@ module lsu_harness::<CFG: core_cfg> #(
     function mk_uop (
         po: input POp,
     ) -> logic<UOP_W> {
-        return (if po.kind == 2'd1 ? {1'b0, po.op.size} : {!po.op.sgn, po.op.size}) as UOP_W;
+        return if po.kind == 3'd3 ? po.amo as UOP_W : (if po.op.st ? {1'b0, po.op.size} : {!po.op.sgn, po.op.size}) as UOP_W;
+    }
+
+    function mk_fu (
+        po: input POp,
+    ) -> FuKind {
+        return if po.kind == 3'd3 ? FuKind::ATOMIC : if po.op.st ? FuKind::STORE : FuKind::LOAD;
+    }
+
+    // LQ ops: loads, LR and non-cacheable loads; SQ ops: stores, the other
+    // atomics and non-cacheable stores.
+    function in_lq (
+        po: input POp,
+    ) -> logic {
+        return (po.kind == 3'd0 || po.kind == 3'd4 || po.kind == 3'd3) && !po.op.st;
+    }
+
+    function in_sq (
+        po: input POp,
+    ) -> logic {
+        return (po.kind == 3'd1 || po.kind == 3'd4 || po.kind == 3'd3) && po.op.st;
+    }
+
+    // The line of the last byte of an access.
+    function ln_last (
+        po: input POp,
+    ) -> logic<50> {
+        var a: logic<64>;
+        a = po.va + ((64'd1 << po.op.size) - 64'd1);
+        return a[55:6];
     }
 
     function radv (
@@ -577,7 +1100,7 @@ module lsu_harness::<CFG: core_cfg> #(
         return if h.wrap == t.wrap ? (e >= (h.idx as 32) && e <: (t.idx as 32)) : (e >= (h.idx as 32) || e <: (t.idx as 32));
     }
 
-    assign tok_v      = rob_cnt != 0 && !kill_q.valid;
+    assign tok_v      = rob_cnt != 0 && !kill_q.valid && !irq_q;
     assign tokt.valid = tok_v;
     assign tokt.tag   = tok;
     assign tok   = head_q;
@@ -596,9 +1119,9 @@ module lsu_harness::<CFG: core_cfg> #(
         d_take    = 0;
         for l in 0..DW {
             d_op[l]       = pop(disp_q + l);
-            d_nld[l + 1]  = d_nld[l] + ((d_op[l].kind == 2'd0) as 32);
-            d_nst[l + 1]  = d_nst[l] + ((d_op[l].kind == 2'd1) as 32);
-            d_nbar[l + 1] = d_nbar[l] + ((d_op[l].kind == 2'd2) as 32);
+            d_nld[l + 1]  = d_nld[l] + (in_lq(d_op[l]) as 32);
+            d_nst[l + 1]  = d_nst[l] + (in_sq(d_op[l]) as 32);
+            d_nbar[l + 1] = d_nbar[l] + ((d_op[l].kind == 3'd2) as 32);
             if d_take == l && rob_cnt + l + 1 <= RN && d_nld[l + 1] <= (lq_free as 32) && d_nst[l + 1] <= (sq_free as 32) && !kill_q.valid && lfsr[3 + l] {
                 d_take = l + 1;
             }
@@ -613,20 +1136,20 @@ module lsu_harness::<CFG: core_cfg> #(
         // compact the loads and stores of the taken lanes into slots
         for l in 0..DW {
             let rt: RobTag = radv(tail_q, l);
-            if l <: d_take && d_op[l].kind == 2'd0 {
+            if l <: d_take && in_lq(d_op[l]) {
                 lq_av[d_nld[l]]             = 1'b1;
                 lq_alloc[d_nld[l]].ex.rob   = rt;
                 lq_alloc[d_nld[l]].ex.pdst.cls = RegClass::FP;
                 lq_alloc[d_nld[l]].ex.pdst.idx = rt.idx as PREG_W;
                 lq_alloc[d_nld[l]].ex.has_rd = 1'b1;
-                lq_alloc[d_nld[l]].fu       = FuKind::LOAD;
+                lq_alloc[d_nld[l]].fu       = mk_fu(d_op[l]);
                 lq_alloc[d_nld[l]].uop      = mk_uop(d_op[l]);
                 lq_alloc[d_nld[l]].sq_lim   = sq_atag[d_nst[l]];
             }
-            if l <: d_take && d_op[l].kind == 2'd1 {
+            if l <: d_take && in_sq(d_op[l]) {
                 sq_av[d_nst[l]]             = 1'b1;
                 sq_alloc[d_nst[l]].rob      = rt;
-                sq_alloc[d_nst[l]].fu       = FuKind::STORE;
+                sq_alloc[d_nst[l]].fu       = mk_fu(d_op[l]);
                 sq_alloc[d_nst[l]].uop      = mk_uop(d_op[l]);
                 sq_alloc[d_nst[l]].lq_lim   = lq_atag[d_nld[l]];
             }
@@ -634,7 +1157,7 @@ module lsu_harness::<CFG: core_cfg> #(
         var nb: logic<32>;
         nb = 0;
         for l in 0..DW {
-            if l <: d_take && d_op[l].kind == 2'd2 {
+            if l <: d_take && d_op[l].kind == 3'd2 {
                 nb = nb + 1;
             }
         }
@@ -643,18 +1166,23 @@ module lsu_harness::<CFG: core_cfg> #(
 
     // ---- memory IQ (oldest eligible, with random skips) ----
 
+    // An atomic issues only on the HEAD pipe while it holds the token; every
+    // other op issues speculatively.
     var sel_v: logic     [MW];
     var sel_e: logic<RW> [MW];
     always_comb {
         var taken: logic<RN>;
         taken = '0;
         for p in 0..MW {
-            sel_v[p]   = 1'b0;
-            sel_e[p]   = '0;
+            sel_v[p] = 1'b0;
+            sel_e[p] = '0;
             for k in 0..RN {
                 let e : logic<RW> = ridx(head_q, k);
-                let el: logic     = (k as 32) <: rob_cnt && r_iniq[e] && !taken[e] && !(r_obey[e] && !(lfence.valid && lfence.seq == r_barw[e]));
-                if el && !sel_v[p] && !hold[p] && !kill_q.valid && lfsr[(k + p * 7) % 64] {
+                let iw: logic     = (k as 32) <: rob_cnt;
+                let at: logic     = r_kind[e] == 3'd3;
+                let ok: logic     = !at || (k == 0 && tok_v && mem_port_head(p));
+                let el: logic     = iw && r_iniq[e] && r_kind[e] != 3'd2 && ok && !taken[e] && !(r_obey[e] && !(lfence.valid && lfence.seq == r_barw[e]));
+                if el && !sel_v[p] && !hold[p] && wb_ok[p] && !kill_q.valid && lfsr[(k + p * 7) % 64] {
                     sel_v[p] = 1'b1;
                     sel_e[p] = e;
                 }
@@ -675,25 +1203,49 @@ module lsu_harness::<CFG: core_cfg> #(
             iss[p].tag.rob.idx  = e;
             iss[p].tag.pdst.cls = RegClass::FP;
             iss[p].tag.pdst.idx = e as PREG_W;
-            iss[p].tag.has_rd   = po.kind == 2'd0;
-            iss[p].fu           = if po.kind == 2'd0 ? FuKind::LOAD : FuKind::STORE;
+            iss[p].tag.has_rd   = !po.op.st || po.kind == 3'd3;
+            iss[p].fu           = mk_fu(po);
             iss[p].cold.uop     = mk_uop(po);
-            iss[p].cold.imm     = {po.imm[11] repeat 20, po.imm};
-            iss[p].cold.lq      = if po.kind == 2'd0 ? r_lq[e] : r_lqlim[e];
-            iss[p].cold.sq      = if po.kind == 2'd0 ? r_sqlim[e] : r_sq[e];
+            iss[p].cold.imm     = if po.kind == 3'd3 ? {22'd0, 5'd12, 5'd10} : {po.imm[11] repeat 20, po.imm};
+            iss[p].cold.lq      = if in_lq(po) ? r_lq[e] : r_lqlim[e];
+            iss[p].cold.sq      = if in_sq(po) ? r_sq[e] : r_sqlim[e];
             iss[p].src[0].en    = 1'b1;
             iss[p].src[0].pr.cls = RegClass::INT;
             iss[p].src[0].pr.idx = e as PREG_W;
-            iss[p].src[1].en    = po.kind == 2'd1;
+            iss[p].src[1].en    = po.op.st;
             iss[p].src[1].pr.cls = RegClass::INT;
             iss[p].src[1].pr.idx = (e as PREG_W) + (RN as PREG_W);
-            wb_ok[p]           = 1'b1;
+            iqrsv[p]            = if sel_v[p] ? fu_pkg::WbSlot'{valid: 1'b1, off: fu_pkg::claim_off(FuKind::LOAD) as fu_pkg::WbOff} : 0 as fu_pkg::WbSlot;
+            wb_ok[p]            = rs_ok[p][fu_pkg::claim_off(FuKind::LOAD)];
         }
         // the register file: rs1 = va - imm, rs2 = store data
         let p1: POp = pop(r_pi[rf_a1[p].idx[RW - 1:0]]);
         let p2: POp = pop(r_pi[rf_a2[p].idx[RW - 1:0]]);
-        assign rf_d1[p] = p1.va - {p1.imm[11] repeat 52, p1.imm};
+        assign rf_d1[p] = p1.va - (if p1.kind == 3'd3 ? 64'd0 : {p1.imm[11] repeat 52, p1.imm});
         assign rf_d2[p] = p2.data;
+    }
+
+    // ---- atomic_unit's arch RAT and PRF reads ----
+
+    let hpo: POp = pop(r_pi[head_q.idx]);
+    // memory's bytes at the head op's address, for amocas compare values
+    var hraw: logic<128>;
+    always_comb {
+        for b in 0..16 {
+            let gi: logic<15> = hpo.va[14:0] + b;
+            let iv: logic<64> = mem_init(gi[14:3]);
+            hraw[b * 8+:8] = if gold_w[gi] ? gold[gi] : iv[gi[2:0] * 8+:8];
+        }
+    }
+    // arch RAT = identity; the PRF holds rd (10), rd+1 (11) and rs2+1 (13)
+    assign at_preg = at_rat as PREG_W;
+    always_comb {
+        at_prfd = case at_prf.idx {
+            10     : if hpo.cmat ? hraw[63:0] : hpo.cmp,
+            11     : if hpo.cmat ? hraw[127:64] : ~hpo.cmp,
+            13     : hpo.hi,
+            default: 64'd0,
+        };
     }
 
     // ---- store data delay (separate STD arrival) ----
@@ -714,6 +1266,7 @@ module lsu_harness::<CFG: core_cfg> #(
     var c_fence: logic    ;
     var c_rply : logic    ;
     var c_bad  : logic    ;
+    var c_x    : logic    ; // an atomic or non-cacheable op retires at lane 0
     always_comb {
         var stop : logic    ;
         var lines: logic<32>;
@@ -723,6 +1276,7 @@ module lsu_harness::<CFG: core_cfg> #(
         c_fence = 1'b0;
         c_rply  = 1'b0;
         c_bad   = 1'b0;
+        c_x     = 1'b0;
         stop    = kill_q.valid;
         lines   = 0;
         for l in 0..CMW {
@@ -731,15 +1285,31 @@ module lsu_harness::<CFG: core_cfg> #(
             if !stop {
                 if (l as 32) >= rob_cnt {
                     stop = 1'b1;
-                } else if po.kind == 2'd2 {
+                } else if po.kind == 3'd2 {
                     if l == 0 && ord_empty {
                         c_ret   = 1;
                         c_fence = 1'b1;
                     }
                     stop = 1'b1;
+                } else if po.kind >= 3'd3 {
+                    // a store-class one also waits for its SQ entry's retire_ok
+                    var rk: logic;
+                    rk = !po.op.st;
+                    for k in 0..MW {
+                        if po.op.st && sq_win[k].valid && sq_win[k].tag == r_sq[e] {
+                            rk = sq_win[k].retire_ok;
+                        }
+                    }
+                    if l == 0 && r_done[e] && rk {
+                        c_ret = 1;
+                        c_x   = 1'b1;
+                        c_ld  = (!po.op.st) as 32;
+                        c_st  = po.op.st as 32;
+                    }
+                    stop = 1'b1;
                 } else if !r_done[e] {
                     stop = 1'b1;
-                } else if po.kind == 2'd0 {
+                } else if po.kind == 3'd0 {
                     var pz: logic;
                     var fd: logic;
                     pz = 1'b0;
@@ -815,7 +1385,7 @@ module lsu_harness::<CFG: core_cfg> #(
                     let ej: logic<RW> = ridx(head_q, j);
                     let pj: POp       = pop(r_pi[ej]);
                     let dj: logic<15> = gi - pj.va[14:0];
-                    if (j as 32) <: c_ret && pj.kind == 2'd1 && dj <: ({11'd0, 4'd1} << pj.op.size) {
+                    if (j as 32) <: c_ret && pj.kind == 3'd1 && dj <: ({11'd0, 4'd1} << pj.op.size) {
                         raw[b * 8+:8] = pj.data[dj[2:0] * 8+:8];
                     }
                 }
@@ -826,7 +1396,7 @@ module lsu_harness::<CFG: core_cfg> #(
                 2'd2   : if po.op.sgn ? {raw[31] repeat 32, raw[31:0]} : {32'd0, raw[31:0]},
                 default: raw,
             };
-            if (l as 32) <: c_ret && po.kind == 2'd0 && r_val[e] != ex {
+            if (l as 32) <: c_ret && po.kind == 3'd0 && r_val[e] != ex {
                 c_mis = 1'b1;
                 c_mpi = r_pi[e];
                 c_mex = ex;
@@ -835,7 +1405,83 @@ module lsu_harness::<CFG: core_cfg> #(
         }
     }
 
+    // ---- retire checks of atomics and non-cacheable ops ----
+
+    function tb_fmt (
+        raw: input logic<64>,
+        bo : input logic<3> ,
+        op : input MemOp    ,
+    ) -> logic<64> {
+        let v: logic<64> = raw >> {bo, 3'd0};
+        return if op.sgn ? sext(v, op.size) : zext(v, op.size);
+    }
+
+    var x_bad: logic     ;
+    var x_why: logic<3>  ;
+    var x_wr : logic     ; // the atomic wrote memory
+    var x_nv : logic<128>; // its new bytes from the address
+    var x_nb : logic<5>  ;
+    always_comb {
+        let e : logic<RW> = head_q.idx;
+        var rf : ARef     ;
+        var raw: logic<64>;
+        var ex : logic<64>;
+        var ls : logic    ;
+        rf    = ref_amo(hpo, hraw, if hpo.cmat ? hraw : {~hpo.cmp, hpo.cmp});
+        x_bad = 1'b0;
+        x_why = 3'd0;
+        x_wr  = 1'b0;
+        x_nv  = rf.nv;
+        x_nb  = if hpo.amo.f3 == 3'd4 ? 5'd16 : 5'd1 << hpo.op.size;
+        ls    = !trsv_v_q || trsv_pa_q != hpo.va || tlost_q;
+        raw   = if hpo.nc ?
+            {nc_gold[{hpo.va[7:3], 3'd7}], nc_gold[{hpo.va[7:3], 3'd6}], nc_gold[{hpo.va[7:3], 3'd5}], nc_gold[{hpo.va[7:3], 3'd4}],
+             nc_gold[{hpo.va[7:3], 3'd3}], nc_gold[{hpo.va[7:3], 3'd2}], nc_gold[{hpo.va[7:3], 3'd1}], nc_gold[{hpo.va[7:3], 3'd0}]}
+        : if hpo.va[3] ?
+            tdev_q
+        :
+            64'h1000 + io_r0_q
+        ;
+        ex = tb_fmt(raw, hpo.va[2:0], hpo.op);
+        if c_x && hpo.kind == 3'd3 {
+            if hpo.ctr {
+                if r_val[e] != mem_init(CTR_D) + ctr_n_q + {32'd0, rc_snap_q} {
+                    x_bad = 1'b1;
+                    x_why = 3'd1;
+                }
+            } else if hpo.amo.op == AmoOp::SC {
+                if r_val[e] >: 64'd1 || (ls && r_val[e] != 64'd1) {
+                    x_bad = 1'b1;
+                    x_why = 3'd2;
+                }
+                x_wr = r_val[e] == 64'd0;
+                x_nv = {64'd0, hpo.data};
+            } else {
+                if r_val[e] != rf.rd || (hpo.amo.f3 == 3'd4 && r_val2[e] != rf.rd2) {
+                    x_bad = 1'b1;
+                    x_why = 3'd3;
+                }
+                x_wr = rf.wr;
+            }
+        }
+        if c_x && hpo.kind == 3'd4 {
+            if !hpo.st && (r_val[e] != ex || dev_rd_q != io_ld_n_q + 1 || dev_wr_q != io_st_n_q) {
+                x_bad = 1'b1;
+                x_why = 3'd4;
+            }
+            if hpo.st && (dev_wr_q != io_st_n_q + 1 || dev_rd_q != io_ld_n_q) {
+                x_bad = 1'b1;
+                x_why = 3'd5;
+            }
+        }
+    }
+
     // ---- kills ----
+
+    // an interrupt is taken only while the head has not started an access
+    let x_take: logic = irq_q && !hs_q && rob_cnt != 0 && !kill_q.valid && c_ret == 0 && !c_rply && lfsr[61:60] == 2'd0;
+    assign rsv_clr = x_take;
+    assign hret    = c_ret != 0;
 
     var k_next: Kill     ;
     var k_pi  : logic<32>;
@@ -845,7 +1491,7 @@ module lsu_harness::<CFG: core_cfg> #(
         let kk: logic<RW> = kr.idx;
         k_next          = '0;
         k_pi            = disp_q;
-        if c_rply {
+        if c_rply || x_take {
             k_next.valid = 1'b1;
             k_next.full  = 1'b1;
             k_pi         = r_pi[head_q.idx];
@@ -879,8 +1525,41 @@ module lsu_harness::<CFG: core_cfg> #(
             rb_q   = 3'd0;
             pr_v_q = 1'b0;
             pr_a_q = '0;
+            pr_inc_q  = 1'b0;
+            rcnt_q    = 0;
+            fexcl_q   = 1'b1;
+            inv_q     = 1'b0;
+            inv_a_q   = '0;
+            spur_q    = 1'b0;
+            spur_l_q  = '0;
+            dev_c_q   = 64'h1000;
+            dev_d_q   = 64'd0;
+            dev_rd_q  = 0;
+            dev_wr_q  = 0;
+            ctr_n_q   = 0;
+            rc_snap_q = 0;
+            trsv_v_q  = 1'b0;
+            trsv_pa_q = '0;
+            tlost_q   = 1'b0;
+            sc_sent_q = 1'b0;
+            lr_age_q  = 0;
+            io_ld_n_q = 0;
+            io_st_n_q = 0;
+            io_r0_q   = 0;
+            tdev_q    = 64'd0;
+            irq_q     = 1'b0;
+            irq_n_q   = 4'd0;
+            hs_q      = 1'b0;
             for i in 0..32 {
-                cnt_q[i] = 0;
+                cnt_q[i]  = 0;
+                cnt2_q[i] = 0;
+                nc_mem[i] = 64'd0;
+            }
+            for i in 0..256 {
+                nc_gold[i] = 8'd0;
+            }
+            for i in 0..512 {
+                own_q[i] = 1'b0;
             }
             for p in 0..MW {
                 hv_q[p] = 1'b0;
@@ -897,18 +1576,26 @@ module lsu_harness::<CFG: core_cfg> #(
                 gold_w[b] = 1'b0;
             }
         } else {
-            var t: logic<64>;
+            var t : logic<64>;
+            var ev: logic<32>;
             t     = lfsr ^ (lfsr << 13);
             t     = t ^ (t >> 7);
             t     = t ^ (t << 17);
             lfsr  = t;
             cyc_q = cyc_q + 1;
 
-            // memory read slot
+            // memory read slot; an uncached read is served in its grant cycle
             case rs_q {
-                2'd0: if mr_gnt {
-                    rs_q = 2'd1;
-                    rw_q = {2'd0, lfsr[47:46]} + 4'd1;
+                2'd0: if mr_gnt && mr_unc {
+                    dev_rd_q = dev_rd_q + 1;
+                    if is_io(mr_addr) && !mr_addr[3] {
+                        dev_c_q = dev_c_q + 64'd1;
+                    }
+                } else if mr_gnt {
+                    rs_q    = 2'd1;
+                    rw_q    = {2'd0, lfsr[47:46]} + 4'd1;
+                    fexcl_q = mr_rfo || lfsr[39];
+                    own_q[mr_addr[14:6]] = mr_rfo || lfsr[39];
                 }
                 2'd1: {
                     rw_q = rw_q - 4'd1;
@@ -925,7 +1612,14 @@ module lsu_harness::<CFG: core_cfg> #(
                 }
             }
             // memory write channel
-            if mw_wen {
+            if mw_wen && mw_unc {
+                dev_wr_q = dev_wr_q + 1;
+                if is_nc(mw_addr) {
+                    nc_mem[mw_addr[7:3]] = (nc_mem[mw_addr[7:3]] & ~mw_um) | (mw_data[mw_ln] & mw_um);
+                } else if mw_addr[3] {
+                    dev_d_q = (dev_d_q & ~mw_um) | (mw_data[mw_ln] & mw_um);
+                }
+            } else if mw_wen {
                 for l in 0..8 {
                     var m: logic<64>;
                     for b in 0..8 {
@@ -937,12 +1631,70 @@ module lsu_harness::<CFG: core_cfg> #(
                     }
                 }
             }
-            // recalls of random lines
+            // recalls: random lines, the counter line (a remote increment),
+            // and the line of an atomic about to present its request
             if pr_v_q && (pr_ack || (mw_wen && mw_wb && mw_addr[55:6] == pr_a_q[55:6])) {
                 pr_v_q = 1'b0;
-            } else if !pr_v_q && lfsr[55:49] == 7'd0 {
-                pr_v_q = 1'b1;
-                pr_a_q = 64'h8000_0000 | {49'd0, lfsr[12:10], 12'd0} | {56'd0, lfsr[14:13], 6'd0};
+                if pr_inc_q {
+                    mem[CTR_D]   = ctr_cur + 64'd1;
+                    mem_w[CTR_D] = 1'b1;
+                    rcnt_q       = rcnt_q + 1;
+                }
+            } else if !pr_v_q && resv_nx && r_kind[head_q.idx] == 3'd3 && (lfsr[33:32] == 2'd0 || (hpo.amo.op == AmoOp::SC && lr_age_q >: 16'd64)) {
+                pr_v_q   = 1'b1;
+                pr_a_q   = hpo.va;
+                pr_inc_q = hpo.ctr;
+            } else if !pr_v_q && lfsr[55:49] <: 7'd2 {
+                pr_v_q   = 1'b1;
+                pr_inc_q = lfsr[31:30] == 2'd0;
+                pr_a_q   = if lfsr[31:30] == 2'd0 ? CTR_VA : 64'h8000_0000 | {49'd0, lfsr[12:10], 12'd0} | {56'd0, lfsr[14:13], 6'd0};
+            }
+            // invalidates of lines this hart cannot hold E or M
+            inv_q = 1'b0;
+            if lfsr[47:42] == 6'd0 {
+                let la: logic<64> = 64'h8000_0000 | {49'd0, lfsr[12:10], 12'd0} | {56'd0, lfsr[14:13], 6'd0};
+                if !own_q[la[14:6]] {
+                    inv_q   = 1'b1;
+                    inv_a_q = la;
+                }
+            }
+            // spurious events for atomic_unit only
+            spur_q   = lfsr[29:22] == 8'd0;
+            spur_l_q = if lfsr[25] ? hpo.va[55:6] : trsv_pa_q[55:6];
+            // the counter write landed: remember the remote increments so far
+            if np_v[NP_ATOMIC] && np_req[NP_ATOMIC].cls == MemCls::STORE_EXCL && np_req[NP_ATOMIC].pa[55:6] == CTR_VA[55:6] && dc_terms.wenl_fires {
+                rc_snap_q = rcnt_q;
+            }
+            // interrupts withhold the token for a while and may be taken
+            if irq_q {
+                irq_n_q = irq_n_q - 4'd1;
+                if irq_n_q == 4'd0 || x_take {
+                    irq_q = 1'b0;
+                }
+            } else if lfsr[40:34] == 7'd0 {
+                irq_q   = 1'b1;
+                irq_n_q = lfsr[21:18] | 4'd1;
+            }
+            if at_st || io_st_s {
+                hs_q = 1'b1;
+            } else if c_ret != 0 || (kill_q.valid && kill_q.full) {
+                hs_q = 1'b0;
+            }
+            // the reservation as the program sees it
+            // (frozen once an SC presented its write: later events are after it)
+            if np_v[NP_ATOMIC] && np_req[NP_ATOMIC].cls == MemCls::STORE_EXCL {
+                sc_sent_q = 1'b1;
+            }
+            for c in 0..COH_N {
+                if at_coh_v[c] && at_coh_l[c] == trsv_pa_q[55:6] && !sc_sent_q {
+                    tlost_q = 1'b1;
+                }
+            }
+            if x_take {
+                trsv_v_q = 1'b0;
+            }
+            if lr_age_q != 16'hffff {
+                lr_age_q = lr_age_q + 16'd1;
             }
 
             // store data delay
@@ -965,12 +1717,17 @@ module lsu_harness::<CFG: core_cfg> #(
                 }
             }
 
-            // completion packets
+            // completion packets; a pair packet is the in-place rd+1 write of
+            // amocas.q and completes nothing
             for p in 0..MW {
                 if wb[p].valid {
-                    r_done[wb[p].tag.rob.idx] = 1'b1;
-                    r_exc[wb[p].tag.rob.idx]  = wb[p].exc.valid;
-                    r_val[wb[p].tag.rob.idx]  = wb[p].data;
+                    if wb[p].pair {
+                        r_val2[wb[p].tag.rob.idx] = wb[p].data;
+                    } else {
+                        r_done[wb[p].tag.rob.idx] = 1'b1;
+                        r_exc[wb[p].tag.rob.idx]  = wb[p].exc.valid;
+                        r_val[wb[p].tag.rob.idx]  = wb[p].data;
+                    }
                 }
             }
 
@@ -987,16 +1744,59 @@ module lsu_harness::<CFG: core_cfg> #(
             }
 
             // commit
-            if c_mis || c_bad {
+            if c_mis || c_bad || x_bad {
                 ok_q = 1'b0;
                 if ok_q {
                     $display("lsu mismatch seed=%d cyc=%d mis=%b bad=%b pi=%d exp=%h got=%h", SEED, cyc_q, c_mis, c_bad, c_mpi, c_mex, c_mgt);
+                    $display("lsu x mismatch why=%d pi=%d kind=%d op=%d f3=%d va=%h got=%h rsv=%b %h lost=%b", x_why, r_pi[head_q.idx], hpo.kind, hpo.amo.op, hpo.amo.f3, hpo.va, r_val[head_q.idx], trsv_v_q, trsv_pa_q, tlost_q);
+                }
+            }
+            if c_x && hpo.kind == 3'd3 {
+                if x_wr {
+                    for b in 0..16 {
+                        if (b as 5) <: x_nb {
+                            gold[(hpo.va[14:0] + b) as 15]   = x_nv[b * 8+:8];
+                            gold_w[(hpo.va[14:0] + b) as 15] = 1'b1;
+                        }
+                    }
+                }
+                if hpo.ctr {
+                    ctr_n_q = ctr_n_q + 64'd1;
+                }
+                if hpo.amo.op == AmoOp::LR {
+                    lr_age_q  = 0;
+                    trsv_v_q  = 1'b1;
+                    trsv_pa_q = hpo.va;
+                    tlost_q   = 1'b0;
+                }
+                if hpo.amo.op == AmoOp::SC {
+                    trsv_v_q = 1'b0;
+                }
+                sc_sent_q = 1'b0;
+            }
+            if c_x && hpo.kind == 3'd4 {
+                if hpo.st {
+                    io_st_n_q = io_st_n_q + 1;
+                    for b in 0..8 {
+                        if (b as 4) <: (4'd1 << hpo.op.size) {
+                            if hpo.nc {
+                                nc_gold[(hpo.va[7:0] + b) as 8] = hpo.data[b * 8+:8];
+                            } else {
+                                tdev_q[(hpo.va[2:0] + b) * 8+:8] = hpo.data[b * 8+:8];
+                            }
+                        }
+                    }
+                } else {
+                    io_ld_n_q = io_ld_n_q + 1;
+                    if !hpo.nc && !hpo.va[3] {
+                        io_r0_q = io_r0_q + 64'd1;
+                    }
                 }
             }
             for l in 0..CMW {
                 let e : logic<RW> = ridx(head_q, l);
                 let po: POp       = pop(r_pi[e]);
-                if (l as 32) <: c_ret && po.kind == 2'd1 {
+                if (l as 32) <: c_ret && po.kind == 3'd1 {
                     for b in 0..8 {
                         let bi: logic<3>  = b;
                         let sz: logic<4>  = 4'd1 << po.op.size;
@@ -1023,9 +1823,12 @@ module lsu_harness::<CFG: core_cfg> #(
                     if l <: d_take {
                         let e: logic<RW> = ridx(tail_q, l);
                         r_pi[e]    = disp_q + l;
-                        r_done[e]  = d_op[l].kind == 2'd2;
+                        r_done[e]  = d_op[l].kind == 3'd2;
                         r_exc[e]   = 1'b0;
-                        r_iniq[e]  = d_op[l].kind != 2'd2;
+                        r_iniq[e]  = d_op[l].kind != 3'd2;
+                        r_kind[e]  = d_op[l].kind;
+                        r_ln[e]    = d_op[l].va[55:6];
+                        r_ln2[e]   = ln_last(d_op[l]);
                         r_lq[e]    = lq_atag[d_nld[l]];
                         r_sq[e]    = sq_atag[d_nst[l]];
                         r_lqlim[e] = lq_atag[d_nld[l]];
@@ -1034,8 +1837,8 @@ module lsu_harness::<CFG: core_cfg> #(
                         r_ssq[e]   = sq_atag[d_nst[l + 1]];
                         r_sbar[e]  = bar_after[d_nbar[l + 1]];
                         r_barw[e]  = bar_after[d_nbar[l]];
-                        r_obey[e]  = d_op[l].kind == 2'd0 && bar_after[d_nbar[l]] != bar_rt;
-                        if d_op[l].kind == 2'd1 {
+                        r_obey[e]  = d_op[l].kind == 3'd0 && bar_after[d_nbar[l]] != bar_rt;
+                        if in_sq(d_op[l]) {
                             sq_rob[sq_atag[d_nst[l]].idx] = radv(tail_q, l);
                         }
                     }
@@ -1143,16 +1946,53 @@ module lsu_harness::<CFG: core_cfg> #(
             if lfence.valid {
                 cnt_q[31] = cnt_q[31] + 1;
             }
+            ev[0]  = atperf.start;
+            ev[1]  = atperf.ld_excl;
+            ev[2]  = atperf.st_excl;
+            ev[3]  = atperf.pass;
+            ev[4]  = atperf.fail;
+            ev[5]  = atperf.watch;
+            ev[6]  = atperf.backoff;
+            ev[7]  = atperf.park_fill;
+            ev[8]  = atperf.park_busy;
+            ev[9]  = atperf.retry;
+            ev[10] = atperf.rsv_set;
+            ev[11] = atperf.rsv_coh;
+            ev[12] = atperf.rsv_clr;
+            ev[13] = atperf.sc_nores;
+            ev[14] = atperf.cas_miss;
+            ev[15] = atperf.tok_lost;
+            ev[16] = ioperf.load;
+            ev[17] = ioperf.store;
+            ev[18] = ioperf.cmo;
+            ev[19] = ioperf.ord_wait;
+            ev[20] = adperf.resv_turn;
+            ev[21] = adperf.nf_bank;
+            ev[22] = adperf.excl_hold;
+            ev[23] = adperf.excl_busy;
+            ev[24] = adperf.unc_done;
+            ev[25] = adperf.wt_done;
+            ev[26] = c_x && hpo.kind == 3'd3 && hpo.amo.op == AmoOp::SC && r_val[head_q.idx] == 64'd0;
+            ev[27] = c_x && hpo.kind == 3'd3 && hpo.amo.op == AmoOp::SC && r_val[head_q.idx] == 64'd1;
+            ev[28] = pr_v_q && pr_inc_q && (pr_ack || (mw_wen && mw_wb && mw_addr[55:6] == pr_a_q[55:6]));
+            ev[29] = inv_q;
+            ev[30] = x_take;
+            ev[31] = c_x && hpo.kind == 3'd3 && hpo.amo.f3 == 3'd4;
+            for i in 0..32 {
+                if ev[i] {
+                    cnt2_q[i] = cnt2_q[i] + 1;
+                }
+            }
         }
     }
-
 
     always_comb {
         for i in 0..32 {
-            o_cov[i] = cnt_q[i] != 0;
+            o_cov[i]  = cnt_q[i] != 0;
+            o_cov2[i] = cnt2_q[i] != 0;
         }
     }
-    assign o_chk     = {2'd0, c_ad, c_sb, c_sq, c_lq, ok_q == 1'b0};
+    assign o_chk     = {7'd0, c_io, c_at, c_ad, c_sb, c_sq, c_lq, ok_q == 1'b0};
     assign o_pass    = ok_q && idle_q <: 16'd3000;
     assign o_done    = nret_q >= NOPS || idle_q >= 16'd3000;
     assign o_retired = nret_q;
@@ -1163,11 +2003,12 @@ module test_lsu {
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
-    var d: logic     [4];
-    var p: logic     [4];
-    var n: logic<32> [4];
-    var v: logic<32> [4];
-    var c: logic<16> [4];
+    var d: logic     [5];
+    var p: logic     [5];
+    var n: logic<32> [5];
+    var v: logic<32> [5];
+    var w: logic<32> [5];
+    var c: logic<32> [5];
 
     inst h0: lsu_harness::<cfg_w2> #(
         SEED: 64'h1,
@@ -1178,6 +2019,7 @@ module test_lsu {
         o_pass   : p[0]   ,
         o_retired: n[0]   ,
         o_cov    : v[0]   ,
+        o_cov2   : w[0]   ,
         o_chk    : c[0]   ,
     );
     inst h1: lsu_harness::<cfg_w2> #(
@@ -1189,6 +2031,7 @@ module test_lsu {
         o_pass   : p[1]   ,
         o_retired: n[1]   ,
         o_cov    : v[1]   ,
+        o_cov2   : w[1]   ,
         o_chk    : c[1]   ,
     );
     inst h2: lsu_harness::<cfg_w4> #(
@@ -1200,6 +2043,7 @@ module test_lsu {
         o_pass   : p[2]   ,
         o_retired: n[2]   ,
         o_cov    : v[2]   ,
+        o_cov2   : w[2]   ,
         o_chk    : c[2]   ,
     );
     inst h3: lsu_harness::<cfg_w4> #(
@@ -1211,19 +2055,35 @@ module test_lsu {
         o_pass   : p[3]   ,
         o_retired: n[3]   ,
         o_cov    : v[3]   ,
+        o_cov2   : w[3]   ,
         o_chk    : c[3]   ,
+    );
+    inst h4: lsu_harness::<cfg_w4> #(
+        SEED: 64'h2,
+        XOPS: 0    ,
+    ) (
+        clk               ,
+        rst               ,
+        o_done   : d[4]   ,
+        o_pass   : p[4]   ,
+        o_retired: n[4]   ,
+        o_cov    : v[4]   ,
+        o_cov2   : w[4]   ,
+        o_chk    : c[4]   ,
     );
 
     initial {
         rst.assert(clk);
-        clk.next(10000);
-        for i in 0..4 {
-            $display("lsu %d: done=%b pass=%b retired=%d cov=%b chk=%b", i, d[i], p[i], n[i], v[i], c[i]);
+        clk.next(14000);
+        for i in 0..5 {
+            $display("lsu %d: done=%b pass=%b retired=%d cov=%b cov2=%b chk=%b", i, d[i], p[i], n[i], v[i], w[i], c[i]);
         }
-        $assert(d[0] && p[0] && c[0] == 16'd0 && d[1] && p[1] && c[1] == 16'd0, "lsu w2 failed");
-        $assert(d[2] && p[2] && c[2] == 16'd0 && d[3] && p[3] && c[3] == 16'd0, "lsu w4 failed");
+        $assert(d[0] && p[0] && c[0] == 32'd0 && d[1] && p[1] && c[1] == 32'd0, "lsu w2 failed");
+        $assert(d[2] && p[2] && c[2] == 32'd0 && d[3] && p[3] && c[3] == 32'd0 && d[4] && p[4] && c[4] == 32'd0, "lsu w4 failed");
         $assert((v[0] | v[1]) == 32'hffff_ffff, "lsu w2: a mechanism did not fire");
-        $assert((v[2] | v[3]) == 32'hffff_ffff, "lsu w4: a mechanism did not fire");
+        $assert((v[2] | v[3] | v[4]) == 32'hffff_ffff, "lsu w4: a mechanism did not fire");
+        $assert((w[0] | w[1]) == 32'hffff_ffff, "lsu w2: an atomic or io mechanism did not fire");
+        $assert((w[2] | w[3]) == 32'hffff_ffff, "lsu w4: an atomic or io mechanism did not fire");
         $finish();
     }
 }

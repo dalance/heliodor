@@ -33,6 +33,23 @@ converts each ELF to `test/hex/act_<ext>_<name>.hex` and writes
 `tb/test_act_<ext>.veryl` (one `#[test] #[ignore]` module per ELF). Both the hex
 and the Veryl modules are gitignored — regenerate with `make`.
 
+### On the new core (GA / GL-C)
+
+`test/gates/m2_act.list` names every generated test with its repo-relative
+image. With the images built as above:
+
+```bash
+test/gates/run_act.py --core w2              # GA pass/fail + GL-C final hash
+test/gates/run_act.py --core w4 --pass-fail  # GA only
+test/gates/run_act.py --core w2 --suite zaamo,zabha
+```
+
+The runner writes `#[ignore]` wrappers `tb/test_<core>_act_<ext>.veryl`
+(gitignored, deleted after the run), runs them in one `veryl test`, and
+compares each test's final `H` line with `test/golden/act/<ext>.final`. The
+finals come from the golden model through `test/golden/run_golden.py`, which
+reads the same list.
+
 ## Framework version pin
 
 `riscv/riscv-arch-test`'s default branch `act4` is the moving development tip

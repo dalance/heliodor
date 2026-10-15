@@ -37,7 +37,8 @@ pub package opclass_pkg {
 
     // Architectural side effects applied at retire (bitset).
     struct Effect {
-        fflags: logic,
+        fflags  : logic, // accrue the op's fflags
+        fs_dirty: logic, // mstatus.FS := Dirty
     }
 
     // Rename/dispatch resources an op consumes (bitset).
@@ -108,8 +109,45 @@ pub package opclass_pkg {
         return imm[16:12];
     }
 
+    // SFENCE.VMA immediate: rs1 and rs2 were x0.
+    function sys_rs1_x0 (
+        imm: input logic<32>,
+    ) -> logic {
+        return imm[0];
+    }
+
+    function sys_rs2_x0 (
+        imm: input logic<32>,
+    ) -> logic {
+        return imm[1];
+    }
+
     // LOAD and STORE carry the RISC-V width field f3 as uop[2:0]:
-    // size = f3[1:0], zero-extend = f3[2].
+    // size = f3[1:0], zero-extend = f3[2]; uop[3] marks an FP load (its
+    // result is NaN-boxed) or FP store. A CBO is a STORE with uop[4] set and
+    // uop[2:0] = funct12[2:0] (0 inval, 1 clean, 2 flush, 4 zero).
+
+    enum AmoOp: logic<4> {
+        LR,
+        SC,
+        SWAP,
+        ADD,
+        XOR,
+        AND,
+        OR,
+        MIN,
+        MAX,
+        MINU,
+        MAXU,
+        CAS,
+    }
+
+    // ATOMIC uop. f3 is the width field: 0 B, 1 H (Zabha), 2 W, 3 D, 4 Q
+    // (amocas.q).
+    struct AmoUop {
+        op: AmoOp   ,
+        f3: logic<3>,
+    }
 
     // ---- op_class input ----
 
@@ -128,8 +166,10 @@ pub package opclass_pkg {
         is_amo    : logic            ,
         amo_lr    : logic            ,
         amo_aq    : logic            ,
+        amo_pair  : logic            , // amocas.q: rd+1 is written in place
         is_csr    : logic            ,
         csr_wr    : logic            , // csr_op == RW || rs1/uimm != 0
+        csr_fp    : logic            , // the CSR is fflags, frm or fcsr
         is_xret   : logic            ,
         is_sfence : logic            , // SFENCE.VMA, SINVAL.VMA, HFENCE.*
         is_sinval : logic            , // SFENCE.W.INVAL, SFENCE.INVAL.IR
@@ -138,6 +178,25 @@ pub package opclass_pkg {
         is_fp     : logic            , // FP compute (not FP load/store)
         alu_op    : alu_pkg::AluOp   ,
         fpu_op    : fpu_pkg::FpuOp   ,
+    }
+
+    // FP ops whose rm field is a rounding mode (all others use it as a
+    // sub-opcode or ignore it).
+    function fp_rounds (
+        op: input fpu_pkg::FpuOp,
+    ) -> logic {
+        case op {
+            fpu_pkg::FpuOp::FMIN_S, fpu_pkg::FpuOp::FMAX_S, fpu_pkg::FpuOp::FMIN_D, fpu_pkg::FpuOp::FMAX_D,
+            fpu_pkg::FpuOp::FMINM_S, fpu_pkg::FpuOp::FMAXM_S, fpu_pkg::FpuOp::FMINM_D, fpu_pkg::FpuOp::FMAXM_D,
+            fpu_pkg::FpuOp::FSGNJ_S, fpu_pkg::FpuOp::FSGNJN_S, fpu_pkg::FpuOp::FSGNJX_S, fpu_pkg::FpuOp::FSGNJ_D,
+            fpu_pkg::FpuOp::FSGNJN_D, fpu_pkg::FpuOp::FSGNJX_D, fpu_pkg::FpuOp::FEQ_S, fpu_pkg::FpuOp::FLT_S,
+            fpu_pkg::FpuOp::FLE_S, fpu_pkg::FpuOp::FEQ_D, fpu_pkg::FpuOp::FLT_D, fpu_pkg::FpuOp::FLE_D,
+            fpu_pkg::FpuOp::FLEQ_S, fpu_pkg::FpuOp::FLTQ_S, fpu_pkg::FpuOp::FLEQ_D, fpu_pkg::FpuOp::FLTQ_D,
+            fpu_pkg::FpuOp::FCLASS_S, fpu_pkg::FpuOp::FCLASS_D, fpu_pkg::FpuOp::FMV_X_W, fpu_pkg::FpuOp::FMV_W_X,
+            fpu_pkg::FpuOp::FMV_X_D, fpu_pkg::FpuOp::FMV_D_X, fpu_pkg::FpuOp::FMV_X_H, fpu_pkg::FpuOp::FMV_H_X,
+            fpu_pkg::FpuOp::FLI_S, fpu_pkg::FpuOp::FLI_D, fpu_pkg::FpuOp::FCVTMOD_W_D: return 1'b0;
+            default: return 1'b1;
+        }
     }
 
     function fp_kind (
@@ -187,6 +246,8 @@ pub package opclass_pkg {
             c.nonspec    = 1'b1;
             c.alone      = 1'b1;
             c.ld_barrier = d.amo_aq;
+            // Younger ops may have read the old rd+1 (section L.11).
+            c.flush = if d.amo_pair ? FlushKind::NEXT_PC : FlushKind::NONE;
         } else if d.mem_ren {
             c.fu = FuKind::LOAD;
         } else if d.mem_wen {
@@ -194,11 +255,12 @@ pub package opclass_pkg {
         } else if d.is_branch || d.is_jal || d.is_jalr || d.is_auipc {
             c.fu = FuKind::BRU;
         } else if d.is_csr {
-            c.fu      = FuKind::SYS;
-            c.nonspec = 1'b1;
-            c.alone   = 1'b1;
-            c.csr_wr  = d.csr_wr;
-            c.flush   = if d.csr_wr ? FlushKind::NEXT_PC : FlushKind::NONE;
+            c.fu              = FuKind::SYS;
+            c.nonspec         = 1'b1;
+            c.alone           = 1'b1;
+            c.csr_wr          = d.csr_wr;
+            c.flush           = if d.csr_wr ? FlushKind::NEXT_PC : FlushKind::NONE;
+            c.effect.fs_dirty = d.csr_wr && d.csr_fp;
         } else if d.is_sfence {
             c.fu      = FuKind::SYS;
             c.nonspec = 1'b1;
@@ -217,10 +279,14 @@ pub package opclass_pkg {
             c.alone = 1'b1;
             c.flush = FlushKind::XRET;
         } else if d.is_fp {
-            c.fu            = fp_kind(d.fpu_op);
-            c.effect.fflags = 1'b1;
+            c.fu              = fp_kind(d.fpu_op);
+            c.effect.fflags   = 1'b1;
+            c.effect.fs_dirty = 1'b1;
         } else if d.writes_int {
             c.fu = int_kind(d.alu_op);
+        }
+        if c.fu == FuKind::LOAD && d.writes_fp {
+            c.effect.fs_dirty = 1'b1;
         }
         // NONE ops (fences, xRET, hints) never write a register.
         c.budget.int_rd = c.fu != FuKind::NONE && d.writes_int && d.rd_nz;

@@ -1,0 +1,344 @@
+// fu_fdiv: scalar FP divide, square root and Zfa round-to-integral (S, D),
+// blocking.
+//
+// Ports (timing contract):
+//   i_valid/i_op/i_tag/i_src : the op accepted in cycle A (rs1, rs2); issued
+//                              only while o_ready
+//   i_rm/i_frm               : the instruction's rm field and fcsr.frm, A
+//   o_ready                  : registered, fu_blocking_shell
+//   o_hf_req/o_hf_tag        : the result is ready: A + 4 for FROUND and
+//                              FROUNDNX, A + 15 or later for the iterative
+//                              leaves
+//   i_wb_grant               : the hole-fill grant of o_hf_req
+//   i_kill                   : drops the op in any cycle up to its WB
+//   o_wb                     : registered, in the granted slot; LAT_FDIV is
+//                              the minimum A to WB distance; fflags in the
+//                              packet, exc always clear
+//   o_perf                   : a kill aborted the op in the unit
+//   o_chk                    : sticky {a leaf result while the unit is
+//                              empty, an op presented while not ready}
+// Owns:
+//   - see fu_blocking_shell; one op at a time, whichever leaf runs it
+// Rationale:
+//   - round-to-integral adds copysign(2^p, x) and subtracts it again, so the
+//     adder's own rounding rounds off the fraction under the op's rounding
+//     mode; the two adds run back to back with the sum registered between
+//     them, so no cycle holds more than one adder half
+pub module fu_fdiv::<CFG: core_cfg> (
+    clk       : input  clock                              ,
+    rst       : input  reset                              ,
+    i_valid   : input  logic                              ,
+    i_op      : input  fpu_pkg::FpuOp                     ,
+    i_tag     : input  core_types::<CFG>::ExTag           ,
+    i_src     : input  logic                      <64> [2],
+    i_rm      : input  logic                      <3>     ,
+    i_frm     : input  logic                      <3>     ,
+    i_kill    : input  core_types::<CFG>::Kill            ,
+    o_ready   : output logic                              ,
+    o_hf_req  : output logic                              ,
+    o_hf_tag  : output core_types::<CFG>::ExTag           ,
+    i_wb_grant: input  fu_pkg::WbSlot                     ,
+    o_wb      : output core_types::<CFG>::WbPacket        ,
+    o_perf    : output logic                              ,
+    o_chk     : output logic                      <2>     ,
+) {
+    import fpu_pkg::*;
+
+    var start     : logic    ;
+    var flush     : logic    ;
+    var leaf_valid: logic    ;
+    var leaf_data : logic<64>;
+    var leaf_ffl  : logic<5> ;
+
+    inst u_shell: fu_blocking_shell::<CFG> (
+        clk                      ,
+        rst                      ,
+        i_valid                  ,
+        i_tag                    ,
+        i_kill                   ,
+        o_ready                  ,
+        o_start      : start     ,
+        o_flush      : flush     ,
+        i_leaf_valid : leaf_valid,
+        i_leaf_data  : leaf_data ,
+        i_leaf_fflags: leaf_ffl  ,
+        o_hf_req                 ,
+        o_hf_tag                 ,
+        i_wb_grant               ,
+        o_wb                     ,
+        o_wake       : _         ,
+    );
+
+    let rm: logic<3>  = resolve_rm(i_rm, i_frm);
+    let s1: logic<32> = unbox_s(i_src[0]);
+    let s2: logic<32> = unbox_s(i_src[1]);
+
+    var op_q: FpuOp;
+    always_ff {
+        if start {
+            op_q = i_op;
+        }
+    }
+
+    // ---- Iterative leaves ----
+
+    var div_s_v: logic    ;
+    var div_s_r: logic<32>;
+    var div_s_f: logic<5> ;
+    inst u_div_s: fp_divider_s (
+        clk                                     ,
+        rst                                     ,
+        i_valid : start && i_op == FpuOp::FDIV_S,
+        i_a     : s1                            ,
+        i_b     : s2                            ,
+        i_rm    : rm                            ,
+        i_flush : flush                         ,
+        o_result: div_s_r                       ,
+        o_fflags: div_s_f                       ,
+        o_valid : div_s_v                       ,
+        o_busy  : _                             ,
+    );
+
+    var sqrt_s_v: logic    ;
+    var sqrt_s_r: logic<32>;
+    var sqrt_s_f: logic<5> ;
+    inst u_sqrt_s: fp_sqrt_s (
+        clk                                      ,
+        rst                                      ,
+        i_valid : start && i_op == FpuOp::FSQRT_S,
+        i_a     : s1                             ,
+        i_rm    : rm                             ,
+        i_flush : flush                          ,
+        o_result: sqrt_s_r                       ,
+        o_fflags: sqrt_s_f                       ,
+        o_valid : sqrt_s_v                       ,
+        o_busy  : _                              ,
+    );
+
+    var div_d_v: logic    ;
+    var div_d_r: logic<64>;
+    var div_d_f: logic<5> ;
+    inst u_div_d: fp_divider (
+        clk                                     ,
+        rst                                     ,
+        i_valid : start && i_op == FpuOp::FDIV_D,
+        i_a     : i_src[0]                      ,
+        i_b     : i_src[1]                      ,
+        i_rm    : rm                            ,
+        i_flush : flush                         ,
+        o_result: div_d_r                       ,
+        o_fflags: div_d_f                       ,
+        o_valid : div_d_v                       ,
+        o_busy  : _                             ,
+    );
+
+    var sqrt_d_v: logic    ;
+    var sqrt_d_r: logic<64>;
+    var sqrt_d_f: logic<5> ;
+    inst u_sqrt_d: fp_sqrt (
+        clk                                      ,
+        rst                                      ,
+        i_valid : start && i_op == FpuOp::FSQRT_D,
+        i_a     : i_src[0]                       ,
+        i_rm    : rm                             ,
+        i_flush : flush                          ,
+        o_result: sqrt_d_r                       ,
+        o_fflags: sqrt_d_f                       ,
+        o_valid : sqrt_d_v                       ,
+        o_busy  : _                              ,
+    );
+
+    // ---- Round to integral ----
+    // A: x + magic, stage 1 | A+1: stage 2, sum registered | A+2: sum - magic,
+    // stage 1 | A+3: stage 2, result registered | A+4: result to the shell.
+
+    let is_fr: logic = i_op == FpuOp::FROUND_S || i_op == FpuOp::FROUNDNX_S || i_op == FpuOp::FROUND_D || i_op
+        == FpuOp::FROUNDNX_D;
+    let fr_d : logic = i_op == FpuOp::FROUND_D || i_op == FpuOp::FROUNDNX_D;
+    let fr_nx: logic = i_op == FpuOp::FROUNDNX_S || i_op == FpuOp::FROUNDNX_D;
+
+    var fr_cnt_q: logic<3> ; // 0: idle, k: cycle A+k of a round
+    var fr_x_q  : logic<64>; // the operand, single in the low 32 bits
+    var fr_d_q  : logic    ;
+    var fr_nx_q : logic    ;
+    var fr_rm_q : logic<3> ;
+    var fr_sum_s: logic<32>;
+    var fr_sum_d: logic<64>;
+    var fr_inx_q: logic    ; // the first add was inexact
+    var fr_res_q: logic<64>;
+    var fr_ffl_q: logic<5> ;
+
+    var add_s_r: logic<32>;
+    var add_s_f: logic<5> ;
+    inst u_fr_add_s: fp_adder_s #(
+        PIPE: 1,
+    ) (
+        clk                              ,
+        rst                              ,
+        i_a     : s1                     ,
+        i_b     : {s1[31], 8'd150, 23'd0},
+        i_sub   : 1'b0                   ,
+        i_rm    : rm                     ,
+        o_result: add_s_r                ,
+        o_fflags: add_s_f                ,
+    );
+
+    var add_d_r: logic<64>;
+    var add_d_f: logic<5> ;
+    inst u_fr_add_d: fp_adder #(
+        PIPE: 1,
+    ) (
+        clk                                      ,
+        rst                                      ,
+        i_a     : i_src[0]                       ,
+        i_b     : {i_src[0][63], 11'd1075, 52'd0},
+        i_sub   : 1'b0                           ,
+        i_rm    : rm                             ,
+        o_result: add_d_r                        ,
+        o_fflags: add_d_f                        ,
+    );
+
+    var sub_s_r: logic<32>;
+    inst u_fr_sub_s: fp_adder_s #(
+        PIPE: 1,
+    ) (
+        clk                                  ,
+        rst                                  ,
+        i_a     : fr_sum_s                   ,
+        i_b     : {fr_x_q[31], 8'd150, 23'd0},
+        i_sub   : 1'b1                       ,
+        i_rm    : fr_rm_q                    ,
+        o_result: sub_s_r                    ,
+        o_fflags: _                          ,
+    );
+
+    var sub_d_r: logic<64>;
+    inst u_fr_sub_d: fp_adder #(
+        PIPE: 1,
+    ) (
+        clk                                    ,
+        rst                                    ,
+        i_a     : fr_sum_d                     ,
+        i_b     : {fr_x_q[63], 11'd1075, 52'd0},
+        i_sub   : 1'b1                         ,
+        i_rm    : fr_rm_q                      ,
+        o_result: sub_d_r                      ,
+        o_fflags: _                            ,
+    );
+
+    // Patch the cases the add-subtract does not cover: NaN, values that are
+    // already integral (|x| >= 2^p, infinities), and results that round to
+    // zero, which keep the sign of x.
+    let x_s    : logic<32> = fr_x_q[31:0];
+    let x_s_nan: logic     = x_s[30:23] == 8'hFF && x_s[22:0] != 23'd0;
+    let x_s_sn : logic     = x_s_nan && !x_s[22];
+    let x_s_big: logic     = x_s[30:23] >= 8'd150;
+    let x_d_nan: logic     = fr_x_q[62:52] == 11'h7FF && fr_x_q[51:0] != 52'd0;
+    let x_d_sn : logic     = x_d_nan && !fr_x_q[51];
+    let x_d_big: logic     = fr_x_q[62:52] >= 11'd1075;
+
+    var fr_res: logic<64>;
+    var fr_ffl: logic<5> ;
+    always_comb {
+        if fr_d_q {
+            fr_res = if x_d_nan ?
+                CANONICAL_NAN_D
+            : if x_d_big ?
+                fr_x_q
+            : if sub_d_r[62:0] == 63'd0 ?
+                {fr_x_q[63], 63'd0}
+            :
+                sub_d_r
+            ;
+            fr_ffl = if x_d_sn ? 5'b10000 : {4'b0000, fr_nx_q && !x_d_big && fr_inx_q};
+        } else {
+            fr_res = box_s(
+                if x_s_nan ? CANONICAL_NAN_S : if x_s_big ? x_s : if sub_s_r[30:0] == 31'd0 ? {x_s[31], 31'd0} : sub_s_r,
+            );
+            fr_ffl = if x_s_sn ? 5'b10000 : {4'b0000, fr_nx_q && !x_s_big && fr_inx_q};
+        }
+    }
+
+    always_ff {
+        if_reset {
+            fr_cnt_q = 3'd0;
+        } else if flush || fr_cnt_q == 3'd4 {
+            fr_cnt_q = 3'd0;
+        } else if start && is_fr {
+            fr_cnt_q = 3'd1;
+        } else if fr_cnt_q != 3'd0 {
+            fr_cnt_q = fr_cnt_q + 3'd1;
+        }
+    }
+
+    always_ff {
+        if start {
+            fr_x_q  = if fr_d ? i_src[0] : {32'd0, s1};
+            fr_d_q  = fr_d;
+            fr_nx_q = fr_nx;
+            fr_rm_q = rm;
+        }
+        if fr_cnt_q == 3'd1 {
+            fr_sum_s = add_s_r;
+            fr_sum_d = add_d_r;
+            fr_inx_q = if fr_d_q ? add_d_f[0] : add_s_f[0];
+        }
+        if fr_cnt_q == 3'd3 {
+            fr_res_q = fr_res;
+            fr_ffl_q = fr_ffl;
+        }
+    }
+
+    let fr_v: logic = fr_cnt_q == 3'd4;
+
+    // ---- Result to the shell ----
+
+    assign leaf_valid = div_s_v || sqrt_s_v || div_d_v || sqrt_d_v || fr_v;
+
+    always_comb {
+        case op_q {
+            FpuOp::FDIV_S: {
+                leaf_data = box_s(div_s_r);
+                leaf_ffl  = div_s_f;
+            }
+            FpuOp::FSQRT_S: {
+                leaf_data = box_s(sqrt_s_r);
+                leaf_ffl  = sqrt_s_f;
+            }
+            FpuOp::FDIV_D: {
+                leaf_data = div_d_r;
+                leaf_ffl  = div_d_f;
+            }
+            FpuOp::FSQRT_D: {
+                leaf_data = sqrt_d_r;
+                leaf_ffl  = sqrt_d_f;
+            }
+            default: {
+                leaf_data = fr_res_q;
+                leaf_ffl  = fr_ffl_q;
+            }
+        }
+    }
+
+    assign o_perf = flush;
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var chk_q: logic<2>;
+        always_ff {
+            if_reset {
+                chk_q = 2'b00;
+            } else {
+                if i_valid && !o_ready {
+                    chk_q[0] = 1'b1;
+                }
+                if leaf_valid && o_ready {
+                    chk_q[1] = 1'b1;
+                }
+            }
+        }
+        assign o_chk = chk_q;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 2'b00;
+}

@@ -1,0 +1,225 @@
+// fu_fma: scalar FP add, subtract, multiply and fused multiply-add (S, D),
+// two stages.
+//
+// Ports (timing contract):
+//   i_valid/i_op/i_tag/i_src : the op accepted in cycle A (rs1, rs2, rs3)
+//   i_rm/i_frm               : the instruction's rm field and fcsr.frm, A
+//   i_kill                   : applied at the capture edge of both stages
+//   o_ready                  : constant 1 (pipelined)
+//   o_wb                     : registered, valid in A + LAT_FMA; fflags in
+//                              the packet, exc always clear
+// Owns:
+//   - o_wb.tag is i_tag of the same op
+// Rationale:
+//   - the leaves run with their midpoint register (PIPE=1), which captures
+//     every cycle, so stage 1 is the leaves' first half and the op's tag
+//     and kind travel beside it in a stage_reg; fp_fma runs without its
+//     third stage because that stage reads the rounding mode again a cycle
+//     later
+pub module fu_fma::<CFG: core_cfg> (
+    clk    : input  clock                              ,
+    rst    : input  reset                              ,
+    i_valid: input  logic                              ,
+    i_op   : input  fpu_pkg::FpuOp                     ,
+    i_tag  : input  core_types::<CFG>::ExTag           ,
+    i_src  : input  logic                      <64> [3],
+    i_rm   : input  logic                      <3>     ,
+    i_frm  : input  logic                      <3>     ,
+    i_kill : input  core_types::<CFG>::Kill            ,
+    o_ready: output logic                              ,
+    o_wb   : output core_types::<CFG>::WbPacket        ,
+) {
+    import core_types::<CFG>::*;
+    import fpu_pkg::*;
+
+    let rm: logic<3>  = resolve_rm(i_rm, i_frm);
+    let s1: logic<32> = unbox_s(i_src[0]);
+    let s2: logic<32> = unbox_s(i_src[1]);
+    let s3: logic<32> = unbox_s(i_src[2]);
+
+    let neg_p: logic = i_op == FpuOp::FNMADD_S || i_op == FpuOp::FNMSUB_S || i_op == FpuOp::FNMADD_D || i_op
+        == FpuOp::FNMSUB_D;
+    let sub_c: logic = i_op == FpuOp::FMSUB_S || i_op == FpuOp::FNMADD_S || i_op == FpuOp::FMSUB_D || i_op
+        == FpuOp::FNMADD_D;
+    let sub_s: logic = i_op == FpuOp::FSUB_S;
+    let sub_d: logic = i_op == FpuOp::FSUB_D;
+
+    // ---- Leaves: stage 1 in A, result in A + 1 ----
+
+    var add_s_r: logic<32>;
+    var add_s_f: logic<5> ;
+    inst u_add_s: fp_adder_s #(
+        PIPE: 1,
+    ) (
+        clk              ,
+        rst              ,
+        i_a     : s1     ,
+        i_b     : s2     ,
+        i_sub   : sub_s  ,
+        i_rm    : rm     ,
+        o_result: add_s_r,
+        o_fflags: add_s_f,
+    );
+
+    var mul_s_r: logic<32>;
+    var mul_s_f: logic<5> ;
+    inst u_mul_s: fp_multiplier_s #(
+        PIPE: 1,
+    ) (
+        clk              ,
+        rst              ,
+        i_a     : s1     ,
+        i_b     : s2     ,
+        i_rm    : rm     ,
+        o_result: mul_s_r,
+        o_fflags: mul_s_f,
+    );
+
+    var fma_s_r: logic<32>;
+    var fma_s_f: logic<5> ;
+    inst u_fma_s: fp_fma_s #(
+        PIPE: 1,
+    ) (
+        clk              ,
+        rst              ,
+        i_a     : s1     ,
+        i_b     : s2     ,
+        i_c     : s3     ,
+        i_neg_p : neg_p  ,
+        i_sub_c : sub_c  ,
+        i_rm    : rm     ,
+        o_result: fma_s_r,
+        o_fflags: fma_s_f,
+    );
+
+    var add_d_r: logic<64>;
+    var add_d_f: logic<5> ;
+    inst u_add_d: fp_adder #(
+        PIPE: 1,
+    ) (
+        clk               ,
+        rst               ,
+        i_a     : i_src[0],
+        i_b     : i_src[1],
+        i_sub   : sub_d   ,
+        i_rm    : rm      ,
+        o_result: add_d_r ,
+        o_fflags: add_d_f ,
+    );
+
+    var mul_d_r: logic<64>;
+    var mul_d_f: logic<5> ;
+    inst u_mul_d: fp_multiplier #(
+        PIPE: 1,
+    ) (
+        clk               ,
+        rst               ,
+        i_a     : i_src[0],
+        i_b     : i_src[1],
+        i_rm    : rm      ,
+        o_result: mul_d_r ,
+        o_fflags: mul_d_f ,
+    );
+
+    var fma_d_r: logic<64>;
+    var fma_d_f: logic<5> ;
+    inst u_fma_d: fp_fma #(
+        PIPE  : 1   ,
+        STAGE3: 1'b0,
+    ) (
+        clk               ,
+        rst               ,
+        i_a     : i_src[0],
+        i_b     : i_src[1],
+        i_c     : i_src[2],
+        i_neg_p : neg_p   ,
+        i_sub_c : sub_c   ,
+        i_rm    : rm      ,
+        o_result: fma_d_r ,
+        o_fflags: fma_d_f ,
+    );
+
+    // ---- Stage 1 register: the op beside the leaves' midpoint ----
+
+    struct Meta {
+        tag: ExTag,
+        op : FpuOp,
+    }
+
+    var m_in: Meta;
+    always_comb {
+        m_in.tag = i_tag;
+        m_in.op  = i_op;
+    }
+
+    var s1_v: logic;
+    var m   : Meta ;
+    inst u_s1: stage_reg::<CFG> #(
+        T: Meta,
+    ) (
+        clk               ,
+        rst               ,
+        i_valid           ,
+        i_data : m_in     ,
+        i_tag  : i_tag.rob,
+        i_kill            ,
+        o_valid: s1_v     ,
+        o_data : m        ,
+    );
+
+    // ---- Stage 2: select the leaf ----
+
+    var pkt: WbPacket;
+    always_comb {
+        pkt       = 0 as WbPacket;
+        pkt.valid = 1'b1;
+        pkt.tag   = m.tag;
+        case m.op {
+            FpuOp::FADD_S, FpuOp::FSUB_S: {
+                pkt.data   = box_s(add_s_r);
+                pkt.fflags = add_s_f;
+            }
+            FpuOp::FMUL_S: {
+                pkt.data   = box_s(mul_s_r);
+                pkt.fflags = mul_s_f;
+            }
+            FpuOp::FMADD_S, FpuOp::FMSUB_S, FpuOp::FNMADD_S, FpuOp::FNMSUB_S: {
+                pkt.data   = box_s(fma_s_r);
+                pkt.fflags = fma_s_f;
+            }
+            FpuOp::FADD_D, FpuOp::FSUB_D: {
+                pkt.data   = add_d_r;
+                pkt.fflags = add_d_f;
+            }
+            FpuOp::FMUL_D: {
+                pkt.data   = mul_d_r;
+                pkt.fflags = mul_d_f;
+            }
+            default: {
+                pkt.data   = fma_d_r;
+                pkt.fflags = fma_d_f;
+            }
+        }
+    }
+
+    var wb_v: logic   ;
+    var wb_d: WbPacket;
+    inst u_out: stage_reg::<CFG> #(
+        T: WbPacket,
+    ) (
+        clk               ,
+        rst               ,
+        i_valid: s1_v     ,
+        i_data : pkt      ,
+        i_tag  : m.tag.rob,
+        i_kill            ,
+        o_valid: wb_v     ,
+        o_data : wb_d     ,
+    );
+
+    always_comb {
+        o_wb       = wb_d;
+        o_wb.valid = wb_v;
+    }
+    assign o_ready = 1'b1;
+}

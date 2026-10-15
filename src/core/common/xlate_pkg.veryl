@@ -1,0 +1,233 @@
+// xlate_pkg: translation types and the pure functions shared by the I and D
+// translation paths (tlb, ptw, mem_pipe, ifu).
+//
+// The permission check, the PA construction and the selective-flush predicate
+// exist once here; every consumer calls the same function instead of keeping
+// a near copy.
+pub package xlate_pkg {
+    // CBO: cbo.clean/flush/inval, translated with read-or-write permission and
+    // without a D-bit requirement; its faults are store-side.
+    enum AccKind: logic<3> {
+        LOAD,
+        STORE,
+        AMO,
+        FETCH,
+        CBO,
+    }
+
+    // Translation regime of a walk key (V1 and HLV are used from M5).
+    enum Regime: logic<2> {
+        V0,
+        V1,
+        HLV,
+    }
+
+    struct PtwKey {
+        vpn   : logic <27>,
+        regime: Regime    ,
+    }
+
+    struct TlbLookup {
+        valid: logic    ,
+        vpn  : logic<27>, // VA[38:12]
+        asid : logic<16>,
+    }
+
+    // A lookup result. A napot entry is a 4 KiB entry whose ppn[3:0] already
+    // holds VA[15:12]; napot only widens the sfence match. Only A = 1 leaves
+    // are cached, so there is no A bit.
+    struct TlbEntry {
+        hit  : logic    ,
+        ppn  : logic<44>,
+        level: logic<2> , // 2: 1 GiB, 1: 2 MiB, 0: 4 KiB
+        r    : logic    ,
+        w    : logic    ,
+        x    : logic    ,
+        u    : logic    ,
+        d    : logic    ,
+        g    : logic    ,
+        pbmt : logic<2> , // 0 PMA, 1 NC, 2 IO
+        napot: logic    ,
+    }
+
+    const TLB_ENTRY_W: u32 = 56;
+
+    // ptw -> tlb install.
+    struct TlbFill {
+        valid: logic    ,
+        vpn  : logic<27>,
+        asid : logic<16>,
+        ppn  : logic<44>,
+        level: logic<2> ,
+        r    : logic    ,
+        w    : logic    ,
+        x    : logic    ,
+        u    : logic    ,
+        d    : logic    ,
+        g    : logic    ,
+        pbmt : logic<2> ,
+        napot: logic    ,
+    }
+
+    // Same encoding as core_types XfKind.
+    enum InvKind: logic<2> {
+        SFENCE,
+        HFENCE_VVMA,
+        HFENCE_GVMA,
+    }
+
+    // Retire-time invalidation, the operands of SFENCE.VMA and HFENCE.*.
+    struct TlbInv {
+        valid   : logic      ,
+        kind    : InvKind    ,
+        va      : logic  <64>,
+        asid    : logic  <16>,
+        all_va  : logic      , // rs1 was x0
+        all_asid: logic      , // rs2 was x0
+    }
+
+    // CSR context of a translation, read at lookup (and latched by ptw at
+    // walk start): effective privilege, SUM/MXR, menvcfg ADUE/PBMTE, satp.
+    struct XlateCtx {
+        prv  : csr_pkg::PrivLevel    ,
+        sum  : logic                 ,
+        mxr  : logic                 ,
+        adue : logic                 ,
+        pbmte: logic                 ,
+        asid : logic             <16>,
+        root : logic             <44>, // satp.PPN
+    }
+
+    struct Perm {
+        ok    : logic   ,
+        need_d: logic   , // store/AMO on W = 1, D = 0 with ADUE: the PA is not final
+        cause : logic<6>, // page-fault cause when !ok
+    }
+
+    struct TlbPerf {
+        miss    : logic, // a valid lookup missed
+        fill    : logic,
+        fill_inv: logic, // a fill dropped because an invalidation came in the same cycle
+        inv     : logic, // an invalidation removed at least one entry
+    }
+
+    struct PtwPerf {
+        req     : logic, // a request entered the queue
+        coalesce: logic, // a request joined a queued or running walk
+        full    : logic, // a request waited for queue room
+        q_drop  : logic, // a queued request was dropped by a kill
+        walk    : logic, // a walk started
+        pte_rd  : logic, // a PTE read was accepted
+        park    : logic, // a PTE read parked on a fill
+        busy    : logic, // a PTE read waited for any fill to end
+        retry   : logic,
+        pfault  : logic, // a walk ended in a page fault
+        afault  : logic, // a walk ended in an access fault (PTE PMP/PMA)
+        install : logic,
+        stale   : logic, // a faultless walk not installed (epoch)
+        own_drop: logic, // a completed walk whose owner was dropped
+        a_wr    : logic, // an A/D write setting A was accepted
+        d_wr    : logic, // an A/D write setting D was accepted
+        ad_rd   : logic, // a PTE re-read before an A/D write
+    }
+
+    function pf_cause (
+        acc: input AccKind,
+    ) -> logic<6> {
+        return case acc {
+            AccKind::FETCH: 6'd12,
+            AccKind::LOAD : 6'd13,
+            default       : 6'd15,
+        };
+    }
+
+    function af_cause (
+        acc: input AccKind,
+    ) -> logic<6> {
+        return case acc {
+            AccKind::FETCH: 6'd1,
+            AccKind::LOAD : 6'd5,
+            default       : 6'd7,
+        };
+    }
+
+    // Page permission of a cached leaf for access acc under ctx. AMO needs W
+    // (which implies R in a legal leaf); CBO needs R or W and no D.
+    function perm (
+        e  : input TlbEntry,
+        acc: input AccKind ,
+        ctx: input XlateCtx,
+    ) -> Perm {
+        var p    : Perm ;
+        var rwx  : logic;
+        var dirty: logic;
+        let fetch: logic = acc == AccKind::FETCH;
+        let st   : logic = acc == AccKind::STORE || acc == AccKind::AMO;
+        let rd_ok: logic = e.r || (ctx.mxr && e.x);
+        rwx   = case acc {
+            AccKind::LOAD : rd_ok,
+            AccKind::STORE: e.w,
+            AccKind::AMO  : e.w,
+            AccKind::FETCH: e.x,
+            default       : e.r || e.w,
+        };
+        let u_ok    : logic = if ctx.prv == csr_pkg::PrivLevel::USER ? e.u : (!e.u || (ctx.sum && !fetch));
+        dirty    = !st || e.d;
+        p.ok     = rwx && u_ok && (dirty || ctx.adue);
+        p.need_d = rwx && u_ok && !dirty && ctx.adue;
+        p.cause  = pf_cause(acc);
+        return p;
+    }
+
+    function entry_pa (
+        e : input TlbEntry    ,
+        va: input logic   <64>,
+    ) -> pma_pkg::Pa {
+        return case e.level {
+            2'd2   : {e.ppn[43:18], va[29:0]},
+            2'd1   : {e.ppn[43:9], va[20:0]},
+            default: {e.ppn, va[11:0]},
+        };
+    }
+
+    // Svpbmt composition: NC and IO only make the attributes stricter.
+    function pbmt_attr (
+        a   : input pma_pkg::PmaAttr   ,
+        pbmt: input logic           <2>,
+    ) -> pma_pkg::PmaAttr {
+        var r: pma_pkg::PmaAttr;
+        r = a;
+        if pbmt != 2'd0 {
+            r.cacheable     = 1'b0;
+            r.amo           = pma_pkg::AmoClass::NONE;
+            r.misaligned_ok = 1'b0;
+        }
+        if pbmt == 2'd2 {
+            r.idempotent = 1'b0;
+            r.io_ordered = 1'b1;
+        }
+        return r;
+    }
+
+    // Whether an SFENCE.VMA invalidation removes a cached V = 0 leaf. A
+    // napot entry matches the whole 64 KiB range of its VA; HFENCE does not
+    // touch V = 0 entries.
+    function inv_hit (
+        inv  : input TlbInv    ,
+        vpn  : input logic <27>,
+        level: input logic <2> ,
+        napot: input logic     ,
+        asid : input logic <16>,
+        g    : input logic     ,
+    ) -> logic {
+        let iv  : logic<27> = inv.va[38:12];
+        let lv_m: logic     = case level {
+            2'd2   : vpn[26:18] == iv[26:18],
+            2'd1   : vpn[26:9] == iv[26:9],
+            default: if napot ? vpn[26:4] == iv[26:4] : vpn == iv,
+        };
+        let va_m: logic = inv.all_va || lv_m;
+        let as_m: logic = inv.all_asid || (asid == inv.asid && !g);
+        return inv.valid && inv.kind == InvKind::SFENCE && va_m && as_m;
+    }
+}

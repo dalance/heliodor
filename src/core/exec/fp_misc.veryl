@@ -1,0 +1,267 @@
+// fp_misc: the single-cycle scalar FP ops: sign injection, min/max, compares,
+// classify, moves, FLI and the conversions (fp_cvt), combinational.
+//
+// Ports (timing contract):
+//   i_op     : an FMISC FpuOp (opclass_pkg::fp_kind); any other op yields an
+//              unspecified result
+//   i_a/i_b  : rs1 and rs2 register values (rs1 is the integer source of
+//              FMV.*.X and the int-to-FP FCVTs)
+//   i_rm     : resolved rounding mode, read by the conversions only
+//   i_fli    : the FLI constant index (the rs1 field)
+//   o_result : FP results NaN-boxed, integer results sign-extended to 64
+//   o_fflags : {NV, DZ, OF, UF, NX}
+// Owns:
+//   - S and H operands that are not NaN-boxed read as the canonical NaN,
+//     except in FMV.X.W and FMV.X.H, which move the raw bits
+pub module fp_misc (
+    i_op    : input  fpu_pkg::FpuOp    ,
+    i_a     : input  logic         <64>,
+    i_b     : input  logic         <64>,
+    i_rm    : input  logic         <3> ,
+    i_fli   : input  logic         <5> ,
+    o_result: output logic         <64>,
+    o_fflags: output logic         <5> ,
+) {
+    import fpu_pkg::*;
+
+    // Operand facts in the op's format (S or D). ord maps the encoding to an
+    // unsigned key in FP order, -0 just below +0.
+    struct FpInfo {
+        sign: logic    ,
+        nan : logic    ,
+        snan: logic    ,
+        inf : logic    ,
+        zero: logic    ,
+        sub : logic    ,
+        ord : logic<64>,
+    }
+
+    function info (
+        d: input logic    , // double, else single
+        x: input logic<64>, // single in the low 32 bits
+    ) -> FpInfo {
+        var r : FpInfo;
+        var e1: logic ; // exponent all ones
+        var e0: logic ; // exponent zero
+        var m0: logic ; // fraction zero
+        var qb: logic ; // fraction MSB (quiet bit)
+        if d {
+            r.sign = x[63];
+            e1     = x[62:52] == 11'h7FF;
+            e0     = x[62:52] == 11'd0;
+            m0     = x[51:0] == 52'd0;
+            qb     = x[51];
+            r.ord  = x ^ (if x[63] ? 64'hFFFF_FFFF_FFFF_FFFF : 64'h8000_0000_0000_0000);
+        } else {
+            r.sign = x[31];
+            e1     = x[30:23] == 8'hFF;
+            e0     = x[30:23] == 8'd0;
+            m0     = x[22:0] == 23'd0;
+            qb     = x[22];
+            r.ord  = {32'd0, x[31:0] ^ (if x[31] ? 32'hFFFF_FFFF : 32'h8000_0000)};
+        }
+        r.nan  = e1 && !m0;
+        r.snan = e1 && !m0 && !qb;
+        r.inf  = e1 && m0;
+        r.zero = e0 && m0;
+        r.sub  = e0 && !m0;
+        return r;
+    }
+
+    // FLI constants, indexed by the rs1 field.
+    function fli_s (
+        i: input logic<5>,
+    ) -> logic<32> {
+        return case i {
+            5'd0   : 32'hBF80_0000, // -1.0
+            5'd1   : 32'h0080_0000, // smallest normal
+            5'd2   : 32'h3780_0000, // 2^-16
+            5'd3   : 32'h3800_0000, // 2^-15
+            5'd4   : 32'h3B80_0000, // 2^-8
+            5'd5   : 32'h3C00_0000, // 2^-7
+            5'd6   : 32'h3D80_0000, // 0.0625
+            5'd7   : 32'h3E00_0000, // 0.125
+            5'd8   : 32'h3E80_0000, // 0.25
+            5'd9   : 32'h3EA0_0000, // 0.3125
+            5'd10  : 32'h3EC0_0000, // 0.375
+            5'd11  : 32'h3EE0_0000, // 0.4375
+            5'd12  : 32'h3F00_0000, // 0.5
+            5'd13  : 32'h3F20_0000, // 0.625
+            5'd14  : 32'h3F40_0000, // 0.75
+            5'd15  : 32'h3F60_0000, // 0.875
+            5'd16  : 32'h3F80_0000, // 1.0
+            5'd17  : 32'h3FA0_0000, // 1.25
+            5'd18  : 32'h3FC0_0000, // 1.5
+            5'd19  : 32'h3FE0_0000, // 1.75
+            5'd20  : 32'h4000_0000, // 2.0
+            5'd21  : 32'h4020_0000, // 2.5
+            5'd22  : 32'h4040_0000, // 3.0
+            5'd23  : 32'h4080_0000, // 4.0
+            5'd24  : 32'h4100_0000, // 8.0
+            5'd25  : 32'h4180_0000, // 16.0
+            5'd26  : 32'h4300_0000, // 128.0
+            5'd27  : 32'h4380_0000, // 256.0
+            5'd28  : 32'h4700_0000, // 2^15
+            5'd29  : 32'h4780_0000, // 2^16
+            5'd30  : 32'h7F80_0000, // +inf
+            default: 32'h7FC0_0000, // canonical NaN
+        };
+    }
+
+    function fli_d (
+        i: input logic<5>,
+    ) -> logic<64> {
+        return case i {
+            5'd0   : 64'hBFF0_0000_0000_0000,
+            5'd1   : 64'h0010_0000_0000_0000,
+            5'd2   : 64'h3EF0_0000_0000_0000,
+            5'd3   : 64'h3F00_0000_0000_0000,
+            5'd4   : 64'h3F70_0000_0000_0000,
+            5'd5   : 64'h3F80_0000_0000_0000,
+            5'd6   : 64'h3FB0_0000_0000_0000,
+            5'd7   : 64'h3FC0_0000_0000_0000,
+            5'd8   : 64'h3FD0_0000_0000_0000,
+            5'd9   : 64'h3FD4_0000_0000_0000,
+            5'd10  : 64'h3FD8_0000_0000_0000,
+            5'd11  : 64'h3FDC_0000_0000_0000,
+            5'd12  : 64'h3FE0_0000_0000_0000,
+            5'd13  : 64'h3FE4_0000_0000_0000,
+            5'd14  : 64'h3FE8_0000_0000_0000,
+            5'd15  : 64'h3FEC_0000_0000_0000,
+            5'd16  : 64'h3FF0_0000_0000_0000,
+            5'd17  : 64'h3FF4_0000_0000_0000,
+            5'd18  : 64'h3FF8_0000_0000_0000,
+            5'd19  : 64'h3FFC_0000_0000_0000,
+            5'd20  : 64'h4000_0000_0000_0000,
+            5'd21  : 64'h4004_0000_0000_0000,
+            5'd22  : 64'h4008_0000_0000_0000,
+            5'd23  : 64'h4010_0000_0000_0000,
+            5'd24  : 64'h4020_0000_0000_0000,
+            5'd25  : 64'h4030_0000_0000_0000,
+            5'd26  : 64'h4060_0000_0000_0000,
+            5'd27  : 64'h4070_0000_0000_0000,
+            5'd28  : 64'h40E0_0000_0000_0000,
+            5'd29  : 64'h40F0_0000_0000_0000,
+            5'd30  : 64'h7FF0_0000_0000_0000,
+            default: 64'h7FF8_0000_0000_0000,
+        };
+    }
+
+    let is_d: logic = case i_op {
+        FpuOp::FSGNJ_D, FpuOp::FSGNJN_D, FpuOp::FSGNJX_D, FpuOp::FMIN_D, FpuOp::FMAX_D, FpuOp::FMINM_D, FpuOp::FMAXM_D,
+        FpuOp::FEQ_D, FpuOp::FLT_D, FpuOp::FLE_D, FpuOp::FLEQ_D, FpuOp::FLTQ_D, FpuOp::FCLASS_D: 1'b1,
+        default: 1'b0,
+    };
+
+    let sa: logic<32> = unbox_s(i_a);
+    let sb: logic<32> = unbox_s(i_b);
+
+    // Operands as register values in the op's format.
+    let va  : logic <64> = if is_d ? i_a : box_s(sa);
+    let vb  : logic <64> = if is_d ? i_b : box_s(sb);
+    let cnan: logic <64> = if is_d ? CANONICAL_NAN_D : box_s(CANONICAL_NAN_S);
+    let ia  : FpInfo     = info(is_d, if is_d ? i_a : {32'd0, sa});
+    let ib  : FpInfo     = info(is_d, if is_d ? i_b : {32'd0, sb});
+
+    // ---- Sign injection ----
+
+    function sgnj (
+        d: input logic    ,
+        v: input logic<64>,
+        s: input logic    ,
+    ) -> logic<64> {
+        return if d ? {s, v[62:0]} : {v[63:32], s, v[30:0]};
+    }
+
+    // ---- Min/max and compares ----
+
+    let any_nan : logic = ia.nan || ib.nan;
+    let any_snan: logic = ia.snan || ib.snan;
+    let lt      : logic = ia.ord <: ib.ord;
+    let eq      : logic = ia.ord == ib.ord || (ia.zero && ib.zero);
+
+    let min_v: logic<64> = if ia.nan && ib.nan ? cnan : if ia.nan ? vb : if ib.nan ? va : if lt ? va : vb;
+    let max_v: logic<64> = if ia.nan && ib.nan ? cnan : if ia.nan ? vb : if ib.nan ? va : if ia.ord >: ib.ord ? va : vb;
+
+    // ---- Classify ----
+
+    let cls: logic<10> = {
+        ia.nan && !ia.snan, ia.snan, !ia.sign && ia.inf, !ia.sign && !ia.nan && !ia.inf && !ia.zero && !ia.sub,
+        !ia.sign && ia.sub, !ia.sign && ia.zero, ia.sign && ia.zero, ia.sign && ia.sub,
+        ia.sign && !ia.nan && !ia.inf && !ia.zero && !ia.sub, ia.sign && ia.inf
+    };
+
+    // ---- Conversions ----
+
+    var cvt_res: logic<64>;
+    var cvt_fl : logic<5> ;
+    inst u_cvt: fp_cvt (
+        i_op             ,
+        i_a              ,
+        i_rm             ,
+        o_result: cvt_res,
+        o_fflags: cvt_fl ,
+    );
+
+    // ---- Result ----
+
+    const NV: logic<5> = 5'b10000;
+
+    always_comb {
+        o_result = 64'd0;
+        o_fflags = 5'd0;
+        case i_op {
+            FpuOp::FSGNJ_S, FpuOp::FSGNJ_D  : o_result = sgnj(is_d, va, ib.sign);
+            FpuOp::FSGNJN_S, FpuOp::FSGNJN_D: o_result = sgnj(is_d, va, !ib.sign);
+            FpuOp::FSGNJX_S, FpuOp::FSGNJX_D: o_result = sgnj(is_d, va, ia.sign ^ ib.sign);
+            FpuOp::FMIN_S, FpuOp::FMIN_D    : {
+                o_result = min_v;
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FMAX_S, FpuOp::FMAX_D: {
+                o_result = max_v;
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FMINM_S, FpuOp::FMINM_D: {
+                o_result = if any_nan ? cnan : min_v;
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FMAXM_S, FpuOp::FMAXM_D: {
+                o_result = if any_nan ? cnan : max_v;
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FEQ_S, FpuOp::FEQ_D: {
+                o_result = {63'd0, !any_nan && eq};
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FLTQ_S, FpuOp::FLTQ_D: {
+                o_result = {63'd0, !any_nan && !eq && lt};
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FLEQ_S, FpuOp::FLEQ_D: {
+                o_result = {63'd0, !any_nan && (eq || lt)};
+                o_fflags = if any_snan ? NV : 5'd0;
+            }
+            FpuOp::FLT_S, FpuOp::FLT_D: {
+                o_result = {63'd0, !any_nan && !eq && lt};
+                o_fflags = if any_nan ? NV : 5'd0;
+            }
+            FpuOp::FLE_S, FpuOp::FLE_D: {
+                o_result = {63'd0, !any_nan && (eq || lt)};
+                o_fflags = if any_nan ? NV : 5'd0;
+            }
+            FpuOp::FCLASS_S, FpuOp::FCLASS_D: o_result = {54'd0, cls};
+            FpuOp::FMV_X_W                  : o_result = {i_a[31] repeat 32, i_a[31:0]};
+            FpuOp::FMV_X_H                  : o_result = {i_a[15] repeat 48, i_a[15:0]};
+            FpuOp::FMV_X_D, FpuOp::FMV_D_X  : o_result = i_a;
+            FpuOp::FMV_W_X                  : o_result = box_s(i_a[31:0]);
+            FpuOp::FMV_H_X                  : o_result = box_h(i_a[15:0]);
+            FpuOp::FLI_S                    : o_result = box_s(fli_s(i_fli));
+            FpuOp::FLI_D                    : o_result = fli_d(i_fli);
+            default                         : {
+                o_result = cvt_res;
+                o_fflags = cvt_fl;
+            }
+        }
+    }
+}

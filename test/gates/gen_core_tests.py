@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the new-core test wrappers from a gate list.
 
-    test/gates/gen_core_tests.py --core w2 [--no-lockstep] [--out-dir tb] test/gates/<milestone>.list
+    test/gates/gen_core_tests.py --core w2 [--no-lockstep] [--ignored] [--out-dir tb] test/gates/<milestone>.list
 
 Writes <out-dir>/test_<core>_<suite>.veryl with one test `test_<core>_<suite>_<name>`
 per list entry. Each wrapper selects the core with the harness `CORE` param,
@@ -9,6 +9,11 @@ runs the early-exit loop (BUDGET/1000 steps of 1000 cycles, stop on o_pass or
 o_fail) and, with lockstep, points the tracer at the golden checkpoint file
 test/golden/arch/<suite>/<name>.ck.hex. The harness folds the checker and the
 lockstep mismatch into o_pass/o_fail, so the wrapper only asserts o_pass.
+
+Entries with lockstep=0 are always pass/fail; mtime=instret selects the
+retire-count mtime; irq=<mask> pulses those PLIC sources. --ignored marks
+every test `#[ignore]` (suites too long for the default run, e.g. ACT4: see
+test/gates/run_act.py).
 
 Lockstep entries need their golden file (test/golden/run_golden.py); a missing
 one is an error unless --allow-missing-golden. Files of the same core and
@@ -33,6 +38,10 @@ def params(e, core, lockstep):
         ("HEX_FILE", f'"{e.hex}"'),
         ("TOHOST_IDX", str(e.tohost)),
     ]
+    if e.mtime == "instret":
+        p += [("MTIME_SRC", "soc_pkg::MTIME_INSTRET"), ("MTIME_DIV", "10")]
+    if e.irq:
+        p += [("EXT_IRQ_SRC", f"32'h{e.irq:08x}")]
     if lockstep:
         p += [("CK_EN", "1"), ("CK_FILE", f'"{e.ck_file}"')]
     kw = max(len(k) for k, _ in p)
@@ -40,13 +49,15 @@ def params(e, core, lockstep):
     return "\n".join(f"        {k.ljust(kw)}: {v.ljust(vw)}," for k, v in p)
 
 
-def gen_module(e, core, lockstep):
+def gen_module(e, core, lockstep, ignored):
     mod = f"test_{core}_{e.ident}"
     steps = e.budget // gatelist.EARLY_EXIT_STEP
+    lockstep = lockstep and e.lockstep
     mode = "lockstep" if lockstep else "pass/fail"
+    ign = "#[ignore]\n" if ignored else ""
     return f"""
 #[test({mod})]
-module {mod} {{
+{ign}module {mod} {{
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
     var pass  : logic    ;
@@ -84,12 +95,13 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=MASTER / "tb")
     ap.add_argument("--no-lockstep", action="store_true", help="pass/fail only, no golden checkpoint file")
     ap.add_argument("--allow-missing-golden", action="store_true")
+    ap.add_argument("--ignored", action="store_true", help="mark the generated tests #[ignore]")
     a = ap.parse_args()
 
     lockstep = not a.no_lockstep
     entries = gatelist.parse(a.list)
     if lockstep and not a.allow_missing_golden:
-        missing = [e.ck_file for e in entries if not (MASTER / e.ck_file).is_file()]
+        missing = [e.ck_file for e in entries if e.lockstep and not (MASTER / e.ck_file).is_file()]
         if missing:
             print("gen_core_tests: missing golden files (run test/golden/run_golden.py):", file=sys.stderr)
             for m in missing:
@@ -102,7 +114,7 @@ def main():
     a.out_dir.mkdir(parents=True, exist_ok=True)
     for suite, es in gatelist.by_suite(entries).items():
         path = a.out_dir / f"test_{a.core}_{suite}.veryl"
-        path.write_text(HEADER.format(src=src) + "".join(gen_module(e, a.core, lockstep) for e in es))
+        path.write_text(HEADER.format(src=src) + "".join(gen_module(e, a.core, lockstep, a.ignored) for e in es))
         print(f"gen_core_tests: wrote {path} ({len(es)} tests)")
     return 0
 

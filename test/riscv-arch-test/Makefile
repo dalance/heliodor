@@ -40,9 +40,34 @@ endef
 
 $(foreach s,$(SUITES),$(eval $(call SUITE_template,$(s))))
 
-all: $(SUITES)
+# The "v" environment runs the same tests in U-mode under Sv39 with demand
+# paging (env/v/vm.c), so fetch and data translation, the walkers and page
+# faults are exercised. F is in -march only because vm.c names fssr in an
+# asm string; the image executes no FP instruction.
+VSUITES := rv64ui
+VCFLAGS := -march=rv64imf_zicsr_zifencei -mabi=lp64 -static -mcmodel=medany -fvisibility=hidden \
+           -nostdlib -nostartfiles -DENTROPY=0x1234567 -std=gnu99 -O2 \
+           -I$(ENV)/v -I$(UPSTREAM)/isa/macros/scalar
+VSRCS   := $(ENV)/v/entry.S $(wildcard $(ENV)/v/*.c)
+
+define VSUITE_template
+$(1)_v_NAMES := $$(patsubst $$(UPSTREAM)/isa/$(1)/%.S,%,$$(wildcard $$(UPSTREAM)/isa/$(1)/*.S))
+$(1)_v_HEX   := $$(addprefix $$(BUILD)/$(1)_v/,$$(addsuffix .hex,$$($(1)_v_NAMES)))
+
+$(1)_v: $$($(1)_v_HEX)
+
+$$(BUILD)/$(1)_v/%.hex: $$(UPSTREAM)/isa/$(1)/%.S $$(VSRCS)
+	@mkdir -p $$(BUILD)/$(1)_v
+	$$(CC) $$(VCFLAGS) -T $$(ENV)/v/link.ld $$(VSRCS) $$< -o $$(BUILD)/$(1)_v/$$*.elf
+	$$(OBJCOPY) -O binary $$(BUILD)/$(1)_v/$$*.elf $$(BUILD)/$(1)_v/$$*.bin
+	$$(BIN2HEX) $$(BUILD)/$(1)_v/$$*.bin $$@
+endef
+
+$(foreach s,$(VSUITES),$(eval $(call VSUITE_template,$(s))))
+
+all: $(SUITES) $(addsuffix _v,$(VSUITES))
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean $(SUITES)
+.PHONY: all clean $(SUITES) $(addsuffix _v,$(VSUITES))
