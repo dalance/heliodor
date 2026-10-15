@@ -290,8 +290,12 @@ bad_csr:
     bne     t1, t0, fail
     li      t0, (3 << 32)
     csrw    menvcfg, t0
+    li      t0, (1 << 32)
+    csrw    menvcfg, t0
     csrr    t1, menvcfg
-    bnez    t1, fail
+    li      t0, (3 << 32)
+    bne     t1, t0, fail
+    csrw    menvcfg, zero
     li      t0, 1
     slli    t0, t0, 63
     csrs    mstatus, t0
