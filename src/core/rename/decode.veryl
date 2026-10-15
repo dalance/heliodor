@@ -6,8 +6,8 @@
 //   i_rq_ready    : rq.o_ready (registered); the whole group moves or none
 //   o_valid/o_dec : to rq.i_valid/i_data, combinational from the inputs
 //   o_dq_take     : to DQ.i_take: every valid lane when rq is ready, else 0
-//   i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm : live csr outputs, read
-//                   combinationally
+//   i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr : live csr outputs,
+//                   read combinationally
 //   o_perf        : registered event wires
 //   o_chk         : sticky invariant flags (HELIODOR_CHK builds only, else 0)
 //   Kill is applied by the two queues (both flush on kill.valid); decode
@@ -28,21 +28,26 @@
 //     HFENCE/HINVAL and the hypervisor and VS CSRs) and the V CSRs
 //   - a CSR access names a CSR that does not exist, needs more privilege, or
 //     writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM
+//   - a counter (cycle, time, instret, hpmcounterN) below M whose mcounteren
+//     bit is clear, or in U whose scounteren bit is clear; stimecmp in
+//     HS-mode without mcounteren.TM and menvcfg.STCE
+//   - an F or D instruction or fflags/frm/fcsr with mstatus.FS = Off
+//   - a CBO below M that menvcfg disables (CBIE = 0 for inval, CBCFE for
+//     clean and flush, CBZE for zero), or in U that senvcfg disables
 //   - MRET below M, SRET in U or in HS-mode with mstatus.TSR, SFENCE.VMA or
-//     SINVAL.VMA in HS-mode with mstatus.TVM, or an undefined SYSTEM
+//     SINVAL.VMA in HS-mode with mstatus.TVM, any SFENCE or SINVAL form in
+//     U, WFI in U or in HS-mode with mstatus.TW, or an undefined SYSTEM
 //     function
-//   Not checked: the counteren registers (the reused csr stores them without
-//   enforcing access); mstatus.FS (no F or D op or CSR is legal here anyway).
 // Rationale:
 //   - legality reads the committed CSR state live with no shadow: every CSR
 //     change retires with a flush, which empties DQ, decode and rq, so the
 //     state a surviving op saw equals its state at commit
 //   - a fetch fault outranks every decode-time exception, so the fetch
 //     record is taken as is and the decoder output is discarded
-//   - WFI is a no-op (fu NONE): it completes at once, which the privileged
-//     spec allows in every mode, so mstatus.TW never makes it trap
-//   - WRS.NTO and WRS.STO are no-ops (fu NONE) for the same reason: Zawrs
-//     allows them to complete at once
+//   - a legal WFI is a no-op (fu NONE): it completes at once, which the
+//     privileged spec allows; the WFI that traps follows the reference model
+//   - WRS.NTO and WRS.STO are no-ops (fu NONE) and never trap: Zawrs allows
+//     them to complete at once
 module decode::<CFG: core_cfg> (
     clk          : input  clock                                                                      ,
     rst          : input  reset                                                                      ,
@@ -56,6 +61,7 @@ module decode::<CFG: core_cfg> (
     i_virt       : input  logic                                                                      ,
     i_mstatus_tsr: input  logic                                                                      ,
     i_mstatus_tvm: input  logic                                                                      ,
+    i_csr        : input  csr_pkg::DecCsr                                                            ,
     o_perf       : output core_types::<CFG>::DecPerf                                                 ,
     o_chk        : output logic                                                                      ,
 ) {
@@ -196,6 +202,18 @@ module decode::<CFG: core_cfg> (
             && a <= 12'hc22) || a[9:8] == 2'b10;
     }
 
+    // The envcfg field that enables a CBO kind.
+    function cbo_on (
+        env : input logic<64>,
+        kind: input logic<5> ,
+    ) -> logic {
+        return case kind {
+            5'd0   : env[5:4] != 2'b00,
+            5'd4   : env[7],
+            default: env[6],
+        };
+    }
+
     // Decode-time legality of one instruction (see the header).
     function illegal (
         insn  : input logic             <32>,
@@ -217,6 +235,7 @@ module decode::<CFG: core_cfg> (
         virt  : input logic                 ,
         tsr   : input logic                 ,
         tvm   : input logic                 ,
+        cs    : input csr_pkg::DecCsr       ,
     ) -> logic {
         let f3    : logic<3>  = insn[14:12];
         let f7    : logic<7>  = insn[31:25];
@@ -228,13 +247,21 @@ module decode::<CFG: core_cfg> (
         let mret  : logic     = xret && f12 == 12'h302;
         let sret  : logic     = xret && f12 == 12'h102;
         let is_sys: logic     = insn[6:0] == riscv_pkg::Opcode::SYSTEM;
+        let umode : logic     = priv == csr_pkg::PrivLevel::USER;
+        let below : logic     = priv != csr_pkg::PrivLevel::MACHINE;
+        let ctr   : logic     = f12[11:5] == 7'b1100000; // cycle, time, instret, hpmcounterN
+        let ctr_ill: logic    = csr && ((ctr && ((below && !cs.mcounteren[f12[4:0]]) || (umode && !cs.scounteren[f12[4:0]])))
+            || (f12 == 12'h14d && hs && !(cs.mcounteren[1] && cs.menvcfg[63])));
+        let fs_ill: logic = cs.fs == 2'b00 && (fp || (csr && f12 >= 12'h001 && f12 <= 12'h003));
+        let cbo_k : logic<5> = insn[24:20]; // 0 inval, 1 clean, 2 flush, 4 zero
+        let cbo_ill: logic   = cbo && ((below && !cbo_on(cs.menvcfg, cbo_k)) || (umode && !cbo_on(cs.senvcfg, cbo_k)));
         let unsrv : logic     = fp || amo || cbo || hlv || hfen || (csr && csr_unserved(f12));
         let csr_ill: logic    = csr && (!csr_pkg::csr_exists(f12) || rp >: priv || (f12[11:10] == 2'b11 && csr_wr) || (hs
             && tvm && f12 == 12'h180));
         let sys_ill: logic = (mret && priv != csr_pkg::PrivLevel::MACHINE) || (sret && (priv == csr_pkg::PrivLevel::USER
-            || (hs && tsr))) || (sfence && !hfen && hs && tvm) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret
-            || wfi || sfence || sinval || wrs));
-        return dill || vec || unsrv || csr_ill || sys_ill;
+            || (hs && tsr))) || (sfence && !hfen && hs && tvm) || ((sfence || sinval) && umode) || (wfi && (umode || (hs
+            && cs.tw))) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret || wfi || sfence || sinval || wrs));
+        return dill || vec || unsrv || csr_ill || ctr_ill || fs_ill || cbo_ill || sys_ill;
     }
 
     var lane_ill: logic [W];
@@ -251,7 +278,7 @@ module decode::<CFG: core_cfg> (
 
             let ill: logic = illegal(insn, dec_ill[l], is_vec[l], is_fp[l], is_amo[l], is_cbo_z[l] || is_cbo_m[l], hlv[l]
                 || hlvx[l], is_csr[l], csr_wr, is_sfence[l], is_sinval[l], is_ecall[l], is_ebreak[l], is_mret[l],
-                is_wfi[l], i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm);
+                is_wfi[l], i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr);
 
             var exc: exc_pkg::ExcRec;
             exc = 0 as exc_pkg::ExcRec;

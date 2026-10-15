@@ -46,6 +46,8 @@ pa_loop:
     csrw    MENVCFG, t0             # STCE = 1 (Sstc enabled)
     li      t0, (1 << 5)
     csrw    mideleg, t0             # delegate supervisor timer (cause 5) to S
+    li      t0, (1 << 1)
+    csrw    mcounteren, t0          # TM: S-mode may read time and access stimecmp
     li      t0, -1
     csrw    STIMECMP, t0            # park high until S-mode programs it
     la      t0, s_handler
