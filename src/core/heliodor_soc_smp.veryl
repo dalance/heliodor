@@ -236,12 +236,21 @@ pub module heliodor_soc_smp #(
     var l2_wcadd_v   : logic   ;
     var l2_wcadd_hart: logic<3>;
     var l2_wcadd_own : logic   ;
+    // I slot single-beat reads (new cores only: uncached ROM fetch) share the
+    // hart's bus read channel. mem_ctrl grants the D slot first, so the I
+    // address is presented only while the D slot has no single-beat read.
+    var c_imemr_addr : logic<64> [N_HARTS];
+    var c_imemr_req  : logic     [N_HARTS];
+    var c_imemr_dram : logic     [N_HARTS];
+    var c_imemr_iread: logic     [N_HARTS];
+    var i_legacy     : logic     [N_HARTS];
     for h in 0..N_HARTS :gen_busin {
-        assign bus_in_raddr[h] = c_dmem_addr[h];
+        assign i_legacy[h]     = c_imemr_req[h] && !c_imemr_dram[h];
+        assign bus_in_raddr[h] = if i_legacy[h] && !(c_dmem_req[h] && !in_dram[h]) ? c_imemr_addr[h] : c_dmem_addr[h];
         // P9.1: the bus read channel now arbitrates LEGACY (non-DRAM: MMIO /
         // firmware-ROM) combinational reads plus mem_ctrl's DRAM gather
         // beats; DRAM read transactions are accepted/streamed by mem_ctrl.
-        assign bus_in_ren[h]   = c_dmem_ren[h] && !in_dram[h];
+        assign bus_in_ren[h]   = (c_dmem_ren[h] && !in_dram[h]) || (i_legacy[h] && ctrl_hgrant[N_HARTS + h]);
         assign bus_in_rreq[h]  = ctrl_bus_rreq[h];
         assign bus_in_waddr[h] = c_dmemw_addr[h];
         for l in 0..8 :gen_busin_lane {
@@ -448,13 +457,13 @@ pub module heliodor_soc_smp #(
     // firmware-ROM) reads pass through combinationally on the read grant.
     // ── Block N SHIPPED: TWO transaction slots per hart (cp_mshr_mlp_plan.md §10.2). ──
     // Slot 2h is the D side (loads, store-RFO fills, uncached MMIO), slot 2h+1 the
-    // I side (I-cache fill + I-side page-table walk). An I-side read is always DRAM
-    // (a non-DRAM fetch uses the o_imem passthrough) and always an uncounted I-read.
+    // I side (I-cache fill + I-side page-table walk). The old core's I-side read is
+    // always a DRAM line I-read (its non-DRAM fetch uses the o_imem passthrough);
+    // a new core marks its uncached ROM fetch as a single beat, whose data comes
+    // from the external port like a D-side legacy read.
     var mc_req  : logic     [N_HARTS * 2];
     var mc_addr : logic<64> [N_HARTS * 2];
     var mc_dram : logic     [N_HARTS * 2];
-    var c_imemr_addr: logic<64> [N_HARTS];
-    var c_imemr_req : logic     [N_HARTS];
     // SLOT-MAJOR (see mem_ctrl's header): slots [0, N_HARTS) are the D side, one per
     // hart in hart order, and [N_HARTS, 2*N_HARTS) the I side. Hart-major numbering
     // would hand hart 0 two consecutive slots and let it win both lowest-id-wins
@@ -465,9 +474,9 @@ pub module heliodor_soc_smp #(
         assign mc_dram[h]     = in_dram[h];
         assign mc_req[N_HARTS + h]  = c_imemr_req[h];
         assign mc_addr[N_HARTS + h] = c_imemr_addr[h];
-        assign mc_dram[N_HARTS + h] = 1'b1;
+        assign mc_dram[N_HARTS + h] = c_imemr_dram[h];
         assign c_dmem_rfo[N_HARTS + h]   = 1'b0;
-        assign c_dmem_iread[N_HARTS + h] = 1'b1;
+        assign c_dmem_iread[N_HARTS + h] = c_imemr_iread[h];
     }
 
     inst u_mctrl: mem_ctrl #(
@@ -706,7 +715,9 @@ pub module heliodor_soc_smp #(
     // beat) / firmware-ROM (external comb port, legacy path — only the
     // granted hart's dcache advances on it).
     var core_dmem_rdata: logic<64> [N_HARTS];
+    var core_imem_rdata: logic<64> [N_HARTS];
     for h in 0..N_HARTS :gen_rdata {
+        assign core_imem_rdata[h] = if c_imemr_dram[h] ? ctrl_hrdata[N_HARTS + h] : i_dmem_rdata;
         assign core_dmem_rdata[h] = if in_clint[h] ?
             clint_rdata
         : if in_uart[h] ?
@@ -740,6 +751,8 @@ pub module heliodor_soc_smp #(
             for c in 0..128 :gen_core_lw {
                 assign o_dbg_lw_cause[h * 128 + c] = core_lw_cause[c];
             }
+            assign c_imemr_dram[h]  = 1'b1;
+            assign c_imemr_iread[h] = 1'b1;
             inst u_core: v14_heliodor_core #(
                 ID_SPLIT: 1, // Block N SHIPPED: the I side has its own mem_ctrl slot
                 RESET_PC    : RESET_PC,
@@ -952,10 +965,10 @@ pub module heliodor_soc_smp #(
                     i_dmem_fill_excl     : ctrl_hexcl[h]           ,
                     o_imemr_addr         : c_imemr_addr[h]         ,
                     o_imemr_req          : c_imemr_req[h]          ,
-                    o_imemr_dram         : _                       ,
-                    o_imemr_iread        : _                       ,
+                    o_imemr_dram         : c_imemr_dram[h]         ,
+                    o_imemr_iread        : c_imemr_iread[h]        ,
                     i_imemr_grant        : ctrl_hgrant[N_HARTS + h],
-                    i_imemr_rdata        : ctrl_hrdata[N_HARTS + h],
+                    i_imemr_rdata        : core_imem_rdata[h]      ,
                     o_dmemw_addr         : c_dmemw_addr[h]         ,
                     o_dmem_wdata         : core_wdata              ,
                     o_dmem_wstrb         : core_wstrb              ,
@@ -1013,10 +1026,10 @@ pub module heliodor_soc_smp #(
                     i_dmem_fill_excl     : ctrl_hexcl[h]           ,
                     o_imemr_addr         : c_imemr_addr[h]         ,
                     o_imemr_req          : c_imemr_req[h]          ,
-                    o_imemr_dram         : _                       ,
-                    o_imemr_iread        : _                       ,
+                    o_imemr_dram         : c_imemr_dram[h]         ,
+                    o_imemr_iread        : c_imemr_iread[h]        ,
                     i_imemr_grant        : ctrl_hgrant[N_HARTS + h],
-                    i_imemr_rdata        : ctrl_hrdata[N_HARTS + h],
+                    i_imemr_rdata        : core_imem_rdata[h]      ,
                     o_dmemw_addr         : c_dmemw_addr[h]         ,
                     o_dmem_wdata         : core_wdata              ,
                     o_dmem_wstrb         : core_wstrb              ,
