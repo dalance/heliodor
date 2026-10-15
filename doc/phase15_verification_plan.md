@@ -64,6 +64,20 @@
 - 共有モジュール (CLINT、csr、SoC、dcache/MMU への追加出力) または V14 に触れるコミット: V14 で梯子 1-5 を回す。共有モジュールの変更は M2 まで追加のみ (設計書 §4.4) なので、V14 の dhrystone/coremark の cycles と instret はビット一致するはずであり、それを受入条件にする。
 - サイクル予算は早期終了つきの上限であり、理由なく増やさない。ハーネスの載せ替えで予算が足りなくなった場合は、同じハーネスで V14 を測り、その値を根拠として記録してから変える。
 
+### 1.4 M2 のゲートの現状 (2026-10-15)
+
+基点は統合ブランチ `phase15/m2-int` の `3187069` (既定 `veryl test` 830 passed、0 failed)。U24 と U28 を決めたブランチ `phase15/m2-u28` (`88f1f31`、832 passed) はまだ統合ブランチに入っていない。語: LS = W2 で golden と lockstep 一致、PF = pass/fail だけ、HARN = harness が足りない、FEAT = RTL の機能が足りない、DEV = golden の誤り (付録 B)。
+
+| ゲート | 状態 | 残作業 |
+|---|---|---|
+| G0 (W2) | LS: rv64ui/um/ua/uc/uf/ud、rv64mi 13 本、rv64si、uzba/uzbb/uzbs、mzicbo、directed (zicond、hint、zcb、sysb、supm、cmo、svnapot、zfhmin、zfa、fma、fp_smoke)。PF: rv64mi の csr/mcsr/ma_fetch (misa を読む、B43) と illegal (割込みの位置。arch harness に schedule replay が無い)、rv64ui_v と icache_alias (golden の checkpoint が無い)、svpbmt、sstc/hpm/sscofpmf/priv、lrsc_reorder、io_smoke、§7.4 の probe 26 本 | svadu (FEAT: ADUE=0 固定)。smode_plic (HARN: SoC に `i_ext_irq_src` が無い)。b46_uart (HARN: THR の書込み計数器。§8 の `chk_io_mon` で置き換える)。§7.4 の未作成の directed (順序違反の REPLAY、walk 中の full kill の epoch 破棄、SC 失敗時の書込み権限の翻訳、Supm の Sv39/U-mode 版、§8 の IO 系) |
+| G0 (W4) | PF: rv64ui 全部と、W2 と同じリストの pass/fail | |
+| GA / GL-C (W2) | 診断の試走 (コミットしない): 696 本で pass 689 / fail 7、golden 一致 600。U24 と U28 の後は一致 603、既知の DEV による不一致 89、FEAT 4 | 不一致は misa (B43)、rd=x0 の AMO の store record (B55)、fence.i 無しの自己書換えコードの取り込み (B56)、Zicntr 2 本 (HARN: arch harness に `MTIME_SRC` が無い)。FEAT は Svadu/SvaduPMP の 4 本 (ADUE=0)。GL-C を回す入口 (§2.5 の `CORE` 切替。今は `gen_core_tests.py` のリストで代用) と、生成テスト名 `test_w2_act_*` と golden の final 名 `test_act_*` の対応付け (`check_hash.py`) が要る |
+| GL-B | HARN | N=1 boot harness に `CORE` と W2 の 5.15 boot テストを足した (`phase15/m2-int` の `d0675a9`)。残り: SoC と CLINT の `MTIME_SRC=INSTRET`、irq schedule を読んで debug 入力を駆動する tb、§4.7 の EXCLUDE 窓の要否 (B03 の `SATP_WIN` 窓のカーネル page fault を数える) |
+| GB1 | HARN | 6.6/7.1 の harness の `CORE`。7.1 は ADUE (FEAT) が前提 |
+| GV | HARN | `CORE` を指定する Verilator ラッパ (例 `sim/verilator/tb_soc_linux_boot_w2.sv`) |
+| GS / GF | 未記録 | GF は M1b と同じく `o_perf` の配線と `perf_acc`/`fire_matrix.txt`/`fire_check.py` が要る (§5.2) |
+
 ---
 
 ## 2. ハーネスの載せ替え (D3)
@@ -140,6 +154,7 @@ litmus の histogram (0x8000_4000) と barrier 語 (0x8000_6000) の DRAM ダン
 
 - SoC と各 harness は `CORE` param を持ち、generate-if で枝を選ぶ。V14 枝は旧 harness 本体の逐語移設なので、V14 のゲート結果は動かない。M6 では V14 枝と `src/v14/`、V14 専用の印字を削除し、`CORE` の既定値を変える。
 - 【決定】新コアのテストは、ゲートリスト `test/gates/<milestone>.list` から `test/gates/gen_core_tests.py` が生成するラッパ (`tb/test_w2_*.veryl`、`tb/test_w4_*.veryl`) で走らせる。生成物は既定スイートに入るのでコミットする。ラッパは `CORE` を明示し、早期終了ループと golden checkpoint ファイルの param を持つ。理由: 1 回の `veryl test` で V14 と W2/W4 を同時に回せる。
+- 【決定】(M2) 生成される suite のファイル (`tb/test_<core>_<suite>.veryl`) 1 つにつき、それを生成するゲートリストはちょうど 1 つとする。M2 のリストは領域ごとに分け、lockstep のリスト (`m2_<領域>.list`) と pass/fail のリスト (`m2_<領域>_pf.list`、`--no-lockstep`) が同じ suite を持たないようにする。理由: `gen_core_tests.py` は 1 回の実行で suite ごとのファイルを丸ごと書き直し、その実行が作らないファイルには触れない。2 つのリストが同じ suite のエントリを持つと、後に生成した方がもう一方のエントリを消す。
 - 【M1a で決定】テンプレートを変えない既存テスト (ACT4 の生成テスト、`test_arch_fp` 等) と Verilator ラッパは、harness の `CORE` の既定値 `tb_core_sel::CORE` に従う。この定数を `#[ifdef]` で切り替え、`veryl test --define CORE_W2` (および Verilator 用の `veryl build`) で新コアを選ぶ案を spike (設計書 §3.7) で確かめる。測るのは、package const への `#[ifdef]` が `test` と `build` の両方で効くかどうかである。だめなら Verilator 用に `#(.CORE(...))` だけを足した新しいラッパファイルを追加し、既存ファイルには触れない。define を切り替えると `.build` の再構築が起きるので、構成ごとに worktree を分けるか直列に回す (veryl は同時に 1 起動まで)。
 - ACT4 の生成テンプレート (`test/act/gen_suite.py`) は変えない。テンプレートは harness 名、3 つのポート、`HEX_FILE/TOHOST_IDX/MTIME_EN` にしか依存しておらず、checker と lockstep の判定は §2.3 で `o_pass` に畳み込まれている。代償として ACT4 は早期終了せず、1 本 300K サイクルを使い切る。
 - Verilator で新コアを回すときは `build_w2_n1` のように Mdir を構成ごとに分け、構成を変えたら `rm -rf` してから作り直す。4-hart top は `-O1 -j 2` で作る。
@@ -341,7 +356,7 @@ H <order> <hash>
 ### 4.8 実装で確定した規則 (M1a、`src/pkg/retire_pkg.veryl`、`tb/rvfi_tracer.veryl`、`tb/retire_mon.veryl`)
 
 - mask と data: `mem_rmask`/`mem_wmask` は右詰めの 16 bit (16 B アクセスまで)、data は `_lo`/`_hi` の 64+64 bit。tracer は wdata を wmask のバイトで切り出してから印字・hash する。
-- 混合関数: `mix64` (splitmix64 の finalizer) は `retire_pkg` に、rolling の 1 段 `h' = mix64((h ^ w) + 0x9e3779b97f4a7c15)` は tracer に置く。版は `retire_pkg::TRACER_VER` (現在 1)。`retire_pkg` を変えたら golden 成果物を再生成する。
+- 混合関数: `mix64` (splitmix64 の finalizer) は `retire_pkg` に、rolling の 1 段 `h' = mix64((h ^ w) + 0x9e3779b97f4a7c15)` は tracer に置く。版は `retire_pkg::TRACER_VER` (現在 2。M1b で mnstatus の `N` 行を足して上げた、付録 B の B48)。`retire_pkg` を変えたら golden 成果物を再生成する。
 - vector: §4.4 の形式に `V <vtype> <vl> <vstart> <wcnt> <vrf_hash>` を足す (vector op の record にだけ付く)。後から足すと TRACER_VER を上げることになるので最初から入れた。
 - ビット単位の MASK (付録 B の mhpmevent の bit 63、mip/sip の bit 13 など) は、そのビットを 0 にしてから印字・hash する。フィールド全体を `*` にするのはフィールド単位の MASK だけ。
 - rd=x0 の書き込みは record に出さない (rd_kind=INT かつ rd_addr=0 は「書き込みなし」)。`F` は fflags が 0 でないときだけ付ける。rd=x0 の load の `mem_rdata` の MASK は、trace に load の値を出さないので実装しない。
@@ -373,6 +388,7 @@ H <order> <hash>
 ### 5.2 機構ごとの発火カウンタ
 
 - コアは機構ごとに event wire を `o_perf` に出す (設計書 §4.5)。tb モジュール `perf_acc` が hart ごとに 64 bit で累算し、テストの終わりに `P <name> <count>` を印字する。
+- M1b の末 (2026-10-15) の GF は評価できなかった: `heliodor_soc_smp` (W2 と W4 の両方の generate 枝) と全 tb が `o_perf` を tie off しており、`perf_acc`、`P` 行、`fire_matrix.txt`、`fire_check.py` がまだ無い。SoC から `o_perf` を出し、生成ラッパに `perf_acc` を入れるのが次の作業である (§1.4)。
 - 【決定】`test/gates/fire_matrix.txt` に「機構、それが 0 より大きくなるべきゲート」を列挙し、`test/gates/fire_check.py` がマイルストーン末の梯子のログを集計する。どのゲートでも 0 のままの機構があれば exit code で失敗とし、directed test を足すか、その機構を消す。理由: ビット一致の結果は「発火しなかった」と読む (設計書 §5.15)。
 
 | 機構 (event) | 所有者 | 期待するゲート | 判定に使う【M3 で決定】 |
@@ -415,13 +431,19 @@ N4 の値は `.build/test_timings` のもので、CLAUDE.md の 4408 s は 2026-
 | マイルストーン | 構成 | 対象 | cycles | 実行時間 | cy/s | whole-comb / event の fallback | 木の commit | veryl の commit |
 |---|---|---|---|---|---|---|---|---|
 | M0 基準 | 旧コア | 5.15 N=1 boot | 12.2M | 145.2 s | 84.0k | 未測定 (§6.4 の S1) | b0f4668 | fbd14729 |
+| M1b | W2 | rv64ui ld_st (boot は M1b では走らない。arch テストで代用) | 5,347 (settle 6,005) | 2.335 s | 2.57k | 0 / 0 (設計のコード。tb の `$display` 5 文だけが残る) | 7f425c7 | 2c63092a |
+| M1b | W4 | rv64ui ld_st (同上) | 7,386 (settle 8,004) | 24.138 s | 0.33k | Clock event の 2 つの `If` の木 (94,241 文と 56,545 文) が AOT-C の 1 文の上限 16 MiB を超えて decline。dataflow は 0 | 7f425c7 | 2c63092a |
+
+M1b の行の補足: cy/s は settle 数 / `sim_s` (build を除く)。W4 は ma_data で 220、sd で 210 cy/s で、W2 (2.5k 前後) の約 8-12 倍遅い。`VERYL_AOT_C_MAX_STMT_MB=64` で decline を無くすと、W4 はさらに遅くなる (ld_st 196、ma_data 190 cy/s) ので、上限は W4 の遅さの原因ではない。54 本を並行に流した batch の W4 で dataflow が全 settle で fallback したのは、AOT-C の compile lock が残っていたための失敗で再現しない (下の注)。どちらの数値も arch harness のもので、旧コアの boot の 84k cy/s とは比べられない。
+
+注 (veryl の不具合): `~/.cache/veryl/aot_c/` に、途中で終わった run が残した `.so` の無い `.lock` が溜まると、待つ側が持ち主を生きていると誤認して止まる (sandbox の各起動は別の PID 名前空間で、死んだ持ち主の pid が別のプロセスを指す。pid が記録されていると 600 s の年齢規則が効かない)。clone 側で直す。それまでは古い lock を退避すれば進む。
 
 ### 6.3 N=4 の段差の調査 (D7、M3 の最初の作業)
 
 1. S3-1: V14 で (新コアの SMP は M4 から)、同じ木、同じマシンで、5.15 boot の先頭 5M サイクルを N=1/2/4 の順に直列で走らせる (`VERYL_AOT_C_ASYNC=0`)。`--features profile` でビルドした veryl (`release-verylup-prof`) で、SimProfile の settle/comb/event の ns を SoC サイクルあたりに直す。段差が comb、event、settle のどこにあるかを見る。
 2. S3-2: 同じ slice を Verilator でも測る。Verilator にも段差が出るなら設計とホストのキャッシュ容量の問題、出ないなら veryl 固有の問題と切り分ける。
 3. S3-3: 仮説を 1 つずつ潰す。(a) 設計の肥大: hart-cycle あたりのコストが N によらず一定かを見る。(b) ホストのキャッシュ容量: `perf stat` で LLC miss を N=2 と N=4 で比べる。(c) N=4 でだけ whole-comb か whole-event が bail している: N ごとに `VERYL_AOT_C_DIAG=1 VERYL_AOT_C_EVENT_DIAG=1` を見る。(d) 生成 C の関数が巨大になる影響: `.so` のサイズと命令キャッシュ miss を N ごとに比べる。
-4. S3-4: 原因が veryl にあれば clone 側で直し (プロジェクト規則)、同じ slice で再測定する。
+4. S3-4: 原因が veryl にあれば clone 側で直し (プロジェクト規則)、同じ slice で再測定する。結論 (2026-10-15): 段差の原因は、veryl の dataflow の粗粒度化の上限 `DATAFLOW_COARSE_MAX_STMTS` に N=4 の設計が掛かることだと特定した。veryl の clone 側で修正中で、修正後に同じ slice で再測定する。
 5. 【M3 で決定】N=4 boot ゲートを両構成で回すかどうか (決定は M4 から適用する)。新コアの N=4 boot は M4 まで存在しないので、S3 の後の V14 の N=4 boot の壁時間に、W2/W4 と V14 の N=1 boot の cy/s の比を掛けて W2 と W4 の値を見積もる。M4 で実測し、見積もりと大きく違えば見直す。両構成の梯子が直列で約 4 時間以内に収まるなら両方で回す。収まらなければ、メモリ系の変更ごとに W4 だけで回し、W2 はマイルストーン末だけにする。Verilator を N=4 のゲートエンジンにする案 (約 1.6 倍速い、`-O1 -j 2` が必要) もこのときに比べる。
 
 ### 6.4 whole-comb fallback の検査
@@ -559,7 +581,7 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 | B27 | FP load、FP CSR の書き込み、vector で FS/VS を Dirty にしない | 確定 (probe、FS) | csr.veryl:1053-1055、1164-1169 | n (5.15 は FPU off) | STOP:FS_DIRTY (設計書 §C.9 #10。新コアは csr 修正で直す。arch suite で発火したテストは lockstep から外して pass/fail で判定する) | `b27_fs_dirty`、tohost 0x3B01B。fld と csrwi fflags の後も FS=Clean のまま。fmv.d.x では Dirty になる |
 | B28 | FS/VS=Off のときの FP/vector CSR アクセスを trap しない | 確定 (probe、FS) | 6893-6898、decoder.veryl:779-790 | n | STOP | `b28_fs_off_csr`、tohost 0x3B01C。FS=Off で csrr fflags と csrr frm が trap しない |
 | B29 | WFI は NOP (TW/VTW も見ない) | 確定 | 4641 (コメント)、decoder.veryl:693-695 | y (idle ループ、S-mode・TW=0) | S-mode・TW=0 の WFI は SAME (両コア NOP)。新コアは U-mode と TW=1 の S-mode で不正命令にする (設計書 §C.8) ので、その条件の WFI は STOP:WFI_TRAP | U-mode で wfi。golden の期待値は NOP として retire |
-| B30 | decoder が予約符号化を通す (未知の SYSTEM funct12 は NOP、AMO の funct5/幅、予約 LOAD/STORE funct3、静的な予約 rm) | 確定 (probe、4/4) | decoder.veryl:684-735、609-632、334-352 | n | STOP | `b30_reserved_enc`、tohost 0xFB01E。DRET、LOAD funct3=7、SYSTEM funct12=0x7ff、AMO funct5=0x02 のどれも trap しない |
+| B30 | decoder が予約符号化を通す (未知の SYSTEM funct12 は NOP、AMO の funct5/幅、予約 LOAD/STORE funct3、静的な予約 rm) | 確定 (probe、4/4) | decoder.veryl:684-735、609-632、334-352 | n | STOP | `b30_reserved_enc`、tohost 0xFB01E。DRET、LOAD funct3=7、SYSTEM funct12=0x7ff、AMO funct5=0x06 のどれも trap しない。case 4 の語は当初 0x0807b02f (funct5=0x01 の正当な amoswap.d) で誤っており、M2 で 0x3007b02f (funct5=0x06、予約) に直した。tohost の値は修正前の run のもので、case 4 の golden での再確認が要る |
 | B31 | 未実装 CSR は 0 を読み書き込みを捨てる。新コアは decode で存在を検査する (設計書 §5.5) | 確定 | csr.veryl:585-591 | y (推定。SBI base の mvendorid/marchid/mimpid) | SAME とするため、新コアの CSR 存在表に、golden が 0 を読ませる必須 CSR (mvendorid、marchid、mimpid) を含める。それ以外は STOP:CSR_EXIST | 不要 (§3.5 の trace で触れた CSR アドレスを列挙して存在表と照合する) |
 | B32 | counteren を強制しない | 確定 | csr.veryl:408-409 | n (fw は mcounteren=7、S は time だけを読む) | STOP | U-mode で scounteren=0 のまま rdcycle |
 | B33 | Svadu の差 (TLB が W を w&&d で持つ、A/D 更新が非 atomic、I 側の投機的な A bit) | 推定 | 10536、mmu.veryl:297、918-921 | n (5.15 は ADUE off) | OUT (7.1 は pass/fail) | 不要 |
@@ -572,15 +594,18 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 | B40 | V=1 の MXR を G-stage にも適用する、二段 walk が cbo を store として扱う | 推定 | mmu.veryl:583-594、716 | n (V=1) | OUT (M5) | M5 で |
 | B41 | IO load が head を待たずに投機発行されうる、遅い store の retire の次サイクルに IO 書き込みを再提示しうる | IO store の再提示は確定 (probe、B46)。IO load は推定 | 10705-10714、11940 | y (console の文字が倍になることを §3.5 の run で確認、B46) | trace には現れない。新コアは §8 の IO モニタで守る。golden ではモニタを走らせない | store 側は B46 の `b46_uart` を見よ。IO load の投機発行は未 probe |
 | B42 | boot の SoC は hole で fault しない (`PMA_FAULT=0`)。新コアの `MAP_BOOT` は hole を fault にする | 確定 | 64 (`PMA_FAULT` の既定 0、両 SoC とも上書きしない)、7988、8861 | 不明 (n を期待) | STOP:PMA_HOLE | 不要 (§3.5 の trace で DRAM/ROM/IO 以外への PA を列挙する) |
-| B43 | 再利用する csr.veryl の癖 (satp の MODE が WARL でない、mstatus[63] を格納する、mip の読み値が pin 由来の bit を含まない、misa に F/D/C が無い) | 確定 | csr.veryl:1088、421、570、517 | y (satp の書き込み、misa の読み出しはありうる) | satp の MODE は新コアが csr 修正で WARL にする (設計書 §C.9 #20) ので STOP:SATP_WARL (5.15 は MODE を probe しないので 0 回の見込み)。残りは SAME で、M6 まで misa と firmware から見える CSR の振る舞いは変えない。変える場合はこの行を見直して golden 成果物を再生成する | S-mode で satp に MODE=9 を書いて読み戻す。golden の期待値は 9 が残る |
+| B43 | 再利用する csr.veryl の癖 (satp の MODE が WARL でない、mstatus[63] を格納する、mip の読み値が pin 由来の bit を含まない、misa に F/D/C が無い) | 確定 | csr.veryl:1088、421、570、517 | y (satp の書き込み、misa の読み出しはありうる) | satp の MODE は新コアが csr 修正で WARL にする (設計書 §C.9 #20) ので STOP:SATP_WARL (5.15 は MODE を probe しないので 0 回の見込み)。mstatus[63] と mip は SAME。misa は【決定】(M2) 新コアがその build の ISA をそのまま報告する (設計書 §C.9。M2 の値 `0x8000_0000_0014_112d`、golden は `0x8000_0000_0034_1181`) ので、misa を読む record は rd で食い違う。rv64mi の csr、mcsr、ma_fetch は pass/fail で判定する (`m2_csr_pf.list`)。ACT4 の trap/prolog の misa の読み出しは MASK:MISA (misa を読む Zicsr op の rd) で吸収する。【M2 で決定】MASK:MISA の tracer への実装 (GL-C の不一致の大半がこれで、抽出した 5 本は misa 以外に差が無い) | S-mode で satp に MODE=9 を書いて読み戻す。golden の期待値は 9 が残る |
 | B44 | 時刻の CSR を読む時点 (旧コアは head で issue、新コアは oldest token の `fu_sys`) | 確定 | iq_int.veryl:425-428、csr.veryl:576 | y (rdtime 23 か所) | SAME (§4.1 の議論により両者とも retire 順位だけで決まる) | 不要 |
 | B45 | mhpmevent の OF (bit 63) が既に立っていても、counter の再度の wrap で LCOFI を再び pend する | 確定 | csr.veryl:1226-1239 | n (5.15 は Sscofpmf の overflow を使わない) | STOP:LCOFI (新コアは OF の 0→1 でだけ pend する csr 修正、設計書 §C.9 #21) | OF を立てたまま hpmcounter を再び overflow させ、mip.LCOFIP を読む |
 | B46 | console の文字が 2 回ずつ出る (`pprriinnttkk`)。パッチ前の `b0f4668` でも同じで、B41 の IO store の重複書き込み (M 段の無条件の latch) による | 確定 (probe、現象と原因) | 11940 (fill_1 の M 段 latch) | y (console の全文字) | 許容差異。新コアは IO store をちょうど 1 回だけ書く (設計書 §5.14) ので、console に出るバイト列は golden と違う。trace には現れない (store の record は両コアとも 1 つ) ので、IO デバイス側の書き込み (console の出力を含む) を trace の比較に入れない。新コアの回数は §8 の IO モニタと、UART THR への書き込み回数を数える自己検査型の directed test (§7.4) で守る | `b46_uart`、tohost 0xB02E。commit した THR への byte store 12 個に対し device 書き込みは 21 回。trace の IO store record は store ごとにちょうど 1 つ。連続する store と fence で隔てた store は 2 回書かれ、直後に DRAM への sd が続く store は 1 回 (別の store が M 段の latch を上書きすると重複が消える) |
 | B47 | W=1/D=0 のページ (ADUE=0) で page fault する store が、trap しながらデータをメモリに書く | 確定 (probe) | `b10_amo_vm` の trace と実行後のメモリ。コード位置は未特定 | 不明 (D=0 のページへ ADUE=0 で store したときだけ起こる。測った範囲では 5.15 lockstep boot はそうしないが、数えるタグは無い) | 許容差異。新コアは trap する op では何も書かない (設計書 §5.8)。trap record は両コアで同じなので、差は後でその番地を読む load の rd に現れ、lockstep はそこで止まる | `b10_amo_vm` (B10 と同じ probe)。trace `T ... 0062b023 0f 0000000080201000` で store が cause 15 で trap した後、メモリにはその store のデータ (0x10) が入っていた |
-| B48 | riscv-tests の env (`upstream/env/p/riscv_test.h` の `INIT_RNMI`) が全テストの先頭で `csrwi mnstatus, MNSTATUS_NMIE` (CSR 0x744、Smrnmi) を実行する。golden は未実装 CSR として書き込みを捨てて retire する (B31 と同じ機構)。新コアは CSR の存在検査 (設計書 §C.8) で不正命令 (cause 2) の trap にする。env は直前に mtvec をこの命令の直後に向けているので、どちらも同じ次 PC から続く | 確定 (コード。M1b の decode で判明) | `upstream/env/p/riscv_test.h:120-125`、csr.veryl:585-591 | n (boot は推定)。arch では riscv-tests の env を使う全テストで y (1 回ずつ) | 【M1b で決定】B31 の STOP:CSR_EXIST のままでは rv64ui の lockstep がすべて先頭で止まるので、M1b の rv64ui trace ゲートより前に扱いを決める。この 1 命令の record (golden は R、新コアは cause 2 の T) をどう吸収するか (正規化、MASK、mnstatus を存在表に入れるか) は未決 | 不要 (env のコードと両コアの trace で確認できる) |
+| B48 | riscv-tests の env (`upstream/env/p/riscv_test.h` の `INIT_RNMI`) が全テストの先頭で `csrwi mnstatus, MNSTATUS_NMIE` (CSR 0x744、Smrnmi) を実行する。golden は未実装 CSR として書き込みを捨てて retire する (B31 と同じ機構)。新コアは CSR の存在検査 (設計書 §C.8) で不正命令 (cause 2) の trap にする。env は直前に mtvec をこの命令の直後に向けているので、どちらも同じ次 PC から続く | 確定 (コード。M1b の decode で判明) | `upstream/env/p/riscv_test.h:120-125`、csr.veryl:585-591 | n (boot は推定)。arch では riscv-tests の env を使う全テストで y (1 回ずつ) | NORM。【決定】(M1b) tracer が CSR 0x744 の Zicsr op を、golden の R record と新コアの cause 2 の T record のどちらでも `N <order> <pc> 744` の 1 行に正規化し、hash もこの形で取る (`TRACER_VER = 2`、§4.8)。理由: どちらも record は 1 つで同じ次 PC から続くので、この 1 命令の形を揃えれば残りはそのまま比べられる。mnstatus を存在表に入れると Smrnmi を持つふりになる |
+ 不要 (env のコードと両コアの trace で確認できる) |
 | B49 | FCVT.L.D で \|x\| ∈ [2^53, 2^63) の結果が誤る。仮数をシフトせずにそのまま返す。fflags は正しい | 確定 (probe) | `fpu_wrap.veryl` の FP→整数変換 (行は未特定)。M2 準備の `fp_cvt` の移植で判明 | 不明 (カーネルはこれらの変換をほとんど使わないと推定。数えるタグは無い) | 許容差異。新コアが正しく、golden が誤り。差は rd に現れ、lockstep はそこで止まる。VU は M5 まで `fpu_wrap` を通して同じ誤りを引き継ぐ (設計書 §X.8 の【M5 で決定】) | `b49_fcvt_l_d`、tohost 0x001FB031。sub-case のマスク 0x1F のすべてで仮数がシフトされずに返った |
 | B50 | FCVT.W.D の NX と NV が境界で入れ替わる: +2^31 に丸め上がる入力と -(2^31, 2^31+1) の入力。FCVTMOD.W.D は -(2^31+0.5) で同じ。結果の値は正しい | 確定 (probe) | 同上 | 不明 (同上) | 許容差異。差は fflags (と後でそれを読む rd) に現れる。VU の扱いは B49 と同じ | `b50_fcvt_w_d`、tohost 0x00BFB032。境界の sub-case で NX と NV が入れ替わった |
 | B51 | FCVT.WU.D で 2^32 に丸め上がる入力が NV でなく NX を立てる。結果の値は正しい | 確定 (probe) | 同上 | 不明 (同上) | 許容差異 (B50 と同じ) | `b51_fcvt_wu_d`、tohost 0x0007B033 |
 | B52 | FCVT.S.D の丸めによる overflow で OF が立たない (fflags 0x01、正しくは 0x05)。結果の値は正しい | 確定 (probe) | `fpu_wrap.veryl` の D→S 変換 (行は未特定) | 不明 (同上) | 許容差異 (B50 と同じ) | `b52_fcvt_s_d_of`、tohost 0x001FB034 |
 | B53 | FCVT.H.D で \|x\| < 2^-24 の結果が常に ±0 になる。正しくは、RUP/RDN/RMM で 0 から離れる向きに丸める場合と、RNE で \|x\| ∈ (2^-25, 2^-24) の場合に ±0x0001 | 確定 (probe) | `fpu_wrap.veryl` の D→H 変換 (行は未特定) | 不明 (同上) | 許容差異 (B49 と同じく rd に現れる) | `b53_fcvt_h_d_tiny`、tohost 0x003FB035 |
 | B54 | FCVT.S.D、FCVT.H.S、FCVT.H.D が tininess を丸めの前に判定する。丸めると正規数の最小値になる入力で UF\|NX を立てる (正しくは NX だけ) | 確定 (probe) | `fpu_wrap.veryl` の FP→FP 変換 (行は未特定) | 不明 (同上) | 許容差異 (B50 と同じ) | `b54_fcvt_tininess`、tohost 0x00DBB036。3 つの変換すべてで UF\|NX |
+| B55 | rd=x0 の AMO で、golden の store record のデータが AMO の書いた値 (旧値と rs2 の演算結果) でなく rs2 そのものになる。golden の観測 (§3.3 の N8 の `c_store_data`) の誤りで、メモリに書かれる値ではない | 確定 (M2 の ACT4 診断。Zaamo 16 本、Zabha 16 本の GL-C 不一致) | §3.3 の N8 | 不明 (rd=x0 の AMO を数えるタグは無い) | 許容差異 (新コアが正しい)。【M2 で決定】MASK (rd=x0 の AMO の store record の `mem_wdata`) か NORM か。golden の adapter はこの op の旧値を持たず正しい値を作れないので、MASK を推奨する | 不要 (ACT4 の trace で確認できる) |
+| B56 | store で書き換えたコードへ、fence.i を挟まずに飛ぶ。golden は古い命令を、新コアは新しい命令を実行する。fence.i の前の命令の取り込みは spec 上どちらも合法 | 確定 (M2 の ACT4 診断。pmpsm の cfg_A_tor_zero と tor_check_01..03 の 4 本。record 数が 19 違う) | ACT4 の該当テストの trace | n (推定。カーネルは自己書換えの後に fence.i を使う) | OUT: 該当の 4 本は GL-C から外し、GA (pass/fail) だけで判定する。golden と新コアのどちらの取り込みにも合わせない | 不要 |
