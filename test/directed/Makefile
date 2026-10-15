@@ -1,5 +1,6 @@
 # Self-checking directed probes for the old-core deviations (verification
-# plan, appendix B). Each <name>.S builds <name>.hex.
+# plan, appendix B) and the directed tests of the new core. Each <name>.S
+# builds <name>.hex.
 CC      = riscv64-unknown-elf-gcc
 OBJCOPY = riscv64-unknown-elf-objcopy
 OBJDUMP = riscv64-unknown-elf-objdump
@@ -7,7 +8,7 @@ OBJDUMP = riscv64-unknown-elf-objdump
 CFLAGS  = -march=rv64gcv_zicsr_zifencei_zacas_svinval -mabi=lp64d -nostdlib -nostartfiles -ffreestanding -I.
 ELF2HEX = python3 ../c/bin2hex.py
 
-SRCS = $(wildcard b*.S)
+SRCS = $(wildcard *.S)
 HEXS = $(SRCS:.S=.hex)
 
 all: $(HEXS)
