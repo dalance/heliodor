@@ -57,6 +57,9 @@
 //     RETRY(FILL_BUSY). STORE_WT and UNC_READ answer PENDING(id) and are held
 //     until the write fires or the read is granted, then WT_DONE(id) or
 //     UNC_DONE(id, data) follows; the device sees one access. CMO answers HIT
+//     and is held, driving the dcache's local clean of its line, until the
+//     line is in neither the arrays nor the writeback buffer; a kill does not
+//     cut it short
 //   - a held request presents itself non-folded every cycle until a fill
 //     starts (its own or not: MISS(gen) names the next fill), it is killed, or
 //     it hits without a fill; the last case advances gen and broadcasts
@@ -75,6 +78,8 @@
 //     clients) reduced with the tree helpers
 //   - a done event goes through a one-entry skid: it yields to the dcache's
 //     own events and never overtakes the PENDING response
+//   - the CMO needs no done event: the B position it holds orders it before
+//     the uncached access its requester presents next
 pub module dcache_port_adapter::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
@@ -104,6 +109,8 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     o_dc_wdata      : output logic<64>,
     o_dc_wdata_hi   : output logic<64>,
     o_dc_wstrb      : output logic<8> ,
+    o_dc_clean_v    : output logic    ,
+    o_dc_clean_addr : output logic<64>,
 
     i_dc_rdata          : input logic<64>              ,
     i_dc_rdata_next     : input logic<64>              ,
@@ -122,6 +129,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     i_dc_stall_terms    : input dcache_pkg::StallTerms ,
     i_dc_dhit_used      : input logic                  ,
     i_dc_dhit_rdata_next: input logic<64>              ,
+    i_dc_clean_done     : input logic                  ,
 
     i_inv_v    : input logic    ,
     i_inv_addr : input logic<64>,
@@ -185,7 +193,8 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     let s_xl  : logic     = slot_q.cls == MemCls::LOAD_EXCL;
     let s_ur  : logic     = slot_q.cls == MemCls::UNC_READ;
     let s_wt  : logic     = slot_q.cls == MemCls::STORE_WT;
-    let s_fold: logic     = !s_xl && !s_ur && !s_wt;
+    let s_cm  : logic     = slot_q.cls == MemCls::CMO;
+    let s_fold: logic     = !s_xl && !s_ur && !s_wt && !s_cm;
     let s_kill: logic     = slot_v_q && slot_q.tag.rob_v && killed(i_kill, slot_q.tag.rob);
     let st    : dcache_pkg::StallTerms = i_dc_stall_terms;
     let f_mine: logic     = i_dc_fill_line[49:0] == s_line;
@@ -284,6 +293,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     let n_xs : logic = nf_acc && w_cls == MemCls::STORE_EXCL;
     let n_wt : logic = nf_acc && w_cls == MemCls::STORE_WT;
     let n_ur : logic = nf_acc && w_cls == MemCls::UNC_READ;
+    let n_cm : logic = nf_acc && w_cls == MemCls::CMO;
     let b_pa : pma_pkg::Pa = if nf_acc ? w_pa : slot_q.pa;
     let b_m  : logic<16>   = if nf_acc ? w_mask : slot_q.mask;
     let b_wd : logic<128>  = if nf_acc ? w_wd : slot_q.wdata;
@@ -293,13 +303,15 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     let b_unc  : logic = n_ur || (slot_v_q && s_ur);
     let ur_fire: logic = b_unc && !i_dc_fill_busy && !st.unc_wait;
     let wt_fire: logic = st.wen_fires;
+    let b_cm   : logic = n_cm || (slot_v_q && s_cm);
+    let cm_fire: logic = b_cm && i_dc_clean_done;
 
-    let s_free  : logic = !slot_v_q || (at_v && !v_hold && !v_xw) || h_release || x_release || ur_fire || wt_fire;
+    let s_free  : logic = !slot_v_q || (at_v && !v_hold && !v_xw) || h_release || x_release || ur_fire || wt_fire || cm_fire;
     let fold_acc: logic = cand != '0 && !w_nf && s_free && !i_np_resv_next;
     let acc     : logic = nf_acc || fold_acc;
 
     assign o_dc_addr       = {8'd0, b_pa};
-    assign o_dc_ren        = n_xl || n_ur || (slot_v_q && !s_wt);
+    assign o_dc_ren        = n_xl || n_ur || (slot_v_q && !s_wt && !s_cm);
     assign o_dc_ren_folded = at_v && s_fold;
     assign o_dc_addr_r     = {8'd0, w_pa};
     assign o_dc_ren_r      = fold_acc;
@@ -312,6 +324,8 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
     assign o_dc_wdata      = b_wd[63:0];
     assign o_dc_wdata_hi   = b_wd[127:64];
     assign o_dc_wstrb      = b_m[7:0];
+    assign o_dc_clean_v    = b_cm;
+    assign o_dc_clean_addr = {8'd0, b_pa};
 
     // ---- decisions ----
 
@@ -466,7 +480,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
                 sk_q.valid = 1'b0;
             }
 
-            if fold_acc || n_xl || (n_ur && !ur_fire) || (n_wt && !wt_fire) {
+            if fold_acc || n_xl || (n_ur && !ur_fire) || (n_wt && !wt_fire) || (n_cm && !cm_fire) {
                 slot_v_q     = 1'b1;
                 slot_first_q = fold_acc || n_xl;
                 slot_race_q  = race_a;
@@ -552,7 +566,7 @@ pub module dcache_port_adapter::<CFG: core_cfg> (
             i_resp      : resp_q                                    ,
             i_ev_src    : c_src                                     ,
             i_miss_hit  : empty_gen && slot_miss_q                  ,
-            i_nf_kill   : s_kill && !s_fold                         ,
+            i_nf_kill   : s_kill && !s_fold && !s_cm                ,
             i_skid_lost : done_in && sk_q.valid && !sk_out          ,
             i_unc_fill  : slot_v_q && s_ur && i_dc_fill_start       ,
             o_chk                                                   ,
