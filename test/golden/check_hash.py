@@ -10,7 +10,9 @@ checked) or plain text (the last H line in the file is the final one; give
     last two words, word 0 must equal TRACER_VER), or
   - a final table `*.final`: lines `<test> <count> <hash> [<image sha256>]`,
     `#` comments. Every test of the table must be in the JSON report unless
-    --partial; report tests absent from the table are ignored.
+    --partial; report tests absent from the table are ignored. A new-core
+    report name `test_<core>_<rest>` (core w2, w4, ...) matches the table's
+    `test_<rest>`.
 
 Exit code 0 only if every compared test matches; 1 on a mismatch, a missing
 H line or a missing test; 2 on a usage or stale-golden error.
@@ -24,6 +26,7 @@ from pathlib import Path
 
 MASTER = Path(__file__).resolve().parents[2]
 RE_H = re.compile(r"^H\s+(\d+)\s+([0-9a-fA-F]+)\s*$")
+RE_CORE = re.compile(r"^test_w\d+_")
 RE_VER = re.compile(r"TRACER_VER\s*:\s*logic<64>\s*=\s*64'h([0-9a-fA-F_]+)")
 
 
@@ -96,6 +99,10 @@ def main():
             return 2
         pairs.append((a.test, logs[None], gold[a.test]))
     else:
+        alias = {}
+        for n in logs:
+            alias.setdefault(RE_CORE.sub("test_", n), n)
+        logs = {**{k: logs[v] for k, v in alias.items()}, **logs}
         for name, exp in gold.items():
             if name in logs:
                 pairs.append((name, logs[name], exp))
