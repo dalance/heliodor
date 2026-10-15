@@ -2,10 +2,19 @@
 // through a DTLB lookup port) with PMP and PMA, the dcache request,
 // forwarding, load formatting and the WB packet
 //
-// Served: integer and FP loads and stores of 1, 2, 4 and 8 bytes to
-// cacheable PAs, misaligned and line-crossing ones included where the region
-// allows misaligned access. Every other memory access faults (see Rationale);
-// atomics and CBO never reach a pipe (decode rejects them).
+// Served: integer and FP loads and stores of 1, 2, 4 and 8 bytes, misaligned
+// and line-crossing ones included where the region allows misaligned access;
+// atomics (on the HEAD pipe) and CBO ops.
+//   - a non-cacheable load parks for the head (io_unit performs it); a
+//     non-cacheable store writes its SQ entry like any store (io_unit
+//     performs it at the head)
+//   - an atomic is translated and checked here, writes its SQ entry (an LR
+//     its LQ entry's completion) and leaves m2 for atomic_unit, which writes
+//     it back; with an exception it completes here. An atomic that missed
+//     the DTLB hands its operands to atomic_unit on its first pass and its PA
+//     on the re-issued pass
+//   - cbo.clean/flush/inval are translated and checked only; cbo.zero is a
+//     store of the whole line
 //
 // Ports (timing contract):
 //   i_iss, i_re    : cycle S, combinational; at most one is valid (mem_port_arb
@@ -34,7 +43,14 @@
 //                    (at most one: crossing loads run only as the oldest)
 //   o_verdict, o_wake    : R = m2 + RESP_LAT, combinational from the response;
 //                    the wake leads o_wb by one cycle (see core_types Wake)
-//   o_wb           : registered, R + 1 = m0 + LD_LAT
+//   o_wb           : registered, R + 1 = m0 + LD_LAT, merged with the
+//                    non-pipe clients' hole-fill packets i_np_wb (the HEAD
+//                    pipe; the slots differ, so at most one is valid)
+//   o_wake         : merged likewise with i_np_wake (each one cycle before its
+//                    packet, so a hole-fill wake never meets a pass's wake)
+//   i_np_hf/o_hf_req : the non-pipe clients' hole-fill requests to the pipe's
+//                    wb_resv (at most one is set)
+//   o_amo          : m2, the atomic handed to atomic_unit (HEAD pipe only)
 //   o_perf         : combinational event wires
 //   i_kill         : applied on the capture edge of every stage, and to the
 //                    verdict and wake of the op at R
@@ -56,11 +72,14 @@
 //   - Bare: PA = VA, and a VA above the PA width is a hole (access fault).
 //     Sv39: a non-canonical VA is a page fault without a lookup; a hit is
 //     checked by xlate_pkg::perm, so a page fault wins over PMP and PMA
-//   - access fault (cause 5 load, 7 store) for a hole, a PMP denial, a
-//     non-cacheable PA, and a misaligned access to a region without
-//     misaligned_ok. This build has no uncached access path, and the
+//   - access fault (cause 5 load and LR, 7 store, AMO, SC and CBO) for a
+//     hole, a PMP denial, a misaligned access to a region without
+//     misaligned_ok, any misaligned atomic (before translation), an atomic
+//     to a region without the needed AMO class, and a CBO to a region
+//     without cbo_ok. The
 //     privileged spec allows an access fault for a misaligned access the
-//     region cannot perform
+//     region cannot perform. PMP: an AMO needs read and write, a CBO
+//     management op read or write
 pub module mem_pipe::<CFG: core_cfg> #(
     param PMA_N  : u32                         = 1,
     param PMA_TBL: pma_pkg::PmaRegion [PMA_N] = '{
@@ -113,6 +132,12 @@ pub module mem_pipe::<CFG: core_cfg> #(
     o_wake    : output core_types::<CFG>::Wake     ,
     o_wb      : output core_types::<CFG>::WbPacket ,
 
+    o_amo    : output core_types::<CFG>::AtomicOp                            ,
+    i_np_wb  : input  core_types::<CFG>::WbPacket [core_types::<CFG>::HF_N]  ,
+    i_np_wake: input  core_types::<CFG>::Wake     [core_types::<CFG>::HF_N]  ,
+    i_np_hf  : input  logic                       [core_types::<CFG>::HF_N]  ,
+    o_hf_req : output logic                                                  ,
+
     o_perf: output core_types::<CFG>::MemPipePerf,
 ) {
     import core_types::<CFG>::*;
@@ -125,34 +150,6 @@ pub module mem_pipe::<CFG: core_cfg> #(
         vpn: input logic<27>,
     ) -> logic {
         return e.valid && e.key.vpn == vpn && e.key.regime == xlate_pkg::Regime::V0;
-    }
-
-    // Bytes of an access of 2^size bytes at byte 0.
-    function size_mask (
-        size: input logic<2>,
-    ) -> logic<16> {
-        return case size {
-            2'd0   : 16'h0001,
-            2'd1   : 16'h0003,
-            2'd2   : 16'h000f,
-            default: 16'h00ff,
-        };
-    }
-
-    // Load result from the 16-byte window holding the access at byte bo; an
-    // FP load below 64 bits is NaN-boxed.
-    function fmt_load (
-        win: input logic<128>,
-        bo : input logic<3>  ,
-        op : input MemOp     ,
-    ) -> logic<64> {
-        let v: logic<128> = win >> {bo, 3'd0};
-        return case op.size {
-            2'd0   : if op.sgn ? {v[7] repeat 56, v[7:0]} : {56'd0, v[7:0]},
-            2'd1   : if op.fp ? fpu_pkg::box_h(v[15:0]) : if op.sgn ? {v[15] repeat 48, v[15:0]} : {48'd0, v[15:0]},
-            2'd2   : if op.fp ? fpu_pkg::box_s(v[31:0]) : if op.sgn ? {v[31] repeat 32, v[31:0]} : {32'd0, v[31:0]},
-            default: v[63:0],
-        };
     }
 
     // ---- Stage contents ----
@@ -170,6 +167,8 @@ pub module mem_pipe::<CFG: core_cfg> #(
         va   : logic<64>       , // re-issue: the stored VA
         half : logic           ,
         xexc : exc_pkg::ExcRec , // re-issue: the fault of the pass's walk
+        aop  : opclass_pkg::AmoUop,
+        cas  : logic<10>       , // atomic: {rs2, rd} arch numbers
     }
 
     struct M1Op {
@@ -185,6 +184,9 @@ pub module mem_pipe::<CFG: core_cfg> #(
         xline: logic     ,
         data : logic<128>, // store bytes in the same window
         xexc : exc_pkg::ExcRec,
+        rs2  : logic<64> ,
+        aop  : opclass_pkg::AmoUop,
+        cas  : logic<10> ,
     }
 
     struct M2Op {
@@ -198,7 +200,11 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m16  : logic       <16>,
         xline: logic           ,
         data : logic       <128>,
+        rs2  : logic       <64>,
+        aop  : opclass_pkg::AmoUop,
+        cas  : logic       <10>,
         pa   : pma_pkg::Pa     , // PA of this pass
+        attr : pma_pkg::PmaAttr,
         exc  : exc_pkg::ExcRec ,
         xmiss: logic           , // DTLB miss: no PA
         xgnt : logic           , // the miss's walk request was taken
@@ -218,6 +224,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         bo     : logic     <3>  ,
         pmask  : logic     <16> , // bytes of this pass in its window
         exc    : exc_pkg::ExcRec,
+        io     : logic          , // a non-cacheable load: parks for io_unit
         req    : logic          , // a MemReq was sent
         fwd_cov: logic     <16> ,
         fwd_dat: logic     <128>,
@@ -239,7 +246,9 @@ pub module mem_pipe::<CFG: core_cfg> #(
         s_d.op     = if i_re.valid ? i_re.op : mem_op(i_iss.fu, i_iss.cold.uop);
         s_d.lq     = if i_re.valid ? i_re.lq : i_iss.cold.lq;
         s_d.sq     = if i_re.valid ? i_re.sq : i_iss.cold.sq;
-        s_d.imm    = i_iss.cold.imm;
+        s_d.imm    = if i_iss.fu == opclass_pkg::FuKind::ATOMIC ? 32'd0 : i_iss.cold.imm;
+        s_d.aop    = i_iss.cold.uop as opclass_pkg::AmoUop;
+        s_d.cas    = i_iss.cold.imm[9:0];
         s_d.src1   = i_iss.src[0].pr;
         s_d.src2   = i_iss.src[1].pr;
         s_d.entry  = i_iss.entry;
@@ -276,7 +285,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     let m0_va  : logic<64> = if m0.new_ ? rs1 + {m0.imm[31] repeat 32, m0.imm} : m0.va;
     let m0_bo  : logic<3>  = m0_va[2:0];
-    let m0_m16 : logic<16> = size_mask(m0.op.size) << m0_bo;
+    let m0_m16 : logic<16> = if m0.op.q ? 16'hffff : if m0.op.cmo || m0.op.zero ? 16'd0 : mem_size_mask(m0.op.size) << m0_bo;
     let m0_dw  : logic<3>  = m0_va[5:3];
 
     var m1_in: M1Op;
@@ -293,6 +302,9 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m1_in.xline = m0_dw == 3'd7 && m0_m16[15:8] != 8'd0;
         m1_in.data  = {64'd0, rs2} << {m0_bo, 3'd0};
         m1_in.xexc  = m0.xexc;
+        m1_in.rs2   = rs2;
+        m1_in.aop   = m0.aop;
+        m1_in.cas   = m0.cas;
     }
 
     var m1_v: logic;
@@ -312,14 +324,25 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     // ---- m1: translation, PMP, PMA ----
 
-    let m1_acc   : xlate_pkg::AccKind = if m1.op.st ? xlate_pkg::AccKind::STORE : xlate_pkg::AccKind::LOAD;
+    // An LR translates as a load; SC, AMO and amocas as AMO (W and D).
+    let m1_acc   : xlate_pkg::AccKind = if m1.op.amo ?
+        (if m1.op.st ? xlate_pkg::AccKind::AMO : xlate_pkg::AccKind::LOAD)
+    : if m1.op.cmo ?
+        xlate_pkg::AccKind::CBO
+    : if m1.op.st ?
+        xlate_pkg::AccKind::STORE
+    :
+        xlate_pkg::AccKind::LOAD
+    ;
+    let m1_misal : logic              = ({1'b0, m1.va[2:0]} & ((4'd1 << m1.op.size) - 4'd1)) != 4'd0 || (m1.op.q && m1.va[3]);
+    let m1_amis  : logic              = m1.op.amo && m1_misal; // faults before translation
     let m1_vpn   : logic<27>          = m1.pva[38:12];
     let m1_noncan: logic              = i_xl_on && m1.pva[63:39] != {m1.pva[38] repeat 25};
     let m1_xf    : logic              = m1.xexc.valid; // the walk's answer replaces the lookup
     let m1_perm  : xlate_pkg::Perm    = xlate_pkg::perm(i_tlb, m1_acc, i_ctx);
-    let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf;
+    let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf && !m1_amis;
     let m1_miss  : logic              = m1_lk && !i_tlb.hit;
-    let m1_pf    : logic              = m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok);
+    let m1_pf    : logic              = !m1_amis && (m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok));
 
     always_comb {
         o_tlb_lk.valid = m1_v && m1_lk;
@@ -347,20 +370,37 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let m1_pa   : pma_pkg::Pa      = if i_xl_on ? xlate_pkg::entry_pa(i_tlb, m1.pva) : m1.pva[55:0];
     let m1_hole : logic            = !i_xl_on && m1.pva[63:56] != 8'd0;
     let m1_attr : pma_pkg::PmaAttr = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(m1_pa, PMA_TBL), if i_xl_on ? i_tlb.pbmt : 2'd0);
-    let m1_misal: logic            = ({1'b0, m1.va[2:0]} & ((4'd1 << m1.op.size) - 4'd1)) != 4'd0;
 
-    var m1_pmp_fault: logic;
-    inst u_pmp: pmp_check (
-        i_addr   : {8'd0, m1_pa}               ,
-        i_acc    : if m1.op.st ? 2'd1 : 2'd0   ,
-        i_priv   : i_ctx.prv                   ,
-        i_pmpcfg                               ,
-        i_pmpaddr                              ,
-        o_fault  : m1_pmp_fault                ,
+    var m1_pmp_r: logic;
+    var m1_pmp_w: logic;
+    inst u_pmp_r: pmp_check (
+        i_addr   : {8'd0, m1_pa}  ,
+        i_acc    : 2'd0           ,
+        i_priv   : i_ctx.prv      ,
+        i_pmpcfg                  ,
+        i_pmpaddr                 ,
+        o_fault  : m1_pmp_r       ,
     );
+    inst u_pmp_w: pmp_check (
+        i_addr   : {8'd0, m1_pa}  ,
+        i_acc    : 2'd1           ,
+        i_priv   : i_ctx.prv      ,
+        i_pmpcfg                  ,
+        i_pmpaddr                 ,
+        o_fault  : m1_pmp_w       ,
+    );
+    let m1_pmp_fault: logic = if m1.op.cmo ? m1_pmp_r && m1_pmp_w : if m1.op.rmw ? m1_pmp_r || m1_pmp_w : if m1.op.st ? m1_pmp_w : m1_pmp_r;
+    // The access the region must support beyond being backed.
+    let m1_pma_fault: logic = if m1.op.amo ?
+        (m1_misal || !m1_attr.cacheable || m1_attr.amo == pma_pkg::AmoClass::NONE
+        || (m1.op.rmw && m1_attr.amo != pma_pkg::AmoClass::FULL))
+    : if m1.op.cmo || m1.op.zero ?
+        !m1_attr.cbo_ok
+    :
+        m1_misal && !m1_attr.misaligned_ok
+    ;
 
-    let m1_af: logic = m1_hole || !m1_attr.backed || !m1_attr.cacheable || m1_pmp_fault
-        || (m1_misal && !m1_attr.misaligned_ok);
+    let m1_af: logic = m1_hole || !m1_attr.backed || m1_pmp_fault || m1_pma_fault;
 
     var m2_in: M2Op;
     always_comb {
@@ -374,12 +414,16 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m2_in.m16       = m1.m16;
         m2_in.xline     = m1.xline;
         m2_in.data      = m1.data;
+        m2_in.rs2       = m1.rs2;
+        m2_in.aop       = m1.aop;
+        m2_in.cas       = m1.cas;
         m2_in.pa        = m1_pa;
+        m2_in.attr      = m1_attr;
         m2_in.xmiss     = m1_miss;
         m2_in.xgnt      = o_xreq_valid && i_xreq_gnt;
         m2_in.xseen     = ev_hit(i_ptw_evt, m1_vpn);
         m2_in.vpn       = m1_vpn;
-        m2_in.exc.valid = m1_xf || m1_pf || (!m1_miss && m1_af);
+        m2_in.exc.valid = m1_amis || m1_xf || m1_pf || (!m1_miss && m1_af);
         m2_in.exc.cause = if m1.op.st ? 6'd7 : 6'd5;
         m2_in.exc.tval  = m1.pva;
         m2_in.exc.gpa   = 54'd0;
@@ -411,10 +455,11 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let m2_live : logic     = m2_v && !killed(i_kill, m2.tag.rob);
     let m2_dw   : logic<3>  = if m2.half ? 3'd0 : m2.va[5:3];
     let m2_pmask: logic<16> = if m2.half ? {8'd0, m2.m16[15:8]} : if m2.xline ? {8'd0, m2.m16[7:0]} : m2.m16;
-    let m2_load : logic     = m2_v && !m2.op.st;
+    let m2_load : logic     = m2_v && !m2.op.st && !m2.op.amo;
     let m2_xseen: logic     = m2.xseen || ev_hit(i_ptw_evt, m2.vpn);
+    let m2_io   : logic     = m2_load && !m2.exc.valid && !m2.xmiss && !m2.attr.cacheable;
     // A crossing load runs its passes only as re-issues, which lq grants once it is oldest.
-    let m2_go: logic = m2_load && !m2.exc.valid && !m2.xmiss && !(m2.xline && m2.new_);
+    let m2_go: logic = m2_load && !m2.exc.valid && !m2.xmiss && !m2_io && !(m2.xline && m2.new_);
 
     always_comb {
         o_req_valid           = m2_go;
@@ -434,12 +479,15 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_fwd_q.mask   = m2_pmask;
         o_fwd_q.sq_lim = m2.sq;
 
-        o_snap.valid = m2_go && m2_live;
-        o_snap.lq    = m2.lq;
-        o_snap.half  = m2.half;
-        o_snap.line  = m2.pa[55:6];
-        o_snap.dw    = m2_dw;
-        o_snap.mask  = m2_pmask;
+        o_snap.valid  = (m2_go || m2_io) && m2_live;
+        o_snap.lq     = m2.lq;
+        o_snap.half   = m2.half;
+        o_snap.line   = m2.pa[55:6];
+        o_snap.dw     = m2_dw;
+        o_snap.mask   = m2_pmask;
+        o_snap.io     = m2_io;
+        o_snap.io_ord = m2.attr.io_ordered;
+        o_snap.dram   = m2.attr.target == pma_pkg::Target::DRAM;
 
         o_sta.valid  = m2_live && m2.op.st;
         o_sta.sq     = m2.sq;
@@ -449,12 +497,15 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_sta.line   = m2.pa[55:6];
         o_sta.dw     = m2_dw;
         o_sta.mask   = if m2.half ? {8'd0, m2.m16[15:8]} : m2.m16;
+        o_sta.full   = m2.op.zero;
+        o_sta.attr   = m2.attr;
         o_sta.exc    = m2.exc;
         o_sta.xmiss  = m2.xmiss;
         o_sta.xpark  = m2.xmiss && m2.xgnt && !m2.xseen;
 
-        // Only the first pass reads rs2; re-issued passes carry no data.
-        o_std.valid = m2_live && m2.op.st && !m2.half && m2.new_;
+        // Only the first pass reads rs2; re-issued passes carry no data. An
+        // atomic's SQ entry never supplies data.
+        o_std.valid = m2_live && m2.op.st && !m2.op.amo && !m2.half && m2.new_;
         o_std.sq    = m2.sq;
         o_std.data  = m2.data;
     }
@@ -481,6 +532,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         post_in.bo      = m2.va[2:0];
         post_in.pmask   = m2_pmask;
         post_in.exc     = m2.exc;
+        post_in.io      = m2_io;
         post_in.req     = m2_go;
         post_in.fwd_cov = if m2_go ? fw_cov & m2_pmask : 16'd0;
         post_in.fwd_dat = fw_dat;
@@ -490,6 +542,21 @@ pub module mem_pipe::<CFG: core_cfg> #(
         post_in.xgnt    = m2.xgnt;
         post_in.xseen   = m2_xseen;
         post_in.vpn     = m2.vpn;
+    }
+
+    // An atomic without exception leaves for atomic_unit: its first pass
+    // with the operands (and the PA unless it missed the DTLB), a re-issued
+    // pass with the PA only.
+    always_comb {
+        o_amo.valid    = m2_live && m2.op.amo && !m2.exc.valid && (m2.new_ || !m2.xmiss);
+        o_amo.first    = m2.new_;
+        o_amo.xmiss    = m2.xmiss;
+        o_amo.tag      = m2.tag;
+        o_amo.amo      = m2.aop;
+        o_amo.pa       = m2.pa;
+        o_amo.rs2      = m2.rs2;
+        o_amo.rd_arch  = m2.cas[4:0];
+        o_amo.rs2_arch = m2.cas[9:5];
     }
 
     // ---- m2 -> R: RESP_LAT stages ----
@@ -536,14 +603,15 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let r_rsp  : logic = r.req && i_resp.valid;
     let r_hit  : logic = r_rsp && i_resp.kind == RespKind::HIT;
     let r_exc  : logic = r.exc.valid;
-    let r_head : logic = !r_exc && r.xline && r.new_;
+    let r_amo  : logic = r.op.amo;
+    let r_head : logic = !r_exc && !r_amo && (r.io || (r.xline && r.new_));
     let r_x    : logic = !r_exc && !r_head && r.xmiss;
     let r_wait : logic = !r_exc && !r_head && !r_x && r.fwd_w;
-    let r_value: logic = !r_exc && !r_head && !r_wait && (r_full || r_hit);
+    let r_value: logic = !r_exc && !r_amo && !r_head && !r_wait && (r_full || r_hit);
     let r_lo   : logic = r_value && r.xline && !r.half;
-    let r_done : logic = r_exc || (r_value && !r_lo);
+    let r_done : logic = r_exc || (r_amo && !r.xmiss) || (r_value && !r_lo);
 
-    let r_ldval: logic<64> = fmt_load(if r.xline ? {r_win[63:0], i_split_lo} : r_win, r.bo, r.op);
+    let r_ldval: logic<64> = mem_fmt_load(if r.xline ? {r_win[63:0], i_split_lo} : r_win, r.bo, r.op);
 
     always_comb {
         o_verdict.valid    = r_v && !r_st;
@@ -577,12 +645,28 @@ pub module mem_pipe::<CFG: core_cfg> #(
         }
     }
 
-    assign o_wake.valid = r_v && !r_st && r_done && !r_exc && r.tag.has_rd;
-    assign o_wake.pdst  = r.tag.pdst;
+    var np_wake: Wake;
+    var np_wb  : WbPacket;
+    always_comb {
+        var hf: logic<HF_N>;
+        np_wake = 0 as Wake;
+        np_wb   = 0 as WbPacket;
+        for k in 0..HF_N {
+            np_wake = (np_wake | (if i_np_wake[k].valid ? i_np_wake[k] : 0 as Wake)) as Wake;
+            np_wb   = (np_wb | (if i_np_wb[k].valid ? i_np_wb[k] : 0 as WbPacket)) as WbPacket;
+            hf[k]   = i_np_hf[k];
+        }
+        o_hf_req = hf != '0;
+    }
+
+    let own_wake: logic = r_v && !r_st && !r_amo && r_done && !r_exc && r.tag.has_rd;
+    assign o_wake.valid = own_wake || np_wake.valid;
+    assign o_wake.pdst  = if own_wake ? r.tag.pdst : np_wake.pdst;
 
     // A store completes on its last pass; the lo pass of a crossing store
-    // leaves the hi pass to the sq.
-    let r_pkt: logic = if r_st ? (r_exc || (!r.xmiss && !(r.xline && !r.half))) : r_done;
+    // leaves the hi pass to the sq. An atomic completes here only with an
+    // exception (atomic_unit writes it back otherwise).
+    let r_pkt: logic = if r_amo ? r_exc : if r_st ? (r_exc || (!r.xmiss && !(r.xline && !r.half))) : r_done;
 
     var pkt_in: WbPacket;
     always_comb {
@@ -609,8 +693,8 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_data : pkt                 ,
     );
     always_comb {
-        o_wb       = pkt;
-        o_wb.valid = pkt_v;
+        o_wb       = if pkt_v ? pkt : np_wb;
+        o_wb.valid = pkt_v || np_wb.valid;
     }
 
     always_comb {
