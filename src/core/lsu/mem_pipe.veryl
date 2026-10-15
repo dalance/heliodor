@@ -21,6 +21,9 @@
 //                    holds the IQ for this pipe when it grants a re-issue);
 //                    captured into m0
 //   o_iq_rel       : m0; a new issue releases its IQ entry on acceptance
+//   i_tok          : commit's oldest token, read at m1
+//   o_started      : m1, the accepted nonspec walk request of the op holding
+//                    the oldest token (commit's head_started_q)
 //   o_rf_addr*, i_rf_*, i_wb : m0 register read, bypassed from the WB bus
 //   i_xl_on, i_ctx, i_pmp* : read at m1; they change only at a flushing
 //                    retire. i_xl_on: Sv39 is on for data accesses (satp
@@ -67,6 +70,11 @@
 //     parks XLATE in lq, a store's STA write parks its sq entry; both
 //     re-issue the same pass after the walk. A re-issue carrying the walk's
 //     fault (xexc, the owner's answer) takes it instead of a lookup
+//   - a store, AMO or SC pass that hits a W = 1, D = 0 entry under ADUE is
+//     a miss whose walk sets D: it requests that walk (nonspec) only while
+//     it holds the oldest token, and the acceptance is its started pulse;
+//     without the token or the acceptance its STA write parks the entry on
+//     the token (dpark)
 // Rationale:
 //   - a line-crossing access runs as two passes, each translated and checked
 //     on its own line; a crossing load runs only once it holds the oldest
@@ -97,6 +105,9 @@ pub module mem_pipe::<CFG: core_cfg> #(
     i_re : input core_types::<CFG>::MemReissue,
 
     o_iq_rel: output core_types::<CFG>::IqRelease,
+
+    i_tok    : input  core_types::<CFG>::TagTok,
+    o_started: output logic                    ,
 
     o_rf_addr1: output core_types::<CFG>::PReg                             ,
     o_rf_addr2: output core_types::<CFG>::PReg                             ,
@@ -209,7 +220,8 @@ pub module mem_pipe::<CFG: core_cfg> #(
         pa   : pma_pkg::Pa     , // PA of this pass
         attr : pma_pkg::PmaAttr,
         exc  : exc_pkg::ExcRec ,
-        xmiss: logic           , // DTLB miss: no PA
+        xmiss: logic           , // DTLB miss or a D-bit update: no PA
+        xnd  : logic           , // the D-bit update
         xgnt : logic           , // the miss's walk request was taken
         xseen: logic           , // an event of vpn came since the request
         vpn  : logic       <27>, // page of this pass
@@ -354,8 +366,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let m1_xf    : logic              = m1.xexc.valid; // the walk's answer replaces the lookup
     let m1_perm  : xlate_pkg::Perm    = xlate_pkg::perm(i_tlb, m1_acc, i_ctx);
     let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf && !m1_amis;
-    let m1_miss  : logic              = m1_lk && !i_tlb.hit;
+    let m1_nd    : logic              = m1_lk && i_tlb.hit && m1_perm.ok && m1_perm.need_d;
+    let m1_miss  : logic              = m1_lk && (!i_tlb.hit || m1_nd);
     let m1_pf    : logic              = !m1_amis && (m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok));
+    let m1_tok   : logic              = i_tok.valid && i_tok.tag == m1.tag.rob;
 
     always_comb {
         o_tlb_lk.valid = m1_v && m1_lk;
@@ -366,7 +380,8 @@ pub module mem_pipe::<CFG: core_cfg> #(
     // A crossing load's first pass does not walk: it parks HEAD and walks
     // once it runs as the oldest op.
     let m1_head: logic = !m1.op.st && m1.xline && m1.new_;
-    assign o_xreq_valid = m1_v && m1_miss && !m1_head;
+    assign o_xreq_valid = m1_v && m1_miss && !m1_head && (!m1_nd || m1_tok);
+    assign o_started    = o_xreq_valid && m1_nd && i_xreq_gnt;
     always_comb {
         o_xreq.valid       = 1'b1;
         o_xreq.tag.client  = if m1.op.st ? MemClient::SQ : MemClient::LQ;
@@ -377,7 +392,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_xreq.acc         = m1_acc;
         o_xreq.hlv         = 1'b0;
         o_xreq.hlvx        = 1'b0;
-        o_xreq.nonspec     = 1'b0;
+        o_xreq.nonspec     = m1_nd;
     }
 
     let m1_pa   : pma_pkg::Pa      = if i_xl_on ? xlate_pkg::entry_pa(i_tlb, m1.pva) : m1.pva[55:0];
@@ -433,6 +448,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m2_in.pa        = m1_pa;
         m2_in.attr      = m1_attr;
         m2_in.xmiss     = m1_miss;
+        m2_in.xnd       = m1_nd;
         m2_in.xgnt      = o_xreq_valid && i_xreq_gnt;
         m2_in.xseen     = ev_hit(i_ptw_evt, m1_vpn);
         m2_in.vpn       = m1_vpn;
@@ -515,6 +531,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_sta.exc    = m2.exc;
         o_sta.xmiss  = m2.xmiss;
         o_sta.xpark  = m2.xmiss && m2.xgnt && !m2.xseen;
+        o_sta.dpark  = m2.xnd && !m2.xgnt;
 
         // Only the first pass reads rs2; re-issued passes carry no data. An
         // atomic's SQ entry never supplies data.
@@ -718,7 +735,9 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_perf.fwd_part = r_v && !r_st && r.req && !r_full && r.fwd_cov != 16'd0;
         o_perf.fwd_wait = r_v && r_wait;
         o_perf.split    = m2_v && m2.xline;
-        o_perf.xmiss    = m1_v && m1_miss;
+        o_perf.xmiss    = m1_v && m1_miss && !m1_nd;
+        o_perf.dbit     = m1_v && m1_nd;
+        o_perf.dwalk    = o_started;
         o_perf.fault    = r_v && r_exc;
         o_perf.hit      = r_v && r_hit;
         o_perf.miss     = r_v && r_rsp && i_resp.kind == RespKind::MISS;
