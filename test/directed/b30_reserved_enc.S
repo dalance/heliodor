@@ -2,7 +2,7 @@
 //
 // M-mode, outside debug mode: DRET 0x7b200073 (sub-case 1), a LOAD with
 // the reserved funct3=7 (2), an unknown SYSTEM funct12 0x7ff (3), an AMO
-// with the reserved funct5 0x02 (4). Spec: cause 2 each. 0xB01E with a sub-case mask: no trap.
+// with the reserved funct5 0x06 (4). Spec: cause 2 each. 0xB01E with a sub-case mask: no trap.
 #include "common/probe.h"
 
 .macro CASE word, sub
@@ -28,8 +28,8 @@ main:
     CASE    0x0007f003, 2
     // SYSTEM funct3=0 funct12=0x7ff rs1=rd=x0
     CASE    0x7ff00073, 3
-    // AMO .d funct5=0x02 rd=x0 rs1=a5 rs2=x0
-    CASE    0x0807b02f, 4
+    // AMO .d funct5=0x06 rd=x0 rs1=a5 rs2=x0
+    CASE    0x3007b02f, 4
     beqz    s10, 9f
     slli    s10, s10, 16
     li      t0, CODE_BUG(30)

@@ -1,0 +1,251 @@
+// io_unit: executes non-cacheable loads and stores exactly once, at the head
+// of the machine
+//
+// Ports (timing contract):
+//   i_ld, i_st      : registered offers of the oldest non-cacheable load (lq)
+//                     and store (sq); held until the op retires
+//   i_tok           : the oldest token; the access starts only in a cycle
+//                     where it names the op (compared in A itself)
+//   i_ordering_empty, i_atomic_empty : every older store is visible and no
+//                     atomic is in flight
+//   o_head_req      : registered HEAD slot request; i_head_gnt (t) answers it,
+//                     i_head_slot (t + 3) is A
+//   o_req_valid/o_req : A, combinational from registered state and i_tok
+//   i_resp          : the HEAD port's response, RESP_LAT after A (client IO);
+//                     an i_evt in its cycle counts as after it
+//   o_started       : pulse on the A edge of the UNC_READ or STORE_WT
+//   i_head_retired  : lane 0 of commit retired: the op this unit holds
+//   o_ld_done/o_st_done, o_done_id : pulse when the access completed (the
+//                     load's value is in the WB holder; the store's write
+//                     was accepted by the memory side)
+//   o_hf_req, i_wb_grant, o_wb, o_wake : a load's hole-fill on the HEAD
+//                     pipe's WB port; o_wb registered, o_wake one cycle
+//                     before it
+//   i_kill          : drops an op that has not started
+// Owns:
+//   - one access per op: after PENDING the request is never presented again,
+//     and the unit holds the op until it retires, so an offer that is still
+//     present is not executed twice; only RETRY re-presents
+//   - at most one request is outstanding, and its result is captured in one
+//     register
+//   - a DRAM target (non-cacheable through the PMA or the page attributes) is
+//     preceded by a CMO request that cleans this hart's copy of the line
+// Rationale:
+//   - the device sees the read on the grant, so started_q is set when the
+//     request is first presented, not when it completes
+pub module io_unit::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill  ,
+    i_tok : input core_types::<CFG>::TagTok,
+    i_ld  : input core_types::<CFG>::IoOp  ,
+    i_st  : input core_types::<CFG>::IoOp  ,
+
+    i_ordering_empty: input logic,
+    i_atomic_empty  : input logic,
+    i_head_retired  : input logic,
+
+    o_head_req : output logic                      ,
+    i_head_gnt : input  logic                      ,
+    i_head_slot: input  logic                      ,
+    o_req_valid: output logic                      ,
+    o_req      : output core_types::<CFG>::MemReq  ,
+    i_resp     : input  core_types::<CFG>::MemResp ,
+    i_evt      : input  core_types::<CFG>::MemEvent,
+
+    o_started: output logic                              ,
+    o_busy   : output logic                              ,
+    o_ld_done: output logic                              ,
+    o_st_done: output logic                              ,
+    o_done_id: output logic<core_types::<CFG>::MEMID_W>  ,
+
+    o_hf_req  : output logic                         ,
+    i_wb_grant: input  fu_pkg::WbSlot                ,
+    o_wb      : output core_types::<CFG>::WbPacket   ,
+    o_wake    : output core_types::<CFG>::Wake       ,
+
+    #[ifdef(HELIODOR_CHK)]
+    o_chk: output logic<4>,
+
+    o_perf: output core_types::<CFG>::IoPerf,
+) {
+    import core_types::<CFG>::*;
+
+    enum Ph: logic<3> {
+        IDLE,
+        REQ, // HEAD slot requested
+        SLOT, // slot granted, waiting for A
+        RESP, // request presented, response due
+        PEND, // PENDING received, waiting for its done event
+        DONE, // completed, waiting for the retire of the op
+    }
+
+    var ph_q     : Ph    ;
+    var op_q     : IoOp  ;
+    var st_q     : logic ; // the op is a store
+    var cmo_q    : logic ; // the next request is the CMO clean
+    var started_q: logic ;
+    var pid_q    : FillId;
+    var done_q   : logic ;
+    var data_q   : logic<64>;
+
+    let busy  : logic = ph_q != Ph::IDLE;
+    let ld_ok : logic = i_ld.valid && i_tok.valid && i_tok.tag == i_ld.tag.rob;
+    let st_ok : logic = i_st.valid && i_tok.valid && i_tok.tag == i_st.tag.rob;
+    let ready : logic = i_ordering_empty && i_atomic_empty;
+    let accept: logic = !busy && (ld_ok || st_ok) && ready && !i_kill.valid;
+    let tok_ok: logic = i_tok.valid && i_tok.tag == op_q.tag.rob;
+    let dead  : logic = busy && killed(i_kill, op_q.tag.rob);
+
+    // ---- the request in A ----
+
+    let sz_m   : logic<16> = mem_size_mask(op_q.op.size);
+    let slot_a : logic = ph_q == Ph::SLOT && i_head_slot;
+    let present: logic = slot_a && (started_q || tok_ok);
+    always_comb {
+        o_req_valid      = present;
+        o_req.tag.client = MemClient::IO;
+        o_req.tag.id     = op_q.id;
+        o_req.tag.rob    = op_q.tag.rob;
+        o_req.tag.rob_v  = 1'b1;
+        o_req.attr       = '0;
+        o_req.cls        = if cmo_q ? MemCls::CMO : if st_q ? MemCls::STORE_WT : MemCls::UNC_READ;
+        o_req.pa         = op_q.pa;
+        o_req.mask       = {8'd0, sz_m[7:0] << op_q.pa[2:0]};
+        o_req.wdata      = {64'd0, op_q.wdata};
+    }
+    assign o_head_req = ph_q == Ph::REQ;
+    assign o_started  = present && !cmo_q && !started_q;
+
+    // ---- the response and the done event ----
+
+    let rsp    : logic = ph_q == Ph::RESP && i_resp.valid && i_resp.tag.client == MemClient::IO;
+    let r_pend : logic = rsp && i_resp.kind == RespKind::PENDING;
+    let r_cmo  : logic = rsp && cmo_q && i_resp.kind == RespKind::HIT;
+    let r_again: logic = rsp && !r_pend && !r_cmo;
+    let pid    : FillId = if ph_q == Ph::PEND ? pid_q : i_resp.fill_id;
+    let ev_done: logic = i_evt.valid && i_evt.fill_id == pid && (i_evt.kind == (if st_q ? EvKind::WT_DONE : EvKind::UNC_DONE));
+    let fin    : logic = (ph_q == Ph::PEND || r_pend) && ev_done;
+
+    always_ff {
+        if_reset {
+            ph_q      = Ph::IDLE;
+            st_q      = 1'b0;
+            cmo_q     = 1'b0;
+            started_q = 1'b0;
+            pid_q     = '0;
+            done_q    = 1'b0;
+        } else {
+            done_q = fin;
+            if fin {
+                data_q = i_evt.data;
+            }
+            if dead {
+                ph_q      = Ph::IDLE;
+                started_q = 1'b0;
+            } else {
+                case ph_q {
+                    Ph::IDLE: if accept {
+                        op_q  = if ld_ok ? i_ld : i_st;
+                        st_q  = !ld_ok;
+                        cmo_q = if ld_ok ? i_ld.dram : i_st.dram;
+                        ph_q  = Ph::REQ;
+                    }
+                    Ph::REQ: if i_head_gnt {
+                        ph_q = Ph::SLOT;
+                    }
+                    Ph::SLOT: if i_head_slot {
+                        if present {
+                            if !cmo_q {
+                                started_q = 1'b1;
+                            }
+                            ph_q = Ph::RESP;
+                        } else {
+                            ph_q = Ph::REQ;
+                        }
+                    }
+                    Ph::RESP: if rsp {
+                        if fin {
+                            ph_q = Ph::DONE;
+                        } else if r_pend {
+                            pid_q = i_resp.fill_id;
+                            ph_q  = Ph::PEND;
+                        } else if r_cmo {
+                            cmo_q = 1'b0;
+                            ph_q  = Ph::REQ;
+                        } else {
+                            ph_q = Ph::REQ;
+                        }
+                    }
+                    Ph::PEND: if fin {
+                        ph_q = Ph::DONE;
+                    }
+                    Ph::DONE: if i_head_retired {
+                        ph_q      = Ph::IDLE;
+                        started_q = 1'b0;
+                    }
+                    default: {}
+                }
+            }
+        }
+    }
+
+    assign o_busy    = busy;
+    assign o_ld_done = done_q && !st_q;
+    assign o_st_done = done_q && st_q;
+    assign o_done_id = op_q.id;
+
+    inst u_wb: fu_blocking_shell::<CFG> (
+        clk                                                          ,
+        rst                                                          ,
+        i_valid      : accept && ld_ok                               ,
+        i_tag        : i_ld.tag                                      ,
+        i_kill                                                       ,
+        o_ready      : _                                             ,
+        o_start      : _                                             ,
+        o_flush      : _                                             ,
+        i_leaf_valid : done_q && !st_q                               ,
+        i_leaf_data  : mem_fmt_load({64'd0, data_q}, op_q.pa[2:0], op_q.op),
+        i_leaf_fflags: 5'd0                                          ,
+        o_hf_req                                                     ,
+        o_hf_tag     : _                                             ,
+        i_wb_grant                                                   ,
+        o_wb                                                         ,
+        o_wake                                                       ,
+    );
+
+    always_comb {
+        o_perf.load     = present && !cmo_q && !st_q;
+        o_perf.store    = present && !cmo_q && st_q;
+        o_perf.cmo      = present && cmo_q;
+        o_perf.retry    = r_again;
+        o_perf.ord_wait = !busy && (ld_ok || st_ok) && !ready;
+        o_perf.done     = done_q;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var after_q: logic; // the access was PENDING: it must never be presented again
+        always_ff {
+            if_reset {
+                after_q = 1'b0;
+            } else if !busy {
+                after_q = 1'b0;
+            } else if r_pend {
+                after_q = 1'b1;
+            }
+        }
+        inst u_chk: chk_head (
+            clk                                        ,
+            rst                                        ,
+            i_req      : present                       ,
+            i_tok_ok   : tok_ok                        ,
+            i_started  : started_q                     ,
+            i_wait_resp: ph_q == Ph::RESP || ph_q == Ph::PEND,
+            i_kill_st  : dead && started_q             ,
+            i_forbid   : present && after_q            ,
+            o_chk                                      ,
+        );
+    }
+}

@@ -291,12 +291,22 @@ pub package core_types::<CFG: core_cfg> {
 
     // ---- Topology derived from the FU table ----
 
-    // FU kinds a memory pipe accepts: every pipe takes loads and stores.
-    // Atomics are not served by this core build (decode rejects them).
+    // The memory port that carries the non-pipe (HEAD class) clients:
+    // atomic_unit and io_unit.
+    const HEAD_PORT: u32 = 0;
+
+    function mem_port_head (
+        m: input u32,
+    ) -> logic {
+        return m == HEAD_PORT;
+    }
+
+    // FU kinds a memory pipe accepts: every pipe takes loads and stores,
+    // atomics run only on the HEAD port.
     function mem_port_fu (
         m: input u32,
     ) -> FuSet {
-        return fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE);
+        return fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE) | (if mem_port_head(m) ? fu_bit(FuKind::ATOMIC) : 0);
     }
 
     // The exec port that is issue port i of IQ q.
@@ -354,8 +364,12 @@ pub package core_types::<CFG: core_cfg> {
             FuKind::ALU, FuKind::BRU, FuKind::MUL, FuKind::DIV, FuKind::SYS, FuKind::LOAD: {
                 r = !fp && (s == 0 || (s == 1 && k != FuKind::LOAD));
             }
-            FuKind::STORE, FuKind::ATOMIC: {
+            FuKind::STORE: {
                 r = (s == 0 && !fp) || s == 1;
+            }
+            // Slot 2 is the amocas operand read of atomic_unit (section L.11).
+            FuKind::ATOMIC: {
+                r = !fp;
             }
             FuKind::FMA: {
                 r = fp && s <: 3;
@@ -617,33 +631,38 @@ pub package core_types::<CFG: core_cfg> {
         size : logic<3> ,
         vaddr: logic<64>,
         paddr: logic<64>,
+        io   : logic    , // not cacheable
         rmask: logic<16>,
-        wmask: logic<16>,
-        wdata: logic<64>,
+        wmask   : logic<16>,
+        wdata   : logic<64>,
+        wdata_hi: logic<64>, // a 16-byte store (amocas.q)
     }
 
     // Commit window entries, registered by lq (COMMIT_W oldest) and sq
     // (MEM_W oldest); commit selects by tag equality.
     struct LqCmWin {
-        valid : logic ,
-        tag   : LqTag ,
-        poison: logic ,
-        obs   : MemObs,
+        valid     : logic ,
+        tag       : LqTag ,
+        poison    : logic ,
+        io_ordered: logic , // an IO load: retires alone
+        obs       : MemObs,
     }
 
     struct SqCmWin {
-        valid    : logic    ,
-        tag      : SqTag    ,
-        retire_ok: logic    , // every half has its address and the data is written
-        lines    : logic <2>, // sb lines pushed at retire: 1, or 2 (line-crossing)
-        obs      : MemObs   ,
+        valid     : logic    ,
+        tag       : SqTag    ,
+        retire_ok : logic    , // see sq
+        io_ordered: logic    , // an IO store: retires alone
+        lines     : logic <2>, // sb lines pushed at retire: 0, 1, or 2 (line-crossing)
+        obs       : MemObs   ,
     }
 
     // sb credit offered to commit, saturated at PUSH_W lines.
     const SB_CREDIT_W: u32 = tag_pkg::idx_w(PUSH_W + 1);
 
-    // Units whose started pulse sets commit.head_started_q: fu_sys.
-    const STARTED_N: u32 = 1;
+    // Units whose started pulse sets commit.head_started_q: fu_sys,
+    // atomic_unit, io_unit.
+    const STARTED_N: u32 = 3;
 
     // Commit's flush request to flush_ctrl. ftq/foff/taken only for BR_CM.
     struct CmFlush {
@@ -1030,7 +1049,7 @@ pub package core_types::<CFG: core_cfg> {
 
     // LQ and SQ: the memory pipes' passes; PTW_D, PTW_I: PTE reads of the D
     // and I walkers; AD: their A/D writes; IFU: the owner tag of an I-side
-    // walk request.
+    // walk request; ATOMIC, IO: the non-pipe clients of the HEAD port.
     enum MemClient: logic<3> {
         LQ,
         SQ,
@@ -1038,18 +1057,26 @@ pub package core_types::<CFG: core_cfg> {
         PTW_I,
         AD,
         IFU,
+        ATOMIC,
+        IO,
     }
 
-    enum MemCls: logic<2> {
+    enum MemCls: logic<3> {
         LOAD, // one line, up to two adjacent dwords
         PTW_READ, // one PTE, folded like LOAD
-        STORE_WT, // A/D write of a walker
+        STORE_WT, // A/D write of a walker, IO store
+        LOAD_EXCL, // AMO/LR read with ownership
+        UNC_READ,
+        STORE_EXCL,
+        CMO, // clean this hart's copy of the line
     }
 
-    enum RespKind: logic<2> {
+    enum RespKind: logic<3> {
         HIT,
         MISS,
         RETRY,
+        EXCL_PASS,
+        EXCL_FAIL,
         PENDING,
     }
 
@@ -1066,6 +1093,7 @@ pub package core_types::<CFG: core_cfg> {
         FILL_CRIT,
         FILL_DONE,
         FILL_ABORT,
+        UNC_DONE,
         WT_DONE,
     }
 
@@ -1081,17 +1109,22 @@ pub package core_types::<CFG: core_cfg> {
         cls  : MemCls          ,
         pa   : pma_pkg::Pa     ,
         mask : logic   <16>    , // bytes of dwords pa[5:3] and pa[5:3]+1, inside one line
-        wdata: logic   <128>   ,
+        wdata: logic   <128>   , // the same dwords (STORE_WT, STORE_EXCL)
         attr : pma_pkg::PmaAttr,
     }
 
     // Non-pipe clients of memory port 0 (mem_port_arb reserves an empty slot
-    // of pipe 0 for them): the D and I walkers. A client is granted in the
-    // select cycle and presents its request when the slot reaches m2, so its
-    // response comes NP_RESP_LAT cycles after the grant.
-    const NP_N       : u32 = 2;
+    // of pipe 0 for them): the D and I walkers, and the HEAD clients
+    // atomic_unit and io_unit. A client is granted in the select cycle and
+    // presents its request when the slot reaches m2, so its response comes
+    // NP_RESP_LAT cycles after the grant. At most one HEAD client requests
+    // at a time: each serves only the op holding the oldest token or its own
+    // started latch.
+    const NP_N       : u32 = 4;
     const NP_PTW_D   : u32 = 0;
     const NP_PTW_I   : u32 = 1;
+    const NP_ATOMIC  : u32 = 2;
+    const NP_IO      : u32 = 3;
     const NP_RESP_LAT: u32 = 3 + fu_pkg::RESP_LAT;
 
     // Exactly RESP_LAT cycles after accept, one per accepted request.
@@ -1166,11 +1199,18 @@ pub package core_types::<CFG: core_cfg> {
     }
 
     // A memory op as the LSU modules use it, decoded from {fu, uop} by mem_op.
+    // An atomic other than LR is a store (it holds an SQ entry); an LR is a
+    // load. CBO ops are stores.
     struct MemOp {
         st  : logic   , // store (STA + STD); load otherwise
-        size: logic<2>, // log2 bytes
+        size: logic<2>, // log2 bytes (amocas.q: 3, with q)
         sgn : logic   , // load: sign-extend
         fp  : logic   , // load: NaN-box below 64 bits
+        amo : logic   , // atomic: atomic_unit executes it
+        rmw : logic   , // atomic other than LR and SC
+        q   : logic   , // amocas.q: 16 bytes
+        cmo : logic   , // cbo.clean, cbo.flush, cbo.inval
+        zero: logic   , // cbo.zero
     }
 
     function mem_op (
@@ -1178,11 +1218,47 @@ pub package core_types::<CFG: core_cfg> {
         uop: input logic <UOP_W>,
     ) -> MemOp {
         var r: MemOp;
-        r.st   = fu == FuKind::STORE;
-        r.size = uop[1:0];
-        r.sgn  = !uop[2];
-        r.fp   = !r.st && uop[3];
+        let a: AmoUop = uop as AmoUop;
+        r      = 0 as MemOp;
+        r.st   = fu == FuKind::STORE || (fu == FuKind::ATOMIC && a.op != AmoOp::LR);
+        r.size = if fu == FuKind::ATOMIC && a.f3[2] ? 2'd3 : uop[1:0];
+        r.sgn  = fu == FuKind::ATOMIC || !uop[2];
+        r.fp   = fu == FuKind::LOAD && uop[3];
+        r.amo  = fu == FuKind::ATOMIC;
+        r.rmw  = fu == FuKind::ATOMIC && a.op != AmoOp::LR && a.op != AmoOp::SC;
+        r.q    = fu == FuKind::ATOMIC && a.f3[2];
+        r.cmo  = fu == FuKind::STORE && uop[4] && !uop[2];
+        r.zero = fu == FuKind::STORE && uop[4] && uop[2];
         return r;
+    }
+
+    // Bytes of an access of 2^size bytes at byte 0.
+    function mem_size_mask (
+        size: input logic<2>,
+    ) -> logic<16> {
+        return case size {
+            2'd0   : 16'h0001,
+            2'd1   : 16'h0003,
+            2'd2   : 16'h000f,
+            default: 16'h00ff,
+        };
+    }
+
+    // Load result from the 16-byte window holding the access at byte bo:
+    // shift, then sign or zero extension; an FP load below 64 bits is
+    // NaN-boxed.
+    function mem_fmt_load (
+        win: input logic<128>,
+        bo : input logic<3>  ,
+        op : input MemOp     ,
+    ) -> logic<64> {
+        let v: logic<128> = win >> {bo, 3'd0};
+        return case op.size {
+            2'd0   : if op.sgn ? {v[7] repeat 56, v[7:0]} : {56'd0, v[7:0]},
+            2'd1   : if op.fp ? fpu_pkg::box_h(v[15:0]) : if op.sgn ? {v[15] repeat 48, v[15:0]} : {48'd0, v[15:0]},
+            2'd2   : if op.fp ? fpu_pkg::box_s(v[31:0]) : if op.sgn ? {v[31] repeat 32, v[31:0]} : {32'd0, v[31:0]},
+            default: v[63:0],
+        };
     }
 
     // A pass re-entered at m0 from the LQ or SQ: the op is identified the
@@ -1226,6 +1302,8 @@ pub package core_types::<CFG: core_cfg> {
         line  : logic       <50>,
         dw    : logic       <3> ,
         mask  : logic       <16>,
+        full  : logic           , // cbo.zero: the whole line, mask unused
+        attr  : pma_pkg::PmaAttr,
         exc   : exc_pkg::ExcRec ,
         xmiss : logic           , // the pass missed the DTLB: only va and half are meaningful
         xpark : logic           , // xmiss and the walk request was taken: wait for its PtwEvent
@@ -1240,13 +1318,18 @@ pub package core_types::<CFG: core_cfg> {
     }
 
     // m2 forward snapshot of a load pass: the bytes it read, for the scans.
+    // An IO/NC load's snapshot records only its line and attributes: it is
+    // never forwarded to and never poisoned.
     struct LqSnap {
-        valid: logic     ,
-        lq   : LqTag     ,
-        half : logic     ,
-        line : logic <50>,
-        dw   : logic <3> ,
-        mask : logic <16>,
+        valid : logic     ,
+        lq    : LqTag     ,
+        half  : logic     ,
+        line  : logic <50>,
+        dw    : logic <3> ,
+        mask  : logic <16>,
+        io    : logic     , // not cacheable: io_unit executes it
+        io_ord: logic     ,
+        dram  : logic     , // the target is DRAM
     }
 
     // Outcome of a load pass at m2 + RESP_LAT.
@@ -1262,16 +1345,58 @@ pub package core_types::<CFG: core_cfg> {
         va      : logic<64>, // VA of the access, for re-issue and the commit window
     }
 
-    // One committed line pushed into the store buffer.
+    // One committed line pushed into the store buffer. A fresh push (cbo.zero)
+    // never merges into an existing entry.
     struct SbPush {
         valid: logic      ,
         line : logic<50>  ,
         data : logic<512> ,
         strb : logic<64>  ,
+        fresh: logic      ,
     }
 
-    // Coherence events seen by the CoRR scan: inv, inv2, evict1, evict2.
+    // Coherence events seen by the CoRR scan and the atomic watch: inv,
+    // inv2, evict1, evict2.
     const COH_N: u32 = 4;
+
+    // ---- HEAD clients (sections L.11, L.13) ----
+
+    // Hole-fill writers of the HEAD pipe's WB port: atomic_unit, io_unit.
+    const HF_N     : u32 = 2;
+    const HF_ATOMIC: u32 = 0;
+    const HF_IO    : u32 = 1;
+
+    // An atomic handed over by m2 of the HEAD pipe: checked and without
+    // exception. The AGU used imm = 0. The first pass carries the operands
+    // and, unless it missed the DTLB (xmiss), the PA; after a miss the
+    // re-issued pass carries the PA.
+    struct AtomicOp {
+        valid   : logic           ,
+        first   : logic           ,
+        xmiss   : logic           ,
+        tag     : ExTag           ,
+        amo     : AmoUop          ,
+        pa      : pma_pkg::Pa     ,
+        rs2     : logic       <64>,
+        rd_arch : logic       <5> , // amocas: the compare value is rd (and rd+1)
+        rs2_arch: logic       <5> , // amocas.q: the swap value's hi half is rs2+1
+    }
+
+    // amocas operands atomic_unit reads itself, one per cycle through one
+    // arch RAT port and the HEAD pipe's spare PRF port: rd, rd+1, rs2+1.
+    const CAS_RD_N: u32 = 3;
+
+    // A non-cacheable load (offered by lq) or store (offered by sq) that may
+    // run in io_unit once it holds the oldest token.
+    struct IoOp {
+        valid: logic                ,
+        tag  : ExTag                ,
+        id   : logic       <MEMID_W>, // LqTag or SqTag, zero-extended
+        pa   : pma_pkg::Pa          ,
+        op   : MemOp                ,
+        dram : logic                , // the target is DRAM (non-cacheable by attribute)
+        wdata: logic       <64>     , // store bytes in their dword lanes
+    }
 
     // ---- Firing events (o_perf) ----
 
@@ -1324,6 +1449,34 @@ pub package core_types::<CFG: core_cfg> {
         np_win: logic, // a non-pipe client took port 0's slot
     }
 
+    struct AtomicPerf {
+        start    : logic, // started latch set
+        ld_excl  : logic, // LOAD_EXCL presented
+        st_excl  : logic, // STORE_EXCL presented
+        pass     : logic,
+        fail     : logic, // EXCL_FAIL
+        watch    : logic, // a write abandoned because the line left
+        backoff  : logic, // a restart entered backoff
+        park_fill: logic,
+        park_busy: logic,
+        retry    : logic, // RETRY other than FILL_BUSY
+        rsv_set  : logic,
+        rsv_coh  : logic, // reservation lost to inv, inv2 or evict
+        rsv_clr  : logic, // reservation cleared by trap or xRET
+        sc_nores : logic, // SC failed without a request (no or other reservation)
+        cas_miss : logic, // amocas compare failed, no write
+        tok_lost : logic, // a slot arrived without token or started latch
+    }
+
+    struct IoPerf {
+        load    : logic, // UNC_READ presented
+        store   : logic, // STORE_WT presented
+        cmo     : logic,
+        retry   : logic,
+        ord_wait: logic, // an oldest IO op waits for ordering_empty
+        done    : logic,
+    }
+
     struct AdapterPerf {
         accept     : logic,
         b2b        : logic, // accept in the decision cycle of the previous request
@@ -1336,6 +1489,17 @@ pub package core_types::<CFG: core_cfg> {
         r_inv_race : logic,
         r_preempted: logic,
         r_bank     : logic,
+        resv_turn  : logic, // fold group turned away for a HEAD slot
+        nf_accept  : logic,
+        nf_bank    : logic, // a HEAD request found the B position held
+        excl_hold  : logic, // LOAD_EXCL held until the DONE of its fill
+        excl_pass  : logic,
+        excl_fail  : logic,
+        excl_busy  : logic,
+        unc_done   : logic,
+        wt_done    : logic,
+        cmo        : logic,
+        ev_skid    : logic, // a done event waited behind a dcache event
     }
 
     // ---- Core top observation ----
@@ -1373,6 +1537,8 @@ pub package core_types::<CFG: core_cfg> {
         itlb : xlate_pkg::TlbPerf               ,
         ptw_d: xlate_pkg::PtwPerf               ,
         ptw_i: xlate_pkg::PtwPerf               ,
+        at   : AtomicPerf                       ,
+        io   : IoPerf                           ,
         rob  : RobPerf                          ,
         cm   : CmPerf                           ,
         flush: FlushPerf                        ,
@@ -1397,11 +1563,13 @@ pub package core_types::<CFG: core_cfg> {
         lq     : logic<4>                  ,
         sq     : logic<4>                  ,
         sb     : logic<2>                  ,
-        ad     : logic<3>                  ,
+        ad     : logic<6>                  ,
         dtlb   : logic<2>                  ,
         itlb   : logic<2>                  ,
         ptw_d  : logic<4>                  ,
         ptw_i  : logic<4>                  ,
+        at     : logic<4>                  ,
+        io     : logic<4>                  ,
         rob    : logic<CHK_ROB_W>          ,
         cm     : logic<CHK_CM_W>           ,
         flush  : logic<CHK_FLUSH_W>        ,

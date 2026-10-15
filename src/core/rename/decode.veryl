@@ -23,12 +23,15 @@
 // Legality (function `illegal`): an instruction is illegal when
 //   - the reused decoder flags it, or it is a vector instruction
 //   - it is not served by this core build, because no unit for it exists:
-//     the A extension (LR/SC, AMOs), CBO, the H extension (HLV/HLVX/HSV,
-//     HFENCE/HINVAL and the hypervisor and VS CSRs) and the V CSRs
+//     the H extension (HLV/HLVX/HSV, HFENCE/HINVAL and the hypervisor and VS
+//     CSRs) and the V CSRs
 //   - it is a load or store of a reserved width (LOAD funct3 111, STORE
 //     funct3 1xx, a 16-byte FP access: no Q), or an FP op that rounds with a
 //     reserved rm (101, 110) or with rm DYN while frm holds a reserved value
 //     (101-111)
+//   - an AMO encoding outside A, Zabha and Zacas: an unknown funct5, LR/SC
+//     below W, LR with rs2 != 0, a width above D except amocas.q, or
+//     amocas.q with an odd rd or rs2
 //   - a CSR access names a CSR that does not exist, needs more privilege, or
 //     writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM
 //   - a counter (cycle, time, instret, hpmcounterN) below M whose mcounteren
@@ -227,6 +230,41 @@ module decode::<CFG: core_cfg> (
         }
     }
 
+    function amo_op (
+        f5: input logic<5>,
+    ) -> AmoOp {
+        case f5 {
+            5'b00010: return AmoOp::LR;
+            5'b00011: return AmoOp::SC;
+            5'b00001: return AmoOp::SWAP;
+            5'b00100: return AmoOp::XOR;
+            5'b01100: return AmoOp::AND;
+            5'b01000: return AmoOp::OR;
+            5'b10000: return AmoOp::MIN;
+            5'b10100: return AmoOp::MAX;
+            5'b11000: return AmoOp::MINU;
+            5'b11100: return AmoOp::MAXU;
+            5'b00101: return AmoOp::CAS;
+            default : return AmoOp::ADD;
+        }
+    }
+
+    // An AMO encoding of A, Zabha or Zacas (see the header).
+    function amo_legal (
+        insn: input logic<32>,
+    ) -> logic {
+        let f5 : logic<5> = insn[31:27];
+        let f3 : logic<3> = insn[14:12];
+        let lrsc: logic   = f5 == 5'b00010 || f5 == 5'b00011;
+        let cas: logic    = f5 == 5'b00101;
+        let known: logic  = lrsc || cas || f5 == 5'b00000 || f5 == 5'b00001 || f5 == 5'b00100 || f5 == 5'b01100
+            || f5 == 5'b01000 || f5 == 5'b10000 || f5 == 5'b10100 || f5 == 5'b11000 || f5 == 5'b11100;
+        let width: logic  = if lrsc ? (f3 == 3'd2 || f3 == 3'd3) : if cas ? (f3 <= 3'd4) : (f3 <= 3'd3);
+        let pair : logic  = !(cas && f3 == 3'd4) || (!insn[7] && !insn[20]);
+        let lr_rs2: logic = f5 != 5'b00010 || insn[24:20] == 5'd0;
+        return known && width && pair && lr_rs2;
+    }
+
     function sys_op (
         csr : input logic         ,
         cop : input csr_pkg::CsrOp,
@@ -304,7 +342,7 @@ module decode::<CFG: core_cfg> (
         let fs_ill: logic = cs.fs == 2'b00 && (fp || (csr && f12 >= 12'h001 && f12 <= 12'h003));
         let cbo_k : logic<5> = insn[24:20]; // 0 inval, 1 clean, 2 flush, 4 zero
         let cbo_ill: logic   = cbo && ((below && !cbo_on(cs.menvcfg, cbo_k)) || (umode && !cbo_on(cs.senvcfg, cbo_k)));
-        let unsrv : logic     = amo || cbo || hlv || hfen || (csr && csr_unserved(f12));
+        let unsrv : logic     = (amo && !amo_legal(insn)) || hlv || hfen || (csr && csr_unserved(f12));
         let csr_ill: logic    = csr && (!csr_pkg::csr_exists(f12) || rp >: priv || (f12[11:10] == 2'b11 && csr_wr) || (hs
             && tvm && f12 == 12'h180));
         let sys_ill: logic = (mret && priv != csr_pkg::PrivLevel::MACHINE) || (sret && (priv == csr_pkg::PrivLevel::USER
@@ -370,6 +408,7 @@ module decode::<CFG: core_cfg> (
             di.is_amo     = is_amo[l];
             di.amo_lr     = amo_f5[l] == 5'b00010;
             di.amo_aq     = insn[26];
+            di.amo_pair   = is_amo[l] && amo_f5[l] == 5'b00101 && f3 == 3'd4;
             di.is_csr     = is_csr[l];
             di.csr_wr     = csr_wr;
             di.csr_fp     = fpcsr;
@@ -422,10 +461,14 @@ module decode::<CFG: core_cfg> (
                     d.imm      = if is_csr[l] ? {15'd0, insn[19:15], f12} : {30'd0, insn[24:20] == 0, insn[19:15] == 0};
                 }
                 FuKind::LOAD, FuKind::STORE: {
-                    d.uop      = {is_fp[l], f3} as UOP_W;
+                    let cbo: logic = is_cbo_z[l] || is_cbo_m[l];
+                    d.uop      = {cbo, is_fp[l], if cbo ? f12[2:0] : f3} as UOP_W;
                     d.rs1.used = 1'b1;
-                    d.rs2.used = c.fu == FuKind::STORE;
+                    d.rs2.used = c.fu == FuKind::STORE && !cbo;
                     d.rs2.rcls = if is_fp[l] ? RegClass::FP : RegClass::INT;
+                    if cbo {
+                        d.imm = 32'd0;
+                    }
                 }
                 FuKind::FMA, FuKind::FMISC, FuKind::FDIV: {
                     let fli: logic = fpu_op[l] == fpu_pkg::FpuOp::FLI_S || fpu_op[l] == fpu_pkg::FpuOp::FLI_D;
@@ -438,6 +481,16 @@ module decode::<CFG: core_cfg> (
                     d.rs2.rcls = RegClass::FP;
                     d.rs3.used = fp_rs3(fpu_op[l]);
                     d.rs3.rcls = RegClass::FP;
+                }
+                // imm carries rd and rs2 for atomic_unit; the AGU adds 0.
+                FuKind::ATOMIC: {
+                    var au: AmoUop;
+                    au.op      = amo_op(amo_f5[l]);
+                    au.f3      = f3;
+                    d.uop      = au as UOP_W;
+                    d.imm      = {22'd0, insn[24:20], insn[11:7]};
+                    d.rs1.used = 1'b1;
+                    d.rs2.used = au.op != AmoOp::LR;
                 }
                 default: {}
             }
