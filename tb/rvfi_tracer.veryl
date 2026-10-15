@@ -49,10 +49,16 @@
 //       EBREAK_TVAL (cause 3): tval.
 //       SATP_ENABLE_WIN: store PA from the first S-mode satp write with
 //            MODE=8 up to the next satp write.
-//       SC_PA: store PA and IO flag of an SC below M-mode (the golden
-//            records the untranslated VA there).
+//       SC_PA: store PA and IO flag of an SC (the golden records the
+//            untranslated VA there, also for M-mode with MPRV).
 //       AMO_X0_DATA: store data of an AMO with rd=x0 (the golden records
 //            rs2 there, not the value written).
+//       MISA: rd of a Zicsr op on misa (each core reports its own ISA),
+//            and the rd or store data of a later 32-bit integer op with a
+//            source carrying that value: x registers hold a taint bit, set by
+//            these writes and cleared by any other one. An RVC or FP op that
+//            reads a tainted register is not masked, so its use shows as a
+//            mismatch rather than being hidden.
 //     Load values are not traced, so the rd=x0 load rdata rule has nothing
 //     to act on yet.
 //   - Hash: h' = mix64((h ^ w) + ABSORB_K) over 64-bit words, starting
@@ -121,6 +127,7 @@ module rvfi_tracer #(
     var stopped_q : logic    ;
     var win_q     : logic    ;
     var win_done_q: logic    ;
+    var tnt_q     : logic<32>;
     var mismatch_q: logic    ;
     var stale_q   : logic    ;
     var ck_ptr_q  : logic<32>;
@@ -132,6 +139,7 @@ module rvfi_tracer #(
     var stop_c: logic     [LANES + 1];
     var win_c : logic     [LANES + 1];
     var wdn_c : logic     [LANES + 1];
+    var tnt_c : logic<32> [LANES + 1];
 
     var take  : logic        [LANES];
     var pr_on : logic        [LANES];
@@ -177,6 +185,7 @@ module rvfi_tracer #(
     assign stop_c[0] = stopped_q;
     assign win_c[0]  = win_q;
     assign wdn_c[0]  = win_done_q;
+    assign tnt_c[0]  = tnt_q;
 
     for l in 0..LANES :g_lane {
         let r: RetireRec = i_retire[l];
@@ -189,16 +198,26 @@ module rvfi_tracer #(
                 == 12'hDA0);
         let cnt_b63: logic     = csr_op && csr_num >= 12'h323 && csr_num <= 12'h33F;
         let cnt_b13: logic     = csr_op && (csr_num == 12'h344 || csr_num == 12'h144);
+        let misa_rd: logic     = csr_op && csr_num == 12'h301;
 
         let ffault : logic = r.trap && (r.cause == 6'd1 || r.cause == 6'd12 || r.cause == 6'd20);
         let rvc_ill: logic = r.trap && r.cause == 6'd2 && r.is_rvc;
         let ebreak : logic = r.trap && r.cause == 6'd3;
         let n_rec  : logic = csr_op && csr_num == NRM_CSR && !ffault;
         let amo_op : logic = r.insn[6:0] == 7'h2f;
-        let sc_pa  : logic = amo_op && r.insn[31:27] == 5'b00011 && r.priv != 2'd3;
+        let sc_pa  : logic = amo_op && r.insn[31:27] == 5'b00011;
         let amo_x0 : logic = amo_op && r.insn[31:28] != 4'b0001 && r.insn[11:7] == 5'd0;
 
+        let op7   : logic<7>  = r.insn[6:0];
+        let use1  : logic     = !r.is_rvc && (op7 == 7'h13 || op7 == 7'h1b || op7 == 7'h03 || op7 == 7'h67 || op7 == 7'h23
+            || op7 == 7'h63 || op7 == 7'h33 || op7 == 7'h3b || amo_op || (csr_op && !r.insn[14]));
+        let use2  : logic     = !r.is_rvc && (op7 == 7'h23 || op7 == 7'h63 || op7 == 7'h33 || op7 == 7'h3b || amo_op);
+        let tsh1  : logic<32> = tnt_c[l] >> r.insn[19:15];
+        let tsh2  : logic<32> = tnt_c[l] >> r.insn[24:20];
+        let src_t : logic     = (use1 && tsh1[0]) || (use2 && tsh2[0]);
         let rd_int: logic     = r.rd_kind == RdKind::INT && r.rd_addr != 5'd0;
+        let rd_t  : logic     = misa_rd || src_t;
+        let rd_bit: logic<32> = 32'd1 << r.rd_addr;
         let rd_on : logic     = !r.trap && (rd_int || r.rd_kind == RdKind::FP);
         let rd_bm : logic<64> = {cnt_b63 && rd_int, 49'd0, cnt_b13 && rd_int, 13'd0};
         let st_on : logic     = !r.trap && !r.vec_v && r.mem_wmask != 16'd0;
@@ -210,10 +229,10 @@ module rvfi_tracer #(
         assign pr_on[l]  = TRACE_EN && take[l] && r.order >= TRACE_LO && r.order <: TRACE_HI;
         assign m_insn[l] = ffault || rvc_ill;
         assign m_tval[l] = rvc_ill || ebreak;
-        assign m_rd[l]   = cnt_all && rd_int;
+        assign m_rd[l]   = (cnt_all || rd_t) && rd_int;
         assign m_pa[l]   = st_on && (win_c[l] || sc_pa);
         assign p_io[l]   = st_on && r.mem_io && !sc_pa;
-        assign m_wd[l]   = st_on && amo_x0;
+        assign m_wd[l]   = st_on && (amo_x0 || (use2 && tsh2[0]));
         assign p_rvc[l]  = r.is_rvc && !ffault;
         assign p_rd[l]   = if rd_on ? r.rd_kind : RdKind::NONE;
         assign p_rdv[l]  = if rd_on && !m_rd[l] ? r.rd_wdata & ~rd_bm : 64'd0;
@@ -275,6 +294,7 @@ module rvfi_tracer #(
         assign stop_c[l + 1] = stop_c[l] || (take[l] && i_stop[l]);
         assign win_c[l + 1]  = if w_open ? 1'b1 : if w_shut ? 1'b0 : win_c[l];
         assign wdn_c[l + 1]  = wdn_c[l] || w_open;
+        assign tnt_c[l + 1]  = if take[l] && rd_on && rd_int ? (if rd_t ? tnt_c[l] | rd_bit : tnt_c[l] & ~rd_bit) : tnt_c[l];
         assign ck_hit[l]     = take[l] && (cnt_c[l + 1] & CK_MASK) == 64'd0;
         assign ck_bad[l]     = CK_EN && ck_hit[l] && ck_k_q <: ck_n && h_c[l + 1] != ck_exp;
     }
@@ -303,6 +323,7 @@ module rvfi_tracer #(
             stopped_q  = 1'b0;
             win_q      = 1'b0;
             win_done_q = 1'b0;
+            tnt_q      = 32'd0;
             mismatch_q = 1'b0;
             stale_q    = 1'b0;
             ck_ptr_q   = 32'd3;
@@ -409,6 +430,7 @@ module rvfi_tracer #(
             stopped_q  = stopped_q || fin_now;
             win_q      = win_c[LANES];
             win_done_q = wdn_c[LANES];
+            tnt_q      = tnt_c[LANES];
             mismatch_q = mismatch_q || bad_now;
             stale_q    = ck_stale;
             if any_hit {
