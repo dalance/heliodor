@@ -1,5 +1,6 @@
-// mem_pipe: one memory pipe; address generation, translation with PMP and
-// PMA, the dcache request, forwarding, load formatting and the WB packet.
+// mem_pipe: one memory pipe; address generation, translation (Bare or Sv39
+// through a DTLB lookup port) with PMP and PMA, the dcache request,
+// forwarding, load formatting and the WB packet
 //
 // Served: integer loads and stores of 1, 2, 4 and 8 bytes to cacheable PAs,
 // misaligned and line-crossing ones included where the region allows
@@ -12,7 +13,17 @@
 //                    captured into m0
 //   o_iq_rel       : m0; a new issue releases its IQ entry on acceptance
 //   o_rf_addr*, i_rf_*, i_wb : m0 register read, bypassed from the WB bus
-//   i_priv, i_pmp* : read at m1; they change only at a flushing retire
+//   i_xl_on, i_ctx, i_pmp* : read at m1; they change only at a flushing
+//                    retire. i_xl_on: Sv39 is on for data accesses (satp
+//                    mode and the effective privilege, MPRV included);
+//                    i_ctx.prv is that effective privilege, also for PMP
+//   o_tlb_lk/i_tlb : m1, the DTLB lookup port, combinational round trip
+//   o_xreq_valid/o_xreq, i_xreq_gnt : m1, the walk request of a pass that
+//                    missed the DTLB; i_xreq_gnt is its acceptance in the
+//                    same cycle
+//   i_ptw_evt      : the walker's broadcast; an event of the pass's key from
+//                    its m1 cycle until the verdict (loads) or the STA write
+//                    (stores) marks the pass, which then does not park
 //   o_req_*        : m2 = A, the adapter's accept cycle. Every request is
 //                    accepted and answered exactly RESP_LAT cycles later
 //                    (dcache_port_adapter), so i_resp at R belongs to the
@@ -34,11 +45,17 @@
 //     (m2 + 1), so no younger load retires past an unseen violation
 //   - a load's value is the dcache line merged with forwarded bytes; a load
 //     that cannot get every byte this pass parks and re-issues
+//   - a pass that missed the DTLB sends no request and no packet: a load
+//     parks XLATE in lq, a store's STA write parks its sq entry; both
+//     re-issue the same pass after the walk. A re-issue carrying the walk's
+//     fault (xexc, the owner's answer) takes it instead of a lookup
 // Rationale:
 //   - a line-crossing access runs as two passes, each translated and checked
 //     on its own line; a crossing load runs only once it holds the oldest
 //     token and keeps its lo dword in the lq split buffer
-//   - translation is Bare: PA = VA, and a VA above the PA width is a hole
+//   - Bare: PA = VA, and a VA above the PA width is a hole (access fault).
+//     Sv39: a non-canonical VA is a page fault without a lookup; a hit is
+//     checked by xlate_pkg::perm, so a page fault wins over PMP and PMA
 //   - access fault (cause 5 load, 7 store) for a hole, a PMP denial, a
 //     non-cacheable PA, and a misaligned access to a region without
 //     misaligned_ok. This build has no uncached access path, and the
@@ -67,9 +84,17 @@ pub module mem_pipe::<CFG: core_cfg> #(
     i_rf_fp2  : input  logic<64>                                           ,
     i_wb      : input  core_types::<CFG>::WbPacket [core_types::<CFG>::WB_N],
 
-    i_priv   : input csr_pkg::PrivLevel,
-    i_pmpcfg : input logic<64>      [2] ,
-    i_pmpaddr: input logic<64>      [16],
+    i_xl_on  : input logic                   ,
+    i_ctx    : input xlate_pkg::XlateCtx     ,
+    i_pmpcfg : input logic              <64> [2] ,
+    i_pmpaddr: input logic              <64> [16],
+
+    o_tlb_lk    : output xlate_pkg::TlbLookup          ,
+    i_tlb       : input  xlate_pkg::TlbEntry           ,
+    o_xreq_valid: output logic                         ,
+    o_xreq      : output core_types::<CFG>::XlateReq   ,
+    i_xreq_gnt  : input  logic                         ,
+    i_ptw_evt   : input  core_types::<CFG>::PtwEvent   ,
 
     o_req_valid: output logic                     ,
     o_req      : output core_types::<CFG>::MemReq ,
@@ -93,6 +118,14 @@ pub module mem_pipe::<CFG: core_cfg> #(
     import core_types::<CFG>::*;
 
     // ---- helpers ----
+
+    // An event of the walk of page vpn (the pipe walks V = 0 only).
+    function ev_hit (
+        e  : input PtwEvent ,
+        vpn: input logic<27>,
+    ) -> logic {
+        return e.valid && e.key.vpn == vpn && e.key.regime == xlate_pkg::Regime::V0;
+    }
 
     // Bytes of an access of 2^size bytes at byte 0.
     function size_mask (
@@ -135,6 +168,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         new_ : logic           , // from the IQ (operands from the PRF)
         va   : logic<64>       , // re-issue: the stored VA
         half : logic           ,
+        xexc : exc_pkg::ExcRec , // re-issue: the fault of the pass's walk
     }
 
     struct M1Op {
@@ -149,6 +183,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m16  : logic<16> , // access bytes in the 16-byte window at va[5:3]
         xline: logic     ,
         data : logic<128>, // store bytes in the same window
+        xexc : exc_pkg::ExcRec,
     }
 
     struct M2Op {
@@ -164,6 +199,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
         data : logic       <128>,
         pa   : pma_pkg::Pa     , // PA of this pass
         exc  : exc_pkg::ExcRec ,
+        xmiss: logic           , // DTLB miss: no PA
+        xgnt : logic           , // the miss's walk request was taken
+        xseen: logic           , // an event of vpn came since the request
+        vpn  : logic       <27>, // page of this pass
     }
 
     // m2 to R: what the verdict needs besides the response.
@@ -183,6 +222,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
         fwd_dat: logic     <128>,
         fwd_w  : logic          ,
         wait_sq: SqTag          ,
+        xmiss  : logic          ,
+        xgnt   : logic          ,
+        xseen  : logic          ,
+        vpn    : logic     <27> ,
     }
 
     // ---- S -> m0 ----
@@ -202,6 +245,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         s_d.new_   = !i_re.valid;
         s_d.va     = i_re.va;
         s_d.half   = i_re.valid && i_re.half;
+        s_d.xexc   = if i_re.valid ? i_re.xexc : 0 as exc_pkg::ExcRec;
     }
 
     var m0_v: logic;
@@ -247,6 +291,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m1_in.m16   = m0_m16;
         m1_in.xline = m0_dw == 3'd7 && m0_m16[15:8] != 8'd0;
         m1_in.data  = {64'd0, rs2} << {m0_bo, 3'd0};
+        m1_in.xexc  = m0.xexc;
     }
 
     var m1_v: logic;
@@ -264,22 +309,57 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_data : m1            ,
     );
 
-    // ---- m1: Bare translation, PMP, PMA ----
+    // ---- m1: translation, PMP, PMA ----
 
-    let m1_pa   : pma_pkg::Pa      = m1.pva[55:0];
-    let m1_hole : logic            = m1.pva[63:56] != 8'd0;
-    let m1_attr : pma_pkg::PmaAttr = pma_check::<PMA_N>(m1_pa, PMA_TBL);
+    let m1_acc   : xlate_pkg::AccKind = if m1.op.st ? xlate_pkg::AccKind::STORE : xlate_pkg::AccKind::LOAD;
+    let m1_vpn   : logic<27>          = m1.pva[38:12];
+    let m1_noncan: logic              = i_xl_on && m1.pva[63:39] != {m1.pva[38] repeat 25};
+    let m1_xf    : logic              = m1.xexc.valid; // the walk's answer replaces the lookup
+    let m1_perm  : xlate_pkg::Perm    = xlate_pkg::perm(i_tlb, m1_acc, i_ctx);
+    let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf;
+    let m1_miss  : logic              = m1_lk && !i_tlb.hit;
+    let m1_pf    : logic              = m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok);
+
+    always_comb {
+        o_tlb_lk.valid = m1_v && m1_lk;
+        o_tlb_lk.vpn   = m1_vpn;
+        o_tlb_lk.asid  = i_ctx.asid;
+    }
+
+    // A crossing load's first pass does not walk: it parks HEAD and walks
+    // once it runs as the oldest op.
+    let m1_head: logic = !m1.op.st && m1.xline && m1.new_;
+    assign o_xreq_valid = m1_v && m1_miss && !m1_head;
+    always_comb {
+        o_xreq.valid       = 1'b1;
+        o_xreq.tag.client  = if m1.op.st ? MemClient::SQ : MemClient::LQ;
+        o_xreq.tag.id      = if m1.op.st ? {m1.sq.wrap, m1.sq.idx} as MEMID_W : {m1.lq.wrap, m1.lq.idx} as MEMID_W;
+        o_xreq.tag.rob_v   = 1'b1;
+        o_xreq.tag.rob     = m1.tag.rob;
+        o_xreq.va          = m1.pva;
+        o_xreq.acc         = m1_acc;
+        o_xreq.hlv         = 1'b0;
+        o_xreq.hlvx        = 1'b0;
+        o_xreq.nonspec     = 1'b0;
+    }
+
+    let m1_pa   : pma_pkg::Pa      = if i_xl_on ? xlate_pkg::entry_pa(i_tlb, m1.pva) : m1.pva[55:0];
+    let m1_hole : logic            = !i_xl_on && m1.pva[63:56] != 8'd0;
+    let m1_attr : pma_pkg::PmaAttr = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(m1_pa, PMA_TBL), if i_xl_on ? i_tlb.pbmt : 2'd0);
     let m1_misal: logic            = ({1'b0, m1.va[2:0]} & ((4'd1 << m1.op.size) - 4'd1)) != 4'd0;
 
     var m1_pmp_fault: logic;
     inst u_pmp: pmp_check (
         i_addr   : {8'd0, m1_pa}               ,
         i_acc    : if m1.op.st ? 2'd1 : 2'd0   ,
-        i_priv                                 ,
+        i_priv   : i_ctx.prv                   ,
         i_pmpcfg                               ,
         i_pmpaddr                              ,
         o_fault  : m1_pmp_fault                ,
     );
+
+    let m1_af: logic = m1_hole || !m1_attr.backed || !m1_attr.cacheable || m1_pmp_fault
+        || (m1_misal && !m1_attr.misaligned_ok);
 
     var m2_in: M2Op;
     always_comb {
@@ -294,12 +374,20 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m2_in.xline     = m1.xline;
         m2_in.data      = m1.data;
         m2_in.pa        = m1_pa;
-        m2_in.exc.valid = m1_hole || !m1_attr.backed || !m1_attr.cacheable || m1_pmp_fault
-            || (m1_misal && !m1_attr.misaligned_ok);
+        m2_in.xmiss     = m1_miss;
+        m2_in.xgnt      = o_xreq_valid && i_xreq_gnt;
+        m2_in.xseen     = ev_hit(i_ptw_evt, m1_vpn);
+        m2_in.vpn       = m1_vpn;
+        m2_in.exc.valid = m1_xf || m1_pf || (!m1_miss && m1_af);
         m2_in.exc.cause = if m1.op.st ? 6'd7 : 6'd5;
         m2_in.exc.tval  = m1.pva;
         m2_in.exc.gpa   = 54'd0;
         m2_in.exc.gva   = 1'b0;
+        if m1_xf {
+            m2_in.exc = m1.xexc;
+        } else if m1_pf {
+            m2_in.exc.cause = xlate_pkg::pf_cause(m1_acc);
+        }
     }
 
     var m2_v: logic;
@@ -323,17 +411,21 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let m2_dw   : logic<3>  = if m2.half ? 3'd0 : m2.va[5:3];
     let m2_pmask: logic<16> = if m2.half ? {8'd0, m2.m16[15:8]} : if m2.xline ? {8'd0, m2.m16[7:0]} : m2.m16;
     let m2_load : logic     = m2_v && !m2.op.st;
+    let m2_xseen: logic     = m2.xseen || ev_hit(i_ptw_evt, m2.vpn);
     // A crossing load runs its passes only as re-issues, which lq grants once it is oldest.
-    let m2_go: logic = m2_load && !m2.exc.valid && !(m2.xline && m2.new_);
+    let m2_go: logic = m2_load && !m2.exc.valid && !m2.xmiss && !(m2.xline && m2.new_);
 
     always_comb {
         o_req_valid           = m2_go;
         o_req.tag.client = MemClient::LQ;
         o_req.tag.id     = {m2.lq.wrap, m2.lq.idx} as MEMID_W;
+        o_req.tag.rob_v  = 1'b1;
         o_req.tag.rob    = m2.tag.rob;
         o_req.cls        = MemCls::LOAD;
         o_req.pa         = {m2.pa[55:6], m2_dw, 3'd0};
         o_req.mask       = m2_pmask;
+        o_req.wdata      = '0;
+        o_req.attr       = '0;
 
         o_fwd_q.valid  = m2_go;
         o_fwd_q.line   = m2.pa[55:6];
@@ -357,8 +449,11 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_sta.dw     = m2_dw;
         o_sta.mask   = if m2.half ? {8'd0, m2.m16[15:8]} : m2.m16;
         o_sta.exc    = m2.exc;
+        o_sta.xmiss  = m2.xmiss;
+        o_sta.xpark  = m2.xmiss && m2.xgnt && !m2.xseen;
 
-        o_std.valid = m2_live && m2.op.st && !m2.half;
+        // Only the first pass reads rs2; re-issued passes carry no data.
+        o_std.valid = m2_live && m2.op.st && !m2.half && m2.new_;
         o_std.sq    = m2.sq;
         o_std.data  = m2.data;
     }
@@ -390,6 +485,10 @@ pub module mem_pipe::<CFG: core_cfg> #(
         post_in.fwd_dat = fw_dat;
         post_in.fwd_w   = m2_go && i_fwd_sq.wt;
         post_in.wait_sq = i_fwd_sq.wait_sq;
+        post_in.xmiss   = m2.xmiss;
+        post_in.xgnt    = m2.xgnt;
+        post_in.xseen   = m2_xseen;
+        post_in.vpn     = m2.vpn;
     }
 
     // ---- m2 -> R: RESP_LAT stages ----
@@ -399,13 +498,20 @@ pub module mem_pipe::<CFG: core_cfg> #(
     assign dl_v[0] = m2_v;
     assign dl_d[0] = post_in;
     for k in 0..fu_pkg::RESP_LAT :g_dl {
+        var dl_in: PostOp;
+        always_comb {
+            dl_in = dl_d[k];
+            if k != 0 {
+                dl_in.xseen = dl_d[k].xseen || ev_hit(i_ptw_evt, dl_d[k].vpn);
+            }
+        }
         inst u_dl: stage_reg::<CFG> #(
             T: PostOp,
         ) (
             clk                           ,
             rst                           ,
             i_valid: dl_v[k]              ,
-            i_data : dl_d[k]              ,
+            i_data : dl_in                ,
             i_tag  : dl_d[k].tag.rob      ,
             i_kill                        ,
             o_valid: dl_v[k + 1]          ,
@@ -430,7 +536,8 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let r_hit  : logic = r_rsp && i_resp.kind == RespKind::HIT;
     let r_exc  : logic = r.exc.valid;
     let r_head : logic = !r_exc && r.xline && r.new_;
-    let r_wait : logic = !r_exc && !r_head && r.fwd_w;
+    let r_x    : logic = !r_exc && !r_head && r.xmiss;
+    let r_wait : logic = !r_exc && !r_head && !r_x && r.fwd_w;
     let r_value: logic = !r_exc && !r_head && !r_wait && (r_full || r_hit);
     let r_lo   : logic = r_value && r.xline && !r.half;
     let r_done : logic = r_exc || (r_value && !r_lo);
@@ -451,6 +558,9 @@ pub module mem_pipe::<CFG: core_cfg> #(
         } else if r_head {
             o_verdict.state = LqState::PARK;
             o_verdict.why   = ParkWhy::HEAD;
+        } else if r_x {
+            o_verdict.state = if r.xgnt && !r.xseen ? LqState::PARK : LqState::READY;
+            o_verdict.why   = ParkWhy::XLATE;
         } else if r_wait {
             o_verdict.state = LqState::PARK;
             o_verdict.why   = ParkWhy::SQ;
@@ -471,7 +581,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     // A store completes on its last pass; the lo pass of a crossing store
     // leaves the hi pass to the sq.
-    let r_pkt: logic = if r_st ? (r_exc || !(r.xline && !r.half)) : r_done;
+    let r_pkt: logic = if r_st ? (r_exc || (!r.xmiss && !(r.xline && !r.half))) : r_done;
 
     var pkt_in: WbPacket;
     always_comb {
@@ -509,6 +619,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_perf.fwd_part = r_v && !r_st && r.req && !r_full && r.fwd_cov != 16'd0;
         o_perf.fwd_wait = r_v && r_wait;
         o_perf.split    = m2_v && m2.xline;
+        o_perf.xmiss    = m1_v && m1_miss;
         o_perf.fault    = r_v && r_exc;
         o_perf.hit      = r_v && r_hit;
         o_perf.miss     = r_v && r_rsp && i_resp.kind == RespKind::MISS;

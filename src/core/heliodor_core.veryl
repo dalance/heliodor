@@ -26,18 +26,22 @@
 // Owns: none (no state).
 // What this build serves: RV64I, M, C, Zicsr, Zifencei, Zawrs and the M/S/U
 // privileged architecture (delegation, interrupts, Sstc, Zicntr/Zihpm,
-// Sscofpmf), with Bare translation and cacheable memory only; misa says so.
-// decode rejects F, D, A, V, CBO and H as illegal instructions, mem_pipe
-// faults any non-cacheable access, and the reused csr is connected only
-// through the ports listed above (no frm, no translation state). The FP
-// register file, free list and IQ structure exist as the final topology but
-// receive no op.
+// Sscofpmf), with Bare and Sv39 translation (Svnapot; Svade only: the walkers
+// run with ADUE = 0) and cacheable memory only; misa says so. decode rejects
+// F, D, A, V, CBO and H as illegal instructions, mem_pipe faults any
+// non-cacheable access (Svpbmt NC and IO pages included), and the reused csr
+// is connected only through the ports listed above (no frm). The FP register
+// file, free list and IQ structure exist as the final topology but receive no
+// op.
 // Rationale:
 //   - every lane and port array is a generate-for over the config; the FU
 //     topology functions of core_types map issue ports to IQs, WB ports, BRU
 //     and SYS indices, so no port number appears here
 //   - the dcache is a sibling of the LSU behind dcache_port_adapter; its
 //     memory side is the D read slot and the write channel
+//   - both walkers read PTEs as non-pipe clients of memory port 0, so PTE
+//     reads are coherent with this hart's dcache and the I read slot serves
+//     the icache only
 //   - the file is over the 600-line guideline because it is the connection
 //     list of every unit; splitting it would only add pass-through ports
 pub module heliodor_core::<CFG: core_cfg> #(
@@ -145,6 +149,33 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var pmpaddr : logic             <64> [16];
     var dec_csr : csr_pkg::DecCsr            ;
     var dpriv   : csr_pkg::PrivLevel         ; // privilege of loads and stores
+    var satp    : logic             <64>     ;
+    var m_sum   : logic                      ;
+    var m_mxr   : logic                      ;
+    var m_mprv  : logic                      ;
+    var m_mpp   : logic             <2>      ;
+    var pbmte   : logic                      ;
+
+    // ---- Translation context and invalidation ----
+
+    var d_on   : logic              ;
+    var d_ctx  : xlate_pkg::XlateCtx;
+    var i_on   : logic              ;
+    var i_ctx  : xlate_pkg::XlateCtx;
+    var tlb_inv: xlate_pkg::TlbInv  ;
+    inst u_xctx: xlate_ctx (
+        i_priv : priv  ,
+        i_mprv : m_mprv,
+        i_mpp  : m_mpp ,
+        i_satp : satp  ,
+        i_sum  : m_sum ,
+        i_mxr  : m_mxr ,
+        i_pbmte: pbmte ,
+        o_d_on : d_on  ,
+        o_d_ctx: d_ctx ,
+        o_i_on : i_on  ,
+        o_i_ctx: i_ctx ,
+    );
 
     // ==== Front end ====
 
@@ -207,6 +238,13 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var fb_v   : logic   ;
     var fb     : FetchBlk;
     var fb_take: logic   ;
+    var itlb_lk: xlate_pkg::TlbLookup [1];
+    var itlb_e : xlate_pkg::TlbEntry  [1];
+    var ixr_v  : logic                   ;
+    var ixr    : XlateReq                ;
+    var ixr_rdy: logic                   ;
+    var iptw_rs: XlateResp               ;
+    var iptw_ev: PtwEvent                ;
     inst u_ifu: ifu::<CFG> #(
         PMA_N      : PMA_N      ,
         PMA_REGIONS: PMA_REGIONS,
@@ -214,13 +252,21 @@ pub module heliodor_core::<CFG: core_cfg> #(
         clk                                             ,
         rst                                             ,
         i_fetch_valid      : f_v                        ,
-        i_priv             : priv                       ,
+        i_xl_on            : i_on                       ,
+        i_ctx              : i_ctx                      ,
         i_pmpcfg           : pmpcfg                     ,
         i_pmpaddr          : pmpaddr                    ,
         i_fetch            : fetch                      ,
         o_fetch_take       : f_take                     ,
         o_rewind_valid     : rw_v                       ,
         o_rewind           : rw                         ,
+        o_tlb_lk           : itlb_lk[0]                 ,
+        i_tlb              : itlb_e[0]                  ,
+        o_xreq_valid       : ixr_v                      ,
+        o_xreq             : ixr                        ,
+        i_xreq_ready       : ixr_rdy                    ,
+        i_ptw_evt          : iptw_ev                    ,
+        i_ptw_resp         : iptw_rs                    ,
         o_ic_req_valid     : icq_v                      ,
         o_ic_req           : icq                        ,
         i_ic_ready         : ic_rdy                     ,
@@ -235,6 +281,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_ev_fbq_full      : o_perf.front.fbq_full      ,
         o_ev_ftq_empty_idle: o_perf.front.ftq_empty_idle,
         o_ev_fault_stall   : o_perf.front.fault_stall   ,
+        o_ev_xlate_wait    : o_perf.front.xlate_wait    ,
     );
 
     var fill_req : logic        ;
@@ -678,6 +725,13 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var mp_resv : fu_pkg::WbSlot [MW];
     var arb_ok  : logic       [MW];
     var arb_hold: logic       [MW];
+    var dtlb_lk : xlate_pkg::TlbLookup [MW];
+    var dtlb_e  : xlate_pkg::TlbEntry  [MW];
+    var dxr_v   : logic                [MW];
+    var dxr     : XlateReq             [MW];
+    var dxr_gnt : logic                [MW];
+    var dptw_rs : XlateResp                ;
+    var dptw_ev : PtwEvent                 ;
 
     for m in 0..MW :g_mp {
         const W: u32 = IW + m;
@@ -712,9 +766,16 @@ pub module heliodor_core::<CFG: core_cfg> #(
             i_rf_int2  : rd_i[W * SRC_N + 1]       ,
             i_rf_fp2   : rd_f[W * SRC_N + 1]       ,
             i_wb       : wb                        ,
-            i_priv     : dpriv                     ,
-            i_pmpcfg   : pmpcfg                    ,
-            i_pmpaddr  : pmpaddr                   ,
+            i_xl_on     : d_on                     ,
+            i_ctx       : d_ctx                    ,
+            i_pmpcfg    : pmpcfg                   ,
+            i_pmpaddr   : pmpaddr                  ,
+            o_tlb_lk    : dtlb_lk[m]               ,
+            i_tlb       : dtlb_e[m]                ,
+            o_xreq_valid: dxr_v[m]                 ,
+            o_xreq      : dxr[m]                   ,
+            i_xreq_gnt  : dxr_gnt[m]               ,
+            i_ptw_evt   : dptw_ev                  ,
             o_req_valid: mreq_v[m]                 ,
             o_req      : mreq[m]                   ,
             i_resp     : mresp[m]                  ,
@@ -737,6 +798,10 @@ pub module heliodor_core::<CFG: core_cfg> #(
         assign mp_iq_resv[m] = resv_w[IW + m];
     }
 
+    var np_req : logic  [NP_N];
+    var np_gnt : logic  [NP_N];
+    var np_slot: logic  [NP_N];
+    var np_mreq: MemReq [NP_N];
     inst u_arb: mem_port_arb::<CFG> (
         clk                        ,
         rst                        ,
@@ -744,11 +809,14 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_lq_re    : lq_re         ,
         i_sq_re    : sq_re         ,
         i_iq_resv  : mp_iq_resv    ,
+        i_np_req   : np_req        ,
         o_port_hold: arb_hold      ,
         o_re       : mre           ,
         o_resv     : mp_resv       ,
         o_lq_gnt   : lq_gnt        ,
         o_sq_gnt   : sq_gnt        ,
+        o_np_gnt   : np_gnt        ,
+        o_np_slot  : np_slot       ,
         o_perf     : o_perf.arb    ,
     );
 
@@ -796,6 +864,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_std        : std           ,
         i_sq_head    : sq_head       ,
         i_oldest     : oldest        ,
+        i_ptw_evt    : dptw_ev       ,
+        i_ptw_resp   : dptw_rs       ,
         i_retire_cnt : ld_ret        ,
         o_reissue    : lq_re         ,
         i_reissue_gnt: lq_gnt        ,
@@ -815,6 +885,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_alloc_tag  : sq_atag       ,
         i_sta        : sta           ,
         i_std        : std           ,
+        i_ptw_evt    : dptw_ev       ,
+        i_ptw_resp   : dptw_rs       ,
         i_fwd_q      : fwd_q         ,
         o_fwd        : fwd_sq        ,
         o_reissue    : sq_re         ,
@@ -853,6 +925,112 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_perf          : o_perf.sb     ,
     );
 
+    // ==== Translation: TLBs and walkers ====
+
+    var dptw_v  : logic    ;
+    var dptw_rq : XlateReq ;
+    var dptw_rdy: logic    ;
+    inst u_dxarb: ptw_req_arb::<CFG> (
+        i_valid: dxr_v   ,
+        i_req  : dxr     ,
+        i_ready: dptw_rdy,
+        o_valid: dptw_v  ,
+        o_req  : dptw_rq ,
+        o_gnt  : dxr_gnt ,
+    );
+
+    var dfill: xlate_pkg::TlbFill;
+    inst u_dtlb: tlb #(
+        ENTRIES     : CFG::DTLB_N,
+        LOOKUP_PORTS: MW         ,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_lk  : dtlb_lk       ,
+        o_lk  : dtlb_e        ,
+        i_fill: dfill         ,
+        i_inv : tlb_inv       ,
+        o_chk : o_chk.dtlb    ,
+        o_perf: o_perf.dtlb   ,
+    );
+
+    inst u_dptw: ptw::<CFG> #(
+        QN     : CFG::PTW_D_QN,
+        MEM_LAT: NP_RESP_LAT  ,
+        PMA_N  : PMA_N        ,
+        PMA_TBL: PMA_REGIONS  ,
+    ) (
+        clk                               ,
+        rst                               ,
+        i_kill          : kill            ,
+        i_owner_drop    : 1'b0            ,
+        i_req_valid     : dptw_v          ,
+        i_req           : dptw_rq         ,
+        o_req_ready     : dptw_rdy        ,
+        i_ctx           : d_ctx           ,
+        i_pmpcfg        : pmpcfg          ,
+        i_pmpaddr       : pmpaddr         ,
+        i_inv           : tlb_inv         ,
+        i_ordering_empty: ord_empty       ,
+        o_fill          : dfill           ,
+        o_resp          : dptw_rs         ,
+        o_evt           : dptw_ev         ,
+        o_mem_valid     : np_req[NP_PTW_D] ,
+        o_mem_req       : np_mreq[NP_PTW_D],
+        i_mem_ready     : np_gnt[NP_PTW_D] ,
+        i_mem_resp      : mresp[0]        ,
+        i_mem_evt       : mevt            ,
+        o_chk           : o_chk.ptw_d     ,
+        o_perf          : o_perf.ptw_d    ,
+    );
+
+    var ifill: xlate_pkg::TlbFill;
+    inst u_itlb: tlb #(
+        ENTRIES     : CFG::ITLB_N,
+        LOOKUP_PORTS: 1          ,
+    ) (
+        clk                   ,
+        rst                   ,
+        i_lk  : itlb_lk       ,
+        o_lk  : itlb_e        ,
+        i_fill: ifill         ,
+        i_inv : tlb_inv       ,
+        o_chk : o_chk.itlb    ,
+        o_perf: o_perf.itlb   ,
+    );
+
+    // A fetch walk belongs to the front end's current path: a predecode
+    // redirect drops it like a kill.
+    inst u_iptw: ptw::<CFG> #(
+        QN     : CFG::PTW_I_QN,
+        MEM_LAT: NP_RESP_LAT  ,
+        PMA_N  : PMA_N        ,
+        PMA_TBL: PMA_REGIONS  ,
+    ) (
+        clk                               ,
+        rst                               ,
+        i_kill          : kill            ,
+        i_owner_drop    : pdr.valid       ,
+        i_req_valid     : ixr_v           ,
+        i_req           : ixr             ,
+        o_req_ready     : ixr_rdy         ,
+        i_ctx           : i_ctx           ,
+        i_pmpcfg        : pmpcfg          ,
+        i_pmpaddr       : pmpaddr         ,
+        i_inv           : tlb_inv         ,
+        i_ordering_empty: ord_empty       ,
+        o_fill          : ifill           ,
+        o_resp          : iptw_rs         ,
+        o_evt           : iptw_ev         ,
+        o_mem_valid     : np_req[NP_PTW_I] ,
+        o_mem_req       : np_mreq[NP_PTW_I],
+        i_mem_ready     : np_gnt[NP_PTW_I] ,
+        i_mem_resp      : mresp[0]        ,
+        i_mem_evt       : mevt            ,
+        o_chk           : o_chk.ptw_i     ,
+        o_perf          : o_perf.ptw_i    ,
+    );
+
     // ==== dcache and its adapter ====
 
     var dc_addr  : logic<64>             ;
@@ -883,6 +1061,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_kill              : kill         ,
         i_req_valid         : mreq_v       ,
         i_req               : mreq         ,
+        i_np_valid          : np_slot      ,
+        i_np_req            : np_mreq      ,
         o_req_ready         : _            ,
         o_resp              : mresp        ,
         o_evt               : mevt         ,
@@ -1105,6 +1285,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_bar_ret            : cm_bar                ,
         o_ftq_cm             : ftq_cm                ,
         o_icache_inv         : ic_inv                ,
+        o_tlb_inv            : tlb_inv               ,
         o_csr                : csr_cm                ,
         o_retire                                     ,
         o_irq_evt                                    ,
@@ -1177,18 +1358,18 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_sepc         : sepc               ,
         o_medeleg      : medeleg            ,
         o_mideleg      : _                  ,
-        o_satp         : _                  ,
+        o_satp         : satp               ,
         o_priv         : priv               ,
         o_priv_prev    : _                  ,
-        o_mstatus_sum  : _                  ,
-        o_mstatus_mxr  : _                  ,
-        o_mstatus_mprv : _                  ,
-        o_mstatus_mpp  : _                  ,
+        o_mstatus_sum  : m_sum              ,
+        o_mstatus_mxr  : m_mxr              ,
+        o_mstatus_mprv : m_mprv             ,
+        o_mstatus_mpp  : m_mpp              ,
         o_mstatus_tvm  : tvm                ,
         o_mstatus_tsr  : tsr                ,
         o_mstatus_fs   : dec_csr.fs         ,
         o_mstatus_vs   : _                  ,
-        o_menvcfg_pbmte: _                  ,
+        o_menvcfg_pbmte: pbmte              ,
         o_menvcfg_adue : _                  ,
         o_pmpcfg       : pmpcfg             ,
         o_pmpaddr      : pmpaddr            ,

@@ -10,9 +10,11 @@
 //   i_snap[MEM_W]     : m2 of each pipe; sets seen on the capture edge
 //   i_sta[MEM_W]      : store-resolve request at m2; scanned the next cycle
 //   i_verdict[MEM_W]  : m2 + RESP_LAT; only for ops still live in the pipe
-//   i_mem_ev, i_coh_*, i_std, i_sq_head, i_oldest : wake and scan events of
-//                       this cycle; an event in the verdict's cycle counts as
-//                       after the verdict
+//   i_mem_ev, i_coh_*, i_std, i_sq_head, i_oldest, i_ptw_evt : wake and scan
+//                       events of this cycle; an event in the verdict's cycle
+//                       counts as after the verdict
+//   i_ptw_resp        : the D walker's owner answer; a fault for a live load
+//                       is kept with the entry and rides its next re-issue
 //   o_reissue         : registered; the oldest READY entry; i_reissue_gnt in
 //                       the same cycle moves it to INFLIGHT
 //   o_win[COMMIT_W]   : from registered state, the COMMIT_W oldest entries;
@@ -37,8 +39,8 @@
 //     snapshot of a re-issue
 //   - a store's scan covers every load whose snapshot did not include that
 //     store: a snapshot at or before the store's m2 is registered by the scan
-//   - no entry leaves PARK except on its own key (fill_id, SqTag, token) or a
-//     broadcast
+//   - no entry leaves PARK except on its own key (fill_id, SqTag, token, the
+//     page of its pending pass) or a broadcast
 // Rationale:
 //   - ordering violations are repaired only by commit-time replay of the
 //     poisoned load, with no dependence predictor and no filter on the scans:
@@ -72,6 +74,8 @@ pub module lq::<CFG: core_cfg> (
     i_std       : input core_types::<CFG>::StdWrite [CFG::MEM_W]             ,
     i_sq_head   : input core_types::<CFG>::SqTag                            ,
     i_oldest    : input core_types::<CFG>::TagTok                           ,
+    i_ptw_evt   : input core_types::<CFG>::PtwEvent                         ,
+    i_ptw_resp  : input core_types::<CFG>::XlateResp                        ,
 
     i_retire_cnt: input logic<core_types::<CFG>::RETIRE_CNT_W>,
 
@@ -135,6 +139,7 @@ pub module lq::<CFG: core_cfg> (
     var e_fid   : FillId         [QN];
     var e_key   : SqTag          [QN];
     var e_poison: logic          [QN];
+    var e_xexc  : exc_pkg::ExcRec [QN]; // fault of the pending pass's walk
 
     var lo_q     : logic<64>      ;
     var bar_al_q : BarSeq         ;
@@ -182,7 +187,7 @@ pub module lq::<CFG: core_cfg> (
                 let sm: logic<64> = line_mask(sta_q[p].dw, sta_q[p].mask);
                 let ov: logic     = (e_seen0[e] && e_line0[e] == sta_q[p].line && (e_lm0[e] & sm) != 64'd0)
                     || (e_seen1[e] && e_line1[e] == sta_q[p].line && (e_lm1[e] & sm) != 64'd0);
-                s[p] = sta_q[p].valid && ov && !tag_older::<LQ_TAG_W>(tags[e], {sta_q[p].lq_lim.wrap, sta_q[p].lq_lim.idx});
+                s[p] = sta_q[p].valid && !sta_q[p].xmiss && ov && !tag_older::<LQ_TAG_W>(tags[e], {sta_q[p].lq_lim.wrap, sta_q[p].lq_lim.idx});
             }
             for k in 0..COH_N {
                 c[k] = i_coh_v[k] && ((e_seen0[e] && e_line0[e] == i_coh_line[k]) || (e_seen1[e] && e_line1[e] == i_coh_line[k]));
@@ -193,6 +198,16 @@ pub module lq::<CFG: core_cfg> (
     }
 
     // ---- wake conditions ----
+
+    // Page of the pass a re-issue would run: the access's own, or the next
+    // line's for the hi pass of a crossing access.
+    function pass_vpn (
+        va  : input logic<64>,
+        half: input logic    ,
+    ) -> logic<27> {
+        let pva: logic<64> = if half ? {va[63:6] + 58'd1, 6'd0} : va;
+        return pva[38:12];
+    }
 
     function wake_on (
         why : input ParkWhy  ,
@@ -206,6 +221,8 @@ pub module lq::<CFG: core_cfg> (
         sqh : input SqTag    ,
         tokv: input logic    ,
         tok : input RobTag   ,
+        pev : input PtwEvent ,
+        vpn : input logic<27>,
     ) -> logic {
         var sq_d: logic<CFG::MEM_W>;
         let ev_end: logic = ev.valid && (ev.kind == EvKind::FILL_DONE || ev.kind == EvKind::FILL_ABORT);
@@ -217,15 +234,16 @@ pub module lq::<CFG: core_cfg> (
             ParkWhy::FILL: (ev_end || (ev.valid && ev.kind == EvKind::FILL_CRIT && ev.line == line && ev.crit == dw)) && ev.fill_id == fid,
             ParkWhy::BUSY: ev_end,
             ParkWhy::SQ  : sq_w,
-            ParkWhy::HEAD: tokv && tok == rob,
-            default      : 1'b0,
+            ParkWhy::HEAD : tokv && tok == rob,
+            ParkWhy::XLATE: pev.valid && pev.key.vpn == vpn && pev.key.regime == xlate_pkg::Regime::V0,
+            default       : 1'b0,
         };
     }
 
     var wake: logic<QN>;
     always_comb {
         for e in 0..QN {
-            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag);
+            wake[e] = live[e] && e_state[e] == LqState::PARK && wake_on(e_why[e], e_fid[e], e_key[e], if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag, i_ptw_evt, pass_vpn(e_va[e], e_half[e]));
         }
     }
 
@@ -251,6 +269,7 @@ pub module lq::<CFG: core_cfg> (
         o_reissue.lq.wrap = e_wrap[rsel_q];
         o_reissue.lq.idx  = rsel_q;
         o_reissue.sq    = e_sqlim[rsel_q];
+        o_reissue.xexc  = e_xexc[rsel_q];
     }
 
     // ---- commit window ----
@@ -303,6 +322,7 @@ pub module lq::<CFG: core_cfg> (
                 e_seen1[e]  = 1'b0;
                 e_poison[e] = 1'b0;
                 e_half[e]   = 1'b0;
+                e_xexc[e]   = 0 as exc_pkg::ExcRec;
             }
         } else {
             head_q = head_nx;
@@ -349,6 +369,7 @@ pub module lq::<CFG: core_cfg> (
                         e_seen1[e]  = 1'b0;
                         e_poison[e] = 1'b0;
                         e_half[e]   = 1'b0;
+                        e_xexc[e]   = 0 as exc_pkg::ExcRec;
                     }
                 }
                 for p in 0..CFG::MEM_W {
@@ -372,7 +393,7 @@ pub module lq::<CFG: core_cfg> (
                         e_key[e] = i_verdict[p].sq_key;
                         e_va[e]  = i_verdict[p].va;
                         // An event of this cycle counts as after the verdict.
-                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag) {
+                        if i_verdict[p].state == LqState::PARK && wake_on(i_verdict[p].why, i_verdict[p].fill_id, i_verdict[p].sq_key, if e_half[e] ? e_line1[e] : e_line0[e], e_dw[e], e_ex[e].rob, i_mem_ev, i_std, i_sq_head, i_oldest.valid, i_oldest.tag, i_ptw_evt, pass_vpn(i_verdict[p].va, e_half[e])) {
                             e_state[e] = LqState::READY;
                         } else {
                             e_state[e] = i_verdict[p].state;
@@ -380,7 +401,14 @@ pub module lq::<CFG: core_cfg> (
                         if i_verdict[p].split_lo {
                             e_half[e] = 1'b1;
                         }
+                        // The pass consumed (or did not need) the walk's answer.
+                        e_xexc[e] = 0 as exc_pkg::ExcRec;
                     }
+                }
+                if i_ptw_resp.valid && i_ptw_resp.exc.valid && i_ptw_resp.tag.client == MemClient::LQ
+                    && i_ptw_resp.tag.id == {e_wrap[e], e as QIW} as MEMID_W && i_ptw_resp.tag.rob == e_ex[e].rob
+                    && live[e] {
+                    e_xexc[e] = i_ptw_resp.exc;
                 }
             }
             for p in 0..CFG::MEM_W {
@@ -396,12 +424,14 @@ pub module lq::<CFG: core_cfg> (
         var pk_busy: logic<CFG::MEM_W>;
         var pk_sq  : logic<CFG::MEM_W>;
         var pk_head: logic<CFG::MEM_W>;
+        var pk_x   : logic<CFG::MEM_W>;
         for p in 0..CFG::MEM_W {
             let pk: logic = i_verdict[p].valid && i_verdict[p].state == LqState::PARK;
             pk_fill[p] = pk && i_verdict[p].why == ParkWhy::FILL;
             pk_busy[p] = pk && i_verdict[p].why == ParkWhy::BUSY;
             pk_sq[p]   = pk && i_verdict[p].why == ParkWhy::SQ;
             pk_head[p] = pk && i_verdict[p].why == ParkWhy::HEAD;
+            pk_x[p]    = pk && i_verdict[p].why == ParkWhy::XLATE;
         }
         o_perf.poison_sta = sta_hit != '0;
         o_perf.poison_coh = coh_hit != '0;
@@ -409,6 +439,7 @@ pub module lq::<CFG: core_cfg> (
         o_perf.park_busy  = |pk_busy;
         o_perf.park_sq    = |pk_sq;
         o_perf.park_head  = |pk_head;
+        o_perf.park_xlate = |pk_x;
         o_perf.reissue    = i_reissue_gnt && rsel_v_q;
         o_perf.fence_ret  = i_bar_ret;
     }

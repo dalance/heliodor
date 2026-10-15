@@ -219,6 +219,7 @@ pub package core_types::<CFG: core_cfg> {
         tag      : RobTag        ,
         csr_addr : logic     <12>,
         csr_wdata: logic     <64>,
+        inv      : xlate_pkg::TlbInv, // SFENCE.VMA / SINVAL.VMA operands
     }
 
     // lq -> memory iq: a ld_barrier op retired; bar_ret is now seq.
@@ -1024,48 +1025,71 @@ pub package core_types::<CFG: core_cfg> {
 
     const MEMID_W: u32 = if LQ_TAG_W >: SQ_TAG_W ? (if LQ_TAG_W >: FTQ_TAG_W ? LQ_TAG_W : FTQ_TAG_W) : (if SQ_TAG_W >: FTQ_TAG_W ? SQ_TAG_W : FTQ_TAG_W);
 
-    // The only client and request class of this core build: the memory
-    // pipes' loads (stores reach the dcache through the sb drain).
-    enum MemClient: logic {
+    // LQ and SQ: the memory pipes' passes; PTW_D, PTW_I: PTE reads of the D
+    // and I walkers; AD: their A/D writes; IFU: the owner tag of an I-side
+    // walk request.
+    enum MemClient: logic<3> {
         LQ,
+        SQ,
+        PTW_D,
+        PTW_I,
+        AD,
+        IFU,
     }
 
-    enum MemCls: logic {
+    enum MemCls: logic<2> {
         LOAD, // one line, up to two adjacent dwords
+        PTW_READ, // one PTE, folded like LOAD
+        STORE_WT, // A/D write of a walker
     }
 
     enum RespKind: logic<2> {
         HIT,
         MISS,
         RETRY,
+        PENDING,
     }
 
-    enum RetryReason: logic<2> {
+    enum RetryReason: logic<3> {
         FILL_BUSY,
         INV_RACE,
         PREEMPTED,
+        WB_BLOCKED,
         BANK_CONFLICT,
     }
 
-    enum EvKind: logic<2> {
+    enum EvKind: logic<3> {
         FILL_START,
         FILL_CRIT,
         FILL_DONE,
         FILL_ABORT,
+        WT_DONE,
     }
 
     struct MemTag {
-        client: MemClient       ,
+        client: MemClient         ,
         id    : logic    <MEMID_W>, // the requester's queue tag, zero-extended
-        rob   : RobTag          , // the owner op
+        rob_v : logic             , // rob names the owner op; walker requests have none and are never killed
+        rob   : RobTag            ,
     }
 
     struct MemReq {
-        tag : MemTag     ,
-        cls : MemCls     ,
-        pa  : pma_pkg::Pa,
-        mask: logic <16> , // bytes of dwords pa[5:3] and pa[5:3]+1, inside one line
+        tag  : MemTag          ,
+        cls  : MemCls          ,
+        pa   : pma_pkg::Pa     ,
+        mask : logic   <16>    , // bytes of dwords pa[5:3] and pa[5:3]+1, inside one line
+        wdata: logic   <128>   ,
+        attr : pma_pkg::PmaAttr,
     }
+
+    // Non-pipe clients of memory port 0 (mem_port_arb reserves an empty slot
+    // of pipe 0 for them): the D and I walkers. A client is granted in the
+    // select cycle and presents its request when the slot reaches m2, so its
+    // response comes NP_RESP_LAT cycles after the grant.
+    const NP_N       : u32 = 2;
+    const NP_PTW_D   : u32 = 0;
+    const NP_PTW_I   : u32 = 1;
+    const NP_RESP_LAT: u32 = 3 + fu_pkg::RESP_LAT;
 
     // Exactly RESP_LAT cycles after accept, one per accepted request.
     struct MemResp {
@@ -1087,6 +1111,39 @@ pub package core_types::<CFG: core_cfg> {
         data   : logic <64> ,
     }
 
+    // ---- Translation ----
+
+    // valid qualifies a tlb lookup; the ptw request handshake has its own
+    // valid. nonspec: the D bit may be set (the op holds the oldest token).
+    struct XlateReq {
+        valid  : logic             ,
+        tag    : MemTag            ,
+        va     : logic         <64>,
+        acc    : xlate_pkg::AccKind,
+        hlv    : logic             ,
+        hlvx   : logic             ,
+        nonspec: logic             ,
+    }
+
+    // hit: the translation is resolved (from ptw always 1). need_d: a
+    // store/AMO hit a W = 1, D = 0 page under ADUE, the PA is not final.
+    struct XlateResp {
+        valid : logic           ,
+        tag   : MemTag          ,
+        hit   : logic           ,
+        pa    : pma_pkg::Pa     ,
+        pma   : pma_pkg::PmaAttr,
+        exc   : exc_pkg::ExcRec ,
+        need_d: logic           ,
+    }
+
+    // Broadcast on every walk completion, fault or not.
+    struct PtwEvent {
+        valid: logic            ,
+        key  : xlate_pkg::PtwKey,
+        fault: logic            ,
+    }
+
     // ---- LSU ----
 
     enum LqState: logic<3> {
@@ -1097,11 +1154,12 @@ pub package core_types::<CFG: core_cfg> {
         DONE,
     }
 
-    enum ParkWhy: logic<2> {
+    enum ParkWhy: logic<3> {
         FILL,
         BUSY,
         SQ,
         HEAD,
+        XLATE, // a walk of the pass's page: woken by the PtwEvent of its key
     }
 
     // A memory op as the LSU modules use it, decoded from {fu, uop} by mem_op.
@@ -1132,6 +1190,7 @@ pub package core_types::<CFG: core_cfg> {
         half : logic       , // the hi-line pass of a line-crossing access
         lq   : LqTag       ,
         sq   : SqTag       ,
+        xexc : exc_pkg::ExcRec, // the fault of this pass's walk, answered to the op as its owner
     }
 
     // m2 query of the PA-keyed forwarding network (one line, dwords dw..dw+1).
@@ -1163,6 +1222,8 @@ pub package core_types::<CFG: core_cfg> {
         dw    : logic       <3> ,
         mask  : logic       <16>,
         exc   : exc_pkg::ExcRec ,
+        xmiss : logic           , // the pass missed the DTLB: only va and half are meaningful
+        xpark : logic           , // xmiss and the walk request was taken: wait for its PtwEvent
     }
 
     // Store data write: the store's bytes placed in the 16-byte window of its
@@ -1216,6 +1277,7 @@ pub package core_types::<CFG: core_cfg> {
         fwd_part : logic,
         fwd_wait : logic,
         split    : logic, // a line-crossing pass
+        xmiss    : logic, // a pass missed the DTLB
         fault    : logic,
         hit      : logic,
         miss     : logic,
@@ -1229,12 +1291,14 @@ pub package core_types::<CFG: core_cfg> {
         park_busy : logic,
         park_sq   : logic,
         park_head : logic,
+        park_xlate: logic,
         reissue   : logic,
         fence_ret : logic,
     }
 
     struct SqPerf {
         sta     : logic,
+        xpark   : logic, // a store pass parked on a walk
         reissue : logic,
         retire  : logic,
         fwd_wait: logic,
@@ -1252,6 +1316,7 @@ pub package core_types::<CFG: core_cfg> {
         lq_win: logic,
         sq_win: logic,
         lq_blk: logic, // an LQ request lost or waited for its WB slot
+        np_win: logic, // a non-pipe client took port 0's slot
     }
 
     struct AdapterPerf {
@@ -1276,6 +1341,7 @@ pub package core_types::<CFG: core_cfg> {
         fbq_full      : logic   , // ifu
         ftq_empty_idle: logic   ,
         fault_stall   : logic   ,
+        xlate_wait    : logic   , // a fetch walk is pending
         ic_miss       : logic   , // icache
         ic_fill_busy  : logic   ,
         cut_block_end : logic   , // extract
@@ -1298,6 +1364,10 @@ pub package core_types::<CFG: core_cfg> {
         sb   : SbPerf                           ,
         arb  : ArbPerf                          ,
         ad   : AdapterPerf                      ,
+        dtlb : xlate_pkg::TlbPerf               ,
+        itlb : xlate_pkg::TlbPerf               ,
+        ptw_d: xlate_pkg::PtwPerf               ,
+        ptw_i: xlate_pkg::PtwPerf               ,
         rob  : RobPerf                          ,
         cm   : CmPerf                           ,
         flush: FlushPerf                        ,
@@ -1323,6 +1393,10 @@ pub package core_types::<CFG: core_cfg> {
         sq     : logic<4>                  ,
         sb     : logic<2>                  ,
         ad     : logic<3>                  ,
+        dtlb   : logic<2>                  ,
+        itlb   : logic<2>                  ,
+        ptw_d  : logic<4>                  ,
+        ptw_i  : logic<4>                  ,
         rob    : logic<CHK_ROB_W>          ,
         cm     : logic<CHK_CM_W>           ,
         flush  : logic<CHK_FLUSH_W>        ,
