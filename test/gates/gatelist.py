@@ -3,7 +3,7 @@
 A gate list (test/gates/<milestone>.list) holds one test per line:
 
     <suite>/<name> [budget=<cycles>] [hex=<path>] [tohost=<word index>]
-                   [mtime=off|instret] [lockstep=1|0]
+                   [mtime=off|instret] [lockstep=1|0] [irq=<mask>]
 
 `#` starts a comment. The defaults follow the riscv-tests layout: the image is
 test/riscv-arch-test/build/<suite>/<name>.hex, tohost is word 1024 (PA
@@ -13,7 +13,8 @@ the generated tests stop early once tohost is written.
 mtime=instret ticks mtime once per 10 retired records on both the golden and
 the new core, so a test that reads `time` stays comparable. lockstep=0 marks
 a test judged by pass/fail only: it gets no golden artifact and the new-core
-wrapper never compares its trace.
+wrapper never compares its trace. irq=<mask> pulses those PLIC sources once
+early in the run (new core only; such a test must be lockstep=0).
 """
 
 import re
@@ -36,6 +37,7 @@ class Entry:
     tohost: int
     mtime: str = "off"
     lockstep: bool = True
+    irq: int = 0
 
     @property
     def key(self) -> str:
@@ -69,7 +71,7 @@ def parse(path) -> list:
             if "=" not in f:
                 raise ValueError(f"{where}: expected key=value, got {f!r}")
             k, v = f.split("=", 1)
-            if k not in ("budget", "hex", "tohost", "mtime", "lockstep"):
+            if k not in ("budget", "hex", "tohost", "mtime", "lockstep", "irq"):
                 raise ValueError(f"{where}: unknown option {k!r}")
             opts[k] = v
         if opts.get("mtime", "off") not in ("off", "instret"):
@@ -87,7 +89,10 @@ def parse(path) -> list:
             tohost=int(opts.get("tohost", str(DEFAULT_TOHOST)), 0),
             mtime=opts.get("mtime", "off"),
             lockstep=opts.get("lockstep", "1") == "1",
+            irq=int(opts.get("irq", "0"), 0),
         )
+        if e.irq and e.lockstep:
+            raise ValueError(f"{where}: irq needs lockstep=0")
         if e.key in seen:
             raise ValueError(f"{where}: duplicate entry {e.key}")
         seen.add(e.key)

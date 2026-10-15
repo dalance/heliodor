@@ -1,0 +1,141 @@
+// chk_io_mon: exactly-once check of one hart's IO accesses (CLINT, PLIC,
+// UART), observation only.
+//
+// Ports (timing contract):
+//   i_obs[2]        : the SoC's device-side accesses of this cycle ([0] read,
+//                     [1] write), for this hart only
+//   i_retire[LANES] : the hart's registered retire records; only records
+//                     with mem_io to an io_ordered region of PMA_REGIONS
+//                     count (an IO page in DRAM reaches no device)
+//   i_end           : the run's terminal record is in this cycle
+//   o_chk           : sticky flags, bit CHK_*
+//   o_rd_n, o_wr_n  : device reads and writes seen so far
+// Owns:
+//   - An IO op starts only with the oldest token and an IO store is
+//     non-posted, so at most one device access is unmatched at a time and it
+//     always precedes its record. The access is held until the next record
+//     with mem_io, which must have the same direction and address and, for a
+//     store, the same bytes. DUP: a second access arrives while one is held.
+//     MISSING: an IO record finds nothing held (also the reversed order).
+//     DIFF: the held access does not match the record. ORPHAN: an access is
+//     still held at the end of the run (wrong path or killed).
+module chk_io_mon #(
+    param LANES      : u32                        = 2,
+    param PMA_N      : u32                        = 1,
+    param PMA_REGIONS: pma_pkg::PmaRegion [PMA_N] = '{
+        default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
+    },
+) (
+    clk     : input  clock                            ,
+    rst     : input  reset                            ,
+    i_obs   : input  soc_pkg::IoObs            [2]    ,
+    i_retire: input  retire_pkg::RetireRec     [LANES],
+    i_end   : input  logic                            ,
+    o_chk   : output logic                <4>         ,
+    o_rd_n  : output logic                <32>        ,
+    o_wr_n  : output logic                <32>        ,
+) {
+    const CHK_DUP    : u32 = 0;
+    const CHK_MISSING: u32 = 1;
+    const CHK_DIFF   : u32 = 2;
+    const CHK_ORPHAN : u32 = 3;
+
+    var held_v: logic             ;
+    var held  : soc_pkg::IoObs    ;
+    var chk_q : logic         <4> ;
+    var rd_n  : logic         <32>;
+    var wr_n  : logic         <32>;
+
+    var rec_io: logic [LANES];
+    for l in 0..LANES :g_io {
+        let attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(i_retire[l].mem_paddr[55:0], PMA_REGIONS);
+        assign rec_io[l] = i_retire[l].valid && !i_retire[l].trap && i_retire[l].mem_io && attr.io_ordered;
+    }
+
+    var rec_n: logic                <3>;
+    var rec  : retire_pkg::RetireRec   ;
+    always_comb {
+        rec_n = 3'd0;
+        rec   = i_retire[0];
+        for l in 0..LANES {
+            if rec_io[l] {
+                if rec_n == 3'd0 {
+                    rec = i_retire[l];
+                }
+                rec_n += 3'd1;
+            }
+        }
+    }
+
+    // A store's bytes in the 8-byte lane of its address.
+    let rec_w   : logic     = rec.mem_wmask != 16'd0;
+    let rec_strb: logic<8>  = rec.mem_wmask[7:0] << rec.mem_paddr[2:0];
+    let rec_data: logic<64> = rec.mem_wdata << {rec.mem_paddr[2:0], 3'd0};
+    var byte_ok : logic    ;
+    always_comb {
+        byte_ok = 1'b1;
+        for b in 0..8 {
+            if held.strb[b] && held.data[b step 8] != rec_data[b step 8] {
+                byte_ok = 1'b0;
+            }
+        }
+    }
+    let agree: logic = held.write == rec_w && held.addr[63:3] == rec.mem_paddr[63:3]
+        && (if rec_w ? held.strb == rec_strb && byte_ok : held.addr[2:0] == rec.mem_paddr[2:0]);
+
+    let matched: logic    = rec_n != 3'd0 && held_v;
+    let left_v : logic    = held_v && !matched;
+    let new_n  : logic<2> = {1'b0, i_obs[0].valid} + {1'b0, i_obs[1].valid};
+
+    var e: logic<4>;
+    always_comb {
+        e              = 4'd0;
+        e[CHK_DUP]     = new_n != 2'd0 && (left_v || new_n == 2'd2);
+        e[CHK_MISSING] = (rec_n != 3'd0 && !held_v) || rec_n >: 3'd1;
+        e[CHK_DIFF]    = matched && !agree;
+        e[CHK_ORPHAN]  = i_end && left_v;
+    }
+
+    always_ff {
+        if_reset {
+            held_v = 1'b0;
+            held   = '0;
+            chk_q  = 4'd0;
+            rd_n   = 32'd0;
+            wr_n   = 32'd0;
+        } else {
+            chk_q = chk_q | e;
+            rd_n  = rd_n + {31'd0, i_obs[0].valid};
+            wr_n  = wr_n + {31'd0, i_obs[1].valid};
+            if i_obs[1].valid {
+                held_v = 1'b1;
+                held   = i_obs[1];
+            } else if i_obs[0].valid {
+                held_v = 1'b1;
+                held   = i_obs[0];
+            } else if matched {
+                held_v = 1'b0;
+            }
+            if e != 4'd0 && chk_q == 4'd0 {
+                $display(
+                    "chk_io_mon: flags=%b held=%b w=%b addr=%h data=%h strb=%h rec_n=%d pc=%h paddr=%h wmask=%h wdata=%h",
+                    e,
+                    held_v,
+                    held.write,
+                    held.addr,
+                    held.data,
+                    held.strb,
+                    rec_n,
+                    rec.pc,
+                    rec.mem_paddr,
+                    rec.mem_wmask,
+                    rec.mem_wdata,
+                );
+            }
+        }
+    }
+
+    assign o_chk  = chk_q;
+    assign o_rd_n = rd_n;
+    assign o_wr_n = wr_n;
+}
