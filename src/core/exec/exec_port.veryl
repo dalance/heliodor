@@ -1,8 +1,8 @@
 // exec_port: one exec issue port P: issue register, register read with
-// bypass, the FU set PORT_FU[P], the port's WB packet and wake lane. The FU
-// kinds built here are ALU, BRU, SYS, MUL and DIV; a config that puts any
-// other kind on an exec port is rejected by CFG_ERR bit 11, so every op a
-// grant can carry has its FU. DIV is the only blocking kind.
+// bypass, the FU set PORT_FU[P], the port's WB packet and wake lane. Every
+// exec kind (ALU, BRU, SYS, MUL, DIV, FMA, FMISC, FDIV) is built here when
+// the port carries it; CFG_ERR bit 11 keeps the memory kinds off exec ports
+// and bit 18 leaves at most one blocking kind (DIV or FDIV) per port.
 //
 // Ports (timing contract):
 //   i_grant          : the iq grant of select cycle S (combinational)
@@ -21,6 +21,8 @@
 //                      tag (aligned block base and the block's prediction)
 //   o_csr_raddr/i_csr_rdata/i_tok/o_started/o_sys : SYS port,
 //                      see fu_sys
+//   i_frm            : csr's frm, live; the FP units resolve rm DYN with it
+//                      in A (frm changes only at a flushing retire)
 //   i_kill           : applied at every capture edge (issue register, FU
 //                      stages, wake line, blocking FU)
 //   o_perf           : combinational event in A: a read source took a bypass
@@ -63,8 +65,9 @@ pub module exec_port::<CFG: core_cfg> #(
     i_tok      : input  core_types::<CFG>::TagTok                                   ,
     o_started  : output logic                                                       ,
     o_sys      : output core_types::<CFG>::SysPending                               ,
+    i_frm      : input  logic                        <3>                            ,
     o_perf     : output logic                                                       ,
-    o_chk      : output logic                        <4>                            , // {wake without its WB, WB to int pdst 0, blocking FU issued while busy, two FU results}
+    o_chk      : output logic                        <4>                            , // {wake without its WB, WB to int pdst 0, blocking FU issued while busy or FDIV leaf out of turn, two FU results}
 ) {
     import core_types::<CFG>::*;
     import opclass_pkg::*;
@@ -136,14 +139,21 @@ pub module exec_port::<CFG: core_cfg> #(
 
     // ---- FU set ----
 
-    var wb_alu : WbPacket;
-    var wb_bru : WbPacket;
-    var wb_sys : WbPacket;
-    var wb_mul : WbPacket;
-    var wb_div : WbPacket;
-    var div_rdy: logic   ;
-    var div_hf : logic   ;
-    var div_tag: ExTag   ;
+    var wb_alu : WbPacket   ;
+    var wb_bru : WbPacket   ;
+    var wb_sys : WbPacket   ;
+    var wb_mul : WbPacket   ;
+    var wb_div : WbPacket   ;
+    var div_rdy: logic      ;
+    var div_hf : logic      ;
+    var div_tag: ExTag      ;
+    var wb_fma : WbPacket   ;
+    var wb_fmi : WbPacket   ;
+    var wb_fdv : WbPacket   ;
+    var fdv_rdy: logic      ;
+    var fdv_hf : logic      ;
+    var fdv_tag: ExTag      ;
+    var fdv_chk: logic   <2>;
 
     if FS[FuKind::ALU] :g_alu {
         inst u_alu: fu_alu::<CFG> (
@@ -250,14 +260,82 @@ pub module exec_port::<CFG: core_cfg> #(
         assign div_tag = 0 as ExTag;
     }
 
-    assign o_hf_req = div_hf;
+    if FS[FuKind::FMA] :g_fma {
+        inst u_fma: fu_fma::<CFG> (
+            clk                                    ,
+            rst                                    ,
+            i_valid: fu_v(st_v, st.fu, FuKind::FMA),
+            i_op   : st.cold.uop as fpu_pkg::FpuOp ,
+            i_tag  : st.tag                        ,
+            i_src  : val                           ,
+            i_rm   : st.cold.rm                    ,
+            i_frm                                  ,
+            i_kill                                 ,
+            o_ready: _                             ,
+            o_wb   : wb_fma                        ,
+        );
+    } else {
+        assign wb_fma = 0 as WbPacket;
+    }
+
+    if FS[FuKind::FMISC] :g_fmisc {
+        inst u_fmisc: fu_fmisc::<CFG> (
+            clk                                      ,
+            rst                                      ,
+            i_valid: fu_v(st_v, st.fu, FuKind::FMISC),
+            i_op   : st.cold.uop as fpu_pkg::FpuOp   ,
+            i_tag  : st.tag                          ,
+            i_src  : rs                              ,
+            i_imm  : st.cold.imm                     ,
+            i_rm   : st.cold.rm                      ,
+            i_frm                                    ,
+            i_kill                                   ,
+            o_ready: _                               ,
+            o_wb   : wb_fmi                          ,
+        );
+    } else {
+        assign wb_fmi = 0 as WbPacket;
+    }
+
+    if FS[FuKind::FDIV] :g_fdiv {
+        inst u_fdiv: fu_fdiv::<CFG> (
+            clk                                        ,
+            rst                                        ,
+            i_valid   : fu_v(st_v, st.fu, FuKind::FDIV),
+            i_op      : st.cold.uop as fpu_pkg::FpuOp  ,
+            i_tag     : st.tag                         ,
+            i_src     : rs                             ,
+            i_rm      : st.cold.rm                     ,
+            i_frm                                      ,
+            i_kill                                     ,
+            o_ready   : fdv_rdy                        ,
+            o_hf_req  : fdv_hf                         ,
+            o_hf_tag  : fdv_tag                        ,
+            i_wb_grant: i_hf_grant                     ,
+            o_wb      : wb_fdv                         ,
+            o_perf    : _                              ,
+            o_chk     : fdv_chk                        ,
+        );
+    } else {
+        assign wb_fdv  = 0 as WbPacket;
+        assign fdv_rdy = 1'b1;
+        assign fdv_hf  = 1'b0;
+        assign fdv_tag = 0 as ExTag;
+        assign fdv_chk = 0;
+    }
+
+    // At most one blocking FU per port (CFG_ERR bit 18), so the unbuilt one's
+    // request and tag are constant 0 and the merges are plain ORs.
+    let hf_tag: ExTag = (div_tag | fdv_tag) as ExTag;
+    assign o_hf_req = div_hf | fdv_hf;
 
     // A blocking FU is busy until its registered ready returns, and also
     // while the issue register holds an op for it (ready drops only after
     // accept).
     always_comb {
-        o_fu_busy              = 0;
-        o_fu_busy[FuKind::DIV] = !div_rdy || fu_v(st_v, st.fu, FuKind::DIV);
+        o_fu_busy               = 0;
+        o_fu_busy[FuKind::DIV]  = !div_rdy || fu_v(st_v, st.fu, FuKind::DIV);
+        o_fu_busy[FuKind::FDIV] = !fdv_rdy || fu_v(st_v, st.fu, FuKind::FDIV);
     }
 
     // ---- WB packet ----
@@ -268,9 +346,12 @@ pub module exec_port::<CFG: core_cfg> #(
         return if p.valid ? p : 0 as WbPacket;
     }
 
-    let wb_any: logic<5> = {wb_div.valid, wb_mul.valid, wb_sys.valid, wb_bru.valid, wb_alu.valid};
+    let wb_any: logic<8> = {
+        wb_fdv.valid, wb_fmi.valid, wb_fma.valid, wb_div.valid, wb_mul.valid, wb_sys.valid, wb_bru.valid, wb_alu.valid
+    };
     always_comb {
-        o_wb = (keep_v(wb_alu) | keep_v(wb_bru) | keep_v(wb_sys) | keep_v(wb_mul) | keep_v(wb_div)) as WbPacket;
+        o_wb = (keep_v(wb_alu) | keep_v(wb_bru) | keep_v(wb_sys) | keep_v(wb_mul) | keep_v(wb_div) | keep_v(wb_fma)
+            | keep_v(wb_fmi) | keep_v(wb_fdv)) as WbPacket;
     }
 
     // ---- Wake lane ----
@@ -293,9 +374,9 @@ pub module exec_port::<CFG: core_cfg> #(
         push_s.pdst  = i_grant.tag.pdst;
         push_s.rob   = i_grant.tag.rob;
         dly_s        = (lat(i_grant.fu) - 1) as WbOff;
-        push_h.valid = i_hf_grant.valid && div_tag.has_rd;
-        push_h.pdst  = div_tag.pdst;
-        push_h.rob   = div_tag.rob;
+        push_h.valid = i_hf_grant.valid && hf_tag.has_rd;
+        push_h.pdst  = hf_tag.pdst;
+        push_h.rob   = hf_tag.rob;
         dly_h        = i_hf_grant.off - WAKE_LEAD;
     }
 
@@ -376,7 +457,8 @@ pub module exec_port::<CFG: core_cfg> #(
                 if (wb_any & (wb_any - 1)) != 0 {
                     chk_q[0] = 1'b1;
                 }
-                if fu_v(st_v, st.fu, FuKind::DIV) && !div_rdy {
+                if (fu_v(st_v, st.fu, FuKind::DIV) && !div_rdy) || (fu_v(st_v, st.fu, FuKind::FDIV) && !fdv_rdy)
+                    || fdv_chk != 0 {
                     chk_q[1] = 1'b1;
                 }
                 if o_wb.valid && o_wb.tag.has_rd && o_wb.tag.pdst.cls == RegClass::INT && o_wb.tag.pdst.idx == 0 {
