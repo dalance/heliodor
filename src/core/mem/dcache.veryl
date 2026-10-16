@@ -1,0 +1,1077 @@
+// dcache: the L1 data cache of the core: MEM_W request ports with a tag
+// lookup each (dcache_tags), DC_NB dword-interleaved data banks
+// (dcache_data), a line-granular MSHR file with one fill context
+// (dcache_mshr), the sb drain port, and the coherence side (probe,
+// invalidates, departures, writeback buffer) towards mem_ctrl.
+//
+// Ports (timing contract):
+//   i_req_valid[p], i_req[p] : cycle A; o_req_ready is the constant 1
+//   i_np_valid[k], i_np_req[k] : cycle A, the non-pipe client k on the HEAD
+//                     port, whose pipe mem_port_arb kept empty that cycle; its
+//                     response comes on that port and clients filter it by
+//                     MemTag.client
+//   o_resp[p]       : registered, RESP_LAT = 2 cycles after A, one per request
+//   o_evt           : registered, at most one per cycle, built from the state
+//                     of the previous cycle (UNC_DONE and WT_DONE: two or
+//                     more); an event in the cycle of a response counts as
+//                     after it, and no event precedes the response it ends
+//   i_drain_*       : the sb head line, held until o_drain_ack, which is
+//                     combinational; the line is written (or written through)
+//                     on the ack edge
+//   i_inv*, i_probe_* : this cycle's invalidates and recall probe (held until
+//                     o_probe_ack, or until the writeback it causes)
+//   o_ev1/ev2       : this cycle's local departures of a line (victim, probe,
+//                     write-through drain of the own copy)
+//   o_memr_*, o_memw_*, i_fill_excl : the mem_ctrl read slot and write
+//                     channel, unchanged from the reused dcache
+//   i_kill          : applied in the decision cycle to a request whose
+//                     MemTag.rob is valid
+//   o_perf          : combinational event wires
+//   o_chk           : sticky checker flags (HELIODOR_CHK only, else 0), see
+//                     chk_dcache
+// Owns:
+//   - a read of class LOAD, PTW_READ or LOAD_EXCL looks up its tag in A and
+//     reads the banks of its dwords in A; in V = A + 1 it is decided by the
+//     first matching row, registered and answered in A + 2:
+//       1 killed -> RETRY(PREEMPTED)
+//       2 an invalidate or departure of its line in A or V -> RETRY(INV_RACE)
+//       3 hit (LOAD_EXCL: owned) -> HIT, or RETRY(PREEMPTED) if a writeback
+//         capture took the banks in A, or RETRY(BANK_CONFLICT) if an older
+//         request of another port took a bank on another row
+//       4 an MSHR entry holds its line -> HIT from the critical-dword buffer
+//         (a 1-dword LOAD/PTW_READ of the arrived critical dword), else
+//         MISS(the entry's fill id)
+//       5 an entry holds another line of its set, or no entry is free ->
+//         RETRY(FILL_BUSY)
+//       6 MISS(new fill id): it allocates (the oldest of the cycle; the drain
+//         when urgent or alone) or attaches to the line allocated this cycle
+//   - STORE_EXCL is decided in A: owned hit -> EXCL_PASS (merged on this
+//     edge), not owned or an invalidate/unpinned probe of the line ->
+//     EXCL_FAIL, a bank or set taken by a fill -> RETRY(BANK_CONFLICT)
+//   - UNC_READ and STORE_WT answer PENDING(id) and CMO answers HIT; each
+//     holds the single nf slot until the uncached read is granted (UNC_DONE),
+//     the write fires (WT_DONE), or the line is in neither the arrays nor
+//     the writeback buffer; a request finding the slot held gets
+//     RETRY(BANK_CONFLICT)
+//   - a data bank serves one row per cycle: requests on the same row share
+//     it, otherwise the oldest wins; a writeback capture reads every bank
+//   - a bank takes one write per cycle: the fill beat, else the exclusive or
+//     write-through merge, else the drain merge; each lower writer waits
+//     for the cycle (the drain is not acked)
+//   - the fill victim is chosen and dropped at launch from registered state
+//     (a matching S copy is upgraded in place); a dirty victim goes to the
+//     writeback buffer in that cycle; a clean departure raises ev1
+//   - the drain merges into an owned line, writes a full line through and
+//     drops the own copy, or allocates a read for ownership
+//   - a waiter is bound to its fill when it is answered MISS(id) (at the
+//     allocation or by the line of a live entry); every event and the
+//     critical dword come from the entry's registers, and only a request of
+//     exactly the critical dword is served from the critical-dword buffer
+// Rationale:
+//   - one tag lookup per access, in A, keeps a single delivery path for hit
+//     and miss; V only re-checks the line against this cycle's events
+//   - the victim is dropped at launch, so no way of a set in fill holds a
+//     tag over half-written data and every other way stays hit-safe
+//   - the drain waits only for the bank of this cycle's fill beat, a launch
+//     in its set, or a probe of its line, never for a whole fill
+//   - the file is over the 600-line guideline: the per-cycle decisions of
+//     the ports, the allocation, the launch, the drain, the probe and the
+//     write channel read each other's terms; splitting them further would
+//     only export those terms as ports
+pub module dcache::<CFG: core_cfg> #(
+    param INDEX_W: u32 = 6,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill,
+
+    i_req_valid: input  logic                        [CFG::MEM_W]             ,
+    i_req      : input  core_types::<CFG>::MemReq    [CFG::MEM_W]             ,
+    i_np_valid : input  logic                        [core_types::<CFG>::NP_N],
+    i_np_req   : input  core_types::<CFG>::MemReq    [core_types::<CFG>::NP_N],
+    o_req_ready: output logic                        [CFG::MEM_W]             ,
+    o_resp     : output core_types::<CFG>::MemResp   [CFG::MEM_W]             ,
+    o_evt      : output core_types::<CFG>::MemEvent                           ,
+
+    i_drain_v     : input  logic        ,
+    i_drain_addr  : input  logic<64>    ,
+    i_drain_data  : input  logic<64> [8],
+    i_drain_strb  : input  logic<8>  [8],
+    i_drain_urgent: input  logic        ,
+    o_drain_ack   : output logic        ,
+
+    i_inv_v     : input  logic    ,
+    i_inv_addr  : input  logic<64>,
+    i_inv2_v    : input  logic    ,
+    i_inv2_addr : input  logic<64>,
+    i_probe_v   : input  logic    ,
+    i_probe_addr: input  logic<64>,
+    i_probe_self: input  logic    ,
+    o_probe_ack : output logic    ,
+    o_ev1_v     : output logic    ,
+    o_ev1_addr  : output logic<64>,
+    o_ev2_v     : output logic    ,
+    o_ev2_addr  : output logic<64>,
+
+    o_memr_addr : output logic<64>,
+    o_memr_ren  : output logic    ,
+    o_memr_rfo  : output logic    ,
+    o_memr_line : output logic    ,
+    o_memr_req  : output logic    ,
+    i_memr_grant: input  logic    ,
+    i_mem_rdata : input  logic<64>,
+    i_fill_excl : input  logic    ,
+
+    o_memw_addr : output logic<64>    ,
+    o_memw_wdata: output logic<64> [8],
+    o_memw_wstrb: output logic<8>  [8],
+    o_memw_wen  : output logic        ,
+    o_memw_wb   : output logic        ,
+    o_memw_req  : output logic        ,
+    i_memw_grant: input  logic        ,
+
+    o_chk: output logic<core_types::<CFG>::CHK_DC_W>,
+
+    o_perf: output core_types::<CFG>::DcachePerf,
+) {
+    import core_types::<CFG>::*;
+
+    const MW   : u32 = CFG::MEM_W;
+    const NB   : u32 = CFG::DC_NB;
+    const BW   : u32 = $clog2(NB);
+    const SETS : u32 = 1 << INDEX_W;
+    const TAG_W: u32 = 50 - INDEX_W;
+    const LK_N : u32 = MW + 1; // the ports, then the write side (WT or drain)
+    const PW   : u32 = tag_pkg::idx_w(MW);
+    const CL_W : u32 = $bits(MemClient);
+
+    function bank_of (
+        o: input logic<3>,
+    ) -> logic<BW> {
+        return o[BW - 1:0];
+    }
+    function plru_way (
+        t: input logic<3>,
+    ) -> logic<2> {
+        return {t[2], if t[2] ? t[0] : t[1]};
+    }
+    function set_of (
+        l: input logic<50>,
+    ) -> logic<INDEX_W> {
+        return l[INDEX_W - 1:0];
+    }
+    function tag_of (
+        l: input logic<50>,
+    ) -> logic<TAG_W> {
+        return l[49:INDEX_W];
+    }
+    function enc4 (
+        h: input logic<4>,
+    ) -> logic<2> {
+        return tree_onehot_enc::<4, 2>(h);
+    }
+
+    // ---- line state ----
+
+    // Readers of the line state: the ports, then inv, inv2, the probe, the
+    // victim and the write side (the slot's WT, else the drain).
+    const TC_N : u32 = MW + 5;
+    const TC_I1: u32 = MW;
+    const TC_I2: u32 = MW + 1;
+    const TC_P : u32 = MW + 2;
+    const TC_V : u32 = MW + 3;
+    const TC_W : u32 = MW + 4;
+    var tc_ln   : logic<50>    [TC_N]   ;
+    var tc_hv   : logic<4>     [TC_N]   ;
+    var tc_valid: logic<4>     [TC_N]   ;
+    var tc_excl : logic<4>     [TC_N]   ;
+    var tc_dirty: logic<4>     [TC_N]   ;
+    var tc_plru : logic<3>     [TC_N]   ;
+    var tc_tag  : logic<TAG_W> [TC_N, 4];
+
+    var inst_v : logic;
+    var inst_ok: logic;
+
+    var fill_v    : logic         ;
+    var fill_set  : logic<INDEX_W>;
+    var fill_line : logic<50>     ;
+    var fill_way  : logic<2>      ;
+    var fill_dw   : logic<3>      ;
+    var fill_last : logic         ;
+    var fill_abort: logic         ;
+
+    // ---- requests in A ----
+
+    var np_vv : logic<NP_N>;
+    always_comb {
+        for k in 0..NP_N {
+            np_vv[k] = i_np_valid[k];
+        }
+    }
+    let np_oh : logic<NP_N> = tree_first::<NP_N>(np_vv);
+    let np_any: logic       = np_oh != '0;
+
+    var a_v   : logic     [MW];
+    var a_np  : logic     [MW];
+    var a_q   : MemReq    [MW];
+    var a_line: logic<50> [MW];
+    var a_dw  : logic<3>  [MW];
+    var a_two : logic     [MW];
+    var a_rd  : logic     [MW]; // LOAD, PTW_READ, LOAD_EXCL
+    var a_rob : logic<ROB_TAG_W> [MW];
+    var np_q  : MemReq;
+    always_comb {
+        var pa: pma_pkg::Pa       [NP_N];
+        var mk: logic<16>         [NP_N];
+        var wd: logic<128>        [NP_N];
+        var cl: logic<3>          [NP_N];
+        var ct: logic<CL_W>       [NP_N];
+        var id: logic<MEMID_W>    [NP_N];
+        var rv: logic             [NP_N];
+        var rb: logic<ROB_TAG_W>  [NP_N];
+        for k in 0..NP_N {
+            pa[k] = i_np_req[k].pa;
+            mk[k] = i_np_req[k].mask;
+            wd[k] = i_np_req[k].wdata;
+            cl[k] = i_np_req[k].cls;
+            ct[k] = i_np_req[k].tag.client;
+            id[k] = i_np_req[k].tag.id;
+            rv[k] = i_np_req[k].tag.rob_v;
+            rb[k] = {i_np_req[k].tag.rob.wrap, i_np_req[k].tag.rob.idx};
+        }
+        let rob: logic<ROB_TAG_W> = tree_onehot_mux::<NP_N, ROB_TAG_W>(np_oh, rb);
+        np_q            = i_np_req[0];
+        np_q.pa         = tree_onehot_mux::<NP_N, 56>(np_oh, pa);
+        np_q.mask       = tree_onehot_mux::<NP_N, 16>(np_oh, mk);
+        np_q.wdata      = tree_onehot_mux::<NP_N, 128>(np_oh, wd);
+        np_q.cls        = tree_onehot_mux::<NP_N, 3>(np_oh, cl) as MemCls;
+        np_q.tag.client = tree_onehot_mux::<NP_N, CL_W>(np_oh, ct) as MemClient;
+        np_q.tag.id     = tree_onehot_mux::<NP_N, MEMID_W>(np_oh, id);
+        np_q.tag.rob_v  = tree_onehot_mux::<NP_N, 1>(np_oh, rv);
+        np_q.tag.rob.wrap = rob[ROB_TAG_W - 1];
+        np_q.tag.rob.idx  = rob[ROB_TAG_W - 2:0];
+    }
+    always_comb {
+        for p in 0..MW {
+            if p == HEAD_PORT {
+                a_v[p]  = i_req_valid[p] || np_any;
+                a_np[p] = np_any;
+                a_q[p]  = if np_any ? np_q : i_req[p];
+            } else {
+                a_v[p]  = i_req_valid[p];
+                a_np[p] = 1'b0;
+                a_q[p]  = i_req[p];
+            }
+            a_line[p] = a_q[p].pa[55:6];
+            a_dw[p]   = a_q[p].pa[5:3];
+            a_two[p]  = a_q[p].mask[15:8] != 8'd0;
+            a_rd[p]   = a_v[p] && (a_q[p].cls == MemCls::LOAD || a_q[p].cls == MemCls::PTW_READ
+                || a_q[p].cls == MemCls::LOAD_EXCL);
+            a_rob[p]  = {a_q[p].tag.rob.wrap, a_q[p].tag.rob.idx};
+        }
+    }
+
+    var a_hit : logic    [MW];
+    var a_way : logic<2> [MW];
+    var a_excl: logic    [MW];
+    always_comb {
+        for p in 0..MW {
+            a_hit[p]  = tc_hv[p] != 4'd0;
+            a_way[p]  = enc4(tc_hv[p]);
+            a_excl[p] = (tc_hv[p] & tc_excl[p]) != 4'd0;
+        }
+    }
+
+    // ---- coherence events of this cycle ----
+
+    var ev1_v   : logic    ;
+    var ev1_line: logic<50>;
+    var ev2_v   : logic    ;
+    var ev2_line: logic<50>;
+    let inv_line : logic<50> = i_inv_addr[55:6];
+    let inv2_line: logic<50> = i_inv2_addr[55:6];
+    function coh_hit (
+        l : input logic<50>,
+        iv: input logic    ,
+        il: input logic<50>,
+        jv: input logic    ,
+        jl: input logic<50>,
+        ev: input logic    ,
+        el: input logic<50>,
+        fv: input logic    ,
+        fl: input logic<50>,
+    ) -> logic {
+        return (iv && il == l) || (jv && jl == l) || (ev && el == l) || (fv && fl == l);
+    }
+
+    // ---- the probe engine and the pin ----
+
+    var sl_v  : logic    ;
+    var sl_q  : MemReq   ;
+    var sl_id : FillId   ;
+    var pid_q : FillId   ;
+    var pin_line_q: logic<50>;
+    var pin_cnt_q : logic<7> ;
+
+    var wb_v_q   : logic        ;
+    var wb_rdy_q : logic        ;
+    var wb_line_q: logic<50>    ;
+    var wb_data_q: logic<64> [8];
+    var cap_q    : logic        ;
+    var cap_way_q: logic<2>     ;
+
+    let sl_unc: logic = sl_v && sl_q.cls == MemCls::UNC_READ;
+    let sl_wt : logic = sl_v && sl_q.cls == MemCls::STORE_WT;
+    let sl_cmo: logic = sl_v && sl_q.cls == MemCls::CMO;
+
+    let clean_sel: logic     = sl_cmo && !i_probe_v;
+    let pr_v     : logic     = i_probe_v || clean_sel;
+    let pr_line  : logic<50> = if clean_sel ? sl_q.pa[55:6] : i_probe_addr[55:6];
+    let pr_self  : logic     = i_probe_self || clean_sel;
+
+    let pin_live: logic = !pin_cnt_q[6];
+    let pinned  : logic = pin_live && pin_line_q == pr_line && !pr_self;
+    let p_hv    : logic<4> = tc_hv[TC_P];
+    let p_any   : logic    = p_hv != 4'd0;
+    let p_way   : logic<2> = enc4(p_hv);
+    let p_dirty : logic    = (p_hv & tc_dirty[TC_P]) != 4'd0;
+    let p_wbw   : logic    = wb_v_q && wb_line_q == pr_line;
+    let p_act   : logic    = pr_v && !p_wbw && !pinned;
+    let p_cap   : logic    = p_act && p_dirty && !wb_v_q;
+    let p_fill  : logic    = p_act && fill_v && fill_line == pr_line && !pr_self;
+    let p_drop  : logic    = p_act && p_any && (!p_dirty || p_cap);
+    // An unpinned probe of a line holds the writers of that line for the cycle.
+    let p_clash : logic    = pr_v && !pinned;
+    assign o_probe_ack = p_act && !p_dirty && !clean_sel;
+    let clean_done: logic = p_act && !p_dirty && clean_sel;
+
+    // ---- launch ----
+
+    var mshr_lc_v   : logic    ;
+    var mshr_lc_line: logic<50>;
+    let ls       : logic<INDEX_W> = set_of(mshr_lc_line);
+    let v_hv     : logic<4>       = tc_hv[TC_V];
+    let v_inval  : logic<4>       = ~tc_valid[TC_V];
+    let vic      : logic<2>       = if v_hv != 4'd0 ? enc4(v_hv) : if v_inval != 4'd0 ? enc4(tree_first::<4>(v_inval)) : plru_way(tc_plru[TC_V]);
+    let v_valid  : logic          = tc_valid[TC_V][vic];
+    let v_dirty  : logic          = v_valid && tc_dirty[TC_V][vic];
+    let vic_line : logic<50>      = {tc_tag[TC_V][vic], ls};
+    let v_inplace: logic          = v_hv != 4'd0;
+    let launch   : logic          = mshr_lc_v && !p_act && !sl_unc && !(wb_v_q && (v_dirty || wb_line_q == mshr_lc_line));
+    let l_cap    : logic          = launch && v_dirty;
+    let cap_go   : logic          = l_cap || p_cap;
+    let cap_set  : logic<INDEX_W> = if l_cap ? ls : set_of(pr_line);
+    let cap_way  : logic<2>       = if l_cap ? vic : p_way;
+
+    // ---- read channel: the fill context, or the uncached read of the slot ----
+
+    var own_unc_q  : logic    ;
+    var mshr_rd_req: logic    ;
+    var mshr_rd_fil: logic    ;
+    var mshr_rd_adr: logic<64>;
+    var mshr_rd_rfo: logic    ;
+    let mshr_grant : logic = !own_unc_q && i_memr_grant;
+    let unc_grant  : logic = own_unc_q && i_memr_grant;
+    assign o_memr_req  = if own_unc_q ? 1'b1 : mshr_rd_req;
+    assign o_memr_addr = if own_unc_q ? {8'd0, sl_q.pa} : mshr_rd_adr;
+    assign o_memr_rfo  = !own_unc_q && mshr_rd_rfo;
+    assign o_memr_line = !own_unc_q;
+    assign o_memr_ren  = if own_unc_q ? i_memr_grant : mshr_rd_fil || (mshr_rd_req && i_memr_grant);
+
+    let beat   : logic    = fill_v && mshr_grant;
+    let beat_bk: logic<BW> = bank_of(fill_dw);
+    assign inst_v  = beat && fill_last;
+    assign inst_ok = !fill_abort;
+
+    // Banks whose write port the fill context may take this cycle.
+    var fbank: logic<NB>;
+    always_comb {
+        for b in 0..NB {
+            fbank[b] = fill_v && beat_bk == b;
+        }
+    }
+
+    // ---- write side: the WT of the nf slot, else the drain ----
+
+    let d_line: logic<50>      = i_drain_addr[55:6];
+    let w_line: logic<50>      = if sl_wt ? sl_q.pa[55:6] : d_line;
+    always_comb {
+        for p in 0..MW {
+            tc_ln[p] = a_line[p];
+        }
+        tc_ln[TC_I1] = inv_line;
+        tc_ln[TC_I2] = inv2_line;
+        tc_ln[TC_P]  = pr_line;
+        tc_ln[TC_V]  = mshr_lc_line;
+        tc_ln[TC_W]  = w_line;
+    }
+    let w_hv  : logic<4>       = tc_hv[TC_W];
+    let w_hit : logic          = w_hv != 4'd0;
+    let w_way : logic<2>       = enc4(w_hv);
+    let w_excl: logic          = (w_hv & tc_excl[TC_W]) != 4'd0;
+    var lk_hit : logic          [LK_N];
+    var lk_fid : FillId         [LK_N];
+    var lk_wait: logic          [LK_N];
+    var lk_cv  : logic          [LK_N];
+    var lk_cdw : logic<3>       [LK_N];
+    var lk_cdat: logic<64>      [LK_N];
+    var lk_set : logic          [LK_N];
+    var lk_line: logic<50>      [LK_N];
+
+    let wt_dw  : logic<3> = sl_q.pa[5:3];
+    let wt_two : logic    = sl_q.mask[15:8] != 8'd0;
+    var wt_bk  : logic<NB>;
+    always_comb {
+        for b in 0..NB {
+            wt_bk[b] = bank_of(wt_dw) == b || (wt_two && bank_of(wt_dw + 1) == b);
+        }
+    }
+    let wt_want: logic = sl_wt && !wb_v_q && !lk_hit[MW] && (wt_bk & fbank) == '0;
+
+    // The exclusive write of the HEAD port in A.
+    let sx_v   : logic = a_v[HEAD_PORT] && a_q[HEAD_PORT].cls == MemCls::STORE_EXCL;
+    var sx_bk  : logic<NB>;
+    always_comb {
+        for b in 0..NB {
+            sx_bk[b] = bank_of(a_dw[HEAD_PORT]) == b || (a_two[HEAD_PORT] && bank_of(a_dw[HEAD_PORT] + 1) == b);
+        }
+    }
+
+    // Write channel: the writeback buffer, then the slot's WT, then a full
+    // line drain.
+    let wb_req  : logic = wb_v_q && wb_rdy_q;
+    let dv      : logic = i_drain_v && !sl_wt;
+    var d_full  : logic;
+    var d_bk    : logic<NB>;
+    always_comb {
+        d_full = 1'b1;
+        for o in 0..8 {
+            if i_drain_strb[o] != 8'hff {
+                d_full = 1'b0;
+            }
+        }
+        for b in 0..NB {
+            d_bk[b] = 1'b0;
+            for o in 0..8 {
+                if o % NB == b && i_drain_strb[o] != 8'd0 {
+                    d_bk[b] = 1'b1;
+                }
+            }
+        }
+    }
+    let d_own   : logic = w_hit && w_excl;
+    let d_pcl   : logic = p_clash && pr_line == d_line;
+    let dwt_want: logic = dv && !wb_v_q && d_full && !d_own && !d_pcl && !lk_hit[MW] && !launch;
+    let wb_fire : logic = wb_req && i_memw_grant;
+    let wt_fire : logic = !wb_req && wt_want && i_memw_grant;
+    let dwt_fire: logic = !wb_req && !wt_want && dwt_want && i_memw_grant;
+
+    var wtf_bk: logic<NB>;
+    always_comb {
+        for b in 0..NB {
+            wtf_bk[b] = wt_fire && w_hit && wt_bk[b];
+        }
+    }
+    let sx_line  : logic<50> = a_line[HEAD_PORT];
+    let sx_own   : logic     = a_hit[HEAD_PORT] && a_excl[HEAD_PORT];
+    let sx_race  : logic     = (p_clash && pr_line == sx_line) || (i_inv_v && inv_line == sx_line)
+        || (i_inv2_v && inv2_line == sx_line);
+    let sx_struct: logic     = (sx_bk & (fbank | wtf_bk)) != '0 || (launch && ls == set_of(sx_line));
+    let sx_pass  : logic     = sx_v && sx_own && !sx_race && !sx_struct;
+    let sx_fail  : logic     = sx_v && (!sx_own || sx_race);
+    var sxp_bk   : logic<NB>;
+    always_comb {
+        for b in 0..NB {
+            sxp_bk[b] = sx_pass && sx_bk[b];
+        }
+    }
+    let d_conf : logic = (d_bk & (fbank | wtf_bk | sxp_bk)) != '0;
+    let d_merge: logic = dv && d_own && !d_pcl && !d_conf && !(launch && ls == set_of(d_line));
+    assign o_drain_ack = d_merge || dwt_fire;
+
+    // The drain needs ownership of a partial line it does not own.
+    let d_rfo: logic = dv && !d_full && !d_own && !d_pcl;
+
+    // ---- departures ----
+
+    assign ev1_v    = (launch && v_valid && !v_inplace) || (dwt_fire && w_hit);
+    assign ev1_line = if launch ? vic_line : d_line;
+    assign ev2_v    = p_drop || p_fill;
+    assign ev2_line = pr_line;
+    assign o_ev1_v    = ev1_v;
+    assign o_ev1_addr = {8'd0, ev1_line, 6'd0};
+    assign o_ev2_v    = ev2_v;
+    assign o_ev2_addr = {8'd0, ev2_line, 6'd0};
+
+    // ---- data banks ----
+
+    var a_set  : logic<INDEX_W> [MW];
+    var a_bok  : logic          [MW];
+    var v_dat  : logic<128>     [MW];
+    var v_dw   : logic<3>       [MW];
+    var v_way  : logic<2>       [MW];
+    var cap_dat: logic<64>      [8] ;
+    var d_wconf: logic              ;
+    var d_share: logic              ;
+    always_comb {
+        for p in 0..MW {
+            a_set[p] = set_of(a_line[p]);
+        }
+    }
+
+    inst u_data: dcache_data::<CFG> #(
+        INDEX_W: INDEX_W,
+    ) (
+        clk                                      ,
+        rst                                      ,
+        i_rd_v    : a_rd                         ,
+        i_rd_set  : a_set                        ,
+        i_rd_dw   : a_dw                         ,
+        i_rd_two  : a_two                        ,
+        i_rd_rob  : a_rob                        ,
+        i_rd_np   : a_np[HEAD_PORT]              ,
+        o_rd_ok   : a_bok                        ,
+        i_cap_v   : cap_go                       ,
+        i_cap_set : cap_set                      ,
+        i_v_dw    : v_dw                         ,
+        i_v_way   : v_way                        ,
+        o_v_data  : v_dat                        ,
+        i_cap_way : cap_way_q                    ,
+        o_cap_data: cap_dat                      ,
+        i_beat_v  : beat                         ,
+        i_beat_set: fill_set                     ,
+        i_beat_dw : fill_dw                      ,
+        i_beat_way: fill_way                     ,
+        i_beat_data: i_mem_rdata                 ,
+        i_wt_v    : wt_fire && w_hit             ,
+        i_wt_set  : set_of(sl_q.pa[55:6])        ,
+        i_wt_dw   : wt_dw                        ,
+        i_wt_way  : w_way                        ,
+        i_wt_mask : sl_q.mask                    ,
+        i_wt_wdata: sl_q.wdata                   ,
+        i_sx_v    : sx_pass                      ,
+        i_sx_set  : set_of(sx_line)              ,
+        i_sx_dw   : a_dw[HEAD_PORT]              ,
+        i_sx_way  : a_way[HEAD_PORT]             ,
+        i_sx_mask : a_q[HEAD_PORT].mask          ,
+        i_sx_wdata: a_q[HEAD_PORT].wdata         ,
+        i_dr_v    : d_merge                      ,
+        i_dr_set  : set_of(d_line)               ,
+        i_dr_way  : w_way                        ,
+        i_dr_data : i_drain_data                 ,
+        i_dr_strb : i_drain_strb                 ,
+        o_wconf   : d_wconf                      ,
+        o_share   : d_share                      ,
+    );
+
+    // ---- the A -> V register ----
+
+    var s1_v   : logic     [MW];
+    var s1_np  : logic     [MW];
+    var s1_q   : MemReq    [MW];
+    var s1_hit : logic     [MW];
+    var s1_way : logic<2>  [MW];
+    var s1_excl: logic     [MW];
+    var s1_bok : logic     [MW];
+    var s1_pre : logic     [MW];
+    var s1_race: logic     [MW];
+    var s1_ad  : logic     [MW]; // decided in A: s1_ar is the response
+    var resp_q : MemResp   [MW];
+    var s1_ar  : MemResp   [MW];
+
+    // Decisions in A of the HEAD port: STORE_EXCL and the nf slot.
+    let h_cls  : MemCls = a_q[HEAD_PORT].cls;
+    let h_nf   : logic  = a_v[HEAD_PORT] && (h_cls == MemCls::UNC_READ || h_cls == MemCls::STORE_WT || h_cls == MemCls::CMO);
+    let nf_acc : logic  = h_nf && !sl_v;
+    var h_ar   : MemResp;
+    always_comb {
+        h_ar.valid   = 1'b1;
+        h_ar.tag     = a_q[HEAD_PORT].tag;
+        h_ar.data    = '0;
+        h_ar.fill_id = pid_q;
+        h_ar.reason  = RetryReason::BANK_CONFLICT;
+        h_ar.kind    = RespKind::RETRY;
+        if sx_v {
+            h_ar.kind = if sx_pass ? RespKind::EXCL_PASS : if sx_fail ? RespKind::EXCL_FAIL : RespKind::RETRY;
+        } else if nf_acc {
+            h_ar.kind = if h_cls == MemCls::CMO ? RespKind::HIT : RespKind::PENDING;
+        }
+    }
+
+    // ---- decisions in V ----
+
+    var v_line: logic<50> [MW];
+    always_comb {
+        for p in 0..MW {
+            v_line[p]  = s1_q[p].pa[55:6];
+            lk_line[p] = v_line[p];
+        }
+        lk_line[MW] = w_line;
+    }
+
+    var mshr_free  : logic ;
+    var mshr_newfid: FillId;
+
+    var v_kill : logic<MW>;
+    var v_race : logic<MW>;
+    var v_hitok: logic<MW>; // row 3
+    var v_miss : logic<MW>; // rows 4-6
+    var v_crit : logic<MW>;
+    var v_cand : logic<MW>; // may allocate
+    var v_rtag : logic<ROB_TAG_W> [MW];
+    var v_xl   : logic<MW>;
+    always_comb {
+        for p in 0..MW {
+            let rdv: logic = s1_v[p] && !s1_ad[p];
+            v_xl[p]    = s1_q[p].cls == MemCls::LOAD_EXCL;
+            v_kill[p]  = rdv && s1_q[p].tag.rob_v && killed(i_kill, s1_q[p].tag.rob);
+            v_race[p]  = rdv && !v_kill[p] && (s1_race[p] || coh_hit(v_line[p], i_inv_v, inv_line, i_inv2_v, inv2_line, ev1_v, ev1_line, ev2_v, ev2_line));
+            v_hitok[p] = rdv && !v_kill[p] && !v_race[p] && s1_hit[p] && (!v_xl[p] || s1_excl[p]);
+            v_miss[p]  = rdv && !v_kill[p] && !v_race[p] && !v_hitok[p];
+            v_crit[p]  = v_miss[p] && lk_hit[p] && lk_cv[p] && !v_xl[p] && s1_q[p].mask[15:8] == 8'd0
+                && lk_cdw[p] == s1_q[p].pa[5:3];
+            v_cand[p]  = v_miss[p] && !lk_hit[p] && !lk_set[p] && mshr_free;
+            v_rtag[p]  = {s1_q[p].tag.rob.wrap, s1_q[p].tag.rob.idx};
+        }
+    }
+
+    // One allocation per cycle: the HEAD port's non-pipe request, else the
+    // oldest port, or the drain when it is urgent or alone.
+    always_comb {
+        for p in 0..MW {
+            v_dw[p]  = s1_q[p].pa[5:3];
+            v_way[p] = s1_way[p];
+        }
+    }
+    let d_cand    : logic     = d_rfo && !lk_hit[MW] && !lk_set[MW] && mshr_free;
+    let p_win     : logic<MW> = if v_cand[HEAD_PORT] && s1_np[HEAD_PORT] ? (1 << HEAD_PORT) as MW : tree_oldest::<MW, ROB_TAG_W>(v_cand, v_rtag);
+    let d_win     : logic     = d_cand && (v_cand == '0 || i_drain_urgent);
+    let a_line_w  : logic<50> = if d_win ? d_line : tree_onehot_mux::<MW, 50>(p_win, v_line);
+    var v_new     : logic<MW>; // answered MISS(new fill id)
+    var v_up      : logic<MW>;
+    always_comb {
+        for p in 0..MW {
+            v_new[p] = v_cand[p] && v_line[p] == a_line_w;
+            v_up[p]  = v_miss[p] && lk_hit[p] && lk_wait[p] && v_xl[p];
+        }
+    }
+    let alloc_v   : logic     = d_win || v_cand != '0;
+    let alloc_xl  : logic     = (v_new & v_xl) != '0;
+    let alloc_rfo : logic     = d_win || alloc_xl;
+    let alloc_crit: logic<3>  = if d_win ? 3'd0 : tree_onehot_mux::<MW, 3>(p_win, v_dw);
+    let up_any    : logic     = v_up != '0;
+    let up_line   : logic<50> = if up_any ? tree_onehot_mux::<MW, 50>(tree_first::<MW>(v_up), v_line) : d_line;
+    let up_v      : logic     = up_any || (d_rfo && lk_hit[MW] && lk_wait[MW]);
+
+    var v_resp: MemResp [MW];
+    always_comb {
+        for p in 0..MW {
+            v_resp[p].valid   = s1_v[p];
+            v_resp[p].tag     = s1_q[p].tag;
+            v_resp[p].data    = v_dat[p];
+            v_resp[p].fill_id = mshr_newfid;
+            v_resp[p].kind    = RespKind::RETRY;
+            v_resp[p].reason  = RetryReason::FILL_BUSY;
+            if v_kill[p] {
+                v_resp[p].reason = RetryReason::PREEMPTED;
+            } else if v_race[p] {
+                v_resp[p].reason = RetryReason::INV_RACE;
+            } else if v_hitok[p] {
+                if s1_pre[p] {
+                    v_resp[p].reason = RetryReason::PREEMPTED;
+                } else if !s1_bok[p] {
+                    v_resp[p].reason = RetryReason::BANK_CONFLICT;
+                } else {
+                    v_resp[p].kind = RespKind::HIT;
+                }
+            } else if v_crit[p] {
+                v_resp[p].kind = RespKind::HIT;
+                v_resp[p].data = {64'd0, lk_cdat[p]};
+            } else if lk_hit[p] {
+                v_resp[p].kind    = RespKind::MISS;
+                v_resp[p].fill_id = lk_fid[p];
+            } else if v_new[p] {
+                v_resp[p].kind = RespKind::MISS;
+            }
+            if s1_ad[p] {
+                v_resp[p] = s1_ar[p];
+            }
+        }
+    }
+
+    // PLRU: every HIT points its set away from the hit way.
+    var pl_v  : logic          [MW];
+    var pl_set: logic<INDEX_W> [MW];
+    var pl_way: logic<2>       [MW];
+    always_comb {
+        for p in 0..MW {
+            pl_v[p]   = v_hitok[p] && s1_bok[p] && !s1_pre[p];
+            pl_set[p] = set_of(v_line[p]);
+            pl_way[p] = s1_way[p];
+        }
+    }
+
+    // Ways dropped this cycle: the victim, invalidates, the probe, the own
+    // copy of a written-through drain; ways made dirty: the exclusive write
+    // and the drain merge.
+    var clr_v  : logic          [5];
+    var clr_set: logic<INDEX_W> [5];
+    var clr_way: logic<2>       [5];
+    var mrk_v  : logic          [2];
+    var mrk_set: logic<INDEX_W> [2];
+    var mrk_way: logic<2>       [2];
+    always_comb {
+        clr_v[0]   = launch;
+        clr_set[0] = ls;
+        clr_way[0] = vic;
+        clr_v[1]   = i_inv_v && tc_hv[TC_I1] != 4'd0;
+        clr_set[1] = set_of(inv_line);
+        clr_way[1] = enc4(tc_hv[TC_I1]);
+        clr_v[2]   = i_inv2_v && tc_hv[TC_I2] != 4'd0;
+        clr_set[2] = set_of(inv2_line);
+        clr_way[2] = enc4(tc_hv[TC_I2]);
+        clr_v[3]   = p_drop;
+        clr_set[3] = set_of(pr_line);
+        clr_way[3] = p_way;
+        clr_v[4]   = dwt_fire && w_hit;
+        clr_set[4] = set_of(d_line);
+        clr_way[4] = w_way;
+        mrk_v[0]   = sx_pass;
+        mrk_set[0] = set_of(sx_line);
+        mrk_way[0] = a_way[HEAD_PORT];
+        mrk_v[1]   = d_merge;
+        mrk_set[1] = set_of(d_line);
+        mrk_way[1] = w_way;
+    }
+
+    inst u_tags: dcache_tags #(
+        INDEX_W: INDEX_W,
+        RD_N   : TC_N   ,
+        CLR_N  : 5      ,
+        MRK_N  : 2      ,
+        PL_N   : MW     ,
+    ) (
+        clk                         ,
+        rst                         ,
+        i_rd_line : tc_ln           ,
+        o_rd_hv   : tc_hv           ,
+        o_rd_valid: tc_valid        ,
+        o_rd_excl : tc_excl         ,
+        o_rd_dirty: tc_dirty        ,
+        o_rd_plru : tc_plru         ,
+        o_rd_tag  : tc_tag          ,
+        i_ins_v   : inst_v          ,
+        i_ins_line: fill_line       ,
+        i_ins_way : fill_way        ,
+        i_ins_ok  : inst_ok         ,
+        i_ins_excl: i_fill_excl     ,
+        i_clr_v   : clr_v           ,
+        i_clr_set : clr_set         ,
+        i_clr_way : clr_way         ,
+        i_mrk_v   : mrk_v           ,
+        i_mrk_set : mrk_set         ,
+        i_mrk_way : mrk_way         ,
+        i_pl_v    : pl_v            ,
+        i_pl_set  : pl_set          ,
+        i_pl_way  : pl_way          ,
+    );
+
+    // ---- MSHR ----
+
+    var mshr_ev      : MemEvent ;
+    var mshr_pin_v   : logic    ;
+    var mshr_pin_line: logic<50>;
+    var mshr_chk     : logic<2> ;
+
+    inst u_mshr: dcache_mshr::<CFG> #(
+        INDEX_W: INDEX_W,
+        LK_N   : LK_N   ,
+    ) (
+        clk                          ,
+        rst                          ,
+        i_lk_line   : lk_line        ,
+        o_lk_hit    : lk_hit         ,
+        o_lk_fid    : lk_fid         ,
+        o_lk_wait   : lk_wait        ,
+        o_lk_cv     : lk_cv          ,
+        o_lk_cdw    : lk_cdw         ,
+        o_lk_cdat   : lk_cdat        ,
+        o_lk_set    : lk_set         ,
+        o_free      : mshr_free      ,
+        o_new_fid   : mshr_newfid    ,
+        i_alloc_v   : alloc_v        ,
+        i_alloc_line: a_line_w       ,
+        i_alloc_crit: alloc_crit     ,
+        i_alloc_rfo : alloc_rfo      ,
+        i_alloc_xl  : alloc_xl       ,
+        i_up_v      : up_v           ,
+        i_up_line   : up_line        ,
+        i_up_xl     : up_any         ,
+        o_lc_v      : mshr_lc_v      ,
+        o_lc_line   : mshr_lc_line   ,
+        i_launch    : launch         ,
+        i_launch_way: vic            ,
+        o_rd_req    : mshr_rd_req    ,
+        o_rd_fill   : mshr_rd_fil    ,
+        o_rd_addr   : mshr_rd_adr    ,
+        o_rd_rfo    : mshr_rd_rfo    ,
+        i_grant     : mshr_grant     ,
+        i_mem_rdata                  ,
+        o_fill_v    : fill_v         ,
+        o_fill_set  : fill_set       ,
+        o_fill_line : fill_line      ,
+        o_fill_way  : fill_way       ,
+        o_fill_dw   : fill_dw        ,
+        o_fill_last : fill_last      ,
+        o_fill_abort: fill_abort     ,
+        i_inv_v                      ,
+        i_inv_line  : inv_line       ,
+        i_inv2_v                     ,
+        i_inv2_line : inv2_line      ,
+        i_pab_v     : p_fill         ,
+        i_pab_line  : pr_line        ,
+        o_ev        : mshr_ev        ,
+        o_pin_v     : mshr_pin_v     ,
+        o_pin_line  : mshr_pin_line  ,
+        o_chk       : mshr_chk       ,
+    );
+
+    // ---- write channel ----
+
+    assign o_memw_req  = wb_req || wt_want || dwt_want;
+    assign o_memw_wb   = wb_v_q;
+    assign o_memw_addr = if wb_v_q ? {8'd0, wb_line_q, 6'd0} : if sl_wt ? {8'd0, sl_q.pa} : i_drain_addr;
+    assign o_memw_wen  = wb_fire || wt_fire || dwt_fire;
+    for l in 0..8 :g_memw {
+        let wt_lo: logic = wt_dw == l;
+        let wt_hi: logic = wt_two && wt_dw + 1 == l;
+        assign o_memw_wdata[l] = if wb_v_q ? wb_data_q[l] : if sl_wt ? (if wt_lo ? sl_q.wdata[63:0] : if wt_hi ? sl_q.wdata[127:64] : 64'd0) : i_drain_data[l];
+        assign o_memw_wstrb[l] = if wb_v_q ? 8'hff : if sl_wt ? (if wt_fire && wt_lo ? sl_q.mask[7:0] : if wt_fire && wt_hi ? sl_q.mask[15:8] : 8'd0) : if dwt_fire ? i_drain_strb[l] : 8'd0;
+    }
+
+    // ---- events: fill events first, done events through a one-entry skid ----
+
+    var sk_q : MemEvent;
+    var evt_q: MemEvent;
+    let done_in: logic = unc_grant || wt_fire;
+    let sk_out : logic = sk_q.valid && !mshr_ev.valid;
+    var sk_in  : MemEvent;
+    always_comb {
+        sk_in.valid   = done_in;
+        sk_in.fill_id = sl_id;
+        sk_in.line    = sl_q.pa[55:6];
+        sk_in.crit    = sl_q.pa[5:3];
+        sk_in.data    = i_mem_rdata;
+        sk_in.kind    = if unc_grant ? EvKind::UNC_DONE : EvKind::WT_DONE;
+    }
+
+    // ---- state ----
+
+    let sl_free: logic = unc_grant || wt_fire || (sl_cmo && clean_done);
+
+
+    always_ff {
+        if_reset {
+            sl_v       = 1'b0;
+            sl_q       = '0;
+            sl_id      = '0;
+            pid_q      = '0;
+            pin_line_q = '0;
+            pin_cnt_q  = 7'h40;
+            wb_v_q     = 1'b0;
+            wb_rdy_q   = 1'b0;
+            wb_line_q  = '0;
+            cap_q      = 1'b0;
+            cap_way_q  = '0;
+            own_unc_q  = 1'b0;
+            sk_q.valid  = 1'b0;
+            evt_q.valid = 1'b0;
+            for l in 0..8 {
+                wb_data_q[l] = '0;
+            }
+            for p in 0..MW {
+                s1_v[p]  = 1'b0;
+                s1_ad[p] = 1'b0;
+                resp_q[p].valid = 1'b0;
+            }
+        } else {
+            // The nf slot.
+            if nf_acc {
+                sl_v  = 1'b1;
+                sl_q  = a_q[HEAD_PORT];
+                sl_id = pid_q;
+                if h_cls != MemCls::CMO {
+                    pid_q = pid_q + 1;
+                }
+            } else if sl_free {
+                sl_v = 1'b0;
+            }
+
+            // The pin: armed by an owned exclusive read of a new line in A or
+            // by the DONE of the read for ownership it waits for; released by
+            // the exclusive write of the line.
+            if a_v[HEAD_PORT] && h_cls == MemCls::LOAD_EXCL && sx_own && a_line[HEAD_PORT] != pin_line_q {
+                pin_line_q = a_line[HEAD_PORT];
+                pin_cnt_q  = 7'd0;
+            } else if mshr_pin_v {
+                pin_line_q = mshr_pin_line;
+                pin_cnt_q  = 7'd0;
+            } else if sx_pass && sx_line == pin_line_q {
+                pin_cnt_q = 7'h40;
+            } else if pin_live {
+                pin_cnt_q = pin_cnt_q + 7'd1;
+            }
+
+            // Writeback buffer: capture in C, data from the banks in C + 1.
+            cap_q = cap_go;
+            if cap_go {
+                wb_v_q    = 1'b1;
+                wb_rdy_q  = 1'b0;
+                wb_line_q = if l_cap ? vic_line : pr_line;
+                cap_way_q = cap_way;
+            } else if wb_fire {
+                wb_v_q   = 1'b0;
+                wb_rdy_q = 1'b0;
+            }
+            if cap_q {
+                wb_data_q = cap_dat;
+                wb_rdy_q = 1'b1;
+            }
+
+            // Read-channel owner: the slot's uncached read waits until the
+            // fill context neither requests nor streams.
+            if own_unc_q {
+                if i_memr_grant {
+                    own_unc_q = 1'b0;
+                }
+            } else if sl_unc && !mshr_rd_req && !launch {
+                own_unc_q = 1'b1;
+            }
+
+            // Events.
+            evt_q = if sk_out ? sk_q : mshr_ev;
+            if done_in {
+                sk_q = sk_in;
+            } else if sk_out {
+                sk_q.valid = 1'b0;
+            }
+
+            // A -> V and V -> response.
+            for p in 0..MW {
+                resp_q[p]  = v_resp[p];
+                s1_v[p]    = a_v[p];
+                s1_np[p]   = a_np[p];
+                s1_q[p]    = a_q[p];
+                s1_hit[p]  = a_hit[p];
+                s1_way[p]  = a_way[p];
+                s1_excl[p] = a_excl[p];
+                s1_bok[p]  = a_bok[p];
+                s1_pre[p]  = cap_go;
+                s1_race[p] = coh_hit(a_line[p], i_inv_v, inv_line, i_inv2_v, inv2_line, ev1_v, ev1_line, ev2_v, ev2_line);
+                s1_ad[p]   = p == HEAD_PORT && (sx_v || h_nf);
+                s1_ar[p]   = h_ar;
+            }
+        }
+    }
+
+    for p in 0..MW :g_rdy {
+        assign o_req_ready[p] = 1'b1;
+    }
+    assign o_evt  = evt_q;
+    assign o_resp = resp_q;
+
+    // ---- observation ----
+
+    var v_resp_hit: logic<MW>;
+    var lk_hitv   : logic<MW>;
+    var s1_prev   : logic<MW>;
+    var s1_bokv   : logic<MW>;
+    always_comb {
+        for p in 0..MW {
+            v_resp_hit[p] = v_resp[p].kind == RespKind::HIT;
+            lk_hitv[p]    = lk_hit[p];
+            s1_prev[p]    = s1_pre[p];
+            s1_bokv[p]    = s1_bok[p];
+        }
+    }
+
+    always_comb {
+        var r : logic<MW>;
+        var k : logic<MW>;
+        var av: logic<MW>;
+        for p in 0..MW {
+            av[p] = a_v[p];
+            r[p] = s1_v[p] && !s1_ad[p];
+            k[p] = r[p] && v_resp[p].kind == RespKind::RETRY;
+        }
+        o_perf.accept      = av != '0;
+        o_perf.hit         = v_hitok != '0 && (v_resp_hit & v_hitok) != '0;
+        o_perf.crit_hit    = v_crit != '0;
+        o_perf.attach      = (v_miss & ~v_crit & lk_hitv) != '0;
+        o_perf.alloc       = alloc_v && !d_win;
+        o_perf.r_fill_busy = (k & v_miss & ~lk_hitv & ~v_new) != '0;
+        o_perf.r_inv_race  = v_race != '0;
+        o_perf.r_preempted = v_kill != '0 || (k & v_hitok & s1_prev) != '0;
+        o_perf.r_bank      = (k & v_hitok & ~s1_prev & ~s1_bokv) != '0;
+        o_perf.share       = d_share;
+        o_perf.huf         = (v_resp_hit & v_hitok) != '0 && fill_v;
+        o_perf.launch      = launch;
+        o_perf.vic_wb      = l_cap;
+        o_perf.excl_pass   = sx_pass;
+        o_perf.excl_fail   = sx_fail;
+        o_perf.excl_busy   = sx_v && !sx_pass && !sx_fail;
+        o_perf.nf_busy     = h_nf && sl_v;
+        o_perf.unc_done    = unc_grant;
+        o_perf.wt_done     = wt_fire;
+        o_perf.cmo         = nf_acc && h_cls == MemCls::CMO;
+        o_perf.drain_merge = d_merge;
+        o_perf.drain_wt    = dwt_fire;
+        o_perf.drain_rfo   = alloc_v && d_win;
+        o_perf.drain_bank  = dv && d_own && !d_pcl && d_conf;
+        o_perf.probe_ack   = o_probe_ack;
+        o_perf.probe_wb    = p_cap;
+        o_perf.probe_defer = pr_v && pinned;
+        o_perf.ev_skid     = sk_q.valid && mshr_ev.valid;
+    }
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var c_bad: logic<6>;
+        var c_mv : logic  [MW];
+        var c_mf : FillId [MW];
+        always_comb {
+            for p in 0..MW {
+                c_mv[p] = s1_v[p] && !s1_ad[p] && v_resp[p].kind == RespKind::MISS;
+                c_mf[p] = v_resp[p].fill_id;
+            }
+        }
+        always_comb {
+            c_bad    = 6'd0;
+            c_bad[1] = i_req_valid[HEAD_PORT] && np_any;
+            c_bad[2] = (sl_unc || sl_wt) && sl_q.tag.rob_v && killed(i_kill, sl_q.tag.rob);
+            c_bad[3] = done_in && sk_q.valid && !sk_out;
+            c_bad[4] = d_wconf;
+            c_bad[5] = own_unc_q && (mshr_rd_req || fill_v);
+        }
+        inst u_chk: chk_dcache::<CFG> (
+            clk                   ,
+            rst                   ,
+            i_req_valid: a_v      ,
+            i_req      : a_q      ,
+            i_resp     : resp_q   ,
+            i_bad      : c_bad    ,
+            i_mshr     : mshr_chk ,
+            i_alloc_v   : alloc_v    ,
+            i_alloc_fid : mshr_newfid,
+            i_alloc_line: a_line_w   ,
+            i_alloc_crit: alloc_crit ,
+            i_miss_v    : c_mv       ,
+            i_miss_fid  : c_mf       ,
+            i_miss_line : v_line     ,
+            i_ev        : mshr_ev    ,
+            o_chk                 ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

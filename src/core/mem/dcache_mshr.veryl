@@ -1,0 +1,399 @@
+// dcache_mshr: the line-granular miss status holding registers of the
+// dcache and its fill context, which streams one line at a time into the
+// arrays.
+//
+// Ports (timing contract):
+//   i_lk_line[r] -> o_lk_* : combinational lookup of requester r against the
+//                    registered entries: an entry holds the line (o_lk_hit:
+//                    its fill id, its state, its critical dword and whether
+//                    that dword has arrived intact), or another line of the
+//                    same set (o_lk_set)
+//   o_free, o_new_fid : registered: an entry is free; the id the next
+//                    allocation gets
+//   i_alloc_*      : at most one allocation per cycle, into the lowest free
+//                    entry, WAIT_LAUNCH on this edge
+//   i_up_v, i_up_*  : an exclusive requester attached to the line: a
+//                    WAIT_LAUNCH entry of that line becomes a read for
+//                    ownership
+//   o_lc_v, o_lc_* : registered: the oldest WAIT_LAUNCH entry, when the fill
+//                    context is free; i_launch (with the victim way the dcache
+//                    took for it) moves it to WAIT_GRANT on this edge
+//   o_rd_*         : the read-channel request of the WAIT_GRANT or FILL
+//                    entry, registered state only; i_grant is the grant of
+//                    this cycle, given only while the MSHR owns the channel
+//   o_fill_*       : registered: the FILL entry, the set, way and dword of its
+//                    next beat (written when granted, i_mem_rdata), whether it
+//                    is the last one (which installs the line), and whether
+//                    the fill is aborted, including by this cycle's
+//                    invalidates and probe
+//   i_inv*, i_pab_*: invalidates and the non-self probe of this cycle; they
+//                    abort a FILL entry of the line, also in the cycle its
+//                    grant starts it
+//   o_ev           : the fill event of this cycle: FILL_START at the grant,
+//                    FILL_CRIT once the critical dword has arrived intact,
+//                    FILL_DONE or FILL_ABORT in DONE
+//   o_pin_v, o_pin_line : DONE of an intact read for ownership that an
+//                    exclusive read waits for
+//   o_chk          : sticky checker flags (HELIODOR_CHK only, else 0):
+//                    0 two live entries in one set, 1 two entries using the
+//                    fill context
+// Owns:
+//   - at most one live (non-FREE) entry per set, hence per line
+//   - at most N_FILL = 1 entry in WAIT_GRANT, FILL or DONE
+//   - every field of an event comes from the entry's own registers
+//   - every allocated entry ends with FILL_DONE or FILL_ABORT of its id
+// Rationale:
+//   - an entry blocks nothing but allocations (in its set, or when no entry
+//     is free): a WAIT_LAUNCH or WAIT_GRANT entry never holds back a probe,
+//     an invalidate or another port
+//   - fills launch in allocation order (an age matrix), so no entry waits
+//     forever behind younger ones
+//   - one allocation per cycle: the miss rate of a cycle does not justify a
+//     second allocation port
+pub module dcache_mshr::<CFG: core_cfg> #(
+    param INDEX_W: u32 = 6,
+    param LK_N   : u32 = 1,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_lk_line: input  logic<50>                           [LK_N],
+    o_lk_hit : output logic                               [LK_N],
+    o_lk_fid : output core_types::<CFG>::FillId           [LK_N],
+    o_lk_wait: output logic                               [LK_N], // the entry is WAIT_LAUNCH
+    o_lk_cv  : output logic                               [LK_N], // its critical dword arrived intact
+    o_lk_cdw : output logic<3>                            [LK_N],
+    o_lk_cdat: output logic<64>                           [LK_N],
+    o_lk_set : output logic                               [LK_N],
+
+    o_free   : output logic                     ,
+    o_new_fid: output core_types::<CFG>::FillId ,
+
+    i_alloc_v   : input logic    ,
+    i_alloc_line: input logic<50>,
+    i_alloc_crit: input logic<3> ,
+    i_alloc_rfo : input logic    ,
+    i_alloc_xl  : input logic    , // allocated by an exclusive read: arm the pin at DONE
+
+    i_up_v   : input logic    ,
+    i_up_line: input logic<50>,
+    i_up_xl  : input logic    ,
+
+    o_lc_v      : output logic    ,
+    o_lc_line   : output logic<50>,
+    i_launch    : input  logic    ,
+    i_launch_way: input  logic<2> ,
+
+    o_rd_req : output logic    ,
+    o_rd_fill: output logic    , // the request is a FILL entry's (streaming)
+    o_rd_addr: output logic<64>,
+    o_rd_rfo : output logic    ,
+    i_grant  : input  logic    ,
+    i_mem_rdata: input logic<64>,
+
+    o_fill_v    : output logic         ,
+    o_fill_set  : output logic<INDEX_W>,
+    o_fill_line : output logic<50>     ,
+    o_fill_way  : output logic<2>      ,
+    o_fill_dw   : output logic<3>      ,
+    o_fill_last : output logic         ,
+    o_fill_abort: output logic         ,
+
+    i_inv_v   : input logic    ,
+    i_inv_line: input logic<50>,
+    i_inv2_v   : input logic    ,
+    i_inv2_line: input logic<50>,
+    i_pab_v   : input logic    ,
+    i_pab_line: input logic<50>,
+
+    o_ev: output core_types::<CFG>::MemEvent,
+
+    o_pin_v   : output logic    ,
+    o_pin_line: output logic<50>,
+
+    o_chk: output logic<2>,
+) {
+    import core_types::<CFG>::*;
+
+    const N : u32 = CFG::MSHR_N;
+    const IW: u32 = MSHR_IW;
+    const CW: u32 = MSHR_IW + 1;
+
+    enum MshrSt: logic<3> {
+        FREE,
+        WAIT_LAUNCH,
+        WAIT_GRANT,
+        FILL,
+        DONE,
+    }
+
+    var st_q   : MshrSt              [N]   ;
+    var line_q : logic<50>           [N]   ;
+    var crit_q : logic<3>            [N]   ; // the demanded dword, the first beat
+    var rfo_q  : logic               [N]   ;
+    var xl_q   : logic               [N]   ;
+    var way_q  : logic<2>            [N]   ;
+    var gen_q  : logic<FILL_GEN_W>   [N]   ;
+    var abort_q: logic               [N]   ;
+    var cnt_q  : logic<3>            [N]   ; // beats received
+    var cv_q   : logic               [N]   ; // the critical dword is in cdat_q
+    var cs_q   : logic               [N]   ; // FILL_CRIT was sent
+    var cdat_q : logic<64>           [N]   ;
+    var age_q  : logic<N>            [N]   ; // age_q[f][e]: f was allocated before e
+
+    function set_of (
+        l: input logic<50>,
+    ) -> logic<INDEX_W> {
+        return l[INDEX_W - 1:0];
+    }
+
+    var live : logic<N>;
+    var wl   : logic<N>;
+    var wg   : logic<N>;
+    var fl   : logic<N>;
+    var dn   : logic<N>;
+    var fid  : FillId    [N];
+    var lines: logic<50> [N];
+    var inv_e: logic<N>; // an invalidate or the probe hits the entry's line now
+    always_comb {
+        for e in 0..N {
+            live[e]  = st_q[e] != MshrSt::FREE;
+            wl[e]    = st_q[e] == MshrSt::WAIT_LAUNCH;
+            wg[e]    = st_q[e] == MshrSt::WAIT_GRANT;
+            fl[e]    = st_q[e] == MshrSt::FILL;
+            dn[e]    = st_q[e] == MshrSt::DONE;
+            fid[e]   = {e as IW, gen_q[e]};
+            lines[e] = line_q[e];
+            inv_e[e] = (i_inv_v && i_inv_line == line_q[e]) || (i_inv2_v && i_inv2_line == line_q[e])
+                || (i_pab_v && i_pab_line == line_q[e]);
+        }
+    }
+
+    // ---- lookup ----
+
+    var cvs : logic    [N];
+    var cdws: logic<3> [N];
+    always_comb {
+        for e in 0..N {
+            cvs[e]  = (fl[e] || dn[e]) && cv_q[e] && !abort_q[e];
+            cdws[e] = crit_q[e];
+        }
+    }
+    for r in 0..LK_N :g_lk {
+        var m: logic<N>;
+        var s: logic<N>;
+        always_comb {
+            for e in 0..N {
+                m[e] = live[e] && line_q[e] == i_lk_line[r];
+                s[e] = live[e] && set_of(line_q[e]) == set_of(i_lk_line[r]) && line_q[e] != i_lk_line[r];
+            }
+        }
+        assign o_lk_hit[r]  = m != '0;
+        assign o_lk_fid[r]  = tree_onehot_mux::<N, FILL_ID_W>(m, fid);
+        assign o_lk_wait[r] = (m & wl) != '0;
+        assign o_lk_cv[r]   = tree_onehot_mux::<N, 1>(m, cvs);
+        assign o_lk_cdw[r]  = tree_onehot_mux::<N, 3>(m, cdws);
+        assign o_lk_cdat[r] = tree_onehot_mux::<N, 64>(m, cdat_q);
+        assign o_lk_set[r]  = s != '0;
+    }
+
+    // ---- allocation ----
+
+    let free_oh: logic<N>  = tree_first::<N>(~live);
+    let free_ix: logic<IW> = tree_onehot_enc::<N, IW>(free_oh);
+    assign o_free    = free_oh != '0;
+    let new_gen: logic<FILL_GEN_W> = tree_onehot_mux::<N, FILL_GEN_W>(free_oh, gen_q) + 1;
+    assign o_new_fid = {free_ix, new_gen};
+
+    // ---- launch and the fill context ----
+
+    function age_col (
+        e: input u32,
+    ) -> logic<N> {
+        var c: logic<N>;
+        for f in 0..N {
+            c[f] = age_q[f][e];
+        }
+        return c;
+    }
+    var lc: logic<N>;
+    always_comb {
+        for e in 0..N {
+            lc[e] = wl[e] && (wl & age_col(e)) == '0;
+        }
+    }
+    let fc  : logic<N> = wg | fl | dn;
+    let rc  : logic<N> = wg | fl;
+    assign o_lc_v    = lc != '0 && fc == '0;
+    assign o_lc_line = tree_onehot_mux::<N, 50>(lc, lines);
+
+    var woff: logic<3> [N];
+    var rfos: logic    [N];
+    var ways: logic<2> [N];
+    var last: logic    [N];
+    var abn : logic    [N]; // aborted, counting this cycle
+    always_comb {
+        for e in 0..N {
+            woff[e] = crit_q[e] + cnt_q[e];
+            rfos[e] = rfo_q[e];
+            ways[e] = way_q[e];
+            last[e] = cnt_q[e] == 3'd7;
+            abn[e]  = abort_q[e] || inv_e[e];
+        }
+    }
+    let rc_line: logic<50> = tree_onehot_mux::<N, 50>(rc, lines);
+    let rc_off : logic<3>  = tree_onehot_mux::<N, 3>(fl, woff);
+    assign o_rd_req  = rc != '0;
+    assign o_rd_fill = fl != '0;
+    assign o_rd_addr = {8'd0, rc_line, rc_off, 3'd0};
+    assign o_rd_rfo  = tree_onehot_mux::<N, 1>(rc, rfos);
+
+    assign o_fill_v     = fl != '0;
+    assign o_fill_line  = tree_onehot_mux::<N, 50>(fl, lines);
+    assign o_fill_set   = set_of(o_fill_line);
+    assign o_fill_way   = tree_onehot_mux::<N, 2>(fl, ways);
+    assign o_fill_dw    = rc_off;
+    assign o_fill_last  = tree_onehot_mux::<N, 1>(fl, last);
+    assign o_fill_abort = tree_onehot_mux::<N, 1>(fl, abn);
+
+    // ---- events ----
+
+    var ev_s : logic<N>; // FILL_START
+    var ev_c : logic<N>; // FILL_CRIT
+    var ev_v : logic<N>;
+    var ev_k : logic<3> [N];
+    var crits: logic<3> [N];
+    always_comb {
+        for e in 0..N {
+            ev_s[e]  = wg[e] && i_grant;
+            ev_c[e]  = fl[e] && cv_q[e] && !cs_q[e] && !abn[e];
+            ev_v[e]  = ev_s[e] || ev_c[e] || dn[e];
+            crits[e] = crit_q[e];
+            ev_k[e]  = if ev_s[e] ?
+                EvKind::FILL_START
+            : if ev_c[e] ?
+                EvKind::FILL_CRIT
+            : if abort_q[e] ?
+                EvKind::FILL_ABORT
+            :
+                EvKind::FILL_DONE
+            ;
+        }
+    }
+    always_comb {
+        o_ev.valid   = ev_v != '0;
+        o_ev.fill_id = tree_onehot_mux::<N, FILL_ID_W>(ev_v, fid);
+        o_ev.line    = tree_onehot_mux::<N, 50>(ev_v, lines);
+        o_ev.crit    = tree_onehot_mux::<N, 3>(ev_v, crits);
+        o_ev.data    = tree_onehot_mux::<N, 64>(ev_v, cdat_q);
+        o_ev.kind    = tree_onehot_mux::<N, 3>(ev_v, ev_k) as EvKind;
+    }
+
+    var pins: logic<N>;
+    always_comb {
+        for e in 0..N {
+            pins[e] = dn[e] && rfo_q[e] && xl_q[e] && !abort_q[e];
+        }
+    }
+    assign o_pin_v    = pins != '0;
+    assign o_pin_line = tree_onehot_mux::<N, 50>(pins, lines);
+
+    // ---- state ----
+
+    always_ff {
+        if_reset {
+            for e in 0..N {
+                st_q[e]   = MshrSt::FREE;
+                line_q[e] = '0;
+                crit_q[e] = '0;
+                rfo_q[e]  = 1'b0;
+                xl_q[e]   = 1'b0;
+                way_q[e]  = '0;
+                gen_q[e]  = '0;
+                abort_q[e] = 1'b0;
+                cnt_q[e]  = '0;
+                cv_q[e]   = 1'b0;
+                cs_q[e]   = 1'b0;
+                cdat_q[e] = '0;
+                age_q[e]  = '0;
+            }
+        } else {
+            for e in 0..N {
+                if i_alloc_v && free_oh[e] {
+                    st_q[e]    = MshrSt::WAIT_LAUNCH;
+                    line_q[e]  = i_alloc_line;
+                    crit_q[e]  = i_alloc_crit;
+                    rfo_q[e]   = i_alloc_rfo;
+                    xl_q[e]    = i_alloc_xl;
+                    gen_q[e]   = gen_q[e] + 1;
+                    abort_q[e] = 1'b0;
+                    cnt_q[e]   = '0;
+                    cv_q[e]    = 1'b0;
+                    cs_q[e]    = 1'b0;
+                    for f in 0..N {
+                        age_q[f][e] = live[f];
+                        age_q[e][f] = 1'b0;
+                    }
+                } else if wl[e] {
+                    if i_up_v && i_up_line == line_q[e] {
+                        rfo_q[e] = 1'b1;
+                        xl_q[e]  = xl_q[e] || i_up_xl;
+                    }
+                    if i_launch && lc[e] {
+                        st_q[e]  = MshrSt::WAIT_GRANT;
+                        way_q[e] = i_launch_way;
+                    }
+                } else if wg[e] {
+                    if i_grant {
+                        st_q[e]    = MshrSt::FILL;
+                        abort_q[e] = inv_e[e];
+                    }
+                } else if fl[e] {
+                    abort_q[e] = abn[e];
+                    if ev_c[e] {
+                        cs_q[e] = 1'b1;
+                    }
+                    if i_grant {
+                        if cnt_q[e] == 3'd0 {
+                            cdat_q[e] = i_mem_rdata;
+                            cv_q[e]   = 1'b1;
+                        }
+                        cnt_q[e] = cnt_q[e] + 1;
+                        if last[e] {
+                            st_q[e] = MshrSt::DONE;
+                        }
+                    }
+                } else if dn[e] {
+                    st_q[e] = MshrSt::FREE;
+                }
+            }
+        }
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var chk_q: logic<2>;
+        var bad  : logic<2>;
+        always_comb {
+            bad = 2'd0;
+            for e in 0..N {
+                for f in 0..N {
+                    if e != f && live[e] && live[f] && set_of(line_q[e]) == set_of(line_q[f]) {
+                        bad[0] = 1'b1;
+                    }
+                }
+            }
+            bad[1] = tree_popcount::<N, CW>(fc) >: 1;
+        }
+        always_ff {
+            if_reset {
+                chk_q = 2'd0;
+            } else {
+                chk_q = chk_q | bad;
+            }
+        }
+        assign o_chk = chk_q;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}
