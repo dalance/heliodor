@@ -1,0 +1,190 @@
+// dcache_tags: the line state of the dcache: one tag copy per reader, and
+// per set and way the valid, owned (E/M) and dirty (M) bits, with a PLRU
+// tree per set.
+//
+// Ports (timing contract):
+//   i_rd_line[r] -> o_rd_* : combinational lookup of reader r against the
+//                     registered state: the ways holding the line, the valid,
+//                     owned and dirty bits and the PLRU tree of its set, and
+//                     the four tags of the set
+//   i_ins_*         : a fill installs its line on this edge: the tag in every
+//                     copy, valid = i_ins_ok, owned = i_ins_excl, clean
+//   i_clr_*[k]      : drop a way on this edge (invalid and clean)
+//   i_mrk_*[k]      : make a way dirty on this edge
+//   i_pl_*[k]       : a hit on a way points its set's PLRU away from it; of
+//                     several hits on one set a registered toggle takes one;
+//                     an install does the same for the installed way, after
+//                     the hits
+// Owns:
+//   - every copy holds the same tags: the install is their only write
+//   - an installed or dropped way is clean
+// Rationale:
+//   - the tags are 1R1W arrays, one copy per reader; valid, owned and dirty
+//     stay flops because they are read associatively and several ways of a
+//     set may change in one cycle
+pub module dcache_tags #(
+    param INDEX_W: u32 = 6,
+    param RD_N   : u32 = 1,
+    param CLR_N  : u32 = 1,
+    param MRK_N  : u32 = 1,
+    param PL_N   : u32 = 1,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_rd_line : input  logic<50>            [RD_N]   ,
+    o_rd_hv   : output logic<4>             [RD_N]   ,
+    o_rd_valid: output logic<4>             [RD_N]   ,
+    o_rd_excl : output logic<4>             [RD_N]   ,
+    o_rd_dirty: output logic<4>             [RD_N]   ,
+    o_rd_plru : output logic<3>             [RD_N]   ,
+    o_rd_tag  : output logic<50 - INDEX_W>  [RD_N, 4],
+
+    i_ins_v   : input logic          ,
+    i_ins_line: input logic<50>      ,
+    i_ins_way : input logic<2>       ,
+    i_ins_ok  : input logic          ,
+    i_ins_excl: input logic          ,
+
+    i_clr_v  : input logic          [CLR_N],
+    i_clr_set: input logic<INDEX_W> [CLR_N],
+    i_clr_way: input logic<2>       [CLR_N],
+
+    i_mrk_v  : input logic          [MRK_N],
+    i_mrk_set: input logic<INDEX_W> [MRK_N],
+    i_mrk_way: input logic<2>       [MRK_N],
+
+    i_pl_v  : input logic          [PL_N],
+    i_pl_set: input logic<INDEX_W> [PL_N],
+    i_pl_way: input logic<2>       [PL_N],
+) {
+    const SETS : u32 = 1 << INDEX_W;
+    const TAG_W: u32 = 50 - INDEX_W;
+
+    var valid_q: logic<4> [SETS];
+    var excl_q : logic<4> [SETS];
+    var dirty_q: logic<4> [SETS];
+    var plru_q : logic<3> [SETS];
+    var tog_q  : logic          ;
+
+    let ins_set: logic<INDEX_W> = i_ins_line[INDEX_W - 1:0];
+    let ins_tag: logic<TAG_W>   = i_ins_line[49:INDEX_W];
+
+    for r in 0..RD_N :g_rd {
+        let set: logic<INDEX_W> = i_rd_line[r][INDEX_W - 1:0];
+        inst u_tag: dcache_tagbank #(
+            INDEX_W     ,
+            TAG_W: TAG_W,
+        ) (
+            clk                                    ,
+            rst                                    ,
+            i_t_we_0 : i_ins_v && i_ins_way == 2'd0,
+            i_t_idx_0: ins_set                     ,
+            i_t_val_0: ins_tag                     ,
+            i_t_we_1 : i_ins_v && i_ins_way == 2'd1,
+            i_t_idx_1: ins_set                     ,
+            i_t_val_1: ins_tag                     ,
+            i_t_we_2 : i_ins_v && i_ins_way == 2'd2,
+            i_t_idx_2: ins_set                     ,
+            i_t_val_2: ins_tag                     ,
+            i_t_we_3 : i_ins_v && i_ins_way == 2'd3,
+            i_t_idx_3: ins_set                     ,
+            i_t_val_3: ins_tag                     ,
+            i_ridx   : set                         ,
+            o_tag_0  : o_rd_tag[r][0]              ,
+            o_tag_1  : o_rd_tag[r][1]              ,
+            o_tag_2  : o_rd_tag[r][2]              ,
+            o_tag_3  : o_rd_tag[r][3]              ,
+        );
+        always_comb {
+            for w in 0..4 {
+                o_rd_hv[r][w] = valid_q[set][w] && o_rd_tag[r][w] == i_rd_line[r][49:INDEX_W];
+            }
+        }
+        assign o_rd_valid[r] = valid_q[set];
+        assign o_rd_excl[r]  = excl_q[set];
+        assign o_rd_dirty[r] = dirty_q[set];
+        assign o_rd_plru[r]  = plru_q[set];
+    }
+
+    // Of several PLRU updates on one set, the toggle keeps the first or the
+    // last.
+    var pl_v  : logic<PL_N>;
+    var pl_tog: logic      ;
+    always_comb {
+        pl_tog = 1'b0;
+        for k in 0..PL_N {
+            pl_v[k] = i_pl_v[k];
+        }
+        for k in 0..PL_N {
+            for k2 in 0..PL_N {
+                if k2 >: k && pl_v[k] && pl_v[k2] && i_pl_set[k] == i_pl_set[k2] {
+                    pl_tog = 1'b1;
+                    if tog_q {
+                        pl_v[k] = 1'b0;
+                    } else {
+                        pl_v[k2] = 1'b0;
+                    }
+                }
+            }
+        }
+    }
+
+    function plru_next (
+        t: input logic<3>,
+        w: input logic<2>,
+    ) -> logic<3> {
+        return if w[1] ? {1'b0, t[1], !w[0]} : {1'b1, !w[0], t[0]};
+    }
+
+    var clr: logic<4> [SETS];
+    var mrk: logic<4> [SETS];
+    always_comb {
+        for s in 0..SETS {
+            for w in 0..4 {
+                var c: logic<CLR_N>;
+                var m: logic<MRK_N>;
+                for k in 0..CLR_N {
+                    c[k] = i_clr_v[k] && i_clr_set[k] == s && i_clr_way[k] == w;
+                }
+                for k in 0..MRK_N {
+                    m[k] = i_mrk_v[k] && i_mrk_set[k] == s && i_mrk_way[k] == w;
+                }
+                clr[s][w] = c != '0;
+                mrk[s][w] = m != '0;
+            }
+        }
+    }
+
+    always_ff {
+        if_reset {
+            tog_q = 1'b0;
+            for s in 0..SETS {
+                valid_q[s] = 4'd0;
+                excl_q[s]  = 4'd0;
+                dirty_q[s] = 4'd0;
+                plru_q[s]  = 3'd0;
+            }
+        } else {
+            if pl_tog {
+                tog_q = !tog_q;
+            }
+            for s in 0..SETS {
+                for w in 0..4 {
+                    let ins: logic = i_ins_v && ins_set == s && i_ins_way == w;
+                    valid_q[s][w] = if ins ? i_ins_ok : valid_q[s][w] && !clr[s][w];
+                    excl_q[s][w]  = if ins ? i_ins_excl : excl_q[s][w];
+                    dirty_q[s][w] = if ins || clr[s][w] ? 1'b0 : dirty_q[s][w] || mrk[s][w];
+                }
+                for k in 0..PL_N {
+                    if pl_v[k] && i_pl_set[k] == s {
+                        plru_q[s] = plru_next(plru_q[s], i_pl_way[k]);
+                    }
+                }
+                if i_ins_v && ins_set == s {
+                    plru_q[s] = plru_next(plru_q[s], i_ins_way);
+                }
+            }
+        }
+    }
+}

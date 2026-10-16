@@ -1,0 +1,250 @@
+// dcache_data: the data array of the dcache: DC_NB dword-interleaved banks
+// (dword o of a line in bank o % DC_NB), each a dcache_bank whose row holds
+// that bank's dwords of one set for all four ways.
+//
+// Ports (timing contract):
+//   i_rd_*[p]    : the reads of the ports in A: each needs the bank of its
+//                  dword and, for two dwords, the next bank. A bank reads one
+//                  row: requests on the same row share it, else the HEAD
+//                  port's non-pipe request (i_rd_np), else the oldest by
+//                  i_rd_rob wins; o_rd_ok[p] = the port got every bank
+//   i_cap_v/set  : a writeback capture takes every bank in A, for its set;
+//                  no port gets a bank
+//   i_v_dw/way[p] -> o_v_data[p] : in V = A + 1, the dword pair {dw + 1, dw}
+//                  of way from the rows read in A
+//   i_cap_way -> o_cap_data : in A + 1 of a capture, the eight dwords of the
+//                  captured way
+//   i_beat_*, i_wt_*, i_sx_*, i_dr_* : the writes of this cycle (fill beat,
+//                  write-through merge, exclusive merge, drain merge), at most
+//                  one per bank; written on this edge and forwarded to a read
+//                  of the same row
+//   o_wconf      : two writes on one bank this cycle (checker input)
+//   o_share      : a port shared a row another port won (event)
+// Owns:
+//   - a read that loses a bank to another row or to a capture returns
+//     o_rd_ok = 0 and its data is not used
+// Rationale:
+//   - a row holds all ways, so the way is chosen in V from the registered
+//     row, and a capture reads a whole line with one row per bank
+pub module dcache_data::<CFG: core_cfg> #(
+    param INDEX_W: u32 = 6,
+) (
+    clk: input clock,
+    rst: input reset,
+
+    i_rd_v  : input  logic                                   [CFG::MEM_W],
+    i_rd_set: input  logic<INDEX_W>                          [CFG::MEM_W],
+    i_rd_dw : input  logic<3>                                [CFG::MEM_W],
+    i_rd_two: input  logic                                   [CFG::MEM_W],
+    i_rd_rob: input  logic<core_types::<CFG>::ROB_TAG_W>     [CFG::MEM_W],
+    i_rd_np : input  logic                                               ,
+    o_rd_ok : output logic                                   [CFG::MEM_W],
+    i_cap_v : input  logic                                               ,
+    i_cap_set: input logic<INDEX_W>                                      ,
+
+    i_v_dw  : input  logic<3>   [CFG::MEM_W],
+    i_v_way : input  logic<2>   [CFG::MEM_W],
+    o_v_data: output logic<128> [CFG::MEM_W],
+    i_cap_way : input  logic<2>     ,
+    o_cap_data: output logic<64> [8],
+
+    i_beat_v   : input logic          ,
+    i_beat_set : input logic<INDEX_W> ,
+    i_beat_dw  : input logic<3>       ,
+    i_beat_way : input logic<2>       ,
+    i_beat_data: input logic<64>      ,
+
+    i_wt_v    : input logic          ,
+    i_wt_set  : input logic<INDEX_W> ,
+    i_wt_dw   : input logic<3>       ,
+    i_wt_way  : input logic<2>       ,
+    i_wt_mask : input logic<16>      ,
+    i_wt_wdata: input logic<128>     ,
+
+    i_sx_v    : input logic          ,
+    i_sx_set  : input logic<INDEX_W> ,
+    i_sx_dw   : input logic<3>       ,
+    i_sx_way  : input logic<2>       ,
+    i_sx_mask : input logic<16>      ,
+    i_sx_wdata: input logic<128>     ,
+
+    i_dr_v   : input logic             ,
+    i_dr_set : input logic<INDEX_W>    ,
+    i_dr_way : input logic<2>          ,
+    i_dr_data: input logic<64>      [8],
+    i_dr_strb: input logic<8>       [8],
+
+    o_wconf: output logic,
+    o_share: output logic,
+) {
+    import core_types::<CFG>::*;
+
+    const MW   : u32 = CFG::MEM_W;
+    const NB   : u32 = CFG::DC_NB;
+    const BW   : u32 = $clog2(NB);
+    const DPB  : u32 = 8 / NB;
+    const PN   : u32 = DPB * 4;
+    const ROW_W: u32 = PN * 64;
+    const SETS : u32 = 1 << INDEX_W;
+
+    function bank_of (
+        o: input logic<3>,
+    ) -> logic<BW> {
+        return o[BW - 1:0];
+    }
+    function pos_oh (
+        o: input logic<3>,
+        w: input logic<2>,
+    ) -> logic<PN> {
+        var r: logic<PN>;
+        for k in 0..DPB {
+            for ww in 0..4 {
+                r[k * 4 + ww] = (o >> BW) == k && w == ww;
+            }
+        }
+        return r;
+    }
+    function row_get (
+        row: input logic<ROW_W>,
+        o  : input logic<3>    ,
+        w  : input logic<2>    ,
+    ) -> logic<64> {
+        var words: logic<64> [PN];
+        for i in 0..PN {
+            words[i] = row[i * 64+:64];
+        }
+        return tree_onehot_mux::<PN, 64>(pos_oh(o, w), words);
+    }
+    function row_mask (
+        o : input logic<3>,
+        w : input logic<2>,
+        be: input logic<8>,
+    ) -> logic<ROW_W> {
+        var r : logic<ROW_W>;
+        var oh: logic<PN>   ;
+        oh = pos_oh(o, w);
+        for i in 0..PN {
+            for b in 0..8 {
+                r[i * 64 + b * 8+:8] = {oh[i] && be[b] repeat 8};
+            }
+        }
+        return r;
+    }
+    function rep (
+        d: input logic<64>,
+    ) -> logic<ROW_W> {
+        return {d repeat PN};
+    }
+    // The bank write of a 1-2 dword merge {wdata, mask} at dword dw of way w.
+    function x_on (
+        b  : input u32      ,
+        dw : input logic<3> ,
+        two: input logic    ,
+    ) -> logic {
+        return bank_of(dw) == b || (two && bank_of(dw + 1) == b);
+    }
+
+    function dr_any (
+        bb: input u32,
+    ) -> logic {
+        var a: logic<DPB>;
+        for k in 0..DPB {
+            a[k] = i_dr_strb[k * NB + bb] != 8'd0;
+        }
+        return a != '0;
+    }
+
+    var b_rd : logic<ROW_W> [NB];
+    var b_wc : logic<NB>;
+    var b_sh : logic<NB>;
+    var b_got: logic<MW> [NB];
+    var b_ned: logic<MW> [NB];
+
+    for b in 0..NB :g_bank {
+        var need: logic<MW>;
+        var win : logic<MW>;
+        var got : logic<MW>;
+        var idx : logic<INDEX_W>;
+        always_comb {
+            for p in 0..MW {
+                need[p] = i_rd_v[p] && x_on(b, i_rd_dw[p], i_rd_two[p]);
+            }
+            win = if i_rd_np && need[HEAD_PORT] ? (1 << HEAD_PORT) as MW : tree_oldest::<MW, ROB_TAG_W>(need, i_rd_rob);
+            idx = if i_cap_v ? i_cap_set : tree_onehot_mux::<MW, INDEX_W>(win, i_rd_set);
+            for p in 0..MW {
+                got[p] = need[p] && !i_cap_v && (win[p] || i_rd_set[p] == idx);
+            }
+        }
+        assign b_got[b] = got;
+        assign b_ned[b] = need;
+        assign b_sh[b]  = (got & ~win) != '0;
+
+        let bt_on: logic = i_beat_v && bank_of(i_beat_dw) == b;
+        let wt_on: logic = i_wt_v && x_on(b, i_wt_dw, i_wt_mask[15:8] != 8'd0);
+        let sx_on: logic = i_sx_v && x_on(b, i_sx_dw, i_sx_mask[15:8] != 8'd0);
+        let dr_on: logic = i_dr_v && dr_any(b);
+
+        var wd: logic<ROW_W>;
+        var wm: logic<ROW_W>;
+        var wi: logic<INDEX_W>;
+        always_comb {
+            let x_wt : logic     = wt_on;
+            let x_set: logic<INDEX_W> = if x_wt ? i_wt_set : i_sx_set;
+            let x_dw : logic<3>  = if x_wt ? i_wt_dw : i_sx_dw;
+            let x_way: logic<2>  = if x_wt ? i_wt_way : i_sx_way;
+            let x_m  : logic<16> = if x_wt ? i_wt_mask : i_sx_mask;
+            let x_d  : logic<128> = if x_wt ? i_wt_wdata : i_sx_wdata;
+            let x_lo : logic     = bank_of(x_dw) == b;
+            if bt_on {
+                wi = i_beat_set;
+                wd = rep(i_beat_data);
+                wm = row_mask(i_beat_dw, i_beat_way, 8'hff);
+            } else if wt_on || sx_on {
+                wi = x_set;
+                wd = if x_lo ? rep(x_d[63:0]) : rep(x_d[127:64]);
+                wm = if x_lo ? row_mask(x_dw, x_way, x_m[7:0]) : row_mask(x_dw + 1, x_way, x_m[15:8]);
+            } else {
+                wi = i_dr_set;
+                wd = '0;
+                wm = '0;
+                for k in 0..DPB {
+                    let o: u32 = k * NB + b;
+                    wd = wd | (rep(i_dr_data[o]) & row_mask(o as 3, i_dr_way, 8'hff));
+                    wm = wm | row_mask(o as 3, i_dr_way, i_dr_strb[o]);
+                }
+            }
+        }
+        assign b_wc[b] = (bt_on as 3) + (wt_on as 3) + (sx_on as 3) + (dr_on as 3) >: 3'd1;
+
+        inst u_bank: dcache_bank #(
+            SETS : SETS ,
+            ROW_W: ROW_W,
+        ) (
+            clk                                    ,
+            rst                                    ,
+            i_ridx : idx                           ,
+            o_rdata: b_rd[b]                       ,
+            i_we   : bt_on || wt_on || sx_on || dr_on,
+            i_widx : wi                            ,
+            i_wdata: wd                            ,
+            i_wmask: wm                            ,
+        );
+    }
+
+    always_comb {
+        for p in 0..MW {
+            var ok: logic<NB>;
+            for b in 0..NB {
+                ok[b] = !b_ned[b][p] || b_got[b][p];
+            }
+            o_rd_ok[p]  = ok == '1;
+            o_v_data[p] = {row_get(b_rd[bank_of(i_v_dw[p] + 1)], i_v_dw[p] + 1, i_v_way[p]),
+                           row_get(b_rd[bank_of(i_v_dw[p])], i_v_dw[p], i_v_way[p])};
+        }
+        for o in 0..8 {
+            o_cap_data[o] = row_get(b_rd[o % NB], o as 3, i_cap_way);
+        }
+    }
+    assign o_wconf = b_wc != '0;
+    assign o_share = b_sh != '0;
+}

@@ -14,7 +14,7 @@ the struct definitions in src/core/common/core_types.veryl and xlate_pkg.veryl
 
     <event> <gate>[:w2|:w4][,<gate>...]
 
-<event> names a leaf (`ad.r_bank`) or a prefix of leaves (`mp`, `iq[1]`);
+<event> names a leaf (`dc.r_bank`) or a prefix of leaves (`mp`, `iq[1]`);
 an event without an index matches every element (`mp.split` = `mp[*].split`);
 `flush.full_kind.<KIND>` names a RedirKind count. The row passes if the sum
 over its gates is nonzero. A row whose gates have no log is reported as not
