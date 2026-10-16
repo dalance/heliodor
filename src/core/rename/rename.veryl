@@ -26,10 +26,10 @@
 //   - neither RAT maps one physical register to two architectural registers
 //   - after a walk ends, or on the restore edge, the speculative RAT equals
 //     the RAT just after keep was renamed
-//   - a checkpoint is held by one op in the ROB: renamed BRU ops take free
-//     slots in lane order (one each while slots last, the rest recover by
-//     walk); a slot frees when its op resolves without a mispredict, is
-//     killed, or is restored
+//   - a checkpoint is held by one op in the ROB: the oldest BRU op of a
+//     group takes the lowest free slot (none left: it recovers by walk); a
+//     slot frees when its op resolves without a mispredict, is killed, or is
+//     restored
 // Rationale:
 //   - one 64-entry table keyed by {RegClass, arch} for both classes, so
 //     dependency checks, walk and restore are one loop and int/fp mappings
@@ -40,6 +40,9 @@
 //   - a checkpoint is needed only for its op's own mispredict, so it frees
 //     at a correct resolve rather than at retire; a mispredicted op whose
 //     kill was not adopted keeps it until the commit backstop's full kill
+//   - one checkpoint per group keeps the image to one RAT copy per cycle;
+//     dispatch ends the group before a second BRU op when the first one
+//     holds a checkpoint
 //   - an exhausted pool never stalls rename
 module rename::<CFG: core_cfg> (
     clk      : input  clock                                                                             ,
@@ -76,7 +79,7 @@ module rename::<CFG: core_cfg> (
     let restore: logic = i_kill.valid && !i_kill.full && i_kill.ckpt_v && NC != 0;
 
     // Checkpoint pool state and the per-lane slot choice, driven in g_pool.
-    var ck_req : logic<W>             ; // branch lanes
+    var ck_req : logic<W>             ; // the group's oldest branch lane
     var ck_v   : logic<W>             ;
     var ck_id  : logic<CKPT_W> [W]    ;
     var ck_take: logic<W>             ; // taken lanes that get a checkpoint
@@ -181,9 +184,14 @@ module rename::<CFG: core_cfg> (
 
     // ---- Checkpoint pool ----
 
+    // The oldest branch lane of the group asks for the lowest free slot.
     always_comb {
+        var br: logic<W>;
         for l in 0..W {
-            ck_req[l]  = i_valid[l] && i_op[l].cls.fu == FuKind::BRU;
+            br[l] = i_valid[l] && i_op[l].cls.fu == FuKind::BRU;
+        }
+        ck_req = tree_first::<W>(br);
+        for l in 0..W {
             ck_take[l] = ck_v[l] && l <: i_take;
         }
     }
@@ -203,66 +211,47 @@ module rename::<CFG: core_cfg> (
     } else :g_pool {
         var img_q: logic<PREG_W> [NC * RAT_N];
 
-        // The RAT just after lane l: its own and older lanes' writes applied.
-        var aft: logic<PREG_W> [W * RAT_N];
+        let fs   : logic<NC>     = tree_first::<NC>(~ckv_q);
+        let fs_id: logic<CKPT_W> = tree_onehot_enc::<NC, CKPT_W>(fs);
         always_comb {
             for l in 0..W {
-                for e in 0..RAT_N {
-                    var m: logic<W>;
-                    for j in 0..W {
-                        m[j] = j <= l && wr[j] && dkey[j] == e;
-                    }
-                    aft[l * RAT_N + e] = if m != '0 ? tree_onehot_mux::<W, PREG_W>(last_lane(m), pidx) : spec_q[e];
-                }
+                ck_v[l]  = ck_req[l] && fs != 0;
+                ck_id[l] = fs_id;
             }
         }
 
-        // Branch lane l takes the free slot whose rank among the free slots
-        // equals l's rank among the branch lanes.
-        const RW: u32 = tag_pkg::idx_w(NC + W + 1);
-
-        var rank : logic<RW> [W] ;
-        var frank: logic<RW> [NC];
-        var ck_oh: logic<NC> [W] ;
+        // The RAT just after the checkpointed lane: its own and older lanes'
+        // writes applied.
+        let upto: logic<W> = ~(tree_prefix_or::<W>(ck_req) << 1);
+        var aft : logic<PREG_W> [RAT_N];
         always_comb {
-            tree_prefix_count::<W, RW>(ck_req << 1, rank);
-            tree_prefix_count::<NC, RW>(~ckv_q << 1, frank);
-            for l in 0..W {
-                for c in 0..NC {
-                    ck_oh[l][c] = ck_req[l] && !ckv_q[c] && frank[c] == rank[l];
+            for e in 0..RAT_N {
+                var m: logic<W>;
+                for j in 0..W {
+                    m[j] = upto[j] && wr[j] && dkey[j] == e;
                 }
-                ck_v[l]  = ck_oh[l] != 0;
-                ck_id[l] = tree_onehot_enc::<NC, CKPT_W>(ck_oh[l]);
+                aft[e] = if m != '0 ? tree_onehot_mux::<W, PREG_W>(last_lane(m), pidx) : spec_q[e];
             }
         }
 
-        var al    : logic<W>             [NC]       ; // lane taking slot c on this edge
-        var fr    : logic<NC>                       ;
-        var al_own: RobTag               [NC]       ;
-        var al_img: logic<PREG_W>        [NC * RAT_N];
-        var tg    : logic<ROB_TAG_W>     [W]        ;
+        var tg: logic<ROB_TAG_W> [W];
         always_comb {
             for l in 0..W {
                 tg[l] = i_rob_tag[l];
             }
+        }
+        let al_any: logic  = ck_take != '0;
+        let al_own: RobTag = tree_onehot_mux::<W, ROB_TAG_W>(ck_req, tg) as RobTag;
+
+        var fr: logic<NC>;
+        always_comb {
             for c in 0..NC {
                 var rh: logic<BRU_N>;
-                for l in 0..W {
-                    al[c][l] = ck_take[l] && ck_oh[l][c];
-                }
                 for b in 0..BRU_N {
                     let w    : WbPacket = i_wb[bru_port(b)];
                     rh[b] = w.valid && w.br.valid && !w.br.mispred && w.tag.rob == own_q[c];
                 }
-                fr[c]     = |rh || killed(i_kill, own_q[c]) || (restore && i_kill.ckpt == c);
-                al_own[c] = tree_onehot_mux::<W, ROB_TAG_W>(al[c], tg) as RobTag;
-                for e in 0..RAT_N {
-                    var col: logic<PREG_W> [W];
-                    for l in 0..W {
-                        col[l] = aft[l * RAT_N + e];
-                    }
-                    al_img[c * RAT_N + e] = tree_onehot_mux::<W, PREG_W>(al[c], col);
-                }
+                fr[c] = |rh || killed(i_kill, own_q[c]) || (restore && i_kill.ckpt == c);
             }
             for e in 0..RAT_N {
                 var col: logic<PREG_W> [NC];
@@ -285,11 +274,11 @@ module rename::<CFG: core_cfg> (
                 for c in 0..NC {
                     if full {
                         ckv_q[c] = 1'b0;
-                    } else if al[c] != '0 {
+                    } else if al_any && fs[c] {
                         ckv_q[c] = 1'b1;
-                        own_q[c] = al_own[c];
+                        own_q[c] = al_own;
                         for e in 0..RAT_N {
-                            img_q[c * RAT_N + e] = al_img[c * RAT_N + e];
+                            img_q[c * RAT_N + e] = aft[e];
                         }
                     } else if fr[c] {
                         ckv_q[c] = 1'b0;
