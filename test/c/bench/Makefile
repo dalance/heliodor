@@ -13,7 +13,7 @@ LDFLAGS  = -T link.ld -nostdlib
 HEX_DIR  = ../../hex
 ELF2HEX  = python3 ../bin2hex.py
 
-BENCHMARKS = median memcpy multiply
+BENCHMARKS = median memcpy multiply fpmm spmv
 
 HEXES = $(foreach b,$(BENCHMARKS),$(HEX_DIR)/bench_$(b).hex)
 
@@ -65,6 +65,33 @@ bench_multiply.elf: start.o syscalls.o multiply_main.o multiply.o
 $(HEX_DIR)/bench_multiply.hex: bench_multiply.elf
 	$(OBJCOPY) -O binary $< bench_multiply.bin
 	$(ELF2HEX) bench_multiply.bin $@ 0x80000000
+
+# --- fpmm: upstream mm kernel (needs builtins for fma -> fmadd.d) ---
+FPCFLAGS = $(filter-out -ffreestanding -fno-builtin,$(CFLAGS)) -I$(UPSTREAM)/mm
+
+mm.o: $(UPSTREAM)/mm/mm.c
+	$(CC) $(FPCFLAGS) -c -o $@ $<
+
+fpmm_main.o: fpmm_main.c
+	$(CC) $(FPCFLAGS) -c -o $@ $<
+
+bench_fpmm.elf: start.o syscalls.o fpmm_main.o mm.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(HEX_DIR)/bench_fpmm.hex: bench_fpmm.elf
+	$(OBJCOPY) -O binary $< bench_fpmm.bin
+	$(ELF2HEX) bench_fpmm.bin $@ 0x80000000
+
+# --- spmv ---
+spmv_main.o: $(UPSTREAM)/spmv/spmv_main.c
+	$(CC) $(CFLAGS) -I$(UPSTREAM)/spmv -c -o $@ $<
+
+bench_spmv.elf: start.o syscalls.o spmv_main.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(HEX_DIR)/bench_spmv.hex: bench_spmv.elf
+	$(OBJCOPY) -O binary $< bench_spmv.bin
+	$(ELF2HEX) bench_spmv.bin $@ 0x80000000
 
 clean:
 	rm -f *.o *.elf *.bin
