@@ -49,10 +49,10 @@
 | GL-B | | | W2 | W2, W4 | 同 | 同 | 同 |
 | GB1 | | | W2: 6.6, 7.1 | W2, W4 | 同 | + 7.1v | 同 |
 | GT4, GB2 | | | | | W2, W4 | 同 | 同 |
-| GB4 | | | | (新コアの SMP は無い。回し方を D7 の測定で決める、§6.3) | M3 の決定に従う (W2, W4) | 同 | 同 |
+| GB4 | | | | (新コアの SMP は無い。回し方を D7 の測定で決めた、§6.3) | W2: メモリ系の変更ごと。W4: マイルストーン末 (§6.3) | 同 | 同 |
 | GH | | | | | | W2, W4 | 同 |
 | GX | | | | 決定的なテスト全部 | 同 | + H/V | 同 |
-| GV | | | N=1 boot (W2) | N=1 (W2, W4) | + litmus4, N=2, N=4 | + hvlinux | 全部 |
+| GV | | | N=1 boot (W2) | N=1 (W2, W4) | + litmus4, N=2, N=4 (NBA の相互確認だけで、N=4 の判定には使わない、§6.3) | + hvlinux | 全部 |
 | GS / GF | S1 の対照を記録 | 記録 | 記録 | 記録 + M3 判定の材料 | 同 | 同 | 同 |
 
 旧コア (V14) は M6 まで既定コアであり、CLAUDE.md の梯子 1-5 (既定、litmus4、N=2 boot、N=4 boot、hvlinux) をそのまま回し続ける。
@@ -89,6 +89,38 @@ M2 は統合ブランチ `phase15/m2-int` を master の `4fec4e4` に merge し
 - §7.1 の未充足の行 (§7.1 の M2 末の状態)。
 - 設計書 §L.16 の Svadu の残り: 失敗する SC も D を立てる (未決)、A/D の書き込みは M4 まで STORE_WT。設計書 U28 の残り (他 hart の dirty コピーの recall、DRAM からの uncached fetch が自 hart の dirty line を見ない) は M4。
 - 付録 B の B30 の case 4 は、直した語での golden 上の再確認をまだしていない (新コアは 4 case とも仕様どおり)。
+
+
+### 1.5 M3 のゲートの結果 (手順 1-6、2026-10-17)
+
+M3 の手順 1-6 は master の `13241df` までに入った (設計書の「M3 の進捗」)。サイクル数は 5.15 N=1 boot のもので、pass/fail の run の値は 10,000 サイクル刻みである。
+
+| 時点 | ゲート | 結果 |
+|---|---|---|
+| 手順 2 (`64fea45`) | G0 | 850 passed、0 failed、34 ignored。W4 の arch ラッパを lockstep で生成し直し、W2 と同じ 187 本が W4 でも lockstep で一致 |
+| 手順 2 | GA / GL-C (W4) | 696/696 pass、hash 690/690 |
+| 手順 2 | GL-B (W4) | 13,387,428 サイクル、record 10,417,776 は golden と同数、最終 hash `74d4b7982390260f` (W2 と同じ)、不一致 0 |
+| 手順 2 | GB1 (W4) | 5.15 13,424,873 (instret 10,425,675。W2 は 16,433,955)、6.6 18,519,631、7.1 18,003,545 |
+| 手順 2 | GV (W4) | `sim/verilator/tb_soc_linux_boot_w4.sv` が PASSED。cycles、instret、record 10,428,106、trace hash `0277005cc4357fd4` が native の pass/fail run と一致。1,869 s (7.2k cy/s) |
+| 手順 2 | GX | 既定ログの W2/W4 の同名テスト 285 対で H 行を比べ、282 対が一致。違う 3 対は説明済み: `probe_b13_csrrd` (rdtime。mtime がサイクル由来)、`probe_b05_sc` と `mmu_svadu_amo` (W4 で SC が 1 回失敗。予約した line が自 hart の追い出しで消えた。D8 が許す失敗で、retry で成功する) |
+| 手順 2 | GF (W4) | `fire_check.py` exit 0 (default、act、boot、bootls) |
+| 手順 4 (`d658df4`) | G0 / GA / GL-C | 850 passed。ACT4 は W2 で 696/696、hash 690/690 |
+| 手順 4 | GL-B | W2 15,713,503 (M2 末は 16,360,435)、W4 12,641,493。hash は golden と一致 |
+| 手順 4 | GB1 | W2: 5.15 15,790,000 (M2 末は 16,433,955)、6.6 21,428,628、7.1 19,971,632。W4: 5.15 12,660,000 (手順 2 は 13,424,873) |
+| 手順 4 | V14 (`c23af0c`、`v14_dcache` の凍結後) | litmus4 3.87M、N=2 16.42M、hvlinux 22.32M、N=4 25.18M、すべて pass。dhrystone 235,804/264,834、coremark 394,546/374,357 はビット一致 |
+| 手順 5 (`56b5b46`) | G0 | 852 passed (`test_w{2,4}_mem_mem2` を追加。W2 4,176 / W4 2,847 サイクルで hash 一致) |
+| 手順 5 | GA / GL-C | W2 と W4 で 696/696、hash 690/690 |
+| 手順 5 | GL-B / GB1 | GL-B は W2 15,713,503 / W4 12,641,493 (手順 4 と同一)。GB1 は W2 15,790,000 / 21,428,628 / 19,971,632、W4 12,660,000 / 17,601,691 / 17,025,059 (5.15 / 6.6 / 7.1)。checker はすべて 0 |
+| 手順 5 | GF | 0 の行なし。新しい 6 行は W4 の default で発火 |
+| 手順 6 (`e7b9419`) | G0 | 852 passed、0 failed |
+| 手順 6 | GA / GL-C | W2 と W4 で 696/696、hash 690/690 |
+| 手順 6 | GL-B | W2 15,593,486 (−0.76 %)、W4 12,442,044 (−1.58 %)。hash `74d4b7982390260f` |
+| 手順 6 | GB1 | W2 15,670,000 / 21,325,727 / 19,815,511、W4 12,480,000 / 17,490,395 / 16,921,813 (5.15 / 6.6 / 7.1) |
+| 手順 6 | GF | exit 0。新しい行 `ren.ck_alloc`/`ck_restore`/`ck_none`、`disp.cut_ck`、`iss` はすべて 0 より大きい |
+
+- 手順 4 の W2 6.6 は、メモの値 21,428,720 が最終版より前のもので、master の `d658df4` で走らせ直した 21,428,628 が正しい。
+- GS と D7 の測定は §6.2 と §6.3 に置く。手順 6 の CPU 時間は W2 の boot 4 本で 12,157 s (user)、W4 の 4 本で 34,645 s。測定中のマシンの負荷 (loadavg 7-48) で揺れるので、速度の結論に使うのは同時に走らせた対 (`NUM_CKPT` 0 対 4 の +6.6 %) だけである。
+- 手順 4-6 では GV と GX を記録していない (マイルストーン末に回す)。
 
 ---
 
@@ -421,12 +453,12 @@ H <order> <hash>
 
 | 機構 (event) | 所有者 | 期待するゲート | 判定に使う【M3 で決定】 |
 |---|---|---|---|
-| RETRY: FILL_BUSY / INV_RACE / PREEMPTED / WB_BLOCKED / BANK_CONFLICT | `dcache_port_adapter` | boot / M4 の SMP boot と litmus / boot / boot / W2 の boot (HOLD 中の要求と port 0 予約の前サイクル) と W4 の全テスト | dcache の bank 数 (設計書 §3.2) |
+| RETRY: FILL_BUSY / INV_RACE / PREEMPTED / WB_BLOCKED / BANK_CONFLICT | `dcache_port_adapter` (M2)、`dcache` (M3 から、`dc.r_*`) | boot / M4 の SMP boot と litmus / boot / (M3 の dcache は出さない、設計書 §M.6.7) / W4 の全テスト | dcache の bank 数 (設計書 §3.2。M3 で決定、U19) |
 | kill: partial、full (trap / irq / REPLAY / RETIRE_FLUSH / T8 backstop) | `flush_ctrl` | 全テスト / boot。T8 は W4 (BRU 2 本) で、0 なら同じサイクルに mispredict する分岐 2 本の directed を足す | |
 | commit group の切断理由: alone、lane>0 の例外、SB 予算、retire limit、irq_take | `commit` | arch / boot / lockstep run | |
 | forward hit (SQ、SB)、drain shadow の適用 | `lq`, `sb` | arch (ld_st)、boot | |
 | rename walk (回数、サイクル)、walk 中に捨てた resolve | `rename` | boot | walk 中の kill の扱い (設計書 §5.4 T9)、`NUM_CKPT` |
-| checkpoint pool 枯渇からの walk fallback (M3 から) | `rename` | W4 boot で 0 より大 (設計書 §3.3) | |
+| checkpoint pool 枯渇からの walk fallback (M3 から、`ren.ck_none`) | `rename` | boot で 0 より大 (設計書 §3.3)。M3 で W2 と W4 の boot の両方で発火 | |
 | commit 時 REPLAY (順序違反) | `lq` | 順序違反の directed (§7.4)、SMP boot | |
 | HOLE_FILL の待ち (DIV、FDIV、io、atomic) | `wb_resv` | rv64um div、rv64ud fdiv、boot | |
 | PTW の walk、TLB miss、epoch 不一致による install の破棄 | `ptw`, `tlb` | boot。epoch は walk 中に full kill をかける directed | port 0 のクラス別占有 (設計書 §5.9 の D-PTW) |
@@ -436,7 +468,14 @@ H <order> <hash>
 | atomic: LR、SC 成功/失敗、AMO | `atomic_unit` | rv64ua、boot | |
 | `mem_port_arb` の最大待ちサイクル | `mem_port_arb` | 上限 B (設計書 §5.9 MP4) を超えない | |
 
-上表のうち、M2 末の `CorePerf` に無いもの: RETRY の WB_BLOCKED (adapter の perf に無い)、drain shadow の適用 (shadow のハードウェアが無い、設計書 U8)、NC load の件数、page またぎの分割 (`mp.split` は line 跨ぎだけを数える)、`mem_port_arb` の最大待ちサイクル (カウンタでなく最大値で、`o_perf` に出ていない)、CSR 書き込み後 flush のコスト (件数 `cm.rf_serial` だけ)。checkpoint pool の枯渇は M3。
+上表のうち、M2 末の `CorePerf` に無いもの: RETRY の WB_BLOCKED (adapter の perf に無い。M3 の dcache はこの理由を出さないので、構造的に 0)、drain shadow の適用 (shadow のハードウェアが無い、設計書 U8)、NC load の件数、page またぎの分割 (`mp.split` は line 跨ぎだけを数える)、`mem_port_arb` の最大待ちサイクル (カウンタでなく最大値で、`o_perf` に出ていない)、CSR 書き込み後 flush のコスト (件数 `cm.rf_serial` だけ)。checkpoint pool の枯渇は M3 で `ren.ck_none` として入った。
+
+M3 で `CorePerf` に足したもの (手順ごと。`fire_check.py` は struct 定義から名前と幅を復元するので、表の変更は要らない):
+
+- 手順 4: `dc.*` (`DcachePerf`: accept、hit、crit_hit、attach、alloc、RETRY の理由別 `r_fill_busy`/`r_inv_race`/`r_preempted`/`r_bank`、`share`、`huf`、`launch`、`vic_wb`、排他の pass/fail/busy、`nf_busy`、`unc_done`、`wt_done`、`cmo`、drain の merge/wt/rfo/bank、probe の ack/wb/defer、`ev_skid` など) と `dtlb.lk2` (2 ポート以上の同時 lookup)。
+- 手順 5: `sq.sta_multi`、`sq.fwd_multi`、`sq.ret_multi`、`lq.scan_multi`、`sb.push_multi`、`sb.merge_same` (設計書 §L.20)。checker は `chk_sq` bit 4。
+- 手順 6: `ren.ck_alloc`、`ren.ck_restore`、`ren.ck_none`、`disp.cut_ck`、`iss[p]` (exec ポート p が op を受理したサイクル。`ep[p]` は「source が bypass の値を取った」で、ポートの使用率ではない)。checker は `chk_rename` bit 2 と bit 3 (設計書 §R.3.5)。
+- matrix に足した行: `dc.*` と `dtlb.lk2` (手順 4)、手順 5 の 6 本 (default)、`ren.ck_alloc`/`ck_restore` (default)、`ren.ck_none` (boot)、`disp.cut_ck` (default)、`iss` (default)。手順 2 の W4 の `--zero` (どのログでも 0): `disp.cut_int`/`cut_fp`、`iq[1].tok_wait`、DIV と FDIV 以外のポートの `rs[*].hf_*`、`ad.empty_gen`/`excl_fail`/`ev_skid`、`dtlb`/`itlb.fill_inv`、`ptw_i.full`/`d_wr`、`at.fail`/`watch`/`backoff`、`io.retry` (`ad.*` は手順 4 で adapter とともに消えた)。
 
 ---
 
@@ -451,11 +490,12 @@ H <order> <hash>
 | N4 | 3793.2 s | 25.2M | 6.64k | 26.6k |
 | N8 | 15216.2 s | 36.6M | 2.41k | 19.2k |
 
-N4 の値は `.build/test_timings` のもので、CLAUDE.md の 4408 s は 2026-08-05 に別の実行で測った壁時間である (設計書 D7 の 4408 s はこちら)。どちらも測定条件 (`VERYL_AOT_C_ASYNC` の設定、並行実行の有無) が記録されていないので、§6.3 の matched 測定で置き換える。2026-06-11 に同じ木で直列に測った値は N1/N2/N4 で 251k/118k/50.6k cy/s であり、ほぼ線形だった。N=4 の段差 (hart-cycle あたり約 2.7 倍) はその後に現れた。CLAUDE.md の「N=1 約 1 分、N=2 約 3 分」は外挿値で、実測では約 2.4 分と約 7.5 分である。旧コアの梯子 (litmus4 523 s + N2 449 s + N4 3793 s + hv 243 s) は直列で約 83 分で、そのうち N4 boot が 76 % を占める。Verilator の N4 boot は約 11k cy/s で、native の約 1.6 倍速い。
+N4 の値は `.build/test_timings` のもので、CLAUDE.md にあった 4408 s は 2026-08-05 に別の実行で測った壁時間である (設計書 D7 の 4408 s はこちら)。どちらも測定条件 (`VERYL_AOT_C_ASYNC` の設定、並行実行の有無) が記録されていないので、§6.3 の matched 測定で置き換える。2026-06-11 に同じ木で直列に測った値は N1/N2/N4 で 251k/118k/50.6k cy/s であり、ほぼ線形だった。N=4 の段差 (hart-cycle あたり約 2.7 倍) はその後に現れた。CLAUDE.md の「N=1 約 1 分、N=2 約 3 分」は外挿値で、実測では約 2.4 分と約 7.5 分である。旧コアの梯子 (litmus4 523 s + N2 449 s + N4 3793 s + hv 243 s) は直列で約 83 分で、そのうち N4 boot が 76 % を占める。Verilator の N4 boot は約 11k cy/s で、native の約 1.6 倍速い、としていた。【訂正】(M3 の手順 1) matched に測ると、V14 の N4 boot は Verilator 4.66k cy/s、native 6.92k cy/s (どちらも CPU 時間で割った値) で、Verilator の方が遅い (§6.3)。1.6 倍は測定条件の違う値どうしを比べたものだった。
 
 ### 6.2 測定の規約と記録
 
 - 【決定】速度は `VERYL_AOT_C_ASYNC=0` で、直列に、同じ木と同じマシンで測る。他の重い実行と重ねない。理由: 非同期の cc ビルド中は Cranelift で走るので、短い run は cc の速度を測っていない。また過去の数値は日付のない値や外挿値が混ざって誤っていた。
+- 【決定】(M3) cy/s は壁時間ではなく、そのプロセスの CPU 時間 (user) か `perf stat` のホストのサイクル数で割って求める。CPU は固定するなら空いているコアを選ぶ (他の作業と同じコアに固定しない)。理由: マシンは共有で、壁時間は他の負荷で大きく伸びる。CPU 時間でも、同時に走る負荷による L2 の取り合い (§6.3) で揺れるので、2 つの構成を比べるときは同じ時間帯に同時に走らせた対を使う。
 - 【決定】各マイルストーンの末に次の表へ 1 行ずつ追記する。対象は 5.15 N=1 boot (W2/W4)、dhrystone (W2/W4)、既定スイートの壁時間、梯子全体の壁時間、M4 からは N=4 boot である。
 
 | マイルストーン | 構成 | 対象 | cycles | 実行時間 | cy/s | whole-comb / event の fallback | 木の commit | veryl の commit |
@@ -470,6 +510,14 @@ N4 の値は `.build/test_timings` のもので、CLAUDE.md の 4408 s は 2026-
 | M2 | W4 | rv64ui ld_st | 7,386 (settle 8,004) | 3.481 s | 2.30k | M1b と同じ 2 つの `If` の木が decline。dataflow の fallback 0 | fa4cfa9 | 4a48677b |
 | M2 | W4 | rv64ui ld_st (veryl の大きな event の分割後) | 同上 | — | 3.4k | decline 0 (Clock event が whole-AOT) | fa4cfa9 | dd72276c |
 | M2 | V14 + 新コア | 既定スイート 850 本 / 梯子全体 (既定、bench、N=1、litmus4、N=2、hvlinux、W2 lockstep boot、ACT4 W2、N=4 を直列) | | 2,547 s / 9,311 s | | | 4fec4e4 | 4a48677b |
+| M3 (手順 1) | V14 | 5.15 boot、N=1 / N=2 / N=4 (matched、CPU 時間) | 12.2M / 16.4M / 25.2M | | 約 84k / 40.1k / 6.92k | | | |
+| M3 (手順 1) | V14 | 5.15 N=4 boot、Verilator (CPU 時間) | 25.2M | | 4.66k | | | |
+| M3 (手順 2) | W4 | arch (1 CPU に固定、直列) | | | 5.1k | fallback 0 | 64fea45 | dd72276c |
+| M3 (手順 2) | W4 | 5.15 / 6.6 / 7.1 N=1 boot (4 本を並行、負荷下) | 13.4M / 18.5M / 18.0M | | 3.6k-4.4k | whole_event 2-11 %、dataflow 7-24 % | 64fea45 | dd72276c |
+| M3 (手順 2) | W4 | ACT4 (並行) | | | 1.1k | dataflow は 0 本で成立、whole_event はほぼ全部 fallback | 64fea45 | dd72276c |
+| M3 (手順 2) | W4 | 5.15 N=1 boot、Verilator | 13.4M | 1,869 s | 7.2k | | 64fea45 | |
+
+M3 の行の補足: W2 の boot は手順 2 の時点で fallback 0 のまま。W4 の boot と ACT4 に残る whole_event と dataflow の fallback は、M3 末の GS で原因を見る。手順 6 の `NUM_CKPT` の対では、同時に走らせた W2 の 5.15 boot の CPU 時間が 0 で 2,327 s、4 で 2,481 s (+6.6 %)、2 で 2,336 s、8 で 2,510 s だった。checkpoint を lane ごとに持つ最初の形は、W4 の `NUM_CKPT=8` で同時実行の進みが約 1/2-1/3 に落ちた (設計書 §R.3.5)。
 
 M2 の行の補足: 測定は `VERYL_AOT_C_ASYNC=0`、`taskset -c 3` で 1 本ずつ直列、perf_acc 込みの harness。cy/s は settle 数 / `sim_s`。5.15 N=1 boot と dhrystone の W4、dhrystone の W2 はまだ走らせていない (新コアの bench harness と W4 の boot テストが無い)。梯子の行は master の M2 末の梯子 (`logs/summary.txt` の壁時間の合計、うち N=4 boot 3,791 s) で、GS の測定条件 (直列・単独) は守っているが CPU の固定はしていない。
 - W2: M1b の 2.5k cy/s から約 13 倍。M1b では tb の `$display` のために Clock event が whole-AOT にならなかったが、M2 では whole-AOT になった (下の veryl の修正)。旧コアの N=1 boot (84.0k cy/s、§6.1) の約 0.42 倍。Verilator (1 thread、HELIODOR_CHK なし) の W2 5.15 boot は 12.6k cy/s (1,308 s) で native の約 1/2.8。
@@ -486,7 +534,10 @@ M1b の行の補足: cy/s は settle 数 / `sim_s` (build を除く)。W4 は ma
 2. S3-2: 同じ slice を Verilator でも測る。Verilator にも段差が出るなら設計とホストのキャッシュ容量の問題、出ないなら veryl 固有の問題と切り分ける。
 3. S3-3: 仮説を 1 つずつ潰す。(a) 設計の肥大: hart-cycle あたりのコストが N によらず一定かを見る。(b) ホストのキャッシュ容量: `perf stat` で LLC miss を N=2 と N=4 で比べる。(c) N=4 でだけ whole-comb か whole-event が bail している: N ごとに `VERYL_AOT_C_DIAG=1 VERYL_AOT_C_EVENT_DIAG=1` を見る。(d) 生成 C の関数が巨大になる影響: `.so` のサイズと命令キャッシュ miss を N ごとに比べる。
 4. S3-4: 原因が veryl にあれば clone 側で直し (プロジェクト規則)、同じ slice で再測定する。結論 (2026-10-15): 段差の原因は、veryl の dataflow の粗粒度化の上限 `DATAFLOW_COARSE_MAX_STMTS` に N=4 の設計が掛かることだと特定した。veryl の clone 側で修正中で、修正後に同じ slice で再測定する。修正は M2 中に `fix/dataflow-coarse-cap` として `local/heliodor-fixes` (`4a48677b`) に入った。同じ slice の matched な再測定はまだで、M3 の最初に行う。参考: この veryl で回した M2 末の梯子の V14 N=4 boot は 3,791 s で、§6.1 の 3,793 s とほぼ同じだった (matched な条件ではない)。
-5. 【M3 で決定】N=4 boot ゲートを両構成で回すかどうか (決定は M4 から適用する)。新コアの N=4 boot は M4 まで存在しないので、S3 の後の V14 の N=4 boot の壁時間に、W2/W4 と V14 の N=1 boot の cy/s の比を掛けて W2 と W4 の値を見積もる。M4 で実測し、見積もりと大きく違えば見直す。両構成の梯子が直列で約 4 時間以内に収まるなら両方で回す。収まらなければ、メモリ系の変更ごとに W4 だけで回し、W2 はマイルストーン末だけにする。Verilator を N=4 のゲートエンジンにする案 (約 1.6 倍速い、`-O1 -j 2` が必要) もこのときに比べる。
+
+   【訂正】(M3 の手順 1、2026-10-16) 修正後の veryl で matched に測り直すと段差は残り、上の結論は誤りだった。V14 の 5.15 boot (CPU 時間で割った cy/s) は N=1 約 84k、N=2 40.1k、N=4 6.92k で、hart-cycle あたり N=1 から N=2 は平ら、N=4 で約 2.9 倍の段差がある。Verilator の N=4 は 4.66k cy/s で、native より遅い。原因は (b) のホストのキャッシュ容量で、生成コードがホストの L2 (1 コアあたり 2 MB) に収まらない。veryl は hart の instance ごとに生成コードの複製を持つので、N=4 でコードが L2 を溢れる。veryl のバグではないので clone では直さない。instance 間でコードを共有すれば N=4 で約 3 倍の見込みがあり、veryl のロードマップ項目とする。
+5. N=4 boot ゲートを両構成で回すかどうか (M3 で決めた。決定は下の 6.、M4 から適用する)。新コアの N=4 boot は M4 まで存在しないので、S3 の後の V14 の N=4 boot の壁時間に、W2/W4 と V14 の N=1 boot の cy/s の比を掛けて W2 と W4 の値を見積もる。M4 で実測し、見積もりと大きく違えば見直す。両構成の梯子が直列で約 4 時間以内に収まるなら両方で回す。収まらなければ、メモリ系の変更ごとに W4 だけで回し、W2 はマイルストーン末だけにする。Verilator を N=4 のゲートエンジンにする案 (約 1.6 倍速いとしていたが、実測では native より遅かった。`-O1 -j 2` が必要) もこのときに比べる。
+6. 【決定】(M3 の手順 1、U1 と U2。M4 から適用) 見積もり: 新コアの N=4 boot は、W2 が静かなマシンで約 3 時間、負荷下で 5-6 時間、W4 が 4-14 時間。両構成の梯子は 4 時間に収まらないので、次のように回す。W2 の N=4 boot (GB4) をメモリ系の変更ごとのゲートにする。litmus N=4 (GT4) は両構成で回す。W4 の N=4 boot はマイルストーンの末に夜間に回す。Verilator は N=4 の判定に使わず (native より遅い)、マイルストーン末の NBA の相互確認 (GV、`-O1 -j 2`) にだけ使う。M4 で新コアの N=4 boot を実測し、見積もりと大きく違えば見直す。
 
 ### 6.4 whole-comb fallback の検査
 
