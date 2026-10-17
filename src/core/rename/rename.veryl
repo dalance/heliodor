@@ -1,26 +1,35 @@
 // rename: speculative and architectural RAT, in-group dependency resolution,
-// and recovery by walk (partial kill) or arch-RAT copy (full kill).
+// the checkpoint pool, and recovery by checkpoint restore or walk (partial
+// kill) or arch-RAT copy (full kill).
 //
 // Ports (timing contract):
 //   i_valid/i_op : rq output lanes (registered), contiguous from lane 0
 //   i_pop_int/i_pop_fp : free_list pop windows (registered)
-//   o_ren        : per-lane mapping, combinational from the inputs and the
-//                  registered RAT; independent of i_take
+//   i_rob_tag    : rob allocation tags (registered); lane l becomes i_rob_tag[l]
+//   o_ren        : per-lane mapping and checkpoint, combinational from the
+//                  inputs and registered state; independent of i_take
 //   i_take       : lanes 0..i_take-1 are renamed on this edge (from dispatch,
 //                  0 in kill and walk cycles)
 //   i_walk       : rob walk lanes (registered), youngest first in a batch
 //   i_cm         : commit lanes; arch RAT updated on the edge
-//   i_kill       : full kill copies the arch RAT on the edge
+//   i_wb         : WB packets; a resolve on a BRU port that did not
+//                  mispredict frees its op's checkpoint on the edge
+//   i_kill       : full kill copies the arch RAT on the edge; a partial kill
+//                  with ckpt_v restores checkpoint ckpt on the edge
 //   i_arch_rd/o_arch_preg : integer arch RAT read, combinational from the
 //                  registered RAT (atomic_unit's amocas operands)
 //   o_perf       : registered event wires
 //   o_chk        : sticky invariant flags (HELIODOR_CHK builds only, else 0)
 // Owns:
 //   - each speculative RAT entry is written once per cycle, by priority full
-//     kill > walk > rename
+//     kill > checkpoint restore > walk > rename
 //   - neither RAT maps one physical register to two architectural registers
-//   - after a walk ends, the speculative RAT equals the RAT just after keep
-//     was renamed
+//   - after a walk ends, or on the restore edge, the speculative RAT equals
+//     the RAT just after keep was renamed
+//   - a checkpoint is held by one op in the ROB: the oldest BRU op of a
+//     group takes the lowest free slot (none left: it recovers by walk); a
+//     slot frees when its op resolves without a mispredict, is killed, or is
+//     restored
 // Rationale:
 //   - one 64-entry table keyed by {RegClass, arch} for both classes, so
 //     dependency checks, walk and restore are one loop and int/fp mappings
@@ -28,6 +37,13 @@
 //   - x0 is never renamed (has_rd = 0 from decode); its entry stays p0
 //   - the mapping does not depend on take, so dispatch computes take from
 //     credits alone and no path runs from take back into the mapping
+//   - a checkpoint is needed only for its op's own mispredict, so it frees
+//     at a correct resolve rather than at retire; a mispredicted op whose
+//     kill was not adopted keeps it until the commit backstop's full kill
+//   - one checkpoint per group keeps the image to one RAT copy per cycle;
+//     dispatch ends the group before a second BRU op when the first one
+//     holds a checkpoint
+//   - an exhausted pool never stalls rename
 module rename::<CFG: core_cfg> (
     clk      : input  clock                                                                             ,
     rst      : input  reset                                                                             ,
@@ -36,23 +52,40 @@ module rename::<CFG: core_cfg> (
     i_take   : input  logic                      <core_types::<CFG>::TAKE_W>                            ,
     i_pop_int: input  logic                      <core_types::<CFG>::PREG_W> [CFG::RENAME_W]            ,
     i_pop_fp : input  logic                      <core_types::<CFG>::PREG_W> [CFG::RENAME_W]            ,
+    i_rob_tag: input  core_types::<CFG>::RobTag                              [CFG::RENAME_W]            ,
     o_ren    : output core_types::<CFG>::RenOut                              [CFG::RENAME_W]            ,
     i_walk   : input  core_types::<CFG>::WalkLane                            [core_types::<CFG>::WALK_W],
     i_cm     : input  core_types::<CFG>::RenCm                               [CFG::COMMIT_W]            ,
+    i_wb     : input  core_types::<CFG>::WbPacket                            [core_types::<CFG>::WB_N]  ,
     i_kill   : input  core_types::<CFG>::Kill                                                           ,
     i_arch_rd  : input  logic<5>                                                                        ,
     o_arch_preg: output logic<core_types::<CFG>::PREG_W>                                                ,
     o_perf   : output core_types::<CFG>::RenPerf                                                        ,
-    o_chk    : output logic                      <2>                                                    ,
+    o_chk    : output logic                      <4>                                                    ,
 ) {
     import core_types::<CFG>::*;
+    import opclass_pkg::*;
 
     const W  : u32 = CFG::RENAME_W;
     const CW : u32 = TAKE_W;
     const KEY: u32 = 6;
+    const NC : u32 = CFG::NUM_CKPT;
+    const CKN: u32 = CKPT_SLOT;
 
     var spec_q: logic<PREG_W> [RAT_N];
     var arch_q: logic<PREG_W> [RAT_N];
+
+    let full   : logic = i_kill.valid && i_kill.full;
+    let restore: logic = i_kill.valid && !i_kill.full && i_kill.ckpt_v && NC != 0;
+
+    // Checkpoint pool state and the per-lane slot choice, driven in g_pool.
+    var ck_req : logic<W>             ; // the group's oldest branch lane
+    var ck_v   : logic<W>             ;
+    var ck_id  : logic<CKPT_W> [W]    ;
+    var ck_take: logic<W>             ; // taken lanes that get a checkpoint
+    var ckv_q  : logic<CKN>           ;
+    var own_q  : RobTag        [CKN]  ;
+    var rs_wd  : logic<PREG_W> [RAT_N]; // the restored image
 
     function key (
         c: input RegClass   ,
@@ -144,13 +177,119 @@ module rename::<CFG: core_cfg> (
             o_ren[l].grp      = g;
             o_ren[l].pdst     = pdst[l];
             o_ren[l].old_pdst = oldp;
+            o_ren[l].ckpt_v   = ck_v[l];
+            o_ren[l].ckpt     = ck_id[l];
+        }
+    }
+
+    // ---- Checkpoint pool ----
+
+    // The oldest branch lane of the group asks for the lowest free slot.
+    always_comb {
+        var br: logic<W>;
+        for l in 0..W {
+            br[l] = i_valid[l] && i_op[l].cls.fu == FuKind::BRU;
+        }
+        ck_req = tree_first::<W>(br);
+        for l in 0..W {
+            ck_take[l] = ck_v[l] && l <: i_take;
+        }
+    }
+
+    if NC == 0 :g_nopool {
+        always_comb {
+            for l in 0..W {
+                ck_v[l]  = 1'b0;
+                ck_id[l] = 0;
+            }
+            for e in 0..RAT_N {
+                rs_wd[e] = 0;
+            }
+            ckv_q    = 0;
+            own_q[0] = 0;
+        }
+    } else :g_pool {
+        var img_q: logic<PREG_W> [NC * RAT_N];
+
+        let fs   : logic<NC>     = tree_first::<NC>(~ckv_q);
+        let fs_id: logic<CKPT_W> = tree_onehot_enc::<NC, CKPT_W>(fs);
+        always_comb {
+            for l in 0..W {
+                ck_v[l]  = ck_req[l] && fs != 0;
+                ck_id[l] = fs_id;
+            }
+        }
+
+        // The RAT just after the checkpointed lane: its own and older lanes'
+        // writes applied.
+        let upto: logic<W> = ~(tree_prefix_or::<W>(ck_req) << 1);
+        var aft : logic<PREG_W> [RAT_N];
+        always_comb {
+            for e in 0..RAT_N {
+                var m: logic<W>;
+                for j in 0..W {
+                    m[j] = upto[j] && wr[j] && dkey[j] == e;
+                }
+                aft[e] = if m != '0 ? tree_onehot_mux::<W, PREG_W>(last_lane(m), pidx) : spec_q[e];
+            }
+        }
+
+        var tg: logic<ROB_TAG_W> [W];
+        always_comb {
+            for l in 0..W {
+                tg[l] = i_rob_tag[l];
+            }
+        }
+        let al_any: logic  = ck_take != '0;
+        let al_own: RobTag = tree_onehot_mux::<W, ROB_TAG_W>(ck_req, tg) as RobTag;
+
+        var fr: logic<NC>;
+        always_comb {
+            for c in 0..NC {
+                var rh: logic<BRU_N>;
+                for b in 0..BRU_N {
+                    let w    : WbPacket = i_wb[bru_port(b)];
+                    rh[b] = w.valid && w.br.valid && !w.br.mispred && w.tag.rob == own_q[c];
+                }
+                fr[c] = |rh || killed(i_kill, own_q[c]) || (restore && i_kill.ckpt == c);
+            }
+            for e in 0..RAT_N {
+                var col: logic<PREG_W> [NC];
+                var oh : logic<NC>         ;
+                for c in 0..NC {
+                    col[c] = img_q[c * RAT_N + e];
+                    oh[c]  = i_kill.ckpt == c;
+                }
+                rs_wd[e] = tree_onehot_mux::<NC, PREG_W>(oh, col);
+            }
+        }
+
+        always_ff {
+            if_reset {
+                ckv_q = 0;
+                for c in 0..NC {
+                    own_q[c] = 0;
+                }
+            } else {
+                for c in 0..NC {
+                    if full {
+                        ckv_q[c] = 1'b0;
+                    } else if al_any && fs[c] {
+                        ckv_q[c] = 1'b1;
+                        own_q[c] = al_own;
+                        for e in 0..RAT_N {
+                            img_q[c * RAT_N + e] = aft[e];
+                        }
+                    } else if fr[c] {
+                        ckv_q[c] = 1'b0;
+                    }
+                }
+            }
         }
     }
 
     // Per-entry write selection. Rename: the youngest taken lane wins. Walk:
     // the oldest lane of the batch (highest lane index) wins.
-    let full: logic = i_kill.valid && i_kill.full;
-
     const CMW: u32 = CFG::COMMIT_W;
 
     // One-hot of the highest set bit over the commit lanes (the youngest).
@@ -214,6 +353,8 @@ module rename::<CFG: core_cfg> (
             for e in 0..RAT_N {
                 if full {
                     spec_q[e] = arch_q[e];
+                } else if restore {
+                    spec_q[e] = rs_wd[e];
                 } else if wlk_we[e] {
                     spec_q[e] = wlk_wd[e];
                 } else if ren_we[e] {
@@ -227,6 +368,13 @@ module rename::<CFG: core_cfg> (
     }
 
     assign o_arch_preg = arch_q[key(RegClass::INT, i_arch_rd)];
+
+    var take_m: logic<W>;
+    always_comb {
+        for l in 0..W {
+            take_m[l] = l <: i_take;
+        }
+    }
 
     var walk_any: logic;
     always_comb {
@@ -242,9 +390,12 @@ module rename::<CFG: core_cfg> (
         if_reset {
             perf_q = 0 as RenPerf;
         } else {
-            perf_q.walk_start   = i_kill.valid && !i_kill.full;
+            perf_q.walk_start   = i_kill.valid && !i_kill.full && !restore;
             perf_q.walk_cyc     = walk_any && !full;
             perf_q.full_restore = full;
+            perf_q.ck_restore   = restore;
+            perf_q.ck_alloc     = ck_take != '0;
+            perf_q.ck_none      = NC != 0 && (ck_req & ~ck_v & take_m) != '0;
         }
     }
     assign o_perf = perf_q;
@@ -257,11 +408,14 @@ module rename::<CFG: core_cfg> (
             i_spec   : spec_q                                   ,
             i_arch   : arch_q                                   ,
             i_blocked: (i_kill.valid || walk_any) && i_take != 0,
+            i_kill                                              ,
+            i_ckv    : ckv_q                                    ,
+            i_own    : own_q                                    ,
             o_chk                                               ,
         );
     }
     #[ifndef(HELIODOR_CHK)]
     {
-        assign o_chk = 2'b0;
+        assign o_chk = 4'b0;
     }
 }

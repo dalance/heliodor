@@ -3,12 +3,18 @@
 //
 // A random producer feeds groups of DecOps with dense intra-group register
 // dependencies into rq. Behavioural stand-ins play rob (ring, retire, partial
-// and full kill, youngest-first walk), lq/sq (tag counters) and busy_table
-// (random ready bits and wake lanes); credits are randomly throttled to
-// force partial acceptance. References:
+// and full kill, youngest-first walk), the BRU resolve ports, lq/sq (tag
+// counters) and busy_table (random ready bits and wake lanes); credits are
+// randomly throttled to force partial acceptance. A partial kill whose keep
+// holds a checkpoint restores it, any other walks. References:
 //   - mapping: every taken lane's sources and old destination equal the map
 //     derived from the architectural reference plus the in-flight stand-in
-//     entries in order, updated lane by lane within the group
+//     entries in order, updated lane by lane within the group. After a
+//     restore this is the map a walk would have produced
+//   - checkpoints: the busy slots are those of in-flight entries that still
+//     hold one; a taken branch lane gets a free slot exactly when its rank
+//     among the group's branch lanes is below the free count, and no two
+//     lanes share a slot
 //   - free list: a per-register used/free bitmap per class; every pop must be
 //     free, every release used, and o_free must equal the free count
 //   - take, compaction, snapshot positions, bar_w and ready initialization
@@ -19,7 +25,7 @@ module rename_harness::<CFG: core_cfg> (
     o_pass: output logic    ,
     o_done: output logic    ,
     o_bad : output logic<16>,
-    o_cov : output logic<12>,
+    o_cov : output logic<16>,
 ) {
     import core_types::<CFG>::*;
     import opclass_pkg::*;
@@ -32,12 +38,14 @@ module rename_harness::<CFG: core_cfg> (
     const PN : u32 = 1 << PREG_W;
     const CW : u32 = TAKE_W;
     const FTW: u32 = tag_pkg::idx_w(FW + 1);
+    const NC : u32 = CFG::NUM_CKPT;
+    const CKN: u32 = CKPT_SLOT;
 
     var lfsr : logic<64>;
     var lfsr2: logic<64>;
     var cnt  : logic<16>;
     var bad_q: logic<16>;
-    var cov_q: logic<12>;
+    var cov_q: logic<16>;
 
     // ---- Producer ----
 
@@ -83,9 +91,12 @@ module rename_harness::<CFG: core_cfg> (
                 d.cls.budget.sq = 1'b1;
             }
             3'd6: {
-                d.cls.fu   = FuKind::BRU;
-                d.rs1.used = 1'b1;
-                d.rs2.used = h[12];
+                // A jump with a link register checkpoints its own write.
+                d.cls.fu            = FuKind::BRU;
+                d.rs1.used          = 1'b1;
+                d.rs2.used          = h[12];
+                d.dst.has_rd        = r != 0 && h[13];
+                d.cls.budget.int_rd = r != 0 && h[13];
             }
             3'd7: {
                 d.cls.fu         = FuKind::NONE;
@@ -151,6 +162,9 @@ module rename_harness::<CFG: core_cfg> (
     var e_snap : DispSnap            [RN];
     var e_lq   : logic               [RN];
     var e_bar  : logic               [RN];
+    var e_bru  : logic               [RN];
+    var e_res  : logic               [RN]; // resolved
+    var e_ckl  : logic               [RN]; // still holds its checkpoint
     var wk_busy: logic                   ;
     var wk_ptr : logic   <ROB_TAG_W>     ; // one past the youngest unwalked entry
     var wk_end : logic   <ROB_TAG_W>     ; // one past keep
@@ -174,11 +188,26 @@ module rename_harness::<CFG: core_cfg> (
     // free list, which is smaller than the ROB.
     let drain_ph: logic = cnt[9:8] == 2'b11;
 
+    // A random in-flight entry holding a checkpoint, the preferred keep.
+    var ck_cand: logic<ROB_TAG_W>;
+    var ck_any : logic           ;
+    always_comb {
+        ck_cand = 0;
+        ck_any  = 1'b0;
+        for i in 0..RN {
+            let c: logic<ROB_TAG_W> = head_q + i;
+            if i <: count && e_ckl[ridx(c)] && (!ck_any || lfsr[i % 64]) {
+                ck_cand = c;
+                ck_any  = 1'b1;
+            }
+        }
+    }
+
     // Kill: registered-state decision; at most one per cycle, no partial
     // kill during a walk or right after a kill.
     var keep_c: logic<ROB_TAG_W>;
     always_comb {
-        keep_c       = head_q + (lfsr2[15:0] % (if count == 0 ? 1 : count)) as ROB_TAG_W;
+        keep_c       = if ck_any && lfsr2[30] ? ck_cand : head_q + (lfsr2[15:0] % (if count == 0 ? 1 : count)) as ROB_TAG_W;
         kill         = 0 as Kill;
         kill.full    = lfsr2[23:18] == 0 && !drain_ph;
         kill.valid   = kill.full || (lfsr2[28:25] == 0 && count != 0 && !wk_busy && !kprev_q && !drain_ph);
@@ -188,13 +217,31 @@ module rename_harness::<CFG: core_cfg> (
         kill.fl_int  = e_snap[ridx(keep_c)].fl_int;
         kill.fl_fp   = e_snap[ridx(keep_c)].fl_fp;
         kill.bar_seq = e_snap[ridx(keep_c)].bar_seq;
+        kill.ckpt_v  = e_ckl[ridx(keep_c)];
+        kill.ckpt    = e_snap[ridx(keep_c)].ckpt;
     }
     let pkill: logic = kill.valid && !kill.full;
     let fkill: logic = kill.valid && kill.full;
+    let rstr : logic = pkill && kill.ckpt_v;
 
-    // Retire: never in a full kill; never past keep in a partial kill.
+    // Retire: never in a full kill; never past keep in a partial kill; never
+    // a branch that still holds its checkpoint (a branch retires resolved).
+    var ret_ok: logic<ROB_TAG_W>;
+    always_comb {
+        var go: logic;
+        go     = 1'b1;
+        ret_ok = 0;
+        for l in 0..CMW {
+            if go && !e_ckl[ridx(head_q + l)] {
+                ret_ok += 1;
+            } else {
+                go = 1'b0;
+            }
+        }
+    }
     let kept    : logic<ROB_TAG_W> = keep_c - head_q + 1;
-    let ret_lim : logic<ROB_TAG_W> = if pkill ? kept : count;
+    let ret_lim0: logic<ROB_TAG_W> = if pkill ? kept : count;
+    let ret_lim : logic<ROB_TAG_W> = if ret_ok <: ret_lim0 ? ret_ok : ret_lim0;
     let ret_want: logic<ROB_TAG_W> = (lfsr[50:48] % (CMW + 1)) as ROB_TAG_W;
     let n_ret   : logic<ROB_TAG_W> = if fkill || drain_ph || lfsr[55:53] == 0 ?
         0
@@ -227,6 +274,36 @@ module rename_harness::<CFG: core_cfg> (
             walk[l].cls      = e_cls[e];
             walk[l].rd_arch  = e_arch[e];
             walk[l].old_pdst = e_old[e];
+        }
+    }
+
+    // ---- BRU resolve stand-in ----
+
+    // BRU port b resolves the in-flight entry at offset base + b, if it is an
+    // unresolved branch; an occasional mispredict keeps the checkpoint.
+    var wb    : WbPacket          [WB_N] ;
+    var rs_v  : logic             [BRU_N];
+    var rs_t  : logic<ROB_TAG_W>  [BRU_N];
+    var rs_mis: logic             [BRU_N];
+    always_comb {
+        let base: logic<ROB_TAG_W> = if lfsr[41] ? 0 : (lfsr[47:32] % (if count == 0 ? 1 : count)) as ROB_TAG_W;
+        for p in 0..WB_N {
+            wb[p] = 0 as WbPacket;
+        }
+        for b in 0..BRU_N {
+            let off: logic<ROB_TAG_W> = ((base + b) % (if count == 0 ? 1 : count)) as ROB_TAG_W;
+            let c  : logic<ROB_TAG_W> = head_q + off;
+            rs_v[b]   = lfsr[42 + b] && b <: count && e_bru[ridx(c)] && !e_res[ridx(c)];
+            rs_t[b]   = c;
+            rs_mis[b] = lfsr[58:56] == 0;
+            for p in 0..WB_N {
+                if p == bru_port(b) {
+                    wb[p].valid      = rs_v[b];
+                    wb[p].tag.rob    = rtag(c);
+                    wb[p].br.valid   = 1'b1;
+                    wb[p].br.mispred = rs_mis[b];
+                }
+            }
         }
     }
 
@@ -276,7 +353,7 @@ module rename_harness::<CFG: core_cfg> (
     var clr_p   : PReg               [W]     ;
     var rperf   : RenPerf                    ;
     var dperf   : DispPerf                   ;
-    var chk_r   : logic   <2>                ;
+    var chk_r   : logic   <4>                ;
     var chk_fi  : logic   <2>                ;
     var chk_ff  : logic   <2>                ;
     var chk_d   : logic   <3>                ;
@@ -289,9 +366,11 @@ module rename_harness::<CFG: core_cfg> (
         i_take   : take   ,
         i_pop_int: pop_int,
         i_pop_fp : pop_fp ,
+        i_rob_tag: rob_tg ,
         o_ren    : ren    ,
         i_walk   : walk   ,
         i_cm     : cm     ,
+        i_wb     : wb     ,
         i_kill   : kill   ,
         i_arch_rd  : 5'd0  ,
         o_arch_preg: _     ,
@@ -496,8 +575,28 @@ module rename_harness::<CFG: core_cfg> (
     var b_rdy  : logic    ;
     var b_snap : logic    ;
     var grp_any: logic    ;
+    var b_ck   : logic    ;
     always_comb {
-        // Expected take, serially.
+        // Free checkpoint slots.
+        var busy : logic<CKN>;
+        var nfree: u32       ;
+        var rk   : u32       ;
+        var got_c: logic<CKN>;
+        var ckd  : logic     ;
+        busy = 0;
+        for i in 0..RN {
+            let e: logic<ROB_IDX_W> = ridx(head_q + i);
+            if i <: count && e_ckl[e] {
+                busy[e_snap[e].ckpt] = 1'b1;
+            }
+        }
+        nfree = 0;
+        for c in 0..NC {
+            nfree += (!busy[c]) as u32;
+        }
+
+        // Expected take, serially; the group ends before a branch behind a
+        // checkpointed one.
         var nr: u32       ;
         var nl: u32       ;
         var ns: u32       ;
@@ -515,7 +614,15 @@ module rename_harness::<CFG: core_cfg> (
         }
         go     = !kill.valid && !wk_busy;
         e_take = 0;
+        ckd    = 1'b0;
         for l in 0..W {
+            let isbr: logic = rq_ov[l] && rq_od[l].cls.fu == FuKind::BRU;
+            if isbr && ckd {
+                go = 1'b0;
+            }
+            if isbr && nfree != 0 {
+                ckd = 1'b1;
+            }
             if go && rq_ov[l] {
                 let q : u32 = fu_iq(rq_od[l].cls.fu);
                 nr += 1;
@@ -694,6 +801,29 @@ module rename_harness::<CFG: core_cfg> (
             }
         }
 
+        // Checkpoints: the group's oldest branch takes a free slot, and no
+        // branch is taken behind a checkpointed one.
+        got_c = 0;
+        rk   = 0;
+        b_ck = 1'b0;
+        for l in 0..W {
+            if l <: take {
+                let br: logic   = rq_od[l].cls.fu == FuKind::BRU;
+                let rn: RenOut  = ren[l];
+                if rn.ckpt_v != (br && rk == 0 && nfree != 0) || rob_a[l].snap.ckpt_v != rn.ckpt_v || rob_a[l].snap.ckpt != rn.ckpt
+                    || (br && got_c != 0) {
+                    b_ck = 1'b1;
+                }
+                if rn.ckpt_v {
+                    if rn.ckpt >= NC || busy[rn.ckpt] || got_c[rn.ckpt] {
+                        b_ck = 1'b1;
+                    }
+                    got_c[rn.ckpt] = 1'b1;
+                }
+                rk += br as u32;
+            }
+        }
+
         // Free list: counts match the bitmap, pops are free.
         var fc   : u32 [2];
         fc[0] = 0;
@@ -752,6 +882,9 @@ module rename_harness::<CFG: core_cfg> (
                 e_snap[e] = 0 as DispSnap;
                 e_lq[e]   = 1'b0;
                 e_bar[e]  = 1'b0;
+                e_bru[e]  = 1'b0;
+                e_res[e]  = 1'b0;
+                e_ckl[e]  = 1'b0;
             }
             for k in 0..RAT_N {
                 arch_ref[k] = k[4:0] as PREG_W;
@@ -761,7 +894,7 @@ module rename_harness::<CFG: core_cfg> (
                 used_q[1][p] = p <: 32;
             }
         } else {
-            bad_q = bad_q | {9'd0, chk_any, b_rdy, b_snap, b_free, b_cmp, b_map, 1'b0};
+            bad_q = bad_q | {8'd0, b_ck, chk_any, b_rdy, b_snap, b_free, b_cmp, b_map, 1'b0};
 
             // Producer.
             if kill.valid || push || pn_q == 0 {
@@ -797,8 +930,28 @@ module rename_harness::<CFG: core_cfg> (
                         e_snap[e] = rob_a[l].snap;
                         e_lq[e]   = rob_a[l].ent.lq_v;
                         e_bar[e]  = rq_od[l].cls.ld_barrier;
+                        e_bru[e]  = rq_od[l].cls.fu == FuKind::BRU;
+                        e_res[e]  = 1'b0;
+                        e_ckl[e]  = rob_a[l].snap.ckpt_v;
                     }
                 }
+            }
+
+            // Resolves free a checkpoint unless mispredicted; a restore
+            // consumes keep's.
+            for b in 0..BRU_N {
+                if rs_v[b] {
+                    e_res[ridx(rs_t[b])] = 1'b1;
+                    if !rs_mis[b] {
+                        if e_ckl[ridx(rs_t[b])] {
+                            cov_q[15] = 1'b1;
+                        }
+                        e_ckl[ridx(rs_t[b])] = 1'b0;
+                    }
+                }
+            }
+            if rstr {
+                e_ckl[ridx(keep_c)] = 1'b0;
             }
 
             // Retire.
@@ -822,7 +975,7 @@ module rename_harness::<CFG: core_cfg> (
                 bar_c    = bar_rt + rb;
                 cov_q[0] = 1'b1;
             } else if pkill {
-                if tail_q != keep_c + 1 {
+                if tail_q != keep_c + 1 && !rstr {
                     wk_busy = 1'b1;
                     wk_ptr  = tail_q;
                     wk_end  = keep_c + 1;
@@ -872,6 +1025,15 @@ module rename_harness::<CFG: core_cfg> (
             if free_fp <: W {
                 cov_q[11] = 1'b1;
             }
+            if rperf.ck_restore {
+                cov_q[12] = 1'b1;
+            }
+            if rperf.ck_none {
+                cov_q[13] = 1'b1;
+            }
+            if rperf.walk_start && NC != 0 {
+                cov_q[14] = 1'b1;
+            }
 
             var t    : logic<64>;
             var t2   : logic<64>;
@@ -898,14 +1060,19 @@ module test_rename {
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
+    // The checkpoint scenarios (cov[15:12]) are covered exactly in a config
+    // with a pool.
+    const COV2: bit<16> = if cfg_w2::NUM_CKPT != 0 ? 16'hffff : 16'h0fff;
+    const COV4: bit<16> = if cfg_w4::NUM_CKPT != 0 ? 16'hffff : 16'h0fff;
+
     var pass2: logic    ;
     var done2: logic    ;
     var bad2 : logic<16>;
-    var cov2 : logic<12>;
+    var cov2 : logic<16>;
     var pass4: logic    ;
     var done4: logic    ;
     var bad4 : logic<16>;
-    var cov4 : logic<12>;
+    var cov4 : logic<16>;
     inst h2: rename_harness::<cfg_w2> (
         clk          ,
         rst          ,
@@ -929,7 +1096,7 @@ module test_rename {
         $display("rename: w2 pass=%b bad=%b cov=%b  w4 pass=%b bad=%b cov=%b", pass2, bad2, cov2, pass4, bad4, cov4);
         $assert(done2 && done4, "rename test did not run enough cycles");
         $assert(pass2 && pass4, "rename/dispatch diverged from the reference");
-        $assert(cov2 == 12'hfff && cov4 == 12'hfff, "rename scenario not covered");
+        $assert(cov2 == COV2 && cov4 == COV4, "rename scenario not covered");
         $finish();
     }
 }
