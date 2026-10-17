@@ -129,12 +129,10 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      (~19.2M cycles, ~3 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
      (~14.2M cycles, ~1 min).
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
-     (~29.7M cycles, **~75 min** — measured 2026-08-05 at 4408 s wall on this box).
-     Cycle counts drift with perf work — treat large unexplained jumps as
-     regressions (N=4 has a ±1M timing band). The wall-time here read "~10 min"
-     from P9.1 (2026-06-12) until 2026-08-05: the cycle count was refreshed over
-     the intervening perf work but the runtime was not, so it understated the gate
-     by ~7×. Budget over an hour for it, and re-measure if you touch this line.
+     (~25.2M cycles; ~6.9k cy/s of CPU time, so **~1 h CPU**, measured 2026-10-16).
+     Wall time depends on the load of this shared box: budget well over an hour.
+     Cycle counts drift with perf work, so treat large unexplained jumps as
+     regressions (N=4 has a ±1M timing band).
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
      hypervisor (~22.3M cycles, ~5 min). The only gate that runs the two-stage (V=1)
      MMU under load; the native boots never leave single-stage translation, so a
