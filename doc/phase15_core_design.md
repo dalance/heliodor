@@ -4165,7 +4165,7 @@ GF は `fire_check.py` が exit 0 で、matrix の行に 0 は無い (default、
 - STA/STD の分離 (§L.4): 必要な census (STA が可能で data だけを待つ store の滞在サイクル) の event が無い。IQ mem の sweep で boot が ±0.2 % なので優先度は低い。
 - trap 段 (§C.3)、kill の配布段 (モジュールをまたぐ経路、§C.4)、rename の段 (§R.1): CP の分解の対象だが、core 全体の synth が dynamic range select に対応しておらず走らないので判定できていない。
 
-既知の不具合: master で `veryl build` (SV の出力) が `cfg_w4_sb8` を引き金に veryl の emitter で panic する。veryl のバグで、別に直している。`veryl test` (sim) は通るので G0 には影響しないが、直るまで GV と synth の SV 出力は master のままでは作れない (検証計画 §1.5)。
+M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `veryl build` が panic) は veryl 側で直し、master で SV を出せる (検証計画 §1.5)。
 
 ### M4: SMP
 
