@@ -91,9 +91,9 @@ M2 は統合ブランチ `phase15/m2-int` を master の `4fec4e4` に merge し
 - 付録 B の B30 の case 4 は、直した語での golden 上の再確認をまだしていない (新コアは 4 case とも仕様どおり)。
 
 
-### 1.5 M3 のゲートの結果 (手順 1-6、2026-10-17)
+### 1.5 M3 のゲートの結果 (2026-10-18)
 
-M3 の手順 1-6 は master の `13241df` までに入った (設計書の「M3 の進捗」)。サイクル数は 5.15 N=1 boot のもので、pass/fail の run の値は 10,000 サイクル刻みである。
+M3 の手順 1-6 は master の `13241df` まで、手順 7 の sweep の採用値は `7c4bebf`、M3 の末の U26 は `797e61f` で入った (設計書の「M3 の進捗」と「M3 の完了」)。サイクル数は特に断らない限り 5.15 N=1 boot のもので、手順 6 までの 5.15 の pass/fail の run の値は 10,000 サイクル刻みである。手順 7 からは pass/fail の run も正確なサイクル数を記録した。
 
 | 時点 | ゲート | 結果 |
 |---|---|---|
@@ -117,10 +117,39 @@ M3 の手順 1-6 は master の `13241df` までに入った (設計書の「M3 
 | 手順 6 | GL-B | W2 15,593,486 (−0.76 %)、W4 12,442,044 (−1.58 %)。hash `74d4b7982390260f` |
 | 手順 6 | GB1 | W2 15,670,000 / 21,325,727 / 19,815,511、W4 12,480,000 / 17,490,395 / 16,921,813 (5.15 / 6.6 / 7.1) |
 | 手順 6 | GF | exit 0。新しい行 `ren.ck_alloc`/`ck_restore`/`ck_none`、`disp.cut_ck`、`iss` はすべて 0 より大きい |
+| 手順 7 (`902b273`、RTL は `2feea4b` と同一) | G0 | 852 passed、0 failed |
+| 手順 7 | GA / GL-C | W2 と W4 で 696/696、hash 690/690 |
+| 手順 7 | GL-B | W2 14,871,928 (手順 6 は 15,593,486、−4.6 %)、W4 12,108,086 (12,442,044、−2.7 %)。hash `74d4b7982390260f` |
+| 手順 7 | GB1 | W2 14,948,679 / 21,263,334 / 19,589,910、W4 12,132,244 / 17,479,576 / 16,871,179 (5.15 / 6.6 / 7.1)。checker はすべて 0 |
+| 手順 7 | GF | exit 0、matrix の行に 0 は無い |
+| M3 の末 (`087a7d1`) | G0 | 852 passed、0 failed、44 ignored (916 s)。W2/W4 の lockstep arch を含む |
+| M3 の末 | GA / GL-C | W2 と W4 で 696/696、hash 690/690 |
+| M3 の末 | GL-B | W2 14,398,090 (手順 7 は 14,871,928、−3.19 %)、W4 11,763,601 (12,108,086、−2.85 %)。どちらも record 10,417,776、hash `74d4b7982390260f` (golden)、不一致 0 |
+| M3 の末 | GB1 | W2 14,469,209 (−3.21 %) / 20,653,378 (−2.87 %) / 19,267,105 (−1.65 %)、W4 11,770,173 (−2.98 %) / 17,211,050 (−1.54 %) / 16,530,632 (−2.02 %) (5.15 / 6.6 / 7.1、手順 7 との比)。checker はすべて 0 |
+| M3 の末 | GF | `fire_check.py` exit 0、matrix の行に 0 は無い (default、act、boot、bootls。boot と bootls には boot のログ 8 本すべて)。新しい行 `mp.ewake` (default) |
+| M3 の末 | GV | Verilator 5.050 (`-O3`) で両構成が PASSED。W2 は cycles 14,469,209、instret 10,427,890、record 10,430,322、hash `e6c9b918825f45a3`、W4 は 11,770,173、10,418,577、10,421,005、`c146b7ae5ad120b5` で、native の pass/fail run と一致 |
+| M3 の末 | GX | 既定ログの W2/W4 の同名テスト 286 対 (手順 5 で `mem2` が増えた) の最終 hash を比べ、284 対が一致。違う 2 対は下 |
+| M3 の末 | V14 | 共有モジュールを変えていない (変更は `src/core/{common,lsu,mem}` と `heliodor_core` だけで、V14 はこれらを使わない) ので省いた |
 
 - 手順 4 の W2 6.6 は、メモの値 21,428,720 が最終版より前のもので、master の `d658df4` で走らせ直した 21,428,628 が正しい。
 - GS と D7 の測定は §6.2 と §6.3 に置く。手順 6 の CPU 時間は W2 の boot 4 本で 12,157 s (user)、W4 の 4 本で 34,645 s。測定中のマシンの負荷 (loadavg 7-48) で揺れるので、速度の結論に使うのは同時に走らせた対 (`NUM_CKPT` 0 対 4 の +6.6 %) だけである。
 - 手順 4-6 では GV と GX を記録していない (マイルストーン末に回す)。
+- M3 の末の GX の差 2 対: `probe_b13_csrrd` (rdtime を読む。record は W2 2,279 / W4 2,278 で、mtime がサイクル由来なので当然違う)、`probe_b05_sc` (record は 5,639 で同数。W2 で SC が 1 回失敗した (`at.rsv_coh` 1、`sc_nores` 1、W4 は 0)。probe は SC の成否どちらも許し、a0 を合算するので制御フローは同じ)。手順 2 にあった `mmu_svadu_amo` の差は今回は出なかった。`io_access` は H 行を出さないが、arch 行の hash が一致した (`feb3a60a07723337`)。
+- 手順 7 の CPU 時間は W2 の boot 4 本で 12,332 s (user)、W4 の 4 本で 39,915 s (4 コアに固定)。
+- 既知の不具合 (未修正): master (`7c4bebf` 以降) で `veryl build` (SV の出力) が veryl の emitter (`emitter.rs:3522` の unreachable) で panic する。`2feea4b` では通り、引き金は `902b273` の tb 用構成 `cfg_w4_sb8` (test_lsu の `h5 = lsu_harness::<cfg_w4_sb8>`) である。解決に失敗しているのは `core_types.veryl:490` の `tag_next::<FTQ_TAG_W, CFG::FTQ_N>` (`ftq_next`) を `CFG = cfg_w4_sb8` で解くところ。`cfg_w4_sb8` の値をすべてリテラルにしても、`src/core/common` に移しても、名前を変えても再現するので、alias は原因ではない。veryl のバグで、別に直している。`veryl test` (sim) は通るので G0 には影響しないが、直るまで GV と synth 用の SV は master のままでは出せない。M3 の末の GV は、作業用の worktree で `h5` を一時的に `cfg_w4` に置き換え、`cfg_w4_sb8` を退避して `veryl build` し、走らせた後に戻した (commit していない)。
+
+新コアの bench (`tohost` までのサイクル数。`test_cbench_*`、§2.4。基準は手順 6 の値で、設計書 §3.3):
+
+| 時点 | 構成 | dhrystone | coremark | fpmm | spmv |
+|---|---|---|---|---|---|
+| 手順 6 | W2 | 272,321 | 395,868 | 1,175,729 | 45,936 |
+| 手順 6 | W4 | 212,453 | 327,210 | 982,010 | 36,114 |
+| 手順 7 | W2 | 272,262 | 400,101 | 1,123,913 | 44,084 |
+| 手順 7 | W4 | 212,453 | 327,210 | 982,010 | 36,114 |
+| M3 の末 | W2 | 268,750 (−1.29 %) | 381,245 (−4.71 %) | 1,115,855 (−0.72 %) | 43,773 (−0.71 %) |
+| M3 の末 | W4 | 204,945 (−3.53 %) | 315,611 (−3.54 %) | 975,168 (−0.70 %) | 36,113 (0) |
+
+M3 の末の百分率は手順 7 との比。手順 7 の W2 の coremark が遅くなったのは `FTQ_N` を 32 にしたためで (設計書 §3.4)、W4 は採用値で bench の値が変わらない。
 
 ---
 
@@ -186,6 +215,8 @@ litmus の histogram (0x8000_4000) と barrier 語 (0x8000_6000) の DRAM ダン
 | `test_arch_common_harness` | tb/test_arch_common.veryl:10-319 | arch 201 + FP 28 + fp_smoke + lrsc_reorder + ACT4 696 | 移植。`CORE` で分岐し、V14 枝は現在の本体 (平坦メモリ、`PMA_FAULT=1`、`COHERENT_IFETCH=0`、DRAM の tohost 監視) を `v14_arch_bare` に逐語移設する。新コア枝は統合 SoC + `MAP_ARCH` + `retire_mon` + `rvfi_tracer`。ポート (`o_pass/o_fail/o_tohost`) と param (`HEX_FILE/TOHOST_IDX/MTIME_EN`) は変えない。 |
 | `test_arch_common_harness_dbg` | 同 :321-500 | どこからも instantiate されていない | 削除 (M1a の最初)。 |
 | `test_perf_harness` | tb/test_bench.veryl:14-335 | bench 5 本 | 移植。V14 枝は逐語移設する (設計書 §4.4 の改名受入で dhrystone/coremark のビット一致を測る基準なので、1 bit も変えない)。新コア枝は `retire_mon` の凍結値と `o_perf` の合計を出す。旧 census ポートは新コアでは出さない。 |
+| 新コアの bench ラッパ (M3) | tb/test_core_bench.veryl | `#[ignore]`、ゲートではない | 新規。`arch_soc_harness` の上の `test_cbench_w{2,4}_{dhrystone,coremark,fpmm,spmv}` (pass = tohost 1。cycles、instret、perf の dump を印字) と、5.15 N=1 boot (`test_w{2,4}_linux_boot` と同じもの) を他のテスト名と部分文字列が衝突しない名前で走らせる `test_cboot_w{2,4}`。fpmm は upstream の mm kernel (double、fmadd.d が主体、48×50×48 を 4 回、tohost は 0x8000_3000)、spmv は upstream の spmv (double、load が主体で小さい)。M3 の sweep の指標 (設計書 §3.3)。1 構成分は `veryl test --ignored --test test_cbench_w2` のように走らせる。 |
+| `test_lsu` (単体 tb) | tb/test_lsu.veryl | 既定 1 本 | 新規 (M1b)。乱数 program を `lsu_harness` に流す。instance は `cfg_w2` 2 本、`cfg_w4` 3 本、tb 専用の構成 `cfg_w4_sb8` 1 本 (`h5`)。`cfg_w4_sb8` (tb/cfg_w4_sb8.veryl) は `SB_N` だけを 8 にし、他の値は `cfg_w4` を参照する (M3)。理由: `SB_N` を 16 にした `cfg_w4` では、乱数 program が SB に 14 line までしか溜めず、W4 の urgent drain (`sb.urgent`) が発火しない。M3 の末から dcache の `o_vhit` を実物から配線し、V 段の早期 wake も unit test で走る。`cfg_w4_sb8` は `veryl build` の panic (veryl の不具合、§1.5) の引き金になっている。 |
 | `test_smode_plic_harness` | tb/test_smode_plic.veryl | 既定 1 本 | 移植。新コア枝は統合 SoC (`MAP_BOOT`、ROM に hex) で、source 10 のパルスは `i_ext_irq_src` から入れる。2,000 サイクル予算は SoC 経由の遅延で足りなくなりうるので、V14 を同じ SoC 構成で測った値の 2 倍に改める (§1.3)。PLIC claim の読み出し回数 == 1 を assert に加える (§8)。実装 (M2): 新コア枝は `test_w2_smode_plic`/`test_w4_smode_plic` で、ROM ではなく同じ program を DRAM 0x8000_0000 から `arch_soc_harness` (`MAP_ARCH`) で走らせる (コードが PC 相対なので載せ替えが要らない)。source 10 は harness の param `EXT_IRQ_SRC = 0x400` をサイクル 8-14 に `i_ext_irq_src` へ入れる。合否は `PASS_BY_X3` で x3 := 0xAA、予算は 1,000 サイクル刻みの早期終了で上限 20,000。claim の 1 回性は回数の assert ではなく、§8 の `chk_io_mon` (claim を含む PLIC アクセスがすべて retire したアクセスとちょうど 1 対 1) で検査する。V14 枝は現行の harness のまま。 |
 | `test_smoke`, `test_hello`, `test_linux_boot` | 同名 .veryl | `#[ignore]`、梯子の外。forensic `o_dbg_*` の唯一の消費者 | 削除 (M1a の最初、v14 改名より前)。 |
 | `test_soc_linux_boot_harness` (+66/71/71v) | tb/test_soc_linux_boot*.veryl | N=1 boot 4 本 | 統合 SoC `N_HARTS=1` へ移す。`CORE` param を足す。x3 は V14 なら `o_dbg_r3`、新コアなら `retire_mon`。census の印字は V14 枝だけに残す。lockstep 用の param (`MTIME_SRC`、schedule、checkpoint ファイル) を足す。 |
@@ -475,6 +506,7 @@ M3 で `CorePerf` に足したもの (手順ごと。`fire_check.py` は struct 
 - 手順 4: `dc.*` (`DcachePerf`: accept、hit、crit_hit、attach、alloc、RETRY の理由別 `r_fill_busy`/`r_inv_race`/`r_preempted`/`r_bank`、`share`、`huf`、`launch`、`vic_wb`、排他の pass/fail/busy、`nf_busy`、`unc_done`、`wt_done`、`cmo`、drain の merge/wt/rfo/bank、probe の ack/wb/defer、`ev_skid` など) と `dtlb.lk2` (2 ポート以上の同時 lookup)。
 - 手順 5: `sq.sta_multi`、`sq.fwd_multi`、`sq.ret_multi`、`lq.scan_multi`、`sb.push_multi`、`sb.merge_same` (設計書 §L.20)。checker は `chk_sq` bit 4。
 - 手順 6: `ren.ck_alloc`、`ren.ck_restore`、`ren.ck_none`、`disp.cut_ck`、`iss[p]` (exec ポート p が op を受理したサイクル。`ep[p]` は「source が bypass の値を取った」で、ポートの使用率ではない)。checker は `chk_rename` bit 2 と bit 3 (設計書 §R.3.5)。
+- M3 の末: `mp.ewake` (`MemPipePerf.ewake`、load の pass が dcache の V 段の HIT か全 forward で consumer を起こした。設計書 §L.2)。matrix の default の行。
 - matrix に足した行: `dc.*` と `dtlb.lk2` (手順 4)、手順 5 の 6 本 (default)、`ren.ck_alloc`/`ck_restore` (default)、`ren.ck_none` (boot)、`disp.cut_ck` (default)、`iss` (default)。手順 2 の W4 の `--zero` (どのログでも 0): `disp.cut_int`/`cut_fp`、`iq[1].tok_wait`、DIV と FDIV 以外のポートの `rs[*].hf_*`、`ad.empty_gen`/`excl_fail`/`ev_skid`、`dtlb`/`itlb.fill_inv`、`ptw_i.full`/`d_wr`、`at.fail`/`watch`/`backoff`、`io.retry` (`ad.*` は手順 4 で adapter とともに消えた)。
 
 ---
@@ -516,8 +548,14 @@ N4 の値は `.build/test_timings` のもので、CLAUDE.md にあった 4408 s 
 | M3 (手順 2) | W4 | 5.15 / 6.6 / 7.1 N=1 boot (4 本を並行、負荷下) | 13.4M / 18.5M / 18.0M | | 3.6k-4.4k | whole_event 2-11 %、dataflow 7-24 % | 64fea45 | dd72276c |
 | M3 (手順 2) | W4 | ACT4 (並行) | | | 1.1k | dataflow は 0 本で成立、whole_event はほぼ全部 fallback | 64fea45 | dd72276c |
 | M3 (手順 2) | W4 | 5.15 N=1 boot、Verilator | 13.4M | 1,869 s | 7.2k | | 64fea45 | |
+| M3 (末) | W2 | 5.15 N=1 boot GL-B / pass/fail、6.6、7.1 (3-4 本を並行、user 時間で build を含む) | 14.4M / 14.5M / 20.7M / 19.3M | | 5.8k / 6.2k / 6.1k / 6.1k | | 087a7d1 | |
+| M3 (末) | W4 | 同上 | 11.8M / 11.8M / 17.2M / 16.5M | | 1.69k / 1.68k / 1.87k / 1.87k | | 087a7d1 | |
+| M3 (末) | W2 / W4 | arch rv64ui 108 本 (1 コアに固定、`sim_s` の合計) | | | 5.5k / 1.7k | degraded modules W2 162 / W4 215 | 087a7d1 | |
+| M3 (末) | W2 / W4 | 5.15 N=1 boot、Verilator 5.050 `-O3` | 14.5M / 11.8M | | 22.6k / 8.1k | | 087a7d1 | |
 
 M3 の行の補足: W2 の boot は手順 2 の時点で fallback 0 のまま。W4 の boot と ACT4 に残る whole_event と dataflow の fallback は、M3 末の GS で原因を見る。手順 6 の `NUM_CKPT` の対では、同時に走らせた W2 の 5.15 boot の CPU 時間が 0 で 2,327 s、4 で 2,481 s (+6.6 %)、2 で 2,336 s、8 で 2,510 s だった。checkpoint を lane ごとに持つ最初の形は、W4 の `NUM_CKPT=8` で同時実行の進みが約 1/2-1/3 に落ちた (設計書 §R.3.5)。
+
+M3 の末の行の補足: 記録だけで、速度の結論には使わない。boot の cy/s は 3-4 本を並行に走らせた user 時間 (build を含む) で割った値で、手順 2 の W4 の値 (3.6k-4.4k、条件が違う) とは直接比べられない。arch の行は小さいテストが多く初期化が支配するので、boot より低く出る。degraded modules の数は veryl の診断出力の値をそのまま記した。手順 6 の補足で「M3 末の GS で原因を見る」とした W4 の whole_event と dataflow の fallback は、M3 ではまだ原因を見ていない。
 
 M2 の行の補足: 測定は `VERYL_AOT_C_ASYNC=0`、`taskset -c 3` で 1 本ずつ直列、perf_acc 込みの harness。cy/s は settle 数 / `sim_s`。5.15 N=1 boot と dhrystone の W4、dhrystone の W2 はまだ走らせていない (新コアの bench harness と W4 の boot テストが無い)。梯子の行は master の M2 末の梯子 (`logs/summary.txt` の壁時間の合計、うち N=4 boot 3,791 s) で、GS の測定条件 (直列・単独) は守っているが CPU の固定はしていない。
 - W2: M1b の 2.5k cy/s から約 13 倍。M1b では tb の `$display` のために Clock event が whole-AOT にならなかったが、M2 では whole-AOT になった (下の veryl の修正)。旧コアの N=1 boot (84.0k cy/s、§6.1) の約 0.42 倍。Verilator (1 thread、HELIODOR_CHK なし) の W2 5.15 boot は 12.6k cy/s (1,308 s) で native の約 1/2.8。
