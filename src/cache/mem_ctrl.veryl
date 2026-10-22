@@ -105,6 +105,12 @@ pub module mem_ctrl #(
     // the L2; on GATHER completion it streams straight to the L1. The I-cache
     // is kept coherent by FENCE.I + recall-on-owned, not by directory tracking.
     i_iread: input  logic [N_SLOTS],
+    // An uncached single-beat read of a DRAM address (i_hdram = 0). The slot
+    // holds it in LOOKUP until no L1 owns the line (the recall engine brings
+    // a dirty copy home), then reads the beat like a legacy read. It adds no
+    // sharer and installs nothing. o_hhold: the read is not on the bus yet.
+    i_hunc : input  logic [N_SLOTS],
+    o_hhold: output logic [N_SLOTS],
     o_hexcl: output logic [N_SLOTS],
     // Bus side: read-channel cycle requests (gather beats + legacy reads).
     // The memory_bus arbitrates these with its existing rotation + AMO lock.
@@ -202,6 +208,7 @@ pub module mem_ctrl #(
     const ST_GATHER : logic<3> = 3'd4;
     const ST_INSTALL: logic<3> = 3'd5;
     const ST_STREAM : logic<3> = 3'd6;
+    const ST_UNC    : logic<3> = 3'd7;
 
     // Write-snoop line decode (the +8 line covers the misaligned hi-side).
     let w_line   : logic<58> = i_w_addr[63:6];
@@ -216,6 +223,7 @@ pub module mem_ctrl #(
     var conf_all   : logic     [N_SLOTS]    ;
     var rfo_all    : logic     [N_SLOTS]    ; // P9.2: slot transaction is an RFO
     var iread_all  : logic     [N_SLOTS]    ; // P9.6: slot transaction is an I-read (uncounted)
+    var unc_all    : logic     [N_SLOTS]    ; // slot transaction is an uncached DRAM read
     var inst_go_all: logic     [N_SLOTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
     var lk_go_all  : logic     [N_SLOTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
     var lk_excl_w  : logic                  ; // P9.2: grant state for the lookup go
@@ -286,7 +294,7 @@ pub module mem_ctrl #(
     var c2c_go_all: logic [N_SLOTS];
     for h in 0..N_SLOTS :gen_c2c {
         assign c2c_go_all[h] = (st_all[h] == ST_LOOKUP) && i_w_valid && i_w_wb
-            && (w_line == line_all[h]) && (i_w_hart != ((h % N_HARTS) as 3));
+            && (w_line == line_all[h]) && (i_w_hart != ((h % N_HARTS) as 3)) && !unc_all[h];
     }
     always_comb {
         o_w_cadd_v    = 1'b0;
@@ -334,13 +342,13 @@ pub module mem_ctrl #(
     var acc_old   : logic    [N_SLOTS];
     var old_found : logic    [N_SLOTS];
     for h in 0..N_SLOTS :gen_accok {
-        assign acc_ok[h] = (st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h]
+        assign acc_ok[h] = (st_all[h] == ST_IDLE) && i_hreq[h] && (i_hdram[h] || i_hunc[h])
             && !acc_line_busy[h];
         assign acc_old[h] = acc_ok[h] && (acc_wait_q[h] >= STARVE_WAIT);
         always_ff (clk, rst) {
             if_reset {
                 acc_wait_q[h] = 8'd0;
-            } else if accept[h] || !((st_all[h] == ST_IDLE) && i_hreq[h] && i_hdram[h]) {
+            } else if accept[h] || !((st_all[h] == ST_IDLE) && i_hreq[h] && (i_hdram[h] || i_hunc[h])) {
                 acc_wait_q[h] = 8'd0;
             } else if acc_wait_q[h] <: STARVE_WAIT {
                 acc_wait_q[h] = acc_wait_q[h] + 8'd1;
@@ -376,6 +384,7 @@ pub module mem_ctrl #(
         var iok_q  : logic        ;
         var rfo_q  : logic        ; // P9.2: transaction is a read-for-ownership
         var iread_q: logic        ; // P9.6: transaction is an I-read (uncounted)
+        var unc_q  : logic        ;
         var excl_q : logic        ; // P9.2: grant state (E/M vs S), set at grant
         var buf_q  : logic<64> [8];
 
@@ -394,6 +403,9 @@ pub module mem_ctrl #(
         assign iok_all[h]   = iok_q;
         assign rfo_all[h]   = rfo_q;
         assign iread_all[h] = iread_q;
+        assign unc_all[h]   = unc_q;
+        // The uncached requester may leave (kill) or move to another line.
+        let unc_live: logic = i_hreq[h] && i_hunc[h] && (i_haddr[h][63:6] == line_q);
         for l in 0..8 :gen_buf_exp {
             assign buf_all[h * 8 + l] = buf_q[l];
         }
@@ -412,6 +424,7 @@ pub module mem_ctrl #(
                 iok_q   = 1'b0;
                 rfo_q   = 1'b0;
                 iread_q = 1'b0;
+                unc_q   = 1'b0;
                 excl_q  = 1'b0;
                 for l in 0..8 {
                     buf_q[l] = 64'd0;
@@ -425,8 +438,9 @@ pub module mem_ctrl #(
                             gcnt_q = 3'd0;
                             scnt_q = 3'd0;
                             iok_q   = 1'b1;
-                            rfo_q   = i_hrfo[h];
+                            rfo_q   = i_hrfo[h] && !i_hunc[h];
                             iread_q = i_iread[h];
+                            unc_q   = i_hunc[h];
                             excl_q  = 1'b0;
                             st_q    = ST_LOOKUP;
                         }
@@ -439,7 +453,13 @@ pub module mem_ctrl #(
                         // the slot heads for DRAM.
                         // P9.3: a recall WB for this slot's line is captured
                         // directly (c2c) — straight to STREAM.
-                        if c2c_go_all[h] {
+                        if unc_q {
+                            if !unc_live {
+                                st_q = ST_IDLE;
+                            } else if lk_sel_all[h] && !(i_l2_chit && i_l2_c_owned) {
+                                st_q = ST_UNC;
+                            }
+                        } else if c2c_go_all[h] {
                             for l in 0..8 {
                                 buf_q[l] = i_w_lanes[l];
                             }
@@ -531,6 +551,11 @@ pub module mem_ctrl #(
                             st_q = ST_IDLE;
                         }
                     }
+                    ST_UNC: {
+                        if !unc_live || slot_bus_gnt[h] {
+                            st_q = ST_IDLE;
+                        }
+                    }
                     default: {
                         st_q = ST_IDLE;
                     }
@@ -540,7 +565,8 @@ pub module mem_ctrl #(
 
         // Hart-facing grant: accept pulse, the 8 stream beats, or the legacy
         // (non-DRAM) combinational passthrough of the bus grant.
-        let legacy: logic = i_hreq[h] && !i_hdram[h];
+        let legacy : logic = i_hreq[h] && !i_hdram[h] && !i_hunc[h];
+        let unc_bus: logic = (st_q == ST_UNC) && unc_live;
         // P9.6 fix (unified): a STREAM beat is granted ONLY to a consumer that
         // is addressing THIS slot's line (i_haddr line == line_q). The core
         // demuxes the shared read port to the I-cache / I-PTW / D-cache via
@@ -554,7 +580,8 @@ pub module mem_ctrl #(
         // current request; mismatched beats stream out unconsumed (scnt still
         // advances) and the consumer re-requests a fresh, correctly-targeted txn.
         let stream_ok: logic = (st_q == ST_STREAM) && (i_haddr[h][63:6] == line_q);
-        assign o_hgrant[h] = accept[h] || stream_ok || (legacy && slot_bus_gnt[h]);
+        assign o_hgrant[h] = (accept[h] && !i_hunc[h]) || stream_ok || ((legacy || unc_bus) && slot_bus_gnt[h]);
+        assign o_hhold[h]  = i_hunc[h] && !unc_bus;
         // Beat data: the addressed dword of the slot buffer (the dcache walks
         // its critical-word-first order through i_haddr during STREAM).
         assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
@@ -563,7 +590,7 @@ pub module mem_ctrl #(
 
         // Bus cycle requests: gather beats + legacy reads (per SLOT; the per-hart
         // aggregation and grant distribution are below).
-        assign slot_bus_req[h] = legacy || (st_q == ST_GATHER);
+        assign slot_bus_req[h] = legacy || unc_bus || (st_q == ST_GATHER);
     }
 
     // Per-hart aggregation of the slot bus requests, and the reverse distribution
@@ -661,7 +688,7 @@ pub module mem_ctrl #(
     // is answered without aborting the requester's own fill — probe-self).
     assign lk_excl_w = lk_rfo || (N_HARTS == 1);
     for h in 0..N_SLOTS :gen_lkgo {
-        assign lk_go_all[h] = lk_sel_all[h] && lk_go;
+        assign lk_go_all[h] = lk_sel_all[h] && lk_go && !unc_all[h];
     }
     // ══════════════════════════════════════════════════════════════════
     // Block N lookup-port census (cp_mshr_mlp_plan.md §13). DEAD at LK_CENSUS=0.
