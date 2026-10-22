@@ -16,6 +16,7 @@
 - §M dcache/MMU の CPU 側・TLB・PTW・PMP/PMA
 - §S SoC とプラットフォーム
 - §V ベクトルユニットの統合
+- §D デバッグ (Debug Specification 1.0)
 - リスクと未決事項
 - マイルストーン計画
 - 付録: 旧コアの経緯と防ぐバグ類
@@ -41,7 +42,7 @@
 | マーク | 意味 |
 |---|---|
 | 【決定】 | 決定済み。理由を 1 行で添える。 |
-| 【M<n> で決定】 | マイルストーン M<n> で決める。何を測って決めるかを明記する。それまでの暫定値がある場合は併記する。 |
+| 【M<n> で決定】 | マイルストーン M<n> で決める。何を測って決めるかを明記する。それまでの暫定値がある場合は併記する。デバッグのマイルストーン MD (D9) では【MD で決定】と書く。 |
 | 【要判断】 | ユーザの判断が必要。選択肢と推奨を併記する。本書では極力使わない。 |
 | 【計画】 | 期限のマイルストーンで建てず、期限を決めずに計画に残した大きい設計変更。測った上限か推定を併記する (M3 から)。 |
 | 無印 | 契約 (レビューで検査できる不変条件) または事実。 |
@@ -69,8 +70,9 @@
 | §C | ROB, commit, trap, flush 制御, CSR 接続 |
 | §V | ベクトルユニットの統合 (M5) |
 | §S | SoC とプラットフォーム (CLINT, PLIC, UART, L2, mem_ctrl) |
+| §D | デバッグ (Debug Specification 1.0 の Sdext、Sdtrig、Debug Module、SBA。MD) |
 
-### 1.4 M0 でのユーザ決定 (2026-10-11 と 10-12, 拘束力あり)
+### 1.4 ユーザ決定 (M0 の 2026-10-11 と 10-12、以後の追加を含む。拘束力あり)
 
 | ID | 決定内容 |
 |---|---|
@@ -82,6 +84,7 @@
 | D6 | M6 まで master 上で旧コアと共存させる。旧コアの private モジュールは今すぐ機械的に改名し (prefix `v14_`)、新コアは最終名を使う。SoC には `CORE` パラメータを設け、generate-if で切り替える。M6 で行うのは旧コアの削除だけ。 |
 | D7 | 支援構成は 2-2-2-1-2 と 4-4-6-2-4 (fetch/decode - rename/dispatch - issue - memory ports - commit)。N=4 で生じる per-hart シミュレーション速度の約 8 倍の崖 (N=4 boot 4408 s) は M3 までに原因を特定し、その結果を見て N=4 boot ゲートを両構成で回すかを決める。 |
 | D8 (2026-10-12) | AMO/SC は §L L.11 の方式 B とする。op は最古のまま LOAD_EXCL → 演算 → STORE_EXCL を連続して行い、rd は PASS の後にだけ書く。FAIL または watch の hit は `atomic_unit` の内部で、hart id 全体を seed にした backoff 付きで再試行する。SC の rd は PASS で 0、FAIL で 1。dcache 契約と D5 の待ち行列方式は変えない。帰結: REPLAY の発生源は `lq` だけになる (§5.12 C7)。 |
+| D9 (2026-10-22) | デバッグは RISC-V Debug Specification 1.0 (Sdext + Sdtrig) に従い、OpenOCD/GDB から操作できるようにする。設計は JTAG を持たない: Debug Module は全 hart を受け持つので SoC top (`heliodor_soc_smp`) に置き、DMI のレジスタ空間を APB の slave ポートで出す。JTAG DTM が要るなら SoC を使う側が外に足す。シミュレーションで OpenOCD/GDB を試すための JTAG DTM (Verilator ラッパの DPI による remote_bitbang over TCP) は tb 専用の検証基盤とし、設計には含めない。範囲: (1) core の Debug Mode (haltreq、dcsr.ebreakm/s/u の ebreak、dcsr.step、trigger による入場。dcsr、dpc、dscratch0/1、dret、stepie、stopcount、stoptime)、(2) Debug Module (dmcontrol、dmstatus、hartinfo、abstractcs、command、data、progbuf、hart の選択、halt/resume/ndmreset/hartreset、Access Register (GPR/FPR/CSR)、program buffer の実行)、(3) Sdtrig (mcontrol6 の execute/load/store の address 照合と icount、trigger 数は構成ごとのパラメータで 2-4。M2 の「0 を読む trigger CSR」を置き換える)、(4) System Bus Access、(5) SMP (halt group、hasel/hawindow、haltsum)。新しいマイルストーン MD を M4 と M5 の間に置き、core 側の入場の設計は M4 の中で確定し、H との相互作用 (dcsr.v、prv) は M5 で扱う。範囲外: trace (E-trace/N-trace) と debug の認証。旧コア (V14) はデバッグを持たないまま残す。設計は §D。 |
 
 D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハーネスの arm は統合 SoC の上に載せ替える。V14 の arm は M6 まで旧来の bare ハーネス本体をそのまま保つ。理由: D6 の共存と、`v14_` 改名のビット一致受入 (§4.4) に必要なため。
 
@@ -102,7 +105,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | 深さ規則 1 | FU はレイテンシをパラメータとして公表し、スケジューラはそれだけを見る。 |
 | 深さ規則 2 | 各 writeback ポートを予約制にするか調停制にするかは設計時に決める。 |
 | 深さ規則 3 | op の識別子は op と一緒に運ぶ。ROB head のような生きた状態から読まない。 |
-| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → M5 H/V → M6 既定コアの切替。 |
+| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替。 |
 | 再利用 | dcache/MMU は内部ロジックを再利用し、CPU 側を N ポートで作り直す (インタフェースは最初から N ポート、実装は M1-M2 で 1 ポート、M3 で 2 ポート)。ロジックとして再利用するもの: L2/coherence/mem_ctrl/bus, CSR, FPU, VU, decoder, 周辺, パッケージ, 検証資産。 |
 | golden | `b0f4668`。mtime を retire 命令数で進めるモードと、RVFI 寄せの retire ポートを使う (具体化は D1/D2)。 |
 
@@ -158,7 +161,11 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | sweep、census | 1 軸だけを変えて IPC を測ること / 機構ごとに事象の母集団と内訳を数える計測。 | §2.5、§L.17 |
 | golden、V14、W2/W4 (`cfg_w2`/`cfg_w4`) | 観測パッチを当てた `b0f4668` / master 上の改名済み旧コア / 新コアの 2 構成。 | §1.4 D1、§3.2、検証計画の用語 |
 | lockstep、trace diff、allow-list | retire record の列を golden と比べる検証と、その比較で吸収する既知の差異の表。 | §1.4 D2/D4、検証計画 |
-| ゲートの梯子、ゲート ID (G0、GA、GL-A..GL-C、GB1/GB2/GB4、GT4、GH、GX、GV、GS、GF) | マイルストーンごとに通すテスト群の列と、その個々の名前。V14 の梯子 1-5 は CLAUDE.md の回帰の手順。 | 検証計画 §1 |
+| Debug Mode、DM、DMI | Debug Spec 1.0 の hart の停止状態 / 全 hart を受け持つ Debug Module (SoC に 1 つ) / DM のレジスタ空間 (本設計では APB の slave ポートで出す)。Debug Spec の信号は `dm_` prefix で呼び、§5.13 の lockstep 用の `i_dbg_*` とは別物である。 | §D.2、§D.3 |
+| debug memory、ROM、ABS、progbuf | hart が Debug Mode で実行する DM の領域 (`DM_BASE`) / その中の固定の命令列 / DM が abstract command から生成する命令語 / デバッガが書く program buffer。 | §D.7 |
+| `dm_take`、`dm_req`、outcome DEBUG | 非同期の Debug Mode 入場 (haltreq、step、icount) の受付 / その要求 / 同期の入場 (ebreak、trigger) を lane 0 で起こす commit の outcome。 | §D.4 |
+| 照合と発火 (trigger) | trigger の一致を fetch と m1 で投機的に記録すること / その記録を持つ op が lane 0 に来て効果 (hit、入場、trap) を起こすこと。 | §D.6 |
+| ゲートの梯子、ゲート ID (G0、GA、GL-A..GL-C、GB1/GB2/GB4、GT4、GH、GX、GV、GS、GF、GD、GG) | マイルストーンごとに通すテスト群の列と、その個々の名前。V14 の梯子 1-5 は CLAUDE.md の回帰の手順。 | 検証計画 §1 |
 | N2.2a | 旧コアで grant の前に MSHR エントリを確保した実験 (MSHR ALLOC)。N=1 のビット一致を保ったまま N=4 boot を livelock させ、撤回した。原因は M3 で特定した (fill の帰属の誤り、§M.6.4)。 | §M.6.1、§M.6.4、付録 |
 | LSR | 旧コアで dcache の主ポートを占有して load を 1 本保持していたレジスタ。旧コアとの比較にだけ現れる。 | 付録 |
 
@@ -205,6 +212,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | M2 | arch suite、ACT4、5.15 N=1 boot の lockstep (cfg_w2)。 | 推定段階の旧コアバグを directed test で確認済み (D4)。 |
 | M3 | 両構成で N=1 のゲートの梯子を通る (新コアの SMP は M4 から存在する)。N=4 boot ゲートの扱い (D7) をここで決め、M4 から適用する。 | 各軸の sweep で IPC が期待方向に動く。動かない場合は、その原因を §3.4 に天井として登録する。dcache の CPU 側は 2 ポート (bank 化、ポートごとの tag lookup、`fill_id = {index, 世代}` を持つ MSHR file の構造) で、DTLB は lookup 2 ポート。いずれも N=1 のゲートで検査する。支援する `MSHR_N`/`N_FILL` は 1 のまま。cy/s を記録している。 |
 | M4 | litmus N=2/N=4、N=2/N=4 boot。 | メモリ系を変更した場合は N=4 boot を必須とする。`MSHR_N`/`N_FILL` を 1 より大きくするのは、新コアの N=4 boot ができた後に限り、そのコミットはすべて N=4 boot をゲートとする。 |
+| MD | DMI を駆動する directed test (N=1、N=4、GD)、OpenOCD+GDB による riscv-tests の debug suite (GG、spike と同じ範囲)。DMI が idle のとき M4 までのゲートの結果が MD の前とビット一致する。 | §D の新規モジュールが cold-reader gate を通過。knob 0 個。`chk_debug` と `chk_dm` がすべてのテストで 0。§D.15 の事象が GF で 0 より大きい。 |
 | M5 | hvlinux、vector のテスト群。 | VU の上限を修正するか宣言する (§3.4)。 |
 | M6 | 既定コアを切り替える。旧コアを削除する (`src/v14/` を消す)。 | M6 での変更は、削除と既定値の変更だけ。 |
 
@@ -219,7 +227,8 @@ sweep の判定: 1 軸だけを増やし、他の軸を固定する。coremark/d
 - non-coherent な bare 構成 (メモリを直結したコア単体ハーネス) への対応 (D3)。
 - 実体のある WFI (D2 により NOP)。
 - M4 で新コアの N=4 boot ができるまでの、1 hart あたり複数 line fill (MLP) (§3.4 で上限として宣言)。
-- RVA23 のうち旧コアが持たない拡張の追加。これは M5 の後に、ユーザの判断で行う。
+- RVA23 のうち旧コアが持たない拡張の追加。これは M5 の後に、ユーザの判断で行う。例外として、デバッグ (Debug Spec 1.0 の Sdext、Sdtrig、Debug Module) は D9 により MD で入れる (§D)。
+- デバッグのうち、trace (E-trace、N-trace)、debug の認証、設計内の JTAG DTM (D9、§D.1)。旧コア (V14) のデバッグ。
 
 ---
 
@@ -283,6 +292,7 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 | `REISSUE_W` | `lq` | 1 | 1 | 1 サイクルに再 issue する数 (§L.7)。上限は MEM_W。【決定】(M3、U21) 1。N=1 では律速しない (§L.7)。 |
 | `DC_NB` | `dcache` (M3 の CPU 側) | 2 | 4 | data の bank 数 (§M.6.3)。M1-M2 の adapter は 1 で固定だった。【決定】(M3、U19) §M.6.3 の sweep で決めた。 |
 | `MSHR_N` | `dcache` (M3 の CPU 側) | 1 | 1 | §M.6.4。1 を超える値は M4 で新コアの N=4 boot ができた後に限る (§2.5)。 |
+| `TRIG_N` | `trig_unit` (MD) | 2 | 4 | Sdtrig の trigger 数 (§D.6)。照合器は execute が block あたり、load/store が memory pipe あたり trigger 1 つにつき 1 組なので、面積と照合の CP は `TRIG_N × (1 + MEM_W)` に比例する。W2 の 2 は GDB の hardware breakpoint 2 本 (gdbserver の `Hwbp2`) か breakpoint 1 本と watchpoint 1 本を同時に置ける最小。【MD で決定】(U34) gdbserver suite の結果と照合器の synth で確かめる。 |
 
 ### 3.4 宣言された上限 (再利用モジュールと本設計の構造に由来するもの)
 
@@ -307,6 +317,9 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 | wbm0 だけに付く HOLE_FILL の client | `io_unit`、`atomic_unit`、VU の scalar 結果 (§5.7) | - | 宣言された上限。どれも head でしか動かないので同時に 1 つ。 |
 | `MemEvent` は 1 サイクルに 1 個 | adapter と M3 の dcache の event ポート (§M.2.5) | - | `MSHR_N > 1` (M4) にするときに再検討する。 |
 | kill 1/cycle、commit-alone 1/cycle、D-PTW と I-PTW 各 1 本、rename group あたり VEC 1 個 | §3.2 の固定値 | - | 宣言された上限として残す。 |
+| (MD) trigger は 4 個まで | `ExcRec.trig_hit` が `logic<4>` (§5.8、§D.6) | 1 ≤ `TRIG_N` ≤ 4 | 宣言された上限。増やすには `ExcRec` の幅を変える。 |
+| (MD) Debug Mode の命令は 1 beat ずつ fetch し、retire は lane 0 だけ (step と icount の間) | DM の領域は uncached (§D.7)、step と icount の retire 制限 (§D.5) | - | 宣言された上限。デバッグ中だけの性能で、ゲートは時間でなく機能で判定する。 |
+| (MD) DM の progbuf 8 語、data 2 語、halt group 数 = `N_HARTS` | DM の固定値 (§D.7、§D.12) | - | 宣言された上限。 |
 | (M3 の sweep) ROB、PRF int、LQ、IQ int/mem、`PTW_D_QN`、`REISSUE_W` を増やしても boot が速くならない | front end の供給。M1b の予測器 (`bp_btb` の 2-bit ctr だけで global history が無い、§F.4) | - | 5.15 boot で dispatch が空のサイクルは W2 6.0M / 15.7M (38 %)、W4 5.4M / 12.5M (43 %)。redirect は W2 453k / W4 424k 回で、そのうち commit 時の mispredict が 297k / 239k (10.4M 命令で 28 / 23 MPKI)。redirect から rename まで約 8 サイクル (§F.9) なので、3.4-3.6M サイクルが refetch に消える。`cut_rob` は 6k / 49k、`cut_int` は 0、`cut_lq` は約 100 で、どの資源も満杯にならない。予測器 (§F.4) は計画に残す (M3 の進捗)。 |
 | (M3 の sweep) `SQ_N` を増やしても速くならない (W2 32: −0.26 %、W4 64: +0.10 %) | store の drain ポートは 1 本 (上の行) | - | store の burst は drain 1 本で律速する。SQ を増やすと `cut_sq` は減るが、その分が IQ (`cut_iq`) と commit の `cut_store` に移る。効くのは SB の増加で、W2 の 8 で `sb.full` が 435k から 42k、boot −1.80 % (§3.3)。 |
 | (M3 の sweep) `FTQ_N` を増やすと coremark が悪化する (W2 は 16→32 で +1.07 %、W4 は 32→16 で −1.35 %) | 予測器は commit で更新する (§F.3 FQ4) | - | FTQ が深いほど mispredict が増える (coremark で W2 8,307 → 8,653 回、W4 8,332 → 8,742 回)。run-ahead が深いと、同じ branch を更新前の古い counter で予測する回数が増える。boot、fpmm、spmv では FTQ 満杯の解消が勝つので 32 を採る (§3.3、§F.3)。 |
@@ -345,6 +358,7 @@ VU に由来する行 (ROB ≤ 256 と 2 の冪、CDB の 2 lane snoop、alloc 1
 | 16 | `IQ_N[q]` < 512 | IQ の credit は固定幅 `IQ_CNT_W = 9` で dispatch に渡す (§R.5.1) |
 | 17 | `IC_RESP_LAT == 1` かつ `SHADOW_LEN == 0` | `ifu` は fetch の段ごとにレジスタを 1 つしか持たず、`sb` は drain の ack の edge で line を手放す (§5.9 MP7)。RTL がこの値で作られている |
 | 18 | 1 つのポートに DIV と FDIV を同時に載せない | HOLE_FILL の FU はポートに高々 1 つ (wb_resv の HOLE_FILL 要求者が 1 つで済む、§X.2) |
+| 19 (MD) | 1 ≤ `TRIG_N` ≤ 4 | `ExcRec.trig_hit` の幅と tselect の WARL 範囲 (§3.4、§D.6)。`cfg_bad_*` のどちらかに `TRIG_N = 5` を足して bit を立てる |
 
 - 【決定】(M1b) `ROB_N` ≤ 256 と 2 の冪 (VU の 8 bit owner と `idx - head`、§3.4) は M1b の build では検査しない。M5 で VU を入れるときに bit 3 へ戻す。理由: M1b の build には VU が無く、この制約が守る対象が無い。§3.4 の宣言された上限としては残す。
 
@@ -380,6 +394,7 @@ pub proto package core_cfg {
     const REISSUE_W  : u32; // LQ re-issues per cycle, <= MEM_W
     const DC_NB      : u32; // dcache data banks (rebuilt CPU side, M3)
     const MSHR_N     : u32; // dcache MSHR entries (M3 structure, > 1 only from M4)
+    const TRIG_N     : u32; // Sdtrig triggers, 1..4 (MD, section D.6)
     // FU topology (see sections 5.7 and X)
     const PORT_FU    : FuSet [ISSUE_W]; // FU set per exec issue port
     const PORT_IQ    : u32 [ISSUE_W];   // IQ feeding each exec issue port
@@ -540,6 +555,8 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 | `lane_queue`, `stage_reg` | 段境界の汎用部品 (§5.3) | §0 | 新規 |
 | `chk_*` | 観測専用の invariant checker (§5.15) | §0 | 新規 |
 | `heliodor_soc_smp` | 統合した SoC (`CORE`, `N_HARTS>=1`, PMA 表) | §S | 再利用 + 変更 |
+| `trig_unit` (MD) | Sdtrig の trigger の CSR と、照合に使う登録済みの構成。hit bit と icount の更新 | §D | 新規 |
+| `dmi_apb`、`dm`、`dm_mem`、`dm_sba` (MD) | SoC の Debug Module: APB の DMI ポート、DM のレジスタと hart の制御と abstract command、debug memory (ROM、progbuf、data、flag)、System Bus Access | §D | 新規 |
 
 パッケージ: `core_cfg` (proto), `cfg_w2`, `cfg_w4`, `core_types::<CFG>`, `bpu_pkg::<CFG>` (予測器内部のサイズとレイテンシ、`bpu` だけが読む), `tag_pkg`, `tree_pkg`, `opclass_pkg` (FU 種別、OpClass と、FU ごとの op 符号 `BruOp`/`SysOp`/`SysUop`/`LdUop`/`StUop`/`AmoUop` と `UOP_W`、`op_class()`), `exc_pkg`, `fu_pkg` (モジュール境界を越えて公表するレイテンシのすべて: FU、`RESP_LAT`、`SNAP_OFS`、`LD_LAT`、`FWD_SKEW`、`SHADOW_LEN`、`IC_RESP_LAT`、`ITLB_LAT`、§2.1 P4。ほかはそれから導く WB 枠の helper `is_blocking`/`lat`/`claim_off` と `WbSlot` だけ), `pma_pkg`, `xlate_pkg` (I/D の翻訳で共有する権限判定関数), `retire_pkg`, `csr_pkg` (既存。CSR 属性表を追加のみで拡張する)。
 
@@ -566,7 +583,7 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 | `v14_vector_unit` | M5 | owner 幅と age 計算の修正 (§3.4) | §V |
 
 - MMU には凍結コピーを作らない。`tlb`/`ptw` は `mmu.veryl` のロジックを移植した新規モジュールであり、`mmu.veryl` そのものは変更しないため。
-- 新コアのファイルは `src/core/` の下に、章ごとのサブディレクトリ (`common/`, `front/`, `rename/`, `sched/`, `exec/`, `lsu/`, `mem/`, `commit/`) を切って置く。Veryl のモジュール名前空間はプロジェクト全体で 1 つなので、ディレクトリは読み手のための区分にすぎない。
+- 新コアのファイルは `src/core/` の下に、章ごとのサブディレクトリ (`common/`, `front/`, `rename/`, `sched/`, `exec/`, `lsu/`, `mem/`, `commit/`) を切って置く。Veryl のモジュール名前空間はプロジェクト全体で 1 つなので、ディレクトリは読み手のための区分にすぎない。MD で足す core 側の `trig_unit` は `src/core/debug/`、SoC 側の DM (`dmi_apb`、`dm`、`dm_mem`、`dm_sba`) は `src/peripheral/dm/` に置く (§D.2)。
 
 ### 4.5 コアの外部ポート群
 
@@ -582,11 +599,12 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 | 割込み | `i_irq_timer_m`, `i_irq_sw_m`, `i_irq_ext_m`, `i_irq_ext_s` (ゲスト外部割込みは M5) | csr で pending を作り、1 サイクル登録してから使う (§5.13)。 |
 | 時刻 | `i_mtime` | lockstep 時の tick は SoC 側で作る (§5.13)。 |
 | retire ポート | `o_retire[COMMIT_W]: RetireRec`、`o_irq_evt: IrqEvent` | §5.12。新コアの観測契約はこれだけ。`o_dbg_*` の群は持たない。 |
-| デバッグ入力 | `i_dbg_retire_limit_en`, `i_dbg_retire_limit`, `i_dbg_irq_mask`, `i_dbg_irq_allow` | §5.13。通常使用ではすべて 0 に固定する。 |
+| デバッグ入力 | `i_dbg_retire_limit_en`, `i_dbg_retire_limit`, `i_dbg_irq_mask`, `i_dbg_irq_allow` | §5.13。通常使用ではすべて 0 に固定する。lockstep 用の検証入力で、Debug Spec の Debug Mode とは無関係 (下の行)。 |
+| Debug Module (MD) | `i_dm_haltreq`, `i_dm_hartreset`, `o_dm_quiet`, `o_dm_stoptime`, 静的な `i_dm_halt_pc`/`i_dm_exc_pc`, 観測の `o_retire_dm` | §D.7。halt と resume の handshake は debug memory の flag で行うので、これ以外の配線は無い。`i_dm_*` は DM が駆動しない限り 0 で、そのときの振る舞いは MD の前と同一 (§D.1)。 |
 | 性能イベント | `o_perf` (登録済みの event wire の struct) | 機構ごとの発火 wire (§5.15)。HPM の 8 bit バス (csr 内部) はこの部分集合。 |
 | checker | `o_chk` (sticky flag) | 観測専用 (§5.15)。 |
 
-統合 SoC (`heliodor_soc_smp`、§S.1、§S.5) は、検証のために次のパラメータとポートを追加する: パラメータ `MTIME_SRC`/`MTIME_DIV` (mtime を時間で進めるか、retire 数の tick で進めるか、とその分周)、`i_mtime_tick`、`i_ext_irq_src` (外部割込みの注入元)、hart ごとの `i_dbg_*`、hart ごとに帰属を付けた IO アクセスの観測出力 `o_chk_io`。詳細は検証計画 §2.1 に従う。
+統合 SoC (`heliodor_soc_smp`、§S.1、§S.5) は、検証のために次のパラメータとポートを追加する: パラメータ `MTIME_SRC`/`MTIME_DIV` (mtime を時間で進めるか、retire 数の tick で進めるか、とその分周)、`i_mtime_tick`、`i_ext_irq_src` (外部割込みの注入元)、hart ごとの `i_dbg_*`、hart ごとに帰属を付けた IO アクセスの観測出力 `o_chk_io`。詳細は検証計画 §2.1 に従う。MD からは、DM のドメインの reset `i_dm_rst`、APB4 の slave ポート `i_dm_psel/penable/pwrite/paddr/pwdata/pstrb/pprot` と `o_dm_pready/prdata/pslverr`、パラメータ `DM_BASE`、DM の観測出力 `o_dm_obs` も持つ (§D.3、検証計画 §2.1)。
 
 ---
 
@@ -780,7 +798,7 @@ function killed (k: input Kill, t: input RobTag) -> logic { return k.valid && (k
 
 - T1. kill は 1 サイクルに最大 1 つ。full が partial に優先する。同じサイクルに resolve した BRU の中では、最古のものが勝つ (木で選ぶ)。採用されなかった resolve は捨ててよい。commit の backstop (T8) が拾うので安全である。別の kill の直後のサイクルには部分 kill を採用しない (`!kill_q.valid`)。そのサイクルの resolve は直前の kill で既に死んでいる可能性があり、捨てても T8 が拾う。
 - 【決定】`Kill` は free list の head を、クラスごとの配列 `fl_head[2]` ではなく 2 つのフィールド `fl_int`/`fl_fp` で運ぶ。理由: Veryl は struct の中に unpacked 配列を置けないため。
-- 【決定】`RedirKind` は `core_types` に `Redirect` と並べて定義し、生成するのは `flush_ctrl` である (値の意味は §C.4)。理由: `Redirect` のフィールドの型であり、モジュール間で共有する型は型パッケージに置くため。`RedirKind` は少なくとも `BR` (BRU の resolve による部分 kill)、`BR_CM` (commit 時の検査 T8 による full kill) と、その他の原因 (例外、割込み、xRET、replay、flush を伴う retire) を区別する。front end は `BR`/`BR_CM` と `foff`/`taken` を使って history、RAS、FTQ の outcome を正確に修復する (§F)。
+- 【決定】`RedirKind` は `core_types` に `Redirect` と並べて定義し、生成するのは `flush_ctrl` である (値の意味は §C.4)。理由: `Redirect` のフィールドの型であり、モジュール間で共有する型は型パッケージに置くため。`RedirKind` は少なくとも `BR` (BRU の resolve による部分 kill)、`BR_CM` (commit 時の検査 T8 による full kill) と、その他の原因 (例外、割込み、xRET、replay、flush を伴う retire) を区別する。front end は `BR`/`BR_CM` と `foff`/`taken` を使って history、RAS、FTQ の outcome を正確に修復する (§F)。【決定】(MD、§D.4) `RedirKind` に Debug Mode への入場を表す `DEBUG` を足す (8 値で `logic<3>` に収まる)。dret は `XRET` を使う。front end から見ると TRAP と同じ「branch の結末を運ばない full kill」である。
 - T2. kill のサイクルには、タグを持つどの構造にも割り当てを行わない (`dispatch` を抑止する)。
 - T3. kill のサイクルにも issue、execute、完了は続いてよい。ただし、すべての段レジスタは、その edge で捕捉する op に `killed()` を適用する。kill のサイクルに完了した op は kill に負ける。
 - T4. 部分 kill は commit と同じサイクルに共存できる (keep より古い op は影響を受けない)。full kill のサイクルには commit を抑止する。
@@ -957,6 +975,7 @@ struct ExcRec { valid: logic, cause: logic<6>, tval: logic<64>, gpa: logic<54>, 
 - `trap_unit` が cause、tval、htval、GVA、委譲を計算するときは、運ばれてきたフィールドだけを使う。live な MMU 出力は読まない。
 - 同期例外の epc はその op の pc とする。割込みの epc は、`commit` が保持する commit 済みの next PC (`arch_next_pc_q`) とする。fetch のポインタは使わない。
 - trap した op はアーキ状態に書かない (RAT、PRF の対、CSR、store、reservation のいずれにも)。例外は 1 つだけ文書化しておく: ベクトルの precise fault は vstart と、部分的な VRF への書き込みを残す (M5)。
+- 【決定】(MD、§D.4、§D.6) 同期の Debug Mode 入場 (ebreak と trigger) もこの経路で運ぶ。`ExcRec` に `dm` (trap ではなく Debug Mode に入る)、`trig` (発生源が trigger で、tval は運ばれた値を使う)、`trig_hit: logic<4>` (一致した trigger の mask) を足す。trigger の一致は `exc_prio` の中で特権仕様の位置 (execute は最上位、load/store は不正命令と同じ群) に入る。フィールドの予約と位置は M4 で確定する (§D.16)。
 
 ### 5.9 メモリポート契約
 
@@ -1106,6 +1125,7 @@ retire record (`retire_pkg::RetireRec`、lane ごと)。record は retire の 1 
 
 割込み event (`IrqEvent`): `{valid, cause, epc, order}`。`order` は次の record の order であり、event 自体は order を消費しない。lane の record が無いサイクルにだけ出る。
 
+- (MD、§D.4) Debug Mode への入場は割込みの受付と同じく record を出さず order を消費しない。Debug Mode 中の retire は record を出し、同じタイミングで登録済みの `o_retire_dm` に印を付ける。`RetireRec` は変えない (golden のパッチが逐語コピーしているため)。retire_mon、tracer、`MTIME_SRC=INSTRET` の tick、lockstep の比較は印の付いた record を数えない。
 - lane の位置は比較対象ではない。trace diff は、record を order 順に直列化した列を比較する。golden の adapter は (偽 ifault の正規化などで) 別の lane に record を置いてもよい。
 - 正規化規則と MASK 対象 (counter CSR の読み出し、旧コアの minstret、偽 ifault の窓、不正な RVC の tval、rd=x0 の load の `mem_rdata` (LQ はデータを持たないので再構成できない) など) は、tracer と golden adapter の両方の隣に書く (検証計画、D4)。
 
@@ -1126,6 +1146,8 @@ retire record (`retire_pkg::RetireRec`、lane ごと)。record は retire の 1 
 | `i_dbg_retire_limit_en`, `i_dbg_retire_limit` (64) | lane l は `order_q + l < limit` のときにだけ retire できる。`order_q == limit` の op は oldest token を受け取らないので、取り消せない操作を始めない。 |
 | `i_dbg_irq_mask` | 1 のとき、割込みを受け付けない (pending は保持される)。 |
 | `i_dbg_irq_allow` | 1 のとき、`i_dbg_retire_limit_en=1` かつ `order_q == limit` の境界に限って mask を無視して受け付ける。`limit_en=0` なら allow は効かない (式の正本は §C.2.6 の `irq_ok`)。 |
+
+(MD、§D.4、§D.5) Debug Mode の入場は、この節の受付点をそのまま使う。haltreq、step の完了、icount の発火は割込みと同じ flush-at-head (`dm_take`、割込みより優先)、ebreak と trigger は例外と同じ lane 0 の outcome (DEBUG) で受け付ける。`dm_req` の間は oldest token を出さないので I3/I4 の論拠がそのまま成り立つ。retire limit は lockstep (上表)、step、icount の 3 つを合成した 1 項になる (正本は §D.5 と §C.2.2)。
 
 replay の手順 (tb が行う): golden の (K, cause) ごとに、`limit=K, limit_en=1, mask=1, allow=1` を設定する。コアは order K-1 まで retire して境界で止まり、`irq_q.pending` が立っていれば受け付ける。tb は event の cause が golden の cause と一致することを assert する。一定サイクル以内に event が出なければ、「golden の割込みが自コアで pending でない」として失敗とする。
 
@@ -2198,6 +2220,8 @@ M1b では、1 つのモジュールで閉じる項目を各モジュールの `
 
 REPLAY outcome は M1b から group 関数に入るが、発火するのは §L が順序違反の検出を入れてからである。割込み経路は M2 で実装する (rv64ui のゲートは割込みを使わない)。
 
+MD (§D) で本章のモジュールに足すもの: `commit` の outcome DEBUG、`dm_take` と `dm_pend_q`、step と icount の retire 制限 (`limit_ok` の合成、§D.5)、`o_retire_dm`、入場と dret での reservation の解除。`trap_unit` の Debug Mode 中の飛び先 (`i_dm_exc_pc`、ebreak は `i_dm_halt_pc`) と trigger の tval。`flush_ctrl` の `RedirKind::DEBUG`。`rob` の xRET 種別の 2 bit 化 (`XretKind {MRET, SRET, DRET}`)。`csr` の dcsr/dpc/dscratch0/1、`debug_mode`、`i_dm_enter`/`i_dret_fire`、stopcount、trigger の CSR の `trig_unit` への振り分け。decode の DRET と debug CSR の合法性 (C.8)。設計の確定は M4 で行う (§D.16)。
+
 M1b の `commit` が持たない副作用ポート (C.2.4 の表のうち M2 以降のもの): `o_xlate_flush` (翻訳の無効化、tlb/ptw と同時に M2)、`o_rsv_clr` と atomic の retire (`atomic_unit` と同時に M2)、FS/VS の dirty 化 (`i_fs_dirty` を足す M2、VS は M5)、vector のフィールド (M5)。`head_started_q` の発生源は `fu_sys` だけである (`STARTED_N = 1`)。M2 で `atomic_unit` と `io_unit` の `o_started` を足して `STARTED_N = 3` にする。M2 統合でこれらをすべて入れた: 翻訳の無効化は commit が `XlateFlush` から作る `o_tlb_inv: TlbInv` として I/D の `tlb` と `ptw` に出し (C.2.4 の表の `o_xlate_flush` にあたる)、`o_rsv_clr`、`o_head_retired`、`o_bar_ret`、FS の dirty 化、`STARTED_N = 3` (`fu_sys`、`atomic_unit`、`io_unit`) がある。
 
 ---
@@ -2315,6 +2339,8 @@ lane ごとの outcome (上から最初に当たったもの):
 
 flush の kind (XRET、SERIAL、BR_CM、および TRAP、IRQ、REPLAY) は `RedirKind` (§C.4) の値をそのまま使う。
 
+(MD、§D.4) 2 行目は `exc_q.rec.dm` なら outcome DEBUG (kind `DEBUG`、飛び先 `i_dm_halt_pc`) になり、そうでなければ TRAP のままである。DEBUG は TRAP と同じく lane 0 でだけ作用する。flush の優先順位の先頭に `dm_take` (非同期の入場) が入る: `dm_take` > `irq_take` > `trap_fire`/`dbg_fire` > `replay_fire` > RETIRE_FLUSH。下の式の `limit_ok` は MD から §D.5 の合成項 (lockstep、step、icount) になり、`retire[l]` には `!dm_take` が足される。
+
 retire の式 (正本。§5.12 C1 はこの式の要約):
 
 ```
@@ -2358,7 +2384,7 @@ limit_ok[l] = !i_dbg_retire_limit_en || order_q + l < i_dbg_retire_limit
 | 翻訳の無効化 | SFENCE.VMA, SINVAL.VMA, HFENCE.*, HINVAL.* | I/D の `tlb` と `ptw` (`o_xlate_flush`) | 1 |
 | icache の無効化 | `fence_i` (ROB エントリ) | `icache` (`o_icache_inv`) | 1 |
 | head の retire | lane 0 の retire | `atomic_unit` と `io_unit` の `i_head_retired` (started latch を下ろし、保持中の op を手放す。M2) | 1 |
-| reservation の解除事象 | trap の受付、xRET、satp への書込み | `atomic_unit` (`o_rsv_clr`) | 1 |
+| reservation の解除事象 | trap の受付、xRET、satp への書込み。MD から Debug Mode への入場と dret (§D.4) | `atomic_unit` (`o_rsv_clr`) | 1 |
 | FTQ と予測器 | retire した最年少 lane の `{ftq, foff}` | `ftq` の `i_cm` へ 1 本の `o_ftq_cm: FtqCommit {valid, ftq, foff}` (§F.3)。valid は retire した lane が 1 つ以上あることなので、full kill のサイクルには立たない。予測器の更新は ftq が commit 済みの範囲から作る (§F.4) | 1 |
 | instret | `popcount(retire)` | `csr.i_instret_cnt` | `RETIRE_CNT_W` |
 
@@ -2429,7 +2455,8 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 | xRET の飛び先 | MRET は `mepc`、SRET は `virt ? vsepc : sepc`。retire サイクルの csr 出力を読む (更新は次の edge)。 | 同じ (`:7714-7725`) |
 
 - 【決定】priv と V は csr の現在値を使い、旧コアの `o_priv_prev`/`o_virt_prev` は使わない。理由: priv と V が変わるのは trap と xRET の retire だけで、どちらも full kill を伴う。したがって retire サイクルの現在値は、その op を実行したときのモードと常に等しい。
-- 【決定】breakpoint の tval は `trap_unit` が epc で埋める。理由: ACT4 の構成 (`test/act/config/heliodor/heliodor.yaml:171`, REPORT_VA_IN_MTVAL_ON_BREAKPOINT) と一致させる。Sdtrig を持たないので cause 3 の発生源は EBREAK だけであり、decode に PC を配る必要もない。
+- 【決定】breakpoint の tval は `trap_unit` が epc で埋める。理由: ACT4 の構成 (`test/act/config/heliodor/heliodor.yaml:171`, REPORT_VA_IN_MTVAL_ON_BREAKPOINT) と一致させる。MD まで Sdtrig の trigger を持たないので cause 3 の発生源は EBREAK だけであり、decode に PC を配る必要もない。【決定】(MD、§D.6) MD からは trigger (action=0) も cause 3 を起こす。その tval は発生源 (execute は `ifu`/`extract`、load/store は `mem_pipe`) が `ExcRec.tval` に載せ、`trap_unit` は `ExcRec.trig=1` ならそれを、`trig=0` (EBREAK) なら epc を使う。icount の action=0 は非同期の breakpoint で、epc は `arch_next_pc_q` である。
+- 【決定】(MD、§D.4) Debug Mode 中の trap は CSR を書かない: `trap_unit` は `csr.i_trap_fire` を出さず、飛び先を EBREAK なら `i_dm_halt_pc`、それ以外の例外なら `i_dm_exc_pc` にする。dret の飛び先は dpc (`o_dret_pc`)。
 - decode 不正の tval は元の符号化 (RVC なら 16 bit) を発生源が `ExcRec.tval` に載せる (ACT4 構成の REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION)。cause 22 も同じ規則とする (M5)。
 - 特権検査はしない。合法性はすべて decode で済んでいる (C.8)。
 - 【M5 で決定】VS-stage の暗黙アクセスによる guest-page fault で、spec が tinst に擬似命令値を要求するかを照合する。要るなら `ExcRec` に `implicit` bit を足す (§5.8 で予告済み)。
@@ -2493,6 +2520,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
   - 追加のみ (M1-M2): `i_instret_cnt` (幅はパラメータ `INSTRET_CNT_W`、既定 1 で旧コアは従来の 1 bit を与える)、`i_fs_dirty`/`i_vs_dirty` (旧コアは 0)、decode 用の出力 (mcounteren, scounteren, hcounteren, mstatus.TW, hstatus.VTW, menvcfg/senvcfg/henvcfg の CBIE/CBCFE/CBZE と STCE)。
   - 挙動の修正 (C.9 で「csr 修正」とした行): 最初の修正が必要になった時点 (M2 を想定) で `src/v14/v14_csr` を凍結コピーし、旧コアはそちらを使う。
   - 【決定】(M2 統合) `v14_csr` を凍結し、`src/core/csr.veryl` は新コア専用になった。以後 csr にポートを足すブランチは `src/core/csr.veryl` を直接編集し、`v14_csr` を写し直さない。理由: 凍結の後は 2 つが別物で、写し直すと新コア側の修正が消える。M2 で足した入出力: `i_hart_id` (mhartid)、パラメータ `MISA` (core top の定数、C.9)、`i_fs_dirty`、`o_mstatus_tw`、`o_mcounteren`/`o_scounteren`、`o_menvcfg`/`o_senvcfg`、Supm/Ssnpm の `o_pmm_m/s/u` (mseccfg/menvcfg/senvcfg の PMM。`mem_pipe` の m0 の pointer masking が使う)、`o_data_priv` (MPRV=1 なら MPP、それ以外は現在の特権)。データの翻訳と PMP の特権は `o_data_priv` から取る (§M.7)。HPM のバスは csr の中で登録してから数える。
+  - (MD、§D.4、§D.9) csr に足すもの: dcsr/dpc/dscratch0/1、`o_debug_mode` (登録済み)、`i_dm_enter {cause, dpc}`、`i_dret_fire`、`o_dret_pc`、Debug Mode での priv := M と dret での復帰 (新しい特権が M 未満なら MPRV を落とす)、`o_data_priv` の mprven の規則、stopcount によるカウンタの停止、`o_dm_stoptime`、0x7A0-0x7A5 の `trig_unit` への読み書きの振り分け。いずれも §C.5 の不変条件 (1 サイクルに csr へ入るのは trap、xRET、CSR 書込みのうち高々 1 つ) に入場と dret を足して保つ。
 
 ---
 
@@ -2549,7 +2577,9 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 | CSR の特権 | `addr[9:8]` > 実効特権 | 2 (VS 階層は 22) | 2 のみ | M1b |
 | RO への書込み | `addr[11:10]==3 && csr_wr` | 2 | 書込み意図ではなく opcode で判定 | M1b |
 | xRET | MRET は priv != M。SRET は U、または S で TSR=1 | 2 (VU/VTSR は 22) | 検査なし (`:7146-7147`) | M1b |
-| SYSTEM の未定義 | SYSTEM funct3=000 の未定義 funct12 (DRET 等。ECALL、EBREAK、MRET、SRET、WFI、SFENCE/SINVAL 系、WRS.NTO/STO 以外) | 2 | NOP として実行 | M1b |
+| SYSTEM の未定義 | SYSTEM funct3=000 の未定義 funct12 (MD までは DRET を含む。ECALL、EBREAK、MRET、SRET、WFI、SFENCE/SINVAL 系、WRS.NTO/STO 以外) | 2 | NOP として実行 | M1b |
+| DRET | Debug Mode の外 (§D.4) | 2 | NOP として実行 (B30) | MD |
+| debug CSR | dcsr、dpc、dscratch0/1 (0x7B0-0x7B3) へのアクセスで Debug Mode の外 (§D.14) | 2 | 存在しない | MD |
 | counteren | S/U からの cycle/time/instret/hpmcounterN で mcounteren (U は scounteren も、V=1 は hcounteren も) のビットが 0 | 2 / 22 | 検査なし | M2 |
 | Sstc | stimecmp は mcounteren.TM && menvcfg.STCE (vstimecmp は hcounteren/henvcfg も) | 2 / 22 | 検査なし | M2 |
 | FS=Off | FP 演算、FP load/store、fflags/frm/fcsr | 2 | commit で判定、メモリアクセスの後、FP CSR は対象外 | M2 |
@@ -2567,7 +2597,8 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 | H 命令 | HLV/HSV/HFENCE/HINVAL を V=1 で、U で HU=0 | 22 / 2 | VU の HFENCE は検査なし | M5 |
 
 - 【決定】属性表に mvendorid, marchid, mimpid, mconfigptr, mcountinhibit を「存在・RO・値 0」で登録する。理由: 旧コアはこれらを未実装のまま 0 で読ませており、boot の firmware が m*id を読む。存在しない CSR を trap にしても boot の挙動は変わらない。
-- 【決定】(M2 統合) Sdtrig の trigger の CSR (tselect 0x7A0、tdata1 0x7A1、tdata2 0x7A2、tcontrol 0x7A5) は存在する CSR として登録し、0 を読み書き込みを捨てる (trigger は 1 つも実装しない)。理由: rv64mi の breakpoint が tselect を読み書きし、0 が読めれば trigger 無しとしてテストを飛ばす。存在しない CSR にすると cause 2 の trap で止まる。
+- 【決定】(M2 統合、MD まで) Sdtrig の trigger の CSR (tselect 0x7A0、tdata1 0x7A1、tdata2 0x7A2、tcontrol 0x7A5) は存在する CSR として登録し、0 を読み書き込みを捨てる (trigger は 1 つも実装しない)。理由: rv64mi の breakpoint が tselect を読み書きし、0 が読めれば trigger 無しとしてテストを飛ばす。存在しない CSR にすると cause 2 の trap で止まる。この決定は MD で §D.14 の存在表 (`TRIG_N` 個の mcontrol6/icount、tdata3、tinfo、tcontrol の mte/mpte) に置き換わる。
+- 【決定】(MD、§D.14) dcsr、dpc、dscratch0/1 は CSR 属性表に「Debug Mode でだけ存在」の属性で登録し、decode は csr の登録済み出力 `debug_mode` に対して評価する。`debug_mode` が変わるのは入場と dret の full kill だけなので、priv と同じ論拠で decode 時の値は op から見て正しい。Debug Mode の EBREAK は `ExcRec.dm=1` で再入場し、Debug Mode の外の EBREAK は現在の特権の dcsr.ebreakm/s/u が 1 なら `dm=1` を付ける。
 - 【決定】(M2 統合) decode の M2 行は csr の登録済み出力 (`DecCsr {tw, fs, mcounteren, scounteren, menvcfg, senvcfg}`) に対して評価する。counteren の行に加え、stimecmp は HS で mcounteren.TM と menvcfg.STCE の両方を要する。
 - 【決定】WFI は、合法なら NOP (D2)、上表の条件では trap とする。理由: ACT4 の参照である Sail は U-mode の WFI と TW=1 の S-mode の WFI を illegal にする。NOP は「有界時間で完了する」ので spec 上は trap しなくてもよいが、ACT4 の比較対象に合わせる。boot の WFI は S-mode・TW=0 だけなので lockstep には影響しない。M2 で確認した: ACT4 の `sail.json` は `wfi_is_nop: false`、`wfi_available_to_user_mode: false` で、この規則と一致する。
 - 不正判定が decode にあるので、FS=Off の FP load がメモリに触れることも、illegal と load fault の優先順位が逆転することも構造的に起きない。
@@ -2613,7 +2644,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 
 ### C.10 発火カウンタと checker
 
-`o_perf` に出す本章の事象 (§5.15): retire した lane 数ごとのサイクル数、group を切った理由ごと (alone, 例外, poison, store 予算, drain 待ち, limit, irq, kill)、outcome の種別ごと (TRAP, REPLAY, RETIRE_FLUSH の kind 別, T8 backstop)、`irq_take`、`head_started_q` による受付待ちサイクル、partial kill の採用と破棄 (walk 中、連続、full 優先)、full kill の kind 別、walk サイクル数、`exc_q` の置き換え。
+`o_perf` に出す本章の事象 (§5.15): (MD で §D.15 の `CorePerf.dbg` と `chk_debug` を足す) retire した lane 数ごとのサイクル数、group を切った理由ごと (alone, 例外, poison, store 予算, drain 待ち, limit, irq, kill)、outcome の種別ごと (TRAP, REPLAY, RETIRE_FLUSH の kind 別, T8 backstop)、`irq_take`、`head_started_q` による受付待ちサイクル、partial kill の採用と破棄 (walk 中、連続、full 優先)、full kill の kind 別、walk サイクル数、`exc_q` の置き換え。
 
 `chk_commit` と `chk_rob` (観測専用、sticky) の項目:
 
@@ -3507,7 +3538,7 @@ o_evt : PtwEvent  // {valid, key: PtwKey = {vpn, regime}, fault} (section 5.10);
 
 ### S.1 統合 SoC
 
-- 【決定】`heliodor_soc` を削除し、`heliodor_soc_smp` を `N_HARTS>=1` で使う 1 つの SoC にする (D3)。M1a の作業である。パラメータは `CORE` (enum `V14`/`W2`/`W4`)、`N_HARTS`、`PMA_REGIONS` (S.2)、`MTIME_SRC`/`MTIME_DIV` (S.5)、`RESET_PC`。
+- 【決定】`heliodor_soc` を削除し、`heliodor_soc_smp` を `N_HARTS>=1` で使う 1 つの SoC にする (D3)。M1a の作業である。パラメータは `CORE` (enum `V14`/`W2`/`W4`)、`N_HARTS`、`PMA_REGIONS` (S.2)、`MTIME_SRC`/`MTIME_DIV` (S.5)、`RESET_PC`。MD で `DM_BASE` (debug memory の base、§D.7) を足す。DM は新コアの枝には常にあり、有無の knob は持たない。V14 の枝には DM が無く、APB のポートは `pready = 1`、`prdata = 0` を返す (§D.17)。
 - `CORE` は generate-if でコアを選ぶ (D6、§3.6)。V14 枝は現在の SoC の配線をそのまま保つ (PA[31] による DRAM デコード、`o_imem` の tb 供給、I slot の DRAM 固定)。V14 のゲート結果を動かさないためである。新コアの枝では、アドレスのデコードを `pma_pkg::pma_check(PMA_REGIONS)` の 1 か所で行う (§5.11 PM1)。
 - コアとの接続は §4.5 の外部ポート群だけである。D read slot と I read slot は hart ごとに 1 本ずつ (S.3)、write channel と coherence 入力は再利用 dcache の既存仕様、割込みは CLINT と PLIC からの pin、時刻は `i_mtime` である。
 - `N_HARTS=1` で幅 0 の信号が生じないように、hart 番号の幅は `idx_w` 相当の helper で作る (§5.1)。
@@ -3523,8 +3554,10 @@ o_evt : PtwEvent  // {valid, key: PtwKey = {vpn, regime}, fault} (section 5.10);
 | PLIC | 0x0C00_0000 | 4 MiB | 0x1000_0000 | IO | 0 | 0 | 0 | 0 | 1 | NONE | 0 | 0 | 0 |
 | UART | 0x1000_0000 | 4 KiB | 0x100 | IO | 0 | 0 | 0 | 0 | 1 | NONE | 0 | 0 | 0 |
 | DRAM | 0x8000_0000 | 32 MiB | 0x1FFF000 | DRAM | 1 | 1 | 1 | 1 | 0 | FULL | 1 | 1 | 1 |
+| DM code (MD) | `DM_BASE` (推奨 0x0000_4000、U38) | 4 KiB | (無し) | DEBUG | 0 | 0 | 1 | 1 | 0 | NONE | 0 | 0 | 0 |
+| DM data (MD) | `DM_BASE` + 0x1000 | 4 KiB | (無し) | DEBUG | 0 | 0 | 0 | 0 | 1 | NONE | 0 | 0 | 0 |
 
-それ以外の PA はすべて hole であり、アクセス fault になる (§5.11 PM4)。
+それ以外の PA はすべて hole であり、アクセス fault になる (§5.11 PM4)。DM の 2 領域は `MAP_BOOT`、`MAP_ARCH`、`MAP_LITMUS` のすべてに入れ、Debug Mode の外からのアクセスは target DEBUG の規則でアクセス fault になる (§D.8)。DTS と `sail.json` には載せず、PM6 の照合は target DEBUG の領域を外す。
 
 - 表の不変条件 (所有者 `pma_pkg`。elaborate 時に const 関数で検査し、PM6 の照合スクリプトでも検査する): 各領域は 4 KiB 以上の 2 の冪の大きさで、その大きさに自然整列している。領域は重ならない。`executable=1` ならば `idempotent=1` (§F.6 IC5)。`pte_ok=1` ならば `cacheable=1 && coherent=1` (§M.8.3)。`amo != NONE` ならば `cacheable=1`。
 - 旧コアとの差: 旧 SoC は UART を PA[31:28]==1 の 256 MiB の窓で、CLINT と PLIC を PA[31:24] の 16 MiB の窓でデコードし、PA[63:32] を見ない。新コアの枝では上表の大きさだけが backed で、残りは hole になる。旧コアは ROM を hole に置き、`PMA_FAULT=0` で hole 判定を切っていた (検証計画付録 B の B42)。
@@ -3552,9 +3585,11 @@ L1 から見た mem_ctrl の read channel の規約を、コアの外部契約�
 ### S.5 時刻、割込み、デバッグ入力、観測
 
 - CLINT: 追加の入力 `i_tick_sel`/`i_tick` (§3.4)。`i_tick_sel=0` で従来の /10 prescaler、1 で `i_tick` のサイクルに mtime を 1 進める。SoC の `MTIME_SRC` は `CYCLE`、`INSTRET`、`EXTERNAL`、`OFF` の 4 値で、`MTIME_DIV` はその分周 (既定は `CYCLE` と 10)。値の意味と harness の対応は検証計画 §4.1 にある。
+- (MD) CLINT に追加入力 `i_time_stop` を足す。新コアの枝では全 hart の `o_dm_stoptime` の AND を入れ、V14 の枝は 0 に固定する (§D.9)。`MTIME_SRC=INSTRET` の tick は `o_retire_dm` の印の付いた record を数えない。
 - 【決定】`MTIME_SRC=INSTRET` の tick は、hart 0 の retire record (サイクル r の retire はサイクル r+1 に登録済みで出る、§C.2.7) から組合せで作り、そのサイクルの edge で mtime に入れる。tick の経路にレジスタを足さない。理由: 時刻の読みが retire 順位だけで決まるという論証 (検証計画 §4.1) は余裕が 0 サイクルである。op X がサイクル r に retire すると、record は r+1、mtime の更新は r+1 の edge、次の op Y が token を得るのは r+1、Y の `fu_sys` の受理は早くて r+2 である。tick に 1 段でもレジスタが入ると、Y は X の分の tick を見ずに読む。SoC は `MTIME_SRC==INSTRET` のとき `N_HARTS==1` と `MTIME_DIV ≥ COMMIT_W` を elaborate 時に検査する。
 - 割込み: CLINT から hart ごとの timer と software の pin、PLIC から hart ごとの M と S の外部割込みの pin (hart あたり 2 context)。`i_ext_irq_src` は PLIC に足す外部ソースで、tb が smode_plic のパルスを入れる (既定 0)。ゲスト外部割込みは M5。
 - デバッグ入力: hart ごとの `i_dbg_retire_limit_en/limit`、`i_dbg_irq_mask/allow` をコアへそのまま配る (§5.13)。harness が駆動しない限り 0。
+- Debug Module (MD): `dm` の hart ごとの `haltreq`/`hartreset` をコアへ、コアの `o_dm_quiet`/`o_dm_stoptime` を `dm` と reset 木と CLINT へ配り、`dm_mem` を memory_bus の slave に、`dm_sba` を mem_ctrl の SBA の経路に置く。`ndmreset` は DM と APB 以外の reset 木に OR する。設計の正本は §D。
 - 観測: hart ごとの `o_retire`、`o_irq_evt`、`o_perf`、`o_chk` をそのまま出す。`o_chk_io` は SoC 側の IO モニタ `chk_io_mon` の sticky flag で、照合規則は検証計画 §8 にある。V14 の枝では retire port が無いので無効である。
 - M2 で SoC に入れたもの (新コアの枝。V14 の枝は変えない): `MTIME_SRC`/`MTIME_DIV` と retire 数で進む mtime (hart 0 の retire record の非 trap 数を累算し、`MTIME_DIV` ごとに CLINT の `i_tick` を 1 回。`MTIME_SRC=CYCLE` かつ `MTIME_DIV=10` 以外では `i_tick_sel=1`)、hart ごとの `i_dbg_retire_limit_en/limit`、`i_dbg_irq_mask/allow`、PLIC のソースに OR する `i_ext_irq_src` (bit 10 は UART)、device 側のアクセスの観測 `o_io_obs[2]` (`soc_pkg::IoObs`、[0] が読み、[1] が書き込み)、hart ごとの `o_core_perf` (`PERF_W` = 512 bit に 0 拡張した CorePerf、V14 枝は 0)、param `UART_WRCNT` (UART + 0x100 の読み出しが device 側の UART 書き込み回数を返す。試験用で既定 0)。新コアの枝では UART の読みデータを offset の byte lane に置き、書きデータを offset の byte lane から取る (V14 の枝は下位 byte 固定のまま)。
 - 【決定】(M2) IO モニタ `chk_io_mon` は SoC には置かず tb のモジュールにし、SoC は `o_io_obs` だけを出す (`o_chk_io` は作らない)。理由: 照合の相手の retire record と PMA 表は harness が持っており、SoC に置くと SoC が checker のために `retire_pkg` の照合を抱える。
@@ -3574,8 +3609,9 @@ owned な line は recall されてから読まれるので、自 hart と他 ha
 | hart 数 ≤ 8 | mem_ctrl の `o_cadd_hart: logic<3>` と `o_inst_hart`、CLINT のデコード (`clint.veryl:33-34` の `logic<3>`) | N_HARTS ∈ {1, 2, 4, 8} |
 | hart あたりの slot は 2 本 | `SPH=2` (D 1 本、I 1 本)。`SPH > 2` には `o_inst_hart = h as 3` (`mem_ctrl.veryl:1067`) の修正などが要る (§M.4) | `N_FILL=1` |
 | PLIC のソース数 | DTS の `riscv,ndev = <31>` | 31 |
+| (MD) SBA の slot | U33 の推奨 (a) では全 hart の D/I の後に 1 本。N=8 で 17 本になり、mem_ctrl の slot 番号 `logic<4>` (N_SLOTS ≤ 16、§M.4) を導出幅に直す必要がある | 1 本 |
 
-どれも §3.4 に載っている。
+MD の行を除き、どれも §3.4 に載っている。
 
 ### S.8 マイルストーンごとの範囲
 
@@ -3585,6 +3621,7 @@ owned な line は recall されてから読まれるので、自 hart と他 ha
 | M1b | `CORE=W2/W4` の枝 (新コアの instantiate と `pma_check` によるデコード) |
 | M2 | 新コアでの boot と smode_plic (ROM fetch、割込みの pin、`i_ext_irq_src`)、`chk_io_mon` の有効化。済み: S.5 の M2 の追加と U28 の single beat (S.3)。smode_plic の新コア枝は ROM ではなく DRAM から走らせる (検証計画 §2.4) |
 | M4 | PLIC claim の競合の directed test (検証計画 §8) |
+| MD | DM (`dmi_apb`、`dm`、`dm_mem`、`dm_sba`)、APB のポートと `i_dm_rst`、`DM_BASE` と DM の PMA 領域、ndmreset と hartreset の reset 木、CLINT の `i_time_stop`、mem_ctrl の SBA の経路 (U33)、`o_dm_obs` (§D) |
 | M6 | V14 の枝の削除 |
 
 ---
@@ -3782,6 +3819,352 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 
 ---
 
+## §D デバッグ (Debug Specification 1.0)
+
+本章は RISC-V Debug Specification 1.0 (以下 spec) の Sdext (core の Debug Mode)、Sdtrig (trigger)、Debug Module (DM) と System Bus Access (SBA) を、新コアと統合 SoC に入れる設計を定める。根拠はユーザ決定 D9 (§1.4) である。実装はマイルストーン MD (M4 と M5 の間) で行い、core 側の入場の設計は M4 の中で確定する (D.16)。§5.4 (kill)、§5.8 (例外)、§5.12 (commit group と retire record)、§5.13 (割込みの受付点と lockstep の debug 入力)、§5.13.1 (取り消せない操作) と §C を前提とし、ここではそれに足すものだけを書く。spec のレジスタの bit 配置と値の意味は spec を正本とし、本章は再掲しない。
+
+### D.0 範囲
+
+| 区分 | 範囲 | 扱い |
+|---|---|---|
+| Sdext | Debug Mode への入場 (haltreq、`dcsr.ebreakm/s/u` による ebreak、`dcsr.step`、trigger)、dcsr、dpc、dscratch0/1、dret、stepie、stopcount、stoptime | MD (D.4、D.5、D.9) |
+| DM | dmcontrol、dmstatus、hartinfo、abstractcs、command、abstractauto、data、progbuf、hart の選択、halt/resume/ndmreset/hartreset、Access Register (GPR/FPR/CSR)、program buffer の実行 | MD (D.3、D.7、D.13) |
+| Sdtrig | mcontrol6 の address 照合 (execute/load/store)、icount、trigger 数 `TRIG_N` (2-4、構成ごと) | MD (D.6)。§C.8 の「0 を読む trigger CSR」を置き換える |
+| SBA | sbcs、sbaddress、sbdata | MD (D.11) |
+| SMP | halt group と resume group、hasel/hawindow、haltsum0 | MD (D.12) |
+| H との相互作用 | dcsr.v と prv、ebreakvs/vu、mcontrol6 の vs/vu、HLV/HSV と VU の要素アクセスの照合 | M5 (D.16) |
+| 範囲外 | trace (E-trace/N-trace)、debug の認証、設計内の JTAG DTM、V14 のデバッグ | 実装しない (D.1) |
+
+### D.1 目標と非目標
+
+目標:
+
+- OpenOCD と GDB が、統合 SoC の DM を spec どおりの DM として扱えること。riscv-tests の debug suite (`gdbserver.py`) が、spike で通る範囲を除外表 (U37) の外で同じく通ること (検証計画 §9)。
+- Debug Mode への入場と trigger の発火を、例外や割込みと同じ精密な commit 時の事象にすること。投機的な op が hart を止めることも、hit bit を立てることも構造的に無い。
+- DMI が idle のとき、コアと SoC の振る舞いが MD の前とサイクル単位で同一であること。lockstep の梯子は DM を持ったまま動き、結果を変えない (検証計画 §9.3)。
+- 新コアの規則 (knob 0 個、§5.15 のヘッダ、600 行の目安、cold-reader gate、checker、発火カウンタ) を DM と `trig_unit` にも適用する。
+
+非目標:
+
+- 設計内の JTAG DTM。DM への入口は APB の slave ポート 1 本で (D.3)、JTAG DTM が要るなら SoC を使う側が外に足す。シミュレーションで OpenOCD をつなぐための JTAG DTM は tb にだけ置く (検証計画 §9.2)。
+- trace と debug の認証。`dmstatus.authenticated` は常に 1 で、authdata は持たない。
+- Abstract command の Access Memory と Quick Access。【決定】持たない (cmderr = 2)。理由: OpenOCD は SBA と program buffer のどちらかがあればメモリを読み書きでき、Access Memory を入れると hart の翻訳と PMP を DM の command の側で再現することになる。
+- Debug Mode 中の性能。Debug Mode の命令は uncached の DM の領域から fetch し、step と icount の間は lane 0 だけが retire する (§3.4 の MD の行)。
+- V14 のデバッグ。V14 は M6 で消えるまでデバッグを持たない (D.17)。
+
+### D.2 構造
+
+```
+  integrator's JTAG DTM (outside the design) or tb-only DTM (verification)
+        |
+        v  APB4 slave: DMI register space, 512 B
+  +-----------+     +--------------------------------------------+
+  |  dmi_apb  |---->| dm: DM registers, per-hart state, groups,  |
+  +-----------+     |     abstract command generator, ndmreset   |
+                    +----+--------------+--------------+---------+
+                         | haltreq[h]   | ABS/progbuf  | sb* registers
+                         | hartreset[h] | flags        |
+                         v              v              v
+  +----------------------------+  +-------------+  +--------+
+  | core h (x N_HARTS)         |  | dm_mem      |  | dm_sba |
+  |  commit, trap_unit, csr,   |  | (memory_bus |  +---+----+
+  |  trig_unit, ifu/extract,   |->|  slave)     |      | SBA path
+  |  mem_pipe (trigger match)  |  +-------------+      v
+  +----------------------------+                   mem_ctrl / memory_bus
+     fetch/load/store to the DM region (Debug Mode only)
+  dm.ndmreset and each core's o_dm_quiet drive the SoC reset tree
+```
+
+| モジュール | 置き場所 | 責務 | 由来 |
+|---|---|---|---|
+| `dmi_apb` | SoC (`src/peripheral/dm/`) | APB4 の 1 transfer を DMI の 1 アクセス `{op, addr: logic<7>, data: logic<32>}` にする。1 wait state 固定 (D.3) | 新規 |
+| `dm` | SoC | spec の DM のレジスタ、hart ごとの状態 (halted、resumeack、havereset、resethaltreq、hartreset の要求)、halt/resume group、abstract command の生成と進行、`ndmreset`。600 行を超えるなら register の decode と hart の状態と command の生成で分ける (【MD で決定】、§2.2 M4) | 新規 |
+| `dm_mem` | SoC (memory_bus の slave) | debug memory: debug ROM (const)、abstract command の命令語、progbuf、data、hart ごとの flag と、hart が書く HALTED/GOING/RESUMING/EXCEPTION の受け口 (D.7) | 新規 |
+| `dm_sba` | SoC | SBA の master。アクセスを 1 つずつ出す (D.11) | 新規 |
+| `trig_unit` | core (`src/core/debug/`) | trigger の CSR (tselect、tdata1-3、tinfo、tcontrol)、照合に使う登録済みの構成 `TrigCfg`、hit bit と icount の更新、tcontrol の mte/mpte (D.6) | 新規 |
+| `csr` | core | dcsr、dpc、dscratch0/1、`debug_mode`、入場と dret での特権の切替、stopcount、mprven (D.4、D.9) | 変更 (新コア専用、§C.5) |
+| `commit`、`trap_unit`、`flush_ctrl`、`rob` | core | outcome DEBUG、`dm_take`、step と icount の retire 制限、Debug Mode 中の trap の飛び先、`RedirKind::DEBUG`、xRET 種別の 2 bit 化 | 変更 (§C.0 の MD の段落) |
+| `decode` | core | DRET、debug CSR、ebreak の `dm` の合法性と属性 (§C.8) | 変更 |
+| `ifu`/`extract`、`mem_pipe`/`lq`/`sq` | core | execute と load/store の trigger の照合 (D.6)、DM 領域の PMA/PMP の規則 (D.8) | 変更 |
+| `clint` | SoC | `i_time_stop` (D.9)。V14 の枝は 0 に固定する追加入力 | 変更 (追加のみ) |
+
+- 【決定】DM は SoC に 1 つだけ置き、全 hart を受け持つ (`nextdm = 0`)。理由: hart の選択、hasel、halt group は全 hart を見る 1 か所で決まり、spec の「1 つの DM が複数 hart を受け持つ」形にそのまま一致する。
+- 【決定】Debug Spec の信号と状態は `dm_` prefix で呼び、§5.13 の lockstep 用の `i_dbg_*` とは名前で分ける。`i_dbg_*` は改名しない。理由: `i_dbg_*` は検証用の制御入力で Debug Mode とは無関係だが、改名すると lockstep の harness と SoC のポートを触ることになり、得るものが名前の衝突の回避だけである。
+
+### D.3 APB の DMI ポート
+
+SoC の外部ポート (DM のドメイン):
+
+| ポート | 幅 | 意味 |
+|---|---|---|
+| `i_dm_rst` | 1 (async_low) | DM と APB のドメインの reset。power-on でだけ下げる。ndmreset と hartreset では下がらない (D.13) |
+| `i_dm_psel`、`i_dm_penable`、`i_dm_pwrite` | 1 | APB4 |
+| `i_dm_paddr` | 9 | byte address。`paddr[8:2]` が DMI のアドレス (0x00-0x7F)。`paddr[1:0]` は無視する |
+| `i_dm_pwdata` / `o_dm_prdata` | 32 | |
+| `i_dm_pstrb` | 4 | `4'hF` 以外の書き込みは捨て、`o_dm_pslverr = 1` を返す |
+| `i_dm_pprot` | 3 | 無視する |
+| `o_dm_pready`、`o_dm_pslverr` | 1 | |
+
+【決定】APB は SoC の `clk` に同期させ、どの transfer も ACCESS 相を 2 サイクル (1 wait state) にする。
+
+| サイクル | APB | DM |
+|---|---|---|
+| T0 | SETUP (`psel=1, penable=0`) | なし |
+| T1 | ACCESS (`penable=1`)、`pready=0` | アドレスを decode し、読み値を登録する |
+| T2 | ACCESS、`pready=1`、`prdata` 有効 | T2 の終わりの edge で、書き込みと読みの副作用 (autoexecdata、sbreadondata、sbautoincrement など) を 1 回だけ起こす |
+
+理由: 読み値を登録して出すので、DM のレジスタから APB へ組合せの経路が出ない。spec の DMI アクセスの副作用は 1 アクセスに 1 回であり、それを T2 の edge の 1 か所に置ける。
+
+- DM は DMI のアクセスを待たせない。spec の DMI の busy は DTM の概念で、DM 側の「処理中」は spec どおり abstractcs.busy/cmderr と sbcs.sbbusy/sbbusyerror で返す。
+- 存在しないアドレスは 0 を読み、書き込みを捨てる (spec)。`pslverr` は pstrb の部分書き込みにしか使わない。
+- 非同期の clock domain への橋渡し、JTAG DTM、APB の address decode (`psel` の生成) は SoC を使う側の責任である。
+- 統合 SoC の既存の harness はすべて `i_dm_psel = 0`、`i_dm_rst = rst` を明示的に接続する (検証計画 §2.1、新規ファイルの missing_port 警告 0)。
+
+### D.4 core の Debug Mode: 精密な commit 時の事象
+
+入場の原因と受付:
+
+| 原因 (dcsr.cause) | 発生源 | 受付の形 | dpc |
+|---|---|---|---|
+| ebreak (1) | `decode`: EBREAK で、現在の特権の `dcsr.ebreakm/s/u` が 1 | 同期: op が `ExcRec {cause 3, dm=1}` を運び、lane 0 で outcome DEBUG | その ebreak の pc |
+| trigger (2)、address | `ifu`/`extract` (execute) と `mem_pipe` (load/store) の照合で action=1 の trigger が一致 (D.6) | 同期: `ExcRec {dm=1, trig=1, trig_hit}`、outcome DEBUG | その op の pc (before) |
+| trigger (2)、icount | `trig_unit` の icount が pending (D.6) | 非同期 (`dm_take`) | 次に実行する命令の pc |
+| haltreq (3) | DM の `haltreq[h]`。resethaltreq と halt group による停止も DM が haltreq で伝える | 非同期 (`dm_take`) | 次に実行する命令の pc |
+| step (4) | `commit` の step (D.5) | 非同期 (`dm_take`) | 次に実行する命令の pc (trap したならハンドラの先頭) |
+
+【決定】resethaltreq (5) と halt group (6) の cause は報告せず、3 を報告する。理由: spec はどちらにも 3 での報告を許している。core の入力は `i_dm_haltreq` 1 本で済み、DM が原因を core に伝える必要が無い。
+
+【決定】入場は例外と割込みの受付点をそのまま使う。理由: 精密さ (dpc が正確で、それより古い op はすべて retire し、若い op は 1 つも効果を残さない) は、例外と割込みについて既に §5.4、§5.12、§5.13 の不変条件と checker で守られている。新しい受付点を作ると同じ論証をもう一度要する。
+
+- 同期の入場は例外の経路 (§5.8、§C.1.2) に乗せる。`ExcRec` に `dm`、`trig`、`trig_hit` を足し (§5.8)、`exc_q` の最古の 1 件の選択と `exc_prio` の合流をそのまま使う。§C.2.2 の 2 行目は `exc_q.rec.dm` なら outcome DEBUG、そうでなければ TRAP になる。DEBUG は TRAP と同じく lane 0 でだけ作用し、lane l>0 では group を切るだけである。
+- 非同期の入場は割込みと同じ flush-at-head にする。`dm_q` (`i_dm_haltreq` を 1 サイクル登録したもの) と commit の内部の pending `dm_pend_q` (step の完了、icount の発火) の OR を `dm_req` とし、`dm_take = !debug_mode && dm_req && !head_started_q && !i_kill.valid` とする。`dm_take` のサイクルには lane を 1 つも retire させない。
+- 1 サイクルの flush は 1 つ (§C.2.2): `dm_take` > `irq_take` > lane 0 の DEBUG/TRAP > REPLAY > RETIRE_FLUSH。lane 0 の DEBUG と TRAP は同じ `exc_q` の 1 件なので同時には起きない。haltreq と割込みが同時なら Debug Mode に入り、割込みは pending のまま残る (Debug Mode では受け付けず、dret の後に受け付ける)。
+- oldest token (§5.13 I5) の valid に `!dm_req` を足す。これで割込みと同じく、入場を待つ間に新しい取り消せない操作は始まらず、始まった操作は自分の started latch で終わる (§5.13.1 IR1)。したがって入場は有界時間で起きる。M4 が足す取り消せない操作 (ASQ など) もこの論拠に入る (D.16)。
+- WRS.NTO/STO を待つ実装にする場合は、haltreq でも待ちを解く (割込みと同じ扱い)。NOP として実装するなら何も要らない。
+
+入場のサイクルの動作 (所有者 `commit`):
+
+- `flush_ctrl` へ full kill (`RedirKind::DEBUG`、`Redirect.pc = i_dm_halt_pc`)。`arch_next_pc_q := i_dm_halt_pc`。
+- `csr.i_dm_enter {cause, dpc: arch_next_pc_q}`。csr は dcsr.cause、dcsr.prv (と M5 から dcsr.v) に現在値を、dpc に `arch_next_pc_q` を書き、`debug_mode := 1`、priv := M とする。同期の入場では op は retire しないので、`arch_next_pc_q` はその op の pc に等しい (§C.2.3 の不変条件)。dpc の式は原因によらず 1 つである。
+- trigger による入場なら `trig_unit.i_hit {mask: trig_hit}` で hit bit を立てる。
+- reservation を消す (`o_rsv_clr`、§C.2.4)。
+- record も IrqEvent も出さない (割込みの受付と同じく order を消費しない、§5.12)。
+
+Debug Mode 中の hart:
+
+| 事項 | 規則 | 所有者 |
+|---|---|---|
+| 特権 | M で実行する。mstatus.MPRV は `dcsr.mprven=1` のときだけ data の特権に効く (`o_data_priv`) | `csr` |
+| 割込み | 受け付けない (`irq_ok` に `!debug_mode`)。pending は保持される | `commit` |
+| trigger | 一致しない (`TrigCfg` の有効 bit を `!debug_mode` で落とす) | `trig_unit` |
+| 例外 | CSR を書かない (mcause、mepc、mtval、mstatus を変えない)。`trap_unit` は `csr.i_trap_fire` を出さず、飛び先を `i_dm_exc_pc` にする。trap record は出す | `trap_unit`、`commit` |
+| ebreak | 再入場: dpc と dcsr を変えず、`i_dm_halt_pc` へ飛ぶ。decode は Debug Mode の EBREAK に `dm=1` を付け、commit は `debug_mode` なら入場の動作を「飛ぶだけ」にする | `decode`、`commit` |
+| WFI | NOP (D2 と同じ) | |
+| カウンタ | `dcsr.stopcount=1` なら mcycle、minstret、hpmcounter を進めない (D.9) | `csr` |
+| retire record | 出す。同じタイミングの `o_retire_dm` (登録済み、1 bit) で印を付ける | `commit` |
+| 翻訳 | 特権が M なので Bare (MPRV と mprven による場合を除く) | `tlb`、`ptw` |
+| DM の領域 | アクセスでき、PMP を適用しない (D.8) | `ifu`、`mem_pipe` |
+
+- 【決定】Debug Mode 中の retire は record を出し、`o_retire_dm` で印を付ける。`RetireRec` は変えない。理由: `retire_pkg` は golden のパッチが逐語コピーしており (§1.4 D1)、フィールドを足すと golden の成果物をすべて作り直すことになる。retire_mon、tracer、`MTIME_SRC=INSTRET` の tick、lockstep の比較は印の付いた record を数えない (検証計画 §9.3)。step の「1 record」(D.5) と icount の数え方 (D.6) も印の付いた record を数えない。
+
+dret:
+
+- decode は Debug Mode の外の DRET を不正命令 (cause 2) にする (§C.8)。Debug Mode の DRET は SYS、nonspec、alone、`flush = XRET` である。ROB エントリの xRET の種別は 1 bit (`sret`) から 2 bit (`xret: XretKind {MRET, SRET, DRET}`) に広げる (§C.1.1)。
+- retire で `csr.i_dret_fire`: priv := dcsr.prv、V := dcsr.v (M5)、`debug_mode := 0`。新しい特権が M 未満なら mstatus.MPRV を落とす (spec の dret の規則)。飛び先は dpc (`trap_unit.o_dret_pc`)、full kill は RETIRE_FLUSH (XRET)。reservation を消す。
+- `dcsr.step = 1` なら commit が step を arm する (D.5)。
+
+### D.5 single step と retire 制限
+
+【決定】step は「1 record だけ retire させ、その次の命令の前に再び入場する」で実装し、§5.13 の lockstep の retire limit と同じ 1 項に合成する。理由: step の要件 (ちょうど 1 命令を実行し、次の命令に取り消せない操作を始めさせない) は、lockstep の replay の境界 (`order_q == limit` の op は token を受け取らない、§5.13) と同じ形である。制限を 1 か所に置けば、両者が同じ不変条件と checker を共有する。
+
+- dret の retire で `dcsr.step` が 1 なら、commit は `step_q := 1`、`step_n_q := 0` とする。
+- `step_q` の間、lane 0 だけが retire でき、それも最初の 1 つだけである (`step_ok`)。最初の 1 つの op は oldest token を受け取れる (CSR 書き込みや IO の op も step できる)。
+- 1 つの record (retire か trap) か、`irq_take` (stepie=1 のときだけ起きうる) が出たら `dm_pend_q := 1` (cause step) とする。その後は oldest token が出ず (D.4)、次の `dm_take` で入場する。dpc は `arch_next_pc_q` で、次に実行する命令の pc、trap か割込みを取ったならハンドラの先頭である。
+- `dcsr.stepie = 0` の間は割込みを受け付けない (`irq_ok` に `!(step_q && !stepie)`)。
+- step する命令が ebreak (ebreakX = 1) か trigger の一致なら、lane 0 の DEBUG が先に起き、cause は 1 か 2 になる。step の状態は入場で消える。
+- WFI は NOP なので step で止まらない。
+
+retire 制限の合成 (正本。§C.2.2 の `limit_ok` を置き換え、§5.13 の「debug 入力を使うのは 3 か所だけ」はこの合成項と `irq_ok`、token の 3 か所に読み替える):
+
+```
+limit_ok[l] = ls_ok[l] && step_ok[l] && icnt_ok[l]
+ls_ok[l]    = !i_dbg_retire_limit_en || order_q + l < i_dbg_retire_limit   // lockstep replay (5.13)
+step_ok[l]  = !step_q || (l == 0 && step_n_q == 0)
+icnt_ok[l]  = !icount_active || l == 0                                     // D.6
+o_oldest.valid = rob.o_head.valid && !(irq_q.pending && irq_ok) && !dm_req
+                 && !(i_dbg_retire_limit_en && order_q >= i_dbg_retire_limit)
+                 && !(step_q && step_n_q != 0) && !i_kill.valid
+irq_ok = !debug_mode && !(step_q && !stepie) && (lockstep mask/allow, C.2.6)
+```
+
+### D.6 Sdtrig: 照合は fetch と LSU、発火は commit
+
+`trig_unit` (所有者) と構成:
+
+- `TRIG_N` (§3.3): W2 2、W4 4 (【MD で決定】U34)。上限 4 は `ExcRec.trig_hit` の幅 (§3.4、§3.5 bit 19)。
+- tdata1 の type は mcontrol6 (6)、icount (3)、disabled (15) で、tinfo はこの 3 つと version を報告する。legacy の mcontrol (2) は持たない。
+- mcontrol6: `select = 0` (address) だけ。`match` は 0 (一致)、1 (NAPOT)、2 (以上)、3 (未満) と `chain`。`size` は 0 (any) だけ。data value の照合 (select = 1)、textra (tdata3) による context の照合、mcontext/scontext は持たない。どれも WARL で、持たない値は書かれない (U34 で gdbserver の結果と照合する)。
+- action は 0 (breakpoint 例外) と 1 (Debug Mode に入る)。spec どおり、action = 1 は dmode = 1 の trigger にだけ書け、dmode = 1 の trigger は Debug Mode でしか書けない。
+- tcontrol: mte と mpte。M への trap で `mpte := mte, mte := 0`、MRET で `mte := mpte`。M での action = 0 の trigger は mte = 1 のときだけ一致する (ハンドラの中での再入を防ぐ)。入力は commit の `m_trap_fire` と `mret_fire`。
+- csr は 0x7A0-0x7A5 の読み書きを `trig_unit` に振り分ける。`fu_sys` の読みは csr の 1 本の読出しのまま (§C.5)。照合の構成は登録済みの `TrigCfg` (trigger ごとの有効、type、action、chain、match、tdata2、特権ごとの有効、execute/load/store) として `ifu`、`extract`、`mem_pipe`、`commit` に配る。
+
+【決定】照合は投機的に行い、効果は commit でだけ起こす。照合の結果は op が運ぶ `ExcRec` の bit にすぎず、hit bit、Debug Mode への入場、breakpoint の trap はどれも lane 0 の op が受け付けられたサイクルにだけ起きる。理由: trigger の構成は CSR 書き込み (full kill) でしか変わらないので、fetch や m1 で読む `TrigCfg` はその op から見て正しい commit 済みの値である (§5.10 X1 と同じ論拠)。kill された op の一致は `ExcRec` と一緒に消えるので、wrong path の一致が hart を止めることは構造的に無い。
+
+| 種類 | 照合の場所 | 比較する値 | `exc_prio` での位置 |
+|---|---|---|---|
+| execute | `ifu` (block 単位、下記) と `extract` (lane への割り振り) | 命令の VA | 最上位。instruction address breakpoint は fetch の page fault と access fault より上で、fetch の record と合流する (§5.8) |
+| load、store | `mem_pipe` の m1 (翻訳と同じ段) | アクセスの VA の byte 範囲 | 不正命令と同じ群で、misaligned、page fault、access fault より上 (特権仕様の同期例外の優先順位) |
+| icount | `trig_unit` (commit の record 数) | 有効な mode での record 数 | 非同期 (D.4) |
+
+- 【決定】execute の照合は block 単位にする。`ifu` が fetch block ごとに、trigger 1 つにつき 1 回、`[start_pc, start_pc + FETCH_BYTES)` と tdata2 の関係 (一致と NAPOT なら block に入るか、以上と未満なら block の全部か一部か無しか) を評価し、境界が block の中にあるときだけ `extract` が foff の下位 bit で lane に割り振る。理由: lane ごとに 64 bit の比較器を `FETCH_W × TRIG_N` 個置かずに済む。特権と mode は block の中で変わらない。
+- load/store の照合の結果は、翻訳の fault と同じく LQ/SQ のエントリの例外として `ExcRec` に入る。
+- timing は常に before である (mcontrol6 の address 照合)。アクセスを起こさないことは、例外を持つ op の既存の扱いで成り立つ: 例外付きの store は retire しないので `sb` に入らない。`io_unit` は例外付きの IO/NC の load と store を発行しない。`atomic_unit` は例外付きの op を開始しない。照合は m1 で翻訳と同時に済むので、§5.13.1 の開始点より必ず前である。cacheable な load は投機的に読まれうるが、rd を書かずに受け付けられるのでアーキ上の効果は無い。
+- line 跨ぎ (§L.15) の 2 pass は、それぞれ自分の byte 範囲で照合し、エントリで OR する。どちらの半分で一致しても op は retire しないので、lo の半分も書かれない。line 内の misaligned は、1 pass の 16 byte 窓の mask が表す byte 範囲で照合する。
+- AMO は load と store の両方の照合を受ける (load bit か store bit のどちらかで一致する)。LR は load、SC は store として、成否によらず照合する。
+- chain は同じ照合点 (execute どうし、load/store どうし) の連続した trigger にだけ効く。照合点の違う trigger を chain したものは一致しない (spec が許す WARL の制限)。
+- PTE の読み書き (暗黙のアクセス) は照合しない。cbo.* の扱いと action = 0 の tval の値は U35、vector の要素アクセスは M5 (U39)。
+- action = 0 の tval: 発生源が `ExcRec.tval` に載せる (execute は命令の VA、load/store はアクセスの VA)。`trap_unit` は `trig = 1` ならそれを使う (§C.3)。
+- icount: count は有効な mode での record ごとに 1 減る (印の付いた Debug Mode の record は数えない)。icount の trigger が有効な間 (`icount_active`)、commit は lane 0 だけを retire させる (`icnt_ok`)。count が 1 から 0 になったら pending とし、次の命令の前に発火する: action = 1 なら `dm_pend_q` (cause 2)、action = 0 なら epc = `arch_next_pc_q` の breakpoint の trap を `irq_take` と同じ受付点で取る。pending の保持と発火する mode の条件は spec に従い、`trig_unit` が持つ。理由: lane を 1 本に絞れば count の境界が group の途中に来ず、count を数える経路が 1 bit の加算で済む。icount はデバッガの step の代わりにしか使われず、性能は問わない。
+- hit bit は、受け付けた (DEBUG か TRAP になった) op の `trig_hit` で立てる。照合しただけでは立てない。
+
+### D.7 DM と hart: debug memory と実行ベースの abstract command
+
+【決定】abstract command は実行ベースにする。DM は Access Register を命令列に変換して debug memory に置き、halt 中の hart がそれを実行する。DM から hart の register file を直接読み書きする経路は作らない。理由: 新コアのアーキレジスタは arch RAT の先の PRF にあり、DM から直接読むには PRF の読出ポートと RAT の lookup を足すことになる (§X.2 の PRF のポート数を動かす)。実行ベースなら、GPR、FPR、CSR の区別も、FS=Off などの合法性も、通常の命令の規則がそのまま効く。
+
+DM と core の間の配線は hart ごとに次だけである:
+
+| 信号 | 向き | 意味 |
+|---|---|---|
+| `i_dm_haltreq` | DM → core | level。core は 1 サイクル登録して使う (D.4) |
+| `i_dm_hartreset` | DM → core | hartreset の要求 (D.13) |
+| `o_dm_quiet` | core → SoC | hartreset の前の quiesce が済んだ (D.13) |
+| `o_dm_stoptime` | core → SoC | `debug_mode && dcsr.stoptime` (登録済み、D.9) |
+| `i_dm_halt_pc`、`i_dm_exc_pc` | SoC → core | 静的入力。`i_reset_pc` と同じ理由 (§4.5) でパラメータにしない |
+
+【決定】halt と resume の handshake は debug memory の flag だけで行い、halted/running/resumeack の専用の配線を持たない。理由: hart の入場は必ず debug ROM の実行を経るので、「halted」を ROM が HALTED を書いた時点と定義すれば、spec の意味 (hart が DM の指示を待っている) にそのまま一致する。core は ROM の存在を知らず、入場、dret、Debug Mode の規則だけを持つ。
+
+debug memory の配置 (`DM_BASE` は SoC のパラメータ。値は U38、推奨 0x0000_4000):
+
+| 領域 | 範囲 | PMA (§S.2) | 中身 |
+|---|---|---|---|
+| DM code | `DM_BASE` から 4 KiB | target DEBUG、executable、uncached、idempotent | debug ROM (halt の入口と例外の入口)、abstract command の命令語 (ABS)、progbuf 8 語、impebreak の ebreak 1 語 |
+| DM data | `DM_BASE + 0x1000` から 4 KiB | target DEBUG、uncached、io_ordered | data0-1、hart ごとの flag (GO、RESUME)、hart が書く HALTED、GOING、RESUMING、EXCEPTION |
+
+- 2 領域に分けるのは、§S.2 の不変条件 (`executable=1` なら `idempotent=1`、領域の最小単位 4 KiB) を満たしつつ、hart が書く flag を IO (non-posted、1 回だけ) にするためである。hart の data 領域へのアクセスは `io_unit` が head で行い、DM code の fetch は ROM と同じく I read slot の single beat で行う (§S.4)。
+
+ROM の手順 (命令列は U38 で決める。spike の DM と同じ流れ):
+
+1. 入口 (`i_dm_halt_pc`。入場と Debug Mode 中の ebreak の両方): s0 (と s1) を dscratch0/1 に退避し、`fence` で自分の committed store と queued atomic を見えるようにする (D.10)。mhartid を HALTED に書く。
+2. 自分の flag を IO load の loop で待つ。GO なら GOING を書き、`fence.i` の後に s0/s1 を戻して ABS へ飛ぶ。RESUME なら RESUMING を書き、`fence.i` の後に s0/s1 を戻して dret を実行する。
+3. ABS の最後 (postexec が無ければ ABS の直後の ebreak、あれば progbuf の後の impebreak) の ebreak は Debug Mode の ebreak なので、入口 (1) に戻る。
+4. 例外の入口 (`i_dm_exc_pc`): s0 を退避して EXCEPTION を書き、s0 を戻してから入口 (1) に戻る (入口が hart の s0 を退避し直せるように)。
+
+| hart の書き込み | DM の解釈 |
+|---|---|
+| HALTED (hartid) | その hart で command が実行中なら完了 (`abstractcs.busy := 0`)。そうでなければ halted := 1 (halt group の伝播の起点、D.12) |
+| GOING | その hart の GO を下ろす |
+| RESUMING | RESUME を下ろし、halted := 0、resumeack := 1 |
+| EXCEPTION | cmderr := 3 (exception)、busy := 0 |
+
+- abstract command: Access Register の GPR (0x1000-0x101F)、FPR (0x1020-0x103F)、CSR (0x0000-0x0FFF) を、aarsize 2 と 3、transfer、write、postexec で受ける。aarpostincrement と 128 bit は持たない (cmderr = 2)。ROM が使う s0/s1 は ABS に入る前に戻っているので、progbuf は hart の GPR をそのまま見る (spec の要求)。生成コードが s0/s1 を対象にするときと、base の作り方に使う dscratch の本数と `hartinfo.nscratch` は U38。FPR と FP CSR は FS = Off なら不正命令になり cmderr = 3 を返す (デバッガが mstatus.FS を上げる。spec が許す振る舞い)。
+- DM の固定値: `progbufsize = 8`、`impebreak = 1`、`datacount = 2` (RV64 の 64 bit の値を data0/data1 で運ぶ)、`hartinfo.dataaccess = 1` (data は hart のメモリ空間にある)、`hasresethaltreq = 1`、abstractauto の autoexecdata/autoexecprogbuf を持つ、`authenticated = 1`、`confstrptrvalid = 0`、`nextdm = 0`、dmstatus.version は 1.0 を示す値。
+- 【決定】hart は ABS へ飛ぶ前と dret の前に必ず `fence.i` を実行する (ROM の手順 2)。理由: DM code は uncached でも、front end は ROM の flag の読みが retire する前に、予測に従って ABS や dpc の先を先読みしうる。`fence.i` の full kill (§C.6) により、GO を観測した後の内容で fetch し直す。SBA や progbuf の store で書き換えた命令についても同じ (D.10)。
+
+### D.8 PMP と PMA の免除
+
+- 【決定】DM の 2 領域は PMA の target `DEBUG` とし、「target が DEBUG で `debug_mode = 0` ならアクセス fault」の規則を `ifu` (命令アクセス fault) と `mem_pipe` (load/store アクセス fault) が `pma_check` の結果に適用する。理由: debug memory を通常の実行から見えなくする。`debug_mode` は入場と dret の full kill でしか変わらないので、翻訳時に読む値は op から見て正しい。
+- 【決定】Debug Mode 中の DM 領域へのアクセス (fetch、load、store) には PMP を適用しない。それ以外のアクセスは M の通常の規則 (lock された entry を含む) に従う。理由: lock された PMP の entry が DM 領域を覆うと、デバッガは hart を二度と動かせない。免除は「Debug Mode かつ DM 領域」に限り、免除の判定は `pma_check` の target だけから作る (アドレスの比較を足さない)。
+- DM 領域は DTS にも `sail.json` にも載らない。§5.11 PM6 の照合スクリプトは target DEBUG の領域を照合から外す。
+- SBA は hart の PMP を経由しない (system bus の master であり、PMP は hart ごとの検査である)。PMA は `pma_check` で引き、hole と DM 領域は `sberror = 2` にする (D.11)。
+
+### D.9 stopcount、stoptime とカウンタ、mtime
+
+- stopcount: `dcsr.stopcount = 1` の間、csr は mcycle、minstret、hpmcounter を進めない。Debug Mode の record (`o_retire_dm`) で minstret を進めないのは、この規則の一部である。
+- 【決定】stoptime: mtime は CLINT が全 hart で共有しているので、`i_time_stop = AND over h (o_dm_stoptime[h])` の間だけ止める (CLINT の追加入力、V14 の枝は 0)。理由: spec の stoptime は hart-local な timer を対象にしており、この platform には hart-local な timer が無い。走っている hart がある間に共有の mtime を止めると、その hart の時刻が実時間からずれる。全 hart が止まっているときだけ止めるのが、spec の意図 (デバッグで止めている間に時間が進んで timer 割込みが溜まらない) を保つ最も近い形である。N = 1 では spec の意味と一致し、OpenOCD の SMP 構成は全 hart を一緒に止めるので実用上も止まる。
+- `MTIME_SRC = CYCLE` の prescaler も `i_time_stop` の間は進めない。`MTIME_SRC = INSTRET` の tick は印の付いた record を数えない (§S.5)。
+- Sstc の stimecmp と CLINT の mtimecmp は mtime を比べるだけなので、変更は無い。
+
+### D.10 メモリの一貫性: halt、SBA、progbuf と fence.i
+
+- halt の時点: ROM の入口の `fence` (drain = 1、`sb.ordering_empty` を待つ、§C.6) で、それまでに retire した store と queued atomic (M4 で ASQ を入れた場合) は自 hart の dcache に入る。dcache は coherent なので、その後の SBA の読み (D.11) は最新の値を見る。
+- SBA の書き込みは mem_ctrl を通る coherent な書き込みで、所有者を recall し、L1D の sharer を invalidate する (D.11)。I 側の line は directory に載らないので (§S.6)、SBA の書き込みは icache を invalidate しない。再開する hart は ROM の手順で `fence.i` を実行するので (D.7)、書き換えた命令 (software breakpoint の ebreak の挿入と除去を含む) を必ず fetch し直す。
+- progbuf の store は hart 自身の store で、通常の SB と dcache を通る。同じ hart の命令として見えるのは `fence.i` の後であり、ROM は ABS へ飛ぶ前と dret の前に必ずそれを実行する。
+- SMP: debug で止めた hart はすべて ROM を通って再開するので、他 hart が書き換えた命令についても `fence.i` の条件 (RISC-V の規約、§F.10) が自動で満たされる。
+
+### D.11 SBA: mem_ctrl と memory_bus への経路
+
+- `dm_sba` は spec の sbcs (sbversion 1、sbaccess 8/16/32/64、sbreadonaddr、sbreadondata、sbautoincrement、sbbusy、sbbusyerror、sberror)、sbaddress0/1、sbdata0/1 を持ち、アクセスを 1 つずつ出す。sbasize は PA の幅 56 (§5.1)。
+- 経路: DRAM の番地は mem_ctrl の uncached な single-beat の経路で読み書きし、非 DRAM の番地 (CLINT、PLIC、UART、ROM) は memory_bus の read/write channel を通す (§S.3 の非 DRAM の読みと同じ)。DRAM の読みは、他の L1 が所有する line を recall してから読む (`i_iread = 1` と同じ coherent な読みで、sharer として数えず L2 にも install しない)。DRAM の書き込みは、所有者の recall の後に書き、sharer を invalidate する (hart の write-through と同じ義務、§S.3)。
+- 依存: DRAM の uncached 読みで他 hart の dirty コピーを recall することは、M4 に残した U28 の残り (§5.11) である。MD はそれが入っていることを前提にする (D.16)。
+- mem_ctrl への接続形は U33 (推奨は SBA 専用の slot を 1 本足す形)。
+- エラー: hole と DM 領域は `sberror = 2`、size に整列していない番地は 3、128 bit の要求は 4。bus は必ず応答するので timeout (1) は起きない。
+- SBA は走っている hart と並行に動いてよく、coherent な追加の agent として振る舞う。SBA の書き込みと hart の store の間の順序は保証しない (spec どおり)。
+
+### D.12 SMP: hart の選択、hasel、haltsum、group
+
+- hartsel: `hartsello` の下位 `idx_w(N_HARTS)` bit だけを持つ (他は WARL で 0)。存在しない hart を選ぶと dmstatus の anynonexistent/allnonexistent を立てる。
+- hasel と hart array mask: `hawindowsel` は 0 だけ (N_HARTS ≤ 8 ≤ 32)、`hawindow` は `N_HARTS` bit。hasel = 1 なら hartsel と mask の和集合が選択で、haltreq、resumereq、hartreset、ackhavereset、setresethaltreq/clrresethaltreq はその全 hart に効く。dmstatus の any*/all* はその集合で集計する。abstract command は hartsel の 1 hart だけで実行する (spec)。
+- haltsum0 の bit h は hart h の halted。haltsum1-3 は持たない (32 hart 以下では不要。spec どおり 0 を読む)。
+- halt group と resume group (dmcs2、`hgselect = 0` だけ。外部 trigger の group は持たない): group の数は `N_HARTS` (どの hart も別々の group に置ける最小の数)。group 番号の意味 (0 の扱いを含む) は spec の dmcs2 に従う。
+- 【決定】group による停止の伝播は DM の中で行う。hart h が新しく halted になった (HALTED の書き込みが command の完了でない) サイクルの次に、同じ halt group の走っている hart に haltreq を出し、それらが halted になるまで保持する。core 側は通常の haltreq として受け付ける (cause 3)。resumereq が resume group の hart に効いたら、同じ group の halted な全 hart に RESUME を立てる。理由: hart の間に配線を足さずに済み、伝播の遅れは ROM の入口の命令数と受付の待ち (`head_started_q`、有界、D.4) で決まる。
+
+### D.13 reset
+
+| reset | 範囲 | 起こし方 | 備考 |
+|---|---|---|---|
+| power-on | 全体 (`rst`) と DM (`i_dm_rst`) | SoC の外 | harness は両方を同じ信号にする |
+| dmactive = 0 | DM の状態 (dmactive 以外) | DMI の書き込み | DM は haltreq、ndmreset、hartreset を出さない |
+| ndmreset | DM と APB 以外のすべて (全 hart、L1、L2、mem_ctrl、周辺) | dmcontrol.ndmreset | DM の登録済み出力を SoC の reset 木に OR し、1 の間 reset を保つ |
+| hartreset | 選択した hart の core ドメイン | dmcontrol.hartreset | quiesce の後 (下記) |
+
+- 【決定】hartreset は hart の core ドメイン (front end、rename、scheduler、LSQ と `sb`、`csr`、`trig_unit`、TLB と `ptw`、icache) だけを reset し、dcache とその coherence agent は reset しない。reset の前に core が quiesce する: `i_dm_hartreset` を受けた core は、haltreq と同じ受付点 (D.4) で in-flight の op を full kill して fetch を止め、`!head_started_q`、`sb.resource_empty`、dcache の MSHR と書き込みの idle、`islot_arb` の idle がそろったら `o_dm_quiet` を出す。SoC は `hartreset && o_dm_quiet` の間、その hart の core ドメインの reset を下げる。理由: dcache は directory に載った line を持つ coherence の agent なので、hart 単独で reset すると他 hart から見た所有と directory が食い違う。line の中身はアーキ状態ではないので残してよい。ドメインの境界と quiesce の条件の細部は U32。
+- DM は hartreset = 1 の書き込みを hart ごとの要求として latch し、その hart が reset を通過する (havereset が立つ) まで保持する。理由: OpenOCD は hartreset の 1 と 0 を続けて書くので、quiesce がその間に終わらなくても reset を取りこぼさない。
+- havereset: どの reset (power-on、ndmreset、hartreset) から出ても立ち、ackhavereset で消える。DM のドメインにあるので ndmreset では消えない。
+- resethaltreq: DM が hart ごとの bit を持ち (DM のドメインなので ndmreset を越えて残る)、reset 中とその後 hart が halted になるまで haltreq を出す。core は reset の後の最初の命令の前に入場する (cause 3、dpc = `i_reset_pc`)。
+- core の reset 値: `debug_mode = 0`、dcsr は spec の reset 値 (prv = M、debugver は 1.0 を示す値、他は 0)、trigger は disabled。
+- reset 中の hart (power-on と ndmreset の直後、hartreset の間) は dmstatus で unavail とする。
+
+### D.14 CSR の存在表の変更
+
+| CSR | MD の前 (§C.8) | MD の後 |
+|---|---|---|
+| tselect (0x7A0) | 存在、0 を読み書き込みを捨てる | WARL、0..`TRIG_N`-1 |
+| tdata1 (0x7A1) | 同上 | mcontrol6 / icount / disabled (D.6) |
+| tdata2 (0x7A2) | 同上 | 照合する address。icount では WARL |
+| tdata3 (0x7A3) | 存在しない | 存在、0 を読み書き込みを捨てる (textra を持たない) |
+| tinfo (0x7A4) | 存在しない | 存在、RO (type 6、3、15 と version) |
+| tcontrol (0x7A5) | 存在、0 を読み書き込みを捨てる | mte、mpte |
+| mcontext (0x7A8)、scontext (0x5A8)、hcontext (0x6A8) | 存在しない | 存在しない (不正命令) |
+| dcsr (0x7B0)、dpc (0x7B1)、dscratch0 (0x7B2)、dscratch1 (0x7B3) | 存在しない | Debug Mode でだけ存在。Debug Mode の外では不正命令 (§C.8 の MD の行) |
+
+- dcsr のフィールド: ebreakm/s/u、stepie、stopcount、stoptime、mprven、step、prv は書ける。cause と debugver は RO。ebreakvs/ebreakvu と v は M5 まで 0 (H が無い)。nmip、extcause、cetrig、pelp は 0 (NMI、Smdbltrp、Zicfilp を持たない)。
+- 存在表は `csr_pkg` の属性表 1 つ (§C.8) に「Debug Mode でだけ存在」の属性を足して表す。
+- misa には何も足さない (Sdext と Sdtrig は misa に bit を持たない)。
+- rv64mi の breakpoint は tselect に書いた値が読めるかで trigger の有無を判断するので、MD からは実際に trigger を使って走る。trigger を持たない golden とは制御の流れが分かれるので、このテストは MD から pass/fail で判定する (検証計画 §9.3 と付録 B)。
+
+### D.15 発火カウンタと checker
+
+`o_perf` に足す事象 (`CorePerf.dbg`): 入場の原因ごと (ebreak、trigger、haltreq、step) と Debug Mode 中の ebreak の再入場、dret、Debug Mode 中の例外、`dm_req` が `head_started_q` を待ったサイクル、trigger の照合 (execute、load、store) と受付 (action ごと)、icount の発火、step の完了、hartreset の quiesce のサイクル。照合したが kill された op の数は、照合数と受付数の差として tb が求める (wrong path の一致が実際に起きていることの確認)。DM 側は SoC の観測出力 `o_dm_obs` に出し、tb が数える: DMI の読み書き、abstract command の種類と cmderr ごと、SBA の読み書きと sberror ごと、halt/resume group の伝播、ndmreset と hartreset。
+
+| checker | 置き場所 | 不変条件 |
+|---|---|---|
+| `chk_debug` | core | (1) 入場と dret は lane 0 の flush で、他の flush と同じサイクルに起きない (`chk_commit` の flush の一意性の項を拡張する)。(2) `debug_mode` の間は割込みを受け付けず、csr の trap 入力が立たない。(3) `dm_req` の間に started のパルスが出ない。(4) step を arm してから入場までの record と IrqEvent は合わせて高々 1。(5) trigger の hit bit が立つのは DEBUG か TRAP を受け付けたサイクルだけ。(6) `debug_mode = 0` で target DEBUG への fetch、load、store が完了しない |
+| `chk_dm` | tb | APB の手順 (SETUP の後に ACCESS、ACCESS の間 address と制御が不変)、存在しない hart へ haltreq を出さない、abstractcs.busy の間 hartsel の hart が halted のまま (command 中に running にならない)、SBA の未完了は高々 1 |
+
+### D.16 マイルストーンごとの範囲
+
+| M | §D の範囲 |
+|---|---|
+| M4 | 入場の設計を commit/trap で確定する (RTL は入れない。DEAD scaffolding を作らないため): outcome DEBUG と `RedirKind::DEBUG`、`dm_req` の受付と token の抑止を割込みと共通の項にすること、retire 制限の合成 1 項 (D.5)、`ExcRec` の `dm`/`trig`/`trig_hit`、xRET の 2 bit 化。M4 が足す取り消せない操作 (ASQ など) が §5.13.1 の表に載り、`head_started_q` の有界性と `ordering_empty` の意味 (queued atomic を含む) を保つことをレビューで確かめる。SBA が前提にする U28 の残り (他 hart の dirty コピーの recall) を入れる |
+| MD | §D の全部 (D.0 の MD の行) と検証計画 §9 のゲート |
+| M5 | H との相互作用: 入場で dcsr.v と dcsr.prv に V と特権を保存し dret で戻す、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV の照合 (data の翻訳の regime で比べる)、Debug Mode での MPRV と MPV (mprven)、VU の要素アクセスの trigger (U39)。debug を混ぜた H の directed を G0 に足す |
+
+### D.17 旧コアとの関係
+
+V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は DM を instantiate せず、APB のポートは `pready = 1`、`prdata = 0`、`pslverr = 0` を返す。CLINT の `i_time_stop` と mem_ctrl の SBA の経路は V14 の枝で 0 に固定し、V14 の dhrystone/coremark のビット一致で確かめる (§4.4)。
+
+---
+
 ## リスクと未決事項
 
 本章は 2 つの部分からなる。前半はリスク登録簿で、Phase 15 全体を通じて監視するリスクを、所有するマイルストーン、早期警報、緩和策とともに挙げる。後半は未決事項の一覧で、第 0 部が後のマイルストーンに送った判断と、M0 の調査で答えが出なかった問いのうちどの章にも属さないものを 1 つの表にまとめる。各章 (§F から §S) が自分の中で閉じている未決事項は、ここには再掲しない。
@@ -3908,9 +4291,37 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
   - (1) 新コアの SMP は M4 から存在するので、M3 では天井を上げるメモリ系の変更 (`MSHR_N`/`N_FILL` > 1) を出荷しない。それらは M4 で新コアの N=4 boot ができた後に限り、コミットごとに N=4 boot をゲートとする (§2.5)。M3 の 2 ポート化そのものは `MSHR_N=1` で N=1 のゲートを通す。旧コアの N=4 boot を使う N2.2a の原因調査 (§M.6.1) は M3 で行う。
   - (2) hvlinux を梯子に入れたままにする。
 
+#### R9. デバッグの経路が commit の精密さと既存のゲートを崩す
+
+- 内容: MD は commit に新しい flush の源 (`dm_take`、outcome DEBUG)、token を止める新しい条件 (`dm_req`)、retire 制限の新しい源 (step、icount) を足し、SoC に DM と SBA の経路と reset 木の分岐を足す。DMI が idle でも、これらの項の書き方しだいで lockstep のサイクル数や SMP の振る舞いが動きうる。さらに、`dm_take` は `head_started_q` を待つので、M4 で足す取り消せない操作が有界でなければ、halt が返ってこない (hart が「止まらない」) 形で現れる。SBA は他 hart の dirty コピーの recall (U28 の残り) を前提にしており、それが欠けていると古い値を読む。
+- 所有: M4 (入場の設計の確定と U28 の残り)、MD。
+- 早期警報:
+  - DMI が idle のときの GL-B と bench が MD の前とビット一致しない (検証計画 §9.3)。
+  - `chk_commit`、`chk_debug` の flag。
+  - N=4 の halt と halt group の directed (GD4) の timeout。
+  - SBA の読みと hart の store の結果が N=4 の directed で食い違う。
+- 緩和策:
+  - (1) 入場を例外と割込みの受付点に載せ、新しい受付点を作らない (§D.4)。retire 制限は lockstep と同じ 1 項に合成する (§D.5)。
+  - (2) 設計を M4 で確定し、M4 の変更 (ASQ など) がその前提を壊さないことを M4 のレビューで確かめる (§D.16)。
+  - (3) DM の出力 (`haltreq`、`hartreset`、`ndmreset`) は登録済みで、DMI が idle なら定数 0 である。idle のビット一致を MD の各コミットのゲートにする (検証計画 §1.3)。
+  - (4) メモリ系に触れる MD のコミット (SBA、hartreset の quiesce) は GB4 を通す (§2.5 の M4 行の規則のまま)。
+
+#### R10. 外部ツールとシミュレーション速度に依存する debug suite
+
+- 内容: GG (検証計画 §9.2) は OpenOCD、GDB、spike、riscv-tests の `gdbserver.py` と、Verilator のラッパの DPI による TCP の remote_bitbang に依存する。どれも heliodor の外の版で振る舞いが変わり、sandbox の中で localhost の TCP が使えることも前提である。JTAG を bit 単位で shift する remote_bitbang は 1 回の DMI アクセスに数十から百を超える TCK を使い、W2 の Verilator が 10-20k cy/s 程度なので、GDB の `load` やメモリ読みを多用するテストは timeout しうる。
+- 所有: MD。
+- 早期警報:
+  - spike では通るテストが heliodor で timeout する。
+  - OpenOCD や gdbserver の更新で、同じ木の結果が変わる。
+- 緩和策:
+  - (1) OpenOCD、GDB、spike、riscv-tests の版を `toolchain/versions.env` で固定する (U36)。
+  - (2) 主ゲートは native シミュレーションの GD (DMI を tb から直接駆動する) とし、GG はマイルストーンの節目と末にだけ回す (検証計画 §1.2)。
+  - (3) gdbserver の target の timeout を sim の速度に合わせて伸ばす。それでも遅ければ、tb の DTM の transport を OpenOCD の `jtag_dpi` (scan 単位の転送) に替える (U36)。どちらも tb だけの変更で、設計は変わらない。
+  - (4) 除外表 (U37) には、持たない optional 機能に結び付いたテストだけを載せ、不具合を除外で隠さない。
+
 ### 未決事項の一覧
 
-出所の列: 「§n」は第 0 部の該当箇所にある【M<n> で決定】、「D7」は第 0 部 §1.4 のユーザ決定に付いた期限、「調査:」は M0 の調査で答えが出なかった問い (括弧内はその分野)。調査の問いのうち、第 0 部で解決済みのものと、ある章に明確に属するものは載せない。本書に残る【要判断】は無い。U3 は採用済み、U1/U2/U4/U6/U7/U8/U13/U15/U17/U18/U19/U20/U21/U22/U23/U24/U25/U26/U27/U28/U29 は決定済み、U16 は M5 の後に送ってあり、それ以外は【M<n> で決定】である。
+出所の列: 「§n」は第 0 部の該当箇所にある【M<n> で決定】、「D7」は第 0 部 §1.4 のユーザ決定に付いた期限、「調査:」は M0 の調査で答えが出なかった問い (括弧内はその分野)。調査の問いのうち、第 0 部で解決済みのものと、ある章に明確に属するものは載せない。本書に残る【要判断】は無い。U3 は採用済み、U1/U2/U4/U6/U7/U8/U13/U15/U17/U18/U19/U20/U21/U22/U23/U24/U25/U26/U27/U28/U29 は決定済み、U16 は M5 の後に送ってあり、それ以外は【M<n> で決定】である。U32-U38 は D9 で足したデバッグの項目で期限は MD (U36 は MD の開始時)、U39 はその M5 分である。
 
 | # | 項目 | 出所 | 期限 | 何を測るか / 選択肢と推奨 |
 |---|---|---|---|---|
@@ -3945,12 +4356,20 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 | U29 | NC load の投機的な発行 | §5.14 | M3 | boot と bench で NC load の発生数を数える。0 なら head 発行のまま確定する。【決定済み (M3 の手順 7)】head 発行のまま確定する。`io.load` (IO と NC の合計) は 5.15 boot と bench で 0、6.6 と 7.1 の boot で 31 (§5.14)。 |
 | U30 | VU の IO アクセス | §5.14 | M5 | IO 領域への vector アクセスの数を数える。0 なら fault にする (§V.4)。 |
 | U31 | 本書の編集上の積み残し | M0 のレビュー | M1a (ヘッダ雛形は M1b) | 完了 (2026-10-14): 規則の正本を 1 か所に決め、他の箇所は参照と 1 行の要約にした (PC の保持者と読み手は §F.3、commit の PC 導出は §C.2.3、割込みの受付は §5.13、FENCE 系の OpClass は §5.5 で retire 時の動作は §C.6、adapter の規則は §M.2、kill の消費者表は §5.4、I read slot の調停は §M.5、`MSHR_N` を増やす条件は §2.5)。各章の「防ぐバグ類」と経緯だけの旧コアの参照は付録に移し、§1.6 の用語集と §5.1 の型の索引を補った。設計の変更は伴わない。続けて、章の間で食い違っていた規則 7 件を正本側に揃えた: adapter の MISS 判定 (E1 の latch 値、`o_miss_valid` は使わない) と保持 slot の駆動 (fold 群と nf 群) は §M.2 を正とし §5.9 は参照だけにした。commit の retire 式は §C.2.2 を正とし §5.12 C1 は要約と参照にした (`alone_eff` が足すのは IO だけなので、§5.5 の load の行を IO (alone=1) と NC (nonspec だが alone=0) に分けた)。store の retire 予算は §C.2.2 の `n_st <= MEM_W`、`n_line <= min(PUSH_W, sb_credit)` (credit は line 単位) に §L.9 を揃えた。dispatch snapshot に `bar_seq` を足した (§C.1.6)。`i_dbg_irq_allow` が `limit_en` を要すること (§C.2.6) を §5.13 の表に書いた。HFENCE.*/HINVAL.* の retire 条件を SFENCE.VMA と同じ (`ordering_empty` + `sys_pending`) にした (§C.6)。残り (M1b): cold-reader gate の対象モジュールすべてに §5.15 書式のヘッダ雛形を置く。 |
+| U32 | hartreset の reset ドメインの境界と quiesce の条件 | §D.13 | MD | 推奨: dcache とその coherence agent は reset せず、core ドメイン (front end、rename、scheduler、LSQ と `sb`、`csr`、`trig_unit`、TLB と `ptw`、icache) だけを reset する。quiesce の条件は `!head_started_q`、`sb.resource_empty`、dcache の MSHR と書き込みの idle、`islot_arb` の idle。測るもの: N=4 で 1 hart を reset し、他の hart が走り続けたまま litmus 型の共有データの検査と GB4 相当の負荷で一貫性が保たれること。dcache を残すと reset の後に古い line を hit しうるが、line はアーキ状態ではなく coherence で最新に保たれているので問題ない、という論拠を directed で確かめる。代案 (dcache を clean して invalidate してから reset) は quiesce に dcache の sweep が要るので採らない。 |
+| U33 | SBA の mem_ctrl への接続形 | §D.11 | MD | 選択肢: (a) SBA 専用の slot を 1 本足す (slot 番号は全 hart の D/I の後)、(b) memory_bus の第 2 の master にし、DRAM だけ mem_ctrl の uncached な経路へ渡す。推奨は (a)。理由: recall と write-grant veto と sharer の invalidate の仕組みは mem_ctrl の slot の経路にあり、(b) は同じ義務を別の経路で作り直すことになる。(a) では N=8 で slot が 17 本になるので、mem_ctrl の slot 番号の `logic<4>` (§M.4) を導出幅に直す (§S.7)。前提は M4 の U28 の残り (他 hart の dirty コピーの recall)。 |
+| U34 | `TRIG_N` の値と mcontrol6 の照合機能の範囲 | §3.3、§D.6 | MD | 推奨: W2 2、W4 4。match は 0/1/2/3 と chain、size は 0 だけ、select は 0 だけ (data value の照合と textra は持たない)。測るもの: gdbserver suite (検証計画 §9.2) で、持たない機能のために落ちるテストが除外表 (U37) に載せられる範囲に収まるか。`ifu` の block 照合と `mem_pipe` の照合器を `TRIG_N` = 2/4 で synth し、CP の分解で名指しされないこと。 |
+| U35 | trigger の照合の対象 (cbo.*) と action=0 の tval の値 | §D.6 | MD | 推奨: cbo.zero は store として照合し、cbo.clean/flush/inval の扱いと tval の値 (execute は命令の VA、load/store はアクセスの VA) は Sail と spike の振る舞いに合わせる。PTE の暗黙のアクセスは照合しない。測るもの: 同じ directed を spike で走らせて tval と照合の有無を比べる。 |
+| U36 | OpenOCD、GDB、spike、riscv-tests の版と取得、tb の JTAG DTM の transport | §D.1、R10 | MD の開始時 | 推奨: `toolchain/fetch.sh` に OpenOCD (riscv-openocd)、riscv64 の GDB、spike を pin した版で足す (prebuilt が無ければ pin した commit からの build の手順を `toolchain/README.md` に書く)。riscv-tests の debug suite は `test/riscv-arch-test/upstream/debug/` の clone を使い、commit を記録する。transport はユーザ決定どおり remote_bitbang (Verilator のラッパの DPI、localhost の TCP) から始め、GG の壁時間が梯子の予算 (目安 2 時間) を超えるときだけ `jtag_dpi` に替える。 |
+| U37 | gdbserver.py の除外表 | 検証計画 §9.2 | MD の末 | 推奨: `test/debug/heliodor_excludes.yaml` に commit し、各行を持たない optional 機能 (Access Memory、Quick Access、aarpostincrement、data value の trigger、textra、128 bit) か spike との意図した差に結び付ける。不具合を除外で隠さない。spike で通るテストが heliodor で落ち、除外の理由が無ければ MD の出口を満たさない。 |
+| U38 | `DM_BASE`、debug memory の配置、ROM と生成コードの命令列、`hartinfo.nscratch` | §D.7、§S.2 | MD | 推奨: `DM_BASE = 0x0000_4000` (boot ROM の直後で、どの map でも空いている)。DM code と DM data を 4 KiB ずつ、ROM の base register から ±2 KiB に収める配置。ROM は s0/s1 を dscratch0/1 に退避し、ABS に入る前に戻す (spike の DM と同じ流れ)。`nscratch` は生成コードが使わずに済む本数で、推奨 1。測るもの: gdbserver suite の register と progbuf のテストが spike と同じ結果になること。 |
+| U39 | VU の要素アクセスの trigger (M5) | §D.6、§D.16 | M5 | 推奨: `vu_mem_adapter` で要素ごとに load/store の照合を行い、一致した要素の手前で precise fault と同じく vstart を残して受け付ける (§V)。代案は vector の op を照合の対象外と宣言することだが、spec の load/store の照合は vector を除外しない。測るもの: V のテスト群と、vector の memcpy に watchpoint を置く directed。 |
 
 ---
 
 ## マイルストーン計画
 
-本章は本文の最後の章であり、M0-M6 の各マイルストーンについて、目標、作業の順序、実装する章とモジュール、出口条件 (ゲート)、そのマイルストーンの中で決める事項をまとめる。出口条件のゲート ID は検証計画 §1.1、構成ごとの投入時期は検証計画 §1.2、機能ゲートと構造ゲートの区分は第 0 部 §2.5 に従う。各章の出荷範囲の表 (§F.11、§R.7、§X.12、§C.0、§L.18、§M.1、§S.8、§V.11) は本章の要約の正本であり、ここではそれを順序と出口に並べ直すだけで、範囲を足しも削りもしない。決定事項の番号 U<n> は「リスクと未決事項」章の一覧のものである。
+本章は本文の最後の章であり、M0-M6 と MD (D9 で M4 と M5 の間に足したデバッグのマイルストーン。既存の番号を動かさないため番号ではなく MD と呼ぶ) の各マイルストーンについて、目標、作業の順序、実装する章とモジュール、出口条件 (ゲート)、そのマイルストーンの中で決める事項をまとめる。出口条件のゲート ID は検証計画 §1.1、構成ごとの投入時期は検証計画 §1.2、機能ゲートと構造ゲートの区分は第 0 部 §2.5 に従う。各章の出荷範囲の表 (§F.11、§R.7、§X.12、§C.0、§L.18、§M.1、§S.8、§V.11、§D.16) は本章の要約の正本であり、ここではそれを順序と出口に並べ直すだけで、範囲を足しも削りもしない。決定事項の番号 U<n> は「リスクと未決事項」章の一覧のものである。
 
 全マイルストーンに共通する規則:
 
@@ -4178,8 +4597,10 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 3. AD クラスを owned RMW (LOAD_EXCL + STORE_EXCL) に変える (§5.9、§M.8.4)。7.1 の ADUE=1 で必要になる。
 4. 新コアの N=4 boot ができた後に限り、`MSHR_N` (必要なら `N_FILL`) を 1 より大きくする (§M.6.1 の手順 5)。そのコミットはすべて GB4 をゲートとする (第 0 部 §2.5)。`SPH > 2` に要る mem_ctrl の修正 (§M.4) もこの順序に従う。
 5. ASQ と victim 除外のブランチ実験 (§L.11、§L.12) と、N=4 での SB の占有の測定 (§L.17)。
+6. Debug Mode の入場の設計を commit/trap で確定する (§D.4、§D.5、§D.16)。RTL は MD で入れる (DEAD scaffolding を作らない)。確定するもの: outcome DEBUG と `RedirKind::DEBUG`、非同期の入場 `dm_take` を割込みと同じ受付点に置き token の抑止を共通の項にすること、retire 制限を lockstep・step・icount の合成 1 項にすること、`ExcRec` の `dm`/`trig`/`trig_hit` と `exc_prio` での trigger の位置、xRET 種別の 2 bit 化。M4 の手順 1-5 で足す取り消せない操作 (ASQ を採るならそれ) が §5.13.1 の表に載り、`head_started_q` の有界性と `ordering_empty` の意味 (queued atomic を含む) を保つことを、この確定のレビューで確かめる。
+7. SBA (MD) の前提として、U28 の残り (DRAM の uncached 読みの前に他 hart の dirty コピーを recall する) を入れる (§5.11、§D.11)。
 
-実装する範囲: §L.18 と §M.1 の各 M4 列。
+実装する範囲: §L.18 と §M.1 の各 M4 列、§D.16 の M4 行。
 
 出口条件:
 
@@ -4188,7 +4609,37 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 | 機能 (W2, W4) | G0 に litmus N=2 を追加。GT4、GB2 (5.15、マイルストーン末は 6.6/7.1 の SMP も)。GB4 は M3 の決定に従う。GV: litmus4、N=2、N=4。 |
 | 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。 |
 
-M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11)、fill の victim 選択から pin 中の line を除外するか (§L.12)、`MSHR_N` の値 (§M.6.4)。
+M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11)、fill の victim 選択から pin 中の line を除外するか (§L.12)、`MSHR_N` の値 (§M.6.4)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16)。
+
+### MD: デバッグ
+
+目標: RISC-V Debug Specification 1.0 の Sdext、Sdtrig、Debug Module、SBA を新コアと統合 SoC に入れ、OpenOCD と GDB から N=1 と N=4 の SoC をデバッグできるようにする (D9、§D)。DMI が idle のとき、M4 までのゲートの結果を 1 つも変えない。
+
+作業の順序:
+
+1. ツールと参照 (U36): OpenOCD、riscv64 の GDB、spike を pin して `toolchain/` から取れるようにし、riscv-tests の debug suite (`gdbserver.py`) を spike に対して走らせて、参照の pass の集合を記録する (検証計画 §9.2)。
+2. SoC の骨格: `dmi_apb`、`dm` (dmcontrol、dmstatus、hartinfo、haltreq/resumereq、hart の選択)、`dm_mem` (ROM、flag)、`DM_BASE` と DM の PMA 領域 (U38)、`i_dm_rst` と APB のポート。全 harness の APB を idle に接続する。tb の DMI script の player (検証計画 §9.1) をここで作る。
+3. core の入場と dret (§D.4): csr の dcsr/dpc/dscratch と `debug_mode`、commit の outcome DEBUG と `dm_take`、`trap_unit` の Debug Mode の飛び先、`flush_ctrl` の `DEBUG`、decode の DRET/ebreak/debug CSR、DM 領域の PMA/PMP の規則 (§D.8)、`o_retire_dm`。この段で halt/resume が N=1 で通る。直後に DMI idle のビット一致 (検証計画 §9.3) を取る。
+4. step (§D.5)、stopcount、stoptime と CLINT の `i_time_stop` (§D.9)。
+5. abstract command と progbuf (§D.7): Access Register の生成、autoexec、cmderr、例外の入口。
+6. Sdtrig (§D.6): `trig_unit`、execute の block 照合、load/store の照合、icount、action 0/1、tcontrol。§C.8 の「0 を読む trigger CSR」を §D.14 の存在表に置き換える。rv64mi の breakpoint の判定を pass/fail に移す。
+7. SBA (§D.11、U33): mem_ctrl の接続、coherent な読み書き、エラー。
+8. SMP (§D.12): hasel/hawindow、haltsum0、halt group と resume group。N=4 の directed (GD4)。
+9. reset (§D.13): ndmreset、hartreset の quiesce と core ドメインの reset (U32)、havereset、resethaltreq。
+10. Verilator のラッパと tb の JTAG DTM (remote_bitbang)、OpenOCD の構成、`gdbserver.py` の heliodor の target を作り、GG を回す。除外表を確定する (U37)。
+
+実装する範囲: §D.16 の MD 行と §S.8 の MD 行。
+
+出口条件:
+
+| 区分 | 条件 |
+|---|---|
+| 機能 (W2, W4) | G0 に GD (N=1 の debug directed、検証計画 §9.1) を追加。GD4 (N=4 の debug directed)。GG: W2 の N=1 で `gdbserver.py` が、spike で通るテストのうち除外表 (U37) に無いものをすべて通る。N=4 は SMP のテスト (hart の切替、halt group) を通る。W4 は N=1 の GG をマイルストーンの末に回す。M4 の出口のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4 の方針、GX、GV) が緑。 |
+| idle 等価 | DMI が idle のとき、W2/W4 の GL-B の cycles、record 数、最終 hash と、新コアの bench 4 本の cycles と instret が、MD の直前の master とビット一致する (検証計画 §9.3)。 |
+| 構造 | `trig_unit`、`dmi_apb`、`dm`、`dm_mem`、`dm_sba` が cold-reader gate を通過。knob 0 個。`chk_debug` と `chk_dm` がすべてのテストで 0。§D.15 の事象が GF で 0 より大きい (`dbg`、`gdb` の列、検証計画 §5.2)。GS を記録。 |
+| V14 | 共有モジュール (CLINT、mem_ctrl、memory_bus、SoC) に触れたので、梯子 1-5 が緑で dhrystone/coremark がビット一致。 |
+
+MD で決める事項: U32 (hartreset のドメイン)、U33 (SBA の接続形)、U34 (`TRIG_N` と照合機能の範囲)、U35 (cbo.* と tval)、U36 (ツールの版と DTM の transport、MD の開始時)、U37 (gdbserver の除外表、MD の末)、U38 (`DM_BASE` と debug memory の配置、ROM)。
 
 ### M5: H と V
 
@@ -4197,7 +4648,7 @@ M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い�
 作業の順序:
 
 1. VU の作業 (§V.11 の順): `MEM_PIPE=0` の arm の再検証、VU 関係の推定バグの golden 上の directed test (U17 の VU 分)、`v14_vector_unit` の凍結と VM1-VM4、`vu_adapter`/`vu_mem_adapter`/`sb.i_vu_push`/mem_pipe 0 の VU client、`busy_table` の `prf_done` (VU の scalar オペランドが最初の消費者、§5.7)、VU 専用の PRF 読出ポート (int 2、fp 1)、commit の VEC 規則と csr への追加。
-2. H 拡張: `tlb`/`ptw` の V=1 と二段 walk (§M.12)、`trap_unit` の VS への委譲・htval/mtval2・GVA・tinst (§C.0 の M5 列)、decode の M5 行 (§C.8)、guest 外部割込み。
+2. H 拡張: `tlb`/`ptw` の V=1 と二段 walk (§M.12)、`trap_unit` の VS への委譲・htval/mtval2・GVA・tinst (§C.0 の M5 列)、decode の M5 行 (§C.8)、guest 外部割込み。デバッグとの相互作用 (§D.16 の M5 行): 入場で dcsr.v と dcsr.prv に V と特権を保存し dret で戻す、dcsr.ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV の照合、Debug Mode での MPRV と MPV (mprven)、VU の要素アクセスの trigger (U39)。
 3. G13 の一覧を directed test で確かめ直し、README の「complete RVA23」の記述を直す (§V.9、U16)。
 
 実装する範囲: §C.0、§M.1、§V.11 の各 M5 列と §L.18 の M5 列 (VU の接続、HLV/HSV)。
@@ -4206,16 +4657,16 @@ M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い�
 
 | 区分 | 条件 |
 |---|---|
-| 機能 (W2, W4) | G0 に H 17 本、V 20 本、test_vmspre を追加。GH (hvlinux)。GB1 に 7.1v。GB4 (memory pipe と `sb` を変えるので必須、§V.11)。GX に H/V。GV に hvlinux。`chk_vu` がすべてのテストで 0。 |
+| 機能 (W2, W4) | G0 に H 17 本、V 20 本、test_vmspre を追加。GH (hvlinux)。GB1 に 7.1v。GB4 (memory pipe と `sb` を変えるので必須、§V.11)。GX に H/V。GV に hvlinux。`chk_vu` がすべてのテストで 0。GD に debug と H/V の directed (VS/VU からの入場と dret、vs/vu の trigger、vector の watchpoint) を追加し、GG を再び通す (検証計画 §9.4)。 |
 | 構造 | VU の上限を修正するか宣言する。§3.4 の VU 由来の行を消し、残す上限は §V.10 に移す。 |
 
-M5 で決める事項: U30 (VU の IO アクセス)。各章が M5 に送った事項: tinst のための `ExcRec.implicit` (§5.8、§C.3)、`fpu_wrap` の二重を解消するか (§X.8)、vset/vstart の csr への渡し方 (§C.5)、N=2 の vector ゲートを足すか (§V.11)。U16 (ISA の目標) は M5 の後にユーザが判断する。
+M5 で決める事項: U30 (VU の IO アクセス)、U39 (VU の要素アクセスの trigger)。各章が M5 に送った事項: tinst のための `ExcRec.implicit` (§5.8、§C.3)、`fpu_wrap` の二重を解消するか (§X.8)、vset/vstart の csr への渡し方 (§C.5)、N=2 の vector ゲートを足すか (§V.11)。U16 (ISA の目標) は M5 の後にユーザが判断する。
 
 ### M6: 既定コアの切替
 
 - 目標: 既定コアを新コアに切り替え、旧コアを削除する。
 - 作業: SoC と harness の `CORE` の既定値を変更し、V14 枝、`src/v14/` (凍結コピーを含む)、V14 専用の印字と `o_dbg_*` を削除する。README の数値と構成を新コアで更新する。
-- 出口条件: 新コアが既定で、検証計画 §1.2 の M6 列のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4、GH、GX、GV をすべて) を両構成で通る。M6 のコミットの変更は、削除と既定値の変更だけである (第 0 部 §2.5)。
+- 出口条件: 新コアが既定で、検証計画 §1.2 の M6 列のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4、GH、GX、GV、GD、GG をすべて) を両構成で通る。M6 のコミットの変更は、削除と既定値の変更だけである (第 0 部 §2.5)。
 - M6 の後: §2.6 で送った RVA23 の不足分と G13 の判断 (U16)、misa の F/D/C の扱い (§C.9) をユーザが判断する。
 
 ---

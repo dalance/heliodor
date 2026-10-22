@@ -37,23 +37,27 @@
 | GV | Verilator 相互確認 (`sim/verilator/` の既存ラッパ) | マイルストーン末 | PASSED 行 |
 | GS | 速度と whole-comb fallback (§6) | マイルストーン末 | fallback 0、cy/s を記録 |
 | GF | 発火行列 (§5.2) | マイルストーン末 | `fire_check.py` の exit code |
+| GD / GD4 | debug の directed (§9.1): tb が APB の DMI ポートを script で駆動し、halt/resume/step、abstract command、progbuf、SBA、trigger、group、reset を N=1 (GD) / N=4 (GD4) で検査する (MD から) | GD は G0 に含む。GD4 は `--ignored` | script の全 CHECK が一致、`chk_debug`/`chk_dm` 0、tohost==1 |
+| GG | riscv-tests の debug suite (`gdbserver.py`) を OpenOCD + GDB で Verilator のラッパ (tb 専用の JTAG DTM) に対して走らせる。spike を参照にする (§9.2、MD から) | マイルストーンの節目と末 | spike で通るテストのうち除外表に無いものがすべて pass |
 
 ### 1.2 マイルストーン × 構成
 
-【決定】新コアのゲート投入時期を下表に固定する。理由: SMP は M4、H/V は M5 で初めて機能が揃うが、揃ったマイルストーンからは両構成で常に回し、後から足さない。
+【決定】新コアのゲート投入時期を下表に固定する。理由: SMP は M4、デバッグは MD、H/V は M5 で初めて機能が揃うが、揃ったマイルストーンからは両構成で常に回し、後から足さない。MD は D9 (設計書 §1.4) で M4 と M5 の間に足したマイルストーンである。
 
-| ゲート | M1a | M1b | M2 | M3 | M4 | M5 | M6 |
-|---|---|---|---|---|---|---|---|
-| G0 新コア分 | (新コアは無い。V14 の梯子 1-5 と SoC の unit test、spike の unit test) | W2: rv64ui 54 を lockstep。W4: rv64ui を pass/fail (最低でも ALU・分岐・load/store 群、目標は 54 全部) | W2: スカラ arch 全部 (lockstep 対象は §4.6) + smode_plic + 新規 directed (§7.4)。W4: rv64ui 全部 | W2 と W4 で同一リスト | + litmus N=2 (W2, W4) | + H 17 本、V 20 本、test_vmspre | 既定コアを新コアに |
-| GA / GL-C | | | W2 | W2, W4 | 同 | 同 | 同 |
-| GL-B | | | W2 | W2, W4 | 同 | 同 | 同 |
-| GB1 | | | W2: 6.6, 7.1 | W2, W4 | 同 | + 7.1v | 同 |
-| GT4, GB2 | | | | | W2, W4 | 同 | 同 |
-| GB4 | | | | (新コアの SMP は無い。回し方を D7 の測定で決めた、§6.3) | W2: メモリ系の変更ごと。W4: マイルストーン末 (§6.3) | 同 | 同 |
-| GH | | | | | | W2, W4 | 同 |
-| GX | | | | 決定的なテスト全部 | 同 | + H/V | 同 |
-| GV | | | N=1 boot (W2) | N=1 (W2, W4) | + litmus4, N=2, N=4 (NBA の相互確認だけで、N=4 の判定には使わない、§6.3) | + hvlinux | 全部 |
-| GS / GF | S1 の対照を記録 | 記録 | 記録 | 記録 + M3 判定の材料 | 同 | 同 | 同 |
+| ゲート | M1a | M1b | M2 | M3 | M4 | MD | M5 | M6 |
+|---|---|---|---|---|---|---|---|---|
+| G0 新コア分 | (新コアは無い。V14 の梯子 1-5 と SoC の unit test、spike の unit test) | W2: rv64ui 54 を lockstep。W4: rv64ui を pass/fail (最低でも ALU・分岐・load/store 群、目標は 54 全部) | W2: スカラ arch 全部 (lockstep 対象は §4.6) + smode_plic + 新規 directed (§7.4)。W4: rv64ui 全部 | W2 と W4 で同一リスト | + litmus N=2 (W2, W4) | + GD (N=1 の debug directed、W2, W4)。rv64mi の breakpoint は pass/fail へ (§9.3) | + H 17 本、V 20 本、test_vmspre、debug と H/V の directed | 既定コアを新コアに |
+| GA / GL-C | | | W2 | W2, W4 | 同 | 同 | 同 | 同 |
+| GL-B | | | W2 | W2, W4 | 同 | 同 + DMI idle で MD の前とビット一致 (§9.3) | 同 | 同 |
+| GB1 | | | W2: 6.6, 7.1 | W2, W4 | 同 | 同 | + 7.1v | 同 |
+| GT4, GB2 | | | | | W2, W4 | 同 | 同 | 同 |
+| GB4 | | | | (新コアの SMP は無い。回し方を D7 の測定で決めた、§6.3) | W2: メモリ系の変更ごと。W4: マイルストーン末 (§6.3) | 同 (SBA と hartreset の quiesce はメモリ系) | 同 | 同 |
+| GH | | | | | | | W2, W4 | 同 |
+| GX | | | | 決定的なテスト全部 | 同 | 同 | + H/V | 同 |
+| GV | | | N=1 boot (W2) | N=1 (W2, W4) | + litmus4, N=2, N=4 (NBA の相互確認だけで、N=4 の判定には使わない、§6.3) | 同 | + hvlinux | 全部 |
+| GD4 | | | | | | W2: 節目と末。W4: 末 | 同 | 同 |
+| GG | | | | | | W2: N=1 全部と N=4 の SMP のテスト、節目と末。W4: N=1、末 | 同 (H/V の追加の後に再実行) | 同 |
+| GS / GF | S1 の対照を記録 | 記録 | 記録 | 記録 + M3 判定の材料 | 同 | 同 (+ `dbg`、`gdb` の列) | 同 | 同 |
 
 旧コア (V14) は M6 まで既定コアであり、CLAUDE.md の梯子 1-5 (既定、litmus4、N=2 boot、N=4 boot、hvlinux) をそのまま回し続ける。
 
@@ -62,6 +66,7 @@
 - 新コアだけを変えるコミット: G0。M2-M3 では GL-B が最初の実ゲートになる (旧コアの「N=2 boot が最初の実ゲート」に相当)。
 - メモリ系 (`lsu/`、`mem/`、dcache、MMU、SoC) を変えるコミット: M4 以降は GB4 必須 (設計書 §2.5)、M5 以降は GH も必須。front end と予測器の変更は M4 以降 GB2 必須。新コアの SMP は M4 から存在するので、M3 の dcache 2 ポート化 (bank、ポートごとの tag、MSHR file の構造) は `MSHR_N=N_FILL=1` のまま N=1 のゲート (G0、GA、GL-B、GB1、GX) で検査する。`MSHR_N`/`N_FILL` を 1 より大きくするコミットは、M4 で新コアの GB4 ができた後に限り、1 つずつ GB4 をゲートとする。
 - 共有モジュール (CLINT、csr、SoC、dcache/MMU への追加出力) または V14 に触れるコミット: V14 で梯子 1-5 を回す。共有モジュールの変更は M2 まで追加のみ (設計書 §4.4) なので、V14 の dhrystone/coremark の cycles と instret はビット一致するはずであり、それを受入条件にする。
+- デバッグの経路 (設計書 §D: commit の `dm_take` と outcome DEBUG、retire 制限、`trig_unit`、trigger の照合、DM、SBA、reset 木) を変えるコミット (MD 以降): G0 (GD を含む) と、DMI idle のビット一致 (§9.3: W2 の GL-B と新コアの bench 4 本)。SBA と hartreset の quiesce はメモリ系として GB4 も通す。trigger の照合や DM の ROM を変えたら GD4 と GG を節目で回す。
 - サイクル予算は早期終了つきの上限であり、理由なく増やさない。ハーネスの載せ替えで予算が足りなくなった場合は、同じハーネスで V14 を測り、その値を根拠として記録してから変える。
 
 ### 1.4 M2 のゲートの結果 (2026-10-16)
@@ -173,6 +178,9 @@ M3 の末の百分率は手順 7 との比。手順 7 の W2 の coremark が遅
 | `i_mtime_tick` | 入力 | `MTIME_SRC=EXTERNAL` のときだけ使う (§4.7)。 |
 | `i_ext_irq_src` | 入力 | PLIC の追加ソース。smode_plic の tb パルス用。既定 0。 |
 | `UART_WRCNT` | param (M2) | 1 なら UART + 0x100 の読み出しが device 側の UART 書き込み回数を返す (b46_uart 用)。既定 0。 |
+| `i_dm_rst`、`i_dm_psel/penable/pwrite/paddr/pwdata/pstrb/pprot`、`o_dm_pready/prdata/pslverr` | 入出力 (MD) | DM のドメインの reset と APB4 の DMI ポート (設計書 §D.3)。debug を使わない harness は `i_dm_psel = 0`、`i_dm_rst = rst` を明示的に接続する。V14 の枝は `pready = 1`、`prdata = 0`。 |
+| `DM_BASE` | param (MD) | debug memory の base (設計書 §D.7、U38)。DM の 2 領域は `MAP_BOOT`/`MAP_ARCH`/`MAP_LITMUS` のすべてに入る (§2.2)。 |
+| `o_dm_obs` | 出力 (MD) | DM の観測 (DMI アクセス、abstract command と cmderr、SBA と sberror、group の伝播、reset)。`perf_acc` と `chk_dm` が読む (§5.1、§5.2)。 |
 | V14 用の `o_dbg_r3/pc/retire_v/trap_*` | 出力 | V14 の既存 harness が読むものだけを残す。消費者のない 23 本の forensic 出力は統合時に削除する。 |
 
 Veryl では未接続の入力は警告にしかならず、浮いたまま動作が変わりうる。新しい harness はすべての入力を明示的に接続し、新規ファイルの `missing_port` 警告は 0 とする (設計書 §5.15 の lint 差分)。
@@ -186,6 +194,8 @@ PMA 表の型と評価関数は設計書 §5.11、boot 系のプラットフォ�
 | `MAP_BOOT` | N=1/SMP boot、hvlinux、smode_plic | ROM [0, 0x4000) は executable かつ uncacheable。DRAM 0x8000_0000 から 32 MiB。CLINT/PLIC/UART は IO。旧コアは ROM を hole に置き、`PMA_FAULT=0` で hole 判定を切っていた。 |
 | `MAP_ARCH` | arch、ACT4、bench | ROM なし。DRAM は harness の配列サイズ (4 MiB、bench は 256 KiB)。0x5000_0000 (`RVMODEL_ACCESS_FAULT_ADDRESS`) は hole。旧コアは pa[31] だけを見て 2 GiB を backed とし、PA[63:32] を無視していた (付録 B の B34)。 |
 | `MAP_LITMUS` | litmus | DRAM 32 MiB、ROM なし。tohost の write-through 窓は存在しない (設計書 §5.11 PM5)。 |
+
+MD から、3 つの表すべてに DM code と DM data の 2 領域 (target DEBUG、設計書 §S.2) が入る。Debug Mode の外からのアクセスはアクセス fault になるので、既存のテストの振る舞いは変わらない。`pma_check.py` は target DEBUG の領域を DTS と `sail.json` との照合から外す。
 
 harness の DRAM 配列サイズと表の DRAM 領域の一致は harness 内の const で検査する。設計書 §5.11 PM6 の照合は `test/gates/pma_check.py` が行う。照合対象は `tb_platform_pkg` の表、`test/linux/dts/*.dts` の memory/CLINT/PLIC/UART ノード、`test/act/config/heliodor/sail.json` の領域、`rvmodel_macros.h` の hole アドレスである。ずれは exit code で失敗とし、マイルストーン末と表を変えたコミットで回す。
 
@@ -225,6 +235,8 @@ litmus の histogram (0x8000_4000) と barrier 語 (0x8000_6000) の DRAM ダン
 | `test_soc_hvlinux_harness` | tb/test_soc_hvlinux.veryl:15-208 | hvlinux | 統合 SoC `N_HARTS=1` へ移す。`CORE` を足す。 |
 | 単体 tb (`test_clint` ほか) | | | `test_clint` は CLINT の新入力を `i_tick_sel=0` に固定すれば無変更で通る (§4.1)。 |
 | Verilator ラッパ | sim/verilator/*.sv | N=1/2/4/8 boot、litmus4、hvlinux、ACT PMP | 変更しない。harness の名前とポートだけに依存しているので、`CORE` の既定値 (§2.5) に従う。 |
+| `dm_soc_harness` (MD) | tb/dm_soc_harness.veryl、tb/dm_seq.veryl | GD、GD4 | 新規。統合 SoC (`MAP_ARCH`、`N_HARTS` は 1 か 4) の上に DMI script の player `dm_seq` を置き、APB を駆動する (§9.1)。program の hex と script の hex を param で受ける。ゲートリスト `test/gates/md_dbg.list` から生成ラッパ (`tb/test_w{2,4}_dbg*.veryl`) を作る。 |
+| debug の Verilator ラッパ (MD) | sim/verilator/tb_soc_dm_n1.sv、tb_soc_dm_n4.sv、sim/verilator/jtag_dtm.sv、sim/verilator/rbb_dpi.c | GG | 新規、tb 専用。boot の harness と同じ SoC に、JTAG の TAP と DTM (dtmcs、dmi) を SV で置いて APB の master にし、DPI の C で OpenOCD の remote_bitbang を localhost の TCP で受ける (§9.2)。設計には入らない (設計書 §D.1)。 |
 
 ### 2.5 コアの選択と旧コアとの共存 (D6)
 
@@ -469,6 +481,8 @@ H <order> <hash>
 | `chk_retire` | tb (`retire_mon`) | lane が lane 0 から連続している、order が 1 ずつ増える、trap は lane 0 だけ (golden では N4 を許す)、1 サイクルの flush は最大 1、IrqEvent は record の無いサイクルだけ、trap record に rd/store/CSR が無い | 設計書 §5.12 |
 | `chk_irq` | tb (`irq_replay`) | §4.2 の (a)(b)(c) | D2 |
 | `chk_io_mon` | tb (SoC の `o_io_obs` を読む) | §8 | 設計書 §5.14 |
+| `chk_debug` (MD) | core | 入場と dret は lane 0 の唯一の flush、Debug Mode の間は割込みの受付と csr の trap 入力が無い、`dm_req` の間に started パルスが無い、step の arm から入場までの record と IrqEvent は合わせて高々 1、hit bit は受付のサイクルにだけ立つ、Debug Mode の外で DM 領域へのアクセスが完了しない | 設計書 §D.15 |
+| `chk_dm` (MD) | tb (SoC の APB と `o_dm_obs` を読む) | APB の手順、存在しない hart への haltreq が無い、abstract command の実行中に対象 hart が running にならない、SBA の未完了は高々 1 | 設計書 §D.15 |
 
 【M1a で決定】の synth からの除外方法は設計書 §5.15 に従う。`$assert` と `$display` は RTL に置かず、tb だけで使う (cc backend の whole-comb bail を避けるため)。
 
@@ -476,7 +490,7 @@ H <order> <hash>
 
 - コアは機構ごとに event wire を `o_perf` (`core_types::CorePerf`) に出す (設計書 §4.5)。SoC は hart ごとに `o_core_perf: logic<soc_pkg::PERF_W=512>` (V14 枝は 0) として出し、tb モジュール `perf_acc` (`tb/perf_acc.veryl`) が hart ごとに、各ビットが 1 のサイクル数と、full kill の `RedirKind` ごとの回数を 64 bit で累算する。arch と boot の harness が instantiate する。
 - 【決定】(M2) 印字は名前ではなくビット番号で行う。テストの終わりに `PERF <core> <PERF_W> <width> <N_IQ> <ISSUE_W> <MEM_W> <WB_N> <RETIRE_CNT_W>` を 1 行、`PB <core> <bit> <count>` を 0 でないビットだけ (bit 0 は CorePerf の LSB)、`PK <core> <RedirKind> <count>` を出す。名前は `fire_check.py` が `core_types.veryl` と `xlate_pkg.veryl` の struct 定義から復元し、計算した幅を PERF 行の `<width>` と照合する (ずれたら exit 2)。理由: RTL 側に名前表を持たずに済み、struct の変更に自動で追従する。CorePerf は W2 で 195 bit、W4 で 225 bit。
-- ゲート名 (matrix の列) は `fire_matrix.txt` の冒頭で定義した: `default` (既定 `veryl test` の W2/W4 の arch、directed、probe)、`act` (`run_act.py` の ACT4)、`boot` (W2 5.15 N=1 の pass/fail)、`bootls` (W2 5.15 N=1 の lockstep。retire limit と replay)、`smp` (M4 からの SMP boot と litmus)。行の形は `<event> <gate>[:w2|:w4][,...]` で、`<event>` は葉か接頭辞 (`mp` は `mp[*]` の全要素)、`flush.full_kind.<KIND>` は PK の値。行は、列のゲートの合計が 0 より大きければ pass。ログの無いゲートだけの行は「走らせていない」と表示し、失敗にしない。
+- ゲート名 (matrix の列) は `fire_matrix.txt` の冒頭で定義した: `default` (既定 `veryl test` の W2/W4 の arch、directed、probe)、`act` (`run_act.py` の ACT4)、`boot` (W2 5.15 N=1 の pass/fail)、`bootls` (W2 5.15 N=1 の lockstep。retire limit と replay)、`smp` (M4 からの SMP boot と litmus)。MD で `dbg` (GD と GD4 のログ) と `gdb` (GG の Verilator の run の perf の dump) を足す。行の形は `<event> <gate>[:w2|:w4][,...]` で、`<event>` は葉か接頭辞 (`mp` は `mp[*]` の全要素)、`flush.full_kind.<KIND>` は PK の値。行は、列のゲートの合計が 0 より大きければ pass。ログの無いゲートだけの行は「走らせていない」と表示し、失敗にしない。
 - M2 末の結果 (§1.4): 40 行のうち走らせた 38 行がすべて pass。走らせたログは default、act (W2 の pass/fail 114 本: misalign*、sv*、exceptionssv*、zalrsc、zacas、zaamo、zicbom/z、zifencei)、boot (5.15/6.6/7.1)、bootls。`flush.full_kind.BR` は設計上 0 (分岐は partial kill) なので matrix に載せない。
 - `--zero` はどのログでも 0 の葉を列挙する。M2 末で W2 は 198 本中 17 本: `disp.cut_int`、`disp.cut_fp`、`ad.empty_gen`、`ad.excl_fail`、`ad.ev_skid`、`dtlb.fill_inv`、`itlb.fill_inv`、`ptw_i.full`、`ptw_i.afault`、`ptw_i.a_wr`、`ptw_i.d_wr`、`ptw_i.ad_rd`、`at.fail`、`at.watch`、`at.backoff`、`at.rsv_coh`、`flush.drop_older`。分類: 構造的に起こりえない (`disp.cut_int`: `PRF_INT_N` 96 = 32 + ROB 64。`flush.drop_older`: W2 は BRU 1 本)、SMP を待つ (`at.fail/watch/backoff/rsv_coh`、`ad.excl_fail`)、directed が要る候補 (`dtlb/itlb.fill_inv`、`ad.empty_gen`、`ad.ev_skid`、`ptw_*.afault`)、要確認 (`disp.cut_fp`、`ptw_i.a_wr/d_wr/ad_rd`: Svadu の後も I 側の A/D 更新が 0)。W4 は default しか走らせていないので 228 本中 40 本が 0 (boot 系の事象は 0 で当然)。
 - 【M3 で決定】matrix に無い事象がどのゲートでも 0 のときに失敗とするか。今は `--zero` で一覧するだけで失敗にしない。失敗にするなら、上の「構造的に 0」と「SMP 待ち」を許容表に載せる必要がある。
@@ -498,6 +512,9 @@ H <order> <hash>
 | misaligned の分割、page またぎの分割 | `mem_pipe` | ma_data、ACT4 Misalign、§7.4 | |
 | atomic: LR、SC 成功/失敗、AMO | `atomic_unit` | rv64ua、boot | |
 | `mem_port_arb` の最大待ちサイクル | `mem_port_arb` | 上限 B (設計書 §5.9 MP4) を超えない | |
+| (MD) Debug Mode の入場 (原因ごと)、Debug Mode 中の ebreak と例外、dret、step の完了、`dm_req` の待ち | `commit`、`csr` (`CorePerf.dbg`) | `dbg` (GD/GD4 のログ)、`gdb` (GG) | |
+| (MD) trigger の照合 (execute、load、store) と受付 (action ごと)、icount の発火、照合したが kill された op | `ifu`/`extract`、`mem_pipe`、`trig_unit` | `dbg`。kill された一致は wrong path に trigger の番地を置く directed で 0 より大 | `TRIG_N` と照合機能の範囲 (U34) |
+| (MD) DMI アクセス、abstract command と cmderr、SBA と sberror、group の伝播、ndmreset と hartreset、hartreset の quiesce | `dm`、`dm_sba` (`o_dm_obs`)、core | `dbg`、`gdb` | |
 
 上表のうち、M2 末の `CorePerf` に無いもの: RETRY の WB_BLOCKED (adapter の perf に無い。M3 の dcache はこの理由を出さないので、構造的に 0)、drain shadow の適用 (shadow のハードウェアが無い、設計書 U8)、NC load の件数、page またぎの分割 (`mp.split` は line 跨ぎだけを数える)、`mem_port_arb` の最大待ちサイクル (カウンタでなく最大値で、`o_perf` に出ていない)、CSR 書き込み後 flush のコスト (件数 `cm.rf_serial` だけ)。checkpoint pool の枯渇は M3 で `ren.ck_none` として入った。
 
@@ -661,6 +678,36 @@ M2 末の新コア側: 付録 B の probe 27 本 (`m2_probe_pf.list` の 15 本�
 
 未作成: walk 中の full kill による epoch 破棄 (PTW の遅延を伸ばす仕掛けが要る)、PLIC claim の競合 (M4、§8)、PAUSE が drain しないこと。
 
+### 7.5 MD (デバッグ、設計書 §D)
+
+証明の担い手: GD (N=1 の debug directed)、GD4 (N=4)、GG (riscv-tests の debug suite、spike を参照)。テスト名は §9.1 の表。
+
+| 機能 | GD | GD4 | GG | 注記 |
+|---|---|---|---|---|
+| haltreq による halt と resume、resumeack、dpc | dm_halt_resume | dm_smp_select | 全テストの前提 | dpc が次に実行する命令の pc であること。割込みが pending でも halt が先 |
+| ebreak (ebreakm/s/u) と software breakpoint | dm_ebreak | | software breakpoint の系 | ebreakX=0 なら通常の breakpoint 例外 (tval = epc) |
+| single step (stepie 0/1、trap する命令、割込み、CSR 書き込みと IO の op) | dm_step | | step の系 | 1 record ごとに入場すること、trap したらハンドラの先頭で止まること |
+| dcsr/dpc/dscratch と DRET の合法性 | dm_dcsr | | | Debug Mode の外では不正命令 (cause 2) |
+| Debug Mode 中の例外と ebreak | dm_exc | | | cmderr = 3。mcause/mepc/mtval が変わらないこと |
+| Access Register (GPR、FPR、CSR。aarsize 2/3、transfer、write、postexec) | dm_abs_gpr、dm_abs_fpr_csr | | register の系 | s0/s1 の値が hart の値であること。FS=Off の FPR は cmderr = 3。aarpostincrement は cmderr = 2 |
+| progbuf の実行と abstractauto | dm_progbuf | | メモリ (MemTest*) の系 | progbuf が hart の GPR を見ること、impebreak |
+| stopcount、stoptime | dm_counters | dm_smp_stoptime | | N=1 は halt 中に mcycle/minstret/mtime が止まる。N=4 は全 hart が止まったときだけ mtime が止まる |
+| trigger: execute (match 0-3、chain) | dm_trig_exec | | hardware breakpoint (Hwbp*) | block の境界をまたぐ範囲、RVC と 32 bit の命令 |
+| trigger: load/store (line 内の misaligned、line 跨ぎ、AMO、LR/SC、IO の load と store) | dm_trig_ldst | | watchpoint と Trigger* の系 | before: 一致した store がメモリに残らず、IO load が device に届かない (`chk_io_mon`) |
+| trigger が wrong path で止めない | dm_trig_wrongpath | | | mispredict の影の命令と load に一致させ、入場が 0 回、照合したが kill された数が 0 より大 |
+| trigger: action=0 (tval、tcontrol の mte/mpte) と icount | dm_trig_action0、dm_icount | | | M のハンドラで再入しないこと、icount の境界が group の途中に来ないこと |
+| hit bit | dm_trig_exec、dm_trig_ldst | | | 受け付けた trigger だけが立つ |
+| SBA (sbaccess 8-64、autoincrement、readonaddr/readondata、sbbusyerror、sberror) | dm_sba | | DownloadTest、メモリの系 | hole と DM 領域は sberror = 2 |
+| SBA の一貫性 (他 hart の dirty line、書き込みの後の sharer) | | dm_smp_sba_coh | | 他 hart が書いた dirty line を SBA が最新の値で読む。SBA の書き込みの後、他 hart の load が新しい値を見る |
+| SBA で書き換えたコードの実行 | dm_sba_code | | software breakpoint の系 | resume の `fence.i` で新しい命令を実行する |
+| hart の選択、hasel/hawindow、haltsum0、nonexistent | | dm_smp_select | hart の切替の系 | |
+| halt group と resume group | | dm_smp_group | | 1 hart の trigger で group 全体が止まる |
+| ndmreset、hartreset、havereset/ackhavereset、resethaltreq、dmactive | dm_reset | dm_smp_hartreset | reset の系 | hartreset の間も他 hart が走り続け、共有データの一貫性が保たれる (U32) |
+| PMP と PMA の免除 | dm_pmp_lock | | | lock した PMP が DM 領域を覆っても debug でき、Debug Mode の外の DM 領域へのアクセスは fault |
+| DMI idle の等価 | §9.3 | | | GL-B と bench のビット一致 |
+
+H/V との相互作用 (M5): VS/VU からの入場と dret (dcsr.v、prv)、ebreakvs/vu、mcontrol6 の vs/vu、HLV/HSV と vector の要素アクセスの trigger。§7.3 の H/V の directed と同じ扱いで G0 に足す。
+
 ---
 
 ## 8. SoC 側の IO モニタ (設計書 §5.14)
@@ -691,6 +738,64 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 | UART の送信回数 | THR への retire した store の数と device の書き込み回数が一致すること (旧コアで推定された重複書き込みの検出) |
 | LSR を offset 5 から lb で読む | SoC の読みデータの lane 契約を確かめる (SoC は offset によらず下位 byte を返している推定がある) |
 | claim の競合 (M4、N=2) | 2 hart が同時に claim し、合計の読み出しが 2 回で値が重複しないこと |
+
+---
+
+## 9. デバッグの検証 (MD、設計書 §D)
+
+### 9.1 native の directed: DMI script の player (GD、GD4)
+
+【決定】debug の主ゲートは native シミュレーションの directed とし、tb が APB の DMI ポートを直接駆動する。理由: OpenOCD と JTAG を通さずに済むので速く、tb の外のツールの版に依存しない。spec の DM の振る舞いは DMI のレジスタの読み書きの列として書けるので、script で表せる。
+
+- `dm_seq` (tb のモジュール) は script の hex (tb の `$readmemh`) を 1 命令ずつ実行し、APB の transfer を 1 つずつ出す。命令は `WR addr data`、`RD addr expect mask` (一致しなければ fail の bit を立てる)、`POLL addr mask value timeout`、`WAIT n`、`MARK id` (ログに印字)、`END`。
+- hart は同じ harness の DRAM で小さな program (hex) を走らせる。program は自分の結果を tohost に書いてもよい。合否は「script が END に達し、CHECK の不一致が 0、`chk_debug` と `chk_dm` が 0、program が tohost を書くなら tohost == 1」。
+- script の源は人が読める `test/debug/dmi/*.dmi` で、`make -C test/debug` が hex を作る (hex は他の hex と同じく gitignore)。program は `test/debug/prog/*.S` で、同じ `make` で作る。
+- 【決定】期待値の出所: 各 CHECK に、spec の節か設計書 §D の節をコメントで付ける。DM の実装に依存しない CHECK (halted、cmderr、data の値、sberror) は、同じ `.dmi` を OpenOCD の `riscv dmi_read`/`riscv dmi_write` で spike の DM に流す driver (`test/debug/dmi/run_spike.py`) でも確かめる。理由: script の期待値を自分の実装から写すと、spec の読み違いが両側にそろって見えなくなる。spike は gdbserver の参照と同じ版 (U36) を使う。
+- 生成ラッパとゲートリスト: `test/gates/md_dbg.list` (N=1、G0) と `test/gates/md_dbg4.list` (N=4、`--ignored`) から `gen_core_tests.py` が `tb/test_w{2,4}_dbg.veryl` と `tb/test_w{2,4}_dbg4.veryl` を作る (§2.5 の 1 suite 1 リストの規則)。
+
+| テスト | N | 確かめること |
+|---|---|---|
+| dm_halt_resume | 1 | haltreq、resumereq、dmstatus (allhalted/allrunning/allresumeack)、dpc、割込みが pending のときの halt、ROB が空でない状態からの halt、started の op (IO、AMO) の完了を待つ halt |
+| dm_ebreak | 1 | ebreakm/s/u の各特権、ebreakX=0 での通常の breakpoint 例外 |
+| dm_step | 1 | step の 1 record、trap する命令 (ハンドラの先頭で止まる)、stepie 0/1、CSR 書き込みと IO store の step、step 中の WFI |
+| dm_dcsr | 1 | Debug Mode の外での dcsr/dpc/dscratch と DRET の不正命令、dcsr の WARL |
+| dm_exc | 1 | progbuf の例外で cmderr = 3、mcause/mepc/mtval が変わらない、Debug Mode 中の ebreak の再入場 |
+| dm_abs_gpr、dm_abs_fpr_csr | 1 | Access Register の全組合せ、s0/s1、FS=Off、aarpostincrement の拒否、cmderr の sticky と W1C |
+| dm_progbuf | 1 | progbuf の store と load、autoexecdata/autoexecprogbuf、busy 中のアクセスの cmderr = 1 |
+| dm_counters | 1 | stopcount と stoptime (N=1 で mtime が止まる) |
+| dm_trig_exec | 1 | match 0/1/2/3、chain、block の境界、RVC、hit bit |
+| dm_trig_ldst | 1 | load、store、line 内の misaligned、line 跨ぎ (hi の半分だけが一致)、AMO、LR/SC、IO load と IO store (device に届かない、`chk_io_mon`) |
+| dm_trig_wrongpath | 1 | mispredict の影の命令と load への一致で入場しない。照合したが kill された数が 0 より大 |
+| dm_trig_action0、dm_icount | 1 | action=0 の cause 3 と tval、tcontrol の mte/mpte、icount の count と action 0/1 |
+| dm_sba | 1 | sbaccess 8/16/32/64、autoincrement、readonaddr、readondata、sbbusyerror、sberror 2/3/4 |
+| dm_sba_code | 1 | SBA で命令を書き換え、resume で新しい命令を実行する (ROM の `fence.i`) |
+| dm_reset | 1 | ndmreset、havereset/ackhavereset、resethaltreq (最初の命令の前に止まる)、dmactive = 0 |
+| dm_pmp_lock | 1 | lock した PMP が DM 領域を覆っても halt と abstract command が動く。Debug Mode の外の DM 領域へのアクセスは fault |
+| dm_smp_select | 4 | hartsel、hasel/hawindow、haltsum0、anynonexistent、選んだ全 hart の halt と resume |
+| dm_smp_group | 4 | halt group (1 hart の trigger で group が止まる)、resume group |
+| dm_smp_sba_coh | 4 | 他 hart の dirty line を SBA が最新の値で読む、SBA の書き込みを他 hart の load が見る |
+| dm_smp_hartreset | 4 | 1 hart の hartreset の間、他の hart が共有のカウンタを更新し続け、値が保たれる (U32) |
+| dm_smp_stoptime | 4 | 一部の hart だけ止めても mtime は進み、全 hart を止めると止まる |
+
+### 9.2 riscv-tests の debug suite (GG)
+
+- 構成: Verilator のラッパ (`sim/verilator/tb_soc_dm_n1.sv`、`tb_soc_dm_n4.sv`) が統合 SoC と tb 専用の JTAG DTM (`jtag_dtm.sv`: TAP、IDCODE、dtmcs、dmi) を instantiate し、DTM が APB の master として DM を駆動する。DPI の C (`rbb_dpi.c`) が OpenOCD の remote_bitbang を localhost の TCP で受け、TCK/TMS/TDI/TDO と reset を毎サイクル受け渡す。DTM もラッパも設計には入らない (設計書 §D.1)。
+- OpenOCD の構成 `test/debug/openocd/heliodor.cfg` (remote_bitbang、riscv の target、N=4 では SMP)。`gdbserver.py` の target `test/debug/targets/heliodor/{w2_n1,w2_n4,w4_n1}.py` (hart 数、RAM の base と大きさ、link script、sim の起動コマンド、OpenOCD の構成、timeout)。suite は `test/riscv-arch-test/upstream/debug/` の clone を使い、commit を記録する (U36)。
+- 【決定】spike を参照にする。同じ版の `gdbserver.py` を spike の target (`spike64` と、SMP の `spike64-2` 相当) で走らせて pass の集合を記録し、heliodor は「spike で pass し、除外表 (設計書 U37、`test/debug/heliodor_excludes.yaml`) に無いテスト」をすべて通す。理由: suite のテストには DM の optional 機能や spike の実装の都合に依存するものがあり、heliodor の結果だけを見ると、不具合と持たない機能を区別できない。除外表の各行は持たない optional 機能か spike との意図した差に結び付ける。
+- 回す範囲: W2 の N=1 で全テスト、N=4 (`w2_n4`) で SMP のテスト (hart の切替、全 hart の halt と resume、group)、W4 の N=1 をマイルストーンの末に。結果 (pass/fail/除外の数、壁時間、OpenOCD・GDB・spike・suite の版) は MD の結果の節に記録する。
+- 速度: 1 回の DMI アクセスが JTAG の数十から百を超える TCK になるので、target の timeout を sim の速度に合わせて伸ばす。壁時間が梯子の予算 (目安 2 時間) を超えたら、tb の transport を OpenOCD の `jtag_dpi` に替える (設計書 U36、R10)。
+- 発火: GG の run も `perf_acc` の dump を出し、GF の `gdb` 列にする (§5.2)。
+
+### 9.3 DMI が idle のときの等価と lockstep
+
+- 【決定】MD のコミットは、DMI が idle (`psel = 0`、DM の出力は登録済みの 0) のとき、M4 までのゲートの結果を変えてはならない。検査: W2 (節目では W4 も) の GL-B の cycles、record 数、最終 hash と、新コアの bench 4 本 (`test_cbench_w{2,4}_*`) の cycles と instret が、MD の直前の master とビット一致すること。理由: DMI が idle なら新しい項 (`dm_req`、step、icount、DM 領域の PMA) はどれも定数の側にあり、1 サイクルでもずれたらそれは debug の経路が通常の経路に漏れた欠陥である。boot の cy は 10,000 刻みなので、ビット一致を言うのは GL-B の record と hash と bench の値である。
+- lockstep の run は Debug Mode に入らないので、`o_retire_dm` の印の付いた record は現れない。tracer と retire_mon は印の付いた record を数えず、lockstep の run でそれが 1 つでも現れたら fail にする (debug の経路が誤って発火した印)。
+- rv64mi の breakpoint: MD から新コアは trigger を持つので、golden (trigger 無し) と制御の流れが分かれる。lockstep のリストから pass/fail のリストへ移す (付録 B の B59)。
+- `MTIME_SRC = INSTRET` の tick は印の付いた record を数えない (設計書 §D.9)。GL-B は Debug Mode に入らないので、tick の列は MD の前と同一である。
+
+### 9.4 M5 での追加
+
+H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed を GD に足す: VS/VU からの halt と dret (dcsr.v、prv)、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV と vector の要素アクセスへの trigger (U39)、Debug Mode での MPRV と MPV。GG は H を持つ target の spike と比べて再び回す。
 
 ---
 
@@ -771,3 +876,4 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 | B56 | store で書き換えたコードへ、fence.i を挟まずに飛ぶ。golden は古い命令を、新コアは新しい命令を実行する。fence.i の前の命令の取り込みは spec 上どちらも合法 | 確定 (M2 の ACT4 診断。pmpsm の cfg_A_tor_zero と tor_check_01..03 の 4 本。record 数が 19 違う) | ACT4 の該当テストの trace | n (推定。カーネルは自己書換えの後に fence.i を使う) | OUT: 該当の 4 本は GL-C から外し、GA (pass/fail) だけで判定する。golden と新コアのどちらの取り込みにも合わせない。実装 (M2): `test/gates/m2_act.list` の 4 エントリに `lockstep=0` を付けた (golden の run と final を持たず、`run_act.py` は GA だけで判定する) | 不要 |
 | B57 | golden の SC の store record の PA と IO 印が、翻訳前の VA から作られる (PA = VA)。Sv39 の S/U の SC だけでなく、M-mode で MPRV が翻訳する SC も同じ。メモリへの書き込みは正しい PA に行く | 確定 (M2。GL-B の全文 trace 比較と ACT4 の S/U と MPRV の SC) | §3.3 の N8 (SC の store record の PA の源) | y (5.15 boot の SC。GL-B の全文比較の差分 2 種類のうちの 1 つ) | 許容差異。MASK:SC_PA (SC の store record の PA と IO 印、全特権、§4.8) | 不要 (trace で確認できる) |
 | B58 | golden で、失敗する SC (reservation が無い) が store 権限の検査を飛ばし、書けないページ (R のみ、Svade で D=0、無効) への SC が fault しない。仕様は SC を成否によらず store として翻訳・検査することを求める (Sail も同じ) | 確定 (M2。`sc_wperm` の作成時に判明) | `test/directed/sc_wperm.S` | 不明 (失敗する SC を数えるタグは無い。カーネルは書けるページにしか SC を出さないと推定) | 許容差異。新コアは書けないページへの SC を reservation の有無によらず cause 15 で trap する (AMO と同じく W と D の権限で翻訳する、設計書 §L.16)。trap record が食い違うので lockstep はそこで止まる。`sc_wperm` は pass/fail だけで判定する (`m2_lsu_pf.list`) | `sc_wperm` (新コアの directed。golden は reservation の無い SC の case で fault しない) |
+| B59 | golden は Sdtrig の trigger を持たない (tselect、tdata1、tdata2、tcontrol は 0 を読み書き込みを捨てる、M2 の新コアも同じ)。MD から新コアは trigger を持つので、tselect に書いた値が読めるかで trigger の有無を判断するテスト (rv64mi の breakpoint) の制御の流れが分かれる | 確定 (設計、設計書 §D.14) | 設計書 §C.8 の Sdtrig の【決定】、§D.14 | n (boot の firmware は自前の `test/linux/fw/linux_boot_fw.S` で trigger の CSR を触らず、S-mode の kernel は M の CSR に触れない) | OUT。MD から rv64mi の breakpoint を lockstep のリストから pass/fail のリストへ移す (§9.3) | 不要 |
