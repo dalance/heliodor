@@ -4365,8 +4365,8 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 | U36 | OpenOCD、GDB、spike、riscv-tests の版と取得、tb の JTAG DTM の transport | §D.1、R10 | MD の開始時 | 推奨: `toolchain/fetch.sh` に OpenOCD (riscv-openocd)、riscv64 の GDB、spike を pin した版で足す (prebuilt が無ければ pin した commit からの build の手順を `toolchain/README.md` に書く)。riscv-tests の debug suite は `test/riscv-arch-test/upstream/debug/` の clone を使い、commit を記録する。transport はユーザ決定どおり remote_bitbang (Verilator のラッパの DPI、localhost の TCP) から始め、GG の壁時間が梯子の予算 (目安 2 時間) を超えるときだけ `jtag_dpi` に替える。 |
 | U37 | gdbserver.py の除外表 | 検証計画 §9.2 | MD の末 | 推奨: `test/debug/heliodor_excludes.yaml` に commit し、各行を持たない optional 機能 (Access Memory、Quick Access、aarpostincrement、data value の trigger、textra、128 bit) か spike との意図した差に結び付ける。不具合を除外で隠さない。spike で通るテストが heliodor で落ち、除外の理由が無ければ MD の出口を満たさない。 |
 | U38 | `DM_BASE`、debug memory の配置、ROM と生成コードの命令列、`hartinfo.nscratch` | §D.7、§S.2 | MD | 推奨: `DM_BASE = 0x0000_4000` (boot ROM の直後で、どの map でも空いている)。DM code と DM data を 4 KiB ずつ、ROM の base register から ±2 KiB に収める配置。ROM は s0/s1 を dscratch0/1 に退避し、ABS に入る前に戻す (spike の DM と同じ流れ)。`nscratch` は生成コードが使わずに済む本数で、推奨 1。測るもの: gdbserver suite の register と progbuf のテストが spike と同じ結果になること。 |
-| U40 | ユーザ向け book の公開の場と mdbook、mdbook-i18n-helpers の版 | §MDOC | MDOC の開始時 | 推奨: 版は `toolchain/versions.env` に pin して `fetch.sh` で取る。公開 (GitHub Pages など) はユーザの判断で、MDOC は build までを出口とする。 |
 | U39 | VU の要素アクセスの trigger (M5) | §D.6、§D.16 | M5 | 推奨: `vu_mem_adapter` で要素ごとに load/store の照合を行い、一致した要素の手前で precise fault と同じく vstart を残して受け付ける (§V)。代案は vector の op を照合の対象外と宣言することだが、spec の load/store の照合は vector を除外しない。測るもの: V のテスト群と、vector の memcpy に watchpoint を置く directed。 |
+| U40 | ユーザ向け book の公開の場と mdbook、mdbook-i18n-helpers の版 | §MDOC | MDOC の開始時 | 推奨: 版は `toolchain/versions.env` に pin して `fetch.sh` で取る。公開 (GitHub Pages など) はユーザの判断で、MDOC は build までを出口とする。 |
 
 ---
 
