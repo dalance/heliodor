@@ -28,13 +28,20 @@
 //   o_evt             : registered, the cycle after every completion
 //   o_mem_*, i_mem_*  : one request at a time on port 0 (valid/ready; valid
 //                       never depends on ready). PTE reads are PTW_READ of
-//                       client PTW_D (PTW_I for an IFU walk), A/D writes
-//                       STORE_WT of client AD, tag.id = {sequence, IFU walk},
+//                       client PTW_D (PTW_I for an IFU walk); an A/D update
+//                       is an owned read-modify-write of client AD, LOAD_EXCL
+//                       then STORE_EXCL; tag.id = {sequence, IFU walk},
 //                       rob_v = 0. A response is taken by tag only, MEM_LAT
 //                       cycles after accept; o_mem_req holds from accept
 //                       until that response, so a port that presents the
 //                       request later than the accept may read it there
-//   i_ordering_empty  : sb ordering_empty; A/D re-reads and writes wait for it
+//   i_mem_slot        : the accepted request is due on the port this cycle
+//                       (the accept cycle itself for a port that presents at
+//                       accept); o_mem_av presents it. A STORE_EXCL whose
+//                       window broke since the grant is withdrawn there and
+//                       gets no response
+//   i_ordering_empty  : sb ordering_empty; the A/D read and write wait for it
+//   i_coh_v/i_coh_line: inv, inv2 and the local departures of this cycle
 // Owns:
 //   - an install never carries a translation read before a full kill or an
 //     invalidation
@@ -45,9 +52,12 @@
 // Rationale:
 //   - the owner always gets its own answer, so it progresses even if a
 //     younger fill evicts the entry before it looks up again
-//   - an A/D write re-reads the leaf once sb ordering_empty holds and writes
-//     only if it held since that read: a store to the PTE draining between the
-//     read and the write would otherwise be overwritten with the old value
+//   - an A/D update reads the leaf with ownership once sb ordering_empty
+//     holds and writes only if, up to the write's slot, ordering_empty held
+//     and the line never left: an own store draining into the PTE or another
+//     hart's write would otherwise be overwritten with the old value. A leaf
+//     that differs from the walk's in more than A/D, or an EXCL_FAIL, restarts
+//     the walk from the root (a stale walk ends instead)
 //   - PTE reads use supervisor PMP (implicit accesses) and the PMA pte_ok bit,
 //     both checked before the read is presented
 pub module ptw::<CFG: core_cfg> #(
@@ -73,7 +83,9 @@ pub module ptw::<CFG: core_cfg> #(
     i_pmpaddr: input logic              <64> [16],
     i_inv    : input xlate_pkg::TlbInv           ,
 
-    i_ordering_empty: input logic,
+    i_ordering_empty: input logic                                       ,
+    i_coh_v         : input logic     [core_types::<CFG>::COH_N],
+    i_coh_line      : input logic<50> [core_types::<CFG>::COH_N],
 
     o_fill: output xlate_pkg::TlbFill          ,
     o_resp: output core_types::<CFG>::XlateResp,
@@ -82,6 +94,8 @@ pub module ptw::<CFG: core_cfg> #(
     o_mem_valid: output logic                      ,
     o_mem_req  : output core_types::<CFG>::MemReq  ,
     i_mem_ready: input  logic                      ,
+    i_mem_slot : input  logic                      ,
+    o_mem_av   : output logic                      ,
     i_mem_resp : input  core_types::<CFG>::MemResp ,
     i_mem_evt  : input  core_types::<CFG>::MemEvent,
 
@@ -106,7 +120,6 @@ pub module ptw::<CFG: core_cfg> #(
         REQ, // present the PTE read or the A/D write
         WAIT, // the response of an accepted request
         PARK, // a fill event before the read is presented again
-        WT, // WT_DONE of an accepted A/D write
         DONE, // completion: install, answer, broadcast
     }
 
@@ -151,8 +164,8 @@ pub module ptw::<CFG: core_cfg> #(
     var w_wr_q   : logic           ; // REQ presents the A/D write
     var w_seta_q : logic           ;
     var w_setd_q : logic           ;
-    var w_adr_q  : logic           ; // A/D phase: reads wait for ordering_empty
-    var w_clean_q: logic           ; // ordering_empty held since the A/D-phase read
+    var w_adr_q  : logic           ; // A/D phase: owned reads after ordering_empty
+    var w_clean_q: logic           ; // ordering_empty held and the line stayed since the A/D read
     var w_fid_q  : FillId          ;
     var w_any_q  : logic           ; // PARK waits for the end of any fill
     var w_id_q   : logic      <IDW>;
@@ -255,7 +268,7 @@ pub module ptw::<CFG: core_cfg> #(
     var mtag: MemTag;
     always_comb {
         mtag        = '0;
-        mtag.client = if w_wr_q ? MemClient::AD : if w_side_q ? MemClient::PTW_I : MemClient::PTW_D;
+        mtag.client = if w_adr_q ? MemClient::AD : if w_side_q ? MemClient::PTW_I : MemClient::PTW_D;
         mtag.id     = {w_id_q, w_side_q};
     }
 
@@ -264,7 +277,7 @@ pub module ptw::<CFG: core_cfg> #(
         && (if w_wr_q ? i_ordering_empty && w_clean_q : !pte_deny && (!w_adr_q || i_ordering_empty));
     always_comb {
         o_mem_req.tag   = mtag;
-        o_mem_req.cls   = if w_wr_q ? MemCls::STORE_WT : MemCls::PTW_READ;
+        o_mem_req.cls   = if w_wr_q ? MemCls::STORE_EXCL : if w_adr_q ? MemCls::LOAD_EXCL : MemCls::PTW_READ;
         o_mem_req.pa    = w_pa_q;
         o_mem_req.mask  = 16'h00ff;
         o_mem_req.wdata = {64'd0, w_pte_q};
@@ -278,18 +291,22 @@ pub module ptw::<CFG: core_cfg> #(
     let ev_end: logic       = ev.valid && (ev.kind == EvKind::FILL_DONE || ev.kind == EvKind::FILL_ABORT);
     let r_dw  : logic   <3> = w_pa_q[5:3];
 
+    // An owned read waits for the whole fill: the critical dword is not
+    // ownership.
     function fill_wake (
         e   : input MemEvent    ,
         fin : input logic       ,
         fid : input FillId      ,
         any : input logic       ,
+        crit: input logic       ,
         line: input logic   <50>,
         dw  : input logic   <3> ,
     ) -> logic {
         return if any ?
             fin
         :
-            (fin || (e.valid && e.kind == EvKind::FILL_CRIT && e.line == line && e.crit == dw)) && e.fill_id == fid
+            (fin || (crit && e.valid && e.kind == EvKind::FILL_CRIT && e.line == line && e.crit == dw))
+                && e.fill_id == fid
         ;
     }
 
@@ -345,11 +362,29 @@ pub module ptw::<CFG: core_cfg> #(
     let set_a  : logic = !p_a;
     let set_d  : logic = want_d && own_live;
     let need_wr: logic = set_a || set_d;
-    let clean  : logic = w_clean_q && i_ordering_empty;
+
+    var coh_hit: logic;
+    always_comb {
+        coh_hit = 1'b0;
+        for c in 0..COH_N {
+            coh_hit |= i_coh_v[c] && i_coh_line[c] == w_pa_q[55:6];
+        }
+    }
+    let clean: logic = w_clean_q && i_ordering_empty && !coh_hit;
+
+    // Registered only: the slot drives the port. A drain in the slot cycle
+    // itself lands after the exclusive write.
+    let wd: logic = i_mem_slot && w_wr_q && !w_clean_q;
+    assign o_mem_av = i_mem_slot && !wd;
 
     let r_hit : logic = r_my && !w_wr_q && rs.kind == RespKind::HIT;
     let r_leaf: logic = r_hit && !p_fault && p_leaf;
     let r_lost: logic = r_leaf && want_d && !own_live;
+
+    // The owned read found another leaf, or the exclusive write failed.
+    let ad_diff: logic = r_hit && w_adr_q && (d & ~64'hc0) != (w_pte_q & ~64'hc0);
+    let ad_fail: logic = r_my && w_wr_q && rs.kind == RespKind::EXCL_FAIL;
+    let redo   : logic = (ad_diff || ad_fail) && !w_stale_q && !epoch_mv;
 
     // ---- the walk: completion ----
 
@@ -468,6 +503,10 @@ pub module ptw::<CFG: core_cfg> #(
             w_own_q   = own_live;
             w_stale_q = w_stale_q || epoch_mv;
             w_clean_q = if mem_acc && !w_wr_q ? 1'b1 : clean;
+            if redo {
+                w_adr_q = 1'b0;
+                w_wr_q  = 1'b0;
+            }
             if r_my {
                 w_id_q = w_id_q + 1;
             }
@@ -491,17 +530,14 @@ pub module ptw::<CFG: core_cfg> #(
                     }
                 }
                 WSt::WAIT: {
-                    if r_my {
-                        if w_wr_q {
-                            w_st_q = if rs.kind == RespKind::PENDING ?
-                                (if ev.valid && ev.kind == EvKind::WT_DONE && ev.fill_id == rs.fill_id ?
-                                    WSt::DONE
-                                :
-                                    WSt::WT
-                                )
-                            :
-                                WSt::REQ
-                            ;
+                    if wd {
+                        w_st_q = WSt::REQ;
+                        w_wr_q = 1'b0;
+                    } else if r_my {
+                        if ad_diff || ad_fail {
+                            w_st_q = if redo ? WSt::REQ : WSt::DONE;
+                        } else if w_wr_q {
+                            w_st_q = if rs.kind == RespKind::EXCL_PASS ? WSt::DONE : WSt::REQ;
                         } else if rs.kind == RespKind::HIT {
                             if p_fault || !p_leaf || !need_wr {
                                 w_st_q = if p_fault || p_leaf ? WSt::DONE : WSt::REQ;
@@ -513,7 +549,7 @@ pub module ptw::<CFG: core_cfg> #(
                                 w_wr_q  = w_adr_q && clean;
                             }
                         } else if rs.kind == RespKind::MISS {
-                            w_st_q = if fill_wake(ev, ev_end, rs.fill_id, 1'b0, w_pa_q[55:6], r_dw) ?
+                            w_st_q = if fill_wake(ev, ev_end, rs.fill_id, 1'b0, !w_adr_q, w_pa_q[55:6], r_dw) ?
                                 WSt::REQ
                             :
                                 WSt::PARK
@@ -526,13 +562,8 @@ pub module ptw::<CFG: core_cfg> #(
                     }
                 }
                 WSt::PARK: {
-                    if fill_wake(ev, ev_end, w_fid_q, w_any_q, w_pa_q[55:6], r_dw) {
+                    if fill_wake(ev, ev_end, w_fid_q, w_any_q, !w_adr_q, w_pa_q[55:6], r_dw) {
                         w_st_q = WSt::REQ;
-                    }
-                }
-                WSt::WT: {
-                    if ev.valid && ev.kind == EvKind::WT_DONE && ev.fill_id == w_fid_q {
-                        w_st_q = WSt::DONE;
                     }
                 }
                 default: w_st_q = WSt::IDLE;
@@ -552,7 +583,12 @@ pub module ptw::<CFG: core_cfg> #(
             w_setd_q = 1'b0;
         } else if in_req && !w_wr_q && pte_deny {
             w_flt_q = Flt::ACCESS;
-        } else if r_hit {
+        } else if redo {
+            w_lvl_q  = 2'd2;
+            w_pa_q   = {w_ctx_q.root, va[38:30], 3'd0};
+            w_seta_q = 1'b0;
+            w_setd_q = 1'b0;
+        } else if r_hit && !ad_diff {
             if p_fault {
                 w_flt_q = Flt::PAGE;
             } else if !p_leaf {
@@ -591,6 +627,8 @@ pub module ptw::<CFG: core_cfg> #(
         o_perf.a_wr     = mem_acc && w_wr_q && w_seta_q;
         o_perf.d_wr     = mem_acc && w_wr_q && w_setd_q;
         o_perf.ad_rd    = mem_acc && !w_wr_q && w_adr_q;
+        o_perf.ad_redo  = redo;
+        o_perf.ad_wd    = wd;
     }
 
     #[ifdef(HELIODOR_CHK)]
@@ -607,6 +645,7 @@ pub module ptw::<CFG: core_cfg> #(
             i_resp     : resp_q     ,
             i_lost     : r_lost     ,
             i_mem_acc  : mem_acc    ,
+            i_mem_wd   : wd         ,
             i_mem_tag  : mtag       ,
             i_mem_resp : rs         ,
             o_chk                   ,

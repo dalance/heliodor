@@ -3,7 +3,8 @@
 // Page tables live in a behavioural memory behind the port-0 client protocol
 // (random ready; responses exactly RESP_LAT after accept: HIT, MISS on a fill
 // with FILL_CRIT/FILL_DONE/FILL_ABORT events, RETRY with every reason;
-// STORE_WT answered PENDING then WT_DONE). The modelled PTEs are a pure
+// STORE_EXCL answered EXCL_PASS, EXCL_FAIL or RETRY; random departures of
+// the walker's line). The modelled PTEs are a pure
 // function of (SEED, slot, version): pointers to the canonical next table,
 // 4 KiB / 2 MiB / 1 GiB leaves, 64 KiB napot groups, invalid and reserved
 // encodings, misaligned superpages, pointers into IO and holes (pte_ok = 0),
@@ -311,6 +312,9 @@ module ptw_harness::<CFG: core_cfg> #(
     var inv_q  : TlbInv           ;
     var drop_q : logic            ; // owner_drop (IFU side)
     var oe_q   : logic            ; // ordering_empty
+    var coh_v  : logic        [COH_N];
+    var coh_ln : logic   <50> [COH_N];
+    var mslot  : logic            ;
     var hot_q  : logic   <64>     ; // VA of the latest remap
     var lrd_v_q: logic            ; // the slot of the latest accepted PTE read
     var lrd_s_q: logic   <11>     ;
@@ -404,12 +408,16 @@ module ptw_harness::<CFG: core_cfg> #(
         i_pmpaddr       : PMPADDR,
         i_inv           : inv_q  ,
         i_ordering_empty: oe_q   ,
+        i_coh_v         : coh_v  ,
+        i_coh_line      : coh_ln ,
         o_fill          : fill   ,
         o_resp          : resp   ,
         o_evt           : evt    ,
         o_mem_valid     : mv     ,
         o_mem_req       : mreq   ,
         i_mem_ready     : mrdy   ,
+        i_mem_slot      : mslot  ,
+        o_mem_av        : _      ,
         i_mem_resp      : mrsp   ,
         i_mem_evt       : mev    ,
         o_chk           : pchk   ,
@@ -571,11 +579,10 @@ module ptw_harness::<CFG: core_cfg> #(
 
     var mq_v  : logic      [RL];
     var mq_r  : MemReq     [RL];
-    var mq_wok: logic      [RL]; // a STORE_WT taken (PENDING)
-    var mq_fid: FillId     [RL];
+    var mq_wok: logic      [RL]; // a STORE_EXCL passed
+    var mq_wf : logic      [RL]; // a STORE_EXCL failed
     var mq_d  : logic <64> [RL]; // read data, sampled at accept
     var gen_q : FillId         ;
-    var wgen_q: FillId         ;
     var f_v   : logic          ;
     var f_id  : FillId         ;
     var f_line: logic <50>     ;
@@ -583,12 +590,10 @@ module ptw_harness::<CFG: core_cfg> #(
     var f_cnt : logic <5>      ;
     var f_cat : logic <5>      ; // FILL_CRIT when f_cnt reaches it
     var f_ab  : logic          ;
-    var wt_v  : logic          ;
-    var wt_id : FillId         ;
-    var wt_cnt: logic <4>      ;
 
     assign mrdy = rnd[1:0] != 2'd0;
     let m_acc: logic = mv && mrdy;
+    assign mslot = m_acc;
 
     let m_sl : logic           <12> = slot_of(mreq.pa);
     let m_att: pma_pkg::PmaAttr     = pma_check::<2>(mreq.pa, PMA_T);
@@ -600,8 +605,18 @@ module ptw_harness::<CFG: core_cfg> #(
         gen_slot(m_sl[10:0], 16'd0)
     ;
     let m_wd : logic           <64> = mreq.wdata[63:0];
-    let m_wt : logic                = mreq.cls == MemCls::STORE_WT;
+    let m_wt : logic                = mreq.cls == MemCls::STORE_EXCL;
     let m_wok: logic                = m_wt && rnd[3:2] != 2'd0;
+    let m_wf : logic                = m_wt && !m_wok && rnd[4];
+
+    // Departures of the line the walker presents (the PTE it reads or
+    // writes), without a change of its data.
+    always_comb {
+        for c in 0..COH_N {
+            coh_v[c]  = c == 0 && rnd3[63:59] == 5'd0;
+            coh_ln[c] = mreq.pa[55:6];
+        }
+    }
 
     // The leaf slot of a test VA at each level (slot_of over the canonical
     // tables), to attribute an A/D write to the op whose page it updates.
@@ -632,18 +647,18 @@ module ptw_harness::<CFG: core_cfg> #(
     let q      : MemReq    = mq_r[RL - 1];
     let qv     : logic     = mq_v[RL - 1];
     let r_k    : logic <3> = rnd2[2:0]; // 0-3 HIT, 4 MISS, 5 FILL_BUSY, 6-7 RETRY
-    let r_miss : logic     = qv && q.cls != MemCls::STORE_WT && r_k == 3'd4;
+    let r_miss : logic     = qv && q.cls != MemCls::STORE_EXCL && r_k == 3'd4;
     let r_newf : logic     = r_miss && !f_v;
-    let r_busy : logic     = qv && q.cls != MemCls::STORE_WT && r_k == 3'd5 && f_v;
-    let r_retry: logic     = qv && (if q.cls == MemCls::STORE_WT ? !mq_wok[RL - 1] : r_k[2:1] == 2'd3);
+    let r_busy : logic     = qv && q.cls != MemCls::STORE_EXCL && r_k == 3'd5 && f_v;
+    let r_retry: logic     = qv && (if q.cls == MemCls::STORE_EXCL ? !mq_wok[RL - 1] && !mq_wf[RL - 1] : r_k[2:1] == 2'd3);
 
     always_comb {
         mrsp         = '0;
         mrsp.valid   = qv;
         mrsp.tag     = q.tag;
         mrsp.data    = {64'd0, mq_d[RL - 1]};
-        mrsp.kind    = if q.cls == MemCls::STORE_WT ?
-            (if mq_wok[RL - 1] ? RespKind::PENDING : RespKind::RETRY)
+        mrsp.kind    = if q.cls == MemCls::STORE_EXCL ?
+            (if mq_wok[RL - 1] ? RespKind::EXCL_PASS : if mq_wf[RL - 1] ? RespKind::EXCL_FAIL : RespKind::RETRY)
         : if r_miss ?
             RespKind::MISS
         : if r_busy || r_retry ?
@@ -651,7 +666,7 @@ module ptw_harness::<CFG: core_cfg> #(
         :
             RespKind::HIT
         ;
-        mrsp.fill_id = if q.cls == MemCls::STORE_WT ? mq_fid[RL - 1] : if r_newf ? gen_q + 1 : f_id;
+        mrsp.fill_id = if r_newf ? gen_q + 1 : f_id;
         mrsp.reason  = if r_busy ?
             RetryReason::FILL_BUSY
         :
@@ -666,16 +681,13 @@ module ptw_harness::<CFG: core_cfg> #(
 
     let f_crit_now: logic = f_v && f_cnt == f_cat;
     let f_end_now : logic = f_v && f_cnt == 5'd0;
-    let wt_now    : logic = wt_v && wt_cnt == 4'd0 && !f_crit_now && !f_end_now;
     always_comb {
         mev         = '0;
-        mev.valid   = f_crit_now || f_end_now || wt_now;
-        mev.fill_id = if wt_now ? wt_id : f_id;
+        mev.valid   = f_crit_now || f_end_now;
+        mev.fill_id = f_id;
         mev.line    = f_line;
         mev.crit    = f_crit;
-        mev.kind    = if wt_now ?
-            EvKind::WT_DONE
-        : if f_end_now ?
+        mev.kind    = if f_end_now ?
             (if f_ab ? EvKind::FILL_ABORT : EvKind::FILL_DONE)
         :
             EvKind::FILL_CRIT
@@ -910,7 +922,6 @@ module ptw_harness::<CFG: core_cfg> #(
             snd_s       = '0;
             alloc_q     = '0;
             gen_q       = '0;
-            wgen_q      = '0;
             f_v         = 1'b0;
             f_id        = '0;
             f_line      = '0;
@@ -918,9 +929,6 @@ module ptw_harness::<CFG: core_cfg> #(
             f_cnt       = '0;
             f_cat       = '0;
             f_ab        = 1'b0;
-            wt_v        = 1'b0;
-            wt_id       = '0;
-            wt_cnt      = '0;
             ctx_q       = '0;
             ctx_q.prv   = csr_pkg::PrivLevel::SUPERVISOR;
             ctx_q.root  = 44'h80000;
@@ -941,7 +949,7 @@ module ptw_harness::<CFG: core_cfg> #(
             for k in 0..RL {
                 mq_v[k]   = 1'b0;
                 mq_wok[k] = 1'b0;
-                mq_fid[k] = '0;
+                mq_wf[k]  = 1'b0;
                 mq_r[k]   = '0;
                 mq_d[k]   = '0;
             }
@@ -960,7 +968,7 @@ module ptw_harness::<CFG: core_cfg> #(
             if rs_bad {
                 err_q[1] = 1'b1;
             }
-            if mv && mreq.cls == MemCls::PTW_READ && (!m_att.pte_ok || ref_pmp_deny(mreq.pa, AccKind::LOAD)) {
+            if mv && mreq.cls != MemCls::STORE_EXCL && (!m_att.pte_ok || ref_pmp_deny(mreq.pa, AccKind::LOAD)) {
                 err_q[2] = 1'b1; // a PTE read the walker must not present
             }
             if m_acc && m_wt
@@ -996,14 +1004,14 @@ module ptw_harness::<CFG: core_cfg> #(
             mq_v[0]   = m_acc;
             mq_r[0]   = mreq;
             mq_wok[0] = m_wok;
-            mq_fid[0] = wgen_q + 1;
+            mq_wf[0]  = m_wf;
             mq_d[0]   = m_cur;
             for k in 1..RL {
                 mq_d[k]   = mq_d[k - 1];
                 mq_v[k]   = mq_v[k - 1];
                 mq_r[k]   = mq_r[k - 1];
                 mq_wok[k] = mq_wok[k - 1];
-                mq_fid[k] = mq_fid[k - 1];
+                mq_wf[k]  = mq_wf[k - 1];
             }
             if m_acc && mreq.cls == MemCls::PTW_READ && m_sl[11] {
                 lrd_v_q = 1'b1;
@@ -1013,14 +1021,6 @@ module ptw_harness::<CFG: core_cfg> #(
             if m_acc && m_wok {
                 mem[m_sl[10:0]]   = m_wd;
                 mem_w[m_sl[10:0]] = 1'b1;
-                wgen_q            = wgen_q + 1;
-                wt_v              = 1'b1;
-                wt_id             = wgen_q + 1;
-                wt_cnt            = (RL as 4) + {2'd0, rnd3[1:0]} + {3'd0, rnd3[2]};
-            } else if wt_now {
-                wt_v = 1'b0;
-            } else if wt_v && wt_cnt != 4'd0 {
-                wt_cnt = wt_cnt - 4'd1;
             }
             if f_end_now {
                 f_v = 1'b0;
@@ -1452,6 +1452,7 @@ module test_ptw_chk {
         i_resp     : rs          ,
         i_lost     : stp == 8'd12,
         i_mem_acc  : stp == 8'd14,
+        i_mem_wd   : 1'b0        ,
         i_mem_tag  : mt          ,
         i_mem_resp : mr          ,
         o_chk      : pc          ,
