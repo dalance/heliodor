@@ -160,6 +160,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--matrix", type=Path, default=ROOT / "test/gates/fire_matrix.txt")
     ap.add_argument("--zero", action="store_true", help="list leaves that are zero in every log")
+    ap.add_argument("--nonzero", action="store_true", help="list leaves with their counts, nonzero only")
     ap.add_argument("logs", nargs="+", metavar="gate=log")
     a = ap.parse_args()
 
@@ -248,6 +249,13 @@ def main():
         verdict = "not run" if not ran else ("ok" if total else "ZERO")
         fail += ran and not total
         print("%-34s %-26s %-12s %s" % (ev, gspec, total if ran else "-", verdict))
+
+    if a.nonzero:
+        for (g, c), cnt in sorted(counts.items()):
+            print("\nnonzero in %s:%s:" % (g, CORES.get(c, c)))
+            for n, v in cnt.items():
+                if v:
+                    print("  %-32s %d" % (n, v))
 
     if a.zero:
         for core in sorted(layouts):
