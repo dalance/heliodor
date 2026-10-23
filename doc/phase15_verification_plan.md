@@ -30,7 +30,7 @@
 | GL-C | ACT4 lockstep。GA のログの最終 H 行を `test/golden/check_hash.py` が golden と照合 | GA と同時 | script の exit code |
 | GL-B | 5.15 N=1 boot lockstep (ADUE off、`MTIME_SRC=INSTRET`、schedule replay) | `--ignored` | x3==0xAA、checkpoint 一致、割込み assert 0 |
 | GB1 | N=1 boot pass/fail: 6.6、7.1 (FP、ADUE)、7.1v (M5) | `--ignored` | x3==0xAA |
-| GT2 / GT4 | litmus N=2 (既定) / N=4 | GT4 は `--ignored` | tohost==1 |
+| GT2 / GT4 | litmus N=2 (既定は短い像、ITER=200) / N=4 | GT4 と ITER=1000 の full は `--ignored` | tohost==1 |
 | GB2 / GB4 | SMP boot N=2 / N=4 (5.15。6.6/7.1 の SMP はマイルストーン末) | `--ignored` | hart 0 の x3==0xAA |
 | GH | hvlinux (V=1 の二段翻訳を負荷下で通す唯一のゲート) | `--ignored` | x3==0xAA |
 | GX | W2 対 W4 の差分 lockstep (§4.6) | マイルストーン末 | trace 一致 |
@@ -46,7 +46,7 @@
 
 | ゲート | M1a | M1b | M2 | M3 | M4 | MD | M5 | M6 |
 |---|---|---|---|---|---|---|---|---|
-| G0 新コア分 | (新コアは無い。V14 の梯子 1-5 と SoC の unit test、spike の unit test) | W2: rv64ui 54 を lockstep。W4: rv64ui を pass/fail (最低でも ALU・分岐・load/store 群、目標は 54 全部) | W2: スカラ arch 全部 (lockstep 対象は §4.6) + smode_plic + 新規 directed (§7.4)。W4: rv64ui 全部 | W2 と W4 で同一リスト | + litmus N=2 (W2, W4) | + GD (N=1 の debug directed、W2, W4)。rv64mi の breakpoint は pass/fail へ (§9.3) | + H 17 本、V 20 本、test_vmspre、debug と H/V の directed | 既定コアを新コアに |
+| G0 新コア分 | (新コアは無い。V14 の梯子 1-5 と SoC の unit test、spike の unit test) | W2: rv64ui 54 を lockstep。W4: rv64ui を pass/fail (最低でも ALU・分岐・load/store 群、目標は 54 全部) | W2: スカラ arch 全部 (lockstep 対象は §4.6) + smode_plic + 新規 directed (§7.4)。W4: rv64ui 全部 | W2 と W4 で同一リスト | + litmus N=2 short (W2, W4。ITER=200 の像) + `test_smp_coh` (CoRR、LR/SC、AMO watch、drain、wt_fires、PLIC claim。N=2 の W2、W4) + A/D 競合 (`ad.S`) + SMP uncached 読み (`unc.S`) | + GD (N=1 の debug directed、W2, W4)。rv64mi の breakpoint は pass/fail へ (§9.3) | + H 17 本、V 20 本、test_vmspre、debug と H/V の directed | 既定コアを新コアに |
 | GA / GL-C | | | W2 | W2, W4 | 同 | 同 | 同 | 同 |
 | GL-B | | | W2 | W2, W4 | 同 | 同 + DMI idle で MD の前とビット一致 (§9.3) | 同 | 同 |
 | GB1 | | | W2: 6.6, 7.1 | W2, W4 | 同 | 同 | + 7.1v | 同 |
@@ -58,6 +58,9 @@
 | GD4 | | | | | | W2: 節目と末。W4: 末 | 同 | 同 |
 | GG | | | | | | W2: N=1 全部と N=4 の SMP のテスト、節目と末。W4: N=1、末 | 同 (H/V の追加の後に再実行) | 同 |
 | GS / GF | S1 の対照を記録 | 記録 | 記録 | 記録 + M3 判定の材料 | 同 | 同 (+ `dbg`、`gdb` の列) | 同 | 同 |
+
+【決定】(M4 手順 1、ユーザ承認) G0 の litmus N=2 は短い像 `litmus_n2_short.hex` (ITER=200。AMO/LOCK は 1000/500 のまま。W2 985,091 cy、W4 971,035 cy) にする。理由: ITER=1000 の N=2 は負荷の高い箱で W2 約 35 分、W4 約 2 時間 (wall) で、G0 の時間に収まらない。ITER=1000 の像は `#[ignore]` の `test_{w2,w4}_litmus_full_2hart` に残す (W2 4,021,722 cy、W4 3,955,649 cy)。GT4 の W2 は 5,031,303 cy。
+【未決】(M4) GT4 の W4 は約 140 cy/s で 10 時間級 (N=4 の段差) のため判定していない。表は W4 の GT4 を毎回回す形のままだが、GB4 の W4 と同じく「マイルストーンの末だけ」に改める案をユーザの判断に出す。
 
 旧コア (V14) は M6 まで既定コアであり、CLAUDE.md の梯子 1-5 (既定、litmus4、N=2 boot、N=4 boot、hvlinux) をそのまま回し続ける。
 
@@ -232,6 +235,8 @@ litmus の histogram (0x8000_4000) と barrier 語 (0x8000_6000) の DRAM ダン
 | `test_soc_linux_boot_harness` (+66/71/71v) | tb/test_soc_linux_boot*.veryl | N=1 boot 4 本 | 統合 SoC `N_HARTS=1` へ移す。`CORE` param を足す。x3 は V14 なら `o_dbg_r3`、新コアなら `retire_mon`。census の印字は V14 枝だけに残す。lockstep 用の param (`MTIME_SRC`、schedule、checkpoint ファイル) を足す。 |
 | `test_soc_smp_linux_boot_harness` (+66/71) | tb/test_soc_smp_linux_boot*.veryl | SMP boot 7 本 | `CORE` を足す。生存プローブと最初の 4 trap の印字は `retire_mon` から作る (旧 `o_dbg_trap_pc` は c_pc で、割込みと偽 ifault で誤っていた)。 |
 | `test_litmus_harness` | tb/test_litmus.veryl:17-385 | litmus 3 本 | `CORE` を足す。新コアの tohost は retire store から取る。新コアでは litmus の atomic がどの番地でも cacheable になる。 |
+| 新コアの SMP ラッパ (M4) | tb/test_core_smp.veryl | G0 の litmus N=2 short (W2、W4)。`#[ignore]`: litmus full N=2、litmus N=4、5.15 SMP boot N=2/4 | 新規。`boot_soc_harness` を `N_HARTS` で一般化した上のラッパ (hart ごとに `retire_mon`、`rvfi_tracer`、perf_acc。pass は hart 0、fail はいずれかの hart。`PROBE_LOG2` で hart ごとの pc、records、traps を印字)。litmus は `MAP_ARCH` (ROM なし、4 MiB)、tohost は `retire_mon` が retire record の store から見る。DRAM の配列を読まないので histogram の dump は無い。N=4 boot は新コア専用の firmware `test/hex/linux_boot_fw_4hart_mt.hex` を使う (設計書 M4 の進捗)。 |
+| `test_smp_coh` (M4) | tb/test_smp_coh.veryl、test/coh/{coh,ad,unc}.S | G0 (N=2、W2/W4)、N=4 は `#[ignore]` | 新規 (§7.2)。coh.S は CoRR、LR/SC の reservation、AMO の watch、drain の飢餓の上限、`wt_fires`、PLIC claim の競合 (N=2 で W2 132,938 cy、W4 128,288 cy)。ad.S は 2 hart の A/D の競合、unc.S は SMP の uncached 読みと他 hart の dirty line (W2 6,128 cy、W4 6,155 cy)。 |
 | `test_soc_hvlinux_harness` | tb/test_soc_hvlinux.veryl:15-208 | hvlinux | 統合 SoC `N_HARTS=1` へ移す。`CORE` を足す。 |
 | 単体 tb (`test_clint` ほか) | | | `test_clint` は CLINT の新入力を `i_tick_sel=0` に固定すれば無変更で通る (§4.1)。 |
 | Verilator ラッパ | sim/verilator/*.sv | N=1/2/4/8 boot、litmus4、hvlinux、ACT PMP | 変更しない。harness の名前とポートだけに依存しているので、`CORE` の既定値 (§2.5) に従う。 |
@@ -647,7 +652,9 @@ M2 末 (2026-10-16) の状態: 上表の既定スイートと ACT4 の列はす�
 
 ### 7.2 M4 (SMP)
 
-RVWMO (litmus N=2/4/8)、remote invalidate による reservation の消去、atomic の line 所有、Zawrs と Svinval の SMP 下の動作 (7.1 SMP boot)、PLIC claim の競合 (§8 の directed)。旧コアでは N=1 のビット一致が N=4 boot の正しさを含意しなかったので、メモリ系の変更には GB4 を必須とする (§1.3)。
+RVWMO (litmus N=2/4/8)、remote invalidate による reservation の消去、atomic の line 所有、Zawrs と Svinval の SMP 下の動作 (7.1 SMP boot)、PLIC claim の競合 (§8 の directed)。
+
+M4 の directed (手順 2、3、7): `test/coh/coh.S` (`tb/test_smp_coh.veryl`)、`ad.S` (A/D の owned RMW。変更前の RTL で失敗)、`unc.S` (uncached 読みの recall。変更前の RTL で失敗)。穴: hart ごとの `chk_io_mon` が無く、PLIC の read 回数は間接的にしか検査していない。CoRR の発火は間接で、B05 の `SC_REPLAY` の probe は未作成。7.1 の boot は HW の A/D 更新を通らない (Linux は A=D=1 の PTE を作る) ので、A/D は `ad.S` が唯一の検査である。SBA の書き込み側の recall は MD で検査する。旧コアでは N=1 のビット一致が N=4 boot の正しさを含意しなかったので、メモリ系の変更には GB4 を必須とする (§1.3)。
 
 ### 7.3 M5 (H/V)
 
