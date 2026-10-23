@@ -767,9 +767,9 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 
 | テスト | N | 確かめること |
 |---|---|---|
-| dm_halt_resume | 1 | haltreq、resumereq、dmstatus (allhalted/allrunning/allresumeack)、dpc、割込みが pending のときの halt、ROB が空でない状態からの halt、started の op (IO、AMO) の完了を待つ halt |
+| dm_halt_resume | 1 | haltreq、resumereq、dmstatus (allhalted/allrunning/allresumeack)、dpc、割込みが pending のときの halt、ROB が空でない状態からの halt、started の op (IO、AMO) の完了を待つ halt、halted の後も haltreq を下ろさない間に abstract command と progbuf が進む (`dm_req` が `!debug_mode` を含む、設計書 §D.4 の M4-3) |
 | dm_ebreak | 1 | ebreakm/s/u の各特権、ebreakX=0 での通常の breakpoint 例外 |
-| dm_step | 1 | step の 1 record、trap する命令 (ハンドラの先頭で止まる)、stepie 0/1、CSR 書き込みと IO store の step、step 中の WFI |
+| dm_step | 1 | step の 1 record、trap する命令 (ハンドラの先頭で止まる)、stepie 0/1、CSR 書き込みと IO store の step、step 中の WFI、step する命令の直後に若い分岐の mispredict がある列 (部分 kill が `dm_take` を遅らせても record は 1 つ、設計書 §D.5 の【M4 で決定】) |
 | dm_dcsr | 1 | Debug Mode の外での dcsr/dpc/dscratch と DRET の不正命令、dcsr の WARL |
 | dm_exc | 1 | progbuf の例外で cmderr = 3、mcause/mepc/mtval が変わらない、Debug Mode 中の ebreak の再入場 |
 | dm_abs_gpr、dm_abs_fpr_csr | 1 | Access Register の全組合せ、s0/s1、FS=Off、aarpostincrement の拒否、cmderr の sticky と W1C |
