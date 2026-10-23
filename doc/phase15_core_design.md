@@ -214,7 +214,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | M1b 歩く骨格 | rv64ui が golden の trace と一致する (cfg_w2)。cfg_w4 は elaborate でき、rv64ui のサブセットが通る。 | M1b で取り込んだ新規モジュールが cold-reader gate を通過している (P5)。knob が 0 個。`VERYL_AOT_C_DIAG=1` で whole-comb fallback が 0。kill/WB の invariant checker がすべてのテストで 0。 |
 | M2 | arch suite、ACT4、5.15 N=1 boot の lockstep (cfg_w2)。 | 推定段階の旧コアバグを directed test で確認済み (D4)。 |
 | M3 | 両構成で N=1 のゲートの梯子を通る (新コアの SMP は M4 から存在する)。N=4 boot ゲートの扱い (D7) をここで決め、M4 から適用する。 | 各軸の sweep で IPC が期待方向に動く。動かない場合は、その原因を §3.4 に天井として登録する。dcache の CPU 側は 2 ポート (bank 化、ポートごとの tag lookup、`fill_id = {index, 世代}` を持つ MSHR file の構造) で、DTLB は lookup 2 ポート。いずれも N=1 のゲートで検査する。支援する `MSHR_N`/`N_FILL` は 1 のまま。cy/s を記録している。 |
-| M4 | litmus N=2/N=4、N=2/N=4 boot。 | メモリ系を変更した場合は N=4 boot を必須とする。`MSHR_N`/`N_FILL` を 1 より大きくするのは、新コアの N=4 boot ができた後に限り、そのコミットはすべて N=4 boot をゲートとする。 |
+| M4 | litmus N=2/N=4、N=2/N=4 boot。 | メモリ系を変更した場合は N=4 boot を必須とする。`MSHR_N`/`N_FILL` を 1 より大きくするのは、新コアの N=4 boot ができた後に限り、そのコミットはすべて N=4 boot をゲートとする。【M4 で決定】`MSHR_N = 2` (W2/W4、§M.6.4)。`N_FILL` は 1 のまま。 |
 | MM | 新コアの SoC の DRAM 側が AXI4 の master になり、固定遅延の設定と、遅延と backpressure を乱数で振った設定の両方で、GL-B の record 列と最終 hash が一致する。G0、GT2/GT4、GB2、GB4 (W2) が乱数遅延で通る。AXI の protocol checker の違反が 0。V14 の dhrystone/coremark がビット一致する。 | `mem_ctrl` に固定サイクルの仮定が残らない (slave を差し替えても機能が変わらない)。新しいモジュールが cold-reader gate を通過。knob 0 個。メモリ系の変更なので全コミットが GB4 (W2) を通る。 |
 | MD | DMI を駆動する directed test (N=1、N=4、GD)、OpenOCD+GDB による riscv-tests の debug suite (GG、spike と同じ範囲)。DMI が idle のとき M4 までのゲートの結果が MD の前とビット一致する。 | §D の新規モジュールが cold-reader gate を通過。knob 0 個。`chk_debug` と `chk_dm` がすべてのテストで 0。§D.15 の事象が GF で 0 より大きい。 |
 | M5 | hvlinux、vector のテスト群。 | VU の上限を修正するか宣言する (§3.4)。 |
@@ -296,7 +296,7 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 | `PTW_D_QN` / `PTW_I_QN` | `ptw` | 4 / 1 | 4 / 1 | 要求キューの深さ (§M.8.1)。M2 から。【決定】(M3、U21) 据え置き。N=1 では律速せず、SMP で見直す (§M.8.1)。 |
 | `REISSUE_W` | `lq` | 1 | 1 | 1 サイクルに再 issue する数 (§L.7)。上限は MEM_W。【決定】(M3、U21) 1。N=1 では律速しない (§L.7)。 |
 | `DC_NB` | `dcache` (M3 の CPU 側) | 2 | 4 | data の bank 数 (§M.6.3)。M1-M2 の adapter は 1 で固定だった。【決定】(M3、U19) §M.6.3 の sweep で決めた。 |
-| `MSHR_N` | `dcache` (M3 の CPU 側) | 1 | 1 | §M.6.4。1 を超える値は M4 で新コアの N=4 boot ができた後に限る (§2.5)。 |
+| `MSHR_N` | `dcache` (M3 の CPU 側) | 2 | 2 | §M.6.4。【M4 で決定】(`6eb785a`) 2。M3 では 1 に限っていた (§2.5)。 |
 | `TRIG_N` | `trig_unit` (MD) | 2 | 4 | Sdtrig の trigger 数 (§D.6)。照合器は execute が block あたり、load/store が memory pipe あたり trigger 1 つにつき 1 組なので、面積と照合の CP は `TRIG_N × (1 + MEM_W)` に比例する。W2 の 2 は GDB の hardware breakpoint 2 本 (gdbserver の `Hwbp2`) か breakpoint 1 本と watchpoint 1 本を同時に置ける最小。【MD で決定】(U34) gdbserver suite の結果と照合器の synth で確かめる。 |
 
 ### 3.4 宣言された上限 (再利用モジュールと本設計の構造に由来するもの)
@@ -308,7 +308,7 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 | VU は CDB を 2 lane だけ snoop する | `vector_unit.veryl:94-101` | VU を使うのは M5 から | M5: head に達した時点で scalar は ready とみなし、snoop は使わない。 |
 | VU の alloc は 1/cycle | `vector_unit.veryl:70` | rename group あたり 1 | 宣言された上限として残す。 |
 | dcache data は 1 read/cycle | `o_hit2` は `S3_SLOT1=1` によって 0 に固定 (`dcache.veryl:877,3112`) | M1-M2 では物理アクセス 1 本 | M3: data を bank 化し、tag を複製する。M3 の手順 4 で済み (§M.6.2、§M.6.3)。新コアの dcache には残らず、`v14_dcache` だけの上限。 |
-| D-line fill は 1 hart に 1 本 | `MSHR_N=1` (`dcache.veryl:452`)、mem_ctrl の SPH=2 | N_FILL=1 | 宣言された上限。M3 は MSHR file の構造 (`fill_id = {index, 世代}`) だけを作り、値は 1 のまま。増やす条件は §2.5 の M4 行。 |
+| D-line fill は 1 hart に 1 本 | mem_ctrl の SPH=2 (`MSHR_N` は M4 で 2 になったが、mem_ctrl への fill は `N_FILL=1` のままで 1 本) | N_FILL=1 | 宣言された上限。M3 は MSHR file の構造 (`fill_id = {index, 世代}`) を作り、M4 で `MSHR_N=2` にした (§M.6.4)。`N_FILL` を増やす条件は §2.5 の M4 行。 |
 | icache の fill は 1 本で、I read slot を icache の uncached 読みと共有する | 再利用 `icache` の単一 fill、外部 slot は I 側に 1 本 | - | 宣言された上限として残す。I read slot の調停は `islot_arb` (§M) が行う。I-PTW の PTE 読みは M2 から memory port 0 を使う (§M.5) |
 | `o_inst_hart = h as 3` | `mem_ctrl.veryl:1067` | SPH=2 | SPH>2 にする前に `h % N_HARTS` に修正する。 |
 | hart 数 ≤ 8 | fabric の `logic<3>`、CLINT のデコードが 3 bit | N_HARTS ∈ {1,2,4,8} | 宣言された上限として残す。 |
@@ -320,7 +320,7 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 | store の drain ポートは 1 本 | `sb` の head だけが駆動する line 幅の書込ポート (§5.9 MP7、§M.6.6) | - | 宣言された上限。PUSH_W と MEM_W を上げても drain の帯域は増えない。 |
 | port 0 専用の client クラス | HEAD、PTW、AD、ASQ と VU (§5.9 の能力表、§L.14) | - | 宣言された上限。MEM_W を上げてもこれらの帯域は増えない。 |
 | wbm0 だけに付く HOLE_FILL の client | `io_unit`、`atomic_unit`、VU の scalar 結果 (§5.7) | - | 宣言された上限。どれも head でしか動かないので同時に 1 つ。 |
-| `MemEvent` は 1 サイクルに 1 個 | adapter と M3 の dcache の event ポート (§M.2.5) | - | `MSHR_N > 1` (M4) にするときに再検討する。 |
+| `MemEvent` は 1 サイクルに 1 個 | adapter と M3 の dcache の event ポート (§M.2.5) | - | `MSHR_N > 1` (M4) にするときに再検討する。【M4 で確認】`MSHR_N = 2` では `MemEvent` の形を変えていない。 |
 | kill 1/cycle、commit-alone 1/cycle、D-PTW と I-PTW 各 1 本、rename group あたり VEC 1 個 | §3.2 の固定値 | - | 宣言された上限として残す。 |
 | (MD) trigger は 4 個まで | `ExcRec.trig_hit` が `logic<4>` (§5.8、§D.6) | 1 ≤ `TRIG_N` ≤ 4 | 宣言された上限。増やすには `ExcRec` の幅を変える。 |
 | (MD) Debug Mode の命令は 1 beat ずつ fetch し、retire は lane 0 だけ (step と icount の間) | DM の領域は uncached (§D.7)、step と icount の retire 制限 (§D.5) | - | 宣言された上限。デバッグ中だけの性能で、ゲートは時間でなく機能で判定する。 |
@@ -350,7 +350,7 @@ VU に由来する行 (ROB ≤ 256 と 2 の冪、CDB の 2 lane snoop、alloc 1
 | 3 | `ROB_N ≥ RENAME_W` | dispatch は 1 group を丸ごと割り当てる |
 | 4 | `PRF_INT_N`、`PRF_FP_N` > 32 | free list が空にならない |
 | 5 | 1 ≤ `REISSUE_W` ≤ `MEM_W` | §3.3 |
-| 6 | `MSHR_N == 1` かつ `DC_NB` ∈ {2, 4, 8} | 【決定】(M3) dcache は grant の前に MSHR エントリを確保するので、それを許すのは新コアの N=4 boot がゲートになるまで 1 エントリだけ (§2.5、§M.6.1)。dword を 2、4、8 bank に interleave する (§M.6.3)。M2 までは adapter の 1 bank (`DC_NB == 1`) だった。`MSHR_N` は M4 で緩める |
+| 6 | `MSHR_N >= 1` かつ `DC_NB` ∈ {2, 4, 8} | 【決定】(M3) dword を 2、4、8 bank に interleave する (§M.6.3)。M2 までは adapter の 1 bank (`DC_NB == 1`) だった。【M4 で決定】(`90f6f8e`) `MSHR_N` の制約は 0 だけを拒否する形に緩めた。M3 は dcache が grant の前に MSHR エントリを確保することから 1 エントリに限っていたが (§2.5、§M.6.1)、MSHR file の module はもともと `MSHR_N` について generic で、RTL の変更は無い。`MSHR_N = 1` の bench は M3 の末とビット一致 |
 | 7 | `DQ_N ≥ FETCH_W`、`RQ_N ≥ FETCH_W`、`RQ_N ≥ RENAME_W` | `lane_queue` は少なくとも 1 group を保持する |
 | 8 | `MEM_IQ < N_IQ` | §X.2 |
 | 9 | 各 IQ に issue ポートが 1 本以上 (`MEM_IQ` は memory pipe を数える)、`IQ_N[q] ≥ RENAME_W`、1 ≤ `IQ_NSRC[q]` ≤ 3 | |
@@ -1190,7 +1190,7 @@ IDLE --(受理 edge で token.valid && token.tag == 自分の tag)--> STARTED --
 
 【M4 で確認】(M4 手順 6 のレビュー、master `bbfa026` の RTL と `phase15/m4-mshr` の `6eb785a` を見た):
 
-- 表の網羅: RTL の started の発生源は `STARTED_N = 4` の `{mp_start, st_io, st_at, ep_start[SYS_P]}` で、表の `fu_sys`、`io_unit`、`atomic_unit`、`mem_pipe` の 4 行と一致する。M4 の手順 1-4 は started の発生源を足していない。M4 が足した取り消せない書き込みは 2 つあり、どちらも表の既存の行の内部の手順か、表の外 (投機的な A) に入る: (a) `ptw` の A/D の owned RMW (`eb67415`) の `STORE_EXCL` は、D の場合は `mem_pipe` の行の `nonspec` walk の中で起き、A だけの場合は IR5 の投機的な A の書き込みで、kill の後も walk が続いてよい (§5.4 の `ptw` の要求キューの行)。(b) mem_ctrl の `i_hunc` の recall (`7cb1bb4`) は `io_unit` の `UNC_READ` の応答を遅らせるだけで、新しい開始点ではない。所有者の L1 が dirty の line を書き戻す recall は mem_ctrl と dcache の coherence agent の間で完結し、所有者の hart の commit、token、Debug Mode に依らない。`MSHR_N = 2` (`6eb785a`、未 merge) は MSHR の本数を変えるだけで、開始点も手順も変えない。
+- 表の網羅: RTL の started の発生源は `STARTED_N = 4` の `{mp_start, st_io, st_at, ep_start[SYS_P]}` で、表の `fu_sys`、`io_unit`、`atomic_unit`、`mem_pipe` の 4 行と一致する。M4 の手順 1-4 は started の発生源を足していない。M4 が足した取り消せない書き込みは 2 つあり、どちらも表の既存の行の内部の手順か、表の外 (投機的な A) に入る: (a) `ptw` の A/D の owned RMW (`eb67415`) の `STORE_EXCL` は、D の場合は `mem_pipe` の行の `nonspec` walk の中で起き、A だけの場合は IR5 の投機的な A の書き込みで、kill の後も walk が続いてよい (§5.4 の `ptw` の要求キューの行)。(b) mem_ctrl の `i_hunc` の recall (`7cb1bb4`) は `io_unit` の `UNC_READ` の応答を遅らせるだけで、新しい開始点ではない。所有者の L1 が dirty の line を書き戻す recall は mem_ctrl と dcache の coherence agent の間で完結し、所有者の hart の commit、token、Debug Mode に依らない。`MSHR_N = 2` (`6eb785a`、master に merge 済み) は MSHR の本数を変えるだけで、開始点も手順も変えない。
 - `head_started_q` の有界性: 開始後の各手順が待つものは、M4 の後も token、他の op の retire、他 hart の commit のいずれも含まない。M4 で増えた待ちは、`ptw` の A/D が待つ `ordering_empty` (`sb` の drain は commit と独立に進み、started の op は head なので、その間に新しい store が `sb` に入ることは無い)、exclusive な読みの pin (最大 64 サイクル、§M.8.4)、`i_hunc` の recall (所有者の dcache の書き戻し) で、どれも有界である。EXCL_FAIL による walk の引き直しと AMO の FAIL の再試行は、他 hart との競合の下での前進が §L.12 の pin と backoff に依ることも M2 から変わらない。したがって D.4 の「入場は有界時間で起きる」は M4 の後も成り立つ。
 - `ordering_empty` の意味: RTL の `sb.o_ordering_empty` は `cnt == 0` の 1 本で、§5.9 MP7 の `resource_empty` は別の出力として存在しない。queued atomic (ASQ) は M4 の手順 5 で採否が決まるまで実装されておらず、`SHADOW_LEN = 0` なので、今は「commit 済みの store がすべて可視で、atomic の待ち行列も空」と「`sb` が空」が一致し、1 本で正しい。読み手は `commit` (C6 の drain)、`atomic_unit`、`io_unit`、D と I の `ptw` の 5 つである。ASQ を採るなら、`ordering_empty` に待ち行列の空を AND し、`resource_empty` を別の出力に分け、上の 5 つの読み手はすべて `ordering_empty` のままにする (U51)。queued atomic は retire した後に動くので started latch は持たず、`head_started_q` にも入らず、この表に行を足さない (`sb` の drain と同じく commit と独立に進むので、入場を遅らせない)。
 
@@ -3129,7 +3129,7 @@ AMO は W と D の権限で翻訳する (旧コアは AMO の W/D の検査を�
 
 | 項目 | M1b | M2 | M3 | M4 | M5 |
 |---|---|---|---|---|---|
-| dcache CPU 側 | `dcache_port_adapter` (論理 `MEM_W` ポート、物理 1 経路) | 同左 | 2 ポートに再構築 (bank 化、ポートごとの tag lookup、`fill_id = {index, 世代}` の MSHR file の構造、`MSHR_N=1`)。N=1 のゲート (M.6)。M3 の手順 4 で実装 (`src/core/mem/dcache*.veryl`、`DC_NB` は W2 2 / W4 4)。adapter と旧 `src/cache/dcache.veryl` は削除した | 新コアの N=4 boot ができた後に `MSHR_N` を増やす (各コミットを N=4 boot でゲート) | VU の要素アクセス (§V) |
+| dcache CPU 側 | `dcache_port_adapter` (論理 `MEM_W` ポート、物理 1 経路) | 同左 | 2 ポートに再構築 (bank 化、ポートごとの tag lookup、`fill_id = {index, 世代}` の MSHR file の構造、`MSHR_N=1`)。N=1 のゲート (M.6)。M3 の手順 4 で実装 (`src/core/mem/dcache*.veryl`、`DC_NB` は W2 2 / W4 4)。adapter と旧 `src/cache/dcache.veryl` は削除した | 【M4 で決定】`MSHR_N = 2` (§M.6.4)。`N_FILL` を増やすのは新コアの N=4 boot でゲートした後に限る | VU の要素アクセス (§V) |
 | 再利用 dcache への変更 | 追加 export E1/E3/E5 (M.2.2) | 同左 | `src/v14/v14_dcache` を凍結して本体を改造 (§4.4)。凍結後も V14 の dhrystone/coremark はビット一致 | | |
 | `tlb` | (無し。Bare の翻訳を `mem_pipe`/`ifu` の m1/f1 で行う) | V=0、`LOOKUP_PORTS=MEM_W`、`ENTRIES` = `DTLB_N`/`ITLB_N` | DTLB 2 lookup ポートの実働 (手順 4、event `dtlb.lk2`)、`ENTRIES` と ptw キュー深さの sweep | | V=1 エントリ |
 | `ptw` (D, I) | (無し) | V=0 Sv39 (Svade、Svnapot、Svpbmt、PTE の PMP/PMA)、Svadu (A/D は STORE_WT) | | A/D を owned RMW に (M4 で済み) | 二段翻訳 |
@@ -3309,7 +3309,7 @@ fold 群と LOAD_EXCL は、判定サイクル V に次の行を上から評価�
   - probe には WB か ack で答える。defer してよいのは pin の 64 サイクルだけである。
   - uncached 読みは exact-address の 1 beat で、デバイスの read enable は grant のサイクルに 1 回だけ立つ。
   - misaligned の hi-dword バイパス (`o_dmem_wdata_hi`/`o_dmem_wstrb_hi`) は使わない (MP5)。再利用モジュールの該当入力は 0 に固定する。
-- `SPH > 2` (`N_FILL ≥ 2`) に必要なもの。M4 で新コアの N=4 boot ができるまでは範囲外で (§2.6)、上げるときは N=4 boot を入口ゲートとする (§2.5、§3.4):
+- `SPH > 2` (`N_FILL ≥ 2`) に必要なもの。M4 で `MSHR_N = 2` にしたが `N_FILL` は 1 のままなので (§M.6.4)、以下は不要のままで範囲外 (§2.6)。上げるときは N=4 boot を入口ゲートとする (§2.5、§3.4)。§5.11 の SB drain の watermark の根拠も `N_FILL = 1` に基づくので変わらない:
   - mem_ctrl の `o_inst_hart = h as 3` (`mem_ctrl.veryl:1067`) を `h % N_HARTS` に直す。N=1/2/4 でも、番号 `h ≥ N_HARTS` の slot が install すると sharer mask が壊れる。
   - slot の割り当てを (N_HARTS, N_FILL) から生成する (slot-major、D 系を先に)。`inst_sel_h`/`lkc_nin` の `logic<4>` (N_SLOTS ≤ 16) を導出幅にする。lookup と install の選択にも aging を入れる。
   - L1 に、MSHR エントリごとの line buffer を置く。STREAM は back-pressure できず、複数の slot が同じサイクルに流し込むからである。mem_ctrl は同じ line の accept を直列化するので、secondary-miss merge も L1 で行う。
@@ -3385,7 +3385,11 @@ enum MshrSt { FREE, WAIT_LAUNCH, WAIT_GRANT, FILL, DONE }
 - 旧 `state == IDLE` が持っていた 3 つの意味を分ける: エントリごとの状態、「このサイクルに array の書き込み口が空いている」、「次の read channel の grant の持ち主」。3 つ目は、WAIT_GRANT/FILL のエントリか uncached 読みのどちらか 1 つを、登録済みの選択 (`own_unc_q`) で決める。read channel の grant は、MSHR が channel を持つ間だけ MSHR に渡る。N2.2a で、他人の grant を自分の launch と誤認した事故はこの 3 つ目の混同である。
 - 自 hart の probe (`i_probe_self`) は自分の fill を abort しない。他 hart の probe と inv は、FILL のエントリの line と比較し、当たれば abort する (grant でそのエントリが始まるサイクルを含む)。
 - kill: エントリは kill の消費者ではない。kill が効くのは V の判定 (行 1、RETRY(PREEMPTED)) だけで、MISS を返した後に waiter が殺されても、エントリは FILL_DONE か FILL_ABORT まで進む。確保したエントリはすべて、自分の id の FILL_DONE か FILL_ABORT で終わる。
-- `MSHR_N` は M3 では 1 とする (M.6.1、`CFG_ERR` bit 6)。【M4 で決定】`MSHR_N` を 1/2/4 で sweep する (新コアの N=4 boot ができた後、各点を N=4 boot でゲートする)。測定済みの天井 (fill 中に別の line を待つ load は boot の 0.79 %) から見て、IPC の利得は小さい。主な価値は構造 (ポートが miss で塞がらないこと) なので、IPC が下がらない最小値を採る。
+- `MSHR_N` は M3 では 1 とした (M.6.1)。測定済みの天井 (fill 中に別の line を待つ load は boot の 0.79 %) から見て、IPC の利得は小さい。主な価値は構造 (ポートが miss で塞がらないこと) なので、IPC が下がらない最小値を採る。
+- 【決定】(M4、`90f6f8e`、`6eb785a`) `MSHR_N = 2` を `cfg_w2` と `cfg_w4` に採る。`CFG_ERR` bit 6 は `MSHR_N == 0` だけを拒否する形に緩めた (RTL の module はもともと `MSHR_N` について generic で、変更は無い。`MSHR_N = 1` の bench は M3 の末とビット一致)。`N_FILL` は 1 のままで、§M.4 の mem_ctrl の `SPH > 2` の修正は要らず、§5.11 の SB drain の watermark の根拠も変わらない。`tb/test_lsu` の seed は h0 1 → 5、h1 3 → 7、h2 2 → 9 に替えた。`MSHR_N = 2` では、旧 seed で W2 の `sb.urgent` と `at.watch`、W4 の `at.fail` の coverage assert が発火しなくなったためで、機構の変更ではなく乱数列の変化である。
+  - 理由 (sweep、`MSHR_N` = 1 / 2 / 4): GL-B は W2 14,398,090 / 14,316,714 / 14,313,517、W4 11,763,601 / 11,681,911 / 11,675,464。fpmm は W2 1,115,855 / 1,044,649 / 1,044,450、W4 975,168 / 861,025 / 855,571。spmv は W2 43,773 / 41,165 / 40,852、W4 36,113 / 32,160 / 32,190。coremark は W2 381,245、W4 315,611 で 3 点とも同一、dhrystone はほぼ不変。2 から 4 への利得は 0.05 % 以下 (fpmm の W4 だけ 0.6 %) で、2 が「IPC が下がらない最小値」である。
+  - 計測 (`b7b852d`): `DcachePerf` に `mshr_live2` (live な MSHR エントリが 2 本以上のサイクル) と `alloc_ovl` (別のエントリが live の間の alloc) を足した。GL-B は W2 331,640 サイクル (2.3 %)、alloc 32,166 のうち 11,703 が重なり、W4 は 349,443 サイクル (3.0 %)、32,167 のうち 12,396 が重なる。2 本目が使われる母集団は 2-3 % で、旧コアの天井の測定 (0.79 % から 1.26 %) と同じ桁である。
+  - ゲート (`MSHR_N = 2`、W2): G0 860 passed、0 failed。GL-B は record 10,417,776、hash `74d4b7982390260f`、`chk_dcache` 0。GB2 19,082,790。GB4 24,808,238 (pass、checker はすべて 0)。GT4 5,029,995 (pass)。W4 の GB2/GB4/GT4 は未実行 (マイルストーン末)。
 
 #### M.6.5 hit-under-fill
 
@@ -4753,7 +4757,7 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 6. Debug Mode の入場の設計を commit/trap で確定する (§D.4、§D.5、§D.16)。RTL は MD で入れる (DEAD scaffolding を作らない)。確定するもの: outcome DEBUG と `RedirKind::DEBUG`、非同期の入場 `dm_take` を割込みと同じ受付点に置き token の抑止を共通の項にすること、retire 制限を lockstep・step・icount の合成 1 項にすること、`ExcRec` の `dm`/`trig`/`trig_hit` と `exc_prio` での trigger の位置、xRET 種別の 2 bit 化。M4 の手順 1-5 で足す取り消せない操作 (ASQ を採るならそれ) が §5.13.1 の表に載り、`head_started_q` の有界性と `ordering_empty` の意味 (queued atomic を含む) を保つことを、この確定のレビューで確かめる。
 7. SBA (MD) の前提として、U28 の残り (DRAM の uncached 読みの前に他 hart の dirty コピーを recall する) を入れる (§5.11、§D.11)。
 
-進捗 (2026-10-23): 手順 1、2、3、6、7 は完了。手順 4、5 は残り (手順 4 の `MSHR_N = 2` はブランチ `phase15/m4-mshr` にあり未 merge)。積み重ねた先端での GB4 は未実行 (手順 7 の `7cb1bb4` と手順 3 の `eb67415` はメモリ系なので GB4 が要る)。
+進捗 (2026-10-24): 手順 1、2、3、4、6、7 は完了。手順 5 (ASQ と victim 除外のブランチ実験、N=4 での SB の占有の測定) は残り。マイルストーン末に残るのは W4 の GB2/GB4/GT4 と、6.6/7.1 の SMP boot である。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) での W2 の GB4 は 24,922,839 サイクルで pass、`MSHR_N = 2` では 24,808,238 で pass (checker はすべて 0)。
 
 - 手順 1 (`ab66e89`、`50f5dde`、`tb/test_core_smp.veryl`): `boot_soc_harness` を `N_HARTS` で一般化した (既定 1。N=1 の DUT と hart 0 の観測は不変)。hart ごとに `retire_mon`、`rvfi_tracer`、perf_acc を持ち、pass は hart 0 (x3=0xAA か tohost==1)、fail はいずれかの hart の chk か tohost の異常。RTL の変更はなく、立ち上げで RTL のバグは 1 件も出なかった (chk 全 0)。結果 (cycles):
 
@@ -4771,6 +4775,8 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 - 手順 7 (`0aca8fa`、`7cb1bb4`): U28 解決 (§5.11、§S.3、§D.11)。`test_{w2,w4}_smp_unc_2hart` は G0 に入っている (W2 6,128、W4 6,155 cy)。SBA の DRAM 読みは `i_hunc=1` の 1 beat の経路が使える。SBA の書き込み側の recall は未検証。
 - 新コア専用の firmware の像 (`964905c`): 4-hart 用の firmware の HSM `HART_START` の busy delay (約 1.05M 命令) は、新コアでは 1 回の start で約 8M cy かかる (ROM の fetch が uncached の single beat で 1 反復約 16 cy)。new-core だけの像 `test/hex/linux_boot_fw_4hart_mt.hex` を `test/linux/fw/patch_hsm_mtime_wait.sh` で作った (待ちを mtime で 102,400 tick に抑える)。`tb/test_core_smp.veryl` の N=4 boot はこの像を使い、V14 は旧 hex のまま使う。この hex は `linux_boot_fw.S` から再現できない (source が hex から乖離している)。
 - 手順 6 (設計のみ、RTL なし): Debug Mode の入場を commit/trap で確定した (§D.4 の M4-1 から M4-7、§D.5)。M0 の文から 2 点を直した: `!debug_mode` は `dm_take` ではなく `dm_req` に掛ける (Debug Mode の間も haltreq が保持されると token が止まり ROM が進まない)、step と icount の pending の後も `lim_ok` が retire を止める (部分 kill のサイクルに `dm_take` が遅れて 2 record 目が retire する窓を閉じる)。RTL に `exc_prio` という関数は無く、3 つの発生源の優先 chain の先頭に trigger を入れる形にした。レビュー (§5.13.1 の【M4 で確認】): M4 は started の発生源を足しておらず (RTL の `STARTED_N = 4`)、A/D の owned RMW、`i_hunc` の recall、`MSHR_N = 2` はどれも開始後の手順に token や他 op の retire への依存を足さないので `head_started_q` は有界、`ordering_empty` は ASQ が無い間は `sb` の空と一致する。hartreset の quiesce に `ptw` の idle を足した (U32)。MD に送った事項は U50 (line 跨ぎの lo の fault と hi の trigger) と U51 (ASQ を採ったときの `ordering_empty` の分割)。
+- 手順 4 (`90f6f8e`、`6eb785a`、`b7b852d`): `MSHR_N = 2` を `cfg_w2`/`cfg_w4` に採った (§M.6.4)。`CFG_ERR` bit 6 を `MSHR_N == 0` の拒否に緩めた。`DcachePerf` に `mshr_live2` と `alloc_ovl` を足した (検証計画の matrix の boot の行)。`N_FILL` は 1 のままなので §M.4 の mem_ctrl の修正は要らない。
+- firmware の修正の効果: W2 の GB4 は旧 4-hart firmware の像で 43,479,101 サイクル、新コア専用の mtime の像で 24,922,839 サイクルになった。以前の N=4 SMP の遅さは core ではなく firmware の delay によるものだった。
 - 未決・持ち越し: (a) 新コアの uncached の ROM fetch が遅い (性能、優先度は低い)。(b) firmware の source と hex の乖離 (source の整合、または patch script を正本に決める)。(c) W4 の GT4 を GB4 と同じ「マイルストーンの末だけ」にするか (提案、ユーザ判断。検証計画 §1.2 は W4 の GT4 を毎回回す表のまま)。(d) 失敗する SC も D を立てる件 (§L.16)。
 
 実装する範囲: §L.18 と §M.1 の各 M4 列、§D.16 の M4 行。
@@ -4780,9 +4786,9 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 | 区分 | 条件 |
 |---|---|
 | 機能 (W2, W4) | G0 に litmus N=2 を追加。GT4、GB2 (5.15、マイルストーン末は 6.6/7.1 の SMP も)。GB4 は M3 の決定に従う。GV: litmus4、N=2、N=4。 |
-| 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。 |
+| 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。`MSHR_N = 2` の出荷分は W2 の GB4 を通した (W4 はマイルストーン末)。 |
 
-M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11)、fill の victim 選択から pin 中の line を除外するか (§L.12)、`MSHR_N` の値 (§M.6.4)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16、完了)。
+M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11)、fill の victim 選択から pin 中の line を除外するか (§L.12)、`MSHR_N` の値 (§M.6.4、手順 4 で 2 に決定)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16、完了)。
 
 ### MM: 外部メモリインタフェース
 

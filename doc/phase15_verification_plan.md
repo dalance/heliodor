@@ -71,7 +71,7 @@
 ### 1.3 コミットごとの運用
 
 - 新コアだけを変えるコミット: G0。M2-M3 では GL-B が最初の実ゲートになる (旧コアの「N=2 boot が最初の実ゲート」に相当)。
-- メモリ系 (`lsu/`、`mem/`、dcache、MMU、SoC) を変えるコミット: M4 以降は GB4 必須 (設計書 §2.5)、M5 以降は GH も必須。front end と予測器の変更は M4 以降 GB2 必須。新コアの SMP は M4 から存在するので、M3 の dcache 2 ポート化 (bank、ポートごとの tag、MSHR file の構造) は `MSHR_N=N_FILL=1` のまま N=1 のゲート (G0、GA、GL-B、GB1、GX) で検査する。`MSHR_N`/`N_FILL` を 1 より大きくするコミットは、M4 で新コアの GB4 ができた後に限り、1 つずつ GB4 をゲートとする。
+- メモリ系 (`lsu/`、`mem/`、dcache、MMU、SoC) を変えるコミット: M4 以降は GB4 必須 (設計書 §2.5)、M5 以降は GH も必須。front end と予測器の変更は M4 以降 GB2 必須。新コアの SMP は M4 から存在するので、M3 の dcache 2 ポート化 (bank、ポートごとの tag、MSHR file の構造) は `MSHR_N=N_FILL=1` のまま N=1 のゲート (G0、GA、GL-B、GB1、GX) で検査する。`MSHR_N`/`N_FILL` を 1 より大きくするコミットは、M4 で新コアの GB4 ができた後に限り、1 つずつ GB4 をゲートとする (`MSHR_N = 2` は M4 の手順 4 で採用、結果は §1.6)。
 - 共有モジュール (CLINT、csr、SoC、dcache/MMU への追加出力) または V14 に触れるコミット: V14 で梯子 1-5 を回す。共有モジュールの変更は M2 まで追加のみ (設計書 §4.4) なので、V14 の dhrystone/coremark の cycles と instret はビット一致するはずであり、それを受入条件にする。
 - AXI4 の外部メモリポート (設計書 §MM: `mem_ctrl` の外側、write buffer、ID、SoC の DRAM 側ポート) を変えるコミット (MM 以降): メモリ系なので GB4 (W2) 必須。加えて G0 (固定遅延)、GP、GL-B と GT2 short の乱数遅延 (GM)。V14 の枝に触れないことを V14 の dhrystone/coremark のビット一致で確かめる。
 - デバッグの経路 (設計書 §D: commit の `dm_take` と outcome DEBUG、retire 制限、`trig_unit`、trigger の照合、DM、SBA、reset 木) を変えるコミット (MD 以降): G0 (GD を含む) と、DMI idle のビット一致 (§9.3: W2 の GL-B と新コアの bench 4 本)。SBA と hartreset の quiesce はメモリ系として GB4 も通す。trigger の照合や DM の ROM を変えたら GD4 と GG を節目で回す。
@@ -165,6 +165,28 @@ M3 の手順 1-6 は master の `13241df` まで、手順 7 の sweep の採用�
 M3 の末の百分率は手順 7 との比。手順 7 の W2 の coremark が遅くなったのは `FTQ_N` を 32 にしたためで (設計書 §3.4)、W4 は採用値で bench の値が変わらない。
 
 ---
+
+### 1.6 M4 のゲートの結果 (2026-10-24、途中)
+
+M4 の手順 4 で `MSHR_N = 2` を `cfg_w2`/`cfg_w4` に採った (`90f6f8e`、`6eb785a`、`b7b852d`。設計書 §M.6.4)。W4 の GB2/GB4/GT4 と 6.6/7.1 の SMP boot はマイルストーン末に回す。
+
+| ゲート | 結果 (`MSHR_N = 2`) |
+|---|---|
+| G0 | 860 passed、0 failed。`tb/test_lsu` の seed を h0 1 → 5、h1 3 → 7、h2 2 → 9 に替えた (`MSHR_N = 2` で W2 の `sb.urgent`、`at.watch`、W4 の `at.fail` の coverage assert が旧 seed で発火しなくなったため) |
+| GL-B | record 10,417,776、hash `74d4b7982390260f`、`chk_dcache` 0 |
+| GB2 (W2) | 19,082,790 |
+| GB4 (W2) | 24,808,238 pass、checker はすべて 0。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) では 24,922,839 pass。旧 4-hart firmware の像は 43,479,101 だったので、以前の N=4 SMP の遅さは firmware の delay だった |
+| GT4 (W2) | 5,029,995 pass |
+
+`MSHR_N` の sweep (1 / 2 / 4。W2、W4。coremark は 3 点とも同一で W2 381,245、W4 315,611、dhrystone はほぼ不変):
+
+| 測定 | W2 | W4 |
+|---|---|---|
+| GL-B | 14,398,090 / 14,316,714 / 14,313,517 | 11,763,601 / 11,681,911 / 11,675,464 |
+| fpmm | 1,115,855 / 1,044,649 / 1,044,450 | 975,168 / 861,025 / 855,571 |
+| spmv | 43,773 / 41,165 / 40,852 | 36,113 / 32,160 / 32,190 |
+
+`DcachePerf` に足した `mshr_live2` (live な MSHR が 2 本以上のサイクル) と `alloc_ovl` (別のエントリが live の間の alloc) は、`fire_matrix.txt` の boot の行である (`fire_check.py` は struct から名前を復元するので、表の変更は要らない)。GL-B では W2 が 331,640 サイクル (2.3 %)、alloc 32,166 のうち 11,703 が重なり、W4 が 349,443 サイクル (3.0 %)、32,167 のうち 12,396 が重なる。
 
 ## 2. ハーネスの載せ替え (D3)
 
