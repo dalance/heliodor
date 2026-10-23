@@ -39,28 +39,32 @@
 | GF | 発火行列 (§5.2) | マイルストーン末 | `fire_check.py` の exit code |
 | GD / GD4 | debug の directed (§9.1): tb が APB の DMI ポートを script で駆動し、halt/resume/step、abstract command、progbuf、SBA、trigger、group、reset を N=1 (GD) / N=4 (GD4) で検査する (MD から) | GD は G0 に含む。GD4 は `--ignored` | script の全 CHECK が一致、`chk_debug`/`chk_dm` 0、tohost==1 |
 | GG | riscv-tests の debug suite (`gdbserver.py`) を OpenOCD + GDB で Verilator のラッパ (tb 専用の JTAG DTM) に対して走らせる。spike を参照にする (§9.2、MD から) | マイルストーンの節目と末 | spike で通るテストのうち除外表に無いものがすべて pass |
+| GM | 乱数遅延の再走 (§10.4): tb の AXI4 slave model の遅延と backpressure を seed 付きの乱数にして、GL-B、GT2/GT4、GB2、GB4 (W2)、GV を回す (MM から) | MM のコミットごと (GL-B と GT2 short)。GB2、GB4、GV は節目と末 | GL-B は record 数と最終 hash が固定遅延と一致、他は各ゲートの判定と同じ。`pass=1` の seed 一覧を記録する |
+| GP | AXI4 の protocol checker の違反数 (§10.3、MM から) | 新コアの AXI を持つ全 run | 違反の sticky flag がすべて 0。G0 を含む |
 
 ### 1.2 マイルストーン × 構成
 
 【決定】新コアのゲート投入時期を下表に固定する。理由: SMP は M4、デバッグは MD、H/V は M5 で初めて機能が揃うが、揃ったマイルストーンからは両構成で常に回し、後から足さない。MD は D9 (設計書 §1.4) で M4 と M5 の間に足したマイルストーンである。
 
-| ゲート | M1a | M1b | M2 | M3 | M4 | MD | M5 | M6 |
-|---|---|---|---|---|---|---|---|---|
-| G0 新コア分 | (新コアは無い。V14 の梯子 1-5 と SoC の unit test、spike の unit test) | W2: rv64ui 54 を lockstep。W4: rv64ui を pass/fail (最低でも ALU・分岐・load/store 群、目標は 54 全部) | W2: スカラ arch 全部 (lockstep 対象は §4.6) + smode_plic + 新規 directed (§7.4)。W4: rv64ui 全部 | W2 と W4 で同一リスト | + litmus N=2 short (W2, W4。ITER=200 の像) + `test_smp_coh` (CoRR、LR/SC、AMO watch、drain、wt_fires、PLIC claim。N=2 の W2、W4) + A/D 競合 (`ad.S`) + SMP uncached 読み (`unc.S`) | + GD (N=1 の debug directed、W2, W4)。rv64mi の breakpoint は pass/fail へ (§9.3) | + H 17 本、V 20 本、test_vmspre、debug と H/V の directed | 既定コアを新コアに |
-| GA / GL-C | | | W2 | W2, W4 | 同 | 同 | 同 | 同 |
-| GL-B | | | W2 | W2, W4 | 同 | 同 + DMI idle で MD の前とビット一致 (§9.3) | 同 | 同 |
-| GB1 | | | W2: 6.6, 7.1 | W2, W4 | 同 | 同 | + 7.1v | 同 |
-| GT4, GB2 | | | | | W2, W4 | 同 | 同 | 同 |
-| GB4 | | | | (新コアの SMP は無い。回し方を D7 の測定で決めた、§6.3) | W2: メモリ系の変更ごと。W4: マイルストーン末 (§6.3) | 同 (SBA と hartreset の quiesce はメモリ系) | 同 | 同 |
-| GH | | | | | | | W2, W4 | 同 |
-| GX | | | | 決定的なテスト全部 | 同 | 同 | + H/V | 同 |
-| GV | | | N=1 boot (W2) | N=1 (W2, W4) | + litmus4, N=2, N=4 (NBA の相互確認だけで、N=4 の判定には使わない、§6.3) | 同 | + hvlinux | 全部 |
-| GD4 | | | | | | W2: 節目と末。W4: 末 | 同 | 同 |
-| GG | | | | | | W2: N=1 全部と N=4 の SMP のテスト、節目と末。W4: N=1、末 | 同 (H/V の追加の後に再実行) | 同 |
-| GS / GF | S1 の対照を記録 | 記録 | 記録 | 記録 + M3 判定の材料 | 同 | 同 (+ `dbg`、`gdb` の列) | 同 | 同 |
+| ゲート | M1a | M1b | M2 | M3 | M4 | MM | MD | M5 | M6 |
+|---|---|---|---|---|---|---|---|---|---|
+| G0 新コア分 | (新コアは無い。V14 の梯子 1-5 と SoC の unit test、spike の unit test) | W2: rv64ui 54 を lockstep。W4: rv64ui を pass/fail (最低でも ALU・分岐・load/store 群、目標は 54 全部) | W2: スカラ arch 全部 (lockstep 対象は §4.6) + smode_plic + 新規 directed (§7.4)。W4: rv64ui 全部 | W2 と W4 で同一リスト | + litmus N=2 short (W2, W4。ITER=200 の像) + `test_smp_coh` (CoRR、LR/SC、AMO watch、drain、wt_fires、PLIC claim。N=2 の W2、W4) + A/D 競合 (`ad.S`) + SMP uncached 読み (`unc.S`) | 同 (固定遅延の slave)。+ AXI の slave model と protocol checker の単体テスト、MM.5 の I1-I6 の directed (§10.4) | + GD (N=1 の debug directed、W2, W4)。rv64mi の breakpoint は pass/fail へ (§9.3) | + H 17 本、V 20 本、test_vmspre、debug と H/V の directed | 既定コアを新コアに |
+| GA / GL-C |  |  | W2 | W2, W4 | 同 | 同 (固定遅延) | 同 | 同 | 同 |
+| GL-B |  |  | W2 | W2, W4 | 同 | 同 + 乱数遅延で record 数と最終 hash が固定遅延と一致 (§10.4)。cycles は変わってよい | 同 + DMI idle で MD の前とビット一致 (§9.3) | 同 | 同 |
+| GB1 |  |  | W2: 6.6, 7.1 | W2, W4 | 同 | 同 | 同 | + 7.1v | 同 |
+| GT4, GB2 |  |  |  |  | W2, W4 | 同 + 乱数遅延 (GT2 short も) | 同 | 同 | 同 |
+| GB4 |  |  |  | (新コアの SMP は無い。回し方を D7 の測定で決めた、§6.3) | W2: メモリ系の変更ごと。W4: マイルストーン末 (§6.3) | W2: MM の全コミット (固定遅延と乱数遅延)。W4: マイルストーン末 | 同 (SBA と hartreset の quiesce はメモリ系) | 同 | 同 |
+| GH |  |  |  |  |  |  |  | W2, W4 | 同 |
+| GX |  |  |  | 決定的なテスト全部 | 同 | 同 | 同 | + H/V | 同 |
+| GV |  |  | N=1 boot (W2) | N=1 (W2, W4) | + litmus4, N=2, N=4 (NBA の相互確認だけで、N=4 の判定には使わない、§6.3) | 同 + 乱数遅延 (§10.4) | 同 | + hvlinux | 全部 |
+| GD4 |  |  |  |  |  |  | W2: 節目と末。W4: 末 | 同 | 同 |
+| GG |  |  |  |  |  |  | W2: N=1 全部と N=4 の SMP のテスト、節目と末。W4: N=1、末 | 同 (H/V の追加の後に再実行) | 同 |
+| GS / GF | S1 の対照を記録 | 記録 | 記録 | 記録 + M3 判定の材料 | 同 | 同 (+ MM の事象、§10.4) | 同 (+ `dbg`、`gdb` の列) | 同 | 同 |
 
 【決定】(M4 手順 1、ユーザ承認) G0 の litmus N=2 は短い像 `litmus_n2_short.hex` (ITER=200。AMO/LOCK は 1000/500 のまま。W2 985,091 cy、W4 971,035 cy) にする。理由: ITER=1000 の N=2 は負荷の高い箱で W2 約 35 分、W4 約 2 時間 (wall) で、G0 の時間に収まらない。ITER=1000 の像は `#[ignore]` の `test_{w2,w4}_litmus_full_2hart` に残す (W2 4,021,722 cy、W4 3,955,649 cy)。GT4 の W2 は 5,031,303 cy。
 【未決】(M4) GT4 の W4 は約 140 cy/s で 10 時間級 (N=4 の段差) のため判定していない。表は W4 の GT4 を毎回回す形のままだが、GB4 の W4 と同じく「マイルストーンの末だけ」に改める案をユーザの判断に出す。
+
+【決定】(D11) MM (外部メモリインタフェース、設計書 §MM) は M4 と MD の間のマイルストーンで、AXI4 の slave model と protocol checker (GP) を MM から全 run に入れる。GM は乱数遅延の再走で、MM 以降は GL-B と GT2 short を毎コミット、重いゲートを節目に回す。MD 以降の列は MM を含む。
 
 旧コア (V14) は M6 まで既定コアであり、CLAUDE.md の梯子 1-5 (既定、litmus4、N=2 boot、N=4 boot、hvlinux) をそのまま回し続ける。
 
@@ -69,6 +73,7 @@
 - 新コアだけを変えるコミット: G0。M2-M3 では GL-B が最初の実ゲートになる (旧コアの「N=2 boot が最初の実ゲート」に相当)。
 - メモリ系 (`lsu/`、`mem/`、dcache、MMU、SoC) を変えるコミット: M4 以降は GB4 必須 (設計書 §2.5)、M5 以降は GH も必須。front end と予測器の変更は M4 以降 GB2 必須。新コアの SMP は M4 から存在するので、M3 の dcache 2 ポート化 (bank、ポートごとの tag、MSHR file の構造) は `MSHR_N=N_FILL=1` のまま N=1 のゲート (G0、GA、GL-B、GB1、GX) で検査する。`MSHR_N`/`N_FILL` を 1 より大きくするコミットは、M4 で新コアの GB4 ができた後に限り、1 つずつ GB4 をゲートとする。
 - 共有モジュール (CLINT、csr、SoC、dcache/MMU への追加出力) または V14 に触れるコミット: V14 で梯子 1-5 を回す。共有モジュールの変更は M2 まで追加のみ (設計書 §4.4) なので、V14 の dhrystone/coremark の cycles と instret はビット一致するはずであり、それを受入条件にする。
+- AXI4 の外部メモリポート (設計書 §MM: `mem_ctrl` の外側、write buffer、ID、SoC の DRAM 側ポート) を変えるコミット (MM 以降): メモリ系なので GB4 (W2) 必須。加えて G0 (固定遅延)、GP、GL-B と GT2 short の乱数遅延 (GM)。V14 の枝に触れないことを V14 の dhrystone/coremark のビット一致で確かめる。
 - デバッグの経路 (設計書 §D: commit の `dm_take` と outcome DEBUG、retire 制限、`trig_unit`、trigger の照合、DM、SBA、reset 木) を変えるコミット (MD 以降): G0 (GD を含む) と、DMI idle のビット一致 (§9.3: W2 の GL-B と新コアの bench 4 本)。SBA と hartreset の quiesce はメモリ系として GB4 も通す。trigger の照合や DM の ROM を変えたら GD4 と GG を節目で回す。
 - サイクル予算は早期終了つきの上限であり、理由なく増やさない。ハーネスの載せ替えで予算が足りなくなった場合は、同じハーネスで V14 を測り、その値を根拠として記録してから変える。
 
@@ -803,6 +808,41 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 ### 9.4 M5 での追加
 
 H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed を GD に足す: VS/VU からの halt と dret (dcsr.v、prv)、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV と vector の要素アクセスへの trigger (U39)、Debug Mode での MPRV と MPV。GG は H を持つ target の spike と比べて再び回す。
+
+---
+
+## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
+
+【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
+
+### 10.1 tb の AXI4 slave model
+
+- `tb/axi4_slave_model.veryl` (tb のモジュール)。メモリの内容は他の harness と同じく `$readmemh` の hex を配列に持つ (ROM の置き場所は設計書 U44)。DRAM の配列の base と大きさは `MAP_*` (§2.2) に従う。
+- 遅延と backpressure の parameter (channel ごと): AR と AW の受理の遅れ、R の初回遅延と beat 間の隙間、W の ready の確率、B の遅延、R と B の ID 間の順不同 (同じ ID の中は順序を守る)。乱数は seed を parameter に持つ LFSR で作る。`$random` は使わない。理由: Verilator でも同じ列が出て (GV)、失敗した seed を回帰に固定できる。
+- 設定の名前を 4 つに固定する: `FIXED` (固定遅延。AR と AW は即受理、初回遅延は固定、beat は毎サイクル、W は常に ready)、`SLOW` (遅延が大きい。outstanding が 1 に近い)、`BACKPRESSURE` (遅延は小さく、全 channel の ready を確率で落とす)、`REORDER` (複数 ID の応答が順不同に返る)。各設定は seed を持つ。
+- 単体テスト: model だけを protocol checker の下で駆動する (master 役の tb が合法な取引と、わざと違反した取引を出し、checker が違反を捕まえること)。
+
+### 10.2 固定遅延の設定と cycles の許容
+
+- `FIXED` は MM の前の DRAM の遅延 (L2 miss から最初の beat まで) を再現するように決める。完全な一致は求めない。理由: gather の beat の調停 (bus の rotation) と `DRAM_WAIT` が無くなり、遅延の入り方が変わる。
+- 受入: `FIXED` で、W2/W4 の GL-B (5.15 N=1) と新コアの bench 4 本の cycles が MM の前の値と近いこと。許容幅は最初の測定で決め、本書に記録する (MM の手順 2 の末)。決めた後は、許容を超えるずれは調査の対象にし、乱数設定の cycles は参考値として記録するだけで、ゲートにはしない。
+- 機能の結果 (GL-B の record 数と最終 hash、tohost、x3) は `FIXED` と他の設定で一致しなければならない。cycles を含めて一致を求めるのは V14 だけである。
+
+### 10.3 AXI4 の protocol checker
+
+- tb のモジュール `axi4_mon` が、SoC の AXI4 ポートに常時接続する。違反は sticky flag の群で出し、`$error` や SV の assert は使わない (JIT で panic するため)。flag は `o_chk` に似た形で各 harness の合否に含める (§2.3)。
+- 検査する規則 (master の側と、slave model の側の両方): valid は ready まで下げない。valid のあいだ payload (アドレス、ID、LEN、SIZE、BURST、strb、data、LAST) が変わらない。valid が ready に依存して立たない (ready を待たずに立つ)。`RLAST`、`WLAST` が burst の最後の beat だけに立つ。W の beat 数が `AWLEN + 1` に一致する。INCR の burst が 4 KiB をまたがない。AR と R、AW と B の ID の対応 (応答の無い ID の応答が来ない、同じ ID の順序)。outstanding が param の上限以下。reset 後に valid が 0。
+- 各規則に、わざと違反した取引で flag が立つ単体テストを 1 本付ける (§10.1 の単体テスト)。
+- 判定: G0 を含む新コアの AXI を持つ全 run で、すべての flag が 0。
+
+### 10.4 乱数遅延のゲート (GM) と directed
+
+- directed (設計書 MM.5 の不変条件ごと): I1 は、write の B を遅らせた slave で、同じ line の read を出す (read が古い値を返さない)。I2 は、他 hart が所有する line への write の recall と AW の遅れを重ねる。I3 は、`i_hunc` の読みを、R を遅らせた slave で recall と重ねる。I4 は、gather 中の line に write を入れ、`install_ok` が落ちて L1 が再 fetch すること。I5 は、複数 slot の gather を `REORDER` で順不同に返す。I6 は、各 channel の ready を長く落とした slave で deadlock しないこと。`test/axi/*.S` と `tb/test_axi_*.veryl` に置き、G0 に入れる (N=2 を含む)。
+- GM の run: GL-B (W2 の 5.15 N=1) を `FIXED`、`SLOW`、`BACKPRESSURE`、`REORDER` の各設定で、設定ごとに複数の seed で走らせ、record 数と最終 hash が `FIXED` と一致すること。GT2 short は各設定の複数 seed、GT4 は 1 seed ずつ (禁止結果の hit は memory-model のバグ)。GB2 と GB4 (W2) は `BACKPRESSURE` と `REORDER` を 1 seed ずつ (GB4 は MM の全コミット)。seed の数は MM の最初の測定で、壁時間が梯子の予算に収まるように決めて記録する。
+- GV: AXI の slave model を `veryl build` で SV にし (`sim/verilator/` のラッパから instantiate)、litmus4、N=2、N=4 の boot を `BACKPRESSURE` で走らせる。Verilator は NBA の相互確認で、N=4 の判定には使わない (§6.3 のまま)。
+- 失敗した seed は回帰の一覧 (`test/gates/mm_seeds.list`) に固定して残す。seed だけを変えて通すことはしない (原因を調べる)。
+- 発火 (GF): 設計書 MM.5 の I1 (read を write の B まで止めた回数)、I4 (`install_ok` が落ちた回数)、write buffer 満杯での write grant の停止、AR の停止 (line buffer の確保失敗) の事象を `o_perf` に出し、乱数遅延の run で 0 より大きいことを `fire_check.py` で確かめる。`FIXED` では I1 と I4 が 0 でもよい。
+- V14: 梯子 1-5 と dhrystone/coremark のビット一致 (設計書 MM.7)。V14 の枝の経路は AXI の slave model を通らない。
 
 ---
 

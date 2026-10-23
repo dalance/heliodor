@@ -17,6 +17,7 @@
 - §S SoC とプラットフォーム
 - §V ベクトルユニットの統合
 - §D デバッグ (Debug Specification 1.0)
+- §MM 外部メモリインタフェース (AXI4)
 - リスクと未決事項
 - マイルストーン計画
 - 付録: 旧コアの経緯と防ぐバグ類
@@ -85,6 +86,7 @@
 | D7 | 支援構成は 2-2-2-1-2 と 4-4-6-2-4 (fetch/decode - rename/dispatch - issue - memory ports - commit)。N=4 で生じる per-hart シミュレーション速度の約 8 倍の崖 (N=4 boot 4408 s) は M3 までに原因を特定し、その結果を見て N=4 boot ゲートを両構成で回すかを決める。 |
 | D8 (2026-10-12) | AMO/SC は §L L.11 の方式 B とする。op は最古のまま LOAD_EXCL → 演算 → STORE_EXCL を連続して行い、rd は PASS の後にだけ書く。FAIL または watch の hit は `atomic_unit` の内部で、hart id 全体を seed にした backoff 付きで再試行する。SC の rd は PASS で 0、FAIL で 1。dcache 契約と D5 の待ち行列方式は変えない。帰結: REPLAY の発生源は `lq` だけになる (§5.12 C7)。 |
 | D9 (2026-10-22) | デバッグは RISC-V Debug Specification 1.0 (Sdext + Sdtrig) に従い、OpenOCD/GDB から操作できるようにする。設計は JTAG を持たない: Debug Module は全 hart を受け持つので SoC top (`heliodor_soc_smp`) に置き、DMI のレジスタ空間を APB の slave ポートで出す。JTAG DTM が要るなら SoC を使う側が外に足す。シミュレーションで OpenOCD/GDB を試すための JTAG DTM (Verilator ラッパの DPI による remote_bitbang over TCP) は tb 専用の検証基盤とし、設計には含めない。範囲: (1) core の Debug Mode (haltreq、dcsr.ebreakm/s/u の ebreak、dcsr.step、trigger による入場。dcsr、dpc、dscratch0/1、dret、stepie、stopcount、stoptime)、(2) Debug Module (dmcontrol、dmstatus、hartinfo、abstractcs、command、data、progbuf、hart の選択、halt/resume/ndmreset/hartreset、Access Register (GPR/FPR/CSR)、program buffer の実行)、(3) Sdtrig (mcontrol6 の execute/load/store の address 照合と icount、trigger 数は構成ごとのパラメータで 2-4。M2 の「0 を読む trigger CSR」を置き換える)、(4) System Bus Access、(5) SMP (halt group、hasel/hawindow、haltsum)。新しいマイルストーン MD を M4 と M5 の間に置き、core 側の入場の設計は M4 の中で確定し、H との相互作用 (dcsr.v、prv) は M5 で扱う。範囲外: trace (E-trace/N-trace) と debug の認証。旧コア (V14) はデバッグを持たないまま残す。設計は §D。 |
+| D11 (2026-10-23) | SoC top (`heliodor_soc_smp`) の DRAM 側は、固定遅延を仮定する今の素のポート (`o_dmem_*`、write は応答なし) をやめ、遅延に耐える標準のメモリポート AXI4 にする。FPGA で実物の DRAM controller をつなぎやすくするためで、メモリ側のタイミングはコアの性質ではなく、つないだ slave の性質にする。新しいマイルストーン MM を M4 と MD の間に置く (順序は M4 → MM → MD → M5 → M6)。理由: M4 の手順 4 が mem_ctrl の outstanding (`MSHR_N`、`SPH`) を決め、MD の SBA は mem_ctrl に乗るので、先に遅延耐性のあるインタフェースを作ればやり直しが無い。旧コア (V14) は凍結で、V14 の枝の経路と数値は動かさない。設計は §MM。 |
 
 D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハーネスの arm は統合 SoC の上に載せ替える。V14 の arm は M6 まで旧来の bare ハーネス本体をそのまま保つ。理由: D6 の共存と、`v14_` 改名のビット一致受入 (§4.4) に必要なため。
 
@@ -105,7 +107,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | 深さ規則 1 | FU はレイテンシをパラメータとして公表し、スケジューラはそれだけを見る。 |
 | 深さ規則 2 | 各 writeback ポートを予約制にするか調停制にするかは設計時に決める。 |
 | 深さ規則 3 | op の識別子は op と一緒に運ぶ。ROB head のような生きた状態から読まない。 |
-| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替。 |
+| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MM 外部メモリインタフェース (D11 で追加) → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替。 |
 | 再利用 | dcache/MMU は内部ロジックを再利用し、CPU 側を N ポートで作り直す (インタフェースは最初から N ポート、実装は M1-M2 で 1 ポート、M3 で 2 ポート)。ロジックとして再利用するもの: L2/coherence/mem_ctrl/bus, CSR, FPU, VU, decoder, 周辺, パッケージ, 検証資産。 |
 | golden | `b0f4668`。mtime を retire 命令数で進めるモードと、RVFI 寄せの retire ポートを使う (具体化は D1/D2)。 |
 
@@ -212,6 +214,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | M2 | arch suite、ACT4、5.15 N=1 boot の lockstep (cfg_w2)。 | 推定段階の旧コアバグを directed test で確認済み (D4)。 |
 | M3 | 両構成で N=1 のゲートの梯子を通る (新コアの SMP は M4 から存在する)。N=4 boot ゲートの扱い (D7) をここで決め、M4 から適用する。 | 各軸の sweep で IPC が期待方向に動く。動かない場合は、その原因を §3.4 に天井として登録する。dcache の CPU 側は 2 ポート (bank 化、ポートごとの tag lookup、`fill_id = {index, 世代}` を持つ MSHR file の構造) で、DTLB は lookup 2 ポート。いずれも N=1 のゲートで検査する。支援する `MSHR_N`/`N_FILL` は 1 のまま。cy/s を記録している。 |
 | M4 | litmus N=2/N=4、N=2/N=4 boot。 | メモリ系を変更した場合は N=4 boot を必須とする。`MSHR_N`/`N_FILL` を 1 より大きくするのは、新コアの N=4 boot ができた後に限り、そのコミットはすべて N=4 boot をゲートとする。 |
+| MM | 新コアの SoC の DRAM 側が AXI4 の master になり、固定遅延の設定と、遅延と backpressure を乱数で振った設定の両方で、GL-B の record 列と最終 hash が一致する。G0、GT2/GT4、GB2、GB4 (W2) が乱数遅延で通る。AXI の protocol checker の違反が 0。V14 の dhrystone/coremark がビット一致する。 | `mem_ctrl` に固定サイクルの仮定が残らない (slave を差し替えても機能が変わらない)。新しいモジュールが cold-reader gate を通過。knob 0 個。メモリ系の変更なので全コミットが GB4 (W2) を通る。 |
 | MD | DMI を駆動する directed test (N=1、N=4、GD)、OpenOCD+GDB による riscv-tests の debug suite (GG、spike と同じ範囲)。DMI が idle のとき M4 までのゲートの結果が MD の前とビット一致する。 | §D の新規モジュールが cold-reader gate を通過。knob 0 個。`chk_debug` と `chk_dm` がすべてのテストで 0。§D.15 の事象が GF で 0 より大きい。 |
 | M5 | hvlinux、vector のテスト群。 | VU の上限を修正するか宣言する (§3.4)。 |
 | M6 | 既定コアを切り替える。旧コアを削除する (`src/v14/` を消す)。 | M6 での変更は、削除と既定値の変更だけ。 |
@@ -3582,6 +3585,8 @@ L1 から見た mem_ctrl の read channel の規約を、コアの外部契約�
 - coherence: `probe` と `probe_ack` (pin による延期は 64 サイクル以内)、directory から来る precise な `inv`/`inv2`。
 - 不変条件 (所有者 mem_ctrl と L1。§M.4 と同じ): accept の grant は必ず L1 の fill の開始と一致する。要求者は accept まで要求を保持し続ける (落とすと 64 サイクルの aging がリセットされる、3da1aa2)。STREAM の beat の受理を自分の要求で gate しない (9d9f013)。
 
+- 【決定】(D11) 以上は L1 から mem_ctrl への内側の契約で、MM の後も変わらない。変わるのは mem_ctrl の外側 (DRAM 側の `o_mem_*` と write の外部ポート) で、新コアの枝では AXI4 になる (§MM)。
+
 ### S.4 I read slot の非 DRAM ルーティング (M1a の前提作業)
 
 - 現状: SoC は I slot の `mc_dram` を `1'b1` に固定している (`heliodor_soc_smp.veryl:447`)。I slot は常に DRAM の line 読みであり、ROM からの fetch は `o_imem` のパススルーで tb が直接返している (`tb/test_soc_smp_linux_boot.veryl:132-137`)。新コアは `o_imem` を持たない (§4.5) ので、このままでは ROM から 1 命令も fetch できない。reset PC が ROM にある boot 系 (GL-B、GB1) と smode_plic がすべて止まる。
@@ -3627,6 +3632,7 @@ MD の行を除き、どれも §3.4 に載っている。
 | M1b | `CORE=W2/W4` の枝 (新コアの instantiate と `pma_check` によるデコード) |
 | M2 | 新コアでの boot と smode_plic (ROM fetch、割込みの pin、`i_ext_irq_src`)、`chk_io_mon` の有効化。済み: S.5 の M2 の追加と U28 の single beat (S.3)。smode_plic の新コア枝は ROM ではなく DRAM から走らせる (検証計画 §2.4) |
 | M4 | PLIC claim の競合の directed test (検証計画 §8) |
+| MM | 新コアの枝の DRAM 側ポートを AXI4 master に置き換える (§MM)。`mem_ctrl` の read gather と write path をハンドシェイクで駆動する。ROM と MMIO のデコードは SoC に残す。V14 の枝は旧ポートのまま |
 | MD | DM (`dmi_apb`、`dm`、`dm_mem`、`dm_sba`)、APB のポートと `i_dm_rst`、`DM_BASE` と DM の PMA 領域、ndmreset と hartreset の reset 木、CLINT の `i_time_stop`、mem_ctrl の SBA の経路 (U33)、`o_dm_obs` (§D) |
 | M6 | V14 の枝の削除 |
 
@@ -4102,7 +4108,7 @@ ROM の手順 (命令列は U38 で決める。spike の DM と同じ流れ):
 - `dm_sba` は spec の sbcs (sbversion 1、sbaccess 8/16/32/64、sbreadonaddr、sbreadondata、sbautoincrement、sbbusy、sbbusyerror、sberror)、sbaddress0/1、sbdata0/1 を持ち、アクセスを 1 つずつ出す。sbasize は PA の幅 56 (§5.1)。
 - 経路: DRAM の番地は mem_ctrl の uncached な single-beat の経路で読み書きし、非 DRAM の番地 (CLINT、PLIC、UART、ROM) は memory_bus の read/write channel を通す (§S.3 の非 DRAM の読みと同じ)。DRAM の読みは、他の L1 が所有する line を recall してから読む。【M4 手順 7 で確定】M4 で入れた `mem_ctrl` の `i_hunc=1` の 1 beat の読み (§5.11 の U28、§S.3) をそのまま使えばよい。`i_iread` の line 読みではない (line は転送せず、sharer にも L2 にも入らない)。DRAM の書き込みは、所有者の recall の後に書き、sharer を invalidate する (hart の write-through と同じ義務、§S.3)。
 - 依存: DRAM の uncached 読みで他 hart の dirty コピーを recall することは、M4 に残した U28 の残り (§5.11) である。M4 手順 7 で入った (DRAM の読み側)。MD はそれを前提にする (D.16)。SBA の書き込み側の recall (所有者の recall の後に書き、sharer を invalidate する) は未検証である。MD で directed test を書く。
-- mem_ctrl への接続形は U33 (推奨は SBA 専用の slot を 1 本足す形)。
+- mem_ctrl への接続形は U33 (推奨は SBA 専用の slot を 1 本足す形)。MM の後は、SBA の DRAM アクセスも他の slot と同じ AXI4 の ID 空間に乗る (§MM.3)。
 - エラー: hole と DM 領域は `sberror = 2`、size に整列していない番地は 3、128 bit の要求は 4。bus は必ず応答するので timeout (1) は起きない。
 - SBA は走っている hart と並行に動いてよく、coherent な追加の agent として振る舞う。SBA の書き込みと hart の store の間の順序は保証しない (spec どおり)。
 
@@ -4168,6 +4174,88 @@ ROM の手順 (命令列は U38 で決める。spike の DM と同じ流れ):
 ### D.17 旧コアとの関係
 
 V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は DM を instantiate せず、APB のポートは `pready = 1`、`prdata = 0`、`pslverr = 0` を返す。CLINT の `i_time_stop` と mem_ctrl の SBA の経路は V14 の枝で 0 に固定し、V14 の dhrystone/coremark のビット一致で確かめる (§4.4)。
+
+---
+
+## §MM 外部メモリインタフェース (AXI4)
+
+本章は SoC top (`heliodor_soc_smp`) の DRAM 側を、固定遅延を仮定する素のポートから AXI4 の master に替える設計を定める。根拠はユーザ決定 D11 (§1.4) である。実装はマイルストーン MM (M4 と MD の間) で行う。§S.3 (mem_ctrl の slot プロトコル)、§M.4 (L1 が守る義務)、§M.6 (MSHR_N と SPH)、§D.11 (SBA) を前提とし、ここではそれに足すものだけを書く。L1 から mem_ctrl への内側の契約 (accept、STREAM、write-grant veto、recall、`i_hunc` の hold) は変えない。変えるのは mem_ctrl の外側である。
+
+### MM.0 動機と範囲
+
+- 現状 (ソースで確認済み): SoC の DRAM 側は `o_dmem_addr`/`o_dmem_ren`/`i_dmem_rdata`/`o_dmem_wen`/`o_dmem_wdata[8]`/`o_dmem_wstrb[8]` で、valid/ready も応答の handshake も無い。`mem_ctrl` の `o_mem_addr`/`o_mem_ren`/`i_mem_rdata` は line を 1 サイクル 1 dword で gather し、`i_mem_rdata` を決まったサイクルに取り込む。write には受理の応答が無い。DRAM の遅延は tb の配列が決め、コアはそれを前提に書かれている。これでは FPGA で実物の DRAM controller (遅延が可変で、backpressure があり、応答が順不同になりうる) をつなげない。
+- 【決定】(D11) 新コアの枝の DRAM 側ポートを AXI4 にする: ID、line 転送は INCR burst、AR/R/AW/W/B の 5 channel が独立に valid/ready を持つ、`mem_ctrl` と MSHR の容量までの複数 outstanding、write には B 応答。メモリ側のタイミングはコアの性質ではなく slave の性質になる。
+- 範囲: (1) `mem_ctrl` の read gather と write path をハンドシェイク駆動にし、固定サイクルの仮定を残さず、どの channel の backpressure も尊重する。(2) ROM と MMIO のデコードは SoC に残す (MM.6)。(3) 順序と一貫性の不変条件をハンドシェイク上で言い直す (MM.5)。(4) V14 の枝は旧ポートのまま (MM.7)。
+- 範囲外: クロックドメインをまたぐ橋 (U49)、FPGA の DRAM controller の選定 (U48)、AXI4 の exclusive access (原子操作は L1 の MESI が持つので `AxLOCK` は常に 0)、AXI の error 応答を access fault として commit に届ける経路 (U46 の推奨は sticky な観測だけ)。
+
+### MM.1 SoC top のポート
+
+- 【決定】新コアの枝の DRAM 側は AXI4 の master ポート 1 組である。幅は param `AXI_ID_W` (MM.3 の導出値)、`AXI_ADDR_W` (PA の幅、§5.1)、`AXI_DATA_W` (U41 の推奨は 64) で与え、ポートは Veryl の interface (`axi4_if`、modport の master/slave) にまとめる。理由: 5 channel の信号を平らに並べると、SoC の top と tb の slave でポートの対応を人が確かめることになり、可読性 (§2.3) を損なう。
+- line の取引は `AxLEN = 7`、`AxSIZE = 3`、`AxBURST = INCR`、line 境界から始める (4 KiB をまたがない)。uncached の 1 beat (§S.3 の `i_hunc=1` と、`i_hdram=0` の DRAM 内アクセス) は `AxLEN = 0` で、write の byte は `WSTRB` が決める。`AxLOCK = 0`、`AxPROT`、`AxCACHE`、`AxQOS` は定数 (値は U41)。
+- 【決定】critical-word-first は mem_ctrl の内側が持つ (§S.3 の STREAM が `i_haddr[5:3]` の dword を選ぶ)。AXI の側は常に line 境界から読み、line 全部を slot の buffer に集めてから STREAM に入る。理由: WRAP burst は slave の対応に依存し、line の install は全部そろってからにしたいので得が無い。
+- 旧ポート `o_dmem_*` は V14 の枝のためだけに残り、新コアの枝では 0 に固定する (U45)。`o_imem_*` と `o_iptw_*` は §4.5 と §S.4 のとおり新コアの枝には元から無く (I fetch は I slot、I-PTW は memory port 0)、MM で足すものも消すものも無い。
+
+### MM.2 mem_ctrl の read path
+
+- 【決定】read gather を R channel 駆動にする。slot が line の読みを accept し、L2 が miss だったら、固定サイクルの遅延モデル (`DRAM_WAIT`) を待たずに AR を出す。`ARVALID` は `ARREADY` まで保持する。R の beat は slot の line buffer に、到着した順に `gcnt` で書く。`DRAM_WAIT` と、DRAM 向けの bus read channel の rotation による beat の調停は無くなる。
+- 【決定】`RREADY` は、AR を発行した時点で確保した slot 専用の line buffer に書く限り、常に 1 とする。理由: R を mem_ctrl の都合で止めると、R の経路が L2 の install や recall の進行に依存し、deadlock の経路が増える。buffer を AR の発行時に確保すれば、R に backpressure をかける必要が構造的に無くなる。確保できないあいだは AR を出さない (これが AR の backpressure の唯一の源)。
+- 取引は `RLAST` と beat 数の一致で終わる。`RRESP != OKAY` は U46 に従う。
+- `ST_UNC` の読み (§5.11 U28) は同じ AR で `AxLEN = 0`。`o_hhold` は R が返るまで保つ (MM.5 の I3)。
+- 「accept の grant は必ず L1 の fill の開始と一致する」(§S.3 の不変条件) は accept の時点で決まり、AR の発行より前なので、AR が遅れても崩れない。AR が遅れると L1 の FILL の待ちが長くなるだけである。
+
+### MM.3 ID と outstanding
+
+- 【決定】read の ID は `{slot, mshr index}` から導出する。slot 数は `N_SLOTS = N_HARTS * SPH` (MD 以降は SBA の slot が 1 本増える、U33)、mshr index は `MSHR_N` (§M.6.4)。`AXI_ID_W` はこの積から導出し、幅 0 を作らない (§5.1 の helper)。同じ ID の read は slave が順序を守る (AXI の規則)。異なる ID の応答は順不同でよく、slot が独立に進む今の構造のままである。選択は U42 で確かめる。
+- 【決定】read の outstanding は slot の line buffer の本数 (`N_SLOTS` と `MSHR_N` の積) までで、param `AXI_RD_OUT` で下げられる。上限は §3.4 に宣言する。
+- write の ID と outstanding は MM.4。
+- AXI の規則のうち master が守る側 (valid の保持、payload の安定、valid が ready に依存しないこと、`xLAST`) は、検証計画 §10.3 の protocol checker が検査する。
+
+### MM.4 write path
+
+- 現状: write は 8 dword lane と strobe の posted な 1 サイクルの取引で、grant が返れば DRAM に届いたものとして扱う (§S.3)。
+- 【決定】grant の意味を「DRAM に届いた」から「mem_ctrl の write buffer に入った」に替える。write buffer は line 単位の entry を `WB_N` 本持ち (U42)、空きが無いあいだは write grant を出さない (SoC の既存の write 調停の backpressure に載る)。entry は AW と W を独立に出し、`AWVALID` と `WVALID` は相手の ready を待たずに立てる (AXI の規則)。W は 8 beat で `WLAST` を立てる。B は ID ごとに数え、entry は B を受けて解放する。
+- 【決定】B の用途は 3 つだけである: (1) entry の解放。(2) 同じ line の read との順序 (MM.5 の I1)。(3) 「write がすべて DRAM に届いた」ことを待つ quiesce (hartreset、U32)。FENCE.I と SB の drain は L1 の中で閉じていて B を待たない。io_ordered な DRAM 内の store (Svpbmt IO、§5.14) の完了を B にするかは U43。
+- write の ID は hart 番号 (SBA は専用の 1 つ) とする。同じ ID の write は slave が順序を守るので、同じ hart の同じ line への 2 回の write は AW の順に届く。
+- 現行の `o_mem_busy` (gather の beat のあいだ SoC が write を止める) は不要になる。read と write は別 channel で、両者の衝突は MM.5 の I1 だけが扱う。
+
+### MM.5 順序と一貫性の不変条件 (ハンドシェイク上)
+
+所有者はすべて `mem_ctrl` (と SoC の write 調停)。検査は検証計画 §10.3 と §10.4。
+
+- I1 (read と write の hazard): AR と AW は別 channel で、slave は両者の順序を保証しない。したがって、ある line について write buffer の entry が残っている (B が未着の) あいだは、その line の AR を出さない。理由: 先に出した write を後の read が追い越すと、古い値を install する。固定遅延では write が 1 サイクルで届いていたので、この規則は要らなかった。
+- I2 (write-grant veto と recall): 他 hart が所有する line への非 WB の write は、recall が済んでから write buffer に入る (veto の判定は write buffer の入口、grant の前)。AXI 側の遅延は veto の順序に影響しない。recall の返答の WB は、home が merge してから ownership を clear する順序を保つ (merge は write buffer に入った時点で完了とし、DRAM への到達を待たない。その line の以後の read は I1 が守る)。
+- I3 (`i_hunc` の hold): `o_hhold` は recall が必要なあいだと、ST_UNC の AR を出してから R が返るまで立てたままにする。要求者は accept まで要求を保持する (§S.3)。
+- I4 (gather と write の競合、install_ok): gather 中の line に write が入ったら `install_ok` を落とす (今の規則)。窓は AR の発行から最後の R までで、固定遅延のときより長いので、L1 の fill-abort と再 fetch の経路が通る回数が増える。設計どおりで、乱数遅延の run で発火することを GF で確かめる。
+- I5 (L2 の install と victim の recall): install は line buffer がそろってから 1 回、既存の規則のとおり。AXI の応答の順序は install の直列化に影響しない (gather は slot ごとの buffer、install は 1 本ずつ)。
+- I6 (forward progress): 各 channel の ready は、slave が有限サイクルで立てることだけを前提にする。master 側は `RREADY` を MM.2 のとおり常に 1 にし、`BREADY` も 1 にする。master が自分の都合で slave の応答を止めないので、mem_ctrl の側に循環待ちは生じない。
+
+### MM.6 ROM、MMIO、tb 供給のポート
+
+- 【決定】アドレスのデコードは今までどおり SoC が `pma_pkg::pma_check(PMA_REGIONS)` で 1 か所で行う (§5.11 PM1)。CLINT、PLIC、UART、DM は SoC の内側の slave で、AXI を通らない。DRAM と ROM の置き場所は U44 で決める (推奨: ROM も AXI の側の領域とし、内容は slave が持つ)。
+- tb が直接返す固定タイミングの副ポート (`o_imem_*`、`o_iptw_*`) は、新コアの枝に元から無い (MM.1)。MM が新コアの枝から取り除くのは `o_dmem_*` の DRAM と ROM の読み書きの経路で、tb 供給の固定タイミングのポートは残らない。
+
+### MM.7 V14 との関係
+
+- 【決定】V14 は凍結である。V14 の枝の DRAM の経路 (`o_dmem_*` とその配線) は変えない。V14 の数値 (dhrystone/coremark の cycles と instret、梯子 1-5) はビット一致のままにする。
+- `mem_ctrl` と `memory_bus` は V14 と新コアが共有する (D3)。MM で `mem_ctrl` の外側を変えるので、共有モジュールの変更の規則 (§4.4) に従い、V14 の枝に触れない形にする。形は U45: (a) 共有の `mem_ctrl` に AXI の外側と旧ポートの外側を両方持たせ、CORE で選ぶ、(b) 旧ポートを `mem_ctrl` の外側の固定遅延 adapter に分け、V14 の枝だけがそれを使う。どちらでも V14 の dhrystone/coremark のビット一致を受入条件にする。
+- M6 で V14 の枝を削除すると、旧ポートと固定遅延の経路も消える。
+
+### MM.8 検証の要約
+
+詳細は検証計画 §10。ここでは設計側が要求するものだけを挙げる。
+
+- tb の AXI4 slave model (遅延と backpressure を parameter と seed で振れる。固定遅延の設定を持つ) と、AXI4 の protocol checker。
+- 既存のゲートを乱数遅延で再走する: GL-B (record と hash は固定遅延と一致、cycles は変わってよい)、GT2/GT4、GB2、GB4 (W2)、GV (Verilator)。
+- 固定遅延の設定は MM の前の cycles に近い値を再現する。完全な一致は求めない (mem_ctrl の gather と bus の rotation が無くなり、遅延の入り方が変わる)。許容の幅は検証計画 §10.2。
+
+### MM.9 マイルストーンごとの範囲
+
+| M | §MM が出荷するもの |
+|---|---|
+| M4 | (前提) `MSHR_N`、`SPH` の値を決める (手順 4)。MM の ID 幅と buffer の本数はそれから導出する |
+| MM | MM.1-MM.7 の全部と検証計画 §10 のゲート |
+| MD | SBA の slot が AXI の ID 空間に 1 つ加わる (§D.11、U33)。MM の構造は変えない |
+| M6 | V14 の枝と一緒に旧ポートと固定遅延の経路を削除 |
 
 ---
 
@@ -4325,9 +4413,24 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
   - (3) gdbserver の target の timeout を sim の速度に合わせて伸ばす。それでも遅ければ、tb の DTM の transport を OpenOCD の `jtag_dpi` (scan 単位の転送) に替える (U36)。どちらも tb だけの変更で、設計は変わらない。
   - (4) 除外表 (U37) には、持たない optional 機能に結び付いたテストだけを載せ、不具合を除外で隠さない。
 
+#### R11. 遅延耐性のある外部インタフェースが、固定遅延が隠していた順序の穴を開ける
+
+- 内容: MM は DRAM 側を AXI4 にし、遅延と応答の順序を slave に任せる。固定遅延では write が 1 サイクルで届き、read が write を追い越せなかったので、AR と AW の順序、write の B の前に read が出る窓、gather 中の line への write (install_ok)、応答の順不同は一度も試されていない。また、旧コアでは N=1 のビット一致が N=4 boot の正しさを含意しなかった (§2.5 の M4 行、検証計画 §1.3) ので、N=1 の GL-B が一致しても SMP でライブロックしうる。
+- 所有: MM。
+- 早期警報:
+  - 乱数遅延の GL-B で record または hash が固定遅延の run と食い違う。
+  - GB2 または GB4 (W2) が乱数遅延の seed によって timeout する。
+  - AXI の protocol checker の違反 (valid の取り下げ、payload の変化、`xLAST` の誤り)。
+  - litmus N=2/N=4 の禁止結果。
+- 緩和策:
+  - (1) slave model の遅延と backpressure を seed 付きで乱数にし、固定遅延の設定との差を機能の差として扱う (検証計画 §10.1)。
+  - (2) 順序の不変条件 (MM.5 の I1-I6) を 1 つずつ directed test にし、先に slave model の最悪の遅延の設定で当てる (検証計画 §10.4)。
+  - (3) メモリ系なので MM の全コミットを GB4 (W2) のゲートにする (§2.5)。
+  - (4) 失敗した seed は固定して回帰に加える。
+
 ### 未決事項の一覧
 
-出所の列: 「§n」は第 0 部の該当箇所にある【M<n> で決定】、「D7」は第 0 部 §1.4 のユーザ決定に付いた期限、「調査:」は M0 の調査で答えが出なかった問い (括弧内はその分野)。調査の問いのうち、第 0 部で解決済みのものと、ある章に明確に属するものは載せない。本書に残る【要判断】は無い。U3 は採用済み、U1/U2/U4/U6/U7/U8/U13/U15/U17/U18/U19/U20/U21/U22/U23/U24/U25/U26/U27/U28/U29 は決定済み、U16 は M5 の後に送ってあり、それ以外は【M<n> で決定】である。U32-U38 は D9 で足したデバッグの項目で期限は MD (U36 は MD の開始時)、U39 はその M5 分である。
+出所の列: 「§n」は第 0 部の該当箇所にある【M<n> で決定】、「D7」は第 0 部 §1.4 のユーザ決定に付いた期限、「調査:」は M0 の調査で答えが出なかった問い (括弧内はその分野)。調査の問いのうち、第 0 部で解決済みのものと、ある章に明確に属するものは載せない。本書に残る【要判断】は無い。U3 は採用済み、U1/U2/U4/U6/U7/U8/U13/U15/U17/U18/U19/U20/U21/U22/U23/U24/U25/U26/U27/U28/U29 は決定済み、U16 は M5 の後に送ってあり、それ以外は【M<n> で決定】である。U32-U38 は D9 で足したデバッグの項目で期限は MD (U36 は MD の開始時)、U39 はその M5 分である。U41-U49 は D11 で足した外部メモリインタフェースの項目で期限は MM (U45 は MM の開始時) である。
 
 | # | 項目 | 出所 | 期限 | 何を測るか / 選択肢と推奨 |
 |---|---|---|---|---|
@@ -4370,12 +4473,21 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 | U37 | gdbserver.py の除外表 | 検証計画 §9.2 | MD の末 | 推奨: `test/debug/heliodor_excludes.yaml` に commit し、各行を持たない optional 機能 (Access Memory、Quick Access、aarpostincrement、data value の trigger、textra、128 bit) か spike との意図した差に結び付ける。不具合を除外で隠さない。spike で通るテストが heliodor で落ち、除外の理由が無ければ MD の出口を満たさない。 |
 | U38 | `DM_BASE`、debug memory の配置、ROM と生成コードの命令列、`hartinfo.nscratch` | §D.7、§S.2 | MD | 推奨: `DM_BASE = 0x0000_4000` (boot ROM の直後で、どの map でも空いている)。DM code と DM data を 4 KiB ずつ、ROM の base register から ±2 KiB に収める配置。ROM は s0/s1 を dscratch0/1 に退避し、ABS に入る前に戻す (spike の DM と同じ流れ)。`nscratch` は生成コードが使わずに済む本数で、推奨 1。測るもの: gdbserver suite の register と progbuf のテストが spike と同じ結果になること。 |
 | U39 | VU の要素アクセスの trigger (M5) | §D.6、§D.16 | M5 | 推奨: `vu_mem_adapter` で要素ごとに load/store の照合を行い、一致した要素の手前で precise fault と同じく vstart を残して受け付ける (§V)。代案は vector の op を照合の対象外と宣言することだが、spec の load/store の照合は vector を除外しない。測るもの: V のテスト群と、vector の memcpy に watchpoint を置く directed。 |
+| U41 | AXI4 のデータ幅、burst の形、属性 | §MM.1 | MM | 推奨: `AXI_DATA_W = 64`、line は `AxLEN = 7` の INCR (line 境界から)、uncached の 1 beat は `AxLEN = 0`。`AxLOCK = 0`、`AxPROT = 0`、`AxCACHE = 4'b0011` (Normal Non-cacheable Bufferable)、`AxQOS = 0`。line 幅 (512 bit) は選ばない。理由: 内側の STREAM が 64 bit/beat で、FPGA の DRAM controller の幅は AXI の width converter で吸収できる。測るもの: 固定遅延の設定で line の gather が MM の前の cycles に近いこと (検証計画 §10.2)。 |
+| U42 | ID の割り当て、read の outstanding 数、write buffer の本数 `WB_N` | §MM.3、§MM.4 | MM | 推奨: read の ID は `{slot, mshr index}`、outstanding は `N_SLOTS` と `MSHR_N` の積まで。write の ID は hart 番号 (SBA は専用に 1 つ) で、`WB_N` は hart あたり 2 本から始める。測るもの: 乱数遅延の GL-B と bench で、write buffer 満杯による write grant の停止と AR の停止の回数 (`o_perf`)。停止が支配的なら `WB_N` を sweep する。 |
+| U43 | io_ordered な DRAM 内の store (Svpbmt IO) と、write 全体の「届いた」の完了を B にするか | §MM.4、§5.14 | MM | 推奨: 通常の cacheable な write の grant は write buffer への受理、Svpbmt IO の DRAM 内 store の完了だけ B の応答にする (後続の IO load との順序を保つため)。代案: すべて受理の grant。測るもの: IO の DRAM 内 store の発生数 (5.15 boot で 0 に近い)。順序が変わるかを directed test (`io_ordered` の store の後の load) で確かめる。 |
+| U44 | ROM の置き場所 | §MM.6 | MM | 推奨: ROM も AXI の側の領域にし、内容は slave が持つ (tb の model は hex を読む)。代案: SoC の内側の ROM モジュール (`INIT` の hex を param に持つ)。測るもの: 新コアの uncached の ROM fetch (M4 の持ち越し (a)) の AXI での遅延と、boot の cycles。FPGA では BRAM の slave を AXI につなぐ。 |
+| U45 | V14 の枝との共存の形 | §MM.7 | MM の開始時 | 選択肢: (a) 共有の `mem_ctrl` が AXI の外側と旧ポートの外側を両方持ち CORE で選ぶ、(b) 旧ポートを外側の固定遅延 adapter に分け、V14 の枝だけがそれを使う。推奨は (b)。理由: 共有モジュールに CORE の分岐を増やさず、M6 で adapter ごと消せる。どちらでも V14 の dhrystone/coremark の cycles と instret のビット一致と梯子 1-5 を受入条件にする。 |
+| U46 | AXI の error 応答 (SLVERR/DECERR) の扱い | §MM.2 | MM | 推奨: MM では sticky な観測 (`o_perf` と `chk`) に出すだけで、access fault として commit には届けない。理由: 今の設計に bus error の経路が無く (bus は必ず応答する、§D.11)、足すと §5.8 の例外の経路が増える。ユーザの判断で FPGA の実機の段階で再検討する。 |
+| U47 | 簡単な AXI4-to-SRAM / FPGA 向けの例の wrapper を足すか | §MM | MM の末 | 推奨: 足す。合成できる単純な slave (ID 付き、順序は ID ごと、BRAM 相当) を `src/peripheral/` に置き、tb の model と同じ AXI の規則で検査し、Verilator の GV でも使う。理由: ポートの使い方の例と、FPGA の最初の bring-up の足がかりになる。足さない場合は tb の model だけを持つ。 |
+| U48 | FPGA の DRAM controller の対象 (MIG、LiteDRAM など) | §MM.0、P11 | P11 (MM では決めない) | 推奨: MM では選ばず、ポートを汎用の AXI4 に保つ。選定は FPGA の段階 (将来の Phase の P11) でユーザが行う。MM の出口は「標準の AXI4 slave ならつながる」ことまでで、特定の controller での動作は主張しない。 |
+| U49 | クロックドメインをまたぐ橋 | §MM.0 | MM (記録だけ) | 推奨: MM の範囲外。SoC top は単一クロックで、AXI の master も同じクロックである。controller が別クロックなら、利用者が AXI の async FIFO か vendor の clock converter を外に足す。MM は単一クロックを前提に書き、設計に CDC を持ち込まない。 |
 
 ---
 
 ## マイルストーン計画
 
-本章は本文の最後の章であり、M0-M6 と MD (D9 で M4 と M5 の間に足したデバッグのマイルストーン。既存の番号を動かさないため番号ではなく MD と呼ぶ) の各マイルストーンについて、目標、作業の順序、実装する章とモジュール、出口条件 (ゲート)、そのマイルストーンの中で決める事項をまとめる。出口条件のゲート ID は検証計画 §1.1、構成ごとの投入時期は検証計画 §1.2、機能ゲートと構造ゲートの区分は第 0 部 §2.5 に従う。各章の出荷範囲の表 (§F.11、§R.7、§X.12、§C.0、§L.18、§M.1、§S.8、§V.11、§D.16) は本章の要約の正本であり、ここではそれを順序と出口に並べ直すだけで、範囲を足しも削りもしない。決定事項の番号 U<n> は「リスクと未決事項」章の一覧のものである。
+本章は本文の最後の章であり、M0-M6 と MM (D11 で M4 と MD の間に足した外部メモリインタフェースのマイルストーン)、MD (D9 で M4 と M5 の間に足したデバッグのマイルストーン。既存の番号を動かさないため番号ではなく MD と呼ぶ) の各マイルストーンについて、目標、作業の順序、実装する章とモジュール、出口条件 (ゲート)、そのマイルストーンの中で決める事項をまとめる。出口条件のゲート ID は検証計画 §1.1、構成ごとの投入時期は検証計画 §1.2、機能ゲートと構造ゲートの区分は第 0 部 §2.5 に従う。各章の出荷範囲の表 (§F.11、§R.7、§X.12、§C.0、§L.18、§M.1、§S.8、§V.11、§D.16、§MM.9) は本章の要約の正本であり、ここではそれを順序と出口に並べ直すだけで、範囲を足しも削りもしない。決定事項の番号 U<n> は「リスクと未決事項」章の一覧のものである。
 
 全マイルストーンに共通する規則:
 
@@ -4635,6 +4747,36 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 | 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。 |
 
 M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11)、fill の victim 選択から pin 中の line を除外するか (§L.12)、`MSHR_N` の値 (§M.6.4)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16)。
+
+### MM: 外部メモリインタフェース
+
+目標: SoC top の DRAM 側を遅延耐性のある AXI4 の master にし、メモリ側のタイミングを slave の性質にする (D11、§MM)。固定遅延の設定で、MM の前の cycles に近い値を再現する。V14 の数値は動かさない。
+
+M4 の後、MD の前に置く理由: M4 の手順 4 が mem_ctrl の outstanding (`MSHR_N`、`SPH`) を決め、MD の SBA は mem_ctrl に乗る。MM を M4 の後に置くと ID と buffer の本数が最終値から導出でき、MD の SBA を最初から AXI の上に作れる。M4 の手順 4-6 が残っていても MM の設計は着手できるが、MM の出荷は手順 4 の値が決まった後である。
+
+作業の順序:
+
+1. tb の AXI4 slave model と protocol checker を、単体テストで作る (検証計画 §10.1、§10.3)。固定遅延、乱数遅延、乱数の backpressure の各設定。
+2. U45 を決め、`axi4_if` と SoC の AXI4 ポートを足す。新コアの枝の DRAM 側を固定遅延の slave につなぎ、旧ポートの経路と同じ結果 (G0 と GL-B の hash) を出す。
+3. `mem_ctrl` の read path を AR/R に替える (MM.2)。ID と buffer の確保 (MM.3)、固定サイクルの仮定の撤去。
+4. write path を write buffer と AW/W/B に替える (MM.4)。I1 の hazard の規則と directed test。
+5. uncached の 1 beat (`ST_UNC`、`i_hunc`) と、U43 の IO store、U44 の ROM の経路。
+6. 乱数遅延と backpressure で、既存のゲートを再走する (検証計画 §10.4)。seed を増やし、失敗した seed を回帰に固定する。
+7. (U47 を採るなら) AXI4-to-SRAM の例の wrapper と、Verilator の GV での使用。
+8. §S.3 の外側の説明と §3.4 の上限を更新する。
+
+実装する範囲: §MM.9 の MM 行と §S.8 の MM 行。
+
+出口条件:
+
+| 区分 | 条件 |
+|---|---|
+| 機能 (W2, W4) | G0 (固定遅延) が全 pass。GL-B の record 数と最終 hash が、固定遅延と乱数遅延の複数の seed のすべてで MM の前と一致する (cycles は変わってよい)。GT2 (short)、GT4 が乱数遅延で通る。GB2 が乱数遅延で通る。GB4 (W2) が乱数遅延で通る (W4 は末に)。GV: Verilator の litmus4、N=2、N=4 の boot が乱数遅延で通る。AXI の protocol checker の違反が全ゲートで 0。 |
+| 固定遅延 | 固定遅延の設定の W2/W4 の GL-B と bench の cycles が MM の前に近い (許容は検証計画 §10.2)。 |
+| 構造 | `mem_ctrl` に固定サイクルの仮定が残らない (slave の遅延を変えても機能が変わらない)。AXI の新規モジュールが cold-reader gate を通過。knob 0 個。メモリ系の変更なので、全コミットが GB4 (W2) を通っている。GS を記録。 |
+| V14 | 共有モジュール (SoC、mem_ctrl) に触れたので、梯子 1-5 が緑で dhrystone/coremark がビット一致。 |
+
+MM で決める事項: U41 (幅と属性)、U42 (ID、outstanding、`WB_N`)、U43 (IO store の完了)、U44 (ROM)、U45 (V14 との共存、MM の開始時)、U46 (error 応答)、U47 (例の wrapper、MM の末)。U48 (FPGA の controller) と U49 (CDC) は MM では決めず、記録だけを残す。
 
 ### MD: デバッグ
 
