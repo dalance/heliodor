@@ -4757,7 +4757,7 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 6. Debug Mode の入場の設計を commit/trap で確定する (§D.4、§D.5、§D.16)。RTL は MD で入れる (DEAD scaffolding を作らない)。確定するもの: outcome DEBUG と `RedirKind::DEBUG`、非同期の入場 `dm_take` を割込みと同じ受付点に置き token の抑止を共通の項にすること、retire 制限を lockstep・step・icount の合成 1 項にすること、`ExcRec` の `dm`/`trig`/`trig_hit` と `exc_prio` での trigger の位置、xRET 種別の 2 bit 化。M4 の手順 1-5 で足す取り消せない操作 (ASQ を採るならそれ) が §5.13.1 の表に載り、`head_started_q` の有界性と `ordering_empty` の意味 (queued atomic を含む) を保つことを、この確定のレビューで確かめる。
 7. SBA (MD) の前提として、U28 の残り (DRAM の uncached 読みの前に他 hart の dirty コピーを recall する) を入れる (§5.11、§D.11)。
 
-進捗 (2026-10-24): 手順 1、2、3、4、6、7 は完了。手順 5 (ASQ と victim 除外のブランチ実験、N=4 での SB の占有の測定) は残り。マイルストーン末に残るのは W4 の GB2/GB4/GT4 と、6.6/7.1 の SMP boot である。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) での W2 の GB4 は 24,922,839 サイクルで pass、`MSHR_N = 2` では 24,808,238 で pass (checker はすべて 0)。
+進捗 (2026-10-24): 手順 1 から 7 はすべて完了。マイルストーン末に残るのは W4 の GB2/GB4/GT4 と、6.6/7.1 の SMP boot である。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) での W2 の GB4 は 24,922,839 サイクルで pass、`MSHR_N = 2` では 24,808,238 で pass (checker はすべて 0)。
 
 - 手順 1 (`ab66e89`、`50f5dde`、`tb/test_core_smp.veryl`): `boot_soc_harness` を `N_HARTS` で一般化した (既定 1。N=1 の DUT と hart 0 の観測は不変)。hart ごとに `retire_mon`、`rvfi_tracer`、perf_acc を持ち、pass は hart 0 (x3=0xAA か tohost==1)、fail はいずれかの hart の chk か tohost の異常。RTL の変更はなく、立ち上げで RTL のバグは 1 件も出なかった (chk 全 0)。結果 (cycles):
 
@@ -4775,6 +4775,10 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 - 手順 7 (`0aca8fa`、`7cb1bb4`): U28 解決 (§5.11、§S.3、§D.11)。`test_{w2,w4}_smp_unc_2hart` は G0 に入っている (W2 6,128、W4 6,155 cy)。SBA の DRAM 読みは `i_hunc=1` の 1 beat の経路が使える。SBA の書き込み側の recall は未検証。
 - 新コア専用の firmware の像 (`964905c`): 4-hart 用の firmware の HSM `HART_START` の busy delay (約 1.05M 命令) は、新コアでは 1 回の start で約 8M cy かかる (ROM の fetch が uncached の single beat で 1 反復約 16 cy)。new-core だけの像 `test/hex/linux_boot_fw_4hart_mt.hex` を `test/linux/fw/patch_hsm_mtime_wait.sh` で作った (待ちを mtime で 102,400 tick に抑える)。`tb/test_core_smp.veryl` の N=4 boot はこの像を使い、V14 は旧 hex のまま使う。この hex は `linux_boot_fw.S` から再現できない (source が hex から乖離している)。
 - 手順 6 (設計のみ、RTL なし): Debug Mode の入場を commit/trap で確定した (§D.4 の M4-1 から M4-7、§D.5)。M0 の文から 2 点を直した: `!debug_mode` は `dm_take` ではなく `dm_req` に掛ける (Debug Mode の間も haltreq が保持されると token が止まり ROM が進まない)、step と icount の pending の後も `lim_ok` が retire を止める (部分 kill のサイクルに `dm_take` が遅れて 2 record 目が retire する窓を閉じる)。RTL に `exc_prio` という関数は無く、3 つの発生源の優先 chain の先頭に trigger を入れる形にした。レビュー (§5.13.1 の【M4 で確認】): M4 は started の発生源を足しておらず (RTL の `STARTED_N = 4`)、A/D の owned RMW、`i_hunc` の recall、`MSHR_N = 2` はどれも開始後の手順に token や他 op の retire への依存を足さないので `head_started_q` は有界、`ordering_empty` は ASQ が無い間は `sb` の空と一致する。hartreset の quiesce に `ptw` の idle を足した (U32)。MD に送った事項は U50 (line 跨ぎの lo の fault と hi の trigger) と U51 (ASQ を採ったときの `ordering_empty` の分割)。
+- 手順 5 (census、perf のみ。ブランチ `phase15/m4-census` の `07a0e71`、master には入れない。ログは `/tmp/claude-4004/m4c/`、名前付き perf は `boot4_perf.txt`): W2 の N=4 boot (24,808,238 cy、4 hart 合計 99.2M hart-cy) で測った。
+  - (a) ASQ は採らない (§L.11)。ASQ クラス (rd=x0 の RMW。aq を数えないので上限) の atomic は 3,801 個で、head を握った時間は 102,652 hart-cy (0.10 %、1 個あたり 27 cy)。boot の利得の上限は 0.41 %。全 atomic が head を握る時間は 5.68M hart-cy (5.7 %) だが大半は rd!=0 で ASQ は取れない。`ordering_empty` の待ちは 38.9k (0.04 %)。【決定】ASQ の on/off を N=4 で比べる代わりに、母集団の上限で決めた (当初の計画の読み替え。母集団の上限が小さければ比較は不要と判断)。U51 は不要として閉じる。§5.13.1 は不変 (`STARTED_N = 4`)。litmus N=2 の `asq_head` 7.6 % は敵対的な test の値で代表的ではない。
+  - (b) victim 除外は採らない (§L.12)。`dc.vic_pin` は N=4 boot (launch 112k)、litmus N=2 の W2/W4、N=4 coh のすべてで 0。boot では `rsv_coh`/`rsv_ev` と EXCL_FAIL が 0、`sc_nores` が 174。litmus の reservation の喪失は 2.7k 回で `vic_pin` は 0。基準「0 でなければ採る」に照らして採らない。測定は W2 のみ (W4 の N=4 は 10 時間超)。`rsv_lost_evict` は `dc.vic_pin` と `at.rsv_ev` に置き換えた。SC の最大連続失敗は測っていない。
+  - (c) §L.17 の SB 占有 (N=4、W2、`SB_N = 8`、hart-cycle あたり): 非空 5.62 %、1 超 1.65 %、2 超 0.97 %、4 超 0.44 %、6 超 (urgent) 0.21 %、満杯 0.144 % (142,859)。M3 の N=1 の満杯は 0.29 % だった。drain の head の ack 待ちは 16 cy 以上が 1.53M、64 cy 以上が 24,061、256 cy 以上が 0 で、drain の飢餓は無い。
 - 手順 4 (`90f6f8e`、`6eb785a`、`b7b852d`): `MSHR_N = 2` を `cfg_w2`/`cfg_w4` に採った (§M.6.4)。`CFG_ERR` bit 6 を `MSHR_N == 0` の拒否に緩めた。`DcachePerf` に `mshr_live2` と `alloc_ovl` を足した (検証計画の matrix の boot の行)。`N_FILL` は 1 のままなので §M.4 の mem_ctrl の修正は要らない。
 - firmware の修正の効果: W2 の GB4 は旧 4-hart firmware の像で 43,479,101 サイクル、新コア専用の mtime の像で 24,922,839 サイクルになった。以前の N=4 SMP の遅さは core ではなく firmware の delay によるものだった。
 - 未決・持ち越し: (a) 新コアの uncached の ROM fetch が遅い (性能、優先度は低い)。(b) firmware の source と hex の乖離 (source の整合、または patch script を正本に決める)。(c) W4 の GT4 を GB4 と同じ「マイルストーンの末だけ」にするか (提案、ユーザ判断。検証計画 §1.2 は W4 の GT4 を毎回回す表のまま)。(d) 失敗する SC も D を立てる件 (§L.16)。
@@ -4788,7 +4792,7 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 | 機能 (W2, W4) | G0 に litmus N=2 を追加。GT4、GB2 (5.15、マイルストーン末は 6.6/7.1 の SMP も)。GB4 は M3 の決定に従う。GV: litmus4、N=2、N=4。 |
 | 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。`MSHR_N = 2` の出荷分は W2 の GB4 を通した (W4 はマイルストーン末)。 |
 
-M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11)、fill の victim 選択から pin 中の line を除外するか (§L.12)、`MSHR_N` の値 (§M.6.4、手順 4 で 2 に決定)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16、完了)。
+M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11、手順 5 で採らないと決定)、fill の victim 選択から pin 中の line を除外するか (§L.12、手順 5 で採らないと決定)、`MSHR_N` の値 (§M.6.4、手順 4 で 2 に決定)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16、完了)。
 
 ### MM: 外部メモリインタフェース
 
