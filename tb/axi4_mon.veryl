@@ -1,0 +1,305 @@
+// axi4_mon: AXI4 protocol checker, observation only. Checks both the master
+// and the slave side of one AXI4 port (64-bit data).
+//
+// Ports (timing contract):
+//   i_*    : every signal of the port, sampled at the clock edge
+//   o_chk  : sticky flags, bit axi4_tb_pkg::CHK_*; 0 while all rules hold
+// Owns:
+//   - handshake stability: a valid stays up and its payload stays unchanged
+//     until ready, on all five channels
+//   - an R or B response matches the oldest outstanding request of its ID
+//     (that is what in-order per ID means at a port without data tags); the
+//     R beat count of that request must end with RLAST at ARLEN + 1
+//   - W bursts belong to AWs in AW order; a W burst must end with WLAST at
+//     AWLEN + 1 beats, and B of an AW must follow the last W of its burst
+//   - INCR only, AxSIZE <= 3, no burst crosses a 4 KiB boundary
+//   - at most MAX_RD / MAX_WR outstanding requests
+// Rationale:
+//   - sticky flags instead of $error or assert (the cc and JIT backends
+//     abort on them), read by the harness verdict
+//   - a W burst that completes before its AW has arrived is checked when the
+//     AW arrives; only one such early burst is tracked, which is enough for
+//     a master that raises AW and W together
+module axi4_mon #(
+    param ID_W  : u32 = 4,
+    param MAX_RD: u32 = 8,
+    param MAX_WR: u32 = 8,
+) (
+    clk      : input  clock                       ,
+    rst      : input  reset                       ,
+    i_arvalid: input  logic                       ,
+    i_arready: input  logic                       ,
+    i_arid   : input  logic<ID_W>                 ,
+    i_araddr : input  logic<64>                   ,
+    i_arlen  : input  logic<8>                    ,
+    i_arsize : input  logic<3>                    ,
+    i_arburst: input  logic<2>                    ,
+    i_rvalid : input  logic                       ,
+    i_rready : input  logic                       ,
+    i_rid    : input  logic<ID_W>                 ,
+    i_rdata  : input  logic<64>                   ,
+    i_rresp  : input  logic<2>                    ,
+    i_rlast  : input  logic                       ,
+    i_awvalid: input  logic                       ,
+    i_awready: input  logic                       ,
+    i_awid   : input  logic<ID_W>                 ,
+    i_awaddr : input  logic<64>                   ,
+    i_awlen  : input  logic<8>                    ,
+    i_awsize : input  logic<3>                    ,
+    i_awburst: input  logic<2>                    ,
+    i_wvalid : input  logic                       ,
+    i_wready : input  logic                       ,
+    i_wdata  : input  logic<64>                   ,
+    i_wstrb  : input  logic<8>                    ,
+    i_wlast  : input  logic                       ,
+    i_bvalid : input  logic                       ,
+    i_bready : input  logic                       ,
+    i_bid    : input  logic<ID_W>                 ,
+    i_bresp  : input  logic<2>                    ,
+    o_chk    : output logic<axi4_tb_pkg::CHK_N>   ,
+) {
+    import axi4_tb_pkg::*;
+
+    const RN: u32 = MAX_RD + 1;
+    const WN: u32 = MAX_WR + 1;
+    const PA: u32 = ID_W + 77; // AR/AW payload: id, addr, len, size, burst
+    const PW: u32 = 73;
+    const PR: u32 = ID_W + 67;
+    const PB: u32 = ID_W + 2;
+
+    function older (
+        a: input logic<16>,
+        b: input logic<16>,
+    ) -> logic {
+        let d: logic<16> = a - b;
+        return d[15];
+    }
+
+    // Burst attributes and the 4 KiB rule of one request.
+    function bad_attr (
+        size : input logic<3>,
+        burst: input logic<2>,
+    ) -> logic {
+        return burst != 2'b01 || size >: 3'd3;
+    }
+
+    function cross_4k (
+        addr: input logic<64>,
+        len : input logic<8>,
+        size: input logic<3>,
+    ) -> logic {
+        let first: logic<13> = {1'b0, addr[11:0]};
+        let span : logic<13> = ({5'd0, len} + 13'd1) << size;
+        let end_ : logic<14> = {1'b0, first} + {1'b0, span};
+        return end_ >: 14'd4096;
+    }
+
+    var chk_q  : logic<CHK_N>;
+    var hold_q : logic<5>    ; // previous cycle: valid && !ready, per channel
+    var ar_p   : logic<PA>   ;
+    var aw_p   : logic<PA>   ;
+    var w_p    : logic<PW>   ;
+    var r_p    : logic<PR>   ;
+    var b_p    : logic<PB>    ;
+    let ar_now : logic<PA>    = {i_arid, i_araddr, i_arlen, i_arsize, i_arburst};
+    let aw_now : logic<PA>    = {i_awid, i_awaddr, i_awlen, i_awsize, i_awburst};
+    let w_now  : logic<PW>    = {i_wdata, i_wstrb, i_wlast};
+    let r_now  : logic<PR>    = {i_rid, i_rdata, i_rresp, i_rlast};
+    let b_now  : logic<PB>     = {i_bid, i_bresp};
+    let ar_hs  : logic        = i_arvalid && i_arready;
+    let aw_hs  : logic        = i_awvalid && i_awready;
+    let w_hs   : logic        = i_wvalid && i_wready;
+    let r_hs   : logic        = i_rvalid && i_rready;
+    let b_hs   : logic        = i_bvalid && i_bready;
+
+    // ── read table ──
+    var rt_v   : logic       [RN];
+    var rt_id  : logic<ID_W> [RN];
+    var rt_len : logic<8>    [RN];
+    var rt_beat: logic<8>    [RN];
+    var rt_seq : logic<16>   [RN];
+    var ar_seq : logic<16>       ;
+
+    var rt_free_v: logic    ;
+    var rt_free_i: u32      ;
+    var rt_n     : u32      ;
+    var r_hit_v  : logic    ;
+    var r_hit_i  : u32      ;
+    always_comb {
+        rt_free_v = 1'b0;
+        rt_free_i = 0;
+        rt_n      = 0;
+        r_hit_v   = 1'b0;
+        r_hit_i   = 0;
+        for i in 0..RN {
+            if rt_v[i] {
+                rt_n = rt_n + 1;
+                if rt_id[i] == i_rid && (!r_hit_v || older(rt_seq[i], rt_seq[r_hit_i])) {
+                    r_hit_v = 1'b1;
+                    r_hit_i = i;
+                }
+            } else if !rt_free_v {
+                rt_free_v = 1'b1;
+                rt_free_i = i;
+            }
+        }
+    }
+    let r_last_exp: logic = r_hit_v && rt_beat[r_hit_i] == rt_len[r_hit_i];
+
+    // ── write table (B pairing) and W burst pairing (AW order) ──
+    var wt_v  : logic       [WN];
+    var wt_id : logic<ID_W> [WN];
+    var wt_len: logic<8>    [WN];
+    var wt_seq: logic<16>   [WN];
+    var aw_seq: logic<16>       ; // AWs accepted
+    var wb_seq: logic<16>       ; // W bursts completed
+    var w_beat: logic<8>        ;
+    var ew_v  : logic           ; // a W burst completed before its AW
+    var ew_n  : logic<8>        ; // its beat count - 1
+
+    var wt_free_v: logic;
+    var wt_free_i: u32  ;
+    var wt_n     : u32  ;
+    var b_hit_v  : logic;
+    var b_hit_i  : u32  ;
+    var wc_v     : logic; // the AW of the current W burst is known
+    var wc_len   : logic<8>;
+    always_comb {
+        wt_free_v = 1'b0;
+        wt_free_i = 0;
+        wt_n      = 0;
+        b_hit_v   = 1'b0;
+        b_hit_i   = 0;
+        wc_v      = 1'b0;
+        wc_len    = '0;
+        for i in 0..WN {
+            if wt_v[i] {
+                wt_n = wt_n + 1;
+                if wt_id[i] == i_bid && (!b_hit_v || older(wt_seq[i], wt_seq[b_hit_i])) {
+                    b_hit_v = 1'b1;
+                    b_hit_i = i;
+                }
+                if wt_seq[i] == wb_seq {
+                    wc_v   = 1'b1;
+                    wc_len = wt_len[i];
+                }
+            } else if !wt_free_v {
+                wt_free_v = 1'b1;
+                wt_free_i = i;
+            }
+        }
+        if aw_hs && aw_seq == wb_seq {
+            wc_v   = 1'b1;
+            wc_len = i_awlen;
+        }
+    }
+    // B's write: its W burst is done once wb_seq has passed its sequence number
+    let b_wdone: logic = b_hit_v && older(wt_seq[b_hit_i], wb_seq);
+
+    var chk_w: logic<CHK_N>;
+    always_comb {
+        chk_w = '0;
+        chk_w[CHK_AR_HOLD] = hold_q[0] && (!i_arvalid || ar_now != ar_p);
+        chk_w[CHK_AW_HOLD] = hold_q[1] && (!i_awvalid || aw_now != aw_p);
+        chk_w[CHK_W_HOLD]  = hold_q[2] && (!i_wvalid || w_now != w_p);
+        chk_w[CHK_R_HOLD]  = hold_q[3] && (!i_rvalid || r_now != r_p);
+        chk_w[CHK_B_HOLD]  = hold_q[4] && (!i_bvalid || b_now != b_p);
+        chk_w[CHK_WLAST]   = (w_hs && wc_v && (i_wlast != (w_beat == wc_len)))
+            || (aw_hs && ew_v && aw_seq == wb_seq - 16'd1 && ew_n != i_awlen);
+        chk_w[CHK_RLAST]   = r_hs && r_hit_v && (i_rlast != r_last_exp);
+        chk_w[CHK_NO_REQ]  = (r_hs && !r_hit_v) || (b_hs && !b_hit_v);
+        chk_w[CHK_B_EARLY] = b_hs && b_hit_v && !b_wdone;
+        chk_w[CHK_4K]      = (i_arvalid && cross_4k(i_araddr, i_arlen, i_arsize))
+            || (i_awvalid && cross_4k(i_awaddr, i_awlen, i_awsize));
+        chk_w[CHK_ATTR]    = (i_arvalid && bad_attr(i_arsize, i_arburst))
+            || (i_awvalid && bad_attr(i_awsize, i_awburst));
+        chk_w[CHK_OUTSTAND] = (ar_hs && (rt_n >= MAX_RD || !rt_free_v))
+            || (aw_hs && (wt_n >= MAX_WR || !wt_free_v));
+    }
+
+    always_ff {
+        if_reset {
+            chk_q   = '0;
+            hold_q  = '0;
+            ar_p    = '0;
+            aw_p    = '0;
+            w_p     = '0;
+            r_p     = '0;
+            b_p     = '0;
+            for i in 0..RN {
+                rt_v[i]    = 1'b0;
+                rt_id[i]   = '0;
+                rt_len[i]  = '0;
+                rt_beat[i] = '0;
+                rt_seq[i]  = '0;
+            }
+            for i in 0..WN {
+                wt_v[i]   = 1'b0;
+                wt_id[i]  = '0;
+                wt_len[i] = '0;
+                wt_seq[i] = '0;
+            }
+            ar_seq = '0;
+            aw_seq = '0;
+            wb_seq = '0;
+            w_beat = '0;
+            ew_v   = 1'b0;
+            ew_n   = '0;
+        } else {
+            chk_q   = chk_q | chk_w;
+            hold_q  = {i_bvalid && !i_bready, i_rvalid && !i_rready, i_wvalid && !i_wready, i_awvalid && !i_awready, i_arvalid && !i_arready};
+            ar_p    = ar_now;
+            aw_p    = aw_now;
+            w_p     = w_now;
+            r_p     = r_now;
+            b_p     = b_now;
+
+            if r_hs && r_hit_v {
+                if i_rlast {
+                    rt_v[r_hit_i] = 1'b0;
+                } else {
+                    rt_beat[r_hit_i] = rt_beat[r_hit_i] + 8'd1;
+                }
+            }
+            if ar_hs && rt_free_v {
+                rt_v[rt_free_i]    = 1'b1;
+                rt_id[rt_free_i]   = i_arid;
+                rt_len[rt_free_i]  = i_arlen;
+                rt_beat[rt_free_i] = 8'd0;
+                rt_seq[rt_free_i]  = ar_seq;
+            }
+            if ar_hs {
+                ar_seq = ar_seq + 16'd1;
+            }
+
+            if b_hs && b_hit_v {
+                wt_v[b_hit_i] = 1'b0;
+            }
+            if aw_hs && wt_free_v {
+                wt_v[wt_free_i]   = 1'b1;
+                wt_id[wt_free_i]  = i_awid;
+                wt_len[wt_free_i] = i_awlen;
+                wt_seq[wt_free_i] = aw_seq;
+            }
+            if aw_hs {
+                aw_seq = aw_seq + 16'd1;
+                if ew_v && aw_seq == wb_seq - 16'd1 {
+                    ew_v = 1'b0;
+                }
+            }
+            if w_hs {
+                if i_wlast {
+                    if !wc_v {
+                        ew_v = 1'b1;
+                        ew_n = w_beat;
+                    }
+                    w_beat = 8'd0;
+                    wb_seq = wb_seq + 16'd1;
+                } else {
+                    w_beat = w_beat + 8'd1;
+                }
+            }
+        }
+    }
+    assign o_chk = chk_q;
+}

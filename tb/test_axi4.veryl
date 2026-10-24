@@ -1,0 +1,424 @@
+// Self-tests of the tb AXI4 slave model and the AXI4 protocol checker.
+//
+// A scripted tb master writes NOPS bursts (lengths 0-7, four IDs, one burst
+// with partial strobes), waits for every B, then reads the bursts back with
+// up to four reads in flight and compares the data. The master drops RREADY
+// and BREADY at random when RDY_RAND is set.
+//
+// INJ = 0 is a clean run under one slave setting: it passes when the
+// read-back matches and every checker flag stays 0. INJ > 0 corrupts the
+// wires between master and slave in one way, and the run passes when
+// checker flag EXP fires.
+module test_axi4_harness #(
+    param CFG     : axi4_tb_pkg::SlaveCfg = axi4_tb_pkg::FIXED,
+    param SEED    : bit<32>               = 32'h1             ,
+    param RDY_RAND: bit                   = 1'b1              ,
+    param INJ     : u32                   = 0                 ,
+    param EXP     : u32                   = 0                 ,
+    param MAX_RD  : u32                   = 8                 ,
+) (
+    clk   : input  clock                     ,
+    rst   : input  reset                     ,
+    o_pass: output logic                     ,
+    o_done: output logic                     ,
+    o_err : output logic<8>                  ,
+    o_chk : output logic<axi4_tb_pkg::CHK_N> ,
+) {
+    const BASE: logic<64> = 64'h8000_0000;
+    const NOPS: u32       = 16;
+
+    function op_addr (
+        k: input logic<5>,
+    ) -> logic<64> {
+        return if INJ == 6 && k == 5'd5 ? BASE + 64'h0ff0 : BASE + {52'd0, k, 7'd0} + {59'd0, k[1:0], 3'd0};
+    }
+    function op_len (
+        k: input logic<5>,
+    ) -> logic<8> {
+        return {5'd0, k[2:0]};
+    }
+    function op_strb (
+        k: input logic<5>,
+    ) -> logic<8> {
+        return if k == 5'd3 ? 8'h0f : 8'hff;
+    }
+    function xs32 (
+        x: input logic<32>,
+    ) -> logic<32> {
+        let a: logic<32> = x ^ (x << 13);
+        let b: logic<32> = a ^ (a >> 17);
+        return b ^ (b << 5);
+    }
+    function pat (
+        a: input logic<64>,
+    ) -> logic<64> {
+        return {~a[31:0], a[31:0] ^ 32'h5a5a_a5a5};
+    }
+    function bmask (
+        s: input logic<8>,
+    ) -> logic<64> {
+        var m: logic<64>;
+        for b in 0..8 {
+            m[b step 8] = if s[b] ? 8'hff : 8'h00;
+        }
+        return m;
+    }
+
+    var lf: logic<32>;
+    always_ff {
+        if_reset {
+            lf = SEED ^ 32'h1234_5678 | 32'd1;
+        } else {
+            lf = xs32(lf);
+        }
+    }
+
+    // master outputs (m_*), slave outputs (s_*), wires after injection (x_*)
+    var m_arvalid: logic    ;
+    var m_araddr : logic<64>;
+    var m_arlen  : logic<8> ;
+    var m_arid   : logic<4> ;
+    var m_awvalid: logic    ;
+    var m_awaddr : logic<64>;
+    var m_awlen  : logic<8> ;
+    var m_awid   : logic<4> ;
+    var m_wvalid : logic    ;
+    var m_wdata  : logic<64>;
+    var m_wstrb  : logic<8> ;
+    var m_wlast  : logic    ;
+    var m_rready : logic    ;
+    var m_bready : logic    ;
+    var s_arready: logic    ;
+    var s_awready: logic    ;
+    var s_wready : logic    ;
+    var s_rvalid : logic    ;
+    var s_rid    : logic<4> ;
+    var s_rdata  : logic<64>;
+    var s_rresp  : logic<2> ;
+    var s_rlast  : logic    ;
+    var s_bvalid : logic    ;
+    var s_bid    : logic<4> ;
+    var s_bresp  : logic<2> ;
+
+    var ph     : logic<2> ; // 0 write, 1 read, 2 done
+    var wk     : logic<5> ;
+    var aw_done: logic    ;
+    var w_done : logic    ;
+    var w_bt   : logic<8> ;
+    var bcnt   : logic<8> ;
+    var rk     : logic<5> ;
+    var rcnt   : logic<8> ;
+    var busy   : logic    [4];
+    var rb_k   : logic<5> [4];
+    var rb_bt  : logic<8> [4];
+    var err    : logic<8> ;
+    var ar_wq  : logic    ; // last cycle: valid && !ready
+    var aw_wq  : logic    ;
+    var w_wq   : logic    ;
+    var r_wq   : logic    ;
+    var b_wq   : logic    ;
+    var eb_done: logic    ;
+
+    assign m_awvalid = ph == 2'd0 && wk <: NOPS && !aw_done;
+    assign m_awaddr  = op_addr(wk);
+    assign m_awlen   = op_len(wk);
+    assign m_awid    = {2'd0, wk[1:0]};
+    assign m_wvalid  = ph == 2'd0 && wk <: NOPS && !w_done;
+    assign m_wdata   = pat({m_awaddr[63:3], 3'd0} + {53'd0, w_bt, 3'd0});
+    assign m_wstrb   = op_strb(wk);
+    assign m_wlast   = w_bt == op_len(wk);
+    assign m_arvalid = ph == 2'd1 && rk <: NOPS && !busy[rk[1:0]];
+    assign m_araddr  = op_addr(rk);
+    assign m_arlen   = op_len(rk);
+    assign m_arid    = {2'd0, rk[1:0]};
+    assign m_rready  = !RDY_RAND || lf[1:0] != 2'd0;
+    assign m_bready  = !RDY_RAND || lf[3:2] != 2'd0;
+
+    let eb_fire: logic = INJ == 8 && ph == 2'd0 && wk == 5'd2 && aw_done && w_bt == 8'd1 && !eb_done && !s_bvalid;
+
+    let x_arvalid: logic     = if INJ == 2 ? m_arvalid && !ar_wq : m_arvalid;
+    let x_araddr : logic<64> = if INJ == 1 && ar_wq ? m_araddr ^ 64'h8 : m_araddr;
+    let x_awvalid: logic     = m_awvalid;
+    let x_awaddr : logic<64> = if INJ == 3 && aw_wq ? m_awaddr ^ 64'h8 : m_awaddr;
+    let x_awburst: logic<2>  = if INJ == 7 && wk == 5'd2 ? 2'b10 : 2'b01;
+    let x_wdata  : logic<64> = if INJ == 4 && w_wq ? m_wdata ^ 64'h1 : m_wdata;
+    let x_wlast  : logic     = m_wlast || (INJ == 5 && wk == 5'd1 && w_bt == 8'd0);
+    let x_rvalid : logic     = if INJ == 9 ? s_rvalid && !r_wq : s_rvalid;
+    let x_rid    : logic<4>  = if INJ == 10 && rcnt == 8'd0 ? s_rid ^ 4'b1000 : s_rid;
+    let x_rlast  : logic     = s_rlast && !(INJ == 11 && rcnt == 8'd0);
+    let x_bvalid : logic     = if INJ == 13 ? s_bvalid && !b_wq : s_bvalid || eb_fire;
+    let x_bid    : logic<4>  = if eb_fire ? 4'd2 : s_bid;
+
+    let ar_hs: logic = x_arvalid && s_arready;
+    let aw_hs: logic = x_awvalid && s_awready;
+    let w_hs : logic = m_wvalid && s_wready;
+    let r_hs : logic = x_rvalid && m_rready;
+    let b_hs : logic = x_bvalid && m_bready;
+
+    let r_slot: logic<2>  = x_rid[1:0];
+    let r_k   : logic<5>  = rb_k[r_slot];
+    let r_a   : logic<64> = op_addr(r_k);
+    let r_exp : logic<64> = pat({r_a[63:3], 3'd0} + {53'd0, rb_bt[r_slot], 3'd0}) & bmask(op_strb(r_k));
+
+    always_ff {
+        if_reset {
+            ph      = 2'd0;
+            wk      = '0;
+            aw_done = 1'b0;
+            w_done  = 1'b0;
+            w_bt    = '0;
+            bcnt    = '0;
+            rk      = '0;
+            rcnt    = '0;
+            for i in 0..4 {
+                busy[i]  = 1'b0;
+                rb_k[i]  = '0;
+                rb_bt[i] = '0;
+            }
+            err     = '0;
+            ar_wq   = 1'b0;
+            aw_wq   = 1'b0;
+            w_wq    = 1'b0;
+            r_wq    = 1'b0;
+            b_wq    = 1'b0;
+            eb_done = 1'b0;
+        } else {
+            ar_wq = m_arvalid && !s_arready;
+            aw_wq = m_awvalid && !s_awready;
+            w_wq  = m_wvalid && !s_wready;
+            r_wq  = s_rvalid && !m_rready;
+            b_wq  = s_bvalid && !m_bready;
+            if eb_fire {
+                eb_done = 1'b1;
+            }
+
+            if aw_hs {
+                aw_done = 1'b1;
+            }
+            if w_hs {
+                if m_wlast {
+                    w_done = 1'b1;
+                } else {
+                    w_bt = w_bt + 8'd1;
+                }
+            }
+            if (aw_done || aw_hs) && (w_done || (w_hs && m_wlast)) {
+                wk      = wk + 5'd1;
+                aw_done = 1'b0;
+                w_done  = 1'b0;
+                w_bt    = 8'd0;
+            }
+            if b_hs {
+                bcnt = bcnt + 8'd1;
+            }
+            if ph == 2'd0 && wk == NOPS && bcnt == NOPS {
+                ph = 2'd1;
+            }
+
+            if ar_hs {
+                busy[rk[1:0]]  = 1'b1;
+                rb_k[rk[1:0]]  = rk;
+                rb_bt[rk[1:0]] = 8'd0;
+                rk             = rk + 5'd1;
+            }
+            if r_hs {
+                if s_rdata != r_exp || s_rresp != 2'd0 {
+                    err = err + 8'd1;
+                }
+                if x_rlast {
+                    busy[r_slot] = 1'b0;
+                    rcnt         = rcnt + 8'd1;
+                } else {
+                    rb_bt[r_slot] = rb_bt[r_slot] + 8'd1;
+                }
+            }
+            if ph == 2'd1 && rcnt == NOPS {
+                ph = 2'd2;
+            }
+        }
+    }
+
+    inst u_slave: axi4_slave_model #(
+        ID_W    : 4    ,
+        MEM_BASE: BASE ,
+        MEM_DW  : 1024 ,
+        CFG     : CFG  ,
+        SEED    : SEED ,
+    ) (
+        clk                  ,
+        rst                  ,
+        i_arvalid: x_arvalid ,
+        o_arready: s_arready ,
+        i_arid   : m_arid    ,
+        i_araddr : x_araddr  ,
+        i_arlen  : m_arlen   ,
+        o_rvalid : s_rvalid  ,
+        i_rready : m_rready  ,
+        o_rid    : s_rid     ,
+        o_rdata  : s_rdata   ,
+        o_rresp  : s_rresp   ,
+        o_rlast  : s_rlast   ,
+        i_awvalid: x_awvalid ,
+        o_awready: s_awready ,
+        i_awid   : m_awid    ,
+        i_awaddr : x_awaddr  ,
+        i_awlen  : m_awlen   ,
+        i_wvalid : m_wvalid  ,
+        o_wready : s_wready  ,
+        i_wdata  : x_wdata   ,
+        i_wstrb  : m_wstrb   ,
+        o_bvalid : s_bvalid  ,
+        i_bready : m_bready  ,
+        o_bid    : s_bid     ,
+        o_bresp  : s_bresp   ,
+    );
+
+    var chk: logic<axi4_tb_pkg::CHK_N>;
+    inst u_mon: axi4_mon #(
+        ID_W  : 4      ,
+        MAX_RD: MAX_RD ,
+        MAX_WR: 16     ,
+    ) (
+        clk                  ,
+        rst                  ,
+        i_arvalid: x_arvalid ,
+        i_arready: s_arready ,
+        i_arid   : m_arid    ,
+        i_araddr : x_araddr  ,
+        i_arlen  : m_arlen   ,
+        i_arsize : 3'd3      ,
+        i_arburst: 2'b01     ,
+        i_rvalid : x_rvalid  ,
+        i_rready : m_rready  ,
+        i_rid    : x_rid     ,
+        i_rdata  : s_rdata   ,
+        i_rresp  : s_rresp   ,
+        i_rlast  : x_rlast   ,
+        i_awvalid: x_awvalid ,
+        i_awready: s_awready ,
+        i_awid   : m_awid    ,
+        i_awaddr : x_awaddr  ,
+        i_awlen  : m_awlen   ,
+        i_awsize : 3'd3      ,
+        i_awburst: x_awburst ,
+        i_wvalid : m_wvalid  ,
+        i_wready : s_wready  ,
+        i_wdata  : x_wdata   ,
+        i_wstrb  : m_wstrb   ,
+        i_wlast  : x_wlast   ,
+        i_bvalid : x_bvalid  ,
+        i_bready : m_bready  ,
+        i_bid    : x_bid     ,
+        i_bresp  : s_bresp   ,
+        o_chk    : chk       ,
+    );
+
+    assign o_done = ph == 2'd2;
+    assign o_err  = err;
+    assign o_chk  = chk;
+    assign o_pass = if INJ == 0 ? o_done && err == '0 && chk == '0 : chk[EXP];
+}
+
+// Clean runs: one per named slave setting.
+#[test(test_axi4_fixed)]
+module test_axi4_fixed {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass: logic                    ;
+    var done: logic                    ;
+    var err : logic<8>                 ;
+    var chk : logic<axi4_tb_pkg::CHK_N>;
+    inst h: test_axi4_harness #( CFG: axi4_tb_pkg::FIXED, RDY_RAND: 1'b0 ) ( clk, rst, o_pass: pass, o_done: done, o_err: err, o_chk: chk );
+    initial {
+        rst.assert(clk);
+        clk.next(20000);
+        $display("axi4 fixed: done=%0d err=%0d chk=%h", done, err, chk);
+        $assert (pass, "axi4 fixed failed");
+        $finish ();
+    }
+}
+
+#[test(test_axi4_slow)]
+module test_axi4_slow {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass: logic                    ;
+    var done: logic                    ;
+    var err : logic<8>                 ;
+    var chk : logic<axi4_tb_pkg::CHK_N>;
+    inst h: test_axi4_harness #( CFG: axi4_tb_pkg::SLOW, SEED: 32'h51 ) ( clk, rst, o_pass: pass, o_done: done, o_err: err, o_chk: chk );
+    initial {
+        rst.assert(clk);
+        clk.next(20000);
+        $display("axi4 slow: done=%0d err=%0d chk=%h", done, err, chk);
+        $assert (pass, "axi4 slow failed");
+        $finish ();
+    }
+}
+
+#[test(test_axi4_backpressure)]
+module test_axi4_backpressure {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass: logic                    ;
+    var done: logic                    ;
+    var err : logic<8>                 ;
+    var chk : logic<axi4_tb_pkg::CHK_N>;
+    inst h: test_axi4_harness #( CFG: axi4_tb_pkg::BACKPRESSURE, SEED: 32'hb9 ) ( clk, rst, o_pass: pass, o_done: done, o_err: err, o_chk: chk );
+    initial {
+        rst.assert(clk);
+        clk.next(20000);
+        $display("axi4 backpressure: done=%0d err=%0d chk=%h", done, err, chk);
+        $assert (pass, "axi4 backpressure failed");
+        $finish ();
+    }
+}
+
+#[test(test_axi4_reorder)]
+module test_axi4_reorder {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass: logic                    ;
+    var done: logic                    ;
+    var err : logic<8>                 ;
+    var chk : logic<axi4_tb_pkg::CHK_N>;
+    inst h: test_axi4_harness #( CFG: axi4_tb_pkg::REORDER, SEED: 32'h7e ) ( clk, rst, o_pass: pass, o_done: done, o_err: err, o_chk: chk );
+    initial {
+        rst.assert(clk);
+        clk.next(20000);
+        $display("axi4 reorder: done=%0d err=%0d chk=%h", done, err, chk);
+        $assert (pass, "axi4 reorder failed");
+        $finish ();
+    }
+}
+
+// Checker self-tests: one injected violation each; flag EXP must fire.
+#[test(test_axi4_inj)]
+module test_axi4_inj {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var chk: logic<axi4_tb_pkg::CHK_N> [13];
+    var p  : logic                     [13];
+    inst h1: test_axi4_harness #( CFG: axi4_tb_pkg::BACKPRESSURE, INJ: 1, EXP: axi4_tb_pkg::CHK_AR_HOLD ) ( clk, rst, o_pass: p[0], o_done: _, o_err: _, o_chk: chk[0] );
+    inst h2: test_axi4_harness #( CFG: axi4_tb_pkg::BACKPRESSURE, INJ: 2, EXP: axi4_tb_pkg::CHK_AR_HOLD ) ( clk, rst, o_pass: p[1], o_done: _, o_err: _, o_chk: chk[1] );
+    inst h3: test_axi4_harness #( CFG: axi4_tb_pkg::BACKPRESSURE, INJ: 3, EXP: axi4_tb_pkg::CHK_AW_HOLD ) ( clk, rst, o_pass: p[2], o_done: _, o_err: _, o_chk: chk[2] );
+    inst h4: test_axi4_harness #( CFG: axi4_tb_pkg::BACKPRESSURE, INJ: 4, EXP: axi4_tb_pkg::CHK_W_HOLD ) ( clk, rst, o_pass: p[3], o_done: _, o_err: _, o_chk: chk[3] );
+    inst h5: test_axi4_harness #( INJ: 5, EXP: axi4_tb_pkg::CHK_WLAST ) ( clk, rst, o_pass: p[4], o_done: _, o_err: _, o_chk: chk[4] );
+    inst h6: test_axi4_harness #( INJ: 6, EXP: axi4_tb_pkg::CHK_4K ) ( clk, rst, o_pass: p[5], o_done: _, o_err: _, o_chk: chk[5] );
+    inst h7: test_axi4_harness #( INJ: 7, EXP: axi4_tb_pkg::CHK_ATTR ) ( clk, rst, o_pass: p[6], o_done: _, o_err: _, o_chk: chk[6] );
+    inst h8: test_axi4_harness #( INJ: 8, EXP: axi4_tb_pkg::CHK_B_EARLY ) ( clk, rst, o_pass: p[7], o_done: _, o_err: _, o_chk: chk[7] );
+    inst h9: test_axi4_harness #( INJ: 9, EXP: axi4_tb_pkg::CHK_R_HOLD ) ( clk, rst, o_pass: p[8], o_done: _, o_err: _, o_chk: chk[8] );
+    inst h10: test_axi4_harness #( INJ: 10, EXP: axi4_tb_pkg::CHK_NO_REQ ) ( clk, rst, o_pass: p[9], o_done: _, o_err: _, o_chk: chk[9] );
+    inst h11: test_axi4_harness #( INJ: 11, EXP: axi4_tb_pkg::CHK_RLAST ) ( clk, rst, o_pass: p[10], o_done: _, o_err: _, o_chk: chk[10] );
+    inst h12: test_axi4_harness #( INJ: 12, EXP: axi4_tb_pkg::CHK_OUTSTAND, MAX_RD: 2 ) ( clk, rst, o_pass: p[11], o_done: _, o_err: _, o_chk: chk[11] );
+    inst h13: test_axi4_harness #( INJ: 13, EXP: axi4_tb_pkg::CHK_B_HOLD ) ( clk, rst, o_pass: p[12], o_done: _, o_err: _, o_chk: chk[12] );
+    initial {
+        rst.assert(clk);
+        clk.next(4000);
+        for i in 0..13 {
+            $display("axi4 inj %0d: chk=%h pass=%0d", i + 1, chk[i], p[i]);
+            $assert (p[i], "axi4 checker missed an injected violation");
+        }
+        $finish ();
+    }
+}

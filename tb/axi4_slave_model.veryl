@@ -1,0 +1,384 @@
+// axi4_slave_model: tb AXI4 slave over a memory array, with the latency and
+// backpressure of every channel drawn from seeded LFSRs (axi4_tb_pkg::SlaveCfg).
+//
+// Ports (timing contract):
+//   AXI4 slave, 64-bit data, INCR bursts of AxSIZE 3. Every output comes
+//   from registered state only (no ready or valid depends on a master input
+//   of the same cycle). An access outside [MEM_BASE, MEM_BASE + 8 * MEM_DW)
+//   answers DECERR: reads return 0, writes are dropped.
+// Owns:
+//   - W beats are taken only for an accepted AW, in AW order; the beat count
+//     comes from AWLEN (WLAST is the checker's business)
+//   - responses of one ID leave in request order; with reorder = 0 every
+//     response leaves in request order
+//   - one R burst at a time (no interleaving); a beat's data is read from the
+//     array when the beat is presented and held until RREADY
+// Rationale:
+//   - LFSRs instead of $random, so that Verilator sees the same sequence and
+//     a failing seed can be pinned
+module axi4_slave_model #(
+    param ID_W    : u32                   = 4                    ,
+    param MEM_BASE: bit<64>               = 64'h8000_0000        ,
+    param MEM_DW  : u32                   = 1024                 , // dwords, a power of 2
+    param HEX_EN  : bit                   = 1'b0                 ,
+    param HEX     : string                = ""                   , // 32-bit words, as the harness DRAM hexes
+    param CFG     : axi4_tb_pkg::SlaveCfg = axi4_tb_pkg::FIXED   ,
+    param SEED    : bit<32>               = 32'h1                ,
+) (
+    clk      : input  clock       ,
+    rst      : input  reset       ,
+    i_arvalid: input  logic       ,
+    o_arready: output logic       ,
+    i_arid   : input  logic<ID_W> ,
+    i_araddr : input  logic<64>   ,
+    i_arlen  : input  logic<8>    ,
+    o_rvalid : output logic       ,
+    i_rready : input  logic       ,
+    o_rid    : output logic<ID_W> ,
+    o_rdata  : output logic<64>   ,
+    o_rresp  : output logic<2>    ,
+    o_rlast  : output logic       ,
+    i_awvalid: input  logic       ,
+    o_awready: output logic       ,
+    i_awid   : input  logic<ID_W> ,
+    i_awaddr : input  logic<64>   ,
+    i_awlen  : input  logic<8>    ,
+    i_wvalid : input  logic       ,
+    o_wready : output logic       ,
+    i_wdata  : input  logic<64>   ,
+    i_wstrb  : input  logic<8>    ,
+    o_bvalid : output logic       ,
+    i_bready : input  logic       ,
+    o_bid    : output logic<ID_W> ,
+    o_bresp  : output logic<2>    ,
+) {
+    const N    : u32       = 8;
+    const NW   : u32       = 3;
+    const NA   : u32       = NW + 1;
+    const MAW  : u32       = $clog2(MEM_DW);
+    const OKAY : logic<2>  = 2'b00;
+    const DEC  : logic<2>  = 2'b11;
+
+    function xs32 (
+        x: input logic<32>,
+    ) -> logic<32> {
+        let a: logic<32> = x ^ (x << 13);
+        let b: logic<32> = a ^ (a >> 17);
+        return b ^ (b << 5);
+    }
+
+    // a was issued before b (modular sequence numbers)
+    function older (
+        a: input logic<16>,
+        b: input logic<16>,
+    ) -> logic {
+        let d: logic<16> = a - b;
+        return d[15];
+    }
+
+    function due (
+        now: input logic<32>,
+        rdy: input logic<32>,
+    ) -> logic {
+        let d: logic<32> = now - rdy;
+        return !d[31];
+    }
+
+    function in_mem (
+        a: input logic<64>,
+    ) -> logic {
+        let off: logic<64> = a - MEM_BASE;
+        return off <: ((MEM_DW as 64) << 3);
+    }
+
+    #[allow(initial_assign)]
+    var mem: logic<32> [2 * MEM_DW];
+    if HEX_EN :g_hex {
+        initial {
+            $readmemh(HEX, mem);
+        }
+    }
+
+    // ── random sources ──
+    var now_q: logic<32>    ;
+    var lf   : logic<32> [4]; // 0 AR/AW/W ready, 1 R gap and R pick, 2 R latency, 3 B latency and pick
+    always_ff {
+        if_reset {
+            now_q = 32'd0;
+            lf[0] = SEED ^ 32'h9e37_79b9 | 32'd1;
+            lf[1] = SEED ^ 32'h85eb_ca6b | 32'd1;
+            lf[2] = SEED ^ 32'hc2b2_ae35 | 32'd1;
+            lf[3] = SEED ^ 32'h27d4_eb2f | 32'd1;
+        } else {
+            now_q = now_q + 32'd1;
+            for k in 0..4 {
+                lf[k] = xs32(lf[k]);
+            }
+        }
+    }
+    let ar_stall: logic = lf[0][7:0] <: CFG.ar_bp;
+    let aw_stall: logic = lf[0][15:8] <: CFG.aw_bp;
+    let w_stall : logic = lf[0][23:16] <: CFG.w_bp;
+    let r_gap   : logic = lf[1][7:0] <: CFG.r_gap_bp;
+    let r_due   : logic<32> = now_q + (CFG.r_lat as 32) + ((lf[2][7:0] & CFG.r_lat_mask) as 32);
+    let b_due   : logic<32> = now_q + (CFG.b_lat as 32) + ((lf[3][7:0] & CFG.b_lat_mask) as 32);
+
+    // ── read requests ──
+    var rq_v   : logic           [N];
+    var rq_id  : logic<ID_W>     [N];
+    var rq_addr: logic<64>       [N];
+    var rq_len : logic<8>        [N];
+    var rq_rdy : logic<32>       [N];
+    var rq_seq : logic<16>       [N];
+    var r_seq_q: logic<16>          ;
+
+    var r_free_v: logic    ;
+    var r_free_i: logic<NW>;
+    var r_el    : logic [N];
+    var r_sel_v : logic    ;
+    var r_sel_i : logic<NW>;
+    always_comb {
+        r_free_v = 1'b0;
+        r_free_i = '0;
+        for i in 0..N {
+            if !rq_v[i] && !r_free_v {
+                r_free_v = 1'b1;
+                r_free_i = i as NW;
+            }
+        }
+        for i in 0..N {
+            r_el[i] = rq_v[i] && due(now_q, rq_rdy[i]);
+            for j in 0..N {
+                if rq_v[j] && older(rq_seq[j], rq_seq[i]) && (!CFG.reorder || rq_id[j] == rq_id[i]) {
+                    r_el[i] = 1'b0;
+                }
+            }
+        }
+        r_sel_v = 1'b0;
+        r_sel_i = '0;
+        for k in 0..N {
+            let idx: logic<NW> = lf[1][18:16] + (k as NW);
+            if r_el[idx] && !r_sel_v {
+                r_sel_v = 1'b1;
+                r_sel_i = idx;
+            }
+        }
+    }
+
+    assign o_arready = r_free_v && !ar_stall;
+    let ar_hs: logic = i_arvalid && o_arready;
+
+    var r_cur_v: logic    ;
+    var r_cur_i: logic<NW>;
+    var r_beat : logic<8> ;
+    var rvalid_q: logic       ;
+    var rid_q   : logic<ID_W> ;
+    var rdata_q : logic<64>   ;
+    var rresp_q : logic<2>    ;
+    var rlast_q : logic       ;
+
+    let r_hs     : logic     = rvalid_q && i_rready;
+    let r_nb     : logic<8>  = if r_hs ? r_beat + 8'd1 : r_beat;
+    let r_present: logic     = r_cur_v && !(r_hs && rlast_q) && (!rvalid_q || r_hs) && !r_gap;
+    let r_base   : logic<64> = rq_addr[r_cur_i];
+    let r_baddr  : logic<64> = {r_base[63:3], 3'b000} + ({56'd0, r_nb} << 3);
+    let r_off    : logic<64> = r_baddr - MEM_BASE;
+    let r_idx    : logic<MAW> = r_off[MAW + 2:3];
+    let r_in     : logic     = in_mem(r_baddr);
+
+    always_ff {
+        if_reset {
+            for i in 0..N {
+                rq_v[i]    = 1'b0;
+                rq_id[i]   = '0;
+                rq_addr[i] = '0;
+                rq_len[i]  = '0;
+                rq_rdy[i]  = '0;
+                rq_seq[i]  = '0;
+            }
+            r_seq_q  = '0;
+            r_cur_v  = 1'b0;
+            r_cur_i  = '0;
+            r_beat   = '0;
+            rvalid_q = 1'b0;
+            rid_q    = '0;
+            rdata_q  = '0;
+            rresp_q  = '0;
+            rlast_q  = 1'b0;
+        } else {
+            if r_hs {
+                rvalid_q = 1'b0;
+                if rlast_q {
+                    r_cur_v        = 1'b0;
+                    rq_v[r_cur_i] = 1'b0;
+                } else {
+                    r_beat = r_beat + 8'd1;
+                }
+            }
+            if r_present {
+                rvalid_q = 1'b1;
+                rid_q    = rq_id[r_cur_i];
+                rdata_q  = if r_in ? {mem[{r_idx, 1'b1}], mem[{r_idx, 1'b0}]} : 64'd0;
+                rresp_q  = if r_in ? OKAY : DEC;
+                rlast_q  = r_nb == rq_len[r_cur_i];
+            }
+            if !r_cur_v && r_sel_v {
+                r_cur_v = 1'b1;
+                r_cur_i = r_sel_i;
+                r_beat  = 8'd0;
+            }
+            if ar_hs {
+                rq_v[r_free_i]    = 1'b1;
+                rq_id[r_free_i]   = i_arid;
+                rq_addr[r_free_i] = i_araddr;
+                rq_len[r_free_i]  = i_arlen;
+                rq_rdy[r_free_i]  = r_due;
+                rq_seq[r_free_i]  = r_seq_q;
+                r_seq_q           = r_seq_q + 16'd1;
+            }
+        }
+    }
+    assign o_rvalid = rvalid_q;
+    assign o_rid    = rid_q;
+    assign o_rdata  = rdata_q;
+    assign o_rresp  = rresp_q;
+    assign o_rlast  = rlast_q;
+
+    // ── write requests (AW FIFO, W follows it) ──
+    var aq_id  : logic<ID_W> [N];
+    var aq_addr: logic<64>   [N];
+    var aq_len : logic<8>    [N];
+    var aq_hd  : logic<NA>  ;
+    var aq_tl  : logic<NA>  ;
+    var w_beat : logic<8>       ;
+    var w_err  : logic          ;
+
+    var bq_v   : logic       [N];
+    var bq_id  : logic<ID_W> [N];
+    var bq_rdy : logic<32>   [N];
+    var bq_seq : logic<16>   [N];
+    var bq_resp: logic<2>    [N];
+    var b_seq_q: logic<16>      ;
+
+    var b_free_v: logic    ;
+    var b_free_i: logic<NW>;
+    var b_el    : logic [N];
+    var b_sel_v : logic    ;
+    var b_sel_i : logic<NW>;
+    always_comb {
+        b_free_v = 1'b0;
+        b_free_i = '0;
+        for i in 0..N {
+            if !bq_v[i] && !b_free_v {
+                b_free_v = 1'b1;
+                b_free_i = i as NW;
+            }
+        }
+        for i in 0..N {
+            b_el[i] = bq_v[i] && due(now_q, bq_rdy[i]);
+            for j in 0..N {
+                if bq_v[j] && older(bq_seq[j], bq_seq[i]) && (!CFG.reorder || bq_id[j] == bq_id[i]) {
+                    b_el[i] = 1'b0;
+                }
+            }
+        }
+        b_sel_v = 1'b0;
+        b_sel_i = '0;
+        for k in 0..N {
+            let idx: logic<NW> = lf[3][18:16] + (k as NW);
+            if b_el[idx] && !b_sel_v {
+                b_sel_v = 1'b1;
+                b_sel_i = idx;
+            }
+        }
+    }
+
+    let aq_n    : logic<NA> = aq_tl - aq_hd;
+    let aq_h    : logic<NW>     = aq_hd[NW - 1:0];
+    assign o_awready = (aq_n != (N as NA)) && !aw_stall;
+    assign o_wready  = (aq_n != '0) && b_free_v && !w_stall;
+    let aw_hs   : logic     = i_awvalid && o_awready;
+    let w_hs    : logic     = i_wvalid && o_wready;
+    let w_head  : logic<64> = aq_addr[aq_h];
+    let w_baddr : logic<64> = {w_head[63:3], 3'b000} + ({56'd0, w_beat} << 3);
+    let w_off   : logic<64> = w_baddr - MEM_BASE;
+    let w_idx   : logic<MAW> = w_off[MAW + 2:3];
+    let w_in    : logic     = in_mem(w_baddr);
+    let w_old   : logic<64> = {mem[{w_idx, 1'b1}], mem[{w_idx, 1'b0}]};
+    var w_new   : logic<64>;
+    always_comb {
+        for b in 0..8 {
+            w_new[b step 8] = if i_wstrb[b] ? i_wdata[b step 8] : w_old[b step 8];
+        }
+    }
+
+    always_ff {
+        if_reset {} else if w_hs && w_in {
+            mem[{w_idx, 1'b0}] = w_new[31:0];
+            mem[{w_idx, 1'b1}] = w_new[63:32];
+        }
+    }
+
+    var bvalid_q: logic      ;
+    var bid_q   : logic<ID_W>;
+    var bresp_q : logic<2>   ;
+    let b_hs    : logic       = bvalid_q && i_bready;
+
+    always_ff {
+        if_reset {
+            for i in 0..N {
+                aq_id[i]   = '0;
+                aq_addr[i] = '0;
+                aq_len[i]  = '0;
+                bq_v[i]    = 1'b0;
+                bq_id[i]   = '0;
+                bq_rdy[i]  = '0;
+                bq_seq[i]  = '0;
+                bq_resp[i] = '0;
+            }
+            aq_hd    = '0;
+            aq_tl    = '0;
+            w_beat   = '0;
+            w_err    = 1'b0;
+            b_seq_q  = '0;
+            bvalid_q = 1'b0;
+            bid_q    = '0;
+            bresp_q  = '0;
+        } else {
+            if aw_hs {
+                aq_id[aq_tl[NW - 1:0]]   = i_awid;
+                aq_addr[aq_tl[NW - 1:0]] = i_awaddr;
+                aq_len[aq_tl[NW - 1:0]]  = i_awlen;
+                aq_tl                    = aq_tl + 1;
+            }
+            if w_hs {
+                if w_beat == aq_len[aq_h] {
+                    bq_v[b_free_i]    = 1'b1;
+                    bq_id[b_free_i]   = aq_id[aq_h];
+                    bq_rdy[b_free_i]  = b_due;
+                    bq_seq[b_free_i]  = b_seq_q;
+                    bq_resp[b_free_i] = if w_err || !w_in ? DEC : OKAY;
+                    b_seq_q           = b_seq_q + 16'd1;
+                    aq_hd             = aq_hd + 1;
+                    w_beat            = 8'd0;
+                    w_err             = 1'b0;
+                } else {
+                    w_beat = w_beat + 8'd1;
+                    w_err  = w_err || !w_in;
+                }
+            }
+            if b_hs {
+                bvalid_q = 1'b0;
+            }
+            if (!bvalid_q || b_hs) && b_sel_v {
+                bvalid_q         = 1'b1;
+                bid_q            = bq_id[b_sel_i];
+                bresp_q          = bq_resp[b_sel_i];
+                bq_v[b_sel_i]   = 1'b0;
+            }
+        }
+    }
+    assign o_bvalid = bvalid_q;
+    assign o_bid    = bid_q;
+    assign o_bresp  = bresp_q;
+}
