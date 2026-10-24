@@ -843,6 +843,7 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 - 遅延と backpressure の parameter (channel ごと): AR と AW の受理の遅れ、R の初回遅延と beat 間の隙間、W の ready の確率、B の遅延、R と B の ID 間の順不同 (同じ ID の中は順序を守る)。乱数は seed を parameter に持つ LFSR で作る。`$random` は使わない。理由: Verilator でも同じ列が出て (GV)、失敗した seed を回帰に固定できる。
 - 設定の名前を 4 つに固定する: `FIXED` (固定遅延。AR と AW は即受理、初回遅延は固定、beat は毎サイクル、W は常に ready)、`SLOW` (遅延が大きい。outstanding が 1 に近い)、`BACKPRESSURE` (遅延は小さく、全 channel の ready を確率で落とす)、`REORDER` (複数 ID の応答が順不同に返る)。各設定は seed を持つ。
 - 単体テスト: model だけを protocol checker の下で駆動する (master 役の tb が合法な取引と、わざと違反した取引を出し、checker が違反を捕まえること)。
+- 【MM で決定】実装: `tb/axi4_slave_model.veryl`、設定は `tb/axi4_tb_pkg.veryl` の `SlaveCfg` (`FIXED`/`SLOW`/`BACKPRESSURE`/`REORDER`) と `SEED`、乱数は channel ごとの xorshift32。model は AW を受けた後にだけ W を取り (AXI が許す)、R の burst は 1 本ずつ (interleave しない)、範囲外は DECERR。単体テストは `tb/test_axi4.veryl` で、4 設定の clean run (16 burst の write と read-back、master は RREADY/BREADY を乱数で落とす) と、違反の注入 13 種を G0 に置く (合わせて数秒)。ROM の領域 (U44) は SoC につなぐ手順で足す。
 
 ### 10.2 固定遅延の設定と cycles の許容
 
@@ -855,6 +856,7 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 - tb のモジュール `axi4_mon` が、SoC の AXI4 ポートに常時接続する。違反は sticky flag の群で出し、`$error` や SV の assert は使わない (JIT で panic するため)。flag は `o_chk` に似た形で各 harness の合否に含める (§2.3)。
 - 検査する規則 (master の側と、slave model の側の両方): valid は ready まで下げない。valid のあいだ payload (アドレス、ID、LEN、SIZE、BURST、strb、data、LAST) が変わらない。valid が ready に依存して立たない (ready を待たずに立つ)。`RLAST`、`WLAST` が burst の最後の beat だけに立つ。W の beat 数が `AWLEN + 1` に一致する。INCR の burst が 4 KiB をまたがない。AR と R、AW と B の ID の対応 (応答の無い ID の応答が来ない、同じ ID の順序)。outstanding が param の上限以下。reset 後に valid が 0。
 - 各規則に、わざと違反した取引で flag が立つ単体テストを 1 本付ける (§10.1 の単体テスト)。
+- 【MM で決定】実装は `tb/axi4_mon.veryl`、flag は `axi4_tb_pkg::CHK_*` の 12 本。「valid が ready に依存して立たない」と「reset 中の valid が 0」は、クロックの edge で標本化する monitor からは観測できないので flag にしない (前者は master の RTL のレビューで、後者は valid が reset された register から出ることで守る)。同じ ID の順序は「応答はその ID の最古の未完了の要求のもの」として beat 数と `xLAST` の照合に含める。AW より先に終わった W の burst は 1 本だけ追跡する (mem_ctrl は AW と W を同時に立てるので足りる)。
 - 判定: G0 を含む新コアの AXI を持つ全 run で、すべての flag が 0。
 
 ### 10.4 乱数遅延のゲート (GM) と directed
