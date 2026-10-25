@@ -876,6 +876,23 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 - 発火 (GF): 設計書 MM.5 の I1 (read を write の B まで止めた回数)、I4 (`install_ok` が落ちた回数)、write buffer 満杯での write grant の停止、AR の停止 (line buffer の確保失敗) の事象を `o_perf` に出し、乱数遅延の run で 0 より大きいことを `fire_check.py` で確かめる。`FIXED` では I1 と I4 が 0 でもよい。
 - V14: 梯子 1-5 と dhrystone/coremark のビット一致 (設計書 MM.7)。V14 の枝の経路は AXI の slave model を通らない。
 
+### 10.5 MM の最初の実装の記録 (手順 2-5、固定遅延)
+
+- 範囲: U45 の凍結コピー `src/v14/v14_mem_ctrl.veryl` (SoC の V14 の枝だけが使う)、新コアの `mem_ctrl` の read path (AR/R、`ARID` = slot、line は `ARLEN = 7`、uncached と ROM は `ARLEN = 0`)、write path (`WB_N = 2 × N_HARTS` の FIFO、`AWID = 0`、strobe の lane 範囲の 1 burst、B で解放、I1)、U44 の ROM (SoC の `mc_unc` を `pma_check` の target ∈ {DRAM, ROM} に替え、ROM の内容は slave model が持つ)。harness は `boot_soc_harness` と `arch_soc_harness` が `tb/axi4_mem.veryl` (`axi4_slave_model` + `axi4_mon`) を `FIXED` でつなぎ、`axi4_mon` の flag は retire_mon の chk に入る (GP)。
+- 未着手: GF の事象 (I1、I4、write buffer 満杯、AR の停止) の `o_perf`、U46 の sticky な error 観測、GM (乱数設定での再走)、§10.4 の directed、GV、U47。
+- slave model は ROM も DRAM と同じ `r_lat` で返す (`FIXED` は 20)。
+
+| ゲート (W2、`FIXED`) | MM の前 (`0ebac00`) | MM |
+|---|---|---|
+| G0 | 860 passed (M4 の記録) | 865 passed、0 failed |
+| GL-B | 14,316,714 | 15,597,260 (+8.9 %)。record 10,417,776、hash `74d4b7982390260f`、chk 0 (AXI の flag を含む) |
+| GB2 | 19,082,790 | 20,880,466 (+9.4 %)、pass、chk 0 (両 hart) |
+| cbench dhrystone / coremark / fpmm / spmv | 268,712 / 381,245 / 1,044,649 / 41,165 | 268,776 / 381,354 / 1,046,441 / 42,819 |
+| V14 dhrystone / coremark | 235,804 (instret 264,834) / 394,546 (374,357) | 同じ (ビット一致) |
+| V14 5.15 N=1 boot | cy=0x00ba9d70 | 同じ |
+
+- GL-B の +8.9 % は §10.2 の許容をまだ決めていない段階の値である。主な候補は ROM の fetch (以前は組合せの legacy の経路、いまは 1 beat ごとに AXI の往復) と、write が 1 サイクルの posted から 1 beat/サイクルの W に変わったこと。分解は GF の事象を足してから行う。
+
 ---
 
 ## 付録 B. 許容差異表
