@@ -100,6 +100,7 @@ pub module mem_ctrl #(
     // a dirty copy home), then reads one AXI beat. It adds no sharer and
     // installs nothing. o_hhold: the beat has not been granted yet.
     i_hunc : input  logic [N_SLOTS],
+    i_hrom : input  logic [N_SLOTS], // the i_hunc read targets ROM (o_perf only)
     o_hhold: output logic [N_SLOTS],
     o_hexcl: output logic [N_SLOTS],
     // Bus side: read-channel cycle requests of legacy (MMIO) reads, which
@@ -210,6 +211,8 @@ pub module mem_ctrl #(
     o_w_cadd_v   : output logic   ,
     o_w_cadd_hart: output logic<3>,
     o_w_cadd_own : output logic   ,
+    // Event wires; wb_full is left 0 (the SoC sees the write requests).
+    o_perf: output soc_pkg::McPerf,
 ) {
     // Slot states.
     const ST_IDLE   : logic<3> = 3'd0;
@@ -235,6 +238,8 @@ pub module mem_ctrl #(
     var iread_all  : logic     [N_SLOTS]    ; // P9.6: slot transaction is an I-read (uncounted)
     var unc_all    : logic     [N_SLOTS]    ; // slot transaction is an uncached single beat
     var dw_all     : logic<3>  [N_SLOTS]    ; // the dword of an uncached beat
+    var rom_all    : logic     [N_SLOTS]    ; // ... which targets ROM (o_perf only)
+    var rd_fly     : logic     [N_SLOTS]    ; // AR presented or R beats arriving
     var inst_go_all: logic     [N_SLOTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
     var lk_go_all  : logic     [N_SLOTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
     var lk_excl_w  : logic                  ; // P9.2: grant state for the lookup go
@@ -397,6 +402,7 @@ pub module mem_ctrl #(
         var rfo_q  : logic        ; // transaction is a read-for-ownership
         var iread_q: logic        ; // transaction is an I-read (uncounted)
         var unc_q  : logic        ;
+        var rom_q  : logic        ;
         var excl_q : logic        ; // grant state (E/M vs S), set at grant
         var buf_q  : logic<64> [8];
 
@@ -407,9 +413,11 @@ pub module mem_ctrl #(
         assign rfo_all[h]   = rfo_q;
         assign iread_all[h] = iread_q;
         assign unc_all[h]   = unc_q;
+        assign rom_all[h]   = rom_q;
         // The uncached requester may leave (kill) or move to another line.
         let unc_live: logic = i_hreq[h] && i_hunc[h] && (i_haddr[h][63:6] == line_q);
         let ar_mine : logic = ar_busy_q && (ar_slot_q == (h as ID_W));
+        assign rd_fly[h] = ar_mine || (st_q == ST_GATHER);
         for l in 0..8 :gen_buf_exp {
             assign buf_all[h * 8 + l] = buf_q[l];
         }
@@ -430,6 +438,7 @@ pub module mem_ctrl #(
                 rfo_q   = 1'b0;
                 iread_q = 1'b0;
                 unc_q   = 1'b0;
+                rom_q   = 1'b0;
                 excl_q  = 1'b0;
                 for l in 0..8 {
                     buf_q[l] = 64'd0;
@@ -447,6 +456,7 @@ pub module mem_ctrl #(
                             rfo_q   = i_hrfo[h] && !i_hunc[h];
                             iread_q = i_iread[h];
                             unc_q   = i_hunc[h];
+                            rom_q   = i_hunc[h] && i_hrom[h];
                             excl_q  = 1'b0;
                             st_q    = ST_LOOKUP;
                         }
@@ -829,18 +839,19 @@ pub module mem_ctrl #(
     // takes the channel when it is free or frees this cycle; the AR then
     // holds from registers until ARREADY.
     // ------------------------------------------------------------------
+    var ar_wt  : logic [N_SLOTS]; // in ST_AR, AR not presented yet
+    var ar_haz : logic [N_SLOTS];
     var ar_cand: logic [N_SLOTS];
     always_comb {
         for h in 0..N_SLOTS {
-            ar_cand[h] = (st_all[h] == ST_AR) && !(ar_busy_q && (ar_slot_q == (h as ID_W)));
-            if i_w_valid && (w_line == line_all[h]) {
-                ar_cand[h] = 1'b0;
-            }
+            ar_wt[h]  = (st_all[h] == ST_AR) && !(ar_busy_q && (ar_slot_q == (h as ID_W)));
+            ar_haz[h] = i_w_valid && (w_line == line_all[h]);
             for e in 0..WB_N {
                 if wb_v[e] && (wb_line[e] == line_all[h]) {
-                    ar_cand[h] = 1'b0;
+                    ar_haz[h] = 1'b1;
                 }
             }
+            ar_cand[h] = ar_wt[h] && !ar_haz[h];
         }
     }
     var ar_found: logic [N_SLOTS];
@@ -1092,4 +1103,40 @@ pub module mem_ctrl #(
         }
     }
     assign o_l2_inst_v = inst_sel_v && inst_do && !inst_blocked;
+
+    // ------------------------------------------------------------------
+    // Event wires.
+    // ------------------------------------------------------------------
+    // Write-buffer entries whose AW is presented or accepted and whose B is
+    // still due: the oldest wb_n - aw_n (+1 while an AW is presented).
+    var wr_fly: logic [WB_N];
+    for e in 0..WB_N :gen_wrfly {
+        let age : logic<WBC> = if (e as WBI) >= wb_hd ? (e as WBC) - (wb_hd as WBC) : (e as WBC) + (WB_N as WBC) - (wb_hd as WBC);
+        let sent: logic<WBC> = wb_n - aw_n;
+        assign wr_fly[e] = (age <: wb_n) && (age <: sent || ((age == sent) && (aw_n != '0)));
+    }
+    always_comb {
+        o_perf            = 0;
+        o_perf.ar_line    = ar_hs && !ar_unc;
+        o_perf.ar_dram1   = ar_hs && ar_unc && !rom_all[ar_slot_q];
+        o_perf.ar_rom     = ar_hs && ar_unc && rom_all[ar_slot_q];
+        o_perf.aw         = aw_hs;
+        o_perf.w_beat     = w_hs;
+        o_perf.ar_bp      = o_arvalid && !i_arready;
+        o_perf.inst_abort = inst_sel_v && !inst_do && !inst_blocked;
+        for h in 0..N_SLOTS {
+            if ar_wt[h] && ar_haz[h] {
+                o_perf.i1_hold = 1'b1;
+            }
+            if ar_wt[h] && !ar_haz[h] && !ar_take[h] {
+                o_perf.ar_wait = 1'b1;
+            }
+            o_perf.lat_line[h]  = rd_fly[h] && !unc_all[h];
+            o_perf.lat_dram1[h] = rd_fly[h] && unc_all[h] && !rom_all[h];
+            o_perf.lat_rom[h]   = rd_fly[h] && unc_all[h] && rom_all[h];
+        }
+        for e in 0..WB_N {
+            o_perf.lat_wr[e] = wr_fly[e];
+        }
+    }
 }

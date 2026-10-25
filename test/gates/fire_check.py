@@ -8,11 +8,13 @@ Each log is the output of a run whose harness instantiates tb/perf_acc.veryl
 (plain text or a `veryl test --format json` report). perf_acc prints, per
 test, one `PERF` layout line, `PB <core> <bit> <count>` for every nonzero bit
 of core_types::CorePerf and `PK <core> <kind> <count>` for full kills by
-RedirKind. This script sums the counts per (gate, core), names the bits from
-the struct definitions in src/core/common/core_types.veryl and xlate_pkg.veryl
-(checking the width against the PERF line), and judges every matrix row:
+RedirKind; tb/mc_perf_acc.veryl prints the same lines as core 0 for the SoC's
+soc_pkg::McPerf. This script sums the counts per (gate, core), names the bits
+from the struct definitions in src/core/common/core_types.veryl, xlate_pkg.veryl
+and src/core/soc_pkg.veryl (checking the width against the PERF line), and
+judges every matrix row:
 
-    <event> <gate>[:w2|:w4][,<gate>...]
+    <event> <gate>[:w2|:w4|:mc][,<gate>...]
 
 <event> names a leaf (`dc.r_bank`) or a prefix of leaves (`mp`, `iq[1]`);
 an event without an index matches every element (`mp.split` = `mp[*].split`);
@@ -31,8 +33,10 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SRC = [ROOT / "src/core/common/core_types.veryl", ROOT / "src/core/common/xlate_pkg.veryl"]
-CORES = {2: "w2", 4: "w4"}
+SRC = [ROOT / "src/core/common/core_types.veryl", ROOT / "src/core/common/xlate_pkg.veryl",
+       ROOT / "src/core/soc_pkg.veryl"]
+CORES = {0: "mc", 2: "w2", 4: "w4"}
+ROOTS = {0: "McPerf"}  # the struct a core id's PB bits index, CorePerf otherwise
 
 # Readable names for the bits of plain vector fields, MSB first.
 VEC_NAMES = {
@@ -49,9 +53,11 @@ def strip_comments(s):
 
 
 def parse_sources():
-    structs, enums = {}, {}
+    structs, enums, consts = {}, {}, {}
     for f in SRC:
         s = strip_comments(f.read_text())
+        for m in re.finditer(r"\bconst\s+(\w+)\s*:\s*u32\s*=\s*(\d+)\s*;", s):
+            consts[m.group(1)] = int(m.group(2))
         for m in re.finditer(r"\benum\s+(\w+)\s*:\s*logic\s*<\s*(\d+)\s*>\s*\{(.*?)\}", s, re.S):
             members = [x.strip().split("=")[0].strip() for x in m.group(3).split(",") if x.strip()]
             enums[m.group(1)] = (int(m.group(2)), members)
@@ -64,7 +70,7 @@ def parse_sources():
                     fields.append((name.strip(), re.sub(r"\s+", "", typ)))
             if all(t for _, t in fields):
                 structs[m.group(1)] = fields
-    return structs, enums
+    return structs, enums, consts
 
 
 def eval_dim(expr, syms):
@@ -164,7 +170,7 @@ def main():
     ap.add_argument("logs", nargs="+", metavar="gate=log")
     a = ap.parse_args()
 
-    structs, enums = parse_sources()
+    structs, enums, consts = parse_sources()
     bits = defaultdict(lambda: defaultdict(int))  # (gate, core) -> bit -> count
     kinds = defaultdict(lambda: defaultdict(int))  # (gate, core) -> kind -> count
     hdr = {}  # core -> PERF fields
@@ -190,14 +196,16 @@ def main():
     rk_w, rk_names = enums["RedirKind"]
     layouts = {}
     for core, (_, perf_w, width, n_iq, iw, mw, wbn, rcw) in hdr.items():
-        lay = Layout(structs, enums, {"N_IQ": n_iq, "ISSUE_W": iw, "MEM_W": mw, "WB_N": wbn, "RETIRE_CNT_W": rcw})
-        w = lay.width("CorePerf")
+        syms = dict(consts, N_IQ=n_iq, ISSUE_W=iw, MEM_W=mw, WB_N=wbn, RETIRE_CNT_W=rcw)
+        lay = Layout(structs, enums, syms)
+        top = ROOTS.get(core, "CorePerf")
+        w = lay.width(top)
         if w != width or w > perf_w:
-            print("fire_check: core %d CorePerf is %d bits in the sources, %d in the run (PERF_W %d)"
-                  % (core, w, width, perf_w), file=sys.stderr)
+            print("fire_check: core %d %s is %d bits in the sources, %d in the run (PERF_W %d)"
+                  % (core, top, w, width, perf_w), file=sys.stderr)
             return 2
         out = []
-        lay.leaves("CorePerf", "", 0, out)
+        lay.leaves(top, "", 0, out)
         layouts[core] = out
 
     def leaf_counts(gate, core):
@@ -209,7 +217,7 @@ def main():
                 continue
             res[name] = sum(b.get(lsb + i, 0) for i in range(w))
         k = kinds.get((gate, core), {})
-        for i, n in enumerate(rk_names):
+        for i, n in enumerate(rk_names if core not in ROOTS else []):
             if n != "BR":  # partial kills, counted by flush.partial
                 res["flush.full_kind." + n] = k.get(i, 0)
         return res
