@@ -1,0 +1,194 @@
+// axi4_sram: a synthesizable AXI4 slave over a simple dual-port RAM (one
+// read port, one byte-enable write port), an example of the memory the SoC's
+// AXI4 master port expects (an FPGA BRAM, or the first step of a bring-up).
+//
+// Ports (timing contract):
+//   AXI4 slave, 64-bit data, 56-bit address. Bursts are INCR of AxSIZE 3
+//   (all the SoC issues); AxBURST and AxSIZE are not decoded. Every output
+//   comes from registers. A burst with any beat outside [BASE, BASE + 8 *
+//   DEPTH) answers DECERR: its reads return undefined data, its writes are
+//   dropped.
+// Owns:
+//   - one read burst and one write burst at a time, each in request order,
+//     so the responses of every ID keep request order
+//   - the next AR is taken after the last R of the burst; the next AW after
+//     the B of the burst; W is taken only for an accepted AW
+//   - R beats stream one per cycle while RREADY is high; the RAM read is
+//     issued only when the output register is free or drains this cycle
+// Rationale:
+//   - a burst-at-a-time slave keeps the per-ID order rule trivially and the
+//     RAM a plain 1R1W array; it gives up overlap, which the SoC's master
+//     tolerates (it never relies on more than one outstanding transaction)
+module axi4_sram #(
+    param ID_W    : u32     = 4             ,
+    param BASE    : bit<56> = 56'h8000_0000 ,
+    param DEPTH   : u32     = 1024          , // 64-bit words, a power of 2
+    param INIT_EN : bit     = 1'b0          ,
+    param INIT_HEX: string  = ""            , // one 64-bit word per line
+) (
+    clk      : input  clock       ,
+    rst      : input  reset       ,
+    i_arvalid: input  logic       ,
+    o_arready: output logic       ,
+    i_arid   : input  logic<ID_W> ,
+    i_araddr : input  logic<56>   ,
+    i_arlen  : input  logic<8>    ,
+    o_rvalid : output logic       ,
+    i_rready : input  logic       ,
+    o_rid    : output logic<ID_W> ,
+    o_rdata  : output logic<64>   ,
+    o_rresp  : output logic<2>    ,
+    o_rlast  : output logic       ,
+    i_awvalid: input  logic       ,
+    o_awready: output logic       ,
+    i_awid   : input  logic<ID_W> ,
+    i_awaddr : input  logic<56>   ,
+    i_awlen  : input  logic<8>    ,
+    i_wvalid : input  logic       ,
+    o_wready : output logic       ,
+    i_wdata  : input  logic<64>   ,
+    i_wstrb  : input  logic<8>    ,
+    o_bvalid : output logic       ,
+    i_bready : input  logic       ,
+    o_bid    : output logic<ID_W> ,
+    o_bresp  : output logic<2>    ,
+) {
+    const AW  : u32      = $clog2(DEPTH);
+    const OKAY: logic<2> = 2'b00;
+    const DEC : logic<2> = 2'b11;
+
+    // Every beat of the burst lies inside the RAM.
+    function in_ram (
+        a  : input logic<56>,
+        len: input logic<8> ,
+    ) -> logic {
+        let off: logic<56> = a - BASE;
+        let lst: logic<56> = off + ({48'd0, len} << 3);
+        return (off <: ((DEPTH as 56) << 3)) && (lst <: ((DEPTH as 56) << 3));
+    }
+
+    var mem: logic<64> [DEPTH];
+    if INIT_EN :g_init {
+        #[allow(initial_assign)]
+        initial {
+            $readmemh(INIT_HEX, mem);
+        }
+    }
+
+    // ── read ──
+    var rd_act  : logic    ;
+    var rd_n    : logic<9> ; // beats not yet read from the RAM
+    var rd_idx  : logic<AW>;
+    var rvalid_q: logic    ;
+    var rid_q   : logic<ID_W>;
+    var rdata_q : logic<64>;
+    var rresp_q : logic<2> ;
+    var rlast_q : logic    ;
+
+    assign o_arready = !rd_act;
+    let ar_hs  : logic     = i_arvalid && !rd_act;
+    let r_hs   : logic     = rvalid_q && i_rready;
+    let fetch  : logic     = rd_act && (rd_n != 9'd0) && (!rvalid_q || r_hs);
+    let ar_off : logic<56> = i_araddr - BASE;
+
+    always_ff {
+        if fetch {
+            rdata_q = mem[rd_idx];
+        }
+    }
+    always_ff {
+        if_reset {
+            rd_act   = 1'b0;
+            rd_n     = 9'd0;
+            rd_idx   = '0;
+            rvalid_q = 1'b0;
+            rid_q    = '0;
+            rresp_q  = OKAY;
+            rlast_q  = 1'b0;
+        } else {
+            if ar_hs {
+                rd_act  = 1'b1;
+                rd_n    = {1'b0, i_arlen} + 9'd1;
+                rd_idx  = ar_off[AW + 2:3];
+                rid_q   = i_arid;
+                rresp_q = if in_ram(i_araddr, i_arlen) ? OKAY : DEC;
+            }
+            if fetch {
+                rvalid_q = 1'b1;
+                rlast_q  = rd_n == 9'd1;
+                rd_n     = rd_n - 9'd1;
+                rd_idx   = rd_idx + 1;
+            } else if r_hs {
+                rvalid_q = 1'b0;
+            }
+            if r_hs && rlast_q {
+                rd_act = 1'b0;
+            }
+        }
+    }
+    assign o_rvalid = rvalid_q;
+    assign o_rid    = rid_q;
+    assign o_rdata  = rdata_q;
+    assign o_rresp  = rresp_q;
+    assign o_rlast  = rlast_q;
+
+    // ── write ──
+    var wr_act  : logic      ;
+    var wr_n    : logic<8>   ; // beats left after this one
+    var wr_idx  : logic<AW>  ;
+    var wr_err  : logic      ;
+    var bvalid_q: logic      ;
+    var bid_q   : logic<ID_W>;
+    var bresp_q : logic<2>   ;
+
+    assign o_awready = !wr_act && !bvalid_q;
+    assign o_wready  = wr_act;
+    let aw_hs : logic     = i_awvalid && !wr_act && !bvalid_q;
+    let w_hs  : logic     = i_wvalid && wr_act;
+    let b_hs  : logic     = bvalid_q && i_bready;
+    let aw_off: logic<56> = i_awaddr - BASE;
+
+    always_ff {
+        if w_hs && !wr_err {
+            for b in 0..8 {
+                if i_wstrb[b] {
+                    mem[wr_idx][b step 8] = i_wdata[b step 8];
+                }
+            }
+        }
+    }
+    always_ff {
+        if_reset {
+            wr_act   = 1'b0;
+            wr_n     = 8'd0;
+            wr_idx   = '0;
+            wr_err   = 1'b0;
+            bvalid_q = 1'b0;
+            bid_q    = '0;
+            bresp_q  = OKAY;
+        } else {
+            if aw_hs {
+                wr_act = 1'b1;
+                wr_n   = i_awlen;
+                wr_idx = aw_off[AW + 2:3];
+                wr_err = !in_ram(i_awaddr, i_awlen);
+                bid_q  = i_awid;
+            }
+            if w_hs {
+                wr_idx = wr_idx + 1;
+                wr_n   = wr_n - 8'd1;
+                if wr_n == 8'd0 {
+                    wr_act   = 1'b0;
+                    bvalid_q = 1'b1;
+                    bresp_q  = if wr_err ? DEC : OKAY;
+                }
+            }
+            if b_hs {
+                bvalid_q = 1'b0;
+            }
+        }
+    }
+    assign o_bvalid = bvalid_q;
+    assign o_bid    = bid_q;
+    assign o_bresp  = bresp_q;
+}
