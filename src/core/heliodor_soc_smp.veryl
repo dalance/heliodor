@@ -36,6 +36,8 @@ pub module heliodor_soc_smp #(
     param PMA_REGIONS: pma_pkg::PmaRegion     [PMA_N] = '{
         default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
     },
+    // AXI ID width of the new-core DRAM port: the ARID is the mem_ctrl slot.
+    param AXI_ID_W: u32 = $clog2(N_HARTS * 2),
 ) (
     clk: input clock,
     rst: input reset,
@@ -47,18 +49,59 @@ pub module heliodor_soc_smp #(
     o_iptw_addr : output logic<64> [N_HARTS],
     o_iptw_req  : output logic     [N_HARTS],
     i_iptw_rdata: input  logic<64> [N_HARTS],
-    // Shared data DRAM (MMIO stripped out internally; tb serves DRAM)
-    // S25: DRAM writes are LINE transactions — 8 dword lanes + per-lane byte
-    // strobes (lanes with wstrb==0 are dont-care); the hi-side bypass stays
-    // dword-wide.
+    // Old-core DRAM port (CORE == V14 only, 0 otherwise; MMIO stripped out
+    // internally; tb serves DRAM). S25: DRAM writes are LINE transactions,
+    // 8 dword lanes + per-lane byte strobes (lanes with wstrb==0 are dont-
+    // care); the hi-side bypass stays dword-wide.
     o_dmem_addr    : output logic<64>    ,
     o_dmem_wdata   : output logic<64> [8],
-    i_dmem_rdata   : input  logic<64>    ,
+    i_dmem_rdata   : input  logic<64>     = 0,
     o_dmem_wen     : output logic        ,
     o_dmem_ren     : output logic        ,
     o_dmem_wstrb   : output logic<8>  [8],
     o_dmem_wdata_hi: output logic<64>    ,
     o_dmem_wstrb_hi: output logic<8>     ,
+    // New-core DRAM and ROM port (CORE != V14 only, idle otherwise): AXI4
+    // master, 64-bit data, INCR bursts of AxSIZE 3, 56-bit PA. A line read
+    // is ARLEN 7 from the line base, an uncached read ARLEN 0; a write is
+    // one burst over its strobed lanes of one line. RREADY and BREADY are 1.
+    o_axi_arvalid: output logic          ,
+    i_axi_arready: input  logic           = 1'b0,
+    o_axi_arid   : output logic<AXI_ID_W>,
+    o_axi_araddr : output logic<56>      ,
+    o_axi_arlen  : output logic<8>       ,
+    o_axi_arsize : output logic<3>       ,
+    o_axi_arburst: output logic<2>       ,
+    o_axi_arlock : output logic          ,
+    o_axi_arcache: output logic<4>       ,
+    o_axi_arprot : output logic<3>       ,
+    o_axi_arqos  : output logic<4>       ,
+    i_axi_rvalid : input  logic           = 1'b0,
+    o_axi_rready : output logic          ,
+    i_axi_rid    : input  logic<AXI_ID_W> = 0,
+    i_axi_rdata  : input  logic<64>       = 0,
+    i_axi_rresp  : input  logic<2>        = 0,
+    i_axi_rlast  : input  logic           = 1'b0,
+    o_axi_awvalid: output logic          ,
+    i_axi_awready: input  logic           = 1'b0,
+    o_axi_awid   : output logic<AXI_ID_W>,
+    o_axi_awaddr : output logic<56>      ,
+    o_axi_awlen  : output logic<8>       ,
+    o_axi_awsize : output logic<3>       ,
+    o_axi_awburst: output logic<2>       ,
+    o_axi_awlock : output logic          ,
+    o_axi_awcache: output logic<4>       ,
+    o_axi_awprot : output logic<3>       ,
+    o_axi_awqos  : output logic<4>       ,
+    o_axi_wvalid : output logic          ,
+    i_axi_wready : input  logic           = 1'b0,
+    o_axi_wdata  : output logic<64>      ,
+    o_axi_wstrb  : output logic<8>       ,
+    o_axi_wlast  : output logic          ,
+    i_axi_bvalid : input  logic           = 1'b0,
+    o_axi_bready : output logic          ,
+    i_axi_bid    : input  logic<AXI_ID_W> = 0,
+    i_axi_bresp  : input  logic<2>        = 0,
     // UART TX observation (shared)
     o_uart_tx_valid: output logic   ,
     o_uart_tx_data : output logic<8>,
@@ -175,6 +218,9 @@ pub module heliodor_soc_smp #(
     var c_dmemw_addr   : logic<64> [N_HARTS];
     var c_dmemw_req    : logic     [N_HARTS];
 
+    // The new cores reach DRAM and ROM through the AXI4 port.
+    const AXI: bit = CORE != soc_pkg::CoreSel::V14;
+
     // Per-hart MMIO address decode.
     var in_dram : logic [N_HARTS];
     var in_clint: logic [N_HARTS];
@@ -224,6 +270,9 @@ pub module heliodor_soc_smp #(
     var l2_inst_addr : logic<64>          ;
     var l2_inst_data : logic<64> [8]      ;
     var l2_mem_addr  : logic<64>          ;
+    var l2_mem_wdata : logic<64> [8]      ;
+    var l2_mem_wstrb : logic<8>  [8]      ;
+    var l2_mem_wen   : logic              ;
     // P9.2: directory wires (mem_ctrl <-> l2cache) + precise invalidates.
     var l2_cadd_v    : logic              ;
     var l2_cadd_hart : logic<3>           ;
@@ -268,6 +317,16 @@ pub module heliodor_soc_smp #(
     var l2_wcadd_v   : logic   ;
     var l2_wcadd_hart: logic<3>;
     var l2_wcadd_own : logic   ;
+    // A new core's single beat to DRAM or ROM is an uncached AXI read in
+    // mem_ctrl; only its MMIO single beats use the bus read channel.
+    var d_on_axi: logic [N_HARTS];
+    var i_on_axi: logic [N_HARTS];
+    for h in 0..N_HARTS :gen_axidec {
+        let d_attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(c_dmem_addr[h][55:0], PMA_REGIONS);
+        let i_attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(c_imemr_addr[h][55:0], PMA_REGIONS);
+        assign d_on_axi[h] = d_attr.backed && (d_attr.target != pma_pkg::Target::IO);
+        assign i_on_axi[h] = i_attr.backed && (i_attr.target != pma_pkg::Target::IO);
+    }
     for h in 0..N_HARTS :gen_busin {
         // P9.1: the bus read channel now arbitrates LEGACY (single-beat: MMIO /
         // firmware-ROM, and a new core's uncached reads of any address)
@@ -275,10 +334,11 @@ pub module heliodor_soc_smp #(
         // transactions are accepted/streamed by mem_ctrl. mem_ctrl gives the
         // hart's bus grant to its D slot before its I slot.
         // A single beat held by mem_ctrl for a recall is not on the bus.
-        let d_single: logic = c_dmem_req[h] && !c_dmem_line[h] && !ctrl_hhold[h];
-        let i_single: logic = c_imemr_req[h] && !c_imemr_line[h] && !ctrl_hhold[N_HARTS + h];
+        let d_single: logic = c_dmem_req[h] && !c_dmem_line[h] && (if AXI ? !d_on_axi[h] : !ctrl_hhold[h]);
+        let i_single: logic = c_imemr_req[h] && !c_imemr_line[h] && (if AXI ? !i_on_axi[h] : !ctrl_hhold[N_HARTS + h]);
         assign bus_in_raddr[h] = if !d_single && i_single ? c_imemr_addr[h] : c_dmem_addr[h];
-        assign bus_in_ren[h]   = (c_dmem_ren[h] && !c_dmem_line[h] && !ctrl_hhold[h]) || (i_single && ctrl_hgrant[N_HARTS + h]);
+        assign bus_in_ren[h]   = (c_dmem_ren[h] && !c_dmem_line[h] && (if AXI ? !d_on_axi[h] : !ctrl_hhold[h]))
+            || (i_single && ctrl_hgrant[N_HARTS + h]);
         assign bus_in_rreq[h]  = ctrl_bus_rreq[h];
         assign bus_in_waddr[h] = c_dmemw_addr[h];
         for l in 0..8 :gen_busin_lane {
@@ -325,6 +385,7 @@ pub module heliodor_soc_smp #(
     // one address port).
     var bus_dramr_ren: logic;
     var ctrl_mem_busy: logic;
+    var ctrl_wb_full : logic; // new cores: the AXI write buffer is full
     let w_in_clint: logic = bus_dramw_addr[31:24] == 8'h02;
     let w_in_uart : logic = bus_dramw_addr[31:28] == 4'h1;
     let w_in_plic : logic = bus_dramw_addr[31:24] == 8'h0c; // P9.5: PLIC
@@ -333,7 +394,7 @@ pub module heliodor_soc_smp #(
     let r_in_plic : logic = bus_dramr_addr[31:24] == 8'h0c;
     // P9.5: PLIC reads are internal MMIO (served by plic_rdata), not legacy
     // firmware-ROM reads — exclude them from driving the external read port.
-    let legacy_ext_read: logic = bus_dramr_ren && !r_in_clint && !r_in_uart && !r_in_plic;
+    let legacy_ext_read: logic = !AXI && bus_dramr_ren && !r_in_clint && !r_in_uart && !r_in_plic;
     var clint_wen_w: logic;
     var clint_ren_w: logic;
     var uart_wen_w : logic;
@@ -385,7 +446,7 @@ pub module heliodor_soc_smp #(
     // analyzer tripping on a bundled l2 output. 0 unless L2_READ_1R1W (o_w_hit
     // is gated). Comb on pre-grant selection + registered spec state — no loop.
     let l2_w_spec_hold: logic = wv_req_on && l2_w_hit && !l2_w_spec_ready;
-    let wgrant_ok: logic = !ctrl_mem_busy && !legacy_ext_read && !w_veto
+    let wgrant_ok: logic = !ctrl_mem_busy && !ctrl_wb_full && !legacy_ext_read && !w_veto
         && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart)
         && !(plic_ren_w && w_in_plic) && !l2_w_spec_hold;
 
@@ -479,16 +540,17 @@ pub module heliodor_soc_smp #(
 
     // P9.1: split-transaction DRAM read controller (see the mem_ctrl header).
     // It accepts a hart's DRAM read, looks the line up in the L2 and streams
-    // the 8 beats after the modeled latency (HIT_WAIT on an L2 hit, DRAM_WAIT
-    // plus an 8-cycle gather on a miss, installing the line). Gather beats are
-    // arbitrated through the bus's read-channel rotation; legacy (MMIO /
+    // the 8 beats. For the old core (v14_mem_ctrl) a miss is a modeled
+    // DRAM_WAIT plus an 8-cycle gather over the bus read-channel rotation;
+    // for a new core (mem_ctrl) it is an AXI4 read burst, and writes leave
+    // through mem_ctrl's AXI write buffer. Legacy (MMIO, and the old core's
     // firmware-ROM) reads pass through combinationally on the read grant.
     // ── Block N SHIPPED: TWO transaction slots per hart (cp_mshr_mlp_plan.md §10.2). ──
     // Slot 2h is the D side (loads, store-RFO fills, uncached MMIO), slot 2h+1 the
     // I side (I-cache fill + I-side page-table walk). The old core's I-side read is
     // always a DRAM line I-read (its non-DRAM fetch uses the o_imem passthrough);
-    // a new core marks its uncached fetch as a single beat, whose data comes from
-    // the external port like a D-side single beat.
+    // a new core marks its uncached fetch as a single beat, an uncached AXI read
+    // like a D-side single beat to DRAM or ROM.
     var mc_req  : logic     [N_HARTS * 2];
     var mc_addr : logic<64> [N_HARTS * 2];
     var mc_dram : logic     [N_HARTS * 2];
@@ -501,85 +563,197 @@ pub module heliodor_soc_smp #(
         assign mc_req[h]      = c_dmem_req[h];
         assign mc_addr[h]     = c_dmem_addr[h];
         assign mc_dram[h]     = c_dmem_line[h];
-        assign mc_unc[h]      = c_dmem_req[h] && !c_dmem_line[h] && c_dmem_addr[h][31];
+        assign mc_unc[h]      = c_dmem_req[h] && !c_dmem_line[h] && (if AXI ? d_on_axi[h] : c_dmem_addr[h][31]);
         assign mc_req[N_HARTS + h]  = c_imemr_req[h];
         assign mc_addr[N_HARTS + h] = c_imemr_addr[h];
         assign mc_dram[N_HARTS + h] = c_imemr_line[h];
-        assign mc_unc[N_HARTS + h]  = c_imemr_req[h] && !c_imemr_line[h] && c_imemr_addr[h][31];
+        assign mc_unc[N_HARTS + h]  = c_imemr_req[h] && !c_imemr_line[h] && (if AXI ? i_on_axi[h] : c_imemr_addr[h][31]);
         assign c_dmem_rfo[N_HARTS + h]   = 1'b0;
         assign c_dmem_iread[N_HARTS + h] = c_imemr_iread[h];
     }
 
-    inst u_mctrl: mem_ctrl #(
-        N_HARTS: N_HARTS,
-        SPH    : 2      ,
-    ) (
-        clk                                 ,
-        rst                                 ,
-        i_hreq        : mc_req              ,
-        i_haddr       : mc_addr             ,
-        i_hdram       : mc_dram             ,
-        o_hgrant      : ctrl_hgrant         ,
-        o_hrdata      : ctrl_hrdata         ,
-        i_hrfo        : c_dmem_rfo          , // P9.2: store fill = RFO
-        i_iread       : c_dmem_iread        , // P9.6: I-cache fill (uncounted read)
-        i_hunc        : mc_unc              ,
-        o_hhold       : ctrl_hhold          ,
-        o_hexcl       : ctrl_hexcl          , // P9.2: grant state to the L1
-        o_bus_rreq    : ctrl_bus_rreq       ,
-        i_bus_rgrant  : bus_dgrant          ,
-        o_l2_caddr    : l2_caddr            ,
-        o_l2_cren     : l2_cren             ,
-        i_l2_chit     : l2_chit             ,
-        i_l2_cdata    : l2_cdata            ,
-        o_cadd_v      : l2_cadd_v           , // P9.2: directory maintenance
-        o_cadd_hart   : l2_cadd_hart        ,
-        o_cadd_own    : l2_cadd_own         ,
-        i_l2_c_shr    : l2_c_sharers        ,
-        i_l2_c_owned  : l2_c_owned          ,
-        o_l2_inst_v   : l2_inst_v           ,
-        o_l2_inst_addr: l2_inst_addr        ,
-        o_l2_inst_data: l2_inst_data        ,
-        o_inst_hart   : l2_inst_hart        ,
-        i_iv_valid    : l2_iv_valid         ,
-        i_iv_addr     : l2_iv_addr          ,
-        i_iv_sharers  : l2_iv_sharers       ,
-        i_iv_owned    : l2_iv_owned         ,
-        i_iv_blocked  : l2_iv_blocked       ,
-        i_inst_port_busy: l2_inst_port_busy ,
-        i_inst_oldshr : l2_inst_oldshr      ,
-        o_busy_line   : ctrl_busy_line      ,
-        o_busy_v      : ctrl_busy_v         ,
-        i_w_hart      : w_hart_idx          ,
-        i_w_wb        : bus_dramw_wb        ,
-        i_w_shr       : l2_w_sharers        ,
-        i_w_shr_hi    : l2_w_sharers_hi     ,
-        o_probe_v     : ctrl_probe_v        , // P9.2: recall engine
-        o_probe_addr  : ctrl_probe_addr     ,
-        o_probe_self  : ctrl_probe_self     ,
-        i_probe_ack   : core_probe_ack      ,
-        o_eclr_v      : ctrl_eclr_v         ,
-        o_eclr_addr   : ctrl_eclr_addr      ,
-        o_eclr_hart   : ctrl_eclr_hart      ,
-        i_wv_req      : w_veto              ,
-        i_wv_line     : wv_line             ,
-        i_wv_hart     : wv_owner            ,
-        o_inv1_v      : ctrl_inv1_v         ,
-        o_inv1_addr   : ctrl_inv1_addr      ,
-        o_inv2_v      : ctrl_inv2_v         ,
-        o_inv2_addr   : ctrl_inv2_addr      ,
-        o_mem_addr    : ctrl_mem_addr       ,
-        o_mem_ren     : ctrl_mem_ren        ,
-        i_mem_rdata   : i_dmem_rdata        ,
-        o_mem_busy    : ctrl_mem_busy       ,
-        i_w_valid     : bus_dram_wen        ,
-        i_w_addr      : bus_dramw_addr      ,
-        i_w_hi        : l2_wstrb_hi != 8'd0 ,
-        i_w_lanes     : bus_dram_wdata      , // P9.3: c2c WB capture
-        o_w_cadd_v    : l2_wcadd_v          ,
-        o_w_cadd_hart : l2_wcadd_hart       ,
-        o_w_cadd_own  : l2_wcadd_own        ,
-    );
+    // The old core keeps its frozen copy of mem_ctrl and the old DRAM port.
+    if CORE == soc_pkg::CoreSel::V14 :g_mc14 {
+        inst u_mctrl: v14_mem_ctrl #(
+            N_HARTS: N_HARTS,
+            SPH    : 2      ,
+        ) (
+            clk                                 ,
+            rst                                 ,
+            i_hreq        : mc_req              ,
+            i_haddr       : mc_addr             ,
+            i_hdram       : mc_dram             ,
+            o_hgrant      : ctrl_hgrant         ,
+            o_hrdata      : ctrl_hrdata         ,
+            i_hrfo        : c_dmem_rfo          , // P9.2: store fill = RFO
+            i_iread       : c_dmem_iread        , // P9.6: I-cache fill (uncounted read)
+            i_hunc        : mc_unc              ,
+            o_hhold       : ctrl_hhold          ,
+            o_hexcl       : ctrl_hexcl          , // P9.2: grant state to the L1
+            o_bus_rreq    : ctrl_bus_rreq       ,
+            i_bus_rgrant  : bus_dgrant          ,
+            o_l2_caddr    : l2_caddr            ,
+            o_l2_cren     : l2_cren             ,
+            i_l2_chit     : l2_chit             ,
+            i_l2_cdata    : l2_cdata            ,
+            o_cadd_v      : l2_cadd_v           , // P9.2: directory maintenance
+            o_cadd_hart   : l2_cadd_hart        ,
+            o_cadd_own    : l2_cadd_own         ,
+            i_l2_c_shr    : l2_c_sharers        ,
+            i_l2_c_owned  : l2_c_owned          ,
+            o_l2_inst_v   : l2_inst_v           ,
+            o_l2_inst_addr: l2_inst_addr        ,
+            o_l2_inst_data: l2_inst_data        ,
+            o_inst_hart   : l2_inst_hart        ,
+            i_iv_valid    : l2_iv_valid         ,
+            i_iv_addr     : l2_iv_addr          ,
+            i_iv_sharers  : l2_iv_sharers       ,
+            i_iv_owned    : l2_iv_owned         ,
+            i_iv_blocked  : l2_iv_blocked       ,
+            i_inst_port_busy: l2_inst_port_busy ,
+            i_inst_oldshr : l2_inst_oldshr      ,
+            o_busy_line   : ctrl_busy_line      ,
+            o_busy_v      : ctrl_busy_v         ,
+            i_w_hart      : w_hart_idx          ,
+            i_w_wb        : bus_dramw_wb        ,
+            i_w_shr       : l2_w_sharers        ,
+            i_w_shr_hi    : l2_w_sharers_hi     ,
+            o_probe_v     : ctrl_probe_v        , // P9.2: recall engine
+            o_probe_addr  : ctrl_probe_addr     ,
+            o_probe_self  : ctrl_probe_self     ,
+            i_probe_ack   : core_probe_ack      ,
+            o_eclr_v      : ctrl_eclr_v         ,
+            o_eclr_addr   : ctrl_eclr_addr      ,
+            o_eclr_hart   : ctrl_eclr_hart      ,
+            i_wv_req      : w_veto              ,
+            i_wv_line     : wv_line             ,
+            i_wv_hart     : wv_owner            ,
+            o_inv1_v      : ctrl_inv1_v         ,
+            o_inv1_addr   : ctrl_inv1_addr      ,
+            o_inv2_v      : ctrl_inv2_v         ,
+            o_inv2_addr   : ctrl_inv2_addr      ,
+            o_mem_addr    : ctrl_mem_addr       ,
+            o_mem_ren     : ctrl_mem_ren        ,
+            i_mem_rdata   : i_dmem_rdata        ,
+            o_mem_busy    : ctrl_mem_busy       ,
+            i_w_valid     : bus_dram_wen        ,
+            i_w_addr      : bus_dramw_addr      ,
+            i_w_hi        : l2_wstrb_hi != 8'd0 ,
+            i_w_lanes     : bus_dram_wdata      , // P9.3: c2c WB capture
+            o_w_cadd_v    : l2_wcadd_v          ,
+            o_w_cadd_hart : l2_wcadd_hart       ,
+            o_w_cadd_own  : l2_wcadd_own        ,
+        );
+        assign ctrl_wb_full  = 1'b0;
+        assign o_axi_arvalid = 1'b0;
+        assign o_axi_arid    = '0;
+        assign o_axi_araddr  = '0;
+        assign o_axi_arlen   = '0;
+        assign o_axi_rready  = 1'b0;
+        assign o_axi_awvalid = 1'b0;
+        assign o_axi_awid    = '0;
+        assign o_axi_awaddr  = '0;
+        assign o_axi_awlen   = '0;
+        assign o_axi_wvalid  = 1'b0;
+        assign o_axi_wdata   = '0;
+        assign o_axi_wstrb   = '0;
+        assign o_axi_wlast   = 1'b0;
+        assign o_axi_bready  = 1'b0;
+    } else :g_mc {
+        inst u_mctrl: mem_ctrl #(
+            N_HARTS: N_HARTS ,
+            SPH    : 2       ,
+            ID_W   : AXI_ID_W,
+        ) (
+            clk                                 ,
+            rst                                 ,
+            i_hreq        : mc_req              ,
+            i_haddr       : mc_addr             ,
+            i_hdram       : mc_dram             ,
+            o_hgrant      : ctrl_hgrant         ,
+            o_hrdata      : ctrl_hrdata         ,
+            i_hrfo        : c_dmem_rfo          , // P9.2: store fill = RFO
+            i_iread       : c_dmem_iread        , // P9.6: I-cache fill (uncounted read)
+            i_hunc        : mc_unc              ,
+            o_hhold       : ctrl_hhold          ,
+            o_hexcl       : ctrl_hexcl          , // P9.2: grant state to the L1
+            o_bus_rreq    : ctrl_bus_rreq       ,
+            i_bus_rgrant  : bus_dgrant          ,
+            o_l2_caddr    : l2_caddr            ,
+            o_l2_cren     : l2_cren             ,
+            i_l2_chit     : l2_chit             ,
+            i_l2_cdata    : l2_cdata            ,
+            o_cadd_v      : l2_cadd_v           , // P9.2: directory maintenance
+            o_cadd_hart   : l2_cadd_hart        ,
+            o_cadd_own    : l2_cadd_own         ,
+            i_l2_c_shr    : l2_c_sharers        ,
+            i_l2_c_owned  : l2_c_owned          ,
+            o_l2_inst_v   : l2_inst_v           ,
+            o_l2_inst_addr: l2_inst_addr        ,
+            o_l2_inst_data: l2_inst_data        ,
+            o_inst_hart   : l2_inst_hart        ,
+            i_iv_valid    : l2_iv_valid         ,
+            i_iv_addr     : l2_iv_addr          ,
+            i_iv_sharers  : l2_iv_sharers       ,
+            i_iv_owned    : l2_iv_owned         ,
+            i_iv_blocked  : l2_iv_blocked       ,
+            i_inst_port_busy: l2_inst_port_busy ,
+            i_inst_oldshr : l2_inst_oldshr      ,
+            o_busy_line   : ctrl_busy_line      ,
+            o_busy_v      : ctrl_busy_v         ,
+            i_w_hart      : w_hart_idx          ,
+            i_w_wb        : bus_dramw_wb        ,
+            i_w_shr       : l2_w_sharers        ,
+            i_w_shr_hi    : l2_w_sharers_hi     ,
+            o_probe_v     : ctrl_probe_v        , // P9.2: recall engine
+            o_probe_addr  : ctrl_probe_addr     ,
+            o_probe_self  : ctrl_probe_self     ,
+            i_probe_ack   : core_probe_ack      ,
+            o_eclr_v      : ctrl_eclr_v         ,
+            o_eclr_addr   : ctrl_eclr_addr      ,
+            o_eclr_hart   : ctrl_eclr_hart      ,
+            i_wv_req      : w_veto              ,
+            i_wv_line     : wv_line             ,
+            i_wv_hart     : wv_owner            ,
+            o_inv1_v      : ctrl_inv1_v         ,
+            o_inv1_addr   : ctrl_inv1_addr      ,
+            o_inv2_v      : ctrl_inv2_v         ,
+            o_inv2_addr   : ctrl_inv2_addr      ,
+            o_arvalid     : o_axi_arvalid       ,
+            i_arready     : i_axi_arready       ,
+            o_arid        : o_axi_arid          ,
+            o_araddr      : o_axi_araddr        ,
+            o_arlen       : o_axi_arlen         ,
+            i_rvalid      : i_axi_rvalid        ,
+            o_rready      : o_axi_rready        ,
+            i_rid         : i_axi_rid           ,
+            i_rdata       : i_axi_rdata         ,
+            o_awvalid     : o_axi_awvalid       ,
+            i_awready     : i_axi_awready       ,
+            o_awid        : o_axi_awid          ,
+            o_awaddr      : o_axi_awaddr        ,
+            o_awlen       : o_axi_awlen         ,
+            o_wvalid      : o_axi_wvalid        ,
+            i_wready      : i_axi_wready        ,
+            o_wdata       : o_axi_wdata         ,
+            o_wstrb       : o_axi_wstrb         ,
+            o_wlast       : o_axi_wlast         ,
+            i_bvalid      : i_axi_bvalid        ,
+            o_bready      : o_axi_bready        ,
+            o_wb_full     : ctrl_wb_full        ,
+            i_w_valid     : bus_dram_wen        ,
+            i_w_addr      : bus_dramw_addr      ,
+            i_w_hi        : l2_wstrb_hi != 8'd0 ,
+            i_w_strb      : bus_dram_wstrb      ,
+            i_w_lanes     : bus_dram_wdata      , // P9.3: c2c WB capture
+            o_w_cadd_v    : l2_wcadd_v          ,
+            o_w_cadd_hart : l2_wcadd_hart       ,
+            o_w_cadd_own  : l2_wcadd_own        ,
+        );
+        assign ctrl_mem_addr = 64'd0;
+        assign ctrl_mem_ren  = 1'b0;
+        assign ctrl_mem_busy = 1'b0;
+    }
 
     // Shared L2 (P9.1 line-granular): lookup/copy + line install from
     // mem_ctrl; write side keeps the bus write channel; lower interface is
@@ -633,17 +807,24 @@ pub module heliodor_soc_smp #(
         o_w_hit       : l2_w_hit      , // P3.b: raw hold pieces (combined at SoC)
         o_w_spec_ready: l2_w_spec_ready,
         o_mem_addr : l2_mem_addr   ,
-        o_mem_wdata: o_dmem_wdata  ,
-        o_mem_wstrb: o_dmem_wstrb  ,
-        o_mem_wen  : o_dmem_wen    ,
+        o_mem_wdata: l2_mem_wdata  ,
+        o_mem_wstrb: l2_mem_wstrb  ,
+        o_mem_wen  : l2_mem_wen    ,
     );
-    assign o_dmem_wdata_hi = dram_wdata_hi;
-    assign o_dmem_wstrb_hi = dram_wstrb_hi;
-
-    // External DRAM port muxing — the three users are mutually exclusive by
-    // construction (gather beats and legacy firmware-ROM reads block writes
-    // through wgrant_ok; the single read grant excludes gather vs legacy).
-    assign o_dmem_addr = if ctrl_mem_busy ?
+    // External DRAM port muxing (old core) — the three users are mutually
+    // exclusive by construction (gather beats and legacy firmware-ROM reads
+    // block writes through wgrant_ok; the single read grant excludes gather
+    // vs legacy). A new core's writes leave through the AXI write buffer.
+    for l in 0..8 :gen_dmem_lane {
+        assign o_dmem_wdata[l] = if AXI ? 64'd0 : l2_mem_wdata[l];
+        assign o_dmem_wstrb[l] = if AXI ? 8'd0 : l2_mem_wstrb[l];
+    }
+    assign o_dmem_wen      = !AXI && l2_mem_wen;
+    assign o_dmem_wdata_hi = if AXI ? 64'd0 : dram_wdata_hi;
+    assign o_dmem_wstrb_hi = if AXI ? 8'd0 : dram_wstrb_hi;
+    assign o_dmem_addr     = if AXI ?
+        64'd0
+    : if ctrl_mem_busy ?
         ctrl_mem_addr
     : if o_dmem_wen ?
         l2_mem_addr
@@ -651,6 +832,21 @@ pub module heliodor_soc_smp #(
         bus_dramr_addr
     ;
     assign o_dmem_ren = ctrl_mem_ren || legacy_ext_read;
+
+    // Constant AXI attributes: INCR bursts of 8-byte beats, Normal
+    // Non-cacheable Bufferable, no exclusive access.
+    assign o_axi_arsize  = 3'd3;
+    assign o_axi_arburst = 2'b01;
+    assign o_axi_arlock  = 1'b0;
+    assign o_axi_arcache = 4'b0011;
+    assign o_axi_arprot  = 3'd0;
+    assign o_axi_arqos   = 4'd0;
+    assign o_axi_awsize  = 3'd3;
+    assign o_axi_awburst = 2'b01;
+    assign o_axi_awlock  = 1'b0;
+    assign o_axi_awcache = 4'b0011;
+    assign o_axi_awprot  = 3'd0;
+    assign o_axi_awqos   = 4'd0;
 
     // Shared CLINT / UART driven by the granted core's decoded MMIO access.
     // Enables are an OR-reduction (only the granted core has c_dmem_wen/ren=1);
@@ -841,6 +1037,8 @@ pub module heliodor_soc_smp #(
             plic_rdata
         : if c_dmem_line[h] ?
             ctrl_hrdata[h]
+        : if AXI ?
+            ctrl_hrdata[h]
         :
             i_dmem_rdata
         ;
@@ -848,7 +1046,7 @@ pub module heliodor_soc_smp #(
     // A new core's I slot: a single beat reads the external port.
     var core_imemr_rdata: logic<64> [N_HARTS];
     for h in 0..N_HARTS :gen_irdata {
-        assign core_imemr_rdata[h] = if c_imemr_line[h] ? ctrl_hrdata[N_HARTS + h] : i_dmem_rdata;
+        assign core_imemr_rdata[h] = if c_imemr_line[h] || AXI ? ctrl_hrdata[N_HARTS + h] : i_dmem_rdata;
     }
 
     // N cores. HART_ID = loop index → mhartid. imem/iptw per-hart (tb-served).

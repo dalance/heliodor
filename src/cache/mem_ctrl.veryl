@@ -1,69 +1,58 @@
-// P9.1: split-transaction DRAM read controller.
+// mem_ctrl: the coherent home of the new-core SoC and its AXI4 master.
 //
-// Sits between the per-hart L1 read channels and the shared L2 / external
-// DRAM port, replacing the old combinational same-cycle read path. A DRAM
-// line read is now a TRANSACTION with a modeled latency:
+// Sits between the per-slot L1 read channels and the shared L2, and drives
+// the SoC's DRAM side as one AXI4 master port (64-bit data, INCR bursts of
+// AxSIZE 3). The old core uses the frozen copy v14_mem_ctrl.
 //
-//   ACCEPT  : the hart's read request (a dcache fill start) is accepted with
-//             a 1-cycle o_hgrant pulse — the dcache latches its FILL state on
-//             it and then sits in FILL waiting for beats (it only advances on
-//             granted cycles, which is exactly the pre-P9.1 contract).
-//   LOOKUP  : the next cycle, the line is looked up in the shared L2 (full
-//             64B-line hit since P9.1 — the L2's lazy per-word fills are gone).
-//   L2 hit  : the line is copied into the slot buffer; after HIT_WAIT cycles
-//             (L2 access latency model) the 8 beats stream to the hart.
-//   L2 miss : after DRAM_WAIT cycles (DRAM row/CAS latency model) the line is
-//             gathered from the external DRAM port, one dword per granted
-//             read-channel cycle (the memory_bus rotation arbitrates gather
-//             beats across harts and keeps the AMO-lock pinning semantics),
-//             then installed into the L2 as a full line, then streamed.
-//   STREAM  : o_hgrant held for 8 consecutive cycles; o_hrdata serves the
-//             dword the hart addresses each cycle (i_haddr[5:3]), so the
-//             dcache's critical-word-first wrap order works unchanged.
+// Read transaction of a slot:
+//   ACCEPT  : a 1-cycle o_hgrant pulse; the L1 latches its FILL state on it.
+//   LOOKUP  : the line is looked up in the shared L2 (one slot per cycle).
+//   L2 hit  : the line is copied into the slot buffer and, after HIT_WAIT
+//             cycles, streams to the L1.
+//   L2 miss : the slot asks for the AR channel (ST_AR). The AR is a line
+//             burst (ARLEN 7 from the line base, ARID = slot); the R beats
+//             land in the slot buffer in arrival order, then the line is
+//             installed into the L2 and streams (an I-read streams without
+//             installing).
+//   STREAM  : o_hgrant held for 8 cycles; o_hrdata serves the dword the L1
+//             addresses (i_haddr[5:3]), so critical-word-first is the L1's.
+//   UNCACHED: an i_hunc read (DRAM or ROM) waits in LOOKUP until no L1 owns
+//             the line, then reads one beat (ARLEN 0, 8-byte aligned) and
+//             grants it for one cycle (ST_UNCD). o_hhold stays up until then.
 //
-// One slot per hart (an L1 dcache has a single fill FSM, so one outstanding
-// line read per hart is the structural maximum). Slots progress independently:
-// hart B's L2-hit fill streams while hart A waits out its DRAM latency —
-// the "multiple outstanding" half of P9.1. Only the shared resources
-// serialize: the L2 lookup port (implicitly 1/cycle — accepts are 1/cycle),
-// the external DRAM port (gather beats via the bus read-channel rotation),
-// and the L2 install port (gathers serialize, so installs cannot collide).
+// Writes: a granted DRAM write enters the write buffer (WB_N line entries,
+// one FIFO in grant order); the grant means "accepted by the home", not
+// "reached DRAM". Each entry is one INCR burst over the lanes between its
+// first and last strobed lane, AWID 0 for every write so that the slave
+// keeps them in grant order. AW and W are raised independently; an entry is
+// freed by its B. o_wb_full stops the SoC's write grant.
 //
-// Non-DRAM (MMIO / firmware-ROM) reads keep the legacy combinational path:
-// their bus request/grant passes straight through (o_bus_rreq / o_hgrant),
-// preserving the pre-P9.1 single-cycle behavior — the SoC muxes their read
-// data (CLINT/UART/external comb port) per hart, not this module's o_hrdata.
+// AXI rules this module keeps: every valid and payload comes from registers
+// and holds until its ready; RREADY and BREADY are always 1 (the slot buffer
+// is the R sink, so R never needs backpressure). No AR is raised for a line
+// while a write to that line is buffered or granted this cycle (a later read
+// must not pass an earlier write); a write granted while the AR of a slot is
+// presented or its R beats are arriving clears install_ok, as before.
 //
-// Write-conflict snoop: a granted DRAM write (write-through, still 1-cycle
-// posted) that lands on a line being GATHERED or INSTALLED clears install_ok —
-// the gathered copy may pre-date the write, so it must not be installed into
-// the L2 (the requesting L1 discards its own copy through the existing
-// invalidate-broadcast fill-abort and refetches). Writes during DWAIT are
-// harmless (they hit DRAM before the gather reads it), and writes during
-// HWAIT/STREAM never install anything.
+// Non-DRAM, non-ROM (MMIO) reads keep the legacy path: their bus request
+// and grant pass straight through (o_bus_rreq / o_hgrant) and the SoC muxes
+// their data.
 //
-// Protocol invariant relied upon: an accept grant ALWAYS starts the dcache
-// fill — the dcache suppresses o_memr_req while an urgent store drain
-// preempts the fill start (see dcache want_fill_start), so a granted request
-// implies the IDLE→FILL transition fires that cycle.
+// Protocol invariant relied upon: an accept grant ALWAYS starts the L1 fill
+// (the requester suppresses its request when it could not start the fill).
 //
-// P9.2 (MESI home): transactions carry an RFO flag (read-for-ownership, the
-// dcache's store fill) and complete with a grant STATE (o_hexcl: E/M-capable
-// vs S). New rules:
+// MESI home rules:
 //  - PER-LINE SERIALIZATION: an accept is blocked while another slot or the
-//    recall engine is active on the same line — this is what makes directory
-//    updates race-free. (P9.3: the bus AMO lock and its RFO accept gating
-//    are gone — RMW atomicity lives in the L1 via ownership.)
-//  - LOOKUP hit on an OWNED line (any owner, incl. the requester itself
-//    after a silent E drop): the RECALL ENGINE probes the owner; a dirty
+//    recall engine is active on the same line, which keeps directory
+//    updates race-free.
+//  - LOOKUP hit on an OWNED line: the RECALL ENGINE probes the owner; a dirty
 //    copy comes back as a WB on the write channel (the home merges it and
-//    clears ownership), a clean one answers probe_ack (ownership cleared
-//    via o_eclr). The slot re-looks-up until the line is unowned.
-//  - LOOKUP hit, not owned: READ grants E (sole sharer → cadd_own) or S;
-//    RFO grants M-capability — the other sharers are invalidated through
-//    the inv-port arbitration (lookup waits for a free port).
-//  - INSTALL: an OWNED victim is recalled before the eviction (engine);
-//    grants are E/M (the installer becomes owner).
+//    clears ownership), a clean one answers probe_ack (o_eclr). The slot
+//    re-looks-up until the line is unowned, or captures the WB (c2c).
+//  - LOOKUP hit, not owned: READ grants E (N = 1) or S; RFO grants M after
+//    the other sharers are invalidated (lookup waits for an inv port).
+//  - INSTALL: an OWNED victim is recalled before the eviction; the installer
+//    becomes owner.
 //  - The recall engine also serves the SoC's WRITE-GRANT VETO (a non-WB
 //    write targeting a line owned by another hart).
 pub module mem_ctrl #(
@@ -84,8 +73,9 @@ pub module mem_ctrl #(
     // to the pre-Block-N version.
     param SPH      : u32 = 2 ,
     param N_SLOTS  : u32 = N_HARTS * SPH,
-    param DRAM_WAIT: u32 = 20, // accept -> gather start (DRAM latency model), >= 1
     param HIT_WAIT : u32 = 2 , // L2 copy -> stream start (L2 latency model), >= 1
+    param WB_N     : u32 = 2 * N_HARTS, // write buffer entries
+    param ID_W     : u32 = if N_SLOTS >= 2 ? $clog2(N_SLOTS) : 1, // ARID = slot
 ) (
     clk: input clock,
     rst: input reset,
@@ -105,15 +95,15 @@ pub module mem_ctrl #(
     // the L2; on GATHER completion it streams straight to the L1. The I-cache
     // is kept coherent by FENCE.I + recall-on-owned, not by directory tracking.
     i_iread: input  logic [N_SLOTS],
-    // An uncached single-beat read of a DRAM address (i_hdram = 0). The slot
+    // An uncached single-beat read of DRAM or ROM (i_hdram = 0). The slot
     // holds it in LOOKUP until no L1 owns the line (the recall engine brings
-    // a dirty copy home), then reads the beat like a legacy read. It adds no
-    // sharer and installs nothing. o_hhold: the read is not on the bus yet.
+    // a dirty copy home), then reads one AXI beat. It adds no sharer and
+    // installs nothing. o_hhold: the beat has not been granted yet.
     i_hunc : input  logic [N_SLOTS],
     o_hhold: output logic [N_SLOTS],
     o_hexcl: output logic [N_SLOTS],
-    // Bus side: read-channel cycle requests (gather beats + legacy reads).
-    // The memory_bus arbitrates these with its existing rotation + AMO lock.
+    // Bus side: read-channel cycle requests of legacy (MMIO) reads, which
+    // the memory_bus arbitrates with its rotation.
     o_bus_rreq  : output logic [N_HARTS],
     i_bus_rgrant: input  logic [N_HARTS],
     // L2 line lookup/copy port (combinational hit + 8-dword line read).
@@ -179,16 +169,37 @@ pub module mem_ctrl #(
     o_inv1_addr: output logic<64>           ,
     o_inv2_v   : output logic     [N_HARTS],
     o_inv2_addr: output logic<64>           ,
-    // External DRAM read port (one dword per gather cycle, comb response).
-    o_mem_addr : output logic<64>,
-    o_mem_ren  : output logic    ,
-    i_mem_rdata: input  logic<64>,
-    o_mem_busy : output logic    , // gather beat this cycle -> SoC holds writes
-    // Write snoop: the granted DRAM write this cycle (line + misaligned
-    // hi-side flag, which also writes the line at i_w_addr+8).
+    // AXI4 master (the attributes that are constant live in the SoC).
+    o_arvalid: output logic      ,
+    i_arready: input  logic      ,
+    o_arid   : output logic<ID_W>,
+    o_araddr : output logic<56>  ,
+    o_arlen  : output logic<8>   ,
+    i_rvalid : input  logic      ,
+    o_rready : output logic      ,
+    i_rid    : input  logic<ID_W>,
+    i_rdata  : input  logic<64>  ,
+    o_awvalid: output logic      ,
+    i_awready: input  logic      ,
+    o_awid   : output logic<ID_W>,
+    o_awaddr : output logic<56>  ,
+    o_awlen  : output logic<8>   ,
+    o_wvalid : output logic      ,
+    i_wready : input  logic      ,
+    o_wdata  : output logic<64>  ,
+    o_wstrb  : output logic<8>   ,
+    o_wlast  : output logic      ,
+    i_bvalid : input  logic      ,
+    o_bready : output logic      ,
+    // The write buffer has no free entry: the SoC grants no write.
+    o_wb_full: output logic,
+    // The granted DRAM write this cycle (line + misaligned hi-side flag,
+    // which also writes the line at i_w_addr+8). It is snooped by the slots
+    // and enters the write buffer.
     i_w_valid: input logic    ,
     i_w_addr : input logic<64>,
     i_w_hi   : input logic    ,
+    i_w_strb : input logic<8> [8],
     // P9.3 c2c: the granted write's data lanes. A slot waiting in LOOKUP on
     // an owned line captures the recall's WB directly off the write channel
     // (owner-to-requester transfer through the home) instead of re-looking
@@ -204,11 +215,11 @@ pub module mem_ctrl #(
     const ST_IDLE   : logic<3> = 3'd0;
     const ST_LOOKUP : logic<3> = 3'd1;
     const ST_HWAIT  : logic<3> = 3'd2;
-    const ST_DWAIT  : logic<3> = 3'd3;
-    const ST_GATHER : logic<3> = 3'd4;
+    const ST_AR     : logic<3> = 3'd3; // waiting for the AR channel
+    const ST_GATHER : logic<3> = 3'd4; // AR accepted, R beats arriving
     const ST_INSTALL: logic<3> = 3'd5;
     const ST_STREAM : logic<3> = 3'd6;
-    const ST_UNC    : logic<3> = 3'd7;
+    const ST_UNCD   : logic<3> = 3'd7; // uncached beat in the buffer, granted this cycle
 
     // Write-snoop line decode (the +8 line covers the misaligned hi-side).
     let w_line   : logic<58> = i_w_addr[63:6];
@@ -218,23 +229,33 @@ pub module mem_ctrl #(
     // Cross-hart visible slot state (each element driven by its own slot).
     var st_all     : logic<3>  [N_SLOTS]    ;
     var line_all   : logic<58> [N_SLOTS]    ;
-    var gcnt_all   : logic<3>  [N_SLOTS]    ;
     var iok_all    : logic     [N_SLOTS]    ;
     var conf_all   : logic     [N_SLOTS]    ;
     var rfo_all    : logic     [N_SLOTS]    ; // P9.2: slot transaction is an RFO
     var iread_all  : logic     [N_SLOTS]    ; // P9.6: slot transaction is an I-read (uncounted)
-    var unc_all    : logic     [N_SLOTS]    ; // slot transaction is an uncached DRAM read
+    var unc_all    : logic     [N_SLOTS]    ; // slot transaction is an uncached single beat
+    var dw_all     : logic<3>  [N_SLOTS]    ; // the dword of an uncached beat
     var inst_go_all: logic     [N_SLOTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
     var lk_go_all  : logic     [N_SLOTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
     var lk_excl_w  : logic                  ; // P9.2: grant state for the lookup go
     var inst_excl_w: logic     [N_SLOTS]    ; // P9.2: grant state at install go
     var buf_all    : logic<64> [N_SLOTS * 8];
-    // Block N: the DRAM read channel stays ONE request per hart — memory_bus is
-    // unchanged. A hart's slots share it: any slot may ask, and the lowest-indexed
-    // asking slot of that hart takes the grant (aggregation below the slot loop).
-    // Identity at SPH=1, where each hart has exactly one slot.
+    // The legacy (MMIO) read channel stays ONE request per hart: a hart's
+    // slots share it and the lowest-indexed asking slot takes the grant.
     var slot_bus_req: logic [N_SLOTS];
     var slot_bus_gnt: logic [N_SLOTS];
+
+    // AR channel owner (registered): the slot whose AR is presented.
+    var ar_busy_q: logic      ;
+    var ar_slot_q: logic<ID_W>;
+    var ar_pick  : logic [N_SLOTS]; // lowest ST_AR slot free of a write hazard
+    var ar_take  : logic [N_SLOTS]; // ... that takes the AR channel this cycle
+    let ar_hs    : logic = ar_busy_q && i_arready;
+    // An R beat of this cycle belongs to slot i_rid.
+    var r_mine: logic [N_SLOTS];
+    for h in 0..N_SLOTS :gen_rmine {
+        assign r_mine[h] = i_rvalid && (i_rid == (h as ID_W));
+    }
 
     // P9.2 Phase B: recall engine state (registered; probes are asserted
     // while busy, completion = clean probe-ack OR the owner's WB arriving on
@@ -267,16 +288,6 @@ pub module mem_ctrl #(
             assign lk_found[h]   = lk_found[h - 1] || lk_sel_all[h];
         }
     }
-
-    // ── L2 sync-read: the DATA-capture timing (cp_l2_sync_read_plan.md §4) ──
-    // Flip TOGETHER with l2cache.veryl's const. ONLY the L2 DATA array (i_l2_cdata) is registered;
-    // the DIRECTORY (i_l2_chit / i_l2_c_owned / i_l2_c_shr) stays combinational, so ALL lookup
-    // decisions (hit / miss / recall / RFO-invalidate / sharer-add) are UNCHANGED. The one change:
-    // a hitting slot presents its line in ST_LOOKUP (deciding the hit combinationally), and the
-    // registered line data arrives the NEXT cycle — so the buf_q capture moves from ST_LOOKUP to the
-    // FIRST ST_HWAIT cycle. HIT_WAIT (≥1, the L2-access latency model) already provides that cycle →
-    // cycle-identical to =0. At =0 the capture stays in ST_LOOKUP (combinational data) → byte-identical.
-    const L2_SYNC_READ: bit = 1;
 
     // ------------------------------------------------------------------
     // P9.3 c2c transfer: a slot waiting in LOOKUP on line L (the verdict
@@ -374,38 +385,31 @@ pub module mem_ctrl #(
         }
     }
 
-    // Per-hart slot.
+    // Per-slot transaction state.
     for h in 0..N_SLOTS :gen_slot {
-        var st_q  : logic<3>     ;
-        var line_q: logic<58>    ;
-        var wcnt_q: logic<8>     ;
-        var gcnt_q: logic<3>     ;
-        var scnt_q: logic<3>     ;
+        var st_q   : logic<3>     ;
+        var line_q : logic<58>    ;
+        var dw_q   : logic<3>     ;
+        var wcnt_q : logic<8>     ;
+        var gcnt_q : logic<3>     ;
+        var scnt_q : logic<3>     ;
         var iok_q  : logic        ;
-        var rfo_q  : logic        ; // P9.2: transaction is a read-for-ownership
-        var iread_q: logic        ; // P9.6: transaction is an I-read (uncounted)
+        var rfo_q  : logic        ; // transaction is a read-for-ownership
+        var iread_q: logic        ; // transaction is an I-read (uncounted)
         var unc_q  : logic        ;
-        var excl_q : logic        ; // P9.2: grant state (E/M vs S), set at grant
+        var excl_q : logic        ; // grant state (E/M vs S), set at grant
         var buf_q  : logic<64> [8];
-
-        // ── O4 CEILING ORACLE (Block N, cp_mshr_mlp_plan.md §8): make an OWNERSHIP
-        // transaction's modeled latency vanish (wait = 1, the minimum L2_SYNC_READ needs)
-        // while leaving demand loads untouched. Unsound — ownership cannot arrive before
-        // the data — but it isolates exactly what overlapping the RFO with the load path
-        // would hide, with none of O3's locality side-effects. Restore to 0 after reading.
-        const RFO_FAST: bit = 0;
-        let eff_hwait: logic<8> = if RFO_FAST && rfo_q ? 8'd1 : (HIT_WAIT as 8);
-        let eff_dwait: logic<8> = if RFO_FAST && rfo_q ? 8'd1 : (DRAM_WAIT as 8);
 
         assign st_all[h]    = st_q;
         assign line_all[h]  = line_q;
-        assign gcnt_all[h]  = gcnt_q;
+        assign dw_all[h]    = dw_q;
         assign iok_all[h]   = iok_q;
         assign rfo_all[h]   = rfo_q;
         assign iread_all[h] = iread_q;
         assign unc_all[h]   = unc_q;
         // The uncached requester may leave (kill) or move to another line.
         let unc_live: logic = i_hreq[h] && i_hunc[h] && (i_haddr[h][63:6] == line_q);
+        let ar_mine : logic = ar_busy_q && (ar_slot_q == (h as ID_W));
         for l in 0..8 :gen_buf_exp {
             assign buf_all[h * 8 + l] = buf_q[l];
         }
@@ -416,11 +420,12 @@ pub module mem_ctrl #(
 
         always_ff (clk, rst) {
             if_reset {
-                st_q   = ST_IDLE;
-                line_q = '0;
-                wcnt_q = 8'd0;
-                gcnt_q = 3'd0;
-                scnt_q = 3'd0;
+                st_q    = ST_IDLE;
+                line_q  = '0;
+                dw_q    = 3'd0;
+                wcnt_q  = 8'd0;
+                gcnt_q  = 3'd0;
+                scnt_q  = 3'd0;
                 iok_q   = 1'b0;
                 rfo_q   = 1'b0;
                 iread_q = 1'b0;
@@ -433,10 +438,11 @@ pub module mem_ctrl #(
                 case st_q {
                     ST_IDLE: {
                         if accept[h] {
-                            line_q = i_haddr[h][63:6];
-                            wcnt_q = 8'd0;
-                            gcnt_q = 3'd0;
-                            scnt_q = 3'd0;
+                            line_q  = i_haddr[h][63:6];
+                            dw_q    = i_haddr[h][5:3];
+                            wcnt_q  = 8'd0;
+                            gcnt_q  = 3'd0;
+                            scnt_q  = 3'd0;
                             iok_q   = 1'b1;
                             rfo_q   = i_hrfo[h] && !i_hunc[h];
                             iread_q = i_iread[h];
@@ -446,18 +452,15 @@ pub module mem_ctrl #(
                         }
                     }
                     ST_LOOKUP: {
-                        // P9.2: the grant decision (selection, write-snoop
-                        // retry, OWNED recall wait, RFO sharer-invalidate
-                        // port wait, grant state) is computed at module
-                        // level — lk_go_all/lk_excl_w. On a verified MISS
-                        // the slot heads for DRAM.
-                        // P9.3: a recall WB for this slot's line is captured
-                        // directly (c2c) — straight to STREAM.
+                        // The grant decision (selection, write-snoop retry,
+                        // OWNED recall wait, RFO sharer-invalidate port wait,
+                        // grant state) is computed at module level. A recall
+                        // WB for this line is captured directly (c2c).
                         if unc_q {
                             if !unc_live {
                                 st_q = ST_IDLE;
                             } else if lk_sel_all[h] && !(i_l2_chit && i_l2_c_owned) {
-                                st_q = ST_UNC;
+                                st_q = ST_AR;
                             }
                         } else if c2c_go_all[h] {
                             for l in 0..8 {
@@ -467,61 +470,58 @@ pub module mem_ctrl #(
                             scnt_q = 3'd0;
                             st_q   = ST_STREAM;
                         } else if lk_go_all[h] {
-                            // Hit decided combinationally (directory). =0: capture the combinational
-                            // L2 data line now. =1: the DATA array is sync-read → its line arrives
-                            // NEXT cycle; capture it in the first ST_HWAIT cycle below (HIT_WAIT hides
-                            // the read latency → cycle-identical).
-                            if !L2_SYNC_READ {
-                                for l in 0..8 {
-                                    buf_q[l] = i_l2_cdata[l];
-                                }
-                            }
+                            // The L2 data array is sync-read: the line arrives
+                            // in the first HWAIT cycle.
                             excl_q = lk_excl_w;
                             wcnt_q = 8'd0;
                             st_q   = ST_HWAIT;
                         } else if lk_sel_all[h] && !conflict && !i_l2_chit {
-                            wcnt_q = 8'd0;
-                            st_q   = ST_DWAIT;
+                            st_q = ST_AR;
                         }
                     }
                     ST_HWAIT: {
-                        // =1: the sync-read DATA line for the ST_LOOKUP present (line_q) arrives now,
-                        // on the FIRST HWAIT cycle (wcnt==0) — capture it. The slot presented line_q
-                        // in ST_LOOKUP last cycle, so i_l2_cdata (registered) is line_q's line. This
-                        // is cycle-identical to =0's ST_LOOKUP capture (same value, HIT_WAIT-hidden).
-                        if L2_SYNC_READ && wcnt_q == 8'd0 {
+                        if wcnt_q == 8'd0 {
                             for l in 0..8 {
                                 buf_q[l] = i_l2_cdata[l];
                             }
                         }
                         wcnt_q = wcnt_q + 8'd1;
-                        if wcnt_q == eff_hwait - 8'd1 {
+                        if wcnt_q == (HIT_WAIT as 8) - 8'd1 {
                             scnt_q = 3'd0;
                             st_q   = ST_STREAM;
                         }
                     }
-                    ST_DWAIT: {
-                        wcnt_q = wcnt_q + 8'd1;
-                        if wcnt_q == eff_dwait - 8'd1 {
+                    ST_AR: {
+                        if ar_mine && i_arready {
                             gcnt_q = 3'd0;
                             st_q   = ST_GATHER;
+                        } else if unc_q && !unc_live && !ar_mine && !ar_take[h] {
+                            st_q = ST_IDLE;
+                        }
+                        // Once the AR is presented, the slave may order it
+                        // either side of a write granted now.
+                        if conflict && ar_mine {
+                            iok_q = 1'b0;
                         }
                     }
                     ST_GATHER: {
-                        if slot_bus_gnt[h] {
-                            buf_q[gcnt_q] = i_mem_rdata;
-                            if gcnt_q == 3'd7 {
-                                // P9.6: an I-read does NOT install into the L2 (no
-                                // directory entry) — stream the gathered line
-                                // straight to the I-cache.
-                                if iread_q {
-                                    scnt_q = 3'd0;
-                                    st_q   = ST_STREAM;
-                                } else {
-                                    st_q = ST_INSTALL;
-                                }
+                        if r_mine[h] {
+                            if unc_q {
+                                buf_q[dw_q] = i_rdata;
+                                st_q        = ST_UNCD;
                             } else {
-                                gcnt_q = gcnt_q + 3'd1;
+                                buf_q[gcnt_q] = i_rdata;
+                                if gcnt_q == 3'd7 {
+                                    // An I-read does not install into the L2.
+                                    if iread_q {
+                                        scnt_q = 3'd0;
+                                        st_q   = ST_STREAM;
+                                    } else {
+                                        st_q = ST_INSTALL;
+                                    }
+                                } else {
+                                    gcnt_q = gcnt_q + 3'd1;
+                                }
                             }
                         }
                         if conflict {
@@ -529,13 +529,9 @@ pub module mem_ctrl #(
                         }
                     }
                     ST_INSTALL: {
-                        // P9.2: INSTALL can HOLD (back-inv / abort-inv port
-                        // arbitration, blocked or OWNED victim, or another
-                        // INSTALL slot ahead) — advance only on inst_go for
-                        // this slot, and keep folding write conflicts into
-                        // iok meanwhile. The grant state is latched here
-                        // (installer becomes owner unless an in-place
-                        // overwrite finds other sharers listed).
+                        // INSTALL can HOLD (inv-port arbitration, blocked or
+                        // OWNED victim, another INSTALL slot ahead): advance
+                        // only on inst_go, folding write conflicts into iok.
                         if inst_go_all[h] {
                             excl_q = inst_excl_w[h];
                             scnt_q = 3'd0;
@@ -551,10 +547,8 @@ pub module mem_ctrl #(
                             st_q = ST_IDLE;
                         }
                     }
-                    ST_UNC: {
-                        if !unc_live || slot_bus_gnt[h] {
-                            st_q = ST_IDLE;
-                        }
+                    ST_UNCD: {
+                        st_q = ST_IDLE;
                     }
                     default: {
                         st_q = ST_IDLE;
@@ -563,34 +557,21 @@ pub module mem_ctrl #(
             }
         }
 
-        // Hart-facing grant: accept pulse, the 8 stream beats, or the legacy
-        // (non-DRAM) combinational passthrough of the bus grant.
+        // Hart-facing grant: accept pulse, the 8 stream beats, the uncached
+        // beat, or the legacy (MMIO) combinational passthrough of the bus
+        // grant.
         let legacy : logic = i_hreq[h] && !i_hdram[h] && !i_hunc[h];
-        let unc_bus: logic = (st_q == ST_UNC) && unc_live;
-        // P9.6 fix (unified): a STREAM beat is granted ONLY to a consumer that
-        // is addressing THIS slot's line (i_haddr line == line_q). The core
-        // demuxes the shared read port to the I-cache / I-PTW / D-cache via
-        // ic_route, and that routing can drift mid-STREAM (an I-fill that
-        // aborts/over-delivers releases ic_owns before the slot's 8-beat STREAM
-        // drains; a redirect re-targets the I-cache to a new line). Without the
-        // line match, the routed-in consumer latches the wrong line's beats as
-        // its own fill data (observed: D-cache PTE line getting kernel code, and
-        // an I-cache line getting another line's bytes → corrupted code/pointer).
-        // The line-tag check makes every captured beat belong to the consumer's
-        // current request; mismatched beats stream out unconsumed (scnt still
-        // advances) and the consumer re-requests a fresh, correctly-targeted txn.
+        let unc_dlv: logic = (st_q == ST_UNCD) && unc_live && (i_haddr[h][5:3] == dw_q);
+        // A STREAM beat is granted only to a consumer addressing this slot's
+        // line: the core's routing of the shared read port can drift
+        // mid-STREAM, and mismatched beats must stream out unconsumed.
         let stream_ok: logic = (st_q == ST_STREAM) && (i_haddr[h][63:6] == line_q);
-        assign o_hgrant[h] = (accept[h] && !i_hunc[h]) || stream_ok || ((legacy || unc_bus) && slot_bus_gnt[h]);
-        assign o_hhold[h]  = i_hunc[h] && !unc_bus;
-        // Beat data: the addressed dword of the slot buffer (the dcache walks
-        // its critical-word-first order through i_haddr during STREAM).
+        assign o_hgrant[h] = (accept[h] && !i_hunc[h]) || stream_ok || unc_dlv || (legacy && slot_bus_gnt[h]);
+        assign o_hhold[h]  = i_hunc[h] && !unc_dlv;
         assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
-        // P9.2: grant state to the L1 (sampled at fill completion).
-        assign o_hexcl[h] = excl_q;
+        assign o_hexcl[h]  = excl_q;
 
-        // Bus cycle requests: gather beats + legacy reads (per SLOT; the per-hart
-        // aggregation and grant distribution are below).
-        assign slot_bus_req[h] = legacy || unc_bus || (st_q == ST_GATHER);
+        assign slot_bus_req[h] = legacy;
     }
 
     // Per-hart aggregation of the slot bus requests, and the reverse distribution
@@ -690,141 +671,6 @@ pub module mem_ctrl #(
     for h in 0..N_SLOTS :gen_lkgo {
         assign lk_go_all[h] = lk_sel_all[h] && lk_go && !unc_all[h];
     }
-    // ══════════════════════════════════════════════════════════════════
-    // Block N lookup-port census (cp_mshr_mlp_plan.md §13). DEAD at LK_CENSUS=0.
-    //
-    // N1 (the I/D channel split) gained -1.13 % at N=1 and -3.13 % at N=2 but REVERSED
-    // to +1.86 % at N=4, and the suspect is the one shared resource N1 does not widen:
-    // this module's L2 lookup port serves ONE slot per cycle, and N1 doubles the number
-    // of slots contending for it. Two very different failures look the same from the
-    // boot number, and they need different fixes:
-    //
-    //   STARVATION — the port has spare cycles but lowest-id-wins keeps handing them to
-    //     the same slots. Fix: a fairer selection. Signature: `wait` high while `busy`
-    //     is well under 100 %.
-    //   BANDWIDTH  — the port is simply saturated at 1 lookup/cycle. Fix: replicate the
-    //     directory (it is flops; the sync-read DATA array can stay single-ported since
-    //     only a HITTING slot reads it). Signature: `busy` near 100 % whenever `cont`.
-    //
-    // Slot numbering is slot-major, so [0, N_HARTS) is the D side and [N_HARTS, 2N) the
-    // I side; `hi` is the HIGHEST-numbered D slot = the hart the priority encoder ranks
-    // last, i.e. the first one starvation would show up on. Printed periodically so the
-    // SMP arms need no census port plumbing (same trick as Block T's B2B_SUP_TRACE).
-    // ══════════════════════════════════════════════════════════════════
-    const LK_CENSUS: bit       = 0;
-    const LK_EVERY : logic<32> = 32'd5000000;
-    var lkc_nin   : logic<4>;
-    var lkc_d_in  : logic   ;
-    var lkc_d_wait: logic   ;
-    var lkc_i_in  : logic   ;
-    var lkc_i_wait: logic   ;
-    always_comb {
-        lkc_nin    = 4'd0;
-        lkc_d_in   = 1'b0;
-        lkc_d_wait = 1'b0;
-        lkc_i_in   = 1'b0;
-        lkc_i_wait = 1'b0;
-        for s in 0..N_SLOTS {
-            if st_all[s] == ST_LOOKUP {
-                lkc_nin = lkc_nin + 4'd1;
-                if s <: N_HARTS {
-                    lkc_d_in = 1'b1;
-                    if !lk_sel_all[s] {
-                        lkc_d_wait = 1'b1;
-                    }
-                } else {
-                    lkc_i_in = 1'b1;
-                    if !lk_sel_all[s] {
-                        lkc_i_wait = 1'b1;
-                    }
-                }
-            }
-        }
-    }
-    // The last-ranked D slot: starvation shows here first.
-    let lkc_hi_wait: logic = (st_all[N_HARTS - 1] == ST_LOOKUP) && !lk_sel_all[N_HARTS - 1];
-    var lkc_cy   : logic<32>;
-    var lkc_busy : logic<32>; // the port served someone
-    var lkc_cont : logic<32>; // 2+ slots wanted it
-    var lkc_dwait: logic<32>;
-    var lkc_iwait: logic<32>;
-    var lkc_hiw  : logic<32>;
-    var lkc_own  : logic<32>; // the SELECTED slot is re-looking-up an OWNED line
-    // Pass 2 (the lookup port turned out to be idle at N=2, §13.3): the OTHER shared
-    // resources a second slot per hart adds contenders to.
-    var lkc_accl : logic<32>; // an accept was refused by per-line serialization
-    var lkc_accw : logic<32>; // an accept was refused because another slot won the cycle
-    var lkc_busq : logic<32>; // both of a hart's slots wanted the DRAM read channel
-    var lkc_accl_w: logic   ;
-    var lkc_accw_w: logic   ;
-    var lkc_busq_w: logic   ;
-    always_comb {
-        lkc_accl_w = 1'b0;
-        lkc_accw_w = 1'b0;
-        for s in 0..N_SLOTS {
-            if (st_all[s] == ST_IDLE) && i_hreq[s] && i_hdram[s] {
-                if acc_line_busy[s] {
-                    lkc_accl_w = 1'b1;
-                } else if !accept[s] {
-                    lkc_accw_w = 1'b1;
-                }
-            }
-        }
-        lkc_busq_w = 1'b0;
-        for h2 in 0..N_HARTS {
-            if slot_bus_req[h2] && slot_bus_req[N_HARTS + h2] {
-                lkc_busq_w = 1'b1;
-            }
-        }
-    }
-    always_ff (clk, rst) {
-        if_reset {
-            lkc_cy    = 32'd0;
-            lkc_busy  = 32'd0;
-            lkc_cont  = 32'd0;
-            lkc_dwait = 32'd0;
-            lkc_iwait = 32'd0;
-            lkc_hiw   = 32'd0;
-            lkc_own   = 32'd0;
-            lkc_accl  = 32'd0;
-            lkc_accw  = 32'd0;
-            lkc_busq  = 32'd0;
-        } else if LK_CENSUS {
-            lkc_cy = lkc_cy + 32'd1;
-            if lkc_nin != 4'd0 {
-                lkc_busy = lkc_busy + 32'd1;
-            }
-            if lkc_nin >: 4'd1 {
-                lkc_cont = lkc_cont + 32'd1;
-            }
-            if lkc_d_wait {
-                lkc_dwait = lkc_dwait + 32'd1;
-            }
-            if lkc_i_wait {
-                lkc_iwait = lkc_iwait + 32'd1;
-            }
-            if lkc_hi_wait {
-                lkc_hiw = lkc_hiw + 32'd1;
-            }
-            if lk_v && !lk_cf && i_l2_chit && i_l2_c_owned { // = lk_recall_req, declared below
-                lkc_own = lkc_own + 32'd1;
-            }
-            if lkc_accl_w {
-                lkc_accl = lkc_accl + 32'd1;
-            }
-            if lkc_accw_w {
-                lkc_accw = lkc_accw + 32'd1;
-            }
-            if lkc_busq_w {
-                lkc_busq = lkc_busq + 32'd1;
-            }
-            if lkc_cy % LK_EVERY == 32'd0 {
-                $display("LK [%d] busy=%d cont=%d dwait=%d iwait=%d hiwait=%d ownretry=%d", lkc_cy, lkc_busy, lkc_cont, lkc_dwait, lkc_iwait, lkc_hiw, lkc_own);
-                $display("LK2[%d] accline=%d acclost=%d busboth=%d", lkc_cy, lkc_accl, lkc_accw, lkc_busq);
-            }
-        }
-    }
-
     // Recall request: lookup hit on an OWNED line (owner = the one-hot mask).
     let lk_recall_req: logic = lk_v && !lk_cf && i_l2_chit && i_l2_c_owned;
     var lk_owner: logic<3>;
@@ -850,18 +696,195 @@ pub module mem_ctrl #(
     }
     assign o_cadd_own = lk_excl_w;
 
-    // External gather mux: at most one slot holds the bus read grant.
+    // ------------------------------------------------------------------
+    // Write buffer: WB_N line entries in grant order. wb_hd is the oldest
+    // entry (waiting for its B), wb_aw / wb_w the next AW / W burst to send.
+    // ------------------------------------------------------------------
+    const WBI: u32 = if WB_N >= 2 ? $clog2(WB_N) : 1;
+    const WBC: u32 = $clog2(WB_N + 1);
+
+    function wb_inc (
+        p: input logic<WBI>,
+    ) -> logic<WBI> {
+        return if p == (WB_N - 1) as WBI ? '0 : p + 1;
+    }
+
+    var wb_v   : logic     [WB_N]    ;
+    var wb_line: logic<58> [WB_N]    ;
+    var wb_lo  : logic<3>  [WB_N]    ;
+    var wb_hi  : logic<3>  [WB_N]    ;
+    var wb_data: logic<64> [WB_N * 8];
+    var wb_strb: logic<8>  [WB_N * 8];
+    var wb_tl  : logic<WBI>          ;
+    var wb_hd  : logic<WBI>          ;
+    var wb_aw  : logic<WBI>          ;
+    var wb_w   : logic<WBI>          ;
+    var wb_n   : logic<WBC>          ;
+    var aw_n   : logic<WBC>          ;
+    var w_n    : logic<WBC>          ;
+    var w_beat : logic<3>            ;
+
+    // First and last strobed lane of the granted write.
+    var in_any: logic   ;
+    var in_lo : logic<3>;
+    var in_hi : logic<3>;
     always_comb {
-        o_mem_addr = 64'd0;
-        o_mem_ren  = 1'b0;
-        for h in 0..N_SLOTS {
-            if (st_all[h] == ST_GATHER) && slot_bus_gnt[h] {
-                o_mem_addr = {line_all[h], gcnt_all[h], 3'b000};
-                o_mem_ren  = 1'b1;
+        in_any = 1'b0;
+        in_lo  = 3'd0;
+        in_hi  = 3'd0;
+        for l in 0..8 {
+            if i_w_strb[l] != 8'd0 {
+                if !in_any {
+                    in_lo = l as 3;
+                }
+                in_any = 1'b1;
+                in_hi  = l as 3;
             }
         }
     }
-    assign o_mem_busy = o_mem_ren;
+    let wb_enq: logic = i_w_valid && in_any;
+
+    let aw_hs  : logic     = o_awvalid && i_awready;
+    let w_hs   : logic     = o_wvalid && i_wready;
+    let w_lane : logic<3>  = wb_lo[wb_w] + w_beat;
+    let w_end  : logic     = w_lane == wb_hi[wb_w];
+    let aw_line: logic<58> = wb_line[wb_aw];
+    let aw_lo  : logic<3>  = wb_lo[wb_aw];
+
+    assign o_wb_full = wb_n == WB_N as WBC;
+    assign o_awvalid = aw_n != '0;
+    assign o_awid    = '0;
+    let aw_full: logic<64> = {aw_line, aw_lo, 3'b000};
+    assign o_awaddr  = aw_full[55:0];
+    assign o_awlen   = {5'd0, wb_hi[wb_aw] - aw_lo};
+    assign o_wvalid  = w_n != '0;
+    assign o_wdata   = wb_data[{wb_w, w_lane}];
+    assign o_wstrb   = wb_strb[{wb_w, w_lane}];
+    assign o_wlast   = w_end;
+    assign o_bready  = 1'b1;
+
+    always_ff (clk, rst) {
+        if_reset {
+            for e in 0..WB_N {
+                wb_v[e]    = 1'b0;
+                wb_line[e] = '0;
+                wb_lo[e]   = 3'd0;
+                wb_hi[e]   = 3'd0;
+                for l in 0..8 {
+                    wb_data[e * 8 + l] = 64'd0;
+                    wb_strb[e * 8 + l] = 8'd0;
+                }
+            }
+            wb_tl  = '0;
+            wb_hd  = '0;
+            wb_aw  = '0;
+            wb_w   = '0;
+            wb_n   = '0;
+            aw_n   = '0;
+            w_n    = '0;
+            w_beat = 3'd0;
+        } else {
+            for e in 0..WB_N {
+                if wb_enq && (wb_tl == e as WBI) {
+                    wb_v[e]    = 1'b1;
+                    wb_line[e] = w_line;
+                    wb_lo[e]   = in_lo;
+                    wb_hi[e]   = in_hi;
+                    for l in 0..8 {
+                        wb_data[e * 8 + l] = i_w_lanes[l];
+                        wb_strb[e * 8 + l] = i_w_strb[l];
+                    }
+                }
+                if i_bvalid && (wb_hd == e as WBI) {
+                    wb_v[e] = 1'b0;
+                }
+            }
+            if wb_enq {
+                wb_tl = wb_inc(wb_tl);
+            }
+            if i_bvalid {
+                wb_hd = wb_inc(wb_hd);
+            }
+            wb_n = wb_n + (wb_enq as WBC) - (i_bvalid as WBC);
+            if aw_hs {
+                wb_aw = wb_inc(wb_aw);
+            }
+            aw_n = aw_n + (wb_enq as WBC) - (aw_hs as WBC);
+            if w_hs {
+                if w_end {
+                    wb_w   = wb_inc(wb_w);
+                    w_beat = 3'd0;
+                } else {
+                    w_beat = w_beat + 3'd1;
+                }
+            }
+            w_n = w_n + (wb_enq as WBC) - ((w_hs && w_end) as WBC);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // AR channel. A slot in ST_AR may take it unless its line has a write
+    // buffered or granted this cycle (a later read must not pass an earlier
+    // write: AR and AW are unordered at the slave). The lowest such slot
+    // takes the channel when it is free or frees this cycle; the AR then
+    // holds from registers until ARREADY.
+    // ------------------------------------------------------------------
+    var ar_cand: logic [N_SLOTS];
+    always_comb {
+        for h in 0..N_SLOTS {
+            ar_cand[h] = (st_all[h] == ST_AR) && !(ar_busy_q && (ar_slot_q == (h as ID_W)));
+            if i_w_valid && (w_line == line_all[h]) {
+                ar_cand[h] = 1'b0;
+            }
+            for e in 0..WB_N {
+                if wb_v[e] && (wb_line[e] == line_all[h]) {
+                    ar_cand[h] = 1'b0;
+                }
+            }
+        }
+    }
+    var ar_found: logic [N_SLOTS];
+    for h in 0..N_SLOTS :gen_arpick {
+        if h == 0 :gen_first {
+            assign ar_pick[h]  = ar_cand[h];
+            assign ar_found[h] = ar_cand[h];
+        } else :gen_rest {
+            assign ar_pick[h]  = ar_cand[h] && !ar_found[h - 1];
+            assign ar_found[h] = ar_found[h - 1] || ar_cand[h];
+        }
+    }
+    let ar_free: logic = !ar_busy_q || ar_hs;
+    for h in 0..N_SLOTS :gen_artake {
+        assign ar_take[h] = ar_pick[h] && ar_free;
+    }
+    var ar_next: logic<ID_W>;
+    always_comb {
+        ar_next = '0;
+        for h in 0..N_SLOTS {
+            if ar_pick[h] {
+                ar_next = h as ID_W;
+            }
+        }
+    }
+    always_ff (clk, rst) {
+        if_reset {
+            ar_busy_q = 1'b0;
+            ar_slot_q = '0;
+        } else if ar_free && ar_found[N_SLOTS - 1] {
+            ar_busy_q = 1'b1;
+            ar_slot_q = ar_next;
+        } else if ar_hs {
+            ar_busy_q = 1'b0;
+        }
+    }
+    let ar_line: logic<58> = line_all[ar_slot_q];
+    let ar_unc : logic     = unc_all[ar_slot_q];
+    assign o_arvalid = ar_busy_q;
+    assign o_arid    = ar_slot_q;
+    let ar_full: logic<64> = if ar_unc ? {ar_line, dw_all[ar_slot_q], 3'b000} : {ar_line, 6'd0};
+    assign o_araddr  = ar_full[55:0];
+    assign o_arlen   = if ar_unc ? 8'd0 : 8'd7;
+    assign o_rready  = 1'b1;
 
     // ------------------------------------------------------------------
     // P9.2 install stage. INSTALL slots can now WAIT (inv-port arbitration /
@@ -998,36 +1021,6 @@ pub module mem_ctrl #(
         }
     }
     let iv_recall_req: logic = inst_sel_v && inst_do && i_iv_valid && i_iv_owned;
-
-    // Block N lookup census, part 2 (declared here because inst_blocked / iv_recall_req
-    // are `let`s at this point in the file). DEAD at LK_CENSUS=0.
-    var lkc_cy2  : logic<32>;
-    var lkc_instb: logic<32>; // the selected INSTALL slot was held
-    var lkc_engb : logic<32>; // the recall engine was busy
-    var lkc_engw : logic<32>; // a recall was wanted while the engine was busy
-    always_ff (clk, rst) {
-        if_reset {
-            lkc_cy2   = 32'd0;
-            lkc_instb = 32'd0;
-            lkc_engb  = 32'd0;
-            lkc_engw  = 32'd0;
-        } else if LK_CENSUS {
-            lkc_cy2 = lkc_cy2 + 32'd1;
-            if inst_sel_v && inst_blocked {
-                lkc_instb = lkc_instb + 32'd1;
-            }
-            if eng_busy {
-                lkc_engb = lkc_engb + 32'd1;
-            }
-            if eng_busy && (i_wv_req || iv_recall_req || lk_recall_req) {
-                lkc_engw = lkc_engw + 32'd1;
-            }
-            if lkc_cy2 % LK_EVERY == 32'd0 {
-                $display("LK3[%d] instblk=%d engbusy=%d engwait=%d", lkc_cy2, lkc_instb, lkc_engb, lkc_engw);
-            }
-        }
-    }
-
 
     // ------------------------------------------------------------------
     // P9.2 Phase B: recall engine. One outstanding recall; requesters by
