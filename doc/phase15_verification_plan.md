@@ -851,7 +851,7 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 - 遅延と backpressure の parameter (channel ごと): AR と AW の受理の遅れ、R の初回遅延と beat 間の隙間、W の ready の確率、B の遅延、R と B の ID 間の順不同 (同じ ID の中は順序を守る)。乱数は seed を parameter に持つ LFSR で作る。`$random` は使わない。理由: Verilator でも同じ列が出て (GV)、失敗した seed を回帰に固定できる。
 - 設定の名前を 4 つに固定する: `FIXED` (固定遅延。AR と AW は即受理、初回遅延は固定、beat は毎サイクル、W は常に ready)、`SLOW` (遅延が大きい。outstanding が 1 に近い)、`BACKPRESSURE` (遅延は小さく、全 channel の ready を確率で落とす)、`REORDER` (複数 ID の応答が順不同に返る)。各設定は seed を持つ。
 - 単体テスト: model だけを protocol checker の下で駆動する (master 役の tb が合法な取引と、わざと違反した取引を出し、checker が違反を捕まえること)。
-- 【MM で決定】実装: `tb/axi4_slave_model.veryl`、設定は `tb/axi4_tb_pkg.veryl` の `SlaveCfg` (`FIXED`/`SLOW`/`BACKPRESSURE`/`REORDER`) と `SEED`、乱数は channel ごとの xorshift32。model は AW を受けた後にだけ W を取り (AXI が許す)、R の burst は 1 本ずつ (interleave しない)、範囲外は DECERR。単体テストは `tb/test_axi4.veryl` で、4 設定の clean run (16 burst の write と read-back、master は RREADY/BREADY を乱数で落とす) と、違反の注入 13 種を G0 に置く (合わせて数秒)。ROM の領域 (U44) は SoC につなぐ手順で足す。
+- 【MM で決定】実装: `tb/axi4_slave_model.veryl`、設定は `tb/axi4_tb_pkg.veryl` の `SlaveCfg` (`FIXED`/`SLOW`/`BACKPRESSURE`/`REORDER`) と `SEED`、乱数は channel ごとの xorshift32。model は AW を受けた後にだけ W を取り (AXI が許す)、R の burst は 1 本ずつ (interleave しない)、範囲外は DECERR。R の遅延は `r_lat` (line の burst) と `r_lat1` (`ARLEN = 0` の 1 beat) を別に持つ。単体テストは `tb/test_axi4.veryl` で、4 設定の clean run (16 burst の write と read-back、master は RREADY/BREADY を乱数で落とす) と、違反の注入 13 種を G0 に置く (合わせて数秒)。ROM の領域 (U44) は SoC につなぐ手順で足す。
 
 ### 10.2 固定遅延の設定と cycles の許容
 
@@ -874,24 +874,50 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 - GV: AXI の slave model を `veryl build` で SV にし (`sim/verilator/` のラッパから instantiate)、litmus4、N=2、N=4 の boot を `BACKPRESSURE` で走らせる。Verilator は NBA の相互確認で、N=4 の判定には使わない (§6.3 のまま)。
 - 失敗した seed は回帰の一覧 (`test/gates/mm_seeds.list`) に固定して残す。seed だけを変えて通すことはしない (原因を調べる)。
 - 発火 (GF): 設計書 MM.5 の I1 (read を write の B まで止めた回数)、I4 (`install_ok` が落ちた回数)、write buffer 満杯での write grant の停止、AR の停止 (line buffer の確保失敗) の事象を `o_perf` に出し、乱数遅延の run で 0 より大きいことを `fire_check.py` で確かめる。`FIXED` では I1 と I4 が 0 でもよい。
+- 【MM で決定】GF の実装: `soc_pkg::McPerf` を SoC の `o_mc_perf` に出し、harness の `tb/mc_perf_acc.veryl` が `PERF 0`/`PB 0` (core 0 = mem_ctrl、`fire_check.py` が `McPerf` から名前を付ける) と、人が読む `MC` の 2 行を印字する。事象: `ar_line`/`ar_dram1`/`ar_rom` (AR の handshake、取引の種類ごと)、`aw`、`w_beat`、`i1_hold` (I1)、`ar_wait` (AR channel を他の slot が持つ)、`ar_bp` (ARREADY の backpressure)、`wb_full` (write の要求があるのに write buffer が満杯)、`inst_abort` (I4)。`lat_line`/`lat_dram1`/`lat_rom` は slot ごとの「AR valid から最後の R まで」、`lat_wr` は write buffer の entry ごとの「AW valid から B まで」の bit で、bit の count の和がその種類の遅延の合計になる (費用 = 件数 × 平均遅延が `MC` の行で直接読める)。mem_ctrl の設計では R に backpressure をかけないので、AR の停止の源は I1、channel 待ち、ARREADY の 3 つである。
 - V14: 梯子 1-5 と dhrystone/coremark のビット一致 (設計書 MM.7)。V14 の枝の経路は AXI の slave model を通らない。
 
 ### 10.5 MM の最初の実装の記録 (手順 2-5、固定遅延)
 
 - 範囲: U45 の凍結コピー `src/v14/v14_mem_ctrl.veryl` (SoC の V14 の枝だけが使う)、新コアの `mem_ctrl` の read path (AR/R、`ARID` = slot、line は `ARLEN = 7`、uncached と ROM は `ARLEN = 0`)、write path (`WB_N = 2 × N_HARTS` の FIFO、`AWID = 0`、strobe の lane 範囲の 1 burst、B で解放、I1)、U44 の ROM (SoC の `mc_unc` を `pma_check` の target ∈ {DRAM, ROM} に替え、ROM の内容は slave model が持つ)。harness は `boot_soc_harness` と `arch_soc_harness` が `tb/axi4_mem.veryl` (`axi4_slave_model` + `axi4_mon`) を `FIXED` でつなぎ、`axi4_mon` の flag は retire_mon の chk に入る (GP)。
-- 未着手: GF の事象 (I1、I4、write buffer 満杯、AR の停止) の `o_perf`、U46 の sticky な error 観測、GM (乱数設定での再走)、§10.4 の directed、GV、U47。
-- slave model は ROM も DRAM と同じ `r_lat` で返す (`FIXED` は 20)。
+- 未着手: U46 の sticky な error 観測、GM (乱数設定での再走)、§10.4 の directed、GV、U47。GF の事象は §10.4 のとおり実装済み (下の分解に使った)。
+- 下の表の「MM」列は最初の `FIXED` (`r_lat = 20` を line にも 1 beat にも使う) の値で、「新 FIXED」列は分解の後に `FIXED` を MM の前の遅延に合わせた (`r_lat = 17`、`r_lat1 = 0`) 値である。
 
-| ゲート (W2、`FIXED`) | MM の前 (`0ebac00`) | MM |
-|---|---|---|
-| G0 | 860 passed (M4 の記録) | 865 passed、0 failed |
-| GL-B | 14,316,714 | 15,597,260 (+8.9 %)。record 10,417,776、hash `74d4b7982390260f`、chk 0 (AXI の flag を含む) |
-| GB2 | 19,082,790 | 20,880,466 (+9.4 %)、pass、chk 0 (両 hart) |
-| cbench dhrystone / coremark / fpmm / spmv | 268,712 / 381,245 / 1,044,649 / 41,165 | 268,776 / 381,354 / 1,046,441 / 42,819 |
-| V14 dhrystone / coremark | 235,804 (instret 264,834) / 394,546 (374,357) | 同じ (ビット一致) |
-| V14 5.15 N=1 boot | cy=0x00ba9d70 | 同じ |
+| ゲート (W2、`FIXED`) | MM の前 (`0ebac00`) | MM (`r_lat` 20) | MM、新 FIXED |
+|---|---|---|---|
+| G0 | 860 passed (M4 の記録) | 865 passed、0 failed | 865 passed、0 failed |
+| GL-B | 14,316,714 | 15,597,260 (+8.9 %)。record 10,417,776、hash `74d4b7982390260f`、chk 0 (AXI の flag を含む) | 14,570,718 (+1.77 %)。record と hash は同じ、chk 0 |
+| GB2 | 19,082,790 | 20,880,466 (+9.4 %)、pass、chk 0 (両 hart) | 19,380,793 (+1.56 %)、pass、chk 0 (両 hart)。ROM の read 897,133 回の大半は hart 1 が ROM の中で起動を待つ spin |
+| cbench dhrystone / coremark / fpmm / spmv | 268,712 / 381,245 / 1,044,649 / 41,165 | 268,776 / 381,354 / 1,046,441 / 42,819 | 未測定 |
+| V14 dhrystone / coremark | 235,804 (instret 264,834) / 394,546 (374,357) | 同じ (ビット一致) | 変更の範囲外 (V14 は AXI を通らない) |
+| V14 5.15 N=1 boot | cy=0x00ba9d70 | 同じ | 同じく範囲外 |
 
-- GL-B の +8.9 % は §10.2 の許容をまだ決めていない段階の値である。主な候補は ROM の fetch (以前は組合せの legacy の経路、いまは 1 beat ごとに AXI の往復) と、write が 1 サイクルの posted から 1 beat/サイクルの W に変わったこと。分解は GF の事象を足してから行う。
+#### GL-B の +8.9 % の分解
+
+取引ごとの遅延 (MM の前はソースからの導出、MM は `MC` の行の実測。L は slot が L2 を lookup したサイクル):
+
+| 取引 | MM の前 (`0ebac00`) | MM、`r_lat` 20 | MM、新 FIXED |
+|---|---|---|---|
+| line fill (L2 miss) | DWAIT 20 の後に bus の gather 8 beat。最初の beat は L+21、INSTALL は L+29 | ST_AR 1 サイクル、AR の handshake、最初の R は AR の 22 サイクル後: L+24 / L+32 (+3)。AR valid から最後の R まで平均 30.1 | `r_lat` 17 で L+21 / L+29 (一致)。平均 27.1 |
+| ROM の read (1 beat) | legacy の組合せの経路: slot を使わず、bus の read grant と同じサイクルにデータ | accept、LOOKUP、ST_AR、AR、R、ST_UNCD の slot の取引。AR valid から R まで平均 23.0、要求から約 27 サイクル | `r_lat1` 0 で AR valid から R まで 4.0 (AR の 1 サイクルと slave の登録 2 段)、要求から約 8 サイクル |
+| DRAM の uncached 1 beat | ST_UNC: L+1 (bus の grant と同じサイクル) | ROM と同じ | ROM と同じ。GL-B では 0 件 |
+| write | 1 サイクルの posted。gather の beat と legacy の ROM read のあいだだけ grant を止める | write buffer (`WB_N` = 2) に入り、AW と W を出し B で解放。92,523 本、うち line の 8 beat がほぼ全部 (W 740,184 beat)、AW valid から B まで平均 13.4 | 同じ |
+
+件数 (GL-B、`r_lat` 20 / 新 FIXED): line 48,668 / 49,596、ROM 54,024 / 56,562、DRAM の 1 beat 0 / 0、write の burst 92,523 / 92,537、`wb_full` 316,826 / 305,299 サイクル、`i1_hold` 2,135 / 669、`ar_wait`、`ar_bp`、`inst_abort` はどれも 0。ROM の read は、boot の間 M-mode の trap の処理 (ROM の firmware) を uncached で fetch するもので、1 beat ずつ直列に待つので遅延がほぼそのまま cycles に出る。
+
+遅延を 1 つずつ戻した GL-B の run で差分を取った (record と hash はすべて同じ):
+
+| 区分 | 根拠の run | cycles | +8.9 % (1,280,546) に占める割合 |
+|---|---|---|---|
+| ROM の fetch の遅延 (1 beat に `r_lat` 20) | `r_lat` 20 → line 20 / 1 beat 0 (14,659,950) | 937,310 | 73.2 % |
+| line fill (+3 サイクル: ST_AR と AR の handshake の 2 段と、R の登録の 1 段) | line 20 / 1 beat 0 → line 17 / 1 beat 0 (14,570,718) | 89,232 (潜在 3 × 48,668 = 146,004 の 61 %) | 7.0 % |
+| DRAM の uncached 1 beat | 件数 0 | 0 | 0 % |
+| write (write buffer 満杯の停止を含む) | 新 FIXED で `WB_N` を 6 にした run (14,579,390、`wb_full` 2,541 サイクル) | 0 (差は -8,672 で雑音の幅。`wb_full` は 305,299 サイクルあるが core の進行を止めていない) | 0 % |
+| 残り (AXI の構造: 主に ROM の 1 beat が slot の取引になったこと) | 新 FIXED と MM の前の差 | 254,004 | 19.8 % (GL-B の +1.77 %) |
+
+- 【MM で決定】`FIXED` を MM の前の遅延に合わせた: `r_lat = 17` (line の最初の beat が lookup の 21 サイクル後になり、`DRAM_WAIT = 20` の gather と同じサイクルにそろう)、`r_lat1 = 0` (1 beat は slave が出せる最短。MM の前の 1 beat は組合せで返っていた)。`b_lat` は 1 のまま (0 と 1 は model の中で同じ時刻になる)。他の 3 設定は `r_lat1 = r_lat` で、振る舞いを変えない。
+- 残りの 254,004 (+1.77 %) は AXI の構造による。MM の前の ROM の read は slot を使わずに同じサイクルで返っていたが、AXI では 1 beat ごとに accept、LOOKUP、ST_AR、AR、slave の登録 2 段、ST_UNCD を通り、最短でも要求から約 8 サイクルかかる。56,562 回 × 約 4.5 サイクルでこの残りに見合う (ROM 以外の寄与は分けて測っていない)。mem_ctrl の側で削れるのは ST_AR の 1 サイクル (LOOKUP の miss から直接 AR を立てる) と ST_UNCD の 1 サイクルで、残りは registered な AXI の往復そのものである。§10.2 の許容幅はこの値を基準に決める。
+- write の側は、`WB_N = 2` で `wb_full` が 305,299 サイクル立つが、`WB_N = 6` にして 2,541 サイクルまで消しても cycles は変わらなかった (14,579,390)。したがって `WB_N` の sweep (設計書 MM.4) は今は不要である。なお、この run では harness の `axi4_mon` の `MAX_WR` (`N_HARTS × 2`) も 6 に上げる必要があった。`MAX_WR` は `WB_N` に追従させる。
 
 ---
 
