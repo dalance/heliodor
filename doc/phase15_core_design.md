@@ -4761,7 +4761,7 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 6. Debug Mode の入場の設計を commit/trap で確定する (§D.4、§D.5、§D.16)。RTL は MD で入れる (DEAD scaffolding を作らない)。確定するもの: outcome DEBUG と `RedirKind::DEBUG`、非同期の入場 `dm_take` を割込みと同じ受付点に置き token の抑止を共通の項にすること、retire 制限を lockstep・step・icount の合成 1 項にすること、`ExcRec` の `dm`/`trig`/`trig_hit` と `exc_prio` での trigger の位置、xRET 種別の 2 bit 化。M4 の手順 1-5 で足す取り消せない操作 (ASQ を採るならそれ) が §5.13.1 の表に載り、`head_started_q` の有界性と `ordering_empty` の意味 (queued atomic を含む) を保つことを、この確定のレビューで確かめる。
 7. SBA (MD) の前提として、U28 の残り (DRAM の uncached 読みの前に他 hart の dirty コピーを recall する) を入れる (§5.11、§D.11)。
 
-進捗 (2026-10-24): 手順 1 から 7 はすべて完了。マイルストーン末に残るのは W4 の GB2/GB4/GT4 と、6.6/7.1 の SMP boot である。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) での W2 の GB4 は 24,922,839 サイクルで pass、`MSHR_N = 2` では 24,808,238 で pass (checker はすべて 0)。
+進捗 (2026-10-25): 手順 1 から 7 はすべて完了し、マイルストーン末のゲートも通った (結果は検証計画 §1.6)。W4 の native の GB4 と W4 の 6.6/7.1 の SMP boot は M6 に繰り延べた (下の完了の項)。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) での W2 の GB4 は 24,922,839 サイクルで pass、`MSHR_N = 2` では 24,808,238 で pass (checker はすべて 0)。
 
 - 手順 1 (`ab66e89`、`50f5dde`、`tb/test_core_smp.veryl`): `boot_soc_harness` を `N_HARTS` で一般化した (既定 1。N=1 の DUT と hart 0 の観測は不変)。hart ごとに `retire_mon`、`rvfi_tracer`、perf_acc を持ち、pass は hart 0 (x3=0xAA か tohost==1)、fail はいずれかの hart の chk か tohost の異常。RTL の変更はなく、立ち上げで RTL のバグは 1 件も出なかった (chk 全 0)。結果 (cycles):
 
@@ -4794,7 +4794,9 @@ M3 の末に見つかった veryl の不具合 (`cfg_w4_sb8` を引き金に `ve
 | 区分 | 条件 |
 |---|---|
 | 機能 (W2, W4) | G0 に litmus N=2 を追加。GT4、GB2 (5.15、マイルストーン末は 6.6/7.1 の SMP も)。GB4 は M3 の決定に従う。GV: litmus4、N=2、N=4。 |
-| 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。`MSHR_N = 2` の出荷分は W2 の GB4 を通した (W4 はマイルストーン末)。 |
+| 構造 | メモリ系を変えたコミットはすべて GB4 を通っている。`MSHR_N > 1` を出荷する場合は、各コミットが GB4 を通っている。`MSHR_N = 2` の出荷分は W2 の GB4 を通した。W4 の N=4 boot は Verilator で通した (native は M6 へ)。 |
+
+【M4 の出口条件の判定】(2026-10-25) 充足。W2/W4 の GB2、GT4、GV (litmus4、N=2、N=4) と、W2 の 6.6/7.1 の SMP N=2 boot が通り、checker は 0。Verilator の cycles は W2 (5.15 N=2 19,082,790、litmus N=4 5,029,995、5.15 N=4 24,808,238) と W4 の N=2 (16,159,839) と litmus N=4 (5,028,286) で native と一致した。W4 の 5.15 N=4 boot は Verilator で 22,546,887 cy で PASSED。繰り延べ (ユーザ承認): W4 の native の 5.15 N=4 boot (約 130 cy/s で約 48 時間) と W4 の 6.6/7.1 の SMP boot は M6 の既定切替のゲートで走らせる。完了の宣言はユーザが決める。
 
 M4 で決める事項: 未決事項の一覧には M4 期限の項目は無い。各章が M4 に送った事項: ASQ クラスを入れるか (§L.11、手順 5 で採らないと決定)、fill の victim 選択から pin 中の line を除外するか (§L.12、手順 5 で採らないと決定)、`MSHR_N` の値 (§M.6.4、手順 4 で 2 に決定)。加えて、手順 6 の Debug Mode の入場の設計の確定 (§D.16、完了)。
 

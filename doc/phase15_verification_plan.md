@@ -166,9 +166,9 @@ M3 の末の百分率は手順 7 との比。手順 7 の W2 の coremark が遅
 
 ---
 
-### 1.6 M4 のゲートの結果 (2026-10-24、途中)
+### 1.6 M4 のゲートの結果 (2026-10-25、完了)
 
-M4 の手順 4 で `MSHR_N = 2` を `cfg_w2`/`cfg_w4` に採った (`90f6f8e`、`6eb785a`、`b7b852d`。設計書 §M.6.4)。W4 の GB2/GB4/GT4 と 6.6/7.1 の SMP boot はマイルストーン末に回す。
+M4 の手順 4 で `MSHR_N = 2` を `cfg_w2`/`cfg_w4` に採った (`90f6f8e`、`6eb785a`、`b7b852d`。設計書 §M.6.4)。W4 の GB2/GT4 と W2 の 6.6/7.1 の SMP boot はマイルストーン末に走らせ、下の表に結果を置いた。W4 の GB4 (native) と W4 の 6.6/7.1 の SMP boot は M6 の既定切替のゲートに繰り延べた (表の下)。
 
 | ゲート | 結果 (`MSHR_N = 2`) |
 |---|---|
@@ -177,6 +177,14 @@ M4 の手順 4 で `MSHR_N = 2` を `cfg_w2`/`cfg_w4` に採った (`90f6f8e`、
 | GB2 (W2) | 19,082,790 |
 | GB4 (W2) | 24,808,238 pass、checker はすべて 0。積み重ねた先端 (手順 1-3、7 と mtime firmware、`MSHR_N = 1`) では 24,922,839 pass。旧 4-hart firmware の像は 43,479,101 だったので、以前の N=4 SMP の遅さは firmware の delay だった |
 | GT4 (W2) | 5,029,995 pass |
+| GB2 (W4) | 16,159,839 pass、checker はすべて 0 |
+| GT4 (W4) | 5,028,286 pass |
+| GB2 6.6 / 7.1 (W2、SMP N=2) | 31,657,282 / 23,814,202 pass、chk はすべて 0 |
+| GB4 (W4、native) | 未実行 (下の決定) |
+| GV (W2) | Verilator で 5.15 N=2 19,082,790、litmus N=4 5,029,995、5.15 N=4 24,808,238 がすべて PASSED。cycles は native の GB2/GT4/GB4 (W2) と完全に一致 |
+| GV (W4) | Verilator で 5.15 N=2 16,159,839、litmus N=4 5,028,286 が PASSED で native と完全に一致。5.15 N=4 は 22,546,887 で PASSED (native は未実行) |
+
+【決定】(2026-10-25、ユーザ承認) W4 の 5.15 N=4 boot は native で走らせない。理由: この箱で約 130 cy/s なので約 48 時間かかる。代わりに Verilator の W4 N=4 boot の PASSED と、W2/W4 のほかの GV (N=2、litmus N=4) が native と cycle 単位で一致していることで担保する。native の W4 GB4 と W4 の 6.6/7.1 の SMP boot は M6 の既定切替のゲートに繰り延べる。
 
 `MSHR_N` の sweep (1 / 2 / 4。W2、W4。coremark は 3 点とも同一で W2 381,245、W4 315,611、dhrystone はほぼ不変):
 
