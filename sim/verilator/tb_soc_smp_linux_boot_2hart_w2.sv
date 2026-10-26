@@ -3,10 +3,21 @@
 // as the native test_w2_smp_linux_boot_2hart does; polls o_pass (hart 0
 // x3==0xAA = SBI shutdown) and o_fail (any hart's checker or failure).
 // See CLAUDE.md "Running Tests on Verilator" for the build/run commands.
+// AXI_SEL picks the tb AXI4 slave timing (0 FIXED, 1 SLOW, 2 BACKPRESSURE,
+// 3 REORDER) and AXI_SEED its seed; set them at build time with -G, e.g.
+// -GAXI_SEL=3 -GAXI_SEED=1.
 
 `timescale 1ns/1ps
 
-module tb_soc_smp_linux_boot_2hart_w2;
+module tb_soc_smp_linux_boot_2hart_w2 #(
+    parameter int unsigned AXI_SEL  = 0,
+    parameter int unsigned AXI_SEED = 1
+);
+    localparam heliodor_axi4_tb_pkg::SlaveCfg AXI_CFG =
+        AXI_SEL == 1 ? heliodor_axi4_tb_pkg::SLOW :
+        AXI_SEL == 2 ? heliodor_axi4_tb_pkg::BACKPRESSURE :
+        AXI_SEL == 3 ? heliodor_axi4_tb_pkg::REORDER : heliodor_axi4_tb_pkg::FIXED;
+
     logic        clk;
     logic        rst;
     logic        pass;
@@ -19,6 +30,8 @@ module tb_soc_smp_linux_boot_2hart_w2;
         .N_HARTS (32'd2),
         .FW_HEX  ("test/hex/linux_boot_fw_2hart.hex"),
         .DRAM_HEX("test/hex/linux_dram_real_2hart.hex"),
+        .AXI_CFG (AXI_CFG),
+        .AXI_SEED(AXI_SEED),
         .CORE    (heliodor_soc_pkg::CoreSel_W2)
     ) dut (
         .clk      (clk),
@@ -48,7 +61,7 @@ module tb_soc_smp_linux_boot_2hart_w2;
             if (i % 5_000_000 == 0)
                 $display("  [W2 N=2] cy=%0d instret=%0d x3=%h", cycles, instret, x3);
         end
-        $display("[tb_soc_smp_linux_boot_2hart_w2] pass=%0b fail=%0b x3=%h cy=%0d instret=%0d", pass, fail, x3, cycles, instret);
+        $display("[tb_soc_smp_linux_boot_2hart_w2] axi_sel=%0d seed=%0d pass=%0b fail=%0b x3=%h cy=%0d instret=%0d", AXI_SEL, AXI_SEED, pass, fail, x3, cycles, instret);
         if (pass)
             $display("W2 SMP(N=2) LINUX BOOT PASSED on Verilator (SBI shutdown, x3==0xAA)");
         else

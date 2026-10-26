@@ -3,10 +3,21 @@
 // the native test_w2_litmus_4hart does (no ROM, MAP_ARCH, tohost protocol:
 // 1 = pass, anything else = forbidden outcome / trap).
 // See CLAUDE.md "Running Tests on Verilator" for the build/run commands.
+// AXI_SEL picks the tb AXI4 slave timing (0 FIXED, 1 SLOW, 2 BACKPRESSURE,
+// 3 REORDER) and AXI_SEED its seed; set them at build time with -G, e.g.
+// -GAXI_SEL=3 -GAXI_SEED=1.
 
 `timescale 1ns/1ps
 
-module tb_litmus_4hart_w2;
+module tb_litmus_4hart_w2 #(
+    parameter int unsigned AXI_SEL  = 0,
+    parameter int unsigned AXI_SEED = 1
+);
+    localparam heliodor_axi4_tb_pkg::SlaveCfg AXI_CFG =
+        AXI_SEL == 1 ? heliodor_axi4_tb_pkg::SLOW :
+        AXI_SEL == 2 ? heliodor_axi4_tb_pkg::BACKPRESSURE :
+        AXI_SEL == 3 ? heliodor_axi4_tb_pkg::REORDER : heliodor_axi4_tb_pkg::FIXED;
+
     logic        clk;
     logic        rst;
     logic        pass;
@@ -22,6 +33,8 @@ module tb_litmus_4hart_w2;
         .RESET_PC   (64'h8000_0000),
         .PASS_BY_X3 (1'b0),
         .TOHOST_PA  (64'h8000_1000),
+        .AXI_CFG (AXI_CFG),
+        .AXI_SEED(AXI_SEED),
         .CORE       (heliodor_soc_pkg::CoreSel_W2)
     ) dut (
         .clk      (clk),
@@ -51,7 +64,7 @@ module tb_litmus_4hart_w2;
             if (i % 1_000_000 == 0)
                 $display("  [W2 litmus N=4] cy=%0d", cycles);
         end
-        $display("[tb_litmus_4hart_w2] pass=%0b fail=%0b cy=%0d", pass, fail, cycles);
+        $display("[tb_litmus_4hart_w2] axi_sel=%0d seed=%0d pass=%0b fail=%0b cy=%0d", AXI_SEL, AXI_SEED, pass, fail, cycles);
         if (pass)
             $display("W2 LITMUS(N=4) PASSED on Verilator (tohost==1)");
         else
