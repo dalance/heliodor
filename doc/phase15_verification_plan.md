@@ -944,7 +944,32 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 - directed (§10.4) の cycles: `test_axi_i1` 4,819、`test_axi_i1_stall` 13,054、`test_axi_i4_slow` 18,397、`test_axi_unc_slow` 8,382、`test_axi_unc_stall` 12,258、`test_axi_coh_bp` 132,336、`test_axi_ad_reorder` 91,896、`test_axi_err` 388。G0 は 874 passed、0 failed (MM の前の 865 に directed 8 本と `test_axi4_sram` を足した)。
 - U46: `test_axi_err` (`test/axi/err.S`) は slave の DRAM を 2 MiB にした harness (`AXI_MEM_DW`) で、PMA の DRAM (4 MiB) の中だが slave の外の line を読み、NC で 1 dword を書く。`r_err` 9 beat、`b_err` 1 回、両方の sticky flag が立ち、core は trap しない。
 - U47: `test_axi4_sram` が pass (`axi4_mon` の flag 0、read-back 一致)。生成した SV の RAM は reset の無い `always_ff @(posedge clk)` の read-enable 付き read と byte-enable の write で、BRAM に推論できる形である。Verilator の `--lint-only -Wall` は使わない address の bit (`UNUSEDSIGNAL`) だけを出す。
-- 残り: GV (AXI の slave model を通した Verilator の litmus4、N=2、N=4 の boot)、GT2/GT4 と GB4 の乱数設定での run、`SLOW` での `WB_N` の sweep、`axi4_sram` を boot の harness で使う形 (DRAM の hex を 64 bit/行に変換する必要がある)。
+- GT2 と GT4、GB4 の乱数設定 (`e93eca2`): GT2 short は `tb/test_axi_gm.veryl` の `test_gm_w2_litmus_2hart_{slow,bp,reorder}_{s1,s2}` (native、`#[ignore]`、6 本を 1 回の invocation で並列、壁時間 約 10 分)。N=4 は native が遅い (約 600 cy/s) ので Verilator で回す。`sim/verilator/` の W2 のラッパ 3 本 (`tb_litmus_4hart_w2.sv`、`tb_soc_smp_linux_boot_{2,4}hart_w2.sv`) に module parameter `AXI_SEL` (0 `FIXED`、1 `SLOW`、2 `BACKPRESSURE`、3 `REORDER`) と `AXI_SEED` を足し、build 時に `-GAXI_SEL=3 -GAXI_SEED=1` のように渡す (既定は `FIXED` で、従来の build と同じ)。設定ごとに Mdir を分ける (`build_<top>_<設定>_s1`、`-O1 -j 2`)。Verilator の run は 1 本ずつ直列に走らせた。
+
+| run | 設定 / seed | cycles | 結果 | 備考 (MC の行)、壁時間 |
+|---|---|---|---|---|
+| GT2 short (native) | `FIXED` | 985,016 | pass | `test_w2_litmus_2hart` |
+| GT2 short (native) | `SLOW` / 1、2 | 987,747、987,618 | pass | |
+| GT2 short (native) | `BACKPRESSURE` / 1、2 | 985,124、985,155 | pass | |
+| GT2 short (native) | `REORDER` / 1、2 | 985,487、985,600 | pass | |
+| GT4 (Verilator) | `FIXED` (M4 末) | 5,029,779 | pass | |
+| GT4 (Verilator) | `BACKPRESSURE` / 1 | 5,029,816 | pass、chk 0 (4 hart) | `line` 170、`aw` 125,956、`ar_bp` 104、`wb_full` 0。38 分 |
+| GT4 (Verilator) | `REORDER` / 1 | 5,030,147 | pass、chk 0 (4 hart) | `line` 171、`aw` 125,952、`ar_bp` 28、`wb_full` 0。40 分 |
+| GB4 (Verilator) | `FIXED` (M4 末) | 24,989,451 | pass | |
+| GB4 (Verilator) | `BACKPRESSURE` / 1 | 25,515,720 (+2.1 %) | pass、chk 0 (4 hart) | `line` 111,874、`ar_bp` 933,313、`wb_full` 524,250、`i1_hold` 10,806、`ar_wait` 72,174。3 時間 20 分 |
+| GB4 (Verilator) | `REORDER` / 1 | 26,848,519 (+7.4 %) | pass、chk 0 (4 hart) | `line` 113,333、`ar_bp` 143,662、`wb_full` 191,725、`i1_hold` 6,962、`ar_wait` 6,096。3 時間 30 分 |
+| GB2 (Verilator) | `BACKPRESSURE` / 1 | 19,855,455 | pass、chk 0 (両 hart) | native の GM run と cycles が一致 (同じ値)。`ar_bp` 420,504、`wb_full` 571,601。1 時間 4 分 |
+
+- litmus の乱数設定は cycles がほとんど動かない。litmus の image は L2 に収まり、DRAM の line read は N=4 でも 170 本しかない。GT2 と GT4 の乱数設定が試すのは主に write path (AW 12.6 万本) と coherence であって、read の順不同ではない。read の順不同と backpressure を負荷の下で試すのは GB2 と GB4 である。
+- `WB_N` の sweep (設計書 MM.4、U42): `mem_ctrl` の `WB_N` を `4 × N_HARTS` (N=1 で 4) にし、`boot_soc_harness` の `MAX_WR` を `N_HARTS × 4` に合わせて GL-B を 2 本走らせた。record 数と hash は両方とも `FIXED` と一致した。
+
+| GL-B | `WB_N = 2` (既定) | `WB_N = 4` | 差 |
+|---|---|---|---|
+| `FIXED` | 14,570,718 (`wb_full` 305,299) | 14,564,006 (`wb_full` 244,656) | -0.05 % |
+| `SLOW` / 1 | 23,509,127 (`wb_full` 1,955,812) | 22,651,396 (`wb_full` 865,521) | -3.65 % |
+
+- 【決定】`WB_N` は既定の `2 × N_HARTS` のままにする。理由: `FIXED` の差は -0.05 % で、§10.5 の `WB_N = 6` の run (差は雑音の幅) と同じく、固定遅延の memory では write buffer は core の進行を止めていない。`SLOW` の 3.65 % は、遅延が大きく outstanding が 1 に近い slave でだけ出る利得で、entry を倍にする面積 (line 幅の data と strobe の FF、N=4 で 8 から 16 entry) に見合う根拠にはならない。実 memory の遅延が `SLOW` に近い構成 (FPGA の DRAM controller、U48) では `WB_N` を上げる価値があるので、`WB_N` は parameter のまま残し、その構成を測るときに決め直す。
+- 残り: `axi4_sram` を boot の harness で使う形 (DRAM の hex を 64 bit/行に変換する必要がある)。GV の残りは無い。
 
 ---
 
