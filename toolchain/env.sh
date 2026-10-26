@@ -16,6 +16,10 @@ _tc_prepend "$_tc_root/sail"
 _tc_prepend "$_tc_root/sail/bin"
 # uv: single binary at the root after strip.
 _tc_prepend "$_tc_root/uv"
+# Debug flow (source-built by `fetch.sh debug`).
+_tc_prepend "$_tc_root/spike/bin"
+_tc_prepend "$_tc_root/openocd/bin"
+_tc_prepend "$_tc_root/gdb/bin"
 export PATH
 
 # ACT4 Python (uv) + Ruby/UDB (bundler) caches must be writable. Keep them under

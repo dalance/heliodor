@@ -30,6 +30,28 @@ test/linux/build.sh                  # Linux boot images (linux gcc)
 | `sail/`      | `sail_riscv_sim` (Sail RISC-V)    | ACT4 golden reference |
 | `uv/`        | `uv`                              | ACT4 Python framework env |
 
+## Debug flow tools (built from source)
+
+`toolchain/fetch.sh debug` builds three tools from pinned sources into
+gitignored `spike/`, `openocd/`, `gdb/` (sources under `src/`), then
+`source toolchain/env.sh` puts them on `PATH`. They are not part of `all`.
+
+| dir        | tool | pin (`versions.env`) |
+|------------|------|----------------------|
+| `spike/`   | spike (riscv-isa-sim) | `SPIKE_COMMIT` |
+| `openocd/` | riscv-collab/riscv-openocd, remote_bitbang + jtag_dpi | `OPENOCD_COMMIT` |
+| `gdb/`     | `riscv64-unknown-elf-gdb` (GNU GDB, no Python) | `GDB_URL`, `GDB_SHA256` |
+
+Why source builds: the riscv-collab prebuilt GDB needs `libpython3.10` and a
+newer `libstdc++` than EL9 has, and there is no trustworthy prebuilt OpenOCD or
+spike for this host. Build needs only host tools: gcc/g++ >= 11, make,
+autoconf/automake/libtool/texinfo (OpenOCD), `dtc` and boost-devel (spike),
+gmp/mpfr/ncurses/zlib/expat -devel (GDB). OpenOCD's libjaylink submodule
+(gitlab) is skipped, so J-Link is not supported; USB adapters are not built
+because `libusb1-devel` is absent, which does not matter for simulation.
+The riscv-tests debug suite itself is the `test/riscv-arch-test/upstream/debug/`
+clone; its commit and the reference results are recorded under `test/debug/`.
+
 Ruby/UDB use the **system** Ruby (`ruby --version` ≥ 3.4); `env.sh` points
 `BUNDLE_PATH` at a writable, gitignored dir so `bundle install` works without a
 writable system gem dir.

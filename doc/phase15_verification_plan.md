@@ -828,6 +828,13 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 - 速度: 1 回の DMI アクセスが JTAG の数十から百を超える TCK になるので、target の timeout を sim の速度に合わせて伸ばす。壁時間が梯子の予算 (目安 2 時間) を超えたら、tb の transport を OpenOCD の `jtag_dpi` に替える (設計書 U36、R10)。
 - 発火: GG の run も `perf_acc` の dump を出し、GF の `gdb` 列にする (§5.2)。
 
+【記録: spike の参照 (MD 手順 1、U36)】
+- 版: riscv-tests `933a897d` (`test/riscv-arch-test/upstream/debug/`)、spike `b86c9bba` (1.1.1-dev)、riscv-openocd `10b7a647`、GDB 17.2 (riscv64-unknown-elf、Python 無し)、GCC 16.1.0。すべて `toolchain/versions.env` で pin し、`toolchain/fetch.sh debug` で build する。riscv-collab の prebuilt GDB は libpython3.10 と新しい libstdc++ を要求し EL9 で動かないので、GDB も source から build した。
+- 走らせ方: `test/debug/run_spike_ref.sh <spike64|spike64-2> <out> [jobs]` (1 テスト 1 プロセス、`--isolate`、4 並列)。結果の一覧は `test/debug/spike_ref_spike64.txt` と `spike_ref_spike64-2.txt`。
+- spike64 (1 hart): 74 テスト中 pass 63、not_applicable 10、exception 1、fail 0。壁時間 1 分 2 秒。not_applicable は CeaseStepiTest、MemTestBlockReadInvalid、MulticoreRegTest、MulticoreRtosSwitchActiveHartTest、MulticoreRunAllHaltOne、SmpSimultaneousRunHalt、StepThread2Test、Sv32Test、UnavailableMultiTest、VectorTest。exception は FreeRtosTest で、新しい GDB の `load` の出力に "Transfer rate" が無く suite の assert が落ちるハーネス側の問題であり、target の不具合ではない (除外表の候補)。
+- spike64-2 (2 hart): pass 63、not_applicable 11、fail 0、exception 0。壁時間 4 分 5 秒。not_applicable は CeaseStepiTest、FreeRtosTest、MemorySampleMixed、MemorySampleSingle、MemTestBlockReadInvalid、MulticoreRtosSwitchActiveHartTest、SemihostingFileio、SmpSimultaneousRunHalt、StepThread2Test、Sv32Test、VectorTest。
+- 計画との差: (1) spike の target は `progbufsize=0` (spike64 は `--dm-progsize 0`) で、progbuf を使う経路は spike では検証されない。heliodor は progbuf を持つので、「spike で pass」の集合は progbuf 経路について heliodor の基準にならない (GD の directed が受け持つ)。(2) 2 hart の target は SBA を使うテスト (MemorySample) と SmpSimultaneousRunHalt が not_applicable で、hart の切替の合否は MulticoreRegTest などが 2 hart 側で pass することで見る。(3) spike64 では Multicore 系と SmpSimultaneousRunHalt が not_applicable なので、N=4 の SMP のゲートは spike64-2 の pass 集合を基準にする。(4) 参照は fail 0 で、除外表 (U37) の種は上の not_applicable と FreeRtosTest である。
+
 ### 9.3 DMI が idle のときの等価と lockstep
 
 - 【決定】MD のコミットは、DMI が idle (`psel = 0`、DM の出力は登録済みの 0) のとき、M4 までのゲートの結果を変えてはならない。検査: W2 (節目では W4 も) の GL-B の cycles、record 数、最終 hash と、新コアの bench 4 本 (`test_cbench_w{2,4}_*`) の cycles と instret が、MD の直前の master とビット一致すること。理由: DMI が idle なら新しい項 (`dm_req`、step、icount、DM 領域の PMA) はどれも定数の側にあり、1 サイクルでもずれたらそれは debug の経路が通常の経路に漏れた欠陥である。boot の cy は 10,000 刻みなので、ビット一致を言うのは GL-B の record と hash と bench の値である。
