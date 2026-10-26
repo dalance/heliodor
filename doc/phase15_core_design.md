@@ -4832,6 +4832,8 @@ M4 の後、MD の前に置く理由: M4 の手順 4 が mem_ctrl の outstandin
 
 MM で決める事項: U41 (幅と属性)、U42 (ID、outstanding、`WB_N`)、U43 (IO store の完了)、U44 (ROM)、U45 (V14 との共存、MM の開始時)、U46 (error 応答)、U47 (例の wrapper、MM の末)。U48 (FPGA の controller) と U49 (CDC) は MM では決めず、記録だけを残す。
 
+【MM の出口条件の判定】(2026-10-27) 充足。2026-10-27 にユーザが MM の完了を承認した。結果は検証計画 §10.5、§10.6。GL-B は W2 14,570,718 (MM の前 14,316,714、+1.77 %)、W4 12,262,946 (MM の前 11,681,911、+4.97 %) で、record 数と hash は FIXED と乱数遅延のすべての seed で MM の前と一致した。GB2 W2 19,380,793、Verilator の GB4 W2 24,989,451 (FIXED)、乱数遅延の GT2/GT4/GB2/GB4 と GV が pass、protocol checker の違反は 0。cold-reader のレビューの指摘は `6f40944b`/`7d729a87` で解消した (I-read の I4 は FENCE.I の abort で守られる、§MM.5)。W4 の +4.97 % は W2 より大きく、§10.2 の許容は未決のまま記録だけ残す。繰り延べ (ユーザ承認): `axi4_sram` を boot の harness で使う形は FPGA の実機の作業 (U48) に送る。
+
 ### MD: デバッグ
 
 目標: RISC-V Debug Specification 1.0 の Sdext、Sdtrig、Debug Module、SBA を新コアと統合 SoC に入れ、OpenOCD と GDB から N=1 と N=4 の SoC をデバッグできるようにする (D9、§D)。DMI が idle のとき、M4 までのゲートの結果を 1 つも変えない。

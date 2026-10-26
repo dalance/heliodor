@@ -969,7 +969,7 @@ H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed �
 | `SLOW` / 1 | 23,509,127 (`wb_full` 1,955,812) | 22,651,396 (`wb_full` 865,521) | -3.65 % |
 
 - 【決定】`WB_N` は既定の `2 × N_HARTS` のままにする。理由: `FIXED` の差は -0.05 % で、§10.5 の `WB_N = 6` の run (差は雑音の幅) と同じく、固定遅延の memory では write buffer は core の進行を止めていない。`SLOW` の 3.65 % は、遅延が大きく outstanding が 1 に近い slave でだけ出る利得で、entry を倍にする面積 (line 幅の data と strobe の FF、N=4 で 8 から 16 entry) に見合う根拠にはならない。実 memory の遅延が `SLOW` に近い構成 (FPGA の DRAM controller、U48) では `WB_N` を上げる価値があるので、`WB_N` は parameter のまま残し、その構成を測るときに決め直す。
-- 残り: `axi4_sram` を boot の harness で使う形 (DRAM の hex を 64 bit/行に変換する必要がある)。GV の残りは無い。
+- 残り: なし。`axi4_sram` を boot の harness で使う形 (DRAM の hex を 64 bit/行に変換する必要がある) は FPGA の実機の作業 (U48) に繰り延べた (2026-10-27、ユーザ承認)。W4 の GL-B は 12,262,946 (MM の前 11,681,911、+4.97 %)、record 数と hash は一致。GV の残りは無い。
 
 ---
 
