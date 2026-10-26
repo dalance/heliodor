@@ -36,8 +36,10 @@ pub module heliodor_soc_smp #(
     param PMA_REGIONS: pma_pkg::PmaRegion     [PMA_N] = '{
         default: pma_pkg::PmaRegion'{base: 0, mask: 0, attr: 0 as pma_pkg::PmaAttr}
     },
+    // Write-buffer entries of the new-core AXI master (mem_ctrl WB_N).
+    param AXI_WB_N: u32 = 2 * N_HARTS,
     // AXI ID width of the new-core DRAM port: the ARID is the mem_ctrl slot.
-    param AXI_ID_W: u32 = $clog2(N_HARTS * 2),
+    const AXI_ID_W: u32 = $clog2(N_HARTS * 2),
 ) (
     clk: input clock,
     rst: input reset,
@@ -102,8 +104,9 @@ pub module heliodor_soc_smp #(
     o_axi_bready : output logic          ,
     i_axi_bid    : input  logic<AXI_ID_W> = 0,
     i_axi_bresp  : input  logic<2>        = 0,
-    // Sticky AXI error responses: bit 0 RRESP, bit 1 BRESP != OKAY (0 on V14).
-    o_axi_err    : output logic<2>       ,
+    // Sticky AXI errors (0 on V14): bit 0 RRESP, bit 1 BRESP != OKAY, bit 2
+    // a slave protocol fault (unexpected R beat, RLAST misplaced, BID != 0).
+    o_axi_err    : output logic<3>       ,
     // UART TX observation (shared)
     o_uart_tx_valid: output logic   ,
     o_uart_tx_data : output logic<8>,
@@ -234,13 +237,19 @@ pub module heliodor_soc_smp #(
     var in_clint_w: logic [N_HARTS];
     var in_uart_w : logic [N_HARTS];
     var in_plic_w : logic [N_HARTS];
+    var w_dram: logic [N_HARTS];
+    for h in 0..N_HARTS :gen_wdec {
+        let w_attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(c_dmemw_addr[h][55:0], PMA_REGIONS);
+        assign w_dram[h] = w_attr.backed && (w_attr.target == pma_pkg::Target::DRAM);
+    }
     for h in 0..N_HARTS :gen_dec {
         assign in_dram[h]    = c_dmem_addr[h][31];
         assign in_clint[h]   = c_dmem_addr[h][31:24] == 8'h02;
         assign in_uart[h]    = c_dmem_addr[h][31:28] == 4'h1;
         assign in_plic[h]    = c_dmem_addr[h][31:24] == 8'h0c; // P9.5: PLIC
-        // S23: the write channel carries its own address.
-        assign in_dram_w[h]  = c_dmemw_addr[h][31];
+        // S23: the write channel carries its own address. A new core decodes
+        // DRAM writes with the PMA table, as its reads.
+        assign in_dram_w[h]  = if AXI ? w_dram[h] : c_dmemw_addr[h][31];
         assign in_clint_w[h] = c_dmemw_addr[h][31:24] == 8'h02;
         assign in_uart_w[h]  = c_dmemw_addr[h][31:28] == 4'h1;
         assign in_plic_w[h]  = c_dmemw_addr[h][31:24] == 8'h0c;
@@ -336,12 +345,12 @@ pub module heliodor_soc_smp #(
         assign i_rom[h]    = i_attr.target == pma_pkg::Target::ROM;
     }
     for h in 0..N_HARTS :gen_busin {
-        // P9.1: the bus read channel now arbitrates LEGACY (single-beat: MMIO /
-        // firmware-ROM, and a new core's uncached reads of any address)
-        // combinational reads plus mem_ctrl's DRAM gather beats; line
-        // transactions are accepted/streamed by mem_ctrl. mem_ctrl gives the
-        // hart's bus grant to its D slot before its I slot.
-        // A single beat held by mem_ctrl for a recall is not on the bus.
+        // The bus read channel carries the LEGACY combinational single beats:
+        // MMIO, plus the old core's firmware-ROM reads and its DRAM gather
+        // beats. A new core's DRAM and ROM reads go to mem_ctrl's AXI port.
+        // mem_ctrl gives the hart's bus grant to its D slot before its I slot.
+        // An old core's single beat held by mem_ctrl for a recall is not on
+        // the bus.
         let d_single: logic = c_dmem_req[h] && !c_dmem_line[h] && (if AXI ? !d_on_axi[h] : !ctrl_hhold[h]);
         let i_single: logic = c_imemr_req[h] && !c_imemr_line[h] && (if AXI ? !i_on_axi[h] : !ctrl_hhold[N_HARTS + h]);
         assign bus_in_raddr[h] = if !d_single && i_single ? c_imemr_addr[h] : c_dmem_addr[h];
@@ -680,13 +689,13 @@ pub module heliodor_soc_smp #(
         assign o_axi_wstrb   = '0;
         assign o_axi_wlast   = 1'b0;
         assign o_axi_bready  = 1'b0;
-        assign o_axi_err     = 2'b00;
+        assign o_axi_err     = 3'b000;
     } else :g_mc {
         var mc_perf: soc_pkg::McPerf;
         inst u_mctrl: mem_ctrl #(
             N_HARTS: N_HARTS ,
             SPH    : 2       ,
-            ID_W   : AXI_ID_W,
+            WB_N   : AXI_WB_N,
         ) (
             clk                                 ,
             rst                                 ,
@@ -699,7 +708,6 @@ pub module heliodor_soc_smp #(
             i_iread       : c_dmem_iread        , // P9.6: I-cache fill (uncounted read)
             i_hunc        : mc_unc              ,
             i_hrom        : mc_rom              ,
-            o_hhold       : ctrl_hhold          ,
             o_hexcl       : ctrl_hexcl          , // P9.2: grant state to the L1
             o_bus_rreq    : ctrl_bus_rreq       ,
             i_bus_rgrant  : bus_dgrant          ,
@@ -753,6 +761,7 @@ pub module heliodor_soc_smp #(
             i_rid         : i_axi_rid           ,
             i_rdata       : i_axi_rdata         ,
             i_rresp       : i_axi_rresp         ,
+            i_rlast       : i_axi_rlast         ,
             o_awvalid     : o_axi_awvalid       ,
             i_awready     : i_axi_awready       ,
             o_awid        : o_axi_awid          ,
@@ -765,6 +774,7 @@ pub module heliodor_soc_smp #(
             o_wlast       : o_axi_wlast         ,
             i_bvalid      : i_axi_bvalid        ,
             o_bready      : o_axi_bready        ,
+            i_bid         : i_axi_bid           ,
             i_bresp       : i_axi_bresp         ,
             o_axi_err     : o_axi_err           ,
             o_wb_full     : ctrl_wb_full        ,
@@ -785,6 +795,10 @@ pub module heliodor_soc_smp #(
         assign ctrl_mem_addr = 64'd0;
         assign ctrl_mem_ren  = 1'b0;
         assign ctrl_mem_busy = 1'b0;
+        // An uncached read is held by its pending request, not by a hold.
+        for s in 0..N_HARTS * 2 :gen_nohold {
+            assign ctrl_hhold[s] = 1'b0;
+        }
     }
 
     // Shared L2 (P9.1 line-granular): lookup/copy + line install from
@@ -843,7 +857,7 @@ pub module heliodor_soc_smp #(
         o_mem_wstrb: l2_mem_wstrb  ,
         o_mem_wen  : l2_mem_wen    ,
     );
-    // External DRAM port muxing (old core) — the three users are mutually
+    // External DRAM port muxing (old core): the three users are mutually
     // exclusive by construction (gather beats and legacy firmware-ROM reads
     // block writes through wgrant_ok; the single read grant excludes gather
     // vs legacy). A new core's writes leave through the AXI write buffer.

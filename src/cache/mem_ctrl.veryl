@@ -18,7 +18,7 @@
 //             addresses (i_haddr[5:3]), so critical-word-first is the L1's.
 //   UNCACHED: an i_hunc read (DRAM or ROM) waits in LOOKUP until no L1 owns
 //             the line, then reads one beat (ARLEN 0, 8-byte aligned) and
-//             grants it for one cycle (ST_UNCD). o_hhold stays up until then.
+//             grants it for one cycle (ST_UNCD).
 //
 // Writes: a granted DRAM write enters the write buffer (WB_N line entries,
 // one FIFO in grant order); the grant means "accepted by the home", not
@@ -75,7 +75,7 @@ pub module mem_ctrl #(
     param N_SLOTS  : u32 = N_HARTS * SPH,
     param HIT_WAIT : u32 = 2 , // L2 copy -> stream start (L2 latency model), >= 1
     param WB_N     : u32 = 2 * N_HARTS, // write buffer entries
-    param ID_W     : u32 = if N_SLOTS >= 2 ? $clog2(N_SLOTS) : 1, // ARID = slot
+    const ID_W     : u32 = if N_SLOTS >= 2 ? $clog2(N_SLOTS) : 1, // ARID = slot
 ) (
     clk: input clock,
     rst: input reset,
@@ -98,10 +98,10 @@ pub module mem_ctrl #(
     // An uncached single-beat read of DRAM or ROM (i_hdram = 0). The slot
     // holds it in LOOKUP until no L1 owns the line (the recall engine brings
     // a dirty copy home), then reads one AXI beat. It adds no sharer and
-    // installs nothing. o_hhold: the beat has not been granted yet.
+    // installs nothing; the requester holds its request until the beat's
+    // grant.
     i_hunc : input  logic [N_SLOTS],
     i_hrom : input  logic [N_SLOTS], // the i_hunc read targets ROM (o_perf only)
-    o_hhold: output logic [N_SLOTS],
     o_hexcl: output logic [N_SLOTS],
     // Bus side: read-channel cycle requests of legacy (MMIO) reads, which
     // the memory_bus arbitrates with its rotation.
@@ -181,6 +181,7 @@ pub module mem_ctrl #(
     i_rid    : input  logic<ID_W>,
     i_rdata  : input  logic<64>  ,
     i_rresp  : input  logic<2>   ,
+    i_rlast  : input  logic      ,
     o_awvalid: output logic      ,
     i_awready: input  logic      ,
     o_awid   : output logic<ID_W>,
@@ -193,10 +194,13 @@ pub module mem_ctrl #(
     o_wlast  : output logic      ,
     i_bvalid : input  logic      ,
     o_bready : output logic      ,
+    i_bid    : input  logic<ID_W>,
     i_bresp  : input  logic<2>   ,
-    // Sticky: bit 0 an R beat, bit 1 a B, answered other than OKAY. The data
-    // of an errored beat is used as it came; nothing reaches the core.
-    o_axi_err: output logic<2>   ,
+    // Sticky: bit 0 an R beat, bit 1 a B, answered other than OKAY; bit 2 a
+    // slave protocol fault: an R beat for a slot not gathering, RLAST not on
+    // the burst's last beat, or a B with BID != 0. The data of an errored
+    // beat is used as it came; nothing reaches the core.
+    o_axi_err: output logic<3>   ,
     // The write buffer has no free entry: the SoC grants no write.
     o_wb_full: output logic,
     // The granted DRAM write this cycle (line + misaligned hi-side flag,
@@ -245,6 +249,7 @@ pub module mem_ctrl #(
     var dw_all     : logic<3>  [N_SLOTS]    ; // the dword of an uncached beat
     var rom_all    : logic     [N_SLOTS]    ; // ... which targets ROM (o_perf only)
     var rd_fly     : logic     [N_SLOTS]    ; // AR presented or R beats arriving
+    var r_ok       : logic     [N_SLOTS]    ; // this cycle's R beat is the slot's expected one
     var inst_go_all: logic     [N_SLOTS]    ; // P9.2: INSTALL→STREAM go (assigned below)
     var lk_go_all  : logic     [N_SLOTS]    ; // P9.2: LOOKUP-hit grant go (assigned below)
     var lk_excl_w  : logic                  ; // P9.2: grant state for the lookup go
@@ -423,6 +428,7 @@ pub module mem_ctrl #(
         let unc_live: logic = i_hreq[h] && i_hunc[h] && (i_haddr[h][63:6] == line_q);
         let ar_mine : logic = ar_busy_q && (ar_slot_q == (h as ID_W));
         assign rd_fly[h] = ar_mine || (st_q == ST_GATHER);
+        assign r_ok[h]   = r_mine[h] && (st_q == ST_GATHER) && (i_rlast == (unc_q || (gcnt_q == 3'd7)));
         for l in 0..8 :gen_buf_exp {
             assign buf_all[h * 8 + l] = buf_q[l];
         }
@@ -582,7 +588,6 @@ pub module mem_ctrl #(
         // mid-STREAM, and mismatched beats must stream out unconsumed.
         let stream_ok: logic = (st_q == ST_STREAM) && (i_haddr[h][63:6] == line_q);
         assign o_hgrant[h] = (accept[h] && !i_hunc[h]) || stream_ok || unc_dlv || (legacy && slot_bus_gnt[h]);
-        assign o_hhold[h]  = i_hunc[h] && !unc_dlv;
         assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
         assign o_hexcl[h]  = excl_q;
 
@@ -1111,11 +1116,21 @@ pub module mem_ctrl #(
 
     let r_err: logic = i_rvalid && (i_rresp != 2'b00);
     let b_err: logic = i_bvalid && (i_bresp != 2'b00);
+    var r_any_ok: logic;
+    always_comb {
+        r_any_ok = 1'b0;
+        for h in 0..N_SLOTS {
+            if r_ok[h] {
+                r_any_ok = 1'b1;
+            }
+        }
+    }
+    let p_err: logic = (i_rvalid && !r_any_ok) || (i_bvalid && (i_bid != '0));
     always_ff (clk, rst) {
         if_reset {
-            o_axi_err = 2'b00;
+            o_axi_err = 3'b000;
         } else {
-            o_axi_err = o_axi_err | {b_err, r_err};
+            o_axi_err = o_axi_err | {p_err, b_err, r_err};
         }
     }
 
@@ -1148,12 +1163,18 @@ pub module mem_ctrl #(
             if ar_wt[h] && !ar_haz[h] && !ar_take[h] {
                 o_perf.ar_wait = 1'b1;
             }
-            o_perf.lat_line[h]  = rd_fly[h] && !unc_all[h];
-            o_perf.lat_dram1[h] = rd_fly[h] && unc_all[h] && !rom_all[h];
-            o_perf.lat_rom[h]   = rd_fly[h] && unc_all[h] && rom_all[h];
+            // The latency vectors are MC_PERF_N wide; later slots and
+            // entries are not counted.
+            if h <: soc_pkg::MC_PERF_N {
+                o_perf.lat_line[h]  = rd_fly[h] && !unc_all[h];
+                o_perf.lat_dram1[h] = rd_fly[h] && unc_all[h] && !rom_all[h];
+                o_perf.lat_rom[h]   = rd_fly[h] && unc_all[h] && rom_all[h];
+            }
         }
         for e in 0..WB_N {
-            o_perf.lat_wr[e] = wr_fly[e];
+            if e <: soc_pkg::MC_PERF_N {
+                o_perf.lat_wr[e] = wr_fly[e];
+            }
         }
     }
 }
