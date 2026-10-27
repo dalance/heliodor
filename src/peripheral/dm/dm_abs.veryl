@@ -1,0 +1,125 @@
+// dm_abs: the abstract command program for an Access Register command.
+//
+// Ports (timing contract, all combinational):
+//   i_cmd    : the command register value
+//   i_mprven : the command hart's dcsr.mprven, reported with GOING
+//   o_code   : the ABS_N words the hart runs from dm_pkg::MEM_ABS; the
+//              program buffer follows them
+// Owns:
+//   - Word 0 is a probe that faults exactly when the transfer would (CSR
+//     existence and access, mstatus.FS for an FPR) and has no other effect.
+//     It runs with every GPR holding the hart's value, so the ROM's exception
+//     entry saves the right s0/s1; the rest of the program cannot fault.
+//   - s0 and s1 are saved in dscratch0/1 around the transfer: s1 is the base
+//     of data0 (auipc), s0 carries a CSR value. A transfer of s0/s1 goes
+//     through their dscratch copy. Both are restored before the last word,
+//     an ebreak, or a nop that falls into the program buffer (postexec).
+//   - The debug memory access runs with dcsr.mprven clear, so mstatus.MPRV
+//     cannot translate it; mprven is set back before a CSR write, so a
+//     write to dcsr itself keeps the written value.
+// Rationale:
+//   - A size-2 GPR or CSR write uses lw, which sign-extends: the spec leaves
+//     the upper bits of a partial write unspecified.
+module dm_abs (
+    i_cmd   : input  logic<32>                ,
+    i_mprven: input  logic                    ,
+    o_code  : output logic<32> [dm_pkg::ABS_N],
+) {
+    const NOP   : logic<32> = 32'h0000_0013;
+    const EBREAK: logic<32> = 32'h0010_0073;
+    const S0    : logic<5>  = 5'd8;
+    const S1    : logic<5>  = 5'd9;
+    // data0 relative to the auipc in word 5 (it adds 0x1000 to its own pc).
+    const OFF: logic<12> = 12'd0 - (dm_pkg::MEM_ABS[11:0] + 12'd20);
+
+    function csr_i (
+        csr: input logic<12>,
+        rs1: input logic<5> ,
+        f3 : input logic<3> ,
+        rd : input logic<5> ,
+    ) -> logic<32> {
+        return {csr, rs1, f3, rd, 7'h73};
+    }
+    function ld_i (
+        rd : input logic<5>,
+        f3 : input logic<3>,
+        opc: input logic<7>,
+    ) -> logic<32> {
+        return {OFF, S1, f3, rd, opc};
+    }
+    function st_i (
+        rs2: input logic<5>,
+        f3 : input logic<3>,
+        opc: input logic<7>,
+    ) -> logic<32> {
+        return {OFF[11:5], rs2, S1, f3, OFF[4:0], opc};
+    }
+
+    let size    : logic<3>  = i_cmd[22:20];
+    let postexec: logic     = i_cmd[18];
+    let transfer: logic     = i_cmd[17];
+    let write   : logic     = i_cmd[16];
+    let regno   : logic<16> = i_cmd[15:0];
+    let is_gpr  : logic     = regno[15:5] == 11'h080;
+    let is_fpr  : logic     = regno[15:5] == 11'h081;
+    let r       : logic<5>  = regno[4:0];
+    let csr     : logic<12> = regno[11:0];
+    let f3      : logic<3>  = {1'b0, size[1:0]};
+
+    var probe: logic<32>;
+    var pre  : logic<32>;
+    var xfer : logic<32>;
+    var post : logic<32>;
+    always_comb {
+        probe = NOP;
+        pre   = NOP;
+        xfer  = NOP;
+        post  = NOP;
+        if transfer {
+            if is_gpr {
+                if write {
+                    xfer = ld_i(if r == S0 || r == S1 ? S0 : r, f3, 7'h03);
+                    if r == S0 {
+                        post = csr_i(12'h7b2, S0, 3'b001, 5'd0);
+                    } else if r == S1 {
+                        post = csr_i(12'h7b3, S0, 3'b001, 5'd0);
+                    }
+                } else {
+                    if r == S1 {
+                        pre = csr_i(12'h7b3, 5'd0, 3'b010, S0);
+                    }
+                    xfer = st_i(if r == S1 ? S0 : r, f3, 7'h23);
+                }
+            } else if is_fpr {
+                // fmv.x.w/fmv.x.d x0, f
+                probe = {6'b111000, size[0], 5'd0, r, 3'b000, 5'd0, 7'h53};
+                xfer  = if write ? ld_i(r, f3, 7'h07) : st_i(r, f3, 7'h27);
+            } else {
+                // A write to a read-only CSR probes with csrrw x0, which
+                // faults on the address alone; others probe with a read.
+                probe = if write && csr[11:10] == 2'b11 ? csr_i(csr, 5'd0, 3'b001, 5'd0) : csr_i(csr, 5'd0, 3'b010,
+                    5'd0);
+                if write {
+                    xfer = ld_i(S0, f3, 7'h03);
+                    post = csr_i(csr, S0, 3'b001, 5'd0);
+                } else {
+                    pre  = csr_i(csr, 5'd0, 3'b010, S0);
+                    xfer = st_i(S0, f3, 7'h23);
+                }
+            }
+        }
+    }
+
+    assign o_code[0]  = probe;
+    assign o_code[1]  = csr_i(12'h7b2, S0, 3'b001, 5'd0); // csrw dscratch0, s0
+    assign o_code[2]  = csr_i(12'h7b3, S1, 3'b001, 5'd0); // csrw dscratch1, s1
+    assign o_code[3]  = pre;
+    assign o_code[4]  = if i_mprven ? csr_i(12'h7b0, 5'd16, 3'b111, 5'd0) : NOP; // csrci dcsr, mprven
+    assign o_code[5]  = {20'h00001, S1, 7'h17}; // auipc s1, 1
+    assign o_code[6]  = xfer;
+    assign o_code[7]  = if i_mprven ? csr_i(12'h7b0, 5'd16, 3'b110, 5'd0) : NOP; // csrsi dcsr, mprven
+    assign o_code[8]  = post;
+    assign o_code[9]  = csr_i(12'h7b2, 5'd0, 3'b010, S0); // csrr s0, dscratch0
+    assign o_code[10] = csr_i(12'h7b3, 5'd0, 3'b010, S1); // csrr s1, dscratch1
+    assign o_code[11] = if postexec ? NOP : EBREAK;
+}

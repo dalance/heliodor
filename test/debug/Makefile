@@ -1,5 +1,6 @@
 # Debug directed tests: DMI scripts (dmi/*.dmi -> dmi/*.hex, read by tb/dm_seq)
-# and the hart programs they run against (prog/*.S -> prog/*.hex).
+# and the hart programs they run against (prog/*.S -> prog/*.hex). A script's
+# SYMS line names the program ELF its @symbols come from.
 CC      = riscv64-unknown-elf-gcc
 OBJCOPY = riscv64-unknown-elf-objcopy
 CFLAGS  = -march=rv64gc -mabi=lp64 -nostdlib -nostartfiles -ffreestanding
@@ -11,7 +12,8 @@ PROG := $(patsubst %.S,%.hex,$(wildcard prog/*.S))
 
 all: $(DMI) $(PROG)
 
-dmi/%.hex: dmi/%.dmi dmi/dmi_asm.py
+.SECONDEXPANSION:
+dmi/%.hex: dmi/%.dmi dmi/dmi_asm.py $$(shell sed -n 's/^SYMS *//p' dmi/$$*.dmi)
 	$(DMIASM) $< $@
 
 prog/%.elf: prog/%.S prog/prog.ld
@@ -24,4 +26,5 @@ prog/%.hex: prog/%.elf
 clean:
 	rm -f dmi/*.hex prog/*.elf prog/*.bin prog/*.hex
 
+.SECONDARY:
 .PHONY: all clean

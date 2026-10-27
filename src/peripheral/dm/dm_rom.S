@@ -6,7 +6,9 @@
 // in Debug Mode). It saves s0/s1 in dscratch0/1, reports HALTED with its
 // hartid and polls its flag byte: GO jumps to the abstract command program,
 // RESUME leaves with dret. Both restore s0/s1 and run fence.i first, so the
-// hart refetches whatever the debugger changed while it was halted.
+// hart refetches whatever the debugger changed while it was halted. The
+// exception entry relies on s0/s1 holding the hart's values when the fault
+// is taken, which the abstract command program guarantees (dm_abs).
 
 #define CSR_DCSR      0x7b0
 #define CSR_DSCRATCH0 0x7b2
@@ -59,9 +61,15 @@ entry_loop:
         bnez    s0, resume
         j       entry_loop
 
+// GOING carries the hart's dcsr.mprven: the abstract command program runs
+// its debug memory accesses with mprven clear and sets it back from this.
 going:
-        NO_MPRV(csrr s0, mhartid; sw s0, GOING(s1))
-        csrr    s0, CSR_DSCRATCH0
+        csrrci  s0, CSR_DCSR, MPRVEN
+        andi    s0, s0, MPRVEN
+        sw      s0, GOING(s1)
+        beqz    s0, 1f
+        csrsi   CSR_DCSR, MPRVEN
+1:      csrr    s0, CSR_DSCRATCH0
         csrr    s1, CSR_DSCRATCH1
         fence.i
         j       entry + ABS_OFF

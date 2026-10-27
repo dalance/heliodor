@@ -4,45 +4,71 @@
 //   i_raddr/o_rdata : combinational single-beat read; the offset from
 //                     DM_BASE in, the aligned dword out (the bus's legacy
 //                     read channel takes data in the grant cycle)
-//   i_wen, i_waddr, i_wdata : a write granted this cycle; i_wdata is the
-//                     dword lane of the written address
-//   i_resume        : per-hart RESUME flags (dm)
-//   o_halted, o_resuming, o_hartid : combinational decode of this cycle's
-//                     write to HALTED or RESUMING and the hartid it carries
+//   i_wen, i_waddr, i_wdata, i_wstrb : a write granted this cycle; i_wdata
+//                     is the dword lane of the written address, i_wstrb its
+//                     byte strobes
+//   i_code          : the words at dm_pkg::MEM_ABS (dm)
+//   i_data          : data1:data0 (dm)
+//   i_go, i_resume  : per-hart GO and RESUME flags (dm)
+//   o_wevt          : combinational decode of this cycle's write to HALTED,
+//                     GOING, RESUMING or EXCEPTION, with the word it carries
+//   o_dstrb         : byte strobes of this cycle's write to data0/data1
 // Owns:
-//   - The code region reads the debug ROM (dm_rom_pkg) and zero past it;
-//     the data region reads the flag bytes and zero elsewhere.
-//   - Reads have no side effects; only the word writes above are decoded.
+//   - The code region reads the debug ROM (dm_rom_pkg), then i_code from
+//     MEM_ABS, and zero elsewhere; the data region reads data0/data1, the
+//     flag bytes and zero elsewhere.
+//   - Reads have no side effects; only the writes above are decoded.
 module dm_mem #(
     param N_HARTS: u32 = 1,
 ) (
-    i_raddr   : input  logic<13>     ,
-    o_rdata   : output logic<64>     ,
-    i_wen     : input  logic         ,
-    i_waddr   : input  logic<13>     ,
-    i_wdata   : input  logic<64>     ,
-    i_resume  : input  logic<N_HARTS>,
-    o_halted  : output logic         ,
-    o_resuming: output logic         ,
-    o_hartid  : output logic<32>     ,
+    i_raddr : input  logic<13>                  ,
+    o_rdata : output logic<64>                  ,
+    i_wen   : input  logic                      ,
+    i_waddr : input  logic<13>                  ,
+    i_wdata : input  logic<64>                  ,
+    i_wstrb : input  logic<8>                   ,
+    i_code  : input  logic<32> [dm_pkg::CODE_N] ,
+    i_data  : input  logic<64>                  ,
+    i_go    : input  logic<N_HARTS>             ,
+    i_resume: input  logic<N_HARTS>             ,
+    o_wevt  : output dm_pkg::HartWr             ,
+    o_dstrb : output logic<8>                   ,
 ) {
-    const ROM_DW: u32 = dm_rom_pkg::ROM_N / 2;
+    const ROM_DW : u32 = dm_rom_pkg::ROM_N / 2;
+    const CODE_DW: u32 = (dm_pkg::CODE_N + 1) / 2;
+    const ABS_DW : u32 = (dm_pkg::MEM_ABS as u32) / 8;
 
     var flags: logic<64>;
     always_comb {
         flags = 64'd0;
         for h in 0..N_HARTS {
+            flags[h * 8 + dm_pkg::FLAG_GO]     = i_go[h];
             flags[h * 8 + dm_pkg::FLAG_RESUME] = i_resume[h];
         }
     }
 
-    let dw   : logic<10> = {1'b0, i_raddr[11:3]};
-    let rom_v: logic     = !i_raddr[12] && ((dw as u32) <: ROM_DW);
-    let rom_i: logic<10> = if rom_v ? dw : 10'd0;
-    let rom  : logic<64> = {dm_rom_pkg::ROM[{rom_i[8:0], 1'b1}], dm_rom_pkg::ROM[{rom_i[8:0], 1'b0}]};
+    var code: logic<64> [CODE_DW];
+    always_comb {
+        for d in 0..CODE_DW {
+            code[d][31:0]  = i_code[2 * d];
+            code[d][63:32] = if 2 * d + 1 <: dm_pkg::CODE_N ? i_code[2 * d + 1] : 32'd0;
+        }
+    }
+
+    let dw    : logic<10> = {1'b0, i_raddr[11:3]};
+    let rom_v : logic     = !i_raddr[12] && ((dw as u32) <: ROM_DW);
+    let rom_i : logic<10> = if rom_v ? dw : 10'd0;
+    let rom   : logic<64> = {dm_rom_pkg::ROM[{rom_i[8:0], 1'b1}], dm_rom_pkg::ROM[{rom_i[8:0], 1'b0}]};
+    let code_o: logic<10> = dw - ABS_DW;
+    let code_v: logic     = !i_raddr[12] && (dw as u32) >= ABS_DW && ((code_o as u32) <: CODE_DW);
+    let code_i: logic<10> = if code_v ? code_o : 10'd0;
 
     assign o_rdata = if rom_v ?
         rom
+    : if code_v ?
+        code[code_i]
+    : if i_raddr[12:3] == dm_pkg::MEM_DATA[12:3] ?
+        i_data
     : if i_raddr[12:3] == dm_pkg::MEM_FLAGS[12:3] ?
         flags
     :
@@ -50,7 +76,12 @@ module dm_mem #(
     ;
 
     let wword: logic<13> = {i_waddr[12:2], 2'b00};
-    assign o_halted   = i_wen && wword == dm_pkg::MEM_HALTED;
-    assign o_resuming = i_wen && wword == dm_pkg::MEM_RESUMING;
-    assign o_hartid   = if i_waddr[2] ? i_wdata[63:32] : i_wdata[31:0];
+    assign o_wevt = dm_pkg::HartWr'{
+        halted   : i_wen && wword == dm_pkg::MEM_HALTED                     ,
+        going    : i_wen && wword == dm_pkg::MEM_GOING                      ,
+        resuming : i_wen && wword == dm_pkg::MEM_RESUMING                   ,
+        exception: i_wen && wword == dm_pkg::MEM_EXCEPTION                  ,
+        value    : if i_waddr[2] ? i_wdata[63:32] : i_wdata[31:0]          ,
+    };
+    assign o_dstrb = if i_wen && i_waddr[12:3] == dm_pkg::MEM_DATA[12:3] ? i_wstrb : 8'd0;
 }

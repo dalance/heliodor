@@ -1,14 +1,19 @@
-// dm: the Debug Module registers and per-hart run state (Debug Spec 1.0).
+// dm: the Debug Module registers, per-hart run state and abstract commands
+// (Debug Spec 1.0).
 //
 // Ports (timing contract):
 //   i_dmi_raddr/o_dmi_rdata : combinational read decode of the DMI address
-//   i_dmi        : one DMI access per valid cycle (dmi_apb); writes take
-//                  effect on that edge
-//   i_halted     : a hart wrote its hartid to HALTED this cycle (dm_mem)
-//   i_resuming   : a hart wrote its hartid to RESUMING this cycle (dm_mem)
-//   i_hartid     : the hartid word of that write
+//   i_dmi        : one DMI access per valid cycle (dmi_apb); writes and read
+//                  side effects (autoexec, busy errors) take effect on that edge
+//   i_wevt       : a hart's write to HALTED, GOING, RESUMING or EXCEPTION
+//                  this cycle (dm_mem)
+//   i_dstrb, i_dwdata : a hart's write to data0/data1 this cycle (dm_mem)
 //   o_haltreq    : registered, per-hart halt request level
-//   o_resume     : registered, per-hart RESUME flag read by the debug ROM
+//   o_go, o_resume : registered, per-hart GO and RESUME flags read by the ROM
+//   o_code       : the abstract command program, the program buffer and the
+//                  implicit ebreak, from registered state
+//   o_data       : data1:data0, registered
+//   o_obs        : abstract command events (D.15)
 // Owns:
 //   - dmcontrol.dmactive = 0 holds every other bit of state at its reset
 //     value; a write that clears dmactive applies nothing else.
@@ -18,6 +23,12 @@
 //   - RESUME is raised only for a selected hart that is halted when
 //     resumereq is written (and haltreq is not written with it), and drops
 //     when that hart writes RESUMING, which also sets its resumeack.
+//   - A command runs on the hart selected when it starts. Its life is
+//     busy -> GO (until the hart writes GOING) -> running -> HALTED (done) or
+//     EXCEPTION (cmderr 3). A HALTED before GOING is the ROM's wait loop and
+//     does not end the command.
+//   - cmderr is only set while it is 0; abstractcs writes clear it (W1C)
+//     unless a command is busy.
 // Rationale:
 //   - hartsel keeps idx_w(N_HARTS) bits of hartsello (WARL), so a debugger
 //     finds the hart count by writing all ones; a selection past the last
@@ -28,31 +39,47 @@
 module dm #(
     param N_HARTS: u32 = 1,
 ) (
-    clk        : input  clock          ,
-    rst        : input  reset          ,
-    i_dmi_raddr: input  logic<7>       ,
-    o_dmi_rdata: output logic<32>      ,
-    i_dmi      : input  dm_pkg::DmiReq ,
-    i_halted   : input  logic          ,
-    i_resuming : input  logic          ,
-    i_hartid   : input  logic<32>      ,
-    o_haltreq  : output logic<N_HARTS> ,
-    o_resume   : output logic<N_HARTS> ,
+    clk        : input  clock                       ,
+    rst        : input  reset                       ,
+    i_dmi_raddr: input  logic<7>                    ,
+    o_dmi_rdata: output logic<32>                   ,
+    i_dmi      : input  dm_pkg::DmiReq              ,
+    i_wevt     : input  dm_pkg::HartWr              ,
+    i_dstrb    : input  logic<8>                    ,
+    i_dwdata   : input  logic<64>                   ,
+    o_haltreq  : output logic<N_HARTS>              ,
+    o_go       : output logic<N_HARTS>              ,
+    o_resume   : output logic<N_HARTS>              ,
+    o_code     : output logic<32> [dm_pkg::CODE_N]  ,
+    o_data     : output logic<64>                   ,
+    o_obs      : output dm_pkg::CmdObs              ,
 ) {
     const HSEL_W: u32 = tag_pkg::idx_w(N_HARTS);
+    const PB_N  : u32 = dm_pkg::PROGBUFSIZE;
 
-    var active_q   : logic         ;
-    var hartsel_q  : logic<HSEL_W> ;
-    var haltreq_q  : logic<N_HARTS>;
-    var halted_q   : logic<N_HARTS>;
-    var resumeack_q: logic<N_HARTS>;
-    var resume_q   : logic<N_HARTS>;
+    var active_q   : logic           ;
+    var hartsel_q  : logic<HSEL_W>   ;
+    var haltreq_q  : logic<N_HARTS>  ;
+    var halted_q   : logic<N_HARTS>  ;
+    var resumeack_q: logic<N_HARTS>  ;
+    var resume_q   : logic<N_HARTS>  ;
+    var data_q     : logic<64>       ;
+    var pbuf_q     : logic<32> [PB_N];
+    var cmd_q      : logic<32>       ;
+    var autod_q    : logic<2>        ;
+    var autop_q    : logic<PB_N>     ;
+    var cmderr_q   : logic<3>        ;
+    var busy_q     : logic           ;
+    var run_q      : logic           ; // the hart wrote GOING for this command
+    var cmdh_q     : logic<N_HARTS>  ; // the command hart, one-hot
+    var mprven_q   : logic           ;
 
-    let dmc_wr   : logic         = i_dmi.valid && i_dmi.write && i_dmi.addr == dm_pkg::DMI_DMCONTROL;
-    let active_d : logic         = if dmc_wr ? i_dmi.data[0] : active_q;
-    let wsel     : logic<HSEL_W> = i_dmi.data[16+:HSEL_W];
-    let w_haltreq: logic         = i_dmi.data[31];
-    let w_resume : logic         = i_dmi.data[30] && !i_dmi.data[31];
+    let dmi     : dm_pkg::DmiReq = i_dmi;
+    let dmc_wr  : logic          = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_DMCONTROL;
+    let active_d: logic          = if dmc_wr ? dmi.data[0] : active_q;
+    let wsel    : logic<HSEL_W>  = dmi.data[16+:HSEL_W];
+    let w_haltreq: logic         = dmi.data[31];
+    let w_resume: logic          = dmi.data[30] && !dmi.data[31];
 
     // One-hot over the harts: the event's hartid, the written hartsel and
     // the current one.
@@ -61,15 +88,79 @@ module dm #(
     var sel_oh : logic<N_HARTS>;
     always_comb {
         for h in 0..N_HARTS {
-            evt_oh[h]  = i_hartid == h;
+            evt_oh[h]  = i_wevt.value == h;
             wsel_oh[h] = wsel == h;
             sel_oh[h]  = hartsel_q == h;
         }
     }
-    let hit_halted  : logic<N_HARTS> = if i_halted ? evt_oh : '0;
-    let hit_resuming: logic<N_HARTS> = if i_resuming ? evt_oh : '0;
+    let hit_halted  : logic<N_HARTS> = if i_wevt.halted ? evt_oh : '0;
+    let hit_resuming: logic<N_HARTS> = if i_wevt.resuming ? evt_oh : '0;
     let w_sel       : logic<N_HARTS> = if dmc_wr ? wsel_oh : '0;
     let rq          : logic<N_HARTS> = if w_resume ? w_sel : '0;
+
+    let exist : logic = (hartsel_q as u32) <: N_HARTS;
+    let halted: logic = exist && ((halted_q & sel_oh) != '0);
+    let ack   : logic = exist && ((resumeack_q & sel_oh) != '0);
+
+    // Abstract command registers touched by this access.
+    let a_data : logic    = dmi.valid && (dmi.addr == dm_pkg::DMI_DATA0 || dmi.addr == dm_pkg::DMI_DATA1);
+    let a_pbuf : logic    = dmi.valid && dmi.addr[6:3] == dm_pkg::DMI_PROGBUF0[6:3];
+    let a_cmd  : logic    = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_COMMAND;
+    let a_auto : logic    = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_ABSTRACTAUTO;
+    let a_acs  : logic    = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_ABSTRACTCS;
+    let didx   : logic    = dmi.addr[0];
+    let pidx   : logic<3> = dmi.addr[2:0];
+    let a_busy : logic    = busy_q && (a_data || a_pbuf || a_cmd || a_auto || a_acs);
+    let autoex : logic    = (a_data && autod_q[didx]) || (a_pbuf && autop_q[pidx]);
+    let ex_req : logic    = !busy_q && cmderr_q == dm_pkg::ERR_NONE && (a_cmd || autoex);
+    let ex_cmd : logic<32> = if a_cmd ? dmi.data : cmd_q;
+    let ex_err : logic<3> = dm_pkg::cmd_err(ex_cmd);
+    let ex_err2: logic<3> = if ex_err != dm_pkg::ERR_NONE ?
+        ex_err
+    : if !halted ?
+        dm_pkg::ERR_HALT
+    :
+        dm_pkg::ERR_NONE
+    ;
+    let ex_go  : logic    = ex_req && ex_err2 == dm_pkg::ERR_NONE && (ex_cmd[17] || ex_cmd[18]);
+    let going  : logic    = i_wevt.going && busy_q && !run_q;
+    let done   : logic    = i_wevt.halted && busy_q && run_q && (hit_halted & cmdh_q) != '0;
+    let exc    : logic    = i_wevt.exception && busy_q && run_q;
+
+    // The cmderr this cycle sets, if cmderr is 0.
+    let err_set: logic<3> = if a_busy ?
+        dm_pkg::ERR_BUSY
+    : if exc ?
+        dm_pkg::ERR_EXC
+    : if ex_req ?
+        ex_err2
+    :
+        dm_pkg::ERR_NONE
+    ;
+
+    // data0/data1 take a DMI write when idle and a hart's write.
+    let dmi_w  : logic     = !busy_q && dmi.valid && dmi.write;
+    var data_d : logic<64> ;
+    var cmderr_d: logic<3> ;
+    always_comb {
+        data_d = data_q;
+        if dmi_w && a_data {
+            if didx {
+                data_d[63:32] = dmi.data;
+            } else {
+                data_d[31:0] = dmi.data;
+            }
+        }
+        for b in 0..8 {
+            if i_dstrb[b] {
+                data_d[b * 8+:8] = i_dwdata[b * 8+:8];
+            }
+        }
+        cmderr_d = if cmderr_q != dm_pkg::ERR_NONE ? cmderr_q : err_set;
+        if dmi_w && a_acs {
+            cmderr_d = cmderr_q & ~dmi.data[10:8];
+        }
+    }
 
     always_ff {
         if_reset {
@@ -79,6 +170,16 @@ module dm #(
             halted_q    = '0;
             resumeack_q = '0;
             resume_q    = '0;
+            data_q      = 64'd0;
+            pbuf_q      = '{default: 32'd0};
+            cmd_q       = 32'd0;
+            autod_q     = 2'd0;
+            autop_q     = '0;
+            cmderr_q    = 3'd0;
+            busy_q      = 1'b0;
+            run_q       = 1'b0;
+            cmdh_q      = '0;
+            mprven_q    = 1'b0;
         } else {
             active_q = active_d;
             if !active_d {
@@ -87,6 +188,16 @@ module dm #(
                 halted_q    = '0;
                 resumeack_q = '0;
                 resume_q    = '0;
+                data_q      = 64'd0;
+                pbuf_q      = '{default: 32'd0};
+                cmd_q       = 32'd0;
+                autod_q     = 2'd0;
+                autop_q     = '0;
+                cmderr_q    = 3'd0;
+                busy_q      = 1'b0;
+                run_q       = 1'b0;
+                cmdh_q      = '0;
+                mprven_q    = 1'b0;
             } else {
                 if dmc_wr {
                     hartsel_q = wsel;
@@ -95,13 +206,39 @@ module dm #(
                 halted_q    = (halted_q | hit_halted) & ~hit_resuming;
                 resumeack_q = (resumeack_q & ~rq) | hit_resuming;
                 resume_q    = (resume_q | (rq & halted_q)) & ~hit_resuming;
+
+                if dmi_w && a_pbuf {
+                    for i in 0..PB_N {
+                        if pidx == i {
+                            pbuf_q[i] = dmi.data;
+                        }
+                    }
+                }
+                if dmi_w && a_auto {
+                    autod_q = dmi.data[1:0];
+                    autop_q = dmi.data[16+:PB_N];
+                }
+                data_q   = data_d;
+                cmderr_q = cmderr_d;
+                if a_cmd && ex_req {
+                    cmd_q = dmi.data;
+                }
+                if ex_go {
+                    busy_q = 1'b1;
+                    run_q  = 1'b0;
+                    cmdh_q = sel_oh;
+                }
+                if going {
+                    run_q    = 1'b1;
+                    mprven_q = i_wevt.value[4];
+                }
+                if done || exc {
+                    busy_q = 1'b0;
+                    run_q  = 1'b0;
+                }
             }
         }
     }
-
-    let exist : logic = (hartsel_q as u32) <: N_HARTS;
-    let halted: logic = exist && ((halted_q & sel_oh) != '0);
-    let ack   : logic = exist && ((resumeack_q & sel_oh) != '0);
 
     var dmstatus: logic<32>;
     always_comb {
@@ -116,6 +253,7 @@ module dm #(
         dmstatus[15]  = !exist;
         dmstatus[16]  = ack;
         dmstatus[17]  = ack;
+        dmstatus[22]  = 1'b1; // impebreak
     }
 
     var dmcontrol: logic<32>;
@@ -125,12 +263,54 @@ module dm #(
         dmcontrol[16+:HSEL_W] = hartsel_q;
     }
 
-    assign o_dmi_rdata = case i_dmi_raddr {
-        dm_pkg::DMI_DMCONTROL: dmcontrol,
-        dm_pkg::DMI_DMSTATUS : dmstatus,
-        dm_pkg::DMI_HARTINFO : 32'h0010_0000, // nscratch = 1
-        default              : 32'd0,
+    var abstractcs: logic<32>;
+    always_comb {
+        abstractcs        = 32'd0;
+        abstractcs[3:0]   = dm_pkg::DATACOUNT;
+        abstractcs[10:8]  = cmderr_q;
+        abstractcs[12]    = busy_q;
+        abstractcs[28:24] = PB_N;
+    }
+
+    let raddr_pb: logic = i_dmi_raddr[6:3] == dm_pkg::DMI_PROGBUF0[6:3];
+    assign o_dmi_rdata = if raddr_pb ?
+        pbuf_q[i_dmi_raddr[2:0]]
+    : case i_dmi_raddr {
+        dm_pkg::DMI_DATA0       : data_q[31:0],
+        dm_pkg::DMI_DATA1       : data_q[63:32],
+        dm_pkg::DMI_DMCONTROL   : dmcontrol,
+        dm_pkg::DMI_DMSTATUS    : dmstatus,
+        dm_pkg::DMI_HARTINFO    : 32'h0010_0000, // nscratch = 1
+        dm_pkg::DMI_ABSTRACTCS  : abstractcs,
+        dm_pkg::DMI_ABSTRACTAUTO: {8'd0, autop_q, 14'd0, autod_q},
+        default                 : 32'd0,
     };
+
+    var abs: logic<32> [dm_pkg::ABS_N];
+    inst u_abs: dm_abs (
+        i_cmd   : cmd_q   ,
+        i_mprven: mprven_q,
+        o_code  : abs     ,
+    );
+    always_comb {
+        for i in 0..dm_pkg::ABS_N {
+            o_code[i] = abs[i];
+        }
+        for i in 0..PB_N {
+            o_code[dm_pkg::ABS_N + i] = pbuf_q[i];
+        }
+        o_code[dm_pkg::CODE_N - 1] = 32'h0010_0073; // impebreak
+    }
+
     assign o_haltreq = haltreq_q;
+    assign o_go      = if busy_q && !run_q ? cmdh_q : '0;
     assign o_resume  = resume_q;
+    assign o_data    = data_q;
+    assign o_obs     = dm_pkg::CmdObs'{
+        start : ex_go                                                         ,
+        kind  : dm_pkg::cmd_kind(ex_cmd)                                      ,
+        err   : if cmderr_q == dm_pkg::ERR_NONE ? err_set : dm_pkg::ERR_NONE  ,
+        busy  : busy_q                                                        ,
+        halted: (halted_q & cmdh_q) != '0                                     ,
+    };
 }
