@@ -1,0 +1,876 @@
+// Single step, stopcount and stoptime at the commit level: commit, trap_unit
+// and csr against a scripted ROB window.
+//
+// The harness enters Debug Mode by haltreq, then runs one segment per
+// table row: in Debug Mode it writes dcsr (step, stepie, stopcount,
+// stoptime), dpc and checks the counters, presents a DRET, and after the
+// dret's kill presents the row's ops. On the next entry it checks the
+// records and interrupt events since the dret, dcsr.cause, dpc and minstret.
+// The rows step over an ALU group, a trapping op, a pending interrupt with
+// stepie 0 and 1, a mispredicted branch, a partial kill right after the
+// stepped record, a haltreq racing the step, an EBREAK, and run once with
+// step 0. The second test drives chk_debug with one violation per step.
+package step_tb_pkg {
+    enum SOp: logic<3> {
+        NONE,
+        ALU,
+        EXC, // illegal instruction trap
+        EBRK, // EBREAK with ExcRec.dm
+        BRM, // mispredicted, unrecovered branch: RETIRE_FLUSH to its target
+        DRET,
+    }
+
+    struct Seg {
+        sstep : logic   ,
+        stepie: logic   ,
+        stopc : logic   ,
+        stopt : logic   ,
+        irq   : logic   , // interrupt pending through the run
+        pkill : logic   , // partial kill the cycle after the first record
+        halt  : logic   , // haltreq at the first record
+        n_rec : logic<4>, // records since the dret; 15: one per commit lane
+        n_irq : logic<2>,
+        cause : logic<3>,
+        pc    : logic<3>, // dpc: 0 P + 4, 1 TVEC, 2 branch target, 3 P, 4 P + 4 * COMMIT_W
+    }
+
+    const TVEC  : logic<64> = 64'h0000_0000_8000_4000;
+    const SEG_N : u32       = 9;
+    const BR_OFF: logic<64> = 64'h40;
+
+    function seg_of (
+        i: input logic<4>,
+    ) -> Seg {
+        var s      : Seg;
+        s       = 0 as Seg;
+        s.sstep = 1'b1;
+        s.n_rec = 4'd1;
+        s.cause = 3'd4;
+        case i {
+            4'd0: {
+                s.stopc = 1'b1;
+                s.stopt = 1'b1;
+            }
+            4'd1: {
+                s.pc = 3'd1;
+            }
+            4'd2: {
+                s.irq = 1'b1;
+            }
+            4'd3: {
+                s.irq    = 1'b1;
+                s.stepie = 1'b1;
+                s.n_rec  = 4'd0;
+                s.n_irq  = 2'd1;
+                s.pc     = 3'd1;
+                s.stopc  = 1'b1;
+            }
+            4'd4: {
+                s.pc = 3'd2;
+            }
+            4'd5: {
+                s.pkill = 1'b1;
+            }
+            4'd6: {
+                s.halt  = 1'b1;
+                s.cause = 3'd3;
+            }
+            4'd7: {
+                s.n_rec = 4'd0;
+                s.cause = 3'd1;
+                s.pc    = 3'd3;
+            }
+            default: {
+                s.sstep = 1'b0;
+                s.halt  = 1'b1;
+                s.n_rec = 4'd15;
+                s.cause = 3'd3;
+                s.pc    = 3'd4;
+            }
+        }
+        return s;
+    }
+
+    // Op j of row i: the first op is the one under test.
+    function seg_op (
+        i: input logic<4>,
+        j: input u32     ,
+    ) -> SOp {
+        if j != 0 {
+            return SOp::ALU;
+        }
+        return case i {
+            4'd1   : SOp::EXC,
+            4'd4   : SOp::BRM,
+            4'd7   : SOp::EBRK,
+            default: SOp::ALU,
+        };
+    }
+
+    function seg_pc (
+        i: input logic<4>,
+    ) -> logic<64> {
+        return 64'h0000_0000_8000_1000 + {52'd0, i, 8'd0};
+    }
+}
+
+module step_harness::<CFG: core_cfg> (
+    clk   : input  clock    ,
+    rst   : input  reset    ,
+    o_pass: output logic    ,
+    o_done: output logic    ,
+    o_cov : output logic<8> ,
+    o_dbg : output logic<64>,
+) {
+    import core_types::<CFG>::*;
+    import opclass_pkg::*;
+    import retire_pkg::*;
+    import step_tb_pkg::*;
+
+    const CW : u32 = CFG::COMMIT_W;
+    const MW : u32 = CFG::MEM_W;
+    const END: u32 = 3000;
+
+    enum Ph: logic<2> {
+        BOOT,
+        SETUP,
+        RUN,
+        FIN,
+    }
+
+    // ---- DUT ----
+
+    var cm       : RobCm                   [CW];
+    var rob_exc  : ExcHold                     ;
+    var rob_head : TagTok                      ;
+    var lq_win   : LqCmWin                 [CW];
+    var sq_win   : SqCmWin                 [MW];
+    var kill     : Kill                        ;
+    var irq_in   : IrqReq                      ;
+    var haltreq  : logic                       ;
+    var ret_cnt  : logic    <RETIRE_CNT_W>     ;
+    var oldest   : TagTok                      ;
+    var cm_flush : CmFlush                     ;
+    var trap_fire: logic                       ;
+    var irq_take : logic                       ;
+    var irq_q    : IrqReq                      ;
+    var epc      : logic    <64>               ;
+    var csr_cm   : CsrCm                       ;
+    var retire   : RetireRec               [CW];
+    var irq_evt  : IrqEvent                    ;
+    var ret_dm   : logic                       ;
+    var dm_req   : logic                       ;
+    var stepping : logic                       ;
+    var cm_chk   : logic    <CHK_CM_W>         ;
+
+    var trap_t : CsrTrap               ;
+    var tgt    : logic             <64>;
+    var tval   : logic             <64>;
+    var mret_pc: logic             <64>;
+    var sret_pc: logic             <64>;
+    var dret_pc: logic             <64>;
+    var c_dm   : logic                 ;
+    var c_dpc  : logic             <64>;
+    var c_step : logic                 ;
+    var c_sie  : logic                 ;
+    var c_stopt: logic                 ;
+    var c_mtvec: logic             <64>;
+    var c_mepc : logic             <64>;
+    var c_stvec: logic             <64>;
+    var c_sepc : logic             <64>;
+    var c_vsepc: logic             <64>;
+    var c_medel: logic             <64>;
+    var c_priv : csr_pkg::PrivLevel    ;
+    var c_virt : logic                 ;
+    var c_rd   : logic             <64>;
+
+    var tb_we  : logic           ;
+    var tb_wa  : logic<12>       ;
+    var tb_wd  : logic<64>       ;
+    var tb_ra  : logic<12>       ;
+    var dbg_chk: logic<CHK_DBG_W>;
+
+    always_comb {
+        for w in 0..CW {
+            lq_win[w] = 0;
+        }
+        for w in 0..MW {
+            sq_win[w] = 0;
+        }
+    }
+
+    inst u_commit: commit::<CFG> (
+        clk                                         ,
+        rst                                         ,
+        i_reset_pc           : 64'h8000_0000        ,
+        i_cm                 : cm                   ,
+        i_exc                : rob_exc              ,
+        i_head               : rob_head             ,
+        i_lq_win             : lq_win               ,
+        i_sq_win             : sq_win               ,
+        i_ordering_empty     : 1'b1                 ,
+        i_sb_credit          : PUSH_W as SB_CREDIT_W,
+        i_kill               : kill                 ,
+        i_sys_wr             : 0                    ,
+        i_started            : 0                    ,
+        i_irq                : irq_in               ,
+        i_priv               : c_priv               ,
+        i_virt               : c_virt               ,
+        i_dm                 : c_dm                 ,
+        i_dm_haltreq         : haltreq              ,
+        i_dm_halt_pc         : 64'h4000             ,
+        i_dm_step            : c_step               ,
+        i_dm_stepie          : c_sie                ,
+        i_rd2_valid          : 1'b0                 ,
+        i_rd2                : 64'd0                ,
+        i_trap_target        : tgt                  ,
+        i_trap_tval          : tval                 ,
+        i_mret_pc            : mret_pc              ,
+        i_sret_pc            : sret_pc              ,
+        i_dret_pc            : dret_pc              ,
+        i_dbg_retire_limit_en: 1'b0                 ,
+        i_dbg_retire_limit   : 64'd0                ,
+        i_dbg_irq_mask       : 1'b0                 ,
+        i_dbg_irq_allow      : 1'b0                 ,
+        o_retire_cnt         : ret_cnt              ,
+        o_oldest             : oldest               ,
+        o_flush              : cm_flush             ,
+        o_trap_fire          : trap_fire            ,
+        o_irq_take           : irq_take             ,
+        o_irq_q              : irq_q                ,
+        o_epc                : epc                  ,
+        o_ren_cm             : _                    ,
+        o_lq_ret_cnt         : _                    ,
+        o_sq_ret_cnt         : _                    ,
+        o_ftq_cm             : _                    ,
+        o_bar_ret            : _                    ,
+        o_icache_inv         : _                    ,
+        o_tlb_inv            : _                    ,
+        o_head_retired       : _                    ,
+        o_rsv_clr            : _                    ,
+        o_csr                : csr_cm               ,
+        o_retire             : retire               ,
+        o_irq_evt            : irq_evt              ,
+        o_retire_dm          : ret_dm               ,
+        o_dm_req             : dm_req               ,
+        o_step               : stepping             ,
+        o_perf               : _                    ,
+        o_chk                : cm_chk               ,
+    );
+
+    inst u_trap: trap_unit::<CFG> (
+        i_trap_fire: trap_fire  ,
+        i_irq_take : irq_take   ,
+        i_exc      : rob_exc.rec,
+        i_irq      : irq_q      ,
+        i_epc      : epc        ,
+        i_priv     : c_priv     ,
+        i_virt     : c_virt     ,
+        i_medeleg  : c_medel    ,
+        i_mtvec    : c_mtvec    ,
+        i_stvec    : c_stvec    ,
+        i_mepc     : c_mepc     ,
+        i_sepc     : c_sepc     ,
+        i_vsepc    : c_vsepc    ,
+        i_dpc      : c_dpc      ,
+        i_dm       : c_dm       ,
+        i_dm_exc_pc: 64'h4004   ,
+        o_trap     : trap_t     ,
+        o_target   : tgt        ,
+        o_tval     : tval       ,
+        o_mret_pc  : mret_pc    ,
+        o_sret_pc  : sret_pc    ,
+        o_dret_pc  : dret_pc    ,
+    );
+
+    inst u_csr: csr #(
+        INSTRET_CNT_W: RETIRE_CNT_W,
+    ) (
+        clk                                             ,
+        rst                                             ,
+        i_hart_id    : 8'd0                             ,
+        i_rd_addr    : tb_ra                            ,
+        o_rd_data    : c_rd                             ,
+        i_wr_en      : csr_cm.wr_en || tb_we,
+        i_wr_addr    : if tb_we ? tb_wa : csr_cm.wr_addr,
+        i_wr_data    : if tb_we ? tb_wd : csr_cm.wr_data,
+        i_mtime      : 64'd0                            ,
+        i_trap_fire  : trap_t.fire                      ,
+        i_trap_pc    : trap_t.pc                        ,
+        i_trap_cause : trap_t.cause                     ,
+        i_trap_tval  : trap_t.tval                      ,
+        i_mret_fire  : csr_cm.mret                      ,
+        i_sret_fire  : csr_cm.sret                      ,
+        i_dm_enter   : csr_cm.dm_enter                  ,
+        i_dm_cause   : csr_cm.dm_cause                  ,
+        i_dm_pc      : epc                              ,
+        i_dret_fire  : csr_cm.dret                      ,
+        o_debug_mode : c_dm                             ,
+        o_dpc        : c_dpc                            ,
+        o_dcsr_ebreak: _                                ,
+        o_dcsr_step  : c_step                           ,
+        o_dcsr_stepie: c_sie                            ,
+        o_dm_stoptime: c_stopt                          ,
+        o_mtvec      : c_mtvec                          ,
+        o_mepc       : c_mepc                           ,
+        o_stvec      : c_stvec                          ,
+        o_sepc       : c_sepc                           ,
+        o_medeleg    : c_medel                          ,
+        o_priv       : c_priv                           ,
+        o_virt       : c_virt                           ,
+        o_vsepc      : c_vsepc                          ,
+        i_trap_to_s  : trap_t.to_s                      ,
+        i_trap_to_vs : trap_t.to_vs                     ,
+        i_htval      : trap_t.htval                     ,
+        i_trap_gva   : trap_t.gva                       ,
+        i_irq_timer_m: 1'b0                             ,
+        i_irq_sw_m   : 1'b0                             ,
+        i_irq_ext_m  : 1'b0                             ,
+        i_irq_ext_s  : 1'b0                             ,
+        i_instret_cnt: csr_cm.instret_cnt               ,
+        i_fflags_set : csr_cm.fflags_set                ,
+        i_fflags     : csr_cm.fflags                    ,
+        i_fs_dirty   : csr_cm.fs_dirty                  ,
+        i_vxsat_set  : 1'b0                             ,
+        i_vset_wr    : 1'b0                             ,
+        i_set_vtype  : 64'd0                            ,
+        i_set_vl     : 64'd0                            ,
+        i_vstart_wr  : 1'b0                             ,
+        i_vstart_val : 64'd0                            ,
+        i_hpm_events : 8'd0                             ,
+    );
+
+    inst u_chk_dbg: chk_debug::<CFG> (
+        clk                        ,
+        rst                        ,
+        i_dm          : c_dm       ,
+        i_irq_take    : irq_take   ,
+        i_trap_in     : trap_t.fire,
+        i_dm_req      : dm_req     ,
+        i_started     : 0          ,
+        i_step        : stepping   ,
+        i_retire_cnt  : ret_cnt    ,
+        i_trap_fire   : trap_fire  ,
+        i_ic_req_valid: 1'b0       ,
+        i_ic_req      : 0          ,
+        i_retire      : retire     ,
+        i_retire_dm   : ret_dm     ,
+        o_chk         : dbg_chk    ,
+    );
+
+    // ---- The scripted ROB window ----
+
+    var ph    : Ph                  ;
+    var seg   : logic<4>            ;
+    var sub   : logic<5>            ;
+    var cyc   : logic<32>           ;
+    var q_op  : SOp              [4];
+    var q_n   : logic<3>            ;
+    var htag  : logic<ROB_TAG_W>    ;
+    var kill_q: logic               ; // full kill of a flush last cycle
+    var pk_q  : logic               ; // partial kill keeping the head
+    var load_q: logic               ; // present the row's ops after the kill
+    var rec_n : logic<4>            ;
+    var irq_n : logic<2>            ;
+    var ok_n  : logic<4>            ; // non-trap records
+    var first : logic               ; // no record yet in this run
+    var done_q: logic               ; // the stepped op, trap or interrupt is out
+    var hreq_q: logic               ;
+    var dret_q: logic               ;
+    var m0    : logic<64>           ;
+    var c0    : logic<64>           ;
+    var fail  : logic<16>           ;
+    var cov   : logic<8>            ;
+
+    let cur : Seg = seg_of(seg);
+    let prev: Seg = seg_of(seg - 4'd1);
+
+    always_comb {
+        for l in 0..CW {
+            let t             : logic<ROB_TAG_W> = htag + l;
+            let o             : SOp              = q_op[l];
+            cm[l]          = 0;
+            cm[l].valid    = (l as u32) <: (q_n as u32);
+            cm[l].tag      = t as RobTag;
+            cm[l].done     = 1'b1;
+            cm[l].ent.insn = {29'd0, o};
+            cm[l].ent.fu   = if o == SOp::BRM ? FuKind::BRU : FuKind::ALU;
+            if o == SOp::DRET {
+                cm[l].ent.fu    = FuKind::NONE;
+                cm[l].ent.flush = FlushKind::XRET;
+                cm[l].ent.xret  = XretKind::DRET;
+                cm[l].ent.alone = 1'b1;
+            }
+            if o == SOp::BRM {
+                cm[l].res.mispred = 1'b1;
+                cm[l].res.taken   = 1'b1;
+                cm[l].res.next_pc = seg_pc(seg) + BR_OFF;
+            }
+        }
+        rob_exc           = 0;
+        rob_exc.tag       = htag as RobTag;
+        rob_exc.valid     = q_n != 0 && (q_op[0] == SOp::EXC || q_op[0] == SOp::EBRK);
+        rob_exc.rec.valid = rob_exc.valid;
+        rob_exc.rec.cause = if q_op[0] == SOp::EBRK ? 6'd3 : 6'd2;
+        rob_exc.rec.dm    = q_op[0] == SOp::EBRK;
+        rob_head.valid    = q_n != 0;
+        rob_head.tag      = htag as RobTag;
+        kill              = 0;
+        kill.valid        = kill_q || pk_q;
+        kill.full         = kill_q;
+        kill.keep         = htag as RobTag;
+        irq_in            = 0;
+        irq_in.pending    = ph == Ph::RUN && cur.irq || ph == Ph::SETUP && sub <: 5'd3 && prev.irq;
+        irq_in.code       = 6'd7;
+    }
+
+    // Debug Mode setup: sub 0 checks the last run, 1-3 write the CSRs, 4-9
+    // measure mcycle, 10 samples minstret and presents the DRET.
+    always_comb {
+        tb_we = 1'b0;
+        tb_wa = 12'h000;
+        tb_wd = 64'd0;
+        tb_ra = 12'hB02;
+        if ph == Ph::BOOT {
+            tb_we = 1'b1;
+            tb_wa = 12'h305;
+            tb_wd = TVEC;
+        }
+        if ph == Ph::SETUP {
+            case sub {
+                5'd1: {
+                    tb_ra = 12'h7B0;
+                }
+                5'd2: {
+                    tb_we = 1'b1;
+                    tb_wa = 12'h7B0;
+                    tb_wd = {52'd0, cur.stepie, cur.stopc, cur.stopt, 6'd0, cur.sstep, 2'b11};
+                }
+                5'd3: {
+                    tb_we = 1'b1;
+                    tb_wa = 12'h7B1;
+                    tb_wd = seg_pc(seg);
+                }
+                5'd4, 5'd9: {
+                    tb_ra = 12'hB00;
+                }
+                default: {}
+            }
+        }
+    }
+
+    var r_now : logic<4>;
+    var k_now : logic<4>;
+    var dm_now: logic   ;
+    always_comb {
+        r_now  = 0;
+        k_now  = 0;
+        dm_now = 1'b0;
+        for l in 0..CW {
+            if retire[l].valid && !ret_dm {
+                r_now += 4'd1;
+                if !retire[l].trap {
+                    k_now += 4'd1;
+                }
+            }
+            if retire[l].valid && ret_dm {
+                dm_now = 1'b1;
+            }
+        }
+    }
+
+    // The haltreq of a row races the step: it is up in the cycle of the
+    // stepped retire, so the registered request meets the step's pending.
+    let first_ret: logic = ph == Ph::RUN && first && (ret_cnt != 0 || trap_fire);
+    assign haltreq = hreq_q || (first_ret && cur.halt);
+
+    always_ff {
+        if_reset {
+            ph     = Ph::BOOT;
+            seg    = 0;
+            sub    = 0;
+            cyc    = 0;
+            q_n    = 0;
+            htag   = 0;
+            kill_q = 1'b0;
+            pk_q   = 1'b0;
+            load_q = 1'b0;
+            rec_n  = 0;
+            irq_n  = 0;
+            ok_n   = 0;
+            first  = 1'b1;
+            m0     = 0;
+            c0     = 0;
+            fail   = 0;
+            cov    = 0;
+            hreq_q = 1'b0;
+            done_q = 1'b0;
+            dret_q = 1'b0;
+            for i in 0..4 {
+                q_op[i] = SOp::NONE;
+            }
+        } else {
+            cyc    = cyc + 1;
+            kill_q = cm_flush.valid;
+            pk_q   = 1'b0;
+
+            // The ROB: retire shifts the window, a kill drops it.
+            if cm_flush.valid {
+                q_n  = 0;
+                htag = htag + (ret_cnt as ROB_TAG_W);
+            } else if kill.valid && !kill.full {
+                q_n = if q_n == 0 ? 3'd0 : 3'd1;
+            } else if ret_cnt != 0 {
+                for i in 0..4 {
+                    q_op[i] = if i + (ret_cnt as u32) <: 4 ? q_op[i + (ret_cnt as u32)] : SOp::NONE;
+                }
+                q_n  = q_n - (ret_cnt as 3);
+                htag = htag + (ret_cnt as ROB_TAG_W);
+            }
+            if load_q && kill_q {
+                load_q = 1'b0;
+                for i in 0..4 {
+                    q_op[i] = seg_op(seg, i);
+                }
+                q_n = 3'd4;
+            }
+
+            // Records and interrupt events since the dret; only the dret's
+            // own record is marked.
+            rec_n  = rec_n + r_now;
+            ok_n   = ok_n + k_now;
+            dret_q = csr_cm.dret;
+            if dm_now && ph == Ph::RUN && !dret_q {
+                fail[0] = 1'b1;
+            }
+            if irq_evt.valid {
+                irq_n = irq_n + 2'd1;
+            }
+
+            if c_stopt != (c_dm && (if ph == Ph::SETUP && sub <= 5'd2 ? prev.stopt : cur.stopt)) && ph != Ph::BOOT {
+                fail[1] = 1'b1;
+            }
+            if c_stopt {
+                cov[0] = 1'b1;
+            }
+
+            case ph {
+                Ph::BOOT: {
+                    hreq_q = 1'b1;
+                    if c_dm {
+                        ph  = Ph::SETUP;
+                        sub = 0;
+                    }
+                }
+                Ph::SETUP: {
+                    sub = sub + 5'd1;
+                    case sub {
+                        5'd0: {
+                            hreq_q = 1'b0;
+                            if seg != 0 {
+                                if rec_n != (if prev.n_rec == 4'd15 ? CW as 4 : prev.n_rec) {
+                                    fail[2] = 1'b1;
+                                }
+                                if irq_n != prev.n_irq {
+                                    fail[3] = 1'b1;
+                                }
+                                if c_rd != m0 + {60'd0, ok_n} {
+                                    fail[4] = 1'b1;
+                                }
+                            }
+                        }
+                        5'd1: {
+                            let pp: logic<64> = seg_pc(seg - 4'd1);
+                            let xp: logic<64> = if seg == 0 ?
+                                64'h8000_0000
+                            :
+                                case prev.pc {
+                                    3'd0   : pp + 64'd4,
+                                    3'd1   : TVEC,
+                                    3'd2   : pp + BR_OFF,
+                                    3'd3   : pp,
+                                    default: pp + 4 * CW,
+                                }
+                            ;
+                            let xc: logic<3> = if seg == 0 ? 3'd3 : prev.cause;
+                            if c_rd[8:6] != xc || c_rd[31:28] != 4'd4 {
+                                fail[5] = 1'b1;
+                            }
+                            if c_dpc != xp {
+                                fail[6] = 1'b1;
+                            }
+
+                            if seg == SEG_N {
+                                ph = Ph::FIN;
+                            }
+                        }
+                        5'd4: {
+                            c0 = c_rd;
+                        }
+                        5'd9: {
+                            if c_rd - c0 != (if cur.stopc ? 64'd0 : 64'd5) {
+                                fail[7] = 1'b1;
+                            }
+                            cov[1] = cov[1] | cur.stopc;
+                        }
+                        5'd10: {
+                            m0      = c_rd + (if cur.stopc ? 64'd0 : 64'd1);
+                            q_op[0] = SOp::DRET;
+                            q_n     = 3'd1;
+                        }
+                        default: {}
+                    }
+                    if csr_cm.dret {
+                        ph     = Ph::RUN;
+                        load_q = 1'b1;
+                        rec_n  = 0;
+                        irq_n  = 0;
+                        ok_n   = 0;
+                        first  = 1'b1;
+                        done_q = 1'b0;
+                    }
+                }
+                Ph::RUN: {
+                    if first_ret {
+                        first = 1'b0;
+                        if cur.pkill {
+                            pk_q = 1'b1;
+                        }
+                        if cur.halt {
+                            hreq_q = 1'b1;
+                        }
+                    }
+                    if ret_cnt != 0 || trap_fire || irq_take {
+                        done_q = 1'b1;
+                    }
+                    // After the stepped record, nothing gets the token.
+                    if cur.sstep && done_q && oldest.valid {
+                        fail[8] = 1'b1;
+                    }
+                    if cur.pkill && pk_q {
+                        cov[2] = 1'b1;
+                    }
+                    if irq_take && cur.stepie {
+                        cov[3] = 1'b1;
+                    }
+                    if c_dm {
+                        ph  = Ph::SETUP;
+                        sub = 0;
+                        seg = seg + 4'd1;
+                    }
+                }
+                default: {}
+            }
+            if irq_take && !cur.stepie && ph == Ph::RUN {
+                fail[9] = 1'b1;
+            }
+            if cm_chk != 0 || dbg_chk != 0 {
+                fail[10] = 1'b1;
+            }
+        }
+    }
+
+    assign o_pass = ph == Ph::FIN && fail == 0;
+    assign o_done = ph == Ph::FIN || cyc >= END;
+    assign o_cov  = cov;
+    assign o_dbg  = {fail, 12'd0, seg, sub, 3'd0, ph, 22'd0};
+}
+
+// chk_debug fires on injected violations: each step breaks one invariant and
+// the sticky flags must then equal exactly the bits broken so far.
+module chk_debug_harness::<CFG: core_cfg> (
+    clk   : input  clock,
+    rst   : input  reset,
+    o_pass: output logic,
+    o_done: output logic,
+) {
+    import core_types::<CFG>::*;
+    import retire_pkg::*;
+
+    const DM_PC: logic<56> = tb_platform_pkg::DM_BASE;
+    const DM_PA: logic<56> = tb_platform_pkg::DM_BASE + 56'h1000;
+
+    var cyc: logic<4>;
+    var ok : logic   ;
+
+    var dm   : logic                                  ;
+    var irq  : logic                                  ;
+    var trin : logic                                  ;
+    var req  : logic                                  ;
+    var start: logic    <STARTED_N>                   ;
+    var stp  : logic                                  ;
+    var rcnt : logic    <RETIRE_CNT_W>                ;
+    var icv  : logic                                  ;
+    var icq  : IcReq                                  ;
+    var rec  : RetireRec               [CFG::COMMIT_W];
+    var chk  : logic    <CHK_DBG_W>                   ;
+
+    always_comb {
+        dm    = 1'b0;
+        irq   = 1'b0;
+        trin  = 1'b0;
+        req   = 1'b0;
+        start = 0;
+        stp   = 1'b0;
+        rcnt  = 0;
+        icv   = 1'b0;
+        icq   = 0;
+        for l in 0..CFG::COMMIT_W {
+            rec[l] = 0;
+        }
+        case cyc {
+            4'd1: {
+                dm   = 1'b1;
+                trin = 1'b1;
+            }
+            4'd2: {
+                req      = 1'b1;
+                start[0] = 1'b1;
+            }
+            4'd3: {
+                stp  = 1'b1;
+                rcnt = 1;
+            }
+            4'd4: {
+                stp = 1'b1;
+                irq = 1'b1;
+            }
+            4'd5: {
+                icv          = 1'b1;
+                icq.id.probe = 1'b1;
+                icq.pa       = DM_PC;
+            }
+            4'd6: {
+                rec[0].valid     = 1'b1;
+                rec[0].mem_rmask = 16'h00ff;
+                rec[0].mem_paddr = {8'd0, DM_PA};
+            }
+            default: {
+                // In Debug Mode the same accesses are legal.
+                dm           = 1'b1;
+                icv          = 1'b1;
+                icq.id.probe = 1'b1;
+                icq.pa       = DM_PC;
+            }
+        }
+    }
+
+    inst u_chk: chk_debug::<CFG> #(
+        PMA_N      : tb_platform_pkg::MAP_ARCH_N,
+        PMA_REGIONS: tb_platform_pkg::MAP_ARCH  ,
+    ) (
+        clk                  ,
+        rst                  ,
+        i_dm          : dm   ,
+        i_irq_take    : irq  ,
+        i_trap_in     : trin ,
+        i_dm_req      : req  ,
+        i_started     : start,
+        i_step        : stp  ,
+        i_retire_cnt  : rcnt ,
+        i_trap_fire   : 1'b0 ,
+        i_ic_req_valid: icv  ,
+        i_ic_req      : icq  ,
+        i_retire      : rec  ,
+        i_retire_dm   : 1'b0 ,
+        o_chk         : chk  ,
+    );
+
+    let exp_chk: logic<CHK_DBG_W> = case cyc {
+        4'd0, 4'd1: 5'b00000,
+        4'd2      : 5'b00001,
+        4'd3, 4'd4: 5'b00011,
+        4'd5      : 5'b00111,
+        4'd6      : 5'b01111,
+        default   : 5'b11111,
+    };
+
+    always_ff {
+        if_reset {
+            cyc = 0;
+            ok  = 1'b1;
+        } else {
+            if cyc != 4'd15 {
+                cyc = cyc + 4'd1;
+            }
+            if chk != exp_chk {
+                ok = 1'b0;
+            }
+        }
+    }
+
+    assign o_pass = ok;
+    assign o_done = cyc == 4'd15;
+}
+
+#[test(test_step)]
+module test_step {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic    ;
+    var done2: logic    ;
+    var cov2 : logic<8> ;
+    var dbg2 : logic<64>;
+    var pass4: logic    ;
+    var done4: logic    ;
+    var cov4 : logic<8> ;
+    var dbg4 : logic<64>;
+    inst h2: step_harness::<cfg_w2> (
+        clk          ,
+        rst          ,
+        o_pass: pass2,
+        o_done: done2,
+        o_cov : cov2 ,
+        o_dbg : dbg2 ,
+    );
+    inst h4: step_harness::<cfg_w4> (
+        clk          ,
+        rst          ,
+        o_pass: pass4,
+        o_done: done4,
+        o_cov : cov4 ,
+        o_dbg : dbg4 ,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(3100);
+        $display("step: w2 pass=%b cov=%b dbg=%h  w4 pass=%b cov=%b dbg=%h", pass2, cov2, dbg2, pass4, cov4, dbg4);
+        $assert(done2 && done4, "step test did not finish");
+        $assert(pass2 && pass4, "step records, cause, dpc or counters mismatch");
+        $assert(cov2 == 8'h0f && cov4 == 8'h0f, "step scenario not covered");
+        $finish();
+    }
+}
+
+#[test(test_chk_debug)]
+module test_chk_debug {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var pass2: logic;
+    var done2: logic;
+    var pass4: logic;
+    var done4: logic;
+    inst h2: chk_debug_harness::<cfg_w2> (
+        clk          ,
+        rst          ,
+        o_pass: pass2,
+        o_done: done2,
+    );
+    inst h4: chk_debug_harness::<cfg_w4> (
+        clk          ,
+        rst          ,
+        o_pass: pass4,
+        o_done: done4,
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(20);
+        $assert(done2 && done4, "chk_debug test did not finish");
+        $assert(pass2 && pass4, "chk_debug flags differ from the injected violations");
+        $finish();
+    }
+}

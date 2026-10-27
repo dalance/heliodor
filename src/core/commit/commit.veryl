@@ -19,6 +19,7 @@
 //   i_dm_haltreq         : the Debug Module's halt request level, registered
 //                          here (dm_q) before any use
 //   i_dm_halt_pc         : static, the halt entry of debug memory
+//   i_dm_step, i_dm_stepie : csr's dcsr.step and dcsr.stepie (registered)
 //   i_rd2_valid, i_rd2   : atomic_unit's held rd+1 value of amocas.q, for the
 //                          retire record only (the op is the head and alone)
 //   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs;
@@ -48,6 +49,7 @@
 //   o_retire, o_irq_evt  : registered, one cycle after retire
 //   o_retire_dm          : registered with o_retire: its records retired in
 //                          Debug Mode
+//   o_dm_req, o_step     : dm_req and step_q, for chk_debug
 // Owns:
 //   - retire is a prefix of the lanes; at most one flush per cycle (Debug
 //     Mode entry > irq > lane 0 DEBUG or trap > replay > the RETIRE_FLUSH of
@@ -58,6 +60,10 @@
 //     ExcRec.dm like an exception (outcome DEBUG on lane 0, dbg_fire). Both
 //     redirect to i_dm_halt_pc and emit no record; dpc is the committed next
 //     PC. In Debug Mode dbg_fire only redirects and no interrupt is taken
+//   - single step: a dret with dcsr.step arms step_q. Lane 0 alone may then
+//     retire one op; that record, a trap or an interrupt sets step_n_q, which
+//     withholds the token and retire like the lockstep limit and requests
+//     entry (cause 4). Without dcsr.stepie no interrupt is taken meanwhile
 //   - every side effect is conditioned on retire[l] alone (plus trap_fire
 //     or irq_take on lane 0), never on "the head is valid"
 //   - arch_pc_q is the PC of the head op whenever the head is valid, so lane
@@ -96,6 +102,8 @@ pub module commit::<CFG: core_cfg> (
     i_dm                 : input  logic                                                                         ,
     i_dm_haltreq         : input  logic                                                                         ,
     i_dm_halt_pc         : input  logic                        <64>                                             ,
+    i_dm_step            : input  logic                                                                         ,
+    i_dm_stepie          : input  logic                                                                         ,
     i_rd2_valid          : input  logic                                                                         ,
     i_rd2                : input  logic                        <64>                                             ,
     i_trap_target        : input  logic                        <64>                                             ,
@@ -127,6 +135,8 @@ pub module commit::<CFG: core_cfg> (
     o_retire             : output retire_pkg::RetireRec                                          [CFG::COMMIT_W],
     o_irq_evt            : output retire_pkg::IrqEvent                                                          ,
     o_retire_dm          : output logic                                                                         ,
+    o_dm_req             : output logic                                                                         ,
+    o_step               : output logic                                                                         ,
     o_perf               : output core_types::<CFG>::CmPerf                                                     ,
     o_chk                : output logic                        <core_types::<CFG>::CHK_CM_W>                    ,
 ) {
@@ -153,6 +163,8 @@ pub module commit::<CFG: core_cfg> (
     var order_q  : logic     <64>     ;
     var irq_q    : IrqReq             ;
     var dm_q     : logic              ;
+    var step_q   : logic              ;
+    var step_n_q : logic              ; // the stepped op (or a trap or interrupt) is done
     var sys_q    : SysPending         ;
     var started_q: logic              ;
     var ret_q    : RetireRec      [CW];
@@ -165,17 +177,20 @@ pub module commit::<CFG: core_cfg> (
     // ---- Interrupt and Debug Mode acceptance, the oldest token ----
 
     // A pending acceptance (acc_hold) withholds the token, so no new started
-    // op begins and the head's started latch clears in bounded time.
+    // op begins and the head's started latch clears in bounded time. The
+    // retire limits (lockstep and step) withhold it through lim_hold.
     let limit_hit: logic = i_dbg_retire_limit_en && order_q >= i_dbg_retire_limit;
-    let irq_ok   : logic = !i_dm && (!i_dbg_irq_mask
-        || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit));
-    let dm_req   : logic = !i_dm && dm_q;
+    let step_done: logic = step_q && step_n_q;
+    let irq_ok   : logic = !i_dm && !(step_q && !i_dm_stepie)
+        && (!i_dbg_irq_mask || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit));
+    let dm_req   : logic = !i_dm && (dm_q || step_done);
     let dm_take  : logic = dm_req && !started_q && !i_kill.valid;
     let irq_take : logic = irq_q.pending && irq_ok && !dm_req && !started_q && !i_kill.valid;
     let acc_hold : logic = (irq_q.pending && irq_ok) || dm_req;
+    let lim_hold : logic = limit_hit || step_done;
 
     always_comb {
-        o_oldest.valid = i_head.valid && !acc_hold && !limit_hit && !i_kill.valid;
+        o_oldest.valid = i_head.valid && !acc_hold && !lim_hold && !i_kill.valid;
         o_oldest.tag   = i_head.tag;
     }
 
@@ -351,7 +366,11 @@ pub module commit::<CFG: core_cfg> (
     always_comb {
         for l in 0..CW {
             let rf       : logic = outc[l] == Outcome::RETIRE_FLUSH;
-            lim_ok[l] = !i_dbg_retire_limit_en || order_q + l <: i_dbg_retire_limit;
+            // A pending step also stops retire: a partial kill can delay
+            // dm_take past the cycle after the stepped record.
+            let ls_ok    : logic = !i_dbg_retire_limit_en || order_q + l <: i_dbg_retire_limit;
+            let step_ok  : logic = !step_q || (l == 0 && !step_n_q);
+            lim_ok[l] = ls_ok && step_ok;
             bud_ok[l] = n_st[l] <= MW && ((n_l1[l] as u32) + (n_l2[l] as u32)) <= (i_sb_credit as u32);
             ok[l]     = (outc[l] == Outcome::RETIRE || rf) && !kil[l] && bud_ok[l] && lim_ok[l];
             fin[l]    = rf || alone_e[l];
@@ -481,7 +500,7 @@ pub module commit::<CFG: core_cfg> (
         o_csr.sret        = |sret;
         o_csr.dret        = |dret;
         o_csr.dm_enter    = dm_redir && !i_dm;
-        o_csr.dm_cause    = if dm_take ? 3'd3 : 3'd1;
+        o_csr.dm_cause    = if dm_take ? (if dm_q ? 3'd3 : 3'd4) : 3'd1;
         o_csr.instret_cnt = n_ret;
         o_csr.fflags_set  = |ffl_v;
         o_csr.fs_dirty    = |fsd_v;
@@ -499,6 +518,8 @@ pub module commit::<CFG: core_cfg> (
             order_q   = 0;
             irq_q     = 0;
             dm_q      = 1'b0;
+            step_q    = 1'b0;
+            step_n_q  = 1'b0;
             sys_q     = 0;
             started_q = 1'b0;
         } else {
@@ -515,6 +536,16 @@ pub module commit::<CFG: core_cfg> (
                 arch_pc_q = apc;
             }
             order_q = order_q + (n_ret as 64) + (trap_fire as 64);
+
+            if dm_redir {
+                step_q   = 1'b0;
+                step_n_q = 1'b0;
+            } else if |dret && i_dm_step {
+                step_q   = 1'b1;
+                step_n_q = 1'b0;
+            } else if step_q && (|retire || trap_fire || irq_take) {
+                step_n_q = 1'b1;
+            }
 
             if (sys_q.valid && killed(i_kill, sys_q.tag)) || |sys_ret {
                 sys_q.valid = 1'b0;
@@ -619,6 +650,8 @@ pub module commit::<CFG: core_cfg> (
 
     assign o_retire    = ret_q;
     assign o_retire_dm = ret_dm_q;
+    assign o_dm_req    = dm_req;
+    assign o_step      = step_q;
     assign o_irq_evt   = evt_q;
 
     // ---- Firing events ----
@@ -653,7 +686,8 @@ pub module commit::<CFG: core_cfg> (
             perf_q.rf_br_cm    = rf_any && rf_kind == RedirKind::BR_CM;
             perf_q.irq_take    = irq_take;
             perf_q.irq_started = irq_q.pending && irq_ok && started_q && !i_kill.valid;
-            perf_q.dm_halt     = dm_take;
+            perf_q.dm_halt     = dm_take && dm_q;
+            perf_q.dm_step     = dm_take && !dm_q;
             perf_q.dm_ebreak   = dbg_fire && !i_dm;
             perf_q.dm_reenter  = dbg_fire && i_dm;
             perf_q.dm_exc      = trap_fire && i_dm;
