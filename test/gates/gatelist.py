@@ -16,7 +16,8 @@ a test judged by pass/fail only: it gets no golden artifact and the new-core
 wrapper never compares its trace. irq=<mask> pulses those PLIC sources once
 early in the run (new core only; such a test must be lockstep=0). dmi=<path>
 plays that DMI script hex on the Debug Module (new core only, lockstep=0); the
-test then ends when the script does.
+test then passes once the script has ended and the program has written
+tohost = 1.
 """
 
 import re

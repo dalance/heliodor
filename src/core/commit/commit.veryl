@@ -1,5 +1,5 @@
-// commit: the commit-group function, retire side effects, interrupt
-// acceptance, the oldest token and the retire record.
+// commit: the commit-group function, retire side effects, interrupt and
+// Debug Mode acceptance, the oldest token and the retire record.
 //
 // Ports (timing contract):
 //   i_reset_pc           : static; the PC of the first op after reset
@@ -15,9 +15,15 @@
 //   i_irq                : csr's pending interrupt, registered here (irq_q)
 //                          before any use
 //   i_priv, i_virt       : csr's current mode, for the retire record only
+//   i_dm                 : csr's debug_mode (registered)
+//   i_dm_haltreq         : the Debug Module's halt request level, registered
+//                          here (dm_q) before any use
+//   i_dm_halt_pc         : static, the halt entry of debug memory
 //   i_rd2_valid, i_rd2   : atomic_unit's held rd+1 value of amocas.q, for the
 //                          retire record only (the op is the head and alone)
-//   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs
+//   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs;
+//                          i_trap_target is the debug memory exception entry
+//                          in Debug Mode
 //   i_dbg_*              : lockstep controls, all 0 in normal use
 //   decision outputs     : o_retire_cnt, o_flush, o_trap_fire, o_irq_take,
 //                          the side-effect ports and o_csr are combinational
@@ -40,10 +46,18 @@
 //                          satp write retired: clears the LR reservation
 //   o_oldest             : from registered state, i_kill and i_dbg_*
 //   o_retire, o_irq_evt  : registered, one cycle after retire
+//   o_retire_dm          : registered with o_retire: its records retired in
+//                          Debug Mode
 // Owns:
-//   - retire is a prefix of the lanes; at most one flush per cycle (irq >
-//     trap > replay > the RETIRE_FLUSH of the youngest retired lane); a
-//     trap, replay or interrupt cycle retires nothing
+//   - retire is a prefix of the lanes; at most one flush per cycle (Debug
+//     Mode entry > irq > lane 0 DEBUG or trap > replay > the RETIRE_FLUSH of
+//     the youngest retired lane); an entry, trap, replay or interrupt cycle
+//     retires nothing
+//   - Debug Mode entry: the halt request is taken like an interrupt (at a
+//     group head that holds no started op, dm_take), an EBREAK with
+//     ExcRec.dm like an exception (outcome DEBUG on lane 0, dbg_fire). Both
+//     redirect to i_dm_halt_pc and emit no record; dpc is the committed next
+//     PC. In Debug Mode dbg_fire only redirects and no interrupt is taken
 //   - every side effect is conditioned on retire[l] alone (plus trap_fire
 //     or irq_take on lane 0), never on "the head is valid"
 //   - arch_pc_q is the PC of the head op whenever the head is valid, so lane
@@ -79,12 +93,16 @@ pub module commit::<CFG: core_cfg> (
     i_irq                : input  core_types::<CFG>::IrqReq                                                     ,
     i_priv               : input  csr_pkg::PrivLevel                                                            ,
     i_virt               : input  logic                                                                         ,
+    i_dm                 : input  logic                                                                         ,
+    i_dm_haltreq         : input  logic                                                                         ,
+    i_dm_halt_pc         : input  logic                        <64>                                             ,
     i_rd2_valid          : input  logic                                                                         ,
     i_rd2                : input  logic                        <64>                                             ,
     i_trap_target        : input  logic                        <64>                                             ,
     i_trap_tval          : input  logic                        <64>                                             ,
     i_mret_pc            : input  logic                        <64>                                             ,
     i_sret_pc            : input  logic                        <64>                                             ,
+    i_dret_pc            : input  logic                        <64>                                             ,
     i_dbg_retire_limit_en: input  logic                                                                         ,
     i_dbg_retire_limit   : input  logic                        <64>                                             ,
     i_dbg_irq_mask       : input  logic                                                                         ,
@@ -108,6 +126,7 @@ pub module commit::<CFG: core_cfg> (
     o_csr                : output core_types::<CFG>::CsrCm                                                      ,
     o_retire             : output retire_pkg::RetireRec                                          [CFG::COMMIT_W],
     o_irq_evt            : output retire_pkg::IrqEvent                                                          ,
+    o_retire_dm          : output logic                                                                         ,
     o_perf               : output core_types::<CFG>::CmPerf                                                     ,
     o_chk                : output logic                        <core_types::<CFG>::CHK_CM_W>                    ,
 ) {
@@ -126,29 +145,37 @@ pub module commit::<CFG: core_cfg> (
         RETIRE_FLUSH,
         TRAP,
         REPLAY,
+        DEBUG,
     }
 
     var arch_pc_q: logic     <64>     ;
     var boot_q   : logic              ; // first cycle out of reset: the PC is i_reset_pc
     var order_q  : logic     <64>     ;
     var irq_q    : IrqReq             ;
+    var dm_q     : logic              ;
     var sys_q    : SysPending         ;
     var started_q: logic              ;
     var ret_q    : RetireRec      [CW];
+    var ret_dm_q : logic              ;
     var evt_q    : IrqEvent           ;
     var perf_q   : CmPerf             ;
 
     let apc: logic<64> = if boot_q ? i_reset_pc : arch_pc_q;
 
-    // ---- Interrupt acceptance and the oldest token ----
+    // ---- Interrupt and Debug Mode acceptance, the oldest token ----
 
+    // A pending acceptance (acc_hold) withholds the token, so no new started
+    // op begins and the head's started latch clears in bounded time.
     let limit_hit: logic = i_dbg_retire_limit_en && order_q >= i_dbg_retire_limit;
-    let irq_ok   : logic = !i_dbg_irq_mask
-        || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit);
-    let irq_take : logic = irq_q.pending && irq_ok && !started_q && !i_kill.valid;
+    let irq_ok   : logic = !i_dm && (!i_dbg_irq_mask
+        || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit));
+    let dm_req   : logic = !i_dm && dm_q;
+    let dm_take  : logic = dm_req && !started_q && !i_kill.valid;
+    let irq_take : logic = irq_q.pending && irq_ok && !dm_req && !started_q && !i_kill.valid;
+    let acc_hold : logic = (irq_q.pending && irq_ok) || dm_req;
 
     always_comb {
-        o_oldest.valid = i_head.valid && !(irq_q.pending && irq_ok) && !limit_hit && !i_kill.valid;
+        o_oldest.valid = i_head.valid && !acc_hold && !limit_hit && !i_kill.valid;
         o_oldest.tag   = i_head.tag;
     }
 
@@ -199,6 +226,18 @@ pub module commit::<CFG: core_cfg> (
         return r;
     }
 
+    // xRET target of each lane's op.
+    var xpc_l: logic<64>     [CW] ;
+    always_comb {
+        for l in 0..CW {
+            xpc_l[l] = case i_cm[l].ent.xret {
+                XretKind::SRET: i_sret_pc,
+                XretKind::DRET: i_dret_pc,
+                default       : i_mret_pc,
+            };
+        }
+    }
+
     var nrvc : logic<CW>          ;
     var n32  : logic<HW_W>   [CW] ; // 32-bit ops among lanes 0..l-1
     var hw   : logic<HW_W>   [NA] ; // halfwords of lanes 0..k-1
@@ -218,7 +257,7 @@ pub module commit::<CFG: core_cfg> (
         for l in 0..CW - 1 {
             let e: RobEnt = i_cm[l].ent;
             a_v[l + 1]   = e.fu == FuKind::BRU || e.flush == FlushKind::XRET;
-            a_adj[l + 1] = (if e.fu == FuKind::BRU ? i_cm[l].res.next_pc : if e.sret ? i_sret_pc : i_mret_pc) - {hw[l + 1], 1'b0};
+            a_adj[l + 1] = (if e.fu == FuKind::BRU ? i_cm[l].res.next_pc : xpc_l[l]) - {hw[l + 1], 1'b0};
         }
         for l in 0..CW {
             pc[l] = tree_onehot_mux::<NA, 64>(last_oh(a_v & ((1 << (l + 1)) - 1)), a_adj) + {hw[l], 1'b0};
@@ -248,7 +287,7 @@ pub module commit::<CFG: core_cfg> (
             let e   : RobEnt     = i_cm[l].ent;
             let ctrl: logic      = e.fu == FuKind::BRU;
             let len : logic <64> = if e.is_rvc ? 64'd2 : 64'd4;
-            let xpc : logic <64> = if e.sret ? i_sret_pc : i_mret_pc;
+            let xpc : logic <64> = xpc_l[l];
 
             for w in 0..CW {
                 lq_hit[l][w] = e.lq_v && i_lq_win[w].valid && i_lq_win[w].tag == e.lq;
@@ -276,7 +315,7 @@ pub module commit::<CFG: core_cfg> (
             if !i_cm[l].valid || !i_cm[l].done {
                 outc[l] = Outcome::WAIT;
             } else if exc[l] {
-                outc[l] = Outcome::TRAP;
+                outc[l] = if i_exc.rec.dm ? Outcome::DEBUG : Outcome::TRAP;
             } else if poison[l] {
                 outc[l] = Outcome::REPLAY;
             } else if st_wait[l] || dr_wait[l] {
@@ -318,12 +357,14 @@ pub module commit::<CFG: core_cfg> (
             fin[l]    = rf || alone_e[l];
         }
         cut    = (alone_e | exc | poison) & ~HEAD;
-        retire = if irq_take ? 0 : tree_prefix_and::<CW>(ok & ~cut & ~(fin << 1));
+        retire = if irq_take || dm_take ? 0 : tree_prefix_and::<CW>(ok & ~cut & ~(fin << 1));
     }
 
-    let head_go    : logic = !irq_take && !kil[0] && lim_ok[0];
+    let head_go    : logic = !irq_take && !dm_take && !kil[0] && lim_ok[0];
     let trap_fire  : logic = head_go && outc[0] == Outcome::TRAP;
     let replay_fire: logic = head_go && outc[0] == Outcome::REPLAY;
+    let dbg_fire   : logic = head_go && outc[0] == Outcome::DEBUG;
+    let dm_redir   : logic = dm_take || dbg_fire;
 
     var rf_lane: logic<CW>;
     always_comb {
@@ -363,8 +404,10 @@ pub module commit::<CFG: core_cfg> (
     let new_pc : logic    <64>     = tree_onehot_mux::<CW, 64>(last, nxt_pc);
 
     always_comb {
-        o_flush.valid = irq_take || trap_fire || replay_fire || rf_any;
-        o_flush.kind  = if irq_take ?
+        o_flush.valid = dm_redir || irq_take || trap_fire || replay_fire || rf_any;
+        o_flush.kind  = if dm_redir ?
+            RedirKind::DEBUG
+        : if irq_take ?
             RedirKind::IRQ
         : if trap_fire ?
             RedirKind::TRAP
@@ -373,10 +416,10 @@ pub module commit::<CFG: core_cfg> (
         :
             rf_kind
         ;
-        o_flush.pc    = if irq_take || trap_fire ? i_trap_target : if replay_fire ? apc : rf_pc;
-        o_flush.ftq   = if irq_take ? 0 : rf_ftq;
-        o_flush.foff  = if irq_take ? 0 : rf_foff;
-        o_flush.taken = !irq_take && rf_tkn;
+        o_flush.pc    = if dm_redir ? i_dm_halt_pc : if irq_take || trap_fire ? i_trap_target : if replay_fire ? apc : rf_pc;
+        o_flush.ftq   = if irq_take || dm_redir ? 0 : rf_ftq;
+        o_flush.foff  = if irq_take || dm_redir ? 0 : rf_foff;
+        o_flush.taken = !irq_take && !dm_redir && rf_tkn;
     }
 
     let n_ret: logic<RC_W> = tree_popcount::<CW, RC_W>(retire);
@@ -396,6 +439,7 @@ pub module commit::<CFG: core_cfg> (
     var csr_ret: logic<CW>    ;
     var mret   : logic<CW>    ;
     var sret   : logic<CW>    ;
+    var dret   : logic<CW>    ;
     var fen_i  : logic<CW>    ;
     var ffl_v  : logic<CW>    ;
     var fsd_v  : logic<CW>    ;
@@ -405,8 +449,9 @@ pub module commit::<CFG: core_cfg> (
             let e         : RobEnt = i_cm[l].ent;
             sys_ret[l] = retire[l] && e.fu == FuKind::SYS;
             csr_ret[l] = sys_ret[l] && e.csr_wr;
-            mret[l]    = retire[l] && e.flush == FlushKind::XRET && !e.sret;
-            sret[l]    = retire[l] && e.flush == FlushKind::XRET && e.sret;
+            mret[l]    = retire[l] && e.flush == FlushKind::XRET && e.xret == XretKind::MRET;
+            sret[l]    = retire[l] && e.flush == FlushKind::XRET && e.xret == XretKind::SRET;
+            dret[l]    = retire[l] && e.flush == FlushKind::XRET && e.xret == XretKind::DRET;
             fen_i[l]   = retire[l] && e.fence_i;
             ffl_v[l]   = retire[l] && e.effect.fflags;
             fsd_v[l]   = retire[l] && e.effect.fs_dirty;
@@ -428,12 +473,15 @@ pub module commit::<CFG: core_cfg> (
         o_tlb_inv         = sys_q.inv;
         o_tlb_inv.valid   = |sys_ret && sys_q.valid && sys_q.inv.valid;
         o_head_retired    = retire[0];
-        o_rsv_clr         = trap_fire || irq_take || |mret || |sret || (|csr_ret && sys_q.csr_addr == 12'h180);
+        o_rsv_clr         = dm_redir || trap_fire || irq_take || |mret || |sret || |dret || (|csr_ret && sys_q.csr_addr == 12'h180);
         o_csr.wr_en       = |csr_ret;
         o_csr.wr_addr     = sys_q.csr_addr;
         o_csr.wr_data     = sys_q.csr_wdata;
         o_csr.mret        = |mret;
         o_csr.sret        = |sret;
+        o_csr.dret        = |dret;
+        o_csr.dm_enter    = dm_redir && !i_dm;
+        o_csr.dm_cause    = if dm_take ? 3'd3 : 3'd1;
         o_csr.instret_cnt = n_ret;
         o_csr.fflags_set  = |ffl_v;
         o_csr.fs_dirty    = |fsd_v;
@@ -450,12 +498,16 @@ pub module commit::<CFG: core_cfg> (
             boot_q    = 1'b1;
             order_q   = 0;
             irq_q     = 0;
+            dm_q      = 1'b0;
             sys_q     = 0;
             started_q = 1'b0;
         } else {
             irq_q  = i_irq;
+            dm_q   = i_dm_haltreq;
             boot_q = 1'b0;
-            if irq_take || trap_fire {
+            if dm_redir {
+                arch_pc_q = i_dm_halt_pc;
+            } else if irq_take || trap_fire {
                 arch_pc_q = i_trap_target;
             } else if |retire {
                 arch_pc_q = new_pc;
@@ -496,7 +548,9 @@ pub module commit::<CFG: core_cfg> (
             for l in 0..CW {
                 ret_q[l] = 0;
             }
+            ret_dm_q = 1'b0;
         } else {
+            ret_dm_q = i_dm;
             for l in 0..CW {
                 let c               : RobCm  = i_cm[l];
                 let mo              : MemObs = mem_obs[l];
@@ -563,8 +617,9 @@ pub module commit::<CFG: core_cfg> (
         }
     }
 
-    assign o_retire  = ret_q;
-    assign o_irq_evt = evt_q;
+    assign o_retire    = ret_q;
+    assign o_retire_dm = ret_dm_q;
+    assign o_irq_evt   = evt_q;
 
     // ---- Firing events ----
 
@@ -598,6 +653,12 @@ pub module commit::<CFG: core_cfg> (
             perf_q.rf_br_cm    = rf_any && rf_kind == RedirKind::BR_CM;
             perf_q.irq_take    = irq_take;
             perf_q.irq_started = irq_q.pending && irq_ok && started_q && !i_kill.valid;
+            perf_q.dm_halt     = dm_take;
+            perf_q.dm_ebreak   = dbg_fire && !i_dm;
+            perf_q.dm_reenter  = dbg_fire && i_dm;
+            perf_q.dm_exc      = trap_fire && i_dm;
+            perf_q.dm_dret     = |dret;
+            perf_q.dm_started  = dm_req && started_q && !i_kill.valid;
             perf_q.mispred     = |(retire & br_mis);
             perf_q.retire_none = !(|retire);
         }
@@ -613,6 +674,7 @@ pub module commit::<CFG: core_cfg> (
         i_cm                      ,
         i_kill                    ,
         i_trap_fire  : trap_fire  ,
+        i_dbg_fire   : dm_redir   ,
         i_replay_fire: replay_fire,
         i_irq_take   : irq_take   ,
         i_rf_lane    : rf_lane    ,

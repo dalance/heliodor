@@ -3,10 +3,10 @@
 //
 // Ports (timing contract):
 //   i_rd_addr/o_rd_data : combinational read of the live state
-//   i_wr_*, i_trap_*, i_mret_fire, i_sret_fire, i_fflags*, i_fs_dirty,
+//   i_wr_*, i_trap_*, i_*ret_fire, i_dm_*, i_fflags*, i_fs_dirty,
 //   i_instret_cnt       : retire-time inputs, applied on the edge; at most one
-//                         of {trap, xRET, CSR write} per cycle (commit's alone
-//                         and trap rules)
+//                         of {trap, xRET, CSR write, Debug Mode entry} per
+//                         cycle (commit's alone and trap rules)
 //   i_hart_id           : static, read as mhartid
 //   i_hpm_events        : registered here before counting
 //   all other outputs   : registered state or combinational views of it
@@ -27,6 +27,11 @@
 //   - a counter overflow pends LCOFI only when it sets OF (0 to 1)
 //   - i_fs_dirty marks mstatus.FS dirty (FP ops that do not accrue fflags)
 //   - o_data_priv is the privilege of loads and stores (MPP under MPRV)
+// Debug Mode (Sdext): i_dm_enter saves the cause, the privilege and dpc and
+// enters Debug Mode in M; i_dret_fire returns to dcsr.prv (clearing MPRV
+// below M). In Debug Mode MPRV applies only with dcsr.mprven. dcsr holds
+// ebreakm/s/u, mprven and prv; step, stepie, stopcount and stoptime read
+// zero. dcsr, dpc and dscratch0/1 are reachable in Debug Mode only (decode).
 pub module csr #(
     param INSTRET_CNT_W: u32       = 1                       , // ops retired per cycle, up to 2^W - 1
     param MISA         : bit  <64> = 64'h8000_0000_0034_1181 ,
@@ -62,6 +67,15 @@ pub module csr #(
     i_mret_fire: input logic,
     // SRET (commit-time): restore priv ← SPP, SIE ← SPIE
     i_sret_fire: input logic,
+
+    // Debug Mode entry and DRET (commit-time)
+    i_dm_enter  : input  logic    ,
+    i_dm_cause  : input  logic<3> ,
+    i_dm_pc     : input  logic<64>,
+    i_dret_fire : input  logic    ,
+    o_debug_mode: output logic    ,
+    o_dpc       : output logic<64>,
+    o_dcsr_ebreak: output logic<3>, // {ebreakm, ebreaks, ebreaku}
 
     // mtvec for trap redirect target
     o_mtvec    : output logic<64>,
@@ -338,6 +352,10 @@ pub module csr #(
     const ADDR_TIME      : logic<12> = 12'hC01; // user time (== mtime)
     const ADDR_CYCLE     : logic<12> = 12'hC00;
     const ADDR_INSTRET   : logic<12> = 12'hC02;
+    const ADDR_DCSR      : logic<12> = 12'h7B0;
+    const ADDR_DPC       : logic<12> = 12'h7B1;
+    const ADDR_DSCRATCH0 : logic<12> = 12'h7B2;
+    const ADDR_DSCRATCH1 : logic<12> = 12'h7B3;
 
     // M5.D current privilege level
     var priv: csr_pkg::PrivLevel;
@@ -346,6 +364,19 @@ pub module csr #(
     // this (not the live priv) for sync-exception delegation, so the eval order
     // of this block vs the core's commit comb cannot corrupt the decision.
     var priv_prev: csr_pkg::PrivLevel;
+
+    // === Debug Mode state ===
+    var debug_mode : logic   ;
+    var dcsr_eb    : logic<3>; // {ebreakm, ebreaks, ebreaku}
+    var dcsr_mprven: logic   ;
+    var dcsr_cause : logic<3>;
+    var dcsr_prv   : logic<2>;
+    var dpc        : logic<64>;
+    var dscratch0  : logic<64>;
+    var dscratch1  : logic<64>;
+    // debugver 4 (Debug Spec 1.0) and the stored fields.
+    let dcsr_rd: logic<64> = {32'd0, 4'd4, 12'd0, dcsr_eb[2], 1'b0, dcsr_eb[1:0], 3'd0, dcsr_cause, 1'b0, dcsr_mprven,
+        2'd0, dcsr_prv};
 
     // === Registered CSRs ===
     var mstatus : logic<64>;
@@ -641,6 +672,10 @@ pub module csr #(
             ADDR_TIME      : rd_data_w = i_mtime; // external clint mtime
             ADDR_CYCLE     : rd_data_w = mcycle; // alias
             ADDR_INSTRET   : rd_data_w = minstret;
+            ADDR_DCSR      : rd_data_w = dcsr_rd;
+            ADDR_DPC       : rd_data_w = dpc;
+            ADDR_DSCRATCH0 : rd_data_w = dscratch0;
+            ADDR_DSCRATCH1 : rd_data_w = dscratch1;
             default        : {
                 // P10 Zihpm counter/event ranges (index = addr[4:0]).
                 if i_rd_addr >= ADDR_MHPMC_LO && i_rd_addr <= ADDR_MHPMC_HI {
@@ -834,7 +869,10 @@ pub module csr #(
     assign o_scounteren = scounteren[31:0];
     assign o_menvcfg    = menvcfg;
     assign o_senvcfg    = senvcfg;
-    assign o_data_priv  = if mstatus[17] ? mstatus[12:11] as csr_pkg::PrivLevel : priv;
+    assign o_data_priv  = if mstatus[17] && (!debug_mode || dcsr_mprven) ? mstatus[12:11] as csr_pkg::PrivLevel : priv;
+    assign o_debug_mode  = debug_mode;
+    assign o_dpc         = dpc;
+    assign o_dcsr_ebreak = dcsr_eb;
 
     assign o_pmpcfg       = pmpcfg;
     assign o_pmpaddr      = pmpaddr;
@@ -896,6 +934,14 @@ pub module csr #(
             priv      = csr_pkg::PrivLevel::MACHINE;
             priv_prev = csr_pkg::PrivLevel::MACHINE;
             virt_prev = 1'b0;
+            debug_mode  = 1'b0;
+            dcsr_eb     = 3'd0;
+            dcsr_mprven = 1'b0;
+            dcsr_cause  = 3'd0;
+            dcsr_prv    = 2'b11;
+            dpc         = 64'd0;
+            dscratch0   = 64'd0;
+            dscratch1   = 64'd0;
             // M9.A.270: match v1 mstatus reset value.
             //   bits 35:34 SXL = 2 (= 64-bit S-mode XLEN)
             //   bits 33:32 UXL = 2 (= 64-bit U-mode XLEN)
@@ -985,7 +1031,19 @@ pub module csr #(
             // Phase 11-H3: i_trap_to_vs takes priority — a VS/VU trap delegated
             // by both medeleg and hedeleg/hideleg is taken in VS-mode, updating
             // the VS-level trap CSRs + vsstatus, with priv ← S(=VS) and V kept 1.
-            if i_trap_fire {
+            if i_dm_enter {
+                dcsr_cause = i_dm_cause;
+                dcsr_prv   = priv;
+                dpc        = i_dm_pc;
+                debug_mode = 1'b1;
+                priv       = csr_pkg::PrivLevel::MACHINE;
+            } else if i_dret_fire {
+                priv       = dcsr_prv as csr_pkg::PrivLevel;
+                debug_mode = 1'b0;
+                if dcsr_prv != 2'b11 {
+                    mstatus[17] = 1'b0; // MPRV
+                }
+            } else if i_trap_fire {
                 if i_trap_to_vs {
                     vsepc   = i_trap_pc;
                     vscause = i_trap_cause;
@@ -1233,6 +1291,16 @@ pub module csr #(
                     ADDR_VSATP     : vsatp      = i_wr_data;
                     ADDR_VSTIMECMP : vstimecmp  = i_wr_data; // Phase 11-H Sstc-in-VS
                     ADDR_MCOUNTEREN: mcounteren = {32'd0, i_wr_data[31:0]};
+                    ADDR_DCSR      : {
+                        dcsr_eb     = {i_wr_data[15], i_wr_data[13:12]};
+                        dcsr_mprven = i_wr_data[4];
+                        if i_wr_data[1:0] != 2'b10 {
+                            dcsr_prv = i_wr_data[1:0];
+                        }
+                    }
+                    ADDR_DPC      : dpc       = {i_wr_data[63:1], 1'b0};
+                    ADDR_DSCRATCH0: dscratch0 = i_wr_data;
+                    ADDR_DSCRATCH1: dscratch1 = i_wr_data;
                     default        : {
                         // P10 Zihpm: mhpmcounter / mhpmevent writes (index =
                         // addr[4:0]). The mhpmcounter write is reconciled with
