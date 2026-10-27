@@ -1,0 +1,136 @@
+// dm: the Debug Module registers and per-hart run state (Debug Spec 1.0).
+//
+// Ports (timing contract):
+//   i_dmi_raddr/o_dmi_rdata : combinational read decode of the DMI address
+//   i_dmi        : one DMI access per valid cycle (dmi_apb); writes take
+//                  effect on that edge
+//   i_halted     : a hart wrote its hartid to HALTED this cycle (dm_mem)
+//   i_resuming   : a hart wrote its hartid to RESUMING this cycle (dm_mem)
+//   i_hartid     : the hartid word of that write
+//   o_haltreq    : registered, per-hart halt request level
+//   o_resume     : registered, per-hart RESUME flag read by the debug ROM
+// Owns:
+//   - dmcontrol.dmactive = 0 holds every other bit of state at its reset
+//     value; a write that clears dmactive applies nothing else.
+//   - halted[h] is set by HALTED and cleared by RESUMING; the debug ROM
+//     writes HALTED on every pass of its wait loop, so a DM reset relearns
+//     the halted harts.
+//   - RESUME is raised only for a selected hart that is halted when
+//     resumereq is written (and haltreq is not written with it), and drops
+//     when that hart writes RESUMING, which also sets its resumeack.
+// Rationale:
+//   - hartsel keeps idx_w(N_HARTS) bits of hartsello (WARL), so a debugger
+//     finds the hart count by writing all ones; a selection past the last
+//     hart reads as nonexistent.
+//   - hartinfo reports no memory-mapped data registers (dataaccess = 0,
+//     datasize = 0): dataaddr must be reachable from x0 (within 2 KiB of
+//     address 0) and debug memory sits at DM_BASE above the boot ROM.
+module dm #(
+    param N_HARTS: u32 = 1,
+) (
+    clk        : input  clock          ,
+    rst        : input  reset          ,
+    i_dmi_raddr: input  logic<7>       ,
+    o_dmi_rdata: output logic<32>      ,
+    i_dmi      : input  dm_pkg::DmiReq ,
+    i_halted   : input  logic          ,
+    i_resuming : input  logic          ,
+    i_hartid   : input  logic<32>      ,
+    o_haltreq  : output logic<N_HARTS> ,
+    o_resume   : output logic<N_HARTS> ,
+) {
+    const HSEL_W: u32 = tag_pkg::idx_w(N_HARTS);
+
+    var active_q   : logic         ;
+    var hartsel_q  : logic<HSEL_W> ;
+    var haltreq_q  : logic<N_HARTS>;
+    var halted_q   : logic<N_HARTS>;
+    var resumeack_q: logic<N_HARTS>;
+    var resume_q   : logic<N_HARTS>;
+
+    let dmc_wr   : logic         = i_dmi.valid && i_dmi.write && i_dmi.addr == dm_pkg::DMI_DMCONTROL;
+    let active_d : logic         = if dmc_wr ? i_dmi.data[0] : active_q;
+    let wsel     : logic<HSEL_W> = i_dmi.data[16+:HSEL_W];
+    let w_haltreq: logic         = i_dmi.data[31];
+    let w_resume : logic         = i_dmi.data[30] && !i_dmi.data[31];
+
+    // One-hot over the harts: the event's hartid, the written hartsel and
+    // the current one.
+    var evt_oh : logic<N_HARTS>;
+    var wsel_oh: logic<N_HARTS>;
+    var sel_oh : logic<N_HARTS>;
+    always_comb {
+        for h in 0..N_HARTS {
+            evt_oh[h]  = i_hartid == h;
+            wsel_oh[h] = wsel == h;
+            sel_oh[h]  = hartsel_q == h;
+        }
+    }
+    let hit_halted  : logic<N_HARTS> = if i_halted ? evt_oh : '0;
+    let hit_resuming: logic<N_HARTS> = if i_resuming ? evt_oh : '0;
+    let w_sel       : logic<N_HARTS> = if dmc_wr ? wsel_oh : '0;
+    let rq          : logic<N_HARTS> = if w_resume ? w_sel : '0;
+
+    always_ff {
+        if_reset {
+            active_q    = 1'b0;
+            hartsel_q   = '0;
+            haltreq_q   = '0;
+            halted_q    = '0;
+            resumeack_q = '0;
+            resume_q    = '0;
+        } else {
+            active_q = active_d;
+            if !active_d {
+                hartsel_q   = '0;
+                haltreq_q   = '0;
+                halted_q    = '0;
+                resumeack_q = '0;
+                resume_q    = '0;
+            } else {
+                if dmc_wr {
+                    hartsel_q = wsel;
+                    haltreq_q = (haltreq_q & ~w_sel) | (if w_haltreq ? w_sel : '0);
+                }
+                halted_q    = (halted_q | hit_halted) & ~hit_resuming;
+                resumeack_q = (resumeack_q & ~rq) | hit_resuming;
+                resume_q    = (resume_q | (rq & halted_q)) & ~hit_resuming;
+            }
+        }
+    }
+
+    let exist : logic = (hartsel_q as u32) <: N_HARTS;
+    let halted: logic = exist && ((halted_q & sel_oh) != '0);
+    let ack   : logic = exist && ((resumeack_q & sel_oh) != '0);
+
+    var dmstatus: logic<32>;
+    always_comb {
+        dmstatus      = 32'd0;
+        dmstatus[3:0] = 4'd3; // version 1.0
+        dmstatus[7]   = 1'b1; // authenticated
+        dmstatus[8]   = halted;
+        dmstatus[9]   = halted;
+        dmstatus[10]  = exist && !halted;
+        dmstatus[11]  = exist && !halted;
+        dmstatus[14]  = !exist;
+        dmstatus[15]  = !exist;
+        dmstatus[16]  = ack;
+        dmstatus[17]  = ack;
+    }
+
+    var dmcontrol: logic<32>;
+    always_comb {
+        dmcontrol             = 32'd0;
+        dmcontrol[0]          = active_q;
+        dmcontrol[16+:HSEL_W] = hartsel_q;
+    }
+
+    assign o_dmi_rdata = case i_dmi_raddr {
+        dm_pkg::DMI_DMCONTROL: dmcontrol,
+        dm_pkg::DMI_DMSTATUS : dmstatus,
+        dm_pkg::DMI_HARTINFO : 32'h0010_0000, // nscratch = 1
+        default              : 32'd0,
+    };
+    assign o_haltreq = haltreq_q;
+    assign o_resume  = resume_q;
+}

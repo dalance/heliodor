@@ -1,0 +1,147 @@
+// dm_seq: DMI script player, an APB4 requester for the SoC's DMI port.
+//
+// FILE is a $readmemh image of 128-bit commands (test/debug/dmi/dmi_asm.py):
+// {op[7:0], addr[7:0], 16'd0, a[31:0], b[31:0], c[31:0]}.
+//   END  (0)              : stop, o_done = 1
+//   WR   (1) addr a b     : write a with strobes b[3:0]; pslverr must be
+//                           set exactly when the strobes are not all set
+//   RD   (2) addr a b     : read; (rdata & b) != a is a mismatch
+//   POLL (3) addr a b c   : read until (rdata & b) == a, at most c reads;
+//                           running out is a mismatch
+//   WAIT (4) a            : idle a cycles
+//   MARK (5) a            : print a
+// A read with pslverr is a mismatch. Commands
+// run back to back: a transfer's SETUP follows the previous completion.
+module dm_seq #(
+    param FILE : string = "" ,
+    param DEPTH: u32    = 256,
+) (
+    clk      : input  clock    ,
+    rst      : input  reset    ,
+    o_psel   : output logic    ,
+    o_penable: output logic    ,
+    o_pwrite : output logic    ,
+    o_paddr  : output logic<9> ,
+    o_pwdata : output logic<32>,
+    o_pstrb  : output logic<4> ,
+    i_pready : input  logic    ,
+    i_prdata : input  logic<32>,
+    i_pslverr: input  logic    ,
+    o_done   : output logic    ,
+    o_fail   : output logic    ,
+    o_rd_n   : output logic<32>, // completed read transfers
+    o_wr_n   : output logic<32>, // completed write transfers
+) {
+    const OP_END : logic<8> = 8'd0;
+    const OP_WR  : logic<8> = 8'd1;
+    const OP_RD  : logic<8> = 8'd2;
+    const OP_POLL: logic<8> = 8'd3;
+    const OP_WAIT: logic<8> = 8'd4;
+    const OP_MARK: logic<8> = 8'd5;
+
+    #[allow(initial_assign)]
+    var prog: logic<128> [DEPTH];
+    initial {
+        $readmemh(FILE, prog);
+    }
+
+    enum St: logic<2> {
+        FETCH,
+        SETUP,
+        ACCESS,
+        IDLE,
+    }
+
+    var st_q  : St       ;
+    var pc_q  : logic<32>;
+    var cnt_q : logic<32>;
+    var done_q: logic    ;
+    var fail_q: logic    ;
+    var rd_n_q: logic<32>;
+    var wr_n_q: logic<32>;
+
+    let ins : logic<128> = prog[pc_q];
+    let op  : logic<8>   = ins[127:120];
+    let addr: logic<7>   = ins[118:112];
+    let a   : logic<32>  = ins[95:64];
+    let b   : logic<32>  = ins[63:32];
+    let c   : logic<32>  = ins[31:0];
+
+    let xfer : logic = op == OP_WR || op == OP_RD || op == OP_POLL;
+    let match: logic = (i_prdata & b) == a;
+
+    always_ff {
+        if_reset {
+            st_q   = St::FETCH;
+            pc_q   = 32'd0;
+            cnt_q  = 32'd0;
+            done_q = 1'b0;
+            fail_q = 1'b0;
+            rd_n_q = 32'd0;
+            wr_n_q = 32'd0;
+        } else {
+            case st_q {
+                St::FETCH: if !done_q {
+                    if op == OP_END {
+                        done_q = 1'b1;
+                    } else if xfer {
+                        st_q  = St::SETUP;
+                        cnt_q = 32'd1;
+                    } else if op == OP_WAIT {
+                        st_q  = St::IDLE;
+                        cnt_q = a;
+                    } else {
+                        if op == OP_MARK {
+                            $display("dm_seq: MARK %d", a);
+                        } else {
+                            $display("dm_seq: bad op %h at %d", op, pc_q);
+                            fail_q = 1'b1;
+                        }
+                        pc_q = pc_q + 32'd1;
+                    }
+                }
+                St::SETUP: st_q = St::ACCESS;
+                St::ACCESS: if i_pready {
+                    if op == OP_WR {
+                        wr_n_q = wr_n_q + 32'd1;
+                    } else {
+                        rd_n_q = rd_n_q + 32'd1;
+                    }
+                    if i_pslverr != (op == OP_WR && b[3:0] != 4'hf) {
+                        $display("dm_seq: pslverr %b at %d", i_pslverr, pc_q);
+                        fail_q = 1'b1;
+                    }
+                    if op == OP_POLL && !match && cnt_q != c {
+                        st_q  = St::SETUP;
+                        cnt_q = cnt_q + 32'd1;
+                    } else {
+                        if op != OP_WR && !match {
+                            $display("dm_seq: mismatch at %d addr %h: read %h mask %h expect %h", pc_q, addr, i_prdata,
+                                b, a);
+                            fail_q = 1'b1;
+                        }
+                        st_q = St::FETCH;
+                        pc_q = pc_q + 32'd1;
+                    }
+                }
+                default: if cnt_q == 32'd0 {
+                    st_q = St::FETCH;
+                    pc_q = pc_q + 32'd1;
+                } else {
+                    cnt_q = cnt_q - 32'd1;
+                }
+            }
+        }
+    }
+
+    assign o_psel    = st_q == St::SETUP || st_q == St::ACCESS;
+    assign o_penable = st_q == St::ACCESS;
+    assign o_pwrite  = op == OP_WR;
+    assign o_paddr   = {addr, 2'b00};
+    assign o_pwdata  = if op == OP_WR ? a : 32'd0;
+    assign o_pstrb   = if op == OP_WR ? b[3:0] : 4'h0;
+    assign o_done    = done_q;
+    assign o_fail    = fail_q;
+    assign o_rd_n    = rd_n_q;
+    assign o_wr_n    = wr_n_q;
+}

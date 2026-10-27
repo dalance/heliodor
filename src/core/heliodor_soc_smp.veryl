@@ -20,6 +20,9 @@
 // Per-hart instruction fetch (o_imem_*) and instruction PTW (o_iptw_*) stay
 // per-hart and are served by the tb. Coherence: mem_ctrl drives precise per-hart
 // invalidates from the L2 directory (see core_inv_valid below).
+//
+// A new-core SoC also holds the Debug Module (dmi_apb, dm, dm_mem) behind
+// the APB DMI port; debug memory sits on the bus channels like the CLINT.
 pub module heliodor_soc_smp #(
     param N_HARTS    : u32                            = 2                    ,
     param RESET_PC   : u64                            = 64'h8000_0000        ,
@@ -38,6 +41,9 @@ pub module heliodor_soc_smp #(
     },
     // Write-buffer entries of the new-core AXI master (mem_ctrl WB_N).
     param AXI_WB_N: u32 = 2 * N_HARTS,
+    // Base of debug memory (new cores): PMA_REGIONS must map the 4 KiB at
+    // DM_BASE (code) and DM_BASE + 0x1000 (data) as target DEBUG.
+    param DM_BASE: bit<56> = 56'h4000,
     // AXI ID width of the new-core DRAM port: the ARID is the mem_ctrl slot.
     const AXI_ID_W: u32 = $clog2(N_HARTS * 2),
 ) (
@@ -203,6 +209,20 @@ pub module heliodor_soc_smp #(
     i_ext_irq_src: input logic<32> = 0,
     // Device-side CLINT/PLIC/UART accesses of this cycle: [0] read, [1] write.
     o_io_obs: output soc_pkg::IoObs [2],
+    // Debug Module domain reset (power-on only) and its APB4 DMI port. V14
+    // has no Debug Module: pready = 1, prdata = 0, pslverr = 0.
+    i_dm_rst    : input  reset          ,
+    i_dm_psel   : input  logic          ,
+    i_dm_penable: input  logic          ,
+    i_dm_pwrite : input  logic          ,
+    i_dm_paddr  : input  logic<9>       ,
+    i_dm_pwdata : input  logic<32>      ,
+    i_dm_pstrb  : input  logic<4>       ,
+    i_dm_pprot  : input  logic<3>       ,
+    o_dm_pready : output logic          ,
+    o_dm_prdata : output logic<32>      ,
+    o_dm_pslverr: output logic          ,
+    o_dm_obs    : output soc_pkg::DmObs ,
 ) {
     // Per-hart core <-> SoC dmem wires (pre-decode, flat DRAM+MMIO).
     var c_dmem_addr    : logic<64> [N_HARTS]    ;
@@ -238,9 +258,11 @@ pub module heliodor_soc_smp #(
     var in_uart_w : logic [N_HARTS];
     var in_plic_w : logic [N_HARTS];
     var w_dram: logic [N_HARTS];
+    var in_dm_w: logic [N_HARTS];
     for h in 0..N_HARTS :gen_wdec {
         let w_attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(c_dmemw_addr[h][55:0], PMA_REGIONS);
-        assign w_dram[h] = w_attr.backed && (w_attr.target == pma_pkg::Target::DRAM);
+        assign w_dram[h]  = w_attr.backed && (w_attr.target == pma_pkg::Target::DRAM);
+        assign in_dm_w[h] = AXI && w_attr.backed && (w_attr.target == pma_pkg::Target::DEBUG);
     }
     for h in 0..N_HARTS :gen_dec {
         assign in_dram[h]    = c_dmem_addr[h][31];
@@ -331,18 +353,25 @@ pub module heliodor_soc_smp #(
     var l2_wcadd_hart: logic<3>;
     var l2_wcadd_own : logic   ;
     // A new core's single beat to DRAM or ROM is an uncached AXI read in
-    // mem_ctrl; only its MMIO single beats use the bus read channel.
+    // mem_ctrl; its MMIO and debug memory single beats use the bus read
+    // channel.
     var d_on_axi: logic [N_HARTS];
     var i_on_axi: logic [N_HARTS];
     var d_rom   : logic [N_HARTS];
     var i_rom   : logic [N_HARTS];
+    var in_dm   : logic [N_HARTS];
+    var in_dm_i : logic [N_HARTS];
     for h in 0..N_HARTS :gen_axidec {
         let d_attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(c_dmem_addr[h][55:0], PMA_REGIONS);
         let i_attr: pma_pkg::PmaAttr = pma_check::<PMA_N>(c_imemr_addr[h][55:0], PMA_REGIONS);
-        assign d_on_axi[h] = d_attr.backed && (d_attr.target != pma_pkg::Target::IO);
-        assign i_on_axi[h] = i_attr.backed && (i_attr.target != pma_pkg::Target::IO);
+        assign d_on_axi[h] = d_attr.backed && (d_attr.target == pma_pkg::Target::DRAM
+            || d_attr.target == pma_pkg::Target::ROM);
+        assign i_on_axi[h] = i_attr.backed && (i_attr.target == pma_pkg::Target::DRAM
+            || i_attr.target == pma_pkg::Target::ROM);
         assign d_rom[h]    = d_attr.target == pma_pkg::Target::ROM;
         assign i_rom[h]    = i_attr.target == pma_pkg::Target::ROM;
+        assign in_dm[h]    = AXI && d_attr.backed && (d_attr.target == pma_pkg::Target::DEBUG);
+        assign in_dm_i[h]  = AXI && i_attr.backed && (i_attr.target == pma_pkg::Target::DEBUG);
     }
     for h in 0..N_HARTS :gen_busin {
         // The bus read channel carries the LEGACY combinational single beats:
@@ -946,7 +975,7 @@ pub module heliodor_soc_smp #(
     :
         mt_wrap
     ;
-    always_ff {
+    always_ff (clk, rst) {
         if_reset {
             mt_acc_q = 32'd0;
         } else if mt_wrap {
@@ -1024,7 +1053,7 @@ pub module heliodor_soc_smp #(
     );
 
     var uart_wr_n: logic<32>;
-    always_ff {
+    always_ff (clk, rst) {
         if_reset {
             uart_wr_n = 32'd0;
         } else if UART_WRCNT && uart_wen_w {
@@ -1066,6 +1095,87 @@ pub module heliodor_soc_smp #(
     assign o_io_obs[1] = soc_pkg::IoObs'{valid: io_wen, write: 1'b1, hart: io_whart, addr: bus_dramw_addr,
         data: bus_dram_wdata[bus_dramw_addr[5:3]], strb: io_wstrb};
 
+    // Debug Module (new cores). Debug memory sits on the bus channels like
+    // the CLINT, with its own read and write address ports.
+    var dm_rdata: logic<64>;
+    if AXI :g_dm {
+        var dm_wen: logic;
+        always_comb {
+            dm_wen = 1'b0;
+            for h in 0..N_HARTS {
+                if c_dmem_wen[h] && in_dm_w[h] {
+                    dm_wen = 1'b1;
+                }
+            }
+        }
+        var dmi_raddr: logic<7>      ;
+        var dmi_rdata: logic<32>     ;
+        var dmi_req  : dm_pkg::DmiReq;
+        var dm_halted: logic         ;
+        var dm_resumg: logic         ;
+        var dm_hartid: logic<32>     ;
+        var dm_resume: logic<N_HARTS>;
+        var dm_hreq  : logic<N_HARTS>;
+        inst u_dmi: dmi_apb (
+            clk                     ,
+            rst      : i_dm_rst     ,
+            i_psel   : i_dm_psel    ,
+            i_penable: i_dm_penable ,
+            i_pwrite : i_dm_pwrite  ,
+            i_paddr  : i_dm_paddr   ,
+            i_pwdata : i_dm_pwdata  ,
+            i_pstrb  : i_dm_pstrb   ,
+            o_pready : o_dm_pready  ,
+            o_prdata : o_dm_prdata  ,
+            o_pslverr: o_dm_pslverr ,
+            o_raddr  : dmi_raddr    ,
+            i_rdata  : dmi_rdata    ,
+            o_req    : dmi_req      ,
+        );
+        inst u_dm: dm #(
+            N_HARTS: N_HARTS,
+        ) (
+            clk                      ,
+            rst        : i_dm_rst    ,
+            i_dmi_raddr: dmi_raddr   ,
+            o_dmi_rdata: dmi_rdata   ,
+            i_dmi      : dmi_req     ,
+            i_halted   : dm_halted   ,
+            i_resuming : dm_resumg   ,
+            i_hartid   : dm_hartid   ,
+            o_haltreq  : dm_hreq     ,
+            o_resume   : dm_resume   ,
+        );
+        inst u_dm_mem: dm_mem #(
+            N_HARTS: N_HARTS,
+        ) (
+            i_raddr   : bus_dramr_addr[12:0] - DM_BASE[12:0],
+            o_rdata   : dm_rdata                            ,
+            i_wen     : dm_wen                              ,
+            i_waddr   : bus_dramw_addr[12:0] - DM_BASE[12:0],
+            i_wdata   : bus_dram_wdata[bus_dramw_addr[5:3]] ,
+            i_resume  : dm_resume                           ,
+            o_halted  : dm_halted                           ,
+            o_resuming: dm_resumg                           ,
+            o_hartid  : dm_hartid                           ,
+        );
+        always_comb {
+            o_dm_obs         = 0 as soc_pkg::DmObs;
+            o_dm_obs.dmi_rd  = dmi_req.valid && !dmi_req.write;
+            o_dm_obs.dmi_wr  = dmi_req.valid && dmi_req.write;
+            o_dm_obs.dmi_err = o_dm_pslverr;
+            for h in 0..N_HARTS {
+                o_dm_obs.haltreq[h] = dm_hreq[h];
+            }
+        }
+    } else {
+        assign dm_rdata     = 64'd0;
+        assign o_dm_pready  = 1'b1;
+        assign o_dm_prdata  = 32'd0;
+        assign o_dm_pslverr = 1'b0;
+        assign o_dm_obs     = 0 as soc_pkg::DmObs;
+    }
+
     // Per-hart load data: CLINT / UART / PLIC / DRAM (mem_ctrl per-hart stream
     // beat) / firmware-ROM (external comb port, legacy path — only the
     // granted hart's dcache advances on it).
@@ -1081,6 +1191,8 @@ pub module heliodor_soc_smp #(
             {56'd0, uart_rdata}
         : if in_plic[h] ?
             plic_rdata
+        : if in_dm[h] ?
+            dm_rdata
         : if c_dmem_line[h] ?
             ctrl_hrdata[h]
         : if AXI ?
@@ -1092,7 +1204,13 @@ pub module heliodor_soc_smp #(
     // A new core's I slot: a single beat reads the external port.
     var core_imemr_rdata: logic<64> [N_HARTS];
     for h in 0..N_HARTS :gen_irdata {
-        assign core_imemr_rdata[h] = if c_imemr_line[h] || AXI ? ctrl_hrdata[N_HARTS + h] : i_dmem_rdata;
+        assign core_imemr_rdata[h] = if in_dm_i[h] ?
+            dm_rdata
+        : if c_imemr_line[h] || AXI ?
+            ctrl_hrdata[N_HARTS + h]
+        :
+            i_dmem_rdata
+        ;
     }
 
     // N cores. HART_ID = loop index → mhartid. imem/iptw per-hart (tb-served).

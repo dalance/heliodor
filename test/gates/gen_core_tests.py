@@ -11,7 +11,8 @@ test/golden/arch/<suite>/<name>.ck.hex. The harness folds the checker and the
 lockstep mismatch into o_pass/o_fail, so the wrapper only asserts o_pass.
 
 Entries with lockstep=0 are always pass/fail; mtime=instret selects the
-retire-count mtime; irq=<mask> pulses those PLIC sources. --ignored marks
+retire-count mtime; irq=<mask> pulses those PLIC sources; dmi=<path> plays a
+DMI script on the Debug Module. --ignored marks
 every test `#[ignore]` (suites too long for the default run, e.g. ACT4: see
 test/gates/run_act.py).
 
@@ -42,6 +43,8 @@ def params(e, core, lockstep):
         p += [("MTIME_SRC", "soc_pkg::MTIME_INSTRET"), ("MTIME_DIV", "10")]
     if e.irq:
         p += [("EXT_IRQ_SRC", f"32'h{e.irq:08x}")]
+    if e.dmi:
+        p += [("DMI_EN", "1'b1"), ("DMI_FILE", f'"{e.dmi}"')]
     if lockstep:
         p += [("CK_EN", "1"), ("CK_FILE", f'"{e.ck_file}"')]
     kw = max(len(k) for k, _ in p)

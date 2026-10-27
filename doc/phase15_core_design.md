@@ -3575,7 +3575,7 @@ o_evt : PtwEvent  // {valid, key: PtwKey = {vpn, regime}, fault} (section 5.10);
 | PLIC | 0x0C00_0000 | 4 MiB | 0x1000_0000 | IO | 0 | 0 | 0 | 0 | 1 | NONE | 0 | 0 | 0 |
 | UART | 0x1000_0000 | 4 KiB | 0x100 | IO | 0 | 0 | 0 | 0 | 1 | NONE | 0 | 0 | 0 |
 | DRAM | 0x8000_0000 | 32 MiB | 0x1FFF000 | DRAM | 1 | 1 | 1 | 1 | 0 | FULL | 1 | 1 | 1 |
-| DM code (MD) | `DM_BASE` (推奨 0x0000_4000、U38) | 4 KiB | (無し) | DEBUG | 0 | 0 | 1 | 1 | 0 | NONE | 0 | 0 | 0 |
+| DM code (MD) | `DM_BASE` (0x0000_4000、U38) | 4 KiB | (無し) | DEBUG | 0 | 0 | 1 | 1 | 0 | NONE | 0 | 0 | 0 |
 | DM data (MD) | `DM_BASE` + 0x1000 | 4 KiB | (無し) | DEBUG | 0 | 0 | 0 | 0 | 1 | NONE | 0 | 0 | 0 |
 
 それ以外の PA はすべて hole であり、アクセス fault になる (§5.11 PM4)。DM の 2 領域は `MAP_BOOT`、`MAP_ARCH`、`MAP_LITMUS` のすべてに入れ、Debug Mode の外からのアクセスは target DEBUG の規則でアクセス fault になる (§D.8)。DTS と `sail.json` には載せず、PM6 の照合は target DEBUG の領域を外す。
@@ -3944,6 +3944,9 @@ SoC の外部ポート (DM のドメイン):
 - 存在しないアドレスは 0 を読み、書き込みを捨てる (spec)。`pslverr` は pstrb の部分書き込みにしか使わない。
 - 非同期の clock domain への橋渡し、JTAG DTM、APB の address decode (`psel` の生成) は SoC を使う側の責任である。
 - 統合 SoC の既存の harness はすべて `i_dm_psel = 0`、`i_dm_rst = rst` を明示的に接続する (検証計画 §2.1、新規ファイルの missing_port 警告 0)。
+- 【MD 手順 2 で決定】`dmi_apb` は APB の相だけを持ち、DMI の読みの decode は `dm` が組合せで返す (`o_raddr`/`i_rdata`)。`dmi_apb` は最初の ACCESS のサイクルにその値を登録し、2 つ目の ACCESS のサイクルに 1 サイクルの `DmiReq` を `dm` に出す。部分書き込みは `DmiReq` を出さない。SoC は `i_dm_rst` を DM のドメイン (`dmi_apb`、`dm`) にだけ配り、SoC 自身の `always_ff` は `(clk, rst)` を明示する (reset が 2 本になるため)。`i_dm_pprot` は受けて捨てる。
+- 【MD 手順 2 で決定】debug memory (`dm_mem`) は SoC の bus の read と write の channel に CLINT と同じ形でつなぐ。新コアの枝は PMA の target DEBUG を見て、DEBUG の single beat を AXI ではなく bus の read channel に出し (`d_on_axi`/`i_on_axi` を DRAM と ROM に限定)、読みデータを D と I の両方の読み口に mux する。`dm_mem` は読みと書きの番地を別に持つので、write grant の条件 (`wgrant_ok`) に項を足さない。DEBUG の領域に触れない限り、bus と mem_ctrl の振る舞いは MD の前と同じである (§9.3 の idle 等価)。ただし手順 3 で D.8 の規則 (Debug Mode の外の target DEBUG はアクセス fault) が入るまでは、core から見た DM の 2 領域は hole ではなく通常の uncached 領域で、wrong path の fetch も bus に出うる。
+- 【MD 手順 2 で決定】`dm` の hart ごとの haltreq は、core の受け口 (`i_dm_haltreq`、手順 3) ができるまで SoC の観測出力 `o_dm_obs.haltreq` にだけ出し、tb の `chk_dm` が読む。`o_dm_obs` (`soc_pkg::DmObs`) は手順 2 では DMI の読み、書き、部分書き込みの事象と haltreq を持ち、D.15 の残りの事象は機能と同じ手順で足す。
 
 ### D.4 core の Debug Mode: 精密な commit 時の事象
 
@@ -4091,7 +4094,7 @@ DM と core の間の配線は hart ごとに次だけである:
 
 【決定】halt と resume の handshake は debug memory の flag だけで行い、halted/running/resumeack の専用の配線を持たない。理由: hart の入場は必ず debug ROM の実行を経るので、「halted」を ROM が HALTED を書いた時点と定義すれば、spec の意味 (hart が DM の指示を待っている) にそのまま一致する。core は ROM の存在を知らず、入場、dret、Debug Mode の規則だけを持つ。
 
-debug memory の配置 (`DM_BASE` は SoC のパラメータ。値は U38、推奨 0x0000_4000):
+debug memory の配置 (`DM_BASE` は SoC のパラメータ。値は U38 で 0x0000_4000 に決定):
 
 | 領域 | 範囲 | PMA (§S.2) | 中身 |
 |---|---|---|---|
@@ -4099,13 +4102,27 @@ debug memory の配置 (`DM_BASE` は SoC のパラメータ。値は U38、推�
 | DM data | `DM_BASE + 0x1000` から 4 KiB | target DEBUG、uncached、io_ordered | data0-1、hart ごとの flag (GO、RESUME)、hart が書く HALTED、GOING、RESUMING、EXCEPTION |
 
 - 2 領域に分けるのは、§S.2 の不変条件 (`executable=1` なら `idempotent=1`、領域の最小単位 4 KiB) を満たしつつ、hart が書く flag を IO (non-posted、1 回だけ) にするためである。hart の data 領域へのアクセスは `io_unit` が head で行い、DM code の fetch は ROM と同じく I read slot の single beat で行う (§S.4)。
+- 【MD 手順 2 で決定】(U38) 領域内の offset (`DM_BASE` から。`dm_pkg` と `src/peripheral/dm/dm_rom.S` が同じ値を持つ):
 
-ROM の手順 (命令列は U38 で決める。spike の DM と同じ流れ):
+  | offset | 中身 | 手順 |
+  |---|---|---|
+  | 0x000 | halt の入口 (`i_dm_halt_pc = DM_BASE`) | 2 (ROM)、3 (配線) |
+  | 0x004 | 例外の入口 (`i_dm_exc_pc = DM_BASE + 4`) | 2 (ROM)、3 (配線) |
+  | 0x000-0x2FF | debug ROM (今は 76 語) | 2 |
+  | 0x300- | ABS、その直後に progbuf 8 語と impebreak の ebreak。語数と詰め方は手順 5 で決める | 5 |
+  | 0x1000、0x1004 | data0、data1 | 5 |
+  | 0x1100、0x1104、0x1108、0x110C | hart が書く HALTED、GOING、RESUMING、EXCEPTION (32 bit の語) | 2 (HALTED、RESUMING)、5 (GOING、EXCEPTION) |
+  | 0x1400 + h | hart h の flag の byte。bit 0 が GO、bit 1 が RESUME (8 hart で 1 dword) | 2 (RESUME)、5 (GO) |
+
+  ROM は位置独立で、`auipc` で自分の位置から data 領域 (+0x1000) を指す。理由: ROM の命令語が `DM_BASE` に依存しないので、ROM を `DM_BASE` ごとに作り直さずに済む。x0 を base にした絶対番地 (spike の形) は ±2 KiB にしか届かず、boot ROM が [0, 0x4000) を占めるので使えない。そのため ROM は base に s1 を使い、s0 と s1 の両方を dscratch0/1 に退避する。ROM の data 領域へのアクセスは spike の ROM と同じく `dcsr.mprven` を一時的に落として行う (mstatus.MPRV が M の物理番地から外さないように)。命令列は `dm_rom.S` が正本で、`gen_dm_rom.py` が `dm_rom_pkg` の定数を生成する。
+- 【MD 手順 2 で決定】(U38) `hartinfo` は `nscratch = 1`、`dataaccess = 0`、`datasize = 0`、`dataaddr = 0` とする。理由: spec の `dataaddr` は x0 を base にした 12 bit の符号付きの絶対番地で、`DM_BASE + 0x1000` の data0 は表せない。dataaccess = 1 で番地を偽ると、OpenOCD は data を scratch として使う progbuf (`scratch_reserve`) で誤った番地を読み書きする。dataaccess = 0 なら OpenOCD は progbuf か work area を scratch に使い、RV64GC では FPR の読み書きも `fmv` で済む。data0/data1 は ROM と生成コードのために debug memory に置いたままにする (デバッガに公表しないだけ)。`nscratch` は U38 の推奨どおり 1 (ROM と例外の入口は dscratch を command の間の一時領域としてしか使わない)。
+
+ROM の手順 (命令列は `dm_rom.S`、U38。spike の DM と同じ流れ):
 
 1. 入口 (`i_dm_halt_pc`。入場と Debug Mode 中の ebreak の両方): s0 (と s1) を dscratch0/1 に退避し、`fence` で自分の committed store と queued atomic を見えるようにする (D.10)。mhartid を HALTED に書く。
 2. 自分の flag を IO load の loop で待つ。GO なら GOING を書き、`fence.i` の後に s0/s1 を戻して ABS へ飛ぶ。RESUME なら RESUMING を書き、`fence.i` の後に s0/s1 を戻して dret を実行する。
 3. ABS の最後 (postexec が無ければ ABS の直後の ebreak、あれば progbuf の後の impebreak) の ebreak は Debug Mode の ebreak なので、入口 (1) に戻る。
-4. 例外の入口 (`i_dm_exc_pc`): s0 を退避して EXCEPTION を書き、s0 を戻してから入口 (1) に戻る (入口が hart の s0 を退避し直せるように)。
+4. 例外の入口 (`i_dm_exc_pc`): s0 と s1 を退避して EXCEPTION を書き、s0 と s1 を戻してから入口 (1) に戻る (入口が hart の s0/s1 を退避し直せるように)。
 
 | hart の書き込み | DM の解釈 |
 |---|---|
@@ -4114,8 +4131,12 @@ ROM の手順 (命令列は U38 で決める。spike の DM と同じ流れ):
 | RESUMING | RESUME を下ろし、halted := 0、resumeack := 1 |
 | EXCEPTION | cmderr := 3 (exception)、busy := 0 |
 
+- 【MD 手順 2 で決定】hart ごとの状態 (halted、resumeack、RESUME と GO の flag) は `dm` が持ち、`dm_mem` は状態を持たない bus の slave (ROM と flag の読み、hart の書き込みの decode) にする。理由: dmactive = 0 と DM の reset で消える状態を 1 か所に置ける。hartid が `N_HARTS` 以上の書き込みは捨てる。
+- 【MD 手順 2 で決定】resumereq は、書き込みの時点で halted の選択 hart にだけ RESUME を立て、選択 hart の resumeack は halted かどうかによらず下ろす (spec の文言どおり。haltreq = 1 と同時の resumereq は無視する)。spike は走っている hart にも RESUME を立てるが、それでは次の halt の直後に hart が勝手に再開する。
+- 【MD 手順 2 で決定】選択した hart が存在しないとき、dmstatus は anynonexistent と allnonexistent だけを立て、他の all* と any* は 0 にする (空集合の「all」を真にしない)。
+
 - abstract command: Access Register の GPR (0x1000-0x101F)、FPR (0x1020-0x103F)、CSR (0x0000-0x0FFF) を、aarsize 2 と 3、transfer、write、postexec で受ける。aarpostincrement と 128 bit は持たない (cmderr = 2)。ROM が使う s0/s1 は ABS に入る前に戻っているので、progbuf は hart の GPR をそのまま見る (spec の要求)。生成コードが s0/s1 を対象にするときと、base の作り方に使う dscratch の本数と `hartinfo.nscratch` は U38。FPR と FP CSR は FS = Off なら不正命令になり cmderr = 3 を返す (デバッガが mstatus.FS を上げる。spec が許す振る舞い)。
-- DM の固定値: `progbufsize = 8`、`impebreak = 1`、`datacount = 2` (RV64 の 64 bit の値を data0/data1 で運ぶ)、`hartinfo.dataaccess = 1` (data は hart のメモリ空間にある)、`hasresethaltreq = 1`、abstractauto の autoexecdata/autoexecprogbuf を持つ、`authenticated = 1`、`confstrptrvalid = 0`、`nextdm = 0`、dmstatus.version は 1.0 を示す値。
+- DM の固定値: `progbufsize = 8`、`impebreak = 1`、`datacount = 2` (RV64 の 64 bit の値を data0/data1 で運ぶ)、`hartinfo.dataaccess = 0` (上の【MD 手順 2 で決定】)、`hasresethaltreq = 1`、abstractauto の autoexecdata/autoexecprogbuf を持つ、`authenticated = 1`、`confstrptrvalid = 0`、`nextdm = 0`、dmstatus.version は 1.0 を示す値 (3)。機能を入れる手順 (impebreak と progbufsize と datacount は 5、hasresethaltreq は 9) までは 0 を返し、持たない機能を公表しない。
 - 【決定】hart は ABS へ飛ぶ前と dret の前に必ず `fence.i` を実行する (ROM の手順 2)。理由: DM code は uncached でも、front end は ROM の flag の読みが retire する前に、予測に従って ABS や dpc の先を先読みしうる。`fence.i` の full kill (§C.6) により、GO を観測した後の内容で fetch し直す。SBA や progbuf の store で書き換えた命令についても同じ (D.10)。
 
 ### D.8 PMP と PMA の免除
@@ -4513,7 +4534,7 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 | U35 | trigger の照合の対象 (cbo.*) と action=0 の tval の値 | §D.6 | MD | 推奨: cbo.zero は store として照合し、cbo.clean/flush/inval の扱いと tval の値 (execute は命令の VA、load/store はアクセスの VA) は Sail と spike の振る舞いに合わせる。PTE の暗黙のアクセスは照合しない。測るもの: 同じ directed を spike で走らせて tval と照合の有無を比べる。 |
 | U36 | OpenOCD、GDB、spike、riscv-tests の版と取得、tb の JTAG DTM の transport | §D.1、R10 | MD の開始時 | 推奨: `toolchain/fetch.sh` に OpenOCD (riscv-openocd)、riscv64 の GDB、spike を pin した版で足す (prebuilt が無ければ pin した commit からの build の手順を `toolchain/README.md` に書く)。riscv-tests の debug suite は `test/riscv-arch-test/upstream/debug/` の clone を使い、commit を記録する。transport はユーザ決定どおり remote_bitbang (Verilator のラッパの DPI、localhost の TCP) から始め、GG の壁時間が梯子の予算 (目安 2 時間) を超えるときだけ `jtag_dpi` に替える。 |
 | U37 | gdbserver.py の除外表 | 検証計画 §9.2 | MD の末 | 推奨: `test/debug/heliodor_excludes.yaml` に commit し、各行を持たない optional 機能 (Access Memory、Quick Access、aarpostincrement、data value の trigger、textra、128 bit) か spike との意図した差に結び付ける。不具合を除外で隠さない。spike で通るテストが heliodor で落ち、除外の理由が無ければ MD の出口を満たさない。 |
-| U38 | `DM_BASE`、debug memory の配置、ROM と生成コードの命令列、`hartinfo.nscratch` | §D.7、§S.2 | MD | 推奨: `DM_BASE = 0x0000_4000` (boot ROM の直後で、どの map でも空いている)。DM code と DM data を 4 KiB ずつ、ROM の base register から ±2 KiB に収める配置。ROM は s0/s1 を dscratch0/1 に退避し、ABS に入る前に戻す (spike の DM と同じ流れ)。`nscratch` は生成コードが使わずに済む本数で、推奨 1。測るもの: gdbserver suite の register と progbuf のテストが spike と同じ結果になること。 |
+| U38 | `DM_BASE`、debug memory の配置、ROM と生成コードの命令列、`hartinfo.nscratch` | §D.7、§S.2 | MD | 【MD 手順 2 で決定】`DM_BASE = 0x0000_4000`、offset の表と位置独立な ROM (`dm_rom.S`)、`nscratch = 1`、`hartinfo.dataaccess = 0` (§D.7)。生成コードの命令列は手順 5 で決める。以下は M0 の推奨: `DM_BASE = 0x0000_4000` (boot ROM の直後で、どの map でも空いている)。DM code と DM data を 4 KiB ずつ、ROM の base register から ±2 KiB に収める配置。ROM は s0/s1 を dscratch0/1 に退避し、ABS に入る前に戻す (spike の DM と同じ流れ)。`nscratch` は生成コードが使わずに済む本数で、推奨 1。測るもの: gdbserver suite の register と progbuf のテストが spike と同じ結果になること。 |
 | U39 | VU の要素アクセスの trigger (M5) | §D.6、§D.16 | M5 | 推奨: `vu_mem_adapter` で要素ごとに load/store の照合を行い、一致した要素の手前で precise fault と同じく vstart を残して受け付ける (§V)。代案は vector の op を照合の対象外と宣言することだが、spec の load/store の照合は vector を除外しない。測るもの: V のテスト群と、vector の memcpy に watchpoint を置く directed。 |
 | U40 | ユーザ向け book の公開の場と mdbook、mdbook-i18n-helpers の版 | §MDOC | MDOC の開始時 | 推奨: 版は `toolchain/versions.env` に pin して `fetch.sh` で取る。公開 (GitHub Pages など) はユーザの判断で、MDOC は build までを出口とする。 |
 | U41 | AXI4 のデータ幅、burst の形、属性 | §MM.1 | MM | 【MM で決定 (§MM.1)】`AXI_DATA_W = 64`、`AxSIZE = 3`、INCR だけ。write は strobe の lane 範囲の 1 本 (1 line の中)。属性は下の推奨どおり。以下は決定前の記録。推奨: `AXI_DATA_W = 64`、line は `AxLEN = 7` の INCR (line 境界から)、uncached の 1 beat は `AxLEN = 0`。`AxLOCK = 0`、`AxPROT = 0`、`AxCACHE = 4'b0011` (Normal Non-cacheable Bufferable)、`AxQOS = 0`。line 幅 (512 bit) は選ばない。理由: 内側の STREAM が 64 bit/beat で、FPGA の DRAM controller の幅は AXI の width converter で吸収できる。測るもの: 固定遅延の設定で line の gather が MM の前の cycles に近いこと (検証計画 §10.2)。 |
@@ -4863,6 +4884,10 @@ MM で決める事項: U41 (幅と属性)、U42 (ID、outstanding、`WB_N`)、U4
 | V14 | 共有モジュール (CLINT、mem_ctrl、memory_bus、SoC) に触れたので、梯子 1-5 が緑で dhrystone/coremark がビット一致。 |
 
 MD で決める事項: U32 (hartreset のドメイン)、U33 (SBA の接続形)、U34 (`TRIG_N` と照合機能の範囲)、U35 (cbo.* と tval)、U36 (ツールの版と DTM の transport、MD の開始時)、U37 (gdbserver の除外表、MD の末)、U38 (`DM_BASE` と debug memory の配置、ROM)。
+
+#### MD の進捗
+
+- 手順 2 (SoC の骨格): `src/peripheral/dm/` に `dmi_apb`、`dm` (dmcontrol の dmactive、haltreq、resumereq、hartsel、dmstatus、hartinfo)、`dm_mem` (状態を持たない debug memory の slave)、`dm_pkg`、位置独立な debug ROM (`dm_rom.S`、`gen_dm_rom.py` が `dm_rom_pkg` を生成) を入れた。`pma_pkg::Target` に `DEBUG` を足し、`MAP_ARCH`/`MAP_BOOT` に DM の 2 領域 (`tb_platform_pkg::DM_BASE` = 0x4000) を入れた。SoC は `DM_BASE`、`i_dm_rst`、APB4 のポートと `o_dm_obs` を持ち、全 harness が APB を idle に接続する。tb は DMI script の player `dm_seq`、`chk_dm`、`test/debug` の `dmi_asm.py` と Makefile、gate list `test/gates/md_dbg.list` (`dmi=` の項目) と生成された `tb/test_w{2,4}_dbg.veryl` (GD の最初の 1 本 `dbg/dmi_selftest`)、`test_dmi_seq_bad`、`test_dm_handshake` (hart の模型で halt/resume の handshake)、`test_dm_mem_rom`、`test_dm_pma_map`。決めたことは §D.3、§D.7 の【MD 手順 2 で決定】と U38、検証計画 §9.1。手順 3 が引き継ぐもの: core の `i_dm_haltreq` (今は `o_dm_obs.haltreq` だけが読む)、`i_dm_halt_pc = DM_BASE`、`i_dm_exc_pc = DM_BASE + 4`、D.8 の規則 (それまで DM の 2 領域は Debug Mode の外からも通常の uncached 領域に見える)、`chk_io_mon` と retire_mon が DM data 領域 (io_ordered) の Debug Mode のアクセスを IO として数えないこと、新コアで初めて使う I slot の非 DRAM single beat (bus の read channel) の経路。
 
 ### M5: H と V
 
