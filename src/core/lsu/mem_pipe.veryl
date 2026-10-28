@@ -33,6 +33,8 @@
 //                    the effective privilege, changed only by a flushing retire
 //   i_dm           : csr's debug_mode, read at m1; it changes only at the
 //                    full kills of Debug Mode entry and dret
+//   i_trig         : trig_unit's configuration, read at m1 (it changes only
+//                    at a flushing retire)
 //   o_tlb_lk/i_tlb : m1, the DTLB lookup port, combinational round trip
 //   o_xreq_valid/o_xreq, i_xreq_gnt : m1, the walk request of a pass that
 //                    missed the DTLB; i_xreq_gnt is its acceptance in the
@@ -93,6 +95,12 @@
 //     privileged spec allows an access fault for a misaligned access the
 //     region cannot perform. PMP: an AMO needs read and write, a CBO
 //     management op read or write
+//   - load and store triggers compare the bytes of the whole access in every
+//     pass (a CBO: its line), so a match on either half of a crossing access
+//     is reported by its first pass, ahead of any fault of that pass. A
+//     matching pass looks up nothing and walks nothing: timing before means
+//     the access has no effect, the D bit included. An AMO matches as a load
+//     and as a store, LR as a load, SC and CBOs as stores
 //   - debug memory (target DEBUG) is a hole outside Debug Mode and is not
 //     checked against PMP in it, so a locked PMP entry cannot lock the
 //     debugger out
@@ -128,6 +136,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
     i_pmpcfg : input logic              <64> [2] ,
     i_pmpaddr: input logic              <64> [16],
     i_dm     : input logic                   ,
+    i_trig   : input core_types::<CFG>::TrigCfg,
 
     o_tlb_lk    : output xlate_pkg::TlbLookup          ,
     i_tlb       : input  xlate_pkg::TlbEntry           ,
@@ -373,7 +382,21 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let m1_noncan: logic              = i_xl_on && m1.pva[63:39] != {m1.pva[38] repeat 25};
     let m1_xf    : logic              = m1.xexc.valid; // the walk's answer replaces the lookup
     let m1_perm  : xlate_pkg::Perm    = xlate_pkg::perm(i_tlb, m1_acc, i_ctx);
-    let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf && !m1_amis;
+    // Triggers over the bytes [m1_lo, m1_hi] of the access.
+    let m1_ln    : logic              = m1.op.cmo || m1.op.zero;
+    let m1_lo    : logic<64>          = if m1_ln ? {m1.va[63:6], 6'd0} : m1.va;
+    let m1_hi    : logic<64>          = m1_lo + (if m1_ln ? 64'd63 : if m1.op.q ? 64'd15 : (64'd1 << m1.op.size) - 64'd1);
+    var m1_tm    : logic<CFG::TRIG_N>;
+    always_comb {
+        var m: logic<CFG::TRIG_N>;
+        for t in 0..CFG::TRIG_N {
+            m[t] = ((i_trig.ld[t] && (!m1.op.st || m1.op.rmw)) || (i_trig.st[t] && m1.op.st))
+                && trig_range(i_trig.mt[t], i_trig.t2[t], m1_lo, m1_hi);
+        }
+        m1_tm = trig_fire(m, i_trig);
+    }
+    let m1_trig  : logic              = m1_tm != 0;
+    let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf && !m1_amis && !m1_trig;
     let m1_nd    : logic              = m1_lk && i_tlb.hit && m1_perm.ok && m1_perm.need_d;
     let m1_miss  : logic              = m1_lk && (!i_tlb.hit || m1_nd);
     let m1_pf    : logic              = !m1_amis && (m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok));
@@ -443,33 +466,37 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     var m2_in: M2Op;
     always_comb {
-        m2_in.tag       = m1.tag;
-        m2_in.op        = m1.op;
-        m2_in.lq        = m1.lq;
-        m2_in.sq        = m1.sq;
-        m2_in.new_      = m1.new_;
-        m2_in.half      = m1.half;
-        m2_in.va        = m1.va;
-        m2_in.m16       = m1.m16;
-        m2_in.xline     = m1.xline;
-        m2_in.data      = m1.data;
-        m2_in.rs2       = m1.rs2;
-        m2_in.aop       = m1.aop;
-        m2_in.cas       = m1.cas;
-        m2_in.pa        = m1_pa;
-        m2_in.attr      = m1_attr;
-        m2_in.xmiss     = m1_miss;
-        m2_in.xnd       = m1_nd;
-        m2_in.xgnt      = o_xreq_valid && i_xreq_gnt;
-        m2_in.xseen     = ev_hit(i_ptw_evt, m1_vpn);
-        m2_in.vpn       = m1_vpn;
-        m2_in.exc.valid = m1_amis || m1_xf || m1_pf || (!m1_miss && m1_af);
-        m2_in.exc.cause = if m1.op.st ? 6'd7 : 6'd5;
-        m2_in.exc.tval  = m1.pva;
-        m2_in.exc.gpa   = 54'd0;
-        m2_in.exc.gva   = 1'b0;
-        m2_in.exc.dm    = 1'b0;
-        if m1_xf {
+        m2_in.tag          = m1.tag;
+        m2_in.op           = m1.op;
+        m2_in.lq           = m1.lq;
+        m2_in.sq           = m1.sq;
+        m2_in.new_         = m1.new_;
+        m2_in.half         = m1.half;
+        m2_in.va           = m1.va;
+        m2_in.m16          = m1.m16;
+        m2_in.xline        = m1.xline;
+        m2_in.data         = m1.data;
+        m2_in.rs2          = m1.rs2;
+        m2_in.aop          = m1.aop;
+        m2_in.cas          = m1.cas;
+        m2_in.pa           = m1_pa;
+        m2_in.attr         = m1_attr;
+        m2_in.xmiss        = m1_miss;
+        m2_in.xnd          = m1_nd;
+        m2_in.xgnt         = o_xreq_valid && i_xreq_gnt;
+        m2_in.xseen        = ev_hit(i_ptw_evt, m1_vpn);
+        m2_in.vpn          = m1_vpn;
+        m2_in.exc.valid    = m1_trig || m1_amis || m1_xf || m1_pf || (!m1_miss && m1_af);
+        m2_in.exc.cause    = if m1.op.st ? 6'd7 : 6'd5;
+        m2_in.exc.tval     = m1.pva;
+        m2_in.exc.gpa      = 54'd0;
+        m2_in.exc.gva      = 1'b0;
+        m2_in.exc.dm       = 1'b0;
+        m2_in.exc.trig     = 1'b0;
+        m2_in.exc.trig_hit = 0;
+        if m1_trig {
+            m2_in.exc = trig_exc(m1_tm, (m1_tm & i_trig.dm) != 0, m1.va);
+        } else if m1_xf {
             m2_in.exc = m1.xexc;
         } else if m1_pf {
             m2_in.exc.cause = xlate_pkg::pf_cause(m1_acc);
@@ -499,6 +526,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
     let m2_load : logic     = m2_v && !m2.op.st && !m2.op.amo;
     let m2_xseen: logic     = m2.xseen || ev_hit(i_ptw_evt, m2.vpn);
     let m2_io   : logic     = m2_load && !m2.exc.valid && !m2.xmiss && !m2.attr.cacheable;
+    let m2_lr   : logic     = m2_v && m2.op.amo && !m2.op.st && !m2.exc.valid && !m2.xmiss;
     // A crossing load runs its passes only as re-issues, which lq grants once it is oldest.
     let m2_go: logic = m2_load && !m2.exc.valid && !m2.xmiss && !m2_io && !(m2.xline && m2.new_);
 
@@ -520,7 +548,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_fwd_q.mask   = m2_pmask;
         o_fwd_q.sq_lim = m2.sq;
 
-        o_snap.valid  = (m2_go || m2_io) && m2_live;
+        o_snap.valid  = (m2_go || m2_io || m2_lr) && m2_live;
         o_snap.lq     = m2.lq;
         o_snap.half   = m2.half;
         o_snap.line   = m2.pa[55:6];
@@ -529,6 +557,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_snap.io     = m2_io;
         o_snap.io_ord = m2.attr.io_ordered;
         o_snap.dram   = m2.attr.target == pma_pkg::Target::DRAM;
+        o_snap.lr     = m2_lr;
 
         o_sta.valid  = m2_live && m2.op.st;
         o_sta.sq     = m2.sq;
@@ -773,5 +802,6 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_perf.miss     = r_v && r_rsp && i_resp.kind == RespKind::MISS;
         o_perf.retry    = r_v && r_rsp && i_resp.kind == RespKind::RETRY;
         o_perf.ewake    = e_ok;
+        o_perf.trig     = m1_v && m1_trig;
     }
 }

@@ -1,0 +1,261 @@
+// trig_unit: the Sdtrig triggers (tselect, tdata1-3, tinfo, tcontrol), the
+// address-match configuration the fetch and memory pipes compare against, and
+// the icount triggers.
+//
+// Ports (timing contract):
+//   i_rd_addr/o_rd_data : combinational read of 0x7A0-0x7A5 (csr returns it)
+//   i_wr_en, i_wr_addr, i_wr_data : commit's CSR write, applied on the edge
+//   i_priv, i_dm        : csr's privilege and debug_mode (registered)
+//   i_m_trap, i_mret    : a trap into M, an MRET retired; applied on the edge
+//   i_hit               : hit bits of an accepted address-trigger exception
+//   i_cnt               : lane 0 retired, trapped or took an interrupt outside
+//                         Debug Mode (icount counts it)
+//   i_icnt_take         : commit took the pending icount {breakpoint, Debug
+//                         Mode entry}
+//   o_cfg, o_icnt_*     : combinational from registered state
+//   o_hit               : the hit bits (chk_debug)
+// Owns:
+//   - tdata1 types mcontrol6 (6), icount (3) and disabled (15); any other
+//     type written disables the trigger. mcontrol6 keeps select 0, size 0,
+//     timing before and match 0-3 (others write 0); action 1 (Debug Mode)
+//     needs dmode, and dmode is written only in Debug Mode
+//   - tdata1-3 of a dmode trigger are written only in Debug Mode; tselect
+//     ignores a value of TRIG_N or more
+//   - no trigger matches or counts in Debug Mode; an action-0 trigger
+//     matches in M only with tcontrol.mte
+//   - icount decrements once per counted event in an enabled mode; reaching
+//     zero sets pending, which fires (and clears) before the next
+//     instruction in an enabled mode
+// Rationale:
+//   - every configuration change is a CSR write, trap or xRET, all full
+//     kills, so o_cfg read at fetch or m1 is the committed state of the op
+//   - icount counts only lane 0: commit retires on lane 0 alone while an
+//     icount trigger is armed, so the count never ends inside a group
+pub module trig_unit::<CFG: core_cfg> (
+    clk        : input  clock                                       ,
+    rst        : input  reset                                       ,
+    i_rd_addr  : input  logic                        <12>           ,
+    o_rd_data  : output logic                        <64>           ,
+    i_wr_en    : input  logic                                       ,
+    i_wr_addr  : input  logic                        <12>           ,
+    i_wr_data  : input  logic                        <64>           ,
+    i_priv     : input  csr_pkg::PrivLevel                          ,
+    i_dm       : input  logic                                       ,
+    i_m_trap   : input  logic                                       ,
+    i_mret     : input  logic                                       ,
+    i_hit      : input  logic                        <CFG::TRIG_N>  ,
+    i_cnt      : input  logic                                       ,
+    i_icnt_take: input  logic                        <2>            ,
+    o_cfg      : output core_types::<CFG>::TrigCfg                  ,
+    o_icnt_act : output logic                                       ,
+    o_icnt_dm  : output logic                                       ,
+    o_icnt_bp  : output logic                                       ,
+    o_hit      : output logic                        <CFG::TRIG_N>  ,
+) {
+    import core_types::<CFG>::*;
+
+    const TN   : u32 = CFG::TRIG_N;
+    const SEL_W: u32 = tag_pkg::idx_w(TN);
+
+    enum Typ: logic<2> {
+        DIS,
+        MC6,
+        ICNT,
+    }
+
+    struct Trig {
+        typ  : Typ      ,
+        dmode: logic    ,
+        act  : logic    , // action 1 (Debug Mode); 0 is the breakpoint exception
+        m    : logic    ,
+        s    : logic    ,
+        u    : logic    ,
+        hit  : logic    ,
+        x    : logic    , // mcontrol6 execute, store, load
+        st   : logic    ,
+        ld   : logic    ,
+        chain: logic    ,
+        mt   : logic<2> ,
+        cnt  : logic<14>, // icount
+        pend : logic    ,
+        t2   : logic<64>,
+    }
+
+    var tr_q  : Trig       [TN];
+    var sel_q : logic<SEL_W>   ;
+    var mte_q : logic          ;
+    var mpte_q: logic          ;
+
+    let in_m: logic = i_priv == csr_pkg::PrivLevel::MACHINE;
+
+    function mode_ok (
+        r   : input Trig              ,
+        priv: input csr_pkg::PrivLevel,
+    ) -> logic {
+        return case priv {
+            csr_pkg::PrivLevel::MACHINE   : r.m,
+            csr_pkg::PrivLevel::SUPERVISOR: r.s,
+            default                       : r.u,
+        };
+    }
+
+    // The action of each trigger's chain: that of its last trigger.
+    var ga: logic<TN>;
+    always_comb {
+        var nxt: logic;
+        nxt = 1'b0;
+        for i in 0..TN {
+            let t: u32 = TN - 1 - i;
+            nxt   = if tr_q[t].typ == Typ::MC6 && tr_q[t].chain ? nxt : tr_q[t].act;
+            ga[t] = nxt;
+        }
+    }
+
+    var ie: logic<TN>; // icount triggers armed in this mode
+    always_comb {
+        for t in 0..TN {
+            let en: logic = !i_dm && mode_ok(tr_q[t], i_priv) && (ga[t] || !in_m || mte_q);
+            let mc: logic = en && tr_q[t].typ == Typ::MC6;
+            o_cfg.x[t]     = mc && tr_q[t].x;
+            o_cfg.ld[t]    = mc && tr_q[t].ld;
+            o_cfg.st[t]    = mc && tr_q[t].st;
+            o_cfg.chain[t] = tr_q[t].typ == Typ::MC6 && tr_q[t].chain;
+            o_cfg.dm[t]    = ga[t];
+            o_cfg.mt[t]    = tr_q[t].mt;
+            o_cfg.t2[t]    = tr_q[t].t2;
+            ie[t]          = en && tr_q[t].typ == Typ::ICNT;
+            o_hit[t]       = tr_q[t].hit;
+        }
+    }
+
+    var ic_act : logic<TN>;
+    var ic_pend: logic<TN>;
+    always_comb {
+        for t in 0..TN {
+            ic_act[t]  = ie[t] && (tr_q[t].cnt != 14'd0 || tr_q[t].pend);
+            ic_pend[t] = ie[t] && tr_q[t].pend;
+        }
+    }
+    assign o_icnt_act = ic_act != 0;
+    assign o_icnt_dm  = (ic_pend & ga) != 0;
+    assign o_icnt_bp  = (ic_pend & ~ga) != 0;
+
+    // ---- CSR read ----
+
+    function tdata1 (
+        r: input Trig,
+    ) -> logic<64> {
+        return case r.typ {
+            Typ::MC6 : {4'd6, r.dmode, 32'd0, 4'd0, r.hit, 6'd0, 3'd0, r.act, r.chain, 2'd0, r.mt, r.m, 1'b0, r.s,
+                r.u, r.x, r.st, r.ld},
+            Typ::ICNT: {4'd3, r.dmode, 32'd0, 2'd0, r.hit, r.cnt, r.m, r.pend, r.s, r.u, 5'd0, r.act},
+            default  : {4'd15, r.dmode, 59'd0},
+        };
+    }
+
+    var cur: Trig;
+    always_comb {
+        cur = tr_q[0];
+        for t in 1..TN {
+            if sel_q == t {
+                cur = tr_q[t];
+            }
+        }
+        o_rd_data = case i_rd_addr {
+            12'h7A0: sel_q as 64,
+            12'h7A1: tdata1(cur),
+            12'h7A2: cur.t2,
+            12'h7A4: 64'h0100_8048, // version 1; types 15, 6 and 3
+            12'h7A5: {56'd0, mpte_q, 3'd0, mte_q, 3'd0},
+            default: 64'd0,
+        };
+    }
+
+    // ---- State ----
+
+    let wd : logic<64> = i_wr_data;
+    let wdm: logic     = wd[59] && i_dm;
+
+    // Trigger r after a tdata1 write of wd; nxt_dm is the next trigger's
+    // dmode (a chain does not join a dmode trigger to one without), last
+    // marks the last trigger (no chain).
+    function wr_tdata1 (
+        r     : input Trig ,
+        nxt_dm: input logic,
+        last  : input logic,
+    ) -> Trig {
+        var n: Trig;
+        n       = 0 as Trig;
+        n.t2    = r.t2;
+        n.dmode = wdm;
+        if wd[63:60] == 4'd6 {
+            n.typ   = Typ::MC6;
+            n.hit   = wd[22];
+            n.act   = wd[15:12] == 4'd1 && wdm;
+            n.chain = wd[11] && !last && !(nxt_dm && !wdm);
+            n.mt    = if wd[10:9] == 2'd0 ? wd[8:7] : 2'd0;
+            n.m     = wd[6];
+            n.s     = wd[4];
+            n.u     = wd[3];
+            n.x     = wd[2];
+            n.st    = wd[1];
+            n.ld    = wd[0];
+        } else if wd[63:60] == 4'd3 {
+            n.typ  = Typ::ICNT;
+            n.hit  = wd[24];
+            n.cnt  = wd[23:10];
+            n.m    = wd[9];
+            n.pend = wd[8];
+            n.s    = wd[7];
+            n.u    = wd[6];
+            n.act  = wd[5:0] == 6'd1 && wdm;
+        }
+        return n;
+    }
+
+    always_ff {
+        if_reset {
+            for t in 0..TN {
+                tr_q[t] = 0 as Trig;
+            }
+            sel_q  = 0;
+            mte_q  = 1'b0;
+            mpte_q = 1'b0;
+        } else {
+            for t in 0..TN {
+                if i_hit[t] {
+                    tr_q[t].hit = 1'b1;
+                }
+                if ic_pend[t] && (if ga[t] ? i_icnt_take[0] : i_icnt_take[1]) {
+                    tr_q[t].pend = 1'b0;
+                    tr_q[t].hit  = 1'b1;
+                }
+                if i_cnt && ie[t] && tr_q[t].cnt != 14'd0 {
+                    tr_q[t].cnt = tr_q[t].cnt - 14'd1;
+                    if tr_q[t].cnt == 14'd1 {
+                        tr_q[t].pend = 1'b1;
+                    }
+                }
+                if i_wr_en && sel_q == t && (!tr_q[t].dmode || i_dm) {
+                    if i_wr_addr == 12'h7A2 {
+                        tr_q[t].t2 = wd;
+                    } else if i_wr_addr == 12'h7A1 {
+                        tr_q[t] = wr_tdata1(tr_q[t], tr_q[(t + 1) % TN].dmode, t == TN - 1);
+                    }
+                }
+            }
+            if i_wr_en && i_wr_addr == 12'h7A0 && wd <: TN {
+                sel_q = wd[SEL_W - 1:0];
+            }
+            if i_wr_en && i_wr_addr == 12'h7A5 {
+                mte_q  = wd[3];
+                mpte_q = wd[7];
+            } else if i_m_trap {
+                mpte_q = mte_q;
+                mte_q  = 1'b0;
+            } else if i_mret {
+                mte_q = mpte_q;
+            }
+        }
+    }
+}

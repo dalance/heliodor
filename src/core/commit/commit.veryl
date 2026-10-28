@@ -20,6 +20,9 @@
 //                          here (dm_q) before any use
 //   i_dm_halt_pc         : static, the halt entry of debug memory
 //   i_dm_step, i_dm_stepie : csr's dcsr.step and dcsr.stepie (registered)
+//   i_icnt_act, i_icnt_dm, i_icnt_bp : trig_unit, from registered state: an
+//                          icount trigger is armed; one is pending with action
+//                          1 (Debug Mode) or 0 (breakpoint)
 //   i_rd2_valid, i_rd2   : atomic_unit's held rd+1 value of amocas.q, for the
 //                          retire record only (the op is the head and alone)
 //   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs;
@@ -50,11 +53,16 @@
 //   o_retire_dm          : registered with o_retire: its records retired in
 //                          Debug Mode
 //   o_dm_req, o_step     : dm_req and step_q, for chk_debug
+//   o_bp_take            : the icount breakpoint is taken (to trap_unit)
+//   o_trig_hit           : hit bits of an accepted trigger exception
+//   o_icnt_cnt, o_icnt_take : icount events: lane 0 retired, trapped or took
+//                          an interrupt outside Debug Mode; the pending
+//                          icount was taken {breakpoint, Debug Mode}
 // Owns:
 //   - retire is a prefix of the lanes; at most one flush per cycle (Debug
-//     Mode entry > irq > lane 0 DEBUG or trap > replay > the RETIRE_FLUSH of
-//     the youngest retired lane); an entry, trap, replay or interrupt cycle
-//     retires nothing
+//     Mode entry > irq > icount breakpoint > lane 0 DEBUG or trap > replay >
+//     the RETIRE_FLUSH of the youngest retired lane); an entry, trap, replay
+//     or interrupt cycle retires nothing
 //   - Debug Mode entry: the halt request is taken like an interrupt (at a
 //     group head that holds no started op, dm_take), an EBREAK with
 //     ExcRec.dm like an exception (outcome DEBUG on lane 0, dbg_fire). Both
@@ -64,6 +72,12 @@
 //     retire one op; that record, a trap or an interrupt sets step_n_q, which
 //     withholds the token and retire like the lockstep limit and requests
 //     entry (cause 4). Without dcsr.stepie no interrupt is taken meanwhile
+//   - triggers: an address trigger is the head's exception (DEBUG or TRAP,
+//     cause 2 or 3) and sets its hit bits on acceptance. While icount is
+//     armed only lane 0 retires; its pending withholds the token and retire
+//     like a step and is taken at the interrupt acceptance point, as entry
+//     (cause 2, before haltreq) or as a breakpoint trap record (epc the
+//     committed next PC, after an interrupt)
 //   - every side effect is conditioned on retire[l] alone (plus trap_fire
 //     or irq_take on lane 0), never on "the head is valid"
 //   - arch_pc_q is the PC of the head op whenever the head is valid, so lane
@@ -104,6 +118,9 @@ pub module commit::<CFG: core_cfg> (
     i_dm_halt_pc         : input  logic                        <64>                                             ,
     i_dm_step            : input  logic                                                                         ,
     i_dm_stepie          : input  logic                                                                         ,
+    i_icnt_act           : input  logic                                                                         ,
+    i_icnt_dm            : input  logic                                                                         ,
+    i_icnt_bp            : input  logic                                                                         ,
     i_rd2_valid          : input  logic                                                                         ,
     i_rd2                : input  logic                        <64>                                             ,
     i_trap_target        : input  logic                        <64>                                             ,
@@ -137,6 +154,10 @@ pub module commit::<CFG: core_cfg> (
     o_retire_dm          : output logic                                                                         ,
     o_dm_req             : output logic                                                                         ,
     o_step               : output logic                                                                         ,
+    o_bp_take            : output logic                                                                         ,
+    o_trig_hit           : output logic                        <CFG::TRIG_N>                                    ,
+    o_icnt_cnt           : output logic                                                                         ,
+    o_icnt_take          : output logic                        <2>                                              ,
     o_perf               : output core_types::<CFG>::CmPerf                                                     ,
     o_chk                : output logic                        <core_types::<CFG>::CHK_CM_W>                    ,
 ) {
@@ -183,11 +204,13 @@ pub module commit::<CFG: core_cfg> (
     let step_done: logic = step_q && step_n_q;
     let irq_ok   : logic = !i_dm && !(step_q && !i_dm_stepie)
         && (!i_dbg_irq_mask || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit));
-    let dm_req   : logic = !i_dm && (dm_q || step_done);
+    let icnt_pnd : logic = i_icnt_dm || i_icnt_bp;
+    let dm_req   : logic = !i_dm && (dm_q || step_done || i_icnt_dm);
     let dm_take  : logic = dm_req && !started_q && !i_kill.valid;
     let irq_take : logic = irq_q.pending && irq_ok && !dm_req && !started_q && !i_kill.valid;
+    let bp_take  : logic = i_icnt_bp && !dm_req && !(irq_q.pending && irq_ok) && !started_q && !i_kill.valid;
     let acc_hold : logic = (irq_q.pending && irq_ok) || dm_req;
-    let lim_hold : logic = limit_hit || step_done;
+    let lim_hold : logic = limit_hit || step_done || icnt_pnd;
 
     always_comb {
         o_oldest.valid = i_head.valid && !acc_hold && !lim_hold && !i_kill.valid;
@@ -370,20 +393,23 @@ pub module commit::<CFG: core_cfg> (
             // dm_take past the cycle after the stepped record.
             let ls_ok    : logic = !i_dbg_retire_limit_en || order_q + l <: i_dbg_retire_limit;
             let step_ok  : logic = !step_q || (l == 0 && !step_n_q);
-            lim_ok[l] = ls_ok && step_ok;
+            let icnt_ok  : logic = !i_icnt_act || (l == 0 && !icnt_pnd);
+            lim_ok[l] = ls_ok && step_ok && icnt_ok;
             bud_ok[l] = n_st[l] <= MW && ((n_l1[l] as u32) + (n_l2[l] as u32)) <= (i_sb_credit as u32);
             ok[l]     = (outc[l] == Outcome::RETIRE || rf) && !kil[l] && bud_ok[l] && lim_ok[l];
             fin[l]    = rf || alone_e[l];
         }
         cut    = (alone_e | exc | poison) & ~HEAD;
-        retire = if irq_take || dm_take ? 0 : tree_prefix_and::<CW>(ok & ~cut & ~(fin << 1));
+        retire = if irq_take || dm_take || bp_take ? 0 : tree_prefix_and::<CW>(ok & ~cut & ~(fin << 1));
     }
 
-    let head_go    : logic = !irq_take && !dm_take && !kil[0] && lim_ok[0];
+    let head_go    : logic = !irq_take && !dm_take && !bp_take && !kil[0] && lim_ok[0];
     let trap_fire  : logic = head_go && outc[0] == Outcome::TRAP;
     let replay_fire: logic = head_go && outc[0] == Outcome::REPLAY;
     let dbg_fire   : logic = head_go && outc[0] == Outcome::DEBUG;
     let dm_redir   : logic = dm_take || dbg_fire;
+    let async_tr   : logic = irq_take || bp_take; // a trap with no op
+    let trig_acc   : logic = (trap_fire || dbg_fire) && i_exc.rec.trig;
 
     var rf_lane: logic<CW>;
     always_comb {
@@ -423,22 +449,22 @@ pub module commit::<CFG: core_cfg> (
     let new_pc : logic    <64>     = tree_onehot_mux::<CW, 64>(last, nxt_pc);
 
     always_comb {
-        o_flush.valid = dm_redir || irq_take || trap_fire || replay_fire || rf_any;
+        o_flush.valid = dm_redir || async_tr || trap_fire || replay_fire || rf_any;
         o_flush.kind  = if dm_redir ?
             RedirKind::DEBUG
         : if irq_take ?
             RedirKind::IRQ
-        : if trap_fire ?
+        : if trap_fire || bp_take ?
             RedirKind::TRAP
         : if replay_fire ?
             RedirKind::REPLAY
         :
             rf_kind
         ;
-        o_flush.pc    = if dm_redir ? i_dm_halt_pc : if irq_take || trap_fire ? i_trap_target : if replay_fire ? apc : rf_pc;
-        o_flush.ftq   = if irq_take || dm_redir ? 0 : rf_ftq;
-        o_flush.foff  = if irq_take || dm_redir ? 0 : rf_foff;
-        o_flush.taken = !irq_take && !dm_redir && rf_tkn;
+        o_flush.pc    = if dm_redir ? i_dm_halt_pc : if async_tr || trap_fire ? i_trap_target : if replay_fire ? apc : rf_pc;
+        o_flush.ftq   = if async_tr || dm_redir ? 0 : rf_ftq;
+        o_flush.foff  = if async_tr || dm_redir ? 0 : rf_foff;
+        o_flush.taken = !async_tr && !dm_redir && rf_tkn;
     }
 
     let n_ret: logic<RC_W> = tree_popcount::<CW, RC_W>(retire);
@@ -492,7 +518,7 @@ pub module commit::<CFG: core_cfg> (
         o_tlb_inv         = sys_q.inv;
         o_tlb_inv.valid   = |sys_ret && sys_q.valid && sys_q.inv.valid;
         o_head_retired    = retire[0];
-        o_rsv_clr         = dm_redir || trap_fire || irq_take || |mret || |sret || |dret || (|csr_ret && sys_q.csr_addr == 12'h180);
+        o_rsv_clr         = dm_redir || trap_fire || async_tr || |mret || |sret || |dret || (|csr_ret && sys_q.csr_addr == 12'h180);
         o_csr.wr_en       = |csr_ret;
         o_csr.wr_addr     = sys_q.csr_addr;
         o_csr.wr_data     = sys_q.csr_wdata;
@@ -500,7 +526,7 @@ pub module commit::<CFG: core_cfg> (
         o_csr.sret        = |sret;
         o_csr.dret        = |dret;
         o_csr.dm_enter    = dm_redir && !i_dm;
-        o_csr.dm_cause    = if dm_take ? (if dm_q ? 3'd3 : 3'd4) : 3'd1;
+        o_csr.dm_cause    = if dm_take ? (if i_icnt_dm ? 3'd2 : if dm_q ? 3'd3 : 3'd4) : if i_exc.rec.trig ? 3'd2 : 3'd1;
         o_csr.instret_cnt = n_ret;
         o_csr.fflags_set  = |ffl_v;
         o_csr.fs_dirty    = |fsd_v;
@@ -528,14 +554,14 @@ pub module commit::<CFG: core_cfg> (
             boot_q = 1'b0;
             if dm_redir {
                 arch_pc_q = i_dm_halt_pc;
-            } else if irq_take || trap_fire {
+            } else if async_tr || trap_fire {
                 arch_pc_q = i_trap_target;
             } else if |retire {
                 arch_pc_q = new_pc;
             } else {
                 arch_pc_q = apc;
             }
-            order_q = order_q + (n_ret as 64) + (trap_fire as 64);
+            order_q = order_q + (n_ret as 64) + ((trap_fire || bp_take) as 64);
 
             if dm_redir {
                 step_q   = 1'b0;
@@ -543,7 +569,7 @@ pub module commit::<CFG: core_cfg> (
             } else if |dret && i_dm_step {
                 step_q   = 1'b1;
                 step_n_q = 1'b0;
-            } else if step_q && (|retire || trap_fire || irq_take) {
+            } else if step_q && (|retire || trap_fire || async_tr) {
                 step_n_q = 1'b1;
             }
 
@@ -585,7 +611,7 @@ pub module commit::<CFG: core_cfg> (
             for l in 0..CW {
                 let c               : RobCm  = i_cm[l];
                 let mo              : MemObs = mem_obs[l];
-                let tr              : logic  = trap_fire && l == 0;
+                let tr              : logic  = (trap_fire || bp_take) && l == 0;
                 ret_q[l]         = 0;
                 ret_q[l].valid   = retire[l] || tr;
                 ret_q[l].order   = order_q + l;
@@ -597,8 +623,12 @@ pub module commit::<CFG: core_cfg> (
                 ret_q[l].virt    = i_virt;
                 if tr {
                     ret_q[l].trap  = 1'b1;
-                    ret_q[l].cause = i_exc.rec.cause;
+                    ret_q[l].cause = if bp_take ? 6'd3 : i_exc.rec.cause;
                     ret_q[l].tval  = i_trap_tval;
+                    if bp_take {
+                        ret_q[l].insn   = 32'd0;
+                        ret_q[l].is_rvc = 1'b0;
+                    }
                 } else {
                     if c.ent.has_rd {
                         ret_q[l].rd_kind  = if c.ent.cls == RegClass::FP ? RdKind::FP : RdKind::INT;
@@ -652,6 +682,10 @@ pub module commit::<CFG: core_cfg> (
     assign o_retire_dm = ret_dm_q;
     assign o_dm_req    = dm_req;
     assign o_step      = step_q;
+    assign o_bp_take   = bp_take;
+    assign o_trig_hit  = if trig_acc ? i_exc.rec.trig_hit[CFG::TRIG_N - 1:0] : 0;
+    assign o_icnt_cnt  = !i_dm && (retire[0] || trap_fire || irq_take);
+    assign o_icnt_take = {bp_take, dm_take && i_icnt_dm};
     assign o_irq_evt   = evt_q;
 
     // ---- Firing events ----
@@ -686,13 +720,17 @@ pub module commit::<CFG: core_cfg> (
             perf_q.rf_br_cm    = rf_any && rf_kind == RedirKind::BR_CM;
             perf_q.irq_take    = irq_take;
             perf_q.irq_started = irq_q.pending && irq_ok && started_q && !i_kill.valid;
-            perf_q.dm_halt     = dm_take && dm_q;
-            perf_q.dm_step     = dm_take && !dm_q;
-            perf_q.dm_ebreak   = dbg_fire && !i_dm;
+            perf_q.dm_halt     = dm_take && dm_q && !i_icnt_dm;
+            perf_q.dm_step     = dm_take && !dm_q && !i_icnt_dm;
+            perf_q.dm_ebreak   = dbg_fire && !i_dm && !i_exc.rec.trig;
             perf_q.dm_reenter  = dbg_fire && i_dm;
             perf_q.dm_exc      = trap_fire && i_dm;
             perf_q.dm_dret     = |dret;
             perf_q.dm_started  = dm_req && started_q && !i_kill.valid;
+            perf_q.trig_dm     = dbg_fire && i_exc.rec.trig;
+            perf_q.trig_bp     = trap_fire && i_exc.rec.trig;
+            perf_q.icnt_dm     = dm_take && i_icnt_dm;
+            perf_q.icnt_bp     = bp_take;
             perf_q.mispred     = |(retire & br_mis);
             perf_q.retire_none = !(|retire);
         }
@@ -707,7 +745,7 @@ pub module commit::<CFG: core_cfg> (
         i_retire     : retire     ,
         i_cm                      ,
         i_kill                    ,
-        i_trap_fire  : trap_fire  ,
+        i_trap_fire  : trap_fire || bp_take,
         i_dbg_fire   : dm_redir   ,
         i_replay_fire: replay_fire,
         i_irq_take   : irq_take   ,

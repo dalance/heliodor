@@ -63,7 +63,8 @@ ABI = ["zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1"] + [f"a{i}" 
 CSRS = {
     "fflags": 0x001, "frm": 0x002, "fcsr": 0x003, "sstatus": 0x100, "satp": 0x180,
     "mstatus": 0x300, "misa": 0x301, "mie": 0x304, "mtvec": 0x305, "mscratch": 0x340, "mepc": 0x341,
-    "mcause": 0x342, "mtval": 0x343, "mip": 0x344, "dcsr": 0x7B0, "dpc": 0x7B1, "dscratch0": 0x7B2,
+    "mcause": 0x342, "mtval": 0x343, "mip": 0x344, "tselect": 0x7A0, "tdata1": 0x7A1,
+    "tdata2": 0x7A2, "tdata3": 0x7A3, "tinfo": 0x7A4, "tcontrol": 0x7A5, "dcsr": 0x7B0, "dpc": 0x7B1, "dscratch0": 0x7B2,
     "dscratch1": 0x7B3, "mcycle": 0xB00, "minstret": 0xB02, "cycle": 0xC00, "time": 0xC01,
     "instret": 0xC02, "mhartid": 0xF14,
 }

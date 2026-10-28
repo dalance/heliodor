@@ -734,6 +734,82 @@ pub package core_types::<CFG: core_cfg> {
         gva  : logic    ,
     }
 
+    // ---- Triggers (Sdtrig) ----
+
+    // trig_unit -> ifu, mem_pipe: the address-match configuration, a function
+    // of registered state. Bit t of x, ld and st: trigger t matches executes,
+    // loads or stores in the current mode (none in Debug Mode). chain[t]: t is
+    // chained to t + 1. dm[t]: the chain of t enters Debug Mode (action 1)
+    // instead of raising a breakpoint exception (action 0).
+    struct TrigCfg {
+        x    : logic<CFG::TRIG_N>    ,
+        ld   : logic<CFG::TRIG_N>    ,
+        st   : logic<CFG::TRIG_N>    ,
+        chain: logic<CFG::TRIG_N>    ,
+        dm   : logic<CFG::TRIG_N>    ,
+        mt   : logic<CFG::TRIG_N, 2> , // match: 0 equal, 1 NAPOT, 2 at or above, 3 below
+        t2   : logic<CFG::TRIG_N, 64>,
+    }
+
+    // The triggers that fire at one match point, given which of them match:
+    // a chain fires only when every trigger of it matches. When chains of
+    // both actions fire, Debug Mode wins and only its triggers report a hit.
+    function trig_fire (
+        m  : input logic  <CFG::TRIG_N>,
+        cfg: input TrigCfg             ,
+    ) -> logic<CFG::TRIG_N> {
+        var ok  : logic<CFG::TRIG_N>;
+        var f   : logic<CFG::TRIG_N>;
+        var prev: logic             ;
+        var nxt : logic             ;
+        prev = 1'b1;
+        for t in 0..CFG::TRIG_N {
+            ok[t] = m[t] && prev;
+            prev  = !cfg.chain[t] || ok[t];
+        }
+        nxt = 1'b0;
+        for i in 0..CFG::TRIG_N {
+            let t: u32 = CFG::TRIG_N - 1 - i;
+            f[t] = if cfg.chain[t] ? nxt : ok[t];
+            nxt  = f[t];
+        }
+        return if (f & cfg.dm) != 0 ? f & cfg.dm : f;
+    }
+
+    // Whether a trigger with match mt and tdata2 t2 covers a byte of [lo, hi].
+    function trig_range (
+        mt: input logic<2> ,
+        t2: input logic<64>,
+        lo: input logic<64>,
+        hi: input logic<64>,
+    ) -> logic {
+        let nm: logic<64> = t2 ^ (t2 + 64'd1); // NAPOT: the bits below the match
+        return case mt {
+            2'd0   : lo <= t2 && t2 <= hi,
+            2'd1   : (t2 & ~nm) <= hi && lo <= (t2 | nm),
+            2'd2   : hi >= t2,
+            default: lo <: t2,
+        };
+    }
+
+    // The exception of an op whose triggers hit fired (cause 3); dm selects
+    // Debug Mode entry.
+    function trig_exc (
+        hit : input logic<CFG::TRIG_N>,
+        dm  : input logic             ,
+        tval: input logic<64>         ,
+    ) -> exc_pkg::ExcRec {
+        var r: exc_pkg::ExcRec;
+        r          = 0 as exc_pkg::ExcRec;
+        r.valid    = hit != 0;
+        r.cause    = 6'd3;
+        r.tval     = tval;
+        r.dm       = dm;
+        r.trig     = 1'b1;
+        r.trig_hit = hit as exc_pkg::TRIG_MAX;
+        return r;
+    }
+
     // ---- Firing events (registered) ----
 
     struct RobPerf {
@@ -766,6 +842,10 @@ pub package core_types::<CFG: core_cfg> {
         dm_exc     : logic              , // exception in Debug Mode
         dm_dret    : logic              ,
         dm_started : logic              , // dm_req waits for head_started_q
+        trig_dm    : logic              , // Debug Mode entry by an address trigger
+        trig_bp    : logic              , // breakpoint exception of an address trigger
+        icnt_dm    : logic              , // Debug Mode entry by icount
+        icnt_bp    : logic              , // breakpoint exception of icount
         mispred    : logic              , // a retired control op mispredicted (recovered or not)
         retire_none: logic              , // no lane retired
     }
@@ -784,7 +864,7 @@ pub package core_types::<CFG: core_cfg> {
     // Checker flag widths (bit meanings in each chk_* header).
     const CHK_ROB_W  : u32 = 7;
     const CHK_CM_W   : u32 = 7;
-    const CHK_DBG_W  : u32 = 5;
+    const CHK_DBG_W  : u32 = 6;
     const CHK_FLUSH_W: u32 = 2;
 
     // ---- Front end ----
@@ -827,12 +907,14 @@ pub package core_types::<CFG: core_cfg> {
 
     // icache request ID, echoed unchanged with the response.
     struct FetchId {
-        ftq     : FtqTag                 ,
-        start_pc: logic          <64>    ,
-        pred    : BlockPred              ,
-        probe   : logic                  , // 0: no lookup, echo only (faulted block)
-        exc     : exc_pkg::ExcRec        , // translation or PMA fault of the whole block
-        pmp_deny: logic          <GRAN_N>, // per-granule PMP execute deny
+        ftq     : FtqTag                           ,
+        start_pc: logic          <64>              ,
+        pred    : BlockPred                        ,
+        probe   : logic                            , // 0: no lookup, echo only (faulted block)
+        exc     : exc_pkg::ExcRec                  , // translation or PMA fault of the whole block
+        pmp_deny: logic          <GRAN_N>          , // per-granule PMP execute deny
+        tr_hit  : logic          <NH, CFG::TRIG_N> , // per halfword: the triggers an op starting there fires
+        tr_dm   : logic          <NH>              , // per halfword: they enter Debug Mode
     }
 
     struct FetchBlk {
@@ -1374,6 +1456,7 @@ pub package core_types::<CFG: core_cfg> {
         io    : logic     , // not cacheable: io_unit executes it
         io_ord: logic     ,
         dram  : logic     , // the target is DRAM
+        lr    : logic     , // an LR: only its line, for the retire record
     }
 
     // Outcome of a load pass at m2 + RESP_LAT.
@@ -1459,6 +1542,7 @@ pub package core_types::<CFG: core_cfg> {
         miss     : logic,
         retry    : logic,
         ewake    : logic, // a load pass woke its consumers in V
+        trig     : logic, // a pass matched a trigger
     }
 
     struct LqPerf {
@@ -1579,6 +1663,7 @@ pub package core_types::<CFG: core_cfg> {
         cut_block_end : logic   , // extract
         dq_full       : logic   ,
         pdr           : logic<5>,
+        trig          : logic   , // an op that matched a trigger entered the DQ
     }
 
     // Every registered event wire of the core, grouped by owner.
@@ -1720,6 +1805,9 @@ pub package core_types::<CFG: core_cfg> {
         // fetch stage, and sb hands a drained line over on the ack edge.
         if fu_pkg::IC_RESP_LAT != 1 || fu_pkg::SHADOW_LEN != 0 {
             e |= 1 << 17;
+        }
+        if CFG::TRIG_N == 0 || CFG::TRIG_N >: exc_pkg::TRIG_MAX {
+            e |= 1 << 19; // ExcRec.trig_hit has TRIG_MAX bits
         }
         return e;
     }
