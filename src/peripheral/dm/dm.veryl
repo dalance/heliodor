@@ -17,6 +17,15 @@
 //   o_obs        : abstract command events (D.15)
 //   o_active     : dmcontrol.dmactive, registered (dm_sba)
 //   o_hobs       : per-hart run state and groups, from registered state
+//   i_sys_idle   : mem_ctrl has no AXI transaction outstanding
+//   i_quiet      : per hart, the core has quiesced for hartreset
+//   o_drain      : registered state; an ndmreset waits for i_sys_idle: no new
+//                  AXI transaction may start
+//   o_ndmreset   : registered, the platform outside the DM domain is held in
+//                  reset
+//   o_hartreset  : registered, per-hart hartreset request to the core
+//   o_hart_rst   : registered, per-hart reset of the core domain
+//   o_robs       : reset state for the observation port
 // Owns:
 //   - dmcontrol.dmactive = 0 holds every other bit of state at its reset
 //     value; a write that clears dmactive applies nothing else.
@@ -40,6 +49,19 @@
 //     does not end the command.
 //   - cmderr is only set while it is 0; abstractcs writes clear it (W1C)
 //     unless a command is busy.
+//   - ndmreset holds the platform in reset once mem_ctrl is idle on AXI
+//     (o_drain stops new transactions meanwhile) and releases it when the
+//     bit is written 0; a 1 written and cleared before the drain ends still
+//     resets for one cycle. hartreset is latched per hart until the core,
+//     having quiesced, enters reset, and the reset holds while the hart's
+//     hartreset bit is 1.
+//   - A hart in reset is unavailable: not halted, not running. Its halted
+//     state, RESUME flag and group halt request drop, and a command running
+//     on it ends with cmderr 4. haltreq survives a reset.
+//   - havereset is set by every reset of the hart (power-on, ndmreset,
+//     hartreset) and cleared only by ackhavereset; dmactive = 0 keeps it.
+//   - A hart with resethaltreq has a halt request from its reset until it
+//     halts.
 // Rationale:
 //   - hartsel keeps idx_w(N_HARTS) bits of hartsello (WARL), so a debugger
 //     finds the hart count by writing all ones; a selection past the last
@@ -70,6 +92,13 @@ module dm #(
     o_obs      : output dm_pkg::CmdObs              ,
     o_active   : output logic                       ,
     o_hobs     : output dm_pkg::HartObs             ,
+    i_sys_idle : input  logic                       ,
+    i_quiet    : input  logic<N_HARTS>              ,
+    o_drain    : output logic                       ,
+    o_ndmreset : output logic                       ,
+    o_hartreset: output logic<N_HARTS>              ,
+    o_hart_rst : output logic<N_HARTS>              ,
+    o_robs     : output dm_pkg::RstObs              ,
 ) {
     const HSEL_W: u32 = tag_pkg::idx_w(N_HARTS);
     const PB_N  : u32 = dm_pkg::PROGBUFSIZE;
@@ -97,6 +126,15 @@ module dm #(
     var run_q      : logic           ; // the hart wrote GOING for this command
     var cmdh_q     : logic<N_HARTS>  ; // the command hart, one-hot
     var mprven_q   : logic           ;
+    var ndm_q      : logic           ; // dmcontrol.ndmreset
+    var ndp_q      : logic           ; // an ndmreset written 1 that has not reset yet
+    var nd_rst_q   : logic           ; // the platform is held in reset
+    var hrl_q      : logic<N_HARTS>  ; // dmcontrol.hartreset per hart
+    var hrp_q      : logic<N_HARTS>  ; // a hartreset that has not reset the hart yet
+    var hr_rst_q   : logic<N_HARTS>  ; // the core domain is held in reset
+    var haverst_q  : logic<N_HARTS>  ;
+    var rhr_q      : logic<N_HARTS>  ; // resethaltreq
+    var rhreq_q    : logic<N_HARTS>  ; // halt request after a reset with resethaltreq
 
     let dmi     : dm_pkg::DmiReq = i_dmi;
     let dmc_wr  : logic          = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_DMCONTROL;
@@ -105,6 +143,11 @@ module dm #(
     let w_haltreq: logic         = dmi.data[31];
     let w_resume: logic          = dmi.data[30] && !dmi.data[31];
     let w_hasel : logic          = dmi.data[26];
+    let w_hrst  : logic          = dmi.data[29];
+    let w_ackhr : logic          = dmi.data[28];
+    let w_setrh : logic          = dmi.data[3] && !dmi.data[2];
+    let w_clrrh : logic          = dmi.data[2];
+    let w_ndm   : logic          = dmi.data[1];
     let hw_wr   : logic          = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_HAWINDOW;
     let cs2_wr  : logic          = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_DMCS2;
     let w_grp   : logic<5>       = dmi.data[6:2];
@@ -127,7 +170,10 @@ module dm #(
     let sel_m       : logic<N_HARTS> = sel_oh | (if hasel_q ? hawin_q : '0);
     let w_sel       : logic<N_HARTS> = if dmc_wr ? wsel_oh | (if w_hasel ? hawin_q : '0) : '0;
     let rq          : logic<N_HARTS> = if w_resume ? w_sel : '0;
-    let halted_d    : logic<N_HARTS> = (halted_q | hit_halted) & ~hit_resuming;
+    // A hart in reset this cycle.
+    let hrst        : logic<N_HARTS> = hr_rst_q | (if nd_rst_q ? '1 : '0);
+    let halted_d    : logic<N_HARTS> = (halted_q | hit_halted) & ~hit_resuming & ~hrst;
+    let haverst_d   : logic<N_HARTS> = (haverst_q & ~(if active_d && w_ackhr ? w_sel : '0)) | hrst;
 
     // Group propagation: harts sharing a nonzero halt group with a hart that
     // newly halts, and halted harts sharing a nonzero resume group with a
@@ -155,14 +201,20 @@ module dm #(
     // dmstatus over the selected harts. hartsel naming no hart is the only
     // way to select a nonexistent one (hawindow keeps N_HARTS bits), and an
     // all* bit is 0 whenever any selected hart does not exist.
-    let exist  : logic = (hartsel_q as u32) <: N_HARTS;
-    let halted : logic = exist && ((halted_q & sel_oh) != '0); // the command hart
-    let any_hlt: logic = (sel_m & halted_q) != '0;
-    let all_hlt: logic = exist && (sel_m & ~halted_q) == '0;
-    let any_run: logic = (sel_m & ~halted_q) != '0;
-    let all_run: logic = exist && (sel_m & halted_q) == '0;
-    let any_ack: logic = (sel_m & resumeack_q) != '0;
-    let all_ack: logic = exist && (sel_m & ~resumeack_q) == '0;
+    let exist  : logic          = (hartsel_q as u32) <: N_HARTS;
+    let hlt    : logic<N_HARTS> = halted_q & ~hrst;
+    let run    : logic<N_HARTS> = ~halted_q & ~hrst;
+    let halted : logic          = exist && ((hlt & sel_oh) != '0); // the command hart
+    let any_hlt: logic          = (sel_m & hlt) != '0;
+    let all_hlt: logic          = exist && (sel_m & ~hlt) == '0;
+    let any_run: logic          = (sel_m & run) != '0;
+    let all_run: logic          = exist && (sel_m & ~run) == '0;
+    let any_un : logic          = (sel_m & hrst) != '0;
+    let all_un : logic          = exist && (sel_m & ~hrst) == '0;
+    let any_ack: logic          = (sel_m & resumeack_q) != '0;
+    let all_ack: logic          = exist && (sel_m & ~resumeack_q) == '0;
+    let any_hr : logic          = (sel_m & haverst_q) != '0;
+    let all_hr : logic          = exist && (sel_m & ~haverst_q) == '0;
 
     // Abstract command registers touched by this access.
     let a_data : logic    = dmi.valid && (dmi.addr == dm_pkg::DMI_DATA0 || dmi.addr == dm_pkg::DMI_DATA1);
@@ -188,10 +240,13 @@ module dm #(
     let going  : logic    = i_wevt.going && busy_q && !run_q;
     let done   : logic    = i_wevt.halted && busy_q && run_q && (hit_halted & cmdh_q) != '0;
     let exc    : logic    = i_wevt.exception && busy_q && run_q;
+    let cmd_rst: logic    = busy_q && (cmdh_q & hrst) != '0;
 
     // The cmderr this cycle sets, if cmderr is 0.
     let err_set: logic<3> = if a_busy ?
         dm_pkg::ERR_BUSY
+    : if cmd_rst ?
+        dm_pkg::ERR_HALT
     : if exc ?
         dm_pkg::ERR_EXC
     : if ex_req ?
@@ -248,8 +303,18 @@ module dm #(
             run_q       = 1'b0;
             cmdh_q      = '0;
             mprven_q    = 1'b0;
+            ndm_q       = 1'b0;
+            ndp_q       = 1'b0;
+            nd_rst_q    = 1'b0;
+            hrl_q       = '0;
+            hrp_q       = '0;
+            hr_rst_q    = '0;
+            haverst_q   = '1;
+            rhr_q       = '0;
+            rhreq_q     = '0;
         } else {
-            active_q = active_d;
+            active_q  = active_d;
+            haverst_q = haverst_d;
             if !active_d {
                 hartsel_q   = '0;
                 hasel_q     = 1'b0;
@@ -272,12 +337,32 @@ module dm #(
                 run_q       = 1'b0;
                 cmdh_q      = '0;
                 mprven_q    = 1'b0;
+                ndm_q       = 1'b0;
+                ndp_q       = 1'b0;
+                nd_rst_q    = 1'b0;
+                hrl_q       = '0;
+                hrp_q       = '0;
+                hr_rst_q    = '0;
+                rhr_q       = '0;
+                rhreq_q     = '0;
             } else {
                 if dmc_wr {
                     hartsel_q = wsel;
                     hasel_q   = w_hasel;
                     haltreq_q = (haltreq_q & ~w_sel) | (if w_haltreq ? w_sel : '0);
+                    hrl_q     = (hrl_q & ~w_sel) | (if w_hrst ? w_sel : '0);
+                    rhr_q     = (rhr_q & ~(if w_clrrh ? w_sel : '0)) | (if w_setrh ? w_sel : '0);
+                    ndm_q     = w_ndm;
                 }
+                // The resets: nd_rst_q and hr_rst_q hold for at least one
+                // cycle, then follow their dmcontrol bits.
+                nd_rst_q = if nd_rst_q ? ndm_q : (ndm_q || ndp_q) && i_sys_idle;
+                ndp_q    = !nd_rst_q && (ndp_q || (dmc_wr && w_ndm));
+                for h in 0..N_HARTS {
+                    hr_rst_q[h] = if hr_rst_q[h] ? hrl_q[h] : hrp_q[h] && i_quiet[h];
+                }
+                hrp_q   = (hrp_q | (if dmc_wr && w_hrst ? w_sel : '0)) & ~hr_rst_q & ~(if nd_rst_q ? '1 : '0);
+                rhreq_q = (rhreq_q | (hrst & rhr_q)) & ~halted_d;
                 if hw_wr {
                     hawin_q = dmi.data[N_HARTS - 1:0];
                 }
@@ -293,10 +378,10 @@ module dm #(
                         }
                     }
                 }
-                ghreq_q     = (ghreq_q | g_halt) & ~halted_d;
+                ghreq_q     = (ghreq_q | g_halt) & ~halted_d & ~hrst;
                 halted_q    = halted_d;
                 resumeack_q = (resumeack_q & ~(rq | res_set)) | hit_resuming;
-                resume_q    = (resume_q | res_set) & ~hit_resuming;
+                resume_q    = (resume_q | res_set) & ~hit_resuming & ~hrst;
 
                 if dmi_w && a_pbuf {
                     for i in 0..PB_N {
@@ -323,7 +408,7 @@ module dm #(
                     run_q    = 1'b1;
                     mprven_q = i_wevt.value[4];
                 }
-                if done || exc {
+                if done || exc || cmd_rst {
                     busy_q = 1'b0;
                     run_q  = 1'b0;
                 }
@@ -335,15 +420,20 @@ module dm #(
     always_comb {
         dmstatus      = 32'd0;
         dmstatus[3:0] = 4'd3; // version 1.0
+        dmstatus[5]   = 1'b1; // hasresethaltreq
         dmstatus[7]   = 1'b1; // authenticated
         dmstatus[8]   = any_hlt;
         dmstatus[9]   = all_hlt;
         dmstatus[10]  = any_run;
         dmstatus[11]  = all_run;
+        dmstatus[12]  = any_un;
+        dmstatus[13]  = all_un;
         dmstatus[14]  = !exist;
         dmstatus[15]  = sel_m == '0;
         dmstatus[16]  = any_ack;
         dmstatus[17]  = all_ack;
+        dmstatus[18]  = any_hr;
+        dmstatus[19]  = all_hr;
         dmstatus[22]  = 1'b1; // impebreak
     }
 
@@ -351,6 +441,8 @@ module dm #(
     always_comb {
         dmcontrol             = 32'd0;
         dmcontrol[0]          = active_q;
+        dmcontrol[1]          = ndm_q;
+        dmcontrol[29]         = (hrl_q & sel_oh) != '0;
         dmcontrol[16+:HSEL_W] = hartsel_q;
         dmcontrol[26]         = hasel_q;
     }
@@ -409,7 +501,22 @@ module dm #(
     }
 
     assign o_active  = active_q;
-    assign o_haltreq = haltreq_q | ghreq_q;
+    assign o_haltreq   = haltreq_q | ghreq_q | rhreq_q | (hrst & rhr_q);
+    assign o_drain     = (ndm_q || ndp_q) && !nd_rst_q;
+    assign o_ndmreset  = nd_rst_q;
+    assign o_hartreset = hrp_q & ~hr_rst_q;
+    assign o_hart_rst  = hr_rst_q;
+    always_comb {
+        o_robs           = 0 as dm_pkg::RstObs;
+        o_robs.ndm       = nd_rst_q;
+        o_robs.drain     = o_drain;
+        o_robs.idle      = i_sys_idle;
+        o_robs.hrst      = hrst as 8;
+        o_robs.hreq      = o_hartreset as 8;
+        o_robs.quiet     = i_quiet as 8;
+        o_robs.havereset = haverst_q as 8;
+        o_robs.resethalt = rhr_q as 8;
+    }
     assign o_go      = if busy_q && !run_q ? cmdh_q : '0;
     assign o_resume  = resume_q;
     assign o_data    = data_q;
