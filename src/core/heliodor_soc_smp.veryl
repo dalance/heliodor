@@ -21,8 +21,10 @@
 // per-hart and are served by the tb. Coherence: mem_ctrl drives precise per-hart
 // invalidates from the L2 directory (see core_inv_valid below).
 //
-// A new-core SoC also holds the Debug Module (dmi_apb, dm, dm_mem) behind
-// the APB DMI port; debug memory sits on the bus channels like the CLINT.
+// A new-core SoC also holds the Debug Module (dmi_apb, dm, dm_mem, dm_sba)
+// behind the APB DMI port; debug memory sits on the bus channels like the
+// CLINT, and System Bus Access reaches DRAM and ROM through mem_ctrl's SBA
+// slot and the devices through their ports.
 pub module heliodor_soc_smp #(
     param N_HARTS    : u32                            = 2                    ,
     param RESET_PC   : u64                            = 64'h8000_0000        ,
@@ -44,8 +46,9 @@ pub module heliodor_soc_smp #(
     // Base of debug memory (new cores): PMA_REGIONS must map the 4 KiB at
     // DM_BASE (code) and DM_BASE + 0x1000 (data) as target DEBUG.
     param DM_BASE: bit<56> = 56'h4000,
-    // AXI ID width of the new-core DRAM port: the ARID is the mem_ctrl slot.
-    const AXI_ID_W: u32 = $clog2(N_HARTS * 2),
+    // AXI ID width of the new-core DRAM port: the ARID is the mem_ctrl slot
+    // (two per hart and the SBA slot).
+    const AXI_ID_W: u32 = $clog2(N_HARTS * 2 + 1),
 ) (
     clk: input clock,
     rst: input reset,
@@ -249,6 +252,9 @@ pub module heliodor_soc_smp #(
 
     // The new cores reach DRAM and ROM through the AXI4 port.
     const AXI: bit = CORE != soc_pkg::CoreSel::V14;
+    // mem_ctrl slots: D and I per hart, and the SBA slot of a new core.
+    const MC_N : u32 = N_HARTS * 2 + (if AXI ? 1 : 0);
+    const SBA_S: u32 = N_HARTS * 2;
 
     // Per-hart MMIO address decode.
     var in_dram : logic [N_HARTS];
@@ -294,9 +300,9 @@ pub module heliodor_soc_smp #(
     var bus_wgrant  : logic     [N_HARTS]    ; // arbiter -> per-hart WRITE grant
     // P9.1: mem_ctrl <-> SoC wires (split-transaction DRAM reads).
     var ctrl_bus_rreq: logic     [N_HARTS];
-    var ctrl_hgrant  : logic     [N_HARTS * 2];
+    var ctrl_hgrant  : logic     [MC_N];
     var ctrl_hhold   : logic     [N_HARTS * 2]; // uncached DRAM read waiting for a recall
-    var ctrl_hrdata  : logic<64> [N_HARTS * 2];
+    var ctrl_hrdata  : logic<64> [MC_N];
     var ctrl_mem_addr: logic<64>          ;
     var ctrl_mem_ren : logic              ;
     var l2_caddr     : logic<64>          ;
@@ -326,8 +332,8 @@ pub module heliodor_soc_smp #(
     var l2_inst_port_busy: logic          ; // P3.a L2 1R1W: install-yields-to-write hold
     var l2_w_hit         : logic          ; // P3.b L2 1R1W: write hits L2 (needs merge-read), gated
     var l2_w_spec_ready  : logic          ; // P3.b L2 1R1W: pending write-hit's old line spec-read
-    var ctrl_busy_line: logic<58> [N_HARTS * 2];
-    var ctrl_busy_v   : logic     [N_HARTS * 2];
+    var ctrl_busy_line: logic<58> [MC_N];
+    var ctrl_busy_v   : logic     [MC_N];
     var l2_w_sharers   : logic<N_HARTS>   ;
     var l2_w_sharers_hi: logic<N_HARTS>   ;
     var l2_w_owned     : logic            ;
@@ -338,9 +344,9 @@ pub module heliodor_soc_smp #(
     var ctrl_inv2_addr: logic<64>          ;
     // P9.2 Phase B: write-back / MESI wires.
     var c_dmemw_wb    : logic     [N_HARTS]; // core → bus: writeback flag
-    var c_dmem_rfo    : logic     [N_HARTS * 2]; // core → mem_ctrl: store fill = RFO (per SLOT)
-    var c_dmem_iread  : logic     [N_HARTS * 2]; // P9.6: core → mem_ctrl: I-cache fill (uncounted, per SLOT)
-    var ctrl_hexcl    : logic     [N_HARTS * 2]; // mem_ctrl → core: grant state (per SLOT)
+    var c_dmem_rfo    : logic     [MC_N]; // core → mem_ctrl: store fill = RFO (per SLOT)
+    var c_dmem_iread  : logic     [MC_N]; // P9.6: core → mem_ctrl: I-cache fill (uncounted, per SLOT)
+    var ctrl_hexcl    : logic     [MC_N]; // mem_ctrl → core: grant state (per SLOT)
     var ctrl_probe_v  : logic     [N_HARTS]; // recall engine probes
     var ctrl_probe_addr: logic<64>         ;
     var ctrl_probe_self: logic             ;
@@ -375,6 +381,51 @@ pub module heliodor_soc_smp #(
         assign in_dm[h]    = AXI && d_attr.backed && (d_attr.target == pma_pkg::Target::DEBUG);
         assign in_dm_i[h]  = AXI && i_attr.backed && (i_attr.target == pma_pkg::Target::DEBUG);
     }
+
+    // memory_bus DRAM arbiter outputs (S23: per-channel downstream → L2),
+    // and the same channels once a System Bus Access may own them.
+    var bus_o_raddr   : logic<64>    ;
+    var bus_o_waddr   : logic<64>    ;
+    var bus_o_wdata   : logic<64> [8];
+    var bus_o_wstrb   : logic<8>  [8];
+    var bus_o_wen     : logic        ;
+    var bus_o_wb      : logic        ;
+    var bus_dramr_addr: logic<64>    ;
+    var bus_dramw_addr: logic<64>    ;
+    var bus_dram_wdata: logic<64> [8]; // S25: granted line lanes
+    var bus_dram_wstrb: logic<8>  [8];
+    var bus_dram_wen  : logic        ;
+
+    // System Bus Access (new cores): dm_sba's one access, decoded here. DRAM
+    // and ROM reads take mem_ctrl's SBA slot, which recalls an owner first. A
+    // DRAM write waits in that slot until no L1 owns the line (sba_wok), then
+    // takes the write channel for a cycle and invalidates every sharer. A
+    // device access owns the device ports in its first cycle. While SBA owns
+    // a channel, harts get no write grant and make no bus read request. ROM
+    // writes, debug memory and holes complete at once with sberror 2.
+    var sba_req: dm_pkg::SbaReq;
+    var sba_wok: logic         ;
+    let sba_attr : pma_pkg::PmaAttr = pma_check::<PMA_N>(sba_req.addr, PMA_REGIONS);
+    let sba_dram : logic            = sba_attr.backed && sba_attr.target == pma_pkg::Target::DRAM;
+    let sba_rom  : logic            = sba_attr.backed && sba_attr.target == pma_pkg::Target::ROM && !sba_req.write;
+    let sba_io   : logic            = sba_attr.backed && sba_attr.target == pma_pkg::Target::IO;
+    let sba_mc   : logic            = sba_req.valid && (sba_dram || sba_rom);
+    let sba_bad  : logic            = sba_req.valid && !(sba_dram || sba_rom || sba_io);
+    let sba_wsel : logic            = sba_mc && sba_req.write && sba_wok;
+    let sba_iocyc: logic            = sba_req.valid && sba_io;
+    let sba_wown : logic            = sba_wsel || (sba_iocyc && sba_req.write);
+    let sba_addr : logic<64>        = {8'd0, sba_req.addr};
+    let sba_clint: logic            = sba_iocyc && sba_req.addr[31:24] == 8'h02;
+    let sba_uart : logic            = sba_iocyc && sba_req.addr[31:28] == 4'h1;
+    let sba_plic : logic            = sba_iocyc && sba_req.addr[31:24] == 8'h0c;
+    assign bus_dramr_addr = if sba_iocyc ? sba_addr : bus_o_raddr;
+    assign bus_dramw_addr = if sba_wown ? sba_addr : bus_o_waddr;
+    for l in 0..8 :gen_sba_lane {
+        let sba_lane: logic = sba_dram && sba_req.addr[5:3] == l;
+        assign bus_dram_wdata[l] = if sba_wown ? sba_req.wdata : bus_o_wdata[l];
+        assign bus_dram_wstrb[l] = if sba_wown ? (if sba_lane ? sba_req.strb : 8'd0) : bus_o_wstrb[l];
+    }
+
     for h in 0..N_HARTS :gen_busin {
         // The bus read channel carries the LEGACY combinational single beats:
         // MMIO, plus the old core's firmware-ROM reads and its DRAM gather
@@ -387,7 +438,7 @@ pub module heliodor_soc_smp #(
         assign bus_in_raddr[h] = if !d_single && i_single ? c_imemr_addr[h] : c_dmem_addr[h];
         assign bus_in_ren[h]   = (c_dmem_ren[h] && !c_dmem_line[h] && (if AXI ? !d_on_axi[h] : !ctrl_hhold[h]))
             || (i_single && ctrl_hgrant[N_HARTS + h]);
-        assign bus_in_rreq[h]  = ctrl_bus_rreq[h];
+        assign bus_in_rreq[h]  = ctrl_bus_rreq[h] && !sba_iocyc;
         assign bus_in_waddr[h] = c_dmemw_addr[h];
         for l in 0..8 :gen_busin_lane {
             assign bus_in_wdata[h * 8 + l] = c_dmem_wdata[h * 8 + l];
@@ -419,12 +470,6 @@ pub module heliodor_soc_smp #(
         assign bus_stall_mem[h]  = 1'b0;
     }
 
-    // memory_bus DRAM arbiter outputs (S23: per-channel downstream → L2).
-    var bus_dramr_addr: logic<64>    ;
-    var bus_dramw_addr: logic<64>    ;
-    var bus_dram_wdata: logic<64> [8]; // S25: granted line lanes
-    var bus_dram_wstrb: logic<8>  [8];
-    var bus_dram_wen  : logic        ;
     // S23: write-grant qualification — the downstream DRAM port is single
     // and reads keep their pre-split priority. P9.1: a write is held while
     // mem_ctrl gathers a line from DRAM (ctrl_mem_busy) and while a legacy
@@ -478,7 +523,7 @@ pub module heliodor_soc_smp #(
                 // Intent, NOT the fired write enable (c_dmem_wen asserts only
                 // WITH its grant — using it here would close a comb loop
                 // through wgrant_ok). req + non-WB + DRAM target suffices.
-                wv_req_on = c_dmemw_req[h] && in_dram_w[h];
+                wv_req_on = c_dmemw_req[h] && in_dram_w[h] && !sba_wown;
             }
         }
     }
@@ -502,10 +547,14 @@ pub module heliodor_soc_smp #(
     // Formed at SoC level (like w_veto) from raw l2 pieces to avoid the comb-loop
     // analyzer tripping on a bundled l2 output. 0 unless L2_READ_1R1W (o_w_hit
     // is gated). Comb on pre-grant selection + registered spec state — no loop.
-    let l2_w_spec_hold: logic = wv_req_on && l2_w_hit && !l2_w_spec_ready;
+    let w_req_on      : logic = wv_req_on || sba_wsel;
+    let l2_w_spec_hold: logic = w_req_on && l2_w_hit && !l2_w_spec_ready;
     let wgrant_ok: logic = !ctrl_mem_busy && !ctrl_wb_full && !legacy_ext_read && !w_veto
         && !(clint_ren_w && w_in_clint) && !(uart_ren_w && w_in_uart)
-        && !(plic_ren_w && w_in_plic) && !l2_w_spec_hold;
+        && !(plic_ren_w && w_in_plic) && !l2_w_spec_hold && !sba_wsel && !sba_iocyc;
+    let sba_wfire: logic = sba_wsel && !ctrl_wb_full && !l2_w_spec_hold;
+    assign bus_dram_wen = bus_o_wen || sba_wfire;
+    assign bus_dramw_wb = bus_o_wb && !sba_wown;
 
     inst u_bus: memory_bus #(
         N_HARTS: N_HARTS,
@@ -543,13 +592,13 @@ pub module heliodor_soc_smp #(
         i_wgrant_ok     : wgrant_ok     ,
         o_dmemr_grant   : bus_dgrant    ,
         o_dmemw_grant   : bus_wgrant    ,
-        o_dmemr_addr    : bus_dramr_addr,
+        o_dmemr_addr    : bus_o_raddr   ,
         o_dmemr_ren     : bus_dramr_ren ,
-        o_dmemw_addr    : bus_dramw_addr,
-        o_dmemw_wdata   : bus_dram_wdata,
-        o_dmemw_wstrb   : bus_dram_wstrb,
-        o_dmemw_wen     : bus_dram_wen  ,
-        o_dmemw_wb      : bus_dramw_wb  , // P9.2: selected write is a WB
+        o_dmemw_addr    : bus_o_waddr   ,
+        o_dmemw_wdata   : bus_o_wdata   ,
+        o_dmemw_wstrb   : bus_o_wstrb   ,
+        o_dmemw_wen     : bus_o_wen     ,
+        o_dmemw_wb      : bus_o_wb      , // P9.2: selected write is a WB
         o_dmemw_sel     : bus_dramw_sel , // P9.2: write-channel selection
         o_dmem_inv_valid: _             , // P9.2: precise inv via mem_ctrl
         o_dmem_inv_addr : _             ,
@@ -608,11 +657,11 @@ pub module heliodor_soc_smp #(
     // always a DRAM line I-read (its non-DRAM fetch uses the o_imem passthrough);
     // a new core marks its uncached fetch as a single beat, an uncached AXI read
     // like a D-side single beat to DRAM or ROM.
-    var mc_req  : logic     [N_HARTS * 2];
-    var mc_addr : logic<64> [N_HARTS * 2];
-    var mc_dram : logic     [N_HARTS * 2];
-    var mc_unc  : logic     [N_HARTS * 2];
-    var mc_rom  : logic     [N_HARTS * 2];
+    var mc_req  : logic     [MC_N];
+    var mc_addr : logic<64> [MC_N];
+    var mc_dram : logic     [MC_N];
+    var mc_unc  : logic     [MC_N];
+    var mc_rom  : logic     [MC_N];
     // SLOT-MAJOR (see mem_ctrl's header): slots [0, N_HARTS) are the D side, one per
     // hart in hart order, and [N_HARTS, 2*N_HARTS) the I side. Hart-major numbering
     // would hand hart 0 two consecutive slots and let it win both lowest-id-wins
@@ -706,6 +755,7 @@ pub module heliodor_soc_smp #(
         );
         assign o_mc_perf     = 0;
         assign ctrl_wb_full  = 1'b0;
+        assign sba_wok       = 1'b0;
         assign o_axi_arvalid = 1'b0;
         assign o_axi_arid    = '0;
         assign o_axi_araddr  = '0;
@@ -740,6 +790,8 @@ pub module heliodor_soc_smp #(
             i_hunc        : mc_unc              ,
             i_hrom        : mc_rom              ,
             o_hexcl       : ctrl_hexcl          , // P9.2: grant state to the L1
+            i_sba_wr      : sba_req.write       ,
+            o_sba_wok     : sba_wok             ,
             o_bus_rreq    : ctrl_bus_rreq       ,
             i_bus_rgrant  : bus_dgrant          ,
             o_l2_caddr    : l2_caddr            ,
@@ -810,6 +862,7 @@ pub module heliodor_soc_smp #(
             o_axi_err     : o_axi_err           ,
             o_wb_full     : ctrl_wb_full        ,
             i_w_valid     : bus_dram_wen        ,
+            i_w_sba       : sba_wfire           ,
             i_w_addr      : bus_dramw_addr      ,
             i_w_hi        : l2_wstrb_hi != 8'd0 ,
             i_w_strb      : bus_dram_wstrb      ,
@@ -826,6 +879,13 @@ pub module heliodor_soc_smp #(
         assign ctrl_mem_addr = 64'd0;
         assign ctrl_mem_ren  = 1'b0;
         assign ctrl_mem_busy = 1'b0;
+        assign mc_req[SBA_S]       = sba_mc;
+        assign mc_addr[SBA_S]      = sba_addr;
+        assign mc_dram[SBA_S]      = 1'b0;
+        assign mc_unc[SBA_S]       = sba_mc;
+        assign mc_rom[SBA_S]       = sba_rom;
+        assign c_dmem_rfo[SBA_S]   = 1'b0;
+        assign c_dmem_iread[SBA_S] = 1'b0;
         // An uncached read is held by its pending request, not by a hold.
         for s in 0..N_HARTS * 2 :gen_nohold {
             assign ctrl_hhold[s] = 1'b0;
@@ -838,6 +898,7 @@ pub module heliodor_soc_smp #(
     inst u_l2: l2cache #(
         N_HARTS: N_HARTS,
         SPH    : 2      ,
+        N_SLOTS: MC_N   ,
     ) (
         clk                        ,
         rst                        ,
@@ -864,6 +925,7 @@ pub module heliodor_soc_smp #(
         i_busy_line : ctrl_busy_line,
         i_busy_v    : ctrl_busy_v  ,
         i_w_hart      : w_hart_idx     ,
+        i_w_nohart    : sba_wfire      ,
         i_w_wb        : bus_dramw_wb   ,
         i_w_cadd_v   : l2_wcadd_v   , // P9.3: c2c requester add
         i_w_cadd_hart: l2_wcadd_hart,
@@ -880,7 +942,7 @@ pub module heliodor_soc_smp #(
         i_wstrb    : bus_dram_wstrb,
         i_wstrb_hi : l2_wstrb_hi   ,
         i_wen      : bus_dram_wen  ,
-        i_w_req      : wv_req_on      , // P3.b: selected DRAM write requested (pre-grant)
+        i_w_req      : w_req_on       , // P3.b: selected DRAM write requested (pre-grant)
         o_w_hit       : l2_w_hit      , // P3.b: raw hold pieces (combined at SoC)
         o_w_spec_ready: l2_w_spec_ready,
         o_mem_addr : l2_mem_addr   ,
@@ -955,6 +1017,12 @@ pub module heliodor_soc_smp #(
                 plic_ren_w = 1'b1;
             }
         }
+        clint_wen_w |= sba_clint && sba_req.write;
+        clint_ren_w |= sba_clint && !sba_req.write;
+        uart_wen_w  |= sba_uart && sba_req.write;
+        uart_ren_w  |= sba_uart && !sba_req.write;
+        plic_wen_w  |= sba_plic && sba_req.write;
+        plic_ren_w  |= sba_plic && !sba_req.write;
     }
 
     // mtime tick, combinational from hart 0's registered retire records: a
@@ -1098,9 +1166,10 @@ pub module heliodor_soc_smp #(
             }
         }
     }
-    assign o_io_obs[0] = soc_pkg::IoObs'{valid: io_ren, write: 1'b0, hart: io_rhart, addr: bus_dramr_addr, data: io_rdat,
+    // The hart-side IO checker sees only the harts' accesses.
+    assign o_io_obs[0] = soc_pkg::IoObs'{valid: io_ren && !sba_iocyc, write: 1'b0, hart: io_rhart, addr: bus_dramr_addr, data: io_rdat,
         strb: 8'd0};
-    assign o_io_obs[1] = soc_pkg::IoObs'{valid: io_wen, write: 1'b1, hart: io_whart, addr: bus_dramw_addr,
+    assign o_io_obs[1] = soc_pkg::IoObs'{valid: io_wen && !sba_iocyc, write: 1'b1, hart: io_whart, addr: bus_dramw_addr,
         data: bus_dram_wdata[bus_dramw_addr[5:3]], strb: io_wstrb};
 
     // Debug Module (new cores). Debug memory sits on the bus channels like
@@ -1130,7 +1199,14 @@ pub module heliodor_soc_smp #(
         var dm_code  : logic<32> [dm_pkg::CODE_N] ;
         var dm_data  : logic<64>                  ;
         var dm_cmd   : dm_pkg::CmdObs             ;
+        var dm_active: logic                      ;
+        var dm_rd    : logic<32>                  ;
+        var sba_rd   : logic<32>                  ;
+        var sba_obs  : dm_pkg::SbaObs             ;
         let dm_wdata : logic<64> = bus_dram_wdata[bus_dramw_addr[5:3]];
+        let sba_done : logic     = sba_bad || sba_iocyc || sba_wfire || (sba_mc && !sba_req.write && ctrl_hgrant[SBA_S]);
+        let sba_rdata: logic<64> = if sba_iocyc ? io_rdat : ctrl_hrdata[SBA_S];
+        assign dmi_rdata = dm_rd | sba_rd;
         inst u_dmi: dmi_apb (
             clk                     ,
             rst      : i_dm_rst     ,
@@ -1153,7 +1229,7 @@ pub module heliodor_soc_smp #(
             clk                      ,
             rst        : i_dm_rst    ,
             i_dmi_raddr: dmi_raddr   ,
-            o_dmi_rdata: dmi_rdata   ,
+            o_dmi_rdata: dm_rd       ,
             i_dmi      : dmi_req     ,
             i_wevt     : dm_wevt     ,
             i_dstrb    : dm_dstrb    ,
@@ -1164,6 +1240,20 @@ pub module heliodor_soc_smp #(
             o_code     : dm_code     ,
             o_data     : dm_data     ,
             o_obs      : dm_cmd      ,
+            o_active   : dm_active   ,
+        );
+        inst u_sba: dm_sba (
+            clk                      ,
+            rst        : i_dm_rst    ,
+            i_active   : dm_active   ,
+            i_dmi_raddr: dmi_raddr   ,
+            o_dmi_rdata: sba_rd      ,
+            i_dmi      : dmi_req     ,
+            o_req      : sba_req     ,
+            i_done     : sba_done    ,
+            i_err      : sba_bad     ,
+            i_rdata    : sba_rdata   ,
+            o_obs      : sba_obs     ,
         );
         inst u_dm_mem: dm_mem #(
             N_HARTS: N_HARTS,
@@ -1187,6 +1277,7 @@ pub module heliodor_soc_smp #(
             o_dm_obs.dmi_wr  = dmi_req.valid && dmi_req.write;
             o_dm_obs.dmi_err = o_dm_pslverr;
             o_dm_obs.cmd     = dm_cmd;
+            o_dm_obs.sba     = sba_obs;
             for h in 0..N_HARTS {
                 o_dm_obs.haltreq[h] = dm_haltreq[h];
             }
@@ -1194,6 +1285,7 @@ pub module heliodor_soc_smp #(
     } else {
         assign dm_rdata     = 64'd0;
         assign dm_haltreq   = '0;
+        assign sba_req      = 0 as dm_pkg::SbaReq;
         assign o_dm_pready  = 1'b1;
         assign o_dm_prdata  = 32'd0;
         assign o_dm_pslverr = 1'b0;

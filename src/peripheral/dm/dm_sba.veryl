@@ -1,0 +1,220 @@
+// dm_sba: the Debug Module's System Bus Access registers and its bus master
+// (Debug Spec 1.0, sbversion 1, sbasize 56, accesses of 8 to 64 bits).
+//
+// Ports (timing contract):
+//   i_active       : dmcontrol.dmactive (registered in dm)
+//   i_dmi_raddr/o_dmi_rdata : combinational read decode of the DMI address,
+//                    0 outside sbcs .. sbdata1
+//   i_dmi          : the DMI access of this cycle; its side effects (an
+//                    access start, sbbusyerror) take effect on this edge
+//   o_req          : registered; the one outstanding access
+//   i_done         : the access completes this cycle; i_err marks a bad
+//                    address (sberror 2), i_rdata is the aligned dword
+//                    holding a read's bytes
+//   o_obs          : SBA events (design section D.15)
+// Owns:
+//   - At most one access: o_req.valid from its start to i_done (sbbusy).
+//     While busy, an access to sbaddress0/1 (write) or sbdata0/1 (read or
+//     write) sets sbbusyerror and does nothing else.
+//   - An access starts on an sbaddress0 write with sbreadonaddr, an sbdata0
+//     read with sbreadondata, or an sbdata0 write, only while sberror and
+//     sbbusyerror are 0. The size (sberror 4) and the alignment (sberror 3)
+//     are checked at the start; a failed check starts nothing.
+//   - sbaddress advances by the access size after a successful access with
+//     sbautoincrement.
+// Rationale:
+//   - A read fills sbdata1:sbdata0 zero-extended (the spec leaves the bits
+//     above the access size open).
+//   - sbcs stays writable while busy: the access latched its size, address
+//     and data at its start.
+//   - dmactive = 0 resets every register and drops the outstanding request;
+//     the SoC side lets a requester leave before its completion.
+module dm_sba (
+    clk        : input  clock         ,
+    rst        : input  reset         ,
+    i_active   : input  logic         ,
+    i_dmi_raddr: input  logic<7>      ,
+    o_dmi_rdata: output logic<32>     ,
+    i_dmi      : input  dm_pkg::DmiReq,
+    o_req      : output dm_pkg::SbaReq,
+    i_done     : input  logic         ,
+    i_err      : input  logic         ,
+    i_rdata    : input  logic<64>     ,
+    o_obs      : output dm_pkg::SbaObs,
+) {
+    var addr_q    : logic<56>     ;
+    var data_q    : logic<64>     ;
+    var rdonaddr_q: logic         ;
+    var rdondata_q: logic         ;
+    var autoinc_q : logic         ;
+    var access_q  : logic<3>      ;
+    var sberr_q   : logic<3>      ;
+    var busyerr_q : logic         ;
+    var req_q     : dm_pkg::SbaReq;
+
+    let dmi : dm_pkg::DmiReq = i_dmi;
+    let busy: logic          = req_q.valid;
+    let a_cs: logic          = dmi.valid && dmi.write && dmi.addr == dm_pkg::DMI_SBCS;
+    let a_a0: logic          = dmi.valid && dmi.addr == dm_pkg::DMI_SBADDRESS0;
+    let a_a1: logic          = dmi.valid && dmi.addr == dm_pkg::DMI_SBADDRESS1;
+    let a_d0: logic          = dmi.valid && dmi.addr == dm_pkg::DMI_SBDATA0;
+    let a_d1: logic          = dmi.valid && dmi.addr == dm_pkg::DMI_SBDATA1;
+
+    let busy_hit: logic = busy && (((a_a0 || a_a1) && dmi.write) || a_d0 || a_d1);
+    let clean   : logic = !busy && sberr_q == dm_pkg::SBERR_NONE && !busyerr_q;
+    let go_raddr: logic = clean && a_a0 && dmi.write && rdonaddr_q;
+    let go_rdata: logic = clean && a_d0 && !dmi.write && rdondata_q;
+    let go_write: logic = clean && a_d0 && dmi.write;
+    let go      : logic = go_raddr || go_rdata || go_write;
+
+    // The access a start would issue: its address and data are the values
+    // this access writes.
+    let s_addr : logic<56> = if go_raddr ? {addr_q[55:32], dmi.data} : addr_q;
+    let s_data : logic<64> = if go_write ? {data_q[63:32], dmi.data} : data_q;
+    let s_size : logic<2>  = access_q[1:0];
+    let s_strb : logic<8>  = case s_size {
+        2'd0   : 8'h01,
+        2'd1   : 8'h03,
+        2'd2   : 8'h0f,
+        default: 8'hff,
+    };
+    let s_amask: logic<3> = case s_size {
+        2'd0   : 3'd0,
+        2'd1   : 3'd1,
+        2'd2   : 3'd3,
+        default: 3'd7,
+    };
+    let s_err  : logic<3>  = if access_q >: 3'd3 ?
+        dm_pkg::SBERR_SIZE
+    : if (s_addr[2:0] & s_amask) != 3'd0 ?
+        dm_pkg::SBERR_ALIGN
+    :
+        dm_pkg::SBERR_NONE
+    ;
+    let s_ok: logic = go && s_err == dm_pkg::SBERR_NONE;
+
+    function size_mask (
+        size: input logic<2>,
+    ) -> logic<64> {
+        return case size {
+            2'd0   : 64'h0000_0000_0000_00ff,
+            2'd1   : 64'h0000_0000_0000_ffff,
+            2'd2   : 64'h0000_0000_ffff_ffff,
+            default: 64'hffff_ffff_ffff_ffff,
+        };
+    }
+
+    // A completed read, right-justified and cut to its size.
+    let r_sh  : logic<64> = i_rdata >> {req_q.addr[2:0], 3'd0};
+    let r_mask: logic<64> = size_mask(req_q.size);
+    let d_ok  : logic     = busy && i_done && !i_err;
+    let d_err : logic<3>  = if busy && i_done && i_err ? dm_pkg::SBERR_ADDR : if go ? s_err : dm_pkg::SBERR_NONE;
+    let r_inc : logic<56> = addr_q + ({53'd0, 3'd1} << req_q.size);
+
+    always_ff {
+        if_reset {
+            addr_q     = 56'd0;
+            data_q     = 64'd0;
+            rdonaddr_q = 1'b0;
+            rdondata_q = 1'b0;
+            autoinc_q  = 1'b0;
+            access_q   = 3'd2;
+            sberr_q    = 3'd0;
+            busyerr_q  = 1'b0;
+            req_q      = 0 as dm_pkg::SbaReq;
+        } else if !i_active {
+            addr_q     = 56'd0;
+            data_q     = 64'd0;
+            rdonaddr_q = 1'b0;
+            rdondata_q = 1'b0;
+            autoinc_q  = 1'b0;
+            access_q   = 3'd2;
+            sberr_q    = 3'd0;
+            busyerr_q  = 1'b0;
+            req_q      = 0 as dm_pkg::SbaReq;
+        } else {
+            if a_cs {
+                busyerr_q  = busyerr_q && !dmi.data[22];
+                rdonaddr_q = dmi.data[20];
+                access_q   = dmi.data[19:17];
+                autoinc_q  = dmi.data[16];
+                rdondata_q = dmi.data[15];
+                sberr_q    = sberr_q & ~dmi.data[14:12];
+            }
+            if busy_hit {
+                busyerr_q = 1'b1;
+            }
+            if !busy && dmi.write {
+                if a_a0 {
+                    addr_q[31:0] = dmi.data;
+                }
+                if a_a1 {
+                    addr_q[55:32] = dmi.data[23:0];
+                }
+                if a_d1 {
+                    data_q[63:32] = dmi.data;
+                }
+                if go_write {
+                    data_q[31:0] = dmi.data;
+                }
+            }
+            if d_err != dm_pkg::SBERR_NONE {
+                sberr_q = d_err;
+            }
+            if d_ok {
+                if !req_q.write {
+                    data_q = r_sh & r_mask;
+                }
+                if autoinc_q {
+                    addr_q = r_inc;
+                }
+            }
+            if busy && i_done {
+                req_q.valid = 1'b0;
+            }
+            if s_ok {
+                req_q = dm_pkg::SbaReq'{
+                    valid: 1'b1                                               ,
+                    write: go_write                                           ,
+                    addr : s_addr                                             ,
+                    size : s_size                                             ,
+                    wdata: (s_data & size_mask(s_size)) << {s_addr[2:0], 3'd0},
+                    strb : s_strb << s_addr[2:0]                              ,
+                };
+            }
+        }
+    }
+    assign o_req = req_q;
+
+    var sbcs: logic<32>;
+    always_comb {
+        sbcs        = 32'd0;
+        sbcs[31:29] = 3'd1;
+        sbcs[22]    = busyerr_q;
+        sbcs[21]    = busy;
+        sbcs[20]    = rdonaddr_q;
+        sbcs[19:17] = access_q;
+        sbcs[16]    = autoinc_q;
+        sbcs[15]    = rdondata_q;
+        sbcs[14:12] = sberr_q;
+        sbcs[11:5]  = 7'd56;
+        sbcs[3:0]   = 4'hf; // 64, 32, 16 and 8-bit accesses
+    }
+    assign o_dmi_rdata = case i_dmi_raddr {
+        dm_pkg::DMI_SBCS      : sbcs,
+        dm_pkg::DMI_SBADDRESS0: addr_q[31:0],
+        dm_pkg::DMI_SBADDRESS1: {8'd0, addr_q[55:32]},
+        dm_pkg::DMI_SBDATA0   : data_q[31:0],
+        dm_pkg::DMI_SBDATA1   : data_q[63:32],
+        default               : 32'd0,
+    };
+
+    assign o_obs = dm_pkg::SbaObs'{
+        start  : i_active && s_ok                             ,
+        done   : busy && (i_done || !i_active)                ,
+        write  : req_q.write                                  ,
+        err    : if sberr_q == dm_pkg::SBERR_NONE && i_active ? d_err : dm_pkg::SBERR_NONE,
+        busyerr: i_active && busy_hit && !busyerr_q           ,
+        busy   : busy                                         ,
+    };
+}

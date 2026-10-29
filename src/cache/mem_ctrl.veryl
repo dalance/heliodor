@@ -38,6 +38,14 @@
 // and grant pass straight through (o_bus_rreq / o_hgrant) and the SoC muxes
 // their data.
 //
+// The last slot (SBA_S) belongs to the Debug Module's System Bus Access and
+// to no hart; it only makes i_hunc requests. A read is the uncached beat
+// above. A write (i_sba_wr) waits in LOOKUP like a read, so the recall
+// engine brings an owned line home, then holds the line in ST_UNCD
+// (o_sba_wok) until the SoC grants it the write channel (i_w_sba). Holding
+// the slot keeps every other accept off the line, so no L1 can own it again
+// before the write, and the write invalidates every sharer.
+//
 // Protocol invariant relied upon: an accept grant ALWAYS starts the L1 fill
 // (the requester suppresses its request when it could not start the fill).
 //
@@ -72,10 +80,12 @@ pub module mem_ctrl #(
     // slot->hart map (slot / SPH) is the identity, so the module is byte-identical
     // to the pre-Block-N version.
     param SPH      : u32 = 2 ,
-    param N_SLOTS  : u32 = N_HARTS * SPH,
     param HIT_WAIT : u32 = 2 , // L2 copy -> stream start (L2 latency model), >= 1
     param WB_N     : u32 = 2 * N_HARTS, // write buffer entries
-    const ID_W     : u32 = if N_SLOTS >= 2 ? $clog2(N_SLOTS) : 1, // ARID = slot
+    const SBA_S    : u32 = N_HARTS * SPH, // the SBA slot
+    const N_SLOTS  : u32 = SBA_S + 1,
+    const ID_W     : u32 = $clog2(N_SLOTS), // ARID = slot
+    const SLOT_W   : u32 = $clog2(N_SLOTS),
 ) (
     clk: input clock,
     rst: input reset,
@@ -103,6 +113,10 @@ pub module mem_ctrl #(
     i_hunc : input  logic [N_SLOTS],
     i_hrom : input  logic [N_SLOTS], // the i_hunc read targets ROM (o_perf only)
     o_hexcl: output logic [N_SLOTS],
+    // The SBA slot's request is a write; o_sba_wok (registered) holds the
+    // line for it.
+    i_sba_wr : input  logic,
+    o_sba_wok: output logic,
     // Bus side: read-channel cycle requests of legacy (MMIO) reads, which
     // the memory_bus arbitrates with its rotation.
     o_bus_rreq  : output logic [N_HARTS],
@@ -207,6 +221,7 @@ pub module mem_ctrl #(
     // which also writes the line at i_w_addr+8). It is snooped by the slots
     // and enters the write buffer.
     i_w_valid: input logic    ,
+    i_w_sba  : input logic    , // ... is the SBA slot's write (no writer hart)
     i_w_addr : input logic<64>,
     i_w_hi   : input logic    ,
     i_w_strb : input logic<8> [8],
@@ -231,7 +246,7 @@ pub module mem_ctrl #(
     const ST_GATHER : logic<3> = 3'd4; // AR accepted, R beats arriving
     const ST_INSTALL: logic<3> = 3'd5;
     const ST_STREAM : logic<3> = 3'd6;
-    const ST_UNCD   : logic<3> = 3'd7; // uncached beat in the buffer, granted this cycle
+    const ST_UNCD   : logic<3> = 3'd7; // uncached beat in the buffer, granted this cycle; an SBA write holds its line
 
     // Write-snoop line decode (the +8 line covers the misaligned hi-side).
     let w_line   : logic<58> = i_w_addr[63:6];
@@ -414,6 +429,7 @@ pub module mem_ctrl #(
         var unc_q  : logic        ;
         var rom_q  : logic        ;
         var excl_q : logic        ; // grant state (E/M vs S), set at grant
+        var wr_q   : logic        ; // the SBA slot's transaction is a write
         var buf_q  : logic<64> [8];
 
         assign st_all[h]    = st_q;
@@ -451,6 +467,7 @@ pub module mem_ctrl #(
                 unc_q   = 1'b0;
                 rom_q   = 1'b0;
                 excl_q  = 1'b0;
+                wr_q    = 1'b0;
                 for l in 0..8 {
                     buf_q[l] = 64'd0;
                 }
@@ -469,6 +486,7 @@ pub module mem_ctrl #(
                             unc_q   = i_hunc[h];
                             rom_q   = i_hunc[h] && i_hrom[h];
                             excl_q  = 1'b0;
+                            wr_q    = h == SBA_S && i_sba_wr;
                             st_q    = ST_LOOKUP;
                         }
                     }
@@ -481,7 +499,7 @@ pub module mem_ctrl #(
                             if !unc_live {
                                 st_q = ST_IDLE;
                             } else if lk_sel_all[h] && !(i_l2_chit && i_l2_c_owned) {
-                                st_q = ST_AR;
+                                st_q = if wr_q ? ST_UNCD : ST_AR;
                             }
                         } else if c2c_go_all[h] {
                             for l in 0..8 {
@@ -569,7 +587,9 @@ pub module mem_ctrl #(
                         }
                     }
                     ST_UNCD: {
-                        st_q = ST_IDLE;
+                        if !wr_q || !unc_live || (i_w_valid && i_w_sba) {
+                            st_q = ST_IDLE;
+                        }
                     }
                     default: {
                         st_q = ST_IDLE;
@@ -582,7 +602,7 @@ pub module mem_ctrl #(
         // beat, or the legacy (MMIO) combinational passthrough of the bus
         // grant.
         let legacy : logic = i_hreq[h] && !i_hdram[h] && !i_hunc[h];
-        let unc_dlv: logic = (st_q == ST_UNCD) && unc_live && (i_haddr[h][5:3] == dw_q);
+        let unc_dlv: logic = (st_q == ST_UNCD) && !wr_q && unc_live && (i_haddr[h][5:3] == dw_q);
         // A STREAM beat is granted only to a consumer addressing this slot's
         // line: the core's routing of the shared read port can drift
         // mid-STREAM, and mismatched beats must stream out unconsumed.
@@ -592,6 +612,9 @@ pub module mem_ctrl #(
         assign o_hexcl[h]  = excl_q;
 
         assign slot_bus_req[h] = legacy;
+        if h == SBA_S :gen_sba_wok {
+            assign o_sba_wok = (st_q == ST_UNCD) && wr_q;
+        }
     }
 
     // Per-hart aggregation of the slot bus requests, and the reverse distribution
@@ -647,19 +670,25 @@ pub module mem_ctrl #(
     //     (lowest arbitration priority — wait until granted).
     //   - grant state: RFO or sole-sharer READ ⇒ E/M (cadd_own), else S.
     // ------------------------------------------------------------------
-    var lk_v : logic         ;
-    var lk_oh: logic<N_HARTS>;
-    var lk_h : logic<3>      ;
+    var lk_v  : logic         ;
+    var lk_oh : logic<N_HARTS>;
+    var lk_h  : logic<3>      ;
+    var lk_sba: logic         ;
     always_comb {
-        lk_v  = 1'b0;
-        lk_oh = '0;
-        lk_h  = 3'd0;
-        for h in 0..N_SLOTS {
+        lk_v   = 1'b0;
+        lk_oh  = '0;
+        lk_h   = 3'd0;
+        lk_sba = 1'b0;
+        for h in 0..SBA_S {
             if lk_sel_all[h] {
                 lk_v            = 1'b1;
                 lk_oh[h % N_HARTS] = 1'b1; // HART one-hot: lk_others ANDs it with the directory
                 lk_h               = (h % N_HARTS) as 3;
             }
+        }
+        if lk_sel_all[SBA_S] {
+            lk_v   = 1'b1;
+            lk_sba = 1'b1;
         }
     }
     var lk_rfo: logic;
@@ -922,14 +951,14 @@ pub module mem_ctrl #(
     //     entered into the directory).
     // ------------------------------------------------------------------
     var inst_sel_v: logic    ;
-    var inst_sel_h: logic<4> ;
+    var inst_sel_h: logic<SLOT_W>;
     always_comb {
         inst_sel_v = 1'b0;
         inst_sel_h = 4'd0;
         for h in 0..N_SLOTS {
             if (st_all[h] == ST_INSTALL) && !inst_sel_v {
                 inst_sel_v = 1'b1;
-                inst_sel_h = h as 4;
+                inst_sel_h = h as SLOT_W;
             }
         }
     }
@@ -939,7 +968,7 @@ pub module mem_ctrl #(
         inst_line = '0;
         inst_do   = 1'b0;
         for h in 0..N_SLOTS {
-            if inst_sel_v && (inst_sel_h == (h as 4)) {
+            if inst_sel_v && (inst_sel_h == (h as SLOT_W)) {
                 inst_line = line_all[h];
                 inst_do   = iok_all[h] && !conf_all[h];
             }
@@ -947,7 +976,7 @@ pub module mem_ctrl #(
     }
     var inst_sel_oh: logic<N_SLOTS>;
     for h in 0..N_SLOTS :gen_inst_oh {
-        assign inst_sel_oh[h] = inst_sel_v && (inst_sel_h == (h as 4));
+        assign inst_sel_oh[h] = inst_sel_v && (inst_sel_h == (h as SLOT_W));
     }
 
     // The install one-hot above is a SLOT mask; the directory consumers below
@@ -969,11 +998,12 @@ pub module mem_ctrl #(
     // event holds until a port frees.
     var w_hart_oh: logic<N_HARTS>;
     for h in 0..N_HARTS :gen_w_oh {
-        assign w_hart_oh[h] = i_w_hart == (h as 3);
+        assign w_hart_oh[h] = !i_w_sba && i_w_hart == (h as 3);
     }
     // lo-line write inv: a misaligned store kills the line at the home (the
     // hi dword bypassed it), so ALL sharers drop it; a plain write keeps the
-    // writer's own copy (its L1 merged the data itself). Phase B: a WB
+    // writer's own copy (its L1 merged the data itself), and an SBA write
+    // has no writer. Phase B: a WB
     // (eviction/recall/flush) invalidates nobody — the writer already
     // dropped its copy and no other sharer exists (it was the owner).
     let ev_w1_mask: logic<N_HARTS> = if i_w_hi ? i_w_shr : i_w_shr & ~w_hart_oh;
@@ -1074,7 +1104,7 @@ pub module mem_ctrl #(
             } else {
                 eng_line = lk_line;
                 eng_hart = lk_owner;
-                eng_self = lk_owner == lk_h;
+                eng_self = lk_owner == lk_h && !lk_sba;
             }
         } else if eng_done_ack || eng_done_wb {
             eng_busy = 1'b0;

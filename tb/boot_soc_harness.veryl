@@ -10,7 +10,9 @@
 // o_* scalars are hart 0's. REPLAY_EN replays the golden interrupt schedule
 // IRQ_FILE through irq_replay on hart 0 (N_HARTS = 1 with MTIME_SRC =
 // INSTRET for a golden lockstep run); a replay failure is the top bit of
-// hart 0's monitor chk.
+// hart 0's monitor chk. DMI_EN plays the DMI script DMI_FILE (dm_seq) on the
+// SoC's APB port, checked by chk_dm; the run then passes only once the
+// script has reached END with no mismatch.
 module boot_soc_harness #(
     param N_HARTS    : u32                                = 1                              ,
     param FW_HEX     : string                             = "test/hex/linux_boot_fw.hex"   ,
@@ -39,6 +41,8 @@ module boot_soc_harness #(
     param AXI_MEM_DW : u32                                = 4194304                        , // slave DRAM, dwords
     param AXI_ERR_EXP: bit                                = 1'b0                           , // pass needs both AXI error flags
     param WB_N       : u32                                = 2 * N_HARTS                    , // SoC write buffer entries
+    param DMI_EN     : bit                                = 1'b0                           ,
+    param DMI_FILE   : string                             = ""                             ,
 ) (
     clk      : input  clock    ,
     rst      : input  reset    ,
@@ -52,8 +56,8 @@ module boot_soc_harness #(
     o_traps  : output logic<64>,
 ) {
     const RL: u32 = soc_pkg::RET_LANES;
-    const MW: u32 = 2 + soc_pkg::CHK_W + retire_pkg::CHK_RET_W;
-    const IW: u32 = $clog2(N_HARTS * 2);
+    const MW: u32 = 9 + soc_pkg::CHK_W + retire_pkg::CHK_RET_W;
+    const IW: u32 = $clog2(N_HARTS * 2 + 1); // the mem_ctrl slots: D, I per hart and SBA
 
     var axi_arvalid: logic                     ;
     var axi_arready: logic                     ;
@@ -130,6 +134,20 @@ module boot_soc_harness #(
     }
     let ext_irq: logic<32> = if tc >= 4'd8 && tc <: 4'hf ? EXT_IRQ_SRC : 32'd0;
 
+    var dm_psel   : logic         ;
+    var dm_penable: logic         ;
+    var dm_pwrite : logic         ;
+    var dm_paddr  : logic<9>      ;
+    var dm_pwdata : logic<32>     ;
+    var dm_pstrb  : logic<4>      ;
+    var dm_pready : logic         ;
+    var dm_prdata : logic<32>     ;
+    var dm_pslverr: logic         ;
+    var dm_obs    : soc_pkg::DmObs;
+    var dm_chk    : logic<6>      ;
+    var seq_done  : logic         ;
+    var seq_fail  : logic         ;
+
     inst dut: heliodor_soc_smp #(
         N_HARTS    : N_HARTS    ,
         RESET_PC   : RESET_PC   ,
@@ -200,18 +218,82 @@ module boot_soc_harness #(
         i_dbg_irq_mask       : irq_mask              ,
         i_dbg_irq_allow      : irq_allow             ,
         i_dm_rst             : rst                   ,
-        i_dm_psel            : 1'b0                  ,
-        i_dm_penable         : 1'b0                  ,
-        i_dm_pwrite          : 1'b0                  ,
-        i_dm_paddr           : 9'd0                  ,
-        i_dm_pwdata          : 32'd0                 ,
-        i_dm_pstrb           : 4'd0                  ,
+        i_dm_psel            : dm_psel               ,
+        i_dm_penable         : dm_penable            ,
+        i_dm_pwrite          : dm_pwrite             ,
+        i_dm_paddr           : dm_paddr              ,
+        i_dm_pwdata          : dm_pwdata             ,
+        i_dm_pstrb           : dm_pstrb              ,
         i_dm_pprot           : 3'd0                  ,
-        o_dm_pready          : _                     ,
-        o_dm_prdata          : _                     ,
-        o_dm_pslverr         : _                     ,
-        o_dm_obs             : _                     ,
+        o_dm_pready          : dm_pready             ,
+        o_dm_prdata          : dm_prdata             ,
+        o_dm_pslverr         : dm_pslverr            ,
+        o_dm_obs             : dm_obs                ,
     );
+
+    if DMI_EN :g_dmi {
+        inst u_seq: dm_seq #(
+            FILE: DMI_FILE,
+        ) (
+            clk                   ,
+            rst                   ,
+            o_psel   : dm_psel    ,
+            o_penable: dm_penable ,
+            o_pwrite : dm_pwrite  ,
+            o_paddr  : dm_paddr   ,
+            o_pwdata : dm_pwdata  ,
+            o_pstrb  : dm_pstrb   ,
+            i_pready : dm_pready  ,
+            i_prdata : dm_prdata  ,
+            i_pslverr: dm_pslverr ,
+            o_done   : seq_done   ,
+            o_fail   : seq_fail   ,
+            o_rd_n   : _          ,
+            o_wr_n   : _          ,
+        );
+        inst u_chk_dm: chk_dm #(
+            N_HARTS: N_HARTS,
+        ) (
+            clk                   ,
+            rst                   ,
+            i_psel   : dm_psel    ,
+            i_penable: dm_penable ,
+            i_pwrite : dm_pwrite  ,
+            i_paddr  : dm_paddr   ,
+            i_pwdata : dm_pwdata  ,
+            i_pstrb  : dm_pstrb   ,
+            i_pready : dm_pready  ,
+            i_obs    : dm_obs     ,
+            o_chk    : dm_chk     ,
+        );
+        var said : logic    ;
+        var sbr_n: logic<32>;
+        var sbw_n: logic<32>;
+        always_ff {
+            if_reset {
+                said  = 1'b0;
+                sbr_n = 32'd0;
+                sbw_n = 32'd0;
+            } else {
+                sbr_n += {31'd0, dm_obs.sba.done && !dm_obs.sba.write};
+                sbw_n += {31'd0, dm_obs.sba.done && dm_obs.sba.write};
+                if seq_done && !said {
+                    said = 1'b1;
+                    $display("dmi: done fail=%b chk=%b sba_rd=%d sba_wr=%d", seq_fail, dm_chk, sbr_n, sbw_n);
+                }
+            }
+        }
+    } else {
+        assign dm_psel    = 1'b0;
+        assign dm_penable = 1'b0;
+        assign dm_pwrite  = 1'b0;
+        assign dm_paddr   = 9'd0;
+        assign dm_pwdata  = 32'd0;
+        assign dm_pstrb   = 4'd0;
+        assign dm_chk     = 6'd0;
+        assign seq_done   = 1'b0;
+        assign seq_fail   = 1'b0;
+    }
 
     inst u_mem: axi4_mem #(
         ID_W   : IW          ,
@@ -222,7 +304,7 @@ module boot_soc_harness #(
         ROM_HEX: FW_HEX      ,
         CFG    : AXI_CFG     ,
         SEED   : AXI_SEED    ,
-        MAX_RD : N_HARTS * 2 ,
+        MAX_RD : N_HARTS * 2 + 1,
         MAX_WR : WB_N        ,
     ) (
         clk                    ,
@@ -378,14 +460,15 @@ module boot_soc_harness #(
             LANES     : RL                ,
             TOHOST_PA : TOHOST_PA         ,
             PASS_BY_X3: PASS_BY_X3        ,
-            CHK_W     : 2 + soc_pkg::CHK_W,
+            CHK_W     : 9 + soc_pkg::CHK_W,
+            DM_OK     : DMI_EN            ,
         ) (
             clk                                                        ,
             rst                                                        ,
             i_retire       : ret                                       ,
             i_retire_dm    : retire_dm[h]                              ,
             i_irq_evt      : irq_evt[h]                                ,
-            i_chk          : {axi_bad && h == 0, rp_fail && h == 0, core_chk[h]},
+            i_chk          : {seq_fail && h == 0, (if h == 0 ? dm_chk : 6'd0), axi_bad && h == 0, rp_fail && h == 0, core_chk[h]},
             i_hash_mismatch: mismatch[h]                               ,
             o_stop         : stop                                      ,
             o_x3           : h_x3[h]                                   ,
@@ -402,7 +485,7 @@ module boot_soc_harness #(
         );
     }
 
-    assign o_pass    = h_pass[0] && !any_fail && (!AXI_ERR_EXP || axi_err[1:0] == 2'b11);
+    assign o_pass    = h_pass[0] && !any_fail && (!AXI_ERR_EXP || axi_err[1:0] == 2'b11) && (!DMI_EN || seq_done);
     assign o_fail    = any_fail;
     assign o_x3      = h_x3[0];
     assign o_cycles  = h_cyc[0];
