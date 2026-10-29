@@ -4,6 +4,7 @@ A gate list (test/gates/<milestone>.list) holds one test per line:
 
     <suite>/<name> [budget=<cycles>] [hex=<path>] [tohost=<word index>]
                    [mtime=off|instret] [lockstep=1|0] [irq=<mask>] [dmi=<path>]
+                   [harts=<n>]
 
 `#` starts a comment. The defaults follow the riscv-tests layout: the image is
 test/riscv-arch-test/build/<suite>/<name>.hex, tohost is word 1024 (PA
@@ -17,7 +18,8 @@ wrapper never compares its trace. irq=<mask> pulses those PLIC sources once
 early in the run (new core only; such a test must be lockstep=0). dmi=<path>
 plays that DMI script hex on the Debug Module (new core only, lockstep=0); the
 test then passes once the script has ended and the program has written
-tohost = 1.
+tohost = 1. harts=<n> runs the image on an n-hart SoC (boot_soc_harness under
+the riscv-tests map, pass = hart 0's tohost; lockstep=0, no mtime or irq).
 """
 
 import re
@@ -42,6 +44,7 @@ class Entry:
     lockstep: bool = True
     irq: int = 0
     dmi: str = ""
+    harts: int = 1
 
     @property
     def key(self) -> str:
@@ -75,7 +78,7 @@ def parse(path) -> list:
             if "=" not in f:
                 raise ValueError(f"{where}: expected key=value, got {f!r}")
             k, v = f.split("=", 1)
-            if k not in ("budget", "hex", "tohost", "mtime", "lockstep", "irq", "dmi"):
+            if k not in ("budget", "hex", "tohost", "mtime", "lockstep", "irq", "dmi", "harts"):
                 raise ValueError(f"{where}: unknown option {k!r}")
             opts[k] = v
         if opts.get("mtime", "off") not in ("off", "instret"):
@@ -95,11 +98,16 @@ def parse(path) -> list:
             lockstep=opts.get("lockstep", "1") == "1",
             irq=int(opts.get("irq", "0"), 0),
             dmi=opts.get("dmi", ""),
+            harts=int(opts.get("harts", "1")),
         )
         if e.irq and e.lockstep:
             raise ValueError(f"{where}: irq needs lockstep=0")
         if e.dmi and e.lockstep:
             raise ValueError(f"{where}: dmi needs lockstep=0")
+        if e.harts < 1:
+            raise ValueError(f"{where}: harts must be at least 1")
+        if e.harts > 1 and (e.lockstep or e.mtime != "off" or e.irq):
+            raise ValueError(f"{where}: harts > 1 needs lockstep=0 and no mtime or irq")
         if e.key in seen:
             raise ValueError(f"{where}: duplicate entry {e.key}")
         seen.add(e.key)

@@ -12,7 +12,8 @@ lockstep mismatch into o_pass/o_fail, so the wrapper only asserts o_pass.
 
 Entries with lockstep=0 are always pass/fail; mtime=instret selects the
 retire-count mtime; irq=<mask> pulses those PLIC sources; dmi=<path> plays a
-DMI script on the Debug Module. --ignored marks
+DMI script on the Debug Module; harts=<n> runs an n-hart SoC through
+boot_soc_harness. --ignored marks
 every test `#[ignore]` (suites too long for the default run, e.g. ACT4: see
 test/gates/run_act.py).
 
@@ -52,7 +53,70 @@ def params(e, core, lockstep):
     return "\n".join(f"        {k.ljust(kw)}: {v.ljust(vw)}," for k, v in p)
 
 
+def smp_params(e, core):
+    p = [
+        ("N_HARTS", str(e.harts)),
+        ("CORE", CORE_CONST[core]),
+        ("DRAM_HEX", f'"{e.hex}"'),
+        ("ROM_EN", "1'b0"),
+        ("PMA_N", "tb_platform_pkg::MAP_ARCH_N"),
+        ("PMA_REGIONS", "tb_platform_pkg::MAP_ARCH"),
+        ("RESET_PC", "64'h8000_0000"),
+        ("PASS_BY_X3", "1'b0"),
+        ("TOHOST_PA", f"64'h{0x80000000 + 4 * e.tohost:x}"),
+    ]
+    if e.dmi:
+        p += [("DMI_EN", "1'b1"), ("DMI_FILE", f'"{e.dmi}"')]
+    kw = max(len(k) for k, _ in p)
+    vw = max(len(v) for _, v in p)
+    return "\n".join(f"        {k.ljust(kw)}: {v.ljust(vw)}," for k, v in p)
+
+
+def gen_smp_module(e, core, ignored):
+    mod = f"test_{core}_{e.ident}"
+    steps = e.budget // gatelist.EARLY_EXIT_STEP
+    ign = "#[ignore]\n" if ignored else ""
+    return f"""
+#[test({mod})]
+{ign}module {mod} {{
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass  : logic    ;
+    var fail  : logic    ;
+    var cycles: logic<64>;
+    inst h: boot_soc_harness #(
+{smp_params(e, core)}
+    ) (
+        clk              ,
+        rst              ,
+        o_pass   : pass  ,
+        o_fail   : fail  ,
+        o_x3     : _     ,
+        o_cycles : cycles,
+        o_instret: _     ,
+        o_last_pc: _     ,
+        o_ret_cnt: _     ,
+        o_traps  : _     ,
+    );
+    initial {{
+        rst.assert(clk);
+        for _i in 0..{steps} {{
+            clk.next({gatelist.EARLY_EXIT_STEP});
+            if pass || fail {{
+                break;
+            }}
+        }}
+        $display("{core} {e.key} (N={e.harts}, pass/fail) cycles=%d pass=%b", cycles, pass);
+        $assert(pass, "{core} {e.key} fail");
+        $finish();
+    }}
+}}
+"""
+
+
 def gen_module(e, core, lockstep, ignored):
+    if e.harts > 1:
+        return gen_smp_module(e, core, ignored)
     mod = f"test_{core}_{e.ident}"
     steps = e.budget // gatelist.EARLY_EXIT_STEP
     lockstep = lockstep and e.lockstep
