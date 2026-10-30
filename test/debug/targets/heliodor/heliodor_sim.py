@@ -109,8 +109,9 @@ class HeliodorTarget(targets.Target):
     # timeout is a multiple of it). At about 20k cycles/s a 13 KB memory write
     # packet (the largest gdb sends) takes about 42 s through the program
     # buffer, and DownloadTest's continue (20 operations) runs a bitwise CRC
-    # of 256 KiB, about 23M instructions in 2,700 s.
-    timeout_sec = 240
+    # of 256 KiB compiled at -O0: on W2 it retired 77M instructions in 203M
+    # cycles, about 2 h 45 min for the whole test.
+    timeout_sec = 600
     server_timeout_sec = 600
     implements_custom_test = False
     support_unavailable_control = False
