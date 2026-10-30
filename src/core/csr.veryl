@@ -3,6 +3,7 @@
 //
 // Ports (timing contract):
 //   i_rd_addr/o_rd_data : combinational read of the live state
+//   o_rmw_data          : the same read as the base of a CSRRS/CSRRC write
 //   i_trig_rd           : trig_unit's read of i_rd_addr, returned for the
 //                         trigger CSRs 0x7A0-0x7A5
 //   i_wr_*, i_trap_*, i_*ret_fire, i_dm_*, i_fflags*, i_fs_dirty,
@@ -23,6 +24,8 @@
 //     are ignored; satp writes with a MODE other than Bare or Sv39 are ignored
 //   - mideleg, mip and sip write only their writable interrupt bits; sie and
 //     sip show only the interrupts delegated to S
+//   - mip and sip read the pin-driven MSIP, MTIP, MEIP and SEIP; the
+//     CSRRS/CSRRC base (o_rmw_data) keeps only the software-written SEIP
 //   - mcounteren/scounteren are 32 bits; menvcfg/senvcfg keep only the
 //     implemented fields (a reserved CBIE or PMM value leaves the field
 //     unchanged)
@@ -47,9 +50,10 @@ pub module csr #(
     i_hart_id: input logic<8>,
 
     // Combinational read (issue-time CSR value sample)
-    i_rd_addr: input  logic<12>,
-    o_rd_data: output logic<64>,
-    i_trig_rd: input  logic<64>,
+    i_rd_addr : input  logic<12>,
+    o_rd_data : output logic<64>,
+    o_rmw_data: output logic<64>,
+    i_trig_rd : input  logic<64>,
 
     // Registered CSR write (commit-time)
     i_wr_en  : input logic    ,
@@ -183,9 +187,8 @@ pub module csr #(
     i_htval     : input logic<64>,
     i_trap_gva  : input logic    ,
 
-    // M8.C IRQ source pins (from CLINT / PLIC). They set the
-    // corresponding mip bits when asserted; mip CSR writes still
-    // override (handler can clear via csrw mip, 0).
+    // M8.C IRQ source pins (from CLINT / PLIC), read-only pending bits of
+    // mip (MSIP, MTIP, MEIP) and the hardware half of mip.SEIP.
     i_irq_timer_m: input logic,
     i_irq_sw_m   : input logic,
     i_irq_ext_m  : input logic,
@@ -556,12 +559,18 @@ pub module csr #(
     // P10 Sstc effective STIP. When menvcfg.STCE=1 the supervisor timer
     // interrupt-pending bit (mip[5]) is hardware-driven by time>=stimecmp and
     // the software-written mip.STIP is ignored; when STCE=0 it is the plain
-    // software-written bit (legacy SBI-timer path, unchanged). mip_read feeds
-    // the mip/sip CSR read so software observes the effective pending state.
+    // software-written bit (legacy SBI-timer path, unchanged).
     let sstc_en  : logic     = menvcfg[63];
     let stip_hw  : logic     = sstc_en && (i_mtime >= stimecmp);
     let stip_eff : logic     = if sstc_en ? stip_hw : mip[5];
-    let mip_read : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
+    let mip_sw   : logic<64> = (mip & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
+    // mip bit 3=MSIP, 7=MTIP, 9=SEIP, 11=MEIP from CLINT/PLIC. SEIP reads as
+    // the OR of the pin and the software-written bit, but a CSRRS/CSRRC uses
+    // only the software-written bit (privileged spec), so mip_sw is the
+    // read-modify-write base of mip.
+    let mip_pin : logic<64> = (if i_irq_sw_m ? 64'h0008 : 64'd0) | (if i_irq_timer_m ? 64'h0080 : 64'd0)
+        | (if i_irq_ext_m ? 64'h0800 : 64'd0) | (if i_irq_ext_s ? 64'h0200 : 64'd0);
+    let mip_read: logic<64> = mip_sw | mip_pin;
 
     // Phase 11-H Sstc-in-VS: the guest's supervisor-timer-pending (VSTIP) is
     // hardware-driven when Sstc is enabled for the guest — menvcfg.STCE AND
@@ -729,16 +738,8 @@ pub module csr #(
             }
         }
     }
-    // M8.C IRQ pending logic. mip[h/w-driven bits] OR with i_irq_*; the
-    // CSR-written value still flows because mip is RW (handler clears).
-    // mip layout: bit 1=SSIP, 3=MSIP, 5=STIP, 7=MTIP, 9=SEIP, 11=MEIP.
-    // mip_raw ORs the pin-driven hardware sources (MSIP/MTIP/MEIP/SEIP) into
-    // the software-written mip; the STIP bit (5) is then overridden by the
-    // Sstc effective value (software-written when STCE=0, time>=stimecmp when 1).
-    let mip_raw : logic<64> = mip | (if i_irq_sw_m ? 64'h0008 : 64'd0) | (if i_irq_timer_m ? 64'h0080 : 64'd0)
-        | (if i_irq_ext_m ? 64'h0800 : 64'd0) | (if i_irq_ext_s ? 64'h0200 : 64'd0);
-    let mip_eff : logic<64> = (mip_raw & ~64'h20) | (if stip_eff ? 64'h20 : 64'd0);
-    let mie_pend: logic<64> = mip_eff & mie;
+    // IRQ pending logic: the effective pending set is the mip read value.
+    let mie_pend: logic<64> = mip_read & mie;
     // M-mode global enable: MIE for M-priv; always enabled if priv < M.
     // S-mode global enable: SIE for S-priv (only when not delegated to M).
     let m_irqs_visible: logic<64> = mie_pend & ~mideleg;
@@ -895,6 +896,7 @@ pub module csr #(
     assign o_pmpaddr      = pmpaddr;
 
     assign o_rd_data      = rd_data_w;
+    assign o_rmw_data     = if i_rd_addr == ADDR_MIP ? mip_sw : rd_data_w;
     assign o_mtvec        = mtvec;
     assign o_mepc         = mepc;
     assign o_stvec        = stvec;
