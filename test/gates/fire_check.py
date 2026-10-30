@@ -9,12 +9,13 @@ Each log is the output of a run whose harness instantiates tb/perf_acc.veryl
 test, one `PERF` layout line, `PB <core> <bit> <count>` for every nonzero bit
 of core_types::CorePerf and `PK <core> <kind> <count>` for full kills by
 RedirKind; tb/mc_perf_acc.veryl prints the same lines as core 0 for the SoC's
-soc_pkg::McPerf. This script sums the counts per (gate, core), names the bits
-from the struct definitions in src/core/common/core_types.veryl, xlate_pkg.veryl
-and src/core/soc_pkg.veryl (checking the width against the PERF line), and
-judges every matrix row:
+soc_pkg::McPerf and tb/dm_perf_acc.veryl as core 1 for its soc_pkg::DmObs.
+This script sums the counts per (gate, core), names the bits from the struct
+definitions in src/core/common/core_types.veryl, xlate_pkg.veryl,
+src/core/soc_pkg.veryl and src/peripheral/dm/dm_pkg.veryl (checking the width
+against the PERF line), and judges every matrix row:
 
-    <event> <gate>[:w2|:w4|:mc][,<gate>...]
+    <event> <gate>[:w2|:w4|:mc|:dm][,<gate>...]
 
 <event> names a leaf (`dc.r_bank`) or a prefix of leaves (`mp`, `iq[1]`);
 an event without an index matches every element (`mp.split` = `mp[*].split`);
@@ -34,9 +35,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = [ROOT / "src/core/common/core_types.veryl", ROOT / "src/core/common/xlate_pkg.veryl",
-       ROOT / "src/core/soc_pkg.veryl"]
-CORES = {0: "mc", 2: "w2", 4: "w4"}
-ROOTS = {0: "McPerf"}  # the struct a core id's PB bits index, CorePerf otherwise
+       ROOT / "src/core/soc_pkg.veryl", ROOT / "src/peripheral/dm/dm_pkg.veryl"]
+CORES = {0: "mc", 1: "dm", 2: "w2", 4: "w4"}
+ROOTS = {0: "McPerf", 1: "DmObs"}  # the struct a core id's PB bits index, CorePerf otherwise
 
 # Readable names for the bits of plain vector fields, MSB first.
 VEC_NAMES = {

@@ -2,12 +2,15 @@
 # dcsr, dpc, dscratch0/1 and DRET are illegal and debug memory faults like a
 # hole (design doc D.8, D.14); EBREAK with dcsr.ebreakm = 0 is a breakpoint.
 # Then a counting loop runs while the script halts and resumes the hart: its
-# invariants catch a resume at a wrong pc and clobbered s0/s1/s2. tohost = 1
-# on success, else the number of the failed check.
+# invariants catch a resume at a wrong pc and clobbered s0/s1/s2. The loop
+# reads CLINT mtime (an IO load, started at the head) so that a halt request
+# waits for a started op (design doc D.4). tohost = 1 on success, else the
+# number of the failed check.
 
 #define DM_CODE 0x4000
 #define DM_DATA 0x5000
-#define LOOP_N  40000
+#define LOOP_N  4000
+#define MTIME   0x200bff8
 
         .option norvc
         .section .text.init
@@ -39,7 +42,9 @@ _start:
         li      s1, 0
         li      s2, 0
         li      t2, LOOP_N
-loop:   addi    s0, s0, 1
+        li      t5, MTIME
+loop:   ld      t4, 0(t5)
+        addi    s0, s0, 1
         addi    s1, s1, 2
         addi    s2, s2, 3
         bne     s0, t2, loop
