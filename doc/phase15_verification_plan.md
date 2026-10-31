@@ -610,6 +610,7 @@ N4 の値は `.build/test_timings` のもので、CLAUDE.md にあった 4408 s 
 | M3 (末) | W4 | 同上 | 11.8M / 11.8M / 17.2M / 16.5M | | 1.69k / 1.68k / 1.87k / 1.87k | | 087a7d1 | |
 | M3 (末) | W2 / W4 | arch rv64ui 108 本 (1 コアに固定、`sim_s` の合計) | | | 5.5k / 1.7k | degraded modules W2 162 / W4 215 | 087a7d1 | |
 | M3 (末) | W2 / W4 | 5.15 N=1 boot、Verilator 5.050 `-O3` | 14.5M / 11.8M | | 22.6k / 8.1k | | 087a7d1 | |
+| MD (`2b34717c`) | W2 | 5.15 N=1 boot (GL-B lockstep、同期ビルド、1 コア固定、master と対) | 14,570,718 | 4,664 s (sim) | 3.1k (master `9016b4c3` は 2,338 s、6.2k) | 0 / 0 (MD も master も) | 2b34717c | |
 
 M3 の行の補足: W2 の boot は手順 2 の時点で fallback 0 のまま。W4 の boot と ACT4 に残る whole_event と dataflow の fallback は、M3 末の GS で原因を見る。手順 6 の `NUM_CKPT` の対では、同時に走らせた W2 の 5.15 boot の CPU 時間が 0 で 2,327 s、4 で 2,481 s (+6.6 %)、2 で 2,336 s、8 で 2,510 s だった。checkpoint を lane ごとに持つ最初の形は、W4 の `NUM_CKPT=8` で同時実行の進みが約 1/2-1/3 に落ちた (設計書 §R.3.5)。
 
@@ -886,6 +887,32 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 ### 9.4 M5 での追加
 
 H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed を GD に足す: VS/VU からの halt と dret (dcsr.v、prv)、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV と vector の要素アクセスへの trigger (U39)、Debug Mode での MPRV と MPV。GG は H を持つ target の spike と比べて再び回す。
+
+### 9.5 MD の出口のゲートの結果 (`2b34717c`、2026-11-01)
+
+M4 のゲートの結果は §1.6、MM は §10.5-10.6 である。比較の基準は MD の直前の master (`9016b4c3`、MM の完了) で、MM の時点の GB1 と W4 の bench は記録が無かったので、master を同じ箱で走らせ直して取った。native の run は `veryl test --ignored --test ...` を 1 本ずつ、Verilator は `-O1 -j 2` である。
+
+| ゲート | MD (`2b34717c`) | 基準 | 判定 |
+|---|---|---|---|
+| G0 | 914 passed、0 failed、81 ignored | B43 の時点で 914 | 一致 |
+| GA / GL-C (W4) | pass 696/696、hash 690/690 | M3 の末から 696/696、690/690 (W2 は MD の手順 10 で 696/696、690/690) | 一致 |
+| GL-B | W2 14,570,718、W4 12,262,946。record 10,417,776、hash `74d4b7982390260f` | MM: W2 14,570,718、W4 12,262,946 | ビット一致 |
+| GB1 (W2) | 5.15 14,617,653 (instret 10,429,948、hash `650ecd24d934e4f2`)、6.6 21,394,340、7.1 19,301,314 | master の同じ run: 同一値 (hash も一致) | ビット一致 |
+| GB1 (W4) | 5.15 12,286,458 (hash `e87fa2f00e262139`)、6.6 18,323,297、7.1 16,757,476 | master の同じ run: 同一値 (hash も一致) | ビット一致 |
+| GT4 (W2、native) | 5,029,779 pass | MM の Verilator FIXED 5,029,779 | 一致 |
+| GB4 (W2、native) | 24,989,451 pass、checker はすべて 0 | MM の Verilator FIXED 24,989,451 | 一致 |
+| GB4 (W4、native) | 未実行 | M4 の決定 (§1.6) で M6 へ繰延 | 方針どおり |
+| GV (W2、Verilator) | litmus N=4 5,029,779、5.15 N=1 14,617,653、N=2 19,380,793、N=4 24,989,451 がすべて PASSED | native の GT4、GB1、GB2 (MM の 19,380,793)、GB4 と cycles 一致 | 一致 |
+| GV (W4、Verilator) | litmus N=4 5,028,524、N=1 12,286,458、N=2 16,811,410、N=4 22,640,641 がすべて PASSED | N=1 は native の GB1 (W4) と一致。他は MM の時点の W4 の Verilator の記録が無い (M4 の末は 5,028,286 / 16,159,839 / 22,546,887 で、litmus +0.005 %、N=2 +4.0 %、N=4 +0.4 %。MM の AXI で W4 の GL-B が +4.97 % 動いたのと同程度) | pass。N=2、N=4 と litmus は master での再取得はしていない |
+| GX | 既定ログの W2/W4 の同名 307 対のうち 287 対が一致 | M3 の末: 286 対のうち 284 対 | 差 20 対は下 |
+| bench (W2/W4、4 本ずつ) | W2 dhrystone 268,712、coremark 381,237、fpmm 1,044,664、spmv 41,171。W4 dhrystone 204,902、coremark 315,613、fpmm 861,034、spmv 32,162 (record と hash も master と同一) | master `9016b4c3` の同じ run | 8 本ともビット一致 |
+| V14 梯子 1-5 | G0 914 passed、litmus4 0x3b0d30、N=2 boot 0x0fa8ca0、N=4 boot 0x1803760 (25.18M)、hvlinux 0x1549380 (22.32M) がすべて pass。dhrystone 235,804 / 264,834、coremark 394,546 / 374,357 | master `9016b4c3` で litmus4、N=2、hvlinux、dhrystone、coremark が同一。N=4 は master を走らせていない (CLAUDE.md の 25.2M と一致) | 一致 |
+| GS | §6.2 の MD の行 | 同 | 記録 (sim が約 2.0 倍遅い、下) |
+
+- DMI が idle のときの等価 (§9.3) は、GL-B (W2/W4)、GB1 の 6 本 (W2/W4)、bench 8 本、V14 の dhrystone/coremark、litmus4、N=2、hvlinux のすべてで master とビット一致である。boot の harness では retire_mon の checker の幅が MD で広がっている (`chk=` の桁数) が、値はすべて 0 である。
+- GX の差 20 対: `probe_b13_csrrd` (rdtime、mtime がサイクル由来) と `probe_b05_sc` (SC の 1 回の失敗が W2 だけに出る) は M3 から既知。`smp_ad_2hart`、`smp_coh_2hart`、`smp_unc_2hart`、`sba_coh_2hart`、`litmus_2hart` の 5 対は 2 hart の interleaving が構成の timing で変わるため、H の hash が一致しない (決定的なテストではない)。`dbg_*` の 13 対 (`dbg_halt_resume`、`dbg_dm_abs`、`_counters`、`_ebreak`、`_icount`、`_pmp_lock`、`_progbuf`、`_reset`、`_sba`、`_sba_code`、`_step`、`_trig_exec`、`_trig_ldst`) は DMI script を cycle で駆動するので、W2 と W4 で Debug Mode に入る時点が違い、retire 数が 1-2 本動く (`dbg_halt_resume` と `_pmp_lock` は count が同じで hash だけ違う)。GX の「決定的なテスト」の定義からこの 18 対 (SMP と dbg) を外すと、差は既知の 2 対だけである。debug の 13 対は 1 本ずつ追っていない (各 run は pass、`chk_debug`/`chk_dm` は 0)。
+- GS の記録 (§6.2 の表の MD の行): W2 の GL-B を `VERYL_AOT_C_ASYNC=0`、`taskset` で 1 コアに固定し、master と同時に 1 本ずつ走らせた。コアを入れ替えて 2 回測った。結果は master が sim 2,331.9 s と 2,338.5 s (14.57M cycles、約 6.2k cy/s)、MD が 4,668.6 s と 4,663.6 s (約 3.1k cy/s) で、MD は約 2.0 倍遅い。whole-comb と event の fallback はどちらも 0、dataflow は両方 declined。W4 の boot も同じ比 (GB1 の W4 5.15 で sim 15,111 s 対 master 7,137 s、3 本並行の負荷下の値) である。cycles は一致しているので、遅くなったのは RTL の動きでなく sim の評価量 (debug の状態と DM の settle) である。native の GB4 (W2) は sim 58,653 s で約 430 cy/s。Verilator は W2 の N=4 が 11,450 s、W4 の N=4 が 18,252 s (CPU 時間)。
+- 注意: 非同期の cc ビルドの既定 (`VERYL_AOT_C_ASYNC` を設定しない) では、boot の `whole_event` に 0.1-0.3 % の fallback が出る (非同期の cc ビルド中の Cranelift での実行と推定、原因は確かめていない)。GS の判定は上の同期ビルドの値を使う。
 
 ---
 

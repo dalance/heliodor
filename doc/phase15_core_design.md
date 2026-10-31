@@ -4971,13 +4971,14 @@ MD で決める事項: U32 (hartreset のドメイン)、U33 (SBA の接続形)�
 | 機能 | GG: W2 の N=1 で、spike で通り除外表に無いものがすべて通る | 済: B43 を直し、mip の検査は通る。InterruptTest の残り (壁時間に依存) は理由付きで除外。52 本 pass、11 本は理由付きで除外、FAIL 0 |
 | 機能 | GG: N=4 で SMP のテスト (hart の切替、halt group) | 済 (抜粋): w2_n4 の MulticoreRegTest、InstantHaltTest など 6 本と w2_n4_smp の 5 本 (MulticoreRtosSwitchActiveHartTest、StepThread2Test、SmpSimultaneousRunHalt を含む) が pass。halt group の伝播は GD4 の `dm_smp_group` と、OpenOCD の SMP 構成が使う group の haltreq (`hart.ghalt` が `gdb` 列で 0 より大) |
 | 機能 | GG: W4 の N=1 | 済: 49 本 pass、14 本は理由付きで除外 (InterruptTest を含む)、FAIL 0 |
-| 機能 | M4 の出口のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4 の方針、GX、GV) | 一部: G0、GL-B (W2/W4)、W2 N=2 boot、Verilator の W2 N=4 boot は手順 10 で緑。GA、GL-C、GB1、GT4、GX、GV と GB4 の native は MD の手順の中では回していない |
+| 機能 | M4 の出口のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4 の方針、GX、GV) | 済 (`2b34717c`、検証計画 §9.5): G0 914 passed、GA/GL-C は W2/W4 とも 696/696 と hash 690/690、GL-B は W2 14,570,718 と W4 12,262,946 (record と hash は golden と一致)、GB1 は W2/W4 の 5.15/6.6/7.1 が MD の直前の master (`9016b4c3`) とサイクル・record・hash まで一致、GT4 (W2 native) 5,029,779、GB4 (W2 native) 24,989,451、GV は W2 の 4 本と W4 の 4 本が PASSED (W2 は native と cycles 一致)。W4 の GB4 native は M4 の決定のとおり M6 へ繰延。GX の差と GS は下の行 |
+| 機能 | GX (W2 対 W4、既定ログの同名 307 対) | 287 対が一致。違う 20 対は説明つき: 2 対は M3 から既知 (`probe_b13_csrrd`、`probe_b05_sc`)、5 対は SMP の timing 依存 (`smp_ad_2hart`、`smp_coh_2hart`、`smp_unc_2hart`、`sba_coh_2hart`、`litmus_2hart`)、13 対は `dbg_*` の GD (DMI script を cycle で駆動するので、構成ごとの timing の差で retire 数が 1-2 本動く)。debug の 13 対は 1 本ずつ追っていない (記録のみ) |
 | idle 等価 | W2/W4 の GL-B と bench 4 本がビット一致 | 済 (手順 2-10 と B43 の修正のすべてで同一) |
 | 構造 | 5 モジュールの cold-reader gate、knob 0 個 | 未確認 (手順 10 では扱っていない) |
 | 構造 | `chk_debug` と `chk_dm` がすべてのテストで 0 | 済: G0、GD4、GG の 122 回の run |
 | 構造 | §D.15 の事象が GF で 0 より大 (`dbg`、`gdb`) | 済: `dbg` 33 行、`gdb` 20 行 |
-| 構造 | GS の記録 | 未 |
-| V14 | 梯子 1-5 が緑、dhrystone/coremark がビット一致 | 未 (手順 9 で V14 の N=2 boot だけ確認) |
+| 構造 | GS の記録 | 済 (記録のみ、検証計画 §6.2 の MD の行): W2 の GL-B (lockstep) を `VERYL_AOT_C_ASYNC=0`、1 コア固定で master と対にして走らせた。whole-comb と event の fallback は MD も master も 0。sim 時間は master 2,338 s (6.2k cy/s) に対し MD 4,664 s (3.1k cy/s) で約 2.0 倍遅い (コアを入れ替えた再測定でも同じ)。MD の追加 (debug の状態と DM) が settle を重くした。cycles は同一で、速度は極端に悪化していない (feedback の方針どおり最適化はしない) が、M6 までの課題として記録する |
+| V14 | 梯子 1-5 が緑、dhrystone/coremark がビット一致 | 済: 既定 (G0) 914 passed、litmus4 0x3b0d30、N=2 boot 0x0fa8ca0、N=4 boot 0x1803760、hvlinux 0x1549380 が pass。litmus4、N=2、hvlinux は master と同一で、V14 の dhrystone 235,804 (instret 264,834) と coremark 394,546 (374,357) も master と同一。新コアの bench 8 本 (W2/W4) も master とビット一致 (idle 等価の行)。V14 の N=4 boot は master を走らせていない (CLAUDE.md の 25.2M と一致) |
 ### M5: H と V
 
 目標: H 拡張 (二段翻訳) と VU を新コアに統合し、hvlinux と vector テスト群を通す。
