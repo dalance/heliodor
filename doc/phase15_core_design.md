@@ -4979,6 +4979,7 @@ MD で決める事項: U32 (hartreset のドメイン)、U33 (SBA の接続形)�
 | 構造 | §D.15 の事象が GF で 0 より大 (`dbg`、`gdb`) | 済: `dbg` 33 行、`gdb` 20 行 |
 | 構造 | GS の記録 | 済 (記録のみ、検証計画 §6.2 の MD の行): W2 の GL-B (lockstep) を `VERYL_AOT_C_ASYNC=0`、1 コア固定で master と対にして走らせた。whole-comb と event の fallback は MD も master も 0。sim 時間は master 2,338 s (6.2k cy/s) に対し MD 4,664 s (3.1k cy/s) で約 2.0 倍遅い (コアを入れ替えた再測定でも同じ)。MD の追加 (debug の状態と DM) が settle を重くした。cycles は同一で、速度は極端に悪化していない (feedback の方針どおり最適化はしない) が、M6 までの課題として記録する |
 | V14 | 梯子 1-5 が緑、dhrystone/coremark がビット一致 | 済: 既定 (G0) 914 passed、litmus4 0x3b0d30、N=2 boot 0x0fa8ca0、N=4 boot 0x1803760、hvlinux 0x1549380 が pass。litmus4、N=2、hvlinux は master と同一で、V14 の dhrystone 235,804 (instret 264,834) と coremark 394,546 (374,357) も master と同一。新コアの bench 8 本 (W2/W4) も master とビット一致 (idle 等価の行)。V14 の N=4 boot は master を走らせていない (CLAUDE.md の 25.2M と一致) |
+| veryl | binary を `c66bf8ab` に切替えた後の再確認 | 済 (検証計画 §9.5): G0 914 passed、GD4 10/10、GL-B (W2/W4)、bench 8 本、V14 の N=2 boot・dhrystone・coremark、Verilator の W2 N=1 がすべて記録と同一。W2 N=2 boot 19,380,793 cy pass (延期していた出口のゲート)。sim は GL-B (W2) で約 9 倍速い |
 ### M5: H と V
 
 目標: H 拡張 (二段翻訳) と VU を新コアに統合し、hvlinux と vector テスト群を通す。
