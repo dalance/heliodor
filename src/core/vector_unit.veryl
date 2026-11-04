@@ -8,19 +8,19 @@
 // the scalar (integer) operand of vadd.vx / vset*vl needs wakeup, which it gets
 // from the integer CDB exactly like iq_fp's int→fp source.
 //
-// Completion rides the lane-0 CDB at LOWEST priority (the VU drives the bus only
-// when the scalar pipe is idle, i_cdb_free). A vector-dest op (vadd) drives the
-// CDB with has_rd=0 to set the ROB's result_written; a vector→scalar op
-// (vmv.x.s, vset*vl) drives it with has_rd=1 to write the integer PRF + wake int
-// consumers + set result_written, exactly like an fcvt.w.s (FP→INT) writeback.
+// The VU works on its head only under the exec permission i_exec (the head's
+// tag). When the head has a result ready it raises o_wb_req (o_wb_rd when the
+// result writes a scalar rd) and completes in the cycle the core grants
+// i_cdb_free; o_cdb_* carry the completion. FIFO entries are dropped by the
+// core's kill (i_kill) by tag age; a full kill also abandons the head's work
+// and reloads vtype/vl from the committed CSRs.
 //
 // V0 subset: vsetvli / vsetivli, vadd.{vv,vx,vi}, vmv.x.s. VLEN=128, ELEN=64.
 // Tail / masked-off elements are written as 0 (refined to vta/vma in V2).
-pub module vector_unit #(
+pub module vector_unit::<CFG: core_cfg> #(
     param VRF_W    : u32 = 5  ,
     param VLEN     : u32 = 128 ,
-    param PRF_W    : u32 = 6  , // integer PRF index width
-    param ROB_IDX_W: u32 = 5  ,
+    param PRF_W    : u32 = 6  , // PRF index width
     param FIFO_N   : u32 = 8  ,
     param FIFO_W   : u32 = 3  ,
     // CP: FP operand pipeline. The COMPUTE present-phase drives the VRF operand
@@ -88,7 +88,7 @@ pub module vector_unit #(
     i_alloc_has_rd      : input  logic                , // writes a scalar rd (int or FP)
     i_alloc_rd_is_fp    : input  logic                , // the scalar rd is an FP reg (vfmv.f.s)
     i_alloc_rd_pdst     : input  logic         <PRF_W>,
-    i_alloc_rob_idx     : input  logic         <ROB_IDX_W>,
+    i_alloc_tag         : input  core_types::<CFG>::RobTag,
     o_alloc_rdy         : output logic                , // FIFO has a free slot
 
     // ---- Integer CDB snoop (wake the scalar operand) ------------------------
@@ -126,22 +126,24 @@ pub module vector_unit #(
     o_vd_wen    : output logic       ,
     o_vd_data   : output logic<VLEN> ,
 
-    // ---- Non-speculative execution gate -------------------------------------
+    // ---- Exec permission and the FIFO head ------------------------------------
     // The VRF is NOT renamed, so a wrong-path vector op's VRF write could not be
-    // rolled back. The VU therefore executes its head op only once that op is the
-    // ROB head (all older ops committed → it is non-speculative and cannot be
-    // squashed by an older mispredict; a younger mispredict flushes the FIFO
-    // before this op ever reaches the head). Correctness-first; throughput is a
-    // later-sub-phase concern (execute-driven per ReOVE).
-    i_rob_head_idx: input logic<ROB_IDX_W>,
+    // rolled back. The VU therefore works on its head op only while i_exec is
+    // valid with the head's tag; the core grants it to a non-speculative op.
+    i_exec: input  core_types::<CFG>::TagTok,
+    o_head: output core_types::<CFG>::VuHead,
 
-    // ---- CDB writeback grant + output (lowest priority on lane 0) -----------
-    i_cdb_free   : input  logic            , // scalar pipe idle this cycle
+    // ---- Completion -------------------------------------------------------------
+    // o_wb_req: the head has a result ready (o_wb_rd: it writes a scalar rd).
+    // Neither depends on i_cdb_free; the op completes (o_cdb_valid) in a cycle
+    // with i_cdb_free.
+    o_wb_req     : output logic            ,
+    o_wb_rd      : output logic            ,
+    i_cdb_free   : input  logic            ,
     o_cdb_valid  : output logic            ,
     o_cdb_has_rd : output logic            ,
     o_cdb_pdst   : output logic<PRF_W>     ,
     o_cdb_data   : output logic<64>        ,
-    o_cdb_rob_idx: output logic<ROB_IDX_W> ,
     // vset*vl carries the new vtype/vl to the ROB shadow → CSR at commit.
     o_cdb_vset_wen: output logic       ,
     o_cdb_vtype   : output logic<64>   ,
@@ -210,13 +212,10 @@ pub module vector_unit #(
     // writeback, the core must route cdb.pdst/data to prf_fp (cdb_dest_is_fp).
     o_cdb_fp_dest   : output logic   ,
 
-    // ---- Flush (commit-time redirect) ---------------------------------------
-    i_flush: input logic,
-    // Early (execute-time) PARTIAL squash, mirroring the ROB's i_squash_en /
-    // i_squash_idx: keep FIFO entries older-or-equal to i_squash_idx (ROB age) and
-    // drop the younger suffix. Mutually exclusive with i_flush.
-    i_squash_en : input logic              ,
-    i_squash_idx: input logic<ROB_IDX_W>   ,
+    // ---- Kill ---------------------------------------------------------------------
+    // Drops the FIFO entries it selects. A partial kill never selects the op the
+    // VU is working on (it is the oldest); a full kill abandons it.
+    i_kill: input core_types::<CFG>::Kill,
 ) {
     import vector_pkg::*;
     import fpu_pkg::*;
@@ -842,7 +841,7 @@ pub module vector_unit #(
     var fifo_has_rd: logic                 [FIFO_N];
     var fifo_rd_fp : logic                 [FIFO_N]; // V3f: scalar rd is FP (vfmv.f.s)
     var fifo_rd_pd : logic         <PRF_W> [FIFO_N];
-    var fifo_rob   : logic     <ROB_IDX_W> [FIFO_N];
+    var fifo_tag   : core_types::<CFG>::RobTag [FIFO_N];
     var head       : logic         <FIFO_W>;
     var count      : logic       <FIFO_W+1>; // 0..FIFO_N
 
@@ -979,6 +978,9 @@ pub module vector_unit #(
     let has_free: logic = !count[FIFO_W];
     assign o_alloc_rdy = has_free;
 
+    let kill_full: logic = i_kill.valid && i_kill.full;
+    let kill_part: logic = i_kill.valid && !i_kill.full;
+
     // ---- Head fields --------------------------------------------------------
     let h_op    : vector_pkg::VecOp = fifo_op[head];
     let h_instr : logic        <32> = fifo_instr[head];
@@ -993,7 +995,7 @@ pub module vector_unit #(
     let h_has_rd: logic             = fifo_has_rd[head];
     let h_rd_fp : logic             = fifo_rd_fp[head]; // V3f scalar rd is FP
     let h_rd_pd : logic     <PRF_W> = fifo_rd_pd[head];
-    let h_rob   : logic <ROB_IDX_W> = fifo_rob[head];
+    let h_tag   : core_types::<CFG>::RobTag = fifo_tag[head];
 
     let h_is_vset: logic = (h_op == VecOp::VSETVLI) || (h_op == VecOp::VSETIVLI);
     let h_is_valu: logic = h_op == VecOp::VALU;
@@ -2245,9 +2247,10 @@ pub module vector_unit #(
     // VFP_EX_PIPE registers u_vfpu's fround add and FMA mantissa product. The extra
     // cycles surface as vfpu_busy, which the COMPUTE FSM already waits on before capture.
     const VFP_EX_PIPE: bit = 1;
+    // The owner and rd widths match fpu_wrap's CdbBus fields (pipeline_pkg).
     inst u_vfpu: fpu_wrap #(
-        PRF_W    : PRF_W    ,
-        ROB_IDX_W: ROB_IDX_W,
+        PRF_W    : 6        ,
+        ROB_IDX_W: 5        ,
         PIPE       : 1          , // 2-stage FP arith; VU streams via fp_ph (present/capture)
         FROUND_PIPE: VFP_EX_PIPE, // register the double fround-add off the vector FP CP (held via o_fpu_busy)
         FMA_PIPE3  : VFP_EX_PIPE, // register the FMA 53x53 mantissa-mul (held via o_fpu_busy)
@@ -2266,10 +2269,11 @@ pub module vector_unit #(
         // i_issue_rob_idx; the VU drives one element at a time with i_issue_valid
         // held high, so a CONSTANT id would leave the previous element's done flag
         // "for me" and the divider would never re-trigger. Feeding the element
-        // index (consecutive elements always differ mod 32) makes each element a
-        // fresh owner → the divider restarts per element. Harmless for the
-        // single-cycle ops (they don't use the owner latch).
-        i_issue_rob_idx   : fp_elem[ROB_IDX_W - 1:0],
+        // index (consecutive elements always differ) makes each element a fresh
+        // owner → the divider restarts per element. The owner is the element
+        // index mod 32, independent of the ROB. Harmless for the single-cycle
+        // ops (they don't use the owner latch).
+        i_issue_rob_idx   : fp_elem[4:0],
         i_issue_has_rd    : 1'b0             ,
         i_issue_writes_int: 1'b0             ,
         i_s1_data         : fpu_s1           ,
@@ -2280,7 +2284,7 @@ pub module vector_unit #(
         // the 2*SEW (int64) element at the wide source geometry. FP-input ops
         // ignore this.
         i_int_rs1_data    : fpu_int_rs1      ,
-        i_flush           : i_flush          ,
+        i_flush           : kill_full        ,
         o_fpu_busy        : vfpu_busy        ,
         o_cdb             : vfpu_cdb         ,
         o_fflags          : vfpu_fflags      ,
@@ -2370,14 +2374,16 @@ pub module vector_unit #(
     let fp_reg_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && !h_is_fcmp && !h_is_red && fp_dreg_last;
     let fp_cmp_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && h_is_fcmp && fp_last_elem;
     let fp_red_wr  : logic = (fp_state == 2'd1) && !vfpu_busy && fp_ph && h_is_red && fp_last_elem;
-    let fp_cdb_fire: logic = h_is_fp && (fp_state == 2'd2) && i_cdb_free && !i_flush;
+    let fp_wb_req  : logic = h_is_fp && (fp_state == 2'd2) && !kill_full;
+    let fp_cdb_fire: logic = fp_wb_req && i_cdb_free;
 
     // ---- Execute the head (combinational) -----------------------------------
     let scalar_ok: logic = !h_uses_s || h_s_rdy;
-    let at_head   : logic = h_rob == i_rob_head_idx; // non-speculative
+    let at_head   : logic = i_exec.valid && h_tag == i_exec.tag; // non-speculative
     // vset / vmv.x.s fire in one combinational cycle (LMUL-independent, int rd).
     let h_is_1cyc: logic = h_is_vset || h_is_vmv || h_is_vfmv_sf || h_is_vfmv_fs || h_is_vmask || h_is_vcpop || h_is_vmspre;
-    let fire     : logic = (count != 0) && at_head && scalar_ok && i_cdb_free && !i_flush && h_is_1cyc;
+    let wb_1cyc  : logic = (count != 0) && at_head && scalar_ok && !kill_full && h_is_1cyc;
+    let fire     : logic = wb_1cyc && i_cdb_free;
     // V4i permute (slide / vrgather / vcompress): element-serial via the pm_state
     // FSM below, retiring from DONE (pm_cdb_fire). Handles all LMUL. The VRF write
     // is the dest-register boundary (slide / vrgather) or every compressed element
@@ -2393,7 +2399,8 @@ pub module vector_unit #(
     // The dest-register VRF write only fires in the present cycle (not the FETCH
     // cycle, where pm_fetched_q is still 0 and the registered index is stale).
     let pm_reg_wr  : logic = (pm_state == 2'd1) && (!pm_need_fetch || pm_fetched_q) && (if h_is_comp ? pm_cm : pm_dreg_lst);
-    let pm_cdb_fire: logic = h_is_perm && (pm_state == 2'd2) && i_cdb_free && !i_flush;
+    let pm_wb_req  : logic = h_is_perm && (pm_state == 2'd2) && !kill_full;
+    let pm_cdb_fire: logic = pm_wb_req && i_cdb_free;
     // VALU (ALU/mul-div/merge/compare): walk va_nregs register groups, one per
     // cycle. Intermediate groups write the VRF with no CDB; the last group
     // (va_last) rides the vu_cdb (result_written) and needs i_cdb_free.
@@ -2439,7 +2446,7 @@ pub module vector_unit #(
     // registered and pulses on the IDLE cycle (busy already 0), so without this a
     // new lane would (re)start with the just-finished lane's still-current dv_lane
     // operands — shifting every result one lane.
-    let dv_start  : logic = dv_op && at_head && (count != 0) && scalar_ok && !i_flush && !dv_group_done && !dv_busy_w && !dv_valid_w;
+    let dv_start  : logic = dv_op && at_head && (count != 0) && scalar_ok && !kill_full && !dv_group_done && !dv_busy_w && !dv_valid_w;
     inst u_int_div: int_divider (
         clk                    ,
         rst                    ,
@@ -2447,7 +2454,7 @@ pub module vector_unit #(
         i_alu_op: dv_alu_op    ,
         i_a     : dv_a_ext     ,
         i_b     : dv_b_ext     ,
-        i_flush : i_flush      ,
+        i_flush : kill_full    ,
         o_result: dv_result_w  ,
         o_valid : dv_valid_w   ,
         o_busy  : dv_busy_w    ,
@@ -2463,7 +2470,7 @@ pub module vector_unit #(
     let dv_mask_vlen: logic<VLEN> = {64'd0, dv_sew_mask} << dv_bitoff;
     let dv_res_vlen : logic<VLEN> = {64'd0, dv_result_w & dv_sew_mask} << dv_bitoff;
 
-    let va_run  : logic = (count != 0) && at_head && scalar_ok && !i_flush && (h_is_valu || h_is_viota) && (!dv_op || dv_group_done);
+    let va_run  : logic = (count != 0) && at_head && scalar_ok && !kill_full && (h_is_valu || h_is_viota) && (!dv_op || dv_group_done);
     let va_last : logic = ({1'b0, va_reg} + 4'd1) >= va_nregs;
     // CP (VALU_PIPE): a plain-valu/compare group first spends a FETCH cycle (latch the
     // VRF operands into va_vs*_q); compute/retire waits on va_ops_rdy. Widen/narrow/
@@ -2471,10 +2478,12 @@ pub module vector_unit #(
     // true (as today). Dead when VALU_PIPE=0 (va_use_reg=0 -> va_ops_rdy=1).
     let va_ops_rdy   : logic = !va_use_reg || va_fetched_q;
     let va_fetch_need: logic = va_use_reg && va_run && !va_fetched_q; // the FETCH cycle
-    let va_fire : logic = va_run && va_last && i_cdb_free && va_ops_rdy; // final group + writeback
+    let va_wb_req: logic = va_run && va_last && va_ops_rdy;
+    let va_fire : logic = va_wb_req && i_cdb_free; // final group + writeback
     let va_step : logic = va_run && !va_last && va_ops_rdy;             // intermediate group (no CDB)
     // Memory ops (vle/vse) stream through the FSM below, retiring from DONE.
-    let mem_cdb_fire: logic = h_is_mem && (mem_state == 2'd3) && i_cdb_free && !i_flush;
+    let mem_wb_req  : logic = h_is_mem && (mem_state == 2'd3) && !kill_full;
+    let mem_cdb_fire: logic = mem_wb_req && i_cdb_free;
     // A retiring vleff that trimmed vl writes the new vl at commit. It reuses the
     // vset writeback path (sh_vset / o_commit_vtype/vl in the ROB → CSR), carrying
     // the unchanged vtype (vtype_q) and the trimmed vl (ff_vl_q).
@@ -2536,7 +2545,20 @@ pub module vector_unit #(
     assign o_cdb_fp_dest  = fire && h_rd_fp;  // vfmv.f.s → write prf_fp (cdb_dest_is_fp)
     assign o_cdb_pdst     = h_rd_pd;
     assign o_cdb_data     = h_cdb_data;
-    assign o_cdb_rob_idx  = h_rob;
+
+    assign o_wb_req = wb_1cyc || va_wb_req || mem_wb_req || fp_wb_req || pm_wb_req;
+    assign o_wb_rd  = wb_1cyc && h_has_rd;
+
+    // Whole-register loads/stores and vset* do not depend on vtype. Vector FP
+    // is OPFVV/OPFVF and the FP scalar moves (VFALU also carries the integer
+    // reductions).
+    always_comb {
+        o_head.valid     = count != 0;
+        o_head.tag       = h_tag;
+        o_head.vtype_dep = !h_is_vset && !h_is_wholereg;
+        o_head.is_fp     = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || h_is_vfmv_sf || h_is_vfmv_fs;
+        o_head.insn      = h_instr;
+    }
     assign o_cdb_vset_wen = (fire && h_is_vset) || ff_trim_retire;
     assign o_cdb_vtype    = if ff_trim_retire ? vtype_q : vtype_new;
     assign o_cdb_vl       = if ff_trim_retire ? {56'd0, ff_vl_q} : vl_new;
@@ -2581,21 +2603,15 @@ pub module vector_unit #(
     let do_alloc: logic = i_alloc_en && has_free;
     let tail    : logic<FIFO_W> = head + count[FIFO_W-1:0];
 
-    // Partial-squash keep mask. A slot is kept if occupied and its op is older-or-
-    // equal to i_squash_idx (ROB age <= squash_age) — exactly the ROB's rule.
-    var sq_keep : logic         [FIFO_N];
-    var sq_nkeep: logic<FIFO_W + 1>     ;
+    // Partial-kill keep mask: the occupied slots the kill does not select.
+    var sq_keep: logic<FIFO_N>;
     always_comb {
-        let squash_age: logic<ROB_IDX_W> = i_squash_idx - i_rob_head_idx;
-        sq_nkeep = 4'd0;
         for i in 0..FIFO_N {
-            let eage: logic<ROB_IDX_W> = fifo_rob[i] - i_rob_head_idx;
-            sq_keep[i] = occupied[i] && (eage <= squash_age);
-            if sq_keep[i] {
-                sq_nkeep = sq_nkeep + 4'd1;
-            }
+            sq_keep[i] = occupied[i] && !core_types::<CFG>::killed(i_kill, fifo_tag[i]);
         }
     }
+    const CNT_W   : u32               = FIFO_W + 1;
+    let sq_nkeep: logic<FIFO_W + 1> = tree_popcount::<FIFO_N, CNT_W>(sq_keep);
 
     always_ff (clk, rst) {
         if_reset {
@@ -2607,14 +2623,14 @@ pub module vector_unit #(
                 fifo_vs1[i]    = 5'd0;
                 fifo_vs2[i]    = 5'd0;
                 fifo_uses_s[i] = 1'b0;
-                fifo_s_pdst[i] = 6'd0;
-                fifo_fs_pd[i]  = 6'd0;
-                fifo_s2_pd[i]  = 6'd0;
+                fifo_s_pdst[i] = '0;
+                fifo_fs_pd[i]  = '0;
+                fifo_s2_pd[i]  = '0;
                 fifo_s_rdy[i]  = 1'b0;
                 fifo_has_rd[i] = 1'b0;
                 fifo_rd_fp[i]  = 1'b0;
-                fifo_rd_pd[i]  = 6'd0;
-                fifo_rob[i]    = 5'd0;
+                fifo_rd_pd[i]  = '0;
+                fifo_tag[i]    = '0;
             }
             head    = 0;
             count   = 0;
@@ -2656,7 +2672,7 @@ pub module vector_unit #(
             pm_acc      = {1'b0 repeat VLEN};
             pm_j        = 8'd0;
             pm_fetched_q = 1'b0;
-        } else if i_flush {
+        } else if kill_full {
             // Drop all speculative vector ops; restore config from the committed
             // (architectural) vtype/vl held in the CSR file. Abandon any in-flight
             // memory op (its element writes are idempotent unit-stride accesses;
@@ -3001,20 +3017,19 @@ pub module vector_unit #(
                 fifo_has_rd[tail] = i_alloc_has_rd;
                 fifo_rd_fp[tail]  = i_alloc_rd_is_fp;
                 fifo_rd_pd[tail]  = i_alloc_rd_pdst;
-                fifo_rob[tail]    = i_alloc_rob_idx;
+                fifo_tag[tail]    = i_alloc_tag;
                 // Initial scalar readiness: core-supplied, or same-cycle int CDB.
                 fifo_s_rdy[tail] = (!i_alloc_uses_scalar) || i_alloc_scalar_ready
                     || (i_cdb_int_valid && i_cdb_int_pdst == i_alloc_scalar_pdst)
                     || (i_cdb2_valid && i_cdb2_has_rd && i_cdb2_pdst == i_alloc_scalar_pdst);
             }
-            // Early (execute-time) PARTIAL squash, mirroring the ROB. Drop FIFO
-            // entries YOUNGER than i_squash_idx (ROB age > squash_age); the kept set
-            // is sq_keep / sq_nkeep (computed combinationally). This runs alongside
+            // Partial kill: drop the entries it selects; the kept set is sq_keep /
+            // sq_nkeep (computed combinationally). This runs alongside
             // the normal FSM/pop above (it only touches the younger suffix — the
             // tail side — while pop touches the head, so they are independent). Only
             // CLEAR occupied for dropped slots so a same-cycle vu_pop's head clear
-            // above is preserved. The core suppresses alloc on a squash cycle.
-            if i_squash_en {
+            // above is preserved. The core suppresses alloc in a kill cycle.
+            if kill_part {
                 for i in 0..FIFO_N {
                     if !sq_keep[i] {
                         occupied[i] = 1'b0;
@@ -3024,7 +3039,7 @@ pub module vector_unit #(
             // Head/count update (pop + push are independent slots). On a squash the
             // surviving count is sq_nkeep (minus the head if it also popped); the
             // head advances only on a pop.
-            if i_squash_en {
+            if kill_part {
                 if vu_pop {
                     head  = head + 1;
                     count = sq_nkeep - 4'd1;

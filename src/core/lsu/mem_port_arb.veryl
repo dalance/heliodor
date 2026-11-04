@@ -1,7 +1,8 @@
 // mem_port_arb: assigns the next m0 slot of each memory pipe to a requester
 // class (NEW = memory IQ select, LQ and SQ = re-issue, NP = a non-pipe
-// client of the HEAD port: a walker, atomic_unit or io_unit), and drives the
-// pipe's WB slot reservation.
+// client of the HEAD port: a walker, atomic_unit or io_unit, VU = an element
+// pass of the vector unit on the HEAD pipe), and drives the pipe's WB slot
+// reservation.
 //
 // Ports (timing contract):
 //   i_wb_ok[p]    : wb_resv of pipe p: the WB slot a pass entering m0 next
@@ -10,22 +11,25 @@
 //   i_iq_resv[p]  : the memory IQ's reservation for pipe p this cycle
 //   i_np_req[k]   : non-pipe client k requests the HEAD port, from its
 //                   registered state
+//   i_vu_req      : vu_mem_adapter's registered element request
 //   o_port_hold[p], o_re[p], o_lq_gnt, o_sq_gnt, o_np_gnt[k] : this cycle t,
 //                   combinational from the registered inputs only; a held
 //                   pipe gets o_re[p] or an NP token instead of an IQ select,
 //                   captured into m0 on the edge
+//   o_vu_gnt, o_vu_go[p] : this cycle t, the element enters m0 of pipe p
+//                   (the HEAD pipe) on the edge
 //   o_np_slot[k]  : registered, client k's token is in m2 = A (t + 3): the
 //                   HEAD pipe's slot is empty and the client's request is
 //                   presented on the HEAD port this cycle
 //   o_resv[p]     : to wb_resv of pipe p: the re-issue's claim of the slot a
-//                   pass entering m0 next cycle uses, none for an NP token,
-//                   else i_iq_resv[p]
+//                   pass entering m0 next cycle uses, none for an NP token
+//                   or a VU pass (neither writes back), else i_iq_resv[p]
 //   o_perf        : combinational event wires
 // Owns:
 //   - a request is granted on at most one pipe, and a pipe gets at most one
 //     requester per cycle
 //   - no starvation: classes are served round-robin per pipe, so a waiting
-//     class is served within B = 3 slots of its pipe (classes - 1); the NP
+//     class is served within B = 4 slots of its pipe (classes - 1); the NP
 //     clients take turns among themselves the same way
 // Rationale:
 //   - no class has absolute priority; the IQ's NEW requests are not starved
@@ -49,6 +53,7 @@ pub module mem_port_arb::<CFG: core_cfg> (
     i_sq_re  : input core_types::<CFG>::MemReissue                           ,
     i_iq_resv: input fu_pkg::WbSlot                 [CFG::MEM_W]             ,
     i_np_req : input logic                          [core_types::<CFG>::NP_N],
+    i_vu_req : input logic                                                   ,
 
     o_port_hold: output logic                           [CFG::MEM_W]             ,
     o_re       : output core_types::<CFG>::MemReissue   [CFG::MEM_W]             ,
@@ -57,6 +62,8 @@ pub module mem_port_arb::<CFG: core_cfg> (
     o_sq_gnt   : output logic                                                    ,
     o_np_gnt   : output logic                           [core_types::<CFG>::NP_N],
     o_np_slot  : output logic                           [core_types::<CFG>::NP_N],
+    o_vu_gnt   : output logic                                                    ,
+    o_vu_go    : output logic                           [CFG::MEM_W]             ,
 
 
     o_perf: output core_types::<CFG>::ArbPerf,
@@ -67,8 +74,8 @@ pub module mem_port_arb::<CFG: core_cfg> (
     // WB slot a memory-pipe pass claims when it enters m0 the next cycle.
     const CLAIM: fu_pkg::WbSlot = fu_pkg::WbSlot'{valid: 1'b1, off: fu_pkg::claim_off(FuKind::LOAD) as fu_pkg::WbOff};
 
-    // Classes, in round-robin order: 0 NEW, 1 LQ, 2 SQ, 3 NP.
-    const NC: u32 = 4;
+    // Classes, in round-robin order: 0 NEW, 1 LQ, 2 SQ, 3 NP, 4 VU.
+    const NC: u32 = 5;
 
     var rr_q  : logic<NC>   [CFG::MEM_W]; // one-hot: the class served first
     var win   : logic<NC>   [CFG::MEM_W]; // one-hot over the classes
@@ -96,6 +103,7 @@ pub module mem_port_arb::<CFG: core_cfg> (
             r[1] = i_lq_re.valid && i_wb_ok[p] && !lq_by[p] && (mem_port_head(p) || !i_lq_re.op.amo);
             r[2] = i_sq_re.valid && i_wb_ok[p] && !sq_by[p] && (mem_port_head(p) || !i_sq_re.op.amo);
             r[3] = mem_port_head(p) && np_r != '0;
+            r[4] = mem_port_head(p) && i_vu_req;
             // the requests at or after the round-robin pointer come first
             hi           = r & ~(rr_q[p] - 1);
             win[p]       = if hi != '0 ? tree_first::<NC>(hi) : tree_first::<NC>(r);
@@ -103,11 +111,13 @@ pub module mem_port_arb::<CFG: core_cfg> (
             sq_by[p + 1] = sq_by[p] || win[p][2];
         }
     }
-    let np_win: logic<NP_N> = if win[0][3] ? np_sel : '0;
+    let np_win: logic<NP_N> = if win[HEAD_PORT][3] ? np_sel : '0;
+    assign o_vu_gnt = win[HEAD_PORT][4];
 
     for p in 0..CFG::MEM_W :g_port {
-        assign o_port_hold[p] = win[p][1] || win[p][2] || win[p][3];
-        assign o_resv[p]      = if win[p][1] || win[p][2] ? CLAIM : if win[p][3] ? 0 as fu_pkg::WbSlot : i_iq_resv[p];
+        assign o_port_hold[p] = win[p][1] || win[p][2] || win[p][3] || win[p][4];
+        assign o_vu_go[p]     = win[p][4];
+        assign o_resv[p]      = if win[p][1] || win[p][2] ? CLAIM : if win[p][3] || win[p][4] ? 0 as fu_pkg::WbSlot : i_iq_resv[p];
         always_comb {
             o_re[p]       = if win[p][2] ? i_sq_re : i_lq_re;
             o_re[p].valid = win[p][1] || win[p][2];
@@ -147,4 +157,6 @@ pub module mem_port_arb::<CFG: core_cfg> (
     assign o_perf.sq_win = o_sq_gnt;
     assign o_perf.lq_blk = i_lq_re.valid && !o_lq_gnt;
     assign o_perf.np_win = np_win != '0;
+    assign o_perf.vu_win = o_vu_gnt;
+    assign o_perf.vu_blk = i_vu_req && !o_vu_gnt;
 }

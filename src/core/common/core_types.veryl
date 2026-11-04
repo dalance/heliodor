@@ -685,8 +685,9 @@ pub package core_types::<CFG: core_cfg> {
     const SB_CREDIT_W: u32 = tag_pkg::idx_w(PUSH_W + 1);
 
     // Units whose started pulse sets commit.head_started_q: fu_sys,
-    // atomic_unit, io_unit, and the mem pipes' D-bit walk requests.
-    const STARTED_N: u32 = 4;
+    // atomic_unit, io_unit, the mem pipes' D-bit walk requests and
+    // vu_adapter.
+    const STARTED_N: u32 = 5;
 
     // Commit's flush request to flush_ctrl. ftq/foff/taken only for BR_CM.
     struct CmFlush {
@@ -720,6 +721,13 @@ pub package core_types::<CFG: core_cfg> {
         fflags_set : logic              ,
         fflags     : logic<5>           ,
         fs_dirty   : logic              ,
+        vs_dirty   : logic              ,
+        vset       : logic              , // vtype and vl := vtype, vl
+        vtype      : logic<64>          ,
+        vl         : logic<64>          ,
+        vstart_wr  : logic              ,
+        vstart     : logic<64>          ,
+        vxsat      : logic              , // vxsat := 1
     }
 
     // trap_unit -> csr
@@ -833,6 +841,7 @@ pub package core_types::<CFG: core_cfg> {
         rf_xret    : logic              ,
         rf_serial  : logic              ,
         rf_br_cm   : logic              , // commit-time misprediction backstop
+        rf_vec     : logic              , // a vector store's RETIRE_FLUSH
         irq_take   : logic              ,
         irq_started: logic              , // interrupt waits for head_started_q
         dm_halt    : logic              , // Debug Mode entry by haltreq
@@ -1152,6 +1161,7 @@ pub package core_types::<CFG: core_cfg> {
         cut_int   : logic,
         cut_fp    : logic,
         cut_ck    : logic, // a BRU op behind the group's checkpointed BRU op
+        cut_vq    : logic, // a second vector op, or the vector unit FIFO is full
         kill_stall: logic,
         walk_stall: logic,
         stall     : logic, // a lane refused for a missing credit
@@ -1175,8 +1185,9 @@ pub package core_types::<CFG: core_cfg> {
 
     // LQ and SQ: the memory pipes' passes; PTW_D, PTW_I: PTE reads of the D
     // and I walkers; AD: their A/D writes; IFU: the owner tag of an I-side
-    // walk request; ATOMIC, IO: the non-pipe clients of the HEAD port.
-    enum MemClient: logic<3> {
+    // walk request; ATOMIC, IO: the non-pipe clients of the HEAD port; VU:
+    // the vector unit's element passes on pipe 0.
+    enum MemClient: logic<4> {
         LQ,
         SQ,
         PTW_D,
@@ -1185,6 +1196,7 @@ pub package core_types::<CFG: core_cfg> {
         IFU,
         ATOMIC,
         IO,
+        VU,
     }
 
     enum MemCls: logic<3> {
@@ -1489,10 +1501,12 @@ pub package core_types::<CFG: core_cfg> {
 
     // ---- HEAD clients (sections L.11, L.13) ----
 
-    // Hole-fill writers of the HEAD pipe's WB port: atomic_unit, io_unit.
-    const HF_N     : u32 = 2;
+    // Hole-fill writers of the HEAD pipe's WB port: atomic_unit, io_unit,
+    // vu_adapter.
+    const HF_N     : u32 = 3;
     const HF_ATOMIC: u32 = 0;
     const HF_IO    : u32 = 1;
+    const HF_VU    : u32 = 2;
 
     // An atomic handed over by m2 of the HEAD pipe: checked and without
     // exception. The AGU used imm = 0. The first pass carries the operands
@@ -1585,6 +1599,8 @@ pub package core_types::<CFG: core_cfg> {
         sq_win: logic,
         lq_blk: logic, // an LQ request lost or waited for its WB slot
         np_win: logic, // a non-pipe client took port 0's slot
+        vu_win: logic, // the vector unit's element took pipe 0's slot
+        vu_blk: logic, // the vector unit's element waited for its slot
     }
 
     struct AtomicPerf {
@@ -1650,6 +1666,122 @@ pub package core_types::<CFG: core_cfg> {
 
     const CHK_DC_W: u32 = 9;
 
+    // ---- Vector unit (section V) ----
+
+    // dispatch -> vu_adapter: the first VEC lane of a rename group. Every
+    // source is the rename-time mapping of its register field, whether the
+    // op reads it or not.
+    struct VuAlloc {
+        valid : logic                ,
+        tag   : RobTag               ,
+        op    : vector_pkg::VecOp    ,
+        insn  : logic            <32>,
+        src1  : PReg                 , // int rs1
+        src2  : PReg                 , // int rs2
+        fsrc1 : PReg                 , // fp rs1
+        dst   : PReg                 , // the scalar rd: FP class for vfmv.f.s
+        has_rd: logic                ,
+    }
+
+    // vector_unit -> vu_adapter: the dispatch FIFO head.
+    struct VuHead {
+        valid    : logic     ,
+        tag      : RobTag    ,
+        vtype_dep: logic     , // illegal while vtype.vill is set
+        is_fp    : logic     , // vector FP: illegal unless SEW is 32 or 64
+        insn     : logic <32>,
+    }
+
+    // Retire-time side effects of a vector op; commit holds one.
+    struct VecSide {
+        vcfg_v  : logic    , // vset*, or a fault-only-first trim: vtype and vl
+        vtype   : logic<64>,
+        vl      : logic<64>,
+        vstart  : logic<64>, // the faulting element of a trapping access, else 0
+        fflags  : logic<5> ,
+        vxsat   : logic    ,
+        vrf_wcnt: logic<8> , // retire record only
+        vrf_hash: logic<64>, // retire record only
+    }
+
+    // vu_adapter -> rob and commit; the completion of a vector op. data is
+    // the scalar rd value (retire record only; the PRF write is a pair
+    // packet on the HEAD pipe's WB port in the same cycle).
+    struct VuDone {
+        valid: logic          ,
+        tag  : RobTag         ,
+        exc  : exc_pkg::ExcRec,
+        side : VecSide        ,
+        data : logic      <64>,
+    }
+
+    // vu_mem_adapter -> memory pipe 0: one element access, taken into m0 when
+    // mem_port_arb grants the slot.
+    struct VuMemReq {
+        valid: logic     ,
+        tag  : MemTag    , // client VU, id = request generation, rob = the VEC op
+        va   : logic <64>,
+        size : logic <2> , // log2 bytes; the element is naturally aligned
+        st   : logic     ,
+    }
+
+    enum VuMemKind: logic<3> {
+        HIT, // load: data
+        MISS, // load: request again after the fill fill_id
+        RETRY, // request again
+        XPARK, // DTLB miss with its walk requested: request again after the walk
+        ST_OK, // store: translated and checked, pa
+        FAULT, // exc
+    }
+
+    // memory pipe 0 -> vu_mem_adapter, at m2 + RESP_LAT of the pass. The pipe
+    // neither forwards nor formats a VU load.
+    struct VuMemRes {
+        valid  : logic               ,
+        tag    : MemTag              ,
+        kind   : VuMemKind           ,
+        data   : logic          <128>, // load: dwords pa[5:3] and pa[5:3] + 1
+        pa     : pma_pkg::Pa         ,
+        fill_id: FillId              ,
+        exc    : exc_pkg::ExcRec     ,
+    }
+
+    // vu_mem_adapter -> sb: one store element; data and strobe are placed in
+    // the dword of pa.
+    struct VuPush {
+        valid: logic          ,
+        pa   : pma_pkg::Pa    ,
+        data : logic      <64>,
+        strb : logic      <8> ,
+    }
+
+    struct VuPerf {
+        exec_wait: logic, // the head waits for the token
+        start    : logic,
+        illegal  : logic, // an illegal head completed with cause 2
+        src_block: logic, // a source not done held the start back
+        hf_wait  : logic, // an rd op waits for its hole-fill slot
+        done     : logic,
+        vstart_nz: logic, // an op started with vstart != 0
+    }
+
+    struct VuMemPerf {
+        req     : logic, // a slot request granted
+        wait_ord: logic, // the VU holds a memory op with no element out and sb not empty
+        miss    : logic,
+        miss_ev : logic, // the fill event came with the MISS verdict
+        retry   : logic,
+        xpark   : logic,
+        fault   : logic,
+        misal   : logic,
+        push    : logic,
+        push_blk: logic, // sb full
+        port_req: logic, // the VU holds a memory op (the old core's port lock)
+    }
+
+    const CHK_VU_W : u32 = 5;
+    const CHK_VUM_W: u32 = 2;
+
     // ---- Core top observation ----
 
     struct FrontPerf {
@@ -1689,6 +1821,8 @@ pub package core_types::<CFG: core_cfg> {
         ptw_i: xlate_pkg::PtwPerf               ,
         at   : AtomicPerf                       ,
         io   : IoPerf                           ,
+        vu   : VuPerf                           ,
+        vum  : VuMemPerf                        ,
         rob  : RobPerf                          ,
         cm   : CmPerf                           ,
         flush: FlushPerf                        ,
@@ -1720,6 +1854,8 @@ pub package core_types::<CFG: core_cfg> {
         ptw_i  : logic<4>                  ,
         at     : logic<4>                  ,
         io     : logic<4>                  ,
+        vu     : logic<CHK_VU_W>           ,
+        vum    : logic<CHK_VUM_W>          ,
         rob    : logic<CHK_ROB_W>          ,
         cm     : logic<CHK_CM_W>           ,
         flush  : logic<CHK_FLUSH_W>        ,
@@ -1771,7 +1907,7 @@ pub package core_types::<CFG: core_cfg> {
             }
             // Memory and dispatch-completed kinds never sit on an exec port.
             if (CFG::PORT_FU[p] & (fu_bit(FuKind::NONE) | fu_bit(FuKind::LOAD) | fu_bit(FuKind::STORE)
-                | fu_bit(FuKind::ATOMIC))) != 0 {
+                | fu_bit(FuKind::ATOMIC) | fu_bit(FuKind::VEC))) != 0 {
                 e |= 1 << 11;
             }
             // At most one blocking FU per port: one hole-fill requester.

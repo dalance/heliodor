@@ -10,6 +10,10 @@
 //                          at PUSH_W lines)
 //   i_kill               : the registered Kill of this cycle
 //   i_sys_wr             : fu_sys write of sys_pending, applied on the edge
+//   i_vu_done            : vu_adapter's completion of a VEC op; its VecSide
+//                          is held in vec_q, applied on the edge
+//   i_vtype, i_vl        : csr's committed vtype and vl, for the retire
+//                          record only
 //   i_started            : started-latch pulses of the units, on their
 //                          acceptance edge
 //   i_irq                : csr's pending interrupt, registered here (irq_q)
@@ -96,6 +100,9 @@
 //   - sys_q belongs to the SYS op that retires: SYS ops are nonspec and
 //     alone, so at most one is past select at any time, it is the head when
 //     it retires, and sys_q is written only by it (chk_commit bit 4)
+//   - vec_q belongs to the VEC op on lane 0 by the same argument; a VEC op
+//     writes vstart when it retires, and when it traps on an element
+//     access (the elements before it stay written)
 // Rationale:
 //   - trap, replay and interrupts act only at the group head (lane 0); an
 //     exception, poison or alone op on a younger lane cuts the group so it
@@ -119,6 +126,9 @@ pub module commit::<CFG: core_cfg> (
     i_sb_credit          : input  logic                        <core_types::<CFG>::SB_CREDIT_W>                 ,
     i_kill               : input  core_types::<CFG>::Kill                                                       ,
     i_sys_wr             : input  core_types::<CFG>::SysPending                                                 ,
+    i_vu_done            : input  core_types::<CFG>::VuDone                                                     ,
+    i_vtype              : input  logic                        <64>                                             ,
+    i_vl                 : input  logic                        <64>                                             ,
     i_started            : input  logic                        <core_types::<CFG>::STARTED_N>                   ,
     i_irq                : input  core_types::<CFG>::IrqReq                                                     ,
     i_priv               : input  csr_pkg::PrivLevel                                                            ,
@@ -205,6 +215,9 @@ pub module commit::<CFG: core_cfg> (
     var step_q   : logic              ;
     var step_n_q : logic              ; // the stepped op (or a trap or interrupt) is done
     var sys_q    : SysPending         ;
+    var vec_v_q  : logic              ;
+    var vec_t_q  : RobTag             ;
+    var vec_q    : VecSide            ;
     var started_q: logic              ;
     var ret_q    : RetireRec      [CW];
     var ret_dm_q : logic              ;
@@ -500,6 +513,13 @@ pub module commit::<CFG: core_cfg> (
 
     // ---- Side effects ----
 
+    // The VEC op on lane 0 and its held side record. A trap on an element
+    // access writes the faulting element to vstart; an illegal VEC op does
+    // not touch vstart.
+    let vec_mine: logic = vec_v_q && vec_t_q == i_cm[0].tag && i_cm[0].ent.effect.vstart;
+    let vec_ret : logic = retire[0] && vec_mine;
+    let vec_trap: logic = trap_fire && vec_mine && i_exc.rec.cause != 6'd2;
+
     var sys_ret: logic<CW>    ;
     var csr_ret: logic<CW>    ;
     var mret   : logic<CW>    ;
@@ -550,6 +570,13 @@ pub module commit::<CFG: core_cfg> (
         o_csr.instret_cnt = n_ret;
         o_csr.fflags_set  = |ffl_v;
         o_csr.fs_dirty    = |fsd_v;
+        o_csr.vs_dirty    = vec_ret || vec_trap;
+        o_csr.vset        = vec_ret && vec_q.vcfg_v;
+        o_csr.vtype       = vec_q.vtype;
+        o_csr.vl          = vec_q.vl;
+        o_csr.vstart_wr   = vec_ret || vec_trap;
+        o_csr.vstart      = if vec_ret ? 64'd0 : vec_q.vstart;
+        o_csr.vxsat       = vec_ret && vec_q.vxsat;
         for b in 0..5 {
             o_csr.fflags[b] = |ffl_col[b];
         }
@@ -569,6 +596,9 @@ pub module commit::<CFG: core_cfg> (
             step_q    = 1'b0;
             step_n_q  = 1'b0;
             sys_q     = 0;
+            vec_v_q   = 1'b0;
+            vec_t_q   = 0;
+            vec_q     = 0;
             started_q = 1'b0;
         } else {
             irq_q  = i_irq;
@@ -602,6 +632,15 @@ pub module commit::<CFG: core_cfg> (
             }
             if i_sys_wr.valid {
                 sys_q = i_sys_wr;
+            }
+
+            if (i_kill.valid && i_kill.full) || retire[0] {
+                vec_v_q = 1'b0;
+            }
+            if i_vu_done.valid && !killed(i_kill, i_vu_done.tag) {
+                vec_v_q = 1'b1;
+                vec_t_q = i_vu_done.tag;
+                vec_q   = i_vu_done.side;
             }
 
             if retire[0] || trap_fire || (i_kill.valid && i_kill.full) {
@@ -686,6 +725,14 @@ pub module commit::<CFG: core_cfg> (
                     if c.ent.effect.fflags {
                         ret_q[l].fflags = c.fflags;
                     }
+                    if l == 0 && vec_mine {
+                        ret_q[l].vec_v    = 1'b1;
+                        ret_q[l].vrf_wcnt = vec_q.vrf_wcnt;
+                        ret_q[l].vrf_hash = vec_q.vrf_hash;
+                        ret_q[l].vtype    = if vec_q.vcfg_v ? vec_q.vtype : i_vtype;
+                        ret_q[l].vl       = if vec_q.vcfg_v ? vec_q.vl : i_vl;
+                        ret_q[l].vstart   = 64'd0;
+                    }
                 }
             }
         }
@@ -743,6 +790,7 @@ pub module commit::<CFG: core_cfg> (
             perf_q.rf_xret     = rf_any && rf_kind == RedirKind::XRET;
             perf_q.rf_serial   = rf_any && rf_kind == RedirKind::SERIAL;
             perf_q.rf_br_cm    = rf_any && rf_kind == RedirKind::BR_CM;
+            perf_q.rf_vec      = rf_lane[0] && i_cm[0].ent.fu == FuKind::VEC;
             perf_q.irq_take    = irq_take;
             perf_q.irq_started = irq_q.pending && irq_ok && started_q && !i_kill.valid;
             perf_q.dm_halt     = dm_take && dm_q && !i_icnt_dm;

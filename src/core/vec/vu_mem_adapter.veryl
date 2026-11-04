@@ -1,0 +1,308 @@
+// vu_mem_adapter: carries the vector unit's element accesses over memory
+// pipe 0 (translation, PMP, PMA, the dcache) and its store elements into sb
+//
+// Ports (timing contract):
+//   i_mem_*, o_mem_* : the vector_unit element port (MEM_PIPE = 0): the VU
+//                    holds an element until o_mem_ready or o_mem_fault*.
+//                    o_mem_ready/o_mem_fault*/o_mem_rdata come from registered
+//                    state, except o_mem_ready of a store element, which is
+//                    its sb accept (i_push_rdy is registered in sb)
+//   o_mem_idle     : sb.o_ordering_empty, what the VU waits for before the
+//                    first element of a memory op
+//   i_rob          : the tag of the vector op at the VU head
+//   o_req, i_gnt   : registered slot request for pipe 0 (mem_port_arb, HEAD
+//                    class), held until the grant
+//   i_res          : the pipe's verdict on the pass, at m2 + RESP_LAT; taken
+//                    only when its MemTag is this adapter's request
+//   i_ev           : dcache fill events; an event in the cycle of a MISS
+//                    verdict counts as after it
+//   i_ptw_evt, i_ptw_resp : the D walker's broadcast and its answer to the
+//                    owner; an XPARK waits for the event of its page, and a
+//                    faulting walk this adapter owns ends the element
+//   o_push, i_push_rdy : a store element into sb, held until accepted
+//   o_exc          : the record of the last faulting element, for VuDone
+//   i_kill         : drops the element in flight when it selects i_rob
+//   i_port_req     : the VU holds a memory op (event only)
+//   i_cm_push      : commit's sb pushes (checker only)
+//   o_chk          : sticky checker flags (HELIODOR_CHK only, else 0):
+//                    0 a VU push and a commit push in one cycle, 1 a
+//                    verdict for this client that is not the request in
+//                    flight
+//   o_perf         : combinational event wires
+// Owns:
+//   - at most one element in flight; it is captured once from the VU, so no
+//     VRF-to-port path crosses this module
+//   - a stale verdict (a request of an earlier generation) is never taken
+//   - a store element reaches sb only after the pipe translated and checked
+//     it; the op holds the exec boundary then, so the push cannot be undone
+// Rationale:
+//   - an element not naturally aligned to its EEW faults here (cause 4 load,
+//     6 store) without a request: RVV lets an implementation trap instead of
+//     performing a misaligned element access
+//   - a vector load does not forward: the VU waits for o_mem_idle before its
+//     first element, and no store enters sb while a vector op holds the head
+//   - a MISS parks on its fill_id and requests again on FILL_DONE,
+//     FILL_ABORT, or FILL_CRIT of the requested dword; RETRY requests again
+//   - a non-cacheable element faults in the pipe (no head-serialized
+//     element access)
+pub module vu_mem_adapter::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill  ,
+    i_rob : input core_types::<CFG>::RobTag,
+
+    i_mem_active  : input  logic    ,
+    i_mem_vaddr   : input  logic<64>,
+    i_mem_is_store: input  logic    ,
+    i_mem_funct3  : input  logic<3> ,
+    i_mem_wdata   : input  logic<64>,
+    i_mem_wstrb   : input  logic<8> ,
+    o_mem_idle    : output logic    ,
+    o_mem_ready   : output logic    ,
+    o_mem_rdata   : output logic<64>,
+    o_mem_fault   : output logic    ,
+    o_mem_fault_st: output logic    ,
+
+    i_ordering_empty: input logic,
+
+    o_req: output core_types::<CFG>::VuMemReq,
+    i_gnt: input  logic                      ,
+    i_res: input  core_types::<CFG>::VuMemRes,
+    i_ev : input  core_types::<CFG>::MemEvent,
+
+    i_ptw_evt : input core_types::<CFG>::PtwEvent ,
+    i_ptw_resp: input core_types::<CFG>::XlateResp,
+
+    o_push    : output core_types::<CFG>::VuPush,
+    i_push_rdy: input  logic                    ,
+
+    o_exc: output exc_pkg::ExcRec,
+
+    i_port_req : input  logic                                                     ,
+    i_cm_push  : input  core_types::<CFG>::SbPush   [core_types::<CFG>::PUSH_W]  ,
+    o_chk      : output logic                       <core_types::<CFG>::CHK_VUM_W>,
+    o_perf     : output core_types::<CFG>::VuMemPerf                              ,
+) {
+    import core_types::<CFG>::*;
+
+    enum St: logic<3> {
+        IDLE,
+        REQ, // o_req valid until granted
+        WAIT, // the pass is in the pipe
+        PARK, // MISS: waiting for the fill event
+        XPARK, // DTLB miss: waiting for the walk
+        PUSH, // store: o_push valid until sb accepts
+        DONE, // load: o_mem_ready this cycle
+        FAULT, // o_mem_fault* this cycle
+    }
+
+    var st_q  : St                 ;
+    var gen_q : logic              ; // generation of the request in flight
+    var rob_q : RobTag             ;
+    var va_q  : logic          <64>;
+    var size_q: logic          <2> ;
+    var str_q : logic              ;
+    var wd_q  : logic          <64>;
+    var strb_q: logic          <8> ;
+    var pa_q  : pma_pkg::Pa        ;
+    var fill_q: FillId             ;
+    var rd_q  : logic          <64>;
+    var exc_q : exc_pkg::ExcRec    ;
+    var xf_q  : exc_pkg::ExcRec    ; // the fault of a walk this element owns
+
+    let dead : logic    = st_q != St::IDLE && killed(i_kill, rob_q);
+    let size : logic<2> = i_mem_funct3[1:0];
+    let misal: logic    = (i_mem_vaddr[2:0] & ((3'd1 << size) - 3'd1)) != 3'd0;
+    let take : logic    = st_q == St::IDLE && i_mem_active && !killed(i_kill, i_rob);
+
+    let res_mine: logic     = st_q == St::WAIT && i_res.valid && i_res.tag.client == MemClient::VU && i_res.tag.id[0]
+        == gen_q;
+    let ev_fill : FillId    = if res_mine ? i_res.fill_id : fill_q;
+    let ev_dw   : logic <3> = if res_mine ? i_res.pa[5:3] : pa_q[5:3];
+    let ev_mine : logic     = i_ev.valid && i_ev.fill_id == ev_fill
+        && (i_ev.kind == EvKind::FILL_DONE || i_ev.kind == EvKind::FILL_ABORT
+            || (i_ev.kind == EvKind::FILL_CRIT && i_ev.crit == ev_dw));
+
+    // The walk of this element's page: its event, and a fault answered to
+    // this adapter as the owner.
+    let xev  : logic           = i_ptw_evt.valid && i_ptw_evt.key.vpn == va_q[38:12] && i_ptw_evt.key.regime == xlate_pkg::Regime::V0;
+    let xflt : logic           = i_ptw_resp.valid && i_ptw_resp.exc.valid && i_ptw_resp.tag.client == MemClient::VU
+        && i_ptw_resp.tag.rob == rob_q && st_q != St::IDLE;
+    let xf_n : exc_pkg::ExcRec = if xflt ? i_ptw_resp.exc : xf_q;
+
+    always_comb {
+        o_req.valid      = st_q == St::REQ;
+        o_req.tag.client = MemClient::VU;
+        o_req.tag.id     = {gen_q} as MEMID_W;
+        o_req.tag.rob_v  = 1'b1;
+        o_req.tag.rob    = rob_q;
+        o_req.va         = va_q;
+        o_req.size       = size_q;
+        o_req.st         = str_q;
+
+        o_push.valid = st_q == St::PUSH;
+        o_push.pa    = pa_q;
+        o_push.data  = wd_q;
+        o_push.strb  = strb_q;
+    }
+
+    assign o_mem_idle     = i_ordering_empty;
+    assign o_mem_ready    = st_q == St::DONE || (st_q == St::PUSH && i_push_rdy);
+    assign o_mem_rdata    = rd_q;
+    assign o_mem_fault    = st_q == St::FAULT && !str_q;
+    assign o_mem_fault_st = st_q == St::FAULT && str_q;
+    assign o_exc          = exc_q;
+
+    always_ff {
+        if_reset {
+            st_q   = St::IDLE;
+            gen_q  = 1'b0;
+            rob_q  = '0;
+            va_q   = 64'd0;
+            size_q = 2'd0;
+            str_q  = 1'b0;
+            wd_q   = 64'd0;
+            strb_q = 8'd0;
+            pa_q   = '0;
+            fill_q = '0;
+            rd_q   = 64'd0;
+            exc_q  = '0;
+            xf_q   = '0;
+        } else if dead {
+            st_q = St::IDLE;
+        } else {
+            xf_q = xf_n;
+            case st_q {
+                St::IDLE: {
+                    if take {
+                        rob_q  = i_rob;
+                        va_q   = i_mem_vaddr;
+                        size_q = size;
+                        str_q  = i_mem_is_store;
+                        wd_q   = i_mem_wdata;
+                        strb_q = i_mem_wstrb;
+                        xf_q   = '0;
+                        if misal {
+                            exc_q.valid = 1'b1;
+                            exc_q.cause = if i_mem_is_store ? 6'd6 : 6'd4;
+                            exc_q.tval  = i_mem_vaddr;
+                            exc_q.gpa   = 54'd0;
+                            exc_q.gva   = 1'b0;
+                            st_q        = St::FAULT;
+                        } else {
+                            st_q = St::REQ;
+                        }
+                    }
+                }
+                St::REQ: {
+                    if i_gnt {
+                        st_q = St::WAIT;
+                    }
+                }
+                St::WAIT: {
+                    if res_mine {
+                        gen_q = ~gen_q;
+                        pa_q  = i_res.pa;
+                        case i_res.kind {
+                            VuMemKind::HIT: {
+                                rd_q = i_res.data[63:0];
+                                st_q = St::DONE;
+                            }
+                            VuMemKind::MISS: {
+                                fill_q = i_res.fill_id;
+                                st_q   = if ev_mine ? St::REQ : St::PARK;
+                            }
+                            VuMemKind::ST_OK: {
+                                st_q = St::PUSH;
+                            }
+                            VuMemKind::FAULT: {
+                                exc_q = i_res.exc;
+                                st_q  = St::FAULT;
+                            }
+                            VuMemKind::XPARK: {
+                                if xf_n.valid {
+                                    exc_q = xf_n;
+                                    st_q  = St::FAULT;
+                                } else {
+                                    st_q = if xev ? St::REQ : St::XPARK;
+                                }
+                            }
+                            default: {
+                                if xf_n.valid {
+                                    exc_q = xf_n;
+                                    st_q  = St::FAULT;
+                                } else {
+                                    st_q = St::REQ;
+                                }
+                            }
+                        }
+                    }
+                }
+                St::PARK: {
+                    if ev_mine {
+                        st_q = St::REQ;
+                    }
+                }
+                St::XPARK: {
+                    if xf_n.valid {
+                        exc_q = xf_n;
+                        st_q  = St::FAULT;
+                    } else if xev {
+                        st_q = St::REQ;
+                    }
+                }
+                St::PUSH: {
+                    if i_push_rdy {
+                        st_q = St::IDLE;
+                    }
+                }
+                default: {
+                    st_q = St::IDLE;
+                }
+            }
+        }
+    }
+
+    always_comb {
+        o_perf.req      = o_req.valid && i_gnt;
+        o_perf.wait_ord = i_port_req && !i_mem_active && !i_ordering_empty;
+        o_perf.miss     = res_mine && i_res.kind == VuMemKind::MISS;
+        o_perf.miss_ev  = res_mine && i_res.kind == VuMemKind::MISS && ev_mine;
+        o_perf.retry    = res_mine && i_res.kind == VuMemKind::RETRY;
+        o_perf.xpark    = res_mine && i_res.kind == VuMemKind::XPARK;
+        o_perf.port_req = i_port_req;
+        o_perf.fault    = st_q == St::FAULT;
+        o_perf.misal    = take && misal;
+        o_perf.push     = st_q == St::PUSH && i_push_rdy;
+        o_perf.push_blk = st_q == St::PUSH && !i_push_rdy;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var chk_q: logic<CHK_VUM_W>;
+        var cm_pv: logic<PUSH_W>  ;
+        always_comb {
+            for k in 0..PUSH_W {
+                cm_pv[k] = i_cm_push[k].valid;
+            }
+        }
+        always_ff {
+            if_reset {
+                chk_q = 0;
+            } else {
+                // a VU push and a commit push in one cycle
+                if o_push.valid && i_push_rdy && cm_pv != '0 {
+                    chk_q[0] = 1'b1;
+                }
+                // a verdict for this client that is not the request in flight
+                if i_res.valid && i_res.tag.client == MemClient::VU && !res_mine {
+                    chk_q[1] = 1'b1;
+                }
+            }
+        }
+        assign o_chk = chk_q;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

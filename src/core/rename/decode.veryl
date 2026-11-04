@@ -21,10 +21,16 @@
 //     illegal-instruction fault (legality below is the only place deciding it)
 //   - pred_taken is set only on branches and jumps (checked, not used)
 // Legality (function `illegal`): an instruction is illegal when
-//   - the reused decoder flags it, or it is a vector instruction
+//   - the reused decoder flags it (this includes every vector encoding the
+//     vector unit does not implement)
 //   - it is not served by this core build, because no unit for it exists:
 //     the H extension (HLV/HLVX/HSV, HFENCE/HINVAL and the hypervisor and VS
-//     CSRs) and the V CSRs
+//     CSRs)
+//   - a vector instruction or a vector CSR access with mstatus.VS = Off, or
+//     with vsstatus.VS = Off when V = 1; a vector FP instruction (OPFVV,
+//     OPFVF) with mstatus.FS = Off; a reserved OPIVV or OPIVI encoding the
+//     decoder lets through (vrsub.vv, vmsgt{u}.vv, vsub.vi, vmin{u}.vi,
+//     vmax{u}.vi, vmslt{u}.vi, vssub{u}.vi)
 //   - it is a load or store of a reserved width (LOAD funct3 111, STORE
 //     funct3 1xx, a 16-byte FP access: no Q), or an FP op that rounds with a
 //     reserved rm (101, 110) or with rm DYN while frm holds a reserved value
@@ -117,6 +123,7 @@ module decode::<CFG: core_cfg> (
     var hlv       : logic                   [W];
     var hlvx      : logic                   [W];
     var is_vec    : logic                   [W];
+    var vec_op    : vector_pkg::VecOp       [W];
     var imm64     : logic              <64> [W];
 
     for l in 0..W :g_dec {
@@ -158,7 +165,7 @@ module decode::<CFG: core_cfg> (
             o_hlv             : hlv[l]       ,
             o_hlvx            : hlvx[l]      ,
             o_is_vec          : is_vec[l]    ,
-            o_vec_op          : _            ,
+            o_vec_op          : vec_op[l]    ,
             o_vec_uses_scalar : _            ,
             o_vec_writes_int  : _            ,
         );
@@ -284,12 +291,31 @@ module decode::<CFG: core_cfg> (
         }
     }
 
-    // CSRs of extensions this build does not serve: the V CSRs, and the
-    // hypervisor and VS CSRs (address bits [9:8] = 2'b10).
+    // CSRs of extensions this build does not serve: the hypervisor and VS
+    // CSRs (address bits [9:8] = 2'b10).
     function csr_unserved (
         a: input logic<12>,
     ) -> logic {
-        return (a >= 12'h008 && a <= 12'h00a) || a == 12'h00f || (a >= 12'hc20 && a <= 12'hc22) || a[9:8] == 2'b10;
+        return a[9:8] == 2'b10;
+    }
+
+    function csr_vec (
+        a: input logic<12>,
+    ) -> logic {
+        return (a >= 12'h008 && a <= 12'h00a) || a == 12'h00f || (a >= 12'hc20 && a <= 12'hc22);
+    }
+
+    // OPIVV and OPIVI funct6 values RVV 1.0 reserves among those the decoder
+    // maps to an op.
+    function vec_rsv (
+        insn: input logic<32>,
+    ) -> logic {
+        let f6 : logic<6> = insn[31:26];
+        let opv: logic    = insn[6:0] == riscv_pkg::Opcode::OP_V;
+        let ivv: logic    = opv && insn[14:12] == 3'b000;
+        let ivi: logic    = opv && insn[14:12] == 3'b011;
+        return (ivv && (f6 == 6'b000011 || f6 == 6'b011110 || f6 == 6'b011111)) || (ivi && (f6 == 6'b000010
+            || f6[5:2] == 4'b0001 || f6 == 6'b011010 || f6 == 6'b011011 || f6 == 6'b100010 || f6 == 6'b100011));
     }
 
     // The envcfg field that enables a CBO kind.
@@ -309,6 +335,7 @@ module decode::<CFG: core_cfg> (
         insn  : input logic             <32>,
         dill  : input logic                 ,
         vec   : input logic                 ,
+        vfp   : input logic                 , // a vector FP instruction
         fp    : input logic                 , // any F or D instruction
         enc   : input logic                 , // reserved width or rm (see the header)
         amo   : input logic                 ,
@@ -344,7 +371,9 @@ module decode::<CFG: core_cfg> (
         let ctr   : logic     = f12[11:5] == 7'b1100000; // cycle, time, instret, hpmcounterN
         let ctr_ill: logic    = csr && ((ctr && ((below && !cs.mcounteren[f12[4:0]]) || (umode && !cs.scounteren[f12[4:0]])))
             || (f12 == 12'h14d && hs && !(cs.mcounteren[1] && cs.menvcfg[63])));
-        let fs_ill: logic = cs.fs == 2'b00 && (fp || (csr && f12 >= 12'h001 && f12 <= 12'h003));
+        let fs_ill: logic = cs.fs == 2'b00 && (fp || vfp || (csr && f12 >= 12'h001 && f12 <= 12'h003));
+        let vs_off: logic = cs.vs == 2'b00 || (virt && cs.vsvs == 2'b00);
+        let vs_ill: logic = (vec && (vs_off || vec_rsv(insn))) || (csr && csr_vec(f12) && vs_off);
         let cbo_k : logic<5> = insn[24:20]; // 0 inval, 1 clean, 2 flush, 4 zero
         let cbo_ill: logic   = cbo && ((below && !cbo_on(cs.menvcfg, cbo_k)) || (umode && !cbo_on(cs.senvcfg, cbo_k)));
         let unsrv : logic     = (amo && !amo_legal(insn)) || hlv || hfen || (csr && csr_unserved(f12));
@@ -354,7 +383,7 @@ module decode::<CFG: core_cfg> (
             || (hs && tsr))) || (sfence && !hfen && hs && tvm) || ((sfence || sinval) && umode) || (wfi && (umode || (hs
             && cs.tw))) || (dret && !cs.dm) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret || wfi || sfence || sinval
             || wrs || dret));
-        return dill || vec || enc || unsrv || csr_ill || ctr_ill || fs_ill || cbo_ill || sys_ill;
+        return dill || enc || unsrv || csr_ill || ctr_ill || fs_ill || vs_ill || cbo_ill || sys_ill;
     }
 
     var lane_ill: logic [W];
@@ -374,6 +403,8 @@ module decode::<CFG: core_cfg> (
                 default                       : i_csr.ebreak[0],
             };
             let fpc   : logic     = is_fp[l] && !mem_ren[l] && !mem_wen[l];
+            let opv   : logic     = insn[6:0] == riscv_pkg::Opcode::OP_V;
+            let vfp   : logic     = is_vec[l] && opv && (f3 == 3'b001 || f3 == 3'b101);
             let fpcsr : logic     = is_csr[l] && f12 >= 12'h001 && f12 <= 12'h003;
             let rm_ill: logic     = fpc && fp_rounds(fpu_op[l])
                 && (f3 == 3'b101 || f3 == 3'b110 || (f3 == 3'b111 && i_frm >= 3'b101));
@@ -381,7 +412,7 @@ module decode::<CFG: core_cfg> (
             let w_rsv : logic     = (opc == riscv_pkg::Opcode::LOAD && f3 == 3'b111) || (opc == riscv_pkg::Opcode::STORE
                 && f3[2]) || (is_fp[l] && !fpc && f3 == 3'b100);
 
-            let ill: logic = illegal(insn, dec_ill[l], is_vec[l], is_fp[l], w_rsv || rm_ill, is_amo[l], is_cbo_z[l]
+            let ill: logic = illegal(insn, dec_ill[l], is_vec[l], vfp, is_fp[l] && !is_vec[l], w_rsv || rm_ill, is_amo[l], is_cbo_z[l]
                 || is_cbo_m[l], hlv[l] || hlvx[l], is_csr[l], csr_wr, is_sfence[l], is_sinval[l], is_ecall[l], is_ebreak[l],
                 is_mret[l], is_wfi[l], dret, i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr);
 
@@ -430,7 +461,10 @@ module decode::<CFG: core_cfg> (
             di.is_sinval  = is_sinval[l];
             di.is_fence   = is_fence[l];
             di.is_fence_i = is_fence_i[l];
-            di.is_fp      = fpc;
+            di.is_fp      = fpc && !is_vec[l];
+            di.is_vec     = is_vec[l];
+            di.vec_st     = is_vec[l] && opc == riscv_pkg::Opcode::STORE_FP;
+            di.vec_fp     = vfp;
             di.alu_op     = alu_op[l];
             di.fpu_op     = fpu_op[l];
 
@@ -494,6 +528,16 @@ module decode::<CFG: core_cfg> (
                     d.rs2.rcls = RegClass::FP;
                     d.rs3.used = fp_rs3(fpu_op[l]);
                     d.rs3.rcls = RegClass::FP;
+                }
+                // The sources are the rename-time mappings of x[rs1], x[rs2]
+                // and f[rs1]; vu_adapter checks all three done.
+                FuKind::VEC: {
+                    d.uop      = vec_op[l] as UOP_W;
+                    d.rs1.used = 1'b1;
+                    d.rs2.used = 1'b1;
+                    d.rs3.used = 1'b1;
+                    d.rs3.rcls = RegClass::FP;
+                    d.rs3.arch = insn[19:15];
                 }
                 // imm carries rd and rs2 for atomic_unit; the AGU adds 0.
                 FuKind::ATOMIC: {

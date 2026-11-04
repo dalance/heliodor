@@ -1,0 +1,310 @@
+// vu_adapter: connects the reused vector_unit to the core: allocation, the
+// exec boundary, scalar operands, completion, retire side effects, the
+// illegal-configuration check and the VRF write observation
+//
+// Ports (timing contract):
+//   i_alloc, o_alloc_rdy : at most one op per cycle, never in a kill cycle;
+//                    o_alloc_rdy is the VU FIFO's registered free slot
+//   i_oldest       : commit's oldest token (invalid while an interrupt or a
+//                    Debug Mode entry is pending, and in a kill cycle)
+//   o_started      : pulse on the start edge of the op at the VU head
+//   i_retire       : lane 0 retired this cycle
+//   i_csr_vtype, i_csr_vstart : the committed vtype and vstart
+//   o_prf_rd, i_prf_rdata, i_prf_done : the head's int rs1, int rs2 and fp
+//                    rs1, combinational; i_prf_done from busy_table
+//   o_hf_req, i_hf_grant : hole fill on the memory pipe 0 WB port, the grant
+//                    in the same cycle (offset >= WAKE_LEAD = 2)
+//   o_wake         : the rd wake, one cycle before o_wb, as the memory pipe
+//                    wakes on that lane
+//   o_wb           : registered; the PRF write of an op with a scalar rd,
+//                    in the granted slot, as a pair packet (it completes
+//                    nothing)
+//   o_done         : registered, one cycle after the VU completes the op or
+//                    after an illegal head is found; to rob and commit, in
+//                    the cycle of o_wb
+//   i_mem_exc      : vu_mem_adapter's record of the faulting element
+//   o_vu_*, i_vu_* : the vector_unit instance beside this module
+//   i_kill         : a full kill clears the started and completion state
+//   o_chk          : sticky checker flags (HELIODOR_CHK only, else 0)
+//   o_perf         : combinational event wires
+// Owns:
+//   - the exec boundary: the VU works on its head only under o_vu_exec,
+//     valid when the head holds the token (the start edge) or exec_q is set,
+//     with the head's tag
+//   - exec_q is set on the start edge and held until the op retires or a
+//     full kill; element requests after the start need no token, so an
+//     interrupt that stops the token cannot strand a started op
+//   - one VuDone per op; an rd op's VuDone and its PRF write leave in the
+//     same cycle
+//   - the scalar sources are done (VA3): the start waits for i_prf_done,
+//     which the token already implies (every older op retired); chk_vu
+//     counts a start it held back
+// Rationale:
+//   - the VU's i_cdb_free comes only from the hole-fill countdown and the
+//     VU's own o_wb_req/o_wb_rd, so no same-cycle path from issue reaches it
+//   - an op whose vtype is illegal, or a vector FP op at a SEW other than 32
+//     or 64, completes with cause 2 instead of starting; its trap full-kills
+//     the FIFO, so the VU needs no illegal path of its own
+//   - every source is checked done, not only the ones the op reads:
+//     dispatch passes the rename-time mapping of every register field, and
+//     each of those is done once the op holds the token
+pub module vu_adapter::<CFG: core_cfg> (
+    clk: input clock,
+    rst: input reset,
+
+    i_kill: input core_types::<CFG>::Kill,
+
+    i_alloc    : input  core_types::<CFG>::VuAlloc,
+    o_alloc_rdy: output logic                     ,
+
+    i_oldest    : input  core_types::<CFG>::TagTok    ,
+    i_retire    : input  logic                        ,
+    i_csr_vtype : input  logic                    <64>,
+    i_csr_vstart: input  logic                    <64>,
+    o_started   : output logic                        ,
+
+    o_prf_rd   : output core_types::<CFG>::PReg     [3],
+    i_prf_rdata: input  logic                  <64> [3],
+    i_prf_done : input  logic                       [3],
+
+    o_hf_req  : output logic                      ,
+    i_hf_grant: input  fu_pkg::WbSlot             ,
+    o_wake    : output core_types::<CFG>::Wake    ,
+    o_wb      : output core_types::<CFG>::WbPacket,
+    o_done    : output core_types::<CFG>::VuDone  ,
+    i_mem_exc : input  exc_pkg::ExcRec            ,
+
+    o_vu_alloc_en  : output logic                                               ,
+    o_vu_op        : output vector_pkg::VecOp                                   ,
+    o_vu_insn      : output logic                    <32>                       ,
+    o_vu_vd        : output logic                    <5>                        ,
+    o_vu_vs1       : output logic                    <5>                        ,
+    o_vu_vs2       : output logic                    <5>                        ,
+    o_vu_s_pd      : output logic                    <core_types::<CFG>::PREG_W>,
+    o_vu_s2_pd     : output logic                    <core_types::<CFG>::PREG_W>,
+    o_vu_fs_pd     : output logic                    <core_types::<CFG>::PREG_W>,
+    o_vu_has_rd    : output logic                                               ,
+    o_vu_rd_fp     : output logic                                               ,
+    o_vu_rd_pd     : output logic                    <core_types::<CFG>::PREG_W>,
+    o_vu_tag       : output core_types::<CFG>::RobTag                           ,
+    i_vu_alloc_rdy : input  logic                                               ,
+    i_vu_head      : input  core_types::<CFG>::VuHead                           ,
+    o_vu_exec      : output core_types::<CFG>::TagTok                           ,
+    i_vu_s_pd      : input  logic                    <core_types::<CFG>::PREG_W>,
+    i_vu_s2_pd     : input  logic                    <core_types::<CFG>::PREG_W>,
+    i_vu_fs_pd     : input  logic                    <core_types::<CFG>::PREG_W>,
+    o_vu_s_data    : output logic                    <64>                       ,
+    o_vu_s2_data   : output logic                    <64>                       ,
+    o_vu_fs_data   : output logic                    <64>                       ,
+    i_vu_wb_req    : input  logic                                               ,
+    i_vu_wb_rd     : input  logic                                               ,
+    o_vu_cdb_free  : output logic                                               ,
+    i_vu_cdb_valid : input  logic                                               ,
+    i_vu_cdb_has_rd: input  logic                                               ,
+    i_vu_cdb_fp    : input  logic                                               ,
+    i_vu_cdb_pdst  : input  logic                    <core_types::<CFG>::PREG_W>,
+    i_vu_cdb_data  : input  logic                    <64>                       ,
+    i_vu_vset_wen  : input  logic                                               ,
+    i_vu_vtype     : input  logic                    <64>                       ,
+    i_vu_vl        : input  logic                    <64>                       ,
+    i_vu_lfault    : input  logic                                               ,
+    i_vu_sfault    : input  logic                                               ,
+    i_vu_vstart_wen: input  logic                                               ,
+    i_vu_vstart    : input  logic                    <64>                       ,
+    i_vu_ffl_wen   : input  logic                                               ,
+    i_vu_ffl       : input  logic                    <5>                        ,
+    i_vu_vxsat_wen : input  logic                                               ,
+    i_vu_vxsat     : input  logic                                               ,
+    i_vu_vd_wen    : input  logic                                               ,
+    i_vu_vd_addr   : input  logic                    <5>                        ,
+    i_vu_vd_data   : input  logic                    <128>                      ,
+
+    o_chk : output logic                    <core_types::<CFG>::CHK_VU_W>,
+    o_perf: output core_types::<CFG>::VuPerf                             ,
+) {
+    import core_types::<CFG>::*;
+
+    // ---- allocation ----
+
+    assign o_alloc_rdy   = i_vu_alloc_rdy;
+    assign o_vu_alloc_en = i_alloc.valid;
+    assign o_vu_op       = i_alloc.op;
+    assign o_vu_insn     = i_alloc.insn;
+    assign o_vu_vd       = i_alloc.insn[11:7];
+    assign o_vu_vs1      = i_alloc.insn[19:15];
+    assign o_vu_vs2      = i_alloc.insn[24:20];
+    assign o_vu_s_pd     = i_alloc.src1.idx;
+    assign o_vu_s2_pd    = i_alloc.src2.idx;
+    assign o_vu_fs_pd    = i_alloc.fsrc1.idx;
+    assign o_vu_has_rd   = i_alloc.has_rd;
+    assign o_vu_rd_fp    = i_alloc.dst.cls == RegClass::FP;
+    assign o_vu_rd_pd    = i_alloc.dst.idx;
+    assign o_vu_tag      = i_alloc.tag;
+
+    // ---- scalar operands ----
+
+    always_comb {
+        o_prf_rd[0].cls = RegClass::INT;
+        o_prf_rd[0].idx = i_vu_s_pd;
+        o_prf_rd[1].cls = RegClass::INT;
+        o_prf_rd[1].idx = i_vu_s2_pd;
+        o_prf_rd[2].cls = RegClass::FP;
+        o_prf_rd[2].idx = i_vu_fs_pd;
+    }
+    assign o_vu_s_data  = i_prf_rdata[0];
+    assign o_vu_s2_data = i_prf_rdata[1];
+    assign o_vu_fs_data = i_prf_rdata[2];
+
+    // ---- exec boundary ----
+
+    let kill_full: logic    = i_kill.valid && i_kill.full;
+    let sew      : logic<3> = i_csr_vtype[5:3];
+    let illegal  : logic    = (i_vu_head.vtype_dep && i_csr_vtype[63])
+        || (i_vu_head.is_fp && sew != 3'd2 && sew != 3'd3);
+
+    var exec_q: logic ;
+    var ill_q : logic ; // an illegal head was reported, waiting for its trap
+    var tag_q : RobTag;
+
+    let tok_mine : logic = i_oldest.valid && i_vu_head.valid && i_vu_head.tag == i_oldest.tag && !exec_q && !ill_q;
+    let src_ok   : logic = i_prf_done[0] && i_prf_done[1] && i_prf_done[2];
+    let start    : logic = tok_mine && !illegal && src_ok;
+    let ill_fire : logic = tok_mine && illegal;
+    let src_block: logic = tok_mine && !illegal && !src_ok;
+
+    assign o_started       = start;
+    assign o_vu_exec.valid = start || exec_q;
+    assign o_vu_exec.tag   = if exec_q ? tag_q : i_vu_head.tag;
+
+    // ---- completion ----
+
+    // A rd op waits for its hole-fill slot: granted off cycles ahead, the
+    // VU fires one cycle before it and the registered packet lands in it.
+    var hf_q : logic        ;
+    var cnt_q: fu_pkg::WbOff;
+
+    let hf_fire: logic = hf_q && cnt_q == 1;
+    assign o_hf_req      = i_vu_wb_req && i_vu_wb_rd && !hf_q && !kill_full;
+    assign o_vu_cdb_free = (i_vu_wb_req && !i_vu_wb_rd) || hf_fire;
+
+    let rd_pr: PReg = PReg'{cls: if i_vu_cdb_fp ? RegClass::FP : RegClass::INT, idx: i_vu_cdb_pdst};
+    assign o_wake.valid = i_vu_cdb_valid && i_vu_cdb_has_rd;
+    assign o_wake.pdst  = rd_pr;
+
+    // VRF writes of the op so far (observation only).
+    var wcnt_q: logic<8> ;
+    var hash_q: logic<64>;
+    let wcnt_n: logic<8>  = wcnt_q + (i_vu_vd_wen as 8);
+    let hash_n: logic<64> = if i_vu_vd_wen ? retire_pkg::vrf_hash_step(hash_q, i_vu_vd_addr, i_vu_vd_data) : hash_q;
+
+    var done_n: VuDone;
+    always_comb {
+        done_n.valid         = i_vu_cdb_valid || ill_fire;
+        done_n.tag           = i_vu_head.tag;
+        done_n.exc           = if i_vu_lfault || i_vu_sfault ? i_mem_exc : '0;
+        done_n.exc.valid     = ill_fire || ((i_vu_lfault || i_vu_sfault) && i_mem_exc.valid);
+        done_n.side.vcfg_v   = i_vu_cdb_valid && i_vu_vset_wen;
+        done_n.side.vtype    = i_vu_vtype;
+        done_n.side.vl       = i_vu_vl;
+        done_n.side.vstart   = if i_vu_vstart_wen ? i_vu_vstart : 64'd0;
+        done_n.side.fflags   = if i_vu_ffl_wen ? i_vu_ffl : 5'd0;
+        done_n.side.vxsat    = i_vu_vxsat_wen && i_vu_vxsat;
+        done_n.side.vrf_wcnt = wcnt_n;
+        done_n.side.vrf_hash = hash_n;
+        done_n.data          = i_vu_cdb_data;
+        if ill_fire {
+            done_n.exc.cause = 6'd2;
+            done_n.exc.tval  = {32'd0, i_vu_head.insn};
+            done_n.exc.gpa   = 54'd0;
+            done_n.exc.gva   = 1'b0;
+            done_n.side      = '0;
+        }
+    }
+
+    var wb_n: WbPacket;
+    always_comb {
+        wb_n            = '0;
+        wb_n.valid      = i_vu_cdb_valid && i_vu_cdb_has_rd;
+        wb_n.tag.rob    = i_vu_head.tag;
+        wb_n.tag.pdst   = rd_pr;
+        wb_n.tag.has_rd = 1'b1;
+        wb_n.data       = i_vu_cdb_data;
+        wb_n.pair       = 1'b1;
+    }
+
+    always_ff {
+        if_reset {
+            exec_q = 1'b0;
+            ill_q  = 1'b0;
+            tag_q  = '0;
+            hf_q   = 1'b0;
+            cnt_q  = '0;
+            wcnt_q = 8'd0;
+            hash_q = 64'd0;
+            o_done = '0;
+            o_wb   = '0;
+        } else {
+            if kill_full || (exec_q && i_retire) {
+                exec_q = 1'b0;
+            } else if start {
+                exec_q = 1'b1;
+                tag_q  = i_vu_head.tag;
+            }
+            if kill_full {
+                ill_q = 1'b0;
+            } else if ill_fire {
+                ill_q = 1'b1;
+            }
+            if kill_full || hf_fire {
+                hf_q = 1'b0;
+            } else if o_hf_req {
+                hf_q  = 1'b1;
+                cnt_q = i_hf_grant.off - 1;
+            } else if hf_q {
+                cnt_q = cnt_q - 1;
+            }
+            if kill_full || i_vu_cdb_valid {
+                wcnt_q = 8'd0;
+                hash_q = 64'd0;
+            } else {
+                wcnt_q = wcnt_n;
+                hash_q = hash_n;
+            }
+            o_done       = done_n;
+            o_done.valid = done_n.valid && !kill_full;
+            o_wb         = wb_n;
+            o_wb.valid   = wb_n.valid && !kill_full;
+        }
+    }
+
+    // ---- observation ----
+
+    always_comb {
+        o_perf.exec_wait = i_vu_head.valid && !exec_q && !start && !ill_q;
+        o_perf.start     = start;
+        o_perf.illegal   = ill_fire;
+        o_perf.src_block = src_block;
+        o_perf.hf_wait   = hf_q && !hf_fire;
+        o_perf.done      = i_vu_cdb_valid;
+        o_perf.vstart_nz = start && i_csr_vstart != 64'd0;
+    }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        inst u_chk: chk_vu::<CFG> (
+            clk                                                        ,
+            rst                                                        ,
+            i_kill                                                     ,
+            i_alloc_v  : i_alloc.valid                                 ,
+            i_src_block: src_block                                     ,
+            i_done     : o_done                                        ,
+            i_wb       : o_wb                                          ,
+            i_retire                                                   ,
+            i_mem_fault: i_vu_cdb_valid && (i_vu_lfault || i_vu_sfault),
+            i_mem_exc_v: i_mem_exc.valid                               ,
+            o_chk                                                      ,
+        );
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 0;
+}

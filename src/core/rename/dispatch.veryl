@@ -21,7 +21,10 @@
 //                       bound for q (compacted, program order)
 //   o_lq_*/o_sq_*     : compacted in program order; the queue gives slot i
 //                       its o_alloc_tag[i]
-//   o_bt_clr_*     : destinations whose prf_ready clears on this edge
+//   o_bt_clr_*     : destinations whose prf_ready (and prf_done) clears on
+//                    this edge
+//   i_vu_rdy       : vu_adapter's registered free FIFO slot
+//   o_vu           : the taken VEC op, at most one per group
 //   o_perf         : registered event wires; o_chk : sticky flags
 //   All outputs are combinational from the inputs; every write happens on
 //   the edge of this cycle.
@@ -30,6 +33,8 @@
 //   - no owner is asked for more allocations than its registered credit
 //   - nothing is allocated in a kill cycle or during a walk
 //   - an op with fu NONE goes to rob only, allocated done
+//   - a VEC op goes to rob and the vector unit; the group ends before a
+//     second VEC op (the vector unit takes one op per cycle)
 // Rationale:
 //   - take is a prefix of lanes whose cumulative demand fits every credit
 //     and that holds at most one checkpointed BRU op (rename's one
@@ -62,6 +67,7 @@ module dispatch::<CFG: core_cfg> (
     i_fl_fp_free : input  logic                      <core_types::<CFG>::FL_CNT_W>                             ,
     i_fl_fp_head : input  core_types::<CFG>::FlPtr                                  [CFG::RENAME_W + 1]        ,
     i_bt_rdy     : input  logic                                                     [3 * CFG::RENAME_W]        ,
+    i_vu_rdy     : input  logic                                                                                ,
     i_wake       : input  core_types::<CFG>::Wake                                   [core_types::<CFG>::WB_N]  ,
     o_take       : output logic                      <core_types::<CFG>::TAKE_W>                               ,
     o_pop_n_int  : output logic                      <core_types::<CFG>::TAKE_W>                               ,
@@ -77,6 +83,7 @@ module dispatch::<CFG: core_cfg> (
     o_sq         : output core_types::<CFG>::SqAlloc                                [CFG::RENAME_W]            ,
     o_bt_clr_v   : output logic                                                     [CFG::RENAME_W]            ,
     o_bt_clr_p   : output core_types::<CFG>::PReg                                   [CFG::RENAME_W]            ,
+    o_vu         : output core_types::<CFG>::VuAlloc                                                          ,
     o_perf       : output core_types::<CFG>::DispPerf                                                          ,
     o_chk        : output logic                      <3>                                                       ,
 ) {
@@ -97,6 +104,7 @@ module dispatch::<CFG: core_cfg> (
     var d_int: logic<W>       ;
     var d_fp : logic<W>       ;
     var d_bar: logic<W>       ;
+    var d_vq : logic<W>       ;
     var iq_of: logic<NIQW> [W];
     always_comb {
         for l in 0..W {
@@ -106,6 +114,7 @@ module dispatch::<CFG: core_cfg> (
             d_int[l] = i_valid[l] && i_op[l].cls.budget.int_rd;
             d_fp[l]  = i_valid[l] && i_op[l].cls.budget.fp_rd;
             d_bar[l] = i_valid[l] && i_op[l].cls.ld_barrier;
+            d_vq[l]  = i_valid[l] && i_op[l].cls.budget.vq;
             iq_of[l] = fu_iq(i_op[l].cls.fu) as NIQW;
         }
     }
@@ -116,6 +125,7 @@ module dispatch::<CFG: core_cfg> (
     var p_int: logic<CW> [W];
     var p_fp : logic<CW> [W];
     var p_bar: logic<CW> [W];
+    var p_vq : logic<CW> [W];
     always_comb {
         tree_prefix_count::<W, CW>(vm, p_rob);
         tree_prefix_count::<W, CW>(d_lq, p_lq);
@@ -123,6 +133,7 @@ module dispatch::<CFG: core_cfg> (
         tree_prefix_count::<W, CW>(d_int, p_int);
         tree_prefix_count::<W, CW>(d_fp, p_fp);
         tree_prefix_count::<W, CW>(d_bar, p_bar);
+        tree_prefix_count::<W, CW>(d_vq, p_vq);
     }
 
     var d_iq: logic<W>  [NQ]    ;
@@ -154,6 +165,7 @@ module dispatch::<CFG: core_cfg> (
     var c_fp  : logic<W>     ;
     var c_iq  : logic<W>     ;
     var c_ck  : logic<W>     ;
+    var c_vq  : logic<W>     ;
     var ok    : logic<W>     ;
     always_comb {
         var ckp: logic<W>;
@@ -172,7 +184,8 @@ module dispatch::<CFG: core_cfg> (
             c_fp[l]  = (p_fp[l] as FL_CNT_W) >: i_fl_fp_free;
             c_iq[l]  = !(&fit_iq[l]);
             c_ck[l]  = ckp[l] && i_op[l].cls.fu == FuKind::BRU;
-            ok[l]    = i_valid[l] && !(c_rob[l] || c_lq[l] || c_sq[l] || c_int[l] || c_fp[l] || c_iq[l] || c_ck[l]);
+            c_vq[l]  = d_vq[l] && p_vq[l] >: (i_vu_rdy as CW);
+            ok[l]    = i_valid[l] && !(c_rob[l] || c_lq[l] || c_sq[l] || c_int[l] || c_fp[l] || c_iq[l] || c_ck[l] || c_vq[l]);
         }
     }
 
@@ -332,6 +345,23 @@ module dispatch::<CFG: core_cfg> (
         assign o_sq[i]       = sq_l[x_sq];
     }
 
+    // The taken VEC lane (at most one: c_vq cuts the group before a second).
+    let s_vq: logic<W>  = d_vq & tk;
+    let x_vq: logic<LW> = tree_onehot_enc::<W, LW>(s_vq);
+    always_comb {
+        let op: DecOp  = i_op[x_vq];
+        let rn: RenOut = i_ren[x_vq];
+        o_vu.valid  = |s_vq;
+        o_vu.tag    = i_rob_tag[x_vq];
+        o_vu.op     = op.uop[4:0] as vector_pkg::VecOp;
+        o_vu.insn   = op.insn;
+        o_vu.src1   = rn.ps1;
+        o_vu.src2   = rn.ps2;
+        o_vu.fsrc1  = rn.ps3;
+        o_vu.dst    = rn.pdst;
+        o_vu.has_rd = op.dst.has_rd;
+    }
+
     for q in 0..NQ :g_iqs {
         var pc: logic<CW> [W];
         always_comb {
@@ -362,6 +392,7 @@ module dispatch::<CFG: core_cfg> (
             perf_q.cut_int    = !stall && |(first & c_int);
             perf_q.cut_fp     = !stall && |(first & c_fp);
             perf_q.cut_ck     = !stall && |(first & c_ck);
+            perf_q.cut_vq     = !stall && |(first & c_vq);
             perf_q.kill_stall = i_kill.valid && i_valid[0];
             perf_q.walk_stall = !i_kill.valid && i_walk_busy && i_valid[0];
             perf_q.stall      = !stall && |(first & (c_rob | c_iq | c_lq | c_sq | c_int | c_fp));
