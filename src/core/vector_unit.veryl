@@ -15,8 +15,8 @@
 // core's kill (i_kill) by tag age; a full kill also abandons the head's work
 // and reloads vtype/vl from the committed CSRs.
 //
-// V0 subset: vsetvli / vsetivli, vadd.{vv,vx,vi}, vmv.x.s. VLEN=128, ELEN=64.
-// Tail / masked-off elements are written as 0 (refined to vta/vma in V2).
+// VLEN=128, ELEN=64. Tail and masked-off elements keep the old vd
+// (undisturbed, which also satisfies the agnostic policies).
 pub module vector_unit::<CFG: core_cfg> #(
     param VRF_W    : u32 = 5  ,
     param VLEN     : u32 = 128 ,
@@ -868,6 +868,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     var mem_va_ready_q: logic   ;
     var velem     : logic<8> ; // current element index (0 .. vl)
     var vacc      : logic<VLEN>; // load accumulator (tail / masked-off stay 0)
+    var vmsk      : logic<VLEN>; // bits of vacc written by active elements
     var fault_q   : logic    ; // the op faulted at vstart_q
     var fault_va_q: logic<64>;
     var vstart_q  : logic<8> ;
@@ -1238,8 +1239,10 @@ pub module vector_unit::<CFG: core_cfg> #(
     }
     let req_vsew : logic<3> = vtype_req[5:3];
     let req_vlmul: logic<3> = vtype_req[2:0];
-    // Reserved configs → vill (SEW > 64 = ELEN, or LMUL encoding 100).
-    let vill: logic = (req_vsew >= 3'd4) || (req_vlmul == 3'd4);
+    // Reserved configs → vill: SEW > ELEN, LMUL encoding 100, a set reserved
+    // vtype bit, or a fractional LMUL with SEW > LMUL * ELEN.
+    let frac_bad: logic = req_vlmul[2] && (req_vsew >: (req_vlmul - 3'd5));
+    let vill    : logic = (req_vsew >= 3'd4) || (req_vlmul == 3'd4) || (vtype_req[63:8] != 56'd0) || frac_bad;
     // Elements per vector register at this SEW (16/8/4/2 for SEW 8/16/32/64).
     let vlen_div_sew: logic<8> = 8'd16 >> req_vsew;
     var vlmax: logic<8>;
@@ -1996,6 +1999,10 @@ pub module vector_unit::<CFG: core_cfg> #(
     let ld_shifted: logic<VLEN> = ({64'd0, ld_el} as VLEN) << elem_bitoff;
     let ld_contrib: logic<VLEN> = if m_active ? ld_shifted : {1'b0 repeat VLEN};
     let ld_write  : logic<VLEN> = vacc | ld_contrib;
+    // Masked-off and tail elements keep the old vd: the register write merges
+    // the loaded elements into it.
+    let ld_mcontr : logic<VLEN> = if m_active ? (({64'd0, eew_mask} as VLEN) << elem_bitoff) : {1'b0 repeat VLEN};
+    let ld_wmask  : logic<VLEN> = vmsk | ld_mcontr;
     // Store: extract the element from the current source register (vs3 = h_vd+mem_reg).
     let m_vs3_sh: logic<VLEN> = m_vs3 >> elem_bitoff;
     let st_el   : logic<64>   = m_vs3_sh[63:0] & eew_mask;
@@ -2502,7 +2509,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     // at least one loaded element); a fault exactly at a register boundary leaves
     // the (entirely-tail) register untouched, matching the unit-stride convention.
     let mem_trim_wr  : logic = (mem_state == 2'd2) && m_active && mem_fault_now && h_is_ff && (velem != 8'd0) && (mem_local != 8'd0);
-    let mem_wr_data  : logic<VLEN> = if mem_trim_wr ? vacc : ld_write;
+    let mem_wr_data  : logic<VLEN> = if mem_trim_wr ? ((i_vdold_data & ~vmsk) | vacc) : ((i_vdold_data & ~ld_wmask) | ld_write);
 
     let h_cdb_data: logic<64> = if h_is_vset ? vl_new : if h_is_vmv ? vmv_res : if h_is_vfmv_fs ? fp_mv_res : if h_is_vcpop ? vcpop_res : 64'd0;
     // vfmv.s.f writes vd[0] in the (single-cycle) fire path; suppress the write
@@ -2535,7 +2542,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
     assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
-    assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp)))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
+    assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
     assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narr ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || mem_trim_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
     assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? mem_wr_data : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : valu_res)))))))));
@@ -2642,6 +2649,7 @@ pub module vector_unit::<CFG: core_cfg> #(
             velem      = 8'd0;
             seg_field  = 3'd0;
             vacc       = {1'b0 repeat VLEN};
+            vmsk       = {1'b0 repeat VLEN};
             fault_q    = 1'b0;
             fault_va_q = 64'd0;
             vstart_q   = 8'd0;
@@ -2722,6 +2730,7 @@ pub module vector_unit::<CFG: core_cfg> #(
                         velem     = 8'd0;
                         seg_field = 3'd0;
                         vacc      = {1'b0 repeat VLEN};
+                        vmsk      = {1'b0 repeat VLEN};
                         fault_q   = 1'b0;
                         ff_trim_q = 1'b0;
                         mem_fetched_q = 1'b0; // CP (MEM_PIPE): first element starts with a FETCH
@@ -2783,6 +2792,7 @@ pub module vector_unit::<CFG: core_cfg> #(
                         // (mem_ld_wr / ld_write) and the accumulator resets.
                         if h_is_vle {
                             vacc = if reg_last ? {1'b0 repeat VLEN} : ld_write;
+                            vmsk = if reg_last ? {1'b0 repeat VLEN} : ld_wmask;
                         }
                         if velem + 8'd1 >= m_vl8 {
                             // Field complete. For a segment op, advance to the next
