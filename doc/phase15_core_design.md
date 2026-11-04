@@ -303,10 +303,7 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 
 | 上限 | 出所 | 許される値 | 処置と期限 |
 |---|---|---|---|
-| ROB ≤ 256、かつ ROB_N は 2 の冪 | VU の `fp_elem` が `logic<8>` (`vector_unit.veryl:925`)、VU の age 計算が `idx - head` | ROB_N ∈ {2^k, k≤8} | M5: VU の owner 幅を切り離し、age 計算を `tag_pkg::older` に置き換える。 |
 | 単一の PREG 幅 | VU と `pipeline_pkg::CdbBus` | PREG_W 共通 | 【決定】§3.2 |
-| VU は CDB を 2 lane だけ snoop する | `vector_unit.veryl:94-101` | VU を使うのは M5 から | M5: head に達した時点で scalar は ready とみなし、snoop は使わない。 |
-| VU の alloc は 1/cycle | `vector_unit.veryl:70` | rename group あたり 1 | 宣言された上限として残す。 |
 | dcache data は 1 read/cycle | `o_hit2` は `S3_SLOT1=1` によって 0 に固定 (`dcache.veryl:877,3112`) | M1-M2 では物理アクセス 1 本 | M3: data を bank 化し、tag を複製する。M3 の手順 4 で済み (§M.6.2、§M.6.3)。新コアの dcache には残らず、`v14_dcache` だけの上限。 |
 | D-line fill は 1 hart に 1 本 | mem_ctrl の SPH=2 (`MSHR_N` は M4 で 2 になったが、mem_ctrl への fill は `N_FILL=1` のままで 1 本) | N_FILL=1 | 宣言された上限。M3 は MSHR file の構造 (`fill_id = {index, 世代}`) を作り、M4 で `MSHR_N=2` にした (§M.6.4)。`N_FILL` を増やす条件は §2.5 の M4 行。 |
 | icache の fill は 1 本で、I read slot を icache の uncached 読みと共有する | 再利用 `icache` の単一 fill、外部 slot は I 側に 1 本 | - | 宣言された上限として残す。I read slot の調停は `islot_arb` (§M) が行う。I-PTW の PTE 読みは M2 から memory port 0 を使う (§M.5) |
@@ -1210,7 +1207,7 @@ IDLE --(受理 edge で token.valid && token.tag == 自分の tag)--> STARTED --
 | misaligned、AMO、LR/SC | NC/IO 領域に対しては、翻訳時にアクセス fault (load は cause 5、store/AMO は cause 7) とする。分割はしない。 |
 | fetch | `executable=0` の領域からの fetch は、命令アクセス fault とする。 |
 | NC の load | M1-M2 では IO と同じく head でだけ発行する。投機的な発行を許すかどうかは、boot と bench で NC load の発生数を測り、0 であれば head 発行のまま確定するとしていた (U29)。【決定】(M3、U29) head 発行のまま確定する。`io_unit` の load の数 (`io.load`。IO と NC を区別しない) は、5.15 boot で 0、6.6 と 7.1 の boot で 31、bench で 0 だった。NC load はこの 31 以下で、投機させて得るものが無い。 |
-| VU の IO アクセス | 【M5 で決定】fault にするか、head で要素ごとに直列化するか: vector テスト群と boot に IO 領域への vector アクセスがあるかを数え、0 なら fault にする (§V)。 |
+| VU の IO アクセス | 【決定】(M5、U30) fault にする: PMA が `cacheable=0` の要素は、`mem_pipe` 0 の m1 でアクセス fault (load は cause 5、store は cause 7) とする。理由: 20 本の V テストは W2 と W4 で fault 案のまま全部通った (IO 領域への要素アクセスは 0。1 つでもあれば trap して失敗する)。Linux の MMIO アクセス (`memcpy_toio` など) は scalar で、vector を使わない。7.1+V boot での確認は M5 のゲートで行う。 |
 
 検証側の obligation: SoC のモニタが、IO 領域に対する hart ごとのデバイス読み書き enable を、retire record の `mem_io` と回数・アドレス順で照合する (検証計画)。boot ではデバイス読み出しの副作用が一度も起きないので、この規則は自己検査型の directed test で守る。
 
@@ -2107,7 +2104,7 @@ issue ポート 1 本分。for-generate で ISSUE_W 個並べ、中身は `PORT_
 - 【決定】fround と froundnx は `fu_fdiv` の shell で実行し、FuKind は FDIV とする。理由: 1 FU = 1 LATENCY (§5.6) を崩さず、RESERVED ポートに 4 サイクルの経路を足さずに済む。Zfa の fround は稀で、旧コアも 4 サイクル占有の blocking 扱いだった。
 - 【決定】(M2 準備) fround のタイミングは、結果が揃って HOLE_FILL を要求するのが A+4、最も早い WB が A+6 で、これが `LAT_FDIV` (FDIV の最小 LATENCY) になる。fround は `copysign(2^p, x)` を足してから引き、加算器自身の丸めで小数部を落とす。2 回の加算は間に和のレジスタを置いて続けて行い、1 サイクルに加算器の半分より多くを置かない。理由: fround が FDIV の中で最短の経路なので、公表する最小値はこの経路で決まる。
 - 【決定】(M2 準備) `fp_misc` を 3 つのモジュールに分ける: 1 サイクル演算と FLI の `fp_misc`、全 FCVT の `fp_cvt` (`fp_misc` が instantiate する)、形式ごとの丸めと詰め直しの `fp_round_pack` (`#(EW, MW)`)。`fp_cvt` は入力をすべて `(-1)^sign × sig × 2^(exp-63)` (`sig[63]=1`) の 1 つの形に展開し、出力の形式ごとに `fp_round_pack` を 1 つ使う。理由: 1 モジュール 600 行の目安 (§2.2 M4) に収めるためと、変換の組ごとに丸めのコードを持たないためである。移植の途中で、旧 `fpu_wrap` の変換経路に検証計画付録 B の B49-B54 の誤りが見つかった。`fp_round_pack` は tininess を丸めの後で判定する (B54 を直す)。
-- 【決定】`fu_fmisc` の中身は新しい leaf `fp_misc` (純組合せ) に抽出し、`fpu_wrap` には手を入れない (§5.6 の凍結)。M5 までは cheap-op の論理が `fpu_wrap` と `fp_misc` に 2 重にある。【M5 で決定】VU の `u_vfpu` も新しい FP FU に移して 2 重を解消するか、`fpu_wrap` を VU 専用のまま残すか: VU の vector テスト群がビット一致で通るかと、移したときの VU の LATENCY 変化で決める。
+- 【決定】`fu_fmisc` の中身は新しい leaf `fp_misc` (純組合せ) に抽出し、`fpu_wrap` には手を入れない (§5.6 の凍結)。M5 までは cheap-op の論理が `fpu_wrap` と `fp_misc` に 2 重にある。【M5 で決定】VU の `u_vfpu` も新しい FP FU に移して 2 重を解消するか、`fpu_wrap` を VU 専用のまま残すか: VU の vector テスト群がビット一致で通るかと、移したときの VU の LATENCY 変化で決める。【決定】(M5) `fpu_wrap` を VU 専用のまま残し、2 重は §V.10 の上限として宣言する。理由: VU の FP FSM は `fpu_wrap` の PIPE=1 の present/capture 2 相、`o_fpu_busy` による保持、owner による div/sqrt の再起動に合わせて書かれており、新しい FP FU (exec_port の受理と WB の契約) に移すには VU の FSM を書き直すことになる。これは §V.2 の「VU の契約の変更は VM1-VM4 だけ」を超える。20 本の V テストは `fpu_wrap` のままで W2 と W4 で通っている。移したときの LATENCY の測定はしていない。残る代償: vector の変換 (vfcvt 系) は B49-B54 の誤りを持ち続ける (§V.9 の G14)。
 - 旧コアの `alu`、`alu_wrap`、`lsu` は `v14_` に改名される private モジュールである (§4.4) ので、instantiate せずに論理を移植する。`int_divider` と fp_* の leaf は共有モジュールで、そのまま instantiate する。
 
 #### §X.8.1 fu_blocking_shell
@@ -2521,7 +2518,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 | `i_instret_cnt` (幅パラメータ `INSTRET_CNT_W` 付き、既定 1。旧コアは既定値のまま) | commit | `popcount(retire)` |
 | `i_fflags_set`, `i_fflags` | commit | lane 間 OR |
 | `i_fs_dirty` (新)、`i_vs_dirty` (新, M5) | commit | lane 間 OR。V=1 では vsstatus 側も dirty にする (M5) |
-| `i_vxsat_set`, `i_vset_wr`…, `i_vstart_wr`… | commit (M5) | 【M5 で決定】VU が head でしか実行しない性質を使い、`sys_pending` と同形の単一レジスタで渡すか |
+| `i_vxsat_set`, `i_vset_wr`…, `i_vstart_wr`… | commit (M5) | 【決定】(M5) `sys_pending` と同形の単一レジスタ `commit.vec_q` で渡す。`vu_adapter` の `VuDone` が運ぶ `VecSide` を `vec_q` に置き、lane 0 の VEC op の retire で vset (`vcfg_v` のとき)、vstart (0)、vxsat を csr に書き、要素アクセスの trap では vstart に fault した要素を書く。理由: VEC op は nonspec かつ alone なので、完了済みで未 retire の VEC op は常に高々 1 つであり (VA5)、ROB の各エントリに vector の側帯を持たせる必要がない。 |
 | `i_hpm_events` | 各所有者の登録済みビットを top で連結 (C.7) | |
 | `i_mtime`, `i_irq_*` | core の外部ポート | |
 | `o_priv`, `o_virt`, status/envcfg/counteren 系 | decode (C.8)、`tlb`/`ptw` (X1)、`trap_unit` | |
@@ -3677,7 +3674,7 @@ MD の行を除き、どれも §3.4 に載っている。
 |---|---|---|
 | VM1 | FIFO のタグを `RobTag` にし、`i_flush`/`i_squash_en`/`i_squash_idx` を `i_kill: Kill` 1 本に置き換える。エントリは `killed(i_kill, tag)` で落とす。 | `fifo_rob - i_rob_head_idx` による年齢計算 (`vector_unit.veryl:2589-2593`)。2 の冪の ROB と ROB head 番号を前提にしていた。 |
 | VM2 | `i_rob_head_idx` を exec 許可 `i_exec: {valid, tag: RobTag}` に置き換える。`at_head = i_exec.valid && h_tag == i_exec.tag`。FIFO head の `o_head: {valid, tag, vtype_dep, is_fp}` を出力に足す。 | `at_head = h_rob == i_rob_head_idx` (`:2377`)。 |
-| VM3 | 専用 `u_vfpu` の owner 幅を `ROB_IDX_W` から切り離し、8 bit に固定する。 | `fp_elem[ROB_IDX_W-1:0]` で `fp_elem: logic<8>` (`:925, :2272`)。ROB_IDX_W > 8 が elaborate できない。 |
+| VM3 | 専用 `u_vfpu` の owner 幅を `ROB_IDX_W` から切り離し、固定幅にする。【決定】(M5) 5 bit (要素番号の下位 5 bit) とする。理由: `fpu_wrap` の owner は `pipeline_pkg::CdbBus` の 5 bit の `rob_idx` に出るので、それより広くできない。owner に要るのは「連続する要素で値が変わること」だけである。 | `fp_elem[ROB_IDX_W-1:0]` で `fp_elem: logic<8>` (`:925, :2272`)。ROB_IDX_W > 8 が elaborate できない。 |
 | VM4 | `o_wb_req` (head op に完了待ちの結果がある) と `o_wb_rd` (その完了が scalar rd を書く) を出力に足す。どちらも `i_cdb_free` には依存しない。 | 完了の要求は外から見えず、`i_cdb_free` を組合せで受けて即座に発火していた (`:2373-2477`)。 |
 
 - VM1-VM4 と V.9 の VU 内部の修正は、追加だけでは済まない変更である。§4.4 に従い、M5 で変更を入れる前に `src/v14/v14_vector_unit` へ凍結コピーを取り、旧コアはそちらを使う。受入条件は dhrystone/coremark のビット一致と、旧コアでの 20 本の V テスト。
@@ -3698,7 +3695,7 @@ struct VecSide {                     // rides the completion packet, held in com
     fflags: logic<5>, vxsat: logic,
     vrf_wcnt: logic<8>, vrf_hash: logic<64>,              // section V.7
 }
-struct VuDone { valid: logic, tag: RobTag, exc: exc_pkg::ExcRec, side: VecSide } // to rob and commit
+struct VuDone { valid: logic, tag: RobTag, exc: exc_pkg::ExcRec, side: VecSide, data: logic<64> } // to rob and commit
 ```
 
 | # | 契約 (所有者) |
@@ -3706,7 +3703,7 @@ struct VuDone { valid: logic, tag: RobTag, exc: exc_pkg::ExcRec, side: VecSide }
 | VA1 | alloc (`dispatch`): rename group の中で最初の VEC lane だけを VU に割り当てる。2 つ目の VEC lane の手前で group を切る (§5.3 R4 の部分受理、予算 `VQ`、§3.2 の「群あたり 1」)。VU の credit は FIFO の登録済み空き (`o_alloc_rdy`) である。最初の VEC lane は prefix の one-hot で選び、lane 番号で特例を書かない (R4)。割り当ては ROB の割り当てと同じサイクルに行い、kill のサイクルには行わない (T2)。 |
 | VA2 | exec 許可 (`vu_adapter`、許可の生成は `commit`、タグは `rob`): VU が FIFO head の作業を始めてよいのは、`i_exec.tag` が head のタグと等しいときだけ。M1-M5 では exec 境界 = oldest token とし、`i_exec.tag = rob.oldest.tag`、`i_exec.valid = nonspec_ok \|\| exec_q` とする (§5.12, I5)。この信号には「exec 境界」として名前を付け、将来の緩和 (V.8) を `vu_adapter` 内の局所変更にする。`exec_q` は §5.13.1 の started latch の VU 版である: `nonspec_ok` かつ `o_head.tag == rob.oldest.tag` のサイクルを開始点とし、その edge で `exec_q` を立てて `o_started` を出し、その op が retire するか自分の trap で full kill されるまで保持する。開始後の要素要求は token ではなく `exec_q` で出す (§5.13.1 IR1)。保持がないと、開始後に割込みが pending になった時点で token が止まり (I4)、VU が途中で止まったまま head が retire できずに固まる。 |
 | VA3 | scalar オペランド (`vu_adapter`, `prf`): VU が読む scalar source はすべて `prf_done=1` でなければならない (§5.7)。`busy_table` の `prf_done` は、この最初の消費者と同時に M5 で作る (§5.7、§X.4)。M5 ではこの条件は VA2 から構造的に成り立つ。head より古い producer はすべて retire 済みであり、retire した op の値は PRF にあるからである。`vu_adapter` は exec 許可の条件に `prf_done` の項を入れ、その項が許可を止めた回数を `chk_vu` で数える (0 であるべき)。`prf` への要求: ROB に完了を記録したサイクルの次のサイクルからは、その値が PRF の読出ポートで見えること。VU の CDB snoop 入力は 0 に、`i_alloc_scalar_ready` は 1 に固定する (head でしか動かないので snoop は要らない、§3.4)。読出ポートは VU 専用に int 2 本と fp 1 本を足す (§3.2 の表に M5 からの追加として記載)。 |
-| VA4 | 完了 (`vu_adapter`, `rob`, `wb_resv`): 完了は `rob` の VU 専用完了入力 `i_vu_done` (予約済み、調停なし) に `VuDone` を出して行う。これは §C.1.3 が認める 2 種類の完了入力の 1 つで、`rob` のヘッダに宣言する。scalar rd を書く op (VM4 の `o_wb_rd`、1 サイクル op だけ) は、wbm0 の HOLE_FILL 枠を登録済みの予約表から予約する。その枠のサイクルに `i_cdb_free=1` を返し、PRF への書込と完了を同時に行う。rd を書かない op は `o_wb_req` のサイクルにそのまま完了する。`i_cdb_free` は予約表と `o_wb_req/o_wb_rd` だけから作り、同じサイクルの issue へ組合せで戻る経路を作らない。 |
+| VA4 | 完了 (`vu_adapter`, `rob`, `wb_resv`): 完了は `rob` の VU 専用完了入力 `i_vu_done` (予約済み、調停なし) に `VuDone` を出して行う。これは §C.1.3 が認める 2 種類の完了入力の 1 つで、`rob` のヘッダに宣言する。scalar rd を書く op (VM4 の `o_wb_rd`、1 サイクル op だけ) は、wbm0 の HOLE_FILL 枠を登録済みの予約表から予約する。その枠のサイクルに `i_cdb_free=1` を返し、PRF への書込と完了を同時に行う。【決定】(M5) PRF への書込は pair packet (`WbPacket.pair=1`、完了を伴わない) として WB ポートに出し、完了は `VuDone` だけが行う。retire record の rd の値は `VuDone.data` で運ぶ。理由: 1 つの op を 2 つの入力で完了させない (`chk_rob` bit 1)。rd を書かない op は `o_wb_req` のサイクルにそのまま完了する。`i_cdb_free` は予約表と `o_wb_req/o_wb_rd` だけから作り、同じサイクルの issue へ組合せで戻る経路を作らない。 |
 | VA5 | 側帯 (`commit`): `VecSide` は packet に載せて運び、`commit` の `vec_pending` レジスタ 1 本に置く。1 本で足りる理由: VEC は `nonspec=1, alone=1` なので、完了済みで未 retire の VEC op は常に高々 1 つしかない (F6 の `sys_pending` と同じ論法)。retire 時に適用し、full kill で捨てる。例外 (`ExcRec`) は `VuDone.exc` として `rob` に渡し、保持の方式は §C に従う。 |
 | VA6 | kill (`vector_unit`): VM1 により dispatch FIFO は §5.4 の消費者になる。部分 kill が実行中の op を消すことは無い。実行中の op は最古であり、`keep` と等しいかそれより古いからである。full kill は、その op 自身の trap/flush でしか起きない (I3)。 |
 | VA7 | 事前検査 (`vu_adapter`): `o_head.vtype_dep=1` で csr の `vtype.vill=1` の場合、または `o_head.is_fp=1` で SEW が 32/64 以外の場合は、VU に exec 許可を渡さない。代わりに illegal (cause 2) 付きで `VuDone` を出す。retire の TRAP による full kill で FIFO から消えるので、VM2 の `o_head` 以外に VU 側の変更は要らない。 |
@@ -3716,7 +3713,8 @@ struct VuDone { valid: logic, tag: RobTag, exc: exc_pkg::ExcRec, side: VecSide }
 
 - 【決定】VU は `MEM_PIPE=0` で instantiate する。理由: `MEM_PIPE=1` の FETCH/ACCESS の 2 相は旧コアの M-stage のタイミング (無条件捕捉と、直前の要素の dcache 再読出が hit すること) に依存している (`vector_unit.veryl:35-43, 2752-2763`)。`MEM_PIPE=0` なら契約は「要素ごとに `i_mem_ready` か `i_mem_fault*` まで要求を保持する」だけになる。ただしこの arm は `a21c499` 以降に一度も動いておらず、`VINT_PIPE=1` と組み合わせた形 (`MEM_PIPE=0, VINT_PIPE=1`) は一度も動いたことがない。そこで M5 の最初の作業として再検証する (V.11)。
 - 要素要求の受け方: `o_mem_active` は VU の状態と VRF の v0 読出から組合せで作られる。adapter は要素を要求レジスタに 1 回だけ取り込み、VRF からポートへの組合せ経路を切る。未完了の要素は常に高々 1 つで、MemTag は `{client: VU, id: 1 bit の世代, rob: その VEC op の RobTag}` とする (§5.9)。
-- 【決定】VU は port 0 の生の client ではなく、memory pipe 0 の issue 段に入る client とする。理由: 要素アクセスには、AGU の pointer mask、DTLB lookup、`pmp_check`、`pma_check` が必要だからである。これらは memory pipe ごとに 1 つずつあり (§5.10)、VU 専用の lookup ポートを足すと MEM_W の軸の外に TLB ポートが増える。issue 枠は `mem_port_arb` が登録済み状態から 1 サイクル前に予約し、memory IQ はそのサイクルに pipe 0 を選ばない (MP3)。VU は port 0 の HEAD クラスの普通の要求者で、他のクラスと round-robin で並び、優先はしない (§L.14 の【決定】)。VU の待ちにも他の要求者の待ちにも MP4 の上限 B が適用される。
+- 【決定】VU は port 0 の生の client ではなく、memory pipe 0 の issue 段に入る client とする。理由: 要素アクセスには、AGU の pointer mask、DTLB lookup、`pmp_check`、`pma_check` が必要だからである。これらは memory pipe ごとに 1 つずつあり (§5.10)、VU 専用の lookup ポートを足すと MEM_W の軸の外に TLB ポートが増える。issue 枠は `mem_port_arb` が登録済み状態から 1 サイクル前に予約し、memory IQ はそのサイクルに pipe 0 を選ばない (MP3)。VU は port 0 の HEAD クラスの普通の要求者で、他のクラスと round-robin で並び、優先はしない (§L.14 の【決定】)。VU の待ちにも他の要求者の待ちにも MP4 の上限 B が適用される。【決定】(M5) `mem_port_arb` では VU を NP (非 pipe client) の 1 つにせず、HEAD pipe だけにある 5 番目のクラス VU とする (NEW、LQ、SQ、NP、VU の round-robin、B = 4)。理由: NP は空の slot を m2 で port に出すだけで、翻訳と検査を通らない。VU の要素は再発行と同じく m0 に入る。VU の pass は WB slot を予約しない。
+- DTLB miss の扱い (M5 の実装): walk の要求が受理され、その walk の `PtwEvent` がまだ来ていなければ、pass は `XPARK` を返し、adapter はその page の event を待って要求し直す。受理されなかったか event が既に来ていれば `RETRY` を返す。adapter が owner の walk が fault したら、`XlateResp` の `ExcRec` で要素を終える。D bit を立てる walk は、VEC op が開始済みなので token 無しで nonspec として要求する。
 - VU client に対して `mem_pipe` が行う処理と行わない処理:
   - load は forward 判定と load 整形を行わず、生の 128 bit を返す。dword の選択は adapter が行う。応答の扱いは MP2 に従う: HIT ならその場で返し、MISS なら `fill_id` に park して FILL_CRIT/DONE/ABORT で再 issue し、RETRY なら再 issue する。
   - store は翻訳と PMP/PMA 検査だけを行い、dcache には要求を出さず、PA と属性を返す。
@@ -3751,7 +3749,7 @@ FENCE との関係は通常の規則で足りる: vector store の要素は `sb`
 | `fu` / `nonspec` / `alone` | `VEC` / 1 / 1 |
 | `drain` | 0。順序は V.4 の開始条件で取る (retire 時ではなく実行開始時に待つ)。 |
 | `flush` | vector store (unit-stride、strided、indexed、segment、whole-register) は `NEXT_PC`、それ以外は `NONE`。vset は flush しない。decode が vtype に依存しないからである。 |
-| `effect` | すべての VEC op: `VS_DIRTY`, `VSTART`。vset* と fault-only-first: `VCFG`。vector FP: `FFLAGS`, `FS_DIRTY`。vfmv.f.s: `FS_DIRTY`。固定小数点: `VXSAT`。 |
+| `effect` | すべての VEC op: `VS_DIRTY`, `VSTART`。vset* と fault-only-first: `VCFG`。vector FP: `FFLAGS`, `FS_DIRTY`。vfmv.f.s: `FS_DIRTY`。固定小数点: `VXSAT`。【決定】(M5) `Effect` に足すビットは `vs_dirty` と `vstart` だけとする。`VCFG` と `VXSAT` は `VecSide` の `vcfg_v` と `vxsat` がそのまま条件になる (vleff が vl を切り詰めたかは実行するまで分からないので、decode のビットでは表せない)。vector FP は OPFVV と OPFVF の命令 (funct3 001、101) とする。 |
 | `budget` | `VQ`。scalar rd を書く op はさらに `INT_RD` か `FP_RD`。 |
 
 - retire (C1-C3): VEC op は lane 0 で単独で retire する。retire[0] だけを条件に次を行う: `vcfg_v` なら csr の vtype/vl を書く。vstart を書く (成功時は 0)。fflags と vxsat を OR する。VS を Dirty にし、`FS_DIRTY` を持つ op なら FS も Dirty にする。旧コアは vector の CSR 副作用を valid で gate していた (冪等なので安全だった) が、新コアは C3 に揃えて retire だけで gate する。
@@ -3797,14 +3795,15 @@ Constraint 1 を強めたままにする理由【決定】:
 | G2 | VS=Off の op が実行されてから commit で trap する (VRF やメモリが書き換わる) | decode で合法性を検査する。 | `decode` |
 | G3 | V=1 で vsstatus.VS を見ない。VS=Off でも vector CSR へのアクセスが trap しない | decode で合法性を検査する。csr に `o_vsstatus_vs` を追加する。 | `decode`, `csr` |
 | G4 | VS が Dirty にならない。vfmv.f.s と vector FP が FS を Dirty にせず、FS=Off も検査しない | `effect` で VS/FS を Dirty にする (V.6)。decode で FS を検査する。 | `commit`, `decode` |
-| G5 | vill が強制されない。reserved bit や SEW > LMUL×ELEN を vill と判定しない | 強制は VA7 で行う。判定の修正は VU の vset 論理を直す (VM 群と同時に入れ、v14 は凍結コピー)。 | `vu_adapter`, `vector_unit` |
+| G5 | vill が強制されない。reserved bit や SEW > LMUL×ELEN を vill と判定しない | 強制は VA7 で行う。判定の修正は VU の vset 論理を直す (VM 群と同時に入れ、v14 は凍結コピー)。(M5 で実装) vtype の bit 63:8 のどれかが 1、または分数 LMUL で SEW > LMUL×ELEN のときも vill にする。 | `vu_adapter`, `vector_unit` |
 | G6 | 算術 op が vstart を 0 に戻さない | VEC op の retire で必ず vstart を書く (V.6)。 | `commit` |
-| G7 | 再開時に vstart を無視し、要素 0 からやり直す | 【M5 で決定】7.1+V boot と V テストで、vstart≠0 で再開した回数を数える。0 なら上限として宣言し、0 でなければ VU を修正する。 | `vector_unit` |
-| G8 | mask された要素と tail の要素に、load が 0 を書く (どちらの policy でも違反) | VU を修正する。ALU op と同じく、古い vd と merge する。 | `vector_unit` |
+| G7 | 再開時に vstart を無視し、要素 0 からやり直す | 【M5 で決定】7.1+V boot と V テストで、vstart≠0 で再開した回数を数える。0 なら上限として宣言し、0 でなければ VU を修正する。(M5 の測定) `vu_adapter` の event `vu.vstart_nz` (vstart≠0 で開始した op) は 20 本の V テストで W2、W4 とも 0。7.1+V boot の値を待って確定する。 | `vector_unit` |
+| G8 | mask された要素と tail の要素に、load が 0 を書く (どちらの policy でも違反) | VU を修正する。ALU op と同じく、古い vd と merge する。(M5 で実装) load は書いた要素のビットを集め、レジスタの書込で古い vd (`o_vdold_addr` を load の書込先にする) と merge する。 | `vector_unit` |
 | G9 | misaligned な要素を黙って切り詰める | address-misaligned 例外にする (V.4)。 | `vu_mem_adapter` |
 | G10 | PMP fault を落とす。G-stage fault の cause/htval が誤る | port の `ExcRec` で報告する (V.4)。 | `vu_mem_adapter` |
 | G11 | VU のアドレスに pointer mask (Supm/Ssnpm) をかけない | `mem_pipe` 0 が VU client にも同じ関数をかける。 | `mem_pipe` |
-| G12 | reserved encoding (`vssubu.vi` など) を実行してしまう | decode で illegal にする。 | `decode` |
+| G12 | reserved encoding (`vssubu.vi` など) を実行してしまう | decode で illegal にする。(M5 で実装) `decoder` が op に割り当てる OPIVV と OPIVI の funct6 のうち RVV 1.0 が予約しているもの (vrsub.vv、vmsgt{u}.vv、vsub.vi、vmin{u}.vi、vmax{u}.vi、vmslt{u}.vi、vssub{u}.vi)。golden の probe `b39_opv_ill` で旧コアが vssubu.vi を trap せずに実行することを確かめた。 | `decode` |
+| G14 | vector の変換 (vfcvt 系) が `fpu_wrap` の変換経路 (付録 B の B49-B54) を使う | `fpu_wrap` を VU 専用に残すので (§X.8 の【決定】(M5))、M5 では直さない。G13 と一緒に M5 の後で判断する。 | `vector_unit` |
 | G13 | 未実装: vmv.s.x、vmv<nr>r.v、vmacc 系、vadc/vsbc/vmadc/vmsbc、vzext/vsext、vwmacc 系、strided/indexed/fault-only-first の segment | M5 では illegal として trap させる。実装するかどうかは M5 の後に判断する (下記)。 | `decode` (`vector_unit`) |
 
 G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zvfhmin, Zvkt) の扱い: §2.6 に従い、M5 の後に RVA23 の不足分とまとめてユーザが判断する (M0 時点の選択肢のうち (2) を採る)。M5 の範囲では実装せず、illegal として trap させる。理由: G13 が無くても、20 本の V テストと 7.1+V boot は通る (旧コアで実証済み)。M5 の目的は統合の構造であり、ISA の拡張ではない。ただし README の「complete RVA23」は M5 の時点で事実と食い違うので、記述の修正だけは M5 で行う。
@@ -3815,7 +3814,8 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 
 | 上限 | 値 | 処置 |
 |---|---|---|
-| ROB_N ≤ 256、かつ 2 の冪 | VM1 と VM3 の後は消える | M5 で解消する。M5 より前は VU を instantiate しないので、この制約は掛からない。 |
+| ROB_N ≤ 256、かつ 2 の冪 | VM1 と VM3 の後は消える | 【解消】(M5) VM1 (タグと `killed`) と VM3 (owner 5 bit) で無くなった。§3.4 の行は消した。 |
+| VU の CDB snoop は 2 lane | head でしか動かないので snoop は使わない | 【解消】(M5) snoop の入力は 0、`i_alloc_scalar_ready` は 1 に固定し、開始の条件に `prf_done` を入れた (VA3)。§3.4 の行は消した。 |
 | VLEN | 128 固定 (`vector_pkg`、VU 内のリテラル 45 か所) | 宣言された上限として残す。 |
 | alloc | rename group あたり 1、1 サイクルに 1 | 宣言された上限として残す (§3.2)。 |
 | 実行 | 1 op ずつ、oldest token を持つときだけ | 宣言された上限として残す。exec 境界の緩和は V.8 (b)。 |
@@ -3827,10 +3827,10 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 
 ### V.11 M5 の作業順とゲート
 
-1. `MEM_PIPE=0` の arm を再検証する。
+1. `MEM_PIPE=0` の arm を再検証する。(M5 の結果) (a) は使えなかった: 旧コアの `MEM_PIPE` を 0 にすると elaboration が combinational loop で失敗する (`v14_heliodor_core.veryl` の `alu_cdb_eff` を含む loop)。そこで (b) を取り、新コアの上で `MEM_PIPE=0, VINT_PIPE=1` の VU を統合した。20 本の V テストは W2 と W4 で通り、retire record の `vrf_hash` を含む rolling hash は 20 本すべてで W2 と W4 が一致した。
    - (a) 旧コアのブランチで core と VU の `MEM_PIPE` を 0 にし、20 本の V テストと `test_vmspre` を回す。
    - (b) 旧コアの側の `MEM_PIPE=0` の arm が腐っていて (a) が使えない場合は、新コアの上で直接統合する。V.7 の `vrf_hash` の trace diff で最初に食い違う vector op を見つけ、VU の arm の問題か adapter の問題かを切り分ける。
-2. 旧コア上の directed test で、推定段階の旧コアのバグを確かめる (D4)。対象は、`amoadd x0` の直後に同じ line へ `vle` を出す ASQ の穴、LSR が残っている状態での VU 要素の読出、不正な OP-V の wedge。
+2. 旧コア上の directed test で、推定段階の旧コアのバグを確かめる (D4)。対象は、`amoadd x0` の直後に同じ line へ `vle` を出す ASQ の穴、LSR が残っている状態での VU 要素の読出、不正な OP-V の wedge。(M5 の結果、golden 上の probe) ASQ の穴は `b39_amo_vle` で再現せず (M2 で確認済み)。LSR は `b39_lsr_vle` (cold な line への scalar load、別の line の vle64、さらに別の line の scalar load) で再現せず (tohost 1)。不正な OP-V は `b39_opv_ill` で、未実装の vmv.s.x が trap せずに止まり (200k サイクルで tohost 0、wedge を確認)、予約された vssubu.vi は trap せずに実行された (G12)。3 本は新コアの `test_w{2,4}_vprobe` に入れた。
 3. `v14_vector_unit` を凍結し、旧コアのビット一致を確認する。その後に VM1-VM4 と G5/G8 を入れる。
 4. `vu_adapter`、`vu_mem_adapter`、`sb.i_vu_push`、`mem_pipe` 0 の VU client、decode の合法性、commit の VEC 規則、csr への追加を入れる。
 5. ゲート:
@@ -4580,7 +4580,7 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 | U27 | D-PTW を L2 直結にするか | §5.9 | M3 | W4 の sweep で port 0 の占有率をクラス別に測り、PTW が上位 2 位以内に入った場合に限って評価する。【決定済み (M3 の手順 7)】評価しない。W4 の 5.15 boot で D-PTW は port 0 の 3 位 (IQ の発行 2.62M、再 issue 0.26M、PTE 読み 105k、§5.9)。 |
 | U28 | DRAM 内の Svpbmt NC/IO | §5.11 | M2 | 【決定済み (§5.11)】line か single beat かを D/I 両 slot で要求者の属性が決め、`io_unit` は uncached の DRAM アクセスの前に自 hart の line を本物の clean で書き戻して落とす。他 hart の dirty なコピーの recall と、DRAM からの uncached fetch が自 hart の L1D の dirty line を見ないことは、M4 手順 7 (`i_hunc`/`o_hhold`、`ST_UNC`) で解決した (§5.11)。 |
 | U29 | NC load の投機的な発行 | §5.14 | M3 | boot と bench で NC load の発生数を数える。0 なら head 発行のまま確定する。【決定済み (M3 の手順 7)】head 発行のまま確定する。`io.load` (IO と NC の合計) は 5.15 boot と bench で 0、6.6 と 7.1 の boot で 31 (§5.14)。 |
-| U30 | VU の IO アクセス | §5.14 | M5 | IO 領域への vector アクセスの数を数える。0 なら fault にする (§V.4)。 |
+| U30 | VU の IO アクセス | §5.14 | M5 | 【決定】(M5) fault にする (§5.14)。 |
 | U31 | 本書の編集上の積み残し | M0 のレビュー | M1a (ヘッダ雛形は M1b) | 完了 (2026-10-14): 規則の正本を 1 か所に決め、他の箇所は参照と 1 行の要約にした (PC の保持者と読み手は §F.3、commit の PC 導出は §C.2.3、割込みの受付は §5.13、FENCE 系の OpClass は §5.5 で retire 時の動作は §C.6、adapter の規則は §M.2、kill の消費者表は §5.4、I read slot の調停は §M.5、`MSHR_N` を増やす条件は §2.5)。各章の「防ぐバグ類」と経緯だけの旧コアの参照は付録に移し、§1.6 の用語集と §5.1 の型の索引を補った。設計の変更は伴わない。続けて、章の間で食い違っていた規則 7 件を正本側に揃えた: adapter の MISS 判定 (E1 の latch 値、`o_miss_valid` は使わない) と保持 slot の駆動 (fold 群と nf 群) は §M.2 を正とし §5.9 は参照だけにした。commit の retire 式は §C.2.2 を正とし §5.12 C1 は要約と参照にした (`alone_eff` が足すのは IO だけなので、§5.5 の load の行を IO (alone=1) と NC (nonspec だが alone=0) に分けた)。store の retire 予算は §C.2.2 の `n_st <= MEM_W`、`n_line <= min(PUSH_W, sb_credit)` (credit は line 単位) に §L.9 を揃えた。dispatch snapshot に `bar_seq` を足した (§C.1.6)。`i_dbg_irq_allow` が `limit_en` を要すること (§C.2.6) を §5.13 の表に書いた。HFENCE.*/HINVAL.* の retire 条件を SFENCE.VMA と同じ (`ordering_empty` + `sys_pending`) にした (§C.6)。残り (M1b): cold-reader gate の対象モジュールすべてに §5.15 書式のヘッダ雛形を置く。 |
 | U32 | hartreset の reset ドメインの境界と quiesce の条件 | §D.13 | MD | 【MD 手順 9 で実装】推奨どおりの境界 (dcache だけが `i_dc_rst`) と quiesce (commit の `hold_q`、`o_dm_quiet`) を入れた (§D.13 の【MD 手順 9 で決定】)。GD4 の `dbg4/dm_smp_reset` で、1 hart と mask の 2 hart の hartreset の間に他の hart が共有の line への amoadd を続け、reset した hart の dirty な line が残ることを確かめた。GB4 相当の負荷と litmus 型の検査の下での hartreset は覆っていない。推奨: dcache とその coherence agent は reset せず、core ドメイン (front end、rename、scheduler、LSQ と `sb`、`csr`、`trig_unit`、TLB と `ptw`、icache) だけを reset する。quiesce の条件は `!head_started_q`、`sb.resource_empty`、dcache の MSHR と書き込みの idle、`islot_arb` の idle。【M4 で追加】D と I の `ptw` の idle (A/D の owned RMW が `LOAD_EXCL` と `STORE_EXCL` の間で dcache の line を pin したまま reset されないため)。ASQ を採るなら `sb.resource_empty` を `ordering_empty` に替える (U51)。MSHR の idle は `MSHR_N` 本すべて。測るもの: N=4 で 1 hart を reset し、他の hart が走り続けたまま litmus 型の共有データの検査と GB4 相当の負荷で一貫性が保たれること。dcache を残すと reset の後に古い line を hit しうるが、line はアーキ状態ではなく coherence で最新に保たれているので問題ない、という論拠を directed で確かめる。代案 (dcache を clean して invalidate してから reset) は quiesce に dcache の sweep が要るので採らない。 |
 | U33 | SBA の mem_ctrl への接続形 | §D.11 | MD | 選択肢: (a) SBA 専用の slot を 1 本足す (slot 番号は全 hart の D/I の後)、(b) memory_bus の第 2 の master にし、DRAM だけ mem_ctrl の uncached な経路へ渡す。推奨は (a)。理由: recall と write-grant veto と sharer の invalidate の仕組みは mem_ctrl の slot の経路にあり、(b) は同じ義務を別の経路で作り直すことになる。(a) では N=8 で slot が 17 本になるので、mem_ctrl の slot 番号の `logic<4>` (§M.4) を導出幅に直す (§S.7)。前提は M4 の U28 の残り (他 hart の dirty コピーの recall)。 |
