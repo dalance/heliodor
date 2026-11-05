@@ -1,12 +1,13 @@
 # Heliodor
 
 **Heliodor** is a from-scratch, out-of-order RV64 RISC-V application-processor core
-written in [Veryl](https://veryl-lang.org/). It implements the complete **RVA23**
-profile — RV64GC, the scalar extensions, the **vector (V)** extension, and the
-**hypervisor (H)** extension — across all privilege modes (M / HS / VS / VU), and
-boots unmodified mainline Linux: the **5.15**, **6.6 LTS**, and **7.1** SMP kernels
-(1–8 harts) through OpenSBI to SBI shutdown, plus a full **guest Linux** under a
-self-written bare-metal **type-1 hypervisor**.
+written in [Veryl](https://veryl-lang.org/). It implements most of the **RVA23**
+profile — RV64GC, the scalar extensions, the **vector (V)** extension (less the
+RVV 1.0 encodings and the Zvbb / Zvfhmin / Zvkt extensions listed under *Vector
+unit*), and the **hypervisor (H)** extension — across all privilege modes
+(M / HS / VS / VU), and boots unmodified mainline Linux: the **5.15**, **6.6 LTS**,
+and **7.1** SMP kernels (1–8 harts) through OpenSBI to SBI shutdown, plus a full
+**guest Linux** under a self-written bare-metal **type-1 hypervisor**.
 
 ## Status
 
@@ -67,11 +68,15 @@ own type-1 hypervisor. See **Verification**.
   integer CDB, and completion rides the lane-0 CDB at lowest priority. VLEN = 128,
   ELEN = 64; integer + single/double FP, all LMUL; `vset{i}vl{i}`, unit-stride /
   strided / indexed / segment / fault-only-first loads and stores, masking, and
-  widening / narrowing
+  widening / narrowing. Not implemented: `vmv.s.x`, `vmv<nr>r.v`, the integer
+  multiply-add family (`vmacc`/`vnmsac`/`vmadd`/`vnmsub`, `vwmacc*`),
+  `vadc`/`vsbc`/`vmadc`/`vmsbc`, `vzext`/`vsext`, strided / indexed /
+  fault-only-first segment loads and stores, and the RVA23 vector extensions
+  Zvbb, Zvfhmin and Zvkt
 - **ISA**: **RV64GC** base (RV64IMAFDC_Zicsr_Zifencei) — M (mul/div), A (LR/SC +
   AMO), F/D (single + double FP), C (compressed, incl. compressed FP load/store,
-  expanded in fetch by `c_expander`) — extended to the full **RVA23 application /
-  supervisor profile**:
+  expanded in fetch by `c_expander`) — extended toward the **RVA23 application /
+  supervisor profile** (the vector gaps are listed under *Vector unit*):
   - The **vector (V)** extension (RVV 1.0) — see *Vector unit* below
   - Bit-manipulation **Zba/Zbb/Zbs**; data-independent-latency **Zkt**
   - Atomics: **Zacas** (compare-and-swap, incl. the 128-bit even-odd
@@ -261,7 +266,7 @@ as of Phase 14:
 | 9     | Multi-core memory-system build-out: RVWMO litmus harness (P9.0), split-transaction DRAM read controller + line-granular L2 (P9.1), write-back D$ + MESI inclusive directory (P9.2), cache-to-cache transfer + in-cache AMO/LR-SC (P9.3), N=8 SMP boot (P9.4), PLIC wiring + uncached MMIO + TLB ASID + selective SFENCE.VMA (P9.5), coherent instruction side — I-cache + I-PTW through L2, FENCE.I/SFENCE flush sweep retired (P9.6) | complete |
 | 10    | **RVA23-profile scalar ISA extensions** (V / H excluded): Zba/Zbb/Zbs, Sstc, Zicntr/Zihpm, Zicond, Zicbom/Zicboz, Zfa, Zfhmin, Sscofpmf, Supm/Ssnpm, and the hint / Zcb / system / MMU (Svnapot/Svpbmt/Svadu) bundles. Validated by upgrading the boot from 5.15 to mainline **6.6 LTS** and **7.1**, which discover the extensions from the device tree and exercise them; enabling userspace FP on 7.1 exposed and fixed two SMP-only FP-context RTL bugs | complete |
 | 11    | **Hypervisor (H) extension** (`misa.H`): HS/VS/VU modes + `V` bit, the full HS/VS CSR set, two-stage Sv39 × Sv39x4 nested translation (VMID/VS-ASID-tagged TLB), HLV/HLVX/HSV, the guest-page-fault trio, virtual-interrupt delivery, htimedelta + Sstc-in-VS guest timers, and VS-mode CSR isolation. Validated end-to-end by a self-written bare-metal type-1 hypervisor that boots an unmodified guest Linux to its own userspace and SBI shutdown (Veryl sim + Verilator) | complete |
-| 12    | **Vector (V) extension (RVV 1.0)** — a decoupled in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL; full arithmetic + masking + unit-stride / strided / indexed / segment / fault-only-first load-store), exercised by a V-enabled 7.1 kernel and inline **RVV arch suites** — plus **RVA23 architectural-compliance** verification against the official ACT4 (`riscv-arch-test`, Sail golden reference). The compliance pass closed scalar atomic gaps (**Zabha**, full **Zacas** incl. `amocas.q`), added **PMP** (Smpmp / SvPMP) enforcement, and fixed real FPU bugs + upstreamed several **Veryl** simulator/analyzer fixes. See `test/act/README.md` | complete |
+| 12    | **Vector (V) extension (RVV 1.0)** — a decoupled in-order vector unit (32 × 128-bit VRF, VLEN=128 / ELEN=64, integer + single/double FP, all LMUL; arithmetic + masking + unit-stride / strided / indexed / segment / fault-only-first load-store), exercised by a V-enabled 7.1 kernel and inline **RVV arch suites** — plus **RVA23 architectural-compliance** verification against the official ACT4 (`riscv-arch-test`, Sail golden reference). The compliance pass closed scalar atomic gaps (**Zabha**, full **Zacas** incl. `amocas.q`), added **PMP** (Smpmp / SvPMP) enforcement, and fixed real FPU bugs + upstreamed several **Veryl** simulator/analyzer fixes. See `test/act/README.md` | complete |
 | 13    | **Realistic-SRAM migration + near-term deep-pipeline CP** (tapeout realism): every cache RAM (D$ / icache / L2 tags + data) migrated to real ASIC-SRAM port shapes — **1R1W** (tag read-port replication, data byte-write-enable write-collapse) with **registered-address (clocked) reads** for the three big data arrays (a `--dump-area` sweep confirms all migratable blocks 1R1W, core + SMP-SoC). The icache clocked read shipped **default-on** behind a **fetch-directed prefetcher** (FTB) at **~+8 % IPC**, cross-checked byte-identical on Verilator; near-term **~12 ns CP** met. See `doc/sram_inventory.md`, `doc/cp_icache_fetch_decouple_plan.md` | complete |
 | 14    | **Front-end + LSQ structural completion** (deep-OoO structures instead of single-cycle fusions): predictor arrays to clocked 1R1W SRAM with a later-stage override, a decoupled front end through a descriptor fetch target queue, a pipelined scheduler (select + speculative wakeup), a store-drain visibility contract that frees the load port, a first-class physical-address-exact load queue, non-blocking misses from the second load stage, atomics without a return value retired into the store queue, wider rename slot-1 use + a 32 KB L1I (IPC above 1.0), and separate instruction / data read slots in the DRAM controller. Correcting the synthesis flow (it had been timing half the netlist) and cutting four serial-reduce chains brought the measured critical path to **15.16 ns**. Execute-stage deepening (`EX_PIPE`) is built and CP-neutral but stays off for its IPC cost. See `doc/phase14_frontend_deep_ooo_plan.md` | complete |
 
