@@ -25,6 +25,7 @@ or a number taken as the regno; a size-2 access is written <reg>.w.
                                 (default 0) and leave it set
     ARD  <reg> <lo> [<hi>]      read reg; data0 must be lo (and data1 hi)
     ARDM <reg> <lo> <mask>      read reg; data0 & mask must be lo
+    ARDH <reg> <hi> <mask>      read reg; data1 & mask must be hi
     ARDS <reg> <slot>           read reg; keep data0 in slot
     ARDEQ/ARDNE <reg> <slot>    read reg; data0 must equal / differ from slot
     AWR  <reg> <lo> [<hi>]      write reg from data0/data1 (hi defaults to 0)
@@ -66,7 +67,8 @@ CSRS = {
     "mcause": 0x342, "mtval": 0x343, "mip": 0x344, "tselect": 0x7A0, "tdata1": 0x7A1,
     "tdata2": 0x7A2, "tdata3": 0x7A3, "tinfo": 0x7A4, "tcontrol": 0x7A5, "dcsr": 0x7B0, "dpc": 0x7B1, "dscratch0": 0x7B2,
     "dscratch1": 0x7B3, "pmpcfg0": 0x3A0, "pmpaddr0": 0x3B0, "mcycle": 0xB00, "minstret": 0xB02, "cycle": 0xC00, "time": 0xC01,
-    "instret": 0xC02, "mhartid": 0xF14,
+    "instret": 0xC02, "mhartid": 0xF14, "vstart": 0x008, "hstatus": 0x600, "sscratch": 0x140,
+    "vsscratch": 0x240,
 }
 SYMS = {}
 
@@ -135,12 +137,14 @@ def expand(op, args):
         return rd + [("RD", ["data0", args[1]])] + ([("RD", ["data1", args[2]])] if len(args) > 2 else [])
     if op == "ARDM":
         return rd + [("RD", ["data0", args[1], args[2]])]
+    if op == "ARDH":
+        return rd + [("RD", ["data1", args[1], args[2]])]
     if op == "ARDS":
         return rd + [("RDS", ["data0", args[1]])]
     return rd + [("RDEQ" if op == "ARDEQ" else "RDNE", ["data0", args[1]])]
 
 
-MACROS = {"ACMD": (1, 2), "AWR": (2, 3), "ARD": (2, 3), "ARDM": (3, 3), "ARDS": (2, 2), "ARDEQ": (2, 2),
+MACROS = {"ACMD": (1, 2), "AWR": (2, 3), "ARD": (2, 3), "ARDM": (3, 3), "ARDH": (3, 3), "ARDS": (2, 2), "ARDEQ": (2, 2),
           "ARDNE": (2, 2), "RESHALT": (0, 0)}
 
 

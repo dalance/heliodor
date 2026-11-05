@@ -5,7 +5,7 @@ CC      = riscv64-unknown-elf-gcc
 OBJCOPY = riscv64-unknown-elf-objcopy
 OBJDUMP = riscv64-unknown-elf-objdump
 
-CFLAGS  = -march=rv64gcv_zicsr_zifencei_zacas_svinval -mabi=lp64d -nostdlib -nostartfiles -ffreestanding -I.
+CFLAGS  = -march=rv64gcv_zicsr_zifencei_zacas_svinval_h -mabi=lp64d -nostdlib -nostartfiles -ffreestanding -I.
 ELF2HEX = python3 ../c/bin2hex.py
 
 SRCS = $(wildcard *.S)
