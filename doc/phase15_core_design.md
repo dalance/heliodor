@@ -3796,23 +3796,23 @@ Constraint 1 を強めたままにする理由【決定】:
 | # | 旧コアの挙動 | M5 の計画 | 場所 |
 |---|---|---|---|
 | G1 | 不正・未実装の OP-V が head で wedge する (推定) | M1 から `NONE` + illegal。M5 でも未実装の encoding は illegal のまま。 | `decode` |
-| G2 | VS=Off の op が実行されてから commit で trap する (VRF やメモリが書き換わる) | decode で合法性を検査する。 | `decode` |
-| G3 | V=1 で vsstatus.VS を見ない。VS=Off でも vector CSR へのアクセスが trap しない | decode で合法性を検査する。csr に `o_vsstatus_vs` を追加する。 | `decode`, `csr` |
-| G4 | VS が Dirty にならない。vfmv.f.s と vector FP が FS を Dirty にせず、FS=Off も検査しない | `effect` で VS/FS を Dirty にする (V.6)。decode で FS を検査する。 | `commit`, `decode` |
-| G5 | vill が強制されない。reserved bit や SEW > LMUL×ELEN を vill と判定しない | 強制は VA7 で行う。判定の修正は VU の vset 論理を直す (VM 群と同時に入れ、v14 は凍結コピー)。(M5 で実装) vtype の bit 63:8 のどれかが 1、または分数 LMUL で SEW > LMUL×ELEN のときも vill にする。 | `vu_adapter`, `vector_unit` |
-| G6 | 算術 op が vstart を 0 に戻さない | VEC op の retire で必ず vstart を書く (V.6)。 | `commit` |
-| G7 | 再開時に vstart を無視し、要素 0 からやり直す | 【M5 で決定】7.1+V boot と V テストで、vstart≠0 で再開した回数を数える。0 なら上限として宣言し、0 でなければ VU を修正する。(M5 の測定) `vu_adapter` の event `vu.vstart_nz` (vstart≠0 で開始した op) は 20 本の V テストで W2、W4 とも 0。7.1+V boot の値を待って確定する。 | `vector_unit` |
-| G8 | mask された要素と tail の要素に、load が 0 を書く (どちらの policy でも違反) | VU を修正する。ALU op と同じく、古い vd と merge する。(M5 で実装) load は書いた要素のビットを集め、レジスタの書込で古い vd (`o_vdold_addr` を load の書込先にする) と merge する。 | `vector_unit` |
-| G9 | misaligned な要素を黙って切り詰める | address-misaligned 例外にする (V.4)。 | `vu_mem_adapter` |
-| G10 | PMP fault を落とす。G-stage fault の cause/htval が誤る | port の `ExcRec` で報告する (V.4)。 | `vu_mem_adapter` |
-| G11 | VU のアドレスに pointer mask (Supm/Ssnpm) をかけない | `mem_pipe` 0 が VU client にも同じ関数をかける。 | `mem_pipe` |
-| G12 | reserved encoding (`vssubu.vi` など) を実行してしまう | decode で illegal にする。(M5 で実装) `decoder` が op に割り当てる OPIVV と OPIVI の funct6 のうち RVV 1.0 が予約しているもの (vrsub.vv、vmsgt{u}.vv、vsub.vi、vmin{u}.vi、vmax{u}.vi、vmslt{u}.vi、vssub{u}.vi)。golden の probe `b39_opv_ill` で旧コアが vssubu.vi を trap せずに実行することを確かめた。 | `decode` |
+| G2 | VS=Off の op が実行されてから commit で trap する (VRF やメモリが書き換わる) | decode で合法性を検査する。(M5 の確認) `v_vs_off`。 | `decode` |
+| G3 | V=1 で vsstatus.VS を見ない。VS=Off でも vector CSR へのアクセスが trap しない | decode で合法性を検査する。csr に `o_vsstatus_vs` を追加する。(M5 の確認) `v_vs_virt`。 | `decode`, `csr` |
+| G4 | VS が Dirty にならない。vfmv.f.s と vector FP が FS を Dirty にせず、FS=Off も検査しない | `effect` で VS/FS を Dirty にする (V.6)。decode で FS を検査する。(M5 の確認) `v_vs_dirty` で、vector CSR (vstart、vxsat、vxrm、vcsr) への CSR 書込が VS を Dirty にしていなかったことが分かり、decode の `DecInfo.csr_vec` から CSR op の `effect.vs_dirty` を立てるよう直した。 | `commit`, `decode` |
+| G5 | vill が強制されない。reserved bit や SEW > LMUL×ELEN を vill と判定しない | 強制は VA7 で行う。判定の修正は VU の vset 論理を直す (VM 群と同時に入れ、v14 は凍結コピー)。(M5 で実装) vtype の bit 63:8 のどれかが 1、または分数 LMUL で SEW > LMUL×ELEN のときも vill にする。(M5 の確認) `v_vill`。 | `vu_adapter`, `vector_unit` |
+| G6 | 算術 op が vstart を 0 に戻さない | VEC op の retire で必ず vstart を書く (V.6)。(M5 の確認) `v_vstart`。 | `commit` |
+| G7 | 再開時に vstart を無視し、要素 0 からやり直す | 【M5 で決定】7.1+V boot と V テストで、vstart≠0 で再開した回数を数える。0 なら上限として宣言し、0 でなければ VU を修正する。(M5 の測定) `vu_adapter` の event `vu.vstart_nz` (vstart≠0 で開始した op) は 20 本の V テストで W2、W4 とも 0。7.1+V boot の値を待って確定する。【M5 手順 3 で決定】7.1+V の N=1 boot (W2) でも 0 だったので、VU は直さず上限として宣言する (V.10)。(M5 の確認) segment の load/store は field を外側に回すので、segment の途中の fault で書く vstart は、それより前の segment の残りの field が済んだことを意味しない。`v_vpmp` に一時的に足した確認で、vlseg2e32 の field 0 の要素 1 の PMP fault は vstart 1 を書き、segment 0 の field 1 は読まれていなかった。再開は vstart を無視して要素 0 からやり直すので結果は正しい。G7 と一緒に上限として宣言する (V.10)。 | `vector_unit` |
+| G8 | mask された要素と tail の要素に、load が 0 を書く (どちらの policy でも違反) | VU を修正する。ALU op と同じく、古い vd と merge する。(M5 で実装) load は書いた要素のビットを集め、レジスタの書込で古い vd (`o_vdold_addr` を load の書込先にする) と merge する。(M5 の確認) `v_vld_mask` (unit-stride、strided、indexed、segment、fault-only-first)。あわせて、途中の要素で trap した load がそのレジスタで読み終えた要素を書いていなかった (vstart より前の要素が済んでいない) ので、fault-only-first の部分書込 (`mem_trim_wr`) をすべての load に広げた (`v_vmisalign`、`v_vpmp`、`v_vgpf` で確認)。 | `vector_unit` |
+| G9 | misaligned な要素を黙って切り詰める | address-misaligned 例外にする (V.4)。(M5 の確認) `v_vmisalign`。 | `vu_mem_adapter` |
+| G10 | PMP fault を落とす。G-stage fault の cause/htval が誤る | port の `ExcRec` で報告する (V.4)。(M5 の確認) `v_vpmp`、`v_vgpf` (VS-mode と MPRV/MPV の M-mode)。 | `vu_mem_adapter` |
+| G11 | VU のアドレスに pointer mask (Supm/Ssnpm) をかけない | `mem_pipe` 0 が VU client にも同じ関数をかける。(M5 の確認) `v_vpm` (Smmpm の M-mode、PMLEN16 と PMLEN7)。 | `mem_pipe` |
+| G12 | reserved encoding (`vssubu.vi` など) を実行してしまう | decode で illegal にする。(M5 で実装) `decoder` が op に割り当てる OPIVV と OPIVI の funct6 のうち RVV 1.0 が予約しているもの (vrsub.vv、vmsgt{u}.vv、vsub.vi、vmin{u}.vi、vmax{u}.vi、vmslt{u}.vi、vssub{u}.vi)。golden の probe `b39_opv_ill` で旧コアが vssubu.vi を trap せずに実行することを確かめた。(M5 の確認) `v_opv_sweep` で、funct6 以外の field が予約されている 17 種 (vmv.v.* と vfmv.v.f の vs2≠0、vmv.x.s・vfmv.f.s・vcompress・mask 論理演算の vm=0、vfmv.s.f の vm=0 と vs2≠0、vid.v の vs2≠0、mask と whole-register の load/store の vm=0、vlm.v・vsm.v と whole-register store の EEW≠8) を trap せずに実行していたので、`decode` の `vec_rsv` に加えた。 | `decode` |
 | G14 | vector の変換 (vfcvt 系) が `fpu_wrap` の変換経路 (付録 B の B49-B54) を使う | `fpu_wrap` を VU 専用に残すので (§X.8 の【決定】(M5))、M5 では直さない。G13 と一緒に M5 の後で判断する。 | `vector_unit` |
-| G13 | 未実装: vmv.s.x、vmv<nr>r.v、vmacc 系、vadc/vsbc/vmadc/vmsbc、vzext/vsext、vwmacc 系、strided/indexed/fault-only-first の segment | M5 では illegal として trap させる。実装するかどうかは M5 の後に判断する (下記)。 | `decode` (`vector_unit`) |
+| G13 | 未実装: vmv.s.x、vmv<nr>r.v、vmacc 系、vadc/vsbc/vmadc/vmsbc、vzext/vsext、vwmacc 系、strided/indexed/fault-only-first の segment | M5 では illegal として trap させる。実装するかどうかは M5 の後に判断する (下記)。(M5 の確認) `v_opv_sweep` (7 つの funct3 の全 funct6、unary 群の sub-op、load/store の各形、計 624 行) で、一覧の encoding 55 行はすべて illegal で trap し、実装済みの 306 行はどれも trap しない。一覧は過不足なくこのとおり。 | `decode` (`vector_unit`) |
 
 G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zvfhmin, Zvkt) の扱い: §2.6 に従い、M5 の後に RVA23 の不足分とまとめてユーザが判断する (M0 時点の選択肢のうち (2) を採る)。M5 の範囲では実装せず、illegal として trap させる。理由: G13 が無くても、20 本の V テストと 7.1+V boot は通る (旧コアで実証済み)。M5 の目的は統合の構造であり、ISA の拡張ではない。ただし README の「complete RVA23」は M5 の時点で事実と食い違うので、記述の修正だけは M5 で行う。
 
-- G13 の一覧はコード調査 (`decoder` と `vector_unit` の静的な読み) から作ったものであり、実行で確かめていない。M5 で、各 encoding を 1 つずつ実行する directed test によって「未実装 = illegal で trap する」ことを確かめ直し、一覧を確定させる。
+- G13 の一覧はコード調査 (`decoder` と `vector_unit` の静的な読み) から作ったものであり、実行で確かめていない。M5 で、各 encoding を 1 つずつ実行する directed test によって「未実装 = illegal で trap する」ことを確かめ直し、一覧を確定させる。【M5 手順 3 で確認】`v_opv_sweep` (W2、W4) で確定した (上の表の G13 行)。
 
 ### V.10 VU の上限 (§3.4 への登録)
 
@@ -3828,6 +3828,8 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 | PRF 読出ポート | VU 専用に int 2 本と fp 1 本 | `prf` の読出ポート数に加算する。 |
 | hart ごとの専用 `fpu_wrap` と `int_divider` | 面積とシミュレーション速度を食う | 宣言する。シミュレーション上の割合は M5 で測る (リスク R1)。 |
 | 割込みの受付遅延 | 最長の vector op 1 本分 (例: LMUL=8 の要素直列 vdiv、または要素ごとに miss する load) | 宣言する (V.6)。 |
+| vstart による再開 | VU は vstart を無視して要素 0 からやり直す (V.9 の G7) | 宣言する。vstart≠0 で始まった op は 20 本の V テストと 7.1+V の N=1 boot で 0 回。 |
+| segment の load/store の fault | field を外側に回すので、fault で書く vstart は前の segment の完了を意味しない (V.9 の G7 の行) | 宣言する。再開は G7 のとおり要素 0 からなので結果は正しい。 |
 
 ### V.11 M5 の作業順とゲート
 
@@ -5010,6 +5012,7 @@ M5 で決める事項: U30 (VU の IO アクセス)、U39 (VU の要素アクセ
 進捗:
 
 - 手順 2 (H 拡張) 【M5 手順 2 で実装】: `xlate_pkg` に guest の文脈 (`XlateCtx` の V/vsatp/hgatp/vsstatus/hstatus.SPVP の field、op ごとの regime を解く `xeff`、段ごとの `stage_perm` と合成エントリの `perm_x`、`noncanon`/`gpa_big`、HFENCE の `inv_hit`) を足し、`tlb` は `{virt, vmid, s1_on}` と G-stage の権限 bit を持つ同居のエントリにした。`ptw` は 1 つの cursor で VS-stage と Sv39x4 の G-stage を歩き (状態 RES、G-stage の walk の目的 `w_fin_q`)、G-stage の A/D を owned RMW で立てる。`mem_pipe` と `ifu` は op の regime (V=1、HLV/HSV) で翻訳し、PMP は実効特権で検査する。`decode` は §C.8 の M5 行 (cause 22) と HLV/HSV (`MemOp.hlv/hlvx`、offset 0)、HINVAL、HFENCE の種類 (`opclass_pkg::sys_inv_kind`) を、`fu_sys` は VMID を、`trap_unit` は VS への委譲、htval/mtval2、GVA、htinst/mtinst を、csr は H_EN = 1 (misa の H)、hstatus/hideleg/hedeleg/henvcfg/hgatp/vsatp の WARL、V=1 の FS/VS の vsstatus への dirty、VSINH/VUINH、`o_data_virt`、dcsr の v/ebreakvs/ebreakvu を持つ。`trig_unit` は vs/vu と HLV/HSV の regime を、`commit` は vector の要素の trigger による Debug Mode の入場で vstart を書く。決めたこと: tinst の `ExcRec.implicit` (§C.3)、TLB の同居と guest の Svadu (§M.12)、GEILEN = 0 (§S.5)、U39。テスト: G0 に `m5_h.list` (H 17 本、W2/W4)、`m5_hprobe.list` (付録 B の B11、B23、B25、B40 の probe と `h_gad`)、GD に `m5_dbgh.list` (`dbgh/dm_h`)、GH に `test_w2_hvlinux`/`test_w4_hvlinux`。旧コアの H の directed 11 本と hypervisor (`test/hv`) は旧コアの逸脱に依存していたところを直した (検証計画 §7.3)。新コアの directed のうち misa の H を「無い」と確かめていた `test/priv` と、H を unserved としていた `test_decode` の 1 vector (VS の HLV.W を cause 22 に)、HFENCE の種類と VMID を知らなかった `test_sched` の reference を直した。結果: G0 は 1002 passed、4 failed (上の 3 本の修正前の `test_w{2,4}_privd_priv`、`test_sched`、`test_decode`)、85 ignored で、修正後にその 4 本が pass (合わせて 1006 passed、0 failed)。GL-B (W2) は 14,570,718 cy、record 10,417,776、hash 74d4b7982390260f で M5 手順 1 と同一 (V=0 の挙動は変わらない)。GH は W2 18,622,469 cy (instret 11,394,753)、W4 16,172,701 cy (instret 11,382,596) で pass (旧コアは 22.32M)。
+- 手順 3 (G 一覧の確認と README) 【M5 手順 3 で実装】: `m5_vprobe.list` に V の directed を 11 本足した (W2/W4、pass/fail): `v_vs_off` (G2)、`v_vs_virt` (G3)、`v_vs_dirty` (G4)、`v_vill` (G5)、`v_vstart` (G6)、`v_vld_mask` (G8)、`v_vmisalign` (G9)、`v_vpmp` と `v_vgpf` (G10)、`v_vpm` (G11)、`v_opv_sweep` (G12 と G13: OP-V の全 funct6、unary 群の sub-op、load/store の各形の 624 行を 1 つずつ実行し、実装済みは trap しないこと、予約と未実装は illegal で trap することを見る)。見つかって直したもの: (1) funct6 以外の field が予約されている vector の encoding 17 種を trap せずに実行していた (`decode` の `vec_rsv`)、(2) vector CSR への CSR 書込が VS を Dirty にしていなかった (`effect.vs_dirty`)、(3) 途中の要素で trap した load が、そのレジスタで読み終えた要素を書いていなかった (`vector_unit` の `mem_trim_wr`)。宣言した上限: G7 (vstart を無視した再開) と segment の fault 時の vstart (§V.10)。G13 の一覧は過不足なく確定した (§V.9)。README の「complete RVA23」は、V の未実装 encoding と Zvbb/Zvfhmin/Zvkt を明記する記述に直した。二段翻訳の乱数テスト `tb/test_ptw2.veryl` (`test_ptw2`、`test_tlb_h_unit`) を現在の `ptw` に移植した (memory port は `test_ptw` と同じ STORE_EXCL と coherence の退出、VS-stage は Svade、requester は key の無い VA を送らない、fence には full kill が続く)。これが `ptw` のバグを 1 つ見つけた: V = 0 の walk が A=0 の leaf で、権限の無い access のためにも A を立てに行き、PTE のページが書込不可だと page fault ではなく access fault を返していた。A を立てるのは許された access だけにした (`leaf_bad`)。結果: G0 は 1030 passed (手順 2 の 1006 + vprobe 22 + `test_ptw2`、`test_tlb_h_unit`)、0 failed、85 ignored。7.1+V の N=1 boot (W2) は 20,778,460 cy、hash 4716d470177c4bdf で手順 1 と同一。
 
 ### M6: 既定コアの切替
 
