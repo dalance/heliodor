@@ -76,17 +76,15 @@ _start:
     csrw    mideleg, zero
     csrw    mie, zero
 
-    # misa: RV64, I M C S U, no H
+    # misa: RV64, I M C H S U
     STEP 2
     csrr    t1, misa
     srli    t2, t1, 62
     li      t0, 2
     bne     t2, t0, fail
-    li      t0, (1 << 8) | (1 << 12) | (1 << 2) | (1 << 18) | (1 << 20)
+    li      t0, (1 << 8) | (1 << 12) | (1 << 2) | (1 << 7) | (1 << 18) | (1 << 20)
     and     t2, t1, t0
     bne     t2, t0, fail
-    andi    t2, t1, (1 << 7)
-    bnez    t2, fail
     # mhartid of hart 0; the trigger registers read zero without trapping
     csrr    t1, mhartid
     bnez    t1, fail
