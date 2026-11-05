@@ -2,7 +2,7 @@
 # Run the riscv-tests debug suite (gdbserver.py) against spike, one test per
 # process, and write "<test> <status>" lines to the output file.
 #
-# Usage: run_spike_ref.sh <spike64|spike64-2> <out.txt> [jobs]
+# Usage: run_spike_ref.sh <spike64|spike64-2|path/to/target.py> <out.txt> [jobs]
 # Env:   UPSTREAM  riscv-tests clone (default: test/riscv-arch-test/upstream)
 #        LOGDIR    per-test logs (default: a fresh temp dir)
 # Needs on PATH (source toolchain/env.sh): spike, openocd, riscv64-unknown-elf-gdb,
@@ -18,6 +18,7 @@ upstream="${UPSTREAM:-$root/test/riscv-arch-test/upstream}"
 logdir="${LOGDIR:-$(mktemp -d)}"
 dbg="$upstream/debug"
 tfile="$dbg/targets/RISC-V/$target.py"
+[ -f "$target" ] && tfile="$(realpath "$target")"
 
 mkdir -p "$logdir"
 tests="$("$dbg/gdbserver.py" --list-tests "$tfile")"
