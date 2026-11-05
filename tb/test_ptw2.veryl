@@ -1,0 +1,1873 @@
+// Two-stage tlb + ptw walking test (guest walks: V = 1 and HLV/HSV/HLVX).
+//
+// Host memory holds the G-stage tables (Sv39x4, root at 0x8000_0000) and the
+// VS-stage tables (Sv39, at GPAs the G-stage maps 1:1 onto the same host
+// pages); the V = 0 regime walks the VS tables directly as an Sv39 table, so
+// V = 0 and guest entries of the same address share the tlb. The PTEs are a
+// pure function of (SEED, slot, version): pointers, leaves at every level of
+// both stages, napot groups, invalid and reserved encodings, misaligned
+// superpages, pointers to GPAs beyond Sv39x4, into IO and holes, G-stage
+// leaves of table pages without R, W or U, and PMP-denied and read-only
+// table pages. The memory port answers like the one of test_ptw (random
+// ready, RESP_LAT responses with misses, fill events and retries,
+// STORE_EXCL answered EXCL_PASS, EXCL_FAIL or RETRY, random departures of
+// the walker's line). A synthetic requester plays the LQ/SQ (or the IFU)
+// with random ops under random contexts (vsatp/hgatp Bare or not, V, SPVP,
+// SUM and MXR at both levels, ADUE), partial and full kills, nonspec
+// stores, remaps with their fences (SFENCE.VMA then HFENCE.VVMA for a VS
+// table, HFENCE.GVMA for a G table) and fences without a remap. Like the
+// memory pipe it sends no VA without a translation key (non-canonical, or a
+// GPA beyond Sv39x4 under a Bare first stage).
+//
+// Checked against a reference two-stage walk over the current memory: every
+// owner response (exc with cause, tval, gpa, gva and implicit, pa, pma,
+// need_d), every tlb hit on the lookup ports (composed level, PA, both
+// stages' bits, PBMT), every A/D write (only A/D change; a D bit only for a
+// live nonspec op; a guest walk writes G-stage PTEs only, its VS-stage being
+// Svade), every PTE read (pte_ok and PMP), liveness of every accepted
+// request and the checkers.
+module ptw2_harness::<CFG: core_cfg> #(
+    param SEED : logic<64> = 1    ,
+    param ISIDE: bit       = 0    ,
+    param NCYC : u32       = 48000,
+) (
+    clk   : input  clock    ,
+    rst   : input  reset    ,
+    o_done: output logic    ,
+    o_pass: output logic    ,
+    o_err : output logic<16>,
+    o_cov : output logic<32>,
+    o_chk : output logic<6> ,
+) {
+    import core_types::<CFG>::*;
+    import xlate_pkg::*;
+
+    const LP  : u32 = if ISIDE ? 1 : CFG::MEM_W;
+    const TN  : u32 = if ISIDE ? CFG::ITLB_N : CFG::DTLB_N;
+    const QN  : u32 = if ISIDE ? CFG::PTW_I_QN : CFG::PTW_D_QN;
+    const NS  : u32 = 8; // op slots
+    const MS  : u32 = 1196; // modelled PTE slots
+    const RL  : u32 = fu_pkg::RESP_LAT;
+    const NCK : u32 = LP + 1; // reference walks: one per lookup port + the response
+    const LIVE: u32 = 8000;
+
+    const ATTR_DRAM: pma_pkg::PmaAttr       = pma_pkg::PmaAttr'{
+        target       : pma_pkg::Target::DRAM  ,
+        backed       : 1                      ,
+        cacheable    : 1                      ,
+        coherent     : 1                      ,
+        executable   : 1                      ,
+        amo          : pma_pkg::AmoClass::FULL,
+        idempotent   : 1                      ,
+        io_ordered   : 0                      ,
+        misaligned_ok: 1                      ,
+        pte_ok       : 1                      ,
+        cbo_ok       : 1
+    };
+    const ATTR_IO  : pma_pkg::PmaAttr       = pma_pkg::PmaAttr'{
+        target       : pma_pkg::Target::IO    ,
+        backed       : 1                      ,
+        cacheable    : 0                      ,
+        coherent     : 0                      ,
+        executable   : 0                      ,
+        amo          : pma_pkg::AmoClass::NONE,
+        idempotent   : 0                      ,
+        io_ordered   : 1                      ,
+        misaligned_ok: 0                      ,
+        pte_ok       : 0                      ,
+        cbo_ok       : 0
+    };
+    // DRAM [0, 512 MiB) and [2 GiB, 3 GiB), IO [1 GiB, 2 GiB), holes elsewhere
+    const PMA_T    : pma_pkg::PmaRegion [3] = '{
+        pma_pkg::PmaRegion'{base: 56'h0, mask: 56'hff_ffff_e000_0000, attr: ATTR_DRAM},
+        pma_pkg::PmaRegion'{base: 56'h8000_0000, mask: 56'hff_ffff_c000_0000, attr: ATTR_DRAM},
+        pma_pkg::PmaRegion'{base: 56'h4000_0000, mask: 56'hff_ffff_c000_0000, attr: ATTR_IO}
+    };
+
+    // NAPOT: entry 0 the VS L0 table page 0x61 with no permission, entries 1-3
+    // read-only (the data 64 KiB at 0x8100_0000, the G L0 table page 0x8001f,
+    // the VS L0 table page 0x7f), entry 4 everything.
+    const PMPCFG : logic<64> [2]  = '{64'h0000_001f_1919_1918, 64'h0};
+    const PMPADDR: logic<64> [16] = '{
+        64'h1_85ff, 64'h2040_1fff, 64'h2000_7dff, 64'h1_fdff, 64'h003f_ffff_ffff_ffff, 64'h0, 64'h0, 64'h0, 64'h0, 64'h0,
+        64'h0, 64'h0, 64'h0, 64'h0, 64'h0, 64'h0
+    };
+
+    const G_ROOT : logic<44> = 44'h80000;
+    const VS_ROOT: logic<44> = 44'h40;
+
+    enum RK: logic<3> {
+        OK,
+        PAGE,
+        GUEST,
+        ACC,
+        NOENT, // lookup reference only: no entry may exist (A = 0 on the path)
+    }
+
+    // ---- page table model ----
+
+    function mix (
+        x: input logic<64>,
+    ) -> logic<64> {
+        var z: logic<64>;
+        z = x + 64'h9e37_79b9_7f4a_7c15;
+        z = (z ^ (z >> 30)) * 64'hbf58_476d_1ce4_e5b9;
+        z = (z ^ (z >> 27)) * 64'h94d0_49bb_1331_11eb;
+        return z ^ (z >> 31);
+    }
+
+    // {ok, slot}. G root 0x80000 [0..8), G L1 0x80004+t [0..8), G L0 0x80010
+    // [0..128) (the GPA identity region of the tables) and 0x80011+m [0..32),
+    // VS root 0x40 [0..4), VS L1 0x41+t [0..8), VS L0 0x60+m [0..16).
+    function slot_of (
+        pa: input pma_pkg::Pa,
+    ) -> logic<12> {
+        var r : logic<32>;
+        var ok: logic    ;
+        let pn: logic<44> = pa[55:12];
+        let ix: logic<32> = {23'd0, pa[11:3]};
+        ok = 1'b1;
+        r  = 0;
+        if pn == 44'h80000 && ix <: 8 {
+            r = ix;
+        } else if pn >= 44'h80004 && pn <= 44'h80007 && ix <: 8 {
+            r = 8 + (pn[31:0] - 32'h80004) * 8 + ix;
+        } else if pn == 44'h80010 && ix <: 128 {
+            r = 40 + ix;
+        } else if pn >= 44'h80011 && pn <= 44'h8001f && ix <: 32 {
+            r = 168 + (pn[31:0] - 32'h80011) * 32 + ix;
+        } else if pn == 44'h40 && ix <: 4 {
+            r = 648 + ix;
+        } else if pn >= 44'h41 && pn <= 44'h44 && ix <: 8 {
+            r = 652 + (pn[31:0] - 32'h41) * 8 + ix;
+        } else if pn >= 44'h60 && pn <= 44'h7f && ix <: 16 {
+            r = 684 + (pn[31:0] - 32'h60) * 16 + ix;
+        } else {
+            ok = 1'b0;
+        }
+        return {ok, r[10:0]};
+    }
+
+    function pte_ptr (
+        ppn: input logic<44>,
+    ) -> logic<64> {
+        return {10'd0, ppn, 10'b00_0000_0001};
+    }
+
+    // perms: {x, w, r} among r, rw, rx, rwx, x, rw, r, rwx; U clear 1 in 8,
+    // A clear 1 in 4, D clear 1 in 4, PBMT NC or IO 1 in 4 each
+    function pte_leaf (
+        ppn: input logic<44>,
+        h  : input logic<64>,
+    ) -> logic<64> {
+        var rwx : logic<3>;
+        var pbmt: logic<2>;
+        rwx  = case h[5:3] {
+            3'd0   : 3'b001,
+            3'd1   : 3'b011,
+            3'd2   : 3'b101,
+            3'd3   : 3'b111,
+            3'd4   : 3'b100,
+            3'd5   : 3'b011,
+            3'd6   : 3'b001,
+            default: 3'b111,
+        };
+        pbmt = if h[13:11] == 3'd0 ? 2'd1 : if h[13:11] == 3'd1 ? 2'd2 : 2'd0;
+        return {1'b0, pbmt, 7'd0, ppn, 2'd0, h[10] || h[9], h[8] || h[7], 1'b0, h[33:31] != 3'd0, rwx, 1'b1};
+    }
+
+    // Reserved encodings; variant 6 (PBMT = NC) faults only without PBMTE.
+    function pte_bad (
+        lvl: input logic<2> ,
+        ppn: input logic<44>,
+        pt : input logic<44>,
+        h  : input logic<64>,
+    ) -> logic<64> {
+        let lf: logic<64> = pte_leaf(ppn, h);
+        let p : logic<64> = pte_ptr(pt);
+        return case h[18:16] {
+            3'd0   : {lf[63:4], 3'b010, 1'b1},
+            3'd1   : lf | 64'h0040_0000_0000_0000,
+            3'd2   : {lf[63], 2'b11, lf[60:0]},
+            3'd3   : p | 64'h40,
+            3'd4   : p | 64'h8000_0000_0000_0000,
+            3'd5   : {1'b1, lf[62:14], 4'b0001, lf[9:0]},
+            3'd6   : {lf[63], 2'b01, lf[60:0]},
+            default: if lvl == 2'd0 ? p : p | 64'h10,
+        };
+    }
+
+    // G-stage PTEs (PPNs are host PPNs). Root slot i covers GPA[40:30] = i,
+    // L1 table t covers the first 16 MiB of GPA t GiB, L0 table 0 the GPA
+    // pages 0..127 (the VS table pages map 1:1 there).
+    function gen_g (
+        s  : input logic<11>,
+        ver: input logic<16>,
+    ) -> logic<64> {
+        var r : logic<64>;
+        var h : logic<64>;
+        var hg: logic<64>;
+        var t : logic<11>;
+        var pp: logic<44>;
+        h = mix(SEED ^ {32'd0, ver, 5'd1, s});
+        if s <: 11'd8 {
+            pp = case h[22:20] {
+                3'd3   : 44'h80000,
+                3'd4   : 44'h40000,
+                3'd5   : 44'hc0000,
+                3'd6   : 44'h00001,
+                default: 44'h0,
+            };
+            if (s == 11'd0 && (ver == 16'd0 || h[3])) || h[2:0] <: 3'd4 {
+                r = pte_ptr(44'h80004 + {42'd0, s[1:0]});
+            } else {
+                r = case h[2:0] {
+                    3'd4   : pte_leaf(pp, h),
+                    3'd5   : {h[63:1], 1'b0},
+                    3'd6   : pte_bad(2'd2, pp, 44'h80004, h),
+                    default: pte_ptr(44'h30000),
+                };
+            }
+        } else if s <: 11'd40 {
+            t  = s - 11'd8;
+            pp = case h[22:20] {
+                3'd3   : 44'h81000,
+                3'd4   : 44'h40200,
+                3'd5   : 44'h30000,
+                3'd6   : 44'h81001,
+                default: {35'd0, t[2:0], 6'd0} << 3,
+            };
+            if (t == 11'd0 && (ver == 16'd0 || h[3])) || h[2:0] <: 3'd4 {
+                r = pte_ptr(if t == 11'd0 ? 44'h80010 : 44'h80011 + {40'd0, t[3:0] % 4'd15});
+            } else {
+                r = case h[2:0] {
+                    3'd4   : pte_leaf(pp, h),
+                    3'd5   : {h[63:1], 1'b0},
+                    3'd6   : pte_bad(2'd1, pp, 44'h80011, h),
+                    default: pte_ptr(44'h40010),
+                };
+            }
+        } else if s <: 11'd168 {
+            t = s - 11'd40;
+            if t >= 11'h40 {
+                // a VS table page: mostly the identity, readable and writable
+                r = case h[2:0] {
+                    3'd6   : {h[63:1], 1'b0},
+                    3'd7   : pte_bad(2'd0, {33'd0, t}, 44'h80011, h),
+                    default: pte_leaf({33'd0, t}, {h[63:6], (if h[5:3] == 3'd6 ? 3'd0 : if h[5:3] == 3'd7 ? 3'd4 : 3'd1), h[2:0]}),
+                };
+            } else {
+                pp = if h[22:20] <: 3'd5 ? {33'd0, t} : if h[22:20] == 3'd5 ? 44'h81000 + {40'd0, h[27:24]} : 44'h40000 + {33'd0, t};
+                r  = case h[2:0] {
+                    3'd6   : {h[63:1], 1'b0},
+                    3'd7   : pte_bad(2'd0, pp, 44'h80011, h),
+                    default: pte_leaf(pp, h),
+                };
+            }
+        } else {
+            t  = s - 11'd168;
+            hg = mix(SEED ^ {32'd0, ver, 1'b1, 3'd1, 4'd0, t[8:4]});
+            pp = case h[22:20] {
+                3'd4   : {36'd0, h[27:20]},
+                3'd5   : 44'h40000 + {36'd0, h[27:20]},
+                3'd6   : 44'h30000 + {36'd0, h[27:20]},
+                3'd7   : 44'h80010,
+                default: 44'h81000 + {36'd0, h[27:20]},
+            };
+            if hg[1:0] == 2'd0 {
+                r = pte_leaf(44'h81000 | {36'd0, hg[27:24], 4'b1000}, {h[63:6], 3'd3, h[2:0]}) | 64'h8000_0000_0000_0000;
+            } else {
+                r = case h[2:0] {
+                    3'd5   : pte_bad(2'd0, pp, 44'h80011, h),
+                    3'd6   : {h[63:1], 1'b0},
+                    3'd7   : pte_bad(2'd0, pp, 44'h80011, h),
+                    default: pte_leaf(pp, h),
+                };
+            }
+        }
+        return r;
+    }
+
+    // VS-stage PTEs (PPNs are GPA PPNs). Root slot i, L1 table t = i, L0
+    // table m = 8i + j: a VS L0 slot belongs to exactly one GVA page.
+    function gen_vs (
+        s  : input logic<11>,
+        ver: input logic<16>,
+    ) -> logic<64> {
+        var r : logic<64>;
+        var h : logic<64>;
+        var hg: logic<64>;
+        var t : logic<11>;
+        var pp: logic<44>;
+        h = mix(SEED ^ {32'd0, ver, 5'd2, s});
+        if s <: 11'd652 {
+            t  = s - 11'd648;
+            pp = case h[22:20] {
+                3'd3   : 44'h40000,
+                3'd4   : 44'h80000,
+                3'd5   : 44'hc0000,
+                3'd6   : 44'h40001,
+                default: 44'h0,
+            };
+            if (t == 11'd0 && (ver == 16'd0 || h[3])) || h[2:0] <: 3'd4 {
+                r = pte_ptr(44'h41 + {42'd0, t[1:0]});
+            } else {
+                r = case h[2:0] {
+                    3'd4   : pte_leaf(pp, h),
+                    3'd5   : {h[63:1], 1'b0},
+                    3'd6   : pte_bad(2'd2, pp, 44'h41, h),
+                    default: pte_ptr(if h[3] ? 44'h2000_0041 : 44'h7f0),
+                };
+            }
+        } else if s <: 11'd684 {
+            t  = s - 11'd652;
+            pp = {24'd0, h[17:16], h[20:18], 6'd0, 9'd0} | (if h[22:21] == 2'd3 ? 44'h1 : 44'h0);
+            if h[2:0] <: 3'd4 {
+                r = pte_ptr(44'h60 + {39'd0, t[4:0]});
+            } else {
+                r = case h[2:0] {
+                    3'd4   : pte_leaf(pp, h),
+                    3'd5   : {h[63:1], 1'b0},
+                    3'd6   : pte_bad(2'd1, pp, 44'h60, h),
+                    default: pte_ptr(44'h2000_0060),
+                };
+            }
+        } else {
+            t  = s - 11'd684;
+            hg = mix(SEED ^ {32'd0, ver, 1'b1, 3'd2, 3'd0, t[9:4]});
+            pp = if h[28:27] == 2'd3 ? 44'h40 + {40'd0, h[24:21]} : {24'd0, h[17:16], 6'd0, h[20:18], 3'd0, h[26:21]};
+            if hg[1:0] == 2'd0 {
+                r = pte_leaf({24'd0, hg[9:8], 6'd0, hg[12:10], 4'd0, hg[13], 4'b1000}, {h[63:6], 3'd3, h[2:0]})
+                    | 64'h8000_0000_0000_0000;
+            } else {
+                r = case h[2:0] {
+                    3'd5   : pte_bad(2'd0, pp, 44'h60, h),
+                    3'd6   : {h[63:1], 1'b0},
+                    3'd7   : pte_bad(2'd0, pp, 44'h60, h),
+                    default: pte_leaf(pp, h),
+                };
+            }
+        }
+        return r;
+    }
+
+    function gen_slot (
+        s  : input logic<11>,
+        ver: input logic<16>,
+    ) -> logic<64> {
+        return if s <: 11'd648 ? gen_g(s, ver) : gen_vs(s, ver);
+    }
+
+    function pte_rd_deny (
+        pa: input pma_pkg::Pa,
+    ) -> logic {
+        let a: pma_pkg::PmaAttr = pma_check::<3>(pa, PMA_T);
+        return !a.pte_ok || pa[55:12] == 44'h61;
+    }
+
+    function pte_wr_deny (
+        pa: input pma_pkg::Pa,
+    ) -> logic {
+        return pa[55:12] == 44'h61 || pa[55:12] == 44'h8001f || pa[55:12] == 44'h7f;
+    }
+
+    function ref_pmp_deny (
+        pa : input pma_pkg::Pa,
+        acc: input AccKind    ,
+    ) -> logic {
+        let p0: logic = pa[55:12] == 44'h61;
+        let ro: logic = pa[55:16] == 40'h8100 || pa[55:12] == 44'h8001f || pa[55:12] == 44'h7f;
+        return p0 || (ro && acc != AccKind::LOAD && acc != AccKind::CBO);
+    }
+
+    function ref_pa (
+        pte: input logic<64>,
+        lvl: input logic<2> ,
+        va : input logic<64>,
+    ) -> pma_pkg::Pa {
+        let ppn: logic<44> = if pte[63] ? {pte[53:14], va[15:12]} : pte[53:10];
+        return case lvl {
+            2'd2   : {ppn[43:18], va[29:0]},
+            2'd1   : {ppn[43:9], va[20:0]},
+            default: {ppn, va[11:0]},
+        };
+    }
+
+    // {fault, leaf} of a PTE at level lvl
+    function ref_shape (
+        p    : input logic<64>,
+        lvl  : input logic<2> ,
+        pbmte: input logic    ,
+        adue : input logic    ,
+    ) -> logic<2> {
+        let leaf: logic = p[1] || p[3];
+        var bad : logic;
+        if !p[0] || (p[2] && !p[1]) || p[60:54] != 7'd0 {
+            bad = 1'b1;
+        } else if leaf {
+            bad = p[62:61] == 2'd3 || (!pbmte && p[62:61] != 2'd0) || (p[63] && (lvl != 2'd0 || p[13:10] != 4'b1000))
+                || (lvl == 2'd2 && p[27:10] != 18'd0) || (lvl == 2'd1 && p[18:10] != 9'd0) || (!p[6] && !adue);
+        } else {
+            bad = lvl == 2'd0 || p[63] || p[62:61] != 2'd0 || p[7] || p[6] || p[4];
+        }
+        return {bad, leaf};
+    }
+
+    // {ok, need_d}
+    function ref_perm (
+        pte : input logic             <64>,
+        acc : input AccKind               ,
+        prv : input csr_pkg::PrivLevel    ,
+        sum : input logic                 ,
+        mxr : input logic                 ,
+        hlvx: input logic                 ,
+        adue: input logic                 ,
+    ) -> logic<2> {
+        var al: logic;
+        let st: logic = acc == AccKind::STORE || acc == AccKind::AMO;
+        al = case acc {
+            AccKind::LOAD : if hlvx ? pte[3] : pte[1] || (mxr && pte[3]),
+            AccKind::FETCH: pte[3],
+            AccKind::CBO  : pte[1] || pte[2],
+            default       : pte[2],
+        };
+        if prv == csr_pkg::PrivLevel::USER && !pte[4] {
+            al = 1'b0;
+        }
+        if prv == csr_pkg::PrivLevel::SUPERVISOR && pte[4] && (!sum || acc == AccKind::FETCH) {
+            al = 1'b0;
+        }
+        if al && st && !pte[7] {
+            return if adue ? 2'b11 : 2'b00;
+        }
+        return {al, 1'b0};
+    }
+
+    // ---- state ----
+
+    var cyc_q  : logic   <32>     ;
+    var err_q  : logic   <16>     ;
+    var cov_q  : logic   <32>     ;
+    var mem    : logic   <64> [MS];
+    var mem_w  : logic        [MS];
+    var ctx_q  : XlateCtx         ;
+    var kill_q : Kill             ;
+    var inv_q  : TlbInv           ;
+    var drop_q : logic            ;
+    var oe_q   : logic            ;
+    var hot_q  : logic   <64>     ;
+    var lrd_v_q: logic            ;
+    var lrd_s_q: logic   <11>     ;
+    var gw_q   : logic            ; // the running walk is a guest walk
+    var coh_v  : logic        [COH_N];
+    var coh_ln : logic   <50> [COH_N];
+    var mslot  : logic            ;
+
+    // a remap: a fence of the V = 0 entries (VS tables only), then the guest
+    // fence on whose edge the new PTEs land, then a full kill. A pure fence
+    // is followed by the full kill too: a fence retires with a flush, and a
+    // walk it makes stale answers no owner.
+    var md_ph_q  : logic<2> ; // 1: V = 0 fence now, 2: guest fence now, 3: kill now
+    var md_s_q   : logic<11>;
+    var md_n_q   : logic<5> ;
+    var md_ver_q : logic<16>;
+    var md_inv2_q: TlbInv   ;
+    var md_g_q   : logic    ; // a G-stage remap (its kill may change the VMID)
+    var kvm_q    : logic    ; // kill_q is the kill of a G-stage remap
+
+    // op slots
+    var o_act  : logic       [NS];
+    var o_accd : logic       [NS];
+    var o_own  : logic       [NS];
+    var o_tag  : RobTag      [NS];
+    var o_va   : logic  <64> [NS];
+    var o_acc  : AccKind     [NS];
+    var o_hlv  : logic       [NS];
+    var o_hlvx : logic       [NS];
+    var o_ns   : logic       [NS];
+    var o_age  : logic  <16> [NS];
+    var o_nev  : logic  <4>  [NS];
+    var snd_v  : logic           ;
+    var snd_s  : logic  <3>      ;
+    var alloc_q: RobTag          ;
+
+    let rnd : logic<64> = mix(SEED ^ {cyc_q, 32'h5a5a_0001});
+    let rnd2: logic<64> = mix(SEED ^ {cyc_q, 32'h5a5a_0002});
+    let rnd3: logic<64> = mix(SEED ^ {cyc_q, 32'h5a5a_0003});
+    let rnd4: logic<64> = mix(SEED ^ {cyc_q, 32'h5a5a_0004});
+    let rnd5: logic<64> = mix(SEED ^ {cyc_q, 32'h5a5a_0005});
+    let run : logic     = cyc_q <: NCYC;
+
+    // GVA i < 4 (or < 8), j < 8, k < 16 (or < 128); a few non-canonical,
+    // beyond Sv39x4 or in the upper half
+    function rnd_va (
+        h: input logic<64>,
+    ) -> logic<64> {
+        let i : logic<9>  = if h[40:38] == 3'd0 ? {6'd0, h[2:0]} : {7'd0, h[1:0]};
+        let j : logic<9>  = {6'd0, h[5:3]};
+        let k : logic<9>  = if h[44:42] == 3'd0 ? {2'd0, h[12:6]} : {5'd0, h[9:6]};
+        let va: logic<64> = {25'd0, i, j, k, h[24:13]};
+        return case h[50:47] {
+            4'd0   : va | 64'h40_0000_0000,
+            4'd1   : va | 64'h200_0000_0000,
+            4'd2   : va | 64'hffff_ffc0_0000_0000,
+            default: va,
+        };
+    }
+
+    // Whether va has a translation key under the regime of hlv.
+    function keyed (
+        c  : input XlateCtx ,
+        hlv: input logic    ,
+        va : input logic<64>,
+    ) -> logic {
+        let x: XEff = xeff(c, hlv);
+        return !noncanon(x, va) && !gpa_big(x, va);
+    }
+
+    function op_regime (
+        hlv : input logic,
+        virt: input logic,
+    ) -> Regime {
+        return if hlv ? Regime::HLV : if virt ? Regime::V1 : Regime::V0;
+    }
+
+    // ---- DUT ----
+
+    var lk   : TlbLookup    [LP];
+    var lk_va: logic    <64> [LP];
+    var lk_h : logic         [LP]; // the lookup's hlv
+    var ent  : TlbEntry     [LP];
+    var fill : TlbFill          ;
+    var tperf: TlbPerf          ;
+    var tchk : logic    <2>     ;
+
+    var req_v: logic       ;
+    var req  : XlateReq    ;
+    var rdy  : logic       ;
+    var resp : XlateResp   ;
+    var evt  : PtwEvent    ;
+    var mv   : logic       ;
+    var mreq : MemReq      ;
+    var mrdy : logic       ;
+    var mrsp : MemResp     ;
+    var mev  : MemEvent    ;
+    var pperf: PtwPerf     ;
+    var pchk : logic    <4>;
+
+    inst u_tlb: tlb #(
+        ENTRIES     : TN,
+        LOOKUP_PORTS: LP,
+    ) (
+        clk          ,
+        rst          ,
+        i_lk  : lk   ,
+        o_lk  : ent  ,
+        i_fill: fill ,
+        i_inv : inv_q,
+        o_chk : tchk ,
+        o_perf: tperf,
+    );
+
+    inst u_ptw: ptw::<CFG> #(
+        QN     : QN   ,
+        PMA_N  : 3    ,
+        PMA_TBL: PMA_T,
+    ) (
+        clk                      ,
+        rst                      ,
+        i_kill          : kill_q ,
+        i_owner_drop    : drop_q ,
+        i_req_valid     : req_v  ,
+        i_req           : req    ,
+        o_req_ready     : rdy    ,
+        i_ctx           : ctx_q  ,
+        i_pmpcfg        : PMPCFG ,
+        i_pmpaddr       : PMPADDR,
+        i_inv           : inv_q  ,
+        i_ordering_empty: oe_q   ,
+        i_coh_v         : coh_v  ,
+        i_coh_line      : coh_ln ,
+        o_fill          : fill   ,
+        o_resp          : resp   ,
+        o_evt           : evt    ,
+        o_mem_valid     : mv     ,
+        o_mem_req       : mreq   ,
+        i_mem_ready     : mrdy   ,
+        i_mem_slot      : mslot  ,
+        o_mem_av        : _      ,
+        i_mem_resp      : mrsp   ,
+        i_mem_evt       : mev    ,
+        o_idle          : _      ,
+        o_chk           : pchk   ,
+        o_perf          : pperf  ,
+    );
+
+    // ---- requester ----
+
+    always_comb {
+        req_v          = snd_v && o_act[snd_s] && !o_accd[snd_s];
+        req            = '0;
+        req.valid      = 1'b1;
+        req.tag.client = if ISIDE ? MemClient::IFU : if o_acc[snd_s] == AccKind::LOAD ? MemClient::LQ : MemClient::SQ;
+        req.tag.id     = snd_s as MEMID_W;
+        req.tag.rob_v  = !ISIDE;
+        req.tag.rob    = o_tag[snd_s];
+        req.va         = o_va[snd_s];
+        req.acc        = o_acc[snd_s];
+        req.hlv        = o_hlv[snd_s];
+        req.hlvx       = o_hlvx[snd_s];
+        req.nonspec    = o_ns[snd_s];
+    }
+    let acc_now   : logic = req_v && rdy;
+    let in_gone_tb: logic = if ISIDE ? kill_q.valid || drop_q : killed(kill_q, o_tag[snd_s]);
+
+    // ---- reference walks: lookup ports, then the response ----
+
+    let rs_s: logic<3> = resp.tag.id[2:0];
+
+    var ck_va  : logic  <64> [NCK];
+    var ck_hlv : logic       [NCK];
+    var ck_hlvx: logic       [NCK];
+    var ck_acc : AccKind     [NCK];
+    var ck_ns  : logic       [NCK];
+    var ck_sm  : logic       [NCK]; // a lookup: no access, the path only
+
+    var rk  : RK              [NCK];
+    var rimp: logic           [NCK]; // the fault is of an implicit access
+    var rgpa: logic      <64> [NCK];
+    var rs1 : logic      <64> [NCK]; // first-stage leaf
+    var rs1l: logic      <2>  [NCK];
+    var rg  : logic      <64> [NCK]; // G-stage leaf of the final GPA
+    var rgl : logic      <2>  [NCK];
+    var rhpa: pma_pkg::Pa     [NCK];
+    var rnd_: logic           [NCK]; // need_d
+
+    always_comb {
+        for l in 0..LP {
+            ck_va[l]   = lk_va[l];
+            ck_hlv[l]  = lk_h[l];
+            ck_hlvx[l] = 1'b0;
+            ck_acc[l]  = AccKind::LOAD;
+            ck_ns[l]   = 1'b0;
+            ck_sm[l]   = 1'b1;
+        }
+        ck_va[LP]   = o_va[rs_s];
+        ck_hlv[LP]  = o_hlv[rs_s];
+        ck_hlvx[LP] = o_hlvx[rs_s];
+        ck_acc[LP]  = o_acc[rs_s];
+        ck_ns[LP]   = o_ns[rs_s];
+        ck_sm[LP]   = 1'b0;
+    }
+
+    for c in 0..NCK :g_ref {
+        always_comb {
+            var x    : XEff          ;
+            var fin  : logic         ;
+            var last : logic         ;
+            var gpa  : logic     <64>;
+            var s1l  : logic     <2> ;
+            var sl   : logic     <12>;
+            var p    : logic     <64>;
+            var sh   : logic     <2> ;
+            var gl   : logic     <2> ;
+            var gpp  : pma_pkg::Pa   ;
+            var gdone: logic         ;
+            var gleaf: logic     <64>;
+            var glv  : logic     <2> ;
+            var ghpa : pma_pkg::Pa   ;
+            var pm   : logic     <2> ;
+            var wpm  : logic     <2> ;
+            var nwr  : logic         ;
+            var gnd  : logic         ;
+            let va   : logic     <64> = ck_va[c];
+            let acc  : AccKind        = ck_acc[c];
+            let sm   : logic          = ck_sm[c];
+            x       = xeff(ctx_q, ck_hlv[c]);
+            rk[c]   = RK::OK;
+            rimp[c] = 1'b0;
+            rgpa[c] = 64'd0;
+            rs1[c]  = 64'd0;
+            rs1l[c] = 2'd0;
+            rg[c]   = '1;
+            rgl[c]  = 2'd2;
+            rhpa[c] = '0;
+            rnd_[c] = 1'b0;
+            fin     = 1'b0;
+            last    = !x.s1_on;
+            s1l     = 2'd2;
+            gpa     = if x.s1_on ? {8'd0, x.root, va[38:30], 3'd0} : va;
+            gleaf   = '1;
+            glv     = 2'd2;
+            gpp     = '0;
+            ghpa    = '0;
+            gnd     = 1'b0;
+            if (if x.s1_on ? va[63:38] != '0 && va[63:38] != '1 : va[63:41] != '0) {
+                rk[c]   = if x.s1_on ? RK::PAGE : RK::GUEST;
+                rgpa[c] = va;
+                fin     = 1'b1;
+            }
+            for stp in 0..4 {
+                if !fin {
+                    // G-stage translation of gpa: for the next PTE, or final
+                    gdone = 1'b0;
+                    if x.g_on {
+                        gpp = {x.groot[43:2], gpa[40:30], 3'd0};
+                        gl  = 2'd2;
+                        if gpa[63:41] != '0 {
+                            rk[c]   = RK::GUEST;
+                            rgpa[c] = gpa;
+                            rimp[c] = !last;
+                            fin     = 1'b1;
+                        }
+                        for gs in 0..3 {
+                            if !fin && !gdone {
+                                if pte_rd_deny(gpp) {
+                                    rk[c] = RK::ACC;
+                                    fin   = 1'b1;
+                                } else {
+                                    sl = slot_of(gpp);
+                                    p  = if !sl[11] ? 64'd0 : if mem_w[sl[10:0]] ? mem[sl[10:0]] : gen_slot(sl[10:0], 16'd0);
+                                    sh = ref_shape(p, gl, x.gpbmte, x.gadue);
+                                    if sh[1] {
+                                        rk[c]   = RK::GUEST;
+                                        rgpa[c] = gpa;
+                                        rimp[c] = !last;
+                                        fin     = 1'b1;
+                                    } else if !sh[0] {
+                                        gpp = {p[53:10], (if gl == 2'd2 ? gpa[29:21] : gpa[20:12]), 3'd0};
+                                        gl  = gl - 2'd1;
+                                    } else {
+                                        gdone = 1'b1;
+                                        gleaf = p;
+                                        glv   = gl;
+                                    }
+                                }
+                            }
+                        }
+                        if gdone && !fin {
+                            pm  = ref_perm(gleaf, (if last ? acc : AccKind::LOAD), csr_pkg::PrivLevel::USER, 1'b0, x.gmxr,
+                                last && ck_hlvx[c], x.gadue);
+                            nwr = !gleaf[6] || (last && !sm && ck_ns[c] && pm[0]);
+                            if (!last || !sm) && !pm[1] {
+                                rk[c]   = RK::GUEST;
+                                rgpa[c] = gpa;
+                                rimp[c] = !last;
+                                fin     = 1'b1;
+                            } else if sm && !gleaf[6] {
+                                rk[c] = RK::NOENT;
+                                fin   = 1'b1;
+                            } else if nwr && pte_wr_deny(gpp) {
+                                rk[c] = RK::ACC;
+                                fin   = 1'b1;
+                            } else if last && !sm && !ck_ns[c] && pm[0] {
+                                gnd = 1'b1;
+                            }
+                            ghpa = ref_pa(gleaf, glv, gpa);
+                        }
+                    } else {
+                        ghpa  = gpa[55:0];
+                        gleaf = '1;
+                        glv   = 2'd2;
+                    }
+                    if !fin {
+                        if last {
+                            rhpa[c] = ghpa;
+                            rg[c]   = gleaf;
+                            rgl[c]  = glv;
+                            rnd_[c] = rnd_[c] || gnd;
+                            fin     = 1'b1;
+                        } else if pte_rd_deny(ghpa) {
+                            rk[c] = RK::ACC;
+                            fin   = 1'b1;
+                        } else {
+                            sl = slot_of(ghpa);
+                            p  = if !sl[11] ? 64'd0 : if mem_w[sl[10:0]] ? mem[sl[10:0]] : gen_slot(sl[10:0], 16'd0);
+                            sh = ref_shape(p, s1l, x.pbmte, x.adue);
+                            pm = ref_perm(p, acc, x.prv, x.sum, x.mxr, ck_hlvx[c], x.adue);
+                            if sh[1] || (sh[0] && !sm && !pm[1]) {
+                                rk[c] = RK::PAGE;
+                                fin   = 1'b1;
+                            } else if !sh[0] {
+                                gpa = {8'd0, p[53:10], (if s1l == 2'd2 ? va[29:21] : va[20:12]), 3'd0};
+                                s1l = s1l - 2'd1;
+                            } else if sm && !p[6] {
+                                rk[c] = RK::NOENT;
+                                fin   = 1'b1;
+                            } else {
+                                nwr = !p[6] || (!sm && ck_ns[c] && pm[0]);
+                                wpm = ref_perm(gleaf, AccKind::STORE, csr_pkg::PrivLevel::USER, 1'b0, x.gmxr, 1'b0, x.gadue);
+                                if nwr && x.g_on && !wpm[1] {
+                                    rk[c]   = RK::GUEST;
+                                    rgpa[c] = gpa;
+                                    rimp[c] = 1'b1;
+                                    fin     = 1'b1;
+                                } else if nwr && x.g_on && (!gleaf[6] || !gleaf[7]) && pte_wr_deny(gpp) {
+                                    rk[c] = RK::ACC;
+                                    fin   = 1'b1;
+                                } else if nwr && pte_wr_deny(ghpa) {
+                                    rk[c] = RK::ACC;
+                                    fin   = 1'b1;
+                                } else {
+                                    rs1[c]  = p;
+                                    rs1l[c] = s1l;
+                                    rnd_[c] = !sm && !ck_ns[c] && pm[0];
+                                    gpa     = {8'd0, ref_pa(p, s1l, va)};
+                                    last    = 1'b1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // composed PBMT of a reference translation
+    function eff_pbmt (
+        x  : input XEff     ,
+        s1 : input logic<64>,
+        gp : input logic<64>,
+    ) -> logic<2> {
+        let a: logic<2> = if x.s1_on && x.pbmte ? s1[62:61] : 2'd0;
+        let b: logic<2> = if x.g_on && x.gpbmte ? gp[62:61] : 2'd0;
+        return if a != 2'd0 ? a : b;
+    }
+
+    // ---- lookups ----
+
+    var lk_bad: logic<LP>;
+    for l in 0..LP :g_lk {
+        always_comb {
+            let h  : logic<64> = mix(SEED ^ {cyc_q, 24'h77_0000, l as 8});
+            let hot: logic<64> = if h[63:62] == 2'd0 ?
+                o_va[h[2:0]]
+            : if h[61:60] == 2'd0 ?
+                {hot_q[63:16], h[15:12], 12'd0}
+            :
+                rnd_va(h)
+            ;
+            lk_h[l]  = !ISIDE && !ctx_q.virt && h[30];
+            lk_va[l] = {hot[63:12], 12'd0};
+            lk[l]    = lookup_of(xeff(ctx_q, lk_h[l]), lk_va[l], h[58:57] != 2'd0 && keyed(ctx_q, lk_h[l], lk_va[l]));
+        }
+        always_comb {
+            let x   : XEff         = xeff(ctx_q, lk_h[l]);
+            let va  : logic   <64> = ck_va[l];
+            let e   : TlbEntry     = ent[l];
+            let p   : logic   <64> = rs1[l];
+            let gp  : logic   <64> = rg[l];
+            let elv : logic   <2>  = if !x.s1_on ? rgl[l] : if !x.g_on || rs1l[l] <: rgl[l] ? rs1l[l] : rgl[l];
+            let s1ok: logic        = !x.s1_on
+                || (e.r == p[1] && e.w == p[2] && e.x == p[3] && e.u == p[4] && e.g == p[5] && e.napot == p[63] && (!e.d
+                    || p[7]));
+            let gok : logic        = if x.g_on ?
+                e.gr == gp[1] && e.gw == gp[2] && e.gx == gp[3] && (!e.gd || gp[7]) && (x.s1_on || e.napot == gp[63])
+            :
+                e.gr && e.gw && e.gx && e.gd
+            ;
+            lk_bad[l] = e.hit && lk[l].valid
+                && (rk[l] != RK::OK || e.virt != x.two || e.s1_on != x.s1_on || e.level != elv || entry_pa(e, va) != rhpa[l]
+                    || !s1ok || !gok || e.pbmt != eff_pbmt(x, p, gp));
+        }
+    }
+
+    // ---- owner response check ----
+
+    var rs_bad : logic;
+    var rs_noex: logic;
+    var rs_afin: logic;
+    always_comb {
+        let x      : XEff                 = xeff(ctx_q, o_hlv[rs_s]);
+        let va     : logic           <64> = o_va[rs_s];
+        let acc    : AccKind              = o_acc[rs_s];
+        let att    : pma_pkg::PmaAttr     = pma_check::<3>(rhpa[LP], PMA_T);
+        let ok     : logic                = rk[LP] == RK::OK;
+        let aff    : logic                = ok
+            && (ref_pmp_deny(rhpa[LP], acc) || !att.backed || (acc == AccKind::FETCH && !att.executable));
+        let slot_ok: logic                = o_act[rs_s] && o_accd[rs_s] && o_own[rs_s]
+            && (ISIDE || o_tag[rs_s] == resp.tag.rob) && resp.tag.rob_v == !ISIDE;
+        let cause  : logic           <6>  = case rk[LP] {
+            RK::PAGE : pf_cause(acc),
+            RK::GUEST: gpf_cause(acc),
+            default  : af_cause(acc),
+        };
+        rs_noex = ok && !aff;
+        rs_afin = aff;
+        rs_bad  = resp.valid
+            && (!slot_ok || resp.exc.valid == rs_noex || !resp.hit
+                || (!rs_noex
+                    && (resp.exc.cause != cause || resp.exc.tval != va || resp.exc.gva != x.two || resp.exc.gpa != (if
+                        rk[LP] == RK::GUEST ? rgpa[LP][63:2] : 62'd0) || resp.exc.implicit != (rk[LP] == RK::GUEST
+                        && rimp[LP])))
+                || (rs_noex
+                    && (resp.pa != rhpa[LP] || resp.need_d != rnd_[LP] || resp.pma != pbmt_attr(att, eff_pbmt(x, rs1[LP],
+                        rg[LP])))));
+    }
+
+    // ---- memory port model ----
+
+    var mq_v  : logic      [RL];
+    var mq_r  : MemReq     [RL];
+    var mq_wok: logic      [RL]; // a STORE_EXCL passed
+    var mq_wf : logic      [RL]; // a STORE_EXCL failed
+    var mq_d  : logic <64> [RL];
+    var gen_q : FillId         ;
+    var f_v   : logic          ;
+    var f_id  : FillId         ;
+    var f_line: logic <50>     ;
+    var f_crit: logic <3>      ;
+    var f_cnt : logic <5>      ;
+    var f_cat : logic <5>      ;
+    var f_ab  : logic          ;
+
+    assign mrdy = rnd[1:0] != 2'd0;
+    let m_acc: logic = mv && mrdy;
+    assign mslot = m_acc;
+
+    let m_sl : logic           <12> = slot_of(mreq.pa);
+    let m_cur: logic           <64> = if !m_sl[11] ?
+        64'd0
+    : if mem_w[m_sl[10:0]] ?
+        mem[m_sl[10:0]]
+    :
+        gen_slot(m_sl[10:0], 16'd0)
+    ;
+    let m_wd : logic           <64> = mreq.wdata[63:0];
+    let m_wt : logic                = mreq.cls == MemCls::STORE_EXCL;
+    let m_wok: logic                = m_wt && rnd[3:2] != 2'd0;
+    let m_wf : logic                = m_wt && !m_wok && rnd[4];
+
+    // Departures of the line the walker presents: random ones without a
+    // change of its data, and the store of another agent when a remap writes
+    // PTEs (in that cycle and the next, as a read accepted in that cycle
+    // sampled the old data).
+    always_comb {
+        for c in 0..COH_N {
+            coh_v[c]  = (c == 0 && rnd3[63:59] == 5'd0) || (c == 1 && md_ph_q[1]);
+            coh_ln[c] = mreq.pa[55:6];
+        }
+    }
+
+    // The VS leaf slots of a GVA (VS tables are indexed by the GVA alone).
+    function va_slots (
+        va: input logic<64>,
+        sl: input logic<11>,
+    ) -> logic {
+        let i: logic<11> = {2'd0, va[38:30]};
+        let j: logic<11> = {2'd0, va[29:21]};
+        let k: logic<11> = {2'd0, va[20:12]};
+        return sl == 11'd648 + i || sl == 11'd652 + i * 8 + j || sl == 11'd684 + (i * 8 + j) * 16 + k;
+    }
+
+    var ns_live: logic;
+    var ns_accd: logic;
+    var ns_own : logic;
+    always_comb {
+        ns_live = 1'b0;
+        ns_accd = 1'b0;
+        ns_own  = 1'b0;
+        for s in 0..NS {
+            ns_live |= o_act[s] && o_ns[s];
+            ns_accd |= o_act[s] && o_ns[s] && o_accd[s];
+            ns_own  |= o_act[s] && o_ns[s] && o_accd[s] && va_slots(o_va[s], m_sl[10:0]);
+        }
+    }
+
+    let q      : MemReq    = mq_r[RL - 1];
+    let qv     : logic     = mq_v[RL - 1];
+    let r_k    : logic <3> = rnd2[2:0];
+    let r_miss : logic     = qv && q.cls != MemCls::STORE_EXCL && r_k == 3'd4;
+    let r_newf : logic     = r_miss && !f_v;
+    let r_busy : logic     = qv && q.cls != MemCls::STORE_EXCL && r_k == 3'd5 && f_v;
+    let r_retry: logic     = qv && (if q.cls == MemCls::STORE_EXCL ? !mq_wok[RL - 1] && !mq_wf[RL - 1] : r_k[2:1] == 2'd3);
+
+    always_comb {
+        mrsp         = '0;
+        mrsp.valid   = qv;
+        mrsp.tag     = q.tag;
+        mrsp.data    = {64'd0, mq_d[RL - 1]};
+        mrsp.kind    = if q.cls == MemCls::STORE_EXCL ?
+            (if mq_wok[RL - 1] ? RespKind::EXCL_PASS : if mq_wf[RL - 1] ? RespKind::EXCL_FAIL : RespKind::RETRY)
+        : if r_miss ?
+            RespKind::MISS
+        : if r_busy || r_retry ?
+            RespKind::RETRY
+        :
+            RespKind::HIT
+        ;
+        mrsp.fill_id = if r_newf ? gen_q + 1 : f_id;
+        mrsp.reason  = if r_busy ?
+            RetryReason::FILL_BUSY
+        :
+            case rnd2[5:4] {
+                2'd0   : RetryReason::INV_RACE,
+                2'd1   : RetryReason::PREEMPTED,
+                2'd2   : RetryReason::WB_BLOCKED,
+                default: RetryReason::BANK_CONFLICT,
+            }
+        ;
+    }
+
+    let f_crit_now: logic = f_v && f_cnt == f_cat;
+    let f_end_now : logic = f_v && f_cnt == 5'd0;
+    always_comb {
+        mev         = '0;
+        mev.valid   = f_crit_now || f_end_now;
+        mev.fill_id = f_id;
+        mev.line    = f_line;
+        mev.crit    = f_crit;
+        mev.kind    = if f_end_now ?
+            (if f_ab ? EvKind::FILL_ABORT : EvKind::FILL_DONE)
+        :
+            EvKind::FILL_CRIT
+        ;
+        mev.data    = 64'd0;
+    }
+
+    // ---- events and completion ----
+
+    var evt_hit: logic<NS>;
+    var cmpl   : logic<NS>;
+    var killed_: logic<NS>;
+    always_comb {
+        for s in 0..NS {
+            let key_m     : logic = evt.key.vpn == o_va[s][40:12] && evt.key.regime == op_regime(o_hlv[s], ctx_q.virt);
+            evt_hit[s] = evt.valid && o_act[s] && (o_accd[s] || (acc_now && snd_s == s)) && key_m;
+            killed_[s] = o_act[s] && (if ISIDE ? kill_q.valid || drop_q : killed(kill_q, o_tag[s]));
+            cmpl[s]    = o_act[s]
+                && ((o_accd[s] && !o_own[s] && evt_hit[s]) || (resp.valid && rs_s == s && o_accd[s] && o_own[s])
+                    || (acc_now && snd_s == s && !pperf.req && !pperf.coalesce));
+        }
+    }
+
+    var any_act: logic    ;
+    var free_s : logic <3>;
+    var free_v : logic    ;
+    var oldest : RobTag   ;
+    always_comb {
+        var av: logic<NS>            ;
+        var ts: logic<ROB_TAG_W> [NS];
+        for s in 0..NS {
+            av[s] = o_act[s];
+            ts[s] = o_tag[s];
+        }
+        any_act = av != '0;
+        free_v  = av != '1;
+        free_s  = tree_onehot_enc::<NS, 3>(tree_first::<NS>(~av));
+        oldest  = tree_onehot_mux::<NS, ROB_TAG_W>(tree_oldest::<NS, ROB_TAG_W>(av, ts), ts) as RobTag;
+    }
+    let tdist : logic<ROB_TAG_W> = {alloc_q.wrap, alloc_q.idx} - {oldest.wrap, oldest.idx};
+    let win_ok: logic            = !any_act || tdist <: CFG::ROB_N - NS - 2;
+
+    // ---- coverage ----
+
+    let rs_x: XEff = xeff(ctx_q, o_hlv[rs_s]);
+    var cov_n: logic<32>;
+    always_comb {
+        cov_n[0]  = pperf.two;
+        cov_n[1]  = pperf.g_rd;
+        cov_n[2]  = pperf.ad_redo;
+        cov_n[3]  = pperf.gfault;
+        cov_n[4]  = resp.valid && rk[LP] == RK::PAGE && rs_x.two;
+        cov_n[5]  = pperf.afault;
+        cov_n[6]  = fill.valid && fill.virt;
+        cov_n[7]  = 1'b0;
+        cov_n[8]  = 1'b0;
+        cov_n[9]  = 1'b0;
+        cov_n[10] = 1'b0;
+        cov_n[11] = 1'b0;
+        cov_n[12] = 1'b0;
+        for l in 0..LP {
+            let hv: logic = ent[l].hit && lk[l].valid;
+            cov_n[7]  |= hv && ent[l].virt && ent[l].level == 2'd0 && !ent[l].napot;
+            cov_n[8]  |= hv && ent[l].virt && ent[l].level == 2'd1;
+            cov_n[9]  |= hv && ent[l].virt && ent[l].level == 2'd2;
+            cov_n[10] |= hv && ent[l].virt && ent[l].napot;
+            cov_n[11] |= hv && ent[l].virt && !ent[l].s1_on;
+            cov_n[12] |= hv && !ent[l].virt;
+        }
+        cov_n[13] = resp.valid && rs_noex && o_hlvx[rs_s] && (!rs1[LP][1] || !rg[LP][1]);
+        cov_n[14] = resp.valid && rk[LP] == RK::GUEST && rimp[LP];
+        cov_n[15] = resp.valid && rk[LP] == RK::GUEST && !rimp[LP];
+        cov_n[16] = resp.valid && rk[LP] == RK::GUEST && rgpa[LP][63:41] != '0;
+        cov_n[17] = pperf.a_wr;
+        cov_n[18] = pperf.d_wr;
+        cov_n[19] = resp.valid && resp.need_d && rs_x.two;
+        cov_n[20] = pperf.coalesce;
+        cov_n[21] = pperf.park;
+        cov_n[22] = pperf.stale;
+        cov_n[23] = pperf.own_drop;
+        cov_n[24] = tperf.inv && inv_q.kind == InvKind::HFENCE_VVMA;
+        cov_n[25] = tperf.inv && inv_q.kind == InvKind::HFENCE_GVMA;
+        cov_n[26] = resp.valid && rs_afin && rs_x.two;
+        cov_n[27] = resp.valid && rk[LP] == RK::ACC && rs_x.two;
+        cov_n[28] = resp.valid && rs_noex && o_hlv[rs_s];
+        cov_n[29] = resp.valid && rs_noex && rs_x.two && eff_pbmt(rs_x, rs1[LP], rg[LP]) != 2'd0;
+        cov_n[30] = pperf.d_wr && gw_q;
+        cov_n[31] = resp.valid && rs_noex && rs_x.two && !rs_x.s1_on;
+    }
+
+    // ---- per-cycle decisions ----
+
+    // A remap kind: 0 a VS L0 napot group, 1 a VS L0 slot, 2 a VS root/L1
+    // slot, 3 a G slot; a pure fence (no remap) 1 in 4.
+    let rc_now : logic      = pperf.ad_rd && m_sl[11] && rnd3[23];
+    let race   : logic      = rc_now || (rnd4[5] && lrd_v_q);
+    let md_go  : logic      = md_ph_q == 2'd0 && run && !ns_live && (rnd4[12:6] == 7'd0 || rc_now) && !kill_q.valid
+        && !kvm_q;
+    let rc_s   : logic <11> = if rc_now ? m_sl[10:0] : lrd_s_q;
+    let md_rk  : logic <2>  = if !race ?
+        rnd4[15:14]
+    : if rc_s <: 11'd648 ?
+        2'd3
+    : if rc_s >= 11'd684 ?
+        2'd1
+    :
+        2'd2
+    ;
+    let md_t   : logic <11> = if !race ?
+        rnd4[30:20]
+    : if rc_s >= 11'd684 ?
+        rc_s - 11'd684
+    : if rc_s >= 11'd648 ?
+        rc_s - 11'd648
+    :
+        rc_s
+    ;
+    let md_pure: logic      = !race && rnd4[17:16] == 2'd0;
+    var md_s   : logic <11>;
+    var md_n   : logic <5> ;
+    var md_i1  : TlbInv    ; // phase 1 (or the only fence)
+    var md_i2  : TlbInv    ;
+    var md_old : logic <64>;
+    always_comb {
+        var gva: logic<64>;
+        md_i1          = '0;
+        md_i1.valid    = md_go;
+        md_i1.kind     = InvKind::SFENCE;
+        md_i1.all_asid = 1'b1;
+        md_i1.all_va   = 1'b1;
+        md_i2          = md_i1;
+        md_i2.kind     = InvKind::HFENCE_VVMA;
+        md_i2.vmid     = ctx_q.vmid;
+        md_s           = '0;
+        md_n           = '0;
+        gva            = {25'd0, 7'd0, md_t[8:7], 6'd0, md_t[6:4], 5'd0, md_t[3:0], 12'd0};
+        if md_pure {
+            // fences without a remap: selective by ASID, VA or VMID
+            md_i1.kind     = case rnd5[1:0] {
+                2'd0   : InvKind::SFENCE,
+                2'd1   : InvKind::HFENCE_VVMA,
+                default: InvKind::HFENCE_GVMA,
+            };
+            md_i1.all_va   = rnd5[2];
+            md_i1.va       = rnd_va(rnd3);
+            md_i1.all_asid = rnd5[3];
+            md_i1.asid     = {14'd0, rnd5[5:4]};
+            md_i1.vmid     = if rnd5[6] ? ctx_q.vmid : {12'd0, rnd5[8:7]};
+        } else {
+            case md_rk {
+                2'd0: {
+                    md_s         = 11'd684 + {1'b0, md_t[8:4], 4'd0};
+                    md_n         = 5'd16;
+                    md_i1.va     = {gva[63:16], rnd5[15:12], 12'd0};
+                    md_i1.all_va = !md_old[63];
+                }
+                2'd1: {
+                    md_s         = 11'd684 + {1'b0, md_t[8:0]};
+                    md_n         = 5'd1;
+                    md_i1.va     = gva;
+                    md_i1.all_va = 1'b0;
+                }
+                2'd2: {
+                    md_s = 11'd648 + (md_t % 11'd36);
+                    md_n = 5'd1;
+                }
+                default: {
+                    md_s          = md_t % 11'd648;
+                    md_n          = 5'd1;
+                    md_i1.kind    = InvKind::HFENCE_GVMA;
+                    md_i1.all_va  = 1'b1;
+                }
+            }
+            md_i2.va     = md_i1.va;
+            md_i2.all_va = md_i1.all_va;
+        }
+    }
+    // A single-page fence covers a group only if all 16 PTEs were napot.
+    let md_gs: logic<11> = 11'd684 + {1'b0, md_t[8:4], 4'd0};
+    always_comb {
+        md_old = 64'h8000_0000_0000_0000;
+        for k in 0..16 {
+            md_old &= if mem_w[md_gs + k] ? mem[md_gs + k] : gen_slot(md_gs + k, 16'd0);
+        }
+    }
+    // single phase: a pure fence or a G-stage remap
+    let md_one: logic = md_pure || md_rk == 2'd3;
+
+    var k_next: Kill;
+    always_comb {
+        k_next = '0;
+        if md_ph_q == 2'd3 {
+            k_next.valid = 1'b1;
+            k_next.full  = 1'b1;
+        } else if run && md_ph_q == 2'd0 && !md_go && rnd4[21:16] == 6'd0 {
+            if ISIDE {
+                k_next.valid = 1'b1;
+                k_next.full  = rnd4[22];
+            } else if rnd4[23:22] == 2'd0 && !ns_live {
+                k_next.valid = 1'b1;
+                k_next.full  = 1'b1;
+            } else if o_act[rnd4[26:24]] {
+                k_next.valid = 1'b1;
+                k_next.keep  = o_tag[rnd4[26:24]];
+            }
+        }
+    }
+
+    let pick_s : logic  <3> = rnd[10:8];
+    let pick_ok: logic      = o_act[pick_s] && !o_accd[pick_s] && !killed_[pick_s];
+    let new_ns : logic      = !ISIDE && !any_act && !md_go && !inv_q.valid && md_ph_q == 2'd0 && !k_next.valid
+        && rnd[18:17] == 2'd0;
+    let new_ak : AccKind    = case rnd[23:21] {
+        3'd0   : AccKind::LOAD,
+        3'd1   : AccKind::LOAD,
+        3'd2   : AccKind::LOAD,
+        3'd3   : AccKind::STORE,
+        3'd4   : AccKind::STORE,
+        3'd5   : AccKind::AMO,
+        3'd6   : AccKind::CBO,
+        default: AccKind::FETCH,
+    };
+    let new_acc: AccKind     = if ISIDE ?
+        AccKind::FETCH
+    : if new_ns ?
+        (if rnd[31] ? AccKind::AMO : AccKind::STORE)
+    :
+        new_ak
+    ;
+    let new_hlv: logic       = !ISIDE && !ctx_q.virt && new_acc != AccKind::FETCH && new_acc != AccKind::CBO && rnd[33:32]
+        != 2'd0;
+    let new_va : logic  <64> = if rnd[27:25] == 3'd0 ? o_va[rnd[30:28]] : rnd_va(rnd2);
+    let new_key: logic       = keyed(ctx_q, new_hlv, new_va);
+    let alloc  : logic       = run && free_v && !kill_q.valid && win_ok && rnd[16:14] != 3'd0 && md_ph_q == 2'd0
+        && new_key;
+
+    // ---- sequential ----
+
+    always_ff {
+        if_reset {
+            cyc_q     = 0;
+            err_q     = '0;
+            cov_q     = '0;
+            kill_q    = '0;
+            inv_q     = '0;
+            drop_q    = 1'b0;
+            oe_q      = 1'b1;
+            md_ph_q   = 2'd0;
+            md_s_q    = '0;
+            md_n_q    = '0;
+            md_ver_q  = '0;
+            md_inv2_q = '0;
+            md_g_q    = 1'b0;
+            kvm_q     = 1'b0;
+            hot_q     = '0;
+            lrd_v_q   = 1'b0;
+            lrd_s_q   = '0;
+            gw_q      = 1'b0;
+
+            snd_v        = 1'b0;
+            snd_s        = '0;
+            alloc_q      = '0;
+            gen_q        = '0;
+            f_v          = 1'b0;
+            f_id         = '0;
+            f_line       = '0;
+            f_crit       = '0;
+            f_cnt        = '0;
+            f_cat        = '0;
+            f_ab         = 1'b0;
+            ctx_q        = '0;
+            ctx_q.prv    = csr_pkg::PrivLevel::SUPERVISOR;
+            ctx_q.vprv   = csr_pkg::PrivLevel::SUPERVISOR;
+            ctx_q.root   = VS_ROOT;
+            ctx_q.vroot  = VS_ROOT;
+            ctx_q.groot  = G_ROOT;
+            ctx_q.asid   = 16'd1;
+            ctx_q.vasid  = 16'd1;
+            ctx_q.vmid   = 14'd1;
+            ctx_q.adue   = 1'b1;
+            ctx_q.pbmte  = SEED[1];
+            ctx_q.vpbmte = SEED[2];
+            ctx_q.virt   = 1'b1;
+            ctx_q.vs_on  = 1'b1;
+            ctx_q.g_on   = 1'b1;
+            for s in 0..NS {
+                o_act[s]  = 1'b0;
+                o_accd[s] = 1'b0;
+                o_own[s]  = 1'b0;
+                o_tag[s]  = '0;
+                o_va[s]   = '0;
+                o_acc[s]  = AccKind::LOAD;
+                o_hlv[s]  = 1'b0;
+                o_hlvx[s] = 1'b0;
+                o_ns[s]   = 1'b0;
+                o_age[s]  = '0;
+                o_nev[s]  = '0;
+            }
+            for k in 0..RL {
+                mq_v[k]   = 1'b0;
+                mq_wok[k] = 1'b0;
+                mq_wf[k]  = 1'b0;
+                mq_r[k]   = '0;
+                mq_d[k]   = '0;
+            }
+            for s in 0..MS {
+                mem_w[s] = 1'b0;
+                mem[s]   = '0;
+            }
+        } else {
+            cyc_q = cyc_q + 1;
+            cov_q = cov_q | cov_n;
+
+            // -- checks --
+            if lk_bad != '0 {
+                err_q[0] = 1'b1;
+            }
+            if rs_bad {
+                err_q[1] = 1'b1;
+            }
+            if mv && mreq.cls != MemCls::STORE_EXCL && pte_rd_deny(mreq.pa) {
+                err_q[2] = 1'b1;
+            }
+            if m_acc && m_wt
+                && (!m_sl[11] || (m_wd & ~64'hc0) != (m_cur & ~64'hc0) || (m_cur & ~m_wd) != 64'd0 || !oe_q
+                    || pte_wr_deny(mreq.pa)) {
+                err_q[3] = 1'b1;
+            }
+            // D on a G leaf only while an accepted nonspec op lives, on a VS
+            // leaf (a V = 0 walk) only for that op's page; a guest walk
+            // writes no VS PTE
+            if m_acc && m_wt && m_wd[7] && !m_cur[7] && (if m_sl[10:0] <: 11'd648 ? !ns_accd : !ns_own) {
+                err_q[4] = 1'b1;
+            }
+            if m_acc && m_wt && gw_q && m_sl[11] && m_sl[10:0] >= 11'd648 {
+                err_q[11] = 1'b1;
+            }
+            if mv && mreq.tag.rob_v {
+                err_q[5] = 1'b1;
+            }
+            if fill.valid && fill.virt && fill.vmid != ctx_q.vmid {
+                err_q[6] = 1'b1;
+            }
+            for s in 0..NS {
+                if o_act[s] && o_age[s] >: LIVE {
+                    err_q[7] = 1'b1;
+                }
+                if o_act[s] && o_accd[s] && o_nev[s] >: QN + 1 {
+                    err_q[8] = 1'b1;
+                }
+            }
+            if acc_now && o_ns[snd_s] && !pperf.req && !in_gone_tb {
+                err_q[9] = 1'b1;
+            }
+            if resp.valid && o_ns[rs_s] && !resp.exc.valid && resp.need_d && !kill_q.valid {
+                err_q[10] = 1'b1;
+            }
+
+            // -- memory port --
+            mq_v[0]   = m_acc;
+            mq_r[0]   = mreq;
+            mq_wok[0] = m_wok;
+            mq_wf[0]  = m_wf;
+            mq_d[0]   = m_cur;
+            for k in 1..RL {
+                mq_d[k]   = mq_d[k - 1];
+                mq_v[k]   = mq_v[k - 1];
+                mq_r[k]   = mq_r[k - 1];
+                mq_wok[k] = mq_wok[k - 1];
+                mq_wf[k]  = mq_wf[k - 1];
+            }
+            if m_acc && mreq.cls == MemCls::PTW_READ && m_sl[11] {
+                lrd_v_q = 1'b1;
+                lrd_s_q = m_sl[10:0];
+            }
+            if pperf.walk {
+                gw_q = pperf.two;
+            }
+
+            if m_acc && m_wok {
+                mem[m_sl[10:0]]   = m_wd;
+                mem_w[m_sl[10:0]] = 1'b1;
+            }
+            if f_end_now {
+                f_v = 1'b0;
+            } else if f_v {
+                f_cnt = f_cnt - 5'd1;
+            }
+            if r_newf || (!f_v && rnd3[9:5] == 5'd0) {
+                f_v    = 1'b1;
+                f_id   = gen_q + 1;
+                gen_q  = gen_q + 1;
+                f_line = if r_newf ? q.pa[55:6] : {rnd3[49:30], rnd3[29:0]};
+                f_crit = if r_newf && rnd3[10] ? q.pa[5:3] : rnd3[13:11];
+                f_cnt  = 5'd2 + {1'b0, rnd3[17:14]};
+                f_cat  = 5'd1 + {4'd0, rnd3[18]};
+                f_ab   = rnd3[21:19] == 3'd0;
+            }
+
+            // -- remaps and fences --
+            inv_q = '0;
+            if md_go {
+                inv_q     = md_i1;
+                md_ph_q   = if md_pure ? 2'd3 : if md_one ? 2'd2 : 2'd1;
+                md_inv2_q = md_i2;
+                md_s_q    = md_s;
+                md_n_q    = md_n;
+                md_ver_q  = cyc_q[15:0];
+                md_g_q    = !md_pure && md_rk == 2'd3;
+                if !md_pure {
+                    hot_q = md_i1.va;
+                }
+            } else if md_ph_q == 2'd1 {
+                inv_q   = md_inv2_q;
+                md_ph_q = 2'd2;
+            } else if md_ph_q == 2'd2 {
+                // the PTEs change on the edge of the guest fence
+                for k in 0..16 {
+                    if k <: md_n_q {
+                        mem[md_s_q + k]   = gen_slot(md_s_q + k, md_ver_q);
+                        mem_w[md_s_q + k] = 1'b1;
+                    }
+                }
+                md_ph_q = 2'd3;
+            } else if md_ph_q == 2'd3 {
+                md_ph_q = 2'd0;
+            }
+            kvm_q = md_ph_q == 2'd3 && md_g_q;
+            kill_q = k_next;
+            drop_q = ISIDE && run && md_ph_q == 2'd0 && !md_go && !k_next.valid && rnd4[31:25] == 7'd0;
+            oe_q   = !md_go && rnd4[3:0] != 4'd0;
+            // a context change takes effect after the full kill that carries it;
+            // the VMID and hgatp.MODE change only after a G-stage fence of all
+            if kill_q.valid && kill_q.full && (rnd4[40] || kvm_q) {
+                ctx_q.prv   = if rnd4[41] ? csr_pkg::PrivLevel::USER : csr_pkg::PrivLevel::SUPERVISOR;
+                ctx_q.vprv  = if rnd4[49] ? csr_pkg::PrivLevel::USER : csr_pkg::PrivLevel::SUPERVISOR;
+                ctx_q.sum   = rnd4[42];
+                ctx_q.mxr   = rnd4[43] && rnd4[50];
+                ctx_q.vsum  = rnd4[51];
+                ctx_q.vmxr  = rnd4[52];
+                ctx_q.adue  = rnd4[44] || rnd4[45] || rnd4[53];
+                ctx_q.asid  = {14'd0, rnd4[47:46]};
+                ctx_q.vasid = {14'd0, rnd4[57:56]};
+                ctx_q.virt  = rnd4[58] || (!ISIDE && rnd4[59]);
+                ctx_q.vs_on = rnd4[60] || rnd4[61] || !(if kvm_q ? rnd4[62] || rnd4[63] : ctx_q.g_on);
+                if kvm_q {
+                    ctx_q.g_on = rnd4[62] || rnd4[63];
+                    ctx_q.vmid = {12'd0, rnd5[9:8]};
+                }
+            }
+
+            // -- ops --
+            for s in 0..NS {
+                if o_act[s] && o_accd[s] {
+                    o_age[s] = o_age[s] + 16'd1;
+                    if evt.valid && !evt_hit[s] && o_nev[s] != 4'hf {
+                        o_nev[s] = o_nev[s] + 4'd1;
+                    }
+                }
+                if acc_now && snd_s == s {
+                    o_accd[s] = 1'b1;
+                    o_own[s]  = pperf.req;
+                    o_age[s]  = '0;
+                    o_nev[s]  = '0;
+                }
+                if cmpl[s] || killed_[s] {
+                    o_act[s] = 1'b0;
+                }
+                if alloc && free_s == s {
+                    o_act[s]  = 1'b1;
+                    o_accd[s] = 1'b0;
+                    o_own[s]  = 1'b0;
+                    o_tag[s]  = alloc_q;
+                    o_va[s]   = new_va;
+                    o_acc[s]  = new_acc;
+                    o_hlv[s]  = new_hlv;
+                    o_hlvx[s] = new_hlv && new_acc == AccKind::LOAD && rnd[34];
+                    o_ns[s]   = new_ns;
+                    o_age[s]  = '0;
+                    o_nev[s]  = '0;
+                }
+            }
+            if !ISIDE && kill_q.valid && !kill_q.full {
+                alloc_q = tag_next::<ROB_TAG_W, CFG::ROB_N>(kill_q.keep) as RobTag;
+            } else if alloc {
+                alloc_q = tag_next::<ROB_TAG_W, CFG::ROB_N>(alloc_q) as RobTag;
+            }
+            if acc_now || !req_v {
+                snd_v = 1'b0;
+            }
+            if (!snd_v || !req_v) && pick_ok {
+                snd_v = 1'b1;
+                snd_s = pick_s;
+            }
+        }
+    }
+
+    assign o_err  = err_q;
+    assign o_cov  = cov_q;
+    assign o_chk  = {pchk, tchk};
+    assign o_done = !run && !any_act;
+    assign o_pass = o_done && err_q == '0 && pchk == '0 && tchk == '0;
+}
+
+#[test(test_ptw2)]
+module test_ptw2 {
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var d: logic     [6];
+    var p: logic     [6];
+    var e: logic<16> [6];
+    var v: logic<32> [6];
+    var c: logic<6>  [6];
+
+    inst h0: ptw2_harness::<cfg_w2> #(
+        SEED: 64'h103,
+    ) (
+        clk         ,
+        rst         ,
+        o_done: d[0],
+        o_pass: p[0],
+        o_err : e[0],
+        o_cov : v[0],
+        o_chk : c[0],
+    );
+    inst h1: ptw2_harness::<cfg_w2> #(
+        SEED: 64'h215,
+    ) (
+        clk         ,
+        rst         ,
+        o_done: d[1],
+        o_pass: p[1],
+        o_err : e[1],
+        o_cov : v[1],
+        o_chk : c[1],
+    );
+    inst h2: ptw2_harness::<cfg_w4> #(
+        SEED: 64'h327,
+    ) (
+        clk         ,
+        rst         ,
+        o_done: d[2],
+        o_pass: p[2],
+        o_err : e[2],
+        o_cov : v[2],
+        o_chk : c[2],
+    );
+    inst h3: ptw2_harness::<cfg_w4> #(
+        SEED: 64'h43d,
+    ) (
+        clk         ,
+        rst         ,
+        o_done: d[3],
+        o_pass: p[3],
+        o_err : e[3],
+        o_cov : v[3],
+        o_chk : c[3],
+    );
+    inst h4: ptw2_harness::<cfg_w2> #(
+        SEED : 64'h54b,
+        ISIDE: 1      ,
+    ) (
+        clk         ,
+        rst         ,
+        o_done: d[4],
+        o_pass: p[4],
+        o_err : e[4],
+        o_cov : v[4],
+        o_chk : c[4],
+    );
+    inst h5: ptw2_harness::<cfg_w4> #(
+        SEED : 64'h65d,
+        ISIDE: 1      ,
+    ) (
+        clk         ,
+        rst         ,
+        o_done: d[5],
+        o_pass: p[5],
+        o_err : e[5],
+        o_cov : v[5],
+        o_chk : c[5],
+    );
+
+    initial {
+        rst.assert(clk);
+        clk.next(64000);
+        for i in 0..6 {
+            $display("ptw2 %d: done=%b pass=%b err=%b chk=%b cov=%b", i, d[i], p[i], e[i], c[i], v[i]);
+        }
+        for i in 0..6 {
+            $assert(d[i] && p[i], "ptw2 harness failed");
+        }
+        $assert((v[0] | v[1]) == 32'hffff_ffff, "ptw2 w2: a mechanism did not fire");
+        $assert((v[2] | v[3]) == 32'hffff_ffff, "ptw2 w4: a mechanism did not fire");
+        $assert((v[4] | v[5] | 32'hd00f_6000) == 32'hffff_ffff, "ptw2 I side: a mechanism did not fire");
+        $finish();
+    }
+}
+
+// tlb directed, guest entries: V = 0 and guest entries of one VPN do not
+// alias; VMID, s1_on and ASID/global tag guest entries; SFENCE.VMA spares
+// guest entries; HFENCE.VVMA removes by VMID, level-masked VA and ASID
+// (global entries survive an ASID-qualified one); HFENCE.GVMA removes every
+// guest entry of a VMID or of all VMIDs and spares V = 0 entries. perm_x:
+// HLVX on execute-only pages of both stages, MXR per stage, need_d and walk.
+#[test(test_tlb_h_unit)]
+module test_tlb_h_unit {
+    import xlate_pkg::*;
+
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+
+    var stp : logic    <8>     ;
+    var lk  : TlbLookup     [2];
+    var ent : TlbEntry      [2];
+    var fill: TlbFill          ;
+    var inv : TlbInv           ;
+    var pf  : TlbPerf          ;
+    var tc  : logic    <2>     ;
+    var bad : logic    <24>    ;
+
+    function mk_lk (
+        virt : input logic    ,
+        vmid : input logic<14>,
+        s1_on: input logic    ,
+        vpn  : input logic<29>,
+        asid : input logic<16>,
+    ) -> TlbLookup {
+        var l      : TlbLookup;
+        l.valid = 1'b1;
+        l.vpn   = vpn;
+        l.asid  = asid;
+        l.virt  = virt;
+        l.vmid  = vmid;
+        l.s1_on = s1_on;
+        return l;
+    }
+
+    function mk_fill (
+        virt : input logic    ,
+        vmid : input logic<14>,
+        s1_on: input logic    ,
+        vpn  : input logic<29>,
+        asid : input logic<16>,
+        ppn  : input logic<44>,
+        level: input logic<2> ,
+        g    : input logic    ,
+    ) -> TlbFill {
+        var f      : TlbFill;
+        f       = '1;
+        f.napot = 1'b0;
+        f.pbmt  = 2'd0;
+        f.virt  = virt;
+        f.vmid  = vmid;
+        f.s1_on = s1_on;
+        f.vpn   = vpn;
+        f.asid  = asid;
+        f.ppn   = ppn;
+        f.level = level;
+        f.g     = g;
+        return f;
+    }
+
+    function mk_inv (
+        kind    : input InvKind   ,
+        va      : input logic<64> ,
+        asid    : input logic<16> ,
+        vmid    : input logic<14> ,
+        all_va  : input logic     ,
+        all_asid: input logic     ,
+    ) -> TlbInv {
+        var v         : TlbInv;
+        v.valid    = 1'b1;
+        v.kind     = kind;
+        v.va       = va;
+        v.asid     = asid;
+        v.vmid     = vmid;
+        v.all_va   = all_va;
+        v.all_asid = all_asid;
+        return v;
+    }
+
+    always_comb {
+        fill = '0;
+        inv  = '0;
+        lk   = '{default: '0};
+        case stp {
+            8'd1   : fill = mk_fill(1'b0, 14'd0, 1'b1, 29'h10, 16'd1, 44'h81000, 2'd0, 1'b0);
+            8'd2   : fill = mk_fill(1'b1, 14'd1, 1'b1, 29'h10, 16'd1, 44'h82000, 2'd0, 1'b0);
+            8'd3   : fill = mk_fill(1'b1, 14'd1, 1'b0, 29'h10, 16'd0, 44'h83000, 2'd0, 1'b1);
+            8'd4   : fill = mk_fill(1'b1, 14'd2, 1'b1, 29'h10, 16'd1, 44'h84000, 2'd0, 1'b0);
+            8'd5   : fill = mk_fill(1'b1, 14'd1, 1'b1, 29'h200, 16'd1, 44'h80200, 2'd1, 1'b0);
+            8'd8   : inv = mk_inv(InvKind::SFENCE, 64'h0, 16'd0, 14'd0, 1'b1, 1'b1);
+            8'd10  : inv = mk_inv(InvKind::HFENCE_VVMA, 64'h10000, 16'd1, 14'd1, 1'b0, 1'b0);
+            8'd12  : inv = mk_inv(InvKind::HFENCE_VVMA, 64'h0, 16'd1, 14'd1, 1'b1, 1'b0);
+            8'd14  : inv = mk_inv(InvKind::HFENCE_GVMA, 64'h0, 16'd0, 14'd2, 1'b1, 1'b0);
+            8'd16  : inv = mk_inv(InvKind::HFENCE_GVMA, 64'h0, 16'd0, 14'd3, 1'b1, 1'b1);
+            default: {}
+        }
+        case stp {
+            8'd6: {
+                lk[0] = mk_lk(1'b0, 14'd1, 1'b1, 29'h10, 16'd1);
+                lk[1] = mk_lk(1'b1, 14'd1, 1'b1, 29'h10, 16'd1);
+            }
+            8'd7: {
+                lk[0] = mk_lk(1'b1, 14'd1, 1'b0, 29'h10, 16'd5);
+                lk[1] = mk_lk(1'b1, 14'd2, 1'b1, 29'h10, 16'd1);
+            }
+            8'd9: {
+                lk[0] = mk_lk(1'b1, 14'd1, 1'b1, 29'h3ff, 16'd1);
+                lk[1] = mk_lk(1'b0, 14'd1, 1'b1, 29'h10, 16'd1);
+            }
+            8'd11: {
+                lk[0] = mk_lk(1'b1, 14'd1, 1'b1, 29'h10, 16'd1);
+                lk[1] = mk_lk(1'b1, 14'd1, 1'b0, 29'h10, 16'd1);
+            }
+            8'd13: {
+                lk[0] = mk_lk(1'b1, 14'd1, 1'b1, 29'h201, 16'd1);
+                lk[1] = mk_lk(1'b1, 14'd2, 1'b1, 29'h10, 16'd1);
+            }
+            8'd15: {
+                lk[0] = mk_lk(1'b1, 14'd2, 1'b1, 29'h10, 16'd1);
+                lk[1] = mk_lk(1'b1, 14'd1, 1'b0, 29'h10, 16'd1);
+            }
+            8'd17  : lk[1] = mk_lk(1'b1, 14'd1, 1'b0, 29'h10, 16'd1);
+            default: {}
+        }
+    }
+
+    inst u_tlb: tlb #(
+        ENTRIES     : 8,
+        LOOKUP_PORTS: 2,
+    ) (
+        clk         ,
+        rst         ,
+        i_lk  : lk  ,
+        o_lk  : ent ,
+        i_fill: fill,
+        i_inv : inv ,
+        o_chk : tc  ,
+        o_perf: pf  ,
+    );
+
+    let pa0: pma_pkg::Pa = entry_pa(ent[0], {23'd0, lk[0].vpn, 12'h345});
+
+    // perm_x on composed entries
+    function mk_e (
+        rwx : input logic<3>,
+        grwx: input logic<3>,
+        d   : input logic   ,
+        gd  : input logic   ,
+    ) -> TlbEntry {
+        var e      : TlbEntry;
+        e       = '0;
+        e.hit   = 1'b1;
+        e.virt  = 1'b1;
+        e.s1_on = 1'b1;
+        e.r     = rwx[0];
+        e.w     = rwx[1];
+        e.x     = rwx[2];
+        e.d     = d;
+        e.gr    = grwx[0];
+        e.gw    = grwx[1];
+        e.gx    = grwx[2];
+        e.gd    = gd;
+        return e;
+    }
+
+    function mk_x (
+        mxr  : input logic,
+        gmxr : input logic,
+        adue : input logic,
+        gadue: input logic,
+    ) -> XEff {
+        var x      : XEff;
+        x       = '0;
+        x.two   = 1'b1;
+        x.prv   = csr_pkg::PrivLevel::SUPERVISOR;
+        x.mxr   = mxr;
+        x.gmxr  = gmxr;
+        x.adue  = adue;
+        x.gadue = gadue;
+        x.s1_on = 1'b1;
+        x.g_on  = 1'b1;
+        return x;
+    }
+
+    let xo : TlbEntry = mk_e(3'b100, 3'b100, 1'b1, 1'b1); // execute-only at both stages
+    let p_0: Perm     = perm_x(xo, AccKind::LOAD, mk_x(1'b0, 1'b0, 1'b0, 1'b0), 1'b1);
+    let p_1: Perm     = perm_x(xo, AccKind::LOAD, mk_x(1'b0, 1'b0, 1'b0, 1'b0), 1'b0);
+    let p_2: Perm     = perm_x(xo, AccKind::LOAD, mk_x(1'b1, 1'b0, 1'b0, 1'b0), 1'b0);
+    let p_3: Perm     = perm_x(xo, AccKind::LOAD, mk_x(1'b1, 1'b1, 1'b0, 1'b0), 1'b0);
+    let rw : TlbEntry = mk_e(3'b011, 3'b011, 1'b0, 1'b1);
+    let rg : TlbEntry = mk_e(3'b011, 3'b011, 1'b1, 1'b0);
+    let p_4: Perm     = perm_x(rw, AccKind::STORE, mk_x(1'b0, 1'b0, 1'b0, 1'b1), 1'b0);
+    let p_5: Perm     = perm_x(rg, AccKind::STORE, mk_x(1'b0, 1'b0, 1'b0, 1'b1), 1'b0);
+    let p_6: Perm     = perm_x(rg, AccKind::STORE, mk_x(1'b0, 1'b0, 1'b1, 1'b0), 1'b0);
+    let p_7: Perm     = perm_x(rg, AccKind::LOAD, mk_x(1'b0, 1'b0, 1'b0, 1'b0), 1'b0);
+
+    always_ff (clk, rst) {
+        if_reset {
+            stp = 8'd0;
+            bad = '0;
+        } else {
+            stp = stp + 8'd1;
+            case stp {
+                8'd6: {
+                    bad[0] = !ent[0].hit || ent[0].ppn != 44'h81000 || ent[0].virt;
+                    bad[1] = !ent[1].hit || ent[1].ppn != 44'h82000 || !ent[1].virt;
+                }
+                8'd7: {
+                    bad[2] = !ent[0].hit || ent[0].ppn != 44'h83000 || ent[0].s1_on;
+                    bad[3] = !ent[1].hit || ent[1].ppn != 44'h84000;
+                }
+                8'd9: {
+                    bad[4] = !ent[0].hit || ent[0].level != 2'd1 || pa0 != 56'h803f_f345;
+                    bad[5] = ent[1].hit;
+                }
+                8'd11: {
+                    bad[6] = ent[0].hit;
+                    bad[7] = !ent[1].hit || ent[1].ppn != 44'h83000;
+                }
+                8'd13: {
+                    bad[8] = ent[0].hit;
+                    bad[9] = !ent[1].hit || ent[1].ppn != 44'h84000;
+                }
+                8'd15: {
+                    bad[10] = ent[0].hit;
+                    bad[11] = !ent[1].hit;
+                }
+                8'd17  : bad[12] = ent[1].hit;
+                default: {}
+            }
+            bad[13] = bad[13] || !p_0.ok || p_0.walk;
+            bad[14] = bad[14] || p_1.ok || !p_1.walk;
+            bad[15] = bad[15] || p_2.ok || !p_2.walk;
+            bad[16] = bad[16] || !p_3.ok;
+            bad[17] = bad[17] || p_4.ok || !p_4.walk;
+            bad[18] = bad[18] || !p_5.ok || !p_5.need_d;
+            bad[19] = bad[19] || p_6.ok || !p_6.walk;
+            bad[20] = bad[20] || !p_7.ok || p_7.need_d;
+        }
+    }
+
+    initial {
+        rst.assert(clk);
+        clk.next(20);
+        $display("tlb h unit: bad=%b chk=%b", bad, tc);
+        $assert(bad == '0 && tc == '0, "tlb h unit failed");
+        $finish();
+    }
+}
