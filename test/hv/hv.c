@@ -168,7 +168,8 @@ void hv_main(unsigned long hartid, unsigned long dtb) {
 
     CSRW("0x680", 0x8000000000080020UL);       /* hgatp = Sv39x4, PPN=0x80020 */
     CSRW("0x24d", 0xFFFFFFFFFFFFFFFFUL);        /* vstimecmp = max (timer disarmed) */
-    CSRW("0x60a", (1UL << 63));                 /* henvcfg.STCE (Sstc-in-VS) */
+    CSRW("0x60a", (1UL << 63) | 0xd0);          /* henvcfg.STCE (Sstc-in-VS), CBZE, CBCFE, CBIE=01 */
+    CSRW("0x606", 0xffffffffUL);                /* hcounteren: every counter to the guest */
     CSRW("0x602", 0xB1FFUL);                    /* hedeleg: guest exceptions -> VS */
     CSRW("0x603", 0x444UL);                     /* hideleg: VS interrupts -> VS */
     CSRS("0x600", (1UL << 8));                  /* hstatus.SPVP = 1 (VS-supervisor) */

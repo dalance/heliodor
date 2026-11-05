@@ -6,7 +6,7 @@
 #   vsatp = Sv39, root @ GPA 0x80020000, mapping GVA 0x2000 -> GPA 0x80030000 via
 #           a full 3-level walk (L2[0] -> L1[0] -> L0[2]) to a supervisor (U=0)
 #           R|W|X leaf.
-#   hgatp = Sv39x4, root @ HPA 0x80016000, a 1 GiB gigapage mapping guest-physical
+#   hgatp = Sv39x4, root @ HPA 0x8001C000, a 1 GiB gigapage mapping guest-physical
 #           [0x80000000,0xC0000000) -> HPA identity (covers both the VS-stage page
 #           tables, which live in guest PA, and the data page).
 #   hstatus.SPVP (bit 8) = 1, so HLV/HSV run with VS-supervisor privilege.
@@ -37,8 +37,8 @@ _start:
     la   t0, hs_handler
     csrw stvec, t0
 
-    # ---- G-stage page table (Sv39x4), root @ 0x80016000 ----
-    li   t0, 0x80016010          # G L2[2] -> 1GiB leaf, HPA 0x80000000, V|R|W|X|U|A|D
+    # ---- G-stage page table (Sv39x4), root @ 0x8001C000 ----
+    li   t0, 0x8001C010          # G L2[2] -> 1GiB leaf, HPA 0x80000000, V|R|W|X|U|A|D
     li   t1, 0x200000DF
     sd   t1, 0(t0)               # GPA [0x80000000,0xC0000000) identity
 
@@ -56,7 +56,7 @@ _start:
     # ---- program the guest translation CSRs ----
     li   t0, 0x8000000000080020  # vsatp = Sv39, PPN=0x80020
     csrw 0x280, t0
-    li   t0, 0x8000000000080016  # hgatp = Sv39x4, PPN=0x80016
+    li   t0, 0x800000000008001C  # hgatp = Sv39x4, PPN=0x8001C
     csrw 0x680, t0
     li   t0, 0x100               # hstatus.SPVP (bit 8) = 1 : HLV/HSV as VS-supervisor
     csrs 0x600, t0

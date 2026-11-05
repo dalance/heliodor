@@ -25,10 +25,15 @@ _start:
     csrw mideleg, t0
 
     # menvcfg: STCE(63) | PBMTE(62) | ADUE(61) so Sstc-in-VS + guest Svpbmt/Svadu
-    # are available to the HS hypervisor and its guest.
+    # are available to the HS hypervisor and its guest, and CBZE(7) | CBCFE(6) |
+    # CBIE=01(5:4) for the guest's Zicboz/Zicbom (its DT lists them).
     li   t0, 7
     slli t0, t0, 61
+    ori  t0, t0, 0xd0
     csrw 0x30A, t0                   # menvcfg
+    # Every counter (time in particular) readable below M.
+    li   t0, -1
+    csrw mcounteren, t0
 
     # mstatus: MPP=01 (S-mode), MPIE=1, SPIE=1, SIE=1, FS=01 (Initial: FP on).
     # FS!=0 is the global FP gate; without it every guest FP instruction (e.g.

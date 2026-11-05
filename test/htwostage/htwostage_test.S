@@ -46,15 +46,15 @@ _start:
     li   t1, 0x200084C7
     sd   t1, 0(t0)
 
-    # ---- G-stage page table (Sv39x4), root @ 0x80016000 ----
-    li   t0, 0x80016010          # G L2[2] -> 1GiB leaf, HPA 0x80000000, V|R|W|X|U|A|D
+    # ---- G-stage page table (Sv39x4), root @ 0x8001C000 ----
+    li   t0, 0x8001C010          # G L2[2] -> 1GiB leaf, HPA 0x80000000, V|R|W|X|U|A|D
     li   t1, 0x200000DF
     sd   t1, 0(t0)
 
     # ---- program vsatp + hgatp ----
     li   t0, 0x8000000000080013  # Sv39, PPN=0x80013
     csrw 0x280, t0               # vsatp
-    li   t0, 0x8000000000080016  # Sv39x4, PPN=0x80016
+    li   t0, 0x800000000008001C  # Sv39x4, PPN=0x8001C
     csrw 0x680, t0               # hgatp
     sfence.vma zero, zero
 
@@ -94,7 +94,7 @@ _start:
     li   t0, 0x80015000
     li   t1, 0                   # V=0 (invalid)
     sd   t1, 0(t0)
-    sfence.vma zero, zero
+    .word 0x22000073             # hfence.vvma zero, zero (a VS-stage PTE changed)
     li   s4, 1                   # a fault is now expected = PASS
     li   t0, 0x20800             # MPRV=1, MPP=S (MPV bit39 still set)
     csrs mstatus, t0

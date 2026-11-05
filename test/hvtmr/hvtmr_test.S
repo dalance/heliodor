@@ -51,12 +51,15 @@ _start:                              # M-mode
     csrs 0x30A, t0                   # menvcfg.STCE
     csrs 0x60A, t0                   # henvcfg.STCE
     csrw 0x605, zero                 # htimedelta = 0 (guest time == mtime)
+    li   t0, 2                       # TM: the guest reads time and stimecmp
+    csrs mcounteren, t0
+    csrs 0x606, t0                   # hcounteren.TM
 
-    # ---- G-stage gigapage @ 0x80016000, vsatp Bare ----
-    li   t0, 0x80016010
+    # ---- G-stage gigapage @ 0x8001C000, vsatp Bare ----
+    li   t0, 0x8001C010
     li   t1, 0x200000DF
     sd   t1, 0(t0)
-    li   t0, 0x8000000000080016
+    li   t0, 0x800000000008001C
     csrw 0x680, t0                   # hgatp = Sv39x4
     csrw 0x280, zero                 # vsatp = Bare
 

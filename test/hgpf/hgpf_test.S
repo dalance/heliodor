@@ -27,14 +27,14 @@ _start:
     la   t0, hs_handler
     csrw stvec, t0               # HS-mode trap vector (V=0 after a guest exit)
 
-    # ---- G-stage page table (Sv39x4), root @ 0x80016000 ----
-    li   t0, 0x80016010          # G L2[2] -> 1GiB leaf, HPA 0x80000000, V|R|W|X|U|A|D
+    # ---- G-stage page table (Sv39x4), root @ 0x8001C000 ----
+    li   t0, 0x8001C010          # G L2[2] -> 1GiB leaf, HPA 0x80000000, V|R|W|X|U|A|D
     li   t1, 0x200000DF
     sd   t1, 0(t0)               # GPA [0x80000000,0xC0000000) identity (guest code)
     # G L2[1] (GPA [0x40000000,0x80000000)) left 0 = invalid -> data target faults
 
     csrw 0x280, zero             # vsatp = Bare (VS-stage identity)
-    li   t0, 0x8000000000080016  # Sv39x4, PPN=0x80016
+    li   t0, 0x800000000008001C  # Sv39x4, PPN=0x8001C
     csrw 0x680, t0               # hgatp
     sfence.vma zero, zero
 

@@ -79,6 +79,12 @@ hv_trap_vector:
     sd   t0,  2*8(sp)
     addi t0, sp, FRAME               # = HV_TRAP_SP
     csrw sscratch, t0                # restore the trap-stack top for the next trap
+    # The C handler addresses its globals through gp: reload the hypervisor's
+    # (the saved x3 is the guest's, restored below).
+.option push
+.option norelax
+    la   gp, __global_pointer$
+.option pop
     mv   a0, sp                      # frame pointer
     call hv_trap                     # may advance sepc, modify the frame's a0/a1
     ld   x1,  1*8(sp)

@@ -38,6 +38,10 @@ _start:
     csrs 0x30A, t0               # menvcfg.STCE = 1
     csrs 0x60A, t0               # henvcfg.STCE = 1  (Sstc enabled for the guest)
 
+    li   t0, 2                   # TM: the guest reads time and stimecmp
+    csrs mcounteren, t0
+    csrs 0x606, t0               # hcounteren.TM
+
     li   t0, (1 << 6)            # VSTIP position (VS-level timer interrupt)
     csrw 0x603, t0               # hideleg: delegate VS timer to VS-mode
     csrw 0x605, zero             # htimedelta = 0 (guest time == mtime)
