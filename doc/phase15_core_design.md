@@ -598,7 +598,7 @@ spike では、2 つの構成で skeleton (rename + ROB + FU 1 個 + struct 配�
 | I read slot | 同じプロトコル | icache だけが使い (I-PTW は memory port 0、§M.5)、`islot_arb` (§M) が調停する。非 cacheable な fetch (ROM) も single-beat 要求としてこの slot を通す。【決定】旧コアの `o_imem` パススルーは廃止する。理由: 外部メモリプロトコルを 1 つにする (D3)。 |
 | write channel | writeback、write-through、IO store | 1 つの packet にアドレス・データ・strobe を収める。misaligned の hi 側を別線で送ることはしない (§5.9)。 |
 | coherence 入力 | probe, inv, inv2, probe ack | 再利用 dcache の既存仕様に従う。 |
-| 割込み | `i_irq_timer_m`, `i_irq_sw_m`, `i_irq_ext_m`, `i_irq_ext_s` (ゲスト外部割込みは M5) | csr で pending を作り、1 サイクル登録してから使う (§5.13)。 |
+| 割込み | `i_irq_timer_m`, `i_irq_sw_m`, `i_irq_ext_m`, `i_irq_ext_s` (ゲスト外部割込みのピンは持たない。【M5 で決定】GEILEN = 0、§S.5) | csr で pending を作り、1 サイクル登録してから使う (§5.13)。 |
 | 時刻 | `i_mtime` | lockstep 時の tick は SoC 側で作る (§5.13)。 |
 | retire ポート | `o_retire[COMMIT_W]: RetireRec`、`o_irq_evt: IrqEvent` | §5.12。新コアの観測契約はこれだけ。`o_dbg_*` の群は持たない。 |
 | デバッグ入力 | `i_dbg_retire_limit_en`, `i_dbg_retire_limit`, `i_dbg_irq_mask`, `i_dbg_irq_allow` | §5.13。通常使用ではすべて 0 に固定する。lockstep 用の検証入力で、Debug Spec の Debug Mode とは無関係 (下の行)。 |
@@ -967,8 +967,8 @@ FU とポートの対応は config パッケージの FU トポロジ表 (`PORT_
 所有者: 例外を検出したモジュールが `ExcRec` を作る。trap を取るのは `trap_unit`。
 
 ```veryl
-struct ExcRec { valid: logic, cause: logic<6>, tval: logic<64>, gpa: logic<54>, gva: logic } // gpa feeds htval (gpa >> 2)
-// M5 may add `implicit` (fault during an implicit VS-stage access) depending on the htinst/mtinst decision
+struct ExcRec { valid: logic, cause: logic<6>, tval: logic<64>, gpa: logic<62>, gva: logic, implicit: logic, ... } // gpa = GPA >> 2 (htval/mtval2)
+// implicit: a guest-page fault of an implicit VS-stage PTE access (htinst/mtinst get the pseudoinstruction, M5)
 ```
 
 - 例外 record は op と一緒に、その op の完了まで運ぶ。`rob` はエントリごとに ExcRec を持たず、最古の例外 1 つだけを 1 本のレジスタ `exc_q` に保持する (§C)。発生源は、fetch、decode (合法性)、memory pipe (翻訳、PMP、PMA、misaligned) の 3 つ。完了経路で例外を運ぶのは dispatch (fetch と decode の例外を持つ `NONE` op) と memory pipe の WB ポート (index ≥ ISSUE_W) だけで、exec ポートの packet の `exc` は常に 0 である (§X.8.2、§C.1.2)。
@@ -2461,7 +2461,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 | tval | `exc_q.rec.tval`。ただし cause 3 (breakpoint) は epc。割込みは 0。 | EBREAK は 0、不正 RVC は展開形 (`:7338-7346`) |
 | htval/mtval2 | HS/M に入る trap で、cause ∈ {20, 21, 23} なら `gpa >> 2`、それ以外は 0 (M5) | GPF 以外では古い値が残る |
 | GVA | `exc_q.rec.gva` (HS/M に入る trap)。M5。 | ROB 経由の store/AMO GPF で live な MMU 値を読む (`:7281`) |
-| tinst/htinst | 0 | 同じ |
+| tinst/htinst | 0。ただし VS-stage の暗黙の PTE 読みの guest-page fault は擬似命令 `0x3000` (`ExcRec.implicit`、M5) | 常に 0 |
 | trap vector | `tvec = to_vs ? vstvec : to_s ? stvec : mtvec`、`base = {tvec[63:2], 2'b00}`、`target = base + (tvec[0] && is_irq ? 4 * code : 0)` | 同じ (`:7480-7491`) |
 | xRET の飛び先 | MRET は `mepc`、SRET は `virt ? vsepc : sepc`。retire サイクルの csr 出力を読む (更新は次の edge)。 | 同じ (`:7714-7725`) |
 
@@ -2470,7 +2470,8 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 - 【決定】(MD、§D.4) Debug Mode 中の trap は CSR を書かない: `trap_unit` は `csr.i_trap_fire` を出さず、飛び先を EBREAK なら `i_dm_halt_pc`、それ以外の例外なら `i_dm_exc_pc` にする。dret の飛び先は dpc (`o_dret_pc`)。
 - decode 不正の tval は元の符号化 (RVC なら 16 bit) を発生源が `ExcRec.tval` に載せる (ACT4 構成の REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION)。cause 22 も同じ規則とする (M5)。
 - 特権検査はしない。合法性はすべて decode で済んでいる (C.8)。
-- 【M5 で決定】VS-stage の暗黙アクセスによる guest-page fault で、spec が tinst に擬似命令値を要求するかを照合する。要るなら `ExcRec` に `implicit` bit を足す (§5.8 で予告済み)。
+- 【M5 で決定】VS-stage の暗黙アクセスによる guest-page fault で、spec が tinst に擬似命令値を要求するかを照合する。要るなら `ExcRec` に `implicit` bit を足す (§5.8 で予告済み)。【M5 で決定】要る: 特権仕様は、VS-stage の暗黙のアクセスの guest-page fault で htval/mtval2 に 0 でない GPA を書くなら、htinst/mtinst に擬似命令を書くことを求める (0 を書けるのはそれ以外の trap)。`ExcRec.implicit` を足し、`ptw` が G-stage の walk の目的 (VS-stage の PTE か最終の GPA か) から立てる。`trap_unit` は guest-page fault で `implicit` なら `0x3000` (VS-stage 翻訳のための 64 bit の読み) を、それ以外は 0 を書く。VS-stage は Svade (§M.12) なので PTE の書き込み (`0x3020`) は起きない。旧コアは常に 0 を書いていた。
+- 【M5 で実装】VS への委譲は `to_vs = to_s && virt && hedeleg[cause]` (割込みは csr の `to_vs`)、tvec は `to_vs ? vstvec : to_s ? stvec : mtvec`。htval/mtval2 は guest-page fault なら `ExcRec.gpa` (= GPA >> 2)、それ以外の trap では 0 で、csr は HS/M に入るすべての trap で書く (付録 B の B25)。GVA は V = 1 からの trap で tval が番地である cause (0、1、3-7、12、13、15、20、21、23) すべてと、V = 0 では発生源が `ExcRec.gva` を立てたもの (HLV/HSV と、MPRV で MPV = 1 のアクセス) に立てる。hstatus.SPVP は V = 1 から HS に入る trap でだけ書く (B25)。
 - 【計画】(M3 で決めるとしていたが、判定できず計画に残した。core 全体の synth が dynamic range select に対応しておらず走らないので、CP の分解ができていない) trap 段を足すか: 深さは「cause から委譲ビットの選択、tvec の加算」で、入力はすべて登録済みである。CP の分解で `trap_unit` が名指しされた場合に限り、出力を登録し、commit は lane 0 の TRAP を 1 サイクル待たせる。commit の outcome に 1 条件を足すだけの局所変更である。
 
 ---
@@ -2612,6 +2613,7 @@ commit サイクルに評価する組合せモジュールで、入力はすべ�
 - 【決定】(MD、§D.14) dcsr、dpc、dscratch0/1 は CSR 属性表に「Debug Mode でだけ存在」の属性で登録し、decode は csr の登録済み出力 `debug_mode` に対して評価する。`debug_mode` が変わるのは入場と dret の full kill だけなので、priv と同じ論拠で decode 時の値は op から見て正しい。Debug Mode の EBREAK は `ExcRec.dm=1` で再入場し、Debug Mode の外の EBREAK は現在の特権の dcsr.ebreakm/s/u が 1 なら `dm=1` を付ける。
 - 【決定】(M2 統合) decode の M2 行は csr の登録済み出力 (`DecCsr {tw, fs, mcounteren, scounteren, menvcfg, senvcfg}`) に対して評価する。counteren の行に加え、stimecmp は HS で mcounteren.TM と menvcfg.STCE の両方を要する。
 - 【決定】WFI は、合法なら NOP (D2)、上表の条件では trap とする。理由: ACT4 の参照である Sail は U-mode の WFI と TW=1 の S-mode の WFI を illegal にする。NOP は「有界時間で完了する」ので spec 上は trap しなくてもよいが、ACT4 の比較対象に合わせる。boot の WFI は S-mode・TW=0 だけなので lockstep には影響しない。M2 で確認した: ACT4 の `sail.json` は `wfi_is_nop: false`、`wfi_available_to_user_mode: false` で、この規則と一致する。
+- 【M5 で実装】H の行 (`decode` の `illegal` は {不正命令、仮想命令} の 2 bit を返し、両方なら不正命令が勝つ。cause 22 の tval も命令の符号化): HLV/HLVX/HSV は V=1 で 22、V=0 の U で hstatus.HU = 0 なら 2。HFENCE/HINVAL は V=1 で 22、U で 2、HS で mstatus.TVM なら GVMA だけ 2。SFENCE.VMA/SINVAL.VMA は VU で 22、VS で VTVM なら 22。SFENCE.W.INVAL/INVAL.IR は VU で 22。SRET は VU で 22、VS で VTSR なら 22。WFI は mstatus.TW なら (M 以外のどのモードでも) 2、そうでなく VU か VTW の VS なら 22。CSR は、HS で許されるアクセス (mstatus.TVM を除く) を V=1 から hypervisor と VS の CSR (`addr[9:8] = 2'b10`) へ、VU から S の CSR へ行うと 22、VS の satp は VTVM なら 22、HS の hgatp は TVM なら 2。counter は mcounteren が 0 なら 2、そうでなく V=1 で hcounteren が 0 (VU では scounteren も) なら 22。VS の stimecmp は mcounteren.TM と menvcfg.STCE が無ければ 2、hcounteren.TM と henvcfg.STCE が無ければ 22。CBO は menvcfg (V=0 の U は senvcfg も) が禁じれば 2、V=1 で henvcfg (VU では senvcfg も) が禁じれば 22。FS=Off は V=1 では vsstatus.FS = Off も含む。ECALL は VS で 10、VU で 8。EBREAK の Debug Mode 入場は VS/VU で dcsr.ebreakvs/ebreakvu。HINVAL.VVMA/GVMA は再利用の decoder が知らないので `decode` が SYSTEM の符号化から拾い、SFENCE と同じ OpClass にする。SFENCE.VMA/SINVAL.VMA を V=1 で retire すると HFENCE.VVMA と同じ無効化 (hgatp の VMID) になる。旧コアの H の directed のうち、counteren を立てずに guest で time/stimecmp を読むもの (hsstc、hvtmr) と、VS-stage の PTE を書き換えて M の `sfence.vma` で済ませるもの (htwostage、HFENCE.VVMA が要る) はテスト側を直した (どちらも旧コアの逸脱に依存していた。付録 B の B23 の系統)。
 - 不正判定が decode にあるので、FS=Off の FP load がメモリに触れることも、illegal と load fault の優先順位が逆転することも構造的に起きない。
 
 ---
@@ -3524,19 +3526,21 @@ o_evt : PtwEvent  // {valid, key: PtwKey = {vpn, regime}, fault} (section 5.10);
 |---|---|
 | `cause` | page fault 12/13/15、アクセス fault 1/5/7、guest-page fault 20/21/23。どれも元のアクセス種別 (fetch、load、store/AMO) で選ぶ。cbo.* と AMO は store 側。旧コアは ROB 経由で届いた store/AMO の guest-page fault を 15 にしていた (推定)。 |
 | `tval` | fault した部分の VA。分割アクセスの後半の page で fault したら、後半の先頭バイトの VA (特権仕様の「アクセスのうち fault した部分の仮想アドレス」)。canonical でない VA はそのまま入れる。 |
-| `gpa` | guest-page fault のときだけ有効。最終アクセスなら data の GPA、VS-stage の暗黙の PTE アクセスならその PTE の GPA。`trap_unit` は htval/mtval2 に `gpa >> 2` を、それ以外の trap では 0 を書く。旧コアは cause 20/21/23 以外の trap で古い値を残していた。 |
+| `gpa` | guest-page fault のときだけ有効。最終アクセスなら data の GPA、VS-stage の暗黙の PTE アクセスならその PTE の GPA。`trap_unit` は htval/mtval2 に `gpa >> 2` を、それ以外の trap では 0 を書く。旧コアは cause 20/21/23 以外の trap で古い値を残していた。【M5 で実装】フィールドは `GPA >> 2` そのもの (62 bit、Bare の VS-stage の 64 bit の GPA も切り詰めない) で、`trap_unit` はそのまま htval/mtval2 に書く。 |
 | `gva` | tval が guest の仮想アドレスであるとき 1: V=1 のアクセス、HLV/HLVX/HSV、MPRV で MPV=1 のアクセス。 |
-| tinst | `ExcRec` には持たず、`trap_unit` は 0 を書く (旧コアと同じ)。【M5 で決定】VS-stage の暗黙アクセスによる guest-page fault に擬似命令を書く必要があるかを、仕様と ACT4/Sail で確かめる。必要なら `ExcRec` に「暗黙アクセス」の 1 bit を足す。 |
+| `implicit` | 【M5 で決定】VS-stage の暗黙の PTE 読みの guest-page fault で 1 (§C.3 の【M5 で決定】)。`trap_unit` は htinst/mtinst に `0x3000` を書き、それ以外の trap では 0 を書く。 |
 
 ### M.12 二段翻訳と V=1 (M5)
 
 - `tlb` のエントリに `{virt, vmid, vs_mode}` を足し、V=1 の合成エントリ (GVA → HPA、権限は段ごとの AND、level は 2 段の小さい方) を入れる。vsatp が Bare の翻訳 (G-stage だけ) と HLVX も入れる (HLVX は合成エントリの x を見る)。これで「キャッシュされない翻訳」が無くなり、walker が結果を保持する理由も無くなる。
 - 合成エントリで権限検査に落ちたら fault にせず miss として walk し、VS と G のどちらの fault かと GPA を owner への応答で返す (旧コアの規則を保つ)。
-- 【M5 で決定】V=1 のエントリを V=0 と同じ `tlb` に同居させるか、別の instance (初期値 32) にするか: hvlinux の walk 回数を両方で測って決める。
+- 【M5 で決定】V=1 のエントリを V=0 と同じ `tlb` に同居させるか、別の instance (初期値 32) にするか: hvlinux の walk 回数を両方で測って決める。【M5 で決定】同居させる (DTLB 32、ITLB 16 のまま)。エントリは `{virt, vmid, s1_on}` を持ち、lookup は virt が一致し、guest のエントリでは vmid と s1_on も一致したときだけ hit する。理由: guest が走っている間、hypervisor (HS) 自身の翻訳はほとんど使われない (hvlinux の hypervisor は Bare) ので、guest が使える容量は旧コアの別 instance の V=1 TLB (32) と同じになる。別 instance は lookup ポートと fill の振り分けを mem_pipe と ifu に二重に持たせる。walk 回数の比較は測っていない (同居で GH が通ったことだけを確かめた)。測るなら `o_perf.ptw_d.two` を hvlinux で数え、別 instance の版と比べる。
 - `i_no_walk` (投機要求の walk 抑止) は持たない。lookup には副作用が無く、walk を始めるのはキューへの要求だけである (X4)。c358684 の教訓「投機要求は共有 FSM の状態を保持しない」は、この 2 点と結果保持状態の廃止 (M.8.1) で構造的に満たされる。
 - walk の間は、hgatp も walk の開始時に latch した値を使う。旧コアは G-stage を再開するたびに live な hgatp を読んでいた。
 - 旧コアの二段 walk の欠落を M5 で直す。これらは golden と食い違うが、hvlinux は pass/fail だけで判定するので D4 の範囲内である: GST_*/VS_RD での PTE の PMP/PMA 検査、VS と G の PTE の予約 encoding の検査、Sv39x4 の GPA[63:41]=0 の検査、GVA の canonical 検査、二段 walk での cbo の権限 (R または W、D は不要)、MXR の意味 (vsstatus.MXR は VS-stage だけ、sstatus.MXR は両段)。
-- 【M5 で決定】guest 側の Svadu (henvcfg.ADUE による VS-stage の A/D、menvcfg.ADUE による G-stage の A/D) を実装するか、旧コアどおり A/D=0 を fault にするか: hvlinux と ACT4 の H 系テストがどちらを要求するかで決める。
+- 【M5 で決定】guest 側の Svadu (henvcfg.ADUE による VS-stage の A/D、menvcfg.ADUE による G-stage の A/D) を実装するか、旧コアどおり A/D=0 を fault にするか: hvlinux と ACT4 の H 系テストがどちらを要求するかで決める。【M5 で決定】VS-stage は Svade (henvcfg.ADUE は read-only zero、A = 0 の leaf と D = 0 の leaf への store は page fault)、G-stage は menvcfg.ADUE に従う (Svadu なら walker が V = 0 と同じ owned RMW で G-stage の leaf の A/D を立てる。D は nonspec の要求だけ)。理由: hvlinux は G-stage の leaf に A/D を立てて作り、guest の Linux は Svade で動くので、どちらの選択でも通る。ACT4 に H は無い。一方 hvlinux の firmware は menvcfg.ADUE = 1 にしており、特権仕様は menvcfg.ADUE が G-stage の A/D 更新も支配すると定めるので、G-stage を fault にすると V = 0 の Svadu と食い違う。G-stage の A/D は既存の walker の A/D 手順を段に依らず使うだけで足りる。VS-stage の A/D の書き込みは PTE の GPA を G-stage で書き込みとして翻訳し直す経路が要り (暗黙の store、`0x3020` の tinst)、旧コアにも無いので持たない。directed は `h_gad` (G-stage の A と D、ADUE = 0 の guest-page fault)。
+- 【M5 で実装】`xlate_pkg::xeff` が op ごとの regime (V0、V1、HLV) を `XlateCtx` から解く: 第一段の特権 (HLV は hstatus.SPVP)、SUM (V=1 は vsstatus.SUM)、MXR (mstatus.MXR は両段、vsstatus.MXR は VS-stage だけ)、PBMTE (V=1 は menvcfg と henvcfg の両方)。`mem_pipe` と `ifu` は lookup の前に Sv39 の canonical (VS-stage が on) と GPA < 2^41 (VS-stage が Bare で G-stage が on、違反は lookup せずに guest-page fault) を検査する。`ptw` は 1 つの cursor で両段を歩き、G-stage の walk の目的 (VS-stage の次の PTE か最終の GPA) を持つ。guest の leaf の権限が落ちたらその段の fault で終え (VS-stage の page fault が後の段の guest-page fault に化けない)、合成エントリでは落ちた権限を miss にして walk に回す。G-stage の PTE 読みも暗黙のアクセスとして S の PMP と `pte_ok` を検査する。PtwEvent の照合は vpn だけで行い (regime は比べない)、別の regime の event は pass を早く再 issue させるだけである。
+- 【M5 で確認】hgatp.PPN[1:0] は read-only zero (Sv39x4 の root は 16 KiB 境界)。旧コアの H の directed 9 本は root を 0x80016000 (PPN[1:0] = 2) に置いており、新コアでは root が 0x80014000 になって guest-page fault になった。テスト側を 0x8001C000 に移した (旧コアでも通る)。
 - 旧コアの `o_gstage_fault` は VA の一致で gate されていなかった (`mmu.veryl:1304`)。新設計では gstage と gpa は、tag 付きの fault 応答の中にだけ存在する。
 
 ### M.13 checker と発火イベント
@@ -3609,7 +3613,7 @@ L1 から見た mem_ctrl の read channel の規約を、コアの外部契約�
 - CLINT: 追加の入力 `i_tick_sel`/`i_tick` (§3.4)。`i_tick_sel=0` で従来の /10 prescaler、1 で `i_tick` のサイクルに mtime を 1 進める。SoC の `MTIME_SRC` は `CYCLE`、`INSTRET`、`EXTERNAL`、`OFF` の 4 値で、`MTIME_DIV` はその分周 (既定は `CYCLE` と 10)。値の意味と harness の対応は検証計画 §4.1 にある。
 - (MD) CLINT に追加入力 `i_time_stop` を足す。新コアの枝では全 hart の `o_dm_stoptime` の AND を入れ、V14 の枝は 0 に固定する (§D.9)。`MTIME_SRC=INSTRET` の tick は `o_retire_dm` の印の付いた record を数えない。
 - 【決定】`MTIME_SRC=INSTRET` の tick は、hart 0 の retire record (サイクル r の retire はサイクル r+1 に登録済みで出る、§C.2.7) から組合せで作り、そのサイクルの edge で mtime に入れる。tick の経路にレジスタを足さない。理由: 時刻の読みが retire 順位だけで決まるという論証 (検証計画 §4.1) は余裕が 0 サイクルである。op X がサイクル r に retire すると、record は r+1、mtime の更新は r+1 の edge、次の op Y が token を得るのは r+1、Y の `fu_sys` の受理は早くて r+2 である。tick に 1 段でもレジスタが入ると、Y は X の分の tick を見ずに読む。SoC は `MTIME_SRC==INSTRET` のとき `N_HARTS==1` と `MTIME_DIV ≥ COMMIT_W` を elaborate 時に検査する。
-- 割込み: CLINT から hart ごとの timer と software の pin、PLIC から hart ごとの M と S の外部割込みの pin (hart あたり 2 context)。`i_ext_irq_src` は PLIC に足す外部ソースで、tb が smode_plic のパルスを入れる (既定 0)。ゲスト外部割込みは M5。
+- 割込み: CLINT から hart ごとの timer と software の pin、PLIC から hart ごとの M と S の外部割込みの pin (hart あたり 2 context)。`i_ext_irq_src` は PLIC に足す外部ソースで、tb が smode_plic のパルスを入れる (既定 0)。ゲスト外部割込みは M5。【M5 で決定】GEILEN = 0 とし、ゲスト外部割込みのファイル (IMSIC の guest file) は持たない。hgeie、hgeip、hstatus.VGEIN は read-only zero で、SGEIP は立たない。ゲストへの外部割込みは hypervisor が hvip.VSEIP で注入する。理由: 旧コアも hgeip を 0 に固定しており、PLIC はゲストの context を持たない (AIA が無い)。GEILEN = 0 は特権仕様で合法である。
 - デバッグ入力: hart ごとの `i_dbg_retire_limit_en/limit`、`i_dbg_irq_mask/allow` をコアへそのまま配る (§5.13)。harness が駆動しない限り 0。
 - Debug Module (MD): `dm` の hart ごとの `haltreq`/`hartreset` をコアへ、コアの `o_dm_quiet`/`o_dm_stoptime` を `dm` と reset 木と CLINT へ配り、`dm_mem` を memory_bus の slave に、`dm_sba` を mem_ctrl の SBA の経路に置く。`ndmreset` は DM と APB 以外の reset 木に OR する。設計の正本は §D。
 - 観測: hart ごとの `o_retire`、`o_irq_evt`、`o_perf`、`o_chk` をそのまま出す。`o_chk_io` は SoC 側の IO モニタ `chk_io_mon` の sticky flag で、照合規則は検証計画 §8 にある。V14 の枝では retire port が無いので無効である。
@@ -4248,7 +4252,7 @@ ROM の手順 (命令列は `dm_rom.S`、U38。spike の DM と同じ流れ):
 | mcontext (0x7A8)、scontext (0x5A8)、hcontext (0x6A8) | 存在しない | 存在しない (不正命令) |
 | dcsr (0x7B0)、dpc (0x7B1)、dscratch0 (0x7B2)、dscratch1 (0x7B3) | 存在しない | Debug Mode でだけ存在。Debug Mode の外では不正命令 (§C.8 の MD の行) |
 
-- dcsr のフィールド: ebreakm/s/u、stepie、stopcount、stoptime、mprven、step、prv は書ける。cause と debugver は RO。ebreakvs/ebreakvu と v は M5 まで 0 (H が無い)。nmip、extcause、cetrig、pelp は 0 (NMI、Smdbltrp、Zicfilp を持たない)。
+- dcsr のフィールド: ebreakm/s/u、stepie、stopcount、stoptime、mprven、step、prv は書ける。cause と debugver は RO。ebreakvs/ebreakvu と v は M5 まで 0 (H が無い)。【M5 で実装】ebreakvs/ebreakvu (bit 17、16) と v (bit 5) は書ける。入場で v に V を保存し (Debug Mode は V = 0)、dret で V := v (prv が M なら 0) に戻す。nmip、extcause、cetrig、pelp は 0 (NMI、Smdbltrp、Zicfilp を持たない)。
 - 存在表は `csr_pkg` の属性表 1 つ (§C.8) に「Debug Mode でだけ存在」の属性を足して表す。
 - misa には何も足さない (Sdext と Sdtrig は misa に bit を持たない)。
 - rv64mi の breakpoint は tselect に書いた値が読めるかで trigger の有無を判断するので、MD からは実際に trigger を使って走る。trigger を持たない golden とは制御の流れが分かれるので、このテストは MD から pass/fail で判定する (検証計画 §9.3 と付録 B)。
@@ -4280,7 +4284,7 @@ ROM の手順 (命令列は `dm_rom.S`、U38。spike の DM と同じ流れ):
 |---|---|
 | M4 | 入場の設計を commit/trap で確定する (RTL は入れない。DEAD scaffolding を作らないため): outcome DEBUG と `RedirKind::DEBUG`、`dm_req` の受付と token の抑止を割込みと共通の項にすること、retire 制限の合成 1 項 (D.5)、`ExcRec` の `dm`/`trig`/`trig_hit`、xRET の 2 bit 化。M4 が足す取り消せない操作 (ASQ など) が §5.13.1 の表に載り、`head_started_q` の有界性と `ordering_empty` の意味 (queued atomic を含む) を保つことをレビューで確かめる。SBA が前提にする U28 の残り (他 hart の dirty コピーの recall) を入れる。【完了 (M4 手順 6)】確定した形は §D.4 の M4-1 から M4-7 と §D.5 の合成。レビューの結果は §5.13.1 の【M4 で確認】(M4 は started の発生源を足しておらず、`head_started_q` は有界、`ordering_empty` は ASQ が無い間は `sb` の空と一致)。MD に残した事項は U50、U51 |
 | MD | §D の全部 (D.0 の MD の行) と検証計画 §9 のゲート |
-| M5 | H との相互作用: 入場で dcsr.v と dcsr.prv に V と特権を保存し dret で戻す、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV の照合 (data の翻訳の regime で比べる)、Debug Mode での MPRV と MPV (mprven)、VU の要素アクセスの trigger (U39)。debug を混ぜた H の directed を G0 に足す |
+| M5 | H との相互作用: 入場で dcsr.v と dcsr.prv に V と特権を保存し dret で戻す、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV の照合 (data の翻訳の regime で比べる)、Debug Mode での MPRV と MPV (mprven)、VU の要素アクセスの trigger (U39)。debug を混ぜた H の directed を G0 に足す。【M5 手順 2 で実装】mcontrol6 の vs/vu (bit 24、23) と icount の vs/vu (bit 26、25) は V=1 のモードの照合に使い、V=0 のモードは m/s/u だけを見る。HLV/HSV の load/store の照合は `TrigCfg.ldh/sth` (hstatus.SPVP の VS か VU のモードで評価、tcontrol.mte は現在のモード) で行う。通常の load/store は現在のモードで照合する (MPRV の実効モードでは照合しない。MD のまま)。Debug Mode の data の V は `MPRV && mprven && MPP != M ? MPV : 0` (`csr.o_data_virt`)。GD の `dbgh/dm_h` (W2、W4) |
 
 ### D.17 旧コアとの関係
 
@@ -4589,7 +4593,7 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 | U36 | OpenOCD、GDB、spike、riscv-tests の版と取得、tb の JTAG DTM の transport | §D.1、R10 | MD の開始時 | 推奨: `toolchain/fetch.sh` に OpenOCD (riscv-openocd)、riscv64 の GDB、spike を pin した版で足す (prebuilt が無ければ pin した commit からの build の手順を `toolchain/README.md` に書く)。riscv-tests の debug suite は `test/riscv-arch-test/upstream/debug/` の clone を使い、commit を記録する。transport はユーザ決定どおり remote_bitbang (Verilator のラッパの DPI、localhost の TCP) から始め、GG の壁時間が梯子の予算 (目安 2 時間) を超えるときだけ `jtag_dpi` に替える。 |
 | U37 | gdbserver.py の除外表 | 検証計画 §9.2 | MD の末 | 【MD 手順 10 で決定】`test/debug/heliodor_excludes.yaml` に置き、`run_gg.sh` が `--exclude-tests` で渡す。全 target 共通の 11 本 (spike 専用の CustomRegisterTest と Unavailable*Test 4 本、持たない optional 機能の McontrolTest、HwbpManual、EtriggerTest、ItriggerTest、Sv39 だけなので Sv48Test、simulator の速さで OpenOCD の keep_alive の警告が monitor の出力に混ざる RepeatReadTest) と、`w2_n4` の MulticoreRunAllHaltOne (simulator の速さ) で、各行に理由を書く。手順 10 の時点で spike で通り heliodor で落ちて除外に無いのは InterruptTest で、原因は付録 B の B43 (mip の読み値が pin 由来の MTIP を含まない) だった。【MD で決定】B43 を直し (§C.9 の【MD で決定】)、mip の検査は通るようになった。残る「2 秒ずつ 10 回 continue して割込みが 1000 回を超える」は壁時間に依存し simulator の速さでは届かず、gdbserver.py は 1 本の test を分けられないので、InterruptTest は理由付きで全 target の除外に載せた (検証計画 §9.2)。検証計画 §9.2 の【MD 手順 10 で決定】。推奨: `test/debug/heliodor_excludes.yaml` に commit し、各行を持たない optional 機能 (Access Memory、Quick Access、aarpostincrement、data value の trigger、textra、128 bit) か spike との意図した差に結び付ける。不具合を除外で隠さない。spike で通るテストが heliodor で落ち、除外の理由が無ければ MD の出口を満たさない。 |
 | U38 | `DM_BASE`、debug memory の配置、ROM と生成コードの命令列、`hartinfo.nscratch` | §D.7、§S.2 | MD | 【MD 手順 2 で決定】`DM_BASE = 0x0000_4000`、offset の表と位置独立な ROM (`dm_rom.S`)、`nscratch = 1`、`hartinfo.dataaccess = 0` (§D.7)。【MD 手順 5 で決定】生成コードは 12 語の固定の枠 (probe、dscratch0/1 への s0/s1 の退避、`auipc s1, 1` の base、mprven の一時的な解除) と progbuf 8 語、impebreak (§D.7)。以下は M0 の推奨: `DM_BASE = 0x0000_4000` (boot ROM の直後で、どの map でも空いている)。DM code と DM data を 4 KiB ずつ、ROM の base register から ±2 KiB に収める配置。ROM は s0/s1 を dscratch0/1 に退避し、ABS に入る前に戻す (spike の DM と同じ流れ)。`nscratch` は生成コードが使わずに済む本数で、推奨 1。測るもの: gdbserver suite の register と progbuf のテストが spike と同じ結果になること。 |
-| U39 | VU の要素アクセスの trigger (M5) | §D.6、§D.16 | M5 | 推奨: `vu_mem_adapter` で要素ごとに load/store の照合を行い、一致した要素の手前で precise fault と同じく vstart を残して受け付ける (§V)。代案は vector の op を照合の対象外と宣言することだが、spec の load/store の照合は vector を除外しない。測るもの: V のテスト群と、vector の memcpy に watchpoint を置く directed。 |
+| U39 | VU の要素アクセスの trigger (M5) | §D.6、§D.16 | M5 | 【M5 で決定】推奨を採る。VU の要素アクセスは mem pipe 0 の pass なので、`mem_pipe` の m1 が他の pass と同じ照合器で要素ごとに照合する (照合の場所は `vu_mem_adapter` ではなく pipe になる)。一致は要素の fault と同じ経路 (`vu_mem_adapter` の FAULT、VU の vstart) で報告し、action = 1 の Debug Mode の入場でも commit は vstart に一致した要素を書く (`commit` の `vec_trap` に `dbg_fire` を足した)。理由: 照合器を二重に持たず、precise な要素の fault の仕組みをそのまま使える。GD の `dbgh/dm_h` の MARK 9 (vle64 の要素 2 に load trigger、vstart = 2 で止まり、再開で残りを読む)。推奨: `vu_mem_adapter` で要素ごとに load/store の照合を行い、一致した要素の手前で precise fault と同じく vstart を残して受け付ける (§V)。代案は vector の op を照合の対象外と宣言することだが、spec の load/store の照合は vector を除外しない。測るもの: V のテスト群と、vector の memcpy に watchpoint を置く directed。 |
 | U40 | ユーザ向け book の公開の場と mdbook、mdbook-i18n-helpers の版 | §MDOC | MDOC の開始時 | 推奨: 版は `toolchain/versions.env` に pin して `fetch.sh` で取る。公開 (GitHub Pages など) はユーザの判断で、MDOC は build までを出口とする。 |
 | U41 | AXI4 のデータ幅、burst の形、属性 | §MM.1 | MM | 【MM で決定 (§MM.1)】`AXI_DATA_W = 64`、`AxSIZE = 3`、INCR だけ。write は strobe の lane 範囲の 1 本 (1 line の中)。属性は下の推奨どおり。以下は決定前の記録。推奨: `AXI_DATA_W = 64`、line は `AxLEN = 7` の INCR (line 境界から)、uncached の 1 beat は `AxLEN = 0`。`AxLOCK = 0`、`AxPROT = 0`、`AxCACHE = 4'b0011` (Normal Non-cacheable Bufferable)、`AxQOS = 0`。line 幅 (512 bit) は選ばない。理由: 内側の STREAM が 64 bit/beat で、FPGA の DRAM controller の幅は AXI の width converter で吸収できる。測るもの: 固定遅延の設定で line の gather が MM の前の cycles に近いこと (検証計画 §10.2)。 |
 | U42 | ID の割り当て、read の outstanding 数、write buffer の本数 `WB_N` | §MM.3、§MM.4 | MM | 【MM で決定 (§MM.3、§MM.4)】read の ID は slot 番号 (mshr index は mem_ctrl に届かない)、outstanding は `N_SLOTS`。write の ID は 1 つ (hart 番号の ID は c2c の後の WB を追い越させる)、`WB_N` は全体で 1 つの FIFO で初期値 `2 × N_HARTS`、sweep は測定の後。以下は決定前の記録。推奨: read の ID は `{slot, mshr index}`、outstanding は `N_SLOTS` と `MSHR_N` の積まで。write の ID は hart 番号 (SBA は専用に 1 つ) で、`WB_N` は hart あたり 2 本から始める。測るもの: 乱数遅延の GL-B と bench で、write buffer 満杯による write grant の停止と AR の停止の回数 (`o_perf`)。停止が支配的なら `WB_N` を sweep する。 |
@@ -5002,6 +5006,10 @@ MD で決める事項: U32 (hartreset のドメイン)、U33 (SBA の接続形)�
 | 構造 | VU の上限を修正するか宣言する。§3.4 の VU 由来の行を消し、残す上限は §V.10 に移す。 |
 
 M5 で決める事項: U30 (VU の IO アクセス)、U39 (VU の要素アクセスの trigger)。各章が M5 に送った事項: tinst のための `ExcRec.implicit` (§5.8、§C.3)、`fpu_wrap` の二重を解消するか (§X.8)、vset/vstart の csr への渡し方 (§C.5)、N=2 の vector ゲートを足すか (§V.11)。U16 (ISA の目標) は M5 の後にユーザが判断する。
+
+進捗:
+
+- 手順 2 (H 拡張) 【M5 手順 2 で実装】: `xlate_pkg` に guest の文脈 (`XlateCtx` の V/vsatp/hgatp/vsstatus/hstatus.SPVP の field、op ごとの regime を解く `xeff`、段ごとの `stage_perm` と合成エントリの `perm_x`、`noncanon`/`gpa_big`、HFENCE の `inv_hit`) を足し、`tlb` は `{virt, vmid, s1_on}` と G-stage の権限 bit を持つ同居のエントリにした。`ptw` は 1 つの cursor で VS-stage と Sv39x4 の G-stage を歩き (状態 RES、G-stage の walk の目的 `w_fin_q`)、G-stage の A/D を owned RMW で立てる。`mem_pipe` と `ifu` は op の regime (V=1、HLV/HSV) で翻訳し、PMP は実効特権で検査する。`decode` は §C.8 の M5 行 (cause 22) と HLV/HSV (`MemOp.hlv/hlvx`、offset 0)、HINVAL、HFENCE の種類 (`opclass_pkg::sys_inv_kind`) を、`fu_sys` は VMID を、`trap_unit` は VS への委譲、htval/mtval2、GVA、htinst/mtinst を、csr は H_EN = 1 (misa の H)、hstatus/hideleg/hedeleg/henvcfg/hgatp/vsatp の WARL、V=1 の FS/VS の vsstatus への dirty、VSINH/VUINH、`o_data_virt`、dcsr の v/ebreakvs/ebreakvu を持つ。`trig_unit` は vs/vu と HLV/HSV の regime を、`commit` は vector の要素の trigger による Debug Mode の入場で vstart を書く。決めたこと: tinst の `ExcRec.implicit` (§C.3)、TLB の同居と guest の Svadu (§M.12)、GEILEN = 0 (§S.5)、U39。テスト: G0 に `m5_h.list` (H 17 本、W2/W4)、`m5_hprobe.list` (付録 B の B11、B23、B25、B40 の probe と `h_gad`)、GD に `m5_dbgh.list` (`dbgh/dm_h`)、GH に `test_w2_hvlinux`/`test_w4_hvlinux`。旧コアの H の directed 11 本と hypervisor (`test/hv`) は旧コアの逸脱に依存していたところを直した (検証計画 §7.3)。新コアの directed のうち misa の H を「無い」と確かめていた `test/priv` と、H を unserved としていた `test_decode` の 1 vector (VS の HLV.W を cause 22 に)、HFENCE の種類と VMID を知らなかった `test_sched` の reference を直した。結果: G0 は 1002 passed、4 failed (上の 3 本の修正前の `test_w{2,4}_privd_priv`、`test_sched`、`test_decode`)、85 ignored で、修正後にその 4 本が pass (合わせて 1006 passed、0 failed)。GL-B (W2) は 14,570,718 cy、record 10,417,776、hash 74d4b7982390260f で M5 手順 1 と同一 (V=0 の挙動は変わらない)。GH は W2 18,622,469 cy (instret 11,394,753)、W4 16,172,701 cy (instret 11,382,596) で pass (旧コアは 22.32M)。
 
 ### M6: 既定コアの切替
 

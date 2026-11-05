@@ -697,7 +697,7 @@ M4 の directed (手順 2、3、7): `test/coh/coh.S` (`tb/test_smp_coh.veryl`)�
 
 | 機能 | 既定スイート | boot | 注記 |
 |---|---|---|---|
-| H | htwostage、hvstrap、hvirq、hgpf、hgpfns、higpf、hlv、hvinst、hconf、hmtval2、hvscsr、hvtvm、hvsirq、hsstc、hmini、hvtiny、hvtmr (17 本) | hvlinux | ACT4 に H は無い。golden 側の V=1 の誤り (B11、B23、B25、B40) があるので golden lockstep はしない。GX で W2 と W4 を突き合わせる |
+| H | htwostage、hvstrap、hvirq、hgpf、hgpfns、higpf、hlv、hvinst、hconf、hmtval2、hvscsr、hvtvm、hvsirq、hsstc、hmini、hvtiny、hvtmr (17 本) | hvlinux | ACT4 に H は無い。golden 側の V=1 の誤り (B11、B23、B25、B40) があるので golden lockstep はしない。GX で W2 と W4 を突き合わせる。【M5 手順 2 で実装】`test/gates/m5_h.list` (`tb/test_w{2,4}_h.veryl`、pass/fail) と、付録 B の H の probe `m5_hprobe.list` (`b11_amo_gpf`、`b23_vu_fence`、`b25_htval_spvp`、`b40_mxr_cbo`) と G-stage の A/D と htinst/mtinst の `h_gad`。旧コアの 17 本のうち 11 本はテスト側を直した: hgatp の root が 16 KiB 境界に無い 9 本 (PPN[1:0] は read-only zero、root を 0x8001C000 へ)、counteren を立てずに guest が time/stimecmp を読む hsstc と hvtmr、VS-stage の PTE の変更に HFENCE.VVMA ではなく `sfence.vma` を使う htwostage。GH は `test_soc_hvlinux.veryl` の `test_w{2,4}_hvlinux` (boot_soc_harness、`test/hv/hvfw.hex` と `test/hv/hv_dram.hex`)。hypervisor (`test/hv/hv_start.S`) の trap の入口が guest の gp のまま C の handler を呼んでいたので gp を読み直すよう直した (新コアでは guest の gp を base にした HS の Bare の load が hole で access fault になる。旧コアは上位 bit を見ずに DRAM のどこかを読んで通っていたとみられる)。さらに firmware (`hvfw.S`) は mcounteren と menvcfg の CBZE/CBCFE/CBIE を、hypervisor (`hv.c`) は hcounteren と henvcfg の同じ bit を立てるようにした (guest の DT は Zicboz/Zicbom を載せ、guest は time を読む。旧コアは counteren と CBO の許可を検査しなかった)。【M5 手順 2 で確認】GH は W2 18,622,469 cy、W4 16,172,701 cy で pass |
 | V | test_arch_vadd ... vfarith (20 本)、test_vmspre | 7.1v N=1 | ACT4 に V は無い。VRF への書き込みは retire record の `vrf_wcnt`/`vrf_hash` に入るので (設計書 §5.12、§V.7)、W2/W4 の GX で vector の結果を突き合わせられる。golden も D1 パッチの最初の版から同じフィールドを出すので、V テストで最初に食い違う vector op の局所化 (設計書 §V.11) にも使える。VU の上限の修正または宣言 (設計書 §3.4) |
 
 ### 7.4 新規 directed test (自己検査型)
@@ -887,6 +887,8 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 ### 9.4 M5 での追加
 
 H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed を GD に足す: VS/VU からの halt と dret (dcsr.v、prv)、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV と vector の要素アクセスへの trigger (U39)、Debug Mode での MPRV と MPV。GG は H を持つ target の spike と比べて再び回す。
+
+【M5 手順 2 で実装】`test/gates/m5_dbgh.list` の `dbgh/dm_h` (`test/debug/prog/dm_h.S`、`test/debug/dmi/dm_h.dmi`、W2 と W4): dret で VS に入り ebreakvs で入場 (dcsr.v = 1、prv S、sscratch が vsscratch を読む)、VS の loop への haltreq (cause 3、v = 1)、VU と ebreakvu、ebreakvs が無い VS の ebreak が M への breakpoint 例外になる (mepc/mtval、mstatus.MPP = S、MPV、GVA)、mcontrol6 の vs と vu (VU/VS/HS で一致の有無が分かれる、hit)、HLV/HSV の load/store trigger が hstatus.SPVP のモードで一致し m の trigger では一致しない (一致した HSV は memory を変えない)、Debug Mode で MPRV と MPV が mprven の下でだけ二段翻訳に効く (progbuf の load、mprven = 0 と MPV = 0 は hole で cmderr 3)、vle64 の要素 2 への load trigger が vstart = 2 で止まり再開で残りを読む (U39)。DMI の assembler に `ARDH` (data1 の mask 比較) を足した。GG の再走は未実施 (main session に残す)。
 
 ### 9.5 MD の出口のゲートの結果 (`2b34717c`、2026-11-01)
 
