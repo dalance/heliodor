@@ -1,6 +1,8 @@
-// ptw: Sv39 page table walker (V = 0) with a request queue, walk
-// coalescing, the epoch rule for installs, Svadu A/D updates and PTE reads as
-// a tagged client of memory port 0
+// ptw: page table walker with a request queue, walk coalescing, the epoch
+// rule for installs, Svadu A/D updates and PTE reads as a tagged client of
+// memory port 0. A V = 0 walk is Sv39 under satp; a guest walk (V1, HLV) is
+// two-stage: Sv39 under vsatp whose every PTE address is translated by the
+// Sv39x4 G-stage under hgatp, then the G-stage translation of the final GPA
 //
 // Ports (timing contract):
 //   i_req_valid/i_req : a walk request, accepted when o_req_ready; i_req.valid
@@ -23,8 +25,8 @@
 //                       no invalidation since its start, this cycle included
 //   o_resp            : registered, the cycle after completion: the full
 //                       translation for the owner's access (pa, pma with PBMT,
-//                       exc, need_d), only while the owner lives and the walk
-//                       is of the current epoch
+//                       exc with gpa/gva/implicit, need_d), only while the
+//                       owner lives and the walk is of the current epoch
 //   o_evt             : registered, the cycle after every completion
 //   o_mem_*, i_mem_*  : one request at a time on port 0 (valid/ready; valid
 //                       never depends on ready). PTE reads are PTW_READ of
@@ -46,7 +48,8 @@
 // Owns:
 //   - an install never carries a translation read before a full kill or an
 //     invalidation
-//   - the D bit is written only for a nonspec request whose owner lives
+//   - the D bit (of a V = 0 leaf, or of the G-stage leaf of a guest's final
+//     GPA) is written only for a nonspec request whose owner lives
 //   - every completion broadcasts o_evt; at most one o_resp per walk
 //   - no result-holding state: the completion cycle installs, answers and
 //     broadcasts, then the walker is idle
@@ -61,6 +64,16 @@
 //     the walk from the root (a stale walk ends instead)
 //   - PTE reads use supervisor PMP (implicit accesses) and the PMA pte_ok bit,
 //     both checked before the read is presented
+//   - one cursor serves both stages of a guest walk: a G-stage walk runs
+//     either for the next VS-stage PTE (its leaf resumes the VS-stage at the
+//     HPA) or for the final GPA (its leaf completes). A guest leaf whose
+//     permission fails ends the walk with the fault of its stage, so a page
+//     fault is never reported as a guest-page fault of a later stage
+//   - the VS-stage is Svade (henvcfg.ADUE is read-only zero), so a guest walk
+//     writes G-stage PTEs only, with the same owned read-modify-write as V = 0
+//   - a guest walk takes one extra cycle (RES) at each leaf it resumes from;
+//     a V = 0 walk completes from its leaf directly
+//   - requesters send no VA without a key (xlate_pkg::noncanon, gpa_big)
 pub module ptw::<CFG: core_cfg> #(
     param QN     : u32                        = 4               ,
     param MEM_LAT: u32                        = fu_pkg::RESP_LAT, // accept to response
@@ -114,6 +127,7 @@ pub module ptw::<CFG: core_cfg> #(
     enum Flt: logic<2> {
         NONE,
         PAGE,
+        GUEST,
         ACCESS,
     }
 
@@ -122,16 +136,88 @@ pub module ptw::<CFG: core_cfg> #(
         REQ, // present the PTE read or the A/D write
         WAIT, // the response of an accepted request
         PARK, // a fill event before the read is presented again
+        RES, // a guest leaf is final: resume the other stage or complete
         DONE, // completion: install, answer, broadcast
     }
 
+    // The walk position after a G-stage walk of gpa is started; fin: for the
+    // final GPA (else for the next VS-stage PTE). A Bare G-stage resolves at
+    // once.
+    struct Go {
+        st : WSt        ,
+        g  : logic      , // the next read is a G-stage PTE
+        fin: logic      ,
+        pa : pma_pkg::Pa,
+        gpa: logic  <64>,
+        flt: Flt        ,
+    }
+
+    function go_g (
+        gpa: input logic<64>,
+        fin: input logic    ,
+        xe : input XEff     ,
+    ) -> Go {
+        var c    : Go;
+        c.gpa = gpa;
+        c.fin = fin;
+        c.g   = xe.g_on || fin;
+        c.flt = if xe.g_on && gpa[63:41] != '0 ? Flt::GUEST : Flt::NONE;
+        c.pa  = if xe.g_on ? {xe.groot[43:2], gpa[40:30], 3'd0} : gpa[55:0];
+        c.st  = if c.flt != Flt::NONE || (!xe.g_on && fin) ? WSt::DONE : WSt::REQ;
+        return c;
+    }
+
+    // The first read of a walk (and of a walk restarted by an A/D update).
+    function go_init (
+        gva: input logic<64>,
+        xe : input XEff     ,
+    ) -> Go {
+        var c: Go;
+        if !xe.two {
+            c.st  = WSt::REQ;
+            c.g   = 1'b0;
+            c.fin = 1'b0;
+            c.pa  = {xe.root, gva[38:30], 3'd0};
+            c.gpa = '0;
+            c.flt = Flt::NONE;
+        } else if xe.s1_on {
+            c = go_g({8'd0, xe.root, gva[38:30], 3'd0}, 1'b0, xe);
+        } else {
+            c = go_g(gva, 1'b1, xe);
+        }
+        return c;
+    }
+
     function key_of (
-        r: input XlateReq,
+        r   : input XlateReq,
+        virt: input logic   ,
     ) -> PtwKey {
         var k       : PtwKey;
-        k.vpn    = r.va[38:12];
-        k.regime = if r.hlv ? Regime::HLV : Regime::V0;
+        k.vpn    = vpn_of(r.va);
+        k.regime = if r.hlv ? Regime::HLV : if virt ? Regime::V1 : Regime::V0;
         return k;
+    }
+
+    function leaf_entry (
+        pte  : input logic<64>,
+        lvl  : input logic<2> ,
+        a_va : input logic<64>,
+        pbmte: input logic    ,
+    ) -> TlbEntry {
+        var t      : TlbEntry;
+        t       = '1;
+        t.virt  = 1'b0;
+        t.ppn   = if pte[63] ? {pte[53:14], a_va[15:12]} : pte[53:10];
+        t.level = lvl;
+        t.r     = pte[1];
+        t.w     = pte[2];
+        t.x     = pte[3];
+        t.u     = pte[4];
+        t.g     = pte[5];
+        t.d     = pte[7];
+        t.pbmt  = if pbmte ? pte[62:61] : 2'd0;
+        t.napot = pte[63];
+        return t;
     }
 
     function gone (
@@ -159,9 +245,14 @@ pub module ptw::<CFG: core_cfg> #(
     var w_own_q  : logic           ;
     var w_stale_q: logic           ;
     var w_ctx_q  : XlateCtx        ;
-    var w_lvl_q  : logic      <2>  ;
+    var w_lvl_q  : logic      <2>  ; // first-stage level
+    var w_glvl_q : logic      <2>  ; // G-stage level
     var w_pa_q   : pma_pkg::Pa     ;
-    var w_pte_q  : logic      <64> ; // the leaf PTE, or the value an A/D write stores
+    var w_gpa_q  : logic      <64> ; // the GPA under G-stage translation
+    var w_pte_q  : logic      <64> ; // the first-stage leaf, or the value an A/D write stores
+    var w_gpte_q : logic      <64> ; // the same for the G-stage
+    var w_g_q    : logic           ; // the current PTE is a G-stage PTE
+    var w_fin_q  : logic           ; // that G-stage walk is for the final GPA
     var w_flt_q  : Flt             ;
     var w_wr_q   : logic           ; // REQ presents the A/D write
     var w_seta_q : logic           ;
@@ -173,17 +264,17 @@ pub module ptw::<CFG: core_cfg> #(
     var w_id_q   : logic      <IDW>;
     var w_side_q : logic           ; // an IFU walk
 
-    let in_key : PtwKey = key_of(i_req);
+    let in_key : PtwKey = key_of(i_req, i_ctx.virt);
     let in_gone: logic  = gone(i_kill, i_owner_drop, i_req.tag.rob_v, i_req.tag.rob);
     assign o_req_ready = q_v_q != '1;
     let acc_in: logic = i_req_valid && o_req_ready && !in_gone;
 
     let w_busy: logic     = w_st_q != WSt::IDLE;
-    let hit_w : logic     = w_busy && !w_stale_q && !epoch_mv && key_of(w_req_q) == in_key;
+    let hit_w : logic     = w_busy && !w_stale_q && !epoch_mv && key_of(w_req_q, w_ctx_q.virt) == in_key;
     var hit_q : logic<QN>;
     always_comb {
         for e in 0..QN {
-            hit_q[e] = q_v_q[e] && key_of(q_req_q[e]) == in_key;
+            hit_q[e] = q_v_q[e] && key_of(q_req_q[e], i_ctx.virt) == in_key;
         }
     }
     let coal  : logic     = acc_in && !i_req.nonspec && (hit_w || hit_q != '0);
@@ -216,6 +307,8 @@ pub module ptw::<CFG: core_cfg> #(
     let pick_i: logic   <QW> = tree_onehot_enc::<QN, QW>(pick);
     let s_req : XlateReq     = q_req_q[pick_i];
     let s_own : logic        = own_n[pick_i];
+    let s_x   : XEff         = xeff(i_ctx, s_req.hlv);
+    let s_go  : Go           = go_init(s_req.va, s_x);
 
     always_ff {
         if_reset {
@@ -244,6 +337,8 @@ pub module ptw::<CFG: core_cfg> #(
 
     // ---- the walk: memory request ----
 
+    let x       : XEff      = xeff(w_ctx_q, w_req_q.hlv);
+    let cur_pte : logic<64> = if w_g_q ? w_gpte_q : w_pte_q;
     let own_live: logic = w_own_q && !gone(i_kill, i_owner_drop, w_req_q.tag.rob_v, w_req_q.tag.rob);
 
     let pte_attr  : pma_pkg::PmaAttr = pma_check::<PMA_N>(w_pa_q, PMA_TBL);
@@ -282,7 +377,7 @@ pub module ptw::<CFG: core_cfg> #(
         o_mem_req.cls   = if w_wr_q ? MemCls::STORE_EXCL : if w_adr_q ? MemCls::LOAD_EXCL : MemCls::PTW_READ;
         o_mem_req.pa    = w_pa_q;
         o_mem_req.mask  = 16'h00ff;
-        o_mem_req.wdata = {64'd0, w_pte_q};
+        o_mem_req.wdata = {64'd0, cur_pte};
         o_mem_req.attr  = pte_attr;
     }
     let mem_acc: logic = o_mem_valid && i_mem_ready;
@@ -312,54 +407,45 @@ pub module ptw::<CFG: core_cfg> #(
         ;
     }
 
-    // ---- the walk: PTE decode ----
+    // ---- the walk: PTE decode (either stage) ----
 
-    let va    : logic<64> = w_req_q.va;
-    let d     : logic<64> = rs.data[63:0];
-    let p_r   : logic     = d[1];
-    let p_w   : logic     = d[2];
-    let p_x   : logic     = d[3];
-    let p_a   : logic     = d[6];
+    let va     : logic<64> = w_req_q.va;
+    let d      : logic<64> = rs.data[63:0];
+    let p_r    : logic     = d[1];
+    let p_w    : logic     = d[2];
+    let p_x    : logic     = d[3];
+    let p_u    : logic     = d[4];
+    let p_a    : logic     = d[6];
     let p_d   : logic     = d[7];
     let p_n   : logic     = d[63];
     let p_pbmt: logic<2>  = d[62:61];
     let p_ppn : logic<44> = d[53:10];
     let p_leaf: logic     = p_r || p_x;
 
-    let nl_bad  : logic = w_lvl_q == 2'd0 || p_n || p_pbmt != 2'd0 || p_d || p_a || d[4];
-    let pbmt_bad: logic = if w_ctx_q.pbmte ? p_pbmt == 2'd3 : p_pbmt != 2'd0;
-    let mis     : logic = case w_lvl_q {
+    let c_lvl  : logic<2> = if w_g_q ? w_glvl_q : w_lvl_q;
+    let c_pbmte: logic    = if w_g_q ? x.gpbmte : x.pbmte;
+    let c_adue : logic    = if w_g_q ? x.gadue : x.adue;
+    // A G-stage leaf under a VS-stage PTE is checked as an implicit load.
+    let g_acc: AccKind = if w_fin_q ? w_req_q.acc : AccKind::LOAD;
+    let lp   : Perm    = if w_g_q ?
+        stage_perm(p_r, p_w, p_x, p_u, p_d, g_acc, csr_pkg::PrivLevel::USER, 1'b0, x.gmxr, x.gadue, w_fin_q && w_req_q.hlvx)
+    :
+        stage_perm(p_r, p_w, p_x, p_u, p_d, w_req_q.acc, x.prv, x.sum, x.mxr, x.adue, w_req_q.hlvx)
+    ;
+
+    let nl_bad  : logic = c_lvl == 2'd0 || p_n || p_pbmt != 2'd0 || p_d || p_a || p_u;
+    let pbmt_bad: logic = if c_pbmte ? p_pbmt == 2'd3 : p_pbmt != 2'd0;
+    let mis     : logic = case c_lvl {
         2'd2   : p_ppn[17:0] != 18'd0,
         2'd1   : p_ppn[8:0] != 9'd0,
         default: 1'b0,
     };
-    let napot_bad: logic    = p_n && (w_lvl_q != 2'd0 || p_ppn[3:0] != 4'b1000);
-    let leaf_bad : logic    = pbmt_bad || mis || napot_bad || (!p_a && !w_ctx_q.adue);
+    let napot_bad: logic    = p_n && (c_lvl != 2'd0 || p_ppn[3:0] != 4'b1000);
+    let leaf_bad : logic    = pbmt_bad || mis || napot_bad || (!p_a && !c_adue) || (x.two && !lp.ok);
     let p_fault  : logic    = !d[0] || d[60:54] != 7'd0 || (p_w && !p_r) || (if p_leaf ? leaf_bad : nl_bad);
     let next_idx : logic<9> = if w_lvl_q == 2'd2 ? va[29:21] : va[20:12];
+    let g_idx    : logic<9> = if w_glvl_q == 2'd2 ? w_gpa_q[29:21] : w_gpa_q[20:12];
 
-    function leaf_entry (
-        pte  : input logic<64>,
-        lvl  : input logic<2> ,
-        a_va : input logic<64>,
-        pbmte: input logic    ,
-    ) -> TlbEntry {
-        var t      : TlbEntry;
-        t.hit   = 1'b1;
-        t.ppn   = if pte[63] ? {pte[53:14], a_va[15:12]} : pte[53:10];
-        t.level = lvl;
-        t.r     = pte[1];
-        t.w     = pte[2];
-        t.x     = pte[3];
-        t.u     = pte[4];
-        t.g     = pte[5];
-        t.d     = pte[7];
-        t.pbmt  = if pbmte ? pte[62:61] : 2'd0;
-        t.napot = pte[63];
-        return t;
-    }
-
-    let lp     : Perm  = perm(leaf_entry(d, w_lvl_q, va, w_ctx_q.pbmte), w_req_q.acc, w_ctx_q);
     let want_d : logic = w_req_q.nonspec && lp.need_d;
     let set_a  : logic = !p_a;
     let set_d  : logic = want_d && own_live;
@@ -384,23 +470,77 @@ pub module ptw::<CFG: core_cfg> #(
     let r_lost: logic = r_leaf && want_d && !own_live;
 
     // The owned read found another leaf, or the exclusive write failed.
-    let ad_diff: logic = r_hit && w_adr_q && (d & ~64'hc0) != (w_pte_q & ~64'hc0);
+    let ad_diff: logic = r_hit && w_adr_q && (d & ~64'hc0) != (cur_pte & ~64'hc0);
     let ad_fail: logic = r_my && w_wr_q && rs.kind == RespKind::EXCL_FAIL;
     let redo   : logic = (ad_diff || ad_fail) && !w_stale_q && !epoch_mv;
+    let r_go   : Go    = go_init(va, x);
+
+    // A resolved leaf: a V = 0 walk completes, a guest walk resumes (RES).
+    let leaf_st: WSt = if x.two ? WSt::RES : WSt::DONE;
+
+    // ---- the walk: G-stage starts ----
+
+    let s1e   : TlbEntry    = leaf_entry(w_pte_q, w_lvl_q, va, x.pbmte);
+    let ge    : TlbEntry    = leaf_entry(w_gpte_q, w_glvl_q, w_gpa_q, x.gpbmte);
+    let in_res: logic       = w_st_q == WSt::RES;
+    // A VS-stage non-leaf: the next PTE's GPA. RES after a VS-stage leaf: the
+    // final GPA.
+    let nl_go : Go          = go_g({8'd0, p_ppn, next_idx, 3'd0}, 1'b0, x);
+    let fin_go: Go          = go_g({8'd0, entry_pa(s1e, va)}, 1'b1, x);
+    let g_hpa : pma_pkg::Pa = entry_pa(ge, w_gpa_q);
 
     // ---- the walk: completion ----
 
-    let e_ent: TlbEntry         = leaf_entry(w_pte_q, w_lvl_q, va, w_ctx_q.pbmte);
+    // A guest translation composed into one entry: the smaller level, the
+    // final PA with the bits under that level cleared (they come from the
+    // GVA), and the VS-stage PBMT over the G-stage one when not 0.
+    var e_ent: TlbEntry;
+    always_comb {
+        var lv : logic      <2> ;
+        var hpa: pma_pkg::Pa    ;
+        var pb : logic      <2> ;
+        lv    = if !x.s1_on ? ge.level : if !x.g_on || s1e.level <: ge.level ? s1e.level : ge.level;
+        hpa   = if x.g_on ? g_hpa : w_gpa_q[55:0];
+        pb    = if x.g_on ? ge.pbmt : 2'd0;
+        e_ent = s1e;
+        if x.two {
+            e_ent.virt  = 1'b1;
+            e_ent.s1_on = x.s1_on;
+            e_ent.level = lv;
+            e_ent.ppn   = hpa[55:12] & ~(case lv {
+                2'd2   : 44'h3_ffff,
+                2'd1   : 44'h1ff,
+                default: 44'h0,
+            });
+            e_ent.gr = !x.g_on || ge.r;
+            e_ent.gw = !x.g_on || ge.w;
+            e_ent.gx = !x.g_on || ge.x;
+            e_ent.gd = !x.g_on || ge.d;
+            if x.s1_on {
+                e_ent.pbmt = if s1e.pbmt != 2'd0 ? s1e.pbmt : pb;
+            } else {
+                e_ent.r     = 1'b1;
+                e_ent.w     = 1'b1;
+                e_ent.x     = 1'b1;
+                e_ent.u     = 1'b0;
+                e_ent.d     = 1'b1;
+                e_ent.g     = 1'b1;
+                e_ent.pbmt  = pb;
+                e_ent.napot = x.g_on && ge.napot;
+            }
+        }
+    }
+
     let f_pa : pma_pkg::Pa      = entry_pa(e_ent, va);
     let f_att: pma_pkg::PmaAttr = pbmt_attr(pma_check::<PMA_N>(f_pa, PMA_TBL), e_ent.pbmt);
-    let f_p  : Perm             = perm(e_ent, w_req_q.acc, w_ctx_q);
+    let f_p  : Perm             = perm_x(e_ent, w_req_q.acc, x, w_req_q.hlvx);
     var f_rd : logic           ;
     var f_wd : logic           ;
     var f_xd : logic           ;
     inst u_pmp_fr: pmp_check (
         i_addr   : {8'd0, f_pa},
         i_acc    : 2'd0        ,
-        i_priv   : w_ctx_q.prv ,
+        i_priv   : x.prv       ,
         i_pmpcfg               ,
         i_pmpaddr              ,
         o_fault  : f_rd        ,
@@ -408,7 +548,7 @@ pub module ptw::<CFG: core_cfg> #(
     inst u_pmp_fw: pmp_check (
         i_addr   : {8'd0, f_pa},
         i_acc    : 2'd1        ,
-        i_priv   : w_ctx_q.prv ,
+        i_priv   : x.prv       ,
         i_pmpcfg               ,
         i_pmpaddr              ,
         o_fault  : f_wd        ,
@@ -416,7 +556,7 @@ pub module ptw::<CFG: core_cfg> #(
     inst u_pmp_fx: pmp_check (
         i_addr   : {8'd0, f_pa},
         i_acc    : 2'd2        ,
-        i_priv   : w_ctx_q.prv ,
+        i_priv   : x.prv       ,
         i_pmpcfg               ,
         i_pmpaddr              ,
         o_fault  : f_xd        ,
@@ -432,13 +572,21 @@ pub module ptw::<CFG: core_cfg> #(
 
     let done   : logic = w_st_q == WSt::DONE;
     let pf_end : logic = w_flt_q == Flt::PAGE || (w_flt_q == Flt::NONE && !f_p.ok);
-    let af_end : logic = !pf_end && (w_flt_q == Flt::ACCESS || f_pmp || f_pma);
-    let install: logic = done && w_flt_q == Flt::NONE && !w_stale_q && !epoch_mv;
+    let gf_end : logic = w_flt_q == Flt::GUEST;
+    let af_end : logic = !pf_end && !gf_end && (w_flt_q == Flt::ACCESS || f_pmp || f_pma);
+    let install: logic = done && w_flt_q == Flt::NONE && !w_stale_q && !epoch_mv && (x.s1_on || x.g_on);
 
     always_comb {
         o_fill.valid = install;
-        o_fill.vpn   = va[38:12];
-        o_fill.asid  = w_ctx_q.asid;
+        o_fill.vpn   = vpn_of(va);
+        o_fill.asid  = x.asid;
+        o_fill.virt  = e_ent.virt;
+        o_fill.vmid  = x.vmid;
+        o_fill.s1_on = e_ent.s1_on;
+        o_fill.gr    = e_ent.gr;
+        o_fill.gw    = e_ent.gw;
+        o_fill.gx    = e_ent.gx;
+        o_fill.gd    = e_ent.gd;
         o_fill.ppn   = e_ent.ppn;
         o_fill.level = e_ent.level;
         o_fill.r     = e_ent.r;
@@ -458,15 +606,22 @@ pub module ptw::<CFG: core_cfg> #(
         resp_n.hit          = 1'b1;
         resp_n.pa           = f_pa;
         resp_n.pma          = f_att;
-        resp_n.exc.valid    = pf_end || af_end;
-        resp_n.exc.cause    = if pf_end ? pf_cause(w_req_q.acc) : af_cause(w_req_q.acc);
+        resp_n.exc.valid    = pf_end || gf_end || af_end;
+        resp_n.exc.cause    = if pf_end ?
+            pf_cause(w_req_q.acc)
+        : if gf_end ?
+            gpf_cause(w_req_q.acc)
+        :
+            af_cause(w_req_q.acc)
+        ;
         resp_n.exc.tval     = va;
-        resp_n.exc.gpa      = '0;
-        resp_n.exc.gva      = 1'b0;
+        resp_n.exc.gpa      = if gf_end ? w_gpa_q[63:2] : '0;
+        resp_n.exc.gva      = x.two;
+        resp_n.exc.implicit = gf_end && w_g_q && !w_fin_q;
         resp_n.exc.dm       = 1'b0;
         resp_n.exc.trig     = 1'b0;
         resp_n.exc.trig_hit = 0;
-        resp_n.need_d       = !pf_end && !af_end && f_p.need_d;
+        resp_n.need_d       = !pf_end && !gf_end && !af_end && f_p.need_d;
     }
 
     var resp_q: XlateResp;
@@ -487,7 +642,7 @@ pub module ptw::<CFG: core_cfg> #(
         resp_q.pma    = resp_n.pma;
         resp_q.exc    = resp_n.exc;
         resp_q.need_d = resp_n.need_d;
-        evt_q.key     = key_of(w_req_q);
+        evt_q.key     = key_of(w_req_q, w_ctx_q.virt);
         evt_q.fault   = w_flt_q != Flt::NONE;
     }
     assign o_resp = resp_q;
@@ -518,7 +673,7 @@ pub module ptw::<CFG: core_cfg> #(
             case w_st_q {
                 WSt::IDLE: {
                     if start {
-                        w_st_q    = WSt::REQ;
+                        w_st_q    = s_go.st;
                         w_own_q   = s_own;
                         w_stale_q = epoch_mv;
                         w_wr_q    = 1'b0;
@@ -540,12 +695,16 @@ pub module ptw::<CFG: core_cfg> #(
                         w_wr_q = 1'b0;
                     } else if r_my {
                         if ad_diff || ad_fail {
-                            w_st_q = if redo ? WSt::REQ : WSt::DONE;
+                            w_st_q = if redo ? r_go.st : WSt::DONE;
                         } else if w_wr_q {
-                            w_st_q = if rs.kind == RespKind::EXCL_PASS ? WSt::DONE : WSt::REQ;
+                            w_st_q = if rs.kind == RespKind::EXCL_PASS ? leaf_st : WSt::REQ;
                         } else if rs.kind == RespKind::HIT {
-                            if p_fault || !p_leaf || !need_wr {
-                                w_st_q = if p_fault || p_leaf ? WSt::DONE : WSt::REQ;
+                            if p_fault {
+                                w_st_q = WSt::DONE;
+                            } else if !p_leaf {
+                                w_st_q = if x.two && !w_g_q ? nl_go.st : WSt::REQ;
+                            } else if !need_wr {
+                                w_st_q = leaf_st;
                             } else if pte_w_deny {
                                 w_st_q = WSt::DONE;
                             } else {
@@ -571,6 +730,11 @@ pub module ptw::<CFG: core_cfg> #(
                         w_st_q = WSt::REQ;
                     }
                 }
+                WSt::RES: {
+                    w_adr_q = 1'b0;
+                    w_wr_q  = 1'b0;
+                    w_st_q  = if !w_g_q ? fin_go.st : if w_fin_q ? WSt::DONE : WSt::REQ;
+                }
                 default: w_st_q = WSt::IDLE;
             }
         }
@@ -581,30 +745,77 @@ pub module ptw::<CFG: core_cfg> #(
             w_req_q  = s_req;
             w_ctx_q  = i_ctx;
             w_lvl_q  = 2'd2;
-            w_pa_q   = {i_ctx.root, s_req.va[38:30], 3'd0};
             w_flt_q  = Flt::NONE;
             w_side_q = s_req.tag.client == MemClient::IFU;
             w_seta_q = 1'b0;
             w_setd_q = 1'b0;
+            w_pa_q   = s_go.pa;
+            w_gpa_q  = s_go.gpa;
+            w_g_q    = s_go.g;
+            w_fin_q  = s_go.fin;
+            w_glvl_q = 2'd2;
+            if s_go.flt != Flt::NONE {
+                w_flt_q = s_go.flt;
+            }
         } else if in_req && !w_wr_q && pte_deny {
             w_flt_q = Flt::ACCESS;
         } else if redo {
             w_lvl_q  = 2'd2;
-            w_pa_q   = {w_ctx_q.root, va[38:30], 3'd0};
             w_seta_q = 1'b0;
             w_setd_q = 1'b0;
+            w_pa_q   = r_go.pa;
+            w_gpa_q  = r_go.gpa;
+            w_g_q    = r_go.g;
+            w_fin_q  = r_go.fin;
+            w_glvl_q = 2'd2;
+            if r_go.flt != Flt::NONE {
+                w_flt_q = r_go.flt;
+            }
         } else if r_hit && !ad_diff {
             if p_fault {
-                w_flt_q = Flt::PAGE;
+                w_flt_q = if w_g_q ? Flt::GUEST : Flt::PAGE;
             } else if !p_leaf {
-                w_pa_q  = {p_ppn, next_idx, 3'd0};
-                w_lvl_q = w_lvl_q - 2'd1;
+                if w_g_q {
+                    w_pa_q   = {p_ppn, g_idx, 3'd0};
+                    w_glvl_q = w_glvl_q - 2'd1;
+                } else if x.two {
+                    w_lvl_q = w_lvl_q - 2'd1;
+                    w_pa_q   = nl_go.pa;
+                    w_gpa_q  = nl_go.gpa;
+                    w_g_q    = nl_go.g;
+                    w_fin_q  = nl_go.fin;
+                    w_glvl_q = 2'd2;
+                    if nl_go.flt != Flt::NONE {
+                        w_flt_q = nl_go.flt;
+                    }
+                } else {
+                    w_pa_q  = {p_ppn, next_idx, 3'd0};
+                    w_lvl_q = w_lvl_q - 2'd1;
+                }
             } else if need_wr && pte_w_deny {
                 w_flt_q = Flt::ACCESS;
             } else {
-                w_pte_q  = d | (if need_wr ? 64'h40 : 64'h0) | (if set_d ? 64'h80 : 64'h0);
+                if w_g_q {
+                    w_gpte_q = d | (if need_wr ? 64'h40 : 64'h0) | (if set_d ? 64'h80 : 64'h0);
+                } else {
+                    w_pte_q = d | (if need_wr ? 64'h40 : 64'h0) | (if set_d ? 64'h80 : 64'h0);
+                }
                 w_seta_q = set_a;
                 w_setd_q = set_d;
+            }
+        } else if in_res {
+            if !w_g_q {
+                w_pa_q   = fin_go.pa;
+                w_gpa_q  = fin_go.gpa;
+                w_g_q    = fin_go.g;
+                w_fin_q  = fin_go.fin;
+                w_glvl_q = 2'd2;
+                if fin_go.flt != Flt::NONE {
+                    w_flt_q = fin_go.flt;
+                }
+            } else if !w_fin_q {
+                w_pa_q = g_hpa;
+                w_g_q  = 1'b0;
             }
         } else if r_my {
             w_fid_q = rs.fill_id;
@@ -634,6 +845,9 @@ pub module ptw::<CFG: core_cfg> #(
         o_perf.ad_rd    = mem_acc && !w_wr_q && w_adr_q;
         o_perf.ad_redo  = redo;
         o_perf.ad_wd    = wd;
+        o_perf.two      = start && s_x.two;
+        o_perf.g_rd     = mem_acc && !w_wr_q && w_g_q;
+        o_perf.gfault   = done && gf_end;
     }
 
     #[ifdef(HELIODOR_CHK)]

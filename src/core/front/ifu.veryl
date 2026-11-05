@@ -8,7 +8,8 @@
 //                           icache request missed (wins over a take)
 //   i_xl_on, i_ctx, i_pmp*, i_dm : live csr state, read in f0; they change
 //                           only at a flushing retire. i_xl_on: Sv39 is on
-//                           for fetch; i_dm: debug_mode
+//                           for a V = 0 fetch (a V = 1 fetch translates by
+//                           vsatp and hgatp, i_ctx.virt); i_dm: debug_mode
 //   o_tlb_lk/i_tlb        : f0, the ITLB lookup port, combinational round trip
 //   o_xreq_valid/o_xreq, i_xreq_ready : f0, the walk request of the oldest
 //                           unfetched block (nothing in f1 or f2) on an ITLB
@@ -30,7 +31,8 @@
 //   o_ev_*                : event wires: no FBQ credit, ftq empty with the ifu
 //                           idle, stopped after a faulted block
 // Stages: f0 takes an FTQ entry, translates its aligned block (Bare: PA =
-// VA; Sv39: an ITLB hit, or a walk first), and evaluates PMA and per-granule
+// VA; Sv39 or a guest's two stages: an ITLB hit, or a walk first; a guest
+// entry failing a check walks for its fault), and evaluates PMA and per-granule
 // PMP execute permission, all combinationally; f1 (registered) requests the icache; f2 is the cycle after
 // the accept and receives the response, pushing a HIT into the FBQ. The
 // module has one register per stage, so it requires IC_RESP_LAT = 1
@@ -113,7 +115,7 @@ pub module ifu::<CFG: core_cfg> #(
     var stop_q : logic       ; // a faulted block was taken
     var fbq_n_q: logic<CNT_W>; // FBQ occupancy
     var xw_q   : logic       ; // a walk of page xvpn_q is pending
-    var xvpn_q : logic<27>   ;
+    var xvpn_q : logic<29>   ;
     var xf_q   : logic       ; // the walk of page xvpn_q faulted with xexc_q
     var xexc_q : exc_pkg::ExcRec;
 
@@ -127,27 +129,26 @@ pub module ifu::<CFG: core_cfg> #(
     let f1_go : logic = f1_out && i_ic_ready;
 
     // f0: translation of the aligned block and its PMA.
+    let x     : xlate_pkg::XEff      = xlate_pkg::xeff(i_ctx, 1'b0);
+    let xon   : logic                = xlate_pkg::xl_on(x, i_xl_on);
     let va    : logic           <64> = i_fetch.start_pc;
-    let vpn   : logic           <27> = va[38:12];
+    let vpn   : logic           <29> = xlate_pkg::vpn_of(va);
     let base  : logic           <64> = va & ~((CFG::FETCH_BYTES - 1) as 64);
-    let noncan: logic                = i_xl_on && va[63:39] != {va[38] repeat 25};
+    let noncan: logic                = xon && xlate_pkg::noncanon(x, va);
+    let gbig  : logic                = xon && xlate_pkg::gpa_big(x, va);
     let xf_hit: logic                = xf_q && xvpn_q == vpn;
-    let lk    : logic                = i_xl_on && !noncan && !xf_hit;
-    let miss  : logic                = lk && !i_tlb.hit;
-    let prm   : xlate_pkg::Perm      = xlate_pkg::perm(i_tlb, xlate_pkg::AccKind::FETCH, i_ctx);
-    let pf    : logic                = noncan || (lk && i_tlb.hit && !prm.ok);
-    let pa    : pma_pkg::Pa          = if i_xl_on ? xlate_pkg::entry_pa(i_tlb, base) : base[55:0];
-    let pma   : pma_pkg::PmaAttr     = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(pa, PMA_REGIONS), if i_xl_on ? i_tlb.pbmt : 2'd0);
+    let lk    : logic                = xon && !noncan && !gbig && !xf_hit;
+    let prm   : xlate_pkg::Perm      = xlate_pkg::perm_x(i_tlb, xlate_pkg::AccKind::FETCH, x, 1'b0);
+    let miss  : logic                = lk && (!i_tlb.hit || prm.walk);
+    let pf    : logic                = noncan || (lk && i_tlb.hit && !prm.ok && !prm.walk);
+    let pa    : pma_pkg::Pa          = if xon ? xlate_pkg::entry_pa(i_tlb, base) : base[55:0];
+    let pma   : pma_pkg::PmaAttr     = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(pa, PMA_REGIONS), if xon ? i_tlb.pbmt : 2'd0);
     let dbg   : logic                = pma.target == pma_pkg::Target::DEBUG;
     let attr  : pma_pkg::PmaAttr     = if dbg && !i_dm ? 0 as pma_pkg::PmaAttr : pma;
-    let af    : logic                = (!i_xl_on && va[63:56] != 0) || !attr.executable;
-    let fault : logic                = xf_hit || pf || af;
+    let af    : logic                = (!xon && va[63:56] != 0) || !attr.executable;
+    let fault : logic                = xf_hit || pf || gbig || af;
 
-    always_comb {
-        o_tlb_lk.valid = i_fetch_valid && lk;
-        o_tlb_lk.vpn   = vpn;
-        o_tlb_lk.asid  = i_ctx.asid;
-    }
+    assign o_tlb_lk = xlate_pkg::lookup_of(x, va, i_fetch_valid && lk);
     var deny  : logic           <GRAN_N>;
     for g in 0..GRAN_N :g_pmp {
         inst u_pmp: pmp_check (
@@ -197,8 +198,10 @@ pub module ifu::<CFG: core_cfg> #(
         f0_req.id.pred      = i_fetch.pred;
         f0_req.id.probe     = !fault;
         f0_req.id.exc.valid = fault;
-        f0_req.id.exc.cause = if pf ? 6'd12 : 6'd1;
+        f0_req.id.exc.cause = if pf ? 6'd12 : if gbig ? 6'd20 : 6'd1;
         f0_req.id.exc.tval  = i_fetch.start_pc;
+        f0_req.id.exc.gpa   = if gbig ? va[63:2] : '0;
+        f0_req.id.exc.gva   = x.two;
         if xf_hit {
             f0_req.id.exc = xexc_q;
         }
@@ -224,7 +227,7 @@ pub module ifu::<CFG: core_cfg> #(
         o_xreq.acc        = xlate_pkg::AccKind::FETCH;
     }
     let x_acc : logic = o_xreq_valid && i_xreq_ready;
-    let x_end : logic = i_ptw_evt.valid && i_ptw_evt.key.vpn == xvpn_q && i_ptw_evt.key.regime == xlate_pkg::Regime::V0;
+    let x_end : logic = i_ptw_evt.valid && i_ptw_evt.key.vpn == xvpn_q;
     let x_flt : logic = i_ptw_resp.valid && i_ptw_resp.exc.valid && i_ptw_resp.tag.client == MemClient::IFU;
     let push  : logic        = r_hit && !flush;
 

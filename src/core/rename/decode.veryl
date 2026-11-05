@@ -291,14 +291,6 @@ module decode::<CFG: core_cfg> (
         }
     }
 
-    // CSRs of extensions this build does not serve: the hypervisor and VS
-    // CSRs (address bits [9:8] = 2'b10).
-    function csr_unserved (
-        a: input logic<12>,
-    ) -> logic {
-        return a[9:8] == 2'b10;
-    }
-
     function csr_vec (
         a: input logic<12>,
     ) -> logic {
@@ -330,7 +322,9 @@ module decode::<CFG: core_cfg> (
         };
     }
 
-    // Decode-time legality of one instruction (see the header).
+    // Decode-time legality of one instruction (see the header): bit 0 is an
+    // illegal instruction (cause 2), bit 1 a virtual instruction (cause 22);
+    // bit 0 wins when both hold.
     function illegal (
         insn  : input logic             <32>,
         dill  : input logic                 ,
@@ -355,35 +349,56 @@ module decode::<CFG: core_cfg> (
         tsr   : input logic                 ,
         tvm   : input logic                 ,
         cs    : input csr_pkg::DecCsr       ,
-    ) -> logic {
+    ) -> logic<2> {
         let f3    : logic<3>  = insn[14:12];
         let f7    : logic<7>  = insn[31:25];
         let f12   : logic<12> = insn[31:20];
         let rp    : logic<2>  = if f12[9:8] == 2'b10 ? 2'b01 : f12[9:8];
         let hfen  : logic     = sfence && (f7 == 7'b0010001 || f7 == 7'b0110001 || f7 == 7'b0010011 || f7 == 7'b0110011);
+        let gvma  : logic     = hfen && f7[5];
         let hs    : logic     = priv == csr_pkg::PrivLevel::SUPERVISOR && !virt;
+        let vs    : logic     = priv == csr_pkg::PrivLevel::SUPERVISOR && virt;
+        let vu    : logic     = priv == csr_pkg::PrivLevel::USER && virt;
         let wrs   : logic     = f12 == 12'h00d || f12 == 12'h01d;
         let mret  : logic     = xret && f12 == 12'h302;
         let sret  : logic     = xret && f12 == 12'h102;
         let is_sys: logic     = insn[6:0] == riscv_pkg::Opcode::SYSTEM;
         let umode : logic     = priv == csr_pkg::PrivLevel::USER;
+        let hu    : logic     = umode && !virt; // U-mode with V = 0
         let below : logic     = priv != csr_pkg::PrivLevel::MACHINE;
-        let ctr   : logic     = f12[11:5] == 7'b1100000; // cycle, time, instret, hpmcounterN
-        let ctr_ill: logic    = csr && ((ctr && ((below && !cs.mcounteren[f12[4:0]]) || (umode && !cs.scounteren[f12[4:0]])))
-            || (f12 == 12'h14d && hs && !(cs.mcounteren[1] && cs.menvcfg[63])));
-        let fs_ill: logic = cs.fs == 2'b00 && (fp || vfp || (csr && f12 >= 12'h001 && f12 <= 12'h003));
-        let vs_off: logic = cs.vs == 2'b00 || (virt && cs.vsvs == 2'b00);
-        let vs_ill: logic = (vec && (vs_off || vec_rsv(insn))) || (csr && csr_vec(f12) && vs_off);
-        let cbo_k : logic<5> = insn[24:20]; // 0 inval, 1 clean, 2 flush, 4 zero
-        let cbo_ill: logic   = cbo && ((below && !cbo_on(cs.menvcfg, cbo_k)) || (umode && !cbo_on(cs.senvcfg, cbo_k)));
-        let unsrv : logic     = (amo && !amo_legal(insn)) || hlv || hfen || (csr && csr_unserved(f12));
-        let csr_ill: logic    = csr && (!csr_pkg::csr_exists(f12) || rp >: priv || (f12[11:10] == 2'b11 && csr_wr) || (hs
-            && tvm && f12 == 12'h180) || (csr_pkg::csr_dm_only(f12) && !cs.dm));
-        let sys_ill: logic = (mret && priv != csr_pkg::PrivLevel::MACHINE) || (sret && (priv == csr_pkg::PrivLevel::USER
-            || (hs && tsr))) || (sfence && !hfen && hs && tvm) || ((sfence || sinval) && umode) || (wfi && (umode || (hs
-            && cs.tw))) || (dret && !cs.dm) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret || wfi || sfence || sinval
-            || wrs || dret));
-        return dill || enc || unsrv || csr_ill || ctr_ill || fs_ill || vs_ill || cbo_ill || sys_ill;
+        // CSR access: what HS-mode would allow (mstatus.TVM aside), then the
+        // V = 1 rules that turn an HS-legal access into a virtual instruction.
+        let csr_base: logic = csr_pkg::csr_exists(f12) && !(f12[11:10] == 2'b11 && csr_wr) && !(csr_pkg::csr_dm_only(f12)
+            && !cs.dm);
+        let ctr     : logic = f12[11:5] == 7'b1100000; // cycle, time, instret, hpmcounterN
+        let ctr_m   : logic = ctr && below && !cs.mcounteren[f12[4:0]];
+        let ctr_ill : logic = csr && (ctr_m || (hu && ctr && !cs.scounteren[f12[4:0]]));
+        let ctr_vill: logic = csr && ctr && !ctr_m && virt && (!cs.hcounteren[f12[4:0]] || (umode && !cs.scounteren[f12[4:0]]));
+        let stce_m  : logic = cs.mcounteren[1] && cs.menvcfg[63];
+        let stc_ill : logic = csr && f12 == 12'h14d && below && !stce_m;
+        let stc_vill: logic = csr && f12 == 12'h14d && vs && !(cs.hcounteren[1] && cs.henvcfg[63]);
+        let h_csr   : logic = f12[9:8] == 2'b10; // hypervisor and VS CSRs
+        let csr_vhs : logic = virt && (h_csr || (umode && f12[9:8] == 2'b01)); // HS-level from VS/VU
+        let csr_ill : logic = csr && (!csr_base || (if csr_vhs ? 1'b0 : rp >: priv) || (hs && tvm && (f12 == 12'h180
+            || f12 == 12'h680)));
+        let csr_vill: logic = csr && csr_base && (csr_vhs || (vs && cs.vtvm && f12 == 12'h180));
+        let fs_ill  : logic = (cs.fs == 2'b00 || (virt && cs.vsfs == 2'b00)) && (fp || vfp || (csr && f12 >= 12'h001
+            && f12 <= 12'h003));
+        let vs_off  : logic = cs.vs == 2'b00 || (virt && cs.vsvs == 2'b00);
+        let vs_ill  : logic = (vec && (vs_off || vec_rsv(insn))) || (csr && csr_vec(f12) && vs_off);
+        let cbo_k   : logic<5> = insn[24:20]; // 0 inval, 1 clean, 2 flush, 4 zero
+        let cbo_ill : logic = cbo && ((below && !cbo_on(cs.menvcfg, cbo_k)) || (hu && !cbo_on(cs.senvcfg, cbo_k)));
+        let cbo_vill: logic = cbo && virt && (!cbo_on(cs.henvcfg, cbo_k) || (umode && !cbo_on(cs.senvcfg, cbo_k)));
+        let unsrv   : logic = amo && !amo_legal(insn);
+        let vmsfen  : logic = sfence && !hfen; // SFENCE.VMA, SINVAL.VMA
+        let sys_ill : logic = (mret && below) || (sret && (hu || (hs && tsr))) || (vmsfen && (hu || (hs && tvm))) || (sinval
+            && hu) || (hfen && (hu || (gvma && hs && tvm))) || (wfi && (hu || (below && cs.tw))) || (hlv && hu && !cs.hu)
+            || (dret && !cs.dm) || (is_sys && f3 == 3'b000 && !(ecall || ebreak || xret || wfi || sfence || sinval || wrs
+            || dret));
+        let sys_vill: logic = (sret && (vu || (vs && cs.vtsr))) || (vmsfen && (vu || (vs && cs.vtvm))) || (sinval && vu)
+            || ((hfen || hlv) && virt) || (wfi && !cs.tw && (vu || (vs && cs.vtw)));
+        let ill: logic = dill || enc || unsrv || csr_ill || ctr_ill || stc_ill || fs_ill || vs_ill || cbo_ill || sys_ill;
+        return {!ill && (csr_vill || ctr_vill || stc_vill || cbo_vill || sys_vill), ill};
     }
 
     var lane_ill: logic [W];
@@ -399,9 +414,21 @@ module decode::<CFG: core_cfg> (
             let dret  : logic     = insn == 32'h7b20_0073;
             let eb_dm : logic     = i_csr.dm || case i_priv {
                 csr_pkg::PrivLevel::MACHINE   : i_csr.ebreak[2],
-                csr_pkg::PrivLevel::SUPERVISOR: i_csr.ebreak[1],
-                default                       : i_csr.ebreak[0],
+                csr_pkg::PrivLevel::SUPERVISOR: if i_virt ? i_csr.ebreakv[1] : i_csr.ebreak[1],
+                default                       : if i_virt ? i_csr.ebreakv[0] : i_csr.ebreak[0],
             };
+            // HINVAL.VVMA/GVMA: the decoder leaves them to the SYSTEM catch-all.
+            let hinval: logic     = insn[6:0] == riscv_pkg::Opcode::SYSTEM && f3 == 3'b000 && insn[11:7] == 5'd0
+                && (insn[31:25] == 7'b0010011 || insn[31:25] == 7'b0110011);
+            let sfen  : logic     = is_sfence[l] || hinval;
+            let hf_k  : xlate_pkg::InvKind = if insn[31:25] == 7'b0110001 || insn[31:25] == 7'b0110011 ?
+                xlate_pkg::InvKind::HFENCE_GVMA
+            : if i_virt || insn[31:25] == 7'b0010001 || insn[31:25] == 7'b0010011 ?
+                xlate_pkg::InvKind::HFENCE_VVMA
+            :
+                xlate_pkg::InvKind::SFENCE
+            ;
+            let hlv_m : logic     = hlv[l] || hlvx[l];
             let fpc   : logic     = is_fp[l] && !mem_ren[l] && !mem_wen[l];
             let opv   : logic     = insn[6:0] == riscv_pkg::Opcode::OP_V;
             let vfp   : logic     = is_vec[l] && opv && (f3 == 3'b001 || f3 == 3'b101);
@@ -412,17 +439,17 @@ module decode::<CFG: core_cfg> (
             let w_rsv : logic     = (opc == riscv_pkg::Opcode::LOAD && f3 == 3'b111) || (opc == riscv_pkg::Opcode::STORE
                 && f3[2]) || (is_fp[l] && !fpc && f3 == 3'b100);
 
-            let ill: logic = illegal(insn, dec_ill[l], is_vec[l], vfp, is_fp[l] && !is_vec[l], w_rsv || rm_ill, is_amo[l], is_cbo_z[l]
-                || is_cbo_m[l], hlv[l] || hlvx[l], is_csr[l], csr_wr, is_sfence[l], is_sinval[l], is_ecall[l], is_ebreak[l],
-                is_mret[l], is_wfi[l], dret, i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr);
+            let ill: logic<2> = illegal(insn, dec_ill[l], is_vec[l], vfp, is_fp[l] && !is_vec[l], w_rsv || rm_ill, is_amo[l],
+                is_cbo_z[l] || is_cbo_m[l], hlv_m, is_csr[l], csr_wr, sfen, is_sinval[l], is_ecall[l], is_ebreak[l], is_mret[l],
+                is_wfi[l], dret, i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr);
 
             var exc: exc_pkg::ExcRec;
             exc = 0 as exc_pkg::ExcRec;
             if i_xop[l].exc.valid {
                 exc = i_xop[l].exc;
-            } else if ill {
+            } else if ill != 2'b00 {
                 exc.valid = 1'b1;
-                exc.cause = 6'd2;
+                exc.cause = if ill[0] ? 6'd2 : 6'd22;
                 exc.tval  = if i_xop[l].is_rvc ? {48'd0, i_xop[l].cinsn} : {32'd0, insn};
             } else if is_ecall[l] {
                 exc.valid = 1'b1;
@@ -436,7 +463,7 @@ module decode::<CFG: core_cfg> (
                 exc.cause = 6'd3;
                 exc.dm    = eb_dm;
             }
-            lane_ill[l] = !i_xop[l].exc.valid && ill;
+            lane_ill[l] = !i_xop[l].exc.valid && ill != 2'b00;
             lane_exc[l] = exc.valid;
 
             var di           : DecInfo;
@@ -457,7 +484,7 @@ module decode::<CFG: core_cfg> (
             di.csr_wr     = csr_wr;
             di.csr_fp     = fpcsr;
             di.is_xret    = is_mret[l] || dret;
-            di.is_sfence  = is_sfence[l];
+            di.is_sfence  = sfen;
             di.is_sinval  = is_sinval[l];
             di.is_fence   = is_fence[l];
             di.is_fence_i = is_fence_i[l];
@@ -505,15 +532,21 @@ module decode::<CFG: core_cfg> (
                     d.uop      = sys_op(is_csr[l], csr_op[l], csr_imm[l]) as UOP_W;
                     d.rs1.used = !is_csr[l] || !csr_imm[l];
                     d.rs2.used = !is_csr[l];
-                    d.imm      = if is_csr[l] ? {15'd0, insn[19:15], f12} : {30'd0, insn[24:20] == 0, insn[19:15] == 0};
+                    d.imm      = if is_csr[l] ? {15'd0, insn[19:15], f12} : {28'd0, hf_k as 2, insn[24:20] == 0, insn[19:15] == 0};
                 }
+                // An HLV/HSV has no offset; its size is funct7[2:1] and rs2[0]
+                // makes an HLV load unsigned.
                 FuKind::LOAD, FuKind::STORE: {
                     let cbo: logic = is_cbo_z[l] || is_cbo_m[l];
-                    d.uop      = {cbo, is_fp[l], if cbo ? f12[2:0] : f3} as UOP_W;
+                    d.uop      = if hlv_m ?
+                        {hlvx[l], 1'b1, 2'b00, c.fu == FuKind::LOAD && insn[20], insn[27:26]} as UOP_W
+                    :
+                        {cbo, is_fp[l], if cbo ? f12[2:0] : f3} as UOP_W
+                    ;
                     d.rs1.used = 1'b1;
                     d.rs2.used = c.fu == FuKind::STORE && !cbo;
                     d.rs2.rcls = if is_fp[l] ? RegClass::FP : RegClass::INT;
-                    if cbo {
+                    if cbo || hlv_m {
                         d.imm = 32'd0;
                     }
                 }

@@ -1,6 +1,6 @@
-// mem_pipe: one memory pipe; address generation, translation (Bare or Sv39
-// through a DTLB lookup port) with PMP and PMA, the dcache request,
-// forwarding, load formatting and the WB packet
+// mem_pipe: one memory pipe; address generation, translation (Bare, Sv39, or
+// a guest's two stages through a DTLB lookup port) with PMP and PMA, the
+// dcache request, forwarding, load formatting and the WB packet
 //
 // Served: integer and FP loads and stores of 1, 2, 4 and 8 bytes, misaligned
 // and line-crossing ones included where the region allows misaligned access;
@@ -32,12 +32,15 @@
 //   o_started      : m1, the accepted nonspec walk request of the op holding
 //                    the oldest token (commit's head_started_q)
 //   o_rf_addr*, i_rf_*, i_wb : m0 register read, bypassed from the WB bus
-//   i_xl_on, i_ctx, i_pmp* : read at m1; they change only at a flushing
-//                    retire. i_xl_on: Sv39 is on for data accesses (satp
-//                    mode and the effective privilege, MPRV included);
-//                    i_ctx.prv is that effective privilege, also for PMP
-//   i_pmm          : read at m0 with i_xl_on; the pointer-masking mode of
-//                    the effective privilege, changed only by a flushing retire
+//   i_xl_on, i_ctx, i_pmp* : read at m0 and m1; they change only at a
+//                    flushing retire. i_xl_on: Sv39 is on for V = 0 data
+//                    accesses (satp mode and the effective privilege, MPRV
+//                    included); i_ctx.prv is that effective privilege, also
+//                    for PMP. A guest access (i_ctx.virt, or an HLV/HSV op)
+//                    resolves its regime with xlate_pkg::xeff
+//   i_pmm, i_pmm_h : read at m0; the pointer-masking mode of the effective
+//                    privilege and that of HLV/HSV, changed only by a
+//                    flushing retire
 //   i_dm           : csr's debug_mode, read at m1; it changes only at the
 //                    full kills of Debug Mode entry and dret
 //   i_trig         : trig_unit's configuration, read at m1 (it changes only
@@ -94,7 +97,11 @@
 //     token and keeps its lo dword in the lq split buffer
 //   - Bare: PA = VA, and a VA above the PA width is a hole (access fault).
 //     Sv39: a non-canonical VA is a page fault without a lookup; a hit is
-//     checked by xlate_pkg::perm, so a page fault wins over PMP and PMA
+//     checked by xlate_pkg::perm_x, so a page fault wins over PMP and PMA.
+//     A guest: a GPA of 2^41 or above under a Bare VS-stage is a guest-page
+//     fault without a lookup; a guest entry that fails a check walks, and
+//     the walk reports the faulting stage and the GPA. Every exception of a
+//     guest access carries gva
 //   - access fault (cause 5 load and LR, 7 store, AMO, SC and CBO) for a
 //     hole, a PMP denial, a misaligned access to a region without
 //     misaligned_ok, any misaligned atomic (before translation), an atomic
@@ -144,6 +151,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
     i_xl_on  : input logic                   ,
     i_ctx    : input xlate_pkg::XlateCtx     ,
     i_pmm    : input logic              <2>  ,
+    i_pmm_h  : input logic              <2>  ,
     i_pmpcfg : input logic              <64> [2] ,
     i_pmpaddr: input logic              <64> [16],
     i_dm     : input logic                   ,
@@ -186,12 +194,13 @@ pub module mem_pipe::<CFG: core_cfg> #(
 
     // ---- helpers ----
 
-    // An event of the walk of page vpn (the pipe walks V = 0 only).
+    // An event of the walk of page vpn. The regime is not compared: an event
+    // of another regime only re-issues the pass early, which then walks again.
     function ev_hit (
         e  : input PtwEvent ,
-        vpn: input logic<27>,
+        vpn: input logic<29>,
     ) -> logic {
-        return e.valid && e.key.vpn == vpn && e.key.regime == xlate_pkg::Regime::V0;
+        return e.valid && e.key.vpn == vpn;
     }
 
     // ---- Stage contents ----
@@ -256,7 +265,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         xnd  : logic           , // the D-bit update
         xgnt : logic           , // the miss's walk request was taken
         xseen: logic           , // an event of vpn came since the request
-        vpn  : logic       <27>, // page of this pass
+        vpn  : logic       <29>, // page of this pass
         vu   : logic           ,
         vid  : logic  <MEMID_W>,
     }
@@ -282,7 +291,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
         xmiss  : logic          ,
         xgnt   : logic          ,
         xseen  : logic          ,
-        vpn    : logic     <27> ,
+        vpn    : logic     <29> ,
         vu     : logic          ,
         vid    : logic <MEMID_W>,
         pa     : pma_pkg::Pa    ,
@@ -354,9 +363,11 @@ pub module mem_pipe::<CFG: core_cfg> #(
     // Pointer masking replaces the top PMLEN bits of a new pass's effective
     // address, so translation, the LQ/SQ address and the reservation all see
     // the masked address: sign-extended when translated, zero for a bare PA.
-    let m0_ea  : logic<64> = if m0.vu ? m0.va : rs1 + {m0.imm[31] repeat 32, m0.imm};
-    let m0_ext : logic     = i_xl_on && (if i_pmm[0] ? m0_ea[47] : m0_ea[56]);
-    let m0_pm  : logic<64> = case i_pmm {
+    let m0_ea  : logic<64>          = if m0.vu ? m0.va : rs1 + {m0.imm[31] repeat 32, m0.imm};
+    let m0_x   : xlate_pkg::XEff    = xlate_pkg::xeff(i_ctx, m0.op.hlv);
+    let m0_pmv : logic<2>           = if m0.op.hlv ? i_pmm_h : i_pmm;
+    let m0_ext : logic              = (if m0_x.two ? m0_x.s1_on : i_xl_on) && (if m0_pmv[0] ? m0_ea[47] : m0_ea[56]);
+    let m0_pm  : logic<64>          = case m0_pmv {
         2'b10  : {m0_ext repeat 7, m0_ea[56:0]},
         2'b11  : {m0_ext repeat 16, m0_ea[47:0]},
         default: m0_ea,
@@ -416,10 +427,13 @@ pub module mem_pipe::<CFG: core_cfg> #(
     ;
     let m1_misal : logic              = ({1'b0, m1.va[2:0]} & ((4'd1 << m1.op.size) - 4'd1)) != 4'd0 || (m1.op.q && m1.va[3]);
     let m1_amis  : logic              = m1.op.amo && m1_misal; // faults before translation
-    let m1_vpn   : logic<27>          = m1.pva[38:12];
-    let m1_noncan: logic              = i_xl_on && m1.pva[63:39] != {m1.pva[38] repeat 25};
+    let m1_x     : xlate_pkg::XEff    = xlate_pkg::xeff(i_ctx, m1.op.hlv);
+    let m1_on    : logic              = xlate_pkg::xl_on(m1_x, i_xl_on);
+    let m1_vpn   : logic<29>          = xlate_pkg::vpn_of(m1.pva);
+    let m1_noncan: logic              = m1_on && xlate_pkg::noncanon(m1_x, m1.pva);
+    let m1_gbig  : logic              = m1_on && xlate_pkg::gpa_big(m1_x, m1.pva);
     let m1_xf    : logic              = m1.xexc.valid; // the walk's answer replaces the lookup
-    let m1_perm  : xlate_pkg::Perm    = xlate_pkg::perm(i_tlb, m1_acc, i_ctx);
+    let m1_perm  : xlate_pkg::Perm    = xlate_pkg::perm_x(i_tlb, m1_acc, m1_x, m1.op.hlvx);
     // Triggers over the bytes [m1_lo, m1_hi] of the access.
     let m1_ln    : logic              = m1.op.cmo || m1.op.zero;
     let m1_lo    : logic<64>          = if m1_ln ? {m1.va[63:6], 6'd0} : m1.va;
@@ -428,23 +442,22 @@ pub module mem_pipe::<CFG: core_cfg> #(
     always_comb {
         var m: logic<CFG::TRIG_N>;
         for t in 0..CFG::TRIG_N {
-            m[t] = ((i_trig.ld[t] && (!m1.op.st || m1.op.rmw)) || (i_trig.st[t] && m1.op.st))
-                && trig_range(i_trig.mt[t], i_trig.t2[t], m1_lo, m1_hi);
+            let ld: logic = if m1.op.hlv ? i_trig.ldh[t] : i_trig.ld[t];
+            let st: logic = if m1.op.hlv ? i_trig.sth[t] : i_trig.st[t];
+            m[t] = ((ld && (!m1.op.st || m1.op.rmw)) || (st && m1.op.st)) && trig_range(i_trig.mt[t], i_trig.t2[t], m1_lo,
+                m1_hi);
         }
         m1_tm = trig_fire(m, i_trig);
     }
     let m1_trig  : logic              = m1_tm != 0;
-    let m1_lk    : logic              = i_xl_on && !m1_noncan && !m1_xf && !m1_amis && !m1_trig;
+    let m1_lk    : logic              = m1_on && !m1_noncan && !m1_gbig && !m1_xf && !m1_amis && !m1_trig;
     let m1_nd    : logic              = m1_lk && i_tlb.hit && m1_perm.ok && m1_perm.need_d;
-    let m1_miss  : logic              = m1_lk && (!i_tlb.hit || m1_nd);
-    let m1_pf    : logic              = !m1_amis && (m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok));
+    let m1_miss  : logic              = m1_lk && (!i_tlb.hit || m1_nd || m1_perm.walk);
+    let m1_pf    : logic              = !m1_amis && (m1_noncan || (m1_lk && i_tlb.hit && !m1_perm.ok && !m1_perm.walk));
+    let m1_gpf   : logic              = !m1_amis && m1_gbig;
     let m1_tok   : logic              = i_tok.valid && i_tok.tag == m1.tag.rob;
 
-    always_comb {
-        o_tlb_lk.valid = m1_v && m1_lk;
-        o_tlb_lk.vpn   = m1_vpn;
-        o_tlb_lk.asid  = i_ctx.asid;
-    }
+    assign o_tlb_lk = xlate_pkg::lookup_of(m1_x, m1.pva, m1_v && m1_lk);
 
     // A crossing load's first pass does not walk: it parks HEAD and walks
     // once it runs as the oldest op.
@@ -459,14 +472,14 @@ pub module mem_pipe::<CFG: core_cfg> #(
         o_xreq.tag.rob     = m1.tag.rob;
         o_xreq.va          = m1.pva;
         o_xreq.acc         = m1_acc;
-        o_xreq.hlv         = 1'b0;
-        o_xreq.hlvx        = 1'b0;
+        o_xreq.hlv         = m1.op.hlv;
+        o_xreq.hlvx        = m1.op.hlvx;
         o_xreq.nonspec     = m1_nd;
     }
 
-    let m1_pa   : pma_pkg::Pa      = if i_xl_on ? xlate_pkg::entry_pa(i_tlb, m1.pva) : m1.pva[55:0];
-    let m1_hole : logic            = !i_xl_on && m1.pva[63:56] != 8'd0;
-    let m1_pma  : pma_pkg::PmaAttr = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(m1_pa, PMA_TBL), if i_xl_on ? i_tlb.pbmt : 2'd0);
+    let m1_pa   : pma_pkg::Pa      = if m1_on ? xlate_pkg::entry_pa(i_tlb, m1.pva) : m1.pva[55:0];
+    let m1_hole : logic            = !m1_on && m1.pva[63:56] != 8'd0;
+    let m1_pma  : pma_pkg::PmaAttr = xlate_pkg::pbmt_attr(pma_check::<PMA_N>(m1_pa, PMA_TBL), if m1_on ? i_tlb.pbmt : 2'd0);
     let m1_dbg  : logic            = m1_pma.target == pma_pkg::Target::DEBUG;
     let m1_attr : pma_pkg::PmaAttr = if m1_dbg && !i_dm ? 0 as pma_pkg::PmaAttr : m1_pma;
 
@@ -475,7 +488,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
     inst u_pmp_r: pmp_check (
         i_addr   : {8'd0, m1_pa}  ,
         i_acc    : 2'd0           ,
-        i_priv   : i_ctx.prv      ,
+        i_priv   : m1_x.prv       ,
         i_pmpcfg                  ,
         i_pmpaddr                 ,
         o_fault  : m1_pmp_r       ,
@@ -483,7 +496,7 @@ pub module mem_pipe::<CFG: core_cfg> #(
     inst u_pmp_w: pmp_check (
         i_addr   : {8'd0, m1_pa}  ,
         i_acc    : 2'd1           ,
-        i_priv   : i_ctx.prv      ,
+        i_priv   : m1_x.prv       ,
         i_pmpcfg                  ,
         i_pmpaddr                 ,
         o_fault  : m1_pmp_w       ,
@@ -526,20 +539,25 @@ pub module mem_pipe::<CFG: core_cfg> #(
         m2_in.vpn          = m1_vpn;
         m2_in.vu           = m1.vu;
         m2_in.vid          = m1.vid;
-        m2_in.exc.valid    = m1_trig || m1_amis || m1_xf || m1_pf || (!m1_miss && m1_af);
+        m2_in.exc.valid    = m1_trig || m1_amis || m1_xf || m1_pf || m1_gpf || (!m1_miss && m1_af);
         m2_in.exc.cause    = if m1.op.st ? 6'd7 : 6'd5;
         m2_in.exc.tval     = m1.pva;
-        m2_in.exc.gpa      = 54'd0;
-        m2_in.exc.gva      = 1'b0;
+        m2_in.exc.gpa      = '0;
+        m2_in.exc.gva      = m1_x.two;
+        m2_in.exc.implicit = 1'b0;
         m2_in.exc.dm       = 1'b0;
         m2_in.exc.trig     = 1'b0;
         m2_in.exc.trig_hit = 0;
         if m1_trig {
-            m2_in.exc = trig_exc(m1_tm, (m1_tm & i_trig.dm) != 0, m1.va);
+            m2_in.exc     = trig_exc(m1_tm, (m1_tm & i_trig.dm) != 0, m1.va);
+            m2_in.exc.gva = m1_x.two;
         } else if m1_xf {
             m2_in.exc = m1.xexc;
         } else if m1_pf {
             m2_in.exc.cause = xlate_pkg::pf_cause(m1_acc);
+        } else if m1_gpf {
+            m2_in.exc.cause = xlate_pkg::gpf_cause(m1_acc);
+            m2_in.exc.gpa   = m1.pva[63:2];
         }
     }
 
