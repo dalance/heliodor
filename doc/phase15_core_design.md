@@ -327,7 +327,7 @@ sweep の測り方 (M3 の手順 7): 1 軸だけを両側に動かし、他の�
 | (M3 の sweep) `FTQ_N` を増やすと coremark が悪化する (W2 は 16→32 で +1.07 %、W4 は 32→16 で −1.35 %) | 予測器は commit で更新する (§F.3 FQ4) | - | FTQ が深いほど mispredict が増える (coremark で W2 8,307 → 8,653 回、W4 8,332 → 8,742 回)。run-ahead が深いと、同じ branch を更新前の古い counter で予測する回数が増える。boot、fpmm、spmv では FTQ 満杯の解消が勝つので 32 を採る (§3.3、§F.3)。 |
 | (M3 の sweep) IQ int/mem を増やすと coremark がわずかに悪化する (W4 の int 48 +0.34 %、mem 32 +0.51 %。W2 は ±0.2 %) | 原因は未確定 | - | 候補は dispatch 時の最小占有による静的ポート割り当て (§X.3): 深い IQ では若い op が先に忙しいポートへ束縛される。確かめるには「ポートに束縛された ready な op が、他の空きポートを見送ったサイクル」の event が要る。割り当て方針は最小占有のまま (§X.3)。 |
 
-VU に由来する行 (ROB ≤ 256 と 2 の冪、CDB の 2 lane snoop、alloc 1/cycle) は M5 の後にこの表から消える。修正した上限は削除し、残す上限は §V の宣言に移す。
+VU に由来する行 (ROB ≤ 256 と 2 の冪、CDB の 2 lane snoop、alloc 1/cycle) は M5 で整理した: 解消した 2 つは消し、alloc を含む残す上限は §V.10 に宣言した。
 
 ### 3.5 構成値の三段階と非支援値の拒否
 
@@ -3826,7 +3826,7 @@ G13 (基本 RVV の未実装 encoding) と RVA23 の未実装 V 拡張 (Zvbb, Zv
 | dispatch FIFO | 8 エントリ (2 の冪) | `VQ` の credit。 |
 | メモリ | 未完了の要素は 1 つ。1 要素は 8 B 以下。pipe 0 だけを使う。hit が続く場合でも、1 要素あたり約 `RESP_LAT`+1 サイクル (推定) | 宣言された上限として残す。line 幅のアクセスや複数 pipe の利用は再設計を要する。 |
 | PRF 読出ポート | VU 専用に int 2 本と fp 1 本 | `prf` の読出ポート数に加算する。 |
-| hart ごとの専用 `fpu_wrap` と `int_divider` | 面積とシミュレーション速度を食う | 宣言する。シミュレーション上の割合は M5 で測る (リスク R1)。 |
+| hart ごとの専用 `fpu_wrap` と `int_divider` | 面積とシミュレーション速度を食う | 宣言する。シミュレーション上の割合は M5 では測っていない (リスク R1、M6 の GS で測る)。 |
 | 割込みの受付遅延 | 最長の vector op 1 本分 (例: LMUL=8 の要素直列 vdiv、または要素ごとに miss する load) | 宣言する (V.6)。 |
 | vstart による再開 | VU は vstart を無視して要素 0 からやり直す (V.9 の G7) | 宣言する。vstart≠0 で始まった op は 20 本の V テストと 7.1+V の N=1 boot で 0 回。 |
 | segment の load/store の fault | field を外側に回すので、fault で書く vstart は前の segment の完了を意味しない (V.9 の G7 の行) | 宣言する。再開は G7 のとおり要素 0 からなので結果は正しい。 |
@@ -4572,7 +4572,7 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 | U13 | 割込み replay で allow と force のどちらが要るか | 調査 (検証) | M2 | 【決定済み (M2)】allow で足りる。5.15 N=1 の GL-B で golden の割込み 30 回をすべて allow で replay し、「golden の割込みが自コアで pending でない」は 0 回だった (D2、検証計画 §4.2)。 |
 | U14 | golden 成果物の置き場所と commit の方針 | 調査 (検証) | M1a | schedule と hash の列 (小さい) は commit し、boot の trace (約 1 GB) は再生成する方式を推奨する。 |
 | U15 | ACT4 の非既定スイートと H/V の directed test を、マイルストーンのタグ付きで commit するか | 調査 (ISA の網羅) | M2 | ACT4 の tb は gitignore されており、再生成には sandbox を外す必要がある。ゲートの再現性を優先して commit を推奨する。Sstc、Sscofpmf、Supm、Zawrs (ACT4 に無い) の directed test も同じ一覧に入れる。【決定済み (M2 の実装)】ACT4 の新コア用 tb は commit せず、`test/gates/run_act.py` がゲートリストから生成して走らせた後に消す。commit するのはゲートリスト `test/gates/m2_act.list` (Zabha/Zacas を含む 696 本) と golden の final `test/golden/act/*.final` で、hex は gitignore のまま pin されたツールチェーンで `make -C test/act` から作る。Sstc、Sscofpmf、Supm、Zawrs の directed test は `test/gates/m2_*.list` に載せて commit した。H/V の directed は M5 で同じ扱いにする。 |
-| U16 | ISA の目標と README の「complete RVA23」: M5 の後に送る | 調査 (ISA の網羅、vector) | M5 の後 (README の記述修正は M5) | 第 0 部 §2.6 で M5 の後に送ってある。§V.9 の G13 (基本 RVV の未実装 encoding) と RVA23 の不足分とまとめて、M5 の後にユーザが判断する。M5 では実装せず illegal で trap させ、README の「complete RVA23」の記述だけを直す。G13 の一覧はコード調査から作ったものなので、M5 で directed test によって確かめ直す (§V.9)。 |
+| U16 | ISA の目標と README の「complete RVA23」: M5 の後に送る | 調査 (ISA の網羅、vector) | M5 の後 (README の記述修正は M5) | 第 0 部 §2.6 で M5 の後に送ってある。§V.9 の G13 (基本 RVV の未実装 encoding) と RVA23 の不足分とまとめて、M5 の後にユーザが判断する。M5 では実装せず illegal で trap させ、README の「complete RVA23」の記述だけを直す。G13 の一覧はコード調査から作ったものなので、M5 で directed test によって確かめ直す (§V.9)。 【決定】(2026-11-05、ユーザ) 不足分は M5 の後の MI で実装する。README は M5 で直した。 |
 | U17 | 推定段階の旧コアのバグを確かめる directed test 群 | 調査 (複数) | M2 の前 (VU 関係は M5 の前) | 【決定済み (M2、VU 関係を除く)】golden 上の probe で確かめ、結果を検証計画付録 B に結び付けた (検証計画 §7.4)。対象: minstret の数え漏れ、FP div と s2 の WB 衝突、AMO のページ権限の穴、ASQ の aq/rl、dword をまたぐ命令の fault の穴、`vu_mem_idle` の ASQ/LSR の穴、不正な OP-V の wedge。D4 に従い、結果を allow-list のタグに結び付ける。 |
 | U18 | BRU ポート数 (cfg_w4) | §3.2 | M3 | 1 サイクルの resolve 数を sweep する。【決定済み (M3 の手順 6)】2 本 (p0/p1)。1 本にすると W4 の 5.15 boot が 0.27 % 遅い (12,688,563 対 12,654,345)。2 本同時の mispredict で若い方を捨てた (`flush.drop_older`) のは 8,230 回。3 本目は測らない (§3.2)。 |
 | U19 | dcache の data bank 数 (cfg_w4) | §3.2 | M3 | 2 ポート化したときの bank conflict 率を sweep で測る。【決定済み (M3 の手順 4)】W4 は 4、W2 は 2。W4 の 5.15 lockstep boot で NB = 2 / 4 / 8 が 12,669,780 / 12,641,493 / 12,622,924 サイクル、RETRY(BANK_CONFLICT) が 69,981 / 28,005 / 15,943 (§M.6.3)。 |
@@ -4613,7 +4613,7 @@ V14 はデバッグを持たず、M6 まで持たない。SoC の V14 の枝は 
 
 ## マイルストーン計画
 
-本章は本文の最後の章であり、M0-M6 と MM (D11 で M4 と MD の間に足した外部メモリインタフェースのマイルストーン)、MD (D9 で M4 と M5 の間に足したデバッグのマイルストーン。既存の番号を動かさないため番号ではなく MD と呼ぶ)、MDOC (D10 で M6 の後に足したユーザ向けドキュメントのマイルストーン) の各マイルストーンについて、目標、作業の順序、実装する章とモジュール、出口条件 (ゲート)、そのマイルストーンの中で決める事項をまとめる。出口条件のゲート ID は検証計画 §1.1、構成ごとの投入時期は検証計画 §1.2、機能ゲートと構造ゲートの区分は第 0 部 §2.5 に従う。各章の出荷範囲の表 (§F.11、§R.7、§X.12、§C.0、§L.18、§M.1、§S.8、§V.11、§D.16、§MM.9) は本章の要約の正本であり、ここではそれを順序と出口に並べ直すだけで、範囲を足しも削りもしない。決定事項の番号 U<n> は「リスクと未決事項」章の一覧のものである。
+本章は本文の最後の章であり、M0-M6 と MM (D11 で M4 と MD の間に足した外部メモリインタフェースのマイルストーン)、MD (D9 で M4 と M5 の間に足したデバッグのマイルストーン。既存の番号を動かさないため番号ではなく MD と呼ぶ)、MDOC (D10 で M6 の後に足したユーザ向けドキュメントのマイルストーン)、MI (U16 で M5 の後に足した ISA の補完のマイルストーン) の各マイルストーンについて、目標、作業の順序、実装する章とモジュール、出口条件 (ゲート)、そのマイルストーンの中で決める事項をまとめる。出口条件のゲート ID は検証計画 §1.1、構成ごとの投入時期は検証計画 §1.2、機能ゲートと構造ゲートの区分は第 0 部 §2.5 に従う。各章の出荷範囲の表 (§F.11、§R.7、§X.12、§C.0、§L.18、§M.1、§S.8、§V.11、§D.16、§MM.9) は本章の要約の正本であり、ここではそれを順序と出口に並べ直すだけで、範囲を足しも削りもしない。決定事項の番号 U<n> は「リスクと未決事項」章の一覧のものである。
 
 全マイルストーンに共通する規則:
 
@@ -5014,12 +5014,21 @@ M5 で決める事項: U30 (VU の IO アクセス)、U39 (VU の要素アクセ
 - 手順 2 (H 拡張) 【M5 手順 2 で実装】: `xlate_pkg` に guest の文脈 (`XlateCtx` の V/vsatp/hgatp/vsstatus/hstatus.SPVP の field、op ごとの regime を解く `xeff`、段ごとの `stage_perm` と合成エントリの `perm_x`、`noncanon`/`gpa_big`、HFENCE の `inv_hit`) を足し、`tlb` は `{virt, vmid, s1_on}` と G-stage の権限 bit を持つ同居のエントリにした。`ptw` は 1 つの cursor で VS-stage と Sv39x4 の G-stage を歩き (状態 RES、G-stage の walk の目的 `w_fin_q`)、G-stage の A/D を owned RMW で立てる。`mem_pipe` と `ifu` は op の regime (V=1、HLV/HSV) で翻訳し、PMP は実効特権で検査する。`decode` は §C.8 の M5 行 (cause 22) と HLV/HSV (`MemOp.hlv/hlvx`、offset 0)、HINVAL、HFENCE の種類 (`opclass_pkg::sys_inv_kind`) を、`fu_sys` は VMID を、`trap_unit` は VS への委譲、htval/mtval2、GVA、htinst/mtinst を、csr は H_EN = 1 (misa の H)、hstatus/hideleg/hedeleg/henvcfg/hgatp/vsatp の WARL、V=1 の FS/VS の vsstatus への dirty、VSINH/VUINH、`o_data_virt`、dcsr の v/ebreakvs/ebreakvu を持つ。`trig_unit` は vs/vu と HLV/HSV の regime を、`commit` は vector の要素の trigger による Debug Mode の入場で vstart を書く。決めたこと: tinst の `ExcRec.implicit` (§C.3)、TLB の同居と guest の Svadu (§M.12)、GEILEN = 0 (§S.5)、U39。テスト: G0 に `m5_h.list` (H 17 本、W2/W4)、`m5_hprobe.list` (付録 B の B11、B23、B25、B40 の probe と `h_gad`)、GD に `m5_dbgh.list` (`dbgh/dm_h`)、GH に `test_w2_hvlinux`/`test_w4_hvlinux`。旧コアの H の directed 11 本と hypervisor (`test/hv`) は旧コアの逸脱に依存していたところを直した (検証計画 §7.3)。新コアの directed のうち misa の H を「無い」と確かめていた `test/priv` と、H を unserved としていた `test_decode` の 1 vector (VS の HLV.W を cause 22 に)、HFENCE の種類と VMID を知らなかった `test_sched` の reference を直した。結果: G0 は 1002 passed、4 failed (上の 3 本の修正前の `test_w{2,4}_privd_priv`、`test_sched`、`test_decode`)、85 ignored で、修正後にその 4 本が pass (合わせて 1006 passed、0 failed)。GL-B (W2) は 14,570,718 cy、record 10,417,776、hash 74d4b7982390260f で M5 手順 1 と同一 (V=0 の挙動は変わらない)。GH は W2 18,622,469 cy (instret 11,394,753)、W4 16,172,701 cy (instret 11,382,596) で pass (旧コアは 22.32M)。
 - 手順 3 (G 一覧の確認と README) 【M5 手順 3 で実装】: `m5_vprobe.list` に V の directed を 11 本足した (W2/W4、pass/fail): `v_vs_off` (G2)、`v_vs_virt` (G3)、`v_vs_dirty` (G4)、`v_vill` (G5)、`v_vstart` (G6)、`v_vld_mask` (G8)、`v_vmisalign` (G9)、`v_vpmp` と `v_vgpf` (G10)、`v_vpm` (G11)、`v_opv_sweep` (G12 と G13: OP-V の全 funct6、unary 群の sub-op、load/store の各形の 624 行を 1 つずつ実行し、実装済みは trap しないこと、予約と未実装は illegal で trap することを見る)。見つかって直したもの: (1) funct6 以外の field が予約されている vector の encoding 17 種を trap せずに実行していた (`decode` の `vec_rsv`)、(2) vector CSR への CSR 書込が VS を Dirty にしていなかった (`effect.vs_dirty`)、(3) 途中の要素で trap した load が、そのレジスタで読み終えた要素を書いていなかった (`vector_unit` の `mem_trim_wr`)。宣言した上限: G7 (vstart を無視した再開) と segment の fault 時の vstart (§V.10)。G13 の一覧は過不足なく確定した (§V.9)。README の「complete RVA23」は、V の未実装 encoding と Zvbb/Zvfhmin/Zvkt を明記する記述に直した。二段翻訳の乱数テスト `tb/test_ptw2.veryl` (`test_ptw2`、`test_tlb_h_unit`) を現在の `ptw` に移植した (memory port は `test_ptw` と同じ STORE_EXCL と coherence の退出、VS-stage は Svade、requester は key の無い VA を送らない、fence には full kill が続く)。これが `ptw` のバグを 1 つ見つけた: V = 0 の walk が A=0 の leaf で、権限の無い access のためにも A を立てに行き、PTE のページが書込不可だと page fault ではなく access fault を返していた。A を立てるのは許された access だけにした (`leaf_bad`)。結果: G0 は 1030 passed (手順 2 の 1006 + vprobe 22 + `test_ptw2`、`test_tlb_h_unit`)、0 failed、85 ignored。7.1+V の N=1 boot (W2) は 20,778,460 cy、hash 4716d470177c4bdf で手順 1 と同一。
 
+### MI: ISA の補完
+
+【決定】(2026-11-05、ユーザ) M5 の後に、M5 で illegal にした未実装分を実装するマイルストーンを置く (U16)。M6 との前後は計画の時点で提案する。
+
+- 範囲: §V.9 の G13 (基本 RVV の未実装 encoding)、G14 (vfcvt 系を `fpu_wrap` の誤った変換経路から外す)、RVA23 の V の不足分 (Zvbb、Zvfhmin、Zvkt)。
+- ACT4 を 4.1 以降に上げる作業をこのマイルストーンの開始時に行う (M5 とは分ける)。4.1 で Vx/Vls のテストが有効になる。H のテストは 4.1 にも無い。
+- RVA23.1 (2026-10-19 批准、optional の拡張だけを足す: Ssdbltrp、Ssccfg と Sscsrind、Ssctr、Ssqosid、Svrsw60t59b) は、小さい変更で済むものを範囲に入れる。拡張ごとの見積もりは計画の時点で行う。
+- 出口: 計画の時点で決める。G0 の V の directed (`v_opv_sweep` で illegal にしている 55 行が実装に移ること) と ACT4 の V を含める。
+
 ### M6: 既定コアの切替
 
 - 目標: 既定コアを新コアに切り替え、旧コアを削除する。
 - 作業: SoC と harness の `CORE` の既定値を変更し、V14 枝、`src/v14/` (凍結コピーを含む)、V14 専用の印字と `o_dbg_*` を削除する。README の数値と構成を新コアで更新する。
 - 出口条件: 新コアが既定で、検証計画 §1.2 の M6 列のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4、GH、GX、GV、GD、GG をすべて) を両構成で通る。M6 のコミットの変更は、削除と既定値の変更だけである (第 0 部 §2.5)。
-- M6 の後: §2.6 で送った RVA23 の不足分と G13 の判断 (U16)、misa の F/D/C の扱い (§C.9) をユーザが判断する。
+- M6 の後: misa の F/D/C の扱い (§C.9) をユーザが判断する。RVA23 の不足分と G13 は MI で扱う (U16)。
 
 ### MDOC: ユーザ向けドキュメント
 

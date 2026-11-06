@@ -919,13 +919,13 @@ M4 のゲートの結果は §1.6、MM は §10.5-10.6 である。比較の基�
 
 ### 9.6 M5 の出口のゲート: GX、GV、GD4、GG (`c9911e61`、2026-11-06)
 
-M5 の H/V (手順 1-3) の後に、§1.2 の M5 列のうち GX、GV、GD4、GG を回した。比較の基準は §9.5 (MD の出口) と §7.3 の GH の native の記録である。Verilator は 5.050 (N=1 と N=2 は `-O3 -j 4`、4 hart は `-O1 -j 2`)、native は veryl `c66bf8ab`。box の load average は 20-48 で、Verilator の 3 本までと GG の 1 本を並行させた。
+M5 の H/V (手順 1-3) の後に、§1.2 の M5 列のうち GX、GV、GD4、GG を回した。比較の基準は §9.5 (MD の出口) と §7.3 の GH の native の記録である。Verilator は 5.050 (N=1 と N=2 は `-O3 -j 4`、4 hart は `-O1 -j 2`)、native と Verilator の生成元は veryl `96d8af7e` (v0.22.1 の `8521c8c2` に emitter の修正 1 件)。box の load average は 20-48 で、Verilator の 3 本までと GG の 1 本を並行させた。
 
 | ゲート | M5 (`c9911e61`) | 基準 | 判定 |
 |---|---|---|---|
 | G0 (GX の入力) | 1030 passed、0 failed、85 ignored | M5 手順 3 の 1030 | 一致 |
 | GX | 既定ログの W2/W4 の同名 364 対のうち 342 対が一致 | MD: 307 対のうち 287 対 | 差 22 対は下。H/V で増えた 57 対は `h_hvtmr` を除いて一致 |
-| GV (W2、Verilator) | hvlinux 18,622,469 (instret 11,394,753)、litmus N=4 5,029,779、5.15 N=1 14,617,653 (instret 10,429,948)、N=2 19,380,793 がすべて PASSED | native の GH (§7.3) と MD の GV/GB1/GB2 と cycles 一致 | 一致。N=4 は main session が `build_n4w2` で回している |
+| GV (W2、Verilator) | hvlinux 18,622,469 (instret 11,394,753)、litmus N=4 5,029,779、5.15 N=1 14,617,653 (instret 10,429,948)、N=2 19,380,793、N=4 24,989,451 (instret 14,805,212、hart ごとの chk 0、wall 14,349 s) がすべて PASSED | native の GH (§7.3) と MD の GV/GB1/GB2/GB4 と cycles 一致 | 一致 |
 | GV (W4、Verilator) | hvlinux 16,172,701 (instret 11,382,596)、litmus N=4 5,028,524、N=1 12,286,458、N=2 16,811,410、N=4 22,640,641 (instret 14,730,876) がすべて PASSED | native の GH と MD の GV と cycles 一致 | 一致 |
 | GD4 (W2、W4) | 10/10 pass (`chk=0`、dmi fail 0) | MD: 10/10 | 一致 |
 | GG | w2_n1 pass 52、w4_n1 pass 49、w2_n4 pass 6、w2_n4_smp pass 5 (下)。`gg_compare.py` の FAIL は 4 target とも 0 | MD: 52 / 49 / 6 / 5 | 一致 (PrivRw を除外に移し VectorTest が pass に増えた) |
