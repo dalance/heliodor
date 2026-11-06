@@ -43,10 +43,20 @@ SUITE_OPTS = {
 }
 TEST_OPTS = {}
 
+# Tests the framework selects but the harness cannot run, with the reason;
+# they do not link (no ELF), so this table only records them in the list.
+EXCLUDED = {
+    "act_sdtrigs/mcontrol6_match_napot_00": "4.3 MiB image, over the 4 MiB harness DRAM",
+    "act_sdtrigu/mcontrol6_match_napot_00": "4.3 MiB image, over the 4 MiB harness DRAM",
+}
+
 # GL-C compares with the golden model (the old core), which has no Sdtrig and
-# known V and H (V = 1) deviations: those tests are judged by pass/fail only.
-GOLDEN_OFF_SUITE = re.compile(r'^(v[a-z]*\d*|exceptionsv.*|misalignv|h|sdtrig.*|sh.*)$')
+# no Smstateen/Ssstateen, and known V and H (V = 1) deviations: those tests
+# are judged by pass/fail only.
+GOLDEN_OFF_SUITE = re.compile(r'^(v[a-z]*\d*|exceptionsv.*|misalignv|h|sdtrig.*|sh.*|s[ms]stateen)$')
 GOLDEN_OFF_NAME = re.compile(r'(^|_)(H|HSm|V|VF|VS|VU|vs|vu|sv39x4)(_|$)')
+# Single tests the golden model fails (golden_off.list gives the reasons).
+GOLDEN_OFF_LIST = os.path.join(HERE, "golden_off.list")
 
 LIST_HEADER = """\
 # ACT4 (riscv-arch-test) suites for the new core: the GA (pass/fail) and GL-C
@@ -137,12 +147,21 @@ def write_tb(ext, mods):
         f.write("\n".join(out))
 
 
+def golden_off():
+    with open(GOLDEN_OFF_LIST) as f:
+        return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+
+
 def write_list(path, entries):
+    off = golden_off()
     lines = [LIST_HEADER]
+    lines += [f"# excluded: {k} ({why})" for k, why in sorted(EXCLUDED.items())]
     for extlc, short, hexf in entries:
         key = f"act_{extlc}/{short}"
+        if key in EXCLUDED:
+            continue
         opts = " ".join(o for o in (ALL_OPTS, SUITE_OPTS.get(extlc, ""), TEST_OPTS.get(key, "")) if o)
-        if "lockstep=" not in opts and (GOLDEN_OFF_SUITE.match(extlc) or GOLDEN_OFF_NAME.search(short)):
+        if "lockstep=" not in opts and (GOLDEN_OFF_SUITE.match(extlc) or GOLDEN_OFF_NAME.search(short) or key in off):
             opts += " lockstep=0"
         lines.append(f"{key} hex={hexf}" + (f" {opts}" if opts else ""))
     with open(path, "w") as f:
