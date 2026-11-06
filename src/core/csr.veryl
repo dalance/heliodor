@@ -49,7 +49,23 @@
 // bit; hstateen0-3 hold the same bits and read them ANDed with mstateen (a
 // write cannot set a bit mstateen clears). Every other bit of them, and all
 // of sstateen0-3, is read-only zero: heliodor has no state those bits guard.
-// Decode gates the accesses (o_mstateen, o_hstateen).
+// Decode gates the accesses (o_mstateen, o_hstateen). mstateen0 also holds
+// CSRIND and SRMCFG, hstateen0 CSRIND.
+// Ssqosid: srmcfg keeps a 12-bit RCID and a 12-bit MCID (V = 1 accesses trap).
+// Smcsrind/Sscsrind: miselect, siselect and vsiselect hold 0-0xFFF (the
+// upper bits of a write are dropped). No miselect value is implemented.
+// Smcdeleg/Ssccfg: menvcfg.CDE; with siselect 0x40 + i, sireg is mcycle,
+// minstret or mhpmcounter i and sireg2 is mhpmevent i with MINH read-only
+// zero (decode allows only those). scountinhibit reads zero like
+// mcountinhibit. scountovf read from VS also masks by hcounteren.
+// Ssdbltrp: menvcfg.DTE and henvcfg.DTE (writable only while menvcfg.DTE is
+// set, read ANDed with it). mstatus.SDT reads zero unless menvcfg.DTE and
+// vsstatus.SDT unless both are set; a write with DTE clear stores zero, and
+// one that sets SDT clears SIE. A trap into HS sets mstatus.SDT and one into
+// VS vsstatus.SDT; trap_unit turns a trap into HS or VS whose SDT is already
+// set into a double trap into M (o_sdt, o_vsdt). SRET from HS clears SDT, as
+// does an MRET or an SRET from M to U, VS or VU; vsstatus.SDT is cleared by
+// an SRET from VS and by an xRET to VU.
 // Debug Mode (Sdext): i_dm_enter saves the cause, the privilege, V and dpc
 // and enters Debug Mode in M; i_dret_fire returns to dcsr.prv and dcsr.v
 // (clearing MPRV below M). In Debug Mode MPRV applies only with
@@ -276,8 +292,12 @@ pub module csr #(
     o_hstatus_vtw: output logic                 ,
     o_pmm_vs     : output logic             <2> , // henvcfg.PMM
     o_pmm_hu     : output logic             <2> , // hstatus.HUPMM
-    o_mstateen   : output logic             <5> , // {mstateen0.ENVCFG, mstateenN.SE for N = 3..0}
-    o_hstateen   : output logic             <5> , // the same bits of hstateen, ANDed with mstateen
+    o_mstateen   : output logic             <7> , // {mstateen0.SRMCFG, CSRIND, ENVCFG, mstateenN.SE for N = 3..0}
+    o_hstateen   : output logic             <7> , // the same bits of hstateen, ANDed with mstateen
+    o_siselect   : output logic             <12>,
+    o_vsiselect  : output logic             <12>,
+    o_sdt        : output logic                 , // mstatus.SDT as read (menvcfg.DTE)
+    o_vsdt       : output logic                 , // vsstatus.SDT as read (menvcfg.DTE and henvcfg.DTE)
     o_mstatus_mie: output logic                 ,
     o_mstatus_sie: output logic                 ,
     o_vsstatus_sie: output logic                ,
@@ -401,6 +421,12 @@ pub module csr #(
     const ADDR_MSTATEEN3 : logic<12> = 12'h30F;
     const ADDR_HSTATEEN0 : logic<12> = 12'h60C;
     const ADDR_HSTATEEN3 : logic<12> = 12'h60F;
+    const ADDR_SRMCFG    : logic<12> = 12'h181;
+    const ADDR_SISELECT  : logic<12> = 12'h150;
+    const ADDR_SIREG     : logic<12> = 12'h151;
+    const ADDR_SIREG2    : logic<12> = 12'h152;
+    const ADDR_VSISELECT : logic<12> = 12'h250;
+    const ADDR_MISELECT  : logic<12> = 12'h350;
     const ADDR_DCSR      : logic<12> = 12'h7B0;
     const ADDR_DPC       : logic<12> = 12'h7B1;
     const ADDR_DSCRATCH0 : logic<12> = 12'h7B2;
@@ -499,10 +525,16 @@ pub module csr #(
     var hcounteren: logic<64>;
     var htimedelta: logic<64>;
     var henvcfg   : logic<64>;
-    let henvcfg_eff: logic<64> = henvcfg & ~{~menvcfg[63:61], 61'd0};
-    var mstateen  : logic<5> ; // {ENVCFG, SE3, SE2, SE1, SE0}
-    var hstateen  : logic<5> ;
-    let hstateen_eff: logic<5> = hstateen & mstateen;
+    let henvcfg_eff: logic<64> = henvcfg & ~{~menvcfg[63:61], 1'b0, ~menvcfg[59], 59'd0};
+    var mstateen  : logic<7> ; // {SRMCFG, CSRIND, ENVCFG, SE3, SE2, SE1, SE0}
+    var hstateen  : logic<6> ; // no SRMCFG
+    let hstateen_eff: logic<7> = {1'b0, hstateen & mstateen[5:0]};
+    var srmcfg    : logic<64>;
+    var miselect  : logic<12>;
+    var siselect  : logic<12>;
+    var vsiselect : logic<12>;
+    let dte       : logic     = menvcfg[59];
+    let vdte      : logic     = henvcfg_eff[59];
     var hgatp     : logic<64>;
     // VS-level CSRs (guest supervisor state). vsstatus mirrors the sstatus
     // layout; vsie holds the guest's interrupt enables; the rest are standalone
@@ -526,13 +558,14 @@ pub module csr #(
     var mhpmcounter: logic<64> [32];
     var mhpmevent  : logic<64> [32];
     // sstatus visible bits: SIE(1), SPIE(5), SPP(8), VS(10:9), FS(14:13),
-    // XS(16:15), SUM(18), MXR(19), UXL(33:32), SD(63). UXL is read-only for RV64.
+    // XS(16:15), SUM(18), MXR(19), SDT(24), UXL(33:32), SD(63). UXL is
+    // read-only for RV64.
     // Phase 12 V6: VS (bits 10:9, +0x600) is the vector-unit state, written by
     // S-mode software (Linux riscv_v_enable() does csr_set(sstatus, SR_VS)).
     // Omitting it dropped sstatus.VS writes, so vector could never be enabled in
     // S-mode (the M-mode directed tests set mstatus.VS and so missed this). Inert
     // at V=0: VS stays 0 with no vector op, so sstatus read/write is unchanged.
-    const SSTATUS_MASK: logic<64> = 64'h8000_0003_000d_e762;
+    const SSTATUS_MASK: logic<64> = 64'h8000_0003_010d_e762;
     // sie/sip visible bits: SSIE/SSIP(1), STIE/STIP(5), SEIE/SEIP(9),
     // and P10 Sscofpmf LCOFIE/LCOFIP(13) so a delegated counter-overflow
     // interrupt is visible/clearable through sie/sip.
@@ -548,13 +581,13 @@ pub module csr #(
     const HSTATUS_VSXL_RO: logic<64> = 64'h0000_0002_0000_0000;
 
     // Writable bits. mstatus: SIE, MIE, SPIE, MPIE, SPP, VS, MPP, FS, MPRV,
-    // SUM, MXR, TVM, TW, TSR, and GVA (38) and MPV (39) with H; XS and the
+    // SUM, MXR, TVM, TW, TSR, SDT, and GVA (38) and MPV (39) with H; XS and the
     // fields of unimplemented extensions read zero, and SD is never stored.
-    // mideleg/mip: SSIP, STIP, SEIP and LCOFIP; sip: SSIP and LCOFIP. menvcfg: FIOM, CBIE, CBCFE, CBZE, ADUE, PBMTE, STCE; senvcfg:
-    // FIOM, CBIE, CBCFE, CBZE.
-    const MSTATUS_WMASK: logic<64> = if H_EN ? 64'h0000_00c0_007e_7faa : 64'h0000_0000_007e_7faa;
-    // sstatus/vsstatus writable bits: SIE, SPIE, SPP, VS, FS, SUM, MXR.
-    const SSTATUS_WMASK: logic<64> = 64'h0000_0000_000c_6722;
+    // mideleg/mip: SSIP, STIP, SEIP and LCOFIP; sip: SSIP and LCOFIP. menvcfg: FIOM, CBIE, CBCFE, CBZE, PMM, DTE, CDE,
+    // ADUE, PBMTE, STCE; senvcfg: FIOM, CBIE, CBCFE, CBZE, PMM.
+    const MSTATUS_WMASK: logic<64> = if H_EN ? 64'h0000_00c0_017e_7faa : 64'h0000_0000_017e_7faa;
+    // sstatus/vsstatus writable bits: SIE, SPIE, SPP, VS, FS, SUM, MXR, SDT.
+    const SSTATUS_WMASK: logic<64> = 64'h0000_0000_010c_6722;
     const MIP_WMASK    : logic<64> = 64'h0000_0000_0000_2222;
     // mie: the S and M interrupts and LCOFIE, and VSSIE, VSTIE and VSEIE with H
     // (GEILEN is 0, so SGEIE reads zero).
@@ -566,25 +599,48 @@ pub module csr #(
     // vstart holds element indices below VLMAX = VLEN (LMUL 8, SEW 8).
     const VSTART_W: u32 = 7;
     const SIP_WMASK    : logic<64> = 64'h0000_0000_0000_2002;
-    const MENVCFG_WMASK: logic<64> = 64'he000_0003_0000_00f1;
+    const MENVCFG_WMASK: logic<64> = 64'hf800_0003_0000_00f1;
     const SENVCFG_WMASK: logic<64> = 64'h0000_0003_0000_00f1;
     const MSECCFG_WMASK: logic<64> = 64'h0000_0003_0000_0000;
-    // henvcfg: FIOM, CBIE, CBCFE, CBZE, PMM, ADUE, PBMTE, STCE. hstatus:
+    // henvcfg: FIOM, CBIE, CBCFE, CBZE, PMM, DTE, ADUE, PBMTE, STCE. hstatus:
     // GVA, SPV, SPVP, HU, VTVM, VTW, VTSR, HUPMM. hideleg: VSSIP, VSTIP,
     // VSEIP. hedeleg: every standard exception but the environment calls
     // from HS, VS and M and the guest-page and virtual-instruction faults.
-    const HENVCFG_WMASK: logic<64> = 64'he000_0003_0000_00f1;
+    const HENVCFG_WMASK: logic<64> = 64'he800_0003_0000_00f1;
+    const SRMCFG_WMASK : logic<64> = 64'h0000_0000_0fff_0fff;
     const HSTATUS_WMASK: logic<64> = 64'h0003_0000_0070_03c0;
     const HIDELEG_WMASK: logic<64> = 64'h0000_0000_0000_0444;
 
-    // WARL legalization of a mstatus (or sstatus-merged) write value.
+    // WARL legalization of a mstatus (or sstatus-merged) write value. SDT
+    // takes the write only with menvcfg.DTE, and setting it clears SIE.
     function legal_mstatus (
-        v: input logic<64>,
+        v  : input logic<64>,
+        dt : input logic    ,
     ) -> logic<64> {
         var r: logic<64>;
         r = v & MSTATUS_WMASK;
         if r[12:11] == 2'b10 {
             r[12:11] = 2'b00;
+        }
+        r[24] = r[24] && dt;
+        if r[24] {
+            r[1] = 1'b0;
+        }
+        return r;
+    }
+
+    // vsstatus write (also sstatus with V = 1), SDT as in legal_mstatus with
+    // the VS-level DTE.
+    function legal_vsstatus (
+        old: input logic<64>,
+        v  : input logic<64>,
+        dt : input logic    ,
+    ) -> logic<64> {
+        var r: logic<64>;
+        r     = (old & ~SSTATUS_WMASK) | (v & SSTATUS_WMASK);
+        r[24] = r[24] && dt;
+        if r[24] {
+            r[1] = 1'b0;
         }
         return r;
     }
@@ -638,6 +694,10 @@ pub module csr #(
     // OR it into the mstatus / sstatus read values below.
     let mstatus_sd: logic = (mstatus[14:13] == 2'b11) || (mstatus[10:9] == 2'b11) || (mstatus[16:15] == 2'b11);
     let vsstatus_sd: logic = (vsstatus[14:13] == 2'b11) || (vsstatus[10:9] == 2'b11);
+    let sdt_m      : logic     = mstatus[24] && dte;
+    let sdt_vs     : logic     = vsstatus[24] && vdte;
+    let mstatus_v  : logic<64> = {mstatus[63:25], sdt_m, mstatus[23:0]};
+    let vsstatus_v : logic<64> = {vsstatus[63:25], sdt_vs, vsstatus[23:0]};
 
     // P10 Sstc effective STIP. When menvcfg.STCE=1 the supervisor timer
     // interrupt-pending bit (mip[5]) is hardware-driven by time>=stimecmp and
@@ -689,19 +749,34 @@ pub module csr #(
 
     // P10 Sscofpmf: scountovf aggregates the mhpmevent[n].OF (bit 63) of
     // counters 3..31 into bit n, masked by mcounteren[n] (a counter the
-    // supervisor may not read shows 0). Read-only.
+    // supervisor may not read shows 0) and, from VS, hcounteren[n]. Read-only.
     var scountovf_val: logic<64>;
     always_comb {
         scountovf_val = 64'd0;
         for n in 3..32 {
-            scountovf_val[n] = mhpmevent[n][63] && (mcounteren[n] || priv == csr_pkg::PrivLevel::MACHINE);
+            scountovf_val[n] = mhpmevent[n][63] && ((mcounteren[n] && (!virt || hcounteren[n]))
+                || priv == csr_pkg::PrivLevel::MACHINE);
         }
     }
+
+    // sireg and sireg2 with siselect 0x40 + i name the M-level counter i and
+    // mhpmevent i; decode lets through only the delegated counters.
+    function ireg_addr (
+        a  : input logic<12>,
+        sel: input logic<12>,
+    ) -> logic<12> {
+        return case a {
+            ADDR_SIREG : {7'b1011000, sel[4:0]},
+            ADDR_SIREG2: {7'b0011001, sel[4:0]},
+            default    : a,
+        };
+    }
+    let rd_a: logic<12> = ireg_addr(i_rd_addr, siselect);
 
     // === Combinational read ===
     var rd_data_w: logic<64>;
     always_comb {
-        case i_rd_addr {
+        case rd_a {
             ADDR_FFLAGS    : rd_data_w = {59'd0, fcsr[4:0]};
             ADDR_FRM       : rd_data_w = {61'd0, fcsr[7:5]};
             ADDR_FCSR      : rd_data_w = {56'd0, fcsr[7:0]};
@@ -714,10 +789,10 @@ pub module csr #(
             ADDR_VTYPE     : rd_data_w = vtype;
             ADDR_VLENB     : rd_data_w = VLENB_CONST;
             ADDR_MHARTID   : rd_data_w = {56'd0, i_hart_id};
-            ADDR_MSTATUS   : rd_data_w = mstatus | MSTATUS_XL_RO | {mstatus_sd, 63'd0};
+            ADDR_MSTATUS   : rd_data_w = mstatus_v | MSTATUS_XL_RO | {mstatus_sd, 63'd0};
             ADDR_MISA      : rd_data_w = MISA;
             // S-mode CSRs: sstatus/sie/sip are masked views; others standalone.
-            ADDR_SSTATUS   : rd_data_w = (mstatus & SSTATUS_MASK) | SSTATUS_XL_RO | {mstatus_sd, 63'd0};
+            ADDR_SSTATUS   : rd_data_w = (mstatus_v & SSTATUS_MASK) | SSTATUS_XL_RO | {mstatus_sd, 63'd0};
             ADDR_SIE       : rd_data_w = mie & SI_MASK & mideleg;
             ADDR_STVEC     : rd_data_w = stvec;
             ADDR_SCOUNTEREN: rd_data_w = scounteren;
@@ -747,7 +822,7 @@ pub module csr #(
             ADDR_HENVCFG   : rd_data_w = henvcfg_eff;
             ADDR_HGATP     : rd_data_w = hgatp;
             // Phase 11-H VS-level CSRs (own addresses; HS/M view).
-            ADDR_VSSTATUS  : rd_data_w = (vsstatus & SSTATUS_MASK) | SSTATUS_XL_RO | {vsstatus_sd, 63'd0};
+            ADDR_VSSTATUS  : rd_data_w = (vsstatus_v & SSTATUS_MASK) | SSTATUS_XL_RO | {vsstatus_sd, 63'd0};
             ADDR_VSIE      : rd_data_w = vsie & VSI_MASK;
             ADDR_VSTVEC    : rd_data_w = vstvec;
             ADDR_VSSCRATCH : rd_data_w = vsscratch;
@@ -778,28 +853,32 @@ pub module csr #(
             ADDR_CYCLE     : rd_data_w = mcycle; // alias
             ADDR_INSTRET   : rd_data_w = minstret;
             ADDR_DCSR      : rd_data_w = dcsr_rd;
-            ADDR_MSTATEEN0 : rd_data_w = {mstateen[0], mstateen[4], 62'd0};
+            ADDR_MSTATEEN0 : rd_data_w = {mstateen[0], mstateen[4], 1'b0, mstateen[5], 4'd0, mstateen[6], 55'd0};
             12'h30D        : rd_data_w = {mstateen[1], 63'd0};
             12'h30E        : rd_data_w = {mstateen[2], 63'd0};
             ADDR_MSTATEEN3 : rd_data_w = {mstateen[3], 63'd0};
-            ADDR_HSTATEEN0 : rd_data_w = {hstateen_eff[0], hstateen_eff[4], 62'd0};
+            ADDR_HSTATEEN0 : rd_data_w = {hstateen_eff[0], hstateen_eff[4], 1'b0, hstateen_eff[5], 60'd0};
             12'h60D        : rd_data_w = {hstateen_eff[1], 63'd0};
             12'h60E        : rd_data_w = {hstateen_eff[2], 63'd0};
             ADDR_HSTATEEN3 : rd_data_w = {hstateen_eff[3], 63'd0};
+            ADDR_SRMCFG    : rd_data_w = srmcfg;
+            ADDR_SISELECT  : rd_data_w = {52'd0, siselect};
+            ADDR_VSISELECT : rd_data_w = {52'd0, vsiselect};
+            ADDR_MISELECT  : rd_data_w = {52'd0, miselect};
             ADDR_DPC       : rd_data_w = dpc;
             ADDR_DSCRATCH0 : rd_data_w = dscratch0;
             ADDR_DSCRATCH1 : rd_data_w = dscratch1;
             12'h7A0, 12'h7A1, 12'h7A2, 12'h7A3, 12'h7A4, 12'h7A5: rd_data_w = i_trig_rd;
             default        : {
                 // P10 Zihpm counter/event ranges (index = addr[4:0]).
-                if i_rd_addr >= ADDR_MHPMC_LO && i_rd_addr <= ADDR_MHPMC_HI {
-                    rd_data_w = mhpmcounter[i_rd_addr[4:0]];
-                } else if i_rd_addr >= ADDR_HPMC_LO && i_rd_addr <= ADDR_HPMC_HI {
-                    rd_data_w = mhpmcounter[i_rd_addr[4:0]]; // hpmcounterN URO alias
-                } else if i_rd_addr >= ADDR_MHPME_LO && i_rd_addr <= ADDR_MHPME_HI {
-                    rd_data_w = mhpmevent[i_rd_addr[4:0]];
-                } else if i_rd_addr >= ADDR_PMPADDR0 && i_rd_addr <= ADDR_PMPADDR15 {
-                    rd_data_w = pmpaddr[i_rd_addr[3:0]];
+                if rd_a >= ADDR_MHPMC_LO && rd_a <= ADDR_MHPMC_HI {
+                    rd_data_w = mhpmcounter[rd_a[4:0]];
+                } else if rd_a >= ADDR_HPMC_LO && rd_a <= ADDR_HPMC_HI {
+                    rd_data_w = mhpmcounter[rd_a[4:0]]; // hpmcounterN URO alias
+                } else if rd_a >= ADDR_MHPME_LO && rd_a <= ADDR_MHPME_HI {
+                    rd_data_w = mhpmevent[rd_a[4:0]] & ~(if i_rd_addr == ADDR_SIREG2 ? 64'h4000_0000_0000_0000 : 64'd0);
+                } else if rd_a >= ADDR_PMPADDR0 && rd_a <= ADDR_PMPADDR15 {
+                    rd_data_w = pmpaddr[rd_a[3:0]];
                 } else {
                     rd_data_w = 64'd0;
                 }
@@ -810,7 +889,8 @@ pub module csr #(
         // HS-mode). Inert while V=0 (boot never enters a guest).
         if virt {
             case i_rd_addr {
-                ADDR_SSTATUS : rd_data_w = (vsstatus & SSTATUS_MASK) | SSTATUS_XL_RO | {vsstatus_sd, 63'd0};
+                ADDR_SSTATUS : rd_data_w = (vsstatus_v & SSTATUS_MASK) | SSTATUS_XL_RO | {vsstatus_sd, 63'd0};
+                ADDR_SISELECT: rd_data_w = {52'd0, vsiselect};
                 ADDR_SIE     : rd_data_w = vsie & VSI_MASK;
                 ADDR_STVEC   : rd_data_w = vstvec;
                 ADDR_SSCRATCH: rd_data_w = vsscratch;
@@ -985,6 +1065,10 @@ pub module csr #(
     assign o_pmm_hu      = hstatus[49:48];
     assign o_mstateen    = mstateen;
     assign o_hstateen    = hstateen_eff;
+    assign o_siselect    = siselect;
+    assign o_vsiselect   = vsiselect;
+    assign o_sdt         = sdt_m;
+    assign o_vsdt        = sdt_vs;
     assign o_mstatus_mie = mstatus[3];
     assign o_mstatus_sie = mstatus[1];
     assign o_vsstatus_sie = vsstatus[1];
@@ -1051,6 +1135,11 @@ pub module csr #(
     assign o_vtype        = vtype;
     assign o_vl           = vl;
     assign o_vstart       = vstart;
+
+    // A sireg2 write keeps mhpmevent.MINH.
+    let wr_a   : logic<12> = ireg_addr(i_wr_addr, siselect);
+    let wr_minh: logic     = mhpmevent[siselect[4:0]][62];
+    let wr_d   : logic<64> = if i_wr_addr == ADDR_SIREG2 ? {i_wr_data[63], wr_minh, i_wr_data[61:0]} : i_wr_data;
 
     // === Registered writes + trap entry + counters ===
     always_ff (clk, rst) {
@@ -1132,8 +1221,12 @@ pub module csr #(
             hcounteren = 64'd0;
             htimedelta = 64'd0;
             henvcfg    = 64'd0;
-            mstateen   = 5'd0;
-            hstateen   = 5'd0;
+            mstateen   = 7'd0;
+            hstateen   = 6'd0;
+            srmcfg     = 64'd0;
+            miselect   = 12'd0;
+            siselect   = 12'd0;
+            vsiselect  = 12'd0;
             hgatp      = 64'd0;
             vsstatus   = 64'd0;
             vsie       = 64'd0;
@@ -1187,6 +1280,9 @@ pub module csr #(
                     vsstatus[5] = vsstatus[1];
                     vsstatus[1] = 1'b0;
                     vsstatus[8] = if priv == csr_pkg::PrivLevel::SUPERVISOR ? 1'b1 : 1'b0;
+                    if vdte {
+                        vsstatus[24] = 1'b1;
+                    }
                     priv        = csr_pkg::PrivLevel::SUPERVISOR;
                     // virt unchanged (stays 1).
                 } else if i_trap_to_s {
@@ -1207,6 +1303,9 @@ pub module csr #(
                     // sstatus: SPIE ← SIE (bit 5 ← bit 1), SIE ← 0
                     mstatus[5] = mstatus[1];
                     mstatus[1] = 1'b0;
+                    if dte {
+                        mstatus[24] = 1'b1;
+                    }
                     // SPP (bit 8) ← current priv: 0=U, 1=S
                     mstatus[8] = if priv == csr_pkg::PrivLevel::SUPERVISOR ? 1'b1 : 1'b0;
                     priv       = csr_pkg::PrivLevel::SUPERVISOR;
@@ -1252,6 +1351,12 @@ pub module csr #(
                     priv = csr_pkg::PrivLevel::MACHINE;
                 }
             } else if i_mret_fire {
+                if dte && (mstatus[12:11] == 2'b00 || (mstatus[39] && mstatus[12:11] != 2'b11)) {
+                    mstatus[24] = 1'b0;
+                }
+                if vdte && mstatus[12:11] == 2'b00 && mstatus[39] {
+                    vsstatus[24] = 1'b0;
+                }
                 // mstatus: MIE ← MPIE, MPIE ← 1; priv ← MPP; MPP ← U
                 mstatus[3] = mstatus[7];
                 mstatus[7] = 1'b1;
@@ -1281,10 +1386,20 @@ pub module csr #(
                 // return PC is vsepc (selected by the core). hstatus is untouched.
                 vsstatus[1] = vsstatus[5];
                 vsstatus[5] = 1'b1;
+                if vdte {
+                    vsstatus[24] = 1'b0;
+                }
                 priv        = if vsstatus[8] == 1'b1 ? csr_pkg::PrivLevel::SUPERVISOR : csr_pkg::PrivLevel::USER;
                 vsstatus[8] = 1'b0;
                 mstatus[17] = 1'b0; // MPRV
             } else if i_sret_fire {
+                // From HS SDT always clears, from M only on a return to U, VS or VU.
+                if dte && (priv == csr_pkg::PrivLevel::SUPERVISOR || !mstatus[8] || hstatus[7]) {
+                    mstatus[24] = 1'b0;
+                }
+                if vdte && !mstatus[8] && hstatus[7] {
+                    vsstatus[24] = 1'b0;
+                }
                 // sstatus: SIE ← SPIE, SPIE ← 1; priv ← SPP (1=S, 0=U); SPP ← U
                 mstatus[1]  = mstatus[5];
                 mstatus[5]  = 1'b1;
@@ -1300,13 +1415,13 @@ pub module csr #(
             } else if i_wr_en && virt && (i_wr_addr == ADDR_SSTATUS || i_wr_addr == ADDR_SIE
                 || i_wr_addr == ADDR_SIP || i_wr_addr == ADDR_STVEC || i_wr_addr == ADDR_SSCRATCH
                 || i_wr_addr == ADDR_SEPC || i_wr_addr == ADDR_SCAUSE || i_wr_addr == ADDR_STVAL
-                || i_wr_addr == ADDR_SATP || i_wr_addr == ADDR_STIMECMP) {
+                || i_wr_addr == ADDR_SATP || i_wr_addr == ADDR_STIMECMP || i_wr_addr == ADDR_SISELECT) {
                 // Phase 11-H: VS-mode S-CSR write aliasing — the guest's writes
                 // to the S-CSR addresses update the VS shadow registers. This
                 // whole branch is dead while V=0 (boot never enters a guest), so
                 // the existing S-CSR write path below is byte-identical.
                 case i_wr_addr {
-                    ADDR_SSTATUS : vsstatus  = (vsstatus & ~SSTATUS_WMASK) | (i_wr_data & SSTATUS_WMASK);
+                    ADDR_SSTATUS : vsstatus  = legal_vsstatus(vsstatus, i_wr_data, vdte);
                     ADDR_SIE     : vsie      = (vsie & ~VSI_MASK) | (i_wr_data & VSI_MASK);
                     // Phase 11-H3b: the guest's sip.SSIP write aliases hvip.VSSIP
                     // (the one writable VS-interrupt-pending bit); STIP/SEIP are
@@ -1320,10 +1435,11 @@ pub module csr #(
                     ADDR_SATP    : vsatp     = legal_atp(vsatp, i_wr_data, 1'b0);
                     // Phase 11-H Sstc-in-VS: the guest's stimecmp aliases vstimecmp.
                     ADDR_STIMECMP: vstimecmp = i_wr_data;
+                    ADDR_SISELECT: vsiselect = i_wr_data[11:0];
                     default      : {}
                 }
             } else if i_wr_en {
-                case i_wr_addr {
+                case wr_a {
                     ADDR_FFLAGS    : fcsr[4:0] = i_wr_data[4:0];
                     ADDR_FRM       : fcsr[7:5] = i_wr_data[2:0];
                     ADDR_FCSR      : fcsr[7:0] = i_wr_data[7:0];
@@ -1335,7 +1451,7 @@ pub module csr #(
                         vxsat = {63'd0, i_wr_data[0]};
                         vxrm  = {62'd0, i_wr_data[2:1]};
                     }
-                    ADDR_MSTATUS   : mstatus  = legal_mstatus(i_wr_data);
+                    ADDR_MSTATUS   : mstatus  = legal_mstatus(i_wr_data, dte);
                     ADDR_MEDELEG   : medeleg  = i_wr_data & MEDELEG_WMASK;
                     ADDR_MIDELEG   : mideleg  = (i_wr_data & MIP_WMASK) | MIDELEG_RO1; // bits 2/6/10 RO-1
                     ADDR_MIE       : mie      = i_wr_data & MIE_WMASK;
@@ -1373,7 +1489,7 @@ pub module csr #(
                     ADDR_MINSTRET  : minstret = i_wr_data;
                     // S-mode CSRs (M5.D). sstatus/sie/sip write through to
                     // mstatus/mie/mip masked by visible bits.
-                    ADDR_SSTATUS   : mstatus    = legal_mstatus((mstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK));
+                    ADDR_SSTATUS   : mstatus    = legal_mstatus((mstatus & ~SSTATUS_MASK) | (i_wr_data & SSTATUS_MASK), dte);
                     ADDR_SIE       : mie        = (mie & ~(SI_MASK & mideleg)) | (i_wr_data & SI_MASK & mideleg);
                     ADDR_SIP       : mip        = (mip & ~(SIP_WMASK & mideleg)) | (i_wr_data & SIP_WMASK & mideleg);
                     ADDR_STVEC     : stvec      = legal_tvec(stvec, i_wr_data);
@@ -1415,10 +1531,13 @@ pub module csr #(
                     ADDR_HTINST    : htinst     = i_wr_data;
                     ADDR_HCOUNTEREN: hcounteren = {32'd0, i_wr_data[31:0]};
                     ADDR_HTIMEDELTA: htimedelta = i_wr_data;
-                    ADDR_HENVCFG   : henvcfg    = legal_envcfg(henvcfg, i_wr_data, HENVCFG_WMASK);
+                    ADDR_HENVCFG   : {
+                        henvcfg     = legal_envcfg(henvcfg, i_wr_data, HENVCFG_WMASK);
+                        henvcfg[59] = i_wr_data[59] && dte;
+                    }
                     ADDR_HGATP     : hgatp      = legal_atp(hgatp, i_wr_data, 1'b1);
                     // Phase 11-H VS-level CSR writes (own addresses).
-                    ADDR_VSSTATUS  : vsstatus   = (vsstatus & ~SSTATUS_WMASK) | (i_wr_data & SSTATUS_WMASK);
+                    ADDR_VSSTATUS  : vsstatus   = legal_vsstatus(vsstatus, i_wr_data, vdte);
                     ADDR_VSIE      : vsie       = (vsie & ~VSI_MASK) | (i_wr_data & VSI_MASK);
                     // vsip.SSIP aliases hvip.VSSIP (see the SIP-alias write above).
                     ADDR_VSIP      : hvip[2]    = i_wr_data[1];
@@ -1430,6 +1549,10 @@ pub module csr #(
                     ADDR_VSATP     : vsatp      = legal_atp(vsatp, i_wr_data, 1'b0);
                     ADDR_VSTIMECMP : vstimecmp  = i_wr_data; // Phase 11-H Sstc-in-VS
                     ADDR_MCOUNTEREN: mcounteren = {32'd0, i_wr_data[31:0]};
+                    ADDR_SRMCFG    : srmcfg     = i_wr_data & SRMCFG_WMASK;
+                    ADDR_SISELECT  : siselect   = i_wr_data[11:0];
+                    ADDR_VSISELECT : vsiselect  = i_wr_data[11:0];
+                    ADDR_MISELECT  : miselect   = i_wr_data[11:0];
                     ADDR_DCSR      : {
                         dcsr_eb     = {i_wr_data[15], i_wr_data[13:12]};
                         dcsr_ebv    = i_wr_data[17:16];
@@ -1451,19 +1574,22 @@ pub module csr #(
                         // addr[4:0]). The mhpmcounter write is reconciled with
                         // the same-cycle event increment at the bottom of this
                         // block (the increment is suppressed when written here).
-                        if i_wr_addr >= ADDR_MHPMC_LO && i_wr_addr <= ADDR_MHPMC_HI {
-                            mhpmcounter[i_wr_addr[4:0]] = i_wr_data;
-                        } else if i_wr_addr >= ADDR_MHPME_LO && i_wr_addr <= ADDR_MHPME_HI {
-                            mhpmevent[i_wr_addr[4:0]] = i_wr_data;
+                        if wr_a >= ADDR_MHPMC_LO && wr_a <= ADDR_MHPMC_HI {
+                            mhpmcounter[wr_a[4:0]] = wr_d;
+                        } else if wr_a >= ADDR_MHPME_LO && wr_a <= ADDR_MHPME_HI {
+                            mhpmevent[wr_a[4:0]] = wr_d;
                         } else if i_wr_addr >= ADDR_MSTATEEN0 && i_wr_addr <= ADDR_MSTATEEN3 {
                             mstateen[i_wr_addr[1:0]] = i_wr_data[63];
                             if i_wr_addr == ADDR_MSTATEEN0 {
                                 mstateen[4] = i_wr_data[62];
+                                mstateen[5] = i_wr_data[60];
+                                mstateen[6] = i_wr_data[55];
                             }
                         } else if i_wr_addr >= ADDR_HSTATEEN0 && i_wr_addr <= ADDR_HSTATEEN3 {
                             hstateen[i_wr_addr[1:0]] = i_wr_data[63] && mstateen[i_wr_addr[1:0]];
                             if i_wr_addr == ADDR_HSTATEEN0 {
                                 hstateen[4] = i_wr_data[62] && mstateen[4];
+                                hstateen[5] = i_wr_data[60] && mstateen[5];
                             }
                         } else if i_wr_addr >= ADDR_PMPADDR0 && i_wr_addr <= ADDR_PMPADDR15 {
                             // pmpaddr WARL: 54-bit field; locked entry is read-only.
@@ -1517,8 +1643,8 @@ pub module csr #(
             // to minstret/mcycle suppresses the increment that the
             // very next instruction would observe — implement by gating
             // the increment when the same cycle CSR-writes the counter.
-            let mcycle_being_written  : logic = i_wr_en && i_wr_addr == ADDR_MCYCLE;
-            let minstret_being_written: logic = i_wr_en && i_wr_addr == ADDR_MINSTRET;
+            let mcycle_being_written  : logic = i_wr_en && wr_a == ADDR_MCYCLE;
+            let minstret_being_written: logic = i_wr_en && wr_a == ADDR_MINSTRET;
             if !mcycle_being_written && !cnt_stop {
                 mcycle = mcycle + 64'd1;
             }
@@ -1546,8 +1672,8 @@ pub module csr #(
                     || (priv == csr_pkg::PrivLevel::SUPERVISOR && (if virt ? ev_sel[59] : ev_sel[61]))
                     || (priv == csr_pkg::PrivLevel::USER && (if virt ? ev_sel[58] : ev_sel[60]));
                 let ev_hit : logic     = sel != 4'd0 && sel <= 4'd8 && hpm_ev_q[ev_idx] && !inhibit && !cnt_stop;
-                let c_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPMC_LO + (n as 12) - 12'd3);
-                let e_wr   : logic     = i_wr_en && i_wr_addr == (ADDR_MHPME_LO + (n as 12) - 12'd3);
+                let c_wr   : logic     = i_wr_en && wr_a == (ADDR_MHPMC_LO + (n as 12) - 12'd3);
+                let e_wr   : logic     = i_wr_en && wr_a == (ADDR_MHPME_LO + (n as 12) - 12'd3);
                 if ev_hit && !c_wr {
                     // P10 Sscofpmf: detect wrap (all-1s → 0) on this increment;
                     // set the event's OF (bit 63) sticky and pend LCOFI (mip[13]).
