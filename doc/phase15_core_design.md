@@ -88,6 +88,7 @@
 | D9 (2026-10-22) | デバッグは RISC-V Debug Specification 1.0 (Sdext + Sdtrig) に従い、OpenOCD/GDB から操作できるようにする。設計は JTAG を持たない: Debug Module は全 hart を受け持つので SoC top (`heliodor_soc_smp`) に置き、DMI のレジスタ空間を APB の slave ポートで出す。JTAG DTM が要るなら SoC を使う側が外に足す。シミュレーションで OpenOCD/GDB を試すための JTAG DTM (Verilator ラッパの DPI による remote_bitbang over TCP) は tb 専用の検証基盤とし、設計には含めない。範囲: (1) core の Debug Mode (haltreq、dcsr.ebreakm/s/u の ebreak、dcsr.step、trigger による入場。dcsr、dpc、dscratch0/1、dret、stepie、stopcount、stoptime)、(2) Debug Module (dmcontrol、dmstatus、hartinfo、abstractcs、command、data、progbuf、hart の選択、halt/resume/ndmreset/hartreset、Access Register (GPR/FPR/CSR)、program buffer の実行)、(3) Sdtrig (mcontrol6 の execute/load/store の address 照合と icount、trigger 数は構成ごとのパラメータで 2-4。M2 の「0 を読む trigger CSR」を置き換える)、(4) System Bus Access、(5) SMP (halt group、hasel/hawindow、haltsum)。新しいマイルストーン MD を M4 と M5 の間に置き、core 側の入場の設計は M4 の中で確定し、H との相互作用 (dcsr.v、prv) は M5 で扱う。範囲外: trace (E-trace/N-trace) と debug の認証。旧コア (V14) はデバッグを持たないまま残す。設計は §D。 |
 | D10 (2026-10-22) | ユーザ向けドキュメントは mdBook で作り、日本語版は mdbook-i18n-helpers (gettext) で出す。英語を原本、日本語を `po/ja.po` の翻訳とする。Veryl の playground との連携は要らない。新しいマイルストーン MDOC を M6 の後に置く (内部の日本語設計書はユーザ向けドキュメントではない)。公開の場はユーザが決める。 |
 | D11 (2026-10-23) | SoC top (`heliodor_soc_smp`) の DRAM 側は、固定遅延を仮定する今の素のポート (`o_dmem_*`、write は応答なし) をやめ、遅延に耐える標準のメモリポート AXI4 にする。FPGA で実物の DRAM controller をつなぎやすくするためで、メモリ側のタイミングはコアの性質ではなく、つないだ slave の性質にする。新しいマイルストーン MM を M4 と MD の間に置く (順序は M4 → MM → MD → M5 → M6)。理由: M4 の手順 4 が mem_ctrl の outstanding (`MSHR_N`、`SPH`) を決め、MD の SBA は mem_ctrl に乗るので、先に遅延耐性のあるインタフェースを作ればやり直しが無い。旧コア (V14) は凍結で、V14 の枝の経路と数値は動かさない。設計は §MM。 |
+| D12 (2026-11-07) | 合成可能性のマイルストーン MS を M6 と MDOC の間に置く。発端: N=1 W2 の SoC を Vivado で合成すると、L2 のデータ配列 (512×512 bit × 4、組合せ読み 3 と書き込み 3、`L2_READ_1R1W = 0`) が RAM に推論できずに止まり、小さい配列 13 個が FF に展開され、elaboration に約 70 分かかった。多ポートの組合せ読みの SRAM は FPGA だけでなく ASIC でも実在しない。M6 の後に置く理由: L2、mem_ctrl と SoC は M6 までは V14 と共有で、V14 のビット一致の制約が外れてから作り直せる。設計は §MS。 |
 
 D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハーネスの arm は統合 SoC の上に載せ替える。V14 の arm は M6 まで旧来の bare ハーネス本体をそのまま保つ。理由: D6 の共存と、`v14_` 改名のビット一致受入 (§4.4) に必要なため。
 
@@ -108,7 +109,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | 深さ規則 1 | FU はレイテンシをパラメータとして公表し、スケジューラはそれだけを見る。 |
 | 深さ規則 2 | 各 writeback ポートを予約制にするか調停制にするかは設計時に決める。 |
 | 深さ規則 3 | op の識別子は op と一緒に運ぶ。ROB head のような生きた状態から読まない。 |
-| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MM 外部メモリインタフェース (D11 で追加) → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替 → MDOC ユーザ向けドキュメント (D10 で追加)。 |
+| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MM 外部メモリインタフェース (D11 で追加) → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替 → MS 合成可能性 (D12 で追加) → MDOC ユーザ向けドキュメント (D10 で追加)。 |
 | 再利用 | dcache/MMU は内部ロジックを再利用し、CPU 側を N ポートで作り直す (インタフェースは最初から N ポート、実装は M1-M2 で 1 ポート、M3 で 2 ポート)。ロジックとして再利用するもの: L2/coherence/mem_ctrl/bus, CSR, FPU, VU, decoder, 周辺, パッケージ, 検証資産。 |
 | golden | `b0f4668`。mtime を retire 命令数で進めるモードと、RVFI 寄せの retire ポートを使う (具体化は D1/D2)。 |
 
@@ -219,6 +220,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | MD | DMI を駆動する directed test (N=1、N=4、GD)、OpenOCD+GDB による riscv-tests の debug suite (GG、spike と同じ範囲)。DMI が idle のとき M4 までのゲートの結果が MD の前とビット一致する。 | §D の新規モジュールが cold-reader gate を通過。knob 0 個。`chk_debug` と `chk_dm` がすべてのテストで 0。§D.15 の事象が GF で 0 より大きい。 |
 | M5 | hvlinux、vector のテスト群。 | VU の上限を修正するか宣言する (§3.4)。 |
 | M6 | 既定コアを切り替える。旧コアを削除する (`src/v14/` を消す)。 | M6 での変更は、削除と既定値の変更だけ。 |
+| MS | M6 の全ゲートを両構成で通り、GL-B の record 列と hash が MS の前と一致する。 | 配列の棚卸しの全行が分類の規則に合う。Vivado の合成が N=1 W2 の SoC で完走し、規則の閾値を超える配列が FF に展開されず、SRAM に分類した配列がすべて RAM に推論される。 |
 | MDOC | 英語版と日本語版の book が警告なしで build でき、book の中のコマンドが実際に動く。 | ja の翻訳に fuzzy と未翻訳が無い。ゲートの結果には触れない (コードを変えない)。 |
 
 【決定】M1 を M1a (基盤: 旧コア側の前提作業、SoC 統合、golden、spike) と M1b (歩く骨格: rv64ui に要るものだけ) に分ける。理由: 1 つのマイルストーンで前提作業と全モジュールの最終形を同時に求めると、ゲート (rv64ui) が確かめない構造まで cold-reader に掛けることになり、また SoC 統合が使う構文の検証 (spike) が統合より後に来ていた。FP FU、`tlb`/`ptw`、`atomic_unit`、`io_unit`、rv64ui が要らない CSR と割込みは M2 に移す (マイルストーン計画)。
@@ -5079,6 +5081,17 @@ MI の進捗:
 - 作業: SoC と harness の `CORE` の既定値を変更し、V14 枝、`src/v14/` (凍結コピーを含む)、V14 専用の印字と `o_dbg_*` を削除する。README の数値と構成を新コアで更新する。
 - 出口条件: 新コアが既定で、検証計画 §1.2 の M6 列のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4、GH、GX、GV、GD、GG をすべて) を両構成で通る。M6 のコミットの変更は、削除と既定値の変更だけである (第 0 部 §2.5)。
 - M6 の後: misa の F/D/C の扱い (§C.9) をユーザが判断する。RVA23 の不足分と G13 は MI で扱う (U16)。
+
+### MS: 合成可能性
+
+- 目標: 新コアと SoC のすべての配列を、実在する記憶素子 (SRAM マクロ、FF で作るレジスタファイル、FF) に対応する形にし、FPGA と ASIC の合成が通ることを機械的に確かめる。M6 の後に置く (D12)。
+- 作業の順序:
+  1. 棚卸し: 新コアと SoC の全配列について、容量、読みと書きのポート数、読みが同期か組合せか、リセットの有無を一覧にする。旧コアの `doc/sram_inventory.md` の分類を出発点にする。
+  2. 分類の規則を決める: SRAM マクロ (1RW か 1R1W、同期読み、リセット無し)、レジスタファイル (多ポートの小さい配列。FF と書き込み decoder で作る、§5.15)、FF。閾値 (どの容量から SRAM でなければならないか) はここで決める。
+  3. 規則に合わないものを直す。既知のもの: L2 のデータ配列 (P3.b の `L2_READ_1R1W` の完成と、merge の組合せ読みと RMW の読みの撤去)、mem_ctrl の書き込みバッファ (非同期リセット付きの配列)、rename のチェックポイントの配列。
+  4. ゲートを足す: Vivado の out-of-context 合成 (N=1 W2 の SoC、L2 を含む) の完走と、使用量と RAM の推論結果の記録。Design Compiler で SRAM をブラックボックスにした合成を足すかは手順 2 で決める。周波数は参考値として記録し、出口条件にしない。
+- 出口条件: 上の表の MS の行。
+- 記録: Vivado は sandbox の中ではライセンスの取得で abort するので、sandbox の外で走らせる。veryl が出す `core_types` は tb の構成パッケージ (`cfg_bad`、`cfg_w4_sb8`) も参照するので、合成のファイル一覧にそれらを含める。
 
 ### MDOC: ユーザ向けドキュメント
 
