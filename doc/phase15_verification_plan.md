@@ -567,6 +567,8 @@ M3 で `CorePerf` に足したもの (手順ごと。`fire_check.py` は struct 
 - M3 の末: `mp.ewake` (`MemPipePerf.ewake`、load の pass が dcache の V 段の HIT か全 forward で consumer を起こした。設計書 §L.2)。matrix の default の行。
 - matrix に足した行: `dc.*` と `dtlb.lk2` (手順 4)、手順 5 の 6 本 (default)、`ren.ck_alloc`/`ck_restore` (default)、`ren.ck_none` (boot)、`disp.cut_ck` (default)、`iss` (default)。手順 2 の W4 の `--zero` (どのログでも 0): `disp.cut_int`/`cut_fp`、`iq[1].tok_wait`、DIV と FDIV 以外のポートの `rs[*].hf_*`、`ad.empty_gen`/`excl_fail`/`ev_skid`、`dtlb`/`itlb.fill_inv`、`ptw_i.full`/`d_wr`、`at.fail`/`watch`/`backoff`、`io.retry` (`ad.*` は手順 4 で adapter とともに消えた)。
 
+【M5 の末で記録】(2026-11-06、`62ea1364`) M5 の機構の行: VU の 15 行 (M5 の手順 1 で足した `vu.*`、`vum.*`、`arb.vu_win`/`vu_blk`、`disp.cut_vq`、`cm.rf_vec`) と H の 14 行。H の事象のために `CorePerf` に `tr` (`TrapPerf`、`trap_unit` が出す組合せの事象: `vs`、`virt_hs`、`irq_vss`、`irq_vst`、`irq_vse`、`irq_vhs`)、`mp.hlv`、`cm.dm_virt` を足した (W4 の `CorePerf` は 309 bit で `PERF_W` = 512 に収まる)。列に `hv` (GH の hvlinux のログ) を足した。hvip で注入した VS の外部割込みと timer 割込みは既存のテストでは発火しなかった (hvlinux の guest timer は vstimecmp) ので、directed `hprobe/h_hvip` を G0 に足した。ログは G0 (1032 passed) と `test_w2_hvlinux`、`test_w4_hvlinux` で、0 より大きいことを確かめた数 (W2 と W4 の合計): `vu.exec_wait` 23,174、`vu.start` 3,410、`vu.hf_wait` 83、`vu.done` 3,410、`vum.req` 11,188、`vum.wait_ord` 6,013、`vum.miss` 16、`vum.xpark` 14、`vum.fault` 32、`vum.push` 6,406、`vum.port_req` 97,725、`arb.vu_win` 11,188、`arb.vu_blk` 14、`disp.cut_vq` 25,282、`cm.rf_vec` 576 (以上 default)、`ptw_d.two` 9,168、`ptw_i.two` 759、`ptw_d.g_rd` 32,708、`ptw_i.g_rd` 2,482 (default と hv)、`ptw_d.gfault` 72、`ptw_i.gfault` 2、`mp.hlv` 61、`tr.vs` 10、`tr.virt_hs` 7,480、`tr.irq_vst` 67 (default と hv)、`tr.irq_vss` 2 (`h/hvirq`)、`tr.irq_vse` 2 (`hprobe/h_hvip`)、`tr.irq_vhs` 2 (`h/hvsirq`)、`cm.dm_virt` 12 (`dbgh/dm_h`)。29 行はすべて pass。このログの組で 0 だった行は `dc.nf_busy` (default:w2,act:w2) と `ptw_i.stale` (default,act,boot) の 2 本で、どちらも act か boot のログを要する M5 より前の行である (今回は act と boot を走らせていない)。
+
 ---
 
 ## 6. シミュレーション速度計画
@@ -611,6 +613,9 @@ N4 の値は `.build/test_timings` のもので、CLAUDE.md にあった 4408 s 
 | M3 (末) | W2 / W4 | arch rv64ui 108 本 (1 コアに固定、`sim_s` の合計) | | | 5.5k / 1.7k | degraded modules W2 162 / W4 215 | 087a7d1 | |
 | M3 (末) | W2 / W4 | 5.15 N=1 boot、Verilator 5.050 `-O3` | 14.5M / 11.8M | | 22.6k / 8.1k | | 087a7d1 | |
 | MD (`2b34717c`) | W2 | 5.15 N=1 boot (GL-B lockstep、同期ビルド、1 コア固定、master と対) | 14,570,718 | 4,664 s (sim) | 3.1k (master `9016b4c3` は 2,338 s、6.2k) | 0 / 0 (MD も master も) | 2b34717c | |
+| M5 (`2924c8ac`) | W2 | 5.15 N=1 boot (GL-B lockstep、同期ビルド、1 コア固定、MD の完了 `950e991f` と対、コアを入れ替えて 2 回) | 14,570,718 | 373.8 s / 390.7 s (sim) | 39.0k / 37.3k (`950e991f` は 358.4 s / 379.6 s、40.7k / 38.4k) | 0 / 0 (M5 も `950e991f` も) | 2924c8ac | 96d8af7e |
+
+M5 の行の補足: MD の行の数値は古い veryl (`c66bf8ab` の前) のもので、そのまま比べると M5 が約 12 倍速く見えるが、差のほとんどは veryl の変更による。公平に比べるため、MD の完了の木 (`950e991f`) を一時的な worktree に取り、同じ veryl `96d8af7e` で M5 と同時に、それぞれ別の 1 コアに `taskset` で固定して走らせ、コアを入れ替えてもう 1 回走らせた。sim 時間は M5 が `950e991f` より 4.3 % と 2.9 % 長い (平均で約 +3.6 %)。user 時間でも 569.9 s 対 514.9 s、395.8 s 対 382.6 s で同じ向きである (1 回目は cc のビルドを含む)。cycles、record 10,417,776、hash `74d4b7982390260f` は両方の木で同一で、遅くなったのは M5 で足した VU、H の二段翻訳と perf の配線の評価量である。`VERYL_AOT_C_DIAG=1 VERYL_AOT_C_EVENT_DIAG=1` で whole-comb の decline は 0、Clock と Reset の event はすべて AOT-C で、未 AOT の event は tb の initial block の `$display` などだけ (両方の木で同じ 5 個)。box の load average は 23-25 で、16 コアすべてが他の作業で埋まっていた。
 
 M3 の行の補足: W2 の boot は手順 2 の時点で fallback 0 のまま。W4 の boot と ACT4 に残る whole_event と dataflow の fallback は、M3 末の GS で原因を見る。手順 6 の `NUM_CKPT` の対では、同時に走らせた W2 の 5.15 boot の CPU 時間が 0 で 2,327 s、4 で 2,481 s (+6.6 %)、2 で 2,336 s、8 で 2,510 s だった。checkpoint を lane ごとに持つ最初の形は、W4 の `NUM_CKPT=8` で同時実行の進みが約 1/2-1/3 に落ちた (設計書 §R.3.5)。
 
@@ -929,6 +934,8 @@ M5 の H/V (手順 1-3) の後に、§1.2 の M5 列のうち GX、GV、GD4、GG
 | GV (W4、Verilator) | hvlinux 16,172,701 (instret 11,382,596)、litmus N=4 5,028,524、N=1 12,286,458、N=2 16,811,410、N=4 22,640,641 (instret 14,730,876) がすべて PASSED | native の GH と MD の GV と cycles 一致 | 一致 |
 | GD4 (W2、W4) | 10/10 pass (`chk=0`、dmi fail 0) | MD: 10/10 | 一致 |
 | GG | w2_n1 pass 52、w4_n1 pass 49、w2_n4 pass 6、w2_n4_smp pass 5 (下)。`gg_compare.py` の FAIL は 4 target とも 0 | MD: 52 / 49 / 6 / 5 | 一致 (PrivRw を除外に移し VectorTest が pass に増えた) |
+| GF (M5 の機構) | VU 15 行と H 14 行がすべて 0 より大 (G0 1032 passed、W2/W4 の hvlinux 18,622,469 / 16,172,701 cy、`2924c8ac`) | MD: `dbg` 33 行、`gdb` 20 行 | §5.2 の【M5 の末で記録】 |
+| GS | §6.2 の M5 の行 | MD の完了 `950e991f` を同じ veryl で対にして測った | 記録 (sim が約 3.6 % 遅い、fallback 0) |
 
 - GV のラッパ: hvlinux の新コア用に `sim/verilator/tb_soc_hvlinux_w2.sv` と `tb_soc_hvlinux_w4.sv` を足した (`boot_soc_harness` を native の `test_w{2,4}_hvlinux` と同じ parameter で置く)。Verilator の CPU 時間は hvlinux W2 1,026 s / W4 2,559 s、litmus N=4 2,592 s / 4,657 s、N=1 802 s / 1,880 s、N=2 W2 4,283 s / W4 7,374 s、W4 N=4 21,644 s (wall 6 h 18 min)。W4 の 4 hart の build (`-O1 -j 2`) は負荷下で約 1.5 時間かかった。
 - GX の差 22 対: MD の 20 対 (§9.5) と同じものに、`dbgh_dm_h` と `h_hvtmr` が加わった。`dbgh_dm_h` は DMI script を cycle で駆動する debug の directed で、VS の loop への haltreq の時点が W2 と W4 で違う (record 数は 399 で同じ、hash だけ違う。MD の `dbg_halt_resume` と同じ型)。`h_hvtmr` は guest が `time` を読んで vstimecmp を少し先に置き、割込みを待って spin する (record は W2 5,481 / W4 5,477)。mtime はサイクル由来なので spin の回数が構成で変わり、§4.6 の割込みを受けるテストに当たる (`probe_b13_csrrd` と同じ理由)。H の残り 16 本、`m5_hprobe` 5 本、V 20 本、`m5_vprobe` 14 本 (G2-G13 の 11 本と B39 の 3 本) は W2 と W4 で record 数と hash が一致した (VRF の書き込みは `vrf_wcnt`/`vrf_hash` で hash に入る)。
