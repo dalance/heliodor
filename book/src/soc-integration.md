@@ -6,17 +6,7 @@ controller, the CLINT, the PLIC, a UART, and a Debug Module. Its outside
 interface is one AXI4 master port for memory, interrupt inputs, an APB slave port
 for the debugger, and observation outputs.
 
-```text
-                +--------------------------------------------------+
-                |  heliodor_soc_smp                                |
- AXI4 master <--+-- mem_ctrl <-- l2cache <-- [ core h: L1I, L1D ]xN |
- (DRAM, ROM)    |      ^                                           |
-                |      +-- memory_bus -- CLINT, PLIC, UART, dm_mem |
- APB slave   -->+-- dmi_apb -- dm -- dm_sba                        |
- (debug)        |                                                  |
- i_ext_irq_src->+-- PLIC                          o_retire, o_chk.. |
-                +--------------------------------------------------+
-```
+![Block diagram of heliodor_soc_smp](img/soc.svg)
 
 ## Parameters
 

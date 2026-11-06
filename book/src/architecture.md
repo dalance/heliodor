@@ -11,22 +11,7 @@ ahead of instruction fetch, decoded operations are renamed onto physical
 registers, wait in issue queues until their operands are ready, execute out of
 order, and retire in order from the reorder buffer.
 
-```text
- bpu --> ftq --> ifu --> extract --> decode --> rename + dispatch --+--> rob --> commit --> retire port
-  ^       ^      (icache,   (RVC                                      |             |
-  |       |       ITLB,      expand)                                  v             +--> trap_unit, csr
-  |       |       I-PTW)                                       iq + busy_table
-  |       |                                                    + wb_resv
-  |       |                                                           |
-  |       |                                  exec_port[ISSUE_W] ------+------ mem_pipe[MEM_W]
-  |       |                                  (alu bru mul div          |       (AGU, DTLB, PMP/PMA,
-  |       |                                   sys fma fmisc fdiv)      |        forwarding, load format)
-  +-------+------- resolve / commit ---------> prf (int, fp), rob      |
-                                                                       v
-                                                          lq, sq, sb, atomic_unit, io_unit
-                                                                       |
-                                                           dcache --- L2 --- mem_ctrl --- AXI4
-```
+![Block diagram of the core](img/core.svg)
 
 Everything outside the core proper (L2, `mem_ctrl`, the memory bus, CLINT, PLIC,
 UART and the Debug Module) lives in the SoC, `heliodor_soc_smp`. See
