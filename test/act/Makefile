@@ -8,15 +8,15 @@
 #  system Ruby with BUNDLE_PATH set by env.sh.)
 #
 # Usage:
-#     make -C test/act            # generate the default extension set
-#     make -C test/act EXT="F D"  # generate specific extensions
+#     make -C test/act            # every suite selected for the heliodor config
+#     make -C test/act EXT="F D"  # only these suite directories
 #     make -C test/act clean      # remove generated ELFs/bin (keeps upstream clone)
 #     make -C test/act distclean  # also remove the upstream clone
 #
-# The flow per extension <EXT>:
+# The flow per suite <EXT>:
 #   framework `make` -> Sail-signed self-checking ELFs in work/heliodor/elfs/**/<EXT>/
-#   gen_suite.py     -> test/hex/act_<ext>_*.hex + tb/test_act_<ext>.veryl
-# Run with `veryl test --ignored --test test_act_<ext>` from the repo root.
+#   gen_suite.py     -> test/hex/act_<ext>_*.hex + test/gates/mi_act.list
+# Run with test/gates/run_act.py from the repo root.
 
 HERE       := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 REPO       := $(abspath $(HERE)/../..)
@@ -29,32 +29,29 @@ UPSTREAM_URL := https://github.com/riscv/riscv-arch-test
 # sources / Sail signatures and shift the pass/fail counts. Pin to an exact commit
 # so the documented results are reproducible on demand. Bump deliberately (then
 # `make distclean` to repin), not by accident.
-ACT_COMMIT := 06568893b9fc8b27b3eb69037caed2fa06886ee3
+ACT_COMMIT := 8b9ddedcd44a2721dd9153efb4c64fc812090148
 
 CFG_SRC    := $(HERE)/config/heliodor
 CFG_DST    := $(UPSTREAM)/config/cores/heliodor
 JOBS       ?= $(shell nproc)
 
-# Default set: every scalar suite heliodor passes (472/472). Combined-extension
-# suites are named by their test DIRECTORY (e.g. ZfaF, ZcbZba) — see README.
-# Tokens are space-separated here (readable + fed to gen_suite.py) and translated
-# to commas for the framework below (EXT_CSV).
-EXT        ?= I M Zaamo Zalrsc Zca Zcd Zicsr Zifencei Zicntr F D \
-              Zba Zbb Zbs Zcb ZcbM ZcbZba ZcbZbb Zcmop Zimop Zicond \
-              Zihintntl ZihintntlZca Zihintpause ZfaF ZfaD Zfhmin ZfhminD \
-              Zicbom Zicboz Zicbop Zihpm Zmmul \
-              Misalign MisalignD MisalignF MisalignZca
+# Default: every suite the framework selects for the heliodor UDB config
+# (config/heliodor/heliodor.yaml). EXT narrows it to suite directory names,
+# space-separated (e.g. EXT="I Zba Vx8"); the framework wants them
+# comma-separated with no spaces, hence EXT_CSV.
+EXT        ?=
 
-# The upstream framework wants EXTENSIONS comma-separated and strips all spaces
-# from the value (so a space-separated list collapses to one bogus token and
-# matches nothing). EXT stays space-separated for readability + gen_suite.py;
-# translate to commas for the framework invocation below.
 empty      :=
 space      := $(empty) $(empty)
 comma      := ,
 EXT_CSV    := $(subst $(space),$(comma),$(strip $(EXT)))
 
 export OBJCOPY  := riscv64-unknown-elf-objcopy
+# The UDB gem downloads its solver binaries into $XDG_CACHE_HOME at install and
+# writes its resolved spec into $XDG_DATA_HOME; keep both with the other
+# toolchain caches.
+export XDG_CACHE_HOME := $(REPO)/toolchain/.cache
+export XDG_DATA_HOME  := $(REPO)/toolchain/.cache/share
 export ACT_WORK := $(UPSTREAM)/work/heliodor
 
 .PHONY: all upstream config framework elfs hex clean distclean
@@ -92,19 +89,25 @@ framework: config
 	cd "$(UPSTREAM)" && uv sync
 	cd "$(UPSTREAM)/framework/src/act/data" && bundle install
 
-# 4. Generate the Sail-signed ELFs for the requested extensions.
+# 4. Generate the Sail-signed ELFs for the requested extensions. The vector
+#    privileged suites (ExceptionsV*, MisalignV) come from a separate generator
+#    that the framework's default target does not run. The framework's own
+#    `elfs` target stops at the first failure; two SdtrigS/SdtrigU napot tests
+#    exceed the 4 MiB harness DRAM and never link, so call `act` directly with
+#    --keep-going and let the rest through.
+ACT_ARGS   := config/cores/heliodor/test_config.yaml --workdir work --test-dir tests \
+              --jobs $(JOBS) --keep-going $(if $(EXT_CSV),--extensions $(EXT_CSV))
 elfs: framework
 	@command -v riscv64-unknown-elf-gcc >/dev/null || { echo "elf gcc not on PATH — source toolchain/env.sh"; exit 1; }
 	@command -v sail_riscv_sim >/dev/null || { echo "sail_riscv_sim not on PATH — source toolchain/env.sh"; exit 1; }
-	cd "$(UPSTREAM)" && uv run make \
-	  EXTENSIONS="$(EXT_CSV)" \
-	  CONFIG_FILES=config/cores/heliodor/test_config.yaml \
-	  JOBS=$(JOBS)
+	cd "$(UPSTREAM)" && uv run make tests vector-tests JOBS=$(JOBS)
+	-cd "$(UPSTREAM)" && uv run act $(ACT_ARGS)
 
-# 5. ELF -> hex + Veryl modules.
+# 5. ELF -> hex, and the gate list when every suite was generated.
+GATE_LIST  := $(REPO)/test/gates/mi_act.list
 hex: elfs
-	python3 "$(HERE)/gen_suite.py" $(EXT)
-	@echo "Done. Run: veryl test --ignored --test test_act_<ext>"
+	python3 "$(HERE)/gen_suite.py" $(if $(EXT),,--list "$(GATE_LIST)") $(EXT)
+	@echo "Done. Run: test/gates/run_act.py --core w2"
 
 clean:
 	rm -rf "$(HERE)/build"

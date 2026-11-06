@@ -1,123 +1,95 @@
 # rvmodel_macros.h
-# RVMODEL macro definitions for OpenHW CVA6 (cv32a65x) core
+# RVMODEL macro definitions for heliodor on the arch harness (MAP_ARCH:
+# DRAM 4 MiB at 0x8000_0000, CLINT 0x0200_0000, PLIC 0x0C00_0000, UART
+# 0x1000_0000, every other PA a hole).
 # SPDX-License-Identifier: Apache-2.0
 
 #ifndef _RVMODEL_MACROS_H
 #define _RVMODEL_MACROS_H
 
+#define CLINT_BASE_ADDRESS 0x02000000
+
 #define RVMODEL_DATA_SECTION \
         .pushsection .tohost,"aw",@progbits;                \
-        .align 8; .global tohost; tohost: .dword 0;         \
-        .align 8; .global fromhost; fromhost: .dword 0;     \
-        .popsection;
+        .balign 8; .global tohost; tohost: .dword 0;         \
+        .balign 8; .global fromhost; fromhost: .dword 0;     \
+        .popsection
 
-// heliodor implements the mandatory M-mode spec (full M/S/U, CSRs, traps — it
-// boots Linux), so use the framework's standard Sm boot + trap-handler
-// infrastructure. This is required for the privileged / virtual-memory suites
-// (they mode-switch via mret and rely on the prolog initializing mscratch, the
-// trampolines, xtvec, etc.); without it mscratch stays 0 and the tests' mode-
-// switch loads fault into a trap loop. Same as the spike/sail rv64-max configs.
+// heliodor implements the standard M-mode, so the framework's boot code, trap
+// handler and T-SBI run unchanged.
 #define STANDARD_SM_SUPPORTED
-
-##### STARTUP #####
-
-# Perform boot operations. Can be empty or left undefined unless needed for
-# DUT-specific behavior such as turning on a memory controller or
-# initializing custom state.
-//#define RVMODEL_BOOT
-
-// Custom RVMODEL_BOOT_TO_MMODE overrides default RVTEST_BOOT_TO_MMODE
-// if defined.  For most DUTs, the default should work and this macro
-// should not be defined.  If no M-mode or CSRs are implemented, define this
-// macro as blank to bypass the boot process.  If a nonconforming
-// M-mode is implemented, define this macro to set up the necessary
-// state in a fashion similar to RVTEST_BOOT_TO_MMODE.
-//#define RVMODEL_BOOT_TO_MMODE
 
 ##### TERMINATION #####
 
-# Terminate test with a pass indication.
-# When the test is run in simulation, this should end the simulation.
+// The harness passes on a retired store of 1 to tohost (0x8000_1000, link.ld)
+// and fails on any other non-zero value.
 #define RVMODEL_HALT_PASS  \
   li x1, 1                ;\
   la t0, tohost           ;\
   write_tohost_pass:      ;\
     sw x1, 0(t0)          ;\
     sw x0, 4(t0)          ;\
-    fence.i               ;/* heliodor: write-back dcache so tohost reaches DRAM */\
+    fence.i               ;\
   self_loop_pass:         ;\
     j self_loop_pass      ;\
 
-# Terminate test with a fail indication.
-# When the test is run in simulation, this should end the simulation.
 #define RVMODEL_HALT_FAIL \
   li x1, 3                ;\
   la t0, tohost           ;\
   write_tohost_fail:      ;\
     sw x1, 0(t0)          ;\
     sw x0, 4(t0)          ;\
-    fence.i               ;/* heliodor: write-back dcache so tohost reaches DRAM */\
+    fence.i               ;\
   self_loop_fail:         ;\
     j self_loop_fail      ;\
 
 ##### IO #####
 
-# Initialization steps needed prior to writing to the console
-# _R1, _R2, and _R3 can be used as temporary registers if needed.
-# Do not modify any other registers (or make sure to restore them).
-# Can be empty or left undefined if no initialization is needed.
- //#define RVMODEL_IO_INIT(_R1, _R2, _R3)
-
-# Prints a null-terminated string using a DUT specific mechanism.
-# A pointer to the string is passed in _STR_PTR.
-# _R1, _R2, and _R3 can be used as temporary registers if needed.
-# Do not modify any other registers (or make sure to restore them).
+// Each byte goes to the UART transmit register.
 #define RVMODEL_IO_WRITE_STR(_R1, _R2, _R3, _STR_PTR) \
 1:                           ;                        \
-  lbu  _R1, 0(_STR_PTR)      ; /* Load byte */        \
-  beqz _R1, 3f               ; /* Exit if null */     \
-2:                           ;                        \
-  li   _R2, 0x10000000       ; /* virtual printer */  \
+  lbu  _R1, 0(_STR_PTR)      ;                        \
+  beqz _R1, 3f               ;                        \
+  li   _R2, 0x10000000       ;                        \
   sw   _R1, 0(_R2)           ;                        \
-  addi _STR_PTR, _STR_PTR, 1 ; /* Next char */        \
-  j 1b                       ; /* Loop */             \
+  addi _STR_PTR, _STR_PTR, 1 ;                        \
+  j 1b                       ;                        \
 3:
 
 ##### Access Fault #####
 
-// heliodor PMA hole: 0x5000_0000 is outside the backed map (DRAM pa[31] / CLINT
-// 0x02 / UART 0x1 / PLIC 0x0C), so a load/store/fetch to it raises an access
-// fault (cause 5/7/1). Enables the ExceptionsSv* access-fault suites.
+// A hole in MAP_ARCH: every load, store, AMO, LR/SC, fetch and implicit
+// page-table read there raises a precise access fault.
 #define RVMODEL_ACCESS_FAULT_ADDRESS 0x50000000
-
-##### Machine Interrupts #####
-#define RVMODEL_MAX_CYCLES_PER_TIMER_TICK 1
-
-// Interrupt latency configuration
-#define RVMODEL_INTERRUPT_LATENCY 10
-
-#define RVMODEL_TIMER_INT_SOON_DELAY 100
 
 ##### Machine Timer #####
 
+#define RVMODEL_MTIMECMP_ADDRESS (CLINT_BASE_ADDRESS + 0x4000)
+#define RVMODEL_MTIME_ADDRESS    (CLINT_BASE_ADDRESS + 0xBFF8)
+
 ##### Machine Interrupts #####
 
-#define RVMODEL_SET_MEXT_INT(_R1, _R2)
+// Polling iterations while waiting for a requested interrupt to pend.
+#define RVMODEL_INTERRUPT_LATENCY 1000
 
-#define RVMODEL_CLR_MEXT_INT(_R1, _R2)
+// mtime ticks once every 10 cycles on the harness.
+#define RVMODEL_TIMER_INT_SOON_DELAY 100
 
-#define RVMODEL_SET_MSW_INT(_R1, _R2)
+#define RVMODEL_MSIP_ADDRESS (CLINT_BASE_ADDRESS + 0x0)
 
-#define RVMODEL_CLR_MSW_INT(_R1, _R2)
+// The PLIC sources are harness pins without a software trigger, so machine
+// external interrupts are not raised (MEI_INTR_IMPL is false in
+// heliodor.yaml). Supervisor software and external interrupts go through
+// mip.SSIP and mip.SEIP, so their macros stay undefined.
 
-##### Supervisor Interrupts #####
+##### Sscofpmf #####
 
-#define RVMODEL_SET_SEXT_INT(_R1, _R2)
-
-#define RVMODEL_CLR_SEXT_INT(_R1, _R2)
-
-#define RVMODEL_SET_SSW_INT(_R1, _R2)
-
-#define RVMODEL_CLR_SSW_INT(_R1, _R2)
+// Event 5 counts cycles in which a memory port carries a request, so a load
+// increments it. The Sail build runs a fence instead, mapped to selector 5 in
+// sail.json.
+#define RVMODEL_HPM_COUNTER 3
+#define RVMODEL_MHPMEVENT_VAL 0x5
+#define RVMODEL_MHPMEVENT_CODE(_R1, _R2) \
+    lw _R2, 0(_R1)
 
 #endif // _RVMODEL_MACROS_H

@@ -14,74 +14,152 @@ itself is pinned to an exact commit (`ACT_COMMIT` in the `Makefile`) — see
 ## Build + run
 
 ```bash
-toolchain/fetch.sh all && source toolchain/env.sh   # one-time: get gcc/sail/uv
-make -C test/act                                    # default extension set
-make -C test/act EXT="F D"                          # a subset
-veryl test --ignored --test test_act_f              # run one suite (substring)
-veryl test --ignored --test test_act_               # run all generated suites
+toolchain/fetch.sh all && source toolchain/env.sh   # one-time: gcc, Sail 0.16, uv
+make -C test/act                                    # every suite selected for heliodor
+make -C test/act EXT="I Vx8"                        # a subset (suite directory names)
+test/gates/run_act.py --core w2 --pass-fail         # GA on the new core (W2)
+test/gates/run_act.py --core w4 --pass-fail --suite i,zba
 ```
 
-> The ELF-generation step (`make … elfs`) uses Python multiprocessing, which
+> The ELF-generation steps (`make … elfs`) use Python multiprocessing, which
 > needs `AF_UNIX` sockets. A restrictive sandbox blocks those
-> (`PermissionError: Operation not permitted`) — run `make -C test/act` outside
+> (`PermissionError: Operation not permitted`): run `make -C test/act` outside
 > the sandbox (e.g. Claude Code `/sandbox` off). The toolchain fetch, the Veryl
 > sim, and everything else run fine sandboxed.
 
 `make` fetches the framework at the pinned commit, drops in the heliodor DUT
-config, runs the Sail + uv + UDB pipeline to produce ELFs, then `gen_suite.py`
-converts each ELF to `test/hex/act_<ext>_<name>.hex` and writes
-`tb/test_act_<ext>.veryl` (one `#[test] #[ignore]` module per ELF). Both the hex
-and the Veryl modules are gitignored — regenerate with `make`.
+config, generates the test sources (`make tests vector-tests` upstream: the
+vector privileged suites `ExceptionsV*` and `MisalignV` come from a separate
+generator), runs the Sail + uv + UDB pipeline to produce the ELFs (`act
+--keep-going`, see the napot note below), then `gen_suite.py` converts each ELF
+to `test/hex/act_<suite>_<name>.hex` and writes the gate list
+`test/gates/mi_act.list`. The hex images are gitignored; the list is
+committed. `gen_suite.py --tb` additionally writes the old per-suite
+`tb/test_act_<suite>.veryl` modules (default core of the harness).
+
+The framework selects the tests from the UDB config: a suite is generated only
+for extensions `heliodor.yaml` declares, so suites of extensions MI implements
+later (Zvbb, Zvfhmin, Ssstateen/Smstateen) appear once they are declared.
 
 ### On the new core (GA / GL-C)
 
-`test/gates/m2_act.list` names every generated test with its repo-relative
-image. With the images built as above:
+`test/gates/mi_act.list` names every generated test with its repo-relative
+image, the cycle budget (2M; a passing test stops at tohost) and the lockstep
+flag. `run_act.py` writes `#[ignore]` wrappers `tb/test_<core>_act_<suite>.veryl`
+(gitignored, deleted after the run) and runs them in batches of whole suites of
+at most 400 tests (`--batch`): one `veryl test` process keeps every test it ran
+in memory, about 90 MB each, and the 3,640 tests in one process ran the box
+out of memory. GA needs tohost == 1 and clean checkers; GL-C compares each
+test's final `H` line with `test/golden/act/<suite>.final`.
 
-```bash
-test/gates/run_act.py --core w2              # GA pass/fail + GL-C final hash
-test/gates/run_act.py --core w4 --pass-fail  # GA only
-test/gates/run_act.py --core w2 --suite zaamo,zabha
-```
-
-The runner writes `#[ignore]` wrappers `tb/test_<core>_act_<ext>.veryl`
-(gitignored, deleted after the run), runs them in one `veryl test`, and
-compares each test's final `H` line with `test/golden/act/<ext>.final`. The
-finals come from the golden model through `test/golden/run_golden.py`, which
-reads the same list.
+GL-C at this pin: the finals of the previous pin (keyed by the old suite names,
+and different tests under the same names) were removed. Tests the golden model
+cannot run (every V suite, H and the Sh* suites, Sdtrig, and the H/V tests
+inside the Sm/S/U/Exceptions/Interrupts/Sv* suites) carry `lockstep=0`;
+`gen_suite.py` sets that by suite and name pattern (`GOLDEN_OFF_*`). The other
+1,004 tests are lockstep candidates whose finals come from
+`test/golden/run_golden.py test/gates/mi_act.list` in the golden worktree;
+until that has run, GA runs with `--pass-fail`.
 
 ## Framework version pin
 
 `riscv/riscv-arch-test`'s default branch `act4` is the moving development tip
-(no semver release tags — only rolling `ctp-release-*` tags), so a bare
+(no semver release tags, only rolling `ctp-release-*` tags), so a bare
 `git clone` would drift: a clean rebuild could pull different test sources / Sail
 signatures and shift the pass/fail counts. The `Makefile` therefore pins the
 framework to an exact commit via `ACT_COMMIT` and a shallow fetch-by-sha
 (`git init` + `fetch --depth 1 origin <sha>` + `checkout FETCH_HEAD`).
 
-- **Pinned commit:** `06568893b9fc8b27b3eb69037caed2fa06886ee3` (`act4`,
-  2026-06-20) — the framework behind the status table below.
+- **Pinned commit:** `8b9ddedcd44a2721dd9153efb4c64fc812090148` (`act4`,
+  2026-11-05), the framework behind the status table below. The previous pin
+  was `06568893` (2026-06-20); see the history section.
 - **Bumping:** edit `ACT_COMMIT`, then `make -C test/act distclean` (removes the
   clone) and re-`make` to repin. `make` warns if an existing clone's `HEAD` does
   not match `ACT_COMMIT`.
-- The binary tools (`sail_riscv_sim` 0.12, `riscv64-unknown-elf-gcc`, `uv`) are
-  separately pinned by sha256 in `toolchain/versions.env`; the framework's Python
-  and Ruby deps are pinned by its own `uv.lock` / `Gemfile.lock` at this commit.
+- The binary tools (`sail_riscv_sim` **0.16**, `riscv64-unknown-elf-gcc` 16,
+  `uv` **0.13.6**, the version the framework's `.mise.toml` names) are pinned by
+  sha256 in `toolchain/versions.env`; the framework's Python (3.15, installed
+  by uv into `toolchain/.uv-python`) and Ruby deps are pinned by its own
+  `uv.lock` / `Gemfile.lock`. The UDB gem downloads solver binaries into
+  `toolchain/.cache` (the Makefile sets `XDG_CACHE_HOME`/`XDG_DATA_HOME`).
 
 ## heliodor DUT config (`config/heliodor/`)
 
+Rebuilt at this pin from the framework's `sail-RVA23S64` config (UDB yaml and
+Sail 0.16 `sail.json`) with heliodor's deviations.
+
 | file | purpose |
 |------|---------|
-| `rvmodel_macros.h` | HALT writes `tohost=1` then **`fence.i`** (heliodor write-backs/invalidates dcache so the harness sees it in DRAM) |
-| `link.ld` | pins `.tohost` to **0x80001000** (a write-through region; floating high addresses sit in write-back dcache and never reach DRAM) → `TOHOST_IDX = 1024` |
-| `heliodor.yaml` | UDB config (RVA20S64 base + implemented RVA23 exts: Zba/Zbb/Zbs, Zcb, Zcmop/Zimop, Zicond, Zihintntl/Zihintpause, Zfa, Zfhmin, Zicbom/Zicboz/Zicbop, Zihpm, Zmmul + `MISALIGNED_LDST`/`CACHE_BLOCK_SIZE` params) |
-| `sail.json` | Sail reference config |
+| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd (not Sha: no Ssstateen yet), S/Sm 1.13, Zba/Zbb/Zbs (no B: misa.B is an MI item), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu, Sdtrig (2 triggers, mcontrol6 + icount, tcontrol). Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush. Not declared yet: B, Zvbb/Zvkb, Zvfhmin, Zvkt, Ssstateen/Smstateen |
+| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_tcontrol` with 2 triggers. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
+| `rvmodel_macros.h` | HALT writes tohost then `fence.i`; MSIP/MTIME/MTIMECMP at the CLINT; access-fault address 0x5000_0000 (a hole); HPM counter 3 with event 5 (memory port busy) and a load as the event code; supervisor interrupts through mip |
+| `link.ld` | the framework's linker script with RAM = the 4 MiB harness DRAM and `.tohost` pinned at **0x80001000** (`TOHOST_IDX = 1024`) |
 | `test_config.yaml` | compiler / objdump / `sail_riscv_sim` / udb / linker (all resolved from PATH) |
 
-The harness module is `test_arch_common_harness` in `tb/test_arch_common.veryl`
-(4 MB DRAM, `addr[21:2]`, so large signature images fit).
+The harness is `arch_soc_harness` (the new-core arm of
+`test_arch_common_harness`): the SoC with `MAP_ARCH`, 4 MiB DRAM.
 
-## Status (2026-06-21)
+## Status at pin 8b9ddedc (MI step 1, 2026-11-06)
+
+3,642 tests are selected for the heliodor config; 3,640 build (the two
+`SdtrigS`/`SdtrigU` `mcontrol6_match_napot` tests are 4.3 MiB and do not fit the
+4 MiB harness DRAM). On the new core, GA pass/fail: **W2 2,421/3,640, W4
+2,421/3,640.** Every test that corresponds to a suite of the previous pin
+passes on both (I, M, F, D, Zca/Zcd/Zcb, Zba/Zbb/Zbs, Zicsr, Zifencei,
+Zicntr, Zihpm, Zicond, Zimop, Zcmop, Zihintntl/Zihintpause, Zfa, Zfhmin,
+Zicbo*, Zmmul, Zicclsm (was Misalign*), Zaamo/Zalrsc/Zabha/Zacas, PMP (was
+PMP*), Sv/Svade/Svadu/Svbare/Svinval/Svnapot/Svpbmt, and the non-H
+Exceptions cases of the old ExceptionsSv*). 58 suites (956 tests) pass in
+full on both, among them the new Sscofpmf, Ssnpm/Smnpm/Smmpm, Za64rs,
+Zic64b, Zicc*, Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd and Vf64.
+
+Failures by suite (W2 / W4 pass) and category: (a) config or harness, (b) a
+core bug in claimed functionality, (c) implemented later in MI, (d) needs a
+decision.
+
+| suite | tests | W2 | W4 | failures |
+|---|---|---|---|---|
+| Exceptions | 27 | 16 | 16 | 11 (d): breakpoint delegation, see below |
+| S, U | 17, 17 | 15, 15 | 15, 15 | 2 + 2 (d): breakpoint delegation |
+| SdtrigS / SdtrigU | 54 / 42 | 29 / 19 | 28 / 19 | (d) breakpoint delegation (25 / 23); W4: `tselect_trigs` (a: W4 has 4 triggers, the ELFs are built for 2) |
+| SdtrigSm | 61 | 59 | 58 | `mcontrol6_napot_allones`, `vector_mask` (b, open); W4 `tselect_trigs` (a) |
+| Sm | 50 | 44 | 44 | hcounteren upper half ×2, vstvec WARL (c); medeleg[3] ×2 (d); `mcsr_cntr` writes CLINT mtime, read-only on heliodor (b, platform, open) |
+| H, Shcounterenw | 45, 1 | 42, 0 | 42, 0 | hcounteren upper half, vstvec WARL (c) |
+| InterruptsS / InterruptsSm | 26 / 35 | 23 / 34 | 23 / 34 | `trigger_vsti_sstc_*`: fewer VS timer interrupts than Sail (b, open) |
+| Sstc | 8 | 6 | 6 | `vstip` with STCE and hvip.VSTIP set (b, open) |
+| Svadu | 6 | 4 | 4 | the H cases need henvcfg.ADUE (VS-stage Svadu); M5 chose Svade for the VS-stage (d) |
+| Zawrs | 3 | 1 | 1 | WRS in S/U never returns (c: the Zawrs TW item) |
+| Zkt | 66 | 64 | 66 | the test checks that two runs take the same cycles; W2 differs by 1 cycle for `c.subw`/`c.not` (a: front-end timing noise, the data does not matter) |
+| Vx8/16/32/64 | 831 | 686 | 686 | all G13 (c): vmv.s.x, vmv<nr>r, vmacc family, vwmacc family, vadc/vsbc/vmadc/vmsbc, vzext/vsext |
+| Vls8/16/32/64 | 1,240 | 306 | 306 | 850 segment (c: EMUL > 1, strided, indexed, ff); 84 strided and indexed non-segment accesses whose EEW differs from SEW (b, open: the tail and the element geometry follow SEW instead of EEW) |
+| Vf16, Vf32 | 6, 101 | 0, 99 | 0, 99 | SEW 16 integer/FP conversions (c); vfncvt.f.f.w overflow and rod (c: G14) |
+| ExceptionsVx/Vls/Vf32/Vf64 | 43/1/1/1 | 3/0/0/0 | same | arithmetic with vstart != 0 restarts at element 0 (the declared limit G7, §V.10); 3 are G13 instructions trapping as illegal (c) |
+| MisalignV | 2 | 0 | 0 | indexed segment (c: G13) |
+
+Breakpoint delegation (d): the config declares Sdtrig with tcontrol
+(`Use_tcontrol`, what `trig_unit` implements), and UDB and Sail tie that
+option to medeleg[3] hard-wired to 0. heliodor keeps medeleg[3] writable (the
+riscv-tests `rv64si` sbreak test and Linux delegate breakpoints to S), so
+every test whose breakpoint Sail takes in M and relays to S sees the trap
+taken directly in S.
+
+Fixed while bumping (directed probes in `test/gates/mi_probe.list`): mstatus,
+sstatus and vsstatus keep only the implemented fields (XS and the fields of
+unimplemented extensions read 0); mie writes only the implemented interrupts
+and hie/hip are views of mie/mip (mip.VSSIP aliases hvip.VSSIP); medeleg and
+mseccfg write only implemented bits; vsepc bit 0 reads 0; vstart is 7 bits;
+henvcfg.STCE/PBMTE read 0 while menvcfg's are 0; vsie has no LCOFIE;
+scountovf in M ignores mcounteren; vstimecmp below M needs mcounteren.TM and
+menvcfg.STCE; pointer masking is off while MXR is in effect; the vector .vi
+shifts take a uimm5 (SEW 64); vrgather/vslidedown bound the index by VLMAX
+at a fractional LMUL.
+
+## History: pin 06568893 (2026-06, old core)
+
+The sections below record the previous pin and the old core; suite names
+are those of that pin.
+
+### Status (2026-06-21)
 
 ACT4 **506/506**. On top of the original base+FP **327** (integer/atomic/
 compressed/CSR **129/129**, rv64uf **82/82**, rv64ud **114/114**, Zicntr

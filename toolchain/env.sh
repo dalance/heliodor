@@ -26,6 +26,8 @@ export PATH
 # the gitignored build area so they never pollute $HOME or a read-only system gem dir.
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$_tc_root/.uv-cache}"
 export BUNDLE_PATH="${BUNDLE_PATH:-$_tc_root/.bundle}"
+# uv installs the framework's pinned Python (.python-version) here.
+export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-$_tc_root/.uv-python}"
 
 # Convenience handles consumed by the test/act and test/linux build scripts.
 export RISCV_ELF_PREFIX="${RISCV_ELF_PREFIX:-riscv64-unknown-elf-}"

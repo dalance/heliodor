@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run the ACT4 suites on a new core: GA (pass/fail) and GL-C (final hash).
 
-    test/gates/run_act.py --core w2 [--list test/gates/m2_act.list]
-                          [--suite d,zaamo,...] [--pass-fail] [--log-dir DIR] [--keep]
+    test/gates/run_act.py --core w2 [--list test/gates/mi_act.list]
+                          [--suite d,zaamo,...] [--pass-fail] [--log-dir DIR] [--keep] [--batch N]
                           [--from-json REPORT]
 
 The images are gitignored: build them with `make -C test/act` (see
@@ -10,7 +10,8 @@ test/act/README.md); they land in test/hex/act_<ext>_<name>.hex.
 
 Steps: write tb/test_<core>_act_<ext>.veryl with gen_core_tests.py (pass/fail
 wrappers, `#[ignore]`), run `veryl test --ignored --test test_<core>_act_
---format json` once ($VERYL, else veryl/target/release-verylup/veryl), then
+--format json` ($VERYL, else veryl/target/release-verylup/veryl) once per
+batch of whole suites of at most --batch tests, then
 judge every test: GA needs the test to pass (tohost == 1, checkers clean);
 GL-C needs its final `H <count> <hash>` line to equal the row of
 test/golden/act/<ext>.final (the same comparison as test/golden/check_hash.py).
@@ -42,11 +43,12 @@ ACT_SUITE = "act_"
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--core", required=True, choices=sorted(gen_core_tests.CORE_CONST))
-    ap.add_argument("--list", type=Path, default=MASTER / "test" / "gates" / "m2_act.list")
+    ap.add_argument("--list", type=Path, default=MASTER / "test" / "gates" / "mi_act.list")
     ap.add_argument("--suite", default="", help="comma-separated extensions (default: all)")
     ap.add_argument("--pass-fail", action="store_true", help="GA only, do not fail on a hash mismatch")
     ap.add_argument("--log-dir", type=Path, default=MASTER / ".build" / "run_act")
-    ap.add_argument("--keep", action="store_true", help="keep the generated wrappers")
+    ap.add_argument("--keep", action="store_true", help="keep the generated wrappers (renamed per batch)")
+    ap.add_argument("--batch", type=int, default=400, help="tests per veryl run (default 400)")
     ap.add_argument("--from-json", type=Path, help="judge this saved report instead of running")
     a = ap.parse_args()
 
@@ -66,34 +68,54 @@ def main():
     tb = MASTER / "tb"
     for old in tb.glob(f"test_{a.core}_{ACT_SUITE}*.veryl"):
         old.unlink()
-    gen = []
-    for suite, es in gatelist.by_suite(entries).items():
-        path = tb / f"test_{a.core}_{suite}.veryl"
-        src = a.list.resolve().relative_to(MASTER) if a.list.resolve().is_relative_to(MASTER) else a.list
-        path.write_text(gen_core_tests.HEADER.format(src=src)
-                        + "".join(gen_core_tests.gen_module(e, a.core, False, True) for e in es))
-        gen.append(path)
-
     veryl = os.environ.get("VERYL") or str(MASTER / "veryl" / "target" / "release-verylup" / "veryl")
     cmd = [veryl, "test", "--ignored", "--test", f"test_{a.core}_{ACT_SUITE}", "--format", "json"]
+    src = a.list.resolve().relative_to(MASTER) if a.list.resolve().is_relative_to(MASTER) else a.list
     a.log_dir.mkdir(parents=True, exist_ok=True)
-    log = a.log_dir / f"{a.core}.json"
-    print(f"run_act: {' '.join(cmd)} ({len(entries)} tests)", file=sys.stderr, flush=True)
-    try:
-        p = subprocess.run(cmd, cwd=MASTER, text=True, capture_output=True)
-    finally:
-        if not a.keep:
+    tests = []
+    for n, batch in enumerate(batches(gatelist.by_suite(entries), a.batch)):
+        gen = []
+        for suite, es in batch:
+            path = tb / f"test_{a.core}_{suite}.veryl"
+            path.write_text(gen_core_tests.HEADER.format(src=src)
+                            + "".join(gen_core_tests.gen_module(e, a.core, False, True) for e in es))
+            gen.append(path)
+        count = sum(len(es) for _, es in batch)
+        print(f"run_act: batch {n}: {' '.join(cmd)} ({count} tests)", file=sys.stderr, flush=True)
+        try:
+            p = subprocess.run(cmd, cwd=MASTER, text=True, capture_output=True)
+        finally:
             for path in gen:
-                path.unlink(missing_ok=True)
-    log.write_text(p.stdout)
-    (a.log_dir / f"{a.core}.err").write_text(p.stderr)
-    try:
-        rep = json.loads(p.stdout)
-    except json.JSONDecodeError:
-        print(f"run_act: veryl exited {p.returncode} without a JSON report, see {a.log_dir}/{a.core}.err",
-              file=sys.stderr)
-        return 2
+                if a.keep:
+                    path.rename(path.with_suffix(f".veryl.b{n}"))
+                else:
+                    path.unlink(missing_ok=True)
+        (a.log_dir / f"{a.core}.{n}.json").write_text(p.stdout)
+        (a.log_dir / f"{a.core}.{n}.err").write_text(p.stderr)
+        try:
+            tests += json.loads(p.stdout).get("tests", [])
+        except json.JSONDecodeError:
+            print(f"run_act: veryl exited {p.returncode} without a JSON report, see {a.log_dir}/{a.core}.{n}.err",
+                  file=sys.stderr)
+            return 2
+    rep = {"tests": tests}
+    (a.log_dir / f"{a.core}.json").write_text(json.dumps(rep))
     return judge(a, entries, rep)
+
+
+def batches(suites, limit):
+    """Group whole suites into runs of at most `limit` tests (a larger suite
+    runs alone): one veryl process holds every test it runs in memory."""
+    out, cur, n = [], [], 0
+    for suite, es in suites.items():
+        if cur and n + len(es) > limit:
+            out.append(cur)
+            cur, n = [], 0
+        cur.append((suite, es))
+        n += len(es)
+    if cur:
+        out.append(cur)
+    return out
 
 
 def judge(a, entries, rep):
@@ -112,7 +134,7 @@ def judge(a, entries, rep):
             n_pass += ok
             if not ok:
                 bad.append(f"FAIL     {e.key}: {'not run' if t is None else t.get('status')}")
-            if not e.lockstep:
+            if not e.lockstep or a.pass_fail:
                 continue
             exp = gold.get(f"test_{e.ident}")
             got = check_hash.final_h(t.get("output", "")) if t else None
