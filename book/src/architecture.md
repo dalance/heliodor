@@ -84,7 +84,7 @@ units follow one contract, so adding a unit does not change the scheduler.
 | Module | Role |
 |---|---|
 | `mem_pipe` | One memory pipe: address generation, DTLB lookup, PMP and PMA checks, dcache request, forwarding, load formatting. There are `MEM_W` pipes. |
-| `lq`, `sq` | Load queue and store queue. A load that is older than a store whose address resolves later is detected in the load queue and replayed at commit. |
+| `lq`, `sq` | Load queue and store queue. A load that ran before an older store to the same address resolved, or whose line was taken away by another hart before it retired, is marked in the load queue and replayed when it reaches commit. |
 | `sb` | Committed-store buffer with line-granular write combining. Stores retire without waiting for the bus. |
 | `atomic_unit` | AMO, LR and SC, and the reservation. |
 | `io_unit` | Executes non-cacheable accesses exactly once, at the head of the machine. |
