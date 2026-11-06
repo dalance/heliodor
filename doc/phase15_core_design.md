@@ -4992,6 +4992,8 @@ MD で決める事項: U32 (hartreset のドメイン)、U33 (SBA の接続形)�
 
 目標: H 拡張 (二段翻訳) と VU を新コアに統合し、hvlinux と vector テスト群を通す。
 
+【M5 の出口条件の判定】(2026-11-06) 充足。2026-11-06 にユーザが M5 の完了を承認した。結果は下の進捗と検証計画 §9.6。G0 1032 passed、GH (W2 18,622,469 / W4 16,172,701)、GB1 の 7.1v、GB4 (W2、Verilator 24,989,451)、GX、GV、GD4、GG が pass し、V14 の梯子と dhrystone/coremark はビット一致した。H の決定 5 件 (tinst の `implicit`、V=1 の TLB の同居、guest の Svadu、U39、GEILEN = 0) と N=2 の vector ゲートを足さないことはユーザが承認した。旧コアの hvlinux は hv のファームウェアの spec 違反を直したので 20,380,000 cy が新しい基準である。未実装の ISA は MI で扱う。
+
 作業の順序:
 
 1. VU の作業 (§V.11 の順): `MEM_PIPE=0` の arm の再検証、VU 関係の推定バグの golden 上の directed test (U17 の VU 分)、`v14_vector_unit` の凍結と VM1-VM4、`vu_adapter`/`vu_mem_adapter`/`sb.i_vu_push`/mem_pipe 0 の VU client、`busy_table` の `prf_done` (VU の scalar オペランドが最初の消費者、§5.7)、VU 専用の PRF 読出ポート (int 2、fp 1)、commit の VEC 規則と csr への追加。

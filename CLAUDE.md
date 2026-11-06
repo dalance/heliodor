@@ -134,7 +134,7 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      Cycle counts drift with perf work, so treat large unexplained jumps as
      regressions (N=4 has a ±1M timing band).
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
-     hypervisor (~22.3M cycles, ~5 min). The only gate that runs the two-stage (V=1)
+     hypervisor (~20.4M cycles, ~5 min). The only gate that runs the two-stage (V=1)
      MMU under load; the native boots never leave single-stage translation, so a
      change to the shared dmem MMU or the load path can pass steps 1-4 and still
      deadlock here. Needs `test/hv/hv_dram.hex` (gitignored; see the Verilator
