@@ -31,6 +31,12 @@ _start:
     slli t0, t0, 61
     ori  t0, t0, 0xd0
     csrw 0x30A, t0                   # menvcfg
+    # mstateen0: SE0(63) | ENVCFG(62), so the hypervisor reaches henvcfg,
+    # senvcfg and hstateen0; hstateen0 the same, so the guest keeps senvcfg.
+    li   t0, 3
+    slli t0, t0, 62
+    csrw 0x30C, t0                   # mstateen0
+    csrw 0x60C, t0                   # hstateen0
     # Every counter (time in particular) readable below M.
     li   t0, -1
     csrw mcounteren, t0

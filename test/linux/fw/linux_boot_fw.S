@@ -26,6 +26,8 @@
  *                     RVA23-aware kernel (>=6.x) can drive those features.
  *                     MUST stay off for the Linux 5.15 boot (STCE makes
  *                     mip.STIP hardware-driven, breaking the SBI timer path).
+ *                     It also sets mstateen0.SE0/ENVCFG (Smstateen resets
+ *                     them to 0), so the kernel reaches senvcfg.
  */
 
     .section .text.start, "ax"
@@ -118,6 +120,9 @@ _start:
 #endif
     ori  t0, t0, 0xD0          /* CBZE | CBCFE | CBIE=01 (cbo.inval->flush) */
     csrw 0x30a, t0
+    li   t0, 3
+    slli t0, t0, 62             /* SE0(63) | ENVCFG(62) */
+    csrw 0x30c, t0              /* mstateen0 */
 #endif
 
     /* Delegate misaligned load/store(4,6), illegal(2), ecall-U(8),
@@ -844,6 +849,9 @@ _secondary_park:
 #endif
     ori   t1, t1, 0xD0         /* CBZE | CBCFE | CBIE=01 */
     csrw  0x30a, t1
+    li    t1, 3
+    slli  t1, t1, 62           /* SE0 | ENVCFG */
+    csrw  0x30c, t1            /* mstateen0 */
 #endif
 
     /* Same delegation as hart 0 (medeleg + mideleg) */
