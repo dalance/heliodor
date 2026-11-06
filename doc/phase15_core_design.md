@@ -5337,7 +5337,7 @@ sizing (`doc/phase15_ms_sizing.md`) の D-2 (2026-11-20、ユーザ決定)。56 
 
 MDOC で決める事項: U40 (公開の場と版)。推奨は、build までを出口にし、公開 (ホスティング、push) はユーザが行うこと。
 
-【MDOC 進捗】(2026-11-06、ブランチ `phase15/mdoc`) 手順 1 を済ませ、手順 2 の英語の下書きを置いた。`book/` (book.toml、build.sh、SUMMARY と各章、空の `po/ja.po`)、`toolchain/` の pin (mdbook v0.4.52 は sha256 を pin した prebuilt、mdbook-i18n-helpers 0.3.6 は prebuilt が無いので crates.io のソースを sha256 で pin して `fetch.sh book` が build する、U40 の版)。Introduction の ISA 一覧、Verification、Performance は stub。M6 と MI の後に決まる記述 (既定コア、`CORE` の既定値、テスト名) は M6 後の形で書いてあり、M6 の後に確かめ直す。
+【MDOC 進捗】(2026-11-06、ブランチ `phase15/mdoc`) 手順 1 を済ませ、手順 2 の英語の下書きを置いた。`book/` (book.toml、build.sh、SUMMARY と各章、空の `po/ja.po`)、`toolchain/` の pin (mdbook v0.4.52 は sha256 を pin した prebuilt、mdbook-i18n-helpers 0.3.6 は prebuilt が無いので crates.io のソースを sha256 で pin して `fetch.sh book` が build する、U40 の版)。Introduction の ISA 一覧、Verification、Performance は stub。M6 と MI の後に決まる記述 (既定コア、`CORE` の既定値、テスト名) は M6 後の形で書いてあり、M6 の後に確かめ直す。 Architecture、SoC integration、Configuration の 3 章はソースと照合した。手順 3 を前倒しし、`ja.po` を全訳した (fuzzy と未翻訳 0)。構成図 2 枚は SVG (`book/src/img/`、生成元 `book/diagrams.py`、日本語版は `*.ja.svg`) にした。(2026-11-06、ユーザ) この時点の内容でよいとされた。残り: Introduction の ISA 一覧、Verification、Performance、M6 後のコマンド確認、README の縮小。
 
 ---
 
