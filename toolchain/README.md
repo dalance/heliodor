@@ -68,6 +68,14 @@ Ruby/UDB use the **system** Ruby (`ruby --version` ≥ 3.4); `env.sh` points
 `BUNDLE_PATH` at a writable, gitignored dir so `bundle install` works without a
 writable system gem dir.
 
+## Book tools
+
+`toolchain/fetch.sh book` fetches the tools that build `book/`: mdBook
+(a static prebuilt, `mdbook/`) and mdbook-i18n-helpers (`i18n/bin/`). The latter
+publishes no binaries, so `fetch.sh` downloads the pinned crate source, verifies
+`I18N_SHA256`, and builds it with the `Cargo.lock` the crate ships (needs
+`cargo`). `book/build.sh` sources `env.sh` itself.
+
 ## Pinning / reproducibility
 
 `versions.env` is the single source of truth: repo, release tag, and an asset

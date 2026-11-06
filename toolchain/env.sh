@@ -20,6 +20,9 @@ _tc_prepend "$_tc_root/uv"
 _tc_prepend "$_tc_root/spike/bin"
 _tc_prepend "$_tc_root/openocd/bin"
 _tc_prepend "$_tc_root/gdb/bin"
+# Book tools (`fetch.sh book`): mdbook is a single binary at the root.
+_tc_prepend "$_tc_root/mdbook"
+_tc_prepend "$_tc_root/i18n/bin"
 export PATH
 
 # ACT4 Python (uv) + Ruby/UDB (bundler) caches must be writable. Keep them under

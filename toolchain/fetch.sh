@@ -3,7 +3,8 @@
 #
 # Usage:
 #   ./fetch.sh all          # fetch everything declared in versions.env
-#   ./fetch.sh elf          # fetch one component (elf | linux | sail | uv)
+#   ./fetch.sh elf          # fetch one component (elf | linux | sail | uv | mdbook)
+#   ./fetch.sh book         # mdbook + mdbook-i18n-helpers (built from source) for book/
 #   ./fetch.sh debug        # build spike + openocd + gdb from source (MD debug flow)
 #   ./fetch.sh spike        # build one of spike | openocd | gdb
 #   ./fetch.sh glt          # clone litmus-tests-riscv + build herd7 (GLT)
@@ -158,6 +159,28 @@ fetch_litmus() {
   echo "[litmus] done -> $dest"
 }
 
+# mdbook-i18n-helpers: pinned crates.io source (sha256-verified), built with the
+# Cargo.lock it ships. Installs mdbook-gettext and mdbook-xgettext into
+# toolchain/i18n/bin. Needs cargo.
+build_i18n() {
+  local src="$here/src/i18n" dest="$here/i18n" tmp; tmp="$(mktemp -d)"
+  local name="mdbook-i18n-helpers-$I18N_VERSION"
+  curl -fSL --retry 3 -o "$tmp/crate.tar.gz" "https://static.crates.io/crates/mdbook-i18n-helpers/$name.crate"
+  local got; got="$(sha256sum "$tmp/crate.tar.gz" | awk '{print $1}')"
+  if [[ -n "$I18N_SHA256" ]]; then
+    [[ "$got" == "$I18N_SHA256" ]] || { echo "[i18n] ERROR sha256 mismatch: got $got want $I18N_SHA256" >&2; return 1; }
+  else
+    echo "[i18n] sha256 (pin this in versions.env as I18N_SHA256): $got"
+  fi
+  rm -rf "$src"; mkdir -p "$src"
+  tar -xzf "$tmp/crate.tar.gz" -C "$src" --strip-components=1
+  rm -rf "$tmp"
+  [[ -f "$src/Cargo.lock" ]] || { echo "[i18n] ERROR: crate ships no Cargo.lock" >&2; return 1; }
+  rm -rf "$dest"; mkdir -p "$dest/bin"
+  ( cd "$src" && cargo build --release --locked --bins \
+    && cp target/release/mdbook-gettext target/release/mdbook-xgettext "$dest/bin/" )
+}
+
 build_one() {
   local name="$1" dest="$here/$1"
   if [[ -e "$dest/.fetched" && "$FORCE" != "1" ]]; then
@@ -175,10 +198,11 @@ targets=("$@")
 [[ "${targets[0]}" == "all" ]] && targets=(elf linux sail uv)
 [[ "${targets[0]}" == "debug" ]] && targets=(spike openocd gdb)
 [[ "${targets[0]}" == "glt" ]] && targets=(litmus herd)
+[[ "${targets[0]}" == "book" ]] && targets=(mdbook i18n)
 rc=0
 for t in "${targets[@]}"; do
   case "$t" in
-    spike|openocd|gdb|herd) build_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
+    spike|openocd|gdb|herd|i18n) build_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
     litmus) fetch_litmus || { echo "[$t] FAILED" >&2; rc=1; } ;;
     *) fetch_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
   esac
