@@ -98,14 +98,37 @@ Sail 0.16 `sail.json`) with heliodor's deviations.
 
 | file | purpose |
 |------|---------|
-| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Sha (Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd, Ssstateen), S/Sm 1.13, B (Zba/Zbb/Zbs), Smstateen/Ssstateen (SE0-3 and ENVCFG writable, CONTEXT read-only zero), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu (both stages under H), Sdtrig (2 triggers, mcontrol6 + icount, breakpoint reentrancy by the interrupt enables, no tcontrol). Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush, medeleg[3] writable. Not declared yet: Zvbb/Zvkb, Zvfhmin, Zvkt |
-| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_interrupt_enables` with 2 triggers, B, Sha and the stateen bits above. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
+| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Sha (Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd, Ssstateen), S/Sm 1.13, B (Zba/Zbb/Zbs), Smstateen/Ssstateen (SE0-3 and ENVCFG writable, CONTEXT read-only zero), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu (both stages under H), Sdtrig (2 triggers, mcontrol6 + icount, breakpoint reentrancy by the interrupt enables, no tcontrol), and the RVA23.1 options Svrsw60t59b, Ssqosid (RCID and MCID 12 bits), Smcsrind/Sscsrind (mstateen0/hstateen0 CSRIND writable), Smcdeleg/Ssccfg and Ssdbltrp. Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush, medeleg[3] writable. Not declared yet: Zvbb/Zvkb, Zvfhmin, Zvkt |
+| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_interrupt_enables` with 2 triggers, B, Sha and the stateen bits above, Svrsw60t59b, Ssqosid (12-bit RCID and MCID, mstateen0.SRMCFG writable) and Ssdbltrp (Smdbltrp off). Sail 0.16 has no Smcsrind/Sscsrind or Smcdeleg/Ssccfg option; they are declared to UDB only. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
 | `rvmodel_macros.h` | HALT writes tohost then `fence.i`; MSIP/MTIME/MTIMECMP at the CLINT; access-fault address 0x5000_0000 (a hole); HPM counter 3 with event 5 (memory port busy) and a load as the event code; supervisor interrupts through mip |
 | `link.ld` | the framework's linker script with RAM = the 4 MiB harness DRAM and `.tohost` pinned at **0x80001000** (`TOHOST_IDX = 1024`) |
 | `test_config.yaml` | compiler / objdump / `sail_riscv_sim` / udb / linker (all resolved from PATH) |
 
 The harness is `arch_soc_harness` (the new-core arm of
 `test_arch_common_harness`): the SoC with `MAP_ARCH`, 4 MiB DRAM.
+
+## Status at pin 8b9ddedc (MI step 3, 2026-11-06)
+
+MI step 3 declared Svrsw60t59b, Ssqosid, Smcsrind/Sscsrind, Smcdeleg/Ssccfg
+and Ssdbltrp. The pin has no suite of its own for any of them (the
+`SscfgH`, `SscrindH` and `SsdbltrpH` testplans have no generator), so the
+selection stays 3,652 tests (3,650 run). Declaring them adds cases to
+existing tests: Sm `mcsr_walk` (mstatus.SDT under menvcfg.DTE), Sm `mcause`
+(cause 16), Smstateen (srmcfg from every mode under mstateen0.SRMCFG; the
+CSRIND bit is masked out of the comparisons), H `vscsr_ro` (scountinhibit
+with menvcfg.CDE = 0) and Sv `nleaf_pte_reserved` (non-leaf bits 60:59).
+With Ssdbltrp the shared H trap handler also clears vsstatus.SDT, so every
+image changed: the 720 GL-C finals were regenerated from the golden worktree
+at `4db557ab` (the golden model accepted all 720). The extensions are
+checked by the directed probes `mi_svrsw`, `mi_dbltrp` and `mi_csrind` in
+`test/gates/mi_probe.list`.
+
+GA: **W2 2,504/3,650, W4 2,503/3,650**; GL-C: **720/720** on both. The one
+change against step 2 is H `vucsr_00` (W2 and W4), which now fails: (a)
+Sail 0.16 does not model Sscsrind, so its signature expects an illegal
+instruction for a VU-mode access to siselect, sireg, vsiselect and vsireg,
+where Sscsrind requires a virtual-instruction exception (mstateen0.CSRIND
+is set by the framework's setup). Every other failure is the step 2 list.
 
 ## Status at pin 8b9ddedc (MI step 2, 2026-11-06)
 
