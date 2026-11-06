@@ -70,12 +70,13 @@ def svg(w, h, body):
 
 L = {
     "en": dict(
+        fetch="fetch · fetch buffer", l1i="L1I 32 KiB · ITLB", iqs="iq  (wakeup · select)  ·  busy_table  ·  wb_resv", prf="prf  (int · fp, read / bypass)", portnote="exec_port × ISSUE_W  (cfg_w4 shown)",
         front="Front end", ren="Decode · rename · dispatch", exe="Schedule · execute",
         mem="Load / store · memory", cm="Commit",
         redirect="redirect (mispredict, trap, flush) · predictor training at commit",
         btb="BTB · RAS", ftq="fetch targets", ifu="I-cache · ITLB", ext="RVC expand · check",
         dec="× FETCH_W lanes", ren_s="RAT · free_list · checkpoints", dis="ROB / IQ / LQ / SQ entries",
-        rob="reorder buffer", cmt="≤ COMMIT_W per cycle", wb="complete",
+        rob="reorder buffer", cmt="≤ COMMIT_W per cycle", wb="write-back · complete",
         mp="AGU · DTLB · PMP/PMA", lsq="load / store queues", sb="store buffer",
         dc="L1D · PTW", l2="to L2 · mem_ctrl · AXI4 (in the SoC)",
         vu1="in order, decoupled", vu2="memory through pipe 0",
@@ -88,12 +89,13 @@ L = {
         dmem="debug memory", ext_irq="i_ext_irq_src", tx="UART tx",
     ),
     "ja": dict(
+        fetch="フェッチ · バッファ", l1i="L1I 32 KiB · ITLB", iqs="iq (wakeup · select) · busy_table · wb_resv", prf="prf (int · fp、読み出し / バイパス)", portnote="exec_port × ISSUE_W (図は cfg_w4)",
         front="フロントエンド", ren="デコード · リネーム · ディスパッチ", exe="スケジュール · 実行",
         mem="ロード / ストア · メモリ", cm="コミット",
         redirect="リダイレクト(分岐予測ミス、trap、flush) · コミット時の予測器学習",
         btb="BTB · RAS", ftq="フェッチターゲット", ifu="I-cache · ITLB", ext="RVC 展開 · 検査",
         dec="× FETCH_W レーン", ren_s="RAT · free_list · チェックポイント", dis="ROB / IQ / LQ / SQ を確保",
-        rob="リオーダバッファ", cmt="1 サイクル最大 COMMIT_W 個", wb="完了",
+        rob="リオーダバッファ", cmt="≤ COMMIT_W 個 / サイクル", wb="ライトバック · 完了",
         mp="AGU · DTLB · PMP/PMA", lsq="ロード / ストアキュー", sb="ストアバッファ",
         dc="L1D · PTW", l2="L2 · mem_ctrl · AXI4 へ(SoC 内)",
         vu1="インオーダ、分離型", vu2="メモリはパイプ 0 経由",
@@ -109,67 +111,81 @@ L = {
 
 
 def core(t):
-    b = '<g transform="translate(0,40)">'
-    b += grp(20, 0, 700, 100, "front", t["front"], True)
-    b += grp(20, 130, 700, 100, "ren", t["ren"], True)
-    b += grp(20, 260, 700, 140, "exe", t["exe"], True)
-    b += grp(20, 430, 700, 130, "mem", t["mem"], True)
-    b += grp(750, 0, 230, 560, "cm", t["cm"])
-    # redirect loop
-    b += ar([(865, 34), (865, -16), (105, -16), (105, 34)])
-    b += lab(485, -22, t["redirect"], "middle")
+    b = ""
+    # groups
+    b += grp(20, 50, 960, 140, "front", t["front"], True)
+    b += grp(20, 220, 760, 100, "ren", t["ren"], True)
+    b += grp(800, 220, 180, 250, "cm", t["cm"], True)
+    b += grp(20, 350, 760, 320, "exe", t["exe"], True)
+    b += grp(20, 700, 760, 130, "mem", t["mem"])
+    # redirect
+    b += ar([(890, 230), (890, 22), (115, 22), (115, 74)])
+    b += lab(500, 16, t["redirect"], "middle")
     # front end
-    b += box(40, 34, 130, 50, "front", "bpu", t["btb"])
-    b += box(210, 34, 130, 50, "front", "ftq", t["ftq"])
-    b += box(380, 34, 140, 50, "front", "ifu", t["ifu"])
-    b += box(560, 34, 140, 50, "front", "extract", t["ext"])
-    b += ar([(170, 59), (210, 59)]) + ar([(340, 59), (380, 59)]) + ar([(520, 59), (560, 59)])
-    b += ar([(630, 84), (630, 114), (130, 114), (130, 164)])
-    # rename
-    b += box(40, 164, 180, 50, "ren", "decode", t["dec"])
-    b += box(260, 164, 180, 50, "ren", "rename", t["ren_s"])
-    b += box(480, 164, 220, 50, "ren", "dispatch", t["dis"])
-    b += ar([(220, 189), (260, 189)]) + ar([(440, 189), (480, 189)])
-    b += ar([(700, 189), (770, 189)])
-    b += ar([(590, 214), (590, 245), (115, 245), (115, 294)])
-    # execute
-    b += box(40, 294, 150, 90, "exe", "iq", "busy_table", "wb_resv")
-    s = C["exe"][1]
-    b += f'<rect class="box" x="230" y="294" width="290" height="90" rx="6" stroke="{s}"/>'
-    b += '<text class="t" x="375" y="314" text-anchor="middle">exec_port × ISSUE_W</text>'
-    for i, n in enumerate(["alu", "bru", "mul", "div", "sys"]):
-        b += chip(242 + 54 * i, 326, 50, "exe", n)
-    for i, n in enumerate(["fma", "fmisc", "fdiv"]):
-        b += chip(242 + 66 * i, 354, 62, "exe", n)
-    b += box(560, 294, 140, 50, "exe", "prf", t["int"])
-    b += ar([(190, 339), (230, 339)])
-    b += ar([(520, 319), (560, 319)], both=True)
-    # memory
-    b += box(40, 464, 170, 60, "mem", "mem_pipe × MEM_W", t["mp"])
-    b += box(230, 464, 120, 60, "mem", "lq · sq", t["lsq"])
-    b += box(370, 464, 90, 60, "mem", "sb", t["sb"])
-    b += box(480, 464, 100, 60, "mem", "atomic_unit", "io_unit")
-    b += box(600, 464, 100, 60, "mem", "dcache", t["dc"])
-    b += ar([(180, 384), (180, 464)])
-    b += ar([(210, 494), (230, 494)], both=True)
-    b += ar([(650, 524), (650, 600)])
-    b += lab(662, 594, t["l2"])
-    # completion
-    b += ar([(700, 319), (736, 319), (736, 205), (770, 205)])
-    b += f'<path class="ln" d="M700,494 L736,494 L736,319"/>'
-    b += lab(731, 420, t["wb"], "middle", -90)
+    b += box(40, 74, 150, 50, "front", "bpu", t["btb"])
+    b += box(240, 74, 150, 50, "front", "ftq", t["ftq"])
+    b += box(440, 74, 150, 50, "front", "ifu", t["fetch"])
+    b += box(640, 74, 150, 50, "front", "extract", t["ext"])
+    b += box(440, 138, 150, 40, "front", t["l1i"])
+    b += ar([(190, 99), (240, 99)]) + ar([(390, 99), (440, 99)]) + ar([(590, 99), (640, 99)])
+    b += ar([(515, 124), (515, 138)], both=True)
+    b += ar([(715, 124), (715, 205), (130, 205), (130, 244)])
+    # decode / rename / dispatch
+    s = C["ren"][1]
+    b += f'<rect class="box" x="40" y="244" width="250" height="56" rx="6" stroke="{s}"/>'
+    b += '<text class="t" x="165" y="262" text-anchor="middle">decode</text>'
+    for i in range(4):
+        b += chip(52 + 58 * i, 272, 52, "ren", f"lane {i}" if i < 3 else "…")
+    b += box(330, 244, 200, 56, "ren", "rename", t["ren_s"])
+    b += box(570, 244, 190, 56, "ren", "dispatch", t["dis"])
+    b += ar([(290, 272), (330, 272)]) + ar([(530, 272), (570, 272)])
+    b += ar([(760, 272), (820, 272)])
     # commit column
-    b += box(770, 34, 190, 50, "cm", "flush_ctrl", "kill · redirect")
-    b += box(770, 164, 190, 50, "cm", "rob", t["rob"])
-    b += box(770, 244, 190, 50, "cm", "commit", t["cmt"])
-    b += box(770, 314, 90, 44, "cm", "trap_unit")
-    b += box(870, 314, 90, 44, "cm", "csr")
-    b += ar([(865, 214), (865, 244)])
-    b += ar([(815, 294), (815, 314)]) + ar([(915, 294), (915, 314)])
-    b += ar([(960, 269), (972, 269), (972, 59), (960, 59)])
-    b += box(770, 400, 190, 76, "vu", "vector_unit · vrf", t["vu1"], t["vu2"])
-    b += "</g>"
-    return svg(1000, 660, b)
+    b += box(820, 250, 140, 44, "cm", "rob", t["rob"])
+    b += box(820, 318, 140, 44, "cm", "commit", t["cmt"])
+    b += box(820, 386, 66, 36, "cm", "trap")
+    b += box(894, 386, 66, 36, "cm", "csr")
+    b += box(820, 430, 140, 30, "cm", "flush_ctrl")
+    b += ar([(890, 294), (890, 318)])
+    b += ar([(853, 362), (853, 386)]) + ar([(927, 362), (927, 386)])
+    # schedule / register read / execute
+    b += box(40, 380, 720, 44, "exe", t["iqs"])
+    b += ar([(665, 300), (665, 380)])
+    b += box(40, 446, 720, 30, "exe", t["prf"])
+    b += ar([(400, 424), (400, 446)])
+    cols = [("P0", ["ALU", "BRU"]), ("P1", ["ALU", "BRU"]), ("P2", ["ALU", "MUL"]),
+            ("P3", ["ALU", "SYS", "DIV"]), ("P4", ["FMA", "FMISC"]), ("P5", ["FMA", "FDIV"]),
+            ("M0", ["AGU", "DTLB", "PMP"]), ("M1", ["AGU", "DTLB", "PMP"])]
+    for i, (p, fus) in enumerate(cols):
+        x = 40 + 92 * i
+        k = "mem" if p[0] == "M" else "exe"
+        sc = C[k][1]
+        b += ar([(x + 40, 476), (x + 40, 498)])
+        b += f'<rect class="box" x="{x}" y="498" width="80" height="112" rx="6" stroke="{sc}"/>'
+        b += f'<text class="t" x="{x+40}" y="516" text-anchor="middle">{p}</text>'
+        for j, f in enumerate(fus):
+            b += chip(x + 8, 526 + 26 * j, 64, k, f)
+        b += f'<path class="ln" d="M{x+40},610 L{x+40},632"/>'
+    b += lab(40 + 92 * 3 + 40, 492 - 0, "", "middle")
+    b += f'<text class="s" x="290" y="656" text-anchor="middle">{t["portnote"]}</text>'
+    b += f'<text class="s" x="682" y="656" text-anchor="middle">mem_pipe × MEM_W</text>'
+    b += f'<path class="ln" d="M80,632 L775,632"/>'
+    b += lab(560, 627, t["wb"], "middle")
+    b += ar([(775, 632), (790, 632), (790, 461), (760, 461)])
+    b += ar([(790, 461), (790, 284), (820, 284)])
+    # memory
+    b += box(40, 754, 160, 56, "mem", "lq · sq", t["lsq"])
+    b += box(220, 754, 120, 56, "mem", "sb", t["sb"])
+    b += box(360, 754, 160, 56, "mem", "atomic_unit", "io_unit")
+    b += box(540, 754, 220, 56, "mem", "dcache", t["dc"])
+    b += '<path class="ln" d="M678,610 L678,736 M120,736 L678,736"/>'
+    for x in (120, 280, 440, 650):
+        b += ar([(x, 736), (x, 754)])
+    b += ar([(650, 810), (650, 860)])
+    b += lab(662, 852, t["l2"])
+    # vector unit
+    b += box(810, 498, 160, 112, "vu", "vector_unit", "vrf", t["vu1"], t["vu2"])
+    return svg(1000, 880, b)
 
 
 def soc(t):
