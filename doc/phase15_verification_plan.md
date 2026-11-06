@@ -945,6 +945,16 @@ M5 の H/V (手順 1-3) の後に、§1.2 の M5 列のうち GX、GV、GD4、GG
 
 ---
 
+### 9.7 MI での ACT4 の更新 (手順 1)
+
+【MI 手順 1 で変更】GA と GL-C の定義 (§1.1) は変えず、対象と道具を次のように替えた。
+
+- 対象: act4 `8b9ddedc` の 3,640 本 (`test/gates/mi_act.list`、`test/act/gen_suite.py --list` が生成)。`m2_act.list` (696 本) と旧 pin の `test/golden/act/*.final` は消した。GA の合格基準は「旧 pin の suite に対応するテストがすべて pass し、残りの fail は `test/act/README.md` の表で理由 (MI で実装、宣言済みの上限、未解決の不具合、決定待ち、構成) を付ける」とし、MI の出口で表の fail を MI の範囲の分だけ減らす。
+- 実行: `test/gates/run_act.py --core w2|w4 --pass-fail`。suite 単位で 400 本以下の batch に分けて `veryl test` を回す (`--batch`)。budget は全テスト 2M サイクルで、pass すれば tohost で止まる。W2 と W4 の 3,640 本はそれぞれ約 25 分 (shared box、batch 9-10 回)。
+- GL-C: golden が走れないテスト (V、H と Sh*、Sdtrig、H/V を含む Sm/S/U/Exceptions/Interrupts/Sv* のテスト) は `lockstep=0`。残る 1,004 本は golden の final を `run_golden.py test/gates/mi_act.list` で作ってから GL-C に入れる。final が無い間は `--pass-fail` で GA だけを判定する。
+- W4 は Sdtrig の trigger が 4 個で、ELF は W2 の 2 個で作るので、SdtrigS/SdtrigSm の `tselect_trigs` は W4 で fail する (構成の差)。
+- MI の directed: `test/gates/mi_probe.list` (`tb/test_w{2,4}_miprobe.veryl`、G0 で走る)。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
