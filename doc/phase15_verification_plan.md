@@ -888,7 +888,7 @@ boot ではデバイスの読み出し副作用が一度も起きないので、
 
 H/V とデバッグの相互作用 (設計書 §D.16 の M5 行) の directed を GD に足す: VS/VU からの halt と dret (dcsr.v、prv)、ebreakvs/ebreakvu、mcontrol6 の vs/vu、HLV/HSV と vector の要素アクセスへの trigger (U39)、Debug Mode での MPRV と MPV。GG は H を持つ target の spike と比べて再び回す。
 
-【M5 手順 2 で実装】`test/gates/m5_dbgh.list` の `dbgh/dm_h` (`test/debug/prog/dm_h.S`、`test/debug/dmi/dm_h.dmi`、W2 と W4): dret で VS に入り ebreakvs で入場 (dcsr.v = 1、prv S、sscratch が vsscratch を読む)、VS の loop への haltreq (cause 3、v = 1)、VU と ebreakvu、ebreakvs が無い VS の ebreak が M への breakpoint 例外になる (mepc/mtval、mstatus.MPP = S、MPV、GVA)、mcontrol6 の vs と vu (VU/VS/HS で一致の有無が分かれる、hit)、HLV/HSV の load/store trigger が hstatus.SPVP のモードで一致し m の trigger では一致しない (一致した HSV は memory を変えない)、Debug Mode で MPRV と MPV が mprven の下でだけ二段翻訳に効く (progbuf の load、mprven = 0 と MPV = 0 は hole で cmderr 3)、vle64 の要素 2 への load trigger が vstart = 2 で止まり再開で残りを読む (U39)。DMI の assembler に `ARDH` (data1 の mask 比較) を足した。GG の再走は未実施 (main session に残す)。
+【M5 手順 2 で実装】`test/gates/m5_dbgh.list` の `dbgh/dm_h` (`test/debug/prog/dm_h.S`、`test/debug/dmi/dm_h.dmi`、W2 と W4): dret で VS に入り ebreakvs で入場 (dcsr.v = 1、prv S、sscratch が vsscratch を読む)、VS の loop への haltreq (cause 3、v = 1)、VU と ebreakvu、ebreakvs が無い VS の ebreak が M への breakpoint 例外になる (mepc/mtval、mstatus.MPP = S、MPV、GVA)、mcontrol6 の vs と vu (VU/VS/HS で一致の有無が分かれる、hit)、HLV/HSV の load/store trigger が hstatus.SPVP のモードで一致し m の trigger では一致しない (一致した HSV は memory を変えない)、Debug Mode で MPRV と MPV が mprven の下でだけ二段翻訳に効く (progbuf の load、mprven = 0 と MPV = 0 は hole で cmderr 3)、vle64 の要素 2 への load trigger が vstart = 2 で止まり再開で残りを読む (U39)。DMI の assembler に `ARDH` (data1 の mask 比較) を足した。GG の再走は M5 の出口で行った (§9.6)。
 
 ### 9.5 MD の出口のゲートの結果 (`2b34717c`、2026-11-01)
 
@@ -916,6 +916,25 @@ M4 のゲートの結果は §1.6、MM は §10.5-10.6 である。比較の基�
 - GX の差 20 対: `probe_b13_csrrd` (rdtime、mtime がサイクル由来) と `probe_b05_sc` (SC の 1 回の失敗が W2 だけに出る) は M3 から既知。`smp_ad_2hart`、`smp_coh_2hart`、`smp_unc_2hart`、`sba_coh_2hart`、`litmus_2hart` の 5 対は 2 hart の interleaving が構成の timing で変わるため、H の hash が一致しない (決定的なテストではない)。`dbg_*` の 13 対 (`dbg_halt_resume`、`dbg_dm_abs`、`_counters`、`_ebreak`、`_icount`、`_pmp_lock`、`_progbuf`、`_reset`、`_sba`、`_sba_code`、`_step`、`_trig_exec`、`_trig_ldst`) は DMI script を cycle で駆動するので、W2 と W4 で Debug Mode に入る時点が違い、retire 数が 1-2 本動く (`dbg_halt_resume` と `_pmp_lock` は count が同じで hash だけ違う)。GX の「決定的なテスト」の定義からこの 18 対 (SMP と dbg) を外すと、差は既知の 2 対だけである。debug の 13 対は 1 本ずつ追っていない (各 run は pass、`chk_debug`/`chk_dm` は 0)。
 - GS の記録 (§6.2 の表の MD の行): W2 の GL-B を `VERYL_AOT_C_ASYNC=0`、`taskset` で 1 コアに固定し、master と同時に 1 本ずつ走らせた。コアを入れ替えて 2 回測った。結果は master が sim 2,331.9 s と 2,338.5 s (14.57M cycles、約 6.2k cy/s)、MD が 4,668.6 s と 4,663.6 s (約 3.1k cy/s) で、MD は約 2.0 倍遅い。whole-comb と event の fallback はどちらも 0、dataflow は両方 declined。W4 の boot も同じ比 (GB1 の W4 5.15 で sim 15,111 s 対 master 7,137 s、3 本並行の負荷下の値) である。cycles は一致しているので、遅くなったのは RTL の動きでなく sim の評価量 (debug の状態と DM の settle) である。native の GB4 (W2) は sim 58,653 s で約 430 cy/s。Verilator は W2 の N=4 が 11,450 s、W4 の N=4 が 18,252 s (CPU 時間)。
 - 注意: 非同期の cc ビルドの既定 (`VERYL_AOT_C_ASYNC` を設定しない) では、boot の `whole_event` に 0.1-0.3 % の fallback が出る (非同期の cc ビルド中の Cranelift での実行と推定、原因は確かめていない)。GS の判定は上の同期ビルドの値を使う。
+
+### 9.6 M5 の出口のゲート: GX、GV、GD4、GG (`c9911e61`、2026-11-06)
+
+M5 の H/V (手順 1-3) の後に、§1.2 の M5 列のうち GX、GV、GD4、GG を回した。比較の基準は §9.5 (MD の出口) と §7.3 の GH の native の記録である。Verilator は 5.050 (N=1 と N=2 は `-O3 -j 4`、4 hart は `-O1 -j 2`)、native は veryl `c66bf8ab`。box の load average は 20-48 で、Verilator の 3 本までと GG の 1 本を並行させた。
+
+| ゲート | M5 (`c9911e61`) | 基準 | 判定 |
+|---|---|---|---|
+| G0 (GX の入力) | 1030 passed、0 failed、85 ignored | M5 手順 3 の 1030 | 一致 |
+| GX | 既定ログの W2/W4 の同名 364 対のうち 342 対が一致 | MD: 307 対のうち 287 対 | 差 22 対は下。H/V で増えた 57 対は `h_hvtmr` を除いて一致 |
+| GV (W2、Verilator) | hvlinux 18,622,469 (instret 11,394,753)、litmus N=4 5,029,779、5.15 N=1 14,617,653 (instret 10,429,948)、N=2 19,380,793 がすべて PASSED | native の GH (§7.3) と MD の GV/GB1/GB2 と cycles 一致 | 一致。N=4 は main session が `build_n4w2` で回している |
+| GV (W4、Verilator) | hvlinux 16,172,701 (instret 11,382,596)、litmus N=4 5,028,524、N=1 12,286,458、N=2 16,811,410、N=4 22,640,641 (instret 14,730,876) がすべて PASSED | native の GH と MD の GV と cycles 一致 | 一致 |
+| GD4 (W2、W4) | 10/10 pass (`chk=0`、dmi fail 0) | MD: 10/10 | 一致 |
+| GG | w2_n1 pass 52、w4_n1 pass 49、w2_n4 pass 6、w2_n4_smp pass 5 (下)。`gg_compare.py` の FAIL は 4 target とも 0 | MD: 52 / 49 / 6 / 5 | 一致 (PrivRw を除外に移し VectorTest が pass に増えた) |
+
+- GV のラッパ: hvlinux の新コア用に `sim/verilator/tb_soc_hvlinux_w2.sv` と `tb_soc_hvlinux_w4.sv` を足した (`boot_soc_harness` を native の `test_w{2,4}_hvlinux` と同じ parameter で置く)。Verilator の CPU 時間は hvlinux W2 1,026 s / W4 2,559 s、litmus N=4 2,592 s / 4,657 s、N=1 802 s / 1,880 s、N=2 W2 4,283 s / W4 7,374 s、W4 N=4 21,644 s (wall 6 h 18 min)。W4 の 4 hart の build (`-O1 -j 2`) は負荷下で約 1.5 時間かかった。
+- GX の差 22 対: MD の 20 対 (§9.5) と同じものに、`dbgh_dm_h` と `h_hvtmr` が加わった。`dbgh_dm_h` は DMI script を cycle で駆動する debug の directed で、VS の loop への haltreq の時点が W2 と W4 で違う (record 数は 399 で同じ、hash だけ違う。MD の `dbg_halt_resume` と同じ型)。`h_hvtmr` は guest が `time` を読んで vstimecmp を少し先に置き、割込みを待って spin する (record は W2 5,481 / W4 5,477)。mtime はサイクル由来なので spin の回数が構成で変わり、§4.6 の割込みを受けるテストに当たる (`probe_b13_csrrd` と同じ理由)。H の残り 16 本、`m5_hprobe` 5 本、V 20 本、`m5_vprobe` 14 本 (G2-G13 の 11 本と B39 の 3 本) は W2 と W4 で record 数と hash が一致した (VRF の書き込みは `vrf_wcnt`/`vrf_hash` で hash に入る)。
+- GG の misa: H と V で misa が 0x80000000003411ad になったので、`test/debug/targets/heliodor/heliodor_sim.py` の値を合わせた (CheckMisa が pass)。gdbserver.py は misa の V を見て VectorTest を走らせ、heliodor は pass する (spike64 は V を持たず not_applicable なので判定上は extra)。
+- GG の PrivRw: misa の bit 7 (H) を「特権 2 がある」と読み、`$priv=2` の読み返しが 2 であることを要求して fail する。H があっても特権 2 は予約で、dcsr.prv は WARL (heliodor は 2 の書き込みで前の値を保つ)。H と V を持つ spike の target (`test/debug/targets/spike/spike64h.py`、misa を新コアと同じにした spike64) を足して参照を取り直すと (`test/debug/spike_ref_spike64h.txt`: pass 60、fail 2、exception 2、not_applicable 10、壁時間 78 秒)、spike も PrivRw で fail する (読み返しは 0)。suite の前提の問題なので、PrivRw を除外表の全 target 共通の側に理由付きで載せた。spike64h のほかの差 (DisconnectTest の fail と SimpleV13Test、VectorTest の exception) は spike が progbuf を持たない構成で vector のレジスタを書けないことによるもので、heliodor は 3 本とも pass する。判定 (`gg_compare.py`) の参照は MD と同じく spike64 と spike64-2/-hwthread のまま。
+- GG の結果の一覧は `test/debug/gg_w2_n1.txt`、`gg_w4_n1.txt`、`gg_w2_n4.txt`、`gg_w2_n4_smp.txt` を更新した。w2_n1 は 74 本で pass 52、not_applicable 21、PrivRw の fail 1 (除外表に足す前の run。足した後の `gg_compare.py` は FAIL 0)、DownloadTest は `timeout_sec` 600 で pass (2 億 290 万サイクル、3 時間 28 分)。w4_n1 は 74 本で pass 49、not_applicable 25 (除外 15)。w2_n4 は MD と同じ 7 本で pass 6、除外 1。w2_n4_smp は MD と同じ 5 本で pass 5。壁時間は 1 本ずつの直列で w2_n1 4 時間 44 分、w4_n1 3 時間 2 分、w2_n4 2 時間 52 分、w2_n4_smp 3 時間 38 分。simulator の run はすべて `fail=0` と checker 0 で終わった (w2_n1 56 回、w4_n1 50 回、w2_n4 6 回、w2_n4_smp 5 回)。
 
 ---
 
