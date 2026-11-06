@@ -5019,12 +5019,36 @@ M5 で決める事項: U30 (VU の IO アクセス)、U39 (VU の要素アクセ
 
 ### MI: ISA の補完
 
-【決定】(2026-11-05、ユーザ) M5 の後に、M5 で illegal にした未実装分を実装するマイルストーンを置く (U16)。M6 との前後は計画の時点で提案する。
+【決定】(2026-11-05、ユーザ) M5 の後に、M5 で illegal にした未実装分を実装するマイルストーンを置く (U16)。
 
-- 範囲: §V.9 の G13 (基本 RVV の未実装 encoding)、G14 (vfcvt 系を `fpu_wrap` の誤った変換経路から外す)、RVA23 の V の不足分 (Zvbb、Zvfhmin、Zvkt)。
-- ACT4 を 4.1 以降に上げる作業をこのマイルストーンの開始時に行う (M5 とは分ける)。4.1 で Vx/Vls のテストが有効になる。H のテストは 4.1 にも無い。
-- RVA23.1 (2026-10-19 批准、optional の拡張だけを足す: Ssdbltrp、Ssccfg と Sscsrind、Ssctr、Ssqosid、Svrsw60t59b) は、小さい変更で済むものを範囲に入れる。拡張ごとの見積もりは計画の時点で行う。
-- 出口: 計画の時点で決める。G0 の V の directed (`v_opv_sweep` で illegal にしている 55 行が実装に移ること) と ACT4 の V を含める。
+目標: 新コアで RVA23 (RVA23U64 と RVA23S64) の必須をすべて満たし、RVA23.1 の optional のうち 4 つを足す。ACT4 を最新に上げて機械的に確かめる。
+
+M6 との順序: 【提案】MI を M6 の前に置く。理由: M6 を既定コアの切替と旧コアの削除だけに保てる (§2.5)。README と book を ISA の揃った状態で一度だけ書ける。MI は新コアだけを変え、V14 には触れないので、M6 の前に置いても V14 の梯子の負担は増えない。
+
+範囲 (2026-11-06 の調査で確定。【決定】の行はユーザの判断):
+
+| 群 | 内容 | 規模の見込み |
+|---|---|---|
+| ACT4 | 【決定】(ユーザ) act4 の tip を commit で pin する (H と Sh*、Sscofpmf、Sstc、Ssnpm、Zicc* のテストが入る)。suite の名前がほぼ全部変わり、Sail は 0.16 に上がる。config (`heliodor.yaml`、`sail.json`、`rvmodel_macros.h`、`link.ld`) を作り直し、`Za128rs` の宣言を `Za64rs` に直す | M |
+| RVA23 の必須の不足 | Ssstateen と Smstateen (mstateen0-3、sstateen0-3、hstateen0-3。SE0 と ENVCFG とこのマイルストーンで足す拡張の bit を実装し、残りは 0 固定) | S〜M |
+| 小さな修正 | misa の B、hcounteren の上位 32 bit、vstvec の WARL、Zawrs の WRS.NTO の TW=1 での trap (reservation が有効なときだけ)、`heliodor_core` の古いヘッダ | XS 各 |
+| RVA23.1 | 【決定】(ユーザ) Svrsw60t59b、Ssqosid、Ssdbltrp、Ssccfg (Smcdeleg と Sscsrind/Smcsrind を含む)。Ssctr は入れない (L、Sail にも ACT にも無い) | XS、S、S〜M、M |
+| V | G14 (VU の変換を `fp_cvt` へ移し、frm の無視と rod の近似も直す)、SEW=16 の整数と FP の幅変換 (基本 V、G13 の一覧から漏れていた)、Zvfhmin、G13 の整数 6 群 (vmv.s.x、vmv<nr>r.v、vmacc 系、vwmacc 系、vadc/vsbc/vmadc/vmsbc、vzext/vsext)、Zvbb (Zvkb を含む)、strided/indexed/ff の segment と EMUL>1 の segment、Zvkt の監査と宣言 | VU と decoder で +800〜1200 行 |
+
+作業の順序:
+
+1. ACT4 を上げ、今通っている suite がすべて通り続けることを確かめる。新しく入った suite の fail は、既存の不具合か MI の範囲かに振り分けて記録する。V の suite は pass/fail だけで判定する (golden の V は G 系の誤りを持つので lockstep から外す)。
+2. Ssstateen/Smstateen と小さな修正。
+3. RVA23.1: Svrsw60t59b、Ssqosid、Sscsrind/Smcsrind、Ssccfg/Smcdeleg、Ssdbltrp の順。ACT のテストが無いものは directed を自作し、Sail がモデルを持つもの (Ssdbltrp、Sscsrind、Ssqosid、Svrsw60t59b) は Sail と比べる。
+4. V: G14、SEW=16 の変換、Zvfhmin、G13 の整数群、Zvbb、segment の順。最後の segment が最も危ない (vstart の扱いと `vu_mem_adapter` の例外が絡む)。Zvkt は VU の該当命令に値で決まる早期終了が無いことを確かめて宣言する。
+5. README の ISA の記述を直す (「most of RVA23」を外せるかは出口で判断する)。
+
+出口条件:
+
+| 区分 | 条件 |
+|---|---|
+| 機能 (W2, W4) | G0。GA: ACT4 tip の該当 suite (V、Zvbb、Zvfhmin、H と Sh*、stateen、Zawrs を含む) がすべて pass、または fail を理由付きで宣言する。`v_opv_sweep` で、未実装として illegal にする encoding が 0 行になる (予約の encoding は illegal のまま)。RVA23.1 の各拡張の directed。GB1 7.1v、GH、GB4 (segment で VU のメモリ経路を変えるので必須)、GX、GV。 |
+| 構造 | GS、GF (新しい機構の行)、新しいモジュールの cold-reader gate。V14 は触れないので、V14 の dhrystone/coremark のビット一致だけを確かめる。 |
 
 ### M6: 既定コアの切替
 
