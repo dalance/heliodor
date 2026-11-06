@@ -40,8 +40,18 @@ BINDIR  = os.path.join(HERE, "build", "bin")
 ALL_OPTS = "budget=2000000"
 SUITE_OPTS = {
     "zicntr": "mtime=instret lockstep=0",
+    # Their retire streams depend on timing that differs between cores: Zkt
+    # keeps cycle counts, InterruptsS takes interrupts at times the core's
+    # speed sets, and Sstc compares stimecmp with time.
+    "zkt": "lockstep=0",
+    "interruptss": "lockstep=0",
+    "sstc": "lockstep=0",
 }
-TEST_OPTS = {}
+# These keep HPM counter values, which differ between cores.
+TEST_OPTS = {
+    "act_sscofpmf/S_inhibit_lo_00": "lockstep=0",
+    "act_sscofpmf/U_inhibit_lo_00": "lockstep=0",
+}
 
 # Tests the framework selects but the harness cannot run, with the reason;
 # they do not link (no ELF), so this table only records them in the list.
