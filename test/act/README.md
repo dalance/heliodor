@@ -17,8 +17,8 @@ itself is pinned to an exact commit (`ACT_COMMIT` in the `Makefile`) — see
 toolchain/fetch.sh all && source toolchain/env.sh   # one-time: gcc, Sail 0.16, uv
 make -C test/act                                    # every suite selected for heliodor
 make -C test/act EXT="I Vx8"                        # a subset (suite directory names)
-test/gates/run_act.py --core w2 --pass-fail         # GA on the new core (W2)
-test/gates/run_act.py --core w4 --pass-fail --suite i,zba
+test/gates/run_act.py --core w2                     # GA and GL-C on the new core (W2)
+test/gates/run_act.py --core w4 --pass-fail --suite i,zba   # GA only
 ```
 
 > The ELF-generation steps (`make … elfs`) use Python multiprocessing, which
@@ -39,7 +39,12 @@ committed. `gen_suite.py --tb` additionally writes the old per-suite
 
 The framework selects the tests from the UDB config: a suite is generated only
 for extensions `heliodor.yaml` declares, so suites of extensions MI implements
-later (Zvbb, Zvfhmin, Ssstateen/Smstateen) appear once they are declared.
+later (Zvbb, Zvfhmin) appear once they are declared. Two selected tests are
+excluded: the `SdtrigS`/`SdtrigU` `mcontrol6_match_napot` images are 4.3 MiB
+and do not fit the 4 MiB harness DRAM (they do not link; the harness DRAM
+stays 4 MiB because widening it would change `MAP_ARCH` for every arch test).
+`gen_suite.py` records them as `# excluded:` lines of the gate list
+(`EXCLUDED`).
 
 ### On the new core (GA / GL-C)
 
@@ -54,12 +59,15 @@ test's final `H` line with `test/golden/act/<suite>.final`.
 
 GL-C at this pin: the finals of the previous pin (keyed by the old suite names,
 and different tests under the same names) were removed. Tests the golden model
-cannot run (every V suite, H and the Sh* suites, Sdtrig, and the H/V tests
-inside the Sm/S/U/Exceptions/Interrupts/Sv* suites) carry `lockstep=0`;
-`gen_suite.py` sets that by suite and name pattern (`GOLDEN_OFF_*`). The other
-1,004 tests are lockstep candidates whose finals come from
-`test/golden/run_golden.py test/gates/mi_act.list` in the golden worktree;
-until that has run, GA runs with `--pass-fail`.
+cannot run carry `lockstep=0`, set by `gen_suite.py`: by suite and name pattern
+(`GOLDEN_OFF_*`: every V suite, H and the Sh* suites, Sdtrig, Smstateen and
+Ssstateen, and the H/V tests inside the Sm/S/U/Exceptions/Interrupts/Sv*
+suites), by test for the 275 tests the golden model fails
+(`golden_off.list`, found by running it), and by `SUITE_OPTS`/`TEST_OPTS` for
+the suites and tests whose retire stream keeps timing or counter values that
+differ between cores (Zicntr, Zkt, InterruptsS, Sstc, two Sscofpmf tests). The
+other 720 tests are compared with `test/golden/act/<suite>.final`, made by
+`test/golden/run_golden.py test/gates/mi_act.list` in the golden worktree.
 
 ## Framework version pin
 
@@ -90,14 +98,32 @@ Sail 0.16 `sail.json`) with heliodor's deviations.
 
 | file | purpose |
 |------|---------|
-| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd (not Sha: no Ssstateen yet), S/Sm 1.13, Zba/Zbb/Zbs (no B: misa.B is an MI item), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu, Sdtrig (2 triggers, mcontrol6 + icount, tcontrol). Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush. Not declared yet: B, Zvbb/Zvkb, Zvfhmin, Zvkt, Ssstateen/Smstateen |
-| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_tcontrol` with 2 triggers. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
+| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Sha (Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd, Ssstateen), S/Sm 1.13, B (Zba/Zbb/Zbs), Smstateen/Ssstateen (SE0-3 and ENVCFG writable, CONTEXT read-only zero), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu (both stages under H), Sdtrig (2 triggers, mcontrol6 + icount, breakpoint reentrancy by the interrupt enables, no tcontrol). Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush, medeleg[3] writable. Not declared yet: Zvbb/Zvkb, Zvfhmin, Zvkt |
+| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_interrupt_enables` with 2 triggers, B, Sha and the stateen bits above. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
 | `rvmodel_macros.h` | HALT writes tohost then `fence.i`; MSIP/MTIME/MTIMECMP at the CLINT; access-fault address 0x5000_0000 (a hole); HPM counter 3 with event 5 (memory port busy) and a load as the event code; supervisor interrupts through mip |
 | `link.ld` | the framework's linker script with RAM = the 4 MiB harness DRAM and `.tohost` pinned at **0x80001000** (`TOHOST_IDX = 1024`) |
 | `test_config.yaml` | compiler / objdump / `sail_riscv_sim` / udb / linker (all resolved from PATH) |
 
 The harness is `arch_soc_harness` (the new-core arm of
 `test_arch_common_harness`): the SoC with `MAP_ARCH`, 4 MiB DRAM.
+
+## Status at pin 8b9ddedc (MI step 2, 2026-11-06)
+
+3,652 tests are selected (MI step 2 declared B, Sha, Smstateen and Ssstateen:
+the 10 Smstateen/Ssstateen tests are new; B adds no suite) and 3,650 are run
+(the two napot tests are excluded, above). GA: **W2 2,505/3,650, W4
+2,504/3,650**; GL-C: **720/720** on both. Changes against step 1 (W2 / W4
+pass): Exceptions 27/27, S and U 17/17, Sm 49/50, H 45/45, Shcounterenw 1/1,
+SdtrigS 53/52 of 54, SdtrigU 41/42, Svadu 6/6, Zawrs 3/3, Smstateen 5/5,
+Ssstateen 5/5 (the breakpoint delegation, hcounteren, vstvec, hedeleg[19:18],
+WRS.NTO and VS-stage Svadu failures are gone). The V suites are unchanged
+(1,160/2,292 on both). Remaining non-V failures: `vector_mask` in
+SdtrigS/SdtrigU/SdtrigSm (c: G13, vmv.s.x), `trigger_vsti_sstc` ×4 and Sstc
+`vstip` ×2, SdtrigSm `mcontrol6_napot_allones`, Sm `mcsr_cntr` (b, open, as
+in step 1), Zkt `c.subw`/`c.not` on W2 and `tselect_trigs` ×2 on W4 (a), and
+on W4 InterruptsS `wfi_VS` (a: with the regenerated ELF the timer interrupt,
+due `RVMODEL_TIMER_INT_SOON_DELAY` = 100 ticks after it is set, arrives during
+the T-SBI return, before the test samples its trap count; W2 passes).
 
 ## Status at pin 8b9ddedc (MI step 1, 2026-11-06)
 
