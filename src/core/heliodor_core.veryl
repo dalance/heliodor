@@ -42,17 +42,17 @@
 //   i_dbg_*        : lockstep controls, 0 in normal use
 //   o_perf, o_chk  : event wires and sticky checker flags of every unit
 // Owns: none (no state).
-// What this build serves: RV64I, M, A (Zalrsc, Zaamo, Zabha, Zacas), C, F,
-// D, Zfa, Zfhmin, Zicsr, Zifencei, Zawrs, Zicbom, Zicboz and the M/S/U
-// privileged architecture (delegation, interrupts, Sstc, Zicntr/Zihpm,
-// Sscofpmf), with Bare and Sv39 translation (Svnapot, Svpbmt, Svade and
-// Svadu under menvcfg.ADUE); misa says so. Non-cacheable (IO and NC)
-// loads and stores, Svpbmt NC and IO pages included, run once each at the
-// head through io_unit. V (RVV 1.0, VLEN 128) runs on the reused
-// vector_unit beside vu_adapter and vu_mem_adapter: one op at a time at the
-// oldest token, its element accesses through memory pipe 0 and its store
-// elements into sb. decode rejects H as illegal instructions, and the
-// reused csr is connected only through the ports listed above.
+// What this build serves: RV64I, M, A (Zalrsc, Zaamo, Zabha, Zacas), B, C,
+// F, D, Zfa, Zfhmin, Zicsr, Zifencei, Zawrs, Zicbom, Zicboz, V and the
+// M/S/U privileged architecture with H (delegation, interrupts, Sstc,
+// Zicntr/Zihpm, Sscofpmf, Smstateen/Ssstateen, pointer masking), Sdtrig
+// and Sdext, with Bare and Sv39 translation and the Sv39x4 G-stage
+// (Svnapot, Svpbmt, Svinval, Svade and Svadu under menvcfg.ADUE and
+// henvcfg.ADUE); misa says so. Non-cacheable (IO and NC) loads and stores,
+// Svpbmt NC and IO pages included, run once each at the head through
+// io_unit. V (RVV 1.0, VLEN 128) runs on the reused vector_unit beside
+// vu_adapter and vu_mem_adapter: one op at a time at the oldest token, its
+// element accesses through memory pipe 0 and its store elements into sb.
 // Rationale:
 //   - every lane and port array is a generate-for over the config; the FU
 //     topology functions of core_types map issue ports to IQs, WB ports, BRU
@@ -149,9 +149,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
     // WB slot offset a memory-pipe pass claims when it enters m0 the next cycle.
     const MEM_CLAIM_OFF: u32 = fu_pkg::claim_off(FuKind::LOAD);
 
-    // misa: RV64 with the extensions this build serves (I, M, A, C, F, D, H,
-    // S, U, V).
-    const MISA: bit<64> = 64'h8000_0000_0034_11ad;
+    // misa: RV64 with the extensions this build serves (I, M, A, B, C, F, D,
+    // H, S, U, V).
+    const MISA: bit<64> = 64'h8000_0000_0034_11af;
 
     // HPM event bus (csr selector n counts bit n - 1), one event wire of each
     // owner, registered in csr: 1 retired mispredicted control op, 2 Redirect,
@@ -205,6 +205,10 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var vl      : logic             <64>     ;
     var vstart  : logic             <64>     ;
     var vxrm    : logic             <2>      ;
+    var at_rsv  : logic                      ; // the LR reservation is valid
+    var bp_mie  : logic                      ; // mstatus.MIE, for the trigger reentrancy rule
+    var bp_sie  : logic                      ; // mstatus.SIE
+    var bp_vsie : logic                      ; // vsstatus.SIE
 
     // ---- Translation context and invalidation ----
 
@@ -229,6 +233,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_hgatp : hgatp                     ,
         i_vsum  : vs_sum                    ,
         i_vmxr  : vs_mxr                    ,
+        i_vadue : dec_csr.henvcfg[61]       ,
         i_vpbmte: dec_csr.henvcfg[62]       ,
         i_spvp  : spvp                      ,
         i_pmm_m : pmm[0]                    ,
@@ -796,6 +801,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
             i_csr_rmw  : csr_rmw      ,
             i_vmid     : hgatp[57:44] ,
             i_tok      : oldest       ,
+            i_rsv      : at_rsv       ,
             o_started  : ep_start[p]  ,
             o_sys      : ep_sys[p]    ,
             i_frm      : frm          ,
@@ -1245,6 +1251,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_tok           : oldest                            ,
         i_head_retired  : hret                              ,
         i_rsv_clr       : rsv_clr                           ,
+        o_rsv           : at_rsv                            ,
         i_ordering_empty: ord_empty                         ,
         o_head_req      : np_req[NP_ATOMIC]                 ,
         i_head_gnt      : np_gnt[NP_ATOMIC]                 ,
@@ -1940,10 +1947,14 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_hstatus_vtw  : dec_csr.vtw        ,
         o_pmm_vs       : pmm_vs             ,
         o_pmm_hu       : pmm_hu             ,
+        o_mstateen     : dec_csr.mstateen   ,
+        o_hstateen     : dec_csr.hstateen   ,
+        o_mstatus_mie  : bp_mie             ,
+        o_mstatus_sie  : bp_sie             ,
+        o_vsstatus_sie : bp_vsie            ,
         i_hpm_events   : hpm_ev             ,
     );
 
-    let m_trap: logic = csr_trap.fire && !csr_trap.to_s && !csr_trap.to_vs;
     inst u_trig: trig_unit::<CFG> (
         clk                                                     ,
         rst                                                     ,
@@ -1956,8 +1967,10 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_virt     : virt                                       ,
         i_spvp     : spvp                                       ,
         i_dm       : dec_csr.dm                                 ,
-        i_m_trap   : m_trap                                     ,
-        i_mret     : csr_cm.mret                                ,
+        i_mie      : bp_mie                                     ,
+        i_sie      : bp_sie                                     ,
+        i_vsie     : bp_vsie                                    ,
+        i_bp_deleg : {hedeleg[3], medeleg[3]}                   ,
         i_hit      : trig_hit                                   ,
         i_cnt      : icnt_cnt                                   ,
         i_icnt_take: icnt_take                                  ,

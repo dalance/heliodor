@@ -48,8 +48,10 @@
 // Owns:
 //   - an install never carries a translation read before a full kill or an
 //     invalidation
-//   - the D bit (of a V = 0 leaf, or of the G-stage leaf of a guest's final
-//     GPA) is written only for a nonspec request whose owner lives
+//   - the D bit of the leaf that maps the access (V = 0, VS-stage, or the
+//     G-stage leaf of a guest's final GPA) is written only for a nonspec
+//     request whose owner lives. The G-stage leaf of a VS-stage PTE gets D
+//     only for that PTE's own A/D update, the write it is translated for
 //   - every completion broadcasts o_evt; at most one o_resp per walk
 //   - no result-holding state: the completion cycle installs, answers and
 //     broadcasts, then the walker is idle
@@ -69,8 +71,13 @@
 //     HPA) or for the final GPA (its leaf completes). A guest leaf whose
 //     permission fails ends the walk with the fault of its stage, so a page
 //     fault is never reported as a guest-page fault of a later stage
-//   - the VS-stage is Svade (henvcfg.ADUE is read-only zero), so a guest walk
-//     writes G-stage PTEs only, with the same owned read-modify-write as V = 0
+//   - a guest walk updates A/D with the same owned read-modify-write as V = 0,
+//     the VS-stage by henvcfg.ADUE and the G-stage by menvcfg.ADUE. The write
+//     of a VS-stage leaf goes to a guest physical address, so it first needs
+//     the G-stage leaf of that PTE to permit a store: when the leaf the read
+//     walked does not already have W and D, the G-stage walk of that PTE is
+//     redone as a store (w_vsw_q), which faults as an implicit write or sets
+//     D, and the VS-stage leaf is read again
 //   - a guest walk takes one extra cycle (RES) at each leaf it resumes from;
 //     a V = 0 walk completes from its leaf directly
 //   - requesters send no VA without a key (xlate_pkg::noncanon, gpa_big)
@@ -254,6 +261,7 @@ pub module ptw::<CFG: core_cfg> #(
     var w_g_q    : logic           ; // the current PTE is a G-stage PTE
     var w_fin_q  : logic           ; // that G-stage walk is for the final GPA
     var w_flt_q  : Flt             ;
+    var w_vsw_q  : logic           ; // G-stage walks of the VS-stage PTE check its A/D write
     var w_wr_q   : logic           ; // REQ presents the A/D write
     var w_seta_q : logic           ;
     var w_setd_q : logic           ;
@@ -425,8 +433,10 @@ pub module ptw::<CFG: core_cfg> #(
     let c_lvl  : logic<2> = if w_g_q ? w_glvl_q : w_lvl_q;
     let c_pbmte: logic    = if w_g_q ? x.gpbmte : x.pbmte;
     let c_adue : logic    = if w_g_q ? x.gadue : x.adue;
-    // A G-stage leaf under a VS-stage PTE is checked as an implicit load.
-    let g_acc: AccKind = if w_fin_q ? w_req_q.acc : AccKind::LOAD;
+    // A G-stage leaf under a VS-stage PTE is checked as an implicit load, or
+    // as the store of that PTE's A/D update.
+    let imp_w: logic   = w_g_q && !w_fin_q && w_vsw_q;
+    let g_acc: AccKind = if w_fin_q ? w_req_q.acc : if w_vsw_q ? AccKind::STORE : AccKind::LOAD;
     let lp   : Perm    = if w_g_q ?
         stage_perm(p_r, p_w, p_x, p_u, p_d, g_acc, csr_pkg::PrivLevel::USER, 1'b0, x.gmxr, x.gadue, w_fin_q && w_req_q.hlvx)
     :
@@ -449,10 +459,12 @@ pub module ptw::<CFG: core_cfg> #(
     let next_idx : logic<9> = if w_lvl_q == 2'd2 ? va[29:21] : va[20:12];
     let g_idx    : logic<9> = if w_glvl_q == 2'd2 ? w_gpa_q[29:21] : w_gpa_q[20:12];
 
-    let want_d : logic = w_req_q.nonspec && lp.need_d;
+    let want_d : logic = (w_req_q.nonspec || imp_w) && lp.need_d;
     let set_a  : logic = !p_a;
-    let set_d  : logic = want_d && own_live;
+    let set_d  : logic = want_d && (own_live || imp_w);
     let need_wr: logic = set_a || set_d;
+    // A VS-stage leaf to update whose G-stage leaf may not take the write yet.
+    let vs_gchk: logic = x.two && x.g_on && !w_g_q && !w_vsw_q && need_wr && !(w_gpte_q[2] && w_gpte_q[7]);
 
     var coh_hit: logic;
     always_comb {
@@ -470,7 +482,7 @@ pub module ptw::<CFG: core_cfg> #(
 
     let r_hit : logic = r_my && !w_wr_q && rs.kind == RespKind::HIT;
     let r_leaf: logic = r_hit && !p_fault && p_leaf;
-    let r_lost: logic = r_leaf && want_d && !own_live;
+    let r_lost: logic = r_leaf && want_d && !own_live && !imp_w;
 
     // The owned read found another leaf, or the exclusive write failed.
     let ad_diff: logic = r_hit && w_adr_q && (d & ~64'hc0) != (cur_pte & ~64'hc0);
@@ -490,6 +502,7 @@ pub module ptw::<CFG: core_cfg> #(
     // final GPA.
     let nl_go : Go          = go_g({8'd0, p_ppn, next_idx, 3'd0}, 1'b0, x);
     let fin_go: Go          = go_g({8'd0, entry_pa(s1e, va)}, 1'b1, x);
+    let vsw_go: Go          = go_g(w_gpa_q, 1'b0, x);
     let g_hpa : pma_pkg::Pa = entry_pa(ge, w_gpa_q);
 
     // ---- the walk: completion ----
@@ -621,6 +634,7 @@ pub module ptw::<CFG: core_cfg> #(
         resp_n.exc.gpa      = if gf_end ? w_gpa_q[63:2] : '0;
         resp_n.exc.gva      = x.two;
         resp_n.exc.implicit = gf_end && w_g_q && !w_fin_q;
+        resp_n.exc.imp_wr   = gf_end && imp_w;
         resp_n.exc.dm       = 1'b0;
         resp_n.exc.trig     = 1'b0;
         resp_n.exc.trig_hit = 0;
@@ -708,6 +722,8 @@ pub module ptw::<CFG: core_cfg> #(
                                 w_st_q = if x.two && !w_g_q ? nl_go.st : WSt::REQ;
                             } else if !need_wr {
                                 w_st_q = leaf_st;
+                            } else if vs_gchk {
+                                w_st_q = vsw_go.st;
                             } else if pte_w_deny {
                                 w_st_q = WSt::DONE;
                             } else {
@@ -752,6 +768,7 @@ pub module ptw::<CFG: core_cfg> #(
             w_side_q = s_req.tag.client == MemClient::IFU;
             w_seta_q = 1'b0;
             w_setd_q = 1'b0;
+            w_vsw_q  = 1'b0;
             w_pa_q   = s_go.pa;
             w_gpa_q  = s_go.gpa;
             w_g_q    = s_go.g;
@@ -766,6 +783,7 @@ pub module ptw::<CFG: core_cfg> #(
             w_lvl_q  = 2'd2;
             w_seta_q = 1'b0;
             w_setd_q = 1'b0;
+            w_vsw_q  = 1'b0;
             w_pa_q   = r_go.pa;
             w_gpa_q  = r_go.gpa;
             w_g_q    = r_go.g;
@@ -795,6 +813,12 @@ pub module ptw::<CFG: core_cfg> #(
                     w_pa_q  = {p_ppn, next_idx, 3'd0};
                     w_lvl_q = w_lvl_q - 2'd1;
                 }
+            } else if vs_gchk {
+                w_vsw_q  = 1'b1;
+                w_pa_q   = vsw_go.pa;
+                w_g_q    = vsw_go.g;
+                w_fin_q  = vsw_go.fin;
+                w_glvl_q = 2'd2;
             } else if need_wr && pte_w_deny {
                 w_flt_q = Flt::ACCESS;
             } else {

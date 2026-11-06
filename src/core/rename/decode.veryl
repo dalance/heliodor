@@ -41,7 +41,9 @@
 //     amocas.q with an odd rd or rs2
 //   - a CSR access names a CSR that does not exist, needs more privilege, or
 //     writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM;
-//     or names dcsr, dpc or dscratch0/1 outside Debug Mode
+//     or names dcsr, dpc or dscratch0/1 outside Debug Mode; or, below M,
+//     names hstateenN or sstateenN with mstateenN.SE clear, or senvcfg or
+//     henvcfg with mstateen0.ENVCFG clear
 //   - a counter (cycle, time, instret, hpmcounterN) below M whose mcounteren
 //     bit is clear, or in U whose scounteren bit is clear; stimecmp or
 //     vstimecmp below M without mcounteren.TM and menvcfg.STCE
@@ -58,8 +60,9 @@
 // = 1: HLV/HSV and HFENCE/HINVAL; an HS-legal access (mstatus.TVM aside) to
 // a hypervisor or VS CSR, or from VU to a supervisor CSR; a counter that
 // mcounteren allows but hcounteren (in VU also scounteren) does not;
-// stimecmp in VS without hcounteren.TM and henvcfg.STCE; a CBO that menvcfg
-// allows but henvcfg (in VU also senvcfg) does not; in VU SRET, any SFENCE
+// stimecmp in VS without hcounteren.TM and henvcfg.STCE; a CSR whose
+// mstateen bit (above) is set and whose hstateen bit is clear; a CBO that
+// menvcfg allows but henvcfg (in VU also senvcfg) does not; in VU SRET, any SFENCE
 // or SINVAL form and WFI; in VS SRET with hstatus.VTSR, SFENCE.VMA,
 // SINVAL.VMA and satp with hstatus.VTVM, and WFI with hstatus.VTW. With V =
 // 1, FS = Off also covers vsstatus.FS = Off.
@@ -76,8 +79,11 @@
 //     flush), so the DYN rounding check reads it live as well
 //   - a legal WFI is a no-op (fu NONE): it completes at once, which the
 //     privileged spec allows; the WFI that traps follows the reference model
-//   - WRS.NTO and WRS.STO are no-ops (fu NONE) and never trap: Zawrs allows
-//     them to complete at once
+//   - WRS.STO, and WRS.NTO outside the timeout rule, are no-ops (fu NONE):
+//     Zawrs allows them to complete at once. Below M with mstatus.TW, or with
+//     V = 1 and hstatus.VTW, a WRS.NTO is a SYS op: fu_sys times it out at
+//     once into an illegal (TW) or virtual (VTW) instruction exception while
+//     the reservation is valid, the only case in which it would wait
 module decode::<CFG: core_cfg> (
     clk          : input  clock                                                                      ,
     rst          : input  reset                                                                      ,
@@ -411,7 +417,14 @@ module decode::<CFG: core_cfg> (
         let csr_vhs : logic = virt && (h_csr || (umode && f12[9:8] == 2'b01)); // HS-level from VS/VU
         let csr_ill : logic = csr && (!csr_base || (if csr_vhs ? 1'b0 : rp >: priv) || (hs && tvm && (f12 == 12'h180
             || f12 == 12'h680)));
-        let csr_vill: logic = csr && csr_base && (csr_vhs || (vs && cs.vtvm && f12 == 12'h180));
+        // The xstateen bit that gates the CSR: SE of hstateenN and sstateenN,
+        // ENVCFG of senvcfg and henvcfg.
+        let st_se   : logic = f12[11:2] == 10'b0110_0000_11 || f12[11:2] == 10'b0001_0000_11;
+        let st_env  : logic = f12 == 12'h10a || f12 == 12'h60a;
+        let st_m    : logic = !(st_se && !cs.mstateen[f12[1:0]]) && !(st_env && !cs.mstateen[4]);
+        let st_h    : logic = !(st_se && !cs.hstateen[f12[1:0]]) && !(st_env && !cs.hstateen[4]);
+        let st_ill  : logic = csr && below && !st_m;
+        let csr_vill: logic = csr && csr_base && (csr_vhs || (vs && cs.vtvm && f12 == 12'h180) || (virt && !st_h));
         let fs_ill  : logic = (cs.fs == 2'b00 || (virt && cs.vsfs == 2'b00)) && (fp || vfp || (csr && f12 >= 12'h001
             && f12 <= 12'h003));
         let vs_off  : logic = cs.vs == 2'b00 || (virt && cs.vsvs == 2'b00);
@@ -427,7 +440,8 @@ module decode::<CFG: core_cfg> (
             || dret));
         let sys_vill: logic = (sret && (vu || (vs && cs.vtsr))) || (vmsfen && (vu || (vs && cs.vtvm))) || (sinval && vu)
             || ((hfen || hlv) && virt) || (wfi && !cs.tw && (vu || (vs && cs.vtw)));
-        let ill: logic = dill || enc || unsrv || csr_ill || ctr_ill || stc_ill || fs_ill || vs_ill || cbo_ill || sys_ill;
+        let ill: logic = dill || enc || unsrv || csr_ill || st_ill || ctr_ill || stc_ill || fs_ill || vs_ill || cbo_ill
+            || sys_ill;
         return {!ill && (csr_vill || ctr_vill || stc_vill || cbo_vill || sys_vill), ill};
     }
 
@@ -451,6 +465,8 @@ module decode::<CFG: core_cfg> (
             let hinval: logic     = insn[6:0] == riscv_pkg::Opcode::SYSTEM && f3 == 3'b000 && insn[11:7] == 5'd0
                 && (insn[31:25] == 7'b0010011 || insn[31:25] == 7'b0110011);
             let sfen  : logic     = is_sfence[l] || hinval;
+            let wrs_to: logic     = insn == 32'h00d0_0073 && ((i_priv != csr_pkg::PrivLevel::MACHINE && i_csr.tw) || (i_virt
+                && i_csr.vtw));
             let hf_k  : xlate_pkg::InvKind = if insn[31:25] == 7'b0110001 || insn[31:25] == 7'b0110011 ?
                 xlate_pkg::InvKind::HFENCE_GVMA
             : if i_virt || insn[31:25] == 7'b0010001 || insn[31:25] == 7'b0010011 ?
@@ -517,6 +533,7 @@ module decode::<CFG: core_cfg> (
             di.is_xret    = is_mret[l] || dret;
             di.is_sfence  = sfen;
             di.is_sinval  = is_sinval[l];
+            di.is_wrs     = wrs_to;
             di.is_fence   = is_fence[l];
             di.is_fence_i = is_fence_i[l];
             di.is_fp      = fpc && !is_vec[l];
@@ -560,10 +577,16 @@ module decode::<CFG: core_cfg> (
                     d.rs2.used = is_branch[l];
                 }
                 FuKind::SYS: {
-                    d.uop      = sys_op(is_csr[l], csr_op[l], csr_imm[l]) as UOP_W;
-                    d.rs1.used = !is_csr[l] || !csr_imm[l];
-                    d.rs2.used = !is_csr[l];
-                    d.imm      = if is_csr[l] ? {15'd0, insn[19:15], f12} : {28'd0, hf_k as 2, insn[24:20] == 0, insn[19:15] == 0};
+                    d.uop      = if wrs_to ? SysOp::WRS_NTO as UOP_W : sys_op(is_csr[l], csr_op[l], csr_imm[l]) as UOP_W;
+                    d.rs1.used = !wrs_to && (!is_csr[l] || !csr_imm[l]);
+                    d.rs2.used = !wrs_to && !is_csr[l];
+                    d.imm      = if wrs_to ?
+                        {31'd0, !i_csr.tw}
+                    : if is_csr[l] ?
+                        {15'd0, insn[19:15], f12}
+                    :
+                        {28'd0, hf_k as 2, insn[24:20] == 0, insn[19:15] == 0}
+                    ;
                 }
                 // An HLV/HSV has no offset; its size is funct7[2:1] and rs2[0]
                 // makes an HLV load unsigned.

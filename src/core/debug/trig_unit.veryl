@@ -1,13 +1,14 @@
-// trig_unit: the Sdtrig triggers (tselect, tdata1-3, tinfo, tcontrol), the
+// trig_unit: the Sdtrig triggers (tselect, tdata1-3, tinfo), the
 // address-match configuration the fetch and memory pipes compare against, and
 // the icount triggers.
 //
 // Ports (timing contract):
-//   i_rd_addr/o_rd_data : combinational read of 0x7A0-0x7A5 (csr returns it)
+//   i_rd_addr/o_rd_data : combinational read of 0x7A0-0x7A4 (csr returns it)
 //   i_wr_en, i_wr_addr, i_wr_data : commit's CSR write, applied on the edge
 //   i_priv, i_virt, i_dm : csr's privilege, V and debug_mode (registered)
 //   i_spvp              : hstatus.SPVP, the mode of HLV/HSV (VS or VU)
-//   i_m_trap, i_mret    : a trap into M, an MRET retired; applied on the edge
+//   i_mie, i_sie, i_vsie: mstatus.MIE, mstatus.SIE and vsstatus.SIE
+//   i_bp_deleg          : {hedeleg[3], medeleg[3]}, where a breakpoint traps
 //   i_hit               : hit bits of an accepted address-trigger exception
 //   i_cnt               : lane 0 retired, trapped or took an interrupt outside
 //                         Debug Mode (icount counts it)
@@ -28,8 +29,12 @@
 //     only in Debug Mode
 //   - tdata1-3 of a dmode trigger are written only in Debug Mode; tselect
 //     ignores a value of TRIG_N or more
-//   - no trigger matches or counts in Debug Mode; an action-0 trigger
-//     matches in M only with tcontrol.mte
+//   - no trigger matches or counts in Debug Mode. An action-0 trigger
+//     neither matches nor counts while the mode its breakpoint traps to has
+//     interrupts disabled: in M while mstatus.MIE is 0, in HS while
+//     breakpoints are delegated to S and sstatus.SIE is 0, in VS while they
+//     are delegated on to VS and vsstatus.SIE is 0 (U and VU never trap to
+//     their own mode). There is no tcontrol
 //   - the mode bits are m, s, u for V = 0 and vs, vu for V = 1; an HLV or
 //     HSV matches its load or store in the guest mode it accesses
 //     (o_cfg.ldh/sth), the regime of its translation
@@ -39,7 +44,11 @@
 // Rationale:
 //   - every configuration change is a CSR write, trap, xRET, Debug Mode
 //     entry or dret, all full kills, so o_cfg read at fetch or m1 is the
-//     committed state of the op
+//     committed state of the op; that includes the interrupt enables and
+//     the delegation the reentrancy rule reads
+//   - the trap handler a breakpoint enters runs with its mode's interrupt
+//     enable clear, so a trigger that matches the handler cannot re-enter it
+//     at any delegation level (tcontrol would guard only M)
 //   - icount counts only lane 0: commit retires on lane 0 alone while an
 //     icount trigger is armed, so the count never ends inside a group
 pub module trig_unit::<CFG: core_cfg> (
@@ -54,8 +63,10 @@ pub module trig_unit::<CFG: core_cfg> (
     i_virt     : input  logic                                       ,
     i_spvp     : input  logic                                       ,
     i_dm       : input  logic                                       ,
-    i_m_trap   : input  logic                                       ,
-    i_mret     : input  logic                                       ,
+    i_mie      : input  logic                                       ,
+    i_sie      : input  logic                                       ,
+    i_vsie     : input  logic                                       ,
+    i_bp_deleg : input  logic                        <2>            ,
     i_hit      : input  logic                        <CFG::TRIG_N>  ,
     i_cnt      : input  logic                                       ,
     i_icnt_take: input  logic                        <2>            ,
@@ -96,12 +107,15 @@ pub module trig_unit::<CFG: core_cfg> (
         t2   : logic<64>,
     }
 
-    var tr_q  : Trig       [TN];
-    var sel_q : logic<SEL_W>   ;
-    var mte_q : logic          ;
-    var mpte_q: logic          ;
+    var tr_q : Trig       [TN];
+    var sel_q: logic<SEL_W>   ;
 
-    let in_m: logic = i_priv == csr_pkg::PrivLevel::MACHINE;
+    // A breakpoint taken now would re-enter a handler with interrupts off.
+    let reent: logic = case i_priv {
+        csr_pkg::PrivLevel::MACHINE   : !i_mie,
+        csr_pkg::PrivLevel::SUPERVISOR: i_bp_deleg[0] && (if i_virt ? i_bp_deleg[1] && !i_vsie : !i_sie),
+        default                       : 1'b0,
+    };
 
     function mode_ok (
         r   : input Trig              ,
@@ -132,7 +146,7 @@ pub module trig_unit::<CFG: core_cfg> (
     var ie: logic<TN>; // icount triggers armed in this mode
     always_comb {
         for t in 0..TN {
-            let ok_m: logic = !i_dm && (ga[t] || !in_m || mte_q);
+            let ok_m: logic = !i_dm && (ga[t] || !reent);
             let en  : logic = ok_m && mode_ok(tr_q[t], i_priv, i_virt);
             let mc  : logic = en && tr_q[t].typ == Typ::MC6;
             let mch : logic = ok_m && mode_ok(tr_q[t], h_priv, 1'b1) && tr_q[t].typ == Typ::MC6;
@@ -188,7 +202,6 @@ pub module trig_unit::<CFG: core_cfg> (
             12'h7A1: tdata1(cur),
             12'h7A2: cur.t2,
             12'h7A4: 64'h0100_8048, // version 1; types 15, 6 and 3
-            12'h7A5: {56'd0, mpte_q, 3'd0, mte_q, 3'd0},
             default: 64'd0,
         };
     }
@@ -244,9 +257,7 @@ pub module trig_unit::<CFG: core_cfg> (
             for t in 0..TN {
                 tr_q[t] = 0 as Trig;
             }
-            sel_q  = 0;
-            mte_q  = 1'b0;
-            mpte_q = 1'b0;
+            sel_q = 0;
         } else {
             for t in 0..TN {
                 if i_hit[t] {
@@ -272,15 +283,6 @@ pub module trig_unit::<CFG: core_cfg> (
             }
             if i_wr_en && i_wr_addr == 12'h7A0 && wd <: TN {
                 sel_q = wd[SEL_W - 1:0];
-            }
-            if i_wr_en && i_wr_addr == 12'h7A5 {
-                mte_q  = wd[3];
-                mpte_q = wd[7];
-            } else if i_m_trap {
-                mpte_q = mte_q;
-                mte_q  = 1'b0;
-            } else if i_mret {
-                mte_q = mpte_q;
             }
         }
     }

@@ -27,8 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("HELIODOR_ROOT",
                       os.path.abspath(os.path.join(HERE, "..", "..", "..", "..")))
 
-# misa of the new core (RV64 IMAFDC, H, V, S, U), read from the hardware.
-MISA = 0x80000000003411ad
+# misa of the new core (RV64 IMAFDC, B, H, V, S, U), read from the hardware.
+MISA = 0x80000000003411af
 
 
 class HeliodorHart(targets.Hart):

@@ -1,9 +1,10 @@
 # Hart program of dbg/dm_trig_m (dmi/dm_trig_m.dmi): triggers set by M-mode
 # software (dmode 0, action 0, the breakpoint exception). It waits until the
 # script has set s9 (after giving trigger 1 to Debug Mode: dmode 1, execute
-# at 0x1234), then checks the trigger CSRs, tcontrol.mte/mpte, execute, load
-# and store breakpoints (cause 3, mepc, mtval), and an icount breakpoint in
-# U-mode. It ends in an ebreak, which the script catches (dcsr.ebreakm);
+# at 0x1234), then checks the trigger CSRs, the reentrancy rule (an action-0
+# trigger does not match in M while mstatus.MIE is 0, so not in the handler),
+# execute, load and store breakpoints (cause 3, mepc, mtval), and an icount
+# breakpoint in U-mode. It ends in an ebreak, which the script catches (dcsr.ebreakm);
 # `done` writes tohost = 1. A failed check writes its number instead.
 
         .option norvc
@@ -44,17 +45,17 @@ wait:   beqz    s9, wait
         li      t0, 0x6000000000000044
         bne     t0, t1, fail
 
-        # Execute breakpoint: no match in M while tcontrol.mte = 0.
+        # Execute breakpoint: no match in M while mstatus.MIE = 0. mie is
+        # 0, so MIE = 1 takes no interrupt.
         li      gp, 5
-        csrr    t0, tcontrol
-        bnez    t0, fail
+        csrw    mie, zero
+        csrci   mstatus, 8
         li      s7, 4                       # the handler skips the op
         la      t0, bp1
         csrw    tdata2, t0
         jal     ra, bp_call
         bnez    s5, fail
-        li      t0, 8
-        csrs    tcontrol, t0                # mte
+        csrsi   mstatus, 8                  # MIE
         jal     ra, bp_call
         li      gp, 6
         li      t0, 1
@@ -65,9 +66,10 @@ wait:   beqz    s9, wait
         bne     s3, t0, fail
         bne     s4, t0, fail                # mtval: the op's address
         li      gp, 7
-        li      t0, 0x80                    # in the handler: mpte = 1, mte = 0
+        li      t0, 0x80                    # in the handler: MPIE = 1, MIE = 0
         bne     s6, t0, fail
-        csrr    t0, tcontrol                # after mret: mte = mpte
+        csrr    t0, mstatus                 # after mret: MIE = MPIE
+        andi    t0, t0, 0x88
         li      t1, 0x88
         bne     t0, t1, fail
         bnez    a0, fail                    # bp1 did not run the second time
@@ -151,13 +153,14 @@ ucode:  addi    a0, a0, 1
 ubp:    addi    a0, a0, 1
         ecall
 
-        # Records mcause, mepc, mtval and tcontrol, counts the traps, returns
+        # Records mcause, mepc, mtval and mstatus.MIE/MPIE, counts the traps, returns
         # to mepc + s7, or to s8 in M after an ecall from U.
 handler:
         csrr    s2, mcause
         csrr    s3, mepc
         csrr    s4, mtval
-        csrr    s6, tcontrol
+        csrr    s6, mstatus
+        andi    s6, s6, 0x88
         addi    s5, s5, 1
         li      t0, 8
         beq     s2, t0, from_u

@@ -9,8 +9,8 @@
         .section .text.init
         .globl _start
 _start:
-        # M-mode action-0 triggers need tcontrol.mte where tcontrol exists
-        # (heliodor) and mstatus.MIE where it does not (spike); set both.
+        # M-mode action-0 triggers need mstatus.MIE (heliodor, spike), and
+        # tcontrol.mte too where a simulator has tcontrol; set both.
         # mie stays 0, so no interrupt is taken.
         la      t0, 1f
         csrw    mtvec, t0
