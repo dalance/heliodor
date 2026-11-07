@@ -2102,9 +2102,12 @@ pub module vector_unit::<CFG: core_cfg> #(
     let fw_vd_d   : logic<64>   = fw_vd_dsh[63:0]; // V3j widening-FMA addend (old vd, double)
     let fw_s1d    : logic<64>   = if h_is_fwiden_w ? fw_vs2_d : s2d(fw_vs2_s);
     let fw_s2d    : logic<64>   = s2d(fw_vs1_s);
-    // V4h vfncvt: the 2*SEW source element (double / int64) is read at the wide
-    // geometry — source register h_vs2 + (fp_elem>>1), bit offset (fp_elem&1)*64.
-    let fn_sbitoff: logic<8>    = if fp_elem[0] ? 8'd64 : 8'd0;
+    // vfncvt reads its 2*SEW source element at the wide geometry: register
+    // h_vs2 + fn_sreg, at fn_sbitoff.
+    let fn_slog   : logic<2>    = vsew[1:0] + 2'd1; // log2 of the source bytes
+    let fn_sepr8  : logic<8>    = 8'd16 >> fn_slog;
+    let fn_sreg   : logic<8>    = fp_elem >> (3'd4 - {1'b0, fn_slog});
+    let fn_sbitoff: logic<8>    = (fp_elem & (fn_sepr8 - 8'd1)) << (3'd3 + {1'b0, fn_slog});
     let fn_src_sh : logic<VLEN> = i_vs2_data >> fn_sbitoff;
     let fncvt_src : logic<64>   = fn_src_sh[63:0];
     // Conversions (funct6 010010: vfcvt, vfwcvt, vfncvt) run on fp_cvt, the
@@ -2123,12 +2126,16 @@ pub module vector_unit::<CFG: core_cfg> #(
         2'd2   : fpu_pkg::box_s(cv_raw[31:0]),
         default: cv_raw,
     };
-    let cv_a    : logic<64> = if cv_fromi ? cv_raw : cv_fsrc;
+    // A 16-bit integer source (vfwcvt.f.x[u].v at SEW 16) converts as 32 bits.
+    let cv_isrc : logic<64> = if vsew == 3'd1 ? (if cv_sub[0] ? {cv_raw[15] repeat 48, cv_raw[15:0]} : {48'd0, cv_raw[15:0]}) : cv_raw;
+    let cv_a    : logic<64> = if cv_fromi ? cv_isrc : cv_fsrc;
     let cv_rm   : logic<3>  = if cv_sub[2:1] == 2'b11 || cv_rod ? 3'b001 : i_frm;
     var cv_op   : fpu_pkg::FpuOp;
     always_comb {
         if h_is_fwcvt {
-            if cv_fromi {
+            if cv_fromi && vsew == 3'd1 {
+                cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_S_W : fpu_pkg::FpuOp::FCVT_S_WU;
+            } else if cv_fromi {
                 cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_D_W : fpu_pkg::FpuOp::FCVT_D_WU;
             } else if cv_toint {
                 cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_L_S : fpu_pkg::FpuOp::FCVT_LU_S;
@@ -2138,6 +2145,8 @@ pub module vector_unit::<CFG: core_cfg> #(
         } else if h_is_fncvt {
             if cv_fromi {
                 cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_S_L : fpu_pkg::FpuOp::FCVT_S_LU;
+            } else if cv_toint && vsew == 3'd1 {
+                cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_W_S : fpu_pkg::FpuOp::FCVT_WU_S;
             } else if cv_toint {
                 cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_W_D : fpu_pkg::FpuOp::FCVT_WU_D;
             } else {
@@ -2336,7 +2345,14 @@ pub module vector_unit::<CFG: core_cfg> #(
     // vfncvt.rod.f.f.w rounds toward zero and sets the LSB of an inexact
     // result (round to odd; an overflow already gives the largest finite
     // value, whose LSB is set).
-    let cv_val   : logic<64> = if cv_rod ? {cv_res[63:1], cv_res[0] | cv_ffl[0]} : cv_res;
+    // vfncvt[.rtz].x[u].f.w at SEW 16 converts to 32 bits and saturates to
+    // 16 with only NV, as a 16-bit conversion would.
+    let cv_i16   : logic     = h_is_fncvt && cv_toint && vsew == 3'd1;
+    let cv_hi    : logic     = if cv_sub[0] ? (!cv_res[63] && cv_res[62:15] != 48'd0) : cv_res[31:16] != 16'd0;
+    let cv_lo    : logic     = cv_sub[0] && cv_res[63] && cv_res[62:15] != {1'b1 repeat 48};
+    let cv_sat   : logic     = cv_i16 && (cv_hi || cv_lo);
+    let cv_val   : logic<64> = if cv_sat ? (if cv_lo ? 64'h8000 : (if cv_sub[0] ? 64'h7fff : 64'hffff)) : (if cv_rod ? {cv_res[63:1], cv_res[0] | cv_ffl[0]} : cv_res);
+    let cv_vffl  : logic<5>  = if cv_sat ? 5'b10000 : cv_ffl;
     // Per-element write value (SEW-wide). Arithmetic/div/sqrt use the FPU result;
     // a merge selects f[rs1] (active) or vs2[i] (inactive) — no FPU; an estimate
     // (vfrsqrt7/vfrec7) uses the ROM result. A merge writes EVERY body element
@@ -2349,12 +2365,21 @@ pub module vector_unit::<CFG: core_cfg> #(
     // writes SEW elements at the source geometry (fp_reg / fp_bitoff). For a
     // wide-dest op the result is the full 64-bit value from the FPU.
     let h_is_wdst  : logic        = h_is_fwiden || h_is_fwcvt; // 2*SEW dest geometry
-    let fp_res_vlen: logic<VLEN>  = if (fp_double || h_is_wdst) ? {64'd0, fp_wval} : {96'd0, fp_wval[31:0]};
-    let fp_dmask   : logic<VLEN>  = if (fp_double || h_is_wdst) ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
-    let fp_dbitoff : logic<8>     = if h_is_wdst ? (if fp_elem[0] ? 8'd64 : 8'd0) : fp_bitoff;
-    let fp_dlocal0 : logic        = if h_is_wdst ? !fp_elem[0] : (fp_local == 8'd0);
-    let fp_dreg    : logic<8>     = if h_is_wdst ? (fp_elem >> 1) : fp_reg;
-    let fp_dreg_last: logic       = if h_is_wdst ? (fp_elem[0] || ((fp_elem + 8'd1) >= vl8)) : fp_reg_last;
+    let fp_dlog    : logic<2>     = if h_is_wdst ? vsew[1:0] + 2'd1 : vsew[1:0]; // log2 of the dest bytes
+    let fp_dw_msk  : logic<64>    = case fp_dlog {
+        2'd0   : 64'h0000_0000_0000_00ff,
+        2'd1   : 64'h0000_0000_0000_ffff,
+        2'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let fp_depr8   : logic<8>     = 8'd16 >> fp_dlog;
+    let fp_dlocal  : logic<8>     = fp_elem & (fp_depr8 - 8'd1);
+    let fp_res_vlen: logic<VLEN>  = {64'd0, fp_wval & fp_dw_msk};
+    let fp_dmask   : logic<VLEN>  = {64'd0, fp_dw_msk};
+    let fp_dbitoff : logic<8>     = fp_dlocal << (3'd3 + {1'b0, fp_dlog});
+    let fp_dlocal0 : logic        = fp_dlocal == 8'd0;
+    let fp_dreg    : logic<8>     = fp_elem >> (3'd4 - {1'b0, fp_dlog});
+    let fp_dreg_last: logic       = ((fp_dlocal + 8'd1) >= fp_depr8) || ((fp_elem + 8'd1) >= vl8);
     let fp_dreg_vrf: logic<VRF_W> = h_vd + fp_dreg[VRF_W - 1:0];
     let fp_dreg_vs2: logic<VRF_W> = h_vs2 + fp_dreg[VRF_W - 1:0]; // .w: vs2 at dest (double) geometry
     let fp_acc_base: logic<VLEN>  = if fp_dlocal0 ? i_vdold_data : fp_acc;
@@ -2563,7 +2588,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_scalar2_pdst = h_s2_pd; // V5h strided stride: prf_int 2nd read address
     assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + {2'd0, fp_elem[3:1]}) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src=elem>>1 / .w vs2=dest geom / elem) / mem / widen / src2
+    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + fn_sreg[VRF_W - 1:0]) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
@@ -2585,11 +2610,16 @@ pub module vector_unit::<CFG: core_cfg> #(
     // count, vset* ignores vstart, and every other op needs vstart = 0 (the
     // spec allows the trap, and the VU never leaves such an op part done).
     let mem_vlmax8: logic<8> = if h_is_wholereg ? (wr_nreg8 * mem_epr8) : (if h_is_maskmem ? 8'd16 : pm_vlmax8);
+    // A vector FP op runs at SEW 32 and 64, or only 32 when one side is 2*SEW,
+    // and at 16 only the conversions between 16-bit integers and singles.
+    let fp_op  : logic = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || h_is_vfmv_sf || h_is_vfmv_fs;
+    let fp_wide: logic = h_is_fwiden || h_is_fwred || h_is_fwcvt || h_is_fncvt;
+    let fp_ok16: logic = (h_is_fwcvt && cv_fromi) || (h_is_fncvt && cv_toint);
     always_comb {
         o_head.valid      = count != 0;
         o_head.tag        = h_tag;
         o_head.vtype_dep  = !h_is_vset && !h_is_wholereg;
-        o_head.is_fp      = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || h_is_vfmv_sf || h_is_vfmv_fs;
+        o_head.sews       = if fp_op ? {!fp_wide, 1'b1, fp_ok16, 1'b0} : 4'b1111;
         o_head.vstart_max = if h_is_vset ? 8'hff : (if h_is_mem ? mem_vlmax8 - 8'd1 : 8'd0);
         o_head.insn       = h_instr;
     }
@@ -2892,7 +2922,7 @@ pub module vector_unit::<CFG: core_cfg> #(
                             if fp_active && !h_is_fmerge && !h_is_anyired {
                                 // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU);
                                 // integer reductions (h_is_anyired) accrue no FP flags.
-                                fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : (if h_is_fcvt ? cv_ffl : vfpu_fflags));
+                                fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : (if h_is_fcvt ? cv_vffl : vfpu_fflags));
                             }
                             // A compare accumulates the running mask in fp_acc (no
                             // reset — one mask register spans the whole op); a reduction
