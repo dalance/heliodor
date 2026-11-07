@@ -98,14 +98,38 @@ Sail 0.16 `sail.json`) with heliodor's deviations.
 
 | file | purpose |
 |------|---------|
-| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Sha (Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd, Ssstateen), S/Sm 1.13, B (Zba/Zbb/Zbs), Smstateen/Ssstateen (SE0-3 and ENVCFG writable, CONTEXT read-only zero), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu (both stages under H), Sdtrig (2 triggers, mcontrol6 + icount, breakpoint reentrancy by the interrupt enables, no tcontrol), and the RVA23.1 options Svrsw60t59b, Ssqosid (RCID and MCID 12 bits), Smcsrind/Sscsrind (mstateen0/hstateen0 CSRIND writable), Smcdeleg/Ssccfg and Ssdbltrp. Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush, medeleg[3] writable. Not declared yet: Zvbb/Zvkb, Zvfhmin, Zvkt |
-| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_interrupt_enables` with 2 triggers, B, Sha and the stateen bits above, Svrsw60t59b, Ssqosid (12-bit RCID and MCID, mstateen0.SRMCFG writable) and Ssdbltrp (Smdbltrp off). Sail 0.16 has no Smcsrind/Sscsrind or Smcdeleg/Ssccfg option; they are declared to UDB only. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
+| `heliodor.yaml` | UDB config: what the core implements. RV64GCV (Zve64d, Zvl128b, VLEN 128, ELEN 64) + H with Sha (Shcounterenw/Shgatpa/Shtvala/Shvsatpa/Shvstvala/Shvstvecd, Ssstateen), S/Sm 1.13, B (Zba/Zbb/Zbs), Smstateen/Ssstateen (SE0-3 and ENVCFG writable, CONTEXT read-only zero), Zabha/Zacas/Zawrs, Za64rs (and Za128rs, which UDB requires with it), Zic64b/Ziccamoa/Ziccif/Zicclsm/Ziccrse, Zkt, Sscofpmf, Sstc, Ssnpm/Smnpm/Smmpm/Supm (PMLEN 7 and 16), Svadu (both stages under H), Sdtrig (2 triggers, mcontrol6 + icount, breakpoint reentrancy by the interrupt enables, no tcontrol), and the RVA23.1 options Svrsw60t59b, Ssqosid (RCID and MCID 12 bits), Smcsrind/Sscsrind (mstateen0/hstateen0 CSRIND writable), Smcdeleg/Ssccfg and Ssdbltrp. Parameters: GEILEN 0, tinst always zero, `MEI_INTR_IMPL` false (the PLIC sources are harness pins), vector misaligned accesses trap, mcountinhibit reads zero, LR/SC reservation on the exact address, cbo.inval acts as a flush, medeleg[3] writable, and Zvfhmin. Not declared yet: Zvbb/Zvkb, Zvkt |
+| `sail.json` | the matching Sail reference config: 4 MiB RAM region, vector misaligned → alignment exception, `EV_FENCE` mapped to HPM event 5, Sdtrig `Use_interrupt_enables` with 2 triggers, B, Sha and the stateen bits above, Svrsw60t59b, Ssqosid (12-bit RCID and MCID, mstateen0.SRMCFG writable), Ssdbltrp (Smdbltrp off) and Zvfhmin; vector arithmetic and the scalar moves raise illegal-instruction at vstart != 0 (`vstart.zero_required`), as heliodor does. Sail 0.16 has no Smcsrind/Sscsrind or Smcdeleg/Ssccfg option; they are declared to UDB only. The simple interrupt generator, which ACT requires to build signatures, sits at 0x0D00_0000 (a hole on heliodor, never touched) |
 | `rvmodel_macros.h` | HALT writes tohost then `fence.i`; MSIP/MTIME/MTIMECMP at the CLINT; access-fault address 0x5000_0000 (a hole); HPM counter 3 with event 5 (memory port busy) and a load as the event code; supervisor interrupts through mip |
 | `link.ld` | the framework's linker script with RAM = the 4 MiB harness DRAM and `.tohost` pinned at **0x80001000** (`TOHOST_IDX = 1024`) |
 | `test_config.yaml` | compiler / objdump / `sail_riscv_sim` / udb / linker (all resolved from PATH) |
 
 The harness is `arch_soc_harness` (the new-core arm of
 `test_arch_common_harness`): the SoC with `MAP_ARCH`, 4 MiB DRAM.
+
+## Status at pin 8b9ddedc (MI step 4a, 2026-11-07)
+
+MI step 4a declared Zvfhmin, which selects its suite (2 tests): 3,654
+selected, 3,652 run. GA: **W2 2,788/3,652, W4 2,787/3,652**; GL-C:
+**720/720** on both. Every test that passed at step 3 still passes; the 284
+new passes are the same on both cores:
+
+| suite | W2 / W4 pass | was | what changed |
+|---|---|---|---|
+| Vls8/16/32/64 | 390/1,240 | 306 | the 84 strided and indexed non-segment tests (b, fixed): the vector unit read inst[24:20] as lumop/sumop for every mop, so a strided rs2 or indexed vs2 of 8, 11 or 16 made the op a whole-register, mask or fault-only-first transfer (element count, mask and fault rule). The step 1 note blaming the EEW geometry was wrong |
+| Vx8/16/32/64 | 831/831 | 686 | G13 (c, implemented): vmv.s.x, vmv<nr>r.v, vmacc/vnmsac/vmadd/vnmsub, the vwmacc family, vadc/vsbc/vmadc/vmsbc, vzext/vsext |
+| ExceptionsVx | 43/43 | 3 | arithmetic at vstart != 0 now raises illegal-instruction, as the Sail config expects (user decision (4) of step 1); 3 were vmadc (G13) |
+| ExceptionsVf32, ExceptionsVf64 | 1/1, 1/1 | 0, 0 | vstart != 0 |
+| Vf16, Vf32 | 6/6, 101/101 | 0, 99 | SEW 16 integer/FP conversions; the conversions run on `fp_cvt` (G14: frm, round to odd, the vfncvt.f.f.w overflow flags) |
+| Zvfhmin | 2/2 | new | vfwcvt.f.f.v and vfncvt.f.f.w at SEW 16 |
+| SdtrigS, SdtrigU, SdtrigSm | 54/53, 42/42, 60/59 of 54, 42, 61 | 53/52, 41, 59/58 | `vector_mask` (needed vmv.s.x) |
+
+Remaining vector failures are all segment accesses (MI step 4c): the 850
+segment tests of Vls, ExceptionsVls (`vlseg2e8` with vstart != 0: segment
+loads and stores still restart at element 0) and MisalignV ×2 (indexed
+segment). The non-vector failures are those of step 3. The directed probes of
+this step are `mi_vls_rs2`, `mi_vstart`, `mi_vcvt`, `mi_vcvt16`,
+`mi_zvfhmin` and `mi_vint` in `test/gates/mi_probe.list`.
 
 ## Status at pin 8b9ddedc (MI step 3, 2026-11-06)
 
