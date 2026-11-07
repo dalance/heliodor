@@ -1,22 +1,48 @@
-// Phase 12 V0: decoupled, in-order Vector Unit (VU).
+// vector_unit: the in-order Vector Unit (VU) that executes RVV 1.0 one
+// instruction at a time, with VLEN=128 and ELEN=64
 //
-// The VU owns the vector config state (vtype/vl, working copies) and drives the
-// VRF (vrf.veryl). It receives vector instructions from rename in PROGRAM ORDER
-// into a small in-order FIFO and executes them one at a time, head first — the
-// VRF is not renamed, so vector source operands are always the values the VU
-// itself wrote earlier in program order (no vector-operand wakeup needed). Only
-// the scalar (integer) operand of vadd.vx / vset*vl needs wakeup, which it gets
-// from the integer CDB exactly like iq_fp's int→fp source.
-//
-// The VU works on its head only under the exec permission i_exec (the head's
-// tag). When the head has a result ready it raises o_wb_req (o_wb_rd when the
-// result writes a scalar rd) and completes in the cycle the core grants
-// i_cdb_free; o_cdb_* carry the completion. FIFO entries are dropped by the
-// core's kill (i_kill) by tag age; a full kill also abandons the head's work
-// and reloads vtype/vl from the committed CSRs.
-//
-// VLEN=128, ELEN=64. Tail and masked-off elements keep the old vd
-// (undisturbed, which also satisfies the agnostic policies).
+// Ports (timing contract):
+//   i_alloc_*, o_alloc_rdy : in-program-order push into an 8-entry FIFO; the
+//                    op carries its renamed scalar sources (int rs1, int rs2
+//                    for strides, fp rs1) as physical registers
+//   i_exec, o_head : the VU works on the FIFO head only while i_exec is valid
+//                    with the head's tag; o_head exposes the head to the core
+//   o_scalar_pdst, o_fscalar_pdst, o_scalar2_pdst : scalar operand reads of
+//                    the head, combinational, at execute
+//   o_vs1_addr .. o_vdold_addr, o_vd_* : four combinational VRF read ports
+//                    (vs1, vs2, v0 mask, old vd) and one registered write
+//   o_wb_req, o_wb_rd : the head has a result ready (and writes a scalar rd);
+//                    neither depends on i_cdb_free
+//   i_cdb_free, o_cdb_* : the op completes in a cycle with i_cdb_free; the
+//                    o_cdb_* side effects (vset*vl vtype/vl, vstart, fflags,
+//                    vxsat, memory faults) retire with it
+//   o_mem_*, i_mem_* : the element-serial vector memory port; the VU holds
+//                    the port while a load or store is at the head
+//   i_kill         : drops FIFO entries by tag age; a full kill also abandons
+//                    the head's work and reloads vtype/vl from i_csr_vtype and
+//                    i_csr_vl
+//   i_cdb_int_*, i_cdb2_* : integer result snoop that wakes a pending scalar
+//                    operand; a user that runs the VU only at the oldest
+//                    instruction ties them off
+// Owns:
+//   - the working copies of vtype and vl
+//   - element-serial execution of the integer, fixed-point, floating-point,
+//     mask, permute and reduction ops, including the Zvbb/Zvkb subset, and of
+//     all the unit-stride, strided, indexed, segment and whole-register
+//     loads and stores
+//   - tail and masked-off elements keep the old vd (undisturbed, which also
+//     satisfies the agnostic policies)
+// Rationale:
+//   - the VRF is not renamed, so a wrong-path write could not be rolled
+//     back: the VU runs a head only under i_exec, and a vector source is
+//     always what the VU itself wrote earlier in program order, so vector
+//     operands need no wakeup
+//   - the core instantiates this module with the scalar operands ready at
+//     the start (the head holds the oldest token), so it does not use the
+//     integer snoop; the frozen old core has its own copy of this module
+//   - the Parameters below that default to 1 insert a FETCH phase that
+//     splits a long combinational cone at the cost of one cycle per element
+//     or group; 0 folds the phase away
 pub module vector_unit::<CFG: core_cfg> #(
     param VRF_W    : u32 = 5  ,
     param VLEN     : u32 = 128 ,
@@ -32,7 +58,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     // fp_fetched_q is never set, so the FSM stays the 2-phase present/capture and
     // o_/u_vfpu inputs take the live combinational operands = today (cycle-exact).
     param VFP_PIPE : bit = 1  ,
-    // CP: MMU->dcache memory pipeline (cp_mmu_dcache_pipeline_plan.md, M2). When
+    // CP: MMU->dcache memory pipeline. When
     // the core's MEM_PIPE is on, the dcache reads the REGISTERED translated PA one
     // cycle after the MMU translates, so each VU mem element needs 2 cycles: a
     // FETCH (drive vaddr -> MMU translate -> the core's M-stage latches the PA) and
@@ -41,8 +67,8 @@ pub module vector_unit::<CFG: core_cfg> #(
     // Passed from the core's `const MEM_PIPE` so the two stay in sync. Built DEAD
     // (=0): mem_fetched_q is never set -> single-cycle element = today (cycle-exact).
     param MEM_PIPE : bit = 0  ,
-    // CP: VU integer/permute datapath pipeline (cp_vu_datapath_pipeline_plan.md,
-    // cut #1). vrgather's per-element source addressing is a data-dependent chained
+    // CP: VU integer/permute datapath pipeline.
+    // vrgather's per-element source addressing is a data-dependent chained
     // VRF read: vs1 -> idx -> source-register select -> the dynamic vs2 read (the
     // ~7.8 ns VU-compute floor). VINT_PIPE=1 inserts a FETCH phase in the permute
     // COMPUTE FSM that registers the gather addressing (pm_g_sreg/sbitoff/oob) off
@@ -51,7 +77,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     // +1 cycle per vrgather element. Built DEAD (=0): pm_fetched_q is never set, so
     // the permute FSM stays single-cycle and the addressing is live = cycle-exact.
     param VINT_PIPE: bit = 1  ,
-    // CP: VU same-width integer ALU/mul datapath pipeline (cp_vrf_cut_plan.md §2).
+    // CP: VU same-width integer ALU/mul datapath pipeline.
     // The register-serial VALU compute reads the full VRF group (vs2/vs1/vdold) and
     // runs the multiply/ALU (valu_res) or compare (cmp_res) in one cycle -> the vrf
     // 13.88 ns front. VALU_PIPE=1 inserts a FETCH cycle per plain-valu/compare group
