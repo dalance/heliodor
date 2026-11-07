@@ -230,9 +230,11 @@ pub module vector_unit::<CFG: core_cfg> #(
         op: input logic<6>,
     ) -> logic<W> {
         let sh   : logic<W> = b & (W - 1);
+        let nsh  : logic<W> = (~sh + 1) & (W - 1);
         let sra_r: logic<W> = $signed(a) >>> sh; // arithmetic right shift (signed)
         return case op {
             6'b000000: a + b,                                // vadd
+            6'b000001: a & ~b,                               // vandn
             6'b000010: a - b,                                // vsub
             6'b000011: b - a,                                // vrsub
             6'b000100: if a <: b ? a : b,                    // vminu
@@ -242,6 +244,8 @@ pub module vector_unit::<CFG: core_cfg> #(
             6'b001001: a & b,                                // vand
             6'b001010: a | b,                                // vor
             6'b001011: a ^ b,                                // vxor
+            6'b010100: (a >> sh) | (a << nsh),               // vror
+            6'b010101: (a << sh) | (a >> nsh),               // vrol
             6'b100101: a << sh,                              // vsll
             6'b101000: a >> sh,                              // vsrl
             6'b101001: sra_r,                                // vsra
@@ -471,6 +475,52 @@ pub module vector_unit::<CFG: core_cfg> #(
             6'b100110: hi_su, // vmulhsu (signed   × unsigned, high)
             default  : lo_v,
         };
+    }
+
+    // ---- Zvbb unary bit ops (OPMVV VXUNARY0, vs1 01xxx) ----------------------
+    // sel = vs1[2:0]: 000 vbrev8, 001 vrev8, 010 vbrev, 100 vclz, 101 vctz,
+    // 110 vcpop. The counts are a log-depth suffix OR and a tree popcount.
+    function vbbu::<W: u32> (
+        a  : input logic<W>,
+        sel: input logic<3>,
+    ) -> logic<W> {
+        var rb : logic<W>;
+        var rb8: logic<W>;
+        var ry : logic<W>;
+        var sl : logic<W>;
+        var st : logic<W>;
+        for i in 0..W {
+            rb[i]  = a[W - 1 - i];
+            rb8[i] = a[i - (i % 8) + 7 - (i % 8)];
+        }
+        for i in 0..(W / 8) {
+            ry[i * 8+:8] = a[(W / 8 - 1 - i) * 8+:8];
+        }
+        sl = a;
+        st = rb;
+        for s in 0..tag_pkg::idx_w(W) {
+            sl = sl | (sl >> (1 << s));
+            st = st | (st >> (1 << s));
+        }
+        sl = ~sl;
+        st = ~st;
+        return case sel {
+            3'b000 : rb8,
+            3'b001 : ry,
+            3'b010 : rb,
+            3'b100 : fpu_pkg::popcount64(sl as 64) as W,
+            3'b101 : fpu_pkg::popcount64(st as 64) as W,
+            default: fpu_pkg::popcount64(a as 64) as W,
+        };
+    }
+
+    // vwsll: zero-extended a shifted left by the low log2(2*W) bits of b.
+    function vwsll::<W: u32> (
+        a: input logic<W>,
+        b: input logic<W>,
+    ) -> logic<W * 2> {
+        let sh: logic<W * 2> = {1'b0 repeat W, b} & (W * 2 - 1);
+        return {1'b0 repeat W, a} << sh;
     }
 
     // ---- Per-element widening add/sub/mul (V2d-4, OPMVV/OPMVX funct6 11xxxx) -
@@ -1093,7 +1143,9 @@ pub module vector_unit::<CFG: core_cfg> #(
     let h_is_vmvr  : logic = h_is_valu && h_funct3 == 3'b011 && h_funct6 == 6'b100111;
     // vzext/vsext (OPMVV VXUNARY0 010010): vs1[2:1] = 01, 10, 11 for vf8, vf4,
     // vf2 (vext_flog = log2 of the factor), vs1[0] sign-extends.
-    let h_is_vext  : logic    = h_is_valu && h_funct3 == 3'b010 && h_funct6 == 6'b010010;
+    let h_is_vext  : logic    = h_is_valu && h_funct3 == 3'b010 && h_funct6 == 6'b010010 && h_instr[19:18] == 2'b00;
+    // Zvbb VXUNARY0 (vs1 01xxx): vbrev8, vrev8, vbrev, vclz, vctz, vcpop.v.
+    let h_is_vbbu  : logic    = h_is_valu && h_funct3 == 3'b010 && h_funct6 == 6'b010010 && h_instr[19:18] == 2'b01;
     let vext_flog  : logic<3> = 3'd4 - {1'b0, h_instr[17:16]};
     // V5c scaling (rounding) right shift (OPIV* funct6 10101x): vssrl/vssra.
     // funct6[0] = arithmetic (vssra) vs logical (vssrl). Rounds per vxrm.
@@ -1104,10 +1156,12 @@ pub module vector_unit::<CFG: core_cfg> #(
     let h_is_vsmul : logic = h_is_valu && !h_is_opm && (h_funct6 == 6'b100111);
     // V2d-4 widening (OPMVV/OPMVX funct6 11xxxx): result EEW = 2*SEW, so the
     // destination spans 2*EMUL registers (one source group → two dest groups).
-    let h_is_widen: logic = h_is_opm && (h_funct6[5:4] == 2'b11);
+    // vwsll (OPIV* 110101) shares the widening geometry.
+    let h_is_vwsll: logic = h_is_valu && !h_is_opm && (h_funct6 == 6'b110101);
+    let h_is_widen: logic = (h_is_opm && (h_funct6[5:4] == 2'b11)) || h_is_vwsll;
     // .w forms (vwadd.w/vwsub.w, funct6 1101xx): vs2 is already 2*SEW, so it is
     // read full-width (h_vs2+va_reg) while vs1/scalar is the SEW operand.
-    let h_is_widen_w: logic = h_is_widen && (h_funct6[5:2] == 4'b1101);
+    let h_is_widen_w: logic = h_is_widen && h_is_opm && (h_funct6[5:2] == 4'b1101);
     // V2d-5 narrowing (OPIVV/VX/VI funct6 10110x = vnsrl/vnsra): source vs2 is
     // 2*SEW, so two source registers feed one SEW dest register (the inverse of
     // widening). funct6[0] = arithmetic (vnsra) vs logical (vnsrl).
@@ -1327,9 +1381,13 @@ pub module vector_unit::<CFG: core_cfg> #(
     // (vmv.v.* has vm=1 → all active → broadcast b); tail stays undisturbed.
     // The shifts and clips (funct6 100101, 101xxx) take imm5 as uimm5, which
     // matters for the 6-bit shift amount of SEW 64.
+    // vror.vi (01010x) takes a 6-bit uimm, its bit 5 in funct6[0]; valu sees it
+    // as funct6 010100 (vror).
     let vi_uimm: logic     = h_instr[31:26] == 6'b100101 || h_instr[31:29] == 3'b101;
-    let bbcast : logic<64> = if h_is_vx ? i_scalar_data : if vi_uimm ? {59'd0, h_instr[19:15]} : {h_instr[19] repeat 59,
-        h_instr[19:15]};
+    let vi_ror : logic     = h_funct3 == 3'b011 && h_funct6[5:1] == 5'b01010;
+    let bbcast : logic<64> = if h_is_vx ? i_scalar_data : if vi_ror ? {58'd0, h_instr[26], h_instr[19:15]} : if vi_uimm ? {59'd0,
+        h_instr[19:15]} : {h_instr[19] repeat 59, h_instr[19:15]};
+    let va_f6  : logic<6>  = if vi_ror ? 6'b010100 : h_funct6;
     // CP (VALU_PIPE): the multiply/compare operands read these aliases. They are
     // PARAM-gated (folds to va_vs*_q at VALU_PIPE=1, i_vs*_data at =0) so no runtime
     // mux is left on the datapath — a runtime `va_use_reg ? reg : live` mux leaves a
@@ -1381,8 +1439,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 }
                             } else if h_is_vmac {
                                 valu_res[i*8+:8] = vmac::<8>(a, b, i_vdold_data[i*8+:8], h_funct6);
+                            } else if h_is_vbbu {
+                                valu_res[i*8+:8] = vbbu::<8>(a, h_instr[17:15]);
                             } else {
-                                valu_res[i*8+:8] = if h_is_vdiv ? dv_acc[i*8+:8] : (if h_is_opm ? vmuldiv::<8>(a, b, h_funct6) : valu::<8>(a, b, h_funct6));
+                                valu_res[i*8+:8] = if h_is_vdiv ? dv_acc[i*8+:8] : (if h_is_opm ? vmuldiv::<8>(a, b, h_funct6) : valu::<8>(a, b, va_f6));
                             }
                         }
                     }
@@ -1420,8 +1480,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 }
                             } else if h_is_vmac {
                                 valu_res[i*16+:16] = vmac::<16>(a, b, i_vdold_data[i*16+:16], h_funct6);
+                            } else if h_is_vbbu {
+                                valu_res[i*16+:16] = vbbu::<16>(a, h_instr[17:15]);
                             } else {
-                                valu_res[i*16+:16] = if h_is_vdiv ? dv_acc[i*16+:16] : (if h_is_opm ? vmuldiv::<16>(a, b, h_funct6) : valu::<16>(a, b, h_funct6));
+                                valu_res[i*16+:16] = if h_is_vdiv ? dv_acc[i*16+:16] : (if h_is_opm ? vmuldiv::<16>(a, b, h_funct6) : valu::<16>(a, b, va_f6));
                             }
                         }
                     }
@@ -1459,8 +1521,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 }
                             } else if h_is_vmac {
                                 valu_res[i*32+:32] = vmac::<32>(a, b, i_vdold_data[i*32+:32], h_funct6);
+                            } else if h_is_vbbu {
+                                valu_res[i*32+:32] = vbbu::<32>(a, h_instr[17:15]);
                             } else {
-                                valu_res[i*32+:32] = if h_is_vdiv ? dv_acc[i*32+:32] : (if h_is_opm ? vmuldiv::<32>(a, b, h_funct6) : valu::<32>(a, b, h_funct6));
+                                valu_res[i*32+:32] = if h_is_vdiv ? dv_acc[i*32+:32] : (if h_is_opm ? vmuldiv::<32>(a, b, h_funct6) : valu::<32>(a, b, va_f6));
                             }
                         }
                     }
@@ -1498,8 +1562,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 }
                             } else if h_is_vmac {
                                 valu_res[i*64+:64] = vmac::<64>(a, b, i_vdold_data[i*64+:64], h_funct6);
+                            } else if h_is_vbbu {
+                                valu_res[i*64+:64] = vbbu::<64>(a, h_instr[17:15]);
                             } else {
-                                valu_res[i*64+:64] = if h_is_vdiv ? dv_acc[i*64+:64] : (if h_is_opm ? vmuldiv::<64>(a, b, h_funct6) : valu::<64>(a, b, h_funct6));
+                                valu_res[i*64+:64] = if h_is_vdiv ? dv_acc[i*64+:64] : (if h_is_opm ? vmuldiv::<64>(a, b, h_funct6) : valu::<64>(a, b, va_f6));
                             }
                         }
                     }
@@ -1607,8 +1673,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                     if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
                         let a : logic<8>  = vw_vs2_half[j*8+:8];     // SEW src (.vv/.vx)
                         let aw: logic<16> = i_vs2_data[j*16+:16];    // 2*SEW src (.w)
-                        let b : logic<8>  = if h_is_vv ? vw_vs1_half[j*8+:8] : i_scalar_data[7:0];
-                        let wp: logic<16> = vwiden::<8>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
+                        let b : logic<8>  = if h_is_vv ? vw_vs1_half[j*8+:8] : (if h_is_vx ? i_scalar_data[7:0] : {3'd0, h_instr[19:15]});
+                        let wp: logic<16> = if h_is_vwsll ? vwsll::<8>(a, b) : vwiden::<8>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
                         vw_res[j*16+:16] = if h_is_widen_w ? vwidenw::<8>(aw, b, h_funct6) : (if h_is_wmacc ? i_vdold_data[j*16+:16] + wp : wp);
                     }
                 }
@@ -1620,8 +1686,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                     if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
                         let a : logic<16> = vw_vs2_half[j*16+:16];
                         let aw: logic<32> = i_vs2_data[j*32+:32];
-                        let b : logic<16> = if h_is_vv ? vw_vs1_half[j*16+:16] : i_scalar_data[15:0];
-                        let wp: logic<32> = vwiden::<16>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
+                        let b : logic<16> = if h_is_vv ? vw_vs1_half[j*16+:16] : (if h_is_vx ? i_scalar_data[15:0] : {11'd0, h_instr[19:15]});
+                        let wp: logic<32> = if h_is_vwsll ? vwsll::<16>(a, b) : vwiden::<16>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
                         vw_res[j*32+:32] = if h_is_widen_w ? vwidenw::<16>(aw, b, h_funct6) : (if h_is_wmacc ? i_vdold_data[j*32+:32] + wp : wp);
                     }
                 }
@@ -1633,8 +1699,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                     if ((gbase + (j as 8)) <: vl8) && (h_alu_vm || msk[j]) {
                         let a : logic<32> = vw_vs2_half[j*32+:32];
                         let aw: logic<64> = i_vs2_data[j*64+:64];
-                        let b : logic<32> = if h_is_vv ? vw_vs1_half[j*32+:32] : i_scalar_data[31:0];
-                        let wp: logic<64> = vwiden::<32>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
+                        let b : logic<32> = if h_is_vv ? vw_vs1_half[j*32+:32] : (if h_is_vx ? i_scalar_data[31:0] : {27'd0, h_instr[19:15]});
+                        let wp: logic<64> = if h_is_vwsll ? vwsll::<32>(a, b) : vwiden::<32>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
                         vw_res[j*64+:64] = if h_is_widen_w ? vwidenw::<32>(aw, b, h_funct6) : (if h_is_wmacc ? i_vdold_data[j*64+:64] + wp : wp);
                     }
                 }

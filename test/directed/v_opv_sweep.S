@@ -104,7 +104,7 @@ sweep:
 
     // OPIVV
     EX  0x00, OPIVV                         // vadd.vv
-    TR  0x01, OPIVV                         // reserved
+    EX  0x01, OPIVV                         // vandn.vv
     EX  0x02, OPIVV                         // vsub.vv
     TR  0x03, OPIVV                         // reserved
     EX  0x04, OPIVV                         // vminu.vv
@@ -119,8 +119,8 @@ sweep:
     TR  0x0d, OPIVV                         // reserved
     EX  0x0e, OPIVV                         // vrgatherei16.vv
     TR  0x0f, OPIVV                         // reserved
-    TR  0x14, OPIVV                         // reserved
-    TR  0x15, OPIVV                         // reserved
+    EX  0x14, OPIVV                         // vror.vv
+    EX  0x15, OPIVV                         // vrol.vv
     TR  0x16, OPIVV                         // reserved
     EX  0x18, OPIVV                         // vmseq.vv
     EX  0x19, OPIVV                         // vmsne.vv
@@ -151,7 +151,7 @@ sweep:
     TR  0x32, OPIVV                         // reserved
     TR  0x33, OPIVV                         // reserved
     TR  0x34, OPIVV                         // reserved
-    TR  0x35, OPIVV                         // reserved
+    EX  0x35, OPIVV                         // vwsll.vv
     TR  0x36, OPIVV                         // reserved
     TR  0x37, OPIVV                         // reserved
     TR  0x38, OPIVV                         // reserved
@@ -176,7 +176,7 @@ sweep:
 
     // OPIVX
     EX  0x00, OPIVX                         // vadd.vx
-    TR  0x01, OPIVX                         // reserved
+    EX  0x01, OPIVX                         // vandn.vx
     EX  0x02, OPIVX                         // vsub.vx
     EX  0x03, OPIVX                         // vrsub.vx
     EX  0x04, OPIVX                         // vminu.vx
@@ -191,8 +191,8 @@ sweep:
     TR  0x0d, OPIVX                         // reserved
     EX  0x0e, OPIVX                         // vslideup.vx
     EX  0x0f, OPIVX                         // vslidedown.vx
-    TR  0x14, OPIVX                         // reserved
-    TR  0x15, OPIVX                         // reserved
+    EX  0x14, OPIVX                         // vror.vx
+    EX  0x15, OPIVX                         // vrol.vx
     TR  0x16, OPIVX                         // reserved
     EX  0x18, OPIVX                         // vmseq.vx
     EX  0x19, OPIVX                         // vmsne.vx
@@ -223,7 +223,7 @@ sweep:
     TR  0x32, OPIVX                         // reserved
     TR  0x33, OPIVX                         // reserved
     TR  0x34, OPIVX                         // reserved
-    TR  0x35, OPIVX                         // reserved
+    EX  0x35, OPIVX                         // vwsll.vx
     TR  0x36, OPIVX                         // reserved
     TR  0x37, OPIVX                         // reserved
     TR  0x38, OPIVX                         // reserved
@@ -265,8 +265,8 @@ sweep:
     EX  0x0f, OPIVI                         // vslidedown.vi
     TR  0x12, OPIVI                         // reserved
     TR  0x13, OPIVI                         // reserved
-    TR  0x14, OPIVI                         // reserved
-    TR  0x15, OPIVI                         // reserved
+    EX  0x14, OPIVI                         // vror.vi
+    EX  0x15, OPIVI                         // vror.vi (uimm bit 5 set)
     TR  0x16, OPIVI                         // reserved
     EX  0x18, OPIVI                         // vmseq.vi
     EX  0x19, OPIVI                         // vmsne.vi
@@ -296,7 +296,7 @@ sweep:
     TR  0x32, OPIVI                         // reserved
     TR  0x33, OPIVI                         // reserved
     TR  0x34, OPIVI                         // reserved
-    TR  0x35, OPIVI                         // reserved
+    EX  0x35, OPIVI                         // vwsll.vi
     TR  0x36, OPIVI                         // reserved
     TR  0x37, OPIVI                         // reserved
     TR  0x38, OPIVI                         // reserved
@@ -385,6 +385,14 @@ sweep:
     EX  0x12, OPMVV, vs1=6                  // vzext.vf2
     EX  0x12, OPMVV, vs1=7                  // vsext.vf2
     TR  0x12, OPMVV, vs1=0                  // VXUNARY0 vs1 = 0: reserved
+    EX  0x12, OPMVV, vs1=8                  // vbrev8.v
+    EX  0x12, OPMVV, vs1=9                  // vrev8.v
+    EX  0x12, OPMVV, vs1=10                 // vbrev.v
+    TR  0x12, OPMVV, vs1=11                 // VXUNARY0 vs1 = 11: reserved
+    EX  0x12, OPMVV, vs1=12                 // vclz.v
+    EX  0x12, OPMVV, vs1=13                 // vctz.v
+    EX  0x12, OPMVV, vs1=14                 // vcpop.v
+    TR  0x12, OPMVV, vs1=15                 // VXUNARY0 vs1 = 15: reserved
     EX  0x14, OPMVV, vs1=1                  // vmsbf.m
     EX  0x14, OPMVV, vs1=2                  // vmsof.m
     EX  0x14, OPMVV, vs1=3                  // vmsif.m
