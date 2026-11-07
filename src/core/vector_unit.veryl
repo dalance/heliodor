@@ -172,8 +172,8 @@ pub module vector_unit::<CFG: core_cfg> #(
     i_mem_rdata   : input  logic<64>   , // load dword (dcache_rdata)
     i_mem_fault   : input  logic       , // load page/access fault
     i_mem_fault_st: input  logic       , // store page/access fault
-    // vstart resume element. V1 always restarts a faulting unit-stride op from
-    // element 0 (idempotent), so this is currently informational only.
+    // vstart: the first element of a load or store (a segment op restarts
+    // at 0). vu_adapter traps every other op that would start at vstart != 0.
     i_csr_vstart  : input  logic<64>   ,
     // ---- Memory fault + vstart, carried on the vu_cdb writeback -------------
     // A faulting element rides the (lowest-priority lane-0) vu_cdb just like a
@@ -1981,6 +1981,10 @@ pub module vector_unit::<CFG: core_cfg> #(
     // transfers ceil(vl/8) bytes (EEW=8 → elems-per-register handled as bytes).
     let wr_nreg8 : logic<8> = {5'd0, h_nf} + 8'd1;        // NREG = nf+1 ∈ {1,2,4,8}
     let m_vl8    : logic<8> = if h_is_wholereg ? (wr_nreg8 * mem_epr8) : (if h_is_maskmem ? ((vl_q[7:0] + 8'd7) >> 3) : vl_q[7:0]);
+    // The first element: vstart, except that a segment op restarts at 0 (its
+    // field-outer walk leaves later fields of the segments before vstart
+    // undone when it faults). The prestart elements merge from the old vd.
+    let mem_start: logic<8> = if h_is_segment ? 8'd0 : i_csr_vstart[7:0];
     // This element completes its register (last in-register element, or last vl).
     let reg_last : logic = ((mem_local + 8'd1) >= mem_epr8) || ((velem + 8'd1) >= m_vl8);
     // Element byte address: indexed = base + vs2[velem]; strided = base +
@@ -2567,13 +2571,17 @@ pub module vector_unit::<CFG: core_cfg> #(
 
     // Whole-register loads/stores and vset* do not depend on vtype. Vector FP
     // is OPFVV/OPFVF and the FP scalar moves (VFALU also carries the integer
-    // reductions).
+    // reductions). Loads and stores resume at any vstart below their element
+    // count, vset* ignores vstart, and every other op needs vstart = 0 (the
+    // spec allows the trap, and the VU never leaves such an op part done).
+    let mem_vlmax8: logic<8> = if h_is_wholereg ? (wr_nreg8 * mem_epr8) : (if h_is_maskmem ? 8'd16 : pm_vlmax8);
     always_comb {
-        o_head.valid     = count != 0;
-        o_head.tag       = h_tag;
-        o_head.vtype_dep = !h_is_vset && !h_is_wholereg;
-        o_head.is_fp     = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || h_is_vfmv_sf || h_is_vfmv_fs;
-        o_head.insn      = h_instr;
+        o_head.valid      = count != 0;
+        o_head.tag        = h_tag;
+        o_head.vtype_dep  = !h_is_vset && !h_is_wholereg;
+        o_head.is_fp      = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || h_is_vfmv_sf || h_is_vfmv_fs;
+        o_head.vstart_max = if h_is_vset ? 8'hff : (if h_is_mem ? mem_vlmax8 - 8'd1 : 8'd0);
+        o_head.insn       = h_instr;
     }
     assign o_cdb_vset_wen = (fire && h_is_vset) || ff_trim_retire;
     assign o_cdb_vtype    = if ff_trim_retire ? vtype_q : vtype_new;
@@ -2736,7 +2744,7 @@ pub module vector_unit::<CFG: core_cfg> #(
                 2'd0: {
                     // IDLE: launch when a mem op is the ROB head with its base ready.
                     if (count != 0) && at_head && h_is_mem && scalar_ok {
-                        velem     = 8'd0;
+                        velem     = mem_start;
                         seg_field = 3'd0;
                         vacc      = {1'b0 repeat VLEN};
                         vmsk      = {1'b0 repeat VLEN};
@@ -2744,7 +2752,7 @@ pub module vector_unit::<CFG: core_cfg> #(
                         ff_trim_q = 1'b0;
                         mem_fetched_q = 1'b0; // CP (MEM_PIPE): first element starts with a FETCH
                         mem_va_ready_q = 1'b0; // CP (VINT_PIPE cut #2): first element starts with a VADDR
-                        if m_vl8 == 8'd0 {
+                        if m_vl8 <= mem_start {
                             mem_state = 2'd3; // empty op: nothing to access
                         } else {
                             mem_state = 2'd1; // ARM: drain the scalar mem path

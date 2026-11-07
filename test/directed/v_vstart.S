@@ -2,10 +2,10 @@
 //
 // Spec: every vector instruction, vset{i}vl{i} included, resets vstart to
 // 0 when it completes without a trap. Each check sets vstart to 1 first
-// (and runs only with vstart below vl, so the op has elements to do).
+// (and runs only with vstart below vl, so the op has elements to do). The
+// arithmetic ops trap at vstart 1 on this core (mi_vstart).
 // tohost: 1, or the number of the failing check:
-//   2 vadd.vv, 3 vle32.v, 4 vse32.v, 5 vsetvli, 6 vmv.x.s, 7 vfadd.vv
-//   left vstart nonzero
+//   3 vle32.v, 4 vse32.v, 5 vsetvli left vstart nonzero
 #include "common/probe.h"
 
 .macro VSTART_1
@@ -21,16 +21,12 @@
 
     .section .text
 main:
-    li      t0, MSTATUS_VS_INIT | MSTATUS_FS_INIT
+    li      t0, MSTATUS_VS_INIT
     csrs    mstatus, t0
     vsetivli zero, 4, e32, m1, ta, ma
     li      s1, SCRATCH
     vmv.v.i v2, 1
-    vmv.v.i v3, 2
 
-    VSTART_1
-    vadd.vv v1, v2, v3
-    ZERO    2
     VSTART_1
     vle32.v v1, (s1)
     ZERO    3
@@ -40,12 +36,6 @@ main:
     VSTART_1
     vsetivli zero, 4, e32, m1, ta, ma
     ZERO    5
-    VSTART_1
-    vmv.x.s t1, v2
-    ZERO    6
-    VSTART_1
-    vfadd.vv v1, v2, v3
-    ZERO    7
     REPORT  1
 
 fail:
