@@ -1155,18 +1155,12 @@ pub module vector_unit::<CFG: core_cfg> #(
     // neither issues the shared FPU nor accrues fflags. Every body element is
     // written (active → f[rs1], inactive → vs2); only the tail stays undisturbed.
     let h_is_fmerge: logic = h_is_fp && (h_funct6 == 6'b010111);
-    // V3g: vfcvt.* (funct6 010010) — same-width int<->FP conversion. The rtz
-    // variants (vs1 00110/00111, i.e. vs1[2]=1) round toward zero; the rest use
-    // fcsr.frm. int->FP variants feed the vreg element to the FPU's INT input.
+    // VFUNARY0 (funct6 010010): every conversion, run on fp_cvt (cv_* below).
+    // vs1[4:3] selects the group: 00 vfcvt (same width), 01 vfwcvt (SEW to
+    // 2*SEW, the 2*SEW dest geometry), 10 vfncvt (a 2*SEW source read at the
+    // wide geometry, the SEW dest geometry).
     let h_is_fcvt: logic = h_is_fp && (h_funct6 == 6'b010010);
-    // V3j: widening conversion vfwcvt.* (VFUNARY0 010010, vs1[4:3]==01, SEW->2*SEW).
-    // Unary; result is 64-bit (double or 2*SEW int), so it uses the 2*SEW dest
-    // geometry. vs1[2:0] selects the FCVT op (see the FpuOp map below).
     let h_is_fwcvt: logic = h_is_fp && (h_funct6 == 6'b010010) && (h_instr[19:18] == 2'b01);
-    // V4h: vfncvt.* (VFUNARY0 010010, vs1[4:3]==10): narrowing convert, 2*SEW
-    // source (double / int64) -> SEW dest (single / int32). Mirror of vfwcvt:
-    // the source is read at the 2*SEW (double) geometry while the dest is the
-    // normal same-width SEW geometry. vs1[2:0] selects the FCVT op.
     let h_is_fncvt: logic = h_is_fp && (h_funct6 == 6'b010010) && (h_instr[19:18] == 2'b10);
     // V3j-4: vfrsqrt7.v (VFUNARY1 010011, vs1=00100) / vfrec7.v (vs1=00101) — the
     // 7-bit reciprocal-square-root / reciprocal estimates. Same-width, OPFVV-only,
@@ -2113,34 +2107,60 @@ pub module vector_unit::<CFG: core_cfg> #(
     let fn_sbitoff: logic<8>    = if fp_elem[0] ? 8'd64 : 8'd0;
     let fn_src_sh : logic<VLEN> = i_vs2_data >> fn_sbitoff;
     let fncvt_src : logic<64>   = fn_src_sh[63:0];
+    // Conversions (funct6 010010: vfcvt, vfwcvt, vfncvt) run on fp_cvt, the
+    // scalar converter, not on u_vfpu. vs1[2:0] picks the conversion within
+    // each group: 00x xu.f/x.f, 01x f.xu/f.x, 100 f.f, 101 rod.f.f, 11x
+    // rtz.xu.f/rtz.x.f; vs1[0] marks the signed integer side. FP sources are
+    // NaN-boxed for fp_cvt; the source is 2*SEW wide for vfncvt.
+    let cv_sub  : logic<3>  = h_instr[17:15];
+    let cv_toint: logic     = cv_sub[2:1] == 2'b00 || cv_sub[2:1] == 2'b11;
+    let cv_fromi: logic     = cv_sub[2:1] == 2'b01;
+    let cv_rod  : logic     = h_is_fncvt && cv_sub == 3'b101;
+    let cv_raw  : logic<64> = if h_is_fncvt ? fncvt_src : fp_a_sh[63:0];
+    let cv_slog : logic<2>  = if h_is_fncvt ? vsew[1:0] + 2'd1 : vsew[1:0]; // log2 of the source bytes
+    let cv_fsrc : logic<64> = case cv_slog {
+        2'd1   : fpu_pkg::box_h(cv_raw[15:0]),
+        2'd2   : fpu_pkg::box_s(cv_raw[31:0]),
+        default: cv_raw,
+    };
+    let cv_a    : logic<64> = if cv_fromi ? cv_raw : cv_fsrc;
+    let cv_rm   : logic<3>  = if cv_sub[2:1] == 2'b11 || cv_rod ? 3'b001 : i_frm;
+    var cv_op   : fpu_pkg::FpuOp;
+    always_comb {
+        if h_is_fwcvt {
+            if cv_fromi {
+                cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_D_W : fpu_pkg::FpuOp::FCVT_D_WU;
+            } else if cv_toint {
+                cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_L_S : fpu_pkg::FpuOp::FCVT_LU_S;
+            } else {
+                cv_op = fpu_pkg::FpuOp::FCVT_D_S;
+            }
+        } else if h_is_fncvt {
+            if cv_fromi {
+                cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_S_L : fpu_pkg::FpuOp::FCVT_S_LU;
+            } else if cv_toint {
+                cv_op = if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_W_D : fpu_pkg::FpuOp::FCVT_WU_D;
+            } else {
+                cv_op = fpu_pkg::FpuOp::FCVT_S_D;
+            }
+        } else if cv_fromi {
+            cv_op = if fp_double ? (if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_D_L : fpu_pkg::FpuOp::FCVT_D_LU) : (if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_S_W : fpu_pkg::FpuOp::FCVT_S_WU);
+        } else {
+            cv_op = if fp_double ? (if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_L_D : fpu_pkg::FpuOp::FCVT_LU_D) : (if cv_sub[0] ? fpu_pkg::FpuOp::FCVT_W_S : fpu_pkg::FpuOp::FCVT_WU_S);
+        }
+    }
     // V4g-2 FP widening reduction: s1 is the double accumulator (seeded from the
     // 2*SEW vs1[0]), s2 is the s2d-widened single vs2 element. FpuOp = FADD_D.
     let fp_wred_s1: logic<64>   = if fp_elem == 8'd0 ? i_vs1_data[63:0] : red_acc;
     let red_w_s2d : logic<64>   = s2d(fw_vs2_s);
-    let fp_s1     : logic<64>   = if h_is_fncvt ? fncvt_src : (if h_is_fwred ? fp_wred_s1 : (if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a)))));
+    let fp_s1     : logic<64>   = if h_is_fcvt ? cv_a : (if h_is_fwred ? fp_wred_s1 : (if h_is_fred ? fp_red_s1 : (if h_is_fwiden ? fw_s1d : (if h_is_fma ? fma_mul_a : (if fp_swap ? fp_scalar : fp_velem_a)))));
     let fp_s2     : logic<64>   = if h_is_fwred ? red_w_s2d : (if h_is_fred ? fp_velem_a : (if h_is_fwiden ? fw_s2d : (if h_is_fma ? fma_mul_b : (if fp_swap ? fp_velem_a : fp_s2_op))));
     let fp_s3     : logic<64>   = if h_is_fwfma ? fw_vd_d : (if h_is_fma ? fma_add : 64'd0);
     // FPU op from funct6 + SEW (single-cycle for all V3a ops). vfsub = vs2-vs1
     // and vfsgnj take magnitude/sign from vs2/vs1, matching s1=vs2, s2=vs1.
     var fp_fpu_op: fpu_pkg::FpuOp;
     always_comb {
-        if h_is_fwcvt {
-            // V3j widening conversion vfwcvt.* (SEW=32 source -> 64-bit dest). vs1[2:0]
-            // = h_instr[17:15]: 100 f.f (single->double) / 011 f.x (int32->double) /
-            // 010 f.xu (uint32->double) / 001 x.f (single->int64) / 000 xu.f
-            // (single->uint64) / 111 rtz.x.f / 110 rtz.xu.f. (FP->int truncates per the
-            // shared fpu_wrap RTZ limitation; rtz.* are exact.)
-            case h_instr[17:15] {
-                3'b100  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_S;  // f.f
-                3'b011  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_W;  // f.x
-                3'b010  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_WU; // f.xu
-                3'b001  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_L_S;  // x.f
-                3'b000  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_LU_S; // xu.f
-                3'b111  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_L_S;  // rtz.x.f
-                3'b110  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_LU_S; // rtz.xu.f
-                default : fp_fpu_op = fpu_pkg::FpuOp::FCVT_D_S;
-            }
-        } else if h_is_fwiden {
+        if h_is_fwiden {
             // Widening always computes in double (operands are s2d-converted; for
             // the .w forms vs2 is taken as a raw double, vs1/scalar via s2d). The
             // 1111xx FMAs multiply the two s2d operands and accumulate the old vd.
@@ -2152,21 +2172,6 @@ pub module vector_unit::<CFG: core_cfg> #(
                 6'b111110           : fp_fpu_op = fpu_pkg::FpuOp::FMSUB_D;  // vfwmsac
                 6'b111111           : fp_fpu_op = fpu_pkg::FpuOp::FNMSUB_D; // vfwnmsac
                 default             : fp_fpu_op = fpu_pkg::FpuOp::FADD_D; // vfwadd / vfwadd.w (110000/110100)
-            }
-        } else if h_is_fncvt {
-            // V4h narrowing conversion vfncvt.* (2*SEW source -> SEW dest). vs1[2:0]
-            // = h_instr[17:15]: 000 xu.f (double->uint32) / 001 x.f (double->int32) /
-            // 010 f.xu (uint64->single) / 011 f.x (int64->single) / 100 f.f
-            // (double->single) / 101 rod.f.f (round-odd, approximated) / 110 rtz.xu.f
-            // / 111 rtz.x.f. (FP->int truncates per the shared fpu_wrap RTZ limit.)
-            case h_instr[17:15] {
-                3'b000  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_WU_D; // xu.f
-                3'b001  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_W_D;  // x.f
-                3'b010  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_LU; // f.xu
-                3'b011  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_L;  // f.x
-                3'b110  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_WU_D; // rtz.xu.f
-                3'b111  : fp_fpu_op = fpu_pkg::FpuOp::FCVT_W_D;  // rtz.x.f
-                default : fp_fpu_op = fpu_pkg::FpuOp::FCVT_S_D;  // f.f / rod.f.f
             }
         } else if h_is_fwred {
             // V4g-2 FP widening reduction: always a double add of the widened
@@ -2192,9 +2197,6 @@ pub module vector_unit::<CFG: core_cfg> #(
                 6'b100001: fp_fpu_op = fpu_pkg::FpuOp::FDIV_D; // vfrdiv.vf (operands swapped)
                 // vfsqrt.v (vs1=0) / vfclass.v (vs1=10000) share funct6 010011.
                 6'b010011: fp_fpu_op = if h_instr[19:15] == 5'b10000 ? fpu_pkg::FpuOp::FCLASS_D : fpu_pkg::FpuOp::FSQRT_D;
-                // vfcvt.*: int->FP when vs1[2:1]==01 (f.xu/f.x); else FP->int
-                // (xu.f/x.f, incl. the rtz forms 00110/00111). Signed = vs1[0].
-                6'b010010: fp_fpu_op = if h_instr[17:16] == 2'b01 ? (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_D_L : fpu_pkg::FpuOp::FCVT_D_LU) : (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_L_D : fpu_pkg::FpuOp::FCVT_LU_D);
                 6'b011000: fp_fpu_op = fpu_pkg::FpuOp::FEQ_D; // vmfeq
                 6'b011100: fp_fpu_op = fpu_pkg::FpuOp::FEQ_D; // vmfne (result inverted)
                 6'b011001: fp_fpu_op = fpu_pkg::FpuOp::FLE_D; // vmfle
@@ -2228,9 +2230,6 @@ pub module vector_unit::<CFG: core_cfg> #(
                 6'b100001: fp_fpu_op = fpu_pkg::FpuOp::FDIV_S; // vfrdiv.vf (operands swapped)
                 // vfsqrt.v (vs1=0) / vfclass.v (vs1=10000) share funct6 010011.
                 6'b010011: fp_fpu_op = if h_instr[19:15] == 5'b10000 ? fpu_pkg::FpuOp::FCLASS_S : fpu_pkg::FpuOp::FSQRT_S;
-                // vfcvt.*: int->FP when vs1[2:1]==01 (f.xu/f.x); else FP->int
-                // (xu.f/x.f, incl. the rtz forms 00110/00111). Signed = vs1[0].
-                6'b010010: fp_fpu_op = if h_instr[17:16] == 2'b01 ? (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_S_W : fpu_pkg::FpuOp::FCVT_S_WU) : (if h_instr[15] ? fpu_pkg::FpuOp::FCVT_W_S : fpu_pkg::FpuOp::FCVT_WU_S);
                 6'b011000: fp_fpu_op = fpu_pkg::FpuOp::FEQ_S; // vmfeq
                 6'b011100: fp_fpu_op = fpu_pkg::FpuOp::FEQ_S; // vmfne (result inverted)
                 6'b011001: fp_fpu_op = fpu_pkg::FpuOp::FLE_S; // vmfle
@@ -2254,7 +2253,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     // spurious fflags / busy). Arithmetic and compare issue it for active elements.
     // CP (VFP_PIPE): the resolved u_vfpu int operand (registered in the FETCH
     // phase alongside fp_s1/2/3). Live when VFP_PIPE=0.
-    let fp_int_rs1: logic<64> = if h_is_fncvt ? fncvt_src : fp_a_sh[63:0];
+    let fp_int_rs1: logic<64> = fp_a_sh[63:0];
     // u_vfpu operands: registered (FETCH-phase copy) when VFP_PIPE, else live.
     let fpu_s1     : logic<64> = if VFP_PIPE ? fp_s1_q : fp_s1;
     let fpu_s2     : logic<64> = if VFP_PIPE ? fp_s2_q : fp_s2;
@@ -2262,7 +2261,7 @@ pub module vector_unit::<CFG: core_cfg> #(
     let fpu_int_rs1: logic<64> = if VFP_PIPE ? fp_int_rs1_q : fp_int_rs1;
     // CP (VFP_PIPE): only issue to u_vfpu AFTER the FETCH phase has registered the
     // operands (fp_fetched_q). VFP_PIPE=0 -> the gate is always true (today).
-    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest && !h_is_anyired && (!VFP_PIPE || fp_fetched_q);
+    let fp_issue_v: logic = (fp_state == 2'd1) && fp_active && !h_is_fmerge && !h_is_vfest && !h_is_fcvt && !h_is_anyired && (!VFP_PIPE || fp_fetched_q);
     // VFP_EX_PIPE registers u_vfpu's fround add and FMA mantissa product. The extra
     // cycles surface as vfpu_busy, which the COMPUTE FSM already waits on before capture.
     const VFP_EX_PIPE: bit = 1;
@@ -2278,9 +2277,7 @@ pub module vector_unit::<CFG: core_cfg> #(
         rst                                  ,
         i_issue_valid     : fp_issue_v       ,
         i_fpu_op          : fp_fpu_op        ,
-        // Vector FP rounds with fcsr.frm (DYN), except vfcvt.rtz.* (vs1[2]=1)
-        // which forces round-toward-zero.
-        i_fp_rm           : if h_is_fcvt && h_instr[17] ? 3'b001 : 3'b111,
+        i_fp_rm           : 3'b111           , // vector FP rounds with fcsr.frm (DYN)
         i_fli_idx         : 5'd0             ,
         i_frm             : i_frm            ,
         i_issue_rd_pdst   : '0               ,
@@ -2327,12 +2324,25 @@ pub module vector_unit::<CFG: core_cfg> #(
     let est_ffl_d: logic<5>  = if h_is_vfrec7 ? rec_d[68:64] : rsq_d[68:64];
     let vfest_res: logic<64> = if fp_double ? est_res_d : {32'd0, est_res_s};
     let vfest_ffl: logic<5>  = if fp_double ? est_ffl_d : est_ffl_s;
+    var cv_res   : logic<64>;
+    var cv_ffl   : logic<5> ;
+    inst u_vcvt: fp_cvt (
+        i_op    : cv_op ,
+        i_a     : fpu_s1,
+        i_rm    : cv_rm ,
+        o_result: cv_res,
+        o_fflags: cv_ffl,
+    );
+    // vfncvt.rod.f.f.w rounds toward zero and sets the LSB of an inexact
+    // result (round to odd; an overflow already gives the largest finite
+    // value, whose LSB is set).
+    let cv_val   : logic<64> = if cv_rod ? {cv_res[63:1], cv_res[0] | cv_ffl[0]} : cv_res;
     // Per-element write value (SEW-wide). Arithmetic/div/sqrt use the FPU result;
     // a merge selects f[rs1] (active) or vs2[i] (inactive) — no FPU; an estimate
     // (vfrsqrt7/vfrec7) uses the ROM result. A merge writes EVERY body element
     // (fp_wr_elem=1), while arithmetic / estimates leave inactive / tail elements
     // undisturbed (fp_wr_elem = active). The value is spliced in at fp_bitoff.
-    let fp_wval    : logic<64>   = if h_is_fmerge ? (if fp_active ? fp_scalar : fp_velem_a) : (if h_is_vfest ? vfest_res : vfpu_cdb.data);
+    let fp_wval    : logic<64>   = if h_is_fmerge ? (if fp_active ? fp_scalar : fp_velem_a) : (if h_is_vfest ? vfest_res : (if h_is_fcvt ? cv_val : vfpu_cdb.data));
     let fp_wr_elem : logic       = h_is_fmerge || fp_active;
     // Destination element geometry. Widening (arith/FMA/cvt) writes 2*SEW elements,
     // two per register (one source register -> two dest registers); everything else
@@ -2882,7 +2892,7 @@ pub module vector_unit::<CFG: core_cfg> #(
                             if fp_active && !h_is_fmerge && !h_is_anyired {
                                 // vfrsqrt7/vfrec7 supply their own flags (ROM, no FPU);
                                 // integer reductions (h_is_anyired) accrue no FP flags.
-                                fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : vfpu_fflags);
+                                fp_fflags_q = fp_fflags_q | (if h_is_vfest ? vfest_ffl : (if h_is_fcvt ? cv_ffl : vfpu_fflags));
                             }
                             // A compare accumulates the running mask in fp_acc (no
                             // reset — one mask register spans the whole op); a reduction
