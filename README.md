@@ -106,14 +106,12 @@ own type-1 hypervisor. See **Verification**.
   - The debug trigger extension **Sdtrig** (`mcontrol6` and `icount`)
   - Declared limits: `mcountinhibit` (and so `scountinhibit`) reads zero, and
     the CLINT `mtime` is read-only. On the pinned ACT4 suite the Phase 15
-    core passes 3,744 of 3,749 tests in its 2-wide configuration (3,743 in the
+    core passes 3,745 of 3,749 tests in its 2-wide configuration (3,744 in the
     4-wide one, which trades the two Zkt failures below for three that come
     from its trigger count and interrupt timing). The 2-wide failures are one
     H test whose Sail 0.16 reference lacks Sscsrind, two Zkt tests whose two
-    timed runs differ by one front-end cycle, one test that writes `mtime`,
-    and one open deviation: `tdata2` keeps an all-ones NAPOT mask instead of
-    clearing its top mask bit (`mcontrol6_napot_allones`). See
-    `test/act/README.md`
+    timed runs differ by one front-end cycle, and one test that writes
+    `mtime`. See `test/act/README.md`
 - **Privilege & virtual memory**: Machine / Supervisor / User; Sv39 with a
   16-entry fully-associative TLB (ASID-tagged) and a hardware 3-level page-table
   walk (separate instruction / data MMUs, `SFENCE.VMA` + fine-grained **Svinval**).
