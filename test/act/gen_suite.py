@@ -63,7 +63,7 @@ EXCLUDED = {
 # GL-C compares with the golden model (the old core), which has no Sdtrig and
 # no Smstateen/Ssstateen, and known V and H (V = 1) deviations: those tests
 # are judged by pass/fail only.
-GOLDEN_OFF_SUITE = re.compile(r'^(v[a-z]*\d*|zv[a-z]*|exceptionsv.*|misalignv|h|sdtrig.*|sh.*|s[ms]stateen)$')
+GOLDEN_OFF_SUITE = re.compile(r'^(v[a-z]*\d*|zv[a-z]*\d*|exceptionsv.*|misalignv|h|sdtrig.*|sh.*|s[ms]stateen)$')
 GOLDEN_OFF_NAME = re.compile(r'(^|_)(H|HSm|V|VF|VS|VU|vs|vu|sv39x4)(_|$)')
 # Single tests the golden model fails (golden_off.list gives the reasons).
 GOLDEN_OFF_LIST = os.path.join(HERE, "golden_off.list")
