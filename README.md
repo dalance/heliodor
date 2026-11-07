@@ -1,12 +1,12 @@
 # Heliodor
 
 **Heliodor** is a from-scratch, out-of-order RV64 RISC-V application-processor core
-written in [Veryl](https://veryl-lang.org/). It implements most of the **RVA23**
-profile — RV64GC, the scalar extensions, the **vector (V)** extension (less the
-RVV 1.0 encodings and the Zvbb / Zvfhmin / Zvkt extensions listed under *Vector
-unit*), and the **hypervisor (H)** extension — across all privilege modes
-(M / HS / VS / VU), and boots unmodified mainline Linux: the **5.15**, **6.6 LTS**,
-and **7.1** SMP kernels (1–8 harts) through OpenSBI to SBI shutdown, plus a full
+written in [Veryl](https://veryl-lang.org/). It implements every mandatory
+extension of the **RVA23** profile (RVA23U64 and RVA23S64) — RV64GCB, the scalar
+extensions, the **vector (V)** extension with Zvbb / Zvfhmin / Zvkt, and the
+**hypervisor (H)** extension with Sha — plus five RVA23.1 options, across all
+privilege modes (M / HS / VS / VU), and boots unmodified mainline Linux: the
+**5.15**, **6.6 LTS**, and **7.1** SMP kernels (1–8 harts) through OpenSBI to SBI shutdown, plus a full
 **guest Linux** under a self-written bare-metal **type-1 hypervisor**.
 
 ## Status
@@ -67,18 +67,23 @@ own type-1 hypervisor. See **Verification**.
   issue queues; only the scalar operand of `vadd.vx` / `vset*vl` wakes from the
   integer CDB, and completion rides the lane-0 CDB at lowest priority. VLEN = 128,
   ELEN = 64; integer + single/double FP, all LMUL; `vset{i}vl{i}`, unit-stride /
-  strided / indexed / segment / fault-only-first loads and stores, masking, and
-  widening / narrowing. Not implemented: `vmv.s.x`, `vmv<nr>r.v`, the integer
-  multiply-add family (`vmacc`/`vnmsac`/`vmadd`/`vnmsub`, `vwmacc*`),
-  `vadc`/`vsbc`/`vmadc`/`vmsbc`, `vzext`/`vsext`, strided / indexed /
-  fault-only-first segment loads and stores, and the RVA23 vector extensions
-  Zvbb, Zvfhmin and Zvkt
+  strided / indexed / segment / fault-only-first loads and stores (every segment
+  form at any EMUL), masking, and widening / narrowing: the whole RVV 1.0
+  instruction set, with the register-group EMUL, alignment and overlap checks,
+  plus the RVA23 vector extensions **Zvbb** (with Zvkb), **Zvfhmin** and
+  **Zvkt**. Declared limits: vector arithmetic with `vstart` != 0 traps as an
+  illegal instruction (which RVV 1.0 permits) and misaligned vector accesses
+  trap; Zvbc and the other vector crypto extensions are not implemented
 - **ISA**: **RV64GC** base (RV64IMAFDC_Zicsr_Zifencei) — M (mul/div), A (LR/SC +
   AMO), F/D (single + double FP), C (compressed, incl. compressed FP load/store,
-  expanded in fetch by `c_expander`) — extended toward the **RVA23 application /
-  supervisor profile** (the vector gaps are listed under *Vector unit*):
-  - The **vector (V)** extension (RVV 1.0) — see *Vector unit* below
-  - Bit-manipulation **Zba/Zbb/Zbs**; data-independent-latency **Zkt**
+  expanded in fetch by `c_expander`) — extended to every mandatory extension of
+  the **RVA23 application / supervisor profile** (RVA23U64 and RVA23S64). This
+  is the ISA of the Phase 15 core (`src/core/heliodor_core.veryl`); the frozen
+  old core (`src/v14/`) predates the stateen, RVA23.1 and vector completions:
+  - The **vector (V)** extension (RVV 1.0) with Zvbb / Zvfhmin / Zvkt — see
+    *Vector unit* below
+  - Bit-manipulation **B** (Zba/Zbb/Zbs, `misa.B`); data-independent-latency
+    **Zkt**
   - Atomics: **Zacas** (compare-and-swap, incl. the 128-bit even-odd
     `amocas.q`) and **Zabha** (byte / halfword AMO)
   - **Zfa** (additional FP) and **Zfhmin** (minimal half-precision: binary16
@@ -88,6 +93,26 @@ own type-1 hypervisor. See **Verification**.
   - May-be-ops **Zimop**/**Zcmop**; hints **Zihintpause**/**Zihintntl**
   - Counters **Zicntr**/**Zihpm**; pointer masking **Supm/Ssnpm** (`PMM` in
     mseccfg/menvcfg/senvcfg)
+  - State enable **Smstateen/Ssstateen** (`mstateen0-3`, `hstateen0-3`,
+    `sstateen0-3`; SE0, ENVCFG, CSRIND and SRMCFG are implemented, the other
+    bits read zero)
+  - RVA23.1 options: **Svrsw60t59b** (PTE bits 60:59 for software),
+    **Ssqosid** (`srmcfg`, 12-bit RCID and MCID), **Smcsrind/Sscsrind**
+    (indirect CSR access; `siselect` reaches the counters delegated by
+    Smcdeleg, `miselect` selects nothing),
+    **Smcdeleg/Ssccfg** (counter delegation, `scountinhibit`) and
+    **Ssdbltrp** (S/VS double-trap detection)
+  - The debug trigger extension **Sdtrig** (`mcontrol6` and `icount`)
+  - Declared limits: `mcountinhibit` (and so `scountinhibit`) reads zero, and
+    the CLINT `mtime` is read-only. On the pinned ACT4 suite the Phase 15
+    core passes 3,744 of 3,749 tests in its 2-wide configuration (3,743 in the
+    4-wide one, which trades the two Zkt failures below for three that come
+    from its trigger count and interrupt timing). The 2-wide failures are one
+    H test whose Sail 0.16 reference lacks Sscsrind, two Zkt tests whose two
+    timed runs differ by one front-end cycle, one test that writes `mtime`,
+    and one open deviation: `tdata2` keeps an all-ones NAPOT mask instead of
+    clearing its top mask bit (`mcontrol6_napot_allones`). See
+    `test/act/README.md`
 - **Privilege & virtual memory**: Machine / Supervisor / User; Sv39 with a
   16-entry fully-associative TLB (ASID-tagged) and a hardware 3-level page-table
   walk (separate instruction / data MMUs, `SFENCE.VMA` + fine-grained **Svinval**).
@@ -95,8 +120,9 @@ own type-1 hypervisor. See **Verification**.
   load / store / fetch / AMO and on page-table-walk reads, plus PMA-hole faults.
   Sv39 honors **Svnapot** (64 KB NAPOT), **Svpbmt** (page-based memory types),
   and both **Svade** (A/D page-fault) and **Svadu** (hardware A/D update via
-  `menvcfg.ADUE`). Supervisor extensions: **Sstc** (`stimecmp`) and **Sscofpmf**
-  (HPM count-overflow interrupt + mode-based filtering)
+  `menvcfg.ADUE`, and under H via `henvcfg.ADUE` for the VS-stage). Supervisor
+  extensions: **Sstc** (`stimecmp`) and **Sscofpmf** (HPM count-overflow
+  interrupt + mode-based filtering)
 - **Hypervisor (H) extension** (`src/mmu/`, `src/core/csr.veryl`): the
   virtualized **HS / VS / VU** modes and the `V` state bit on top of M/S/U. Full
   HS/VS CSR set; **two-stage translation** — a guest VS-stage Sv39 walk nested
@@ -106,7 +132,11 @@ own type-1 hypervisor. See **Verification**.
   `htval`/`htinst` (HS) and `mtval2`/`mtinst` (M); virtual-interrupt delivery
   (`hvip` into VS, plus non-delegated VS interrupts taken by HS); `htimedelta`
   and **Sstc-in-VS** (`vstimecmp`) guest timers; `hstatus.VTVM`/`VTSR` guest-op
-  interception and VS-mode CSR isolation; `HFENCE.VVMA`/`GVMA`
+  interception and VS-mode CSR isolation; `HFENCE.VVMA`/`GVMA`; **Sha**
+  (Shcounterenw, Shvstvala, Shtvala, Shvstvecd, Shvsatpa, Shgatpa and
+  `hstateen0-3`). Declared limits: GEILEN = 0 (no guest external interrupt
+  files), and `htinst`/`mtinst` are zero except for a guest-page fault of a
+  VS-stage walk's implicit access
 - **Caches** (`src/cache/`)
   - L1 I-cache: 32 KB, 4-way, 64 B line, tree-PLRU, non-blocking
     (hit-under-fill, streaming), single-cycle assembly of instructions
