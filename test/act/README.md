@@ -107,6 +107,36 @@ Sail 0.16 `sail.json`) with heliodor's deviations.
 The harness is `arch_soc_harness` (the new-core arm of
 `test_arch_common_harness`): the SoC with `MAP_ARCH`, 4 MiB DRAM.
 
+## Status at pin 8b9ddedc (MI step 4c, 2026-11-07)
+
+MI step 4c implemented the strided, indexed and fault-only-first segment
+loads and stores and EMUL > 1 for every segment form, made segment accesses
+resume at vstart (segments are walked element-outer, field-inner, so the
+vstart of a fault means every field of the earlier segments is done), and
+added the register-group checks of Sail (`vu_grp_chk`: group alignment, the
+EMUL range, the widening, narrowing and disjoint-group overlaps, v0 under a
+mask, NFIELDS*EMUL <= 8 and vd + NFIELDS*EMUL <= 32). The selection is
+unchanged (3,749 run). GA: **W2 3,738/3,749, W4 3,737/3,749**; GL-C:
+**720/720** on both. Every test that passed at step 4b still passes; the
+853 new passes are the same on both cores:
+
+| suite | W2 / W4 pass | was | what changed |
+|---|---|---|---|
+| Vls8/16/32/64 | 1,240/1,240 | 390 | the 850 segment tests: strided, indexed, fault-only-first and EMUL > 1 |
+| ExceptionsVls | 1/1 | 0 | `cp_vstart` of the segment forms: a segment access resumes at vstart |
+| MisalignV | 2/2 | 0 | indexed segment |
+
+ExceptionsVls runs every vector load and store form up to LMUL 8 element by
+element and takes 3.29M cycles on W2 and 3.24M on W4, over the 2M default:
+`gen_suite.py` gives it `budget=5000000` (`TEST_OPTS`). No vector test fails
+any more. The 11 remaining W2 failures and 12 remaining W4 failures are
+those of step 3: H `vucsr_00` (Sail 0.16 has no Sscsrind), the VS timer
+interrupts `trigger_vsti_sstc` ×4 and Sstc `vstip` ×2, SdtrigSm
+`mcontrol6_napot_allones`, Sm `mcsr_cntr` (CLINT mtime), and on W2 the Zkt
+1-cycle noise ×2, on W4 `tselect_trigs` ×2 and InterruptsS `wfi_VS`. The
+directed probes of this step are `mi_vseg` and `mi_vemul` in
+`test/gates/mi_probe.list`.
+
 ## Status at pin 8b9ddedc (MI step 4b, 2026-11-07)
 
 MI step 4b implemented Zvbb (with Zvkb) and declared Zvbb, Zvkb and Zvkt.
