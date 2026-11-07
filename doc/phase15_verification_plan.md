@@ -569,6 +569,8 @@ M3 で `CorePerf` に足したもの (手順ごと。`fire_check.py` は struct 
 
 【M5 の末で記録】(2026-11-06、`62ea1364`) M5 の機構の行: VU の 15 行 (M5 の手順 1 で足した `vu.*`、`vum.*`、`arb.vu_win`/`vu_blk`、`disp.cut_vq`、`cm.rf_vec`) と H の 14 行。H の事象のために `CorePerf` に `tr` (`TrapPerf`、`trap_unit` が出す組合せの事象: `vs`、`virt_hs`、`irq_vss`、`irq_vst`、`irq_vse`、`irq_vhs`)、`mp.hlv`、`cm.dm_virt` を足した (W4 の `CorePerf` は 309 bit で `PERF_W` = 512 に収まる)。列に `hv` (GH の hvlinux のログ) を足した。hvip で注入した VS の外部割込みと timer 割込みは既存のテストでは発火しなかった (hvlinux の guest timer は vstimecmp) ので、directed `hprobe/h_hvip` を G0 に足した。ログは G0 (1032 passed) と `test_w2_hvlinux`、`test_w4_hvlinux` で、0 より大きいことを確かめた数 (W2 と W4 の合計): `vu.exec_wait` 23,174、`vu.start` 3,410、`vu.hf_wait` 83、`vu.done` 3,410、`vum.req` 11,188、`vum.wait_ord` 6,013、`vum.miss` 16、`vum.xpark` 14、`vum.fault` 32、`vum.push` 6,406、`vum.port_req` 97,725、`arb.vu_win` 11,188、`arb.vu_blk` 14、`disp.cut_vq` 25,282、`cm.rf_vec` 576 (以上 default)、`ptw_d.two` 9,168、`ptw_i.two` 759、`ptw_d.g_rd` 32,708、`ptw_i.g_rd` 2,482 (default と hv)、`ptw_d.gfault` 72、`ptw_i.gfault` 2、`mp.hlv` 61、`tr.vs` 10、`tr.virt_hs` 7,480、`tr.irq_vst` 67 (default と hv)、`tr.irq_vss` 2 (`h/hvirq`)、`tr.irq_vse` 2 (`hprobe/h_hvip`)、`tr.irq_vhs` 2 (`h/hvsirq`)、`cm.dm_virt` 12 (`dbgh/dm_h`)。29 行はすべて pass。このログの組で 0 だった行は `dc.nf_busy` (default:w2,act:w2) と `ptw_i.stale` (default,act,boot) の 2 本で、どちらも act か boot のログを要する M5 より前の行である (今回は act と boot を走らせていない)。
 
+【MI の末で記録】(2026-11-08、`95b46137`) MI の機構の行 9 本: `tr.dbl` (`TrapPerf`、Ssdbltrp の double trap を M に向けた)、`rob.sys_exc` (`RobPerf`、SYS port の例外の報告。WRS.NTO の TW/VTW の trap)、`ptw_d.vs_ad`/`ptw_d.vsw` (`PtwPerf`、VS-stage の PTE への A/D の書き込みの受理と、その書き込みのために G-stage の walk を store としてやり直した回数)、`vu.ill_grp`/`vu.ill_vst` (`VuPerf`、`vu_grp_chk` が拒んだ head と vstart が `vstart_max` を超えた head)、`vseg.ld_wr`/`vseg.st`/`vseg.skip` (新しい `VsegPerf`、`vector_unit` の `o_perf`: segment の field の load の書き込み、field の store の完了、mask で外れた segment の skip)。W4 の `CorePerf` は 320 bit。stateen、Ssqosid、Smcsrind/Sscsrind、Smcdeleg/Ssccfg、Svrsw60t59b は CSR と decode の規則だけで、発火を数える機構を持たない (directed と ACT が受け持つ)。ログは G0 (1064 passed、`95b46137` の内容)、GA の W2/W4 の json (act)、W2/W4 の hvlinux (hv)、W2 の GL-B (bootls)、W2 の 5.15/6.6/7.1/7.1v の pass/fail (boot)、W2 の N=2 boot と G0 (smp)、G0 と GD4 の W2/W4 (dbg) で、新しい 9 行はすべて 0 より大きい (W2 と W4 の合計): `tr.dbl` 4 (`mi_dbltrp`)、`rob.sys_exc` 16 (act の Zawrs)、`ptw_d.vs_ad` 4、`ptw_d.vsw` 4 (`mi_vs_adue`)、`vu.ill_grp` 42 (`mi_vemul` など)、`vu.ill_vst` 14 (`mi_vstart` など)、`vseg.ld_wr` 1,283,962、`vseg.st` 603,660、`vseg.skip` 39,258 (default と act)。matrix の全行では `dc.nf_busy` (default:w2,act:w2) だけが 0 で、`fire_check.py` は exit 1 になる。この行は M5 の末の記録で「act のログが無い」としていたものだが、MI の ACT (`8b9ddedc`) の W2/W4 のログに加え、boot、bootls、hv、smp、dbg のどのログでも 0 だった (M2 の旧 pin の act 114 本では発火していた)。MI は dcache に触れていないので MI の機構の行ではない。UNC_READ、STORE_WT、CMO が nf slot の使用中に head port に来る状況を作る directed を足すか、構造的に起こりえないなら行と event を消すかを M6 の前に決める (設計書の MI の進捗)。`gdb` の 20 行は GG の simulator のログで別に確かめた (§9.8)。
+
 ---
 
 ## 6. シミュレーション速度計画
@@ -614,6 +616,9 @@ N4 の値は `.build/test_timings` のもので、CLAUDE.md にあった 4408 s 
 | M3 (末) | W2 / W4 | 5.15 N=1 boot、Verilator 5.050 `-O3` | 14.5M / 11.8M | | 22.6k / 8.1k | | 087a7d1 | |
 | MD (`2b34717c`) | W2 | 5.15 N=1 boot (GL-B lockstep、同期ビルド、1 コア固定、master と対) | 14,570,718 | 4,664 s (sim) | 3.1k (master `9016b4c3` は 2,338 s、6.2k) | 0 / 0 (MD も master も) | 2b34717c | |
 | M5 (`2924c8ac`) | W2 | 5.15 N=1 boot (GL-B lockstep、同期ビルド、1 コア固定、MD の完了 `950e991f` と対、コアを入れ替えて 2 回) | 14,570,718 | 373.8 s / 390.7 s (sim) | 39.0k / 37.3k (`950e991f` は 358.4 s / 379.6 s、40.7k / 38.4k) | 0 / 0 (M5 も `950e991f` も) | 2924c8ac | 96d8af7e |
+| MI (`95b46137`) | W2 | 5.15 N=1 boot (GL-B lockstep、同期ビルド、1 コア固定、M5 の完了 `ba4282e9` と対、コアを入れ替えて 2 回) | 14,570,718 | 712.0 s / 945.9 s (sim) | 20.5k / 15.4k (`ba4282e9` は 683.2 s / 900.7 s、21.3k / 16.2k) | 0 / 0 (MI も `ba4282e9` も) | 95b46137 | 96d8af7e |
+
+MI の行の補足: M5 と同じ方法で、M5 の完了の木 (`ba4282e9`、`git archive` で一時的な木に取り、生成物の hex は MI の木と共有) と MI の木を同じ veryl `96d8af7e` で同時に、それぞれ別の 1 コア (14、15) に `taskset` で固定して走らせ、コアを入れ替えてもう 1 回走らせた (`VERYL_AOT_C_ASYNC=0`、`--format json` の `sim_s`)。sim 時間は MI が `ba4282e9` より 4.2 % と 5.0 % 長い (平均で約 +4.6 %)。同じ組で `--format json` なしに先に走らせた 2 回の user 時間 (cc のビルドが cache にある 2 回目) は 411.3 s 対 402.2 s (+2.3 %)。cycles、record 10,417,776、hash `74d4b7982390260f` は両方の木で同一で、遅くなったのは MI で足した VU の segment と EMUL の検査、CSR の追加の評価量である。whole-comb の decline は 0、Clock と Reset の event はすべて AOT-C で、未 AOT の event は tb の initial block の 5 個 (両方の木で同じ)。box の load average は 13-35 (GV の Verilator と GG、GA と並行) で、M5 の行より絶対値が約 2 倍遅いのはこの負荷による。速度は極端に悪化していないので最適化はしない。
 
 M5 の行の補足: MD の行の数値は古い veryl (`c66bf8ab` の前) のもので、そのまま比べると M5 が約 12 倍速く見えるが、差のほとんどは veryl の変更による。公平に比べるため、MD の完了の木 (`950e991f`) を一時的な worktree に取り、同じ veryl `96d8af7e` で M5 と同時に、それぞれ別の 1 コアに `taskset` で固定して走らせ、コアを入れ替えてもう 1 回走らせた。sim 時間は M5 が `950e991f` より 4.3 % と 2.9 % 長い (平均で約 +3.6 %)。user 時間でも 569.9 s 対 514.9 s、395.8 s 対 382.6 s で同じ向きである (1 回目は cc のビルドを含む)。cycles、record 10,417,776、hash `74d4b7982390260f` は両方の木で同一で、遅くなったのは M5 で足した VU、H の二段翻訳と perf の配線の評価量である。`VERYL_AOT_C_DIAG=1 VERYL_AOT_C_EVENT_DIAG=1` で whole-comb の decline は 0、Clock と Reset の event はすべて AOT-C で、未 AOT の event は tb の initial block の `$display` などだけ (両方の木で同じ 5 個)。box の load average は 23-25 で、16 コアすべてが他の作業で埋まっていた。
 
@@ -954,6 +959,32 @@ M5 の H/V (手順 1-3) の後に、§1.2 の M5 列のうち GX、GV、GD4、GG
 - GL-C: golden が走れないテスト (V、H と Sh*、Sdtrig、H/V を含む Sm/S/U/Exceptions/Interrupts/Sv* のテスト) は `lockstep=0`。残る 1,004 本は golden の final を `run_golden.py test/gates/mi_act.list` で作ってから GL-C に入れる。final が無い間は `--pass-fail` で GA だけを判定する。
 - W4 は Sdtrig の trigger が 4 個で、ELF は W2 の 2 個で作るので、SdtrigS/SdtrigSm の `tselect_trigs` は W4 で fail する (構成の差)。
 - MI の directed: `test/gates/mi_probe.list` (`tb/test_w{2,4}_miprobe.veryl`、G0 で走る)。
+
+### 9.8 MI の出口のゲート (`d8c327ac`、2026-11-08)
+
+MI の手順 1-4c の後に、設計書の MI の出口条件の表のうち手順の中で回していないゲートを、最終の RTL (`95b46137`。その後の 2 コミットは README だけ) で W2 と W4 について回した。比較の基準は §9.6 (M5 の出口) と設計書の MI の進捗の各手順の記録である。Verilator は 5.050 (N=1、N=2、hvlinux、dm の N=1 は `-O3 -j 4`、4 hart は `-O1 -j 2`)、veryl は `96d8af7e`。box の load average は 8-48 で、Verilator の 3-4 本、GG の 2 target、GA、native の boot を並行させた。
+
+| ゲート | MI (`95b46137`) | 基準 | 判定 |
+|---|---|---|---|
+| G0 | 1,064 passed、0 failed、85 ignored | 手順 4c の 1,064 | 一致 (`mi_csr_warl` は vsie の修正に合わせて直した) |
+| GA / GL-C | W2 3,744/3,749、W4 3,743/3,749、hash 720/720 | 手順 4c: 3,738 / 3,737、720/720 | +6 (VS の timer の 6 本)。残りは理由付き (`test/act/README.md`) |
+| GL-B | W2 14,570,718、W4 12,262,946。record 10,417,776、hash `74d4b7982390260f` | M5 と同一 | ビット一致 |
+| GH | W2 18,611,543、W4 16,187,826 | W2 は手順 2 以来同一。W4 は M5 の 16,172,701 (手順 2 の firmware の変更の後は初めて) | pass |
+| GB1 | W2: 5.15 14,617,653、6.6 21,394,340、7.1 19,240,001、7.1v 20,710,928。W4: 7.1 16,694,742、7.1v 17,827,384 | W2 は MD と手順 4c と同一。W4 の 7.1 は MD の 16,757,476 (手順 2 の firmware の作り直しの前) | pass |
+| GB2 (native) | W2 19,380,793、W4 16,811,410 | MD/M5 と同一 | 一致 |
+| GT4 (native) | W2 5,029,779、W4 5,028,524 | MD/M5: 5,029,779 / 5,028,524 | 一致 |
+| GD / GD4 | GD は G0 の中で W2/W4 の 16 本ずつ pass。GD4 は W2/W4 の 5 本ずつ pass | M5: 10/10 | 一致 |
+| GX | 既定ログの W2/W4 の同名 381 対のうち 359 対が一致 | M5: 364 対のうち 342 対 | 差 22 対は M5 と同じ (下) |
+| GV (W2、Verilator) | hvlinux 18,611,543、N=1 14,617,653、N=2 19,380,793、litmus N=4 5,029,779、N=4 24,989,451 (instret 14,805,212、hart ごとの chk 0、wall 3 時間 39 分) がすべて PASSED | native の GH/GB1/GB2/GT4 と手順 4c の GB4 | 一致 |
+| GV (W4、Verilator) | hvlinux 16,187,826、N=1 12,286,458、N=2 16,811,410、litmus N=4 5,028,524、N=4 22,640,641 (instret 14,730,876、hart ごとの chk 0、wall 6 時間 43 分) がすべて PASSED | native の GH/GB2 と M5 の GV | 一致 |
+| GG | w2_n1 pass 52 (下)、w4_n1 pass 49、w2_n4 pass 6、w2_n4_smp pass 5。`gg_compare.py` の FAIL は 4 target とも 0 | M5: 52 / 49 / 6 / 5 | 一致 |
+| GF | MI の 9 行がすべて 0 より大。matrix 全体で 0 は `dc.nf_busy` の 1 行 | M5: 29 行 | §5.2 の【MI の末で記録】 |
+| GS | §6.2 の MI の行 | M5 の完了 `ba4282e9` と同じ veryl で対 | 記録 (sim が約 4.6 % 遅い、fallback 0) |
+| V14 | dhrystone 235,804 (instret 264,834)、coremark 394,546 (374,357) | M5 と同一 | ビット一致 |
+
+- GX の差 22 対: M5 の 22 対 (§9.6) と同じもの (`probe_b13_csrrd`、`probe_b05_sc`、SMP の 5 対、`dbg_*` の 13 対、`dbgh_dm_h`、`h_hvtmr`)。MI の directed `mi_probe` の 16 対 (`mi_csr_warl`、`mi_vshift_vi`、`mi_vperm_frac`、`mi_vs_adue`、`mi_svrsw`、`mi_dbltrp`、`mi_csrind`、`mi_vls_rs2`、`mi_vstart`、`mi_vcvt`、`mi_vcvt16`、`mi_zvfhmin`、`mi_vint`、`mi_zvbb`、`mi_vseg`、`mi_vemul`) は W2 と W4 で record 数と hash が一致した。
+- GG の w2_n1: 全 74 本を 3 並列で走らせた run (壁時間 4 時間 16 分、DownloadTest は `timeout_sec` 600 で 4 時間 5 分) では pass 50、not_applicable 22 (PrivRw は M5 で除外表に移したので not_applicable)、MemorySampleSingle と MemorySampleMixed が exception (「No samples collected」) だった。この 2 本は 5 秒の壁時間の間に OpenOCD が集めた sample を数える test で、box の load average が 25-48 の間は simulator が約 7.7k cy/s (MD の時点の約 1/3) に落ち、hart が sample の窓の中でほとんど進まなかった。負荷の下がった時点で 1 本ずつ走らせ直すと Mixed は 84 秒、Single は 83 秒で pass した (Single は load average 13 の間に 3 回 exception で、8 の時に pass)。test の前提 (壁時間) による結果で、RTL の差ではない (simulator の run は `fail=0` と checker 0)。w4_n1 は 3 並列で 1 時間 35 分、pass 49、not_applicable 25 (除外 15)。w2_n4 は MD と同じ 7 本で pass 6、除外 1 (2 並列、1 時間 18 分)。w2_n4_smp は 5 本で pass 5 (2 並列、1 時間 39 分)。simulator の run はすべて `fail=0` と checker 0 で終わった。結果の一覧は `test/debug/gg_w2_n1.txt`、`gg_w4_n1.txt`、`gg_w2_n4.txt`、`gg_w2_n4_smp.txt` を更新した。
+- GB4 (W4) は M4 の決定のとおり M6 で走らせる。GM (乱数遅延) は MI の出口条件に無いので回していない。
 
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
