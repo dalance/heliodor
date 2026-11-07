@@ -691,12 +691,12 @@ sweep:
     EXM LOAD, 0, 0, 2, 1, 16, 6             // vlse32.v
     EXM LOAD, 0, 0, 1, 1, 16, 6             // vluxei32.v
     EXM LOAD, 0, 0, 3, 1, 16, 6             // vloxei32.v
-    NIM LOAD, 1, 0, 2, 1, 16, 6             // vlsseg2e32.v
-    NIM LOAD, 1, 0, 1, 1, 16, 6             // vluxseg2ei32.v
-    NIM LOAD, 1, 0, 3, 1, 16, 6             // vloxseg2ei32.v
-    NIM LOAD, 7, 0, 2, 1, 16, 6             // vlsseg8e32.v
-    NIM LOAD, 7, 0, 1, 1, 16, 6             // vluxseg8ei32.v
-    NIM LOAD, 7, 0, 3, 1, 16, 6             // vloxseg8ei32.v
+    EXM LOAD, 1, 0, 2, 1, 16, 6             // vlsseg2e32.v
+    EXM LOAD, 1, 0, 1, 1, 16, 6             // vluxseg2ei32.v
+    EXM LOAD, 1, 0, 3, 1, 16, 6             // vloxseg2ei32.v
+    EXM LOAD, 7, 0, 2, 1, 16, 6             // vlsseg8e32.v
+    EXM LOAD, 7, 0, 1, 1, 16, 6             // vluxseg8ei32.v
+    EXM LOAD, 7, 0, 3, 1, 16, 6             // vloxseg8ei32.v
     EXM LOAD, 0, 0, 0, 1, 11, 0             // vlm.v
     TRM LOAD, 0, 0, 0, 1, 11, 6             // vlm.v with EEW 32: reserved
     TRM LOAD, 1, 0, 0, 1, 11, 0             // vlm.v with nf = 1: reserved
@@ -707,8 +707,8 @@ sweep:
     EXM LOAD, 7, 0, 0, 1, 8, 6              // vl8re32.v
     TRM LOAD, 0, 0, 0, 0, 8, 6              // vl1re32.v with vm = 0: reserved
     EXM LOAD, 0, 0, 0, 1, 16, 6             // vle32ff.v
-    NIM LOAD, 1, 0, 0, 1, 16, 6             // vlseg2e32ff.v
-    NIM LOAD, 7, 0, 0, 1, 16, 6             // vlseg8e32ff.v
+    EXM LOAD, 1, 0, 0, 1, 16, 6             // vlseg2e32ff.v
+    EXM LOAD, 7, 0, 0, 1, 16, 6             // vlseg8e32ff.v
     TRM LOAD, 2, 0, 0, 1, 8, 6              // vl3r: reserved
     TRM LOAD, 4, 0, 0, 1, 8, 6              // vl5r: reserved
     TRM LOAD, 5, 0, 0, 1, 8, 6              // vl6r: reserved
@@ -726,12 +726,12 @@ sweep:
     EXM STORE, 0, 0, 2, 1, 16, 6            // vsse32.v
     EXM STORE, 0, 0, 1, 1, 16, 6            // vsuxei32.v
     EXM STORE, 0, 0, 3, 1, 16, 6            // vsoxei32.v
-    NIM STORE, 1, 0, 2, 1, 16, 6            // vssseg2e32.v
-    NIM STORE, 1, 0, 1, 1, 16, 6            // vsuxseg2ei32.v
-    NIM STORE, 1, 0, 3, 1, 16, 6            // vsoxseg2ei32.v
-    NIM STORE, 7, 0, 2, 1, 16, 6            // vssseg8e32.v
-    NIM STORE, 7, 0, 1, 1, 16, 6            // vsuxseg8ei32.v
-    NIM STORE, 7, 0, 3, 1, 16, 6            // vsoxseg8ei32.v
+    EXM STORE, 1, 0, 2, 1, 16, 6            // vssseg2e32.v
+    EXM STORE, 1, 0, 1, 1, 16, 6            // vsuxseg2ei32.v
+    EXM STORE, 1, 0, 3, 1, 16, 6            // vsoxseg2ei32.v
+    EXM STORE, 7, 0, 2, 1, 16, 6            // vssseg8e32.v
+    EXM STORE, 7, 0, 1, 1, 16, 6            // vsuxseg8ei32.v
+    EXM STORE, 7, 0, 3, 1, 16, 6            // vsoxseg8ei32.v
     EXM STORE, 0, 0, 0, 1, 11, 0            // vsm.v
     TRM STORE, 0, 0, 0, 1, 11, 6            // vsm.v with EEW 32: reserved
     TRM STORE, 1, 0, 0, 1, 11, 0            // vsm.v with nf = 1: reserved

@@ -1,0 +1,305 @@
+// vu_grp_chk: the register-group rules of a vector instruction under a
+// vtype, combinational
+//
+// Ports (timing contract):
+//   i_insn  : the instruction at the VU head (a decode-legal vector op)
+//   i_vtype : the committed vtype; its vill is checked elsewhere, and the
+//             result for a vtype-dependent op under vill is meaningless
+//   o_ok    : 0 when RVV 1.0 reserves the encoding for these register
+//             numbers under i_vtype
+// Owns:
+//   - the rules are those Sail applies before executing each instruction
+//     (vext_*_insts.sail, zvbb_insts.sail): a register group aligned to its
+//     EMUL; EMUL above 8 or below 1/8 on the 2*SEW side of a widening or
+//     narrowing op, on the source of vzext/vsext and on load/store data and
+//     indices; the widening (overlap only in the highest part, from a source
+//     EMUL of at least 1) and narrowing (only in the lowest part) overlaps;
+//     the disjoint groups of vrgather, vslideup, vslide1up, vcompress,
+//     viota, vmsbf/vmsif/vmsof and the vwmacc family; sources of different
+//     EEW that overlap; v0 as the destination of a masked op whose result is
+//     not a mask or as a source of other than EEW 1 of a masked op;
+//     NFIELDS*EMUL > 8 and vd + NFIELDS*EMUL > 32 for loads and stores; a
+//     whole-register vd not a multiple of NREG
+//   - rules that need no vtype and that decode already checks (vmv<nr>r.v,
+//     vadc with vm = 1, the reserved operand fields) are not repeated
+// Rationale:
+//   - vrgatherei16 has no EMUL range check on its index group: Sail has none
+//     (its index EMUL is 16 at SEW 8, LMUL 8); a widening reduction has no
+//     EMUL check either (its 2*SEW operands are single registers)
+//   - a log2 EMUL is carried biased by 8 (5 bits), so EMUL 1 is 8
+pub module vu_grp_chk (
+    i_insn : input  logic<32>,
+    i_vtype: input  logic<64>,
+    o_ok   : output logic    ,
+) {
+    // Registers in a group of biased log2 EMUL pb (a fractional EMUL is one).
+    function gsz (
+        pb: input logic<5>,
+    ) -> logic<8> {
+        let up: logic<5> = pb - 5'd8;
+        return if pb >: 5'd8 ? 8'd1 << up : 8'd1;
+    }
+
+    function inrng (
+        pb: input logic<5>,
+    ) -> logic {
+        return pb >= 5'd5 && pb <= 5'd11;
+    }
+
+    function al (
+        r : input logic<5>,
+        pb: input logic<5>,
+    ) -> logic {
+        return ({3'd0, r} & (gsz(pb) - 8'd1)) == 8'd0;
+    }
+
+    // Sail valid_reg_overlap: source rs (EMUL ps) against destination rd.
+    function wn (
+        rs: input logic<5>,
+        rd: input logic<5>,
+        ps: input logic<5>,
+        pd: input logic<5>,
+    ) -> logic {
+        let s : logic<8> = {3'd0, rs};
+        let d : logic<8> = {3'd0, rd};
+        let se: logic<8> = s + gsz(ps);
+        let de: logic<8> = d + gsz(pd);
+        let wd: logic    = se <= d || s >= de || (se == de && ps >= 5'd8);
+        let nr: logic    = d <= s || d >= se;
+        return al(rs, ps) && al(rd, pd) && (if ps <: pd ? wd : (if ps >: pd ? nr : 1'b1));
+    }
+
+    // Disjoint groups; rd spans nf groups of its EMUL.
+    function dj (
+        rs: input logic<5>,
+        rd: input logic<5>,
+        ps: input logic<5>,
+        pd: input logic<5>,
+        nf: input logic<4>,
+    ) -> logic {
+        let s: logic<8> = {3'd0, rs};
+        let d: logic<8> = {3'd0, rd};
+        return al(rs, ps) && al(rd, pd) && (s + gsz(ps) <= d || d + gsz(pd) * {4'd0, nf} <= s);
+    }
+
+    let opc  : logic<7> = i_insn[6:0];
+    let f3   : logic<3> = i_insn[14:12];
+    let f6   : logic<6> = i_insn[31:26];
+    let m    : logic    = !i_insn[25];
+    let vs2  : logic<5> = i_insn[24:20];
+    let vs1  : logic<5> = i_insn[19:15];
+    let vd   : logic<5> = i_insn[11:7];
+    let lmul : logic<3> = i_vtype[2:0];
+    let sew  : logic<2> = i_vtype[4:3];
+    let lb   : logic<5> = if lmul[2] ? {2'd0, lmul} : 5'd8 + {3'd0, lmul[1:0]};
+    let wb   : logic<5> = lb + 5'd1;
+    let ivv  : logic    = f3 == 3'b000;
+    let fvv  : logic    = f3 == 3'b001;
+    let mvv  : logic    = f3 == 3'b010;
+    let ivi  : logic    = f3 == 3'b011;
+    let fvf  : logic    = f3 == 3'b101;
+    let mvx  : logic    = f3 == 3'b110;
+    let iv   : logic    = ivv || ivi || f3 == 3'b100;
+    let fv   : logic    = fvv || fvf;
+    let mv   : logic    = mvv || mvx;
+    let opv  : logic    = opc == riscv_pkg::Opcode::OP_V && f3 != 3'b111;
+    let flog : logic<5> = 5'd4 - {3'd0, vs1[2:1]};
+
+    // What the op names: a_* groups to align (and, against vd, to check for
+    // the widening/narrowing overlap), z_* registers that must not be v0
+    // when masked, eq_* groups that must differ from vd, dj_* groups that
+    // must be disjoint (s12: vs1 and vs2).
+    var a_vd  : logic   ;
+    var a_s1  : logic   ;
+    var a_s2  : logic   ;
+    var z_vd  : logic   ;
+    var z_s1  : logic   ;
+    var z_s2  : logic   ;
+    var eq_s1 : logic   ;
+    var eq_s2 : logic   ;
+    var dj_s1 : logic   ;
+    var dj_s2 : logic   ;
+    var dj_s12: logic   ;
+    var rng1  : logic   ;
+    var pd    : logic<5>;
+    var p1    : logic<5>;
+    var p2    : logic<5>;
+    always_comb {
+        a_vd   = 1'b1;
+        a_s1   = ivv || fvv || mvv;
+        a_s2   = 1'b1;
+        z_vd   = 1'b1;
+        z_s1   = ivv || fvv || mvv;
+        z_s2   = 1'b1;
+        eq_s1  = 1'b0;
+        eq_s2  = 1'b0;
+        dj_s1  = 1'b0;
+        dj_s2  = 1'b0;
+        dj_s12 = 1'b0;
+        rng1   = 1'b1;
+        pd     = lb;
+        p1     = lb;
+        p2     = lb;
+        if iv {
+            if f6 == 6'b001100 {
+                eq_s1 = ivv;
+                eq_s2 = 1'b1;
+            } else if f6 == 6'b001110 && ivv {
+                p1     = wb - {3'd0, sew};
+                rng1   = 1'b0;
+                dj_s1  = 1'b1;
+                eq_s2  = 1'b1;
+                dj_s12 = sew != 2'd1;
+            } else if f6 == 6'b001110 {
+                eq_s2 = 1'b1;
+            } else if f6 == 6'b010001 || f6 == 6'b010011 || f6[5:3] == 3'b011 {
+                a_vd = 1'b0;
+                z_vd = 1'b0;
+            } else if f6 == 6'b010111 && !m {
+                a_s2 = 1'b0;
+                z_s2 = 1'b0;
+            } else if f6[5:2] == 4'b1011 {
+                p2     = wb;
+                dj_s12 = ivv;
+            } else if f6[5:1] == 5'b11000 && ivv {
+                a_vd   = 1'b0;
+                z_vd   = 1'b0;
+                p1     = 5'd8;
+                dj_s12 = 1'b1;
+            } else if f6 == 6'b110101 {
+                pd = wb;
+            } else if f6 == 6'b100111 && ivi {
+                a_vd = 1'b0;
+                a_s2 = 1'b0;
+                z_vd = 1'b0;
+                z_s2 = 1'b0;
+            }
+        } else if fv {
+            if fvv && f6[5:3] == 3'b000 && f6[0] {
+                a_vd = 1'b0;
+                z_vd = 1'b0;
+                p1   = 5'd8;
+            } else if f6[5:3] == 3'b011 {
+                a_vd = 1'b0;
+                z_vd = 1'b0;
+            } else if fvv && (f6 == 6'b110001 || f6 == 6'b110011) {
+                a_vd   = 1'b0;
+                z_vd   = 1'b0;
+                p1     = 5'd8;
+                dj_s12 = 1'b1;
+            } else if f6 == 6'b010000 {
+                a_vd = 1'b0;
+                a_s1 = 1'b0;
+                a_s2 = 1'b0;
+                z_vd = 1'b0;
+                z_s1 = 1'b0;
+                z_s2 = 1'b0;
+            } else if fvv && (f6 == 6'b010010 || f6 == 6'b010011) {
+                a_s1 = 1'b0;
+                z_s1 = 1'b0;
+                if f6 == 6'b010010 && vs1[4:3] == 2'b01 {
+                    pd = wb;
+                }
+                if f6 == 6'b010010 && vs1[4:3] == 2'b10 {
+                    p2 = wb;
+                }
+            } else if f6 == 6'b001110 && fvf {
+                eq_s2 = 1'b1;
+            } else if f6 == 6'b010111 && !m {
+                a_s2 = 1'b0;
+                z_s2 = 1'b0;
+            } else if f6 == 6'b110000 || f6 == 6'b110010 || f6 == 6'b111000 {
+                pd = wb;
+            } else if f6 == 6'b110100 || f6 == 6'b110110 {
+                pd     = wb;
+                p2     = wb;
+                dj_s12 = fvv;
+            } else if f6[5:2] == 4'b1111 {
+                pd    = wb;
+                dj_s1 = fvv;
+                dj_s2 = fvv;
+            }
+        } else if mv {
+            if mvv && f6[5:3] == 3'b000 {
+                a_vd = 1'b0;
+                z_vd = 1'b0;
+                p1   = 5'd8;
+            } else if f6 == 6'b010000 || (mvv && f6[5:3] == 3'b011) {
+                a_vd = 1'b0;
+                a_s1 = 1'b0;
+                a_s2 = 1'b0;
+                z_vd = 1'b0;
+                z_s1 = 1'b0;
+                z_s2 = 1'b0;
+            } else if mvv && f6 == 6'b010010 {
+                a_s1 = 1'b0;
+                z_s1 = 1'b0;
+                if vs1[4:3] == 2'b00 {
+                    p2 = lb - flog;
+                }
+            } else if mvv && f6 == 6'b010100 {
+                a_vd  = vs1[4];
+                a_s1  = 1'b0;
+                a_s2  = 1'b0;
+                z_s1  = 1'b0;
+                z_s2  = 1'b0;
+                eq_s2 = vs1 != 5'b10001;
+            } else if mvv && f6 == 6'b010111 {
+                z_vd  = 1'b0;
+                z_s1  = 1'b0;
+                z_s2  = 1'b0;
+                p1    = 5'd8;
+                dj_s1 = 1'b1;
+                eq_s2 = 1'b1;
+                dj_s12 = 1'b1;
+            } else if mvx && f6 == 6'b001110 {
+                eq_s2 = 1'b1;
+            } else if f6[5:2] == 4'b1101 {
+                pd     = wb;
+                p2     = wb;
+                dj_s12 = mvv;
+            } else if f6[5:4] == 2'b11 {
+                pd    = wb;
+                dj_s1 = mvv && f6[5:2] == 4'b1111;
+                dj_s2 = f6[5:2] == 4'b1111;
+            }
+        }
+    }
+
+    let rng_ok: logic = !(a_vd && !inrng(pd)) && !(a_s1 && rng1 && !inrng(p1)) && !(a_s2 && !inrng(p2));
+    let al_ok : logic = (!a_vd || al(vd, pd)) && (!a_s1 || al(vs1, p1)) && (!a_s2 || al(vs2, p2));
+    let wn_ok : logic = !a_vd || ((!a_s1 || wn(vs1, vd, p1, pd)) && (!a_s2 || wn(vs2, vd, p2, pd)));
+    let z_ok  : logic = !m || !((z_vd && vd == 5'd0) || (z_s1 && vs1 == 5'd0) || (z_s2 && vs2 == 5'd0));
+    let ov_ok : logic = !(eq_s1 && vs1 == vd) && !(eq_s2 && vs2 == vd) && !(dj_s1 && !dj(vs1, vd, p1, pd, 4'd1))
+        && !(dj_s2 && !dj(vs2, vd, p2, pd, 4'd1)) && !(dj_s12 && !dj(vs1, vs2, p1, p2, 4'd1));
+    let opv_ok: logic = rng_ok && al_ok && wn_ok && z_ok && ov_ok;
+
+    // Loads and stores: vd is the data (vs3 of a store), vs2 the index.
+    let st    : logic    = opc == riscv_pkg::Opcode::STORE_FP;
+    let mop   : logic<2> = i_insn[27:26];
+    let nf1   : logic<4> = {1'b0, i_insn[31:29]} + 4'd1;
+    let eew   : logic<2> = if f3[2] ? f3[1:0] : 2'd0;
+    let idx   : logic    = mop[0];
+    let whole : logic    = mop == 2'b00 && vs2 == 5'b01000;
+    let maskm : logic    = mop == 2'b00 && vs2 == 5'b01011;
+    let ib    : logic<5> = lb + {3'd0, eew} - {3'd0, sew};
+    let eb    : logic<5> = if idx ? lb : ib;
+    let span  : logic<8> = gsz(eb) * {4'd0, nf1};
+    let seg_ok: logic    = inrng(eb) && span <= 8'd8 && {3'd0, vd} + span <= 8'd32 && !(m && vd == 5'd0);
+    let idx_ok: logic    = inrng(ib) && !(m && vs2 == 5'd0) && (if st ?
+        (if eew == sew ? al(vs2, ib) && al(vd, eb) : dj(vs2, vd, ib, eb, nf1))
+    : if nf1 == 4'd1 ?
+        wn(vs2, vd, ib, eb)
+    :
+        dj(vs2, vd, ib, eb, nf1)
+    );
+    let mem_ok: logic = if whole ?
+        ((vd[2:0] & (nf1[2:0] - 3'd1)) == 3'd0)
+    : if maskm ?
+        1'b1
+    :
+        seg_ok && al(vd, eb) && (!idx || idx_ok)
+    ;
+
+    assign o_ok = if opv ? opv_ok : (if opc == riscv_pkg::Opcode::LOAD_FP || st ? mem_ok : 1'b1);
+}
