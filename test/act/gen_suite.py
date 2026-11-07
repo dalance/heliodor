@@ -47,10 +47,13 @@ SUITE_OPTS = {
     "interruptss": "lockstep=0",
     "sstc": "lockstep=0",
 }
-# These keep HPM counter values, which differ between cores.
+# These keep HPM counter values, which differ between cores. ExceptionsVls
+# runs every vector load and store form up to LMUL 8 element by element
+# (3.3M cycles on W2).
 TEST_OPTS = {
     "act_sscofpmf/S_inhibit_lo_00": "lockstep=0",
     "act_sscofpmf/U_inhibit_lo_00": "lockstep=0",
+    "act_exceptionsvls/rv64": "budget=5000000",
 }
 
 # Tests the framework selects but the harness cannot run, with the reason;
@@ -170,7 +173,11 @@ def write_list(path, entries):
         key = f"act_{extlc}/{short}"
         if key in EXCLUDED:
             continue
-        opts = " ".join(o for o in (ALL_OPTS, SUITE_OPTS.get(extlc, ""), TEST_OPTS.get(key, "")) if o)
+        kv = {}
+        for o in " ".join((ALL_OPTS, SUITE_OPTS.get(extlc, ""), TEST_OPTS.get(key, ""))).split():
+            k, v = o.split("=", 1)
+            kv[k] = v
+        opts = " ".join(f"{k}={v}" for k, v in kv.items())
         if "lockstep=" not in opts and (GOLDEN_OFF_SUITE.match(extlc) or GOLDEN_OFF_NAME.search(short) or key in off):
             opts += " lockstep=0"
         lines.append(f"{key} hex={hexf}" + (f" {opts}" if opts else ""))
