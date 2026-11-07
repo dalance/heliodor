@@ -162,14 +162,14 @@ sweep:
     TR  0x3d, OPIVV                         // reserved
     TR  0x3e, OPIVV                         // reserved
     TR  0x3f, OPIVV                         // reserved
-    NI  0x10, OPIVV, vm=0                   // vadc.vvm
+    EX  0x10, OPIVV, vm=0                   // vadc.vvm
     TR  0x10, OPIVV                         // vadc with vm = 1: reserved
-    NI  0x11, OPIVV, vm=0                   // vmadc.vvm
-    NI  0x11, OPIVV                         // vmadc.vv
-    NI  0x12, OPIVV, vm=0                   // vsbc.vvm
+    EX  0x11, OPIVV, vm=0                   // vmadc.vvm
+    EX  0x11, OPIVV                         // vmadc.vv
+    EX  0x12, OPIVV, vm=0                   // vsbc.vvm
     TR  0x12, OPIVV                         // vsbc with vm = 1: reserved
-    NI  0x13, OPIVV, vm=0                   // vmsbc.vvm
-    NI  0x13, OPIVV                         // vmsbc.vv
+    EX  0x13, OPIVV, vm=0                   // vmsbc.vvm
+    EX  0x13, OPIVV                         // vmsbc.vv
     EX  0x17, OPIVV, vm=0                   // vmerge.vvm
     EX  0x17, OPIVV, vs2=0                  // vmv.v.v
     TR  0x17, OPIVV                         // vmv.v.v with vs2 != 0: reserved
@@ -234,14 +234,14 @@ sweep:
     TR  0x3d, OPIVX                         // reserved
     TR  0x3e, OPIVX                         // reserved
     TR  0x3f, OPIVX                         // reserved
-    NI  0x10, OPIVX, vm=0                   // vadc.vxm
+    EX  0x10, OPIVX, vm=0                   // vadc.vxm
     TR  0x10, OPIVX                         // vadc with vm = 1: reserved
-    NI  0x11, OPIVX, vm=0                   // vmadc.vxm
-    NI  0x11, OPIVX                         // vmadc.vx
-    NI  0x12, OPIVX, vm=0                   // vsbc.vxm
+    EX  0x11, OPIVX, vm=0                   // vmadc.vxm
+    EX  0x11, OPIVX                         // vmadc.vx
+    EX  0x12, OPIVX, vm=0                   // vsbc.vxm
     TR  0x12, OPIVX                         // vsbc with vm = 1: reserved
-    NI  0x13, OPIVX, vm=0                   // vmsbc.vxm
-    NI  0x13, OPIVX                         // vmsbc.vx
+    EX  0x13, OPIVX, vm=0                   // vmsbc.vxm
+    EX  0x13, OPIVX                         // vmsbc.vx
     EX  0x17, OPIVX, vm=0                   // vmerge.vxm
     EX  0x17, OPIVX, vs2=0                  // vmv.v.x
     TR  0x17, OPIVX                         // vmv.v.x with vs2 != 0: reserved
@@ -307,17 +307,17 @@ sweep:
     TR  0x3d, OPIVI                         // reserved
     TR  0x3e, OPIVI                         // reserved
     TR  0x3f, OPIVI                         // reserved
-    NI  0x10, OPIVI, vm=0                   // vadc.vim
+    EX  0x10, OPIVI, vm=0                   // vadc.vim
     TR  0x10, OPIVI                         // vadc with vm = 1: reserved
-    NI  0x11, OPIVI, vm=0                   // vmadc.vim
-    NI  0x11, OPIVI                         // vmadc.vi
+    EX  0x11, OPIVI, vm=0                   // vmadc.vim
+    EX  0x11, OPIVI                         // vmadc.vi
     EX  0x17, OPIVI, vm=0                   // vmerge.vim
     EX  0x17, OPIVI, vs2=0                  // vmv.v.i
     TR  0x17, OPIVI                         // vmv.v.i with vs2 != 0: reserved
-    NI  0x27, OPIVI, vs1=0, vd=8            // vmv1r.v
-    NI  0x27, OPIVI, vs1=1, vd=8            // vmv2r.v
-    NI  0x27, OPIVI, vs1=3, vd=8            // vmv4r.v
-    NI  0x27, OPIVI, vs1=7, vd=8            // vmv8r.v
+    EX  0x27, OPIVI, vs1=0, vd=8            // vmv1r.v
+    EX  0x27, OPIVI, vs1=1, vd=8            // vmv2r.v
+    EX  0x27, OPIVI, vs1=3, vd=8            // vmv4r.v
+    EX  0x27, OPIVI, vs1=7, vd=8            // vmv8r.v
     TR  0x27, OPIVI, vs1=2, vd=8            // vmv<nr>r.v with nr = 3: reserved
 
     // OPMVV
@@ -350,13 +350,13 @@ sweep:
     EX  0x26, OPMVV                         // vmulhsu.vv
     EX  0x27, OPMVV                         // vmulh.vv
     TR  0x28, OPMVV                         // reserved
-    NI  0x29, OPMVV                         // vmadd.vv
+    EX  0x29, OPMVV                         // vmadd.vv
     TR  0x2a, OPMVV                         // reserved
-    NI  0x2b, OPMVV                         // vnmsub.vv
+    EX  0x2b, OPMVV                         // vnmsub.vv
     TR  0x2c, OPMVV                         // reserved
-    NI  0x2d, OPMVV                         // vmacc.vv
+    EX  0x2d, OPMVV                         // vmacc.vv
     TR  0x2e, OPMVV                         // reserved
-    NI  0x2f, OPMVV                         // vnmsac.vv
+    EX  0x2f, OPMVV                         // vnmsac.vv
     EX  0x30, OPMVV                         // vwaddu.vv
     EX  0x31, OPMVV                         // vwadd.vv
     EX  0x32, OPMVV                         // vwsubu.vv
@@ -369,21 +369,21 @@ sweep:
     TR  0x39, OPMVV                         // reserved
     EX  0x3a, OPMVV                         // vwmulsu.vv
     EX  0x3b, OPMVV                         // vwmul.vv
-    NI  0x3c, OPMVV                         // vwmaccu.vv
-    NI  0x3d, OPMVV                         // vwmacc.vv
+    EX  0x3c, OPMVV                         // vwmaccu.vv
+    EX  0x3d, OPMVV                         // vwmacc.vv
     TR  0x3e, OPMVV                         // reserved
-    NI  0x3f, OPMVV                         // vwmaccsu.vv
+    EX  0x3f, OPMVV                         // vwmaccsu.vv
     EX  0x10, OPMVV, vs1=0                  // vmv.x.s
     TR  0x10, OPMVV, vm=0, vs1=0            // vmv.x.s with vm = 0: reserved
     EX  0x10, OPMVV, vs1=16                 // vcpop.m
     EX  0x10, OPMVV, vs1=17                 // vfirst.m
     TR  0x10, OPMVV, vs1=1                  // VWXUNARY0 vs1 = 1: reserved
-    NI  0x12, OPMVV, vs1=2                  // vzext.vf8
-    NI  0x12, OPMVV, vs1=3                  // vsext.vf8
-    NI  0x12, OPMVV, vs1=4                  // vzext.vf4
-    NI  0x12, OPMVV, vs1=5                  // vsext.vf4
-    NI  0x12, OPMVV, vs1=6                  // vzext.vf2
-    NI  0x12, OPMVV, vs1=7                  // vsext.vf2
+    TR  0x12, OPMVV, vs1=2                  // vzext.vf8 at SEW 32 (EEW 4): reserved
+    TR  0x12, OPMVV, vs1=3                  // vsext.vf8 at SEW 32 (EEW 4): reserved
+    EX  0x12, OPMVV, vs1=4                  // vzext.vf4
+    EX  0x12, OPMVV, vs1=5                  // vsext.vf4
+    EX  0x12, OPMVV, vs1=6                  // vzext.vf2
+    EX  0x12, OPMVV, vs1=7                  // vsext.vf2
     TR  0x12, OPMVV, vs1=0                  // VXUNARY0 vs1 = 0: reserved
     EX  0x14, OPMVV, vs1=1                  // vmsbf.m
     EX  0x14, OPMVV, vs1=2                  // vmsof.m
@@ -445,13 +445,13 @@ sweep:
     EX  0x26, OPMVX                         // vmulhsu.vx
     EX  0x27, OPMVX                         // vmulh.vx
     TR  0x28, OPMVX                         // reserved
-    NI  0x29, OPMVX                         // vmadd.vx
+    EX  0x29, OPMVX                         // vmadd.vx
     TR  0x2a, OPMVX                         // reserved
-    NI  0x2b, OPMVX                         // vnmsub.vx
+    EX  0x2b, OPMVX                         // vnmsub.vx
     TR  0x2c, OPMVX                         // reserved
-    NI  0x2d, OPMVX                         // vmacc.vx
+    EX  0x2d, OPMVX                         // vmacc.vx
     TR  0x2e, OPMVX                         // reserved
-    NI  0x2f, OPMVX                         // vnmsac.vx
+    EX  0x2f, OPMVX                         // vnmsac.vx
     EX  0x30, OPMVX                         // vwaddu.vx
     EX  0x31, OPMVX                         // vwadd.vx
     EX  0x32, OPMVX                         // vwsubu.vx
@@ -464,11 +464,11 @@ sweep:
     TR  0x39, OPMVX                         // reserved
     EX  0x3a, OPMVX                         // vwmulsu.vx
     EX  0x3b, OPMVX                         // vwmul.vx
-    NI  0x3c, OPMVX                         // vwmaccu.vx
-    NI  0x3d, OPMVX                         // vwmacc.vx
-    NI  0x3e, OPMVX                         // vwmaccus.vx
-    NI  0x3f, OPMVX                         // vwmaccsu.vx
-    NI  0x10, OPMVX, vs2=0                  // vmv.s.x
+    EX  0x3c, OPMVX                         // vwmaccu.vx
+    EX  0x3d, OPMVX                         // vwmacc.vx
+    EX  0x3e, OPMVX                         // vwmaccus.vx
+    EX  0x3f, OPMVX                         // vwmaccsu.vx
+    EX  0x10, OPMVX, vs2=0                  // vmv.s.x
     TR  0x10, OPMVX                         // VRXUNARY0 vs2 != 0: reserved
 
     // OPFVV

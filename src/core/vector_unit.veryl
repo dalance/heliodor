@@ -477,6 +477,30 @@ pub module vector_unit::<CFG: core_cfg> #(
     // a, b are SEW-wide source elements; the result is 2*W (= 2*SEW). Operands
     // are sign-/zero-extended to 2*W per signedness before the op (the low 2*W
     // bits of the extended product hold the correctly-signed widening product).
+    // vadc/vsbc and vmadc/vmsbc: {carry or borrow out, a + b + c or a - b - c}.
+    function vadcsbc::<W: u32> (
+        a  : input logic<W>,
+        b  : input logic<W>,
+        c  : input logic   ,
+        sub: input logic   ,
+    ) -> logic<W + 1> {
+        let cw: logic<W + 1> = {1'b0 repeat W, c};
+        return if sub ? {1'b0, a} - {1'b0, b} - cw : {1'b0, a} + {1'b0, b} + cw;
+    }
+
+    // vmacc/vnmsac (op[2] = 1): +-(b * a) + d; vmadd/vnmsub: +-(b * d) + a.
+    // op[1] negates the product. a = vs2, b = vs1 or x[rs1], d = the old vd.
+    function vmac::<W: u32> (
+        a : input logic<W>,
+        b : input logic<W>,
+        d : input logic<W>,
+        op: input logic<6>,
+    ) -> logic<W> {
+        let p: logic<W> = vmuldiv::<W>(if op[2] ? a : d, b, 6'b100101);
+        let s: logic<W> = if op[2] ? d : a;
+        return if op[1] ? s - p : s + p;
+    }
+
     function vwiden::<W: u32> (
         a : input logic<W>,
         b : input logic<W>,
@@ -1042,7 +1066,12 @@ pub module vector_unit::<CFG: core_cfg> #(
     let h_alu_vm : logic    = h_instr[25];
     // V2b op categories (within VALU): integer compare (funct6 011xxx → mask
     // register result) and merge/vmv.v (funct6 010111 → element select).
-    let h_is_cmp  : logic = h_funct6[5:3] == 3'b011;
+    // vadc/vmadc (01000x) and vsbc/vmsbc (01001x) on OPIV*: funct6[0] writes
+    // the carry or borrow out as a mask (compare path); vm = 0 takes v0 as the
+    // carry or borrow in.
+    let h_is_adc  : logic = h_is_valu && !h_is_opm && (h_funct6[5:2] == 4'b0100);
+    let h_is_madc : logic = h_is_adc && h_funct6[0];
+    let h_is_cmp  : logic = h_funct6[5:3] == 3'b011 || h_is_madc;
     let h_is_merge: logic = h_funct6 == 6'b010111;
     // V5a fixed-point saturating add/sub (OPIV* funct6 1000xx): vsaddu/vsadd/
     // vssubu/vssub. Gated to !h_is_opm so it does not collide with the OPMV*
@@ -1057,6 +1086,15 @@ pub module vector_unit::<CFG: core_cfg> #(
     // V5b averaging add/sub (OPMV* funct6 0010xx): vaaddu/vaadd/vasubu/vasub.
     // funct6[1] = sub, funct6[0] = signed. Rounds the 1-bit shift per vxrm.
     let h_is_vaavg : logic = h_is_valu && h_is_opm && (h_funct6[5:2] == 4'b0010);
+    // vmadd (101001), vnmsub (101011), vmacc (101101), vnmsac (101111): OPMV*
+    // multiply-adds on the old vd element (vmac).
+    let h_is_vmac  : logic = h_is_valu && h_is_opm && (h_funct6[5:3] == 3'b101);
+    // vmv<nr>r.v (OPIVI 100111): copies simm5 + 1 whole registers.
+    let h_is_vmvr  : logic = h_is_valu && h_funct3 == 3'b011 && h_funct6 == 6'b100111;
+    // vzext/vsext (OPMVV VXUNARY0 010010): vs1[2:1] = 01, 10, 11 for vf8, vf4,
+    // vf2 (vext_flog = log2 of the factor), vs1[0] sign-extends.
+    let h_is_vext  : logic    = h_is_valu && h_funct3 == 3'b010 && h_funct6 == 6'b010010;
+    let vext_flog  : logic<3> = 3'd4 - {1'b0, h_instr[17:16]};
     // V5c scaling (rounding) right shift (OPIV* funct6 10101x): vssrl/vssra.
     // funct6[0] = arithmetic (vssra) vs logical (vssrl). Rounds per vxrm.
     let h_is_vssh  : logic = h_is_valu && !h_is_opm && (h_funct6[5:1] == 5'b10101);
@@ -1208,7 +1246,7 @@ pub module vector_unit::<CFG: core_cfg> #(
         }
     }
     // Widening walks 2*EMUL dest groups; narrowing 2*EMUL source steps; else EMUL.
-    let va_nregs: logic<4> = if (h_is_widen || h_is_narr) ? {emul[2:0], 1'b0} : emul;
+    let va_nregs: logic<4> = if h_is_vmvr ? {1'b0, h_instr[17:15]} + 4'd1 : (if (h_is_widen || h_is_narr) ? {emul[2:0], 1'b0} : emul);
     // EEW from the instruction width field (inst[14:12]): 000=8, 101=16,
     // 110=32, 111=64 → eew_log = log2(bytes). vm (inst[25]): 1 = unmasked.
     let h_eew_log: logic<2> = if h_instr[14] ? h_instr[13:12] : 2'd0;
@@ -1321,6 +1359,9 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let b  : logic<8> = if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0];
                         if h_is_merge {
                             valu_res[i*8+:8] = if act ? b : a;
+                        } else if h_is_adc {
+                            let ac: logic<9> = vadcsbc::<8>(a, b, !h_alu_vm && msk[i], h_funct6[1]);
+                            valu_res[i*8+:8] = ac[7:0];
                         } else if act {
                             if h_is_satadd {
                                 let sr: logic<9> = vsatas::<8>(a, b, h_funct6[1], h_funct6[0]);
@@ -1338,6 +1379,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 if sr[8] {
                                     vsat_grp = 1'b1;
                                 }
+                            } else if h_is_vmac {
+                                valu_res[i*8+:8] = vmac::<8>(a, b, i_vdold_data[i*8+:8], h_funct6);
                             } else {
                                 valu_res[i*8+:8] = if h_is_vdiv ? dv_acc[i*8+:8] : (if h_is_opm ? vmuldiv::<8>(a, b, h_funct6) : valu::<8>(a, b, h_funct6));
                             }
@@ -1355,6 +1398,9 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let b  : logic<16> = if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0];
                         if h_is_merge {
                             valu_res[i*16+:16] = if act ? b : a;
+                        } else if h_is_adc {
+                            let ac: logic<17> = vadcsbc::<16>(a, b, !h_alu_vm && msk[i], h_funct6[1]);
+                            valu_res[i*16+:16] = ac[15:0];
                         } else if act {
                             if h_is_satadd {
                                 let sr: logic<17> = vsatas::<16>(a, b, h_funct6[1], h_funct6[0]);
@@ -1372,6 +1418,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 if sr[16] {
                                     vsat_grp = 1'b1;
                                 }
+                            } else if h_is_vmac {
+                                valu_res[i*16+:16] = vmac::<16>(a, b, i_vdold_data[i*16+:16], h_funct6);
                             } else {
                                 valu_res[i*16+:16] = if h_is_vdiv ? dv_acc[i*16+:16] : (if h_is_opm ? vmuldiv::<16>(a, b, h_funct6) : valu::<16>(a, b, h_funct6));
                             }
@@ -1389,6 +1437,9 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let b  : logic<32> = if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0];
                         if h_is_merge {
                             valu_res[i*32+:32] = if act ? b : a;
+                        } else if h_is_adc {
+                            let ac: logic<33> = vadcsbc::<32>(a, b, !h_alu_vm && msk[i], h_funct6[1]);
+                            valu_res[i*32+:32] = ac[31:0];
                         } else if act {
                             if h_is_satadd {
                                 let sr: logic<33> = vsatas::<32>(a, b, h_funct6[1], h_funct6[0]);
@@ -1406,6 +1457,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 if sr[32] {
                                     vsat_grp = 1'b1;
                                 }
+                            } else if h_is_vmac {
+                                valu_res[i*32+:32] = vmac::<32>(a, b, i_vdold_data[i*32+:32], h_funct6);
                             } else {
                                 valu_res[i*32+:32] = if h_is_vdiv ? dv_acc[i*32+:32] : (if h_is_opm ? vmuldiv::<32>(a, b, h_funct6) : valu::<32>(a, b, h_funct6));
                             }
@@ -1423,6 +1476,9 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let b  : logic<64> = if h_is_vv ? va_vs1[i*64+:64] : bbcast;
                         if h_is_merge {
                             valu_res[i*64+:64] = if act ? b : a;
+                        } else if h_is_adc {
+                            let ac: logic<65> = vadcsbc::<64>(a, b, !h_alu_vm && msk[i], h_funct6[1]);
+                            valu_res[i*64+:64] = ac[63:0];
                         } else if act {
                             if h_is_satadd {
                                 let sr: logic<65> = vsatas::<64>(a, b, h_funct6[1], h_funct6[0]);
@@ -1440,6 +1496,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                                 if sr[64] {
                                     vsat_grp = 1'b1;
                                 }
+                            } else if h_is_vmac {
+                                valu_res[i*64+:64] = vmac::<64>(a, b, i_vdold_data[i*64+:64], h_funct6);
                             } else {
                                 valu_res[i*64+:64] = if h_is_vdiv ? dv_acc[i*64+:64] : (if h_is_opm ? vmuldiv::<64>(a, b, h_funct6) : valu::<64>(a, b, h_funct6));
                             }
@@ -1447,6 +1505,9 @@ pub module vector_unit::<CFG: core_cfg> #(
                     }
                 }
             }
+        }
+        if h_is_vmvr {
+            valu_res = va_vs2;
         }
     }
 
@@ -1470,8 +1531,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                 let msk    : logic<VLEN> = i_mask_data >> base;
                 let seed_sh: logic<VLEN> = cmp_seed >> base; // prior bits for this group
                 for i in 0..16 {
-                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<8>(va_vs2[i*8+:8], if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0], h_funct6) : seed_sh[i];
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i] || h_is_madc);
+                    let cb  : logic<8> = if h_is_vv ? va_vs1[i*8+:8] : bbcast[7:0];
+                    let ac  : logic<9> = vadcsbc::<8>(va_vs2[i*8+:8], cb, !h_alu_vm && msk[i], h_funct6[1]);
+                    vcmp_grp[i] = if do_c ? (if h_is_madc ? ac[8] : vcmp::<8>(va_vs2[i*8+:8], cb, h_funct6)) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({112'd0, 16'hffff} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1480,8 +1543,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                 let msk    : logic<VLEN> = i_mask_data >> base;
                 let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..8 {
-                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<16>(va_vs2[i*16+:16], if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0], h_funct6) : seed_sh[i];
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i] || h_is_madc);
+                    let cb  : logic<16> = if h_is_vv ? va_vs1[i*16+:16] : bbcast[15:0];
+                    let ac  : logic<17> = vadcsbc::<16>(va_vs2[i*16+:16], cb, !h_alu_vm && msk[i], h_funct6[1]);
+                    vcmp_grp[i] = if do_c ? (if h_is_madc ? ac[16] : vcmp::<16>(va_vs2[i*16+:16], cb, h_funct6)) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({120'd0, 8'hff} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1490,8 +1555,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                 let msk    : logic<VLEN> = i_mask_data >> base;
                 let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..4 {
-                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<32>(va_vs2[i*32+:32], if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0], h_funct6) : seed_sh[i];
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i] || h_is_madc);
+                    let cb  : logic<32> = if h_is_vv ? va_vs1[i*32+:32] : bbcast[31:0];
+                    let ac  : logic<33> = vadcsbc::<32>(va_vs2[i*32+:32], cb, !h_alu_vm && msk[i], h_funct6[1]);
+                    vcmp_grp[i] = if do_c ? (if h_is_madc ? ac[32] : vcmp::<32>(va_vs2[i*32+:32], cb, h_funct6)) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({124'd0, 4'hf} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1500,8 +1567,10 @@ pub module vector_unit::<CFG: core_cfg> #(
                 let msk    : logic<VLEN> = i_mask_data >> base;
                 let seed_sh: logic<VLEN> = cmp_seed >> base;
                 for i in 0..2 {
-                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]);
-                    vcmp_grp[i] = if do_c ? vcmp::<64>(va_vs2[i*64+:64], if h_is_vv ? va_vs1[i*64+:64] : bbcast, h_funct6) : seed_sh[i];
+                    let do_c: logic = ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i] || h_is_madc);
+                    let cb  : logic<64> = if h_is_vv ? va_vs1[i*64+:64] : bbcast;
+                    let ac  : logic<65> = vadcsbc::<64>(va_vs2[i*64+:64], cb, !h_alu_vm && msk[i], h_funct6[1]);
+                    vcmp_grp[i] = if do_c ? (if h_is_madc ? ac[64] : vcmp::<64>(va_vs2[i*64+:64], cb, h_funct6)) : seed_sh[i];
                 }
                 cmp_res = (cmp_seed & ~({126'd0, 2'h3} << base)) | ({112'd0, vcmp_grp} << base);
             }
@@ -1513,6 +1582,18 @@ pub module vector_unit::<CFG: core_cfg> #(
     // is always VLEN/2 = 64 (= elems_per_dreg * SEW), so the half is selected by a
     // constant shift (no dynamic part-select). Even dest groups take the low half,
     // odd the high half. Global element index = va_reg * elems_per_dreg + j.
+    // vwmaccu/vwmacc/vwmaccus/vwmaccsu (1111xx) add the widened product to the
+    // old vd; vwmaccsu (signed vs1 times unsigned vs2) swaps the operands of
+    // the vwmulsu product.
+    let h_is_wmacc : logic    = h_is_widen && h_funct6[5:2] == 4'b1111;
+    let vw_swap    : logic    = h_funct6 == 6'b111111;
+    let vw_op      : logic<6> = case h_funct6 {
+        6'b111100: 6'b111000,
+        6'b111101: 6'b111011,
+        6'b111110: 6'b111010,
+        6'b111111: 6'b111010,
+        default  : h_funct6,
+    };
     let vw_vs2_half: logic<64> = if va_reg[0] ? i_vs2_data[127:64] : i_vs2_data[63:0];
     let vw_vs1_half: logic<64> = if va_reg[0] ? i_vs1_data[127:64] : i_vs1_data[63:0];
     var vw_res: logic<VLEN>;
@@ -1527,7 +1608,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let a : logic<8>  = vw_vs2_half[j*8+:8];     // SEW src (.vv/.vx)
                         let aw: logic<16> = i_vs2_data[j*16+:16];    // 2*SEW src (.w)
                         let b : logic<8>  = if h_is_vv ? vw_vs1_half[j*8+:8] : i_scalar_data[7:0];
-                        vw_res[j*16+:16] = if h_is_widen_w ? vwidenw::<8>(aw, b, h_funct6) : vwiden::<8>(a, b, h_funct6);
+                        let wp: logic<16> = vwiden::<8>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
+                        vw_res[j*16+:16] = if h_is_widen_w ? vwidenw::<8>(aw, b, h_funct6) : (if h_is_wmacc ? i_vdold_data[j*16+:16] + wp : wp);
                     }
                 }
             }
@@ -1539,7 +1621,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let a : logic<16> = vw_vs2_half[j*16+:16];
                         let aw: logic<32> = i_vs2_data[j*32+:32];
                         let b : logic<16> = if h_is_vv ? vw_vs1_half[j*16+:16] : i_scalar_data[15:0];
-                        vw_res[j*32+:32] = if h_is_widen_w ? vwidenw::<16>(aw, b, h_funct6) : vwiden::<16>(a, b, h_funct6);
+                        let wp: logic<32> = vwiden::<16>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
+                        vw_res[j*32+:32] = if h_is_widen_w ? vwidenw::<16>(aw, b, h_funct6) : (if h_is_wmacc ? i_vdold_data[j*32+:32] + wp : wp);
                     }
                 }
             }
@@ -1551,7 +1634,8 @@ pub module vector_unit::<CFG: core_cfg> #(
                         let a : logic<32> = vw_vs2_half[j*32+:32];
                         let aw: logic<64> = i_vs2_data[j*64+:64];
                         let b : logic<32> = if h_is_vv ? vw_vs1_half[j*32+:32] : i_scalar_data[31:0];
-                        vw_res[j*64+:64] = if h_is_widen_w ? vwidenw::<32>(aw, b, h_funct6) : vwiden::<32>(a, b, h_funct6);
+                        let wp: logic<64> = vwiden::<32>(if vw_swap ? b : a, if vw_swap ? a : b, vw_op);
+                        vw_res[j*64+:64] = if h_is_widen_w ? vwidenw::<32>(aw, b, h_funct6) : (if h_is_wmacc ? i_vdold_data[j*64+:64] + wp : wp);
                     }
                 }
             }
@@ -1631,6 +1715,56 @@ pub module vector_unit::<CFG: core_cfg> #(
         }
     }
 
+    // ---- vzext/vsext: dest group va_reg takes its elements from slice
+    // va_reg mod f (VLEN/f bits) of source register h_vs2 + va_reg / f.
+    let vext_sreg: logic<3>    = va_reg >> vext_flog;
+    let vext_sh  : logic<8>    = {5'd0, va_reg & ((3'd1 << vext_flog) - 3'd1)} << (3'd7 - vext_flog);
+    let vext_src : logic<VLEN> = va_vs2 >> vext_sh;
+    let vext_sgn : logic       = h_instr[15];
+    var vext_res : logic<VLEN>;
+    always_comb {
+        vext_res = i_vdold_data;
+        case vsew {
+            3'd1: {
+                let base: logic<8>    = {2'd0, va_reg, 3'd0};
+                let msk : logic<VLEN> = i_mask_data >> base;
+                for i in 0..8 {
+                    if ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]) {
+                        let e: logic<8> = vext_src[i*8+:8];
+                        vext_res[i*16+:16] = {(vext_sgn && e[7]) repeat 8, e};
+                    }
+                }
+            }
+            3'd2: {
+                let base: logic<8>    = {3'd0, va_reg, 2'd0};
+                let msk : logic<VLEN> = i_mask_data >> base;
+                for i in 0..4 {
+                    if ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]) {
+                        let e16: logic<16> = vext_src[i*16+:16];
+                        let e8 : logic<8>  = vext_src[i*8+:8];
+                        vext_res[i*32+:32] = if vext_flog == 3'd1 ? {(vext_sgn && e16[15]) repeat 16, e16} : {(vext_sgn && e8[7]) repeat 24, e8};
+                    }
+                }
+            }
+            default: {
+                let base: logic<8>    = {4'd0, va_reg, 1'b0};
+                let msk : logic<VLEN> = i_mask_data >> base;
+                for i in 0..2 {
+                    if ((base + (i as 8)) <: vl8) && (h_alu_vm || msk[i]) {
+                        let e32: logic<32> = vext_src[i*32+:32];
+                        let e16: logic<16> = vext_src[i*16+:16];
+                        let e8 : logic<8>  = vext_src[i*8+:8];
+                        vext_res[i*64+:64] = case vext_flog {
+                            3'd1   : {(vext_sgn && e32[31]) repeat 32, e32},
+                            3'd2   : {(vext_sgn && e16[15]) repeat 48, e16},
+                            default: {(vext_sgn && e8[7]) repeat 56, e8},
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     // ---- vmv.x.s: x[rd] = sign-extend(vs2[element 0], SEW) ------------------
     var vmv_res: logic<64>;
     always_comb {
@@ -1644,10 +1778,18 @@ pub module vector_unit::<CFG: core_cfg> #(
     // ---- V3f FP scalar moves ------------------------------------------------
     // vfmv.f.s: f[rd] = vs2[element 0] (NaN-boxed for SEW=32, raw for SEW=64).
     let fp_mv_res: logic<64> = if vsew == 3'd3 ? i_vs2_data[63:0] : {32'hffffffff, i_vs2_data[31:0]};
-    // vfmv.s.f: vd[0] = f[rs1], the rest of vd undisturbed. Splice the SEW-wide
-    // scalar (vector elements are not NaN-boxed) into element 0 of the old vd.
-    let sf_mask: logic<VLEN> = if vsew == 3'd3 ? {64'd0, 64'hffff_ffff_ffff_ffff} : {96'd0, 32'hffff_ffff};
-    let sf_val : logic<VLEN> = if vsew == 3'd3 ? {64'd0, i_fscalar_data} : {96'd0, i_fscalar_data[31:0]};
+    // vfmv.s.f and vmv.s.x (OPMVX): vd[0] = f[rs1] or x[rs1], the rest of vd
+    // undisturbed. Splice the SEW-wide scalar (vector elements are not
+    // NaN-boxed) into element 0 of the old vd.
+    let sf_int : logic       = h_funct3 == 3'b110;
+    let sf_m64 : logic<64>   = case vsew {
+        3'd0   : 64'h0000_0000_0000_00ff,
+        3'd1   : 64'h0000_0000_0000_ffff,
+        3'd2   : 64'h0000_0000_ffff_ffff,
+        default: 64'hffff_ffff_ffff_ffff,
+    };
+    let sf_mask: logic<VLEN> = {64'd0, sf_m64};
+    let sf_val : logic<VLEN> = {64'd0, (if sf_int ? i_scalar_data : i_fscalar_data) & sf_m64};
     let sf_res : logic<VLEN> = (i_vdold_data & ~sf_mask) | sf_val;
 
     // ---- V4c mask-register logical (single-cycle, whole register) -----------
@@ -2028,11 +2170,9 @@ pub module vector_unit::<CFG: core_cfg> #(
     let fp_eshamt  : logic<3>     = 3'd3 + {1'b0, vsew[1:0]}; // log2(SEW in bits)
     let fp_reg     : logic<8>     = fp_elem >> fp_eshift;     // register index (0..EMUL-1)
     let fp_local   : logic<8>     = fp_elem & (fp_epr8 - 8'd1);
-    let fp_reg_vrf : logic<VRF_W> = h_vd  + fp_reg[VRF_W - 1:0];
     let fp_vs2_vrf : logic<VRF_W> = h_vs2 + fp_reg[VRF_W - 1:0];
     let fp_vs1_vrf : logic<VRF_W> = h_vs1 + fp_reg[VRF_W - 1:0];
     let fp_bitoff  : logic<8>     = fp_local << fp_eshamt;    // element bit offset in register
-    let fp_reg_last: logic        = ((fp_local + 8'd1) >= fp_epr8) || ((fp_elem + 8'd1) >= vl8);
     // Mask: vm=1 unmasked; else v0[fp_elem]. (Shift then bit 0 — no dynamic select.)
     let fp_mask_sh : logic<VLEN>  = i_mask_data >> fp_elem;
     let fp_active  : logic        = h_vm || fp_mask_sh[0];
@@ -2588,12 +2728,12 @@ pub module vector_unit::<CFG: core_cfg> #(
     assign o_fscalar_pdst = h_fs_pd; // V3b FP scalar (.vf): prf_fp read address
     assign o_scalar2_pdst = h_s2_pd; // V5h strided stride: prf_int 2nd read address
     assign o_vs1_addr    = if (h_is_mem && h_is_indexed) ? idx_reg_vrf : (if h_is_perm ? (if h_is_comp ? h_vs1 : (if h_is_rg16 ? (h_vs1 + pm_ei16_reg[VRF_W - 1:0]) : (h_vs1 + pm_dreg[VRF_W - 1:0]))) : (if h_is_fp ? fp_vs1_vrf : (if (h_is_widen || h_is_narr) ? (h_vs1 + vw_src) : (h_vs1 + {2'd0, va_reg})))); // indexed mem: vs2 index reg / vcompress mask reg / vrgatherei16 16b idx reg / vrgather index reg / FP elem reg / shift/src1 half-pair
-    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + fn_sreg[VRF_W - 1:0]) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg}))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src / .w vs2=dest geom / elem) / mem / widen / src2
+    assign o_vs2_addr    = if h_is_perm ? (h_vs2 + pm_src_reg_e[VRF_W - 1:0]) : (if h_is_viota ? h_vs2 : (if h_is_fp ? (if h_is_fncvt ? (h_vs2 + fn_sreg[VRF_W - 1:0]) : (if h_is_fwiden_w ? fp_dreg_vs2 : fp_vs2_vrf)) : (if h_is_mem ? mem_reg_vrf : (if h_is_vext ? (h_vs2 + {2'd0, vext_sreg}) : (if (h_is_widen && !h_is_widen_w) ? (h_vs2 + vw_src) : (h_vs2 + {2'd0, va_reg})))))); // permute src reg / viota mask / FP (vfncvt 2*SEW src / .w vs2=dest geom / elem) / mem / widen / src2
     assign o_mask_addr   = 5'd0;                       // v0 mask (masked ALU + masked mem + masked FP)
     assign o_vdold_addr  = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP mask|red|elem|widen-dst / int mask / narrow / group
     assign o_vd_addr     = if h_is_perm ? pm_dst_vrf : (if (h_is_vfmv_sf || h_is_vmask || h_is_vmspre) ? h_vd : (if h_is_fp ? (if (h_is_fcmp || h_is_red) ? h_vd : fp_dreg_vrf) : (if h_is_mem ? mem_reg_vrf : (if h_is_cmp ? h_vd : (if h_is_narr ? vn_dst : va_grp))))); // permute dest reg / vfmv.s.f / mask logical|prefix / FP / load / int mask / narrow / arith
     assign o_vd_wen      = (h_is_valu && (if h_is_cmp ? cmp_wen : (if h_is_narr ? narrow_wen : (va_step || va_fire)))) || (h_is_viota && (va_step || va_fire)) || mem_ld_wr || mem_trim_wr || fp_reg_wr || fp_cmp_wr || fp_red_wr || sf_wr || vmask_wr || vmspre_wr || pm_reg_wr;
-    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? mem_wr_data : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : valu_res)))))))));
+    assign o_vd_data     = if h_is_perm ? pm_vd_data : (if h_is_vfmv_sf ? sf_res : (if h_is_vmask ? vmask_res : (if h_is_vmspre ? vmspre_res : (if h_is_viota ? viota_res : (if h_is_fp ? (if h_is_fcmp ? fp_mask_next : (if h_is_red ? fp_red_vd : fp_acc_next)) : (if h_is_mem ? mem_wr_data : (if h_is_cmp ? cmp_res : (if h_is_widen ? vw_res : (if h_is_narr ? {vn_step, vn_lo} : (if h_is_vext ? vext_res : valu_res))))))))));
 
     assign o_cdb_valid    = fire || va_fire || mem_cdb_fire || fp_cdb_fire || pm_cdb_fire;
     assign o_cdb_has_rd   = fire && h_has_rd; // vadd/vle/vse has_rd=0; vset/vmv.x.s/vfmv.f.s carry scalar rd
@@ -2613,14 +2753,17 @@ pub module vector_unit::<CFG: core_cfg> #(
     // A vector FP op runs at SEW 32 and 64, or only 32 when one side is 2*SEW,
     // and at 16 only the conversions between 16-bit integers and singles and
     // the Zvfhmin ones between halves and singles (vfwcvt.f.f.v, vfncvt.f.f.w).
-    let fp_op  : logic = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || h_is_vfmv_sf || h_is_vfmv_fs;
+    let fp_op  : logic = (h_is_fp && (h_funct3 == 3'b001 || h_funct3 == 3'b101)) || (h_is_vfmv_sf && !sf_int) || h_is_vfmv_fs;
     let fp_wide: logic = h_is_fwiden || h_is_fwred || h_is_fwcvt || h_is_fncvt;
     let fp_ok16: logic = (h_is_fwcvt && (cv_fromi || cv_sub == 3'b100)) || (h_is_fncvt && (cv_toint || cv_sub == 3'b100));
+    // The integer ops with a 2*SEW side run below SEW 64; vzext/vsext need a
+    // source EEW of at least 8.
+    let int_wide: logic = (h_is_valu && (h_is_widen || h_is_narr)) || h_is_iwred;
     always_comb {
         o_head.valid      = count != 0;
         o_head.tag        = h_tag;
         o_head.vtype_dep  = !h_is_vset && !h_is_wholereg;
-        o_head.sews       = if fp_op ? {!fp_wide, 1'b1, fp_ok16, 1'b0} : 4'b1111;
+        o_head.sews       = if fp_op ? {!fp_wide, 1'b1, fp_ok16, 1'b0} : (if h_is_vext ? 4'b1111 << vext_flog : (if int_wide ? 4'b0111 : 4'b1111));
         o_head.vstart_max = if h_is_vset ? 8'hff : (if h_is_mem ? mem_vlmax8 - 8'd1 : 8'd0);
         o_head.insn       = h_instr;
     }
