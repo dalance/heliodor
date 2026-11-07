@@ -107,6 +107,25 @@ Sail 0.16 `sail.json`) with heliodor's deviations.
 The harness is `arch_soc_harness` (the new-core arm of
 `test_arch_common_harness`): the SoC with `MAP_ARCH`, 4 MiB DRAM.
 
+## Status at pin 8b9ddedc (MI exit, 2026-11-07)
+
+Two Sstc-under-H bugs of the new core's csr were behind the six VS timer
+failures: VSTIP ignored hvip.VSTIP while henvcfg.STCE was set (the spec ORs
+hvip.VSTIP with the vstimecmp compare; Sstc `vstip` x2), and vsie was a
+register of its own instead of a view of the hie bits hideleg delegates, so
+a VS timer interrupt enabled through hie never reached VS
+(`trigger_vsti_sstc` x4). With both fixed, GA: **W2 3,744/3,749, W4
+3,743/3,749**; GL-C: **720/720** on both. The remaining failures:
+
+| test | W2 | W4 | reason |
+|---|---|---|---|
+| H `vucsr_00` | fail | fail | Sail 0.16 has no Sscsrind: from VU, siselect/sireg/vsiselect/vsireg are virtual-instruction (Sscsrind with mstateen0.CSRIND set), the signature expects illegal-instruction |
+| SdtrigSm `mcontrol6_napot_allones` | fail | fail | open: tdata2 keeps all ones written to bits maskmax6-1:0 of a NAPOT match; Sail clears bit maskmax6-1 |
+| Sm `mcsr_cntr` | fail | fail | writes the CLINT mtime, which is read-only on heliodor |
+| Zkt `c.subw`, `c.not` | fail | pass | the test checks that two runs take the same cycles; W2 differs by one front-end cycle |
+| SdtrigS/SdtrigSm `tselect_trigs` | pass | fail | W4 has 4 triggers, the ELFs are built for 2 |
+| InterruptsS `wfi_VS` | pass | fail | the timer interrupt of `RVMODEL_TIMER_INT_SOON_DELAY` = 100 arrives during the T-SBI round trip, before the test reads its trap count |
+
 ## Status at pin 8b9ddedc (MI step 4c, 2026-11-07)
 
 MI step 4c implemented the strided, indexed and fault-only-first segment
