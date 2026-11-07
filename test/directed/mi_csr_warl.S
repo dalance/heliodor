@@ -12,7 +12,8 @@
 //   8 hie <- ~0 with mie 0: VSSIE, VSTIE, VSEIE, and they are the mie bits
 //   9 mip <- VSSIP: an alias of hvip.VSSIP
 //  10 henvcfg <- ~0 with menvcfg 0: STCE and PBMTE read zero
-//  11 vsie <- ~0: SSIE, STIE, SEIE (LCOFIE is not delegable to VS)
+//  11 vsie <- ~0: zero with hideleg 0; with hideleg's VS bits set, SSIE,
+//     STIE, SEIE (LCOFIE is not delegable to VS), and they are the hie bits
 //  12 scountovf in M: the OF bit of mhpmevent3 shows with mcounteren 0
 //  13 mseccfg <- ~0: only PMM (Smmpm)
 #include "common/probe.h"
@@ -80,10 +81,19 @@ main:
     li      t0, 1 << 9
     or      s3, s3, t0
 2:  csrw    henvcfg, zero
+    csrw    hideleg, zero
+    li      t0, -1
+    csrw    vsie, t0
+    CHECK   11, vsie, 0
+    csrw    mie, zero
+    li      t0, 0x444
+    csrw    hideleg, t0
     li      t0, -1
     csrw    vsie, t0
     CHECK   11, vsie, 0x222
+    CHECK   11, hie, 0x444
     csrw    vsie, zero
+    csrw    hideleg, zero
     csrw    mcounteren, zero
     li      t0, 1
     slli    t0, t0, 63
