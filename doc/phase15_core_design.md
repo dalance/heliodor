@@ -90,6 +90,7 @@
 | D11 (2026-10-23) | SoC top (`heliodor_soc_smp`) の DRAM 側は、固定遅延を仮定する今の素のポート (`o_dmem_*`、write は応答なし) をやめ、遅延に耐える標準のメモリポート AXI4 にする。FPGA で実物の DRAM controller をつなぎやすくするためで、メモリ側のタイミングはコアの性質ではなく、つないだ slave の性質にする。新しいマイルストーン MM を M4 と MD の間に置く (順序は M4 → MM → MD → M5 → M6)。理由: M4 の手順 4 が mem_ctrl の outstanding (`MSHR_N`、`SPH`) を決め、MD の SBA は mem_ctrl に乗るので、先に遅延耐性のあるインタフェースを作ればやり直しが無い。旧コア (V14) は凍結で、V14 の枝の経路と数値は動かさない。設計は §MM。 |
 | D12 (2026-11-07) | 合成可能性のマイルストーン MS を M6 と MDOC の間に置く。発端: N=1 W2 の SoC を Vivado で合成すると、L2 のデータ配列 (512×512 bit × 4、組合せ読み 3 と書き込み 3、`L2_READ_1R1W = 0`) が RAM に推論できずに止まり、小さい配列 13 個が FF に展開され、elaboration に約 70 分かかった。多ポートの組合せ読みの SRAM は FPGA だけでなく ASIC でも実在しない。M6 の後に置く理由: L2、mem_ctrl と SoC は M6 までは V14 と共有で、V14 のビット一致の制約が外れてから作り直せる。設計は §MS。 |
 | D13 (2026-11-07、ユーザ) | M6 は旧コア (V14) を使わなくするが、`.veryl` のファイルは消さない。理由: リポジトリの veryl ファイル数をしばらく保つため。SoC の `CORE` の選択肢と既定値、harness の V14 の枝、V14 のゲートからは外す。`src/v14/` (凍結コピーを含む) と V14 用の tb は残し、`Veryl.toml` の `sources` にも残すので、`veryl check` と `veryl build` は解析し続ける。V14 専用の `#[test]` は `#[ignore]` にする。帰結: 共有のパッケージやモジュールのインタフェースを変えるとき (MS の L2 など) は、残った V14 のファイルも `veryl check` を通るように直す。V14 の挙動とビット一致は M6 の後は検査しない。D6 と本書の「M6 で消える」「`src/v14/` の削除」は、D13 により「使われなくなる (ファイルは残る)」と読む。 |
+| D14 (2026-11-08、ユーザ) | 検証環境を拡充するマイルストーン MV を M6 と MS の間に置く (順序は M6 → MV → MS → MDOC)。範囲は標準 RVFI ポート、spike とのオンライン co-simulation、乱数命令列、カバレッジ、RISC-V の公式 litmus テスト群。riscv-formal による形式検証は yosys に SoC を通す必要があるので MS の後に回す。co-simulation は Veryl の verification component (Rust で書き dynamic library として読み込む、`always_ff` と同じ NBA の意味で clock ごとに駆動される) で spike の libriscv を包み、native シミュレータの上でオンラインに比べる。component の crate は heliodor の中に置き、spike は Sail と同じく `toolchain/` の pin 付きの取得物にする。参照の ISS は spike とし、Sail は ACT4 の参照のまま残す。発端: golden は旧コアなので M5 と MI で足した H/V、RVA23.1、Zvbb、Sdtrig を命令単位で照合できず、GX は W2 と W4 で RTL を共有するので共通のバグが見えない (MI の出口の VSTIP/vsie の仕様違反は ACT の最後の signature で初めて見つかった)。MS の前に置く理由: MS の L2 と mem_ctrl の作り直しを、golden が照合できない範囲も含めて co-simulation で守る。設計は §MV。 |
 
 D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハーネスの arm は統合 SoC の上に載せ替える。V14 の arm は M6 まで旧来の bare ハーネス本体をそのまま保つ。理由: D6 の共存と、`v14_` 改名のビット一致受入 (§4.4) に必要なため。
 
@@ -110,7 +111,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | 深さ規則 1 | FU はレイテンシをパラメータとして公表し、スケジューラはそれだけを見る。 |
 | 深さ規則 2 | 各 writeback ポートを予約制にするか調停制にするかは設計時に決める。 |
 | 深さ規則 3 | op の識別子は op と一緒に運ぶ。ROB head のような生きた状態から読まない。 |
-| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MM 外部メモリインタフェース (D11 で追加) → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替 → MS 合成可能性 (D12 で追加) → MDOC ユーザ向けドキュメント (D10 で追加)。 |
+| マイルストーン | M0 設計文書 → M1 walking skeleton (最終構造 + 最も単純な policy, rv64ui の trace 一致。M0 のレビューで M1a 基盤と M1b 歩く骨格に分けた、§2.5) → M2 スカラ ISA 全体 (arch suite, ACT4, 1-hart Linux lockstep) → M3 幅とポート (2-2-2-1-2 → 4-4-6-2-4, dcache/MMU 2 ポート, sweep) → M4 SMP → MM 外部メモリインタフェース (D11 で追加) → MD デバッグ (D9 で追加) → M5 H/V → M6 既定コアの切替 → MV 検証環境の拡充 (D14 で追加) → MS 合成可能性 (D12 で追加) → MDOC ユーザ向けドキュメント (D10 で追加)。 |
 | 再利用 | dcache/MMU は内部ロジックを再利用し、CPU 側を N ポートで作り直す (インタフェースは最初から N ポート、実装は M1-M2 で 1 ポート、M3 で 2 ポート)。ロジックとして再利用するもの: L2/coherence/mem_ctrl/bus, CSR, FPU, VU, decoder, 周辺, パッケージ, 検証資産。 |
 | golden | `b0f4668`。mtime を retire 命令数で進めるモードと、RVFI 寄せの retire ポートを使う (具体化は D1/D2)。 |
 
@@ -221,6 +222,7 @@ D3 の補足: D3 の載せ替えは新コアに適用する。新コアのハー
 | MD | DMI を駆動する directed test (N=1、N=4、GD)、OpenOCD+GDB による riscv-tests の debug suite (GG、spike と同じ範囲)。DMI が idle のとき M4 までのゲートの結果が MD の前とビット一致する。 | §D の新規モジュールが cold-reader gate を通過。knob 0 個。`chk_debug` と `chk_dm` がすべてのテストで 0。§D.15 の事象が GF で 0 より大きい。 |
 | M5 | hvlinux、vector のテスト群。 | VU の上限を修正するか宣言する (§3.4)。 |
 | M6 | 既定コアを切り替える。旧コアを SoC と harness とゲートから外す (ファイルは残す、D13)。 | M6 での変更は、V14 を外すことと既定値の変更だけ。`veryl check` が残した V14 のファイルを含めて通る。 |
+| MV | GC (spike との co-simulation) が arch、ACT4 の全 suite、directed、N=1 の Linux boot (5.15、6.6、7.1、7.1v)、hvlinux で不一致 0 で通る。GR (乱数命令列) の固定 seed の集合が GC 付きで通る。GLT (公式 litmus) で禁止された結果が 0。M6 のゲートの結果が MV の前と一致する (GL-B は record 列と hash まで)。 | RVFI ポートが riscv-formal の信号の定義に合う。新しいモジュールと component が cold-reader gate を通る。GCV (カバレッジ) を記録し、穴を directed で埋めるか理由付きで宣言する。 |
 | MS | M6 の全ゲートを両構成で通り、GL-B の record 列と hash が MS の前と一致する。 | 配列の棚卸しの全行が分類の規則に合う。Vivado の合成が N=1 W2 の SoC で完走し、規則の閾値を超える配列が FF に展開されず、SRAM に分類した配列がすべて RAM に推論される。 |
 | MDOC | 英語版と日本語版の book が警告なしで build でき、book の中のコマンドが実際に動く。 | ja の翻訳に fuzzy と未翻訳が無い。ゲートの結果には触れない (コードを変えない)。 |
 
@@ -5121,9 +5123,21 @@ MI の進捗:
 - 出口条件: 新コアが既定で、検証計画 §1.2 の M6 列のゲート (G0、GA/GL-C、GL-B、GB1、GT4、GB2、GB4、GH、GX、GV、GD、GG をすべて) を両構成で通る。M6 のコミットの変更は、V14 を外すことと既定値の変更だけである (第 0 部 §2.5、D13)。残した V14 のファイルを含めて `veryl check` が通る。
 - M6 の後: misa の F/D/C の扱い (§C.9) をユーザが判断する。RVA23 の不足分と G13 は MI で扱う (U16)。
 
+### MV: 検証環境の拡充
+
+- 目標: 旧コアの golden に頼らずに、新コアの全 ISA を命令単位で照合できるようにする (D14)。M6 の後、MS の前に置く。
+- 作業の順序:
+  1. V1 標準 RVFI ポート: `RetireRec` に rs1/rs2 の番号と読み値、load の値、`intr`、`halt`、CSR の読み値と WARL 後の値を足し、riscv-formal の `rvfi_*` (NRET = commit 幅) を出す adapter を置く。H/V と vector は名前を決めた拡張にする。今の tracer と hash は変えず、GL-B の record 列と hash を保つ。
+  2. V2 spike との co-simulation (GC): spike の libriscv を C++ の shim で包んだ Veryl の component を作り、RVFI の lane を毎サイクル受けて spike を 1 命令ずつ進め、pc、insn、rd、store、CSR、trap を比べる。割込みは `intr` を見て spike の MIP に反映し、mtime と MMIO の読み値は RVFI の load の値で上書きする。N=1 から始め、SMP は hart ごとの spike と load 値の流し込みで広げる。spike を `toolchain/` に足す。
+  3. V3 乱数命令列 (GR): riscv-dv の Python 版か自作の生成器で、scalar、FP、V、CSR、特権の遷移、ページ表を混ぜた命令列を作り、GC で判定する。固定 seed の集合をマイルストーンの末に回す。
+  4. V4 カバレッジ (GCV): RVFI の trace から命令×特権、trap の cause、CSR、vtype の格子などを集計し、GV の構成で Verilator の line/toggle カバレッジを取る。記録のみ。
+  5. V5 公式 litmus (GLT): RISC-V の litmus テスト群を bare-metal にし、N=2/N=4 の W2/W4 で回して herd のモデルが許す結果と照合する。
+- MS の後: riscv-formal を V1 の RVFI につなぐ (V6)。
+- 出口条件: 上の表の MV の行。
+
 ### MS: 合成可能性
 
-- 目標: 新コアと SoC のすべての配列を、実在する記憶素子 (SRAM マクロ、FF で作るレジスタファイル、FF) に対応する形にし、FPGA と ASIC の合成が通ることを機械的に確かめる。M6 の後に置く (D12)。
+- 目標: 新コアと SoC のすべての配列を、実在する記憶素子 (SRAM マクロ、FF で作るレジスタファイル、FF) に対応する形にし、FPGA と ASIC の合成が通ることを機械的に確かめる。M6 の後に置く (D12)。D14 で MV を間に入れたので、MV の後になる。
 - 作業の順序:
   1. 棚卸し: 新コアと SoC の全配列について、容量、読みと書きのポート数、読みが同期か組合せか、リセットの有無を一覧にする。旧コアの `doc/sram_inventory.md` の分類を出発点にする。
   2. 分類の規則を決める: SRAM マクロ (1RW か 1R1W、同期読み、リセット無し)、レジスタファイル (多ポートの小さい配列。FF と書き込み decoder で作る、§5.15)、FF。閾値 (どの容量から SRAM でなければならないか) はここで決める。
