@@ -978,7 +978,7 @@ MI の手順 1-4c の後に、設計書の MI の出口条件の表のうち手�
 | GV (W2、Verilator) | hvlinux 18,611,543、N=1 14,617,653、N=2 19,380,793、litmus N=4 5,029,779、N=4 24,989,451 (instret 14,805,212、hart ごとの chk 0、wall 3 時間 39 分) がすべて PASSED | native の GH/GB1/GB2/GT4 と手順 4c の GB4 | 一致 |
 | GV (W4、Verilator) | hvlinux 16,187,826、N=1 12,286,458、N=2 16,811,410、litmus N=4 5,028,524、N=4 22,640,641 (instret 14,730,876、hart ごとの chk 0、wall 6 時間 43 分) がすべて PASSED | native の GH/GB2 と M5 の GV | 一致 |
 | GG | w2_n1 pass 52 (下)、w4_n1 pass 49、w2_n4 pass 6、w2_n4_smp pass 5。`gg_compare.py` の FAIL は 4 target とも 0 | M5: 52 / 49 / 6 / 5 | 一致 |
-| GF | MI の 9 行がすべて 0 より大。matrix 全体で 0 は `dc.nf_busy` の 1 行 | M5: 29 行 | §5.2 の【MI の末で記録】 |
+| GF | MI の 9 行がすべて 0 より大。matrix 全体で 0 だった `dc.nf_busy` は directed `test_axi_dc_nf_busy` (`d34f8c4d`) で 2 | M5: 29 行 | §5.2 の【MI の末で記録】 |
 | GS | §6.2 の MI の行 | M5 の完了 `ba4282e9` と同じ veryl で対 | 記録 (sim が約 4.6 % 遅い、fallback 0) |
 | V14 | dhrystone 235,804 (instret 264,834)、coremark 394,546 (374,357) | M5 と同一 | ビット一致 |
 
