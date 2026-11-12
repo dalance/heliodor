@@ -51,8 +51,8 @@ heliodor/
 ├── CLAUDE.md
 ├── Veryl.toml              # Project configuration
 ├── src/
-│   ├── core/               # Shared core blocks (decoder, FPU, CSR, VU), SoC, and the Phase 15 core
-│   ├── v14/                # Old core (v14_ prefix), frozen; default until Phase 15 M6
+│   ├── core/               # The core (configs W2 default, W4), shared blocks (decoder, FPU, CSR, VU), SoC
+│   ├── v14/                # Old core (v14_ prefix), frozen and kept for reference; no longer used by the SoC
 │   ├── cache/              # I-Cache / D-Cache / shared L2 / memory_bus
 │   ├── mmu/                # Sv39 MMU
 │   ├── peripheral/         # UART, CLINT, PLIC
@@ -107,46 +107,57 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
   second backend (e.g. `--backend cranelift` or `--backend interpret`): two
   independent backends agreeing is strong evidence the RTL, not the sim, is at fault.
 - **Regression testing**: After modifying heliodor or veryl, run the multi-step regression.
-  (The icache real-SRAM read + fetch-directed-prefetch bundle is **default-on** since 2026-07-23 —
-  `ICACHE_SYNC_READ`/`ICACHE_FETCH_DIRECTED`/`ICACHE_FTB_COND`/`ICACHE_FIFO_BYPASS` all default 1; see
-  `doc/cp_icache_fetch_decouple_plan.md` §27. It costs ~+8 % IPC, so the boot/litmus cycle counts below
-  are the post-flip baseline — the pre-flip figures were ~8 % lower.)
-  1. `veryl test` — fast tests **+ the arch suite** (~150 tests, seconds-to-~minute;
-     the rv64ui/um/ua/mi/si arch tests in `tb/test_arch_common.veryl` and the
-     rv64uf/ud FP tests in `tb/test_arch_fp.veryl` are NOT `#[ignore]` and run here,
-     on the OoO core). Fix any failures before proceeding.
-  2. `veryl test --ignored --test test_litmus_4hart` — P9.0 RVWMO litmus battery
-     at N=4 (IRIW + 4-way barrier/bus stress; **~5.6M cycles** at icache default-on — was ~2.5M at P9.1;
-     P9.3.B `7beb31a` retired the bus-wide AMO lock for in-cache MESI atomics, so
-     the contended-atomic litmus now pays line-bounce/RFO cost — by design, not a
-     regression; N=2 is ~2.1M). On this shared box that is ~10 min, and its probe
-     prints only every 5M cycles, so a PASS shows one `cy=0x2710` line then the
-     `litmus(N=4): … pass=1` line — "stuck at cy=0x2710" for minutes is NORMAL, not
-     a hang. The N=2 battery (`test_litmus_2hart`) already runs in step 1. Any
-     forbidden-outcome hit is a memory-model bug — see `test/litmus/litmus.S` for
-     the tohost encoding.
+  The default core is the W2 config (2-wide); each ladder test below runs it. W4 (4-wide)
+  has explicit counterparts (`test_w4_litmus_4hart`, `test_w4_smp_linux_boot_2hart`,
+  `test_w4_hvlinux`, `test_w4_linux_boot`); run them too when a change can differ
+  between the configs. Cycle counts are the W2 values; wall times are from this
+  shared box and vary with its load.
+  1. `veryl test`: fast tests **+ the arch suite** (~830 tests, tens of minutes).
+     The riscv-tests arch suites run on the default core as the `test_w2_*` modules
+     (`tb/test_w2_rv64*.veryl`, with W4 copies in `tb/test_w4_*`), most of them in
+     golden lockstep. Fix any failures before proceeding.
+  2. `veryl test --ignored --test test_litmus_4hart`: RVWMO litmus battery at N=4
+     (IRIW + 4-way barrier/bus stress; **5,029,779 cycles**). The native sim runs a
+     4-hart SoC at only ~600 cy/s, so this takes hours; the Verilator wrapper
+     `tb_litmus_4hart.sv` gives the same cycle count faster. The N=2 battery
+     (`test_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
+     memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (~19.2M cycles, ~3 min). N=1 single-hart is `--ignored --test test_soc_linux_boot`
-     (~14.2M cycles, ~1 min).
-  4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart` — N=4 SMP Linux boot
-     (~25.2M cycles; ~6.9k cy/s of CPU time, so **~1 h CPU**, measured 2026-10-16).
-     Wall time depends on the load of this shared box: budget well over an hour.
-     Cycle counts drift with perf work, so treat large unexplained jumps as
-     regressions (N=4 has a ±1M timing band).
+     (**19,380,793 cycles**, ~30 min). N=1 single-hart is `--ignored --test
+     test_soc_linux_boot` (**14,617,653 cycles**, ~7 min). The N=1 boot in golden
+     lockstep (retire-count mtime, trace hash checked against the old-core golden) is
+     `--ignored --test test_w2_linux_boot_lockstep` (14,570,718 cycles, ~7 min); run it
+     after any change that can alter the retire stream.
+  4. N=4 SMP Linux boot (**24,989,451 cycles**), judged on **Verilator** for both W2
+     and W4: the native sim is too slow at N=4 (W2 ~11-16 h, W4 ~48 h), while the
+     Verilator `-O1` build runs W2 in ~3.5 h (W4 ~7 h) with identical cycle counts.
+     Build with `-O1 -j 2` (`-O3` ICEs on the 4-hart top) from the project root:
+     ```bash
+     veryl build
+     verilator --binary --top-module tb_soc_smp_linux_boot_4hart -f heliodor.f \
+               sim/verilator/tb_soc_smp_linux_boot_4hart.sv --timing -Wno-fatal -O1 -j 2 \
+               --Mdir sim/verilator/build_n4 -o tb_soc_smp_linux_boot_4hart
+     sim/verilator/build_n4/tb_soc_smp_linux_boot_4hart   # prints "... PASSED ..."
+     ```
+     For W4 use `tb_soc_smp_linux_boot_4hart_w4` (22,640,641 cycles). The native
+     `test_soc_smp_linux_boot_4hart` still exists; it returns to the ladder if the
+     native sim becomes faster than Verilator at N=4.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
-     hypervisor (~20.4M cycles, ~5 min). The only gate that runs the two-stage (V=1)
-     MMU under load; the native boots never leave single-stage translation, so a
-     change to the shared dmem MMU or the load path can pass steps 1-4 and still
-     deadlock here. Needs `test/hv/hv_dram.hex` (gitignored; see the Verilator
-     table for its `make -C test/hv` line).
-- **Microbenchmarks**: `tb/test_bench.veryl` has 5 `#[ignore]` perf tests
-  (`test_dhrystone`, `test_bench_{memcpy,multiply,median}`, `test_coremark`)
-  that print cycles + retired instructions (IPC = instret / cycles, frozen at
-  `tohost`). NOT a regression gate — run
-  individually, e.g. `veryl test --ignored --test test_dhrystone`. Current
+     hypervisor (**18,611,543 cycles**, ~10 min). The only gate that runs the
+     two-stage (V=1) MMU under load; the native boots never leave single-stage
+     translation, so a change to the dmem MMU or the load path can pass steps 1-4
+     and still deadlock here. Needs `test/hv/hv_dram.hex` (gitignored; see the
+     Verilator table for its `make -C test/hv` line).
+- **Microbenchmarks**: `tb/test_core_bench.veryl` has `#[ignore]` perf tests for the
+  default core, `test_cbench_w2_{dhrystone,coremark,fpmm,spmv}` and the
+  `test_cbench_w4_*` counterparts, that print cycles + retired instructions
+  (IPC = instret / cycles, frozen at `tohost`). NOT a regression gate; run
+  individually, e.g. `veryl test --ignored --test test_cbench_w2_coremark`. Current
   numbers are in README.md. CoreMark runs ITERATIONS=1 with the upstream EEMBC
   sources vendored under `test/c/coremark/` (port layer: core_portme.*,
   start.S, link.ld; tohost at PA 0x80008000 → TOHOST_IDX 8192).
+  `tb/test_bench.veryl` is the old (V14) core's bench, kept but `#[ignore]` and
+  no longer tracked.
 - **Formatting**: `veryl fmt`. Note: bare `veryl fmt` reformats the ENTIRE repo;
   before a focused commit, format by hand in the surrounding style instead.
 - **Stale lock**: If a previous `veryl test` was killed, delete `.build/lock` before re-running: `rm -f .build/lock`
@@ -159,8 +170,9 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
 The official `riscv-software-src/riscv-tests` ISA tests are integrated
 under `test/riscv-arch-test/`. The upstream is cloned (not a git
 submodule) into `upstream/`, and the suites are built as `.hex` files
-under `build/<suite>/`. The Veryl `#[test]` modules are hand-maintained
-inline in `tb/test_arch_common.veryl` + `tb/test_arch_fp.veryl`.
+under `build/<suite>/`. The Veryl `#[test]` modules for the default core are
+`tb/test_w2_<suite>.veryl` (and `tb/test_w4_<suite>.veryl`), generated by
+`test/gates/gen_core_tests.py` from the lists in `test/gates/*.list`.
 
 Build the hex files (one-time, requires riscv64-unknown-elf-gcc):
 
@@ -171,21 +183,21 @@ make -C test/riscv-arch-test
 Run all rv64ui ISA tests:
 
 ```bash
-veryl test --test test_arch_rv64ui          # substring filter, all rv64ui tests
+veryl test --test test_w2_rv64ui            # substring filter, all rv64ui tests
 ```
 
 Each test loads its hex into a 1 MB DRAM mapped at PA 0x80000000 and
 boots heliodor at that address. Pass/fail is signalled via the standard
 riscv-tests `tohost` mechanism (write to PA 0x80001000): `tohost == 1`
 means all subtests passed; `tohost > 1` means subtest with that ID
-failed. The OoO-core arch harness + per-test modules live inline in
-`tb/test_arch_common.veryl` (rv64ui/um/ua/mi/si) and `tb/test_arch_fp.veryl`
-(rv64uf/ud); they are NOT `#[ignore]`, so they run as part of the default
-`veryl test`. The `--test test_arch_rv64ui` substring just narrows the run.
-The hex files are built by `make -C test/riscv-arch-test` (from the cloned
-`upstream/`); the test modules themselves are hand-maintained inline in
-`test_arch_common.veryl` / `test_arch_fp.veryl` (the old `gen_tb.py` v1
-generator was removed in the cleanup).
+failed. The harness is `test_arch_common_harness` in
+`tb/test_arch_common.veryl`, selected per core with its `CORE` param; most
+W2 tests also run in lockstep against golden checkpoint files under
+`test/golden/arch/`. The tests are NOT `#[ignore]`, so they run as part of the
+default `veryl test`; `--test test_w2_rv64ui` just narrows the run. Edit the
+lists and rerun the generator rather than the generated files. The old-core
+arch modules still in `tb/test_arch_common.veryl` and `tb/test_arch_fp.veryl`
+duplicate these and are `#[ignore]`.
 
 ## Running Tests on Verilator
 
@@ -198,14 +210,19 @@ Native Veryl `#[test]` modules use `$tb::clock_gen`/`reset_gen` and cannot run
 on Verilator, so thin SV wrappers in `sim/verilator/` instantiate the harness
 modules `veryl build` emits to `tb/*.sv`:
 
-| Wrapper                              | Config | Harness                                  |
-|--------------------------------------|--------|------------------------------------------|
-| `tb_soc_linux_boot.sv`               | N=1    | `heliodor_test_soc_linux_boot_harness`   |
-| `tb_soc_smp_linux_boot_2hart.sv`     | N=2    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=2) |
-| `tb_soc_smp_linux_boot_4hart.sv`     | N=4    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=4) |
-| `tb_soc_smp_linux_boot_8hart.sv`     | N=8    | `heliodor_test_soc_smp_linux_boot_harness` #(N_HARTS=8) |
-| `tb_litmus_4hart.sv`                 | N=4    | `heliodor_test_litmus_harness` #(N_HARTS=4) (P9.0 RVWMO litmus) |
-| `tb_soc_hvlinux.sv`                  | V=1    | `heliodor_test_soc_hvlinux_harness` (P11-H5.2b type-1 hypervisor + guest Linux; `make -C test/hv GUEST=Image GUEST_DTB=guest.dtb` first) |
+All wrappers drive `heliodor_boot_soc_harness` except `tb_soc_linux_boot*.sv`,
+which use `heliodor_test_soc_linux_boot_harness` (itself a thin layer over it).
+The unsuffixed wrappers use the default core (W2); the `_w2`/`_w4` variants pin
+`CORE`.
+
+| Wrapper                                   | Config | Notes |
+|-------------------------------------------|--------|-------|
+| `tb_soc_linux_boot{,_w2,_w4}.sv`          | N=1    | 5.15 boot |
+| `tb_soc_smp_linux_boot_2hart{,_w2,_w4}.sv`| N=2    | 5.15 SMP boot |
+| `tb_soc_smp_linux_boot_4hart{,_w2,_w4}.sv`| N=4    | 5.15 SMP boot; ladder step 4 (`-O1 -j 2`) |
+| `tb_soc_smp_linux_boot_8hart.sv`          | N=8    | not verified on the current core |
+| `tb_litmus_4hart{,_w2,_w4}.sv`            | N=4    | RVWMO litmus |
+| `tb_soc_hvlinux{,_w2,_w4}.sv`             | V=1    | type-1 hypervisor + guest Linux; `make -C test/hv GUEST=Image GUEST_DTB=guest.dtb` first |
 
 Build + run (from the project root, so the harness `$readmemh` paths resolve):
 
@@ -217,6 +234,7 @@ verilator --binary --top-module tb_soc_smp_linux_boot_2hart -f heliodor.f \
 sim/verilator/build_n2/tb_soc_smp_linux_boot_2hart  # prints "... PASSED ..." on x3==0xAA
 ```
 
+The 4-hart tops need `-O1 -j 2` instead of `-O3` (see ladder step 4).
 Comment lines must not start with the word `verilator` (Verilator parses
 `// verilator ...` as a pragma — `BADVLTPRAGMA`). The `build_*/` output dirs are
 gitignored. Add a new wrapper by copying one of the above and rewiring the ports.

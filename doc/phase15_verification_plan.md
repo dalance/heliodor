@@ -7,7 +7,7 @@
 | 語 | 意味 |
 |---|---|
 | golden | `b0f4668` に観測専用パッチを当てた旧コア。別 worktree でだけビルドする (D1)。 |
-| V14 | master 上で `v14_` に改名された旧コア。SoC の `CORE=V14` で選ぶ。M6 まで既定コアとしてゲートを通り続ける (D6)。golden とは別物。 |
+| V14 | master 上で `v14_` に改名された旧コア。M6 まで SoC の `CORE=V14` で選ぶ既定コアとしてゲートを通り続けた (D6)。M6 で SoC、harness、ゲートから外したが、`src/v14/` のファイルは残す (D13)。golden とは別物。 |
 | W2 / W4 | 新コアの `cfg_w2` / `cfg_w4` (`CORE=W2/W4`)。 |
 | record | `retire_pkg::RetireRec` 1 個 (設計書 §5.12)。`IrqEvent` は record ではない。 |
 | trace | record と IrqEvent を order 順に直列化したテキスト。lane 数に依存しない (§4.4)。 |
@@ -66,7 +66,7 @@
 
 【決定】(D11) MM (外部メモリインタフェース、設計書 §MM) は M4 と MD の間のマイルストーンで、AXI4 の slave model と protocol checker (GP) を MM から全 run に入れる。GM は乱数遅延の再走で、MM 以降は GL-B と GT2 short を毎コミット、重いゲートを節目に回す。MD 以降の列は MM を含む。
 
-旧コア (V14) は M6 まで既定コアであり、CLAUDE.md の梯子 1-5 (既定、litmus4、N=2 boot、N=4 boot、hvlinux) をそのまま回し続ける。
+旧コア (V14) は M6 まで既定コアであり、CLAUDE.md の梯子 1-5 (既定、litmus4、N=2 boot、N=4 boot、hvlinux) をそのまま回し続ける。【M6 で更新】(2026-11-12) M6 で既定コアは新コアの W2 になり、梯子 1-5 は同じテスト名のまま新コアを回す。梯子 4 (N=4 boot) は W2、W4 とも Verilator で判定する (§6.3 の 6.)。V14 の梯子は回さない。
 
 ### 1.3 コミットごとの運用
 
@@ -280,7 +280,7 @@ litmus の histogram (0x8000_4000) と barrier 語 (0x8000_6000) の DRAM ダン
 
 ### 2.5 コアの選択と旧コアとの共存 (D6)
 
-- SoC と各 harness は `CORE` param を持ち、generate-if で枝を選ぶ。V14 枝は旧 harness 本体の逐語移設なので、V14 のゲート結果は動かない。M6 では V14 枝と `src/v14/`、V14 専用の印字を削除し、`CORE` の既定値を変える。
+- SoC と各 harness は `CORE` param を持ち、generate-if で枝を選ぶ。V14 枝は旧 harness 本体の逐語移設なので、V14 のゲート結果は動かない。M6 では V14 枝と V14 専用の印字を削除し、`CORE` の既定値を変える。【D13 で変更】`src/v14/` と V14 用の tb のファイルは削除せずに残し、`veryl check` が解析し続ける。V14 専用の `#[test]` は `#[ignore]` にする。
 - 【決定】新コアのテストは、ゲートリスト `test/gates/<milestone>.list` から `test/gates/gen_core_tests.py` が生成するラッパ (`tb/test_w2_*.veryl`、`tb/test_w4_*.veryl`) で走らせる。生成物は既定スイートに入るのでコミットする。ラッパは `CORE` を明示し、早期終了ループと golden checkpoint ファイルの param を持つ。理由: 1 回の `veryl test` で V14 と W2/W4 を同時に回せる。
 - 【決定】(M2) 生成される suite のファイル (`tb/test_<core>_<suite>.veryl`) 1 つにつき、それを生成するゲートリストはちょうど 1 つとする。M2 のリストは領域ごとに分け、lockstep のリスト (`m2_<領域>.list`) と pass/fail のリスト (`m2_<領域>_pf.list`、`--no-lockstep`) が同じ suite を持たないようにする。理由: `gen_core_tests.py` は 1 回の実行で suite ごとのファイルを丸ごと書き直し、その実行が作らないファイルには触れない。2 つのリストが同じ suite のエントリを持つと、後に生成した方がもう一方のエントリを消す。
 - 【M1a で決定】テンプレートを変えない既存テスト (ACT4 の生成テスト、`test_arch_fp` 等) と Verilator ラッパは、harness の `CORE` の既定値 `tb_core_sel::CORE` に従う。この定数を `#[ifdef]` で切り替え、`veryl test --define CORE_W2` (および Verilator 用の `veryl build`) で新コアを選ぶ案を spike (設計書 §3.7) で確かめる。測るのは、package const への `#[ifdef]` が `test` と `build` の両方で効くかどうかである。だめなら Verilator 用に `#(.CORE(...))` だけを足した新しいラッパファイルを追加し、既存ファイルには触れない。define を切り替えると `.build` の再構築が起きるので、構成ごとに worktree を分けるか直列に回す (veryl は同時に 1 起動まで)。
