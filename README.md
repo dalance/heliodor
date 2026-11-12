@@ -207,9 +207,8 @@ non-delegated VS interrupts, `mtval2`, and an end-to-end mini-hypervisor). The
 Linux boots are `#[ignore]`d (run them by name, e.g.
 `--test test_soc_71_smp_linux_boot_2hart`, or `--test test_soc_hvlinux` for the
 guest boot); the 7.1 kernel is built with `CONFIG_FPU=y`, so its boot drives the
-FP unit through real kernel context switches. The boot is additionally
-cross-checked on Verilator (the 4-hart boot is judged there, as the native
-simulator is much slower at N=4); see `CLAUDE.md`.
+FP unit through real kernel context switches. The boots are additionally
+cross-checked on Verilator; see `CLAUDE.md`.
 
 ## Microbenchmarks
 

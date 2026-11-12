@@ -117,9 +117,7 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      (`tb/test_w2_rv64*.veryl`, with W4 copies in `tb/test_w4_*`), most of them in
      golden lockstep. Fix any failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart`: RVWMO litmus battery at N=4
-     (IRIW + 4-way barrier/bus stress; **5,029,779 cycles**). The native sim runs a
-     4-hart SoC at only ~600 cy/s, so this takes hours; the Verilator wrapper
-     `tb_litmus_4hart.sv` gives the same cycle count faster. The N=2 battery
+     (IRIW + 4-way barrier/bus stress; **5,029,779 cycles**). The N=2 battery
      (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
      memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
@@ -128,20 +126,10 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      lockstep (retire-count mtime, trace hash checked against the old-core golden) is
      `--ignored --test test_w2_linux_boot_lockstep` (14,570,718 cycles, ~7 min); run it
      after any change that can alter the retire stream.
-  4. N=4 SMP Linux boot (**24,989,451 cycles**), judged on **Verilator** for both W2
-     and W4: the native sim is too slow at N=4 (W2 ~11-16 h, W4 ~48 h), while the
-     Verilator `-O1` build runs W2 in ~3.5 h (W4 ~7 h) with identical cycle counts.
-     Build with `-O1 -j 2` (`-O3` ICEs on the 4-hart top) from the project root:
-     ```bash
-     veryl build
-     verilator --binary --top-module tb_soc_smp_linux_boot_4hart -f heliodor.f \
-               sim/verilator/tb_soc_smp_linux_boot_4hart.sv --timing -Wno-fatal -O1 -j 2 \
-               --Mdir sim/verilator/build_n4 -o tb_soc_smp_linux_boot_4hart
-     sim/verilator/build_n4/tb_soc_smp_linux_boot_4hart   # prints "... PASSED ..."
-     ```
-     For W4 use `tb_soc_smp_linux_boot_4hart_w4` (22,640,641 cycles). The native
-     `test_soc_smp_linux_boot_4hart` still exists; it returns to the ladder if the
-     native sim becomes faster than Verilator at N=4.
+  4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: N=4 SMP Linux boot
+     (**24,989,451 cycles**). W4 is `test_w4_smp_linux_boot_4hart` (22,640,641
+     cycles, ~5 h at ~1.3k cy/s). The Verilator wrappers give identical cycle counts
+     and serve as the NBA cross-check, not the gate.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
      hypervisor (**18,611,543 cycles**, ~10 min). The only gate that runs the
      two-stage (V=1) MMU under load; the native boots never leave single-stage
@@ -234,7 +222,7 @@ verilator --binary --top-module tb_soc_smp_linux_boot_2hart -f heliodor.f \
 sim/verilator/build_n2/tb_soc_smp_linux_boot_2hart  # prints "... PASSED ..." on x3==0xAA
 ```
 
-The 4-hart tops need `-O1 -j 2` instead of `-O3` (see ladder step 4).
+The 4-hart tops need `-O1 -j 2` instead of `-O3` (`-O3` ICEs on them).
 Comment lines must not start with the word `verilator` (Verilator parses
 `// verilator ...` as a pragma — `BADVLTPRAGMA`). The `build_*/` output dirs are
 gitignored. Add a new wrapper by copying one of the above and rewiring the ports.
@@ -242,3 +230,8 @@ gitignored. Add a new wrapper by copying one of the above and rewiring the ports
 ## Sandbox Restrictions
 
 - **Do NOT use `ps`** to check for running processes. The `ps` command does not work correctly inside the sandbox and produces misleading results (e.g., empty output even when processes are running). Instead, wait for command completion via the shell's return or use the timeout mechanism.
+- **Run long simulations outside the sandbox.** The sandbox kills detached `gcc`, so the
+  cc backend's compiled `.so` may never land and the run silently falls back to a path
+  10-100x slower. For boots and N=4 runs use `VERYL_AOT_C_ASYNC=0 VERYL_BACKEND_DIAG=1
+  veryl test ... --format json` and check that the JSON reports `fell_back: 0`.
+  `--format json` holds all `$display` output until the test ends.
