@@ -120,7 +120,7 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      (IRIW + 4-way barrier/bus stress; **5,029,779 cycles**). The native sim runs a
      4-hart SoC at only ~600 cy/s, so this takes hours; the Verilator wrapper
      `tb_litmus_4hart.sv` gives the same cycle count faster. The N=2 battery
-     (`test_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
+     (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
      memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
      (**19,380,793 cycles**, ~30 min). N=1 single-hart is `--ignored --test
