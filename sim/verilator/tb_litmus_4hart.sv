@@ -1,31 +1,51 @@
-// SystemVerilog wrapper to run the P9.0 RVWMO litmus battery (N=4, IRIW
-// included) on an external SV simulator. Drives heliodor_test_litmus_harness
-// with the 4-hart hex and polls o_pass/o_fail (riscv-tests tohost protocol:
-// 1 = pass, even = forbidden outcome / trap). The harness itself dumps the
-// outcome histogram when tohost goes non-zero.
+// SystemVerilog wrapper to run the RVWMO litmus battery (N=4) on the default
+// core on an external SV simulator. Drives heliodor_boot_soc_harness as the
+// native test_litmus_4hart does (no ROM, MAP_ARCH, tohost protocol:
+// 1 = pass, anything else = forbidden outcome / trap).
 // See CLAUDE.md "Running Tests on Verilator" for the build/run commands.
+// AXI_SEL picks the tb AXI4 slave timing (0 FIXED, 1 SLOW, 2 BACKPRESSURE,
+// 3 REORDER) and AXI_SEED its seed; set them at build time with -G, e.g.
+// -GAXI_SEL=3 -GAXI_SEED=1.
 
 `timescale 1ns/1ps
 
-module tb_litmus_4hart;
+module tb_litmus_4hart #(
+    parameter int unsigned AXI_SEL  = 0,
+    parameter int unsigned AXI_SEED = 1
+);
+    localparam heliodor_axi4_tb_pkg::SlaveCfg AXI_CFG =
+        AXI_SEL == 1 ? heliodor_axi4_tb_pkg::SLOW :
+        AXI_SEL == 2 ? heliodor_axi4_tb_pkg::BACKPRESSURE :
+        AXI_SEL == 3 ? heliodor_axi4_tb_pkg::REORDER : heliodor_axi4_tb_pkg::FIXED;
+
     logic        clk;
     logic        rst;
     logic        pass;
     logic        fail;
-    logic [31:0] tohost;
-    logic [31:0] cy;
+    logic [63:0] cycles;
 
-    heliodor_test_litmus_harness #(
-        .N_HARTS (4),
-        .HEX_DRAM("test/litmus/litmus_n4.hex")
+    heliodor_boot_soc_harness #(
+        .N_HARTS    (32'd4),
+        .DRAM_HEX   ("test/litmus/litmus_n4.hex"),
+        .ROM_EN     (1'b0),
+        .PMA_N      (heliodor_tb_platform_pkg::MAP_ARCH_N),
+        .PMA_REGIONS(heliodor_tb_platform_pkg::MAP_ARCH),
+        .RESET_PC   (64'h8000_0000),
+        .PASS_BY_X3 (1'b0),
+        .TOHOST_PA  (64'h8000_1000),
+        .AXI_CFG (AXI_CFG),
+        .AXI_SEED(AXI_SEED)
     ) dut (
-        .clk     (clk),
-        .rst     (rst),
-        .o_pass  (pass),
-        .o_fail  (fail),
-        .o_tohost(tohost),
-        .o_cy    (cy)
-        // o_pc_all / o_ret_all / o_trapc_all left unconnected
+        .clk      (clk),
+        .rst      (rst),
+        .o_pass   (pass),
+        .o_fail   (fail),
+        .o_x3     (),
+        .o_cycles (cycles),
+        .o_instret(),
+        .o_last_pc(),
+        .o_ret_cnt(),
+        .o_traps  ()
     );
 
     initial clk = 1'b0;
@@ -41,13 +61,13 @@ module tb_litmus_4hart;
             @(posedge clk);
             if (pass || fail) break;
             if (i % 1_000_000 == 0)
-                $display("  [verilator litmus n4] cy=%0d tohost=%h", cy, tohost);
+                $display("  [litmus N=4] cy=%0d", cycles);
         end
-        $display("[tb_litmus_4hart] pass=%0b fail=%0b tohost=%h cy=%0d", pass, fail, tohost, cy);
+        $display("[tb_litmus_4hart] axi_sel=%0d seed=%0d pass=%0b fail=%0b cy=%0d", AXI_SEL, AXI_SEED, pass, fail, cycles);
         if (pass)
             $display("LITMUS(N=4) PASSED on Verilator (tohost==1)");
         else
-            $display("LITMUS(N=4) FAILED on Verilator (tohost=%h: ((test<<8|slot)<<4)|2 = forbidden outcome, (mcause<<8)|0xE0 = trap, 0 = timeout)", tohost);
+            $display("LITMUS(N=4) FAILED or timed out on Verilator (fail=%0b)", fail);
         $finish;
     end
 endmodule

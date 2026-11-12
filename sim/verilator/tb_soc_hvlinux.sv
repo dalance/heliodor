@@ -1,19 +1,9 @@
-// SystemVerilog wrapper to cross-check the P11-H5.2b hypervisor guest-Linux boot
-// on an independent SV simulator with standard NBA semantics — the companion to
-// tb_soc_linux_boot.sv etc. for the V=1 hypervisor path. cc and cranelift share
-// the Veryl front-end, so this fully independent flow guards against Veryl-sim
-// artifacts (it was instrumental in confirming the blocker-1 two-stage o_fault
-// hazard was real RTL, not a sim quirk).
-//
-// The harness loads test/hv/{hvfw.hex,hv_dram.hex} itself ($readmemh) and echoes
-// the guest/hypervisor UART ($write), so the result is read straight from the
-// console: a healthy boot prints the kernel banner, reaches userspace, and ends
-// with "[HV] guest issued SBI system_reset (shutdown)" -> pass (x3==0xAA).
-//
-// Build/run from the project root (so the $readmemh paths resolve) with the same
-// recipe the other tb_soc_*_boot.sv wrappers use (CLAUDE.md, section "Running
-// Tests on Verilator"; set --top-module tb_soc_hvlinux). Build the DRAM image
-// first:  make -C test/hv GUEST=Image GUEST_DTB=guest.dtb
+// SystemVerilog wrapper to run the hypervisor guest-Linux boot on the default
+// core on an external SV simulator. Drives heliodor_boot_soc_harness
+// as the native test_soc_hvlinux does; polls o_pass (guest SBI shutdown,
+// x3==0xAA) and o_fail (checker or failure). Build test/hv/hv_dram.hex first
+// (make -C test/hv GUEST=Image GUEST_DTB=guest.dtb).
+// See CLAUDE.md "Running Tests on Verilator" for the build/run commands.
 
 `timescale 1ns/1ps
 
@@ -21,21 +11,31 @@ module tb_soc_hvlinux;
     logic        clk;
     logic        rst;
     logic        pass;
-    logic [63:0] r3;
-    logic [31:0] cy;
+    logic        fail;
+    logic [63:0] x3;
+    logic [63:0] cycles;
+    logic [63:0] instret;
 
-    heliodor_test_soc_hvlinux_harness dut (
-        .clk   (clk),
-        .rst   (rst),
-        .o_pass(pass),
-        .o_r3  (r3),
-        .o_cy  (cy)
+    heliodor_boot_soc_harness #(
+        .FW_HEX  ("test/hv/hvfw.hex"),
+        .DRAM_HEX("test/hv/hv_dram.hex")
+    ) dut (
+        .clk      (clk),
+        .rst      (rst),
+        .o_pass   (pass),
+        .o_fail   (fail),
+        .o_x3     (x3),
+        .o_cycles (cycles),
+        .o_instret(instret),
+        .o_last_pc(),
+        .o_ret_cnt(),
+        .o_traps  ()
     );
 
     initial clk = 1'b0;
     always #5 clk = ~clk;
 
-    localparam longint unsigned MAX_CY = 40_000_000;
+    localparam longint unsigned MAX_CY = 60_000_000;
 
     initial begin
         rst = 1'b0;
@@ -43,15 +43,15 @@ module tb_soc_hvlinux;
         rst = 1'b1;
         for (longint unsigned i = 0; i < MAX_CY; i++) begin
             @(posedge clk);
-            if (pass) break;
+            if (pass || fail) break;
             if (i % 2_000_000 == 0)
-                $display("  [verilator hvlinux] cy=%0d r3=%h", cy, r3);
+                $display("  [hvlinux] cy=%0d instret=%0d x3=%h", cycles, instret, x3);
         end
-        $display("[tb_soc_hvlinux] pass=%0b r3=%h cy=%0d", pass, r3, cy);
+        $display("[tb_soc_hvlinux] pass=%0b fail=%0b x3=%h cy=%0d instret=%0d", pass, fail, x3, cycles, instret);
         if (pass)
             $display("HV GUEST BOOT PASSED on Verilator (guest SBI shutdown, x3==0xAA)");
         else
-            $display("HV guest did NOT reach SBI shutdown within %0d cy", MAX_CY);
+            $display("HV guest did NOT pass within %0d cy (fail=%0b)", MAX_CY, fail);
         $finish;
     end
 endmodule

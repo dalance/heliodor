@@ -1,6 +1,6 @@
-// SystemVerilog wrapper to run the N=1 (single-hart) SoC Linux boot on an
-// external SV simulator (the native Veryl #[test] uses $tb::clock_gen, which is
-// Veryl-runtime only). Drives clk/rst, polls o_pass (hart0 x3==0xAA = shutdown).
+// SystemVerilog wrapper to run the N=1 (single-hart) SoC Linux boot on the
+// default core on an external SV simulator (the native Veryl #[test] uses
+// $tb::clock_gen, which is Veryl-runtime only). Drives clk/rst, polls o_pass (hart0 x3==0xAA = shutdown).
 // See CLAUDE.md "Running Tests on Verilator" for the build/run commands.
 
 `timescale 1ns/1ps

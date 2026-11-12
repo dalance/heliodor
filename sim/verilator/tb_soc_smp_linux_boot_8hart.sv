@@ -1,29 +1,48 @@
-// SystemVerilog wrapper to run the N=8 SMP SoC Linux boot on an external SV
-// simulator. Drives the shared SMP harness with N_HARTS=8 + the 8-hart hex
-// assets and polls o_pass (hart0 x3==0xAA = SBI shutdown); the per-hart liveness
-// arrays are left unconnected.
+// SystemVerilog wrapper to run the N=8 SMP SoC Linux 5.15 boot on the default
+// core on an external SV simulator. Drives heliodor_boot_soc_harness
+// as the native test_soc_smp_linux_boot_8hart does; polls o_pass (hart 0
+// x3==0xAA = SBI shutdown) and o_fail (any hart's checker or failure).
 // See CLAUDE.md "Running Tests on Verilator" for the build/run commands.
+// AXI_SEL picks the tb AXI4 slave timing (0 FIXED, 1 SLOW, 2 BACKPRESSURE,
+// 3 REORDER) and AXI_SEED its seed; set them at build time with -G, e.g.
+// -GAXI_SEL=3 -GAXI_SEED=1.
 
 `timescale 1ns/1ps
 
-module tb_soc_smp_linux_boot_8hart;
+module tb_soc_smp_linux_boot_8hart #(
+    parameter int unsigned AXI_SEL  = 0,
+    parameter int unsigned AXI_SEED = 1
+);
+    localparam heliodor_axi4_tb_pkg::SlaveCfg AXI_CFG =
+        AXI_SEL == 1 ? heliodor_axi4_tb_pkg::SLOW :
+        AXI_SEL == 2 ? heliodor_axi4_tb_pkg::BACKPRESSURE :
+        AXI_SEL == 3 ? heliodor_axi4_tb_pkg::REORDER : heliodor_axi4_tb_pkg::FIXED;
+
     logic        clk;
     logic        rst;
     logic        pass;
-    logic [63:0] r3;
-    logic [31:0] cy;
+    logic        fail;
+    logic [63:0] x3;
+    logic [63:0] cycles;
+    logic [63:0] instret;
 
-    heliodor_test_soc_smp_linux_boot_harness #(
-        .N_HARTS (8),
-        .HEX_FW  ("test/hex/linux_boot_fw_8hart.hex"),
-        .HEX_DRAM("test/hex/linux_dram_real_8hart.hex")
+    heliodor_boot_soc_harness #(
+        .N_HARTS (32'd8),
+        .FW_HEX  ("test/hex/linux_boot_fw_8hart.hex"),
+        .DRAM_HEX("test/hex/linux_dram_real_8hart.hex"),
+        .AXI_CFG (AXI_CFG),
+        .AXI_SEED(AXI_SEED)
     ) dut (
-        .clk   (clk),
-        .rst   (rst),
-        .o_pass(pass),
-        .o_r3  (r3),
-        .o_cy  (cy)
-        // o_r3_h1 / o_pc* / o_ret* / o_trapc* / o_*_all left unconnected
+        .clk      (clk),
+        .rst      (rst),
+        .o_pass   (pass),
+        .o_fail   (fail),
+        .o_x3     (x3),
+        .o_cycles (cycles),
+        .o_instret(instret),
+        .o_last_pc(),
+        .o_ret_cnt(),
+        .o_traps  ()
     );
 
     initial clk = 1'b0;
@@ -37,15 +56,15 @@ module tb_soc_smp_linux_boot_8hart;
         rst = 1'b1;
         for (longint unsigned i = 0; i < MAX_CY; i++) begin
             @(posedge clk);
-            if (pass) break;
+            if (pass || fail) break;
             if (i % 5_000_000 == 0)
-                $display("  [verilator N=8] cy=%0d r3=%h", cy, r3);
+                $display("  [N=8] cy=%0d instret=%0d x3=%h", cycles, instret, x3);
         end
-        $display("[tb_soc_smp_linux_boot_8hart] pass=%0b r3=%h cy=%0d", pass, r3, cy);
+        $display("[tb_soc_smp_linux_boot_8hart] axi_sel=%0d seed=%0d pass=%0b fail=%0b x3=%h cy=%0d instret=%0d", AXI_SEL, AXI_SEED, pass, fail, x3, cycles, instret);
         if (pass)
             $display("SMP(N=8) LINUX BOOT PASSED on Verilator (SBI shutdown, x3==0xAA)");
         else
-            $display("SMP(N=8) did NOT reach SBI shutdown within %0d cy", MAX_CY);
+            $display("SMP(N=8) did NOT pass within %0d cy (fail=%0b)", MAX_CY, fail);
         $finish;
     end
 endmodule

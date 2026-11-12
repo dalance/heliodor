@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build + run every ACT4 PMPS test on Verilator (the Veryl cc/cranelift sim
-# hangs on the PMP-active M-mode cleanup — a sim convergence artifact; the RTL
-# settles correctly under real SV NBA). One wrapper, re-templated per hex.
+# Build + run every ACT4 PMPS test on Verilator on the default core (the
+# arch harness). The Veryl sim can fail to converge on the PMP-active M-mode
+# cleanup; real SV NBA settles it. One wrapper, re-templated per hex.
 set -u
 cd "$(dirname "$0")/../.."
 TESTS=(pmps_cfg_A_off pmps_cfg_XWR pmps_csr_access pmps_mprv_check_01 \

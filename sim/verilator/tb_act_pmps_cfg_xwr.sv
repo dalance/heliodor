@@ -1,8 +1,9 @@
-// SystemVerilog wrapper to run the ACT4 PMPS cfg_XWR test on the SV sim.
-// Classifies whether the cc/cranelift Veryl-sim hang on PMP-active M-mode
-// cleanup is a real RTL issue or a sim-convergence artifact (standard SV NBA
-// settling here). Drives clk/rst, polls o_pass / o_tohost. Build via the
-// standard --binary flow (see CLAUDE.md), top module tb_act_pmps_cfg_xwr.
+// SystemVerilog wrapper to run the ACT4 PMPS cfg_XWR test on the SV sim, on
+// the default core (heliodor_test_arch_common_harness). Tells a real RTL
+// issue from a Veryl-sim convergence artifact on PMP-active M-mode cleanup
+// (standard SV NBA settling here). Drives clk/rst, polls o_pass / o_tohost.
+// Build via the standard --binary flow (see CLAUDE.md), top module
+// tb_act_pmps_cfg_xwr.
 
 `timescale 1ns/1ps
 
