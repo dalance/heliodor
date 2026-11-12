@@ -5129,7 +5129,7 @@ MI の進捗:
   2. 【済 `62cf0c38`、wrapper は `fcad6d03`】harness: `test_arch_common` と `test_soc_linux_boot` の V14 の枝 (`v14_arch_bare`、`v14_soc_linux_boot` の呼び出しと census の出力) を消す。SoC を CORE 無指定で instantiate して旧 DRAM ポートを駆動する旧 harness 6 ファイル (litmus、N=1 の 6.6/7.1/7.1v、hvlinux、SMP boot) は中身を新コアの harness (`boot_soc_harness` など) に載せ替え、テスト名を保つ (CLAUDE.md の梯子のコマンドが変わらない)。新コアに未対応だった 8hart の boot、6.6/7.1 の SMP N=4、litmus N=8 は新コアの初めてのゲートになる。`sim/verilator/` の V14 の wrapper 8 本も載せ替える。
   3. 【済 `32314de1`。G0 は 829 passed、0 failed、321 ignored】テスト: 新コアの `test_w2_*` と中身が重なるもの (arch 229 本、fp_smoke、lrsc_reorder など) と、v14 の unit テスト (alu、icache、dcache、dcache_inv、cache_edge)、V14 の bench 5 本を `#[ignore]` にする (D13)。`test_sched` の参照モデル `v14_alu` はそのまま使う。
   4. 【済 `55ebe011`】文書: CLAUDE.md の梯子 (コマンド、サイクル数、梯子 4 は Verilator)、README の構成と数値、検証計画の「M6 で `src/v14/` を削除」の記述を直す。
-  5. 出口のゲート: 検証計画 §1.2 の M6 列を両構成で回す。W4 の native の N=4 boot は 2026-11-12 に 22,640,641 cycles (MI と一致) で通った。受入条件は、新コアの数値 (GL-B の record 列と hash、各ゲートのサイクル数) が MI の完了 (`cf1c973b`) とビット一致すること。M4 の繰り延べ (W4 の native の N=4 boot、W4 の 6.6/7.1 の SMP boot) を回す。
+  5. 出口のゲート: 検証計画 §1.2 の M6 列を両構成で回す。native の N=4 boot は 2026-11-12 に W4 が 22,640,641 cycles (sim 17,929 s)、W2 が 24,989,451 cycles (instret 14,805,212、sim 9,360 s、約 2.7k cy/s) で通り、どちらも MI と一致した (`fell_back` 0)。受入条件は、新コアの数値 (GL-B の record 列と hash、各ゲートのサイクル数) が MI の完了 (`cf1c973b`) とビット一致すること。M4 の繰り延べ (W4 の native の N=4 boot、W4 の 6.6/7.1 の SMP boot) を回す。
 - M6 の後: misa の F/D/C の扱い (§C.9) をユーザが判断する。RVA23 の不足分と G13 は MI で扱う (U16)。
 
 ### MV: 検証環境の拡充

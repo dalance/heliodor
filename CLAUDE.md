@@ -127,7 +127,7 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      `--ignored --test test_w2_linux_boot_lockstep` (14,570,718 cycles, ~7 min); run it
      after any change that can alter the retire stream.
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: N=4 SMP Linux boot
-     (**24,989,451 cycles**). W4 is `test_w4_smp_linux_boot_4hart` (22,640,641
+     (**24,989,451 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (22,640,641
      cycles, ~5 h at ~1.3k cy/s). The Verilator wrappers give identical cycle counts
      and serve as the NBA cross-check, not the gate.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
