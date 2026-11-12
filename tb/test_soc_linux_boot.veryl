@@ -1,472 +1,83 @@
-// Phase 7 v4 M8.D.1: SoC-level Linux boot smoke.
-//
-// The Linux boot firmware + kernel, driven through heliodor_soc_smp
-// (N_HARTS=1): the CLINT, UART and MMIO address-decode live INSIDE the SoC, so
-// this harness only serves DRAM + firmware ROM for the imem / iptw / dmem
-// buses. Pass = x3 reaches 0xAA (SBI SRST shutdown).
+// SoC-level Linux boot: the 5.15 Linux boot firmware and kernel on
+// heliodor_soc_smp (N_HARTS=1) with the MAP_BOOT table (boot_soc_harness).
+// Pass = x3 reaches 0xAA (SBI SRST shutdown). CORE defaults to
+// tb_core_sel::CORE; x3 and instret come from retire_mon.
 //
 // Marked #[ignore] (long run). Run explicitly with:
 //   veryl test --ignored --test test_soc_linux_boot
-//
-// CORE selects the old core (v14_soc_linux_boot) or a new core on the same
-// SoC with the MAP_BOOT table (boot_soc_harness). The new-core arm has no
-// census counters (they read 0) and reports x3 and instret from retire_mon.
 module test_soc_linux_boot_harness #(
     param CORE: soc_pkg::CoreSel = tb_core_sel::CORE,
 ) (
-    clk          : input  clock           ,
-    rst          : input  reset           ,
-    o_pass       : output logic           ,
-    o_r3         : output logic<64>       ,
-    o_cy         : output logic<32>       ,
-    o_load_viol  : output logic<32>       ,
-    o_load_replay: output logic<32>       ,
-    o_inv_viol   : output logic<32>       ,
-    o_mshr_pois  : output logic<32>       ,
-    o_viol_exact : output logic<32>       ,
-    o_viol_pgx   : output logic<32>       ,
-    o_st_resolve : output logic<32>       ,
-    o_viol_store : output logic<32>       ,
-    o_viol_self  : output logic<32>       ,
-    o_lw_cause   : output logic<32> [128] ,
-    o_load_wait  : output logic<32>       ,
-    o_instret    : output logic<32>       ,
-    o_last_pc    : output logic<64>       ,
+    clk      : input  clock    ,
+    rst      : input  reset    ,
+    o_pass   : output logic    ,
+    o_r3     : output logic<64>,
+    o_cy     : output logic<32>,
+    o_instret: output logic<32>,
+    o_last_pc: output logic<64>,
 ) {
-    if CORE == soc_pkg::CoreSel::V14 :g_v14 {
-        inst u_v14: v14_soc_linux_boot (
-            clk           ,
-            rst           ,
-            o_pass        ,
-            o_r3          ,
-            o_cy          ,
-            o_load_viol   ,
-            o_load_replay ,
-            o_inv_viol    ,
-            o_mshr_pois   ,
-            o_viol_exact  ,
-            o_viol_pgx    ,
-            o_st_resolve  ,
-            o_viol_store  ,
-            o_viol_self   ,
-            o_lw_cause    ,
-            o_load_wait   ,
-            o_instret     ,
-        );
-        assign o_last_pc = 0;
-    } else {
-        var cy     : logic<32>;
-        var instret: logic<64>;
-        inst u_new: boot_soc_harness #(
-            CORE: CORE,
-        ) (
-            clk                ,
-            rst                ,
-            o_pass   : o_pass   ,
-            o_fail   : _        ,
-            o_x3     : o_r3     ,
-            o_cycles : _        ,
-            o_instret: instret  ,
-            o_last_pc: o_last_pc,
-            o_ret_cnt: _        ,
-            o_traps  : _        ,
-        );
-        always_ff {
-            if_reset {
-                cy = 32'd0;
-            } else {
-                cy = cy + 32'd1;
-            }
-        }
-        assign o_cy          = cy;
-        assign o_instret     = instret[31:0];
-        assign o_load_viol   = 0;
-        assign o_load_replay = 0;
-        assign o_inv_viol    = 0;
-        assign o_mshr_pois   = 0;
-        assign o_viol_exact  = 0;
-        assign o_viol_pgx    = 0;
-        assign o_st_resolve  = 0;
-        assign o_viol_store  = 0;
-        assign o_viol_self   = 0;
-        assign o_lw_cause    = '{default: 0};
-        assign o_load_wait   = 0;
-    }
-}
-
-module v14_soc_linux_boot (
-    clk: input clock,
-    rst: input reset,
-    o_pass: output logic    ,
-    o_r3  : output logic<64>,
-    o_cy  : output logic<32>,
-    // L3 census counters, frozen at the pass cycle.
-    o_load_viol   : output logic<32>,
-    o_load_replay : output logic<32>,
-    o_inv_viol    : output logic<32>,
-    o_mshr_pois   : output logic<32>,
-    o_viol_exact  : output logic<32>,
-    o_viol_pgx    : output logic<32>,
-    o_st_resolve  : output logic<32>,
-    o_viol_store  : output logic<32>,
-    o_viol_self   : output logic<32>,
-    o_lw_cause    : output logic<32> [128],
-    o_load_wait   : output logic<32>,
-    o_instret     : output logic<32>,
-) {
-    var imem_addr    : logic<64> [1];
-    var imem_rdata   : logic<32> [1];
-    var imem_ren     : logic     [1];
-    var iptw_addr    : logic<64> [1];
-    var iptw_rdata   : logic<64> [1];
-    var dmem_addr    : logic<64>    ;
-    var dmem_wdata   : logic<64> [8]; // S25: write-channel line lanes
-    var dmem_rdata   : logic<64>    ;
-    var dmem_wen     : logic        ;
-    var dmem_ren     : logic        ;
-    var dmem_wstrb   : logic<8>  [8];
-    var dmem_wdata_hi: logic<64>;
-    var dmem_wstrb_hi: logic<8> ;
-    var uart_tx_v    : logic    ;
-    var uart_tx_d    : logic<8> ;
-    var dbg_r3       : logic<64> [1];
-    var dbg_load_viol: logic<32> [1];
-    var dbg_load_rep : logic<32> [1];
-    var dbg_inv_viol : logic<32> [1];
-    var dbg_mshr_pois: logic<32> [1];
-    var dbg_v_exact  : logic<32> [1];
-    var dbg_v_pgx    : logic<32> [1];
-    var dbg_st_res   : logic<32> [1];
-    var dbg_v_store  : logic<32> [1];
-    var dbg_v_self   : logic<32> [1];
-    var dbg_lw_cause : logic<32> [128];
-    var dbg_load_wait: logic<32> [1];
-    var dbg_commit   : logic<32> [1];
-
-    inst dut: heliodor_soc_smp #(
-        N_HARTS : 1            ,
-        RESET_PC: 64'h0000_0000,
+    var cy     : logic<32>;
+    var instret: logic<64>;
+    inst u_new: boot_soc_harness #(
+        CORE: CORE,
     ) (
-        clk                          ,
-        rst                          ,
-        o_imem_addr    : imem_addr   ,
-        i_imem_rdata   : imem_rdata  ,
-        o_imem_ren     : imem_ren    ,
-        o_iptw_addr    : iptw_addr   ,
-        o_iptw_req     : _           ,
-        i_iptw_rdata   : iptw_rdata  ,
-        o_dmem_addr    : dmem_addr   ,
-        o_dmem_wdata   : dmem_wdata  ,
-        i_dmem_rdata   : dmem_rdata  ,
-        o_dmem_wen     : dmem_wen    ,
-        o_dmem_ren     : dmem_ren    ,
-        o_dmem_wstrb   : dmem_wstrb  ,
-        o_dmem_wdata_hi: dmem_wdata_hi,
-        o_dmem_wstrb_hi: dmem_wstrb_hi,
-        o_uart_tx_valid: uart_tx_v   ,
-        o_uart_tx_data : uart_tx_d   ,
-        o_dbg_r3       : dbg_r3      ,
-        o_dbg_load_viol_cnt : dbg_load_viol,
-        o_dbg_load_replay_cnt: dbg_load_rep,
-        o_dbg_inv_viol_cnt  : dbg_inv_viol ,
-        o_dbg_mshr_pois_cnt : dbg_mshr_pois,
-        o_dbg_viol_exact_cnt: dbg_v_exact  ,
-        o_dbg_viol_pgx_cnt  : dbg_v_pgx    ,
-        o_dbg_st_resolve_cnt: dbg_st_res   ,
-        o_dbg_viol_store_cnt: dbg_v_store  ,
-        o_dbg_viol_self_cnt : dbg_v_self   ,
-        o_dbg_lw_cause      : dbg_lw_cause ,
-        o_dbg_load_wait_cnt : dbg_load_wait,
-        o_dbg_rob_commit_cnt: dbg_commit   ,
-        i_dm_rst            : rst          ,
-        i_dm_psel           : 1'b0         ,
-        i_dm_penable        : 1'b0         ,
-        i_dm_pwrite         : 1'b0         ,
-        i_dm_paddr          : 9'd0         ,
-        i_dm_pwdata         : 32'd0        ,
-        i_dm_pstrb          : 4'd0         ,
-        i_dm_pprot          : 3'd0         ,
-        o_dm_pready         : _            ,
-        o_dm_prdata         : _            ,
-        o_dm_pslverr        : _            ,
-        o_dm_obs            : _            ,
-        o_retire_dm         : _            ,
+        clk                ,
+        rst                ,
+        o_pass   : o_pass   ,
+        o_fail   : _        ,
+        o_x3     : o_r3     ,
+        o_cycles : _        ,
+        o_instret: instret  ,
+        o_last_pc: o_last_pc,
+        o_ret_cnt: _        ,
+        o_traps  : _        ,
     );
-    let _unused_imem_ren: logic = imem_ren[0];
-    let _unused_dmem_ren: logic = dmem_ren;
-
-    // Firmware ROM (16 KB) + DRAM (32 MB).
-    #[allow(initial_assign)]
-    var fw_rom: logic<32> [4096]   ;
-    #[allow(initial_assign)]
-    var dram  : logic<32> [8388608];
-    initial {
-        $readmemh("test/hex/linux_boot_fw.hex", fw_rom);
-        $readmemh("test/hex/linux_dram_real.hex", dram);
-    }
-
-    // Instruction fetch: firmware (PA < 0x4000) else DRAM (PA >= 0x8000_0000).
-    let imem_in_fw   : logic     = imem_addr[0][31:14] == 18'd0;
-    let dram_imem_idx: logic<23> = imem_addr[0][24:2];
-    let fw_imem_idx  : logic<12> = imem_addr[0][13:2];
-    assign imem_rdata[0] = if imem_in_fw ? fw_rom[fw_imem_idx] : if imem_addr[0][31] ? dram[dram_imem_idx] : 32'd0;
-
-    // Data reads: DRAM / firmware ROM (CLINT + UART are served inside the SoC).
-    let in_fw   : logic = dmem_addr[31:14] == 18'd0;
-    let in_dram : logic = dmem_addr[31];
-
-    let dram_dmem_lo   : logic<23> = {dmem_addr[24:3], 1'b0};
-    let dram_dmem_hi   : logic<23> = {dmem_addr[24:3], 1'b1};
-    let dram_dmem_nx_lo: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b0};
-    let dram_dmem_nx_hi: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b1};
-    let fw_dmem_lo     : logic<12> = {dmem_addr[13:3], 1'b0};
-    let fw_dmem_hi     : logic<12> = {dmem_addr[13:3], 1'b1};
-    assign dmem_rdata = if in_dram ?
-        {dram[dram_dmem_hi], dram[dram_dmem_lo]}
-    : if in_fw ?
-        {fw_rom[fw_dmem_hi], fw_rom[fw_dmem_lo]}
-    :
-        64'd0
-    ;
-
-    // Instruction-PTW PTE read (DRAM / firmware).
-    let iptw_in_fw  : logic     = iptw_addr[0][31:14] == 18'd0;
-    let iptw_in_dram: logic     = iptw_addr[0][31];
-    let dram_iptw_lo: logic<23> = {iptw_addr[0][24:3], 1'b0};
-    let dram_iptw_hi: logic<23> = {iptw_addr[0][24:3], 1'b1};
-    let fw_iptw_lo  : logic<12> = {iptw_addr[0][13:3], 1'b0};
-    let fw_iptw_hi  : logic<12> = {iptw_addr[0][13:3], 1'b1};
-    assign iptw_rdata[0] = if iptw_in_dram ?
-        {dram[dram_iptw_hi], dram[dram_iptw_lo]}
-    : if iptw_in_fw ?
-        {fw_rom[fw_iptw_hi], fw_rom[fw_iptw_lo]}
-    :
-        64'd0
-    ;
-
-    // DRAM write (S25: line lanes + misaligned hi-side carry). The SoC already
-    // gates o_dmem_wen / o_dmem_wstrb_hi to DRAM accesses only.
-    always_ff (clk, rst) {
-        if_reset {} else if dmem_wen && in_dram {
-            for l in 0..8 {
-                if dmem_wstrb[l] != 8'd0 {
-                    let w_lo : logic<23> = {dmem_addr[24:6], l as 3, 1'b0};
-                    let w_hi : logic<23> = {dmem_addr[24:6], l as 3, 1'b1};
-                    let w_old: logic<64> = {dram[w_hi], dram[w_lo]};
-                    let w_new: logic<64> = {
-                        if dmem_wstrb[l][7] ? dmem_wdata[l][63:56] : w_old[63:56],
-                        if dmem_wstrb[l][6] ? dmem_wdata[l][55:48] : w_old[55:48],
-                        if dmem_wstrb[l][5] ? dmem_wdata[l][47:40] : w_old[47:40],
-                        if dmem_wstrb[l][4] ? dmem_wdata[l][39:32] : w_old[39:32],
-                        if dmem_wstrb[l][3] ? dmem_wdata[l][31:24] : w_old[31:24],
-                        if dmem_wstrb[l][2] ? dmem_wdata[l][23:16] : w_old[23:16],
-                        if dmem_wstrb[l][1] ? dmem_wdata[l][15:8] : w_old[15:8],
-                        if dmem_wstrb[l][0] ? dmem_wdata[l][7:0] : w_old[7:0]
-                    };
-                    dram[w_lo] = w_new[31:0];
-                    dram[w_hi] = w_new[63:32];
-                }
-            }
-            // misaligned hi-side (next dword)
-            if dmem_wstrb_hi[0] {
-                dram[dram_dmem_nx_lo][7:0] = dmem_wdata_hi[7:0];
-            }
-            if dmem_wstrb_hi[1] {
-                dram[dram_dmem_nx_lo][15:8] = dmem_wdata_hi[15:8];
-            }
-            if dmem_wstrb_hi[2] {
-                dram[dram_dmem_nx_lo][23:16] = dmem_wdata_hi[23:16];
-            }
-            if dmem_wstrb_hi[3] {
-                dram[dram_dmem_nx_lo][31:24] = dmem_wdata_hi[31:24];
-            }
-            if dmem_wstrb_hi[4] {
-                dram[dram_dmem_nx_hi][7:0] = dmem_wdata_hi[39:32];
-            }
-            if dmem_wstrb_hi[5] {
-                dram[dram_dmem_nx_hi][15:8] = dmem_wdata_hi[47:40];
-            }
-            if dmem_wstrb_hi[6] {
-                dram[dram_dmem_nx_hi][23:16] = dmem_wdata_hi[55:48];
-            }
-            if dmem_wstrb_hi[7] {
-                dram[dram_dmem_nx_hi][31:24] = dmem_wdata_hi[63:56];
-            }
-        }
-    }
-
-
-    // UART TX echo (SoC consumes the writes; this just mirrors them to stdout).
-    always_ff (clk, rst) {
-        if_reset {} else if uart_tx_v {
-            $write("%c", uart_tx_d);
-        }
-    }
-
-    // Cycle counter + pass latch.
-    var cy: logic<32>;
-    always_ff (clk, rst) {
+    always_ff {
         if_reset {
             cy = 32'd0;
         } else {
             cy = cy + 32'd1;
         }
     }
-    assign o_cy   = cy;
-    assign o_r3   = dbg_r3[0];
-    assign o_pass = dbg_r3[0] == 64'hAA;
-
-    // L3 census: freeze the counters at the SBI-shutdown cycle (the kernel keeps
-    // spinning afterwards, which would otherwise inflate them).
-    var lv_f: logic<32>;
-    var lr_f: logic<32>;
-    var iv_f: logic<32>;
-    var mp_f: logic<32>;
-    var ve_f: logic<32>;
-    var vp_f: logic<32>;
-    var sr_f: logic<32>;
-    var vs_f: logic<32>;
-    var vf_f: logic<32>;
-    var lc_f: logic<32> [128];
-    var lw_f: logic<32>;
-    var ir_f: logic<32>;
-    always_ff (clk, rst) {
-        if_reset {
-            lv_f = 32'd0;
-            lr_f = 32'd0;
-            iv_f = 32'd0;
-            mp_f = 32'd0;
-            ve_f = 32'd0;
-            vp_f = 32'd0;
-            sr_f = 32'd0;
-            vs_f = 32'd0;
-            vf_f = 32'd0;
-            for c in 0..128 {
-                lc_f[c] = 32'd0;
-            }
-            lw_f = 32'd0;
-            ir_f = 32'd0;
-        } else if dbg_r3[0] != 64'hAA {
-            lv_f = dbg_load_viol[0];
-            lr_f = dbg_load_rep[0];
-            iv_f = dbg_inv_viol[0];
-            mp_f = dbg_mshr_pois[0];
-            ve_f = dbg_v_exact[0];
-            vp_f = dbg_v_pgx[0];
-            sr_f = dbg_st_res[0];
-            vs_f = dbg_v_store[0];
-            vf_f = dbg_v_self[0];
-            for c in 0..128 {
-                lc_f[c] = dbg_lw_cause[c];
-            }
-            lw_f = dbg_load_wait[0];
-            ir_f = dbg_commit[0];
-        }
-    }
-    assign o_load_viol   = lv_f;
-    assign o_load_replay = lr_f;
-    assign o_inv_viol    = iv_f;
-    assign o_mshr_pois   = mp_f;
-    assign o_viol_exact  = ve_f;
-    assign o_viol_pgx    = vp_f;
-    assign o_st_resolve  = sr_f;
-    assign o_viol_store  = vs_f;
-    assign o_viol_self   = vf_f;
-    assign o_lw_cause    = lc_f;
-    assign o_load_wait   = lw_f;
-    assign o_instret     = ir_f;
+    assign o_cy      = cy;
+    assign o_instret = instret[31:0];
 }
 
+// The 5.15 N=1 boot on the default core, pass/fail only.
 #[test(test_soc_linux_boot)]
 #[ignore]
 module test_soc_linux_boot {
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
-    var pass    : logic    ;
-    var r3      : logic<64>;
-    var cy      : logic<32>;
-    var loadviol: logic<32>;
-    var loadrep : logic<32>;
-    var invviol : logic<32>;
-    var mshrpois: logic<32>;
-    var vexact  : logic<32>;
-    var vpgx    : logic<32>;
-    var stres   : logic<32>;
-    var vstore  : logic<32>;
-    var vself   : logic<32>;
-    var lwcause : logic<32> [128];
-    var loadwait: logic<32>;
-    var instret : logic<32>;
+    var pass   : logic    ;
+    var r3     : logic<64>;
+    var cy     : logic<32>;
+    var instret: logic<32>;
 
-    inst harness: test_soc_linux_boot_harness #(
-        CORE: tb_core_sel::CORE_V14,
-    ) (
-        clk           ,
-        rst           ,
-        o_pass: pass  ,
-        o_r3  : r3    ,
-        o_cy  : cy    ,
-        o_load_viol  : loadviol,
-        o_load_replay: loadrep ,
-        o_inv_viol   : invviol ,
-        o_mshr_pois  : mshrpois,
-        o_viol_exact : vexact  ,
-        o_viol_pgx   : vpgx    ,
-        o_st_resolve : stres   ,
-        o_viol_store : vstore  ,
-        o_viol_self  : vself   ,
-        o_lw_cause   : lwcause ,
-        o_load_wait  : loadwait,
-        o_instret    : instret ,
-        o_last_pc    : _       ,
+    inst harness: test_soc_linux_boot_harness (
+        clk                ,
+        rst                ,
+        o_pass   : pass    ,
+        o_r3     : r3      ,
+        o_cy     : cy      ,
+        o_instret: instret ,
+        o_last_pc: _       ,
     );
 
     initial {
         rst.assert(clk);
         // Poll in 10000-cycle chunks and break on pass so `cy` reports the
-        // actual SBI-shutdown cycle (matches the N=2/N=4 SMP tb + the Verilator
-        // wrapper, which both break on pass). 45M-cycle budget = 4500 chunks.
-        for _i in 0..4500 {
+        // SBI-shutdown cycle to that resolution.
+        for _i in 0..3700 {
             clk.next(10000);
             if pass {
                 break;
             }
         }
-        $display  ("v4 SoC linux boot smoke: cy=%h x3=%h pass=%b", cy, r3, pass);
-        $display  ("  loadreplay= %d  (loadviol=%d invviol=%d mshrpois=%d)", loadrep, loadviol, invviol, mshrpois);
-        $display  ("  violstore=%d violself=%d  (of which exact=%d pgx=%d) stresolve=%d", vstore, vself, vexact, vpgx, stres);
-        $display  ("  loadwait= %d", loadwait);
-        $display  ("  lw sole-blocker: lsr=%d mmu=%d walk=%d store=%d fpu=%d mshr=%d replay=%d redir=%d", lwcause[0], lwcause[1], lwcause[2], lwcause[3], lwcause[4], lwcause[5], lwcause[6], lwcause[7]);
-        $display  ("  lw multi=%d none=%d amopath=%d mshrack=%d", lwcause[8], lwcause[9], lwcause[10], lwcause[11]);
-        $display  ("  lsr why-incumbent: dcache=%d lane0=%d fault=%d stdrive=%d mmuwalk=%d stwr=%d replay=%d other=%d", lwcause[12], lwcause[13], lwcause[14], lwcause[15], lwcause[16], lwcause[17], lwcause[18], lwcause[19]);
-        $display  ("  replay_q resident=%d driving=%d | blocked: stdrive=%d mmubusy=%d stwr=%d asqdr=%d asqovl=%d other=%d", lwcause[20], lwcause[26], lwcause[21], lwcause[22], lwcause[23], lwcause[24], lwcause[25], lwcause[27]);
-        $display  ("  W1 rename: 1wide=%d 2wide=%d | norename(instr avail)=%d frontend empty=%d", lwcause[28], lwcause[33], lwcause[34], lwcause[35]);
-        $display  ("  W1 1wide sole-blocker: no2nd=%d ineligible=%d resource=%d multi=%d", lwcause[29], lwcause[30], lwcause[31], lwcause[32]);
-        $display  ("  W1 ineligible-by-class: load=%d storeamo=%d branch=%d other=%d", lwcause[36], lwcause[37], lwcause[38], lwcause[39]);
-        $display  ("  W2 fifo-empty: fetchnotready=%d redirect=%d other=%d | notready: fifoempty=%d straddle=%d other=%d", lwcause[40], lwcause[41], lwcause[42], lwcause[43], lwcause[44], lwcause[45]);
-        $display  ("  W2 slot1 not produced: predtaken=%d straddle=%d xline=%d other=%d | roomheld=%d produced=%d", lwcause[46], lwcause[47], lwcause[48], lwcause[49], lwcause[50], lwcause[51]);
-        $display  ("  W2b fifo-notavail: empty=%d wrongdword=%d | producer: icmiss=%d immu=%d wffull=%d other=%d presenting=%d | pushes=%d", lwcause[52], lwcause[53], lwcause[54], lwcause[55], lwcause[56], lwcause[57], lwcause[58], lwcause[59]);
-        $display  ("  M0 replay: events=%d cycles=%d squashsum=%d lwt_hit=%d sameaslast=%d repois=%d", lwcause[61], lwcause[60], lwcause[62], lwcause[63], lwcause[69], lwcause[70]);
-        $display  ("  M0 window: clean=%d trap=%d cap=%d | cleancycles=%d worst=%d | amoreplay=%d", lwcause[64], lwcause[65], lwcause[66], lwcause[71], lwcause[67], lwcause[68]);
-        $display  ("  M0 split: refetchcycles=%d seen=%d", lwcause[72], lwcause[73]);
-        $display  ("  M2a exempt=%d  of which NOTHING-forwarded=%d (must be 0) | in-LQ=%d storemis=%d", lwcause[74], lwcause[75], lwcause[76], lwcause[77]);
-        $display  ("  M2 selfscan by port: p0=%d p2=%d", lwcause[78], lwcause[79]);
-        $display  ("  T lsr turnaround: b2b=%d mshrb2b=%d | freeidle=%d busy=%d truelane0=%d", lwcause[80], lwcause[81], lwcause[82], lwcause[83], lwcause[84]);
-        $display  ("  T lsr totals: captures=%d completes=%d residency=%d", lwcause[85], lwcause[86], lwcause[87]);
-        $display  ("  T2 store-blocker: stdrive=%d sbcnt3=%d | L1b probe: events=%d fired=%d missport=%d misstlb=%d", lwcause[88], lwcause[89], lwcause[90], lwcause[91], lwcause[92], lwcause[93]);
-        $display  ("  T2 sbq: b2b suppressed=%d fired=%d", lwcause[94], lwcause[95]);
-        $display  ("  N mlp fill: busy=%d 2ndqueued=%d lsralso=%d | starts=%d", lwcause[96], lwcause[97], lwcause[98], lwcause[106]);
-        $display  ("  N handoff declined: full=%d fillonly=%d", lwcause[99], lwcause[100]);
-        $display  ("  N chan: iowns_dwait=%d iyield=%d dnogrant=%d | iroute=%d dreq=%d idle=%d", lwcause[101], lwcause[102], lwcause[103], lwcause[104], lwcause[105], lwcause[107]);
-        $display  ("  N ngrant: infill=%d prefill=%d | pre: iowns=%d unc=%d noaccept=%d", lwcause[108], lwcause[109], lwcause[110], lwcause[111], lwcause[112]);
-        $display  ("  N queued: total=%d nofill=%d | dcachestall=%d", lwcause[113], lwcause[114], lwcause[115]);
-        $display  ("  N rfo: prefill_rfo=%d prefill_accept=%d | rfocycles=%d rfongrant=%d", lwcause[116], lwcause[117], lwcause[118], lwcause[119]);
-        $display  ("  O 2nd store line waits: behind an RFO fill=%d behind any fill=%d | exists=%d", lwcause[120], lwcause[121], lwcause[122]);
-        $display  ("  O drain would MERGE LOCALLY but arrays busy=%d | sb FULL=%d | acks=%d | RFO fill cy=%d any fill cy=%d", lwcause[127], lwcause[123], lwcause[126], lwcause[124], lwcause[125]);
-        $display  ("  instret = %d", instret);
-        $assert   (pass, "v4 SoC linux boot: did not reach SBI shutdown (x3 != 0xAA)");
-        $finish   ();
+        $display("SoC linux boot: cy=%d instret=%d x3=%h pass=%b", cy, instret, r3, pass);
+        $assert (pass, "SoC linux boot: did not reach SBI shutdown (x3 != 0xAA)");
+        $finish ();
     }
 }
 
@@ -493,17 +104,6 @@ module test_w2_linux_boot {
         o_pass       : pass   ,
         o_r3         : r3     ,
         o_cy         : cy     ,
-        o_load_viol  : _      ,
-        o_load_replay: _      ,
-        o_inv_viol   : _      ,
-        o_mshr_pois  : _      ,
-        o_viol_exact : _      ,
-        o_viol_pgx   : _      ,
-        o_st_resolve : _      ,
-        o_viol_store : _      ,
-        o_viol_self  : _      ,
-        o_lw_cause   : _      ,
-        o_load_wait  : _      ,
         o_instret    : instret,
         o_last_pc    : last_pc,
     );
@@ -602,17 +202,6 @@ module test_w4_linux_boot {
         o_pass       : pass   ,
         o_r3         : r3     ,
         o_cy         : cy     ,
-        o_load_viol  : _      ,
-        o_load_replay: _      ,
-        o_inv_viol   : _      ,
-        o_mshr_pois  : _      ,
-        o_viol_exact : _      ,
-        o_viol_pgx   : _      ,
-        o_st_resolve : _      ,
-        o_viol_store : _      ,
-        o_viol_self  : _      ,
-        o_lw_cause   : _      ,
-        o_load_wait  : _      ,
         o_instret    : instret,
         o_last_pc    : last_pc,
     );

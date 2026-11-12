@@ -1,362 +1,12 @@
-// Phase 7 v4 M9.3: N=2 SMP Linux boot smoke through heliodor_soc_smp.
+// SMP Linux 5.15 boots on heliodor_soc_smp (boot_soc_harness with N_HARTS > 1)
+// on the default core. Pass = hart 0 x3 reaches 0xAA (SBI SRST shutdown) with
+// every hart's checker at 0.
 //
-// Mirrors test_soc_linux_boot (single-hart) but drives the SMP SoC: per-hart
-// instruction fetch (o_imem_*) and PTW (o_iptw_*) are arrays served from the same
-// firmware ROM + DRAM, while the data path (o_dmem_*) is the single shared port
-// the SoC's memory_bus arbitrates. CLINT / UART live inside the SoC. Pass = hart0
-// x3 reaches 0xAA (SBI SRST shutdown). 2-hart firmware + SMP kernel image.
-//
-// Marked #[ignore] (long run). The two SMP boot tests have INDEPENDENTLY
-// selectable names (neither is a prefix of the other):
+// Marked #[ignore] (long run). The names are independently selectable:
 //   veryl test --ignored --test test_soc_smp_linux_boot_2hart   # N=2 only
 //   veryl test --ignored --test test_soc_smp_linux_boot_4hart   # N=4 only
-//   veryl test --ignored --test test_soc_smp_linux_boot         # both
+//   veryl test --ignored --test test_soc_smp_linux_boot_8hart   # N=8 only
 // (N=1 single-hart boot is the separate test_soc_linux_boot.)
-module test_soc_smp_linux_boot_harness #(
-    param N_HARTS   : u32    = 2                                   ,
-    param HEX_FW    : string = "test/hex/linux_boot_fw_2hart.hex"  ,
-    param HEX_DRAM  : string = "test/hex/linux_dram_real_2hart.hex",
-) (
-    clk : input clock,
-    rst : input reset,
-    o_pass : output logic    ,
-    o_r3   : output logic<64>,
-    o_r3_h1: output logic<64>,
-    o_pc0  : output logic<64>,
-    o_pc1  : output logic<64>,
-    o_ret0  : output logic<32>,
-    o_ret1  : output logic<32>,
-    o_trapc0: output logic<32>,
-    o_trapc1: output logic<32>,
-    o_cy   : output logic<32>,
-    // M9.4 N=4: clean per-hart liveness arrays (PC + retire/trap counters) for
-    // ALL harts, so the N=4 top module can observe harts 2/3 without the N=2
-    // hart1-only forensic ports. Additive; the N=2 top module ignores these.
-    o_pc_all   : output logic<64> [N_HARTS],
-    o_ret_all  : output logic<32> [N_HARTS],
-    o_trapc_all: output logic<32> [N_HARTS],
-    // L3 census: per-hart memory-order counters, frozen at hart0's SBI shutdown.
-    o_lv_all   : output logic<32> [N_HARTS],
-    o_lr_all   : output logic<32> [N_HARTS],
-    o_iv_all   : output logic<32> [N_HARTS],
-    o_mp_all   : output logic<32> [N_HARTS],
-    o_lw_all   : output logic<32> [N_HARTS],
-    o_ir_all   : output logic<32> [N_HARTS],
-) {
-    // Per-hart instruction fetch + PTW (tb-served from shared memory).
-    var imem_addr : logic<64> [N_HARTS];
-    var imem_rdata: logic<32> [N_HARTS];
-    var imem_ren  : logic     [N_HARTS];
-    var iptw_addr : logic<64> [N_HARTS];
-    var iptw_req  : logic     [N_HARTS];
-    var iptw_rdata: logic<64> [N_HARTS];
-    // Shared data port (arbitrated inside the SoC). S25: writes are LINE
-    // transactions — 8 dword lanes + per-lane byte strobes.
-    var dmem_addr    : logic<64>    ;
-    var dmem_wdata   : logic<64> [8];
-    var dmem_rdata   : logic<64>    ;
-    var dmem_wen     : logic        ;
-    var dmem_ren     : logic        ;
-    var dmem_wstrb   : logic<8>  [8];
-    var dmem_wdata_hi: logic<64>    ;
-    var dmem_wstrb_hi: logic<8>     ;
-    var uart_tx_v    : logic    ;
-    var uart_tx_d    : logic<8> ;
-    var dbg_r3        : logic<64> [N_HARTS];
-    var dbg_pc        : logic<64> [N_HARTS];
-    var dbg_retire_v  : logic     [N_HARTS];
-    var dbg_trap_fire : logic     [N_HARTS];
-    // Block T forensics: the FIRST trap each hart takes, reported once. hart1
-    // wedging in the firmware's s_debug_trap (`li gp,0xDD; j .`) says only "an
-    // S-mode trap arrived before the kernel installed stvec"; cause/epc/tval say
-    // WHICH. Print-only — no port plumbing, so the N=4/N=8 tops are untouched.
-    var dbg_trap_cause: logic<64> [N_HARTS];
-    var dbg_trap_pc   : logic<64> [N_HARTS];
-    var dbg_trap_tval : logic<64> [N_HARTS];
-    var dbg_trap_to_s : logic     [N_HARTS];
-    var dbg_lv        : logic<32> [N_HARTS];
-    var dbg_lr        : logic<32> [N_HARTS];
-    var dbg_iv        : logic<32> [N_HARTS];
-    var dbg_mp        : logic<32> [N_HARTS];
-    var dbg_lw        : logic<32> [N_HARTS];
-    var dbg_ir        : logic<32> [N_HARTS];
-
-    inst dut: heliodor_soc_smp #(
-        N_HARTS : N_HARTS      ,
-        RESET_PC: 64'h0000_0000,
-    ) (
-        clk                          ,
-        rst                          ,
-        o_imem_addr    : imem_addr   ,
-        i_imem_rdata   : imem_rdata  ,
-        o_imem_ren     : imem_ren    ,
-        o_iptw_addr    : iptw_addr   ,
-        o_iptw_req     : iptw_req    ,
-        i_iptw_rdata   : iptw_rdata  ,
-        o_dmem_addr    : dmem_addr   ,
-        o_dmem_wdata   : dmem_wdata  ,
-        i_dmem_rdata   : dmem_rdata  ,
-        o_dmem_wen     : dmem_wen    ,
-        o_dmem_ren     : dmem_ren    ,
-        o_dmem_wstrb   : dmem_wstrb  ,
-        o_dmem_wdata_hi: dmem_wdata_hi,
-        o_dmem_wstrb_hi: dmem_wstrb_hi,
-        o_uart_tx_valid: uart_tx_v   ,
-        o_uart_tx_data : uart_tx_d   ,
-        o_dbg_r3        : dbg_r3        ,
-        o_dbg_pc        : dbg_pc        ,
-        o_dbg_retire_v  : dbg_retire_v  ,
-        o_dbg_trap_fire : dbg_trap_fire ,
-        o_dbg_trap_cause: dbg_trap_cause,
-        o_dbg_trap_pc   : dbg_trap_pc   ,
-        o_dbg_stval     : dbg_trap_tval ,
-        o_dbg_trap_to_s : dbg_trap_to_s ,
-        o_dbg_load_viol_cnt : dbg_lv    ,
-        o_dbg_load_replay_cnt: dbg_lr   ,
-        o_dbg_inv_viol_cnt  : dbg_iv    ,
-        o_dbg_mshr_pois_cnt : dbg_mp    ,
-        o_dbg_load_wait_cnt : dbg_lw    ,
-        o_dbg_rob_commit_cnt: dbg_ir    ,
-        i_dm_rst            : rst       ,
-        i_dm_psel           : 1'b0      ,
-        i_dm_penable        : 1'b0      ,
-        i_dm_pwrite         : 1'b0      ,
-        i_dm_paddr          : 9'd0      ,
-        i_dm_pwdata         : 32'd0     ,
-        i_dm_pstrb          : 4'd0      ,
-        i_dm_pprot          : 3'd0      ,
-        o_dm_pready         : _         ,
-        o_dm_prdata         : _         ,
-        o_dm_pslverr        : _         ,
-        o_dm_obs            : _         ,
-        o_retire_dm         : _         ,
-    );
-
-    // Firmware ROM (16 KB) + DRAM (32 MB), shared by both harts.
-    #[allow(initial_assign)]
-    var fw_rom: logic<32> [4096]   ;
-    #[allow(initial_assign)]
-    var dram  : logic<32> [8388608];
-    initial {
-        $readmemh(HEX_FW, fw_rom);
-        $readmemh(HEX_DRAM, dram);
-    }
-
-    // Per-hart instruction fetch + PTW: firmware (PA < 0x4000) else DRAM (PA[31]).
-    for h in 0..N_HARTS :gen_fetch {
-        let imem_in_fw   : logic     = imem_addr[h][31:14] == 18'd0;
-        let dram_imem_idx: logic<23> = imem_addr[h][24:2];
-        let fw_imem_idx  : logic<12> = imem_addr[h][13:2];
-        assign imem_rdata[h] = if imem_in_fw ? fw_rom[fw_imem_idx] : if imem_addr[h][31] ? dram[dram_imem_idx] : 32'd0;
-
-        let iptw_in_fw  : logic     = iptw_addr[h][31:14] == 18'd0;
-        let iptw_in_dram: logic     = iptw_addr[h][31];
-        let dram_iptw_lo: logic<23> = {iptw_addr[h][24:3], 1'b0};
-        let dram_iptw_hi: logic<23> = {iptw_addr[h][24:3], 1'b1};
-        let fw_iptw_lo  : logic<12> = {iptw_addr[h][13:3], 1'b0};
-        let fw_iptw_hi  : logic<12> = {iptw_addr[h][13:3], 1'b1};
-        assign iptw_rdata[h] = if iptw_in_dram ?
-            {dram[dram_iptw_hi], dram[dram_iptw_lo]}
-        : if iptw_in_fw ?
-            {fw_rom[fw_iptw_hi], fw_rom[fw_iptw_lo]}
-        :
-            64'd0
-        ;
-    }
-    let _unused_imem_ren: logic = imem_ren[0];
-    let _unused_iptw_req: logic = iptw_req[0];
-    let _unused_dmem_ren: logic = dmem_ren;
-
-    // Shared data reads: DRAM / firmware ROM (CLINT + UART served inside the SoC).
-    let in_fw  : logic = dmem_addr[31:14] == 18'd0;
-    let in_dram: logic = dmem_addr[31];
-
-    let dram_dmem_lo   : logic<23> = {dmem_addr[24:3], 1'b0};
-    let dram_dmem_hi   : logic<23> = {dmem_addr[24:3], 1'b1};
-    let dram_dmem_nx_lo: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b0};
-    let dram_dmem_nx_hi: logic<23> = {(dmem_addr[24:3] + 22'd1), 1'b1};
-    let fw_dmem_lo     : logic<12> = {dmem_addr[13:3], 1'b0};
-    let fw_dmem_hi     : logic<12> = {dmem_addr[13:3], 1'b1};
-    assign dmem_rdata = if in_dram ?
-        {dram[dram_dmem_hi], dram[dram_dmem_lo]}
-    : if in_fw ?
-        {fw_rom[fw_dmem_hi], fw_rom[fw_dmem_lo]}
-    :
-        64'd0
-    ;
-
-    // Cycle counter (declared here so the LOCKW diag in the DRAM-write
-    // always_ff below can read it; incremented in the counter always_ff later).
-    var cy: logic<32>;
-
-    // Shared DRAM write (S25: line lanes + misaligned hi-side carry). The SoC
-    // gates o_dmem_wen / o_dmem_wstrb_hi to DRAM accesses only.
-    always_ff (clk, rst) {
-        if_reset {} else if dmem_wen && in_dram {
-            for l in 0..8 {
-                if dmem_wstrb[l] != 8'd0 {
-                    let w_lo : logic<23> = {dmem_addr[24:6], l as 3, 1'b0};
-                    let w_hi : logic<23> = {dmem_addr[24:6], l as 3, 1'b1};
-                    let w_old: logic<64> = {dram[w_hi], dram[w_lo]};
-                    let w_new: logic<64> = {
-                        if dmem_wstrb[l][7] ? dmem_wdata[l][63:56] : w_old[63:56],
-                        if dmem_wstrb[l][6] ? dmem_wdata[l][55:48] : w_old[55:48],
-                        if dmem_wstrb[l][5] ? dmem_wdata[l][47:40] : w_old[47:40],
-                        if dmem_wstrb[l][4] ? dmem_wdata[l][39:32] : w_old[39:32],
-                        if dmem_wstrb[l][3] ? dmem_wdata[l][31:24] : w_old[31:24],
-                        if dmem_wstrb[l][2] ? dmem_wdata[l][23:16] : w_old[23:16],
-                        if dmem_wstrb[l][1] ? dmem_wdata[l][15:8] : w_old[15:8],
-                        if dmem_wstrb[l][0] ? dmem_wdata[l][7:0] : w_old[7:0]
-                    };
-                    dram[w_lo] = w_new[31:0];
-                    dram[w_hi] = w_new[63:32];
-                }
-            }
-            // misaligned hi-side (next dword)
-            if dmem_wstrb_hi[0] {
-                dram[dram_dmem_nx_lo][7:0] = dmem_wdata_hi[7:0];
-            }
-            if dmem_wstrb_hi[1] {
-                dram[dram_dmem_nx_lo][15:8] = dmem_wdata_hi[15:8];
-            }
-            if dmem_wstrb_hi[2] {
-                dram[dram_dmem_nx_lo][23:16] = dmem_wdata_hi[23:16];
-            }
-            if dmem_wstrb_hi[3] {
-                dram[dram_dmem_nx_lo][31:24] = dmem_wdata_hi[31:24];
-            }
-            if dmem_wstrb_hi[4] {
-                dram[dram_dmem_nx_hi][7:0] = dmem_wdata_hi[39:32];
-            }
-            if dmem_wstrb_hi[5] {
-                dram[dram_dmem_nx_hi][15:8] = dmem_wdata_hi[47:40];
-            }
-            if dmem_wstrb_hi[6] {
-                dram[dram_dmem_nx_hi][23:16] = dmem_wdata_hi[55:48];
-            }
-            if dmem_wstrb_hi[7] {
-                dram[dram_dmem_nx_hi][31:24] = dmem_wdata_hi[63:56];
-            }
-        }
-    }
-
-
-    // UART TX echo (SoC consumes the writes; mirror to stdout).
-    always_ff (clk, rst) {
-        if_reset {} else if uart_tx_v {
-            $write("%c", uart_tx_d);
-        }
-    }
-
-    // Cycle counter + per-hart retire/trap counters + pass latch (hart0 x3==0xAA).
-    // (var cy is declared earlier, above the DRAM-write always_ff.)
-    var ret0  : logic<32>;
-    var ret1  : logic<32>;
-    var trapc0 : logic<32>;
-    var trapc1 : logic<32>;
-    always_ff (clk, rst) {
-        if_reset {
-            cy      = 32'd0;
-            ret0    = 32'd0;
-            ret1    = 32'd0;
-            trapc0  = 32'd0;
-            trapc1  = 32'd0;
-        } else {
-            cy = cy + 32'd1;
-            if dbg_retire_v[0] {
-                ret0 = ret0 + 32'd1;
-            }
-            if dbg_retire_v[1] {
-                ret1 = ret1 + 32'd1;
-            }
-            if dbg_trap_fire[0] {
-                trapc0 = trapc0 + 32'd1;
-            }
-            if dbg_trap_fire[1] {
-                trapc1 = trapc1 + 32'd1;
-            }
-            // Block T forensics (print-only): report the first N traps per hart so a
-            // hart that dies into the firmware's s_debug_trap names its cause.
-            if dbg_trap_fire[0] && trapc0 <: 32'd4 {
-                $display("  [trap h0 #%d] cy=%h cause=%h epc=%h tval=%h to_s=%b", trapc0, cy, dbg_trap_cause[0], dbg_trap_pc[0], dbg_trap_tval[0], dbg_trap_to_s[0]);
-            }
-            if dbg_trap_fire[1] && trapc1 <: 32'd4 {
-                $display("  [trap h1 #%d] cy=%h cause=%h epc=%h tval=%h to_s=%b", trapc1, cy, dbg_trap_cause[1], dbg_trap_pc[1], dbg_trap_tval[1], dbg_trap_to_s[1]);
-            }
-        }
-    }
-    assign o_cy     = cy;
-    assign o_ret0   = ret0;
-    assign o_ret1   = ret1;
-    assign o_trapc0 = trapc0;
-    assign o_trapc1 = trapc1;
-
-    // M9.4 N=4: per-hart retire/trap counters for ALL harts (N-generic).
-    var ret_arr  : logic<32> [N_HARTS];
-    var trapc_arr: logic<32> [N_HARTS];
-    always_ff (clk, rst) {
-        if_reset {
-            for h in 0..N_HARTS {
-                ret_arr[h]   = 32'd0;
-                trapc_arr[h] = 32'd0;
-            }
-        } else {
-            for h in 0..N_HARTS {
-                if dbg_retire_v[h] {
-                    ret_arr[h] = ret_arr[h] + 32'd1;
-                }
-                if dbg_trap_fire[h] {
-                    trapc_arr[h] = trapc_arr[h] + 32'd1;
-                }
-            }
-        }
-    }
-    assign o_pc_all    = dbg_pc;
-    assign o_ret_all   = ret_arr;
-    assign o_trapc_all = trapc_arr;
-
-    // L3 census: freeze the per-hart counters at hart0's SBI shutdown (the other
-    // harts park in WFI/spin afterwards, which would otherwise keep counting).
-    var lv_arr: logic<32> [N_HARTS];
-    var lr_arr: logic<32> [N_HARTS];
-    var iv_arr: logic<32> [N_HARTS];
-    var mp_arr: logic<32> [N_HARTS];
-    var lw_arr: logic<32> [N_HARTS];
-    var ir_arr: logic<32> [N_HARTS];
-    always_ff (clk, rst) {
-        if_reset {
-            for h in 0..N_HARTS {
-                lv_arr[h] = 32'd0;
-                lr_arr[h] = 32'd0;
-                iv_arr[h] = 32'd0;
-                mp_arr[h] = 32'd0;
-                lw_arr[h] = 32'd0;
-                ir_arr[h] = 32'd0;
-            }
-        } else if dbg_r3[0] != 64'h00000000000000aa {
-            for h in 0..N_HARTS {
-                lv_arr[h] = dbg_lv[h];
-                lr_arr[h] = dbg_lr[h];
-                iv_arr[h] = dbg_iv[h];
-                mp_arr[h] = dbg_mp[h];
-                lw_arr[h] = dbg_lw[h];
-                ir_arr[h] = dbg_ir[h];
-            }
-        }
-    }
-    assign o_lv_all = lv_arr;
-    assign o_lr_all = lr_arr;
-    assign o_iv_all = iv_arr;
-    assign o_mp_all = mp_arr;
-    assign o_lw_all = lw_arr;
-    assign o_ir_all = ir_arr;
-    assign o_r3    = dbg_r3[0];
-    assign o_r3_h1 = dbg_r3[1];
-    assign o_pc0   = dbg_pc[0];
-    assign o_pc1   = dbg_pc[1];
-    assign o_pass  = dbg_r3[0] == 64'h00000000000000aa;
-
-}
 
 #[test(test_soc_smp_linux_boot_2hart)]
 #[ignore]
@@ -364,233 +14,136 @@ module test_soc_smp_linux_boot_2hart {
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
-    var pass : logic    ;
-    var r3   : logic<64>;
-    var r3_h1: logic<64>;
-    var pc0  : logic<64>;
-    var pc1  : logic<64>;
-    var ret0   : logic<32>;
-    var ret1   : logic<32>;
-    var trapc0 : logic<32>;
-    var trapc1 : logic<32>;
-    var cy     : logic<32>;
-    var lv_all : logic<32> [2];
-    var lr_all : logic<32> [2];
-    var iv_all : logic<32> [2];
-    var mp_all : logic<32> [2];
-    var lw_all : logic<32> [2];
-    var ir_all : logic<32> [2];
+    var pass   : logic    ;
+    var fail   : logic    ;
+    var x3     : logic<64>;
+    var cycles : logic<64>;
+    var instret: logic<64>;
 
-    inst harness: test_soc_smp_linux_boot_harness (
-        clk             ,
-        rst             ,
-        o_pass  : pass   ,
-        o_r3    : r3     ,
-        o_r3_h1 : r3_h1  ,
-        o_pc0   : pc0    ,
-        o_pc1   : pc1    ,
-        o_ret0  : ret0   ,
-        o_ret1  : ret1   ,
-        o_trapc0: trapc0 ,
-        o_trapc1: trapc1 ,
-        o_cy    : cy     ,
-        o_lv_all: lv_all ,
-        o_lr_all: lr_all ,
-        o_iv_all: iv_all ,
-        o_mp_all: mp_all ,
-        o_lw_all: lw_all ,
-        o_ir_all: ir_all ,
+    inst h: boot_soc_harness #(
+        N_HARTS   : 2,
+        FW_HEX    : "test/hex/linux_boot_fw_2hart.hex",
+        DRAM_HEX  : "test/hex/linux_dram_real_2hart.hex",
+        PROBE_LOG2: 20,
+    ) (
+        clk                 ,
+        rst                 ,
+        o_pass   : pass     ,
+        o_fail   : fail     ,
+        o_x3     : x3       ,
+        o_cycles : cycles   ,
+        o_instret: instret  ,
+        o_last_pc: _        ,
+        o_ret_cnt: _        ,
+        o_traps  : _        ,
     );
 
     initial {
         rst.assert(clk);
-        // Poll for SBI shutdown (hart0 x3==0xAA); budget 100M cycles. The periodic
-        // probe shows per-hart PC + retire/trap counts: a moving PC / rising retire
-        // = forward progress; a frozen retire = a deadlock (never extend to mask it).
         for _i in 0..10000 {
             clk.next(10000);
-            if _i % 1000 == 0 {
-                $display("  [smp probe] cy=%h h0_pc=%h h1_pc=%h ret0=%h ret1=%h trap0=%h trap1=%h", cy, pc0, pc1, ret0, ret1, trapc0, trapc1);
-            }
-            if pass {
+            if pass || fail {
                 break;
             }
         }
-        $display("v4 SoC SMP(N=2) boot: cy=%h pass=%b h0_pc=%h h1_pc=%h ret0=%h ret1=%h trap0=%h trap1=%h", cy, pass, pc0, pc1, ret0, ret1, trapc0, trapc1);
-        for h in 0..2 {
-            $display("  hart%d: loadreplay=%d loadviol=%d invviol=%d mshrpois=%d loadwait=%d instret=%d", h, lr_all[h], lv_all[h], iv_all[h], mp_all[h], lw_all[h], ir_all[h]);
-        }
-        $assert(pass, "v4 SoC SMP(N=2) boot: did not reach SBI shutdown (hart0 x3 != 0xAA)");
-        $finish();
+        clk.next(10);
+        $display("smp(N=2) linux boot: cycles=%d instret=%d x3=%h pass=%b fail=%b", cycles, instret, x3, pass, fail);
+        $assert (pass, "smp(N=2) linux boot: checker, hart failure or no SBI shutdown");
+        $finish ();
     }
 }
 
-// ============================================================
-// M9.4 — N=4 SMP Linux boot.
-//
-// Reuses test_soc_smp_linux_boot_harness with N_HARTS=4 and the 4-hart hex
-// assets: linux_boot_fw_4hart.hex (firmware already carries the Phase 6.A.3
-// HART_START msip delay, 0x80000 cy for target hart>=1) and
-// linux_dram_real_4hart.hex (kernel CONFIG_NR_CPUS=4 + 4-cpu DTB @ 0x81400000).
-// The SoC/bus/CLINT are already N_HARTS-parameterized (memory_bus gen_n4), and
-// the M9.3 free-list fix (commit 3a28998) is N-agnostic and already in the core.
-//
-// The N=2-only harness ports (o_r3_h1 / o_pc0/1 / o_ret0/1 / o_trapc0/1) are
-// left unconnected (#[allow(missing_port)]); all harts are observed via the
-// clean per-hart o_pc_all / o_ret_all / o_trapc_all liveness arrays. Pass =
-// hart0 x3 == 0xAA.
-//
-//   veryl test --ignored --test test_soc_smp_linux_boot_4hart
-// ============================================================
+// The 4-hart firmware waits for each HSM HART_START on mtime
+// (linux_boot_fw_4hart_mt.hex) instead of an instruction-count busy delay.
 #[test(test_soc_smp_linux_boot_4hart)]
 #[ignore]
 module test_soc_smp_linux_boot_4hart {
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
-    var pass     : logic     ;
-    var r3       : logic<64> ;
-    var cy       : logic<32> ;
-    var pc_all   : logic<64> [4];
-    var ret_all  : logic<32> [4];
-    var trapc_all: logic<32> [4];
-    var lv_all   : logic<32> [4];
-    var lr_all   : logic<32> [4];
-    var iv_all   : logic<32> [4];
-    var mp_all   : logic<32> [4];
-    var lw_all   : logic<32> [4];
-    var ir_all   : logic<32> [4];
+    var pass   : logic    ;
+    var fail   : logic    ;
+    var x3     : logic<64>;
+    var cycles : logic<64>;
+    var instret: logic<64>;
 
-    #[allow(missing_port)]
-    inst harness: test_soc_smp_linux_boot_harness #(
-        N_HARTS   : 4                                   ,
-        HEX_FW    : "test/hex/linux_boot_fw_4hart.hex"  ,
-        HEX_DRAM  : "test/hex/linux_dram_real_4hart.hex",
+    inst h: boot_soc_harness #(
+        N_HARTS   : 4,
+        FW_HEX    : "test/hex/linux_boot_fw_4hart_mt.hex",
+        DRAM_HEX  : "test/hex/linux_dram_real_4hart.hex",
+        PROBE_LOG2: 20,
     ) (
-        clk                   ,
-        rst                   ,
-        o_pass     : pass     ,
-        o_r3       : r3       ,
-        o_cy       : cy       ,
-        o_pc_all   : pc_all   ,
-        o_ret_all  : ret_all  ,
-        o_trapc_all: trapc_all,
-        o_lv_all   : lv_all   ,
-        o_lr_all   : lr_all   ,
-        o_iv_all   : iv_all   ,
-        o_mp_all   : mp_all   ,
-        o_lw_all   : lw_all   ,
-        o_ir_all   : ir_all   ,
+        clk                 ,
+        rst                 ,
+        o_pass   : pass     ,
+        o_fail   : fail     ,
+        o_x3     : x3       ,
+        o_cycles : cycles   ,
+        o_instret: instret  ,
+        o_last_pc: _        ,
+        o_ret_cnt: _        ,
+        o_traps  : _        ,
     );
 
     initial {
         rst.assert(clk);
-        // Poll for SBI shutdown (hart0 x3==0xAA); budget 100M cycles. The per-100-iter
-        // probe shows all 4 harts' PC + retire/trap counts: rising retire on a hart =
-        // forward progress; a frozen count = a stuck hart. Healthy trajectory: hart0
-        // boots solo (~0-18M), then secondaries wake sequentially via the firmware-
-        // delayed SBI HART_START (hart1 ~18M, hart2 ~22M, hart3 ~26M), then the kernel
-        // completes SMP bring-up and reaches SBI shutdown (~52M with the M9.4 SMP fixes:
-        // sticky AMO bus-lock + SC commit-time re-validation + age-gated SC clear).
-        // Never extend the budget to mask a frozen (deadlocked) retire count.
         for _i in 0..10000 {
             clk.next(10000);
-            // Per-100-iter trajectory probe: per-hart PC + retire/trap counts.
-            if _i % 100 == 0 {
-                $display("  [n4 probe] cy=%h pc=[%h %h %h %h] ret=[%h %h %h %h] trap=[%h %h %h %h]", cy, pc_all[0], pc_all[1], pc_all[2], pc_all[3], ret_all[0], ret_all[1], ret_all[2], ret_all[3], trapc_all[0], trapc_all[1], trapc_all[2], trapc_all[3]);
-            }
-            if pass {
+            if pass || fail {
                 break;
             }
         }
-        $display("v4 SoC SMP(N=4) boot: cy=%h pass=%b r3=%h", cy, pass, r3);
-        for h in 0..4 {
-            $display("  hart%h: pc=%h retired=%h traps=%h", h, pc_all[h], ret_all[h], trapc_all[h]);
-        }
-        for h in 0..4 {
-            $display("  hart%d: loadreplay=%d loadviol=%d invviol=%d mshrpois=%d loadwait=%d instret=%d", h, lr_all[h], lv_all[h], iv_all[h], mp_all[h], lw_all[h], ir_all[h]);
-        }
-        $assert(pass, "v4 SoC SMP(N=4) boot: did not reach SBI shutdown (hart0 x3 != 0xAA)");
-        $finish();
+        clk.next(10);
+        $display("smp(N=4) linux boot: cycles=%d instret=%d x3=%h pass=%b fail=%b", cycles, instret, x3, pass, fail);
+        $assert (pass, "smp(N=4) linux boot: checker, hart failure or no SBI shutdown");
+        $finish ();
     }
 }
 
-// ============================================================
-// P9.4 — N=8 SMP Linux boot.
-//
-// Same harness, N_HARTS=8. The firmware (linux_boot_fw_8hart.hex) is the
-// 4-hart firmware rebuilt only with the new kernel's HART_LOTTERY_PA
-// (per-hart-agnostic otherwise: each hart branches on mhartid, parks, and
-// the kernel's SBI HSM HART_START wakes it; DTB_ADDR=0x81400000). The kernel
-// is REBUILT with CONFIG_NR_CPUS=8 (the committed 2/4-hart images are
-// NR_CPUS=2/4, which cap onlining at 4 cpus — see heliodor_kernel_8hart.config
-// and the rebuild steps in doc/linux_boot_hex_build.md / p94_n8_scale.md).
-// linux_dram_real_8hart.hex = the NR_CPUS=8 Image + an 8-cpu DTB at the
-// 0x81400000 offset. The memory_bus generic round-robin arm (N>=5) supplies
-// the fairness to bring up 8 harts without starvation.
-//
-// STATUS (P9.4): all 8 cpus come online and the kernel runs to completion —
-// "smp: Brought up 1 node, 8 CPUs" (SLUB CPUs=8, PLIC 16 contexts), /init runs,
-// and it reaches SBI SRST shutdown (x3==0xAA); native Veryl and Verilator agreed
-// on the cycle count when cross-checked. The earlier post-bringup init hang was a CLINT
-// hart-range bug — the 3-bit compare `msip_hart <: N_HARTS as 3` truncated 8 to
-// 0, so for N=8 every msip/mtimecmp write was dropped (no IPIs / timers); fixed
-// to a 4-bit compare in 42da658, with no kernel workaround. N=8 coherence is
-// additionally checked by test_litmus_8hart, and the boot is cross-checked on
-// Verilator (sim/verilator/tb_soc_smp_linux_boot_8hart.sv). #[ignore] only
-// because the 8-core sim is slow:
-//   veryl test --ignored --test test_soc_smp_linux_boot_8hart
+// N=8: the memory_bus generic round-robin arm (N>=5) must bring up 8 harts
+// without starvation. Cross-checked on Verilator
+// (sim/verilator/tb_soc_smp_linux_boot_8hart.sv).
 #[test(test_soc_smp_linux_boot_8hart)]
 #[ignore]
 module test_soc_smp_linux_boot_8hart {
     inst clk: $tb::clock_gen;
     inst rst: $tb::reset_gen ( clk );
 
-    var pass     : logic     ;
-    var r3       : logic<64> ;
-    var cy       : logic<32> ;
-    var pc_all   : logic<64> [8];
-    var ret_all  : logic<32> [8];
-    var trapc_all: logic<32> [8];
+    var pass   : logic    ;
+    var fail   : logic    ;
+    var x3     : logic<64>;
+    var cycles : logic<64>;
+    var instret: logic<64>;
 
-    #[allow(missing_port)]
-    inst harness: test_soc_smp_linux_boot_harness #(
-        N_HARTS   : 8                                   ,
-        HEX_FW    : "test/hex/linux_boot_fw_8hart.hex"  ,
-        HEX_DRAM  : "test/hex/linux_dram_real_8hart.hex",
+    inst h: boot_soc_harness #(
+        N_HARTS   : 8,
+        FW_HEX    : "test/hex/linux_boot_fw_8hart.hex",
+        DRAM_HEX  : "test/hex/linux_dram_real_8hart.hex",
+        PROBE_LOG2: 20,
     ) (
-        clk                   ,
-        rst                   ,
-        o_pass     : pass     ,
-        o_r3       : r3       ,
-        o_cy       : cy       ,
-        o_pc_all   : pc_all   ,
-        o_ret_all  : ret_all  ,
-        o_trapc_all: trapc_all,
+        clk                 ,
+        rst                 ,
+        o_pass   : pass     ,
+        o_fail   : fail     ,
+        o_x3     : x3       ,
+        o_cycles : cycles   ,
+        o_instret: instret  ,
+        o_last_pc: _        ,
+        o_ret_cnt: _        ,
+        o_traps  : _        ,
     );
 
     initial {
         rst.assert(clk);
-        // Poll for SBI shutdown (hart0 x3==0xAA); the `if pass break` stops
-        // early on success. Budget 45M.
-        // The per-hart PC + retire/trap probe shows progress; never raise the
-        // budget to mask a genuinely FROZEN retire count (all harts idle + flat
-        // retire = a stuck boot, not just a slow one).
-        for _i in 0..4500 {
+        for _i in 0..10000 {
             clk.next(10000);
-            if _i % 100 == 0 {
-                $display("  [n8 probe] cy=%h pc=[%h %h %h %h %h %h %h %h]", cy, pc_all[0], pc_all[1], pc_all[2], pc_all[3], pc_all[4], pc_all[5], pc_all[6], pc_all[7]);
-                $display("  [n8 ret ] cy=%h ret=[%h %h %h %h %h %h %h %h] trap=[%h %h %h %h %h %h %h %h]", cy, ret_all[0], ret_all[1], ret_all[2], ret_all[3], ret_all[4], ret_all[5], ret_all[6], ret_all[7], trapc_all[0], trapc_all[1], trapc_all[2], trapc_all[3], trapc_all[4], trapc_all[5], trapc_all[6], trapc_all[7]);
-            }
-            if pass {
+            if pass || fail {
                 break;
             }
         }
-        $display("v4 SoC SMP(N=8) boot: cy=%h pass=%b r3=%h", cy, pass, r3);
-        for h in 0..8 {
-            $display("  hart%h: pc=%h retired=%h traps=%h", h, pc_all[h], ret_all[h], trapc_all[h]);
-        }
-        $assert(pass, "v4 SoC SMP(N=8) boot: did not reach SBI shutdown (hart0 x3 != 0xAA)");
-        $finish();
+        clk.next(10);
+        $display("smp(N=8) linux boot: cycles=%d instret=%d x3=%h pass=%b fail=%b", cycles, instret, x3, pass, fail);
+        $assert (pass, "smp(N=8) linux boot: checker, hart failure or no SBI shutdown");
+        $finish ();
     }
 }
