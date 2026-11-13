@@ -6,7 +6,7 @@ OBJCOPY = riscv64-unknown-elf-objcopy
 CFLAGS  = -march=rv64ima_zicsr -mabi=lp64 -nostdlib -nostartfiles -ffreestanding
 ELF2HEX = python3 ../c/bin2hex.py
 
-all: coh_n2.hex coh_n4.hex ad_n2.hex unc_n2.hex
+all: coh_n2.hex coh_n4.hex ad_n2.hex unc_n2.hex tkts_n2.hex
 
 coh_n%.elf: coh.S coh.ld
 	$(CC) $(CFLAGS) -DNH=$* -T coh.ld -o $@ coh.S
@@ -33,3 +33,17 @@ clean:
 	rm -f *.elf *.bin *.hex
 
 .PHONY: all clean
+
+tkt_n%.elf: tkt.S coh.ld
+	$(CC) $(CFLAGS) -DNH=$* -T coh.ld -o $@ tkt.S
+
+tkt_n%.hex: tkt_n%.elf
+	$(OBJCOPY) -O binary $< tkt_n$*.bin
+	$(ELF2HEX) tkt_n$*.bin $@
+
+tkts_n%.elf: tkt.S coh.ld
+	$(CC) $(CFLAGS) -DNH=$* -DSAME_LINE -T coh.ld -o $@ tkt.S
+
+tkts_n%.hex: tkts_n%.elf
+	$(OBJCOPY) -O binary $< tkts_n$*.bin
+	$(ELF2HEX) tkts_n$*.bin $@
