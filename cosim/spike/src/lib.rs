@@ -166,7 +166,7 @@ fn is_timing_csr_read(insn: u64) -> bool {
 }
 
 const DRAM_BASE: u64 = 0x8000_0000;
-const DEFAULT_ISA: &str = "rv64imafdcbvh_zicsr_zifencei_zicntr_zihpm";
+const DEFAULT_ISA: &str = "rv64imafdcbvh_zicsr_zifencei_zicntr_zihpm_zicclsm";
 
 /// Checks every retire record of a single-hart heliodor against spike.
 #[derive(Component)]
