@@ -986,6 +986,64 @@ MI の手順 1-4c の後に、設計書の MI の出口条件の表のうち手�
 - GG の w2_n1: 全 74 本を 3 並列で走らせた run (壁時間 4 時間 16 分、DownloadTest は `timeout_sec` 600 で 4 時間 5 分) では pass 50、not_applicable 22 (PrivRw は M5 で除外表に移したので not_applicable)、MemorySampleSingle と MemorySampleMixed が exception (「No samples collected」) だった。この 2 本は 5 秒の壁時間の間に OpenOCD が集めた sample を数える test で、box の load average が 25-48 の間は simulator が約 7.7k cy/s (MD の時点の約 1/3) に落ち、hart が sample の窓の中でほとんど進まなかった。負荷の下がった時点で 1 本ずつ走らせ直すと Mixed は 84 秒、Single は 83 秒で pass した (Single は load average 13 の間に 3 回 exception で、8 の時に pass)。test の前提 (壁時間) による結果で、RTL の差ではない (simulator の run は `fail=0` と checker 0)。w4_n1 は 3 並列で 1 時間 35 分、pass 49、not_applicable 25 (除外 15)。w2_n4 は MD と同じ 7 本で pass 6、除外 1 (2 並列、1 時間 18 分)。w2_n4_smp は 5 本で pass 5 (2 並列、1 時間 39 分)。simulator の run はすべて `fail=0` と checker 0 で終わった。結果の一覧は `test/debug/gg_w2_n1.txt`、`gg_w4_n1.txt`、`gg_w2_n4.txt`、`gg_w2_n4_smp.txt` を更新した。
 - GB4 (W4) は M4 の決定のとおり M6 で走らせる。GM (乱数遅延) は MI の出口条件に無いので回していない。
 
+### 9.9 M6 の出口のゲート (`e32036e7`、2026-11-12/13)
+
+M6 の手順 1-4 (V14 を外し、既定を W2 にした) の後に、§1.2 の M6 列を W2 と W4 で回した。受入条件は MI の完了 (`cf1c973b`) とのビット一致である。基準は §9.8 と、MI に記録が無いものは `cf1c973b` で同じテストを走らせ直した値である。native は sandbox の外で `VERYL_AOT_C_ASYNC=0` で回し、JSON の `fell_back` はすべての run で 0 だった。Verilator は 5.050 (N=1 と N=2 は `-O3 -j 4`、4 hart は `-O1 -j 2`)、veryl は `96d8af7e`。box の load average は 8-47 で、native と Verilator と GG を 3-5 本並行させた。G0、W2 の GL-B/GB1 (5.15)/GB2/GH と W2/W4 の GB4 は手順の中で回した (§1.2 の改訂と設計書の M6 の進捗)。
+
+| ゲート | M6 (`e32036e7`) | 基準 | 判定 |
+|---|---|---|---|
+| G0 | 829 passed、0 failed、321 ignored | 手順 3 の 829 | 一致 |
+| GA / GL-C | W2 3,745/3,749、W4 3,744/3,749、hash 720/720 (W2 と W4) | MI の出口の後の修正を含む値: W2 3,745、W4 3,744 | 一致。fail は W2 が `vucsr_00`、`mcsr_cntr_00`、Zkt 2 本、W4 が `vucsr_00`、`mcsr_cntr_00`、`tselect_trigs_00` 2 本、`wfi_VS_00` で、すべて既知 |
+| GL-B (W4) | 12,262,946、record 10,417,776、hash `74d4b7982390260f` | MI と同一 | ビット一致 |
+| GB1 (W2) | 6.6 21,394,340、7.1 19,240,001、7.1v 20,710,928 | MI と同一 | ビット一致 |
+| GB1 (W4) | 5.15 12,286,458 (hash `e87fa2f00e262139`)、6.6 18,323,297、7.1 16,694,742、7.1v 17,827,384 | MI と同一 (6.6 は MD の値) | ビット一致 |
+| GB2 (W4) | 16,811,410 | MI と同一 | 一致 |
+| GH (W4) | 16,187,826 | MI と同一 | 一致 |
+| GT4 (native) | W2 5,029,779、W4 5,028,524 | MI と同一 | 一致 |
+| GB2 6.6/7.1 (W2、SMP N=2) | 6.6 46,941,211、7.1 31,054,040 | `cf1c973b` で `test_w2_smp_linux_boot_{66,71}_2hart` を回した値と cycles、両 hart の hash まで同一 | ビット一致 (M4 の 31,657,282 / 23,814,202 からは MM と MI の firmware の作り直しで動いている) |
+| GB2 6.6 (W4、SMP N=2、M4 から繰り延べ) | 61,047,678 | `cf1c973b` の同じ run と同一 | ビット一致 |
+| GB2 7.1 (W4、SMP N=2、M4 から繰り延べ) | FAIL (100M cycles の budget で timeout、下) | `cf1c973b` の同じ run は修正を優先して途中で止めたので無い | 不具合。下の修正 (`52de079e`) の後は pass |
+| GB4 6.6/7.1 (W2、SMP N=4、新コアで初) | 6.6 97,595,741、7.1 55,919,816 がともに pass、checker はすべて 0 | 無し | pass。6.6 は budget (100M) までの余りが 2.4 % しかない (下) |
+| GD / GD4 | GD は G0 の中。GD4 は W2/W4 の 5 本ずつ pass (`chk=0`、dmi fail 0) | MI: 5 本ずつ | 一致 |
+| GX | 既定ログの W2/W4 の同名 381 対のうち 359 対が一致 | MI: 381 対のうち 359 対 | 差 22 対は MI と同じもの |
+| GV (W2、Verilator) | N=1 14,617,653 (hash `650ecd24d934e4f2`)、N=2 19,380,793 が PASSED | native と MI の GV | 一致 |
+| GG | w4_n1 pass 49、w2_n4 pass 6 (除外 1)、w2_n4_smp pass 5、w2_n1 pass 52 (not_applicable 22、DownloadTest は 12,706 s で pass)。`gg_compare.py` の FAIL は 0 | MI: 52 / 49 / 6 / 5 | 一致 |
+| GF | 0 行が zero。`dc.nf_busy` は 2 (`test_axi_dc_nf_busy`)、`cm.cut_limit` は 35 (bootls) | MI: `dc.nf_busy` だけが zero | pass。`gdb` 列も GG の simulator のログ 132 本で 0 行が zero |
+
+- W4 の 7.1 の SMP N=2 boot (`test_w4_smp_linux_boot_71_2hart`) は M6 で初めて回したゲートで、hang した。28.3M cycles 付近から hart 0 が 1 本も retire しなくなる (pc `ffffffff8003128c`、record 6,800,387、trap 93 のまま 100M cycles まで動かない)。hart 1 は `ffffffff800311ec`-`80031200` を回り続ける (record は増え続ける)。kernel の像を逆アセンブルすると、hart 1 の位置は ticket spinlock の待ち (`lr.w` と `wrs.nto` の loop)、hart 0 の位置は `mmiowb_spin_unlock` の per-cpu の `sh` (`fence o,w` の直後で、その後に lock の解放の `sh` が続く) である。hart 0 は lock を持ったまま store が retire できず、hart 1 はその lock を待つ。console の最後は `clocksource: Switched to clocksource riscv_clocksource`。同じ boot を scratch の Verilator wrapper (`boot_soc_harness`、W4、`linux_boot_fw_71.hex` + `linux_dram_71_2hart.hex`、`PROBE_LOG2 = 20`) で 36M cycles まで回すと、probe の pc と record 数が native とすべて同じ点で止まる。したがって RTL の不具合で、simulator の誤りではない。W2 の同じ boot と W4 の 6.6 の SMP boot は通る。真因と修正は §9.10。
+- 6.6 の SMP N=4 は `linux_boot_fw_66_smp.hex` (mtime の待ちを入れた `_mt` ではない firmware) を使い、secondary の hart が HSM の busy delay を回すので、97.6M cycles と budget に近い。hart 1-3 の instret は 42.8M / 31.9M / 20.9M。7.1 の N=4 も `_mt` ではない firmware である。W4 の 6.6/7.1 の SMP N=4 は `#[test]` が無いので回していない。
+- G0 のログは手順 3 の run (`/tmp` の pretty 形式、829 passed) を GX と GF の入力にした。GF の入力は default (G0)、act (GA の W2/W4 の batch 22 本)、boot (W2 の 6.6/7.1/7.1v と W4 の 5 本)、bootls (W4 の GL-B)、hv (W4)、smp (G0、N=2/N=4 の SMP boot、GT4)、dbg (G0 と GD4)。W2 の 5.15、GL-B、GH は手順の中で回したもので、ここでは GF に入れていない。
+- GG の w2_n4 は、最初に全 74 本で起動してしまったので途中で止め、MI と同じ 7 本に絞った。止める前に終わっていた 3 本 (`Hwbp1`、`InstantChangePc`、`InstantHaltTest`、すべて pass) と残りの 4 本で判定した。
+- wall 時間 (並行下): W2 の N=1 boot 538-673 s、GD4 W2 478 s / W4 886 s、GT4 W2 2,415 s / W4 9,353 s、W4 の N=1 boot の 5 本 (1 コアに固定して直列) 12,421 s、W4 GB2 6,453 s、W4 GH 2,413 s、SMP N=2 の W2 6.6 4,133 s / 7.1 2,965 s、W4 6.6 15,201 s / 7.1 30,136 s (timeout)、SMP N=4 の W2 6.6 28,605 s / 7.1 17,327 s、GA W2 4,435 s / W4 10,932 s (3 コアに固定)、GV の N=1 868 s / N=2 4,475 s、W4 7.1 の Verilator の 36M cycles 15,790 s、GG w4_n1 5,962 s、w2_n4 (4 本) 3,577 s、w2_n4_smp 6,030 s、w2_n1 13,110 s (いずれも 2 並列)。
+
+### 9.10 W4 の 7.1 の SMP N=2 の hang の修正 (`52de079e`、2026-11-14)
+
+hang の窓 (28,330,000-28,340,000 cycles) を Verilator の VCD で取って解析した。89 cycles 周期の livelock である。
+
+1. hart 1 は ticket spinlock の待ちで `lr.w` を回し、lock の line を exclusive で取って 64 cycles pin する。
+2. hart 0 の ROB の head は unlock の `lw a5,0(a0)` (`ffffffff80031290`) で、miss する。hart 1 への probe は pin が切れるまで待たされる。
+3. pin が切れて hart 0 に line が届くと、hart 1 の LR がすぐに RFO を出し直す。hart 0 の `lw` が data を受け取る cycle に、その line の invalidate が LQ に届く。
+4. LQ はこれを coherence の順序違反として poison を立て、commit が `lw` を replay する。2 に戻る。
+
+ROB の head の load は、それより古い命令がすべて retire しているので、読んだ後に line が invalidate されても順序違反にならない。そこで LQ は、`i_oldest` が指す load には coherence の poison を立てないようにした (`src/core/lsu/lq.veryl`)。store の scan による poison と、head になる前に立った poison は従来どおり replay する。後者が残るので同じ address の load の順 (CoRR) は保たれ、replay は高々 1 回で終わる。
+
+同時に、Linux 7.1 の ticket spinlock の書き方を再現する 2 hart の stress (`test/coh/tkt.S`、`test_{w2,w4}_smp_tkt_2hart`) を足した。この hang は再現しないが、kernel と同じ lock の型の回帰として残す。`test_lsu` の W4 の seed 9 と 8 は、修正でタイミングが変わり、ともに `atperf.fail` (exclusive の失敗) を出さなくなったので、h3 の seed を 3 に変えた (`9e2bbf06`、seed 3 は単独で全 event を出す)。
+
+修正の後のゲート (native、sandbox の外、`fell_back` はすべて 0):
+
+| ゲート | 修正の後 | 修正の前 | 判定 |
+|---|---|---|---|
+| GB2 7.1 (W4、SMP N=2) | 36,935,818 | 100M で timeout | pass |
+| G0 | 831 passed、0 failed、321 ignored | 829 (stress の 2 本を足した) | pass |
+| GT4 (native) | W2 5,022,440、W4 5,023,457 | W2 5,029,779、W4 5,028,524 | pass |
+| GB2 (5.15、SMP N=2) | W2 19,382,092、W4 16,814,425 | W2 19,380,793、W4 16,811,410 | pass |
+| GB2 7.1 (W2、SMP N=2) | 31,061,009 | 31,054,040 | pass |
+| GB4 (5.15、SMP N=4) | W2 24,190,865、W4 21,837,182 | W2 24,989,451、W4 22,640,641 | pass (spinlock の無駄な replay が減った分、3.2 % / 3.5 % 減った) |
+| GH | W2 18,611,543、W4 16,187,826 | 同じ | 一致 |
+
+- N=1 の boot、GL-B、GA、GD4、GG、GV は回し直していない。N=1 には他の hart が無く、coherence の event は hart の間でしか起きないので、retire の流れは変わらない見込みである。
+- W2 6.6 の SMP N=4 (budget の余り 2.4 %) と W4 6.6 の SMP N=2 も回し直していない。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
