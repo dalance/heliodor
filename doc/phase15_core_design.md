@@ -5136,12 +5136,16 @@ MI の進捗:
 ### MV: 検証環境の拡充
 
 - 目標: 旧コアの golden に頼らずに、新コアの全 ISA を命令単位で照合できるようにする (D14)。M6 の後、MS の前に置く。
-- 作業の順序:
-  1. V1 標準 RVFI ポート: `RetireRec` に rs1/rs2 の番号と読み値、load の値、`intr`、`halt`、CSR の読み値と WARL 後の値を足し、riscv-formal の `rvfi_*` (NRET = commit 幅) を出す adapter を置く。H/V と vector は名前を決めた拡張にする。今の tracer と hash は変えず、GL-B の record 列と hash を保つ。
-  2. V2 spike との co-simulation (GC): spike の libriscv を C++ の shim で包んだ Veryl の component を作り、RVFI の lane を毎サイクル受けて spike を 1 命令ずつ進め、pc、insn、rd、store、CSR、trap を比べる。割込みは `intr` を見て spike の MIP に反映し、mtime と MMIO の読み値は RVFI の load の値で上書きする。N=1 から始め、SMP は hart ごとの spike と load 値の流し込みで広げる。spike を `toolchain/` に足す。
-  3. V3 乱数命令列 (GR): riscv-dv の Python 版か自作の生成器で、scalar、FP、V、CSR、特権の遷移、ページ表を混ぜた命令列を作り、GC で判定する。固定 seed の集合をマイルストーンの末に回す。
-  4. V4 カバレッジ (GCV): RVFI の trace から命令×特権、trap の cause、CSR、vtype の格子などを集計し、GV の構成で Verilator の line/toggle カバレッジを取る。記録のみ。
-  5. V5 公式 litmus (GLT): RISC-V の litmus テスト群を bare-metal にし、N=2/N=4 の W2/W4 で回して herd のモデルが許す結果と照合する。
+- 作業の順序 (2026-11-14、手順 0 の試作の結果から具体化):
+  0. 【済 `bf731ce1`、ブランチ `phase15/mv-spike`】試作: spike (`b86c9bb`) の libriscv を C++ の shim で包んだ component `heliodor_cosim` (`cosim/spike/`) を作り、W2 の arch harness の retire lane と `IrqEvent` を階層参照でつないで、record ごとに pc、priv、trap、cause、tval、insn、next_pc、int/FP の rd の値、store の byte を照合した。shim は `sim_t` を使わず、平らな DRAM (0x8000_0000) だけを持つ `simif_t` と `processor_t` 1 個で、tb と同じ hex を spike のメモリに読む。riscv-tests 18 本 (ui/um/ua/mi/si/uf/ud/uc/uzbb、Sv39 の `_v`)、dhrystone、coremark が不一致 0 で通り、故意に入れた不一致は検出した。照合の代金は sim 時間で約 6-7 % である。分かったこと: (a) tb が `$comp` を参照すると、spike の無い環境で `veryl check` が通らない。(b) spike には割込みの pending、mtime、MMIO の読み値を外から与える口が無い (試作は mie を隠して DUT の `IrqEvent` のときだけ割込みを取らせた)。(c) spike と heliodor の実装定義の差 (misa の書き込み、Sv39 の `max_vaddr_bits`、misaligned、WFI、counter) は shim の設定で吸収できた。(d) 利用者の `LD_LIBRARY_PATH` に別の libriscv があると取り違えるので、DT_RPATH で link する。
+  1. V1 RVFI: `RetireRec` に rs1/rs2 の番号と読み値、CSR の読み値と WARL 後の書き値、割込みの印 (`intr`) を足し、riscv-formal の `rvfi_*` (NRET = commit 幅) を出す adapter を tb の側に置く。H/V と vector は名前を決めた拡張にする。tracer の hash の入力は変えない。受入条件: GL-B の record 列と hash、G0、GT4 が V1 の前と一致する。
+  2. V2 GC (N=1): 試作を本番の形にする。(a) spike と DUT の構成 (ISA 文字列、misa、PMP の数と粒度、misaligned、counter) を 1 か所の表から作る。(b) 非決定の入力を spike に与える: 割込みは `intr` の record で spike に trap を起こさせ、mtime、MMIO と IO の load は DUT の読み値で spike のレジスタを上書きする。spike に口が無いものは、`toolchain/` に置く最小のパッチで足す。(c) vector は shim で `vrf_hash_step` と同じ fold を spike の VRF から計算して比べ、H は virt、V=1 の cause、tval、htval、htinst を比べる。(d) tohost に書いたら照合を止める。HTIF の syscall を使う program は対象にしない。(e) 照合の tb は arch suite、directed、N=1 の Linux boot (5.15、6.6、7.1、7.1v)、hvlinux、ACT4 の harness に足す。
+  3. V2 GC (SMP): hart ごとの `processor_t` が 1 つのメモリを共有し、retire の順で進める。他の hart の store の見え方は spike で再現しないので、load、LR、AMO の読み値は DUT の値を正として spike のレジスタに入れ、store の値と番地を照合する。N=2/N=4 の SMP boot と litmus で回す。
+  4. V3 乱数命令列 (GR): riscv-dv の Python 版か自作の生成器で、scalar、FP、V、CSR、特権の遷移、ページ表を混ぜた命令列を作り、GC で判定する。固定 seed の集合をマイルストーンの末に回す。
+  5. V4 カバレッジ (GCV): RVFI の trace から命令×特権、trap の cause、CSR、vtype の格子などを集計し、GV の構成で Verilator の line/toggle カバレッジを取る。記録のみ。
+  6. V5 公式 litmus (GLT): RISC-V の litmus テスト群を bare-metal にし、N=2/N=4 の W2/W4 で回して herd のモデルが許す結果と照合する。
+- 【決定】(2026-11-14、ユーザ) 照合の tb は本体の tb に置き、component の manifest を commit して、spike の無い環境でも `veryl check` と `veryl build` が通るようにする。spike が要るのは照合の tb を走らせるときだけである。veryl に manifest だけで解析を通す道が無ければ、手順 2 の最初に相談し直す。
+- 【決定】(2026-11-14、ユーザ) spike に足りない口 (割込みの pending、mtime、MMIO と IO の読み値) は、`toolchain/` に置く最小のパッチで足し、`fetch.sh` が pin した commit に当ててから build する。shim で spike の内部の振る舞いに頼る回避はしない。
 - MS の後: riscv-formal を V1 の RVFI につなぐ (V6)。
 - 出口条件: 上の表の MV の行。
 
