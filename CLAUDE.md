@@ -117,17 +117,17 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      (`tb/test_w2_rv64*.veryl`, with W4 copies in `tb/test_w4_*`), most of them in
      golden lockstep. Fix any failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart`: RVWMO litmus battery at N=4
-     (IRIW + 4-way barrier/bus stress; **5,029,779 cycles**). The N=2 battery
+     (IRIW + 4-way barrier/bus stress; **5,022,440 cycles**). The N=2 battery
      (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
      memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (**19,380,793 cycles**, ~30 min). N=1 single-hart is `--ignored --test
+     (**19,382,092 cycles**, ~30 min). N=1 single-hart is `--ignored --test
      test_soc_linux_boot` (**14,617,653 cycles**, ~7 min). The N=1 boot in golden
      lockstep (retire-count mtime, trace hash checked against the old-core golden) is
      `--ignored --test test_w2_linux_boot_lockstep` (14,570,718 cycles, ~7 min); run it
      after any change that can alter the retire stream.
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: N=4 SMP Linux boot
-     (**24,989,451 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (22,640,641
+     (**24,190,865 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (21,837,182
      cycles, ~5 h at ~1.3k cy/s). The Verilator wrappers give identical cycle counts
      and serve as the NBA cross-check, not the gate.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
