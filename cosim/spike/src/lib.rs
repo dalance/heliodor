@@ -29,7 +29,7 @@ unsafe extern "C" {
     fn hc_get_xpr(h: *mut c_void, i: u32) -> u64;
     fn hc_set_xpr(h: *mut c_void, i: u32, v: u64);
     fn hc_get_fpr(h: *mut c_void, i: u32) -> u64;
-    fn hc_step(h: *mut c_void, out: *mut HcStep);
+    fn hc_step(h: *mut c_void, out: *mut HcStep, irq: i32);
 }
 
 /// Owns one spike instance. The host serializes calls into an instance, and
@@ -166,6 +166,7 @@ fn is_timing_csr_read(insn: u64) -> bool {
 }
 
 const DRAM_BASE: u64 = 0x8000_0000;
+const DEFAULT_ISA: &str = "rv64imafdcbvh_zicsr_zifencei_zicntr_zihpm";
 
 /// Checks every retire record of a single-hart heliodor against spike.
 #[derive(Component)]
@@ -176,6 +177,8 @@ struct SpikeCosim {
     rec1: InputPort,
     rec2: InputPort,
     rec3: InputPort,
+    /// retire_pkg::IrqEvent.
+    irq: InputPort,
     /// `$readmemh` image (32-bit words) loaded at PA 0x8000_0000.
     #[param(name = "HEX_FILE")]
     hex_file: Option<String>,
@@ -183,9 +186,14 @@ struct SpikeCosim {
     isa: Option<String>,
     #[param(name = "MEM_SIZE")]
     mem_size: Option<u64>,
+    /// PA of tohost; the record count at its first store is logged.
+    #[param(name = "TOHOST_PA")]
+    tohost_pa: Option<u64>,
     #[state]
     spike: Spike,
     compared: u64,
+    at_tohost: Option<u64>,
+    irqs: u64,
     done: bool,
     buf: Vec<u64>,
 }
@@ -215,7 +223,7 @@ impl SpikeCosim {
     fn check(&mut self, r: &Rec) -> std::result::Result<(), String> {
         let h = self.spike.0;
         let mut s = HcStep::default();
-        unsafe { hc_step(h, &mut s) };
+        unsafe { hc_step(h, &mut s, 0) };
         let mut errs = Vec::new();
         if r.pc != s.pc {
             errs.push(format!("pc dut={:#x} ref={:#x}", r.pc, s.pc));
@@ -224,7 +232,10 @@ impl SpikeCosim {
             errs.push(format!("priv dut={} ref={}", r.priv_, s.priv_));
         }
         if r.trap != (s.trap != 0) {
-            errs.push(format!("trap dut={} ref={} (ref cause={:#x})", r.trap, s.trap, s.cause));
+            errs.push(format!(
+                "trap dut={} ref={} (ref cause={:#x} insn={:#x})",
+                r.trap, s.trap, s.cause, s.insn
+            ));
         } else if r.trap {
             if r.cause != s.cause & 0x3f || s.cause >> 63 != 0 {
                 errs.push(format!("cause dut={:#x} ref={:#x}", r.cause, s.cause));
@@ -300,7 +311,7 @@ impl SpikeCosim {
 #[component_impl]
 impl SpikeCosim {
     fn on_init(&mut self, ctx: &mut SimCtx) -> Result<()> {
-        let isa = CString::new(self.isa.clone().unwrap_or("rv64imafdc_zicsr_zifencei".into()))?;
+        let isa = CString::new(self.isa.clone().unwrap_or(DEFAULT_ISA.into()))?;
         let priv_ = CString::new("MSU")?;
         let size = self.mem_size.unwrap_or(4 << 20);
         let h = unsafe { hc_new(isa.as_ptr(), priv_.as_ptr(), DRAM_BASE, size, DRAM_BASE) };
@@ -334,6 +345,26 @@ impl SpikeCosim {
             }
         }
         recs.sort_by_key(|r| r.order);
+        let mut iw = [0u64; 3];
+        ctx.read_words(self.irq, &mut iw);
+        // IrqEvent {valid, cause<6>, epc<64>, order<64>}, valid on top.
+        if bits(&iw, 134, 1) != 0 {
+            let cause = bits(&iw, 128, 6);
+            let epc = bits(&iw, 64, 64);
+            let order = bits(&iw, 0, 64);
+            let mut s = HcStep::default();
+            unsafe { hc_step(self.spike.0, &mut s, 1) };
+            if s.trap == 0 || s.cause >> 63 == 0 || s.cause & 0x3f != cause || s.pc != epc {
+                ctx.fail(format!(
+                    "spike mismatch at interrupt before order {order}: dut cause={cause} epc={epc:#x}, \
+                     ref trap={} cause={:#x} pc={:#x}",
+                    s.trap, s.cause, s.pc
+                ));
+                self.done = true;
+                return Ok(());
+            }
+            self.irqs += 1;
+        }
         for r in &recs {
             if let Err(msg) = self.check(r) {
                 ctx.fail(msg);
@@ -341,12 +372,23 @@ impl SpikeCosim {
                 return Ok(());
             }
             self.compared += 1;
+            if self.at_tohost.is_none()
+                && r.mem_wmask != 0
+                && r.mem_paddr == self.tohost_pa.unwrap_or(0x8000_1000)
+            {
+                self.at_tohost = Some(self.compared);
+            }
         }
         Ok(())
     }
 
     fn on_finish(&mut self, ctx: &mut SimCtx) -> Result<()> {
-        ctx.log(&format!("spike cosim: {} records compared", self.compared));
+        ctx.log(&format!(
+            "spike cosim: {} records and {} interrupts compared, {} records up to the tohost store",
+            self.compared,
+            self.irqs,
+            self.at_tohost.map_or("none".into(), |n| n.to_string())
+        ));
         if self.compared == 0 {
             ctx.fail("spike cosim: no records compared");
         }

@@ -21,6 +21,9 @@ class flat_sim_t : public simif_t {
     cfg_.priv = priv;
     cfg_.mem_layout = {mem_cfg_t(base, size)};
     cfg_.hartids = {0};
+    // The DUT retires a WFI and stalls without records; spike must not
+    // wait, since it never sees the pending interrupt that ends the wait.
+    cfg_.wfi_as_nop = true;
     proc_ = new processor_t(isa, priv, &cfg_, this, 0, false, nullptr, std::cerr);
     harts_[0] = proc_;
   }
@@ -69,6 +72,8 @@ struct hc_step_t {
 void* hc_new(const char* isa, const char* priv, uint64_t base, uint64_t size, uint64_t pc) {
   try {
     auto* s = new flat_sim_t(isa, priv, base, size);
+    s->proc()->set_max_vaddr_bits(39);
+    s->proc()->reset();
     s->proc()->get_state()->pc = pc;
     return s;
   } catch (std::exception& e) {
@@ -101,7 +106,11 @@ uint64_t hc_get_csr(void* h, unsigned addr) {
   }
 }
 
-void hc_step(void* h, hc_step_t* out) {
+// irq = 0: a pending enabled interrupt must not be taken, since the DUT
+// decides when it takes one; mie reads as 0 for this step. irq = 1: the DUT
+// took an interrupt here, so the step takes it and executes nothing.
+// misa is read-only on the DUT, so a write to it is undone.
+void hc_step(void* h, hc_step_t* out, int irq) {
   auto* p = static_cast<flat_sim_t*>(h)->proc();
   auto* st = p->get_state();
   reg_t x0[NXPR];
@@ -116,7 +125,15 @@ void hc_step(void* h, hc_step_t* out) {
   } catch (...) {
   }
   reg_t instret = st->minstret->read();
+  reg_t misa = st->misa->read();
+  reg_t mie = st->mie->read();
+  bool masked = !irq && (st->mip->read() & mie);
+  if (masked) st->mie->write(0);
   p->step(1);
+  // A timer CSR access first returns to serialize, executing nothing.
+  if (st->serialized) p->step(1);
+  if (masked && st->mie->read() == 0) st->mie->write(mie);
+  if (st->misa->read() != misa) st->misa->write(misa);
   out->next_pc = st->pc;
   // A trapping instruction does not retire, so minstret stands still.
   out->trap = st->minstret->read() == instret;
