@@ -29,6 +29,7 @@ unsafe extern "C" {
     fn hc_get_xpr(h: *mut c_void, i: u32) -> u64;
     fn hc_set_xpr(h: *mut c_void, i: u32, v: u64);
     fn hc_get_fpr(h: *mut c_void, i: u32) -> u64;
+    fn hc_get_csr(h: *mut c_void, addr: u32) -> u64;
     fn hc_step(h: *mut c_void, out: *mut HcStep, irq: i32);
 }
 
@@ -88,6 +89,19 @@ const FIELDS: &[(&str, u32)] = &[
     ("vtype", 64),
     ("vl", 64),
     ("vstart", 64),
+    ("intr", 1),
+    ("rs1_kind", 2),
+    ("rs1_addr", 5),
+    ("rs1_rdata", 64),
+    ("rs2_kind", 2),
+    ("rs2_addr", 5),
+    ("rs2_rdata", 64),
+    ("rs3_kind", 2),
+    ("rs3_addr", 5),
+    ("rs3_rdata", 64),
+    ("csr_read", 1),
+    ("csr_rdata", 64),
+    ("csr_new", 64),
 ];
 
 fn rec_width() -> u32 {
@@ -122,6 +136,14 @@ struct Rec {
     mem_paddr: u64,
     mem_wmask: u64,
     mem_wdata: u64,
+    csr_valid: bool,
+    csr_addr: u64,
+    intr: bool,
+    /// (kind, addr, value) of rs1, rs2, rs3.
+    rs: [(u64, u64, u64); 3],
+    csr_read: bool,
+    csr_rdata: u64,
+    csr_new: u64,
 }
 
 fn decode(words: &[u64]) -> Rec {
@@ -148,6 +170,21 @@ fn decode(words: &[u64]) -> Rec {
             "mem_paddr" => r.mem_paddr = v,
             "mem_wmask" => r.mem_wmask = v,
             "mem_wdata" => r.mem_wdata = v,
+            "csr_valid" => r.csr_valid = v != 0,
+            "csr_addr" => r.csr_addr = v,
+            "intr" => r.intr = v != 0,
+            "rs1_kind" => r.rs[0].0 = v,
+            "rs1_addr" => r.rs[0].1 = v,
+            "rs1_rdata" => r.rs[0].2 = v,
+            "rs2_kind" => r.rs[1].0 = v,
+            "rs2_addr" => r.rs[1].1 = v,
+            "rs2_rdata" => r.rs[1].2 = v,
+            "rs3_kind" => r.rs[2].0 = v,
+            "rs3_addr" => r.rs[2].1 = v,
+            "rs3_rdata" => r.rs[2].2 = v,
+            "csr_read" => r.csr_read = v != 0,
+            "csr_rdata" => r.csr_rdata = v,
+            "csr_new" => r.csr_new = v,
             _ => {}
         }
     }
@@ -163,6 +200,26 @@ fn is_timing_csr_read(insn: u64) -> bool {
     let csr = (insn >> 20) & 0xfff;
     matches!(csr, 0xc00 | 0xc01 | 0xb00) || (0xc03..=0xc1f).contains(&csr)
         || (0xb03..=0xb1f).contains(&csr)
+}
+
+/// CSRs whose value spike cannot reproduce: the counters, and the interrupt
+/// pending bits (spike sees no interrupt pins).
+fn is_unmodeled_csr(csr: u64) -> bool {
+    matches!(csr, 0xc00..=0xc1f | 0xb00..=0xb1f | 0x344 | 0x144 | 0x644)
+}
+
+/// Bits of a CSR whose value differs between the DUT and spike by an
+/// implementation choice, not compared: the FS/VS/SD reset state of mstatus
+/// and sstatus (the DUT leaves FS Initial, spike Off), mideleg.SGEI
+/// (read-only one on spike, zero on the DUT, which has GEILEN = 0) and
+/// medeleg bit 0 (writable on the DUT, read-only zero on spike with C).
+fn csr_cmp_mask(csr: u64) -> u64 {
+    match csr {
+        0x300 | 0x100 => !((1u64 << 63) | (3 << 13) | (3 << 9)),
+        0x302 => !1u64,
+        0x303 => !(1u64 << 12),
+        _ => !0,
+    }
 }
 
 const DRAM_BASE: u64 = 0x8000_0000;
@@ -194,6 +251,11 @@ struct SpikeCosim {
     compared: u64,
     at_tohost: Option<u64>,
     irqs: u64,
+    /// Source and CSR values compared.
+    src_checked: u64,
+    csr_checked: u64,
+    /// The next record is the first of a trap handler.
+    intr_next: bool,
     done: bool,
     buf: Vec<u64>,
 }
@@ -222,9 +284,39 @@ impl SpikeCosim {
 
     fn check(&mut self, r: &Rec) -> std::result::Result<(), String> {
         let h = self.spike.0;
+        let mut errs = Vec::new();
+        // Source values and the CSR read, against spike's state before the
+        // step.
+        for (i, &(kind, addr, v)) in r.rs.iter().enumerate() {
+            let want = match kind {
+                1 => unsafe { hc_get_xpr(h, addr as u32) },
+                2 => unsafe { hc_get_fpr(h, addr as u32) },
+                _ => {
+                    if addr != 0 || v != 0 {
+                        errs.push(format!("rs{} unused but addr={addr} value={v:#x}", i + 1));
+                    }
+                    continue;
+                }
+            };
+            if v != want {
+                let rf = if kind == 2 { "f" } else { "x" };
+                errs.push(format!("rs{} {rf}{addr} dut={v:#x} ref={want:#x}", i + 1));
+            }
+            self.src_checked += 1;
+        }
+        if r.csr_read && !is_unmodeled_csr(r.csr_addr) {
+            let want = unsafe { hc_get_csr(h, r.csr_addr as u32) };
+            if (r.csr_rdata ^ want) & csr_cmp_mask(r.csr_addr) != 0 {
+                errs.push(format!("csr {:#x} read dut={:#x} ref={want:#x}", r.csr_addr, r.csr_rdata));
+            }
+            self.csr_checked += 1;
+        }
+        if r.intr != self.intr_next {
+            errs.push(format!("intr dut={} expected={}", r.intr, self.intr_next));
+        }
+        self.intr_next = r.trap;
         let mut s = HcStep::default();
         unsafe { hc_step(h, &mut s, 0) };
-        let mut errs = Vec::new();
         if r.pc != s.pc {
             errs.push(format!("pc dut={:#x} ref={:#x}", r.pc, s.pc));
         }
@@ -282,6 +374,13 @@ impl SpikeCosim {
             if v != r.rd_wdata {
                 errs.push(format!("f{rd} dut={:#x} ref={:#x}", r.rd_wdata, v));
             }
+        }
+        if r.csr_valid && !r.trap && !is_unmodeled_csr(r.csr_addr) {
+            let want = unsafe { hc_get_csr(h, r.csr_addr as u32) };
+            if (r.csr_new ^ want) & csr_cmp_mask(r.csr_addr) != 0 {
+                errs.push(format!("csr {:#x} after write dut={:#x} ref={want:#x}", r.csr_addr, r.csr_new));
+            }
+            self.csr_checked += 1;
         }
         let size = self.mem_size.unwrap_or(4 << 20);
         if r.mem_wmask & 0xff != 0 && r.mem_paddr >= DRAM_BASE && r.mem_paddr - DRAM_BASE + 8 <= size {
@@ -364,6 +463,7 @@ impl SpikeCosim {
                 return Ok(());
             }
             self.irqs += 1;
+            self.intr_next = true;
         }
         for r in &recs {
             if let Err(msg) = self.check(r) {
@@ -384,9 +484,12 @@ impl SpikeCosim {
 
     fn on_finish(&mut self, ctx: &mut SimCtx) -> Result<()> {
         ctx.log(&format!(
-            "spike cosim: {} records and {} interrupts compared, {} records up to the tohost store",
+            "spike cosim: {} records and {} interrupts compared ({} source and {} CSR values), \
+             {} records up to the tohost store",
             self.compared,
             self.irqs,
+            self.src_checked,
+            self.csr_checked,
             self.at_tohost.map_or("none".into(), |n| n.to_string())
         ));
         if self.compared == 0 {

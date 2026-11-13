@@ -22,7 +22,8 @@
 //   i_irq_*        : interrupt pins, registered in csr and again in commit
 //   i_mtime        : time CSR source
 //   o_retire[COMMIT_W], o_irq_evt : registered retire records and interrupt
-//                    event, the core's only observation contract
+//                    event, the core's only observation contract; csr_new
+//                    alone is read from the CSR file in the record's cycle
 //   o_retire_dm    : registered with o_retire: its records retired in Debug
 //                    Mode (observers that follow the program skip them)
 //   i_dm_haltreq   : the Debug Module's halt request level
@@ -202,6 +203,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var trig_cfg: TrigCfg                    ; // trig_unit's address-match configuration
     var trig_hits: logic<CFG::TRIG_N>        ;
     var trig_rd : logic             <64>     ;
+    var trig_obs: logic             <64>     ;
+    var csr_obs : logic             <64>     ;
+    var csr_oa  : logic             <12>     ;
     var vtype   : logic             <64>     ;
     var vl      : logic             <64>     ;
     var vstart  : logic             <64>     ;
@@ -580,6 +584,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var bar_n    : logic    <TAKE_W>        ;
     var rob_v    : logic               [RW] ;
     var rob_a    : RobAlloc            [RW] ;
+    var rob_src  : OpSrc               [RW] ;
     var iq_v     : logic               [NQ * RW];
     var iq_a     : IqAlloc             [NQ * RW];
     var lq_av    : logic               [RW] ;
@@ -618,6 +623,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_bar_n      : bar_n       ,
         o_rob_valid  : rob_v       ,
         o_rob        : rob_a       ,
+        o_rob_src    : rob_src     ,
         o_iq_valid   : iq_v        ,
         o_iq         : iq_a        ,
         o_lq_valid   : lq_av       ,
@@ -694,10 +700,39 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var rd_f : logic   <64> [PRF_RD_N];
     var vu_xi: logic   <64> [2]       ; // the vector unit's read ports
     var vu_xf: logic   <64> [1]       ;
+    // Source values of the retire record: the PRF entries the ops at the
+    // head read. They are still live at retire (an entry is freed only when
+    // a younger writer of its register retires), so the values are the ones
+    // the ops read.
+    var cm_src: OpSrc         [CW]    ;
+    var ord_i : logic<PREG_W> [3 * CW];
+    var ord_f : logic<PREG_W> [3 * CW];
+    var obs_i : logic<64>     [3 * CW];
+    var obs_f : logic<64>     [3 * CW];
+    var src_rd: logic<64>     [3 * CW];
+    var src_k : SrcObs        [3 * CW];
+    always_comb {
+        for l in 0..CW {
+            src_k[3 * l]     = cm_src[l].rs1;
+            src_k[3 * l + 1] = cm_src[l].rs2;
+            src_k[3 * l + 2] = cm_src[l].rs3;
+        }
+    }
+    for j in 0..3 * CW :g_src {
+        assign ord_i[j]  = if src_k[j].kind == retire_pkg::RdKind::INT ? src_k[j].preg : 0;
+        assign ord_f[j]  = if src_k[j].kind == retire_pkg::RdKind::FP ? src_k[j].preg : 0;
+        assign src_rd[j] = case src_k[j].kind {
+            retire_pkg::RdKind::INT: obs_i[j],
+            retire_pkg::RdKind::FP : obs_f[j],
+            default                : 64'd0,
+        };
+    }
+
     inst u_prf_i: prf::<CFG> #(
         CLS    : RegClass::INT ,
         N_ENTRY: CFG::PRF_INT_N,
         XRD_N  : 2             ,
+        ORD_N  : 3 * CW        ,
     ) (
         clk                              ,
         rst                              ,
@@ -706,12 +741,15 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_wb    : wb                     ,
         i_xraddr: '{vu_prd[0], vu_prd[1]},
         o_xrdata: vu_xi                  ,
+        i_oraddr: ord_i                  ,
+        o_ordata: obs_i                  ,
         o_chk   : o_chk.prf_int          ,
     );
     inst u_prf_f: prf::<CFG> #(
         CLS    : RegClass::FP ,
         N_ENTRY: CFG::PRF_FP_N,
         XRD_N  : 1            ,
+        ORD_N  : 3 * CW       ,
     ) (
         clk                     ,
         rst                     ,
@@ -720,6 +758,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         i_wb    : wb            ,
         i_xraddr: '{vu_prd[2]}  ,
         o_xrdata: vu_xf         ,
+        i_oraddr: ord_f         ,
+        o_ordata: obs_f         ,
         o_chk   : o_chk.prf_fp  ,
     );
 
@@ -1654,11 +1694,13 @@ pub module heliodor_core::<CFG: core_cfg> #(
         rst                      ,
         i_alloc_valid: rob_v     ,
         i_alloc      : rob_a     ,
+        i_alloc_src  : rob_src   ,
         o_alloc_tag  : rob_tag   ,
         o_free       : rob_free  ,
         i_wb         : wb        ,
         i_vu_done    : vu_done   ,
         o_cm         : rob_cm    ,
+        o_cm_src     : cm_src    ,
         o_exc        : rob_exc   ,
         o_head       : rob_head  ,
         i_retire_cnt : retire_cnt,
@@ -1711,11 +1753,26 @@ pub module heliodor_core::<CFG: core_cfg> #(
     var icnt_act : logic     ;
     var icnt_dm  : logic     ;
     var icnt_bp  : logic     ;
+    var cm_ret: retire_pkg::RetireRec [CW];
+    #[ifdef(HELIODOR_CHK)]
+    always_comb {
+        o_retire = cm_ret;
+        // SYS ops are alone and retire on lane 0.
+        if cm_ret[0].csr_valid {
+            o_retire[0].csr_new = csr_obs;
+        }
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_retire = cm_ret;
+
     inst u_commit: commit::<CFG> (
         clk                                          ,
         rst                                          ,
         i_reset_pc                                   ,
         i_cm                 : rob_cm                ,
+        i_cm_src             : cm_src                ,
+        i_src_rdata          : src_rd                ,
+        o_csr_obs_addr       : csr_oa                ,
         i_exc                : rob_exc               ,
         i_head               : rob_head              ,
         i_lq_win             : lq_win                ,
@@ -1768,7 +1825,7 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_head_retired       : hret                  ,
         o_rsv_clr            : rsv_clr               ,
         o_csr                : csr_cm                ,
-        o_retire                                     ,
+        o_retire             : cm_ret                ,
         o_irq_evt                                    ,
         o_retire_dm                                  ,
         o_dm_req             : dm_req                ,
@@ -1848,6 +1905,9 @@ pub module heliodor_core::<CFG: core_cfg> #(
         o_rd_data      : csr_rd             ,
         o_rmw_data     : csr_rmw            ,
         i_trig_rd      : trig_rd            ,
+        i_obs_addr     : csr_oa             ,
+        o_obs_data     : csr_obs            ,
+        i_trig_obs     : trig_obs           ,
         i_wr_en        : csr_cm.wr_en       ,
         i_wr_addr      : csr_cm.wr_addr     ,
         i_wr_data      : csr_cm.wr_data     ,
@@ -1970,6 +2030,8 @@ pub module heliodor_core::<CFG: core_cfg> #(
         rst                                                     ,
         i_rd_addr  : ep_csr_a[SYS_P]                            ,
         o_rd_data  : trig_rd                                    ,
+        i_obs_addr : csr_oa                                     ,
+        o_obs_data : trig_obs                                   ,
         i_wr_en    : csr_cm.wr_en                               ,
         i_wr_addr  : csr_cm.wr_addr                             ,
         i_wr_data  : csr_cm.wr_data                             ,

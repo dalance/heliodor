@@ -55,7 +55,12 @@
 //   o_rsv_clr            : a trap or interrupt was taken, or an xRET or a
 //                          satp write retired: clears the LR reservation
 //   o_oldest             : from registered state, i_kill and i_dbg_*
-//   o_retire, o_irq_evt  : registered, one cycle after retire
+//   o_retire, o_irq_evt  : registered, one cycle after retire. csr_new is 0:
+//                          the core reads it from the CSR file at
+//                          o_csr_obs_addr in the cycle the record is visible
+//   i_cm_src, i_src_rdata : rob's source registers of each lane and their
+//                          values read from the PRF (3 per lane, rs1..rs3),
+//                          for the retire record only
 //   o_retire_dm          : registered with o_retire: its records retired in
 //                          Debug Mode
 //   o_dm_req, o_step     : dm_req and step_q, for chk_debug
@@ -118,6 +123,9 @@ pub module commit::<CFG: core_cfg> (
     rst                  : input  reset                                                                         ,
     i_reset_pc           : input  logic                        <64>                                             ,
     i_cm                 : input  core_types::<CFG>::RobCm                                       [CFG::COMMIT_W],
+    i_cm_src             : input  core_types::<CFG>::OpSrc                                       [CFG::COMMIT_W],
+    i_src_rdata          : input  logic                        <64>                              [3 * CFG::COMMIT_W],
+    o_csr_obs_addr       : output logic                        <12>                                             ,
     i_exc                : input  core_types::<CFG>::ExcHold                                                    ,
     i_head               : input  core_types::<CFG>::TagTok                                                     ,
     i_lq_win             : input  core_types::<CFG>::LqCmWin                                     [CFG::COMMIT_W],
@@ -740,6 +748,99 @@ pub module commit::<CFG: core_cfg> (
         }
     }
 
+    // Observation-only fields (retire_pkg): held apart from ret_q so that
+    // without HELIODOR_CHK they are constants and leave no state.
+    struct RecObs {
+        intr     : logic    ,
+        rs1_kind : RdKind   ,
+        rs1_addr : logic<5> ,
+        rs1_rdata: logic<64>,
+        rs2_kind : RdKind   ,
+        rs2_addr : logic<5> ,
+        rs2_rdata: logic<64>,
+        rs3_kind : RdKind   ,
+        rs3_addr : logic<5> ,
+        rs3_rdata: logic<64>,
+        csr_read : logic    ,
+        csr_addr : logic<12>,
+        csr_rdata: logic<64>,
+    }
+
+    var rx: RecObs [CW];
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        // intr_q: a trap or interrupt was taken and no record has followed
+        // it outside Debug Mode yet.
+        var rx_q  : RecObs [CW];
+        var intr_q: logic       ;
+        always_ff {
+            if_reset {
+                rx_q   = '{default: 0 as RecObs};
+                intr_q = 1'b0;
+            } else {
+                for l in 0..CW {
+                    let c   : RobCm     = i_cm[l];
+                    let sr  : OpSrc     = i_cm_src[l];
+                    let ins : logic<32> = c.ent.insn;
+                    let zcsr: logic     = c.ent.fu == FuKind::SYS && ins[6:0] == 7'h73 && ins[13:12] != 2'b00;
+                    rx_q[l]      = 0 as RecObs;
+                    rx_q[l].intr = l == 0 && intr_q && !i_dm;
+                    if retire[l] {
+                        rx_q[l].rs1_kind  = sr.rs1.kind;
+                        rx_q[l].rs1_addr  = sr.rs1.arch;
+                        rx_q[l].rs1_rdata = i_src_rdata[3 * l];
+                        rx_q[l].rs2_kind  = sr.rs2.kind;
+                        rx_q[l].rs2_addr  = sr.rs2.arch;
+                        rx_q[l].rs2_rdata = i_src_rdata[3 * l + 1];
+                        rx_q[l].rs3_kind  = sr.rs3.kind;
+                        rx_q[l].rs3_addr  = sr.rs3.arch;
+                        rx_q[l].rs3_rdata = i_src_rdata[3 * l + 2];
+                        // CSRRW and CSRRWI with rd = x0 do not read.
+                        if zcsr && !(ins[13:12] == 2'b01 && ins[11:7] == 5'd0) {
+                            rx_q[l].csr_read  = 1'b1;
+                            rx_q[l].csr_addr  = ins[31:20];
+                            rx_q[l].csr_rdata = c.obs;
+                        }
+                    }
+                }
+                if trap_fire || async_tr {
+                    intr_q = 1'b1;
+                } else if retire[0] && !i_dm {
+                    intr_q = 1'b0;
+                }
+            }
+        }
+        assign rx             = rx_q;
+        assign o_csr_obs_addr = ret_q[0].csr_addr;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    {
+        assign rx             = '{default: 0 as RecObs};
+        assign o_csr_obs_addr = 12'd0;
+    }
+
+    always_comb {
+        for l in 0..CW {
+            o_retire[l]           = ret_q[l];
+            o_retire[l].intr      = rx[l].intr;
+            o_retire[l].rs1_kind  = rx[l].rs1_kind;
+            o_retire[l].rs1_addr  = rx[l].rs1_addr;
+            o_retire[l].rs1_rdata = rx[l].rs1_rdata;
+            o_retire[l].rs2_kind  = rx[l].rs2_kind;
+            o_retire[l].rs2_addr  = rx[l].rs2_addr;
+            o_retire[l].rs2_rdata = rx[l].rs2_rdata;
+            o_retire[l].rs3_kind  = rx[l].rs3_kind;
+            o_retire[l].rs3_addr  = rx[l].rs3_addr;
+            o_retire[l].rs3_rdata = rx[l].rs3_rdata;
+            o_retire[l].csr_read  = rx[l].csr_read;
+            o_retire[l].csr_rdata = rx[l].csr_rdata;
+            if rx[l].csr_read {
+                o_retire[l].csr_addr = rx[l].csr_addr;
+            }
+        }
+    }
+
     always_ff {
         if_reset {
             evt_q = 0;
@@ -751,7 +852,6 @@ pub module commit::<CFG: core_cfg> (
         }
     }
 
-    assign o_retire    = ret_q;
     assign o_retire_dm = ret_dm_q;
     assign o_dm_req    = dm_req;
     assign o_step      = step_q;
