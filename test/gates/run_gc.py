@@ -41,7 +41,7 @@ from run_act import batches  # noqa: E402
 DEFAULT_LISTS = [
     "m1b", "m2_csr", "m2_csr_pf", "m2_directed", "m2_fp", "m2_fp_pf", "m2_io_pf", "m2_lsu", "m2_lsu_pf",
     "m2_mmu_pf", "m2_probe_pf", "m2_scalar", "m3_mem_pf", "m5_h", "m5_hprobe", "m5_vec", "m5_vprobe",
-    "mi_probe",
+    "mi_probe", "mv_probe",
 ]
 
 SPIKE_GAPS = {
