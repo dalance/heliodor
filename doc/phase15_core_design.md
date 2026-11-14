@@ -5145,7 +5145,7 @@ MI の進捗:
   4. V3 乱数命令列 (GR): riscv-dv の Python 版か自作の生成器で、scalar、FP、V、CSR、特権の遷移、ページ表を混ぜた命令列を作り、GC で判定する。固定 seed の集合をマイルストーンの末に回す。
   5. V4 カバレッジ (GCV): RVFI の trace から命令×特権、trap の cause、CSR、vtype の格子などを集計し、GV の構成で Verilator の line/toggle カバレッジを取る。記録のみ。
   6. V5 公式 litmus (GLT): RISC-V の litmus テスト群を bare-metal にし、N=2/N=4 の W2/W4 で回して herd のモデルが許す結果と照合する。
-- 【決定】(2026-11-14、ユーザ) 照合の tb は本体の tb に置き、component の manifest を commit して、spike の無い環境でも `veryl check` と `veryl build` が通るようにする。spike が要るのは照合の tb を走らせるときだけである。veryl に manifest だけで解析を通す道が無ければ、手順 2 の最初に相談し直す。
+- 【決定】(2026-11-14、ユーザ) 照合の tb は本体の tb に置き、component の manifest を commit して、spike の無い環境でも `veryl check` と `veryl build` が通るようにする。spike が要るのは照合の tb を走らせるときだけである。(手順 2 の最初に確認、`eab30a25`) veryl は component の crate に置いた `veryl.manifest.json` を読むので、spike も build 済みの成果物も無い環境で `veryl check` の解析は通り、`veryl test` は照合の tb を除いて通る (component の build の失敗は `[ERROR]` の行を出すだけで、照合の tb は `component type not found` で fail する)。shim の port や parameter を変えたら manifest を作り直して commit する。
 - 【決定】(2026-11-14、ユーザ、同日改訂) spike への入力は、まず公開 API (`mip` の backdoor 書込み、自前の `simif_t` の `mmio_load`、`wfi_as_nop` などの設定) だけで組む。それでも埋まらない穴 (例: trap で retire しない step を minstret で判定する回避) が残ったときに限り、`toolchain/` に置く最小のパッチで足し、`fetch.sh` が pin した commit に当ててから build する。改訂の理由: 試作の後で、外から与える口が公開 API にあると分かった (手順 0 の (b) の訂正)。
 - MS の後: riscv-formal を V1 の RVFI につなぐ (V6)。
 - 出口条件: 上の表の MV の行。
