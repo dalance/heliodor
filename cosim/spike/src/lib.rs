@@ -666,9 +666,13 @@ impl Engine {
             (field!("rs2_kind"), field!("rs2_addr"), field!("rs2_rdata")),
             (field!("rs3_kind"), field!("rs3_addr"), field!("rs3_rdata")),
         ];
+        // amocas.q writes rd+1 in place, so a source that is rd+1 reads the
+        // written value back at retire.
+        let pair_hi = if r.on(field!("rd2_valid")) { Some(r.get(field!("rd_addr")) + 1) } else { None };
         for (i, &(k, a, d)) in srcs.iter().enumerate() {
             let (sk, addr, v) = (r.get(k), r.get(a), r.get(d));
             let want = match sk {
+                1 if pair_hi == Some(addr) => r.get(field!("rd2_wdata")),
                 1 => unsafe { hc_get_xpr(h, t, addr as u32) },
                 2 => unsafe { hc_get_fpr(h, t, addr as u32) },
                 _ => {
