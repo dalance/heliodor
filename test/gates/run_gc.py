@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run gate lists under the N=1 spike cosim (GC): every retire record checked
+"""Run gate lists under the spike cosim (GC): every retire record checked
 against spike.
 
     test/gates/run_gc.py --core w2 [--list L ...] [--suite S,...] [--log-dir DIR]
@@ -7,8 +7,9 @@ against spike.
 
 Needs spike: SPIKE_HOME (or toolchain/spike) for the spike_cosim component in
 cosim/spike. Without --list it runs the arch and directed lists the default
-`veryl test` runs on the core (DEFAULT_LISTS); entries with dmi= or harts > 1
-are skipped (gen_core_tests.cosim_ok). For ACT4 use run_act.py --cosim.
+`veryl test` runs on the core (DEFAULT_LISTS); entries with dmi= are skipped
+(gen_core_tests.cosim_ok). Entries with harts > 1 run under spike_cosim_smp.
+For ACT4 use run_act.py --cosim.
 
 Steps: write tb/test_gc_<core>_<suite>.veryl with gen_core_tests.py --cosim
 (`#[ignore]`), run `veryl test --ignored --test test_gc_<core>_ --format json`

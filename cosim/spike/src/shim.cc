@@ -1,13 +1,15 @@
-// C ABI over one spike hart. The platform (memories, device windows) is the
-// simif_t below; device reads return the values the DUT read, and the hart
-// only takes an interrupt when the caller says the DUT took one. Instances
-// share no state, so separate instances may run on separate threads.
+// C ABI over spike harts sharing one platform. The platform (memories,
+// device windows) is the simif_t below; device reads return the values the
+// DUT read, and a hart only takes an interrupt when the caller says the DUT
+// took one. Instances share no state, so separate instances may run on
+// separate threads.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,6 +39,7 @@ struct hc_cfg_t {
   uint64_t reset_pc;
   uint64_t misa_ro;  // misa is read-only on the DUT
   uint64_t stimecmp_reset;
+  uint64_t harts;
 };
 
 // The DUT's data access of the record being stepped, for device reads.
@@ -100,16 +103,19 @@ class plat_sim_t : public simif_t {
     cfg_.pmpregions = c.pmp_regions;
     cfg_.pmpgranularity = c.pmp_granularity;
     cfg_.trigger_count = c.trigger_count;
-    cfg_.hartids = {0};
+    cfg_.hartids.clear();
+    for (uint64_t i = 0; i < c.harts; i++) cfg_.hartids.push_back(i);
     // The DUT retires a WFI and stalls without records; the interrupt that
     // ends the wait arrives as its own step.
     cfg_.wfi_as_nop = true;
     log_ = fopen("/dev/null", "w");
-    proc_ = new processor_t(cfg_.isa, cfg_.priv, &cfg_, this, 0, false, log_, std::cerr);
-    harts_[0] = proc_;
+    for (uint64_t i = 0; i < c.harts; i++) {
+      procs_.push_back(new processor_t(cfg_.isa, cfg_.priv, &cfg_, this, i, false, log_, std::cerr));
+      harts_[i] = procs_.back();
+    }
   }
   ~plat_sim_t() override {
-    delete proc_;
+    for (auto* p : procs_) delete p;
     if (log_) fclose(log_);
   }
 
@@ -154,7 +160,8 @@ class plat_sim_t : public simif_t {
   const std::map<size_t, processor_t*>& get_harts() const override { return harts_; }
   const char* get_symbol(uint64_t) override { return nullptr; }
 
-  processor_t* proc() { return proc_; }
+  size_t nharts() const { return procs_.size(); }
+  processor_t* proc(unsigned i) { return procs_.at(i); }
   uint8_t* region_mem(size_t i) { return i < regions_.size() ? regions_[i].mem.data() : nullptr; }
 
   // Per-step context for the device callbacks.
@@ -206,7 +213,7 @@ class plat_sim_t : public simif_t {
   std::string isa_, priv_;
   std::vector<region_t> regions_;
   FILE* log_ = nullptr;
-  processor_t* proc_;
+  std::vector<processor_t*> procs_;
   std::map<size_t, processor_t*> harts_;
   hc_dut_mem_t dut_{};
   hc_step_t* out_ = nullptr;
@@ -231,22 +238,25 @@ extern "C" {
 
 void* hc_new(const hc_cfg_t* c, const hc_region_t* r, size_t n) {
   try {
+    if (c->harts == 0) throw std::runtime_error("no harts");
     auto* s = new plat_sim_t(*c, r, n);
-    auto* p = s->proc();
-    p->geilen = unsigned(c->geilen);
-    p->set_max_vaddr_bits(unsigned(c->max_vaddr_bits));
-    p->enable_log_commits();
-    p->reset();
-    auto* st = p->get_state();
-    // Without Smcntrpmf, spike's Smcdeleg setup leaves null entries for
-    // mcyclecfg/minstretcfg in the CSR map, and an access dereferences them;
-    // dropped, the access is the illegal instruction it is on the DUT.
-    for (auto it = st->csrmap.begin(); it != st->csrmap.end();)
-      it = it->second ? std::next(it) : st->csrmap.erase(it);
-    st->mstatus->write((st->mstatus->read() & ~c->mstatus_reset_mask) | c->mstatus_reset_val);
-    if (st->stimecmp) st->stimecmp->write(c->stimecmp_reset);
-    if (st->vstimecmp) st->vstimecmp->write(c->stimecmp_reset);
-    st->pc = c->reset_pc;
+    for (unsigned i = 0; i < s->nharts(); i++) {
+      auto* p = s->proc(i);
+      p->geilen = unsigned(c->geilen);
+      p->set_max_vaddr_bits(unsigned(c->max_vaddr_bits));
+      p->enable_log_commits();
+      p->reset();
+      auto* st = p->get_state();
+      // Without Smcntrpmf, spike's Smcdeleg setup leaves null entries for
+      // mcyclecfg/minstretcfg in the CSR map, and an access dereferences
+      // them; dropped, the access is the illegal instruction it is on the DUT.
+      for (auto it = st->csrmap.begin(); it != st->csrmap.end();)
+        it = it->second ? std::next(it) : st->csrmap.erase(it);
+      st->mstatus->write((st->mstatus->read() & ~c->mstatus_reset_mask) | c->mstatus_reset_val);
+      if (st->stimecmp) st->stimecmp->write(c->stimecmp_reset);
+      if (st->vstimecmp) st->vstimecmp->write(c->stimecmp_reset);
+      st->pc = c->reset_pc;
+    }
     return s;
   } catch (std::exception& e) {
     std::cerr << "hc_new: " << e.what() << "\n";
@@ -258,34 +268,36 @@ void hc_free(void* h) { delete S(h); }
 
 uint8_t* hc_region_mem(void* h, size_t i) { return S(h)->region_mem(i); }
 
-uint64_t hc_get_misa(void* h) { return S(h)->proc()->get_state()->misa->read(); }
+uint64_t hc_get_misa(void* h, unsigned t) { return S(h)->proc(t)->get_state()->misa->read(); }
 
-uint64_t hc_get_xpr(void* h, unsigned i) { return S(h)->proc()->get_state()->XPR[i]; }
+uint64_t hc_get_xpr(void* h, unsigned t, unsigned i) { return S(h)->proc(t)->get_state()->XPR[i]; }
 
-void hc_set_xpr(void* h, unsigned i, uint64_t v) { S(h)->proc()->get_state()->XPR.write(i, v); }
+void hc_set_xpr(void* h, unsigned t, unsigned i, uint64_t v) { S(h)->proc(t)->get_state()->XPR.write(i, v); }
 
-uint64_t hc_get_fpr(void* h, unsigned i) { return S(h)->proc()->get_state()->FPR[i].v[0]; }
+uint64_t hc_get_fpr(void* h, unsigned t, unsigned i) { return S(h)->proc(t)->get_state()->FPR[i].v[0]; }
 
-uint64_t hc_get_csr(void* h, unsigned addr) { return csr_or(S(h)->proc(), addr, 0xdeadbeefdeadbeefULL); }
+uint64_t hc_get_csr(void* h, unsigned t, unsigned addr) {
+  return csr_or(S(h)->proc(t), addr, 0xdeadbeefdeadbeefULL);
+}
 
-void hc_set_csr(void* h, unsigned addr, uint64_t v) {
+void hc_set_csr(void* h, unsigned t, unsigned addr, uint64_t v) {
   try {
-    S(h)->proc()->put_csr(addr, v);
+    S(h)->proc(t)->put_csr(addr, v);
   } catch (...) {
   }
 }
 
 // VLEN/8 bytes of v[i], or null without V.
-const uint8_t* hc_get_vreg(void* h, unsigned i) {
-  auto& vu = S(h)->proc()->VU;
+const uint8_t* hc_get_vreg(void* h, unsigned t, unsigned i) {
+  auto& vu = S(h)->proc(t)->VU;
   if (!vu.reg_file || vu.VLEN == 0) return nullptr;
   return static_cast<const uint8_t*>(vu.reg_file) + i * (vu.VLEN / 8);
 }
 
-uint64_t hc_vlenb(void* h) { return S(h)->proc()->VU.VLEN / 8; }
+uint64_t hc_vlenb(void* h) { return S(h)->proc(0)->VU.VLEN / 8; }
 
-uint64_t hc_get_vcsr(void* h, unsigned which) {
-  auto& vu = S(h)->proc()->VU;
+uint64_t hc_get_vcsr(void* h, unsigned t, unsigned which) {
+  auto& vu = S(h)->proc(t)->VU;
   if (!vu.vl) return 0;
   switch (which) {
     case 0: return vu.vtype->read();
@@ -294,14 +306,14 @@ uint64_t hc_get_vcsr(void* h, unsigned which) {
   }
 }
 
-// Steps one record. irq >= 0: the DUT took interrupt `irq` here; the step
-// takes it and executes nothing. irq < 0: the step executes one instruction
-// and takes no interrupt, whatever spike would pend.
+// Steps one record of hart t. irq >= 0: the DUT took interrupt `irq` here;
+// the step takes it and executes nothing. irq < 0: the step executes one
+// instruction and takes no interrupt, whatever spike would pend.
 // flags bit 0: drop spike's reservation first (the DUT's SC failed).
 // flags bit 1: misaligned accesses fault in this step (a vector access).
-void hc_step(void* h, int irq, const hc_dut_mem_t* dut, hc_step_t* out, uint64_t flags) {
+void hc_step(void* h, unsigned t, int irq, const hc_dut_mem_t* dut, hc_step_t* out, uint64_t flags) {
   auto* s = S(h);
-  auto* p = s->proc();
+  auto* p = s->proc(t);
   auto* st = p->get_state();
   memset(out, 0, sizeof(*out));
   out->pc = st->pc;

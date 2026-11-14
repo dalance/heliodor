@@ -1,6 +1,13 @@
 //! Online spike co-simulation of heliodor's retire records: each
 //! `retire_pkg::RetireRec` steps one spike instruction and each IrqEvent
 //! makes spike take that interrupt, and the two are compared field by field.
+//!
+//! With several harts, each has its own spike hart on one shared memory,
+//! stepped in retire order (by cycle, then hart, then record order). That
+//! order is not the DUT's coherence order, so a read that may observe another
+//! hart (load, LR, AMO) gets the bytes the DUT read written into spike's
+//! memory for its step; spike then executes it as usual, and the bytes the
+//! step did not store are put back afterwards.
 
 use std::ffi::{CString, c_char, c_void};
 use std::io::Read;
@@ -31,6 +38,7 @@ struct HcCfg {
     reset_pc: u64,
     misa_ro: u64,
     stimecmp_reset: u64,
+    harts: u64,
 }
 
 #[repr(C)]
@@ -73,16 +81,16 @@ unsafe extern "C" {
     fn hc_new(cfg: *const HcCfg, regions: *const HcRegion, n: usize) -> *mut c_void;
     fn hc_free(h: *mut c_void);
     fn hc_region_mem(h: *mut c_void, i: usize) -> *mut u8;
-    fn hc_get_misa(h: *mut c_void) -> u64;
-    fn hc_get_xpr(h: *mut c_void, i: u32) -> u64;
-    fn hc_set_xpr(h: *mut c_void, i: u32, v: u64);
-    fn hc_get_fpr(h: *mut c_void, i: u32) -> u64;
-    fn hc_get_csr(h: *mut c_void, addr: u32) -> u64;
-    fn hc_set_csr(h: *mut c_void, addr: u32, v: u64);
-    fn hc_get_vreg(h: *mut c_void, i: u32) -> *const u8;
+    fn hc_get_misa(h: *mut c_void, t: u32) -> u64;
+    fn hc_get_xpr(h: *mut c_void, t: u32, i: u32) -> u64;
+    fn hc_set_xpr(h: *mut c_void, t: u32, i: u32, v: u64);
+    fn hc_get_fpr(h: *mut c_void, t: u32, i: u32) -> u64;
+    fn hc_get_csr(h: *mut c_void, t: u32, addr: u32) -> u64;
+    fn hc_set_csr(h: *mut c_void, t: u32, addr: u32, v: u64);
+    fn hc_get_vreg(h: *mut c_void, t: u32, i: u32) -> *const u8;
     fn hc_vlenb(h: *mut c_void) -> u64;
-    fn hc_get_vcsr(h: *mut c_void, which: u32) -> u64;
-    fn hc_step(h: *mut c_void, irq: i32, dut: *const HcDutMem, out: *mut HcStep, flags: u64);
+    fn hc_get_vcsr(h: *mut c_void, t: u32, which: u32) -> u64;
+    fn hc_step(h: *mut c_void, t: u32, irq: i32, dut: *const HcDutMem, out: *mut HcStep, flags: u64);
 }
 
 /// Owns one spike instance. The host serializes calls into an instance, and
@@ -293,37 +301,67 @@ fn is_csr_op(insn: u64) -> bool {
 const STEP_SC_FAIL: u64 = 1;
 const STEP_NO_MISALIGNED: u64 = 2;
 
-/// Checks every retire record of a single-hart heliodor against spike.
-#[derive(Component)]
-#[component(kind = clocked, requires(file))]
-struct SpikeCosim {
-    clk: ClockPort,
-    rec0: InputPort,
-    rec1: InputPort,
-    rec2: InputPort,
-    rec3: InputPort,
-    /// retire_pkg::IrqEvent.
-    irq: InputPort,
-    /// `$readmemh` image (32-bit words) loaded at PA 0x8000_0000.
-    #[param(name = "HEX_FILE")]
+/// Width of retire_pkg::IrqEvent {valid, cause<6>, epc<64>, order<64>},
+/// valid on top.
+const IRQ_W: u32 = 135;
+
+#[derive(Default)]
+struct HartState {
+    /// The next record is the first of a trap handler.
+    intr_next: bool,
+    /// An interrupt the DUT took, checked with the handler's first record.
+    irq_pending: Option<(u64, u64, u64)>,
+}
+
+/// An AMO with rd = x0 whose old value its store does not determine (and,
+/// or, min, max): the DUT's store is accepted if some old value yields it.
+#[derive(Clone, Copy)]
+struct AmoFree {
+    funct5: u64,
+    bytes: u64,
+    rs2: u64,
+}
+
+impl AmoFree {
+    fn reachable(&self, w: u64) -> bool {
+        let sh = 64 - 8 * self.bytes as u32;
+        let (w, r) = ((w << sh) >> sh, (self.rs2 << sh) >> sh);
+        let sx = |v: u64| ((v << sh) as i64) >> sh;
+        match self.funct5 {
+            0x08 => w & r == r,
+            0x0c => w & !r == 0,
+            0x10 => w == r || sx(w) < sx(r),
+            0x14 => w == r || sx(w) > sx(r),
+            0x18 => w <= r,
+            0x1c => w >= r,
+            _ => false,
+        }
+    }
+}
+
+/// A DRAM byte holding the DUT's read for one step: its offset, the value it
+/// replaced, and its index relative to mem_paddr.
+struct Patched {
+    off: usize,
+    saved: u8,
+    rel: u64,
+}
+
+/// The `#[param]`s both component types take.
+struct Params {
     hex_file: Option<String>,
-    /// Firmware ROM image at PA 0 (MAP = "boot").
-    #[param(name = "ROM_HEX")]
     rom_hex: Option<String>,
-    /// Harness memory map: "arch" (default) or "boot".
-    #[param(name = "MAP")]
     map: Option<String>,
-    /// UDB architecture configuration spike is built from.
-    #[param(name = "CONFIG")]
     config: Option<String>,
-    /// Trigger count when the core differs from the configuration's (W4).
-    #[param(name = "TRIGGERS")]
     triggers: Option<u64>,
-    /// PA of tohost: the comparison ends after the first store to it.
-    #[param(name = "TOHOST_PA")]
     tohost_pa: Option<u64>,
-    #[state]
+}
+
+/// Spike, the per-hart comparison state and the counters.
+#[derive(Default)]
+struct Engine {
     spike: Spike,
+    harts: Vec<HartState>,
     compared: u64,
     irqs: u64,
     /// Source and CSR values compared.
@@ -331,12 +369,13 @@ struct SpikeCosim {
     csr_checked: u64,
     vec_checked: u64,
     dev_checked: u64,
-    /// The next record is the first of a trap handler.
-    intr_next: bool,
-    /// An interrupt the DUT took, checked with the handler's first record.
-    irq_pending: Option<(u64, u64, u64)>,
+    /// Reads whose DUT bytes differed from spike's memory, and AMO stores
+    /// taken from the DUT (several harts only).
+    reads_forced: u64,
+    amo_forced: u64,
     at_tohost: bool,
     done: bool,
+    tohost_pa: u64,
     medeleg_skip: u64,
     mideleg_skip: u64,
     /// xstateen0.C and CONTEXT, writable on spike, which always has
@@ -350,11 +389,11 @@ struct SpikeCosim {
     vec_misaligned: bool,
     vec_wholereg_misaligned: bool,
     dram_size: u64,
+    /// Field LSBs within one record.
     offs: Vec<u32>,
-    buf: Vec<u64>,
 }
 
-impl SpikeCosim {
+impl Engine {
     fn load_hex(&mut self, ctx: &mut SimCtx, path: &str, region: usize, size: u64) -> Result<()> {
         let mut text = String::new();
         ctx.open(path)?.read_to_string(&mut text)?;
@@ -376,12 +415,114 @@ impl SpikeCosim {
         Ok(())
     }
 
-    fn decode(&self) -> Rec {
+    fn init(&mut self, ctx: &mut SimCtx, p: &Params, harts: usize) -> Result<()> {
+        let cfg_path = p.config.clone().unwrap_or("test/act/config/heliodor/heliodor.yaml".into());
+        let mut text = String::new();
+        ctx.open(&cfg_path)?.read_to_string(&mut text)?;
+        let a = ArchCfg::parse(&text)?;
+        if a.bool("MISALIGNED_LDST")? != a.has("Zicclsm") {
+            bail!("{cfg_path}: MISALIGNED_LDST disagrees with Zicclsm");
+        }
+        let map = p.map.clone().unwrap_or("arch".into());
+        let (regions, reset_pc) = platform::memory_map(&map)?;
+        self.dram_size = regions[0].size;
+        let hr: Vec<HcRegion> = regions
+            .iter()
+            .map(|g| HcRegion { base: g.base, size: g.size, kind: g.device as u64 })
+            .collect();
+        let isa = CString::new(a.spike_isa())?;
+        let priv_ = CString::new(a.spike_priv())?;
+        let hc = HcCfg {
+            isa: isa.as_ptr(),
+            priv_: priv_.as_ptr(),
+            pmp_regions: a.u64("NUM_PMP_ENTRIES")?,
+            pmp_granularity: 1 << a.u64("PMP_GRANULARITY")?,
+            trigger_count: p.triggers.unwrap_or(a.u64("SDTRIG_NUM_TRIGGERS")?),
+            max_vaddr_bits: a.max_vaddr_bits(),
+            geilen: a.u64("NUM_EXTERNAL_GUEST_INTERRUPTS")?,
+            mstatus_reset_mask: platform::MSTATUS_RESET_MASK,
+            mstatus_reset_val: platform::MSTATUS_RESET_VAL,
+            reset_pc,
+            misa_ro: !a.any_mutable_misa() as u64,
+            stimecmp_reset: platform::STIMECMP_RESET,
+            harts: harts as u64,
+        };
+        let h = unsafe { hc_new(&hc, hr.as_ptr(), hr.len()) };
+        if h.is_null() {
+            bail!("spike construction failed (isa {})", a.spike_isa());
+        }
+        self.spike = Spike(h);
+        self.harts = (0..harts).map(|_| HartState::default()).collect();
+        let misa = unsafe { hc_get_misa(h, 0) };
+        if misa != a.misa() {
+            bail!("spike misa {misa:#x} != configured {:#x}", a.misa());
+        }
+        let vlenb = unsafe { hc_vlenb(h) };
+        if a.has("V") && vlenb * 8 != a.u64("VLEN")? {
+            bail!("spike VLEN {} != configured {}", vlenb * 8, a.u64("VLEN")?);
+        }
+        // Delegation bits the configuration and spike disagree on, found by
+        // probing spike's reset and writable masks.
+        let geilen = a.u64("NUM_EXTERNAL_GUEST_INTERRUPTS")?;
+        self.medeleg_skip = a.mask("MEDELEG_DELEGATABLE")? ^ probe_writable(h, 0x302);
+        let ro1 = unsafe { hc_get_csr(h, 0, 0x303) };
+        let want_ro1 = if a.has("H") { (1 << 2) | (1 << 6) | (1 << 10) | if geilen > 0 { 1 << 12 } else { 0 } } else { 0 };
+        self.mideleg_skip = ro1 ^ want_ro1;
+        self.marchid = 0;
+        self.mimpid = 0;
+        if a.bool("MARCHID_IMPLEMENTED")? || a.bool("MIMPID_IMPLEMENTED")? {
+            bail!("{cfg_path}: marchid/mimpid values are not modelled");
+        }
+        self.mvendorid = a.u64("VENDOR_ID_BANK")? << 7 | a.u64("VENDOR_ID_OFFSET")?;
+        self.vec_misaligned = a.bool("VECTOR_LS_MISALIGNED_LEGAL")?;
+        if a.str("MSTATEEN_CONTEXT_TYPE")? == "read-only-0" {
+            self.stateen_skip |= 1 << 57;
+        }
+        if !a.bool("NON_STANDARD_EXTENSION_IMPLEMENTED")? {
+            self.stateen_skip |= 1;
+        }
+        self.inhibit_skip = a.mask("COUNTINHIBIT_EN")? ^ probe_writable(h, 0x320);
+        self.vsatp_ignore = a.bool("IGNORE_INVALID_VSATP_MODE_WRITES_WHEN_V_EQ_ZERO")?;
+        self.vec_wholereg_misaligned = a.bool("VECTOR_LS_WHOLEREG_MISALIGNED_LEGAL")?;
+        self.tohost_pa = p.tohost_pa.unwrap_or(0);
+        let Some(path) = p.hex_file.clone() else {
+            bail!("HEX_FILE is required");
+        };
+        self.load_hex(ctx, &path, 0, regions[0].size)?;
+        if let Some(rom) = p.rom_hex.clone() {
+            if map != "boot" {
+                bail!("ROM_HEX needs MAP = \"boot\"");
+            }
+            self.load_hex(ctx, &rom, 1, regions[1].size)?;
+        }
+        let mut top = rec_width();
+        self.offs = FIELDS
+            .iter()
+            .map(|&(_, fw)| {
+                top -= fw;
+                top
+            })
+            .collect();
+        ctx.log(&format!(
+            "spike cosim: {harts} hart(s), isa {} priv {} medeleg skip {:#x} mideleg skip {:#x}",
+            a.spike_isa(),
+            a.spike_priv(),
+            self.medeleg_skip,
+            self.mideleg_skip
+        ));
+        Ok(())
+    }
+
+    /// The record whose LSB is bit `base` of `buf`, if valid.
+    fn decode(&self, buf: &[u64], base: u32) -> Option<Rec> {
+        if bits(buf, base + self.offs[0], 1) == 0 {
+            return None;
+        }
         let mut r = Rec { f: [0; FIELDS.len()] };
         for (i, &(_, w)) in FIELDS.iter().enumerate() {
-            r.f[i] = bits(&self.buf, self.offs[i], w);
+            r.f[i] = bits(buf, base + self.offs[i], w);
         }
-        r
+        Some(r)
     }
 
     fn csr_kind(&self, csr: u64) -> CsrKind {
@@ -410,14 +551,14 @@ impl SpikeCosim {
 
     /// `vs`: the handler runs with V = 1, so the interrupt went to VS. A VS
     /// interrupt arrives as its VS cause (1, 5, 9), one below its mip bit.
-    fn check_irq(&mut self, cause: u64, epc: u64, vs: bool) -> std::result::Result<(), String> {
+    fn check_irq(&mut self, t: u32, cause: u64, epc: u64, vs: bool) -> std::result::Result<(), String> {
         let h = self.spike.0;
         let bit = if vs { cause + 1 } else { cause };
         let mut s = HcStep::default();
-        unsafe { hc_step(h, bit as i32, &HcDutMem::default(), &mut s, 0) };
+        unsafe { hc_step(h, t, bit as i32, &HcDutMem::default(), &mut s, 0) };
         if s.trap == 0 || s.cause >> 63 == 0 || s.cause & 0x3f != cause || s.pc != epc || vs != (s.trap == 3) {
             return Err(format!(
-                "spike mismatch at interrupt: dut cause={cause} epc={epc:#x} vs={vs}, \
+                "spike mismatch at interrupt: hart {t} dut cause={cause} epc={epc:#x} vs={vs}, \
                  ref level={} cause={:#x} pc={:#x}",
                 s.trap, s.cause, s.pc
             ));
@@ -447,7 +588,68 @@ impl SpikeCosim {
         f
     }
 
-    fn check(&mut self, r: &Rec) -> std::result::Result<(), String> {
+    fn dram<'a>(&self) -> &'a mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(hc_region_mem(self.spike.0, 0), self.dram_size as usize) }
+    }
+
+    /// The bytes the DUT read in a scalar access that another hart may have
+    /// raced, relative to mem_paddr: a load or LR (its read data), an AMO
+    /// (the old value in rd, or recovered from the store for add and xor).
+    fn dut_read(&self, r: &Rec) -> (Vec<(u64, u8)>, Option<AmoFree>) {
+        let mut v = Vec::new();
+        if r.on(field!("mem_io")) {
+            return (v, None);
+        }
+        let rd_kind = r.get(field!("rd_kind"));
+        let rd = r.get(field!("rd_addr"));
+        let rd_known = rd_kind == 2 || (rd_kind == 1 && rd != 0);
+        let rmask = r.get(field!("mem_rmask"));
+        if rmask != 0 {
+            // A load to x0 reports no read data.
+            if rd_known {
+                for i in 0..16u64 {
+                    if rmask >> i & 1 != 0 {
+                        let w = if i < 8 { r.get(field!("mem_rdata")) } else { r.get(field!("mem_rdata_hi")) };
+                        v.push((i, (w >> (8 * (i & 7))) as u8));
+                    }
+                }
+            }
+            return (v, None);
+        }
+        let insn = r.get(field!("insn"));
+        let funct5 = insn >> 27;
+        if r.on(field!("is_rvc")) || insn & 0x7f != 0x2f || funct5 == 2 || funct5 == 3 {
+            return (v, None);
+        }
+        let bytes = match (insn >> 12) & 7 {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            4 => 16,
+            _ => return (v, None),
+        };
+        let (lo, hi) = if rd_known {
+            (r.get(field!("rd_wdata")), r.get(field!("rd2_wdata")))
+        } else {
+            let (w, rs2) = (r.get(field!("mem_wdata")), r.get(field!("rs2_rdata")));
+            match funct5 {
+                0x00 => (w.wrapping_sub(rs2), 0),
+                0x04 => (w ^ rs2, 0),
+                0x08 | 0x0c | 0x10 | 0x14 | 0x18 | 0x1c => {
+                    return (v, Some(AmoFree { funct5, bytes, rs2 }));
+                }
+                _ => return (v, None),
+            }
+        };
+        for i in 0..bytes {
+            let w = if i < 8 { lo } else { hi };
+            v.push((i, (w >> (8 * (i & 7))) as u8));
+        }
+        (v, None)
+    }
+
+    fn check(&mut self, t: u32, r: &Rec) -> std::result::Result<(), String> {
         let h = self.spike.0;
         let mut errs = Vec::new();
         let pc = r.get(field!("pc"));
@@ -467,8 +669,8 @@ impl SpikeCosim {
         for (i, &(k, a, d)) in srcs.iter().enumerate() {
             let (sk, addr, v) = (r.get(k), r.get(a), r.get(d));
             let want = match sk {
-                1 => unsafe { hc_get_xpr(h, addr as u32) },
-                2 => unsafe { hc_get_fpr(h, addr as u32) },
+                1 => unsafe { hc_get_xpr(h, t, addr as u32) },
+                2 => unsafe { hc_get_fpr(h, t, addr as u32) },
                 _ => {
                     if addr != 0 || v != 0 {
                         errs.push(format!("rs{} unused but addr={addr} value={v:#x}", i + 1));
@@ -484,21 +686,21 @@ impl SpikeCosim {
         }
         if r.on(field!("csr_read")) {
             let got = r.get(field!("csr_rdata"));
-            let want = unsafe { hc_get_csr(h, csr_addr as u32) };
+            let want = unsafe { hc_get_csr(h, t, csr_addr as u32) };
             let bad = match self.csr_kind(csr_addr) {
                 CsrKind::DutValued => false,
                 CsrKind::Configured(v) => got != v,
                 CsrKind::Masked(m) => (got ^ want) & m != 0,
                 CsrKind::Unspecified(m) => {
                     if (got ^ want) & m != 0 {
-                        unsafe { hc_set_csr(h, csr_addr as u32, (want & !m) | (got & m)) };
+                        unsafe { hc_set_csr(h, t, csr_addr as u32, (want & !m) | (got & m)) };
                     }
                     (got ^ want) & !m != 0
                 }
                 CsrKind::Status => {
                     let ok = dirty_only(got, want);
                     if ok && got != want {
-                        unsafe { hc_set_csr(h, csr_addr as u32, (want & !STATUS_DIRTY) | (got & STATUS_DIRTY)) };
+                        unsafe { hc_set_csr(h, t, csr_addr as u32, (want & !STATUS_DIRTY) | (got & STATUS_DIRTY)) };
                     }
                     !ok
                 }
@@ -509,20 +711,43 @@ impl SpikeCosim {
             }
             self.csr_checked += 1;
         }
+        let hs = &mut self.harts[t as usize];
         let intr = r.on(field!("intr"));
-        if intr != self.intr_next {
-            errs.push(format!("intr dut={intr} expected={}", self.intr_next));
+        if intr != hs.intr_next {
+            errs.push(format!("intr dut={intr} expected={}", hs.intr_next));
         }
-        self.intr_next = dtrap;
+        hs.intr_next = dtrap;
+
+        let paddr = r.get(field!("mem_paddr"));
+        let mut patched = Vec::new();
+        let mut amo_free = None;
+        if self.harts.len() > 1 && !dtrap && !r.on(field!("vec_v")) {
+            let (bytes, free) = self.dut_read(r);
+            amo_free = free;
+            let base = platform::DRAM_BASE;
+            let mem = self.dram();
+            let mut differs = false;
+            for (rel, b) in bytes {
+                let a = paddr + rel;
+                if (a ^ paddr) >> 12 != 0 || a < base || a - base >= self.dram_size {
+                    continue;
+                }
+                let off = (a - base) as usize;
+                differs |= mem[off] != b;
+                patched.push(Patched { off, saved: mem[off], rel });
+                mem[off] = b;
+            }
+            self.reads_forced += differs as u64;
+        }
 
         let dm = HcDutMem {
-            paddr: r.get(field!("mem_paddr")),
+            paddr,
             rmask: r.get(field!("mem_rmask")),
             rdata: r.get(field!("mem_rdata")),
             rdata_hi: r.get(field!("mem_rdata_hi")),
         };
         let mut s = HcStep::default();
-        unsafe { hc_step(h, -1, &dm, &mut s, self.step_flags(r)) };
+        unsafe { hc_step(h, t, -1, &dm, &mut s, self.step_flags(r)) };
         if s.suppress_fail != 0 {
             errs.push("a pending interrupt could not be held off for this step".into());
         }
@@ -580,7 +805,7 @@ impl SpikeCosim {
         // The odd register of an amocas.q pair.
         if r.on(field!("rd2_valid")) && want_x != 0 && rd < 31 {
             want_x |= 1u64 << (rd + 1);
-            let v = unsafe { hc_get_xpr(h, rd + 1) };
+            let v = unsafe { hc_get_xpr(h, t, rd + 1) };
             let d = r.get(field!("rd2_wdata"));
             if v != d {
                 errs.push(format!("x{} dut={d:#x} ref={v:#x}", rd + 1));
@@ -590,7 +815,7 @@ impl SpikeCosim {
             errs.push(format!("ref wrote x regs {:#x}, dut rd_kind={rd_kind} rd={rd}", s.xpr_written));
         }
         if want_x != 0 {
-            let v = unsafe { hc_get_xpr(h, rd) };
+            let v = unsafe { hc_get_xpr(h, t, rd) };
             let m = match kind {
                 CsrKind::DutValued => 0,
                 CsrKind::Configured(c) => {
@@ -606,14 +831,14 @@ impl SpikeCosim {
                 errs.push(format!("x{rd} dut={rd_wdata:#x} ref={v:#x} (ref wrote {:#x})", s.xpr_written));
             }
             if m != !0 {
-                unsafe { hc_set_xpr(h, rd, rd_wdata) };
+                unsafe { hc_set_xpr(h, t, rd, rd_wdata) };
             }
         }
         if s.fpr_written & !want_f != 0 {
             errs.push(format!("ref wrote f regs {:#x}, dut rd_kind={rd_kind} rd={rd}", s.fpr_written));
         }
         if want_f != 0 {
-            let v = unsafe { hc_get_fpr(h, rd) };
+            let v = unsafe { hc_get_fpr(h, t, rd) };
             if v != rd_wdata {
                 errs.push(format!("f{rd} dut={rd_wdata:#x} ref={v:#x}"));
             }
@@ -627,7 +852,7 @@ impl SpikeCosim {
         }
         if r.on(field!("csr_valid")) && !dtrap {
             let got = r.get(field!("csr_new"));
-            let want = unsafe { hc_get_csr(h, csr_addr as u32) };
+            let want = unsafe { hc_get_csr(h, t, csr_addr as u32) };
             // A reserved xtvec MODE: the legalization of stvec's and vstvec's
             // is left to the implementation, and spike cannot be set to the
             // configured one for mtvec (retain).
@@ -640,13 +865,13 @@ impl SpikeCosim {
             let bad = match kind {
                 CsrKind::DutValued | CsrKind::Configured(_) => false,
                 CsrKind::DutLegal => {
-                    unsafe { hc_set_csr(h, csr_addr as u32, got) };
+                    unsafe { hc_set_csr(h, t, csr_addr as u32, got) };
                     false
                 }
                 CsrKind::Masked(m) => (got ^ want) & m != 0,
                 CsrKind::Unspecified(m) => {
                     if (got ^ want) & m != 0 {
-                        unsafe { hc_set_csr(h, csr_addr as u32, (want & !m) | (got & m)) };
+                        unsafe { hc_set_csr(h, t, csr_addr as u32, (want & !m) | (got & m)) };
                     }
                     (got ^ want) & !m != 0
                 }
@@ -658,13 +883,23 @@ impl SpikeCosim {
             }
             self.csr_checked += 1;
         }
-        self.check_vec(r, &s, &mut errs);
-        self.check_mem(r, &s, &mut errs);
+        self.check_vec(t, r, &s, &mut errs);
+        self.check_mem(r, &s, amo_free, &mut errs);
+        // Bytes the step did not store go back to the latest store in retire
+        // order.
+        let wmask = r.get(field!("mem_wmask"));
+        let mem = self.dram();
+        for p in &patched {
+            if wmask >> p.rel & 1 == 0 {
+                mem[p.off] = p.saved;
+            }
+        }
         if errs.is_empty() {
             Ok(())
         } else {
+            let who = if self.harts.len() > 1 { format!("hart {t} ") } else { String::new() };
             Err(format!(
-                "spike mismatch at order {} pc={pc:#x} insn={insn:#010x}: {}",
+                "spike mismatch at {who}order {} pc={pc:#x} insn={insn:#010x}: {}",
                 r.get(field!("order")),
                 errs.join("; ")
             ))
@@ -673,7 +908,7 @@ impl SpikeCosim {
 
     /// The registers the DUT's VRF writes reached, against the ones spike
     /// changed, and their final values through the write-order-free fold.
-    fn check_vec(&mut self, r: &Rec, s: &HcStep, errs: &mut Vec<String>) {
+    fn check_vec(&mut self, t: u32, r: &Rec, s: &HcStep, errs: &mut Vec<String>) {
         let h = self.spike.0;
         if !r.on(field!("vec_v")) {
             if s.vr_written != 0 && s.trap == 0 {
@@ -689,7 +924,7 @@ impl SpikeCosim {
         let mut x = 0u64;
         for v in 0..32u32 {
             if (wmask >> v) & 1 != 0 {
-                let data = unsafe { std::slice::from_raw_parts(hc_get_vreg(h, v), vlenb) };
+                let data = unsafe { std::slice::from_raw_parts(hc_get_vreg(h, t, v), vlenb) };
                 x ^= vrf_hash_step(0, v as u64, data);
             }
         }
@@ -704,7 +939,7 @@ impl SpikeCosim {
         let idx = [field!("vtype"), field!("vl"), field!("vstart")];
         for i in 0..3 {
             let got = r.get(idx[i]);
-            let want = unsafe { hc_get_vcsr(h, i as u32) };
+            let want = unsafe { hc_get_vcsr(h, t, i as u32) };
             if got != want {
                 errs.push(format!("{} dut={got:#x} ref={want:#x}", names[i]));
             }
@@ -712,8 +947,7 @@ impl SpikeCosim {
         self.vec_checked += 1;
     }
 
-    fn check_mem(&mut self, r: &Rec, s: &HcStep, errs: &mut Vec<String>) {
-        let h = self.spike.0;
+    fn check_mem(&mut self, r: &Rec, s: &HcStep, amo_free: Option<AmoFree>, errs: &mut Vec<String>) {
         if s.dev_read_miss != 0 {
             errs.push(format!("ref read device {:#x} that the dut did not read", s.dev_read_addr));
         }
@@ -750,13 +984,29 @@ impl SpikeCosim {
         if wmask == 0 {
             return;
         }
+        let mem = self.dram();
+        // An AMO to x0 whose old value is unknown: spike's store used the old
+        // value of its own memory order; the DUT's must be one the operation
+        // can produce, and then replaces it.
+        if let Some(a) = amo_free.filter(|a| a.bytes <= 8 && in_dram(paddr) && paddr & (a.bytes - 1) == 0) {
+            let off = (paddr - base) as usize;
+            let w = r.get(field!("mem_wdata"));
+            let got = (0..a.bytes as usize).fold(0u64, |v, i| v | (mem[off + i] as u64) << (8 * i));
+            let sh = 64 - 8 * a.bytes as u32;
+            if (got ^ w) << sh != 0 && a.reachable(w) {
+                for i in 0..a.bytes as usize {
+                    mem[off + i] = (w >> (8 * i)) as u8;
+                }
+                self.amo_forced += 1;
+            }
+        }
         // Bytes past a page boundary sit at another PA.
         for i in 0..16u64 {
             let a = paddr + i;
             if wmask >> i & 1 == 0 || (a ^ paddr) >> 12 != 0 || !in_dram(a) {
                 continue;
             }
-            let got = unsafe { *hc_region_mem(h, 0).add((a - base) as usize) };
+            let got = mem[(a - base) as usize];
             let w = if i < 8 { r.get(field!("mem_wdata")) } else { r.get(field!("mem_wdata_hi")) };
             let want = (w >> (8 * (i & 7))) as u8;
             if got != want {
@@ -764,161 +1014,248 @@ impl SpikeCosim {
                 break;
             }
         }
-        let tohost = self.tohost_pa.unwrap_or(0);
+        let tohost = self.tohost_pa;
         if tohost != 0 && paddr <= tohost && tohost < paddr + 16 && wmask >> (tohost - paddr) & 0xff != 0 {
             self.at_tohost = true;
         }
     }
+
+    /// One cycle of hart `t`: the interrupt it took, then its records in
+    /// order. False once the comparison has ended.
+    fn hart_cycle(&mut self, ctx: &mut SimCtx, t: u32, irq: Option<(u64, u64, u64)>, recs: &[Rec]) -> bool {
+        let ti = t as usize;
+        if let Some(ev) = irq {
+            // A second interrupt before the first handler retired anything
+            // preempted it from a higher level, so the first went to M or HS.
+            if let Some((cause, epc, order)) = self.harts[ti].irq_pending.take() {
+                if let Err(msg) = self.check_irq(t, cause, epc, false) {
+                    ctx.fail(format!("{msg} (before order {order})"));
+                    self.done = true;
+                    return false;
+                }
+            }
+            self.harts[ti].irq_pending = Some(ev);
+            self.irqs += 1;
+            self.harts[ti].intr_next = true;
+        }
+        for r in recs {
+            if let Some((cause, epc, order)) = self.harts[ti].irq_pending.take() {
+                if let Err(msg) = self.check_irq(t, cause, epc, r.on(field!("virt"))) {
+                    ctx.fail(format!("{msg} (before order {order})"));
+                    self.done = true;
+                    return false;
+                }
+            }
+            if let Err(msg) = self.check(t, r) {
+                ctx.fail(msg);
+                self.done = true;
+                return false;
+            }
+            self.compared += 1;
+            if self.at_tohost {
+                self.done = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish(&mut self, ctx: &mut SimCtx) {
+        let smp = if self.harts.len() > 1 {
+            format!(
+                "; {} reads and {} AMO stores taken from the DUT",
+                self.reads_forced, self.amo_forced
+            )
+        } else {
+            String::new()
+        };
+        ctx.log(&format!(
+            "spike cosim: {} records and {} interrupts compared ({} source, {} CSR, {} vector, {} device values){}{}",
+            self.compared,
+            self.irqs,
+            self.src_checked,
+            self.csr_checked,
+            self.vec_checked,
+            self.dev_checked,
+            smp,
+            if self.at_tohost { ", stopped at the tohost store" } else { "" }
+        ));
+        if self.compared == 0 {
+            ctx.fail("spike cosim: no records compared");
+        }
+    }
+}
+
+/// IrqEvent at bit `base` of `w`, if valid: (cause, epc, order).
+fn irq_event(w: &[u64], base: u32) -> Option<(u64, u64, u64)> {
+    if bits(w, base + IRQ_W - 1, 1) == 0 {
+        return None;
+    }
+    Some((bits(w, base + 128, 6), bits(w, base + 64, 64), bits(w, base, 64)))
+}
+
+/// Checks every retire record of a single-hart heliodor against spike.
+#[derive(Component)]
+#[component(kind = clocked, requires(file))]
+struct SpikeCosim {
+    clk: ClockPort,
+    rec0: InputPort,
+    rec1: InputPort,
+    rec2: InputPort,
+    rec3: InputPort,
+    /// retire_pkg::IrqEvent.
+    irq: InputPort,
+    /// `$readmemh` image (32-bit words) loaded at PA 0x8000_0000.
+    #[param(name = "HEX_FILE")]
+    hex_file: Option<String>,
+    /// Firmware ROM image at PA 0 (MAP = "boot").
+    #[param(name = "ROM_HEX")]
+    rom_hex: Option<String>,
+    /// Harness memory map: "arch" (default) or "boot".
+    #[param(name = "MAP")]
+    map: Option<String>,
+    /// UDB architecture configuration spike is built from.
+    #[param(name = "CONFIG")]
+    config: Option<String>,
+    /// Trigger count when the core differs from the configuration's (W4).
+    #[param(name = "TRIGGERS")]
+    triggers: Option<u64>,
+    /// PA of tohost: the comparison ends after the first store to it.
+    #[param(name = "TOHOST_PA")]
+    tohost_pa: Option<u64>,
+    #[state]
+    eng: Engine,
+    buf: Vec<u64>,
 }
 
 #[component_impl]
 impl SpikeCosim {
     fn on_init(&mut self, ctx: &mut SimCtx) -> Result<()> {
-        let cfg_path = self.config.clone().unwrap_or("test/act/config/heliodor/heliodor.yaml".into());
-        let mut text = String::new();
-        ctx.open(&cfg_path)?.read_to_string(&mut text)?;
-        let a = ArchCfg::parse(&text)?;
-        if a.bool("MISALIGNED_LDST")? != a.has("Zicclsm") {
-            bail!("{cfg_path}: MISALIGNED_LDST disagrees with Zicclsm");
-        }
-        let map = self.map.clone().unwrap_or("arch".into());
-        let (regions, reset_pc) = platform::memory_map(&map)?;
-        self.dram_size = regions[0].size;
-        let hr: Vec<HcRegion> = regions
-            .iter()
-            .map(|g| HcRegion { base: g.base, size: g.size, kind: g.device as u64 })
-            .collect();
-        let isa = CString::new(a.spike_isa())?;
-        let priv_ = CString::new(a.spike_priv())?;
-        let hc = HcCfg {
-            isa: isa.as_ptr(),
-            priv_: priv_.as_ptr(),
-            pmp_regions: a.u64("NUM_PMP_ENTRIES")?,
-            pmp_granularity: 1 << a.u64("PMP_GRANULARITY")?,
-            trigger_count: self.triggers.unwrap_or(a.u64("SDTRIG_NUM_TRIGGERS")?),
-            max_vaddr_bits: a.max_vaddr_bits(),
-            geilen: a.u64("NUM_EXTERNAL_GUEST_INTERRUPTS")?,
-            mstatus_reset_mask: platform::MSTATUS_RESET_MASK,
-            mstatus_reset_val: platform::MSTATUS_RESET_VAL,
-            reset_pc,
-            misa_ro: !a.any_mutable_misa() as u64,
-            stimecmp_reset: platform::STIMECMP_RESET,
+        let p = Params {
+            hex_file: self.hex_file.clone(),
+            rom_hex: self.rom_hex.clone(),
+            map: self.map.clone(),
+            config: self.config.clone(),
+            triggers: self.triggers,
+            tohost_pa: self.tohost_pa,
         };
-        let h = unsafe { hc_new(&hc, hr.as_ptr(), hr.len()) };
-        if h.is_null() {
-            bail!("spike construction failed (isa {})", a.spike_isa());
-        }
-        self.spike = Spike(h);
-        let misa = unsafe { hc_get_misa(h) };
-        if misa != a.misa() {
-            bail!("spike misa {misa:#x} != configured {:#x}", a.misa());
-        }
-        let vlenb = unsafe { hc_vlenb(h) };
-        if a.has("V") && vlenb * 8 != a.u64("VLEN")? {
-            bail!("spike VLEN {} != configured {}", vlenb * 8, a.u64("VLEN")?);
-        }
-        // Delegation bits the configuration and spike disagree on, found by
-        // probing spike's reset and writable masks.
-        let geilen = a.u64("NUM_EXTERNAL_GUEST_INTERRUPTS")?;
-        self.medeleg_skip = a.mask("MEDELEG_DELEGATABLE")? ^ probe_writable(h, 0x302);
-        let ro1 = unsafe { hc_get_csr(h, 0x303) };
-        let want_ro1 = if a.has("H") { (1 << 2) | (1 << 6) | (1 << 10) | if geilen > 0 { 1 << 12 } else { 0 } } else { 0 };
-        self.mideleg_skip = ro1 ^ want_ro1;
-        self.marchid = 0;
-        self.mimpid = 0;
-        if a.bool("MARCHID_IMPLEMENTED")? || a.bool("MIMPID_IMPLEMENTED")? {
-            bail!("{cfg_path}: marchid/mimpid values are not modelled");
-        }
-        self.mvendorid = a.u64("VENDOR_ID_BANK")? << 7 | a.u64("VENDOR_ID_OFFSET")?;
-        self.vec_misaligned = a.bool("VECTOR_LS_MISALIGNED_LEGAL")?;
-        if a.str("MSTATEEN_CONTEXT_TYPE")? == "read-only-0" {
-            self.stateen_skip |= 1 << 57;
-        }
-        if !a.bool("NON_STANDARD_EXTENSION_IMPLEMENTED")? {
-            self.stateen_skip |= 1;
-        }
-        self.inhibit_skip = a.mask("COUNTINHIBIT_EN")? ^ probe_writable(h, 0x320);
-        self.vsatp_ignore = a.bool("IGNORE_INVALID_VSATP_MODE_WRITES_WHEN_V_EQ_ZERO")?;
-        self.vec_wholereg_misaligned = a.bool("VECTOR_LS_WHOLEREG_MISALIGNED_LEGAL")?;
-        let Some(path) = self.hex_file.clone() else {
-            bail!("HEX_FILE is required");
-        };
-        self.load_hex(ctx, &path, 0, regions[0].size)?;
-        if let Some(rom) = self.rom_hex.clone() {
-            if map != "boot" {
-                bail!("ROM_HEX needs MAP = \"boot\"");
-            }
-            self.load_hex(ctx, &rom, 1, regions[1].size)?;
-        }
+        self.eng.init(ctx, &p, 1)?;
         let w = self.rec0.width();
         if w != rec_width() {
             bail!("rec0 is {w} bits, RetireRec layout here is {}", rec_width());
         }
-        let mut top = w;
-        self.offs = FIELDS.iter().map(|&(_, fw)| {
-            top -= fw;
-            top
-        }).collect();
         self.buf = vec![0; w.div_ceil(64) as usize];
-        ctx.log(&format!(
-            "spike cosim: isa {} priv {} medeleg skip {:#x} mideleg skip {:#x}",
-            a.spike_isa(),
-            a.spike_priv(),
-            self.medeleg_skip,
-            self.mideleg_skip
-        ));
         Ok(())
     }
 
     fn on_clock(&mut self, ctx: &mut SimCtx) -> Result<()> {
         let _ = ctx.fired(self.clk);
-        if self.done {
+        if self.eng.done {
             return Ok(());
         }
-        let valid_lsb = self.offs[0];
         let mut recs = Vec::new();
         for p in [self.rec0, self.rec1, self.rec2, self.rec3] {
             ctx.read_words(p, &mut self.buf);
-            if bits(&self.buf, valid_lsb, 1) != 0 {
-                recs.push(self.decode());
+            if let Some(r) = self.eng.decode(&self.buf, 0) {
+                recs.push(r);
             }
         }
         recs.sort_by_key(|r| r.get(field!("order")));
         let mut iw = [0u64; 3];
         ctx.read_words(self.irq, &mut iw);
-        // IrqEvent {valid, cause<6>, epc<64>, order<64>}, valid on top. Its
-        // level shows in the V of the handler's first record, which comes
-        // in a later cycle.
-        if bits(&iw, 134, 1) != 0 {
-            // A second interrupt before the first handler retired anything
-            // preempted it from a higher level, so the first went to M or HS.
-            if let Some((cause, epc, order)) = self.irq_pending.take() {
-                if let Err(msg) = self.check_irq(cause, epc, false) {
-                    ctx.fail(format!("{msg} (before order {order})"));
-                    self.done = true;
-                    return Ok(());
-                }
-            }
-            self.irq_pending = Some((bits(&iw, 128, 6), bits(&iw, 64, 64), bits(&iw, 0, 64)));
-            self.irqs += 1;
-            self.intr_next = true;
+        self.eng.hart_cycle(ctx, 0, irq_event(&iw, 0), &recs);
+        Ok(())
+    }
+
+    fn on_finish(&mut self, ctx: &mut SimCtx) -> Result<()> {
+        self.eng.finish(ctx);
+        Ok(())
+    }
+}
+
+/// Checks every retire record of a multi-hart heliodor against spike harts
+/// sharing one memory.
+#[derive(Component)]
+#[component(kind = clocked, requires(file))]
+struct SpikeCosimSmp {
+    clk: ClockPort,
+    /// Every hart's retire lanes, concatenated: lane l of hart t is element
+    /// t * lanes + l, element 0 in the low bits.
+    rec: InputPort,
+    /// Every hart's retire_pkg::IrqEvent, concatenated, hart 0 in the low
+    /// bits. Its width sets the hart count.
+    irq: InputPort,
+    /// `$readmemh` image (32-bit words) loaded at PA 0x8000_0000.
+    #[param(name = "HEX_FILE")]
+    hex_file: Option<String>,
+    /// Firmware ROM image at PA 0 (MAP = "boot").
+    #[param(name = "ROM_HEX")]
+    rom_hex: Option<String>,
+    /// Harness memory map: "arch" (default) or "boot".
+    #[param(name = "MAP")]
+    map: Option<String>,
+    /// UDB architecture configuration spike is built from.
+    #[param(name = "CONFIG")]
+    config: Option<String>,
+    /// Trigger count when the core differs from the configuration's (W4).
+    #[param(name = "TRIGGERS")]
+    triggers: Option<u64>,
+    /// PA of tohost: the comparison ends after the first store to it by any
+    /// hart.
+    #[param(name = "TOHOST_PA")]
+    tohost_pa: Option<u64>,
+    #[state]
+    eng: Engine,
+    lanes: u32,
+    buf: Vec<u64>,
+    ibuf: Vec<u64>,
+}
+
+#[component_impl]
+impl SpikeCosimSmp {
+    fn on_init(&mut self, ctx: &mut SimCtx) -> Result<()> {
+        let iw = self.irq.width();
+        let rw = rec_width();
+        if iw % IRQ_W != 0 || iw == 0 {
+            bail!("irq is {iw} bits, not a multiple of the {IRQ_W}-bit IrqEvent");
         }
-        for r in &recs {
-            if let Some((cause, epc, order)) = self.irq_pending.take() {
-                if let Err(msg) = self.check_irq(cause, epc, r.on(field!("virt"))) {
-                    ctx.fail(format!("{msg} (before order {order})"));
-                    self.done = true;
-                    return Ok(());
+        let harts = iw / IRQ_W;
+        let w = self.rec.width();
+        if w % (harts * rw) != 0 || w == 0 {
+            bail!("rec is {w} bits, not {harts} harts of {rw}-bit RetireRec lanes");
+        }
+        self.lanes = w / (harts * rw);
+        let p = Params {
+            hex_file: self.hex_file.clone(),
+            rom_hex: self.rom_hex.clone(),
+            map: self.map.clone(),
+            config: self.config.clone(),
+            triggers: self.triggers,
+            tohost_pa: self.tohost_pa,
+        };
+        self.eng.init(ctx, &p, harts as usize)?;
+        self.buf = vec![0; w.div_ceil(64) as usize];
+        self.ibuf = vec![0; iw.div_ceil(64) as usize];
+        Ok(())
+    }
+
+    fn on_clock(&mut self, ctx: &mut SimCtx) -> Result<()> {
+        let _ = ctx.fired(self.clk);
+        if self.eng.done {
+            return Ok(());
+        }
+        ctx.read_words(self.rec, &mut self.buf);
+        ctx.read_words(self.irq, &mut self.ibuf);
+        let rw = rec_width();
+        for t in 0..self.eng.harts.len() as u32 {
+            let mut recs = Vec::new();
+            for l in 0..self.lanes {
+                if let Some(r) = self.eng.decode(&self.buf, (t * self.lanes + l) * rw) {
+                    recs.push(r);
                 }
             }
-            if let Err(msg) = self.check(r) {
-                ctx.fail(msg);
-                self.done = true;
-                return Ok(());
-            }
-            self.compared += 1;
-            if self.at_tohost {
-                self.done = true;
+            recs.sort_by_key(|r| r.get(field!("order")));
+            if !self.eng.hart_cycle(ctx, t, irq_event(&self.ibuf, t * IRQ_W), &recs) {
                 break;
             }
         }
@@ -926,33 +1263,21 @@ impl SpikeCosim {
     }
 
     fn on_finish(&mut self, ctx: &mut SimCtx) -> Result<()> {
-        ctx.log(&format!(
-            "spike cosim: {} records and {} interrupts compared ({} source, {} CSR, {} vector, {} device values){}",
-            self.compared,
-            self.irqs,
-            self.src_checked,
-            self.csr_checked,
-            self.vec_checked,
-            self.dev_checked,
-            if self.at_tohost { ", stopped at the tohost store" } else { "" }
-        ));
-        if self.compared == 0 {
-            ctx.fail("spike cosim: no records compared");
-        }
+        self.eng.finish(ctx);
         Ok(())
     }
 }
 
-/// The writable bits of a WARL CSR, by writing all ones and reading back;
-/// the CSR is restored.
+/// The writable bits of a WARL CSR of hart 0, by writing all ones and
+/// reading back; the CSR is restored.
 fn probe_writable(h: *mut c_void, addr: u32) -> u64 {
     unsafe {
-        let old = hc_get_csr(h, addr);
-        hc_set_csr(h, addr, !0);
-        let m = hc_get_csr(h, addr);
-        hc_set_csr(h, addr, old);
+        let old = hc_get_csr(h, 0, addr);
+        hc_set_csr(h, 0, addr, !0);
+        let m = hc_get_csr(h, 0, addr);
+        hc_set_csr(h, 0, addr, old);
         m
     }
 }
 
-veryl_component_export!("spike_cosim" => SpikeCosim);
+veryl_component_export!("spike_cosim" => SpikeCosim, "spike_cosim_smp" => SpikeCosimSmp);

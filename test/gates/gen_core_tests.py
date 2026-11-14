@@ -23,8 +23,8 @@ suite that are not produced by this run are left alone.
 
 --cosim writes test_gc_<core>_<suite>.veryl instead: `#[ignore]` pass/fail
 tests `test_gc_<core>_<suite>_<name>` that also check every retire record
-against spike (the spike_cosim component, cosim/spike; needs SPIKE_HOME).
-Entries with dmi= or harts > 1 are skipped. test/gates/run_gc.py generates,
+against spike (the spike_cosim component, or spike_cosim_smp for harts > 1;
+cosim/spike; needs SPIKE_HOME). Entries with dmi= are skipped. test/gates/run_gc.py generates,
 runs and removes them.
 """
 
@@ -121,12 +121,71 @@ def gen_smp_module(e, core, ignored):
 
 
 def cosim_ok(e):
-    """Whether the N=1 spike cosim can check this entry: Debug Mode (dmi) and
-    SMP images are out of its reach."""
-    return e.harts == 1 and not e.dmi
+    """Whether the spike cosim can check this entry: Debug Mode (dmi) is out
+    of its reach."""
+    return not e.dmi
+
+
+def gen_cosim_smp_module(e, core):
+    mod = f"test_gc_{core}_{e.ident}"
+    steps = e.budget // gatelist.EARLY_EXIT_STEP
+    lanes = e.harts * 4
+    rec = ", ".join(f"h.retire[{i}]" for i in reversed(range(lanes)))
+    irq = ", ".join(f"h.irq_evt[{i}]" for i in reversed(range(e.harts)))
+    c = [("HEX_FILE", f'"{e.hex}"'), ("TOHOST_PA", f"64'h{0x80000000 + 4 * e.tohost:x}")]
+    if core != "w2":
+        c += [("TRIGGERS", "4")]
+    kw = max(len(k) for k, _ in c)
+    cp = "\n".join(f"        {k.ljust(kw)}: {v}," for k, v in c)
+    return f"""
+#[test({mod})]
+#[ignore]
+module {mod} {{
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass  : logic    ;
+    var fail  : logic    ;
+    var cycles: logic<64>;
+    inst h: boot_soc_harness #(
+{smp_params(e, core)}
+    ) (
+        clk              ,
+        rst              ,
+        o_pass   : pass  ,
+        o_fail   : fail  ,
+        o_x3     : _     ,
+        o_cycles : cycles,
+        o_instret: _     ,
+        o_last_pc: _     ,
+        o_ret_cnt: _     ,
+        o_traps  : _     ,
+    );
+    inst cosim: $comp::spike_cosim_smp #(
+{cp}
+    ) (
+        clk,
+        rec: {{{rec}}},
+        irq: {{{irq}}},
+    );
+    initial {{
+        rst.assert(clk);
+        for _i in 0..{steps} {{
+            clk.next({gatelist.EARLY_EXIT_STEP});
+            if pass || fail {{
+                break;
+            }}
+        }}
+        $display("gc {core} {e.key} (N={e.harts}) cycles=%d pass=%b", cycles, pass);
+        $assert(pass, "gc {core} {e.key} fail");
+        $finish();
+    }}
+}}
+"""
 
 
 def gen_cosim_module(e, core):
+    if e.harts > 1:
+        return gen_cosim_smp_module(e, core)
     mod = f"test_gc_{core}_{e.ident}"
     steps = e.budget // gatelist.EARLY_EXIT_STEP
     p = [("CORE", CORE_CONST[core]), ("HEX_FILE", f'"{e.hex}"'), ("TOHOST_IDX", str(e.tohost))]
