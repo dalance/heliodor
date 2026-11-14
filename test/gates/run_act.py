@@ -2,8 +2,8 @@
 """Run the ACT4 suites on a new core: GA (pass/fail) and GL-C (final hash).
 
     test/gates/run_act.py --core w2 [--list test/gates/mi_act.list]
-                          [--suite d,zaamo,...] [--pass-fail] [--log-dir DIR] [--keep] [--batch N]
-                          [--from-json REPORT]
+                          [--suite d,zaamo,...] [--pass-fail] [--cosim] [--log-dir DIR] [--keep]
+                          [--batch N] [--from-json REPORT]
 
 The images are gitignored: build them with `make -C test/act` (see
 test/act/README.md); they land in test/hex/act_<ext>_<name>.hex.
@@ -18,6 +18,8 @@ test/golden/act/<ext>.final (the same comparison as test/golden/check_hash.py).
 Entries with lockstep=0 are judged by GA only. The wrappers are deleted
 afterwards unless --keep, so the default `veryl test` does not compile them.
 --from-json judges a saved report (<log-dir>/<core>.json) without running.
+--cosim runs the tests under the spike cosim instead (test_gc_<core>_act_*,
+gen_core_tests.py --cosim; needs SPIKE_HOME), judged pass/fail only.
 
 Exit code 0 only if every test passes and, without --pass-fail, every
 compared hash matches.
@@ -26,6 +28,7 @@ compared hash matches.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +42,23 @@ import gen_core_tests  # noqa: E402
 
 ACT_SUITE = "act_"
 
+# Under --cosim, tests that exercise behaviour the configuration fixes and
+# spike cannot be set to through its public API: not run, the reason printed.
+SPIKE_GAPS = {
+    "act_h/vucsr_00": "spike raises virtual-instruction from VU for CSRs that are illegal there "
+                      "(scountinhibit without menvcfg.CDE)",
+    "act_h/vucsr_01": "spike raises virtual-instruction from VU for the M-level mireg (Sscsrind checks first)",
+    "act_h/vucsr_02": "spike implements hcontext (HCONTEXT_IMPLEMENTED false)",
+    "act_sdtrigsm/csr_access_global_00": "spike implements mcontext (MCONTEXT_IMPLEMENTED false)",
+    "act_smstateen/00": "spike implements scontext (SCONTEXT_IMPLEMENTED false)",
+    "act_ssstateen/01": "spike implements scontext (SCONTEXT_IMPLEMENTED false)",
+    "act_sdtrigsm/icount_self_write_00": "spike decrements icount on the instruction that writes it",
+    "act_sv/sv39_nleaf_pte_reserved_Smode_00": "spike has no Svrsw60t59b: PTE bits 60:59 are reserved and fault",
+    "act_sv/sv39_pte_reserved_field_Smode_00": "spike has no Svrsw60t59b: PTE bits 60:59 are reserved and fault",
+    "act_sv/H_sv39_vs_pte_00": "spike has no Svrsw60t59b: PTE bits 60:59 are reserved and fault",
+    "act_sv/H_sv39x4_g_pte_00": "spike has no Svrsw60t59b: PTE bits 60:59 are reserved and fault",
+}
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -50,10 +70,19 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the generated wrappers (renamed per batch)")
     ap.add_argument("--batch", type=int, default=400, help="tests per veryl run (default 400)")
     ap.add_argument("--from-json", type=Path, help="judge this saved report instead of running")
+    ap.add_argument("--cosim", action="store_true", help="check every record against spike (pass/fail only)")
     a = ap.parse_args()
+    if a.cosim:
+        a.pass_fail = True
+    a.prefix = f"test_gc_{a.core}_" if a.cosim else f"test_{a.core}_"
 
     want = {ACT_SUITE + s for s in a.suite.split(",") if s}
     entries = [e for e in gatelist.parse(a.list) if not want or e.suite in want]
+    if a.cosim:
+        for e in entries:
+            if e.key in SPIKE_GAPS:
+                print(f"SKIP     {e.key}: {SPIKE_GAPS[e.key]}")
+        entries = [e for e in entries if e.key not in SPIKE_GAPS]
     if not entries:
         print("run_act: no tests selected", file=sys.stderr)
         return 2
@@ -66,19 +95,19 @@ def main():
         return 2
 
     tb = MASTER / "tb"
-    for old in tb.glob(f"test_{a.core}_{ACT_SUITE}*.veryl"):
+    for old in tb.glob(f"{a.prefix}{ACT_SUITE}*.veryl"):
         old.unlink()
     veryl = os.environ.get("VERYL") or str(MASTER / "veryl" / "target" / "release-verylup" / "veryl")
-    cmd = [veryl, "test", "--ignored", "--test", f"test_{a.core}_{ACT_SUITE}", "--format", "json"]
+    cmd = [veryl, "test", "--ignored", "--test", f"{a.prefix}{ACT_SUITE}", "--format", "json"]
     src = a.list.resolve().relative_to(MASTER) if a.list.resolve().is_relative_to(MASTER) else a.list
     a.log_dir.mkdir(parents=True, exist_ok=True)
     tests = []
     for n, batch in enumerate(batches(gatelist.by_suite(entries), a.batch)):
         gen = []
         for suite, es in batch:
-            path = tb / f"test_{a.core}_{suite}.veryl"
+            path = tb / f"{a.prefix}{suite}.veryl"
             path.write_text(gen_core_tests.HEADER.format(src=src)
-                            + "".join(gen_core_tests.gen_module(e, a.core, False, True) for e in es))
+                            + "".join(gen_core_tests.gen_module(e, a.core, False, True, a.cosim) for e in es))
             gen.append(path)
         count = sum(len(es) for _, es in batch)
         print(f"run_act: batch {n}: {' '.join(cmd)} ({count} tests)", file=sys.stderr, flush=True)
@@ -101,6 +130,12 @@ def main():
     rep = {"tests": tests}
     (a.log_dir / f"{a.core}.json").write_text(json.dumps(rep))
     return judge(a, entries, rep)
+
+
+def run_gc_mismatch(t):
+    """The first spike mismatch message of a test report, if any."""
+    m = re.search(r"spike mismatch(?:(?!\\n)[^\"])*", json.dumps(t))
+    return m.group(0) if m else None
 
 
 def batches(suites, limit):
@@ -129,11 +164,13 @@ def judge(a, entries, rep):
         gold = finals.setdefault(ext, check_hash.load_golden(fpath) if fpath.is_file() else {})
         n_pass = n_cmp = n_match = 0
         for e in es:
-            t = report.get(f"test_{a.core}_{e.ident}")
+            t = report.get(f"{a.prefix}{e.ident}")
             ok = t is not None and t.get("status") == "pass"
             n_pass += ok
             if not ok:
-                bad.append(f"FAIL     {e.key}: {'not run' if t is None else t.get('status')}")
+                m = run_gc_mismatch(t) if a.cosim and t else None
+                bad.append(f"FAIL     {e.key}: {'not run' if t is None else t.get('status')}"
+                           + (f": {m}" if m else ""))
             if not e.lockstep or a.pass_fail:
                 continue
             exp = gold.get(f"test_{e.ident}")

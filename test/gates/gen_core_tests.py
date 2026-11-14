@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the new-core test wrappers from a gate list.
 
-    test/gates/gen_core_tests.py --core w2 [--no-lockstep] [--ignored] [--out-dir tb] test/gates/<milestone>.list
+    test/gates/gen_core_tests.py --core w2 [--no-lockstep] [--ignored] [--cosim] [--out-dir tb] test/gates/<milestone>.list
 
 Writes <out-dir>/test_<core>_<suite>.veryl with one test `test_<core>_<suite>_<name>`
 per list entry. Each wrapper selects the core with the harness `CORE` param,
@@ -20,6 +20,12 @@ test/gates/run_act.py).
 Lockstep entries need their golden file (test/golden/run_golden.py); a missing
 one is an error unless --allow-missing-golden. Files of the same core and
 suite that are not produced by this run are left alone.
+
+--cosim writes test_gc_<core>_<suite>.veryl instead: `#[ignore]` pass/fail
+tests `test_gc_<core>_<suite>_<name>` that also check every retire record
+against spike (the spike_cosim component, cosim/spike; needs SPIKE_HOME).
+Entries with dmi= or harts > 1 are skipped. test/gates/run_gc.py generates,
+runs and removes them.
 """
 
 import argparse
@@ -114,7 +120,75 @@ def gen_smp_module(e, core, ignored):
 """
 
 
-def gen_module(e, core, lockstep, ignored):
+def cosim_ok(e):
+    """Whether the N=1 spike cosim can check this entry: Debug Mode (dmi) and
+    SMP images are out of its reach."""
+    return e.harts == 1 and not e.dmi
+
+
+def gen_cosim_module(e, core):
+    mod = f"test_gc_{core}_{e.ident}"
+    steps = e.budget // gatelist.EARLY_EXIT_STEP
+    p = [("CORE", CORE_CONST[core]), ("HEX_FILE", f'"{e.hex}"'), ("TOHOST_IDX", str(e.tohost))]
+    if e.mtime == "instret":
+        p += [("MTIME_SRC", "soc_pkg::MTIME_INSTRET"), ("MTIME_DIV", "10")]
+    if e.irq:
+        p += [("EXT_IRQ_SRC", f"32'h{e.irq:08x}")]
+    kw = max(len(k) for k, _ in p)
+    vw = max(len(v) for _, v in p)
+    hp = "\n".join(f"        {k.ljust(kw)}: {v.ljust(vw)}," for k, v in p)
+    c = [("HEX_FILE", f'"{e.hex}"'), ("TOHOST_PA", f"64'h{0x80000000 + 4 * e.tohost:x}")]
+    if core != "w2":
+        c += [("TRIGGERS", "4")]
+    kw = max(len(k) for k, _ in c)
+    cp = "\n".join(f"        {k.ljust(kw)}: {v}," for k, v in c)
+    return f"""
+#[test({mod})]
+#[ignore]
+module {mod} {{
+    inst clk: $tb::clock_gen;
+    inst rst: $tb::reset_gen ( clk );
+    var pass  : logic    ;
+    var fail  : logic    ;
+    var tohost: logic<32>;
+    inst h: arch_soc_harness #(
+{hp}
+    ) (
+        clk             ,
+        rst             ,
+        o_pass  : pass  ,
+        o_fail  : fail  ,
+        o_tohost: tohost,
+    );
+    inst cosim: $comp::spike_cosim #(
+{cp}
+    ) (
+        clk              ,
+        rec0: h.retire[0],
+        rec1: h.retire[1],
+        rec2: h.retire[2],
+        rec3: h.retire[3],
+        irq : h.irq_evt[0],
+    );
+    initial {{
+        rst.assert(clk);
+        for _i in 0..{steps} {{
+            clk.next({gatelist.EARLY_EXIT_STEP});
+            if pass || fail {{
+                break;
+            }}
+        }}
+        $display("gc {core} {e.key} tohost=%h pass=%b", tohost, pass);
+        $assert(pass, "gc {core} {e.key} fail");
+        $finish();
+    }}
+}}
+"""
+
+
+def gen_module(e, core, lockstep, ignored, cosim=False):
+    if cosim:
+        return gen_cosim_module(e, core)
     if e.harts > 1:
         return gen_smp_module(e, core, ignored)
     mod = f"test_{core}_{e.ident}"
@@ -163,10 +237,13 @@ def main():
     ap.add_argument("--no-lockstep", action="store_true", help="pass/fail only, no golden checkpoint file")
     ap.add_argument("--allow-missing-golden", action="store_true")
     ap.add_argument("--ignored", action="store_true", help="mark the generated tests #[ignore]")
+    ap.add_argument("--cosim", action="store_true", help="write the spike cosim tests test_gc_<core>_<suite>")
     a = ap.parse_args()
 
-    lockstep = not a.no_lockstep
+    lockstep = not a.no_lockstep and not a.cosim
     entries = gatelist.parse(a.list)
+    if a.cosim:
+        entries = [e for e in entries if cosim_ok(e)]
     if lockstep and not a.allow_missing_golden:
         missing = [e.ck_file for e in entries if e.lockstep and not (MASTER / e.ck_file).is_file()]
         if missing:
@@ -179,9 +256,11 @@ def main():
     except ValueError:
         src = a.list
     a.out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = "test_gc_" if a.cosim else "test_"
     for suite, es in gatelist.by_suite(entries).items():
-        path = a.out_dir / f"test_{a.core}_{suite}.veryl"
-        path.write_text(HEADER.format(src=src) + "".join(gen_module(e, a.core, lockstep, a.ignored) for e in es))
+        path = a.out_dir / f"{prefix}{a.core}_{suite}.veryl"
+        path.write_text(HEADER.format(src=src) + "".join(gen_module(e, a.core, lockstep, a.ignored, a.cosim)
+                                                         for e in es))
         print(f"gen_core_tests: wrote {path} ({len(es)} tests)")
     return 0
 
