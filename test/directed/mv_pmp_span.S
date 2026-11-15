@@ -8,6 +8,9 @@
 //   1 ld          2 sd          3 vle64.v (1 element)    4 vse64.v
 //   5 vle32.v of 2 elements: element 1 (SCRATCH + 4) matches fully and is
 //     allowed for M: no trap
+//   6 amoadd.d    7 lr.d
+//   8 cbo.zero    9 cbo.clean: the CMO spec checks the whole cache block
+//     (spike checks only the byte at rs1 and does not trap)
 #include "common/probe.h"
 
 .macro CASE sub, cause
@@ -61,6 +64,18 @@ main:
     CASE    5
     vle32.v v1, (a0)
     CHECK   5, 0
+    CASE    6
+    amoadd.d zero, zero, (a0)
+    CHECK   6, 7
+    CASE    7
+    lr.d    t1, (a0)
+    CHECK   7, 5
+    CASE    8
+    .insn   i 0x0f, 2, x0, a0, 4    // cbo.zero (a0)
+    CHECK   8, 7
+    CASE    9
+    .insn   i 0x0f, 2, x0, a0, 1    // cbo.clean (a0)
+    CHECK   9, 7
     li      t0, 0x1f
     csrw    pmpcfg0, t0
     beqz    s3, 9f
