@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run random instruction streams (test/gr/gen.py) under the spike cosim.
 
-    test/gr/run_gr.py [--core w2|w4] [--priv] [--seeds 1-50] [--length 3000]
+    test/gr/run_gr.py [--core w2|w4] [--priv] [--vec] [--seeds 1-50] [--length 3000]
                       [--long 1001-1003] [--long-length 30000]
                       [--batch N] [--log-dir DIR] [--keep] [--no-run]
 
@@ -13,7 +13,9 @@ veryl/target/release-verylup/veryl) and requires every program to pass: the
 DUT writes tohost = 1 and the cosim reports no mismatch. Needs spike
 (SPIKE_HOME) for the spike_cosim component. The wrappers are deleted
 afterwards unless --keep. --priv runs the privileged stream (gen.py --priv)
-as test_gc_<core>_grp_s<seed>, by default seeds 1-300 and 1001-1005.
+as test_gc_<core>_grp_s<seed>, by default seeds 1-300 and 1001-1005. --vec
+mixes in the vector stream (gen.py --vec) as test_gc_<core>_grv[p]_s<seed>,
+by default seeds 1-500 and 1001-1005.
 
 Prints the mnemonics the programs contain (static counts from objdump, summed
 over the seeds) and the ones of gen.MNEMONICS no program contains; with a
@@ -41,6 +43,7 @@ import gen_core_tests  # noqa: E402
 
 CYCLES_PER_INSN = 40
 PRIV_CYCLES_PER_INSN = 80
+VEC_CYCLES_PER_INSN = 400
 
 
 def seed_list(spec):
@@ -68,6 +71,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--core", default="w2", choices=sorted(gen_core_tests.CORE_CONST))
     ap.add_argument("--priv", action="store_true", help="the privileged stream (gen.py --priv)")
+    ap.add_argument("--vec", action="store_true", help="mix in the vector stream (gen.py --vec)")
     ap.add_argument("--seeds", default=None, help="short seeds (default 1-50, with --priv 1-300)")
     ap.add_argument("--length", type=int, default=3000)
     ap.add_argument("--long", default=None, help="seeds run at --long-length ('' for none; default 1001-1003, "
@@ -79,11 +83,11 @@ def main():
     ap.add_argument("--no-run", action="store_true", help="generate, build and count only")
     a = ap.parse_args()
     if a.seeds is None:
-        a.seeds = "1-300" if a.priv else "1-50"
+        a.seeds = "1-500" if a.vec else "1-300" if a.priv else "1-50"
     if a.long is None:
-        a.long = "1001-1005" if a.priv else "1001-1003"
-    suite = "grp" if a.priv else "gr"
-    cpi = PRIV_CYCLES_PER_INSN if a.priv else CYCLES_PER_INSN
+        a.long = "1001-1005" if a.priv or a.vec else "1001-1003"
+    suite = gen.stem_of(0, a.priv, a.vec)[:-2]
+    cpi = VEC_CYCLES_PER_INSN if a.vec else PRIV_CYCLES_PER_INSN if a.priv else CYCLES_PER_INSN
 
     progs = [(s, a.length) for s in seed_list(a.seeds)] + [(s, a.long_length) for s in seed_list(a.long)]
     if len({s for s, _ in progs}) != len(progs):
@@ -92,7 +96,7 @@ def main():
     out = HERE / "build"
     entries, cover = [], collections.Counter()
     for seed, length in progs:
-        hexp, dyn = gen.generate(seed, length, out, priv=a.priv)
+        hexp, dyn = gen.generate(seed, length, out, priv=a.priv, vec=a.vec)
         cover += mnemonics(hexp.with_suffix(".elf"))
         budget = -(-max(dyn * cpi, 100_000) // gatelist.EARLY_EXIT_STEP) * gatelist.EARLY_EXIT_STEP
         entries.append(gatelist.Entry(suite=suite, name=f"s{seed}", budget=budget,
@@ -100,11 +104,13 @@ def main():
                                       lockstep=False))
     print(f"run_gr: {len(entries)} programs, {sum(cover.values())} instructions, {len(cover)} mnemonics")
     print(" ".join(f"{m}:{n}" for m, n in sorted(cover.items())))
+    want = list(gen.MNEMONICS)
     if a.priv:
         import priv
-        want = gen.MNEMONICS + [m for m in priv.PRIV_MNEMONICS if m not in gen.MNEMONICS]
-    else:
-        want = gen.MNEMONICS
+        want += [m for m in priv.PRIV_MNEMONICS if m not in want]
+    if a.vec:
+        import vec
+        want += vec.VEC_MNEMONICS
     missing = [m for m in want if m not in cover]
     if missing:
         print(f"never generated: {' '.join(missing)}")
