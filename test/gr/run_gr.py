@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run random instruction streams (test/gr/gen.py) under the spike cosim.
 
-    test/gr/run_gr.py [--core w2|w4] [--priv] [--vec] [--seeds 1-50] [--length 3000]
+    test/gr/run_gr.py [--core w2|w4] [--priv | --hyp] [--vec] [--seeds 1-50] [--length 3000]
                       [--long 1001-1003] [--long-length 30000]
                       [--batch N] [--log-dir DIR] [--keep] [--no-run]
 
@@ -15,11 +15,16 @@ DUT writes tohost = 1 and the cosim reports no mismatch. Needs spike
 afterwards unless --keep. --priv runs the privileged stream (gen.py --priv)
 as test_gc_<core>_grp_s<seed>, by default seeds 1-300 and 1001-1005. --vec
 mixes in the vector stream (gen.py --vec) as test_gc_<core>_grv[p]_s<seed>,
-by default seeds 1-500 and 1001-1005.
+by default seeds 1-500 and 1001-1005. --hyp runs the H stream (gen.py
+--hyp, combinable with --vec) as test_gc_<core>_gr[v]h_s<seed>, by default
+seeds 1-400 and 1001-1005.
 
 Prints the mnemonics the programs contain (static counts from objdump, summed
 over the seeds) and the ones of gen.MNEMONICS no program contains; with a
-report, the records compared and the sim time per seed.
+report, the records compared and the sim time per seed, and the cosim's
+coverage summed over the seeds: traps by source mode, handler level and
+cause, interrupts, and mode changes (with --hyp also the H causes and mode
+changes no program reached).
 
 Exit code 0 only if every program passes.
 """
@@ -72,6 +77,7 @@ def main():
     ap.add_argument("--core", default="w2", choices=sorted(gen_core_tests.CORE_CONST))
     ap.add_argument("--priv", action="store_true", help="the privileged stream (gen.py --priv)")
     ap.add_argument("--vec", action="store_true", help="mix in the vector stream (gen.py --vec)")
+    ap.add_argument("--hyp", action="store_true", help="the H stream (gen.py --hyp)")
     ap.add_argument("--seeds", default=None, help="short seeds (default 1-50, with --priv 1-300)")
     ap.add_argument("--length", type=int, default=3000)
     ap.add_argument("--long", default=None, help="seeds run at --long-length ('' for none; default 1001-1003, "
@@ -83,11 +89,11 @@ def main():
     ap.add_argument("--no-run", action="store_true", help="generate, build and count only")
     a = ap.parse_args()
     if a.seeds is None:
-        a.seeds = "1-500" if a.vec else "1-300" if a.priv else "1-50"
+        a.seeds = "1-400" if a.hyp else "1-500" if a.vec else "1-300" if a.priv else "1-50"
     if a.long is None:
-        a.long = "1001-1005" if a.priv or a.vec else "1001-1003"
-    suite = gen.stem_of(0, a.priv, a.vec)[:-2]
-    cpi = VEC_CYCLES_PER_INSN if a.vec else PRIV_CYCLES_PER_INSN if a.priv else CYCLES_PER_INSN
+        a.long = "1001-1005" if a.priv or a.vec or a.hyp else "1001-1003"
+    suite = gen.stem_of(0, a.priv, a.vec, a.hyp)[:-2]
+    cpi = VEC_CYCLES_PER_INSN if a.vec else PRIV_CYCLES_PER_INSN if a.priv or a.hyp else CYCLES_PER_INSN
 
     progs = [(s, a.length) for s in seed_list(a.seeds)] + [(s, a.long_length) for s in seed_list(a.long)]
     if len({s for s, _ in progs}) != len(progs):
@@ -96,7 +102,7 @@ def main():
     out = HERE / "build"
     entries, cover = [], collections.Counter()
     for seed, length in progs:
-        hexp, dyn = gen.generate(seed, length, out, priv=a.priv, vec=a.vec)
+        hexp, dyn = gen.generate(seed, length, out, priv=a.priv, vec=a.vec, hyp=a.hyp)
         cover += mnemonics(hexp.with_suffix(".elf"))
         budget = -(-max(dyn * cpi, 100_000) // gatelist.EARLY_EXIT_STEP) * gatelist.EARLY_EXIT_STEP
         entries.append(gatelist.Entry(suite=suite, name=f"s{seed}", budget=budget,
@@ -105,9 +111,12 @@ def main():
     print(f"run_gr: {len(entries)} programs, {sum(cover.values())} instructions, {len(cover)} mnemonics")
     print(" ".join(f"{m}:{n}" for m, n in sorted(cover.items())))
     want = list(gen.MNEMONICS)
-    if a.priv:
+    if a.priv or a.hyp:
         import priv
         want += [m for m in priv.PRIV_MNEMONICS if m not in want]
+    if a.hyp:
+        import hyp
+        want += [m for m in hyp.HYP_MNEMONICS if m not in want]
     if a.vec:
         import vec
         want += vec.VEC_MNEMONICS
@@ -153,11 +162,13 @@ def main():
 
 MISMATCH = re.compile(r"spike mismatch[^\n]*")
 RECORDS = re.compile(r"spike cosim: (\d+) records")
+COVERAGE = re.compile(r"spike cosim coverage: ([^\n]*)")
 
 
 def judge(a, entries, tests):
     report = {t["name"]: t for t in tests}
     bad, n_pass, recs, sim = [], 0, 0, 0.0
+    cov = collections.Counter()
     for e in entries:
         t = report.get(f"test_gc_{a.core}_{e.ident}")
         ok = t is not None and t.get("status") == "pass"
@@ -166,12 +177,24 @@ def judge(a, entries, tests):
         m = RECORDS.search(out)
         r = int(m.group(1)) if m else 0
         recs += r
+        m = COVERAGE.search(out)
+        for kv in (m.group(1).split(", ") if m and m.group(1) else []):
+            k, _, n = kv.rpartition("=")
+            cov[k] += int(n)
         sim += (t or {}).get("sim_s", 0.0)
         print(f"{e.name}: {'pass' if ok else 'FAIL'} records {r} sim {(t or {}).get('sim_s', 0.0):.1f}s")
         if not ok:
             why = "not run" if t is None else t.get("status")
             mm = MISMATCH.search((t or {}).get("message", "") + out)
             bad.append(f"FAIL {e.name}: {why}" + (f": {mm.group(0)}" if mm else ""))
+    print("coverage: " + ", ".join(f"{k}={n}" for k, n in sorted(cov.items())))
+    if a.hyp:
+        import hyp
+        causes = {int(k.rpartition(":")[2]) for k in cov if k.startswith("trap ")}
+        lost = [str(c) for c in hyp.HYP_CAUSES if c not in causes]
+        lost += [m for m in hyp.HYP_MODES if f"mode {m}" not in cov]
+        if lost:
+            print(f"never reached: {' '.join(lost)}")
     print(f"total pass {n_pass}/{len(entries)}, {recs} records, sim {sim:.0f}s")
     for b in bad:
         print(b)

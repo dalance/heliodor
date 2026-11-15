@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Random instruction stream generator for the spike cosim (GR).
 
-    test/gr/gen.py --seed N [--length L] [--priv] [--vec] [--out DIR] [--no-build]
+    test/gr/gen.py --seed N [--length L] [--priv | --hyp] [--vec] [--out DIR] [--no-build]
 
 Writes DIR/gr_<seed>.S (default DIR test/gr/build) and, unless --no-build,
 assembles it with riscv64-unknown-elf-gcc into gr_<seed>.elf and the
@@ -27,7 +27,9 @@ EXCLUDED lists what the generator never emits, with the reason.
 Sv39 paging, delegation, PMP and random CSR accesses (test/gr/priv.py, whose
 PRIV_EXCLUDED adds to EXCLUDED). --vec mixes RVV 1.0 into either stream
 (grv_<seed>, grvp_<seed>; test/gr/vec.py, whose VEC_EXCLUDED adds to the
-table).
+table). --hyp writes grh_<seed> (grvh_<seed> with --vec): the privileged
+stream with the H extension, VS and VU guests and G-stage translation
+(test/gr/hyp.py, whose HYP_EXCLUDED adds to the table).
 """
 
 import argparse
@@ -872,17 +874,22 @@ def bin2hex(binp, hexp):
     Path(hexp).write_text("".join(f"{w:08X}\n" for w in words))
 
 
-def stem_of(seed, priv=False, vec=False):
-    return f"gr{'v' if vec else ''}{'p' if priv else ''}_{seed}"
+def stem_of(seed, priv=False, vec=False, hyp=False):
+    return f"gr{'v' if vec else ''}{'h' if hyp else 'p' if priv else ''}_{seed}"
 
 
-def generate(seed, length, out, build=True, priv=False, vec=False):
-    """Write gr[v][p]_<seed>.S (and .elf/.hex); returns (hex path, dynamic
+def generate(seed, length, out, build=True, priv=False, vec=False, hyp=False):
+    """Write gr[v][p|h]_<seed>.S (and .elf/.hex); returns (hex path, dynamic
     estimate)."""
     out.mkdir(parents=True, exist_ok=True)
-    stem = out / stem_of(seed, priv, vec)
+    stem = out / stem_of(seed, priv, vec, hyp)
     march = MARCH_V if vec else MARCH
-    if priv:
+    if hyp:
+        import hyp as hypgen
+        cls = hypgen.VecHypGen if vec else hypgen.HypGen
+        src, dyn = cls(seed, length).build()
+        ld, march = HERE / "gr_priv.ld", march + "_svinval_h"
+    elif priv:
         import priv as privgen
         cls = privgen.PrivGen
         if vec:
@@ -915,11 +922,12 @@ def main():
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--priv", action="store_true", help="the privileged stream (test/gr/priv.py)")
     ap.add_argument("--vec", action="store_true", help="mix in the vector stream (test/gr/vec.py)")
+    ap.add_argument("--hyp", action="store_true", help="the H stream (test/gr/hyp.py)")
     ap.add_argument("--excluded", action="store_true", help="print the exclusion table and exit")
     a = ap.parse_args()
     if a.excluded:
         table = dict(EXCLUDED)
-        if a.priv:
+        if a.priv or a.hyp:
             import priv as privgen
             table.pop("CSR writes other than fcsr/frm/fflags, xRET, privilege changes")
             table.update(privgen.PRIV_EXCLUDED)
@@ -928,10 +936,21 @@ def main():
             table.pop("vector, H")
             table["H"] = "a separate stream"
             table.update(vecgen.VEC_EXCLUDED)
+        if a.hyp:
+            import hyp as hypgen
+            table.pop("vector, H", None)
+            table.pop("H", None)
+            if not a.vec:
+                table["vector"] = "a separate stream"
+            table.pop("cycle/time/instret/hpmcounter reads")
+            table.pop("interrupts (mie, sie, mip, sip writes; Sstc)")
+            table.pop("wfi, wrs.nto, wrs.sto")
+            table["wrs.nto, wrs.sto"] = "stall until a reservation loss that never comes"
+            table.update(hypgen.HYP_EXCLUDED)
         for k, v in table.items():
             print(f"{k}: {v}")
         return 0
-    hexp, dyn = generate(a.seed, a.length, a.out, not a.no_build, a.priv, a.vec)
+    hexp, dyn = generate(a.seed, a.length, a.out, not a.no_build, a.priv, a.vec, a.hyp)
     print(json.dumps({"seed": a.seed, "hex": str(hexp), "dyn": dyn}))
     return 0
 
