@@ -52,6 +52,18 @@ because `libusb1-devel` is absent, which does not matter for simulation.
 The riscv-tests debug suite itself is the `test/riscv-arch-test/upstream/debug/`
 clone; its commit and the reference results are recorded under `test/debug/`.
 
+## GLT: litmus tests and herd7
+
+`toolchain/fetch.sh glt` clones the official RISC-V litmus tests
+(`LITMUS_COMMIT`) into the gitignored `test/glt/upstream/` and builds herd7 from
+herdtools7 (`HERD_COMMIT`, tag 7.58) into the gitignored `herd/`. The build
+fetches the pinned `opam` binary, compiles OCaml and the herdtools7 dependencies
+listed in `OCAML_PKGS` into an opam root under `herd/opam`, and installs herd7
+with its `riscv.cat` model under `herd/bin` and `herd/share`. Nothing is
+installed system-wide. dune opens sockets during the build, so run it outside a
+sandbox that forbids them. `test/glt/run_glt.py` uses the tools (see its
+docstring).
+
 Ruby/UDB use the **system** Ruby (`ruby --version` ≥ 3.4); `env.sh` points
 `BUNDLE_PATH` at a writable, gitignored dir so `bundle install` works without a
 writable system gem dir.

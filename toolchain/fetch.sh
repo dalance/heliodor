@@ -6,6 +6,7 @@
 #   ./fetch.sh elf          # fetch one component (elf | linux | sail | uv)
 #   ./fetch.sh debug        # build spike + openocd + gdb from source (MD debug flow)
 #   ./fetch.sh spike        # build one of spike | openocd | gdb
+#   ./fetch.sh glt          # clone litmus-tests-riscv + build herd7 (GLT)
 #   ./fetch.sh elf linux    # fetch several
 #
 # Resolves the release asset via the GitHub API (so the exact dated asset name
@@ -127,6 +128,36 @@ build_gdb() {
     && make -j"$JOBS" all-gdb && make install-gdb )
 }
 
+build_herd() {
+  local dest="$here/herd" src="$here/src/herdtools7"
+  mkdir -p "$dest/bin"
+  curl -fSL --retry 3 -o "$dest/bin/opam" "$OPAM_URL"
+  local got; got="$(sha256sum "$dest/bin/opam" | awk '{print $1}')"
+  [[ "$got" == "$OPAM_SHA256" ]] || { echo "[herd] ERROR opam sha256 mismatch: got $got" >&2; return 1; }
+  chmod +x "$dest/bin/opam"
+  export OPAMROOT="$dest/opam" OPAMYES=1 OPAMCOLOR=never DUNE_CACHE=disabled XDG_CACHE_HOME="$dest/.cache"
+  local opam="$dest/bin/opam" ocaml pkgs
+  read -r ocaml pkgs <<< "$OCAML_PKGS"
+  [[ -d "$OPAMROOT" ]] || "$opam" init --bare --disable-sandboxing -n default https://opam.ocaml.org
+  "$opam" switch list -s | grep -qx herd || "$opam" switch create herd "$ocaml" -j"$JOBS"
+  # shellcheck disable=SC2086
+  "$opam" install --switch herd -j"$JOBS" $pkgs
+  git_checkout "$HERD_GIT" "$HERD_COMMIT" "$src"
+  ( eval "$("$opam" env --switch herd --set-switch)" && cd "$src" \
+    && make all PREFIX="$dest" -j"$JOBS" && make install PREFIX="$dest" )
+}
+
+fetch_litmus() {
+  local dest="$here/../test/glt/upstream/litmus-tests-riscv"
+  if [[ -e "$dest/.fetched" && "$FORCE" != "1" ]]; then
+    echo "[litmus] already present ($dest) — skip (FORCE=1 to refetch)"
+    return 0
+  fi
+  git_checkout "$LITMUS_GIT" "$LITMUS_COMMIT" "$dest"
+  date -u +%FT%TZ > "$dest/.fetched"
+  echo "[litmus] done -> $dest"
+}
+
 build_one() {
   local name="$1" dest="$here/$1"
   if [[ -e "$dest/.fetched" && "$FORCE" != "1" ]]; then
@@ -143,10 +174,12 @@ targets=("$@")
 [[ ${#targets[@]} -eq 0 ]] && targets=(all)
 [[ "${targets[0]}" == "all" ]] && targets=(elf linux sail uv)
 [[ "${targets[0]}" == "debug" ]] && targets=(spike openocd gdb)
+[[ "${targets[0]}" == "glt" ]] && targets=(litmus herd)
 rc=0
 for t in "${targets[@]}"; do
   case "$t" in
-    spike|openocd|gdb) build_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
+    spike|openocd|gdb|herd) build_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
+    litmus) fetch_litmus || { echo "[$t] FAILED" >&2; rc=1; } ;;
     *) fetch_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
   esac
 done
