@@ -54,6 +54,8 @@ SPIKE_GAPS = {
                          "(and Sail) reserve as illegal",
     "miprobe/mi_vemul": "spike executes register-group encodings RVV reserves (EMUL, overlap, v0 rules) that "
                         "the configuration (and Sail) make illegal",
+    "mvprobe/mv_pmp_span": "spike checks PMP for a CBO on the byte at rs1 only; the configuration checks the "
+                           "whole cache block, as the CMO spec says",
 }
 
 
