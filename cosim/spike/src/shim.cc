@@ -294,6 +294,21 @@ const uint8_t* hc_get_vreg(void* h, unsigned t, unsigned i) {
   return static_cast<const uint8_t*>(vu.reg_file) + i * (vu.VLEN / 8);
 }
 
+// Translation state of hart t: satp (non-virtual), vsatp and hgatp MODE in
+// bits 3:0, 7:4 and 11:8, then mstatus.MPRV, MPV and MPP in bits 12, 13 and
+// 15:14.
+uint64_t hc_get_xlate(void* h, unsigned t) {
+  auto* st = S(h)->proc(t)->get_state();
+  const reg_t ms = st->mstatus->read();
+  uint64_t v = st->satp->readvirt(false) >> 60;
+  if (st->vsatp) v |= (st->vsatp->read() >> 60) << 4;
+  if (st->hgatp) v |= (st->hgatp->read() >> 60) << 8;
+  v |= uint64_t((ms & MSTATUS_MPRV) != 0) << 12;
+  v |= uint64_t((ms & MSTATUS_MPV) != 0) << 13;
+  v |= ((ms & MSTATUS_MPP) >> 11) << 14;
+  return v;
+}
+
 uint64_t hc_vlenb(void* h) { return S(h)->proc(0)->VU.VLEN / 8; }
 
 uint64_t hc_get_vcsr(void* h, unsigned t, unsigned which) {

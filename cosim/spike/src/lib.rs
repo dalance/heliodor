@@ -14,6 +14,7 @@ use std::io::Read;
 
 use veryl_component::*;
 
+mod cov;
 mod platform;
 use platform::ArchCfg;
 
@@ -89,6 +90,7 @@ unsafe extern "C" {
     fn hc_set_csr(h: *mut c_void, t: u32, addr: u32, v: u64);
     fn hc_get_vreg(h: *mut c_void, t: u32, i: u32) -> *const u8;
     fn hc_vlenb(h: *mut c_void) -> u64;
+    fn hc_get_xlate(h: *mut c_void, t: u32) -> u64;
     fn hc_get_vcsr(h: *mut c_void, t: u32, which: u32) -> u64;
     fn hc_step(h: *mut c_void, t: u32, irq: i32, dut: *const HcDutMem, out: *mut HcStep, flags: u64);
 }
@@ -363,6 +365,12 @@ struct Patched {
     rel: u64,
 }
 
+#[derive(Default)]
+struct CovPre {
+    vec: Option<(u64, u64, u64)>,
+    xlate: u64,
+}
+
 /// The `#[param]`s both component types take.
 struct Params {
     hex_file: Option<String>,
@@ -407,6 +415,9 @@ struct Engine {
     dram_size: u64,
     /// Coverage: traps by source mode, level and cause; mode changes.
     cov: std::collections::BTreeMap<String, u64>,
+    /// Functional coverage keys (HELIODOR_COV_DIR).
+    fcov: cov::Cov,
+    vlen: u64,
     /// Field LSBs within one record.
     offs: Vec<u32>,
 }
@@ -507,6 +518,9 @@ impl Engine {
             bail!("HEX_FILE is required");
         };
         self.load_hex(ctx, &path, 0, regions[0].size)?;
+        let stem = std::path::Path::new(&path).file_stem().map(|f| f.to_string_lossy().into_owned());
+        self.fcov = cov::Cov::new(&stem.unwrap_or_default());
+        self.vlen = vlenb * 8;
         if let Some(rom) = p.rom_hex.clone() {
             if map != "boot" {
                 bail!("ROM_HEX needs MAP = \"boot\"");
@@ -583,7 +597,76 @@ impl Engine {
         }
         let key = format!("irq {}>{}:{}", mode_name(s.priv_, s.virt), level_name(s.trap), cause);
         *self.cov.entry(key).or_default() += 1;
+        if self.fcov.on() {
+            self.fcov.trap(cause, cov::mode(s.priv_, s.virt), s.trap, true);
+        }
         Ok(())
+    }
+
+    /// The state before the step the coverage keys need: vtype, vl and
+    /// vstart for a vector op, the translation state for an access.
+    fn cov_pre(&self, t: u32, insn: u64) -> CovPre {
+        let h = self.spike.0;
+        let mut p = CovPre::default();
+        if cov::is_vector(insn) {
+            p.vec = unsafe { Some((hc_get_vcsr(h, t, 0), hc_get_vcsr(h, t, 1), hc_get_vcsr(h, t, 2))) };
+        }
+        if cov::mem_class(insn).is_some() {
+            p.xlate = unsafe { hc_get_xlate(h, t) };
+        }
+        p
+    }
+
+    fn cov_record(&mut self, r: &Rec, s: &HcStep, p: CovPre) {
+        let insn = r.get(field!("insn"));
+        let mode = cov::mode(s.priv_, s.virt);
+        let trap = s.trap != 0;
+        self.fcov.insn(s.insn, mode, s.trap, s.cause);
+        if trap {
+            self.fcov.trap(s.cause, mode, s.trap, false);
+        }
+        if let Some((vtype, vl, vstart)) = p.vec {
+            // A vset is keyed by the vtype and vl it sets.
+            let (vtype, vl) = if insn & 0x707f == 0x7057 && !trap {
+                (r.get(field!("vtype")), r.get(field!("vl")))
+            } else {
+                (vtype, vl)
+            };
+            self.fcov.vec(s.insn, vtype, vl, vstart, self.vlen, mode, trap);
+        }
+        let Some((class, size)) = cov::mem_class(insn) else { return };
+        let x = p.xlate;
+        let mprv = s.priv_ == 3 && x >> 12 & 1 != 0 && class != cov::MEM_HLV && class != cov::MEM_HSV;
+        let (eprv, evirt) = if mprv {
+            let mpp = x >> 14 & 3;
+            (mpp, if mpp == 3 { 0 } else { x >> 13 & 1 })
+        } else {
+            (s.priv_, s.virt)
+        };
+        let hyp = class == cov::MEM_HLV || class == cov::MEM_HSV;
+        let (eff, s1, g) = if hyp {
+            (7, x >> 4 & 15, x >> 8 & 15)
+        } else if eprv == 3 {
+            (cov::mode(3, 0), 15, 15)
+        } else if evirt != 0 {
+            (cov::mode(eprv, 1), x >> 4 & 15, x >> 8 & 15)
+        } else {
+            (cov::mode(eprv, 0), x & 15, 15)
+        };
+        let rmask = r.get(field!("mem_rmask"));
+        let wmask = r.get(field!("mem_wmask"));
+        let span = if !trap && (rmask | wmask) != 0 && class != cov::MEM_VLOAD && class != cov::MEM_VSTORE {
+            let va = r.get(field!("mem_vaddr"));
+            let n = 1u64 << r.get(field!("mem_size"));
+            Some((va & (n - 1) != 0, (va & 0xfff) + n > 0x1000, r.on(field!("mem_io"))))
+        } else {
+            None
+        };
+        let cause = if trap { Some(s.cause) } else { None };
+        self.fcov.mem(class, size, span, eff, s1, g, mprv, cause);
+        if class == cov::MEM_SC && !trap {
+            self.fcov.sc((insn >> 12) & 7, r.get(field!("rd_wdata")) != 0, mode);
+        }
     }
 
     fn step_flags(&self, r: &Rec) -> u64 {
@@ -770,8 +853,12 @@ impl Engine {
             rdata: r.get(field!("mem_rdata")),
             rdata_hi: r.get(field!("mem_rdata_hi")),
         };
+        let pre = if self.fcov.on() { Some(self.cov_pre(t, insn)) } else { None };
         let mut s = HcStep::default();
         unsafe { hc_step(h, t, -1, &dm, &mut s, self.step_flags(r)) };
+        if let Some(p) = pre {
+            self.cov_record(r, &s, p);
+        }
         if s.suppress_fail != 0 {
             errs.push("a pending interrupt could not be held off for this step".into());
         }
@@ -1124,6 +1211,9 @@ impl Engine {
         ));
         let cov: Vec<String> = self.cov.iter().map(|(k, n)| format!("{k}={n}")).collect();
         ctx.log(&format!("spike cosim coverage: {}", cov.join(", ")));
+        if let Err(e) = self.fcov.write(self.harts.len(), self.compared) {
+            ctx.log(&format!("spike cosim: coverage not written: {e}"));
+        }
         if self.compared == 0 {
             ctx.fail("spike cosim: no records compared");
         }
