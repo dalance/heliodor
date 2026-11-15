@@ -49,9 +49,6 @@ VEC_EXCLUDED = {
     "masked vfredusum/vfwredusum": "with no active element the result is implementation-defined: spike adds "
                                    "the additive identity (a NaN vs1[0] becomes the canonical NaN), the DUT "
                                    "copies vs1[0] (VFREDUSUM_NAN no_change)",
-    "PMP boundaries inside an aligned access (the privileged vector stream keeps them on 64 bytes, no NA4)":
-        "the DUT checks PMP on the first 4-byte word of an access only, so an entry matching part of it does "
-        "not fail it (test/directed/mv_pmp_span.S); spike follows the privileged spec",
     "vmv<nr>r.v while vill is set": "spike raises illegal-instruction (it checks vill), RVV says whole-register "
                                     "moves do not depend on vtype",
     "vector FP at SEW 16 other than the Zvfhmin conversions": "Zvfh is not implemented: only illegal",
@@ -1437,33 +1434,6 @@ class VecPrivGen(VecMixin, priv.PrivGen):
         self.v_mprv = False
         self.li(t, priv.MSTATUS_MPRV | priv.MSTATUS_SUM | priv.MSTATUS_MXR)
         self.emit(f"csrc mstatus, {gen.fx(t)}")
-
-    def t_pmp(self):
-        """priv.PrivGen.t_pmp with every boundary on 64 bytes (no NA4): an
-        aligned vector element never straddles one (see VEC_EXCLUDED)."""
-        r = self.r
-        lo, hi = priv.WIN_PA, priv.WIN_PA + priv.WIN_PAGES * 0x1000
-        cfg = 0
-        t = self.ch(self.pool)
-        for i in range(r.randrange(1, 8)):
-            m = r.choice(["off", "tor", "napot"] if i else ["off", "napot"])
-            if m == "napot":
-                sz = 1 << r.randrange(6, 15)
-                base = lo + r.randrange(0, (hi - lo) // sz) * sz
-                raw = (base >> 2) | ((sz >> 3) - 1)
-                a = 3
-            else:
-                raw = r.randrange(lo, hi + 1, 64) >> 2
-                a = 1 if m == "tor" else 0
-            perm = r.randrange(8)
-            cfg |= ((a << 3) | perm | (r.getrandbits(2) << 5 if self.p(0.1) else 0)) << (8 * i)
-            self.li(t, raw)
-            self.emit(f"csrw pmpaddr{i}, {gen.fx(t)}")
-        self.li(t, cfg)
-        self.emit(f"csrw pmpcfg0, {gen.fx(t)}")
-        self.emit("sfence.vma")
-        if self.p(0.3):
-            self.emit(f"csrr {gen.fx(self.xw())}, pmpaddr{r.randrange(8)}")
 
     def v_epilogue(self):
         if self.vs == 0:

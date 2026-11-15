@@ -74,6 +74,8 @@ PRIV_EXCLUDED = {
     "PMP lock bit, mseccfg": "a locked entry stays until reset and applies to M",
     "PTE writes without a covering fence": "which translation a stale TLB entry gives is implementation-defined",
     "misaligned accesses across a window boundary": "which part's fault is reported is implementation-defined",
+    "a PMP boundary inside the line of a CBO (window CBOs use the first line of each 512 bytes, which holds "
+    "none)": "spike checks PMP on the byte at rs1 only, the DUT on the whole cache block as the CMO spec says",
     "trigger CSRs": "breakpoints are a debug stream",
 }
 
@@ -137,6 +139,7 @@ class PrivGen(gen.Gen):
         self.pt = {}  # pa -> value
         self.pt_next = PT_PA
         self.adue = self.p(0.5)
+        self.pmp_b = []  # PA boundaries of the current PMP entries
 
     # Page tables.
     def alloc(self):
@@ -352,6 +355,10 @@ class PrivGen(gen.Gen):
         r = self.r
         if self.mode == 3 or not self.translated():
             base = WIN_PA
+            # An aligned dword across a 4-byte PMP boundary.
+            near = [b - 4 for b in self.pmp_b if b % 8 == 4 and base <= b - 4 < base + WIN_PAGES * 0x1000 - 8]
+            if size == 8 and near and self.p(0.2):
+                return self.ch(near)
             return base + r.randrange(0, WIN_PAGES * 0x1000 - size)
         sl = self.ch(self.slots)
         if sl.level == 0:
@@ -377,7 +384,9 @@ class PrivGen(gen.Gen):
                             ("amoswap.d", 8), ("amoor.b", 1), ("lr.d", 8), ("sc.w", 4), ("amocas.w", 4),
                             ("cbo.zero", 64), ("cbo.clean", 64), ("prefetch.w", 64)])
         a = addr_fn(size)
-        if op.startswith(("amo", "lr", "sc")) or size == 64:
+        if op.startswith("cbo"):
+            a &= ~0x1ff
+        elif op.startswith(("amo", "lr", "sc")) or size == 64:
             a &= ~(size - 1)
         elif self.p(0.7):
             a &= ~(size - 1)
@@ -549,24 +558,35 @@ class PrivGen(gen.Gen):
 
     # Top-level state changes.
     def t_pmp(self):
-        """Random PMP entries 0-7 over the window pages; entry 15 is the catch-all."""
+        """Random PMP entries 0-7 over the window pages; entry 15 is the
+        catch-all. No boundary falls inside the first line of 512 bytes."""
         r = self.r
         lo, hi = WIN_PA, WIN_PA + WIN_PAGES * 0x1000
         cfg = 0
         t = self.ch(self.pool)
+        self.pmp_b = []
+
+        def cbo_safe(b):
+            return b + 64 if b % 64 and b % 512 < 64 else b
+
         for i in range(r.randrange(1, 8)):
             m = r.choice(["off", "tor", "na4", "napot"] if i else ["off", "na4", "napot"])
             if m == "napot":
                 sz = 1 << r.randrange(3, 15)
                 base = lo + r.randrange(0, (hi - lo) // sz) * sz
+                if sz < 256 and base % 512 < 64:
+                    base += 128  # also keeps raw << 2, a TOR bound, out of the line
                 raw = (base >> 2) | ((sz >> 3) - 1)
                 a = 3
+                self.pmp_b += [base, base + sz, raw << 2]
             elif m == "na4":
-                raw = r.randrange(lo, hi, 4) >> 2
+                raw = cbo_safe(r.randrange(lo, hi, 4)) >> 2
                 a = 2
+                self.pmp_b += [raw << 2, (raw << 2) + 4]
             else:
-                raw = r.randrange(lo, hi + 1, 4) >> 2
+                raw = cbo_safe(r.randrange(lo, hi + 1, 4)) >> 2
                 a = 1 if m == "tor" else 0
+                self.pmp_b.append(raw << 2)
             perm = r.randrange(8)
             cfg |= ((a << 3) | perm | (r.getrandbits(2) << 5 if self.p(0.1) else 0)) << (8 * i)
             self.li(t, raw)
