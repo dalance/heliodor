@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Random instruction stream generator for the spike cosim (GR).
 
-    test/gr/gen.py --seed N [--length L] [--out DIR] [--no-build]
+    test/gr/gen.py --seed N [--length L] [--priv] [--out DIR] [--no-build]
 
 Writes DIR/gr_<seed>.S (default DIR test/gr/build) and, unless --no-build,
 assembles it with riscv64-unknown-elf-gcc into gr_<seed>.elf and the
@@ -22,6 +22,10 @@ trap handler counts each cause and resumes after the faulting instruction (or
 at a recorded resume point after a fetch fault).
 
 EXCLUDED lists what the generator never emits, with the reason.
+
+--priv writes grp_<seed> instead: a stream that moves between M, S and U with
+Sv39 paging, delegation, PMP and random CSR accesses (test/gr/priv.py, whose
+PRIV_EXCLUDED adds to EXCLUDED).
 """
 
 import argparse
@@ -849,15 +853,21 @@ def bin2hex(binp, hexp):
     Path(hexp).write_text("".join(f"{w:08X}\n" for w in words))
 
 
-def generate(seed, length, out, build=True):
-    """Write gr_<seed>.S (and .elf/.hex); returns (hex path, dynamic estimate)."""
+def generate(seed, length, out, build=True, priv=False):
+    """Write gr_<seed>.S or grp_<seed>.S (and .elf/.hex); returns (hex path,
+    dynamic estimate)."""
     out.mkdir(parents=True, exist_ok=True)
-    src, dyn = Gen(seed, length).build()
-    stem = out / f"gr_{seed}"
+    if priv:
+        import priv as privgen
+        src, dyn = privgen.PrivGen(seed, length).build()
+        stem, ld, march = out / f"grp_{seed}", HERE / "gr_priv.ld", MARCH + "_svinval"
+    else:
+        src, dyn = Gen(seed, length).build()
+        stem, ld, march = out / f"gr_{seed}", HERE / "gr.ld", MARCH
     Path(f"{stem}.S").write_text(src)
     if build:
-        subprocess.run([tool("gcc"), f"-march={MARCH}", "-mabi=lp64d", "-nostdlib", "-nostartfiles", "-static", "-Wl,--no-warn-rwx-segments",
-                        "-T", str(HERE / "gr.ld"), "-o", f"{stem}.elf", f"{stem}.S"], check=True)
+        subprocess.run([tool("gcc"), f"-march={march}", "-mabi=lp64d", "-nostdlib", "-nostartfiles", "-static", "-Wl,--no-warn-rwx-segments",
+                        "-T", str(ld), "-o", f"{stem}.elf", f"{stem}.S"], check=True)
         subprocess.run([tool("objcopy"), "-O", "binary", f"{stem}.elf", f"{stem}.bin"], check=True)
         bin2hex(f"{stem}.bin", f"{stem}.hex")
         os.unlink(f"{stem}.bin")
@@ -870,13 +880,19 @@ def main():
     ap.add_argument("--length", type=int, default=3000, help="dynamic instructions to aim for (default 3000)")
     ap.add_argument("--out", type=Path, default=HERE / "build")
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--priv", action="store_true", help="the privileged stream (test/gr/priv.py)")
     ap.add_argument("--excluded", action="store_true", help="print the exclusion table and exit")
     a = ap.parse_args()
     if a.excluded:
-        for k, v in EXCLUDED.items():
+        table = dict(EXCLUDED)
+        if a.priv:
+            import priv as privgen
+            table.pop("CSR writes other than fcsr/frm/fflags, xRET, privilege changes")
+            table.update(privgen.PRIV_EXCLUDED)
+        for k, v in table.items():
             print(f"{k}: {v}")
         return 0
-    hexp, dyn = generate(a.seed, a.length, a.out, not a.no_build)
+    hexp, dyn = generate(a.seed, a.length, a.out, not a.no_build, a.priv)
     print(json.dumps({"seed": a.seed, "hex": str(hexp), "dyn": dyn}))
     return 0
 

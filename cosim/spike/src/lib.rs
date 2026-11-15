@@ -765,7 +765,14 @@ impl Engine {
             errs.push(format!("virt dut={} ref={}", r.get(field!("virt")), s.virt));
         }
         if dtrap != (s.trap != 0) {
-            errs.push(format!("trap dut={dtrap} ref={} (ref cause={:#x} insn={:#x})", s.trap, s.cause, s.insn));
+            errs.push(format!(
+                "trap dut={dtrap} ref={} (dut cause={:#x} tval={:#x}, ref cause={:#x} insn={:#x})",
+                s.trap,
+                r.get(field!("cause")),
+                r.get(field!("tval")),
+                s.cause,
+                s.insn
+            ));
         } else if dtrap {
             // A double trap delivers cause 16 to M with the exception's cause
             // in mtval2; the record keeps the exception's cause.
