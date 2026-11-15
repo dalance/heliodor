@@ -1044,6 +1044,98 @@ ROB の head の load は、それより古い命令がすべて retire して�
 - N=1 の boot、GL-B、GA、GD4、GG、GV は回し直していない。N=1 には他の hart が無く、coherence の event は hart の間でしか起きないので、retire の流れは変わらない見込みである。
 - W2 6.6 の SMP N=4 (budget の余り 2.4 %) と W4 6.6 の SMP N=2 も回し直していない。
 
+### 9.11 MV 手順 5: カバレッジ (GCV) の記録 (2026-11-16)
+
+設計書 §MV の手順 5。記録のみで、RTL は変えていない。
+
+#### 機能カバレッジ
+
+集め方: spike cosim の component (`cosim/spike/src/cov.rs`) が、環境変数 `HELIODOR_COV_DIR` があるときだけ、照合した record ごとに詰めた key を数え、run の終わりに 1 個の JSON をそのディレクトリに書く。key は 5 種: 命令 (spike が fetch した生の命令語、mode、trap の level と cause)、vector (命令語、step の前の vtype、vl の類 (0、VLMAX 未満、VLMAX)、vstart ≠ 0)、memory access (類、大きさ、misaligned、page 跨ぎ、IO、MPRV を含めた実効 mode、第一段の MODE、G-stage の MODE、trap の cause)、SC の成否、trap (cause、元の mode、取った level、割込みか)。命令名は `test/gates/cov_report.py` が集計のときに pin した objdump (`-M no-aliases`) で付けるので、hot path は hash への加算だけである。代金: 4 本の N=1 boot (5.15、6.6、7.1、7.1v) の sim 時間は無しに比べて +0.9 %、+0.7 %、0.0 %、-6.3 % で、機械の負荷の揺れの中にある。生の key は全集合で 430 MB、集計は 15 s。
+
+集合 (W2、すべて照合の不一致 0): `cov_report.py run` が次を回す。
+
+| 集合 | run | record | wall |
+|---|---|---|---|
+| gc (`run_gc.py`、arch と directed の list、mv_probe を含む) | 366 | 715,187 | 69 s |
+| act (`run_act.py --cosim`、ACT4 の全 suite) | 3,738 | 71,034,345 | 1,400 s |
+| gr / grp / grv / grvp / grh / grvh (`run_gr.py` の既定の seed) | 53 / 305 / 505 / 505 / 405 / 405 | 0.32 M / 5.15 M / 2.59 M / 9.79 M / 11.27 M / 12.14 M | 28 / 259 / 262 / 523 / 381 / 454 s |
+| boot (`test_cosim_spike_w2_linux_boot*`、5.15、6.6、7.1、7.1v) | 4 | 52,475,097 | 792 s |
+
+ACT の 3 本の fail (act_sm/mcsr_cntr_00、act_zkt/ZktZca_c_subw_00、act_zkt/ZktZcb_c_not_00) は手順 2 と同じ既知の DUT の GA fail で、照合の不一致は無い。
+
+実装した宇宙: 命令は GR の表 (`gen.MNEMONICS`、`priv.PRIV_MNEMONICS`、`hyp.HYP_MNEMONICS`、`vec.VEC_MNEMONICS`) に生成器が出さない実装済みの命令 (wrs.nto、wrs.sto、dret、c.addi16sp) を足した 982 個。CSR は `csr_pkg::csr_exists` の 217 個。trap は構成の委譲の規則 (medeleg と hedeleg の書込み可能 bit、cause ごとに起こり得る元の mode) から作った例外 147 組と割込み 69 組で、構造上起きないもの (`TRAP_UNREACHABLE`: IALIGN 16 の cause 0、M の fetch の page fault、V = 0 の fetch の guest-page fault、Zicfiss の cause 18、cause 19、GEILEN 0 の SGEI) は除いた。vtype は vector の類ごとに合法な SEW × LMUL (widening、FP、変換、segment の EMUL と NFIELDS の規則) の 316 cell。memory は 12 類 × (M、HS/U の Bare と Sv39、VS/VU の Bare と Sv39 × Bare と Sv39x4、HLV/HSV の 4 組) の 138 組。
+
+結果 (fill の後):
+
+| 軸 | 結果 |
+|---|---|
+| 命令 (trap せずに実行) | 981/982。mode 別 M 980、HS 968、U 970、VS 903、VU 888。命令の類 (int、int-mem、fp、fp-mem、amo、lr/sc、cmo、fence、csr、ecall/ebreak、xret、wait、sfence、hfence、hlv/hsv、vector、vector-mem) × 実行できる mode の穴は 0 |
+| 例外 (cause × 元の mode × level) | 147/147 |
+| 割込み | 69/69 (fill の前は 63/69) |
+| CSR | 217/217 に access、特権の低い mode からの拒否 (illegal か virtual) は該当する全 CSR で出た。書込み、set、clear の無い CSR は 19 個 (下の宣言) |
+| vtype | 316/316。どの類も ta/ma の 4 組と vl の 3 類が出た。vstart ≠ 0 の実行は load/store と vset だけ (算術は vstart ≠ 0 で illegal) |
+| memory | 138/138。misaligned の実行は load、store、fload、fstore、hlv、hsv、page 跨ぎは load、store、fload、fstore、IO は load と store。SC は 5 mode すべてで成功と失敗 |
+
+穴と決定:
+
+| 穴 | 決定 |
+|---|---|
+| csrrs/csrrc の無い pmpcfg0/2、pmpaddr0-15、tselect、srmcfg、scountinhibit (srmcfg と scountinhibit は csrrw も無い) | (a) directed `mv_csr_rmw` (M で set と clear をして読み戻す) |
+| M 外部割込み (cause 11) を M、HS、U、VS、VU から、VS 外部割込みを VU から VS へ (9:VU>VS) | (a) directed `mv_mei_modes` (harness が PLIC の source 1-5 を 1 回 pulse し、source k を 1 つずつ有効にして各 mode で待つ。最後は hideleg.VSEI と hvip.VSEIP で VU から VS に取らせ、VS の handler が ecall で M に戻る)。list の `irq=0x3e` |
+| dret、dcsr、dpc、dscratch0/1 | (b) Debug Mode だけで実行できる。Debug Mode の gate (`md_dbg*` の dmi 項目) は cosim の対象外 (`cosim_ok`) で、native の G0 と GD4 で覆う |
+| siselect、sireg*、vsiselect、vsireg*、miselect の書込み | (b) spike-gap。それを書く `mi_csrind` は `run_gc.py` の SPIKE_GAPS (spike の Smcdeleg の sireg が読出し専用の hpmcounter に化ける) で、native の G0 (W2/W4) が覆う |
+| segment の mnemonic の一部 × VS/VU (VS 79、VU 94 の不足の大半)、c.addi16sp × VS/VU | (b) 標本の偏り。mode が変えるのは翻訳と権限で、類 × mode と類 × 翻訳の軸は埋まっている。GR は sp を書かない (`EXCLUDED`) |
+| leaf の page の大きさ | 集めていない。spike の公開 API は leaf の level を出さない。GR の priv/hyp は 4 KiB、2 MiB、1 GiB、NAPOT の leaf を構造として作る |
+
+fill の 2 本は W2/W4 の native と cosim で pass し、G0 は 860 passed、0 failed (856 と 2 本 × W2/W4)。`.insn` と出た 11 語は reserved な field を持つ FENCE/FENCE.I (ACT が出す) で、基本の形として実行されるので fence と fence.i に数えた。`mv_pmp_span` は cosim で cbo.zero の PMP の検査が spike (rs1 の 1 byte だけを見る) と違って落ちるので、`run_gc.py` の SPIKE_GAPS に足した (手順 4c の修正で gate list に入った後、`run_gc.py` を回していなかった)。
+
+#### 構造カバレッジ (W2)
+
+`sim/verilator/run_cov.py` が `veryl build` の出力から Verilator 5.050 (`-O1`、`--coverage-line --coverage-toggle`、HELIODOR_CHK なし、1 thread) で 2 つの top を作る。build はそれぞれ約 2.5 分。
+
+- arch: `tb_cov_arch_w2.sv` (arch harness を 1 つの binary にし、作業 dir の `cur.hex` を読む)。`run_gc.py` の既定の list の single-hart の 365 本 (割込み、mtime、dmi、tohost ≠ 1024 の項目を除く) と、ACT の各 suite から 12 本に 1 本の 372 本、計 737 本がすべて pass。38,119,616 cycles、6 並列で 2,833 s。
+- boot: `tb_soc_linux_boot_w2.sv` の 5.15 N=1。14,617,653 cycles (native と同じ)、instret 10,429,948、5,420 s (約 2.7k cy/s)。
+
+GR は時間の都合で入れていない。ACT の全 suite (約 3,700 本、coverage 付きで約 2.2k cy/s) は約 10 倍かかるので 1/12 の標本にした。coverage の点は source の file、行、列、信号で数え、arch と boot の top が同じ module を別の名前に特殊化したものや複数の instance を 1 つにまとめる。tb/、src/v14/、Verilator の library は数えない。
+
+合計: line 5,842/6,393 (91.4 %)、toggle 232,062/311,604 (74.5 %)。boot が arch に足したのは line 4 点と toggle 1.3 pt (arch だけでは 91.3 %、73.2 %)。
+
+主な module:
+
+| module | line | toggle |
+|---|---|---|
+| vector_unit | 801/810 (98.9 %) | 41,261/44,278 (93.2 %) |
+| heliodor_core | 56/56 | 20,433/29,626 (69.0 %) |
+| csr | 373/385 (96.9 %) | 6,214/16,730 (37.1 %) |
+| rob | 77/77 | 11,501/12,610 (91.2 %) |
+| heliodor_soc_smp | 154/154 | 3,870/10,474 (36.9 %) |
+| dcache | 230/236 (97.5 %) | 7,186/10,384 (69.2 %) |
+| ptw | 169/175 (96.6 %) | 6,066/9,846 (61.6 %) |
+| mem_pipe | 134/134 | 7,064/8,572 (82.4 %) |
+| fpu_wrap | 298/630 (47.3 %) | 4,955/7,598 (65.2 %) |
+| sq / lq | 96/96、63/63 | 83.7 %、75.2 % |
+| commit | 141/144 (97.9 %) | 4,980/6,774 (73.5 %) |
+| mem_ctrl | 208/212 (98.1 %) | 2,727/6,500 (42.0 %) |
+| icache / extract / iq | 100 %、98.4 %、100 % | 85.9 %、81.7 %、93.1 % |
+| l2cache | 145/160 (90.6 %) | 1,538/4,288 (35.9 %) |
+| decode | 44/73 (60.3 %) | 537/546 (98.4 %) |
+| decoder | 358/398 (89.9 %) | 476/480 (99.2 %) |
+| fp_divider / fp_sqrt | 70.0 % / 73.9 % | 76.3 % / 80.5 % |
+| dm / dm_sba / dm_abs / dmi_apb | 96.8 %、97.1 %、80.0 %、90.0 % | 9.8 %、1.6 %、2.9 %、0.8 % |
+| plic | 27/31 (87.1 %) | 283/1,000 (28.3 %) |
+
+line 80 % か toggle 50 % を下回る module と主な理由:
+
+- fpu_wrap (line 47 %): VU の中の 1 instance だけが使う共有の block で、scalar の FP は新コアの FU が実行する。覆われない行は FROUND、FCVT.L/LU.S などの scalar 専用の op と、その丸めの arm である。
+- decode (line 60 %)、decoder (90 %)、sb などの関数の中の行: case の arm の `return` は、機能として必ず通る arm (BNE、FMV.W.X の判定など) も Verilator の line coverage では未到達と出る。関数を inline した後の数え方によるもので、toggle はほぼ 100 % である。
+- fp_divider、fp_sqrt (line 70-74 %): 丸めの mode ごとの overflow の結果と丸め上げの arm。scalar の `fu_fdiv` と VU の `fpu_wrap` の instance を合わせても届いていない。ACT の FP の suite は 12 本に 1 本の標本で、GR は入れていないので、標本の穴と見る (機能カバレッジは丸めの mode を数えていない)。
+- csr、xlate_ctx、dcache_tagbank (toggle 29-39 %): 64 bit の CSR と root PPN、tag の上位 bit。WARL の固定 bit、counter の上位 bit、DRAM の窓が狭いことによる PA の上位 bit は 1 度も変わらない。
+- heliodor_soc_smp、heliodor_core_w、memory_bus、mem_ctrl、l2cache、islot_arb (toggle 35-49 %): 外部の bus と L2 の address と ID の上位 bit、N=1 なので他の hart の側の信号。
+- dm、dm_sba、dm_abs、dmi_apb (toggle 1-10 %): Debug Module。DMI の gate はこの集合に無い (MD の GD4 が覆う)。
+- plic (toggle 28 %): 31 の source のうち使うのは数本。
+
+再現: `test/gates/cov_report.py run` (既定で全集合、`--sets` で選ぶ、出力は `.build/cov/report.json` と `summary.txt`) と `cov_report.py report` (集計だけ)。構造は `veryl build` の後に `sim/verilator/run_cov.py build arch`、`build boot`、`arch --every 12 --jobs 6`、`boot`、`report` (出力は `.build/cov_rtl/summary.txt` と `modules.json`)。どちらも出力は gitignore の下に置く。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
