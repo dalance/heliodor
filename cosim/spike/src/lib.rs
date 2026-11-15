@@ -311,6 +311,22 @@ struct HartState {
     intr_next: bool,
     /// An interrupt the DUT took, checked with the handler's first record.
     irq_pending: Option<(u64, u64, u64)>,
+    /// (priv, virt) of the last record.
+    last_mode: Option<(u64, u64)>,
+}
+
+fn mode_name(prv: u64, virt: u64) -> &'static str {
+    match (prv, virt) {
+        (3, _) => "M",
+        (1, 0) => "HS",
+        (1, _) => "VS",
+        (0, 0) => "U",
+        _ => "VU",
+    }
+}
+
+fn level_name(trap: u64) -> &'static str {
+    ["-", "M", "HS", "VS"][trap.min(3) as usize]
 }
 
 /// An AMO with rd = x0 whose old value its store does not determine (and,
@@ -389,6 +405,8 @@ struct Engine {
     vec_misaligned: bool,
     vec_wholereg_misaligned: bool,
     dram_size: u64,
+    /// Coverage: traps by source mode, level and cause; mode changes.
+    cov: std::collections::BTreeMap<String, u64>,
     /// Field LSBs within one record.
     offs: Vec<u32>,
 }
@@ -563,6 +581,8 @@ impl Engine {
                 s.trap, s.cause, s.pc
             ));
         }
+        let key = format!("irq {}>{}:{}", mode_name(s.priv_, s.virt), level_name(s.trap), cause);
+        *self.cov.entry(key).or_default() += 1;
         Ok(())
     }
 
@@ -763,6 +783,17 @@ impl Engine {
         }
         if r.on(field!("virt")) != (s.virt != 0) {
             errs.push(format!("virt dut={} ref={}", r.get(field!("virt")), s.virt));
+        }
+        let mode = (s.priv_, s.virt);
+        if let Some(last) = self.harts[t as usize].last_mode.replace(mode) {
+            if last != mode {
+                let key = format!("mode {}>{}", mode_name(last.0, last.1), mode_name(mode.0, mode.1));
+                *self.cov.entry(key).or_default() += 1;
+            }
+        }
+        if s.trap != 0 {
+            let key = format!("trap {}>{}:{}", mode_name(mode.0, mode.1), level_name(s.trap), s.cause & 0x3f);
+            *self.cov.entry(key).or_default() += 1;
         }
         if dtrap != (s.trap != 0) {
             errs.push(format!(
@@ -1091,6 +1122,8 @@ impl Engine {
             smp,
             if self.at_tohost { ", stopped at the tohost store" } else { "" }
         ));
+        let cov: Vec<String> = self.cov.iter().map(|(k, n)| format!("{k}={n}")).collect();
+        ctx.log(&format!("spike cosim coverage: {}", cov.join(", ")));
         if self.compared == 0 {
             ctx.fail("spike cosim: no records compared");
         }
