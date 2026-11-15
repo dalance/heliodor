@@ -75,7 +75,6 @@ PRIV_EXCLUDED = {
     "PTE writes without a covering fence": "which translation a stale TLB entry gives is implementation-defined",
     "misaligned accesses across a window boundary": "which part's fault is reported is implementation-defined",
     "trigger CSRs": "breakpoints are a debug stream",
-    "H, V": "separate streams",
 }
 
 
