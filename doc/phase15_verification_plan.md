@@ -1136,6 +1136,62 @@ line 80 % か toggle 50 % を下回る module と主な理由:
 
 再現: `test/gates/cov_report.py run` (既定で全集合、`--sets` で選ぶ、出力は `.build/cov/report.json` と `summary.txt`) と `cov_report.py report` (集計だけ)。構造は `veryl build` の後に `sim/verilator/run_cov.py build arch`、`build boot`、`arch --every 12 --jobs 6`、`boot`、`report` (出力は `.build/cov_rtl/summary.txt` と `modules.json`)。どちらも出力は gitignore の下に置く。
 
+### 9.12 MV 手順 6: 公式 litmus (GLT) の記録 (2026-11-16)
+
+設計書 §MV の手順 6。RTL は変えていない。
+
+#### 取得物とモデルの許す結果
+
+- litmus 群: litmus-tests-riscv (`08728edc`) を `toolchain/fetch.sh glt` が `test/glt/upstream/` (gitignore) に clone する。`tests/to-AArch64` を除く 7,939 本。
+- モデル: herdtools7 7.58 (`1ca343e1`) を同じ `fetch.sh glt` が build する (pin した opam 2.3.0 の binary、OCaml 4.14.2、dune 3.25.0、menhir 20260209、zarith 1.14 を `toolchain/herd/opam` に入れる)。`test/glt/run_glt.py herd` が全 test に `herd7 -model riscv.cat` (mixed-size の dir は `-variant mixed`) をかけ、出力を `test/glt/build/herd/` に置く (16 並列で約 30 s)。許す結果は herd が出す `States` の列 (条件と locations の変数への射影) である。
+- 照合: suite が持つ herd の結果 (`model-results/herd.logs`) と herd の hash が同じ 3,384 本で、7.58 の結果と変数と状態の集合が完全に一致した。
+
+#### 選別
+
+`run_glt.py list [--set full] [-v]`。名前が同じで中身も同じ test (diy の別の conf が同じ test を出したもの) は 1 本にまとめる。
+
+| 区分 | 本数 | 理由 |
+|---|---|---|
+| 実行 (full) | 4,041 | N=2 (1-2 thread) 1,794、N=4 (3-4 thread) 2,247 |
+| Zalasr | 3,406 | `lw.aq`/`sw.rl` などの load-acquire/store-release を使う。heliodor は Zalasr を実装していない |
+| 重複 | 455 | 別の path の同じ test |
+| 配列の location | 12 | `uint8_t x[128]` などの misaligned の mixed-size。どれも herd が受け付けない種類 |
+| 64 bit の mixed-size | 9 | herd の `-variant mixed` は値を 32 bit で持つ (上位語への store の後の `ld` を 0 と出す、LR-SC-mixed1/2 で確認)。許す集合が信用できない |
+| filter 節 | 8 | herd は filter を通った状態しか出さない |
+| herd が拒否 | 6 | misaligned の access (4)、`jalr x0` の構文 (2、ctrlind) |
+| unrolling 上限 | 1 | Andy27 (loop)、許す集合が欠けうる |
+| 観測なし | 1 | `forall true` の 1 命令 test |
+
+Ztso を要する test、Zacas を使う test は suite に無い。`fence.tso` (81 本の FENCE.TSO family と SINGLE_INST) は基本 ISA なので回す。`.aq.rl` の AMO と LR/SC は GNU as の `.aqrl` に書き換える。
+
+family 別の実行本数 (full、N は SoC の hart 数): AMO_X0_2_THREAD 111 (N=2)、ATOMICS 236 (N=2) + 292 (N=4)、BASIC_2_THREAD 36、CO 32 + 24、FENCE.TSO 81、HAND 109 + 11、RELAX 1,021、SAFE 57 + 1,461、SF_THESIS 103 + 458、SINGLE_INST 2、mixed-size/HAND 2、mixed-size/SF_THESIS 4 + 1。既定の集合は小さい family と手書きの family を全部、大きい生成 family (RELAX、SAFE、ATOMICS、SF_THESIS) を path の hash で 16 本に 1 本取ったもの (N=2 460 本、N=4 173 本)。
+
+#### 変換と harness (`test/glt/conv.py`)
+
+- 1 本の program に 20 本の test を入れ、全 hart が 0x8000_0000 から M-mode で走る。test ごとに反復 (既定の集合 100 回、full は N=2 100 回、N=4 50 回)。反復ごとに hart 0 が location を初期値に戻し (location ごとに別の 64 B line、0x8000_8000 から)、sense 反転の barrier で全 hart を放つ。各 hart は 16 bit の LFSR で 0-63 回の遅延 loop を回し (barrier を最後に抜けた hart は先に走り出すので 16 回足す。BASIC_2_THREAD の分布を見て決めた)、thread が触るレジスタを 0 にして初期値を入れ、thread の命令をそのまま実行し、観測されるレジスタを hart の文脈領域に書く。harness の状態 (反復数、LFSR、barrier の sense) は文脈領域に退避し、thread が使わないレジスタで戻す。
+- 2 回目の barrier の後、hart 0 が最終のメモリ値と他の hart のレジスタを読み、変数ごとに「herd がその変数に許す値の列の中の番号 (無ければ escape)」を 64 bit の key の field に詰め、test の許す状態の key の表で数える。表に無い key は禁止された結果で、異なる 4 個まで数え、最初の 1 回の生の値を残す。終わりに hart 0 が全表を UART に出し、禁止された結果が無ければ tohost = 1、あれば 3、どの hart の trap でも cause と epc を出して 5 を書く。
+- `run_glt.py run` が表を herd の状態に戻して照合し、禁止された結果、反復数と結果の数の食い違い、trap、表の欠落を fail にする。許すが一度も出ない状態は数えるだけ。
+- 陰性の対照: SB の (0,0) と 2+2W の (x=1,y=1) を許す集合から抜いた program は、W2 N=2 の 200 回で SB 16 回、2+2W 11 回を表に無い結果として検出し、最初の生の値を正しく残し、tohost = 3 で fail した。
+
+#### 結果 (すべて禁止された結果 0、trap 0、`fell_back` 0)
+
+| 集合 | core | N | test | 反復 | 禁止 | 許すが未観測の状態 (test 数) | cycles | sim | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| 既定 | W2 | 2 | 460 | 100 | 0 | 1,446 / 2,767 (315) | 27.9 M | 3,270 s | 307 s |
+| 既定 | W2 | 4 | 173 | 100 | 0 | 1,566 / 3,162 (147) | 12.4 M | 4,620 s | 960 s |
+| 既定 | W4 | 2 | 460 | 100 | 0 | 1,444 / 2,767 (312) | 27.4 M | 11,051 s | 1,259 s |
+| 既定 | W4 | 4 | 173 | 100 | 0 | 1,575 / 3,162 (147) | 12.3 M | 11,954 s | 2,232 s |
+| full | W2 | 2 | 1,794 | 100 | 0 | 5,969 / 11,165 (1,347) | 118.6 M | 13,505 s | 966 s |
+| full | W2 | 4 | 2,247 | 50 | 0 | 25,343 / 43,436 (1,936) | 89.0 M | 37,908 s | 2,698 s |
+| full | W4 | 2 | 1,794 | 100 | 0 | 5,906 / 11,165 (1,349) | 116.5 M | 49,598 s | 3,397 s |
+| full | W4 | 4 | 2,247 | 50 | 0 | 25,552 / 43,436 (1,980) | 87.6 M | 97,355 s | 6,785 s |
+
+full の 4 構成の wall の合計は約 3.8 h (W4 N=4 が 1.9 h)。wall は 1 回の `veryl test` (program を並列に走らせる) の時間で、この共有の機械の負荷で揺れる。反復あたり約 600 cycles (N=2) と 720 cycles (N=4)。sim の速度は W2 N=2 約 8.5k cy/s、W2 N=4 約 2.7k cy/s、W4 N=2 約 2.5k cy/s、W4 N=4 約 1.0k cy/s。
+
+未観測が多いのは、状態の数が多い 3/4 thread の test (ATOMICS の N=4 は 19,062 状態中 15,488) と、このコアで出ない弱い結果である。BASIC_2_THREAD の古典 6 本では、SB の弱い結果 (0,0) だけが出て (W2 full で 100 回中 11 回、W4 full で 8 回)、MP、LB、R、S、2+2W の弱い結果は W2/W4 のどの run でも出ない。未観測は記録のみで、ゲートは禁止された結果 0 である。
+
+再現: `toolchain/fetch.sh glt` (dune が socket を使うので sandbox の外)、`test/glt/run_glt.py herd`、`VERYL=... VERYL_AOT_C_ASYNC=0 test/glt/run_glt.py run --core w2|w4 --harts 2|4 [--set full]` (sandbox の外)。出力は `.build/glt/<core>_n<N>_<set>.{json,err,results.json}`。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
