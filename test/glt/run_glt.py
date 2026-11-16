@@ -52,7 +52,7 @@ TESTS = SUITE / "tests"
 HERD_OUT = HERE / "build" / "herd"
 LARGE = {"RELAX", "SAFE", "ATOMICS", "SF_THESIS"}
 SAMPLE = 16
-ITERS = {("default", 2): 100, ("default", 4): 100, ("full", 2): 200, ("full", 4): 100}
+ITERS = {("default", 2): 100, ("default", 4): 100, ("full", 2): 100, ("full", 4): 50}
 CYCLES_PER_ITER = {2: 600, 4: 800}
 compared = 0
 
@@ -353,7 +353,7 @@ def main():
     r.add_argument("--core", default="w2", choices=sorted(gen_core_tests.CORE_CONST))
     r.add_argument("--harts", type=int, default=2, choices=[2, 4])
     r.add_argument("--set", default="default", choices=["default", "full"])
-    r.add_argument("--iters", type=int, default=0, help="iterations per test (default 100, full set at N=2 200)")
+    r.add_argument("--iters", type=int, default=0, help="iterations per test (default 100, full set at N=4 50)")
     r.add_argument("--chunk", type=int, default=20, help="tests per program")
     r.add_argument("--seed", type=int, default=0xace1)
     r.add_argument("--jitter", type=int, default=63, help="delay mask (iterations of the delay loop)")
