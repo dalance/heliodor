@@ -11,8 +11,7 @@ Sets (SETS): gc = run_gc.py (the arch and directed lists, mv_probe included),
 act = run_act.py --cosim (all ACT4 suites), gr/grp/grv/grvp/grh/grvh =
 run_gr.py with its default seeds (scalar, privileged, vector, vector +
 privileged, H, H + vector), boot = the N=1 boots under the cosim (5.15, 6.6,
-7.1, 7.1v). Needs
-SPIKE_HOME, as the runners do.
+7.1, 7.1v). Needs SPIKE_HOME, as the runners do.
 
 `report` merges <out>/raw/*/ into <out>/report.json and <out>/summary.txt:
 instructions by mnemonic and mode, traps by cause, source mode and handling

@@ -132,7 +132,8 @@ impl ArchCfg {
     /// then every multi-letter extension spike models. Sm is the base
     /// machine mode; the Sv modes are set by max_vaddr_bits; spike always
     /// has Sdtrig (its trigger count is set apart) and does not know
-    /// Svrsw60t59b (two PTE bits it leaves reserved, which no image sets).
+    /// Svrsw60t59b (it faults on the two PTE bits, so the tests that set them
+    /// are not run under the cosim).
     pub fn spike_isa(&self) -> String {
         let letters = self.letters();
         let mut s = String::from("rv64");
@@ -167,7 +168,7 @@ impl ArchCfg {
         p
     }
 
-    /// Sv39 is the widest translation mode heliodor implements.
+    /// Spike's max_vaddr_bits: the widest Sv mode of the configuration.
     pub fn max_vaddr_bits(&self) -> u64 {
         if self.has("Sv57") {
             57

@@ -19,12 +19,11 @@ skipped. `boot` runs the boot from the project root. Both log pass/fail per
 run under .build/cov_rtl/.
 
 Each arch run's coverage file is folded into .build/cov_rtl/arch.dat and
-deleted (one file is over 100 MB). `report` merges arch.dat and boot.dat and
-writes line and toggle summaries per source module (summary.txt,
-modules.json): a point counts as covered if any instance or
-specialization covered it, and only design sources count (not tb/, src/v14/ or Verilator's
-library),
-and modules under the thresholds are listed.
+deleted, as each run writes a large one. `report` merges arch.dat and
+boot.dat and writes line and toggle summaries per source module
+(summary.txt, modules.json): a point counts as covered if any instance or
+specialization covered it, only design sources count (not tb/, src/v14/ or
+Verilator's library), and modules under the thresholds are listed.
 """
 
 import argparse
