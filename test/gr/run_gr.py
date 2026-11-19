@@ -4,6 +4,7 @@
     test/gr/run_gr.py [--core w2|w4] [--priv | --hyp] [--vec] [--seeds 1-50] [--length 3000]
                       [--long 1001-1003] [--long-length 30000]
                       [--batch N] [--log-dir DIR] [--keep] [--no-run]
+    test/gr/run_gr.py --fixed test/gr/fixed.list [--only NAME,...] [--batch N] [--log-dir DIR]
 
 Generates and assembles one program per seed into test/gr/build/, writes the
 `#[ignore]` wrappers tb/test_gc_<core>_gr.veryl (gen_core_tests.py --cosim
@@ -25,6 +26,12 @@ report, the records compared and the sim time per seed, and the cosim's
 coverage summed over the seeds: traps by source mode, handler level and
 cause, interrupts, and mode changes (with --hyp also the H causes and mode
 changes no program reached).
+
+--fixed runs every row of a seed-set file (test/gr/fixed.list: the fixed set
+rerun as a whole) and also requires each row's total record count to
+equal the one the file records; the file names the commit of the generator
+the counts came from, and a warning is printed if the generator has changed
+since.
 
 Exit code 0 only if every program passes.
 """
@@ -87,7 +94,59 @@ def main():
     ap.add_argument("--log-dir", type=Path, default=MASTER / ".build" / "run_gr")
     ap.add_argument("--keep", action="store_true", help="keep the generated wrappers (renamed per batch)")
     ap.add_argument("--no-run", action="store_true", help="generate, build and count only")
+    ap.add_argument("--fixed", type=Path, help="run the seed sets of this file (test/gr/fixed.list)")
+    ap.add_argument("--only", default="", help="with --fixed: comma-separated row names")
     a = ap.parse_args()
+    if a.fixed:
+        return run_fixed(a)
+    return run(a)[0]
+
+
+GENERATOR = ["gen.py", "priv.py", "vec.py", "hyp.py", "gr.ld", "gr_priv.ld"]
+
+
+def run_fixed(a):
+    """One run() per row of the --fixed file; each row must pass and match its
+    record count."""
+    rows, commit = [], None
+    for line in a.fixed.read_text().splitlines():
+        f = line.split("#", 1)[0].split()
+        if not f:
+            continue
+        if f[0] == "generator":
+            commit = f[1]
+            continue
+        name, core, kind, seeds, length, long_, long_length, records = f
+        rows.append((name, core, kind, seeds, int(length), "" if long_ == "-" else long_, int(long_length),
+                     int(records)))
+    if commit:
+        files = [str((HERE / g).relative_to(MASTER)) for g in GENERATOR]
+        if subprocess.run(["git", "diff", "--quiet", commit, "--", *files], cwd=MASTER).returncode:
+            print(f"run_gr: WARNING the generator differs from {commit}: the programs and counts may not match",
+                  file=sys.stderr)
+    only = {s for s in a.only.split(",") if s}
+    summary, rc = [], 0
+    for name, core, kind, seeds, length, long_, long_length, want in rows:
+        if only and name not in only:
+            continue
+        r = argparse.Namespace(**vars(a))
+        r.core, r.seeds, r.length, r.long, r.long_length = core, seeds, length, long_, long_length
+        r.priv, r.vec, r.hyp = "p" in kind, "v" in kind, "h" in kind
+        r.log_dir = a.log_dir / name
+        print(f"run_gr: --- {name}: {core} {kind} seeds {seeds} @{length} long {long_ or '-'} @{long_length}",
+              flush=True)
+        code, n_pass, n, recs = run(r)
+        ok = code == 0 and (a.no_run or recs == want)
+        rc |= not ok
+        summary.append(f"{name}: {'pass' if ok else 'FAIL'} {n_pass}/{n}, records {recs} (expected {want})")
+    for s in summary:
+        print(s)
+    return 1 if rc else 0
+
+
+def run(a):
+    """Generate, run and judge one seed set; returns (exit code, passed,
+    programs, records)."""
     if a.seeds is None:
         a.seeds = "1-400" if a.hyp else "1-500" if a.vec else "1-300" if a.priv else "1-50"
     if a.long is None:
@@ -98,7 +157,7 @@ def main():
     progs = [(s, a.length) for s in seed_list(a.seeds)] + [(s, a.long_length) for s in seed_list(a.long)]
     if len({s for s, _ in progs}) != len(progs):
         print("run_gr: a seed is listed twice", file=sys.stderr)
-        return 2
+        return 2, 0, 0, 0
     out = HERE / "build"
     entries, cover = [], collections.Counter()
     for seed, length in progs:
@@ -124,7 +183,7 @@ def main():
     if missing:
         print(f"never generated: {' '.join(missing)}")
     if a.no_run:
-        return 0
+        return 0, 0, len(entries), 0
 
     tb = MASTER / "tb"
     path = tb / f"test_gc_{a.core}_{suite}.veryl"
@@ -152,7 +211,7 @@ def main():
         except json.JSONDecodeError:
             print(f"run_gr: veryl exited {p.returncode} without a JSON report, see {a.log_dir}/{a.core}.{b}.err",
                   file=sys.stderr)
-            return 2
+            return 2, 0, len(entries), 0
         tests += rep.get("tests", [])
         fell = sum(d.get("fell_back", 0) for d in rep.get("dispatch", []))
         if fell:
@@ -198,7 +257,7 @@ def judge(a, entries, tests):
     print(f"total pass {n_pass}/{len(entries)}, {recs} records, sim {sim:.0f}s")
     for b in bad:
         print(b)
-    return 0 if n_pass == len(entries) else 1
+    return 0 if n_pass == len(entries) else 1, n_pass, len(entries), recs
 
 
 if __name__ == "__main__":
