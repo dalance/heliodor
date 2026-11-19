@@ -24,6 +24,11 @@
     .section .text.init
     .globl _start
 _start:
+    # PMP: one NAPOT entry over the whole space, RWX, so S/U may access.
+    li   t0, -1
+    csrw pmpaddr0, t0
+    li   t0, 0x1f
+    csrw pmpcfg0, t0
     # ---- Phase A: STIP gating with STCE = 0 ----
     csrw    MENVCFG, x0             # STCE = 0 (Sstc disabled)
     csrw    STIMECMP, x0            # stimecmp = 0 (mtime exceeds it at once)

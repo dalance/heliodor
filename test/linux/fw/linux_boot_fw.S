@@ -75,6 +75,23 @@ _start:
     /* Disable interrupts during init */
     csrw mie, zero
 
+    /* PMP: one NAPOT entry over the whole address space, RWX. An S/U access
+     * that matches no entry fails, so every hart sets this before any mret
+     * to S (the HSM restart paths reuse it). The block is 32 bytes, the
+     * largest fetch block, so the code after it keeps its offset within an
+     * uncached ROM fetch and its cost per pass. */
+    .option push
+    .option norvc
+    li t0, -1
+    csrw pmpaddr0, t0
+    li t0, 0x1f
+    csrw pmpcfg0, t0
+    nop
+    nop
+    nop
+    nop
+    .option pop
+
     /* Save hartid for later (s11 is callee-saved across our flow). */
     csrr s11, mhartid
 

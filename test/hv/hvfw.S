@@ -16,6 +16,13 @@ _start:
     la   t0, m_trap
     csrw mtvec, t0
 
+    # PMP: one NAPOT entry over the whole address space, RWX, so HS and the
+    # guest may access memory (an access that matches no entry fails below M).
+    li   t0, -1
+    csrw pmpaddr0, t0
+    li   t0, 0x1f
+    csrw pmpcfg0, t0
+
     # Delegate to HS: synchronous causes 0-8, ECALL-from-VS (10), page faults
     # (12/13/15) and the guest-page-faults (20/21/23) the hypervisor services.
     li   t0, 0x00B0B5FF

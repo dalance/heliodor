@@ -19,6 +19,11 @@
     .global _start
 
 _start:
+    /* PMP: one NAPOT entry over the whole space, RWX, so S/U may access. */
+    li   t0, -1
+    csrw pmpaddr0, t0
+    li   t0, 0x1f
+    csrw pmpcfg0, t0
     /* S-mode trap handler */
     la   t0, s_ext_handler
     csrw stvec, t0

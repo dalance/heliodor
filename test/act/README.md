@@ -420,8 +420,8 @@ this, **all RVA23-mandatory scalar atomics are covered**.
 
 heliodor enforces PMP on the load / store / fetch paths (16 entries, OFF / TOR /
 NA4 / NAPOT matching, lowest-match priority, R/W/X, lock bits, M-mode bypass of
-unlocked entries; combinational `src/mmu/pmp_check.veryl`, boot-safe all-OFF =
-inactive). Three real RTL bugs were fixed to make the **PMPS suite pass 9/9**
+unlocked entries; combinational `src/mmu/pmp_check.veryl`; an S/U access that
+matches no entry faults, also with every entry OFF). Three real RTL bugs were fixed to make the **PMPS suite pass 9/9**
 (cfg_A_off, cfg_XWR, csr_access, mprv_check_01/02, napot_legal_lxwr_01/02,
 tor_legal_lxwr_01/02): (1) `medeleg` is fully writable so an access fault
 (cause 1/5/7) is **delegated to the S-mode trap handler** as the Sail reference

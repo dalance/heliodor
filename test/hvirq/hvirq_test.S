@@ -24,6 +24,11 @@
     .section .text.init
     .globl _start
 _start:
+    # PMP: one NAPOT entry over the whole space, RWX, so S/U may access.
+    li   t0, -1
+    csrw pmpaddr0, t0
+    li   t0, 0x1f
+    csrw pmpcfg0, t0
     la   t0, m_handler
     csrw mtvec, t0
     la   t0, guest_trap

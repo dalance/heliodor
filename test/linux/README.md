@@ -60,6 +60,10 @@ syscall fallback is used). `-mno-relax` is still needed on the freestanding
 
 ## Key facts
 
+- **Prebuilt firmware**: only `linux_boot_fw_71.hex` and `_71v.hex` are built
+  from the current `linux_boot_fw.S`. The other `linux_boot_fw*.hex` predate it;
+  `fw/patch_pmp_allow_all.sh` added its allow-all PMP entry to them, and
+  `fw/patch_hsm_mtime_wait.sh` derives `_4hart_mt` from `_4hart`.
 - **DRAM**: firmware @ `0x80000000`; DTB placed at `dtb_addr` (0x80AB9000 for
   v5.15, 0x80300000 for 6.6/7.1/7.1v). DRAM size must match the DTS `reg` and the
   harness array.
