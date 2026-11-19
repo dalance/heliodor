@@ -1192,6 +1192,97 @@ full の 4 構成の wall の合計は約 3.8 h (W4 N=4 が 1.9 h)。wall は 1 
 
 再現: `toolchain/fetch.sh glt` (dune が socket を使うので sandbox の外)、`test/glt/run_glt.py herd`、`VERYL=... VERYL_AOT_C_ASYNC=0 test/glt/run_glt.py run --core w2|w4 --harts 2|4 [--set full]` (sandbox の外)。出力は `.build/glt/<core>_n<N>_<set>.{json,err,results.json}`。
 
+### 9.13 MV の出口のゲート (2026-11-19)
+
+設計書 §MV の出口条件の表を、手順 1-6 の後の最終の RTL (`89de4180`。RTL は手順 6 の `29b3c55d` から変えていない) で W2 と W4 について回した。veryl は `9d6081f0` (§9.9 の `96d8af7e` から更新)、spike は `b86c9bb`。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0` で回し、JSON の `fell_back` はすべての run で 0 だった。一時的な worktree を 10 本作り、boot、ACT、GR、G0 を並行させた (box の load average は 11-96)。wall 時間はこの並行の下の値である。
+
+#### GC (spike との co-simulation)
+
+| 対象 | W2 | W4 | 判定 |
+|---|---|---|---|
+| arch と directed (`run_gc.py`、arch/directed/probe の list) | 366/366、不一致 0、wall 363 s | 366/366、不一致 0、wall 676 s | pass。SPIKE_GAPS の 6 本 (`mi_csr_warl`、`mi_svrsw`、`mi_csrind`、`mi_vstart`、`mi_vemul`、`mv_pmp_span`) は理由を出して外した |
+| ACT4 の全 suite (`run_act.py --cosim`、3,749 本) | 3,735/3,738、不一致 0、wall 1,971 s | 3,734/3,738、不一致 0、wall 4,777 s | pass。SPIKE_GAPS 11 本。fail は照合の不一致ではなく既知の DUT の GA の fail (W2: `mcsr_cntr_00`、Zkt 2 本。W4: `mcsr_cntr_00`、`tselect_trigs_00` 2 本、`wfi_VS_00`)。`vucsr_00` は SPIKE_GAPS |
+| 5.15 N=1 | 14,617,653 cy、10,432,497 record、割込み 46、sim 800 s | 12,286,458 cy、10,424,129 record、割込み 36、sim 3,053 s | pass、cycles は native と一致 |
+| 6.6 N=1 | 21,394,340 cy、17,629,279 record、割込み 44、sim 1,095 s | 18,323,297 cy、17,786,998 record、割込み 38、sim 5,405 s | 同上 |
+| 7.1 N=1 | 19,240,001 cy、12,055,568 record、割込み 34、sim 976 s | 16,694,742 cy、12,042,948 record、割込み 29、sim 4,748 s | 同上 |
+| 7.1v N=1 | 20,710,928 cy、12,357,753 record (vector 34)、割込み 39、sim 975 s | 17,827,384 cy、12,342,171 record (vector 34)、割込み 34、sim 4,941 s | 同上 |
+| hvlinux | 18,611,543 cy、11,403,217 record、割込み 32、sim 619 s | 16,187,826 cy、11,387,696 record、割込み 29、sim 4,827 s | 同上 |
+| litmus N=2 短縮 / N=2 / N=4 | 982,716 / 4,010,267 / 5,022,440 cy (9,354,958 record、DUT の読み値 127,128 回) | 968,170 / 3,943,879 / 5,023,457 cy (13,233,319 record、DUT の読み値 152,820 回) | pass。N=2 短縮と N=4 は native (G0 の litmus N=2 と GT4) と一致 |
+| SMP directed (coh N=2/N=4、ad、unc、tkt) | 133,468 / 165,914 / 91,841 / 6,131 / 1,738,890 cy | 130,301 / 166,542 / 77,190 / 6,130 / 1,739,095 cy | pass、N=2 の 4 本は W2/W4 とも G0 の native と一致 |
+| 5.15 SMP N=2 | 19,382,092 cy、18,649,903 record、割込み 160、sim 6,073 s | 16,814,425 cy、18,723,167 record、割込み 150、sim 11,236 s | pass、cycles は native と一致 |
+| 5.15 SMP N=4 | 24,190,865 cy、34,838,627 record、割込み 334、sim 19,615 s | 21,837,182 cy、32,586,697 record、割込み 306、sim 30,217 s | 同上 |
+
+- W4 の boot、hvlinux、SMP の照合の tb は手順 3 までは無かったので `tb/test_cosim_spike_w4.veryl` (`test_cosim_spike_w4_*`、W2 の版の CORE を W4 にし、component に `TRIGGERS: 4` を渡す) を足した (`7caeedd5`)。native に `test_w4_smp_coh_4hart` が無いので、W4 の coh N=4 の cycles は比べる相手が無い。
+- 照合の代金: W2 の hvlinux は native 609 s に対し cosim 619 s (並行の下で揺れの中)、W4 の N=1 boot は native の sim 2,495-3,877 s に対し cosim 3,053-5,405 s。
+
+#### GR の固定 seed の集合
+
+`test/gr/fixed.list` に固定の集合を置き (生成器 `7ba0ae58`、行ごとに core、種類、seed、長さ、record の合計)、`run_gr.py --fixed test/gr/fixed.list [--only 行]` で回す (`22868792`)。各行は全 program の pass と record の合計の一致を要する。生成器のファイルが記録の commit から変わっていれば警告を出す。集合は手順 4a-4d の既定の集合と、各手順で回した W4 の部分集合である。
+
+| 行 | core | seed (3,000 命令 / 30,000 命令) | 結果 | record | sim |
+|---|---|---|---|---|---|
+| gr_w2 | W2 | 1-50 / 1001-1003 | 53/53 | 321,125 | 87 s |
+| grp_w2 | W2 | 1-300 / 1001-1005 | 305/305 | 5,148,983 | 1,086 s |
+| grv_w2 | W2 | 1-500 / 1001-1005 | 505/505 | 2,593,567 | 1,136 s |
+| grvp_w2 | W2 | 1-500 / 1001-1005 | 505/505 | 9,785,265 | 3,491 s |
+| grh_w2 | W2 | 1-400 / 1001-1005 | 405/405 | 11,272,526 | 4,390 s |
+| grvh_w2 | W2 | 1-400 / 1001-1005 | 405/405 | 12,140,067 | 7,187 s |
+| gr_w4 | W4 | 1-100 / 1001-1003 | 103/103 | 513,838 | 594 s |
+| grp_w4 | W4 | 1-100 / 1001-1002 | 102/102 | 1,703,601 | 1,519 s |
+| grv_w4 | W4 | 1-100 / 1001-1002 | 102/102 | 563,504 | 809 s |
+| grvp_w4 | W4 | 1-50 / 1001 | 51/51 | 970,569 | 2,789 s |
+| grh_w4 | W4 | 1-100 / 1001-1002 | 102/102 | 2,922,199 | 4,778 s |
+| grvh_w4 | W4 | 1-50 / 1001 | 51/51 | 1,674,053 | 1,388 s |
+
+- 計 2,689 本、約 4,961 万 record、不一致 0。record の合計は手順 4b-4d の記録 (grp 約 515 万、grv 約 259 万、grvp 約 979 万、grh 約 1,127 万、grvh 約 1,214 万) と合う。gr_w2 と gr_w4 は `--fixed` で回し直して record の合計まで一致した (program は seed の関数なので決定的)。
+- 生成されない mnemonic: grvp_w2 で `vsoxseg8ei16.v` (手順 4c の終わりの記録と同じ)。W4 の vector の部分集合は seed が少ないので segment の mnemonic の一部が出ない (W2 の集合では出る)。
+
+#### M6 のゲート (MV の前との比較)
+
+| ゲート | MV の後 | MV の前 (§9.9、§9.10、設計書の M6 の判定) | 判定 |
+|---|---|---|---|
+| G0 | 862 passed、0 failed、371 ignored | 860 (手順 5 の後) | pass。+2 は RVFI の検査の追加 (`test_rvfi_adapter_w4_rv64ui_add`、`test_rvfi_adapter_chk_idle`) |
+| GL-B | W2 14,570,718、W4 12,262,946。record 10,417,776、hash `74d4b7982390260f` | 同じ | ビット一致 |
+| GB1 (W2) | 5.15 14,617,653 (hash `650ecd24d934e4f2`)、6.6 21,394,340、7.1 19,240,001、7.1v 20,710,928 | 同じ | 一致 |
+| GB1 (W4) | 5.15 12,286,458 (hash `e87fa2f00e262139`)、6.6 18,323,297、7.1 16,694,742、7.1v 17,827,384 | 同じ | 一致 |
+| GT4 | W2 5,022,440、W4 5,023,457 | W2 5,022,440、W4 5,023,457 (§9.10) | 一致 |
+| GB2 (5.15、N=2) | W2 19,382,092、W4 16,814,425 | 同じ (§9.10) | 一致 |
+| GB2 6.6 (N=2) | W2 46,950,222、W4 61,051,721 (hart 0 の hash W2 `1ad671e2301011fd`、W4 `4b5b4d18dc2304a5`) | §9.9 の W2 46,941,211、W4 61,047,678 は LQ の修正 (`52de079e`) の前の値で、修正の後は回していなかった。M6 の完了 (`1e1cf1b0`) を同じ veryl で回し直すと W2 46,950,222、W4 61,051,721 で、両 hart の hash まで同じ | MV の前とビット一致。§9.9 との差 (+9,011 / +4,043) は M6 の LQ の修正によるもので、MV の RTL の変更によるものではない |
+| GB2 7.1 (N=2) | W2 31,061,009、W4 36,935,818 | W2 31,061,009、W4 36,935,818 (§9.10) | 一致 |
+| GB4 (5.15、N=4) | W2 24,190,865 (instret 14,482,390)、W4 21,837,182 (instret 14,373,764) | W2 24,190,865、W4 21,837,182 (§9.10) | 一致 |
+| GH | W2 18,611,543、W4 16,187,826 | 同じ | 一致 |
+| GA / GL-C | W2 3,745/3,749、W4 3,744/3,749、hash 720/720 | 同じ (§9.9) | 一致。fail は §9.9 と同じ既知のもの |
+| bench | W2: dhrystone 268,712 (instret 264,835)、coremark 381,237 (374,358)、fpmm 1,044,664、spmv 41,171。W4: 204,902、315,613、861,034、32,162 | README の値 | 一致 |
+
+- MV が変えた RTL (scalar_rsv、hgatp の WARL、CBO の権限、pmpcfg の R/W、vector の NaN-boxing、`vsetvli x0, x0` の vill、PMP の部分一致、vsip、vfslide1 の FP、VS の SFENCE の slvl、HLVX の X、GVA) は、どの gate の cycle 数も record 列も変えなかった。各修正の手順の中で GL-B と litmus N=4 と hvlinux が変わらないことは確かめてあり、ここで残りの gate も変わらないことを確かめた。
+- wall 時間 (並行の下): N=1 native W2 1,000 s (5 本並行)、W4 4,140 s、N=2 W2 5,167 s、W4 19,758 s、N=4 W2 20,566 s、W4 37,817 s、G0 3,453 s、GA W2 3,240 s、W4 6,228 s、GR の固定の集合 約 7 時間 (12 行を直列)。
+
+#### RVFI と riscv-formal
+
+riscv-formal (`c992aa61`、`docs/source/rvfi.rst` と `csrs.rst`) の定義と `tb/rvfi_adapter.veryl` を信号ごとに比べた。
+
+| 項目 | 結果 |
+|---|---|
+| 名前、幅、NRET の packing (lane l は `[l*W +: W]`)、ILEN 32 | 一致。lane は record の順なので、同じ register を書く命令の勝者は大きい channel |
+| `rvfi_valid`、`rvfi_order` (重複と欠番なし)、`rvfi_insn` (圧縮命令は 16 bit を 0 拡張、fetch fault は 0) | 一致。Debug Mode の record も valid のまま `rvfi_dm` の拡張で印を付けるので order に欠番が無い |
+| `rvfi_trap`、`rvfi_intr`、`rvfi_halt` | 一致。trap の record は `pc_wdata` を 0 とし、次の record (handler の最初) に `rvfi_intr` を立てる。riscv-formal の `intr` の定義 (前の `pc_wdata` と `pc_rdata` が合わない最初の命令) に合う |
+| `rvfi_mode`、`rvfi_ixl` | 一致 (U 0、S 1、M 3。V=1 は `rvfi_virt` の拡張。ixl は常に 2) |
+| `rvfi_rs1/rs2_*`、`rvfi_rd_*` | 一致。rd が x0 なら addr と wdata は 0。x0 の読み値が 0 であることは `rvfi_adapter_chk` の影の register で確かめている |
+| `rvfi_pc_rdata/wdata`、`rvfi_mem_*` (`RISCV_FORMAL_ALIGNED_MEM` なしの形、AMO は rmask と wmask の両方) | 一致。16 byte の access は `_hi` の拡張、vector の access は `rvfi_v_*` の拡張 |
+| FP の提案 (`rvfi_frs1-3_*`、`rvfi_frd_*`、`rvfi_csr_fcsr_*`) | 不足を直した: f0 は register なので `rvfi_frs1/2/3_rvalid` と `rvfi_frd_wvalid` を足し、`rvfi_csr_fcsr_*` を足した (fflags と frm の Zicsr access も fcsr の bit 4:0 と 7:5 で出す) |
+| 仮想記憶の提案 (`rvfi_csr_satp_*`、`rvfi_mem_paddr`、`rvfi_mem_pte0-3`、`rvfi_pc_paddr`) | satp の名前付き port を足した。`rvfi_mem_paddr` はある。PTE と `rvfi_pc_paddr` は出さない (record に無い) |
+| CSR の名前付き port の意味 | 差 (宣言): op 自身の Zicsr access だけを出し、trap の入口、xRET、FP の flag の累積、別の view (sstatus から mstatus など) による更新は出さない。riscv-formal の CSR の一貫性の検査はこのままでは使えない。直すには record に trap と xRET の CSR 更新を載せる必要があり、riscv-formal をつなぐ時 (MS の後の V6) に扱う |
+
+検査の追加 (`e9c64cdb`): `rvfi_adapter_chk` は record も source の値も 1 つも見なかったときに `o_idle` を立て、`arch_soc_harness` はそのとき pass にせず、終わっていれば fail にする (手順 1 から残っていた「被覆 0 でも fail しない」の解消)。新しい port も lane ごとに照合する。`test_rvfi_adapter_chk_idle` (record なしで idle) と W4 の `test_rvfi_adapter_w4_rv64ui_add` を足した。
+
+#### cold-reader gate
+
+対象: `tb/rvfi_adapter*.veryl`、`cosim/spike/src/*.rs`、`shim.cc`、`build.rs`、`test/gr/*.py`、`test/glt/*.py`、`test/gates/cov_report.py`、`sim/verilator/run_cov.py`、`src/mmu/pmp_check.veryl`。直したもの (`ece68b61`、コメントだけ): `pmp_check` の em-dash 3 個、ヘッダの「entry が 1 つでも実装されていれば一致しない S/U の access は fault」(実装は enable の entry が 1 つ以上のときだけ fault) と「全 OFF の場合は S/U から観測できない」(下の directed で観測できる) の誤り、`platform.rs` の「Svrsw60t59b の bit を立てる image は無い」(ACT と `mi_svrsw` が立てるので SPIKE_GAPS にしている) と Sv39 の固定の記述、`cov_report.py` と `run_cov.py` の docstring の崩れた改行と古くなる数値 (100 MB)。手順の番号やマイルストーンの参照は無かった (GC/GR/GCV は gate の名前として残す)。
+
+#### 見つかった逸脱 (未修正、ユーザ判断待ち)
+
+cold-reader gate の途中で、`pmp_check` の PMP の全 entry が OFF のときの扱いが特権仕様と違うことが分かった。仕様は、PMP の entry が 1 つでも実装されていれば、どの entry にも一致しない S/U の access を失敗させる。DUT は enable の entry が無いとき (`any_cfg = 0`) は全 access を通す。spike は reset で entry 0 を全域の NAPOT RWX にする (PMP を知らない software のため) ので、PMP を書かない program では DUT と spike が同じに振る舞い、GC はこの差を見ていなかった。directed `test/directed/mv_pmp_off.S` (`89de4180`、gate list には入れていない): 全 entry を OFF にして (1) S への mret、(2) MPRV で MPP = S の ld、(3) 同じく sd、(4) M の ld。HEAD では W2/W4 とも tohost 0x742 (sub-case 1-3 が fault しない。1 は S の ecall まで実行する)。cosim では spike が order 37 で cause 1 を出して不一致になる。`o_fault` の no-match の項を `!is_m` にすると W2/W4 とも cosim 付きで pass するが、G0 は 53 本 (PMP を書かずに S/U に入る directed、`test_mmu`、`test_front` など) が落ちる。直すなら reset 値の決定 (spike と同じく entry 0 を全域 RWX にするか、PMP を書かない test を直すか) を伴い、fetch と LSU と PTW の PMP に効くので、修正は入れずに報告に留める。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。

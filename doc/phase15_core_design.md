@@ -5160,6 +5160,16 @@ MI の進捗:
 - 【決定】(2026-11-14、ユーザ、同日改訂) spike への入力は、まず公開 API (`mip` の backdoor 書込み、自前の `simif_t` の `mmio_load`、`wfi_as_nop` などの設定) だけで組む。それでも埋まらない穴 (例: trap で retire しない step を minstret で判定する回避) が残ったときに限り、`toolchain/` に置く最小のパッチで足し、`fetch.sh` が pin した commit に当ててから build する。改訂の理由: 試作の後で、外から与える口が公開 API にあると分かった (手順 0 の (b) の訂正)。
 - MS の後: riscv-formal を V1 の RVFI につなぐ (V6)。
 - 出口条件: 上の表の MV の行。
+- 【MV の出口条件の判定】(2026-11-19) 判定の候補 (ユーザ判断待ち)。出口の gate を最終の RTL で W2/W4 について回した。表と数値は検証計画 §9.13。
+  - GC (機能、必須): arch と directed は W2/W4 とも 366/366、ACT4 の全 suite は W2 3,735/3,738、W4 3,734/3,738 (fail は既知の DUT の GA の fail で、照合の不一致は無い)、N=1 の 5.15/6.6/7.1/7.1v と hvlinux は W2/W4 とも pass。不一致はすべて 0 で、cycle 数は native と一致した。W4 の boot、hvlinux、SMP の照合の tb は `tb/test_cosim_spike_w4.veryl` に足した (`7caeedd5`)。SMP (litmus N=2/N=4、coh/ad/unc/tkt、5.15 の N=2/N=4) も W2/W4 とも不一致 0 (W4 の N=4 boot は 32,586,697 record)。充足。
+  - GR の固定 seed の集合 (機能、必須): `test/gr/fixed.list` (生成器 `7ba0ae58`、手順 4a-4d の既定の集合と W4 の部分集合、12 行 2,689 本、record の合計を記録) と `run_gr.py --fixed` を足した (`22868792`)。全行が不一致 0 で pass し、約 4,961 万 record。充足。
+  - GLT (機能、必須): 手順 6 で禁止された結果 0 (§9.12)。充足。
+  - M6 の gate が MV の前と一致 (機能、必須): G0 862 passed (860 と RVFI の検査 2 本)、GL-B は W2 14,570,718、W4 12,262,946 cy で record 10,417,776 と hash `74d4b7982390260f` まで一致、GB1 (W2/W4 の 4 本)、GB2 (5.15)、GT4、GH、GA/GL-C、bench、GB2 (7.1)、GB4 (W2 24,190,865、W4 21,837,182) は §9.9/§9.10 と同一。GB2 (6.6) は W2 46,950,222、W4 61,051,721 で §9.9 (46,941,211 / 61,047,678) と違うが、§9.9 の値は M6 の LQ の修正 (`52de079e`) の前のもので、M6 の完了 (`1e1cf1b0`) を回し直すと両 hart の hash まで同じだった。MV の RTL の変更 (scalar_rsv から GVA まで) はどの gate の cycle 数も record 列も変えなかった。充足。
+  - RVFI (構造): riscv-formal (`c992aa61`) の定義と信号ごとに比べた。標準の信号は一致した。FP の提案の `rvfi_frs*_rvalid`/`rvfi_frd_wvalid` と `rvfi_csr_fcsr_*`、仮想記憶の提案の `rvfi_csr_satp_*` を足し、`rvfi_adapter_chk` は record も source も見なかった run を fail にするようにした (`e9c64cdb`)。差として宣言するもの: 名前付き CSR の port は op 自身の Zicsr access だけを出し、trap の入口、xRET、FP の flag の累積、別の view からの更新を出さないので、riscv-formal の CSR の一貫性の検査はそのままでは使えない (riscv-formal をつなぐ V6 で扱う)。PTE と `rvfi_pc_paddr` は出さない。充足 (宣言付き)。
+  - cold-reader gate (構造): 新しい module と component、生成器、runner を読み、コメントの誤り (pmp_check のヘッダと全 OFF の記述、platform.rs の Svrsw60t59b の記述など) と em-dash を直した (`ece68b61`、コメントだけ)。充足。
+  - GCV (構造): 手順 5 で記録済み (§9.11)。充足。
+  - 未解決 (ユーザ判断待ち): cold-reader gate の途中で、PMP の全 entry が OFF のとき DUT が S/U の access を通す (特権仕様は entry が 1 つでも実装されていれば一致しない S/U の access を失敗させる) ことが分かった。spike は reset で entry 0 を全域 RWX にするので、PMP を書かない program では差が出ず、GC は見ていなかった。directed `mv_pmp_off` (`89de4180`、gate list の外) は HEAD で W2/W4 とも fail (0x742)、no-match の項を直すと cosim 付きで pass するが、PMP を書かずに S/U に入る G0 の 53 本が落ちる。直すには reset 値の方針 (entry 0 を全域にするか、test を直すか) を決める必要があり、fetch、LSU、PTW の PMP に効くので修正していない。
+  - 推奨: MV の出口条件は、必須の 4 項目と構造の 3 項目を満たす。PMP の全 OFF の逸脱は MV が持ち込んだものではなく (旧コアからの `pmp_check`)、MV の照合で見つかった既存の差なので、宣言して MV を閉じ、修正 (reset 値の方針と N=4 boot を含む gate) を MS の前の独立の項目にすることを勧める。
 
 ### MS: 合成可能性
 
