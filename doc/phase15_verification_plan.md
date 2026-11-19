@@ -1287,7 +1287,7 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 
 【決定】(2026-11-19、ユーザ) `pmp_range_check` の一致しない access は、M なら許し、S/U なら常に fault にする (実装する entry は常に 16 個なので、特権仕様の「entry が 1 つでも実装されていれば」に当たる)。pmpcfg の A/L の reset 値は 0 のまま (fail-closed。spike のように entry 0 を全域にはしない) とし、S/U に降りる M の firmware と test の startup を直す。`any_cfg` は不要になったので消した。`pmp_check` は凍結した旧コアとも共有で、これは受け入れた。
 
-変更 (`e45cd7e9`):
+変更 (`f145cfb5`):
 
 - firmware: `test/linux/fw/linux_boot_fw.S` は `_start` の先頭 (全 hart が通り、secondary の park と HSM の再開の前) で pmpaddr0 = 全 1、pmpcfg0 = 0x1f (NAPOT|R|W|X) を書く。`linux_boot_fw_71.hex`/`_71v.hex` だけが現行のソースから再現する (旧ソースで byte 一致を確かめた) ので、この 2 つはソースから作り直した。それ以外の `linux_boot_fw*.hex` (5.15 の N=1/2hart/4hart/8hart、6.6、6.6 SMP) は現行のソースより古い版から作られていて、作り直すと PMP 以外 (mstateen0 など) も変わる。そこで `fw/patch_pmp_allow_all.sh` で先頭の `csrw mie, zero` を image の後ろに足した trampoline への jump にし、同じ 5 命令を足した (他の address は動かない)。`_4hart_mt` は patch した `_4hart` から `patch_hsm_mtime_wait.sh` で作り直した。`test/hv/hvfw.S` も同じ entry を書く (ソースから byte 一致で再現することを確かめてから作り直した)。
 - firmware の block の大きさ: 最初の版 (圧縮命令で 12 byte) は後ろのコードを 12 byte ずらし、HSM HART_START の遅延ループ (`addi`/`bnez`、0x80000 回) が ROM の 8 byte の beat を跨いだ。uncached の ROM fetch が 1 回から 2 回になり、7.1 の N=2 boot が W2 +10,450,070 cy (1 回あたり約 20 cy)、W4 +18.5M cy 遅くなった。block を norvc の 4 命令と 4 個の nop で 32 byte (W4 の FETCH_BYTES) にし、後ろのコードが fetch block 内の同じ offset に残るようにした。最終の `_71.hex` は旧 image を 32 byte ずらしただけと一致する。
@@ -1295,7 +1295,7 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - golden: 5.15 N=1 の boot golden (`test/golden/boot/linux515_n1.*`) は、golden の commit `fab5ae50` の一時的な worktree に新しい `linux_boot_fw.hex` を置いて `test_golden_boot_linux515_n1` を回し、K/I/H/G の行から作った (同じ変換を旧 image の run にかけると commit 済みの 3 ファイルと byte 一致することを先に確かめた)。record は 10,417,776 → 10,417,784 (firmware の +6 と、retire 数の mtime の位相がずれて SATP_WIN の record が +2)、hash は `60e504ab77211f61`。directed の `svnapot`/`sysb` は `run_golden.py` で `.golden` (`4db557ab`) に新しい hex を一時的に写して作り直した (record は各 +4)。master の `retire_pkg` は MANIFEST の pin の後に RVFI の field が増えて sha が合わないので pin の照合だけを外し (TRACER_VER は 3 のまま)、gate list の和集合からの `golden_runs_*.veryl` の再生成も止めた (master の ACT の list が golden の branch と違い、そのまま生成すると golden の tree が汚れる)。そのため `[arch/directed]` の `golden_commit` は `4db557ab` になった。他の image は変わっていないので golden も作り直していない。
 - `mv_pmp_off` を `test/gates/mv_probe.list` に入れた (W2/W4 の `test_*_mvprobe_mv_pmp_off`)。
 
-ゲート (`e45cd7e9`。7.1/7.1v の image を含まない gate は、7.1 の firmware の block を 32 byte にする前の `d6c83146` で回した。両者の差は `linux_boot_fw_71{,v}.hex` とその firmware のソースだけである。veryl `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0):
+ゲート (`f145cfb5`。7.1/7.1v の image を含まない gate は、7.1 の firmware の block を 32 byte にする前の中間の commit で回した。両者の差は `linux_boot_fw_71{,v}.hex` とその firmware のソースだけである。veryl `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0):
 
 | ゲート | 前 (§9.13) | 後 | 差と原因 |
 |---|---|---|---|
