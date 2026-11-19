@@ -1279,9 +1279,41 @@ riscv-formal (`c992aa61`、`docs/source/rvfi.rst` と `csrs.rst`) の定義と `
 
 対象: `tb/rvfi_adapter*.veryl`、`cosim/spike/src/*.rs`、`shim.cc`、`build.rs`、`test/gr/*.py`、`test/glt/*.py`、`test/gates/cov_report.py`、`sim/verilator/run_cov.py`、`src/mmu/pmp_check.veryl`。直したもの (`ece68b61`、コメントだけ): `pmp_check` の em-dash 3 個、ヘッダの「entry が 1 つでも実装されていれば一致しない S/U の access は fault」(実装は enable の entry が 1 つ以上のときだけ fault) と「全 OFF の場合は S/U から観測できない」(下の directed で観測できる) の誤り、`platform.rs` の「Svrsw60t59b の bit を立てる image は無い」(ACT と `mi_svrsw` が立てるので SPIKE_GAPS にしている) と Sv39 の固定の記述、`cov_report.py` と `run_cov.py` の docstring の崩れた改行と古くなる数値 (100 MB)。手順の番号やマイルストーンの参照は無かった (GC/GR/GCV は gate の名前として残す)。
 
-#### 見つかった逸脱 (未修正、ユーザ判断待ち)
+#### 見つかった逸脱
 
-cold-reader gate の途中で、`pmp_check` の PMP の全 entry が OFF のときの扱いが特権仕様と違うことが分かった。仕様は、PMP の entry が 1 つでも実装されていれば、どの entry にも一致しない S/U の access を失敗させる。DUT は enable の entry が無いとき (`any_cfg = 0`) は全 access を通す。spike は reset で entry 0 を全域の NAPOT RWX にする (PMP を知らない software のため) ので、PMP を書かない program では DUT と spike が同じに振る舞い、GC はこの差を見ていなかった。directed `test/directed/mv_pmp_off.S` (`89de4180`、gate list には入れていない): 全 entry を OFF にして (1) S への mret、(2) MPRV で MPP = S の ld、(3) 同じく sd、(4) M の ld。HEAD では W2/W4 とも tohost 0x742 (sub-case 1-3 が fault しない。1 は S の ecall まで実行する)。cosim では spike が order 37 で cause 1 を出して不一致になる。`o_fault` の no-match の項を `!is_m` にすると W2/W4 とも cosim 付きで pass するが、G0 は 53 本 (PMP を書かずに S/U に入る directed、`test_mmu`、`test_front` など) が落ちる。直すなら reset 値の決定 (spike と同じく entry 0 を全域 RWX にするか、PMP を書かない test を直すか) を伴い、fetch と LSU と PTW の PMP に効くので、修正は入れずに報告に留める。
+cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のとき S/U の access を通すことが分かった (directed `mv_pmp_off`、`89de4180`)。2026-11-19 のユーザの決定で直した (§9.14)。
+
+### 9.14 PMP の一致しない S/U access の修正 (2026-11-19/20)
+
+【決定】(2026-11-19、ユーザ) `pmp_range_check` の一致しない access は、M なら許し、S/U なら常に fault にする (実装する entry は常に 16 個なので、特権仕様の「entry が 1 つでも実装されていれば」に当たる)。pmpcfg の A/L の reset 値は 0 のまま (fail-closed。spike のように entry 0 を全域にはしない) とし、S/U に降りる M の firmware と test の startup を直す。`any_cfg` は不要になったので消した。`pmp_check` は凍結した旧コアとも共有で、これは受け入れた。
+
+変更 (`e45cd7e9`):
+
+- firmware: `test/linux/fw/linux_boot_fw.S` は `_start` の先頭 (全 hart が通り、secondary の park と HSM の再開の前) で pmpaddr0 = 全 1、pmpcfg0 = 0x1f (NAPOT|R|W|X) を書く。`linux_boot_fw_71.hex`/`_71v.hex` だけが現行のソースから再現する (旧ソースで byte 一致を確かめた) ので、この 2 つはソースから作り直した。それ以外の `linux_boot_fw*.hex` (5.15 の N=1/2hart/4hart/8hart、6.6、6.6 SMP) は現行のソースより古い版から作られていて、作り直すと PMP 以外 (mstateen0 など) も変わる。そこで `fw/patch_pmp_allow_all.sh` で先頭の `csrw mie, zero` を image の後ろに足した trampoline への jump にし、同じ 5 命令を足した (他の address は動かない)。`_4hart_mt` は patch した `_4hart` から `patch_hsm_mtime_wait.sh` で作り直した。`test/hv/hvfw.S` も同じ entry を書く (ソースから byte 一致で再現することを確かめてから作り直した)。
+- firmware の block の大きさ: 最初の版 (圧縮命令で 12 byte) は後ろのコードを 12 byte ずらし、HSM HART_START の遅延ループ (`addi`/`bnez`、0x80000 回) が ROM の 8 byte の beat を跨いだ。uncached の ROM fetch が 1 回から 2 回になり、7.1 の N=2 boot が W2 +10,450,070 cy (1 回あたり約 20 cy)、W4 +18.5M cy 遅くなった。block を norvc の 4 命令と 4 個の nop で 32 byte (W4 の FETCH_BYTES) にし、後ろのコードが fetch block 内の同じ offset に残るようにした。最終の `_71.hex` は旧 image を 32 byte ずらしただけと一致する。
+- test: PMP を書かずに S/U に降りていた G0 の 53 本 (W2/W4) を直した。共有の startup は無い (directed の `common/probe.h` は既に entry を書いている) ので、各 `_start` の先頭に同じ 4 命令を足した: `test/{svnapot,sysb}`、H の 16 本 (`test/h*`、`test/hv*`)、`test/{svadu,svpbmt}` の各 2 本、`test/sstc`、`test/vleff`、`test/c/smode_plic_test.S`。hex はソースから作り直した (再現しない 6 本は 0 と c.nop の詰め物の 1 語だけが違い、どれも実行されない)。unit test の `test_front`、`test_mmu`、`test_mmu_asid` は PMP の入力に同じ全域の entry を与えた。検査の中身は変えていない。G0 の外の image (coh/ad/unc/tkt、litmus、debug、cbench、GR、GLT) は S/U に降りないか既に entry を書いているので変えていない。
+- golden: 5.15 N=1 の boot golden (`test/golden/boot/linux515_n1.*`) は、golden の commit `fab5ae50` の一時的な worktree に新しい `linux_boot_fw.hex` を置いて `test_golden_boot_linux515_n1` を回し、K/I/H/G の行から作った (同じ変換を旧 image の run にかけると commit 済みの 3 ファイルと byte 一致することを先に確かめた)。record は 10,417,776 → 10,417,784 (firmware の +6 と、retire 数の mtime の位相がずれて SATP_WIN の record が +2)、hash は `60e504ab77211f61`。directed の `svnapot`/`sysb` は `run_golden.py` で `.golden` (`4db557ab`) に新しい hex を一時的に写して作り直した (record は各 +4)。master の `retire_pkg` は MANIFEST の pin の後に RVFI の field が増えて sha が合わないので pin の照合だけを外し (TRACER_VER は 3 のまま)、gate list の和集合からの `golden_runs_*.veryl` の再生成も止めた (master の ACT の list が golden の branch と違い、そのまま生成すると golden の tree が汚れる)。そのため `[arch/directed]` の `golden_commit` は `4db557ab` になった。他の image は変わっていないので golden も作り直していない。
+- `mv_pmp_off` を `test/gates/mv_probe.list` に入れた (W2/W4 の `test_*_mvprobe_mv_pmp_off`)。
+
+ゲート (`e45cd7e9`。7.1/7.1v の image を含まない gate は、7.1 の firmware の block を 32 byte にする前の `d6c83146` で回した。両者の差は `linux_boot_fw_71{,v}.hex` とその firmware のソースだけである。veryl `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0):
+
+| ゲート | 前 (§9.13) | 後 | 差と原因 |
+|---|---|---|---|
+| G0 | 862 passed | 864 passed、0 failed、371 ignored | +2 は W2/W4 の `mv_pmp_off` |
+| GC (`run_gc.py`) | 366/366 | W2/W4 とも 367/367、不一致 0 | +1 は `mv_pmp_off` (cosim でも pass) |
+| ACT4 pmp (`run_act.py --suite pmp --cosim`) | | W2/W4 とも 99/99、不一致 0 | |
+| GL-B W2 / W4 | 14,570,718 / 12,262,946、record 10,417,776 | 14,571,787 (+1,069) / 12,261,972 (−974)、record 10,417,784、hash `60e504ab77211f61` (新しい golden と一致) | record の差は golden と同じ +8。cycle の差はその 8 命令と、retire の位置がずれたことによる予測器と cache の状態の差 |
+| GB1 W2 5.15 / 6.6 / 7.1 / 7.1v | 14,617,653 / 21,394,340 / 19,240,001 / 20,710,928 | 14,633,581 (+15,928) / 21,394,490 (+150) / 19,261,226 (+21,225) / 20,727,075 (+16,147) | 下の注 (時刻のずれ) |
+| GB1 W4 5.15 / 6.6 / 7.1 / 7.1v | 12,286,458 / 18,323,297 / 16,694,742 / 17,827,384 | 12,286,122 (−336) / 18,323,463 (+166) / 16,700,556 (+5,814) / 17,768,385 (−58,999) | 同上 |
+| GB2 W2 5.15 / 6.6 / 7.1 | 19,382,092 / 46,950,222 / 31,061,009 | 19,382,030 (−62) / 46,943,543 (−6,679) / 31,041,604 (−19,405) | 同上 |
+| GB2 W4 5.15 / 6.6 / 7.1 | 16,814,425 / 61,051,721 / 36,935,818 | 16,811,486 (−2,939) / 61,081,863 (+30,142) / 36,751,512 (−184,306) | 同上 |
+| GB4 W2 / W4 | 24,190,865 / 21,837,182 | 24,988,093 (+797,228) / 22,634,564 (+797,382) | boot の最後が timer の 1 tick 後にずれた。W2 の旧と新の probe の列は 24.1M cy まで record の差が数千に収まり、旧は "Run /init" の後すぐ power down するが、新は "Run /init" が 24.12M の probe の後に出て、secondary の trap が各 +2 (timer 1 回分) で、約 797k cy 後に power down する。W2 と W4 で同じ量で、cosim の割込みの数も W2 334 → 348、W4 306 → 322 と増えた |
+| GH W2 / W4 | 18,611,543 / 16,187,826 | 18,619,780 (+8,237) / 16,180,476 (−7,350) | 下の注 |
+| spike cosim (N=1 の 4 本、hvlinux、5.15 SMP N=2/N=4) | 不一致 0 | W2/W4 とも不一致 0、cycle は native と一致 | |
+
+- 注 (時刻のずれ): lockstep でない boot は mtime を cycle で進めるので、reset 直後の数命令 (firmware の 8 命令。5.15/6.6 の patch では 5 命令と trampoline への jump) で全体が数十 cycle ずれると、timer の割込みが入る命令の位置が変わり、kernel の時刻に依存する経路 (idle、遅延のループ、RCU) の命令数が変わる。record 数も boot ごとに数千から数万違う。retire 数で mtime を進め割込みの schedule を再生する GL-B では、変わったのは firmware の命令と mtime の位相による +2 だけで、hash は golden と一致した。RTL の変更そのものは cycle に効かない: 旧の `pmp_check` と新しい firmware の組で回した 7.1/7.1v の N=1 (W2/W4、12 byte の block の版) は、新しい `pmp_check` との組と cycle と hash まで一致した (entry 0 がすべての access に一致するので、一致しない場合の項は使われない)。
+- litmus と cbench は image が変わっていないので回していない (どちらも S/U に降りない)。
+- wall 時間 (worktree 12 本を並行、load average 最大約 74。1 回の `veryl test` の中の複数の boot は並行): G0 6,117 s、ACT pmp の cosim W2 422 s、W4 1,021 s、GC W2 731 s、W4 1,095 s、N=1 の 5 本 W2 3,637 s、W4 8,091 s、N=2/N=4 の 4 本 W2 15,471 s、W4 36,902 s、GH と その cosim W2 3,346 s、W4 8,673 s、N=1 の cosim 4 本 W2 3,896 s、W4 8,497 s、SMP の cosim 2 本 W2 17,376 s、W4 37,612 s。
 
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 

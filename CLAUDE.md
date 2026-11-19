@@ -121,17 +121,17 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
      memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (**19,382,092 cycles**, ~30 min). N=1 single-hart is `--ignored --test
-     test_soc_linux_boot` (**14,617,653 cycles**, ~7 min). The N=1 boot in golden
+     (**19,382,030 cycles**, ~30 min). N=1 single-hart is `--ignored --test
+     test_soc_linux_boot` (**14,633,581 cycles**, ~7 min). The N=1 boot in golden
      lockstep (retire-count mtime, trace hash checked against the old-core golden) is
-     `--ignored --test test_w2_linux_boot_lockstep` (14,570,718 cycles, ~7 min); run it
+     `--ignored --test test_w2_linux_boot_lockstep` (14,571,787 cycles, ~7 min); run it
      after any change that can alter the retire stream.
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: N=4 SMP Linux boot
-     (**24,190,865 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (21,837,182
+     (**24,988,093 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (22,634,564
      cycles, ~5 h at ~1.3k cy/s). The Verilator wrappers give identical cycle counts
      and serve as the NBA cross-check, not the gate.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
-     hypervisor (**18,611,543 cycles**, ~10 min). The only gate that runs the
+     hypervisor (**18,619,780 cycles**, ~10 min). The only gate that runs the
      two-stage (V=1) MMU under load; the native boots never leave single-stage
      translation, so a change to the dmem MMU or the load path can pass steps 1-4
      and still deadlock here. Needs `test/hv/hv_dram.hex` (gitignored; see the

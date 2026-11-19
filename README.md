@@ -190,7 +190,7 @@ own type-1 hypervisor. See **Verification**.
 | Linux **5.15** SMP boot, 1 / 2 / 4-hart                                     | pass (W2: 14.6 / 19.4 / 25.0M cycles; W4: 12.3 / 16.8 / 22.6M) |
 | Linux **5.15** SMP boot, 8-hart                                             | declared, not yet verified on the current core |
 | Linux **6.6 LTS** boot (RVA23 device tree), 1 / 2-hart                      | pass (W2 1-hart: 21.4M cycles) |
-| Linux **7.1** boot (RVA23 + userspace FP), 1 / 2-hart                       | pass (W2 1-hart: 19.2M cycles) |
+| Linux **7.1** boot (RVA23 + userspace FP), 1 / 2-hart                       | pass (W2 1-hart: 19.3M cycles) |
 | Linux **7.1 + Vector** boot (`test_soc_71v_linux_boot`, V-aware kernel)      | pass (W2: 20.7M cycles, 1-hart) |
 | **Guest Linux** boot under a type-1 hypervisor (H extension, two-stage MMU)  | pass (W2: 18.6M cycles; W4: 16.2M) |
 | RVWMO litmus, 4-hart                                                        | pass (W2: 5.03M cycles) |

@@ -5168,8 +5168,8 @@ MI の進捗:
   - RVFI (構造): riscv-formal (`c992aa61`) の定義と信号ごとに比べた。標準の信号は一致した。FP の提案の `rvfi_frs*_rvalid`/`rvfi_frd_wvalid` と `rvfi_csr_fcsr_*`、仮想記憶の提案の `rvfi_csr_satp_*` を足し、`rvfi_adapter_chk` は record も source も見なかった run を fail にするようにした (`e9c64cdb`)。差として宣言するもの: 名前付き CSR の port は op 自身の Zicsr access だけを出し、trap の入口、xRET、FP の flag の累積、別の view からの更新を出さないので、riscv-formal の CSR の一貫性の検査はそのままでは使えない (riscv-formal をつなぐ V6 で扱う)。PTE と `rvfi_pc_paddr` は出さない。充足 (宣言付き)。
   - cold-reader gate (構造): 新しい module と component、生成器、runner を読み、コメントの誤り (pmp_check のヘッダと全 OFF の記述、platform.rs の Svrsw60t59b の記述など) と em-dash を直した (`ece68b61`、コメントだけ)。充足。
   - GCV (構造): 手順 5 で記録済み (§9.11)。充足。
-  - 未解決 (ユーザ判断待ち): cold-reader gate の途中で、PMP の全 entry が OFF のとき DUT が S/U の access を通す (特権仕様は entry が 1 つでも実装されていれば一致しない S/U の access を失敗させる) ことが分かった。spike は reset で entry 0 を全域 RWX にするので、PMP を書かない program では差が出ず、GC は見ていなかった。directed `mv_pmp_off` (`89de4180`、gate list の外) は HEAD で W2/W4 とも fail (0x742)、no-match の項を直すと cosim 付きで pass するが、PMP を書かずに S/U に入る G0 の 53 本が落ちる。直すには reset 値の方針 (entry 0 を全域にするか、test を直すか) を決める必要があり、fetch、LSU、PTW の PMP に効くので修正していない。
-  - 推奨: MV の出口条件は、必須の 4 項目と構造の 3 項目を満たす。PMP の全 OFF の逸脱は MV が持ち込んだものではなく (旧コアからの `pmp_check`)、MV の照合で見つかった既存の差なので、宣言して MV を閉じ、修正 (reset 値の方針と N=4 boot を含む gate) を MS の前の独立の項目にすることを勧める。
+  - PMP の全 entry が OFF のとき S/U の access を通す逸脱 (cold-reader gate の途中で `mv_pmp_off` が見つけた、旧コアからの `pmp_check` の差): 2026-11-19 のユーザの決定で直した (一致しない S/U の access は常に fault、reset 値は 0 のまま、S/U に降りる firmware と test が全域の entry を書く。`e45cd7e9`)。gate と cycle 数は検証計画 §9.14。
+  - 推奨: MV の出口条件は、必須の 4 項目と構造の 3 項目を満たす。PMP の全 OFF の逸脱は上のとおり直した。
 
 ### MS: 合成可能性
 
