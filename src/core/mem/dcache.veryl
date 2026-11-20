@@ -24,7 +24,8 @@
 //   o_ev1/ev2       : this cycle's local departures of a line (victim, probe,
 //                     write-through drain of the own copy)
 //   o_memr_*, o_memw_*, i_fill_excl : the mem_ctrl read slot and write
-//                     channel, unchanged from the reused dcache
+//                     channel, unchanged from the reused dcache; o_memr_cmo
+//                     marks the slot's single-beat request as a CMO_HOME
 //   i_kill          : applied in the decision cycle to a request whose
 //                     MemTag.rob is valid
 //   o_idle          : registered state only: no live MSHR entry, no held
@@ -46,17 +47,20 @@
 //         (a 1-dword LOAD/PTW_READ of the arrived critical dword), else
 //         MISS(the entry's fill id)
 //       5 an entry holds another line of its set, or no entry is free ->
-//         RETRY(FILL_BUSY)
+//         RETRY(FILL_BUSY); the line is held by a CMO -> RETRY(CMO_BUSY)
 //       6 MISS(new fill id): it allocates (the oldest of the cycle; the drain
 //         when urgent or alone) or attaches to the line allocated this cycle
 //   - STORE_EXCL is decided in A: owned hit -> EXCL_PASS (merged on this
 //     edge), not owned or an invalidate/unpinned probe of the line ->
 //     EXCL_FAIL, a bank or set taken by a fill -> RETRY(BANK_CONFLICT)
-//   - UNC_READ and STORE_WT answer PENDING(id) and CMO answers HIT; each
-//     holds the single nf slot until the uncached read is granted (UNC_DONE),
-//     the write fires (WT_DONE), or the line is in neither the arrays nor
-//     the writeback buffer; a request finding the slot held gets
-//     RETRY(BANK_CONFLICT)
+//   - UNC_READ, CMO_HOME and STORE_WT answer PENDING(id) and CMO answers
+//     HIT; each holds the single nf slot until the uncached read or the
+//     CMO_HOME is granted (UNC_DONE), the write fires (WT_DONE), or the line
+//     is in no MSHR entry, the arrays nor the writeback buffer; a request
+//     finding the slot held gets RETRY(BANK_CONFLICT)
+//   - while the slot holds a CMO or CMO_HOME, a miss on its line allocates
+//     no MSHR entry (RETRY(CMO_BUSY)); a fill already running finishes
+//     before the CMO drops the line
 //   - a data bank serves one row per cycle: requests on the same row share
 //     it, otherwise the oldest wins; a writeback capture reads every bank
 //   - a bank takes one write per cycle: the fill beat, else the exclusive or
@@ -123,6 +127,7 @@ pub module dcache::<CFG: core_cfg> #(
     o_memr_ren  : output logic    ,
     o_memr_rfo  : output logic    ,
     o_memr_line : output logic    ,
+    o_memr_cmo  : output logic    ,
     o_memr_req  : output logic    ,
     i_memr_grant: input  logic    ,
     i_mem_rdata : input  logic<64>,
@@ -327,11 +332,15 @@ pub module dcache::<CFG: core_cfg> #(
     var cap_q    : logic        ;
     var cap_way_q: logic<2>     ;
 
-    let sl_unc: logic = sl_v && sl_q.cls == MemCls::UNC_READ;
-    let sl_wt : logic = sl_v && sl_q.cls == MemCls::STORE_WT;
-    let sl_cmo: logic = sl_v && sl_q.cls == MemCls::CMO;
+    let sl_home: logic = sl_v && sl_q.cls == MemCls::CMO_HOME;
+    let sl_unc : logic = sl_v && (sl_q.cls == MemCls::UNC_READ || sl_home);
+    let sl_wt  : logic = sl_v && sl_q.cls == MemCls::STORE_WT;
+    let sl_cmo : logic = sl_v && sl_q.cls == MemCls::CMO;
+    let sl_line: logic<50> = sl_q.pa[55:6];
+    let cmo_blk: logic     = sl_cmo || sl_home;
 
-    let clean_sel: logic     = sl_cmo && !i_probe_v;
+    var lk_hit : logic          [LK_N];
+    let clean_sel: logic     = sl_cmo && !i_probe_v && !lk_hit[MW];
     let pr_v     : logic     = i_probe_v || clean_sel;
     let pr_line  : logic<50> = if clean_sel ? sl_q.pa[55:6] : i_probe_addr[55:6];
     let pr_self  : logic     = i_probe_self || clean_sel;
@@ -383,6 +392,7 @@ pub module dcache::<CFG: core_cfg> #(
     assign o_memr_addr = if own_unc_q ? {8'd0, sl_q.pa} : mshr_rd_adr;
     assign o_memr_rfo  = !own_unc_q && mshr_rd_rfo;
     assign o_memr_line = !own_unc_q;
+    assign o_memr_cmo  = own_unc_q && sl_home;
     assign o_memr_ren  = if own_unc_q ? i_memr_grant : mshr_rd_fil || (mshr_rd_req && i_memr_grant);
 
     let beat   : logic    = fill_v && mshr_grant;
@@ -401,7 +411,7 @@ pub module dcache::<CFG: core_cfg> #(
     // ---- write side: the WT of the nf slot, else the drain ----
 
     let d_line: logic<50>      = i_drain_addr[55:6];
-    let w_line: logic<50>      = if sl_wt ? sl_q.pa[55:6] : d_line;
+    let w_line: logic<50>      = if sl_wt || sl_cmo || sl_home ? sl_line : d_line;
     always_comb {
         for p in 0..MW {
             tc_ln[p] = a_line[p];
@@ -416,7 +426,6 @@ pub module dcache::<CFG: core_cfg> #(
     let w_hit : logic          = w_hv != 4'd0;
     let w_way : logic<2>       = enc4(w_hv);
     let w_excl: logic          = (w_hv & tc_excl[TC_W]) != 4'd0;
-    var lk_hit : logic          [LK_N];
     var lk_fid : FillId         [LK_N];
     var lk_wait: logic          [LK_N];
     var lk_cv  : logic          [LK_N];
@@ -447,7 +456,7 @@ pub module dcache::<CFG: core_cfg> #(
     // Write channel: the writeback buffer, then the slot's WT, then a full
     // line drain.
     let wb_req  : logic = wb_v_q && wb_rdy_q;
-    let dv      : logic = i_drain_v && !sl_wt;
+    let dv      : logic = i_drain_v && !sl_wt && !sl_cmo && !sl_home;
     var d_full  : logic;
     var d_bk    : logic<NB>;
     always_comb {
@@ -588,7 +597,8 @@ pub module dcache::<CFG: core_cfg> #(
 
     // Decisions in A of the HEAD port: STORE_EXCL and the nf slot.
     let h_cls  : MemCls = a_q[HEAD_PORT].cls;
-    let h_nf   : logic  = a_v[HEAD_PORT] && (h_cls == MemCls::UNC_READ || h_cls == MemCls::STORE_WT || h_cls == MemCls::CMO);
+    let h_nf   : logic  = a_v[HEAD_PORT] && (h_cls == MemCls::UNC_READ || h_cls == MemCls::STORE_WT || h_cls == MemCls::CMO
+        || h_cls == MemCls::CMO_HOME);
     let nf_acc : logic  = h_nf && !sl_v;
     var h_ar   : MemResp;
     always_comb {
@@ -627,6 +637,7 @@ pub module dcache::<CFG: core_cfg> #(
     var v_miss : logic<MW>; // rows 4-6
     var v_crit : logic<MW>;
     var v_cand : logic<MW>; // may allocate
+    var v_cblk : logic<MW>; // a CMO holds the line
     var v_rtag : logic<ROB_TAG_W> [MW];
     var v_xl   : logic<MW>;
     always_comb {
@@ -639,7 +650,8 @@ pub module dcache::<CFG: core_cfg> #(
             v_miss[p]  = rdv && !v_kill[p] && !v_race[p] && !v_hitok[p];
             v_crit[p]  = v_miss[p] && lk_hit[p] && lk_cv[p] && !v_xl[p] && s1_q[p].mask[15:8] == 8'd0
                 && lk_cdw[p] == s1_q[p].pa[5:3];
-            v_cand[p]  = v_miss[p] && !lk_hit[p] && !lk_set[p] && mshr_free;
+            v_cblk[p]  = v_miss[p] && !lk_hit[p] && cmo_blk && v_line[p] == sl_line;
+            v_cand[p]  = v_miss[p] && !lk_hit[p] && !lk_set[p] && mshr_free && !v_cblk[p];
             v_rtag[p]  = {s1_q[p].tag.rob.wrap, s1_q[p].tag.rob.idx};
         }
     }
@@ -699,6 +711,8 @@ pub module dcache::<CFG: core_cfg> #(
             } else if lk_hit[p] {
                 v_resp[p].kind    = RespKind::MISS;
                 v_resp[p].fill_id = lk_fid[p];
+            } else if v_cblk[p] {
+                v_resp[p].reason = RetryReason::CMO_BUSY;
             } else if v_new[p] {
                 v_resp[p].kind = RespKind::MISS;
             }
@@ -1025,7 +1039,7 @@ pub module dcache::<CFG: core_cfg> #(
         o_perf.alloc       = alloc_v && !d_win;
         o_perf.mshr_live2  = mshr_live2;
         o_perf.alloc_ovl   = alloc_v && mshr_live1;
-        o_perf.r_fill_busy = (k & v_miss & ~lk_hitv & ~v_new) != '0;
+        o_perf.r_fill_busy = (k & v_miss & ~lk_hitv & ~v_new & ~v_cblk) != '0;
         o_perf.r_inv_race  = v_race != '0;
         o_perf.r_preempted = v_kill != '0 || (k & v_hitok & s1_prev) != '0;
         o_perf.r_bank      = (k & v_hitok & ~s1_prev & ~s1_bokv) != '0;
@@ -1051,7 +1065,7 @@ pub module dcache::<CFG: core_cfg> #(
     }
     #[ifdef(HELIODOR_CHK)]
     {
-        var c_bad: logic<6>;
+        var c_bad: logic<7>;
         var c_mv : logic  [MW];
         var c_mf : FillId [MW];
         always_comb {
@@ -1061,12 +1075,13 @@ pub module dcache::<CFG: core_cfg> #(
             }
         }
         always_comb {
-            c_bad    = 6'd0;
+            c_bad    = 7'd0;
             c_bad[1] = i_req_valid[HEAD_PORT] && np_any;
             c_bad[2] = (sl_unc || sl_wt) && sl_q.tag.rob_v && killed(i_kill, sl_q.tag.rob);
             c_bad[3] = done_in && sk_q.valid && !sk_out;
             c_bad[4] = d_wconf;
             c_bad[5] = own_unc_q && (mshr_rd_req || fill_v);
+            c_bad[6] = sl_home && unc_grant && (w_hit || (wb_v_q && wb_line_q == sl_line));
         }
         inst u_chk: chk_dcache::<CFG> (
             clk                   ,

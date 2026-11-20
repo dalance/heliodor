@@ -46,6 +46,20 @@
 // the slot keeps every other accept off the line, so no L1 can own it again
 // before the write, and the write invalidates every sharer.
 //
+// CMO_HOME (i_hcmo with i_hunc, a hart's D slot): the flush of one line
+// for cbo.clean/flush/inval, after the requester dropped its own copy. It
+// waits in LOOKUP like an uncached read, so the recall engine brings an
+// owned line home (a dirty copy enters the write buffer), then, in the one
+// cycle it proceeds, invalidates every listed sharer on an inv port and
+// the line in the L2 (o_l2_cinv_v), and records the write-buffer entries
+// of the line. It holds the line in ST_UNCD until each of them has its B,
+// then grants for one cycle: the line is in no cache and its last write is
+// in DRAM. Holding the slot keeps every accept off the line, so no cache
+// can take the line again before the grant. Progress: the recall and the
+// inv-port wait end as for an uncached read or an RFO, the recorded entries
+// drain in order, and the requester has at most one CMO_HOME (its single
+// D slot), so no retry is involved.
+//
 // Protocol invariant relied upon: an accept grant ALWAYS starts the L1 fill
 // (the requester suppresses its request when it could not start the fill).
 //
@@ -112,6 +126,8 @@ pub module mem_ctrl #(
     // grant.
     i_hunc : input  logic [N_SLOTS],
     i_hrom : input  logic [N_SLOTS], // the i_hunc read targets ROM (o_perf only)
+    // The i_hunc request is a CMO_HOME (see the header).
+    i_hcmo : input  logic [N_SLOTS],
     o_hexcl: output logic [N_SLOTS],
     // The SBA slot's request is a write; o_sba_wok (registered) holds the
     // line for it.
@@ -131,6 +147,9 @@ pub module mem_ctrl #(
     o_cadd_v     : output logic          ,
     o_cadd_hart  : output logic<3>       ,
     o_cadd_own   : output logic          ,
+    // A CMO_HOME invalidates the c-port line in the L2 (with its directory
+    // entry) this cycle.
+    o_l2_cinv_v  : output logic          ,
     i_l2_c_shr   : input  logic<N_HARTS> ,
     i_l2_c_owned : input  logic          ,
     // L2 full-line install port (gathered DRAM line).
@@ -242,6 +261,10 @@ pub module mem_ctrl #(
     o_w_cadd_own : output logic   ,
     // Event wires; wb_full is left 0 (the SoC sees the write requests).
     o_perf: output soc_pkg::McPerf,
+    // Sticky (HELIODOR_CHK only, else 0): while a CMO_HOME holds its line
+    // after invalidating it, another slot became active on the line, or the
+    // line was installed in the L2 or added to the directory.
+    o_chk: output logic,
 ) {
     // Slot states.
     const ST_IDLE   : logic<3> = 3'd0;
@@ -266,6 +289,10 @@ pub module mem_ctrl #(
     var rfo_all    : logic     [N_SLOTS]    ; // P9.2: slot transaction is an RFO
     var iread_all  : logic     [N_SLOTS]    ; // P9.6: slot transaction is an I-read (uncounted)
     var unc_all    : logic     [N_SLOTS]    ; // slot transaction is an uncached single beat
+    var cmo_all    : logic     [N_SLOTS]    ; // ... which is a CMO_HOME
+    var cmo_go_all : logic     [N_SLOTS]    ; // the CMO_HOME invalidates its line this cycle
+    var wbl_all    : logic<WB_N> [N_SLOTS]  ; // write-buffer entries of the slot's line, less this cycle's B
+    var wb_bclr    : logic<WB_N>            ; // the entry whose B arrives this cycle (the oldest)
     var dw_all     : logic<3>  [N_SLOTS]    ; // the dword of an uncached beat
     var rom_all    : logic     [N_SLOTS]    ; // ... which targets ROM (o_perf only)
     var rd_fly     : logic     [N_SLOTS]    ; // AR presented or R beats arriving
@@ -435,6 +462,8 @@ pub module mem_ctrl #(
         var rom_q  : logic        ;
         var excl_q : logic        ; // grant state (E/M vs S), set at grant
         var wr_q   : logic        ; // the SBA slot's transaction is a write
+        var cmo_q  : logic        ; // the transaction is a CMO_HOME
+        var pend_q : logic<WB_N>  ; // write-buffer entries of the line a CMO_HOME waits for
         var buf_q  : logic<64> [8];
 
         assign st_all[h]    = st_q;
@@ -444,6 +473,7 @@ pub module mem_ctrl #(
         assign rfo_all[h]   = rfo_q;
         assign iread_all[h] = iread_q;
         assign unc_all[h]   = unc_q;
+        assign cmo_all[h]   = cmo_q;
         assign rom_all[h]   = rom_q;
         // The uncached requester may leave (kill) or move to another line.
         let unc_live: logic = i_hreq[h] && i_hunc[h] && (i_haddr[h][63:6] == line_q);
@@ -473,6 +503,8 @@ pub module mem_ctrl #(
                 rom_q   = 1'b0;
                 excl_q  = 1'b0;
                 wr_q    = 1'b0;
+                cmo_q   = 1'b0;
+                pend_q  = '0;
                 for l in 0..8 {
                     buf_q[l] = 64'd0;
                 }
@@ -492,6 +524,7 @@ pub module mem_ctrl #(
                             rom_q   = i_hunc[h] && i_hrom[h];
                             excl_q  = 1'b0;
                             wr_q    = h == SBA_S && i_sba_wr;
+                            cmo_q   = h <: N_HARTS && i_hunc[h] && i_hcmo[h];
                             st_q    = ST_LOOKUP;
                         }
                     }
@@ -503,6 +536,11 @@ pub module mem_ctrl #(
                         if unc_q {
                             if !unc_live {
                                 st_q = ST_IDLE;
+                            } else if cmo_q {
+                                if cmo_go_all[h] {
+                                    pend_q = wbl_all[h];
+                                    st_q   = ST_UNCD;
+                                }
                             } else if lk_sel_all[h] && !(i_l2_chit && i_l2_c_owned) {
                                 st_q = if wr_q ? ST_UNCD : ST_AR;
                             }
@@ -592,7 +630,12 @@ pub module mem_ctrl #(
                         }
                     }
                     ST_UNCD: {
-                        if !wr_q || !unc_live || (i_w_valid && i_w_sba) {
+                        if cmo_q {
+                            if pend_q == '0 || !unc_live {
+                                st_q = ST_IDLE;
+                            }
+                            pend_q = pend_q & ~wb_bclr;
+                        } else if !wr_q || !unc_live || (i_w_valid && i_w_sba) {
                             st_q = ST_IDLE;
                         }
                     }
@@ -607,12 +650,13 @@ pub module mem_ctrl #(
         // beat, or the legacy (MMIO) combinational passthrough of the bus
         // grant.
         let legacy : logic = i_hreq[h] && !i_hdram[h] && !i_hunc[h];
-        let unc_dlv: logic = (st_q == ST_UNCD) && !wr_q && unc_live && (i_haddr[h][5:3] == dw_q);
+        let unc_dlv: logic = (st_q == ST_UNCD) && !wr_q && !cmo_q && unc_live && (i_haddr[h][5:3] == dw_q);
+        let cmo_dlv: logic = (st_q == ST_UNCD) && cmo_q && unc_live && pend_q == '0;
         // A STREAM beat is granted only to a consumer addressing this slot's
         // line: the core's routing of the shared read port can drift
         // mid-STREAM, and mismatched beats must stream out unconsumed.
         let stream_ok: logic = (st_q == ST_STREAM) && (i_haddr[h][63:6] == line_q);
-        assign o_hgrant[h] = (accept[h] && !i_hunc[h]) || stream_ok || unc_dlv || (legacy && slot_bus_gnt[h]);
+        assign o_hgrant[h] = (accept[h] && !i_hunc[h]) || stream_ok || unc_dlv || cmo_dlv || (legacy && slot_bus_gnt[h]);
         assign o_hrdata[h] = buf_q[i_haddr[h][5:3]];
         assign o_hexcl[h]  = excl_q;
 
@@ -697,20 +741,25 @@ pub module mem_ctrl #(
         }
     }
     var lk_rfo: logic;
+    var lk_cmo: logic;
     var lk_cf : logic;
     always_comb {
         lk_rfo = 1'b0;
+        lk_cmo = 1'b0;
         lk_cf  = 1'b0;
         for h in 0..N_SLOTS {
             if lk_sel_all[h] {
                 lk_rfo = rfo_all[h];
+                lk_cmo = cmo_all[h];
                 lk_cf  = conf_all[h];
             }
         }
     }
     let lk_others  : logic<N_HARTS> = i_l2_c_shr & ~lk_oh;
+    // An RFO invalidates the other sharers, a CMO_HOME every sharer.
+    let lk_imask   : logic<N_HARTS> = if lk_cmo ? i_l2_c_shr : lk_others;
     let lk_hit_ok  : logic          = lk_v && !lk_cf && i_l2_chit && !i_l2_c_owned;
-    let lk_need_inv: logic          = lk_hit_ok && lk_rfo && (lk_others != '0);
+    let lk_need_inv: logic          = lk_hit_ok && (lk_rfo || lk_cmo) && (lk_imask != '0);
     // lk_inv_granted comes from the inv-port arbitration below (var).
     var lk_inv_granted: logic;
     let lk_go: logic = lk_hit_ok && (!lk_need_inv || lk_inv_granted);
@@ -725,6 +774,13 @@ pub module mem_ctrl #(
     for h in 0..N_SLOTS :gen_lkgo {
         assign lk_go_all[h] = lk_sel_all[h] && lk_go && !unc_all[h];
     }
+    // A CMO_HOME proceeds once the line is unowned, no write to it is granted
+    // this cycle, and its sharers (if any) have an inv port.
+    let cmo_go: logic = lk_cmo && lk_v && !lk_cf && !(i_l2_chit && i_l2_c_owned) && (!lk_need_inv || lk_inv_granted);
+    for h in 0..N_SLOTS :gen_cmogo {
+        assign cmo_go_all[h] = lk_sel_all[h] && cmo_go;
+    }
+    assign o_l2_cinv_v = cmo_go && i_l2_chit;
     // Recall request: lookup hit on an OWNED line (owner = the one-hot mask).
     let lk_recall_req: logic = lk_v && !lk_cf && i_l2_chit && i_l2_c_owned;
     var lk_owner: logic<3>;
@@ -797,6 +853,16 @@ pub module mem_ctrl #(
         }
     }
     let wb_enq: logic = i_w_valid && in_any;
+    always_comb {
+        for e in 0..WB_N {
+            wb_bclr[e] = i_bvalid && wb_hd == e as WBI;
+        }
+        for h in 0..N_SLOTS {
+            for e in 0..WB_N {
+                wbl_all[h][e] = wb_v[e] && wb_line[e] == line_all[h] && !wb_bclr[e];
+            }
+        }
+    }
 
     let aw_hs  : logic     = o_awvalid && i_awready;
     let w_hs   : logic     = o_wvalid && i_wready;
@@ -1057,8 +1123,8 @@ pub module mem_ctrl #(
     assign o_inv1_addr = if ev_w1_v ? {w_line, 6'd0} : if i_on_p1 ? ev_i_addr : {lk_line, 6'd0};
     assign o_inv2_addr = if ev_w2_v ? {w_line_hi, 6'd0} : if i_on_p2 ? ev_i_addr : {lk_line, 6'd0};
     for h in 0..N_HARTS :gen_inv_out {
-        assign o_inv1_v[h] = if ev_w1_v ? ev_w1_mask[h] : if i_on_p1 ? ev_i_mask[h] : (l_on_p1 && lk_others[h]);
-        assign o_inv2_v[h] = if ev_w2_v ? ev_w2_mask[h] : if i_on_p2 ? ev_i_mask[h] : (l_on_p2 && lk_others[h]);
+        assign o_inv1_v[h] = if ev_w1_v ? ev_w1_mask[h] : if i_on_p1 ? ev_i_mask[h] : (l_on_p1 && lk_imask[h]);
+        assign o_inv2_v[h] = if ev_w2_v ? ev_w2_mask[h] : if i_on_p2 ? ev_i_mask[h] : (l_on_p2 && lk_imask[h]);
     }
 
     // Go/hold for the selected INSTALL slot. Phase B: an OWNED victim must
@@ -1200,6 +1266,11 @@ pub module mem_ctrl #(
         o_perf.r_err      = r_err;
         o_perf.b_err      = b_err;
         for h in 0..N_SLOTS {
+            if st_all[h] == ST_UNCD && cmo_all[h] && o_hgrant[h] {
+                o_perf.cmo = 1'b1;
+            }
+        }
+        for h in 0..N_SLOTS {
             if ar_wt[h] && ar_haz[h] {
                 o_perf.i1_hold = 1'b1;
             }
@@ -1220,4 +1291,36 @@ pub module mem_ctrl #(
             }
         }
     }
+
+    #[ifdef(HELIODOR_CHK)]
+    {
+        var chk_q: logic;
+        var bad  : logic;
+        always_comb {
+            bad = 1'b0;
+            for h in 0..N_SLOTS {
+                if st_all[h] == ST_UNCD && cmo_all[h] {
+                    if (o_l2_inst_v && o_l2_inst_addr[63:6] == line_all[h]) || (o_cadd_v && o_l2_caddr[63:6] == line_all[h])
+                        || (o_w_cadd_v && w_line == line_all[h]) {
+                        bad = 1'b1;
+                    }
+                    for g in 0..N_SLOTS {
+                        if g != h && st_all[g] != ST_IDLE && line_all[g] == line_all[h] {
+                            bad = 1'b1;
+                        }
+                    }
+                }
+            }
+        }
+        always_ff (clk, rst) {
+            if_reset {
+                chk_q = 1'b0;
+            } else if bad {
+                chk_q = 1'b1;
+            }
+        }
+        assign o_chk = chk_q;
+    }
+    #[ifndef(HELIODOR_CHK)]
+    assign o_chk = 1'b0;
 }
