@@ -1,6 +1,6 @@
 # Phase 15 MS: 配列の棚卸しと分類規則 (手順 1、2)
 
-設計書 §MS の手順 1 (棚卸し) と手順 2 (分類の規則) の成果物。手順 2 の規則と閾値、違反の直し方、Design Compiler を足すかは **判断待ち** (ユーザが決める)。本書は RTL を変えていない (`phase15/ms`、`e5b77300` の時点のソース)。
+設計書 §MS の手順 1 (棚卸し) と手順 2 (分類の規則) の成果物。手順 2 の規則と閾値、違反の直し方、Design Compiler を足すかは 2026-11-20 にユーザが決めた (各節の【決定】と設計書 §MS)。本書の棚卸しは RTL を変えていない (`phase15/ms`、`e5b77300` の時点のソース)。
 
 ## 0. 方法
 
@@ -149,7 +149,7 @@
 
 大きい順 (1 個あたり、W4): `bp_btb` payload 1.22 Mbit、`l2cache.data` 256 Kbit × 4、`icache_array.data` 64 Kbit × 4、`dcache_bank` 32 Kbit × 4 (W2 は 64 Kbit × 2)、`l2cache.tag` 25 Kbit × 4 × 5 組、`bp_btb` valid 20 Kbit、`rob.ent_q` 12.5 Kbit、`ftq` 11.9 Kbit、`prf` int 10 Kbit、`sb` 10 Kbit (F)、`lq.e_xexc` 9 Kbit。合計で見ると、旧コアの棚卸しに無かった `bp_btb` (新しいフロントエンドの BTB、W4 で 1.2 Mbit) が L2 のデータ (1 Mbit) より大きい。
 
-## 2. 分類の規則 (提案、判断待ち)
+## 2. 分類の規則 (2026-11-20 に決定)
 
 ### 2.1 3 つの区分
 
@@ -171,26 +171,26 @@
 3. 多ポートで同期読みにできない構造 (PRF、ROB の payload、wakeup の CAM) は、実在のコアでも FF の RF か latch 配列で作る。その最大 (W4 の `rob.ent_q` 12.5 Kbit、`prf` int 10 Kbit) が 16 Kbit 未満に収まるので、T_S = 16 Kbit なら構成を大きくしない限り R と F は破れない。W4 を将来広げる (ROB 256 など) と `rob.ent_q` が T_S を超えるので、そのときは lane ごとの bank 分けが要る。
 4. 単位を「1 個の配列」(同じ index と同じ口を持つ field の束) にしたのは、`rob` のように口の違う field (dispatch で書く `ent_q` と WB で書く `obs_q`) を足し合わせると、実在しない「巨大な多ポート配列」を作ってしまうため。
 
-判断待ち: T_S と T_R の値 (16 Kbit / 4 Kbit)、単位の決め方、`C/R` を S の同期読みとして認めるか。
+【決定】(2026-11-20、ユーザ) 推奨どおり。T_S = 16 Kbit (深さ 64 以上) は S が必須、4-16 Kbit (T_R の帯) は S にすべきで、R のままにするなら理由を本書に記録する。単位は配列 1 個 (index 空間が 1 つで口の組が 1 つ)。出力がレジスタにしか入らない組合せ読み (`C/R`) は同期読みとして数える。
 
 ### 2.3 規則を当てた結果: 違反の一覧と直し方
 
 | # | 配列 | 区分 | 違反 | 直し方の案 | リスク |
 |---|---|---|---|---|---|
 | V1 | `l2cache.data_0..3` (D12 と §MS が名指し) | S | S2: way を同じサイクルの tag 比較で選んでから読む。S3/S4: 非同期リセット付きの `always_ff` の中で書く。S4: 書きが RMW 形 (`(data & ~msk) \| (new & msk)`)。死んだ口 (`L2_READ_1R1W` の spec 読み、`!L2_PORTS_1R1W` の merge 読みと 2 本の書き) が生成 SV に残る | データ配列を `dcache_bank` と同じ形の 1R1W のモジュール (リセットの無い書き、byte enable の書き、登録済みの読み) に出し、4 way を同じ index で並列に読んで、登録済みの `ctm` で次のサイクルに選ぶ。merge は byte enable の書き込みで行うので古い行の読みは要らない。死んだ scaffold (`L2_READ_1R1W`、`L2_PORTS_1R1W = 0` の枝、`w_old_line`、`w_merged_line`) を消す。V14 の `v14_*` が共有するインタフェースを変える場合は D13 に従って V14 側も `veryl check` を通す | mem_ctrl の HIT_WAIT がすでに 1 サイクルの読みを隠しているので、サイクルは変わらない見込み。L2 の書き込みの原子性 (merge と install が同じサイクルに来ない、SoC の `wgrant_ok`) は今の規則のまま。ゲートは G0、N=2 boot、litmus N=4、N=4 boot (メモリ系の変更) |
-| V2 | `l2cache.tag_0..3` と L2 の tag 複製 4 組 | S (25 Kbit / way、深さ 512) | S2: 読みが C/L (lookup、install、engine、write、misaligned の各経路が同じサイクルにヒット判定を使う)。S3/S4: リセット付きの `always_ff` で書く。複製が 5 組で、tag の総量は 490 Kbit とデータの半分近い | 案 a (推奨): L2 の作り直しで tag の読みを 1 段パイプラインにし、tag と directory (`lv`、`own`、`shr`) を 1 語にまとめた way ごとの 1RW (または 1R1W) マクロ 1 組にする。mem_ctrl の各経路 (lookup、install、engine、write、misaligned) は 1 本の tag ポートを調停する (同じ line の直列化は今の per-line 規則がすでに持つ)。案 b: tag を R に分類し直す (閾値の例外)。案 b は 25 Kbit × 5 組の FF で、T_S を破る | 案 a は mem_ctrl の LOOKUP と write grant の時間関係が変わる。SMP の一貫性 (recall、veto、per-line の直列化) に触れるので、litmus N=4 と N=4 boot が必須。MS で最も大きい変更 |
+| V2 | `l2cache.tag_0..3` と L2 の tag 複製 4 組 | S (25 Kbit / way、深さ 512) | S2: 読みが C/L (lookup、install、engine、write、misaligned の各経路が同じサイクルにヒット判定を使う)。S3/S4: リセット付きの `always_ff` で書く。複製が 5 組で、tag の総量は 490 Kbit とデータの半分近い | 案 a (推奨): L2 の作り直しで tag の読みを 1 段パイプラインにし、tag と directory (`lv`、`own`、`shr`) を 1 語にまとめた way ごとの 1RW (または 1R1W) マクロ 1 組にする。mem_ctrl の各経路 (lookup、install、engine、write、misaligned) は 1 本の tag ポートを調停する (同じ line の直列化は今の per-line 規則がすでに持つ)。案 b: tag を R に分類し直す (閾値の例外)。案 b は 25 Kbit × 5 組の FF で、T_S を破る | 案 a は mem_ctrl の LOOKUP と write grant の時間関係が変わる。SMP の一貫性 (recall、veto、per-line の直列化) に触れるので、litmus N=4 と N=4 boot が必須。MS で最も大きい変更。【決定】(2026-11-20、ユーザ) 案 a |
 | V3 | `bp_btb` valid (`vld`、`s_v`、`t_v`) | F (16 / 20 Kbit) | F1: T_S 以上の F。全エントリのリセット | valid を payload の語に入れて S にし、リセット後に 4096 行を掃き出す FSM (4096 サイクル、その間は予測しない) か、2-3 bit の世代番号で無効化する。予測は正しさに影響しない (extract が全予測を検査する) | 低い。サイクル数はリセット直後だけ変わる (掃き出しの間は予測が無い)。GL-B の record 列と hash は変わらない見込み (予測は retire 列に出ない) |
 | V4 | `icache_array.data_0..3` | S | S2: way を同じサイクルの tag 比較で選んでから読む (C/R だが way 選択が前)。S4: 書きが RMW 形 | 4 way を `blk_i` で並列に読み、tag のヒットで次のサイクルに選ぶ (応答はもともと 1 サイクル後なので遅延は変わらない)。書きを 64 bit の書き込み enable の形にする | 低い。`IC_RESP_LAT = 1` は変わらない |
 | V5 | `rename.img_q` (§MS が名指し) | R | R4: リセット付きの `always_ff` の中で書く (書く文はリセットしない) | 書きをリセットの無い `always_ff` に移す。`ckv_q` と `own_q` はリセット付きのまま | 低い。値とサイクルは変わらない |
 | V6 | `mem_ctrl.wb_data`、`wb_strb` (§MS が名指し) | R | R3: payload を非同期リセットで 0 にする | payload のリセットを消す (有効は `wb_v` が持つ)。書きをリセットの無い `always_ff` に移す | 低い。リセット直後の値を誰も読まないことを `wb_v` で確かめる |
 | V7 | `rob.ent_q`、`snap_q`、`obs_q`、`res_q`、`ffl_q` | R | R4: リセット付きの `always_ff` の中で書く | V5 と同じ移動。`done_q`、`rec_q` はリセット付きの F として残す | 低い |
 | V8 | `dcache_tagbank.tags_0..3` (dcache の複製) | R (2.8 Kbit) | R4: リセット付きの `always_ff` の中で書く | 移動だけ。L2 側の複製は V2 で消える | 低い |
-| V9 | `prf.rf_q`、`vrf.vrf` | R | R3: payload を全エントリ 0 にリセットする | `prf`: x0 (int の pdst 0) だけを読み出し側で 0 に固定し、リセットを消す。`vrf`: リセットを消す。ただし v レジスタの初期値 0 に依存している tb (golden の lockstep、spike との cosim の初期状態) が無いかを先に確かめる | `vrf` は初期値の差が cosim と GL-B に出うる (判断待ち: 例外として残すか)。`prf` は低い |
+| V9 | `prf.rf_q`、`vrf.vrf` | R | R3: payload を全エントリ 0 にリセットする | `prf`: x0 (int の pdst 0) だけを読み出し側で 0 に固定し、リセットを消す。`vrf`: リセットを消す。ただし v レジスタの初期値 0 に依存している tb (golden の lockstep、spike との cosim の初期状態) が無いかを先に確かめる | `vrf` は初期値の差が cosim と GL-B に出うる。【決定】(2026-11-20、ユーザ) `vrf` もリセットを消す。ゲートで初期状態の差が出たら、tb から初期化する。`prf` は低い |
 | V10 | `lq.e_xexc` (W4 9 Kbit)、`icache_array.tags` (5.5 Kbit / way) | R (T_R 以上) | 違反ではない (推奨 S の帯)。R のままにする理由: `e_xexc` は E の書き (エントリごとの enable) で 1 口にまとまらない。icache の tag は C/L で、同じサイクルのヒット判定に要る | 記録だけ | — |
 
 違反ではないが確かめが要るもの:
 - `dcache_bank` (S): 書きが RMW 形で、読み出しレジスタの前方転送も mask を使う。Vivado が byte enable の 1R1W と認識するかは手順 4 の合成で確かめる。認識しなければ書き込みを byte ごとの `if` の形に書き換える (値は同じ)。
-- F に分類した `lq`/`sq`/`sb` の payload はリセット付きの `always_ff` の中で書かれる (無(rb))。F なので規則違反ではないが、FPGA ではリセットを clock enable に混ぜる論理が増える。手順 3 のついでに移すかは判断待ち。
+- F に分類した `lq`/`sq`/`sb` の payload はリセット付きの `always_ff` の中で書かれる (無(rb))。F なので規則違反ではないが、FPGA ではリセットを clock enable に混ぜる論理が増える。【決定】(2026-11-20、ユーザ) 手順 3 でこれらの payload の書きもリセットの無い `always_ff` に移す。
 
 ### 2.4 Vivado と Design Compiler (ツールの確認と提案)
 
@@ -201,7 +201,7 @@
 | Verilator 5.050 | `~/local/bin/verilator` | 既存 |
 | yosys | 無し | riscv-formal (§MV、D14) に要る。MS の後の作業で導入が要る |
 
-提案 (判断待ち): 手順 4 で Vivado の out-of-context 合成に加えて、**Design Compiler で S 区分の配列をブラックボックスにした合成**を足す。
+提案: 手順 4 で Vivado の out-of-context 合成に加えて、**Design Compiler で S 区分の配列をブラックボックスにした合成**を足す。【決定】(2026-11-20、ユーザ) 足す。
 - やり方: 手順 3 で S 区分の配列をすべて共通のラッパ (`sram_1r1w`、`sram_1rw`。シミュレーション用の振る舞いモデルを持つ) に置き換え、DC ではラッパを black box にして `compile` する。ラッパは「S 区分の配列が他に無い」ことの機械的な検査にもなる (DC の `Inferred memory devices` に S 級の大きさのメモリが残れば規則違反)。
 - 得るもの: ASIC で問題になる構造 (latch の推論、組合せループ、多重駆動、巨大な FF 配列) の検出と、R と F の実際の面積。Vivado は FPGA の推論しか見ないので、`C/R` を FPGA の block RAM の出力レジスタが吸収して ASIC で破綻するような差は DC でしか見えない。
 - 代金: 合成スクリプトの保守、ライセンスの占有、実行時間 (SoC 全体で数時間の見込み、未測定)。ゲートの頻度は節目ごと (MS の出口と以後のメモリ系の変更) にする案。

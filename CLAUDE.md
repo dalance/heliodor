@@ -115,7 +115,9 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
   1. `veryl test`: fast tests **+ the arch suite** (~830 tests, tens of minutes).
      The riscv-tests arch suites run on the default core as the `test_w2_*` modules
      (`tb/test_w2_rv64*.veryl`, with W4 copies in `tb/test_w4_*`), most of them in
-     golden lockstep. Fix any failures before proceeding.
+     golden lockstep. It also runs the CBO visibility tests (`test_*_cbo_vis_*`),
+     which check the DRAM behind the AXI port after cbo.clean/flush/inval. Fix any
+     failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart`: RVWMO litmus battery at N=4
      (IRIW + 4-way barrier/bus stress; **5,022,440 cycles**). The N=2 battery
      (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
@@ -131,7 +133,8 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      cycles, ~5 h at ~1.3k cy/s). The Verilator wrappers give identical cycle counts
      and serve as the NBA cross-check, not the gate.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
-     hypervisor (**18,619,780 cycles**, ~10 min). The only gate that runs the
+     hypervisor (**18,679,320 cycles**, ~10 min; the guest runs 2,048 CBOs, the
+     5.15 boots none, 6.6 4,096 and 7.1 2,048). The only gate that runs the
      two-stage (V=1) MMU under load; the native boots never leave single-stage
      translation, so a change to the dmem MMU or the load path can pass steps 1-4
      and still deadlock here. Needs `test/hv/hv_dram.hex` (gitignored; see the

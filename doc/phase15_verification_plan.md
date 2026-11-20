@@ -1315,6 +1315,43 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - litmus と cbench は image が変わっていないので回していない (どちらも S/U に降りない)。
 - wall 時間 (worktree 12 本を並行、load average 最大約 74。1 回の `veryl test` の中の複数の boot は並行): G0 6,117 s、ACT pmp の cosim W2 422 s、W4 1,021 s、GC W2 731 s、W4 1,095 s、N=1 の 5 本 W2 3,637 s、W4 8,091 s、N=2/N=4 の 4 本 W2 15,471 s、W4 36,902 s、GH と その cosim W2 3,346 s、W4 8,673 s、N=1 の cosim 4 本 W2 3,896 s、W4 8,497 s、SMP の cosim 2 本 W2 17,376 s、W4 37,612 s。
 
+### 9.15 MS: CBO (cbo.clean/flush/inval) の実装のゲート (2026-11-20)
+
+設計書 §MS の CBO の節 (案 A、2026-11-20 のユーザ決定) の実装 (`cfa614f3`) のゲート。メモリ系の変更なので N=4 boot を必須にした。比較の相手は §9.14 の値 (CLAUDE.md の梯子の値と同じ)。veryl は `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、JSON の `fell_back` は全 run で 0。
+
+#### 新しいテスト
+
+| テスト | 内容 | 結果 |
+|---|---|---|
+| `test_w{2,4}_cbo_vis_{1,2}hart` (G0、`#[ignore]` を外した) | `test/cmo/cbo_vis.S`。store の後の clean/flush (自分の dirty な line と、N=2 では hart 1 の dirty な line) を AXI の先の DRAM で検査し、tb が DRAM を書き換えた後の inval/flush の後の load が新しい値を読むこと (hart 1 の clean な copy を含む)。N=2 は SBA の読みも検査する | 4 本 pass。tohost = 1、backdoor の検査はすべて ok |
+| `test_w2_cbo_vis_{1,2}hart_{wr_lag,stall,reorder}` (G0、新規) | 同じ program を AXI の slave の WR_LAG (W と B が遅い)、STALL、REORDER で回す | 6 本 pass |
+| backdoor の retire 時の検査 (`BdOp.cbo`) | hart 0 が CBO を retire したサイクルに、その line の DRAM の値を検査する。CBO の完了が B を待つことの検査 | 全 10 本で ok。B を待たずに grant する変異を入れると WR_LAG の 1 hart で A と B が MISMATCH になることを確かめた |
+| `test_lsu_chk` | dcache の checker の新しい bit 9 が立つこと | pass |
+
+#### ゲート
+
+| ゲート | 前 (§9.14) | 後 | 差と原因 |
+|---|---|---|---|
+| G0 | 864 passed | 874 passed、0 failed、371 ignored | +10 は cbo_vis の 10 本 |
+| GL-B W2 / W4 | 14,571,787 / 12,261,972、record 10,417,784、hash `60e504ab77211f61` | 同じ (W2/W4 とも record と hash まで一致) | 5.15 の DT は Zicbom を広告せず、CBO は 0 回 |
+| GB1 W2 5.15 / 6.6 / 7.1 / 7.1v | 14,633,581 / 21,394,490 / 19,261,226 / 20,727,075 | 14,633,581 / 21,420,532 (+26,042) / 19,307,507 (+46,281) / 20,767,343 (+40,268) | 5.15 は一致 (CBO 0 回)。6.6 は CBO 4,096 回、7.1 と 7.1v は 2,048 回 (注 1) |
+| GB1 W4 5.15 / 6.6 / 7.1 / 7.1v | 12,286,122 / 18,323,463 / 16,700,556 / 17,768,385 | 12,286,122 / 18,310,751 (−12,712) / 16,735,285 (+34,729) / 17,870,364 (+101,979) | 同上 |
+| GT4 (litmus N=4) W2 / W4 | 5,022,440 / 5,023,457 | 同じ | CBO を含まない |
+| GH W2 / W4 | 18,619,780 / 16,180,476 | 18,679,320 (+59,540) / 16,161,015 (−19,461) | guest の kernel が CBO を 2,048 回 (V = 1 の CBO の経路を通る) |
+| GB2 W2 5.15 / 6.6 / 7.1 | 19,382,030 / 46,943,543 / 31,041,604 | 19,382,030 / 47,354,848 (+411,305) / 31,082,784 (+41,180) | 5.15 は一致。6.6 は CBO 4,096 回、7.1 は 2,048 回 (注 1) |
+| GB2 W4 5.15 / 6.6 / 7.1 | 16,811,486 / 61,081,863 / 36,751,512 | 16,811,486 / 61,499,436 (+417,573) / 36,769,175 (+17,663) | 同上 |
+| GB4 W2 / W4 | 24,988,093 / 22,634,564 | 24,988,093 / 22,634,564 | 5.15 なので CBO は 0 回 |
+| ACT4 (`run_act.py`、CBO を含む 10 suite: exceptions、pmp、sdtrigs、sdtrigsm、sdtrigu、sv、zic64b、zicbom、zicbop、zicboz) | | W2 385/385、hash 108/108。W4 383/385、hash 108/108 | W4 の fail 2 本は既知の `tselect_trigs_00` (§9.13) |
+| ACT4 の同じ 10 suite の cosim (`--cosim`) | | W2 379/379、W4 377/379、不一致 0 | SPIKE_GAPS 6 本を除く。W4 の fail は同じ既知の 2 本 |
+| GC (`run_gc.py`) | 367/367 | W2/W4 とも 367/367、不一致 0 | |
+| spike cosim (N=1 の 4 本、hvlinux、SMP N=2/N=4) | 不一致 0 | W2/W4 とも全 12 本 pass、不一致 0 (W2 の 6.6 は 17,621,962 record、W4 の N=4 は 33,999,637 record を照合) | cycle は native と一致 |
+
+- 注 1: CBO は以前は retire での no-op だったので、CBO を実行する boot (6.6、7.1、7.1v、hvlinux の guest) は 1 回ごとに head での直列化、dcache の第 1 段、mem_ctrl の LOOKUP と B の待ちの分だけ遅くなる。回数は boot ごとに一定 (6.6 は 4,096、7.1 系は 2,048、kernel の DMA の atomic pool の準備 (`arch_dma_prep_coherent`) が 64 byte の line ごとに cbo.flush を出す見込み)。lockstep でない boot は mtime を cycle で進めるので、その遅れで timer の割込みの位置がずれ、kernel の時刻に依存する経路の命令数が変わる (§9.14 の注と同じ)。W4 の 6.6 N=1 と hvlinux が速くなったのはこのため。6.6 の N=2 が W2/W4 とも約 +0.41M cy (+0.9 %、+0.7 %) なのは、boot の終わりが timer の境界をまたいだもので、W2 と W4 でほぼ同じ量になる (§9.14 の GB4 の +797k と同じ形)。CBO を実行しない 5.15 の全 boot、GL-B (W2/W4 の record 列と hash)、litmus N=4 は cycle まで一致した。
+- 初版の不具合: 最初の実装は、CBO の line への miss を RETRY(FILL_BUSY) で断った。LQ、ptw、atomic_unit は FILL_BUSY を受けると fill の終わりの event を待って止まるので、CBO の間に若い load が止まったまま起きず、ACT4 の `exceptions/Zicbo{S,Sm,U}_00` (store、CBO、同じ line の load) が hang した。新しい理由 CMO_BUSY (要求者は止まらずに再発行する) にして直した (設計書 §MS の CBO の節の 4)。
+- CBO の回数は `IoPerf.cbo` (perf_acc の PB 行を `fire_check.py --nonzero` で名付けた)。`McPerf.cmo` と `dc.cmo` も同じ値。CBO を実行しない boot は 0。
+- spike の cosim で見えないもの: 設計書 §MS の CBO の節のとおり、CBO はメモリの no-op として照合されるので、DRAM が更新されたか、cache から line が消えたかは cosim では見えない。それは cbo_vis の backdoor の検査が持つ。
+- wall 時間: 機械が過負荷 (load average 最大約 140、他の利用者と共有) だったので、途中からユーザの指示で同時の `veryl test` を 3 本までにし、長い boot を 1 回の invocation に複数入れないように分けた (最初に並べた 8 本のうち 5 本は途中で止めて回し直した)。G0 6,001 s、W2 N=1 の 5 本 (1 invocation) 3,872 s、W2 N=4 10,550 s、W4 N=4 22,802 s、W4 6.6 N=2 17,103 s、W4 7.1 N=2 11,864 s、W2 の N=4 の cosim 9,000 s 前後、W4 の N=4 の cosim 23,422 s (1 本だけで走った)。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
