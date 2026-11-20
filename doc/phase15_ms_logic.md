@@ -441,3 +441,27 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 
   「R1 の後」の `*_obs` は測っていない。§2.3 の値 (O1 と R1 の前) から R1 の実測の差 (W4 −16,963 LUT / −117 FF、W2 −12,260 / −71) を引いた推定である。
 - 読み方: 観測の port を出す top (`heliodor_soc_smp` をそのまま top にした合成など) では、O1 で観測の代金が消え、機能の port だけの合成との差は W4 で LUT +3,395 / FF +122 (0.4 %) まで縮んだ。機能の port だけの合成は前から Vivado が観測を刈っていたので、O1 では減らない。W2 SoC の LUT +4,099 (+1.0 %) は、上のとおり register の集合が同じなので、論理の構造が変わったことによる Vivado の最適化の揺れである (階層では `u_sb` +9,416、`u_vum` −4,250、`u_lq`/`u_sq` 約 −2,400 ずつと、帰属の移動が大きい)。
+
+### 8.3 P: PMP 検査の重複
+
+- 変更 (`src/mmu/pmp_check.veryl`):
+  - `pmp_decode`: エントリごとの cfg byte、pmpaddr、NAPOT の mask (54 bit の加算)、TOR が空でないか (54 bit の比較) を作る。csr が 1 個だけ組合せで持ち (`o_pmp`)、すべての検査器に配る。register にしないので、PMP の CSR の書き込みが効く時期は前と同じ (次のサイクルから)。
+  - `pmp_match #(N)`: 同じ 64 byte の塊にある N 個の access の一致を計算する。結果は「どれかが一致」「一番小さい一致エントリが全 byte を覆う」「そのエントリの cfg byte」で、access の種類と特権に依らない。塊の部分 (addr[55:6]) とエントリの比較はエントリごとに 1 回で、access ごとには 4 bit の比較だけになる。
+  - `pmp_pkg::fault`: 一致の結果に access の種類と特権を当てて fault を出す。
+  - `pmp_range_check`/`pmp_check` は旧コア (`src/v14`、`src/mmu` の旧 MMU) のためにそのまま残し、中身を上の 3 つで作り直した。
+- 使う側: `mem_pipe` は r/w/x の 3 個を 1 個の一致から (P1)、`ifu` は GRAN_N 個を `pmp_match #(GRAN_N)` 1 個に (P3。fetch block は FETCH_BYTES ≤ 64 で整列しているので 1 つの 64 byte の塊に入る、と module header に書いた)、`ptw` は PTE の r/w の 2 個を 1 個、最後の PA の r/w/x の 3 個を 1 個に (P2)、エントリの定数は csr で 1 回 (P4)。
+- `ptw` の最後の PA の検査は `mem_pipe` の検査と重複しているか: 証明できないので残した。`ptw` は walk の終わりに access fault を返し TLB に入れない。これを外すと TLB に入れてから `mem_pipe` (fetch は `ifu`) が再実行で fault を出すことになり、fault の種類は同じでもサイクルが変わる。また `ptw` は va の 4 byte の granule、`mem_pipe` は access の byte の範囲を見るので、検査の対象も同じではない。
+- 正しさ: 旧式 (`9f7f62ec` の `pmp_range_check`) と新式を Verilator で乱数 400 万組 (TOR、NA4、NAPOT が塊の周りに集まるような pmpaddr、M/S/U、r/w/x、範囲と 8 granule の fetch の形) 比べ、不一致 0。
+- 判定 (すべてサイクルまで一致): cbench 8 本の出力が完全に一致。G0 864 pass。ACT4 `pmp` suite (99 本、SvPMP と Smpmp を含む) を spike cosim で W2 99/99、W4 99/99。`mv_pmp_*` などの directed は G0 の中で pass。5.15 N=1 boot W2 14,655,526 (出力全体が R1 と同じ)、W4 12,291,246。hvlinux W2 18,619,930。N=2 SMP W2 19,778,334。
+- 合成 (前は W2 SoC が O1 の後、W4 core が R1 の後。W4 core は O1 の後を測っていないが、機能の port だけの合成なので O1 の影響は揺れの範囲):
+
+| | 前 | 後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 415,168 | 368,809 | −46,359 (−11.2 %) |
+| W2 SoC FF | 132,331 | 131,459 | −872 |
+| W2 SoC CARRY8 | 18,399 | 11,268 | −7,131 |
+| W4 core LUT | 790,550 | 731,042 | −59,508 (−7.5 %) |
+| W4 core FF | 195,418 | 194,035 | −1,383 |
+| W4 core CARRY8 | 27,919 | 16,722 | −11,197 |
+
+  階層では W2 で `u_csr` 42,584 → 15,052、`u_dptw` 13,688 → 6,041、`u_iptw` 6,270 → 3,063、`g_mp[0]` 8,647 → 6,240。W4 で `u_csr` 62,271 → 18,476、`u_dptw` 16,566 → 7,591、`u_iptw` 6,444 → 3,005 (rebuilt の帰属なので、CSR の階層の減りの大半は mem_pipe と ifu の検査器である、§5 の P)。FF の減りは複製の減り。§5 の見積もり (W2 約 41,000、W4 約 62,000) とほぼ合う。

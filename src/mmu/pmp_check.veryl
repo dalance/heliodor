@@ -1,26 +1,188 @@
-// PMP (Physical Memory Protection, Smpmp) checker, combinational.
+// PMP (Physical Memory Protection, Smpmp) check, combinational.
 //
-// Given a physical address, the access type, the effective privilege, and the
-// 16 PMP entries (pmpcfg0/pmpcfg2 + pmpaddr0..15), decide whether the access is
-// allowed. The matching entry is the LOWEST-numbered entry whose address range
-// covers the access; its R/W/X bits then grant or deny. M-mode bypasses an
-// UNLOCKED matching entry (L=0); a locked entry (L=1) is enforced even in
-// M-mode. An access that matches NO entry is allowed in M-mode and faults in
-// S/U-mode, so firmware must program an entry before dropping to S/U.
+// The matching entry is the LOWEST-numbered entry whose address range covers
+// the access; its R/W/X bits then grant or deny. M-mode bypasses an UNLOCKED
+// matching entry (L=0); a locked entry (L=1) is enforced even in M-mode. An
+// access that matches NO entry is allowed in M-mode and faults in S/U-mode,
+// as the privileged spec requires whenever at least one entry is implemented
+// (all 16 always are), even with every entry OFF. An entry that matches some
+// but not all bytes of an access makes it fail when it is the lowest-numbered
+// entry matching any of them, whatever the privilege.
 //
 // Address fields are addr[55:2] (PHYS_ADDR_WIDTH=56, granularity G=0 so NA4 is
 // supported). pmpcfg byte: [7]=L, [4:3]=A (0 OFF / 1 TOR / 2 NA4 / 3 NAPOT),
 // [2]=X, [1]=W, [0]=R.
-//
-// This is the single-word form (the 4-byte granule holding i_addr); see
-// pmp_range_check for an access of several granules.
+pub package pmp_pkg {
+    // One entry as the matchers read it. nmask and tor depend on the CSRs
+    // only, so pmp_decode makes them once for every matcher.
+    struct PmpEnt {
+        cfg  : logic<8> ,
+        addr : logic<54>, // pmpaddr[53:0]
+        nmask: logic<54>, // NAPOT: the trailing ones of addr plus the first zero
+        tor  : logic    , // TOR: the previous entry's addr <: addr
+    }
+
+    // The match of one access: some entry matches (hit), the lowest matching
+    // entry covers every byte (all), and that entry's config byte.
+    struct PmpRes {
+        hit: logic   ,
+        all: logic   ,
+        cfg: logic<8>,
+    }
+
+    // acc: 0 read, 1 write, 2 execute.
+    function fault (
+        r   : input PmpRes            ,
+        acc : input logic<2>          ,
+        priv: input csr_pkg::PrivLevel,
+    ) -> logic {
+        let is_m: logic = priv == csr_pkg::PrivLevel::MACHINE;
+        let perm: logic = if acc == 2'd0 ? r.cfg[0] : if acc == 2'd1 ? r.cfg[1] : r.cfg[2];
+        return if r.hit ? !(r.all && ((is_m && !r.cfg[7]) || perm)) : !is_m;
+    }
+}
+
+// The entries of pmpcfg0/pmpcfg2 and pmpaddr0..15 for pmp_match.
+pub module pmp_decode (
+    i_pmpcfg : input  logic          <64> [2] ,
+    i_pmpaddr: input  logic          <64> [16],
+    o_ent    : output pmp_pkg::PmpEnt     [16],
+) {
+    always_comb {
+        for e in 0..16 {
+            let a : logic<54> = i_pmpaddr[e][53:0];
+            let lo: logic<54> = if e == 0 ? 54'd0 : i_pmpaddr[e - 1][53:0];
+            o_ent[e].cfg   = i_pmpcfg[e / 8][(e % 8) * 8+:8];
+            o_ent[e].addr  = a;
+            o_ent[e].nmask = a ^ (a + 54'd1);
+            o_ent[e].tor   = lo <: a;
+        }
+    }
+}
+
+// The PMP match of N accesses in one naturally aligned 64-byte block: access
+// n covers the words [i_lo4[n], i_hi4[n]] of block i_blk. The result does
+// not depend on the access type or the privilege; pmp_pkg::fault applies
+// them.
+// Rationale:
+//   - an address compare with an entry splits into the block part (addr[55:6],
+//     the same for every access) and the word offset, so the block compares
+//     are made once per entry and shared by the N accesses, which leaves
+//     4-bit compares per access
+//   - for a NA4 or NAPOT region smaller than the block, a region strictly
+//     between the two ends overlaps the access without matching either end
+//   - the lowest match is mvec & -mvec, a log-depth subtract instead of a
+//     16-deep priority chain
+pub module pmp_match #(
+    param N: u32 = 1,
+) (
+    i_blk: input  logic          <50>     , // addr[55:6] of every access
+    i_lo4: input  logic          <4>  [N] , // first word of access n
+    i_hi4: input  logic          <4>  [N] , // last word of access n
+    i_ent: input  pmp_pkg::PmpEnt     [16],
+    o_res: output pmp_pkg::PmpRes     [N] ,
+) {
+    // Block compares, per entry. The TOR lower bound of entry e is the
+    // address of entry e - 1 (0 for entry 0).
+    var b_lt: logic<16>; // i_blk <: the entry's block
+    var b_eq: logic<16>; // i_blk == the entry's block
+    var p_gt: logic<16>; // i_blk >: the lower bound's block
+    var p_eq: logic<16>; // i_blk == the lower bound's block
+    var n_eq: logic<16>; // i_blk lies in the NAPOT region above the word bits
+    always_comb {
+        for e in 0..16 {
+            let a : logic<54> = i_ent[e].addr;
+            let lo: logic<54> = if e == 0 ? 54'd0 : i_ent[e - 1].addr;
+            b_lt[e] = i_blk <: a[53:4];
+            b_eq[e] = i_blk == a[53:4];
+            p_gt[e] = i_blk >: lo[53:4];
+            p_eq[e] = i_blk == lo[53:4];
+            n_eq[e] = ((i_blk ^ a[53:4]) & ~i_ent[e].nmask[53:4]) == 50'd0;
+        }
+    }
+
+    for n in 0..N :g_acc {
+        let lo4 : logic<4>  = i_lo4[n];
+        let hi4 : logic<4>  = i_hi4[n];
+        var mvec: logic<16>; // the entry matches some byte
+        var avec: logic<16>; // the entry matches every byte
+        always_comb {
+            for e in 0..16 {
+                let ta     : logic<4> = i_ent[e].addr[3:0];
+                let nm     : logic<4> = i_ent[e].nmask[3:0];
+                let pa     : logic<4> = if e == 0 ? 4'd0 : i_ent[e - 1].addr[3:0];
+                let lo_lt_a: logic    = b_lt[e] || (b_eq[e] && lo4 <: ta);
+                let hi_lt_a: logic    = b_lt[e] || (b_eq[e] && hi4 <: ta);
+                let lo_ge_p: logic    = p_gt[e] || (p_eq[e] && lo4 >= pa);
+                let hi_ge_p: logic    = p_gt[e] || (p_eq[e] && hi4 >= pa);
+                let n_lo   : logic    = n_eq[e] && ((lo4 ^ ta) & ~nm) == 4'd0;
+                let n_hi   : logic    = n_eq[e] && ((hi4 ^ ta) & ~nm) == 4'd0;
+                let n_in   : logic    = b_eq[e] && lo4 <: (ta & ~nm) && hi4 >: (ta | nm);
+                mvec[e] = case i_ent[e].cfg[4:3] {
+                    2'd1   : lo_lt_a && hi_ge_p && i_ent[e].tor,
+                    2'd2   : b_eq[e] && lo4 <= ta && ta <= hi4,
+                    2'd3   : n_lo || n_hi || n_in,
+                    default: 1'b0,
+                };
+                avec[e] = case i_ent[e].cfg[4:3] {
+                    2'd1   : lo_ge_p && hi_lt_a,
+                    2'd2   : b_eq[e] && lo4 == ta && hi4 == ta,
+                    default: n_lo && n_hi,
+                };
+            }
+        }
+        let low: logic<16> = mvec & (16'd0 - mvec);
+        always_comb {
+            o_res[n].hit = |mvec;
+            o_res[n].all = |(low & avec);
+            o_res[n].cfg = 8'd0;
+            for e in 0..16 {
+                if low[e] {
+                    o_res[n].cfg = i_ent[e].cfg;
+                }
+            }
+        }
+    }
+}
+
+// The bytes [i_lo, i_hi] of one access, both in the same naturally aligned
+// 64-byte block, from the raw CSRs (the old core's form).
+pub module pmp_range_check (
+    i_lo     : input  logic<64>         , // first byte of the access
+    i_hi     : input  logic<64>         , // last byte, same 64-byte block
+    i_acc    : input  logic<2>          , // 0=read, 1=write, 2=execute
+    i_priv   : input  csr_pkg::PrivLevel,
+    i_pmpcfg : input  logic<64>     [2] ,
+    i_pmpaddr: input  logic<64>     [16],
+    o_fault  : output logic             , // 1 => PMP denies the access
+) {
+    var ent: pmp_pkg::PmpEnt [16];
+    var res: pmp_pkg::PmpRes [1] ;
+    inst u_dec: pmp_decode (
+        i_pmpcfg        ,
+        i_pmpaddr       ,
+        o_ent    : ent  ,
+    );
+    inst u_match: pmp_match #(
+        N: 1,
+    ) (
+        i_blk: i_lo[55:6]  ,
+        i_lo4: '{i_lo[5:2]},
+        i_hi4: '{i_hi[5:2]},
+        i_ent: ent         ,
+        o_res: res         ,
+    );
+    assign o_fault = pmp_pkg::fault(res[0], i_acc, i_priv);
+}
+
+// The 4-byte granule holding i_addr (the old core's form).
 pub module pmp_check (
-    i_addr  : input  logic<64>          , // physical address being accessed
-    i_acc   : input  logic<2>           , // 0=read, 1=write, 2=execute
-    i_priv  : input  csr_pkg::PrivLevel ,
-    i_pmpcfg : input logic<64> [2] ,
-    i_pmpaddr: input logic<64> [16],
-    o_fault : output logic              , // 1 => PMP denies the access
+    i_addr   : input  logic<64>         , // physical address being accessed
+    i_acc    : input  logic<2>          , // 0=read, 1=write, 2=execute
+    i_priv   : input  csr_pkg::PrivLevel,
+    i_pmpcfg : input  logic<64>     [2] ,
+    i_pmpaddr: input  logic<64>     [16],
+    o_fault  : output logic             , // 1 => PMP denies the access
 ) {
     inst u_range: pmp_range_check (
         i_lo   : i_addr,
@@ -31,79 +193,4 @@ pub module pmp_check (
         i_pmpaddr      ,
         o_fault        ,
     );
-}
-
-// PMP check of the bytes [i_lo, i_hi] of one access. An entry that matches
-// some but not all of them makes the access fail when it is the
-// lowest-numbered entry matching any of them, whatever the privilege.
-// Both ends must lie in the same naturally aligned 64-byte block, so an
-// entry's overlap with the access follows from comparing both ends with it
-// plus, for a NA4 or NAPOT region smaller than the block, the word offsets
-// within the block.
-pub module pmp_range_check (
-    i_lo     : input  logic<64>          , // first byte of the access
-    i_hi     : input  logic<64>          , // last byte, same 64-byte block
-    i_acc    : input  logic<2>           , // 0=read, 1=write, 2=execute
-    i_priv   : input  csr_pkg::PrivLevel ,
-    i_pmpcfg : input  logic<64> [2]      ,
-    i_pmpaddr: input  logic<64> [16]     ,
-    o_fault  : output logic              , // 1 => PMP denies the access
-) {
-    import csr_pkg::*;
-
-    let lo_w: logic<54> = i_lo[55:2];
-    let hi_w: logic<54> = i_hi[55:2];
-    let is_m: logic     = i_priv == PrivLevel::MACHINE;
-
-    // Fmax: the priority scan over 16 entries used to be a sequential carry
-    // (`if !matched && matchE { matched=1; ... }`), a 16-deep combinational chain
-    // on the (shared) memory-op datapath. Compute each entry independently into
-    // packed vectors, then resolve the LOWEST-numbered match with the standard
-    // isolate-lowest-set-bit trick `mvec & -mvec` (one-hot of the winning entry;
-    // the negate is a log-depth subtract). Bit-identical to the priority scan:
-    // exactly the lowest matching entry's allow_w is selected.
-    var mvec : logic<16>; // per-entry match of any byte
-    var eavec: logic<16>; // per-entry allow: all bytes matched and permitted
-    always_comb {
-        for e in 0..16 {
-            // Per-entry config byte (entry e -> pmpcfg[e/8] byte e%8).
-            let cfg : logic<8>  = i_pmpcfg[e / 8][(e % 8) * 8+:8];
-            let a   : logic<2>  = cfg[4:3];
-            let l   : logic     = cfg[7];
-            let this_a: logic<54> = i_pmpaddr[e][53:0];
-            // TOR lower bound = previous entry's address (0 for entry 0).
-            let lo  : logic<54> = if e == 0 ? 54'd0 : i_pmpaddr[(e + 15) % 16][53:0];
-            // NAPOT range mask: trailing ones of this_a, plus the first zero.
-            let nmask: logic<54> = this_a ^ (this_a + 54'd1);
-            let blk  : logic     = lo_w[53:4] == this_a[53:4];
-            let n_lo : logic     = ((lo_w ^ this_a) & ~nmask) == 54'd0;
-            let n_hi : logic     = ((hi_w ^ this_a) & ~nmask) == 54'd0;
-            // A NAPOT region inside the block, strictly between the two ends.
-            let n_in : logic     = blk && lo_w[3:0] <: (this_a[3:0] & ~nmask[3:0]) && hi_w[3:0] >: (this_a[3:0] | nmask[3:0]);
-            let anyE: logic =
-                if a == 2'd1 ? ((lo_w <: this_a) && (hi_w >= lo) && (lo <: this_a))          // TOR
-                : if a == 2'd2 ? (blk && lo_w[3:0] <= this_a[3:0] && this_a[3:0] <= hi_w[3:0]) // NA4
-                : if a == 2'd3 ? (n_lo || n_hi || n_in)                                      // NAPOT
-                : 1'b0;                                                                      // OFF
-            let allE: logic =
-                if a == 2'd1 ? ((lo_w >= lo) && (hi_w <: this_a))
-                : if a == 2'd2 ? (lo_w == this_a && hi_w == this_a)
-                : n_lo && n_hi;
-            // Permission for this access type.
-            let perm: logic = if i_acc == 2'd0 ? cfg[0] : if i_acc == 2'd1 ? cfg[1] : cfg[2];
-            mvec[e]  = anyE;
-            // M-mode bypasses an unlocked match; otherwise check R/W/X.
-            eavec[e] = allE && ((is_m && !l) || perm);
-        }
-    }
-    // Lowest-numbered matching entry, one-hot (0 if no match).
-    let lowest_oh: logic<16> = mvec & (16'd0 - mvec);
-    let matched  : logic     = |mvec;
-    let allow_w  : logic     = |(lowest_oh & eavec);
-
-    // Matched: enforce the entry's permission (M-mode bypasses an unlocked one).
-    // No match: M allowed, S/U denied, as the privileged spec requires whenever
-    // at least one entry is implemented (all 16 always are), even with every
-    // entry OFF.
-    assign o_fault = if matched ? !allow_w : !is_m;
 }
