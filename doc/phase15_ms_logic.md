@@ -465,3 +465,36 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 | W4 core CARRY8 | 27,919 | 16,722 | −11,197 |
 
   階層では W2 で `u_csr` 42,584 → 15,052、`u_dptw` 13,688 → 6,041、`u_iptw` 6,270 → 3,063、`g_mp[0]` 8,647 → 6,240。W4 で `u_csr` 62,271 → 18,476、`u_dptw` 16,566 → 7,591、`u_iptw` 6,444 → 3,005 (rebuilt の帰属なので、CSR の階層の減りの大半は mem_pipe と ifu の検査器である、§5 の P)。FF の減りは複製の減り。§5 の見積もり (W2 約 41,000、W4 約 62,000) とほぼ合う。
+
+### 8.4 C1: CSR の幅と死んだ状態
+
+- 入れたもの (読める値は前とすべて同じ):
+  - `mhpmcounter`/`mhpmevent` の 0-2: 記憶を `hpmc_q`/`hpme_q` (3-31 の 29 本) に移し、0-2 は読みで 0 の定数にした。0-2 は decode でも siselect でも書かれず、前から常に 0 だった。動的 index の書き込みでも合成が 0-2 を消せるようになる。
+  - `vl` (8 bit) と `vtype` (vill + vtype[7:0] の 9 bit): 書くのは vset の commit だけで、vector_unit は vl ≤ VLMAX ≤ 128、vtype は vill なら `1 << 63`、そうでなければ下位 8 bit だけを出す。CSR 命令からは読み出し専用。読みと `o_vl`/`o_vtype` は 64 bit に 0 を足して前と同じ値を出す。
+- 入れなかったもの (判断待ち): `mcause`/`scause`/`vscause`、`mtinst`/`htinst`、`mhpmevent` の実装していない bit。今はどれもソフトが書いた 64 bit をそのまま読み返す。幅を縮めると、範囲の外の値を書いてから読む場合 (ACT4 の `mcsr_walk` などがする) の読みが変わり、「読める値は今と同じ」に反する。spike と Sail もこれらを全幅で持つので、cosim と ACT4 の期待値とも食い違う見込みである。WARL/WLRL として縮めるなら、読みの値が変わることを認めるかどうかの決定が要る (縮められる FF は約 1,800)。
+- 判定: cbench 8 本の出力が完全に一致。G0 864 pass。ACT4 を spike cosim で W2 (zihpm、sscofpmf、zicntr、h、sm、s、u と V の全 suite: exceptionsv*、misalignv、vf*、vls*、vx*、zvbb*、zvkb*、zvfhmin) 2,546/2,547。落ちた 1 本 `act_sm/mcsr_cntr_00` (`csrr time` が 0、期待は 1) は C1 と関係しない: C1 を外した HEAD (`d2173780`) の cosim でも、この series の前 (`9f7f62ec`) の素の GA でも同じく落ちる。`.wt/mv` から写した ACT4 の image と今の tree の組み合わせの問題と見ている (未解決)。cosim なしの GA/GL-C (sm、zihpm、sscofpmf、zicntr) は同じ 1 本を除いて pass、hash 30/30。5.15 N=1 W2 boot は 14,655,526 で出力全体が一致。
+- 合成:
+
+| | P の後 | C1 の後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT / FF | 368,809 / 131,459 | 368,914 / 130,733 | +105 / −726 |
+| W2 `u_csr` LUT / FF | 15,052 / 7,447 | 15,154 / 6,956 | +102 / −491 |
+| W4 core LUT / FF | 731,042 / 194,035 | 730,787 / 193,273 | −255 / −762 |
+| W4 `u_csr` LUT / FF | 18,476 / 7,450 | 18,327 / 6,953 | −149 / −497 |
+
+  csr の FF の減り (約 490) は 0-2 の 384 と vl/vtype の 111 にほぼ合う。SoC 全体の FF の減りがそれより大きいのは複製の差。LUT の差は揺れの範囲。
+
+### 8.5 まとめ (§2 の値から)
+
+| | §2 (前) | C1 の後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 423,329 | 368,914 | −54,415 (−12.9 %) |
+| W2 SoC LUTRAM | 24,208 | 12,688 | −11,520 |
+| W2 SoC FF | 132,512 | 130,733 | −1,779 |
+| W2 SoC BRAM | 0 | RAMB36 6 + RAMB18 7 + URAM 1 | |
+| W4 core LUT | 807,513 | 730,787 | −76,726 (−9.5 %) |
+| W4 core LUTRAM | 27,408 | 12,688 | −14,720 |
+| W4 core FF | 195,535 | 193,273 | −2,262 |
+| W4 core BRAM | 0 | RAMB36 8 + RAMB18 10 + URAM 1 | |
+
+観測の port を出す top では、これに O1 の分 (W4 で LUT 約 −75,000、FF 約 −17,000、DSP −60) が加わる (§8.2)。
