@@ -15,9 +15,9 @@
 //     update, the update writes its slot fields into the new owner; that
 //     costs prediction accuracy only, never correctness (extract checks every
 //     prediction)
-//   - the table is one array of BP_BTB_N rows with a registered read and one
-//     bit-masked write, no reset. A lookup and an update of the same row in
-//     one cycle read the row as it was before the update (read-old)
+//   - the table is BP_BTB_N rows with a registered read and one write, no
+//     reset. A lookup and an update of the same row in one cycle read the
+//     row as it was before the update (read-old)
 //   - for BP_BTB_N cycles after reset the write port clears one row per
 //     cycle, every lookup misses and training is dropped
 // Rationale:
@@ -33,6 +33,10 @@
 //   - the valid bits live in the row and are cleared by the sweep, so no
 //     part of the table needs a reset; a generation scheme would still need
 //     the sweep, since rows hold arbitrary values at power-on
+//   - the row is split into one array per group of fields that an update
+//     writes together, so each array takes a plain whole-word write; a
+//     bit-masked read-modify-write needs a second read port and does not map
+//     to block RAM
 pub module bp_btb::<CFG: core_cfg> (
     clk       : input  clock                           ,
     rst       : input  reset                           ,
@@ -48,7 +52,6 @@ pub module bp_btb::<CFG: core_cfg> (
     import bpu_pkg::<CFG>::*;
 
     const N_CAND: u32 = BP_SLOTS + 1; // conditional slots, then the tail slot
-    const ROW_W : u32 = $bits(BtbRow);
 
     function idx_of (
         pc: input logic<64>,
@@ -81,14 +84,17 @@ pub module bp_btb::<CFG: core_cfg> (
 
     // ---- Table ----
 
-    var swp_q : logic                      ; // reset sweep in progress
-    var swi_q : logic<BTB_IDX_W>           ;
-    var mem_q : logic<ROW_W>     [BP_BTB_N];
-    var rd_q  : logic<ROW_W>               ;
-    var w_en  : logic                      ;
-    var w_idx : logic<BTB_IDX_W>           ;
-    var w_data: logic<ROW_W>               ;
-    var w_mask: logic<ROW_W>               ;
+    var swp_q: logic           ; // reset sweep in progress
+    var swi_q: logic<BTB_IDX_W>;
+    var w_idx: logic<BTB_IDX_W>;
+    var w_row: BtbRow          ;
+    var w_vt : logic           ; // vld, tag
+    var w_sv : logic<BP_SLOTS> ;
+    var w_so : logic<BP_SLOTS> ;
+    var w_sc : logic<BP_SLOTS> ;
+    var w_st : logic<BP_SLOTS> ;
+    var w_tv : logic           ;
+    var w_tx : logic           ; // t_off, t_knd, t_rvc, t_tgt
 
     always_ff {
         if_reset {
@@ -102,12 +108,73 @@ pub module bp_btb::<CFG: core_cfg> (
         }
     }
 
+    let r_idx: logic<BTB_IDX_W> = idx_of(i_lk_pc);
+
+    var vt_q : logic<1 + BTB_TAG_W>                       [BP_BTB_N];
+    var tv_q : logic                                      [BP_BTB_N];
+    var tx_q : logic<FOFF_W + 3 + 1 + BTB_TTGT_W - 1>     [BP_BTB_N];
+    var rd_vt: logic<1 + BTB_TAG_W>                                 ;
+    var rd_tv: logic                                                ;
+    var rd_tx: logic<FOFF_W + 3 + 1 + BTB_TTGT_W - 1>               ;
     always_ff {
         if i_lk_valid {
-            rd_q = mem_q[idx_of(i_lk_pc)];
+            rd_vt = vt_q[r_idx];
+            rd_tv = tv_q[r_idx];
+            rd_tx = tx_q[r_idx];
         }
-        if w_en {
-            mem_q[w_idx] = (mem_q[w_idx] & ~w_mask) | (w_data & w_mask);
+        if w_vt {
+            vt_q[w_idx] = {w_row.vld, w_row.tag};
+        }
+        if w_tv {
+            tv_q[w_idx] = w_row.t_v;
+        }
+        if w_tx {
+            tx_q[w_idx] = {w_row.t_off, w_row.t_knd, w_row.t_rvc, w_row.t_tgt};
+        }
+    }
+
+    var rd_sv: logic                     [BP_SLOTS];
+    var rd_so: logic<FOFF_W>             [BP_SLOTS];
+    var rd_sc: logic<2>                  [BP_SLOTS];
+    var rd_st: logic<BTB_STGT_W - 1>     [BP_SLOTS];
+    for k in 0..BP_SLOTS :g_slot {
+        var sv_q: logic                     [BP_BTB_N];
+        var so_q: logic<FOFF_W>             [BP_BTB_N];
+        var sc_q: logic<2>                  [BP_BTB_N];
+        var st_q: logic<BTB_STGT_W - 1>     [BP_BTB_N];
+        always_ff {
+            if i_lk_valid {
+                rd_sv[k] = sv_q[r_idx];
+                rd_so[k] = so_q[r_idx];
+                rd_sc[k] = sc_q[r_idx];
+                rd_st[k] = st_q[r_idx];
+            }
+            if w_sv[k] {
+                sv_q[w_idx] = w_row.s_v[k];
+            }
+            if w_so[k] {
+                so_q[w_idx] = w_row.s_off[k];
+            }
+            if w_sc[k] {
+                sc_q[w_idx] = w_row.s_ctr[k];
+            }
+            if w_st[k] {
+                st_q[w_idx] = w_row.s_tgt[k];
+            }
+        }
+    }
+
+    var row: BtbRow;
+    always_comb {
+        row = 0 as BtbRow;
+        {row.vld, row.tag}                           = rd_vt;
+        row.t_v                                      = rd_tv;
+        {row.t_off, row.t_knd, row.t_rvc, row.t_tgt} = rd_tx;
+        for k in 0..BP_SLOTS {
+            row.s_v[k]   = rd_sv[k];
+            row.s_off[k] = rd_so[k];
+            row.s_ctr[k] = rd_sc[k];
+            row.s_tgt[k] = rd_st[k];
         }
     }
 
@@ -127,7 +194,6 @@ pub module bp_btb::<CFG: core_cfg> (
         }
     }
 
-    let row  : BtbRow         = rd_q as BtbRow;
     let r_hit: logic          = lk_v_q && row.vld && row.tag == tag_of(lk_pc_q);
     let r_s0 : logic <FOFF_W> = foff_of(lk_pc_q);
 
@@ -285,10 +351,21 @@ pub module bp_btb::<CFG: core_cfg> (
         }
     }
 
-    assign w_en   = swp_q || u.valid;
-    assign w_idx  = if swp_q ? swi_q : u_idx;
-    assign w_data = if swp_q ? '0 : wd as ROW_W;
-    assign w_mask = if swp_q ? '1 : wm as ROW_W;
+    // Every field of wm is all ones or all zeros, and a group is written
+    // whole. The sweep writes every group with zeros.
+    assign w_idx = if swp_q ? swi_q : u_idx;
+    assign w_row = if swp_q ? 0 as BtbRow : wd;
+    assign w_vt  = swp_q || wm.vld;
+    assign w_tv  = swp_q || wm.t_v;
+    assign w_tx  = swp_q || wm.t_off[0];
+    always_comb {
+        for k in 0..BP_SLOTS {
+            w_sv[k] = swp_q || wm.s_v[k];
+            w_so[k] = swp_q || wm.s_off[k][0];
+            w_sc[k] = swp_q || wm.s_ctr[k][0];
+            w_st[k] = swp_q || wm.s_tgt[k][0];
+        }
+    }
 
     // ---- Events ----
 

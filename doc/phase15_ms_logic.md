@@ -383,3 +383,35 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 2. P、S1、R1、R2、C1 を入れるか。P と S1 はそれぞれ単独のモジュールの変更で、旧式との全数比較 (P は ACT4 の PMP も) で判定できる。
 3. S2 と P4 は単体の合成で測ってから決める。
 4. MS の出口条件 (L2 込みの SoC の合成の完走) は V1 が入るまで満たせない。V1 の後にこのフロー (`soc_w2_l2`) を回す。
+
+## 7. 決定 (2026-11-20、ユーザ)
+
+§5 と §6 の判断待ちに対する決定:
+
+- 推奨どおり承認: O1、P、S1、R2、R1、C1 は MS で入れる。S2 は先に測ってから決める。W1 は CP のデータが揃うまで保留。G、F、H は決定済み (sizing §0)。
+- 順序: 独立で小さい O1、P、C1、R1 を先に入れる。S1、R2、L2 の作業 (V1/V2) は CBO の作業が master に入った後にする。
+- S 類の新しい規則: SRAM 級の配列へ bit の mask による read-modify-write の書き込みをしない。byte lane の write enable を使うか、行を「一緒に書く組」ごとの配列に分ける。理由: Vivado はこの形を非同期の 2 本目の読み口とみなし、BRAM ではなく LUTRAM にした (§3.2 の BTB と `dcache_bank`)。
+
+## 8. 実施の記録
+
+合成はすべて §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし) で、「前」は §2 の値。
+
+### 8.1 R1: BTB の書き込みの形
+
+- 変更: `bp_btb` の行を「一緒に書く field の組」ごとの配列に分けた。`vld`+`tag`、tail の `t_v`、tail の残り (`t_off`、`t_knd`、`t_rvc`、`t_tgt`)、slot ごとの `s_v`、`s_off`、`s_ctr`、`s_tgt` (W2 11 個、W4 14 個)。`wm` の各 field はすべて 1 かすべて 0 なので、組の write enable は `wm` の 1 bit で決まり、組の中は丸ごと書く。記憶の中身は前と bit 単位で同じで、読みは同期 1 口、書きは 1 口、リセットなし、掃き出し (起動後 4096 サイクル) と read-old も前のまま。
+- Vivado の推論: 全部が block RAM になり、LUTRAM は 0。31 bit の tail の組は Vivado が自分で URAM288 を選んだ (block RAM の一種で LUTRAM ではない)。
+
+| | 前 | 後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 423,329 | 411,069 | −12,260 |
+| W2 SoC LUTRAM | 24,208 | 12,688 | −11,520 |
+| W2 SoC FF | 132,512 | 132,441 | −71 |
+| W2 SoC BRAM | 0 | RAMB36 6 + RAMB18 7 (9.5 tile) + URAM 1 | |
+| W2 `u_bpu` LUT | 14,630 | 2,310 | −12,320 |
+| W4 core LUT | 807,513 | 790,550 | −16,963 |
+| W4 core LUTRAM | 27,408 | 12,688 | −14,720 |
+| W4 core FF | 195,535 | 195,418 | −117 |
+| W4 core BRAM | 0 | RAMB36 8 + RAMB18 10 (13 tile) + URAM 1 | |
+| W4 `u_bpu` LUT | 20,933 | 3,949 | −16,984 |
+
+- 判定: cbench 8 本 (W2/W4 の dhrystone、coremark、fpmm、spmv) の出力 (cycles、instret、retire の hash、perf の dump) が `fdca872c` と完全に一致 (W2 coremark 383,986、W4 coremark 316,668 など)。5.15 N=1 W2 boot は 14,655,526 サイクルで一致。G0 は 864 pass、0 fail。
