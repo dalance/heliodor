@@ -119,14 +119,14 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      which check the DRAM behind the AXI port after cbo.clean/flush/inval. Fix any
      failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart`: RVWMO litmus battery at N=4
-     (IRIW + 4-way barrier/bus stress; **5,022,440 cycles**). The N=2 battery
+     (IRIW + 4-way barrier/bus stress; **5,023,959 cycles**). The N=2 battery
      (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
      memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (**19,382,030 cycles**, ~30 min). N=1 single-hart is `--ignored --test
-     test_soc_linux_boot` (**14,633,581 cycles**, ~7 min). The N=1 boot in golden
+     (**19,778,334 cycles**, ~30 min). N=1 single-hart is `--ignored --test
+     test_soc_linux_boot` (**14,655,526 cycles**, ~7 min). The N=1 boot in golden
      lockstep (retire-count mtime, trace hash checked against the old-core golden) is
-     `--ignored --test test_w2_linux_boot_lockstep` (14,571,787 cycles, ~7 min); run it
+     `--ignored --test test_w2_linux_boot_lockstep` (14,579,991 cycles, ~7 min); run it
      after any change that can alter the retire stream.
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: N=4 SMP Linux boot
      (**24,988,093 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (22,634,564

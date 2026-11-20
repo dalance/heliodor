@@ -3,12 +3,10 @@
 // Ports (timing contract):
 //   i_lk_valid/i_lk_pc : lookup of the block entered at i_lk_pc, every cycle
 //   o_pred/o_meta/...  : result of the lookup of the previous cycle
-//                        (bpu_pkg::BTB_LAT = 1); combinational from the
-//                        registered lookup address, so a cycle with no lookup
+//                        (bpu_pkg::BTB_LAT = 1); a cycle with no lookup
 //                        leaves them stale
 //   i_upd              : training of one committed block per cycle, written
-//                        at the edge; a lookup of the same entry in that cycle
-//                        reads the old contents
+//                        at the edge
 // Owns:
 //   - the prediction is a function of the table and the looked-up start_pc
 //     only; the table holds no speculative state (no recover port)
@@ -17,6 +15,11 @@
 //     update, the update writes its slot fields into the new owner; that
 //     costs prediction accuracy only, never correctness (extract checks every
 //     prediction)
+//   - the table is one array of BP_BTB_N rows with a registered read and one
+//     bit-masked write, no reset. A lookup and an update of the same row in
+//     one cycle read the row as it was before the update (read-old)
+//   - for BP_BTB_N cycles after reset the write port clears one row per
+//     cycle, every lookup misses and training is dropped
 // Rationale:
 //   - indexed and tagged by start_pc in halfwords, and slot offsets are
 //     relative to the aligned block, so a prediction is used only from the
@@ -24,6 +27,12 @@
 //   - an entry has BP_SLOTS conditional slots (2-bit counter and target) and
 //     one tail slot for the unconditional jump that ends the block; the exit
 //     is the earliest predicted-taken slot
+//   - targets keep only their low bits (bit 0 is always 0); the bits above
+//     come from the lookup pc, so a far target mispredicts and is redirected
+//     like any wrong target
+//   - the valid bits live in the row and are cleared by the sweep, so no
+//     part of the table needs a reset; a generation scheme would still need
+//     the sweep, since rows hold arbitrary values at power-on
 pub module bp_btb::<CFG: core_cfg> (
     clk       : input  clock                           ,
     rst       : input  reset                           ,
@@ -39,18 +48,7 @@ pub module bp_btb::<CFG: core_cfg> (
     import bpu_pkg::<CFG>::*;
 
     const N_CAND: u32 = BP_SLOTS + 1; // conditional slots, then the tail slot
-
-    var vld  : logic              [BP_BTB_N]          ;
-    var tagv : logic  <BTB_TAG_W> [BP_BTB_N]          ;
-    var s_v  : logic              [BP_SLOTS, BP_BTB_N];
-    var s_off: logic  <FOFF_W>    [BP_SLOTS, BP_BTB_N];
-    var s_ctr: logic  <2>         [BP_SLOTS, BP_BTB_N];
-    var s_tgt: logic  <BTB_STGT_W> [BP_SLOTS, BP_BTB_N];
-    var t_v  : logic              [BP_BTB_N]          ;
-    var t_off: logic  <FOFF_W>    [BP_BTB_N]          ;
-    var t_knd: CfiKind            [BP_BTB_N]          ;
-    var t_tgt: logic  <BTB_TTGT_W> [BP_BTB_N]          ;
-    var t_rvc: logic              [BP_BTB_N]          ;
+    const ROW_W : u32 = $bits(BtbRow);
 
     function idx_of (
         pc: input logic<64>,
@@ -81,6 +79,38 @@ pub module bp_btb::<CFG: core_cfg> (
         return pc[FOFF_W:1];
     }
 
+    // ---- Table ----
+
+    var swp_q : logic                      ; // reset sweep in progress
+    var swi_q : logic<BTB_IDX_W>           ;
+    var mem_q : logic<ROW_W>     [BP_BTB_N];
+    var rd_q  : logic<ROW_W>               ;
+    var w_en  : logic                      ;
+    var w_idx : logic<BTB_IDX_W>           ;
+    var w_data: logic<ROW_W>               ;
+    var w_mask: logic<ROW_W>               ;
+
+    always_ff {
+        if_reset {
+            swp_q = 1'b1;
+            swi_q = 0;
+        } else if swp_q {
+            swi_q = swi_q + 1;
+            if swi_q == BP_BTB_N - 1 {
+                swp_q = 1'b0;
+            }
+        }
+    }
+
+    always_ff {
+        if i_lk_valid {
+            rd_q = mem_q[idx_of(i_lk_pc)];
+        }
+        if w_en {
+            mem_q[w_idx] = (mem_q[w_idx] & ~w_mask) | (w_data & w_mask);
+        }
+    }
+
     // ---- Lookup ----
 
     var lk_v_q : logic    ;
@@ -90,16 +120,16 @@ pub module bp_btb::<CFG: core_cfg> (
             lk_v_q  = 1'b0;
             lk_pc_q = 64'd0;
         } else if i_lk_valid {
-            lk_v_q  = 1'b1;
+            lk_v_q  = !swp_q;
             lk_pc_q = i_lk_pc;
         } else {
             lk_v_q = 1'b0;
         }
     }
 
-    let r_idx: logic<BTB_IDX_W> = idx_of(lk_pc_q);
-    let r_hit: logic            = lk_v_q && vld[r_idx] && tagv[r_idx] == tag_of(lk_pc_q);
-    let r_s0 : logic<FOFF_W>    = foff_of(lk_pc_q);
+    let row  : BtbRow         = rd_q as BtbRow;
+    let r_hit: logic          = lk_v_q && row.vld && row.tag == tag_of(lk_pc_q);
+    let r_s0 : logic <FOFF_W> = foff_of(lk_pc_q);
 
     var c_v  : logic  <N_CAND>         ;
     var c_off: logic  <FOFF_W> [N_CAND];
@@ -110,25 +140,25 @@ pub module bp_btb::<CFG: core_cfg> (
     always_comb {
         meta           = 0 as BtbMeta;
         meta.hit       = r_hit;
-        meta.tail_v    = r_hit && t_v[r_idx];
-        meta.tail_foff = t_off[r_idx];
+        meta.tail_v    = r_hit && row.t_v;
+        meta.tail_foff = row.t_off;
         for k in 0..BP_SLOTS {
             var sm           : SlotMeta;
-            sm.v          = r_hit && s_v[k][r_idx];
-            sm.foff       = s_off[k][r_idx];
-            sm.ctr        = s_ctr[k][r_idx];
+            sm.v          = r_hit && row.s_v[k];
+            sm.foff       = row.s_off[k];
+            sm.ctr        = row.s_ctr[k];
             meta.slots[k] = sm;
             c_v[k]        = sm.v && sm.ctr[1] && sm.foff >= r_s0;
             c_off[k]      = sm.foff;
             c_knd[k]      = CfiKind::BR;
-            c_tgt[k]      = (lk_pc_q & S_HI) | (s_tgt[k][r_idx] as 64);
+            c_tgt[k]      = (lk_pc_q & S_HI) | ({row.s_tgt[k], 1'b0} as 64);
             c_rvc[k]      = 1'b0;
         }
-        c_v[BP_SLOTS]   = meta.tail_v && t_off[r_idx] >= r_s0;
-        c_off[BP_SLOTS] = t_off[r_idx];
-        c_knd[BP_SLOTS] = t_knd[r_idx];
-        c_tgt[BP_SLOTS] = (lk_pc_q & T_HI) | (t_tgt[r_idx] as 64);
-        c_rvc[BP_SLOTS] = t_rvc[r_idx];
+        c_v[BP_SLOTS]   = meta.tail_v && row.t_off >= r_s0;
+        c_off[BP_SLOTS] = row.t_off;
+        c_knd[BP_SLOTS] = row.t_knd;
+        c_tgt[BP_SLOTS] = (lk_pc_q & T_HI) | ({row.t_tgt, 1'b0} as 64);
+        c_rvc[BP_SLOTS] = row.t_rvc;
     }
 
     // The earliest taken candidate wins (lower index on equal offsets);
@@ -202,70 +232,70 @@ pub module bp_btb::<CFG: core_cfg> (
     let t_inv    : logic           = u.valid && um.hit && um.tail_v && um.tail_foff <= u.last
         && !(u.res.exit_v && u.res.exit_foff == um.tail_foff);
 
-    // Valid bits.
-    always_ff {
-        if_reset {
-            for e in 0..BP_BTB_N {
-                vld[e] = 1'b0;
-                t_v[e] = 1'b0;
-                for k in 0..BP_SLOTS {
-                    s_v[k][e] = 1'b0;
-                }
-            }
-        } else {
-            if alloc {
-                vld[u_idx] = 1'b1;
-            }
-            for k in 0..BP_SLOTS {
-                if (alloc && k == 0 && x_br) || (need_slot && victim[k]) {
-                    s_v[k][u_idx] = 1'b1;
-                } else if alloc || inv[k] {
-                    s_v[k][u_idx] = 1'b0;
-                }
-            }
-            if alloc && x_br {
-                t_v[u_idx] = 1'b0;
-            } else if x_jmp {
-                t_v[u_idx] = 1'b1;
-            } else if t_inv {
-                t_v[u_idx] = 1'b0;
-            }
-        }
-    }
-
-    // Payload.
-    always_ff {
+    // The fields this update writes (wm) and their values (wd).
+    var wd: BtbRow;
+    var wm: BtbRow;
+    always_comb {
+        wd = 0 as BtbRow;
+        wm = 0 as BtbRow;
         if alloc {
-            tagv[u_idx] = tag_of(u.start_pc);
+            wd.vld = 1'b1;
+            wd.tag = tag_of(u.start_pc);
+            wm.vld = 1'b1;
+            wm.tag = '1;
         }
         for k in 0..BP_SLOTS {
             if (alloc && k == 0 && x_br) || (need_slot && victim[k]) {
-                s_off[k][u_idx] = u.res.exit_foff;
-                s_ctr[k][u_idx] = 2'd2;
-                s_tgt[k][u_idx] = u.res.target[BTB_STGT_W - 1:0];
-            } else if !alloc {
+                wd.s_v[k]   = 1'b1;
+                wd.s_off[k] = u.res.exit_foff;
+                wd.s_ctr[k] = 2'd2;
+                wd.s_tgt[k] = u.res.target[BTB_STGT_W - 1:1];
+                wm.s_v[k]   = 1'b1;
+                wm.s_off[k] = '1;
+                wm.s_ctr[k] = '1;
+                wm.s_tgt[k] = '1;
+            } else if alloc || inv[k] {
+                wm.s_v[k] = 1'b1;
+            } else {
                 if ctr_we[k] {
-                    s_ctr[k][u_idx] = new_c[k];
+                    wd.s_ctr[k] = new_c[k];
+                    wm.s_ctr[k] = '1;
                 }
                 if tgt_we[k] {
-                    s_tgt[k][u_idx] = u.res.target[BTB_STGT_W - 1:0];
+                    wd.s_tgt[k] = u.res.target[BTB_STGT_W - 1:1];
+                    wm.s_tgt[k] = '1;
                 }
             }
         }
-        if x_jmp {
-            t_off[u_idx] = u.res.exit_foff;
-            t_knd[u_idx] = u.res.exit_kind;
-            t_tgt[u_idx] = u.res.target[BTB_TTGT_W - 1:0];
-            t_rvc[u_idx] = x_rvc;
+        if alloc && x_br {
+            wm.t_v = 1'b1;
+        } else if x_jmp {
+            wd.t_v   = 1'b1;
+            wd.t_off = u.res.exit_foff;
+            wd.t_knd = u.res.exit_kind;
+            wd.t_tgt = u.res.target[BTB_TTGT_W - 1:1];
+            wd.t_rvc = x_rvc;
+            wm.t_v   = 1'b1;
+            wm.t_off = '1;
+            wm.t_knd = 3'b111 as CfiKind;
+            wm.t_tgt = '1;
+            wm.t_rvc = 1'b1;
+        } else if t_inv {
+            wm.t_v = 1'b1;
         }
     }
 
+    assign w_en   = swp_q || u.valid;
+    assign w_idx  = if swp_q ? swi_q : u_idx;
+    assign w_data = if swp_q ? '0 : wd as ROW_W;
+    assign w_mask = if swp_q ? '1 : wm as ROW_W;
+
     // ---- Events ----
 
-    let ev_x : logic     = u.valid && u.res.exit_v;
-    let ev_d : logic<64> = u.res.target ^ u.start_pc;
-    let ev_j : logic     = ev_x && !x_br && !is_pop(u.res.exit_kind);
-    var ev_q : BtbPerf  ;
+    let ev_x: logic       = u.valid && u.res.exit_v;
+    let ev_d: logic  <64> = u.res.target ^ u.start_pc;
+    let ev_j: logic       = ev_x && !x_br && !is_pop(u.res.exit_kind);
+    var ev_q: BtbPerf    ;
     always_ff {
         if_reset {
             ev_q = 0 as BtbPerf;
@@ -276,7 +306,7 @@ pub module bp_btb::<CFG: core_cfg> (
             ev_q.x_j    = ev_j;
             ev_q.far_br = {ev_d[63:20] != 0, ev_d[63:16] != 0, ev_d[63:14] != 0, ev_d[63:13] != 0, ev_d[63:12] != 0}
                 & {ev_x && x_br repeat 5};
-            ev_q.far_j = {ev_d[63:32] != 0, ev_d[63:24] != 0, ev_d[63:20] != 0, ev_d[63:16] != 0, ev_d[63:13] != 0}
+            ev_q.far_j  = {ev_d[63:32] != 0, ev_d[63:24] != 0, ev_d[63:20] != 0, ev_d[63:16] != 0, ev_d[63:13] != 0}
                 & {ev_j repeat 5};
         }
     }
