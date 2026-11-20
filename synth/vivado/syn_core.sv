@@ -3,7 +3,9 @@
 // are left open and the schedule-replay inputs tied off, so synthesis prunes
 // logic that only feeds them. OBS = 1 keeps all of it alive (every
 // observation bit reaches o_obs through an XOR tree, the replay inputs are
-// ports), which is what a top that exports those ports costs.
+// ports), which is what a top that exports those ports costs. Without the
+// HELIODOR_OBS define (the synthesis build) those outputs are 0 in the core
+// and the two settings come out the same.
 module syn_core #(
     parameter bit W4  = 1'b1,
     parameter bit OBS = 1'b0

@@ -415,3 +415,29 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 | W4 `u_bpu` LUT | 20,933 | 3,949 | −16,984 |
 
 - 判定: cbench 8 本 (W2/W4 の dhrystone、coremark、fpmm、spmv) の出力 (cycles、instret、retire の hash、perf の dump) が `fdca872c` と完全に一致 (W2 coremark 383,986、W4 coremark 316,668 など)。5.15 N=1 W2 boot は 14,655,526 サイクルで一致。G0 は 864 pass、0 fail。
+
+### 8.2 O1: 観測専用の論理を `HELIODOR_OBS` の中へ
+
+- define の名前は `HELIODOR_OBS` (D-3 の define を広げたもの)。`Veryl.toml` の `[test].defines` に `HELIODOR_CHK` と並べて入れ、試験は今までどおり record、perf、lockstep、cosim を使う。合成の build (define なし) では次が無くなる:
+  - commit: `ret_q`、`ret_dm_q`、`evt_q`、`order_q`、record 用の LQ/SQ の窓の選択と `rmask64`、`rx_q` (前は `HELIODOR_CHK`)、`o_csr_obs_addr`。lockstep の制御 (`i_dbg_*`) は `order_q` と比べるので同じ define の中に置き、define なしでは「制御なし」(limit 0、interrupt mask なし) と同じ値の定数にした。
+  - rob: `obs_q`、`src_q` (前は `HELIODOR_CHK`)。dispatch の `RobEnt.insn` は define なしで 0。
+  - lq/sq: commit 窓の `obs`。
+  - vu_adapter: VRF の書き込みの数と hash (`wcnt_q`、`hash_q`) と final-value fold (前は `HELIODOR_CHK`)。
+  - prf: record 用の読み口 `o_ordata` (前は `HELIODOR_CHK`)。
+  - heliodor_core: `o_perf` は 0 (`hpm_ev` の 7 本は中の `perf` から取るので CSR の HPM はそのまま)。`o_retire[0].csr_new` の差し替え (前は `HELIODOR_CHK`)。
+  - SoC: `o_mc_perf`、`o_io_obs`、`o_dm_obs`。`MTIME_SRC = INSTRET` は retire record を数えるので `HELIODOR_OBS` が要る (試験専用の設定)。
+- 振る舞い: 試験の build は define があるので RTL の意味は前と同じ。cbench 8 本の出力 (cycles、instret、record の hash、perf の dump) は R1 と完全に一致、GL-B (`test_w2_linux_boot_lockstep`) は pass で 14,579,991 サイクル、record 10,417,784、hash `60e504ab77211f61`。G0 は 864 pass、0 fail。define なしの build は arch harness が retire record で tohost を見るので sim では回せない。代わりに、機能の port だけの合成 (`soc_w2`) と観測の port を残した合成 (`core_w4_obs`) の register を cell 名で R1 と突き合わせ、register の種類 (信号名) の集合が完全に同じで、数の差は Vivado の複製と併合の差だけであることを確かめた (W2 SoC で −110、W4 で +122)。
+- 合成 (define なし):
+
+| | R1 の後 | O1 の後 | 差 |
+|---|---|---|---|
+| W2 SoC (機能の port だけ) LUT / FF / DSP | 411,069 / 132,441 / 349 | 415,168 / 132,331 / 348 | +4,099 / −110 / −1 |
+| W4 core、観測の port を残す top (`core_w4_obs`) LUT | 869,310 (推定) | 793,945 | −75,365 |
+| 同 FF | 212,496 (推定) | 195,540 | −16,956 |
+| 同 DSP | 432 | 372 | −60 |
+| W2 core、観測の port を残す top (`core_w2_obs`) LUT | 424,693 (推定) | 408,438 | −16,255 |
+| 同 FF | 137,560 (推定) | 128,167 | −9,393 |
+| 同 DSP | 409 | 348 | −61 |
+
+  「R1 の後」の `*_obs` は測っていない。§2.3 の値 (O1 と R1 の前) から R1 の実測の差 (W4 −16,963 LUT / −117 FF、W2 −12,260 / −71) を引いた推定である。
+- 読み方: 観測の port を出す top (`heliodor_soc_smp` をそのまま top にした合成など) では、O1 で観測の代金が消え、機能の port だけの合成との差は W4 で LUT +3,395 / FF +122 (0.4 %) まで縮んだ。機能の port だけの合成は前から Vivado が観測を刈っていたので、O1 では減らない。W2 SoC の LUT +4,099 (+1.0 %) は、上のとおり register の集合が同じなので、論理の構造が変わったことによる Vivado の最適化の揺れである (階層では `u_sb` +9,416、`u_vum` −4,250、`u_lq`/`u_sq` 約 −2,400 ずつと、帰属の移動が大きい)。

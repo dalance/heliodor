@@ -18,7 +18,8 @@
 #                ifu's 4 or 8 per-word checks (syn_pmp.sv), for costing
 #
 # Run from the project root after `veryl build` (it reads heliodor.f). No
-# HELIODOR_CHK define: the checkers are out of synthesis, as in a real build.
+# HELIODOR_CHK or HELIODOR_OBS define: the checkers and the observation-only
+# logic are out of synthesis, as in a real build.
 # Vivado needs its license, so run this outside the sandbox. Output goes to
 # synth/vivado/out/<target>/ (gitignored).
 set -euo pipefail

@@ -34,7 +34,8 @@
 //   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs;
 //                          i_trap_target is the debug memory exception entry
 //                          in Debug Mode
-//   i_dbg_*              : lockstep controls, all 0 in normal use
+//   i_dbg_*              : lockstep controls, all 0 in normal use; read only
+//                          with HELIODOR_OBS
 //   decision outputs     : o_retire_cnt, o_flush, o_trap_fire, o_irq_take,
 //                          the side-effect ports and o_csr are combinational
 //                          functions of registered state, i_kill and i_dbg_*
@@ -57,7 +58,8 @@
 //   o_oldest             : from registered state, i_kill and i_dbg_*
 //   o_retire, o_irq_evt  : registered, one cycle after retire. csr_new is 0:
 //                          the core reads it from the CSR file at
-//                          o_csr_obs_addr in the cycle the record is visible
+//                          o_csr_obs_addr in the cycle the record is visible.
+//                          0 without HELIODOR_OBS, like o_retire_dm
 //   i_cm_src, i_src_rdata : rob's source registers of each lane and their
 //                          values read from the PRF (3 per lane, rs1..rs3),
 //                          for the retire record only
@@ -217,7 +219,6 @@ pub module commit::<CFG: core_cfg> (
 
     var arch_pc_q: logic     <64>     ;
     var boot_q   : logic              ; // first cycle out of reset: the PC is i_reset_pc
-    var order_q  : logic     <64>     ;
     var irq_q    : IrqReq             ;
     var dm_q     : logic              ;
     var hr_q     : logic              ;
@@ -229,9 +230,6 @@ pub module commit::<CFG: core_cfg> (
     var vec_t_q  : RobTag             ;
     var vec_q    : VecSide            ;
     var started_q: logic              ;
-    var ret_q    : RetireRec      [CW];
-    var ret_dm_q : logic              ;
-    var evt_q    : IrqEvent           ;
     var perf_q   : CmPerf             ;
 
     let apc: logic<64> = if boot_q ? i_reset_pc : arch_pc_q;
@@ -241,10 +239,13 @@ pub module commit::<CFG: core_cfg> (
     // A pending acceptance (acc_hold) withholds the token, so no new started
     // op begins and the head's started latch clears in bounded time. The
     // retire limits (lockstep and step) withhold it through lim_hold.
-    let limit_hit: logic = i_dbg_retire_limit_en && order_q >= i_dbg_retire_limit;
-    let step_done: logic = step_q && step_n_q;
-    let irq_ok   : logic = !i_dm && !(step_q && !i_dm_stepie)
-        && (!i_dbg_irq_mask || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit));
+    // The lockstep controls (i_dbg_*) compare with order_q and exist only
+    // with HELIODOR_OBS; without it they read as 0.
+    var limit_hit: logic    ; // the retire limit is reached
+    var irq_dbg  : logic    ; // the interrupt mask lets an interrupt in
+    var lim_ln   : logic<CW>; // lane l is below the retire limit
+    let step_done: logic     = step_q && step_n_q;
+    let irq_ok   : logic     = !i_dm && !(step_q && !i_dm_stepie) && irq_dbg;
     let icnt_pnd : logic = i_icnt_dm || i_icnt_bp;
     let hr_blk   : logic = hr_q || hold_q;
     let hr_take  : logic = hr_q && !hold_q && !started_q && !i_kill.valid;
@@ -262,21 +263,17 @@ pub module commit::<CFG: core_cfg> (
 
     // ---- Lane classification ----
 
-    var lq_bits: logic<OBS_W> [CW];
     var lq_pz  : logic<CW>        ;
     var lq_io  : logic<CW>        ;
-    var sq_bits: logic<OBS_W> [MW];
     var sq_ok  : logic<MW>        ;
     var sq_io  : logic<MW>        ;
     var sq_ln  : logic<2>     [MW];
     always_comb {
         for w in 0..CW {
-            lq_bits[w] = i_lq_win[w].obs;
             lq_pz[w]   = i_lq_win[w].poison;
             lq_io[w]   = i_lq_win[w].io_ordered;
         }
         for w in 0..MW {
-            sq_bits[w] = i_sq_win[w].obs;
             sq_ok[w]   = i_sq_win[w].retire_ok;
             sq_io[w]   = i_sq_win[w].io_ordered;
             sq_ln[w]   = i_sq_win[w].lines;
@@ -357,7 +354,6 @@ pub module commit::<CFG: core_cfg> (
     var ln2    : logic  <CW>         ; // store pushes two lines
     var lq_hit : logic  <CW> [CW]    ;
     var sq_hit : logic  <MW> [CW]    ;
-    var mem_obs: MemObs      [CW]    ;
     var kil    : logic  <CW>         ;
     var st_wait: logic  <CW>         ;
     var dr_wait: logic  <CW>         ;
@@ -388,8 +384,6 @@ pub module commit::<CFG: core_cfg> (
             st_wait[l] = e.sq_v && !(|(sq_hit[l] & sq_ok));
             dr_wait[l] = e.drain && !i_ordering_empty;
             br_mis[l]  = ctrl && i_cm[l].res.mispred;
-            mem_obs[l] = (tree_onehot_mux::<CW, OBS_W>(lq_hit[l], lq_bits)
-                | tree_onehot_mux::<MW, OBS_W>(sq_hit[l], sq_bits)) as MemObs;
 
             nxt_pc[l] = if ctrl ? i_cm[l].res.next_pc : if e.flush == FlushKind::XRET ? xpc : pc[l] + len;
 
@@ -434,7 +428,7 @@ pub module commit::<CFG: core_cfg> (
             let rf       : logic = outc[l] == Outcome::RETIRE_FLUSH;
             // A pending step also stops retire: a partial kill can delay
             // dm_take past the cycle after the stepped record.
-            let ls_ok    : logic = !i_dbg_retire_limit_en || order_q + l <: i_dbg_retire_limit;
+            let ls_ok    : logic = lim_ln[l];
             let step_ok  : logic = !step_q || (l == 0 && !step_n_q);
             let icnt_ok  : logic = !i_icnt_act || (l == 0 && !icnt_pnd);
             lim_ok[l] = ls_ok && step_ok && icnt_ok;
@@ -600,7 +594,6 @@ pub module commit::<CFG: core_cfg> (
         if_reset {
             arch_pc_q = 0;
             boot_q    = 1'b1;
-            order_q   = 0;
             irq_q     = 0;
             dm_q      = 1'b0;
             hr_q      = 1'b0;
@@ -627,7 +620,6 @@ pub module commit::<CFG: core_cfg> (
             } else {
                 arch_pc_q = apc;
             }
-            order_q = order_q + (n_ret as 64) + ((trap_fire || bp_take) as 64);
 
             if dm_redir {
                 step_q   = 1'b0;
@@ -666,94 +658,11 @@ pub module commit::<CFG: core_cfg> (
 
     // ---- Retire record ----
 
-    var rmask64: logic<64> [CW];
-    always_comb {
-        for l in 0..CW {
-            for b in 0..64 {
-                rmask64[l][b] = mem_obs[l].rmask[b / 8];
-            }
-        }
-    }
+    // The record, the lockstep controls and the interrupt event observe the
+    // core and feed nothing back; they exist only with HELIODOR_OBS.
 
-    always_ff {
-        if_reset {
-            for l in 0..CW {
-                ret_q[l] = 0;
-            }
-            ret_dm_q = 1'b0;
-        } else {
-            ret_dm_q = i_dm;
-            for l in 0..CW {
-                let c               : RobCm  = i_cm[l];
-                let mo              : MemObs = mem_obs[l];
-                let tr              : logic  = (trap_fire || bp_take) && l == 0;
-                ret_q[l]         = 0;
-                ret_q[l].valid   = retire[l] || tr;
-                ret_q[l].order   = order_q + l;
-                ret_q[l].pc      = pc[l];
-                ret_q[l].next_pc = if tr ? 64'd0 : nxt_pc[l];
-                ret_q[l].insn    = c.ent.insn;
-                ret_q[l].is_rvc  = c.ent.is_rvc;
-                ret_q[l].priv    = i_priv;
-                ret_q[l].virt    = i_virt;
-                if tr {
-                    ret_q[l].trap  = 1'b1;
-                    ret_q[l].cause = if bp_take ? 6'd3 : i_exc.rec.cause;
-                    ret_q[l].tval  = i_trap_tval;
-                    if bp_take {
-                        ret_q[l].insn   = 32'd0;
-                        ret_q[l].is_rvc = 1'b0;
-                    }
-                } else {
-                    if c.ent.has_rd {
-                        ret_q[l].rd_kind  = if c.ent.cls == RegClass::FP ? RdKind::FP : RdKind::INT;
-                        ret_q[l].rd_addr  = c.ent.rd_arch;
-                        ret_q[l].rd_wdata = c.obs;
-                    }
-                    if c.ent.fu == FuKind::ATOMIC && i_rd2_valid {
-                        ret_q[l].rd2_valid = 1'b1;
-                        ret_q[l].rd2_wdata = i_rd2;
-                    }
-                    if c.ent.lq_v || c.ent.sq_v {
-                        ret_q[l].mem_size     = mo.size;
-                        ret_q[l].mem_vaddr    = mo.vaddr;
-                        ret_q[l].mem_paddr    = mo.paddr;
-                        ret_q[l].mem_io       = mo.io;
-                        ret_q[l].mem_rmask    = mo.rmask;
-                        ret_q[l].mem_wmask    = mo.wmask;
-                        ret_q[l].mem_wdata    = mo.wdata;
-                        ret_q[l].mem_wdata_hi = mo.wdata_hi;
-                    }
-                    if c.ent.lq_v {
-                        ret_q[l].mem_rdata = c.obs & rmask64[l];
-                    }
-                    if c.ent.fu == FuKind::SYS && c.ent.csr_wr {
-                        ret_q[l].csr_valid = 1'b1;
-                        ret_q[l].csr_addr  = sys_q.csr_addr;
-                        ret_q[l].csr_wdata = sys_q.csr_wdata;
-                    }
-                    // ffl_q is written only by a writeback: an op done at
-                    // allocation would report its slot's previous occupant.
-                    if c.ent.effect.fflags {
-                        ret_q[l].fflags = c.fflags;
-                    }
-                    if l == 0 && vec_mine {
-                        ret_q[l].vec_v     = 1'b1;
-                        ret_q[l].vrf_wcnt  = vec_q.vrf_wcnt;
-                        ret_q[l].vrf_hash  = vec_q.vrf_hash;
-                        ret_q[l].vrf_wmask = vec_q.vrf_wmask;
-                        ret_q[l].vrf_xhash = vec_q.vrf_xhash;
-                        ret_q[l].vtype     = if vec_q.vcfg_v ? vec_q.vtype : i_vtype;
-                        ret_q[l].vl        = if vec_q.vcfg_v ? vec_q.vl : i_vl;
-                        ret_q[l].vstart    = 64'd0;
-                    }
-                }
-            }
-        }
-    }
-
-    // Observation-only fields (retire_pkg): held apart from ret_q so that
-    // without HELIODOR_CHK they are constants and leave no state.
+    // Observation-only fields of the record (retire_pkg) that ret_q does
+    // not hold.
     struct RecObs {
         intr     : logic    ,
         rs1_kind : RdKind   ,
@@ -772,10 +681,131 @@ pub module commit::<CFG: core_cfg> (
         tinst    : logic<64>,
     }
 
-    var rx: RecObs [CW];
-
-    #[ifdef(HELIODOR_CHK)]
+    #[ifdef(HELIODOR_OBS)]
     {
+        var order_q : logic    <64>     ;
+        var ret_q   : RetireRec     [CW];
+        var ret_dm_q: logic             ;
+        var evt_q   : IrqEvent          ;
+
+        always_comb {
+            limit_hit = i_dbg_retire_limit_en && order_q >= i_dbg_retire_limit;
+            irq_dbg   = !i_dbg_irq_mask || (i_dbg_irq_allow && i_dbg_retire_limit_en && order_q == i_dbg_retire_limit);
+            for l in 0..CW {
+                lim_ln[l] = !i_dbg_retire_limit_en || order_q + l <: i_dbg_retire_limit;
+            }
+        }
+
+        always_ff {
+            if_reset {
+                order_q = 0;
+            } else {
+                order_q = order_q + (n_ret as 64) + ((trap_fire || bp_take) as 64);
+            }
+        }
+
+        var lq_bits: logic <OBS_W> [CW];
+        var sq_bits: logic <OBS_W> [MW];
+        var mem_obs: MemObs        [CW];
+        always_comb {
+            for w in 0..CW {
+                lq_bits[w] = i_lq_win[w].obs;
+            }
+            for w in 0..MW {
+                sq_bits[w] = i_sq_win[w].obs;
+            }
+            for l in 0..CW {
+                mem_obs[l] = (tree_onehot_mux::<CW, OBS_W>(lq_hit[l], lq_bits)
+                    | tree_onehot_mux::<MW, OBS_W>(sq_hit[l], sq_bits)) as MemObs;
+            }
+        }
+
+        var rmask64: logic<64> [CW];
+        always_comb {
+            for l in 0..CW {
+                for b in 0..64 {
+                    rmask64[l][b] = mem_obs[l].rmask[b / 8];
+                }
+            }
+        }
+
+        always_ff {
+            if_reset {
+                for l in 0..CW {
+                    ret_q[l] = 0;
+                }
+                ret_dm_q = 1'b0;
+            } else {
+                ret_dm_q = i_dm;
+                for l in 0..CW {
+                    let c               : RobCm  = i_cm[l];
+                    let mo              : MemObs = mem_obs[l];
+                    let tr              : logic  = (trap_fire || bp_take) && l == 0;
+                    ret_q[l]         = 0;
+                    ret_q[l].valid   = retire[l] || tr;
+                    ret_q[l].order   = order_q + l;
+                    ret_q[l].pc      = pc[l];
+                    ret_q[l].next_pc = if tr ? 64'd0 : nxt_pc[l];
+                    ret_q[l].insn    = c.ent.insn;
+                    ret_q[l].is_rvc  = c.ent.is_rvc;
+                    ret_q[l].priv    = i_priv;
+                    ret_q[l].virt    = i_virt;
+                    if tr {
+                        ret_q[l].trap  = 1'b1;
+                        ret_q[l].cause = if bp_take ? 6'd3 : i_exc.rec.cause;
+                        ret_q[l].tval  = i_trap_tval;
+                        if bp_take {
+                            ret_q[l].insn   = 32'd0;
+                            ret_q[l].is_rvc = 1'b0;
+                        }
+                    } else {
+                        if c.ent.has_rd {
+                            ret_q[l].rd_kind  = if c.ent.cls == RegClass::FP ? RdKind::FP : RdKind::INT;
+                            ret_q[l].rd_addr  = c.ent.rd_arch;
+                            ret_q[l].rd_wdata = c.obs;
+                        }
+                        if c.ent.fu == FuKind::ATOMIC && i_rd2_valid {
+                            ret_q[l].rd2_valid = 1'b1;
+                            ret_q[l].rd2_wdata = i_rd2;
+                        }
+                        if c.ent.lq_v || c.ent.sq_v {
+                            ret_q[l].mem_size     = mo.size;
+                            ret_q[l].mem_vaddr    = mo.vaddr;
+                            ret_q[l].mem_paddr    = mo.paddr;
+                            ret_q[l].mem_io       = mo.io;
+                            ret_q[l].mem_rmask    = mo.rmask;
+                            ret_q[l].mem_wmask    = mo.wmask;
+                            ret_q[l].mem_wdata    = mo.wdata;
+                            ret_q[l].mem_wdata_hi = mo.wdata_hi;
+                        }
+                        if c.ent.lq_v {
+                            ret_q[l].mem_rdata = c.obs & rmask64[l];
+                        }
+                        if c.ent.fu == FuKind::SYS && c.ent.csr_wr {
+                            ret_q[l].csr_valid = 1'b1;
+                            ret_q[l].csr_addr  = sys_q.csr_addr;
+                            ret_q[l].csr_wdata = sys_q.csr_wdata;
+                        }
+                        // ffl_q is written only by a writeback: an op done at
+                        // allocation would report its slot's previous occupant.
+                        if c.ent.effect.fflags {
+                            ret_q[l].fflags = c.fflags;
+                        }
+                        if l == 0 && vec_mine {
+                            ret_q[l].vec_v     = 1'b1;
+                            ret_q[l].vrf_wcnt  = vec_q.vrf_wcnt;
+                            ret_q[l].vrf_hash  = vec_q.vrf_hash;
+                            ret_q[l].vrf_wmask = vec_q.vrf_wmask;
+                            ret_q[l].vrf_xhash = vec_q.vrf_xhash;
+                            ret_q[l].vtype     = if vec_q.vcfg_v ? vec_q.vtype : i_vtype;
+                            ret_q[l].vl        = if vec_q.vcfg_v ? vec_q.vl : i_vl;
+                            ret_q[l].vstart    = 64'd0;
+                        }
+                    }
+                }
+            }
+        }
+
         // intr_q: a trap or interrupt was taken and no record has followed
         // it outside Debug Mode yet.
         var rx_q  : RecObs [CW];
@@ -821,50 +851,56 @@ pub module commit::<CFG: core_cfg> (
                 }
             }
         }
-        assign rx             = rx_q;
-        assign o_csr_obs_addr = ret_q[0].csr_addr;
-    }
-    #[ifndef(HELIODOR_CHK)]
-    {
-        assign rx             = '{default: 0 as RecObs};
-        assign o_csr_obs_addr = 12'd0;
-    }
 
-    always_comb {
-        for l in 0..CW {
-            o_retire[l]           = ret_q[l];
-            o_retire[l].intr      = rx[l].intr;
-            o_retire[l].rs1_kind  = rx[l].rs1_kind;
-            o_retire[l].rs1_addr  = rx[l].rs1_addr;
-            o_retire[l].rs1_rdata = rx[l].rs1_rdata;
-            o_retire[l].rs2_kind  = rx[l].rs2_kind;
-            o_retire[l].rs2_addr  = rx[l].rs2_addr;
-            o_retire[l].rs2_rdata = rx[l].rs2_rdata;
-            o_retire[l].rs3_kind  = rx[l].rs3_kind;
-            o_retire[l].rs3_addr  = rx[l].rs3_addr;
-            o_retire[l].rs3_rdata = rx[l].rs3_rdata;
-            o_retire[l].csr_read  = rx[l].csr_read;
-            o_retire[l].csr_rdata = rx[l].csr_rdata;
-            o_retire[l].tval2     = rx[l].tval2;
-            o_retire[l].tinst     = rx[l].tinst;
-            if rx[l].csr_read {
-                o_retire[l].csr_addr = rx[l].csr_addr;
+        always_comb {
+            for l in 0..CW {
+                o_retire[l]           = ret_q[l];
+                o_retire[l].intr      = rx_q[l].intr;
+                o_retire[l].rs1_kind  = rx_q[l].rs1_kind;
+                o_retire[l].rs1_addr  = rx_q[l].rs1_addr;
+                o_retire[l].rs1_rdata = rx_q[l].rs1_rdata;
+                o_retire[l].rs2_kind  = rx_q[l].rs2_kind;
+                o_retire[l].rs2_addr  = rx_q[l].rs2_addr;
+                o_retire[l].rs2_rdata = rx_q[l].rs2_rdata;
+                o_retire[l].rs3_kind  = rx_q[l].rs3_kind;
+                o_retire[l].rs3_addr  = rx_q[l].rs3_addr;
+                o_retire[l].rs3_rdata = rx_q[l].rs3_rdata;
+                o_retire[l].csr_read  = rx_q[l].csr_read;
+                o_retire[l].csr_rdata = rx_q[l].csr_rdata;
+                o_retire[l].tval2     = rx_q[l].tval2;
+                o_retire[l].tinst     = rx_q[l].tinst;
+                if rx_q[l].csr_read {
+                    o_retire[l].csr_addr = rx_q[l].csr_addr;
+                }
             }
         }
-    }
 
-    always_ff {
-        if_reset {
-            evt_q = 0;
-        } else {
-            evt_q.valid = irq_take;
-            evt_q.cause = irq_q.code;
-            evt_q.epc   = apc;
-            evt_q.order = order_q;
+        always_ff {
+            if_reset {
+                evt_q = 0;
+            } else {
+                evt_q.valid = irq_take;
+                evt_q.cause = irq_q.code;
+                evt_q.epc   = apc;
+                evt_q.order = order_q;
+            }
         }
+
+        assign o_csr_obs_addr = ret_q[0].csr_addr;
+        assign o_retire_dm    = ret_dm_q;
+        assign o_irq_evt      = evt_q;
+    }
+    #[ifndef(HELIODOR_OBS)]
+    {
+        assign limit_hit      = 1'b0;
+        assign irq_dbg        = 1'b1;
+        assign lim_ln         = '1;
+        assign o_csr_obs_addr = 12'd0;
+        assign o_retire       = '{default: 0 as RetireRec};
+        assign o_retire_dm    = 1'b0;
+        assign o_irq_evt      = 0 as IrqEvent;
     }
 
-    assign o_retire_dm = ret_dm_q;
     assign o_dm_req    = dm_req;
     assign o_step      = step_q;
     assign o_dm_quiet  = hold_q && !started_q && i_ordering_empty && i_dc_idle && i_islot_idle && i_dptw_idle && i_iptw_idle;
@@ -872,7 +908,6 @@ pub module commit::<CFG: core_cfg> (
     assign o_trig_hit  = if trig_acc ? i_exc.rec.trig_hit[CFG::TRIG_N - 1:0] : 0;
     assign o_icnt_cnt  = !i_dm && (retire[0] || trap_fire || irq_take);
     assign o_icnt_take = {bp_take, dm_take && i_icnt_dm};
-    assign o_irq_evt   = evt_q;
 
     // ---- Firing events ----
 
