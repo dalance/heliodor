@@ -1376,6 +1376,28 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - `act_sm/mcsr_cntr_00` は MI 以来の既知の fail (CLINT の mtime が読み出し専用) で、image の食い違いではない (`doc/phase15_ms_logic.md` §8.4)。
 - 合成の代金は `doc/phase15_ms_logic.md` §8.6。
 
+### 9.17 MS: R2 (dcache の tag の複製) と S1 (SQ の forwarding) のゲート (2026-11-21)
+
+`phase15/ms` の `761f9824` に R2 (`c3b86c8c`、tag の書き込みをリセットの無い `always_ff` へ) と S1 (`7c4110c2`、forwarding を 16 byte の窓どうしで合わせる) を積んだ tip のゲート。どちらも cycle を変えない変更なので、判定は §9.16 の値との完全な一致である。合成の結果と S1 の旧式との乱数比較は `doc/phase15_ms_logic.md` §8.7、§8.8。veryl `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0。
+
+| ゲート | 前 (§9.16) | 後 | 判定 |
+|---|---|---|---|
+| G0 | 874 passed | 874 passed、0 failed、371 ignored | pass |
+| cbench W2/W4 (8 本) | `761f9824` の出力 | 出力 (cycles、instret、record の hash、perf の dump) が全行一致。W2 coremark 383,986、W4 coremark 316,668 | 一致 |
+| GL-B W2 | 14,579,991、record 10,417,784、hash `60e504ab77211f61` | 同じ | 一致 |
+| GL-B W4 | 12,266,737、同じ hash | 同じ | 一致 |
+| 5.15 N=1 W2 / W4 | 14,655,526 / 12,291,246 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W4 | 18,359,025 / 16,738,226 / 17,882,492 | 同じ | 一致 (W4 の 5.15 と同じ invocation で走った) |
+| hvlinux W2 | 18,684,930 | 同じ | 一致 |
+| litmus N=4 W2 | 5,023,959 | 同じ | 一致 |
+| 5.15 SMP N=2 W2 | 19,778,334 | 同じ | 一致 |
+| 5.15 SMP N=4 W2 | 24,199,767 (record 14,478,663) | 同じ (record も同じ) | 一致 |
+| 5.15 SMP N=4 W4 | 22,634,564 (§9.15、BTB の変更の前) | 21,842,350 (record 14,373,313) | pass。−792,214 (−3.5 %)。下の注 |
+| ACT4 W2 の cosim (`run_act.py --cosim`、load/store/AMO/CMO と翻訳を通る 32 suite: i、d、f、zca、zcb、zcd、zaamo、zalrsc、zacas、zabha、za64rs、zawrs、ziccamoa、zicclsm、ziccrse、zic64b、zicbom、zicbop、zicboz、exceptions、misalignv、sv、svade、svadu、svnapot、svpbmt、pmp、h、vls8、vls16、vls32、vls64) | | 1,899/1,899、不一致 0 | pass。SPIKE_GAPS 7 本 (`h/vucsr_00..02`、`sv` の Svrsw60t59b の 4 本) を除く |
+
+- wall 時間 (最大 4 本の `veryl test` と Vivado 2 本を並べた): G0 2,941 s、cbench 628 s、GL-B W2 781 s、5.15 N=1 W2 700 s、W4 の N=1 の 5 本 (1 invocation) 3,209 s、hvlinux 600 s、litmus N=4 2,137 s、N=2 2,358 s、W2 N=4 9,676 s、W4 N=4 23,624 s、ACT の cosim 813 s。
+- W4 の N=4 の差: R2 と S1 は他のすべてのゲート (W2 の N=4 を record 数まで含む) で cycle を変えていない。W4 の N=4 は §9.15 の後に入った ms-size の BTB の変更 (BTB の圧縮と per-write-group の配列) の後に一度も測っていなかったので、22,634,564 は古い値だった。差の −792,214 は W2 の N=4 が同じ BTB の変更で動いた量 (§9.16 の −788,326) とほぼ同じで、終わりが timer の境界をまたぐかどうかで決まる形 (§9.14 の +797k と同じ) である。R2 の前の tip の W4 N=4 (5 時間以上) は回していないので、W4 だけでの BTB の変更の分と R2/S1 の分を直接には分けていない。CLAUDE.md の値を 21,842,350 に更新した。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。

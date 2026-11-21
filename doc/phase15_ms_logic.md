@@ -521,3 +521,57 @@ CBO の実装 (`cfa614f3`、dcache の CMO_HOME、io_unit、sq、mem_ctrl、l2ca
 - W2 SoC の L2 は black box (§1.1) なので、l2cache の `i_cinv_v` (directory の消去) はこの数に入っていない。
 - 読み方: CBO の代金は LUT で 0.1-0.3 % で、Vivado の最適化の揺れ (§8.2 で O1 の register の集合が同じでも +4,099 LUT 動いた) と同じ大きさである。checker (`HELIODOR_CHK`) と CBO の回数の perf (`McPerf.cmo`、`IoPerf.cbo`) は define なしの合成には入らない (perf は O1 で core と SoC の出口で 0 になる)。
 - 実行時間: `soc_w2` は synth_design 26 分 26 秒、`core_w4` は 38 分 29 秒 (sim と並べて回した)。
+
+### 8.7 R2: dcache の tag の複製 (V8)
+
+- 変更 (`src/cache/dcache_tagbank.veryl`): tag の書き込みを、リセット付きの `always_ff` の else 側から、リセットの無い `always_ff (clk)` へ移した。tag は前からリセットされていなかった (if_reset の側は空) ので、変わるのは「リセット中は書かない」が「リセット中も書く」になることだけである。`rst` の port は呼び出し側 (dcache_tags、l2cache、旧コア) のために残した。
+- tag の中身が意味を持たない (書かれていない、または古い) way を読んで判断に使う所が無いことを確かめた。dcache_tags の hit (`o_rd_hv`) は `valid_q` との AND。dcache の victim の line (`vic_line`) は、追い出しの通知 (`ev1_v`) が `v_valid` を、書き戻しの捕捉 (`l_cap`) が `v_dirty` (`v_valid` を含む) を要求する。core の coherence の比較 (`coh_line[2]`) は `ev1_v` で守られる。L2 の tag の複製 (`u_l2tag_*`) の比較も `lv_*` との AND である。リセット中は fill の state がリセットされているので書き込みの enable は 0 で、sim の上でも中身は前と同じになる。
+- Vivado の推論: 6 組 (W2) / 7 組 (W4) × 4 way の配列がすべて `RAM64M8 x 7` (64 × 44) の LUTRAM になった。前の FF の数が 1 組分 (64 × 4 × 44 = 11,264) 程度だったのは、全組が同じ書き込みを受けるので Vivado が同じ値の FF を併合していたためで、各組の 64:1 の読みの mux は組ごとに残っていた。
+
+| | 前 (§8.6) | 後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 369,808 | 352,188 | −17,620 (−4.8 %) |
+| W2 SoC LUTRAM | 12,688 | 13,936 | +1,248 |
+| W2 SoC FF | 130,771 | 119,458 | −11,313 |
+| W2 `u_dc` LUT / FF | 40,927 / 15,928 | 23,470 / 4,660 | −17,457 / −11,268 |
+| W4 core LUT | 731,454 | 711,646 | −19,808 (−2.7 %) |
+| W4 core LUTRAM | 12,688 (§8.5) | 14,144 | +1,456 |
+| W4 core FF | 193,173 | 181,869 | −11,304 |
+
+- §5 の見積もり (FF 12,224、LUT 約 16,000 / 25,000) に対し、FF は合い、LUT は W2 で少し多く W4 で少し少ない。
+- 判定: R2 と S1 を積んだ tip で、G0、cbench 8 本、GL-B W2/W4、5.15 N=1 W2/W4、hvlinux、litmus N=4、N=2、W2 の N=4 がすべて cycle まで前と一致し、ACT4 の load/store/AMO/CMO と翻訳の 32 suite の cosim が 1,899/1,899 (`doc/phase15_verification_plan.md` §9.17)。
+- 実行時間: `soc_w2` は synth_design 31 分 16 秒、`core_w4` は 53 分 1 秒 (sim 4 本と並べて回した)。
+
+### 8.8 S1: SQ の forwarding の line 画像
+
+- 変更 (`src/core/lsu/sq.veryl`):
+  - forwarding: エントリごとの 64 byte の line 画像 (`lo_d`/`lo_m64`/`hi_d`/`hi_m64`) を作って load の `dw` で切り出すのをやめ、query × エントリごとに 16 byte の窓どうしを直接合わせる。store の lo の窓と load の窓が重なるのは 8 byte 単位の offset が等しい (`eq`)、load が 1 つ後 (`dn`、store の上半分が load の下半分に来る)、load が 1 つ前 (`up`) の 3 通りだけで、hi の line は offset −1 の lo と同じ扱い (`dn` で load の `dw` = 0 のとき) になる。line の端を越える byte (`dw` = 7 の上半分) は覆わない。cbo.zero (`e_full`) は lo の line の窓の全 byte を覆い data は 0。data は cov の立つ byte しか使われない (後段の選択は cov で作る) ので、半分ごとの 2:1 の選択にした。
+  - push: 同じ line 画像を全エントリについて作って commit の窓 (`w_ix`) で選んでいたのを、窓のエントリの field を先に選んでから MEM_W 個だけずらす形にした。値は前と同じ式である。
+- 正しさ: 旧式 (`761f9824` から生成した `sq.sv` の module 名だけを変えたもの) と新式を同じ乱数入力で並べて走らせ、全出力 (`o_fwd`、`o_push`、`o_win`、`o_reissue`、`o_io`、`o_free`、`o_alloc_tag`、`o_head`、`o_chk`、`o_perf`) を毎サイクル比べる Verilator の testbench を書いた。line は 4 種に絞り、store の 1/8 を cbo.zero にする。W2 と W4 で 2 seed × 200 万サイクル、不一致 0。旧式の内部で forwarding に効いた (cand かつ cov ≠ 0) エントリを場合ごとに数えると、W2 の 1 seed で eq 17,421、dn 13,953、up 14,053、hi 155、cbo.zero 20,593、`dw` = 7 は 6,625 回で、どの場合も通った (W4 はおよそ 2 倍)。testbench は commit していない。
+- 重なり (備考): K (`sq.e_data` の上位 64 bit を amocas.q 用の 1 本に) を入れると data の幅が 64 bit になり、S1 の後の 2:1 の選択も半分になる。K はこの作業では入れていない。
+
+| | R2 の後 | S1 の後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 352,188 | 332,246 | −19,942 (−5.7 %) |
+| W2 SoC FF | 119,458 | 119,263 | −195 |
+| W2 `u_sq` LUT / FF | 28,413 / 8,230 | 7,916 / 7,984 | −20,497 / −246 |
+| W4 core LUT | 711,646 | 661,407 | −50,239 (−7.1 %) |
+| W4 core FF | 181,869 | 181,428 | −441 |
+| W4 `u_sq` LUT / FF | 90,105 / 16,411 | 28,330 / 15,938 | −61,775 / −473 |
+
+- §5 の見積もり (W2 約 9,000、W4 約 24,000) の 2 倍を超えた。見積もりは cell 名が `e_data` の LUT (forwarding の側) だけを数えたが、push の側もエントリごとに同じ line 画像を作ってから選んでいた。FF の差は複製の差。LUTRAM、BRAM、DSP は変わらない。
+- 判定: §8.7 と同じ (ゲートは R2 と S1 を積んだ tip で 1 回)。
+- 実行時間: `soc_w2` は synth_design 19 分 47 秒、`core_w4` は 35 分 52 秒。
+
+### 8.9 まとめ (§8.6 の値から)
+
+| | §8.6 (前) | S1 の後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 369,808 | 332,246 | −37,562 (−10.2 %) |
+| W2 SoC LUTRAM | 12,688 | 13,936 | +1,248 |
+| W2 SoC FF | 130,771 | 119,263 | −11,508 |
+| W4 core LUT | 731,454 | 661,407 | −70,047 (−9.6 %) |
+| W4 core LUTRAM | 12,688 | 14,144 | +1,456 |
+| W4 core FF | 193,173 | 181,428 | −11,745 |
+
+W4 core は KU15P の LUT の 126.5 % (§0 の 154 % から) になった。
