@@ -392,6 +392,10 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 - 順序: 独立で小さい O1、P、C1、R1 を先に入れる。S1、R2、L2 の作業 (V1/V2) は CBO の作業が master に入った後にする。
 - S 類の新しい規則: SRAM 級の配列へ bit の mask による read-modify-write の書き込みをしない。byte lane の write enable を使うか、行を「一緒に書く組」ごとの配列に分ける。理由: Vivado はこの形を非同期の 2 本目の読み口とみなし、BRAM ではなく LUTRAM にした (§3.2 の BTB と `dcache_bank`)。
 
+2026-11-21 の追加の決定 (ユーザ):
+
+- C1 の残り (`mcause`/`scause`/`vscause` の幅、`mtinst`/`htinst`、`mhpmevent` の実装していない bit) は入れない。理由: 範囲の外の値を書いた後の読みの値が変わり、spike と Sail (cosim と ACT4 の mcsr の walk) との一致が崩れる。それと引き換えに減るのは約 1,800 FF だけである。C1 は §8.4 の形 (HPM 0-2 と vl/vtype) で終わりにする。
+
 ## 8. 実施の記録
 
 合成はすべて §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし) で、「前」は §2 の値。
@@ -471,8 +475,8 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 - 入れたもの (読める値は前とすべて同じ):
   - `mhpmcounter`/`mhpmevent` の 0-2: 記憶を `hpmc_q`/`hpme_q` (3-31 の 29 本) に移し、0-2 は読みで 0 の定数にした。0-2 は decode でも siselect でも書かれず、前から常に 0 だった。動的 index の書き込みでも合成が 0-2 を消せるようになる。
   - `vl` (8 bit) と `vtype` (vill + vtype[7:0] の 9 bit): 書くのは vset の commit だけで、vector_unit は vl ≤ VLMAX ≤ 128、vtype は vill なら `1 << 63`、そうでなければ下位 8 bit だけを出す。CSR 命令からは読み出し専用。読みと `o_vl`/`o_vtype` は 64 bit に 0 を足して前と同じ値を出す。
-- 入れなかったもの (判断待ち): `mcause`/`scause`/`vscause`、`mtinst`/`htinst`、`mhpmevent` の実装していない bit。今はどれもソフトが書いた 64 bit をそのまま読み返す。幅を縮めると、範囲の外の値を書いてから読む場合 (ACT4 の `mcsr_walk` などがする) の読みが変わり、「読める値は今と同じ」に反する。spike と Sail もこれらを全幅で持つので、cosim と ACT4 の期待値とも食い違う見込みである。WARL/WLRL として縮めるなら、読みの値が変わることを認めるかどうかの決定が要る (縮められる FF は約 1,800)。
-- 判定: cbench 8 本の出力が完全に一致。G0 864 pass。ACT4 を spike cosim で W2 (zihpm、sscofpmf、zicntr、h、sm、s、u と V の全 suite: exceptionsv*、misalignv、vf*、vls*、vx*、zvbb*、zvkb*、zvfhmin) 2,546/2,547。落ちた 1 本 `act_sm/mcsr_cntr_00` (`csrr time` が 0、期待は 1) は C1 と関係しない: C1 を外した HEAD (`d2173780`) の cosim でも、この series の前 (`9f7f62ec`) の素の GA でも同じく落ちる。`.wt/mv` から写した ACT4 の image と今の tree の組み合わせの問題と見ている (未解決)。cosim なしの GA/GL-C (sm、zihpm、sscofpmf、zicntr) は同じ 1 本を除いて pass、hash 30/30。5.15 N=1 W2 boot は 14,655,526 で出力全体が一致。
+- 入れなかったもの (入れないことに決めた、§7): `mcause`/`scause`/`vscause`、`mtinst`/`htinst`、`mhpmevent` の実装していない bit。今はどれもソフトが書いた 64 bit をそのまま読み返す。幅を縮めると、範囲の外の値を書いてから読む場合 (ACT4 の `mcsr_walk` などがする) の読みが変わり、「読める値は今と同じ」に反する。spike と Sail もこれらを全幅で持つので、cosim と ACT4 の期待値とも食い違う見込みである。WARL/WLRL として縮めるなら、読みの値が変わることを認めるかどうかの決定が要る (縮められる FF は約 1,800)。
+- 判定: cbench 8 本の出力が完全に一致。G0 864 pass。ACT4 を spike cosim で W2 (zihpm、sscofpmf、zicntr、h、sm、s、u と V の全 suite: exceptionsv*、misalignv、vf*、vls*、vx*、zvbb*、zvkb*、zvfhmin) 2,546/2,547。落ちた 1 本 `act_sm/mcsr_cntr_00` (`csrr time` が 0、期待は 1) は C1 と関係しない: C1 を外した HEAD (`d2173780`) の cosim でも、この series の前 (`9f7f62ec`) の素の GA でも同じく落ちる。後で調べた結果、これは MI 以来の既知の fail で (`test/act/README.md` の Sm `mcsr_cntr`)、image の食い違いではない。test (`cp_mtime_write`) は CLINT の mtime に 42 を書き、`time` が 42 から 100 以内であることを signature の 1 として確かめるが、heliodor の CLINT の mtime は読み出し専用なので 0 になる。image は `.wt/mi` で pin `8b9ddedc` から作ったもので (md5 が一致)、その後の `test/act/config` の変更 (FS/VS の dirty を imprecise にしたもの) はこの test に関係しない。cosim なしの GA/GL-C (sm、zihpm、sscofpmf、zicntr) は同じ 1 本を除いて pass、hash 30/30。5.15 N=1 W2 boot は 14,655,526 で出力全体が一致。
 - 合成:
 
 | | P の後 | C1 の後 | 差 |
@@ -498,3 +502,22 @@ walk は kill の直後の組 (`k_batch`、`tail_q` から) と続きの組 (`c_
 | W4 core BRAM | 0 | RAMB36 8 + RAMB18 10 + URAM 1 | |
 
 観測の port を出す top では、これに O1 の分 (W4 で LUT 約 −75,000、FF 約 −17,000、DSP −60) が加わる (§8.2)。
+
+### 8.6 CBO の論理の代金 (`phase15/ms` への統合の後)
+
+CBO の実装 (`cfa614f3`、dcache の CMO_HOME、io_unit、sq、mem_ctrl、l2cache の `i_cinv_v`) を上の series と同じ branch に積んだ後の tip を、同じフローで合成した。`syn_core` には core の新しい port `o_dmem_cmo` を足した (足さないと core の CMO_HOME の論理が開いた出力として刈られる)。比べる相手は §8.4 の C1 の後。
+
+| | C1 の後 (CBO なし) | 統合の後 (CBO あり) | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 368,914 | 369,808 | +894 (+0.24 %) |
+| W2 SoC FF | 130,733 | 130,771 | +38 |
+| W2 SoC CARRY8 / DSP | 11,266 / 348 | 11,196 / 348 | −70 / 0 |
+| W2 SoC LUTRAM / BRAM | 12,688 / RAMB36 6 + RAMB18 7 + URAM 1 | 同じ | 0 |
+| W4 core LUT | 730,787 | 731,454 | +667 (+0.09 %) |
+| W4 core FF | 193,273 | 193,173 | −100 |
+| W4 core DSP | 374 | 373 | −1 |
+
+- 階層 (W2 SoC、LUT / FF): `u_dc` 40,610 / 15,916 → 40,927 / 15,928、`u_mctrl` 3,995 / 3,147 → 4,267 / 3,156。CBO が足した state は mem_ctrl の slot ごとの CMO の印と io_unit の `home_q` 程度で、FF の差は揺れの範囲である。
+- W2 SoC の L2 は black box (§1.1) なので、l2cache の `i_cinv_v` (directory の消去) はこの数に入っていない。
+- 読み方: CBO の代金は LUT で 0.1-0.3 % で、Vivado の最適化の揺れ (§8.2 で O1 の register の集合が同じでも +4,099 LUT 動いた) と同じ大きさである。checker (`HELIODOR_CHK`) と CBO の回数の perf (`McPerf.cmo`、`IoPerf.cbo`) は define なしの合成には入らない (perf は O1 で core と SoC の出口で 0 になる)。
+- 実行時間: `soc_w2` は synth_design 26 分 26 秒、`core_w4` は 38 分 29 秒 (sim と並べて回した)。
