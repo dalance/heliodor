@@ -20,6 +20,7 @@ module syn_core #(
     output var logic          o_dmem_req,
     output var logic          o_dmem_rfo,
     output var logic          o_dmem_dram,
+    output var logic          o_dmem_cmo,
     input  var logic          i_dmem_grant,
     input  var logic [63:0]   i_dmem_rdata,
     input  var logic          i_dmem_fill_excl,
@@ -82,7 +83,8 @@ module syn_core #(
         .i_hart_id (i_hart_id), .i_reset_pc (i_reset_pc), \
         .o_dmem_addr (o_dmem_addr), .o_dmem_ren (o_dmem_ren), \
         .o_dmem_req (o_dmem_req), .o_dmem_rfo (o_dmem_rfo), \
-        .o_dmem_dram (o_dmem_dram), .i_dmem_grant (i_dmem_grant), \
+        .o_dmem_dram (o_dmem_dram), .o_dmem_cmo (o_dmem_cmo), \
+        .i_dmem_grant (i_dmem_grant), \
         .i_dmem_rdata (i_dmem_rdata), .i_dmem_fill_excl (i_dmem_fill_excl), \
         .o_imemr_addr (o_imemr_addr), .o_imemr_req (o_imemr_req), \
         .o_imemr_dram (o_imemr_dram), .o_imemr_iread (o_imemr_iread), \
