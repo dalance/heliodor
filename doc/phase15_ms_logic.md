@@ -9,7 +9,7 @@ FPGA 合成を試した人から「ROB がとても大きい」と報告があ�
 - 合成の対象と結果 (Kintex UltraScale+ `xcku15p-ffve1517-2-e`、out-of-context、`HELIODOR_CHK` なし):
   - N=1 W2 SoC (L2 を除く): LUT 423,329 (うち LUTRAM 24,208)、FF 132,512、BRAM 0、DSP 349。core は LUT 413,957 / FF 128,330。
   - W4 core: LUT 807,513 (うち LUTRAM 27,408)、FF 195,535、BRAM 0、DSP 372。KU15P の LUT の 154 % で、この part に入らない。
-  - L2 を含む SoC は合成できない。L2 のデータ配列 (`data_0..3`、512 × 512 bit × 4) が RAM に推論されず、FF への展開も上限 (262,144 bit) を超えて elaboration が 25 分 46 秒で止まる (§3.1)。SoC の数字は L2 を black box にしたものである。
+  - L2 を含む SoC は合成できない (この時点。L2 の作り直しの後は完走し、L2 の配列はすべて block RAM になった。§8.10)。L2 のデータ配列 (`data_0..3`、512 × 512 bit × 4) が RAM に推論されず、FF への展開も上限 (262,144 bit) を超えて elaboration が 25 分 46 秒で止まる (§3.1)。SoC の数字は L2 を black box にしたものである。
   - BRAM は 1 個も使われていない。BTB、dcache のデータ、icache のデータと tag はすべて LUTRAM、dcache の tag の複製はすべて FF になった (§3)。
 - 観測の出力を残すと大きくなる: retire record、perf、checker の出力をすべて生かした合成は、W4 core で LUT +78,760 (+9.8 %)、FF +17,078 (+8.7 %)、DSP +60、W2 core で LUT +19,444 (+4.7 %)、FF +9,299 (+7.2 %)、DSP +60 だった (§2.3)。W4 ではそのうち ROB 関連 (`obs_q`、`insn` とそれを書く論理) が FF 約 12,300、LUT 約 48,000 である。`heliodor_soc_smp` をそのまま top にすると `o_retire`、`o_core_perf` などが port に残るので、報告者の合成はこの状態だったと考えられる。その場合 W4 の ROB は LUT 66,560 / FF 35,444 になる。
 - 機能の port だけを残した合成では、観測専用の論理は Vivado がすでに刈る。決定済みの E は、この場合は 0 しか減らない。E の効果は top が観測の port を出す場合に限られるので、E の define を retire record と perf の全体に広げることを提案する (§5 の O1)。
@@ -30,7 +30,7 @@ FPGA 合成を試した人から「ROB がとても大きい」と報告があ�
 | `syn_pmp.sv` | PMP 検査器の単体の原価を測る top (§5 の P) |
 | `cells.tcl`、`cells.py` | checkpoint の全 primitive を名前つきで書き出し、階層または信号名で集計する。§4 と §5 の内訳はこれで取った |
 
-target: `soc_w2`、`soc_w2_l2` (L2 込み、今は失敗する)、`core_w2`、`core_w4`、`core_w2_obs`、`core_w4_obs`、`pmp1`、`pmp3`、`pmp_if4`、`pmp_if8`。
+target: `soc_w2`、`soc_w2_l2` (L2 込み。この時点では失敗した。§8.10 で完走)、`core_w2`、`core_w4`、`core_w2_obs`、`core_w4_obs`、`pmp1`、`pmp3`、`pmp_if4`、`pmp_if8`。
 
 手順:
 
@@ -575,3 +575,29 @@ CBO の実装 (`cfa614f3`、dcache の CMO_HOME、io_unit、sq、mem_ctrl、l2ca
 | W4 core FF | 193,173 | 181,428 | −11,745 |
 
 W4 core は KU15P の LUT の 126.5 % (§0 の 154 % から) になった。
+
+### 8.10 L2 の作り直し (V1、V2、C、V6) と L2 込みの SoC の合成 (MS の出口条件)
+
+設計は `doc/phase15_core_design.md` §MS の「L2 の作り直し」。合成は §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし) で、tip は `3a88b97a`。`soc_w2_l2` は `soc_w2` と同じ top で L2 を black box にしない target で、§3.1 のとおり前は elaboration で止まっていた。`run.sh` の target の説明も今の状態に直した。
+
+- L2 込みの N=1 W2 SoC (`soc_w2_l2`) が完走した (synth_design 34 分 26 秒。sim 4 本と並べた。sim と並べない途中の版では 17 分 21 秒)。L2 の配列はすべて block RAM になった:
+  - データ `gen_data[0..3].u_data.mem_q`: 各 512 × 512 の RAM_SDP、RAMB36 8 個 (512 × 64 の 8 本、byte write enable)。計 32 個。
+  - tag と directory `gen_tag[0..3].u_tag.mem_q`: 各 512 × 43 (N = 1) の RAM_SDP、RAMB36 1 個。計 4 個。
+  - line の valid (way ごとに 512 × 1) と PLRU (512 × 3) は FF (3,584)。
+  - mem_ctrl の `wb_data`/`wb_strb` (V6) は FF のまま (「dissolved into registers」)。エントリの 8 lane を同じサイクルに書くので、lane を index とする配列は書き口が 8 本になる。容量は 1,152 bit (N = 1) で R 区分の範囲内なので、形はこのままにした。
+- 数 (L2 込みは前が無いので、L2 を black box にした `soc_w2` を前後で比べ、L2 の分は 2 つの差):
+
+| | §8.9 (前、`soc_w2`) | 後 `soc_w2` (L2 black box) | 後 `soc_w2_l2` (L2 込み) |
+|---|---|---|---|
+| LUT | 332,246 | 330,188 | 336,439 |
+| LUTRAM | 13,936 | 13,728 | 13,728 |
+| FF | 119,263 | 119,337 | 122,997 |
+| block RAM | RAMB36 6 + RAMB18 7 | RAMB36 6 + RAMB18 7 | RAMB36 42 + RAMB18 7 (45.5 tile) |
+| URAM | 1 | 1 | 1 |
+| DSP | 348 | 348 | 348 |
+| `u_mctrl` LUT / FF | 4,267 / 3,156 (§8.6) | 2,983 / 3,265 | 2,357 / 3,188 |
+| `u_l2` LUT / FF / RAMB36 | — (合成不能) | — | 7,120 / 3,742 / 36 |
+
+  `soc_w2` の LUT の −2,058 は mem_ctrl の減り (2 本の invalidate の口の調停、misaligned の hi 側、install と書きの口の保留が無くなった) で、FF の +74 は tag port の op の状態 (`x_*`、`wg_*`)。L2 そのものの代金は LUT 約 6,300、FF 約 3,700、RAMB36 36 個。tag の総量は 4 × 512 × 43 = 88,064 bit (N = 1) になり、前の 5 組 × 49 bit (501,760 bit) と FF の directory の約 1/6。
+- W4 core (`core_w4`、L2 も mem_ctrl も含まない) は §8.8 と同じ: LUT 661,407 (LUTRAM 14,144)、FF 181,428、RAMB36 8 + RAMB18 10、URAM 1、DSP 373 (synth_design 42 分 19 秒、`b764f3b6` で回した。core の RTL は `3a88b97a` と同じ)。
+- 実行時間: `soc_w2_l2` 34 分 26 秒 (前は elaboration で 25 分 46 秒の後に失敗)、`soc_w2` 15 分 43 秒。

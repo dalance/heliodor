@@ -5235,6 +5235,41 @@ MI の進捗:
 - I-cache: I-cache の copy は directory に載らない (I-read は sharer を足さない) ので CBO の対象にしない。命令の書き換えは FENCE.I が持つ (§F.10)。
 - spike の cosim (GC) が見られないもの: component は CBO をメモリの no-op として照合する (record に store が無い)。spike のメモリは DUT の coherent な値と同じなので、CBO の後の load の値で照合は崩れない。照合で見えないのは coherence の外の観測者から見た結果 (CBO の完了の時点で DRAM が更新されたか、L1 と L2 から line が消えたか) で、それは `test_*_cbo_vis_*` の backdoor の検査が持つ。
 
+#### L2 の作り直し (V1、V2、C、V6)【実装 (2026-11-21)】
+
+棚卸し (`doc/phase15_ms_inventory.md`) の V1 と V2 (案 a、2026-11-20 のユーザ決定)、sizing (`doc/phase15_ms_sizing.md`) の C (D-6 で V2 と同時)、V6 を一緒に入れた。
+
+- 配列 (すべて 1R1W、同期読み、リセット無し、リセットの無い `always_ff` で書く):
+  - データ: way ごとの `l2_data_bank` (512 行 × 512 bit)。書きは byte enable (64 本) で、merge は書き込みの byte enable が行い、古い行を読まない。install は全 byte。読みは 4 way を同じ index で並列に読み、次のサイクルに hit した way を選ぶ。読みは read-old で、同じサイクルに同じ行へ書かれた読みの値は使わない (下の 2)。
+  - tag と directory: way ごとの `l2_tag_bank` (512 語 × {own, shr[N], tag})。tag は PA[55:15] の 41 bit で、`$bits(pma_pkg::Pa) - 15` から導く (C。PA の幅を構成値にする D-2 で自動的に縮む)。語は N = 1 で 43 bit、N = 4 で 46 bit。読みは同じサイクルの書きを返す (配列の外のレジスタと選択器による前方転送で、配列そのものは read-old)。
+  - line の valid (`lv`、512 × 4 bit) と PLRU (512 × 3 bit) はリセット付きの F に残した (S3 の「リセットの要るビットは S の外の F に置く」)。valid は実行のサイクルに登録済みの index で読むので、tag の語と同じ時間関係になる。valid を語に入れてリセット後に 512 サイクルで掃き出す版を最初に作ったが、リセットから最初の命令の fetch までが 512 サイクル延び、DMI の script を固定のサイクルで流す debug の directed (`test_w2_dbg_dm_abs` など 5 本) が落ちた。script を直すより、リセットの時間関係を変えない F の方を採った。tag の語は valid が立つ間だけ意味を持ち、install が語の全体を書く。
+  - 消えたもの: tag の複製 4 組 (`u_l2tag_e/c/w/nxt`)、install 用の tag 配列、`lv`/`own`/`shr` の FF 配列、死んだ scaffold (`L2_SYNC_READ`、`L2_PORTS_1R1W`、`L2_READ_1R1W`、`w_old_line`、`w_merged_line`、spec-read の FSM、SoC の `l2_w_spec_hold`)、merge と install の同じ way での衝突の保留 (`o_inst_port_busy`)、misaligned の hi 側の経路 (`i_wstrb_hi`、`o_w_*_hi`、mem_ctrl の `i_w_hi`/`i_w_shr_hi`、2 本目の invalidate の口)。hi 側の経路は新 SoC で常に 0 に結ばれていた。core の `i_inv2_*` は 0 に結んだ。
+- tag port の op (mem_ctrl のヘッダに要約): directory を読むすべての判断は、L2 の 1 本の tag port の op になった。op は発行のサイクルに line を出し (tag の語とデータの行を 4 way 読む)、次のサイクル (実行) に L2 の判定 (hit、sharer、owner、データ、install の victim) を受けて、その line に高々 1 つの動作をする (tag の語 1 つとデータの行 1 つを書く)。
+
+  | op | 出す者 | 実行のサイクルにすること |
+  |---|---|---|
+  | LK | LOOKUP の slot (最小の番号) | hit の判定、sharer の追加 (grant)、RFO と CMO_HOME の invalidate、owned なら recall の要求、miss なら AR へ |
+  | IN | INSTALL の slot (最後の R beat のサイクルに先に出す) | victim の選択、back-invalidate、owned な victim の recall の要求、install |
+  | WR | SoC が選んだ DRAM の書き込み (grant の前) | veto の判定、grant (`o_wt_ok` の時だけ)、directory の更新と merge、書き込みの invalidate、c2c |
+  | EC | recall engine (clean ack のサイクル) | 持ち主を directory から外す。recall を頼んだ lookup がまだ待っていれば、その lookup を同じ op で行う |
+
+  調停: EC が最優先 (recall 1 回につき 1 回)。LK、IN、WR は round robin (最後に出したクラスを最後に回す)。slot、書き込みの channel、engine はそれぞれ op を 1 つしか走らせない (同じ要求者が続けて出さない)。uncached の ROM 読みは lookup をしない (ROM は書かれないので、どの cache にも新しい copy は無い)。
+- 時間関係の変化:
+  - L2 hit: 変わらない。HIT_WAIT がすでに隠していたデータの 1 サイクルを、tag の読みが使う。
+  - L2 miss: AR が 1 サイクル遅い (hit の判定が 1 サイクル後)。
+  - install: IN op を最後の R beat のサイクルに出すので、port が空いていれば変わらない。
+  - DRAM の書き込み: WR op の実行のサイクルにしか grant しないので 1 サイクル遅い。
+  - recall: lookup の判定が 1 サイクル後なので recall の開始が 1 サイクル遅い。clean ack の後は EC がその lookup を兼ねるので、ack から grant までは旧と同じ 1 サイクル (EC を別の op にした最初の版は 2 サイクル余計にかかり、N = 1 で self-recall が多い fpmm が +3.6 % になった)。
+  - 旧は lookup、install、書き込みの grant が別々の口を持ち、同じサイクルに進めた。今は 1 サイクルに 1 つ。
+- 一貫性と前進の論拠:
+  1. directory の更新の順序: op は 1 サイクルに 1 つだけ実行され、tag の読みはそのサイクルの書きを前方転送するので、各 op は直前の op の結果を見て決め、自分の結果を書く。旧の「同じサイクルの同じ line の書きと lookup の衝突」による directory の競合と、invalidate の口の取り合い (2 本の口の優先順位、口を待つ RFO の lookup と install) は無くなった。実行中の op がそのサイクルの invalidate の口を持つ。
+  2. データ: lookup のデータはその op の発行のサイクルに読む。そのサイクルに同じ line への書きが grant されたときだけ古いので、その lookup はやり直す (`lk_cf`、旧の `conflict` によるやり直しと同じ役)。install は動いている transaction の line を追い出さない (per-line の直列化) ので、install の書きが lookup の line の way を変えることは無い。
+  3. 書き込み: 選ばれた DRAM の書きは、その line の WR op の実行のサイクルにしか grant されず、veto もそのサイクルの判定である。SoC の書き込みの rotation (`memory_bus.i_wadv`) は、選ばれた DRAM の書きに WR op が実行されるまで動かず、実行のたびに次の hart へ進む。WR op は line について判断するので、実行のサイクルに同じ line の別の書きが選ばれていても、その判定で grant してよい。
+  4. 前進: 進めない op (owned な line、veto された書き、塞がれた install) は何も変えずにまた出る。待つ相手は recall の終わり (EC、または owner の WB = WR op) か B (op は要らない) である。EC は最優先、他のクラスは 3 サイクル以内に順番が来る。veto された書きが待つ WB も WR だが、rotation が WR op の実行ごとに次の hart へ進むので、WB を持つ hart にも順番が回る。同じ line の順序は per-line の直列化が持つ (変えていない)。CMO_HOME の論拠 (recall と B 待ちは有限) も変わらない。
+- 検査: mem_ctrl の `o_chk` に「DRAM の書きが、自分の line の WR op の実行の外で grant された」を足した。
+- V6: `mem_ctrl.wb_data`/`wb_strb` の書きをリセットの無い `always_ff` に移した。読むのは AXI の W channel だけで、`o_wvalid` (書き込み buffer のエントリがある) の間だけ意味を持つ。
+- 結果は `doc/phase15_ms_logic.md` §8.10 (合成) と `doc/phase15_verification_plan.md` §9.18 (ゲート)。
+
 ### MDOC: ユーザ向けドキュメント
 
 目標: heliodor を使う人 (SoC に組み込む人、シミュレーションや Linux boot を試す人、コアに手を入れる人) 向けの文書を mdBook の book として整える (D10)。内容は M6 の後の最終形 (新コアが既定) を書く。内部の日本語設計書 (`doc/` の phase15 系) は設計の根拠の記録であり、book の原本ではない。README.md は短い入口として残し、book へのリンクを置く。

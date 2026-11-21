@@ -5,10 +5,8 @@
 #
 # Targets:
 #   soc_w2       N=1 W2 SoC, functional ports only (syn_soc_w2.sv), with the
-#                L2 (heliodor_l2cache) as a black box: its data arrays do not
-#                infer RAM (see soc_w2_l2)
-#   soc_w2_l2    the same with the L2; fails in elaboration until the L2
-#                data arrays are 1R1W
+#                L2 (heliodor_l2cache) as a black box
+#   soc_w2_l2    the same with the L2 (its arrays map to block RAM)
 #   core_w2      W2 core alone, functional ports only (syn_core.sv)
 #   core_w4      W4 core alone, functional ports only
 #   core_w2_obs  W2 core alone, retire/perf/checker outputs kept alive
