@@ -1352,6 +1352,30 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - spike の cosim で見えないもの: 設計書 §MS の CBO の節のとおり、CBO はメモリの no-op として照合されるので、DRAM が更新されたか、cache から line が消えたかは cosim では見えない。それは cbo_vis の backdoor の検査が持つ。
 - wall 時間: 機械が過負荷 (load average 最大約 140、他の利用者と共有) だったので、途中からユーザの指示で同時の `veryl test` を 3 本までにし、長い boot を 1 回の invocation に複数入れないように分けた (最初に並べた 8 本のうち 5 本は途中で止めて回し直した)。G0 6,001 s、W2 N=1 の 5 本 (1 invocation) 3,872 s、W2 N=4 10,550 s、W4 N=4 22,802 s、W4 6.6 N=2 17,103 s、W4 7.1 N=2 11,864 s、W2 の N=4 の cosim 9,000 s 前後、W4 の N=4 の cosim 23,422 s (1 本だけで走った)。
 
+### 9.16 MS: CBO と MS の論理の整理の統合のゲート (2026-11-21)
+
+`phase15/ms` (CBO、`cfa614f3`) に `phase15/ms-size` の 9 commit (BTB の圧縮と per-write-group の配列、Vivado のフロー、O1 の `HELIODOR_OBS`、P の `pmp_match`、C1 の一部) を積み、`syn_core` に CBO の port `o_dmem_cmo` を足した tip (`c6cdeccc`) のゲート。比べる相手は §9.15 (CBO の branch) と `doc/phase15_ms_sizing.md` §3.3 と `doc/phase15_ms_logic.md` §8 (ms-size の branch)。ms-size の BTB の変更は cycle を変えたので、CBO を実行しない boot は ms-size の値に、CBO を実行する boot はどちらの値とも違う値になる見込みだった。veryl `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0。
+
+| ゲート | CBO の branch (§9.15) | ms-size の branch | 統合の後 | 判定 |
+|---|---|---|---|---|
+| G0 | 874 passed | 864 passed (cbo_vis の 10 本の前) | 874 passed、0 failed、371 ignored | pass |
+| GL-B W2 | 14,571,787、hash `60e504ab77211f61` | 14,579,991、同じ hash | 14,579,991、record 10,417,784、hash `60e504ab77211f61` | ms-size と一致 |
+| GL-B W4 | 12,261,972、同じ hash | — | 12,266,737、record 10,417,784、hash `60e504ab77211f61` | hash 一致 (cycle は BTB の分) |
+| 5.15 N=1 W2 / W4 | 14,633,581 / 12,286,122 | 14,655,526 / 12,291,246 | 14,655,526 / 12,291,246 | ms-size と一致 (CBO 0 回) |
+| 6.6 / 7.1 / 7.1v N=1 W2 | 21,420,532 / 19,307,507 / 20,767,343 | — / 19,266,594 / — | 21,471,106 / 19,302,668 / 20,760,200 | pass (CBO と BTB の両方の差) |
+| 6.6 / 7.1 / 7.1v N=1 W4 | 18,310,751 / 16,735,285 / 17,870,364 | — | 18,359,025 / 16,738,226 / 17,882,492 | pass |
+| spike cosim N=1 W2 (5.15、6.6、7.1、7.1v) | 不一致 0 | — | 4 本 pass、不一致 0、cycle は native と一致 | pass |
+| hvlinux W2 | 18,679,320 | 18,619,930 | 18,684,930 | pass (guest の CBO 2,048 回と BTB) |
+| litmus N=4 W2 | 5,022,440 | 5,023,959 | 5,023,959 | ms-size と一致 |
+| 5.15 SMP N=2 W2 | 19,382,030 | 19,778,334 | 19,778,334 | ms-size と一致 |
+| 5.15 SMP N=4 W2 | 24,988,093 | 未測定 | 24,199,767 (record 14,478,663) | pass。−788,326 (−3.2 %)。5.15 で CBO は 0 回なので BTB の変更の分で、ms-size の branch では測っていなかった。終わりが timer の境界をまたぐかどうかで決まる量で、§9.14 の PMP の修正の +797k と同じ形 |
+| ACT4 W2 の 10 suite (§9.15 と同じ) | 385/385、hash 108/108 | — | 385/385、hash 108/108 | pass |
+| 同じ 10 suite の cosim W2 | 379/379、不一致 0 | — | 379/379、不一致 0 | pass |
+
+- W4 の N=4 boot (5 時間) は回していない。統合で W4 だけの経路に触れた変更は無い (統合の衝突は CLAUDE.md の数値だけで、RTL は自動で併合された)。
+- `act_sm/mcsr_cntr_00` は MI 以来の既知の fail (CLINT の mtime が読み出し専用) で、image の食い違いではない (`doc/phase15_ms_logic.md` §8.4)。
+- 合成の代金は `doc/phase15_ms_logic.md` §8.6。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
