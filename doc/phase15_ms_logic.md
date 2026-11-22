@@ -636,3 +636,29 @@ URAM (1) と DSP (W2 348、W4 373) はどの列も同じ。
 - V9: `vrf` (32 × 128) は FF 4,096 から LUTRAM 304 になった (読み口 4 本、書き口 1 本)。int の PRF は entry 0 の 64 FF が消えた。PRF は書き口が WB の数だけあるので FF のまま (R 区分)。W2 の LUT +2,901 は階層の帰属が大きく動いた揺れ (`u_prf_i` +4,633、`u_prf_f` −4,188) で、W4 は −3,252。
 - K: `u_sq` の FF が W2 −137 / W4 −257。見込みは byte 15 (W2 16 entry で 128、W4 32 entry で 256) と `e_amowr` (16 / 32) の 144 / 288 で、ほぼ合う (record 用の 1 本のレジスタは define なしの合成には入らない)。`u_sq` の LUT は V9 の列で W4 が 28,325 → 35,106 と sq を触っていないのに動いており、K の列の 25,274 との差も揺れを含む。
 - 実行時間 (synth_design、sim 4 本と並べた): V4 `soc_w2` 17 分、`core_w4` 45 分。tip `soc_w2` 19 分、`core_w4` 33 分。
+
+### 8.12 物理アドレスの幅 (D-2: PALEN 56 → 40)
+
+sizing の D-2 (B、N。I は繰り延べ)。内容と仕様の根拠は `doc/phase15_core_design.md` §MS の「物理アドレスの幅」、ゲートは `doc/phase15_verification_plan.md` §9.20。合成は §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし)。前は `5781a9a0` (core の RTL は §8.11 の K と同じ)、後は `59f5c0f5`。前の `soc_w2` と `core_w4` は §8.11 の K の列と同じ値になった (同じ RTL を回し直した)。
+
+| | 前 | 後 | 差 |
+|---|---|---|---|
+| W2 SoC LUT | 321,638 | 313,148 | −8,490 |
+| W2 SoC LUTRAM | 5,840 | 5,296 | −544 |
+| W2 SoC FF | 114,378 | 111,004 | −3,374 |
+| W2 SoC (L2 込み) LUT | 327,907 | 319,248 | −8,659 |
+| W2 SoC (L2 込み) LUTRAM | 5,840 | 5,296 | −544 |
+| W2 SoC (L2 込み) FF | 118,048 | 114,667 | −3,381 |
+| W2 SoC (L2 込み) block RAM | RAMB36 58 + RAMB18 7 (61.5 tile) | RAMB36 54 + RAMB18 11 (59.5 tile) | −2 tile |
+| W4 core LUT | 639,119 | 631,382 | −7,737 |
+| W4 core LUTRAM | 6,256 | 5,552 | −704 |
+| W4 core FF | 176,180 | 171,266 | −4,914 |
+
+URAM (1) は同じ。DSP は W2 348 で同じ、W4 は 373 → 372。
+
+- 見込みとの照合 (FF): `u_csr` は W2 で 6,953 → 6,664 (−289)。pmpaddr 16 本 × 16 bit と satp/hgatp の PPN 2 × 16 bit の 288 に合う。`u_dtlb` は 3,941 → 3,429 (−512 = 32 entry × 16 bit)、`u_itlb` は 1,876 → 1,620 (−256 = 16 entry × 16 bit)。LQ の line と CoRR の比較は W4 の `u_lq` が LUT 34,772 → 29,906 (−4,866)、FF 31,850 → 29,746 (−2,104) で、§5 の対象外の注記 (`e_poison` の 50 bit 比較が 34 bit になる) の分がここに出た。W2 の `u_lq` は LUT 11,482 → 9,624。
+- tag: dcache の tag (LUTRAM) は `u_tags` で W2 1,040 → 640、W4 1,456 → 896 LUTRAM。L2 の tag と directory の語は N = 1 で 43 → 27 bit になり、way ごとの 512 語が RAMB36 1 個から RAMB18 1 個に移った (`u_l2` は RAMB36 36 → 32、RAMB18 0 → 4。LUT 7,351 → 6,990、FF 3,742 → 3,689)。
+- CSR の LUT: `u_csr` は W2 14,626 → 11,950、W4 18,326 → 15,124。pmpaddr の読み出しの mux と PMP の decode (`pmp_decode` の NAPOT の mask と TOR の比較) が 54 → 38 bit になった分。
+- 揺れ: W4 の `u_mshr` は LUT 9,841 → 12,212 (+2,371) で、FF は 268 → 236 と減っている。line の比較が狭くなっただけなので、階層の帰属の揺れと見ている (W2 は 5,546 → 5,066)。
+- 実行時間 (synth_design、sim 4 本と並べた): 前 `soc_w2` 16 分、`soc_w2_l2` 39 分、`core_w4` 30 分。後 `soc_w2` 15 分、`soc_w2_l2` 17 分、`core_w4` 33 分。
+- 合成で見つけた誤り: 最初の版 (`7cc1fc27`) は `sq` の push の line の `tree_onehot_mux::<CFG::MEM_W, 50>` と dcache の非 pipe の PA の `tree_onehot_mux::<NP_N, 56>` に幅の定数が残り、Vivado が elaboration で止まった (Synth 8-659、関数の配列の引数の型の不一致)。`veryl check` は警告を出さず、Veryl の sim は値を正しく扱っていた (この版の W2/W4 の N=1 の boot は前と cycle まで一致)。`59f5c0f5` で直した。

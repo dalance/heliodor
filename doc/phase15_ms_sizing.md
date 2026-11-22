@@ -17,7 +17,7 @@
 | D-7 | J (RAS top の ckpt) | 精度に効くので純粋な無駄ではない。boot の return の mispredict を測ってから決める (保留)。K、L、N は承認のまま |
 | D-8 | BTB の read-old (§3) | 書きの前方転送は入れず、純粋な 1R1W のままにする (W2 boot +0.23 % を受け入れる) |
 
-D-1 の実装は §3。
+D-1 の実装は §3。D-2 (B と N) の実装は `doc/phase15_core_design.md` §MS の「物理アドレスの幅」(2026-11-22、PALEN 既定 40)。I は繰り延べた (理由は同じ節)。
 
 コミットしたのは測定用の足場だけである (`bpu: parametrize BTB target width and add BTB training events`)。
 

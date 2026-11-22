@@ -1459,6 +1459,37 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - L は入れないので、zihpm と sscofpmf は回帰の確認として回した。
 - wall 時間 (最大 4 本の `veryl test` と Vivado 2 本を並べた): cbench 1 commit 7-13 分、G0 3,216 s、W2 N=1 の 5 本 1,741 s、W4 N=1 の 5 本 4,291 s、N=2 W2 2,746 s、litmus N=4 2,752 s、cosim N=1 W2 の 4 本 916 s、W2 N=4 9,893 s、ACT の cosim 1,361 s、hvlinux 616 s。
 
+### 9.20 MS: 物理アドレスの幅 (D-2、PALEN 56 → 40) のゲート (2026-11-22)
+
+`phase15/ms` の `5781a9a0` に D-2 (`7e665c9e` RTL、`7cc1fc27` cosim/ACT4/合成の top、`f0656a79` tb の期待値、`59f5c0f5` 合成で見つけた幅の定数、`06ec5f13`/`35cda57b` ACT4 の lockstep の判定) を積んだ tip のゲート。内容は設計書 §MS の「物理アドレスの幅」、合成は `doc/phase15_ms_logic.md` §8.12。PA の幅は boot と bench の PA (すべて 2^32 未満) に触れないので、判定は §9.19 の値との完全な一致である。veryl `9d6081f0`、spike は `.wt/md` の build (`b86c9bba`)、Sail 0.16。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0、clock の event は全 run で `whole=true`。
+
+| ゲート | 前 (§9.19) | 後 | 判定 |
+|---|---|---|---|
+| G0 | 874 passed | 874 passed、0 failed (tip `35cda57b`) | pass |
+| GL-B W2 / W4 | 14,619,969 / 12,316,997、record 10,417,784、hash `60e504ab77211f61` | 同じ | 一致 |
+| 5.15 N=1 W2 / W4 | 14,695,563 / 12,339,450 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W2 | 21,497,361 / 19,436,507 / 20,946,860 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W4 | 18,493,860 / 16,881,517 / 17,991,524 | 同じ | 一致 |
+| spike cosim N=1 W2 (5.15、6.6、7.1、7.1v) | 不一致 0 | 4 本 pass、不一致 0、cycle は native と一致 | pass |
+| spike cosim SMP N=2 W2 | 19,446,659 (native) | pass、不一致 0、cycle は native と一致 (records 18,641,168、24 reads を DUT から) | pass |
+| 5.15 SMP N=2 W2 | 19,446,659 | 同じ | 一致 |
+| hvlinux W2 | 18,792,075 | 同じ | 一致 |
+| litmus N=4 W2 | 5,122,506 | 同じ、禁止された結果 0 | 一致 |
+| 5.15 SMP N=4 W2 | 25,485,977 (record 14,963,061) | 同じ (record も同じ) | 一致 |
+| 5.15 SMP N=4 W4 | 22,692,494 | 同じ (record 14,714,279) | 一致 |
+| ACT4 W2 cosim (i、m、f、d、zaamo、zalrsc、zacas、zicbom、zicbop、zicboz、pmp、sv、svade、svadu、svnapot、svpbmt、svbare、svinval、h、exceptions、sm、s、u、zicsr、zicsrf、smstateen、ssstateen、sdtrigs、sdtrigsm、sdtrigu、shgatpa、shvsatpa、ssu64xl) | | 842/843、不一致 0。SPIKE_GAPS の 11 本を除く | pass (下の 1 本は前から) |
+| ACT4 W2 GA + GL-C (pmp、sv、svade、svadu、svnapot、svpbmt、svbare、h、exceptions、sm、s、u、zicsr、i、m、zicbom、zicboz) | | GA 445/447、GL-C 191/194 | 下記 |
+| PALEN = 56 (`pma_pkg::PALEN` だけを 56 にした tree) | | `veryl check` の警告は前と同じ種類と件数。`test_ptw*` 3 本、`test_w2_rv64*` 229 本が pass。GL-B W2 は 14,619,969 cycle、hash `60e504ab77211f61` で前と一致 | pass |
+
+- ACT4 の ELF: `sail.json` の `physaddr_bits` と `heliodor.yaml` の `PHYS_ADDR_WIDTH` を 40 にして `make -C test/act` で全 suite を作り直した (Sail 0.16、20 分)。test の名前と数 (3,749) は変わらず、image が変わったのは 7 本 (`act_pmp/Sm_cfg_L_modify_{napot,off,tor}_00`、`act_h/hcsr_addr_00`、`act_sm/H_hcsr_addr_00`、`act_sdtrigs{,m}/tdata2_translate_00`)。Sail の署名は pmpaddr と hgatp の読み返しが PALEN の幅であることを期待し、heliodor はその自己検査を通る。
+- GL-C の 3 本 (`act_pmp/Sm_grain_00`、`Sm_grain_check_00`、`Sm_pmpaddr_upper_00`) は hash が golden と食い違う。golden model (旧コア) は 56 bit の PA で pmpaddr の上位を読み返すため (GA は pass)。この 3 本と image が変わった PMP の 3 本を `gen_suite.py` の `TEST_OPTS` で lockstep=0 にした。riscv-tests の `rv64mi/pmpaddr` (W2/W4) も同じ理由で lockstep の hash が golden と食い違ったので、`m2_csr.list` で pass/fail にした (G0 の最初の run で 2 本が落ち、直した後に pass)。
+- 前からの失敗 (`5781a9a0` でも同じに落ちることを確かめた): `act_sm/mcsr_cntr_00` (mtime を書いた後の `time` の読みの期待 1 に 0。cosim と GA の両方) と `act_h/vucsr_00` (GA のみ。cosim では SPIKE_GAPS)。
+- 大きい PPN の挙動 (PTE の PPN が PALEN を超える) は `tb/test_ptw` の reference model で確かめた (切り捨てると DRAM の page と L0 の表に alias する leaf と非 leaf の PTE を足した)。`ppn_big` を常に 0 にした変異では 7 個の instance がすべて落ちる (commit していない)。ACT4 の sv の suite の image は変わらなかった。PALEN を超え 56 bit に収まる PPN は、56 bit の構成でもメモリの無い PA (access fault) なので、そうした PTE があっても期待値は変わらない。
+- G0 の最初の run (`7cc1fc27`): 870 passed、4 failed。`dbg_dm_sba` (W2/W4) は sbcs の期待値の sbasize を一部 (sberror が立った値) 直し損ねたもの、`rv64mi_pmpaddr` (W2/W4) は上の lockstep。`f0656a79` で直し、4 本を再実行して pass。
+- `59f5c0f5` (sq と dcache の mux の幅の定数) の前後で、Veryl の sim の結果は変わらない: N=1 W2 の 4 本 (cosim、`59f5c0f5`) と `7cc1fc27` の native の cycle が一致した。N=4 W2/W4 と N=1 の native は `7cc1fc27` で回した。
+- spike の PA は 56 bit 固定 (`processor_t::paddr_bits()`) で構成できないので、cosim は pmpaddr0-15、satp、hgatp の PALEN を超える bit を DUT の値で spike に写す (設計書の記述)。5.15/6.6/7.1/7.1v の boot と hvlinux の firmware は pmpaddr0 に全 1 を書くので、この経路を通る。
+- wall 時間 (最大 4 本の `veryl test` と Vivado 2-3 本を並べた): G0 2,339 s (`7cc1fc27`) と 2,067 s (tip)、W2 N=1 の 5 本 2,158 s、W4 N=1 の 5 本 2,971 s、N=2 W2 2,437 s、hvlinux 579 s、litmus N=4 2,276 s、cosim N=1 W2 の 4 本 873 s、cosim N=2 W2 3,041 s、W2 N=4 10,123 s、W4 N=4 19,721 s、ACT の cosim 843 本 約 25 分。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。

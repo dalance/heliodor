@@ -5271,6 +5271,22 @@ MI の進捗:
 - 結果は `doc/phase15_ms_logic.md` §8.10 (合成) と `doc/phase15_verification_plan.md` §9.18 (ゲート)。
 - 【決定】(2026-11-22、ユーザ) N=4 boot の +5.3 % (W2) / +3.9 % (W4) を含めて代金を受け入れた。N=4 の差は kernel の時刻待ち (1 tick = 40 万サイクル) の境界をまたいだ 2-3 tick 分で、正味は 0.2-0.4 % と見積もる。litmus N=4 W4 の +3.55 % は tag port の取り合いの代金。繰り延べたレバー (後の phase): miss と uncached の経路を tag の判定の前に投機的に出す (miss の AR の +1 を取り戻す)。
 
+#### 物理アドレスの幅 (D-2: sizing の B、N、I)【実装 (2026-11-22)】
+
+sizing (`doc/phase15_ms_sizing.md`) の D-2 (2026-11-20、ユーザ決定)。56 bit 固定だった物理アドレス (PA) の幅を構成値 `pma_pkg::PALEN` にし、既定を 40 bit にした。
+
+- 構成値: `pma_pkg` の const 1 つ。`Pa = logic<PALEN>`、`Line = logic<PALEN - 6>` (line のアドレス)、`PPN_W = PALEN - 12`。他の幅はすべてここから導く。56 に戻しても build と test が通る (`doc/phase15_verification_plan.md` §9.20)。前提は 33 <= PALEN <= 56 (SBA の `sbaddress1` が PA[PALEN-1:32] を持ち、Sv39 の PPN は 44 bit)。
+- 縮めたもの: `pma_pkg::Pa` と PMA の表、dcache/icache/L2 の tag (L2 は C で `$bits(Pa) - 15` から導いてあった)、dcache の MSHR、LQ/SQ/SB の line と比較 (LQ の `e_poison` の CoRR の比較を含む)、atomic の予約、PTW の PTE アドレス、TLB の ppn (`TlbEntry`/`TlbFill`)、`satp`/`hgatp` の root、PMP の matcher (`pmp_pkg::AW = PALEN - 2`)、mem_ctrl の slot/write buffer/engine の line と L2 の busy line、AXI の `ARADDR`/`AWADDR`、DM の SBA (`sbasize` = PALEN)、tb の memory map (`tb_platform_pkg`) と harness。
+- 仕様で決まる挙動 (privileged spec、Sail 0.16 と spike `b86c9bba` の実装で確かめた):
+  - `pmpaddr`: PA[PALEN-1:2] を持つ WARL。上の bit は 0 に読む (spec は「pmpaddr は実装した物理アドレスの bit だけを持つ WARL」。Sail は `pmpWriteAddr` で `physaddr_bits - 3` から上を捨て、spike は `paddr_bits() - 2` bit で切る)。
+  - `satp.PPN` と `hgatp.PPN`: 根の表は物理メモリにあるので PPN の PALEN - 12 bit から上は 0 に読む WARL (Sail の `legalize_satp` と `legalize_hgatp` と同じ。spike も `paddr_bits()` で切る)。`vsatp.PPN` は GPA を指すので 44 bit のまま (Sail は vsatp を切らないと明記している)。
+  - PTE の PPN が PALEN を超える: PPN の bit は予約 bit ではないので page fault にはしない。PA はそのまま (切り捨てて別の PA に alias させない) で、そこには何も無い (PMA の hole) ので access fault になる。Sail は `pt_walk` で 44 bit の PPN をそのまま使い、PTE の読みも最終のアクセスも PMA の領域に入らないので access fault (原因は元のアクセスの種類) になる。spike も PPN を切らず、その PA にメモリが無いので access fault になる。順序も Sail と spike に合わせた: leaf の権限の page fault が先で、A/D の更新は walk の中で行い、最終の PA の access fault はその後。tval は VA のまま。
+  - Bare (M モードと satp = Bare): VA[63:PALEN] が 0 でなければ hole で access fault。tval は VA そのまま (Sail の `invalid_physical_address` = None と同じ)。
+- 実装 (PTW): PTE のアドレスが PALEN を超える (`w_big_q`: 非 leaf の PPN、G-stage の Bare の GPA、G-stage の leaf の HPA) なら PTE を読まずに access fault。最終の PA が超える (`f_big`) なら access fault にして TLB には入れない (TLB の ppn は PPN_W bit で、超えた PA は表せない)。coalesce した待ち手は event の後にまた walk し、自分の walk の応答で fault する。VS-stage の leaf からの最終 GPA は PTE の 44 bit の PPN から作る (`pte_pa`。TLB の entry を経由すると GPA が PPN_W bit に切れる)。
+- 検証側: Sail の `physaddr_bits` と UDB の `PHYS_ADDR_WIDTH` を 40 にし、ACT4 の ELF を作り直した。spike の `paddr_bits()` は 56 固定で構成できない (`processor.h`) ので、cosim は `pmpaddr0-15`、`satp`、`hgatp` の PALEN を超える bit を DUT の値で spike に写す (`CsrKind::Unspecified`。幅は `heliodor.yaml` の `PHYS_ADDR_WIDTH` から読む)。PTE の PPN が超える場合は spike も access fault なので何もしていない。`tb/test_ptw` の reference に PALEN を超える leaf と非 leaf の PTE (切り捨てると DRAM の表と page に alias する値) を足した。
+- 繰り延べ (I、pc と VA の幅を PCW = max(PALEN, 41) + 1 bit にする): 入れない。理由: (1) Sv39 で不正な VA (正規形でない VA への jump、load と store) の xepc と xtval を、spike も Sail も 64 bit の VA のまま報告する。PCW bit の pc は「別の不正なアドレス」(spec が許す) しか持てず、ACT4 (Sail の期待値) と spike の cosim の両方で値が食い違う。Sail には VA の不正アドレスを置き換える設定が無い (`invalid_physical_address` は Bare の PA だけ)。(2) pc の型は FTQ、RAS、FBQ、DQ、LQ/SQ の VA、BTB の target、commit の pc の連鎖、trap の組み立てまで広がり、PA の幅とは独立の大きな変更になる。節約は sizing の見積もりで W2 4,576 / W4 6,160 bit (PALEN の分の約 2-3 %) で、合わせて行う理由が無い。
+- 結果は `doc/phase15_ms_logic.md` §8.12 (合成) と `doc/phase15_verification_plan.md` §9.20 (ゲート)。
+
 ### MDOC: ユーザ向けドキュメント
 
 目標: heliodor を使う人 (SoC に組み込む人、シミュレーションや Linux boot を試す人、コアに手を入れる人) 向けの文書を mdBook の book として整える (D10)。内容は M6 の後の最終形 (新コアが既定) を書く。内部の日本語設計書 (`doc/` の phase15 系) は設計の根拠の記録であり、book の原本ではない。README.md は短い入口として残し、book へのリンクを置く。
