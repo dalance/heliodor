@@ -601,3 +601,38 @@ W4 core は KU15P の LUT の 126.5 % (§0 の 154 % から) になった。
   `soc_w2` の LUT の −2,058 は mem_ctrl の減り (2 本の invalidate の口の調停、misaligned の hi 側、install と書きの口の保留が無くなった) で、FF の +74 は tag port の op の状態 (`x_*`、`wg_*`)。L2 そのものの代金は LUT 約 6,300、FF 約 3,700、RAMB36 36 個。tag の総量は 4 × 512 × 43 = 88,064 bit (N = 1) になり、前の 5 組 × 49 bit (501,760 bit) と FF の directory の約 1/6。
 - W4 core (`core_w4`、L2 も mem_ctrl も含まない) は §8.8 と同じ: LUT 661,407 (LUTRAM 14,144)、FF 181,428、RAMB36 8 + RAMB18 10、URAM 1、DSP 373 (synth_design 42 分 19 秒、`b764f3b6` で回した。core の RTL は `3a88b97a` と同じ)。
 - 実行時間: `soc_w2_l2` 34 分 26 秒 (前は elaboration で 25 分 46 秒の後に失敗)、`soc_w2` 15 分 43 秒。
+
+### 8.11 小さい純粋な無駄 (V4、V5、V7、V9、K、L)
+
+inventory の §2.3 の V4、V5、V7、V9 と sizing の §2.1 の K、L。どれも cycle を変えない変更で、1 項目 1 commit。合成は §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし) で、前は §8.10 の `e91a24e6` の値 (core の RTL は `3a88b97a` と同じ)。ゲートは `doc/phase15_verification_plan.md` §9.19。
+
+- V4 (`dfd6ad1a`、`src/cache/icache.veryl`、`src/core/front/icache.veryl`): L1I のデータ配列を way ごとの 1R1W のモジュール `icache_data_bank` (256 bit の行、登録済みの読み、64 bit の語ごとの write enable、リセットなし、read-old) に出した。4 way を毎サイクル `blk_i` で並列に読み、tag の比較で決まる way (`rd_way`、ヒットの way か fill の way) を登録して次のサイクルに選ぶ。応答 (`o_resp`) のデータは、前は `resp_q.data` に登録していたものを、配列の登録済みの読みと登録した chunk の選択から作る。`IC_RESP_LAT = 1` は変わらない。前の組合せの読みも書きと同じ端で `resp_q` に取り込んでいたので read-old で、値は bit 単位で同じ (streaming のヒットで要る dword は前のサイクルまでに書かれている)。uncached の buffer は応答のサイクルに変わらない (`ubuf_v_q` が立つ間は uncached の読みが走らない) ので、そのまま読む。fill の書きは `(data & ~msk) | (new & msk)` の RMW から dword の write enable になった。
+- V5 (`499e771d`): `rename.img_q` の書きをリセットの無い `always_ff` に移した。`ckv_q`、`own_q` はリセット付きのまま。
+- V7 (`1c219a0c`): `rob` の `ent_q`、`snap_q`、`ffl_q`、`res_q`、`obs_q` (`HELIODOR_OBS` の中のまま) の書きをリセットの無い `always_ff` に移した。`done_q`、`rec_q` はリセット付きの F のまま。
+- V9 (`fe485d78`): `prf.rf_q` のリセットを外し、int の file だけ pdst 0 (x0 の固定の写像。x0 は rename されず p0 は free list に入らない) をすべての読み口 (issue、VU の scalar、record) で 0 に固定した。`vrf.vrf` のリセットも外した (旧コアも同じ `vrf` を使うが、SoC には居ない)。x1-x31、f0-f31、v0-v31 のリセット値は ISA が定めない。初期状態の差はゲートに出なかった (Veryl の sim も Verilator もリセットの無い FF は 0 で始まり、spike も 0 で始める)。tb からの初期化は要らなかった。
+- K (`b53de1e3`、`src/core/lsu/sq.veryl`): sizing の前提「上位 64 bit を使うのは amocas.q だけ」は成り立たない。`e_data` は store のデータを 16 byte の窓の中の byte offset (`va[2:0]`) へずらした値なので、8 byte 境界をまたぐ misaligned の store (例: `va[2:0]` = 3 の sd は byte 3-10) は上位の 64 bit を forwarding と push で使う。成り立つのは次の 2 つで、これを最小の正しい形にした:
+  - STD のデータは `{64'd0, rs2} << {va[2:0], 3'd0}` (`mem_pipe`) なので byte 15 は常に 0。`e_data` を 120 bit (15 byte) にした。
+  - amocas.q の 16 byte (と「atomic が書いたか」の `e_amowr`) は retire record (`HELIODOR_OBS`) でしか読まれない。atomic は SQ の head で書き戻され (`i_amo_done` は head の entry にだけ来る)、head から retire するので、record は `HELIODOR_OBS` の中の 1 本のレジスタ (`amo_wd_q`、`amo_wr_q`) で足りる。forwarding は atomic の entry を常に WAIT で答え (`dv` が atomic を除く)、push も io も atomic の `e_data` を読まない。
+  - 却下した形: store のデータをずらさない 64 bit で持ち、使う所でずらす。`e_data` は半分になるが、forwarding の query × entry ごと (W4 で 4 × 32) と push に 128 bit の shifter が要り、§8.8 の S1 で消した entry ごとのずらしを戻すことになる。純粋な無駄の除去ではない。
+- L (しない): `mhpmevent` を WARL で実装する 10 bit に縮めると、ソフトが書いた後の読みの値が Sail と変わる。ACT4 の Sail の設定 (`test/act/config/heliodor/sail.json`) は `hpmevent_width_bits` = 56 で、event の field の 56 bit をそのまま読み返す。heliodor も今は書いた値を読み返し、Sail と一致している (spike は OF と inhibit の bit だけを持ち、event の field は 0 に読む)。§7 の 2026-11-21 の決定 (C1 の残り、`mhpmevent` の実装していない bit を含む) と同じ扱いで、入れない。
+
+合成 (前は §8.10。各列はその commit までを積んだもの):
+
+| | §8.10 (前) | V4 | V5 + V7 | V9 | K (tip) |
+|---|---|---|---|---|---|
+| W2 SoC LUT | 330,188 | 321,164 | 321,213 | 324,114 | 321,638 |
+| W2 SoC LUTRAM | 13,728 | 5,536 | 5,536 | 5,840 | 5,840 |
+| W2 SoC FF | 119,337 | 118,735 | 118,719 | 114,584 | 114,378 |
+| W2 SoC block RAM | RAMB36 6 + RAMB18 7 | RAMB36 22 + RAMB18 7 | 同じ | 同じ | 同じ |
+| W4 core LUT | 661,407 | 652,988 | 644,548 | 641,296 | 639,119 |
+| W4 core LUTRAM | 14,144 | 5,952 | 5,952 | 6,256 | 6,256 |
+| W4 core FF | 181,428 | 180,583 | 180,522 | 176,425 | 176,180 |
+| W4 core block RAM | RAMB36 8 + RAMB18 10 | RAMB36 24 + RAMB18 10 | 同じ | 同じ | 同じ |
+
+URAM (1) と DSP (W2 348、W4 373) はどの列も同じ。
+
+- V4: L1I のデータ 4 way が block RAM になった (`ram.rpt` で way ごとに `RAM_SDP` 256 × 256、RAMB36 4 個、計 16 個)。前はデータが LUTRAM で (SoC 全体の LUTRAM の減りが 8,192)、RMW の形を Vivado が 2 本目の非同期の読み口とみなした (§7 の規則の理由と同じ)。`u_ic` は W2 で LUT 11,748 → 2,743、LUTRAM 8,592 → 400、FF 1,836 → 1,450 (`resp_q.data` が無くなった)。
+- V5 + V7: FF の数は変わらない (リセットの有無だけ)。W4 の LUT −8,440 の大半は `u_rob` (54,066 → 47,982) で、リセットと書き込みの enable を混ぜる論理が消えた分と見ている。W2 は揺れの範囲 (+49)。
+- V9: `vrf` (32 × 128) は FF 4,096 から LUTRAM 304 になった (読み口 4 本、書き口 1 本)。int の PRF は entry 0 の 64 FF が消えた。PRF は書き口が WB の数だけあるので FF のまま (R 区分)。W2 の LUT +2,901 は階層の帰属が大きく動いた揺れ (`u_prf_i` +4,633、`u_prf_f` −4,188) で、W4 は −3,252。
+- K: `u_sq` の FF が W2 −137 / W4 −257。見込みは byte 15 (W2 16 entry で 128、W4 32 entry で 256) と `e_amowr` (16 / 32) の 144 / 288 で、ほぼ合う (record 用の 1 本のレジスタは define なしの合成には入らない)。`u_sq` の LUT は V9 の列で W4 が 28,325 → 35,106 と sq を触っていないのに動いており、K の列の 25,274 との差も揺れを含む。
+- 実行時間 (synth_design、sim 4 本と並べた): V4 `soc_w2` 17 分、`core_w4` 45 分。tip `soc_w2` 19 分、`core_w4` 33 分。

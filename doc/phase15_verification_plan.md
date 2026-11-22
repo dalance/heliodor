@@ -1434,6 +1434,31 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - 掃き出し: line の valid を tag の語に入れ、リセット後に 512 サイクルで語を掃き出す版は、debug の directed 5 本 (`test_w2_dbg_dm_abs` など。DMI の script を固定のサイクルで流す) を落とした (リセットから最初の命令までが 512 サイクル延びる)。valid を F に残す形にした (設計書の節)。
 - wall 時間 (最大 4 本の `veryl test` と Vivado 1 本を並べた): G0 2,700 s、W2 N=1 の 5 本 2,600 s、W4 N=1 の 5 本 1 時間強、N=2 W2 約 50 分、hvlinux 約 20 分、litmus N=4 W2 約 60 分、W2 N=4 約 3 時間、W4 N=4 約 6 時間 15 分。
 
+### 9.19 MS: 小さい純粋な無駄 (V4、V5、V7、V9、K) のゲート (2026-11-22)
+
+`phase15/ms` の `e91a24e6` に V4 (`dfd6ad1a`、L1I のデータを way ごとの 1R1W にして並列に読む)、V5 (`499e771d`)、V7 (`1c219a0c`)、V9 (`fe485d78`)、K (`b53de1e3`) を積んだ tip のゲート。内容と合成は `doc/phase15_ms_logic.md` §8.11 (L は入れない、同じ節)。どれも cycle を変えない変更なので、判定は §9.18 の「後」の値との完全な一致である。veryl `9d6081f0`、spike は `.wt/md` の build。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0、clock の event は全 run で `whole=true` (前と同じ)。
+
+| ゲート | 前 (§9.18) | 後 | 判定 |
+|---|---|---|---|
+| cbench W2/W4 (8 本、commit ごと) | `e91a24e6` の出力 | 5 commit のそれぞれで出力 (cycles、instret、record の hash、perf の dump) が全行一致 | 一致 |
+| `test_front` (V4) | `e91a24e6` の出力 | 全行一致 | 一致 |
+| G0 | 874 passed | 874 passed、0 failed | pass |
+| GL-B W2 / W4 | 14,619,969 / 12,316,997、record 10,417,784、hash `60e504ab77211f61` | 同じ | 一致 |
+| 5.15 N=1 W2 / W4 | 14,695,563 / 12,339,450 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W2 | 21,497,361 / 19,436,507 / 20,946,860 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W4 | 18,493,860 / 16,881,517 / 17,991,524 | 同じ | 一致 |
+| spike cosim N=1 W2 (5.15、6.6、7.1、7.1v) | 不一致 0 | 4 本 pass、不一致 0、cycle は native と一致 | pass |
+| 5.15 SMP N=2 W2 | 19,446,659 | 同じ | 一致 |
+| litmus N=4 W2 | 5,122,506 | 同じ、禁止された結果 0 | 一致 |
+| 5.15 SMP N=4 W2 | 25,485,977 (record 14,963,061) | 同じ (record も同じ) | 一致 |
+| hvlinux W2 | 18,792,075 | 同じ | 一致 |
+| ACT4 W2 cosim (i、m、zaamo、zalrsc、zacas、zabha、za64rs、zawrs、f、d、V の全 suite (vf16/32/64、vls8-64、vx8-64、exceptionsv*、misalignv、zvbb*、zvkb*、zvfhmin)、zihpm、sscofpmf、h) | | 2,774/2,774、不一致 0 | pass。SPIKE_GAPS の `h/vucsr_00..02` を除く |
+
+- V4 は fill の経路に触れるので N=4 boot を回した。W4 の N=4 (5-6 時間) は回していない: W4 だけの経路に触れた変更は無く、W4 の N=1 の 5 本と GL-B W4 が cycle まで一致した。
+- V9 の初期状態: リセットを外した `prf`/`vrf` の初期値の差は、どのゲートにも出なかった (sim はリセットの無い FF を 0 で始め、spike も register を 0 で始める)。tb からの初期化は足していない。
+- L は入れないので、zihpm と sscofpmf は回帰の確認として回した。
+- wall 時間 (最大 4 本の `veryl test` と Vivado 2 本を並べた): cbench 1 commit 7-13 分、G0 3,216 s、W2 N=1 の 5 本 1,741 s、W4 N=1 の 5 本 4,291 s、N=2 W2 2,746 s、litmus N=4 2,752 s、cosim N=1 W2 の 4 本 916 s、W2 N=4 9,893 s、ACT の cosim 1,361 s、hvlinux 616 s。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。
