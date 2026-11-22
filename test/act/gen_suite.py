@@ -54,11 +54,13 @@ TEST_OPTS = {
     "act_sscofpmf/S_inhibit_lo_00": "lockstep=0",
     "act_sscofpmf/U_inhibit_lo_00": "lockstep=0",
     "act_exceptionsvls/rv64": "budget=5000000",
-    # Signed by Sail with physaddr_bits = PALEN (40): the pmpaddr read-back
-    # differs from the golden model's 56-bit PA.
+    # pmpaddr reads back PA[PALEN-1:2] (PALEN 40), the golden model 56 bits.
     "act_pmp/Sm_cfg_L_modify_napot_00": "lockstep=0",
     "act_pmp/Sm_cfg_L_modify_off_00": "lockstep=0",
     "act_pmp/Sm_cfg_L_modify_tor_00": "lockstep=0",
+    "act_pmp/Sm_grain_00": "lockstep=0",
+    "act_pmp/Sm_grain_check_00": "lockstep=0",
+    "act_pmp/Sm_pmpaddr_upper_00": "lockstep=0",
 }
 
 # Tests the framework selects but the harness cannot run, with the reason;
