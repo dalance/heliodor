@@ -1490,6 +1490,49 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 - spike の PA は 56 bit 固定 (`processor_t::paddr_bits()`) で構成できないので、cosim は pmpaddr0-15、satp、hgatp の PALEN を超える bit を DUT の値で spike に写す (設計書の記述)。5.15/6.6/7.1/7.1v の boot と hvlinux の firmware は pmpaddr0 に全 1 を書くので、この経路を通る。
 - wall 時間 (最大 4 本の `veryl test` と Vivado 2-3 本を並べた): G0 2,339 s (`7cc1fc27`) と 2,067 s (tip)、W2 N=1 の 5 本 2,158 s、W4 N=1 の 5 本 2,971 s、N=2 W2 2,437 s、hvlinux 579 s、litmus N=4 2,276 s、cosim N=1 W2 の 4 本 873 s、cosim N=2 W2 3,041 s、W2 N=4 10,123 s、W4 N=4 19,721 s、ACT の cosim 843 本 約 25 分。
 
+### 9.21 MS: F、G、H (例外記録の縮小、`rob.res_q.next_pc`、LQ の byte mask) のゲート (2026-11-22)
+
+`phase15/ms` の `879e2a82` に F (`c3d0c881`)、G (`9e534856`)、H (`8a4dfb73`) を積んだ tip のゲート。内容と合成は `doc/phase15_ms_logic.md` §8.13。どれも cycle を変えない変更なので、判定は §9.20 の値との完全な一致である。veryl `9d6081f0`、spike は `.wt/md` の build、Sail 0.16。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0、clock の event は全 run で `whole=true`。
+
+項目ごとのゲート (commit ごと):
+
+| ゲート | 前 (`879e2a82`) | F | G | H |
+|---|---|---|---|---|
+| cbench W2/W4 (8 本) | 出力 | 全行一致 | 全行一致 | 全行一致 |
+| GL-B W2 | 14,619,969、record 10,417,784、hash `60e504ab77211f61` | 同じ | 同じ (下の修正の後) | 同じ |
+| unit (`test_decode`、`test_front`、`test_ptw*`、`test_commit`、`test_step`、`test_m1b_link`) | | pass | pass | |
+
+tip (`8a4dfb73`) のゲート:
+
+| ゲート | 前 (§9.20) | 後 | 判定 |
+|---|---|---|---|
+| G0 | 874 passed | 874 passed、0 failed | pass |
+| cbench W2/W4 (8 本) | `879e2a82` の出力 | 全行一致 | 一致 |
+| GL-B W2 / W4 | 14,619,969 / 12,316,997、record 10,417,784、hash `60e504ab77211f61` | 同じ | 一致 |
+| 5.15 N=1 W2 / W4 | 14,695,563 / 12,339,450 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W2 | 21,497,361 / 19,436,507 / 20,946,860 | 同じ | 一致 |
+| 6.6 / 7.1 / 7.1v N=1 W4 | 18,493,860 / 16,881,517 / 17,991,524 | 同じ | 一致 |
+| spike cosim N=1 W2 (5.15、6.6、7.1、7.1v) | 不一致 0 | 4 本 pass、不一致 0、cycle は native と一致 | pass |
+| spike cosim hvlinux W2 | 18,792,075 (native) | pass、不一致 0、cycle は native と一致 | pass |
+| 5.15 SMP N=4 W2 | 25,485,977 (record 14,963,061) | 同じ (record も同じ) | 一致 |
+| ACT4 W2 cosim (全 suite、SPIKE_GAPS の 11 本を除く) | | 3,735/3,738、不一致 0 | pass (下の 3 本は前から) |
+
+`4e7d15bc` (下の VU の修正の前の tip) で回したゲート。修正は VU の fault の tval の経路 (`vu_mem_adapter` のレジスタ 1 本と `VuMemRes.tval`) だけで、これらの workload は vector の fault を通らない:
+
+| ゲート | 前 (§9.20) | 後 | 判定 |
+|---|---|---|---|
+| 5.15 SMP N=2 W2 | 19,446,659 | 同じ | 一致 |
+| spike cosim SMP N=2 W2 | 19,446,659 (native) | pass、不一致 0、cycle は native と一致 (records 18,641,168、24 reads を DUT から) | pass |
+| hvlinux W2 | 18,792,075 | 同じ | 一致 |
+| litmus N=4 W2 | 5,122,506 | 同じ、禁止された結果 0 | 一致 |
+
+- 見つかった誤り 2 つ (どちらも項目の commit に入れた):
+  - G の最初の版: GL-B W2 が 140,609 cycle で record の hash の不一致 (checkpoint 131,072)。回復した branch が自分の partial kill のサイクルに retire し、そのサイクルの終わりに書かれる FTQ の `e_res` を古いまま読んでいた。読み口に kill の書きの前送りを足した。`test_commit` の FTQ の model は op の正しい next PC を返すので、この時間関係を見ていなかった (model は「回復していない mispredict には誤った値を返す」ことで `o_late_pc` の経路だけを検査する)。
+  - F の最初の版: VU の fault の tval を pointer masking の前の element の VA にしていた。ACT4 の cosim の `act_smmpm/pmm10_sweep_hightags_00`、`act_smnpm/S_bare_pmm10_sweep_hightags_00`、`S_sv39_pmm10_sweep_lowtags_00`、`act_ssnpm/bare_pmm10_sweep_hightags_00`、`sv39_pmm10_sweep_lowtags_00` が tval の不一致を出した (前の tip では 4 suite の 150 本のうちこの 5 本は pass)。G0、boot、cbench は vector の fault を通らないので一致していた。
+- gpa (F): `act_sv/H_sv39x4_gpa_wide_00` (VS-stage の PTE で GPA の bit 41 と 55 を立てる) が sizing の 39 bit の案を退けた根拠で、54 bit + `gsel` の版で pass する。
+- ACT4 の失敗 3 本は前から: `act_sm/mcsr_cntr_00` (§9.20 と同じ) と `act_zkt/ZktZca_c_subw_00`、`ZktZcb_c_not_00` (tohost = 3、cosim の不一致は 0。`879e2a82` でも同じに落ちることを確かめた。§9.19/§9.20 の cosim は zkt を回していなかった)。`act_h/vucsr_00` は SPIKE_GAPS で cosim では回らない。
+- wall 時間 (最大 4 本の `veryl test` と Vivado 2 本を並べた): cbench 1 commit 7-8 分、GL-B 8-11 分、G0 3,156 s と 3,413 s、W2 N=1 の 5 本 1,587 s と 1,674 s、W4 N=1 の 5 本 4,224 s と 3,308 s、N=2 W2 2,759 s、hvlinux 623 s、litmus N=4 2,268 s、cosim N=1 W2 の 4 本 772 s、cosim N=2 2,712 s、cosim hvlinux 602-792 s、ACT の cosim 全 suite 2,532 s、W2 N=4 9,809 s。
+
 ## 10. 外部メモリインタフェースの検証 (MM、設計書 §MM)
 
 【決定】MM の検証は、メモリ側のタイミングだけを振って機能の結果が変わらないことを示す形にする。理由: AXI4 にした目的は、メモリ側の遅延と順序をコアの性質から外すことである。固定遅延でしか確かめていないと、その目的が果たされたことは分からない。

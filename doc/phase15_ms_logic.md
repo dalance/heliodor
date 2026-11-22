@@ -662,3 +662,35 @@ URAM (1) は同じ。DSP は W2 348 で同じ、W4 は 373 → 372。
 - 揺れ: W4 の `u_mshr` は LUT 9,841 → 12,212 (+2,371) で、FF は 268 → 236 と減っている。line の比較が狭くなっただけなので、階層の帰属の揺れと見ている (W2 は 5,546 → 5,066)。
 - 実行時間 (synth_design、sim 4 本と並べた): 前 `soc_w2` 16 分、`soc_w2_l2` 39 分、`core_w4` 30 分。後 `soc_w2` 15 分、`soc_w2_l2` 17 分、`core_w4` 33 分。
 - 合成で見つけた誤り: 最初の版 (`7cc1fc27`) は `sq` の push の line の `tree_onehot_mux::<CFG::MEM_W, 50>` と dcache の非 pipe の PA の `tree_onehot_mux::<NP_N, 56>` に幅の定数が残り、Vivado が elaboration で止まった (Synth 8-659、関数の配列の引数の型の不一致)。`veryl check` は警告を出さず、Veryl の sim は値を正しく扱っていた (この版の W2/W4 の N=1 の boot は前と cycle まで一致)。`59f5c0f5` で直した。
+
+### 8.13 F、G、H: 例外記録、`rob.res_q.next_pc`、LQ の byte mask (D-4)
+
+sizing の §2.1 の F、G、H。どれも cycle を変えない変更で、1 項目 1 commit。ゲートは `doc/phase15_verification_plan.md` §9.21。合成は §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし)。前は §8.12 の「後」(`59f5c0f5`、`879e2a82` と同じ RTL)。
+
+- F (`c3d0c881`): `exc_pkg::ExcRec` から tval (64 bit) を外し、選択子 `tsel` (2 bit: ZERO、PC、PC2、VAL) にした。PC と PC2 は commit が trap の epc (FTQ から作る op の PC) と epc + 2 から作る (fetch の fault、page をまたぐ 32 bit 命令の上半分、fetch の trigger)。VAL は queue の外を record の横に並べて運ぶ値で、置き場は次のとおり: memory pipe の M2/R と WB の packet (`WbPacket.tval`、access の VA。page をまたぐ access の hi の pass は次の line の先頭、trigger は access の VA で、前と同じ値)、`vu_mem_adapter` (misaligned の element はその VA、他は最後の pass の VA。pass の VA は pointer masking の後の値で、memory pipe の応答 `VuMemRes.tval` から取る)、`VuDone` (VU の不正命令の命令 bit)、SYS port (`wrs.nto` の命令 bit)、dispatch から ROB への `RobAlloc.tval` (decode の不正命令の命令 bit。RVC は 16 bit の parcel)、ROB の `exc_q` (1 本のレジスタ)。decode の不正命令の命令 bit は RQ の中では `DecOp.imm` に置く (例外を持つ op は fu NONE で imm を使わない)。PTW の応答は tval を持たず VAL を返し、受け手が自分の VA を使う: LQ/SQ の `e_xexc` は re-issue の pass の VA (`m1.pva`、walk を出した pass と同じ va と half から作る)、IFU は extract が PC/PC2 に置き換え、VU は最後の pass の VA。ebreak の tval (epc) と icount の 0 は trap_unit の前からの規則のまま。
+  - 最初の版は VU の tval を adapter が受け取った element の VA (`va_q`、pointer masking の前) にしていた。前は memory pipe の pass の VA (masking の後) で、ACT4 の cosim で `act_smmpm`、`act_smnpm`、`act_ssnpm` の `pmm10_sweep` 5 本が tval の不一致を出した (cbench、boot、GL-B、G0 は vector の fault を通らず一致していた)。pass の VA を `VuMemRes.tval` で返して直し、F の commit に入れた。
+  - gpa: sizing の案の 39 bit (Sv39x4 の GPA 41 bit >> 2) にはできなかった。GPA が 41 bit を超える guest-page fault で htval/mtval2 に全幅の GPA >> 2 を書く今の振る舞い (spike、Sail と同じ) を保つため。超える GPA は 2 種類ある: (a) VS-stage の PTE の PPN (44 bit) から作る GPA (leaf の GPA と次の PTE の address。最大 56 bit)。ACT4 の `act_sv/H_sv39x4_gpa_wide_00` がまさにこれ (PPN で GPA の bit 41 と 55 を立て、trap handler が mtval2 を署名に書く)。(b) vsatp が Bare のときの GVA そのもの (64 bit)。(b) は GPA が tval の VA と同じなので選択子 `gsel` (1 bit、htval = tval >> 2) にし、(a) のために gpa を 54 bit (56 bit >> 2) にした。`gsel` を立てるのは IFU と memory pipe の `gpa_big` と、PTW の vsatp Bare の walk の guest-page fault。1 記録の幅は tval 64 + gpa 62 = 126 から tsel 2 + gsel 1 + gpa 54 = 57 bit で、見込みの 85 bit に対して 69 bit の節約。
+- G (`9e534856`): ROB の `res_q` から next_pc (64 bit × ROB_N) を外し、mispred と taken の 2 bit にした。commit は taken の BRU op の次の PC を FTQ の entry の `e_res.target` から読む (新しい commit 用の読み口 COMMIT_W 本、`o_cm_tgt`)。taken の BRU op は block の出口なので、予測が当たっていれば `e_res` は予測の target、外れて partial kill で回復した op ならその kill が `e_res` を直した target である。not-taken は pc + len で、lane の PC の anchor は taken の BRU と xRET だけになった (前は not-taken の BRU も anchor で、値は同じ)。
+  - sizing の案の `FtqRead.pred.target` (`e_pred`) は使えない: `e_pred` は partial kill で直らない (直るのは `e_res`)。
+  - FTQ だけでは足りない場合が 2 つあった。(1) 回復した branch は自分の partial kill のサイクルに retire できるが、`e_res` はそのサイクルの終わりに書かれる。読み口はそのサイクルの kill の書き (`k_res`) を前送りする。最初の版はこれが無く、GL-B W2 が 140,609 cycle で retire の列の hash の不一致を出した (修正後に commit)。(2) partial kill が取られなかった mispredict (`flush_ctrl` が walk 中や連続 kill で落とし、commit が BR_CM で直す) は FTQ が直っていない。`flush_ctrl` に「落とした resolve のうち生きている一番古いもの」の tag と next PC を持つレジスタを 1 本足し (`o_late_pc`)、commit は mispred かつ recovered でない lane にこれを使う。それより若い落とした resolve は、その op の kill か BR_CM の full kill で必ず消えるので 1 本で足りる。
+- H (`8a4dfb73`): `lq.e_lm0`、`e_lm1` (64 bit × 2 × LQ_N) を外し、順序違反の scan のたびに `ld_mask(va[5:0], op)` (16 bit の access mask を `va[5:3]` の dword へずらした 128 bit。下半分が lo の line、上半分が hi の line) で作る。`e_va` は verdict でしか書かれず snapshot より遅いので、`LqSnap` の mask (16 bit) を `bo` (va[5:0]、6 bit) に替え、snapshot で `e_va[5:0]` を書く (verdict が後で同じ値を書く)。旧式との一致は bo 64 × size 4 (+ q) の全数で確かめた。
+
+合成 (各列はその commit までを積んだもの。F、G、H の列は VU の tval の修正 (下記) の前の版で、tip の列が修正の後の `8a4dfb73`):
+
+| | §8.12 (前) | F | G | H | tip |
+|---|---|---|---|---|---|
+| W2 SoC LUT | 313,148 | 308,374 | 310,004 | 310,501 | 310,541 |
+| W2 SoC LUTRAM | 5,296 | 5,296 | 5,296 | 5,296 | 5,296 |
+| W2 SoC FF | 111,004 | 106,238 | 103,428 | 99,355 | 99,421 |
+| W4 core LUT | 631,382 | 614,943 | 612,012 | 607,026 | 607,046 |
+| W4 core LUTRAM | 5,552 | 5,552 | 5,552 | 5,552 | 5,552 |
+| W4 core FF | 171,266 | 161,913 | 155,116 | 146,925 | 146,967 |
+
+block RAM (W2 25.5 tile、W4 29 tile) と URAM (1) はどの列も同じ。DSP は W2 348-349、W4 372-374 で揺れの範囲。
+
+- F: FF は W2 −4,766、W4 −9,353。見込み (69 bit × 記録数) は W2 約 4,100、W4 約 8,600 で、残りは memory pipe の M0/M1 の `xexc` と PTW の応答のレジスタ。LUT の W4 −16,439 は見込み (tval の mux が消える分) より大きく、階層の帰属の揺れを含む。
+- G: `u_rob` の FF は W2 11,207 → 7,060 (−4,147)、W4 23,535 → 15,357 (−8,178) で next_pc の 64 × ROB_N に合う。代わりに `u_ftq` の FF が W2 9,176 → 10,489、W4 10,668 → 11,971 (+1,300) 増えた: commit が読むまで `e_res.target` の bit の一部は誰も読まず、合成が刈っていた。`u_ftq` の LUT は読み口で W2 +1,305、W4 +2,619、`u_flush` の LUT は W2 +1,872、W4 +1,357 (落とした resolve のレジスタと tag の比較)。合計は W2 で LUT +1,630 / FF −2,810、W4 で LUT −2,931 / FF −6,797。
+- H: `u_lq` は W2 で LUT 9,516 → 11,815 (+2,299)、FF 12,530 → 8,468 (−4,062)、W4 で LUT 28,781 → 29,463 (+682)、FF 25,245 → 17,049 (−8,196)。entry ごとの mask の decoder (6 bit から 128 bit) の代金は FF の節約の半分以下 (W2) で、W4 ではほぼ打ち消される。全体では W2 LUT +497 / FF −4,073、W4 LUT −4,986 / FF −8,191 で、純に正なので残す。scan の比較の前に decoder が入るので、CP の確認は CP の分解のときに行う (この合成は時間関係を測っていない)。
+- VU の tval の修正は `vu_mem_adapter` の 64 bit のレジスタ 1 本 (FF +66 / +42)。
+- 計 (tip): W2 SoC は LUT −2,607、FF −11,583。W4 core は LUT −24,336、FF −24,299。
+- 実行時間 (synth_design、sim 4 本と Vivado 2 本を並べた): `soc_w2` 16-29 分、`core_w4` 38-45 分。
