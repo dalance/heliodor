@@ -251,7 +251,8 @@ enum CsrKind {
     /// Fields the configuration leaves to the implementation where spike
     /// chose differently: the legalization of a reserved CBIE or PMM, and
     /// the henvcfg bits gated by menvcfg, whose value after leaving
-    /// read-only zero is unspecified.
+    /// read-only zero is unspecified; and the address bits above the
+    /// configured physical address width, which spike keeps.
     /// Reads and writes are compared outside them, and the DUT's value of
     /// them is copied into spike.
     Unspecified(u64),
@@ -406,6 +407,10 @@ struct Engine {
     /// scontext; mcountinhibit bits the configuration and spike disagree on.
     stateen_skip: u64,
     inhibit_skip: u64,
+    /// pmpaddr bits, and satp/hgatp PPN bits, above PHYS_ADDR_WIDTH: zero
+    /// in the configuration, writable on spike (56-bit physical addresses).
+    pmp_hi: u64,
+    ppn_hi: u64,
     vsatp_ignore: bool,
     marchid: u64,
     mimpid: u64,
@@ -511,6 +516,9 @@ impl Engine {
             self.stateen_skip |= 1;
         }
         self.inhibit_skip = a.mask("COUNTINHIBIT_EN")? ^ probe_writable(h, 0x320);
+        let pw = a.u64("PHYS_ADDR_WIDTH")?;
+        self.pmp_hi = ((1u64 << 54) - 1) & !((1u64 << (pw - 2)) - 1);
+        self.ppn_hi = ((1u64 << 44) - 1) & !((1u64 << (pw - 12)) - 1);
         self.vsatp_ignore = a.bool("IGNORE_INVALID_VSATP_MODE_WRITES_WHEN_V_EQ_ZERO")?;
         self.vec_wholereg_misaligned = a.bool("VECTOR_LS_WHOLEREG_MISALIGNED_LEGAL")?;
         self.tohost_pa = p.tohost_pa.unwrap_or(0);
@@ -573,6 +581,10 @@ impl Engine {
             0x304 | 0x604 if sgei != 0 => CsrKind::Masked(!sgei),
             0x30c | 0x60c | 0x10c if self.stateen_skip != 0 => CsrKind::Masked(!self.stateen_skip),
             0x320 if self.inhibit_skip != 0 => CsrKind::Masked(!self.inhibit_skip),
+            0x3b0..=0x3bf if self.pmp_hi != 0 => CsrKind::Unspecified(self.pmp_hi),
+            // satp and hgatp; 0x180 with V = 1 is vsatp, whose PPN is a GPA
+            // and full width on both sides.
+            0x180 | 0x680 if self.ppn_hi != 0 => CsrKind::Unspecified(self.ppn_hi),
             0x300 | 0x100 | 0x200 => CsrKind::Status,
             0x747 => CsrKind::Unspecified(3 << 32),
             0x30a | 0x10a => CsrKind::Unspecified((3 << 32) | 0x30),
