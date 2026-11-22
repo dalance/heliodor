@@ -35,7 +35,7 @@
 //                       its cbo.clean/flush/inval completed
 //   i_amo_done        : atomic_unit wrote back the head entry's atomic;
 //                       i_amo_wrote/i_amo_wdata: whether and what it wrote,
-//                       kept for the retire record
+//                       kept for the retire record (HELIODOR_OBS only)
 //   o_perf            : combinational event wires
 //   o_chk             : sticky checker flags (HELIODOR_CHK only, else 0)
 // Entry kinds (from the op and, for IO, the STA attributes):
@@ -66,6 +66,11 @@
 //   - a store is a candidate unless sq_lim is older than or equal to it:
 //     with a full SQ the oldest store and sq_lim share their index, where
 //     tag_older(store, sq_lim) would read "not older"
+//   - e_data is the store data shifted to its byte offset in the 16-byte
+//     window, so a store of at most 8 bytes leaves byte 15 zero and the
+//     entry keeps 15 bytes. The 16 bytes of amocas.q are only recorded: an
+//     atomic is written back at the head and retires from it, so one
+//     register holds the head atomic's record
 pub module sq::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
@@ -142,7 +147,7 @@ pub module sq::<CFG: core_cfg> (
     var e_av0  : logic       [QN];
     var e_av1  : logic       [QN];
     var e_exc  : logic       [QN];
-    var e_data : logic<128>  [QN];
+    var e_data : logic<120>  [QN];
     var e_dv   : logic       [QN];
     var e_rdy  : logic       [QN]; // a pass waits for re-issue
     var e_rhalf: logic       [QN]; // that pass is the hi line
@@ -154,8 +159,11 @@ pub module sq::<CFG: core_cfg> (
     var e_ioord: logic       [QN];
     var e_dram : logic       [QN];
     var e_wtd  : logic       [QN]; // io_unit's write accepted, or the atomic written back
-    var e_amowr: logic       [QN]; // the atomic wrote memory
     var io_q   : IoOp            ;
+    #[ifdef(HELIODOR_OBS)]
+    var amo_wr_q: logic; // the head atomic wrote memory
+    #[ifdef(HELIODOR_OBS)]
+    var amo_wd_q: logic<128>; // and what it wrote
 
     var rsel_v_q: logic    ;
     var rsel_q  : logic<QIW>;
@@ -215,7 +223,7 @@ pub module sq::<CFG: core_cfg> (
                 let m16: logic<16>  = if zf ? 16'hffff : if eq ? e_m16[e] : if dn ? {8'd0, e_m16[e][15:8]} : if up ? {e_m16[e][7:0], 8'd0} : 16'd0;
                 cand[e] = live[e] && !e_exc[e] && !e_io[e] && !e_op[e].cmo && !tag_older_eq::<SQ_TAG_W>({i_fwd_q[p].sq_lim.wrap, i_fwd_q[p].sq_lim.idx}, tags[e]);
                 cov[e]  = m16 & {if dw == 3'd7 ? 8'h00 : 8'hff, 8'hff} & i_fwd_q[p].mask;
-                dat[e]  = if zf ? '0 : {if up ? e_data[e][63:0] : e_data[e][127:64], if dn ? e_data[e][127:64] : e_data[e][63:0]};
+                dat[e]  = if zf ? '0 : {if up ? e_data[e][63:0] : {8'd0, e_data[e][119:64]}, if dn ? {8'd0, e_data[e][119:64]} : e_data[e][63:0]};
             }
         }
         var wait_b: logic<16>      ;
@@ -290,7 +298,6 @@ pub module sq::<CFG: core_cfg> (
     var w_x  : logic<CFG::MEM_W>      ; // retiring and crossing
     for k in 0..CFG::MEM_W :g_win {
         let wt : SqTag      = sq_adv(head_q, k);
-        let wsh: logic<128> = e_data[wt.idx] >> {e_va[wt.idx][2:0], 3'd0};
         assign w_ix[k]  = wt.idx;
         let nop: logic      = e_io[wt.idx] || e_op[wt.idx].amo || e_op[wt.idx].cmo;
         assign w_ret[k] = k <: i_retire_cnt;
@@ -306,13 +313,15 @@ pub module sq::<CFG: core_cfg> (
             o_win[k].obs = 0 as MemObs;
             #[ifdef(HELIODOR_OBS)]
             block {
+                let amo: logic      = e_op[wt.idx].amo;
+                let wsh: logic<128> = (if amo ? amo_wd_q : {8'd0, e_data[wt.idx]}) >> {e_va[wt.idx][2:0], 3'd0};
                 o_win[k].obs.size   = {1'b0, e_op[wt.idx].size};
                 o_win[k].obs.vaddr  = e_va[wt.idx];
                 o_win[k].obs.paddr  = {8'd0, e_line0[wt.idx], e_va[wt.idx][5:0]};
                 o_win[k].obs.io     = e_io[wt.idx];
                 o_win[k].obs.rmask = '0;
                 // The record shows no store for CBO ops and an atomic that did not write.
-                o_win[k].obs.wmask    = if e_op[wt.idx].cmo || e_op[wt.idx].zero || (e_op[wt.idx].amo && !e_amowr[wt.idx]) ?
+                o_win[k].obs.wmask    = if e_op[wt.idx].cmo || e_op[wt.idx].zero || (amo && !amo_wr_q) ?
                     16'd0
                 : if e_op[wt.idx].q ?
                     16'hffff
@@ -344,7 +353,7 @@ pub module sq::<CFG: core_cfg> (
                 lo_sel[k] = w_psh[k] && w_off[k] == i;
                 fr[k]     = e_full[w_ix[k]];
                 hi_sel[k] = w_x[k] && w_off[k] + 8'd1 == i;
-                ld[k]     = if hi_sel[k] ? {448'd0, e_data[w_ix[k]][127:64]} : if fr[k] ? '0 : {384'd0, e_data[w_ix[k]]} << {e_dw0[w_ix[k]], 6'd0};
+                ld[k]     = if hi_sel[k] ? {456'd0, e_data[w_ix[k]][119:64]} : if fr[k] ? '0 : {392'd0, e_data[w_ix[k]]} << {e_dw0[w_ix[k]], 6'd0};
                 lm[k]     = if hi_sel[k] ? {56'd0, e_m16[w_ix[k]][15:8]} : if fr[k] ? '1 : {48'd0, e_m16[w_ix[k]]} << {e_dw0[w_ix[k]], 3'd0};
                 ll[k]     = if hi_sel[k] ? e_line1[w_ix[k]] : e_line0[w_ix[k]];
             }
@@ -355,6 +364,14 @@ pub module sq::<CFG: core_cfg> (
         assign o_push[i].data  = tree_onehot_mux::<CFG::MEM_W, 512>(sel, ld);
         assign o_push[i].strb  = tree_onehot_mux::<CFG::MEM_W, 64>(sel, lm);
         assign o_push[i].fresh = (lo_sel & fr) != '0;
+    }
+
+    #[ifdef(HELIODOR_OBS)]
+    always_ff {
+        if i_amo_done && e_op[head_q.idx].amo {
+            amo_wr_q = i_amo_wrote;
+            amo_wd_q = i_amo_wdata;
+        }
     }
 
     // ---- io_unit offer ----
@@ -429,11 +446,6 @@ pub module sq::<CFG: core_cfg> (
                 if ((i_wt_done && (e_io[e] || e_op[e].cmo)) || (i_amo_done && e_op[e].amo)) && e == hix {
                     e_wtd[e] = 1'b1;
                 }
-                // An atomic's entry never holds store data before this.
-                if i_amo_done && e_op[e].amo && e == hix {
-                    e_amowr[e] = i_amo_wrote;
-                    e_data[e]  = i_amo_wdata;
-                }
                 for l in 0..CFG::RENAME_W {
                     if i_alloc_valid[l] && o_alloc_tag[l].idx == e {
                         e_wrap[e]  = o_alloc_tag[l].wrap;
@@ -492,7 +504,7 @@ pub module sq::<CFG: core_cfg> (
                         }
                     }
                     if i_std[p].valid && i_std[p].sq.idx == e {
-                        e_data[e] = i_std[p].data;
+                        e_data[e] = i_std[p].data[119:0];
                         e_dv[e]   = 1'b1;
                     }
                 }
