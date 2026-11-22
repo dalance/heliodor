@@ -103,9 +103,9 @@ pub module ptw::<CFG: core_cfg> #(
     i_pmp    : input pmp_pkg::PmpEnt         [16],
     i_inv    : input xlate_pkg::TlbInv           ,
 
-    i_ordering_empty: input logic                                       ,
-    i_coh_v         : input logic     [core_types::<CFG>::COH_N],
-    i_coh_line      : input logic<50> [core_types::<CFG>::COH_N],
+    i_ordering_empty: input logic                                   ,
+    i_coh_v         : input logic         [core_types::<CFG>::COH_N],
+    i_coh_line      : input pma_pkg::Line [core_types::<CFG>::COH_N],
 
     o_fill: output xlate_pkg::TlbFill          ,
     o_resp: output core_types::<CFG>::XlateResp,
@@ -148,14 +148,15 @@ pub module ptw::<CFG: core_cfg> #(
 
     // The walk position after a G-stage walk of gpa is started; fin: for the
     // final GPA (else for the next VS-stage PTE). A Bare G-stage resolves at
-    // once.
+    // once; its GPA is the PA, and big when above PALEN.
     struct Go {
-        st : WSt        ,
-        g  : logic      , // the next read is a G-stage PTE
-        fin: logic      ,
-        pa : pma_pkg::Pa,
-        gpa: logic  <64>,
-        flt: Flt        ,
+        st : WSt            ,
+        g  : logic          , // the next read is a G-stage PTE
+        fin: logic          ,
+        pa : pma_pkg::Pa    ,
+        big: logic          ,
+        gpa: logic      <64>,
+        flt: Flt            ,
     }
 
     function go_g (
@@ -168,7 +169,8 @@ pub module ptw::<CFG: core_cfg> #(
         c.fin = fin;
         c.g   = xe.g_on || fin;
         c.flt = if xe.g_on && gpa[63:41] != '0 ? Flt::GUEST : Flt::NONE;
-        c.pa  = if xe.g_on ? {xe.groot[43:2], gpa[40:30], 3'd0} : gpa[55:0];
+        c.pa  = if xe.g_on ? {xe.groot[pma_pkg::PPN_W - 1:2], gpa[40:30], 3'd0} : gpa[pma_pkg::PALEN - 1:0];
+        c.big = !xe.g_on && (gpa >> pma_pkg::PALEN) != '0;
         c.st  = if c.flt != Flt::NONE || (!xe.g_on && fin) ? WSt::DONE : WSt::REQ;
         return c;
     }
@@ -183,7 +185,8 @@ pub module ptw::<CFG: core_cfg> #(
             c.st  = WSt::REQ;
             c.g   = 1'b0;
             c.fin = 1'b0;
-            c.pa  = {xe.root, gva[38:30], 3'd0};
+            c.pa  = {xe.root[pma_pkg::PPN_W - 1:0], gva[38:30], 3'd0};
+            c.big = 1'b0;
             c.gpa = '0;
             c.flt = Flt::NONE;
         } else if xe.s1_on {
@@ -213,7 +216,7 @@ pub module ptw::<CFG: core_cfg> #(
         var t      : TlbEntry;
         t       = '1;
         t.virt  = 1'b0;
-        t.ppn   = if pte[63] ? {pte[53:14], a_va[15:12]} : pte[53:10];
+        t.ppn   = if pte[63] ? {pte[pma_pkg::PPN_W + 9:14], a_va[15:12]} : pte[pma_pkg::PPN_W + 9:10];
         t.level = lvl;
         t.r     = pte[1];
         t.w     = pte[2];
@@ -224,6 +227,20 @@ pub module ptw::<CFG: core_cfg> #(
         t.pbmt  = if pbmte ? pte[62:61] : 2'd0;
         t.napot = pte[63];
         return t;
+    }
+
+    // The PA (or GPA) a first-stage leaf maps va to, over the PTE's full PPN.
+    function pte_pa (
+        pte: input logic<64>,
+        lvl: input logic<2> ,
+        a  : input logic<64>,
+    ) -> logic<56> {
+        let ppn: logic<44> = if pte[63] ? {pte[53:14], a[15:12]} : pte[53:10];
+        return case lvl {
+            2'd2   : {ppn[43:18], a[29:0]},
+            2'd1   : {ppn[43:9], a[20:0]},
+            default: {ppn, a[11:0]},
+        };
     }
 
     function gone (
@@ -254,6 +271,7 @@ pub module ptw::<CFG: core_cfg> #(
     var w_lvl_q  : logic      <2>  ; // first-stage level
     var w_glvl_q : logic      <2>  ; // G-stage level
     var w_pa_q   : pma_pkg::Pa     ;
+    var w_big_q  : logic           ; // w_pa_q stands for a PTE address above PALEN
     var w_gpa_q  : logic      <64> ; // the GPA under G-stage translation
     var w_pte_q  : logic      <64> ; // the first-stage leaf, or the value an A/D write stores
     var w_gpte_q : logic      <64> ; // the same for the G-stage
@@ -354,15 +372,15 @@ pub module ptw::<CFG: core_cfg> #(
     inst u_pmp_pte: pmp_match #(
         N: 1,
     ) (
-        i_blk: w_pa_q[55:6]          ,
-        i_lo4: '{w_pa_q[5:2]}        ,
+        i_blk: w_pa_q[pma_pkg::PALEN - 1:6],
+        i_lo4: '{w_pa_q[5:2]},
         i_hi4: '{{w_pa_q[5:3], 1'b1}},
-        i_ent: i_pmp                 ,
-        o_res: pte_pm                ,
+        i_ent: i_pmp                       ,
+        o_res: pte_pm                      ,
     );
     let pte_r_deny: logic = pmp_pkg::fault(pte_pm[0], 2'd0, csr_pkg::PrivLevel::SUPERVISOR);
     let pte_w_deny: logic = pmp_pkg::fault(pte_pm[0], 2'd1, csr_pkg::PrivLevel::SUPERVISOR);
-    let pte_deny: logic = !pte_attr.pte_ok || pte_r_deny;
+    let pte_deny  : logic = !pte_attr.pte_ok || pte_r_deny || w_big_q;
 
     var mtag: MemTag;
     always_comb {
@@ -393,13 +411,13 @@ pub module ptw::<CFG: core_cfg> #(
     // An owned read waits for the whole fill: the critical dword is not
     // ownership.
     function fill_wake (
-        e   : input MemEvent    ,
-        fin : input logic       ,
-        fid : input FillId      ,
-        any : input logic       ,
-        crit: input logic       ,
-        line: input logic   <50>,
-        dw  : input logic   <3> ,
+        e   : input MemEvent        ,
+        fin : input logic           ,
+        fid : input FillId          ,
+        any : input logic           ,
+        crit: input logic           ,
+        line: input pma_pkg::Line   ,
+        dw  : input logic        <3>,
     ) -> logic {
         return if any ?
             fin
@@ -465,7 +483,7 @@ pub module ptw::<CFG: core_cfg> #(
     always_comb {
         coh_hit = 1'b0;
         for c in 0..COH_N {
-            coh_hit |= i_coh_v[c] && i_coh_line[c] == w_pa_q[55:6];
+            coh_hit |= i_coh_v[c] && i_coh_line[c] == w_pa_q[pma_pkg::PALEN - 1:6];
         }
     }
     let clean: logic = w_clean_q && i_ordering_empty && !coh_hit;
@@ -496,9 +514,10 @@ pub module ptw::<CFG: core_cfg> #(
     // A VS-stage non-leaf: the next PTE's GPA. RES after a VS-stage leaf: the
     // final GPA.
     let nl_go : Go          = go_g({8'd0, p_ppn, next_idx, 3'd0}, 1'b0, x);
-    let fin_go: Go          = go_g({8'd0, entry_pa(s1e, va)}, 1'b1, x);
+    let fin_go: Go          = go_g({8'd0, pte_pa(w_pte_q, w_lvl_q, va)}, 1'b1, x);
     let vsw_go: Go          = go_g(w_gpa_q, 1'b0, x);
     let g_hpa : pma_pkg::Pa = entry_pa(ge, w_gpa_q);
+    let g_big : logic       = ppn_big(w_gpte_q[53:10]);
 
     // ---- the walk: completion ----
 
@@ -510,23 +529,25 @@ pub module ptw::<CFG: core_cfg> #(
         var lv : logic      <2> ;
         var hpa: pma_pkg::Pa    ;
         var pb : logic      <2> ;
-        lv    = if !x.s1_on ? ge.level : if !x.g_on || s1e.level <: ge.level ? s1e.level : ge.level;
-        hpa   = if x.g_on ? g_hpa : w_gpa_q[55:0];
+        var lom: logic      <44>;
+        lv  = if !x.s1_on ? ge.level : if !x.g_on || s1e.level <: ge.level ? s1e.level : ge.level;
+        hpa = if x.g_on ? g_hpa : w_gpa_q[pma_pkg::PALEN - 1:0];
+        lom = case lv {
+            2'd2   : 44'h3_ffff,
+            2'd1   : 44'h1ff,
+            default: 44'h0,
+        };
         pb    = if x.g_on ? ge.pbmt : 2'd0;
         e_ent = s1e;
         if x.two {
             e_ent.virt  = 1'b1;
             e_ent.s1_on = x.s1_on;
             e_ent.level = lv;
-            e_ent.ppn   = hpa[55:12] & ~(case lv {
-                2'd2   : 44'h3_ffff,
-                2'd1   : 44'h1ff,
-                default: 44'h0,
-            });
-            e_ent.gr = !x.g_on || ge.r;
-            e_ent.gw = !x.g_on || ge.w;
-            e_ent.gx = !x.g_on || ge.x;
-            e_ent.gd = !x.g_on || ge.d;
+            e_ent.ppn   = hpa[pma_pkg::PALEN - 1:12] & ~lom[pma_pkg::PPN_W - 1:0];
+            e_ent.gr    = !x.g_on || ge.r;
+            e_ent.gw    = !x.g_on || ge.w;
+            e_ent.gx    = !x.g_on || ge.x;
+            e_ent.gd    = !x.g_on || ge.d;
             if x.s1_on {
                 e_ent.pbmt = if s1e.pbmt != 2'd0 ? s1e.pbmt : pb;
             } else {
@@ -542,7 +563,15 @@ pub module ptw::<CFG: core_cfg> #(
         }
     }
 
-    let f_pa : pma_pkg::Pa      = entry_pa(e_ent, va);
+    let f_pa: pma_pkg::Pa = entry_pa(e_ent, va);
+    // The final PA lies above PALEN: a hole, and no entry is installed.
+    let f_big: logic            = if !x.two ?
+        ppn_big(w_pte_q[53:10])
+    : if x.g_on ?
+        g_big
+    :
+        (w_gpa_q >> pma_pkg::PALEN) != '0
+    ;
     let f_att: pma_pkg::PmaAttr = pbmt_attr(pma_check::<PMA_N>(f_pa, PMA_TBL), e_ent.pbmt);
     let f_p  : Perm             = perm_x(e_ent, w_req_q.acc, x, w_req_q.hlvx);
     // The 4-byte granule of the final PA, one match for every access type.
@@ -550,11 +579,11 @@ pub module ptw::<CFG: core_cfg> #(
     inst u_pmp_f: pmp_match #(
         N: 1,
     ) (
-        i_blk: f_pa[55:6]  ,
+        i_blk: f_pa[pma_pkg::PALEN - 1:6],
         i_lo4: '{f_pa[5:2]},
         i_hi4: '{f_pa[5:2]},
-        i_ent: i_pmp       ,
-        o_res: f_pm        ,
+        i_ent: i_pmp                     ,
+        o_res: f_pm                      ,
     );
     let f_rd: logic = pmp_pkg::fault(f_pm[0], 2'd0, x.prv);
     let f_wd: logic = pmp_pkg::fault(f_pm[0], 2'd1, x.prv);
@@ -566,13 +595,13 @@ pub module ptw::<CFG: core_cfg> #(
         AccKind::FETCH: f_xd,
         default       : f_rd && f_wd,
     };
-    let f_pma: logic = !f_att.backed || (w_req_q.acc == AccKind::FETCH && !f_att.executable);
+    let f_pma: logic = f_big || !f_att.backed || (w_req_q.acc == AccKind::FETCH && !f_att.executable);
 
     let done   : logic = w_st_q == WSt::DONE;
     let pf_end : logic = w_flt_q == Flt::PAGE || (w_flt_q == Flt::NONE && !f_p.ok);
     let gf_end : logic = w_flt_q == Flt::GUEST;
     let af_end : logic = !pf_end && !gf_end && (w_flt_q == Flt::ACCESS || f_pmp || f_pma);
-    let install: logic = done && w_flt_q == Flt::NONE && !w_stale_q && !epoch_mv && (x.s1_on || x.g_on);
+    let install: logic = done && w_flt_q == Flt::NONE && !f_big && !w_stale_q && !epoch_mv && (x.s1_on || x.g_on);
 
     always_comb {
         o_fill.valid = install;
@@ -715,7 +744,15 @@ pub module ptw::<CFG: core_cfg> #(
                                 w_wr_q  = w_adr_q && clean;
                             }
                         } else if rs.kind == RespKind::MISS {
-                            w_st_q = if fill_wake(ev, ev_end, rs.fill_id, 1'b0, !w_adr_q, w_pa_q[55:6], r_dw) ?
+                            w_st_q = if fill_wake(
+                                ev,
+                                ev_end,
+                                rs.fill_id,
+                                1'b0,
+                                !w_adr_q,
+                                w_pa_q[pma_pkg::PALEN - 1:6],
+                                r_dw,
+                            ) ?
                                 WSt::REQ
                             :
                                 WSt::PARK
@@ -728,7 +765,7 @@ pub module ptw::<CFG: core_cfg> #(
                     }
                 }
                 WSt::PARK: {
-                    if fill_wake(ev, ev_end, w_fid_q, w_any_q, !w_adr_q, w_pa_q[55:6], r_dw) {
+                    if fill_wake(ev, ev_end, w_fid_q, w_any_q, !w_adr_q, w_pa_q[pma_pkg::PALEN - 1:6], r_dw) {
                         w_st_q = WSt::REQ;
                     }
                 }
@@ -753,6 +790,7 @@ pub module ptw::<CFG: core_cfg> #(
             w_setd_q = 1'b0;
             w_vsw_q  = 1'b0;
             w_pa_q   = s_go.pa;
+            w_big_q  = s_go.big;
             w_gpa_q  = s_go.gpa;
             w_g_q    = s_go.g;
             w_fin_q  = s_go.fin;
@@ -768,6 +806,7 @@ pub module ptw::<CFG: core_cfg> #(
             w_setd_q = 1'b0;
             w_vsw_q  = 1'b0;
             w_pa_q   = r_go.pa;
+            w_big_q  = r_go.big;
             w_gpa_q  = r_go.gpa;
             w_g_q    = r_go.g;
             w_fin_q  = r_go.fin;
@@ -780,11 +819,13 @@ pub module ptw::<CFG: core_cfg> #(
                 w_flt_q = if w_g_q ? Flt::GUEST : Flt::PAGE;
             } else if !p_leaf {
                 if w_g_q {
-                    w_pa_q   = {p_ppn, g_idx, 3'd0};
+                    w_pa_q   = {p_ppn[pma_pkg::PPN_W - 1:0], g_idx, 3'd0};
+                    w_big_q  = ppn_big(p_ppn);
                     w_glvl_q = w_glvl_q - 2'd1;
                 } else if x.two {
                     w_lvl_q = w_lvl_q - 2'd1;
                     w_pa_q   = nl_go.pa;
+                    w_big_q  = nl_go.big;
                     w_gpa_q  = nl_go.gpa;
                     w_g_q    = nl_go.g;
                     w_fin_q  = nl_go.fin;
@@ -793,12 +834,14 @@ pub module ptw::<CFG: core_cfg> #(
                         w_flt_q = nl_go.flt;
                     }
                 } else {
-                    w_pa_q  = {p_ppn, next_idx, 3'd0};
+                    w_pa_q  = {p_ppn[pma_pkg::PPN_W - 1:0], next_idx, 3'd0};
+                    w_big_q = ppn_big(p_ppn);
                     w_lvl_q = w_lvl_q - 2'd1;
                 }
             } else if vs_gchk {
                 w_vsw_q  = 1'b1;
                 w_pa_q   = vsw_go.pa;
+                w_big_q  = vsw_go.big;
                 w_g_q    = vsw_go.g;
                 w_fin_q  = vsw_go.fin;
                 w_glvl_q = 2'd2;
@@ -816,6 +859,7 @@ pub module ptw::<CFG: core_cfg> #(
         } else if in_res {
             if !w_g_q {
                 w_pa_q   = fin_go.pa;
+                w_big_q  = fin_go.big;
                 w_gpa_q  = fin_go.gpa;
                 w_g_q    = fin_go.g;
                 w_fin_q  = fin_go.fin;
@@ -824,8 +868,9 @@ pub module ptw::<CFG: core_cfg> #(
                     w_flt_q = fin_go.flt;
                 }
             } else if !w_fin_q {
-                w_pa_q = g_hpa;
-                w_g_q  = 1'b0;
+                w_pa_q  = g_hpa;
+                w_big_q = g_big;
+                w_g_q   = 1'b0;
             }
         } else if r_my {
             w_fid_q = rs.fill_id;
