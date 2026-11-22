@@ -119,21 +119,21 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
      which check the DRAM behind the AXI port after cbo.clean/flush/inval. Fix any
      failures before proceeding.
   2. `veryl test --ignored --test test_litmus_4hart`: RVWMO litmus battery at N=4
-     (IRIW + 4-way barrier/bus stress; **5,023,959 cycles**). The N=2 battery
+     (IRIW + 4-way barrier/bus stress; **5,122,506 cycles**). The N=2 battery
      (`test_w2_litmus_2hart`) already runs in step 1. Any forbidden-outcome hit is a
      memory-model bug; see `test/litmus/litmus.S` for the tohost encoding.
   3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart` — N=2 SMP Linux boot
-     (**19,778,334 cycles**, ~30 min). N=1 single-hart is `--ignored --test
-     test_soc_linux_boot` (**14,655,526 cycles**, ~7 min). The N=1 boot in golden
+     (**19,446,659 cycles**, ~30 min). N=1 single-hart is `--ignored --test
+     test_soc_linux_boot` (**14,695,563 cycles**, ~7 min). The N=1 boot in golden
      lockstep (retire-count mtime, trace hash checked against the old-core golden) is
-     `--ignored --test test_w2_linux_boot_lockstep` (14,579,991 cycles, ~7 min); run it
+     `--ignored --test test_w2_linux_boot_lockstep` (14,619,969 cycles, ~7 min); run it
      after any change that can alter the retire stream.
   4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: N=4 SMP Linux boot
-     (**24,199,767 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (21,842,350
+     (**25,485,977 cycles**, ~2.6 h at ~2.7k cy/s). W4 is `test_w4_smp_linux_boot_4hart` (22,692,494
      cycles, ~5-6.5 h at ~0.9-1.3k cy/s). The Verilator wrappers give identical cycle counts
      and serve as the NBA cross-check, not the gate.
   5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the type-1
-     hypervisor (**18,684,930 cycles**, ~10 min; the guest runs 2,048 CBOs, the
+     hypervisor (**18,792,075 cycles**, ~10 min; the guest runs 2,048 CBOs, the
      5.15 boots none, 6.6 4,096 and 7.1 2,048). The only gate that runs the
      two-stage (V=1) MMU under load; the native boots never leave single-stage
      translation, so a change to the dmem MMU or the load path can pass steps 1-4

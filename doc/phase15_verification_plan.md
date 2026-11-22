@@ -1402,7 +1402,9 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 
 `phase15/ms` の `dc0c9cce` に V1 (`5e1ff8a8`、データ配列を byte enable の 1R1W の bank にして 4 way を並列に読む)、V2 と C (`3ffdf899`、tag と directory を 1 本の pipeline の tag port に)、V6 (`3a88b97a`、書き込み buffer の payload のリセットを外す) を積んだ tip のゲート。設計は `doc/phase15_core_design.md` §MS の「L2 の作り直し」、合成は `doc/phase15_ms_logic.md` §8.10。veryl `9d6081f0`。native はすべて sandbox の外で `VERYL_AOT_C_ASYNC=0`、`fell_back` は全 run で 0。
 
-【状態】W2 と W4 の N=4 boot が +5.3 % と +3.9 % で、依頼の「boot が約 2 % を超えて遅くなったら止めて報告する」に当たるので、spike の cosim (N=1 の 4 本、SMP)、ACT4 の cosim はまだ回していない。CLAUDE.md の梯子の値も更新していない。
+【状態】W2 と W4 の N=4 boot が +5.3 % と +3.9 % で、依頼の「boot が約 2 % を超えて遅くなったら止めて報告する」に当たったので、一度止めて報告した。
+
+【決定】(2026-11-22、ユーザ) L2 の作り直しの代金をこのまま受け入れる。根拠は下の N=4 の分析 (遅れが kernel の時刻待ちの境界をまたいで tick 単位で増えた形で、正味の遅れは 0.2-0.4 % と見積もる) と、litmus N=4 W4 の +3.55 % を 1 本の tag port の取り合いの代金 (lookup、install、書きの grant が同じサイクルに進めなくなった分が、4 hart が同じ line を奪い合う stress で最も大きく出る) として扱うこと。miss と uncached の経路を投機的に出す (tag の判定を待たずに AR を出し、hit なら捨てる) ことで miss の +1 を取り戻す案は、後の phase に繰り延べる。CLAUDE.md の梯子の値は下の「後」の値に更新した。
 
 | ゲート | 前 (§9.16、§9.17) | 後 | 差 |
 |---|---|---|---|
@@ -1418,8 +1420,13 @@ cold-reader gate の途中で、`pmp_check` が PMP の全 entry が OFF のと�
 | litmus N=4 W2 / W4 | 5,023,959 / 5,023,457 (W4 は §9.15) | 5,122,506 / 5,201,592 | +1.96 % / +3.55 %。禁止された結果 0 |
 | 5.15 SMP N=4 W2 | 24,199,767 (record 14,478,663) | 25,485,977 (record 14,963,061) | **+1,286,210 (+5.31 %)** |
 | 5.15 SMP N=4 W4 | 21,842,350 (record 14,373,313) | 22,692,494 (record 14,714,279) | **+850,144 (+3.89 %)** |
-| cbench W2 coremark | 383,986 | 384,011 | +25 |
+| cbench W2 dhrystone / coremark / fpmm / spmv | 271,007 / 383,986 / 1,047,332 / 41,326 | 271,031 / 384,011 / 1,048,864 / 41,763 | +0.01 / +0.01 / +0.15 / +1.06 % (instret は同じ) |
+| cbench W4 dhrystone / coremark / fpmm / spmv | 207,210 / 316,668 / 863,724 / 32,313 | 207,221 / 316,724 / 866,089 / 32,709 | +0.01 / +0.02 / +0.27 / +1.23 % |
+| spike cosim N=1 W2 (5.15、6.6、7.1、7.1v) | 不一致 0 | 4 本 pass、不一致 0、cycle は native と一致 | |
+| spike cosim SMP N=2 W2 | 不一致 0 | pass、不一致 0、19,446,659 (native と一致) | |
+| ACT4 W2 cosim (i、pmp、zaamo、zalrsc、zacas、zabha、za64rs、zawrs、zic64b、zicbom、zicbop、zicboz) | | 207/207、不一致 0 | |
 
+- cosim、ACT4、cbench は決定の後に `04ea54b7` で回した (RTL は `3a88b97a` と同じ)。spmv の +1.06 % / +1.23 % は DRAM の miss だけの bench で、miss の AR の +1 サイクルがそのまま出る。
 - 時間関係の変化の出所 (設計書の節のとおり): L2 miss の AR が 1 サイクル遅い、DRAM の書きの grant が 1 サイクル遅い、recall の開始が 1 サイクル遅い、lookup、install、書きの grant が同じサイクルに進めない。hit の経路と、clean ack から grant までは前と同じ。cbench の途中の版 (リセットの掃き出しが入っていた版) では、DRAM の miss だけの spmv が +2.3 % (683 miss で +940)、N = 1 の self-recall が 25,000 回ある fpmm が +0.16 % だった。EC を別の op にした最初の版は fpmm が +3.6 % で、EC がその lookup を兼ねる形にして直した。uncached の ROM 読み (N=1 boot で 57,000 回、N=4 で 240 万回) は lookup をしないようにした (旧は同じサイクルで済んでいたので、op にすると +1 になる)。
 - N=4 の差の中身 (W2): base (`dc0c9cce`) を同じ機械で回し直して 24,199,767 を再現し、hart 0 の probe (2^20 サイクルごと) を比べた。2,300 万サイクルまでの遅れは record で 0.2-0.4 % (23,068,672 サイクルで 14,032,223 対 14,001,443、−30,780) で、console の出力は行の順序を除いて同じだった。遅れが伸びるのは `Run /init` の前の区間で、base は 2,350 万サイクル付近、後は 2,450 万サイクル付近で `/init` に入る。この区間は kernel が時刻で待つ区間である。mtime は 10 サイクルに 1 (MTIME_DIV = 10)、timebase は 10 MHz、CONFIG_HZ = 250 なので 1 tick は 40 万サイクルで、W2 の +1.29M は約 3 tick、W4 の +0.85M は約 2 tick に当たる。§9.14 の +797k と §9.16 の −788k (どちらも約 2 tick) と同じ形で、遅れが待ちの境界をまたいで tick 単位の待ちが増えたと見ている。正味の遅れは境界の前の 0.2-0.4 % の側という見立てだが、W4 の base の probe は取っていない。この見立てで先へ進むかは依頼の判断を待つ。
 - 一貫性: litmus N=4 の禁止された結果は W2/W4 とも 0、全 boot の checker (mem_ctrl の新しい検査「DRAM の書きが自分の line の WR op の外で grant された」を含む) は 0。

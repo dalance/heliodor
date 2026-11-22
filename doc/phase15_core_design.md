@@ -5269,6 +5269,7 @@ MI の進捗:
 - 検査: mem_ctrl の `o_chk` に「DRAM の書きが、自分の line の WR op の実行の外で grant された」を足した。
 - V6: `mem_ctrl.wb_data`/`wb_strb` の書きをリセットの無い `always_ff` に移した。読むのは AXI の W channel だけで、`o_wvalid` (書き込み buffer のエントリがある) の間だけ意味を持つ。
 - 結果は `doc/phase15_ms_logic.md` §8.10 (合成) と `doc/phase15_verification_plan.md` §9.18 (ゲート)。
+- 【決定】(2026-11-22、ユーザ) N=4 boot の +5.3 % (W2) / +3.9 % (W4) を含めて代金を受け入れた。N=4 の差は kernel の時刻待ち (1 tick = 40 万サイクル) の境界をまたいだ 2-3 tick 分で、正味は 0.2-0.4 % と見積もる。litmus N=4 W4 の +3.55 % は tag port の取り合いの代金。繰り延べたレバー (後の phase): miss と uncached の経路を tag の判定の前に投機的に出す (miss の AR の +1 を取り戻す)。
 
 ### MDOC: ユーザ向けドキュメント
 
