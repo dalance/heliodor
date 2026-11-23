@@ -2,8 +2,9 @@
 
 RV64GC RISC-V processor core written in [Veryl](https://veryl-lang.org/). Boots
 mainline Linux 5.15 (1/2/4-hart SMP) to SBI shutdown. See `README.md` for the
-architecture overview, status, and roadmap; this file covers the development
-workflow.
+status and `book/` (the user book, `book/build.sh`) for the architecture,
+configuration, SoC integration, verification and performance; this file covers
+the development workflow.
 
 ## Veryl Toolchain
 
@@ -41,6 +42,11 @@ Key commands (run the resolved `veryl` binary from the project root):
 | `veryl fmt`   | Format source files          |
 | `veryl test`  | Run native testbenches       |
 | `veryl clean` | Remove build artifacts       |
+
+`veryl build` and `veryl test` build the `cosim/spike` component declared in
+`Veryl.toml`, which links against spike: run `toolchain/fetch.sh spike` first (or
+set `SPIKE_HOME` to a spike install), else the build stops with `libriscv.so not
+found`.
 
 Refer to `veryl/testcases/veryl/` for language feature examples.
 
@@ -144,7 +150,7 @@ Pins live in `toolchain/versions.env`; keep the **ubuntu-22.04** GCC builds
   `test_cbench_w4_*` counterparts, that print cycles + retired instructions
   (IPC = instret / cycles, frozen at `tohost`). NOT a regression gate; run
   individually, e.g. `veryl test --ignored --test test_cbench_w2_coremark`. Current
-  numbers are in README.md. CoreMark runs ITERATIONS=1 with the upstream EEMBC
+  numbers are in `book/src/performance.md`. CoreMark runs ITERATIONS=1 with the upstream EEMBC
   sources vendored under `test/c/coremark/` (port layer: core_portme.*,
   start.S, link.ld; tohost at PA 0x80008000 → TOHOST_IDX 8192).
   `tb/test_bench.veryl` is the old (V14) core's bench, kept but `#[ignore]` and
@@ -220,11 +226,15 @@ Build + run (from the project root, so the harness `$readmemh` paths resolve):
 ```bash
 veryl build                                         # emit tb/*.sv + heliodor.f
 verilator --binary --top-module tb_soc_smp_linux_boot_2hart -f heliodor.f \
-          sim/verilator/tb_soc_smp_linux_boot_2hart.sv --timing -Wno-fatal -O3 \
+          sim/verilator/tb_soc_smp_linux_boot_2hart.sv +define+HELIODOR_CHK+HELIODOR_OBS \
+          --timing -Wno-fatal -O3 \
           --Mdir sim/verilator/build_n2 -o tb_soc_smp_linux_boot_2hart
 sim/verilator/build_n2/tb_soc_smp_linux_boot_2hart  # prints "... PASSED ..." on x3==0xAA
 ```
 
+The `+define+HELIODOR_CHK+HELIODOR_OBS` is required: the harnesses read the retire
+records, which exist only with `HELIODOR_OBS` (`veryl test` defines both through
+`Veryl.toml`); without them `instret` stays 0 and the run never passes.
 The 4-hart tops need `-O1 -j 2` instead of `-O3` (`-O3` ICEs on them).
 Comment lines must not start with the word `verilator` (Verilator parses
 `// verilator ...` as a pragma — `BADVLTPRAGMA`). The `build_*/` output dirs are
