@@ -5181,6 +5181,12 @@ MI の進捗:
   3. 規則に合わないものを直す。既知のもの: L2 のデータ配列 (P3.b の `L2_READ_1R1W` の完成と、merge の組合せ読みと RMW の読みの撤去)、mem_ctrl の書き込みバッファ (非同期リセット付きの配列)、rename のチェックポイントの配列。
   4. ゲートを足す: Vivado の out-of-context 合成 (N=1 W2 の SoC、L2 を含む) の完走と、使用量と RAM の推論結果の記録。Design Compiler で SRAM をブラックボックスにした合成を足すかは手順 2 で決める (【決定】(2026-11-20、ユーザ) 足す)。周波数は参考値として記録し、出口条件にしない。
 - 出口条件: 上の表の MS の行。
+- 【MS の出口条件の判定】(2026-11-23) 出口条件を満たした (完了の宣言はユーザの判断待ち)。判定は `fdecbf9f` で行い、表と数値は検証計画 §9.22。
+  - M6 の全ゲート (機能): W2 と W4 で G0、GL-B、GB1 (4 本)、GT4、GB2 (5.15、6.6、7.1)、GB4、GH、GA/GL-C、bench を回し、すべて pass。GL-B は W2/W4 とも record 10,417,784、hash `60e504ab77211f61` で MS の前と一致。cycle が変わったのは PMP の修正、CBO、BTB、L2 の作り直しの 4 つだけで、理由は §9.22 の梯子の表。充足。
+  - 棚卸し (構造): `doc/phase15_ms_inventory.md` §1 を `fdecbf9f` のソースから取り直し、全行が規則に合うことを確かめた (§3.1)。照合で見つけた 2 つ (`dcache_bank` の bit の mask の RMW、LQ/SQ/SB の payload のリセット付きの書き) は直した (`89b9114a`、`fdecbf9f`、cycle は不変)。充足。
+  - Vivado (構造): L2 込みの N=1 W2 SoC (`soc_w2_l2`) が 33 分で完走。S の配列は L2 のデータと tag、L1I のデータ、BTB が block RAM (BTB の tail は URAM)、`dcache_bank` が分散 RAM (深さ 64 で行が広いので Vivado が選んだ。記録した例外)。閾値を超える配列の FF への展開と推論の失敗は 0。充足。
+  - 大きさ: W2 SoC (L2 を black box) は MS の前から LUT −27.3 %、FF −25.0 %、W4 core は LUT −25.0 %、FF −24.8 % (`doc/phase15_ms_logic.md` §8.15)。
+  - Design Compiler の合成は出口条件に含めない (ユーザが同意)。S2 は測定の結果入れない (2026-11-23、ユーザ)。C1 の残りと L は入れない。I は繰り延べ、J と W1 は保留、D-5 は調査だけ。
 - 記録: Vivado は sandbox の中ではライセンスの取得で abort するので、sandbox の外で走らせる。veryl が出す `core_types` は tb の構成パッケージ (`cfg_bad`、`cfg_w4_sb8`) も参照するので、合成のファイル一覧にそれらを含める。
 
 - 【手順 1、2 の成果物 (2026-11-20)】棚卸しと分類規則の案は `doc/phase15_ms_inventory.md`。要点: 記憶の配列は 263 個 (`v14` を除く)。規則案は S (SRAM マクロ: 1RW/1R1W、同期読み、リセット無し、リセットの無い `always_ff` で書く)、R (FF のレジスタファイル: payload はリセットしない)、F (FF) の 3 区分で、閾値は T_S = 16 Kbit (これ以上で深さ 64 以上は S が必須)、T_R = 4 Kbit (S を推奨する帯)。違反は V1-V9: L2 のデータ配列 (V1)、L2 の tag と 4 組の複製 (V2、C/L 読みで T_S を超える。MS で最大の変更)、BTB の valid (V3、16/20 Kbit の F)、icache のデータの way 選択 (V4)、rename の checkpoint (V5)、mem_ctrl の書き込みバッファ (V6)、ROB の payload (V7) と dcache の tag 複製 (V8) のリセット付きプロセスでの書き込み、PRF と VRF の payload のリセット (V9)。新しい発見は、新しいフロントエンドの BTB (W4 で 1.22 Mbit) が L2 のデータ (1 Mbit) より大きいこと (旧コアの棚卸しには無い)。Vivado 2021.2 と Design Compiler X-2025.06-SP2 はどちらも sandbox の外で使える。

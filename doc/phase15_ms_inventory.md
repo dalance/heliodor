@@ -1,6 +1,6 @@
 # Phase 15 MS: 配列の棚卸しと分類規則 (手順 1、2)
 
-設計書 §MS の手順 1 (棚卸し) と手順 2 (分類の規則) の成果物。手順 2 の規則と閾値、違反の直し方、Design Compiler を足すかは 2026-11-20 にユーザが決めた (各節の【決定】と設計書 §MS)。本書の棚卸しは RTL を変えていない (`phase15/ms`、`e5b77300` の時点のソース)。
+設計書 §MS の手順 1 (棚卸し) と手順 2 (分類の規則) の成果物。手順 2 の規則と閾値、違反の直し方、Design Compiler を足すかは 2026-11-20 にユーザが決めた (各節の【決定】と設計書 §MS)。最初の棚卸しは `e5b77300` の時点のソースで取った。§1 は MS の出口の確認 (2026-11-23) で `fdecbf9f` のソースから取り直した表に置き換え、§2.3 に各違反の解消の commit を、§3 に出口の照合 (規則と Vivado の推論) を足した。
 
 ## 0. 方法
 
@@ -22,132 +22,107 @@
 - **リセット**: `有` は `if_reset` で全エントリを初期化する。`無(rb)` はリセットしないが、非同期リセット付きの `always_ff` (`if_reset { } else { ... }`) の中で書く。生成 SV は `always_ff @(posedge clk, negedge rst)` になり、FPGA では RAM 推論を妨げ、ASIC ではリセットを書き込み enable に混ぜる。`無` はリセットの無い `always_ff` で書く。
 - **容量**: 1 個あたりの bit 数 (W2 / W4)。N は hart 数。
 
-## 1. 棚卸し
+## 1. 棚卸し (出口の時点、`fdecbf9f`)
+
+MS の出口の確認 (2026-11-23) で、`fdecbf9f` (本書の §2.3 の V1-V9 と、`doc/phase15_ms_logic.md` の論理の整理、D-2 (PALEN 40)、F、G、H、K を入れた後) のソースから取り直した。最初の棚卸し (`e5b77300`) の表は git の履歴にある。
+
+- 方法: `src/` (`src/v14/` を除く) の `var` の配列宣言 815 個のうち、`always_ff` で書かれるもの 241 個を script で抜き出し、それぞれについて書く `always_ff` にリセットがあるか、リセットの枝で書くかを機械的に分類した。そのうえで記憶の配列をモジュールを読んで下の表にまとめた (`chk_*`、`#[ifdef(HELIODOR_CHK)]`、`HELIODOR_OBS` の中、`always_ff` の中の一時変数を除く)。
+- 幅は Verilator で `$bits` を W2 と W4 のパッケージについて取った (PALEN 40: `pma_pkg::Line` 34 bit、`ExcRec` 73 bit)。
+- 対象外は §0 と同じ。`src/mmu/` のうち新コアが使うのは `pmp_check.veryl` (組合せの検査器で記憶を持たない) だけである。
+- 「区分」は §2 の規則による分類、「形」は規則に関わるコードの形: `S1R1W` は 1 読み 1 書き、`sync` は登録済みの読み (C/R を含む)、`BE` は byte (または dword) の write enable、`whole` は語全体の書き、`noRst` はリセットの無い `always_ff` で書くこと。
 
 ### 1.1 フロントエンド
 
-| 配列 (module.signal) | 個数 | エントリ × 幅 (W2 / W4) | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 備考 |
-|---|---|---|---|---|---|---|---|
-| `bp_btb` payload (`tagv`, `s_off`, `s_ctr`, `s_tgt`, `t_off`, `t_knd`, `t_rvc`) | 1 | 4096 × 225 / 298 | 921,600 / 1,220,608 | 1 / 1 | S (`lk_pc_q` から) | 無 | 書きは field ごとの enable (slot ごとの ctr と target)。W4 は slot が 2 から 3 に増え、FOFF_W が 3 から 4 になる |
-| `bp_btb` valid (`vld`, `s_v[slot]`, `t_v`) | 1 | 4096 × 4 / 5 | 16,384 / 20,480 | 1 / 1 | S | 有 | 全エントリのリセット |
-| `bp_ras.stk_q` | 1 | 16 / 32 × 64 | 1,024 / 2,048 | 1 / 1 | C/L | 無 | |
-| `ftq.e_*` (start 64, pred 71/72, meta 17/27, ckpt 68/69, pd 32/64, res 71/72, last 3/4) | 1 | 32 × 326 / 372 | 10,432 / 11,904 | 4 / E(3) | C/L | 無 | field ごとに読みの口数が違う (start 4、pred/pd/res 3、meta/ckpt 2) |
-| `icache_array.data_0..3` | 4 (way) | 256 × 256 | 65,536 | 1 / 1 | C/R | 無 | 読みは `i_req.pa` (cycle A)。way は同じサイクルの tag 比較で選んでから読む。書きは 64 bit の slot mask の RMW 形 |
-| `icache_array.tags_0..3` | 4 (way) | 128 × 43 | 5,504 | 1 / 1 | C/L | 無 | |
-| `icache_array.valid_0..3` | 4 | 128 × 1 | 128 | 2 / 2 + 一斉クリア | C/L | 有 | FENCE.I で全エントリを 0 にする |
-| `icache_array.plru` | 1 | 128 × 3 | 384 | 1 / 2 | C/L | 有 | |
-| `icache.ubuf_q` | 1 | 2 / 4 × 64 | 128 / 256 | A / 1 | — | 無 | |
-| `lane_queue.buf_q` (`ifu` FBQ, FetchBlk) | 1 | 4 × 440 / 629 | 1,760 / 2,516 | 1 / 1 | C/L | 無 | |
-| `lane_queue.buf_q` (`extract` DQ, XOp) | 1 | 8 / 16 × 265 / 266 | 2,120 / 4,256 | FW / E(FW) | C/L | 無 | 口数は lane 数 (W2 2、W4 4) |
-| `lane_queue.buf_q` (core RQ, DecOp) | 1 | 4 / 8 × 278 / 279 | 1,112 / 2,232 | RW / E(RW) | C/L | 無 | |
+| 配列 | 個数 | エントリ × 幅 (W2 / W4) | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 区分 | 備考 |
+|---|---|---|---|---|---|---|---|---|
+| `bp_btb.vt_q` (`vld`、`tag`) | 1 | 4096 × 17 | 69,632 | 1 / 1 | S | 無 | S | 書きの組 (§2.3 の V3、`doc/phase15_ms_logic.md` §8.1) ごとに 1 つの配列。whole の書き。valid は行に入り、リセット後の 4096 サイクルの掃き出しで消す |
+| `bp_btb.tx_q` (tail の `t_off`、`t_knd`、`t_rvc`、`t_tgt`) | 1 | 4096 × 30 / 31 | 122,880 / 126,976 | 1 / 1 | S | 無 | S | |
+| `bp_btb.tv_q` (tail の valid) | 1 | 4096 × 1 | 4,096 | 1 / 1 | S | 無 | S | |
+| `bp_btb.g_slot.sv_q`、`so_q`、`sc_q`、`st_q` | slot 数 2 / 3 | 4096 × 1、3 / 4、2、15 | 4,096、12,288 / 16,384、8,192、61,440 | 1 / 1 | S | 無 | S | slot ごと、field ごとの配列 |
+| `bp_ras.stk_q` | 1 | 16 / 32 × 64 | 1,024 / 2,048 | 1 / 1 | C/L | 無 | R | |
+| `ftq.e_*` (start 64、pred 71/72、meta 17/27、ckpt 68/69、pd 32/64、res 71/72、last 3/4) | 1 | 32 × 326 / 372 | 10,432 / 11,904 | 4 + CW / E(3) | C/L | 無 | R | 深さ 32。G で commit の読み口 (`e_res.target`) が増えた |
+| `icache_data_bank.mem_q` (`icache_array.g_data`) | 4 (way) | 256 × 256 | 65,536 | 1 / 1 | S | 無 | S | V4 (`dfd6ad1a`)。4 way を並列に読み、次のサイクルに way を選ぶ。dword の BE。read-old |
+| `icache_array.tags_0..3` | 4 (way) | 128 × 27 | 3,456 | 1 / 1 | C/L | 無 | R | 同じサイクルのヒット判定に要る |
+| `icache_array.valid_0..3`、`plru` | 5 | 128 × 1、128 × 3 | 128、384 | 2 / 2 + 一斉クリア | C/L | 有 | F | FENCE.I で全エントリを消す |
+| `icache.ubuf_q` | 1 | 2 / 4 × 64 | 128 / 256 | A / 1 | — | 無 | F | |
+| `lane_queue.buf_q` (FBQ、FetchBlk) | 1 | 4 × 371 / 560 | 1,484 / 2,240 | 1 / 1 | C/L | 無 | R | |
+| `lane_queue.buf_q` (DQ、XOp) | 1 | 8 / 16 × 196 / 197 | 1,568 / 3,152 | FW / E(FW) | C/L | 無 | R | F で 64 bit の tval が無くなった |
+| `lane_queue.buf_q` (RQ、DecOp) | 1 | 4 / 8 × 209 / 210 | 836 / 1,680 | RW / E(RW) | C/L | 無 | R | |
 
 ### 1.2 rename、スケジューラ、レジスタファイル
 
-| 配列 | 個数 | エントリ × 幅 | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 備考 |
-|---|---|---|---|---|---|---|---|
-| `rename.spec_q` | 1 | 64 × 7 / 8 | 448 / 512 | A / E | C/L | 有 | 投機 RAT |
-| `rename.arch_q` | 1 | 64 × 7 / 8 | 448 / 512 | A / E | C/L | 有 | |
-| `rename.img_q` (checkpoint) | 1 | 4 / 8 × (64 × 7 / 8) | 1,792 / 4,096 | 1 row / 1 row | C/L | 無(rb) | 1 行 = RAT 全体の像。書きも読みも行単位 |
-| `rename.own_q` | 1 | 4 / 8 × 7 / 8 | 28 / 64 | A / E | — | 有 | |
-| `free_list.ent_q` (int) | 1 | 64 / 128 × 7 / 8 | 448 / 1,024 | RW / CW | C/L | 有 | 初期値 (空きの物理レジスタ番号) が要る |
-| `free_list.ent_q` (fp) | 1 | 32 / 64 × 7 / 8 | 224 / 512 | RW / CW | C/L | 有 | |
-| `iq` (`st_q`, `port_q`, `tag_q`, `fu_q`, `sen_q`, `spr_q`, `srdy_q`, `barw_q`) | 2 / 3 | 24, 16 / 32, 24, 24 × 約 60 | 約 1,500 / 約 1,900 | A / E | C/L | 一部有 | wakeup の比較 (`spr_q`) と選択は全エントリ |
-| `iq.cold_q` | 2 / 3 | 同上 × 64 / 67 | 1,536, 1,024 / 2,144, 1,608, 1,608 | 発行ポート数 / E | C/L | 無 | 発行時に選んだエントリから読む |
-| `prf.rf_q` (int) | 1 | 96 / 160 × 64 | 6,144 / 10,240 | 6+2 / 3 → 13+2 / 7 | C/L | 有 | R の +2 は VU の scalar 読み (§X.2 の表の外)。書きは WB ポート |
-| `prf.rf_q` (fp) | 1 | 64 / 96 × 64 | 4,096 / 6,144 | 4+1 / 2 → 8+1 / 4 | C/L | 有 | |
-| `vrf.vrf` | 1 | 32 × 128 | 4,096 | 4 / 1 | C/L | 有 | 全エントリを 0 にリセット |
-| `exec_port.wl_q`, `hist_q` | ポート数 | 数エントリ | < 200 | 小 | — | 有 | |
+| 配列 | 個数 | エントリ × 幅 (W2 / W4) | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 区分 | 備考 |
+|---|---|---|---|---|---|---|---|---|
+| `rename.spec_q`、`arch_q` | 2 | 64 × 7 / 8 | 448 / 512 | A / E | C/L | 有 | F | |
+| `rename.img_q` (checkpoint) | 1 | 4 / 8 行 × (64 × 7 / 8) | 1,792 / 4,096 | 1 行 / 1 行 | C/L | 無 | R | V5 (`499e771d`)。深さ 4 / 8 |
+| `rename.own_q` | 1 | 4 / 8 × 7 / 8 | 28 / 64 | A / E | — | 有 | F | |
+| `free_list.ent_q` (int / fp) | 2 | 64 / 128 × 7 / 8、32 / 64 × 7 / 8 | 448 / 1,024、224 / 512 | RW / CW | C/L | 有 | F | 初期値 (空きの番号) が要る |
+| `iq` の payload (`port_q`、`tag_q`、`fu_q`、`sen_q`、`spr_q`、`srdy_q`、`barw_q`、`cold_q`) | 2 / 3 | 24、16 / 32、24、24 × 約 120-130 | 約 3,000 / 約 4,200 | A / E | C/L | 無 | F | wakeup の比較と選択は全エントリ。`st_q` などの状態はリセット付きの F |
+| `prf.rf_q` (int) | 1 | 96 / 160 × 64 | 6,144 / 10,240 | issue + VU の scalar / WB の数 | C/L | 無 | R | V9 (`fe485d78`)。p0 は読みで 0 に固定。T_R の帯 (§2.3 の V10) |
+| `prf.rf_q` (fp) | 1 | 64 / 96 × 64 | 4,096 / 6,144 | 同上 | C/L | 無 | R | 同上 |
+| `vrf.vrf` | 1 | 32 × 128 | 4,096 | 4 / 1 | C/L | 無 | R | V9。深さ 32 |
+| `exec_port.wl_q`、`hist_q` | ポート数 | 数エントリ | < 200 | 小 | — | 有 | F | |
 
 ### 1.3 ROB、commit、CSR、debug
 
-| 配列 | 個数 | エントリ × 幅 | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 備考 |
-|---|---|---|---|---|---|---|---|
-| `rob.ent_q` | 1 | 64 / 128 × 93 / 98 | 5,952 / 12,544 | 6 / E(2) → 12 / E(4) | C/L | 無(rb) | 読み = commit の CW + walk の 2 × WALK_W。書き = dispatch の RW lane |
-| `rob.snap_q` | 1 | 64 / 128 × 36 / 42 | 2,304 / 5,376 | 1 / E(RW) | C/L | 無(rb) | |
-| `rob.obs_q` | 1 | 64 / 128 × 64 | 4,096 / 8,192 | CW / E(WB_N + 1) | C/L | 無(rb) | WB_N は 3 / 8 |
-| `rob.res_q` | 1 | 64 / 128 × 66 | 4,224 / 8,448 | CW / E(BRU 数) | C/L | 無(rb) | |
-| `rob.ffl_q` | 1 | 64 / 128 × 5 | 320 / 640 | CW / E | C/L | 無(rb) | |
-| `rob.done_q`, `rec_q` | 1 | 64 / 128 × 1 | 64 / 128 | CW / E | C/L | 有 | |
-| `rob.walk_q` | 1 | RW × 14 / 15 | < 100 | — | — | 有 | |
-| `commit.ret_q`, `rx_q`, `pc` | 1 | CW × 小 | < 1,000 | — | — | 一部有 | |
-| `csr.mhpmcounter` | 1 | 32 × 64 | 2,048 | A / E | — | 有 | 各カウンタが毎サイクル独立に増える |
-| `csr.mhpmevent` | 1 | 32 × 64 | 2,048 | 3 / 2 | C/L | 有 | |
-| `csr.pmpaddr`, `pmpcfg` | 1 | 16 × 64, 2 × 64 | 1,024, 128 | A / 1 | — | 有 | PMP 照合は全エントリ |
-| `trig_unit.tr_q` | 1 | 2 / 4 × Trig | < 600 | A / 1 | — | 有 | |
+| 配列 | 個数 | エントリ × 幅 (W2 / W4) | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 区分 | 備考 |
+|---|---|---|---|---|---|---|---|---|
+| `rob.ent_q` | 1 | 64 / 128 × 93 / 98 | 5,952 / 12,544 | CW + 2 × WALK_W / E(RW) | C/L | 無 | R | V7 (`1c219a0c`)。T_R の帯 (V10) |
+| `rob.snap_q` | 1 | 64 / 128 × 36 / 42 | 2,304 / 5,376 | 1 / E(RW) | C/L | 無 | R | V7。W4 は T_R の帯 (V10) |
+| `rob.res_q` (`mispred`、`taken`) | 1 | 64 / 128 × 2 | 128 / 256 | CW / E(BRU 数) | C/L | 無 | R | G (`9e534856`) で next_pc 64 bit を外した |
+| `rob.ffl_q` | 1 | 64 / 128 × 5 | 320 / 640 | CW / E | C/L | 無 | R | V7 |
+| `rob.done_q`、`rec_q` | 2 | 64 / 128 × 1 | 64 / 128 | CW / E | C/L | 有 | F | |
+| `rob.walk_q`、`commit.pc` など | 1 | 小 | < 1,000 | — | — | 有 | F | `rob.obs_q`、`commit.ret_q`、`rx_q` は `HELIODOR_OBS`/`HELIODOR_CHK` の中で合成の対象外 |
+| `csr.hpmc_q`、`hpme_q` | 2 | 29 × 64 | 1,856 | A / 1 | — | 有 | F | C1 (`b7b2c821`) で 0-2 を外した。カウンタは毎サイクル独立に増える |
+| `csr.pmpaddr`、`pmpcfg` | 1 | 16 × 64 (PALEN 40 で生きている bit は 38)、2 × 64 | 1,024、128 | A / 1 | — | 有 | F | PMP の decode は全エントリ |
+| `trig_unit.tr_q` | 1 | 2 / 4 × Trig | < 600 | A / 1 | — | 有 | F | |
 
 ### 1.4 LSU と dcache
 
-| 配列 | 個数 | エントリ × 幅 | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 備考 |
-|---|---|---|---|---|---|---|---|
-| `lq.e_*` (va 64、line0/1 50+50、lm0/1 64+64、ex、op、sqlim、key、fid、dw、flags) | 1 | 32 / 64 × 約 345 | 約 11,000 / 約 22,000 | A / E(MEM_W + 1) | C/L | 無(rb) | 順序違反の検出と wakeup は全エントリの比較。field ごとの最大は `e_lm0`/`e_lm1` の 2,048 / 4,096 |
-| `lq.e_xexc` | 1 | 32 / 64 × 142 | 4,544 / 9,088 | 1 / E | C/L | 有 | 読みは `rsel_q` だけ |
-| `sq.e_*` (rob、lqlim、op、va、line0/1、dw0、m16、data 128、flags) | 1 | 16 / 32 × 約 348 | 約 5,600 / 約 11,100 | A / E(MEM_W + 1) | C/L | 無(rb) | forwarding は全エントリの比較 |
-| `sq.e_xexc` | 1 | 16 / 32 × 142 | 2,272 / 4,544 | 1 / E | C/L | 有 | |
-| `sb.e_line`, `e_data`, `e_strb` | 1 | 8 / 16 × 626 | 5,008 / 10,016 | A / E | C/L | 無(rb) | forwarding と write-combining (RMW) は全エントリ。最大の field は `e_data` 4,096 / 8,192 |
-| `atomic_unit.preg_q`, `cval_q`、`mem_port_arb`、`ptw.q_*` | 各 1 | 数エントリ | < 600 | 小 | — | 一部有 | |
-| `tlb.ent_q` (D) | 1 | 32 × 123 | 3,936 | A / 1 | — | 無 (v_q は有) | 全エントリの比較 |
-| `tlb.ent_q` (I) | 1 | 16 × 123 | 1,968 | A / 1 | — | 無 (v_q は有) | |
-| `dcache_bank.mem_q` (data) | DC_NB = 2 / 4 | 64 × 1,024 / 512 | 65,536 / 32,768 | 1 / 1 | S | 無 | 行 = 1 set の全 way の、その bank の dword。書きは byte mask の RMW 形。読み出しレジスタは同じ行への書きを前方転送する |
-| `dcache_tagbank.tags_0..3` (dcache の tag 複製) | 4 (way) × TC_N = 6 / 7 | 64 × 44 | 2,816 | 1 / 1 | C/L | 無(rb) | 読み手ごとの複製 (TC_N = MEM_W + 5)。合計 67,584 / 78,848 |
-| `dcache_tags.valid_q`, `excl_q`, `dirty_q` | 各 1 | 64 × 4 | 256 | TC_N / 1 + CLR_N 5 + MRK_N 2 | C/L | 有 | |
-| `dcache_tags.plru_q` | 1 | 64 × 3 | 192 | TC_N / MEM_W + 1 | C/L | 有 | |
-| `dcache_mshr.*` | 1 | MSHR_N = 2 × 小 | < 300 | A / E | — | 一部有 | |
-| `dcache.wb_data_q`、`s1_*`、`resp_q` | 1 | 8 × 64、MEM_W × 小 | 512 他 | — | — | 一部有 | |
+| 配列 | 個数 | エントリ × 幅 (W2 / W4) | 容量 / 個 (W2 / W4) | R / W | 読みの型 | リセット | 区分 | 備考 |
+|---|---|---|---|---|---|---|---|---|
+| `lq.e_*` の payload (wrap、ex、op、sqlim、va 64、line0/1 34+34、dw、why、fid、key) | 1 | 32 / 64 × 181 / 185 | 5,792 / 11,840 | A / E(RW + 2 × MEM_W) | C/L | 無 | F | `fdecbf9f` でリセットの無い `always_ff` へ (§2.3 の注の決定)。順序違反の scan と wakeup は全エントリ。H (`8a4dfb73`) で `e_lm0/1` を外した |
+| `lq` の状態 (state、seen0/1、half、io、ioord、dram、poison) と `e_xexc` (ExcRec 73) | 1 | 32 / 64 × 10 + 73 | 2,656 / 5,312 | A / E | C/L | 有 | F | `e_xexc` は確保で 0 にする (valid が機能に要る) |
+| `sq.e_*` の payload (wrap、rob、lqlim、op、va 64、line0/1、dw0、m16、data 120、rhalf) | 1 | 16 / 32 × 298 / 300 | 4,768 / 9,600 | A / E(RW + 2 × MEM_W) | C/L | 無 | F | `fdecbf9f` でリセットの無い `always_ff` へ。K (`b53de1e3`) で data を 120 bit に |
+| `sq` の状態 (cross、av0/1、exc、dv、rdy、xw、dw、full、io、ioord、dram、wtd) と `e_xexc` | 1 | 16 / 32 × 13 + 73 | 1,376 / 2,752 | A / E | C/L | 有 | F | |
+| `sb.e_line`、`e_wrap`、`e_data`、`e_strb` | 1 | 8 / 16 × 611 | 4,888 / 9,776 | A / E | C/L | 無 | F | `fdecbf9f` でリセットの無い `always_ff` へ。深さ 8 / 16。forwarding と write-combining は全エントリ |
+| `atomic_unit.preg_q`、`cval_q`、`mem_port_arb`、`ptw.q_*`、`dcache_mshr.*`、`dcache.s1_*`、`resp_q`、`wb_data_q` | 各 1 | 数エントリ | < 1,000 | 小 | — | 一部有 | F | |
+| `tlb.ent_q` (D / I) | 2 | 32 × 107、16 × 107 | 3,424、1,712 | A / 1 | — | 無 (v_q は有) | F | 全エントリの比較 |
+| `dcache_bank.mem_q` (`dcache_data.g_bank`) | DC_NB = 2 / 4 | 64 × 1,024 / 512 | 65,536 / 32,768 | 1 / 1 | S | 無 | S | 行 = 1 set の全 way の、その bank の dword。`89b9114a` で bit の mask の RMW から byte の BE に。同じ行への書きは読み出しレジスタへ前方転送 (ヘッダに記載) |
+| `dcache_tagbank.tags_0..3` (dcache の tag 複製) | 4 (way) × TC_N 6 / 7 | 64 × 28 | 1,792 | 1 / 1 | C/L | 無 | R | V8 (`c3b86c8c`)。読み手ごとの複製 |
+| `dcache_tags.valid_q`、`excl_q`、`dirty_q`、`plru_q` | 4 | 64 × 4、64 × 3 | 256、192 | TC_N / 複数 + 一斉クリア | C/L | 有 | F | |
 
 ### 1.5 VU
 
-| 配列 | 個数 | エントリ × 幅 | 容量 / 個 | R / W | 読みの型 | リセット | 備考 |
-|---|---|---|---|---|---|---|---|
-| `vector_unit.fifo_*` (op、instr、vd/vs1/vs2、pdst、tag ...) | 1 | 8 × 約 140 | 約 1,100 | 1 / 1 | C/L | 有 | 命令 FIFO。W2 と W4 で同じ |
-| `vu_adapter.lastm_q` | 1 | 32 × 64 | 2,048 | 1 / 2 | C/L | 有 | |
-| `vrf.vrf` | 1 | 32 × 128 | 4,096 | 4 / 1 | C/L | 有 | (1.2 に再掲) |
+| 配列 | 個数 | エントリ × 幅 | 容量 / 個 | R / W | 読みの型 | リセット | 区分 | 備考 |
+|---|---|---|---|---|---|---|---|---|
+| `vector_unit.fifo_*` | 1 | 8 × 約 140 | 約 1,100 | 1 / 1 | C/L | 有 | F | 命令 FIFO。W2 と W4 で同じ |
+| `vu_adapter.lastm_q` | 1 | 32 × 64 | 2,048 | 1 / 2 | C/L | 有 | F | |
+| `vrf.vrf` | 1 | 32 × 128 | 4,096 | 4 / 1 | C/L | 無 | R | (§1.2 に再掲) |
 
-### 1.6 SoC (L2、mem_ctrl、AXI、周辺、debug module)
+### 1.6 SoC (L2、mem_ctrl、周辺、debug module)
 
-| 配列 | 個数 | エントリ × 幅 | 容量 / 個 | R / W | 読みの型 | リセット | 備考 |
-|---|---|---|---|---|---|---|---|
-| `l2cache.data_0..3` | 4 (way) | 512 × 512 | 262,144 | 1 (+2) / 1 (+2) | C/R | 無(rb) | 既定 (`L2_SYNC_READ = 1`、`L2_PORTS_1R1W = 1`、`L2_READ_1R1W = 0`) で生きている口は、lookup の読み 1 (`c_index`、結果は `c_line_q`) と書き 1 (merge と install を 1 口に束ねた byte mask の RMW 形)。括弧内は const で死んでいるが生成 SV に残る口 (`w_index` の merge 読み、`rd_index` の spec 読み、merge と install の別々の書き)。way は同じサイクルの tag 比較 (`ctm_*`) で選んでから読む |
-| `l2cache.tag_0..3` (install 用) | 4 (way) | 512 × 49 | 25,088 | 1 / 1 | C/L | 無(rb) | |
-| `dcache_tagbank` (L2 の tag 複製 `u_l2tag_e`、`_c`、`_w`、`_nxt`) | 4 (way) × 4 | 512 × 49 | 25,088 | 1 / 1 | C/L | 無(rb) | install 用と合わせて tag は 5 組 (way あたり 125,440 bit、合計 501,760 bit) |
-| `l2cache.lv_0..3` | 4 | 512 × 1 | 512 | 5 / 4 | C/L | 有 | |
-| `l2cache.own_0..3` | 4 | 512 × 1 | 512 | 4 / 6 | C/L | 有 | |
-| `l2cache.shr_0..3` | 4 | 512 × N | 512 × N | 4 / 6 | C/L | 有 | |
-| `l2cache.plru` | 1 | 512 × 3 | 1,536 | 3 / 4 | C/L | 有 | |
-| `mem_ctrl.buf_q` (slot ごと) | 2N + 1 | 8 × 64 | 512 | 2 / 1 | C/L | 有 | slot の gather buffer |
-| `mem_ctrl.wb_data`、`wb_strb` | 1 | 8 × WB_N × (64 + 8) (WB_N = 2N) | 1,152 × N (N = 1 で 1,152、N = 4 で 4,608) | 1 / 1 row | C/R (`wb_w` と `w_lane` は登録済み) | 有 | AXI の書き込みバッファ。`wb_v`、`wb_line`、`wb_lo`、`wb_hi` は小さい制御 |
-| `mem_ctrl.acc_wait_q` ほか | slot 数 | 小 | < 100 | — | — | 有 | |
-| `memory_bus` | — | — | — | — | — | — | 記憶の配列は無い (選択器だけ) |
-| `clint.mtimecmp`、`msip` | 1 | N × 64、N × 1 | 64N | 2 / 2 | C/L | 有 | |
-| `plic.prio`、`enable`、`threshold`、`claimed` | 1 | 32 × 3、2N × 32、2N × 3、2N × 5 | < 600 | A / 小 | — | 有 | |
-| `dm.pbuf_q`、`hgrp_q`、`rgrp_q` | 1 | 8 × 32、N × 小 | 256 他 | 2 / 2 | C/L | 有 | progbuf |
+| 配列 | 個数 | エントリ × 幅 | 容量 / 個 | R / W | 読みの型 | リセット | 区分 | 備考 |
+|---|---|---|---|---|---|---|---|---|
+| `l2_data_bank.mem_q` (`l2cache.gen_data`) | 4 (way) | 512 × 512 | 262,144 | 1 / 1 | S | 無 | S | V1 (`5e1ff8a8`)。4 way を同じ index で並列に読み、登録した tag の比較で選ぶ。byte の BE。read-old |
+| `l2_tag_bank.mem_q` (`l2cache.gen_tag`) | 4 (way) | 512 × (25 + N + 1) | 13,824 (N = 1) / 15,360 (N = 4) | 1 / 1 | S | 無 | S | V2/C (`3ffdf899`)。tag と directory (own、shr) の語。登録した前方転送は配列の外 |
+| `l2cache.gen_tag.lv_q` (line の valid)、`plru` | 4 + 1 | 512 × 1、512 × 3 | 512、1,536 | 1 / 1 | C/L | 有 | F | valid はリセットで消す (掃き出しにすると reset から最初の命令までが延びる、`doc/phase15_verification_plan.md` §9.18) |
+| `mem_ctrl.buf_q` (slot ごと) | 2N + 1 | 8 × 64 | 512 | 2 / 1 | C/L | 有 | F | |
+| `mem_ctrl.wb_data`、`wb_strb` | 1 | 8 × 2N × (64 + 8) | 1,152 × N | 1 / 8 lane | C/R | 無 | R | V6 (`3a88b97a`) |
+| `mem_ctrl.acc_wait_q`、`wb_v`、`wb_line` ほか | slot 数 | 小 | < 300 | — | — | 有 | F | |
+| `clint.mtimecmp`、`msip`、`plic.*`、`dm.pbuf_q`、`hgrp_q`、`rgrp_q` | 各 1 | 小 | < 600 | 小 | C/L | 有 | F | |
 
-`dm_mem` の ROM (`dm_rom_pkg`) は定数の関数で、記憶の配列ではない。
+### 1.7 集計 (出口の時点)
 
-### 1.7 W2 と W4 で口数か読みの型が変わるもの
-
-| 配列 | W2 | W4 |
+| 区分 | 配列 | 規則との照合 |
 |---|---|---|
-| `prf.rf_q` (int / fp) | 6+2 R 3 W / 4+1 R 2 W | 13+2 R 7 W / 8+1 R 4 W |
-| `rob.ent_q` | 6 R、2 lane の書き | 12 R、4 lane の書き |
-| `rob.obs_q` | 2 R、4 源の書き | 4 R、9 源の書き |
-| `dcache_bank` | 2 bank × 1,024 bit の行 | 4 bank × 512 bit の行 (容量は同じ 128 Kbit) |
-| `dcache_tagbank` (dcache) | 6 複製 | 7 複製 |
-| `iq` | 2 個 (24, 16) | 3 個 (32, 24, 24) |
-| `lane_queue` (DQ、RQ) | 2 lane の入出力 | 4 lane の入出力 |
-| `bp_btb` payload | slot 2 (225 bit) | slot 3 (298 bit) |
-| `rename.img_q` | 4 行 × 448 bit | 8 行 × 512 bit |
+| S | `bp_btb` の書きの組 (W2 11 個、W4 14 個)、`icache_data_bank` × 4、`dcache_bank` × 2 / 4、`l2_data_bank` × 4、`l2_tag_bank` × 4 | すべて 1R1W、登録済みの読み、リセット無し、1 つの書き込み文、whole か BE の書き、ヘッダに読みと書きの衝突時の値 (S1-S5) |
+| R | `prf` × 2、`vrf`、`rob` の payload 4 本、`ftq`、`rename.img_q`、`lane_queue` × 3、`icache_array.tags`、`dcache_tagbank` (dcache)、`mem_ctrl.wb_data/wb_strb`、`bp_ras` | すべて T_S 未満、payload はリセット無しの `always_ff` (R1-R4)。T_R の帯の行は §2.3 の V10 に理由 |
+| F | 残り | すべて T_S 未満 (F1)。最大は `lq` の payload (W4 11,840) |
 
-読みの型 (S、C/R、C/L、A) が W2 と W4 で変わる配列は無い。
+T_S (16 Kbit、深さ 64 以上) を超える配列は、S の配列だけである。最大の R は W4 の `rob.ent_q` (12,544)。
 
-### 1.8 集計
-
-| 区分 (下の §2 の規則案で分類) | 行数 | 主なもの |
-|---|---|---|
-| S (SRAM マクロ) | 5 | `bp_btb` payload、`icache_array.data`、`dcache_bank`、`l2cache.data`、`l2cache.tag` と L2 の tag 複製 (4 組)。§2.3 の V3 を採れば `bp_btb` valid も S に入る |
-| R (レジスタファイル) | 17 | `prf` (int/fp)、`vrf`、`rob` の payload 5 本、`ftq`、`rename.img_q`、`lane_queue` 3 種、`iq.cold_q`、`icache_array.tags`、`dcache_tagbank` (dcache)、`mem_ctrl.wb_data/wb_strb`、`lq.e_xexc`、`sq.e_xexc`、`vu_adapter.lastm_q`、`bp_ras` |
-| F (FF) | 残り (約 35 行) | 連想読みの `lq`/`sq`/`sb`/`tlb`/`iq`/`pmp`、リセットや一斉クリアの要る valid、PLRU、カウンタ、ディレクトリのビット |
-
-大きい順 (1 個あたり、W4): `bp_btb` payload 1.22 Mbit、`l2cache.data` 256 Kbit × 4、`icache_array.data` 64 Kbit × 4、`dcache_bank` 32 Kbit × 4 (W2 は 64 Kbit × 2)、`l2cache.tag` 25 Kbit × 4 × 5 組、`bp_btb` valid 20 Kbit、`rob.ent_q` 12.5 Kbit、`ftq` 11.9 Kbit、`prf` int 10 Kbit、`sb` 10 Kbit (F)、`lq.e_xexc` 9 Kbit。合計で見ると、旧コアの棚卸しに無かった `bp_btb` (新しいフロントエンドの BTB、W4 で 1.2 Mbit) が L2 のデータ (1 Mbit) より大きい。
+W2 と W4 で区分か読みの型が変わる配列は無い。容量は `bp_btb` (slot 数と FOFF_W)、`dcache_bank` (bank 数。総量は同じ 128 Kbit)、ROB/LQ/SQ/SB/PRF/IQ の深さで変わる。
 
 ## 2. 分類の規則 (2026-11-20 に決定)
 
@@ -192,6 +167,23 @@
 - `dcache_bank` (S): 書きが RMW 形で、読み出しレジスタの前方転送も mask を使う。Vivado が byte enable の 1R1W と認識するかは手順 4 の合成で確かめる。認識しなければ書き込みを byte ごとの `if` の形に書き換える (値は同じ)。
 - F に分類した `lq`/`sq`/`sb` の payload はリセット付きの `always_ff` の中で書かれる (無(rb))。F なので規則違反ではないが、FPGA ではリセットを clock enable に混ぜる論理が増える。【決定】(2026-11-20、ユーザ) 手順 3 でこれらの payload の書きもリセットの無い `always_ff` に移す。
 
+解消の状況 (MS の出口、2026-11-23):
+
+| # | 状態 | commit |
+|---|---|---|
+| V1 | 解消。way ごとの `l2_data_bank` (1R1W、byte の BE、登録済みの読み、リセット無し)。死んだ scaffold も消した | `5e1ff8a8` |
+| V2 | 解消 (案 a)。tag と directory を way ごとの `l2_tag_bank` 1 組にまとめ、tag port を 1 段のパイプラインにした。複製 4 組は消えた。line の valid と PLRU はリセット付きの F に残した | `3ffdf899` |
+| V3 | 解消。valid を BTB の行に入れ、リセット後に掃き出す。行を書きの組ごとの配列に分けて block RAM に推論させた | `b4b85f3a`、`7a1c74d3` |
+| V4 | 解消。4 way を並列に読み、dword の BE で書く `icache_data_bank` | `dfd6ad1a` |
+| V5 | 解消 | `499e771d` |
+| V6 | 解消 | `3a88b97a` |
+| V7 | 解消 (`obs_q` は `HELIODOR_OBS` の中) | `1c219a0c` |
+| V8 | 解消。dcache の tag の複製は LUTRAM に推論される | `c3b86c8c` |
+| V9 | 解消。初期状態の差はゲートに出ず、tb の初期化は要らなかった | `fe485d78` |
+| V10 | 記録のまま。`icache_array.tags` は PALEN 40 で 3,456 bit になり T_R を下回った。`lq.e_xexc` は F の縮小で 2,336 / 4,672 bit になり、確保で 0 にする (valid が機能に要る) ので F に分類し直した。出口の時点で T_R の帯にある R は `prf` (int 6,144 / 10,240、fp 4,096 / 6,144)、`rob.ent_q` (5,952 / 12,544)、`rob.snap_q` (W4 5,376)、`ftq` (10,432 / 11,904)、`rename.img_q` (W4 4,096)、`vrf` (4,096) で、どれも多ポート (PRF、ROB) か深さ 64 未満 (FTQ、checkpoint、VRF) で 1R1W の S にできない | — |
+| 注の `dcache_bank` | 解消。出口の照合で、書きが bit の mask の RMW のままだと分かり、byte の BE にした (§3.1) | `89b9114a` |
+| 注の LQ/SQ/SB | 解消。出口の照合で、決定が未実施だと分かり、payload の書きをリセットの無い `always_ff` に移した (§3.1) | `fdecbf9f` |
+
 ### 2.4 Vivado と Design Compiler (ツールの確認と提案)
 
 | ツール | 場所 | 確認したこと |
@@ -206,3 +198,34 @@
 - 得るもの: ASIC で問題になる構造 (latch の推論、組合せループ、多重駆動、巨大な FF 配列) の検出と、R と F の実際の面積。Vivado は FPGA の推論しか見ないので、`C/R` を FPGA の block RAM の出力レジスタが吸収して ASIC で破綻するような差は DC でしか見えない。
 - 代金: 合成スクリプトの保守、ライセンスの占有、実行時間 (SoC 全体で数時間の見込み、未測定)。ゲートの頻度は節目ごと (MS の出口と以後のメモリ系の変更) にする案。
 - 足さない場合: Vivado の推論結果 (RAM と FF の内訳) だけを出口条件にし、ASIC の面積は記録しない。
+
+【変更】(MS の途中、ユーザ) Design Compiler の合成は MS の出口条件に含めない。出口は Vivado の推論結果 (§3.2) で判定する。S の配列はそれぞれ専用の 1R1W のモジュール (`l2_data_bank`、`l2_tag_bank`、`icache_data_bank`、`dcache_bank`) か、`bp_btb` の中の 1R1W の配列になっており、ASIC の macro への差し替えはこの境界で行える。
+
+## 3. 出口の照合 (2026-11-23、`fdecbf9f`)
+
+### 3.1 規則との照合 (設計書の MS の出口条件の 2)
+
+§1 の全行を §2 の規則に当てた。結果: すべての行が規則に合う。
+
+- 照合で見つけて直したもの (どちらも値とサイクルを変えない。ゲートは `doc/phase15_verification_plan.md` §9.22):
+  - `dcache_bank` (S): 書きが bit の mask の RMW (`(mem & ~mask) | (data & mask)`) のままで、2026-11-20 の「S 類に bit の mask の RMW をしない」規則 (`doc/phase15_ms_logic.md` §7) に反していた。mask はもともと byte 単位 (`dcache_data` の `row_mask` が byte の bit を 8 回並べる) なので、port を byte の write enable (`i_wbe`) にし、書きと前方転送を byte ごとの形にした。読み出しレジスタのリセットも外した (`89b9114a`)。
+  - `lq`、`sq`、`sb` の payload (F): §2.3 の注の決定 (2026-11-20、リセットの無い `always_ff` に移す) が入っていなかった。payload の書きをリセット付きのプロセスから外し、エントリの状態 (リセットの要るビット) だけを残した (`fdecbf9f`)。
+- 残る例外 (規則に合うが記録しておくもの): `dcache_bank` は FPGA では block RAM でなく LUTRAM に推論される (§3.2)。深さ 64 で行が 1,024 / 512 bit と広く、block RAM にすると RAMB36 を 15 個前後並べて深さの 1/8 しか使わないので、Vivado の選択は面積の上で正しい。S の規則 (1R1W、登録済みの読み、リセット無し、BE の書き) には合っており、ASIC では SRAM の macro に置ける形である。前方転送は読み出しレジスタの前にあり、macro にするときは前方転送の data を登録する形 (`l2_tag_bank` と同じ) に移す。
+
+### 3.2 Vivado の推論 (出口条件の 3、4)
+
+合成は `doc/phase15_ms_logic.md` §1 のフロー (KU15P、Vivado 2021.2、2 thread、define なし)。`soc_w2_l2` (L2 込みの N=1 W2 SoC) は synth_design 33 分 24 秒で完走した (sim 4 本、Vivado 3 本を並べた)。`core_w4` は 43 分 38 秒、`soc_w2` (L2 を black box) は 18 分 58 秒。
+
+S の配列の推論 (`ram.rpt` と `util_hier_full.rpt`):
+
+| 配列 | W2 (`soc_w2_l2`) | W4 (`core_w4`) | 判定 |
+|---|---|---|---|
+| `l2_data_bank` × 4 | RAM_SDP 512 × 512、各 RAMB36 8 (byte の write enable) | (L2 は SoC にある) | RAM |
+| `l2_tag_bank` × 4 | RAM_SDP 512 × 27、各 RAMB18 1 | | RAM |
+| `icache_data_bank` × 4 | 256 × 256 (65,536 bit)、各 RAMB36 4。dword の enable は幅 64 で BRAM の byte enable の上限 (32) を超えるので、Vivado が dword ごとの RAM に分けた (Synth 8-6841、値は同じ) | 同じ | RAM |
+| `bp_btb` の書きの組 (W2 11 個、W4 14 個) | RAM_SDP。RAMB36 6 + RAMB18 7、`tx_q` は URAM 1 | RAMB36 8 + RAMB18 10 + URAM 1 | RAM |
+| `dcache_bank` × 2 / 4 | LUTRAM (`RAM64X1D`、bank あたり 2,048 LUT)、読み出しレジスタ 1,024 FF | LUTRAM (bank あたり 1,024)、512 FF | RAM (分散 RAM。§3.1 の例外) |
+
+R の配列: `icache_array.tags`、`dcache_tagbank` (6 / 7 組)、`vrf` は LUTRAM。`rename.img_q` (port 16)、`mem_ctrl.wb_data/wb_strb` (8 lane の書き)、struct の配列 (`rob`、`ftq`、`lane_queue`、`iq`、`prf` など、Synth 8-5858) は FF。いずれも T_S 未満で、区分どおりである。FF に展開された配列 (Synth 8-4767) は W2 SoC と W4 core のどちらも 16 個で、`img_q`、`wb_data`、`wb_strb` のほかは定数の index で書く小さい配列だった。T_S を超える配列が FF に展開されたものは無く、推論の失敗 (Synth 8-3391) も無い。
+
+使用量: `doc/phase15_ms_logic.md` §8.15。
