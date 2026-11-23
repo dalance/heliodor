@@ -9,8 +9,9 @@ one.
 
 A boot test loads two images into the SoC testbench:
 
-- A **firmware** hex image in the boot ROM at address 0. It sets up the CSRs,
-  provides the SBI calls the kernel needs (timer, console, system reset and, for
+- A **firmware** hex image in the boot ROM at address 0. It programs the PMP and
+  the CSRs that machine mode owns (see
+  [Firmware requirements](soc-integration.md#firmware-requirements)), provides the SBI calls the kernel needs (timer, console, system reset and, for
   SMP, hart start) and jumps to the kernel.
 - A **DRAM** hex image at `0x8000_0000`: the kernel `Image` with its built-in
   initramfs, and the device tree blob placed at a fixed address.
@@ -29,12 +30,16 @@ boots without a Linux toolchain. They are:
 |---|---|---|---|
 | 5.15 | 1 | `linux_boot_fw.hex` | `linux_dram_real.hex` |
 | 5.15 | 2 | `linux_boot_fw_2hart.hex` | `linux_dram_real_2hart.hex` |
-| 5.15 | 4 | `linux_boot_fw_4hart.hex` | `linux_dram_real_4hart.hex` |
+| 5.15 | 4 | `linux_boot_fw_4hart_mt.hex` | `linux_dram_real_4hart.hex` |
 | 6.6 LTS | 1 | `linux_boot_fw_66.hex` | `linux_dram_66.hex` |
 | 6.6 LTS | 2, 4 | `linux_boot_fw_66_smp.hex` | `linux_dram_66_2hart.hex`, `linux_dram_66_4hart.hex` |
 | 7.1 | 1 | `linux_boot_fw_71.hex` | `linux_dram_71.hex` |
 | 7.1 | 2, 4 | `linux_boot_fw_71.hex` | `linux_dram_71_2hart.hex`, `linux_dram_71_4hart.hex` |
 | 7.1 with vector | 1 | `linux_boot_fw_71v.hex` | `linux_dram_71v.hex` |
+
+The 4-hart 5.15 firmware waits for `mtime` instead of counting loop iterations
+when it starts the secondary harts, so that the start-up does not depend on the
+speed of the core.
 
 The 6.6 and 7.1 device trees describe the extensions of the core, and those
 kernels discover them from the device tree. The `71v` image is a 7.1 kernel
@@ -97,18 +102,24 @@ veryl test --ignored --test test_w2_linux_boot_71v            # 7.1 with vector
 ```
 
 Replace `w2` by `w4` for the 4-wide core, for example
-`test_w4_smp_linux_boot_4hart`.
+`test_w4_smp_linux_boot_4hart`. The 4-hart boots of 6.6 and 7.1 are
+`test_soc_66_smp_linux_boot_4hart` and `test_soc_71_smp_linux_boot_4hart` (the
+`test_soc_*` tests run the default core, which is the 2-wide one). Cycle counts
+of all of these are in [Performance](performance.md).
 
 A boot takes from several minutes (one hart) to over an hour (four harts), and
 the cycle counts are in the tens of millions. Progress lines show the cycle
 count, retired instructions and the program counter; a boot that is stuck at the
 same counters for a long time is not necessarily hung, because the probe prints
-only every so many cycles. The run ends with `pass=1` and `x3=...aa`.
+only every so many cycles. The run ends with a line `boot: x3=...aa cycles=<n> ...
+chk=00...0 mismatch=0` from the harness, which has the exact cycle count, and then the
+test's own line ending in `pass=1`. The test's own cycle counter advances in steps
+of 10,000, so it is rounded.
 
 Wall-clock time depends on the load of the machine. Run long boots in the
 background, and do not raise a test's cycle limit without a reason.
 
-## Run a boot on Verilator
+## Run a boot on Verilator {#run-a-boot-on-verilator}
 
 The same boots run on Verilator through the wrappers in `sim/verilator/`:
 
@@ -124,10 +135,15 @@ The same boots run on Verilator through the wrappers in `sim/verilator/`:
 veryl build
 verilator --binary --top-module tb_soc_smp_linux_boot_2hart_w2 -f heliodor.f \
           sim/verilator/tb_soc_smp_linux_boot_2hart_w2.sv \
+          +define+HELIODOR_CHK+HELIODOR_OBS \
           --timing -Wno-fatal -O3 -j 4 \
           --Mdir sim/verilator/build_n2_w2 -o tb_soc_smp_linux_boot_2hart_w2
 sim/verilator/build_n2_w2/tb_soc_smp_linux_boot_2hart_w2
 ```
+
+Pass `+define+HELIODOR_CHK+HELIODOR_OBS` as shown: without the defines the core has
+no retire records and the run cannot detect the shutdown (see
+[Getting started](getting-started.md#run-on-verilator)).
 
 The run prints `W2 SMP(N=2) LINUX BOOT PASSED on Verilator (SBI shutdown, x3==0xAA)`
 on success. The 4-hart top-level modules are large; if `-O3` makes Verilator fail,
@@ -138,7 +154,7 @@ testbench's AXI4 memory model: 0 is fixed latency, 1 is slow, 2 adds
 backpressure, 3 reorders responses between IDs. Boots must pass with every
 setting; the cycle count changes.
 
-## Guest Linux under a hypervisor
+## Guest Linux under a hypervisor {#guest-linux-under-a-hypervisor}
 
 `test/hv/` holds a minimal bare-metal type-1 hypervisor that runs in
 hypervisor-extended supervisor mode, sets up the second translation stage, and
@@ -154,14 +170,20 @@ the one test that runs the two-stage MMU under load.
 | `mkhex.py`, `Makefile` | Assemble `hv_dram.hex` |
 
 Build the DRAM image from a guest kernel `Image` and the compiled guest device
-tree (the image is not committed because it is large):
+tree (the image is not committed because it is large). The guest kernel is the 7.1
+`Image` that `test/linux/build.sh 71` builds, which has the initramfs with the
+`/init` that powers the machine off; the build leaves it at
+`test/linux/build/71/kbuild/arch/riscv/boot/Image`.
 
 ```bash
 source toolchain/env.sh
 dtc -I dts -O dtb -o test/hv/guest.dtb test/hv/guest.dts
-make -C test/hv GUEST=<path to Image> GUEST_DTB=test/hv/guest.dtb
+make -C test/hv GUEST=$PWD/test/linux/build/71/kbuild/arch/riscv/boot/Image GUEST_DTB=$PWD/test/hv/guest.dtb
 veryl test --ignored --test test_w2_hvlinux
 ```
+
+The test passes when the guest reaches its `/init` and the SBI shutdown arrives at
+the hypervisor (`x3 == 0xAA`).
 
 `make -C test/hv` with no arguments embeds a small bare-metal guest instead of
 Linux, which is useful to check the hypervisor itself. Guest physical address

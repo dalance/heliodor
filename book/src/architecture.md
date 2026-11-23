@@ -33,7 +33,7 @@ redirect: one from the back end (a mispredict, a trap, a flush) and one from
 `extract`.
 
 The L1 instruction cache is 32 KiB, 4-way, with 64-byte lines. Its demand read
-is a registered-address SRAM access. It is filled coherently through the L2, so
+is a registered-address SRAM access that reads the four ways in parallel. It is filled coherently through the L2, so
 self-modifying code needs only `fence.i`.
 
 ## Decode, rename and dispatch
@@ -72,7 +72,7 @@ units follow one contract, so adding a unit does not change the scheduler.
 | `lq`, `sq` | Load queue and store queue. A load that ran before an older store to the same address resolved, or whose line was taken away by another hart before it retired, is marked in the load queue and replayed when it reaches commit. |
 | `sb` | Committed-store buffer with line-granular write combining. Stores retire without waiting for the bus. |
 | `atomic_unit` | AMO, LR and SC, and the reservation. |
-| `io_unit` | Executes non-cacheable accesses exactly once, at the head of the machine. |
+| `io_unit` | Executes non-cacheable accesses and cache-block operations (`cbo.clean`, `cbo.flush`, `cbo.inval`) exactly once, at the head of the machine. |
 | `mem_port_arb` | Decides which requester (new instruction, queue replay, walker, atomic, I/O, vector unit) uses each memory pipe slot. |
 
 ## Memory system
@@ -83,9 +83,17 @@ units follow one contract, so adding a unit does not change the scheduler.
 | `tlb`, `ptw` | Translation lookaside buffers (instruction and data) and Sv39 page-table walkers, including the two-stage walk of the hypervisor extension. |
 | `pmp_check` | Physical memory protection. |
 | `pma_pkg` | Physical memory attribute table (`PMA_REGIONS`); every physical address decode in the core and the SoC goes through it. |
-| `l2cache` | Shared 128 KiB, 4-way L2 with a coherence directory (sharer mask and owner per line). |
-| `mem_ctrl` | The coherent home node. It serves each hart's data and instruction read slots, recalls lines owned by other harts, and drives the AXI4 master port. |
-| `memory_bus` | Arbitrates the write channel and the memory-mapped device accesses (CLINT, PLIC, UART, debug memory) of all harts. |
+| `l2cache` | Shared 128 KiB, 4-way L2 with a coherence directory (sharer mask and owner per line). Its tag and directory words go through one pipelined tag port, and its data arrays are banks that read all four ways in parallel. |
+| `mem_ctrl` | The coherent home node. It serves each hart's data and instruction read slots, recalls lines owned by other harts, performs the home side of cache-block operations, buffers writes, and drives the AXI4 master port. |
+| `memory_bus` | Arbitrates the memory-mapped device accesses (CLINT, PLIC, UART, debug memory) of all harts. |
+
+A cache-block operation writes a dirty line back through the write buffer to DRAM,
+invalidates every copy in the L1 data caches and the L2, and completes when the
+last write of the line has its AXI write response. A debugger or any other
+observer that reads DRAM behind the AXI port therefore sees the data once the
+instruction has retired. All three operations behave as a flush, which Zicbom
+allows in place of a clean or an invalidate. The instruction cache is not
+affected: use `fence.i` for code.
 
 ## Commit
 
@@ -109,7 +117,7 @@ kill protocol and memory pipe 0.
 For debugging, `trig_unit` implements the Sdtrig triggers inside the core.
 The Debug Module itself (`dmi_apb`, `dm`, `dm_mem`, `dm_sba`) is part of the SoC.
 
-## Observation ports
+## Observation ports {#observation-ports}
 
 A core drives these outputs for testbenches. None of them feeds back into the
 design.
@@ -121,6 +129,15 @@ design.
   for a load retry, or each kind of kill).
 - `o_chk`: sticky flags from the `chk_*` invariant checkers. A testbench checks
   that they are all zero at the end of every test.
+
+Two compile-time defines select what exists. `HELIODOR_CHK` builds the `chk_*`
+checkers; without it `o_chk` reads zero. `HELIODOR_OBS` builds the logic that
+exists only to feed the observation ports (the retire records, the performance
+wires and the event outputs); without it those outputs read zero and the
+functional design is unchanged. `Veryl.toml` defines both for `veryl test`. A
+synthesis build defines neither. In a Verilator build, pass them with
+`+define+HELIODOR_CHK+HELIODOR_OBS` if the testbench needs the outputs; see
+[Getting started](getting-started.md#run-on-verilator).
 
 ## Directory map
 
@@ -137,14 +154,16 @@ design.
 | `src/core/vec/` | Vector-unit adapters |
 | `src/core/debug/` | `trig_unit` |
 | `src/core/` | `heliodor_core`, the per-configuration wrappers `heliodor_core_w2` and `heliodor_core_w4`, `heliodor_soc_smp`, `soc_pkg`, `csr`, `decoder`, the FP leaf units, `vector_unit`, `vrf` |
-| `src/cache/` | Array-level instruction cache, `l2cache`, `mem_ctrl`, `memory_bus` |
-| `src/mmu/` | `pmp_check` |
+| `src/cache/` | Array-level instruction cache, D-cache tag bank, `l2cache` with its tag and data banks, `mem_ctrl`, `memory_bus` |
+| `src/mmu/` | `pmp_check` (with `pmp_decode`), and the instruction and data MMU wrappers |
 | `src/peripheral/` | `clint`, `plic`, `uart`, `axi4_sram`; `dm/` holds the Debug Module |
 | `src/pkg/` | Shared packages and type definitions |
 | `tb/` | Veryl testbenches and harnesses |
 | `sim/verilator/` | SystemVerilog wrappers for running the harnesses on Verilator |
-| `test/` | Test programs, hex images, compliance suites, the Linux image build |
-| `toolchain/` | Pinned cross toolchains and book tools |
+| `cosim/spike/` | The spike co-simulation component (a Veryl component crate) |
+| `synth/vivado/` | Vivado synthesis scripts and top-level wrappers |
+| `test/` | Test programs, hex images, compliance suites (`riscv-arch-test`, `act`), the Linux image build (`linux`), the hypervisor (`hv`), the random instruction generator (`gr`), the litmus runner (`glt`) |
+| `toolchain/` | Pinned cross toolchains, spike, OpenOCD, GDB and the book tools |
 | `book/` | This book |
 
 Files named `chk_*.veryl` are observation-only invariant checkers.

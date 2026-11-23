@@ -12,6 +12,8 @@ run from the root of the heliodor repository.
   from the Verilator project.
 - `make`, `python3`, `git`, `curl`, `tar`, and `dtc` (the device-tree compiler,
   for the Linux image build).
+- A C++ compiler (GCC 11 or newer) and the Boost development files, to build the
+  spike simulator that `veryl build` needs (see [Get spike](#get-spike)).
 - Ruby 3.4 or newer, only for the ACT4 compliance suites.
 
 ## Get Veryl
@@ -50,12 +52,31 @@ source toolchain/env.sh     # put them on PATH for this shell
 cross compiler, needed to build kernel images), `sail` and `uv` (ACT4). Every
 archive is verified against the sha256 pinned in `toolchain/versions.env`.
 
-`toolchain/fetch.sh debug` builds spike, OpenOCD and GDB from pinned sources;
-you need them only for the [debug flow](soc-integration.md#debug).
 `toolchain/fetch.sh book` fetches the tools that build this book.
 
 Most tests need no toolchain: the hex images of the test programs and of the
 Linux boots are committed to the repository.
+
+## Get spike {#get-spike}
+
+`Veryl.toml` declares the spike co-simulation component (`cosim/spike`), so the
+Veryl compiler builds it, and its build script links against the spike library.
+`veryl build` and `veryl test` therefore fail without spike, even for tests that do
+not use the co-simulation:
+
+```text
+libriscv.so not found under .../toolchain/spike/lib: run `toolchain/fetch.sh spike` or set SPIKE_HOME
+```
+
+```bash
+toolchain/fetch.sh spike    # builds spike from a pinned commit into toolchain/spike
+```
+
+This builds from source and takes a few minutes. The component is a Rust crate, so
+the first `veryl build` also downloads its dependencies with `cargo`. To use a spike you built
+elsewhere, set `SPIKE_HOME` to its install directory (it needs `lib/libriscv.so`
+and `include/`). `toolchain/fetch.sh debug` builds spike, OpenOCD and GDB together;
+you need OpenOCD and GDB only for the [debug flow](soc-integration.md#debug).
 
 ## Build
 
@@ -68,8 +89,10 @@ This transpiles the sources and testbenches to SystemVerilog next to each
 first run takes a minute or two.
 
 `veryl check` runs the analyzer without generating files. It currently prints
-lint warnings for the testbenches and exits with a non-zero status, so use
-`veryl build` as your build gate.
+lint warnings, mostly for the testbenches (unconnected ports) and a few for the
+frozen old core under `src/v14/`, and exits with a non-zero status, so use
+`veryl build` as your build gate. The design sources of the current core produce no
+warnings.
 
 ## Run tests
 
@@ -110,7 +133,7 @@ Run only one `veryl` command at a time in a checkout.
 Tests named `test_w2_*` run on the 2-wide core, and tests named `test_w4_*` run
 the same programs on the 4-wide core.
 
-## Run on Verilator
+## Run on Verilator {#run-on-verilator}
 
 The native `#[test]` modules cannot run on Verilator, so thin SystemVerilog
 wrappers in `sim/verilator/` instantiate the harnesses that `veryl build`
@@ -119,28 +142,49 @@ useful cross-check of the Veryl simulator.
 
 ```bash
 veryl build
-verilator --binary --top-module tb_soc_smp_linux_boot_2hart_w2 -f heliodor.f \
-          sim/verilator/tb_soc_smp_linux_boot_2hart_w2.sv \
+verilator --binary --top-module tb_soc_linux_boot_w2 -f heliodor.f \
+          sim/verilator/tb_soc_linux_boot_w2.sv \
+          +define+HELIODOR_CHK+HELIODOR_OBS \
           --timing -Wno-fatal -O3 -j 4 \
-          --Mdir sim/verilator/build_n2_w2 -o tb_soc_smp_linux_boot_2hart_w2
-sim/verilator/build_n2_w2/tb_soc_smp_linux_boot_2hart_w2
+          --Mdir sim/verilator/build_n1_w2 -o tb_soc_linux_boot_w2
+sim/verilator/build_n1_w2/tb_soc_linux_boot_w2
 ```
+
+The build takes about a minute, and the run (the 5.15 boot on one hart) takes
+about 35 minutes and ends with `W2 N=1 LINUX BOOT PASSED on Verilator`.
+
+The two defines are required. The harnesses detect the end of a test from the
+core's retire records, and the records, like the invariant checkers, exist only in
+a build that defines `HELIODOR_OBS` and `HELIODOR_CHK` (`veryl test` defines them
+for you). Without them the design still runs, the kernel prints its console
+output, but the retired-instruction count stays 0 and the test never passes.
 
 Run the simulator from the repository root, because the harnesses read their
 hex files by relative path. Delete the `--Mdir` directory when you change the
-configuration; a stale build gives confusing results. The wrappers are listed in
-[Running Linux](running-linux.md).
+configuration or the defines; a stale build gives confusing results. The wrappers
+are listed in [Running Linux](running-linux.md).
 
-## Rebuild test programs
+## Rebuild test programs {#rebuild-test-programs}
 
 The hex files are committed, so rebuilding is only needed when you change a test
-program or want to regenerate it with a different toolchain:
+program. A rebuilt image is not byte-identical to the committed one if your
+compiler differs from the one that built it, and the lockstep tests compare the
+retire stream with golden traces of the committed images, so rebuild only the
+programs you intend to change.
+
+The riscv-tests ISA suites need the riscv-tests sources, which the repository does
+not contain (git ignores them):
 
 ```bash
+git clone https://github.com/riscv-software-src/riscv-tests.git test/riscv-arch-test/upstream
+(cd test/riscv-arch-test/upstream && git submodule update --init env)
 source toolchain/env.sh
-make -C test/riscv-arch-test      # riscv-tests ISA suites
-make -C test/act                  # ACT4 (riscv-arch-test) suites; needs sail, uv, ruby
+make -C test/riscv-arch-test all   # every suite; a suite name (rv64ui) builds one
+make -C test/act                   # ACT4 (riscv-arch-test) suites; needs sail, uv, ruby
 ```
+
+The ACT4 images are not committed. [Verification](verification.md) has the details
+of both flows.
 
 ## Next steps
 

@@ -63,6 +63,10 @@ Each constant is read only by the module that owns it (and by `core_types`).
 The L1 cache sizes (32 KiB instruction, 16 KiB data) and the L2 size (128 KiB)
 are fixed by the cache modules, not by the configuration package.
 
+The physical address width is not part of the core configuration either. It is
+the constant `PALEN` of `pma_pkg` (40 bits) and applies to every configuration;
+see [Synthesis](soc-integration.md#synthesis).
+
 ## Execution ports and issue queues
 
 `PORT_FU[p]` is the set of functional units on issue port `p`, and `PORT_IQ[p]`

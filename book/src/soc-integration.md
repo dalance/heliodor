@@ -18,7 +18,7 @@ for the debugger, and observation outputs.
 | `PMA_N`, `PMA_REGIONS` | one empty region | Physical memory attribute table (see [Memory map and PMA](#memory-map-and-pma)) |
 | `MTIME_SRC`, `MTIME_DIV` | `soc_pkg::MTIME_CYCLE`, 10 | Source and divider of `mtime` (see [Time and interrupts](#time-and-interrupts)) |
 | `AXI_WB_N` | `2 * N_HARTS` | Write-buffer entries of the AXI4 master |
-| `DM_BASE` | `56'h4000` | Base address of debug memory (see [Debug](#debug)) |
+| `DM_BASE` | `'h4000` | Base address of debug memory, a `pma_pkg::Pa` (see [Debug](#debug)) |
 | `UART_WRCNT` | 0 | Test aid: a read of `UART + 0x100` returns the number of UART writes |
 
 `AXI_ID_W`, the width of the AXI ID, is a constant of the module:
@@ -43,7 +43,7 @@ The port is flat, with the usual names: `o_axi_ar*`/`i_axi_ar*`, `o_axi_aw*`,
 | Item | Value |
 |---|---|
 | Data width | 64 bits |
-| Address width | 56 bits (the physical address, unmodified) |
+| Address width | `pma_pkg::PALEN` bits, 40 by default (the physical address, unmodified) |
 | ID width | `AXI_ID_W` |
 | `AxSIZE`, `AxBURST` | 3 (8 bytes), INCR |
 | `AxLOCK`, `AxPROT`, `AxQOS` | 0 |
@@ -99,13 +99,18 @@ Both DRAM and boot ROM are reached through this port; see the memory map.
 `o_uart_tx_valid` and `o_uart_tx_data[7:0]` pulse when software writes the UART
 transmit register. The UART has no receive pin: its receive side is tied off.
 
-### Debug
+### Debug port
 
 `i_dm_rst` and the APB slave port `i_dm_psel`, `i_dm_penable`, `i_dm_pwrite`,
 `i_dm_paddr[8:0]`, `i_dm_pwdata[31:0]`, `i_dm_pstrb[3:0]`, `i_dm_pprot[2:0]`,
 `o_dm_pready`, `o_dm_prdata[31:0]`, `o_dm_pslverr`. See [Debug](#debug).
 
 ### Observation outputs
+
+These outputs carry data only in a build that defines `HELIODOR_OBS` (the
+checker flags also need `HELIODOR_CHK`). Without the define they read zero and
+the functional design is the same; see
+[Observation ports](architecture.md#observation-ports).
 
 | Port | Content |
 |---|---|
@@ -119,24 +124,28 @@ transmit register. The UART has no receive pin: its receive side is tied off.
 | `o_dm_obs` | `soc_pkg::DmObs`: Debug Module events |
 | `o_axi_err` | Sticky AXI error flags |
 
-Leave the observation outputs unconnected in a product design. Testbenches use
-them to compare retire streams and to check invariants.
+Leave the observation outputs unconnected in a product design, and do not define
+`HELIODOR_OBS` or `HELIODOR_CHK`. Testbenches use the outputs to compare retire
+streams and to check invariants.
 
 ### Verification inputs
 
 `i_dbg_retire_limit_en`, `i_dbg_retire_limit`, `i_dbg_irq_mask` and
 `i_dbg_irq_allow` (one bit or one 64-bit value per hart) let a testbench replay a
 reference interrupt schedule. They default to 0, which disables them, and are
-unrelated to the Debug Module.
+unrelated to the Debug Module. They act only in a build that defines
+`HELIODOR_OBS`.
 
-## Memory map and PMA
+## Memory map and PMA {#memory-map-and-pma}
 
 Every physical address decision in the core and the SoC (cacheable or not, which
 atomics are allowed, whether the address is backed, whether fetch is permitted,
 whether the access goes to AXI or to a device) is made by one function,
 `pma_check`, over the table `PMA_REGIONS`. A region is a naturally aligned
 power-of-two block: an address hits when `(pa & mask) == base`. An address that
-hits no region is a hole: accessing it raises an access fault.
+hits no region is a hole: accessing it raises an access fault. Addresses and
+masks are `pma_pkg::Pa` values, `pma_pkg::PALEN` (40) bits wide, and an address
+with a bit set above `PALEN` is a hole too.
 
 `pma_pkg::PmaRegion` is `{base, mask, attr}`, and `attr` holds:
 
@@ -152,6 +161,8 @@ hits no region is a hole: accessing it raises an access fault.
 | `misaligned_ok` | Misaligned accesses are handled in hardware |
 | `pte_ok` | Page tables may live here |
 | `cbo_ok` | Cache-block operations are allowed |
+
+A hole reads as all zeros, so it is not backed and not executable.
 
 The table must satisfy these rules (`pma_table_err` returns a bit per violated
 rule, 0 for a legal table; the SoC does not check it, so call it in a test):
@@ -192,7 +203,7 @@ table. A debug region must exist at `DM_BASE` (code) and `DM_BASE + 0x1000`
 | PLIC | priority of source `s` at `0x000000 + 4*s`; pending at `0x001000`; enable of context `c` at `0x002000 + 0x80*c`; threshold of context `c` at `0x200000 + 0x1000*c`; claim/complete at `0x200004 + 0x1000*c`. Context `2*h` is hart `h` machine mode, `2*h+1` supervisor mode. 31 sources, 3-bit priorities. |
 | UART (16550 subset) | THR/RBR at offset 0, IER at 1, IIR at 2, LSR at 5. Transmit only. |
 
-## Time and interrupts
+## Time and interrupts {#time-and-interrupts}
 
 The CLINT produces `mtime`, the timer interrupt (`mtimecmp`) and the software
 interrupt (`msip`) of each hart. The PLIC produces the machine and supervisor
@@ -203,9 +214,27 @@ external interrupt of each hart from the UART (source 10) and `i_ext_irq_src`.
 | Value | Behavior |
 |---|---|
 | `MTIME_CYCLE` | One tick every `MTIME_DIV` cycles. With the default `MTIME_DIV = 10` the CLINT's own prescaler is used: a 100 MHz clock gives the 10 MHz time base that the Linux device trees declare (`timebase-frequency = <10000000>`). |
-| `MTIME_INSTRET` | One tick per `MTIME_DIV` retired instructions of hart 0. Needs `N_HARTS = 1` and `MTIME_DIV` at least the number of retire lanes. It makes the time seen by software independent of microarchitectural timing, which is what a lockstep comparison needs. |
+| `MTIME_INSTRET` | One tick per `MTIME_DIV` retired instructions of hart 0. Needs `N_HARTS = 1`, `MTIME_DIV` at least the number of retire lanes, and a build that defines `HELIODOR_OBS` (it counts retire records). It makes the time seen by software independent of microarchitectural timing, which is what a lockstep comparison needs. |
 | `MTIME_EXTERNAL` | One tick per cycle in which `i_mtime_tick` is high |
 | `MTIME_OFF` | `mtime` stays 0 |
+
+## Firmware requirements {#firmware-requirements}
+
+Every hart comes out of reset in machine mode at `RESET_PC` with the machine
+CSRs at their reset values. Several of those values are restrictive, so firmware
+that hands control to supervisor mode has to set up the following first. The
+Linux boot firmware in `test/linux/fw/linux_boot_fw.S` is a working reference.
+
+| What | Why |
+|---|---|
+| PMP: at least one entry that covers the memory supervisor software uses | A supervisor or user access that matches no PMP entry faults, and `pmpcfg` resets to 0. The reference firmware writes `pmpaddr0 = -1` and `pmpcfg0 = 0x1f` (NAPOT, read, write, execute: the whole address space) on every hart, including a hart that is restarted later. Machine mode is not affected. |
+| `mstateen0` | It resets to 0. Bit 63 (`SE0`) and bit 62 (`ENVCFG`) have to be set for supervisor mode to reach `senvcfg`, and for a hypervisor to reach `henvcfg`. |
+| `menvcfg` | It resets to 0, which leaves `Sstc` (`STCE`, bit 63), `Svpbmt` (`PBMTE`, bit 62) and `Svadu` (`ADUE`, bit 61) off. `CBZE` (bit 7), `CBCFE` (bit 6) and `CBIE` (bits 5:4) enable `cbo.zero`, `cbo.clean` and `cbo.inval` below machine mode. Set only what the supervisor software uses: with `STCE` set, `mip.STIP` is driven by `stimecmp` and no longer by the firmware's SBI timer. |
+| `mcounteren` | Set the bits for the counters (`cycle`, `time`, `instret`) that supervisor software reads. |
+| Trap delegation | `medeleg` and `mideleg` select which traps go to supervisor mode. |
+
+The `time` CSR reads the CLINT `mtime`; see
+[Time and interrupts](#time-and-interrupts).
 
 ## Instantiating the SoC
 
@@ -247,7 +276,7 @@ AXI4 slave model holding DRAM and ROM, used by the Linux boot tests.
 generated SystemVerilog uses the project prefix: the module is
 `heliodor_soc_smp`, and its package of constants is `heliodor_soc_pkg`.
 
-## Debug
+## Debug {#debug}
 
 The Debug Module implements Debug Specification 1.0: halt and resume, single
 step, Access Register commands for GPRs, FPRs and CSRs, the program buffer,
@@ -336,3 +365,47 @@ with target `DEBUG` (see [Memory map and PMA](#memory-map-and-pma)).
 for the AXI port to go idle before it takes effect. `hartreset` resets one hart's
 core domain after the hart has quiesced; its L1 data cache is a coherence agent
 and keeps its contents.
+
+## Synthesis {#synthesis}
+
+The design is synthesizable. The scripts in `synth/vivado/` run Vivado
+out-of-context synthesis of the N=1 W2 SoC or of a core on its own, and they are a
+working example of a synthesis build for another tool.
+
+Three things matter for any synthesis build:
+
+- **No defines.** Do not define `HELIODOR_CHK` or `HELIODOR_OBS`. The checkers and
+  the logic that only feeds the observation ports then do not exist, which removes
+  a large part of the netlist; see [Observation ports](architecture.md#observation-ports).
+  Leave the observation outputs unconnected.
+- **Physical address width.** `pma_pkg::PALEN` (40) sizes every physical address,
+  line address, tag and AXI address in the design. Change that one constant to
+  use a different width; the PMA table values and the platform have to agree with
+  it.
+- **Memories.** The caches, the L2 and the branch target buffer are written as
+  one-read, one-write arrays with registered-address reads, so that synthesis maps
+  them to block RAM or URAM, and the D-cache tags and a few small arrays to
+  distributed RAM. Payload arrays have no reset.
+
+```bash
+veryl build
+synth/vivado/run.sh soc_w2_l2 8     # the N=1 W2 SoC with the L2; the second argument is the thread count
+```
+
+`run.sh` takes the target as its first argument:
+
+| Target | Content |
+|---|---|
+| `soc_w2` | The N=1 W2 SoC with the L2 as a black box |
+| `soc_w2_l2` | The same SoC including the L2 |
+| `core_w2`, `core_w4` | One core with its functional ports only |
+| `core_w2_obs`, `core_w4_obs` | One core with the observation outputs kept alive, to cost a top that exports them |
+
+It needs Vivado and its license: set `VIVADO_BIN` and `SYN_PART` (default
+`xcku15p-ffve1517-2-e`) if yours differ from the defaults in the script, and run it
+outside any sandbox that blocks the license. It reads `heliodor.f`, so run
+`veryl build` first, and it writes its reports to `synth/vivado/out/<target>/`.
+With Vivado 2021.2 on that part, the N=1 W2 SoC with the L2 comes to about 314,000
+LUTs, 103,000 flip-flops, 60 block RAM tiles, one URAM and 348 DSP blocks, and
+`synth_design` takes about 35 minutes. A 4-wide core alone is about 605,000 LUTs.
+These figures change as the design changes; use them as an order of magnitude.

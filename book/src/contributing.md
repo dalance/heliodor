@@ -7,7 +7,10 @@ source follows, and the checks a change has to pass.
 
 1. Build the tools: [Getting started](getting-started.md).
 2. Make the change on a branch.
-3. Run the fast tests and the tests of the area you touched.
+3. Run the fast tests and the tests of the area you touched. A change that can
+   alter the retire stream (decode, execute, the CSRs, the MMU) should also pass
+   the spike co-simulation: `python3 test/gates/run_gc.py --core w2` and a batch of
+   random programs; see [Verification](verification.md).
 4. For a change to the memory system, caches, MMU, coherence, interrupts or
    anything shared by several harts, also run the multi-hart boots (see the
    regression ladder below). A change that passes every single-hart test can
@@ -59,7 +62,14 @@ belong on a branch. Do not leave them in `master` as a configuration knob.
 - **No `$display` or `$assert` in RTL.** Observation goes through ports. The
   `cc` simulator backend gives up a whole combinational block if it contains one.
 - **Reset every valid bit,** and write nothing after the `else` branch of
-  `if_reset`.
+  `if_reset`. Payload arrays of more than a few hundred bits are written by an
+  `always_ff` without a reset, with at most one read and one write port, so that
+  synthesis maps them to RAM.
+- **Observation-only logic is conditional.** State and logic that only feed the
+  observation ports (retire record fields, event wires) go under
+  `#[ifdef(HELIODOR_OBS)]`, and checkers under `#[ifdef(HELIODOR_CHK)]`, each with
+  an `#[ifndef]` branch that gives the port its constant value. A synthesis build
+  defines neither; see [Synthesis](soc-integration.md#synthesis).
 - **Do not leave dead scaffolding:** arms guarded by a constant, counters nobody
   reads, reserved state that nothing uses.
 - **A module with tagged registers has an `i_kill` port.**
@@ -121,32 +131,47 @@ A new module has no warnings. After you update Veryl, count the warnings by kind
 and compare them with the previous count: a kind that has appeared is a bug report
 until proven otherwise.
 
-## The regression ladder
+## The regression ladder {#the-regression-ladder}
 
 After a change, run these steps in order. Fix a failure before you go on. Run the
 long ones in the background.
 
-1. `veryl test`: unit tests, directed tests, and the architecture suites
-   (`rv64ui`, `um`, `ua`, `mi`, `si`, `uf`, `ud`, and the vector suites). It takes
-   from seconds to a few minutes.
-2. `veryl test --ignored --test test_w2_litmus_4hart`: memory-model litmus tests
-   on four harts. A hit on a forbidden outcome is a memory-model bug.
-3. `veryl test --ignored --test test_w2_smp_linux_boot_2hart`: 2-hart Linux boot.
-   The 1-hart boot is `--ignored --test test_w2_linux_boot`.
-4. `veryl test --ignored --test test_w2_smp_linux_boot_4hart`: 4-hart Linux boot.
-   It takes about an hour of CPU time. Run it for every change to the memory
-   system: it has caught livelocks that no smaller test showed.
-5. `veryl test --ignored --test test_w2_hvlinux`: guest Linux under the
-   hypervisor. A change to the shared data-side MMU or the load path can pass
-   steps 1 to 4 and still deadlock here.
+1. `veryl test`: unit tests, directed tests, the cache-block visibility tests, and
+   the architecture suites (`rv64ui`, `um`, `ua`, `mi`, `si`, `uf`, `ud`, and the
+   vector suites), on both configurations. It takes tens of minutes.
+2. `veryl test --ignored --test test_litmus_4hart`: memory-model litmus tests
+   on four harts (5,122,506 cycles). A hit on a forbidden outcome is a
+   memory-model bug.
+3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart`: 2-hart Linux boot
+   (19,446,659 cycles). The 1-hart boot is `--ignored --test test_soc_linux_boot`
+   (14,695,563 cycles).
+4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: 4-hart Linux boot
+   (25,485,977 cycles). It takes about three hours. Run it for every change to
+   the memory system: it has caught livelocks that no smaller test showed.
+5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the
+   hypervisor (18,792,075 cycles). A change to the shared data-side MMU or the
+   load path can pass steps 1 to 4 and still deadlock here.
 
-Repeat the boots for the 4-wide core by replacing `w2` with `w4`. See
-[Verification](verification.md) for the meaning of each step.
+The `test_soc_*` tests run the default (2-wide) core. Repeat the relevant steps
+for the 4-wide core with the `test_w4_*` tests (for example `test_w4_litmus_4hart`,
+`test_w4_smp_linux_boot_2hart` and `test_w4_hvlinux`) when a change can differ
+between the configurations. See [Verification](verification.md) for the meaning of
+each step.
+
+Run the long steps outside any sandbox that blocks the C compiler. The `cc`
+backend compiles the design to a shared library; if that compilation is killed,
+the run silently falls back to a path that is 10 to 100 times slower. Use
+`VERYL_AOT_C_ASYNC=0 VERYL_BACKEND_DIAG=1 veryl test ... --format json` and check
+that the JSON report has `fell_back: 0`. `--format json` holds all `$display`
+output until the test ends.
 
 Cycle counts of boots and litmus tests drift with every performance change. Treat
-a large unexplained jump as a regression. The cycle counter of a boot advances in
+a large unexplained jump as a regression, but remember that a boot takes its time
+from `mtime`: a change of a few cycles can move a whole timer tick (about 400,000
+cycles) of kernel waiting. The cycle counter that a boot test prints advances in
 steps of 10,000, so two runs that print the same count are only equal to within
-that step; the benchmark programs (`dhrystone`, `coremark`) report exact counts.
+that step; the `boot:` line of the harness and the benchmark programs
+(`dhrystone`, `coremark`) report exact counts.
 
 To rule out a simulator bug, rerun a suspicious test on a second backend
 (`--backend cranelift` or `--backend interpret`), and for the boots, on
