@@ -25,8 +25,8 @@ test/linux/build.sh                  # Linux boot images (linux gcc)
 
 | dir          | tool                              | used by |
 |--------------|-----------------------------------|---------|
-| `elf/`       | `riscv64-unknown-elf-gcc` (GCC 16, binutils 2.43) | ACT4, riscv-tests, directed tests, bare hex |
-| `linux/`     | `riscv64-unknown-linux-gnu-gcc` (GCC 16, binutils 2.43) | Linux kernel + `/init` (`test/linux`) |
+| `elf/`       | `riscv64-unknown-elf-gcc` (GCC 16, binutils 2.46) | ACT4, riscv-tests, directed tests, bare hex |
+| `linux/`     | `riscv64-unknown-linux-gnu-gcc` (GCC 16, binutils 2.46) | Linux kernel + `/init` (`test/linux`) |
 | `sail/`      | `sail_riscv_sim` (Sail RISC-V)    | ACT4 golden reference |
 | `uv/`        | `uv`                              | ACT4 Python framework env |
 
@@ -71,9 +71,10 @@ writable system gem dir.
 ## Book tools
 
 `toolchain/fetch.sh book` fetches the tools that build `book/`: mdBook
-(a static prebuilt, `mdbook/`) and mdbook-i18n-helpers (`i18n/bin/`). The latter
-publishes no binaries, so `fetch.sh` downloads the pinned crate source, verifies
-`I18N_SHA256`, and builds it with the `Cargo.lock` the crate ships (needs
+(a static prebuilt, `mdbook/`), mdbook-i18n-helpers (`i18n/bin/`) and
+mdbook-linkcheck (`linkcheck/bin/`). The last two publish no binaries, so
+`fetch.sh` downloads the pinned crate source, verifies `I18N_SHA256` or
+`LINKCHECK_SHA256`, and builds it with the `Cargo.lock` the crate ships (needs
 `cargo`). `book/build.sh` sources `env.sh` itself.
 
 ## Pinning / reproducibility
@@ -98,6 +99,6 @@ need glibc 2.39 and will not run here. Keep the 22.04 variant when bumping.
 The V-enabled Linux build needs, all at once: RVV `as`, `ld -shared` for the
 vDSO, and `ld` ≥ 2.38 so Kconfig's `TOOLCHAIN_HAS_V` auto-detects. An older
 linux-gnu `ld` (2.37) forced an elf-CC + linux-LD mix and a Kconfig patch. The
-pinned 2026.x linux-gnu toolchain has binutils 2.43, which satisfies all three,
+pinned 2026.x linux-gnu toolchain has binutils 2.46, which satisfies all three,
 so `test/linux/build.sh` uses one toolchain with no version workaround. See
 `test/linux/README.md`.
