@@ -183,6 +183,9 @@ state occurs that herd7 forbids. About 4,000 tests apply; the families that need
 load-acquire and store-release instructions (Zalasr) are not run because the core
 does not implement that extension.
 
+The setup and the runs of the official litmus tests were not re-verified on the
+current release.
+
 ```bash
 toolchain/fetch.sh glt                                  # litmus tests + herd7 (builds OCaml; needs sockets)
 python3 test/glt/run_glt.py herd                                # herd7 on every test
@@ -249,7 +252,8 @@ buffer, System Bus Access, triggers, groups and reset. On Verilator, the
 riscv-tests debug suite (`gdbserver.py`) runs against the SoC through OpenOCD and
 GDB, with a testbench JTAG transport; `test/debug/run_gg.sh` runs it and
 `test/debug/` holds the OpenOCD configurations and the list of tests that are
-excluded with a reason. See [SoC integration](soc-integration.md#debug).
+excluded with a reason. The OpenOCD and GDB flow was not re-verified on the
+current release. See [SoC integration](soc-integration.md#debug).
 
 ## Verilator cross-check {#verilator-cross-check}
 

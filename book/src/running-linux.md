@@ -48,6 +48,9 @@ only if the result is correct.
 
 ## Build an image
 
+Building an image from the kernel source was not re-verified on the current
+release; the committed images are the ones the tests use.
+
 `test/linux/build.sh` regenerates an image for one kernel variant with the pinned
 Linux toolchain. You need your own checkout of the matching kernel source, which
 the script expects in `test/linux/src/<tag>/` (git ignores it).
@@ -102,10 +105,9 @@ veryl test --ignored --test test_w2_linux_boot_71v            # 7.1 with vector
 ```
 
 Replace `w2` by `w4` for the 4-wide core, for example
-`test_w4_smp_linux_boot_4hart`. The 4-hart boots of 6.6 and 7.1 are
-`test_soc_66_smp_linux_boot_4hart` and `test_soc_71_smp_linux_boot_4hart` (the
-`test_soc_*` tests run the default core, which is the 2-wide one). Cycle counts
-of all of these are in [Performance](performance.md).
+`test_w4_smp_linux_boot_4hart`. The 4-hart images of 6.6 and 7.1 are in the
+table above, but their boots were not re-verified on the current release. Cycle
+counts of the boots are in [Performance](performance.md).
 
 A boot takes from several minutes (one hart) to over an hour (four harts), and
 the cycle counts are in the tens of millions. Progress lines show the cycle
@@ -140,6 +142,9 @@ verilator --binary --top-module tb_soc_smp_linux_boot_2hart_w2 -f heliodor.f \
           --Mdir sim/verilator/build_n2_w2 -o tb_soc_smp_linux_boot_2hart_w2
 sim/verilator/build_n2_w2/tb_soc_smp_linux_boot_2hart_w2
 ```
+
+Running these wrappers to completion (the boots, the litmus run and the guest
+boot) was not re-verified on the current release; the builds work and the runs start.
 
 Pass `+define+HELIODOR_CHK+HELIODOR_OBS` as shown: without the defines the core has
 no retire records and the run cannot detect the shutdown (see
@@ -181,6 +186,9 @@ dtc -I dts -O dtb -o test/hv/guest.dtb test/hv/guest.dts
 make -C test/hv GUEST=$PWD/test/linux/build/71/kbuild/arch/riscv/boot/Image GUEST_DTB=$PWD/test/hv/guest.dtb
 veryl test --ignored --test test_w2_hvlinux
 ```
+
+Building the guest image from source was not re-verified on the current release;
+the `test_w2_hvlinux` test itself, run on an existing image, was.
 
 The test passes when the guest reaches its `/init` and the SBI shutdown arrives at
 the hypervisor (`x3 == 0xAA`).

@@ -303,6 +303,10 @@ Module.
 
 ### Connecting OpenOCD and GDB in simulation
 
+The simulator build below and its start were checked on the current release, but
+the OpenOCD and GDB connection and the scripts that drive it were not re-verified
+on it.
+
 The repository has a reference JTAG DTM and a remote-bitbang server for
 Verilator: `sim/verilator/jtag_dtm.sv`, `sim/verilator/rbb_dpi.c`, and the
 wrapper `sim/verilator/tb_soc_dm.sv`. The DTM has IDCODE `0x10000a03`, a 5-bit
