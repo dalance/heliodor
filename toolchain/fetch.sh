@@ -177,7 +177,10 @@ build_i18n() {
   rm -rf "$tmp"
   [[ -f "$src/Cargo.lock" ]] || { echo "[i18n] ERROR: crate ships no Cargo.lock" >&2; return 1; }
   rm -rf "$dest"; mkdir -p "$dest/bin"
-  ( cd "$src" && cargo build --release --locked --bins \
+  # The pinned onig_sys C sources fail GCC 14's default
+  # -Werror=incompatible-pointer-types; keep it a warning.
+  ( cd "$src" && CFLAGS="${CFLAGS:-} -Wno-error=incompatible-pointer-types" \
+      cargo build --release --locked --bins \
     && cp target/release/mdbook-gettext target/release/mdbook-xgettext "$dest/bin/" )
 }
 
