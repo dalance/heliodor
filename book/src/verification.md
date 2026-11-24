@@ -116,9 +116,11 @@ committed images, so rebuild only what you intend to change.
 ### ACT4 (RVA23)
 
 ACT4 is the RISC-V Architectural Compliance Test framework (`riscv/riscv-arch-test`).
-Its tests are self-checking and signed by the Sail reference model, so they check
-the RVA23 profile, including the vector, hypervisor, PMP, state-enable and counter
-extensions, against the architecture rather than against a second implementation.
+Its tests cover the RVA23 profile, including the vector, hypervisor, PMP,
+state-enable and counter extensions. Their expected results come from Sail, the
+formal model of the RISC-V specification, so they check Heliodor against the
+specification itself. The spike co-simulation and the golden trace, by contrast,
+compare Heliodor with another implementation.
 Heliodor pins the framework to an exact commit and Sail to 0.16
 (`toolchain/versions.env`, `test/act/Makefile`). `test/act/README.md` has the
 details of the configuration.
