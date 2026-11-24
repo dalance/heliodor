@@ -108,14 +108,17 @@ affected: use `fence.i` for code.
 Exceptions and interrupts are precise: a trap is recognized only when its
 operation reaches the head of the ROB, and everything younger is discarded.
 
-## Vector unit and debug
+## Vector unit
 
 `vector_unit` and `vrf` are a decoupled, in-order unit that owns the vector
 register file. `vu_adapter` and `vu_mem_adapter` connect it to the core's tags,
 kill protocol and memory pipe 0.
 
-For debugging, `trig_unit` implements the Sdtrig triggers inside the core.
-The Debug Module itself (`dmi_apb`, `dm`, `dm_mem`, `dm_sba`) is part of the SoC.
+## Debug
+
+`trig_unit` implements the Sdtrig triggers inside the core. The Debug Module
+itself (`dmi_apb`, `dm`, `dm_mem`, `dm_sba`) is part of the SoC; see
+[SoC integration](soc-integration.md#debug).
 
 ## Observation ports {#observation-ports}
 
