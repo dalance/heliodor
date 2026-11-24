@@ -114,6 +114,6 @@ to software are:
 | [Configuration](configuration.md) | The configuration packages and what each value controls |
 | [SoC integration](soc-integration.md) | Ports, memory map, AXI4, interrupts, debug |
 | [Running Linux](running-linux.md) | Boot images and boot runs, hypervisor guest |
-| [Verification](verification.md) | Test ladder, compliance suites, co-simulation and random testing |
+| [Verification](verification.md) | Long tests, compliance suites, co-simulation and random testing |
 | [Performance](performance.md) | Benchmark and boot results |
 | [Contributing](contributing.md) | Workflow and conventions |

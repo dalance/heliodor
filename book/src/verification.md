@@ -54,41 +54,26 @@ A full run is about 870 tests and takes well under an hour on a quiet machine. I
 needs no cross toolchain, because the hex images are committed, but it does need
 the spike component to be buildable (see [Getting started](getting-started.md)).
 
-## The regression ladder
+## Long tests {#long-tests}
 
-After a change, run these steps in order. The `test_soc_*` tests run the default
-(2-wide) core, and the 4-wide counterparts are listed below the table.
+These tests are marked `#[ignore]`, so `veryl test` skips them. Run each one with
+`veryl test --ignored --test <name>`. The `test_soc_*` tests run the default
+(2-wide) core. [Contributing](contributing.md#which-tests-to-run) says which of
+them to run for which change.
 
-| Step | Command | Expected | Time |
+| Test | Expected | Time | What it catches |
 |---|---|---|---|
-| 1 | `veryl test` | all pass | tens of minutes |
-| 2 | `veryl test --ignored --test test_litmus_4hart` | pass, 5,122,506 cycles | about 40 min |
-| 3 | `veryl test --ignored --test test_soc_smp_linux_boot_2hart` | pass, 19,446,659 cycles | about 30 min |
-| 3b | `veryl test --ignored --test test_soc_linux_boot` | pass, 14,695,563 cycles | about 7 min |
-| 4 | `veryl test --ignored --test test_soc_smp_linux_boot_4hart` | pass, 25,485,977 cycles | about 3 h |
-| 5 | `veryl test --ignored --test test_soc_hvlinux` | pass, 18,792,075 cycles | about 10 min |
+| `test_litmus_4hart` | pass, 5,122,506 cycles | about 40 min | Memory-model errors, under four-way barrier and bus stress. A hit on a forbidden outcome is a memory-model bug. |
+| `test_soc_linux_boot` | pass, 14,695,563 cycles | about 7 min | Errors in a real operating-system boot on one hart |
+| `test_w2_linux_boot_lockstep` | pass, 14,619,969 cycles | about 7 min | Any difference in the retired instructions of a whole 1-hart boot, against the golden trace |
+| `test_soc_smp_linux_boot_2hart` | pass, 19,446,659 cycles | about 30 min | Errors that appear only with more than one hart |
+| `test_soc_smp_linux_boot_4hart` | pass, 25,485,977 cycles | about 3 h | Livelocks and races that no smaller test shows |
+| `test_soc_hvlinux` | pass, 18,792,075 cycles | about 10 min | Errors in the two-stage (hypervisor) MMU under load |
 
-Step 5 needs `test/hv/hv_dram.hex`; see [Running Linux](running-linux.md#guest-linux-under-a-hypervisor).
-
-Why each step exists:
-
-1. **The default run** catches most functional errors.
-2. **Litmus on four harts** runs the memory-model tests with four-way barrier and
-   bus stress. A hit on a forbidden outcome is a memory-model bug.
-3. **The two-hart boot** is the first test of the boot of a real operating system
-   on more than one hart. A change that passes every single-hart test can still
-   break it.
-4. **The four-hart boot** has caught livelocks that no smaller test showed. Run it
-   for any change to the memory system.
-5. **The guest boot** is the only test that runs the two-stage (hypervisor) MMU under
-   load. A change to the data-side MMU or the load path can pass steps 1 to 4 and
-   still deadlock here.
-
-The 4-wide counterparts are `test_w4_litmus_4hart`, `test_w4_smp_linux_boot_2hart`,
-`test_w4_smp_linux_boot_4hart`, `test_w4_linux_boot` and `test_w4_hvlinux`. The
-N=1 boot in lockstep (`test_w2_linux_boot_lockstep`) checks the retire stream of a
-whole boot against the golden trace; run it after any change that can alter the
-retire stream.
+`test_soc_hvlinux` needs `test/hv/hv_dram.hex`; see [Running Linux](running-linux.md#guest-linux-under-a-hypervisor).
+The 4-wide counterparts are `test_w4_litmus_4hart`, `test_w4_linux_boot`,
+`test_w4_smp_linux_boot_2hart`, `test_w4_smp_linux_boot_4hart` and
+`test_w4_hvlinux`.
 
 Boot and litmus cycle counts drift with every performance change. A result is
 equal to a previous one only to within the 10,000-cycle step of the test's counter;
@@ -169,7 +154,7 @@ an LR/SC lock test, and IRIW on four harts. Each test runs thousands of iteratio
 framed by a barrier, with random jitter so that the harts overlap at varying
 offsets. The program writes a histogram and `tohost`: 1 means no forbidden outcome
 was seen. The two-hart battery is part of `veryl test`
-(`test_w2_litmus_2hart`); the four-hart one is step 2 of the ladder.
+(`test_w2_litmus_2hart`); the four-hart one is a [long test](#long-tests).
 
 `test/glt/run_glt.py` runs the official RISC-V litmus tests
 (`litmus-tests-riscv`) against the herd7 model with `riscv.cat`. It converts the

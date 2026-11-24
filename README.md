@@ -23,7 +23,7 @@ The documentation is **The Heliodor Book**, in English and Japanese. Build it wi
 | Configuration | The 2-wide and 4-wide configurations and what each value controls |
 | SoC integration | Ports, AXI4 memory interface, memory map, interrupts, debug, firmware requirements, synthesis |
 | Running Linux | Boot images, boots on the Veryl simulator and Verilator, the hypervisor guest |
-| Verification | Regression ladder, riscv-tests, ACT4, litmus, spike co-simulation, random programs |
+| Verification | Long tests, riscv-tests, ACT4, litmus, spike co-simulation, random programs |
 | Performance | Benchmark and boot cycle counts |
 | Contributing | Workflow and conventions |
 
@@ -58,8 +58,8 @@ veryl build
 veryl test --test test_w2_rv64ui_add       # four tests, about 30 seconds
 ```
 
-`CLAUDE.md` describes the development workflow and the regression ladder. The book
-has the details.
+The book's Contributing chapter describes the development workflow and which tests
+to run for a change.
 
 ## Repository layout
 

@@ -12,9 +12,9 @@ source follows, and the checks a change has to pass.
    the spike co-simulation: `python3 test/gates/run_gc.py --core w2` and a batch of
    random programs; see [Verification](verification.md).
 4. For a change to the memory system, caches, MMU, coherence, interrupts or
-   anything shared by several harts, also run the multi-hart boots (see the
-   regression ladder below). A change that passes every single-hart test can
-   still break a multi-hart boot.
+   anything shared by several harts, also run the multi-hart boots (see
+   [Which tests to run](#which-tests-to-run)). A change that passes every
+   single-hart test can still break a multi-hart boot.
 5. Review the comments and the module headers you touched. Delete comments that
    restate the code.
 6. Commit.
@@ -131,31 +131,22 @@ A new module has no warnings. After you update Veryl, count the warnings by kind
 and compare them with the previous count: a kind that has appeared is a bug report
 until proven otherwise.
 
-## The regression ladder {#the-regression-ladder}
+## Which tests to run {#which-tests-to-run}
 
-After a change, run these steps in order. Fix a failure before you go on.
+The tests range from seconds to hours, so pick them by what the change touches.
+[Verification](verification.md) describes each test.
 
-1. `veryl test`: unit tests, directed tests, the cache-block visibility tests, and
-   the architecture suites (`rv64ui`, `um`, `ua`, `mi`, `si`, `uf`, `ud`, and the
-   vector suites), on both configurations. It takes tens of minutes.
-2. `veryl test --ignored --test test_litmus_4hart`: memory-model litmus tests
-   on four harts (5,122,506 cycles). A hit on a forbidden outcome is a
-   memory-model bug.
-3. `veryl test --ignored --test test_soc_smp_linux_boot_2hart`: 2-hart Linux boot
-   (19,446,659 cycles). The 1-hart boot is `--ignored --test test_soc_linux_boot`
-   (14,695,563 cycles).
-4. `veryl test --ignored --test test_soc_smp_linux_boot_4hart`: 4-hart Linux boot
-   (25,485,977 cycles). It takes about three hours. Run it for every change to
-   the memory system: it has caught livelocks that no smaller test showed.
-5. `veryl test --ignored --test test_soc_hvlinux`: guest Linux under the
-   hypervisor (18,792,075 cycles). A change to the shared data-side MMU or the
-   load path can pass steps 1 to 4 and still deadlock here.
+| Change | Tests to run |
+|---|---|
+| Any change | `veryl test` (tens of minutes). It runs on both configurations. |
+| Anything that can alter the instructions that retire or their results (decode, execute, the CSRs, the MMU) | The 1-hart boot in lockstep, `test_w2_linux_boot_lockstep`, the spike co-simulation, `python3 test/gates/run_gc.py --core w2`, and a batch of random programs |
+| The memory system, the caches, coherence, interrupts, or anything shared by several harts | The 4-hart litmus tests, `test_litmus_4hart`, and the 2-hart and 4-hart boots, `test_soc_smp_linux_boot_2hart` and `test_soc_smp_linux_boot_4hart`. The 4-hart boot takes about three hours, but it has caught livelocks that no smaller test showed. |
+| The data-side MMU, the load path, or the hypervisor extension | The guest boot, `test_soc_hvlinux`. It is the only test that runs the two-stage MMU under load. |
+| Anything that can differ between the 2-wide and 4-wide configurations | The 4-wide counterparts of the tests above (`test_w4_*`) |
 
-The `test_soc_*` tests run the default (2-wide) core. Repeat the relevant steps
-for the 4-wide core with the `test_w4_*` tests (for example `test_w4_litmus_4hart`,
-`test_w4_smp_linux_boot_2hart` and `test_w4_hvlinux`) when a change can differ
-between the configurations. See [Verification](verification.md) for the meaning of
-each step.
+Before a release, run all of these on both configurations. Run the long tests
+with `veryl test --ignored --test <name>`; the expected cycle counts are in
+[Verification](verification.md#long-tests).
 
 Cycle counts of boots and litmus tests drift with every performance change. Treat
 a large unexplained jump as a regression, but remember that a boot takes its time
@@ -164,6 +155,8 @@ cycles) of kernel waiting. The cycle counter that a boot test prints advances in
 steps of 10,000, so two runs that print the same count are only equal to within
 that step; the `boot:` line of the harness and the benchmark programs
 (`dhrystone`, `coremark`) report exact counts.
+
+## Compiler and simulator bugs {#compiler-and-simulator-bugs}
 
 The simulator has three code-generation backends, chosen with `--backend`: `cc`
 (the default: emit C and compile it), `cranelift` (an in-process JIT) and
@@ -176,8 +169,6 @@ unlikely.
 veryl test --backend cranelift --test <name>
 veryl test --backend interpret --test <name>
 ```
-
-## Compiler and simulator bugs {#compiler-and-simulator-bugs}
 
 If a failure is caused by the Veryl compiler or simulator, do not work around it
 in the RTL. To debug the compiler, keep a clone of Veryl in `./veryl/` (git ignores
