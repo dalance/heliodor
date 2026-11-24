@@ -7,8 +7,9 @@
 #   book/build.sh check      # check the links of both languages (internal links
 #                            # and fragments; web links are not followed)
 #
-# Output goes to book/out/<lang>/ (gitignored). Any mdbook warning fails the
-# build. The tools come from `toolchain/fetch.sh book`.
+# Output goes to book/out/<lang>/ (gitignored). The published site puts the
+# English book at its root and the Japanese book under ja/. Any mdbook warning
+# fails the build. The tools come from `toolchain/fetch.sh book`.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,8 +34,10 @@ run() {
   fi
 }
 
-build_en() { run env MDBOOK_BOOK__LANGUAGE=en mdbook build -d out/en; }
-build_ja() { run env MDBOOK_BOOK__LANGUAGE=ja mdbook build -d out/ja; }
+# SITE_URL is the URL path the English book is served from (for example
+# /heliodor/ on GitHub Pages); the Japanese book is served from its ja/ subpath.
+build_en() { run env MDBOOK_BOOK__LANGUAGE=en MDBOOK_OUTPUT__HTML__SITE_URL="${SITE_URL:-/}" mdbook build -d out/en; }
+build_ja() { run env MDBOOK_BOOK__LANGUAGE=ja MDBOOK_OUTPUT__HTML__SITE_URL="${SITE_URL:-/}ja/" mdbook build -d out/ja; }
 build_pot() {
   command -v mdbook-xgettext >/dev/null || { echo "mdbook-xgettext not found" >&2; exit 1; }
   run env MDBOOK_OUTPUT='{"xgettext": {}}' mdbook build -d po

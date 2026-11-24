@@ -10,10 +10,11 @@ bare-metal type-1 hypervisor.
 
 ## Documentation
 
-The documentation is **The Heliodor Book**, in English and Japanese. Build it with
-`book/build.sh` (it needs `toolchain/fetch.sh book`) and open
-`book/out/en/index.html` or `book/out/ja/index.html`. Its sources are in
-`book/src/`.
+The documentation is **The Heliodor Book**, in
+[English](https://dalance.github.io/heliodor/) and
+[Japanese](https://dalance.github.io/heliodor/ja/). Its sources are in `book/src/`;
+to build it locally, run `toolchain/fetch.sh book` and `book/build.sh`, and open
+`book/out/en/index.html` or `book/out/ja/index.html`.
 
 | Chapter | Content |
 |---|---|
