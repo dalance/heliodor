@@ -177,11 +177,20 @@ To rule out a simulator bug, rerun a suspicious test on a second backend
 (`--backend cranelift` or `--backend interpret`), and for the boots, on
 Verilator.
 
-## Compiler and simulator bugs
+## Compiler and simulator bugs {#compiler-and-simulator-bugs}
 
 If a failure is caused by the Veryl compiler or simulator, do not work around it
-in the RTL. Fix it in your clone of Veryl in `./veryl/`, on a branch, and send it
-upstream. Add the regression test to the simulator's own tests.
+in the RTL. To debug the compiler, keep a clone of Veryl in `./veryl/` (git ignores
+the directory) and build it there:
+
+```bash
+git clone https://github.com/veryl-lang/veryl.git veryl
+(cd veryl && cargo build --profile release-verylup)
+```
+
+The test scripts use `./veryl/target/release-verylup/veryl` when `VERYL` is not
+set. Fix the bug on a branch and send it upstream, with the regression test in
+the simulator's own tests.
 
 ## Commits
 

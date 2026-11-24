@@ -49,13 +49,10 @@ pass.
 
 ## Quick start
 
-Heliodor builds with the Veryl compiler from a local clone, and needs spike for the
-co-simulation component that `Veryl.toml` declares:
+Heliodor needs Veryl 0.22.1 or newer ([install](https://veryl-lang.org/install/)),
+and spike for the co-simulation component that `Veryl.toml` declares:
 
 ```bash
-git clone https://github.com/veryl-lang/veryl.git veryl
-(cd veryl && cargo build --profile release-verylup)
-export PATH="$PWD/veryl/target/release-verylup:$PATH"
 toolchain/fetch.sh spike
 veryl build
 veryl test --test test_w2_rv64ui_add       # four tests, about 30 seconds

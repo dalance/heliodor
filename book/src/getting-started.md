@@ -6,7 +6,8 @@ run from the root of the heliodor repository.
 ## Requirements
 
 - Linux on x86-64. The prebuilt toolchains are built for glibc 2.34 or newer.
-- A Rust toolchain (`cargo`), to build the Veryl compiler.
+- Veryl 0.22.1 or newer (see [Get Veryl](#get-veryl)).
+- A Rust toolchain (`cargo`), to build the co-simulation component.
 - [Verilator](https://www.veripool.org/verilator/) 5.x, only for the Verilator flows
   (version 5.050 was used for this book). Install it from your distribution or
   from the Verilator project.
@@ -16,26 +17,24 @@ run from the root of the heliodor repository.
   spike simulator that `veryl build` needs (see [Get spike](#get-spike)).
 - Ruby 3.4 or newer, only for the ACT4 compliance suites.
 
-## Get Veryl
+## Get Veryl {#get-veryl}
 
 Heliodor is written in Veryl and is built and tested with the Veryl compiler and
-simulator. The project keeps its own clone of the compiler in `./veryl/`. The
-directory is ignored by git; it is not a submodule.
+simulator. Install Veryl 0.22.1 or newer by following the instructions on the
+[Veryl website](https://veryl-lang.org/install/), then check the version:
 
 ```bash
-git clone https://github.com/veryl-lang/veryl.git veryl
-(cd veryl && cargo build --profile release-verylup)
-export PATH="$PWD/veryl/target/release-verylup:$PATH"
 veryl --version
 ```
 
-The `release-verylup` profile builds without link-time optimization and is the
-fast release build. Use that binary for all development and testing. The book was
-checked with Veryl 0.22.1.
+The test scripts under `test/` run the compiler named by the variable `VERYL`.
+Without it they look for a development build in `./veryl/` (see
+[Contributing](contributing.md#compiler-and-simulator-bugs)), so point it at the
+installed binary:
 
-The commands below assume `veryl` is the binary you just built. Some scripts in
-the repository read the variable `VERYL` instead of searching the path; set
-`VERYL="$PWD/veryl/target/release-verylup/veryl"` if you use them.
+```bash
+export VERYL="$(command -v veryl)"
+```
 
 ## Get the cross toolchains
 
