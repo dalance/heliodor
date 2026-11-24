@@ -145,8 +145,7 @@ sim/verilator/build_n1_w2/tb_soc_linux_boot_w2
 The build takes about a minute, and the run (the 5.15 boot on one hart) takes
 about 35 minutes and ends with `W2 N=1 LINUX BOOT PASSED on Verilator`.
 
-The run to completion was not re-verified on the current release; the build and
-the start of the run were. The two defines are required. The harnesses detect the end of a test from the
+The two defines are required. The harnesses detect the end of a test from the
 core's retire records, and the records, like the invariant checkers, exist only in
 a build that defines `HELIODOR_OBS` and `HELIODOR_CHK` (`veryl test` defines them
 for you). Without them the design still runs, the kernel prints its console
