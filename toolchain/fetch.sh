@@ -177,9 +177,10 @@ build_i18n() {
   rm -rf "$tmp"
   [[ -f "$src/Cargo.lock" ]] || { echo "[i18n] ERROR: crate ships no Cargo.lock" >&2; return 1; }
   rm -rf "$dest"; mkdir -p "$dest/bin"
-  # The pinned onig_sys C sources fail GCC 14's default
-  # -Werror=incompatible-pointer-types; keep it a warning.
-  ( cd "$src" && CFLAGS="${CFLAGS:-} -Wno-error=incompatible-pointer-types" \
+  # The pinned onig_sys C sources predate C23 (unprototyped function pointers)
+  # and newer GCC's -Werror=incompatible-pointer-types: build them as C17 and
+  # keep that check a warning.
+  ( cd "$src" && CFLAGS="${CFLAGS:-} -std=gnu17 -Wno-error=incompatible-pointer-types" \
       cargo build --release --locked --bins \
     && cp target/release/mdbook-gettext target/release/mdbook-xgettext "$dest/bin/" )
 }
