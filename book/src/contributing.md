@@ -173,9 +173,17 @@ steps of 10,000, so two runs that print the same count are only equal to within
 that step; the `boot:` line of the harness and the benchmark programs
 (`dhrystone`, `coremark`) report exact counts.
 
-To rule out a simulator bug, rerun a suspicious test on a second backend
-(`--backend cranelift` or `--backend interpret`), and for the boots, on
-Verilator.
+The simulator has three code-generation backends, chosen with `--backend`: `cc`
+(the default: emit C and compile it), `cranelift` (an in-process JIT) and
+`interpret` (a tree-walking interpreter, the slowest, used as the reference). To
+rule out a simulator bug, rerun a suspicious test on a second backend, and for the
+boots, on Verilator. Two independent backends that agree make a simulator bug
+unlikely.
+
+```bash
+veryl test --backend cranelift --test <name>
+veryl test --backend interpret --test <name>
+```
 
 ## Compiler and simulator bugs {#compiler-and-simulator-bugs}
 

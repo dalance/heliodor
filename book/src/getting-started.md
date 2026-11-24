@@ -112,14 +112,7 @@ Useful forms:
 ```bash
 veryl test                              # all tests that are not #[ignore]
 veryl test --ignored --test <name>      # one long test (Linux boots, benchmarks)
-veryl test --backend cranelift          # another code-generation backend
-veryl test --backend interpret          # the slowest, reference backend
 ```
-
-The simulator has three code-generation backends: `cc` (the default: emit C and
-compile it), `cranelift` (an in-process JIT) and `interpret` (a tree-walking
-interpreter). If a result looks suspicious, run the same test on a second
-backend. Two independent backends that agree make a simulator bug unlikely.
 
 If a previous `veryl test` was killed, remove the stale lock before running again:
 
