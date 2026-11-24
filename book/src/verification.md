@@ -1,8 +1,7 @@
 # Verification
 
-Heliodor is checked in layers. The fast layers run on every change, and the slow
-ones (Linux boots, the four-hart boot, the compliance suites) run at milestones.
-This chapter lists the layers, how to run each one, and what a pass means. The
+Heliodor is checked in layers, from unit tests that take seconds to Linux boots
+and compliance suites that take hours. This chapter lists the layers, how to run each one, and what a pass means. The
 cycle counts and timings quoted here are for the 2-wide configuration unless a
 column says otherwise; [Performance](performance.md) has the full set.
 
