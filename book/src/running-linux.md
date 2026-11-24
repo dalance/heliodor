@@ -116,8 +116,7 @@ chk=00...0 mismatch=0` from the harness, which has the exact cycle count, and th
 test's own line ending in `pass=1`. The test's own cycle counter advances in steps
 of 10,000, so it is rounded.
 
-Wall-clock time depends on the load of the machine. Run long boots in the
-background, and do not raise a test's cycle limit without a reason.
+Wall-clock time depends on the load of the machine.
 
 ## Run a boot on Verilator {#run-a-boot-on-verilator}
 

@@ -88,8 +88,7 @@ The Veryl simulator with the default `cc` backend runs the 2-wide core at roughl
 35,000 cycles per second on one hart and 2,700 on four harts, so the one-hart 5.15
 boot takes about 7 minutes and the four-hart boot about three hours. The 4-wide
 core is slower, about 1,300 cycles per second at four harts. Speeds depend on the
-machine, and a simulator that falls back from the compiled `cc` backend is 10 to
-100 times slower; see [Contributing](contributing.md#the-regression-ladder).
+machine.
 
 ## Area
 

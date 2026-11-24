@@ -133,8 +133,7 @@ until proven otherwise.
 
 ## The regression ladder {#the-regression-ladder}
 
-After a change, run these steps in order. Fix a failure before you go on. Run the
-long ones in the background.
+After a change, run these steps in order. Fix a failure before you go on.
 
 1. `veryl test`: unit tests, directed tests, the cache-block visibility tests, and
    the architecture suites (`rv64ui`, `um`, `ua`, `mi`, `si`, `uf`, `ud`, and the
@@ -157,13 +156,6 @@ for the 4-wide core with the `test_w4_*` tests (for example `test_w4_litmus_4har
 `test_w4_smp_linux_boot_2hart` and `test_w4_hvlinux`) when a change can differ
 between the configurations. See [Verification](verification.md) for the meaning of
 each step.
-
-Run the long steps outside any sandbox that blocks the C compiler. The `cc`
-backend compiles the design to a shared library; if that compilation is killed,
-the run silently falls back to a path that is 10 to 100 times slower. Use
-`VERYL_AOT_C_ASYNC=0 VERYL_BACKEND_DIAG=1 veryl test ... --format json` and check
-that the JSON report has `fell_back: 0`. `--format json` holds all `$display`
-output until the test ends.
 
 Cycle counts of boots and litmus tests drift with every performance change. Treat
 a large unexplained jump as a regression, but remember that a boot takes its time

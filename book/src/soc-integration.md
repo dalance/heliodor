@@ -402,8 +402,7 @@ synth/vivado/run.sh soc_w2_l2 8     # the N=1 W2 SoC with the L2; the second arg
 | `core_w2_obs`, `core_w4_obs` | One core with the observation outputs kept alive, to cost a top that exports them |
 
 It needs Vivado and its license: set `VIVADO_BIN` and `SYN_PART` (default
-`xcku15p-ffve1517-2-e`) if yours differ from the defaults in the script, and run it
-outside any sandbox that blocks the license. It reads `heliodor.f`, so run
+`xcku15p-ffve1517-2-e`) if yours differ from the defaults in the script. It reads `heliodor.f`, so run
 `veryl build` first, and it writes its reports to `synth/vivado/out/<target>/`.
 With Vivado 2021.2 on that part, the N=1 W2 SoC with the L2 comes to about 314,000
 LUTs, 103,000 flip-flops, 60 block RAM tiles, one URAM and 348 DSP blocks, and

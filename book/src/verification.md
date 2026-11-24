@@ -58,10 +58,7 @@ the spike component to be buildable (see [Getting started](getting-started.md)).
 ## The regression ladder
 
 After a change, run these steps in order. The `test_soc_*` tests run the default
-(2-wide) core, and the 4-wide counterparts are listed below the table. Run the long ones
-outside any sandbox that blocks the C compiler, with
-`VERYL_AOT_C_ASYNC=0 VERYL_BACKEND_DIAG=1 ... --format json`, and check that the JSON
-report has `fell_back: 0` (see [Contributing](contributing.md)).
+(2-wide) core, and the 4-wide counterparts are listed below the table.
 
 | Step | Command | Expected | Time |
 |---|---|---|---|
@@ -149,8 +146,7 @@ python3 test/gates/run_act.py --core w2                   # run all suites on th
 python3 test/gates/run_act.py --core w4 --pass-fail --suite i,zba    # a subset, pass/fail only
 ```
 
-The generation step uses Python multiprocessing, which needs Unix sockets; run it
-outside a sandbox that blocks them. `run_act.py` writes temporary test modules,
+`run_act.py` writes temporary test modules,
 runs them, and judges each result. A test passes when `tohost` is 1 and the
 checkers are clean; where a golden trace exists, its final hash must also match.
 
