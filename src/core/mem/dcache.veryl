@@ -1,121 +1,129 @@
-// dcache: the L1 data cache of the core: MEM_W request ports with a tag
-// lookup each (dcache_tags), DC_NB dword-interleaved data banks
-// (dcache_data), a line-granular MSHR file with one fill context
-// (dcache_mshr), the sb drain port, and the coherence side (probe,
-// invalidates, departures, writeback buffer) towards mem_ctrl.
-//
-// Ports (timing contract):
-//   i_req_valid[p], i_req[p] : cycle A; o_req_ready is the constant 1
-//   i_np_valid[k], i_np_req[k] : cycle A, the non-pipe client k on the HEAD
-//                     port, whose pipe mem_port_arb kept empty that cycle; its
-//                     response comes on that port and clients filter it by
-//                     MemTag.client
-//   o_resp[p]       : registered, RESP_LAT = 2 cycles after A, one per request
-//   o_vhit[p]       : V, the response o_resp[p] registers in V is HIT
-//   o_evt           : registered, at most one per cycle, built from the state
-//                     of the previous cycle (UNC_DONE and WT_DONE: two or
-//                     more); an event in the cycle of a response counts as
-//                     after it, and no event precedes the response it ends
-//   i_drain_*       : the sb head line, held until o_drain_ack, which is
-//                     combinational; the line is written (or written through)
-//                     on the ack edge
-//   i_inv*, i_probe_* : this cycle's invalidates and recall probe (held until
-//                     o_probe_ack, or until the writeback it causes)
-//   o_ev1/ev2       : this cycle's local departures of a line (victim, probe,
-//                     write-through drain of the own copy)
-//   o_memr_*, o_memw_*, i_fill_excl : the mem_ctrl read slot and write
-//                     channel, unchanged from the reused dcache; o_memr_cmo
-//                     marks the slot's single-beat request as a CMO_HOME
-//   i_kill          : applied in the decision cycle to a request whose
-//                     MemTag.rob is valid
-//   o_idle          : registered state only: no live MSHR entry, no held
-//                     uncached read or write-through, no writeback buffered
-//                     and no pinned line
-//   o_perf          : combinational event wires
-//   o_chk           : sticky checker flags (HELIODOR_CHK only, else 0), see
-//                     chk_dcache
-// Owns:
-//   - a read of class LOAD, PTW_READ or LOAD_EXCL looks up its tag in A and
-//     reads the banks of its dwords in A; in V = A + 1 it is decided by the
-//     first matching row, registered and answered in A + 2:
-//       1 killed -> RETRY(PREEMPTED)
-//       2 an invalidate or departure of its line in A or V -> RETRY(INV_RACE)
-//       3 hit (LOAD_EXCL: owned) -> HIT, or RETRY(PREEMPTED) if a writeback
-//         capture took the banks in A, or RETRY(BANK_CONFLICT) if an older
-//         request of another port took a bank on another row
-//       4 an MSHR entry holds its line -> HIT from the critical-dword buffer
-//         (a 1-dword LOAD/PTW_READ of the arrived critical dword), else
-//         MISS(the entry's fill id)
-//       5 an entry holds another line of its set, or no entry is free ->
-//         RETRY(FILL_BUSY); the line is held by a CMO -> RETRY(CMO_BUSY)
-//       6 MISS(new fill id): it allocates (the oldest of the cycle; the drain
-//         when urgent or alone) or attaches to the line allocated this cycle
-//   - STORE_EXCL is decided in A: owned hit -> EXCL_PASS (merged on this
-//     edge), not owned or an invalidate/unpinned probe of the line ->
-//     EXCL_FAIL, a bank or set taken by a fill -> RETRY(BANK_CONFLICT)
-//   - UNC_READ, CMO_HOME and STORE_WT answer PENDING(id) and CMO answers
-//     HIT; each holds the single nf slot until the uncached read or the
-//     CMO_HOME is granted (UNC_DONE), the write fires (WT_DONE), or the line
-//     is in no MSHR entry, the arrays nor the writeback buffer; a request
-//     finding the slot held gets RETRY(BANK_CONFLICT)
-//   - while the slot holds a CMO or CMO_HOME, a miss on its line allocates
-//     no MSHR entry (RETRY(CMO_BUSY)); a fill already running finishes
-//     before the CMO drops the line
-//   - a data bank serves one row per cycle: requests on the same row share
-//     it, otherwise the oldest wins; a writeback capture reads every bank
-//   - a bank takes one write per cycle: the fill beat, else the exclusive or
-//     write-through merge, else the drain merge; each lower writer waits
-//     for the cycle (the drain is not acked)
-//   - the fill victim is chosen and dropped at launch from registered state
-//     (a matching S copy is upgraded in place); a dirty victim goes to the
-//     writeback buffer in that cycle; a clean departure raises ev1
-//   - the drain merges into an owned line, writes a full line through and
-//     drops the own copy, or allocates a read for ownership
-//   - a waiter is bound to its fill when it is answered MISS(id) (at the
-//     allocation or by the line of a live entry); every event and the
-//     critical dword come from the entry's registers, and only a request of
-//     exactly the critical dword is served from the critical-dword buffer
-// Rationale:
-//   - one tag lookup per access, in A, keeps a single delivery path for hit
-//     and miss; V only re-checks the line against this cycle's events
-//   - the victim is dropped at launch, so no way of a set in fill holds a
-//     tag over half-written data and every other way stays hit-safe
-//   - the drain waits only for the bank of this cycle's fill beat, a launch
-//     in its set, or a probe of its line, never for a whole fill
-//   - the file is over the 600-line guideline: the per-cycle decisions of
-//     the ports, the allocation, the launch, the drain, the probe and the
-//     write channel read each other's terms; splitting them further would
-//     only export those terms as ports
+/// The L1 data cache of the core: MEM_W request ports with a tag
+/// lookup each (dcache_tags), DC_NB dword-interleaved data banks
+/// (dcache_data), a line-granular MSHR file with one fill context
+/// (dcache_mshr), the sb drain port, and the coherence side (probe,
+/// invalidates, departures, writeback buffer) towards mem_ctrl.
+///
+/// # Timing
+///
+/// - `o_ev1/ev2`: This cycle's local departures of a line (victim, probe,
+///   write-through drain of the own copy)
+///
+/// # Owns
+///
+/// - a read of class LOAD, PTW_READ or LOAD_EXCL looks up its tag in A and
+///   reads the banks of its dwords in A; in V = A + 1 it is decided by the
+///   first matching row, registered and answered in A + 2:
+///     1 killed -> RETRY(PREEMPTED)
+///     2 an invalidate or departure of its line in A or V -> RETRY(INV_RACE)
+///     3 hit (LOAD_EXCL: owned) -> HIT, or RETRY(PREEMPTED) if a writeback
+///       capture took the banks in A, or RETRY(BANK_CONFLICT) if an older
+///       request of another port took a bank on another row
+///     4 an MSHR entry holds its line -> HIT from the critical-dword buffer
+///       (a 1-dword LOAD/PTW_READ of the arrived critical dword), else
+///       MISS(the entry's fill id)
+///     5 an entry holds another line of its set, or no entry is free ->
+///       RETRY(FILL_BUSY); the line is held by a CMO -> RETRY(CMO_BUSY)
+///     6 MISS(new fill id): it allocates (the oldest of the cycle; the drain
+///       when urgent or alone) or attaches to the line allocated this cycle
+/// - STORE_EXCL is decided in A: owned hit -> EXCL_PASS (merged on this
+///   edge), not owned or an invalidate/unpinned probe of the line ->
+///   EXCL_FAIL, a bank or set taken by a fill -> RETRY(BANK_CONFLICT)
+/// - UNC_READ, CMO_HOME and STORE_WT answer PENDING(id) and CMO answers
+///   HIT; each holds the single nf slot until the uncached read or the
+///   CMO_HOME is granted (UNC_DONE), the write fires (WT_DONE), or the line
+///   is in no MSHR entry, the arrays nor the writeback buffer; a request
+///   finding the slot held gets RETRY(BANK_CONFLICT)
+/// - while the slot holds a CMO or CMO_HOME, a miss on its line allocates
+///   no MSHR entry (RETRY(CMO_BUSY)); a fill already running finishes
+///   before the CMO drops the line
+/// - a data bank serves one row per cycle: requests on the same row share
+///   it, otherwise the oldest wins; a writeback capture reads every bank
+/// - a bank takes one write per cycle: the fill beat, else the exclusive or
+///   write-through merge, else the drain merge; each lower writer waits
+///   for the cycle (the drain is not acked)
+/// - the fill victim is chosen and dropped at launch from registered state
+///   (a matching S copy is upgraded in place); a dirty victim goes to the
+///   writeback buffer in that cycle; a clean departure raises ev1
+/// - the drain merges into an owned line, writes a full line through and
+///   drops the own copy, or allocates a read for ownership
+/// - a waiter is bound to its fill when it is answered MISS(id) (at the
+///   allocation or by the line of a live entry); every event and the
+///   critical dword come from the entry's registers, and only a request of
+///   exactly the critical dword is served from the critical-dword buffer
+///
+/// # Rationale
+///
+/// - one tag lookup per access, in A, keeps a single delivery path for hit
+///   and miss; V only re-checks the line against this cycle's events
+/// - the victim is dropped at launch, so no way of a set in fill holds a
+///   tag over half-written data and every other way stays hit-safe
+/// - the drain waits only for the bank of this cycle's fill beat, a launch
+///   in its set, or a probe of its line, never for a whole fill
+/// - the file is over the 600-line guideline: the per-cycle decisions of
+///   the ports, the allocation, the launch, the drain, the probe and the
+///   write channel read each other's terms; splitting them further would
+///   only export those terms as ports
 pub module dcache::<CFG: core_cfg> #(
     param INDEX_W: u32 = 6,
 ) (
     clk: input clock,
     rst: input reset,
 
+    /// Applied in the decision cycle to a request whose
+    /// MemTag.rob is valid
     i_kill: input core_types::<CFG>::Kill,
 
+    /// Cycle A; o_req_ready is the constant 1
     i_req_valid: input  logic                        [CFG::MEM_W]             ,
+    /// See i_req_valid.
     i_req      : input  core_types::<CFG>::MemReq    [CFG::MEM_W]             ,
+    /// Cycle A, the non-pipe client k on the HEAD
+    /// port, whose pipe mem_port_arb kept empty that cycle; its
+    /// response comes on that port and clients filter it by
+    /// MemTag.client
     i_np_valid : input  logic                        [core_types::<CFG>::NP_N],
+    /// See i_np_valid.
     i_np_req   : input  core_types::<CFG>::MemReq    [core_types::<CFG>::NP_N],
     o_req_ready: output logic                        [CFG::MEM_W]             ,
+    /// Registered, RESP_LAT = 2 cycles after A, one per request
     o_resp     : output core_types::<CFG>::MemResp   [CFG::MEM_W]             ,
+    /// V, the response o_resp[p] registers in V is HIT
     o_vhit     : output logic                        [CFG::MEM_W]             ,
+    /// Registered, at most one per cycle, built from the state
+    /// of the previous cycle (UNC_DONE and WT_DONE: two or
+    /// more); an event in the cycle of a response counts as
+    /// after it, and no event precedes the response it ends
     o_evt      : output core_types::<CFG>::MemEvent                           ,
 
+    /// The sb head line, held until o_drain_ack, which is
+    /// combinational; the line is written (or written through)
+    /// on the ack edge
     i_drain_v     : input  logic        ,
+    /// See i_drain_v.
     i_drain_addr  : input  logic<64>    ,
+    /// See i_drain_v.
     i_drain_data  : input  logic<64> [8],
+    /// See i_drain_v.
     i_drain_strb  : input  logic<8>  [8],
+    /// See i_drain_v.
     i_drain_urgent: input  logic        ,
     o_drain_ack   : output logic        ,
 
+    /// This cycle's invalidates and recall probe (held until
+    /// o_probe_ack, or until the writeback it causes)
     i_inv_v     : input  logic    ,
+    /// See i_inv_v.
     i_inv_addr  : input  logic<64>,
+    /// See i_inv_v.
     i_inv2_v    : input  logic    ,
+    /// See i_inv_v.
     i_inv2_addr : input  logic<64>,
+    /// See i_inv_v.
     i_probe_v   : input  logic    ,
+    /// See i_inv_v.
     i_probe_addr: input  logic<64>,
+    /// See i_inv_v.
     i_probe_self: input  logic    ,
     o_probe_ack : output logic    ,
     o_ev1_v     : output logic    ,
@@ -123,27 +131,48 @@ pub module dcache::<CFG: core_cfg> #(
     o_ev2_v     : output logic    ,
     o_ev2_addr  : output logic<64>,
 
+    /// The mem_ctrl read slot and write
+    /// channel, unchanged from the reused dcache; o_memr_cmo
+    /// marks the slot's single-beat request as a CMO_HOME
     o_memr_addr : output logic<64>,
+    /// See o_memr_addr.
     o_memr_ren  : output logic    ,
+    /// See o_memr_addr.
     o_memr_rfo  : output logic    ,
+    /// See o_memr_addr.
     o_memr_line : output logic    ,
+    /// See o_memr_addr.
     o_memr_cmo  : output logic    ,
+    /// See o_memr_addr.
     o_memr_req  : output logic    ,
     i_memr_grant: input  logic    ,
     i_mem_rdata : input  logic<64>,
+    /// See o_memr_addr.
     i_fill_excl : input  logic    ,
 
+    /// See o_memr_addr.
     o_memw_addr : output logic<64>    ,
+    /// See o_memr_addr.
     o_memw_wdata: output logic<64> [8],
+    /// See o_memr_addr.
     o_memw_wstrb: output logic<8>  [8],
+    /// See o_memr_addr.
     o_memw_wen  : output logic        ,
+    /// See o_memr_addr.
     o_memw_wb   : output logic        ,
+    /// See o_memr_addr.
     o_memw_req  : output logic        ,
     i_memw_grant: input  logic        ,
 
+    /// Registered state only: no live MSHR entry, no held
+    /// uncached read or write-through, no writeback buffered
+    /// and no pinned line
     o_idle: output logic,
+    /// Sticky checker flags (HELIODOR_CHK only, else 0), see
+    /// chk_dcache
     o_chk: output logic<core_types::<CFG>::CHK_DC_W>,
 
+    /// Combinational event wires
     o_perf: output core_types::<CFG>::DcachePerf,
 ) {
     import core_types::<CFG>::*;

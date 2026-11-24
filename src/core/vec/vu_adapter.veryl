@@ -1,133 +1,183 @@
-// vu_adapter: connects the shared vector_unit to the core: allocation, the
-// exec boundary, scalar operands, completion, retire side effects, the
-// illegal-configuration check and the VRF write observation
-//
-// Ports (timing contract):
-//   i_alloc, o_alloc_rdy : at most one op per cycle, never in a kill cycle;
-//                    o_alloc_rdy is the VU FIFO's registered free slot
-//   i_oldest       : commit's oldest token (invalid while an interrupt or a
-//                    Debug Mode entry is pending, and in a kill cycle)
-//   o_started      : pulse on the start edge of the op at the VU head
-//   i_retire       : lane 0 retired this cycle
-//   i_csr_vtype, i_csr_vstart : the committed vtype and vstart
-//   o_prf_rd, i_prf_rdata, i_prf_done : the head's int rs1, int rs2 and fp
-//                    rs1, combinational; i_prf_done from busy_table
-//   o_hf_req, i_hf_grant : hole fill on the memory pipe 0 WB port, the grant
-//                    in the same cycle (offset >= WAKE_LEAD)
-//   o_wake         : the rd wake, one cycle before o_wb, as the memory pipe
-//                    wakes on that lane
-//   o_wb           : registered; the PRF write of an op with a scalar rd,
-//                    in the granted slot, as a pair packet (it completes
-//                    nothing)
-//   o_done         : registered, one cycle after the VU completes the op or
-//                    after an illegal head is found; to rob and commit, in
-//                    the cycle of o_wb. side.vrf_* count and hash the op's
-//                    VRF writes for the retire record only (0 without
-//                    HELIODOR_OBS)
-//   i_mem_exc      : vu_mem_adapter's record of the faulting element
-//   o_vu_*, i_vu_* : the vector_unit instance beside this module
-//   i_kill         : a full kill clears the started and completion state; a
-//                    partial kill is ignored, as it never selects the op at
-//                    the head once that op holds the token (it is the oldest)
-//   o_chk          : sticky checker flags (HELIODOR_CHK only, else 0)
-//   o_perf         : combinational event wires
-// Owns:
-//   - the exec boundary: the VU works on its head only under o_vu_exec,
-//     valid when the head holds the token (the start edge) or exec_q is set,
-//     with the head's tag
-//   - exec_q is set on the start edge and held until the op retires or a
-//     full kill; element requests after the start need no token, so an
-//     interrupt that stops the token cannot strand a started op
-//   - one VuDone per op; an rd op's VuDone and its PRF write leave in the
-//     same cycle
-//   - the scalar sources are done: the start waits for i_prf_done, which
-//     the token already implies (every older op retired); chk_vu flags a
-//     start it held back
-// Rationale:
-//   - the VU's i_cdb_free comes only from the hole-fill countdown and the
-//     VU's own o_wb_req/o_wb_rd, so no same-cycle path from issue reaches it
-//   - an op whose vtype is illegal, at a SEW outside the head's sews, that
-//     would start above the head's vstart_max (any nonzero vstart for
-//     arithmetic, vstart >= VLMAX for a load or store), or whose register
-//     groups vu_grp_chk rejects under the vtype completes with cause 2
-//     instead of starting; its trap full-kills the FIFO, so the VU needs no
-//     illegal path of its own
-//   - every source is checked done, not only the ones the op reads:
-//     dispatch passes the rename-time mapping of every register field, and
-//     each of those is done once the op holds the token
+/// Connects the shared vector_unit to the core: allocation, the
+/// exec boundary, scalar operands, completion, retire side effects, the
+/// illegal-configuration check and the VRF write observation
+///
+/// # Owns
+///
+/// - the exec boundary: the VU works on its head only under o_vu_exec,
+///   valid when the head holds the token (the start edge) or exec_q is set,
+///   with the head's tag
+/// - exec_q is set on the start edge and held until the op retires or a
+///   full kill; element requests after the start need no token, so an
+///   interrupt that stops the token cannot strand a started op
+/// - one VuDone per op; an rd op's VuDone and its PRF write leave in the
+///   same cycle
+/// - the scalar sources are done: the start waits for i_prf_done, which
+///   the token already implies (every older op retired); chk_vu flags a
+///   start it held back
+///
+/// # Rationale
+///
+/// - the VU's i_cdb_free comes only from the hole-fill countdown and the
+///   VU's own o_wb_req/o_wb_rd, so no same-cycle path from issue reaches it
+/// - an op whose vtype is illegal, at a SEW outside the head's sews, that
+///   would start above the head's vstart_max (any nonzero vstart for
+///   arithmetic, vstart >= VLMAX for a load or store), or whose register
+///   groups vu_grp_chk rejects under the vtype completes with cause 2
+///   instead of starting; its trap full-kills the FIFO, so the VU needs no
+///   illegal path of its own
+/// - every source is checked done, not only the ones the op reads:
+///   dispatch passes the rename-time mapping of every register field, and
+///   each of those is done once the op holds the token
 pub module vu_adapter::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
 
+    /// A full kill clears the started and completion state; a
+    /// partial kill is ignored, as it never selects the op at
+    /// the head once that op holds the token (it is the oldest)
     i_kill: input core_types::<CFG>::Kill,
 
+    /// At most one op per cycle, never in a kill cycle;
+    /// o_alloc_rdy is the VU FIFO's registered free slot
     i_alloc    : input  core_types::<CFG>::VuAlloc,
+    /// See i_alloc.
     o_alloc_rdy: output logic                     ,
 
+    /// commit's oldest token (invalid while an interrupt or a
+    /// Debug Mode entry is pending, and in a kill cycle)
     i_oldest    : input  core_types::<CFG>::TagTok    ,
+    /// Lane 0 retired this cycle
     i_retire    : input  logic                        ,
+    /// The committed vtype and vstart
     i_csr_vtype : input  logic                    <64>,
+    /// See i_csr_vtype.
     i_csr_vstart: input  logic                    <64>,
+    /// Pulse on the start edge of the op at the VU head
     o_started   : output logic                        ,
 
+    /// The head's int rs1, int rs2 and fp
+    /// rs1, combinational; i_prf_done from busy_table
     o_prf_rd   : output core_types::<CFG>::PReg     [3],
+    /// See o_prf_rd.
     i_prf_rdata: input  logic                  <64> [3],
+    /// See o_prf_rd.
     i_prf_done : input  logic                       [3],
 
+    /// Hole fill on the memory pipe 0 WB port, the grant
+    /// in the same cycle (offset >= WAKE_LEAD)
     o_hf_req  : output logic                      ,
+    /// See o_hf_req.
     i_hf_grant: input  fu_pkg::WbSlot             ,
+    /// The rd wake, one cycle before o_wb, as the memory pipe
+    /// wakes on that lane
     o_wake    : output core_types::<CFG>::Wake    ,
+    /// Registered; the PRF write of an op with a scalar rd,
+    /// in the granted slot, as a pair packet (it completes
+    /// nothing)
     o_wb      : output core_types::<CFG>::WbPacket,
+    /// Registered, one cycle after the VU completes the op or
+    /// after an illegal head is found; to rob and commit, in
+    /// the cycle of o_wb. side.vrf_* count and hash the op's
+    /// VRF writes for the retire record only (0 without
+    /// HELIODOR_OBS)
     o_done    : output core_types::<CFG>::VuDone  ,
+    /// vu_mem_adapter's record of the faulting element
     i_mem_exc : input  exc_pkg::ExcRec            ,
     i_mem_tval: input  logic                  <64>,
 
+    /// The vector_unit instance beside this module
     o_vu_alloc_en  : output logic                                               ,
+    /// See o_vu_alloc_en.
     o_vu_op        : output vector_pkg::VecOp                                   ,
+    /// See o_vu_alloc_en.
     o_vu_insn      : output logic                    <32>                       ,
+    /// See o_vu_alloc_en.
     o_vu_vd        : output logic                    <5>                        ,
+    /// See o_vu_alloc_en.
     o_vu_vs1       : output logic                    <5>                        ,
+    /// See o_vu_alloc_en.
     o_vu_vs2       : output logic                    <5>                        ,
+    /// See o_vu_alloc_en.
     o_vu_s_pd      : output logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     o_vu_s2_pd     : output logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     o_vu_fs_pd     : output logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     o_vu_has_rd    : output logic                                               ,
+    /// See o_vu_alloc_en.
     o_vu_rd_fp     : output logic                                               ,
+    /// See o_vu_alloc_en.
     o_vu_rd_pd     : output logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     o_vu_tag       : output core_types::<CFG>::RobTag                           ,
+    /// See o_vu_alloc_en.
     i_vu_alloc_rdy : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_head      : input  core_types::<CFG>::VuHead                           ,
+    /// See o_vu_alloc_en.
     o_vu_exec      : output core_types::<CFG>::TagTok                           ,
+    /// See o_vu_alloc_en.
     i_vu_s_pd      : input  logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     i_vu_s2_pd     : input  logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     i_vu_fs_pd     : input  logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     o_vu_s_data    : output logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     o_vu_s2_data   : output logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     o_vu_fs_data   : output logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     i_vu_wb_req    : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_wb_rd     : input  logic                                               ,
+    /// See o_vu_alloc_en.
     o_vu_cdb_free  : output logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_cdb_valid : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_cdb_has_rd: input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_cdb_fp    : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_cdb_pdst  : input  logic                    <core_types::<CFG>::PREG_W>,
+    /// See o_vu_alloc_en.
     i_vu_cdb_data  : input  logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     i_vu_vset_wen  : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_vtype     : input  logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     i_vu_vl        : input  logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     i_vu_lfault    : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_sfault    : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_vstart_wen: input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_vstart    : input  logic                    <64>                       ,
+    /// See o_vu_alloc_en.
     i_vu_ffl_wen   : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_ffl       : input  logic                    <5>                        ,
+    /// See o_vu_alloc_en.
     i_vu_vxsat_wen : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_vxsat     : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_vd_wen    : input  logic                                               ,
+    /// See o_vu_alloc_en.
     i_vu_vd_addr   : input  logic                    <5>                        ,
+    /// See o_vu_alloc_en.
     i_vu_vd_data   : input  logic                    <128>                      ,
 
+    /// Sticky checker flags (HELIODOR_CHK only, else 0)
     o_chk : output logic                    <core_types::<CFG>::CHK_VU_W>,
+    /// Combinational event wires
     o_perf: output core_types::<CFG>::VuPerf                             ,
 ) {
     import core_types::<CFG>::*;

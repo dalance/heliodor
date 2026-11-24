@@ -1,107 +1,119 @@
-// atomic_unit: executes AMO, LR, SC and amocas at the head of the machine,
-// owns the LR/SC reservation and the watch of the line between the read and
-// the write
-//
-// Ports (timing contract):
-//   i_op/o_ready    : the atomic leaves m2 of the HEAD pipe in the cycle it is
-//                     accepted; o_ready is registered (idle). After a DTLB
-//                     miss the op waits for its re-issued pass, which brings
-//                     the PA
-//   i_tok           : the oldest token; a request may start the operation only
-//                     in a cycle where it names the op (compared in A itself)
-//   o_head_req      : registered HEAD slot request to mem_port_arb;
-//                     i_head_gnt (t) answers it, i_head_slot (t + 3) is A
-//   o_req_valid/o_req : A, combinational from registered state and i_tok
-//   i_resp          : the HEAD port's response, RESP_LAT after A (client
-//                     ATOMIC); an i_evt in its cycle counts as after it
-//   i_coh_v/i_coh_line : inv, inv2, evict1, evict2 of this cycle
-//   o_started       : pulse on the A edge that starts the operation
-//   i_head_retired  : lane 0 of commit retired: the op of a set started latch
-//   i_rsv_clr       : a trap was taken, or an xRET or a satp write retired
-//   o_rsv           : registered: the reservation is valid (fu_sys, WRS.NTO)
-//   o_rat_rd/i_rat_preg, o_prf_rd/i_prf_data : amocas operand reads through
-//                     one integer arch RAT port and one PRF port,
-//                     combinational, one operand per cycle (rd, rd+1, rs2+1)
-//   o_hf_req, i_wb_grant, o_wb, o_wake : the result's hole-fill on the HEAD
-//                     pipe's WB port (o_wb registered, o_wake one cycle
-//                     before it); amocas.q first writes rd+1 in place with a
-//                     pair packet, which completes nothing
-//   o_rd2_valid/o_rd2 : amocas.q's rd+1 value (rd != x0), held from its
-//                     packet until the op retires, for the retire record
-//   o_done          : pulse with the last packet of an op other than LR on
-//                     o_wb; the op's SQ entry may retire from the next cycle.
-//                     o_wrote/o_wdata in the same cycle: the op wrote memory,
-//                     and its bytes in the 16-byte window at pa[5:3] (the
-//                     retire record's store data)
-//   i_kill          : drops an op that has not started
-// Owns:
-//   - every write is a STORE_EXCL of an op that holds the token or its started
-//     latch; it is not presented once the watch saw the line leave since the
-//     read, and an EXCL_PASS is final
-//   - rd is written only after EXCL_PASS (AMO, amocas with a matching
-//     compare), after the read (LR, amocas without a match) or with the SC
-//     outcome: 0 after EXCL_PASS, 1 otherwise
-//   - an AMO whose write fails or whose line left re-reads after a backoff
-//     window that doubles per retry, offset by a hash of the whole hart id
-//   - the reservation is the exact PA of the last LR; it is cleared by any SC,
-//     i_rsv_clr, and inv/inv2/evict of its line, never by a kill
-//   - amocas.q writes rd+1 in place into its committed physical register
-//     (the op is the oldest and cannot be killed once started) before rd;
-//     its retire flushes, so no younger op keeps the old rd+1
-//   - every op sends exactly one completing packet, its rd packet;
-//     amocas.q's rd+1 packet before it is a pair packet
-// Rationale:
-//   - the read-modify-write runs back to back while the op is the oldest, so
-//     no atomic ever needs a pipeline replay and the window stays inside the
-//     dcache's ownership pin
-//   - started_q makes the requests after the first independent of the token,
-//     so a pending interrupt (which withholds the token) waits for the op
-//     instead of deadlocking with it
-//   - writing rd+1 in place keeps amocas.q one op with one ROB entry and one
-//     retire record (rd and rd2), like a two-destination op, yet rename,
-//     walk and commit see a single destination: no extra RAT write port, no
-//     second free-list pop, no fused pair of uops at commit
+/// Executes AMO, LR, SC and amocas at the head of the machine,
+/// owns the LR/SC reservation and the watch of the line between the read and
+/// the write
+///
+/// # Owns
+///
+/// - every write is a STORE_EXCL of an op that holds the token or its started
+///   latch; it is not presented once the watch saw the line leave since the
+///   read, and an EXCL_PASS is final
+/// - rd is written only after EXCL_PASS (AMO, amocas with a matching
+///   compare), after the read (LR, amocas without a match) or with the SC
+///   outcome: 0 after EXCL_PASS, 1 otherwise
+/// - an AMO whose write fails or whose line left re-reads after a backoff
+///   window that doubles per retry, offset by a hash of the whole hart id
+/// - the reservation is the exact PA of the last LR; it is cleared by any SC,
+///   i_rsv_clr, and inv/inv2/evict of its line, never by a kill
+/// - amocas.q writes rd+1 in place into its committed physical register
+///   (the op is the oldest and cannot be killed once started) before rd;
+///   its retire flushes, so no younger op keeps the old rd+1
+/// - every op sends exactly one completing packet, its rd packet;
+///   amocas.q's rd+1 packet before it is a pair packet
+///
+/// # Rationale
+///
+/// - the read-modify-write runs back to back while the op is the oldest, so
+///   no atomic ever needs a pipeline replay and the window stays inside the
+///   dcache's ownership pin
+/// - started_q makes the requests after the first independent of the token,
+///   so a pending interrupt (which withholds the token) waits for the op
+///   instead of deadlocking with it
+/// - writing rd+1 in place keeps amocas.q one op with one ROB entry and one
+///   retire record (rd and rd2), like a two-destination op, yet rename,
+///   walk and commit see a single destination: no extra RAT write port, no
+///   second free-list pop, no fused pair of uops at commit
 pub module atomic_unit::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
 
+    /// Drops an op that has not started
     i_kill   : input core_types::<CFG>::Kill      ,
     i_hart_id: input logic<64>                    ,
+    /// The atomic leaves m2 of the HEAD pipe in the cycle it is
+    /// accepted; o_ready is registered (idle). After a DTLB
+    /// miss the op waits for its re-issued pass, which brings
+    /// the PA
     i_op     : input core_types::<CFG>::AtomicOp  ,
+    /// See i_op.
     o_ready  : output logic                       ,
+    /// The oldest token; a request may start the operation only
+    /// in a cycle where it names the op (compared in A itself)
     i_tok    : input core_types::<CFG>::TagTok    ,
 
+    /// Lane 0 of commit retired: the op of a set started latch
     i_head_retired  : input  logic,
+    /// A trap was taken, or an xRET or a satp write retired
     i_rsv_clr       : input  logic,
+    /// Registered: the reservation is valid (fu_sys, WRS.NTO)
     o_rsv           : output logic,
     i_ordering_empty: input  logic,
 
+    /// Registered HEAD slot request to mem_port_arb;
+    /// i_head_gnt (t) answers it, i_head_slot (t + 3) is A
     o_head_req : output logic                      ,
     i_head_gnt : input  logic                      ,
     i_head_slot: input  logic                      ,
+    /// A, combinational from registered state and i_tok
     o_req_valid: output logic                      ,
+    /// See o_req_valid.
     o_req      : output core_types::<CFG>::MemReq  ,
+    /// The HEAD port's response, RESP_LAT after A (client
+    /// ATOMIC); an i_evt in its cycle counts as after it
     i_resp     : input  core_types::<CFG>::MemResp ,
     i_evt      : input  core_types::<CFG>::MemEvent,
 
+    /// Inv, inv2, evict1, evict2 of this cycle
     i_coh_v   : input logic         [core_types::<CFG>::COH_N],
+    /// See i_coh_v.
     i_coh_line: input pma_pkg::Line [core_types::<CFG>::COH_N],
 
+    /// Amocas operand reads through
+    /// one integer arch RAT port and one PRF port,
+    /// combinational, one operand per cycle (rd, rd+1, rs2+1)
     o_rat_rd  : output logic<5>                          ,
+    /// See o_rat_rd.
     i_rat_preg: input  logic<core_types::<CFG>::PREG_W>  ,
+    /// See o_rat_rd.
     o_prf_rd  : output core_types::<CFG>::PReg           ,
+    /// See o_rat_rd.
     i_prf_data: input  logic<64>                         ,
 
+    /// Pulse on the A edge that starts the operation
     o_started : output logic                         ,
     o_empty   : output logic                         ,
+    /// The result's hole-fill on the HEAD
+    /// pipe's WB port (o_wb registered, o_wake one cycle
+    /// before it); amocas.q first writes rd+1 in place with a
+    /// pair packet, which completes nothing
     o_hf_req  : output logic                         ,
+    /// See o_hf_req.
     i_wb_grant: input  fu_pkg::WbSlot                ,
+    /// See o_hf_req.
     o_wb      : output core_types::<CFG>::WbPacket   ,
+    /// See o_hf_req.
     o_wake    : output core_types::<CFG>::Wake       ,
+    /// Pulse with the last packet of an op other than LR on
+    /// o_wb; the op's SQ entry may retire from the next cycle.
+    /// o_wrote/o_wdata in the same cycle: the op wrote memory,
+    /// and its bytes in the 16-byte window at pa[5:3] (the
+    /// retire record's store data)
     o_done    : output logic                         ,
     o_wrote   : output logic                         ,
     o_wdata   : output logic<128>                    ,
+    /// amocas.q's rd+1 value (rd != x0), held from its
+    /// packet until the op retires, for the retire record
     o_rd2_valid: output logic                        ,
+    /// See o_rd2_valid.
     o_rd2      : output logic<64>                    ,
 
     o_chk: output logic<4>,

@@ -1,127 +1,136 @@
-// decode: per-lane instruction decode, op classification and decode-time
-// legality, between the decode queue (DQ) and the rename queue (rq).
-//
-// Ports (timing contract):
-//   i_valid/i_xop : DQ output lanes, contiguous from lane 0, registered
-//   i_rq_ready    : rq.o_ready (registered); the whole group moves or none
-//   o_valid/o_dec : to rq.i_valid/i_data, combinational from the inputs
-//   o_dq_take     : to DQ.i_take: every valid lane when rq is ready, else 0
-//   i_priv, i_virt, i_mstatus_tsr, i_mstatus_tvm, i_csr, i_frm : live csr
-//                   outputs, read combinationally
-//   o_perf        : registered event wires
-//   o_chk         : sticky invariant flags (HELIODOR_CHK builds only, else 0)
-//   Kill is applied by the two queues (both flush on kill.valid); decode
-//   holds no op state.
-// Owns:
-//   - an op that carries any exception (fetch fault, illegal, ECALL, EBREAK)
-//     has class fu NONE and no destination
-//   - an illegal op reports cause 2 with tval = the RVC parcel for an RVC op,
-//     else the 32-bit instruction
-//   - no op of a class this build does not serve leaves decode except as an
-//     illegal-instruction fault (legality below is the only place deciding it)
-//   - pred_taken is set only on branches and jumps (checked, not used)
-// Legality (function `illegal`): an instruction is illegal when
-//   - the reused decoder flags it and it is not one of the vector encodings
-//     decoded here (function `vec_more`: the decoder is shared with the
-//     frozen old core); this includes every vector encoding the vector unit
-//     does not implement
-//   - a vector instruction or a vector CSR access with mstatus.VS = Off, or
-//     with vsstatus.VS = Off when V = 1; a vector FP instruction (OPFVV,
-//     OPFVF) with mstatus.FS = Off; a reserved vector encoding the decoder
-//     lets through (vrsub.vv, vmsgt{u}.vv, vsub.vi, vmin{u}.vi, vmax{u}.vi,
-//     vmslt{u}.vi, vssub{u}.vi; vmv.v.* and vfmv.v.f with vs2 != 0,
-//     vmv.x.s, vfmv.f.s, vcompress and the mask logical ops with vm = 0,
-//     vfmv.s.f with vm = 0 or vs2 != 0, vid.v with vs2 != 0, a mask or
-//     whole-register load or store with vm = 0, vlm.v and vsm.v with EEW
-//     other than 8, a whole-register store with EEW other than 8; vmv.s.x
-//     with vm = 0 or vs2 != 0; vmv<nr>r.v with vm = 0, nr not 1, 2, 4 or
-//     8, or vd or vs2 not a multiple of nr; vadc and vsbc with vm = 1 or
-//     vd = v0)
-//   - it is a load or store of a reserved width (LOAD funct3 111, STORE
-//     funct3 1xx, a 16-byte FP access: no Q), or an FP op that rounds with a
-//     reserved rm (101, 110) or with rm DYN while frm holds a reserved value
-//     (101-111), or a vector FP op (OPFVV, OPFVF) while frm holds one
-//   - a scalar encoding the decoder lets through but the ISA reserves
-//     (function `scalar_rsv`): OP-IMM-32 and OP-32 outside their defined
-//     funct7/funct3 pairs (SLLIW/SRLIW/SRAIW with shamt[5] set included),
-//     FSQRT, FMV.X.W/D and FCLASS with rs2 != 0, FMV.X.W/D with a funct3
-//     other than 000, FMV.W/D.X and FLI with funct3 != 000, an FMA of
-//     format H or Q, BRANCH funct3 01x, JALR funct3 != 000, MISC-MEM
-//     funct3 above 010, and a SYSTEM funct3 000 op with rd != 0 or, for
-//     the fixed-function ones (ECALL, EBREAK, xRET, WFI, WRS, DRET), rs1 != 0
-//   - an AMO encoding outside A, Zabha and Zacas: an unknown funct5, LR/SC
-//     below W, LR with rs2 != 0, a width above D except amocas.q, or
-//     amocas.q with an odd rd or rs2
-//   - a CSR access names a CSR that does not exist, needs more privilege, or
-//     writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM;
-//     or names dcsr, dpc or dscratch0/1 outside Debug Mode; or, below M,
-//     names hstateenN or sstateenN with mstateenN.SE clear, senvcfg or
-//     henvcfg with mstateen0.ENVCFG clear, siselect, sireg*, vsiselect or
-//     vsireg* with mstateen0.CSRIND clear, or srmcfg with mstateen0.SRMCFG
-//     clear
-//   - sireg* with V = 0 unless menvcfg.CDE, siselect is 0x40 + i for a
-//     counter i that mcounteren delegates, and it is sireg for cycle,
-//     instret or hpmcounter i or sireg2 for hpmevent i (Smcdeleg); sireg*
-//     from VS with hstateen0.CSRIND set unless vsiselect is in 0x40-0x5F and
-//     menvcfg.CDE is set; vsireg* with V = 0; scountinhibit without
-//     menvcfg.CDE
-//   - a counter (cycle, time, instret, hpmcounterN) below M whose mcounteren
-//     bit is clear, or in U whose scounteren bit is clear; stimecmp or
-//     vstimecmp below M without mcounteren.TM and menvcfg.STCE
-//   - an F, D, Zfa or Zfhmin instruction (compute, load, store) or
-//     fflags/frm/fcsr with mstatus.FS = Off
-//   - a CBO below M that menvcfg disables (CBIE = 0 for inval, CBCFE for
-//     clean and flush, CBZE for zero), or in U that senvcfg disables
-//   - MRET below M, SRET in U or in HS-mode with mstatus.TSR, SFENCE.VMA or
-//     SINVAL.VMA in HS-mode with mstatus.TVM, any SFENCE or SINVAL form in
-//     U (HFENCE.GVMA also in HS-mode with mstatus.TVM), HLV/HSV in U without
-//     hstatus.HU, WFI in U or below M with mstatus.TW, DRET outside Debug
-//     Mode, or an undefined SYSTEM function
-// Virtual instruction (cause 22, only when none of the above holds), with V
-// = 1: HLV/HSV and HFENCE/HINVAL; an HS-legal access (mstatus.TVM aside) to
-// a hypervisor or VS CSR, or from VU to a supervisor CSR; a counter that
-// mcounteren allows but hcounteren (in VU also scounteren) does not;
-// stimecmp in VS without hcounteren.TM and henvcfg.STCE; a CSR whose
-// mstateen bit (above) is set and whose hstateen bit is clear; srmcfg and
-// every sireg*; scountinhibit, and scountovf with menvcfg.CDE; a CBO that
-// menvcfg allows but henvcfg (in VU also senvcfg) does not; in VU SRET, any SFENCE
-// or SINVAL form and WFI; in VS SRET with hstatus.VTSR, SFENCE.VMA,
-// SINVAL.VMA and satp with hstatus.VTVM, and WFI with hstatus.VTW. With V =
-// 1, FS = Off also covers vsstatus.FS = Off.
-// Debug Mode: an EBREAK carries ExcRec.dm (an entry into Debug Mode, not a
-// breakpoint trap) when the dcsr.ebreakm/s/u/vs/vu bit of the current mode is
-// set, and always in Debug Mode; dcsr is committed state like the rest.
-// Rationale:
-//   - legality reads the committed CSR state live with no shadow: every CSR
-//     change retires with a flush, which empties DQ, decode and rq, so the
-//     state a surviving op saw equals its state at commit
-//   - a fetch fault outranks every decode-time exception, so the fetch
-//     record is taken as is and the decoder output is discarded
-//   - frm is committed state like the rest (a write to it retires with a
-//     flush), so the DYN rounding check reads it live as well
-//   - a legal WFI is a no-op (fu NONE): it completes at once, which the
-//     privileged spec allows; the WFI that traps follows the reference model
-//   - WRS.STO, and WRS.NTO outside the timeout rule, are no-ops (fu NONE):
-//     Zawrs allows them to complete at once. Below M with mstatus.TW, or with
-//     V = 1 and hstatus.VTW, a WRS.NTO is a SYS op: fu_sys times it out at
-//     once into an illegal (TW) or virtual (VTW) instruction exception while
-//     the reservation is valid, the only case in which it would wait
+/// Per-lane instruction decode, op classification and decode-time
+/// legality, between the decode queue (DQ) and the rename queue (rq).
+///
+/// # Owns
+///
+/// - an op that carries any exception (fetch fault, illegal, ECALL, EBREAK)
+///   has class fu NONE and no destination
+/// - an illegal op reports cause 2 with tval = the RVC parcel for an RVC op,
+///   else the 32-bit instruction
+/// - no op of a class this build does not serve leaves decode except as an
+///   illegal-instruction fault (legality below is the only place deciding it)
+/// - pred_taken is set only on branches and jumps (checked, not used)
+/// Legality (function `illegal`): an instruction is illegal when
+/// - the reused decoder flags it and it is not one of the vector encodings
+///   decoded here (function `vec_more`: the decoder is shared with the
+///   frozen old core); this includes every vector encoding the vector unit
+///   does not implement
+/// - a vector instruction or a vector CSR access with mstatus.VS = Off, or
+///   with vsstatus.VS = Off when V = 1; a vector FP instruction (OPFVV,
+///   OPFVF) with mstatus.FS = Off; a reserved vector encoding the decoder
+///   lets through (vrsub.vv, vmsgt{u}.vv, vsub.vi, vmin{u}.vi, vmax{u}.vi,
+///   vmslt{u}.vi, vssub{u}.vi; `vmv.v.*` and vfmv.v.f with vs2 != 0,
+///   vmv.x.s, vfmv.f.s, vcompress and the mask logical ops with vm = 0,
+///   vfmv.s.f with vm = 0 or vs2 != 0, vid.v with vs2 != 0, a mask or
+///   whole-register load or store with vm = 0, vlm.v and vsm.v with EEW
+///   other than 8, a whole-register store with EEW other than 8; vmv.s.x
+///   with vm = 0 or vs2 != 0; vmv<nr>r.v with vm = 0, nr not 1, 2, 4 or
+///   8, or vd or vs2 not a multiple of nr; vadc and vsbc with vm = 1 or
+///   vd = v0)
+/// - it is a load or store of a reserved width (LOAD funct3 111, STORE
+///   funct3 1xx, a 16-byte FP access: no Q), or an FP op that rounds with a
+///   reserved rm (101, 110) or with rm DYN while frm holds a reserved value
+///   (101-111), or a vector FP op (OPFVV, OPFVF) while frm holds one
+/// - a scalar encoding the decoder lets through but the ISA reserves
+///   (function `scalar_rsv`): OP-IMM-32 and OP-32 outside their defined
+///   funct7/funct3 pairs (SLLIW/SRLIW/SRAIW with shamt[5] set included),
+///   FSQRT, FMV.X.W/D and FCLASS with rs2 != 0, FMV.X.W/D with a funct3
+///   other than 000, FMV.W/D.X and FLI with funct3 != 000, an FMA of
+///   format H or Q, BRANCH funct3 01x, JALR funct3 != 000, MISC-MEM
+///   funct3 above 010, and a SYSTEM funct3 000 op with rd != 0 or, for
+///   the fixed-function ones (ECALL, EBREAK, xRET, WFI, WRS, DRET), rs1 != 0
+/// - an AMO encoding outside A, Zabha and Zacas: an unknown funct5, LR/SC
+///   below W, LR with rs2 != 0, a width above D except amocas.q, or
+///   amocas.q with an odd rd or rs2
+/// - a CSR access names a CSR that does not exist, needs more privilege, or
+///   writes a read-only CSR; or accesses satp in HS-mode with mstatus.TVM;
+///   or names dcsr, dpc or dscratch0/1 outside Debug Mode; or, below M,
+///   names hstateenN or sstateenN with mstateenN.SE clear, senvcfg or
+///   henvcfg with mstateen0.ENVCFG clear, siselect, `sireg*`, vsiselect or
+///   `vsireg*` with mstateen0.CSRIND clear, or srmcfg with mstateen0.SRMCFG
+///   clear
+/// - `sireg*` with V = 0 unless menvcfg.CDE, siselect is 0x40 + i for a
+///   counter i that mcounteren delegates, and it is sireg for cycle,
+///   instret or hpmcounter i or sireg2 for hpmevent i (Smcdeleg); `sireg*`
+///   from VS with hstateen0.CSRIND set unless vsiselect is in 0x40-0x5F and
+///   menvcfg.CDE is set; `vsireg*` with V = 0; scountinhibit without
+///   menvcfg.CDE
+/// - a counter (cycle, time, instret, hpmcounterN) below M whose mcounteren
+///   bit is clear, or in U whose scounteren bit is clear; stimecmp or
+///   vstimecmp below M without mcounteren.TM and menvcfg.STCE
+/// - an F, D, Zfa or Zfhmin instruction (compute, load, store) or
+///   fflags/frm/fcsr with mstatus.FS = Off
+/// - a CBO below M that menvcfg disables (CBIE = 0 for inval, CBCFE for
+///   clean and flush, CBZE for zero), or in U that senvcfg disables
+/// - MRET below M, SRET in U or in HS-mode with mstatus.TSR, SFENCE.VMA or
+///   SINVAL.VMA in HS-mode with mstatus.TVM, any SFENCE or SINVAL form in
+///   U (HFENCE.GVMA also in HS-mode with mstatus.TVM), HLV/HSV in U without
+///   hstatus.HU, WFI in U or below M with mstatus.TW, DRET outside Debug
+///   Mode, or an undefined SYSTEM function
+/// Virtual instruction (cause 22, only when none of the above holds), with V
+/// = 1: HLV/HSV and HFENCE/HINVAL; an HS-legal access (mstatus.TVM aside) to
+/// a hypervisor or VS CSR, or from VU to a supervisor CSR; a counter that
+/// mcounteren allows but hcounteren (in VU also scounteren) does not;
+/// stimecmp in VS without hcounteren.TM and henvcfg.STCE; a CSR whose
+/// mstateen bit (above) is set and whose hstateen bit is clear; srmcfg and
+/// every `sireg*`; scountinhibit, and scountovf with menvcfg.CDE; a CBO that
+/// menvcfg allows but henvcfg (in VU also senvcfg) does not; in VU SRET, any SFENCE
+/// or SINVAL form and WFI; in VS SRET with hstatus.VTSR, SFENCE.VMA,
+/// SINVAL.VMA and satp with hstatus.VTVM, and WFI with hstatus.VTW. With V =
+/// 1, FS = Off also covers vsstatus.FS = Off.
+/// Debug Mode: an EBREAK carries ExcRec.dm (an entry into Debug Mode, not a
+/// breakpoint trap) when the dcsr.ebreakm/s/u/vs/vu bit of the current mode is
+/// set, and always in Debug Mode; dcsr is committed state like the rest.
+///
+/// # Rationale
+///
+/// - legality reads the committed CSR state live with no shadow: every CSR
+///   change retires with a flush, which empties DQ, decode and rq, so the
+///   state a surviving op saw equals its state at commit
+/// - a fetch fault outranks every decode-time exception, so the fetch
+///   record is taken as is and the decoder output is discarded
+/// - frm is committed state like the rest (a write to it retires with a
+///   flush), so the DYN rounding check reads it live as well
+/// - a legal WFI is a no-op (fu NONE): it completes at once, which the
+///   privileged spec allows; the WFI that traps follows the reference model
+/// - WRS.STO, and WRS.NTO outside the timeout rule, are no-ops (fu NONE):
+///   Zawrs allows them to complete at once. Below M with mstatus.TW, or with
+///   V = 1 and hstatus.VTW, a WRS.NTO is a SYS op: fu_sys times it out at
+///   once into an illegal (TW) or virtual (VTW) instruction exception while
+///   the reservation is valid, the only case in which it would wait
 module decode::<CFG: core_cfg> (
     clk          : input  clock                                                                      ,
     rst          : input  reset                                                                      ,
+    /// DQ output lanes, contiguous from lane 0, registered
     i_valid      : input  logic                                                        [CFG::FETCH_W],
+    /// See i_valid.
     i_xop        : input  core_types::<CFG>::XOp                                       [CFG::FETCH_W],
+    /// rq.o_ready (registered); the whole group moves or none
     i_rq_ready   : input  logic                                                                      ,
+    /// To rq.i_valid/i_data, combinational from the inputs
     o_valid      : output logic                                                        [CFG::FETCH_W],
+    /// See o_valid.
     o_dec        : output core_types::<CFG>::DecOp                                     [CFG::FETCH_W],
+    /// To DQ.i_take: every valid lane when rq is ready, else 0
     o_dq_take    : output logic                     <tag_pkg::idx_w(CFG::FETCH_W + 1)>               ,
+    /// Live csr
+    /// outputs, read combinationally
     i_priv       : input  csr_pkg::PrivLevel                                                         ,
+    /// See i_priv.
     i_virt       : input  logic                                                                      ,
+    /// See i_priv.
     i_mstatus_tsr: input  logic                                                                      ,
+    /// See i_priv.
     i_mstatus_tvm: input  logic                                                                      ,
+    /// See i_priv.
     i_csr        : input  csr_pkg::DecCsr                                                            ,
+    /// See i_priv.
     i_frm        : input  logic                     <3>                                              ,
+    /// Registered event wires
     o_perf       : output core_types::<CFG>::DecPerf                                                 ,
+    /// Sticky invariant flags (HELIODOR_CHK builds only, else 0)
+    /// Kill is applied by the two queues (both flush on kill.valid); decode
+    /// holds no op state.
     o_chk        : output logic                                                                      ,
 ) {
     import core_types::<CFG>::*;

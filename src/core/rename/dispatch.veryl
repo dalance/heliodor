@@ -1,59 +1,43 @@
-// dispatch: per-cycle acceptance (take) from registered credits, and the
-// allocation writes of the rename/dispatch stage rn_ into rob, iq, lq, sq,
-// the free lists and busy_table.
-//
-// Ports (timing contract):
-//   i_valid/i_op   : rq output lanes (registered), contiguous from lane 0
-//   i_ren          : rename mapping of the same lanes (combinational)
-//   i_*_free, i_rob_tag, i_lq_tag, i_sq_tag, i_lq_bar, i_fl_*_head :
-//                    owner credits and allocation tables, registered state
-//                    only; *_tag[k] / *_head[k] is the ring position after k
-//                    allocations
-//   i_bar_ret      : lq's count of retired ld_barrier ops (registered); a
-//                    load behind an unretired barrier obeys the load fence
-//   i_bt_rdy[3l+s] : busy_table prf_ready of source s of lane l (read with
-//                    i_ren.ps*); i_wake : this cycle's wake lanes
-//   i_kill, i_walk_busy : take is 0 in a kill cycle and while rob walks
-//   o_take         : lanes accepted this cycle, to rq.i_take and rename
-//   o_pop_n_int/fp : free_list pops; o_bar_n : ld_barrier ops to lq
-//   o_rob_valid/o_rob : rob allocation, lanes 0..o_take-1
-//   o_rob_src      : the registers each lane's op reads, for the retire
-//                    record only (observation, not a design input)
-//   o_iq_valid/o_iq   : per IQ q, slots q*RENAME_W + i, the i-th taken op
-//                       bound for q (compacted, program order)
-//   o_lq_*/o_sq_*     : compacted in program order; the queue gives slot i
-//                       its o_alloc_tag[i]
-//   o_bt_clr_*     : destinations whose prf_ready (and prf_done) clears on
-//                    this edge
-//   i_vu_rdy       : vu_adapter's registered free FIFO slot
-//   o_vu           : the taken VEC op, at most one per group
-//   o_perf         : registered event wires; o_chk : sticky flags
-//   All outputs are combinational from the inputs; every write happens on
-//   the edge of this cycle.
-// Owns:
-//   - accepted lanes are contiguous from lane 0; the rest stay in rq
-//   - no owner is asked for more allocations than its registered credit
-//   - nothing is allocated in a kill cycle or during a walk
-//   - an op with fu NONE goes to rob only, allocated done
-//   - a VEC op goes to rob and the vector unit; the group ends before a
-//     second VEC op (the vector unit takes one op per cycle)
-// Rationale:
-//   - take is a prefix of lanes whose cumulative demand fits every credit
-//     and that holds at most one checkpointed BRU op (rename's one
-//     checkpoint per group): the group ends before a BRU op behind it;
-//     the IQ of an op follows from its FU kind alone (one IQ per kind), so
-//     take does not wait for port selection inside the IQ
-//   - tags come from the owners' tables indexed by group prefix counts;
-//     dispatch never computes a next tag and never sees a ring size
-//   - a source written by an older lane of the group starts not ready: its
-//     busy bit still describes the register's previous owner
+/// Per-cycle acceptance (take) from registered credits, and the
+/// allocation writes of the rename/dispatch stage rn_ into rob, iq, lq, sq,
+/// the free lists and busy_table.
+///
+/// # Owns
+///
+/// - accepted lanes are contiguous from lane 0; the rest stay in rq
+/// - no owner is asked for more allocations than its registered credit
+/// - nothing is allocated in a kill cycle or during a walk
+/// - an op with fu NONE goes to rob only, allocated done
+/// - a VEC op goes to rob and the vector unit; the group ends before a
+///   second VEC op (the vector unit takes one op per cycle)
+///
+/// # Rationale
+///
+/// - take is a prefix of lanes whose cumulative demand fits every credit
+///   and that holds at most one checkpointed BRU op (rename's one
+///   checkpoint per group): the group ends before a BRU op behind it;
+///   the IQ of an op follows from its FU kind alone (one IQ per kind), so
+///   take does not wait for port selection inside the IQ
+/// - tags come from the owners' tables indexed by group prefix counts;
+///   dispatch never computes a next tag and never sees a ring size
+/// - a source written by an older lane of the group starts not ready: its
+///   busy bit still describes the register's previous owner
 module dispatch::<CFG: core_cfg> (
     clk          : input  clock                                                                                ,
     rst          : input  reset                                                                                ,
+    /// Rq output lanes (registered), contiguous from lane 0
     i_valid      : input  logic                                                     [CFG::RENAME_W]            ,
+    /// See i_valid.
     i_op         : input  core_types::<CFG>::DecOp                                  [CFG::RENAME_W]            ,
+    /// rename mapping of the same lanes (combinational)
+    /// i_*_free, i_rob_tag, i_lq_tag, i_sq_tag, i_lq_bar, i_fl_*_head :
+    /// owner credits and allocation tables, registered state
+    /// only; *_tag[k] / *_head[k] is the ring position after k
+    /// allocations
     i_ren        : input  core_types::<CFG>::RenOut                                 [CFG::RENAME_W]            ,
+    /// Take is 0 in a kill cycle and while rob walks
     i_kill       : input  core_types::<CFG>::Kill                                                              ,
+    /// See i_kill.
     i_walk_busy  : input  logic                                                                                ,
     i_rob_free   : input  logic                      <core_types::<CFG>::ROB_CNT_W>                            ,
     i_rob_tag    : input  core_types::<CFG>::RobTag                                 [CFG::RENAME_W]            ,
@@ -61,6 +45,8 @@ module dispatch::<CFG: core_cfg> (
     i_lq_free    : input  logic                      <core_types::<CFG>::LQ_CNT_W>                             ,
     i_lq_tag     : input  core_types::<CFG>::LqTag                                  [CFG::RENAME_W + 1]        ,
     i_lq_bar     : input  core_types::<CFG>::BarSeq                                 [CFG::RENAME_W + 1]        ,
+    /// lq's count of retired ld_barrier ops (registered); a
+    /// load behind an unretired barrier obeys the load fence
     i_bar_ret    : input  core_types::<CFG>::BarSeq                                                            ,
     i_sq_free    : input  logic                      <core_types::<CFG>::SQ_CNT_W>                             ,
     i_sq_tag     : input  core_types::<CFG>::SqTag                                  [CFG::RENAME_W + 1]        ,
@@ -68,25 +54,47 @@ module dispatch::<CFG: core_cfg> (
     i_fl_int_head: input  core_types::<CFG>::FlPtr                                  [CFG::RENAME_W + 1]        ,
     i_fl_fp_free : input  logic                      <core_types::<CFG>::FL_CNT_W>                             ,
     i_fl_fp_head : input  core_types::<CFG>::FlPtr                                  [CFG::RENAME_W + 1]        ,
+    /// busy_table prf_ready of source s of lane l (read with
+    /// i_ren.ps*); i_wake : this cycle's wake lanes
     i_bt_rdy     : input  logic                                                     [3 * CFG::RENAME_W]        ,
+    /// vu_adapter's registered free FIFO slot
     i_vu_rdy     : input  logic                                                                                ,
     i_wake       : input  core_types::<CFG>::Wake                                   [core_types::<CFG>::WB_N]  ,
+    /// Lanes accepted this cycle, to rq.i_take and rename
     o_take       : output logic                      <core_types::<CFG>::TAKE_W>                               ,
+    /// free_list pops; o_bar_n : ld_barrier ops to lq
     o_pop_n_int  : output logic                      <core_types::<CFG>::TAKE_W>                               ,
     o_pop_n_fp   : output logic                      <core_types::<CFG>::TAKE_W>                               ,
     o_bar_n      : output logic                      <core_types::<CFG>::TAKE_W>                               ,
+    /// rob allocation, lanes 0..o_take-1
     o_rob_valid  : output logic                                                     [CFG::RENAME_W]            ,
+    /// See o_rob_valid.
     o_rob        : output core_types::<CFG>::RobAlloc                               [CFG::RENAME_W]            ,
+    /// The registers each lane's op reads, for the retire
+    /// record only (observation, not a design input)
     o_rob_src    : output core_types::<CFG>::OpSrc                                  [CFG::RENAME_W]            ,
+    /// Per IQ q, slots q*RENAME_W + i, the i-th taken op
+    /// bound for q (compacted, program order)
     o_iq_valid   : output logic                                                     [CFG::N_IQ * CFG::RENAME_W],
+    /// See o_iq_valid.
     o_iq         : output core_types::<CFG>::IqAlloc                                [CFG::N_IQ * CFG::RENAME_W],
+    /// Compacted in program order; the queue gives slot i
+    /// its o_alloc_tag[i]
     o_lq_valid   : output logic                                                     [CFG::RENAME_W]            ,
     o_lq         : output core_types::<CFG>::LqAlloc                                [CFG::RENAME_W]            ,
+    /// See o_lq_valid.
     o_sq_valid   : output logic                                                     [CFG::RENAME_W]            ,
     o_sq         : output core_types::<CFG>::SqAlloc                                [CFG::RENAME_W]            ,
+    /// Destinations whose prf_ready (and prf_done) clears on
+    /// this edge
     o_bt_clr_v   : output logic                                                     [CFG::RENAME_W]            ,
+    /// See o_bt_clr_v.
     o_bt_clr_p   : output core_types::<CFG>::PReg                                   [CFG::RENAME_W]            ,
+    /// The taken VEC op, at most one per group
     o_vu         : output core_types::<CFG>::VuAlloc                                                          ,
+    /// Registered event wires; o_chk : sticky flags
+    /// All outputs are combinational from the inputs; every write happens on
+    /// the edge of this cycle.
     o_perf       : output core_types::<CFG>::DispPerf                                                          ,
     o_chk        : output logic                      <3>                                                       ,
 ) {

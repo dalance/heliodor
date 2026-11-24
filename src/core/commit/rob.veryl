@@ -1,80 +1,88 @@
-// rob: reorder buffer storage, completion, oldest-exception record, walk
-// sequencing.
-//
-// Ports (timing contract):
-//   i_alloc_valid/i_alloc : dispatch group, lanes contiguous from lane 0;
-//                           lane l becomes the entry o_alloc_tag[l]. No
-//                           allocation in a kill cycle or while o_walk_busy
-//   o_alloc_tag, o_free   : registered state only
-//   i_wb[WB_N]            : one WbPacket per WB port; done, fflags and obs of
-//                           an op completed in cycle t are visible on o_cm
-//                           from t+1 (obs only with HELIODOR_OBS, else 0). BRU ports also write the resolve record;
-//                           the memory pipes and the SYS port may report an
-//                           exception
-//   i_vu_done             : the completion of a VEC op (vu_adapter), the only
-//                           completion input besides i_wb; reserved, never
-//                           arbitrated: VEC ops are alone and nonspec, so at
-//                           most one completes at a time. A pair packet on
-//                           i_wb carries its PRF write in the same cycle
-//   o_cm[COMMIT_W]        : the COMMIT_W oldest entries (lane l = head + l),
-//                           registered state only
-//   i_alloc_src/o_cm_src  : the source registers of the same lanes, for the
-//                           retire record only; held with HELIODOR_OBS, 0
-//                           without it
-//   o_exc, o_head         : registered state only
-//   i_retire_cnt          : from commit; head advances on the edge
-//   i_kill                : full: empties the ROB and aborts a walk. Partial:
-//                           tail := next(keep), and without ckpt_v a walk
-//                           of the killed entries starts (with ckpt_v rename
-//                           restores a checkpoint). Precondition: no partial kill
-//                           while o_walk_busy or in the cycle after a kill
-//                           (flush_ctrl adopts no resolve then; chk_rob bit
-//                           6 checks the walk half). A partial kill during a
-//                           walk would restart from the tail and skip the
-//                           unwalked rest
-//   i_rec_set             : from flush_ctrl; sets recovered on the edge that
-//                           registers the partial Kill
-//   i_snap_tag -> o_snap  : combinational snapshot read for flush_ctrl
-//   o_walk, o_walk_busy   : registered. In the cycles after a partial kill,
-//                           WALK_W entries per cycle, youngest first (lane 0
-//                           is the youngest of the batch); an entry without
-//                           rd is an invalid lane. o_walk_busy is set exactly
-//                           in the cycles that present a batch
-// Owns:
-//   - exc_q is the oldest exception reported by a live op: the reports of
-//     the cycle and the held one go through one oldest-tag tree after the
-//     kill of the cycle removes its victims
-//   - a walk presents every entry younger than keep exactly once, youngest
-//     first, and lasts ceil(n / WALK_W) cycles for n killed entries
-// Rationale:
-//   - an entry holds only what commit and recovery need; large results stay
-//     in their owning queues and the retire record reads them there
-//   - completion is not a filter: a packet for a free entry only marks it
-//     done, and allocation rewrites done. Not sending packets of killed ops
-//     is the senders' duty (kill completeness). A pair packet (amocas.q's
-//     rd+1) completes nothing, so each op completes with exactly one packet
-//   - one register holds the oldest exception: only the group head traps,
-//     and every younger exception dies with that trap's full kill
+/// Reorder buffer storage, completion, oldest-exception record, walk
+/// sequencing.
+///
+/// # Owns
+///
+/// - exc_q is the oldest exception reported by a live op: the reports of
+///   the cycle and the held one go through one oldest-tag tree after the
+///   kill of the cycle removes its victims
+/// - a walk presents every entry younger than keep exactly once, youngest
+///   first, and lasts ceil(n / WALK_W) cycles for n killed entries
+///
+/// # Rationale
+///
+/// - an entry holds only what commit and recovery need; large results stay
+///   in their owning queues and the retire record reads them there
+/// - completion is not a filter: a packet for a free entry only marks it
+///   done, and allocation rewrites done. Not sending packets of killed ops
+///   is the senders' duty (kill completeness). A pair packet (amocas.q's
+///   rd+1) completes nothing, so each op completes with exactly one packet
+/// - one register holds the oldest exception: only the group head traps,
+///   and every younger exception dies with that trap's full kill
 pub module rob::<CFG: core_cfg> (
     clk          : input  clock                                                                                   ,
     rst          : input  reset                                                                                   ,
+    /// dispatch group, lanes contiguous from lane 0;
+    /// lane l becomes the entry o_alloc_tag[l]. No
+    /// allocation in a kill cycle or while o_walk_busy
     i_alloc_valid: input  logic                                                        [CFG::RENAME_W]            ,
+    /// See i_alloc_valid.
     i_alloc      : input  core_types::<CFG>::RobAlloc                                  [CFG::RENAME_W]            ,
+    /// The source registers of the same lanes, for the
+    /// retire record only; held with HELIODOR_OBS, 0
+    /// without it
     i_alloc_src  : input  core_types::<CFG>::OpSrc                                     [CFG::RENAME_W]            ,
+    /// Registered state only
     o_alloc_tag  : output core_types::<CFG>::RobTag                                    [CFG::RENAME_W]            ,
+    /// See o_alloc_tag.
     o_free       : output logic                      <core_types::<CFG>::ROB_CNT_W>                               ,
+    /// One WbPacket per WB port; done, fflags and obs of
+    /// an op completed in cycle t are visible on o_cm
+    /// from t+1 (obs only with HELIODOR_OBS, else 0). BRU ports also write the resolve record;
+    /// the memory pipes and the SYS port may report an
+    /// exception
     i_wb         : input  core_types::<CFG>::WbPacket                                  [core_types::<CFG>::WB_N]  ,
+    /// The completion of a VEC op (vu_adapter), the only
+    /// completion input besides i_wb; reserved, never
+    /// arbitrated: VEC ops are alone and nonspec, so at
+    /// most one completes at a time. A pair packet on
+    /// i_wb carries its PRF write in the same cycle
     i_vu_done    : input  core_types::<CFG>::VuDone                                                               ,
+    /// The COMMIT_W oldest entries (lane l = head + l),
+    /// registered state only
     o_cm         : output core_types::<CFG>::RobCm                                     [CFG::COMMIT_W]            ,
+    /// See i_alloc_src.
     o_cm_src     : output core_types::<CFG>::OpSrc                                     [CFG::COMMIT_W]            ,
+    /// Registered state only
     o_exc        : output core_types::<CFG>::ExcHold                                                              ,
+    /// See o_exc.
     o_head       : output core_types::<CFG>::TagTok                                                               ,
+    /// From commit; head advances on the edge
     i_retire_cnt : input  logic                      <core_types::<CFG>::RETIRE_CNT_W>                            ,
+    /// Full: empties the ROB and aborts a walk. Partial:
+    /// tail := next(keep), and without ckpt_v a walk
+    /// of the killed entries starts (with ckpt_v rename
+    /// restores a checkpoint). Precondition: no partial kill
+    /// while o_walk_busy or in the cycle after a kill
+    /// (flush_ctrl adopts no resolve then; chk_rob bit
+    /// 6 checks the walk half). A partial kill during a
+    /// walk would restart from the tail and skip the
+    /// unwalked rest
     i_kill       : input  core_types::<CFG>::Kill                                                                 ,
+    /// From flush_ctrl; sets recovered on the edge that
+    /// registers the partial Kill
     i_rec_set    : input  core_types::<CFG>::TagTok                                                               ,
+    /// Combinational snapshot read for flush_ctrl
     i_snap_tag   : input  core_types::<CFG>::RobTag                                                               ,
+    /// See i_snap_tag.
     o_snap       : output core_types::<CFG>::DispSnap                                                             ,
+    /// registered. In the cycles after a partial kill,
+    /// WALK_W entries per cycle, youngest first (lane 0
+    /// is the youngest of the batch); an entry without
+    /// rd is an invalid lane. o_walk_busy is set exactly
+    /// in the cycles that present a batch
     o_walk       : output core_types::<CFG>::WalkLane                                  [core_types::<CFG>::WALK_W],
+    /// See o_walk.
     o_walk_busy  : output logic                                                                                   ,
     o_perf       : output core_types::<CFG>::RobPerf                                                              ,
     o_chk        : output logic                      <core_types::<CFG>::CHK_ROB_W>                               ,

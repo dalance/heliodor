@@ -1,103 +1,125 @@
-// mem_ctrl: the coherent home of the new-core SoC and its AXI4 master.
-//
-// Sits between the per-slot L1 read channels and the shared L2, and drives
-// the SoC's DRAM side as one AXI4 master port (64-bit data, INCR bursts of
-// AxSIZE 3). The old core uses the frozen copy v14_mem_ctrl.
-//
-// Read transaction of a slot:
-//   ACCEPT  : a 1-cycle o_hgrant pulse; the L1 latches its FILL state on it.
-//   LOOKUP  : the line is looked up in the shared L2 (an LK op, see below).
-//   L2 hit  : the line is copied into the slot buffer and streams to the L1
-//             HIT_WAIT + 1 cycles after the op issued.
-//   L2 miss : the slot asks for the AR channel (ST_AR). The AR is a line
-//             burst (ARLEN 7 from the line base, ARID = slot); the R beats
-//             land in the slot buffer in arrival order, then the line is
-//             installed into the L2 and streams (an I-read streams without
-//             installing).
-//   STREAM  : o_hgrant held for 8 cycles; o_hrdata serves the dword the L1
-//             addresses (i_haddr[5:3]), so critical-word-first is the L1's.
-//   UNCACHED: an i_hunc read (DRAM or ROM) waits in LOOKUP until no L1 owns
-//             the line (a ROM read does not look up), then reads one beat
-//             (ARLEN 0, 8-byte aligned) and grants it for one cycle (ST_UNCD).
-//
-// Writes: a granted DRAM write enters the write buffer (WB_N line entries,
-// one FIFO in grant order); the grant means "accepted by the home", not
-// "reached DRAM". Each entry is one INCR burst over the lanes between its
-// first and last strobed lane, AWID 0 for every write so that the slave
-// keeps them in grant order. AW and W are raised independently; an entry is
-// freed by its B. o_wb_full stops the SoC's write grant.
-//
-// AXI rules this module keeps: every valid and payload comes from registers
-// and holds until its ready; RREADY and BREADY are always 1 (the slot buffer
-// is the R sink, so R never needs backpressure). No AR is raised for a line
-// while a write to that line is buffered or granted this cycle (a later read
-// must not pass an earlier write); a write granted while the AR of a slot is
-// presented or its R beats are arriving clears install_ok, as before.
-//
-// Non-DRAM, non-ROM (MMIO) reads keep the legacy path: their bus request
-// and grant pass straight through (o_bus_rreq / o_hgrant) and the SoC muxes
-// their data.
-//
-// The last slot (SBA_S) belongs to the Debug Module's System Bus Access and
-// to no hart; it only makes i_hunc requests. A read is the uncached beat
-// above. A write (i_sba_wr) waits in LOOKUP like a read, so the recall
-// engine brings an owned line home, then holds the line in ST_UNCD
-// (o_sba_wok) until the SoC grants it the write channel (i_w_sba). Holding
-// the slot keeps every other accept off the line, so no L1 can own it again
-// before the write, and the write invalidates every sharer.
-//
-// CMO_HOME (i_hcmo with i_hunc, a hart's D slot): the flush of one line
-// for cbo.clean/flush/inval, after the requester dropped its own copy. It
-// waits in LOOKUP like an uncached read, so the recall engine brings an
-// owned line home (a dirty copy enters the write buffer), then, in the one
-// cycle it proceeds, invalidates every listed sharer on an inv port and
-// the line in the L2 (o_l2_cinv_v), and records the write-buffer entries
-// of the line. It holds the line in ST_UNCD until each of them has its B,
-// then grants for one cycle: the line is in no cache and its last write is
-// in DRAM. Holding the slot keeps every accept off the line, so no cache
-// can take the line again before the grant. Progress: the recall and the
-// inv-port wait end as for an uncached read or an RFO, the recorded entries
-// drain in order, and the requester has at most one CMO_HOME (its single
-// D slot), so no retry is involved.
-//
-// Protocol invariant relied upon: an accept grant ALWAYS starts the L1 fill
-// (the requester suppresses its request when it could not start the fill).
-//
-// L2 tag port: every decision on the L2 directory is an op on the L2's one
-// tag port. An op issues (presents its line, o_t_addr) and executes in the
-// next cycle, when the L2's verdict on the line is valid and the op applies
-// at most one action to it. One op issues per cycle, so one executes per
-// cycle, in issue order; the L2 forwards each action to the read of the
-// same cycle. The op kinds: LK, the lookup of a LOOKUP slot; IN, the install
-// of an INSTALL slot (issued at the last R beat already); WR, the SoC's
-// selected DRAM write, granted only in its execute cycle (o_wt_ok); EC, the
-// recall engine's clean-ack directory update, issued with the ack and
-// carrying the lookup that asked for the recall when that slot still waits.
-// A slot, the write channel and the engine have at most one op in flight.
-// EC goes first; LK, IN and WR rotate (the class served last goes last), so
-// a wanting class issues within three cycles. Whatever op executes owns the
-// invalidate port that cycle.
-// Progress: an op that cannot complete (an owned line, a vetoed write, a
-// blocked install) changes nothing and issues again. What it waits for is a
-// recall, which ends with an EC op (issued once, first) or with the owner's
-// WB, a WR op; the SoC's write rotation moves to the next requester after
-// every WR op, so the WB gets one within a turn of the requesting harts.
-// Same-line order is unchanged: the per-line serialization below.
-//
-// MESI home rules:
-//  - PER-LINE SERIALIZATION: an accept is blocked while another slot or the
-//    recall engine is active on the same line, which keeps directory
-//    updates race-free.
-//  - LOOKUP hit on an OWNED line: the RECALL ENGINE probes the owner; a dirty
-//    copy comes back as a WB on the write channel (the home merges it and
-//    clears ownership), a clean one answers probe_ack (o_eclr). The slot
-//    re-looks-up until the line is unowned, or captures the WB (c2c).
-//  - LOOKUP hit, not owned: READ grants E (N = 1) or S; RFO grants M and
-//    invalidates the other sharers in the same cycle.
-//  - INSTALL: an OWNED victim is recalled before the eviction; the installer
-//    becomes owner.
-//  - The recall engine also serves the SoC's WRITE-GRANT VETO (a non-WB
-//    write targeting a line owned by another hart).
+/// The coherent home of the new-core SoC and its AXI4 master.
+///
+/// Sits between the per-slot L1 read channels and the shared L2, and drives
+/// the SoC's DRAM side as one AXI4 master port (64-bit data, INCR bursts of
+/// AxSIZE 3). The old core uses the frozen copy v14_mem_ctrl.
+///
+/// # Read transaction of a slot
+///
+/// ```text
+/// ACCEPT  : a 1-cycle o_hgrant pulse; the L1 latches its FILL state on it.
+/// LOOKUP  : the line is looked up in the shared L2 (an LK op, see below).
+/// L2 hit  : the line is copied into the slot buffer and streams to the L1
+///           HIT_WAIT + 1 cycles after the op issued.
+/// L2 miss : the slot asks for the AR channel (ST_AR). The AR is a line
+///           burst (ARLEN 7 from the line base, ARID = slot); the R beats
+///           land in the slot buffer in arrival order, then the line is
+///           installed into the L2 and streams (an I-read streams without
+///           installing).
+/// STREAM  : o_hgrant held for 8 cycles; o_hrdata serves the dword the L1
+///           addresses (i_haddr[5:3]), so critical-word-first is the L1's.
+/// UNCACHED: an i_hunc read (DRAM or ROM) waits in LOOKUP until no L1 owns
+///           the line (a ROM read does not look up), then reads one beat
+///           (ARLEN 0, 8-byte aligned) and grants it for one cycle (ST_UNCD).
+/// ```
+///
+/// Writes: a granted DRAM write enters the write buffer (WB_N line entries,
+/// one FIFO in grant order); the grant means "accepted by the home", not
+/// "reached DRAM". Each entry is one INCR burst over the lanes between its
+/// first and last strobed lane, AWID 0 for every write so that the slave
+/// keeps them in grant order. AW and W are raised independently; an entry is
+/// freed by its B. o_wb_full stops the SoC's write grant.
+///
+/// AXI rules this module keeps: every valid and payload comes from registers
+/// and holds until its ready; RREADY and BREADY are always 1 (the slot buffer
+/// is the R sink, so R never needs backpressure). No AR is raised for a line
+/// while a write to that line is buffered or granted this cycle (a later read
+/// must not pass an earlier write); a write granted while the AR of a slot is
+/// presented or its R beats are arriving clears install_ok, as before.
+///
+/// Non-DRAM, non-ROM (MMIO) reads keep the legacy path: their bus request
+/// and grant pass straight through (o_bus_rreq / o_hgrant) and the SoC muxes
+/// their data.
+///
+/// The last slot (SBA_S) belongs to the Debug Module's System Bus Access and
+/// to no hart; it only makes i_hunc requests. A read is the uncached beat
+/// above. A write (i_sba_wr) waits in LOOKUP like a read, so the recall
+/// engine brings an owned line home, then holds the line in ST_UNCD
+/// (o_sba_wok) until the SoC grants it the write channel (i_w_sba). Holding
+/// the slot keeps every other accept off the line, so no L1 can own it again
+/// before the write, and the write invalidates every sharer.
+///
+/// CMO_HOME (i_hcmo with i_hunc, a hart's D slot): the flush of one line
+/// for cbo.clean/flush/inval, after the requester dropped its own copy. It
+/// waits in LOOKUP like an uncached read, so the recall engine brings an
+/// owned line home (a dirty copy enters the write buffer), then, in the one
+/// cycle it proceeds, invalidates every listed sharer on an inv port and
+/// the line in the L2 (o_l2_cinv_v), and records the write-buffer entries
+/// of the line. It holds the line in ST_UNCD until each of them has its B,
+/// then grants for one cycle: the line is in no cache and its last write is
+/// in DRAM. Holding the slot keeps every accept off the line, so no cache
+/// can take the line again before the grant. Progress: the recall and the
+/// inv-port wait end as for an uncached read or an RFO, the recorded entries
+/// drain in order, and the requester has at most one CMO_HOME (its single
+/// D slot), so no retry is involved.
+///
+/// Protocol invariant relied upon: an accept grant ALWAYS starts the L1 fill
+/// (the requester suppresses its request when it could not start the fill).
+///
+/// L2 tag port: every decision on the L2 directory is an op on the L2's one
+/// tag port. An op issues (presents its line, o_t_addr) and executes in the
+/// next cycle, when the L2's verdict on the line is valid and the op applies
+/// at most one action to it. One op issues per cycle, so one executes per
+/// cycle, in issue order; the L2 forwards each action to the read of the
+/// same cycle. The op kinds: LK, the lookup of a LOOKUP slot; IN, the install
+/// of an INSTALL slot (issued at the last R beat already); WR, the SoC's
+/// selected DRAM write, granted only in its execute cycle (o_wt_ok); EC, the
+/// recall engine's clean-ack directory update, issued with the ack and
+/// carrying the lookup that asked for the recall when that slot still waits.
+/// A slot, the write channel and the engine have at most one op in flight.
+/// EC goes first; LK, IN and WR rotate (the class served last goes last), so
+/// a wanting class issues within three cycles. Whatever op executes owns the
+/// invalidate port that cycle.
+/// Progress: an op that cannot complete (an owned line, a vetoed write, a
+/// blocked install) changes nothing and issues again. What it waits for is a
+/// recall, which ends with an EC op (issued once, first) or with the owner's
+/// WB, a WR op; the SoC's write rotation moves to the next requester after
+/// every WR op, so the WB gets one within a turn of the requesting harts.
+/// Same-line order is unchanged: the per-line serialization below.
+///
+/// MESI home rules:
+///  - PER-LINE SERIALIZATION: an accept is blocked while another slot or the
+///
+/// ```text
+///    recall engine is active on the same line, which keeps directory
+///    updates race-free.
+/// ```
+///
+///  - LOOKUP hit on an OWNED line: the RECALL ENGINE probes the owner; a dirty
+///
+/// ```text
+///    copy comes back as a WB on the write channel (the home merges it and
+///    clears ownership), a clean one answers probe_ack (o_eclr). The slot
+///    re-looks-up until the line is unowned, or captures the WB (c2c).
+/// ```
+///
+///  - LOOKUP hit, not owned: READ grants E (N = 1) or S; RFO grants M and
+///
+/// ```text
+///    invalidates the other sharers in the same cycle.
+/// ```
+///
+///  - INSTALL: an OWNED victim is recalled before the eviction; the installer
+///
+/// ```text
+///    becomes owner.
+/// ```
+///
+///  - The recall engine also serves the SoC's WRITE-GRANT VETO (a non-WB
+///
+/// ```text
+///    write targeting a line owned by another hart).
+/// ```
 pub module mem_ctrl #(
     param N_HARTS  : u32 = 1 ,
     // ── Block N (cp_mshr_mlp_plan.md §5): transaction SLOTS per hart. ──

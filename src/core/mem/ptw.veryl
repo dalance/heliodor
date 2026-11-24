@@ -1,86 +1,48 @@
-// ptw: page table walker with a request queue, walk coalescing, the epoch
-// rule for installs, Svadu A/D updates and PTE reads as a tagged client of
-// memory port 0. A V = 0 walk is Sv39 under satp; a guest walk (V1, HLV) is
-// two-stage: Sv39 under vsatp whose every PTE address is translated by the
-// Sv39x4 G-stage under hgatp, then the G-stage translation of the final GPA
-//
-// Ports (timing contract):
-//   i_req_valid/i_req : a walk request, accepted when o_req_ready; i_req.valid
-//                       is the lookup qualifier and is not read here. A
-//                       request whose key {vpn, regime} matches a queued
-//                       request or the running walk of the same epoch is
-//                       accepted as a waiter (it gets o_evt only); nonspec
-//                       requests always queue
-//   o_req_ready       : registered state only (a free queue entry)
-//   i_kill            : on its edge drops the queued requests whose oldest
-//                       participant it kills and the owners it kills; a
-//                       request without a RobTag (tag.rob_v = 0, the IFU) is
-//                       dropped by every kill and by i_owner_drop
-//   i_ctx, i_pmp*     : live CSR context; i_ctx is latched at walk start, the
-//                       PMP registers change only under a flush
-//   i_inv             : invalidation at retire; like a full kill it advances
-//                       the epoch
-//   o_fill            : combinational in the completion cycle, to this
-//                       side's tlb: a faultless walk that saw no full kill and
-//                       no invalidation since its start, this cycle included
-//   o_resp            : registered, the cycle after completion: the full
-//                       translation for the owner's access (pa, pma with PBMT,
-//                       exc with gpa/gva/implicit, need_d), only while the
-//                       owner lives and the walk is of the current epoch
-//   o_evt             : registered, the cycle after every completion
-//   o_mem_*, i_mem_*  : one request at a time on port 0 (valid/ready; valid
-//                       never depends on ready). PTE reads are PTW_READ of
-//                       client PTW_D (PTW_I for an IFU walk); an A/D update
-//                       is an owned read-modify-write of client AD, LOAD_EXCL
-//                       then STORE_EXCL; tag.id = {sequence, IFU walk},
-//                       rob_v = 0. A response is taken by tag only, MEM_LAT
-//                       cycles after accept; o_mem_req holds from accept
-//                       until that response, so a port that presents the
-//                       request later than the accept may read it there
-//   i_mem_slot        : the accepted request is due on the port this cycle
-//                       (the accept cycle itself for a port that presents at
-//                       accept); o_mem_av presents it. A STORE_EXCL whose
-//                       window broke since the grant is withdrawn there and
-//                       gets no response
-//   i_ordering_empty  : sb ordering_empty; the A/D read and write wait for it
-//   i_coh_v/i_coh_line: inv, inv2 and the local departures of this cycle
-//   o_idle            : registered state only: no walk and no queued request
-// Owns:
-//   - an install never carries a translation read before a full kill or an
-//     invalidation
-//   - the D bit of the leaf that maps the access (V = 0, VS-stage, or the
-//     G-stage leaf of a guest's final GPA) is written only for a nonspec
-//     request whose owner lives. The G-stage leaf of a VS-stage PTE gets D
-//     only for that PTE's own A/D update, the write it is translated for
-//   - every completion broadcasts o_evt; at most one o_resp per walk
-//   - no result-holding state: the completion cycle installs, answers and
-//     broadcasts, then the walker is idle
-// Rationale:
-//   - the owner always gets its own answer, so it progresses even if a
-//     younger fill evicts the entry before it looks up again
-//   - an A/D update reads the leaf with ownership once sb ordering_empty
-//     holds and writes only if, up to the write's slot, ordering_empty held
-//     and the line never left: an own store draining into the PTE or another
-//     hart's write would otherwise be overwritten with the old value. A leaf
-//     that differs from the walk's in more than A/D, or an EXCL_FAIL, restarts
-//     the walk from the root (a stale walk ends instead)
-//   - PTE reads use supervisor PMP (implicit accesses) and the PMA pte_ok bit,
-//     both checked before the read is presented
-//   - one cursor serves both stages of a guest walk: a G-stage walk runs
-//     either for the next VS-stage PTE (its leaf resumes the VS-stage at the
-//     HPA) or for the final GPA (its leaf completes). A guest leaf whose
-//     permission fails ends the walk with the fault of its stage, so a page
-//     fault is never reported as a guest-page fault of a later stage
-//   - a guest walk updates A/D with the same owned read-modify-write as V = 0,
-//     the VS-stage by henvcfg.ADUE and the G-stage by menvcfg.ADUE. The write
-//     of a VS-stage leaf goes to a guest physical address, so it first needs
-//     the G-stage leaf of that PTE to permit a store: when the leaf the read
-//     walked does not already have W and D, the G-stage walk of that PTE is
-//     redone as a store (w_vsw_q), which faults as an implicit write or sets
-//     D, and the VS-stage leaf is read again
-//   - a guest walk takes one extra cycle (RES) at each leaf it resumes from;
-//     a V = 0 walk completes from its leaf directly
-//   - requesters send no VA without a key (xlate_pkg::noncanon, gpa_big)
+/// Page table walker with a request queue, walk coalescing, the epoch
+/// rule for installs, Svadu A/D updates and PTE reads as a tagged client of
+/// memory port 0. A V = 0 walk is Sv39 under satp; a guest walk (V1, HLV) is
+/// two-stage: Sv39 under vsatp whose every PTE address is translated by the
+/// Sv39x4 G-stage under hgatp, then the G-stage translation of the final GPA
+///
+/// # Owns
+///
+/// - an install never carries a translation read before a full kill or an
+///   invalidation
+/// - the D bit of the leaf that maps the access (V = 0, VS-stage, or the
+///   G-stage leaf of a guest's final GPA) is written only for a nonspec
+///   request whose owner lives. The G-stage leaf of a VS-stage PTE gets D
+///   only for that PTE's own A/D update, the write it is translated for
+/// - every completion broadcasts o_evt; at most one o_resp per walk
+/// - no result-holding state: the completion cycle installs, answers and
+///   broadcasts, then the walker is idle
+///
+/// # Rationale
+///
+/// - the owner always gets its own answer, so it progresses even if a
+///   younger fill evicts the entry before it looks up again
+/// - an A/D update reads the leaf with ownership once sb ordering_empty
+///   holds and writes only if, up to the write's slot, ordering_empty held
+///   and the line never left: an own store draining into the PTE or another
+///   hart's write would otherwise be overwritten with the old value. A leaf
+///   that differs from the walk's in more than A/D, or an EXCL_FAIL, restarts
+///   the walk from the root (a stale walk ends instead)
+/// - PTE reads use supervisor PMP (implicit accesses) and the PMA pte_ok bit,
+///   both checked before the read is presented
+/// - one cursor serves both stages of a guest walk: a G-stage walk runs
+///   either for the next VS-stage PTE (its leaf resumes the VS-stage at the
+///   HPA) or for the final GPA (its leaf completes). A guest leaf whose
+///   permission fails ends the walk with the fault of its stage, so a page
+///   fault is never reported as a guest-page fault of a later stage
+/// - a guest walk updates A/D with the same owned read-modify-write as V = 0,
+///   the VS-stage by henvcfg.ADUE and the G-stage by menvcfg.ADUE. The write
+///   of a VS-stage leaf goes to a guest physical address, so it first needs
+///   the G-stage leaf of that PTE to permit a store: when the leaf the read
+///   walked does not already have W and D, the G-stage walk of that PTE is
+///   redone as a store (w_vsw_q), which faults as an implicit write or sets
+///   D, and the VS-stage leaf is read again
+/// - a guest walk takes one extra cycle (RES) at each leaf it resumes from;
+///   a V = 0 walk completes from its leaf directly
+/// - requesters send no VA without a key (xlate_pkg::noncanon, gpa_big)
 pub module ptw::<CFG: core_cfg> #(
     param QN     : u32                        = 4               ,
     param MEM_LAT: u32                        = fu_pkg::RESP_LAT, // accept to response
@@ -92,33 +54,80 @@ pub module ptw::<CFG: core_cfg> #(
     clk: input clock,
     rst: input reset,
 
+    /// On its edge drops the queued requests whose oldest
+    /// participant it kills and the owners it kills; a
+    /// request without a RobTag (tag.rob_v = 0, the IFU) is
+    /// dropped by every kill and by i_owner_drop
     i_kill      : input core_types::<CFG>::Kill,
     i_owner_drop: input logic                  ,
 
+    /// A walk request, accepted when o_req_ready; i_req.valid
+    /// is the lookup qualifier and is not read here. A
+    /// request whose key {vpn, regime} matches a queued
+    /// request or the running walk of the same epoch is
+    /// accepted as a waiter (it gets o_evt only); nonspec
+    /// requests always queue
     i_req_valid: input  logic                      ,
+    /// See i_req_valid.
     i_req      : input  core_types::<CFG>::XlateReq,
+    /// Registered state only (a free queue entry)
     o_req_ready: output logic                      ,
 
+    /// Live CSR context; i_ctx is latched at walk start, the
+    /// PMP registers change only under a flush
     i_ctx    : input xlate_pkg::XlateCtx         ,
+    /// See i_ctx.
     i_pmp    : input pmp_pkg::PmpEnt         [16],
+    /// Invalidation at retire; like a full kill it advances
+    /// the epoch
     i_inv    : input xlate_pkg::TlbInv           ,
 
+    /// sb ordering_empty; the A/D read and write wait for it
+    /// i_coh_v/i_coh_line: inv, inv2 and the local departures of this cycle
     i_ordering_empty: input logic                                   ,
     i_coh_v         : input logic         [core_types::<CFG>::COH_N],
     i_coh_line      : input pma_pkg::Line [core_types::<CFG>::COH_N],
 
+    /// Combinational in the completion cycle, to this
+    /// side's tlb: a faultless walk that saw no full kill and
+    /// no invalidation since its start, this cycle included
     o_fill: output xlate_pkg::TlbFill          ,
+    /// Registered, the cycle after completion: the full
+    /// translation for the owner's access (pa, pma with PBMT,
+    /// exc with gpa/gva/implicit, need_d), only while the
+    /// owner lives and the walk is of the current epoch
     o_resp: output core_types::<CFG>::XlateResp,
+    /// Registered, the cycle after every completion
     o_evt : output core_types::<CFG>::PtwEvent ,
 
+    /// One request at a time on port 0 (valid/ready; valid
+    /// never depends on ready). PTE reads are PTW_READ of
+    /// client PTW_D (PTW_I for an IFU walk); an A/D update
+    /// is an owned read-modify-write of client AD, LOAD_EXCL
+    /// then STORE_EXCL; tag.id = {sequence, IFU walk},
+    /// rob_v = 0. A response is taken by tag only, MEM_LAT
+    /// cycles after accept; o_mem_req holds from accept
+    /// until that response, so a port that presents the
+    /// request later than the accept may read it there
     o_mem_valid: output logic                      ,
+    /// See o_mem_valid.
     o_mem_req  : output core_types::<CFG>::MemReq  ,
+    /// See o_mem_valid.
     i_mem_ready: input  logic                      ,
+    /// The accepted request is due on the port this cycle
+    /// (the accept cycle itself for a port that presents at
+    /// accept); o_mem_av presents it. A STORE_EXCL whose
+    /// window broke since the grant is withdrawn there and
+    /// gets no response
     i_mem_slot : input  logic                      ,
+    /// See o_mem_valid.
     o_mem_av   : output logic                      ,
+    /// See o_mem_valid.
     i_mem_resp : input  core_types::<CFG>::MemResp ,
+    /// See o_mem_valid.
     i_mem_evt  : input  core_types::<CFG>::MemEvent,
 
+    /// Registered state only: no walk and no queued request
     o_idle: output logic,
     o_chk: output logic<4>,
 

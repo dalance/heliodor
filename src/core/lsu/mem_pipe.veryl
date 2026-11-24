@@ -1,124 +1,78 @@
-// mem_pipe: one memory pipe; address generation, translation (Bare, Sv39, or
-// a guest's two stages through a DTLB lookup port) with PMP and PMA, the
-// dcache request, forwarding, load formatting and the WB packet
-//
-// Served: integer and FP loads and stores of 1, 2, 4 and 8 bytes, misaligned
-// and line-crossing ones included where the region allows misaligned access;
-// atomics (on the HEAD pipe), CBO ops, and the vector unit's element passes
-// (on the HEAD pipe).
-//   - a non-cacheable load parks for the head (io_unit performs it); a
-//     non-cacheable store writes its SQ entry like any store (io_unit
-//     performs it at the head)
-//   - an atomic is translated and checked here, writes its SQ entry (an LR
-//     its LQ entry's completion) and leaves m2 for atomic_unit, which writes
-//     it back; with an exception it completes here. An atomic that missed
-//     the DTLB hands its operands to atomic_unit on its first pass and its PA
-//     on the re-issued pass
-//   - cbo.clean/flush/inval are translated and checked only; cbo.zero is a
-//     store of the whole line
-//   - a VU pass (vu_mem_adapter) gets the pointer mask, translation, PMP and
-//     PMA like any pass, but no forwarding, LQ/SQ write, wake or packet: its
-//     only output is o_vu at R. A load returns the raw dwords of its
-//     request, a store only its PA (vu_mem_adapter pushes it into sb). A
-//     non-cacheable element is an access fault. Its D-bit walk needs no
-//     token: the VEC op is past its start and cannot be killed
-//
-// Ports (timing contract):
-//   i_iss, i_re, i_vu_go/i_vu : cycle S, combinational; at most one is valid
-//                    (mem_port_arb holds the IQ for this pipe when it grants
-//                    a re-issue or a VU pass); captured into m0
-//   o_iq_rel       : m0; a new issue releases its IQ entry on acceptance
-//   i_tok          : commit's oldest token, read at m1
-//   o_started      : m1, the accepted nonspec walk request of the op holding
-//                    the oldest token (commit's head_started_q)
-//   o_rf_addr*, i_rf_*, i_wb : m0 register read, bypassed from the WB bus
-//   i_xl_on, i_ctx, i_pmp* : read at m0 and m1; they change only at a
-//                    flushing retire. i_xl_on: Sv39 is on for V = 0 data
-//                    accesses (satp mode and the effective privilege, MPRV
-//                    included); i_ctx.prv is that effective privilege, also
-//                    for PMP. A guest access (i_ctx.virt, or an HLV/HSV op)
-//                    resolves its regime with xlate_pkg::xeff
-//   i_pmm, i_pmm_h : read at m0; the pointer-masking mode of the effective
-//                    privilege and that of HLV/HSV, changed only by a
-//                    flushing retire
-//   i_dm           : csr's debug_mode, read at m1; it changes only at the
-//                    full kills of Debug Mode entry and dret
-//   i_trig         : trig_unit's configuration, read at m1 (it changes only
-//                    at a flushing retire)
-//   o_tlb_lk/i_tlb : m1, the DTLB lookup port, combinational round trip
-//   o_xreq_valid/o_xreq, i_xreq_gnt : m1, the walk request of a pass that
-//                    missed the DTLB; i_xreq_gnt is its acceptance in the
-//                    same cycle
-//   i_ptw_evt      : the walker's broadcast; an event of the pass's key from
-//                    its m1 cycle until the verdict (loads) or the STA write
-//                    (stores) marks the pass, which then does not park
-//   o_req_*        : m2 = A, the adapter's accept cycle. Every request is
-//                    accepted and answered exactly RESP_LAT cycles later
-//                    (dcache_port_adapter), so i_resp at R belongs to the
-//                    pass at R whenever that pass sent one
-//   o_fwd_q, i_fwd_sq, i_fwd_sb : m2, combinational round trip
-//   o_snap, o_sta, o_std : m2, written on the m2 edge
-//   i_split_lo     : lq's registered lo dword of the crossing load in flight
-//                    (at most one: crossing loads run only as the oldest)
-//   o_verdict, o_wake    : R = m2 + RESP_LAT, combinational from the response;
-//                    the wake leads o_wb by one cycle (see core_types Wake)
-//   o_wb           : registered, R + 1 = m0 + LD_LAT, merged with the
-//                    non-pipe clients' hole-fill packets i_np_wb (the HEAD
-//                    pipe; the slots differ, so at most one is valid)
-//   o_wake         : merged likewise with i_np_wake (one cycle before its
-//                    packet, so a hole-fill wake never meets a pass's wake in
-//                    R; it takes the lane from a pass's wake in V)
-//   i_np_hf/o_hf_req : the non-pipe clients' hole-fill requests to the pipe's
-//                    wb_resv (at most one is set)
-//   o_amo          : m2, the atomic handed to atomic_unit (HEAD pipe only)
-//   o_vu           : R, the outcome of a VU pass (HEAD pipe only)
-//   o_perf         : combinational event wires
-//   i_kill         : applied on the capture edge of every stage, to the
-//                    verdict and wake of the op at R and to the wake in V
-// Owns:
-//   - every pass leaves at R: at most one verdict and one packet per pass, so
-//     a pass uses no WB slot but the one reserved when it entered m0
-//   - a store's completion packet (R + 1) follows its store-resolve scan
-//     (m2 + 1), so no younger load retires past an unseen violation
-//   - a load's value is the dcache line merged with forwarded bytes; a load
-//     that cannot get every byte this pass parks and re-issues
-//   - a pass that missed the DTLB sends no request and no packet: a load
-//     parks XLATE in lq, a store's STA write parks its sq entry; both
-//     re-issue the same pass after the walk. A re-issue carrying the walk's
-//     fault (xexc, the owner's answer) takes it instead of a lookup
-//   - a store, AMO or SC pass that hits a W = 1, D = 0 entry under ADUE is
-//     a miss whose walk sets D: it requests that walk (nonspec) only while
-//     it holds the oldest token, and the acceptance is its started pulse;
-//     without the token or the acceptance its STA write parks the entry on
-//     the token (dpark)
-// Rationale:
-//   - a line-crossing access runs as two passes, each translated and checked
-//     on its own line; a crossing load runs only once it holds the oldest
-//     token and keeps its lo dword in the lq split buffer
-//   - Bare: PA = VA, and a VA above the PA width is a hole (access fault).
-//     Sv39: a non-canonical VA is a page fault without a lookup; a hit is
-//     checked by xlate_pkg::perm_x, so a page fault wins over PMP and PMA.
-//     A guest: a GPA of 2^41 or above under a Bare VS-stage is a guest-page
-//     fault without a lookup; a guest entry that fails a check walks, and
-//     the walk reports the faulting stage and the GPA. Every exception of a
-//     guest access carries gva
-//   - access fault (cause 5 load and LR, 7 store, AMO, SC and CBO) for a
-//     hole, a PMP denial, a misaligned access to a region without
-//     misaligned_ok, any misaligned atomic (before translation), an atomic
-//     to a region without the needed AMO class, and a CBO to a region
-//     without cbo_ok. The
-//     privileged spec allows an access fault for a misaligned access the
-//     region cannot perform. PMP: an AMO needs read and write, a CBO
-//     management op read or write
-//   - load and store triggers compare the bytes of the whole access in every
-//     pass (a CBO: its line), so a match on either half of a crossing access
-//     is reported by its first pass, ahead of any fault of that pass. A
-//     matching pass looks up nothing and walks nothing: timing before means
-//     the access has no effect, the D bit included. An AMO matches as a load
-//     and as a store, LR as a load, SC and CBOs as stores
-//   - debug memory (target DEBUG) is a hole outside Debug Mode and is not
-//     checked against PMP in it, so a locked PMP entry cannot lock the
-//     debugger out
+/// One memory pipe; address generation, translation (Bare, Sv39, or
+/// a guest's two stages through a DTLB lookup port) with PMP and PMA, the
+/// dcache request, forwarding, load formatting and the WB packet
+///
+/// Served: integer and FP loads and stores of 1, 2, 4 and 8 bytes, misaligned
+/// and line-crossing ones included where the region allows misaligned access;
+/// atomics (on the HEAD pipe), CBO ops, and the vector unit's element passes
+/// (on the HEAD pipe).
+///   - a non-cacheable load parks for the head (io_unit performs it); a
+///
+/// ```text
+///     non-cacheable store writes its SQ entry like any store (io_unit
+///     performs it at the head)
+///   - an atomic is translated and checked here, writes its SQ entry (an LR
+///     its LQ entry's completion) and leaves m2 for atomic_unit, which writes
+///     it back; with an exception it completes here. An atomic that missed
+///     the DTLB hands its operands to atomic_unit on its first pass and its PA
+///     on the re-issued pass
+///   - cbo.clean/flush/inval are translated and checked only; cbo.zero is a
+///     store of the whole line
+///   - a VU pass (vu_mem_adapter) gets the pointer mask, translation, PMP and
+///     PMA like any pass, but no forwarding, LQ/SQ write, wake or packet: its
+///     only output is o_vu at R. A load returns the raw dwords of its
+///     request, a store only its PA (vu_mem_adapter pushes it into sb). A
+///     non-cacheable element is an access fault. Its D-bit walk needs no
+///     token: the VEC op is past its start and cannot be killed
+/// ```
+///
+/// # Owns
+///
+/// - every pass leaves at R: at most one verdict and one packet per pass, so
+///   a pass uses no WB slot but the one reserved when it entered m0
+/// - a store's completion packet (R + 1) follows its store-resolve scan
+///   (m2 + 1), so no younger load retires past an unseen violation
+/// - a load's value is the dcache line merged with forwarded bytes; a load
+///   that cannot get every byte this pass parks and re-issues
+/// - a pass that missed the DTLB sends no request and no packet: a load
+///   parks XLATE in lq, a store's STA write parks its sq entry; both
+///   re-issue the same pass after the walk. A re-issue carrying the walk's
+///   fault (xexc, the owner's answer) takes it instead of a lookup
+/// - a store, AMO or SC pass that hits a W = 1, D = 0 entry under ADUE is
+///   a miss whose walk sets D: it requests that walk (nonspec) only while
+///   it holds the oldest token, and the acceptance is its started pulse;
+///   without the token or the acceptance its STA write parks the entry on
+///   the token (dpark)
+///
+/// # Rationale
+///
+/// - a line-crossing access runs as two passes, each translated and checked
+///   on its own line; a crossing load runs only once it holds the oldest
+///   token and keeps its lo dword in the lq split buffer
+/// - Bare: PA = VA, and a VA above the PA width is a hole (access fault).
+///   Sv39: a non-canonical VA is a page fault without a lookup; a hit is
+///   checked by xlate_pkg::perm_x, so a page fault wins over PMP and PMA.
+///   A guest: a GPA of 2^41 or above under a Bare VS-stage is a guest-page
+///   fault without a lookup; a guest entry that fails a check walks, and
+///   the walk reports the faulting stage and the GPA. Every exception of a
+///   guest access carries gva
+/// - access fault (cause 5 load and LR, 7 store, AMO, SC and CBO) for a
+///   hole, a PMP denial, a misaligned access to a region without
+///   misaligned_ok, any misaligned atomic (before translation), an atomic
+///   to a region without the needed AMO class, and a CBO to a region
+///   without cbo_ok. The
+///   privileged spec allows an access fault for a misaligned access the
+///   region cannot perform. PMP: an AMO needs read and write, a CBO
+///   management op read or write
+/// - load and store triggers compare the bytes of the whole access in every
+///   pass (a CBO: its line), so a match on either half of a crossing access
+///   is reported by its first pass, ahead of any fault of that pass. A
+///   matching pass looks up nothing and walks nothing: timing before means
+///   the access has no effect, the D bit included. An AMO matches as a load
+///   and as a store, LR as a load, SC and CBOs as stores
+/// - debug memory (target DEBUG) is a hole outside Debug Mode and is not
+///   checked against PMP in it, so a locked PMP entry cannot lock the
+///   debugger out
 pub module mem_pipe::<CFG: core_cfg> #(
     param PMA_N  : u32                         = 1,
     param PMA_TBL: pma_pkg::PmaRegion [PMA_N] = '{
@@ -128,65 +82,135 @@ pub module mem_pipe::<CFG: core_cfg> #(
     clk: input clock,
     rst: input reset,
 
+    /// Applied on the capture edge of every stage, to the
+    /// verdict and wake of the op at R and to the wake in V
     i_kill: input core_types::<CFG>::Kill,
 
+    /// Cycle S, combinational; at most one is valid
+    /// (mem_port_arb holds the IQ for this pipe when it grants
+    /// a re-issue or a VU pass); captured into m0
     i_iss: input core_types::<CFG>::IqGrant   ,
+    /// See i_iss.
     i_re : input core_types::<CFG>::MemReissue,
+    /// See i_iss.
     i_vu_go: input logic                      ,
+    /// See i_iss.
     i_vu   : input core_types::<CFG>::VuMemReq,
+    /// R, the outcome of a VU pass (HEAD pipe only)
     o_vu   : output core_types::<CFG>::VuMemRes,
 
+    /// m0; a new issue releases its IQ entry on acceptance
     o_iq_rel: output core_types::<CFG>::IqRelease,
 
+    /// commit's oldest token, read at m1
     i_tok    : input  core_types::<CFG>::TagTok,
+    /// m1, the accepted nonspec walk request of the op holding
+    /// the oldest token (commit's head_started_q)
     o_started: output logic                    ,
 
+    /// m0 register read, bypassed from the WB bus
     o_rf_addr1: output core_types::<CFG>::PReg                             ,
+    /// See o_rf_addr1.
     o_rf_addr2: output core_types::<CFG>::PReg                             ,
+    /// See o_rf_addr1.
     i_rf_int1 : input  logic<64>                                           ,
+    /// See o_rf_addr1.
     i_rf_int2 : input  logic<64>                                           ,
+    /// See o_rf_addr1.
     i_rf_fp2  : input  logic<64>                                           ,
+    /// See o_rf_addr1.
     i_wb      : input  core_types::<CFG>::WbPacket [core_types::<CFG>::WB_N],
 
+    /// Read at m0 and m1; they change only at a
+    /// flushing retire. i_xl_on: Sv39 is on for V = 0 data
+    /// accesses (satp mode and the effective privilege, MPRV
+    /// included); i_ctx.prv is that effective privilege, also
+    /// for PMP. A guest access (i_ctx.virt, or an HLV/HSV op)
+    /// resolves its regime with xlate_pkg::xeff
     i_xl_on  : input logic                   ,
+    /// See i_xl_on.
     i_ctx    : input xlate_pkg::XlateCtx     ,
+    /// Read at m0; the pointer-masking mode of the effective
+    /// privilege and that of HLV/HSV, changed only by a
+    /// flushing retire
     i_pmm    : input logic              <2>  ,
+    /// See i_pmm.
     i_pmm_h  : input logic              <2>  ,
+    /// See i_xl_on.
     i_pmp    : input pmp_pkg::PmpEnt         [16],
+    /// csr's debug_mode, read at m1; it changes only at the
+    /// full kills of Debug Mode entry and dret
     i_dm     : input logic                   ,
+    /// trig_unit's configuration, read at m1 (it changes only
+    /// at a flushing retire)
     i_trig   : input core_types::<CFG>::TrigCfg,
 
+    /// m1, the DTLB lookup port, combinational round trip
     o_tlb_lk    : output xlate_pkg::TlbLookup          ,
+    /// See o_tlb_lk.
     i_tlb       : input  xlate_pkg::TlbEntry           ,
+    /// m1, the walk request of a pass that
+    /// missed the DTLB; i_xreq_gnt is its acceptance in the
+    /// same cycle
     o_xreq_valid: output logic                         ,
+    /// See o_xreq_valid.
     o_xreq      : output core_types::<CFG>::XlateReq   ,
+    /// See o_xreq_valid.
     i_xreq_gnt  : input  logic                         ,
+    /// The walker's broadcast; an event of the pass's key from
+    /// its m1 cycle until the verdict (loads) or the STA write
+    /// (stores) marks the pass, which then does not park
     i_ptw_evt   : input  core_types::<CFG>::PtwEvent   ,
 
+    /// m2 = A, the adapter's accept cycle. Every request is
+    /// accepted and answered exactly RESP_LAT cycles later
+    /// (dcache_port_adapter), so i_resp at R belongs to the
+    /// pass at R whenever that pass sent one
     o_req_valid: output logic                     ,
     o_req      : output core_types::<CFG>::MemReq ,
     i_resp     : input  core_types::<CFG>::MemResp,
     i_vhit     : input  logic                     ,
 
+    /// m2, combinational round trip
     o_fwd_q : output core_types::<CFG>::FwdQuery,
+    /// See o_fwd_q.
     i_fwd_sq: input  core_types::<CFG>::FwdPart ,
+    /// See o_fwd_q.
     i_fwd_sb: input  core_types::<CFG>::FwdPart ,
 
+    /// m2, written on the m2 edge
     o_snap: output core_types::<CFG>::LqSnap  ,
+    /// See o_snap.
     o_sta : output core_types::<CFG>::StaWrite,
+    /// See o_snap.
     o_std : output core_types::<CFG>::StdWrite,
 
+    /// lq's registered lo dword of the crossing load in flight
+    /// (at most one: crossing loads run only as the oldest)
     i_split_lo: input  logic<64>                   ,
+    /// R = m2 + RESP_LAT, combinational from the response;
+    /// the wake leads o_wb by one cycle (see core_types Wake)
     o_verdict : output core_types::<CFG>::LqVerdict,
+    /// Merged likewise with i_np_wake (one cycle before its
+    /// packet, so a hole-fill wake never meets a pass's wake in
+    /// R; it takes the lane from a pass's wake in V)
     o_wake    : output core_types::<CFG>::Wake     ,
+    /// Registered, R + 1 = m0 + LD_LAT, merged with the
+    /// non-pipe clients' hole-fill packets i_np_wb (the HEAD
+    /// pipe; the slots differ, so at most one is valid)
     o_wb      : output core_types::<CFG>::WbPacket ,
 
+    /// m2, the atomic handed to atomic_unit (HEAD pipe only)
     o_amo    : output core_types::<CFG>::AtomicOp                            ,
     i_np_wb  : input  core_types::<CFG>::WbPacket [core_types::<CFG>::HF_N]  ,
     i_np_wake: input  core_types::<CFG>::Wake     [core_types::<CFG>::HF_N]  ,
+    /// The non-pipe clients' hole-fill requests to the pipe's
+    /// wb_resv (at most one is set)
     i_np_hf  : input  logic                       [core_types::<CFG>::HF_N]  ,
+    /// See i_np_hf.
     o_hf_req : output logic                                                  ,
 
+    /// Combinational event wires
     o_perf: output core_types::<CFG>::MemPipePerf,
 ) {
     import core_types::<CFG>::*;

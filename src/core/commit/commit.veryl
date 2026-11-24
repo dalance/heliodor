@@ -1,210 +1,243 @@
-// commit: the commit-group function, retire side effects, interrupt and
-// Debug Mode acceptance, the oldest token and the retire record.
-//
-// Ports (timing contract):
-//   i_reset_pc           : static; the PC of the first op after reset
-//   i_cm, i_exc, i_head  : rob's registered window, exc_q and head
-//   i_lq_win, i_sq_win   : registered commit windows of lq and sq; a lane
-//                          selects its entry by tag equality
-//   i_ordering_empty, i_sb_credit : registered sb outputs (credit saturated
-//                          at PUSH_W lines)
-//   i_kill               : the registered Kill of this cycle
-//   i_sys_wr             : fu_sys write of sys_pending, applied on the edge
-//   i_vu_done            : vu_adapter's completion of a VEC op; its VecSide
-//                          is held in vec_q, applied on the edge
-//   i_vtype, i_vl        : csr's committed vtype and vl, for the retire
-//                          record only
-//   i_started            : started-latch pulses of the units, on their
-//                          acceptance edge
-//   i_irq                : csr's pending interrupt, registered here (irq_q)
-//                          before any use
-//   i_priv, i_virt       : csr's current mode, for the retire record only
-//   i_dm                 : csr's debug_mode (registered)
-//   i_dm_haltreq         : the Debug Module's halt request level, registered
-//                          here (dm_q) before any use
-//   i_dm_halt_pc         : static, the halt entry of debug memory
-//   i_dm_hartreset       : the Debug Module's hartreset request level,
-//                          registered here (hr_q) before any use
-//   i_dm_step, i_dm_stepie : csr's dcsr.step and dcsr.stepie (registered)
-//   i_icnt_act, i_icnt_dm, i_icnt_bp : trig_unit, from registered state: an
-//                          icount trigger is armed; one is pending with action
-//                          1 (Debug Mode) or 0 (breakpoint)
-//   i_rd2_valid, i_rd2   : atomic_unit's held rd+1 value of amocas.q, for the
-//                          retire record only (the op is the head and alone)
-//   i_ftq_tgt            : per lane, ftq's resolved exit target of the lane's
-//                          entry, combinational from registered state
-//   i_late_pc            : flush_ctrl's next PC of the dropped resolve
-//                          (registered)
-//   i_trap_*, i_*ret_pc  : trap_unit, combinational from registered inputs;
-//                          i_trap_target is the debug memory exception entry
-//                          in Debug Mode
-//   i_dbg_*              : lockstep controls, all 0 in normal use; read only
-//                          with HELIODOR_OBS
-//   decision outputs     : o_retire_cnt, o_flush, o_trap_fire, o_irq_take,
-//                          the side-effect ports and o_csr are combinational
-//                          functions of registered state, i_kill and i_dbg_*
-//   o_irq_q, o_epc       : irq_q and the committed next PC, registered state,
-//                          to trap_unit
-//   o_ren_cm             : per lane, to rename (arch RAT) and both free lists
-//   o_lq_ret_cnt, o_sq_ret_cnt : loads and stores retired this cycle, to lq
-//                          and sq (their heads advance on the edge)
-//   o_ftq_cm             : position of the youngest op retired this cycle
-//   o_bar_ret            : an ld_barrier op retired this cycle (at most one,
-//                          barrier ops are alone)
-//   o_icache_inv         : a FENCE.I retired this cycle
-//   o_tlb_inv            : the operands of an SFENCE.VMA (SINVAL.VMA) that
-//                          retired this cycle, applied by the TLBs and walkers
-//                          on the edge of its retire
-//   o_head_retired       : lane 0 retired this cycle (releases the op a
-//                          started latch belongs to)
-//   o_rsv_clr            : a trap or interrupt was taken, or an xRET or a
-//                          satp write retired: clears the LR reservation
-//   o_oldest             : from registered state, i_kill and i_dbg_*
-//   o_retire, o_irq_evt  : registered, one cycle after retire. csr_new is 0:
-//                          the core reads it from the CSR file at
-//                          o_csr_obs_addr in the cycle the record is visible.
-//                          0 without HELIODOR_OBS, like o_retire_dm
-//   i_cm_src, i_src_rdata : rob's source registers of each lane and their
-//                          values read from the PRF (3 per lane, rs1..rs3),
-//                          for the retire record only
-//   o_retire_dm          : registered with o_retire: its records retired in
-//                          Debug Mode
-//   o_dm_req, o_step     : dm_req and step_q, for chk_debug
-//   i_*_idle             : the dcache, the I read slot and the D and I
-//                          walkers have nothing in flight
-//   o_dm_quiet           : the hartreset request was taken, no op is
-//                          started, the sb is empty and every i_*_idle holds
-//   o_bp_take            : the icount breakpoint is taken (to trap_unit)
-//   o_trig_hit           : hit bits of an accepted trigger exception
-//   o_icnt_cnt, o_icnt_take : icount events: lane 0 retired, trapped or took
-//                          an interrupt outside Debug Mode; the pending
-//                          icount was taken {breakpoint, Debug Mode}
-// Owns:
-//   - retire is a prefix of the lanes; at most one flush per cycle (Debug
-//     Mode entry > irq > icount breakpoint > lane 0 DEBUG or trap > replay >
-//     the RETIRE_FLUSH of the youngest retired lane); an entry, trap, replay
-//     or interrupt cycle retires nothing
-//   - Debug Mode entry: the halt request is taken like an interrupt (at a
-//     group head that holds no started op, dm_take), an EBREAK with
-//     ExcRec.dm like an exception (outcome DEBUG on lane 0, dbg_fire). Both
-//     redirect to i_dm_halt_pc and emit no record; dpc is the committed next
-//     PC. In Debug Mode dbg_fire only redirects and no interrupt is taken
-//   - hartreset: the request is taken like a halt request, before it and
-//     in or out of Debug Mode (a full kill to i_dm_halt_pc, no record, no
-//     Debug Mode entry), and then holds retire, the token and every other
-//     acceptance until the core is reset, so the core quiesces
-//   - single step: a dret with dcsr.step arms step_q. Lane 0 alone may then
-//     retire one op; that record, a trap or an interrupt sets step_n_q, which
-//     withholds the token and retire like the lockstep limit and requests
-//     entry (cause 4). Without dcsr.stepie no interrupt is taken meanwhile
-//   - triggers: an address trigger is the head's exception (DEBUG or TRAP,
-//     cause 2 or 3) and sets its hit bits on acceptance. While icount is
-//     armed only lane 0 retires; its pending withholds the token and retire
-//     like a step and is taken at the interrupt acceptance point, as entry
-//     (cause 2, before haltreq) or as a breakpoint trap record (epc the
-//     committed next PC, after an interrupt)
-//   - every side effect is conditioned on retire[l] alone (plus trap_fire
-//     or irq_take on lane 0), never on "the head is valid"
-//   - arch_pc_q is the PC of the head op whenever the head is valid, so lane
-//     PCs are derived and never stored
-//   - a lane never retires an op that the kill of the cycle selects
-//   - sys_q belongs to the SYS op that retires: SYS ops are nonspec and
-//     alone, so at most one is past select at any time, it is the head when
-//     it retires, and sys_q is written only by it (chk_commit bit 4)
-//   - vec_q belongs to the VEC op on lane 0 by the same argument; a VEC op
-//     writes vstart when it retires, and when it traps on an element
-//     access (the elements before it stay written)
-// Rationale:
-//   - trap, replay and interrupts act only at the group head (lane 0); an
-//     exception, poison or alone op on a younger lane cuts the group so it
-//     becomes the head next cycle. This is an order property of the group,
-//     not a per-lane special case
-//   - the token is computed from the registered head, so it passes to the
-//     next op one cycle after the previous op retires
-//   - lane l's PC is the target of the youngest redirecting lane before it
-//     (or the head PC) plus the halfwords in between, a prefix count, so no
-//     adder chain runs across the lanes
-//   - a taken BRU op is its block's exit, so its target is the ftq entry's
-//     res, which the partial kill of its mispredict corrected; a mispredict
-//     no partial kill recovered is redirected here to the dropped resolve's
-//     PC (i_late_pc). The rob keeps no next PC
+/// The commit-group function, retire side effects, interrupt and
+/// Debug Mode acceptance, the oldest token and the retire record.
+///
+/// # Timing
+///
+/// - `decision outputs`: o_retire_cnt, o_flush, o_trap_fire, o_irq_take,
+///   the side-effect ports and o_csr are combinational
+///   functions of registered state, i_kill and `i_dbg_*`
+///
+/// # Owns
+///
+/// - retire is a prefix of the lanes; at most one flush per cycle (Debug
+///   Mode entry > irq > icount breakpoint > lane 0 DEBUG or trap > replay >
+///   the RETIRE_FLUSH of the youngest retired lane); an entry, trap, replay
+///   or interrupt cycle retires nothing
+/// - Debug Mode entry: the halt request is taken like an interrupt (at a
+///   group head that holds no started op, dm_take), an EBREAK with
+///   ExcRec.dm like an exception (outcome DEBUG on lane 0, dbg_fire). Both
+///   redirect to i_dm_halt_pc and emit no record; dpc is the committed next
+///   PC. In Debug Mode dbg_fire only redirects and no interrupt is taken
+/// - hartreset: the request is taken like a halt request, before it and
+///   in or out of Debug Mode (a full kill to i_dm_halt_pc, no record, no
+///   Debug Mode entry), and then holds retire, the token and every other
+///   acceptance until the core is reset, so the core quiesces
+/// - single step: a dret with dcsr.step arms step_q. Lane 0 alone may then
+///   retire one op; that record, a trap or an interrupt sets step_n_q, which
+///   withholds the token and retire like the lockstep limit and requests
+///   entry (cause 4). Without dcsr.stepie no interrupt is taken meanwhile
+/// - triggers: an address trigger is the head's exception (DEBUG or TRAP,
+///   cause 2 or 3) and sets its hit bits on acceptance. While icount is
+///   armed only lane 0 retires; its pending withholds the token and retire
+///   like a step and is taken at the interrupt acceptance point, as entry
+///   (cause 2, before haltreq) or as a breakpoint trap record (epc the
+///   committed next PC, after an interrupt)
+/// - every side effect is conditioned on retire[l] alone (plus trap_fire
+///   or irq_take on lane 0), never on "the head is valid"
+/// - arch_pc_q is the PC of the head op whenever the head is valid, so lane
+///   PCs are derived and never stored
+/// - a lane never retires an op that the kill of the cycle selects
+/// - sys_q belongs to the SYS op that retires: SYS ops are nonspec and
+///   alone, so at most one is past select at any time, it is the head when
+///   it retires, and sys_q is written only by it (chk_commit bit 4)
+/// - vec_q belongs to the VEC op on lane 0 by the same argument; a VEC op
+///   writes vstart when it retires, and when it traps on an element
+///   access (the elements before it stay written)
+///
+/// # Rationale
+///
+/// - trap, replay and interrupts act only at the group head (lane 0); an
+///   exception, poison or alone op on a younger lane cuts the group so it
+///   becomes the head next cycle. This is an order property of the group,
+///   not a per-lane special case
+/// - the token is computed from the registered head, so it passes to the
+///   next op one cycle after the previous op retires
+/// - lane l's PC is the target of the youngest redirecting lane before it
+///   (or the head PC) plus the halfwords in between, a prefix count, so no
+///   adder chain runs across the lanes
+/// - a taken BRU op is its block's exit, so its target is the ftq entry's
+///   res, which the partial kill of its mispredict corrected; a mispredict
+///   no partial kill recovered is redirected here to the dropped resolve's
+///   PC (i_late_pc). The rob keeps no next PC
 pub module commit::<CFG: core_cfg> (
     clk                  : input  clock                                                                         ,
     rst                  : input  reset                                                                         ,
+    /// Static; the PC of the first op after reset
     i_reset_pc           : input  logic                        <64>                                             ,
+    /// rob's registered window, exc_q and head
     i_cm                 : input  core_types::<CFG>::RobCm                                       [CFG::COMMIT_W],
+    /// rob's source registers of each lane and their
+    /// values read from the PRF (3 per lane, rs1..rs3),
+    /// for the retire record only
     i_cm_src             : input  core_types::<CFG>::OpSrc                                       [CFG::COMMIT_W],
+    /// See i_cm_src.
     i_src_rdata          : input  logic                        <64>                              [3 * CFG::COMMIT_W],
     o_csr_obs_addr       : output logic                        <12>                                             ,
+    /// See i_cm.
     i_exc                : input  core_types::<CFG>::ExcHold                                                    ,
+    /// See i_cm.
     i_head               : input  core_types::<CFG>::TagTok                                                     ,
+    /// Registered commit windows of lq and sq; a lane
+    /// selects its entry by tag equality
     i_lq_win             : input  core_types::<CFG>::LqCmWin                                     [CFG::COMMIT_W],
+    /// See i_lq_win.
     i_sq_win             : input  core_types::<CFG>::SqCmWin                                     [CFG::MEM_W]   ,
+    /// Registered sb outputs (credit saturated
+    /// at PUSH_W lines)
     i_ordering_empty     : input  logic                                                                         ,
+    /// See i_ordering_empty.
     i_sb_credit          : input  logic                        <core_types::<CFG>::SB_CREDIT_W>                 ,
+    /// The registered Kill of this cycle
     i_kill               : input  core_types::<CFG>::Kill                                                       ,
+    /// fu_sys write of sys_pending, applied on the edge
     i_sys_wr             : input  core_types::<CFG>::SysPending                                                 ,
+    /// vu_adapter's completion of a VEC op; its VecSide
+    /// is held in vec_q, applied on the edge
     i_vu_done            : input  core_types::<CFG>::VuDone                                                     ,
+    /// csr's committed vtype and vl, for the retire
+    /// record only
     i_vtype              : input  logic                        <64>                                             ,
+    /// See i_vtype.
     i_vl                 : input  logic                        <64>                                             ,
+    /// Started-latch pulses of the units, on their
+    /// acceptance edge
     i_started            : input  logic                        <core_types::<CFG>::STARTED_N>                   ,
+    /// csr's pending interrupt, registered here (irq_q)
+    /// before any use
     i_irq                : input  core_types::<CFG>::IrqReq                                                     ,
+    /// csr's current mode, for the retire record only
     i_priv               : input  csr_pkg::PrivLevel                                                            ,
+    /// See i_priv.
     i_virt               : input  logic                                                                         ,
+    /// csr's debug_mode (registered)
     i_dm                 : input  logic                                                                         ,
+    /// The Debug Module's halt request level, registered
+    /// here (dm_q) before any use
     i_dm_haltreq         : input  logic                                                                         ,
+    /// Static, the halt entry of debug memory
     i_dm_halt_pc         : input  logic                        <64>                                             ,
+    /// The Debug Module's hartreset request level,
+    /// registered here (hr_q) before any use
     i_dm_hartreset       : input  logic                                                                         ,
+    /// csr's dcsr.step and dcsr.stepie (registered)
     i_dm_step            : input  logic                                                                         ,
+    /// See i_dm_step.
     i_dm_stepie          : input  logic                                                                         ,
+    /// trig_unit, from registered state: an
+    /// icount trigger is armed; one is pending with action
+    /// 1 (Debug Mode) or 0 (breakpoint)
     i_icnt_act           : input  logic                                                                         ,
+    /// See i_icnt_act.
     i_icnt_dm            : input  logic                                                                         ,
+    /// See i_icnt_act.
     i_icnt_bp            : input  logic                                                                         ,
+    /// atomic_unit's held rd+1 value of amocas.q, for the
+    /// retire record only (the op is the head and alone)
     i_rd2_valid          : input  logic                                                                         ,
+    /// See i_rd2_valid.
     i_rd2                : input  logic                        <64>                                             ,
+    /// Per lane, ftq's resolved exit target of the lane's
+    /// entry, combinational from registered state
     i_ftq_tgt            : input  logic                        <64>                              [CFG::COMMIT_W],
+    /// flush_ctrl's next PC of the dropped resolve
+    /// (registered)
     i_late_pc            : input  logic                        <64>                                             ,
+    /// trap_unit, combinational from registered inputs;
+    /// i_trap_target is the debug memory exception entry
+    /// in Debug Mode
     i_trap_target        : input  logic                        <64>                                             ,
+    /// See i_trap_target.
     i_trap_tval          : input  logic                        <64>                                             ,
+    /// See i_trap_target.
     i_trap_tval2         : input  logic                        <64>                                             ,
+    /// See i_trap_target.
     i_trap_tinst         : input  logic                        <64>                                             ,
+    /// See i_trap_target.
     i_mret_pc            : input  logic                        <64>                                             ,
+    /// See i_trap_target.
     i_sret_pc            : input  logic                        <64>                                             ,
+    /// See i_trap_target.
     i_dret_pc            : input  logic                        <64>                                             ,
+    /// Lockstep controls, all 0 in normal use; read only
+    /// with HELIODOR_OBS
     i_dbg_retire_limit_en: input  logic                                                                         ,
+    /// See i_dbg_retire_limit_en.
     i_dbg_retire_limit   : input  logic                        <64>                                             ,
+    /// See i_dbg_retire_limit_en.
     i_dbg_irq_mask       : input  logic                                                                         ,
+    /// See i_dbg_retire_limit_en.
     i_dbg_irq_allow      : input  logic                                                                         ,
     o_retire_cnt         : output logic                        <core_types::<CFG>::RETIRE_CNT_W>                ,
+    /// From registered state, i_kill and i_dbg_*
     o_oldest             : output core_types::<CFG>::TagTok                                                     ,
     o_flush              : output core_types::<CFG>::CmFlush                                                    ,
     o_trap_fire          : output logic                                                                         ,
     o_irq_take           : output logic                                                                         ,
+    /// irq_q and the committed next PC, registered state,
+    /// to trap_unit
     o_irq_q              : output core_types::<CFG>::IrqReq                                                     ,
+    /// See o_irq_q.
     o_epc                : output logic                        <64>                                             ,
+    /// Per lane, to rename (arch RAT) and both free lists
     o_ren_cm             : output core_types::<CFG>::RenCm                                       [CFG::COMMIT_W],
+    /// Loads and stores retired this cycle, to lq
+    /// and sq (their heads advance on the edge)
     o_lq_ret_cnt         : output logic                        <core_types::<CFG>::RETIRE_CNT_W>                ,
+    /// See o_lq_ret_cnt.
     o_sq_ret_cnt         : output logic                        <core_types::<CFG>::RETIRE_CNT_W>                ,
+    /// An ld_barrier op retired this cycle (at most one,
+    /// barrier ops are alone)
     o_bar_ret            : output logic                                                                         ,
+    /// Position of the youngest op retired this cycle
     o_ftq_cm             : output core_types::<CFG>::FtqCommit                                                  ,
+    /// A FENCE.I retired this cycle
     o_icache_inv         : output logic                                                                         ,
+    /// The operands of an SFENCE.VMA (SINVAL.VMA) that
+    /// retired this cycle, applied by the TLBs and walkers
+    /// on the edge of its retire
     o_tlb_inv            : output xlate_pkg::TlbInv                                                             ,
+    /// Lane 0 retired this cycle (releases the op a
+    /// started latch belongs to)
     o_head_retired       : output logic                                                                         ,
+    /// A trap or interrupt was taken, or an xRET or a
+    /// satp write retired: clears the LR reservation
     o_rsv_clr            : output logic                                                                         ,
     o_csr                : output core_types::<CFG>::CsrCm                                                      ,
+    /// Registered, one cycle after retire. csr_new is 0:
+    /// the core reads it from the CSR file at
+    /// o_csr_obs_addr in the cycle the record is visible.
+    /// 0 without HELIODOR_OBS, like o_retire_dm
     o_retire             : output retire_pkg::RetireRec                                          [CFG::COMMIT_W],
+    /// See o_retire.
     o_irq_evt            : output retire_pkg::IrqEvent                                                          ,
+    /// Registered with o_retire: its records retired in
+    /// Debug Mode
     o_retire_dm          : output logic                                                                         ,
+    /// dm_req and step_q, for chk_debug
     o_dm_req             : output logic                                                                         ,
+    /// See o_dm_req.
     o_step               : output logic                                                                         ,
+    /// The dcache, the I read slot and the D and I
+    /// walkers have nothing in flight
     i_dc_idle            : input  logic                                                                         ,
+    /// See i_dc_idle.
     i_islot_idle         : input  logic                                                                         ,
+    /// See i_dc_idle.
     i_dptw_idle          : input  logic                                                                         ,
+    /// See i_dc_idle.
     i_iptw_idle          : input  logic                                                                         ,
+    /// The hartreset request was taken, no op is
+    /// started, the sb is empty and every i_*_idle holds
     o_dm_quiet           : output logic                                                                         ,
+    /// The icount breakpoint is taken (to trap_unit)
     o_bp_take            : output logic                                                                         ,
+    /// Hit bits of an accepted trigger exception
     o_trig_hit           : output logic                        <CFG::TRIG_N>                                    ,
+    /// Icount events: lane 0 retired, trapped or took
+    /// an interrupt outside Debug Mode; the pending
+    /// icount was taken {breakpoint, Debug Mode}
     o_icnt_cnt           : output logic                                                                         ,
+    /// See o_icnt_cnt.
     o_icnt_take          : output logic                        <2>                                              ,
     o_perf               : output core_types::<CFG>::CmPerf                                                     ,
     o_chk                : output logic                        <core_types::<CFG>::CHK_CM_W>                    ,

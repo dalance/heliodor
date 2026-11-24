@@ -1,106 +1,118 @@
-// lq: load queue; owns each load's execution state, ordering-violation
-// poison, the ld_barrier sequence and the commit window.
-//
-// Ports (timing contract):
-//   i_alloc_valid/i_alloc[RENAME_W] : the loads of the dispatch group,
-//                       compacted in program order; slot i takes the tag
-//                       o_alloc_tag[i]; never valid in a kill cycle
-//   o_free, o_alloc_tag[RENAME_W+1] : registered state only (free = LQ_N -
-//                       (tail - head); o_alloc_tag[k] = tail advanced by k)
-//   i_snap[MEM_W]     : m2 of each pipe; sets seen and writes va[5:0] on the
-//                       capture edge
-//   i_sta[MEM_W]      : store-resolve request at m2; scanned the next cycle
-//   i_verdict[MEM_W]  : m2 + RESP_LAT; only for ops still live in the pipe
-//   i_mem_ev, i_coh_*, i_std, i_sq_head, i_oldest, i_ptw_evt : wake and scan
-//                       events of this cycle; an event in the verdict's cycle
-//                       counts as after the verdict
-//   i_ptw_resp        : the D walker's owner answer; a fault for a live load
-//                       is kept with the entry and rides its next re-issue
-//   o_reissue         : registered; the oldest READY entry; i_reissue_gnt in
-//                       the same cycle moves it to INFLIGHT
-//   o_win[COMMIT_W]   : from registered state, the COMMIT_W oldest entries;
-//                       commit selects by tag equality
-//   o_split_lo        : registered lo dword of the crossing load whose lo
-//                       pass completed (one at a time: crossing loads run
-//                       only as the oldest op), read by the memory pipes
-//   o_io              : registered offer of the head entry to io_unit when it
-//                       is a non-cacheable load parked for the head
-//   i_io_done         : io_unit completed the head entry's load
-//   o_perf            : combinational event wires
-//   o_chk             : sticky checker flags (HELIODOR_CHK only, else 0)
-//   i_retire_cnt      : loads retired this cycle; head advances on the edge
-//   i_bar_alloc, i_bar_ret : ld_barrier ops dispatched / retired this cycle
-//   o_bar_after[k], o_bar_ret : registered barrier counts (o_bar_after[k] =
-//                       allocated + k)
-//   o_load_fence      : registered, the cycle after a barrier retired: seq is
-//                       the retired count, IQ loads with bar_w == seq obey no
-//                       fence any more
-//   i_kill            : tail := kill.lq_tail (partial) or empty (full); the
-//                       barrier count rewinds to kill.bar_seq or the retired
-//                       count; applied on the edge
-// Owns:
-//   - poison is set only on entries with seen = 1 and is cleared by the lo
-//     snapshot of a re-issue
-//   - a coherence event never poisons the load at the ROB head: nothing older
-//     is in flight, so its value cannot be out of order, and replaying it
-//     could repeat forever against a remote writer
-//   - a store's scan covers every load whose snapshot did not include that
-//     store: a snapshot at or before the store's m2 is registered by the scan
-//   - no entry leaves PARK except on its own key (fill_id, SqTag, token, the
-//     page of its pending pass) or a broadcast; a non-cacheable load leaves
-//     PARK(HEAD) only by i_io_done
-//   - a non-cacheable load is never seen by the scans, so never poisoned:
-//     io_unit performs it exactly once
-//   - an LR's entry only names the op: mem_pipe completes it at R and the
-//     scans never see it; its snapshot writes only the line of the record
-// Rationale:
-//   - ordering violations are repaired only by commit-time replay of the
-//     poisoned load, with no dependence predictor and no filter on the scans:
-//     the simplest scheme that is correct
-//   - the per-entry scans OR over MEM_W pipes and COH_N events, written as
-//     reductions of a vector
+/// Load queue; owns each load's execution state, ordering-violation
+/// poison, the ld_barrier sequence and the commit window.
+///
+/// # Owns
+///
+/// - poison is set only on entries with seen = 1 and is cleared by the lo
+///   snapshot of a re-issue
+/// - a coherence event never poisons the load at the ROB head: nothing older
+///   is in flight, so its value cannot be out of order, and replaying it
+///   could repeat forever against a remote writer
+/// - a store's scan covers every load whose snapshot did not include that
+///   store: a snapshot at or before the store's m2 is registered by the scan
+/// - no entry leaves PARK except on its own key (fill_id, SqTag, token, the
+///   page of its pending pass) or a broadcast; a non-cacheable load leaves
+///   PARK(HEAD) only by i_io_done
+/// - a non-cacheable load is never seen by the scans, so never poisoned:
+///   io_unit performs it exactly once
+/// - an LR's entry only names the op: mem_pipe completes it at R and the
+///   scans never see it; its snapshot writes only the line of the record
+///
+/// # Rationale
+///
+/// - ordering violations are repaired only by commit-time replay of the
+///   poisoned load, with no dependence predictor and no filter on the scans:
+///   the simplest scheme that is correct
+/// - the per-entry scans OR over MEM_W pipes and COH_N events, written as
+///   reductions of a vector
 pub module lq::<CFG: core_cfg> (
     clk: input clock,
     rst: input reset,
 
+    /// Tail := kill.lq_tail (partial) or empty (full); the
+    /// barrier count rewinds to kill.bar_seq or the retired
+    /// count; applied on the edge
     i_kill: input core_types::<CFG>::Kill,
 
+    /// The loads of the dispatch group,
+    /// compacted in program order; slot i takes the tag
+    /// o_alloc_tag[i]; never valid in a kill cycle
     i_alloc_valid: input  logic                      [CFG::RENAME_W]    ,
+    /// See i_alloc_valid.
     i_alloc      : input  core_types::<CFG>::LqAlloc [CFG::RENAME_W]    ,
+    /// Registered state only (free = LQ_N -
+    /// (tail - head); o_alloc_tag[k] = tail advanced by k)
     o_free     : output logic<core_types::<CFG>::LQ_CNT_W>             ,
+    /// See o_free.
     o_alloc_tag: output core_types::<CFG>::LqTag   [CFG::RENAME_W + 1],
 
+    /// ld_barrier ops dispatched / retired this cycle
     i_bar_alloc : input  logic<core_types::<CFG>::TAKE_W>                ,
+    /// See i_bar_alloc.
     i_bar_ret   : input  logic                                           ,
+    /// Registered barrier counts (o_bar_after[k] =
+    /// allocated + k)
     o_bar_after : output core_types::<CFG>::BarSeq   [CFG::RENAME_W + 1],
+    /// See o_bar_after.
     o_bar_ret   : output core_types::<CFG>::BarSeq                       ,
+    /// Registered, the cycle after a barrier retired: seq is
+    /// the retired count, IQ loads with bar_w == seq obey no
+    /// fence any more
     o_load_fence: output core_types::<CFG>::LoadFence                    ,
 
+    /// m2 of each pipe; sets seen and writes va[5:0] on the
+    /// capture edge
     i_snap   : input core_types::<CFG>::LqSnap    [CFG::MEM_W],
+    /// Store-resolve request at m2; scanned the next cycle
     i_sta    : input core_types::<CFG>::StaWrite  [CFG::MEM_W],
+    /// m2 + RESP_LAT; only for ops still live in the pipe
     i_verdict: input core_types::<CFG>::LqVerdict [CFG::MEM_W],
 
+    /// Wake and scan
+    /// events of this cycle; an event in the verdict's cycle
+    /// counts as after the verdict
     i_mem_ev  : input core_types::<CFG>::MemEvent                            ,
+    /// See i_mem_ev.
     i_coh_v   : input logic                        [core_types::<CFG>::COH_N],
+    /// See i_mem_ev.
     i_coh_line: input pma_pkg::Line                [core_types::<CFG>::COH_N],
+    /// See i_mem_ev.
     i_std     : input core_types::<CFG>::StdWrite  [CFG::MEM_W]              ,
+    /// See i_mem_ev.
     i_sq_head : input core_types::<CFG>::SqTag                               ,
+    /// See i_mem_ev.
     i_oldest  : input core_types::<CFG>::TagTok                              ,
+    /// See i_mem_ev.
     i_ptw_evt : input core_types::<CFG>::PtwEvent                            ,
+    /// The D walker's owner answer; a fault for a live load
+    /// is kept with the entry and rides its next re-issue
     i_ptw_resp: input core_types::<CFG>::XlateResp                           ,
 
+    /// Loads retired this cycle; head advances on the edge
     i_retire_cnt: input logic<core_types::<CFG>::RETIRE_CNT_W>,
 
+    /// Registered; the oldest READY entry; i_reissue_gnt in
+    /// the same cycle moves it to INFLIGHT
     o_reissue    : output core_types::<CFG>::MemReissue,
     i_reissue_gnt: input  logic                        ,
 
+    /// From registered state, the COMMIT_W oldest entries;
+    /// commit selects by tag equality
     o_win     : output core_types::<CFG>::LqCmWin [CFG::COMMIT_W],
+    /// Registered lo dword of the crossing load whose lo
+    /// pass completed (one at a time: crossing loads run
+    /// only as the oldest op), read by the memory pipes
     o_split_lo: output logic<64>                               ,
 
+    /// Registered offer of the head entry to io_unit when it
+    /// is a non-cacheable load parked for the head
     o_io     : output core_types::<CFG>::IoOp,
+    /// io_unit completed the head entry's load
     i_io_done: input  logic                  ,
 
+    /// Sticky checker flags (HELIODOR_CHK only, else 0)
     o_chk : output logic<4>                ,
+    /// Combinational event wires
     o_perf: output core_types::<CFG>::LqPerf,
 ) {
     import core_types::<CFG>::*;
