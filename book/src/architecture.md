@@ -21,7 +21,7 @@ UART and the Debug Module) lives in the SoC, `heliodor_soc_smp`. See
 
 | Module | Role |
 |---|---|
-| `bpu` | Block predictor: a block-indexed branch target buffer with per-slot 2-bit counters and a return address stack. It predicts one fetch block per cycle. |
+| `bpu` | Block predictor: a block-indexed branch target buffer with a return address stack. Branch direction is predicted by a bimodal predictor (a 2-bit saturating counter per branch slot, no global history). It predicts one fetch block per cycle. |
 | `ftq` | Fetch target queue. A ring of fetch-block descriptors that also holds the prediction metadata and the predictor checkpoint of each block, and supplies PCs to the branch units. |
 | `ifu` | Fetch: ITLB lookup, I-cache request and response, and a fetch buffer. |
 | `extract` | Finds instruction boundaries in a fetch block, expands compressed instructions, and checks the predictor's claims against the real instruction stream. A wrong prediction becomes a pre-decode redirect, never a mis-decoded instruction. |
