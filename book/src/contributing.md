@@ -6,21 +6,15 @@ source follows, and the checks a change has to pass.
 ## Workflow
 
 1. Build the tools: [Getting started](getting-started.md).
-2. Make the change on a branch.
-3. Run the fast tests and the tests of the area you touched. A change that can
+2. Run the fast tests and the tests of the area you touched. A change that can
    alter the retire stream (decode, execute, the CSRs, the MMU) should also pass
    the spike co-simulation: `python3 test/gates/run_gc.py --core w2` and a batch of
    random programs; see [Verification](verification.md).
-4. For a change to the memory system, caches, MMU, coherence, interrupts or
+3. For a change to the memory system, caches, MMU, coherence, interrupts or
    anything shared by several harts, also run the multi-hart boots (see
    [Which tests to run](#which-tests-to-run)). A change that passes every
    single-hart test can still break a multi-hart boot.
-5. Review the comments and the module headers you touched. Delete comments that
-   restate the code.
-6. Commit.
-
-Experiments that switch a behavior (a measurement variant, a different policy)
-belong on a branch. Do not leave them in `master` as a configuration knob.
+4. Commit.
 
 ## Rules for the RTL
 
@@ -28,22 +22,32 @@ belong on a branch. Do not leave them in `master` as a configuration knob.
   (excluding its header) needs a reason.
 - **The core top is wiring.** `heliodor_core` holds instances and connections,
   with no state and no logic.
-- **Every module starts with a header comment** in this form:
+- **Every module, package and interface starts with a documentation comment**
+  (`///`) in this form:
 
   ```text
-  // <module>: <one-line responsibility>
-  //
-  // Ports (timing contract):
-  //   i_x_valid/i_x : group handshake, lanes contiguous from lane 0
-  //   o_x_ready     : registered state only
-  //   i_kill        : applied on the capture edge of every entry and stage
-  // Owns:
-  //   - <invariant this module guarantees, stated so that it can be checked>
-  // Rationale:
-  //   - <design-specific choice and why; omit if there is none>
+  /// <One-line responsibility>.
+  ///
+  /// # Owns
+  ///
+  /// - <invariant this module guarantees, stated so that it can be checked>
+  ///
+  /// # Rationale
+  ///
+  /// - <design-specific choice and why; omit if there is none>
+  pub module m (
+      /// <timing contract of this port: registered or combinational, when it
+      /// is valid, what a handshake means>
+      i_x: input logic,
+  )
   ```
 
-  A reader should be able to use the module from its header alone.
+  The timing contract of a port is a `///` comment on that port. A group of
+  ports that share one contract (a valid/data pair, a kill and its redirect)
+  carries the text on the first port, and the others say "See i_x". A
+  statement about the interface as a whole goes under a `# Timing` heading in
+  the module comment. A reader should be able to use the module from its
+  documentation alone, and `veryl doc` renders it as one page per module.
 - **Sizes come from the configuration package.** A size constant is read only by
   its owner and by `core_types`. Other modules use tag types. See
   [Configuration](configuration.md).
@@ -101,9 +105,7 @@ Every mechanism of a new module should be visible and checkable.
   dispatch group is cut, a forward hit, a walk, a replay) has a registered event
   wire in the `CorePerf` struct that reaches `o_perf`. Each wire has to be
   nonzero in at least one test. A wire that is zero everywhere means the
-  mechanism is either untested (write a directed test) or dead (delete it). A
-  bit-identical result in a test where a mechanism never fired says nothing
-  about that mechanism.
+  mechanism is either untested (write a directed test) or dead (delete it).
 - **Invariant checkers.** `chk_*` modules only observe; they never feed a signal
   back. Their sticky flags reach `o_chk`, and every test checks that the flags
   are zero at the end.
@@ -114,22 +116,15 @@ Every mechanism of a new module should be visible and checkable.
 
 Comments are in English and state only the rationale and non-obvious constraints.
 Do not restate what the code says, do not refer to plans, issue numbers or other
-projects, and do not write numbers that go stale. When the code works, read the
-comments once more and delete the ones that earn nothing.
-
-Prose in documentation and comments avoids em-dashes: use a colon or a comma.
+projects, and do not write numbers that go stale.
 
 ## Formatting
 
-Format with `veryl fmt`. Be careful: a bare `veryl fmt` reformats the whole
-repository. Before a focused change, format by hand in the style of the
-surrounding code, or restrict `veryl fmt` to your files.
+Format with `veryl fmt`.
 
 ## Lint
 
-A new module has no warnings. After you update Veryl, count the warnings by kind
-and compare them with the previous count: a kind that has appeared is a bug report
-until proven otherwise.
+A new module has no warnings.
 
 ## Which tests to run {#which-tests-to-run}
 
@@ -182,13 +177,6 @@ git clone https://github.com/veryl-lang/veryl.git veryl
 The test scripts use `./veryl/target/release-verylup/veryl` when `VERYL` is not
 set. Fix the bug on a branch and send it upstream, with the regression test in
 the simulator's own tests.
-
-## Commits
-
-- Write the commit message in English as a single short subject line.
-- Stage the files you changed by name. Do not stage a whole directory.
-- Keep related fixes on one branch, and in one commit unless there is a reason to
-  split them.
 
 ## Design documents
 

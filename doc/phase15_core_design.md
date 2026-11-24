@@ -1229,21 +1229,27 @@ IDLE --(受理 edge で token.valid && token.tag == 自分の tag)--> STARTED --
 | 型、定数、関数 | 型は PascalCase、定数は UPPER_SNAKE、関数は snake_case。 |
 | lane の添字 | lane は `l`、ポートは `p`、エントリは `e`。 |
 
-モジュールヘッダの書式 (英語):
+モジュールヘッダの書式 (英語。MDOC で `///` ドキュメントコメントに変更し、`veryl doc` で文書化する):
 
 ```
-// <module>: <one-line responsibility>
-//
-// Ports (timing contract):
-//   i_x_valid/i_x : group handshake, lanes contiguous from lane 0
-//   o_x_ready     : registered state only
-//   o_y           : registered, valid N cycles after accept
-//   i_kill        : applied on the capture edge of every entry and stage
-// Owns:
-//   - <invariant this module guarantees, as a checkable statement>
-// Rationale:
-//   - <design-specific choice and why; omit if none>
+/// <One-line responsibility>.
+///
+/// # Owns
+///
+/// - <invariant this module guarantees, as a checkable statement>
+///
+/// # Rationale
+///
+/// - <design-specific choice and why; omit if none>
+pub module m (
+    /// <timing contract of this port>
+    i_x_valid: input logic,
+    /// See i_x_valid.
+    i_x      : input T    ,
+)
 ```
+
+ポートのタイミング契約は各ポート宣言の `///` に書く。複数ポートが同じ契約を共有する場合 (valid/data、kill と redirect) は先頭ポートに本文を置き、残りは "See i_x_valid." とする。モジュール全体にかかる契約は module コメントの `# Timing` に置く。`veryl doc` の出力先は設計文書の `doc/` と衝突するため、`Veryl.toml` の `[doc] path` で `target/doc` にしてある。
 
 RTL 規約:
 

@@ -175,9 +175,10 @@ Files named `chk_*.veryl` are observation-only invariant checkers.
 
 - Module names are snake_case nouns for one concept. Ports start with `i_` or
   `o_`; a register whose output is registered ends with `_q`.
-- Every module starts with a header comment that states the timing contract of
-  its ports, the invariants it owns, and any non-obvious design choice. Read the
-  header before the body.
+- Every module starts with a documentation comment that states the invariants it
+  owns and any non-obvious design choice, and its ports carry their timing
+  contract as documentation comments. Read them before the body, or run
+  `veryl doc` to browse them.
 - A size constant such as `ROB_N` is read only by the module that owns it and by
   `core_types`. Other modules use the tag types and the helpers of `tag_pkg`.
 - The core top, `heliodor_core`, contains only instances and wiring.

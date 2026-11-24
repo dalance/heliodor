@@ -250,8 +250,7 @@ Two checks measure whether the tests exercise the design.
 - **Event wires.** Every mechanism has a registered event wire in `o_perf`
   (each retry reason, each kind of kill, each forwarding hit). `test/gates/fire_check.py`
   checks a matrix of events against the logs of the tests and fails when an event
-  that must fire in a given test does not. A bit-identical result in a test where
-  a mechanism never fired says nothing about that mechanism.
+  that must fire in a given test does not.
 - **Coverage.** `test/gates/cov_report.py` reports functional coverage from the
   co-simulation records (instructions by mode, traps by cause, CSR accesses,
   vector types, memory accesses), measured against the set of implemented cases

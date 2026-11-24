@@ -8,9 +8,8 @@ run from the root of the heliodor repository.
 - Linux on x86-64. The prebuilt toolchains are built for glibc 2.34 or newer.
 - Veryl 0.22.1 or newer (see [Get Veryl](#get-veryl)).
 - A Rust toolchain (`cargo`), to build the co-simulation component.
-- [Verilator](https://www.veripool.org/verilator/) 5.x, only for the Verilator flows
-  (version 5.050 was used for this book). Install it from your distribution or
-  from the Verilator project.
+- [Verilator](https://www.veripool.org/verilator/) 5.x, only for the Verilator flows.
+  Install it from your distribution or from the Verilator project.
 - `make`, `python3`, `git`, `curl`, `tar`, and `dtc` (the device-tree compiler,
   for the Linux image build).
 - A C++ compiler (GCC 11 or newer) and the Boost development files, to build the
@@ -87,11 +86,11 @@ This transpiles the sources and testbenches to SystemVerilog next to each
 `.veryl` file, and writes the file list `heliodor.f` for the Verilator flows. The
 first run takes a minute or two.
 
-`veryl check` runs the analyzer without generating files. It currently prints
-lint warnings, mostly for the testbenches (unconnected ports) and a few for the
-frozen old core under `src/v14/`, and exits with a non-zero status, so use
-`veryl build` as your build gate. The design sources of the current core produce no
-warnings.
+`veryl check` runs the analyzer and lint without generating files.
+
+`veryl doc` renders the documentation comments of the sources (the summary,
+invariants and rationale of each module, and the timing contract of each port) as
+HTML under `target/doc/`.
 
 ## Run tests
 
