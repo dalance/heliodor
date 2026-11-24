@@ -235,9 +235,10 @@ excluded with a reason. See [SoC integration](soc-integration.md#debug).
 
 ## Verilator cross-check {#verilator-cross-check}
 
-Boots and litmus runs also run on Verilator. Standard SystemVerilog scheduling is
-closer to real hardware than the Veryl simulator, and the two give the same cycle
-counts, so a difference points at a simulator problem rather than at the design.
+Boots and litmus runs also run on Verilator. The Veryl simulator is much newer
+than Verilator, so a mature, independent simulator is a useful check on it. The
+two give the same cycle counts, so a difference points at a bug in a simulator
+rather than in the design.
 Build with `+define+HELIODOR_CHK+HELIODOR_OBS`, as the harnesses need the retire
 records. The wrappers are listed in
 [Running Linux](running-linux.md#run-a-boot-on-verilator).

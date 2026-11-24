@@ -129,7 +129,7 @@ the same programs on the 4-wide core.
 
 The native `#[test]` modules cannot run on Verilator, so thin SystemVerilog
 wrappers in `sim/verilator/` instantiate the harnesses that `veryl build`
-generates. Verilator uses standard SystemVerilog scheduling, which makes it a
+generates. Verilator is an independent and mature simulator, which makes it a
 useful cross-check of the Veryl simulator.
 
 ```bash
