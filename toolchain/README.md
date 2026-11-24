@@ -71,11 +71,10 @@ writable system gem dir.
 ## Book tools
 
 `toolchain/fetch.sh book` fetches the tools that build `book/`: mdBook
-(a static prebuilt, `mdbook/`), mdbook-i18n-helpers (`i18n/bin/`) and
-mdbook-linkcheck (`linkcheck/bin/`). The last two publish no binaries, so
-`fetch.sh` downloads the pinned crate source, verifies `I18N_SHA256` or
-`LINKCHECK_SHA256`, and builds it with the `Cargo.lock` the crate ships (needs
-`cargo`). `book/build.sh` sources `env.sh` itself.
+(a static prebuilt, `mdbook/`) and mdbook-i18n-helpers (`i18n/bin/`). The
+latter publishes no binaries, so `fetch.sh` downloads the pinned crate source,
+verifies `I18N_SHA256`, and builds it with the `Cargo.lock` the crate ships
+(needs `cargo`). `book/build.sh` sources `env.sh` itself.
 
 ## Pinning / reproducibility
 

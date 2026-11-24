@@ -4,7 +4,7 @@
 # Usage:
 #   ./fetch.sh all          # fetch everything declared in versions.env
 #   ./fetch.sh elf          # fetch one component (elf | linux | sail | uv | mdbook)
-#   ./fetch.sh book         # mdbook + mdbook-i18n-helpers + mdbook-linkcheck (built from source) for book/
+#   ./fetch.sh book         # mdbook + mdbook-i18n-helpers (built from source) for book/
 #   ./fetch.sh debug        # build spike + openocd + gdb from source (MD debug flow)
 #   ./fetch.sh spike        # build one of spike | openocd | gdb
 #   ./fetch.sh glt          # clone litmus-tests-riscv + build herd7 (GLT)
@@ -177,34 +177,8 @@ build_i18n() {
   rm -rf "$tmp"
   [[ -f "$src/Cargo.lock" ]] || { echo "[i18n] ERROR: crate ships no Cargo.lock" >&2; return 1; }
   rm -rf "$dest"; mkdir -p "$dest/bin"
-  # The pinned onig_sys C sources predate C23 (unprototyped function pointers)
-  # and newer GCC's -Werror=incompatible-pointer-types: build them as C17 and
-  # keep that check a warning.
-  ( cd "$src" && CFLAGS="${CFLAGS:-} -std=gnu17 -Wno-error=incompatible-pointer-types" \
-      cargo build --release --locked --bins \
-    && cp target/release/mdbook-gettext target/release/mdbook-xgettext "$dest/bin/" )
-}
-
-# mdbook-linkcheck: pinned crates.io source (sha256-verified), built with the
-# Cargo.lock it ships, into toolchain/linkcheck/bin. Needs cargo. It runs as an
-# mdBook renderer (book/build.sh check).
-build_linkcheck() {
-  local src="$here/src/linkcheck" dest="$here/linkcheck" tmp; tmp="$(mktemp -d)"
-  local name="mdbook-linkcheck-$LINKCHECK_VERSION"
-  curl -fSL --retry 3 -o "$tmp/crate.tar.gz" "https://static.crates.io/crates/mdbook-linkcheck/$name.crate"
-  local got; got="$(sha256sum "$tmp/crate.tar.gz" | awk '{print $1}')"
-  if [[ -n "$LINKCHECK_SHA256" ]]; then
-    [[ "$got" == "$LINKCHECK_SHA256" ]] || { echo "[linkcheck] ERROR sha256 mismatch: got $got want $LINKCHECK_SHA256" >&2; return 1; }
-  else
-    echo "[linkcheck] sha256 (pin this in versions.env as LINKCHECK_SHA256): $got"
-  fi
-  rm -rf "$src"; mkdir -p "$src"
-  tar -xzf "$tmp/crate.tar.gz" -C "$src" --strip-components=1
-  rm -rf "$tmp"
-  [[ -f "$src/Cargo.lock" ]] || { echo "[linkcheck] ERROR: crate ships no Cargo.lock" >&2; return 1; }
-  rm -rf "$dest"; mkdir -p "$dest/bin"
   ( cd "$src" && cargo build --release --locked --bins \
-    && cp target/release/mdbook-linkcheck "$dest/bin/" )
+    && cp target/release/mdbook-gettext target/release/mdbook-xgettext "$dest/bin/" )
 }
 
 build_one() {
@@ -224,11 +198,11 @@ targets=("$@")
 [[ "${targets[0]}" == "all" ]] && targets=(elf linux sail uv)
 [[ "${targets[0]}" == "debug" ]] && targets=(spike openocd gdb)
 [[ "${targets[0]}" == "glt" ]] && targets=(litmus herd)
-[[ "${targets[0]}" == "book" ]] && targets=(mdbook i18n linkcheck)
+[[ "${targets[0]}" == "book" ]] && targets=(mdbook i18n)
 rc=0
 for t in "${targets[@]}"; do
   case "$t" in
-    spike|openocd|gdb|herd|i18n|linkcheck) build_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
+    spike|openocd|gdb|herd|i18n) build_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
     litmus) fetch_litmus || { echo "[$t] FAILED" >&2; rc=1; } ;;
     *) fetch_one "$t" || { echo "[$t] FAILED" >&2; rc=1; } ;;
   esac

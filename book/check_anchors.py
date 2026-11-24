@@ -4,9 +4,8 @@ exists and, when the link has a fragment, the target page has that id.
 
     book/check_anchors.py out/en out/ja
 
-mdbook-linkcheck verifies that linked files exist but not fragments, and a
-translated heading gets a new generated id, so a link that works in English can
-break in Japanese. The headings that are link targets carry explicit ids.
+A translated heading gets a new generated id, so a link that works in English
+can break in Japanese. The headings that are link targets carry explicit ids.
 """
 import re
 import sys
