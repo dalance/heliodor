@@ -2,8 +2,9 @@
 
 **Heliodor** is a from-scratch, out-of-order RV64 RISC-V application-processor core
 written in [Veryl](https://veryl-lang.org/). It implements every mandatory
-extension of the **RVA23** profile (RVA23U64 and RVA23S64): RV64GCB, the vector (V)
-extension and the hypervisor (H) extension, in machine, supervisor and user modes.
+extension of the **RVA23** profile (RVA23U64 and RVA23S64; RVA23.1 adds no
+mandatory ones): RV64GCB, the vector (V) extension and the hypervisor (H)
+extension, in machine, supervisor and user modes.
 It boots unmodified mainline Linux (5.15, 6.6 LTS and 7.1) on 1, 2 and 4 harts
 through a small M-mode SBI firmware to an SBI shutdown, and boots a guest Linux under a
 bare-metal type-1 hypervisor.

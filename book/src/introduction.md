@@ -50,8 +50,9 @@ This book is for three kinds of reader:
 ## Supported ISA
 
 The base is RV64GC (RV64IMAFDC with Zicsr and Zifencei). On top of it the core
-implements the mandatory extensions of RVA23U64 and RVA23S64, and five optional
-ones of RVA23.1.
+implements the mandatory extensions of RVA23U64 and RVA23S64, which RVA23.1
+leaves unchanged, and four of the five RVA23.1 options: all but Ssctr (control
+transfer records).
 
 | Group | Extensions |
 |---|---|
@@ -65,7 +66,7 @@ ones of RVA23.1.
 | Counters and state enable | Zicntr, Zihpm, Smstateen and Ssstateen |
 | Privilege | Machine, supervisor and user modes; Sv39 (Svnapot, Svpbmt, Svinval, Svade, Svadu); PMP (Smpmp); Sstc; Sscofpmf; Supm, Ssnpm, Smnpm and Smmpm (pointer masking); Ssccptr, Sscounterenw, Sstvala, Sstvecd, Ssu64xl, Svbare |
 | Hypervisor | H, with Sha (Shcounterenw, Shvstvala, Shtvala, Shvstvecd, Shvsatpa, Shgatpa) |
-| RVA23.1 options | Svrsw60t59b, Ssqosid, Smcsrind and Sscsrind, Smcdeleg and Ssccfg, Ssdbltrp |
+| RVA23.1 options | Svrsw60t59b, Ssqosid, Ssdbltrp, Ssccfg (with Smcdeleg, and the Smcsrind and Sscsrind it depends on) |
 | Debug | Debug Specification 1.0 and the Sdtrig triggers (`mcontrol6` and `icount`) |
 
 Instruction fetch, address translation and cache-block operations follow the
